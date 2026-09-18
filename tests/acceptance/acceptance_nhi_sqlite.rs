@@ -46,9 +46,14 @@
 //! * [`config1_mcp_stdio_full_profile_smoke`] — a thin `ai-memory mcp --profile
 //!   full` stdio smoke proving JSON-RPC 2.0 framing + the tool surface.
 //!
-//! Runs under `AI_MEMORY_NO_CONFIG=1` — no embedder, no LLM, no network
-//! dependencies. All daemon children are behind RAII kill guards; every wait is
-//! bounded so a hung daemon fails the test rather than hanging CI.
+//! Runs under `AI_MEMORY_NO_CONFIG=1`, which resolves to the Semantic tier
+//! (`config::effective_tier(None)` = `FeatureTier::Semantic`), so each daemon
+//! DOES build the MiniLM embedder — but hermetically: `spawn_daemon` denies the
+//! network (`AI_MEMORY_EMBED_OFFLINE=1`) and forwards the real `HF_HOME` so the
+//! embedder loads from the #2019-staged HuggingFace cache instead of cold-fetching
+//! from the Hub (#3788). No LLM, and no network dependency. All daemon children
+//! are behind RAII kill guards; every wait is bounded so a hung daemon fails the
+//! test rather than hanging CI.
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -167,6 +172,23 @@ fn local_ca_client(timeout: Duration) -> Option<reqwest::blocking::Client> {
     )
 }
 
+/// #3788 — the real HuggingFace cache to forward as `HF_HOME` to the daemon
+/// child so the OFFLINE embedder resolves the #2019-staged model despite the
+/// per-test HOME override. hf-hub reads `HF_HOME` (else `$HOME/.cache/huggingface`);
+/// coverage.yml stages under `~/.cache/huggingface` and sets no `HF_HOME`, so
+/// derive it from the test process's real `$HOME` (unchanged by the child override).
+fn real_hf_home() -> Option<String> {
+    if let Ok(hf) = std::env::var("HF_HOME")
+        && !hf.trim().is_empty()
+    {
+        return Some(hf);
+    }
+    std::env::var("HOME")
+        .ok()
+        .filter(|h| !h.trim().is_empty())
+        .map(|h| format!("{h}/.cache/huggingface"))
+}
+
 /// Spawn `ai-memory --db <db> serve --host 127.0.0.1 --port <p>` with
 /// `extra_envs` layered on the hermetic base env, and wait (bounded) for
 /// `/api/v1/health` to return 2xx. Retries only on a `free_port()` bind race;
@@ -203,7 +225,18 @@ fn spawn_daemon(db: &std::path::Path, extra_envs: &[(&str, &str)]) -> DaemonChil
             // security-critical WRITE attestation is UNAFFECTED — every store is
             // still a real Ed25519 signature verified against the bound key.
             .env("AI_MEMORY_ADMIN_HEADER_TRUST", "1")
+            // #3788 — AI_MEMORY_NO_CONFIG=1 resolves to the Semantic tier, so the
+            // daemon DOES build the embedder. Deny the network so a boot never
+            // cold-fetches ~90 MB from the Hub (the #2019 hermetic-coverage
+            // guarantee); the model comes from the staged cache forwarded below.
+            .env("AI_MEMORY_EMBED_OFFLINE", "1")
             .env_remove("AI_MEMORY_DB");
+        // #3788 — the HOME override above hides the real HF cache the offline
+        // loader reads; forward it (hf-hub honours HF_HOME). Set BEFORE extra_envs
+        // so a cell can override it (the absence control points it at an empty dir).
+        if let Some(hf_home) = real_hf_home() {
+            cmd.env("HF_HOME", hf_home);
+        }
         for (k, v) in extra_envs {
             cmd.env(k, v);
         }
@@ -1308,4 +1341,71 @@ fn first_boot_daemon_refuses_plain_http_3776() {
             resp.status()
         ),
     }
+}
+
+/// #3788 — daemon-sink ABSENCE control: with the network denied
+/// (`AI_MEMORY_EMBED_OFFLINE=1`, as spawn_daemon sets) and HF_HOME pointed at an
+/// EMPTY cache, `serve` reports the embedder fallback miss on stderr and degrades
+/// to keyword — it does NOT cold-fetch. The allowed-path counterpart is the
+/// config1_* cells, which load the embedder from the #2019 staged cache in the
+/// coverage job (they need the #3776 https-readiness fix, chain 9d, to reach the
+/// probe — this control spawns `serve` directly and reads the boot stderr, which
+/// precedes binding, so it is independent of the readiness probe).
+#[test]
+fn embedder_offline_empty_cache_reports_fallback_miss_not_coldfetch_3788() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = tmp.path().join("acc-nocache.db");
+    let home = tmp.path().join("home");
+    let empty_hf = tmp.path().join("empty-hf");
+    std::fs::create_dir_all(&home).expect("home");
+    std::fs::create_dir_all(&empty_hf).expect("empty hf");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ai-memory"))
+        .env("AI_MEMORY_NO_CONFIG", "1")
+        .env("HOME", &home)
+        .env("AI_MEMORY_KEY_DIR", key_dir_sandbox::pin())
+        .env("AI_MEMORY_EMBED_OFFLINE", "1")
+        .env("HF_HOME", &empty_hf)
+        .args([
+            "--db",
+            db.to_str().expect("utf8"),
+            "serve",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            &free_port().to_string(),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn serve");
+    // Read boot stderr until the embedder verdict or a bounded deadline; the
+    // embedder loads (or misses) BEFORE the listener binds, so this never depends
+    // on the (#3776-gated) readiness probe.
+    let stderr = child.stderr.take().expect("stderr");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut seen = String::new();
+    let mut verdict = None;
+    for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+        seen.push_str(&line);
+        seen.push('\n');
+        if line.contains("EMBEDDER LOAD FAILED")
+            || line.contains("model files not found")
+            || line.contains("semantic recall enabled")
+            || line.contains("listening on")
+        {
+            verdict = Some(line);
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    let verdict =
+        verdict.unwrap_or_else(|| panic!("no embedder verdict on stderr within 30s:\n{seen}"));
+    assert!(
+        verdict.contains("EMBEDDER LOAD FAILED") || verdict.contains("model files not found"),
+        "#3788: offline + empty HF_HOME must report the fallback miss (never cold-fetch), got: {verdict}\n{seen}"
+    );
 }

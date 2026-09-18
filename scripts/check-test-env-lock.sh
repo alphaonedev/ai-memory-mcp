@@ -344,6 +344,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # with their own documented serialization discipline (see header).
 ALLOWLISTED_FILES=(
     "tests/form_7_agent_external_wiring.rs"
+    "tests/hf_cache_staged_3788.rs"
 )
 
 is_allowlisted () {
