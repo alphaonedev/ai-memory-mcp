@@ -60,6 +60,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     python `tests/` 119 passed / 5 skipped and `swarm/tests/` 85 passed, all
     unchanged.
 
+### Fixed (#3544 — the Python shims no longer report an unstored turn as captured)
+
+- **#3544 (bug, ga-blocker) — `capture_turn()` in both published Python
+  shims now returns `True` only for a turn the substrate confirms it
+  PERSISTED.** The predicate was the *absence* form: a response counted as a
+  captured turn unless it matched one of the failure shapes the author had
+  enumerated (JSON-RPC `error`, `isError: true`, and later `status` in
+  {`ask`, `pending`}). A developer using `ai-memory-openai-shim` or
+  `ai-memory-anthropic-shim` therefore got `True` back for a turn that was
+  never stored whenever the envelope was anything unenumerated — an
+  unreadable payload, an empty object, a payload with no `memory_id`, or a
+  `status` a later substrate release adds. Both shims now share ONE
+  predicate, `_capture_outcome.classify_capture_response`, vendored
+  byte-identically into both packages and pinned as byte-identical by
+  `tests/test_capture_outcome_parity.py` in each, so the two wheels cannot
+  disagree about what "captured" means. It is the *presence* form —
+  **captured if and only if the payload carries a non-empty `memory_id`**
+  (`src/mcp/tools/capture_turn.rs`; the field RFC-0001 lists as `required`)
+  — so an unrecognised envelope fails CLOSED without the shim having to know
+  it exists. `status` is read only to say WHY and to carry the recovery
+  handle, never to decide the verdict: `ask` (`capture_turn.rs`, permission
+  `Decision::Ask`) reports that NOTHING was persisted and names no recovery
+  that does not exist, and `pending` (`GovernanceDecision::Pending`) reports
+  the turn as durably QUEUED — not lost — and surfaces the `pending_id` that
+  redeems it via `memory_pending_approve`. Public API, return type and wire
+  shape are unchanged (`capture_turn` is still `-> bool`); READMEs and
+  docstrings now state what the boolean means. Shim-only change: no Rust,
+  no MCP/HTTP/CLI surface, no schema.
 
 ### Added (#3654 — per-peer federation freshness)
 

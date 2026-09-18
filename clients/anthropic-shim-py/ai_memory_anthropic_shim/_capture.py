@@ -21,7 +21,12 @@ import subprocess
 import sys
 from typing import Any, TypedDict
 
+# #3544 — the ONE success predicate, byte-identical in both shim
+# packages and pinned as such by tests/test_capture_outcome_parity.py.
+from ._capture_outcome import classify_capture_response
+
 # Default location of the ai-memory binary; overridable per call or via env.
+_SHIM_NAME = "ai-memory-anthropic-shim"
 _ENV_BIN = "AI_MEMORY_BIN"
 _DEFAULT_BIN = "ai-memory"
 _CAPTURE_TIMEOUT_SECS = 30
@@ -67,35 +72,6 @@ def _pick_call_response(stdout_text: str) -> dict[str, Any] | None:
     return None
 
 
-def _captured_payload(resp: dict[str, Any]) -> dict[str, Any] | None:
-    """The capture_turn tool payload dict, if the result carries one.
-
-    ``mcp/mod.rs`` serialises the handler ``Value`` into
-    ``result.content[0].text`` as a JSON string, so a governance
-    Ask / Pending object rides one level of JSON nesting. Returns ``None``
-    on every shape mismatch (absent / not a dict / not a list / empty /
-    not a string / not JSON) — the normal captured-success shape, which
-    carries no such object.
-    """
-    result = resp.get("result")
-    if not isinstance(result, dict):
-        return None
-    content = result.get("content")
-    if not isinstance(content, list) or not content:
-        return None
-    first = content[0]
-    if not isinstance(first, dict):
-        return None
-    text = first.get("text")
-    if not isinstance(text, str):
-        return None
-    try:
-        payload = json.loads(text)
-    except json.JSONDecodeError:
-        return None
-    return payload if isinstance(payload, dict) else None
-
-
 def build_capture_request(
     *,
     host_session_id: str,
@@ -137,9 +113,26 @@ def capture_turn(
     timestamp_iso: str | None = None,
     ai_memory_bin: str | None = None,
 ) -> bool:
-    """Record one turn to ai-memory. Returns ``True`` on success. NEVER raises
-    — every failure path emits a stderr WARN and returns ``False`` so the shim
-    stays non-wedging."""
+    """Record one turn to ai-memory.
+
+    Returns ``True`` ONLY when the substrate confirms the turn was
+    **persisted** — that is, when the ``memory_capture_turn`` envelope carries
+    a non-empty ``memory_id`` (``src/mcp/tools/capture_turn.rs:531-547``; the
+    same field RFC-0001 lists in the tool result's ``required`` set). Returns
+    ``False`` for everything else and names the reason on stderr:
+
+    * ``status=ask`` — governance asked for approval; **nothing was persisted**
+      and there is no recovery handle (``capture_turn.rs:437-444``).
+    * ``status=pending`` — the write is **durably queued, not lost**; the
+      ``pending_id`` is printed so you can redeem the turn with
+      ``memory_pending_approve`` (``capture_turn.rs:488-496``).
+    * a transport fault, an unreadable payload, or any envelope this shim does
+      not recognise — it fails CLOSED rather than claim a success it cannot
+      prove.
+
+    NEVER raises: every failure path emits a stderr WARN and returns ``False``
+    so the caller's LLM call is never disturbed.
+    """
     bin_path = ai_memory_bin or os.environ.get(_ENV_BIN, _DEFAULT_BIN)
     request = build_capture_request(
         host_session_id=host_session_id,
@@ -162,62 +155,36 @@ def capture_turn(
             timeout=_CAPTURE_TIMEOUT_SECS,
         )
     except FileNotFoundError:
-        print(f"WARN ai-memory-anthropic-shim: binary not found: {bin_path}", file=sys.stderr)
+        print(f"WARN {_SHIM_NAME}: binary not found: {bin_path}", file=sys.stderr)
         return False
     except subprocess.TimeoutExpired:
-        print("WARN ai-memory-anthropic-shim: capture timed out (30s)", file=sys.stderr)
+        print(f"WARN {_SHIM_NAME}: capture timed out (30s)", file=sys.stderr)
         return False
     except OSError as e:  # pragma: no cover - defensive
-        print(f"WARN ai-memory-anthropic-shim: capture spawn failed: {e}", file=sys.stderr)
+        print(f"WARN {_SHIM_NAME}: capture spawn failed: {e}", file=sys.stderr)
         return False
 
     if result.returncode != 0:
         print(
-            f"WARN ai-memory-anthropic-shim: substrate exited {result.returncode}",
+            f"WARN {_SHIM_NAME}: substrate exited {result.returncode}",
             file=sys.stderr,
         )
         return False
     resp = _pick_call_response(result.stdout)
-    if resp is None:
-        print("WARN ai-memory-anthropic-shim: no capture response from substrate", file=sys.stderr)
-        return False
-    # A top-level JSON-RPC `error` member (e.g. an unknown-method / invalid-params
-    # fault) is a FAILURE, not a success — it carries no `result`, so it would
-    # otherwise slip past the `isError` check below and be mis-counted as a
-    # captured turn. Screen it before the tool-level `isError` branch.
-    if resp.get("error") is not None:
-        print("WARN ai-memory-anthropic-shim: substrate returned JSON-RPC error", file=sys.stderr)
-        return False
-    if isinstance(resp.get("result"), dict) and resp["result"].get("isError") is True:
-        print("WARN ai-memory-anthropic-shim: substrate returned isError:true", file=sys.stderr)
-        return False
-    # #3544 — a governance decision returns an Ok result (no `error`, no
-    # `isError`) whose tool payload carries a `status`. Neither is a captured
-    # turn, but they are NOT the same and a caller must tell them apart: an Ask
-    # (capture_turn.rs) persists NOTHING, while a Pending is DURABLY QUEUED and
-    # recoverable via memory_pending_approve — so its `pending_id`, the only
-    # recovery handle, must survive to the caller rather than be discarded.
-    payload = _captured_payload(resp)
-    if isinstance(payload, dict):
-        status = payload.get("status")
-        if status == "ask":
-            print(
-                "WARN ai-memory-anthropic-shim: capture_turn returned status=ask "
-                "(governance approval requested; nothing persisted, no recovery id); "
-                "not counting as a captured turn",
-                file=sys.stderr,
-            )
-            return False
-        if status == "pending":
-            pending_id = payload.get("pending_id")
-            print(
-                "WARN ai-memory-anthropic-shim: capture_turn returned status=pending, "
-                f"pending_id={pending_id} (durably QUEUED for approval; recover via "
-                "memory_pending_approve); not counting as a captured turn",
-                file=sys.stderr,
-            )
-            return False
-    return True
+    # #3544 — ONE predicate decides this, shared byte-identically with the
+    # sibling shim package: a turn is captured IFF the tool payload carries a
+    # non-empty `memory_id`. The pre-fix code was the ABSENCE form (success
+    # unless the response matched an enumerated failure), so an unreadable
+    # payload, an empty object, or a `status` a later substrate release adds
+    # was reported to the caller as a captured turn that was never stored.
+    # Governance `ask` (nothing persisted, no handle) and `pending` (durably
+    # QUEUED and redeemable via memory_pending_approve, carrying the only id
+    # that redeems it) are each surfaced as what they are; anything the
+    # predicate does not recognise fails CLOSED.
+    outcome = classify_capture_response(resp)
+    if not outcome.captured:
+        print(f"WARN {_SHIM_NAME}: {outcome.detail}", file=sys.stderr)
+    return outcome.captured
 
 
 class _CaptureDurability(TypedDict):
