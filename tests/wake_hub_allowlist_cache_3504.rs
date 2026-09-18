@@ -519,13 +519,10 @@ async fn postgres_refresh_derives_publishes_and_narrows_3504() {
 
     let url = std::env::var("AI_MEMORY_TEST_POSTGRES_URL")
         .expect("live isolated PostgreSQL URL required; never skip");
-    // Name AND port (#3468 rule): the coverage workflow's throwaway service
-    // container is also named `ai_memory_test`, on :5432, and must be usable.
-    assert!(
-        !wake_hub_harness::is_shared_live_store(&url),
-        "refusing to run against the shared live store (ai_memory_test on the certified \
-         tier's port); point AI_MEMORY_TEST_POSTGRES_URL at this lane's own isolated database"
-    );
+    // #3777 — the ONE lane-database predicate (name AND port for the shared
+    // store — the coverage workflow's throwaway container is also named
+    // `ai_memory_test`, on :5432, and must be usable).
+    wake_hub_harness::assert_lane_database(&url);
     let database = wake_hub_harness::database_name(&url);
     assert!(
         !database.is_empty(),

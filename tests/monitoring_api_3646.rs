@@ -1,6 +1,9 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 //! #3646 actual-router scope sweep and metadata non-disclosure, both backends.
+#[path = "common/lane_db.rs"]
+mod lane_db;
+
 use ai_memory::config::{FeatureTier, ResolvedScoring, ResolvedTtl};
 use ai_memory::handlers::identity_binding::{EnrolledAgentKeys, api_key_sha256_hex};
 use ai_memory::handlers::monitoring::{METRICS_PATH, MonitoringConfig, STATUS_PATH};
@@ -429,15 +432,10 @@ async fn issue_3646_store_failure_is_failing_without_error_content() {
 #[tokio::test]
 async fn issue_3646_postgres_routes_and_seeded_non_disclosure() {
     let url = std::env::var("AI_MEMORY_TEST_POSTGRES_URL")
-        .expect("dedicated #3646 postgres database required");
-    // #3705 pins `sslmode=verify-full` on every postgres DSN, so the lane
-    // URL carries a query string; the lane-database guard reads the path.
-    assert!(
-        url.split('?')
-            .next()
-            .is_some_and(|path| path.ends_with("/ai_memory_codex_3646")),
-        "never use an operator database"
-    );
+        .expect("a dedicated lane PostgreSQL URL is required");
+    // #3777 — the ONE lane-database predicate (no lane literal); it reads
+    // the URL's path, so the #3705 `sslmode=verify-full` query is fine.
+    lane_db::assert_lane_database(&url);
     let app = postgres_app_state(&url).await;
     let pool = sqlx::PgPool::connect(&url).await.unwrap();
     sqlx::query("INSERT INTO memories (id,tier,namespace,title,content,tags,priority,confidence,source,access_count,created_at,updated_at,metadata) VALUES ('3646','long','private',$1,$1,'[]',5,1.0,'api',0,NOW(),NOW(),$2) ON CONFLICT (id) DO NOTHING")

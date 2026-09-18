@@ -265,13 +265,10 @@ fn sqlite_http_write_receipts_3555() {
 #[test]
 fn postgres_http_write_receipts_3555() {
     let url = std::env::var("AI_MEMORY_TEST_POSTGRES_URL")
-        .expect("fresh ai_memory_codex_3555 URL required");
-    assert!(
-        url.split('?')
-            .next()
-            .is_some_and(|url| url.ends_with("/ai_memory_codex_3555")),
-        "only the lane database is allowed"
-    );
+        .expect("a dedicated lane PostgreSQL URL is required");
+    // #3777 — the ONE lane-database predicate (no lane literal): CI mints
+    // `ai_memory_test_ci_<run>_<attempt>_<leg>`, every lane mints its own.
+    common::lane_db::assert_lane_database(&url);
     let _env = common::MultiEnvVarGuard::apply(&[
         ("AI_MEMORY_NO_CONFIG", Some("1")),
         ("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", Some("0")),
@@ -397,13 +394,10 @@ fn sqlite_http_quorum_and_backup_receipts_3555() {
 #[test]
 fn postgres_http_quorum_and_backup_receipts_3555() {
     let url = std::env::var("AI_MEMORY_TEST_POSTGRES_URL")
-        .expect("fresh ai_memory_codex_3555 URL required");
-    assert!(
-        url.split('?')
-            .next()
-            .is_some_and(|url| url.ends_with("/ai_memory_codex_3555")),
-        "only the lane database is allowed"
-    );
+        .expect("a dedicated lane PostgreSQL URL is required");
+    // #3777 — the ONE lane-database predicate (no lane literal): CI mints
+    // `ai_memory_test_ci_<run>_<attempt>_<leg>`, every lane mints its own.
+    common::lane_db::assert_lane_database(&url);
     let runtime = tokio::runtime::Runtime::new().expect("runtime");
     let _ = ai_memory::governance::wire_check::GOVERNANCE_PRE_ACTION.set(Box::new(|_| Ok(())));
     for backup in [None, Some("attested")] {
