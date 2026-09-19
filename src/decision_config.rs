@@ -89,8 +89,23 @@ pub enum DecisionFallback {
     /// Ask the `[llm]` generative backend instead, reporting
     /// [`crate::decision::DecisionSource::GenerativeFallback`].
     Generative,
-    /// Refuse the operation outright rather than proceed without a
-    /// decision.
+    /// Fail the operation when the decision instrument is
+    /// UNAVAILABLE, rather than proceed without it.
+    ///
+    /// Scope, precisely (#3806 R4): `fallback` governs unavailability,
+    /// not abstention, so this posture fires on CASE 2 only — no
+    /// provider was built, the egress gate refused the endpoint, the
+    /// call timed out, the transport failed, the endpoint returned a
+    /// non-2xx. It does NOT fire when the provider ANSWERED and
+    /// declined (CASE 3), which is terminal under every posture: there
+    /// the instrument worked and gave its answer, the seam takes its
+    /// conservative NON-ACTION branch, and the operation proceeds.
+    ///
+    /// The previous wording — "refuse the operation outright rather
+    /// than proceed without a decision" — was false for CASE 3, where
+    /// the operation does proceed without one. See
+    /// [`crate::decision::AbstainReason::is_unavailable`] for the
+    /// partition, and `crate::decision_seams` for the three cases.
     Refuse,
 }
 

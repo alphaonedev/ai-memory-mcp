@@ -731,11 +731,18 @@ confidence from then on. That is a documented degradation; a fabricated
 **`fallback = "generative"`** asks the `[llm]` backend the same question,
 held to `[decision].timeout_secs` rather than the generative 30-second
 budget — so the worst case on a seam whose primary timed out is two
-decision budgets, not thirty-two seconds. **An egress refusal is never
-routed around**: a destination the posture refused is not re-asked of a
-second endpoint, so `fallback` can never become an egress bypass. The
-outbound check runs before every request, including the retry and the
-fallback leg.
+decision budgets, not thirty-two seconds.
+
+**Three abstains are never routed around**, not one. An **egress
+refusal** is not re-asked of a second endpoint, so `fallback` can never
+become an egress bypass. A **decline** — the model answered, and its
+answer was not a decision — is terminal under every posture, because
+re-asking a deliberate refusal of a weaker reader manufactures an answer
+out of it. And **`no_provider`** is terminal inside the decision plane
+for the same reason an egress refusal is: there is no second decider to
+ask. Everything else is unavailability, and unavailability is what
+`fallback` governs. The outbound check runs before every request,
+including the retry and the fallback leg.
 
 Model-class advice, the air-gap ladder and the hosted-route census land
 with the rest of the `[decision]` documentation (#3806 W6).
@@ -803,6 +810,17 @@ client to reach at all. Inside the decision plane it is terminal — the
 provider chain never answers a refused destination from a second
 endpoint, so `fallback` can never become an egress bypass. It is counted
 as `outcome="egress_refused"`.
+
+It is not the only terminal abstain, and the distinction is worth
+keeping straight. TERMINAL INSIDE THE DECISION PLANE means the provider
+chain will not ask a second decider: that is true of an egress refusal,
+of `no_provider`, and of a DECLINE. TERMINAL AT THE SEAM means
+`fallback` does not apply at all: that is true only of a decline,
+because only there did the instrument work and give its answer. An
+egress refusal and a never-built provider are both case 2 at the seam —
+`refuse` fails, `generative` runs the old path, `abstain` takes the
+conservative branch — even though neither is re-asked inside the
+decision plane.
 
 Every surface that can reach a seam obtains its decider from the ONE
 boot chokepoint: the HTTP daemon, the MCP stdio surface (and its
