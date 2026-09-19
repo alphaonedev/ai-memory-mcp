@@ -148,7 +148,18 @@ impl GenerativeFallbackDecider {
             // The generative client's error already went through the
             // `[llm]` redaction funnel; it is dropped here rather than
             // carried, because a seam must be handed a reason, not text.
-            Ok(Err(_transport_or_parse)) => Err(AbstainReason::Unusable),
+            //
+            // #3806 R1 — this is [`AbstainReason::Unavailable`], NOT
+            // `Unusable`. The model never ANSWERED: the transport
+            // failed, or the response was not a completion at all. As
+            // `Unusable` it classified as a DECLINE, which is terminal
+            // under the 2026-09-19 ruling, so `fallback = "refuse"`
+            // returned `Conservative` during an outage — failing OPEN on
+            // the exact failure that posture exists to refuse. The
+            // module header of `crate::decision_seams` has always listed
+            // "transport error" under CASE 2; the doc was right and the
+            // code was wrong.
+            Ok(Err(_transport_or_parse)) => Err(AbstainReason::Unavailable),
             Ok(Ok(text)) => Ok(text),
         }
     }

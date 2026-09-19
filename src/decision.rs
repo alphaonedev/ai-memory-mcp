@@ -58,7 +58,13 @@ use std::fmt;
 
 /// Where a decision came from. Carried on every result so no surface
 /// can report a generative guess as a decision-model verdict.
+/// #3294 / API-07 — `#[non_exhaustive]` so a later provenance is a
+/// non-breaking change. `pub mod decision` is public API and the crate
+/// ships `rlib`/`staticlib`/`cdylib`, so an external `match` on this
+/// enum must carry a wildcard. Adding the attribute AFTER release is
+/// itself a breaking change, so it is cheap exactly once: now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum DecisionSource {
     /// The configured `[decision]` provider answered.
     DecisionModel,
@@ -91,7 +97,14 @@ impl fmt::Display for DecisionSource {
 /// Why a decision is absent. Present on EVERY abstain and absent on
 /// every decision, so "no opinion" is always accountable and the
 /// `decision_outcome` metric (W1c) has a stable label vocabulary.
+/// #3294 / API-07 — `#[non_exhaustive]` so a later reason is a
+/// non-breaking change. This enum grew 5 -> 6 in #3806 W2
+/// (`Unavailable`), which is precisely the axis the attribute exists to
+/// keep non-breaking, and post-GA that growth would be semver-major.
+/// Adding the attribute later is itself breaking, so it is cheap
+/// exactly once: now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum AbstainReason {
     /// `[decision]` is unset, or the boot chokepoint refused to build a
     /// provider. The v1.0.0-unchanged path.

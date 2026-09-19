@@ -131,7 +131,7 @@ use anyhow::{Result, anyhow};
 
 use crate::config::AppConfig;
 use crate::decision::{AbstainReason, Decision, DecisionSource};
-use crate::decision_boot::{DecisionProviderHandle, build_decision_provider};
+use crate::decision_boot::{DecisionBootOutcome, DecisionProviderHandle, build_decision_provider};
 use crate::decision_clients::calibration::CalibrationSeam;
 use crate::decision_config::{DecisionFallback, fallback_phrase};
 use crate::llm::OllamaClient;
@@ -186,23 +186,76 @@ pub(crate) enum SeamOutcome<T> {
 /// [`crate::decision_boot::DecisionProviderHandle`], which keeps the
 /// handle type's reviewed file list to the chokepoint that defines it
 /// and the module that consumes it.
+/// What a surface's seams actually have.
+///
+/// #3806 R2 — two states, not one, and the second is the whole point.
+/// `[decision]` CONFIGURED with no provider built (the egress gate
+/// refused the endpoint, or the section did not resolve) used to be
+/// indistinguishable from `[decision]` UNSET: `attach_decider` returned
+/// the client untouched, every seam answered `RunLegacy`, and the
+/// v1.0.0 generative path ran. That made a PERMANENT refusal quieter
+/// and more permissive than a two-second blip — the strongest posture
+/// producing the most permissive outcome, unsurfaced — and it bypassed
+/// `fallback` entirely, including `refuse`.
+#[derive(Debug)]
+enum SeamState {
+    /// A provider the boot chokepoint constructed and gated.
+    Gated(Box<DecisionProviderHandle>),
+    /// `[decision]` is configured and NO provider exists. Permanent,
+    /// and CASE 2: `fallback` governs it exactly as it governs a
+    /// transient outage, because in both the provider never answered.
+    NoProvider { fallback: DecisionFallback },
+}
+
 #[derive(Debug)]
 pub struct DecisionSeams {
-    handle: DecisionProviderHandle,
+    state: SeamState,
 }
 
 impl DecisionSeams {
-    /// Wrap an ALREADY-GATED handle. Crate-private, and the only caller
-    /// is [`attach_decider`] — which obtains its handle from the boot
-    /// chokepoint and has no other way to get one.
-    fn from_handle(handle: DecisionProviderHandle) -> Self {
-        Self { handle }
+    /// The gated handle, or `None` when `[decision]` is configured and
+    /// no provider was ever built.
+    fn gated(&self) -> Option<&DecisionProviderHandle> {
+        match &self.state {
+            SeamState::Gated(handle) => Some(handle),
+            SeamState::NoProvider { .. } => None,
+        }
+    }
+
+    /// The operator's declared `fallback`, in either state.
+    fn fallback(&self) -> DecisionFallback {
+        match &self.state {
+            SeamState::Gated(handle) => handle.fallback(),
+            SeamState::NoProvider { fallback } => *fallback,
+        }
+    }
+
+    /// The CASE 2 outcome when `[decision]` is configured and no
+    /// provider was ever built.
+    ///
+    /// Recorded on the operator surface like any other abstain, so a
+    /// permanent boot refusal is VISIBLE rather than silent — it was
+    /// the absence of this record that let the condition hide.
+    ///
+    /// # Errors
+    /// Under `fallback = "refuse"`, which is the posture this repairs.
+    fn no_provider<T>(&self, seam: CalibrationSeam) -> Result<SeamOutcome<T>> {
+        record(
+            seam,
+            outcome_for_reason(AbstainReason::NoProvider),
+            Some(AbstainReason::NoProvider),
+            Instant::now(),
+        );
+        self.on_abstain(AbstainReason::NoProvider)
     }
 
     /// The whole-call ceiling for a seam that must cross the
     /// sync->async bridge.
     fn bridge_budget(&self) -> Duration {
-        self.handle.timeout().saturating_add(SEAM_BRIDGE_SLACK)
+        let timeout = self
+            .gated()
+            .map_or(SEAM_BRIDGE_SLACK, DecisionProviderHandle::timeout);
+        timeout.saturating_add(SEAM_BRIDGE_SLACK)
     }
 
     /// What this seam does when the decider produced no verdict — the
@@ -220,8 +273,9 @@ impl DecisionSeams {
         if !reason.is_unavailable() {
             return Ok(SeamOutcome::Conservative);
         }
-        // CASE 2 — the provider never answered. `fallback` governs.
-        match self.handle.fallback() {
+        // CASE 2 — the provider never answered, whether because a call
+        // failed or because one was never built. `fallback` governs.
+        match self.fallback() {
             DecisionFallback::Refuse => Err(anyhow!(
                 "the decision provider was unavailable ({reason}) and this deployment \
                  refuses to proceed without a decision: {} (#3806)",
@@ -307,6 +361,9 @@ pub(crate) fn classify_kind(
     let Some(seams) = client.decider() else {
         return Ok(SeamOutcome::RunLegacy);
     };
+    let Some(handle) = seams.gated() else {
+        return seams.no_provider(CalibrationSeam::ClassifyKind);
+    };
     let options = kind_options();
     let prompt = crate::llm::classify_kind_prompt(title, content);
     let started = Instant::now();
@@ -314,7 +371,7 @@ pub(crate) fn classify_kind(
     // budget is the outer ceiling for the sync call position. A bridge
     // failure is an ABSTAIN, never a guess.
     let decision = crate::llm::block_on_local_bounded(seams.bridge_budget(), || {
-        seams.handle.provider().choose(&prompt, &options)
+        handle.provider().choose(&prompt, &options)
     })
     .unwrap_or_else(|_| Decision::abstain(AbstainReason::Timeout, DecisionSource::Deterministic));
 
@@ -359,8 +416,11 @@ pub(crate) async fn judge_contradiction(
     let Some(seams) = client.decider() else {
         return Ok(SeamOutcome::RunLegacy);
     };
+    let Some(handle) = seams.gated() else {
+        return seams.no_provider(CalibrationSeam::DetectContradiction);
+    };
     let started = Instant::now();
-    let decision = seams.handle.provider().judge(prompt).await;
+    let decision = handle.provider().judge(prompt).await;
 
     if let Some(verdict) = decision.verdict() {
         record(
@@ -398,16 +458,43 @@ pub fn attach_decider(
     cfg: &AppConfig,
     db_path: &Path,
 ) -> Option<OllamaClient> {
-    let Some(handle) = build_decision_provider(cfg, db_path).into_handle() else {
-        return llm;
+    let state = match build_decision_provider(cfg, db_path) {
+        // CASE 1 — no `[decision]` section. Nothing is attached, no
+        // seam runs, no metric series is created: byte-identical v1.0.0.
+        DecisionBootOutcome::Absent => return llm,
+        DecisionBootOutcome::Constructed(handle) => {
+            // A RETARGETED clone, not this client: see the module
+            // header's "reference cycle" section. `with_model` shares
+            // the reqwest pool, takes a fresh breaker and does NOT copy
+            // the decider field.
+            let generative = llm
+                .as_ref()
+                .map(|client| Arc::new(client.with_model(client.model_name())));
+            let endpoint = cfg.resolve_llm(None, None, None).base_url;
+            SeamState::Gated(Box::new(handle.attach_client(generative, &endpoint)))
+        }
+        // CASE 2, PERMANENTLY (#3806 R2). The section EXISTS and no
+        // provider was built — the egress gate refused the endpoint, or
+        // it did not resolve. This used to return `llm` untouched, which
+        // ran the v1.0.0 generative path and bypassed `fallback`
+        // altogether: a permanent refusal was more permissive than a
+        // transient blip, and `refuse` could not refuse. The operator's
+        // DECLARED fallback is read from the raw section, because a
+        // section that failed to resolve still states its intent.
+        outcome => {
+            let fallback = cfg
+                .decision
+                .as_ref()
+                .and_then(|section| section.fallback)
+                .unwrap_or_default();
+            tracing::warn!(
+                state = outcome.state().as_str(),
+                fallback = fallback.as_str(),
+                "[decision] is configured but NO provider was built; every seam will take \
+                 its `fallback` branch rather than silently running the v1.0.0 path (#3806)"
+            );
+            SeamState::NoProvider { fallback }
+        }
     };
-    // A RETARGETED clone, not this client: see the module header's
-    // "reference cycle" section. `with_model` shares the reqwest pool,
-    // takes a fresh breaker and does NOT copy the decider field.
-    let generative = llm
-        .as_ref()
-        .map(|client| Arc::new(client.with_model(client.model_name())));
-    let endpoint = cfg.resolve_llm(None, None, None).base_url;
-    let handle = handle.attach_client(generative, &endpoint);
-    llm.map(|client| client.with_decider(Arc::new(DecisionSeams::from_handle(handle))))
+    llm.map(|client| client.with_decider(Arc::new(DecisionSeams { state })))
 }
