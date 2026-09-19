@@ -82,7 +82,7 @@ on:
     branches: [main, develop, "release/**"]
     tags: ["v*"]
   pull_request:
-    branches: [main, develop, "release/**"]
+    branches: [main, develop, "release/**", "next/v1.1.0"]
   # Merge Queue (#3089) — GitHub runs a queued PR's REQUIRED checks against the
   # ephemeral `merge_group` ref, NOT the PR ref. A required workflow that does
   # not trigger on `merge_group` never reports on that ref, so its context stays
