@@ -76,7 +76,7 @@ use serde_json::Value;
 
 use crate::decision::{AbstainReason, DecisionProvider, DecisionSource, ScoreRange};
 use crate::decision_config::{
-    DecisionFallback, PROVIDER_LOCAL_NLI, PROVIDER_SYSTEMONE, ResolvedDecision,
+    DecisionFallback, PROVIDER_LOCAL_NLI, PROVIDER_SYSTEMONE, ResolvedDecision, fallback_phrase,
 };
 
 pub mod calibration;
@@ -314,13 +314,18 @@ pub(crate) enum CallFailure {
 }
 
 impl CallFailure {
-    /// The abstain reason a seam sees. A non-2xx status is
-    /// [`AbstainReason::Unusable`]: the endpoint was reachable and
-    /// answered, but not with a decision.
+    /// The abstain reason a seam sees.
+    ///
+    /// A non-2xx status is [`AbstainReason::Unavailable`], NOT
+    /// `Unusable`: the endpoint was reachable but the MODEL never
+    /// answered — a 429, a 500, an expired key. Nothing declined, so a
+    /// seam may fall back to the instrument it used before
+    /// ([`AbstainReason::is_unavailable`], #3806 W2 case 2). `Unusable`
+    /// is reserved for an answer the model actually gave.
     pub(crate) fn reason(self) -> AbstainReason {
         match self {
             Self::Abstain(reason) => reason,
-            Self::Status(_) => AbstainReason::Unusable,
+            Self::Status(_) => AbstainReason::Unavailable,
         }
     }
 }
@@ -337,7 +342,10 @@ fn transport_abstain(error: &reqwest::Error) -> AbstainReason {
     if error.is_timeout() {
         AbstainReason::Timeout
     } else {
-        AbstainReason::Unusable
+        // A refused connection, a DNS failure, a TLS failure: the model
+        // was never reached, so this is UNAVAILABILITY and not a
+        // decline (#3806 W2 case 2).
+        AbstainReason::Unavailable
     }
 }
 
@@ -404,7 +412,9 @@ pub(crate) async fn post_json(call: HttpCall<'_>) -> Result<Value, CallFailure> 
         }
         crate::llm::read_capped_json(response)
             .await
-            .map_err(|_| CallFailure::Abstain(AbstainReason::Unusable))
+            // A body that is not JSON is not an ANSWER: a proxy error
+            // page, a truncated response. Unavailability, not a decline.
+            .map_err(|_| CallFailure::Abstain(AbstainReason::Unavailable))
     })
     .await;
 
@@ -480,11 +490,28 @@ impl FallbackChain {
     }
 
     /// Whether an abstain for `reason` may be re-asked of the fallback.
+    ///
+    /// Three terminal reasons, for three different arguments:
+    ///
+    /// * [`AbstainReason::Unusable`] — the provider ANSWERED and
+    ///   declined. Re-asking the question of a second model turns a
+    ///   deliberate refusal into somebody's opinion, which is the
+    ///   defect #3806 exists to remove rather than to relocate
+    ///   (Conductor ruling, W2 case 3; see
+    ///   [`AbstainReason::is_unavailable`]).
+    /// * [`AbstainReason::EgressRefused`] — a destination the posture
+    ///   refused must not be reachable by asking a different endpoint.
+    /// * [`AbstainReason::NoProvider`] — a constructed client never
+    ///   reports it, so seeing it means the chain IS the absent path.
     #[must_use]
     pub fn may_fall_back(reason: AbstainReason) -> bool {
         match reason {
-            AbstainReason::EgressRefused | AbstainReason::NoProvider => false,
-            AbstainReason::Timeout | AbstainReason::Unusable | AbstainReason::Unsupported => true,
+            AbstainReason::EgressRefused | AbstainReason::NoProvider | AbstainReason::Unusable => {
+                false
+            }
+            AbstainReason::Timeout | AbstainReason::Unavailable | AbstainReason::Unsupported => {
+                true
+            }
         }
     }
 }
@@ -579,9 +606,9 @@ pub fn construct(
         DecisionFallback::Generative => {
             let secondary = generative.ok_or_else(|| {
                 anyhow!(
-                    "[decision].fallback = \"{}\" needs a generative [llm] backend to fall back \
-                     to, and none is configured",
-                    DecisionFallback::Generative.as_str()
+                    "a generative fallback is configured but no generative [llm] backend \
+                     exists to fall back to: {}",
+                    fallback_phrase(DecisionFallback::Generative)
                 )
             })?;
             Ok(Box::new(FallbackChain::new(primary, secondary)))
@@ -657,16 +684,39 @@ mod tests {
     }
 
     #[test]
-    fn an_egress_refusal_never_falls_back_but_a_timeout_does() {
+    fn a_refusal_and_a_decline_never_fall_back_but_unavailability_does() {
         assert!(
             !FallbackChain::may_fall_back(AbstainReason::EgressRefused),
             "a refused destination must not be reachable via a second endpoint"
         );
         assert!(!FallbackChain::may_fall_back(AbstainReason::NoProvider));
-        // PRESENCE control on the same predicate.
+        assert!(
+            !FallbackChain::may_fall_back(AbstainReason::Unusable),
+            "#3806 W2 case 3: the provider ANSWERED and declined, so the question is \
+             terminal — re-asking it of a second model manufactures a definite answer \
+             out of a deliberate refusal"
+        );
+        // PRESENCE control on the same predicate: every UNAVAILABILITY
+        // does fall back, so the three refusals above are a property of
+        // those reasons and not of a predicate that always says no.
         assert!(FallbackChain::may_fall_back(AbstainReason::Timeout));
-        assert!(FallbackChain::may_fall_back(AbstainReason::Unusable));
+        assert!(FallbackChain::may_fall_back(AbstainReason::Unavailable));
         assert!(FallbackChain::may_fall_back(AbstainReason::Unsupported));
+        // The two classes partition the enum, with no third answer.
+        for reason in [
+            AbstainReason::NoProvider,
+            AbstainReason::Timeout,
+            AbstainReason::EgressRefused,
+            AbstainReason::Unavailable,
+            AbstainReason::Unusable,
+            AbstainReason::Unsupported,
+        ] {
+            assert_eq!(
+                reason.is_unavailable(),
+                reason != AbstainReason::Unusable,
+                "`Unusable` is the ONLY decline: {reason}"
+            );
+        }
     }
 
     #[test]

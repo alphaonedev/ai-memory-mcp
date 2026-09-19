@@ -1,0 +1,407 @@
+// Copyright 2026 AlphaOne LLC
+// SPDX-License-Identifier: Apache-2.0
+//! #3806 W2 — the first two DECISION SEAMS, and the only place a gated
+//! decider is attached to a surface.
+//!
+//! ## What a seam is
+//!
+//! A seam is a call position where the substrate already asks a model a
+//! question whose answer is a DECISION over a closed vocabulary. W1a-W1c
+//! built the typed answer ([`crate::decision`]), the boot chokepoint
+//! ([`crate::decision_boot`]) and the clients
+//! ([`crate::decision_clients`]); until this unit nothing consumed any of
+//! them. This module is what consumes them, for the two lowest-risk
+//! positions:
+//!
+//! * `classify_kind` — a 16-way closed choice that a prompt naming
+//!   **8** of the 16 [`MemoryKind`] variants had been answering;
+//! * `detect_contradiction` — a yes/no judgement that
+//!   `answer.starts_with("yes")` had been answering, so a refusal
+//!   ("I'm sorry, I can't help with that"), a preamble ("Yes, because
+//!   …" on a model that then argues itself to no) and a hedge all
+//!   became a VERDICT.
+//!
+//! ## THE THREE CASES (Conductor ruling, 2026-09-19 — binding)
+//!
+//! `[decision].fallback` governs **unavailability, not abstention.**
+//! That distinction is the whole unit, so it is an executable invariant
+//! ([`AbstainReason::is_unavailable`]) and not a comment:
+//!
+//! **Case 1 — `[decision]` UNSET.** The v1.0.0 path runs entirely, text
+//! parse and all. No handle is attached, the seam returns
+//! [`SeamOutcome::RunLegacy`], nothing else in this module executes and
+//! no metric series is created. That is what byte-identical means, and
+//! it is correct: the feature is off.
+//!
+//! **Case 2 — `[decision]` SET, provider UNAVAILABLE.** No provider
+//! constructed, egress refused, timeout, transport error, non-2xx
+//! status. The provider never answered, so falling back to the
+//! instrument used before is legitimate, and this is exactly what
+//! `fallback` governs:
+//!
+//! | `fallback` | case 2 ⇒ the seam |
+//! |---|---|
+//! | `abstain` (default) | conservative NON-ACTION branch |
+//! | `generative` | [`SeamOutcome::RunLegacy`] — the old path |
+//! | `refuse` | `Err`, naming the abstain reason |
+//!
+//! **Case 3 — `[decision]` SET, provider ABSTAINED.** The provider DID
+//! answer, and its answer was "I decline" — a refusal, a preamble, a
+//! hedge, a label outside the closed vocabulary. **That is terminal.**
+//! The seam takes its conservative branch, the question is never
+//! re-asked, and `fallback` does not apply because there is nothing to
+//! fall back FROM.
+//!
+//! Case 3 is the reason this unit exists. Re-asking the same model the
+//! same question and then reading the reply with `starts_with("yes")`
+//! would reintroduce the exact defect W2 removes — and do something
+//! worse than the original, because it would manufacture a definite
+//! answer out of a deliberate refusal. An abstain is information, not an
+//! absence of information. Overriding it with a weaker reader is how a
+//! system learns to be confidently wrong. The same reasoning bars the
+//! provider-level chain from re-asking
+//! ([`crate::decision_clients::FallbackChain::may_fall_back`]), so a
+//! decline costs exactly ONE model call and never two.
+//!
+//! The conservative branch is a non-action, never a fabricated verdict:
+//! `classify_kind` keeps the caller's existing kind (`Ok(None)` — the
+//! abstain this API has always had), and `detect_contradiction` asserts
+//! NO contradiction edge (`Ok(false)` — the same non-action its F-L1
+//! subject-overlap pre-check has always taken). Neither deletes anything,
+//! neither widens a destructive path, and the two are distinguishable on
+//! the wire because [`crate::metrics::record_decision`] labels the
+//! outcome (`abstained` / `timeout` / `egress_refused` / `fallback` /
+//! `decided`) rather than leaving "no opinion" indistinguishable from
+//! "decided no".
+//!
+//! An EGRESS REFUSAL is case 2 at the SEAM (the `[llm]` lane passed its
+//! own #1963 boot gate, and under `deny` there is no `[llm]` client to
+//! reach at all) and terminal INSIDE the decision plane (the chain never
+//! answers a refused destination from a second endpoint). Those are two
+//! different questions about two different clients, and the answers
+//! differ for that reason.
+//!
+//! ## Attachment — the chokepoint monopoly in code
+//!
+//! [`attach_decider`] is the ONLY function that turns a
+//! [`crate::decision_boot::DecisionProviderHandle`] into something a
+//! seam can reach, and it obtains that handle from the boot chokepoint
+//! and nowhere else. It runs the chokepoint EXACTLY once per surface —
+//! whether or not that surface has an `[llm]` client — because the
+//! `/capabilities` snapshot and the signed egress-refusal row are boot
+//! effects of the DECISION lane and must not become conditional on the
+//! chat lane. The three surfaces that can reach a seam call it:
+//! the HTTP daemon (`daemon_runtime::bootstrap_serve`), the MCP stdio
+//! surface and its between-request reload
+//! (`reload::resolve_and_build_mcp_llm`), and the CLI one-shot curator
+//! (`cli::curator::build_curator_llm`).
+//!
+//! `cli/commands/expand.rs` and `cli/commands/atomise.rs` are
+//! deliberately NOT routed: their clients reach `expand_query` and
+//! `Curator::decompose`, neither of which is a seam, so routing them
+//! would construct a decision provider nothing consumes and (under
+//! `deny`) write a refusal row per CLI invocation. That exclusion is
+//! named here rather than left implicit, and
+//! `tests/decision_unset_byte_identical_3806.rs` pins the routed set in
+//! both directions.
+//!
+//! ## The reference cycle, made unrepresentable
+//!
+//! `fallback = "generative"` needs a decider holding an
+//! `Arc<OllamaClient>`. If that were the same client the handle is
+//! attached to, the graph would be
+//! `client -> seams -> handle -> FallbackChain -> decider -> client`:
+//! a leak. [`attach_decider`] hands the fallback a RETARGETED clone
+//! ([`OllamaClient::with_model`] — shared reqwest pool, fresh breaker,
+//! no second `/api/tags` probe), and `with_model` deliberately does not
+//! copy the decider field. The cycle is therefore unrepresentable rather
+//! than avoided by call order.
+
+use std::path::Path;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use anyhow::{Result, anyhow};
+
+use crate::config::AppConfig;
+use crate::decision::{AbstainReason, Decision, DecisionSource};
+use crate::decision_boot::{DecisionProviderHandle, build_decision_provider};
+use crate::decision_clients::calibration::CalibrationSeam;
+use crate::decision_config::{DecisionFallback, fallback_phrase};
+use crate::llm::OllamaClient;
+use crate::models::MemoryKind;
+
+/// Slack added to `[decision].timeout_secs` when a SYNC seam crosses the
+/// sync->async bridge. The provider enforces the operator's budget
+/// itself; this is only the bridge's own ceiling, so a provider that
+/// honours its deadline always reports [`AbstainReason::Timeout`]
+/// rather than being cut off by the bridge with a less specific error.
+const SEAM_BRIDGE_SLACK: Duration = Duration::from_secs(1);
+
+/// `decision_outcome` label values. A CLOSED set: every
+/// [`Decision`] maps onto exactly one of these, so the metric's
+/// cardinality is bounded by construction (4 seams x 5 outcomes).
+mod outcome {
+    /// The decision model answered.
+    pub(super) const DECIDED: &str = "decided";
+    /// The generative fallback answered in its place.
+    pub(super) const FALLBACK: &str = "fallback";
+    /// The per-call budget elapsed.
+    pub(super) const TIMEOUT: &str = "timeout";
+    /// The egress posture refused the outbound call.
+    pub(super) const EGRESS_REFUSED: &str = "egress_refused";
+    /// No opinion for any other reason (no provider, unusable answer,
+    /// unsupported question).
+    pub(super) const ABSTAINED: &str = "abstained";
+}
+
+/// What a seam should do with the decider's answer.
+///
+/// Three arms, not two, because "there is no decider" and "the decider
+/// had no opinion" are different facts with different correct
+/// behaviours — collapsing them is how `[decision]` unset would stop
+/// being byte-identical.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SeamOutcome<T> {
+    /// A verdict. Use it; do not consult any text parse.
+    Decided(T),
+    /// No decider is attached (`[decision]` unset, or the chokepoint
+    /// refused to build one). Run the v1.0.0 body UNCHANGED.
+    RunLegacy,
+    /// A decider is attached and produced no verdict. Take the seam's
+    /// conservative non-action branch.
+    Conservative,
+}
+
+/// The gated decision seams a surface carries.
+///
+/// A thin, deliberately opaque wrapper: it exists so `src/llm.rs` can
+/// hold the attachment without naming
+/// [`crate::decision_boot::DecisionProviderHandle`], which keeps the
+/// handle type's reviewed file list to the chokepoint that defines it
+/// and the module that consumes it.
+#[derive(Debug)]
+pub struct DecisionSeams {
+    handle: DecisionProviderHandle,
+}
+
+impl DecisionSeams {
+    /// Wrap an ALREADY-GATED handle. Crate-private, and the only caller
+    /// is [`attach_decider`] — which obtains its handle from the boot
+    /// chokepoint and has no other way to get one.
+    fn from_handle(handle: DecisionProviderHandle) -> Self {
+        Self { handle }
+    }
+
+    /// The whole-call ceiling for a seam that must cross the
+    /// sync->async bridge.
+    fn bridge_budget(&self) -> Duration {
+        self.handle.timeout().saturating_add(SEAM_BRIDGE_SLACK)
+    }
+
+    /// What this seam does when the decider produced no verdict — the
+    /// module header's cases 2 and 3, as executable logic.
+    ///
+    /// # Errors
+    /// Under `fallback = "refuse"` AND case 2 only: the operator asked
+    /// for the operation to fail when the decision instrument is
+    /// unavailable. A DECLINE is never an error, because the instrument
+    /// worked and gave its answer.
+    fn on_abstain<T>(&self, reason: AbstainReason) -> Result<SeamOutcome<T>> {
+        // CASE 3 — the provider ANSWERED and declined. Terminal, under
+        // EVERY posture: `fallback` governs unavailability, not
+        // abstention, and there is nothing here to fall back from.
+        if !reason.is_unavailable() {
+            return Ok(SeamOutcome::Conservative);
+        }
+        // CASE 2 — the provider never answered. `fallback` governs.
+        match self.handle.fallback() {
+            DecisionFallback::Refuse => Err(anyhow!(
+                "the decision provider was unavailable ({reason}) and this deployment \
+                 refuses to proceed without a decision: {} (#3806)",
+                fallback_phrase(DecisionFallback::Refuse)
+            )),
+            // The old instrument, exactly as v1.0.0 ran it.
+            DecisionFallback::Generative => Ok(SeamOutcome::RunLegacy),
+            DecisionFallback::Abstain => Ok(SeamOutcome::Conservative),
+        }
+    }
+}
+
+/// The `decision_outcome` label for an ABSTAIN. Total over
+/// [`AbstainReason`], so no abstain can go unlabelled.
+fn outcome_for_reason(reason: AbstainReason) -> &'static str {
+    match reason {
+        AbstainReason::Timeout => outcome::TIMEOUT,
+        AbstainReason::EgressRefused => outcome::EGRESS_REFUSED,
+        AbstainReason::NoProvider
+        | AbstainReason::Unavailable
+        | AbstainReason::Unusable
+        | AbstainReason::Unsupported => outcome::ABSTAINED,
+    }
+}
+
+/// The `decision_outcome` label for one answer. Total over
+/// [`Decision`], so no answer can go unlabelled.
+fn outcome_of<T>(decision: &Decision<T>) -> &'static str {
+    match decision.abstain_reason() {
+        None => match decision.source() {
+            DecisionSource::GenerativeFallback => outcome::FALLBACK,
+            DecisionSource::DecisionModel | DecisionSource::Deterministic => outcome::DECIDED,
+        },
+        Some(reason) => outcome_for_reason(reason),
+    }
+}
+
+/// Record one seam call.
+///
+/// `outcome` is passed rather than derived, so the label is always the
+/// one the seam ACTED on: a decided answer the seam could not use
+/// degrades to an abstain, and the metric must degrade with it. A
+/// series that claims a decision the seam did not take is worse than no
+/// series at all.
+///
+/// Both series are created lazily by the first observation, so an
+/// unconfigured deployment's `/metrics` gains nothing — which is half of
+/// "unset is byte-identical".
+fn record(
+    seam: CalibrationSeam,
+    outcome: &'static str,
+    reason: Option<AbstainReason>,
+    started: Instant,
+) {
+    crate::metrics::record_decision(
+        seam.as_str(),
+        outcome,
+        reason.map(AbstainReason::as_str),
+        started.elapsed().as_secs_f64(),
+    );
+}
+
+/// The closed vocabulary `classify_kind` chooses over: EVERY
+/// [`MemoryKind`] variant, derived from [`MemoryKind::all`] so a
+/// variant added later cannot silently fall out of the option set the
+/// way the 8-of-16 prompt did.
+fn kind_options() -> Vec<&'static str> {
+    MemoryKind::all().iter().map(MemoryKind::as_str).collect()
+}
+
+/// #3806 W2 seam 1 — `classify_kind` as a closed 16-way CHOICE.
+///
+/// Returns [`SeamOutcome::RunLegacy`] when no decider is attached, so
+/// `[decision]` unset runs the v1.0.0 generative classifier unchanged.
+///
+/// # Errors
+/// Only under `fallback = "refuse"`, and only on an abstain.
+pub(crate) fn classify_kind(
+    client: &OllamaClient,
+    title: &str,
+    content: &str,
+) -> Result<SeamOutcome<MemoryKind>> {
+    let Some(seams) = client.decider() else {
+        return Ok(SeamOutcome::RunLegacy);
+    };
+    let options = kind_options();
+    let prompt = crate::llm::classify_kind_prompt(title, content);
+    let started = Instant::now();
+    // The provider enforces `[decision].timeout_secs` itself; the bridge
+    // budget is the outer ceiling for the sync call position. A bridge
+    // failure is an ABSTAIN, never a guess.
+    let decision = crate::llm::block_on_local_bounded(seams.bridge_budget(), || {
+        seams.handle.provider().choose(&prompt, &options)
+    })
+    .unwrap_or_else(|_| Decision::abstain(AbstainReason::Timeout, DecisionSource::Deterministic));
+
+    // The client returns the VOCABULARY's spelling, so this parse cannot
+    // fail for a decided answer; if it somehow did, an unmappable label
+    // DEGRADES to an abstain rather than becoming a wrong kind — and is
+    // RECORDED as one, because a metric that claims a decision the seam
+    // did not take is exactly the confusion these series exist to end.
+    if let Some(kind) = decision.chosen().and_then(MemoryKind::from_str) {
+        record(
+            CalibrationSeam::ClassifyKind,
+            outcome_of(&decision),
+            None,
+            started,
+        );
+        return Ok(SeamOutcome::Decided(kind));
+    }
+    let reason = decision.abstain_reason().unwrap_or(AbstainReason::Unusable);
+    record(
+        CalibrationSeam::ClassifyKind,
+        outcome_for_reason(reason),
+        Some(reason),
+        started,
+    );
+    seams.on_abstain(reason)
+}
+
+/// #3806 W2 seam 2 — `detect_contradiction` as a yes/no JUDGEMENT.
+///
+/// This is the call position `answer.starts_with("yes")` used to answer.
+/// With a decider attached the verdict comes from a strictly parsed,
+/// closed-vocabulary answer and a refusal / preamble / hedge is an
+/// ABSTAIN; the loose parse is reachable only when `[decision]` is
+/// unset, where it is the v1.0.0 behaviour this unit must not change.
+///
+/// # Errors
+/// Only under `fallback = "refuse"`, and only on an abstain.
+pub(crate) async fn judge_contradiction(
+    client: &OllamaClient,
+    prompt: &str,
+) -> Result<SeamOutcome<bool>> {
+    let Some(seams) = client.decider() else {
+        return Ok(SeamOutcome::RunLegacy);
+    };
+    let started = Instant::now();
+    let decision = seams.handle.provider().judge(prompt).await;
+
+    if let Some(verdict) = decision.verdict() {
+        record(
+            CalibrationSeam::DetectContradiction,
+            outcome_of(&decision),
+            None,
+            started,
+        );
+        return Ok(SeamOutcome::Decided(verdict));
+    }
+    let reason = decision.abstain_reason().unwrap_or(AbstainReason::Unusable);
+    record(
+        CalibrationSeam::DetectContradiction,
+        outcome_for_reason(reason),
+        Some(reason),
+        started,
+    );
+    seams.on_abstain(reason)
+}
+
+/// Run the boot chokepoint for this surface and attach the resulting
+/// gated decider to its `[llm]` client.
+///
+/// Called EXACTLY once per surface, and unconditionally — the chokepoint
+/// records the `/capabilities` snapshot and (under a refusing posture)
+/// the signed refusal row whether or not `llm` is `Some`, so those boot
+/// effects never become a function of the chat lane's availability.
+///
+/// Returns `llm` unchanged when `[decision]` is unset or the chokepoint
+/// refused to build a provider: the surface then has no decider, every
+/// seam returns [`SeamOutcome::RunLegacy`], and behaviour is v1.0.0.
+#[must_use]
+pub fn attach_decider(
+    llm: Option<OllamaClient>,
+    cfg: &AppConfig,
+    db_path: &Path,
+) -> Option<OllamaClient> {
+    let Some(handle) = build_decision_provider(cfg, db_path).into_handle() else {
+        return llm;
+    };
+    // A RETARGETED clone, not this client: see the module header's
+    // "reference cycle" section. `with_model` shares the reqwest pool,
+    // takes a fresh breaker and does NOT copy the decider field.
+    let generative = llm
+        .as_ref()
+        .map(|client| Arc::new(client.with_model(client.model_name())));
+    let endpoint = cfg.resolve_llm(None, None, None).base_url;
+    let handle = handle.attach_client(generative, &endpoint);
+    llm.map(|client| client.with_decider(Arc::new(DecisionSeams::from_handle(handle))))
+}

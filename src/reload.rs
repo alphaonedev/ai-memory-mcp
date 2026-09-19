@@ -225,6 +225,28 @@ pub fn resolve_and_build_mcp_llm(
     db_path: &Path,
     verbose_banner: bool,
 ) -> Option<Arc<OllamaClient>> {
+    // #3806 W2 — the MCP stdio surface (and its between-request reload)
+    // goes through the SAME boot chokepoint as the HTTP daemon, so a
+    // decision endpoint cannot come into existence on this surface
+    // without passing the inference-plane egress gate. The chokepoint
+    // runs whether or not the `[llm]` client below was built.
+    crate::decision_seams::attach_decider(
+        build_mcp_llm_client(app_config, tier_config, db_path, verbose_banner),
+        app_config,
+        db_path,
+    )
+    .map(Arc::new)
+}
+
+/// The `[llm]` half of [`resolve_and_build_mcp_llm`]. Split out so the
+/// decision chokepoint above runs on EVERY return path of this function,
+/// including the several that disable the client.
+fn build_mcp_llm_client(
+    app_config: &AppConfig,
+    tier_config: &TierConfig,
+    db_path: &Path,
+    verbose_banner: bool,
+) -> Option<OllamaClient> {
     let resolved_llm = app_config.resolve_llm(None, None, None);
 
     // v1.0.0 #1963 (R68/D14) — inference-plane egress gate. On refuse the
@@ -296,10 +318,10 @@ pub fn resolve_and_build_mcp_llm(
                     }
                     None
                 } else {
-                    Some(Arc::new(client))
+                    Some(client)
                 }
             } else {
-                Some(Arc::new(client))
+                Some(client)
             }
         }
         Ok(None) => {
@@ -376,7 +398,14 @@ pub async fn reload_http_llm(
     // Reuse the boot builder so the egress gate re-evaluation + provenance
     // logging come for free. A reload may legitimately resolve to `None`
     // (egress deny, tier change) — `None` swaps in and disables the client.
-    let rebuilt = crate::daemon_runtime::build_llm_client(feature_tier, &cfg, db_path).await;
+    // #3806 W2 — a SIGHUP reload re-runs the decision chokepoint too, so
+    // a posture or `[decision]` change takes effect without a restart and
+    // the hot-swapped client carries the gated decider (or none).
+    let rebuilt = crate::decision_seams::attach_decider(
+        crate::daemon_runtime::build_llm_client(feature_tier, &cfg, db_path).await,
+        &cfg,
+        db_path,
+    );
     let disabled = rebuilt.is_none();
     llm.store(rebuilt);
     models.store(refresh_llm_model_surface(&models.current(), &cfg));

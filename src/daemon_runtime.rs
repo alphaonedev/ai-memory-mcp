@@ -6700,18 +6700,18 @@ pub async fn bootstrap_serve(
     // `llm_model` (keyword/semantic) or the Ollama endpoint is
     // unreachable, the client stays `None` and the hook silently
     // degrades to operator-supplied tags only.
-    let llm = build_llm_client(feature_tier, app_config, db_path).await;
-
-    // #3806 W1b — the `[decision]` boot chokepoint, mirroring the gate
-    // above one inference endpoint over: under `deny` (or loopback-only
-    // against a remote target) NO decision provider is constructed and a
-    // signed refusal row is written. `[decision]` unset returns `Absent`
-    // without resolving or opening anything (byte-identical v1.0.0). The
-    // handle is dropped because no seam consumes one yet (W2-W4); the two
-    // boot effects that matter now are recorded by the call itself.
-    drop(crate::decision_boot::build_decision_provider(
-        app_config, db_path,
-    ));
+    // #3806 W2 — the `[decision]` boot chokepoint runs here, exactly
+    // once, and its gated decider is ATTACHED to the client this
+    // surface's seams reach. `attach_decider` runs the chokepoint
+    // whether or not an `[llm]` client exists, so the `/capabilities`
+    // snapshot and the signed egress-refusal row W1b introduced are
+    // recorded exactly as before. `[decision]` unset returns the client
+    // untouched and both seams run their v1.0.0 bodies.
+    let llm = crate::decision_seams::attach_decider(
+        build_llm_client(feature_tier, app_config, db_path).await,
+        app_config,
+        db_path,
+    );
 
     let db_state: Db = Arc::new(Mutex::new((
         conn,

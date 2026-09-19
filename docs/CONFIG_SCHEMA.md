@@ -647,7 +647,7 @@ fallback     = "abstain"
 | `base_url` | for `openai-compatible` and `systemone` | the alias default, or `[llm].base_url` when the provider matches | REFUSED for `local-nli` (it opens no socket). |
 | `api_key_env` / `api_key_file` | no | per-vendor env chain | Mutually exclusive. Inline `api_key` is REJECTED at parse time, as for `[llm]`. REFUSED for `local-nli`. |
 | `timeout_secs` | no | `2` | `0` is refused. A timeout is an **abstain**, never a `false`. |
-| `fallback` | no | `abstain` | `abstain` \| `generative` \| `refuse`. |
+| `fallback` | no | `abstain` | `abstain` \| `generative` \| `refuse`. **`fallback` governs UNAVAILABILITY, not abstention**: it decides what happens when the decision provider could not answer, never what happens when it answered and declined. |
 
 **Unset `[decision]` is byte-identical v1.0.0 behaviour**: there is no
 provider, every seam consults the always-abstaining `NullDecider`, and
@@ -737,6 +737,78 @@ fallback leg.
 
 Model-class advice, the air-gap ladder and the hosted-route census land
 with the rest of the `[decision]` documentation (#3806 W6).
+
+#### What the seams do with an answer (#3806 W2)
+
+Two call positions consult the decider today: `classify_kind` (a closed
+choice over **all sixteen** `MemoryKind` variants — the v1.0.0 prompt
+named eight of them) and `detect_contradiction` (a yes/no judgement that
+`answer.starts_with("yes")` used to decide, so a refusal, a preamble and
+a hedge all became a verdict).
+
+**`fallback` governs UNAVAILABILITY, not abstention.** There are three
+cases, and only the middle one is `fallback`'s business:
+
+**1. `[decision]` unset.** The v1.0.0 path runs entirely, text parse and
+all. The feature is off; that is what byte-identical means.
+
+**2. `[decision]` set, provider UNAVAILABLE** — no provider constructed,
+egress refused, timeout, transport error, non-2xx status. The provider
+never answered, so falling back to the instrument used before is
+legitimate, and this is what `fallback` selects:
+
+| `fallback` | case 2 ⇒ the seam |
+|---|---|
+| `abstain` (default) | takes its conservative NON-ACTION branch |
+| `generative` | the old path — the `[llm]` model answers |
+| `refuse` | fails the operation, naming the reason |
+
+**3. `[decision]` set, provider ABSTAINED** — it answered, and its answer
+was "I decline": a refusal, a preamble, a hedge, a label outside the
+closed vocabulary. **That is terminal.** The seam takes its conservative
+NON-ACTION branch, the question is never re-asked by anything, and
+`fallback` does not apply — including `refuse`, which is about an
+unavailable instrument and not about an instrument that gave its answer.
+
+Case 3 is the point of the feature. Re-asking the same question of a
+weaker reader would manufacture a definite answer out of a deliberate
+refusal — worse than the `starts_with("yes")` defect, not a milder
+version of it. An abstain is information, not an absence of information.
+
+So **configuring `[decision]` is what takes the loose text parse out of
+the verdict path.** Under `fallback = "generative"` the `[llm]` model is
+still consulted when the decider is unavailable, but through the strict
+closed-vocabulary parser: prose from it is an abstain too.
+
+The conservative branch is a NON-ACTION, never a fabricated verdict:
+`classify_kind` keeps the caller's existing kind, and
+`detect_contradiction` asserts no contradiction edge. Neither deletes
+anything and neither widens a destructive path. An abstain is
+distinguishable from a decided verdict on the wire — see
+`ai_memory_decision_outcome_total` in `docs/telemetry.md` — so "no
+opinion" never looks like "decided no".
+
+**Case 2 and case 3 are distinguishable on the wire too**, which is what
+lets you alert on one and not the other:
+`ai_memory_decision_abstain_total{seam,reason}` carries
+`reason="unavailable"` for an outage and `reason="unusable"` for a model
+that answered and declined. Page on the first; the second is the feature
+working.
+
+An **egress refusal** is case 2 at the seam: the `[llm]` lane passed its
+own egress gate at boot, and under `egress = "deny"` there is no `[llm]`
+client to reach at all. Inside the decision plane it is terminal — the
+provider chain never answers a refused destination from a second
+endpoint, so `fallback` can never become an egress bypass. It is counted
+as `outcome="egress_refused"`.
+
+Every surface that can reach a seam obtains its decider from the ONE
+boot chokepoint: the HTTP daemon, the MCP stdio surface (and its
+between-request reload), and the CLI one-shot curator. `ai-memory
+expand` and `ai-memory atomise` are deliberately not routed — their
+clients reach no seam, so wiring them would construct a provider nothing
+consumes. `tests/decision_unset_byte_identical_3806.rs` pins that list in
+both directions.
 
 ## Migration from v0.6.x (legacy flat fields)
 

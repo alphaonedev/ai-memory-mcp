@@ -806,6 +806,11 @@ pub mod decision_config;
 // (the #3808 defect class). Also owns the per-call `check_outbound`
 // hook and the `/capabilities` boot snapshot.
 pub mod decision_boot;
+// v1.0.0 #3806 W2 — the decision SEAMS: the two call positions that
+// consult a decider, and the ONLY place a gated handle is attached to a
+// surface. Every seam degrades to the v1.0.0 body when `[decision]` is
+// unset, so an unconfigured deployment cannot tell this module exists.
+pub mod decision_seams;
 pub mod durability;
 /// Durability evidence carried by write receipts (#3555).
 pub mod write_receipt;
