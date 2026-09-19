@@ -795,6 +795,12 @@ pub mod decision;
 /// #3806 — the `[decision]` config section, resolver and parse-time
 /// refusals (kept out of `config.rs`, which is at its QUAL-10 ceiling).
 pub mod decision_config;
+// v1.0.0 #3806 W1b — the `[decision]` boot chokepoint: the ONLY
+// construction site for a decision-provider handle, so the
+// inference-plane egress gate cannot be bypassed by a second endpoint
+// (the #3808 defect class). Also owns the per-call `check_outbound`
+// hook and the `/capabilities` boot snapshot.
+pub mod decision_boot;
 pub mod durability;
 /// Durability evidence carried by write receipts (#3555).
 pub mod write_receipt;
