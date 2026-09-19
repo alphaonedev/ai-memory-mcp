@@ -1167,10 +1167,10 @@ async fn recall_response(
                 resp[field_names::BUDGET_TOKENS] = json!(b);
                 // Phase P6 (R1) meta block — same shape as the MCP path.
                 resp["meta"] = json!({
-                    "budget_tokens_used": outcome.tokens_used,
-                    "budget_tokens_remaining": outcome.tokens_remaining.unwrap_or(0),
+                    (field_names::BUDGET_TOKENS_USED): outcome.tokens_used,
+                    (field_names::BUDGET_TOKENS_REMAINING): outcome.tokens_remaining.unwrap_or(0),
                     (field_names::MEMORIES_DROPPED): outcome.memories_dropped,
-                    "budget_overflow": outcome.budget_overflow,
+                    (field_names::BUDGET_OVERFLOW): outcome.budget_overflow,
                 });
             }
             // F-L8a — always surface the MEASURED semantic-withheld block

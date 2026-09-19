@@ -145,6 +145,24 @@ pub fn memories_to_toon(response: &Value, compact: bool) -> String {
     if let Some(budget) = response.get(field_names::BUDGET_TOKENS) {
         meta.push(format!("budget_tokens:{budget}"));
     }
+    // #3802: a budget-truncated recall must be distinguishable from a
+    // small result on the DEFAULT wire format. The recall handler files
+    // the truncation verdict under the nested `meta` object
+    // (`memories_dropped` / `budget_overflow` / `budget_tokens_remaining`,
+    // `src/mcp/tools/recall.rs::decorate_budget`); before this fix the
+    // TOON renderer discarded that object and only the JSON twin of the
+    // same call could show four of five memories were withheld.
+    if let Some(budget_meta) = response.get("meta").and_then(Value::as_object) {
+        for key in [
+            field_names::MEMORIES_DROPPED,
+            field_names::BUDGET_OVERFLOW,
+            field_names::BUDGET_TOKENS_REMAINING,
+        ] {
+            if let Some(value) = budget_meta.get(key) {
+                meta.push(format!("{key}:{value}"));
+            }
+        }
+    }
     if !meta.is_empty() {
         out.push_str(&meta.join("|"));
         out.push('\n');
@@ -684,6 +702,72 @@ mod tests {
         let toon = memories_to_toon(&resp, true);
         assert!(toon.contains("tokens_used:100"));
         assert!(toon.contains("budget_tokens:500"));
+    }
+
+    // #3802 — the nested recall `meta` budget block reaches the TOON meta
+    // line for both projections, and its absence leaves the line unchanged.
+    #[test]
+    fn issue_3802_meta_line_carries_budget_truncation_verdict() {
+        let truncated = json!({
+            "memories": [{"id": "a", "title": "t1"}],
+            "count": 1,
+            "mode": "hybrid",
+            "tokens_used": 34,
+            "budget_tokens": 60,
+            "meta": {
+                "budget_tokens_used": 34,
+                "budget_tokens_remaining": 26,
+                "memories_dropped": 4,
+                "budget_overflow": false,
+            },
+        });
+        for compact in [true, false] {
+            let toon = memories_to_toon(&truncated, compact);
+            let meta_line = toon.lines().next().unwrap_or_default();
+            assert_eq!(
+                meta_line,
+                "count:1|mode:hybrid|tokens_used:34|budget_tokens:60\
+                 |memories_dropped:4|budget_overflow:false|budget_tokens_remaining:26",
+                "compact={compact}: {toon}"
+            );
+        }
+
+        let untruncated = json!({
+            "memories": [{"id": "a", "title": "t1"}],
+            "count": 1,
+            "mode": "hybrid",
+            "tokens_used": 34,
+            "budget_tokens": 600,
+            "meta": {
+                "budget_tokens_used": 34,
+                "budget_tokens_remaining": 566,
+                "memories_dropped": 0,
+                "budget_overflow": false,
+            },
+        });
+        let toon = memories_to_toon(&untruncated, true);
+        assert!(
+            toon.starts_with(
+                "count:1|mode:hybrid|tokens_used:34|budget_tokens:600|memories_dropped:0|"
+            ),
+            "{toon}"
+        );
+
+        // No budget supplied: the recall handler emits no budget block and
+        // the meta line stays exactly as before #3802.
+        let no_budget = json!({
+            "memories": [{"id": "a", "title": "t1"}],
+            "count": 1,
+            "mode": "hybrid",
+            "tokens_used": 34,
+            "meta": {"reranker": "lexical"},
+        });
+        let toon = memories_to_toon(&no_budget, true);
+        assert_eq!(
+            toon.lines().next(),
+            Some("count:1|mode:hybrid|tokens_used:34"),
+            "{toon}"
+        );
     }
 
     #[test]

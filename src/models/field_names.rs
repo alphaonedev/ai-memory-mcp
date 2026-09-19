@@ -147,8 +147,15 @@ pub const SESSION_ID: &str = "session_id";
 /// `version_vector` — per-memory CRDT vector-clock metadata key (#1756 /
 /// #1719 item 2). Lives inside `metadata`; merged by pointwise-max.
 pub const VERSION_VECTOR: &str = "version_vector";
+/// `budget_overflow` — wire/row field name (#3802: the recall `meta`
+/// budget block, mirrored onto the TOON meta line).
+pub const BUDGET_OVERFLOW: &str = "budget_overflow";
 /// `budget_tokens` — wire/row field name.
 pub const BUDGET_TOKENS: &str = "budget_tokens";
+/// `budget_tokens_remaining` — wire/row field name (#3802).
+pub const BUDGET_TOKENS_REMAINING: &str = "budget_tokens_remaining";
+/// `budget_tokens_used` — wire/row field name (#3802).
+pub const BUDGET_TOKENS_USED: &str = "budget_tokens_used";
 /// `by_namespace` — wire/row field name.
 pub const BY_NAMESPACE: &str = "by_namespace";
 /// `by_source_uri` — wire/row field name.

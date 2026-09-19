@@ -9,7 +9,7 @@ use crate::mcp::param_names;
 use crate::mcp::registry::McpTool;
 use crate::models::{
     AttestLevel, CandidateCounts, ConfidenceTier, Memory, MemoryKind, RecallMeta, RecallTelemetry,
-    SemanticWithheld,
+    SemanticWithheld, field_names,
 };
 use crate::observations;
 use crate::reranker::BatchedReranker;
@@ -758,7 +758,7 @@ pub fn decorate_memory_many(
             // insert-if-absent default (`identity::attest::stamp_claimed_if_absent`).
             let content_attestation = mem
                 .metadata
-                .get(crate::models::field_names::ATTEST_LEVEL)
+                .get(field_names::ATTEST_LEVEL)
                 .and_then(serde_json::Value::as_str)
                 .filter(|s| !s.is_empty())
                 .unwrap_or(crate::identity::verify::AttestLevel::Claimed.as_str());
@@ -1257,10 +1257,11 @@ pub fn handle_recall_dto(
                 .expect("recall response is always a JSON object")
                 .entry("meta".to_string())
                 .or_insert_with(|| json!({}));
-            meta["budget_tokens_used"] = json!(outcome.tokens_used);
-            meta["budget_tokens_remaining"] = json!(outcome.tokens_remaining.unwrap_or(0));
-            meta["memories_dropped"] = json!(outcome.memories_dropped);
-            meta["budget_overflow"] = json!(outcome.budget_overflow);
+            meta[field_names::BUDGET_TOKENS_USED] = json!(outcome.tokens_used);
+            meta[field_names::BUDGET_TOKENS_REMAINING] =
+                json!(outcome.tokens_remaining.unwrap_or(0));
+            meta[field_names::MEMORIES_DROPPED] = json!(outcome.memories_dropped);
+            meta[field_names::BUDGET_OVERFLOW] = json!(outcome.budget_overflow);
         }
     };
 

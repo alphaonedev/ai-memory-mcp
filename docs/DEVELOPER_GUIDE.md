@@ -458,6 +458,14 @@ count:3|mode:hybrid
 
 If there are no metadata fields, this line is omitted entirely.
 
+When a recall was issued with `budget_tokens`, the meta line also carries the budget verdict, in this order after `budget_tokens`: `memories_dropped` (rows that matched but were withheld to honour the budget), `budget_overflow` (`true` when even the first row did not fit), and `budget_tokens_remaining`. They are mirrored from the response's nested `meta` budget block, so the TOON line reports the SAME numbers as the JSON twin of the identical call (#3802 — before that fix the default `toon_compact` format rendered a budget-truncated recall as `count:1|mode:hybrid|tokens_used:34|budget_tokens:60`, indistinguishable from a recall that genuinely matched one row):
+
+```
+count:1|mode:hybrid|tokens_used:34|budget_tokens:60|memories_dropped:4|budget_overflow:false|budget_tokens_remaining:26
+```
+
+`memories_dropped:0` is emitted for an untruncated budgeted recall — the absence of truncation is stated, not implied. A recall issued without `budget_tokens` carries none of these keys.
+
 #### Header Line Syntax
 
 The header declares the array name followed by field names in square brackets, pipe-delimited, ending with a colon:
