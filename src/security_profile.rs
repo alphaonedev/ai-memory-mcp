@@ -81,6 +81,8 @@
 //! | `AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS` | *(unset)* | PERMISSIVE-shaped: the unenrolled-peer hatch of the already-pinned `REQUIRE_PEER_ENROLLMENT` is NOT in force (#3201) |
 //! | `AI_MEMORY_FED_CERT_PEER_BINDING` | `enforce` | mTLS cert↔`X-Peer-Id` cross-check mode is `enforce`; `off`/`warn` refuse boot. Inert without `AI_MEMORY_FED_CERT_PEER_BINDING_MAP`. The documented `standard` unset default stays `warn` (#3201 / #3289) |
 //! | `AI_MEMORY_UNSTAMPED_MUTATION` | `refuse` | a caller-scoped mutation of an UNSTAMPED (legacy-unowned) row is refused on every funnel of both backends; `warn` refuses boot. The documented `standard` default stays `warn` (#3124) |
+//! | `AI_MEMORY_STORE_URL_FILE_ALLOW_LAX_PERMS` | *(unset)* | PERMISSIVE-shaped: the store-url file lax-perms hatch is refused — a group/world-readable `AI_MEMORY_STORE_URL_FILE` is never silently accepted (#1927/#3813) |
+//! | `AI_MEMORY_AGENT_API_KEY_FILE_ALLOW_LAX_PERMS` | *(unset)* | PERMISSIVE-shaped: the per-agent api-key file lax-perms hatch is refused — a group/world-readable `AI_MEMORY_AGENT_API_KEY_FILE` is never silently accepted (#3781/#3813) |
 //!
 //! In addition, `asi-hard` forces the config-backed governance knob
 //! `[governance].require_operator_pubkey` to `true` (see
@@ -330,6 +332,16 @@ fn cert_peer_binding_meets_floor(v: &str) -> bool {
     v.trim().eq_ignore_ascii_case("enforce")
 }
 
+/// #3813 — floor for the two secret-FILE lax-perms hatches
+/// (`AI_MEMORY_STORE_URL_FILE_ALLOW_LAX_PERMS`,
+/// `AI_MEMORY_AGENT_API_KEY_FILE_ALLOW_LAX_PERMS`): the hatch is NOT in force.
+/// Both live readers arm the hatch through [`is_truthy`] (the #3200 grammar),
+/// so the floor is its inverse — a truthy token (which would accept a
+/// group/world-readable secret file) refuses `asi-hard` boot.
+fn lax_perms_hatch_meets_floor(v: &str) -> bool {
+    !is_truthy(v)
+}
+
 /// The pinned-knob table. SSOT for the module docs table above and the
 /// [`pinned_knobs`] accessor; the `asi_hard_pins_documented_set` test pins
 /// the two in agreement.
@@ -534,6 +546,20 @@ const KNOBS: &[KnobSpec] = &[
         hard_value: crate::identity::owner_stamp::MODE_REFUSE,
         meets_floor: unstamped_mutation_meets_floor,
     },
+    // #3813 — the two secret-FILE lax-perms escape hatches. PERMISSIVE-shaped:
+    // the hatch must be ABSENT/non-truthy under `asi-hard`, so a
+    // group/world-readable store-url file or per-agent api-key token file can
+    // never be silently accepted (a truthy token refuses boot, fail-loud).
+    KnobSpec {
+        env: crate::store_url::STORE_URL_FILE_ALLOW_LAX_PERMS_ENV,
+        hard_value: "",
+        meets_floor: lax_perms_hatch_meets_floor,
+    },
+    KnobSpec {
+        env: crate::cli::agents::AGENT_API_KEY_FILE_ALLOW_LAX_PERMS_ENV,
+        hard_value: "",
+        meets_floor: lax_perms_hatch_meets_floor,
+    },
 ];
 
 /// The number of env knobs `asi-hard` pins — ONE named SSOT for a count that
@@ -585,7 +611,7 @@ pub fn pinned_knobs() -> Vec<(&'static str, &'static str)> {
 /// [`enforce_at_boot`], which may only run in the synchronous
 /// pre-runtime phase of `fn main()` (#2386), this is safe to call from
 /// any live process (e.g. `ai-memory doctor --posture
-/// enterprise-federation`, which reuses this as ONE SSOT for the 28
+/// enterprise-federation`, which reuses this as ONE SSOT for the 30
 /// `asi-hard` pinned knobs rather than re-deriving the KNOBS table).
 ///
 /// Returns `(env, current_value, hard_value)` triples.
@@ -1593,7 +1619,7 @@ mod tests {
             return;
         }
         // v1.0.0 §5.3 cutline ruling — `enterprise_federation_posture`
-        // reuses this accessor as the SSOT for the 28-knob asi-hard set
+        // reuses this accessor as the SSOT for the 30-knob asi-hard set
         // rather than re-deriving KNOBS; pin its own read-only contract
         // directly (in addition to the exhaustive coverage the
         // `enterprise_federation_posture::tests` module gives it

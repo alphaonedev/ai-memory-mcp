@@ -20,7 +20,19 @@ use std::path::Path;
 const AGENT_API_KEY_FILE_ENV: &str = "AI_MEMORY_AGENT_API_KEY_FILE";
 /// Escape hatch for the strict-permission check on the api-key token file
 /// (mirrors `AI_MEMORY_CAPABILITY_FILE_ALLOW_LAX_PERMS`).
-const AGENT_API_KEY_FILE_ALLOW_LAX_PERMS_ENV: &str = "AI_MEMORY_AGENT_API_KEY_FILE_ALLOW_LAX_PERMS";
+// #3813: `pub` under test/test-support so the integration binary
+// tests/lax_perms_hatches_doctor_sink_3813.rs can name this const; `pub(crate)`
+// in production so the shipped surface is UNCHANGED. Not blanket `pub`: the
+// env-name const is a caller-dependable surface and only the test needs it wider,
+// and the const is production-used so it cannot be cfg-gated away (the
+// test_key_dir Option-2 shape). Its sibling STORE_URL_FILE_ALLOW_LAX_PERMS_ENV is
+// already blanket-pub; this reaches for the smaller widening per the #3783 order.
+#[cfg(any(test, feature = "test-support"))]
+pub const AGENT_API_KEY_FILE_ALLOW_LAX_PERMS_ENV: &str =
+    "AI_MEMORY_AGENT_API_KEY_FILE_ALLOW_LAX_PERMS";
+#[cfg(not(any(test, feature = "test-support")))]
+pub(crate) const AGENT_API_KEY_FILE_ALLOW_LAX_PERMS_ENV: &str =
+    "AI_MEMORY_AGENT_API_KEY_FILE_ALLOW_LAX_PERMS";
 
 #[derive(Args)]
 pub struct AgentsArgs {

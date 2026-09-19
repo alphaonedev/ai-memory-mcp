@@ -95,7 +95,7 @@ floor (the "no-disable" contract). SSOT: `src/security_profile.rs::KNOBS`.
 - plus `[governance].require_operator_pubkey=true` (bridged at the
   governance boot check).
 
-(That list is all **28** `KNOBS` entries. It has drifted from its own
+(That list is all **30** `KNOBS` entries. It has drifted from its own
 declared SSOT twice: it enumerated only 15 of the then-17 through v1.0.0,
 silently omitting the two permissive-shaped pins above — the ones whose
 violation REFUSES BOOT — and it then sat at 17 after #3033 raised the table

@@ -451,7 +451,7 @@ contract). Under the default `standard` posture every knob keeps its
 own default (byte-identical legacy). SSOT: `src/security_profile.rs`.
 
 Pinned knobs (unset → pinned to the hard value; already-compliant →
-accepted; set-below-floor → boot REFUSED). All **28** of them, in `KNOBS`
+accepted; set-below-floor → boot REFUSED). All **30** of them, in `KNOBS`
 order — this table is mechanically pinned to the SSOT by SET equality in
 `src/security_profile.rs::tests::performance_md_pinned_knobs_table_matches_the_knobs_ssot_exactly`,
 so a knob can no longer be added to `KNOBS` without a row here, and a row
@@ -488,6 +488,8 @@ here cannot claim a hardening guarantee the binary does not enforce
 | `AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS` | *(unset)* — PERMISSIVE-shaped: the unenrolled-peer hatch of the already-pinned `REQUIRE_PEER_ENROLLMENT` must be CLOSED; a truthy value REFUSES boot (#3201) |
 | `AI_MEMORY_FED_CERT_PEER_BINDING` | `enforce` (mTLS cert↔`X-Peer-Id` cross-check mode is `enforce`; `off`/`warn` refuse boot. Inert without a binding map. Documented `standard` unset default stays `warn` — #3201 / #3289) |
 | `AI_MEMORY_UNSTAMPED_MUTATION` | `refuse` (a caller-scoped mutation of an UNSTAMPED, legacy-unowned row is refused on every funnel of both backends; `warn` refuses boot. Documented `standard` default stays `warn` — #3124) |
+| `AI_MEMORY_STORE_URL_FILE_ALLOW_LAX_PERMS` | *(unset)* — PERMISSIVE-shaped: the store-url file lax-perms hatch must be non-truthy; a truthy value (which would accept a group/world-readable `AI_MEMORY_STORE_URL_FILE`) REFUSES boot (#1927/#3813) |
+| `AI_MEMORY_AGENT_API_KEY_FILE_ALLOW_LAX_PERMS` | *(unset)* — PERMISSIVE-shaped: the per-agent api-key file lax-perms hatch must be non-truthy; a truthy value (which would accept a group/world-readable `AI_MEMORY_AGENT_API_KEY_FILE`) REFUSES boot (#3781/#3813) |
 
 In addition, `asi-hard` forces the config-backed governance knob
 `[governance].require_operator_pubkey` to `true` at the governance boot

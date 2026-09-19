@@ -55,6 +55,12 @@ pub const STORE_URL_ENV: &str = "AI_MEMORY_STORE_URL";
 /// process environment block, never in shell history).
 pub const STORE_URL_FILE_ENV: &str = "AI_MEMORY_STORE_URL_FILE";
 
+/// #3813 — lax-perms escape hatch for the `AI_MEMORY_STORE_URL_FILE` channel.
+/// A PERMISSIVE-shaped `asi-hard` pin (`src/security_profile.rs` KNOBS): the
+/// hatch must be ABSENT/non-truthy under `asi-hard` so a group/world-readable
+/// store-url file can never be silently accepted.
+pub const STORE_URL_FILE_ALLOW_LAX_PERMS_ENV: &str = "AI_MEMORY_STORE_URL_FILE_ALLOW_LAX_PERMS";
+
 /// #1927 — read a store URL from a file, enforcing owner-only (`0600`)
 /// permissions exactly as [`crate::daemon_runtime::passphrase_from_file`] does for the SQLCipher
 /// passphrase. The file holds a bare credential, so a group/world-readable
@@ -79,7 +85,7 @@ pub fn store_url_from_file(path: &Path) -> Result<String> {
         })?;
         let mode = meta.permissions().mode();
         if mode & 0o077 != 0 {
-            let fail_open = std::env::var("AI_MEMORY_STORE_URL_FILE_ALLOW_LAX_PERMS")
+            let fail_open = std::env::var(STORE_URL_FILE_ALLOW_LAX_PERMS_ENV)
                 .map(|v| crate::security_profile::is_truthy(&v))
                 .unwrap_or(false);
             if fail_open {
