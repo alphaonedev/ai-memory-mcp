@@ -109,9 +109,7 @@ pub fn install() -> &'static Path {
     let path = DIRECTORY
         .get_or_init(|| {
             arm();
-            let root = std::env::temp_dir()
-                .canonicalize()
-                .expect("#3355 resolve temporary root");
+            let root = isolated_temp_root();
             let dir = tempfile::tempdir_in(root).expect("#3355 allocate isolated key directory");
             // #3705 review — `tempdir_in` inherits the AMBIENT UMASK (0002 on
             // this host's default, 0022 on most CI runners): under 0002 the
@@ -234,16 +232,52 @@ fn absolute(path: &Path) -> PathBuf {
     result
 }
 
+/// The test process's HOME, absolutized (lexical). The single resolution point
+/// shared by [`assert_isolated`] and [`isolated_temp_root`].
+pub fn resolved_home() -> PathBuf {
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .or_else(|| dirs::home_dir().map(PathBuf::into_os_string))
+        .expect("#3355 test key isolation requires an identifiable home directory");
+    absolute(Path::new(&home))
+}
+
+/// #3859 — a temporary root guaranteed OUTSIDE `$HOME`, chosen by CONSTRUCTION
+/// rather than by luck. `std::env::temp_dir()` returns `$TMPDIR`, which can itself
+/// sit under `$HOME` (a runner whose `TMPDIR` lives in the home directory).
+/// Allocating the isolation sandbox there and asserting isolation AFTERWARD
+/// panics on the very `#3355` guard [`install`] exists to satisfy — and the guard
+/// message names `install` as the remedy, so it must actually be one. Prefer
+/// `$TMPDIR` when it resolves outside `$HOME`; otherwise fall back to the first
+/// standard temp root that does.
+pub fn isolated_temp_root() -> PathBuf {
+    let home = resolved_home();
+    let canonical_home = home.canonicalize().unwrap_or(home);
+    let off_home = |p: &Path| {
+        p.canonicalize()
+            .ok()
+            .is_some_and(|c| !c.starts_with(&canonical_home))
+    };
+    for candidate in [
+        std::env::temp_dir(),
+        PathBuf::from("/tmp"),
+        PathBuf::from("/var/tmp"),
+    ] {
+        if off_home(&candidate) {
+            return candidate
+                .canonicalize()
+                .expect("#3859 canonicalize off-HOME temporary root");
+        }
+    }
+    panic!("#3859 no temporary root outside HOME is available (checked $TMPDIR, /tmp, /var/tmp)")
+}
+
 pub(crate) fn assert_isolated(path: &Path) {
     // #3516 — an unarmed process is an operator process: never panic there.
     if !armed() {
         return;
     }
-    let home = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .or_else(|| dirs::home_dir().map(PathBuf::into_os_string))
-        .expect("#3355 test key isolation requires an identifiable home directory");
-    let home = absolute(Path::new(&home));
+    let home = resolved_home();
     let path = absolute(path);
     assert!(
         !path.starts_with(&home),

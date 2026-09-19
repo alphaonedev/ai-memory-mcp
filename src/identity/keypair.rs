@@ -2696,9 +2696,12 @@ mod tests {
         // the contract here so a future refactor doesn't quietly drop
         // the override.
         let _g = key_dir_env_lock().lock().unwrap_or_else(|e| e.into_inner());
-        // Bind the override path once (OS-agnostic temp root) and assert
-        // the same value round-trips, so the contract can't desync.
-        let override_path = std::env::temp_dir().join("ai-memory-key-dir-override-probe");
+        // #3859 — take the override base from the isolation helper, which now
+        // roots its sandbox OUTSIDE HOME by construction (was `std::env::temp_dir()`,
+        // i.e. `$TMPDIR`, which can be under HOME and then trips the #3355 guard).
+        // The override subdir need not exist; `default_key_dir` accepts it.
+        let override_path =
+            crate::identity::test_key_dir::install().join("ai-memory-key-dir-override-probe");
         // SAFETY: env mutation serialised by `key_dir_env_lock` for
         // the duration of this test.
         unsafe {
