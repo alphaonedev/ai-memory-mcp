@@ -698,6 +698,44 @@ vocabulary — `absent` | `configured` | `refused_by_egress` |
 decider really is off" instead of parsing prose. The key is **omitted
 entirely** when no `[decision]` section is configured, which is what
 keeps an unconfigured deployment byte-identical to v1.0.0.
+**Which client answers, per `provider`** (#3806 W1c).
+
+| `provider` | Client | Wire shape |
+|---|---|---|
+| any `[llm]` alias (`openrouter`, `openai`, `xai`, `gemini`, `vllm`, `lmstudio`, …) or `openai-compatible` | structured chat-completions | `POST <base_url>/chat/completions` carrying `response_format = {"type": "json_schema", …, "strict": true}`, `logprobs`, `temperature = 0` and a fixed `seed`. The closed vocabulary reaches the endpoint as a JSON-Schema `enum`, so an off-vocabulary answer is refused there before it is refused here. |
+| `ollama` | the same client, against Ollama's OpenAI-compatible surface | `POST <base_url>/v1/chat/completions`. The native `/api/chat` shape carries neither `response_format: json_schema` nor `logprobs`, so it is not used for decisions. |
+| `systemone` | direct decision-route adapter | `POST <base_url>/v1/systemone`. The ROUTE is fixed by the design; the request/response BODY this build sends is an explicit assumption, documented in `src/decision_clients/systemone.rs` and replaceable through `SystemOneDecider::with_wire` without touching anything else. |
+| `local-nli` | none in this build | REFUSED at construction by name. The in-process provider lands separately. |
+
+**When a confidence exists — and when it does not.** A confidence is
+reported ONLY where the endpoint supplied evidence for it:
+
+- *chat-completions* — exactly one contiguous run of returned `logprobs`
+  tokens must concatenate to the decided label EXACTLY; the confidence
+  is then `exp(Σ logprob)` over that run. NO confidence is reported when
+  there is no `logprobs` block, when more than one run reconstructs the
+  label (so which occurrence decided is not knowable), when a token
+  straddles the label, when any logprob is positive or non-finite, or
+  when the request did not ask for logprobs at all.
+- *`systemone`* — the optional `probability` field. Absent, `null`, or
+  outside `0.0..=1.0` means NO confidence, never a repaired number.
+- *`score`* — NEVER carries a confidence. A continuous answer has no
+  closed vocabulary to attribute tokens to.
+- *generative fallback* — NEVER carries a confidence.
+
+An endpoint that rejects `logprobs` with a client error makes the client
+latch the parameter off, retry that one call without it, and report NO
+confidence from then on. That is a documented degradation; a fabricated
+`1.0` would be a number a destructive seam thresholds on.
+
+**`fallback = "generative"`** asks the `[llm]` backend the same question,
+held to `[decision].timeout_secs` rather than the generative 30-second
+budget — so the worst case on a seam whose primary timed out is two
+decision budgets, not thirty-two seconds. **An egress refusal is never
+routed around**: a destination the posture refused is not re-asked of a
+second endpoint, so `fallback` can never become an egress bypass. The
+outbound check runs before every request, including the retry and the
+fallback leg.
 
 Model-class advice, the air-gap ladder and the hosted-route census land
 with the rest of the `[decision]` documentation (#3806 W6).

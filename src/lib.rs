@@ -794,6 +794,11 @@ pub mod daemon_runtime;
 /// #3806 — the `[decision]` provider seam: `choose` / `score` / `judge`
 /// with first-class abstain and evidence-gated confidence.
 pub mod decision;
+/// #3806 - the `[decision]` provider CLIENTS: the structured
+/// OpenAI-compatible call, the direct decision-route adapter, the
+/// generative fallback, the calibration-row adapter, and the factory
+/// the boot chokepoint calls.
+pub mod decision_clients;
 /// #3806 — the `[decision]` config section, resolver and parse-time
 /// refusals (kept out of `config.rs`, which is at its QUAL-10 ceiling).
 pub mod decision_config;

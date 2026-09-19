@@ -834,7 +834,7 @@ async fn read_capped_bytes_inner(mut resp: reqwest::Response, cap: usize) -> Res
 /// Buffer a response body under [`MAX_LLM_RESPONSE_BYTES`] and parse it
 /// as JSON. Drop-in replacement for `resp.json().await` that bounds
 /// memory.
-async fn read_capped_json(resp: reqwest::Response) -> Result<Value> {
+pub(crate) async fn read_capped_json(resp: reqwest::Response) -> Result<Value> {
     let bytes = read_capped_bytes(resp).await?;
     // #3648: parser diagnostics are downstream data, not safe log metadata.
     serde_json::from_slice(&bytes).map_err(|_| ProviderFailure::InvalidJson.into())
