@@ -51,3 +51,20 @@ an explicit classification. Appending a second SQL site changes the count.
 Production builds retain the original query execution and contain no plan
 observer or diagnostic environment toggle. Tests use task-local evidence, so
 another concurrent operation cannot satisfy a cell's plan requirement.
+
+## Which tier executes this matrix
+
+| Runner / workflow | Database tier | New live matrix |
+|---|---|---|
+| Native f1 certification | PostgreSQL 18.6 / AGE 1.8.0 / pgvector 0.8.6, TLS verify-full | Executed |
+| `cert-postgres-age.yml`, self-hosted Linux | Same certified versions, checked against deploy SSOT | Executed, with retained plans |
+| `coverage.yml`, alternate container | PostgreSQL 16 / AGE 1.6.0 | Not selected |
+
+The coverage workflow runs ordinary library/integration tests, then selects a
+separate ignored embedding-dimension conversion test. It does not include
+these two ignored conformance tests. Its existing AGE integrations therefore
+do not establish that this new matrix passes on AGE 1.6.0. No such compatibility
+claim is made here. The native results additionally cover the certified minor
+versions, actual AGE 1.8.0 execution and TLS verify-full that the alternate
+container does not certify. The GitHub cert workflow now uses a native tier;
+its older container-build comments are historical, not its execution path.

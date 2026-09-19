@@ -8,7 +8,7 @@ use std::{cell::RefCell, future::Future};
 
 use sqlx::{Acquire, Execute, Postgres, Row, postgres::PgArguments};
 
-mod fixture;
+mod fixture_tests;
 mod inventory;
 mod matrix;
 

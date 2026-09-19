@@ -5,7 +5,7 @@
 
 use super::{
     capture, evidence,
-    fixture::{Fixture, STAMP},
+    fixture_tests::{Fixture, STAMP},
 };
 
 #[tokio::test]
