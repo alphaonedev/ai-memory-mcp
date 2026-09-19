@@ -9,13 +9,22 @@
 //!    retired `resolve_llm_auto_tag`; if either perturbed `[llm]`
 //!    resolution, this golden changes. It also pins that a config with
 //!    no `[decision]` section resolves to NO provider.
-//! 2. A STRUCTURAL pin that no SEAM consults the decider. W1a added the
-//!    trait, the config and the resolver and wired nothing; W1b adds the
-//!    boot chokepoint and its ONE `bootstrap_serve` call site, and still
-//!    wires no seam (the clients are W1c, the seams W2-W4). Until a seam
-//!    is wired there is no observable output to diff, and this test is
-//!    what makes that claim mechanical rather than asserted. The
-//!    allowlist grows only in lockstep with reviewed wiring.
+//! 2. A STRUCTURAL pin that **every production site which can reach a
+//!    decider obtains it only from the boot chokepoint**. W1a added the
+//!    trait, the config and the resolver; W1b added the chokepoint and
+//!    its ONE `bootstrap_serve` call site; W1c added the provider
+//!    clients, which IMPLEMENT a provider rather than consult one.
+//!
+//!    #3826 replaced the predecessor `no_seam_consults_the_decider_yet`
+//!    with that property. The predecessor asserted a fact with an
+//!    expiry date — it would have had to be deleted by the first unit
+//!    that wired a seam, and in the meantime it was red on the stacked
+//!    integration base for a reason that was not a defect in any cut:
+//!    W1b tightened the allowlist, W1c branched before the tightening,
+//!    and the stack inherited a list that had never seen W1c's five
+//!    provider modules. The successor still ratchets the allowlist —
+//!    it grows only in lockstep with reviewed wiring — but what it
+//!    PROVES is the monopoly, which does not expire when a seam lands.
 //!
 //! Both halves carry a PRESENCE control, so neither can pass vacuously.
 //!
@@ -157,7 +166,11 @@ fn decision_unset_is_byte_identical_v100() {
     );
 }
 
-/// Every token that would mean "a call site consults the decider".
+/// Every token that would mean a file NAMES the decider surface.
+///
+/// Naming the surface is not the same as OBTAINING a decider. The
+/// second, stronger property — a handle comes only from the boot
+/// chokepoint — is pinned separately below.
 const DECIDER_TOKENS: &[&str] = &[
     "DecisionProvider",
     "NullDecider",
@@ -171,25 +184,72 @@ const DECIDER_TOKENS: &[&str] = &[
     "decision_boot",
 ];
 
-/// The files this commit is ALLOWED to mention the decider in: the two
-/// new modules, the `config.rs` wiring (the section field, the `Debug`
-/// line, the validator call, the resolver delegate) and the `lib.rs`
-/// module declarations. Everything else is a seam, and W1a wires none.
-const ALLOWED: &[&str] = &[
+/// The files ALLOWED to name the decider surface. A change in this list
+/// is a change someone reviewed.
+///
+/// These files declare the types (`src/decision.rs`), resolve the
+/// config (`src/decision_config.rs`), gate the endpoint
+/// (`src/decision_boot.rs`, `src/egress.rs`), wire the section and the
+/// module list (`src/config.rs`, `src/lib.rs`), render the boot
+/// snapshot (`src/mcp/tools/capabilities.rs`), run the chokepoint once
+/// at boot (`src/daemon_runtime.rs`), or IMPLEMENT a provider for the
+/// chokepoint to attach (the five `decision_clients` modules).
+const DECIDER_ALLOWED: &[&str] = &[
     "src/decision.rs",
     "src/decision_config.rs",
     "src/config.rs",
     "src/lib.rs",
-    // #3806 W1b, extended in lockstep with the wiring it admits:
-    // the boot chokepoint module, its ONE `bootstrap_serve` call site,
-    // the egress module that now names the `InferenceDecision` class in
-    // its docs, and the capability surface that renders the boot
-    // snapshot. A change in this list is a change someone reviewed.
+    // #3806 W1b — the boot chokepoint, its ONE `bootstrap_serve` call
+    // site, the egress module that names the `InferenceDecision` class,
+    // and the capability surface that renders the boot snapshot.
     "src/decision_boot.rs",
     "src/daemon_runtime.rs",
     "src/egress.rs",
     "src/mcp/tools/capabilities.rs",
+    // #3806 W1c, admitted by #3826 — the provider CLIENTS. These five
+    // are legitimate NON-call-sites: they IMPLEMENT `DecisionProvider`
+    // and are constructed BY the chokepoint through
+    // `decision_clients::construct`, which is handed an already-
+    // resolved, already-egress-gated section and hands back a boxed
+    // provider for the chokepoint to attach. Not one of them obtains a
+    // decider from a production path, and none can — a
+    // `DecisionProviderHandle` has private fields and exactly one
+    // construction site (both pinned below), inside the chokepoint.
+    //
+    // They were missing from this list only because W1c branched from
+    // W1a, before W1b tightened the scan, so the stacked integration
+    // branch inherited a list that had never seen them (#3826).
+    "src/decision_clients.rs",
+    "src/decision_clients/calibration.rs",
+    "src/decision_clients/chat.rs",
+    "src/decision_clients/fallback.rs",
+    "src/decision_clients/systemone.rs",
 ];
+
+/// The chokepoint entry points (`build_decision_provider`,
+/// `build_decision_provider_under`) share this prefix. A file that
+/// names it in CODE is a file that can obtain a gated handle.
+const CHOKEPOINT_TOKEN: &str = "build_decision_provider";
+
+/// The file that DEFINES the chokepoint, and the one home of the gated
+/// handle type. Excluded from the caller set below, because a
+/// definition is not a call.
+const CHOKEPOINT_HOME: &str = "src/decision_boot.rs";
+
+/// THE property, and the reason this pin outlives "no seam is wired
+/// yet": the ONLY way to obtain a `DecisionProviderHandle` is the boot
+/// chokepoint, so these are the only production files that may reach
+/// it. A surface wanting its own ungated decision endpoint would have
+/// to appear here, which is a reviewable act rather than an oversight.
+///
+/// Asserted in BOTH directions: no file outside this list may call the
+/// chokepoint, and every file in it must actually call it — so the list
+/// cannot rot into a permission nobody exercises.
+const CHOKEPOINT_CALLERS: &[&str] = &["src/daemon_runtime.rs"];
+
+/// The gated handle type. Named in exactly one file: the chokepoint
+/// that defines it. Anything else naming it is a second door.
+const HANDLE_TYPE: &str = "DecisionProviderHandle";
 
 fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
     let entries = fs::read_dir(dir).unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()));
@@ -203,41 +263,217 @@ fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// `true` when `line` is Rust code rather than a doc/comment line, so a
+/// module header that MENTIONS the chokepoint is not counted as a call.
+/// `src/decision.rs` and `src/egress.rs` both name it in prose.
+fn is_code_line(line: &str) -> bool {
+    let t = line.trim_start();
+    !(t.starts_with("//") || t.starts_with("/*") || t.starts_with('*'))
+}
+
+/// #3806 W1a/W1b, repaired by #3826 — the STRUCTURAL half of pin (a).
+///
+/// The predecessor asserted only "no seam consults the decider YET",
+/// which expires the moment a seam is wired. This successor asserts the
+/// property that does not expire: **every production site that can
+/// reach a decider obtains it only from the boot chokepoint.**
+///
+/// Four properties, each paired with a control so none can pass
+/// vacuously:
+///
+/// * the walk really saw the `src` tree (anti-vacuity);
+/// * ABSENCE (a) — only reviewed files NAME the decider surface, and
+///   PRESENCE (a) — every file on that list actually names it;
+/// * ABSENCE (b) — only reviewed files CALL the boot chokepoint, and
+///   PRESENCE (b) — every file on that list actually calls it;
+/// * ABSENCE (c) — the gated handle type has one home, all-private
+///   fields and exactly ONE construction site in the whole crate, which
+///   is what makes "no public constructor" enforced by the compiler
+///   rather than merely true today.
 #[test]
-fn no_seam_consults_the_decider_yet() {
+fn every_decider_comes_from_the_boot_chokepoint_3806() {
     let mut files = Vec::new();
     rust_files(Path::new("src"), &mut files);
+    // PRESENCE self-check #1 — the walk really saw the tree. An empty
+    // offender list below can therefore never mean "the walk is broken".
     assert!(files.len() > 100, "the walk must see the whole src tree");
 
     let mut offenders: Vec<String> = Vec::new();
     let mut allowed_hits = 0usize;
+    let mut named_by: Vec<String> = Vec::new();
+    let mut chokepoint_callers: Vec<String> = Vec::new();
+    let mut handle_sites: Vec<String> = Vec::new();
+
     for path in &files {
         let rel = path.to_string_lossy().replace('\\', "/");
         let body = fs::read_to_string(path).unwrap_or_else(|e| panic!("read {rel}: {e}"));
+
+        let mut names_a_token = false;
         for token in DECIDER_TOKENS {
             if !body.contains(token) {
                 continue;
             }
-            if ALLOWED.contains(&rel.as_str()) {
+            names_a_token = true;
+            if DECIDER_ALLOWED.contains(&rel.as_str()) {
                 allowed_hits += 1;
             } else {
                 offenders.push(format!("{rel}: {token}"));
             }
         }
+        if names_a_token {
+            named_by.push(rel.clone());
+        }
+
+        if rel != CHOKEPOINT_HOME
+            && body
+                .lines()
+                .filter(|l| is_code_line(l))
+                .any(|l| l.contains(CHOKEPOINT_TOKEN))
+        {
+            chokepoint_callers.push(rel.clone());
+        }
+
+        if body.contains(HANDLE_TYPE) {
+            handle_sites.push(rel.clone());
+        }
     }
 
+    // ABSENCE (a) — only reviewed files name the decider surface.
     assert!(
         offenders.is_empty(),
-        "W1b wires the BOOT CHOKEPOINT and no seam: the decider must not be \
-         consulted from any seam yet (the clients are W1c, the seams W2-W4). \
-         Offending sites:\n  {}",
+        "these files name the decider surface without being on the \
+         reviewed allowlist. Either the wiring is unreviewed, or the \
+         allowlist needs a reviewed entry saying why the file is a \
+         legitimate non-call-site:\n  {}",
         offenders.join("\n  ")
     );
-    // PRESENCE control — the scan really does find the tokens where they
-    // ARE, so the emptiness above is not a broken grep.
+    // PRESENCE self-check #2 — the scan really does find the tokens
+    // where they ARE, so the emptiness above is not a broken grep.
     assert!(
         allowed_hits >= 10,
-        "the scan found only {allowed_hits} hits in the allowlisted files; \
-         it is not actually matching the decider tokens"
+        "the scan found only {allowed_hits} hits in the allowlisted \
+         files; it is not actually matching the decider tokens"
+    );
+    // PRESENCE (a) — the allowlist cannot rot into a permission nobody
+    // exercises: every entry must exist and must actually name a token.
+    let mut stale: Vec<&str> = DECIDER_ALLOWED
+        .iter()
+        .copied()
+        .filter(|a| !named_by.iter().any(|n| n.as_str() == *a))
+        .collect();
+    stale.sort_unstable();
+    assert!(
+        stale.is_empty(),
+        "these allowlist entries no longer name the decider surface (or \
+         no longer exist); a permission nobody exercises is a permission \
+         nobody reviews:\n  {}",
+        stale.join("\n  ")
+    );
+
+    // ABSENCE (b) + PRESENCE (b) — the chokepoint monopoly, both ways.
+    chokepoint_callers.sort();
+    let mut expected: Vec<String> = CHOKEPOINT_CALLERS
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    expected.sort();
+    assert_eq!(
+        chokepoint_callers, expected,
+        "a DecisionProviderHandle is obtainable ONLY from the boot \
+         chokepoint, so exactly these files may reach it. A file that \
+         APPEARED is an ungated decision endpoint; a file that VANISHED \
+         is a surface that lost its gate."
+    );
+
+    // ABSENCE (c) — one home for the handle type, which is what keeps
+    // 'private fields, no public constructor' enforceable.
+    assert_eq!(
+        handle_sites,
+        vec![CHOKEPOINT_HOME.to_string()],
+        "the gated handle type must be named only by the chokepoint \
+         that defines it; a second file naming it is a second door"
+    );
+
+    assert_handle_is_unforgeable();
+}
+
+/// `true` when `line` opens a `struct` or `impl` item rather than
+/// constructing a value, so the declaration and the inherent `impl`
+/// block are not mistaken for construction sites.
+fn is_item_header(line: &str) -> bool {
+    let t = line.trim_start();
+    t.starts_with("impl")
+        || t.starts_with("struct")
+        || t.starts_with("pub struct")
+        || t.starts_with("pub(crate) struct")
+}
+
+/// ABSENCE (c), the compiler-enforced half: inside its one home the
+/// gated handle has ALL-PRIVATE fields (so no other module can build
+/// one from parts, even in-crate) and exactly ONE struct-literal
+/// construction site (so the chokepoint is the only door). Each is
+/// paired with a presence control, so a parse that found nothing fails
+/// loudly instead of passing.
+fn assert_handle_is_unforgeable() {
+    let body = fs::read_to_string(CHOKEPOINT_HOME)
+        .unwrap_or_else(|e| panic!("read {CHOKEPOINT_HOME}: {e}"));
+
+    // PRESENCE — this file really is the chokepoint's definition site.
+    assert!(
+        body.contains(&format!("fn {CHOKEPOINT_TOKEN}(")),
+        "{CHOKEPOINT_HOME} must DEFINE `{CHOKEPOINT_TOKEN}`; if the \
+         chokepoint moved, every assertion keyed to this file is vacuous"
+    );
+
+    let decl = format!("pub struct {HANDLE_TYPE} {{");
+    let start = body
+        .find(&decl)
+        .unwrap_or_else(|| panic!("{CHOKEPOINT_HOME} must declare `{decl}`"));
+    let mut fields = Vec::new();
+    for line in body[start..].lines().skip(1) {
+        if line.starts_with('}') {
+            break;
+        }
+        let t = line.trim();
+        if t.is_empty() || !is_code_line(line) || t.starts_with('#') {
+            continue;
+        }
+        fields.push(t.to_string());
+    }
+    // PRESENCE — the field parse actually found the fields.
+    assert!(
+        fields.len() >= 3,
+        "parsed only {} field(s) out of `{HANDLE_TYPE}`; the privacy \
+         assertion below would be vacuous: {fields:?}",
+        fields.len()
+    );
+    // ABSENCE — not one of them is `pub`.
+    let public: Vec<&str> = fields
+        .iter()
+        .map(String::as_str)
+        .filter(|f| f.starts_with("pub"))
+        .collect();
+    assert!(
+        public.is_empty(),
+        "`{HANDLE_TYPE}` must keep ALL fields private — a public field \
+         lets any module assemble an UNGATED handle without ever \
+         calling the chokepoint: {public:?}"
+    );
+
+    // ABSENCE — exactly one struct literal in the whole crate, and it
+    // is the one inside the chokepoint (every other file is barred from
+    // naming the type at all by the assertion above).
+    let literal = format!("{HANDLE_TYPE} {{");
+    let sites: Vec<&str> = body
+        .lines()
+        .filter(|l| is_code_line(l))
+        .filter(|l| l.contains(&literal) && !is_item_header(l))
+        .collect();
+    assert_eq!(
+        sites.len(),
+        1,
+        "a gated handle must have exactly ONE construction site, inside \
+         the chokepoint; found {}: {sites:?}",
+        sites.len()
     );
 }
