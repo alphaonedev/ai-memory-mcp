@@ -4,6 +4,7 @@ import contextlib
 import io
 import os
 import sys
+import tracemalloc
 import unittest
 from unittest.mock import patch
 import federation as native
@@ -77,6 +78,23 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual(code,77)
         self.assertIn('skip: native-federation',stream.getvalue())
         with self.assertRaises(native.Failure):native.complete(stream.getvalue(),35)
+
+    def test_over_budget_cleanup_does_not_buffer_termination_output(self):
+        child = ('import signal,sys,time\n'
+                 'def stop(*args):\n'
+                 ' sys.stdout.write("x" * (2 * 1024 * 1024)); sys.stdout.flush(); sys.exit(0)\n'
+                 'signal.signal(signal.SIGTERM,stop)\n'
+                 'print("x" * 2048,flush=True)\n'
+                 'time.sleep(20)\n')
+        tracemalloc.start()
+        try:
+            with patch.object(native,'MAX_COMMAND_OUTPUT',1024),self.assertRaises(native.Failure):
+                native.command([sys.executable,'-c',child],os.environ.copy(),5)
+            _,peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        # A 1KiB diagnostic limit must not retain a 2MiB termination payload.
+        self.assertLess(peak,512 * 1024)
 
 if __name__ == '__main__':
     unittest.main()

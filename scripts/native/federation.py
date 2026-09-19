@@ -90,15 +90,17 @@ def command(argv, env, seconds):
         code = process.wait(timeout=max(1, deadline - time.monotonic()))
         return code, b''.join(chunks).decode(errors='replace')
     except (subprocess.TimeoutExpired, Failure, KeyboardInterrupt):
+        # Never collect more output after the diagnostic budget was exceeded.
+        process.stdout.close()
         try:
             os.killpg(process.pid, signal.SIGTERM)
         except ProcessLookupError:
             pass
         try:
-            process.communicate(timeout=10)
+            process.wait(timeout=10)
         except subprocess.TimeoutExpired:
             os.killpg(process.pid, signal.SIGKILL)
-            process.communicate()
+            process.wait(timeout=10)
         raise Failure('owned native command interrupted or exceeded its diagnostic/time budget') from None
     finally:
         process.stdout.close()
