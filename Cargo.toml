@@ -437,6 +437,14 @@ libc = "0.2"
 # attested NHI identity (X-Agent-Id + Ed25519 write-attestation) across the
 # full tool surface, plus durability-across-restart, at-rest encryption, and
 # crypto-erase invariants — see the module docs in the file.
+# #3858 — `examples/fed_issue.rs` carries a `#[cfg(test)]` module (nine tests, among them
+# the #3783 0600-credential pin). An `[[example]]` target defaults to `test = false`, so
+# plain `cargo test` built the example as a binary and never compiled or ran that module —
+# on any CI posture, ever. `test = true` makes it a real test target everywhere.
+[[example]]
+name = "fed_issue"
+test = true
+
 [[test]]
 name = "acceptance_nhi_sqlite"
 path = "tests/acceptance/acceptance_nhi_sqlite.rs"
