@@ -8,6 +8,8 @@ import json
 import os
 from pathlib import Path
 import re
+import select
+import time
 import shutil
 import signal
 import subprocess
@@ -18,6 +20,7 @@ import uuid
 ROOT = Path(__file__).resolve().parents[2]
 TESTS = ('cov_ga2_pg_federation', 'federation_postgres_fanout',
          'g4_postgres_link_projects_into_age_graph')
+MAX_COMMAND_OUTPUT = 32 * 1024 * 1024  # Diagnostic budget, not a data/result cap.
 FLOOR = 35  # 19 data-tier pins plus 16 shared-helper tests in two binaries.
 
 class Failure(Exception):
@@ -67,20 +70,38 @@ def certify(value):
         raise Failure('native TLS/version pin mismatch (requires PG18.6 AGE1.8.0 pgvector0.8.6)')
 
 def command(argv, env, seconds):
-    """Bound the entire owned child process group, including cargo descendants."""
+    """Bound diagnostic memory and the entire owned child process group."""
     process = subprocess.Popen(argv, cwd=ROOT, env=env, stdout=subprocess.PIPE,
-                               stderr=subprocess.STDOUT, text=True, start_new_session=True)
+                               stderr=subprocess.STDOUT, start_new_session=True)
+    deadline = time.monotonic() + seconds
+    chunks, size = [], 0
     try:
-        output, _ = process.communicate(timeout=seconds)
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not select.select([process.stdout], [], [], remaining)[0]:
+                raise Failure('owned native command timed out')
+            chunk = os.read(process.stdout.fileno(), 65536)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > MAX_COMMAND_OUTPUT:
+                raise Failure('native diagnostic output exceeded the 32MiB memory budget')
+            chunks.append(chunk)
+        code = process.wait(timeout=max(1, deadline - time.monotonic()))
+        return code, b''.join(chunks).decode(errors='replace')
     except (subprocess.TimeoutExpired, Failure, KeyboardInterrupt):
-        os.killpg(process.pid, signal.SIGTERM)
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
         try:
             process.communicate(timeout=10)
         except subprocess.TimeoutExpired:
             os.killpg(process.pid, signal.SIGKILL)
             process.communicate()
-        raise Failure('owned native command interrupted or timed out') from None
-    return process.returncode, output
+        raise Failure('owned native command interrupted or exceeded its diagnostic/time budget') from None
+    finally:
+        process.stdout.close()
 
 class Cluster:
     def __init__(self, url, psql):

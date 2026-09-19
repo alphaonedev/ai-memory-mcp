@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 import contextlib
 import io
+import os
+import sys
 import unittest
 from unittest.mock import patch
 import federation as native
@@ -60,6 +62,13 @@ class HarnessTests(unittest.TestCase):
             return ''
         with patch.object(cluster,'sql',side_effect=sql),contextlib.redirect_stdout(io.StringIO()),self.assertRaises(native.Failure):
             with cluster.database(): pass
+
+    def test_command_output_is_bounded_with_a_small_positive_control(self):
+        with patch.object(native,'MAX_COMMAND_OUTPUT',1024):
+            code,text=native.command([sys.executable,'-c','print("small")'],os.environ.copy(),10)
+            self.assertEqual((code,text),(0,'small\n'))
+            with self.assertRaises(native.Failure):
+                native.command([sys.executable,'-c','print("x"*2048)'],os.environ.copy(),10)
 
     def test_absent_url_is_an_explicit_countable_skip(self):
         stream=io.StringIO()
