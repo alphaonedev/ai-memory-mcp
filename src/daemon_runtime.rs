@@ -12182,71 +12182,12 @@ mod tests {
         run(cli, &cfg, None).await.unwrap();
     }
 
-    // #2044/#2095 — cover the `Command::Agents` api-key-verb dispatch arms in
-    // `run()` (the SAL-store-routed bind/revoke that make postgres enrollment
-    // work). Under the coverage build (`--features sal`) these drive the
-    // `#[cfg(feature = "sal")]` bind/revoke branches through `build_store_handle`
-    // → SqliteStore (no `--store-url` resolves to the sqlite path over `--db`).
-    #[cfg(feature = "sal")]
-    #[tokio::test]
-    async fn test_run_dispatch_agents_bind_api_key_command_2044() {
-        let _g = no_config_env();
-        let env = TestEnv::fresh();
-        let cfg = AppConfig::default();
-        let cli = Cli::try_parse_from([
-            "ai-memory",
-            "--db",
-            env.db_path.to_str().unwrap(),
-            "agents",
-            "bind-api-key",
-            "--agent-id",
-            "alice",
-            "--token",
-            "s3cret-token",
-        ])
-        .unwrap();
-        run(cli, &cfg, None).await.unwrap();
-    }
-
-    #[cfg(feature = "sal")]
-    #[tokio::test]
-    async fn test_run_dispatch_agents_revoke_api_key_command_2095() {
-        let _g = no_config_env();
-        let env = TestEnv::fresh();
-        let cfg = AppConfig::default();
-        // Bind first (covers the bind arm too), then revoke (covers the revoke
-        // arm + the `bindings_removed` path).
-        let bind = Cli::try_parse_from([
-            "ai-memory",
-            "--db",
-            env.db_path.to_str().unwrap(),
-            "agents",
-            "bind-api-key",
-            "--agent-id",
-            "bob",
-            "--token",
-            "bob-token",
-        ])
-        .unwrap();
-        run(bind, &cfg, None).await.unwrap();
-        let revoke = Cli::try_parse_from([
-            "ai-memory",
-            "--db",
-            env.db_path.to_str().unwrap(),
-            "agents",
-            "revoke-api-key",
-            "--agent-id",
-            "bob",
-        ])
-        .unwrap();
-        run(revoke, &cfg, None).await.unwrap();
-    }
-
     // The api-key verb OUTPUT branches (json), the empty-token + invalid-agent
     // error branches, and the store round-trip are covered as focused unit tests
     // on the extracted `cli::agents::{run_bind_api_key,run_revoke_api_key}`
     // helpers (in `src/cli/agents.rs`); the two `test_run_dispatch_agents_*`
-    // tests above cover the thin daemon_runtime dispatch arm (store resolution +
+    // tests (relocated to `src/cli/agents.rs`; #3781 ceiling move) cover the
+    // thin daemon_runtime dispatch arm (store resolution +
     // helper delegation) end-to-end through `run()`.
 
     // `sal`-gated: under `--no-default-features` (the macOS Check job)

@@ -1157,6 +1157,12 @@ pub async fn run_revoke_api_key(
 mod tests {
     use super::*;
     use crate::cli::test_utils::TestEnv;
+    #[cfg(feature = "sal")]
+    use crate::config::AppConfig;
+    #[cfg(feature = "sal")]
+    use crate::daemon_runtime::{Cli, run};
+    #[cfg(feature = "sal")]
+    use clap::Parser;
 
     #[test]
     fn test_agents_list_empty() {
@@ -2940,5 +2946,111 @@ mod tests {
             .block_on(run_revoke_api_key(&store, "bad id", false))
             .expect_err("invalid agent id must error");
         assert!(!err.to_string().is_empty());
+    }
+
+    // #3781 ceiling move: the two `test_run_dispatch_agents_*` tests below were
+    // relocated verbatim from `src/daemon_runtime.rs` (which sat at its 15000-line
+    // qual_10 ceiling). They test the agents bind/revoke commands, so they live
+    // with the agents commands. Only this glue is new — `TestEnv` is imported
+    // above, and `run`/`Cli`/`AppConfig` + the crate-wide caller-id test lock are
+    // pulled in (gated on `sal`, matching the tests). The two bodies below are
+    // byte-identical to their daemon_runtime.rs originals.
+    #[cfg(feature = "sal")]
+    fn no_config_env() -> std::sync::MutexGuard<'static, ()> {
+        crate::identity::agent_id_env_test_lock()
+    }
+
+    // #2044/#2095 — cover the `Command::Agents` api-key-verb dispatch arms in
+    // `run()` (the SAL-store-routed bind/revoke that make postgres enrollment
+    // work). Under the coverage build (`--features sal`) these drive the
+    // `#[cfg(feature = "sal")]` bind/revoke branches through `build_store_handle`
+    // → SqliteStore (no `--store-url` resolves to the sqlite path over `--db`).
+    #[cfg(feature = "sal")]
+    #[tokio::test]
+    async fn test_run_dispatch_agents_bind_api_key_command_2044() {
+        let _g = no_config_env();
+        let env = TestEnv::fresh();
+        let cfg = AppConfig::default();
+        // #3781 refusal pin (rule p3): an argv `--token` is REFUSED — the cut's
+        // whole product. Do NOT relax it; this test now proves the refusal fires
+        // through the dispatch arm, then proves the ALLOWED channel binds.
+        let argv = Cli::try_parse_from([
+            "ai-memory",
+            "--db",
+            env.db_path.to_str().unwrap(),
+            "agents",
+            "bind-api-key",
+            "--agent-id",
+            "alice",
+            "--token",
+            "s3cret-token",
+        ])
+        .unwrap();
+        let err = run(argv, &cfg, None).await.unwrap_err();
+        assert!(
+            err.to_string().contains("`--token` (argv) is REFUSED"),
+            "argv --token must be refused at the dispatch arm (#3781); got: {err}"
+        );
+        // Allowed-path control (rule p3): the same bind via a 0600 --token-file succeeds.
+        let token_path = env.db_path.parent().unwrap().join("alice.token");
+        std::fs::write(&token_path, "s3cret-token").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let ok = Cli::try_parse_from([
+            "ai-memory",
+            "--db",
+            env.db_path.to_str().unwrap(),
+            "agents",
+            "bind-api-key",
+            "--agent-id",
+            "alice",
+            "--token-file",
+            token_path.to_str().unwrap(),
+        ])
+        .unwrap();
+        run(ok, &cfg, None).await.unwrap();
+    }
+
+    #[cfg(feature = "sal")]
+    #[tokio::test]
+    async fn test_run_dispatch_agents_revoke_api_key_command_2095() {
+        let _g = no_config_env();
+        let env = TestEnv::fresh();
+        let cfg = AppConfig::default();
+        // Bind first (covers the bind arm too), then revoke (covers the revoke
+        // arm + the `bindings_removed` path). #3781: bind via the ALLOWED 0600
+        // --token-file channel, since an argv `--token` is refused.
+        let token_path = env.db_path.parent().unwrap().join("bob.token");
+        std::fs::write(&token_path, "bob-token").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let bind = Cli::try_parse_from([
+            "ai-memory",
+            "--db",
+            env.db_path.to_str().unwrap(),
+            "agents",
+            "bind-api-key",
+            "--agent-id",
+            "bob",
+            "--token-file",
+            token_path.to_str().unwrap(),
+        ])
+        .unwrap();
+        run(bind, &cfg, None).await.unwrap();
+        let revoke = Cli::try_parse_from([
+            "ai-memory",
+            "--db",
+            env.db_path.to_str().unwrap(),
+            "agents",
+            "revoke-api-key",
+            "--agent-id",
+            "bob",
+        ])
+        .unwrap();
+        run(revoke, &cfg, None).await.unwrap();
     }
 }
