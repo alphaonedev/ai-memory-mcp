@@ -54,6 +54,19 @@
       "figures": ["swarm_covered", "swarm_pending"],
       "binds": ["run_id"],
       "note": "#3543: covered requires a persisted memory_id or documented EXPECTED_REFUSAL; pending is its own bucket."
+    },
+    {
+      "id": "decision-calibration",
+      "script": "scripts/evidence/decision-calibration.sh",
+      "outputs": ["decision-calibration.json", "bundle.json"],
+      "figures": [
+        "decision_calibration_brier",
+        "decision_calibration_ece",
+        "decision_calibration_ece_bootstrap_p95",
+        "decision_calibration_coverage"
+      ],
+      "binds": ["run_id", "daemon_binary_sha256", "source_commit"],
+      "note": "#3806 W5: [decision] provider calibration. Held-out sets are preregistered (tests/fixtures/decision-calibration/MANIFEST.sha256, verified independently by this script AND by the Rust harness before any figure is computed); every report carries source_commit plus the manifest digest, and reports the ALWAYS-ABSTAIN null baseline and the ORACLE positive baseline on the SAME set. The daemon_binary_sha256 binding is the harness binary that computed the figures -- this producer addresses no daemon. A deliberately miscalibrated fixture must FAIL the ECE gate for the report to be PASS."
     }
   ]
 }
