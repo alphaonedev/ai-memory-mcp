@@ -13,3 +13,5 @@
 #
 cert-postgres-age 152
 postgres-ignored 154
+# E5: receive11 + fanout15 + AGE projection9 (includes16 shared-helper tests).
+native-federation 35
