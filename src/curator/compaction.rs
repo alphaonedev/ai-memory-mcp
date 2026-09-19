@@ -103,6 +103,15 @@ pub(crate) const COMPACTION_TRACE_TARGET: &str = "curator::compaction";
 #[cfg(feature = "sal")]
 pub(crate) const ROLLBACK_FAILED_FAILCLOSED_SLUG: &str = "consolidation rollback FAILED — sweep halted fail-closed (sources may be un-restored; unverifiable summary retained for recovery)";
 
+/// v1.0.0 #2893 / #2894 — the typed, greppable head of an INCOMPLETE
+/// Stage-6 rollback: one or more originals could not come back (a different
+/// id holds the `(title, namespace)` slot) or came back unreachable (its
+/// lifecycle differs from the pre-merge snapshot). The summary is RETAINED
+/// — it may hold the only surviving copy — and the error names every
+/// original it could not restore with the id that holds its slot.
+#[cfg(feature = "sal")]
+pub(crate) const ROLLBACK_INCOMPLETE_SLUG: &str = "consolidation rollback INCOMPLETE — unverifiable summary RETAINED (an original could not be restored)";
+
 /// #2637 — injection seam for the `PreCompaction` decision gate.
 ///
 /// A `pre_compaction` hook gates the curator's autonomous, hard-DELETE
@@ -436,27 +445,62 @@ impl<'a> ConsolidationPass<'a> {
         Ok(new_id)
     }
 
-    /// Persist an operator-reversible `RollbackEntry::Consolidate` snapshot
-    /// to `_curator/rollback` (#1745) so `ai-memory curator --rollback` can
-    /// reverse this hard-DELETE consolidation — at parity with the autonomy
-    /// Pass-1 path, which wraps every `consolidate_cluster` with the same
-    /// entry. Backend-agnostic: reuses [`crate::autonomy::build_rollback_memory`]
-    /// (the exact row shape `reverse_rollback_entry` reads) and writes it via
-    /// [`MemoryStore::store`], so the SQLite and Postgres adapters both land an
-    /// identical, reversible row. Called on the verified happy path only — a
-    /// `verify`-fail cluster is auto-restored by [`Self::rollback_consolidation`]
-    /// instead, so no rollback entry is left pointing at a reversed merge.
-    async fn persist_rollback(&self, originals: &[Memory], result_id: &str) -> Result<()> {
-        let entry = crate::autonomy::RollbackEntry::Consolidate {
-            originals: originals.to_vec(),
-            result_id: result_id.to_string(),
-        };
-        let mem = crate::autonomy::build_rollback_memory(&entry)?;
+    /// v1.0.0 #3692 — WRITE-AHEAD: persist the operator-reversible
+    /// `RollbackEntry::Consolidate` snapshot to `_curator/rollback` (#1745)
+    /// BEFORE the destructive merge, tagged pending with an empty summary id,
+    /// and return the row's id. Backend-agnostic (the row shape is
+    /// [`crate::autonomy::build_write_ahead_memory`], written through
+    /// [`MemoryStore::store`]). Pre-#3692 the entry was written AFTER
+    /// `consolidate` + `verify`, best-effort: with tombstoning off the sources
+    /// were already hard-deleted, so a crash or a failed write in that window
+    /// left the only exact copy of each original in this stack frame.
+    async fn persist_rollback_write_ahead(&self, originals: &[Memory]) -> Result<String> {
+        let mem = crate::autonomy::build_write_ahead_memory(originals)?;
         self.store
             .store(&self.ctx, &mem)
             .await
             .map_err(|e| anyhow::anyhow!(e))?;
-        Ok(())
+        Ok(mem.id)
+    }
+
+    /// #3692 — commit the write-ahead row once the merge verified: the
+    /// summary id is filled in and the pending mark cleared. Same row, same
+    /// id; only content + metadata change.
+    async fn commit_rollback_entry(
+        &self,
+        entry_id: &str,
+        originals: &[Memory],
+        result_id: &str,
+    ) -> Result<()> {
+        let (content, metadata) = crate::autonomy::commit_write_ahead_patch(originals, result_id)?;
+        self.store
+            .update(
+                &self.ctx,
+                entry_id,
+                crate::store::UpdatePatch {
+                    content: Some(content),
+                    metadata: Some(metadata),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!(e))
+    }
+
+    /// #3692 — remove a pending write-ahead row whose merge never landed
+    /// (persist failed atomically) or was fully reversed (Stage-6 rollback
+    /// restored every original). Best-effort by design: a leftover pending
+    /// row is an honest over-retention an operator can see, never a loss.
+    async fn discard_pending_rollback_entry(&self, entry_id: &str) {
+        if let Err(e) = self.store.delete(&self.ctx, entry_id).await {
+            tracing::warn!(
+                target: COMPACTION_TRACE_TARGET,
+                pass = self.name(),
+                entry_id,
+                error = %e,
+                "#3692: pending rollback row could not be removed (harmless over-retention)"
+            );
+        }
     }
 
     /// Verify the consolidated summary is readable from the store.
@@ -567,9 +611,29 @@ impl<'a> ConsolidationPass<'a> {
                     continue;
                 }
             };
+            // #3692 — WRITE-AHEAD. The exact originals reach the rollback log
+            // before `persist` deletes or tombstones a single one of them; a
+            // write-ahead that fails aborts the cluster with nothing touched.
+            let entry_id = match self.persist_rollback_write_ahead(&members).await {
+                Ok(id) => {
+                    report.rollback_entries_written += 1;
+                    id
+                }
+                Err(e) => {
+                    report.errors.push(format!(
+                        "{}: {}: {e}",
+                        self.name(),
+                        crate::autonomy::ROLLBACK_WRITE_AHEAD_FAILED
+                    ));
+                    continue;
+                }
+            };
             let new_id = match self.persist(&summary, &cluster_ids).await {
                 Ok(id) => id,
                 Err(e) => {
+                    // The merge failed atomically: nothing was deleted, the
+                    // pending row has nothing to reverse.
+                    self.discard_pending_rollback_entry(&entry_id).await;
                     report
                         .errors
                         .push(format!("{}: persist failed: {e}", self.name()));
@@ -587,6 +651,11 @@ impl<'a> ConsolidationPass<'a> {
                 // verify-failed string is pushed onto the pass report).
                 match self.rollback_consolidation(&members, &new_id).await {
                     Ok(restored) => {
+                        // Every original is back and reachable: the pending
+                        // write-ahead row has nothing left to reverse.
+                        self.discard_pending_rollback_entry(&entry_id).await;
+                        report.rollback_entries_written =
+                            report.rollback_entries_written.saturating_sub(1);
                         if restored > 0 {
                             report.rolled_back += 1;
                         }
@@ -605,6 +674,13 @@ impl<'a> ConsolidationPass<'a> {
                         continue;
                     }
                     Err(re) => {
+                        // #3692 — the pending write-ahead row is KEPT: it holds
+                        // the exact originals a later `curator --rollback`
+                        // needs. #2893 — an INCOMPLETE rollback (a slot taken
+                        // by another id, or a restored row that is not the
+                        // pre-merge row) arrives here too, naming what it could
+                        // not restore; the summary below is retained for it.
+                        //
                         // #3190 FAIL-CLOSED (data-integrity, GA-blocker). The
                         // Stage-6 auto-rollback itself failed, so the pre-merge
                         // sources are NOT known to be restored (some may already
@@ -647,17 +723,21 @@ impl<'a> ConsolidationPass<'a> {
                 }
             }
 
-            // Happy path — the consolidation verified and sticks. Persist an
-            // operator-reversible rollback snapshot (#1745) so a bad merge can
-            // be undone via `curator --rollback`, matching autonomy Pass-1
-            // parity. Best-effort: a rollback-log write failure is recorded but
-            // does not un-count the (successful, verified) consolidation.
-            match self.persist_rollback(&members, &new_id).await {
-                Ok(()) => report.rollback_entries_written += 1,
-                Err(e) => report.errors.push(format!(
-                    "{}: rollback-log write failed (consolidation kept): {e}",
+            // Happy path — the consolidation verified and sticks. Commit the
+            // write-ahead row (#3692): the summary id lands and the pending
+            // mark clears, so `curator --rollback` reverses the merge exactly
+            // (#1745, autonomy Pass-1 parity). A failed commit leaves the
+            // PENDING row — it still holds the originals and still reverses —
+            // and is reported; the verified consolidation is not un-counted.
+            if let Err(e) = self
+                .commit_rollback_entry(&entry_id, &members, &new_id)
+                .await
+            {
+                report.errors.push(format!(
+                    "{}: rollback-log commit failed (consolidation kept; pending entry \
+                     {entry_id} still holds the originals): {e}",
                     self.name()
-                )),
+                ));
             }
             report.memories_consolidated += members.len();
         }
@@ -671,27 +751,29 @@ impl<'a> ConsolidationPass<'a> {
     /// unverifiable `result_id` — restore-FIRST so a crash mid-rollback leaves
     /// a recoverable over-retention (both live), never data loss. Each original
     /// is restored via the ATOMIC restore-safe CAS
-    /// [`crate::store::MemoryStore::restore_or_conflict`] (#2887): if a
-    /// *different* id now occupies its `(title, namespace)` slot the CAS refuses
-    /// (`StoreError::Conflict`) so it is skipped + warned WITHOUT clobbering the
-    /// occupant — the collision-probe and the restore write are ONE statement,
-    /// closing the prior probe-then-`store()` lost-update. Backend-agnostic —
-    /// uses only the existing `restore_or_conflict` / `delete` trait ops.
-    /// Returns the number of originals restored.
+    /// [`crate::store::MemoryStore::restore_or_conflict`] (#2887): a
+    /// *different* id owning its `(title, namespace)` slot is refused
+    /// (`StoreError::Conflict`) and never clobbered.
+    ///
+    /// **#2893 / #2894 — the delete is conditional on EVERY original being
+    /// back AND reachable.** A refused restore (the slot is someone else's
+    /// row) or a restored row whose lifecycle is not the pre-merge snapshot's
+    /// (present in the table, hidden from recall) makes the rollback
+    /// INCOMPLETE: the summary — which may hold the only surviving copy of
+    /// that original's text — is RETAINED and the call returns `Err` headed
+    /// [`ROLLBACK_INCOMPLETE_SLUG`], naming each original and the id that
+    /// holds its slot. Pre-#2893 a `Conflict` was skipped with a WARN and the
+    /// summary deleted anyway: the recovery path was the step that destroyed
+    /// the data, and a green test required it.
+    ///
+    /// Backend-agnostic — uses only the existing `restore_or_conflict` /
+    /// `get` / `delete` trait ops. Returns the number of originals restored.
     async fn rollback_consolidation(&self, originals: &[Memory], result_id: &str) -> Result<usize> {
         let mut restored = 0usize;
+        let mut unrestored: Vec<String> = Vec::new();
         for m in originals {
-            // #2887 — restore each original via the ATOMIC restore-safe CAS
-            // (`restore_or_conflict`): the collision-probe and the restore write
-            // are ONE statement keyed on the snapshot's OWN id, so a concurrent
-            // writer that took the (title, namespace) slot between them can no
-            // longer be silently clobbered by the restore's upsert (the prior
-            // probe-then-`store()` lost-update window). A DIFFERENT id owning the
-            // slot surfaces as `StoreError::Conflict` and this original is skipped
-            // + warned (mirroring the pre-#2887 guard's refuse/skip semantics),
-            // while the foreign row is left byte-identical.
             match self.store.restore_or_conflict(&self.ctx, m).await {
-                Ok(_) => restored += 1,
+                Ok(_) => {}
                 Err(StoreError::Conflict { id: occupant }) => {
                     tracing::warn!(
                         target: COMPACTION_TRACE_TARGET,
@@ -699,14 +781,51 @@ impl<'a> ConsolidationPass<'a> {
                         namespace = %m.namespace,
                         occupant = %occupant,
                         original = %m.id,
-                        "rollback: (title, namespace) slot taken by a different id — skipping restore"
+                        "rollback: (title, namespace) slot taken by a different id — original NOT restored; summary will be retained (#2893)"
                     );
+                    unrestored.push(format!(
+                        "original {} (namespace {:?}): slot held by {}",
+                        m.id, m.namespace, occupant
+                    ));
                     continue;
                 }
                 Err(e) => return Err(anyhow::anyhow!(e)),
             }
+            // #2894 — reachability, not presence: the row is restored only
+            // when it is back in the state the caller could reach it in
+            // before the merge (post == pre). A row that is present but
+            // still tombstoned has not been restored.
+            match self.store.get(&self.ctx, &m.id).await {
+                Ok(back) if back.lifecycle_state == m.lifecycle_state => restored += 1,
+                Ok(back) => unrestored.push(format!(
+                    "original {} (namespace {:?}): restored row is {} but the pre-merge row was {} (unreachable)",
+                    m.id,
+                    m.namespace,
+                    back.lifecycle_state.as_str(),
+                    m.lifecycle_state.as_str()
+                )),
+                // The read path hides a tombstoned / quarantined row as
+                // NotFound: present in the table, unreachable — not restored.
+                Err(StoreError::NotFound { .. }) => unrestored.push(format!(
+                    "original {} (namespace {:?}): not reachable after the restore write \
+                     (pre-merge row was {}; the row is present but hidden, #2894)",
+                    m.id,
+                    m.namespace,
+                    m.lifecycle_state.as_str()
+                )),
+                Err(e) => return Err(anyhow::anyhow!(e)),
+            }
         }
-        // Remove the unverifiable summary only after the originals are back.
+        if !unrestored.is_empty() {
+            return Err(anyhow::anyhow!(
+                "{ROLLBACK_INCOMPLETE_SLUG}: summary {result_id} kept; {} of {} originals not restored: {}",
+                unrestored.len(),
+                originals.len(),
+                unrestored.join("; ")
+            ));
+        }
+        // Remove the unverifiable summary only after EVERY original is back
+        // and reachable.
         self.store
             .delete(&self.ctx, result_id)
             .await
@@ -1367,6 +1486,11 @@ mod tests {
 
         #[tokio::test]
         async fn run_real_mode_consolidates_cluster() {
+            // #3577 reader guard: this test consolidates under the DEFAULT
+            // flags (hard-delete, no lineage DAG); a sibling seeder (the #2894
+            // tombstone-mode pin, the consolidate_federation seeders) must not
+            // flip the process-global flag mid-body.
+            let _dag = crate::test_support::no_lineage_dag_guard();
             let (store, _dir) = open_db();
             let conn = conn_of(&store);
             let candidates = seed_two_dupes(&conn);
@@ -1495,6 +1619,11 @@ mod tests {
 
         #[tokio::test]
         async fn run_real_mode_persists_reversible_rollback_entry() {
+            // #3577 reader guard: this test consolidates under the DEFAULT
+            // flags (hard-delete, no lineage DAG); a sibling seeder (the #2894
+            // tombstone-mode pin, the consolidate_federation seeders) must not
+            // flip the process-global flag mid-body.
+            let _dag = crate::test_support::no_lineage_dag_guard();
             // #1745 — real-mode consolidation must leave an operator-reversible
             // RollbackEntry::Consolidate in _curator/rollback so
             // `curator --rollback` can undo the hard-DELETE merge, at parity
@@ -1676,6 +1805,11 @@ mod tests {
 
         #[tokio::test]
         async fn rollback_consolidation_restores_originals_and_deletes_result() {
+            // #3577 reader guard: this test consolidates under the DEFAULT
+            // flags (hard-delete, no lineage DAG); a sibling seeder (the #2894
+            // tombstone-mode pin, the consolidate_federation seeders) must not
+            // flip the process-global flag mid-body.
+            let _dag = crate::test_support::no_lineage_dag_guard();
             let (store, _dir) = open_db();
             let conn = conn_of(&store);
             let candidates = seed_two_dupes(&conn);
@@ -1713,8 +1847,21 @@ mod tests {
             );
         }
 
+        /// #2893 — the same scenario the pre-fix pin set up (a NEW memory
+        /// squats one original's `(title, namespace)` slot before the Stage-6
+        /// rollback), with the expectations inverted: the rollback is
+        /// INCOMPLETE and says so, naming the original and the squatter; the
+        /// summary — the only remaining copy of the collided original's text —
+        /// SURVIVES; the un-collided original is back; the squatter is never
+        /// clobbered. Before this fix the test required the summary to be
+        /// deleted with the original unrestored: content in zero places.
         #[tokio::test]
         async fn rollback_consolidation_skips_collided_slot() {
+            // #3577 reader guard: this test consolidates under the DEFAULT
+            // flags (hard-delete, no lineage DAG); a sibling seeder (the #2894
+            // tombstone-mode pin, the consolidate_federation seeders) must not
+            // flip the process-global flag mid-body.
+            let _dag = crate::test_support::no_lineage_dag_guard();
             let (store, _dir) = open_db();
             let conn = conn_of(&store);
             let candidates = seed_two_dupes(&conn);
@@ -1736,25 +1883,271 @@ mod tests {
             );
             crate::db::insert(&conn, &squatter).unwrap();
 
-            // Roll back: collided original is skipped, the other is restored.
-            let restored = pass
+            // Roll back: the collided original cannot come back, so the
+            // rollback is INCOMPLETE — an Err that names it — and the summary
+            // is retained.
+            let err = pass
                 .rollback_consolidation(&candidates, &result_id)
                 .await
-                .unwrap();
-            assert_eq!(restored, 1, "only the un-collided original is restored");
+                .expect_err("#2893: an incomplete rollback must fail loudly")
+                .to_string();
+            assert!(err.starts_with(ROLLBACK_INCOMPLETE_SLUG), "{err}");
+            assert!(err.contains(&candidates[0].id), "names the original: {err}");
+            assert!(
+                err.contains(&squatter.id),
+                "names the id holding its slot: {err}"
+            );
+            assert!(err.contains("1 of 2 originals not restored"), "{err}");
             assert!(
                 crate::db::get(&conn, &candidates[0].id).unwrap().is_none(),
-                "collided original was NOT restored"
+                "collided original was NOT restored (its slot is someone else's)"
             );
             assert!(
                 crate::db::get(&conn, &candidates[1].id).unwrap().is_some(),
                 "un-collided original restored"
             );
-            assert!(
-                crate::db::get(&conn, &squatter.id).unwrap().is_some(),
+            assert_eq!(
+                crate::db::get(&conn, &squatter.id)
+                    .unwrap()
+                    .unwrap()
+                    .content,
+                "squatter content",
                 "squatter not clobbered"
             );
+            assert!(
+                crate::db::get(&conn, &result_id).unwrap().is_some(),
+                "#2893: the summary SURVIVES — it holds the collided original's merged text"
+            );
+
+            // Control: with the squatter gone the same rollback completes —
+            // every original back, the summary removed.
+            crate::db::delete(&conn, &squatter.id).unwrap();
+            let restored = pass
+                .rollback_consolidation(&candidates, &result_id)
+                .await
+                .expect("no collision: the rollback completes");
+            assert_eq!(restored, 2);
+            assert!(crate::db::get(&conn, &candidates[0].id).unwrap().is_some());
             assert!(crate::db::get(&conn, &result_id).unwrap().is_none());
+        }
+
+        /// #2894 - REQUIREMENT: with tombstoning ON, `consolidate`
+        /// leaves each source present and HIDDEN, but the Stage-6 rollback
+        /// RESTORES them to reachability: the same-id restore re-opens each
+        /// tombstoned source to its pre-merge (visible) lifecycle via the ONE
+        /// re-open predicate (`LifecycleState::restore_reopens_row`, rendered
+        /// into the restore arm by `models::restore_reopen_lifecycle_assignment`
+        /// on both adapters), so every original counts as restored, the
+        /// unverifiable summary is DELETED, and the read path shows the
+        /// originals again.
+        ///
+        /// Converted from CHARACTERISATION by #2894 (the Unit-2 cell pinned
+        /// the still-hidden outcome as the open state: rollback INCOMPLETE,
+        /// summary retained). The rollback's honesty rule (#2893) is
+        /// unchanged - a row the caller cannot reach still fails the
+        /// rollback - but a re-opened row IS reachable, so the rollback now
+        /// completes.
+        #[tokio::test]
+        async fn issue_2894_rollback_of_tombstoned_sources_is_incomplete_and_keeps_the_summary() {
+            let dag = crate::test_support::LineageDagIsolation::new();
+            dag.set_lineage_dag(true);
+            dag.set_consolidate_tombstone_sources(true);
+            assert!(crate::config::consolidate_tombstone_sources_enabled());
+
+            let (store, _dir) = open_db();
+            let conn = conn_of(&store);
+            let candidates = seed_two_dupes(&conn);
+            let llm = StubLlm::new("synth");
+            let pass = ConsolidationPass::new(&store, &llm, false);
+            let read_path = |conn: &rusqlite::Connection| -> Vec<String> {
+                let mut ids: Vec<String> = crate::db::list(
+                    conn,
+                    Some("ns"),
+                    None,
+                    16,
+                    0,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap()
+                .into_iter()
+                .map(|m| m.id)
+                .collect();
+                ids.sort();
+                ids
+            };
+            let state_of = |conn: &rusqlite::Connection, id: &str| -> String {
+                conn.query_row(
+                    "SELECT lifecycle_state FROM memories WHERE id = ?1",
+                    [id],
+                    |r| r.get(0),
+                )
+                .unwrap()
+            };
+            let mut pre: Vec<String> = candidates.iter().map(|m| m.id.clone()).collect();
+            pre.sort();
+            assert_eq!(
+                read_path(&conn),
+                pre,
+                "before the merge: both sources reachable"
+            );
+
+            let summary = pass.summarize(&candidates).unwrap();
+            let ids: Vec<String> = candidates.iter().map(|m| m.id.clone()).collect();
+            let result_id = pass.persist(&summary, &ids).await.unwrap();
+            // Tombstoned: present in the table, absent from the read path.
+            for m in &candidates {
+                assert!(crate::db::get(&conn, &m.id).unwrap().is_none(), "hidden");
+                assert_eq!(state_of(&conn, &m.id), "tombstoned");
+            }
+            assert_eq!(read_path(&conn), vec![result_id.clone()]);
+
+            // The rollback: every restore write lands (same-id CAS) AND
+            // re-opens its row, so every original is reachable afterwards -
+            // the rollback COMPLETES and the summary is deleted.
+            let restored = pass
+                .rollback_consolidation(&candidates, &result_id)
+                .await
+                .expect("#2894: a rollback that re-opens every source completes");
+            assert_eq!(restored, 2, "both originals restored AND reachable");
+            // post == pre (pre-merge): open, reachable on the read path.
+            for m in &candidates {
+                assert_eq!(
+                    state_of(&conn, &m.id),
+                    m.lifecycle_state.as_str(),
+                    "the restore re-opens the row to the pre-merge lifecycle"
+                );
+                assert_eq!(
+                    crate::db::get(&conn, &m.id)
+                        .unwrap()
+                        .expect("reachable")
+                        .content,
+                    m.content,
+                    "the restored original carries the pre-merge text"
+                );
+            }
+            assert!(
+                crate::db::get(&conn, &result_id).unwrap().is_none(),
+                "the unverifiable summary is deleted once every original is back"
+            );
+            assert_eq!(
+                read_path(&conn),
+                pre,
+                "the read path shows the originals again"
+            );
+            // No dangling bookkeeping: the summary's derived_from edges die
+            // with it, and no atom_of pointer names the removed summary.
+            let dangling: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM memory_links WHERE source_id = ?1 OR target_id = ?1",
+                    [&result_id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(dangling, 0, "no links survive the deleted summary");
+            let atoms_pointing_at_summary: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM memories WHERE atom_of = ?1",
+                    [&result_id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                atoms_pointing_at_summary, 0,
+                "no atom_of pointer dangles at the removed summary"
+            );
+            drop(dag);
+        }
+
+        /// #3692 — the SAL pass writes the rollback row BEFORE the merge and
+        /// commits it after: on the happy path exactly one committed row
+        /// remains (with the summary id); on a Stage-6 rollback that
+        /// completes, the pending row is removed; on a rollback that FAILS,
+        /// the pending row stays and still holds the exact originals.
+        #[tokio::test]
+        async fn issue_3692_write_ahead_row_outlives_a_failed_rollback() {
+            // #3577 reader guard: this test consolidates under the DEFAULT
+            // flags (hard-delete, no lineage DAG); a sibling seeder (the #2894
+            // tombstone-mode pin, the consolidate_federation seeders) must not
+            // flip the process-global flag mid-body.
+            let _dag = crate::test_support::no_lineage_dag_guard();
+            let (store, _dir) = open_db();
+            let conn = conn_of(&store);
+            let candidates = seed_two_dupes(&conn);
+            let llm = StubLlm::new("synth");
+            let fail_store = RollbackFailStore {
+                inner: store,
+                fail_verify: std::sync::atomic::AtomicBool::new(true),
+                fail_restore: std::sync::atomic::AtomicBool::new(true),
+            };
+            let pass = ConsolidationPass::new(&fail_store, &llm, false);
+            let err = pass
+                .run(&candidates)
+                .await
+                .expect_err("#3190: a failed rollback halts the sweep")
+                .to_string();
+            assert!(err.starts_with(ROLLBACK_FAILED_FAILCLOSED_SLUG), "{err}");
+            // The pending write-ahead row is the ONLY exact copy of the
+            // sources now (they were hard-deleted by the merge): it must be
+            // there, pending, and reversible.
+            let log = crate::db::list(
+                &conn,
+                Some("_curator/rollback"),
+                None,
+                16,
+                0,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                log.len(),
+                1,
+                "the pending write-ahead row survives a failed rollback"
+            );
+            assert_eq!(
+                log[0].metadata[crate::autonomy::ROLLBACK_PENDING_KEY],
+                serde_json::Value::Bool(true)
+            );
+            let entry: crate::autonomy::RollbackEntry =
+                serde_json::from_str(&log[0].content).unwrap();
+            let crate::autonomy::RollbackEntry::Consolidate {
+                originals,
+                result_id,
+            } = &entry
+            else {
+                panic!("consolidate entry");
+            };
+            assert!(result_id.is_empty(), "never committed");
+            assert_eq!(originals.len(), 2);
+            for m in &candidates {
+                assert!(
+                    originals
+                        .iter()
+                        .any(|o| o.id == m.id && o.content == m.content),
+                    "exact original {} is in the pending row",
+                    m.id
+                );
+            }
+            // The operator path reverses it: originals back at their own ids.
+            crate::autonomy::reverse_rollback_entry(&conn, &entry).unwrap();
+            for m in &candidates {
+                assert_eq!(
+                    crate::db::get(&conn, &m.id)
+                        .unwrap()
+                        .expect("restored")
+                        .content,
+                    m.content
+                );
+            }
         }
 
         // ---- #3190 fail-closed on a failed rollback -------------------------
@@ -1899,6 +2292,11 @@ mod tests {
 
         #[tokio::test]
         async fn rollback_failure_halts_sweep_fail_closed_and_retains_summary_3190() {
+            // #3577 reader guard: this test consolidates under the DEFAULT
+            // flags (hard-delete, no lineage DAG); a sibling seeder (the #2894
+            // tombstone-mode pin, the consolidate_federation seeders) must not
+            // flip the process-global flag mid-body.
+            let _dag = crate::test_support::no_lineage_dag_guard();
             // #3190 (data-integrity, GA-blocker): when a Stage-6 auto-rollback
             // ITSELF fails, the sweep must FAIL CLOSED — halt loudly rather than
             // `continue` past an unverifiable-summary-served-as-truth /

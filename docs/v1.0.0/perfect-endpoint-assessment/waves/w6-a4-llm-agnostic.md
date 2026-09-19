@@ -35,7 +35,7 @@ Held-fraction toward **perfect §2.7 under ASI multi-vendor endpoint pressure** 
 | **Embedder neutrality + space migration** | **0.78** | API embedders shipped (#1598); one active dim/model; `reembed` is the switch tool; in-process non-HTTP trait still open (ROADMAP) |
 | **Simultaneous multi-vendor roles (producer × reflector × curator)** | **0.55** | Roles are process-config slots, not dual-backend first-class; composition = multi-process / multi-agent |
 | **Attested multi-family (TOFU + N≥3 write-gate)** | **0.48** default · **0.72** max-enrolled | Loader coverage hard-cap ~40%; enforce opt-in; CLAIMED metadata remains launderable when advisory |
-| **Lab-capture resistance (license + no exclusive path)** | **0.90** | Apache-2.0 + trademark; no compiled single-lab sole path |
+| **Lab-capture resistance (license + no exclusive path)** | **0.90** | Apache-2.0; no compiled single-lab sole path |
 | **Narrative / DX neutrality** | **0.70** | `OllamaClient` name retained; docs still lead with Ollama default |
 
 ### Headline SCORE (this ballot)

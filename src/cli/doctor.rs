@@ -18,7 +18,11 @@
 //! ## Severity rules (initial)
 //!
 //! - **Critical:** dim_violations > 0; pending_actions older than 24h;
-//!   sync skew > 600s; HNSW evictions > 0.
+//!   a sync peer whose last answered pull is older than the shared #3654
+//!   reachability window (3 × its catch-up cadence), a peer clock leading
+//!   this one beyond the pull-cursor bound, or an unreadable `sync_state`
+//!   (#3655);
+//!   HNSW evictions > 0.
 //! - **Warning:** silent-degrade flag from Capabilities v2
 //!   (recall_mode != "hybrid" on capable tiers); subscription delivery
 //!   success < 95% over the lifetime of the subscription.
@@ -36,8 +40,13 @@
 //!   has been wired yet. The doctor consults the Capabilities response
 //!   for the *active* mode at this instant and reports it as the only
 //!   data point.
-//! - **Sync mesh** (T3+): we report `last_pulled_at` skew across
-//!   `sync_state` rows when present, otherwise NOT_AVAILABLE.
+//! - **Sync mesh** (T3+, #3655): every `sync_state` row is aged against the
+//!   probe time (`contact` = `sync_peer_contact.last_contact_at`, the
+//!   reachability signal; `advanced` = `last_pulled_at`, the data-watermark
+//!   stamp; `data` = `last_seen_at`; `pushed` = `last_pushed_at`); an empty
+//!   table is NOT_AVAILABLE, an unreadable one is Critical, a malformed row
+//!   is Warning, a row with no recorded contact is Warning (unknown), and a
+//!   row whose contact is older than the #3654 window is Critical.
 //!
 //! ## Anti-goals (per spec)
 //!
@@ -88,6 +97,38 @@ const FACT_RPO_ON_POWER_LOSS: &str = "rpo_on_power_loss";
 /// exact confusion #3385 was filed over.
 const FACT_ARCHIVE_ON_GC_SOURCE: &str = "archive_on_gc_source";
 const FACT_MAX_SKEW_SECS: &str = "max_skew_secs";
+/// #3655 — the Sync section's fact keys. Per-peer facts are
+/// `peer::<agent>/<peer>::<suffix>`.
+const FACT_PEER_COUNT: &str = "peer_count";
+const FACT_PROBED_AT: &str = "probed_at";
+const FACT_INVALID_ROWS: &str = "invalid_rows";
+/// Peers whose last answered pull is older than the #3654 reachability window.
+const FACT_STALE_PEERS: &str = "stale_peers";
+/// Peers with no recorded contact (or no recorded cadence): reachability
+/// unknown, which is neither healthy nor stale.
+const FACT_UNKNOWN_PEERS: &str = "unknown_peers";
+const FACT_MAX_CONTACT_AGE_SECS: &str = "max_contact_age_secs";
+const FACT_MAX_ADVANCED_AGE_SECS: &str = "max_advanced_age_secs";
+const FACT_MAX_DATA_AGE_SECS: &str = "max_data_age_secs";
+const PEER_FACT_PREFIX: &str = "peer::";
+/// `reachable`, or `unknown:<reason>` with a #3654 reason.
+const PEER_FACT_REACHABILITY: &str = "reachability";
+const PEER_FACT_CONTACT_AGE: &str = "contact_age_secs";
+const PEER_FACT_CATCHUP_INTERVAL: &str = "catchup_interval_secs";
+const PEER_FACT_ADVANCED_AGE: &str = "advanced_age_secs";
+const PEER_FACT_DATA_AGE: &str = "data_age_secs";
+/// The one spelling for "this was not measured" in the Sync section.
+const NOT_OBSERVED: &str = "not_observed";
+/// The one spelling for a peer whose last answered pull is inside the window.
+const REACHABLE: &str = "reachable";
+/// A contact-only peer: it has answered pulls but never delivered data, so
+/// it has no `sync_state` row and no data cursors (v3 review).
+const PEER_NEVER_PULLED: &str = "never_pulled";
+const PEER_FACT_PUSHED_AGE: &str = "pushed_age_secs";
+const PEER_FACT_CLOCK_LEAD: &str = "clock_lead_secs";
+const PEER_FACT_INVALID: &str = "invalid";
+const PEER_NEVER_PUSHED: &str = "never_pushed";
+const SYNC_STATE_UNREADABLE: &str = "unreadable";
 const FACT_RECALL_MODE_ACTIVE: &str = "recall_mode_active";
 const FACT_RERANKER_ACTIVE: &str = "reranker_active";
 /// #3582 — remote capabilities key and doctor fact for federation posture.
@@ -97,6 +138,20 @@ const SECTION_EMBEDDINGS_REACHABILITY: &str = "Embeddings Reachability (#1598)";
 /// #3147 / #3155 — operator-visible identity health. Named to match the
 /// daemon WARN "See `ai-memory doctor` -> Identity".
 const SECTION_IDENTITY: &str = "Identity";
+/// v1.0.0 #3700 — the deployment-shape DETECTOR section, right after the
+/// declared shape (#3714) and before any database work: the signals this
+/// configuration shows versus the shape it declares, so a node configured
+/// like a fleet but declared `singleton` is reported unprompted, at the top.
+/// This is the pre-upgrade detector; it never re-postures.
+pub const SECTION_DEPLOYMENT_SHAPE_DETECTOR: &str = "Deployment shape detector (#3700)";
+/// v1.0.0 #3705 — the transit-encryption section, THIRD in the default
+/// report (after the deployment shape), so every surface that would refuse
+/// under the "only encrypted data in transit" mandate is reported unprompted
+/// before the upgrade that enforces it. Doctor never refuses.
+pub const SECTION_TRANSIT_ENCRYPTION: &str = "Transit encryption (#3705)";
+/// v1.0.0 #3717 — the key-posture section: every key role the declared
+/// shape needs, its typed state, and the command that fixes a finding.
+pub const SECTION_KEY_POSTURE: &str = "Key posture (#3717)";
 /// v1.0.0 #2972 — doctor fact naming the model this binary will ACTUALLY
 /// load, emitted only when it differs from the configured `model` fact.
 const EFFECTIVE_MODEL_FACT: &str = "effective_model";
@@ -121,6 +176,8 @@ const NOT_OBSERVED_PRE_P3: &str = "not_observed (pre-P3 rolling counter)";
 /// entirely (so a fresh-DB doctor report is unchanged).
 #[cfg(feature = "sal-postgres")]
 const SECTION_POSTGRES_EXTENSIONS: &str = "Postgres extensions (#3264)";
+/// v1.0.0 #3124 — the unstamped-owner census row (both backends).
+const SECTION_UNSTAMPED_OWNERS: &str = "Unstamped owners (#3124)";
 
 /// #3264 — anyhow context when the ephemeral probe runtime cannot be built.
 #[cfg(feature = "sal-postgres")]
@@ -163,6 +220,9 @@ const PG_EXT_NOT_INSTALLED: &str = "not installed";
 /// #3264 — fact key for the AGE-absent explanatory line.
 #[cfg(feature = "sal-postgres")]
 const KG_BACKEND_NOTE_KEY: &str = "kg_backend_note";
+/// #3756 — fact key carrying the AGE-version comparator's verdict.
+#[cfg(feature = "sal-postgres")]
+const FACT_AGE_VERSION_VERDICT: &str = "age_version_verdict";
 
 /// #3264 — AGE is opt-in; its absence is a legitimate deployment, so the
 /// row stays INFO and simply says what the KG will do instead.
@@ -1011,6 +1071,418 @@ fn snapshot_before_repair(
 // Local (--db) mode
 // ---------------------------------------------------------------------------
 
+/// v1.0.0 #3700 — the deployment-shape DETECTOR.
+///
+/// Read-only: observes the argv-free shape signals (env + config, and the
+/// agent registry when `registered_agents` is known), compares their floor
+/// with the DECLARED `[deployment] shape` (#3714) and reports the boot
+/// verdict that comparison implies. Promotion is an operator act — the
+/// daemon WARNS (and records) an undeclared promotion, it never re-postures
+/// — so the one thing this section must never do is claim a posture the
+/// node does not run. A hardened DECLARED shape with knobs below its floor
+/// is the refusal case. Doctor itself never refuses.
+fn section_deployment_shape_detector_3700(registered_agents: Option<usize>) -> ReportSection {
+    use crate::config::shape::detector::{self, ISSUE_TAG};
+    use crate::security_profile::SecurityPosture;
+    let app_config = if crate::config::skip_config() {
+        crate::config::AppConfig::default()
+    } else {
+        crate::config::AppConfig::load_for_boot().unwrap_or_default()
+    };
+    let mut observed = detector::observe(Some(&app_config), None);
+    if let Some(n) = registered_agents {
+        observed = observed.with_registry(n);
+    }
+    let assessment = match detector::assess(&app_config, observed) {
+        Ok(a) => a,
+        Err(e) => {
+            return ReportSection {
+                name: SECTION_DEPLOYMENT_SHAPE_DETECTOR.into(),
+                severity: Severity::Critical,
+                facts: vec![
+                    ("posture".into(), "unresolvable".into()),
+                    ("error".into(), e.to_string()),
+                ],
+                note: Some(format!(
+                    "{ISSUE_TAG}: the posture selector carries an unrecognised token; the \
+                     daemon refuses to boot on it (fail-loud). Set it to `standard` or \
+                     `asi-hard`, or unset it so the declared shape's floor applies."
+                )),
+            };
+        }
+    };
+    let list = |names: Vec<&str>| {
+        if names.is_empty() {
+            "none".to_string()
+        } else {
+            names.join(", ")
+        }
+    };
+    let below = crate::security_profile::asi_hard_below_floor();
+    let mut off: Vec<&str> = below.iter().map(|(env, _, _)| *env).collect();
+    if assessment.posture() == SecurityPosture::Standard {
+        off.extend(
+            crate::security_profile::pinned_knobs()
+                .into_iter()
+                .filter(|(env, _)| std::env::var_os(env).is_none())
+                .map(|(env, _)| env),
+        );
+    }
+    let line = assessment.promotion_line();
+    let hardened_below = assessment.declared.is_hardened() && !below.is_empty();
+    let (verdict, severity) = if hardened_below {
+        (
+            "REFUSES at next boot (hardened declared shape with knobs below floor)".to_string(),
+            Severity::Critical,
+        )
+    } else if assessment.unprotected_fleet() {
+        (
+            format!(
+                "boots UNPROTECTED — configuration looks like {}; declare {line}",
+                assessment.observed.observed_floor
+            ),
+            Severity::Critical,
+        )
+    } else if assessment.undeclared_promotion {
+        (
+            format!("boots — signals exceed the declared shape (declare {line})"),
+            Severity::Warning,
+        )
+    } else {
+        ("boots".to_string(), Severity::Info)
+    };
+    let facts = vec![
+        ("declared_shape".into(), assessment.declared.as_str().into()),
+        (
+            "observed_floor".into(),
+            assessment.observed.observed_floor.as_str().into(),
+        ),
+        (
+            "signals_present".into(),
+            list(assessment.observed.present()),
+        ),
+        (
+            "signals_unobservable".into(),
+            list(assessment.observed.unobservable()),
+        ),
+        (
+            "registered_agents".into(),
+            assessment.observed.registered_agents.map_or_else(
+                || {
+                    crate::config::shape::detector::SignalState::Unobservable
+                        .as_str()
+                        .to_string()
+                },
+                |n| n.to_string(),
+            ),
+        ),
+        (
+            "undeclared_promotion".into(),
+            assessment.undeclared_promotion.to_string(),
+        ),
+        (
+            "promotion_line".into(),
+            if assessment.undeclared_promotion {
+                line.clone()
+            } else {
+                "none".to_string()
+            },
+        ),
+        ("posture".into(), assessment.posture.clone()),
+        ("posture_origin".into(), assessment.origin.as_str().into()),
+        ("protections_off".into(), off.len().to_string()),
+        ("protections_off_list".into(), list(off)),
+        ("boot_verdict".into(), verdict),
+    ];
+    let note = match severity {
+        Severity::Info => None,
+        _ if hardened_below => Some(format!(
+            "{ISSUE_TAG}: {} declares a shape whose floor is asi-hard, and {} protection(s) \
+             are set BELOW that floor ({}); the daemon refuses to boot until each is raised \
+             or unset (so the shape pins it). `ai-memory doctor` is the pre-upgrade \
+             detector.",
+            assessment.declared.config_line(),
+            below.len(),
+            below
+                .iter()
+                .map(|(env, _, _)| *env)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+        _ => Some(format!(
+            "{ISSUE_TAG}: this node declares `{}` but its configuration looks like `{}` \
+             (signals: {}). Promotion is an operator act: nothing is re-postured; declare \
+             {line} to run it as what it is (the shape then pins the hardened posture). \
+             `ai-memory doctor` is the pre-upgrade detector.",
+            assessment.declared,
+            assessment.observed.observed_floor,
+            list(assessment.observed.present())
+        )),
+    };
+    ReportSection {
+        name: SECTION_DEPLOYMENT_SHAPE_DETECTOR.into(),
+        severity,
+        facts,
+        note,
+    }
+}
+
+/// v1.0.0 #3705 — every transit surface versus the mandate.
+///
+/// Read-only. The daemon's own listener is argv-only (`--tls-cert` /
+/// `--tls-key`) and therefore unobservable from doctor; what IS observable
+/// is everything that decides a boot before a socket exists: the
+/// `AI_MEMORY_REQUIRE_TLS` token (one grammar; falsy or unrecognised
+/// refuses), the removed downgrade paths (a truthy value refuses), the MCP
+/// forward URL scheme, the PostgreSQL DSN `sslmode` floor, and — once the
+/// store is open — the webhook subscriptions whose target is plaintext
+/// (refused at dispatch and at create). LLM / embedding egress URLs are
+/// DETECTED only: they carry prompt and memory content, but their
+/// refusal is the open item the operator has not ruled on yet.
+#[allow(deprecated)] // the legacy flat `ollama_url` is still a live egress URL
+fn section_transit_encryption_3705(conn: Option<&rusqlite::Connection>) -> ReportSection {
+    use crate::transit_encryption::{
+        self, ENV_REQUIRE_TLS, ISSUE_TAG, MANDATE, PG_SSLMODE_FLOOR, REMEDY_ENTERPRISE_PKI,
+        REMEDY_TLS_RENEW, RequireTls,
+    };
+    let app_config = if crate::config::skip_config() {
+        crate::config::AppConfig::default()
+    } else {
+        crate::config::AppConfig::load_for_boot().unwrap_or_default()
+    };
+    // Everything that will REFUSE the next boot / connect, by name.
+    let mut refuses: Vec<String> = Vec::new();
+    let token = match transit_encryption::require_tls_token() {
+        RequireTls::Floor => "unset (floor)".to_string(),
+        RequireTls::Affirmed => "affirmed".to_string(),
+        RequireTls::DowngradeRequested(t) => {
+            refuses.push(format!("{ENV_REQUIRE_TLS}={t:?}"));
+            format!("downgrade requested: {t:?} — REFUSES boot")
+        }
+        RequireTls::Unrecognised(t) => {
+            refuses.push(format!("{ENV_REQUIRE_TLS}={t:?}"));
+            format!("unrecognised: {t:?} — REFUSES boot")
+        }
+    };
+    let armed = transit_encryption::armed_downgrade_paths();
+    let downgrade_paths = if armed.is_empty() {
+        "none".to_string()
+    } else {
+        refuses.extend(armed.iter().map(|s| (*s).to_string()));
+        format!("{} — REFUSES boot", armed.join(", "))
+    };
+    let forward_url = match app_config.mcp_federation_forward_url.as_deref() {
+        None => "unset".to_string(),
+        Some(u) if transit_encryption::url_is_plaintext_http(u) => {
+            refuses.push(crate::config::shape::detector::SIGNAL_MCP_FEDERATION_FORWARD.to_string());
+            "PLAINTEXT http — REFUSES boot".to_string()
+        }
+        // Origin only — a forward URL can carry a token; never echo it.
+        Some(u) => format!("https ({})", transit_encryption::url_origin_for_refusal(u)),
+    };
+    let store_url_sslmode = match crate::store_url::resolve_store_url(None) {
+        Ok(None) => "sqlite (no store URL)".to_string(),
+        Ok(Some(dsn))
+            if !dsn
+                .trim_start()
+                .to_ascii_lowercase()
+                .starts_with("postgres") =>
+        {
+            "sqlite (store URL is not postgres)".to_string()
+        }
+        Ok(Some(dsn)) if transit_encryption::dsn_pins_sslmode_verify_full(&dsn) => {
+            format!("postgres: sslmode={PG_SSLMODE_FLOOR} pinned")
+        }
+        Ok(Some(_)) => {
+            refuses.push("store URL sslmode".to_string());
+            format!("postgres: sslmode={PG_SSLMODE_FLOOR} NOT pinned — REFUSES at connect")
+        }
+        Err(e) => format!("unresolvable: {e:#}"),
+    };
+    let (webhook_targets, webhook_plaintext) = match conn {
+        None => (
+            crate::config::shape::detector::SignalState::Unobservable
+                .as_str()
+                .to_string(),
+            0_i64,
+        ),
+        Some(c) => match c.query_row(
+            "SELECT COUNT(*) FROM subscriptions WHERE lower(substr(url, 1, 7)) = 'http://'",
+            [],
+            |r| r.get::<_, i64>(0),
+        ) {
+            Ok(n) => (format!("{n} (refused at dispatch and at create)"), n),
+            Err(e) => (format!("unreadable: {e}"), 0_i64),
+        },
+    };
+    // DETECT ONLY — the operator's ruling on model-server egress is open.
+    let mut egress: Vec<&str> = Vec::new();
+    if app_config
+        .llm
+        .as_ref()
+        .and_then(|l| l.base_url.as_deref())
+        .is_some_and(transit_encryption::url_is_plaintext_http)
+    {
+        egress.push("[llm].base_url");
+    }
+    if app_config
+        .embeddings
+        .as_ref()
+        .and_then(|e| e.url.as_deref().or(e.base_url.as_deref()))
+        .is_some_and(transit_encryption::url_is_plaintext_http)
+    {
+        egress.push("[embeddings].url");
+    }
+    if app_config.ollama_url.is_some()
+        && transit_encryption::url_is_plaintext_http(app_config.effective_ollama_url())
+    {
+        egress.push("ollama_url (legacy)");
+    }
+    let llm_egress = if egress.is_empty() {
+        "none configured (the compiled Ollama default is plaintext http://localhost:11434 \
+         when a local model server is used — detected, not enforced)"
+            .to_string()
+    } else {
+        format!(
+            "{} — PLAINTEXT model-server egress carries prompt and memory content \
+             (detected only; refusal awaits the operator's ruling)",
+            egress.join(", ")
+        )
+    };
+    // v1.0.0 #3709 item 1 — the zero-config local certificate under
+    // `<key_dir>/tls/`: absent (first boot generates it), present with its
+    // expiry and SANs, inside the renewal window (renews at next boot or by
+    // the daily in-daemon task), expired (refuses), or unreadable (a corrupt
+    // artefact is reported, never treated as absent).
+    // 3x7 audit ruling (#3709): zero-config local-CA minting is for the
+    // SINGLETON shape only — an unmanaged CA on a fleet-shaped estate is an
+    // audit finding, so a fleet must bring enterprise PKI. The shape is the
+    // operator's DECLARATION (`[deployment] shape`, absent = singleton) —
+    // never the observed signals: the #3700 detector may warn about an
+    // undeclared promotion, it may not re-posture (promotion is an operator
+    // act), and this section follows the same rule.
+    let declared = app_config.effective_shape();
+    let fleet = declared != crate::config::shape::DeploymentShape::Singleton;
+    let key_dir = crate::identity::keypair::resolved_default_key_dir_path();
+    let locally_minted = key_dir.as_ref().is_ok_and(|dir| {
+        dir.join(crate::tls_bootstrap::TLS_SUBDIR)
+            .join(crate::tls_bootstrap::LOCAL_CA_CERT_FILE)
+            .exists()
+    });
+    let mut leaf_warning = false;
+    let mut leaf_expired = false;
+    let mut fleet_pki_missing = false;
+    let local_tls_material = match key_dir
+        .as_ref()
+        .map_err(|e| format!("{e:#}"))
+        .and_then(|dir| crate::tls_bootstrap::leaf_status(dir).map_err(|e| format!("{e:#}")))
+    {
+        Ok(status) if !status.present && fleet => {
+            fleet_pki_missing = true;
+            format!(
+                "absent — enterprise PKI required under `{}`: \
+                 {REMEDY_ENTERPRISE_PKI} — REFUSES boot without --tls-cert/--tls-key",
+                declared.config_line()
+            )
+        }
+        Ok(status) if !status.present => {
+            "absent (first boot will generate a local certificate under <key_dir>/tls/, or \
+             supply --tls-cert/--tls-key)"
+                .to_string()
+        }
+        Ok(_) if fleet && locally_minted => {
+            fleet_pki_missing = true;
+            format!(
+                "present but LOCALLY MINTED — an unmanaged CA under `{}` is an audit \
+                 finding; REFUSES at next boot; import enterprise PKI: {REMEDY_ENTERPRISE_PKI}",
+                declared.config_line()
+            )
+        }
+        Ok(status) => {
+            let days = status.days_remaining.unwrap_or(0);
+            if days < 0 {
+                leaf_expired = true;
+                format!(
+                    "present, EXPIRED {} day(s) ago — REFUSES at next boot; {REMEDY_TLS_RENEW}",
+                    -days
+                )
+            } else if status.within_renewal_window || days == 0 {
+                leaf_warning = true;
+                format!(
+                    "present, INSIDE the renewal window ({days} day(s) to expiry) — a locally \
+                     minted leaf renews at the next boot or by the daily task; operator material: \
+                     {REMEDY_TLS_RENEW}"
+                )
+            } else {
+                format!(
+                    "present, {days} day(s) to expiry, SANs: {}",
+                    if status.subject_alt_names.is_empty() {
+                        "none".to_string()
+                    } else {
+                        status.subject_alt_names.join(", ")
+                    }
+                )
+            }
+        }
+        Err(e) => format!("unreadable: {e}"),
+    };
+    if leaf_expired {
+        refuses.push("local TLS certificate expired".to_string());
+    }
+    if fleet_pki_missing {
+        refuses.push("declared non-singleton shape without enterprise PKI".to_string());
+    }
+    let listener_tls = format!(
+        "operator --tls-cert/--tls-key (unobservable from this process) or the local \
+         certificate in {}/{}; a bind without either is refused, loopback included",
+        key_dir
+            .as_ref()
+            .map_or_else(|_| "<key_dir>".to_string(), |d| d.display().to_string()),
+        crate::tls_bootstrap::TLS_SUBDIR
+    );
+    let verdict = if refuses.is_empty() {
+        "boots with in-process TLS only (a plaintext listener is refused)".to_string()
+    } else {
+        format!("REFUSES at next boot: {}", refuses.join(", "))
+    };
+    let severity = if !refuses.is_empty() || webhook_plaintext > 0 {
+        Severity::Critical
+    } else if !egress.is_empty() || leaf_warning {
+        Severity::Warning
+    } else {
+        Severity::Info
+    };
+    let facts = vec![
+        ("mandate".into(), MANDATE.to_string()),
+        ("listener_tls".into(), listener_tls),
+        ("local_tls_material".into(), local_tls_material),
+        ("require_tls_token".into(), token),
+        ("downgrade_paths_armed".into(), downgrade_paths),
+        (
+            crate::config::shape::detector::SIGNAL_MCP_FEDERATION_FORWARD.into(),
+            forward_url,
+        ),
+        ("store_url_sslmode".into(), store_url_sslmode),
+        ("webhook_plaintext_targets".into(), webhook_targets),
+        ("llm_egress_plaintext".into(), llm_egress),
+        ("boot_verdict".into(), verdict),
+    ];
+    let note = (severity != Severity::Info).then(|| {
+        format!(
+            "{ISSUE_TAG}: {MANDATE} — a plaintext listener, peer, webhook target, MCP forward \
+             URL or PostgreSQL socket is refused, loopback included; provide --tls-cert / \
+             --tls-key, https:// targets and sslmode={PG_SSLMODE_FLOOR}. `ai-memory doctor` \
+             is the pre-upgrade detector: run it BEFORE upgrading to learn what will refuse."
+        )
+    });
+    ReportSection {
+        name: SECTION_TRANSIT_ENCRYPTION.into(),
+        severity,
+        facts,
+        note,
+    }
+}
+
 fn section_peer_allowlist_3582(report: &crate::federation::peer_posture::Report) -> ReportSection {
     use crate::federation::peer_posture::Verdict;
     let severity = match report.verdict {
@@ -1092,6 +1564,20 @@ fn run_local(db_path: &Path, caller_agent_id: Option<&str>) -> Report {
     // `ai-memory.db` in `$PWD`, so the very next step ("could not open
     // database") is a SYMPTOM whose cause would otherwise never be printed.
     sections.push(section_config_health_3166());
+    if let Some(section) = section_deployment_shape_3714() {
+        sections.push(section);
+    }
+    // v1.0.0 #3700 — the DETECTOR, immediately after the declared shape
+    // (#3714) and before the database open: the signals this configuration
+    // shows versus the shape it declares. Detection warns, never
+    // re-postures. The registry signal is folded in once the connection is
+    // open (below); until then it is reported as unobservable, never absent.
+    sections.push(section_deployment_shape_detector_3700(None));
+    // v1.0.0 #3705 — THIRD, before the database open: every transit surface
+    // versus the "only encrypted data in transit" mandate. The webhook
+    // census is folded in once the connection is open (below); until then
+    // it is reported as unobservable, never as zero.
+    sections.push(section_transit_encryption_3705(None));
     sections.push(section_peer_allowlist_3582(
         &crate::federation::peer_posture::observe(None),
     ));
@@ -1105,6 +1591,10 @@ fn run_local(db_path: &Path, caller_agent_id: Option<&str>) -> Report {
     // URL outright).
     #[cfg(feature = "sal-postgres")]
     if let Some(pg) = section_postgres_extensions_3264() {
+        sections.push(pg);
+    }
+    #[cfg(feature = "sal-postgres")]
+    if let Some(pg) = section_postgres_unstamped_owners_3124() {
         sections.push(pg);
     }
 
@@ -1161,6 +1651,7 @@ fn run_local(db_path: &Path, caller_agent_id: Option<&str>) -> Report {
                 facts.push((FACT_SCHEMA_STAMP.into(), "behind".into()));
             }
             sections.push(section_identity_3147(None, db_path, caller_agent_id));
+            sections.push(section_key_posture_3717(caller_agent_id));
             sections.push(ReportSection {
                 name: "Storage".into(),
                 severity: Severity::Critical,
@@ -1228,12 +1719,39 @@ fn run_local(db_path: &Path, caller_agent_id: Option<&str>) -> Report {
         }
     };
 
+    // v1.0.0 #3700 — fold the store-derived registry signal into the shape
+    // section at index 1 (a fleet by registry alone is invisible pre-open).
+    // A registry that cannot be read stays `unobservable` in the section
+    // rather than being reported as an empty registry.
+    if let Some(slot) = sections
+        .iter_mut()
+        .find(|s| s.name == SECTION_DEPLOYMENT_SHAPE_DETECTOR)
+    {
+        *slot =
+            section_deployment_shape_detector_3700(db::list_agents(&conn).ok().map(|a| a.len()));
+    }
+    // v1.0.0 #3705 — fold the subscriptions census into the transit section
+    // at index 2 (plaintext webhook targets are invisible pre-open).
+    if let Some(slot) = sections
+        .iter_mut()
+        .find(|s| s.name == SECTION_TRANSIT_ENCRYPTION)
+    {
+        *slot = section_transit_encryption_3705(Some(&conn));
+    }
     sections.push(section_identity_3147(Some(&conn), db_path, caller_agent_id));
+    // v1.0.0 #3717 — every key ROLE the declared shape needs, from the same
+    // table `keys init` / `keys status` consume, each finding naming the
+    // command that fixes it. Filesystem only; no key material is read.
+    sections.push(section_key_posture_3717(caller_agent_id));
     sections.push(section_storage(&conn, db_path));
     sections.push(section_index(&conn));
     sections.push(section_embedding_space_census_2167(&conn));
     sections.push(section_recall_index_coverage_1964(&conn));
     sections.push(section_corpus_lifecycle_1965(&conn));
+    sections.push(section_unstamped_owners_3124(
+        crate::identity::owner_stamp::sqlite_census(&conn).map_err(anyhow::Error::from),
+        crate::identity::owner_stamp::BACKEND_LABEL_SQLITE,
+    ));
     sections.push(section_recall_local());
     sections.push(section_governance(&conn));
     sections.push(section_sync(&conn));
@@ -1322,6 +1840,124 @@ where
     })
 }
 
+/// v1.0.0 #3124 — render the unstamped-owner census for one backend.
+///
+/// Severity contract (vote constraint 2): `Info` when both live counts are 0;
+/// `Warning` when unstamped / malformed rows exist under the default
+/// `AI_MEMORY_UNSTAMPED_MUTATION=warn`; `Critical` when they exist under
+/// `refuse` (every caller-scoped mutation of those rows is now refused). A
+/// census that could not be read is `Critical` — never reported as 0.
+fn section_unstamped_owners_3124(
+    census: Result<crate::identity::owner_stamp::UnstampedCensus>,
+    backend: &str,
+) -> ReportSection {
+    use crate::identity::owner_stamp::{CENSUS_REMEDY, ENV_UNSTAMPED_MUTATION, mode};
+    let posture = mode();
+    let raw_env = std::env::var(ENV_UNSTAMPED_MUTATION).ok();
+    let mut facts = vec![
+        ("backend".into(), backend.to_string()),
+        (
+            "unstamped_mutation_mode".into(),
+            posture.as_str().to_string(),
+        ),
+    ];
+    if let Some(raw) = raw_env.as_deref()
+        && !crate::identity::owner_stamp::is_recognised_token(raw)
+    {
+        facts.push((
+            "unrecognised_value".into(),
+            format!("{raw:?} (boot refuses this value; accepted: warn | refuse)"),
+        ));
+    }
+    let c = match census {
+        Ok(c) => c,
+        Err(e) => {
+            facts.push(("error".into(), format!("{e:#}")));
+            return ReportSection {
+                name: SECTION_UNSTAMPED_OWNERS.into(),
+                severity: Severity::Critical,
+                facts,
+                note: Some("the unstamped-owner census could not be read".into()),
+            };
+        }
+    };
+    facts.push(("unstamped_rows".into(), c.unstamped.to_string()));
+    facts.push(("malformed_owner_rows".into(), c.malformed.to_string()));
+    facts.push((
+        "archived_unstamped_rows".into(),
+        c.archived_unstamped.to_string(),
+    ));
+    let affected = c.unstamped.saturating_add(c.malformed);
+    let (severity, note) = if affected == 0 {
+        (Severity::Info, None)
+    } else if posture.refuses() {
+        (
+            Severity::Critical,
+            Some(format!(
+                "{affected} live row(s) carry no provable owner and every caller-scoped \
+                 mutation of them is REFUSED under {ENV_UNSTAMPED_MUTATION}=refuse — {CENSUS_REMEDY}"
+            )),
+        )
+    } else {
+        (
+            Severity::Warning,
+            Some(format!(
+                "{affected} live row(s) carry no provable owner; under the default \
+                 {ENV_UNSTAMPED_MUTATION}=warn any caller may mutate the unstamped ones \
+                 (each admission WARNs) — {CENSUS_REMEDY}"
+            )),
+        )
+    };
+    ReportSection {
+        name: SECTION_UNSTAMPED_OWNERS.into(),
+        severity,
+        facts,
+        note,
+    }
+}
+
+/// v1.0.0 #3124 — the postgres twin of the unstamped-owner census. `None`
+/// on a SQLite deployment (no `postgres://` store URL), like
+/// [`section_postgres_extensions_3264`].
+#[cfg(feature = "sal-postgres")]
+fn section_postgres_unstamped_owners_3124() -> Option<ReportSection> {
+    let url = match crate::store_url::resolve_store_url(None) {
+        Ok(Some(url)) if crate::store_url::is_postgres_url(&url) => url,
+        // No postgres store (or an unresolvable one — the extensions
+        // section already reports that as Critical).
+        _ => return None,
+    };
+    let census: Result<crate::identity::owner_stamp::UnstampedCensus> =
+        run_pg_probe(|| async move {
+            let probe = async {
+                let pool = sqlx::postgres::PgPoolOptions::new()
+                    .max_connections(1)
+                    .acquire_timeout(PG_PROBE_TIMEOUT)
+                    .connect(&url)
+                    .await?;
+                let (unstamped, malformed, archived): (i64, i64, i64) =
+                    sqlx::query_as(crate::identity::owner_stamp::PG_CENSUS_SQL)
+                        .fetch_one(&pool)
+                        .await?;
+                pool.close().await;
+                Ok::<_, sqlx::Error>(crate::identity::owner_stamp::UnstampedCensus {
+                    unstamped: u64::try_from(unstamped).unwrap_or(0),
+                    malformed: u64::try_from(malformed).unwrap_or(0),
+                    archived_unstamped: u64::try_from(archived).unwrap_or(0),
+                })
+            };
+            tokio::time::timeout(PG_PROBE_TIMEOUT, probe)
+                .await
+                .map_err(|_elapsed| anyhow::anyhow!(MSG_PG_PROBE_TIMEOUT))?
+                .map_err(anyhow::Error::from)
+        })
+        .and_then(|inner| inner);
+    Some(section_unstamped_owners_3124(
+        census,
+        crate::identity::owner_stamp::BACKEND_LABEL_POSTGRES,
+    ))
+}
+
 /// v1.0.0 (#3264) — "Postgres extensions" report row(s).
 ///
 /// Returns `None` when the resolved store is not a `postgres://` DSN, so a
@@ -1357,10 +1993,7 @@ fn section_postgres_extensions_3264() -> Option<ReportSection> {
             return Some(ReportSection {
                 name: SECTION_POSTGRES_EXTENSIONS.into(),
                 severity: Severity::Critical,
-                facts: vec![(
-                    "error".into(),
-                    crate::logging::redact_urls_in_message(&format!("{e:#}")),
-                )],
+                facts: vec![("error".into(), format!("{e:#}"))],
                 note: Some(MSG_PG_STORE_URL_UNRESOLVED.into()),
             });
         }
@@ -1370,7 +2003,7 @@ fn section_postgres_extensions_3264() -> Option<ReportSection> {
     }
     // Never echo the DSN credential into a report an operator pastes into a
     // ticket (#1893 / #1579 A3 discipline).
-    let redacted = crate::logging::redact_url_password(&url);
+    let redacted = crate::url_display::store_url_display(&url);
 
     type Probe = (PgvectorPreflightFacts, Option<String>, Option<String>);
     let probed: Result<Probe> = run_pg_probe(|| async move {
@@ -1406,10 +2039,7 @@ fn section_postgres_extensions_3264() -> Option<ReportSection> {
                 severity: Severity::Critical,
                 facts: vec![
                     ("store".into(), redacted),
-                    (
-                        "error".into(),
-                        crate::logging::redact_urls_in_message(&format!("{e:#}")),
-                    ),
+                    ("error".into(), format!("{e:#}")),
                 ],
                 note: Some(
                     "could not probe the configured postgres store for pgvector / AGE — the \
@@ -1454,6 +2084,21 @@ fn section_postgres_extensions_3264() -> Option<ReportSection> {
             facts.age_catalog_usage.to_string(),
         ),
         ("pgvector_verdict".into(), verdict.label().to_string()),
+        // #3756 — the comparator's verdict on the installed version
+        // (`canonical` / `tested_alternate` / `below_floor` / `unparseable`;
+        // `not installed` when AGE is absent), so the operator sees the
+        // judgement next to the number it judged.
+        (
+            FACT_AGE_VERSION_VERDICT.into(),
+            age_version.as_deref().map_or_else(
+                || PG_EXT_NOT_INSTALLED.to_string(),
+                |v| {
+                    crate::store::postgres::age_version::age_version_verdict(v)
+                        .label()
+                        .to_string()
+                },
+            ),
+        ),
     ];
 
     // The CRITICAL arm carries the EXACT remedy text the bootstrap abort
@@ -1461,7 +2106,7 @@ fn section_postgres_extensions_3264() -> Option<ReportSection> {
     let (severity, note) = pg_extensions_verdict_3264(
         verdict,
         &facts.database,
-        age_version.is_some(),
+        age_version.as_deref(),
         facts.age_catalog_usage,
     );
 
@@ -1502,13 +2147,29 @@ fn section_postgres_extensions_3264() -> Option<ReportSection> {
 fn pg_extensions_verdict_3264(
     verdict: crate::store::postgres::PgvectorPreflight,
     database: &str,
-    age_installed: bool,
+    age_version: Option<&str>,
     age_catalog_usage: bool,
 ) -> (Severity, Option<String>) {
+    use crate::store::postgres::age_version::{
+        AgeVersionVerdict, age_version_remedy, age_version_verdict,
+    };
     use crate::store::postgres::{MSG_PGVECTOR_MAY_NEED_ADMIN_CREATE, PgvectorPreflight};
+    let age_installed = age_version.is_some();
 
     if let Some(detail) = verdict.preemptive_refusal_detail(database) {
         return (Severity::Critical, Some(detail));
+    }
+    // v1.0.0 #3756 — JUDGE the installed AGE version instead of displaying
+    // it. Below the tested floor (or unparseable) is CRITICAL with the named
+    // remedy: on such a substrate the graph projection drops edge validity
+    // and kg_timeline omits edges kg_query returns — two answers from one
+    // store behind a green doctor. It ranks below the pgvector CRITICAL
+    // (the daemon cannot boot at all) and above every WARN.
+    let age = age_version.map(|v| (v, age_version_verdict(v)));
+    if let Some((v, verdict_age)) = age
+        && verdict_age.is_red()
+    {
+        return (Severity::Critical, age_version_remedy(v, verdict_age));
     }
     if verdict == PgvectorPreflight::AvailableNeedsSuperuserCreate {
         return (
@@ -1520,6 +2181,14 @@ fn pg_extensions_verdict_3264(
         return (
             Severity::Warning,
             Some(MSG_AGE_CATALOG_USAGE_MISSING.to_string()),
+        );
+    }
+    // #3756 — the tested alternate (or any above-floor non-canonical
+    // version) is YELLOW: bootable and tested, not the certified pin.
+    if let Some((v, AgeVersionVerdict::TestedAlternate)) = age {
+        return (
+            Severity::Warning,
+            age_version_remedy(v, AgeVersionVerdict::TestedAlternate),
         );
     }
     (Severity::Info, None)
@@ -1613,6 +2282,199 @@ fn section_config_health_3166() -> ReportSection {
     }
 }
 
+/// #3714 — the deployment shape and the two floors v1.0.0 enforces from
+/// it (posture, at-rest), rendered with their markers so an operator sees
+/// what the shape requires versus suggests. `None` when the config could
+/// not be loaded (the Configuration section above already reports that)
+/// or when config loading is skipped.
+fn section_deployment_shape_3714() -> Option<ReportSection> {
+    const NAME: &str = "Deployment shape (#3714)";
+    if crate::config::skip_config() {
+        return None;
+    }
+    let config = crate::config::AppConfig::load_for_boot().ok()?;
+    let shape = config.effective_shape();
+    let derived = shape.derive();
+    let mut facts: Vec<(String, String)> = vec![(
+        crate::models::field_names::SHAPE.into(),
+        shape.as_str().into(),
+    )];
+    for row in derived.rows() {
+        let [setting, marker, value, _enforced_by] = row;
+        facts.push((setting, format!("{value} ({marker})")));
+    }
+    let env = std::env::var(crate::security_profile::ENV_SECURITY_PROFILE).ok();
+    match crate::config::shape::evaluate_boot(&config, env.as_deref()) {
+        Ok((report, pin)) => {
+            let mut severity = Severity::Info;
+            let mut notes = Vec::new();
+            if let Some(value) = pin {
+                facts.push((
+                    "security_posture_at_boot".into(),
+                    format!("pinned to {value} by the shape (env unset)"),
+                ));
+            }
+            if report.at_rest_pending_escrow {
+                severity = severity_max(severity, Severity::Warning);
+                facts.push((
+                    "at_rest_status".into(),
+                    "required, NOT enabled by the shape (escrow gate #3717 S4)".into(),
+                ));
+                notes.push(crate::config::shape::at_rest_pending_escrow_warning(shape));
+            }
+            if report.at_rest_on_without_escrow {
+                severity = severity_max(severity, Severity::Warning);
+                facts.push((
+                    "at_rest_status".into(),
+                    "enabled ahead of the shape-driven escrow gate (#3717 S4)".into(),
+                ));
+                notes.push(
+                    "see \"Key posture (#3717)\": an at-rest key without its recovery escrow \
+                     loses `content` when it is lost"
+                        .into(),
+                );
+            }
+            Some(ReportSection {
+                name: NAME.into(),
+                severity,
+                facts,
+                note: (!notes.is_empty()).then(|| notes.join(" ")),
+            })
+        }
+        Err(e) => {
+            facts.push(("boot".into(), "REFUSED".into()));
+            Some(ReportSection {
+                name: NAME.into(),
+                severity: Severity::Critical,
+                facts,
+                note: Some(format!("{e:#}")),
+            })
+        }
+    }
+}
+
+/// The one "could not resolve" fact value (two #3147 sites, one #3717 site;
+/// pm-v3.1 hardcoded-literal gate).
+fn unresolved_fact(e: &anyhow::Error) -> String {
+    format!("unresolved: {e:#}")
+}
+
+/// v1.0.0 #3717 — the key posture in plain language: for every role the
+/// declared shape needs, its typed state (present / MISSING / PARTIAL
+/// recoverable / PARTIAL private-half-lost / unreadable / operator-supplied),
+/// the TLS leaf's expiry, and the command that fixes it — from the SAME
+/// table `keys init` and `keys status` consume. Reads no key material.
+fn section_key_posture_3717(caller_agent_id: Option<&str>) -> ReportSection {
+    use crate::keys::roles::{self, Need, Partial, RoleState};
+    let mut facts = Vec::new();
+    let mut note: Option<String> = None;
+    let unresolved = |what: &str, e: &anyhow::Error, severity: Severity| ReportSection {
+        name: SECTION_KEY_POSTURE.into(),
+        severity,
+        facts: vec![(what.into(), unresolved_fact(e))],
+        note: None,
+    };
+    let app_config = if crate::config::skip_config() {
+        crate::config::AppConfig::default()
+    } else {
+        crate::config::AppConfig::load_for_boot().unwrap_or_default()
+    };
+    let shape = app_config.effective_shape();
+    let agent_id = match crate::identity::resolve_agent_id(caller_agent_id, None) {
+        Ok(id) => id,
+        Err(e) => return unresolved("agent_id", &e, Severity::Warning),
+    };
+    let dir = match crate::identity::keypair::resolved_default_key_dir_path() {
+        Ok(dir) => dir,
+        Err(e) => return unresolved("key_dir", &e, Severity::Warning),
+    };
+    let posture = match roles::observe(&dir, &agent_id, shape, &app_config) {
+        Ok(p) => p,
+        Err(e) => return unresolved("key_posture", &e, Severity::Critical),
+    };
+    let plan = roles::plan(&posture, &roles::PlanOptions::default());
+    facts.push(("key_dir".into(), dir.display().to_string()));
+    facts.push(("agent_id".into(), agent_id));
+    facts.push((
+        crate::models::field_names::SHAPE.into(),
+        shape.config_line(),
+    ));
+    facts.push((
+        roles::FIELD_RECOVERY_ENROLLED.into(),
+        if posture.recovery_enrolled {
+            "yes"
+        } else {
+            "no"
+        }
+        .into(),
+    ));
+    let mut severity = Severity::Info;
+    for (r, step) in posture.roles.iter().zip(&plan.steps) {
+        let word = super::keys::state_word(r);
+        match r.state {
+            RoleState::Complete | RoleState::OperatorSupplied => {}
+            RoleState::Absent if r.need == Need::NotRequired => {}
+            RoleState::Absent | RoleState::Partial(Partial::Recoverable) => {
+                severity = severity_max(severity, Severity::Warning);
+                append_note(
+                    &mut note,
+                    &format!(
+                        "{} is {word} ({}) — fix: {}",
+                        r.id.label(),
+                        r.why,
+                        match step.action {
+                            roles::Action::CannotMint => step.reason.clone(),
+                            _ => r
+                                .mint_command
+                                .clone()
+                                .unwrap_or_else(|| step.reason.clone()),
+                        }
+                    ),
+                );
+            }
+            RoleState::Partial(Partial::LostPrivate | Partial::Unreadable) => {
+                severity = severity_max(severity, Severity::Critical);
+                append_note(&mut note, &format!("{} {word}: {}", r.id.label(), r.detail));
+            }
+        }
+        if let Some(days) = r.expires_in_days.filter(|d| *d < 0) {
+            severity = severity_max(severity, Severity::Critical);
+            append_note(
+                &mut note,
+                &format!(
+                    "tls certificate EXPIRED {} day(s) ago — the next boot REFUSES; fix: {}",
+                    -days,
+                    crate::transit_encryption::REMEDY_TLS_RENEW
+                ),
+            );
+        } else if let Some(days) = r
+            .expires_in_days
+            .filter(|d| *d <= crate::tls_bootstrap::RENEWAL_WINDOW_DAYS)
+        {
+            severity = severity_max(severity, Severity::Warning);
+            append_note(
+                &mut note,
+                &format!(
+                    "tls certificate expires in {days} day(s) — a locally minted leaf renews \
+                     at the next boot; operator material: {}",
+                    crate::transit_encryption::REMEDY_TLS_RENEW
+                ),
+            );
+        }
+        facts.push((r.id.label().into(), format!("{word} — {}", r.purpose)));
+    }
+    if let Some(text) = roles::loose_text(&posture) {
+        severity = severity_max(severity, Severity::Critical);
+        append_note(&mut note, &text.replace('\n', " "));
+    }
+    ReportSection {
+        name: SECTION_KEY_POSTURE.into(),
+        severity,
+        facts,
+        note,
+    }
+}
+
 /// Accumulator for the Identity doctor section.
 type IdentityAcc = (Vec<(String, String)>, Severity, Vec<String>);
 
@@ -1630,7 +2492,7 @@ fn identity_keystore_facts() -> IdentityAcc {
         }
         Err(e) => {
             severity = severity_max(severity, Severity::Warning);
-            facts.push(("key_dir".into(), format!("unresolved: {e:#}")));
+            facts.push(("key_dir".into(), unresolved_fact(&e)));
         }
     }
     (facts, severity, notes)
@@ -1644,7 +2506,7 @@ fn identity_dir_mode_facts(
 ) {
     if !dir.exists() {
         facts.push((
-            "key_dir_mode".into(),
+            crate::keys::roles::FIELD_KEY_DIR_MODE.into(),
             "missing (will be created 0700)".into(),
         ));
         return;
@@ -1655,7 +2517,10 @@ fn identity_dir_mode_facts(
         match std::fs::metadata(dir) {
             Ok(md) => {
                 let mode = md.permissions().mode() & 0o7777;
-                facts.push(("key_dir_mode".into(), format!("{mode:o}")));
+                facts.push((
+                    crate::keys::roles::FIELD_KEY_DIR_MODE.into(),
+                    format!("{mode:o}"),
+                ));
                 // SAFETY: geteuid has no preconditions (UNSAFE-01).
                 let euid = unsafe { libc::geteuid() };
                 let uid = md.uid();
@@ -1746,7 +2611,7 @@ fn identity_caller_signing_facts(
         Ok(id) => id,
         Err(e) => {
             *severity = severity_max(*severity, Severity::Warning);
-            facts.push(("caller_agent_id".into(), format!("unresolved: {e:#}")));
+            facts.push(("caller_agent_id".into(), unresolved_fact(&e)));
             facts.push(("signing".into(), "UNSIGNED — caller id unresolved".into()));
             return;
         }
@@ -1807,7 +2672,7 @@ fn section_identity_3147(
     let (mut facts, mut severity, mut notes) = identity_keystore_facts();
     identity_caller_signing_facts(caller_agent_id, &mut facts, &mut severity, &mut notes, None);
     let inventory = crate::identity::keypair::resolved_default_key_dir_path()
-        .and_then(|dir| super::keys::inventory(db_path, None, &dir, false, false));
+        .and_then(|dir| super::keys::inventory(db_path, None, &dir, false, false, caller_agent_id));
     match inventory {
         Ok(inventory) => {
             facts.push((
@@ -1837,9 +2702,7 @@ fn section_identity_3147(
             severity = severity_max(severity, Severity::Warning);
             facts.push(("orphan_key_files".into(), "unknown".into()));
             facts.push(("enrolled_public_keys".into(), "unknown".into()));
-            notes.push(crate::logging::redact_urls_in_message(&format!(
-                "key registry inspection failed: {e:#}"
-            )));
+            notes.push(format!("key registry inspection failed: {e:#}"));
         }
     }
     let mode = crate::config::http_attested_identity_mode();
@@ -2723,19 +3586,122 @@ fn section_governance(conn: &rusqlite::Connection) -> ReportSection {
 }
 
 fn section_sync(conn: &rusqlite::Connection) -> ReportSection {
-    let mut facts = Vec::new();
+    section_sync_at(conn, chrono::Utc::now())
+}
+
+/// #3655 — what the doctor concluded about one peer's reachability.
+enum ReachVerdict {
+    /// The last answered pull is inside the #3654 window.
+    Reachable,
+    /// The last answered pull is older than the window (seconds given).
+    Stale { window_secs: i64 },
+    /// No contact or no cadence was recorded: nothing can be concluded.
+    Unknown,
+}
+
+/// #3655 — a peer's reachability verdict plus its rendered label
+/// (`reachable` or `unknown:<#3654 reason>`).
+struct PeerReach {
+    label: String,
+    verdict: ReachVerdict,
+}
+
+/// #3655 — apply the ONE reachability definition the live daemon uses
+/// (`federation::freshness::reachability`, #3654) to the durable contact
+/// stamp: a pull observation older than
+/// `REACHABILITY_STALE_AFTER_CATCHUP_INTERVALS` × the recorded cadence no
+/// longer says anything about the peer. The offline doctor has the stamp and
+/// the cadence, not the in-process failure streak, so its "stale" is the
+/// registry's `pull_observation_stale` and its "no contact" is the
+/// registry's `no_pull_observation` — same reason strings, same window.
+fn peer_reachability(peer: &db::SyncPeerWatermark) -> PeerReach {
+    use crate::federation::freshness::{
+        REACHABILITY_STALE_AFTER_CATCHUP_INTERVALS, UNKNOWN_NO_CATCHUP_LOOP,
+        UNKNOWN_NO_PULL_OBSERVATION, UNKNOWN_PULL_OBSERVATION_STALE,
+    };
+    let Some(contact_age) = peer.contact_age_secs else {
+        return PeerReach {
+            label: format!("unknown:{UNKNOWN_NO_PULL_OBSERVATION}"),
+            verdict: ReachVerdict::Unknown,
+        };
+    };
+    let Some(cadence) = peer.catchup_interval_secs else {
+        return PeerReach {
+            label: format!("unknown:{UNKNOWN_NO_CATCHUP_LOOP}"),
+            verdict: ReachVerdict::Unknown,
+        };
+    };
+    let window_secs = i64::try_from(
+        cadence.saturating_mul(u64::from(REACHABILITY_STALE_AFTER_CATCHUP_INTERVALS)),
+    )
+    .unwrap_or(i64::MAX);
+    if contact_age > window_secs {
+        PeerReach {
+            label: format!("unknown:{UNKNOWN_PULL_OBSERVATION_STALE}"),
+            verdict: ReachVerdict::Stale { window_secs },
+        }
+    } else {
+        PeerReach {
+            label: REACHABLE.to_string(),
+            verdict: ReachVerdict::Reachable,
+        }
+    }
+}
+
+/// v1.0.0 #3655 — the Sync section, aged against an explicit probe time.
+///
+/// Four states, kept distinct because each is a different operator action:
+/// - **unreadable** (`sync_state` cannot be queried) → **Critical**. The
+///   pre-#3655 section turned this into `peer_count = 0` and called the node
+///   a singleton.
+/// - **empty** (no rows) → **N/A**, the single-node case.
+/// - **invalid** rows (NULL / non-RFC 3339 cursors) → **Warning**, counted
+///   and named; never silently skipped.
+/// - **valid** rows → each cursor is aged against `now`. Reachability uses
+///   the ONE definition the live daemon uses (#3654): a peer whose last
+///   ANSWERED pull (`sync_peer_contact`, stamped even on an empty window) is
+///   older than `REACHABILITY_STALE_AFTER_CATCHUP_INTERVALS` × its recorded
+///   catch-up cadence is `unknown:pull_observation_stale` → **Critical** (the
+///   "equal but old" case the old `|seen - pulled|` skew could never see); a
+///   row with no recorded contact or cadence is `unknown:<reason>` →
+///   **Warning** (absent is not zero, and not stale either); a peer whose
+///   data is stamped further into this node's future than the daemon's own
+///   pull-cursor bound is **Critical** (clocks disagree; its cursors will be
+///   refused). A quiet peer — old data watermark, recent contact — is
+///   **Info**: that is what an empty window looks like.
+fn section_sync_at(
+    conn: &rusqlite::Connection,
+    now: chrono::DateTime<chrono::Utc>,
+) -> ReportSection {
+    use crate::daemon_runtime::PULL_CURSOR_FUTURE_SKEW_SECS;
+
+    let mut facts: Vec<(String, String)> = vec![(FACT_PROBED_AT.into(), now.to_rfc3339())];
     let mut severity = Severity::Info;
     let mut note: Option<String> = None;
 
-    let peer_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM sync_state", [], |r| r.get(0))
-        .unwrap_or(0);
-    facts.push(("peer_count".into(), peer_count.to_string()));
+    let watermarks = match db::doctor_sync_peer_watermarks(conn, now) {
+        Ok(w) => w,
+        Err(e) => {
+            facts.push(("sync_state".into(), SYNC_STATE_UNREADABLE.into()));
+            facts.push(("sync_query_error".into(), e.to_string()));
+            return ReportSection {
+                name: "Sync".into(),
+                severity: Severity::Critical,
+                facts,
+                note: Some(
+                    "the sync_state table could not be read — peer health is UNKNOWN; this is \
+                     not a single-node deployment until the table can be read"
+                        .into(),
+                ),
+            };
+        }
+    };
 
-    if peer_count == 0 {
+    facts.push((FACT_PEER_COUNT.into(), watermarks.row_count().to_string()));
+    if watermarks.row_count() == 0 {
         facts.push((
             FACT_MAX_SKEW_SECS.into(),
-            "not_observed (no peers registered)".into(),
+            format!("{NOT_OBSERVED} (no peers registered)"),
         ));
         return ReportSection {
             name: "Sync".into(),
@@ -2745,23 +3711,145 @@ fn section_sync(conn: &rusqlite::Connection) -> ReportSection {
         };
     }
 
-    match db::doctor_max_sync_skew_secs(conn) {
-        Ok(Some(skew)) => {
-            facts.push((FACT_MAX_SKEW_SECS.into(), skew.to_string()));
-            if skew > 600 {
+    facts.push((
+        FACT_INVALID_ROWS.into(),
+        watermarks.invalid.len().to_string(),
+    ));
+    for (label, reason) in &watermarks.invalid {
+        facts.push((
+            format!("{PEER_FACT_PREFIX}{label}::{PEER_FACT_INVALID}"),
+            reason.clone(),
+        ));
+    }
+    if !watermarks.invalid.is_empty() {
+        severity = Severity::Warning;
+        append_note(
+            &mut note,
+            &format!(
+                "{} sync_state row(s) have cursors that cannot be read — they are not \
+                 counted as healthy peers",
+                watermarks.invalid.len()
+            ),
+        );
+    }
+
+    let mut stale_peers = 0usize;
+    let mut unknown_peers = 0usize;
+    let mut max_contact: Option<i64> = None;
+    let mut max_advanced: Option<i64> = None;
+    let mut max_data: Option<i64> = None;
+    let mut max_lead_abs: Option<i64> = None;
+    for peer in &watermarks.peers {
+        let key = |suffix: &str| {
+            format!(
+                "{PEER_FACT_PREFIX}{}/{}::{suffix}",
+                peer.agent_id, peer.peer_id
+            )
+        };
+        let reach = peer_reachability(peer);
+        facts.push((key(PEER_FACT_REACHABILITY), reach.label.clone()));
+        facts.push((
+            key(PEER_FACT_CONTACT_AGE),
+            peer.contact_age_secs
+                .map_or_else(|| NOT_OBSERVED.to_string(), |a| a.to_string()),
+        ));
+        facts.push((
+            key(PEER_FACT_CATCHUP_INTERVAL),
+            peer.catchup_interval_secs
+                .map_or_else(|| NOT_OBSERVED.to_string(), |a| a.to_string()),
+        ));
+        facts.push((
+            key(PEER_FACT_ADVANCED_AGE),
+            peer.advanced_age_secs
+                .map_or_else(|| PEER_NEVER_PULLED.to_string(), |a| a.to_string()),
+        ));
+        facts.push((
+            key(PEER_FACT_DATA_AGE),
+            peer.data_age_secs
+                .map_or_else(|| PEER_NEVER_PULLED.to_string(), |a| a.to_string()),
+        ));
+        match reach.verdict {
+            ReachVerdict::Reachable => {}
+            ReachVerdict::Stale { window_secs } => {
+                stale_peers = stale_peers.saturating_add(1);
                 severity = Severity::Critical;
-                note = Some(format!(
-                    "max sync skew is {skew}s (>600s threshold) — peer mesh is drifting"
-                ));
+                append_note(
+                    &mut note,
+                    &format!(
+                        "peer {} last answered a pull {}s ago, beyond the {window_secs}s \
+                         reachability window (3 × its {}s catch-up cadence, the same rule the \
+                         live daemon applies) — reachability unknown; the mesh is not \
+                         converging through this node",
+                        peer.peer_id,
+                        peer.contact_age_secs.unwrap_or_default(),
+                        peer.catchup_interval_secs.unwrap_or_default(),
+                    ),
+                );
+            }
+            ReachVerdict::Unknown => {
+                unknown_peers = unknown_peers.saturating_add(1);
+                if severity != Severity::Critical {
+                    severity = Severity::Warning;
+                }
+                append_note(
+                    &mut note,
+                    &format!(
+                        "peer {} has no recorded contact ({}) — it is neither healthy nor \
+                         stale: the sync daemon has not answered a pull for it since this \
+                         database gained contact tracking, or is not running",
+                        peer.peer_id, reach.label
+                    ),
+                );
             }
         }
-        Ok(None) => {
-            facts.push((FACT_MAX_SKEW_SECS.into(), "not_observed".into()));
+        if let Some(c) = peer.contact_age_secs {
+            max_contact = Some(max_contact.map_or(c, |m| m.max(c)));
         }
-        Err(e) => {
-            facts.push(("sync_query_error".into(), e.to_string()));
+        facts.push((
+            key(PEER_FACT_PUSHED_AGE),
+            peer.pushed_age_secs
+                .map_or_else(|| PEER_NEVER_PUSHED.to_string(), |a| a.to_string()),
+        ));
+        facts.push((
+            key(PEER_FACT_CLOCK_LEAD),
+            peer.clock_lead_secs
+                .map_or_else(|| PEER_NEVER_PULLED.to_string(), |a| a.to_string()),
+        ));
+        if let Some(adv) = peer.advanced_age_secs {
+            max_advanced = Some(max_advanced.map_or(adv, |m| m.max(adv)));
+        }
+        if let Some(dat) = peer.data_age_secs {
+            max_data = Some(max_data.map_or(dat, |m| m.max(dat)));
+        }
+        if let Some(lead) = peer.clock_lead_secs {
+            let lead_abs = lead.saturating_abs();
+            max_lead_abs = Some(max_lead_abs.map_or(lead_abs, |m| m.max(lead_abs)));
+            if lead > PULL_CURSOR_FUTURE_SKEW_SECS {
+                severity = Severity::Critical;
+                append_note(
+                    &mut note,
+                    &format!(
+                        "peer {} stamps data {lead}s ahead of this clock \
+                         (>{PULL_CURSOR_FUTURE_SKEW_SECS}s pull-cursor bound) — clocks disagree \
+                         and its cursors will be refused",
+                        peer.peer_id
+                    ),
+                );
+            }
         }
     }
+    facts.push((FACT_STALE_PEERS.into(), stale_peers.to_string()));
+    facts.push((FACT_UNKNOWN_PEERS.into(), unknown_peers.to_string()));
+    // Summary ages are MEASURED maxima over valid rows; with no valid row
+    // (or no recorded contact) there is nothing to summarise and the facts
+    // say so.
+    let render_max = |m: Option<i64>| m.map_or_else(|| NOT_OBSERVED.to_string(), |v| v.to_string());
+    facts.push((FACT_MAX_CONTACT_AGE_SECS.into(), render_max(max_contact)));
+    facts.push((FACT_MAX_ADVANCED_AGE_SECS.into(), render_max(max_advanced)));
+    facts.push((FACT_MAX_DATA_AGE_SECS.into(), render_max(max_data)));
+    // Kept for existing consumers: the largest |seen - pulled| over valid
+    // rows. It no longer drives severity — see `clock_lead_secs`.
+    facts.push((FACT_MAX_SKEW_SECS.into(), render_max(max_lead_abs)));
 
     ReportSection {
         name: "Sync".into(),
@@ -2798,6 +3886,37 @@ fn section_webhook(conn: &rusqlite::Connection) -> ReportSection {
         }
     } else {
         facts.push(("success_rate_pct".into(), "no_deliveries_yet".into()));
+    }
+
+    // #3659 — the persisted delivery history is only as good as the status
+    // transitions that reached it. A row still `pending` past the settle
+    // window is a delivery whose ack/failed UPDATE was lost (or never
+    // attempted), so the totals above are known to be incomplete. Measured
+    // from the table; the live per-stage failure counters are on the
+    // daemon's /health `webhook_audit_delivery` and /metrics.
+    let cutoff = (chrono::Utc::now() - chrono::Duration::seconds(db::WEBHOOK_AUDIT_SETTLE_SECS))
+        .to_rfc3339();
+    match db::doctor_webhook_audit_pending(conn, &cutoff) {
+        Ok((pending, stale)) => {
+            facts.push(("audit_rows_pending".into(), pending.to_string()));
+            facts.push(("audit_rows_pending_stale".into(), stale.to_string()));
+            if stale > 0 {
+                severity = Severity::Warning;
+                let msg = format!(
+                    "{stale} delivery audit row(s) still `pending` after {} s: their \
+                     ack/failed status update never landed, so dispatched/failed totals \
+                     understate reality (#3659)",
+                    db::WEBHOOK_AUDIT_SETTLE_SECS
+                );
+                note = Some(match note.take() {
+                    Some(prev) => format!("{prev}; {msg}"),
+                    None => msg,
+                });
+            }
+        }
+        Err(e) => {
+            facts.push(("audit_rows_pending".into(), format!("unavailable ({e})")));
+        }
     }
 
     ReportSection {
@@ -2859,7 +3978,13 @@ fn section_llm_reachability_1146() -> ReportSection {
     let mut facts = vec![
         ("backend".into(), resolved.backend.clone()),
         ("model".into(), resolved.model.clone()),
-        ("base_url".into(), resolved.base_url.clone()),
+        // #3667/#3711 — a doctor fact is a sink (text, --json, pasted reports):
+        // the endpoint an operator needs is the origin; the userinfo/query a
+        // base URL routinely carries is the credential.
+        (
+            "base_url".into(),
+            crate::url_display::url_origin(&resolved.base_url),
+        ),
         ("config_source".into(), resolved.source.as_str().to_string()),
         (
             field_names::KEY_SOURCE.into(),
@@ -2905,7 +4030,10 @@ fn section_llm_reachability_1146() -> ReportSection {
             resolved.api_key().map(str::to_string),
         )
     };
-    facts.push(("probe_url".into(), probe_url.clone()));
+    facts.push((
+        "probe_url".into(),
+        crate::url_display::url_origin_and_path(&probe_url),
+    ));
 
     let started = std::time::Instant::now();
     let client = match reqwest::blocking::Client::builder()
@@ -2971,7 +4099,7 @@ fn section_llm_reachability_1146() -> ReportSection {
                     Some(format!(
                         "unexpected status {} from {} — verify base_url + endpoint shape",
                         status.as_u16(),
-                        probe_url
+                        crate::url_display::url_origin_and_path(&probe_url)
                     )),
                 )
             }
@@ -2979,19 +4107,19 @@ fn section_llm_reachability_1146() -> ReportSection {
         Err(e) => {
             let elapsed_ms = started.elapsed().as_millis();
             facts.push((field_names::LATENCY_MS.into(), elapsed_ms.to_string()));
-            facts.push(("error".into(), e.to_string()));
-            let kind = if e.is_timeout() {
-                "timeout"
-            } else if e.is_connect() {
-                "connect"
-            } else {
-                "transport"
-            };
+            // #3667/#3711 — a doctor fact and note are sinks (text, `--json`,
+            // every pasted report). `reqwest::Error`'s Display appends the
+            // request URL — userinfo stripped, query VERBATIM — so the fact
+            // carries the failure CLASS, and the note names the probe from
+            // the allowlist (origin + path), never the raw URL.
+            let failure = crate::url_display::TransportFailure::classify(&e);
+            facts.push(("error".into(), crate::url_display::network_failure(&e)));
             (
                 Severity::Critical,
                 Some(format!(
-                    "network/{kind} error contacting {probe_url} — verify \
-                     base_url and connectivity"
+                    "network/{failure} error contacting {} — verify \
+                     base_url and connectivity",
+                    crate::url_display::url_origin_and_path(&probe_url)
                 )),
             )
         }
@@ -3058,7 +4186,10 @@ fn section_embeddings_reachability_1598() -> ReportSection {
     let mut facts = vec![
         ("backend".into(), resolved.backend.clone()),
         ("model".into(), resolved.model.clone()),
-        ("base_url".into(), resolved.url.clone()),
+        (
+            "base_url".into(),
+            crate::url_display::url_origin(&resolved.url),
+        ),
         ("config_source".into(), resolved.source.as_str().to_string()),
         (
             field_names::KEY_SOURCE.into(),
@@ -3137,7 +4268,10 @@ fn section_embeddings_reachability_1598() -> ReportSection {
         let req = client.get(&url);
         (url, req)
     };
-    facts.push(("probe_url".into(), probe_url.clone()));
+    facts.push((
+        "probe_url".into(),
+        crate::url_display::url_origin_and_path(&probe_url),
+    ));
 
     let (mut severity, mut note) = match req.send() {
         Ok(resp) => {
@@ -3177,7 +4311,7 @@ fn section_embeddings_reachability_1598() -> ReportSection {
                     Some(format!(
                         "unexpected status {} from {} — verify base_url + endpoint shape",
                         status.as_u16(),
-                        probe_url
+                        crate::url_display::url_origin_and_path(&probe_url)
                     )),
                 )
             }
@@ -3185,19 +4319,19 @@ fn section_embeddings_reachability_1598() -> ReportSection {
         Err(e) => {
             let elapsed_ms = started.elapsed().as_millis();
             facts.push((field_names::LATENCY_MS.into(), elapsed_ms.to_string()));
-            facts.push(("error".into(), e.to_string()));
-            let kind = if e.is_timeout() {
-                "timeout"
-            } else if e.is_connect() {
-                "connect"
-            } else {
-                "transport"
-            };
+            // #3667/#3711 — a doctor fact and note are sinks (text, `--json`,
+            // every pasted report). `reqwest::Error`'s Display appends the
+            // request URL — userinfo stripped, query VERBATIM — so the fact
+            // carries the failure CLASS, and the note names the probe from
+            // the allowlist (origin + path), never the raw URL.
+            let failure = crate::url_display::TransportFailure::classify(&e);
+            facts.push(("error".into(), crate::url_display::network_failure(&e)));
             (
                 Severity::Critical,
                 Some(format!(
-                    "network/{kind} error contacting {probe_url} — verify \
-                     base_url and connectivity"
+                    "network/{failure} error contacting {} — verify \
+                     base_url and connectivity",
+                    crate::url_display::url_origin_and_path(&probe_url)
                 )),
             )
         }
@@ -3529,6 +4663,13 @@ fn http_get_json(url: &str, auth: &RemoteAuth) -> Result<Value> {
             .with_context(|| format!("read --ca-cert {}", ca_path.display()))?;
         builder =
             builder.add_root_certificate(crate::cli::sync::parse_ca_certificate(&ca_pem, ca_path)?);
+    } else if let Some(local_ca) = crate::tls_bootstrap::local_ca_certificate()? {
+        // v1.0.0 #3709 item 5 — same-installation trust only: the bundled
+        // remote doctor trusts THIS installation's zero-config local CA so
+        // `doctor --remote https://127.0.0.1:9077` works with no flag. Never a
+        // peer's certificate (peer trust stays explicit, #2448); a CA file
+        // that exists but does not parse is an error, never ignored.
+        builder = builder.add_root_certificate(local_ca);
     }
     if let Some(identity) = crate::cli::sync::sync_client_identity(
         auth.client_cert.as_deref(),
@@ -3950,7 +5091,7 @@ mod tests {
     }
 
     #[test]
-    fn local_run_on_empty_db_produces_eighteen_sections_3582() {
+    fn local_run_on_empty_db_produces_nineteen_sections_3582_3124() {
         let env = TestEnv::fresh();
         let report = run_local_collect(&env.db_path);
         assert_eq!(report.mode, "local");
@@ -3964,7 +5105,15 @@ mod tests {
         // #3147/#3155 inserted "Identity" after Configuration — total is
         // now 16; #3471 appended "Wake hub (#3471)"; #3582 added
         // "Federation peer authorization" before the database open and
-        // Identity — total is now 18.
+        // Identity — total is now 18; #3124 added the unconditional
+        // "Unstamped owners (#3124)" census after "Corpus Lifecycle (#1965)"
+        // — total is now 19; #3700 inserted "Deployment shape detector
+        // (#3700)" after Configuration (the #3714 declared-shape section
+        // that precedes it is CONDITIONAL and absent under skip_config, which
+        // `run_local_collect` sets) — total is now 20; #3705
+        // inserted "Transit encryption (#3705)" after the detector (every
+        // transit surface versus the mandate, the pre-upgrade detector) —
+        // total is now 21.
         //
         // #3264 note: "Postgres extensions (#3264)" is an additional CONDITIONAL
         // section — emitted only when `store_url::resolve_store_url(None)`
@@ -3974,25 +5123,29 @@ mod tests {
         // URL in the process env" here. It is NOT true that every test
         // setting one is subprocess-isolated — `src/store_url.rs`'s own
         // in-process tests set `AI_MEMORY_STORE_URL` to a `postgres://`
-        // DSN under that same lock. The count stays 18 on a SQLite
+        // DSN under that same lock. The count stays 21 on a SQLite
         // deployment, which is the invariant this test pins.
         //
         // #3471 note: "Wake hub (#3471)" is UNCONDITIONAL — it reads only the
         // filesystem and this process's own RLIMIT_NOFILE, so it costs nothing
         // on a host with no hub and reports `configured = no` there.
-        assert_eq!(report.sections.len(), 18);
+        assert_eq!(report.sections.len(), 22);
         let names: Vec<&str> = report.sections.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(
             names,
             vec![
                 "Configuration",
+                SECTION_DEPLOYMENT_SHAPE_DETECTOR,
+                SECTION_TRANSIT_ENCRYPTION,
                 "Federation peer authorization",
                 "Identity",
+                SECTION_KEY_POSTURE,
                 "Storage",
                 "Index",
                 "Embedding Space Census (#2167)",
                 "Recall Index Coverage (#1964)",
                 "Corpus Lifecycle (#1965)",
+                SECTION_UNSTAMPED_OWNERS,
                 "Recall",
                 "Governance",
                 "Sync",
@@ -4070,6 +5223,114 @@ mod tests {
         }
         // The resolved key value itself must NEVER appear as a fact key.
         assert!(emb.facts.iter().all(|(k, _)| k != "api_key"));
+    }
+
+    /// v1.0.0 #3705 — the transit-encryption section renders THIRD, carries
+    /// the ordered fact keys, reports the selector as the floor when unset,
+    /// folds the webhook census in once the store is open, and never
+    /// refuses (doctor is the detector).
+    #[test]
+    fn local_run_transit_encryption_section_is_third_3705() {
+        let env = TestEnv::fresh();
+        let report = run_local_collect(&env.db_path);
+        assert_eq!(report.sections[2].name, SECTION_TRANSIT_ENCRYPTION);
+        let transit = find(&report, SECTION_TRANSIT_ENCRYPTION);
+        let keys: Vec<&str> = transit.facts.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec![
+                "mandate",
+                "listener_tls",
+                "local_tls_material",
+                "require_tls_token",
+                "downgrade_paths_armed",
+                "mcp_federation_forward_url",
+                "store_url_sslmode",
+                "webhook_plaintext_targets",
+                "llm_egress_plaintext",
+                "boot_verdict",
+            ]
+        );
+        assert_eq!(
+            fact(transit, "mandate"),
+            crate::transit_encryption::MANDATE,
+            "the mandate is stated verbatim"
+        );
+        assert_eq!(fact(transit, "require_tls_token"), "unset (floor)");
+        assert_eq!(fact(transit, "downgrade_paths_armed"), "none");
+        assert_eq!(fact(transit, "store_url_sslmode"), "sqlite (no store URL)");
+        assert_eq!(
+            fact(transit, "webhook_plaintext_targets"),
+            "0 (refused at dispatch and at create)",
+            "an open store with no subscriptions reports an observed zero"
+        );
+        assert!(
+            fact(transit, "boot_verdict").starts_with("boots with in-process TLS only"),
+            "{:?}",
+            fact(transit, "boot_verdict")
+        );
+        assert!(
+            fact(transit, "listener_tls").contains("unobservable"),
+            "the daemon's argv is unobservable from doctor"
+        );
+        assert!(
+            fact(transit, "local_tls_material").starts_with("absent")
+                || fact(transit, "local_tls_material").starts_with("present"),
+            "#3709: the local certificate is reported absent or present, never invented: {:?}",
+            fact(transit, "local_tls_material")
+        );
+        assert!(
+            !fact(transit, "local_tls_material").contains("enterprise PKI required"),
+            "a singleton (fresh store, no fleet signal) may mint its local certificate: {:?}",
+            fact(transit, "local_tls_material")
+        );
+    }
+
+    /// v1.0.0 #3700 — the detector section renders right after Configuration
+    /// (the #3714 declared-shape section is absent under skip_config),
+    /// carries the store-derived registry count once the store is open, and
+    /// keeps the argv-only signals `unobservable` (doctor cannot see the
+    /// daemon's command line) rather than reporting them absent.
+    #[test]
+    fn local_run_deployment_shape_detector_is_second_and_registry_aware_3700() {
+        let env = TestEnv::fresh();
+        let report = run_local_collect(&env.db_path);
+        assert_eq!(report.sections[1].name, SECTION_DEPLOYMENT_SHAPE_DETECTOR);
+        let shape = find(&report, SECTION_DEPLOYMENT_SHAPE_DETECTOR);
+        let keys: Vec<&str> = shape.facts.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec![
+                "declared_shape",
+                "observed_floor",
+                "signals_present",
+                "signals_unobservable",
+                "registered_agents",
+                "undeclared_promotion",
+                "promotion_line",
+                "posture",
+                "posture_origin",
+                "protections_off",
+                "protections_off_list",
+                "boot_verdict",
+            ]
+        );
+        assert_eq!(fact(shape, "registered_agents"), "0");
+        let unobservable = fact(shape, "signals_unobservable");
+        for argv_only in [
+            crate::config::shape::detector::SIGNAL_OUTBOUND_PEERS,
+            crate::config::shape::detector::SIGNAL_LISTENER_MTLS,
+        ] {
+            assert!(
+                unobservable.contains(argv_only),
+                "{argv_only} must be unobservable from doctor, got {unobservable:?}"
+            );
+        }
+        assert!(
+            !fact(shape, "signals_present")
+                .contains(crate::config::shape::detector::SIGNAL_AGENT_REGISTRY),
+            "an empty registry is not a fleet signal"
+        );
     }
 
     #[test]
@@ -4444,6 +5705,41 @@ mod tests {
         assert_eq!(fact(wh, "dispatched_total"), "0");
         assert_eq!(fact(wh, "failed_total"), "0");
         assert_eq!(fact(wh, "success_rate_pct"), "no_deliveries_yet");
+        // #3659 — an empty audit table is measured as zero pending, not
+        // "unavailable".
+        assert_eq!(fact(wh, "audit_rows_pending"), "0");
+        assert_eq!(fact(wh, "audit_rows_pending_stale"), "0");
+    }
+
+    #[test]
+    fn local_run_webhook_section_warns_on_stale_pending_audit_rows_3659() {
+        let env = TestEnv::fresh();
+        {
+            // `db::open` runs the migrations so `subscription_events` exists.
+            let conn = crate::db::open(&env.db_path).expect("open + migrate");
+            // A fresh pending row (inside the settle window) and a stale one.
+            let now = chrono::Utc::now().to_rfc3339();
+            let old = (chrono::Utc::now() - chrono::Duration::seconds(3_600)).to_rfc3339();
+            for (cid, at) in [("cid-fresh", now.as_str()), ("cid-stale", old.as_str())] {
+                conn.execute(
+                    "INSERT INTO subscription_events \
+                     (subscription_id, correlation_id, event_type, payload, delivered_at, \
+                      delivery_status) VALUES ('sub-3659', ?1, 'memory_store', '{}', ?2, 'pending')",
+                    rusqlite::params![cid, at],
+                )
+                .expect("seed");
+            }
+        }
+        let report = run_local_collect(&env.db_path);
+        let wh = find(&report, "Webhook");
+        assert_eq!(fact(wh, "audit_rows_pending"), "2");
+        assert_eq!(fact(wh, "audit_rows_pending_stale"), "1");
+        assert_eq!(wh.severity, Severity::Warning);
+        assert!(
+            wh.note.as_deref().is_some_and(|n| n.contains("#3659")),
+            "note must name the lost status update: {:?}",
+            wh.note
+        );
     }
 
     // -------------------------------------------------------------------
@@ -4527,6 +5823,12 @@ mod tests {
         assert_eq!(report.overall, Severity::Critical);
     }
 
+    /// #3655 review rework RE-PIN: fresh data cursors with NO recorded contact
+    /// are no longer `Info`. `last_pulled_at` is a data-watermark stamp, not a
+    /// contact time, so this row's reachability is UNKNOWN
+    /// (`unknown:no_pull_observation`) — a Warning, per the #3646/#3654
+    /// standard that a missing observation is never a healthy claim. The
+    /// numeric-skew rendering this test originally pinned still holds.
     #[test]
     fn sync_section_info_when_skew_under_threshold() {
         let env = TestEnv::fresh();
@@ -4544,7 +5846,14 @@ mod tests {
         }
         let report = run_local_collect(&env.db_path);
         let sync = find(&report, "Sync");
-        assert_eq!(sync.severity, Severity::Info);
+        assert_eq!(sync.severity, Severity::Warning, "{sync:?}");
+        assert_eq!(
+            fact(sync, "peer::me/peer-1::reachability"),
+            format!(
+                "unknown:{}",
+                crate::federation::freshness::UNKNOWN_NO_PULL_OBSERVATION
+            )
+        );
         // peer_count=1, skew column rendered as a numeric string.
         assert_eq!(fact(sync, "peer_count"), "1");
         let skew = fact(sync, "max_skew_secs");
@@ -5016,7 +6325,7 @@ mod tests {
             conn.execute(
                 "INSERT INTO subscriptions \
                  (id, url, events, created_at, dispatch_count, failure_count) \
-                 VALUES ('s1', 'http://x', '*', ?1, 10, 5)",
+                 VALUES ('s1', 'https://x', '*', ?1, 10, 5)",
                 params![now],
             )
             .unwrap();
@@ -5047,7 +6356,7 @@ mod tests {
             conn.execute(
                 "INSERT INTO subscriptions \
                  (id, url, events, created_at, dispatch_count, failure_count) \
-                 VALUES ('s1', 'http://x', '*', ?1, 10, 5)",
+                 VALUES ('s1', 'https://x', '*', ?1, 10, 5)",
                 params![now],
             )
             .unwrap();
@@ -5112,13 +6421,33 @@ mod tests {
         let report = run_local_collect(&bad);
         // #3166 — Configuration always renders; #3147 — Identity still
         // renders (the keystore is independent of the database); #3582
-        // peer authorization renders before the database open and Identity.
-        // Storage is the Critical failure.
-        assert_eq!(report.sections.len(), 4);
+        // peer authorization renders before the database open and Identity;
+        // #3700 the deployment-shape detector renders second (the #3714
+        // declared-shape section is absent under skip_config), with the
+        // registry signal left `unobservable` because the store never opened;
+        // #3705 the transit section renders third, with the webhook census
+        // left `unobservable` for the same reason. Storage is the Critical
+        // failure.
+        assert_eq!(report.sections.len(), 7);
         assert_eq!(report.sections[0].name, "Configuration");
-        assert_eq!(report.sections[1].name, "Federation peer authorization");
-        assert_eq!(report.sections[2].name, SECTION_IDENTITY);
-        let storage = &report.sections[3];
+        assert_eq!(report.sections[1].name, SECTION_DEPLOYMENT_SHAPE_DETECTOR);
+        assert_eq!(
+            fact(&report.sections[1], "registered_agents"),
+            "unobservable",
+            "#3700: an unopened store is unobservable, never an empty registry"
+        );
+        assert_eq!(report.sections[2].name, SECTION_TRANSIT_ENCRYPTION);
+        assert_eq!(
+            fact(&report.sections[2], "webhook_plaintext_targets"),
+            "unobservable",
+            "#3705: an unopened store is unobservable, never zero plaintext targets"
+        );
+        assert_eq!(report.sections[3].name, "Federation peer authorization");
+        assert_eq!(report.sections[4].name, SECTION_IDENTITY);
+        // #3717 — the key posture is filesystem-only and renders even when
+        // the database will not open.
+        assert_eq!(report.sections[5].name, SECTION_KEY_POSTURE);
+        let storage = &report.sections[6];
         assert_eq!(storage.name, "Storage");
         assert_eq!(storage.severity, Severity::Critical);
         // overall is computed from the sections; Storage is Critical.
@@ -6157,38 +7486,365 @@ enabled = true
         );
     }
 
-    /// Sync section `Ok(None)` skew arm: a registered peer whose
-    /// `last_pulled_at` is NULL yields peer_count ≥ 1 but no measurable
-    /// skew — the section must render `not_observed` at INFO rather
-    /// than N/A (the no-peers early return) or CRIT.
+    /// #3655 — a row whose cursor cannot be read is an INVALID row: counted,
+    /// named with the offending column, and a Warning. It was previously
+    /// skipped by the probe and the section stayed Info ("not_observed").
     #[test]
-    fn sync_section_not_observed_when_peer_has_no_pull_timestamp() {
-        let conn = rusqlite::Connection::open_in_memory().expect("open_in_memory");
-        conn.execute_batch(
-            "CREATE TABLE sync_state(last_seen_at TEXT, last_pulled_at TEXT);
-             INSERT INTO sync_state(last_seen_at, last_pulled_at)
-             VALUES ('2026-01-01T00:00:00Z', NULL);",
-        )
-        .expect("seed peer row");
-        let section = section_sync(&conn);
-        assert_eq!(section.severity, Severity::Info);
+    fn sync_section_warns_on_malformed_cursor_3655() {
+        let env = TestEnv::fresh();
+        {
+            let conn = crate::db::open(&env.db_path).unwrap();
+            conn.execute(
+                "INSERT INTO sync_state (agent_id, peer_id, last_seen_at, last_pulled_at) \
+                 VALUES ('me', 'peer-1', '2026-01-01T00:00:00Z', 'not-a-timestamp')",
+                [],
+            )
+            .unwrap();
+        }
+        let report = run_local_collect(&env.db_path);
+        let sync = find(&report, "Sync");
+        assert_eq!(sync.severity, Severity::Warning, "{sync:?}");
+        assert_eq!(fact(sync, FACT_PEER_COUNT), "1");
+        assert_eq!(fact(sync, FACT_INVALID_ROWS), "1");
+        assert!(fact(sync, "peer::me/peer-1::invalid").contains("last_pulled_at"));
+        assert_eq!(fact(sync, FACT_STALE_PEERS), "0");
+        assert_eq!(fact(sync, FACT_MAX_SKEW_SECS), "not_observed");
         assert!(
-            section
-                .facts
-                .iter()
-                .any(|(k, v)| k == "max_skew_secs" && v == "not_observed"),
-            "facts: {:?}",
-            section.facts
-        );
-        assert!(
-            section
-                .facts
-                .iter()
-                .any(|(k, v)| k == "peer_count" && v == "1"),
-            "facts: {:?}",
-            section.facts
+            sync.note
+                .as_deref()
+                .unwrap_or_default()
+                .contains("cannot be read")
         );
     }
+
+    /// #3655 — an unreadable `sync_state` is a FAILED probe: Critical, and
+    /// never reported as a single-node deployment. Pre-fix the COUNT error
+    /// became `peer_count = 0` → N/A with the single-node note.
+    #[test]
+    fn sync_section_critical_when_sync_state_unreadable_3655() {
+        let env = TestEnv::fresh();
+        {
+            let conn = crate::db::open(&env.db_path).unwrap();
+            conn.execute_batch("DROP TABLE sync_state;").unwrap();
+        }
+        let report = run_local_collect(&env.db_path);
+        let sync = find(&report, "Sync");
+        assert_eq!(sync.severity, Severity::Critical, "{sync:?}");
+        assert_eq!(fact(sync, "sync_state"), SYNC_STATE_UNREADABLE);
+        assert!(fact(sync, "sync_query_error").contains("sync_state"));
+        assert!(
+            sync.facts.iter().all(|(k, _)| k != FACT_PEER_COUNT),
+            "{sync:?}"
+        );
+        assert!(
+            !sync
+                .note
+                .as_deref()
+                .unwrap_or_default()
+                .contains("single-node deployment or")
+        );
+        assert_eq!(report.overall, Severity::Critical);
+    }
+
+    /// #3655 — the audit's headline case: both cursors EQUAL but hours old.
+    /// The old `|seen - pulled|` skew was 0 → Info; aged against the probe
+    /// time the peer has not been observed for two hours → Critical.
+    #[test]
+    fn sync_section_critical_when_peer_cursors_equal_but_old_3655() {
+        let env = TestEnv::fresh();
+        {
+            let conn = crate::db::open(&env.db_path).unwrap();
+            let old = (chrono::Utc::now() - chrono::Duration::seconds(2 * crate::SECS_PER_HOUR))
+                .to_rfc3339();
+            conn.execute(
+                "INSERT INTO sync_state (agent_id, peer_id, last_seen_at, last_pulled_at) \
+                 VALUES ('me', 'peer-1', ?1, ?1)",
+                params![old],
+            )
+            .unwrap();
+            // Review rework: the finding is about CONTACT, not the data
+            // watermark — the last answered pull is also two hours old, far
+            // beyond 3 × a 60 s cadence.
+            conn.execute(
+                "INSERT INTO sync_peer_contact (agent_id, peer_id, last_contact_at, \
+                 catchup_interval_secs) VALUES ('me', 'peer-1', ?1, 60)",
+                params![old],
+            )
+            .unwrap();
+        }
+        let report = run_local_collect(&env.db_path);
+        let sync = find(&report, "Sync");
+        assert_eq!(sync.severity, Severity::Critical, "{sync:?}");
+        assert_eq!(fact(sync, FACT_STALE_PEERS), "1");
+        assert_eq!(fact(sync, FACT_UNKNOWN_PEERS), "0");
+        assert_eq!(fact(sync, "peer::me/peer-1::clock_lead_secs"), "0");
+        assert_eq!(
+            fact(sync, "peer::me/peer-1::reachability"),
+            format!(
+                "unknown:{}",
+                crate::federation::freshness::UNKNOWN_PULL_OBSERVATION_STALE
+            )
+        );
+        assert!(
+            fact(sync, "peer::me/peer-1::contact_age_secs")
+                .parse::<i64>()
+                .unwrap()
+                >= 2 * crate::SECS_PER_HOUR
+        );
+        assert!(
+            sync.note
+                .as_deref()
+                .unwrap_or_default()
+                .contains("last answered a pull")
+        );
+    }
+
+    /// #3655 (review rework) — the EMPTY-WINDOW case: both data cursors are
+    /// hours old because nothing new has replicated, but the peer answered a
+    /// pull seconds ago. That peer is reachable and healthy; the data
+    /// watermark is not a liveness signal. Pre-rework this rendered Critical
+    /// ("last observed 7200s ago") from `last_pulled_at` alone.
+    #[test]
+    fn sync_section_fresh_contact_with_old_cursors_is_reachable_3655() {
+        let env = TestEnv::fresh();
+        let now = chrono::Utc::now();
+        {
+            let conn = crate::db::open(&env.db_path).unwrap();
+            let old = (now - chrono::Duration::seconds(2 * crate::SECS_PER_HOUR)).to_rfc3339();
+            conn.execute(
+                "INSERT INTO sync_state (agent_id, peer_id, last_seen_at, last_pulled_at) \
+                 VALUES ('me', 'quiet', ?1, ?1)",
+                params![old],
+            )
+            .unwrap();
+            let contact = (now - chrono::Duration::seconds(5)).to_rfc3339();
+            conn.execute(
+                "INSERT INTO sync_peer_contact (agent_id, peer_id, last_contact_at, \
+                 catchup_interval_secs) VALUES ('me', 'quiet', ?1, 60)",
+                params![contact],
+            )
+            .unwrap();
+            let section = section_sync_at(&conn, now);
+            assert_eq!(section.severity, Severity::Info, "{section:?}");
+            assert_eq!(fact(&section, "peer::me/quiet::reachability"), REACHABLE);
+            assert_eq!(fact(&section, "peer::me/quiet::contact_age_secs"), "5");
+            assert_eq!(
+                fact(&section, "peer::me/quiet::catchup_interval_secs"),
+                "60"
+            );
+            assert_eq!(
+                fact(&section, "peer::me/quiet::advanced_age_secs"),
+                (2 * crate::SECS_PER_HOUR).to_string()
+            );
+            assert_eq!(fact(&section, FACT_STALE_PEERS), "0");
+            assert_eq!(fact(&section, FACT_UNKNOWN_PEERS), "0");
+            assert_eq!(fact(&section, FACT_MAX_CONTACT_AGE_SECS), "5");
+            assert!(section.note.is_none(), "{section:?}");
+        }
+    }
+
+    /// #3655 v3 review — a peer that has only ever answered EMPTY windows has
+    /// a contact row and NO `sync_state` row. It must be VISIBLE (enumerated
+    /// from the union), reachable, with its data cursors reported as
+    /// never-pulled — never as an age of 0 and never as invalid. A URL-shaped
+    /// peer id with embedded credentials is redacted in every fact.
+    #[test]
+    fn sync_section_contact_only_peer_is_visible_and_redacted_3655() {
+        let env = TestEnv::fresh();
+        let now = chrono::Utc::now();
+        {
+            let conn = crate::db::open(&env.db_path).unwrap();
+            let contact = (now - chrono::Duration::seconds(4)).to_rfc3339();
+            conn.execute(
+                "INSERT INTO sync_peer_contact (agent_id, peer_id, last_contact_at, \
+                 catchup_interval_secs) VALUES ('me', 'https://alice:hunter2@peer.example/api', ?1, 30)",
+                params![contact],
+            )
+            .unwrap();
+            let section = section_sync_at(&conn, now);
+            assert_eq!(section.severity, Severity::Info, "{section:?}");
+            assert_eq!(fact(&section, FACT_PEER_COUNT), "1");
+            assert_eq!(fact(&section, FACT_INVALID_ROWS), "0");
+            // #3711 — the fact key is built by the ALLOWLIST renderer, not the
+            // userinfo redactor. Pin BOTH halves on the same sink: the secret
+            // is absent AND the host+path that identify the peer are present,
+            // so this cannot pass by the key collapsing to an empty string.
+            let redacted = crate::url_display::url_origin_and_path(
+                "https://alice:hunter2@peer.example/api?token=s3cr3t",
+            );
+            assert!(!redacted.contains("hunter2"), "{redacted}");
+            assert!(
+                !redacted.contains("s3cr3t"),
+                "query token must not survive: {redacted}"
+            );
+            assert!(
+                redacted.contains("peer.example"),
+                "the peer must stay identifiable: {redacted}"
+            );
+            let key = |suffix: &str| format!("peer::me/{redacted}::{suffix}");
+            assert_eq!(fact(&section, &key("reachability")), REACHABLE);
+            assert_eq!(fact(&section, &key("contact_age_secs")), "4");
+            assert_eq!(fact(&section, &key("advanced_age_secs")), PEER_NEVER_PULLED);
+            assert_eq!(fact(&section, &key("data_age_secs")), PEER_NEVER_PULLED);
+            assert_eq!(fact(&section, &key("clock_lead_secs")), PEER_NEVER_PULLED);
+            assert_eq!(fact(&section, FACT_MAX_ADVANCED_AGE_SECS), NOT_OBSERVED);
+            assert_eq!(fact(&section, FACT_MAX_CONTACT_AGE_SECS), "4");
+            assert!(
+                !format!("{section:?}").contains("hunter2"),
+                "the credential must not appear anywhere in the section"
+            );
+        }
+    }
+
+    /// #3655 (review rework) — a row with NO recorded contact is UNKNOWN:
+    /// Warning, named with the #3654 reason, and counted apart from stale.
+    /// Absent is not zero, and it is not "stale" either.
+    #[test]
+    fn sync_section_no_recorded_contact_is_unknown_not_stale_3655() {
+        let env = TestEnv::fresh();
+        let now = chrono::Utc::now();
+        {
+            let conn = crate::db::open(&env.db_path).unwrap();
+            conn.execute(
+                "INSERT INTO sync_state (agent_id, peer_id, last_seen_at, last_pulled_at) \
+                 VALUES ('me', 'peer-1', ?1, ?1)",
+                params![now.to_rfc3339()],
+            )
+            .unwrap();
+            let section = section_sync_at(&conn, now);
+            assert_eq!(section.severity, Severity::Warning, "{section:?}");
+            assert_eq!(
+                fact(&section, "peer::me/peer-1::reachability"),
+                format!(
+                    "unknown:{}",
+                    crate::federation::freshness::UNKNOWN_NO_PULL_OBSERVATION
+                )
+            );
+            assert_eq!(
+                fact(&section, "peer::me/peer-1::contact_age_secs"),
+                NOT_OBSERVED
+            );
+            assert_eq!(fact(&section, FACT_STALE_PEERS), "0");
+            assert_eq!(fact(&section, FACT_UNKNOWN_PEERS), "1");
+            assert_eq!(fact(&section, FACT_MAX_CONTACT_AGE_SECS), NOT_OBSERVED);
+            // A contact WITHOUT a cadence is also unknown (the window cannot be
+            // computed), with the registry's other reason.
+            conn.execute(
+                "INSERT INTO sync_peer_contact (agent_id, peer_id, last_contact_at) \
+                 VALUES ('me', 'peer-1', ?1)",
+                params![now.to_rfc3339()],
+            )
+            .unwrap();
+            let section = section_sync_at(&conn, now);
+            assert_eq!(section.severity, Severity::Warning, "{section:?}");
+            assert_eq!(
+                fact(&section, "peer::me/peer-1::reachability"),
+                format!(
+                    "unknown:{}",
+                    crate::federation::freshness::UNKNOWN_NO_CATCHUP_LOOP
+                )
+            );
+            assert_eq!(fact(&section, "peer::me/peer-1::contact_age_secs"), "0");
+        }
+    }
+
+    /// #3655 — per-peer ages against a pinned probe time, the probe time
+    /// itself, a never-pushed peer, and a quiet peer (old data, recent
+    /// observation) that is NOT a finding. The old probe called the quiet
+    /// peer Critical (|seen - pulled| = 2 h) — a false alarm.
+    #[test]
+    fn sync_section_reports_per_peer_ages_against_probe_time_3655() {
+        let env = TestEnv::fresh();
+        let now = chrono::Utc::now();
+        {
+            let conn = crate::db::open(&env.db_path).unwrap();
+            let t = |secs_ago: i64| (now - chrono::Duration::seconds(secs_ago)).to_rfc3339();
+            conn.execute_batch(&format!(
+                "INSERT INTO sync_state (agent_id, peer_id, last_seen_at, last_pulled_at, last_pushed_at) VALUES \
+                 ('me', 'quiet', '{}', '{}', NULL), \
+                 ('me', 'fresh', '{}', '{}', '{}'); \
+                 INSERT INTO sync_peer_contact (agent_id, peer_id, last_contact_at, catchup_interval_secs) VALUES \
+                 ('me', 'quiet', '{}', 2), \
+                 ('me', 'fresh', '{}', 2);",
+                t(2 * crate::SECS_PER_HOUR),
+                t(30),
+                t(10),
+                t(10),
+                t(5),
+                t(3),
+                t(1),
+            ))
+            .unwrap();
+            let section = section_sync_at(&conn, now);
+            assert_eq!(section.severity, Severity::Info, "{section:?}");
+            assert_eq!(fact(&section, FACT_PROBED_AT), now.to_rfc3339());
+            assert_eq!(fact(&section, FACT_PEER_COUNT), "2");
+            assert_eq!(fact(&section, FACT_INVALID_ROWS), "0");
+            assert_eq!(fact(&section, FACT_STALE_PEERS), "0");
+            assert_eq!(fact(&section, FACT_UNKNOWN_PEERS), "0");
+            assert_eq!(fact(&section, "peer::me/quiet::reachability"), REACHABLE);
+            assert_eq!(fact(&section, "peer::me/quiet::contact_age_secs"), "3");
+            assert_eq!(fact(&section, "peer::me/fresh::contact_age_secs"), "1");
+            assert_eq!(fact(&section, FACT_MAX_CONTACT_AGE_SECS), "3");
+            assert_eq!(fact(&section, "peer::me/quiet::advanced_age_secs"), "30");
+            assert_eq!(
+                fact(&section, "peer::me/quiet::data_age_secs"),
+                (2 * crate::SECS_PER_HOUR).to_string()
+            );
+            assert_eq!(
+                fact(&section, "peer::me/quiet::pushed_age_secs"),
+                PEER_NEVER_PUSHED
+            );
+            // Quiet peer: data older than the observation → NEGATIVE lead, no finding.
+            assert_eq!(
+                fact(&section, "peer::me/quiet::clock_lead_secs"),
+                (30 - 2 * crate::SECS_PER_HOUR).to_string()
+            );
+            assert_eq!(fact(&section, "peer::me/fresh::pushed_age_secs"), "5");
+            assert_eq!(fact(&section, FACT_MAX_ADVANCED_AGE_SECS), "30");
+            assert_eq!(
+                fact(&section, FACT_MAX_DATA_AGE_SECS),
+                (2 * crate::SECS_PER_HOUR).to_string()
+            );
+            assert_eq!(
+                fact(&section, FACT_MAX_SKEW_SECS),
+                (2 * crate::SECS_PER_HOUR - 30).to_string()
+            );
+        }
+    }
+
+    /// #3655 — a peer whose data is stamped beyond the daemon's own
+    /// pull-cursor future bound is a clock disagreement: Critical, named.
+    #[test]
+    fn sync_section_critical_when_peer_clock_leads_beyond_bound_3655() {
+        let env = TestEnv::fresh();
+        let now = chrono::Utc::now();
+        {
+            let conn = crate::db::open(&env.db_path).unwrap();
+            let ahead = (now + chrono::Duration::seconds(crate::SECS_PER_HOUR)).to_rfc3339();
+            conn.execute(
+                "INSERT INTO sync_state (agent_id, peer_id, last_seen_at, last_pulled_at) \
+                 VALUES ('me', 'peer-1', ?1, ?2)",
+                params![ahead, now.to_rfc3339()],
+            )
+            .unwrap();
+            let section = section_sync_at(&conn, now);
+            assert_eq!(section.severity, Severity::Critical, "{section:?}");
+            assert_eq!(fact(&section, FACT_STALE_PEERS), "0");
+            assert_eq!(
+                fact(&section, "peer::me/peer-1::clock_lead_secs"),
+                crate::SECS_PER_HOUR.to_string()
+            );
+            assert!(
+                section
+                    .note
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("clocks disagree")
+            );
+        }
+    }
+
     // ---------------------------------------------------------------
     // #1146 / #1598 reachability probes + #1598 GPU policy — coverage
     // lift (GA push). Driven by wiremock + spawn_blocking (the
@@ -6725,8 +8381,126 @@ enabled = true
 mod pg_extensions_verdict_tests_3264 {
     use super::{MSG_AGE_CATALOG_USAGE_MISSING, Severity, pg_extensions_verdict_3264};
     use crate::store::postgres::PgvectorPreflight;
+    use crate::store::postgres::age_version::{AGE_VERSION_CANONICAL, AGE_VERSION_FLOOR};
 
     const DB: &str = "aimemory";
+
+    /// #3756 — the doctor JUDGES the AGE version through the probe seam
+    /// (no live cluster): below the floor is CRITICAL (RED, doctor exit 2)
+    /// and the note is the named remedy — the version, the floor and the
+    /// canonical pin all appear, so the operator knows what to install.
+    #[test]
+    fn age_below_floor_is_critical_with_the_named_remedy_3756() {
+        for age_usage in [false, true] {
+            let (sev, note) = pg_extensions_verdict_3264(
+                PgvectorPreflight::Installed,
+                DB,
+                Some("1.5.0"),
+                age_usage,
+            );
+            assert_eq!(
+                sev,
+                Severity::Critical,
+                "AGE 1.5.0 is an unsupported substrate"
+            );
+            let note = note.expect("RED carries the remedy");
+            for needle in ["1.5.0", AGE_VERSION_FLOOR, AGE_VERSION_CANONICAL, "#3756"] {
+                assert!(
+                    note.contains(needle),
+                    "the remedy must name {needle:?}: {note}"
+                );
+            }
+        }
+    }
+
+    /// #3756 — an `extversion` the comparator cannot parse is RED too: a
+    /// version nobody can read is a version nobody can vouch for.
+    #[test]
+    fn age_unparseable_version_is_critical_3756() {
+        let (sev, note) =
+            pg_extensions_verdict_3264(PgvectorPreflight::Installed, DB, Some("garbage"), true);
+        assert_eq!(sev, Severity::Critical, "garbage extversion is RED");
+        let note = note.expect("RED carries a note");
+        assert!(
+            note.contains("\"garbage\""),
+            "the note quotes the raw value: {note}"
+        );
+        assert!(
+            note.contains(AGE_VERSION_CANONICAL),
+            "the note names the canonical pin: {note}"
+        );
+    }
+
+    /// #3756 — the tested alternate (the floor itself) is YELLOW: bootable,
+    /// tested, not the certified pin.
+    #[test]
+    fn age_tested_alternate_is_warning_3756() {
+        let (sev, note) = pg_extensions_verdict_3264(
+            PgvectorPreflight::Installed,
+            DB,
+            Some(AGE_VERSION_FLOOR),
+            true,
+        );
+        assert_eq!(
+            sev,
+            Severity::Warning,
+            "AGE {AGE_VERSION_FLOOR} is the tested alternate"
+        );
+        let note = note.expect("YELLOW carries a note");
+        assert!(
+            note.contains(AGE_VERSION_CANONICAL),
+            "names the canonical pin: {note}"
+        );
+    }
+
+    /// #3756 present half — the canonical pin stays GREEN (INFO, no note).
+    #[test]
+    fn age_canonical_stays_info_3756() {
+        assert_eq!(
+            pg_extensions_verdict_3264(
+                PgvectorPreflight::Installed,
+                DB,
+                Some(AGE_VERSION_CANONICAL),
+                true
+            ),
+            (Severity::Info, None)
+        );
+    }
+
+    /// #3756 — the pgvector CRITICAL still outranks an AGE RED (the daemon
+    /// cannot boot at all), and an AGE RED outranks the pgvector
+    /// needs-admin WARN and the `ag_catalog` WARN.
+    #[test]
+    fn age_red_ranks_below_pgvector_critical_and_above_the_warns_3756() {
+        let remedy = PgvectorPreflight::NotAvailableOnServer
+            .preemptive_refusal_detail(DB)
+            .expect("the 0A000 class refuses bootstrap");
+        let (sev, note) = pg_extensions_verdict_3264(
+            PgvectorPreflight::NotAvailableOnServer,
+            DB,
+            Some("1.5.0"),
+            true,
+        );
+        assert_eq!(
+            (sev, note.as_deref()),
+            (Severity::Critical, Some(remedy.as_str()))
+        );
+        let (sev, note) = pg_extensions_verdict_3264(
+            PgvectorPreflight::AvailableNeedsSuperuserCreate,
+            DB,
+            Some("1.5.0"),
+            false,
+        );
+        assert_eq!(
+            sev,
+            Severity::Critical,
+            "AGE RED outranks the pgvector needs-admin WARN"
+        );
+        assert!(
+            note.is_some_and(|n| n.contains("#3756")),
+            "and carries the AGE remedy"
+        );
+    }
 
     /// The one bootstrap-blocking pgvector verdict (`0A000` — the server
     /// image ships no `vector.so`) is CRITICAL (doctor exit 2) and carries
@@ -6743,7 +8517,7 @@ mod pg_extensions_verdict_tests_3264 {
             let (sev, note) = pg_extensions_verdict_3264(
                 PgvectorPreflight::NotAvailableOnServer,
                 DB,
-                true,
+                Some(AGE_VERSION_CANONICAL),
                 age_usage,
             );
             assert_eq!(sev, Severity::Critical);
@@ -6761,7 +8535,7 @@ mod pg_extensions_verdict_tests_3264 {
         let (sev, note) = pg_extensions_verdict_3264(
             PgvectorPreflight::AvailableNeedsSuperuserCreate,
             DB,
-            false,
+            None,
             false,
         );
         assert_eq!(
@@ -6785,7 +8559,12 @@ mod pg_extensions_verdict_tests_3264 {
     /// `age`) — WARN, with the `GRANT` in the note.
     #[test]
     fn age_installed_without_ag_catalog_usage_warns() {
-        let (sev, note) = pg_extensions_verdict_3264(PgvectorPreflight::Installed, DB, true, false);
+        let (sev, note) = pg_extensions_verdict_3264(
+            PgvectorPreflight::Installed,
+            DB,
+            Some(AGE_VERSION_CANONICAL),
+            false,
+        );
         assert_eq!(sev, Severity::Warning);
         let note = note.expect("WARN must carry a note");
         assert_eq!(note, MSG_AGE_CATALOG_USAGE_MISSING);
@@ -6804,11 +8583,15 @@ mod pg_extensions_verdict_tests_3264 {
             PgvectorPreflight::Installed,
             PgvectorPreflight::AvailableCreatableProceed,
         ] {
-            for (age_installed, age_usage) in [(false, false), (false, true), (true, true)] {
+            for (age_version, age_usage) in [
+                (None, false),
+                (None, true),
+                (Some(AGE_VERSION_CANONICAL), true),
+            ] {
                 assert_eq!(
-                    pg_extensions_verdict_3264(verdict, DB, age_installed, age_usage),
+                    pg_extensions_verdict_3264(verdict, DB, age_version, age_usage),
                     (Severity::Info, None),
-                    "{verdict:?} / age={age_installed} usage={age_usage}"
+                    "{verdict:?} / age={age_version:?} usage={age_usage}"
                 );
             }
         }

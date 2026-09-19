@@ -8,7 +8,12 @@ exposes. All endpoints are prefixed with `/api/v1/` unless noted.
 
 ## Base URL
 
-Default: `http://127.0.0.1:9077`.
+Default: `https://127.0.0.1:9077`. The daemon serves TLS only (#3705,
+"only encrypted data in transit"): with no `--tls-cert`/`--tls-key` it
+issues itself a certificate from an installation-local CA under
+`<key_dir>/tls/` (#3709), so point clients at that CA
+(`curl --cacert <key_dir>/tls/local-ca.pem …`) or at the CA behind your
+own `--tls-cert`.
 
 Configure via `ai-memory serve --host <host> --port <port>`. Production
 deployments should always bind TLS: `--tls-cert` + `--tls-key`.
@@ -46,9 +51,9 @@ Failure → **401** `{"error": "missing or invalid API key"}`.
 >
 > ```bash
 > # before (v0.7.0 – v0.10.0) — now 401
-> curl "http://127.0.0.1:9077/api/v1/memories?api_key=$KEY"
+> curl "https://127.0.0.1:9077/api/v1/memories?api_key=$KEY"
 > # after (v1.0.0)
-> curl -H "x-api-key: $KEY" http://127.0.0.1:9077/api/v1/memories
+> curl -H "x-api-key: $KEY" https://127.0.0.1:9077/api/v1/memories
 > ```
 >
 > **Diagnosing it.** The daemon emits a once-per-process WARN under the
@@ -379,6 +384,7 @@ checks for HTTP reachability will mask a corrupted FTS5 index.
 | `fts_integrity.status` | the deep verdict — see below |
 | `fts_integrity.checked_at` | RFC3339 instant the verdict was produced, or `null` if none has completed |
 | `fts_integrity.interval_secs` | the configured check cadence |
+| `webhook_audit_delivery` | webhook delivery-audit persistence for this process (#3659) as a signal object: `state: "available"`, `observed_at_seconds`, and `value` with `status_persisted_total` (ack/failed transitions that reached `subscription_events`), `failed_by_stage` (`open` / `status_update` / `status_no_row` / `dispatch_counter`), `failed_total`, `last_persisted_at_seconds` / `last_failure_at_seconds` (`null` = none since boot), `failing_now` and `actionable` (`true` once any delivery's persisted history is known to disagree with the wire outcome). Carries no subscription or correlation id. Does not affect the HTTP code. |
 
 **The FTS5 integrity verdict is CACHED, not per-request** (#2579). The
 full FTS5 `'integrity-check'` re-tokenizes the whole corpus and is
@@ -441,8 +447,8 @@ operators:
   — one line: a format tag, `failed`, and a UNIX timestamp.
 
 ```bash
-curl -sS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:9077/api/v1/health
-curl -sS http://127.0.0.1:9077/api/v1/health | jq .fts_integrity
+curl -sS -o /dev/null -w '%{http_code}\n' https://127.0.0.1:9077/api/v1/health
+curl -sS https://127.0.0.1:9077/api/v1/health | jq .fts_integrity
 ```
 
 ### `GET /metrics` and `GET /api/v1/metrics`
@@ -451,7 +457,7 @@ Prometheus text exposition format. Scrape from Prometheus, alertmanager,
 or Grafana Agent.
 
 ```bash
-curl http://127.0.0.1:9077/metrics
+curl https://127.0.0.1:9077/metrics
 ```
 
 Both paths are **exempt from admission control** (#1733 / #2032 M3) so
@@ -480,6 +486,13 @@ Series an operator should wire alerts to (canonical registration:
 | `ai_memory_operator_dequarantined_total` | counter | The route-OUT twin (#2402): quarantined memories released by an OPERATOR through `ai-memory quarantine release` or `POST /api/v1/admin/quarantine/{id}/release`. Each increment also appends a `memory.dequarantined` signed-chain row naming the authenticated caller, in the same transaction as the state change; a no-op release does not increment. Pairs with the `quarantine.operator_release` WARN. |
 | `ai_memory_hnsw_evictions_total`, `ai_memory_hnsw_size` | counter, gauge | Vector-index pressure; see `AI_MEMORY_VECTOR_INDEX_CAPACITY`. |
 | `ai_memory_federation_push_dlq_depth`, `..._quarantined_by_cause_total{cause}` | gauge, counter | Federation push-DLQ backlog and its cause breakdown. |
+| `ai_memory_federation_peer_configured{peer}` | gauge | `1` per peer in this node's configured membership (#3654). The census: a peer that never answers is still listed. |
+| `ai_memory_federation_peer_last_attempt_timestamp_seconds{peer,direction}`, `..._last_success_timestamp_seconds{peer,direction}` | gauge | UNIX seconds, on THIS node's clock, of the last attempted and the last successful exchange with the peer. `direction` is `pull` (our catch-up of the peer) or `push` (our writes to it); a push only counts as a success when the peer applied it. Absent until first observed, never a fake `0` (#3654). |
+| `ai_memory_federation_peer_consecutive_failures{peer,direction}`, `ai_memory_federation_peer_failures_total{peer,direction,class}` | gauge, counter | Failure streak since the last success, and failures by closed-set `class` (`unauthorized`, `throttled`, `rejected`, `server_error`, `unreachable`, `bad_response`, `not_applied`, `task_failed`, `other`) (#3654). |
+| `ai_memory_federation_peer_clock_skew_seconds{peer}` | gauge | Peer clock minus local clock from the `Date` header of the peer's last catch-up (pull) response, whole seconds; absent on a node that runs no catch-up loop. Measured, never used as a freshness timestamp (#3654). |
+| `ai_memory_federation_peer_push_dlq_depth{peer}`, `..._push_dlq_oldest_failed_timestamp_seconds{peer}` | gauge | Per-peer push-DLQ backlog and its oldest pending failure, refreshed each replay tick; the oldest-failure series is absent when the backlog is empty (#3654). |
+| `ai_memory_federation_catchup_interval_seconds` | gauge | The configured catch-up cadence, so a stalled catch-up worker is alertable as `time() - last_attempt{direction="pull"}` exceeding a few intervals. Present only while a catch-up loop runs: a node with no catch-up loop exports no sample at all, never a `0` (#3654). |
+| `ai_memory_webhook_audit_status_persisted_total`, `ai_memory_webhook_audit_update_failed_total{stage}`, `ai_memory_webhook_audit_last_failure_at_seconds` | counter, counter, gauge | Webhook delivery-audit bookkeeping (#3659): status transitions that reached `subscription_events`, and bookkeeping failures by stage (`open` \| `status_update` \| `status_no_row` \| `dispatch_counter`; closed set, pre-touched to `0`). The wire counters above say a delivery happened; these say whether its HISTORY was persisted. Any `update_failed_total` increment means `doctor`'s success rate and K7 replay decisions read a history that disagrees with the wire; the ERROR log line carries the subscription and correlation id. |
 | `ai_memory_deferred_audit_drainer_terminal_state` | gauge | Terminal state of the deferred-audit drainer supervisor: `0` = running/graceful, `1` = sink unresolved past `max_restarts`, `2` = sink panicked past `max_restarts` (#3164). **Page on any non-zero value** — the daemon keeps serving requests, but governance refusals are no longer reaching `signed_events` on that node, so it is audit-degraded until restarted. |
 
 This table is the operationally load-bearing subset, not the full
@@ -636,7 +649,7 @@ with `_`: that prefix is reserved for substrate-owned funnels such as
 - **400 / 403 / 500** per validation / governance / server error.
 
 ```bash
-curl -X POST http://127.0.0.1:9077/api/v1/memories \
+curl -X POST https://127.0.0.1:9077/api/v1/memories \
   -H "X-API-Key: KEY" -H "X-Agent-Id: alice" \
   -H "Content-Type: application/json" \
   -d '{"title":"Meeting notes","content":"Q2 roadmap","tier":"mid"}'
@@ -705,9 +718,26 @@ All fields optional. Tier never downgrades.
 
 ### `DELETE /api/v1/memories/{id}` — delete
 
-Archives before delete when `archive_on_gc=true`.
+`delete` means remove the row from the caller's view. Whether the substrate
+RETAINS a copy is a retention policy, and it varies by namespace
+([#3730](https://github.com/alphaonedev/ai-memory-mcp/issues/3730)):
 
-- **200 OK** `{"deleted": true}` or **202** when governance is pending.
+- a message in the caller's agent inbox (`_inbox/<agent>`) is **archived**
+  (`archive_reason = "delete"`, listed by `GET /api/v1/archive`, restorable via
+  `POST /api/v1/archive/{id}/restore`) — the inbox is a queue the recipient
+  drains by deleting what it has handled, and draining must not destroy the
+  record of what the agent was told;
+- every other row is **erased** (no archive copy). The earlier claim on this
+  page that `archive_on_gc=true` archived before delete was wrong: that flag
+  governs `gc` / `forget`, never this route. Archive-first deletion for every
+  namespace is a separate decision (it changes erasure semantics for a caller
+  who deletes in order to erase) and is tracked for v1.0.1.
+
+The response says which happened, so a caller never has to consult this page
+to know whether its data still exists:
+
+- **200 OK** `{"deleted": true, "archived": true|false}` or **202** when
+  governance is pending.
 
 ### `POST /api/v1/memories/bulk` — batch create
 
@@ -814,15 +844,24 @@ JSON envelope; an unrecognised value is a 400).
 ```
 
 ```bash
-curl -X POST http://127.0.0.1:9077/api/v1/recall \
+curl -X POST https://127.0.0.1:9077/api/v1/recall \
   -H "Content-Type: application/json" \
   -d '{"context":"quarterly planning","limit":10}'
 ```
 
 **v0.8.0 §2.5 read-time attested-provenance decoration** ([#1709](https://github.com/alphaonedev/ai-memory-mcp/issues/1709)). Under verbose provenance (the MCP default; HTTP opts in), each recall row carries read-time-composed fields in addition to `score` — all decoration-only (the stored `confidence` ranking contribution is unchanged):
 
-- `provenance_tier` — composed from the row's `confidence_source` + the strongest incident link attestation: `signed_peer` > `curator_derived` > `self_signed` > `unsigned_caller`.
-- `confidence_tier`, `freshness_state`, `latest_link_attest_level` — the existing v0.7.0 Gap-7 decoration.
+- `content_attestation` — **v1.0.0 ([#3548](https://github.com/alphaonedev/ai-memory-mcp/issues/3548))** — the row's OWN write attestation: a **verbatim pass-through of whatever the writer stamped** into the memory's top-level `metadata.attest_level`; absent stamp ⇒ `claimed` (the write path's insert-if-absent default). The field is written by TWO subsystems and its value set is CLOSED and owned by `identity::verify::ATTEST_LEVEL_MEMORY_STAMP_VALUES` (a writer cannot stamp an unlisted value; the set is pinned exactly and this list is bound to it by test):
+  - `claimed` — an unsigned write (a bare `agent_id` assertion) — identity / store paths, federation-applied rows, import, CRDT merge;
+  - `agent_attested` — a per-write Ed25519 signature verified against the AGENT's bound key — the same paths;
+  - `self_signed` — an L4 `memory_capture_turn` with no host signature: the capture channel attests itself — `mcp::tools::capture_turn`;
+  - `signed_by_peer` — an L4 capture whose HOST signature verified — `mcp::tools::capture_turn` (a host key is not the agent's key: kept distinct from `agent_attested` on purpose, and identical to the value on the turn's `signed_events` row and response envelope, #1414).
+  Not this field: `operator_signed` is the governance rules table's column; `loader_observed` is `metadata.model_family_attest`; persona snapshots stamp the nested `metadata.persona.attest_level`. `content_attestation` and `link_attestation` remain different concepts (the memory's own write vs the strongest incident edge) even where two spellings coincide (`self_signed`); folding the L4 pair into one owned enum is [#3736](https://github.com/alphaonedev/ai-memory-mcp/issues/3736) (v1.0.1). A property of the memory itself.
+- `link_attestation` — **v1.0.0 ([#3548](https://github.com/alphaonedev/ai-memory-mcp/issues/3548))** — the EDGE-derived attestation, composed from `confidence_source` + the strongest incident LINK attestation, in the LINK vocabulary (`signed_peer` > `curator_derived` > `self_signed` > `unsigned_caller`; `crate::models::link::AttestLevel`). A property of how the memory was reached, not of the memory. Distinct vocabulary from `content_attestation` by design.
+- `provenance_tier` — **DEPRECATED alias of `link_attestation`, kept for one release (v1.0.0 → removed v1.0.1).** It was composed from `confidence_source` + the strongest incident link attestation and read like a property of the memory while actually being edge-derived; `content_attestation` / `link_attestation` name the two claims apart. Existing consumers keep working until the alias is removed.
+- `confidence_tier` — **NUMERIC-ONLY in v1.0.0** ([#3548](https://github.com/alphaonedev/ai-memory-mcp/issues/3548)): it thresholds the stored `confidence` value (`>= 0.95` ⇒ `confirmed`, `>= 0.7` ⇒ `likely`, else `ambiguous`) and does NOT consult `confidence_source`, so a caller-asserted `1.0` and an engine-measured `1.0` both read `confirmed`. The raw claim rides beside it as `confidence_value` (the stored number) and `confidence_source` (who/what produced it), so a consumer can tell an asserted value from a measured one. Redefining `confirmed` to require engine/curator/calibrated/peer-signed provenance or corroboration ≥ N is deferred to v1.0.1.
+- `confidence_value` — **v1.0.0 ([#3548](https://github.com/alphaonedev/ai-memory-mcp/issues/3548))** — the raw stored `confidence` number, surfaced explicitly beside `confidence_tier`.
+- `freshness_state`, `latest_link_attest_level` — the existing v0.7.0 Gap-7 decoration.
 - `scheduled_validity` (`valid` | `expiring` | `expired`) — present only when `AI_MEMORY_CONFIDENCE_DECAY` is enabled **and** the row has a validity anchor (`expires_at`, else `created_at` + tier TTL); recomputed deterministically against an hour-quantized "as-of" bucket (no exp-decay write). **v1.0.0 #2431** — when the row carries the #1834 claim-validity interval, that interval OVERRIDES the TTL anchor: the horizon is `min(anchor, valid_until)` and the window start is `max(created_at, valid_from)`, so a claim whose `valid_until` has closed reports `expired` (half-open `[valid_from, valid_until)` — a claim ending at T is not valid AT T) instead of the `valid` the TTL anchor alone used to assert. A row whose `valid_from` has NOT been reached yet OMITS the field entirely: the vocabulary describes life remaining and has no point meaning "not yet", so the substrate asserts nothing rather than something false. An unparsable bound fails closed to `expired`.
 
 When a `confidence_tier` filter is requested, the response envelope adds a `meta` object reporting what the filter dropped, so `count: 0` is distinguishable from "no memory":
@@ -1255,6 +1294,9 @@ of the single namespace's standard.
 { "namespace": "engineering/auth", "standards": [ … ], "chain": ["*","engineering","engineering/auth"], "count": 3 }
 ```
 
+With `inherit=false`, the response contains the bound standard's `title`,
+`content`, `priority`, and complete `governance` object on every backend.
+
 Returns 200 with `count: 0` and an empty `standards` array when no
 standard is set. Equivalent MCP tool: `memory_namespace_get_standard`
 (`src/mcp/tools/namespace.rs`).
@@ -1283,6 +1325,9 @@ clamped 1-1000; `limit=0` → 400), `offset`.
 ```json
 { "archived": [ … ], "count": 24 }
 ```
+
+Each archived row uses the live-memory field types; in particular, `tags` is a
+JSON array (never a JSON-encoded string).
 
 Equivalent MCP tool: `memory_archive_list` (`src/mcp/tools/archive.rs`).
 A `POST /api/v1/archive` form also exists (archive an explicit list of
@@ -1407,8 +1452,61 @@ Query: `since` (RFC3339, optional), `limit` (default 500, max 10000),
 
 ### `GET /api/v1/export`
 
-**Admin-gated.** Returns
-`{"memories":[…],"links":[…],"count":N,"exported_at":"…"}`.
+**Admin-gated, bounded (v1.0.0 #3288).** Two modes:
+
+- **Unpaged** (no query parameters): returns
+  `{"memories":[…],"links":[…],"count":N,"exported_at":"…"}` for the whole
+  corpus, but only while the corpus fits the page ceiling
+  (`AI_MEMORY_MAX_PAGE_SIZE`, default 1000). A larger corpus is **refused**
+  with `413 {"code":"EXPORT_PAGING_REQUIRED","max_rows":N}`. It is never
+  truncated, because a client written before paging would keep a partial
+  body as a complete backup.
+- **Paged** (`?limit=N`, then `?limit=N&cursor=<next_cursor>`): each response
+  carries at most `N` memories (`1 <= N <= AI_MEMORY_MAX_PAGE_SIZE`) and the
+  graph edges that page owns, plus `next_cursor` (`null` on the last page).
+  The cursor is opaque. An edge appears exactly once, on the page carrying
+  the later of its two endpoints, so importing the pages in order through
+  `POST /api/v1/import` (1000 memories per call) never references a memory
+  that is not yet imported.
+
+Every body also carries `withheld` (the counts of live rows it does not
+carry: `withheld` forbidden-class drops with `withheld_by_class`,
+`quarantined`, `undecryptable`, plus the reported `tombstoned`, `expired`,
+`redacted` and `dangling_links_withheld` — that last key is the "withheld
+edges" count the acceptance names; the SDK sums it under that name) and
+`partial` (`true` when a forbidden-class, quarantined or undecryptable row was
+withheld). In paged mode the counts are per page: sum them, and OR `partial`,
+across the walk. Refusals: `400 EXPORT_LIMIT_OUT_OF_RANGE` (with `max`) and
+`400 EXPORT_CURSOR_INVALID`. The Python SDK's `export_pages()` performs the
+walk.
+
+**Namespace scope (`?namespace=<ns>`, #3427).** Restricts the export — the
+unpaged body and every page — to one namespace, as a `WHERE` predicate on the
+same ordered query (never a post-filter, so the page bound holds and the
+`withheld` counts are scoped too). The scope is pinned in the cursor: a
+cursor minted under one scope presented with another is refused
+(`400 EXPORT_CURSOR_INVALID`). Every body echoes the scope that was applied
+as `namespace` (`null` = whole corpus), so the operator holding the file can
+see it without trusting the request. An edge whose other endpoint lies
+outside the scope is not carried and is counted in
+`dangling_links_withheld`. Any query parameter the export does not know is
+refused with `400` naming it — a parameter that claims to bound an egress and
+does not is worse than no parameter, so nothing is silently ignored. A
+malformed namespace is `400 VALIDATION_FAILED`.
+
+**Consistency (`"snapshot": false`, #3288 amended acceptance).** A paged walk
+is a **live keyset scan**, not a snapshot, and every body says so. Rows that
+sort *after* the cursor are visited exactly once even when inserted during
+the walk. A row inserted during the walk whose `(created_at, id)` sorts
+*before* the cursor is **not** visited — a federated receive keeps the peer's
+`created_at`, so a backdated insert is not hypothetical on a federating node;
+take the export when the node is quiet, or re-walk. The cursor pins the expiry
+cutoff `as_of` of the walk's first page; a walk continued with an old cursor
+therefore still exports rows that expired after that cutoff and have not yet
+been collected (consistent-walk behaviour, admin-only). Keyset order assumes
+the storage-stable `created_at` rendering every local writer uses
+(`+00:00`, UTC); a row carrying a different offset rendering would sort by
+its text, not its instant.
 
 ### `POST /api/v1/import`
 
@@ -1421,7 +1519,9 @@ Preserves original `metadata.agent_id` into
 
 Three endpoints under `/api/v1/subscriptions` — create them via MCP
 tools or the REST surface. Dispatch is SSRF-hardened (rejects
-private-range IPs; requires `https://` unless loopback).
+private-range IPs) and `https://`-only, loopback included (#3705); a
+receiver behind a private PKI is trusted through the config key
+`[subscriptions] ca_cert = "<PEM>"` (added to the public roots at boot).
 
 Every write surface emits the same events (v1.0.0 #3403): the MCP tools,
 the HTTP handlers, and the `ai-memory` CLI write verbs (`store`,
@@ -1437,6 +1537,9 @@ persisted audit row for replay-from-cursor.
 ### `POST /api/v1/subscriptions` — register webhook
 
 Body: `{ "url": "https://…", "events": "memory_store,memory_delete", "secret": "<shared-secret>", "namespace_filter": "…", "agent_filter": "…" }`.
+`url` must be `https://` (an `http://` target is refused at create and at
+dispatch, loopback included — #3705); a private-PKI receiver needs
+`[subscriptions] ca_cert` in `config.toml`.
 `events` is a **comma-separated string** (default `"*"`). Canonical
 event types (`WEBHOOK_EVENT_TYPES` in `src/subscriptions.rs`):
 `memory_store`, `memory_promote`, `memory_delete`,
@@ -1480,23 +1583,23 @@ returns the appropriate error status.
 
 ```bash
 # Health
-curl http://127.0.0.1:9077/api/v1/health
+curl https://127.0.0.1:9077/api/v1/health
 
 # Store a memory
 curl -X POST -H "Content-Type: application/json" \
-  http://127.0.0.1:9077/api/v1/memories \
+  https://127.0.0.1:9077/api/v1/memories \
   -d '{"title":"hi","content":"there","tier":"mid"}'
 
 # Recall
 curl -X POST -H "Content-Type: application/json" \
-  http://127.0.0.1:9077/api/v1/recall \
+  https://127.0.0.1:9077/api/v1/recall \
   -d '{"context":"what did I store","limit":5}'
 
 # Incremental sync pull since a timestamp
-curl 'http://127.0.0.1:9077/api/v1/sync/since?since=2026-04-01T00:00:00Z&limit=1000'
+curl 'https://127.0.0.1:9077/api/v1/sync/since?since=2026-04-01T00:00:00Z&limit=1000'
 
 # Prometheus scrape
-curl http://127.0.0.1:9077/metrics
+curl https://127.0.0.1:9077/metrics
 ```
 
 ## HTTP ↔ MCP parameter coverage
@@ -1555,11 +1658,11 @@ router in `src/lib.rs`.
 | `POST` | `/api/v1/share` | #1095 — copy a memory into the recipient agent's `_shared/<from>→<to>/` namespace; body `{source_memory_id, target_agent_id}`. MCP: `memory_share`. |
 | `POST` | `/api/v1/session/start` | HTTP parity for `memory_session_start` (auto-recall session boot). Near-duplicates are clustered (same as `ai-memory boot`); a representative row may carry `similar_count`. |
 | `GET`  | `/api/v1/capabilities` | Capabilities envelope (schema_version `"3"`; `Accept-Capabilities` header negotiates v1/v2). MCP: `memory_capabilities`. |
-| `POST` | `/api/v1/notify` | Agent-to-agent inbox message. Sender resolved from `X-Agent-Id` only (#901); body `agent_id` must match or 403. MCP: `memory_notify`. |
-| `GET`  | `/api/v1/inbox` | Read the calling agent's inbox. MCP: `memory_inbox`; when `AI_MEMORY_AGENT_ID` is unset, access is bound to the same process-derived identity used by `memory_notify`, and an explicit `agent_id` must match it. MCP refuses startup when `AI_MEMORY_AGENT_ID` is configured empty or malformed. An isolated single-tenant process may explicitly set `[mcp] single_tenant_trust_all = true` to restore caller-unbound inbox selection; every use emits a WARN. |
+| `POST` | `/api/v1/notify` | Agent-to-agent inbox message. Sender resolved from `X-Agent-Id` only (#901); body `agent_id` must match or 403. MCP: `memory_notify`. Every delivery is a NEW row (#3639): the stored `title` is `<subject> [<id prefix>]` (unique by construction), the caller's title is kept verbatim as `metadata.subject`, a repeated subject never merges into, overwrites or re-attributes an earlier message, and the receipt carries `id`, `title` and `subject`. |
+| `GET`  | `/api/v1/inbox` | Read the calling agent's inbox — the messages it has not yet HANDLED. Handled = the recipient deleted the message (`DELETE /api/v1/memories/{id}`, archived on this namespace, see the delete route); reads never mark anything (#1869 purity) and there is no read marker — `access_count` counts touches, never handling ([#3730](https://github.com/alphaonedev/ai-memory-mcp/issues/3730)). `unread_only` is accepted for compatibility and narrows nothing (every listed message is unhandled); `unread_count == count`. MCP: `memory_inbox`; when `AI_MEMORY_AGENT_ID` is unset, access is bound to the same process-derived identity used by `memory_notify`, and an explicit `agent_id` must match it. MCP refuses startup when `AI_MEMORY_AGENT_ID` is configured empty or malformed. An isolated single-tenant process may explicitly set `[mcp] single_tenant_trust_all = true` to restore caller-unbound inbox selection; every use emits a WARN. |
 | `GET`  | `/api/v1/inbox/stream` | v1.0.0 [#3465](https://github.com/alphaonedev/ai-memory-mcp/issues/3465) — SSE wake stream for the calling agent's OWN inbox (`handlers::inbox_sse`). One `agent_notified` frame per committed `memory_notify`, plus a synthetic `lagged` frame when a slow subscriber overruns the bounded broadcast buffer; keepalive every 15 s. Identity-bound at stream open — no delegation, no namespace widening, and an unresolved identity (absent/unreadable `X-Agent-Id`, or a self-asserted `host:` principal) gets a stream that never emits. Frames carry the inbox row id, namespace, sender, a correlation id and a `sha256:` content digest — **never the body**; the woken client reads its mail through `GET /api/v1/inbox`. Fed from the in-process wake bus, not the webhook lane. No MCP twin (SSE has no MCP transport). |
 | `GET` `POST` `DELETE` | `/api/v1/skill/list`, `/api/v1/skill/register`, `/api/v1/skill/{id}`, `/api/v1/skill/{id}/resource`, `/api/v1/skill/{id}/export`, `/api/v1/skill/{id}/promote`, `/api/v1/skill/{id}/compose` | Cluster E API-2 (#767) — Agent Skills HTTP parity for the seven `memory_skill_*` MCP tools. **Admin-gated.** `…/export` writes on the daemon host and is **jailed** — see *Skills export root* below. |
-| `POST` | `/api/v1/memory_smart_load`, `/api/v1/memory_reflect`, `/api/v1/memory_recall_observations`, `/api/v1/memory_reflection_origin`, `/api/v1/memory_dependents_of_invalidated`, `/api/v1/memory_export_reflection`, `/api/v1/memory_atomise`, `/api/v1/memory_calibrate_confidence`, `/api/v1/memory_verify`, `/api/v1/memory_replay`, `/api/v1/memory_subscription_replay`, `/api/v1/memory_subscription_dlq_list`, `/api/v1/memory_rule_list`, `/api/v1/memory_check_agent_action` | #1111 — 14 thin HTTP wrappers around the same-named MCP substrate handlers (`src/handlers/route_1111.rs`); wire envelopes are byte-equal across MCP and HTTP. **`/api/v1/memory_calibrate_confidence` is a caller-scoped aggregate ([#3507](https://github.com/alphaonedev/ai-memory-mcp/issues/3507)):** the report's `baselines` NAME namespaces, so the sweep is computed only over rows the caller can read, using the store's own visibility predicates (subtree scopes, owner-keyed `scope=private`, substrate exclusion) on BOTH backends. `X-Agent-Id` is REQUIRED — an absent header answers `403`, never the pre-#3507 corpus-wide sweep, because the shared resolver would otherwise synthesize a per-request `anonymous:req-…` that owns no rows. An admin caller (the existing `is_admin_caller_trusted` gate) keeps the global aggregate; every other caller is scoped, and for a scoped caller the sweep is strictly read-only (the `recall_outcome` backfill is admin-only, so `consumption_utility` may report `null`). |
+| `POST` | `/api/v1/memory_smart_load`, `/api/v1/memory_reflect`, `/api/v1/memory_recall_observations`, `/api/v1/memory_reflection_origin`, `/api/v1/memory_dependents_of_invalidated`, `/api/v1/memory_export_reflection`, `/api/v1/memory_atomise`, `/api/v1/memory_calibrate_confidence`, `/api/v1/memory_verify`, `/api/v1/memory_replay`, `/api/v1/memory_subscription_replay`, `/api/v1/memory_subscription_dlq_list`, `/api/v1/memory_rule_list`, `/api/v1/memory_check_agent_action` | #1111 — 14 thin HTTP wrappers around the same-named MCP substrate handlers (`src/handlers/route_1111.rs`); wire envelopes are byte-equal across MCP and HTTP. `memory_subscription_replay` events carry `delivery_status`: `ack` / `failed` are terminal; **`pending` means no terminal status was recorded — including a delivery that settled but whose terminal status write failed** ([#3659](https://github.com/alphaonedev/ai-memory-mcp/issues/3659)), so the field alone cannot separate in-flight from lost; a row still `pending` past the 60 s settle window is the lost case (`doctor` warns; the reliable write is [#3735](https://github.com/alphaonedev/ai-memory-mcp/issues/3735)). **`/api/v1/memory_calibrate_confidence` is a caller-scoped aggregate ([#3507](https://github.com/alphaonedev/ai-memory-mcp/issues/3507)):** the report's `baselines` NAME namespaces, so the sweep is computed only over rows the caller can read, using the store's own visibility predicates (subtree scopes, owner-keyed `scope=private`, substrate exclusion) on BOTH backends. `X-Agent-Id` is REQUIRED — an absent header answers `403`, never the pre-#3507 corpus-wide sweep, because the shared resolver would otherwise synthesize a per-request `anonymous:req-…` that owns no rows. An admin caller (the existing `is_admin_caller_trusted` gate) keeps the global aggregate; every other caller is scoped, and for a scoped caller the sweep is strictly read-only (the `recall_outcome` backfill is admin-only, so `consumption_utility` may report `null`). |
 | `GET`  | `/api/v1/admin/quarantine` | v1.0.0 [#2402](https://github.com/alphaonedev/ai-memory-mcp/issues/2402) — list the memories currently held in federation quarantine (`handlers::list_quarantined`). **Admin-gated.** Identifying metadata ONLY (id, namespace, title, source, kind, timestamps) — never `content`: a quarantined row is untrusted input by construction and its content may be an at-rest seal sentinel. `?namespace=` narrows, `?limit=` pages (clamped to 1000). |
 | `POST` | `/api/v1/admin/quarantine/{id}/release` | v1.0.0 [#2402](https://github.com/alphaonedev/ai-memory-mcp/issues/2402) — release one quarantined memory back to `lifecycle_state=open` (`handlers::release_quarantined`), the operator half of the [#1948](https://github.com/alphaonedev/ai-memory-mcp/issues/1948) route-OUT contract that shipped with no caller. **Admin-gated**; the audit actor is the principal `require_admin` RETURNS — an id it admits only when it is on the admin allowlist AND the deployment has request authentication configured (#1570), and, under the `enforce` identity-binding posture, only when it is key-attested to a per-agent api key (#2044). The handler never reads `X-Agent-Id` itself. Appends a `memory.dequarantined` signed audit row in the SAME transaction as the state change on both backends. Idempotent: an id that is not currently quarantined answers `200 {"released": false}` and writes nothing (deliberately not `404` — that would leak the existence of rows this surface does not return). |
 | `GET`  | `/api/v1/tools/list` | MCP `tools/list` mirror for harness ops — returns the live tool surface for the daemon's profile (**104** advertised entries at `--profile full`; **7** family tools at `core`, **8** on the wire with always-on `memory_capabilities`) — SSOT: `Profile::full()/core().expected_tool_count()` in `src/profile.rs`. |
@@ -1609,12 +1712,12 @@ This is the write-side twin of the `AI_MEMORY_SKILLS_IMPORT_ROOT` register jail
 (#1923). The process working directory is deliberately NOT the fallback root: a
 daemon's CWD is arbitrary — frequently `/` or `$HOME` — which is not a jail.
 
-> **Total HTTP surface at v1.0.0: 86 unique URL paths across 100
+> **Total HTTP surface at v1.0.0: 88 unique URL paths across 102
 > production route registrations** (several paths carry more than one
 > method), on the sqlite-backed daemon and on the postgres-backed daemon
 > under `--features sal-postgres`. Both numbers are pinned in
-> `src/lib.rs` as `EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT = 86` and
-> `EXPECTED_PRODUCTION_ROUTES_COUNT = 100`, asserted by
+> `src/lib.rs` as `EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT = 88` and
+> `EXPECTED_PRODUCTION_ROUTES_COUNT = 102`, asserted by
 > `tests/route_count_invariant.rs`. Three further routes are
 > `#[cfg(test)]`-gated and never registered in a production build
 > (`EXPECTED_TEST_ROUTES_COUNT = 3`).
@@ -1625,7 +1728,7 @@ daemon's CWD is arbitrary — frequently `/` or `$HOME` — which is not a jail.
 > grep -oE '"/[^"]*"' src/handlers/routes.rs | sort -u | wc -l
 > ```
 >
-> That count is `EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT` (86): the
+> That count is `EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT` (88): the
 > `/api/v1/*` paths plus the bare `/metrics`. Do not count `.route(`
 > occurrences in `src/lib.rs` to get the registration total — the
 > router also registers test-only routes under `#[cfg(test)]`, so a
@@ -1711,3 +1814,63 @@ The v0.8.0 net-new tools were the coordination families `memory_action_*`, `memo
 - `docs/CLI_REFERENCE.md` — corresponding CLI surface.
 - `docs/SECURITY.md` — API key + mTLS + governance.
 - `docs/TROUBLESHOOTING.md` — common error scenarios.
+
+
+### Authenticated health monitoring (v1)
+
+`GET /api/v1/monitoring/status` returns versioned, metadata-only JSON;
+`GET /api/v1/monitoring/metrics` returns standard Prometheus exposition. Both
+require the daemon's native TLS and existing enrolled-key or bound mTLS
+authentication (the operator key also works). `[monitoring]` assigns ordinary
+principals a health-only scope enforced before all route dispatch. See the
+[health monitoring contract](HEALTH-MONITORING.md) for enrollment, fields,
+privacy, unavailable audit signals and the storage-boundary follow-up #3672.
+
+## Write receipt durability (#3555)
+
+Write receipts for HTTP create, update, bulk, capture/replay and sync push,
+MCP store/update/capture, and CLI store/update/capture include these top-level fields:
+
+| Field | Meaning |
+| --- | --- |
+| `durability_class` | `local-only`, `quorum W-of-N`, or `replicated+backup` |
+| `fsync` | Observed local commit flush cadence; independent of replica count |
+| `quorum_acks` | Actual distinct acknowledgements including the local commit, when a quorum was established |
+| `quorum_n` | Total configured replicas including the local node |
+| `quorum_required` | Configured acknowledgement threshold for that operation |
+
+For `quorum W-of-N`, W is the actual acknowledgement count at the successful
+quorum verdict, not merely the configured threshold; for example,
+`"durability_class": "quorum 2-of-3"`, `"quorum_acks": 2`, `"quorum_n": 3`.
+The evidence belongs to this operation. A configured mesh, asynchronous fanout,
+or a queued approval does not establish quorum durability for a memory.
+Bulk commits keep the conservative `local-only` aggregate class because their
+fanout can fail independently for individual rows. Capture and sync receivers
+acknowledge local writes; they do not wait for additional replication.
+A replay reports the current local posture, not reconstructed historical evidence.
+
+SQLite `NORMAL` writes report `local-only` with `fsync: per-checkpoint`;
+`FULL` and `EXTRA` report `local-only` with `fsync: per-commit`.
+PostgreSQL reads `fsync` and `synchronous_commit` from the active store pool;
+local fsync with synchronous commits reports `per-commit`. With
+`synchronous_commit=off`, it reports `asynchronous WAL flush`; with `fsync=off`,
+it reports `never (OS write-back only)`. Native PostgreSQL standby configuration
+alone does not establish an application-level W/N count.
+Commit settings must remain stable across pooled writer connections during an
+operation; a receipt is an observation of the active posture, not a settings lock.
+A durability-observation or serialization error fails receipt production with
+500; the response warns that the write may have completed, so callers must use their
+usual idempotency key when reconciling the result.
+
+An operator may explicitly set
+`AI_MEMORY_BACKUP_POSTURE_ATTESTATION=attested` to attest that the replicated
+installation has the required backup posture. Only a write with at least one
+remote acknowledgement can then report `replicated+backup`. Unset or other
+values never enable that class. The setting is a trusted operator posture
+attestation, not a claim that a particular asynchronous backup already contains
+this commit. The receipt retains the actual W/N counts alongside this class.
+Local fsync settings alone never enable either replicated class.
+
+The RPO and loss metric must be interpreted within the receipt's declared
+class and local flush cadence. The generated mutating-surface structural test
+is deferred to #3558, which owns the canonical inventory schema and generator.

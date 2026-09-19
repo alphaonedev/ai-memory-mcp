@@ -327,10 +327,11 @@ pub fn handle_signal_send_with_hooks(
             &signal.namespace,
             bytes,
         )
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("handle_signal_send_with_hooks", e))?;
     }
 
-    crate::signals::insert(conn, &signal).map_err(|e| e.to_string())?;
+    crate::signals::insert(conn, &signal)
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("handle_signal_send_with_hooks", e))?;
 
     // #1714 / #1722 — coordination observability: append a tamper-evident
     // `signed_events` row for the send so the Pillar-1 substrate has an
@@ -374,7 +375,8 @@ pub fn handle_signal_read(conn: &rusqlite::Connection, params: &Value) -> Result
     // returned `{"signal": null}` for a malformed call, so a caller could not
     // tell a bad id from a deleted/expired signal. Refuse instead.
     let id = crate::mcp::param_guard::require_str(params, param_names::ID)?;
-    let found = crate::signals::get(conn, id).map_err(|e| e.to_string())?;
+    let found = crate::signals::get(conn, id)
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("get", e))?;
     match found {
         None => Ok(json!({ "signal": Value::Null })),
         Some(signal) => {
@@ -419,8 +421,8 @@ pub fn handle_signal_inbox(conn: &rusqlite::Connection, params: &Value) -> Resul
     let limit = crate::mcp::param_guard::optional_non_negative_u64(params, param_names::LIMIT)?
         .map_or(50, |n| usize::try_from(n).unwrap_or(usize::MAX));
 
-    let signals =
-        crate::signals::list_inbox(conn, namespace, to_agent, limit).map_err(|e| e.to_string())?;
+    let signals = crate::signals::list_inbox(conn, namespace, to_agent, limit)
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("list_inbox", e))?;
     Ok(json!({
         "signals": serde_json::to_value(&signals).map_err(|e| e.to_string())?,
     }))
@@ -439,7 +441,8 @@ pub fn handle_signal_thread(conn: &rusqlite::Connection, params: &Value) -> Resu
     // empty `signals` array back: a plausible "this thread has no messages"
     // answer to a question that was never actually asked. Refuse instead.
     let correlation_id = crate::mcp::param_guard::require_str(params, param_names::CORRELATION_ID)?;
-    let signals = crate::signals::thread(conn, correlation_id).map_err(|e| e.to_string())?;
+    let signals = crate::signals::thread(conn, correlation_id)
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("thread", e))?;
     Ok(json!({
         "signals": serde_json::to_value(&signals).map_err(|e| e.to_string())?,
     }))
@@ -510,7 +513,9 @@ pub fn handle_signal_ack_with_hooks(
     // addressee, and a refused ack must leave the row byte-identical. Pre-fix
     // the stamp landed first and the row was re-read only to name an actor in
     // the audit trail.
-    let Some(signal) = crate::signals::get(conn, id).map_err(|e| e.to_string())? else {
+    let Some(signal) = crate::signals::get(conn, id)
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("get", e))?
+    else {
         // No row: nothing to authorize and nothing to change. Unchanged
         // pre-#3364 shape — an absent id is not an authorization verdict, and
         // reporting one would leak which ids exist.
@@ -519,7 +524,8 @@ pub fn handle_signal_ack_with_hooks(
     crate::signals::authorize_ack(&signal, &caller).map_err(|e| e.to_string())?;
 
     let now = chrono::Utc::now().timestamp();
-    let acknowledged = crate::signals::mark_acked(conn, id, now).map_err(|e| e.to_string())?;
+    let acknowledged = crate::signals::mark_acked(conn, id, now)
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("authorize_ack", e))?;
 
     // #1722 — coordination observability: append a `coordination.signal_ack`
     // audit row ONLY when this call actually flipped the ack (a no-op re-ack

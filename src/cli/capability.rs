@@ -181,7 +181,7 @@ fn resolve_key_dir(flag: Option<PathBuf>) -> Result<PathBuf> {
 }
 
 /// What an idempotent `capability init` (R9, #1960) actually did.
-struct OwnerInitOutcome {
+pub(crate) struct OwnerInitOutcome {
     /// A fresh `owner.priv`/`owner.pub` keypair was generated this call.
     created_keypair: bool,
     /// A fresh `owner.caproot` mint secret was written this call.
@@ -190,7 +190,7 @@ struct OwnerInitOutcome {
 
 impl OwnerInitOutcome {
     /// True when both halves already existed (the call was a pure no-op).
-    fn already_initialized(&self) -> bool {
+    pub(crate) fn already_initialized(&self) -> bool {
         !self.created_keypair && !self.created_root_secret
     }
 }
@@ -200,18 +200,35 @@ impl OwnerInitOutcome {
 /// `owner.caproot` mint secret (mode `0o600`). Re-running when both halves
 /// already exist is a no-op; a partial state (one half missing) is repaired.
 /// Custody follows the existing key-dir discipline (0o600 private material).
-fn init_owner(dir: &std::path::Path) -> Result<OwnerInitOutcome> {
-    // Keypair — considered present iff a loadable PRIVATE key exists (a
-    // public-only file cannot mint).
-    let has_keypair = keypair::load(OWNER_ISSUER, dir)
-        .map(|kp| kp.private.is_some())
-        .unwrap_or(false);
-    let created_keypair = if has_keypair {
-        false
-    } else {
-        let kp = keypair::generate(OWNER_ISSUER).context("generating owner capability keypair")?;
-        keypair::save(&kp, dir).context("saving owner capability keypair")?;
-        true
+///
+/// #3717 (F1) — the keypair is judged by [`keypair::ensure_keypair`]'s
+/// four-way state table, never by "does `load` succeed": the pre-#3717
+/// `load(..).map(..).unwrap_or(false)` read a half-state (`owner.priv`
+/// present, `owner.pub` absent — `load` fails on the missing public half)
+/// as "no keypair" and MINTED OVER `owner.priv`, silently invalidating every
+/// token the old owner issued. Now the public half is re-derived from the
+/// private half, and the mirror half-state (`owner.pub` without
+/// `owner.priv`) REFUSES rather than minting a different owner.
+pub(crate) fn init_owner(dir: &std::path::Path) -> Result<OwnerInitOutcome> {
+    use keypair::EnsureOutcome;
+    let created_keypair = match keypair::ensure_keypair(OWNER_ISSUER, dir, false)
+        .context("ensuring the owner capability keypair")?
+    {
+        EnsureOutcome::Generated { .. } => true,
+        EnsureOutcome::AlreadyExists { .. } | EnsureOutcome::RepairedPublicFromPrivate { .. } => {
+            false
+        }
+        EnsureOutcome::PublicOnlyDegraded {
+            pub_path,
+            priv_path,
+        } => bail!(
+            "owner capability custody refused: {} exists without its private half {} — a fresh \
+             owner would silently invalidate every token the old one issued (#3717 F1); restore \
+             the private key from backup, or remove the public key to accept a fresh owner",
+            pub_path.display(),
+            priv_path.display()
+        ),
+        EnsureOutcome::SkippedDisabled => bail!("owner keypair auto-generation is disabled"),
     };
 
     // Caproot mint secret — present iff it loads cleanly (right length +

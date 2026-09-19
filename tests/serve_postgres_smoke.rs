@@ -126,6 +126,7 @@ async fn serve_postgres_smoke_round_trip() {
             ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty(),
         ),
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
+        ..Default::default()
     };
     let app_state = build_postgres_app_state(&url).await;
 

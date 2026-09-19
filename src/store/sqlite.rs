@@ -25,6 +25,8 @@ use super::{
 };
 use crate::quotas::{self, QuotaStatus};
 
+// pm-v3.1 hardcoded-literal ratchet: a string spelled 2+ times in this file is named once.
+
 /// SAL adapter over the existing bundled-SQLite storage. Holds an
 /// `Arc<Mutex<Connection>>` matching the HTTP daemon's shared state so
 /// the adapter can be used alongside the existing free-function code
@@ -103,6 +105,40 @@ impl SqliteStore {
         })
     }
 
+    /// v1.0.0 #3435 — open an EXISTING database read-only, for the source
+    /// side of `ai-memory migrate` (and any other verb that only READS a
+    /// store the operator named).
+    ///
+    /// Delegates to [`crate::db::open_existing_read_only`], which is the
+    /// funnel that CANNOT create: a missing path is the typed
+    /// [`crate::db::MISSING_DATABASE_REFUSAL`] instead of `Connection::open`'s
+    /// create-then-migrate, and the connection is `SQLITE_OPEN_READ_ONLY` +
+    /// `PRAGMA query_only = ON`, so no bootstrap DDL, no migration ladder and
+    /// no stray write can touch the source. A source whose schema stamp is
+    /// BEHIND this binary is refused with the typed `SchemaBehindReadOnly`
+    /// (the writer funnel would silently migrate it in place — a migration
+    /// tool must never mutate what it is copying FROM).
+    ///
+    /// # Errors
+    ///
+    /// Every error [`crate::db::open_existing_read_only`] can produce.
+    pub fn open_existing_read_only(path: impl Into<PathBuf>) -> StoreResult<Self> {
+        let path = path.into();
+        let conn = db::open_existing_read_only(&path).map_err(box_err)?;
+        let _ = crate::store::record_stop::seed_from_conn(&conn);
+        let record_stop_key = crate::storage::record_stop::conn_key(&conn);
+        let state = Arc::new(Mutex::new(conn));
+        Ok(Self {
+            // ONE read-only connection serves both roles: there is no writer
+            // to de-stall a traversal from, so a second reader buys nothing.
+            read_state: Arc::clone(&state),
+            state,
+            path,
+            record_stop_key,
+            embed_skip_amort: Arc::new(crate::storage::embed_skip::EmbedSkipAmortisation::new()),
+        })
+    }
+
     /// #3196 — try to open a dedicated read-only connection for
     /// [`Self::find_paths`]. Returns `None` (caller shares the writer) when
     /// the database is in-memory — a second open would attach a FRESH empty
@@ -154,6 +190,26 @@ impl SqliteStore {
 
 fn box_err<E: std::fmt::Display>(e: E) -> StoreError {
     StoreError::Backend(BoxBackendError::new(e.to_string()))
+}
+
+/// Map the typed coordination-guard refusal onto the SAL error: quota and
+/// validation keep their structural variants (the postgres twin maps
+/// `prepare_action` to `IntegrityFailed` the same way); a driver fault
+/// stays a backend detail, byte-identical to the pre-typed funnel.
+fn memory_guard_err(e: crate::errors::MemoryError) -> StoreError {
+    match e {
+        crate::errors::MemoryError::QuotaExceeded(quota) => StoreError::QuotaExceeded {
+            agent_id: quota.agent_id,
+            namespace: quota.namespace,
+            limit: quota.limit.as_str().to_string(),
+            current: quota.current,
+            max: quota.max,
+        },
+        crate::errors::MemoryError::ValidationFailed(detail) => {
+            StoreError::IntegrityFailed { detail }
+        }
+        other => box_err(other.message()),
+    }
 }
 
 /// v1.0.0 #3474 — SAL-layer `GovernedAction` back to its `models` twin, the
@@ -244,24 +300,21 @@ fn link_owner_of(m: &Memory) -> String {
 /// constructs a store — so a future reader does not mistake this arm
 /// for a whole-crate chokepoint.
 ///
-/// SEMANTICS — deliberately sqlite's OWN contract, not postgres's.
+/// SEMANTICS — the ONE cross-backend unstamped-row policy (#3124).
 /// This delegates to the canonical, shared
 /// [`crate::visibility::caller_owns_for_mutation`] predicate — the same
 /// one every MCP mutate tool uses (`mcp::tools::{update, delete, promote,
 /// link, kg_invalidate}`) and the twin of the HTTP
-/// `require_caller_owns_memory` carve-out set (src/handlers/parity.rs).
-/// So an UNSTAMPED row (no `metadata.agent_id`: legacy / pre-v0.6.3 /
-/// migrated) stays MUTABLE, which is what keeps the single-operator
-/// default — where rows may carry no stamp at all — working.
-///
-/// This is NOT the postgres #1628 posture, which REFUSES unstamped rows.
-/// Adopting that here would turn today-writable legacy rows into
-/// permanently inaccessible ones for every non-admin caller — a data-loss
-/// mode — and it would be a posture tightening, which a parity change must
-/// not ship silently. Sqlite therefore stays internally consistent
-/// (HTTP == MCP == SAL); unifying the two BACKENDS (stamp legacy rows via
-/// migration, then refuse everywhere) is the cross-backend policy decision
-/// tracked in #3124 — do NOT tighten this arm here ahead of that issue.
+/// `require_caller_owns_memory` gate (src/handlers/parity.rs). An
+/// UNSTAMPED row (no / null / `""` `metadata.agent_id`: legacy /
+/// pre-v0.6.3 / migrated) is decided by `AI_MEMORY_UNSTAMPED_MUTATION`:
+/// admitted with a WARN + counter under `warn` (the default, and this
+/// arm's pre-#3124 outcome — refusing outright would turn today-writable
+/// legacy rows into inaccessible ones, the data-loss mode the #3115 panel
+/// rejected), refused under `refuse`. A MALFORMED (non-string) owner is
+/// never matched. Postgres's own #1412/#1628 funnels keep refusing an
+/// unstamped row in both postures — `warn` never loosens a funnel that
+/// already refused; under `refuse` the two backends agree on every funnel.
 ///
 /// `allow_inbox` mirrors the established per-verb convention exactly:
 /// `false` for update/promote (an inbox recipient must not rewrite the
@@ -283,6 +336,7 @@ fn assert_caller_owns_for_mutation(
     id: &str,
     action: &str,
     allow_inbox: bool,
+    funnel: &'static str,
 ) -> StoreResult<()> {
     if ctx.bypass_visibility {
         return Ok(());
@@ -291,18 +345,39 @@ fn assert_caller_owns_for_mutation(
         return Err(StoreError::NotFound { id: id.to_string() });
     };
     let caller = ctx.effective_principal();
-    if crate::visibility::caller_owns_for_mutation(&target, caller, allow_inbox) {
+    if crate::visibility::caller_owns_for_mutation(
+        &target,
+        caller,
+        allow_inbox,
+        crate::identity::owner_stamp::MutationSite::sqlite(funnel),
+    ) {
         return Ok(());
     }
-    let owner = target
-        .metadata
-        .get(crate::META_KEY_AGENT_ID)
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("");
+    let stamp = crate::identity::owner_stamp::OwnerStamp::of(&target.metadata);
+    let reason = if stamp.is_unstamped() {
+        // #3124 — `AI_MEMORY_UNSTAMPED_MUTATION=refuse`: the same stable
+        // reason the postgres twin carries for an unstamped row.
+        crate::identity::owner_stamp::REASON_UNSTAMPED_REFUSED.to_string()
+    } else {
+        // #3426 — the refusal reason is the bare SSOT message. Pre-fix it
+        // interpolated the ROW OWNER's agent id, which
+        // `store_err_to_response` renders straight into the 403 body (the
+        // sanitizer only redacts URLs and filesystem paths, not
+        // principals), so a refused cross-tenant caller learned WHO holds
+        // the row. The owner is emitted only to the structured AUTHZ trace
+        // below. Matches the postgres link gate, which already refused
+        // with the bare const.
+        let owner = stamp.owner_for_display();
+        tracing::warn!(
+            target: crate::handlers::AUTHZ_TRACE_TARGET,
+            "sal owner-gate refusal on {action}: caller {caller} != owner {owner} (id={id})"
+        );
+        crate::errors::msg::CALLER_DOES_NOT_OWN_MEMORY.to_string()
+    };
     Err(StoreError::PermissionDenied {
         action: action.to_string(),
         target: id.to_string(),
-        reason: format!("caller {caller:?} does not own memory (owner: {owner:?})"),
+        reason,
     })
 }
 
@@ -318,6 +393,11 @@ fn assert_caller_owns_for_mutation(
 
 #[async_trait::async_trait]
 impl MemoryStore for SqliteStore {
+    async fn write_durability(&self) -> StoreResult<crate::write_receipt::WriteDurability> {
+        let conn = self.state.lock().await;
+        crate::write_receipt::WriteDurability::sqlite(&conn).map_err(box_err)
+    }
+
     fn capabilities(&self) -> Capabilities {
         // #1670 — the two transaction-related bits mean DIFFERENT things;
         // sqlite honestly holds one but not the other:
@@ -413,7 +493,10 @@ impl MemoryStore for SqliteStore {
             crate::storage::stamp_substrate_why_trace(&mut stamped.metadata);
             db::insert(&conn, &stamped).map_err(box_err)
         } else {
-            db::insert(&conn, memory).map_err(box_err)
+            // #3696 — the admission runs as THIS caller (the read-visibility
+            // identity the SAL read lanes use), so a `(title, namespace)`
+            // holder it cannot read is refused typed and unnamed.
+            db::insert_as(&conn, memory, Some(ctx.agent_id.as_str())).map_err(box_err)
         }
     }
 
@@ -581,6 +664,9 @@ impl MemoryStore for SqliteStore {
     /// paths. Delegates to the sqlite SSOT `db::insert_restore_same_id`
     /// (`INSERT … ON CONFLICT(title, namespace) DO UPDATE … WHERE memories.id =
     /// excluded.id`): a same-id restore (incl. against a tombstoned row) merges,
+    /// and since #2894 a restore onto a consolidation tombstone re-opens the
+    /// row to the snapshot's visible lifecycle (the ONE re-open predicate),
+    /// so the restored original is recallable;
     /// a DIFFERENT-id owner is refused with [`StoreError::Conflict`] carrying the
     /// occupant's id, and the foreign row is never clobbered. Mirrors
     /// [`Self::store`]'s `bypass_visibility` substrate why_trace stamp so a
@@ -720,7 +806,14 @@ impl MemoryStore for SqliteStore {
         // Parity finding #4 — SAL-level caller-owns gate (postgres parity).
         // Inbox carve-out DISABLED for update, mirroring the HTTP
         // `update_memory` / MCP `memory_update` convention.
-        assert_caller_owns_for_mutation(&conn, ctx, id, "update", false)?;
+        assert_caller_owns_for_mutation(
+            &conn,
+            ctx,
+            id,
+            "update",
+            false,
+            crate::identity::owner_stamp::funnel::UPDATE,
+        )?;
         // v0.7.0 Provenance Gap 2 (#906) — thread the patch's
         // `source_uri` slot into `update_with_expected_version` so the
         // sqlite SAL adapter honors source_uri rewrites end-to-end.
@@ -805,13 +898,40 @@ impl MemoryStore for SqliteStore {
     async fn delete(&self, ctx: &CallerContext, id: &str) -> StoreResult<()> {
         self.gate_record_stop()?;
         let conn = self.state.lock().await;
+        // #3730 — retention policy by namespace: an inbox message is archived
+        // (`archive_reason = "delete"`), every other row is erased. Looked up
+        // FIRST, through the scalar probe (never the full-row `get`, whose
+        // mapper is pinned fail-closed on an unopenable at-rest envelope — the
+        // #2488 lesson), because the gate below is DERIVED from it.
+        let retains = db::namespace_by_id(&conn, id)
+            .map_err(box_err)?
+            .as_deref()
+            .is_some_and(crate::visibility::inbox_delete_retains);
         // Parity finding #4 — SAL-level caller-owns gate (postgres parity;
         // pg enforces the same gate in its trait `delete`).
-        // Inbox carve-out ENABLED for delete: the addressed recipient may
-        // delete a message sent to it, mirroring HTTP `delete_memory` /
-        // MCP `memory_delete`.
-        assert_caller_owns_for_mutation(&conn, ctx, id, "delete", true)?;
-        let removed = db::delete(&conn, id).map_err(box_err)?;
+        // Inbox carve-out for delete: the addressed recipient may delete a
+        // message sent to it, mirroring HTTP `delete_memory` / MCP
+        // `memory_delete` — but ONLY on the path that archives. Passing a
+        // bare `true` here admitted the recipient for every delete while the
+        // routing below retained only inbox rows, so a non-owner who merely
+        // had a row addressed to it could erase that row — sever, tombstone,
+        // crypto-erase — in any other namespace (pre-dates #3730 on this
+        // adapter; measured 2026-09-15, pinned by
+        // recipient_gate_derived_from_namespace_3730). One predicate governs
+        // both the admission and the disposition.
+        assert_caller_owns_for_mutation(
+            &conn,
+            ctx,
+            id,
+            "delete",
+            retains,
+            crate::identity::owner_stamp::funnel::DELETE,
+        )?;
+        let removed = if retains {
+            db::delete_archive_first(&conn, id).map_err(box_err)?
+        } else {
+            db::delete(&conn, id).map_err(box_err)?
+        };
         if removed {
             Ok(())
         } else {
@@ -861,24 +981,8 @@ impl MemoryStore for SqliteStore {
             // v1.0.0 #1834 — claim-bitemporal AS-OF from the SAL Filter.
             filter.valid_at.as_deref(),
             metadata_eq,
-            // v1.0.0 #3463 — the unread axis rides the SAME `build_list_query`
-            // shape as every other filter, so it narrows BEFORE the SQL `LIMIT`
-            // on this adapter exactly as the `AND access_count = 0` predicate
-            // does on the postgres twin. A post-`LIMIT` Rust filter (what the
-            // inbox surfaces did) can report an empty unread set while older
-            // unread rows exist.
-            filter.unread_only,
         )
         .map_err(box_err)?;
-        // #3463 belt-and-suspenders (the #2580 fail-closed re-check contract):
-        // re-apply the unread marker in-process so a hypothetical drift between
-        // the SQL fragment and the canonical Rust predicate can only ever
-        // NARROW what a caller sees, never widen it. O(returned-rows).
-        let rows: Vec<Memory> = if filter.unread_only {
-            rows.into_iter().filter(|m| m.access_count == 0).collect()
-        } else {
-            rows
-        };
         // #910 SAL-level scope=private gate (see `is_visible_to_caller`
         // contract on the trait). Every query path that returns Memory
         // rows runs the result set through the canonical predicate so
@@ -1989,13 +2093,29 @@ impl MemoryStore for SqliteStore {
 
     async fn set_namespace_standard(
         &self,
-        _ctx: &CallerContext,
+        ctx: &CallerContext,
         namespace: &str,
         standard_id: &str,
         parent: Option<&str>,
     ) -> StoreResult<()> {
         let conn = self.state.lock().await;
-        db::set_namespace_standard(&conn, namespace, standard_id, parent).map_err(box_err)
+        // #3758 — the REBIND gate: the standard CURRENTLY bound decides, through
+        // the same predicate CLEAR uses. Pre-fix this adapter discarded `ctx`
+        // and any trait-routed caller could replace another tenant's
+        // governance standard. Owner read + upsert in ONE WriteTxn (the #3237
+        // item 5 TOCTOU discipline of the CLEAR twin).
+        let write_txn = crate::storage::connection::WriteTxn::begin(&conn).map_err(box_err)?;
+        if !ctx.bypass_visibility {
+            let binding = db::namespace_standard_binding(&conn, namespace).map_err(box_err)?;
+            crate::store::authorize_namespace_standard_mutation(
+                ctx,
+                namespace,
+                &binding,
+                crate::store::NamespaceStandardOp::Set,
+            )?;
+        }
+        db::set_namespace_standard(&conn, namespace, standard_id, parent).map_err(box_err)?;
+        write_txn.commit().map_err(box_err)
     }
 
     async fn clear_namespace_standard(
@@ -2028,33 +2148,9 @@ impl MemoryStore for SqliteStore {
         // check and the act (TOCTOU).
         let write_txn = crate::storage::connection::WriteTxn::begin(&conn).map_err(box_err)?;
         if !ctx.bypass_visibility {
-            let meta_exists: bool = conn
-                .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM namespace_meta WHERE namespace = ?1)",
-                    rusqlite::params![namespace],
-                    |r| r.get::<_, i64>(0),
-                )
-                .map_err(box_err)?
-                != 0;
-            let binding = if meta_exists {
-                let owner_row: Option<Option<String>> = conn
-                    .query_row(
-                        "SELECT CAST(json_extract(m.metadata, '$.agent_id') AS TEXT) \
-                         FROM namespace_meta nm \
-                         JOIN memories m ON m.id = nm.standard_id \
-                         WHERE nm.namespace = ?1",
-                        rusqlite::params![namespace],
-                        |r| r.get::<_, Option<String>>(0),
-                    )
-                    .optional()
-                    .map_err(box_err)?;
-                match owner_row {
-                    Some(owner) => crate::store::NamespaceStandardBinding::Resolved(owner),
-                    None => crate::store::NamespaceStandardBinding::Unresolvable,
-                }
-            } else {
-                crate::store::NamespaceStandardBinding::NoMetaRow
-            };
+            // #3758 — the read is the ONE sqlite binding reader, shared with
+            // the SET gate above and the MCP funnel.
+            let binding = db::namespace_standard_binding(&conn, namespace).map_err(box_err)?;
             crate::store::authorize_clear_namespace_standard(ctx, namespace, &binding)?;
         }
         let cleared = db::clear_namespace_standard(&conn, namespace).map_err(box_err)?;
@@ -2295,15 +2391,18 @@ impl MemoryStore for SqliteStore {
 
     async fn reown(
         &self,
-        _ctx: &CallerContext,
-        namespace: &str,
+        ctx: &CallerContext,
+        namespace: Option<&str>,
         to_id: &str,
-        claim_unowned: bool,
+        select: crate::storage::ReownSelect,
         dry_run: bool,
     ) -> StoreResult<crate::storage::ReownReport> {
-        self.gate_record_stop()?;
+        if !dry_run {
+            self.gate_record_stop()?;
+        }
         let conn = self.state.lock().await;
-        crate::storage::reown(&conn, namespace, to_id, claim_unowned, dry_run).map_err(box_err)
+        crate::storage::reown(&conn, namespace, to_id, select, dry_run, &ctx.agent_id)
+            .map_err(box_err)
     }
 
     async fn action_create(
@@ -2315,7 +2414,7 @@ impl MemoryStore for SqliteStore {
         let conn = self.state.lock().await;
         crate::actions::create_guarded(&conn, action.clone())
             .map(|a| a.id)
-            .map_err(box_err)
+            .map_err(memory_guard_err)
     }
 
     async fn action_get(
@@ -2864,8 +2963,9 @@ impl MemoryStore for SqliteStore {
         // disposition holds: the row stays live and the handler reports
         // `missing`. A 403 would be an existence oracle. Operator lanes
         // (`ctx.bypass_visibility`) skip the gate. The predicate is the
-        // same four-way SQL as `db::archive_memory_for_caller` (#940) so
-        // a nested `BEGIN` is never opened inside this outer tx.
+        // ONE #3124 owner predicate shared with `db::archive_memory_for_caller`
+        // (`db::caller_may_mutate_live_row`, a plain read) so a nested
+        // `BEGIN` is never opened inside this outer tx.
         let owns_tx = conn.is_autocommit();
         let write_txn = if owns_tx {
             Some(crate::storage::connection::WriteTxn::begin(&conn).map_err(box_err)?)
@@ -2884,21 +2984,15 @@ impl MemoryStore for SqliteStore {
                     // live (the caller saw a smaller `moved` count with no
                     // error), while the postgres twin was hardened the
                     // opposite way in the same commit — the two adapters
-                    // disagreed on probe-error disposition. `COUNT(*) > 0`
-                    // always returns exactly one row, so the only `Err` here
-                    // is a genuine backend fault, which must roll the whole
-                    // batch back (the closure returns `anyhow::Result`).
-                    let owned: bool = conn.query_row(
-                        "SELECT COUNT(*) > 0 FROM memories \
-                         WHERE id = ?1 \
-                           AND ( \
-                             json_extract(metadata, '$.agent_id') = ?2 OR \
-                             json_extract(metadata, '$.target_agent_id') = ?2 OR \
-                             json_extract(metadata, '$.agent_id') IS NULL OR \
-                             json_extract(metadata, '$.agent_id') = '' \
-                           )",
-                        rusqlite::params![id, caller],
-                        |r| r.get(0),
+                    // disagreed on probe-error disposition. The probe maps a
+                    // missing row to `Ok(false)`, so the only `Err` here is a
+                    // genuine backend fault, which must roll the whole batch
+                    // back (the closure returns `anyhow::Result`).
+                    let owned = db::caller_may_mutate_live_row(
+                        &conn,
+                        id,
+                        &caller,
+                        crate::identity::owner_stamp::funnel::ARCHIVE,
                     )?;
                     if !owned {
                         continue;
@@ -2940,6 +3034,26 @@ impl MemoryStore for SqliteStore {
     async fn export_links(&self) -> StoreResult<Vec<MemoryLink>> {
         let conn = self.state.lock().await;
         db::export_links(&conn).map_err(box_err)
+    }
+
+    async fn export_memories_page(
+        &self,
+        cursor: Option<&crate::export_paging::ExportCursor>,
+        limit: usize,
+        as_of: chrono::DateTime<chrono::Utc>,
+        namespace: Option<&str>,
+    ) -> StoreResult<crate::export_paging::ExportMemoriesPage> {
+        let conn = self.state.lock().await;
+        db::export_page::memories_page(&conn, cursor, limit, as_of, namespace).map_err(box_err)
+    }
+
+    async fn export_links_page(
+        &self,
+        scope: &crate::export_paging::ExportPageScope,
+        survivors: &std::collections::HashSet<String>,
+    ) -> StoreResult<crate::export_paging::ExportLinksPage> {
+        let conn = self.state.lock().await;
+        db::export_page::links_page(&conn, scope, survivors).map_err(box_err)
     }
 
     async fn build_namespace_chain(&self, namespace: &str) -> StoreResult<Vec<String>> {
@@ -3738,9 +3852,10 @@ impl MemoryStore for SqliteStore {
         &self,
         title: &str,
         namespace: &str,
+        viewer: Option<&str>,
     ) -> StoreResult<Option<String>> {
         let conn = self.state.lock().await;
-        db::find_by_title_namespace(&conn, title, namespace).map_err(box_err)
+        db::find_by_title_namespace(&conn, title, namespace, viewer).map_err(box_err)
     }
 
     async fn get_embedding(&self, _ctx: &CallerContext, id: &str) -> StoreResult<Option<Vec<f32>>> {
@@ -3764,7 +3879,10 @@ impl MemoryStore for SqliteStore {
 
     async fn find_contradictions(&self, title: &str, namespace: &str) -> StoreResult<Vec<Memory>> {
         let conn = self.state.lock().await;
-        db::find_contradictions(&conn, title, namespace).map_err(box_err)
+        // #3712 — the trait method carries no caller identity and has no
+        // production caller (both write surfaces call `db::` directly with
+        // their viewer); trust-all here is the documented posture, not a gap.
+        db::find_contradictions(&conn, title, namespace, None).map_err(box_err)
     }
 
     async fn invalidate_link(
@@ -3821,10 +3939,15 @@ impl MemoryStore for SqliteStore {
         let now = chrono::Utc::now().to_rfc3339();
         let resolved_tier = tier.cloned().unwrap_or(Tier::Short);
         let priority = priority.unwrap_or(5);
+        // #3639 — unique stored title + verbatim subject (see
+        // `crate::inbox_stored_title`); inserted refuse-on-conflict below.
+        let row_id = uuid::Uuid::new_v4().to_string();
+        let stored_title = crate::inbox_stored_title(title, &row_id);
         let mut metadata = serde_json::json!({
             "agent_id": &ctx.agent_id,
             (field_names::TARGET_AGENT_ID): target_agent,
             "notify": true,
+            (crate::INBOX_SUBJECT_META_KEY): title,
         });
         // #2122 — caller-supplied covenant clause-1 rationale (the payload
         // is verbatim caller content, so the substrate never stamps its own
@@ -3833,10 +3956,10 @@ impl MemoryStore for SqliteStore {
             metadata[crate::storage::META_KEY_WHY_TRACE] = serde_json::json!(wt);
         }
         let mem = Memory {
-            id: uuid::Uuid::new_v4().to_string(),
+            id: row_id,
             tier: resolved_tier,
             namespace: crate::inbox_namespace(target_agent),
-            title: title.to_string(),
+            title: stored_title,
             content: payload.to_string(),
             tags: vec!["notify".to_string()],
             priority,
@@ -3886,7 +4009,7 @@ impl MemoryStore for SqliteStore {
             }
             Err(quotas::QuotaCheckError::Sql(e)) => return Err(box_err(e)),
         }
-        match db::insert(&conn, &mem) {
+        match db::insert_no_overwrite(&conn, &mem) {
             Ok(new_id) => {
                 // #3465 — the row is durable: wake the recipient on the
                 // in-process bus AND fan the `agent_notified` event to
@@ -4123,6 +4246,11 @@ impl MemoryStore for SqliteStore {
     ) -> StoreResult<Vec<serde_json::Value>> {
         let conn = self.state.lock().await;
         db::list_archived(&conn, namespace, limit, offset).map_err(box_err)
+    }
+
+    async fn archive_stats(&self) -> StoreResult<serde_json::Value> {
+        let conn = self.state.lock().await;
+        db::archive_stats(&conn).map_err(box_err)
     }
 }
 
@@ -6125,7 +6253,10 @@ mod tests {
             .register_agent(&ctx, &agent)
             .await
             .expect("register_agent");
-        let listed = store.list_agents().await.expect("list_agents");
+        let listed = store
+            .list_agents()
+            .await
+            .expect(crate::mcp::error_text::site::LIST_AGENTS);
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].agent_id, "ai:tester@host");
         assert_eq!(listed[0].agent_type, "test");
@@ -6136,7 +6267,10 @@ mod tests {
     #[tokio::test]
     async fn list_agents_empty_store_returns_empty_vec() {
         let store = fresh_store();
-        let listed = store.list_agents().await.expect("list_agents");
+        let listed = store
+            .list_agents()
+            .await
+            .expect(crate::mcp::error_text::site::LIST_AGENTS);
         assert!(listed.is_empty());
     }
 
@@ -6327,7 +6461,7 @@ mod tests {
         let mem = test_memory("conflict-target", "find_by_title body");
         let id = store.store(&ctx, &mem).await.expect("store");
         let found = store
-            .find_by_title_namespace(&mem.title, &mem.namespace)
+            .find_by_title_namespace(&mem.title, &mem.namespace, None)
             .await
             .expect("find_by_title_namespace");
         assert_eq!(found.as_deref(), Some(id.as_str()));
@@ -6337,7 +6471,7 @@ mod tests {
     async fn find_by_title_namespace_returns_none_for_unknown() {
         let store = fresh_store();
         let found = store
-            .find_by_title_namespace("never-stored", "alphaone")
+            .find_by_title_namespace("never-stored", "alphaone", None)
             .await
             .expect("find_by_title_namespace miss");
         assert!(found.is_none());

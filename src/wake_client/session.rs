@@ -42,11 +42,12 @@ use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio_stream::StreamExt as _;
 use tokio_util::codec::{Encoder as _, FramedRead, LengthDelimitedCodec};
 
+use super::ClientMetrics;
 use super::bundle::HubJoinBundle;
 use crate::wake_hub::codec::codec;
 use crate::wake_hub::frame::{
-    CTX_DECODING_HUB_FRAME, CTX_HUB_CLOSED, CTX_UNPARSEABLE_REFUSAL, Frame, HelloPayload, Kind,
-    WakeMeta, WelcomePayload, decode_error, decode_topics, encode_topics,
+    CTX_DECODING_HUB_FRAME, CTX_HUB_CLOSED, CTX_UNPARSEABLE_REFUSAL, ErrorCode, Frame,
+    HelloPayload, Kind, WakeMeta, WelcomePayload, decode_error, decode_topics, encode_topics,
 };
 use crate::wake_hub::identity::{hello_transcript, topics_hash};
 use crate::wake_hub::limits::{DEFAULT_HANDSHAKE_TIMEOUT_MS, HELLO_NONCE_BYTES};
@@ -132,7 +133,7 @@ impl Session {
     /// session), or EOF. Every one of them ends the session and the caller
     /// backs off; none of them can lose a durable row, because the row is
     /// already committed and the backstop poll still finds it.
-    pub async fn next_event(&mut self) -> Result<SessionEvent> {
+    pub async fn next_event(&mut self, metrics: &ClientMetrics) -> Result<SessionEvent> {
         let Some(next) = self.reader.next().await else {
             bail!(CTX_HUB_CLOSED);
         };
@@ -140,8 +141,28 @@ impl Session {
         let frame = Frame::decode(&body).context(CTX_DECODING_HUB_FRAME)?;
         match frame.kind {
             Kind::Wake => {
-                let meta = WakeMeta::decode(&frame.payload)
-                    .context("decoding the wake metadata the hub routed")?;
+                // A `Frame::decode` error above stays FATAL (the `?`): a hub whose
+                // FRAMING is corrupt cannot be trusted, so the client closes and
+                // reconnects exactly as the SERVER closes on this class
+                // (`wake_hub::conn::Conn::send_error` -> false -> read-loop close,
+                // pinned by
+                // `wake_hub_denied_3467::denied_a_malformed_frame_is_refused_and_closes_the_connection`);
+                // the welcome's `pending_count` makes a reconnect lose no wake.
+                // A WakeMeta payload that will not decode is the DIFFERENT class:
+                // the hub framed a WHOLE `Kind::Wake` frame correctly and relayed
+                // PEER-authored content whose metadata is malformed. That is one
+                // bad message from a peer, not a broken hub — skip this wake
+                // (count it; #2444: a degrade is never silent) and keep the
+                // session so the next well-formed wake still arrives. Nothing is
+                // rendered, so the #3642 hostile-content property holds.
+                let meta = match WakeMeta::decode(&frame.payload) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        metrics.malformed_frame_skipped();
+                        tracing::debug!(error = %e, "wake listener: skipping a wake whose peer-authored metadata will not decode; the session survives");
+                        return Ok(SessionEvent::Idle);
+                    }
+                };
                 Ok(SessionEvent::Wake(Box::new(meta)))
             }
             Kind::Ping => {
@@ -165,7 +186,23 @@ impl Session {
             Kind::Error => {
                 let (code, reason) =
                     decode_error(&frame.payload).unwrap_or((0, CTX_UNPARSEABLE_REFUSAL.to_owned()));
-                bail!("the hub refused this session: {code} {reason}");
+                // #3641 — the listener renders the SAME predicate the forwarder
+                // and the server do (rule s, `ErrorCode::is_session_fatal`): a
+                // session-fatal code (400/401/409/413, or an unknown/unparseable
+                // one) ends the session; a per-message refusal the hub keeps the
+                // session open for (403/404/429/507/500) is counted and SKIPPED,
+                // so one per-frame error — e.g. a refused subscribe on ONE topic
+                // — does not tear the whole listener down.
+                if ErrorCode::wire_is_session_fatal(code) {
+                    bail!("the hub refused this session: {code} {reason}");
+                }
+                metrics.refused_frame_skipped();
+                tracing::debug!(
+                    code,
+                    refusal = ?ErrorCode::from_wire(code),
+                    "wake listener: the hub refused one message per-message; the session survives"
+                );
+                Ok(SessionEvent::Idle)
             }
             // A future hub may send frames this version has no opinion about.
             // Ignore rather than close: a listener that dropped its session
@@ -414,14 +451,18 @@ pub fn assert_socket_is_owner_only(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // #3641 F1 — `encode_error` is used only by the refusal-frame fixtures in
+    // this module; keep it out of the production import so the non-test build
+    // carries no unused import (all five clippy forms).
+    use crate::wake_hub::frame::encode_error;
     use std::os::unix::fs::PermissionsExt as _;
 
     // A hostile peer after admission: socketpair isolates the actual production
     // event decoder without bypassing it. This is not credential evidence.
-    async fn received_event_3578(body: Bytes) -> Result<SessionEvent> {
+    fn session_pair_3578() -> (Session, OwnedWriteHalf) {
         let (client, peer) = UnixStream::pair().expect("socket pair");
         let (reader, writer) = client.into_split();
-        let mut session = Session {
+        let session = Session {
             reader: FramedRead::new(reader, codec()),
             writer,
             agent_id: "ai:listener-3578".into(),
@@ -434,13 +475,21 @@ mod tests {
                 reconnect_jitter_ms: 0,
             },
         };
-        let (_, mut peer_writer) = peer.into_split();
+        let (_, peer_writer) = peer.into_split();
+        (session, peer_writer)
+    }
+
+    async fn received_event_3578(body: Bytes) -> Result<SessionEvent> {
+        let (mut session, mut peer_writer) = session_pair_3578();
         write_framed(&mut peer_writer, body)
             .await
             .expect("send hostile frame");
-        tokio::time::timeout(Duration::from_secs(5), session.next_event())
-            .await
-            .expect("bounded event read")
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            session.next_event(&ClientMetrics::default()),
+        )
+        .await
+        .expect("bounded event read")
     }
 
     #[tokio::test]
@@ -461,13 +510,111 @@ mod tests {
         }
     }
 
+    /// The peer-authored-content class (#3642 / #3578): a whole, well-framed
+    /// `Kind::Wake` whose WakeMeta payload does not decode is SKIPPED (`Idle`),
+    /// counted, and the session SURVIVES so the next well-formed wake still
+    /// renders. Nothing hostile is ever rendered as a Wake. Only the four
+    /// sub-256 metadata fixtures reach this path; the oversize + reserved-kind
+    /// cases fail `Frame::decode` and are the fatal class asserted below.
     #[tokio::test]
-    async fn hostile_binary_frames_are_refused_before_a_renderable_event_3578() {
+    async fn wake_frames_with_bad_metadata_are_skipped_and_the_next_wake_arrives_3578_3642() {
         let vectors: serde_json::Value =
             serde_json::from_str(include_str!("../../sdk/fixtures/wake_meta_3578.json"))
                 .expect("shared vectors");
-        let allowed = &vectors["allowed"][1];
-        let raw = hex::decode(allowed["hex"].as_str().expect("hex")).expect("bytes");
+        let good_raw =
+            hex::decode(vectors["allowed"][1]["hex"].as_str().expect("hex")).expect("bytes");
+        let good_meta = WakeMeta::decode(&good_raw).expect("allowed hint");
+        let valid = Frame::new(
+            Kind::Wake,
+            "producer",
+            "ai:listener-3578",
+            good_raw.clone().into(),
+        )
+        .encode()
+        .expect("valid frame");
+
+        let mut bad_meta = Vec::new();
+        for case in vectors["denied"].as_array().expect("denied cases") {
+            let payload = hex::decode(case["hex"].as_str().expect("hex")).expect("bytes");
+            if payload.len() > 256 {
+                continue; // Frame::decode-fatal (PayloadTooLarge) — asserted in the sibling test.
+            }
+            let mut body = valid[..valid.len() - good_raw.len()].to_vec();
+            body[10..12].copy_from_slice(&u16::try_from(payload.len()).expect("len").to_be_bytes());
+            body.extend_from_slice(&payload);
+            // It FRAMES correctly (Frame::decode Ok); the refusal is at WakeMeta.
+            assert_eq!(
+                Frame::decode(&body)
+                    .expect("valid frame wrapping bad metadata")
+                    .payload
+                    .as_ref(),
+                payload
+            );
+            bad_meta.push((case["name"].to_string(), Bytes::from(body)));
+        }
+        assert_eq!(
+            bad_meta.len(),
+            4,
+            "four sub-256 metadata refusals frame correctly and fail WakeMeta::decode"
+        );
+
+        let (mut session, mut peer_writer) = session_pair_3578();
+        let metrics = ClientMetrics::default();
+        for (name, body) in &bad_meta {
+            write_framed(&mut peer_writer, body.clone())
+                .await
+                .expect("send bad-meta wake");
+            let event = tokio::time::timeout(Duration::from_secs(5), session.next_event(&metrics))
+                .await
+                .expect("bounded read");
+            assert!(
+                matches!(event, Ok(SessionEvent::Idle)),
+                "{name} must skip to Idle, got {event:?}"
+            );
+        }
+        assert_eq!(
+            metrics.snapshot().malformed_frames_skipped,
+            4,
+            "every bad-metadata wake is counted; a degrade is never silent"
+        );
+
+        // PRESENCE on the SAME session: the next well-formed wake IS delivered.
+        let good = Frame::new(Kind::Wake, "producer", "ai:listener-3578", good_raw.into())
+            .encode()
+            .expect("good frame");
+        write_framed(&mut peer_writer, good)
+            .await
+            .expect("send good wake");
+        let event = tokio::time::timeout(Duration::from_secs(5), session.next_event(&metrics))
+            .await
+            .expect("bounded read");
+        assert_eq!(
+            event.expect("wake"),
+            SessionEvent::Wake(Box::new(good_meta)),
+            "the next well-formed wake survives the hostile burst"
+        );
+        assert_eq!(
+            metrics.snapshot().malformed_frames_skipped,
+            4,
+            "a good wake does not move the skip counter"
+        );
+    }
+
+    /// The hub-framing-corruption class (#3578 fatal boundary): a `Frame::decode`
+    /// error — an oversize payload, a reserved kind, or an over-long LENGTH
+    /// PREFIX the codec refuses before buffering — ENDS the session (close +
+    /// reconnect), never a per-message skip. This mirrors the SERVER, which
+    /// closes on exactly this class (`send_error` -> false -> read-loop close,
+    /// pinned by
+    /// `wake_hub_denied_3467::denied_a_malformed_frame_is_refused_and_closes_the_connection`);
+    /// the welcome's `pending_count` makes the reconnect lose no wake. The skip
+    /// counter never moves.
+    #[tokio::test]
+    async fn frame_decode_and_framing_errors_close_the_session_3578() {
+        let vectors: serde_json::Value =
+            serde_json::from_str(include_str!("../../sdk/fixtures/wake_meta_3578.json"))
+                .expect("shared vectors");
+        let raw = hex::decode(vectors["allowed"][1]["hex"].as_str().expect("hex")).expect("bytes");
         let valid = Frame::new(
             Kind::Wake,
             "producer",
@@ -476,46 +623,133 @@ mod tests {
         )
         .encode()
         .expect("valid frame");
-        let mut denied = Vec::new();
+
+        let mut fatal = Vec::new();
         for case in vectors["denied"].as_array().expect("denied cases") {
             let payload = hex::decode(case["hex"].as_str().expect("hex")).expect("bytes");
-            // Construct the wire body directly so even the 257-byte fixture
-            // reaches the receiver instead of failing in the local encoder.
-            let mut body = valid[..valid.len() - raw.len()].to_vec();
-            let len = u16::try_from(payload.len())
-                .expect("fixture length")
-                .to_be_bytes();
-            body[10..12].copy_from_slice(&len);
-            body.extend_from_slice(&payload);
             if payload.len() <= 256 {
-                assert_eq!(
-                    Frame::decode(&body)
-                        .expect("valid frame wrapping bad metadata")
-                        .payload
-                        .as_ref(),
-                    payload
-                );
-            } else {
-                assert!(matches!(
-                    Frame::decode(&body),
-                    Err(crate::wake_hub::frame::FrameError::PayloadTooLarge { .. })
-                ));
+                continue; // WakeMeta-skip — asserted in the sibling test.
             }
-            denied.push((case["name"].to_string(), Bytes::from(body)));
+            let mut body = valid[..valid.len() - raw.len()].to_vec();
+            body[10..12].copy_from_slice(&u16::try_from(payload.len()).expect("len").to_be_bytes());
+            body.extend_from_slice(&payload);
+            assert!(matches!(
+                Frame::decode(&body),
+                Err(crate::wake_hub::frame::FrameError::PayloadTooLarge { .. })
+            ));
+            fatal.push((case["name"].to_string(), Bytes::from(body)));
         }
-        for kind in [11, 12, 13] {
+        for kind in [11u8, 12, 13] {
             let mut body = valid.to_vec();
             body[5] = kind;
-            denied.push((format!("reserved kind {kind}"), body.into()));
+            fatal.push((format!("reserved kind {kind}"), Bytes::from(body)));
         }
         assert_eq!(
-            denied.len(),
-            8,
-            "five metadata refusals and three reserved kinds"
+            fatal.len(),
+            4,
+            "one oversize payload and three reserved kinds fail Frame::decode"
         );
-        for (name, body) in denied {
-            let event = received_event_3578(body).await;
-            assert!(event.is_err(), "{name} reached an event: {event:?}");
+
+        for (name, body) in fatal {
+            let (mut session, mut peer_writer) = session_pair_3578();
+            let metrics = ClientMetrics::default();
+            write_framed(&mut peer_writer, body)
+                .await
+                .expect("send fatal frame");
+            let event = tokio::time::timeout(Duration::from_secs(5), session.next_event(&metrics))
+                .await
+                .expect("bounded read");
+            assert!(
+                event.is_err(),
+                "{name} must END the session (Frame::decode is fatal), got {event:?}"
+            );
+            assert_eq!(
+                metrics.snapshot().malformed_frames_skipped,
+                0,
+                "{name} is fatal, never counted as a per-message skip"
+            );
+        }
+
+        // f2r §5 — the one unresyncable case the fixture cannot express through a
+        // decoded body: an over-long LENGTH PREFIX the codec refuses BEFORE it
+        // buffers a body, surfacing as `reader.next() -> Some(Err)`. Also fatal,
+        // also uncounted. This is the boundary the whole classification leans on.
+        let (mut session, mut peer_writer) = session_pair_3578();
+        let metrics = ClientMetrics::default();
+        peer_writer
+            .write_all(&[0xFF, 0xFF, 0xFF, 0xFF])
+            .await
+            .expect("write over-long length prefix");
+        peer_writer.flush().await.expect("flush");
+        let event = tokio::time::timeout(Duration::from_secs(5), session.next_event(&metrics))
+            .await
+            .expect("bounded read");
+        assert!(
+            event.is_err(),
+            "an over-long length prefix is a framing error and ends the session"
+        );
+        assert_eq!(
+            metrics.snapshot().malformed_frames_skipped,
+            0,
+            "the unresyncable framing error is not a per-message skip"
+        );
+    }
+
+    /// #3641 (F1) — the listener renders the SAME predicate the forwarder and
+    /// the server do: a per-message hub refusal (`Kind::Error`) whose code the
+    /// hub keeps the session open for is counted and SKIPPED (Ok(Idle)); a
+    /// session-fatal code ends the session (Err). Not just DESCRIBED as mirrored
+    /// — actually mirrored, over every code.
+    #[tokio::test]
+    async fn a_per_message_hub_refusal_is_skipped_and_a_fatal_one_ends_the_session_3641() {
+        for (code, fatal) in [
+            (ErrorCode::Forbidden, false),
+            (ErrorCode::UnknownDestination, false),
+            (ErrorCode::RateLimited, false),
+            (ErrorCode::Overflow, false),
+            (ErrorCode::Internal, false),
+            (ErrorCode::Malformed, true),
+            (ErrorCode::Unauthorized, true),
+            (ErrorCode::Replaced, true),
+            (ErrorCode::TooLarge, true),
+        ] {
+            let (mut session, mut peer_writer) = session_pair_3578();
+            let metrics = ClientMetrics::default();
+            let body = Frame::new(
+                Kind::Error,
+                "hub",
+                "ai:listener-3578",
+                encode_error(code, "refused"),
+            )
+            .encode()
+            .expect("error frame");
+            write_framed(&mut peer_writer, body)
+                .await
+                .expect("send error frame");
+            let event = tokio::time::timeout(Duration::from_secs(5), session.next_event(&metrics))
+                .await
+                .expect("bounded read");
+            if fatal {
+                assert!(
+                    event.is_err(),
+                    "{code:?} must END the session, got {event:?}"
+                );
+                assert_eq!(
+                    metrics.snapshot().refused_frames_skipped,
+                    0,
+                    "{code:?} is fatal, never a per-message skip"
+                );
+            } else {
+                assert!(
+                    matches!(event, Ok(SessionEvent::Idle)),
+                    "{code:?} must skip to Idle, got {event:?}"
+                );
+                assert_eq!(
+                    metrics.snapshot().refused_frames_skipped,
+                    1,
+                    "{code:?} is counted as a per-message refusal skip"
+                );
+            }
         }
     }
 

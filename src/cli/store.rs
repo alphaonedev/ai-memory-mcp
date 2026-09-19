@@ -104,6 +104,13 @@ pub struct StoreArgs {
     /// `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1`.
     #[arg(long)]
     pub sign: bool,
+    /// v1.0.0 #3409 — with `--sign`, accept a `claimed` write when no bound
+    /// public key can verify the signature (the agent has a local keypair but
+    /// its public key is not bound in this store), and print a WARN naming
+    /// the missing binding. Without it, `--sign` REFUSES rather than silently
+    /// storing an unsigned row: the caller asked for a signed write.
+    #[arg(long, default_value_t = false)]
+    pub allow_claimed: bool,
     /// v1.0.0 crypto-core (#1942/#1941, spec §2.2/§2.3) — path to a JSON
     /// `write_v2` presentation envelope (certified sub-key signature over the
     /// v2 CBOR-array pre-image). When present it takes precedence over
@@ -162,6 +169,44 @@ fn read_stdin_to_string() -> Result<String> {
 ///
 /// Propagates validation, attestation, substrate and I/O failures. A
 /// governance Deny exits the process; a Pending returns `Ok(())`.
+/// v1.0.0 #3409 — the ONE spelling of the command that binds an agent's local
+/// public key so `--sign` can verify as `agent_attested`. `agents bind-key`
+/// requires the agent to be registered and proves possession from the local
+/// key store (`src/cli/agents.rs`).
+#[must_use]
+pub fn bind_key_command(agent_id: &str) -> String {
+    format!(
+        "ai-memory agents register --agent-id {agent_id} --agent-type <type> && \
+         ai-memory agents bind-key --agent-id {agent_id} \
+         --pubkey \"$(ai-memory identity export-pub --agent-id {agent_id})\""
+    )
+}
+
+/// v1.0.0 #3409 — the refusal for `--sign` with no bound public key. Names
+/// the degradation the caller would otherwise get, the fix, and the
+/// deliberate override.
+#[must_use]
+pub fn sign_unbound_refusal(agent_id: &str) -> String {
+    format!(
+        "--sign: agent '{agent_id}' has a local keypair but no public key is bound in this \
+         store, so the write cannot be verified as agent_attested — it would be stored as \
+         `claimed`. Fix: {}, or pass --allow-claimed to store it as claimed on purpose (#3409)",
+        bind_key_command(agent_id)
+    )
+}
+
+/// v1.0.0 #3409 — the once-per-write WARN printed when `--allow-claimed`
+/// accepts the unverifiable signed write.
+#[must_use]
+pub fn sign_unbound_warning(agent_id: &str) -> String {
+    format!(
+        "#3409: --allow-claimed — agent '{agent_id}' has no bound public key in this store; \
+         the --sign write is stored as `claimed` (unverified). Bind the key with {} to store \
+         agent_attested writes.",
+        bind_key_command(agent_id)
+    )
+}
+
 pub fn run(
     db_path: &Path,
     args: StoreArgs,
@@ -400,6 +445,30 @@ pub(crate) fn run_with_curator(
             let kp = identity::keypair::load(&agent_id, &dir).map_err(|e| {
                 anyhow::anyhow!("--sign requires a local keypair for agent '{agent_id}': {e:#}")
             })?;
+            // v1.0.0 #3409 — the caller asked for a SIGNED write. A local
+            // keypair whose public half is not bound in this store can never
+            // verify, so the permissive gate would silently land the row as
+            // `claimed` with exit 0. Refuse up front (naming the fix) unless
+            // the operator states `--allow-claimed`; a bound key that differs
+            // from the local one is named too (the gate would reject it as
+            // forged, but the cause is a rotated/mismatched binding).
+            let bound = db::agent_pubkey(&conn, &agent_id)?;
+            match bound.as_deref() {
+                None if args.allow_claimed => {
+                    let warn = sign_unbound_warning(&agent_id);
+                    tracing::warn!("{warn}");
+                    writeln!(out.stderr, "ai-memory: WARN {warn}")?;
+                }
+                None => anyhow::bail!("{}", sign_unbound_refusal(&agent_id)),
+                Some(b) if b != kp.public_base64() => anyhow::bail!(
+                    "--sign: the public key bound in this store for agent '{agent_id}' does not \
+                     match the local keypair, so the signature would be rejected as forged. Fix: \
+                     rotate the binding with `ai-memory identity succeed`, or bind the current \
+                     key with `{}` (#3409)",
+                    bind_key_command(&agent_id)
+                ),
+                Some(_) => {}
+            }
             // #1801→#1954 item 4 — redact to storage form BEFORE signing so the
             // signed envelope commits to the persisted bytes (`db::insert`
             // re-redacts idempotently). Without this a `redact`-mode secret
@@ -422,13 +491,20 @@ pub(crate) fn run_with_curator(
         // resolves the require flag internally: permissive unsigned → `claimed`;
         // global-strict unsigned → refuse; a valid `--sign` signature →
         // `agent_attested`.
-        identity::attest::stamp_attestation_sync(
+        let level = identity::attest::stamp_attestation_sync(
             &conn,
             &mut mem,
             &agent_id,
             signature.as_deref(),
             identity::attest::WriteSurface::Cli,
         )?;
+        // v1.0.0 #3409 — belt and braces: `--sign` without `--allow-claimed`
+        // never lands anything below `agent_attested`, whatever the gate's
+        // permissive default resolved to.
+        if args.sign && !args.allow_claimed && level != identity::verify::AttestLevel::AgentAttested
+        {
+            anyhow::bail!("{}", sign_unbound_refusal(&agent_id));
+        }
         // #1801→#1954 item 2 — sender EMIT: persist the author's detached
         // signature into `metadata.write_signature` so it propagates verbatim
         // across every federation relay hop. Self-authored + non-clobbering.
@@ -480,8 +556,10 @@ pub(crate) fn run_with_curator(
             }
         }
     }
+    // #3712 — CLI is operator-as-actor: trust-all (`None`), like every CLI
+    // read lane.
     let contradictions =
-        db::find_contradictions(&conn, &mem.title, &mem.namespace).unwrap_or_default();
+        db::find_contradictions(&conn, &mem.title, &mem.namespace, None).unwrap_or_default();
     let actual_id = db::insert(&conn, &mem)?;
 
     // PR-5 (issue #487): security audit trail. No-op when disabled.
@@ -603,6 +681,7 @@ pub(crate) fn run_with_curator(
         // DB's truth. Unconditional: an unverified write never reaches here.
         let mut j = serde_json::to_value(&persisted)?;
         j["id"] = serde_json::json!(actual_id);
+        crate::write_receipt::WriteDurability::sqlite(&conn)?.attach(&mut j)?;
         let filtered: Vec<&String> = contradictions
             .iter()
             .filter(|c| c.id != actual_id)
@@ -620,7 +699,11 @@ pub(crate) fn run_with_curator(
         // #3025 — echo the PERSISTED tier/namespace, not the requested ones.
         let tier = &persisted.tier;
         let namespace = persisted.namespace.as_str();
-        writeln!(out.stdout, "stored: {actual_id} [{tier}] (ns={namespace})")?;
+        let durability = crate::write_receipt::WriteDurability::sqlite(&conn)?;
+        writeln!(
+            out.stdout,
+            "stored: {actual_id} [{tier}] (ns={namespace}) {durability}"
+        )?;
         // #3402 — an operator whose namespace standard asked for
         // atomisation is told what actually happened. Silent only when
         // the namespace never opted in, so no existing output changes.
@@ -705,6 +788,7 @@ mod tests {
             valid_until: None,
             entity_id: None,
             sign: false,
+            allow_claimed: false,
             write_v2: None,
             capability: None,
             capability_file: None,
@@ -1219,6 +1303,135 @@ mod tests {
             v["metadata"]["attest_level"].as_str().unwrap(),
             "agent_attested"
         );
+    }
+
+    /// #3409 — a local keypair whose public key is NOT bound in the store
+    /// used to land `claimed` with `Ok(())`: the caller asked for a signed
+    /// write and got an unsigned one. Now `--sign` REFUSES, names the bind
+    /// command and the deliberate override, and inserts nothing. On the
+    /// pre-fix head this test FAILS at `unwrap_err()` (the run succeeds).
+    #[test]
+    fn store_sign_without_bound_key_refuses_3409() {
+        let _lock = locked_env();
+        let key_dir = tempfile::tempdir().unwrap();
+        let _kd = EnvVarGuard::set("AI_MEMORY_KEY_DIR", key_dir.path().as_os_str());
+        let _req = EnvVarGuard::set(
+            "AI_MEMORY_REQUIRE_AGENT_ATTESTATION",
+            std::ffi::OsStr::new("0"),
+        );
+        let kp = crate::identity::keypair::generate("ai:signer-3409").unwrap();
+        crate::identity::keypair::save(&kp, key_dir.path()).unwrap();
+
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        // Registered (so a bind WOULD be possible) but never bound.
+        {
+            let conn = db::open(&db).unwrap();
+            db::register_agent(&conn, "ai:signer-3409", "ai:test", &[]).unwrap();
+        }
+        let cfg = config::AppConfig::default();
+        let mut args = default_args();
+        args.sign = true;
+        let err = {
+            let mut out = env.output();
+            run(&db, args, true, &cfg, Some("ai:signer-3409"), &mut out).unwrap_err()
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("#3409"), "got: {msg}");
+        assert!(msg.contains("no public key is bound"), "got: {msg}");
+        assert!(
+            msg.contains("agents bind-key --agent-id ai:signer-3409"),
+            "got: {msg}"
+        );
+        assert!(msg.contains("--allow-claimed"), "got: {msg}");
+        let conn = db::open(&db).unwrap();
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE namespace = 'test-ns'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 0, "a refused --sign write must insert nothing");
+    }
+
+    /// #3409 — the deliberate override: `--allow-claimed` stores the row as
+    /// `claimed` and says so on stderr.
+    #[test]
+    fn store_sign_with_allow_claimed_stores_claimed_and_warns_3409() {
+        let _lock = locked_env();
+        let key_dir = tempfile::tempdir().unwrap();
+        let _kd = EnvVarGuard::set("AI_MEMORY_KEY_DIR", key_dir.path().as_os_str());
+        let _req = EnvVarGuard::set(
+            "AI_MEMORY_REQUIRE_AGENT_ATTESTATION",
+            std::ffi::OsStr::new("0"),
+        );
+        let kp = crate::identity::keypair::generate("ai:signer-3409").unwrap();
+        crate::identity::keypair::save(&kp, key_dir.path()).unwrap();
+
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let cfg = config::AppConfig::default();
+        let mut args = default_args();
+        args.sign = true;
+        args.allow_claimed = true;
+        {
+            let mut out = env.output();
+            run(&db, args, true, &cfg, Some("ai:signer-3409"), &mut out).unwrap();
+        }
+        let v: serde_json::Value = serde_json::from_str(env.stdout_str().trim()).unwrap();
+        assert_eq!(v["metadata"]["attest_level"].as_str().unwrap(), "claimed");
+        let stderr = env.stderr_str();
+        assert!(stderr.contains("#3409"), "stderr: {stderr}");
+        assert!(stderr.contains("stored as `claimed`"), "stderr: {stderr}");
+        assert!(stderr.contains("agents bind-key"), "stderr: {stderr}");
+    }
+
+    /// #3409 — positive control: a bound key still lands `agent_attested`
+    /// with no override and no WARN.
+    #[test]
+    fn store_sign_with_bound_key_is_agent_attested_3409() {
+        let _lock = locked_env();
+        let key_dir = tempfile::tempdir().unwrap();
+        let _kd = EnvVarGuard::set("AI_MEMORY_KEY_DIR", key_dir.path().as_os_str());
+        let _req = EnvVarGuard::set(
+            "AI_MEMORY_REQUIRE_AGENT_ATTESTATION",
+            std::ffi::OsStr::new("0"),
+        );
+        let kp = crate::identity::keypair::generate("ai:signer-3409").unwrap();
+        crate::identity::keypair::save(&kp, key_dir.path()).unwrap();
+
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        {
+            let conn = db::open(&db).unwrap();
+            db::register_agent(&conn, "ai:signer-3409", "ai:test", &[]).unwrap();
+            db::bind_agent_pubkey_with_keypair(&conn, "ai:signer-3409", &kp).unwrap();
+        }
+        let cfg = config::AppConfig::default();
+        let mut args = default_args();
+        args.sign = true;
+        {
+            let mut out = env.output();
+            run(&db, args, true, &cfg, Some("ai:signer-3409"), &mut out).unwrap();
+        }
+        let v: serde_json::Value = serde_json::from_str(env.stdout_str().trim()).unwrap();
+        assert_eq!(
+            v["metadata"]["attest_level"].as_str().unwrap(),
+            "agent_attested"
+        );
+        assert!(!env.stderr_str().contains("#3409"));
+    }
+
+    /// #3409 — the refusal and the WARN name a real, complete command.
+    #[test]
+    fn sign_refusal_names_the_bind_command_3409() {
+        let cmd = bind_key_command("ai:x");
+        assert!(cmd.contains("ai-memory agents register --agent-id ai:x"));
+        assert!(cmd.contains("ai-memory agents bind-key --agent-id ai:x"));
+        assert!(cmd.contains("ai-memory identity export-pub --agent-id ai:x"));
+        assert!(sign_unbound_refusal("ai:x").contains(&cmd));
+        assert!(sign_unbound_warning("ai:x").contains(&cmd));
     }
 
     #[test]

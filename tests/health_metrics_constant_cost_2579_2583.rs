@@ -28,8 +28,7 @@
 //! they reference the new surface and would otherwise break this file's
 //! compile-at-parent property.
 
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpListener;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
@@ -360,7 +359,15 @@ fn h_control_daemon_serves_a_real_corpus_and_counts_it() {
 
 // ---------------------------------------------------------------------------
 // Subprocess daemon harness.
+//
+// #3705 — the daemon refuses every plaintext bind (loopback included), so it
+// is spawned with `--tls-cert` / `--tls-key` from the per-binary leaf and
+// probed over `https://` by a client that trusts exactly that leaf (full
+// verification, no bypass). The cells' claims are about `/health` and
+// `/metrics` cost and shape; the transport is not what they measure.
 // ---------------------------------------------------------------------------
+
+mod common;
 
 struct Daemon {
     child: Child,
@@ -386,6 +393,7 @@ impl Daemon {
 
     fn start_on(db_path: &Path) -> Self {
         let port = free_port();
+        let tls = common::tls::shared(&std::env::temp_dir());
         let child = Command::new(env!("CARGO_BIN_EXE_ai-memory"))
             .args([
                 "serve",
@@ -396,6 +404,7 @@ impl Daemon {
                 "--db",
                 &db_path.display().to_string(),
             ])
+            .args(tls.serve_arg_strs())
             .env("AI_MEMORY_NO_CONFIG", "1")
             .env("AI_MEMORY_INFERENCE_EGRESS", "deny")
             .env("AI_MEMORY_EMBED_OFFLINE", "1")
@@ -432,25 +441,17 @@ impl Daemon {
     }
 
     fn try_get(&self, path: &str) -> Option<(u16, String)> {
-        let mut s = TcpStream::connect(("127.0.0.1", self.port)).ok()?;
-        s.set_read_timeout(Some(Duration::from_secs(30))).ok()?;
-        write!(
-            s,
-            "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
-        )
-        .ok()?;
-        let mut raw = Vec::new();
-        s.read_to_end(&mut raw).ok()?;
-        let text = String::from_utf8_lossy(&raw).into_owned();
-        let mut lines = BufReader::new(text.as_bytes()).lines();
-        let status: u16 = lines
-            .next()?
-            .ok()?
-            .split_whitespace()
-            .nth(1)?
-            .parse()
+        let tls = common::tls::shared(&std::env::temp_dir());
+        let resp = tls
+            .client_with_timeout(Duration::from_secs(30))
+            .get(format!(
+                "{}{path}",
+                common::tls::TestTls::base_url(self.port)
+            ))
+            .send()
             .ok()?;
-        let body = text.split_once("\r\n\r\n").map(|(_, b)| b.to_string())?;
+        let status = resp.status().as_u16();
+        let body = resp.text().ok()?;
         Some((status, body))
     }
 }

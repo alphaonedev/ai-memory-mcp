@@ -155,6 +155,7 @@ fn build_llm_router(llm_url: Option<&str>) -> (axum::Router, NamedTempFile, Db) 
             ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty(),
         ),
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
+        ..Default::default()
     };
     let router = ai_memory::build_router(api_key_state, app_state);
     (router, f, db)

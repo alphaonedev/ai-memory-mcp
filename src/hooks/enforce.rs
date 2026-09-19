@@ -31,7 +31,9 @@ use super::events::HookEvent;
 /// [`crate::config::PermissionsMode`]. Resolved via the ladder
 /// `AI_MEMORY_HOOKS_ENFORCE_MODE` env > `[hooks].enforce_mode` config >
 /// compiled default [`HookEnforceMode::Off`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum HookEnforceMode {
     /// No presence check — today's behaviour (byte-identical default).

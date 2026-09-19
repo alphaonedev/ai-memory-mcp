@@ -100,9 +100,13 @@ pub(super) fn handle_promote(
     validate::validate_id(id).map_err(|e| e.to_string())?;
     // Resolve prefix if exact ID not found; capture the memory so governance
     // has owner context (Task 1.9).
-    let target = if let Some(m) = db::get(conn, id).map_err(|e| e.to_string())? {
+    let target = if let Some(m) =
+        db::get(conn, id).map_err(|e| crate::mcp::error_text::mcp_foreign_err("validate_id", e))?
+    {
         m
-    } else if let Some(m) = db::get_by_prefix(conn, id).map_err(|e| e.to_string())? {
+    } else if let Some(m) = db::get_by_prefix(conn, id)
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("get", e))?
+    {
         m
     } else {
         return Err(crate::errors::msg::MEMORY_NOT_FOUND.into());
@@ -123,7 +127,14 @@ pub(super) fn handle_promote(
     // `AI_MEMORY_AGENT_ID` is set (multi-tenant opt-in); single-operator
     // trust-all default byte-unchanged. `allow_inbox = false`.
     if let Some(caller) = crate::identity::resolve_read_visibility_caller() {
-        if !crate::visibility::caller_owns_for_mutation(&target, &caller, false) {
+        if !crate::visibility::caller_owns_for_mutation(
+            &target,
+            &caller,
+            false,
+            crate::identity::owner_stamp::MutationSite::sqlite(
+                crate::identity::owner_stamp::funnel::PROMOTE,
+            ),
+        ) {
             return Err(crate::errors::msg::CALLER_DOES_NOT_OWN_MEMORY.into());
         }
     }
@@ -169,7 +180,7 @@ pub(super) fn handle_promote(
                 &dest_payload,
                 dest_capability.as_ref(),
             )
-            .map_err(|e| e.to_string())?
+            .map_err(|e| crate::mcp::error_text::mcp_foreign_err("as_ref", e))?
             {
                 GovernanceDecision::Allow => {}
                 GovernanceDecision::Deny(refusal) => {
@@ -196,7 +207,10 @@ pub(super) fn handle_promote(
                 "allow",
                 crate::mcp::registry::tool_names::MEMORY_PROMOTE,
                 to_ns,
-                dest_payload,
+                crate::governance::audit::ForensicPayload::new()
+                    .ident("id", &resolved_id)
+                    .ident(crate::models::field_names::TO_NAMESPACE, to_ns)
+                    .label("mode", "vertical"),
             );
             Some(dest_agent_id)
         } else {
@@ -253,7 +267,7 @@ pub(super) fn handle_promote(
             &payload,
             capability.as_ref(),
         )
-        .map_err(|e| e.to_string())?
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("as_ref", e))?
         {
             GovernanceDecision::Allow => {}
             GovernanceDecision::Deny(refusal) => {
@@ -287,7 +301,7 @@ pub(super) fn handle_promote(
         })?;
         let clone_id =
             db::promote_to_namespace(conn, &resolved_id, to_ns, Some(dest_agent_id.as_str()))
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| crate::mcp::error_text::mcp_foreign_err("as_str", e))?;
         // P5 (G9): fire `memory_promote` webhook for vertical mode AFTER
         // the clone commits. memory_id = source id (subscribers can
         // distinguish via `mode` and `clone_id` in the details block).
@@ -377,7 +391,7 @@ pub(super) fn handle_promote(
         expires_at_arg,
         None,
     )
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| crate::mcp::error_text::mcp_foreign_err("handle_promote", e))?;
     if !found {
         return Err(crate::errors::msg::MEMORY_NOT_FOUND.into());
     }
@@ -492,7 +506,7 @@ mod tests {
 
         // The clone must not exist: a refused promote writes nothing.
         assert!(
-            crate::db::find_by_title_namespace(&conn, "row", "acme")
+            crate::db::find_by_title_namespace(&conn, "row", "acme", None)
                 .expect("probe")
                 .is_none(),
             "a refused promote must not land the clone in the destination"
@@ -561,7 +575,7 @@ mod tests {
             "DESTINATION owner gate must refuse; got: {err}"
         );
         assert!(
-            crate::db::find_by_title_namespace(&conn, "row-bypass", "acme3")
+            crate::db::find_by_title_namespace(&conn, "row-bypass", "acme3", None)
                 .expect("probe")
                 .is_none(),
             "must not clone"
@@ -643,7 +657,7 @@ mod tests {
             None,
         )
         .expect("open destination allows");
-        let clone_id = crate::db::find_by_title_namespace(&conn, "row3", "acme2")
+        let clone_id = crate::db::find_by_title_namespace(&conn, "row3", "acme2", None)
             .expect("probe")
             .expect("clone landed");
         let clone = crate::db::get(&conn, &clone_id)

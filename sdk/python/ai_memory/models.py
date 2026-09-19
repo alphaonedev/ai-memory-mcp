@@ -25,9 +25,25 @@ Design notes
 from __future__ import annotations
 
 from enum import Enum
-from typing import Any
+from typing import Any, TypedDict
 
 from pydantic import BaseModel, ConfigDict, Field
+
+
+class WriteReceipt(TypedDict):
+    """#3555 write evidence; class is local-only, quorum W-of-N, or replicated+backup."""
+
+    durability_class: str
+    fsync: str
+
+
+class MemoryWriteReceipt(WriteReceipt, total=False):
+    """Dictionary response from store/update, retaining existing wire fields."""
+
+    id: str
+    quorum_acks: int
+    quorum_n: int
+    quorum_required: int
 
 
 class _Base(BaseModel):
@@ -375,7 +391,10 @@ class InboxMessage(_Base):
     subject: str
     body: str
     received_at: str
-    read: bool = False
+    # #3730 — no ``read`` field: the inbox carries no read/handled marker.
+    # Handled = the recipient deleted the message (archived on this
+    # namespace); ``unread_only`` is accepted for compatibility and narrows
+    # nothing.
 
 
 class BulkCreateResponse(_Base):
@@ -398,6 +417,10 @@ class BulkCreateResponse(_Base):
     emitted it, so it was permanently empty and misdescribed the wire.
     """
 
+    durability_class: str
+    fsync: str
+    quorum_acks: int | None = None
+    quorum_n: int | None = None
     sent: int = 0
     created: int = 0
     updated: int = 0

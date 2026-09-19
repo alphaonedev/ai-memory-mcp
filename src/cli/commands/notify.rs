@@ -76,6 +76,11 @@ pub fn cmd_notify(
     cli_agent_id: Option<&str>,
     out: &mut CliOutput<'_>,
 ) -> Result<()> {
+    // #3730 (#2572 class) — REFUSE on a Postgres store BEFORE opening the local
+    // sqlite: a notify written here lands in a sidecar the served store never
+    // reads — reported as delivered while the recipient never sees it.
+    let db_path = crate::cli::backup::refuse_pg_store(db_path, "notify", out)?;
+    let db_path = db_path.as_path();
     let conn = db::open(db_path)?;
     let resolved_ttl = app_config.effective_ttl();
     let sender = crate::identity::resolve_agent_id(cli_agent_id, None)

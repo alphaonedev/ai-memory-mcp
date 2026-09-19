@@ -93,39 +93,47 @@ pub(super) fn resource_digest(content: &[u8]) -> Vec<u8> {
 pub(super) fn validate_parameters_schema(schema: &Value) -> anyhow::Result<()> {
     let obj = schema
         .as_object()
-        .ok_or_else(|| anyhow::anyhow!("parameters_schema must be a JSON object"))?;
+        .ok_or_else(|| crate::errors::invalid_input("parameters_schema must be a JSON object"))?;
 
     if let Some(ty) = obj.get("type") {
         if ty.as_str() != Some("object") {
-            anyhow::bail!("parameters_schema.type must be \"object\" when present: got {ty}");
+            return Err(crate::errors::invalid_input(format!(
+                "parameters_schema.type must be \"object\" when present: got {ty}"
+            )));
         }
     }
 
     let properties = match obj.get(field_names::PROPERTIES) {
         Some(props) => Some(props.as_object().ok_or_else(|| {
-            anyhow::anyhow!("parameters_schema.properties must be a JSON object")
+            crate::errors::invalid_input("parameters_schema.properties must be a JSON object")
         })?),
         None => None,
     };
     if let Some(props_obj) = properties {
         for (key, val) in props_obj {
             if !val.is_object() {
-                anyhow::bail!("parameters_schema.properties.{key} must be a JSON object schema");
+                return Err(crate::errors::invalid_input(format!(
+                    "parameters_schema.properties.{key} must be a JSON object schema"
+                )));
             }
         }
     }
 
     if let Some(required) = obj.get("required") {
         let req_arr = required.as_array().ok_or_else(|| {
-            anyhow::anyhow!("parameters_schema.required must be a JSON array of strings")
+            crate::errors::invalid_input(
+                "parameters_schema.required must be a JSON array of strings",
+            )
         })?;
         for r in req_arr {
             let name = r.as_str().ok_or_else(|| {
-                anyhow::anyhow!("parameters_schema.required entries must be strings")
+                crate::errors::invalid_input("parameters_schema.required entries must be strings")
             })?;
             let known = properties.is_some_and(|p| p.contains_key(name));
             if !known {
-                anyhow::bail!("parameters_schema.required references unknown property '{name}'");
+                return Err(crate::errors::invalid_input(format!(
+                    "parameters_schema.required references unknown property '{name}'"
+                )));
             }
         }
     }
@@ -271,7 +279,9 @@ pub(super) fn register_core(
     // write lock up front, serialising concurrent registrations; RAII drop of
     // `tx` rolls back ALL writes on any early `?` return below.
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
-        .map_err(|e| format!("skill register BEGIN IMMEDIATE: {e}"))?;
+        .map_err(|e| {
+        crate::mcp::error_text::mcp_foreign_err("skill register BEGIN IMMEDIATE", e)
+    })?;
     let conn: &Connection = &tx;
 
     // Find the current (non-superseded) row for this (namespace, name),
@@ -321,7 +331,7 @@ pub(super) fn register_core(
             now_secs,
         ],
     )
-    .map_err(|e| format!("skills INSERT: {e}"))?;
+    .map_err(|e| crate::mcp::error_text::mcp_foreign_err("skills INSERT", e))?;
 
     // Insert resources.
     for (res_path, res_kind, res_content) in resources {
@@ -333,7 +343,7 @@ pub(super) fn register_core(
              VALUES (?1,?2,?3,?4,?5)",
             params![new_id, res_path, res_kind, res_blob, res_digest],
         )
-        .map_err(|e| format!("skill_resources INSERT ({res_path}): {e}"))?;
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("skill_resources INSERT", e))?;
     }
 
     // Update previous row's superseded_by.
@@ -342,7 +352,7 @@ pub(super) fn register_core(
             "UPDATE skills SET superseded_by = ?1 WHERE id = ?2",
             params![new_id, prev],
         )
-        .map_err(|e| format!("superseded_by UPDATE: {e}"))?;
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("superseded_by UPDATE", e))?;
         Some(prev.clone())
     } else {
         None
@@ -386,7 +396,7 @@ pub(super) fn register_core(
 
     // Commit the atomic register (skills + resources + supersede) as one unit.
     tx.commit()
-        .map_err(|e| format!("skill register COMMIT: {e}"))?;
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("skill register COMMIT", e))?;
 
     Ok(RegisterResult {
         id: new_id,
@@ -428,8 +438,19 @@ pub fn handle_skill_register(
             // SKILL.md must be a regular file inside the root — never a
             // symlink pointing back out of the jail.
             reject_symlink_escape(&md_path, &root)?;
-            let text = std::fs::read_to_string(&md_path)
-                .map_err(|e| format!("cannot read SKILL.md in '{folder_str}': {e}"))?;
+            // #3762 — the `io::Error` Display carries the OS path text: log
+            // it for the operator, render the failure class to the caller.
+            let text = std::fs::read_to_string(&md_path).map_err(|e| {
+                tracing::error!(
+                    target: crate::mcp::error_text::TRACE_TARGET,
+                    requested = folder_str,
+                    path = %md_path.display(),
+                    error = %e,
+                    "cannot read SKILL.md for import"
+                );
+                let kind = crate::errors::msg::skills_io_kind(e.kind());
+                format!("cannot read SKILL.md in '{folder_str}': {kind}")
+            })?;
 
             // Collect resource files from a 'resources/' sub-directory.
             let mut res: Vec<(String, String, Vec<u8>)> = Vec::new();
@@ -503,12 +524,11 @@ pub fn handle_skill_register(
         "allow",
         "skill_register",
         "",
-        json!({
-            "namespace": manifest.namespace,
-            "name": manifest.name,
-            "resource_count": resource_files.len(),
-            "signed": active_keypair.is_some(),
-        }),
+        crate::governance::audit::ForensicPayload::new()
+            .ident_or_commit("namespace", &manifest.namespace)
+            .ident("name", &manifest.name)
+            .number("resource_count", resource_files.len())
+            .flag("signed", active_keypair.is_some()),
     );
 
     let body_bytes = manifest.body.as_bytes();
@@ -607,7 +627,9 @@ fn resolve_import_root(folder_str: &str, configured_root: Option<&str>) -> Resul
     // `canonicalize` resolves every symlink component AND normalises `..`,
     // so a traversal / symlinked `folder_path` collapses to its true target
     // before any containment check below.
-    let canonical = std::fs::canonicalize(Path::new(folder_str))
+    // #3762 — bind the raw io::Result first, so `?` below propagates only the mapped error.
+    let raw_folder = std::fs::canonicalize(Path::new(folder_str));
+    let canonical = raw_folder
         .map_err(|_| format!("folder_path '{folder_str}' is not a directory or does not exist"))?;
     if !canonical.is_dir() {
         return Err(format!(
@@ -615,13 +637,36 @@ fn resolve_import_root(folder_str: &str, configured_root: Option<&str>) -> Resul
         ));
     }
     if let Some(root_str) = configured_root {
-        let root = std::fs::canonicalize(Path::new(root_str)).map_err(|_| {
-            format!("{SKILLS_IMPORT_ROOT_ENV} '{root_str}' is not a directory or does not exist")
-        })?;
-        if !canonical.starts_with(&root) {
+        // #3713 — the configured root is OPERATOR config; its path goes to the
+        // operator log, never to the caller's error text.
+        // #3762 amend — `let .. else`, not `.map_err(..)?`: the derived Gate 7
+        // walks a `?` on a canonicalize receiver as a path render whatever the
+        // closure renders (#3773); this shape has no `?` on the source and
+        // reads identically to a human — the path goes to the operator log,
+        // the caller gets the env name.
+        let Ok(root) = std::fs::canonicalize(Path::new(root_str)) else {
+            tracing::error!(
+                target: crate::mcp::error_text::TRACE_TARGET,
+                root = root_str,
+                "{SKILLS_IMPORT_ROOT_ENV} is not a directory or does not exist"
+            );
             return Err(format!(
-                "folder_path '{folder_str}' resolves outside the configured skills-import root \
-                 (path-escape refused)"
+                "{SKILLS_IMPORT_ROOT_ENV} is not a directory or does not exist"
+            ));
+        };
+        if !canonical.starts_with(&root) {
+            // #3762 — the resolved jail ROOT is operator detail: it goes to
+            // the operator log, the caller gets the jail label from the ONE
+            // renderer both surfaces share.
+            tracing::error!(
+                target: crate::mcp::error_text::TRACE_TARGET,
+                requested = folder_str,
+                root = %root.display(),
+                "folder_path resolves outside the skills-import root (path-escape refused)"
+            );
+            return Err(format!(
+                "folder_path '{folder_str}' resolves outside the {} (path-escape refused)",
+                crate::errors::msg::skills_root_label(crate::errors::msg::SkillsJail::Import)
             ));
         }
     }
@@ -639,20 +684,52 @@ fn reject_symlink_escape(path: &Path, root: &Path) -> Result<(), String> {
         return Ok(());
     };
     if meta.file_type().is_symlink() {
-        return Err(format!(
-            "refusing symlinked skill path '{}': symlinks are not followed (path-escape defence)",
-            path.display()
-        ));
+        // #3713 — the resolved path carries the operator's import root; the
+        // caller learns the verdict, the operator log names the entry.
+        tracing::warn!(
+            target: crate::mcp::error_text::TRACE_TARGET,
+            path = %path.display(),
+            "refusing symlinked skill path: symlinks are not followed (path-escape defence)"
+        );
+        return Err(
+            "refusing symlinked skill path: symlinks are not followed (path-escape defence)"
+                .to_owned(),
+        );
     }
-    let resolved = std::fs::canonicalize(path)
-        .map_err(|e| format!("cannot resolve skill path '{}': {e}", path.display()))?;
+    // #3762 — bind the raw io::Result first, so `?` below propagates only the mapped error.
+    let raw_path = std::fs::canonicalize(path);
+    let resolved = raw_path
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("cannot resolve skill path", e))?;
     if !resolved.starts_with(root) {
-        return Err(format!(
-            "refusing skill path '{}': resolved path escapes the import root",
-            path.display()
-        ));
+        tracing::warn!(
+            target: crate::mcp::error_text::TRACE_TARGET,
+            path = %path.display(),
+            "refusing skill path: resolved path escapes the import root"
+        );
+        return Err("refusing skill path: resolved path escapes the import root".to_owned());
     }
     Ok(())
+}
+
+/// #3762 amend — the caller-facing name of a resource entry: its path RELATIVE
+/// to the resources folder, forward-slash joined (the same form the success
+/// path stores as `resource_path`), never the canonicalized absolute
+/// spelling. Falls back to the entry's file name when the entry is not under
+/// `base` (cannot happen for a `read_dir` child, kept total).
+fn relative_resource_path(base: &Path, path: &Path) -> String {
+    path.strip_prefix(base).map_or_else(
+        |_| {
+            path.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        },
+        |rel| {
+            rel.components()
+                .map(|c| c.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/")
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -665,22 +742,33 @@ fn collect_resources(
     out: &mut Vec<(String, String, Vec<u8>)>,
     budget: &mut ImportBudget,
 ) -> Result<(), String> {
-    let entries =
-        std::fs::read_dir(dir).map_err(|e| format!("read_dir '{}': {e}", dir.display()))?;
+    let entries = std::fs::read_dir(dir)
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("read_dir", e))?;
     for entry in entries {
-        let entry = entry.map_err(|e| format!("dir entry error: {e}"))?;
+        let entry =
+            entry.map_err(|e| crate::mcp::error_text::mcp_foreign_err("dir entry error", e))?;
         let path = entry.path();
         // #1923 — inspect the entry WITHOUT following it. A symlink (to a
         // dir OR a file) is refused so a planted
         // `resources/loot -> /etc/shadow` cannot be read; walking only
         // real directories keeps the traversal inside `base`.
         let md = std::fs::symlink_metadata(&path)
-            .map_err(|e| format!("stat resource '{}': {e}", path.display()))?;
+            .map_err(|e| crate::mcp::error_text::mcp_foreign_err("stat resource", e))?;
         if md.file_type().is_symlink() {
+            // #3762 amend — `path` is the entry under the canonicalized
+            // folder (its RESOLVED spelling): operator log only; the caller
+            // gets the entry's name relative to its own folder plus the jail
+            // label from the ONE renderer.
+            tracing::warn!(
+                target: crate::mcp::error_text::TRACE_TARGET,
+                path = %path.display(),
+                "refusing symlinked resource: symlinks are not followed (path-escape defence)"
+            );
             return Err(format!(
-                "refusing symlinked resource '{}': symlinks are not followed \
+                "refusing symlinked resource '{}' under the {}: symlinks are not followed \
                  (path-escape defence)",
-                path.display()
+                relative_resource_path(base, &path),
+                crate::errors::msg::skills_root_label(crate::errors::msg::SkillsJail::Import)
             ));
         }
         if md.is_dir() {
@@ -702,16 +790,28 @@ fn collect_resources(
             // Defense-in-depth: the fully-resolved regular file MUST remain
             // under the import root (catches any escape the symlink check
             // above could miss on an exotic filesystem).
-            let resolved = std::fs::canonicalize(&path)
-                .map_err(|e| format!("cannot resolve resource '{}': {e}", path.display()))?;
+            // #3762 — bind the raw io::Result first, so `?` below propagates only the mapped error.
+            let raw_res = std::fs::canonicalize(&path);
+            let resolved = raw_res.map_err(|e| {
+                crate::mcp::error_text::mcp_foreign_err("cannot resolve resource", e)
+            })?;
             if !resolved.starts_with(base) {
+                // #3762 amend — same rule: resolved spelling to the operator
+                // log, the folder-relative name + the jail label to the caller.
+                tracing::warn!(
+                    target: crate::mcp::error_text::TRACE_TARGET,
+                    path = %path.display(),
+                    resolved = %resolved.display(),
+                    "refusing resource: resolved path escapes the import root"
+                );
                 return Err(format!(
-                    "refusing resource '{}': resolved path escapes the import root",
-                    path.display()
+                    "refusing resource '{}': resolves outside the {} (path-escape refused)",
+                    relative_resource_path(base, &path),
+                    crate::errors::msg::skills_root_label(crate::errors::msg::SkillsJail::Import)
                 ));
             }
             let content = std::fs::read(&path)
-                .map_err(|e| format!("read resource '{}': {e}", path.display()))?;
+                .map_err(|e| crate::mcp::error_text::mcp_foreign_err("read resource", e))?;
             budget.charge(content.len() as u64)?;
             // Determine kind from sub-directory name or file extension.
             let kind = infer_kind(&rel);
@@ -1158,16 +1258,14 @@ mod tests {
         assert!(resolve_import_root(inside.to_str().unwrap(), Some(root_s)).is_ok());
         // A sibling directory outside the jail → refused.
         let err = resolve_import_root(outside.to_str().unwrap(), Some(root_s)).unwrap_err();
-        assert!(
-            err.contains("outside the configured skills-import root"),
-            "got: {err}"
-        );
+        // #3762 — the closed vocabulary names the jail label, never the
+        // resolved jail path.
+        assert!(err.contains("outside the skills-import root"), "got: {err}");
         // `..` traversal that lands outside the jail → refused.
         let escape = format!("{root_s}/ok/../../elsewhere");
         let err2 = resolve_import_root(&escape, Some(root_s)).unwrap_err();
         assert!(
-            err2.contains("outside the configured skills-import root")
-                || err2.contains("is not a directory"),
+            err2.contains("outside the skills-import root") || err2.contains("is not a directory"),
             "got: {err2}"
         );
         // Nonexistent folder → fail closed.
@@ -1258,7 +1356,9 @@ mod tests {
             &mut ImportBudget::new(),
         )
         .unwrap_err();
-        assert!(err.contains("read_dir"));
+        // #3713 — the io error is OPERATOR-ONLY; the caller sees the class.
+        assert_eq!(err, crate::mcp::error_text::FILESYSTEM_ERROR_TEXT);
+        assert!(!err.contains("/does/not/exist"), "{err}");
     }
 
     // ---- hex module --------------------------------------------------------
@@ -1443,5 +1543,112 @@ mod tests {
         assert_eq!(compute_skill_version(&conn, id1), 1);
         let id2 = v2["id"].as_str().unwrap();
         assert_eq!(compute_skill_version(&conn, id2), 2);
+    }
+}
+
+#[cfg(test)]
+mod jail_3762_tests {
+    //! #3762 — the skills-import jail renders the jail RELATIONSHIP, not the
+    //! jail.
+    //!
+    //! `handle_skill_register` interpolated the `std::io::Error` `Display` of
+    //! the `SKILL.md` read (which carries the OS path text for the
+    //! `std::fs::canonicalize`-resolved folder) into the MCP error, and the
+    //! import-root escape refusal named the configured root. The fix renders
+    //! a closed vocabulary — the stable `"skills-import root"` label, the
+    //! caller's own `folder_path` echo, and the failure class keyed by
+    //! `std::io::ErrorKind` — and keeps the absolute path on the operator
+    //! log only. Absence (no resolved absolute path) is paired with presence
+    //! (the label / the caller echo) on the same sink.
+
+    use super::*;
+
+    fn open_db() -> (rusqlite::Connection, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("test.db");
+        let conn = crate::db::open(&path).expect("db::open");
+        (conn, dir)
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn unreadable_skill_md_renders_kind_not_os_error_3762() {
+        // Arm (h) #3517 — `handle_skill_register` reaches the identity
+        // resolver, so hold the reader token for the whole body. The plain
+        // test lock (not the unset guard) keeps arm (e) quiet: no
+        // helper-routed mutation is added.
+        let _envg = crate::identity::agent_id_env_test_lock();
+        let (conn, dir) = open_db();
+        // Route the folder through a symlinked parent so the caller-spelled
+        // path and the canonicalized path genuinely differ: the echo must
+        // stay the caller's spelling while the resolved spelling stays out.
+        let actual = dir.path().join("actual-3762");
+        std::fs::create_dir_all(actual.join("skill-3762-nomd")).expect("mkdir folder");
+        std::os::unix::fs::symlink(&actual, dir.path().join("alias-3762")).expect("symlink");
+        let folder = dir.path().join("alias-3762/skill-3762-nomd");
+        let folder_spelling = folder.to_str().expect("utf8").to_owned();
+        let canon_spelling = std::fs::canonicalize(&folder)
+            .expect("canon folder")
+            .to_str()
+            .expect("utf8")
+            .to_owned();
+        assert_ne!(
+            folder_spelling, canon_spelling,
+            "precondition: the alias spelling and the resolved spelling differ"
+        );
+
+        let err = handle_skill_register(&conn, &json!({"folder_path": folder_spelling}), None)
+            .expect_err("a folder without SKILL.md must be refused");
+        assert!(
+            !err.contains(&canon_spelling),
+            "the resolved folder path must not reach the caller: {err}"
+        );
+        assert!(
+            !err.contains("os error"),
+            "no raw OS error text reaches the caller: {err}"
+        );
+        assert!(
+            err.contains(&folder_spelling),
+            "the caller's own folder echo stays: {err}"
+        );
+        assert_eq!(
+            err,
+            format!("cannot read SKILL.md in '{folder_spelling}': not found"),
+            "closed vocabulary, byte-pinned: {err}"
+        );
+    }
+
+    #[test]
+    fn import_jail_escape_renders_label_not_path_3762() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("jail-3762");
+        std::fs::create_dir_all(&root).expect("mkdir jail");
+        let root_s = root.to_str().expect("utf8").to_owned();
+        let canon_spelling = std::fs::canonicalize(&root)
+            .expect("canon jail")
+            .to_str()
+            .expect("utf8")
+            .to_owned();
+        let outside = dir.path().join("elsewhere-3762");
+        std::fs::create_dir_all(&outside).expect("mkdir outside");
+        let outside_s = outside.to_str().expect("utf8").to_owned();
+
+        let err = resolve_import_root(&outside_s, Some(&root_s))
+            .expect_err("a sibling outside the jail must be refused");
+        assert!(
+            !err.contains(&canon_spelling),
+            "the resolved jail path must not reach the caller: {err}"
+        );
+        assert!(
+            err.contains("skills-import root"),
+            "the caller gets the jail label: {err}"
+        );
+        assert_eq!(
+            err,
+            format!(
+                "folder_path '{outside_s}' resolves outside the skills-import root (path-escape refused)"
+            ),
+            "closed vocabulary, byte-pinned: {err}"
+        );
     }
 }

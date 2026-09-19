@@ -469,8 +469,15 @@ fn commit_b_off_path_is_byte_identical() {
     }
 }
 
+/// A WRONG key, not an ABSENT one: the row is sealed to agent A but names
+/// agent B, whose key exists and cannot open it. Renamed under #3718 —
+/// the old name `commit_b_missing_key_fails_closed_on_read` claimed the
+/// absent-key case, which it never covered (a test named for the case it
+/// does not cover retires the question). The absent-key case — read never
+/// mints, typed `KeyAbsent`, no new file, row untouched — is
+/// `tests/encryption_key_absent_3718.rs` (+ `_pg`, `_head`).
 #[test]
-fn commit_b_missing_key_fails_closed_on_read() {
+fn commit_b_wrong_key_fails_closed_on_read() {
     // An encrypted row whose recipient keypair cannot decrypt the
     // envelope (sealed to agent A but the row's metadata.agent_id names
     // agent B) must FAIL the read — never return the empty placeholder
@@ -482,9 +489,13 @@ fn commit_b_missing_key_fails_closed_on_read() {
     let kp = get_or_create_keypair(seal_agent).expect("keypair");
     let envelope = encrypt("secret for seal_agent", &kp.public).expect("encrypt");
     let envelope_bytes = envelope.to_bytes();
+    // #3718 — the WRONG agent must actually OWN a key for this to be the
+    // wrong-key case. Before #3718 the read minted one on the fly, so this
+    // test silently exercised the absent-key path under a wrong-key name.
+    let _wrong_kp = get_or_create_keypair(wrong_agent).expect("wrong agent's own key");
 
     // Row carries the WRONG agent_id, so row_to_memory resolves a
-    // different keypair and decrypt fails.
+    // different (existing) keypair and AEAD authentication fails.
     let mut mem = make_mem("commit-b-fail-closed", "", "global");
     mem.metadata = serde_json::json!({ "agent_id": wrong_agent });
     let id = db::insert(&conn, &mem).expect("insert");

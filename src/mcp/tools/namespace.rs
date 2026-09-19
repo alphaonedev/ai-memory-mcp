@@ -173,7 +173,11 @@ pub(crate) fn authorize_namespace_standard_bind(
     if caller == sentinels::DAEMON_PRINCIPAL {
         return Ok(());
     }
-    authorize_namespace_standard_owner(caller, existing_mem, "namespace standard")?;
+    authorize_namespace_standard_owner(
+        caller,
+        existing_mem,
+        crate::errors::msg::CALLER_DOES_NOT_OWN_NAMESPACE_STANDARD,
+    )?;
     // #2542 — the declared parent must be entitled too (unowned or same owner).
     authorize_namespace_standard_parent(caller, declared_parent_standard)
 }
@@ -194,24 +198,34 @@ pub(crate) fn authorize_namespace_standard_parent(
     }
     match parent_standard {
         None => Ok(()),
-        Some(mem) => {
-            authorize_namespace_standard_owner(caller, mem, "declared parent namespace standard")
-        }
+        Some(mem) => authorize_namespace_standard_owner(
+            caller,
+            mem,
+            crate::errors::msg::CALLER_DOES_NOT_OWN_PARENT_NAMESPACE_STANDARD,
+        ),
     }
 }
 
 /// #2541 / #929 / #2542 — the shared ownership predicate applied to a
 /// namespace-standard memory (the bound standard, or the declared parent's
-/// standard). `subject` names the memory in the refusal so the two call sites
+/// standard). `refusal` is the SSOT text for the memory being judged
+/// (`errors::msg::CALLER_DOES_NOT_OWN_NAMESPACE_STANDARD` /
+/// `CALLER_DOES_NOT_OWN_PARENT_NAMESPACE_STANDARD`) so the two call sites
 /// produce distinct, operator-actionable errors while sharing ONE ownership
 /// rule: an UNOWNED owner passes — that is an EMPTY string, the exact literal
 /// `system`, or [`sentinels::SYSTEM_PRINCIPAL`] (also `"system"`); any other
 /// named owner that differs from the caller refuses. (Review Finding 5: there is
 /// no `system:`-PREFIX match — only these exact values pass.)
+///
+/// #3407 — the refusal names NEITHER the caller NOR the recorded owner. The
+/// pre-#3407 text `(caller=…, owner=…)` reached the refused caller on the MCP
+/// surface verbatim and on HTTP inside the 403 body: an identity oracle (the
+/// same class #3426 closed for the memory owner gates). The owner is
+/// server-side evidence and goes to the authz trace at the gate.
 fn authorize_namespace_standard_owner(
     caller: &str,
     mem: &crate::models::Memory,
-    subject: &str,
+    refusal: &'static str,
 ) -> Result<(), String> {
     let recorded_owner = mem
         .metadata
@@ -222,9 +236,12 @@ fn authorize_namespace_standard_owner(
         || recorded_owner == "system"
         || recorded_owner == sentinels::SYSTEM_PRINCIPAL;
     if !is_unowned && recorded_owner != caller {
-        return Err(format!(
-            "caller does not own this {subject} (caller={caller}, owner={recorded_owner})"
-        ));
+        tracing::warn!(
+            target: crate::handlers::AUTHZ_TRACE_TARGET,
+            standard = %mem.id,
+            "namespace-standard owner-gate refusal: {refusal}: caller {caller} != owner {recorded_owner}"
+        );
+        return Err(refusal.to_string());
     }
     Ok(())
 }
@@ -242,15 +259,15 @@ fn resolve_namespace_standard_memory(
     conn: &rusqlite::Connection,
     namespace: &str,
 ) -> Result<Option<crate::models::Memory>, String> {
-    let Some(standard_id) =
-        db::get_namespace_standard(conn, namespace).map_err(|e| e.to_string())?
+    let Some(standard_id) = db::get_namespace_standard(conn, namespace)
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("namespace_standard", e))?
     else {
         return Ok(None); // no standard bound → unowned
     };
     // A severed / dangling pointer (`Ok(None)`) is a genuinely-unowned state
     // (parity with the pg twin's `NotFound → None`); a read FAULT is not, and
     // must refuse rather than allow.
-    db::get(conn, &standard_id).map_err(|e| e.to_string())
+    db::get(conn, &standard_id).map_err(|e| crate::mcp::error_text::mcp_foreign_err("get", e))
 }
 
 /// #2721 / CB-19 — resolve the caller for a namespace-standard mutation,
@@ -397,13 +414,52 @@ fn handle_namespace_set_standard_inner(
         Some(p) => resolve_namespace_standard_memory(conn, p),
         None => Ok(None),
     };
-    let bind_refusal: Option<String> = match parent_standard {
-        Err(err) => Some(format!(
-            "cannot verify declared parent namespace ownership (parent={}, error={err}); \
-             refusing the bind rather than treating the parent as unowned",
-            parent.unwrap_or("")
-        )),
-        Ok(parent_standard) => match db::get(conn, id) {
+    // #3758 — the REBIND gate FIRST: the standard CURRENTLY bound to the
+    // namespace decides, through the same predicate CLEAR uses (`crate::
+    // visibility::namespace_standard_mutation_admission`). Pre-fix the SET
+    // funnels authorized only the memory being bound (below), so any caller
+    // could REPLACE another tenant's governance standard with a memory of
+    // their own. A read FAULT refuses (fail-closed): an unverifiable current
+    // owner must never be treated as unowned.
+    let rebind_refusal: Option<String> = match db::namespace_standard_binding(conn, namespace) {
+        Err(err) => {
+            tracing::error!(
+                target: crate::mcp::error_text::TRACE_TARGET,
+                error = %err,
+                "namespace_set_standard: cannot verify the current standard owner; refusing the bind",
+            );
+            Some(
+                "cannot verify the current namespace-standard owner; refusing the bind \
+                 rather than treating the standard as unowned"
+                    .to_string(),
+            )
+        }
+        Ok(binding) => crate::visibility::namespace_standard_mutation_admission(
+            &caller,
+            caller == sentinels::DAEMON_PRINCIPAL,
+            namespace,
+            &binding,
+            crate::visibility::NamespaceStandardOp::Set,
+        )
+        .err()
+        .map(|_| crate::errors::msg::CALLER_DOES_NOT_OWN_NAMESPACE_STANDARD.to_string()),
+    };
+    let bind_refusal: Option<String> = match (rebind_refusal, parent_standard) {
+        (Some(refusal), _) => Some(refusal),
+        (None, Err(err)) => {
+            tracing::error!(
+                target: crate::mcp::error_text::TRACE_TARGET,
+                error = %err,
+                parent = parent.unwrap_or(""),
+                "namespace_set_standard: cannot verify the declared parent owner; refusing the bind",
+            );
+            Some(format!(
+                "cannot verify declared parent namespace ownership (parent={}); refusing \
+                 the bind rather than treating the parent as unowned",
+                parent.unwrap_or("")
+            ))
+        }
+        (None, Ok(parent_standard)) => match db::get(conn, id) {
             Ok(Some(existing_mem)) => {
                 authorize_namespace_standard_bind(&caller, &existing_mem, parent_standard.as_ref())
                     .err()
@@ -423,12 +479,16 @@ fn handle_namespace_set_standard_inner(
         },
         "namespace_set_standard",
         "",
-        serde_json::json!({
-            "namespace": namespace,
-            (field_names::STANDARD_ID): id,
-            "parent": parent,
-            "has_governance": params.get(param_names::GOVERNANCE).is_some_and(|v| !v.is_null()),
-        }),
+        crate::governance::audit::ForensicPayload::new()
+            .ident_or_commit("namespace", namespace)
+            .ident(field_names::STANDARD_ID, id)
+            .opt_ident("parent", parent)
+            .flag(
+                "has_governance",
+                params
+                    .get(param_names::GOVERNANCE)
+                    .is_some_and(|v| !v.is_null()),
+            ),
     );
     if let Some(msg) = bind_refusal {
         return Err(msg);
@@ -459,7 +519,7 @@ fn handle_namespace_set_standard_inner(
         // Load the standard memory first so we can read its existing
         // governance blob and merge.
         let mut mem = db::get(conn, id)
-            .map_err(|e| e.to_string())?
+            .map_err(|e| crate::mcp::error_text::mcp_foreign_err("get", e))?
             .ok_or_else(|| crate::errors::msg::memory_not_found(id))?;
         // Compute the merged governance JSON: existing fields preserved,
         // incoming overrides applied per-key.
@@ -494,7 +554,9 @@ fn handle_namespace_set_standard_inner(
             None,
             Some(&metadata),
         )
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| {
+            crate::mcp::error_text::mcp_foreign_err("handle_namespace_set_standard_inner", e)
+        })?;
         if !found {
             return Err(format!("memory not found during governance merge: {id}"));
         }
@@ -581,7 +643,8 @@ pub fn handle_namespace_get_standard(
 
     // The binding is probed separately from the body so a DANGLING binding
     // (id set, memory deleted) keeps its distinct `warning` shape.
-    let standard_id = db::get_namespace_standard(conn, namespace).map_err(|e| e.to_string())?;
+    let standard_id = db::get_namespace_standard(conn, namespace)
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("namespace_get_standard", e))?;
     match standard_id {
         Some(id) => match super::lookup_namespace_standard(conn, namespace, caller) {
             super::StandardLookup::Visible(std) => {
@@ -643,7 +706,7 @@ pub fn handle_namespace_get_standard(
 /// correctly — but operators inspecting the get-standard surface saw
 /// an incomplete policy blob and could not confirm their gate was
 /// stored.
-fn merge_governance_for_response(metadata: &Value) -> Value {
+pub(crate) fn merge_governance_for_response(metadata: &Value) -> Value {
     // Step 1: typed-struct base. Resolves to defaults when no
     // governance metadata is present (matches pre-#1326 behaviour
     // for the well-known-fields surface).
@@ -733,7 +796,7 @@ fn record_clear_refusal(caller: &str, namespace: &str) {
         "refuse",
         AUDIT_KIND_NAMESPACE_CLEAR_STANDARD,
         "",
-        serde_json::json!({ "namespace": namespace }),
+        crate::governance::audit::ForensicPayload::new().ident_or_commit("namespace", namespace),
     );
 }
 
@@ -828,7 +891,8 @@ fn handle_namespace_clear_standard_inner(
             .is_ok();
         if meta_row_exists {
             let resolved = match db::get_namespace_standard(conn, namespace) {
-                Ok(Some(standard_id)) => db::get(conn, &standard_id).map_err(|e| e.to_string())?,
+                Ok(Some(standard_id)) => db::get(conn, &standard_id)
+                    .map_err(|e| crate::mcp::error_text::mcp_foreign_err("get", e))?,
                 Ok(None) => None,
                 Err(e) => return Err(e.to_string()),
             };
@@ -851,9 +915,17 @@ fn handle_namespace_clear_standard_inner(
                         // opposite-ordering half of the #2634 class). Chain
                         // "refuse" here so the refusal is audited.
                         record_clear_refusal(&caller, namespace);
-                        return Err(format!(
-                            "caller does not own this namespace standard (caller={caller}, owner={recorded_owner})"
-                        ));
+                        // #3407 — the owner is server-side evidence only; the
+                        // refusal the caller reads is the bare SSOT const (the
+                        // same one the SAL adapters put in `PermissionDenied`).
+                        tracing::warn!(
+                            target: crate::handlers::AUTHZ_TRACE_TARGET,
+                            "namespace-standard owner-gate refusal: {} on {namespace}: caller {caller} != owner {recorded_owner}",
+                            crate::OP_CLEAR_NAMESPACE_STANDARD
+                        );
+                        return Err(
+                            crate::errors::msg::CALLER_DOES_NOT_OWN_NAMESPACE_STANDARD.to_string()
+                        );
                     }
                 }
                 None => {
@@ -884,10 +956,11 @@ fn handle_namespace_clear_standard_inner(
         "allow",
         AUDIT_KIND_NAMESPACE_CLEAR_STANDARD,
         "",
-        serde_json::json!({ "namespace": namespace }),
+        crate::governance::audit::ForensicPayload::new().ident_or_commit("namespace", namespace),
     );
 
-    let cleared = db::clear_namespace_standard(conn, namespace).map_err(|e| e.to_string())?;
+    let cleared = db::clear_namespace_standard(conn, namespace)
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("clear_namespace_standard", e))?;
     Ok(json!({"cleared": cleared, "namespace": namespace}))
 }
 
@@ -1306,14 +1379,14 @@ mod tests {
             }),
         )
         .expect_err("wire agent_id=daemon must not bypass the ownership gate");
-        assert!(err.contains("does not own"), "got: {err}");
-        assert!(
-            err.contains(sentinels::ANONYMOUS_INVALID),
-            "wire daemon must downgrade to anonymous:invalid, got: {err}"
-        );
-        assert!(
-            !err.contains(&format!("caller={}", sentinels::DAEMON_PRINCIPAL)),
-            "wire daemon must never be honored as the daemon principal, got: {err}"
+        // #3407 — the refusal is the bare SSOT const: it names neither the
+        // caller nor the owner, so the proof that the wire daemon was NOT
+        // honoured is the refusal itself (a real daemon principal bypasses
+        // this gate) plus the unchanged binding asserted below.
+        assert_eq!(
+            err,
+            crate::errors::msg::CALLER_DOES_NOT_OWN_NAMESPACE_STANDARD,
+            "wire daemon must downgrade to anonymous:invalid and be refused by the bare const"
         );
         assert!(
             db::get_namespace_standard(&conn, "ns-2721")
@@ -1737,6 +1810,80 @@ mod tests {
         let conn = fresh_conn();
         // Should not panic when nothing is set up.
         auto_register_path_hierarchy(&conn, "non-existent-ns");
+    }
+
+    /// #3758 — the REBIND gate at the MCP funnel: the standard CURRENTLY
+    /// bound decides. bob may not replace alice's binding with a memory of
+    /// his own (refused with the bare SSOT const — the owner is never named
+    /// and the binding is untouched); alice replaces her own (PRESENCE); an
+    /// UNBOUND namespace binds for anyone; the daemon principal, supplied
+    /// out of band, bypasses.
+    #[test]
+    fn issue_3758_rebind_is_gated_on_the_currently_bound_standards_owner() {
+        // The reader token (check-test-env-lock arm (h)): the lock, not the
+        // unset guard, so this is not an arm (e) helper-routed write either;
+        // every caller in this cell is passed explicitly, never read from env.
+        let _agent_id_env_guard = crate::identity::agent_id_env_test_lock();
+        let conn = fresh_conn();
+        let ns = "ns-3758";
+        let alice_std = insert_owned(&conn, ns, "alice-standard", "ai:alice-3758");
+        let alice_std_2 = insert_owned(&conn, ns, "alice-standard-2", "ai:alice-3758");
+        let bob_std = insert_owned(&conn, ns, "bob-standard", "ai:bob-3758");
+
+        // UNBOUND namespace: anyone binds their own memory (control).
+        handle_namespace_set_standard(
+            &conn,
+            &json!({"namespace": ns, "id": alice_std, "agent_id": "ai:alice-3758"}),
+        )
+        .expect("alice binds her standard to an unbound namespace");
+        assert_eq!(
+            db::get_namespace_standard(&conn, ns).unwrap().as_deref(),
+            Some(alice_std.as_str())
+        );
+
+        // ABSENCE: bob may not REPLACE alice's binding with his own memory.
+        let err = handle_namespace_set_standard(
+            &conn,
+            &json!({"namespace": ns, "id": bob_std, "agent_id": "ai:bob-3758"}),
+        )
+        .expect_err("#3758: a rebind of another agent's namespace standard is refused");
+        assert_eq!(
+            err,
+            crate::errors::msg::CALLER_DOES_NOT_OWN_NAMESPACE_STANDARD,
+            "the refusal is the bare SSOT const — it names neither the caller nor the owner"
+        );
+        assert!(
+            !err.contains("alice"),
+            "the owner must never be named: {err}"
+        );
+        assert_eq!(
+            db::get_namespace_standard(&conn, ns).unwrap().as_deref(),
+            Some(alice_std.as_str()),
+            "a refused rebind leaves the binding untouched"
+        );
+
+        // PRESENCE: the owner replaces her own standard through the same door.
+        handle_namespace_set_standard(
+            &conn,
+            &json!({"namespace": ns, "id": alice_std_2, "agent_id": "ai:alice-3758"}),
+        )
+        .expect("alice rebinds her own namespace");
+        assert_eq!(
+            db::get_namespace_standard(&conn, ns).unwrap().as_deref(),
+            Some(alice_std_2.as_str())
+        );
+
+        // The daemon principal (out of band, never from the wire) bypasses.
+        handle_namespace_set_standard_trusted(
+            &conn,
+            &json!({"namespace": ns, "id": bob_std}),
+            sentinels::DAEMON_PRINCIPAL,
+        )
+        .expect("the trusted daemon principal may rebind any namespace");
+        assert_eq!(
+            db::get_namespace_standard(&conn, ns).unwrap().as_deref(),
+            Some(bob_std.as_str())
+        );
     }
 }
 

@@ -25,7 +25,7 @@ the binary, ai-memory boots a per-session process, and the AI now
 has 8 to 103 advertised memory tools at its disposal (depending on the
 `--profile` flag). For AIs that don't speak MCP, the HTTP API
 covers everything the MCP surface does, plus a few more endpoints
-(100 route registrations / 86 unique URL paths).
+(102 route registrations / 88 unique URL paths).
 
 Every recipe below assumes the binary is on your `PATH`. If
 `ai-memory --version` doesn't print `1.0.0`, go back to
@@ -76,7 +76,7 @@ memory on every conversation start), see
 > documented in
 > [`docs/CLI_REFERENCE.md`](CLI_REFERENCE.html) § `mcp`.
 
-> **Using `--tier smart` or `--tier autonomous` with a non-default LLM backend?** Extend the `env` block above with `AI_MEMORY_LLM_BACKEND`, `AI_MEMORY_LLM_API_KEY`, and `AI_MEMORY_LLM_MODEL`. **Do not** rely on shell exports — MCP-spawned subprocesses don't see your interactive shell's environment ([#1144](https://github.com/alphaonedev/ai-memory-mcp/issues/1144)). Copy-pasteable recipes for every supported provider (Ollama, LMStudio, vLLM, llama.cpp server, xAI Grok, OpenAI, Anthropic, Gemini, DeepSeek, Kimi, Qwen, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks): [`integrations/llm-backends.md`](integrations/llm-backends.html).
+> **Using `--tier smart` or `--tier autonomous` with a non-default LLM backend?** Extend the `env` block above with `AI_MEMORY_LLM_BACKEND`, `AI_MEMORY_LLM_API_KEY`, and `AI_MEMORY_LLM_MODEL`. **Do not** rely on shell exports — MCP-spawned subprocesses don't see your interactive shell's environment ([#1144](https://github.com/alphaonedev/ai-memory-mcp/issues/1144)). Copy-pasteable recipes for every supported provider (Ollama, LMStudio, vLLM, llama.cpp server, xAI Grok, OpenAI, Anthropic, Gemini, Kimi, Qwen, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks): [`integrations/llm-backends.md`](integrations/llm-backends.html).
 
 ### 2a. PreToolUse governance hook (gate every Bash / Edit / Write)
 
@@ -198,12 +198,12 @@ The handful of routes you'll actually call:
 
 ```bash
 # Store a memory
-curl -X POST http://127.0.0.1:9077/api/v1/memories \
+curl -X POST https://127.0.0.1:9077/api/v1/memories \
   -H "Content-Type: application/json" \
   -d '{"title":"Test","content":"Stored from ChatGPT","tier":"mid"}'
 
 # Recall
-curl -X POST http://127.0.0.1:9077/api/v1/recall \
+curl -X POST https://127.0.0.1:9077/api/v1/recall \
   -H "Content-Type: application/json" \
   -d '{"context":"what did I store","limit":5}'
 ```
@@ -310,31 +310,31 @@ Category-1 (hook-capable) vs. Category-2 (MCP-only) matrix.
 
 ## 7. HTTP API fallback — for clients that don't speak MCP
 
-ai-memory ships an HTTP/REST daemon with **100 route registrations / 86 unique URL paths**
+ai-memory ships an HTTP/REST daemon with **102 route registrations / 88 unique URL paths**
 covering everything the MCP surface does. Use it for AI clients
 with no MCP support (most browser-based assistants), custom
 scripts, multi-host setups, and browser extensions.
 
 ```bash
 ai-memory serve --host 127.0.0.1 --port 9077
-curl http://127.0.0.1:9077/api/v1/health  # {"status":"ok"}
+curl https://127.0.0.1:9077/api/v1/health  # {"status":"ok"}
 ```
 
 **Three curl recipes you'll actually use:**
 
 ```bash
 # Store a memory
-curl -X POST http://127.0.0.1:9077/api/v1/memories \
+curl -X POST https://127.0.0.1:9077/api/v1/memories \
   -H "Content-Type: application/json" \
   -d '{"title":"Deploy target","content":"EKS in us-west-2","tier":"long","namespace":"platform"}'
 
 # Recall (semantic + keyword hybrid)
-curl -X POST http://127.0.0.1:9077/api/v1/recall \
+curl -X POST https://127.0.0.1:9077/api/v1/recall \
   -H "Content-Type: application/json" \
   -d '{"context":"what is our deploy target","namespace":"platform","limit":5}'
 
 # Check whether an action would be governance-allowed (v0.7.0 7th-form)
-curl -X POST http://127.0.0.1:9077/api/v1/memory_check_agent_action \
+curl -X POST https://127.0.0.1:9077/api/v1/memory_check_agent_action \
   -H "Content-Type: application/json" \
   -d '{"agent_id":"ai:gpt-5@my-laptop","action":"store","namespace":"platform","content":"test"}'
 ```

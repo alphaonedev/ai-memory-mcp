@@ -1046,7 +1046,7 @@ fn federation_forward_url_branch_takes_http_path() {
         &ttl,
         false,
         None,
-        Some("http://127.0.0.1:1"), // unreachable,
+        Some("https://127.0.0.1:1"), // unreachable,
         None,
     )
     .unwrap_err();
@@ -1077,7 +1077,7 @@ fn federation_forward_url_uses_metadata_agent_id_when_top_level_absent() {
         &ttl,
         false,
         None,
-        Some("http://127.0.0.1:1"), // unreachable — we just want to exercise the agent_id path,
+        Some("https://127.0.0.1:1"), // unreachable — we just want to exercise the agent_id path,
         None,
     );
     // Unreachable URL means a federation_forward error; the
@@ -1105,7 +1105,7 @@ fn federation_forward_url_rejects_malformed_agent_id() {
         &ttl,
         false,
         None,
-        Some("http://127.0.0.1:1"),
+        Some("https://127.0.0.1:1"),
         None,
     )
     .unwrap_err();
@@ -2473,7 +2473,7 @@ fn mcp_store_signed_ledger_fault_refuses_before_persist_3496() {
         "the refusal should identify the failed security ledger: {err}"
     );
     assert!(
-        db::find_by_title_namespace(&conn, title, "test-ns")
+        db::find_by_title_namespace(&conn, title, "test-ns", None)
             .expect("lookup after ledger fault")
             .is_none(),
         "ledger failure must happen before memory persistence"
@@ -2525,7 +2525,7 @@ fn mcp_store_forged_signature_is_rejected() {
     );
     // Hard-reject: nothing persisted.
     assert!(
-        db::find_by_title_namespace(&conn, title, "test-ns")
+        db::find_by_title_namespace(&conn, title, "test-ns", None)
             .expect("lookup")
             .is_none(),
         "a forged write must not persist"
@@ -3036,10 +3036,10 @@ fn store_insert_and_refund_failures_remain_observable_without_persisting_3496() 
         None,
     )
     .expect_err("the forced insert fault must remain observable");
-    assert!(
-        err.contains("forced memory insert failure 3496"),
-        "got: {err}"
-    );
+    // #3713 — "observable" means the WRITE FAILS and the quota is refunded
+    // (asserted below); the trigger's text is driver text and stays on the
+    // operator log, the caller sees the storage class.
+    assert_eq!(err, crate::mcp::error_text::DB_ERROR_TEXT, "got: {err}");
     let charged: (i64, i64) = conn
         .query_row(
             "SELECT current_memories_today, current_storage_bytes
@@ -3065,8 +3065,33 @@ fn store_insert_and_refund_failures_remain_observable_without_persisting_3496() 
     );
 }
 
+/// #3496 → Consolidation Unit 1 (#3695): the CONTRACT this cell pins
+/// CHANGED, deliberately, and the old one is recorded here so the change is
+/// not silent.
+///
+/// The #3496 coverage cell drove the request-echo fallback at
+/// `handle_store_inner` (the `db::get` after the write returns nothing → the
+/// response is built from the request) by QUARANTINING the `(title,
+/// namespace)` slot and storing into it with `on_conflict=merge`: the merge
+/// landed INSIDE the quarantined row, the row stayed hidden, the caller got
+/// a successful envelope for text nothing could ever read. That vehicle IS
+/// the #3695 defect ("a new store matching a QUARANTINED row's (title,
+/// namespace) is written into the hidden row"). Since Unit 1 the store is
+/// refused AT ADMISSION (`visibility::title_slot_admission` →
+/// `Refused`), typed and naming NO row; nothing is written; the quota charge
+/// is refunded. For a caller that means: where `memory_store` used to answer
+/// `{"id": <hidden row>, "duplicate": true, "action": "updated existing
+/// memory"}` for a title held by a quarantined row, it now answers
+/// `CONFLICT: … (existing id: )` — a contract change, chosen (Conductor
+/// ruling on #3696: integrity over a one-bit existence leak) over writing a
+/// caller's text into a row it cannot read.
+///
+/// The echo fallback itself is NOT dead: it still covers a row that becomes
+/// unreadable AFTER the commit — the synchronous atomise pass archiving it,
+/// a concurrent forget / gc / quarantine between the write and the echo
+/// read — which no in-process test can interpose on this path.
 #[test]
-fn store_quarantined_duplicate_uses_request_echo_fallback_3496() {
+fn store_onto_a_quarantined_slot_is_refused_unnamed_not_merged_3496_3695() {
     let conn = fresh_conn();
     let db_path = db_path();
     let ttl = ResolvedTtl::default();
@@ -3083,13 +3108,57 @@ fn store_quarantined_duplicate_uses_request_echo_fallback_3496() {
     )
     .expect("quarantine the dedup slot");
     assert!(db::get(&conn, &id).expect("read").is_none());
+    let before: (String, i64) = conn
+        .query_row(
+            "SELECT content, version FROM memories WHERE id = ?1",
+            rusqlite::params![&id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .expect("row");
 
     params["content"] = json!("A second write into the slot hidden by quarantine.");
-    let response = handle_store(
+    let err = handle_store(
         &conn, &db_path, &params, None, None, None, &ttl, false, None, None, None,
     )
-    .expect("an unreadable echo must not fail the already-committed write");
-    assert_eq!(response["tier"].as_str(), Some(Tier::Mid.as_str()));
-    assert_eq!(response["namespace"].as_str(), Some("test-ns"));
-    assert_eq!(response["title"].as_str(), Some("quarantined-echo-3496"));
+    .expect_err("#3695: a store onto a quarantined slot is refused, never merged into it");
+    assert!(
+        err.starts_with("CONFLICT:") && err.contains("quarantined-echo-3496"),
+        "the typed conflict message: {err}"
+    );
+    assert!(
+        err.contains("(existing id: )") && err.contains("not readable by this caller"),
+        "the hidden row is never named (empty existing id) and the merge hint is not offered: {err}"
+    );
+    let after: (String, i64, String) = conn
+        .query_row(
+            "SELECT content, version, lifecycle_state FROM memories WHERE id = ?1",
+            rusqlite::params![&id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .expect("row");
+    assert_eq!(
+        (after.0, after.1),
+        before,
+        "the quarantined row is byte-identical"
+    );
+    assert_eq!(after.2, "quarantined");
+    let rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        rows, 1,
+        "nothing landed beside it either (the row still holds the slot)"
+    );
+    // the refused write's quota charge was refunded (the seed alone stands)
+    let charged: i64 = conn
+        .query_row(
+            "SELECT current_memories_today FROM agent_quotas WHERE agent_id = 'ai:alice' AND namespace = 'test-ns'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("quota row");
+    assert_eq!(
+        charged, 1,
+        "a fail-closed conflict never landed a row, so its charge is refunded"
+    );
 }

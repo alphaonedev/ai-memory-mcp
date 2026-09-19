@@ -1340,7 +1340,6 @@ async fn http_bulk_create_fans_out_with_federation() {
     // mock peer that records sync_push POSTs and bulk-create N rows;
     // the mock must see N POSTs (background-detached + foreground).
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use tokio::net::TcpListener;
 
     let state = test_state();
 
@@ -1366,21 +1365,16 @@ async fn http_bulk_create_fans_out_with_federation() {
         .with_state(MockState {
             count: count_for_peer,
         });
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, peer_app).await.ok();
-    });
-
-    // Build a FederationConfig that targets the mock.
-    let peer_url = format!("http://{addr}");
+    // #3705 — the mock speaks TLS (test PKI); a plaintext peer is refused by
+    // `FederationConfig::build`, so the config trusts the test CA instead.
+    let peer_url = crate::test_support::spawn_tls_mock(peer_app).await;
     let fed = crate::federation::FederationConfig::build(
         2, // W=2 — local + 1 peer
         &[peer_url],
         std::time::Duration::from_secs(2),
         None,
         None,
-        None,
+        Some(crate::test_support::tls_test_pki().ca_pem.as_path()),
         "ai:bulk-test".to_string(),
         None,
     )
@@ -3417,7 +3411,7 @@ async fn subscribe_accepts_localhost_loopback() {
         .with_state(test_app_state(state));
 
     let body = serde_json::json!({
-        "url": "http://localhost/webhook",
+        "url": "https://localhost/webhook",
         "events": "*",
         "secret": "test-sub-secret",
     });
@@ -7951,7 +7945,7 @@ async fn h8b_subscribe_namespace_shape_synthesizes_url() {
         v["url"]
             .as_str()
             .unwrap()
-            .starts_with("http://localhost/_ns/"),
+            .starts_with("https://localhost/_ns/"),
         "expected synthetic URL, got {}",
         v["url"],
     );
@@ -8131,7 +8125,7 @@ async fn h8b_unsubscribe_by_agent_and_namespace() {
         crate::subscriptions::insert(
             &lock.0,
             &crate::subscriptions::NewSubscription {
-                url: "http://localhost/_ns/alice/demo",
+                url: "https://localhost/_ns/alice/demo",
                 events: "*",
                 secret: None,
                 namespace_filter: Some("demo"),
@@ -8389,7 +8383,15 @@ async fn h8b_notify_happy_path_creates_message() {
     )
     .unwrap();
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].title, "Hi bob");
+    // #3639 — the stored title is `<subject> [<id8>]` (unique per delivery,
+    // so a repeated subject can never overwrite); the subject itself is
+    // carried verbatim in metadata.
+    assert!(
+        rows[0].title.starts_with("Hi bob ["),
+        "stored title is the subject plus the row-id tag: {}",
+        rows[0].title
+    );
+    assert_eq!(rows[0].metadata["subject"], "Hi bob");
 }
 
 /// `target_agent_id` is a required field on `NotifyBody`. Omitting it
@@ -8615,6 +8617,8 @@ async fn h8b_get_inbox_returns_pending_after_notify() {
     let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(v["count"], 1);
     let msg = &v["messages"][0];
+    // #3639 — a caller reads the SUBJECT in `title` (the unique stored form is
+    // internal): this assertion is the head's, unchanged.
     assert_eq!(msg["title"], "ping");
     // `from` is the resolved sender — `handle_notify` calls
     // `identity::resolve_agent_id(None, mcp_client)` which synthesizes the
@@ -8626,14 +8630,15 @@ async fn h8b_get_inbox_returns_pending_after_notify() {
         from == "alice" || from.starts_with("ai:alice@"),
         "unexpected sender: {from}",
     );
-    assert_eq!(msg["read"], false);
+    // #3730 — no `read` field: the inbox carries no read marker.
+    assert!(msg.get("read").is_none(), "got {msg}");
 }
 
-/// `unread_only=true` filter omits already-read messages. We bump
-/// `access_count` directly on the seeded row so the filter has
-/// something to skip.
+/// #3730 — `unread_only=true` narrows NOTHING: a touched row (`access_count`
+/// bumped, the old "read" marker) is still listed, because a touch is not a
+/// handling. Was `h8b_get_inbox_unread_only_filter_excludes_read`.
 #[tokio::test]
-async fn h8b_get_inbox_unread_only_filter_excludes_read() {
+async fn h8b_get_inbox_unread_only_still_lists_touched_rows_3730() {
     let state = test_state();
     // Seed two messages — one read, one unread — directly via db::insert.
     {
@@ -8726,8 +8731,11 @@ async fn h8b_get_inbox_unread_only_filter_excludes_read() {
         .await
         .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(v["count"], 1);
-    assert_eq!(v["messages"][0]["title"], "unread");
+    assert_eq!(
+        v["count"], 2,
+        "both rows list: touched is not handled; got {v}"
+    );
+    assert_eq!(v["unread_count"], 2);
     assert_eq!(v["unread_only"], true);
 }
 
@@ -11028,7 +11036,6 @@ async fn h8d_spawn_mock_peer(
     behaviour: H8dPeerBehaviour,
 ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use tokio::net::TcpListener;
 
     let count = Arc::new(AtomicUsize::new(0));
     let count_for_peer = count.clone();
@@ -11080,12 +11087,9 @@ async fn h8d_spawn_mock_peer(
             count: count_for_peer,
             behaviour,
         });
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.ok();
-    });
-    (format!("http://{addr}"), count)
+    // #3705 — the mock speaks TLS (test PKI); plaintext peers are refused.
+    let base = crate::test_support::spawn_tls_mock(app).await;
+    (base, count)
 }
 
 #[derive(Clone, Copy)]
@@ -11117,7 +11121,8 @@ fn h8d_app_state_with_fed(db: Db, peer_urls: Vec<String>, w: usize, timeout_ms: 
         std::time::Duration::from_millis(timeout_ms),
         None,
         None,
-        None,
+        // #3705 — the H8d mocks speak TLS; the client trusts the test CA.
+        Some(crate::test_support::tls_test_pki().ca_pem.as_path()),
         "ai:h8d-test".to_string(),
         None,
     )
@@ -12323,18 +12328,37 @@ async fn http_health_route_returns_200_with_status_ok() {
     // straight from the AppState wiring — both false in this test.
     assert_eq!(v["embedder_ready"], false);
     assert_eq!(v["federation_enabled"], false);
+    // #3659 — webhook delivery-audit persistence rides /health as a signal
+    // object, never a bare number.
+    let wa = &v[super::transport::HEALTH_KEY_WEBHOOK_AUDIT_DELIVERY];
+    assert_eq!(wa["state"], "available", "signal object expected: {v}");
+    assert!(wa["value"]["failed_total"].is_u64());
+    assert!(wa["value"]["failed_by_stage"]["status_no_row"].is_u64());
+    assert!(wa["value"]["actionable"].is_boolean());
 }
 
 // ---- prometheus_metrics happy path ----
 
 #[tokio::test]
 async fn http_prometheus_metrics_returns_text_body() {
+    // ISOLATION FIX — `/metrics` renders the PROCESS-GLOBAL prometheus registry
+    // (`crate::metrics::render`), which every prior federation/subscription test
+    // in this lib binary has populated. Reading the live body here asserted on
+    // test ORDERING, not the endpoint, and in a full-binary run the accumulated
+    // per-peer #3654 series pushed the body past the `64 * 1024` `to_bytes` cap
+    // (LengthLimitError). The cap is DELIBERATELY NOT RAISED: a larger number
+    // would still be a property of whatever ran before this test. Instead:
+    // (1) assert the ROUTE answers 200 with the exposition content-type WITHOUT
+    //     reading the shared body (no ordering / size coupling); and
+    // (2) assert the exposition SHAPE by calling `crate::metrics::render()`
+    //     DIRECTLY — the same function the endpoint serves as its body — so the
+    //     assertion lands on OUR renderer, not on a fresh test-owned Registry
+    //     (which would only exercise the prometheus crate).
     let state = test_state();
     let app = Router::new()
         .route("/api/v1/metrics", axum_get(prometheus_metrics))
-        // v1.0.0 #2621 — prometheus_metrics now takes `State<AppState>` so the
-        // cold prime can dispatch on the active backend; wrap the `Db` in a
-        // test AppState (the list_namespaces test pattern).
+        // v1.0.0 #2621 — prometheus_metrics takes `State<AppState>` so the cold
+        // prime can dispatch on the active backend.
         .with_state(test_app_state(state));
     let resp = app
         .oneshot(
@@ -12346,12 +12370,30 @@ async fn http_prometheus_metrics_returns_text_body() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    // Prometheus exposition starts with a `#` comment line; whatever
-    // the renderer emits, we just confirm the body is non-empty.
-    let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
-        .await
-        .unwrap();
-    assert!(!bytes.is_empty());
+    assert_eq!(
+        resp.headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("text/plain; version=0.0.4; charset=utf-8"),
+    );
+
+    // Assert the exposition SHAPE on OUR OWN render path. `crate::metrics::render`
+    // is exactly what `prometheus_metrics` serves as the body
+    // (src/handlers/transport.rs). Calling it directly has no HTTP body and no
+    // `to_bytes` cap, so the size / test-ordering coupling that broke the old
+    // assertion is structurally gone — and, unlike a fresh test-owned Registry
+    // (which can only fail if the prometheus crate itself breaks and so pins
+    // nothing of ours), this pins the renderer THIS endpoint uses: it fails for
+    // any defect that empties or malforms our process-global exposition.
+    let rendered = crate::metrics::render();
+    assert!(
+        !rendered.is_empty(),
+        "render() must produce a non-empty exposition body"
+    );
+    assert!(
+        rendered.contains("# TYPE "),
+        "render() output must carry at least one Prometheus TYPE line"
+    );
 }
 
 // ---- list_namespaces with seeded data ----
@@ -12594,6 +12636,102 @@ async fn http_delete_memory_invalid_id_returns_400() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+/// #3730 — the inbox's delete RETENTION POLICY on the sqlite HTTP arm: a
+/// message in the recipient's inbox is ARCHIVED (restorable) and the response
+/// says so; an ordinary row deleted the same way is ERASED and the response
+/// says that too. A caller never has to consult documentation to know
+/// whether its data still exists.
+#[tokio::test]
+async fn http_delete_reports_archived_for_inbox_rows_and_erased_otherwise_3730() {
+    let state = test_state();
+    let inbox_ns = crate::inbox_namespace("alice");
+    {
+        let lock = state.lock().await;
+        for (id, ns, meta) in [
+            (
+                "aaaa3730aaaa3730aaaa3730aaaa3730",
+                inbox_ns.as_str(),
+                json!({"agent_id": "bob", "target_agent_id": "alice", "notify": true}),
+            ),
+            (
+                "bbbb3730bbbb3730bbbb3730bbbb3730",
+                "notes-3730",
+                json!({"agent_id": "alice"}),
+            ),
+        ] {
+            let mem = Memory {
+                id: id.to_string(),
+                namespace: ns.to_string(),
+                title: "row".into(),
+                content: "content".into(),
+                metadata: meta,
+                ..Memory::default()
+            };
+            db::insert(&lock.0, &mem).unwrap();
+        }
+    }
+    let app = Router::new()
+        .route(
+            "/api/v1/memories/{id}",
+            axum::routing::delete(delete_memory),
+        )
+        .with_state(test_app_state(state.clone()));
+    let delete = |id: &'static str| {
+        let app = app.clone();
+        async move {
+            let resp = app
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri(format!("/api/v1/memories/{id}"))
+                        .method("DELETE")
+                        .header("x-agent-id", "alice")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(resp.into_body(), crate::TEST_BODY_READ_CAP)
+                .await
+                .unwrap();
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+        }
+    };
+    let inbox = delete("aaaa3730aaaa3730aaaa3730aaaa3730").await;
+    assert_eq!(inbox["deleted"], true, "{inbox}");
+    assert_eq!(
+        inbox["archived"], true,
+        "inbox message is archived: {inbox}"
+    );
+    let note = delete("bbbb3730bbbb3730bbbb3730bbbb3730").await;
+    assert_eq!(note["deleted"], true, "{note}");
+    assert_eq!(note["archived"], false, "ordinary row is erased: {note}");
+
+    let lock = state.lock().await;
+    let archived: Vec<String> = lock
+        .0
+        .prepare("SELECT id FROM archived_memories WHERE id LIKE '%3730%'")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        archived,
+        vec!["aaaa3730aaaa3730aaaa3730aaaa3730".to_string()],
+        "exactly the inbox row is archived"
+    );
+    let live: i64 = lock
+        .0
+        .query_row(
+            "SELECT COUNT(*) FROM memories WHERE id LIKE '%3730%'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(live, 0, "both rows left the live set");
 }
 
 #[tokio::test]
@@ -13384,7 +13522,7 @@ async fn insert_test_memory_with_metadata(
 #[tokio::test]
 async fn http_export_memories_screens_forbidden_class_row() {
     // v1.0.0 G28 (#1838) — the sqlite `export_memories` branch must run the
-    // corpus through `screen_exported_memories`: a producer-tagged biometric
+    // corpus through the export confidentiality screen: a producer-tagged biometric
     // embedding row is DROPPED from the export artifact, a signed
     // `export.forbidden_class_refused` row is emitted (sqlite path holds the
     // audit connection), and the clean rows still export.
@@ -15409,7 +15547,7 @@ async fn http_subscribe_with_explicit_url_succeeds() {
     // #901: matching X-Agent-Id required for body.agent_id.
     let body = serde_json::json!({
         "agent_id": "ai:webhook-user",
-        "url": "http://localhost:9999/webhook",
+        "url": "https://localhost:9999/webhook",
         "events": "store",
         "secret": "shhh",
         "namespace_filter": "team",
@@ -15431,7 +15569,7 @@ async fn http_subscribe_with_explicit_url_succeeds() {
         .await
         .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(v["url"], "http://localhost:9999/webhook");
+    assert_eq!(v["url"], "https://localhost:9999/webhook");
     assert_eq!(v["events"], "store");
 }
 

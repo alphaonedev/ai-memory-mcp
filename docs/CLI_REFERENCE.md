@@ -80,6 +80,7 @@ never downgrades.
 | `--valid-until` | RFC3339 | — | #2258/#1834 claim-bitemporal VALID-time end bound; half-open `[valid_from, valid_until)`. Stays updatable via `ai-memory update --valid-until`. |
 | `--entity-id` | string | — | QW-2 persona binding; required with `--kind persona`. |
 | `--sign` | bool | `false` | **#626 Layer-3** — sign the write with the resolved agent's local Ed25519 keypair so the stored row is *attested* (`attest_level = "agent_attested"`) rather than merely *claimed*. Requires a `<agent_id>.priv` under the key directory (`AI_MEMORY_KEY_DIR` or the platform default) and a matching bound public key (`ai-memory agents bind-key`). Without `--sign`, the CLI `store` surface is **permissive by default** (operator-as-actor, #1985) — an unsigned write lands *claimed*, not rejected. It is rejected only when the operator has forced strict enforcement via `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1` (or `=true`); see the env-var table above for the full surface-scoped default. |
+| `--allow-claimed` | bool | `false` | **#3409** — with `--sign`, accept a `claimed` write when no bound public key can verify the signature (the agent has a local keypair but its public key is not bound in this store); prints a one-line WARN on stderr naming the missing binding. Without it, `--sign` REFUSES (non-zero exit) rather than silently storing an unsigned row, and the refusal names the fix: `ai-memory agents register --agent-id <id> --agent-type <type> && ai-memory agents bind-key --agent-id <id> --pubkey "$(ai-memory identity export-pub --agent-id <id>)"`. |
 | `--write-v2` | path | — | v1.0.0 crypto-core (#1942/#1941) — path to a JSON `write_v2` presentation envelope (certified sub-key signature over the v2 CBOR-array pre-image). Takes precedence over `--sign`; on success stamps `agent_attested`. An invalid/forged envelope is REJECTED. See `docs/attestation.md` §"v2". |
 | `--capability` | string | — | v0.9.0 G10.1 (#1827) — macaroon capability token (`cap1:...`) that may lift a governance `Pending` (human court) to Allow within its caveats. An explicit operator/rule-derived `Deny` is terminal and is never token-flippable (#3111). Inert unless `[capabilities].enabled`. |
 
@@ -208,7 +209,7 @@ live at delete time, so a restore returns the content you deleted.
 
 | Flag | Applies to | Notes |
 |---|---|---|
-| `--hard` | `delete` | Skip the archive copy and destroy the row irreversibly (the pre-v1.0.0 behaviour, now an explicit opt-in). There is no recovery afterwards short of a `backup`. |
+| `--hard` | `delete` | Skip the archive copy and destroy the row irreversibly (the pre-v1.0.0 behaviour, now an explicit opt-in). There is no recovery afterwards short of a `backup`. On an inbox message (`_inbox/<agent>`) it prints one warning line naming what is being destroyed — the record of what that agent was told — and proceeds ([#3730](https://github.com/alphaonedev/ai-memory-mcp/issues/3730)); to DRAIN an inbox use plain `delete`, which archives. |
 | `--capability <TOKEN>` | `delete` | v0.9.0 G10.1 macaroon token; inert unless `[capabilities].enabled`. |
 | `--capability-file <PATH>` | `delete` | Non-argv `cap1:` token file (`0600`); conflicts with `--capability`. |
 
@@ -401,7 +402,7 @@ API key comes from the `api_key` field in `config.toml`).
 |------|------|---------|-------|
 | `--host` | string | `127.0.0.1` | |
 | `--port` | u16 | `9077` | |
-| `--tls-cert`/`--tls-key` | path | — | Enable HTTPS. rustls, no OpenSSL. |
+| `--tls-cert`/`--tls-key` | path | — | Operator-supplied in-process HTTPS material (rustls, no OpenSSL): full chain PEM + PKCS#8 key, SANs covering every bind host. TLS itself is REQUIRED since v1.0.0 (#3705, "only encrypted data in transit"). On a SINGLETON the flags are optional — first boot generates a local CA + server certificate under `<key_dir>/tls/` and renews it (#3709 item 1). On a FLEET-shaped deployment (production / federated / hive, per #3700) they are REQUIRED: enterprise PKI is the first-class path and a fleet without operator material is refused (3x7 audit ruling — an unmanaged CA in an enterprise estate is an audit finding). A plaintext listener is refused everywhere, loopback included. |
 | `--mtls-allowlist` | path | — | SHA-256 cert-fingerprint allowlist (requires `--tls-cert`). |
 | `--shutdown-grace-secs` | u64 | `30` | SIGINT grace period. |
 | `--quorum-writes` | usize | `0` | v0.7 federation: W (peer acks required). `0` = federation off. |
@@ -414,10 +415,36 @@ API key comes from the `api_key` field in `config.toml`).
 | `--store-url` | URL | — | SAL backend selector (`postgres://…` under `--features sal-postgres`). **Mutually exclusive with `--db`** — passing both is rejected at startup with a clear error. A userinfo password should be supplied via `AI_MEMORY_STORE_URL` (owner-only environment) or `AI_MEMORY_STORE_URL_FILE` (a `0600` file) rather than on argv, which is exposed via `/proc/<pid>/cmdline` and `ps auxww` to any local UID (#1927). |
 
 ```bash
+# singleton, zero-config: first boot generates <key_dir>/tls/{local-ca.pem,local-ca.key,server.pem,server.key}
+ai-memory serve
+# declared non-singleton shape ([deployment] shape = team / production / federated / hive):
+# enterprise PKI is REQUIRED —
 ai-memory serve --host 0.0.0.0 --port 9077 \
   --tls-cert /etc/ai-memory/cert.pem \
   --tls-key /etc/ai-memory/key.pem
 ```
+
+**Zero-config TLS (#3709 item 1) — singleton shape only.** On a singleton
+with no `--tls-cert`/`--tls-key` the daemon issues itself a certificate
+from an installation-local CA kept under
+`<key_dir>/tls/` (`local-ca.pem`, `local-ca.key` 0600, `server.pem`,
+`server.key` 0600; directory 0700): the CA lives 3650 days, the leaf 90 days
+and is re-issued inside a 30-day window at boot and by a daily in-daemon
+task that hot-reloads the listener. A renewal failure is loud and never
+downgrades to plaintext. Clients trust the local CA explicitly —
+`curl --cacert <key_dir>/tls/local-ca.pem https://127.0.0.1:9077/…` — and the
+bundled clients (`doctor --remote`, the MCP forwarder) do so automatically.
+The local CA is NEVER used to trust a federation peer: peer trust stays
+explicit (`--quorum-ca-cert`, `AI_MEMORY_FED_PEER_FINGERPRINTS`,
+`--mtls-allowlist`; the #2448 posture is unchanged). **A deployment whose
+declared shape is not `singleton` gets no local CA at all**: `serve` refuses
+without operator material. The declaration decides — a node whose signals
+or agent registry look like a fleet is WARNED by the #3700 detector, never
+re-postured (promotion is an operator act) — see
+`docs/SECURITY.md` "Bring your own certificate". The `ai-memory tls
+init|import|renew` and `ai-memory db check-tls` verbs are v1.0.1 (#3709 items 2-4); until they ship the refusals name only what exists — `--tls-cert/--tls-key`, `sslmode=verify-full&sslrootcert=<ca.crt>`, the files under `<key_dir>/tls/` — and are
+#3709 items 2–4 (a separate branch); until they land, first-boot generation
+and `--tls-cert`/`--tls-key` are the two paths.
 
 ### `sync`, `sync-daemon`
 
@@ -1129,6 +1156,50 @@ caller id and whether a signing key for THAT id is enrolled.
 Exit codes: `0` healthy, `1` warning (only when `--fail-on-warn`), `2`
 critical.
 
+**`Deployment shape detector (#3700)` section** — right after the
+declared-shape section (#3714) in the default local report, before the
+database open, so a node configured like a fleet but declared `singleton`
+is reported unprompted at the top. Facts: `declared_shape`,
+`observed_floor` (`singleton` / `team` / `federated`, the least demanding
+shape the present signals allow), `signals_present`,
+`signals_unobservable` (argv signals are unobservable from doctor; the
+store is unobservable until it opens), `registered_agents` (folded in from
+the store once the read-only connection is open), `undeclared_promotion`,
+`promotion_line` (the exact `[deployment] shape = "…"` line to declare, or
+`none`), `posture`, `posture_origin` (`explicit` / `shape_floor` /
+`compiled_default`), `protections_off` + `protections_off_list` (the
+pinned knobs not in force), and `boot_verdict` (`boots`, `boots — signals
+exceed the declared shape …`, `boots UNPROTECTED …`, or `REFUSES …`).
+Critical when the node is an undeclared fleet running `standard` or a
+hardened declared shape has a knob below its floor; Warning for an
+undeclared promotion under an explicit hardened posture; Info otherwise.
+Detection never re-postures — promotion is an operator act. This is the
+pre-upgrade detector: run it before upgrading to learn what will refuse.
+
+**`Transit encryption (#3705)` section** — THIRD in the default local
+report, right after the deployment shape: every transit surface versus the
+"only encrypted data in transit" mandate. Facts: `mandate`, `listener_tls`
+(operator `--tls-cert`/`--tls-key` are argv and unobservable from doctor, or
+the local certificate under `<key_dir>/tls`; a bind without either is
+refused), `local_tls_material` (singleton: `absent` — first boot generates it — /
+`present, <n> day(s) to expiry, SANs: …` / `INSIDE the renewal window` /
+`EXPIRED — REFUSES at next boot`; fleet: `absent — enterprise PKI
+required … REFUSES boot` / `present but LOCALLY MINTED — … audit finding;
+REFUSES at next boot`; `unreadable`), `require_tls_token` (`unset
+(floor)` / `affirmed` / `downgrade requested … — REFUSES boot` /
+`unrecognised … — REFUSES boot`), `downgrade_paths_armed` (the removed
+`AI_MEMORY_ALLOW_PLAINTEXT_NONLOOPBACK` / `AI_MEMORY_FED_ALLOW_PLAINTEXT_PEERS`
+hatches, each refusing boot when set), `mcp_federation_forward_url`,
+`store_url_sslmode` (`sqlite` / `postgres: sslmode=verify-full pinned` /
+`… NOT pinned — REFUSES at connect`), `webhook_plaintext_targets` (folded in
+from the store once open; refused at dispatch and at create),
+`llm_egress_plaintext` (DETECTED only — model-server egress awaits the
+operator's ruling) and `boot_verdict`. Critical when anything will refuse or
+a plaintext webhook target is stored, the local certificate is expired, or
+a declared non-singleton shape lacks enterprise PKI;
+Warning for plaintext model-server egress or a leaf inside its renewal
+window; Info otherwise. Doctor never refuses.
+
 ```bash
 ai-memory doctor
 ai-memory doctor --json | jq '.sections[] | select(.severity != "ok")'
@@ -1245,6 +1316,36 @@ which can echo the offending source); `4` unreadable.
 ```bash
 ai-memory config check
 ai-memory config check --file /root/.config/ai-memory/config.toml
+```
+
+### `config show` (v1.0.0 #3714, #3715)
+
+Without flags: the shape-derived requirement table for the declared
+`[deployment] shape` (#3714). With `--effective`: the configuration **as
+the daemon's boot loader accepts it** — the same funnel `serve` boots
+through, so an unknown or removed key refuses here with exit `78`
+(`EX_CONFIG`) and the same text — rendered as TOML with every
+secret-bearing value masked (#3432 funnel). Every top-level setting is
+optional, so a setting absent from the file is absent here and takes its
+compiled default inside its own accessor at use time.
+
+| Flag | Type | Default | Notes |
+|------|------|---------|-------|
+| `--file PATH` | path | resolved `~/.config/ai-memory/config.toml` | File to render. |
+| `--effective` | bool | — | Print the loader-accepted document, secrets masked. |
+| `--provenance` | bool | — | With `--effective`: one line per accepted key — `<key> = <value>  # file <path>` or `<key> = (unset: the compiled default applies at use)  # compiled-default` — each deprecated key annotated `# DEPRECATED since <release> — use <replacement>; removal <scheduled for X | not scheduled>`; then the `AI_MEMORY_*` variables present in the process, **names only** (each is consulted by its own setting at use time; they are not merged into the document). |
+
+Deprecation lifecycle (#3715 item 3): `src/config/deprecated_keys.rs` is
+the table — key, replacement, deprecated-in, removed-in. The boot loader
+WARNs once per process for each deprecated key (the value still applies)
+and **refuses** a key whose removal release the running version has
+reached, naming the replacement — never the generic unknown-key text.
+The v1 flat keys (`llm_model`, `ollama_url`, …) are deprecated since
+0.7.0 with removal not scheduled.
+
+```bash
+ai-memory config show --effective
+ai-memory config show --effective --provenance --file /etc/ai-memory/config.toml
 ```
 
 ## v0.7 feature-gated commands
@@ -1426,40 +1527,58 @@ Pair with `ai-memory doctor` (section "Embeddings Reachability
 (#1598)") to verify the target backend is reachable and authenticated
 *before* a long re-embed run.
 
-### `reown` — re-stamp `metadata.agent_id` ownership (#1720 B2)
+### `reown` — re-stamp `metadata.agent_id` ownership (#1720 B2, #3124)
 
-Rewrites the `metadata.agent_id` owner stamp on every memory in a
-namespace to `<agent_id>`. This is the operational tool to establish
-**durable ownership** before turning on enforced-multi-agent
-`scope=private` reads (#1720): the owner-keyed visibility filter (A)
-drops rows owned by a different agent, so an operator who enables it
-against a namespace of legacy / foreign-owned rows would lock
-themselves out of their own data. `reown` claims the namespace first.
+Rewrites the `metadata.agent_id` owner stamp on memories in a namespace
+(or every namespace) to `<agent_id>`. This is the operational tool to
+establish **durable ownership** before turning on enforced-multi-agent
+`scope=private` reads (#1720) or `AI_MEMORY_UNSTAMPED_MUTATION=refuse`
+(#3124): the owner-keyed visibility filter drops rows owned by a different
+agent, and the `refuse` posture refuses a caller-scoped mutation of a row
+with no owner, so an operator who enables either against legacy rows would
+lock themselves out of their own data. `reown` claims the rows first;
+`ai-memory doctor` (section `Unstamped owners (#3124)`) counts the rows
+that carry no owner.
 
 ```bash
-ai-memory reown --namespace prod --to alice --dry-run   # count, no writes
-ai-memory reown --namespace prod --to alice             # re-own owned rows
-ai-memory reown --namespace prod --to alice --claim-unowned --json
+ai-memory reown --namespace prod --to alice --only-unowned --dry-run   # count first
+ai-memory reown --namespace prod --to alice --only-unowned             # adopt unowned rows only
+ai-memory reown --all-namespaces --to alice --only-unowned --dry-run   # every namespace
+ai-memory reown --namespace prod --to alice                            # same as --only-unowned (the default, #3694)
+ai-memory reown --namespace prod --to alice --take-owned --dry-run     # plan taking rows from their owners
+ai-memory reown --namespace prod --to alice --take-owned --yes         # take them (confirmed)
 ```
 
 | Flag | Notes |
 |---|---|
-| `--namespace <ns>` | The namespace whose memories are re-owned. **EXACT** match — the subtree is NOT included. |
+| `--namespace <ns>` | The namespace whose memories are re-owned. **EXACT** match — the subtree is NOT included. Required unless `--all-namespaces`. |
+| `--all-namespaces` | Sweep every namespace (conflicts with `--namespace`). |
 | `--to <agent_id>` | The new owner stamped onto `metadata.agent_id`. Validated against the wire agent_id shape; a malformed value is rejected before any write. |
-| `--dry-run` | Count the matched rows and print the plan WITHOUT writing. |
-| `--claim-unowned` | ALSO re-own rows with an absent / empty `metadata.agent_id` (the legacy "owned by nobody" class). Without it, only rows with an existing owner are rewritten. |
-| `--json` | Emit the machine-readable `{matched, rewritten, dry_run}` report instead of the human summary. |
+| `--dry-run` | Count the matched rows and print the plan WITHOUT writing. Run it first. |
+| `--only-unowned` | Re-own ONLY rows with no ownership stamp (missing / null / empty `metadata.agent_id`); a row that has an owner is never touched. The remedy for the doctor census, and the **default** since #3694. |
+| `--take-owned` | TAKE every row in scope that already has an owner (#3694). Moves rows off other agents; without `--dry-run` it requires `--yes`, otherwise it refuses and names the row count and the owners it would take, writing nothing. Conflicts with `--only-unowned`. |
+| `--yes` | Confirm a `--take-owned` run. |
+| `--claim-unowned` | **Removed (#3694)** — a hard error naming the replacements. It selected **every** row in scope, owned rows included, under a name that reads as the narrow action. Use `--only-unowned` (the default) or `--take-owned --yes`. |
+| (default) | Without a selection flag, only rows that have **no** owner are rewritten (#3694: the narrowest action is what you get by typing the least). |
+| `--store-url <postgres://…>` | Re-own on a Postgres store. The `AI_MEMORY_STORE_URL_FILE` / `AI_MEMORY_STORE_URL` channels are honoured with the same precedence as `curator` / `serve`. |
+| `--json` | Emit the machine-readable `{matched, rewritten, dry_run, select, owners, changes, changes_omitted}` report instead of the human summary. `owners` maps each prior owner to the rows taken from it; `changes` lists the first 200 rows moved with the owner each came from and `changes_omitted` counts the rest (#3694). |
 
-Only `metadata.agent_id` is touched (a single-key `json_set`); every
-other metadata key is preserved and the `agent_id_idx` generated column
-auto-reprojects the new owner. **The `ai-memory reown` CLI verb operates
-on the local SQLite `--db` only. On a Postgres-served deployment
-(`AI_MEMORY_STORE_URL=postgres://…`, the `AI_MEMORY_STORE_URL_FILE`
-channel, or `--store-url`) it REFUSES rather than phantom-write to a
-throwaway SQLite file the served store never reads — re-own via the HTTP
-daemon (`ai-memory serve`) instead ([#2572](https://github.com/alphaonedev/ai-memory-mcp/issues/2572)).**
-See the §"Agent Identity" durable-stamp posture in `CLAUDE.md` for why
-this precedes enabling enforced reads.
+Only `metadata.agent_id` is touched (a single-key `json_set` /
+`jsonb_set`); every other metadata key is preserved and the
+`agent_id_idx` generated column re-projects the new owner. Every
+rewritten row gets `version + 1` and a fresh `updated_at`, and each live
+run appends ONE `memory.reowned` signed-chain row (scope, new owner,
+selection, count — never content) naming the operator, in the same
+transaction; the write is refused under record-stop. **Operator-only:**
+there is no MCP or HTTP surface, and the audit actor is the resolved
+principal (`--agent-id` / `AI_MEMORY_AGENT_ID` / the durable synthesised
+default) — an anonymous principal is refused. **Both backends:** on a
+`sal` build a `postgres://` store routes through the SAL; the local SQLite
+leg keeps the [#2572](https://github.com/alphaonedev/ai-memory-mcp/issues/2572)
+funnel, so a build without `sal` still REFUSES a Postgres store rather
+than phantom-write to a throwaway SQLite file. See the §"Agent Identity"
+durable-stamp posture in `CLAUDE.md` for why this precedes enabling
+enforced reads.
 
 ### `identity` — Ed25519 keypair management (H-track)
 
@@ -1473,7 +1592,16 @@ this precedes enabling enforced reads.
 Global flag: `--key-dir <PATH>` overrides the key storage directory
 (default: platform config dir; `AI_MEMORY_KEY_DIR` env honoured).
 
-`ai-memory keys prune` reports public-only peer/guardian files as `enrolled_public_keys` and retains them unless both `--include-public-only` and `--yes` are supplied (see [orphan key files](ADMIN_GUIDE.md#orphan-key-files)).
+### `keys` — key roles, the recovery escrow, pruning (#3717)
+
+| Subcommand | Notes |
+|---|---|
+| `ai-memory keys init [--host <bind-host>] [--dry-run] [--recovery-key-out <FILE>]` | Mint every ABSENT key role the declared shape needs (recovery anchor, identity, daemon signer, at-rest wrap key WITH its escrow, local TLS on the singleton shape, capability owner), REPAIR a role whose private half survives, and REFUSE before any write when a private half is lost. `--recovery-key-out` mints the deployment recovery keypair: private half to that file (created 0600 — move it off-node), public half enrolled as `recovery.x25519.pub`. Without an enrolled recovery key the at-rest role is reported `CANNOT MINT HERE` rather than minted bare. Prints the BACK UP and DISTRIBUTE lists. |
+| `ai-memory keys status` | The typed state of every role (`present` / `MISSING` / `PARTIAL (recoverable)` / `PARTIAL (private half LOST)` / `PARTIAL (unreadable)` / `operator-supplied`), the plan `keys init` would follow, and the fix per finding. Writes nothing. `--json` carries the same table. |
+| `ai-memory keys recover --recovery-key <FILE> [--agent <id>]` | Restore a lost `<agent>.x25519.priv` from `<agent>.x25519.escrow` with the off-node recovery private file (a 0600 file channel, never argv). Refuses a wrong key, a live key, an escrow of another agent or generation. Sealed rows are untouched and open again once the key is back. |
+| `ai-memory keys prune [--dry-run] [--include-public-only] [--yes]` | Orphan key-file hygiene (below). |
+
+`ai-memory keys prune` reports public-only peer/guardian files as `enrolled_public_keys` and retains them unless both `--include-public-only` and `--yes` are supplied (see [orphan key files](ADMIN_GUIDE.md#orphan-key-files)); the recovery anchor is protected like the daemon, operator and owner keys.
 
 ### `verify-signed-events-chain` — V-4 closeout verifier
 
@@ -1545,8 +1673,8 @@ twin (byte-equal envelopes; `--json` for the raw envelope):
 | `capture-turn` | `memory_capture_turn` | #3587 U4 — L4 host-volunteered turn capture (CLI twin + Claude Code `Stop` hook sink). Reads a `memory_capture_turn` body or a host `Stop` payload on stdin; `--host-turn-index auto` derives `MAX+1` inside the write transaction; `--quiet` never fails. `refuse_pg_store`. |
 | `reflect` | `memory_reflect` | Synthesize a reflection over source memories (CLI dispatcher runs unsigned / no LLM dedup — use MCP/HTTP for those). |
 | `subscribe` / `unsubscribe` / `list-subscriptions` | `memory_subscribe` / `memory_unsubscribe` / `memory_list_subscriptions` | Webhook subscription CRUD. `created_by` / the #870/#872 owner gate is the global `--agent-id` ([#3433](https://github.com/alphaonedev/ai-memory-mcp/issues/3433)). |
-| `subscription-replay` / `subscription-dlq-list` | `memory_subscription_replay` / `memory_subscription_dlq_list` | Webhook DLQ replay + inspection. |
-| `notify` / `inbox` | `memory_notify` / `memory_inbox` | Agent-to-agent inbox send / read. Sender/owner is the global `--agent-id`; a subcommand `inbox --agent-id` that disagrees is refused ([#3433](https://github.com/alphaonedev/ai-memory-mcp/issues/3433)). |
+| `subscription-replay` / `subscription-dlq-list` | `memory_subscription_replay` / `memory_subscription_dlq_list` | Webhook DLQ replay + inspection. Each replayed event carries `delivery_status`: `ack` / `failed` are terminal; **`pending` means no terminal status was recorded — including a delivery that settled but whose terminal status write failed** ([#3659](https://github.com/alphaonedev/ai-memory-mcp/issues/3659)); the field alone cannot separate in-flight from lost, and a row still `pending` past the 60 s settle window is the lost case (`doctor` warns; the reliable write is [#3735](https://github.com/alphaonedev/ai-memory-mcp/issues/3735)). |
+| `notify` / `inbox` | `memory_notify` / `memory_inbox` | Agent-to-agent inbox send / read. Sender/owner is the global `--agent-id`; a subcommand `inbox --agent-id` that disagrees is refused ([#3433](https://github.com/alphaonedev/ai-memory-mcp/issues/3433)). Every `notify` is a new inbox row — a repeated title never overwrites or re-attributes an earlier message; rows carry the stored unique `title` and the caller's `subject` ([#3639](https://github.com/alphaonedev/ai-memory-mcp/issues/3639)). **The inbox is a queue: `inbox` lists what you have not yet handled, and you drain it with `ai-memory delete <id>` once a message is handled** ([#3730](https://github.com/alphaonedev/ai-memory-mcp/issues/3730)). Plain `delete` ARCHIVES an inbox message (restorable, `archive list`); `delete --hard` ERASES it and destroys the record of what the agent was told — it warns, then proceeds. Reads never mark anything; there is no read marker (`access_count` counts touches). `--unread-only` is accepted for compatibility and narrows nothing. |
 | `ingest-multistep` | `memory_ingest_multistep` | Form 3 multi-step ingest (CLI passes no LLM handler; tier-locked advisory on every tier). |
 | `entity-register` / `entity-get-by-alias` | `memory_entity_register` / `memory_entity_get_by_alias` | Entity registry. CLI errors name `--canonical-name`, not MCP `title` ([#3414](https://github.com/alphaonedev/ai-memory-mcp/issues/3414)). |
 | `dependents-of-invalidated` | `memory_dependents_of_invalidated` | Memories citing invalidated KG edges. |
@@ -1824,7 +1952,8 @@ A Unix-domain-socket switch (mode **0600**, inside an owner-only **0700**
 directory, peer credentials checked with `SO_PEERCRED` on Linux and
 `LOCAL_PEERPID` + `getpeereid` on macOS) that pushes a bounded, **content-free
 wake hint** to agents on this host, so a recipient learns "you have inbox row X"
-in about a millisecond instead of on its next poll.
+with a millisecond design target instead of waiting for its next poll.
+Acceptance-latency measurement #3473 remains open.
 
 **It carries no message bodies.** The v1 protocol has no `request` / `reply` /
 `notify` kinds at all; the largest routed payload is a 256-byte
@@ -2090,6 +2219,21 @@ the same key directory, or whose window has passed, is refused BEFORE the socket
 is dialled. The socket itself is checked the way the hub hardened it: an
 owner-only (0700) directory holding an owner-only (0600) socket, both owned by
 the caller.
+
+For enrolment and a complete shell gate, see [Integrate any agent](a2a-integration.md).
+
+### `notify` — send a durable inbox message
+
+```bash
+ai-memory --agent-id ai:worker notify --target-agent-id ai:coordinator \
+  --title 'Pass complete' --payload 'Review is ready.' --json
+```
+
+`--target-agent-id`, `--title` and `--payload` are required. The global
+`--agent-id` is the sender. This local CLI command uses its selected SQLite
+store; use the daemon's `POST /api/v1/notify` (`content` or `payload`) for its
+configured wake sink and federation fanout. Authenticate HTTP with `X-API-Key`
+when configured, and set `X-Agent-Id` to the sender.
 
 ### `inbox --wait` — block until there is mail (v1.0.0, #3470 / EPIC #3466)
 

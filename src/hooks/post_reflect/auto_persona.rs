@@ -279,11 +279,18 @@ fn count_entity_reflections(
     entity_id: &str,
     namespace: &str,
 ) -> anyhow::Result<i64> {
+    // #3693 — counts only what the generator's source pool
+    // (`persona::load_reflections_for_entity`) may read: hidden reflections
+    // are neither cadence nor source material.
     let count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM memories
-         WHERE namespace = ?1
-           AND memory_kind = 'reflection'
-           AND mentioned_entity_id = ?2",
+        &format!(
+            "SELECT COUNT(*) FROM memories
+             WHERE namespace = ?1
+               AND memory_kind = 'reflection'
+               AND mentioned_entity_id = ?2
+               {lifecycle_vis}",
+            lifecycle_vis = crate::models::lifecycle_visible_clause(""),
+        ),
         rusqlite::params![namespace, entity_id],
         |r| r.get(0),
     )?;

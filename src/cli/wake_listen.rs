@@ -108,7 +108,8 @@ pub struct WakeListenArgs {
     /// normative 60 s wake-plane maximum.
     #[arg(long = "poll-secs", value_name = "SECS")]
     pub poll_secs: Option<u64>,
-    /// Only count messages with `access_count == 0` on each catch-up read.
+    /// Accepted for compatibility; narrows nothing (#3730). Every message
+    /// still in the inbox is unhandled; the catch-up read counts them all.
     #[arg(long = "unread-only")]
     pub unread_only: bool,
     /// Catch-up read page size. Default 50, cap 500.
@@ -258,7 +259,16 @@ pub async fn catch_up_read(
     unread_only: bool,
     limit: Option<u32>,
 ) -> Result<Value> {
-    let db_path = db_path.to_path_buf();
+    // #3730 (#2572 class) — the catch-up read is the same inbox read `ai-memory
+    // inbox` makes: refuse a Postgres store before opening the sidecar.
+    let db_path = {
+        let stdout = std::io::stdout();
+        let stderr = std::io::stderr();
+        let mut so = stdout.lock();
+        let mut se = stderr.lock();
+        let mut out = crate::cli::CliOutput::from_std(&mut so, &mut se);
+        crate::cli::backup::refuse_pg_store(db_path, "inbox", &mut out)?
+    };
     let agent_id = agent_id.to_owned();
     tokio::task::spawn_blocking(move || {
         let conn = crate::db::open(&db_path)?;
@@ -548,7 +558,23 @@ async fn emit(
     count: u64,
 ) -> Result<()> {
     if let Some(cmd) = args.exec.as_deref() {
-        run_exec_hook(cmd, resolved, signal, count).await?;
+        // #3642 — a per-wake exec failure is LOGGED and the listener CONTINUES,
+        // per this listener's own contract (a per-wake failure must never
+        // terminate the process and its always-armed backstop poll). The path
+        // this closes is the SPAWN itself: `run_exec_hook` already contains every
+        // POST-spawn outcome (non-zero exit, wait error, timeout), but a hook
+        // that will not spawn still `?`-propagated out — the exact bytes an
+        // authenticated PEER controls, because a NUL or control character in the
+        // wake metadata (valid UTF-8, so the hub forwards it) makes std refuse to
+        // place it in the child environment (`InvalidInput`), and a transient
+        // EAGAIN / EMFILE / ENOMEM at spawn under load takes the same path. One
+        // such frame must not kill another agent's listener.
+        if let Err(e) = run_exec_hook(cmd, resolved, signal, count).await {
+            tracing::error!(
+                reason = signal.reason.label(),
+                "wake listener: the --exec hook could not be spawned ({e:#}); the durable inbox row is unaffected and the listener continues"
+            );
+        }
     }
     if args.json || args.exec.is_none() {
         let stdout = std::io::stdout();
@@ -756,5 +782,88 @@ mod tests {
     fn hex_digest_is_lowercase_and_pairs_bytes_3470() {
         assert_eq!(hex_digest(&[0x00, 0x0f, 0xff]), "000fff");
         assert_eq!(hex_digest(&[]), "");
+    }
+}
+
+#[cfg(test)]
+mod tests_3642 {
+    use super::*;
+    use crate::wake_client::{WakeClientConfig, WakeReason, WakeSignal};
+    use crate::wake_hub::frame::WakeMeta;
+
+    fn resolved_3642() -> Resolved {
+        Resolved {
+            agent_id: "ai:me-3642".into(),
+            socket: None,
+            hub_id: "ai-memory-wake-hub".into(),
+            key_dir: std::path::PathBuf::from("/nonexistent-3642"),
+            bundle: std::path::PathBuf::from("/nonexistent-3642/bundle"),
+            client: WakeClientConfig::default(),
+        }
+    }
+
+    fn args_exec_3642(cmd: &str) -> WakeListenArgs {
+        WakeListenArgs {
+            agent_id: None,
+            socket: None,
+            hub_id: None,
+            key_dir: None,
+            bundle: None,
+            poll_secs: None,
+            unread_only: false,
+            limit: None,
+            json: false,
+            exec: Some(cmd.into()),
+            once: false,
+            no_hub: false,
+        }
+    }
+
+    fn signal_with_sender_3642(sender: &str) -> WakeSignal {
+        WakeSignal {
+            reason: WakeReason::Wake,
+            meta: Some(WakeMeta {
+                sender: sender.into(),
+                ..WakeMeta::default()
+            }),
+            pending_count: 0,
+            missed: 0,
+        }
+    }
+
+    /// #3642 — a peer-authored NUL in the wake metadata makes the `--exec` hook
+    /// UNSPAWNABLE (std refuses an interior NUL in the child environment). That
+    /// spawn error must be LOGGED and the listener CONTINUE, never propagated:
+    /// one frame from any authenticated peer must not terminate another agent's
+    /// listener and its always-armed backstop poll. Drives the FAILURE path
+    /// (a poisoned wake) with a presence assertion (the next clean wake still
+    /// emits) on the same emitter.
+    #[tokio::test]
+    async fn a_nul_in_wake_metadata_does_not_terminate_the_listener_3642() {
+        let resolved = resolved_3642();
+        let poisoned = signal_with_sender_3642("x\0y");
+
+        // The bare trigger: with a NUL in the sender, the hook cannot be spawned.
+        assert!(
+            run_exec_hook("true", &resolved, &poisoned, 0)
+                .await
+                .is_err(),
+            "a NUL in the wake sender must make the --exec hook unspawnable"
+        );
+
+        // The fix: `emit` SWALLOWS that spawn error and returns Ok, so the
+        // dispatch loop advances to the next wake instead of ending the process.
+        let args = args_exec_3642("true");
+        assert!(
+            emit(&resolved, &args, &poisoned, 0).await.is_ok(),
+            "emit must swallow the spawn error so the listener continues"
+        );
+
+        // Presence on the same emitter: the next well-formed wake still emits.
+        let clean = signal_with_sender_3642("ai:alice");
+        assert!(
+            emit(&resolved, &args, &clean, 0).await.is_ok(),
+            "the next well-formed wake still emits after a poisoned one"
+        );
     }
 }

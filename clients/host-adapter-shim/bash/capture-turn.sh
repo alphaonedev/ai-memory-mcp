@@ -46,16 +46,32 @@
 #
 # # Exit codes
 #
-# - 0  — success (either dedup_hit:true or memory created)
+# - 0  — the substrate PERSISTED the turn (the receipt carried a
+#        non-empty `memory_id`; `dedup_hit:true` counts, the row exists)
 # - 1  — usage error (missing required arg, bad value)
-# - 2  — MCP call failed (substrate error; check stderr)
+# - 2  — the turn was NOT persisted (transport fault, substrate error,
+#        governance `ask`/`pending`, an unreadable receipt, or any
+#        receipt this release cannot prove describes a stored row)
 # - 3  — content file missing/unreadable
+#
+# #3544 — exit 0 used to mean "none of the failures I enumerated
+# happened", so governance `ask` (nothing stored, no recovery handle),
+# governance `pending` (queued, not stored) and an unreadable receipt all
+# reported success for a turn the substrate never wrote. The verdict is
+# now the PRESENCE of a persisted `memory_id`; everything else fails
+# CLOSED. The exit-code SET is unchanged — only the meaning of 0 is,
+# which is the defect. A `pending` turn is not lost: its `pending_id` is
+# printed on stderr and redeems the turn via `memory_pending_approve`.
+#
+# Reading the receipt requires `jq`. Without jq this shim CANNOT prove
+# the turn was persisted, so it refuses to report success (exit 2) rather
+# than guess — degrade, never lie about durability.
 #
 # # Failure mode
 #
 # Per the architecture: this shim MUST NOT wedge the host's
-# operation. On MCP failure, the shim emits a stderr WARN and
-# exits 2. The host's Stop-hook integration should ignore the
+# operation. On any non-persisted outcome, the shim emits a stderr WARN
+# and exits 2. The host's Stop-hook integration should ignore the
 # non-zero exit (it's a backstop, not a gate).
 
 set -euo pipefail
@@ -71,7 +87,12 @@ TIMESTAMP_ISO=""
 AI_MEMORY_BIN="${AI_MEMORY_BIN:-ai-memory}"
 
 usage() {
-  sed -n 's/^# \?//p' "$0" | head -64
+  # Print the header comment block: every line from the one after the shebang
+  # up to the first non-comment line, with the leading "# " stripped. Derived
+  # from the file, so editing the header can never desynchronise a line count
+  # (it used to be a hardcoded `head -N`, which leaked body comments once the
+  # header grew).
+  awk 'NR == 1 { next } !/^#/ { exit } { sub(/^# ?/, ""); print }' "$0"
   exit 1
 }
 
@@ -153,24 +174,120 @@ INIT_NOTIFY='{"jsonrpc":"2.0","method":"notifications/initialized"}'
 CALL_REQUEST="$(printf '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_capture_turn","arguments":%s}}' "${REQUEST}")"
 
 # Pipe both requests to the substrate. The substrate emits one
-# response per request to stdout; we capture the second (tools/call)
-# and emit it on the shim's stdout for the operator.
-RESPONSE="$(printf '%s\n%s\n%s\n' "${INIT_REQUEST}" "${INIT_NOTIFY}" "${CALL_REQUEST}" \
-  | "${AI_MEMORY_BIN}" mcp --profile full 2>&1 | grep -E '^\{"jsonrpc"' | tail -1)" || {
+# response per request to stdout; we want the tools/call one.
+RAW="$(printf '%s\n%s\n%s\n' "${INIT_REQUEST}" "${INIT_NOTIFY}" "${CALL_REQUEST}" \
+  | "${AI_MEMORY_BIN}" mcp --profile full 2>&1)" || {
     echo "WARN: MCP call failed; substrate error follows:" >&2
-    echo "${RESPONSE}" >&2
+    echo "${RAW}" >&2
     exit 2
   }
 
-# Pretty-print the response if jq is available; otherwise emit raw.
-if command -v jq >/dev/null 2>&1; then
-  echo "${RESPONSE}" | jq .
-else
-  echo "${RESPONSE}"
-fi
-
-# Inspect for substrate-side error envelope (isError:true per MCP spec).
-if echo "${RESPONSE}" | grep -q '"isError":true'; then
-  echo "WARN: substrate returned isError:true; check the response envelope above" >&2
+# Reading the receipt is a two-level JSON parse (`result.content[0].text` holds
+# the tool payload as a JSON STRING - `src/mcp/mod.rs:3762`), which grep cannot
+# do correctly. Without jq the shim cannot prove the turn was persisted, so it
+# refuses to claim it was. Degrade, never lie about durability: the call has
+# ALREADY been made at this point, so the turn may well be stored - what this
+# shim refuses to do is REPORT a success it cannot verify.
+if ! command -v jq >/dev/null 2>&1; then
+  echo "${RAW}"
+  echo "WARN: jq not found; the capture receipt cannot be parsed, so this shim CANNOT prove the turn was persisted - refusing to report success (install jq)" >&2
   exit 2
 fi
+
+# Select the tools/call response BY ITS ID, exactly as the sibling python/node
+# adapters do. The previous `grep '^{"jsonrpc"' | tail -1` took the LAST
+# JSON-looking line whatever it was, so an init frame - or any later
+# notification - could be classified as the capture receipt. `-R` + `fromjson?`
+# skips every line that is not JSON (the substrate's stderr is merged in above).
+RESPONSE="$(printf '%s\n' "${RAW}" \
+  | jq -R -c 'fromjson? | select((type == "object") and (.id == 2))' 2>/dev/null \
+  | tail -1)" || RESPONSE=""
+if [[ -z "${RESPONSE}" ]]; then
+  echo "WARN: no capture response from substrate" >&2
+  exit 2
+fi
+
+# Emit the receipt on the shim's stdout for the operator.
+printf '%s\n' "${RESPONSE}" | jq . || printf '%s\n' "${RESPONSE}"
+
+# ── #3544: the capture-outcome predicate ──────────────────────────────────
+#
+# The substrate is the source of truth for this vocabulary; measured at
+# `src/mcp/tools/capture_turn.rs`:
+#
+#   :437-444  permission `Decision::Ask`     -> {"status": "ask", ...}
+#             NOTHING is persisted; no id, no recovery handle.
+#   :488-496  `GovernanceDecision::Pending`  -> {"status": "pending",
+#             "pending_id", ...}  DURABLY QUEUED, redeemable.
+#   :531-538  dedup hit   -> {"memory_id", "dedup_hit": true,  "layer": "L4", ...}
+#   :539-547  fresh write -> {"memory_id", "dedup_hit": false, "layer": "L4", ...}
+#
+# `grep -n '"status"' src/mcp/tools/capture_turn.rs` returns exactly those two
+# literals — that is the whole closed vocabulary. `Decision::Deny` /
+# `GovernanceDecision::Deny` return `Err(..)`, which MCP renders as
+# `isError: true` (`src/mcp/mod.rs`), never as a `status`. RFC-0001 pins
+# `memory_id` in the result's `required` set
+# (`docs/rfc/RFC-0001-mcp-turn-capture.md:160`).
+#
+# THE WHOLE PREDICATE: a turn is CAPTURED if and only if the tool payload
+# carries a non-empty string `memory_id`. `status` is read only to say WHY and
+# to carry the recovery handle — never to decide the verdict, so a status a
+# later substrate release grows fails CLOSED without this program knowing it
+# exists. Kept self-contained (one file, jq only) because operators copy this
+# script to their host; the identical predicate is implemented by the sibling
+# `python/capture_turn.py` and `node/capture-turn.mjs`, and all three are pinned
+# to the same verdicts and the same stderr text by
+# `clients/host-adapter-shim/tests/test_capture_outcome_conformance.py`.
+
+CAPTURE_VERDICT_JQ='
+def payload:
+  if (.result | type) != "object" then null
+  else
+    (.result.content) as $c
+    | if ($c | type) == "array" and ($c | length) > 0
+         and (($c[0] | type) == "object")
+         and (($c[0].text | type) == "string")
+      then ($c[0].text | try fromjson catch null)
+      else null
+      end
+  end;
+def outcome:
+  if type != "object" then
+    {kind: "not_captured", detail: "capture response was not a JSON-RPC object"}
+  elif (.error != null) then
+    {kind: "not_captured", detail: "substrate returned JSON-RPC error"}
+  elif ((.result | type) != "object") then
+    {kind: "not_captured", detail: "capture response carried no result object"}
+  elif (.result.isError == true) then
+    {kind: "not_captured", detail: "substrate returned isError:true"}
+  else
+    payload as $p
+    | if (($p | type) != "object") then
+        {kind: "not_captured", detail: "capture result payload was unreadable (result.content[0].text is not a JSON object); refusing to count it as a captured turn"}
+      elif ($p.status == "ask") then
+        {kind: "ask", detail: "capture_turn returned status=ask (governance approval requested; NOTHING was persisted and there is no recovery handle); not counting as a captured turn"}
+      elif ($p.status == "pending") then
+        (if (($p.pending_id | type) == "string") and (($p.pending_id | length) > 0) then $p.pending_id else null end) as $pid
+        | {kind: "pending", detail: ("capture_turn returned status=pending, pending_id=" + ($pid | tojson) + " (the turn is DURABLY QUEUED for approval, NOT lost; redeem it with memory_pending_approve); not counting as a captured turn")}
+      elif ((($p.memory_id | type) == "string") and (($p.memory_id | length) > 0)) then
+        {kind: "captured", detail: ""}
+      else
+        {kind: "not_captured", detail: ("capture_turn returned no memory_id (status=" + ($p.status | tojson) + "); the turn was NOT persisted - not counting as a captured turn")}
+      end
+  end;
+outcome | .kind + "\t" + .detail
+'
+
+VERDICT="$(printf '%s' "${RESPONSE}" | jq -r "${CAPTURE_VERDICT_JQ}" 2>/dev/null)" || VERDICT=""
+KIND="${VERDICT%%$'\t'*}"
+DETAIL="${VERDICT#*$'\t'}"
+
+if [[ -z "${VERDICT}" ]]; then
+  echo "WARN: capture receipt was unreadable; the turn was NOT persisted - not counting as a captured turn" >&2
+  exit 2
+fi
+if [[ "${KIND}" != "captured" ]]; then
+  echo "WARN: ${DETAIL}" >&2
+  exit 2
+fi
+exit 0

@@ -136,6 +136,7 @@ fn build_router() -> (axum::Router, NamedTempFile, PathBuf) {
         mtls_enforced: false,
         enrolled_agent_keys: enrolled,
         identity_mode: HttpIdentityMode::Advisory,
+        ..Default::default()
     };
     let router = ai_memory::build_router(api_key_state, app_state);
     (router, f, db_path)

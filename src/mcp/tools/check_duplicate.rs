@@ -53,7 +53,7 @@ pub fn handle_check_duplicate(
     // cap at ~0.92 due to nomic prefix normalisation.
     let mut check =
         db::check_duplicate_with_text(conn, &query_embedding, &text, namespace, threshold)
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| crate::mcp::error_text::mcp_foreign_err("check_duplicate_with_text", e))?;
 
     // v1.0.0 #3597 — mirror the #947 HTTP mask (`handlers::power`): when the
     // nearest row is one the caller cannot read (`scope=private`, another

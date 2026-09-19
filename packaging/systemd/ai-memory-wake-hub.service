@@ -28,7 +28,7 @@ Group=ai-memory-hub
 # runtime directory, because AllowlistFile::load_from_file requires the
 # file be owned by THIS uid at exact mode 0600.
 EnvironmentFile=-/etc/ai-memory/wake-hub.env
-Environment=RUST_LOG=ai_memory=info
+Environment=RUST_LOG=info
 Environment=SOCKET=/run/ai-memory-hub/wake-hub.sock
 Environment=ALLOWLIST=/run/ai-memory-hub/hub-allow.json
 # No --tcp in the shipped ExecStart. The kernel RestrictAddressFamilies
@@ -52,8 +52,33 @@ ExecStart=/bin/sh -c '/usr/bin/ai-memory wake-hub --socket "$SOCKET" --allowlist
 # the journal rather than a bare exit code.
 ExecStartPost=/bin/sh -c 'for i in $(seq 1 20); do /usr/bin/ai-memory wake-hub --socket "$SOCKET" --health --json >/dev/null 2>&1 && exit 0; sleep 0.25; done; /usr/bin/ai-memory wake-hub --socket "$SOCKET" --health; exit 2'
 
+# #3643 — ADMIT readiness, AFTER the `--health` liveness probe above. `--health`
+# is a pre-auth client that only proves the socket ANSWERS; it is structurally
+# blind to WHOM the hub admits, so a hub with an empty / aged-out / placeholder
+# (REPLACE_AGENT_ID) allowlist reports healthy while admitting NOBODY. This gate
+# reads the credential-free admit dimension from the same published snapshot the
+# hub admits hellos against (`--posture --require-admits`, no hub connection, no
+# identity) and exits 3 when the hub admits nobody, so a wake plane that can wake
+# no one goes RED here instead of pretending to be up. It is NOT the liveness
+# probe (that stays `--health`, exit 2 on unreachable); it is the missing second
+# dimension. A fresh install ships the REPLACE_AGENT_ID placeholder and so goes
+# RED here until the refresher publishes a real principal — which is the point:
+# fail-closed and VISIBLE, never green-while-admitting-nobody.
+ExecStartPost=/bin/sh -c '/usr/bin/ai-memory wake-hub --socket "$SOCKET" --allowlist "$ALLOWLIST" --posture --require-admits >/dev/null 2>&1 || { /usr/bin/ai-memory wake-hub --socket "$SOCKET" --allowlist "$ALLOWLIST" --posture --require-admits; exit 3; }'
+
 Restart=on-failure
 RestartSec=5s
+# #3643 — the admit-readiness ExecStartPost exits 3 (EXIT_ADMITS_NOBODY) when
+# the hub admits nobody, and that condition NEVER becomes true on its own: an
+# empty / placeholder (REPLACE_AGENT_ID) allowlist is fixed ONLY by the operator
+# editing the principal list, never by restarting. Without this, Restart=on-failure
+# + RestartSec=5s would turn "admits nobody" into a five-second restart LOOP — the
+# exact pathology the `--health` ExecStartPost's retry comment above warns about,
+# and the opposite of the honest red this gate exists to produce. So exit 3 is
+# NON-restartable: the unit lands in `failed` and STAYS there, visibly. Exit 2
+# (EXIT_UNREACHABLE) is deliberately NOT listed here — unreachable can be transient
+# (the bind race) and a genuine crash SHOULD restart, so exit 2 stays restartable.
+RestartPreventExitStatus=3
 # The hub's own bounded drain deadline is 5 s (wake_hub::limits::DRAIN_DEADLINE_MS)
 # and it exits 0 afterwards, so systemd never needs to escalate to SIGKILL.
 KillSignal=SIGTERM

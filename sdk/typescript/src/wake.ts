@@ -70,7 +70,15 @@
  */
 
 import { createHash } from "node:crypto";
-import { lstatSync, readFileSync } from "node:fs";
+import {
+  closeSync,
+  constants as fsConstants,
+  fstatSync,
+  lstatSync,
+  openSync,
+  readFileSync,
+  type Stats,
+} from "node:fs";
 import { connect as netConnect, type Socket } from "node:net";
 import { join } from "node:path";
 
@@ -466,6 +474,93 @@ export interface BundleFile {
 }
 
 /**
+ * Apply the bundle's on-disk standard to an ALREADY-OBTAINED stat.
+ *
+ * Split out so the descriptor-bound path (`fstatSync`) and the Windows
+ * path-based fallback refuse with the SAME words. `path` is only ever used to
+ * word the message; nothing here resolves it again.
+ */
+function checkBundleStat(path: string, st: Stats): void {
+  if (!st.isFile()) throw new WakeError(`${path} is not a regular file`);
+  if ((st.mode & 0o077) !== 0) {
+    throw new WakeError(
+      `${path} is mode ${(st.mode & 0o7777).toString(8).padStart(4, "0")}; a bundle ` +
+        "holding a private key must be 0600, or another local user can join the hub " +
+        "as this agent",
+    );
+  }
+  if (typeof process.geteuid === "function" && st.uid !== process.geteuid()) {
+    throw new WakeError(`${path} is owned by uid ${st.uid}, not by the caller`);
+  }
+}
+
+/**
+ * Read a credential no other local user could read or replace, through ONE
+ * descriptor (#3780).
+ *
+ * `lstatSync(path)` followed by `readFileSync(path)` resolves the path TWICE,
+ * and the bytes that are read are not the bytes that were checked. A local
+ * user who can write in the key directory wins that window twice over: swap a
+ * symlink in and the SDK reads a file it refused a moment earlier
+ * (confused-deputy read); swap a FIFO in and the second open PARKS the process
+ * with no credential needed (availability). So: open ONCE, `fstat` THAT
+ * descriptor, apply every check to it, and read from it.
+ *
+ * `O_NOFOLLOW` refuses a symlink AT THE OPEN, so a link in the key directory
+ * can never have its permissions checked on the target. `O_NONBLOCK` keeps a
+ * FIFO planted at this path from parking the open; the regular-file check then
+ * refuses it. This is the pattern the Rust tree already ships in
+ * `src/wake_client/bundle.rs` (`open_owner_only`), modelled in turn on
+ * `AllowlistCache::open_checked` (#3504).
+ *
+ * **Platform caveat:** Windows has no `O_NOFOLLOW` and no `O_NONBLOCK`, so
+ * there is no way to bind the check to the descriptor with `node:fs` there.
+ * That leg keeps the historical path-based check-then-read, unchanged and
+ * still racy, and says so rather than pretending otherwise. The hub socket and
+ * the key directory this loader serves are POSIX-only surfaces today.
+ */
+function readOwnerOnly(path: string): string {
+  const noFollow = fsConstants.O_NOFOLLOW;
+  const nonBlock = fsConstants.O_NONBLOCK;
+  if (typeof noFollow !== "number" || typeof nonBlock !== "number") {
+    // Windows. Documented above: the pre-#3780 shape, verbatim.
+    const st = lstatSync(path);
+    if (st.isSymbolicLink()) {
+      throw new WakeError(
+        `${path} is a symlink: a credential reached through a link is one whose ` +
+          "permissions were checked on the wrong file",
+      );
+    }
+    checkBundleStat(path, st);
+    return readFileSync(path, "utf8");
+  }
+
+  let fd: number;
+  try {
+    fd = openSync(path, fsConstants.O_RDONLY | noFollow | nonBlock);
+  } catch (err) {
+    // ELOOP is what O_NOFOLLOW reports for a symlink on Linux and macOS
+    // (EMLINK on the BSDs). Kept as its own refusal so the operator is told
+    // what is actually wrong rather than handed a bare errno.
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ELOOP" || code === "EMLINK") {
+      throw new WakeError(
+        `${path} is a symlink: a credential reached through a link is one whose ` +
+          "permissions were checked on the wrong file",
+      );
+    }
+    throw err;
+  }
+  try {
+    // fstat on the descriptor just opened — never a second look at the path.
+    checkBundleStat(path, fstatSync(fd));
+    return readFileSync(fd, "utf8");
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/**
  * The scoped `a2a-hub/join/v1` credential, loaded from the key directory.
  *
  * The delegated private key stays in memory for the life of the process and is
@@ -497,33 +592,21 @@ export class DelegationBundle {
     return join(keyDir, `${agentId}.a2a-hub.json`);
   }
 
-  /** Load and check a bundle. Every failure is a refusal. */
+  /**
+   * Load and check a bundle. Every failure is a refusal.
+   *
+   * The checks are proven against ONE descriptor and the bytes are read from
+   * that SAME descriptor — see {@link readOwnerOnly}. There is deliberately no
+   * second resolution of `path` between the check and the read.
+   */
   static load(
     path: string,
     opts: { hubId?: string; now?: number } = {},
   ): DelegationBundle {
-    const st = lstatSync(path);
-    if (st.isSymbolicLink()) {
-      throw new WakeError(
-        `${path} is a symlink: a credential reached through a link is one whose ` +
-          "permissions were checked on the wrong file",
-      );
-    }
-    if (!st.isFile()) throw new WakeError(`${path} is not a regular file`);
-    if ((st.mode & 0o077) !== 0) {
-      throw new WakeError(
-        `${path} is mode ${(st.mode & 0o7777).toString(8).padStart(4, "0")}; a bundle ` +
-          "holding a private key must be 0600, or another local user can join the hub " +
-          "as this agent",
-      );
-    }
-    if (typeof process.geteuid === "function" && st.uid !== process.geteuid()) {
-      throw new WakeError(`${path} is owned by uid ${st.uid}, not by the caller`);
-    }
-    return DelegationBundle.fromObject(
-      JSON.parse(readFileSync(path, "utf8")) as BundleFile,
-      { ...opts, source: path },
-    );
+    return DelegationBundle.fromObject(JSON.parse(readOwnerOnly(path)) as BundleFile, {
+      ...opts,
+      source: path,
+    });
   }
 
   /** The verification core, over an already-parsed bundle. */

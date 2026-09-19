@@ -153,8 +153,10 @@ pub fn handle_replay(
     // single-memory transcripts for observations. Ordering and
     // dedup live in the substrate so the handler stays a thin
     // serialisation wrapper.
-    let entries: Vec<ReplayEntry> = replay_transcript_union(conn, memory_id, depth)
-        .map_err(|e| format!("replay_transcript_union failed: {e}"))?;
+    let entries: Vec<ReplayEntry> =
+        replay_transcript_union(conn, memory_id, depth).map_err(|e| {
+            crate::mcp::error_text::mcp_foreign_err("replay_transcript_union failed", e)
+        })?;
 
     // v0.7.0 #628 H6 — authorise the replay against EACH transcript's
     // namespace before any decompressed content leaves the daemon. K9
@@ -209,9 +211,9 @@ pub fn handle_replay(
     // does not exist". A leak of existence would still be a useful
     // probe oracle for an attacker enumerating transcript ids.
     for entry in &entries {
-        let anchor = match crate::db::get(conn, &entry.memory_id)
-            .map_err(|e| format!("get anchor memory for replay gate: {e}"))?
-        {
+        let anchor = match crate::db::get(conn, &entry.memory_id).map_err(|e| {
+            crate::mcp::error_text::mcp_foreign_err("get anchor memory for replay gate", e)
+        })? {
             Some(m) => m,
             // Anchor row vanished between the substrate read and the
             // visibility check; treat as not-found to avoid leaking
@@ -311,7 +313,9 @@ pub fn handle_replay(
             obj.insert("truncated".into(), Value::Bool(true));
         } else {
             let content = crate::transcripts::fetch(conn, &meta.id)
-                .map_err(|e| format!("transcripts::fetch failed: {e}"))?
+                .map_err(|e| {
+                    crate::mcp::error_text::mcp_foreign_err("transcripts::fetch failed", e)
+                })?
                 .ok_or_else(|| {
                     format!(
                         "transcript {} disappeared between metadata read and content fetch",

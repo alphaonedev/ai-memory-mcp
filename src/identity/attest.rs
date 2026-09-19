@@ -223,7 +223,7 @@ pub const ENV_REQUIRE_AGENT_ATTESTATION: &str = "AI_MEMORY_REQUIRE_AGENT_ATTESTA
 pub fn global_strict_attestation_enabled() -> bool {
     matches!(
         std::env::var(ENV_REQUIRE_AGENT_ATTESTATION).ok().as_deref(),
-        Some(v) if v == "1" || v.eq_ignore_ascii_case("true")
+        Some(v) if crate::security_profile::is_truthy(v)
     )
 }
 
@@ -260,7 +260,8 @@ pub fn gate_unsigned_surface_attestation(
     metadata: &mut serde_json::Value,
 ) -> Result<crate::identity::verify::AttestLevel> {
     if global_strict_attestation_enabled() {
-        return Err(anyhow::anyhow!("{ATTESTATION_REFUSED_UNSIGNED_SURFACE}"));
+        // #3713 — a typed root so the MCP funnel passes the slug through.
+        return Err(crate::errors::refusal(ATTESTATION_REFUSED_UNSIGNED_SURFACE));
     }
     if let Some(obj) = metadata.as_object_mut() {
         obj.insert(
@@ -310,7 +311,7 @@ pub fn stamp_claimed_if_absent(metadata: &mut serde_json::Value) {
 fn resolve_require_agent_attestation(value: Option<&str>, surface: WriteSurface) -> bool {
     match value {
         Some(v) if v == "0" || v.eq_ignore_ascii_case("false") => false,
-        Some(v) if v == "1" || v.eq_ignore_ascii_case("true") => true,
+        Some(v) if crate::security_profile::is_truthy(v) => true,
         _ => matches!(surface, WriteSurface::HttpDirect),
     }
 }
@@ -473,11 +474,11 @@ pub fn sign_memory_write(
     agent_id: &str,
 ) -> Result<Vec<u8>> {
     if !created_at_is_storage_stable(&mem.created_at) {
-        anyhow::bail!(
+        return Err(crate::errors::refusal(
             "refusing to sign a write whose `created_at` is not the canonical \
              storage-stable RFC3339 UTC form (#3422): the signature could never be \
-             re-derived from the persisted row on a postgres backend"
-        );
+             re-derived from the persisted row on a postgres backend",
+        ));
     }
     let content_hash = content_sha256(&mem.content);
     let write = SignableWrite {
@@ -589,7 +590,7 @@ pub fn resolve_write_attest_level(
         content_sha256: &content_hash,
     };
     crate::identity::verify::attest_write(&write, bound_pubkey_b64, signature, require)
-        .map_err(|e| anyhow::anyhow!("agent attestation failed: {e}"))
+        .map_err(|e| crate::errors::refusal(format!("agent attestation failed: {e}")))
 }
 
 /// Resolve the [`AttestLevel`] for `mem` written by `agent_id` (via
@@ -639,7 +640,9 @@ pub fn resolve_historical_write_attest_level(
     };
     if !resolved.history_exists {
         if resolved.candidate_pubkeys_b64.len() > 1 {
-            anyhow::bail!("legacy attestation lookup returned multiple keys");
+            return Err(crate::errors::refusal(
+                "legacy attestation lookup returned multiple keys",
+            ));
         }
         return resolve_write_attest_level(
             mem,
@@ -653,7 +656,7 @@ pub fn resolve_historical_write_attest_level(
     let mut verified = 0_u8;
     for candidate in &resolved.candidate_pubkeys_b64 {
         crate::identity::keypair::decode_public_base64(candidate)
-            .map_err(|_| anyhow::anyhow!("corrupt pubkey history candidate"))?;
+            .map_err(|_| crate::errors::refusal("corrupt pubkey history candidate"))?;
         if resolve_write_attest_level(mem, agent_id, Some(candidate), Some(signature), true).is_ok()
         {
             verified = verified.saturating_add(1);
@@ -661,8 +664,12 @@ pub fn resolve_historical_write_attest_level(
     }
     match verified {
         1 => Ok(AttestLevel::AgentAttested),
-        0 => anyhow::bail!("no timestamp-eligible history key verifies the write signature"),
-        _ => anyhow::bail!("ambiguous pubkey history: multiple eligible keys verify the signature"),
+        0 => Err(crate::errors::refusal(
+            "no timestamp-eligible history key verifies the write signature",
+        )),
+        _ => Err(crate::errors::refusal(
+            "ambiguous pubkey history: multiple eligible keys verify the signature",
+        )),
     }
 }
 

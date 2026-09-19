@@ -411,19 +411,12 @@ fn report_for(backend: &'static str, samples: &[u128]) -> BackendReport {
     }
 }
 
-/// Strip the password component from a Postgres URL so we don't echo
-/// secrets into stdout or the JSON artifact. Best-effort — any value
-/// the bench prints lands in CI logs.
+/// Render the store URL for stdout / the JSON artifact — both land in CI
+/// logs. #3667/#3711: the ONE allowlist renderer (`scheme://host[:port]/db`),
+/// never a hand-rolled masker that keeps the query (`?password=`) verbatim.
 #[cfg(feature = "sal-postgres")]
 fn redact(url: &str) -> String {
-    if let Some(scheme_end) = url.find("://") {
-        let (scheme, rest) = url.split_at(scheme_end + 3);
-        if let Some(at) = rest.find('@') {
-            let after = &rest[at..];
-            return format!("{scheme}***{after}");
-        }
-    }
-    url.to_string()
+    ai_memory::url_display::store_url_display(url)
 }
 
 #[cfg(feature = "sal-postgres")]

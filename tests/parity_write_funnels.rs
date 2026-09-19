@@ -341,19 +341,18 @@ async fn sqlite_sal_update_and_delete_enforce_the_caller_owns_gate() {
 
 #[tokio::test]
 async fn unstamped_row_is_allowed_through_sqlite_sal_gate() {
-    // Option B (gatekeeper decision, 2026-08-22) — the sqlite SAL gate mirrors
-    // SQLITE'S OWN contract, not postgres's #1628 refusal. An UNSTAMPED row
-    // (no `metadata.agent_id`: legacy / pre-v0.6.3 / migrated) stays MUTABLE,
-    // exactly as the canonical `visibility::caller_owns_for_mutation`
-    // predicate specifies and as the HTTP `require_caller_owns_memory`
-    // carve-out and every MCP mutate tool already behave.
+    // Option B (gatekeeper decision, 2026-08-22), kept as the DEFAULT posture
+    // of the #3124 single cross-backend policy: under
+    // `AI_MEMORY_UNSTAMPED_MUTATION=warn` (the default; this binary never sets
+    // the knob) an UNSTAMPED row (no `metadata.agent_id`: legacy / pre-v0.6.3 /
+    // migrated) stays MUTABLE through the sqlite SAL gate — the admission is
+    // now reported (WARN + counter) rather than silent.
     //
-    // Why this matters (the reason the tighter posture was rejected): refusing
-    // unstamped rows would turn today-writable legacy rows into permanently
-    // inaccessible ones for every non-admin caller — a data-loss mode — and it
-    // would break the single-operator default, where rows may carry no stamp
-    // at all. Cross-backend unification (stamp legacy rows via migration, then
-    // refuse everywhere) is tracked as #3124.
+    // Why the default does not refuse: refusing unstamped rows would turn
+    // today-writable legacy rows into inaccessible ones for every non-admin
+    // caller — a data-loss mode — and break the single-operator default. The
+    // `refuse` twin of this pin (and the other surfaces, both backends) lives
+    // in `tests/unstamped_policy_3124.rs` / `tests/unstamped_policy_3124_pg.rs`.
     let (_guard, db_path) = fresh_db_path();
     let conn = db::open(&db_path).expect("db::open");
     let now = chrono::Utc::now().to_rfc3339();
@@ -403,19 +402,13 @@ async fn unstamped_row_is_allowed_through_sqlite_sal_gate() {
         .expect("an UNSTAMPED row must stay deletable at the SAL layer");
 }
 
-/// The inbox carve-out is wired per-verb exactly as HTTP/MCP wire it:
-/// DELETE passes `allow_inbox = true` (the addressed recipient may delete a
-/// message sent to it after consuming it) while UPDATE passes `false` (the
-/// recipient must NOT rewrite the sender's row).
-#[tokio::test]
-async fn sqlite_sal_inbox_recipient_may_delete_but_not_update() {
-    let (_guard, db_path) = fresh_db_path();
-    let conn = db::open(&db_path).expect("db::open");
+/// A row Alice authored, addressed to Bob, in `namespace`.
+fn addressed_to_bob(namespace: &str) -> Memory {
     let now = chrono::Utc::now().to_rfc3339();
-    let mem = Memory {
+    Memory {
         id: uuid::Uuid::new_v4().to_string(),
         tier: Tier::Mid,
-        namespace: "parity/ns7".to_string(),
+        namespace: namespace.to_string(),
         title: "inbox-msg".to_string(),
         content: "message addressed to bob".to_string(),
         priority: 5,
@@ -427,8 +420,28 @@ async fn sqlite_sal_inbox_recipient_may_delete_but_not_update() {
         memory_kind: MemoryKind::Observation,
         version: 1,
         ..Memory::default()
-    };
-    let id = db::insert(&conn, &mem).expect("insert inbox row");
+    }
+}
+
+/// The inbox carve-out is wired per-verb exactly as HTTP/MCP wire it:
+/// DELETE admits the addressed recipient (the message is one sent to it, and
+/// it is ARCHIVED, not erased — #3730's retention policy) while UPDATE
+/// refuses it (the recipient must NOT rewrite the sender's row).
+///
+/// #3730 — until 2026-09-15 this fixture lived in `parity/ns7`, NOT an inbox
+/// namespace, and asserted the delete was ALLOWED. That was the #3730 hole
+/// written down as a requirement: a recipient could hard-delete any row
+/// merely addressed to it, and this cell defended the defect for as long as
+/// it existed (the full sweep on the fixed tree found it, 7/8). The row now
+/// lives where the carve-out is genuinely exercised, and
+/// `sqlite_sal_recipient_cannot_delete_a_non_inbox_row_addressed_to_it`
+/// below keeps the forbidden path forbidden.
+#[tokio::test]
+async fn sqlite_sal_inbox_recipient_may_delete_but_not_update() {
+    let (_guard, db_path) = fresh_db_path();
+    let conn = db::open(&db_path).expect("db::open");
+    let ns = ai_memory::inbox_namespace("ai:bob");
+    let id = db::insert(&conn, &addressed_to_bob(&ns)).expect("insert inbox row");
     drop(conn);
 
     let store = SqliteStore::open(&db_path).expect("SqliteStore::open");
@@ -448,11 +461,57 @@ async fn sqlite_sal_inbox_recipient_may_delete_but_not_update() {
         "expected PermissionDenied on update, got {err:?}"
     );
 
-    // DELETE: inbox carve-out ENABLED -> allowed.
+    // DELETE: inbox carve-out -> allowed, and the message is ARCHIVED.
     store
         .delete(&bob, &id)
         .await
-        .expect("the addressed recipient MAY delete a message sent to it");
+        .expect("the addressed recipient MAY delete a message sent to its inbox");
+    let admin = CallerContext::for_admin("ai:operator");
+    assert!(
+        store.get(&admin, &id).await.is_err(),
+        "drained from the live set"
+    );
+    let archived = store
+        .list_archived(Some(ns.as_str()), 50, 0)
+        .await
+        .expect("list_archived");
+    assert!(
+        archived
+            .iter()
+            .any(|m| m["id"].as_str() == Some(id.as_str())),
+        "#3730: an inbox drain archives, it does not erase: {archived:?}"
+    );
+}
+
+/// #3730 — the recipient's admission is DERIVED from the namespace: a row
+/// addressed to Bob that lives OUTSIDE an inbox namespace is not Bob's to
+/// delete. This is the cell the file lacked while the one above asserted
+/// the opposite; it is RED on `14748e776` (#3730-r4) and green on the fix.
+#[tokio::test]
+async fn sqlite_sal_recipient_cannot_delete_a_non_inbox_row_addressed_to_it() {
+    let (_guard, db_path) = fresh_db_path();
+    let conn = db::open(&db_path).expect("db::open");
+    let id = db::insert(&conn, &addressed_to_bob("parity/ns7")).expect("insert addressed row");
+    drop(conn);
+
+    let store = SqliteStore::open(&db_path).expect("SqliteStore::open");
+    let bob = CallerContext::for_agent("ai:bob");
+    let err = store
+        .delete(&bob, &id)
+        .await
+        .expect_err("a recipient must NOT delete a non-inbox row merely addressed to it");
+    assert!(
+        matches!(err, StoreError::PermissionDenied { .. }),
+        "expected PermissionDenied on delete, got {err:?}"
+    );
+    let admin = CallerContext::for_admin("ai:operator");
+    assert!(store.get(&admin, &id).await.is_ok(), "the row still exists");
+    // The owner still can.
+    let alice = CallerContext::for_agent("ai:alice");
+    store
+        .delete(&alice, &id)
+        .await
+        .expect("the owner deletes its own row");
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -466,9 +525,88 @@ async fn sqlite_sal_inbox_recipient_may_delete_but_not_update() {
 
 #[cfg(feature = "sal-postgres")]
 mod pg {
-    use super::{Memory, MemoryKind, Tier, json};
+    use super::{Memory, MemoryKind, Tier, addressed_to_bob, json};
     use ai_memory::store::postgres::PostgresStore;
-    use ai_memory::store::{CallerContext, MemoryStore};
+    use ai_memory::store::{CallerContext, MemoryStore, StoreError};
+
+    /// #3730 — the postgres twin of `sqlite_sal_recipient_cannot_delete_a_
+    /// non_inbox_row_addressed_to_it` above: the gate moved on BOTH SAL
+    /// funnels (and this file's own standard is that a sqlite assertion
+    /// alone cannot catch a regression on the backend that moved), so the
+    /// forbidden path is pinned here too — refused, row intact, the owner
+    /// still admitted — beside the inbox drain that IS admitted and archives.
+    /// The four-funnel pin `tests/recipient_gate_derived_from_namespace_3730.rs`
+    /// carries the same postgres cell; this one is the parity file's own.
+    #[tokio::test]
+    async fn pg_recipient_cannot_delete_a_non_inbox_row_addressed_to_it_3730() {
+        let Ok(url) = std::env::var("AI_MEMORY_TEST_POSTGRES_URL") else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url)
+            .await
+            .expect("connect postgres");
+        let alice = CallerContext::for_agent("ai:alice");
+        let bob = CallerContext::for_agent("ai:bob");
+        let admin = CallerContext::for_admin("ai:parity-operator");
+        let ns = format!("parity/pg-{}", uuid::Uuid::new_v4().simple());
+
+        // Forbidden path: a row addressed to Bob OUTSIDE an inbox namespace.
+        let outside = store
+            .store(&alice, &addressed_to_bob(&ns))
+            .await
+            .expect("alice stores the addressed row");
+        let refused = store.delete(&bob, &outside).await;
+        let still_live = store.get(&admin, &outside).await.is_ok();
+        let owner_deletes = store.delete(&alice, &outside).await;
+
+        // Permitted path: the same row shape delivered to Bob's inbox.
+        let inbox_ns = ai_memory::inbox_namespace("ai:bob");
+        let inside = store
+            .store(&alice, &addressed_to_bob(&inbox_ns))
+            .await
+            .expect("alice delivers to bob's inbox");
+        let drained = store.delete(&bob, &inside).await;
+        let archived = store
+            .list_archived(Some(inbox_ns.as_str()), 50, 0)
+            .await
+            .expect("list_archived")
+            .iter()
+            .any(|m| m["id"].as_str() == Some(inside.as_str()));
+
+        // Teardown BEFORE asserting (#2287) so a failure never strands rows.
+        for id in [&outside, &inside] {
+            let _ = sqlx::query("DELETE FROM archived_memories WHERE id = $1")
+                .bind(id)
+                .execute(store.pool())
+                .await;
+            let _ = sqlx::query("DELETE FROM memories WHERE id = $1")
+                .bind(id)
+                .execute(store.pool())
+                .await;
+        }
+
+        assert!(
+            matches!(refused, Err(StoreError::PermissionDenied { .. })),
+            "#3730 pg: a recipient must NOT delete a non-inbox row merely addressed to it: {refused:?}"
+        );
+        assert!(
+            still_live,
+            "#3730 pg: the row still exists after the refusal"
+        );
+        assert!(
+            owner_deletes.is_ok(),
+            "#3730 pg: the owner still deletes its own row: {owner_deletes:?}"
+        );
+        assert!(
+            drained.is_ok(),
+            "#3730 pg: the recipient drains its inbox: {drained:?}"
+        );
+        assert!(
+            archived,
+            "#3730 pg: the drained message is archived, not erased"
+        );
+    }
 
     #[tokio::test]
     async fn pg_archive_by_ids_reason_less_default_matches_the_sqlite_funnel() {

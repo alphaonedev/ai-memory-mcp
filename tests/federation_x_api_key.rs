@@ -304,6 +304,7 @@ async fn mtls_authenticated_request_bypasses_api_key_check() {
             ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty(),
         ),
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
+        ..Default::default()
     };
     let app = Router::new()
         .route("/api/v1/sync/push", post(ok_handler))

@@ -85,8 +85,8 @@ pub(super) fn handle_get_taxonomy(
         })
         .clamp(1, crate::storage::TAXONOMY_MAX_LIMIT);
 
-    let tax =
-        db::get_taxonomy(conn, prefix_owned.as_deref(), depth, limit).map_err(|e| e.to_string())?;
+    let tax = db::get_taxonomy(conn, prefix_owned.as_deref(), depth, limit)
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("as_deref", e))?;
     Ok(json!({
         "tree": tax.tree,
         (field_names::TOTAL_COUNT): tax.total_count,

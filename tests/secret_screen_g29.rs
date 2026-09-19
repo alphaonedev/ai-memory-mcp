@@ -19,6 +19,11 @@
 #![cfg(feature = "sal")]
 #![allow(clippy::missing_panics_doc)]
 
+// #3733 — key dirs created 0700 (not the ambient umask; the #3198 guard
+// refuses a group-writable key dir at umask 0002).
+#[path = "common/key_dir_sandbox.rs"]
+mod key_dir_sandbox;
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc;
@@ -77,7 +82,7 @@ fn spawn_mcp(db_path: &std::path::Path, mode: &str) -> (McpChild, mpsc::Receiver
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."))
         .join(format!("keys-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&key_dir).ok();
+    key_dir_sandbox::mkdir_0700(&key_dir);
     let mut child = Command::new(env!("CARGO_BIN_EXE_ai-memory"))
         .env("AI_MEMORY_NO_CONFIG", "1")
         .env("AI_MEMORY_KEY_DIR", &key_dir)

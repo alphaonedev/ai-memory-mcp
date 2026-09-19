@@ -43,8 +43,9 @@ use std::path::{Path, PathBuf};
 /// call sites in that file (the `fn refuse_pg_store` DEFINITION in
 /// `src/cli/backup.rs` is NOT a call — it lacks the `backup::` path prefix — so
 /// it is correctly excluded). Test-module sites are excluded by
-/// [`production_prefix`]. Total = 31 across 20 files (#2555: +1 doctor.rs
-/// `--repair-schema-version`).
+/// [`production_prefix`]. Total = 36 across 23 files (#2555: +1 doctor.rs
+/// `--repair-schema-version`; #3730: +3 — `inbox`, `notify`, the wake
+/// listener's catch-up inbox read).
 const GUARDED: &[(&str, usize, &str)] = &[
     ("src/cli/store.rs", 1, "`store` write."),
     (
@@ -89,7 +90,13 @@ const GUARDED: &[(&str, usize, &str)] = &[
     (
         "src/cli/reown.rs",
         1,
-        "`reown` re-ownership write (the CLI_REFERENCE overclaim fix).",
+        "`reown` re-ownership write — the LOCAL SQLite leg only. #3124 R4 \
+         (Conductor ruling condition 4) LIFTED the #2572 refusal for this ONE \
+         verb on a `sal` build: a `postgres://` store (flag or the #1927 env \
+         channels) is routed by `daemon_runtime`'s `Command::Reown` arm through \
+         the SAL `MemoryStore::reown` (audited, operator-only, record-stop \
+         refused) BEFORE this guard runs; the guard still refuses a Postgres \
+         store on a build that cannot route it.",
     ),
     ("src/cli/share.rs", 1, "`share` write."),
     (
@@ -139,6 +146,27 @@ const GUARDED: &[(&str, usize, &str)] = &[
          restamping the sqlite sidecar would be a phantom write (the pg ledger \
          is repaired via the admin DELETE the poison message names). The regular \
          doctor health pass is READ-ONLY and correctly carries no guard.",
+    ),
+    (
+        "src/cli/commands/inbox.rs",
+        1,
+        "#3730 — `inbox` READ: the inbox lives in the served store; reading the \
+         sidecar reported an EMPTY inbox while messages waited in Postgres (the \
+         wrong-result half of #2572). Missed by the #2572 census because the \
+         census counts guard calls, not `db::open` sites.",
+    ),
+    (
+        "src/cli/commands/notify.rs",
+        1,
+        "#3730 — `notify` WRITE: a message written to the sidecar is one the served \
+         store never reads — reported as delivered while the recipient never sees \
+         it (the lost-write half of #2572).",
+    ),
+    (
+        "src/cli/wake_listen.rs",
+        1,
+        "#3730 — the wake listener's catch-up inbox read is the same read \
+         `ai-memory inbox` makes, gated the same way.",
     ),
 ];
 
@@ -249,8 +277,9 @@ fn every_class_a_guard_call_is_enumerated_2572() {
 
     let total: usize = GUARDED.iter().map(|(_, n, _)| n).sum();
     assert_eq!(
-        total, 33,
-        "the pinned class-(a) guard total drifted from 33 (#2572; 31 + #3587 U2 watch + U4 capture-turn)"
+        total, 36,
+        "the pinned class-(a) guard total drifted from 36 (#2572; 31 + #3587 U2 watch + U4 \
+         capture-turn + #3730 inbox / notify / wake-listen catch-up read)"
     );
     assert!(
         problems.is_empty(),

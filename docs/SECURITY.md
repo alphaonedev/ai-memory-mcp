@@ -137,6 +137,195 @@ Per the adjudication these carry design-level mitigation for v1.0.0 (no
 dedicated build lane); each is split into its own tracking issue if it
 grows one.
 
+### The deployment-shape detector (#3700)
+
+The posture floor comes from the DECLARED shape — `[deployment] shape`
+(#3714; `ai-memory config show` renders the derivation table, and
+`production` / `federated` / `hive` pin `asi-hard` as a floor). What #3700
+adds is the detector that keeps that declaration honest
+([`src/config/shape/detector.rs`](../src/config/shape/detector.rs)): the machinery
+that stops one agent's wrong conclusion from becoming a swarm's shared
+truth must not sit OFF on a node whose configuration is plainly a fleet
+while its declaration still says `singleton`.
+
+At boot the node observes content-free signals and derives the least
+demanding shape consistent with them (the *observed floor*):
+
+| signal | class | source | present when |
+|---|---|---|---|
+| `outbound_peers` | federation | argv | `serve --quorum-peers` / `sync-daemon --peers` |
+| `inbound_bindings` | federation | env | peer fingerprints, cert↔peer-id bindings or a trust bundle |
+| `listener_mtls` | federation | argv | `serve --mtls-allowlist` |
+| `peer_allowlist` | federation | env | `AI_MEMORY_FED_PEER_ATTESTATION` is set (even `{}`, even invalid) |
+| `mcp_federation_forward_url` | federation | config | MCP writes fan out to a federation daemon |
+| `wake_hub` | multi-agent | config | `[wake_hub]` — the multi-agent wake plane |
+| `agent_registry` | multi-agent | store | 2 or more registered agents (read from the real store once open) |
+
+No signal → `singleton`; multi-agent signals only → `team`; any federation
+signal → `federated`. A signal a process cannot see (argv from `doctor`,
+the store before it opens) is `unobservable`, never `absent`.
+
+- **Undeclared promotion** (observed floor above the declared shape): the
+  boot WARNS once and RECORDS it (forensic audit kind
+  `deployment_shape.undeclared_signals`; the `deployment_shape` field of
+  capabilities), naming the exact line to declare —
+  `[deployment] shape = "<observed>"`. Promotion is an operator act:
+  detection never re-postures and never pins. With the posture at
+  `standard` the warning says so in as many words: every anti-cascade
+  protection is OFF.
+- **Hardened declared shape with knobs below the floor** (`production` /
+  `federated` / `hive` and any pinned knob set below `asi-hard`): the boot
+  is REFUSED, naming every such knob and both ways out (raise or unset each
+  knob, or declare a shape whose posture is a default).
+- **Singleton with no signals**: byte-identical boot. Zero-config local-CA
+  minting (#3709) follows the DECLARED shape and is singleton-only — a
+  node whose signals show a fleet is warned, never re-postured: the
+  operator declares the shape and enrols real peer identities.
+
+**Migration honesty.** The detector shipped with the refusal, so run
+`ai-memory doctor` BEFORE upgrading: its default report carries
+"Deployment shape detector (#3700)" right after the declared shape and
+states the declared shape, the observed floor and its signals, the
+promotion line, the posture and its origin, the protections that are off,
+and the boot verdict the next boot will reach. Doctor never refuses.
+
+### Only encrypted data in transit (#3705)
+
+Operator mandate (2026-09-13, ranks with the North Star): *"only encrypted
+data in transit. there is to never be any unencrypted data in transit
+anywhere in the ai-memory architecture."* "Anywhere" is literal — no
+exemption for loopback, localhost, a dev profile, a single-node install or a
+lab. Loopback is shared by every local process on a multi-agent host, so
+*peer is loopback* is not *peer is trusted* (the #2502 ruling). The floor
+lives in one module, [`src/transit_encryption.rs`](../src/transit_encryption.rs);
+every transit surface consults it.
+
+| surface | funnel | behaviour since #3705 |
+|---|---|---|
+| the daemon listener — every API route, MCP-over-HTTP, `/metrics` | `tls_bind_guard` in `bootstrap_serve` | a bind without `--tls-cert` + `--tls-key` is REFUSED on every host, loopback included; the refusal names the plaintext path |
+| outbound federation peers (`--quorum-peers`, `sync-daemon --peers`) | `tls::validate_peer_url_scheme` | every `http://` peer is REFUSED, loopback included |
+| webhook targets | `subscriptions::validate_url` (create AND dispatch) | every `http://` target is REFUSED, loopback included; https only — a receiver behind a private PKI is trusted via `[subscriptions] ca_cert` (a PEM the dispatcher adds to the public roots; unreadable/unparseable refuses boot) |
+| PostgreSQL store DSN | `PostgresStore` connect funnel | a DSN that does not pin `sslmode=verify-full` (last `sslmode` wins) is REFUSED before a socket opens |
+| MCP → daemon forward URL (`mcp_federation_forward_url`) | boot (`transit_encryption::enforce_config_urls`) | an `http://` URL REFUSES boot |
+
+**One grammar.** `AI_MEMORY_REQUIRE_TLS` is now a floor: unset and every
+canonical truthy token (`1`/`true`/`yes`/`on`, `security_profile::is_truthy`)
+affirm it; a falsy token is a downgrade request and refuses boot; an
+unrecognised token refuses boot rather than proceeding in cleartext. The
+pre-#3705 reader accepted only `1`/`true`, so `=yes` silently left TLS
+optional — the sibling control documented the rule it violated.
+
+**No downgrade paths.** `AI_MEMORY_ALLOW_PLAINTEXT_NONLOOPBACK` and
+`AI_MEMORY_FED_ALLOW_PLAINTEXT_PEERS` can never open plaintext again; a
+truthy value refuses boot in every posture. A reachable downgrade path is a
+defect even when never taken, because an attacker chooses when it is taken.
+
+**Fail closed.** Absent, malformed or unrecognised configuration refuses,
+never proceeds in cleartext — deliberately the opposite of #3701, where
+entitlement fails OPEN: an entitlement failure must never cost a customer
+their data; a transit-encryption failure must never expose it.
+
+**Migration.** Run `ai-memory doctor` with the new binary BEFORE upgrading:
+its third section, "Transit encryption (#3705)", states the selector token,
+the armed downgrade paths, the forward-URL scheme, the store DSN `sslmode`,
+the local certificate's state, the plaintext webhook targets already in the
+store, and the boot verdict. Then point every client, peer and webhook at
+`https://`, and append `?sslmode=verify-full&sslrootcert=<ca.crt>` to the
+PostgreSQL DSN. The listener needs no preparation: see the next subsection.
+
+#### Zero-config first boot (#3709 item 1) — SINGLETON shape only
+
+TLS is required; on a **singleton** (no fleet signal per
+[`src/config/shape/detector.rs`](../src/config/shape/detector.rs)) the flags are
+optional. A singleton `serve` with no `--tls-cert`/`--tls-key` generates an
+installation-local CA and a server certificate
+([`src/tls_bootstrap.rs`](../src/tls_bootstrap.rs)) under
+`<key_dir>/tls/` — `local-ca.pem`, `local-ca.key` (0600), `server.pem`,
+`server.key` (0600), directory 0700. The CA lives 3650 days; the leaf 90
+days, covering the bind host, and is re-issued inside a 30-day window at
+boot and by a daily in-daemon task that hot-reloads the listener. Two
+constraints hold this in the mandate:
+
+- **Generation is not trust.** Nothing trusts the local CA implicitly: a
+  client trusts it explicitly (`curl --cacert <key_dir>/tls/local-ca.pem
+  https://127.0.0.1:9077/api/v1/health`); the bundled clients
+  (`doctor --remote`, the MCP forwarder) add it as a root for THIS
+  installation only. It is never used to trust a federation peer — peer
+  trust stays explicit (`--quorum-ca-cert`, `AI_MEMORY_FED_PEER_FINGERPRINTS`,
+  `--mtls-allowlist`; the #2448 posture is unchanged).
+- **No silent downgrade.** A generation or renewal failure is loud and the
+  listener does not fall back to plaintext; an expired leaf refuses the
+  next boot (doctor's `local_tls_material` fact says so first).
+
+Operators with their own PKI pass `--tls-cert`/`--tls-key`; the local CA
+is then not consulted for the listener. Every refusal names its fix, and
+names only what exists in this release: the `--tls-cert`/`--tls-key` flags,
+the `sslmode=verify-full&sslrootcert=<ca.crt>` DSN parameters, and the files
+under `<key_dir>/tls/`. The `ai-memory tls init|import|renew` and
+`ai-memory db check-tls` verbs are #3709 items 2–4 (v1.0.1, a separate
+branch); a refusal never points at a verb that does not ship with it. Until
+they land, first-boot generation (singleton) and `--tls-cert`/`--tls-key`
+are the two paths.
+
+#### Bring your own certificate (enterprise PKI) — the fleet path
+
+3x7 audit ruling: *a product that mints an unmanaged CA into an enterprise
+estate on first boot is an audit finding, not a feature.* Every
+deployment whose **declared** shape is not `singleton` — `team`,
+`production`, `federated`, `hive` (`[deployment] shape`, #3714) — takes
+enterprise PKI as the first-class path. The declaration decides, never an
+observed signal: the #3700 detector may WARN that a node configured like a
+fleet is still declared `singleton`, but promotion is an operator act and
+nothing re-postures a running node (the local CA it minted is trusted only
+by the bundled clients on that host — never by a peer).
+
+- **What the certificate must cover.** A server certificate issued by your
+  PKI whose subject alternative names include every bind host the daemon
+  answers on (`--host`, the hostnames peers and clients dial, `127.0.0.1` /
+  `localhost` if anything dials loopback). Wildcards are acceptable where
+  your PKI policy allows them.
+- **How it is supplied.** `--tls-cert <fullchain.pem>` (leaf first, then
+  intermediates, PEM) and `--tls-key <key.pem>` (PKCS#8 PEM; SEC1/RSA
+  are accepted). The key file must be owner-only (`chmod 0600`), the
+  directory `0700`; the daemon refuses lax modes the same way it refuses a
+  lax key directory (#3198).
+- **Rotation.** Replace the files in place and restart, or use
+  `--tls-cert <fullchain.pem> --tls-key <key.pem>` (an `ai-memory tls import` verb is #3709 item 2, v1.0.1, separate
+  owner) which validates the pair and hands it to the daily reload task so
+  the listener picks the new material up without a restart. Expiry shows in
+  `ai-memory doctor` (`local_tls_material`) before it bites.
+- **What refuses.** A `serve` under a declared non-singleton shape without
+  operator material is refused at boot
+  (`transit_encryption::fleet_needs_enterprise_pki_refusal`, naming the
+  `[deployment] shape` line and the remedy). Nothing learned at runtime
+  (peers, the agent registry) promotes a node into this refusal — it is
+  reported by the #3700 detector and by `doctor`, and the operator declares
+  the shape. The installation-local CA is **never** consulted under a
+  declared fleet shape, and never used to trust a federation peer
+  — peer trust stays explicit (`--quorum-ca-cert`,
+  `AI_MEMORY_FED_PEER_FINGERPRINTS`, `--mtls-allowlist`; #2448 unchanged).
+- **Doctor remediation line.** "Transit encryption (#3705)" reports
+  `local_tls_material` as `absent — enterprise PKI required …` or
+  `present but LOCALLY MINTED — … audit finding; REFUSES at next boot` on a
+  fleet, Critical, with the remedy text verbatim.
+
+**Open items, stated rather than silently exempted.**
+
+- *Model-server egress.* Prompts and memory content leave the process
+  towards the LLM / embedding endpoints (`[llm].base_url`,
+  `[embeddings].url`, the legacy `ollama_url`, whose compiled default is
+  `http://localhost:11434`). #3705 DETECTS a plaintext endpoint in doctor
+  (`llm_egress_plaintext`) but does not yet refuse it; the operator's
+  ruling on local model servers is pending.
+- *Federation content is not end-to-end encrypted* (#1968;
+  `src/tls.rs` records it). Transport TLS satisfies "encrypted in transit"
+  on the wire; a TLS-terminating intermediary — a load balancer, a reverse
+  proxy, a compromised peer — sees plaintext memory content. Whether the
+  mandate reaches that far is put to the operator, not assumed.
+- *In-kernel IPC.* The wake-hub UNIX domain socket (content-free wakes) and
+  MCP over stdio are kernel-local pipes, not network transit. They are
+  named here so the exemption is explicit, never implied.
+
 ## Trust boundaries
 
 ```
@@ -254,6 +443,67 @@ spawned children. Operators who need the env channel may set
 Defaults (page size, cipher, KDF iterations) match SQLCipher 4.x. To
 open the DB manually: `sqlcipher ai-memory.db` + `PRAGMA key='…';`.
 
+### Per-agent content keys never mint on a read (#3718)
+
+Content sealed at rest (`AI_MEMORY_ENCRYPT_AT_REST` / `[encryption].at_rest`)
+is keyed to a per-agent X25519 pair under the key directory
+(`<agent_id>.x25519.priv`, mode 0600). The accessor is split:
+
+- **Reads** (`encryption::load_keypair`, both decrypt arms of
+  `open_content`) NEVER create key material. A missing `.priv` is the
+  typed `KeyAbsent` error — distinct from an AEAD failure, because "your
+  key is missing" is actionable and "wrong recipient" sends the operator
+  hunting the wrong problem. The caller sees the class (`key_absent`) and
+  the agent, never a path; the operator log (`security.encryption.keys`)
+  names the expected file and the remedy (restore it from backup or the
+  #3717 escrow). The row is untouched; it reads again the moment the key
+  is back.
+- **Writes** (`encryption::get_or_create_keypair`, the seal path only)
+  mint exactly once, on the first write for an agent that has never had a
+  key. A key directory that holds ARCHIVED material of a prior generation
+  (`<agent_id>.x25519.{pub,priv}.<suffix>`) and no live key is a LOST key,
+  not a new agent: the write is refused (`key_generation_gap`) rather than
+  minting generation N+1 over it.
+
+Before #3718 a read with the key file missing minted a fresh pair before
+failing, masking the loss as "wrong key" and forking the key generation so
+no single restore could heal the corpus.
+
+### The at-rest key is escrowed at mint (#3717)
+
+A lost `<agent>.x25519.priv` no longer means lost content. When a
+deployment RECOVERY key is enrolled (`ai-memory keys init
+--recovery-key-out <off-node-file>` mints an X25519 pair, writes the
+private half to that file — created `0600`, for the operator to move
+off-node — and enrolls the public half as `<key_dir>/recovery.x25519.pub`),
+every at-rest key mint writes `<agent>.x25519.escrow` between the private
+and the public half: the private half wrapped under the recovery public
+key with the same `0x02` ECDH + HKDF + ChaCha20-Poly1305 envelope the
+content uses, over the plaintext `agent_id || 0x00 || secret` so an
+escrow cannot be replayed under another agent's name. Sealed rows, the
+per-record DEK wrap and crypto-erase are unchanged.
+
+`ai-memory keys recover --recovery-key <file>` reads the recovery private
+half from that file only (a `0600` file channel, never argv), unwraps the
+escrow, refuses when a present `.x25519.pub` disagrees with the unwrapped
+secret (an escrow of another key generation), restores the private half
+FIRST, and evicts the in-process key cache so the next read opens the
+sealed rows again. `keys init` REFUSES to mint an at-rest key without an
+enrolled recovery key; the seal path (`get_or_create_keypair`) still
+mints bare for a deployment that never enrolled one, and says so on the
+operator log — that is the `[encryption].at_rest = true`-without-escrow
+posture the shape contract admits, and `keys status` reports the missing
+escrow as recoverable so it can be backfilled.
+
+Trust consequence, stated plainly: whoever holds the recovery private
+file can decrypt every agent's at-rest content on that node. That is the
+recoverability-over-confidentiality trade the standing rule requires (a
+lost key must never mean lost memory), and it is declared in the
+certification declaration (#3557), not silent. The guardian set
+(`AI_MEMORY_RECOVERY_GUARDIAN_PUBKEYS`) is a signature quorum for the
+identity-lineage recovery record, not a secret-sharing split of this
+file; splitting the recovery secret is a separate, later decision.
+
 ### File permissions
 
 The daemon expects the DB file + WAL/SHM companions to be writable
@@ -325,7 +575,10 @@ Two related hardening knobs:
 
 The webhook dispatch path validates URLs before POSTing:
 
-- `https://` required unless the host is a loopback address.
+- `https://` required for every target, loopback included (#3705); a
+  receiver behind a private PKI is trusted through `[subscriptions]
+  ca_cert = "<PEM>"`, added to the public roots at boot (a file that does
+  not read or parse refuses boot).
 - Private-range IPv4 (10/8, 172.16/12, 192.168/16), IPv6
   unique-local, and link-local are rejected.
 - DNS is resolved once per send; we do NOT follow redirects.

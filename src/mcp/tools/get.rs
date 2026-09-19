@@ -117,7 +117,12 @@ pub(super) fn handle_get(
     // resolved-but-not-visible row is masked as not-found rather than 403'd so
     // existence is not disclosed. #3387 lifted the gate into `mask_invisible`
     // so every by-id content read shares one implementation.
-    match mask_invisible(db::resolve_id(conn, id).map_err(|e| e.to_string())?, caller) {
+    match mask_invisible(
+        db::resolve_id(conn, id).map_err(|e| {
+            crate::mcp::error_text::mcp_foreign_err(crate::mcp::error_text::site::RESOLVE_ID, e)
+        })?,
+        caller,
+    ) {
         Some(mem) => {
             let links = db::get_links(conn, &mem.id).unwrap_or_default();
             // Flatten: merge memory fields with links at top level (#96)

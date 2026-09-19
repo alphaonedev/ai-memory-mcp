@@ -10,12 +10,15 @@ are otherwise identical.
 from __future__ import annotations
 
 from types import TracebackType
+from collections.abc import AsyncIterator
 from typing import TYPE_CHECKING, Any
 
 import httpx
 
 from ai_memory._common import (
     DEFAULT_BASE_URL,
+    DEFAULT_EXPORT_PAGE_ROWS,
+    export_ceiling_from_error,
     DEFAULT_TIMEOUT,
     build_create_body,
     build_httpx_kwargs,
@@ -26,6 +29,7 @@ from ai_memory._common import (
     wrap_transport_error,
 )
 from ai_memory.attestation import sign_bind_challenge
+from ai_memory.errors import AiMemoryError
 from ai_memory.models import (
     AgentRegistration,
     BulkCreateResponse,
@@ -347,7 +351,37 @@ class AsyncAiMemoryClient:
         return await self._request("POST", "/api/v1/gc")
 
     async def export(self) -> Any:
+        """``GET /api/v1/export`` — the whole corpus as ONE JSON body.
+
+        Refused with HTTP 413 ``EXPORT_PAGING_REQUIRED`` past the daemon's
+        page ceiling (v1.0.0 #3288); use :meth:`export_pages` for any size.
+        """
         return await self._request("GET", "/api/v1/export")
+
+    async def export_pages(
+        self, limit: int | None = None, *, namespace: str | None = None
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Async twin of :meth:`AiMemoryClient.export_pages`: yield every
+        export page in order, following ``next_cursor``."""
+        cursor: str | None = None
+        while True:
+            params: dict[str, Any] = {"limit": limit, "cursor": cursor, "namespace": namespace}
+            if limit is None and cursor is None:
+                params["limit"] = DEFAULT_EXPORT_PAGE_ROWS
+            try:
+                page = await self._request("GET", "/api/v1/export", params=params)
+            except AiMemoryError as exc:
+                # The daemon's ceiling is lower than the default page size:
+                # it names its ceiling, so page at that instead.
+                ceiling = export_ceiling_from_error(exc)
+                if limit is not None or ceiling is None:
+                    raise
+                limit = ceiling
+                continue
+            yield page
+            cursor = page.get("next_cursor") if isinstance(page, dict) else None
+            if not cursor:
+                return
 
     async def import_(self, payload: Any) -> dict[str, Any]:
         return await self._request("POST", "/api/v1/import", json_body=payload)

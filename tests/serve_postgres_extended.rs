@@ -118,6 +118,7 @@ async fn spawn_daemon(
             ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty(),
         ),
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
+        ..Default::default()
     };
     let app_state = build_postgres_app_state(url).await;
     let shutdown = Arc::new(Notify::new());
@@ -572,7 +573,7 @@ async fn archive_list_returns_empty_envelope_on_postgres() {
         .json()
         .await
         .expect("archive stats body");
-    assert!(stats["total_archived"].is_number());
+    assert!(stats["archived_total"].is_number());
 
     shutdown.notify_one();
     let _ = handle.await;

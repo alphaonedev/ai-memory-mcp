@@ -213,6 +213,8 @@ pub const DEFAULT_TIMEOUT_SECONDS: &str = "default_timeout_seconds";
 /// `description` — wire/row field name.
 pub const DESCRIPTION: &str = "description";
 /// `dependents` — MCP/HTTP `memory_dependents_of_invalidated` list key.
+/// #3714 — the `[deployment]` config block.
+pub const DEPLOYMENT: &str = "deployment";
 pub const DEPENDENTS: &str = "dependents";
 /// `earliest_updated_at` — wire/row field name.
 pub const EARLIEST_UPDATED_AT: &str = "earliest_updated_at";
@@ -227,6 +229,9 @@ pub const EMBEDDINGS: &str = "embeddings";
 /// `embedding_dim` — wire/row field name (#1169 dim reporting; #1598
 /// `ResolvedEmbeddings` Debug field).
 pub const EMBEDDING_DIM: &str = "embedding_dim";
+/// `embedding_space` — row column carrying the embedder space fingerprint
+/// (#2167 provenance token; #3404 canonical-projection by-name reads).
+pub const EMBEDDING_SPACE: &str = "embedding_space";
 /// `entity_id` — metadata key naming the entity a reflection is about
 /// (drives auto-persona cadence via the denormalised
 /// [`MENTIONED_ENTITY_ID`] column). Canonical spelling SSOT; the MCP
@@ -298,6 +303,24 @@ pub const DANGLING_LINKS_WITHHELD: &str = "dangling_links_withheld";
 /// export withheld, so publishing it would leak the #2490 objection-O3
 /// index into the source corpus.
 pub const DANGLING_LINK_EDGES: &str = "dangling_link_edges";
+/// `next_cursor` — v1.0.0 #3288: the opaque resume token of a paged
+/// `GET /api/v1/export`; `null` on the last page.
+pub const NEXT_CURSOR: &str = "next_cursor";
+/// `undecryptable` — v1.0.0 #3288: rows the export read returned but could
+/// not decrypt, nested under [`WITHHELD`]. They are NOT in the artifact, so
+/// a non-zero count makes the body `partial`.
+pub const UNDECRYPTABLE: &str = "undecryptable";
+/// `partial` — v1.0.0 #3288: `true` when the export body does not carry
+/// every live row its range covers (a forbidden-class drop, a quarantined
+/// row, or an undecryptable row). Tombstones, expiry and redaction are
+/// reported but are not partial (see
+/// [`crate::export_scope::ExportWithholdLedger::is_partial`]).
+pub const PARTIAL: &str = "partial";
+/// #3288 — export body: `false` on every response today (the paged walk is
+/// a live keyset scan, never a snapshot); declared so a consumer can tell.
+pub const SNAPSHOT: &str = "snapshot";
+/// The row / export-body namespace key (one spelling for the SSOT gates).
+pub const NAMESPACE: &str = "namespace";
 /// `forged_signature_skipped` — import/sync report field name.
 pub const FORGED_SIGNATURE_SKIPPED: &str = "forged_signature_skipped";
 /// `from_agent_id` — wire/row field name.
@@ -398,6 +421,10 @@ pub const PARENT_NAMESPACE: &str = "parent_namespace";
 pub const PEER_ORIGIN: &str = "peer_origin";
 /// `pending_id` — wire/row field name.
 pub const PENDING_ID: &str = "pending_id";
+/// #3638 — the L1-8 reflect pending payload's proposed depth
+/// (`max(source depths) + 1`), written by the MCP reflect gates and the HTTP
+/// postgres write-admission gate, read back by `execute_reflect_from_payload`.
+pub const PROPOSED_DEPTH: &str = "proposed_depth";
 /// `persona_version` — wire/row field name.
 pub const PERSONA_VERSION: &str = "persona_version";
 /// `previous_valid_until` — wire/row field name.
@@ -453,6 +480,8 @@ pub const SENDER_POLICY_DIGEST_HEX: &str = "sender_policy_digest_hex";
 /// field: the sender's committed governance `policy_version` sequence at push
 /// time. ADDITIVE + backward-compatible (absent on pre-#1947 peers).
 pub const SENDER_POLICY_SEQ: &str = "sender_policy_seq";
+/// #3714 — `[deployment] shape`.
+pub const SHAPE: &str = "shape";
 /// `signing_agent` — wire/row field name.
 pub const SIGNING_AGENT: &str = "signing_agent";
 /// `similar_count` — boot / session_start payload annotation (#3352): how
@@ -521,6 +550,14 @@ pub const TOTAL_LINES: &str = "total_lines";
 pub const TOTAL_MEMORIES: &str = "total_memories";
 /// `to_namespace` — wire/row field name.
 pub const TO_NAMESPACE: &str = "to_namespace";
+/// `mode` — the #3202 vertical-promote marker key on a `store`-typed pending
+/// payload (`{id, to_namespace, mode: "vertical"}`), read by
+/// `crate::storage::execute_pending_action` and by the #2478 federation
+/// effect gate (`pending_action_effect`), which MUST stay in lockstep (#3629).
+pub const MODE: &str = "mode";
+/// `vertical` — the [`MODE`] value that routes a `store`-typed pending onto
+/// `promote_to_namespace` instead of the `Memory`-insert path.
+pub const MODE_VERTICAL: &str = "vertical";
 /// `transcript_id` — I2 link / I4 replay envelope.
 pub const TRANSCRIPT_ID: &str = "transcript_id";
 /// `transcripts` — wire/row field name.

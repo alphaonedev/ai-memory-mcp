@@ -28,8 +28,28 @@ from ai_memory.models import CreateMemory
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from ai_memory.attestation import AgentSigningKey
 
-DEFAULT_BASE_URL = "http://localhost:9077"
+# v1.0.0 #3782 — ``https`` even on loopback. Since #3705/#3709 every daemon
+# listener serves TLS and ``tls_bind_guard`` refuses to bind a plaintext one,
+# so an ``http://`` default could never reach a daemon. A zero-config daemon
+# serves a certificate from the local CA it writes to
+# ``<key_dir>/tls/local-ca.pem`` on first boot; pass that path as ``verify=``.
+DEFAULT_BASE_URL = "https://localhost:9077"
 DEFAULT_TIMEOUT = 30.0
+# v1.0.0 #3288 — rows per export page when the caller names no limit; the
+# daemon's default page ceiling (``AI_MEMORY_MAX_PAGE_SIZE``).
+DEFAULT_EXPORT_PAGE_ROWS = 1000
+# The daemon's typed refusal of an export ``limit`` above its page ceiling.
+EXPORT_LIMIT_OUT_OF_RANGE = "EXPORT_LIMIT_OUT_OF_RANGE"
+
+
+def export_ceiling_from_error(exc: Exception) -> int | None:
+    """The page ceiling a daemon named when it refused an export ``limit``
+    (HTTP 400 ``EXPORT_LIMIT_OUT_OF_RANGE``), or ``None`` for any other error."""
+    payload = getattr(exc, "payload", None)
+    if not isinstance(payload, dict) or payload.get("code") != EXPORT_LIMIT_OUT_OF_RANGE:
+        return None
+    ceiling = payload.get("max")
+    return ceiling if isinstance(ceiling, int) and ceiling > 0 else None
 
 #: The daemon's own default `memory_kind` when the field is absent. Kept here
 #: because a SIGNED write must sign the kind the server will actually store —
@@ -68,7 +88,8 @@ def build_httpx_kwargs(
 
     mTLS is wired through the stock httpx params:
 
-    * ``verify`` — path to the server CA bundle or ``True`` / ``False``.
+    * ``verify`` — path to the server CA bundle or ``True`` / ``False``. For a
+      zero-config daemon this is ``<key_dir>/tls/local-ca.pem`` (#3782).
     * ``cert`` — client certificate; accepts a single path or ``(cert, key)``.
 
     ``api_key`` is sent as ``X-API-Key`` (the server also accepts

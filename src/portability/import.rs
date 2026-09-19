@@ -694,7 +694,7 @@ fn apply_all_classes(
         // CLOBBERED an existing destination row's content whenever an
         // imported memory (different id) collided on `(title, namespace)`.
         let collision =
-            crate::storage::find_by_title_namespace(conn, &staged.title, &staged.namespace)
+            crate::storage::find_by_title_namespace(conn, &staged.title, &staged.namespace, None)
                 .with_context(|| format!("import: collision probe for memory {}", staged.id))?;
         // #2878 — whether the write below must be ATOMICALLY fail-closed
         // (`insert_imported_no_overwrite`, `INSERT … ON CONFLICT DO NOTHING`).
@@ -998,7 +998,7 @@ fn apply_all_classes(
         let row = row;
         let mem = &row.memory;
         let agent_id = crate::storage::memory_agent_id(mem);
-        let sealed = crate::encryption::seal_content(&mem.content, agent_id)?;
+        let sealed = crate::storage::seal_content_guarded(conn, &mem.content, agent_id)?;
         let content_to_store: &str = sealed.as_ref().map_or(mem.content.as_str(), |(_, ph)| ph);
         let encrypted_envelope: Option<&[u8]> = sealed.as_ref().map(|(env, _)| env.as_slice());
         // v1.0.0 #2385 — the v90 `archived_memories.cid` / `cid_genesis`
@@ -1754,6 +1754,12 @@ fn restamp_inbound_identity(
             report.restamped += 1;
         }
     }
+    // #3625 — TAIL GUARANTEE (mirrors the v1 importer + receive): after the
+    // `!trust_source` restamp above, ensure EVERY posture leaves a valid #3124
+    // owner stamp — trust-source-with-no-agent_id (Applied). A present author is
+    // Kept; non-object metadata is left UNTOUCHED (NotAnObject) so the
+    // metadata-shape validation still refuses it (#2264).
+    crate::identity::owner_stamp::ensure_stamped(&mut staged.metadata, &opts.caller_agent_id);
     original_claim
 }
 
@@ -2127,6 +2133,54 @@ mod tests {
 
     /// The explicit operator-trusted-backup posture (#2211) — the legacy
     /// verbatim behaviour the byte-exact round-trip tests exercise.
+
+    fn opts_caller_3625(trust: bool) -> ImportOptions {
+        ImportOptions {
+            trust_source: trust,
+            caller_agent_id: "ai:caller".into(),
+            ..ImportOptions::default()
+        }
+    }
+
+    fn v2_import_read_3625(id: &str, metadata: serde_json::Value) -> crate::models::Memory {
+        let src = fresh_conn("src-3625-");
+        let mut env = build_full_envelope(&src, "src", "2026-07-14T00:00:00Z").expect("export");
+        let mut m = memory_fixture(id, "t3625", "seed-author");
+        m.metadata = metadata;
+        env.memories.push(m);
+        let dst = fresh_conn("dst-3625-");
+        import_full_envelope(&dst, &env, &opts_caller_3625(true)).expect("import");
+        crate::db::get(&dst, id).expect("get").expect("row")
+    }
+
+    #[test]
+    fn v2_import_trust_source_keeps_present_author_3625() {
+        // (a) object WITH agent_id -> Kept (control).
+        let m = v2_import_read_3625(
+            "20000000-0000-0000-0000-000000000001",
+            serde_json::json!({"agent_id": "src-author"}),
+        );
+        assert_eq!(
+            m.metadata.get("agent_id").and_then(|v| v.as_str()),
+            Some("src-author")
+        );
+    }
+
+    #[test]
+    fn v2_import_stamps_authorless_even_under_trust_source_3625() {
+        // (b) object WITHOUT agent_id -> Applied. RED pre-wire.
+        let m = v2_import_read_3625(
+            "20000000-0000-0000-0000-000000000002",
+            serde_json::json!({}),
+        );
+        assert_eq!(
+            m.metadata.get("agent_id").and_then(|v| v.as_str()),
+            Some("ai:caller"),
+            "metadata={}",
+            m.metadata
+        );
+    }
+
     fn opts_trusted() -> ImportOptions {
         ImportOptions {
             trust_source: true,

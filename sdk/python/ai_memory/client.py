@@ -14,12 +14,15 @@ See :class:`AsyncAiMemoryClient` for the asyncio counterpart.
 from __future__ import annotations
 
 from types import TracebackType
+from collections.abc import Iterator
 from typing import TYPE_CHECKING, Any
 
 import httpx
 
 from ai_memory._common import (
     DEFAULT_BASE_URL,
+    DEFAULT_EXPORT_PAGE_ROWS,
+    export_ceiling_from_error,
     DEFAULT_TIMEOUT,
     build_create_body,
     build_httpx_kwargs,
@@ -30,6 +33,7 @@ from ai_memory._common import (
     wrap_transport_error,
 )
 from ai_memory.attestation import sign_bind_challenge
+from ai_memory.errors import AiMemoryError
 from ai_memory.models import (
     AgentRegistration,
     BulkCreateResponse,
@@ -55,12 +59,17 @@ class AiMemoryClient:
     closed, or call :meth:`close` explicitly.
 
     Args:
-        base_url: Daemon URL, default ``http://localhost:9077``.
+        base_url: Daemon URL, default ``https://localhost:9077``. The scheme
+            is ``https`` even on loopback — the daemon serves no plaintext
+            listener (#3705/#3709).
         api_key: If provided, sent as ``X-API-Key`` on every request.
         agent_id: If provided, sent as ``X-Agent-Id`` so the server stamps
             this identity on stored memories (see CLAUDE.md §Agent Identity).
         timeout: Seconds before a request is aborted.
-        verify: ``httpx`` ``verify`` — path to server CA bundle or bool.
+        verify: ``httpx`` ``verify`` — path to server CA bundle or bool. A
+            zero-config daemon serves a certificate from the local CA it
+            wrote to ``<key_dir>/tls/local-ca.pem`` on first boot; pass that
+            path to verify it (#3782). Never ``False``.
         cert: ``httpx`` ``cert`` — client cert for mTLS (path or
             ``(cert, key)``).
         headers: Additional headers to send on every request.
@@ -425,8 +434,50 @@ class AiMemoryClient:
         return self._request("POST", "/api/v1/gc")
 
     def export(self) -> Any:
-        """``GET /api/v1/export`` — dump every memory as JSON."""
+        """``GET /api/v1/export`` — the whole corpus as ONE JSON body.
+
+        Bounded since v1.0.0 (#3288): the daemon serves the one-shot body only
+        while the corpus fits its page ceiling (``AI_MEMORY_MAX_PAGE_SIZE``,
+        default 1000 rows) and refuses a larger corpus with HTTP 413
+        ``EXPORT_PAGING_REQUIRED`` rather than truncating it. Use
+        :meth:`export_pages` for a corpus of any size.
+        """
         return self._request("GET", "/api/v1/export")
+
+    def export_pages(
+        self, limit: int | None = None, *, namespace: str | None = None
+    ) -> Iterator[dict[str, Any]]:
+        """Yield every page of ``GET /api/v1/export?limit=&cursor=`` in order.
+
+        Each page is a full export body (``memories``, ``links``, ``count``,
+        ``withheld``, ``partial``, ``next_cursor``, ...). Importing the pages in
+        the order yielded never references a memory before it exists. The
+        ``withheld`` counts and ``partial`` flag are per page: sum / OR them
+        across the walk to learn what the export as a whole did not carry.
+        ``limit`` defaults to the daemon's page ceiling.
+        """
+        cursor: str | None = None
+        while True:
+            # #3427 — ``namespace`` scopes the walk; the daemon pins it in
+            # the cursor and echoes it as ``namespace`` on every page.
+            params: dict[str, Any] = {"limit": limit, "cursor": cursor, "namespace": namespace}
+            if limit is None and cursor is None:
+                # An explicit paging parameter is what selects paged mode.
+                params["limit"] = DEFAULT_EXPORT_PAGE_ROWS
+            try:
+                page = self._request("GET", "/api/v1/export", params=params)
+            except AiMemoryError as exc:
+                # The daemon's ceiling is lower than the default page size:
+                # it names its ceiling, so page at that instead.
+                ceiling = export_ceiling_from_error(exc)
+                if limit is not None or ceiling is None:
+                    raise
+                limit = ceiling
+                continue
+            yield page
+            cursor = page.get("next_cursor") if isinstance(page, dict) else None
+            if not cursor:
+                return
 
     def import_(self, payload: Any) -> dict[str, Any]:
         """``POST /api/v1/import``."""

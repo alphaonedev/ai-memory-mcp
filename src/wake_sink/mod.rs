@@ -294,6 +294,12 @@ pub struct SinkMetricsSnapshot {
     pub wakes_seen: u64,
     /// Handed to a live recipient's writer queue.
     pub delivered: u64,
+    /// Frames the UDS forwarder WROTE to the hub (bytes out). Distinct from
+    /// [`Self::delivered`], which the in-process sink increments only on a
+    /// CONFIRMED delivery: the forwarder is fire-and-forget with no positive
+    /// ack, so a written frame the hub later refuses moves a `dropped_*`
+    /// counter instead — the two never both count the same frame (#3641).
+    pub written: u64,
     /// Recipient offline but known: coalesced into its pending set.
     pub coalesced: u64,
     /// Recipient offline and never seen: nothing to coalesce onto.
@@ -336,6 +342,7 @@ impl SinkMetricsSnapshot {
 pub struct SinkMetrics {
     wakes_seen: AtomicU64,
     delivered: AtomicU64,
+    written: AtomicU64,
     coalesced: AtomicU64,
     dropped_unknown: AtomicU64,
     dropped_overflow: AtomicU64,
@@ -362,6 +369,7 @@ impl SinkMetrics {
     bump!(
         wakes_seen,
         delivered,
+        written,
         coalesced,
         dropped_unknown,
         dropped_overflow,
@@ -383,6 +391,7 @@ impl SinkMetrics {
         SinkMetricsSnapshot {
             wakes_seen: self.wakes_seen.load(Ordering::Relaxed),
             delivered: self.delivered.load(Ordering::Relaxed),
+            written: self.written.load(Ordering::Relaxed),
             coalesced: self.coalesced.load(Ordering::Relaxed),
             dropped_unknown: self.dropped_unknown.load(Ordering::Relaxed),
             dropped_overflow: self.dropped_overflow.load(Ordering::Relaxed),

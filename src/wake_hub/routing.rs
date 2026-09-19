@@ -505,6 +505,34 @@ impl Router {
         }
     }
 
+    /// Reset an agent's subscription set to EXACTLY `keep`, dropping every
+    /// topic membership not in it. Only ever REMOVES — a topic in `keep` the
+    /// agent is not already subscribed to is not added, so the count can never
+    /// rise.
+    ///
+    /// Called when a new session displaces an older one for the same agent id.
+    /// The topic index is keyed by agent id, NOT by session, so a topic the
+    /// DISPLACED session added at runtime — never re-declared in the new
+    /// session's hello — would otherwise survive here: the displaced session's
+    /// [`Self::unregister`] compare-and-remove no longer matches the route, so
+    /// its [`Self::unsubscribe_all`] cleanup is skipped, and the leftover
+    /// topic, being in no live session's `subscribed` set, escapes the #3505
+    /// one-second revalidation forever. Resetting to the replacement's
+    /// revalidated `keep` restores the invariant that the index equals the
+    /// live session's subscription set, so #3505 covers exactly the index.
+    pub fn reset_subscriptions(&self, agent_id: &str, keep: &[String]) {
+        let keep: HashSet<&str> = keep.iter().map(String::as_str).collect();
+        for shard in &self.topics {
+            let mut guard = lock(shard);
+            guard.retain(|topic, subs| {
+                if !keep.contains(topic.as_str()) {
+                    subs.remove(agent_id);
+                }
+                !subs.is_empty()
+            });
+        }
+    }
+
     /// How many topics is this agent subscribed to?
     #[must_use]
     pub fn subscription_count(&self, agent_id: &str) -> usize {
@@ -915,6 +943,53 @@ mod tests {
         r.unsubscribe("a", &["#hive".to_string()]);
         assert!(r.topic_recipients("#hive", "").is_empty());
         assert_eq!(r.topic_recipients("#swarm", ""), ["a"]);
+    }
+
+    #[test]
+    fn reset_subscriptions_resets_to_exactly_keep_and_never_adds() {
+        let r = router(8, 4_096, 1 << 20);
+        let (_s, _rec) = connect(&r, "a");
+        assert!(r.subscribe(
+            "a",
+            &[
+                "#hive".to_string(),
+                "#swarm".to_string(),
+                "#leaked".to_string(),
+            ]
+        ));
+        let before = r.subscription_count("a");
+        assert_eq!(before, 3);
+
+        // Reset to a SUBSET keeps exactly that subset and drops the leftovers.
+        r.reset_subscriptions("a", &["#swarm".to_string()]);
+        let after = r.subscription_count("a");
+        assert!(after <= before, "reset must never add");
+        assert_eq!(after, 1);
+        assert_eq!(r.topic_recipients("#swarm", ""), ["a"]);
+        assert!(r.topic_recipients("#hive", "").is_empty());
+        assert!(r.topic_recipients("#leaked", "").is_empty());
+
+        // A keep topic the agent is NOT subscribed to must NOT be added — reset
+        // only ever removes, so the count cannot rise.
+        let n = r.subscription_count("a");
+        r.reset_subscriptions("a", &["#swarm".to_string(), "#never".to_string()]);
+        assert_eq!(
+            r.subscription_count("a"),
+            n,
+            "reset must never add a keep topic the agent lacked"
+        );
+        assert!(r.topic_recipients("#never", "").is_empty());
+
+        // Resetting agent `a` must never evict another agent from a shared topic.
+        let (_s2, _rec2) = connect(&r, "b");
+        assert!(r.subscribe("b", &["#swarm".to_string()]));
+        r.reset_subscriptions("a", &[]);
+        assert_eq!(r.subscription_count("a"), 0);
+        assert_eq!(
+            r.topic_recipients("#swarm", ""),
+            ["b"],
+            "reset for a must not evict b"
+        );
     }
 
     #[test]

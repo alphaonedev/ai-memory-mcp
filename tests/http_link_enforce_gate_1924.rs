@@ -90,6 +90,7 @@ fn build_test_router() -> (axum::Router, NamedTempFile) {
             ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty(),
         ),
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
+        ..Default::default()
     };
     let router = ai_memory::build_router(api_key_state, app_state);
     (router, f)

@@ -128,6 +128,7 @@ fn build_router_with(
         mtls_enforced: false,
         enrolled_agent_keys: enrolled,
         identity_mode: mode,
+        ..Default::default()
     };
     let router = ai_memory::build_router(api_key_state, app_state);
     (router, f)

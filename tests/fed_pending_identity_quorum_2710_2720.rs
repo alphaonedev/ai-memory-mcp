@@ -147,6 +147,7 @@ fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
             ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty(),
         ),
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
+        ..Default::default()
     };
     (ai_memory::build_router(api_key_state, app_state), db)
 }
@@ -454,4 +455,98 @@ async fn federated_reject_converges_explicit_scope_opt_out_2720() {
         row.status, "rejected",
         "explicit scope opt-out reject converges: {report}"
     );
+}
+
+// ---- #3628 (CWE-346) — the APPROVE arm rebinds the decider like the REJECT arm ---
+
+/// #3628 — `/sync/push` `pending_decisions[]` APPROVE passed the wire
+/// `dec.decider` straight into `approve_with_approver_type`, while REJECT had
+/// rebound it through `resolve_inbound_decider` since #2720: an enrolled peer
+/// could record an approval as ANY registered local agent other than the
+/// requester. ONE `resolve_inbound_decider` call now serves both arms.
+///
+/// Pinned on the SINK — the persisted `pending_actions.decided_by` — with all
+/// three legs in ONE push, so the arms cannot drift apart again:
+/// * ABSENT — an approve whose wire `decider` is another registered local
+///   agent lands `approved` with `decided_by` = the attested peer, never the
+///   wire value;
+/// * CONTROL — a reject on the same push keeps its already-rebound actor;
+/// * PRESENT — a well-formed self-approve from the peer still records.
+#[tokio::test]
+async fn federated_approve_rebinds_forged_decider_3628() {
+    const REQUESTER: &str = "ai:requester-3628";
+    const VICTIM: &str = "ai:bob-3628";
+    let _lock = ENV_LOCK.lock().await;
+    let _g = PostureGuard;
+    set_enrolled_self_only();
+    let (router, db) = build_router_with_db();
+
+    // Both the peer and the victim are REGISTERED local agents (the approve
+    // gate refuses an unregistered approver); the requester is a third party
+    // so neither approve is a self-approval.
+    {
+        let guard = db.lock().await;
+        ai_memory::db::register_agent(&guard.0, PEER_ID, "service", &[]).expect("register peer");
+        ai_memory::db::register_agent(&guard.0, VICTIM, "service", &[]).expect("register victim");
+        for id in ["pa-3628-forged", "pa-3628-rej", "pa-3628-self"] {
+            let pa = PendingAction {
+                id: id.into(),
+                action_type: "store".into(),
+                memory_id: None,
+                namespace: "public/ok".into(),
+                payload: json!({
+                    "title": format!("{id} title"),
+                    "content": format!("{id} content"),
+                    "namespace": "public/ok"
+                }),
+                requested_by: REQUESTER.into(),
+                requested_at: chrono::Utc::now().to_rfc3339(),
+                status: "pending".into(),
+                decided_by: None,
+                decided_at: None,
+                approvals: vec![],
+            };
+            ai_memory::db::upsert_pending_action(&guard.0, &pa).unwrap();
+        }
+    }
+
+    let decisions = vec![
+        json!({"id": "pa-3628-forged", "approved": true, "decider": VICTIM}),
+        json!({"id": "pa-3628-rej", "approved": false, "decider": VICTIM}),
+        json!({"id": "pa-3628-self", "approved": true, "decider": PEER_ID}),
+    ];
+    let (st, report) = push(&router, push_body(vec![], decisions)).await;
+    assert_eq!(st, StatusCode::OK, "{report}");
+
+    let guard = db.lock().await;
+    let row = |id: &str| {
+        ai_memory::db::get_pending_action(&guard.0, id)
+            .unwrap()
+            .expect("row survives")
+    };
+
+    // ABSENT — the forged approve is recorded as the attested peer, and the
+    // approval still landed (a rebound decider is a registered non-requester).
+    let forged = row("pa-3628-forged");
+    assert_eq!(forged.status, "approved", "{report}");
+    assert_eq!(
+        forged.decided_by.as_deref(),
+        Some(PEER_ID),
+        "#3628: the APPROVE arm must rebind the wire decider to the attested peer: {report}"
+    );
+    assert_ne!(
+        forged.decided_by.as_deref(),
+        Some(VICTIM),
+        "#3628: the wire-forged approver id must never be recorded"
+    );
+
+    // CONTROL — the REJECT arm on the same push keeps its #2720 rebinding.
+    let rej = row("pa-3628-rej");
+    assert_eq!(rej.status, "rejected", "{report}");
+    assert_eq!(rej.decided_by.as_deref(), Some(PEER_ID));
+
+    // PRESENT — the peer's own well-formed approve still records as the peer.
+    let own = row("pa-3628-self");
+    assert_eq!(own.status, "approved", "{report}");
+    assert_eq!(own.decided_by.as_deref(), Some(PEER_ID));
 }

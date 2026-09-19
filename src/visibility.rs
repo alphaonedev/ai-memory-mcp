@@ -188,6 +188,160 @@ pub fn is_visible_by_fields(
     }
 }
 
+/// v1.0.0 Consolidation Unit 1 (#3690 / #3695 / #3696 / #3712) — the row that
+/// currently HOLDS a `(title, namespace)` slot, as a write funnel read it
+/// (`SELECT id, namespace, metadata, lifecycle_state`), for
+/// [`title_slot_admission`]. `lifecycle_state` is the raw column text so an
+/// unknown value (a state a newer binary wrote) can be refused fail-closed.
+#[derive(Debug, Clone, Copy)]
+pub struct TitleSlotOccupant<'a> {
+    pub id: &'a str,
+    pub namespace: &'a str,
+    pub metadata: &'a serde_json::Value,
+    pub lifecycle_state: &'a str,
+}
+
+/// THE ONE admission predicate every create funnel consults before its
+/// `ON CONFLICT (title, namespace)` statement, on both adapters — answering
+/// BOTH visibility axes (the Conductor's Unit 1 arity ruling):
+///
+/// * the LIFECYCLE axis, [`crate::models::LifecycleState::title_slot_admission_for`]:
+///   a tombstone holds no slot ([`TitleSlotAdmission::Free`] — the store lands
+///   beside it, #3690); `quarantined` / `contaminated` / unknown keeps its
+///   slot and refuses (#3695);
+/// * the SCOPE axis, [`is_visible_by_fields`] (the public predicate every
+///   read lane already applies — NOT a fourth copy of it): a live occupant
+///   the `viewer` cannot read (another agent's `scope=private` row) is
+///   [`TitleSlotAdmission::Refused`] exactly like a hidden one, because the
+///   only other outcomes are writing the caller's text into a row they
+///   cannot read or inserting beside it, which the live-unique index forbids
+///   (#3696).
+///
+/// `viewer` is the SAME value the read lanes resolve — MCP
+/// `identity::resolve_read_visibility_caller()`, HTTP the resolved request
+/// agent, SAL `CallerContext` (`None` under `bypass_visibility`) — so a write
+/// is never refused on a row the same caller could read; `None` is the
+/// documented single-tenant trust-all posture, which decides on the lifecycle
+/// axis only. A `Refused` verdict is rendered by every funnel as the typed
+/// conflict with an EMPTY id: the row is never named or described.
+///
+/// The SQL partial index and the in-statement merge backstop stay
+/// lifecycle-only on purpose: uniqueness among live rows is a column-level
+/// fact; the scope axis is decided here, in Rust, before the statement.
+#[must_use]
+pub fn title_slot_admission(
+    occupant: &TitleSlotOccupant<'_>,
+    viewer: Option<&str>,
+) -> crate::models::TitleSlotAdmission {
+    use crate::models::TitleSlotAdmission;
+    match crate::models::LifecycleState::title_slot_admission_for(occupant.lifecycle_state) {
+        TitleSlotAdmission::Occupied => match viewer {
+            None => TitleSlotAdmission::Occupied,
+            Some(caller)
+                if is_visible_by_fields(
+                    occupant.id,
+                    occupant.namespace,
+                    occupant.metadata,
+                    caller,
+                ) =>
+            {
+                TitleSlotAdmission::Occupied
+            }
+            Some(_) => TitleSlotAdmission::Refused,
+        },
+        other => other,
+    }
+}
+
+/// Consolidation Unit 1 — what a create funnel DOES with its
+/// `(title, namespace)` statement, decided ONCE for all THREE
+/// [`crate::storage::InsertConflictArm`]s on BOTH adapters by
+/// [`title_slot_disposition`]. Every funnel's routing is a match on this
+/// value; no adapter re-derives the arm × occupant matrix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TitleSlotDisposition {
+    /// Run the arm's statement as written (`ON CONFLICT (title, namespace)
+    /// WHERE <live>`): a fresh insert, a merge into / a no-overwrite refusal
+    /// of / a same-id CAS onto the LIVE occupant the viewer may read.
+    Proceed,
+    /// `RestoreSameId` onto the caller's OWN tombstone (#2887 / #2894): the
+    /// tombstone is NOT in the partial index, so the key does not conflict;
+    /// the SAME `DO UPDATE` arm is re-targeted at the PRIMARY KEY so the
+    /// restore merges IN PLACE and the row stays tombstoned — never a second
+    /// live row beside it.
+    ProceedByPrimaryKey,
+    /// Refuse with the typed conflict. `named` is the occupant's id ONLY when
+    /// the viewer may read it (a `RestoreSameId` whose key a DIFFERENT live,
+    /// visible row holds — vote Q3); `None` renders the EMPTY id: an occupant
+    /// hidden on either axis is never named (#3695 / #3696).
+    Refuse { named: Option<String> },
+}
+
+/// The occupant facts [`title_slot_disposition`] decides on: the LIVE holder
+/// of the key (if any) and the row already stored under the INCOMING id when
+/// that row carries the same key but is NOT the holder (a tombstone, or a
+/// hidden row) — both with their [`title_slot_admission`] verdict.
+#[derive(Debug, Clone)]
+pub struct TitleSlotFacts {
+    /// `(id, admission)` of the live `(title, namespace)` holder.
+    pub holder: Option<(String, crate::models::TitleSlotAdmission)>,
+    /// Admission of the same-id, same-key row that is not the holder.
+    pub same_id_hidden: Option<crate::models::TitleSlotAdmission>,
+}
+
+/// THE ONE arm × occupant matrix (the Conductor's Unit 1 ruling: a same-id
+/// occupant must have an EXPLICIT verdict, and no adapter may build a second
+/// source of truth for it):
+///
+/// | occupant                                   | Merge         | Refuse        | RestoreSameId          |
+/// |--------------------------------------------|---------------|---------------|------------------------|
+/// | none (free slot)                           | Proceed       | Proceed       | Proceed                |
+/// | live holder, visible, SAME id              | Proceed(merge)| Proceed(DO NOTHING → typed, own id) | Proceed (CAS merges) |
+/// | live holder, visible, DIFFERENT id         | Proceed(merge)| Proceed(DO NOTHING → typed, named)  | Refuse { named }     |
+/// | live holder hidden on either axis          | Refuse{None}  | Refuse{None}  | Refuse{None}           |
+/// | no holder; own TOMBSTONE under this key    | Refuse{None}  | Refuse{None}  | ProceedByPrimaryKey    |
+/// | no holder; own HIDDEN row under this key   | Refuse{None}  | Refuse{None}  | Refuse{None}           |
+///
+/// `Proceed` on the Refuse arm still refuses at the statement (`DO NOTHING`
+/// returns no row) — that refusal is typed and names the occupant only when
+/// the funnel's viewer-scoped probe may (the funnel re-probes with the same
+/// viewer). A Merge / Refuse write reusing a tombstone's OWN id is the #3690
+/// defect shape (a store that lands in a hidden row) and is refused; only a
+/// RESTORE may write into an own tombstone, in place.
+#[must_use]
+pub fn title_slot_disposition(
+    arm: crate::storage::InsertConflictArm,
+    incoming_id: &str,
+    facts: &TitleSlotFacts,
+) -> TitleSlotDisposition {
+    use crate::models::TitleSlotAdmission;
+    use crate::storage::InsertConflictArm;
+    if let Some((holder_id, admission)) = &facts.holder {
+        return match admission {
+            TitleSlotAdmission::Refused => TitleSlotDisposition::Refuse { named: None },
+            // A tombstone is never the holder (the index excludes it); a
+            // future predicate that answered `Free` for a holder would be a
+            // hole, so it is treated as occupied by construction.
+            TitleSlotAdmission::Occupied | TitleSlotAdmission::Free => {
+                if arm == InsertConflictArm::RestoreSameId && holder_id != incoming_id {
+                    TitleSlotDisposition::Refuse {
+                        named: Some(holder_id.clone()),
+                    }
+                } else {
+                    TitleSlotDisposition::Proceed
+                }
+            }
+        };
+    }
+    match (facts.same_id_hidden, arm) {
+        (None, _) => TitleSlotDisposition::Proceed,
+        (Some(TitleSlotAdmission::Free), InsertConflictArm::RestoreSameId) => {
+            TitleSlotDisposition::ProceedByPrimaryKey
+        }
+        (Some(_), _) => TitleSlotDisposition::Refuse { named: None },
+    }
+}
+
 /// #3386 — which arm of the visibility rule a row's `metadata.scope` selects.
 ///
 /// Extracted so the scope classification lives at exactly ONE site. Before
@@ -403,23 +557,56 @@ pub fn namespace_read_scope_admits(caller: &str, namespace: &str) -> bool {
 /// twin of the HTTP `handlers::parity::require_caller_owns_memory` gate, lifted
 /// here so the MCP mutation surface (which calls raw `db::*` and historically
 /// skipped the owner check that HTTP + the postgres SAL enforce) inherits the
-/// IDENTICAL, deliberately LENIENT, single-tenant-safe semantics:
+/// IDENTICAL semantics:
 ///
-///   * an UNSTAMPED row (no `agent_id`) is mutable by anyone — legacy / unowned
-///     rows are not locked out (this is what keeps the single-operator default,
-///     where rows may carry no stamp, working);
 ///   * a SELF-OWNED row (`agent_id == caller`) is mutable;
 ///   * the `daemon` principal bypasses (curator / internal);
 ///   * when `allow_inbox`, the inbox recipient (`target_agent_id == caller`)
-///     may mutate (mirrors the HTTP delete-side `allow_inbox=true`).
+///     of a row that is NOT unstamped may mutate (mirrors the HTTP delete-side
+///     `allow_inbox=true`);
+///   * an UNSTAMPED row (missing / null / `""` `agent_id` — the ONE
+///     definition in [`crate::identity::owner_stamp::OwnerStamp`], #3124) is
+///     decided by [`crate::identity::owner_stamp::admit_unstamped`]: admitted
+///     with a WARN + counter under `AI_MEMORY_UNSTAMPED_MUTATION=warn` (the
+///     default, the pre-#3124 outcome of every sqlite funnel), refused under
+///     `refuse`;
+///   * a MALFORMED (non-string) `agent_id` is never matched and never admitted
+///     as unstamped (pre-#3124 the `as_str()` read treated it as unstamped and
+///     mutable by anyone).
 ///
-/// Only a row owned by a DIFFERENT, named agent is refused — closing the
-/// cross-owner MCP mutation gap (#1786) without breaking the single-tenant
-/// default. NOTE: `agent_id` is a CLAIMED identity, so this gate's strength is
-/// bounded by caller attestation (#48) — it closes the unstamped/cross-id gap,
-/// not impersonation by a caller who claims the owner's id.
+/// Every other row — one owned by a DIFFERENT, named agent — is refused.
+/// `site` labels the funnel on the #3124 observability counter. NOTE:
+/// `agent_id` is a CLAIMED identity, so this gate's strength is bounded by
+/// caller attestation (#48) — it closes the unstamped/cross-id gap, not
+/// impersonation by a caller who claims the owner's id.
 #[must_use]
-pub fn caller_owns_for_mutation(mem: &Memory, caller: &str, allow_inbox: bool) -> bool {
+pub fn caller_owns_for_mutation(
+    mem: &Memory,
+    caller: &str,
+    allow_inbox: bool,
+    site: crate::identity::owner_stamp::MutationSite,
+) -> bool {
+    if caller == crate::identity::sentinels::DAEMON_PRINCIPAL {
+        return true;
+    }
+    crate::identity::owner_stamp::metadata_admits_mutation(
+        &mem.metadata,
+        &mem.id,
+        caller,
+        allow_inbox,
+        site,
+    )
+}
+
+/// v1.0.0 #3124 — the PRE-#3124 ownership predicate, kept verbatim for the ONE
+/// read-side consumer (`storage::archive_row_readable`, #3382), which reuses an
+/// ownership check to scope archive LISTINGS. Reads are not mutations: the
+/// `AI_MEMORY_UNSTAMPED_MUTATION` knob deliberately does not change which
+/// archived rows a caller can SEE, so this stays side-effect free (no WARN, no
+/// counter) and keeps the legacy semantics exactly. Never use it to admit a
+/// write — [`caller_owns_for_mutation`] is the mutation gate.
+#[must_use]
+pub fn legacy_owner_admits_read(mem: &Memory, caller: &str, allow_inbox: bool) -> bool {
     let owner = mem
         .metadata
         .get(crate::META_KEY_AGENT_ID)
@@ -440,6 +627,32 @@ pub fn caller_owns_for_mutation(mem: &Memory, caller: &str, allow_inbox: bool) -
         }
     }
     false
+}
+
+/// #3730 — RETENTION POLICY of `delete` for a row in the agent inbox.
+///
+/// `delete` means one thing on every surface: remove the row from the
+/// caller's view. Whether the substrate RETAINS a copy is a retention policy,
+/// and retention already varies by namespace. This predicate is the single
+/// definition of the inbox's policy: a message in a substrate-owned inbox
+/// namespace (`_inbox/<agent>`, legacy `_messages/<agent>`) is ARCHIVED on
+/// delete (`archive_reason = "delete"`, restorable, listed by
+/// `memory_archive_list`) instead of erased, on every funnel — MCP
+/// `memory_delete`, HTTP `DELETE /api/v1/memories/{id}`, both SAL stores.
+/// The CLI `delete` was already archive-first for every row (#3012); its
+/// `--hard` still erases, and says so on an inbox row.
+///
+/// Why: the inbox is a queue the recipient drains by deleting what it has
+/// handled (there is no read marker — `access_count` counts touches, never
+/// handling). A drain that erased by default would destroy the record of what
+/// the agent was told as the normal path. Every OTHER namespace keeps its
+/// erasure semantics; widening this policy product-wide is a separate
+/// decision (a customer who deletes IN ORDER TO ERASE is owed one), tracked
+/// for v1.0.1, not a ride on this predicate.
+#[must_use]
+pub fn inbox_delete_retains(namespace: &str) -> bool {
+    namespace.starts_with(crate::INBOX_NAMESPACE_PREFIX)
+        || namespace.starts_with(crate::LEGACY_INBOX_NAMESPACE_PREFIX)
 }
 
 /// v1.0.0 #3348 — SUBSTRATE-OWNED namespace prefixes. Rows here are written by
@@ -1106,22 +1319,68 @@ mod tests {
 
     #[test]
     fn caller_owns_for_mutation_1786() {
-        // Unstamped row → ANYONE may mutate (single-tenant-safe: legacy/unowned
-        // rows are not locked out). This is the deliberate lenience that keeps
-        // the single-operator default working.
+        use crate::identity::owner_stamp::{
+            MutationSite, UnstampedMutationMode, funnel, metadata_admits_mutation_with_mode,
+        };
+        let site = MutationSite::sqlite(funnel::UPDATE);
+        // #3124 rule (e) census — the pre-#3124 pin "Unstamped row → ANYONE
+        // may mutate" is the `warn` (default) posture of the ONE predicate;
+        // `refuse` is its twin. Pinned through the explicit-mode seam so no
+        // lib test has to mutate the process environment.
         let unstamped = mem_with_metadata(json!({}));
-        assert!(caller_owns_for_mutation(&unstamped, "ai:alice", false));
+        assert!(metadata_admits_mutation_with_mode(
+            &unstamped.metadata,
+            &unstamped.id,
+            "ai:alice",
+            false,
+            site,
+            UnstampedMutationMode::Warn
+        ));
+        assert!(!metadata_admits_mutation_with_mode(
+            &unstamped.metadata,
+            &unstamped.id,
+            "ai:alice",
+            false,
+            site,
+            UnstampedMutationMode::Refuse
+        ));
+        // #3124 R2 — a MALFORMED (non-string) owner is neither matched nor
+        // admitted as unstamped, in either posture (pre-#3124 `as_str()`
+        // treated it as unstamped → mutable by anyone).
+        let malformed = mem_with_metadata(json!({"agent_id": 123}));
+        for mode in [UnstampedMutationMode::Warn, UnstampedMutationMode::Refuse] {
+            assert!(!metadata_admits_mutation_with_mode(
+                &malformed.metadata,
+                &malformed.id,
+                "123",
+                false,
+                site,
+                mode
+            ));
+        }
+        // #3124 — an unstamped row is not an addressed inbox row: the inbox
+        // carve-out does not rescue it under `refuse` (the #1628 shape).
+        let unstamped_inbox = mem_with_metadata(json!({"target_agent_id": "ai:bob"}));
+        assert!(!metadata_admits_mutation_with_mode(
+            &unstamped_inbox.metadata,
+            &unstamped_inbox.id,
+            "ai:bob",
+            true,
+            site,
+            UnstampedMutationMode::Refuse
+        ));
 
         // Self-owned → ok; cross-owner → REFUSED (the gap #1786 closes).
         let alice = mem_with_metadata(json!({"agent_id": "ai:alice"}));
-        assert!(caller_owns_for_mutation(&alice, "ai:alice", false));
-        assert!(!caller_owns_for_mutation(&alice, "ai:bob", false));
+        assert!(caller_owns_for_mutation(&alice, "ai:alice", false, site));
+        assert!(!caller_owns_for_mutation(&alice, "ai:bob", false, site));
 
         // Daemon principal bypasses (curator / internal mutations).
         assert!(caller_owns_for_mutation(
             &alice,
             crate::identity::sentinels::DAEMON_PRINCIPAL,
-            false
+            false,
+            site
         ));
 
         // Inbox carve-out applies ONLY when allow_inbox=true (delete-side).
@@ -1130,13 +1389,33 @@ mod tests {
             "target_agent_id": "ai:bob"
         }));
         assert!(
-            !caller_owns_for_mutation(&inbox, "ai:bob", false),
+            !caller_owns_for_mutation(&inbox, "ai:bob", false, site),
             "no inbox carve-out without allow_inbox"
         );
         assert!(
-            caller_owns_for_mutation(&inbox, "ai:bob", true),
+            caller_owns_for_mutation(&inbox, "ai:bob", true, site),
             "inbox recipient may mutate with allow_inbox"
         );
+    }
+
+    #[test]
+    fn legacy_owner_admits_read_is_unchanged_3124() {
+        // The read-side predicate keeps the pre-#3124 semantics verbatim.
+        assert!(legacy_owner_admits_read(
+            &mem_with_metadata(json!({})),
+            "ai:x",
+            true
+        ));
+        assert!(legacy_owner_admits_read(
+            &mem_with_metadata(json!({"agent_id": 7})),
+            "ai:x",
+            false
+        ));
+        assert!(!legacy_owner_admits_read(
+            &mem_with_metadata(json!({"agent_id": "ai:a"})),
+            "ai:x",
+            false
+        ));
     }
 
     // -----------------------------------------------------------------------
@@ -1531,5 +1810,131 @@ mod sql_param_style_3507_tests {
     fn text_param_renders_each_dialect() {
         assert_eq!(SqlParamStyle::Sqlite.text_param(3), "?3");
         assert_eq!(SqlParamStyle::Postgres.text_param(3), "$3::text");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #3176 / #3758 — the namespace-standard mutation gate (SET and CLEAR)
+// ---------------------------------------------------------------------------
+
+/// #3176 — a namespace's three-state standard BINDING, as read by ONE reader
+/// per backend (`storage::namespace_standard_binding` on sqlite, the
+/// in-transaction read in `PostgresStore`) and judged by ONE predicate
+/// ([`namespace_standard_mutation_admission`]).
+///
+/// Keeping row-presence and owner-nullness SEPARABLE is load-bearing
+/// (#2704-F2): collapsing them makes an UNOWNED standard look UNRESOLVABLE
+/// and refuses a clear that must be allowed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NamespaceStandardBinding {
+    /// No `namespace_meta` row for this namespace at all. There is no
+    /// governance binding to disarm, so the DELETE is a no-op and the gate
+    /// does not apply on either backend.
+    NoMetaRow,
+    /// A `namespace_meta` row exists AND its `standard_id` resolves to a live
+    /// memory. The payload is that memory's `metadata.agent_id`; `None` means
+    /// the key is absent or SQL-NULL (an UNOWNED standard).
+    Resolved(Option<String>),
+    /// A `namespace_meta` row exists but its `standard_id` is SEVERED (NULL,
+    /// #2503) or DANGLING (points at no surviving row) — the bound standard
+    /// is unresolvable.
+    Unresolvable,
+}
+
+/// #3758 — which namespace-standard mutation the shared gate is deciding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NamespaceStandardOp {
+    /// `set_namespace_standard`: REPLACE (or first-bind) the namespace's
+    /// standard.
+    Set,
+    /// `clear_namespace_standard`: DELETE the binding.
+    Clear,
+}
+
+impl NamespaceStandardOp {
+    /// The audit / `PermissionDenied.action` tag.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Set => crate::OP_SET_NAMESPACE_STANDARD,
+            Self::Clear => crate::OP_CLEAR_NAMESPACE_STANDARD,
+        }
+    }
+}
+
+/// Why [`namespace_standard_mutation_admission`] refused. The rendering (the
+/// SSOT reason strings, the HTTP shape) belongs to the funnel, not here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NamespaceStandardRefusal {
+    /// The standard currently bound is owned by a different named principal.
+    NotOwner,
+    /// CLEAR on a severed / dangling binding (#2545, fail-closed).
+    Unresolvable,
+}
+
+/// #3176 / #3758 — the ONE authorization decision for mutating a namespace's
+/// standard binding, SET and CLEAR alike, on both adapters and on the MCP /
+/// HTTP funnels that hold the sqlite connection directly.
+///
+/// Clearing a namespace's standard REVERTS the namespace to permissive
+/// allow-on-silence; REPLACING it rewrites the governance policy gating every
+/// delete/write/promote into that namespace with a policy of the caller's
+/// choosing (#3758 — the SET funnels used to authorize only the memory being
+/// bound, never the standard CURRENTLY bound, so any caller could overwrite
+/// another tenant's policy while being refused to clear it). Both are gated on
+/// the owner of the standard currently bound (#1777).
+///
+/// * `bypass` contexts (admin/operator surfaces, the daemon principal) skip
+///   the gate, the same exemption the SAL scope=private read filter takes.
+/// * An UNOWNED standard (`agent_id` absent, empty, or the `system`
+///   sentinel) is the documented unowned-PASS: a legacy / federated /
+///   pre-#929 standard stays mutable by its namespace's operators.
+/// * An UNRESOLVABLE binding (severed / dangling pointer, #2503) is refused
+///   for CLEAR (fail-closed, #2545 — nothing verifiable owns it) and ALLOWED
+///   for SET: re-pointing is the documented REPAIR path the clear refusal
+///   itself names ("re-point the standard with
+///   `memory_namespace_set_standard` first, then clear"), and a severed
+///   pointer has no owner to disclose or protect.
+///
+/// The refusal names NEITHER the caller NOR the owner (#3407 / #3426): the
+/// owner goes to the authz trace HERE, once, and the reason rendered to the
+/// caller is the bare SSOT const.
+///
+/// # Errors
+///
+/// [`NamespaceStandardRefusal`].
+pub fn namespace_standard_mutation_admission(
+    caller: &str,
+    bypass: bool,
+    namespace: &str,
+    binding: &NamespaceStandardBinding,
+    op: NamespaceStandardOp,
+) -> Result<(), NamespaceStandardRefusal> {
+    if bypass {
+        return Ok(());
+    }
+    match binding {
+        // Nothing bound → nothing to disarm or replace.
+        NamespaceStandardBinding::NoMetaRow => Ok(()),
+        // Row exists with a NAMED owner that is not the caller → refuse.
+        NamespaceStandardBinding::Resolved(Some(owner))
+            if !owner.is_empty()
+                && owner != crate::identity::sentinels::SYSTEM_PRINCIPAL
+                && owner != caller =>
+        {
+            tracing::warn!(
+                target: crate::handlers::AUTHZ_TRACE_TARGET,
+                "namespace-standard owner-gate refusal: {} on {namespace}: caller {caller} != owner {owner}",
+                op.label()
+            );
+            Err(NamespaceStandardRefusal::NotOwner)
+        }
+        // Caller owns it, or it is unowned (absent / empty / `system`) → ALLOW.
+        NamespaceStandardBinding::Resolved(_) => Ok(()),
+        // Severed or dangling: SET is the repair path; CLEAR fails closed (#2545).
+        NamespaceStandardBinding::Unresolvable => match op {
+            NamespaceStandardOp::Set => Ok(()),
+            NamespaceStandardOp::Clear => Err(NamespaceStandardRefusal::Unresolvable),
+        },
     }
 }

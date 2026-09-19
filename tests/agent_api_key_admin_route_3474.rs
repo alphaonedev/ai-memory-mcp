@@ -190,6 +190,7 @@ fn fixture(tag: &str, admins: &[&str]) -> Fixture {
         mtls_enforced: false,
         enrolled_agent_keys: Arc::clone(&registry),
         identity_mode: HttpIdentityMode::Advisory,
+        ..Default::default()
     };
     Fixture {
         router: ai_memory::build_router(api_key_state, app_state),

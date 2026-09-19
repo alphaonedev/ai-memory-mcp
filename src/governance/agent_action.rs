@@ -196,7 +196,7 @@ impl AgentAction {
     /// Canonical lower-snake tag used to look up rules in the
     /// `governance_rules.kind` column. Stable wire format.
     #[must_use]
-    pub fn kind(&self) -> &str {
+    pub fn kind(&self) -> &'static str {
         match self {
             AgentAction::Bash { .. } => action_kinds::BASH,
             AgentAction::FilesystemWrite { .. } => action_kinds::FILESYSTEM_WRITE,
@@ -1279,29 +1279,49 @@ pub fn check_agent_action_cached(
     Ok(decision)
 }
 
+/// #3647 — the forensic commitment preimage: the same `{action, decision}`
+/// object [`emit_check_event`] hashes into `signed_events.payload_hash`, so
+/// one preimage backs both records. Held in memory only; never written.
+#[derive(Serialize)]
+struct ForensicActionContent<'a> {
+    action: &'a AgentAction,
+    decision: &'a Decision,
+}
+
 /// v0.7.0 #697 — translate a `(action, decision)` into the forensic
-/// log shape and emit. No-op when the forensic sink is uninitialised.
+/// log shape and emit. No-op unless the sink is up (#3647: decision rows are
+/// written whenever it is, screened, like integrity rows).
 fn emit_forensic_decision(agent_id: &str, action: &AgentAction, decision: &Decision) {
+    if !crate::governance::audit::is_enabled() {
+        return;
+    }
     let (decision_str, rule_id) = match decision {
-        Decision::Allow => ("allow", String::new()),
-        Decision::Refuse { rule_id, .. } => ("refuse", rule_id.clone()),
-        Decision::Warn { rule_id, .. } => ("warn", rule_id.clone()),
-        Decision::Escalate { rule_id, .. } => ("escalate", rule_id.clone()),
+        Decision::Allow => ("allow", ""),
+        Decision::Refuse { rule_id, .. } => ("refuse", rule_id.as_str()),
+        Decision::Warn { rule_id, .. } => ("warn", rule_id.as_str()),
+        Decision::Escalate { rule_id, .. } => ("escalate", rule_id.as_str()),
     };
-    // payload is `{action, decision_detail}` — keeps the forensic row
-    // self-describing without depending on cross-table joins for a
-    // SIEM walking the chain.
-    let payload = serde_json::json!({
-        "action": action,
-        "decision_detail": decision,
+    // #3647: the action's fields and the decision's reason reach the signed
+    // JSONL only as a keyed commitment; identity and outcome stay readable.
+    let emitted = crate::governance::audit::ForensicPayload::content(&ForensicActionContent {
+        action,
+        decision,
+    })
+    .and_then(|payload| {
+        crate::governance::audit::try_record_decision(
+            agent_id,
+            decision_str,
+            action.kind(),
+            rule_id,
+            payload,
+        )
     });
-    crate::governance::audit::record_decision(
-        agent_id,
-        decision_str,
-        action.kind(),
-        &rule_id,
-        payload,
-    );
+    if let Err(error) = emitted {
+        tracing::error!(
+            target: crate::governance::audit::AUDIT_TRACE_TARGET,
+            "forensic: emission failed: {error}"
+        );
+    }
 }
 
 /// Append a `governance.check` row to `signed_events`. Helper so
@@ -1830,6 +1850,277 @@ mod tests {
             },
         )
         .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn issue_3647_unserializable_action_never_falls_back_to_plaintext() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let _forensic = forensic_lock();
+        let _ = crate::identity::test_key_dir::install();
+        let tmp = tempfile::tempdir().expect("scratch forensic directory");
+        crate::governance::audit::init(tmp.path(), None).expect("init");
+        let action = AgentAction::Bash {
+            command: "ISSUE_3647_SERIALIZATION_SECRET".into(),
+            cwd: Some(std::ffi::OsString::from_vec(vec![0xff]).into()),
+        };
+        emit_forensic_decision("agent:3647", &action, &Decision::Allow);
+        crate::governance::audit::shutdown();
+        assert_eq!(std::fs::read_dir(tmp.path()).expect("directory").count(), 0);
+    }
+
+    #[test]
+    fn issue_3647_refused_command_is_redacted_through_public_checks() {
+        let _forensic = forensic_lock();
+        let _no_pubkey = no_operator_pubkey();
+        let _ = crate::identity::test_key_dir::install();
+        let tmp = tempfile::tempdir().expect("scratch forensic directory");
+        let conn = fresh_conn();
+        add_rule(
+            &conn,
+            "R3647",
+            action_kinds::BASH,
+            r#"{"command_substring":"ISSUE_3647"}"#,
+            "refuse",
+            true,
+        );
+        crate::governance::audit::init(tmp.path(), None).expect("init");
+        let action = AgentAction::Bash {
+            command: "ISSUE_3647_REFUSED_COMMAND_TOKEN".into(),
+            cwd: None,
+        };
+        assert!(
+            check_agent_action(&conn, "agent:3647", &action)
+                .expect("check")
+                .is_refusal()
+        );
+        assert!(
+            check_agent_action_no_audit(&conn, &action)
+                .expect("check")
+                .is_refusal()
+        );
+        crate::governance::audit::shutdown();
+        let mut count = 0;
+        for entry in std::fs::read_dir(tmp.path()).expect("directory") {
+            let body = std::fs::read_to_string(entry.expect("entry").path()).expect("JSONL");
+            assert!(!body.contains("ISSUE_3647_REFUSED_COMMAND_TOKEN"));
+            for line in body.lines() {
+                let row: crate::governance::audit::ForensicDecision =
+                    serde_json::from_str(line).expect("row");
+                assert_eq!(row.decision, "refuse");
+                assert_eq!(row.rule_id, "R3647");
+                assert_eq!(row.payload["sensitive_fields"], "hash_only");
+                count += 1;
+            }
+        }
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn issue_3647_forensic_actions_and_outcomes_never_persist_secrets() {
+        let _forensic = forensic_lock();
+        let _ = crate::identity::test_key_dir::install();
+        let tmp = tempfile::tempdir().expect("scratch forensic directory");
+        let key = ed25519_dalek::SigningKey::from_bytes(&[37; 32]);
+        let public_key = key.verifying_key();
+        crate::governance::audit::init(tmp.path(), Some(key)).expect("init");
+        let secret = ISSUE_3647_SENTINEL;
+        let actions = every_agent_action_with(secret);
+        let decisions = [
+            Decision::Allow,
+            Decision::Refuse {
+                rule_id: "R3647".into(),
+                reason: secret.into(),
+            },
+            Decision::Warn {
+                rule_id: "R3647".into(),
+                reason: secret.into(),
+            },
+            Decision::Escalate {
+                rule_id: "R3647".into(),
+                reason: secret.into(),
+            },
+        ];
+        for action in &actions {
+            for decision in &decisions {
+                emit_forensic_decision("agent:3647", action, decision);
+            }
+        }
+        crate::governance::audit::shutdown();
+        let mut files: Vec<_> = std::fs::read_dir(tmp.path())
+            .expect("read directory")
+            .map(|entry| entry.expect("entry").path())
+            .collect();
+        files.sort();
+        let mut rows = Vec::new();
+        for file in files {
+            let body = std::fs::read_to_string(file).expect("JSONL");
+            assert!(
+                !body.contains(secret),
+                "sensitive action or reason persisted"
+            );
+            for line in body.lines() {
+                // A closed envelope: any extra top-level key fails the parse.
+                rows.push(serde_json::from_str::<ClosedForensicRow>(line).expect("row"));
+            }
+        }
+        assert_eq!(rows.len(), actions.len() * decisions.len());
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[37; 32]);
+        for ((action, decision), row) in actions
+            .iter()
+            .flat_map(|a| decisions.iter().map(move |d| (a, d)))
+            .zip(&rows)
+        {
+            assert_eq!(row.actor, "agent:3647");
+            assert_eq!(row.kind, action.kind());
+            assert_eq!(
+                row.decision,
+                serde_json::to_value(decision).expect("decision")["decision"]
+            );
+            // The commitment's preimage is exactly the governance.check
+            // canonical payload, keyed by the sink's signing key.
+            let preimage =
+                serde_json::to_vec(&serde_json::json!({"action": action, "decision": decision}))
+                    .expect("preimage");
+            assert_eq!(
+                row.payload,
+                serde_json::json!({
+                    "content_mac": crate::governance::audit::forensic_commitment(
+                        &signing_key,
+                        &preimage,
+                    ),
+                    "sensitive_fields": "hash_only",
+                })
+            );
+        }
+        let report =
+            crate::governance::audit::verify_since(tmp.path(), "2000-01-01", Some(&public_key))
+                .expect("verify");
+        assert_eq!(
+            report.total_lines,
+            u64::try_from(rows.len()).expect("row count")
+        );
+        assert!(report.first_failure.is_none(), "redacted chain must verify");
+    }
+
+    const ISSUE_3647_SENTINEL: &str = "ISSUE_3647_SENTINEL_TOKEN";
+
+    /// Mirror of `ForensicDecision` that refuses unknown keys, so a row that
+    /// grew a field (a place content could hide) fails to parse.
+    #[derive(Debug, serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    #[allow(dead_code)] // fields are read through Debug + assertions
+    struct ClosedForensicRow {
+        ts: String,
+        actor: String,
+        decision: String,
+        kind: String,
+        rule_id: String,
+        payload: serde_json::Value,
+        prev_hash: String,
+        sig: String,
+    }
+
+    /// Every [`AgentAction`] variant with every field populated from
+    /// `secret`. [`agent_action_variant_index`] has no wildcard arm and names
+    /// every field without `..`, so a new variant or field does not compile
+    /// until it is handled there; the coverage assertion in
+    /// `issue_3647_sentinel_builder_covers_every_variant_and_field` then fails
+    /// until the new shape is also built here.
+    fn every_agent_action_with(secret: &str) -> Vec<AgentAction> {
+        vec![
+            AgentAction::Bash {
+                command: secret.into(),
+                cwd: Some(secret.into()),
+            },
+            AgentAction::FilesystemWrite {
+                path: secret.into(),
+                byte_estimate: Some(3647),
+            },
+            AgentAction::NetworkRequest {
+                host: secret.into(),
+                scheme: secret.into(),
+            },
+            AgentAction::ProcessSpawn {
+                binary: secret.into(),
+                args: vec![secret.into()],
+            },
+            AgentAction::Custom {
+                custom_kind: secret.into(),
+                payload: serde_json::json!({ secret: [secret] }),
+            },
+            AgentAction::Read {
+                surface: secret.into(),
+                namespace: Some(secret.into()),
+                query: Some(secret.into()),
+            },
+        ]
+    }
+
+    /// Number of [`AgentAction`] variants; bump it together with the arm
+    /// below when a variant is added.
+    const AGENT_ACTION_VARIANTS: usize = 6;
+
+    fn agent_action_variant_index(action: &AgentAction) -> usize {
+        match action {
+            AgentAction::Bash { command: _, cwd: _ } => 0,
+            AgentAction::FilesystemWrite {
+                path: _,
+                byte_estimate: _,
+            } => 1,
+            AgentAction::NetworkRequest { host: _, scheme: _ } => 2,
+            AgentAction::ProcessSpawn { binary: _, args: _ } => 3,
+            AgentAction::Custom {
+                custom_kind: _,
+                payload: _,
+            } => 4,
+            AgentAction::Read {
+                surface: _,
+                namespace: _,
+                query: _,
+            } => 5,
+        }
+    }
+
+    #[test]
+    fn issue_3647_sentinel_builder_covers_every_variant_and_field() {
+        let actions = every_agent_action_with(ISSUE_3647_SENTINEL);
+        let mut seen = [false; AGENT_ACTION_VARIANTS];
+        for action in &actions {
+            seen[agent_action_variant_index(action)] = true;
+            // Every string leaf other than the serde tag carries the sentinel,
+            // so no field is left empty and silently untested.
+            let value = serde_json::to_value(action).expect("serialise");
+            let object = value.as_object().expect("tagged object");
+            for (key, field) in object {
+                if key == "kind" {
+                    continue;
+                }
+                assert_string_leaves_are_sentinel(field);
+            }
+        }
+        assert!(
+            seen.iter().all(|s| *s),
+            "every AgentAction variant must be built: {seen:?}"
+        );
+    }
+
+    fn assert_string_leaves_are_sentinel(value: &serde_json::Value) {
+        match value {
+            serde_json::Value::String(s) => assert_eq!(s, ISSUE_3647_SENTINEL),
+            serde_json::Value::Array(items) => {
+                items.iter().for_each(assert_string_leaves_are_sentinel);
+            }
+            serde_json::Value::Object(map) => {
+                for (key, field) in map {
+                    assert_eq!(key, ISSUE_3647_SENTINEL);
+                    assert_string_leaves_are_sentinel(field);
+                }
+            }
+            serde_json::Value::Number(_) | serde_json::Value::Bool(_) | serde_json::Value::Null => {
+            }
+        }
     }
 
     #[test]

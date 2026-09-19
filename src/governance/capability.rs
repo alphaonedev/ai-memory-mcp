@@ -1047,13 +1047,12 @@ pub fn audit_grant_outcome(req: &CapRequest, base_kind: &'static str, outcome: &
                 "allow",
                 AUDIT_KIND_GRANT,
                 root_id,
-                serde_json::json!({
-                    "issuer": issuer,
-                    "op_level": op_level.as_str(),
-                    "namespace": req.namespace,
-                    "action": req.action,
-                    "flipped_from": base_kind,
-                }),
+                crate::governance::audit::ForensicPayload::new()
+                    .ident("issuer", issuer)
+                    .label("op_level", op_level.as_str())
+                    .ident_or_commit("namespace", &req.namespace)
+                    .ident("action", &req.action)
+                    .label("flipped_from", base_kind),
             );
         }
         GrantOutcome::Rejected(rej) => {
@@ -1062,11 +1061,10 @@ pub fn audit_grant_outcome(req: &CapRequest, base_kind: &'static str, outcome: &
                 base_kind,
                 AUDIT_KIND_REJECT,
                 rej.code(),
-                serde_json::json!({
-                    "namespace": req.namespace,
-                    "action": req.action,
-                    "reason": rej.to_string(),
-                }),
+                crate::governance::audit::ForensicPayload::new()
+                    .ident_or_commit("namespace", &req.namespace)
+                    .ident("action", &req.action)
+                    .commit("reason", &rej.to_string()),
             );
         }
     }
@@ -1203,7 +1201,7 @@ pub fn parse_presented_token(
                 "deny",
                 AUDIT_KIND_REJECT,
                 rej.code(),
-                serde_json::json!({ "stage": "edge-parse" }),
+                crate::governance::audit::ForensicPayload::new().label("stage", "edge-parse"),
             );
             Err(rej)
         }
@@ -1251,7 +1249,7 @@ pub fn capability_from_file(path: &std::path::Path) -> Result<String> {
         let mode = meta.permissions().mode() & 0o777;
         if mode & 0o077 != 0 {
             let fail_open = std::env::var(CAPABILITY_FILE_ALLOW_LAX_PERMS_ENV)
-                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .map(|v| crate::security_profile::is_truthy(&v))
                 .unwrap_or(false);
             if fail_open {
                 tracing::warn!(

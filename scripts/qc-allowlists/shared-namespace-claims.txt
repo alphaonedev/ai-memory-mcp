@@ -1,0 +1,24 @@
+# #3688/6 (#3702) baseline — acknowledged shared-namespace claims (2026-09-13).
+#
+# The gate reports a CLAIM two branches make on one namespace; an entry here
+# records that a human DECIDED the collision. Direction rule: a decision is
+# only allowlistable when it names the resolved value — the gate keeps
+# printing the projected merge-result size next to it, so the decision stays
+# checkable at merge time.
+#
+# Grammar:
+#   ceiling:<src path>=<resolved value>   the ceiling-table entry this queue lands
+#   dup:<issue>=<branchA>+<branchB>       two DIFFERENT-surface branches under one
+#                                         issue are both wanted (sorted branch names,
+#                                         no origin/ prefix — never SHAs, which every
+#                                         push invalidates)
+#   (no grammar exists for a schema-version collision: renumber, never acknowledge)
+#
+# chain 13 — MERGE-PLAYBOOK-chain13.md ruling: migrations.rs lands at 7_440
+# (merge result 7378 lines; 7_400 would leave 22 with #3690 + #2502 rungs owed).
+ceiling:src/storage/migrations.rs=7_440
+#
+# #3688 ships as two complementary branches: gates 1+3 (98fe07055, plus the
+# ceiling-headroom sweep) and gates 2+4+5 (d4573b94b). Different surfaces,
+# both wanted.
+dup:3688=gates/3688-recurring-classes+gates/3688-recurring-classes-2-4-5

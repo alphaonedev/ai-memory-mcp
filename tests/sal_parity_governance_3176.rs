@@ -67,8 +67,10 @@ const REASON_UNRESOLVABLE: &str = "cannot clear namespace standard: the bound st
      (severed or dangling). Re-point the standard first, then clear — or use an \
      admin/bypass surface.";
 
-fn reason_not_owner(owner: &str) -> String {
-    format!("caller does not own this namespace standard (owner: {owner})")
+/// #3407 — the refusal is the bare SSOT const: it names neither the caller
+/// nor the owner (the owner goes to the authz trace at the gate).
+fn reason_not_owner(_owner: &str) -> String {
+    ai_memory::errors::msg::CALLER_DOES_NOT_OWN_NAMESPACE_STANDARD.to_string()
 }
 
 /// #1751 — pin this binary to the permissive agent-attestation opt-out; the

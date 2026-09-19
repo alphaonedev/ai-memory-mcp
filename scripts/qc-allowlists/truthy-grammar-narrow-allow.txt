@@ -1,0 +1,5 @@
+# #3200 — DELIBERATE narrow-grammar sites (the ONE exception to the house
+# 1/true/yes/on truthy predicate). Format: <file>::<symbol> <#issue> <why>.
+# A stale entry FAILS (the gate re-derives), so this file cannot rot.
+src/daemon_runtime.rs::governance_fail_open_value_enabled #3168 fail-OPEN hatch is deliberately exact 1/true, NOT trimmed, NOT yes/on — its asi-hard floor (security_profile::governance_fail_open_hatch_meets_floor = !governance_fail_open_value_enabled) must mirror the LIVE reader's grammar (NB1: a value the live reader would not arm must not refuse boot). Widening it would loosen a security gate AND break the floor coupling.
+src/identity/attest.rs::resolve_require_agent_attestation #1985 the ATTESTATION opt-out falsy arm is deliberately exact 0/false only (FBL-14): a typo like `no`/`off` must fall through to the surface-scoped fail-CLOSED default, never silently loosen the security gate. The truthy arm widens to is_truthy (aligns with the asi-hard is_truthy floor); only the falsy arm stays narrow.

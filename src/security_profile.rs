@@ -80,6 +80,7 @@
 //! | `AI_MEMORY_FED_REQUIRE_POLICY_CURRENT` | `1` | inbound federated push with a DETECTED-stale `policy_version` is refused (#3168; live name `AI_MEMORY_FED_REQUIRE_POLICY_CURRENT` — the unprefixed `REQUIRE_POLICY_CURRENT` does not exist) |
 //! | `AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS` | *(unset)* | PERMISSIVE-shaped: the unenrolled-peer hatch of the already-pinned `REQUIRE_PEER_ENROLLMENT` is NOT in force (#3201) |
 //! | `AI_MEMORY_FED_CERT_PEER_BINDING` | `enforce` | mTLS cert↔`X-Peer-Id` cross-check mode is `enforce`; `off`/`warn` refuse boot. Inert without `AI_MEMORY_FED_CERT_PEER_BINDING_MAP`. The documented `standard` unset default stays `warn` (#3201 / #3289) |
+//! | `AI_MEMORY_UNSTAMPED_MUTATION` | `refuse` | a caller-scoped mutation of an UNSTAMPED (legacy-unowned) row is refused on every funnel of both backends; `warn` refuses boot. The documented `standard` default stays `warn` (#3124) |
 //!
 //! In addition, `asi-hard` forces the config-backed governance knob
 //! `[governance].require_operator_pubkey` to `true` (see
@@ -220,6 +221,32 @@ pub(crate) fn is_truthy(v: &str) -> bool {
         v.trim().to_ascii_lowercase().as_str(),
         "1" | "true" | "yes" | "on"
     )
+}
+
+/// A falsy env token (the negative half of the substrate-wide
+/// `0`/`false`/`no`/`off` convention) — the mirror of [`is_truthy`].
+///
+/// #3200 — the tri-state env resolvers (`resolve_compaction_enabled`,
+/// the `append_only`/`lineage` ladders, `resolve_require_agent_attestation`)
+/// used a narrow `== "0" || eq_ignore_ascii_case("false")` arm that silently
+/// dropped `no`/`off`, the falsy sibling of the narrow truthy grammar. Both
+/// arms now resolve through THIS module's one grammar.
+pub(crate) fn is_falsy(v: &str) -> bool {
+    matches!(
+        v.trim().to_ascii_lowercase().as_str(),
+        "0" | "false" | "no" | "off"
+    )
+}
+
+/// #3124 — `AI_MEMORY_UNSTAMPED_MUTATION` floor: whatever the LIVE resolver
+/// ([`crate::identity::owner_stamp::UnstampedMutationMode::parse`]) resolves to
+/// `refuse` clears it. `warn` and a blank value (resolved as unset → `warn`)
+/// are below it. An unrecognised token is refused at boot by
+/// [`crate::identity::owner_stamp::validate_boot_token`] in EVERY posture, so
+/// this floor never has to judge one. Delegating to the live grammar is the NB1
+/// lesson: a re-derived grammar can false-refuse a boot the gate honours.
+fn unstamped_mutation_meets_floor(v: &str) -> bool {
+    crate::identity::owner_stamp::UnstampedMutationMode::parse(Some(v)).refuses()
 }
 
 /// `AI_MEMORY_SECRET_SCREEN_MODE` floor: only `refuse` clears it.
@@ -497,6 +524,16 @@ const KNOBS: &[KnobSpec] = &[
         hard_value: "enforce",
         meets_floor: cert_peer_binding_meets_floor,
     },
+    // #3124 — the unstamped (legacy-unowned) row mutation posture. The
+    // standard default is `warn` (every funnel keeps its pre-#3124 outcome,
+    // admissions WARN); a hardened deployment refuses a caller-scoped
+    // mutation of a row with no provable owner on every funnel of both
+    // backends (T9 5-agent vote, step 4).
+    KnobSpec {
+        env: crate::identity::owner_stamp::ENV_UNSTAMPED_MUTATION,
+        hard_value: crate::identity::owner_stamp::MODE_REFUSE,
+        meets_floor: unstamped_mutation_meets_floor,
+    },
 ];
 
 /// The number of env knobs `asi-hard` pins — ONE named SSOT for a count that
@@ -548,7 +585,7 @@ pub fn pinned_knobs() -> Vec<(&'static str, &'static str)> {
 /// [`enforce_at_boot`], which may only run in the synchronous
 /// pre-runtime phase of `fn main()` (#2386), this is safe to call from
 /// any live process (e.g. `ai-memory doctor --posture
-/// enterprise-federation`, which reuses this as ONE SSOT for the 27
+/// enterprise-federation`, which reuses this as ONE SSOT for the 28
 /// `asi-hard` pinned knobs rather than re-deriving the KNOBS table).
 ///
 /// Returns `(env, current_value, hard_value)` triples.
@@ -718,6 +755,33 @@ pub fn runtime_boot_report() -> Result<(SecurityPosture, Vec<PinReport>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_truthy_and_is_falsy_are_the_one_house_grammar_3200() {
+        // #3200 — the ONE house truthy/falsy grammar: `1`/`true`/`yes`/`on`
+        // (trimmed, case-insensitive) is truthy; `0`/`false`/`no`/`off` is falsy;
+        // everything else is NEITHER. The narrow 2-term copies that silently
+        // dropped `yes`/`on` (e.g. `AI_MEMORY_REQUIRE_TLS=yes` was inert) are gone
+        // (pinned by scripts/check-truthy-grammar.sh).
+        for t in [
+            "1", "true", "TRUE", "TrUe", "yes", "YES", "on", "ON", " on ", "\tyes\n", "  1  ",
+        ] {
+            assert!(is_truthy(t), "must be truthy: {t:?}");
+            assert!(!is_falsy(t), "must not be falsy: {t:?}");
+        }
+        for f in [
+            "0", "false", "FALSE", "no", "NO", "off", "OFF", " off ", "  0  ",
+        ] {
+            assert!(is_falsy(f), "must be falsy: {f:?}");
+            assert!(!is_truthy(f), "must not be truthy: {f:?}");
+        }
+        for n in [
+            "", "   ", "2", "banana", "tru", "ye", "onn", "enabled", "disabled",
+        ] {
+            assert!(!is_truthy(n), "must not be truthy: {n:?}");
+            assert!(!is_falsy(n), "must not be falsy: {n:?}");
+        }
+    }
 
     /// Serialize env mutations against every other `AI_MEMORY_*`-mutating
     /// test in the crate, not just this module's own tests (#2159, residual
@@ -1529,7 +1593,7 @@ mod tests {
             return;
         }
         // v1.0.0 §5.3 cutline ruling — `enterprise_federation_posture`
-        // reuses this accessor as the SSOT for the 27-knob asi-hard set
+        // reuses this accessor as the SSOT for the 28-knob asi-hard set
         // rather than re-deriving KNOBS; pin its own read-only contract
         // directly (in addition to the exhaustive coverage the
         // `enterprise_federation_posture::tests` module gives it

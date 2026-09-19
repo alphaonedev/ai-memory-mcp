@@ -15,9 +15,16 @@
  *   which the server prefers over the header (precedence documented in
  *   `docs/CLAUDE.md` Agent Identity §).
  *
- * mTLS: terminate TLS with client certificates at the reverse proxy (nginx,
- * Caddy, Envoy) in front of ai-memory. The daemon itself is HTTP-only; mTLS
- * is an edge concern. See README for a suggested nginx config.
+ * TLS: every daemon listener serves TLS (#3705/#3709 — `tls_bind_guard`
+ * refuses to bind a plaintext listener, loopback included), so `baseUrl` is
+ * always `https://`. A zero-config daemon serves a certificate issued by the
+ * local CA it wrote to `<key_dir>/tls/local-ca.pem` on first boot; pass that
+ * file's PEM contents as `caCert` to verify it. See README, "Trust the
+ * daemon's CA".
+ *
+ * mTLS: terminate CLIENT certificates at a reverse proxy (nginx, Caddy,
+ * Envoy) in front of ai-memory — client-cert auth is an edge concern. The
+ * proxy's backend hop is HTTPS too. See README for a suggested nginx config.
  */
 
 import { fetch as undiciFetch, Agent, type RequestInit } from "undici";
@@ -42,6 +49,7 @@ import type {
   ListQuery,
   ListResponse,
   Memory,
+  MemoryWriteReceipt,
   MemoryDetail,
   MemoryLink,
   MetricsResponse,
@@ -127,6 +135,29 @@ function trimTrailingSlashes(value: string): string {
   return end === value.length ? value : value.slice(0, end);
 }
 
+/**
+ * undici `connect` options for a caller-supplied trust anchor (#3782).
+ *
+ * `{}` when no `caCert` is given, so the dispatcher keeps undici's default
+ * connector (and the platform trust store) untouched — a spread of `{}` adds
+ * nothing, while `{ connect: { ca: undefined } }` would still replace the
+ * connector build options. Exported for the unit test; not re-exported from
+ * the package index.
+ *
+ * @internal
+ */
+export function connectOptions(
+  caCert: string | string[] | undefined,
+): { connect?: { ca: string | string[] } } {
+  if (caCert === undefined) return {};
+  if (caCert.length === 0) {
+    // An empty PEM is never a trust anchor; accepting it would hand back a
+    // connector that verifies against nothing the caller named.
+    throw new Error("AiMemoryClient: caCert must be non-empty PEM text");
+  }
+  return { connect: { ca: caCert } };
+}
+
 export class AiMemoryClient {
   private readonly baseUrl: string;
   private readonly apiKey: string | undefined;
@@ -147,10 +178,25 @@ export class AiMemoryClient {
     this.timeoutMs = opts.timeoutMs ?? 30_000;
     this.fetchImpl = fetchImpl ?? (undiciFetch as FetchImpl);
     // A shared Agent gives keep-alive across calls.
-    this.dispatcher =
-      typeof Agent === "function"
-        ? new Agent({ connectTimeout: this.timeoutMs })
-        : undefined;
+    if (typeof Agent === "function") {
+      this.dispatcher = new Agent({
+        connectTimeout: this.timeoutMs,
+        ...connectOptions(opts.caCert),
+      });
+    } else {
+      // No undici Agent on this platform (a browser build). FAIL CLOSED
+      // rather than silently dropping the caller's trust anchor: a
+      // `caCert` that never reaches the TLS layer would leave the
+      // handshake relying on the ambient trust store, which is the
+      // opposite of what was asked for.
+      if (opts.caCert !== undefined) {
+        throw new Error(
+          "AiMemoryClient: caCert requires the undici Agent (Node). On a " +
+            "platform without it, install the CA in the host trust store instead.",
+        );
+      }
+      this.dispatcher = undefined;
+    }
   }
 
   // ---- HTTP plumbing ------------------------------------------------------
@@ -295,7 +341,7 @@ export class AiMemoryClient {
   async store(
     body: CreateMemoryRequest,
     opts?: StoreOptions,
-  ): Promise<Memory> {
+  ): Promise<MemoryWriteReceipt> {
     let payload = body;
     if (opts?.signingKey) {
       if (body.signature) {
@@ -329,7 +375,7 @@ export class AiMemoryClient {
         }),
       };
     }
-    return this.call<Memory, CreateMemoryRequest>({
+    return this.call<MemoryWriteReceipt, CreateMemoryRequest>({
       method: "POST",
       path: "/api/v1/memories",
       body: payload,
@@ -382,7 +428,7 @@ export class AiMemoryClient {
     id: string,
     body: UpdateMemoryRequest,
     opts?: UpdateOptions,
-  ): Promise<Memory> {
+  ): Promise<MemoryWriteReceipt> {
     const requestOpts: RequestOptions | undefined =
       opts?.expectedVersion === undefined
         ? opts
@@ -390,7 +436,7 @@ export class AiMemoryClient {
             ...opts,
             headers: { ...(opts.headers ?? {}), "if-match": String(opts.expectedVersion) },
           };
-    return this.call<Memory, UpdateMemoryRequest>({
+    return this.call<MemoryWriteReceipt, UpdateMemoryRequest>({
       method: "PUT",
       path: `/api/v1/memories/${encodeURIComponent(id)}`,
       body,

@@ -108,6 +108,7 @@ fn router(
         mtls_enforced: false,
         enrolled_agent_keys: enrolled.clone(),
         identity_mode: ai_memory::config::HttpIdentityMode::Enforce,
+        ..Default::default()
     };
     (ai_memory::build_router(api_keys, state), sidecar)
 }

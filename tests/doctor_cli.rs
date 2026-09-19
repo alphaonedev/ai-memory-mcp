@@ -244,7 +244,13 @@ fn doctor_remote_queries_capabilities_endpoint() {
     let serve = spawn_serve(&db);
 
     let assert = ai_memory(&db)
-        .args(["doctor", "--remote", &serve.base_url()])
+        .args([
+            "doctor",
+            "--remote",
+            &serve.base_url(),
+            "--ca-cert",
+            serve.tls.cert_path.to_str().unwrap(),
+        ])
         .assert();
     let output = assert.get_output();
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -275,7 +281,14 @@ fn doctor_remote_queries_capabilities_endpoint() {
 
     // JSON mode parses cleanly.
     let json_out = ai_memory(&db)
-        .args(["doctor", "--remote", &serve.base_url(), "--json"])
+        .args([
+            "doctor",
+            "--remote",
+            &serve.base_url(),
+            "--ca-cert",
+            serve.tls.cert_path.to_str().unwrap(),
+            "--json",
+        ])
         .assert()
         .success()
         .get_output()
@@ -283,6 +296,93 @@ fn doctor_remote_queries_capabilities_endpoint() {
         .clone();
     let v: serde_json::Value = serde_json::from_slice(&json_out).unwrap();
     assert_eq!(v["mode"].as_str().unwrap(), "remote");
+}
+
+/// v1.0.0 #3655 — end-to-end through the binary: a peer whose last ANSWERED
+/// pull (`sync_peer_contact`, review rework) is hours old is a stale peer
+/// (Critical, exit 2) — its equal-but-old data cursors are the symptom, not
+/// the signal; and an unreadable `sync_state` is Critical, never
+/// "single-node". Pre-fix the first case rendered Info (|seen - pulled| = 0)
+/// and the second rendered N/A with the single-node note.
+#[test]
+fn doctor_sync_flags_stale_peer_and_unreadable_table_3655() {
+    let tmp = TempDir::new().unwrap();
+    let db = tmp.path().join("ai-memory.db");
+    init_db(&db);
+    let old = (chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute(
+            "INSERT INTO sync_state (agent_id, peer_id, last_seen_at, last_pulled_at) \
+             VALUES ('me', 'peer-1', ?1, ?1)",
+            params![old],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sync_peer_contact (agent_id, peer_id, last_contact_at, \
+             catchup_interval_secs) VALUES ('me', 'peer-1', ?1, 60)",
+            params![old],
+        )
+        .unwrap();
+    }
+    let sync_section = |db: &Path| -> serde_json::Value {
+        let out = ai_memory(db)
+            .args(["doctor", "--json"])
+            .assert()
+            .code(2)
+            .get_output()
+            .stdout
+            .clone();
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        v["sections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["name"] == "Sync")
+            .cloned()
+            .expect("Sync section")
+    };
+    let fact = |s: &serde_json::Value, key: &str| -> String {
+        s["facts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f[0] == key)
+            .unwrap_or_else(|| panic!("fact {key} missing in {s}"))[1]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+
+    let stale = sync_section(&db);
+    assert_eq!(stale["severity"], "critical", "{stale}");
+    assert_eq!(fact(&stale, "stale_peers"), "1");
+    assert_eq!(fact(&stale, "peer::me/peer-1::clock_lead_secs"), "0");
+    assert_eq!(
+        fact(&stale, "peer::me/peer-1::reachability"),
+        "unknown:pull_observation_stale"
+    );
+    assert!(
+        fact(&stale, "peer::me/peer-1::contact_age_secs")
+            .parse::<i64>()
+            .unwrap()
+            >= 7_000
+    );
+
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch("DROP TABLE sync_state;").unwrap();
+    }
+    let unreadable = sync_section(&db);
+    assert_eq!(unreadable["severity"], "critical", "{unreadable}");
+    assert_eq!(fact(&unreadable, "sync_state"), "unreadable");
+    assert!(
+        !unreadable["note"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("single-node deployment or"),
+        "{unreadable}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -293,11 +393,13 @@ fn doctor_remote_queries_capabilities_endpoint() {
 struct ServeChild {
     child: Option<Child>,
     port: u16,
+    /// #3705 — the leaf the daemon serves; clients trust exactly it.
+    tls: common::tls::TestTls,
 }
 
 impl ServeChild {
     fn base_url(&self) -> String {
-        format!("http://127.0.0.1:{}", self.port)
+        common::tls::TestTls::base_url(self.port)
     }
 }
 
@@ -356,6 +458,11 @@ fn try_spawn_serve_once(db: &Path) -> Result<ServeChild, SpawnFailure> {
         .expect("db lives in a tempdir")
         .join("keys-3198");
     std::fs::create_dir_all(&keys).ok();
+    // #3705 — the daemon refuses every plaintext bind; mint a per-spawn
+    // leaf next to the db and verify against it from the probe client.
+    let tls = common::tls::TestTls::generate(
+        &db.parent().expect("db lives in a tempdir").join("tls-3705"),
+    );
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
@@ -372,6 +479,7 @@ fn try_spawn_serve_once(db: &Path) -> Result<ServeChild, SpawnFailure> {
             "--port",
             &port_s,
         ])
+        .args(tls.serve_arg_strs())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = cmd.spawn().expect("spawn ai-memory serve");
@@ -400,11 +508,8 @@ fn try_spawn_serve_once(db: &Path) -> Result<ServeChild, SpawnFailure> {
         stderr_buf.lock().unwrap().clone()
     };
 
-    let client = reqwest::blocking::Client::builder()
-        .timeout(READINESS_PROBE_TIMEOUT)
-        .build()
-        .unwrap();
-    let url = format!("http://127.0.0.1:{port}/api/v1/health");
+    let client = tls.client_with_timeout(READINESS_PROBE_TIMEOUT);
+    let url = format!("{}/api/v1/health", common::tls::TestTls::base_url(port));
     let deadline = Instant::now() + SPAWN_TIMEOUT;
     while Instant::now() < deadline {
         if let Ok(resp) = client.get(&url).send()
@@ -413,6 +518,7 @@ fn try_spawn_serve_once(db: &Path) -> Result<ServeChild, SpawnFailure> {
             return Ok(ServeChild {
                 child: Some(child),
                 port,
+                tls,
             });
         }
         if let Ok(Some(status)) = child.try_wait() {

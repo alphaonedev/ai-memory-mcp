@@ -18,7 +18,7 @@ TimeoutStopSec=90
 # State location. The package installer creates /var/lib/ai-memory owned by
 # ai-memory:ai-memory with mode 0750.
 Environment=AI_MEMORY_DB=/var/lib/ai-memory/ai-memory.db
-Environment=RUST_LOG=ai_memory=info
+Environment=RUST_LOG=info
 StateDirectory=ai-memory
 StateDirectoryMode=0750
 WorkingDirectory=/var/lib/ai-memory

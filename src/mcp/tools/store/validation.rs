@@ -85,11 +85,23 @@ pub(super) fn default_on_conflict_for_client(mcp_client: Option<&str>) -> OnConf
 /// `super::handle_store`). Single-sources the wire shape — the message literal
 /// lives at exactly one site — so a race-detected conflict is byte-identical to
 /// a probe-detected one.
+///
+/// #3695 / #3696 — an EMPTY `existing_id` is the Refused rendering: the slot
+/// is held by a row this caller cannot read (hidden lifecycle, or another
+/// agent's private row). The merge hint would be a lie there — no
+/// `on_conflict` mode writes into a row the caller cannot read — so the
+/// remedy offered is the only one that exists: another title (or `version`,
+/// which suffixes to a free slot).
 pub(super) fn conflict_error_message(title: &str, namespace: &str, existing_id: &str) -> String {
+    let remedy = if existing_id.is_empty() {
+        "The slot is held by a row not readable by this caller; choose another title \
+         or pass on_conflict='version' to suffix it."
+    } else {
+        "Pass on_conflict='merge' to update in place or 'version' to suffix the title."
+    };
     format!(
         "CONFLICT: memory with title '{title}' already exists in namespace \
-         '{namespace}' (existing id: {existing_id}). Pass \
-         on_conflict='merge' to update in place or 'version' to suffix the title."
+         '{namespace}' (existing id: {existing_id}). {remedy}"
     )
 }
 
@@ -250,16 +262,21 @@ pub(super) fn parse_and_build_memory(
     // exists; `Merge` defers to the legacy code path below.
     let resolved_title = match on_conflict {
         OnConflict::Error => {
+            // #3696 — probe as the ENFORCED-read caller: an occupant this
+            // caller cannot read (another agent's private row, or a hidden
+            // one) is never named here; the write's own admission refuses it
+            // typed and unnamed.
+            let viewer = crate::identity::resolve_read_visibility_caller();
             if let Some(existing_id) =
-                db::find_by_title_namespace(conn, title, &namespace).map_err(|e| e.to_string())?
+                db::find_by_title_namespace(conn, title, &namespace, viewer.as_deref())
+                    .map_err(|e| crate::mcp::error_text::mcp_foreign_err("as_deref", e))?
             {
                 return Err(conflict_error_message(title, &namespace, &existing_id));
             }
             title.to_string()
         }
-        OnConflict::Version => {
-            db::next_versioned_title(conn, title, &namespace).map_err(|e| e.to_string())?
-        }
+        OnConflict::Version => db::next_versioned_title(conn, title, &namespace)
+            .map_err(|e| crate::mcp::error_text::mcp_foreign_err("next_versioned_title", e))?,
         OnConflict::Merge => title.to_string(),
     };
 

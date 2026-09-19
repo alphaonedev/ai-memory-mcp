@@ -29,7 +29,8 @@
 //! (#1998 -> #2115 -> #2127).
 
 use std::ffi::OsString;
-use std::sync::{Mutex, MutexGuard};
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 /// Process-wide lock serialising every test that mutates an environment
 /// variable in-process, so `set_var`'s single-threaded contract holds and no
@@ -338,6 +339,132 @@ pub(crate) fn no_lineage_dag_guard() -> LineageDagIsolation {
          restore on drop)"
     );
     g
+}
+
+// ---------------------------------------------------------------------------
+// #3705 — "only encrypted data in transit": TLS for in-process tests.
+//
+// Since the mandate a listener without `--tls-cert`/`--tls-key` is refused
+// (`daemon_runtime::tls_bind_guard`), an `http://` federation peer or
+// webhook target is refused, and the PostgreSQL DSN needs
+// `sslmode=verify-full`. The in-crate tests therefore need two things:
+// PATHS that satisfy the bind guard for `bootstrap_serve`-based tests that
+// never bind, and a real TLS mock for tests that actually connect.
+// ---------------------------------------------------------------------------
+
+/// The checked-in TLS fixture pair (`tests/fixtures/tls`): the leaf carries
+/// the SAN `ai-memory-test.local` and a PKCS#8 ECDSA key. Enough for
+/// `ServeArgs` in `bootstrap_serve`-based tests, which only need both paths
+/// PRESENT to pass the #3705 bind guard and never bind a socket.
+pub(crate) fn tls_fixture_paths() -> (PathBuf, PathBuf) {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tls");
+    (dir.join("valid_cert.pem"), dir.join("valid_key_pkcs8.pem"))
+}
+
+/// A per-process test PKI for mocks a test CONNECTS to: an ephemeral CA and
+/// a leaf it signed whose SANs are the loopback names (`127.0.0.1`, `::1`,
+/// `localhost`), so a VERIFYING client accepts the mock exactly the way a
+/// production peer would — no `danger_accept_invalid_certs` anywhere.
+/// Generated once with rcgen under `TMPDIR` (the `TempDir` lives for the
+/// process; it is dropped with the static, never leaked).
+pub(crate) struct TlsTestPki {
+    _dir: tempfile::TempDir,
+    /// The CA certificate (PEM) a client adds as its root.
+    pub(crate) ca_pem: PathBuf,
+    /// The leaf certificate (PEM) a mock listener presents.
+    pub(crate) leaf_pem: PathBuf,
+    /// The leaf's PKCS#8 private key (PEM, mode 0600).
+    pub(crate) leaf_key_pem: PathBuf,
+}
+
+static TLS_TEST_PKI: OnceLock<TlsTestPki> = OnceLock::new();
+
+/// The process-wide [`TlsTestPki`] (generated on first use).
+pub(crate) fn tls_test_pki() -> &'static TlsTestPki {
+    TLS_TEST_PKI.get_or_init(generate_tls_test_pki)
+}
+
+fn generate_tls_test_pki() -> TlsTestPki {
+    let dir = tempfile::tempdir().expect("TMPDIR tempdir for the #3705 test PKI");
+    let ca_key = rcgen::KeyPair::generate().expect("test CA key");
+    let mut ca_params =
+        rcgen::CertificateParams::new(Vec::<String>::new()).expect("test CA params");
+    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    ca_params.distinguished_name.push(
+        rcgen::DnType::CommonName,
+        "ai-memory in-process test CA (#3705)",
+    );
+    let ca_cert = ca_params.self_signed(&ca_key).expect("test CA certificate");
+    let issuer = rcgen::Issuer::new(ca_params, ca_key);
+    let leaf_key = rcgen::KeyPair::generate().expect("test leaf key");
+    let leaf_params = rcgen::CertificateParams::new(vec![
+        "127.0.0.1".to_string(),
+        "::1".to_string(),
+        "localhost".to_string(),
+    ])
+    .expect("test leaf params");
+    let leaf_cert = leaf_params
+        .signed_by(&leaf_key, &issuer)
+        .expect("test leaf certificate");
+    let ca_pem = dir.path().join("test-ca.pem");
+    let leaf_pem = dir.path().join("test-leaf.pem");
+    let leaf_key_pem = dir.path().join("test-leaf-key.pem");
+    std::fs::write(&ca_pem, ca_cert.pem()).expect("write test CA");
+    std::fs::write(&leaf_pem, leaf_cert.pem()).expect("write test leaf");
+    std::fs::write(&leaf_key_pem, leaf_key.serialize_pem()).expect("write test leaf key");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&leaf_key_pem, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod 0600 test leaf key");
+    }
+    TlsTestPki {
+        _dir: dir,
+        ca_pem,
+        leaf_pem,
+        leaf_key_pem,
+    }
+}
+
+/// Serve `app` over TLS (the [`tls_test_pki`] leaf) on a loopback ephemeral
+/// port. Returns the `https://127.0.0.1:<port>` base URL. The server task is
+/// detached and ends with the runtime, like the plaintext `axum::serve`
+/// mocks it replaces.
+pub(crate) async fn spawn_tls_mock(app: axum::Router) -> String {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let pki = tls_test_pki();
+    let config = crate::tls::load_rustls_config(&pki.leaf_pem, &pki.leaf_key_pem)
+        .await
+        .expect("test leaf TLS config");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a loopback port");
+    // tokio adopts a std listener only in non-blocking mode.
+    listener
+        .set_nonblocking(true)
+        .expect("non-blocking mock listener");
+    let addr = listener.local_addr().expect("mock listener address");
+    let acceptor = crate::tls::serve_rustls_acceptor(&config);
+    tokio::spawn(async move {
+        let _ = axum_server::from_tcp(listener)
+            .expect("axum_server from_tcp")
+            .acceptor(acceptor)
+            .serve(app.into_make_service())
+            .await;
+    });
+    format!("https://{addr}")
+}
+
+/// A verifying `reqwest` client that trusts the [`tls_test_pki`] CA, so a
+/// [`spawn_tls_mock`] listener is accepted the way a production peer is.
+pub(crate) fn tls_test_client(timeout: std::time::Duration) -> reqwest::Client {
+    let pki = tls_test_pki();
+    let ca_pem = std::fs::read(&pki.ca_pem).expect("read the test CA");
+    let ca = reqwest::Certificate::from_pem(&ca_pem).expect("parse the test CA");
+    reqwest::Client::builder()
+        .use_rustls_tls()
+        .add_root_certificate(ca)
+        .timeout(timeout)
+        .build()
+        .expect("TLS test client")
 }
 
 #[cfg(test)]

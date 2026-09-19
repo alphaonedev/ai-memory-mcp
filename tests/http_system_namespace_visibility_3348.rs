@@ -205,6 +205,7 @@ fn fixture_with_store(
             ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty(),
         ),
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
+        ..Default::default()
     };
     Fixture {
         router: ai_memory::build_router(api_keys, state),

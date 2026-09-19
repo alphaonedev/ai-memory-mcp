@@ -143,6 +143,7 @@ table tr:last-child td{border-bottom:none}
           <a href="knowledge-graph.html">Knowledge Graph</a>
           <a href="autonomous.html">Autonomous</a>
           <a href="a2a-messaging.html">A2A Messaging</a>
+          <a href="a2a-integration.html">Integrate an Agent</a>
           <a href="lifecycle.html">Lifecycle</a>
           <a href="performance.html">Performance</a>
           <a href="agent-identity.html">Agent Identity (NHI)</a>
@@ -213,6 +214,7 @@ table tr:last-child td{border-bottom:none}
         <a href="knowledge-graph.html">Knowledge Graph</a>
         <a href="autonomous.html">Autonomous</a>
         <a href="a2a-messaging.html">A2A Messaging</a>
+          <a href="a2a-integration.html">Integrate an Agent</a>
         <a href="lifecycle.html">Lifecycle</a>
         <a href="performance.html">Performance</a>
         <a href="agent-identity.html">Agent Identity (NHI)</a>
@@ -454,7 +456,7 @@ ai-memory --db ~/.claude/ai-memory.db stats</code></pre>
     <h2>Governance, skills, and attestations at T1.</h2>
     <ul>
       <li><strong>Governance</strong> — Default policy is <code>write: any, promote: any, delete: owner</code>. Override per-namespace via <code>memory_namespace_set_standard</code> if you want pending-approval behavior for sensitive memories. The same governance machinery as T2+ is present; you just rarely use it with one agent.</li>
-      <li><strong>Skills</strong> — Auto-tagging (<code>memory_auto_tag</code>) and contradiction detection (<code>memory_detect_contradiction</code>) require the <code>smart</code> or <code>autonomous</code> feature tier (LLM-bound). Post-#1067 + #1146 (v0.7.0), tier no longer dictates vendor — any tier can route to Ollama OR any of 15+ cloud vendors (xAI, OpenAI, Anthropic, Gemini, DeepSeek, Kimi, Qwen, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks, LMStudio) via a <code>[llm]</code> section in <code>~/.config/ai-memory/config.toml</code> (canonical schema: <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/docs/CONFIG_SCHEMA.md">CONFIG_SCHEMA.md</a>) or via <code>AI_MEMORY_LLM_BACKEND</code> env vars (override). Capabilities introspection v2 (v0.6.3) lets the agent ask the server which skills are available before invoking them.</li>
+      <li><strong>Skills</strong> — Auto-tagging (<code>memory_auto_tag</code>) and contradiction detection (<code>memory_detect_contradiction</code>) require the <code>smart</code> or <code>autonomous</code> feature tier (LLM-bound). Post-#1067 + #1146 (v0.7.0), tier no longer dictates vendor — any tier can route to Ollama OR any of 14+ cloud vendors (xAI, OpenAI, Anthropic, Gemini, Kimi, Qwen, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks, LMStudio) via a <code>[llm]</code> section in <code>~/.config/ai-memory/config.toml</code> (canonical schema: <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/docs/CONFIG_SCHEMA.md">CONFIG_SCHEMA.md</a>) or via <code>AI_MEMORY_LLM_BACKEND</code> env vars (override). Capabilities introspection v2 (v0.6.3) lets the agent ask the server which skills are available before invoking them.</li>
       <li><strong>Attestations</strong> — Not enforced at T1; the <code>signature</code> column on <code>memory_links</code> (added schema v15 / v0.6.3) is populated with Ed25519 attestation.</li>
     </ul>
   </div>
@@ -487,7 +489,7 @@ ai-memory --db ~/.claude/ai-memory.db stats</code></pre>
     <ul>
       <li><code>src/main.rs</code> + <code>src/daemon_runtime.rs</code> — CLI parsing + daemon setup (96 subcommands in the default build (98 under <code>--features sal</code> or <code>--features sal-postgres</code>; #1598 added <code>reembed</code>))</li>
       <li><code>src/mcp/</code> — MCP server (104 advertised entries at <code>--profile full</code>; 7 at <code>--profile core</code>)</li>
-      <li><code>src/handlers/</code> — HTTP route handlers (router registers 100 <code>/api/v1/*</code> route bindings / 86 unique URL paths)</li>
+      <li><code>src/handlers/</code> — HTTP route handlers (router registers 102 <code>/api/v1/*</code> route bindings / 88 unique URL paths)</li>
       <li><code>src/storage/</code> — schema, recall scoring, GC, migrations (current schema v90 per <code>CURRENT_SCHEMA_VERSION</code>; v57 = postgres stored generated tsvector + memories_tsv_gin #1579 B2; v56 = composite list/archive ordering indexes + sargable list #1579 A2; v55 = sargable list_memories_updated_since federation-catchup rewrite + idx_memories_updated_at #1476; v54 = tier-default expiry backfill #1466; v53 = memories_au FTS5 trigger scoping #1418; v52 = transcript_line_dedup #1389; v51 = federation_nonces persistence #1255 / PR #1296; v50 = per-namespace K8 quota dimension #1156)</li>
       <li><code>src/reranker.rs</code> — adaptive blend semantic + keyword</li>
       <li><code>src/hnsw.rs</code> — in-memory ANN</li>

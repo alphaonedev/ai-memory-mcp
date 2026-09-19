@@ -48,6 +48,8 @@ use crate::identity::authority::{Authority, HttpAuthorityInputs};
 /// that loses liveness on a header quirk kills a healthy node.
 pub const AUTHORITY_EXEMPT_EXACT: &[&str] = &[
     super::routes::HEALTH,
+    super::routes::MONITORING_STATUS,
+    super::routes::MONITORING_METRICS,
     super::routes::METRICS_BARE,
     super::routes::METRICS,
 ];
@@ -140,11 +142,11 @@ pub async fn authority_layer(
                 "deny",
                 AUDIT_KIND_AUTHORITY,
                 "",
-                json!({
-                    "endpoint": path,
-                    "outcome": "agent_id_resolve_failed",
-                    "reason": e.to_string(),
-                }),
+                crate::governance::audit::ForensicPayload::new()
+                    .ident("endpoint", &path)
+                    .label("outcome", "agent_id_resolve_failed")
+                    // The error text can echo the hostile header value.
+                    .commit("reason", &e.to_string()),
             );
             tracing::warn!(
                 target: super::AUTHZ_TRACE_TARGET,

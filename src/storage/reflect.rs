@@ -18,6 +18,12 @@ use rusqlite::Connection;
 
 use crate::models::{GovernancePolicy, Memory, MemoryKind, Tier};
 
+/// #3638 — ONE named tracing target for every reflection diagnostic, on both
+/// the storage and MCP sides, so the refusal detail an operator needs is
+/// filterable by a single stable target instead of a magic string repeated at
+/// each emit site.
+pub(crate) const REFLECT_TRACE_TARGET: &str = "mcp.reflect";
+
 use super::{
     ConflictMode, create_link_signed, get, insert_with_conflict, resolve_governance_policy,
 };
@@ -38,8 +44,8 @@ pub enum ReflectError {
     /// the offending id so the caller can name the missing source.
     SourceNotFound(String),
     /// Proposed reflection depth exceeds the resolved namespace cap.
-    /// The triple is the structured payload Task 5/8 will attach to
-    /// the audit row.
+    /// The triple is internal diagnostic/audit data, potentially derived
+    /// from a private standard. Never render it in a tenant response (#3638).
     DepthExceeded {
         attempted: u32,
         cap: u32,
@@ -643,9 +649,11 @@ pub fn reflect_with_hooks_for_caller(
         // validation error rather than smashing the existing row.
         let actual_id = insert_with_conflict(conn, &new_mem, ConflictMode::Error).map_err(|e| {
             if e.downcast_ref::<crate::storage::ConflictError>().is_some() {
-                ReflectError::Validation(format!(
-                    "reflection title collides with an existing memory in the same namespace: {e}"
-                ))
+                tracing::warn!(target: REFLECT_TRACE_TARGET, error = %e, "reflection title conflict");
+                ReflectError::Validation(
+                    "reflection title collides with an existing memory in the same namespace"
+                        .into(),
+                )
             } else {
                 ReflectError::Database(e.to_string())
             }

@@ -1087,7 +1087,7 @@ pub(crate) fn resolve_sqlite_store(
     out: &mut CliOutput<'_>,
 ) -> Result<PathBuf> {
     use crate::daemon_runtime::{SQLITE_URL_SCHEME, is_postgres_url, resolve_store_url};
-    use crate::logging::redact_url_password;
+    use crate::url_display::store_url_display;
 
     // Ambiguity is REFUSED, never silently resolved. `resolve_store_url` gives
     // the env channels precedence over the argv flag (#1927), so an explicit
@@ -1102,8 +1102,8 @@ pub(crate) fn resolve_sqlite_store(
                      (AI_MEMORY_STORE_URL / AI_MEMORY_STORE_URL_FILE) names {}. \
                      Refusing to guess which store `{verb}` should act on — \
                      unset one of them (#2444).",
-                    redact_url_password(arg),
-                    redact_url_password(&env_url),
+                    store_url_display(arg),
+                    store_url_display(&env_url),
                 );
             }
         }
@@ -1120,7 +1120,7 @@ pub(crate) fn resolve_sqlite_store(
             anyhow::bail!(
                 "`ai-memory {verb}` operates on a local SQLite database only, but this \
                  deployment's configured store is Postgres ({}). Refusing — {alt} (#2572).",
-                redact_url_password(&url)
+                store_url_display(&url)
             );
         }
         anyhow::bail!(
@@ -1129,7 +1129,7 @@ pub(crate) fn resolve_sqlite_store(
              artifact would NOT contain the corpus, and a restore from it would \
              silently return nothing. Use `pg_dump` (or `pg_basebackup` + WAL \
              archiving) instead; see docs/production-deployment.md (#2444, #2490).",
-            redact_url_password(&url)
+            store_url_display(&url)
         );
     }
 
@@ -1184,7 +1184,7 @@ pub(crate) fn resolve_sqlite_store(
         "unrecognised store URL: {} (expected sqlite:///path or postgres://...). \
          Refusing to fall back to the local --db file, because that would produce \
          a snapshot of a database this deployment does not serve (#2444).",
-        redact_url_password(&url)
+        store_url_display(&url)
     )
 }
 
@@ -2078,7 +2078,7 @@ fn note_unverified_restore(
     snapshot: &Path,
     target: &Path,
     outcome: ManifestVerification,
-    detail: &str,
+    detail: &'static str,
 ) -> Result<()> {
     writeln!(
         out.stderr,
@@ -2089,17 +2089,17 @@ fn note_unverified_restore(
     )?;
     let caller = crate::identity::resolve_agent_id(None, None)
         .unwrap_or_else(|_| crate::identity::sentinels::ANONYMOUS_INVALID.to_string());
-    crate::governance::audit::record_decision(
-        &caller,
-        "allow",
-        RESTORE_UNVERIFIED_AUDIT_KIND,
-        "",
-        serde_json::json!({
-            "outcome": outcome.as_str(),
-            "detail": detail,
-            "snapshot": snapshot.to_string_lossy(),
-            "target": target.to_string_lossy(),
-        }),
+    // #3647 — restore evidence is an integrity row: written whenever the
+    // forensic sink is up, independent of the governance decision-row gate.
+    crate::governance::audit::record_integrity(
+        crate::governance::audit::IntegrityRow::RestoreUnverified {
+            actor: &caller,
+            kind: RESTORE_UNVERIFIED_AUDIT_KIND,
+            outcome: outcome.as_str(),
+            detail,
+            snapshot,
+            target,
+        },
     );
     Ok(())
 }

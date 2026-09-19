@@ -142,7 +142,7 @@ fn kg_query_by_source_uri(
 ) -> Result<Value, String> {
     validate::validate_source_uri(uri).map_err(|e| e.to_string())?;
     let roots = db::list_by_source_uri(conn, uri, namespace, limit, as_agent, caller)
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("validate_source_uri", e))?;
     // #3386 — run the CANONICAL in-process predicate on this path too, so
     // the two traversal paths agree row-for-row. The SQL
     // `visibility_clause` above is prefix-keyed; `node_visible` carries the
@@ -331,7 +331,7 @@ fn kg_query_from_source(
         limit,
         include_invalidated,
     )
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| crate::mcp::error_text::mcp_foreign_err("kg_query_from_source", e))?;
 
     // #3386 — the `namespace` restriction, previously DEAD on this path. Applied
     // to the RESULT rows rather than pruned mid-walk: pruning would change

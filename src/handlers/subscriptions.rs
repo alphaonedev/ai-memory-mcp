@@ -244,6 +244,7 @@ pub async fn notify(
                 &namespace,
                 receipt_mem.map_or(&fallback_tier, |m| &m.tier),
                 receipt_mem.map_or(fallback_delivered_at.as_str(), |m| m.created_at.as_str()),
+                &body.title,
             )),
         )
             .into_response();
@@ -313,7 +314,8 @@ pub async fn notify(
 // contract. Scenario S33 uses a lighter shape (`{agent_id, namespace}`) to
 // express "subscribe this agent to a namespace". We accept both: when a
 // namespace is supplied without a URL we synthesize an internal loopback URL
-// (`http://localhost/_ns/<agent_id>/<namespace>`) that passes SSRF validation
+// (`https://localhost/_ns/<agent_id>/<namespace>` — https since #3705: no
+// plaintext URL is accepted anywhere, synthetic or not) that passes validation
 // and sets `agent_filter`/`namespace_filter` accordingly. This lets S33 round-
 // trip without needing a separate subscriptions table.
 
@@ -361,6 +363,32 @@ pub async fn subscribe(
         return (
             StatusCode::FORBIDDEN,
             Json(json!({"error": crate::errors::msg::AGENT_ID_BODY_MISMATCH})),
+        )
+            .into_response();
+    }
+    // #3775 — a subscription is a durable OWNER-bound registration: `created_by`
+    // is the caller, and `list` / `unsubscribe` are scoped to the caller
+    // (#870 / #874 / #3407). A per-request `anonymous:req-<uuid8>` principal
+    // is fresh on every request, so an anonymous create would store an owner
+    // that no later request — not even the creator's next one — can resolve:
+    // the webhook could never be listed or removed through the API, while the
+    // #3407 owner gate on DELETE (correctly) refuses everyone. The ONE
+    // predicate (`identity::is_anonymous_request_id`, also behind
+    // `Authority::is_anonymous`) decides here, BEFORE the backend branch, so
+    // sqlite and postgres answer byte-identically. Closed shape: 403
+    // `{error, code: IDENTITY_REQUIRED}` — no row exists yet, so this is not
+    // the `NOT_OWNER` cross-owner refusal (#3426).
+    if crate::identity::is_anonymous_request_id(&caller) {
+        tracing::warn!(
+            target: super::AUTHZ_TRACE_TARGET,
+            "POST /subscriptions 403: no X-Agent-Id asserted (anonymous principal {caller}); a subscription needs a resolvable owner"
+        );
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": crate::errors::msg::SUBSCRIBE_REQUIRES_IDENTITY,
+                "code": crate::errors::error_codes::IDENTITY_REQUIRED,
+            })),
         )
             .into_response();
     }
@@ -417,7 +445,7 @@ pub async fn subscribe(
         {
             url_was_synthesized = true;
         }
-        let synthetic = format!("http://localhost/_ns/{caller}/{ns}");
+        let synthetic = format!("https://localhost/_ns/{caller}/{ns}");
         (
             synthetic,
             Some(ns),
@@ -745,6 +773,19 @@ pub async fn unsubscribe(
                     Json(json!({"id": id, "removed": false, (field_names::STORAGE_BACKEND): "postgres"})),
                 )
                     .into_response(),
+                // #3407 — another agent's subscription: the ONE closed
+                // refusal shape (403 `NOT_OWNER`), byte-identical to the
+                // sqlite arm below. The SAL gate already logged the owner
+                // to the authz trace; the caller learns that they may not,
+                // never who may. (Pre-#3407 this fell through to the generic
+                // memory-owner text while sqlite answered `200 removed:false`.)
+                Err(crate::store::StoreError::PermissionDenied { .. }) => {
+                    crate::handlers::parity::owner_gate_refusal(
+                        crate::errors::msg::CALLER_DOES_NOT_OWN_SUBSCRIPTION,
+                        Some(caller.as_str()),
+                        crate::handlers::parity::RefusedResource::Subscription(&id),
+                    )
+                }
                 Err(e) => store_err_to_response(e),
             },
             None => (
@@ -784,6 +825,37 @@ pub async fn unsubscribe(
     // and delete it.
     if let Some(id) = q.id.clone() {
         let lock = app.db.lock().await;
+        // #3407 — a row ANOTHER agent created is refused with the ONE closed
+        // shape (403 `NOT_OWNER`) instead of the idempotent `200 removed:
+        // false` that a genuinely absent id still gets: the postgres arm
+        // refuses the same act through the SAL owner gate, and the two
+        // backends must answer with the same class. The creator goes to the
+        // authz trace only; the body names nobody.
+        match crate::subscriptions::owner_of(&lock.0, &id) {
+            Ok(Some(creator)) if creator.as_deref() != Some(caller.as_str()) => {
+                drop(lock);
+                tracing::warn!(
+                    target: super::AUTHZ_TRACE_TARGET,
+                    "DELETE /subscriptions 403: caller {caller} != creator {} (id={id})",
+                    creator.as_deref().unwrap_or("")
+                );
+                return crate::handlers::parity::owner_gate_refusal(
+                    crate::errors::msg::CALLER_DOES_NOT_OWN_SUBSCRIPTION,
+                    Some(caller.as_str()),
+                    crate::handlers::parity::RefusedResource::Subscription(&id),
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                drop(lock);
+                tracing::error!("{}", crate::errors::msg::unsubscribe(&e));
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": crate::errors::msg::INTERNAL_SERVER_ERROR})),
+                )
+                    .into_response();
+            }
+        }
         let outcome = crate::subscriptions::delete(&lock.0, &id, Some(&caller));
         drop(lock);
         return match outcome {

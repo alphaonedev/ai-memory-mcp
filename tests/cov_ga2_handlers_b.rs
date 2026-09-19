@@ -158,6 +158,7 @@ fn sqlite_router() -> (axum::Router, tempfile::NamedTempFile) {
             ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty(),
         ),
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
+        ..Default::default()
     };
     (ai_memory::build_router(api_key_state, app_state), db_tmp)
 }
@@ -190,6 +191,7 @@ fn fake_pg_router() -> (axum::Router, std::path::PathBuf) {
             ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty(),
         ),
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
+        ..Default::default()
     };
     (
         ai_memory::build_router(api_key_state, app_state),
@@ -390,7 +392,8 @@ async fn inbox_populated_via_notify_round_trips() {
         "sender should carry alice; got {from}"
     );
     assert_eq!(body["messages"][0]["title"], json!("hello-bob"));
-    assert_eq!(body["messages"][0]["read"], json!(false));
+    // #3730 — no `read` field on the inbox wire shape.
+    assert!(body["messages"][0].get("read").is_none());
 }
 
 #[tokio::test]
@@ -450,6 +453,7 @@ async fn live_notify_inbox_wire_contract_3401() {
             ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty(),
         ),
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
+        ..Default::default()
     };
     let postgres_path = ai_memory::build_router(keys, state);
     assert_inbox_contract_3401(&sqlite, &postgres_path).await;
@@ -548,7 +552,6 @@ async fn assert_inbox_contract_3401(sqlite: &axum::Router, postgres_path: &axum:
         "priority",
         "tier",
         "namespace",
-        "read",
         "access_count",
         "target_agent_id",
     ] {
@@ -1209,6 +1212,7 @@ async fn approval_decide_live_postgres_missing_id_is_404() {
             ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty(),
         ),
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
+        ..Default::default()
     };
     let r = ai_memory::build_router(api_key_state, app_state);
 

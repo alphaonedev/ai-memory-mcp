@@ -64,7 +64,7 @@ Ranked for **ASI-horizon durability**, not 2026 ARR. “Durable” = hard for a 
 | **6** | **Endpoint-resident + LLM-agnostic composition** (local SoR, portable, no lab exclusive capture) | **High** | Real (Rust/SQLite/mobile/API-agnostic) | Centralized governance fails at endpoint count + jurisdiction |
 | **7** | **Backend-blind SAL + embeddings-as-disposable-cache** | **Medium-high** | CORRECT | Index death ≠ mind death; survives vector fashion cycles |
 | **8** | **Seven-property composition as *product identity*** | **Medium-high** | Named; partial on data-model axis | Bundle is the moat; any single property is copyable |
-| **9** | **Trademark `ai-memory` + Apache-2.0 forever** | **Medium** | Stated | Survives code commoditization; **does not** survive category confusion |
+| **9** | **Apache-2.0 forever** | **Medium** | Stated | Survives code commoditization; **does not** survive category confusion |
 | **10** | **Recall quality / LongMemEval scores** | **Low** | Competitive but not unique; competitive harness scaffolding | Peers can match or game R@k; not ASI-load-bearing |
 | **11** | **Surface area (tool/route/CLI count)** | **Anti-moat** | Large | Raises complexity tax; confuses category |
 | **12** | **“Perfect” / grandeur brand claims** | **Anti-moat** | TRACT-banned register | Unfalsifiable; credibility poison for procurement |

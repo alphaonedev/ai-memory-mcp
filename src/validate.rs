@@ -8,7 +8,7 @@ use crate::models::{
     UpdateMemory, VALID_AGENT_TYPES, VALID_SCOPES,
 };
 
-const MAX_TITLE_LEN: usize = 512;
+pub(crate) const MAX_TITLE_LEN: usize = 512;
 /// Max characters in a namespace string (post-Task 1.4).
 /// Flat namespaces still fit in the historical 128 budget; 512 is the ceiling
 /// for hierarchical paths like `a/b/c/…` up to 8 levels deep.
@@ -83,7 +83,7 @@ pub(crate) const VALID_SOURCES: &[&str] = &[
 /// a single vendor's name on every reflection — regardless of which
 /// AI NHI made the call — is a monoculture defect: forensic queries
 /// keyed on `source = 'claude'` silently miss every row minted by an
-/// OpenAI / xAI / Anthropic / Gemini / DeepSeek / Groq / etc. NHI.
+/// OpenAI / xAI / Anthropic / Gemini / Groq / etc. NHI.
 ///
 /// **Migration:** pre-existing rows with `source = "claude"` are
 /// untouched. New substrate writes stamp `DEFAULT_NHI_SOURCE`. Tests

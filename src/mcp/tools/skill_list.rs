@@ -48,7 +48,7 @@ pub fn handle_skill_list(conn: &Connection, params: &Value) -> Result<Value, Str
     );
     let mut stmt = conn
         .prepare(&sql)
-        .map_err(|e| format!("skill_list prepare: {e}"))?;
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("skill_list prepare", e))?;
 
     let mut skills: Vec<Value> = Vec::new();
     let rows = stmt
@@ -68,7 +68,7 @@ pub fn handle_skill_list(conn: &Connection, params: &Value) -> Result<Value, Str
                 row.get::<_, Option<i64>>(11)?,   // retired_at
             ))
         })
-        .map_err(|e| format!("skill_list query: {e}"))?;
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("skill_list query", e))?;
 
     for row in rows {
         let (
@@ -84,7 +84,7 @@ pub fn handle_skill_list(conn: &Connection, params: &Value) -> Result<Value, Str
             signing_agent,
             created_at,
             retired_at,
-        ) = row.map_err(|e| format!("skill_list row: {e}"))?;
+        ) = row.map_err(|e| crate::mcp::error_text::mcp_foreign_err("skill_list row", e))?;
 
         // Apply optional text filter on name or description.
         if !filter.is_empty() && !name.contains(filter) && !description.contains(filter) {

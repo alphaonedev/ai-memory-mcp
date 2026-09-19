@@ -193,6 +193,7 @@ async fn per_agent_key_binds_x_agent_id_and_injects_principal() {
         mtls_enforced: false,
         enrolled_agent_keys: enrolled(&[("alice-key", "alice")]),
         identity_mode: HttpIdentityMode::Advisory,
+        ..Default::default()
     };
     let app = router(auth);
 
@@ -216,6 +217,7 @@ async fn h1_advisory_corrects_forged_x_agent_id_to_key_principal() {
         mtls_enforced: false,
         enrolled_agent_keys: enrolled(&[("alice-key", "alice")]),
         identity_mode: HttpIdentityMode::Advisory,
+        ..Default::default()
     };
     let app = router(auth);
     let (st, body) = call(&app, "alice-key", Some("bob")).await;
@@ -234,6 +236,7 @@ async fn h1_enforce_refuses_forged_x_agent_id() {
         mtls_enforced: false,
         enrolled_agent_keys: enrolled(&[("alice-key", "alice")]),
         identity_mode: HttpIdentityMode::Enforce,
+        ..Default::default()
     };
     let app = router(auth);
     let (st, body) = call(&app, "alice-key", Some("bob")).await;
@@ -251,6 +254,7 @@ async fn shared_key_does_not_bind_or_attest() {
         mtls_enforced: false,
         enrolled_agent_keys: enrolled(&[("alice-key", "alice")]),
         identity_mode: HttpIdentityMode::Enforce,
+        ..Default::default()
     };
     let app = router(auth);
     let (st, body) = call(&app, "shared-transport", Some("victim")).await;
@@ -265,6 +269,7 @@ async fn unknown_key_is_401() {
         mtls_enforced: false,
         enrolled_agent_keys: enrolled(&[("alice-key", "alice")]),
         identity_mode: HttpIdentityMode::Enforce,
+        ..Default::default()
     };
     let app = router(auth);
     let (st, _) = call(&app, "not-a-key", Some("alice")).await;
@@ -280,6 +285,7 @@ async fn off_mode_disables_binding() {
         mtls_enforced: false,
         enrolled_agent_keys: enrolled(&[("alice-key", "alice")]),
         identity_mode: HttpIdentityMode::Off,
+        ..Default::default()
     };
     let app = router(auth);
     let (st, body) = call(&app, "alice-key", Some("bob")).await;

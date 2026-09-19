@@ -61,10 +61,16 @@ pub(super) fn handle_detect_contradiction(
     // call. Fails closed: an unreadable row refuses with the same message an
     // absent row does, and the refusal happens above the `llm.` dispatch so a
     // denied caller causes ZERO egress of either body.
-    let mem_a = mask_invisible(db::get(conn, id_a).map_err(|e| e.to_string())?, caller)
-        .ok_or(NOT_FOUND_A)?;
-    let mem_b = mask_invisible(db::get(conn, id_b).map_err(|e| e.to_string())?, caller)
-        .ok_or(NOT_FOUND_B)?;
+    let mem_a = mask_invisible(
+        db::get(conn, id_a).map_err(|e| crate::mcp::error_text::mcp_foreign_err("get", e))?,
+        caller,
+    )
+    .ok_or(NOT_FOUND_A)?;
+    let mem_b = mask_invisible(
+        db::get(conn, id_b).map_err(|e| crate::mcp::error_text::mcp_foreign_err("get", e))?,
+        caller,
+    )
+    .ok_or(NOT_FOUND_B)?;
     // COVERAGE: LLM response variability. The boolean below is derived
     // from the model's free-form yes/no answer. Envelope is tested at
     // ≥95% via wiremock-driven success / error / shape cases; real-LLM
@@ -72,7 +78,12 @@ pub(super) fn handle_detect_contradiction(
     // LongMemEval benchmark (see `benchmarks/longmemeval/`).
     let contradicts = llm
         .detect_contradiction(&mem_a.content, &mem_b.content)
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| {
+            crate::mcp::error_text::mcp_foreign_err(
+                "detect_contradiction",
+                crate::mcp::error_text::llm(e),
+            )
+        })?;
     Ok(json!({
         (crate::models::link::REL_CONTRADICTS): contradicts,
         "memory_a": {"id": id_a, "title": mem_a.title},

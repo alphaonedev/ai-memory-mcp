@@ -21,13 +21,16 @@
 //!   subscription time and never leaves the DB after.
 
 use crate::models::field_names;
+
+// #3659 — delivery-audit bookkeeping evidence (counters, /metrics, /health).
+pub mod audit_status;
 use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context, Result, anyhow};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension as _, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Notify, Semaphore};
@@ -310,6 +313,24 @@ pub fn delete(conn: &Connection, id: &str, caller_agent_id: Option<&str>) -> Res
     Ok(n > 0)
 }
 
+/// #3407 — the recorded creator of subscription `id` (`created_by`), or
+/// `None` when no such row exists. Deliberately UNSCOPED: the HTTP
+/// `unsubscribe` handler uses it to tell "another agent's row" (a 403
+/// `NOT_OWNER` refusal that names nobody) from "no such row" (the
+/// idempotent `removed: false`). Never rendered to a caller.
+///
+/// # Errors
+/// Any SQLite error.
+pub fn owner_of(conn: &Connection, id: &str) -> Result<Option<Option<String>>> {
+    Ok(conn
+        .query_row(
+            "SELECT created_by FROM subscriptions WHERE id = ?1",
+            params![id],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()?)
+}
+
 /// List active subscriptions, optionally scoped to a single owner.
 ///
 /// Cross-tenant authorization (#872, security-high, 2026-05-18):
@@ -556,6 +577,33 @@ pub(crate) const SHUTDOWN_DRAIN_TIMEOUT: std::time::Duration = std::time::Durati
 /// the LLM client already uses (`src/llm.rs`).
 pub const WEBHOOK_ACK_MAX_BYTES: usize = 64 * 1024;
 
+/// #3724 — the CLOSED vocabulary a delivery attempt fails with. This string
+/// is persisted into `subscription_dlq.last_error` and read back by the
+/// subscriber through `memory_subscription_dlq_list`, so it carries NOTHING
+/// the receiver chose: not the reqwest error (its Display names the full
+/// URL, #3710), not the ack body's `status`, not its `correlation_id`. The
+/// receiver's raw text goes to the operator log only (TIER 2).
+pub mod dlq_reason {
+    /// The HTTP client could not be built.
+    pub const CLIENT_BUILD: &str = "client_build";
+    /// The receiver's ack body could not be read.
+    pub const ACK_READ: &str = "ack_read";
+    /// The receiver's ack body was not JSON.
+    pub const ACK_DECODE: &str = "ack_decode";
+    /// The receiver's ack `status` was not `"ack"`.
+    pub const ACK_STATUS_NOT_ACK: &str = "ack_status_not_ack";
+    /// The receiver's ack `correlation_id` did not match the delivery's.
+    pub const ACK_CORR_MISMATCH: &str = "ack_corr_mismatch";
+    /// The receiver's ack body exceeded [`super::WEBHOOK_ACK_MAX_BYTES`].
+    pub const ACK_TOO_LARGE: &str = "ack_too_large";
+    /// Prefix of the `http-<status>` reason (a non-2xx receiver answer).
+    pub const HTTP_PREFIX: &str = "http-";
+    /// The subscription URL failed the SSRF guard.
+    pub const SSRF_REJECTED: &str = "ssrf_rejected";
+    /// The subscription URL failed the DNS-resolved SSRF guard.
+    pub const DNS_SSRF_REJECTED: &str = "dns_ssrf_rejected";
+}
+
 /// PERF-3 (fix campaign 2026-05-26, FX-10) — default upper bound on the
 /// number of webhook deliveries that may be in flight concurrently.
 ///
@@ -668,6 +716,19 @@ pub struct SubscriptionEvent {
     pub event_type: String,
     pub payload: String,
     pub delivered_at: String,
+    /// `pending` | `ack` | `failed`. `ack` and `failed` are TERMINAL and
+    /// were written after the retry ladder settled. `pending` means NO
+    /// terminal status was recorded for this delivery — which includes
+    /// the case where the delivery DID settle but the terminal status
+    /// write failed (open error, UPDATE error, or the row was missing at
+    /// settle time; counted at its stage on `/metrics`
+    /// `ai_memory_webhook_audit_update_failed_total{stage}` and surfaced on
+    /// `/health` `webhook_audit_delivery`, #3659). A consumer reading
+    /// `pending` off `memory_subscription_replay` therefore cannot tell
+    /// "in flight" from "the outcome was lost" by this field alone; a row
+    /// still `pending` past the 60 s settle window is the lost case, which
+    /// `doctor` warns on. Making the terminal write reliable is #3735
+    /// (v1.0.1).
     pub delivery_status: String,
 }
 
@@ -1163,11 +1224,11 @@ pub fn dispatch_event_to_subs(
                 // v0.7.0 #1072 — reuse `worker_conn` for every sqlite
                 // write below.
                 if let Some(c) = worker_conn.as_ref() {
-                    record_dispatch_with_conn(c, &sub_id, ok);
-                    update_event_status_with_conn(c, &correlation_id, ok);
+                    record_dispatch_with_conn(c, &sub_id, &correlation_id, ok);
+                    update_event_status_with_conn(c, &sub_id, &correlation_id, ok);
                 } else {
-                    record_dispatch(&db_path, &sub_id, ok);
-                    update_event_status(&db_path, &correlation_id, ok);
+                    record_dispatch(&db_path, &sub_id, &correlation_id, ok);
+                    update_event_status(&db_path, &sub_id, &correlation_id, ok);
                 }
                 let dlq_result = if let Some(c) = worker_conn.as_ref() {
                     record_dlq_with_conn(
@@ -1205,11 +1266,11 @@ pub fn dispatch_event_to_subs(
             // v0.7.0 #1072 — reuse `worker_conn` for every sqlite write
             // below.
             if let Some(c) = worker_conn.as_ref() {
-                record_dispatch_with_conn(c, &sub_id, ok);
-                update_event_status_with_conn(c, &correlation_id, ok);
+                record_dispatch_with_conn(c, &sub_id, &correlation_id, ok);
+                update_event_status_with_conn(c, &sub_id, &correlation_id, ok);
             } else {
-                record_dispatch(&db_path, &sub_id, ok);
-                update_event_status(&db_path, &correlation_id, ok);
+                record_dispatch(&db_path, &sub_id, &correlation_id, ok);
+                update_event_status(&db_path, &sub_id, &correlation_id, ok);
             }
             if !ok {
                 let dlq_result = if let Some(c) = worker_conn.as_ref() {
@@ -1488,7 +1549,15 @@ fn deliver_with_retry(
                     first_failed_at = now.clone();
                 }
                 last_failed_at = now;
+                let terminal = refusal_is_terminal(&e);
                 last_error = e;
+                // #3790 — a refusal that is a pure function of the STORED URL
+                // cannot change between attempts: dead-letter it on the first
+                // one instead of sleeping the whole ladder on a bounded
+                // dispatch worker for the same verdict three more times.
+                if terminal {
+                    break;
+                }
             }
         }
     }
@@ -1499,6 +1568,22 @@ fn deliver_with_retry(
         first_failed_at,
         last_failed_at,
     }
+}
+
+/// #3790 — is this `send` refusal TERMINAL for the retry ladder, i.e. a
+/// pure function of the stored subscription URL and the process posture
+/// that no later attempt can change?
+///
+/// Only [`dlq_reason::SSRF_REJECTED`] qualifies today: the syntactic guard
+/// (`validate_url`) reads the URL bytes and the loopback knob, nothing
+/// else. [`dlq_reason::DNS_SSRF_REJECTED`] is NOT terminal — it carries
+/// both the address-class violation (deterministic) and a resolver
+/// FAILURE under the fail-closed posture (transient), and the two share
+/// one reason token; splitting them is a guard change, not a ladder
+/// change. Every ACK / HTTP / client-build reason stays retryable.
+#[must_use]
+fn refusal_is_terminal(reason: &str) -> bool {
+    reason == dlq_reason::SSRF_REJECTED
 }
 
 /// Perform one HTTP POST with SSRF-hardened URL check + signature
@@ -1517,9 +1602,13 @@ fn send(
     signature: Option<&str>,
     correlation_id: &str,
 ) -> Result<(), String> {
+    // #3684 — a webhook URL is tenant-supplied and commonly carries its
+    // credential in the PATH (Slack / Discord) or the query string; every
+    // log line renders it as `scheme://host[:port]` only.
+    let target = crate::url_display::url_origin(url);
     if let Err(e) = validate_url(url) {
-        tracing::warn!("SSRF guard rejected webhook URL {url}: {e}");
-        return Err(format!("ssrf-rejected: {e}"));
+        tracing::warn!("SSRF guard rejected webhook URL {target}: {e}");
+        return Err(dlq_reason::SSRF_REJECTED.to_string());
     }
     // v0.7.0 #1082 (SR-1 #2, HIGH) — DNS-rebind TOCTOU fix. Resolve
     // the host once via the SSRF guard AND capture the validated
@@ -1537,8 +1626,8 @@ fn send(
         match validate_url_dns_resolved(url, crate::config::allow_loopback_webhooks()) {
             Ok(t) => t,
             Err(e) => {
-                tracing::warn!("DNS SSRF guard rejected webhook URL {url}: {e}");
-                return Err(format!("dns-ssrf-rejected: {e}"));
+                tracing::warn!("DNS SSRF guard rejected webhook URL {target}: {e}");
+                return Err(dlq_reason::DNS_SSRF_REJECTED.to_string());
             }
         };
     // v0.7.0 SR-W3 (HIGH) — redirect SSRF-pin bypass. The
@@ -1555,6 +1644,12 @@ fn send(
     let mut builder = reqwest::blocking::Client::builder()
         .timeout(ACK_TIMEOUT)
         .redirect(reqwest::redirect::Policy::none());
+    // v1.0.0 #3705 — a receiver behind a private PKI: the operator-installed
+    // root (`[subscriptions] ca_cert`) is trusted in addition to the public
+    // roots. Never a peer's certificate by inference; always an explicit act.
+    if let Some(ca) = dispatch_root_certificate() {
+        builder = builder.add_root_certificate(ca);
+    }
     for addr in &validated_addrs {
         // Pin reqwest's per-host override. The override SHADOWS
         // reqwest's own DNS query for this host on this client,
@@ -1579,8 +1674,9 @@ fn send(
     let client = match builder.build() {
         Ok(c) => c,
         Err(e) => {
-            tracing::warn!("webhook client build failed: {e}");
-            return Err(format!("client-build: {e}"));
+            // #3724 — the reqwest builder error is operator-log only.
+            tracing::warn!(target: SUBSCRIPTIONS_TRACE_TARGET, "webhook client build failed for {target}: {}", crate::url_display::TransportFailure::classify(&e));
+            return Err(dlq_reason::CLIENT_BUILD.to_string());
         }
     };
     let mut req = client
@@ -1598,13 +1694,17 @@ fn send(
     let resp = match req.body(body.to_string()).send() {
         Ok(r) => r,
         Err(e) => {
-            tracing::warn!("webhook POST to {url} failed: {e}");
-            return Err(crate::errors::msg::network(e));
+            // #3684 / #3710 — origin-only target, class-only error: the
+            // reqwest Display would name the full URL twice per failure,
+            // once in the log and once in the stored DLQ row.
+            let reason = crate::url_display::network_failure(&e);
+            tracing::warn!("webhook POST to {target} failed: {reason}");
+            return Err(reason);
         }
     };
     if !resp.status().is_success() {
         let status = resp.status().as_u16();
-        return Err(format!("http-{status}"));
+        return Err(format!("{}{status}", dlq_reason::HTTP_PREFIX));
     }
     // K6 ACK contract: receivers MUST return
     // {"status":"ack","correlation_id":"..."}. A 2xx with a missing /
@@ -1615,9 +1715,11 @@ fn send(
     // `Take` limiter so an over-cap stream cannot exhaust memory.
     if let Some(len) = resp.content_length() {
         if len > WEBHOOK_ACK_MAX_BYTES as u64 {
-            return Err(format!(
-                "ack-too-large: content-length {len} exceeds {WEBHOOK_ACK_MAX_BYTES}"
-            ));
+            tracing::warn!(
+                target: SUBSCRIPTIONS_TRACE_TARGET,
+                "webhook ack from {target}: content-length {len} exceeds {WEBHOOK_ACK_MAX_BYTES}"
+            );
+            return Err(dlq_reason::ACK_TOO_LARGE.to_string());
         }
     }
     let ack_body = {
@@ -1625,33 +1727,53 @@ fn send(
         let mut body = String::new();
         // Read one byte past the cap so an exactly-at-cap body still
         // reads fully while an over-cap body is detected and rejected.
-        if let Err(e) = resp
+        match resp
             .take(WEBHOOK_ACK_MAX_BYTES as u64 + 1)
             .read_to_string(&mut body)
         {
-            return Err(format!("ack-read: {e}"));
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(target: SUBSCRIPTIONS_TRACE_TARGET, "webhook ack from {target}: read failed: {e}");
+                return Err(dlq_reason::ACK_READ.to_string());
+            }
         }
         if body.len() > WEBHOOK_ACK_MAX_BYTES {
-            return Err(format!(
-                "ack-too-large: streamed body exceeds {WEBHOOK_ACK_MAX_BYTES}"
-            ));
+            tracing::warn!(
+                target: SUBSCRIPTIONS_TRACE_TARGET,
+                "webhook ack from {target}: streamed body exceeds {WEBHOOK_ACK_MAX_BYTES}"
+            );
+            return Err(dlq_reason::ACK_TOO_LARGE.to_string());
         }
         body
     };
+    // #3724 — from here on every failure names the receiver's CHOSEN text
+    // (its JSON, its `status`, its `correlation_id`) in the operator log
+    // ONLY; the stored, caller-readable reason is the closed vocabulary.
     let ack: serde_json::Value = match serde_json::from_str(&ack_body) {
         Ok(v) => v,
-        Err(e) => return Err(format!("ack-decode: {e}")),
+        Err(e) => {
+            tracing::warn!(target: SUBSCRIPTIONS_TRACE_TARGET, "webhook ack from {target}: not JSON: {e}");
+            return Err(dlq_reason::ACK_DECODE.to_string());
+        }
     };
     let status_field = ack.get("status").and_then(|v| v.as_str()).unwrap_or("");
     if status_field != "ack" {
-        return Err(format!("ack-status: {status_field}"));
+        tracing::warn!(
+            target: SUBSCRIPTIONS_TRACE_TARGET,
+            "webhook ack from {target}: status {status_field:?} is not \"ack\""
+        );
+        return Err(dlq_reason::ACK_STATUS_NOT_ACK.to_string());
     }
     let ack_corr = ack
         .get("correlation_id")
         .and_then(|v| v.as_str())
         .unwrap_or("");
     if ack_corr != correlation_id {
-        return Err(format!("ack-corr-mismatch: {ack_corr}"));
+        tracing::warn!(
+            target: SUBSCRIPTIONS_TRACE_TARGET,
+            "webhook ack from {target}: correlation_id {ack_corr:?} != {correlation_id:?}"
+        );
+        return Err(dlq_reason::ACK_CORR_MISMATCH.to_string());
     }
     Ok(())
 }
@@ -1789,6 +1911,28 @@ pub fn validate_url_dns(url: &str) -> Result<()> {
 ///   is not set (post-#1053 fail-CLOSED).
 /// - Any resolved address is private / link-local (or loopback when
 ///   `allow_loopback` is false).
+/// #3744 — the AUTHORITY of a URL with any userinfo removed: everything
+/// after the LAST `@` of the segment between `scheme://` and the first
+/// `/`, `?` or `#`. Both SSRF guards extract their host from this, never
+/// from the raw authority. Before this helper the host was taken as the
+/// text before the last `:` of the raw authority, so for
+/// `https://a:b@169.254.169.254/` the "host" was the USERNAME `a`, the
+/// loopback / private-range checks ran against that literal and PASSED,
+/// and a private, loopback or cloud-metadata target rode into the table at
+/// registration; only the DNS guard's failure to RESOLVE the username text
+/// refused it later — by accident and under the wrong reason. A tenant who
+/// can register a webhook must not be able to hide an internal target in
+/// the userinfo. Userinfo is a credential in the row as well (#3697), and
+/// is stripped here rather than refused so the caller's error names the
+/// real host it targeted.
+fn authority_without_userinfo(rest: &str) -> &str {
+    let host_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..host_end];
+    authority
+        .rfind('@')
+        .map_or(authority, |at| &authority[at + 1..])
+}
+
 pub(crate) fn validate_url_dns_resolved(
     url: &str,
     allow_loopback: bool,
@@ -1802,7 +1946,7 @@ pub(crate) fn validate_url_dns_resolved(
 /// hostname-shape branch so the two read the override identically.
 fn ssrf_dns_fail_open() -> bool {
     std::env::var("AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .map(|v| crate::security_profile::is_truthy(&v))
         .unwrap_or(false)
 }
 
@@ -1841,12 +1985,18 @@ fn validate_url_dns_with(
     url: &str,
     allow_loopback: bool,
 ) -> Result<(String, Vec<std::net::SocketAddr>)> {
+    // #3684 — every message below renders the target as its origin only;
+    // a chat-webhook URL carries its credential in the path.
+    let shown = crate::url_display::url_origin(url);
+    let url_display = shown.as_str();
     let lower = url.to_ascii_lowercase();
     let (_scheme, rest) = lower
         .split_once("://")
-        .ok_or_else(|| anyhow!("webhook URL missing scheme: {url}"))?;
-    let host_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let host_port = &rest[..host_end];
+        .ok_or_else(|| anyhow!("webhook URL missing scheme: {url_display}"))?;
+    // #3744 — userinfo is stripped BEFORE any host extraction, the same
+    // way `validate_url_with` does it; this guard is the SECOND line of
+    // defence for the same class and must read the same host.
+    let host_port = authority_without_userinfo(rest);
     // v0.7.0 #1082 — extract the host (sans port + brackets) for the
     // reqwest `Client::builder().resolve(host, addr)` override the
     // caller installs. The override matches by host string the
@@ -1920,13 +2070,13 @@ fn validate_url_dns_with(
             tracing::warn!(
                 target: SUBSCRIPTIONS_TRACE_TARGET,
                 "SSRF guard: hostname {resolved_host} violates RFC 1035 label/length \
-                 limits for {url}; AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL=1 — degrading to \
+                 limits for {url_display}; AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL=1 — degrading to \
                  ALLOW (UNSAFE, legacy posture)"
             );
             return Ok((resolved_host, Vec::new()));
         }
         return Err(anyhow!(
-            "SSRF guard: DNS resolution failed for {url}: hostname violates RFC 1035 \
+            "SSRF guard: DNS resolution failed for {url_display}: hostname violates RFC 1035 \
              label/length limits; failing CLOSED (post-#1053 secure default — set \
              AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL=1 to revert)"
         ));
@@ -1938,7 +2088,7 @@ fn validate_url_dns_with(
             if fail_open {
                 tracing::warn!(
                     target: SUBSCRIPTIONS_TRACE_TARGET,
-                    "SSRF guard: DNS resolution failed for {url}: {e}; \
+                    "SSRF guard: DNS resolution failed for {url_display}: {e}; \
                      AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL=1 — degrading to ALLOW \
                      (UNSAFE, legacy posture) — reqwest's resolver may bind to \
                      private/loopback IPs the daemon could not pre-check"
@@ -1949,7 +2099,7 @@ fn validate_url_dns_with(
                 return Ok((resolved_host, Vec::new()));
             }
             return Err(anyhow!(
-                "SSRF guard: DNS resolution failed for {url}: {e}; failing CLOSED \
+                "SSRF guard: DNS resolution failed for {url_display}: {e}; failing CLOSED \
                  (post-#1053 secure default — set AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL=1 to revert)"
             ));
         }
@@ -1958,7 +2108,7 @@ fn validate_url_dns_with(
         let ip = addr.ip();
         if is_private(ip) && !is_loopback_normalized(ip) {
             return Err(anyhow!(
-                "host resolves to private/link-local IP {ip}: {url}"
+                "host resolves to private/link-local IP {ip}: {url_display}"
             ));
         }
         // H11 (#628 blocker) — DNS-rebind protection for loopback.
@@ -1967,7 +2117,7 @@ fn validate_url_dns_with(
         // hostnames.
         if is_loopback_normalized(ip) && !allow_loopback {
             return Err(anyhow!(
-                "host resolves to loopback IP {ip}: {url} — rejected by default \
+                "host resolves to loopback IP {ip}: {url_display} — rejected by default \
                  (SSRF guard); set `[subscriptions] allow_loopback_webhooks = true` \
                  to opt in"
             ));
@@ -1981,6 +2131,30 @@ fn validate_url_dns_with(
 /// SSRF guard. Rejects URLs that would cause the daemon to connect
 /// to private-range addresses, link-local, loopback (except
 /// explicitly), or non-HTTPS remote hosts.
+/// v1.0.0 #3705 — the operator-installed root certificate the webhook
+/// dispatcher trusts in addition to the public roots (`[subscriptions]
+/// ca_cert`). Installed once per process at boot; first writer wins.
+static DISPATCH_ROOT_CA: std::sync::OnceLock<reqwest::Certificate> = std::sync::OnceLock::new();
+
+/// Install the dispatcher's extra root certificate from PEM bytes. Explicit
+/// trust only: this is how a receiver behind a private PKI is reached over
+/// https:// (plaintext webhook targets are refused everywhere, #3705).
+///
+/// # Errors
+/// The bytes are not a parseable PEM certificate.
+pub fn install_dispatch_root_certificate(pem: &[u8]) -> Result<()> {
+    let cert = reqwest::Certificate::from_pem(pem)
+        .map_err(|e| anyhow!("[subscriptions] ca_cert is not a PEM certificate: {e} (#3705)"))?;
+    let _ = DISPATCH_ROOT_CA.set(cert);
+    Ok(())
+}
+
+/// The installed extra root, if any (cloned per client build).
+#[must_use]
+pub fn dispatch_root_certificate() -> Option<reqwest::Certificate> {
+    DISPATCH_ROOT_CA.get().cloned()
+}
+
 pub fn validate_url(url: &str) -> Result<()> {
     validate_url_with(url, crate::config::allow_loopback_webhooks())
 }
@@ -1990,24 +2164,43 @@ pub fn validate_url(url: &str) -> Result<()> {
 /// (which would race with parallel tests). Production callers go
 /// through `validate_url`.
 fn validate_url_with(url: &str, allow_loopback: bool) -> Result<()> {
+    // #3684 — refusals name the target as its origin only (see
+    // `validate_url_dns_with`); the subscriber who supplied the URL knows
+    // the rest, and the operator log must not.
+    let shown = crate::url_display::url_origin(url);
+    let url_display = shown.as_str();
     // Cheap scheme check without pulling the `url` crate.
     let lower = url.to_ascii_lowercase();
     let (scheme, rest) = lower
         .split_once("://")
-        .ok_or_else(|| anyhow!("webhook URL missing scheme: {url}"))?;
+        .ok_or_else(|| anyhow!("webhook URL missing scheme: {url_display}"))?;
     if scheme != "https" && scheme != "http" {
-        return Err(anyhow!("webhook URL scheme must be http(s): {url}"));
+        // #3705 review — origin only, never the query/userinfo (a webhook
+        // target routinely carries a token).
+        return Err(anyhow!("webhook URL scheme must be https: {url_display}"));
+    }
+    // v1.0.0 #3705 — "only encrypted data in transit": plaintext http:// is
+    // refused to EVERY host, loopback included (the pre-#3705 loopback
+    // exemption is gone — loopback is shared by every local process).
+    if scheme == "http" {
+        return Err(anyhow!(
+            "{}",
+            crate::transit_encryption::plaintext_url_refusal("webhook target", url)
+        ));
     }
     // Extract host (portion before '/' or ':' or '?'). IPv6 URLs use
     // `[ipv6]:port` syntax — the brackets must be stripped and the
     // colon-split must skip the colons inside the v6 literal.
-    let host_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let host_port = &rest[..host_end];
+    // #3744 — userinfo is stripped BEFORE any host extraction; see
+    // `authority_without_userinfo`.
+    let host_port = authority_without_userinfo(rest);
     let host: String = if let Some(stripped) = host_port.strip_prefix('[') {
         // IPv6: host is everything before the closing bracket.
         match stripped.find(']') {
             Some(i) => stripped[..i].to_string(),
-            None => return Err(anyhow!("malformed IPv6 URL host: {url}")),
+            None => {
+                return Err(anyhow!("malformed IPv6 URL host: {url_display}"));
+            }
         }
     } else {
         // IPv4 / hostname.
@@ -2028,25 +2221,10 @@ fn validate_url_with(url: &str, allow_loopback: bool) -> Result<()> {
     let is_loopback = is_loopback_hostname || is_loopback_ip;
     if is_loopback && !allow_loopback {
         return Err(anyhow!(
-            "webhook URL targets loopback address {url} — rejected by default \
+            "webhook URL targets loopback address {url_display} — rejected by default \
              (SSRF guard); set `[subscriptions] allow_loopback_webhooks = true` \
              to opt in (testing / dev only)"
         ));
-    }
-    if scheme == "http" && !is_loopback {
-        // Accept http only to parsed-loopback IPs; everything else
-        // requires https.
-        if let Some(ip) = parsed_ip {
-            if !is_loopback_normalized(ip) {
-                return Err(anyhow!(
-                    "webhook URL must be https for non-loopback host: {url}"
-                ));
-            }
-        } else {
-            return Err(anyhow!(
-                "webhook URL must be https for non-loopback host: {url}"
-            ));
-        }
     }
     // Reject private-range IPs regardless of scheme (RFC1918 / RFC4193 /
     // link-local). Hostnames that resolve to private ranges are not
@@ -2058,7 +2236,7 @@ fn validate_url_with(url: &str, allow_loopback: bool) -> Result<()> {
         && !is_loopback_normalized(ip)
     {
         return Err(anyhow!(
-            "webhook URL targets private / link-local address: {url}"
+            "webhook URL targets private / link-local address: {url_display}"
         ));
     }
     Ok(())
@@ -2195,24 +2373,30 @@ pub fn record_subscription_event_with_conn(
 }
 
 /// v0.7.0 K6 — transition the audit row's `delivery_status` after the
-/// retry ladder settles. Best-effort: a failure here is logged and
-/// otherwise ignored so the dispatcher loop never blocks on the
-/// audit table.
-fn update_event_status(db_path: &std::path::Path, correlation_id: &str, ok: bool) {
-    let Ok(conn) = Connection::open(db_path) else {
-        return;
-    };
-    update_event_status_with_conn(&conn, correlation_id, ok);
+/// retry ladder settles. Best-effort: the dispatcher loop never blocks on
+/// the audit table. #3659 — but never SILENT: an open failure is logged
+/// with the subscription + correlation identity and counted at stage
+/// `open` (`audit_status`), so the persisted history can no longer
+/// disagree with the wire without anyone knowing.
+fn update_event_status(db_path: &std::path::Path, sub_id: &str, correlation_id: &str, ok: bool) {
+    match Connection::open(db_path) {
+        Ok(conn) => {
+            update_event_status_with_conn(&conn, sub_id, correlation_id, ok);
+        }
+        Err(e) => audit_status::note_failure(
+            audit_status::AuditStage::Open,
+            sub_id,
+            correlation_id,
+            &e.to_string(),
+        ),
+    }
 }
 
 /// v0.7.0 #1072 — `Connection`-reuse variant of
-/// [`update_event_status`].
-fn update_event_status_with_conn(conn: &Connection, correlation_id: &str, ok: bool) {
-    let status = if ok { "ack" } else { "failed" };
-    let _ = conn.execute(
-        "UPDATE subscription_events SET delivery_status = ?1 WHERE correlation_id = ?2",
-        params![status, correlation_id],
-    );
+/// [`update_event_status`]. #3659 — the UPDATE's result is observed
+/// (SQL error and zero-rows-matched are distinct counted stages).
+fn update_event_status_with_conn(conn: &Connection, sub_id: &str, correlation_id: &str, ok: bool) {
+    audit_status::persist_event_status(conn, sub_id, correlation_id, ok);
 }
 
 /// v0.7.0 K6 — append a `subscription_dlq` row for a delivery that
@@ -2522,22 +2706,23 @@ pub fn memory_subscription_replay(
     }))
 }
 
-fn record_dispatch(db_path: &std::path::Path, sub_id: &str, ok: bool) {
-    let Ok(conn) = Connection::open(db_path) else {
-        return;
-    };
-    record_dispatch_with_conn(&conn, sub_id, ok);
+fn record_dispatch(db_path: &std::path::Path, sub_id: &str, correlation_id: &str, ok: bool) {
+    match Connection::open(db_path) {
+        Ok(conn) => record_dispatch_with_conn(&conn, sub_id, correlation_id, ok),
+        Err(e) => audit_status::note_failure(
+            audit_status::AuditStage::Open,
+            sub_id,
+            correlation_id,
+            &e.to_string(),
+        ),
+    }
 }
 
 /// v0.7.0 #1072 — `Connection`-reuse variant of [`record_dispatch`].
-fn record_dispatch_with_conn(conn: &Connection, sub_id: &str, ok: bool) {
-    let now = chrono::Utc::now().to_rfc3339();
-    let sql = if ok {
-        "UPDATE subscriptions SET dispatch_count = dispatch_count + 1, last_dispatched_at = ?1 WHERE id = ?2"
-    } else {
-        "UPDATE subscriptions SET dispatch_count = dispatch_count + 1, failure_count = failure_count + 1, last_dispatched_at = ?1 WHERE id = ?2"
-    };
-    let _ = conn.execute(sql, params![now, sub_id]);
+/// #3659 — the counter UPDATE's result is observed (stage
+/// `dispatch_counter`) instead of discarded.
+fn record_dispatch_with_conn(conn: &Connection, sub_id: &str, correlation_id: &str, ok: bool) {
+    audit_status::persist_dispatch_counter(conn, sub_id, correlation_id, ok);
 }
 
 #[cfg(test)]
@@ -2585,17 +2770,28 @@ mod tests {
         assert!(ua.len() > "ai-memory/".len());
     }
 
+    /// #3705 — plaintext http:// is refused to EVERY host, loopback included,
+    /// even with the loopback SSRF opt-in; the refusal names the mandate.
     #[test]
-    fn http_only_to_loopback() {
-        // H11 inner helper — assert with allow_loopback=true so the
-        // test does not depend on the test-build default and does not
-        // race with parallel tests poking the global atomic.
-        assert!(validate_url_with("http://localhost/hook", true).is_ok());
-        assert!(validate_url_with("http://127.0.0.1:8080/hook", true).is_ok());
-        // IPv6 in URLs must be bracketed per RFC 3986 §3.2.2.
-        assert!(validate_url_with("http://[::1]/hook", true).is_ok());
-        assert!(validate_url_with("http://example.com/hook", true).is_err());
-        assert!(validate_url_with("http://8.8.8.8/hook", true).is_err());
+    fn http_refused_everywhere_loopback_included_3705() {
+        for url in [
+            "http://localhost/hook",
+            "http://127.0.0.1:8080/hook",
+            "http://[::1]/hook",
+            "http://example.com/hook",
+            "http://8.8.8.8/hook",
+        ] {
+            let err = validate_url_with(url, true)
+                .expect_err("#3705: every http:// webhook target must be refused")
+                .to_string();
+            assert!(
+                err.contains(crate::transit_encryption::ISSUE_TAG) && err.contains("https://"),
+                "{url}: {err}"
+            );
+        }
+        assert!(validate_url_with("https://localhost/hook", true).is_ok());
+        assert!(validate_url_with("https://127.0.0.1:8080/hook", true).is_ok());
+        assert!(validate_url_with("https://[::1]/hook", true).is_ok());
     }
 
     #[test]
@@ -2631,9 +2827,9 @@ mod tests {
         // H11 — operators who need loopback for CI/testing opt in via
         // `[subscriptions] allow_loopback_webhooks = true`. Inner
         // helper isolates this test from the global atomic.
-        assert!(validate_url_with("http://127.0.0.1:9999/hook", true).is_ok());
-        assert!(validate_url_with("http://localhost/hook", true).is_ok());
-        assert!(validate_url_with("http://[::1]/hook", true).is_ok());
+        assert!(validate_url_with("https://127.0.0.1:9999/hook", true).is_ok());
+        assert!(validate_url_with("https://localhost/hook", true).is_ok());
+        assert!(validate_url_with("https://[::1]/hook", true).is_ok());
     }
 
     #[test]
@@ -2644,6 +2840,101 @@ mod tests {
         assert!(validate_url("https://169.254.1.1/hook").is_err());
         assert!(validate_url("https://[fc00::1]/hook").is_err());
         assert!(validate_url("https://[fe80::1]/hook").is_err());
+    }
+
+    /// #3744 — userinfo must not hide the target from the SYNTACTIC guard.
+    /// Before the fix the host was taken as the text before the last `:`
+    /// of the raw authority, so each of these read its "host" as the
+    /// username and PASSED. Each is refused at registration (this is the
+    /// guard `insert` runs) and the refusal names the REAL host.
+    #[test]
+    fn userinfo_does_not_hide_a_private_loopback_or_metadata_host_3744() {
+        for (url, host) in [
+            ("https://a:b@10.0.0.1/x", "10.0.0.1"),
+            (
+                "https://a:b@169.254.169.254/latest/meta-data",
+                "169.254.169.254",
+            ),
+            ("https://a:b@[fd00::1]/hook", "fd00::1"),
+            ("https://a@10.0.0.1/x", "10.0.0.1"),
+            ("https://a:b@10.0.0.1:443/x", "10.0.0.1"),
+            ("https://user:p%40ss@[fe80::1]:8443/hook", "fe80::1"),
+        ] {
+            let err = validate_url_with(url, false)
+                .expect_err(&format!("#3744: {url} must be refused at registration"));
+            let msg = err.to_string();
+            assert!(
+                msg.contains(host),
+                "#3744: the refusal names the real host {host} for {url}: {msg}"
+            );
+            assert!(
+                !msg.contains("a:b") && !msg.contains("p%40ss"),
+                "#3744: the refusal never echoes the userinfo for {url}: {msg}"
+            );
+        }
+        // Loopback behind userinfo is the same shape, gated by the same opt-in.
+        assert!(validate_url_with("https://a:b@127.0.0.1/x", false).is_err());
+        assert!(validate_url_with("https://a:b@[::1]/x", false).is_err());
+        assert!(validate_url_with("https://a:b@127.0.0.1/x", true).is_ok());
+    }
+
+    /// #3744 — the second line of defence, made explicit: the DNS-resolved
+    /// guard reads the SAME userinfo-stripped host, so a userinfo URL to a
+    /// private / loopback / metadata address is refused there BECAUSE THE
+    /// ADDRESS IS PRIVATE, not because the username fails to resolve. Until
+    /// 2026-09-15 this guard was the only thing refusing these at dispatch,
+    /// and it did so by accident (`user:pw@host` is not a resolvable name);
+    /// this cell records that it is load-bearing and what it must see.
+    #[test]
+    fn dns_guard_reads_the_userinfo_stripped_host_3744() {
+        for (url, host) in [
+            ("https://a:b@10.0.0.1/x", "10.0.0.1"),
+            ("https://a:b@169.254.169.254/latest", "169.254.169.254"),
+            ("https://a:b@[fd00::1]/hook", "fd00::1"),
+            ("https://a:b@127.0.0.1/x", "127.0.0.1"),
+        ] {
+            let err = validate_url_dns_with(url, false)
+                .expect_err(&format!("#3744: the DNS guard refuses {url}"));
+            let msg = err.to_string();
+            assert!(
+                msg.contains(host),
+                "#3744: the DNS guard's refusal names the real host {host} for {url}: {msg}"
+            );
+            assert!(
+                !msg.contains("invalid port value") && !msg.contains("resolution failed"),
+                "#3744: refused as an address-class violation, not a resolver hiccup: {msg}"
+            );
+        }
+        // And it still opens for the opted-in loopback shape, userinfo or not.
+        assert!(validate_url_dns_with("https://a:b@127.0.0.1/x", true).is_ok());
+    }
+
+    #[test]
+    fn authority_without_userinfo_strips_at_the_last_at_sign_3744() {
+        assert_eq!(
+            authority_without_userinfo("example.com/hook"),
+            "example.com"
+        );
+        assert_eq!(
+            authority_without_userinfo("a:b@example.com:8443/hook?x=1"),
+            "example.com:8443"
+        );
+        assert_eq!(
+            authority_without_userinfo("a@b@example.com/"),
+            "example.com"
+        );
+        assert_eq!(
+            authority_without_userinfo("a:b@[fd00::1]:443"),
+            "[fd00::1]:443"
+        );
+        assert_eq!(
+            authority_without_userinfo("example.com?x=@y"),
+            "example.com"
+        );
+        assert_eq!(
+            authority_without_userinfo("example.com/p@th"),
+            "example.com"
+        );
     }
 
     #[test]
@@ -2714,7 +3005,12 @@ mod tests {
         // Symmetric with the existing loopback opt-in: when allow_loopback
         // is true, `::ffff:127.0.0.1` should be accepted (same as plain
         // `127.0.0.1`).
-        assert!(validate_url_with("http://[::ffff:127.0.0.1]/hook", true).is_ok());
+        assert!(validate_url_with("https://[::ffff:127.0.0.1]/hook", true).is_ok());
+        // #3705 — the plaintext form is refused regardless of the opt-in.
+        let err = validate_url_with("http://[::ffff:127.0.0.1]/hook", true)
+            .expect_err("plaintext to a v4-mapped loopback must be refused (#3705)")
+            .to_string();
+        assert!(err.contains(crate::transit_encryption::ISSUE_TAG), "{err}");
     }
 
     #[test]
@@ -2886,15 +3182,15 @@ mod tests {
         // atomic. Dev/CI workflows opt in via config to get this
         // behaviour at runtime.
         assert!(
-            validate_url_dns_with("http://127.0.0.1/foo", true).is_ok(),
+            validate_url_dns_with("https://127.0.0.1/foo", true).is_ok(),
             "127.0.0.1 should be accepted by validate_url_dns when opted in"
         );
         assert!(
-            validate_url_dns_with("http://127.0.0.1:8080/", true).is_ok(),
+            validate_url_dns_with("https://127.0.0.1:8080/", true).is_ok(),
             "127.0.0.1:8080 should be accepted by validate_url_dns when opted in"
         );
         assert!(
-            validate_url_dns_with("http://localhost/", true).is_ok(),
+            validate_url_dns_with("https://localhost/", true).is_ok(),
             "localhost should be accepted by validate_url_dns when opted in"
         );
     }
@@ -2903,11 +3199,11 @@ mod tests {
     fn test_validate_url_dns_accepts_loopback_v6() {
         // Same as v4 — loopback opt-in via inner helper.
         assert!(
-            validate_url_dns_with("http://[::1]/", true).is_ok(),
+            validate_url_dns_with("https://[::1]/", true).is_ok(),
             "[::1] should be accepted by validate_url_dns when opted in"
         );
         assert!(
-            validate_url_dns_with("http://[0:0:0:0:0:0:0:1]/", true).is_ok(),
+            validate_url_dns_with("https://[0:0:0:0:0:0:0:1]/", true).is_ok(),
             "[::1] expanded form should be accepted when opted in"
         );
     }
@@ -2918,11 +3214,11 @@ mod tests {
         // close DNS-rebind SSRF against local services. Inner helper
         // pins allow_loopback=false without touching the global.
         assert!(
-            validate_url_dns_with("http://127.0.0.1/foo", false).is_err(),
+            validate_url_dns_with("https://127.0.0.1/foo", false).is_err(),
             "127.0.0.1 must be rejected by validate_url_dns when allow_loopback=false (H11)"
         );
         assert!(
-            validate_url_dns_with("http://[::1]/", false).is_err(),
+            validate_url_dns_with("https://[::1]/", false).is_err(),
             "[::1] must be rejected by validate_url_dns when allow_loopback=false (H11)"
         );
     }
@@ -3115,12 +3411,13 @@ mod tests {
     // `record_dispatch`, `load_secret_hash`) and the HTTP send path
     // (`send`) at 0 % coverage.  These tests use a `tempfile::NamedTempFile`
     // to back a real on-disk SQLite (so dispatch threads can re-open the
-    // connection via `Connection::open(db_path)`) and `wiremock` for HTTP
-    // (already a dev-dep from W3 / W10).
+    // connection via `Connection::open(db_path)`) and an in-process TLS
+    // receiver for HTTP (#3705 — plaintext targets are refused, so the
+    // plaintext-only `wiremock` cannot stand in; see `spawn_tls_receiver`).
     //
     // Style:
     //   - DB-only tests are `#[test]` (sync) and use a tempfile path.
-    //   - Tests that drive `wiremock` are `#[tokio::test(flavor =
+    //   - Tests that drive the TLS receiver are `#[tokio::test(flavor =
     //     "multi_thread")]` and run the blocking `send` via
     //     `tokio::task::spawn_blocking`, mirroring the pattern already in
     //     `llm.rs::wiremock_tests`.
@@ -3139,26 +3436,125 @@ mod tests {
         (f, p)
     }
 
-    /// v0.7.0 K6 test helper — wiremock responder that builds a 2xx
-    /// JSON ACK body whose `correlation_id` field echoes the
-    /// dispatched id from the `x-ai-memory-correlation-id` request
-    /// header. Lets the legacy dispatch tests (which previously only
-    /// asserted "2xx → success") satisfy K6's strict ACK contract
-    /// without coupling each test to the exact UUID value.
-    struct AckEcho;
-    impl wiremock::Respond for AckEcho {
-        fn respond(&self, request: &wiremock::Request) -> wiremock::ResponseTemplate {
-            let corr = request
-                .headers
-                .get("x-ai-memory-correlation-id")
-                .map(|v| v.to_str().unwrap_or("").to_string())
-                .unwrap_or_default();
-            let body = serde_json::json!({
-                "status": "ack",
-                "correlation_id": corr,
-            });
-            wiremock::ResponseTemplate::new(200).set_body_json(body)
+    /// #3705 — how the in-process TLS receiver answers a delivery.
+    #[derive(Clone, Copy)]
+    enum Reply {
+        /// v0.7.0 K6 — a 2xx JSON ACK body whose `correlation_id` echoes
+        /// the dispatched id from the `x-ai-memory-correlation-id` request
+        /// header, so the legacy "2xx → success" tests satisfy K6's strict
+        /// ACK contract without coupling to the exact UUID value.
+        AckEcho,
+        /// A bare status (4xx / 5xx ladders).
+        Status(u16),
+        /// `302` to `location` — the SSRF-pin-bypass shape.
+        Redirect(&'static str),
+    }
+
+    /// One request the TLS receiver recorded.
+    #[derive(Clone, Debug)]
+    struct Received {
+        path: String,
+        headers: axum::http::HeaderMap,
+        body: Vec<u8>,
+    }
+
+    #[derive(Clone)]
+    struct ReceiverState {
+        reply: Reply,
+        received: std::sync::Arc<std::sync::Mutex<Vec<Received>>>,
+    }
+
+    /// #3705 — "only encrypted data in transit": an in-process TLS webhook
+    /// receiver. Serves the per-process test PKI leaf
+    /// (`crate::test_support::tls_test_pki`, SANs `127.0.0.1`/`localhost`)
+    /// through the SAME `crate::tls::serve_rustls_acceptor` the daemon
+    /// uses, and records every request so each assertion keeps its
+    /// subject (2xx → ok, 5xx → failure ladder, signature header present /
+    /// absent, correlation id, redirect NOT followed). `wiremock` is
+    /// plaintext-only and can no longer stand in: `validate_url` refuses
+    /// an `http://` target.
+    struct TlsReceiver {
+        base: String,
+        received: std::sync::Arc<std::sync::Mutex<Vec<Received>>>,
+    }
+
+    impl TlsReceiver {
+        fn hook_url(&self) -> String {
+            format!("{}/hook", self.base)
         }
+
+        fn received(&self) -> Vec<Received> {
+            self.received
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        }
+    }
+
+    async fn receiver_handler(
+        axum::extract::State(state): axum::extract::State<ReceiverState>,
+        request: axum::extract::Request,
+    ) -> axum::response::Response {
+        use axum::response::IntoResponse as _;
+        let (parts, body) = request.into_parts();
+        let bytes = axum::body::to_bytes(body, 1 << 20)
+            .await
+            .unwrap_or_default();
+        state
+            .received
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(Received {
+                path: parts.uri.path().to_string(),
+                headers: parts.headers.clone(),
+                body: bytes.to_vec(),
+            });
+        match state.reply {
+            Reply::AckEcho => {
+                let corr = parts
+                    .headers
+                    .get("x-ai-memory-correlation-id")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or_default()
+                    .to_string();
+                (
+                    axum::http::StatusCode::OK,
+                    axum::Json(serde_json::json!({
+                        "status": "ack",
+                        "correlation_id": corr,
+                    })),
+                )
+                    .into_response()
+            }
+            Reply::Status(code) => axum::http::StatusCode::from_u16(code)
+                .expect("a valid status code")
+                .into_response(),
+            Reply::Redirect(location) => (
+                axum::http::StatusCode::FOUND,
+                [(axum::http::header::LOCATION, location)],
+            )
+                .into_response(),
+        }
+    }
+
+    /// Stand up a TLS receiver answering `reply`, and install the test CA
+    /// as the dispatcher's extra root (`install_dispatch_root_certificate`:
+    /// first install wins, process-wide — every receiver in this binary
+    /// serves the ONE test PKI, so the first install is the right one).
+    async fn spawn_tls_receiver(reply: Reply) -> TlsReceiver {
+        let pki = crate::test_support::tls_test_pki();
+        let ca_pem = std::fs::read(&pki.ca_pem).expect("read the test CA");
+        install_dispatch_root_certificate(&ca_pem)
+            .expect("install the test CA as the dispatcher root (#3705)");
+        let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let app = axum::Router::new()
+            .fallback(receiver_handler)
+            .with_state(ReceiverState {
+                reply,
+                received: received.clone(),
+            });
+        let base = crate::test_support::spawn_tls_mock(app).await;
+        TlsReceiver { base, received }
     }
 
     // ---------------- insert / delete / list ----------------
@@ -3544,8 +3940,8 @@ mod tests {
             )
             .unwrap()
         };
-        record_dispatch(&path, &id, true);
-        record_dispatch(&path, &id, true);
+        record_dispatch(&path, &id, "cid-3659", true);
+        record_dispatch(&path, &id, "cid-3659", true);
         let conn = Connection::open(&path).unwrap();
         let (dc, fc): (i64, i64) = conn
             .query_row(
@@ -3577,7 +3973,7 @@ mod tests {
             )
             .unwrap()
         };
-        record_dispatch(&path, &id, false);
+        record_dispatch(&path, &id, "cid-3659", false);
         let conn = Connection::open(&path).unwrap();
         let (dc, fc): (i64, i64) = conn
             .query_row(
@@ -3595,8 +3991,8 @@ mod tests {
         let (_keep, path) = fresh_db();
         // No subscription with this id; the UPDATE simply matches zero
         // rows. Function must not panic and must not poison the DB.
-        record_dispatch(&path, "no-such-id", true);
-        record_dispatch(&path, "no-such-id", false);
+        record_dispatch(&path, "no-such-id", "cid-3659", true);
+        record_dispatch(&path, "no-such-id", "cid-3659", false);
         // Sanity: subscriptions table still queryable.
         let conn = Connection::open(&path).unwrap();
         let n: i64 = conn
@@ -3611,7 +4007,13 @@ mod tests {
         // `Connection::open` early-return branch (let-Err shortcut).
         // Must not panic.
         let bad = std::path::PathBuf::from("/nonexistent-dir-w12c/does-not-exist.db");
-        record_dispatch(&bad, "x", true);
+        // #3659 — the open failure is no longer silent: both bookkeeping
+        // writers count it at stage `open` (a global counter; other tests
+        // may add to it, so the bound is at-least, not exact).
+        let before = audit_status::failures(audit_status::AuditStage::Open);
+        record_dispatch(&bad, "x", "cid-3659", true);
+        update_event_status(&bad, "x", "cid-3659", true);
+        assert!(audit_status::failures(audit_status::AuditStage::Open) >= before + 2);
     }
 
     #[test]
@@ -3723,23 +4125,15 @@ mod tests {
         assert_eq!(fc, 0);
     }
 
-    // ---------------- send() — wiremock-driven HTTP tests ----------------
+    // ---------------- send() — TLS-receiver-driven HTTP tests (#3705) ----------------
 
     #[tokio::test(flavor = "multi_thread")]
     async fn send_returns_true_on_2xx() {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer};
-        let server = MockServer::start().await;
-        // K6: receivers MUST return a JSON ack body — the AckEcho
-        // helper echoes the request's correlation_id header so the
-        // ack-correlation-id check in `send` passes.
-        Mock::given(method("POST"))
-            .and(path("/hook"))
-            .respond_with(AckEcho)
-            .expect(1)
-            .mount(&server)
-            .await;
-        let url = format!("{}/hook", server.uri());
+        // K6: receivers MUST return a JSON ack body — the AckEcho reply
+        // echoes the request's correlation_id header so the
+        // ack-correlation-id check in `send` passes. #3705: TLS receiver.
+        let receiver = spawn_tls_receiver(Reply::AckEcho).await;
+        let url = receiver.hook_url();
         let corr = uuid::Uuid::now_v7().to_string();
         let res = tokio::task::spawn_blocking(move || {
             send(
@@ -3753,19 +4147,17 @@ mod tests {
         .await
         .unwrap();
         assert!(res.is_ok(), "2xx + matching ack must succeed: {res:?}");
+        assert_eq!(
+            receiver.received().len(),
+            1,
+            "exactly one POST reached the hook"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn send_returns_false_on_5xx() {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/hook"))
-            .respond_with(ResponseTemplate::new(500))
-            .mount(&server)
-            .await;
-        let url = format!("{}/hook", server.uri());
+        let receiver = spawn_tls_receiver(Reply::Status(500)).await;
+        let url = receiver.hook_url();
         let corr = uuid::Uuid::now_v7().to_string();
         let res = tokio::task::spawn_blocking(move || {
             send(&url, "{\"event\":\"x\"}", "1700000000", None, &corr)
@@ -3773,24 +4165,27 @@ mod tests {
         .await
         .unwrap();
         assert!(res.is_err(), "5xx must return Err (no retry inside send)");
+        assert_eq!(
+            receiver.received().len(),
+            1,
+            "the 5xx must come from the receiver, not from a refused URL (#3705)"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn send_returns_false_on_4xx() {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/hook"))
-            .respond_with(ResponseTemplate::new(404))
-            .mount(&server)
-            .await;
-        let url = format!("{}/hook", server.uri());
+        let receiver = spawn_tls_receiver(Reply::Status(404)).await;
+        let url = receiver.hook_url();
         let corr = uuid::Uuid::now_v7().to_string();
         let res = tokio::task::spawn_blocking(move || send(&url, "{}", "1700000000", None, &corr))
             .await
             .unwrap();
         assert!(res.is_err(), "4xx must return Err");
+        assert_eq!(
+            receiver.received().len(),
+            1,
+            "the 4xx must come from the receiver, not from a refused URL (#3705)"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3804,27 +4199,12 @@ mod tests {
         // 3xx is surfaced as a non-success status and the dispatch fails
         // safely. We assert BOTH that send returns Err AND that the
         // redirect target was never requested.
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-        let server = MockServer::start().await;
         // The hook returns a redirect to a path that, if followed, the
-        // mock would happily answer 200 — proving the failure is the
-        // un-followed redirect, not a missing target.
-        Mock::given(method("POST"))
-            .and(path("/hook"))
-            .respond_with(
-                ResponseTemplate::new(302).insert_header("location", "/internal-rebind-target"),
-            )
-            .expect(1)
-            .mount(&server)
-            .await;
-        let redirect_followed = Mock::given(path("/internal-rebind-target"))
-            .respond_with(ResponseTemplate::new(200))
-            .expect(0)
-            .named("redirect target must NOT be requested");
-        server.register(redirect_followed).await;
-
-        let url = format!("{}/hook", server.uri());
+        // receiver would happily answer (it records and answers EVERY
+        // path) — proving the failure is the un-followed redirect, not a
+        // missing target.
+        let receiver = spawn_tls_receiver(Reply::Redirect("/internal-rebind-target")).await;
+        let url = receiver.hook_url();
         let corr = uuid::Uuid::now_v7().to_string();
         let res = tokio::task::spawn_blocking(move || send(&url, "{}", "1700000000", None, &corr))
             .await
@@ -3833,37 +4213,26 @@ mod tests {
             res.is_err(),
             "redirect must not be followed; 3xx surfaces as a failed dispatch: {res:?}"
         );
-        // The `.expect(0)` on the redirect-target mock is verified on
-        // server drop; assert it explicitly here for a clear failure
-        // message if reqwest ever regains redirect-following behavior.
-        let hits = server
-            .received_requests()
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|r| r.url.path() == "/internal-rebind-target")
+        // Exactly one request — the hook itself — and never the redirect
+        // target; a clear failure message if reqwest ever regains
+        // redirect-following behavior.
+        let received = receiver.received();
+        assert_eq!(received.len(), 1, "one request: the hook, nothing else");
+        assert_eq!(received[0].path, "/hook");
+        let hits = received
+            .iter()
+            .filter(|r| r.path == "/internal-rebind-target")
             .count();
         assert_eq!(hits, 0, "redirect target was requested — SSRF pin bypassed");
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn send_signature_header_set_when_provided() {
-        use wiremock::matchers::{header, header_exists, method, path};
-        use wiremock::{Mock, MockServer};
-        let server = MockServer::start().await;
         // Assert the `x-ai-memory-signature` header is `sha256=<sig>`
-        // and the timestamp + correlation-id headers are set.
-        Mock::given(method("POST"))
-            .and(path("/hook"))
-            .and(header("x-ai-memory-signature", "sha256=abc123"))
-            .and(header_exists("x-ai-memory-timestamp"))
-            .and(header_exists("x-ai-memory-correlation-id"))
-            .and(header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON))
-            .respond_with(AckEcho)
-            .expect(1)
-            .mount(&server)
-            .await;
-        let url = format!("{}/hook", server.uri());
+        // and the timestamp + correlation-id headers are set (on the
+        // recorded request, below).
+        let receiver = spawn_tls_receiver(Reply::AckEcho).await;
+        let url = receiver.hook_url();
         let corr = uuid::Uuid::now_v7().to_string();
         let res = tokio::task::spawn_blocking(move || {
             send(&url, "{}", "1700000000", Some("abc123"), &corr)
@@ -3874,19 +4243,29 @@ mod tests {
             res.is_ok(),
             "2xx with matched signature header + ack must succeed: {res:?}"
         );
+        let received = receiver.received();
+        assert_eq!(received.len(), 1, "exactly one POST reached the hook");
+        let req = &received[0];
+        assert_eq!(
+            req.headers
+                .get("x-ai-memory-signature")
+                .and_then(|v| v.to_str().ok()),
+            Some("sha256=abc123")
+        );
+        assert!(req.headers.get("x-ai-memory-timestamp").is_some());
+        assert!(req.headers.get("x-ai-memory-correlation-id").is_some());
+        assert_eq!(
+            req.headers
+                .get(crate::HEADER_CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some(crate::MIME_JSON)
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn send_no_signature_header_when_secret_absent() {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, Request};
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/hook"))
-            .respond_with(AckEcho)
-            .mount(&server)
-            .await;
-        let url = format!("{}/hook", server.uri());
+        let receiver = spawn_tls_receiver(Reply::AckEcho).await;
+        let url = receiver.hook_url();
         let corr = uuid::Uuid::now_v7().to_string();
         let res = tokio::task::spawn_blocking({
             let url = url.clone();
@@ -3896,11 +4275,10 @@ mod tests {
         .await
         .unwrap();
         assert!(res.is_ok(), "ack-echo must succeed: {res:?}");
-        // Inspect the captured request to confirm no signature header.
-        let received: Vec<Request> = server.received_requests().await.unwrap_or_default();
+        // Inspect the recorded request to confirm no signature header.
+        let received = receiver.received();
         assert_eq!(received.len(), 1);
         let req = &received[0];
-        // wiremock lower-cases header names.
         assert!(
             req.headers.get("x-ai-memory-signature").is_none(),
             "no signature should be sent when secret absent"
@@ -3940,20 +4318,13 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn dispatch_event_e2e_increments_dispatch_count_on_2xx() {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer};
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/hook"))
-            .respond_with(AckEcho)
-            .mount(&server)
-            .await;
+        let receiver = spawn_tls_receiver(Reply::AckEcho).await;
 
         let (_keep, db_path) = fresh_db();
         // Insert a wildcard subscription pointing at the mock.
         let id = {
             let conn = Connection::open(&db_path).unwrap();
-            let url = format!("{}/hook", server.uri());
+            let url = receiver.hook_url();
             insert(
                 &conn,
                 &NewSubscription {
@@ -3969,53 +4340,36 @@ mod tests {
             .unwrap()
         };
 
-        // Run dispatch and wait for the spawned thread to record the
-        // counter bump. dispatch_event spawns a detached std::thread so
-        // we poll for up to ~5 s.
+        // Run dispatch, then wait on the dispatcher's completion signal
+        // (#3759 — same shape as the 5xx sibling: `wait_dispatch_idle`
+        // returns after the worker's guard drops, i.e. after the counter
+        // write, so no wall-clock poll bound is needed here either).
         {
             let conn = Connection::open(&db_path).unwrap();
             dispatch_event(&conn, "memory_store", "m1", "ns", None, &db_path);
         }
 
-        let path_for_poll = db_path.clone();
-        let id_for_poll = id.clone();
-        let dc = tokio::task::spawn_blocking(move || {
-            for _ in 0..50 {
-                let conn = Connection::open(&path_for_poll).unwrap();
-                let dc: i64 = conn
-                    .query_row(
-                        "SELECT dispatch_count FROM subscriptions WHERE id = ?1",
-                        params![id_for_poll],
-                        |r| r.get(0),
-                    )
-                    .unwrap();
-                if dc > 0 {
-                    return dc;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-            0
-        })
-        .await
-        .unwrap();
+        wait_dispatch_idle().await;
+        let dc: i64 = {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.query_row(
+                "SELECT dispatch_count FROM subscriptions WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
         assert_eq!(dc, 1, "successful dispatch must increment dispatch_count");
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn dispatch_event_e2e_increments_failure_count_on_5xx() {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/hook"))
-            .respond_with(ResponseTemplate::new(500))
-            .mount(&server)
-            .await;
+        let receiver = spawn_tls_receiver(Reply::Status(500)).await;
 
         let (_keep, db_path) = fresh_db();
         let id = {
             let conn = Connection::open(&db_path).unwrap();
-            let url = format!("{}/hook", server.uri());
+            let url = receiver.hook_url();
             insert(
                 &conn,
                 &NewSubscription {
@@ -4036,52 +4390,42 @@ mod tests {
             dispatch_event(&conn, "memory_store", "m2", "ns", None, &db_path);
         }
 
-        // K6 retry ladder (200ms + 1s + 5s) means a final-failure
-        // counter bump can take ≈ 6.5s of wall-clock + per-attempt
-        // overhead. Poll for up to 12s to cover the worst case.
-        let path_for_poll = db_path.clone();
-        let id_for_poll = id.clone();
-        let (dc, fc) = tokio::task::spawn_blocking(move || {
-            for _ in 0..120 {
-                let conn = Connection::open(&path_for_poll).unwrap();
-                let row: (i64, i64) = conn
-                    .query_row(
-                        "SELECT dispatch_count, failure_count FROM subscriptions WHERE id = ?1",
-                        params![id_for_poll],
-                        |r| Ok((r.get(0)?, r.get(1)?)),
-                    )
-                    .unwrap();
-                if row.0 > 0 {
-                    return row;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-            (0, 0)
-        })
-        .await
-        .unwrap();
+        // #3759 — observe the dispatcher's completion signal, not a wall-clock
+        // poll. `dispatch_event` increments `DISPATCH_IN_FLIGHT` SYNCHRONOUSLY
+        // (the `DispatchInFlightGuard` is created before the worker is spawned),
+        // and the guard drops only AFTER `work()` -> `record_dispatch` writes the
+        // terminal counter, so `wait_dispatch_idle` returns exactly when the bump
+        // is durable — regardless of how long the worker takes to be SCHEDULED.
+        // That scheduling latency, NOT the K6 retry ladder, is the real 1-in-5
+        // cause: this cell has `secret: None` and no server-wide hmac, so the
+        // delivery is unsigned-refused (`DeliveryOutcome::unsigned_refused`,
+        // attempts: 0) — it never sends and never enters the ladder; the bump is a
+        // ~28 ms local decision on an idle host (measured, #3759). The old 12 s
+        // poll red 1-in-5 only when a saturated blocking pool delayed the worker's
+        // start past the window. No magic number now — the wait ends on the actual
+        // worker completion (CONCURRENCY-08 SeqCst pairs with the in-flight load).
+        wait_dispatch_idle().await;
+        let (dc, fc): (i64, i64) = {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.query_row(
+                "SELECT dispatch_count, failure_count FROM subscriptions WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        };
         assert_eq!(dc, 1, "5xx still increments dispatch_count");
         assert_eq!(fc, 1, "5xx must increment failure_count");
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn dispatch_event_e2e_signature_present_when_secret_set() {
-        use wiremock::matchers::{header_exists, method, path};
-        use wiremock::{Mock, MockServer};
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/hook"))
-            .and(header_exists("x-ai-memory-signature"))
-            .and(header_exists("x-ai-memory-timestamp"))
-            .respond_with(AckEcho)
-            .expect(1)
-            .mount(&server)
-            .await;
+        let receiver = spawn_tls_receiver(Reply::AckEcho).await;
 
         let (_keep, db_path) = fresh_db();
         let _id = {
             let conn = Connection::open(&db_path).unwrap();
-            let url = format!("{}/hook", server.uri());
+            let url = receiver.hook_url();
             insert(
                 &conn,
                 &NewSubscription {
@@ -4102,23 +4446,26 @@ mod tests {
             dispatch_event(&conn, "memory_store", "m3", "ns", None, &db_path);
         }
 
-        // Wait for the dispatch thread to fire & wiremock to record.
-        // We poll the mock's hit count instead of the DB so the
-        // assertion stays specific to "signature header present".
-        let server_ref = &server;
+        // Wait for the dispatch thread to fire & the receiver to record.
+        // We poll the receiver instead of the DB so the assertion stays
+        // specific to "signature header present".
         for _ in 0..50 {
-            let received = server_ref.received_requests().await.unwrap_or_default();
+            let received = receiver.received();
             if !received.is_empty() {
                 let req = &received[0];
                 assert!(
                     req.headers.get("x-ai-memory-signature").is_some(),
                     "signature header must be present when secret set"
                 );
+                assert!(
+                    req.headers.get("x-ai-memory-timestamp").is_some(),
+                    "timestamp header must be present"
+                );
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
-        panic!("dispatch thread never reached the mock server");
+        panic!("dispatch thread never reached the TLS receiver");
     }
 
     // ----------------------------------------------------------------
@@ -4213,19 +4560,12 @@ mod tests {
     async fn approval_requested_dispatches_to_opt_in_subscriber() {
         // K4: end-to-end. Insert a subscription opt-ed in to
         // `approval_requested` only; queue a pending action via the
-        // db layer; call the dispatch helper; assert the wiremock
+        // db layer; call the dispatch helper; assert the TLS receiver
         // saw the POST and the body shape carries the K4 details.
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer};
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/hook"))
-            .respond_with(AckEcho)
-            .mount(&server)
-            .await;
+        let receiver = spawn_tls_receiver(Reply::AckEcho).await;
 
         let (_keep, db_path) = fresh_db();
-        let url = format!("{}/hook", server.uri());
+        let url = receiver.hook_url();
         let opt_in: Vec<String> = vec!["approval_requested".to_string()];
         let sub_id = {
             let conn = Connection::open(&db_path).unwrap();
@@ -4267,12 +4607,12 @@ mod tests {
             dispatch_approval_requested(&conn, &pending_id, &db_path);
         }
 
-        // Poll the mock for the dispatch — std::thread::spawn is
+        // Poll the receiver for the dispatch — std::thread::spawn is
         // detached so we cannot join. ~5s budget mirrors the existing
         // dispatch_event_e2e_* tests.
         let mut received = Vec::new();
         for _ in 0..50 {
-            received = server.received_requests().await.unwrap_or_default();
+            received = receiver.received();
             if !received.is_empty() {
                 break;
             }
@@ -4300,7 +4640,7 @@ mod tests {
         // Sanity: the dispatch_count was bumped on the subscription
         // row (proves we went through record_dispatch on success).
         // Poll up to 2s — dispatch_count is written back AFTER the HTTP
-        // POST is acked, so seeing the wiremock request above does not
+        // POST is acked, so seeing the receiver request above does not
         // imply the row update has landed yet (race observed on Linux
         // and Windows runners under load).
         let conn = Connection::open(&db_path).unwrap();
@@ -4431,17 +4771,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn k6_dispatch_persists_uuidv7_correlation_id() {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer};
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/hook"))
-            .respond_with(AckEcho)
-            .mount(&server)
-            .await;
+        let receiver = spawn_tls_receiver(Reply::AckEcho).await;
 
         let (_keep, db_path) = fresh_db();
-        let url = format!("{}/hook", server.uri());
+        let url = receiver.hook_url();
         let sub_id = {
             let conn = Connection::open(&db_path).unwrap();
             insert(
@@ -4506,19 +4839,12 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn k6_500_after_retries_lands_in_dlq() {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-        let server = MockServer::start().await;
-        // Mock returns 500 for every attempt — exhausts the retry
+        // The receiver returns 500 for every attempt — exhausts the retry
         // ladder and forces the DLQ branch.
-        Mock::given(method("POST"))
-            .and(path("/hook"))
-            .respond_with(ResponseTemplate::new(500))
-            .mount(&server)
-            .await;
+        let receiver = spawn_tls_receiver(Reply::Status(500)).await;
 
         let (_keep, db_path) = fresh_db();
-        let url = format!("{}/hook", server.uri());
+        let url = receiver.hook_url();
         let sub_id = {
             let conn = Connection::open(&db_path).unwrap();
             insert(

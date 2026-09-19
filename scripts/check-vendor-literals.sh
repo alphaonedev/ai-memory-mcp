@@ -13,7 +13,7 @@
 # Two checks:
 #
 #   (A) Vendor-monoculture gate. Every `"claude" | "openai" | "xai" |
-#       "anthropic" | "gemini" | "deepseek" | "groq" | "ollama" |
+#       "anthropic" | "gemini" | "groq" | "ollama" |
 #       "grok" | "mistral" | "cohere" | "huggingface"` literal outside
 #       the 9-file substrate allowlist is a HARD-BLOCK. Vendor strings
 #       are legitimate only in:
@@ -62,6 +62,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+source "${ROOT}/scripts/lib/production-lines.sh"
 
 # 10-file allowlist. Repo-root-relative paths.
 # Two entries for #1389 L2 host-adapter surface (transcript paths
@@ -87,7 +88,7 @@ ALLOWED_FILES=(
     "tools/t0-orchestrate/src/main.rs"
     # v0.9.0 §25.3 S1 (#1870) — the conservative model-FAMILY normalizer
     # table (`family_of`): the vendor-family stems (claude/anthropic/grok/
-    # deepseek/mistral/gemini/…) ARE the routing key of the normalization,
+    # mistral/gemini/…) ARE the routing key of the normalization,
     # exactly the `src/mine.rs::Format::Claude` vendor-keyed-enum precedent.
     "src/identity/model_family.rs"
 )
@@ -95,7 +96,24 @@ ALLOWED_FILES=(
 # Vendor identifiers to gate. Keep this list narrow — over-broad gates
 # create reviewer friction. Add a new vendor only when an actual
 # alias-table entry lands in `src/llm.rs`.
-VENDOR_PATTERN='(claude|openai|xai|anthropic|gemini|deepseek|groq|ollama|grok|mistral|cohere|huggingface)'
+# #3627 (2026-09-18): the retired provider's token left this pattern in
+# lockstep with its alias-table arm leaving `src/llm.rs` (the documented
+# contract above: "Add a new vendor only when an actual alias-table entry
+# lands in src/llm.rs").
+#
+# The replacement is stricter OVER THIS GATE'S OWN SCOPE, which is what
+# GOVERNANCE §3.2 item 7 requires of a pattern removal. This gate walks
+# `src/` and `tools/` (the single `find` below), skipping comments,
+# `mod tests` regions and the 13 allowlisted files.
+# `tests/issue_3627_retired_llm_alias.rs::retired_alias_is_absent_from_
+# every_current_surface_3627` walks `src/` and `tools/` too — plus
+# `tests/`, `scripts/`, `docs/`, `changelog.d/` and four root docs — and
+# skips NONE of those exclusions, so every path this pattern covered for
+# the retired token is still covered, and more. It is NOT a full
+# mechanisation of the issue's repo-wide grep (`sdk/`, `clients/`,
+# `deploy/`, `migrations/` and most root files are outside both scopes);
+# that wider claim is not made and is not needed here.
+VENDOR_PATTERN='(claude|openai|xai|anthropic|gemini|groq|ollama|grok|mistral|cohere|huggingface)'
 
 # SECS_PER_* magic numbers. Catches the literal forms PR3 extracted
 # named constants for — both unseparated (`3600`) and underscore-
@@ -115,35 +133,12 @@ is_allowed_file () {
     return 1
 }
 
-# find_test_boundary <file>
-# Echoes the line number of the first `mod tests {` (or `pub mod tests {`,
-# or attribute-prefixed variants like `#[cfg(test)] mod tests {`); echoes
-# `999999999` if no test module is found in the file.
-find_test_boundary () {
-    local f="$1"
-    local line
-    line=$(grep -nE '^[[:space:]]*(pub[[:space:]]+)?mod[[:space:]]+tests?[[:space:]]*\{' "$f" 2>/dev/null | head -1 | cut -d: -f1)
-    if [[ -z "$line" ]]; then
-        echo 999999999
-    else
-        echo "$line"
-    fi
-}
-
 # scan_production_lines <file> <regex>
 # Emits "<repo-relative-file>:<lineno>:<content>" for matches in
-# production code. Skips test files by basename + skips lines at or
-# below the file's first `mod tests {` boundary + skips comment lines.
+# production code. Blanks individual test items and skips test filenames
+# through the shared #3623 filter; also skips comment lines.
 scan_production_lines () {
-    local f="$1"
-    local pattern="$2"
-    local bn
-    bn="$(basename "$f")"
-    case "$bn" in
-        *test*.rs|tests.rs) return 0 ;;
-    esac
-    local boundary
-    boundary=$(find_test_boundary "$f")
+    local f="$1" pattern="$2"
     local rel="${f#"${ROOT}/"}"
     # NOTE: the inner match list is captured into a variable and fed to
     # the loop via a here-string (`<<<`) rather than a process
@@ -154,13 +149,12 @@ scan_production_lines () {
     # runs the loop in the current shell. Mirrors the same fix applied
     # to scripts/qc-codegraph-precheck.sh (#1486 / 941b5a706).
     local matches
-    matches="$(grep -En "$pattern" "$f" 2>/dev/null || true)"
+    local production
+    production="$(production_lines "$f")"
+    matches="$(printf '%s\n' "$production" | grep -En "$pattern" || true)"
     [[ -z "$matches" ]] && return 0
     while IFS=: read -r lineno content; do
         [[ -z "$lineno" ]] && continue
-        if (( lineno >= boundary )); then
-            continue
-        fi
         # Skip comments and doc-comment lines.
         local stripped
         stripped=$(printf '%s' "$content" | sed -E 's/^[[:space:]]+//')
@@ -174,10 +168,9 @@ scan_production_lines () {
 # Self-test mode — inject a contrived violation, run the gate, confirm
 # it catches the violation, then clean up.
 if [[ "${1:-}" == "--self-test" ]]; then
+    python3 "${ROOT}/scripts/tests/gate-production-3623.py" "$(basename "$0")"
     echo "Vendor-literal gate: self-test mode (contrived violation -> expect HARD-BLOCK -> cleanup)"
-    # Use a name that does NOT match `*test*.rs` (the production-vs-test
-    # filename heuristic skips those) so the self-test's contrived
-    # violation actually reaches the scanner.
+    # Plant a production file for the original vendor-literal probe.
     contrived="${ROOT}/src/.vendor_literal_gate_probe.rs"
     if [[ -e "$contrived" ]]; then
         echo "ERROR: self-test scratch file already exists: $contrived" >&2

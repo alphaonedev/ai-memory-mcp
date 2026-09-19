@@ -187,10 +187,11 @@ pub fn handle_subscription_dlq_list(
     //     refusing to leak cross-tenant payloads.
     let caller = crate::identity::resolve_agent_id(None, mcp_client).map_err(|e| e.to_string())?;
 
-    let rows_all =
-        crate::subscriptions::list_dlq(conn, subscription_id).map_err(|e| e.to_string())?;
+    let rows_all = crate::subscriptions::list_dlq(conn, subscription_id)
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("resolve_agent_id", e))?;
     let rows: Vec<_> = if let Some(sid) = subscription_id {
-        let owner = crate::subscriptions::get_owner(conn, sid).map_err(|e| e.to_string())?;
+        let owner = crate::subscriptions::get_owner(conn, sid)
+            .map_err(|e| crate::mcp::error_text::mcp_foreign_err("list_dlq", e))?;
         if owner.as_deref() != Some(caller.as_str()) {
             // Identical wire shape to "no DLQ entries since the
             // subscription rolled over". Cannot distinguish from
@@ -217,8 +218,8 @@ pub fn handle_subscription_dlq_list(
             let owner = match owners.get(&sid) {
                 Some(o) => o.clone(),
                 None => {
-                    let o =
-                        crate::subscriptions::get_owner(conn, &sid).map_err(|e| e.to_string())?;
+                    let o = crate::subscriptions::get_owner(conn, &sid)
+                        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("get_owner", e))?;
                     owners.insert(sid.clone(), o.clone());
                     o
                 }
@@ -254,7 +255,8 @@ pub(super) fn handle_pending_list(
             usize::try_from(v).unwrap_or(usize::MAX)
         })
         .min(crate::storage::LIST_MAX_LIMIT);
-    let items = db::list_pending_actions(conn, status, limit).map_err(|e| e.to_string())?;
+    let items = db::list_pending_actions(conn, status, limit)
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("list_pending_actions", e))?;
     Ok(json!({"count": items.len(), "pending": items}))
 }
 
@@ -349,7 +351,7 @@ fn audit_pending_verdict(agent_id: &str, id: &str, decision: &str) {
         decision,
         "pending_approve",
         "",
-        json!({ (field_names::PENDING_ID): id }),
+        crate::governance::audit::ForensicPayload::new().ident(field_names::PENDING_ID, id),
     );
 }
 
@@ -362,7 +364,7 @@ fn audit_reject_verdict(agent_id: &str, id: &str) {
         "refuse",
         "pending_reject",
         "",
-        json!({ (field_names::PENDING_ID): id }),
+        crate::governance::audit::ForensicPayload::new().ident(field_names::PENDING_ID, id),
     );
 }
 
@@ -430,7 +432,8 @@ pub fn handle_pending_approve(
     // (`evaluate_signed_approval_gate`) so MCP + the four HTTP branches enforce
     // the R40 gate identically. The verdict sits strictly ABOVE the
     // `approve_with_approver_type` + `execute_pending_action` finalizer below.
-    let signed_snapshot = db::get_pending_action(conn, id).map_err(|e| e.to_string())?;
+    let signed_snapshot = db::get_pending_action(conn, id)
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("get_pending_action", e))?;
     let presented = parse_signed_approvals(params);
     // Term (2) of the requirement predicate — re-derive from the live rule
     // engine (server-side; PURE, no audit emit) so a payload whose escalation
@@ -493,13 +496,15 @@ pub fn handle_pending_approve(
     // keep the Human-arm gate on the AI_MEMORY_AGENT_ID opt-in (an unconditional
     // reject-self would self-lock the lone operator approving their own action).
     match db::approve_with_approver_type(conn, id, &agent_id, db::ApproveSurface::LocalOperator)
-        .map_err(|e| e.to_string())?
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("approve_with_approver_type", e))?
     {
         ApproveOutcome::Approved => {
             // #2634 — record "allow" BEFORE the execute write below.
             audit_pending_verdict(&agent_id, id, "allow");
             // Task 1.10: auto-execute the queued action on final approval.
-            let executed = db::execute_pending_action(conn, id).map_err(|e| e.to_string())?;
+            let executed = db::execute_pending_action(conn, id).map_err(|e| {
+                crate::mcp::error_text::mcp_foreign_err("execute_pending_action", e)
+            })?;
             record_mcp_decision(conn, id, &agent_id, "approve", remember);
             Ok(json!({
                 "approved": true,
@@ -1196,7 +1201,7 @@ pub fn handle_pending_reject(
     // `AI_MEMORY_AGENT_ID` multi-agent opt-in, inert for the lone operator in
     // the trust-all default so they are not self-locked out of their own queue.
     match db::reject_with_approver_type(conn, id, &agent_id, db::ApproveSurface::LocalOperator)
-        .map_err(|e| e.to_string())?
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("reject_with_approver_type", e))?
     {
         db::RejectOutcome::Rejected => {}
         // Operational not-found (absent or already decided) — contract text

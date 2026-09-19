@@ -120,7 +120,14 @@ pub fn tool_sizes_under_ci_gate() -> usize {
 /// under 11_000). Measured 26_691; ceiling restores ~1.3K headroom,
 /// matching the historical bump cadence. rust-1.98: named const, not a
 /// duplicated magic number across five pins.
-pub const VERBOSE_FULL_PROFILE_CEILING_TOKENS: usize = 28_000;
+/// 2026-09-15 (#3372-v3): declaring the honoured `update` key on
+/// `memory_agent_register` (the #3171 gate) adds its schema description to
+/// the verbose path. MEASURED 28_029 on this branch's base (27_984 before —
+/// 16 tokens of headroom, so any declared field crosses it). Ceiling 28_000
+/// -> 28_100 (+71 headroom, lockstep on this base, never lower); the merger
+/// re-takes the number on the resolved tree, where other branches' docs
+/// stack (the #3730 inbox docs alone are +81).
+pub const VERBOSE_FULL_PROFILE_CEILING_TOKENS: usize = 28_300;
 
 /// Sum of every tool's `total_tokens` (verbose schema) — the
 /// worst-case prefix cost on a `verbose=true` opt-in harness with

@@ -17,6 +17,17 @@
 mod common;
 use common::{DAEMON_READY_TIMEOUT, bounded_test_client, free_port, wait_for_http_ready};
 
+// #3354/#3198 FIXTURE ISOLATION — this suite previously set NO `HOME` and NO
+// `AI_MEMORY_KEY_DIR` and used no sandbox, so every spawned child ran against
+// the DEVELOPER'S real `~/.config/ai-memory` and its result depended on that
+// dir's ambient permissions: a group-writable ancestor there makes #3198
+// correctly refuse the key store, which surfaces as the #3354 "no signing key
+// … could not be generated" boot refusal on the ledger-writing tests. #3733
+// moved eleven key-dir-CREATING fixtures onto this sandbox; THIS file was
+// missed because it CREATES nothing, it merely INHERITED. See `cmd`.
+#[path = "common/key_dir_sandbox.rs"]
+mod key_dir_sandbox;
+
 /// #998 (2026-05-21) — concrete admin id seeded into
 /// `AI_MEMORY_ADMIN_AGENT_IDS` for every spawned integration daemon.
 /// Replaces the pre-#980 `"*"` wildcard which now fails
@@ -24,9 +35,59 @@ use common::{DAEMON_READY_TIMEOUT, bounded_test_client, free_port, wait_for_http
 /// [`curl_get_as_admin`] / [`curl_post_as_admin`].
 const INTEGRATION_TEST_ADMIN: &str = "ai:integration-test-admin";
 
+/// Process-wide isolated `HOME` + key directory for every spawned child, so
+/// the suite's result depends on state it OWNS, never the developer's real
+/// `~/.config/ai-memory`. The key dir is forced to `0o700` (`mkdir_0700`) so it
+/// clears the #3198 gate under ANY umask — `create_dir_all` under umask `0002`
+/// would otherwise leave `0o775`, which #3198 correctly refuses. An explicit
+/// `AI_MEMORY_KEY_DIR` override is gated on the dir ITSELF (`enforce_key_dir_secure`
+/// at resolution + the save-time file->keydir chain), so a `0o700` leaf passes
+/// regardless of parent perms — the same reason the #3733 fixtures pass under
+/// umask `0002`. Built once and shared so a daemon/CLI signing key persists
+/// across the multiple invocations a single test makes.
+fn isolated_home_and_keys() -> (&'static std::path::Path, &'static std::path::Path) {
+    use std::sync::OnceLock;
+    static ISOLATED: OnceLock<(std::path::PathBuf, std::path::PathBuf)> = OnceLock::new();
+    let (home, keys) = ISOLATED.get_or_init(|| {
+        let root =
+            std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("integration-isolated");
+        let home = root.join("home");
+        let keys = root.join("keys");
+        key_dir_sandbox::mkdir_0700(&home);
+        key_dir_sandbox::mkdir_0700(&keys);
+        // RACE-FREE first boot — mint the daemon signing key ONCE, in-process,
+        // before any parallel test spawns concurrent `serve` daemons. On a cold
+        // shared key dir, multiple daemons would otherwise race to generate the
+        // same `host:<hostname>` id; whichever writes the on-disk pair LAST then
+        // disagrees with the in-memory key an earlier daemon already booted
+        // with, and cross-peer/fanout signature verification fails
+        // (`http_*_fans_out`, `http_pending_governance_approve_rejects_cross_peer`,
+        // …). Generating it here means every daemon LOADS the same key. The id
+        // matches the daemon's own `resolve_agent_id(None, None)` fallback (no
+        // `AI_MEMORY_AGENT_ID` is set on the spawned children); tests that pin a
+        // distinct id mint their own key with no contention.
+        if let Ok(id) = ai_memory::identity::resolve_agent_id(None, None)
+            && let Ok(kp) = ai_memory::identity::keypair::generate(&id)
+        {
+            let _ = ai_memory::identity::keypair::save(&kp, keys.as_path());
+        }
+        (home, keys)
+    });
+    (home.as_path(), keys.as_path())
+}
+
 fn cmd(binary: &str) -> std::process::Command {
     let mut c = std::process::Command::new(binary);
     c.env("AI_MEMORY_NO_CONFIG", "1");
+    // #3354/#3198 FIXTURE ISOLATION — an isolated HOME + a `0o700` key dir this
+    // suite owns, so a spawned ledger-writing child mints/loads its signing key
+    // without ever touching (or depending on the permissions of) the
+    // developer's real `~/.config/ai-memory`. Per-test `.env` overrides still
+    // win (env vars are shadowed at `.env()` call time), and no test in this
+    // file sets either var, so this is the sole, uniform source.
+    let (isolated_home, isolated_keys) = isolated_home_and_keys();
+    c.env("HOME", isolated_home)
+        .env("AI_MEMORY_KEY_DIR", isolated_keys);
     // Spawned CLI `--json` reports must be a single JSON document on
     // stdout. GitHub-hosted Check runners (and some local shells) inherit
     // `RUST_LOG=info`; curator then prefixes stdout with a tracing INFO
@@ -273,6 +334,21 @@ fn integration_scratch_root() -> std::path::PathBuf {
         .join("integration");
     std::fs::create_dir_all(&root).ok();
     root
+}
+
+/// #3705 — the ONE TLS leaf this test binary's daemons serve and its
+/// clients verify (the daemon refuses every plaintext bind, loopback
+/// included). Minted once per process under the scratch root.
+fn tls() -> &'static common::tls::TestTls {
+    common::tls::shared(&integration_scratch_root())
+}
+
+fn tls_cert() -> &'static str {
+    tls().cert_path.to_str().expect("utf-8 cert path")
+}
+
+fn tls_key() -> &'static str {
+    tls().key_path.to_str().expect("utf-8 key path")
 }
 
 fn integration_scratch_db(infix: &str) -> std::path::PathBuf {
@@ -1984,6 +2060,10 @@ fn test_health_endpoint() {
             "serve",
             "--port",
             &port.to_string(),
+            "--tls-cert",
+            tls_cert(),
+            "--tls-key",
+            tls_key(),
         ])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -1991,7 +2071,9 @@ fn test_health_endpoint() {
         .unwrap();
 
     // Wait for server to start
-    let url = format!("http://127.0.0.1:{port}/api/v1/health");
+    // #3705: the daemon serves TLS only; probe over HTTPS trusting the
+    // fixture certificate (never `--insecure`).
+    let url = format!("https://127.0.0.1:{port}/api/v1/health");
     let mut ok = false;
     for _ in 0..30 {
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -2004,6 +2086,8 @@ fn test_health_endpoint() {
                 "/dev/null",
                 "-w",
                 "%{http_code}",
+                "--cacert",
+                tls_cert(),
                 &url,
             ])
             .output()
@@ -8362,7 +8446,9 @@ fn health_is_200(port: u16) -> bool {
             "/dev/null",
             "-w",
             "%{http_code}",
-            &format!("http://127.0.0.1:{port}/api/v1/health"),
+            "--cacert",
+            tls_cert(),
+            &format!("https://127.0.0.1:{port}/api/v1/health"),
         ])
         .output()
         .is_ok_and(|out| String::from_utf8_lossy(&out.stdout) == "200")
@@ -8435,6 +8521,10 @@ fn test_sync_daemon_mesh_propagates_memory_between_peers() {
             "serve",
             "--port",
             &port_b.to_string(),
+            "--tls-cert",
+            tls_cert(),
+            "--tls-key",
+            tls_key(),
         ])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::from(stderr_file))
@@ -8488,7 +8578,9 @@ fn test_sync_daemon_mesh_propagates_memory_between_peers() {
             "x-agent-id: peer-b",
             "-d",
             &seed_body.to_string(),
-            &format!("http://127.0.0.1:{port_b}/api/v1/memories"),
+            "--cacert",
+            tls_cert(),
+            &format!("https://127.0.0.1:{port_b}/api/v1/memories"),
         ])
         .output()
         .unwrap();
@@ -8509,9 +8601,11 @@ fn test_sync_daemon_mesh_propagates_memory_between_peers() {
             "peer-a",
             "sync-daemon",
             "--peers",
-            &format!("http://127.0.0.1:{port_b}"),
+            &format!("https://127.0.0.1:{port_b}"),
             "--interval",
             "1",
+            "--ca-cert",
+            tls_cert(),
         ])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -8971,6 +9065,10 @@ fn test_child_guard_kills_daemon_on_assert_panic() {
                 "serve",
                 "--port",
                 &port.to_string(),
+                "--tls-cert",
+                tls_cert(),
+                "--tls-key",
+                tls_key(),
             ])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::from(stderr_file))
@@ -9072,7 +9170,9 @@ fn curl_get(port: u16, path: &str) -> (String, serde_json::Value) {
             CURL_REQUEST_MAX_SECS,
             "-w",
             "\n%{http_code}",
-            &format!("http://127.0.0.1:{port}{path}"),
+            "--cacert",
+            tls_cert(),
+            &format!("https://127.0.0.1:{port}{path}"),
         ])
         .output()
         .unwrap();
@@ -9097,7 +9197,9 @@ fn curl_get_as(port: u16, path: &str, agent_id: &str) -> (String, serde_json::Va
             "\n%{http_code}",
             "-H",
             &format!("x-agent-id: {agent_id}"),
-            &format!("http://127.0.0.1:{port}{path}"),
+            "--cacert",
+            tls_cert(),
+            &format!("https://127.0.0.1:{port}{path}"),
         ])
         .output()
         .unwrap();
@@ -9159,7 +9261,9 @@ fn curl_post(
     std::fs::write(&payload_path, body.to_string()).unwrap();
     args.push("--data-binary".into());
     args.push(format!("@{}", payload_path.display()));
-    args.push(format!("http://127.0.0.1:{port}{path}"));
+    args.push("--cacert".into());
+    args.push(tls_cert().into());
+    args.push(format!("https://127.0.0.1:{port}{path}"));
     let out = std::process::Command::new("curl")
         .args(&args)
         .output()
@@ -9187,7 +9291,9 @@ fn curl_delete(port: u16, path: &str, agent_id: Option<&str>) -> String {
         args.push("-H".into());
         args.push(format!("x-agent-id: {id}"));
     }
-    args.push(format!("http://127.0.0.1:{port}{path}"));
+    args.push("--cacert".into());
+    args.push(tls_cert().into());
+    args.push(format!("https://127.0.0.1:{port}{path}"));
     let out = std::process::Command::new("curl")
         .args(&args)
         .output()
@@ -9256,6 +9362,17 @@ impl OneshotDaemon {
     /// against in-process mock peers (see `spawn_inproc_mock_peer`).
     #[allow(dead_code)]
     fn with_federation(federation: Option<ai_memory::federation::FederationConfig>) -> Self {
+        // #3778 — the in-process leader gets the SAME attestation opt-out the
+        // spawned children get from `cmd()` (`AI_MEMORY_REQUIRE_AGENT_ATTESTATION
+        // = 0`, the #1751/#1985 documented permissive posture), declared HERE.
+        // Before this line the in-process HTTP-direct writes of this binary
+        // only passed when a SIBLING test had already called
+        // `common::free_port()` (which pins the same `Once`) earlier in the
+        // same process — an ambient, order-dependent coupling: a filtered run
+        // (`--test integration http_smoke_matrix_phases_1_3`) failed at
+        // `create_memory` with ATTESTATION_FAILED before reaching the cell
+        // under test. Nothing in CI supplies the value; the sibling did.
+        common::permissive_attestation_for_tests();
         // #1570 — these tests model an AUTHENTICATED deployment (api_key
         // configured at boot), the pre-#1570 implicit posture, so the admin
         // header role-claims they assert keep working. The #1570 secure
@@ -9351,6 +9468,7 @@ impl OneshotDaemon {
                 ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty(),
             ),
             identity_mode: ai_memory::config::HttpIdentityMode::default(),
+            ..Default::default()
         };
         let router = ai_memory::build_router(api_key_state, app_state);
         Self { router }
@@ -9533,6 +9651,10 @@ impl DaemonGuard {
                 "serve",
                 "--port",
                 &port.to_string(),
+                "--tls-cert",
+                tls_cert(),
+                "--tls-key",
+                tls_key(),
             ])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::from(stderr_file))
@@ -9689,7 +9811,9 @@ fn http_inbox_cross_source_agent_id_body_vs_query_vs_header() {
             CURL_REQUEST_MAX_SECS,
             "-H",
             "x-agent-id: ai:bob",
-            &format!("http://127.0.0.1:{}/api/v1/inbox?limit=5", d.port),
+            "--cacert",
+            tls_cert(),
+            &format!("https://127.0.0.1:{}/api/v1/inbox?limit=5", d.port),
         ])
         .output()
         .unwrap();
@@ -10006,6 +10130,10 @@ fn spawn_leader(quorum_writes: usize, peer_urls: &[String]) -> DaemonGuard {
             "serve".into(),
             "--port".into(),
             port.to_string(),
+            "--tls-cert".into(),
+            tls_cert().into(),
+            "--tls-key".into(),
+            tls_key().into(),
         ];
         if quorum_writes > 0 && !peer_urls.is_empty() {
             args.push("--quorum-writes".into());
@@ -10017,6 +10145,8 @@ fn spawn_leader(quorum_writes: usize, peer_urls: &[String]) -> DaemonGuard {
             // sync_push POSTs under a burst).
             args.push("--quorum-timeout-ms".into());
             args.push("15000".into());
+            args.push("--quorum-ca-cert".into());
+            args.push(tls_cert().into());
         }
         let (stderr_file, stderr_log) = serve_stderr_log();
         let mut child = cmd(bin)
@@ -10117,7 +10247,7 @@ fn http_bulk_create_fans_out_concurrently() {
     // (not 500) to keep the suite fast while still being long enough that
     // sequential-100ms would exceed the bound.
     let peer = DaemonGuard::spawn();
-    let peer_urls = vec![format!("http://127.0.0.1:{}", peer.port)];
+    let peer_urls = vec![format!("https://127.0.0.1:{}", peer.port)];
     // quorum_writes=2 over a single peer (n=2) forces every fanout to ack
     // the peer before `bulk_create` finalises the row. That keeps the
     // concurrency guarantee visible: sequential fanout would need
@@ -10202,7 +10332,7 @@ fn http_notify_fans_out_to_peers_so_target_inbox_sees_it() {
     // quorum_writes=2 on n=2 forces the notify fanout to land on the peer
     // before the HTTP response returns. That pins the test on the actual
     // fanout (the S32 regression), not on background detach timing.
-    let leader = spawn_leader(2, &[format!("http://127.0.0.1:{}", peer.port)]);
+    let leader = spawn_leader(2, &[format!("https://127.0.0.1:{}", peer.port)]);
 
     let (code, _body) = curl_post(
         leader.port,
@@ -10319,7 +10449,7 @@ fn http_archive_restore_fans_out() {
     // quorum_writes=2 on n=2 forces each write (create, archive, restore)
     // to ack the peer before returning — deterministic end-state for the
     // peer_port polls below.
-    let leader = spawn_leader(2, &[format!("http://127.0.0.1:{}", peer.port)]);
+    let leader = spawn_leader(2, &[format!("https://127.0.0.1:{}", peer.port)]);
 
     // 1. Seed on leader; fanout lands the write on peer.
     let (code, created) = curl_post(
@@ -10903,7 +11033,7 @@ fn http_pending_governance_approve_rejects_cross_peer() {
     // surfaces it. Without broadcast_pending_quorum the peer sees
     // nothing and cross-peer approve is impossible.
     let peer = DaemonGuard::spawn();
-    let leader = spawn_leader(2, &[format!("http://127.0.0.1:{}", peer.port)]);
+    let leader = spawn_leader(2, &[format!("https://127.0.0.1:{}", peer.port)]);
 
     // Seed the governance standard on the leader with write=approve.
     // The namespace_meta fanout will carry the pointer to the peer.
@@ -10996,7 +11126,7 @@ fn http_namespace_standard_meta_fans_out() {
     // tuple on the peer so `GET /namespaces/child/standard?inherit=true`
     // on the peer walks to the correct parent.
     let peer = DaemonGuard::spawn();
-    let leader = spawn_leader(2, &[format!("http://127.0.0.1:{}", peer.port)]);
+    let leader = spawn_leader(2, &[format!("https://127.0.0.1:{}", peer.port)]);
 
     // Seed a standard memory on leader (fans out to peer automatically).
     let (code, created) = curl_post(
@@ -11189,12 +11319,10 @@ async fn spawn_inproc_mock_peer(
             behaviour,
             count: counter.clone(),
         });
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.ok();
-    });
-    (format!("http://{addr}"), counter)
+    // #3705 — mock peers serve TLS with the process leaf; the leader's
+    // federation client (`federation_cfg_for_test`) trusts exactly it.
+    let (port, _handle) = tls().serve_router(app).await;
+    (common::tls::TestTls::base_url(port), counter)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -11206,8 +11334,8 @@ enum InprocPeerBehaviour {
 
 /// Build a `FederationConfig` pointing the leader at the given peer URLs
 /// with `W=quorum_writes` and a short ack timeout. Mirrors
-/// `FederationConfig::build()` minus the TLS plumbing — the test peers
-/// are plain HTTP, and there's no CA/identity work to do.
+/// `FederationConfig::build()` with the process test leaf as the CA — the
+/// mock peers serve TLS (#3705), so the client verifies them.
 #[allow(dead_code)]
 fn federation_cfg_for_test(
     peer_urls: &[String],
@@ -11221,11 +11349,8 @@ fn federation_cfg_for_test(
     let _ =
         ai_memory::governance::wire_check::GOVERNANCE_PRE_ACTION.set(Box::new(|_action| Ok(())));
     let timeout = Duration::from_millis(timeout_ms);
-    let client = reqwest::Client::builder()
-        .timeout(timeout)
-        .connect_timeout(Duration::from_secs(2))
-        .build()
-        .expect("build test reqwest client");
+    // #3705 — verifies the mock peers' leaf (no accept-any bypass).
+    let client = tls().async_client_with_timeout(timeout);
     let n = 1 + peer_urls.len();
     let policy = ai_memory::replication::QuorumPolicy::new(
         n,
@@ -11528,6 +11653,10 @@ fn spawn_leader_with_timeout(
         "serve".into(),
         "--port".into(),
         port.to_string(),
+        "--tls-cert".into(),
+        tls_cert().into(),
+        "--tls-key".into(),
+        tls_key().into(),
     ];
     if quorum_writes > 0 && !peer_urls.is_empty() {
         args.push("--quorum-writes".into());
@@ -11536,6 +11665,8 @@ fn spawn_leader_with_timeout(
         args.push(peer_urls.join(","));
         args.push("--quorum-timeout-ms".into());
         args.push(timeout_ms.to_string());
+        args.push("--quorum-ca-cert".into());
+        args.push(tls_cert().into());
     }
     let (stderr_file, stderr_log) = serve_stderr_log();
     let mut child = cmd(bin)
@@ -11582,7 +11713,9 @@ fn curl_put(
     std::fs::write(&payload_path, body.to_string()).unwrap();
     args.push("--data-binary".into());
     args.push(format!("@{}", payload_path.display()));
-    args.push(format!("http://127.0.0.1:{port}{path}"));
+    args.push("--cacert".into());
+    args.push(tls_cert().into());
+    args.push(format!("https://127.0.0.1:{port}{path}"));
     let out = std::process::Command::new("curl")
         .args(&args)
         .output()
@@ -11609,6 +11742,24 @@ fn curl_put(
 ///
 /// Phase 3 (6 governance/webhook): `approve_pending`, `reject_pending`, `register_agent`,
 /// notify, subscribe, unsubscribe.
+/// #3778 — `OneshotDaemon::new()` itself declares the permissive attestation
+/// posture for the in-process HTTP-direct surface: after construction the
+/// resolver reads "permissive" whether or not any sibling test ran first.
+/// (The strict posture — an unsigned `POST /api/v1/memories` refused with
+/// `ATTESTATION_FAILED` when attestation is required — is pinned in its own
+/// process by `tests/oneshot_daemon_attestation_3778.rs`, because that
+/// binary may mutate the env; this one never sets it to a strict value.)
+#[tokio::test]
+async fn oneshot_daemon_declares_the_attestation_opt_out_3778() {
+    let _d = OneshotDaemon::new();
+    assert!(
+        !ai_memory::identity::attest::require_agent_attestation_for(
+            ai_memory::identity::attest::WriteSurface::HttpDirect
+        ),
+        "OneshotDaemon::new must leave the HTTP-direct surface permissive"
+    );
+}
+
 #[tokio::test]
 #[allow(clippy::too_many_lines)] // smoke matrix: 30+ HTTP scenarios driven by one runtime
 async fn http_smoke_matrix_phases_1_3() {
@@ -11908,6 +12059,14 @@ async fn http_smoke_matrix_phases_1_3() {
 
     // POST /api/v1/subscriptions — subscribe
     // R3-S1.HMAC (2026-05-13): supply per-sub secret.
+    // #3775 — the caller is NAMED on both calls: a subscription is
+    // owner-bound (`created_by`; list/unsubscribe are caller-scoped), so an
+    // anonymous POST is refused 403 IDENTITY_REQUIRED and the pre-#3775
+    // anonymous shape of this cell passed vacuously (the anonymous DELETE
+    // resolved a fresh `anonymous:req-*` principal, matched nothing, and
+    // answered `200 removed:false` until #3407 made that a 403). The
+    // unsubscribe now asserts `removed: true`, so the smoke matrix proves
+    // the round trip instead of merely surviving it.
     {
         let (code, body) = route_post(
             &d,
@@ -11917,17 +12076,26 @@ async fn http_smoke_matrix_phases_1_3() {
                 "events": "*",
                 "secret": "smoke-secret",
             }),
-            None,
+            Some("ai:smoke-agent"),
         )
         .await;
         assert_eq!(code, "201", "subscribe: {body}");
-        let sub_id = body.get("id").map(|v| v.as_str().unwrap().to_string());
+        let sub_id = body["id"].as_str().expect("subscription id").to_string();
 
-        // DELETE /api/v1/subscriptions — unsubscribe
-        if let Some(id) = sub_id {
-            let code = route_delete(&d, &format!("/api/v1/subscriptions?id={id}"), None).await;
-            assert!(code == "204" || code == "200", "unsubscribe code: {code}");
-        }
+        // DELETE /api/v1/subscriptions — unsubscribe, by the creator.
+        let (status, body) = d
+            .request(
+                "DELETE",
+                &format!("/api/v1/subscriptions?id={sub_id}"),
+                None,
+                Some("ai:smoke-agent"),
+            )
+            .await;
+        assert_eq!(status.as_u16(), 200, "unsubscribe: {body}");
+        assert_eq!(
+            body["removed"], true,
+            "unsubscribe must remove the row it created: {body}"
+        );
     }
 
     // POST /api/v1/pending/{id}/approve — test with nonexistent id.
@@ -13296,6 +13464,7 @@ fn build_serve_state(
             ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty(),
         ),
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
+        ..Default::default()
     };
     (api_key_state, app_state)
 }
@@ -13384,35 +13553,30 @@ async fn test_daemon_cmd_sync_daemon_pulls_then_terminates() {
         let _ = ai_memory::db::open(&db_local).unwrap();
     }
 
-    // 1. Stand up an in-process peer via serve_http_with_shutdown.
-    let peer_port = free_port();
-    let peer_addr = format!("127.0.0.1:{peer_port}");
+    // 1. Stand up an in-process peer over TLS (#3705 — the sync daemon now
+    //    refuses every http:// peer, loopback included): the production
+    //    router served through the test leaf; the sync client trusts it.
     let (peer_api_key, peer_state) = build_serve_state(&db_peer);
-    let peer_shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
-    let peer_shutdown_for_daemon = peer_shutdown.clone();
-    let peer_addr_for_daemon = peer_addr.clone();
-    let peer_handle = tokio::spawn(async move {
-        ai_memory::daemon_runtime::serve_http_with_shutdown(
-            &peer_addr_for_daemon,
-            peer_api_key,
-            peer_state,
-            peer_shutdown_for_daemon,
-        )
-        .await
-    });
-
-    wait_for_http_ready(&peer_addr, DAEMON_READY_TIMEOUT)
-        .await
-        .expect("peer serve never became ready");
+    let peer_router = ai_memory::build_router_with_timeout(
+        peer_api_key,
+        peer_state,
+        std::time::Duration::from_secs(30),
+    );
+    let (peer_port, peer_handle) = tls().serve_router(peer_router).await;
 
     // 2. Run the sync-daemon loop in-process with interval=1 so at least
     //    one full cycle (pull + push) executes before we trigger shutdown.
     let sync_shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
     let sync_shutdown_for_daemon = sync_shutdown.clone();
     let db_local_for_daemon = db_local.clone();
-    let peers = vec![format!("http://127.0.0.1:{peer_port}")];
+    let peers = vec![common::tls::TestTls::base_url(peer_port)];
+    // #3705 — the peer serves the test leaf, which the wrapper's default
+    // client does not trust; drive the SAME loop body through the
+    // `_using_client` entry with a client that verifies that leaf.
+    let trusting_client = tls().async_client_with_timeout(std::time::Duration::from_secs(10));
     let sync_handle = tokio::spawn(async move {
-        ai_memory::daemon_runtime::run_sync_daemon_with_shutdown(
+        ai_memory::daemon_runtime::run_sync_daemon_with_shutdown_using_client(
+            trusting_client,
             db_local_for_daemon,
             "test-agent".to_string(),
             peers,
@@ -13442,8 +13606,7 @@ async fn test_daemon_cmd_sync_daemon_pulls_then_terminates() {
     }
 
     // 4. Tear down the peer.
-    peer_shutdown.notify_one();
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), peer_handle).await;
+    peer_handle.shutdown();
 
     let _ = std::fs::remove_file(&db_local);
     let _ = std::fs::remove_file(&db_peer);
@@ -13601,32 +13764,25 @@ async fn test_daemon_sync_with_shutdown_using_client_accepts_custom_client() {
         let _ = ai_memory::db::open(&db_local).unwrap();
     }
 
-    // 1. In-process peer.
-    let peer_port = free_port();
-    let peer_addr = format!("127.0.0.1:{peer_port}");
+    // 1. Stand up an in-process peer over TLS (#3705 — the sync daemon now
+    //    refuses every http:// peer, loopback included): the production
+    //    router served through the test leaf; the sync client trusts it.
     let (peer_api_key, peer_state) = build_serve_state(&db_peer);
-    let peer_shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
-    let peer_shutdown_for_daemon = peer_shutdown.clone();
-    let peer_addr_for_daemon = peer_addr.clone();
-    let peer_handle = tokio::spawn(async move {
-        ai_memory::daemon_runtime::serve_http_with_shutdown(
-            &peer_addr_for_daemon,
-            peer_api_key,
-            peer_state,
-            peer_shutdown_for_daemon,
-        )
-        .await
-    });
-
-    wait_for_http_ready(&peer_addr, DAEMON_READY_TIMEOUT)
-        .await
-        .expect("peer serve never became ready");
+    let peer_router = ai_memory::build_router_with_timeout(
+        peer_api_key,
+        peer_state,
+        std::time::Duration::from_secs(30),
+    );
+    let (peer_port, peer_handle) = tls().serve_router(peer_router).await;
 
     // 2. Build a custom reqwest::Client that differs from the default the
     //    plain run_sync_daemon_with_shutdown wrapper builds — non-default
     //    timeout + a distinct user-agent. This is the production-shaped
     //    use case (cmd_sync_daemon's mTLS client) compressed to test scale.
+    //    #3705 — it also trusts the peer's test leaf (full verification).
     let custom_client = reqwest::Client::builder()
+        .use_rustls_tls()
+        .add_root_certificate(tls().certificate())
         .timeout(std::time::Duration::from_secs(10))
         .user_agent("ai-memory-sync-mprime-test/1")
         .build()
@@ -13636,7 +13792,7 @@ async fn test_daemon_sync_with_shutdown_using_client_accepts_custom_client() {
     let sync_shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
     let sync_shutdown_for_daemon = sync_shutdown.clone();
     let db_local_for_daemon = db_local.clone();
-    let peers = vec![format!("http://127.0.0.1:{peer_port}")];
+    let peers = vec![common::tls::TestTls::base_url(peer_port)];
     let sync_handle = tokio::spawn(async move {
         ai_memory::daemon_runtime::run_sync_daemon_with_shutdown_using_client(
             custom_client,
@@ -13669,8 +13825,7 @@ async fn test_daemon_sync_with_shutdown_using_client_accepts_custom_client() {
         }
     }
 
-    peer_shutdown.notify_one();
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), peer_handle).await;
+    peer_handle.shutdown();
 
     let _ = std::fs::remove_file(&db_local);
     let _ = std::fs::remove_file(&db_peer);

@@ -33,9 +33,8 @@ use ai_memory::subscriptions::{
     self, NewSubscription, dispatch_semaphore_available_permits,
     override_dispatch_concurrency_for_tests,
 };
+use common::tls_receiver::{TlsReceiver, ack_echo_slow};
 use rusqlite::Connection;
-use wiremock::matchers::{method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
 
 mod common;
 use common::fresh_db_tempfile_path as fresh_db;
@@ -52,35 +51,6 @@ const DRAIN_DEADLINE: Duration = Duration::from_secs(30);
 /// #1475 — poll cadence while waiting for the semaphore to drain.
 const DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
-/// Custom responder that ACKs with the dispatched correlation id so
-/// `deliver_with_retry` counts the call as a success. Wiremock's
-/// per-mock `respond_with` is async-friendly; we add a per-response
-/// delay (~150 ms) so the dispatch worker holds its semaphore permit
-/// long enough for the test sampler to observe the in-flight ceiling.
-struct AckEchoSlow;
-impl wiremock::Respond for AckEchoSlow {
-    fn respond(&self, req: &wiremock::Request) -> ResponseTemplate {
-        // Extract the body's `correlation_id` so the receiver echo
-        // matches what `deliver_with_retry` expects.
-        let body = String::from_utf8_lossy(&req.body);
-        let corr = serde_json::from_str::<serde_json::Value>(&body)
-            .ok()
-            .and_then(|v| {
-                v.get("correlation_id")
-                    .and_then(|c| c.as_str().map(str::to_string))
-            })
-            .unwrap_or_else(|| "missing".to_string());
-        ResponseTemplate::new(200)
-            .set_body_json(serde_json::json!({
-                "status": "ack",
-                "correlation_id": corr,
-            }))
-            // 150 ms keeps every permit held long enough for the
-            // sampler (10 ms cadence) to catch the in-flight peak.
-            .set_delay(Duration::from_millis(150))
-    }
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dispatch_to_50_subscribers_caps_inflight_at_semaphore_bound() {
     // Pin the bound BEFORE any dispatch fires. The override is a
@@ -90,18 +60,18 @@ async fn dispatch_to_50_subscribers_caps_inflight_at_semaphore_bound() {
     // value we ended up with (we read it back via the accessor).
     let _ = override_dispatch_concurrency_for_tests(BOUND);
 
-    // Wiremock binds on 127.0.0.1; the SSRF guard rejects loopback
+    // The receiver binds on 127.0.0.1; the SSRF guard rejects loopback
     // by default. Opt in for the duration of the test (the project
     // already documents this opt-in at `src/subscriptions.rs:1638`).
     set_allow_loopback_webhooks(true);
 
-    // Spin up the receiver. One shared mock for all 50 subs.
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/hook"))
-        .respond_with(AckEchoSlow)
-        .mount(&server)
-        .await;
+    // Spin up the receiver — TLS (#3705: every `http://` target is refused,
+    // loopback included), one shared receiver for all 50 subs, ACKing with
+    // the dispatched correlation id after ~150 ms so every worker holds its
+    // semaphore permit long enough for the sampler (10 ms cadence) to catch
+    // the in-flight peak.
+    let tls = common::tls_receiver::dispatch_tls(&std::env::temp_dir());
+    let server = TlsReceiver::start_with(tls, ack_echo_slow(Duration::from_millis(150))).await;
 
     let (_keep, db_path) = fresh_db();
     let receiver_url = format!("{}/hook", server.uri());

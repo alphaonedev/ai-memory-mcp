@@ -712,7 +712,9 @@ fn load_reflections_for_entity(
     namespace: &str,
     limit: usize,
 ) -> Result<Vec<Memory>> {
-    let mut stmt = conn.prepare(
+    // #3693 — a quarantined / contaminated / tombstoned reflection is never
+    // source material for a generated persona (fail-closed allow-list).
+    let mut stmt = conn.prepare(&format!(
         "SELECT id, tier, namespace, title, content, tags, priority, confidence, source,
                 access_count, created_at, updated_at, last_accessed_at, expires_at,
                 metadata, COALESCE(reflection_depth, 0), COALESCE(memory_kind, 'observation'),
@@ -721,9 +723,11 @@ fn load_reflections_for_entity(
          WHERE namespace = ?1
            AND memory_kind = 'reflection'
            AND mentioned_entity_id = ?2
+           {lifecycle_vis}
          ORDER BY priority DESC, created_at DESC
          LIMIT ?3",
-    )?;
+        lifecycle_vis = crate::models::lifecycle_visible_clause(""),
+    ))?;
     let rows = stmt.query_map(
         rusqlite::params![
             namespace,
@@ -750,7 +754,8 @@ fn load_reflections_for_entity_any_namespace(
     entity_id: &str,
     limit: usize,
 ) -> Result<Vec<Memory>> {
-    let mut stmt = conn.prepare(
+    // #3693 — same fail-closed allow-list as the namespaced loader above.
+    let mut stmt = conn.prepare(&format!(
         "SELECT id, tier, namespace, title, content, tags, priority, confidence, source,
                 access_count, created_at, updated_at, last_accessed_at, expires_at,
                 metadata, COALESCE(reflection_depth, 0), COALESCE(memory_kind, 'observation'),
@@ -758,9 +763,11 @@ fn load_reflections_for_entity_any_namespace(
          FROM memories
          WHERE memory_kind = 'reflection'
            AND mentioned_entity_id = ?1
+           {lifecycle_vis}
          ORDER BY priority DESC, created_at DESC
          LIMIT ?2",
-    )?;
+        lifecycle_vis = crate::models::lifecycle_visible_clause(""),
+    ))?;
     let rows = stmt.query_map(
         rusqlite::params![entity_id, i64::try_from(limit).unwrap_or(i64::MAX)],
         crate::storage::row_to_memory,

@@ -104,7 +104,7 @@ Args: mcp --tier semantic
 ```
 
 **Smart / autonomous tier with a cloud LLM** (any of xAI Grok, OpenAI,
-Anthropic, Gemini, DeepSeek, Kimi, Qwen, Mistral, Groq, Together,
+Anthropic, Gemini, Kimi, Qwen, Mistral, Groq, Together,
 Cerebras, OpenRouter, Fireworks, LMStudio, vLLM, llama.cpp server) —
 the recommended path is the `[llm]` section in
 `~/.config/ai-memory/config.toml` ([#1146](https://github.com/alphaonedev/ai-memory-mcp/issues/1146)).
@@ -183,11 +183,17 @@ Full MCP setup for every IDE: `docs/INSTALL.md` § "MCP client setup".
 ## Path C — HTTP daemon (for applications + services)
 
 ```bash
-# Start the daemon (plain HTTP, loopback only)
+# Start the daemon — TLS is mandatory on every listener, loopback included
+# (#3705). On this single-agent install no flag is needed: first boot
+# generates a local CA + certificate under <key_dir>/tls/ (default key_dir:
+# ~/.config/ai-memory/keys) and renews it automatically (#3709). A fleet
+# (federated / multi-agent) must bring its own PKI: --tls-cert/--tls-key.
 ai-memory serve --host 127.0.0.1 --port 9077 &
+# curl examples below trust the local CA:
+#   --cacert ~/.config/ai-memory/keys/tls/local-ca.pem
 
 # Store via curl
-curl -X POST http://127.0.0.1:9077/api/v1/memories \
+curl -X POST https://127.0.0.1:9077/api/v1/memories \
   -H "Content-Type: application/json" \
   -d '{
     "title": "My first HTTP memory",
@@ -196,7 +202,7 @@ curl -X POST http://127.0.0.1:9077/api/v1/memories \
   }'
 
 # Recall via curl
-curl -X POST http://127.0.0.1:9077/api/v1/recall \
+curl -X POST https://127.0.0.1:9077/api/v1/recall \
   -H "Content-Type: application/json" \
   -d '{"context": "HTTP memory", "limit": 5}'
 

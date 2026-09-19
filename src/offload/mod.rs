@@ -294,9 +294,10 @@ impl<'a> ContextOffloader<'a> {
     /// function returns [`OffloadError::NotFound`] (leak-resistant
     /// — does NOT reveal the blob exists). A future K9 cross-agent
     /// grant check can layer on top of this; pass `None` to BYPASS
-    /// the ownership gate (substrate-internal sweepers, integrity
-    /// audits, operator dump tools — none of which originate from
-    /// an authenticated agent context).
+    /// the ownership gate. In production the only `None` caller is the
+    /// operator CLI (`ai-memory deref`, the trusted direct-ops path); the
+    /// TTL sweep never calls this function. `None` bypasses OWNERSHIP
+    /// only — the #3392 retention refusal below applies to every caller.
     ///
     /// # Errors
     ///
@@ -307,10 +308,12 @@ impl<'a> ContextOffloader<'a> {
     /// - [`OffloadError::SignatureFailed`] when a signer was provided
     ///   and the stored Ed25519 signature fails to verify.
     pub fn deref(&self, ref_id: &str, caller_agent_id: Option<&str>) -> Result<DerefResult> {
-        let row: Option<(Vec<u8>, String, i64, String, String, String)> = self
+        // #3392 — read `ttl_seconds` too, so the read path can REFUSE an expired
+        // blob instead of serving it verbatim (TTL was write-side only before).
+        let row: Option<(Vec<u8>, String, i64, Option<i64>, String, String, String)> = self
             .conn
             .query_row(
-                "SELECT content_zstd, content_sha256, stored_at, namespace,
+                "SELECT content_zstd, content_sha256, stored_at, ttl_seconds, namespace,
                         agent_id, signature_b64
                  FROM offloaded_blobs WHERE ref_id = ?1",
                 params![ref_id],
@@ -322,18 +325,40 @@ impl<'a> ContextOffloader<'a> {
                         r.get(3)?,
                         r.get(4)?,
                         r.get(5)?,
+                        r.get(6)?,
                     ))
                 },
             )
             .optional()
             .context("SELECT offloaded_blobs failed")?;
 
-        let (blob, stored_sha, stored_at, namespace, agent_id, signature_b64) =
-            row.ok_or_else(|| {
+        let (blob, stored_sha, stored_at, ttl_seconds, namespace, agent_id, signature_b64) = row
+            .ok_or_else(|| {
                 anyhow!(OffloadError::NotFound {
                     ref_id: ref_id.to_string(),
                 })
             })?;
+
+        // #3392 (RETENTION) — enforce TTL on READ, for EVERY caller. Before this,
+        // `ttl_seconds` was honoured only by the write-side reaper, so a blob past
+        // its TTL was served verbatim to a caller who believed it was gone. An
+        // expired blob is NotFound (leak-resistant, same disposition as the SEC-4
+        // ownership gate). This check does NOT key on `caller_agent_id`: the only
+        // production caller passing `None` is the operator CLI (`ai-memory deref`,
+        // a user read that must honour retention too), and the daily sweep
+        // (`sweep_expired`) deletes by `stored_at + ttl` without ever calling
+        // `deref` — so an absence-of-caller exemption would protect nothing
+        // and leave the leak open on the CLI path.
+        // `ttl_seconds = 0` is the caller's explicit "expire immediately"
+        // (#3171 admits it; the sweep reaps it on its next pass) — it is not
+        // "no TTL", so there is no `ttl > 0` arm here.
+        if let Some(ttl) = ttl_seconds
+            && stored_at.saturating_add(ttl) <= now_unix_seconds()
+        {
+            return Err(anyhow!(OffloadError::NotFound {
+                ref_id: ref_id.to_string(),
+            }));
+        }
 
         // SEC-4 (Cluster D, issue #767) — IDOR gate. The MCP
         // `handle_deref` handler always passes an authenticated
@@ -741,6 +766,80 @@ mod tests {
         let err = off.deref(&r.ref_id, None).err().expect("deref must reject");
         let downcast = err.downcast_ref::<OffloadError>().expect("OffloadError");
         assert!(matches!(downcast, OffloadError::IntegrityFailed { .. }));
+    }
+
+    /// #3392 — the retention refusal does not key on caller presence: the
+    /// `None` path (the operator CLI, the only production caller passing
+    /// `None`) is refused an expired blob exactly like the MCP path, while an
+    /// unexpired blob is still served to it.
+    #[test]
+    fn deref_refuses_expired_blob_for_the_none_caller_3392() {
+        let conn = fresh_db();
+        let off = ContextOffloader::new(&conn, None, OffloadConfig::default());
+        conn.execute(
+            "INSERT INTO offloaded_blobs
+                (ref_id, namespace, content_zstd, content_sha256,
+                 stored_at, ttl_seconds, agent_id, signature_b64)
+             VALUES ('expired-none', 'ns', X'00', 'deadbeef', 1000, 60, 'ai:alice', '')",
+            [],
+        )
+        .expect("seed expired blob");
+        let err = off
+            .deref("expired-none", None)
+            .expect_err("#3392: an expired blob is refused on the None (CLI) path too");
+        let downcast = err
+            .downcast_ref::<OffloadError>()
+            .expect("OffloadError variant");
+        assert!(
+            matches!(downcast, OffloadError::NotFound { .. }),
+            "leak-resistant NotFound, got {downcast:?}"
+        );
+        // CONTROL — an unexpired blob is still served to the None caller.
+        let live = off
+            .offload("still here", "ns", Some(3600), "ai:alice")
+            .expect("offload live");
+        let back = off
+            .deref(&live.ref_id, None)
+            .expect("#3392: unexpired blob served");
+        assert_eq!(back.content, "still here");
+    }
+
+    /// #3392 (review flag 2) — an explicitly-zero TTL means "expire
+    /// immediately", exactly as the sweep reads it; the read gate must not
+    /// treat `0` as "no TTL".
+    #[test]
+    fn deref_refuses_zero_ttl_blob_immediately_3392() {
+        let conn = fresh_db();
+        let off = ContextOffloader::new(&conn, None, OffloadConfig::default());
+        let now = now_unix_seconds();
+        conn.execute(
+            "INSERT INTO offloaded_blobs
+                (ref_id, namespace, content_zstd, content_sha256,
+                 stored_at, ttl_seconds, agent_id, signature_b64)
+             VALUES ('zero-ttl', 'ns', X'00', 'deadbeef', ?1, 0, 'ai:alice', '')",
+            params![now],
+        )
+        .expect("seed zero-ttl blob");
+        for caller in [None, Some("ai:alice")] {
+            let err = off
+                .deref("zero-ttl", caller)
+                .expect_err("#3392: ttl_seconds = 0 expires immediately on every caller path");
+            let downcast = err
+                .downcast_ref::<OffloadError>()
+                .expect("OffloadError variant");
+            assert!(
+                matches!(downcast, OffloadError::NotFound { .. }),
+                "leak-resistant NotFound for caller {caller:?}, got {downcast:?}"
+            );
+        }
+        // CONTROL — `ttl_seconds = NULL` (no TTL) stored at the same instant is served.
+        let forever = off
+            .offload("kept", "ns", None, "ai:alice")
+            .expect("offload no-ttl");
+        assert_eq!(
+            off.deref(&forever.ref_id, None).expect("served").content,
+            "kept"
+        );
     }
 
     #[test]

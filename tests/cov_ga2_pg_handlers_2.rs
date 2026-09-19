@@ -143,6 +143,7 @@ async fn pg_router(url: &str) -> axum::Router {
             ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty(),
         ),
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
+        ..Default::default()
     };
     ai_memory::build_router(api_key_state, app_state)
 }
@@ -507,6 +508,15 @@ pg_test!(pg_check_duplicate_hides_private, url, {
     // private row (existence + similarity oracle). CALLER is on the
     // admin allowlist but `is_admin_caller_trusted` stays false here
     // (keyless + no `AI_MEMORY_ADMIN_HEADER_TRUST`), so the mask runs.
+    // #3789 — that posture is ESTABLISHED under the lock, not assumed:
+    // the taxonomy tests flip the process-global header-trust env for
+    // their window, and an interleaving made CALLER admin-trusted, so
+    // the mask was bypassed and the probe flagged the private row.
+    let _g = ADMIN_ENV_LOCK.lock().await;
+    // SAFETY: this test owns the process env for the lock's duration.
+    unsafe {
+        std::env::remove_var(ai_memory::handlers::admin_role::ENV_ADMIN_HEADER_TRUST);
+    }
     let r = pg_router(&url).await;
     let ns = uniq_ns();
     let title = "cov-ga2 private dup 3234";
@@ -961,6 +971,158 @@ pg_test!(
             Some(&json!(0)),
             "stranger sees no private dependent; body={body}"
         );
+    }
+);
+
+pg_test!(
+    pg_memory_dependents_hides_quarantined_keeps_contaminated_3614,
+    url,
+    {
+        let r = pg_router(&url).await;
+        let ns = uniq_ns();
+        let owner = "ai:dep-owner-3614";
+        let pool = sqlx::PgPool::connect(&url).await.expect("pg pool");
+        let mut ids = Vec::new();
+        for title in [
+            "root-3614",
+            "open-3614",
+            "contaminated-3614",
+            "quarantined-3614",
+        ] {
+            let (status, body) = post_json_as(
+                &r,
+                "/api/v1/memories",
+                json!({"title": title, "content": "body", "namespace": ns, "agent_id": owner}),
+                owner,
+            )
+            .await;
+            assert!(status.is_success(), "seed status={status} body={body}");
+            ids.push(body["id"].as_str().expect("seed id").to_string());
+        }
+        // #3614 (transitive arm) — a depth-2 row derived FROM the (soon to be)
+        // quarantined node: linked BEFORE the stamp (a hidden target cannot be
+        // linked to), so the walk passes through the hidden node and lists it.
+        let (status, body) = post_json_as(
+            &r,
+            "/api/v1/memories",
+            json!({"title": "grandchild-3614", "content": "body", "namespace": ns, "agent_id": owner}),
+            owner,
+        )
+        .await;
+        assert!(status.is_success(), "seed status={status} body={body}");
+        let grandchild = body["id"].as_str().expect("seed id").to_string();
+        let (status, body) = post_json_as(
+            &r,
+            "/api/v1/links",
+            json!({"source_id": grandchild, "target_id": ids[3], "relation": "derived_from"}),
+            owner,
+        )
+        .await;
+        assert!(status.is_success(), "seed link status={status} body={body}");
+        for (id, state) in ids[1..].iter().zip(["open", "contaminated", "quarantined"]) {
+            let (status, body) = post_json_as(
+                &r,
+                "/api/v1/links",
+                json!({"source_id": id, "target_id": ids[0], "relation": "reflects_on"}),
+                owner,
+            )
+            .await;
+            assert!(status.is_success(), "seed link status={status} body={body}");
+            sqlx::query("UPDATE memories SET lifecycle_state = $1 WHERE id = $2")
+                .bind(state)
+                .bind(id)
+                .execute(&pool)
+                .await
+                .expect("stamp lifecycle");
+        }
+        // Pin the unscoped store result as well as the non-admin HTTP read gate.
+        let store = PostgresStore::connect(&url).await.expect("postgres store");
+        let dependents = store
+            .list_dependents_of_invalidated(&ids[0])
+            .await
+            .expect("list dependents");
+        assert_eq!(
+            dependents.len(),
+            2,
+            "#3614 unscoped lister must hide quarantine"
+        );
+        // The unscoped lineage walk (the `transitive` arm on BOTH surfaces):
+        // quarantined hidden, open + contaminated at depth 1, the grandchild
+        // at depth 2 through the hidden node.
+        let walk = store
+            .lineage_descendants(&ids[0], ai_memory::db::LINEAGE_MAX_DEPTH)
+            .await
+            .expect("lineage descendants");
+        let listed: Vec<(&str, usize)> = walk.iter().map(|n| (n.id.as_str(), n.depth)).collect();
+        assert!(
+            !listed.iter().any(|(id, _)| *id == ids[3]),
+            "#3614 transitive: a quarantined descendant must never render: {listed:?}"
+        );
+        assert!(listed.contains(&(ids[1].as_str(), 1)), "{listed:?}");
+        assert!(listed.contains(&(ids[2].as_str(), 1)), "{listed:?}");
+        assert!(
+            listed.contains(&(grandchild.as_str(), 2)),
+            "#3614 transitive: the walk passes through the hidden node: {listed:?}"
+        );
+        let (status, body) = post_json_as(
+            &r,
+            "/api/v1/memory_dependents_of_invalidated",
+            json!({"memory_id": ids[0], "transitive": true}),
+            owner,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        let rendered: Vec<&str> = body["transitive_suspects"]
+            .as_array()
+            .expect("transitive_suspects")
+            .iter()
+            .map(|n| n["id"].as_str().expect("id"))
+            .collect();
+        assert!(
+            !rendered.contains(&ids[3].as_str()),
+            "#3614 transitive HTTP: {body}"
+        );
+        assert!(rendered.contains(&grandchild.as_str()), "{body}");
+        assert_eq!(body["transitive_count"], json!(3), "{body}");
+        assert!(
+            dependents
+                .iter()
+                .all(|d| (d.id == ids[1] || d.id == ids[2]) && d.namespace == ns)
+        );
+        for (caller, count) in [(owner, 2), ("ai:dep-stranger-3614", 0)] {
+            let (status, body) = post_json_as(
+                &r,
+                "/api/v1/memory_dependents_of_invalidated",
+                json!({"memory_id": ids[0]}),
+                caller,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "body={body}");
+            assert_eq!(
+                body["count"],
+                json!(count),
+                "#3614 caller={caller} body={body}"
+            );
+            let deps = body["dependents"].as_array().expect("dependents array");
+            let expected = if count == 0 {
+                json!([])
+            } else {
+                json!([{"id": ids[1], "namespace": ns}, {"id": ids[2], "namespace": ns}])
+            };
+            assert_eq!(
+                deps.len(),
+                expected.as_array().expect("expected array").len()
+            );
+            for dependent in deps {
+                assert!(
+                    expected
+                        .as_array()
+                        .expect("expected array")
+                        .contains(dependent),
+                    "unexpected dependent: {dependent}"
+                );
+            }
+        }
     }
 );
 

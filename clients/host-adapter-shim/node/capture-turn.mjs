@@ -24,15 +24,27 @@
 //
 // # Exit codes
 //
-// - 0  — success (either dedup_hit:true or memory created)
+// - 0  — the substrate PERSISTED the turn (the receipt carried a
+//        non-empty `memory_id`; `dedup_hit:true` counts, the row exists)
 // - 1  — usage error
-// - 2  — MCP call failed (substrate error; check stderr)
+// - 2  — the turn was NOT persisted (transport fault, substrate error,
+//        governance `ask`/`pending`, an unreadable receipt, or any
+//        receipt this release cannot prove describes a stored row)
 // - 3  — content file missing/unreadable
+//
+// #3544 — exit 0 used to mean "none of the failures I enumerated
+// happened", so governance `ask` (nothing stored, no recovery handle),
+// governance `pending` (queued, not stored) and an unreadable receipt
+// all reported success for a turn the substrate never wrote. The verdict
+// is now the PRESENCE of a persisted `memory_id`; everything else fails
+// CLOSED. The exit-code SET is unchanged — only the meaning of 0 is,
+// which is the defect. A `pending` turn is not lost: its `pending_id` is
+// printed on stderr and redeems the turn via `memory_pending_approve`.
 //
 // # Failure mode
 //
 // Per the architecture: this shim MUST NOT wedge the host's
-// operation. On MCP failure, emits stderr WARN and exits 2.
+// operation. On any non-persisted outcome, emits stderr WARN and exits 2.
 
 import { readFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
@@ -142,6 +154,141 @@ function pickToolsCallResponse(stdoutText) {
   return null;
 }
 
+// ── #3544: the capture-outcome predicate ──────────────────────────────────
+//
+// The substrate is the source of truth for this vocabulary; measured at
+// `src/mcp/tools/capture_turn.rs`:
+//
+//   :437-444  permission `Decision::Ask`     -> {"status": "ask", ...}
+//             NOTHING is persisted; no id, no recovery handle.
+//   :488-496  `GovernanceDecision::Pending`  -> {"status": "pending",
+//             "pending_id", ...}  DURABLY QUEUED, redeemable.
+//   :531-538  dedup hit   -> {"memory_id", "dedup_hit": true,  "layer": "L4", ...}
+//   :539-547  fresh write -> {"memory_id", "dedup_hit": false, "layer": "L4", ...}
+//
+// `grep -n '"status"' src/mcp/tools/capture_turn.rs` returns exactly those two
+// literals — that is the whole closed vocabulary. `Decision::Deny` /
+// `GovernanceDecision::Deny` return `Err(..)`, which MCP renders as
+// `isError: true` (`src/mcp/mod.rs`), never as a `status`. RFC-0001 pins
+// `memory_id` in the result's `required` set
+// (`docs/rfc/RFC-0001-mcp-turn-capture.md:160`).
+//
+// THE WHOLE PREDICATE: a turn is CAPTURED if and only if the tool payload
+// carries a non-empty string `memory_id`. `status` is read only to say WHY and
+// to carry the recovery handle — never to decide the verdict, so a status a
+// later substrate release grows fails CLOSED without this file knowing it
+// exists. Kept self-contained (node builtins only, one file) because operators
+// copy this script to their host; the identical predicate is implemented by the
+// sibling `python/capture_turn.py` and `bash/capture-turn.sh`, and all three
+// are pinned to the same verdicts and the same stderr text by
+// `clients/host-adapter-shim/tests/test_capture_outcome_conformance.py`.
+
+const STATUS_ASK = "ask";
+const STATUS_PENDING = "pending";
+
+const CAPTURED = "captured";
+const ASK = "ask";
+const PENDING = "pending";
+const NOT_CAPTURED = "not_captured";
+
+const PENDING_APPROVE_TOOL = "memory_pending_approve";
+
+function asObject(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value) ? value : null;
+}
+
+/** The tool payload object, or null. Unwraps `result.content[0].text`. Total. */
+function capturePayload(resp) {
+  const outer = asObject(resp);
+  if (!outer) return null;
+  const result = asObject(outer.result);
+  if (!result) return null;
+  const content = result.content;
+  if (!Array.isArray(content) || content.length === 0) return null;
+  const first = asObject(content[0]);
+  if (!first) return null;
+  if (typeof first.text !== "string") return null;
+  try {
+    return asObject(JSON.parse(first.text));
+  } catch {
+    return null;
+  }
+}
+
+/** Return { kind, detail } for one tools/call response. Never throws. */
+function classifyCaptureResponse(resp) {
+  if (resp === null || resp === undefined) {
+    return { kind: NOT_CAPTURED, detail: "no capture response from substrate" };
+  }
+  const outer = asObject(resp);
+  if (!outer) {
+    return { kind: NOT_CAPTURED, detail: "capture response was not a JSON-RPC object" };
+  }
+  if (outer.error !== null && outer.error !== undefined) {
+    return { kind: NOT_CAPTURED, detail: "substrate returned JSON-RPC error" };
+  }
+  const result = asObject(outer.result);
+  if (!result) {
+    return { kind: NOT_CAPTURED, detail: "capture response carried no result object" };
+  }
+  if (result.isError === true) {
+    return { kind: NOT_CAPTURED, detail: "substrate returned isError:true" };
+  }
+
+  const payload = capturePayload(resp);
+  if (!payload) {
+    return {
+      kind: NOT_CAPTURED,
+      detail:
+        "capture result payload was unreadable " +
+        "(result.content[0].text is not a JSON object); " +
+        "refusing to count it as a captured turn",
+    };
+  }
+
+  const status = payload.status;
+  if (status === STATUS_ASK) {
+    // Nothing was written and there is no handle to redeem. Do NOT name a
+    // recovery path that does not exist.
+    return {
+      kind: ASK,
+      detail:
+        "capture_turn returned status=ask (governance approval requested; " +
+        "NOTHING was persisted and there is no recovery handle); " +
+        "not counting as a captured turn",
+    };
+  }
+  if (status === STATUS_PENDING) {
+    const rawId = payload.pending_id;
+    const pendingId = typeof rawId === "string" && rawId ? rawId : null;
+    // The opposite lie from the original bug: a Pending turn is NOT lost.
+    // `pending_id` is the ONLY handle that redeems it and must reach the
+    // operator rather than being discarded.
+    return {
+      kind: PENDING,
+      detail:
+        `capture_turn returned status=pending, pending_id=${JSON.stringify(pendingId)} ` +
+        `(the turn is DURABLY QUEUED for approval, NOT lost; redeem it with ` +
+        `${PENDING_APPROVE_TOOL}); not counting as a captured turn`,
+    };
+  }
+
+  const memoryId = payload.memory_id;
+  if (typeof memoryId === "string" && memoryId) {
+    return { kind: CAPTURED, detail: "" };
+  }
+
+  // Fail closed: an unrecognised status, an empty object, or a payload whose
+  // `memory_id` is absent/blank/not a string. None of these is a turn we can
+  // prove was stored, so none of them is success.
+  return {
+    kind: NOT_CAPTURED,
+    detail:
+      `capture_turn returned no memory_id (status=${JSON.stringify(status) ?? "null"}); ` +
+      "the turn was NOT persisted - not counting as a captured turn",
+  };
+}
+
 async function main() {
   let args;
   try {
@@ -189,18 +336,20 @@ async function main() {
 
   const resp = pickToolsCallResponse(stdoutText);
   if (!resp) {
-    process.stderr.write("WARN: no tools/call response found in substrate stdout\n");
     if (stderrText) process.stderr.write(stderrText);
+    // Same wording as the sibling adapters: the classifier owns every
+    // not-captured message, so the three cannot drift apart.
+    process.stderr.write(`WARN: ${classifyCaptureResponse(null).detail}\n`);
     process.exit(2);
   }
 
   process.stdout.write(`${JSON.stringify(resp, null, 2)}\n`);
 
-  // The MCP wire shape encodes the tool's success/failure under
-  // result.isError. Treat isError:true as exit-2 for the shim's
-  // caller (operator inspection or downstream piping).
-  if (resp.result && resp.result.isError === true) {
-    process.stderr.write("WARN: substrate returned isError:true\n");
+  // #3544 — the verdict is the PRESENCE of a persisted `memory_id`, never the
+  // ABSENCE of an enumerated failure.
+  const outcome = classifyCaptureResponse(resp);
+  if (outcome.kind !== CAPTURED) {
+    process.stderr.write(`WARN: ${outcome.detail}\n`);
     process.exit(2);
   }
   process.exit(0);

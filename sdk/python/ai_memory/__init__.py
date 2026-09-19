@@ -13,7 +13,7 @@ Example
 >>> from ai_memory import AiMemoryClient, Tier
 >>> from ai_memory.attestation import AgentSigningKey
 >>> key = AgentSigningKey.generate()  # doctest: +SKIP
->>> with AiMemoryClient(base_url="http://localhost:9077") as c:  # doctest: +SKIP
+>>> with AiMemoryClient(base_url="https://localhost:9077") as c:  # doctest: +SKIP
 ...     c.bind_agent_pubkey("svc", key)  # once, admin-gated
 ...     created = c.store(
 ...         title="hello", content="world", tier=Tier.MID,
@@ -50,6 +50,8 @@ from ai_memory.models import (
     GovernancePolicy,
     InboxMessage,
     Memory,
+    MemoryWriteReceipt,
+    WriteReceipt,
     MemoryLink,
     NotifyRequest,
     PendingAction,
@@ -90,6 +92,8 @@ __all__ = [
     "GovernancePolicy",
     "InboxMessage",
     "Memory",
+    "MemoryWriteReceipt",
+    "WriteReceipt",
     "MemoryLink",
     "NotFoundError",
     "NotifyRequest",

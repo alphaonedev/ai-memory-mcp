@@ -675,11 +675,9 @@ pub async fn forget_memories(
         {
             Ok(ns) => ns,
             Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": e.to_string()})),
-                )
-                    .into_response();
+                // #3707 — a `StoreError` Display carries sqlx server text.
+                tracing::error!(error = %e, "forget_distinct_namespaces failed");
+                return crate::handlers::postgres_gate::store_err_to_response(e);
             }
         };
         for ns in &matched {
@@ -788,11 +786,20 @@ pub async fn forget_memories(
             }
             Json(json!({"deleted": n})).into_response()
         }
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": e.to_string()})),
-        )
-            .into_response(),
+        // #3707 — `db::forget` mixes TWO error populations on one arm, and my
+        // first cut flattened both. `StorageError::InvalidArgument` is OUR OWN
+        // typed 400 envelope (#962, `FORGET_FILTER_REQUIRED`) and must keep its
+        // status AND its message; anything else is rusqlite/anyhow text naming
+        // tables and columns, which is logged and returned opaque.
+        Err(e) => match e.downcast_ref::<crate::storage::StorageError>() {
+            Some(crate::storage::StorageError::InvalidArgument { reason }) => {
+                (StatusCode::BAD_REQUEST, Json(json!({ "error": reason }))).into_response()
+            }
+            _ => {
+                tracing::error!(error = %e, "forget failed");
+                crate::handlers::errors::handler_error_500(&e)
+            }
+        },
     }
 }
 

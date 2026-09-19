@@ -7,6 +7,272 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (#3782 — SDK quickstarts pointed at a scheme the daemon never serves)
+
+- **#3782 (adopter lens, 3x7 workstream G on PR #3769; GA-blocker) — every
+  SDK example, default and test now speaks `https://` and both SDK READMEs
+  say where the daemon's CA is and how to pin it.** Since #3705/#3709 the
+  daemon has no plaintext listener at all: `src/daemon_runtime.rs`
+  `tls_bind_guard` refuses to bind one (loopback included) and
+  `resolve_tls_material` refuses the boot rather than downgrade. Both SDK
+  quickstarts, `ai_memory._common.DEFAULT_BASE_URL`,
+  `swarm.config.DEFAULT_DAEMON_BASE_URL`, the TypeScript `ClientOptions.baseUrl`
+  doc and 30-odd further occurrences across `sdk/**` still said
+  `http://localhost:9077` — 37 in total, and zero `https://localhost` anywhere
+  under `sdk/`. An adopter following either quickstart therefore failed on
+  their FIRST `store(...)`. The acceptance harness carried the identical
+  defect (#3776).
+  - **Scheme alone would not have fixed it.** A zero-config daemon serves a
+    leaf issued by the local CA it generates on first boot into
+    `<key_dir>/tls/local-ca.pem` (`src/tls_bootstrap.rs`; `<key_dir>` is
+    `$AI_MEMORY_KEY_DIR`, else `~/.config/ai-memory/keys`), which no public
+    root signs. An adopter told "use https" and nothing else fails at
+    certificate verification instead of at connect. Both READMEs gained a
+    **"Trust the daemon's CA"** section naming the file, the platform paths,
+    and the client option that pins it — `verify=<path>` in python (the stock
+    `httpx` parameter, already exposed) and the **new** `caCert` option in
+    TypeScript, which passes PEM text to undici's connector `ca` and leaves
+    verification FULL: it NAMES trust anchors (Node's `ca` replaces the
+    bundled public roots rather than adding to them, which both the README
+    and the JSDoc say out loud), and there is deliberately no "accept any
+    certificate" escape hatch. `caCert` on a platform with no
+    undici `Agent` (a browser build) is a REFUSAL, not a silently dropped
+    trust anchor.
+  - The TypeScript README's mTLS section said "ai-memory itself is HTTP-only
+    by design" and proxied to `http://127.0.0.1:9077`; the proxy's backend hop
+    is HTTPS too, so the snippet now carries
+    `proxy_ssl_trusted_certificate` + `proxy_ssl_verify on`.
+  - **New gate — `scripts/check-sdk-tls-scheme.sh` (wired into
+    `c8-precheck.yml`).** A PAIR, per rule fa41723f: the ABSENCE of
+    `http://localhost` / `http://127.0.0.1` anywhere under `sdk/`, and the
+    PRESENCE in BOTH SDK READMEs of the CA-trust section naming
+    `local-ca.pem` AND that SDK's pinning option. Scheme-only greens the
+    absence half and still leaves the adopter broken, which is why the
+    presence half is not optional. RED on the pre-fix tree (39 violations:
+    37 plaintext URLs + both missing README sections), GREEN on the fix.
+    `--self-test` plants each half of the defect and carries near-miss
+    controls that must PASS (corrected https URLs in both host spellings, an
+    abstract `http://mock` host, a public http URL, and `http://localhost`
+    OUTSIDE `sdk/`); a scanner fault and an empty `sdk/` scan set both fail
+    CLOSED (#2444 / #2713 shapes).
+  - Docs and SDK defaults only — no daemon behaviour changed. SDK suites:
+    TypeScript 120 passed / 8 skipped (was 115/8, +5 new `caCert` tests),
+    python `tests/` 119 passed / 5 skipped and `swarm/tests/` 85 passed, all
+    unchanged.
+### Fixed (#3544 — the TypeScript shims and the host-adapter trio complete the shim set)
+
+- **#3544 (bug, ga-blocker) — the two published TypeScript shims now return
+  `true` only for a turn the substrate confirms it PERSISTED.**
+  `captureTurn()` (`clients/openai-shim-ts/src/index.ts:145`,
+  `clients/anthropic-shim-ts/src/index.ts:143`) and — the arm wrapped clients
+  actually take — `captureTurnAsync()` (`:203` / `:201`) reached `true` after
+  screening only the spawn error, the exit status, a missing `id:2` frame, the
+  JSON-RPC `error` member and `result.isError`. `memory_id` was never read and
+  `status` was never consulted at all, so governance `ask` (nothing persisted,
+  no recovery handle), governance `pending` (durably queued, NOT persisted), an
+  unreadable payload and any `status` a later substrate release adds all came
+  back to the caller as a captured turn. Both packages now share ONE predicate,
+  `src/captureOutcome.ts` — vendored byte-identically into each and pinned as
+  byte-identical by `__tests__/capture_outcome_parity.test.ts` in both, so the
+  two published npm packages cannot disagree about what "captured" means. It is
+  the *presence* form — **captured if and only if the payload carries a
+  non-empty `memory_id`** (`src/mcp/tools/capture_turn.rs`; the field RFC-0001
+  lists as `required`) — so an unrecognised envelope fails CLOSED. `status` is
+  read only to say WHY and to carry the recovery handle: `ask` reports that
+  NOTHING was persisted and names no recovery that does not exist; `pending`
+  reports the turn as durably QUEUED, not lost, and surfaces the `pending_id`
+  that redeems it via `memory_pending_approve`. Public API, return types and
+  wire shape are unchanged (`captureTurn` is still `-> boolean`).
+- **#3544 — the three reference host-adapter shims
+  (`clients/host-adapter-shim/{python,node,bash}`) now exit `0` only for a
+  persisted turn.** `python/capture_turn.py:180`, `node/capture-turn.mjs:206`
+  and `bash/capture-turn.sh:173-176` all exited `0` unless the substrate exited
+  non-zero, emitted no usable frame, or set `result.isError` — so a host hook
+  received "captured" for an `ask`, a `pending`, or a receipt it could not read,
+  and had no signal that its transcript was not durable. All three now
+  implement the same presence predicate and are pinned to the **same exit code
+  and byte-identical stderr text** by a new hermetic cross-language conformance
+  suite (`clients/host-adapter-shim/tests/`), whose `envelopes.py` is the single
+  source of truth for the receipt vocabulary. The **exit-code set is unchanged**
+  (`0` persisted, `1` usage, `2` not persisted, `3` content unreadable); what
+  changes is the meaning of `0`, which is the defect. `2` now also covers `ask`,
+  `pending`, an unreadable receipt and an unknown `status`; the stderr `WARN`
+  line, not the exit code, distinguishes "not stored" from "lost", and a
+  `pending` receipt prints the `pending_id` that redeems it.
+  **The bash adapter now requires `jq`**: reading the receipt is a two-level
+  JSON parse (the payload rides inside `result.content[0].text` as a JSON
+  *string*), which `grep` cannot do correctly, so without `jq` the shim exits
+  `2` and says it cannot verify the turn rather than claiming a success it
+  cannot prove.
+- **#3544 (CI gap) — `clients-ci.yml` now runs the host-adapter trio.** The
+  workflow's `clients/**` path filter already matched
+  `clients/host-adapter-shim/**`, but no job executed it: the trio had no tests
+  at all, so the defect above could never have been caught by a gate. A new
+  `host-adapter-shims` job runs the conformance suite (and asserts the
+  python/node/bash/jq runtimes are present, so a missing runtime cannot pass as
+  a silent skip). The `ts-shims` job also gained `npm run build`, the step
+  `publish-sdk-shims.yml` ships with, so a tsc emit break cannot first surface
+  during a tag-triggered publish.
+
+### Fixed (#3544 — the Python shims no longer report an unstored turn as captured)
+
+- **#3544 (bug, ga-blocker) — `capture_turn()` in both published Python
+  shims now returns `True` only for a turn the substrate confirms it
+  PERSISTED.** The predicate was the *absence* form: a response counted as a
+  captured turn unless it matched one of the failure shapes the author had
+  enumerated (JSON-RPC `error`, `isError: true`, and later `status` in
+  {`ask`, `pending`}). A developer using `ai-memory-openai-shim` or
+  `ai-memory-anthropic-shim` therefore got `True` back for a turn that was
+  never stored whenever the envelope was anything unenumerated — an
+  unreadable payload, an empty object, a payload with no `memory_id`, or a
+  `status` a later substrate release adds. Both shims now share ONE
+  predicate, `_capture_outcome.classify_capture_response`, vendored
+  byte-identically into both packages and pinned as byte-identical by
+  `tests/test_capture_outcome_parity.py` in each, so the two wheels cannot
+  disagree about what "captured" means. It is the *presence* form —
+  **captured if and only if the payload carries a non-empty `memory_id`**
+  (`src/mcp/tools/capture_turn.rs`; the field RFC-0001 lists as `required`)
+  — so an unrecognised envelope fails CLOSED without the shim having to know
+  it exists. `status` is read only to say WHY and to carry the recovery
+  handle, never to decide the verdict: `ask` (`capture_turn.rs`, permission
+  `Decision::Ask`) reports that NOTHING was persisted and names no recovery
+  that does not exist, and `pending` (`GovernanceDecision::Pending`) reports
+  the turn as durably QUEUED — not lost — and surfaces the `pending_id` that
+  redeems it via `memory_pending_approve`. Public API, return type and wire
+  shape are unchanged (`capture_turn` is still `-> bool`); READMEs and
+  docstrings now state what the boolean means. Shim-only change: no Rust,
+  no MCP/HTTP/CLI surface, no schema.
+
+### Added (#3654 — per-peer federation freshness)
+
+- **#3654 (observability) — a peer that stops converging is now visible
+  per peer, and sustained failure is no longer DEBUG-only.** New registry
+  `src/federation/freshness.rs` records, per configured peer and per
+  direction (`pull` catch-up / `push` writes), the last attempt, the last
+  success (a push counts only when the peer applied it, #2341), the
+  failure streak and its closed-set class, the peer's clock offset from
+  its HTTP `Date` header, and the per-peer push-DLQ backlog. Nine new
+  Prometheus series (`ai_memory_federation_peer_*` and
+  `ai_memory_federation_catchup_interval_seconds`) expose them; a series
+  appears only after its first observation, never as a fake `0`, and
+  every timestamp is taken from the local clock so a skewed peer cannot
+  look fresh. Catch-up failures stay at DEBUG for a transient and
+  escalate to a WARN (`federation.peer_freshness`) at 3 consecutive
+  failures, then only when the streak doubles; recovery logs one INFO.
+  A fan-out task that panics is now attributed to its peer
+  (`PeerTasks`), where every lane previously logged an anonymous join
+  error and `bulk_catchup_push` reported the peer as `"unknown"`. A 2xx
+  catch-up envelope with no `memories` array is now recorded as a
+  malformed response instead of being skipped silently. The `peer`
+  label is the minted `peer-h1…` id; an id of any other shape is hashed
+  first, since a legacy id can be a credential-bearing URL. The catch-up
+  cadence series exists only while a catch-up loop runs (a node without
+  one exports no sample, never a `0`). The per-peer block of
+  `/api/v1/monitoring/status` (#3646) is now populated from the registry:
+  `reachability` is derived from pulls only and is `unknown` (with a
+  reason) when there is no fresh pull, never healthy from silence, and
+  `last_successful_push_age_seconds` is the age of the last push the
+  peer applied. Every observed per-peer value is an
+  `{"state":"available","value":…}` signal object and every unobserved
+  one an explicit not-observed object, never a bare number. Not measured
+  by this change: per-peer replication lag and catch-up progress
+  (#3681), the `ai-memory sync-daemon` lane (#3682), and inbound-only
+  peers, which are not enumerated on the status surface (#3686).
+  peer applied, or an explicit not-observed object. Not measured by this
+  change: per-peer replication lag and catch-up progress (#3681), and
+  the `ai-memory sync-daemon` lane (#3682).
+### Fixed (#3655 — doctor no longer masks sync failures or stale peers)
+
+- **#3655 (observability, HIGH; audit #3645 F09) — the local doctor's `Sync`
+  section kept four states distinct and ages every cursor against the probe
+  time.** An unreadable `sync_state` is **Critical** (`sync_state =
+  unreadable` + `sync_query_error`), never `peer_count = 0` / "single-node";
+  rows with NULL or non-RFC 3339 cursors are counted and named
+  (`invalid_rows`, `peer::<agent>/<peer>::invalid`) as a **Warning** instead
+  of being skipped; each valid peer renders `reachability`,
+  `contact_age_secs`, `catchup_interval_secs`, `advanced_age_secs`,
+  `data_age_secs`, `pushed_age_secs` / `never_pushed`, and signed
+  `clock_lead_secs` (**Critical** beyond the sync daemon's 300s pull-cursor
+  future bound; a quiet peer's negative lead is no longer a false Critical).
+  `probed_at`, `stale_peers`, `unknown_peers` and the `max_*_age_secs`
+  facts are new; `max_skew_secs` is kept for consumers but no longer drives
+  severity. `storage::doctor_max_sync_skew_secs` (which turned a failed
+  `prepare` into "not observed") is replaced by
+  `doctor_sync_peer_watermarks`, which propagates the failure.
+- **#3655 review rework — contact is recorded apart from the data
+  watermark, and reachability uses #3654's one definition.**
+  `sync_state.last_pulled_at` moves only when a pull ADVANCED the watermark
+  (`sync_state_observe`), so a quiet peer answering every pull with an
+  empty window never touched it and the first cut called it stale. Schema
+  **v99** adds `sync_peer_contact` (`last_contact_at`,
+  `catchup_interval_secs`; postgres twin is a version stamp only): both pull
+  paths (`sync_cycle_once` and the `serve` catch-up loop) stamp it on every
+  2xx pull, empty window included, with the cadence the #3654 registry
+  published. The doctor classifies each peer with the registry's rule and
+  reason strings — `reachable` inside 3 × the recorded cadence,
+  `unknown:pull_observation_stale` (**Critical**) beyond it,
+  `unknown:no_pull_observation` / `unknown:no_catchup_loop` (**Warning**)
+  when no contact or cadence was recorded — and never renders an absent
+  contact as an age of 0. Tests: an empty-window `sync_cycle_once` stamps
+  contact and leaves `sync_state` untouched; old cursors + fresh contact is
+  Info; old contact is Critical; no contact is Warning.
+- **#3655 v3 review — the reader enumerates the UNION of `sync_state` and
+  `sync_peer_contact`.** A peer that has only ever answered empty windows
+  (contact row, no `sync_state` row) was invisible to the section; it is
+  now listed, reachable, with `advanced_age_secs` / `data_age_secs` /
+  `clock_lead_secs` = `never_pulled` (never 0, never invalid). Peer ids are
+  redacted at watermark construction (`logging::redact_url_password`) so a
+  credential-bearing legacy URL never reaches a fact or note. A non-2xx
+  pull is never stamped as contact (tested with a peer answering 500).
+### Added (#3714 / #3715 — the deployment shape is the primary configuration input; unknown config keys refuse)
+
+- `[deployment] shape = "singleton" | "team" | "production" | "federated" | "hive"`
+  — the ONE new top-level setting of the configuration programme. One
+  definition (`config::shape::DeploymentShape::derive`) yields a
+  `ShapeDerived` table where every row is a **FLOOR** (an override below it
+  refuses boot) or a **default** (an explicit value wins). `#3700` (posture)
+  and `#3709` (transit) consume that table, never the environment. A config
+  with no `[deployment]` block is a `singleton`; nothing ever promotes a
+  running node to a stricter shape — promotion is an operator act.
+- v1.0.0 enforces two rows at boot: `production` / `federated` / `hive` pin
+  `AI_MEMORY_SECURITY_PROFILE=asi-hard` when it is unset and refuse a
+  `standard` override; the same shapes REQUIRE at-rest encryption — and
+  because no recovery escrow for the at-rest key exists yet (#3717), the
+  requirement is DECLARED (boot WARN, `doctor` "Deployment shape" section,
+  #3557) rather than silently enabled: a lost key must never mean lost
+  memory. An explicit `[encryption].at_rest = false` under those shapes
+  refuses boot. Every other derived row is declared here and enforced by
+  its named consumer.
+- `ai-memory config show [--file]` renders the derivation table with the
+  marker on every row (no secrets, no effective values — what the SHAPE
+  says).
+- **Unknown config keys now REFUSE the boot loader at every nesting level**
+  (exit 78, the #3166 class). The accepted key tree is derived from
+  `AppConfig`'s schema (`schemars`), not a hand list — 174 leaf keys at this
+  release — so a new field is accepted the moment it exists. The refusal
+  names the full key path, the nearest accepted sibling by edit distance,
+  any section where a key of that name IS accepted, and the exact repair
+  command. Pre-v1.0.0 only top-level unknown keys WARNed; nested ones were
+  silent. **Run `ai-memory config check` BEFORE upgrading**: it is the
+  detector — valid TOML that the daemon would refuse exits **5** with the
+  same per-key report and never refuses anything itself. `config migrate`,
+  `config check`, `config show` and `governance migrate-to-permissions`
+  all parse through `toml::Value` and stay reachable from a refused
+  config (a fail-closed loader whose repair path is behind the same gate
+  is a lockout, not a control).
+
+### Fixed (#3555 — write receipts declare their durability)
+
+- HTTP create, update, bulk, capture/replay and sync-push receipts, local MCP
+  store/update/capture receipts, and CLI store/update/capture receipts declare
+  `durability_class` and `fsync`. Forwarded MCP stores retain the daemon receipt.
+- Local writes declare `local-only`; SQLite reads the live `synchronous` setting.
+  Successful quorum creates report the actual acknowledgement count and replica
+  count on SQLite and PostgreSQL. Explicit backup-posture attestation can raise
+  an acknowledged replicated write to `replicated+backup`.
+- SDK and shim wire types expose receipt evidence. The generated all-funnel
+  structural contract is deferred to #3558; no competing manifest is introduced.
+
 ### Corrected (#3273 — 2026-09-11: merge messages on #3240 / #3235)
 
 - **#3273 (governance / process integrity) — the merge commits `c3344757`
@@ -20,6 +286,81 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   correction. The technical work in those merges is assessed separately.
   The live merge gate requires a real Fable APPROVE-MERGE signal naming
   the head SHA.
+
+### Removed
+
+- **The `deepseek` LLM provider alias is removed from the product and from
+  every current doc** ([#3627](https://github.com/alphaonedev/ai-memory-mcp/issues/3627),
+  operator directive 2026-09-11).
+
+  **What changes for you.** Any backend selector the substrate does not
+  recognise — the retired token, a typo such as `opena1`, or an arbitrary
+  label like `tei` / `litellm` that used to work as long as you also set an
+  explicit `base_url` — is now REFUSED at client construction, on
+  `AI_MEMORY_LLM_BACKEND`, `[llm].backend`, `AI_MEMORY_EMBED_BACKEND` and
+  `[embeddings].backend` alike. Previously it silently built a client
+  against `http://localhost:11434` with your Bearer token attached: the
+  chat path talked OpenAI-shaped requests to the local Ollama port, and the
+  embed path returned vectors from a model you never chose, which is wrong
+  recall ranking rather than a visible failure. Refusing is the point.
+  **Remedy:** use a recognised selector, or — for a self-hosted
+  OpenAI-compatible endpoint (TEI, LiteLLM, llama.cpp server, vLLM behind a
+  proxy) — use `openai-compatible` with an explicit `AI_MEMORY_LLM_BASE_URL`
+  / `[llm].base_url`, which is the documented escape hatch and is
+  unaffected. The accepted set is unchanged otherwise: `ollama`,
+  `openai-compatible`, `openai`, `xai`, `anthropic`, `gemini`, `kimi`
+  (`moonshot`), `qwen` (`dashscope`), `mistral`, `groq`, `together`,
+  `cerebras`, `openrouter`, `fireworks`, `lmstudio`, `vllm`.
+
+  **It degrades, it does not die.** `ai-memory serve` and `ai-memory mcp`
+  still boot on a refused selector: the LLM client resolves to `None` with a
+  `WARN` naming the backend and the reason, and LLM-powered hooks become
+  no-ops; a refused *embed* selector logs `EMBEDDER LOAD FAILED … Semantic
+  recall DEGRADED to keyword` and the daemon serves keyword recall. Your
+  stored memory text, embeddings and indices are untouched. `ai-memory
+  reembed` exits `3` (`EXIT_EMBEDDER_INIT_FAILED`) rather than re-embedding
+  with the wrong model; `ai-memory atomise` returns `atomise: LLM init
+  failed (backend=…)`. **Two surfaces stay quiet about it.** `ai-memory
+  curator` discards the error (`build_from_resolved(&resolved).ok()
+  .flatten()`), so a refused selector there yields no client and no
+  message; that pre-existing swallow now also hides this error class. And
+  **`ai-memory doctor` does NOT report the refusal**: its LLM reachability
+  probe never consults the selector gate — it builds its own client and
+  still probes the resolved URL, sending your API key as a Bearer to
+  whatever that URL points at. Both are pre-existing behaviours, not
+  introduced here, and both are tracked in
+  [#3811](https://github.com/alphaonedev/ai-memory-mcp/issues/3811).
+
+  **Model-family attestation.** The retired vendor's stem also leaves the
+  `src/identity/model_family.rs` classifier. The live consequence is not the
+  removed provider: an **Ollama-served open-weights model whose name carries
+  that stem** (e.g. `AI_MEMORY_LLM_BACKEND=ollama` with
+  `AI_MEMORY_LLM_MODEL=deepseek-r1:8b`) previously received a
+  `loader_observed` family attestation from
+  `cli/curator.rs::capture_loader_attestation` and now records as CLAIMED
+  with no family. Existing rows keep their stamped family — nothing durable
+  is rewritten — so a corpus using that model becomes mixed-attestation.
+  This is the fail-safe direction: an unattestable model reads "we do not
+  know" rather than being laundered into a family.
+
+  **Why the refusal had to be general.** Deleting the alias arms alone would
+  not have failed closed: `AppConfig::resolve_llm` is infallible and its
+  `backend_default_base_url` catch-all hands an unknown alias the loopback
+  Ollama URL, so a retired selector plus any resolvable API key would still
+  have produced a live client pointed at the wrong endpoint. A refusal
+  narrowed to the one retired token would have left that hole open for every
+  other unrecognised value — and would have had to keep the token in the
+  source to name it.
+
+  The alias tables, the per-vendor key/model maps, the model-family stem,
+  the vendor-literal gate pattern and the v1.0.0 capabilities inventory all
+  drop the row. Historical release records (earlier CHANGELOG sections,
+  `.github/release-body-v0.8.0.md`,
+  `docs/compliance/_inventory/v0.7.0-capabilities.json`), the dated review
+  records under `docs/reviews/`, and two published-research citations
+  (`docs/v0.7.0/mtp-bench-2026-05-17.md`,
+  `docs/rationale/academic-context.md`) keep the name: a record or a
+  citation is not a provider alias, and rewriting one would falsify it.
 
 ### Security (#3549 — one caller-authority resolver beneath every handler)
 
@@ -14340,7 +14681,7 @@ originally triaged for v0.7.0.1 fold into v0.7.0 directly.
   PKCS#11 HSMs, Apple Secure Enclave / TEE, and AWS/GCP/Azure cloud
   KMS adapters are intentionally **not** implemented in this crate. The
   OSS path stops at file-based 0600 storage; certified hardware-backed
-  deployments live in the AgenticMem™ commercial layer per
+  deployments live in the AgenticMem commercial layer per
   `ROADMAP.md`. The OSS code never imports a hardware-token library.
 - **New deps (pure-Rust, MIT/Apache):** `ed25519-dalek = "2"` (with
   the `rand_core` feature for `SigningKey::generate`), `rand_core =

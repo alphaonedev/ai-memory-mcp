@@ -80,7 +80,7 @@ pub fn store_url_from_file(path: &Path) -> Result<String> {
         let mode = meta.permissions().mode();
         if mode & 0o077 != 0 {
             let fail_open = std::env::var("AI_MEMORY_STORE_URL_FILE_ALLOW_LAX_PERMS")
-                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .map(|v| crate::security_profile::is_truthy(&v))
                 .unwrap_or(false);
             if fail_open {
                 tracing::warn!(
@@ -141,7 +141,7 @@ pub fn resolve_store_url(cli_arg: Option<&str>) -> Result<Option<String>> {
         }
     }
     if let Some(url) = cli_arg {
-        if url_has_userinfo_password(url) {
+        if url_carries_credentials(url) {
             tracing::warn!(
                 "--store-url carries a password in argv, which is exposed via world-readable \
                  /proc/<pid>/cmdline and `ps auxww` to any local UID (#1927). Prefer \
@@ -202,7 +202,7 @@ pub fn refuse_postgres_store_url_without_feature(cli_arg: Option<&str>) -> Resul
              --db path (would write agent memory to the wrong store while looking \
              healthy) (#2679). rebuild with `--features sal-postgres`, or unset \
              AI_MEMORY_STORE_URL / AI_MEMORY_STORE_URL_FILE / --store-url",
-            crate::logging::redact_url_password(&url),
+            crate::url_display::store_url_display(&url),
         );
     }
 }
@@ -210,18 +210,27 @@ pub fn refuse_postgres_store_url_without_feature(cli_arg: Option<&str>) -> Resul
 /// #1927 — true when a `scheme://user:pass@host/...` URL carries a non-empty
 /// userinfo password component (`user:pass@`). Best-effort structural check
 /// (no full URL parse) used only to decide whether to warn about argv exposure.
-fn url_has_userinfo_password(url: &str) -> bool {
-    let Some(after_scheme) = url.split_once("://").map(|(_, r)| r) else {
+/// libpq's documented credential-bearing query keys (`password`,
+/// `sslpassword`). This is an ENUMERATION and is documented as one: it
+/// decides whether the argv-exposure WARNING fires, it never decides what
+/// is rendered (rendering is `url_display`, which enumerates nothing).
+const LIBPQ_CREDENTIAL_QUERY_KEYS: [&str; 2] = ["password", "sslpassword"];
+
+/// Does `url` carry a credential a `ps auxww` reader could copy: a
+/// non-empty userinfo password, or a libpq credential query key (compared
+/// percent-decoded and case-insensitively, so `%70assword=` counts)?
+/// (#1927 warning trigger; #3667 widened from userinfo-only.)
+fn url_carries_credentials(url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url.trim()) else {
         return false;
     };
-    // userinfo is everything before the first '@' of the authority.
-    let Some(at) = after_scheme.find('@') else {
-        return false;
-    };
-    let userinfo = &after_scheme[..at];
-    // A password is present iff there is a ':' in the userinfo with something
-    // after it.
-    matches!(userinfo.split_once(':'), Some((_, pass)) if !pass.is_empty())
+    if parsed.password().is_some_and(|p| !p.is_empty()) {
+        return true;
+    }
+    parsed.query_pairs().any(|(k, _)| {
+        let key = k.to_ascii_lowercase();
+        LIBPQ_CREDENTIAL_QUERY_KEYS.contains(&key.as_str())
+    })
 }
 
 /// Process-global lock for every test (and test-only caller) that reads or
@@ -320,14 +329,21 @@ mod tests {
     /// actually present (so a passwordless DSN does not nag the operator).
     #[test]
     fn issue_1927_userinfo_password_detection() {
-        assert!(url_has_userinfo_password(
+        assert!(url_carries_credentials(
             "postgres://user:hunter2@db.internal/mem"
         ));
-        assert!(!url_has_userinfo_password(
-            "postgres://user@db.internal/mem"
+        assert!(!url_carries_credentials("postgres://user@db.internal/mem"));
+        assert!(!url_carries_credentials("postgres://db.internal/mem"));
+        assert!(!url_carries_credentials("sqlite:///var/lib/mem.db"));
+        // #3667 — a credential in the QUERY is as exposed in argv as one in
+        // the userinfo; the key is matched percent-decoded.
+        assert!(url_carries_credentials(
+            "postgres://user@db/mem?%70assword=x"
         ));
-        assert!(!url_has_userinfo_password("postgres://db.internal/mem"));
-        assert!(!url_has_userinfo_password("sqlite:///var/lib/mem.db"));
+        assert!(url_carries_credentials("postgres://db/mem?sslpassword=x"));
+        assert!(!url_carries_credentials(
+            "postgres://db/mem?sslmode=verify-full"
+        ));
     }
 
     /// #2679 — a postgres:// URL on the env channel is refused on a binary

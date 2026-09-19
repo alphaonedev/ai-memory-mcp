@@ -34,6 +34,52 @@ const CAP_SKILLS_POSTGRES_REASON: &str = "the skills plane is sqlite-only: postg
      /api/v1/skill/* path returns 501 NOT IMPLEMENTED and the memory_skill_* MCP \
      tools are unavailable on a postgres-backed daemon (port tracked by #2804)";
 
+/// #3340 — `capabilities.atomisation` key overlaid on a postgres-backed daemon.
+const CAP_ATOMISATION: &str = "atomisation";
+/// #3340 — additive postgres-disclosure flag on `capabilities.atomisation`.
+const CAP_ATOMISATION_UNSUPPORTED_ON_POSTGRES: &str = "unsupported_on_postgres";
+/// #3340 — additive human-readable reason on `capabilities.atomisation`.
+const CAP_ATOMISATION_UNSUPPORTED_REASON: &str = "unsupported_reason";
+/// #3340 — the value the engine-bound sub-feature strings take on postgres.
+/// `CapabilityAtomisation::current()` hardcodes each to `"implemented"`, a
+/// backend-blind claim; on postgres the engine never runs.
+const CAP_ATOMISATION_UNSUPPORTED_VALUE: &str = "unsupported_on_postgres";
+/// #3340 — the engine-bound sub-feature keys the postgres daemon skips on
+/// every write. `recall_preference` / `forensic` / `link_relation` are
+/// read/label surfaces, not engine execution, so they are left untouched.
+const CAP_ATOMISATION_ENGINE_FIELDS: [&str; 4] = ["tool", "cli", "auto", "curator"];
+/// #3340 — the reason text. Names the tracking issue and states the failure
+/// mode (every store reports `atomise_outcome=skipped_backend_unsupported`;
+/// the HTTP atomise route refuses with `EngineRequired`) rather than implying
+/// a degraded mode.
+const CAP_ATOMISATION_POSTGRES_REASON: &str = "the atomisation engine is sqlite-only: it is typed on a rusqlite::Connection, so on a \
+     postgres-backed daemon every auto/tool/cli/curator path reports \
+     atomise_outcome=skipped_backend_unsupported (the HTTP atomise route refuses with \
+     EngineRequired) and no decomposition is written (#3340)";
+
+/// #3340 — honest postgres overlay for the `capabilities.atomisation` object,
+/// mirroring the #3183 skills overlay one plane over. Flips the engine-bound
+/// sub-feature strings from the backend-blind `"implemented"` to
+/// `"unsupported_on_postgres"` and discloses additively, leaving the
+/// read/label surfaces (`recall_preference`/`forensic`/`link_relation`)
+/// untouched. Pure so it is pinnable without a live postgres.
+fn overlay_atomisation_for_postgres(atomisation: &mut serde_json::Map<String, serde_json::Value>) {
+    for field in CAP_ATOMISATION_ENGINE_FIELDS {
+        atomisation.insert(
+            field.to_string(),
+            serde_json::Value::String(CAP_ATOMISATION_UNSUPPORTED_VALUE.to_string()),
+        );
+    }
+    atomisation.insert(
+        CAP_ATOMISATION_UNSUPPORTED_ON_POSTGRES.to_string(),
+        serde_json::Value::Bool(true),
+    );
+    atomisation.insert(
+        CAP_ATOMISATION_UNSUPPORTED_REASON.to_string(),
+        serde_json::Value::String(CAP_ATOMISATION_POSTGRES_REASON.to_string()),
+    );
+}
+
 pub async fn get_capabilities(
     State(app): State<AppState>,
     headers: HeaderMap,
@@ -254,6 +300,21 @@ pub async fn get_capabilities(
                         serde_json::Value::String(CAP_SKILLS_POSTGRES_REASON.to_string()),
                     );
                 }
+                // #3340 — claims-truth on the atomisation plane, mirroring the
+                // #3183 skills overlay above. `CapabilityAtomisation::current()`
+                // hardcodes every sub-feature to `"implemented"` because the
+                // engine is compiled in; but that engine is typed on a
+                // `rusqlite::Connection`, so on a postgres-backed daemon
+                // `try_enqueue_auto_atomise` returns diverged and every store
+                // reports `atomise_outcome=skipped_backend_unsupported`. Overlay
+                // the honest posture additively; sqlite is untouched.
+                if matches!(app.storage_backend, super::StorageBackend::Postgres)
+                    && let Some(atomisation) = obj
+                        .get_mut(CAP_ATOMISATION)
+                        .and_then(serde_json::Value::as_object_mut)
+                {
+                    overlay_atomisation_for_postgres(atomisation);
+                }
             }
             (StatusCode::OK, Json(v)).into_response()
         }
@@ -265,5 +326,75 @@ pub async fn get_capabilities(
             )
                 .into_response()
         }
+    }
+}
+
+#[cfg(test)]
+mod atomisation_capability_truth_3340_tests {
+    use super::*;
+
+    /// #3340 — the pre-overlay atomisation capability is backend-blind: every
+    /// engine sub-feature reports `"implemented"`, which is what a postgres
+    /// daemon wrongly advertised while every store returned
+    /// `atomise_outcome=skipped_backend_unsupported`.
+    #[test]
+    fn atomisation_current_is_backend_blind_all_implemented_3340() {
+        let cap = crate::config::CapabilityAtomisation::current();
+        let val = serde_json::to_value(&cap).expect("serialize CapabilityAtomisation");
+        let obj = val.as_object().expect("atomisation is a JSON object");
+        for field in CAP_ATOMISATION_ENGINE_FIELDS {
+            assert_eq!(
+                obj.get(field).and_then(serde_json::Value::as_str),
+                Some("implemented"),
+                "pre-overlay engine field {field} must read as implemented"
+            );
+        }
+        assert!(
+            obj.get(CAP_ATOMISATION_UNSUPPORTED_ON_POSTGRES).is_none(),
+            "pre-overlay must carry no postgres-unsupported disclosure"
+        );
+    }
+
+    /// #3340 — the postgres overlay makes the claim honest: the engine-bound
+    /// sub-features flip to `unsupported_on_postgres`, the additive disclosure
+    /// + reason are present, and the read/label surfaces are untouched.
+    #[test]
+    fn atomisation_postgres_overlay_flips_engine_fields_only_3340() {
+        let cap = crate::config::CapabilityAtomisation::current();
+        let mut val = serde_json::to_value(&cap).expect("serialize CapabilityAtomisation");
+        let obj = val.as_object_mut().expect("atomisation is a JSON object");
+
+        // Capture the read/label surfaces that MUST stay untouched.
+        let recall_pref_before = obj.get("recall_preference").cloned();
+        let forensic_before = obj.get("forensic").cloned();
+        let link_relation_before = obj.get("link_relation").cloned();
+
+        overlay_atomisation_for_postgres(obj);
+
+        for field in CAP_ATOMISATION_ENGINE_FIELDS {
+            assert_eq!(
+                obj.get(field).and_then(serde_json::Value::as_str),
+                Some(CAP_ATOMISATION_UNSUPPORTED_VALUE),
+                "engine field {field} must be flipped to unsupported_on_postgres"
+            );
+        }
+        assert_eq!(
+            obj.get(CAP_ATOMISATION_UNSUPPORTED_ON_POSTGRES)
+                .and_then(serde_json::Value::as_bool),
+            Some(true),
+            "the additive postgres-unsupported disclosure flag must be true"
+        );
+        assert!(
+            obj.get(CAP_ATOMISATION_UNSUPPORTED_REASON)
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|r| r.contains("#3340")),
+            "the unsupported_reason must be present and cite the tracking issue"
+        );
+
+        // The read/label surfaces are NOT engine execution — they must survive
+        // the overlay byte-identical.
+        assert_eq!(obj.get("recall_preference").cloned(), recall_pref_before);
+        assert_eq!(obj.get("forensic").cloned(), forensic_before);
+        assert_eq!(obj.get("link_relation").cloned(), link_relation_before);
     }
 }
