@@ -96,14 +96,20 @@
 //! (`reload::resolve_and_build_mcp_llm`), and the CLI one-shot curator
 //! (`cli::curator::build_curator_llm`).
 //!
-//! `cli/commands/expand.rs` and `cli/commands/atomise.rs` are
-//! deliberately NOT routed: their clients reach `expand_query` and
-//! `Curator::decompose`, neither of which is a seam, so routing them
-//! would construct a decision provider nothing consumes and (under
-//! `deny`) write a refusal row per CLI invocation. That exclusion is
-//! named here rather than left implicit, and
-//! `tests/decision_unset_byte_identical_3806.rs` pins the routed set in
-//! both directions.
+//! **`cli/commands/expand.rs` and `cli/commands/atomise.rs` are
+//! deliberately NOT routed.** Their clients reach `expand_query` and
+//! `Curator::decompose`, neither of which is a seam — so routing them
+//! would not wire anything: it would require BUILDING a seam at those
+//! call positions first, which is scope this unit does not have. As it
+//! stands, routing them would construct a decision provider nothing
+//! consumes and (under `deny`) write a signed refusal row on every CLI
+//! invocation.
+//!
+//! That exclusion is stated here, and asserted by
+//! `tests/decision_unset_byte_identical_3806.rs`, which pins the routed
+//! set in BOTH directions. An absence that is asserted is a decision; an
+//! absence that is silent is a hole, and the next person auditing seam
+//! coverage would find two call sites with no decider and no reason.
 //!
 //! ## The reference cycle, made unrepresentable
 //!

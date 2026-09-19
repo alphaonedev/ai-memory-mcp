@@ -807,10 +807,14 @@ as `outcome="egress_refused"`.
 Every surface that can reach a seam obtains its decider from the ONE
 boot chokepoint: the HTTP daemon, the MCP stdio surface (and its
 between-request reload), and the CLI one-shot curator. `ai-memory
-expand` and `ai-memory atomise` are deliberately not routed — their
-clients reach no seam, so wiring them would construct a provider nothing
-consumes. `tests/decision_unset_byte_identical_3806.rs` pins that list in
-both directions.
+expand` and `ai-memory atomise` are deliberately **not** routed: their
+clients reach no seam, so routing them would not wire anything — it would
+require building a seam at those call positions first. As it stands it
+would construct a provider nothing consumes, and write a signed refusal
+row on every invocation under `egress = "deny"`.
+`tests/decision_unset_byte_identical_3806.rs` pins that list in both
+directions, so the exclusion is a reviewed decision rather than an
+oversight.
 
 ## Migration from v0.6.x (legacy flat fields)
 
