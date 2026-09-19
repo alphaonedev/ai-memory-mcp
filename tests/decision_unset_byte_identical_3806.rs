@@ -181,6 +181,11 @@ const DECIDER_TOKENS: &[&str] = &[
     // seam to it is caught by this scan too: without this token W1b's
     // own `daemon_runtime` call site would have been invisible here.
     "decision_boot",
+    // #3806 W2 — the seam module and the ONE attachment verb. Without
+    // these two tokens a surface could reach a decider through
+    // `decision_seams` without naming anything this scan looks for.
+    "decision_seams",
+    "attach_decider",
 ];
 
 /// The files ALLOWED to name the decider surface. A change in this list
@@ -223,6 +228,17 @@ const DECIDER_ALLOWED: &[&str] = &[
     "src/decision_clients/chat.rs",
     "src/decision_clients/fallback.rs",
     "src/decision_clients/systemone.rs",
+    // #3806 W2 — the reviewed SEAM wiring. `decision_seams.rs` owns the
+    // two call positions and the attachment; `llm.rs` holds the opaque
+    // attachment and the two seam branches; `reload.rs` (the MCP stdio
+    // surface and its between-request reload) and `cli/curator.rs` (the
+    // CLI one-shot surface) are the two surfaces the W1b ruling named as
+    // W2's acceptance item, now routed through the same chokepoint the
+    // HTTP daemon uses.
+    "src/decision_seams.rs",
+    "src/llm.rs",
+    "src/reload.rs",
+    "src/cli/curator.rs",
 ];
 
 /// The chokepoint entry points (`build_decision_provider`,
@@ -244,11 +260,47 @@ const CHOKEPOINT_HOME: &str = "src/decision_boot.rs";
 /// Asserted in BOTH directions: no file outside this list may call the
 /// chokepoint, and every file in it must actually call it — so the list
 /// cannot rot into a permission nobody exercises.
-const CHOKEPOINT_CALLERS: &[&str] = &["src/daemon_runtime.rs"];
+/// #3806 W2 moved this from `daemon_runtime.rs` to `decision_seams.rs`:
+/// three surfaces now need a decider, and each of them obtaining its own
+/// would be three chances to get the gate wrong. They reach the
+/// chokepoint through ONE function instead — see [`ATTACH_CALLERS`].
+const CHOKEPOINT_CALLERS: &[&str] = &["src/decision_seams.rs"];
 
-/// The gated handle type. Named in exactly one file: the chokepoint
-/// that defines it. Anything else naming it is a second door.
+/// The ONE verb that hands a surface a gated decider, and the complete
+/// list of surfaces allowed to call it.
+///
+/// Asserted in BOTH directions, like the chokepoint itself. A surface
+/// that APPEARS here is a new decision consumer someone reviewed; one
+/// that VANISHES is a surface that silently stopped running the boot
+/// chokepoint — which would take its `/capabilities` snapshot and its
+/// signed egress-refusal row with it.
+///
+/// `src/cli/commands/expand.rs` and `src/cli/commands/atomise.rs`
+/// deliberately do NOT appear: their `[llm]` clients reach
+/// `expand_query` and `Curator::decompose`, neither of which is a seam,
+/// so routing them would construct a decision provider nothing consumes
+/// and write a refusal row per CLI invocation under a refusing posture.
+const ATTACH_CALLERS: &[&str] = &[
+    "src/cli/curator.rs",
+    "src/daemon_runtime.rs",
+    "src/reload.rs",
+];
+
+/// The verb [`ATTACH_CALLERS`] is asserted over.
+const ATTACH_TOKEN: &str = "attach_decider(";
+
+/// The gated handle type.
 const HANDLE_TYPE: &str = "DecisionProviderHandle";
+
+/// The files allowed to NAME the gated handle type: the chokepoint that
+/// defines it, and the seam module that carries it. Nothing else can
+/// build one — the type has all-private fields and exactly ONE struct
+/// literal in the crate (both asserted below) — so this list is about
+/// who may HOLD a handle, and it is short on purpose.
+///
+/// `src/llm.rs` is deliberately NOT here: a client carries the opaque
+/// `decision_seams::DecisionSeams`, never the handle itself.
+const HANDLE_CARRIERS: &[&str] = &["src/decision_boot.rs", "src/decision_seams.rs"];
 
 fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
     let entries = fs::read_dir(dir).unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()));
@@ -301,6 +353,7 @@ fn every_decider_comes_from_the_boot_chokepoint_3806() {
     let mut allowed_hits = 0usize;
     let mut named_by: Vec<String> = Vec::new();
     let mut chokepoint_callers: Vec<String> = Vec::new();
+    let mut attach_callers: Vec<String> = Vec::new();
     let mut handle_sites: Vec<String> = Vec::new();
 
     for path in &files {
@@ -330,6 +383,15 @@ fn every_decider_comes_from_the_boot_chokepoint_3806() {
                 .any(|l| l.contains(CHOKEPOINT_TOKEN))
         {
             chokepoint_callers.push(rel.clone());
+        }
+
+        if rel != CHOKEPOINT_CALLERS[0]
+            && body
+                .lines()
+                .filter(|l| is_code_line(l))
+                .any(|l| l.contains(ATTACH_TOKEN))
+        {
+            attach_callers.push(rel.clone());
         }
 
         if body.contains(HANDLE_TYPE) {
@@ -384,13 +446,34 @@ fn every_decider_comes_from_the_boot_chokepoint_3806() {
          is a surface that lost its gate."
     );
 
-    // ABSENCE (c) — one home for the handle type, which is what keeps
-    // 'private fields, no public constructor' enforceable.
+    // ABSENCE (b2) + PRESENCE (b2) — the attachment verb, both ways.
+    // This is the W1b ruling's acceptance item made mechanical: every
+    // surface that can reach a decider obtains it from the chokepoint,
+    // and the set of such surfaces is a reviewed list.
+    attach_callers.sort();
+    let mut expected_attach: Vec<String> =
+        ATTACH_CALLERS.iter().map(|s| (*s).to_string()).collect();
+    expected_attach.sort();
     assert_eq!(
-        handle_sites,
-        vec![CHOKEPOINT_HOME.to_string()],
-        "the gated handle type must be named only by the chokepoint \
-         that defines it; a second file naming it is a second door"
+        attach_callers, expected_attach,
+        "exactly these surfaces may obtain a gated decider. A surface \
+         that APPEARED is a new decision consumer nobody reviewed; one \
+         that VANISHED stopped running the boot chokepoint, and took \
+         its capability snapshot and its signed refusal row with it."
+    );
+
+    // ABSENCE (c) — a short, reviewed list of files may NAME the handle
+    // type, which is what keeps 'private fields, no public constructor'
+    // enforceable rather than merely true today.
+    handle_sites.sort();
+    let mut expected_handle: Vec<String> =
+        HANDLE_CARRIERS.iter().map(|s| (*s).to_string()).collect();
+    expected_handle.sort();
+    assert_eq!(
+        handle_sites, expected_handle,
+        "only the chokepoint that defines the gated handle and the seam \
+         module that carries it may name it; a third file naming it is a \
+         third door"
     );
 
     assert_handle_is_unforgeable();

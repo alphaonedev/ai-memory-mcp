@@ -94,6 +94,22 @@ pub enum DecisionFallback {
     Refuse,
 }
 
+/// The config key the `fallback` diagnostics name.
+const FALLBACK_KEY: &str = "[decision].fallback";
+
+/// Render `[decision].fallback = "<value>"` — the phrase three
+/// production diagnostics quote.
+///
+/// One home since #3806 W2: the seam's `refuse` error, the client
+/// factory's "no generative backend to fall back to" error and the boot
+/// chokepoint's fallback-bind warning all name this key and its value,
+/// and a magic string repeated on three production sites is exactly what
+/// the pm-v3.1 literal gate exists to stop.
+#[must_use]
+pub(crate) fn fallback_phrase(fallback: DecisionFallback) -> String {
+    format!("{FALLBACK_KEY} = \"{}\"", fallback.as_str())
+}
+
 impl DecisionFallback {
     /// The canonical config / metrics token.
     #[must_use]

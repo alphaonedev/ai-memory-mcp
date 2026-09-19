@@ -74,7 +74,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::AppConfig;
 use crate::decision::{AbstainReason, DecisionProvider, decider_or_null};
-use crate::decision_config::{DecisionFallback, ResolvedDecision, resolve_decision};
+use crate::decision_config::{
+    DecisionFallback, ResolvedDecision, fallback_phrase, resolve_decision,
+};
 use crate::egress::{EgressClass, EgressDecision, InferenceEgressMode, evaluate_inference_egress};
 
 /// The CLOSED vocabulary for the decision-provider boot state.
@@ -361,6 +363,135 @@ impl DecisionProviderHandle {
         self.provider = Some(provider);
         self
     }
+
+    /// #3806 W2 — build and attach the CLIENT this handle's own
+    /// resolution implies.
+    ///
+    /// The chokepoint owns construction end to end:
+    /// [`crate::decision_clients::construct`] is handed the
+    /// already-resolved, already-egress-gated section that only this
+    /// module holds, plus a per-call outbound hook bound to the endpoint
+    /// the boot gate APPROVED — so "the URL the gate approved is the URL
+    /// the client POSTs to" is enforced rather than assumed.
+    ///
+    /// `generative` is the `[llm]` client the `fallback = "generative"`
+    /// leg delegates to. It must NOT be the client this handle is then
+    /// attached to; pass a retarget (see
+    /// [`crate::decision_seams::attach_decider`], the only caller).
+    ///
+    /// On failure the handle is returned UNCHANGED — still answering
+    /// through [`crate::decision::NullDecider`], so every seam abstains
+    /// rather than receiving a fabricated verdict — and the
+    /// `/capabilities` snapshot is corrected from `constructed` to
+    /// `configured`, because a handle with no client is not a
+    /// constructed provider and must not claim to be one.
+    #[must_use]
+    pub fn attach_client(
+        self,
+        generative: Option<Arc<crate::llm::OllamaClient>>,
+        generative_endpoint: &str,
+    ) -> Self {
+        let secondary = match (self.resolved.fallback, generative) {
+            (DecisionFallback::Generative, Some(client)) => {
+                // The fallback leg POSTs to the `[llm]` endpoint and
+                // ONLY there, so that endpoint is the WHOLE of its
+                // approved set — not the decision endpoint, which this
+                // client must never reach. `[llm]` passed its own #1963
+                // boot gate at construction; the decision lane's LIVE
+                // posture is still consulted before every call.
+                match crate::decision_clients::fallback::GenerativeFallbackDecider::new(
+                    client,
+                    generative_endpoint,
+                    self.outbound_check(&[generative_endpoint]),
+                    self.resolved.timeout(),
+                ) {
+                    Ok(decider) => Some(decider),
+                    Err(_) => {
+                        // Our own text only: the error carries the [llm]
+                        // endpoint, which is not ours to log here.
+                        tracing::warn!(
+                            "could not bind the [llm] endpoint for {}; construction will \
+                             refuse rather than answer without the fallback the operator \
+                             asked for (#3806)",
+                            fallback_phrase(DecisionFallback::Generative)
+                        );
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+        // The PRIMARY client POSTs to the gated decision endpoint and
+        // only there.
+        let outbound = self.outbound_check(&[self.resolved.base_url.as_str()]);
+        match crate::decision_clients::construct(&self.resolved, outbound, secondary) {
+            Ok(provider) => self.with_provider(Arc::from(provider)),
+            Err(e) => {
+                tracing::warn!(
+                    "[decision] endpoint passed the egress gate but its client could not be \
+                     constructed; EVERY seam will abstain and the capability surface reports \
+                     `configured`, not `constructed` (#3806): {e:#}"
+                );
+                record_client_attach_failure(&self.resolved);
+                self
+            }
+        }
+    }
+
+    /// The per-call egress hook handed to every client this handle
+    /// builds.
+    ///
+    /// Two conditions, both of which must hold before a socket is
+    /// opened:
+    ///
+    /// 1. the request URL's ORIGIN is one of `approved` — so a
+    ///    mis-joined path, a redirected base or a future client bug
+    ///    cannot send memory content to an endpoint no gate ever saw;
+    /// 2. the LIVE decision posture still permits this provider, so a
+    ///    posture tightened after boot takes effect without a restart.
+    ///
+    /// `approved` is ONE origin per client: the gated decision endpoint
+    /// for the primary, the `[llm]` endpoint for the generative fallback
+    /// leg. Neither client is ever handed the other's.
+    fn outbound_check(&self, approved: &[&str]) -> crate::decision_clients::OutboundCheck {
+        let approved: Vec<String> = approved
+            .iter()
+            .map(|url| crate::url_display::url_origin(url))
+            .collect();
+        let guard = self.guard.clone();
+        Arc::new(move |url: &reqwest::Url| {
+            let origin = crate::url_display::url_origin(url.as_str());
+            if !approved.iter().any(|a| *a == origin) {
+                anyhow::bail!(
+                    "the decision request target is not an endpoint the egress gate \
+                     approved; refusing to send (#3806)"
+                );
+            }
+            // Our own reason string, never the vendor's text and never
+            // the URL (#3648 / #3688).
+            guard
+                .check_outbound()
+                .map_err(|refusal| anyhow::anyhow!("{}", refusal.reason()))
+        })
+    }
+}
+
+/// Correct the `/capabilities` snapshot when a GATED handle could not
+/// obtain a client.
+///
+/// The egress decision already happened and is unchanged; what changes
+/// is the honest state of the provider. Reported as `configured` — a
+/// section exists, no provider answers — which is exactly what a seam
+/// will observe.
+fn record_client_attach_failure(resolved: &ResolvedDecision) {
+    let egress_mode = boot_report().map(|r| r.egress_mode).unwrap_or_default();
+    record(Some(DecisionBootReport {
+        state: DecisionProviderState::Configured,
+        provider: resolved.provider.clone(),
+        model: resolved.model.clone(),
+        local: resolved.is_local(),
+        egress_mode,
+    }));
 }
 
 /// What the boot chokepoint decided.

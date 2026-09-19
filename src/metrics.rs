@@ -145,6 +145,35 @@ pub struct Metrics {
     pub curator_cycles_total: IntCounter,
     pub curator_operations_total: IntCounterVec,
     pub curator_cycle_duration_seconds: HistogramVec,
+    /// #3806 W2 — latency of ONE `[decision]` provider call, labeled by
+    /// `seam` (the preregistered `CalibrationSeam` vocabulary). Children
+    /// are created by the first observation, so a deployment with no
+    /// `[decision]` section exposes none of this series.
+    pub decision_latency_seconds: HistogramVec,
+    /// #3806 W2 — outcome of ONE `[decision]` provider call, labeled by
+    /// `seam` and a CLOSED `outcome` set
+    /// (`decided|fallback|timeout|egress_refused|abstained`). An abstain
+    /// is a first-class answer here, so "no opinion" is never
+    /// indistinguishable from a decided verdict. Cardinality is bounded
+    /// by construction: 4 seams x 5 outcomes.
+    pub decision_outcome_total: IntCounterVec,
+    /// #3806 W2 — WHY a `[decision]` call produced no verdict, labeled by
+    /// `seam` and the `AbstainReason` wire token.
+    ///
+    /// A separate series from `decision_outcome_total` on purpose, and
+    /// the two answer different questions. `decision_outcome_total`
+    /// answers "did the seam get a decision?" — at that level an
+    /// unreachable endpoint and a model that declined are both simply
+    /// `abstained`, and that vocabulary is CLOSED. This series answers
+    /// "why not?", where `unavailable` (the endpoint was down) and
+    /// `unusable` (the model answered and declined) are different events
+    /// an operator alerts on differently: the first is an outage, the
+    /// second is the feature working as designed.
+    ///
+    /// Without this series that distinction would exist only in the
+    /// type, and a distinction an operator cannot see is not one they
+    /// can act on.
+    pub decision_abstain_total: IntCounterVec,
     /// Ultrareview #343: count of post-quorum fanout tasks whose
     /// outcome could not be observed (shutdown, panic, or the
     /// spawned task erred). Non-zero indicates mesh divergence risk.
@@ -1475,6 +1504,45 @@ impl Metrics {
             return Err(e);
         }
 
+        let decision_latency_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "ai_memory_decision_latency_seconds",
+                "Latency in seconds of one [decision] provider call, labeled by seam \
+                 (#3806).",
+            )
+            .buckets(vec![0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5]),
+            &["seam"],
+        )?;
+        registry.register(Box::new(decision_latency_seconds.clone()))?;
+
+        let decision_outcome_total = IntCounterVec::new(
+            prometheus::Opts::new(
+                "ai_memory_decision_outcome_total",
+                "Outcomes of [decision] provider calls, labeled by seam and a closed \
+                 outcome set: decided|fallback|timeout|egress_refused|abstained. \
+                 'abstained' is a first-class answer, not a failure: it means the \
+                 seam took its conservative non-action branch rather than acting on \
+                 an unparseable one (#3806).",
+            ),
+            &["seam", "outcome"],
+        )?;
+        registry.register(Box::new(decision_outcome_total.clone()))?;
+
+        let decision_abstain_total = IntCounterVec::new(
+            prometheus::Opts::new(
+                "ai_memory_decision_abstain_total",
+                "Why a [decision] call produced no verdict, labeled by seam and the \
+                 closed AbstainReason set: no_provider|timeout|egress_refused|\
+                 unavailable|unusable|unsupported. `unavailable` is an OUTAGE (the \
+                 endpoint could not be reached, or did not answer with a decision \
+                 response); `unusable` is the model ANSWERING and declining, which is \
+                 the feature working as designed. Alert on the first, not the second \
+                 (#3806).",
+            ),
+            &["seam", "reason"],
+        )?;
+        registry.register(Box::new(decision_abstain_total.clone()))?;
+
         Ok(Self {
             registry,
             store_total,
@@ -1494,6 +1562,9 @@ impl Metrics {
             curator_cycles_total,
             curator_operations_total,
             curator_cycle_duration_seconds,
+            decision_latency_seconds,
+            decision_outcome_total,
+            decision_abstain_total,
             federation_fanout_dropped_total,
             federation_fanout_retry_total,
             federation_partial_quorum_total,
@@ -1865,6 +1936,38 @@ pub fn record_store(tier: &str, ok: bool) {
         .store_total
         .with_label_values(&[tier, result])
         .inc();
+}
+
+/// #3806 W2 — record ONE `[decision]` seam call.
+///
+/// `seam` is the preregistered `CalibrationSeam` token and `outcome` is
+/// the closed five-value set, so the two series' cardinality is bounded
+/// by construction rather than by what a caller happens to pass. Both
+/// children are created LAZILY by the first call, which is half of
+/// "`[decision]` unset is byte-identical": an unconfigured deployment
+/// never reaches this function, so its `/metrics` body is unchanged.
+pub fn record_decision(
+    seam: &str,
+    outcome: &str,
+    abstain_reason: Option<&str>,
+    latency_seconds: f64,
+) {
+    registry()
+        .decision_latency_seconds
+        .with_label_values(&[seam])
+        .observe(latency_seconds);
+    registry()
+        .decision_outcome_total
+        .with_label_values(&[seam, outcome])
+        .inc();
+    // Only an abstain has a reason, so the "why not" series is exactly
+    // the abstains and never dilutes them with decisions.
+    if let Some(reason) = abstain_reason {
+        registry()
+            .decision_abstain_total
+            .with_label_values(&[seam, reason])
+            .inc();
+    }
 }
 
 /// Convenience: record a recall, labeled by mode + latency.

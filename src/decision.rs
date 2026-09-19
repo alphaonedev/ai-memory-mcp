@@ -101,8 +101,21 @@ pub enum AbstainReason {
     Timeout,
     /// The egress posture refused the outbound call.
     EgressRefused,
-    /// The endpoint answered, but the answer was not usable as a
-    /// decision (unparseable, out of the option set, out of range).
+    /// The provider could not be reached, or did not answer with a
+    /// decision RESPONSE at all: a connection failure, a TLS failure, a
+    /// non-2xx status, a body that is not the documented envelope.
+    ///
+    /// Distinct from [`Self::Unusable`] on purpose — see
+    /// [`Self::is_unavailable`]. The provider never formed an opinion
+    /// here, so a seam may legitimately fall back to whatever
+    /// instrument it used before.
+    Unavailable,
+    /// The endpoint ANSWERED, and its answer was not a decision: a
+    /// refusal, a preamble, a hedge, a value outside the closed option
+    /// set, a score outside the range.
+    ///
+    /// This is the DECLINE, and it is the only one. It is terminal: see
+    /// [`Self::is_unavailable`].
     Unusable,
     /// The provider cannot answer this question at all (e.g. a local
     /// NLI cross-encoder asked for a continuous score).
@@ -117,9 +130,42 @@ impl AbstainReason {
             Self::NoProvider => "no_provider",
             Self::Timeout => "timeout",
             Self::EgressRefused => "egress_refused",
+            Self::Unavailable => "unavailable",
             Self::Unusable => "unusable",
             Self::Unsupported => "unsupported",
         }
+    }
+}
+
+impl AbstainReason {
+    /// Whether the provider NEVER ANSWERED — so a seam's `fallback`
+    /// applies — rather than ANSWERED AND DECLINED, which is terminal.
+    ///
+    /// **Conductor ruling, #3806 W2 (2026-09-19), in three cases:**
+    ///
+    /// 1. `[decision]` UNSET — the v1.0.0 path runs entirely, text parse
+    ///    and all. The feature is off; that is what byte-identical means.
+    /// 2. `[decision]` SET, provider UNAVAILABLE — no provider
+    ///    constructed, egress refused, timeout, transport error. This is
+    ///    what `fallback` governs: `generative` means the old path,
+    ///    `abstain` means abstain, `refuse` means error. The provider
+    ///    never answered, so falling back to the previous instrument is
+    ///    legitimate.
+    /// 3. `[decision]` SET, provider ABSTAINED — the provider DID
+    ///    answer, and its answer was "I decline". **That is terminal.**
+    ///    The seam takes its conservative branch and the question is
+    ///    never re-asked. `fallback` does not apply, because there is
+    ///    nothing to fall back FROM.
+    ///
+    /// Case 3 is why this predicate exists rather than a comment. An
+    /// abstain is information, not an absence of information; re-asking
+    /// the same question of a weaker reader manufactures a definite
+    /// answer out of a deliberate refusal, which is how a system learns
+    /// to be confidently wrong. [`Self::Unusable`] is the only DECLINE,
+    /// and everything else is unavailability.
+    #[must_use]
+    pub fn is_unavailable(self) -> bool {
+        !matches!(self, Self::Unusable)
     }
 }
 

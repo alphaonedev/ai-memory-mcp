@@ -51,7 +51,7 @@
 use crate::config::{is_recognized_llm_backend, unrecognized_llm_backend_error};
 use anyhow::{Context, Result, anyhow};
 use serde_json::{Value, json};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 pub(crate) const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434";
@@ -852,7 +852,11 @@ factual assertion; 'event' for a time-bounded happening; 'observation' for a \
 neutral note or a question. When unsure, reply 'observation'.";
 
 /// Build the per-memory classification user prompt (#1393).
-fn classify_kind_prompt(title: &str, content: &str) -> String {
+///
+/// `pub(crate)` since #3806 W2: the decision seam asks the SAME question
+/// of the decision model, so the prompt has one home rather than two
+/// that can drift.
+pub(crate) fn classify_kind_prompt(title: &str, content: &str) -> String {
     format!("Title: {title}\nContent: {content}\n\nKind:")
 }
 
@@ -1105,9 +1109,31 @@ pub struct OllamaClient {
     /// dim. Ignored by the Ollama-native wire shape. Set via
     /// [`Self::with_embed_dimensions`]; `None` = model-native dim.
     embed_dimensions: Option<u32>,
+    /// #3806 W2 — the GATED decision seams this client's two decision
+    /// call positions consult, or `None` when `[decision]` is unset (or
+    /// the boot chokepoint refused to build a provider), in which case
+    /// both seams run their v1.0.0 bodies byte-identically.
+    ///
+    /// Only `crate::decision_seams::attach_decider` ever sets this, and
+    /// it obtains the handle inside from the boot chokepoint and nowhere
+    /// else, so a client cannot acquire an ungated decision endpoint.
+    decider: Option<Arc<crate::decision_seams::DecisionSeams>>,
 }
 
 impl OllamaClient {
+    /// #3806 W2 — attach the gated decision seams. See
+    /// [`crate::decision_seams::attach_decider`], the only caller.
+    #[must_use]
+    pub(crate) fn with_decider(mut self, seams: Arc<crate::decision_seams::DecisionSeams>) -> Self {
+        self.decider = Some(seams);
+        self
+    }
+
+    /// The attached decision seams, if any.
+    pub(crate) fn decider(&self) -> Option<&crate::decision_seams::DecisionSeams> {
+        self.decider.as_deref()
+    }
+
     /// v0.7.0 (issue #1244) — accessor for the resolved model name.
     ///
     /// Returns the model identifier the client was constructed with
@@ -1136,6 +1162,13 @@ impl OllamaClient {
             client: self.client.clone(),
             breaker: Mutex::new(BreakerState::new()),
             embed_dimensions: self.embed_dimensions,
+            // #3806 W2 — DELIBERATELY not copied. The generative
+            // fallback decider holds an `Arc` to a retarget of this
+            // client, so copying the attachment here would close the
+            // cycle client -> seams -> handle -> chain -> decider ->
+            // client. Not copying makes the cycle unrepresentable
+            // rather than avoided by call order.
+            decider: None,
         }
     }
 
@@ -1175,6 +1208,7 @@ impl OllamaClient {
                 .expect("test reqwest client builds"),
             breaker: Mutex::new(BreakerState::new()),
             embed_dimensions: None,
+            decider: None,
         }
     }
 
@@ -1498,6 +1532,7 @@ impl OllamaClient {
             client,
             breaker: Mutex::new(BreakerState::new()),
             embed_dimensions: None,
+            decider: None,
         })
     }
 
@@ -1585,6 +1620,7 @@ impl OllamaClient {
             client,
             breaker: Mutex::new(BreakerState::new()),
             embed_dimensions: None,
+            decider: None,
         })
     }
 
@@ -2354,6 +2390,14 @@ impl OllamaClient {
         title: &str,
         content: &str,
     ) -> Result<Option<crate::models::MemoryKind>> {
+        // #3806 W2 — the DECISION seam. With no decider attached
+        // (`[decision]` unset) this is `RunLegacy` and the v1.0.0 body
+        // below runs byte-identically, prompt and parse included.
+        match crate::decision_seams::classify_kind(self, title, content)? {
+            crate::decision_seams::SeamOutcome::Decided(kind) => return Ok(Some(kind)),
+            crate::decision_seams::SeamOutcome::Conservative => return Ok(None),
+            crate::decision_seams::SeamOutcome::RunLegacy => {}
+        }
         let out = self.generate(
             &classify_kind_prompt(title, content),
             Some(CLASSIFY_KIND_SYSTEM),
@@ -3140,6 +3184,17 @@ impl OllamaClient {
         let prompt = CONTRADICTION_PROMPT
             .replace("{a}", mem_a)
             .replace("{b}", mem_b);
+
+        // #3806 W2 — the DECISION seam. A decider answers from a
+        // strictly parsed closed vocabulary, so a refusal, a preamble or
+        // a hedge is an ABSTAIN. The loose parse below is reachable ONLY
+        // when `[decision]` is unset, where it is the v1.0.0 behaviour
+        // this unit must not change.
+        match crate::decision_seams::judge_contradiction(self, &prompt).await? {
+            crate::decision_seams::SeamOutcome::Decided(verdict) => return Ok(verdict),
+            crate::decision_seams::SeamOutcome::Conservative => return Ok(false),
+            crate::decision_seams::SeamOutcome::RunLegacy => {}
+        }
 
         let response = self.generate_async(&prompt, None).await?;
         let answer = response.trim().to_lowercase();

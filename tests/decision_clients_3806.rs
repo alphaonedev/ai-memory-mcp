@@ -221,7 +221,11 @@ async fn a_malformed_or_off_vocabulary_answer_abstains_as_unusable() {
     }
 
     // A non-2xx status is likewise an abstain, not an error a seam could
-    // coerce.
+    // coerce — but it is UNAVAILABILITY, not a decline (#3806 W2
+    // Conductor ruling case 2): the endpoint was reachable and the MODEL
+    // never answered, so a seam may still fall back to the instrument it
+    // used before. The prose cases above are the contrast: there the
+    // model DID answer, which is terminal.
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path(CHAT_PATH))
@@ -236,7 +240,17 @@ async fn a_malformed_or_off_vocabulary_answer_abstains_as_unusable() {
     );
     let decider = OpenAiCompatibleDecider::new(&resolved, permit()).expect("constructs");
     let judgement = decider.judge("do these two records conflict?").await;
-    assert_eq!(judgement.abstain_reason(), Some(AbstainReason::Unusable));
+    assert_eq!(
+        judgement.abstain_reason(),
+        Some(AbstainReason::Unavailable),
+        "a 500 is the endpoint failing, not the model declining"
+    );
+    assert!(
+        judgement
+            .abstain_reason()
+            .is_some_and(AbstainReason::is_unavailable),
+        "and it must classify as UNAVAILABLE, which is what lets `fallback` apply"
+    );
     assert_eq!(judgement.verdict(), None);
 }
 
@@ -591,8 +605,12 @@ async fn the_factory_routes_refuses_and_never_routes_around_an_egress_refusal() 
         "a generative fallback with no generative backend must refuse"
     );
 
-    // PRESENCE: an UNUSABLE primary does fall back, and the generative
-    // endpoint is reached.
+    // ABSENCE (#3806 W2, Conductor ruling case 3): a primary that
+    // ANSWERED AND DECLINED is TERMINAL. `decision_endpoint` returns
+    // prose, which is a decline, and the chain must NOT re-ask a second
+    // model — re-asking manufactures a definite answer out of a
+    // deliberate refusal. This assertion was the opposite before the
+    // ruling, and it is the behaviour change W2 carries.
     let chained = construct(
         &wants_fallback,
         permit(),
@@ -602,11 +620,49 @@ async fn the_factory_routes_refuses_and_never_routes_around_an_egress_refusal() 
     let judgement = chained.judge("do these two records conflict?").await;
     assert_eq!(
         judgement.verdict(),
+        None,
+        "a DECLINE is terminal: the chain must not turn it into a verdict"
+    );
+    assert_eq!(judgement.abstain_reason(), Some(AbstainReason::Unusable));
+    assert_eq!(
+        hits(&generative_endpoint).await,
+        0,
+        "a declined question is never re-asked, so no second model call happens"
+    );
+
+    // PRESENCE control on the SAME sink: an UNAVAILABLE primary (the
+    // endpoint answers 503 — reachable, but the model never answered)
+    // DOES fall back, and the generative endpoint is reached exactly
+    // once. So the absence above is a property of the DECLINE, not of a
+    // chain that never falls back.
+    let dead_endpoint = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&dead_endpoint)
+        .await;
+    let unavailable = resolve_for(
+        "openai-compatible",
+        &dead_endpoint.uri(),
+        2,
+        DecisionFallback::Generative,
+    );
+    let generative_after_outage = MockServer::start().await;
+    mount_chat(&generative_after_outage, chat_body("yes", None)).await;
+    let chained = construct(
+        &unavailable,
+        permit(),
+        Some(generative_for(&generative_after_outage, 5)),
+    )
+    .expect("chain constructs");
+    let judgement = chained.judge("do these two records conflict?").await;
+    assert_eq!(
+        judgement.verdict(),
         Some(true),
-        "an unusable primary must hand off to the fallback"
+        "an UNAVAILABLE primary must hand off to the fallback"
     );
     assert_eq!(judgement.source(), DecisionSource::GenerativeFallback);
-    assert_eq!(hits(&generative_endpoint).await, 1);
+    assert_eq!(hits(&generative_after_outage).await, 1);
 
     // ABSENCE, the invariant that matters: an EGRESS REFUSAL is never
     // routed around. The generative endpoint must not be touched.

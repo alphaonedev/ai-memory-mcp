@@ -125,6 +125,29 @@ fn build_curator_llm(
     tier: config::FeatureTier,
     db_path: &std::path::Path,
 ) -> Option<llm::OllamaClient> {
+    // #3806 W2 — the CLI ONE-SHOT surface goes through the SAME boot
+    // chokepoint as the daemon and the MCP stdio surface. `classify_kind`
+    // is a seam this surface owns (the transcript-classify pass), so a
+    // decider must be obtainable here — and obtainable ONLY here, from
+    // the chokepoint. The chokepoint runs whether or not the `[llm]`
+    // client below was built, so the `/capabilities` snapshot and the
+    // signed egress-refusal row are recorded on this surface too.
+    let app_config = config::AppConfig::load();
+    crate::decision_seams::attach_decider(
+        build_curator_llm_inner(tier, db_path, &app_config),
+        &app_config,
+        db_path,
+    )
+}
+
+/// The `[llm]` half of [`build_curator_llm`]. Split out so the decision
+/// chokepoint above runs on EVERY return path, including the two that
+/// disable the client.
+fn build_curator_llm_inner(
+    tier: config::FeatureTier,
+    db_path: &std::path::Path,
+    app_config: &config::AppConfig,
+) -> Option<llm::OllamaClient> {
     // v0.7.x (#1146) — route through the canonical resolver. Two
     // short-circuits preserve pre-#1146 semantics:
     //   1. Tiers with no `llm_model` preset (Keyword, Semantic) AND
@@ -136,7 +159,6 @@ fn build_curator_llm(
     //   2. With operator intent, the resolver folds CLI / env /
     //      config / legacy / compiled through the uniform precedence
     //      ladder.
-    let app_config = config::AppConfig::load();
     let resolved = app_config.resolve_llm(None, None, None);
     if matches!(resolved.source, config::ConfigSource::CompiledDefault)
         && tier.config().llm_model.is_none()
