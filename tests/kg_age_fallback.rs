@@ -306,7 +306,7 @@ const AGE_GRAPH: &str = "memory_graph";
 
 /// Prove, on a FRESH session, that AGE is usable again the way a later
 /// test binary will use it: the extension row is back in `pg_extension`,
-/// `LOAD` + the `ag_catalog` search_path resolve, `memory_graph` is in
+/// `LOAD` + the `ag_catalog` `search_path` resolve, `memory_graph` is in
 /// `ag_catalog.ag_graph`, and a cypher round trip against it answers.
 /// Any miss is an `Err` naming the missing piece — the caller turns it
 /// into a panic, because a restore that silently left the database
