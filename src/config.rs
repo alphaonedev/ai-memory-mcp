@@ -2869,6 +2869,12 @@ const CONFIG_APP_DIR: &str = "ai-memory";
 const LEGACY_CONFIG_DIR: &str = ".config/ai-memory";
 const CONFIG_FILE: &str = "config.toml";
 
+/// The HuggingFace hub cache directory-name segment: `$HOME/.cache/`**`huggingface`**`/hub`
+/// (or `$HF_HOME/hub`). Named here so `src/embeddings.rs` — outside the
+/// vendor-literal allowlist — reads it as `crate::config::HF_CACHE_DIR_NAME`
+/// instead of an inline `"huggingface"` literal (#3820 / pm-v3.1 vendor-monoculture).
+pub const HF_CACHE_DIR_NAME: &str = "huggingface";
+
 /// `sysexits.h` `EX_CONFIG` — the process exit code this binary uses for
 /// "the operator's configuration is unusable; nothing was started".
 ///

@@ -1889,7 +1889,7 @@ impl Embedder {
                 let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
                 std::path::PathBuf::from(home)
                     .join(".cache")
-                    .join("huggingface")
+                    .join(crate::config::HF_CACHE_DIR_NAME)
                     .join("hub")
             }
         };
