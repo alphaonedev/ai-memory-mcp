@@ -244,7 +244,7 @@ pub fn handle_skill_get(conn: &Connection, params: &Value) -> Result<Value, Stri
             "SELECT resource_path, resource_kind FROM skill_resources \
              WHERE skill_id = ?1 ORDER BY resource_path",
         )
-        .map_err(|e| format!("resources prepare: {e}"))?;
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("resources prepare", e))?;
 
     let resources: Vec<Value> = res_stmt
         .query_map([&id], |row| {
@@ -253,7 +253,7 @@ pub fn handle_skill_get(conn: &Connection, params: &Value) -> Result<Value, Stri
                 "kind": row.get::<_, String>(1)?,
             }))
         })
-        .map_err(|e| format!("resources query: {e}"))?
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("resources query", e))?
         .filter_map(|r| r.ok())
         .collect();
 

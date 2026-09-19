@@ -124,12 +124,12 @@ const SQL_LIST_BASE: &str = "SELECT * FROM memories WHERE (expires_at IS NULL OR
 // OF ORDER BY" — a bounded per-tie-block sort, NOT a full "FOR ORDER BY" sort).
 const SQL_LIST_ORDER_LIMIT: &str =
     " ORDER BY priority DESC, updated_at DESC, id ASC LIMIT ? OFFSET ?";
-// v1.0.0 #3463 — the unread narrowing fragment. A bare, parameter-free
-// equality so the planner can serve it directly; appended by
-// `build_list_query` ONLY when the caller asks for unread-only, and always
-// BEFORE `SQL_LIST_ORDER_LIMIT` so it narrows the set the `LIMIT` then pages
-// (the pre-fix inbox filtered AFTER the limit, in Rust).
-const SQL_FRAGMENT_AND_UNREAD: &str = " AND access_count = 0";
+// #3730 — there is no unread narrowing fragment any more. `access_count`
+// counts TOUCHES (recall + fold); it never meant HANDLED, and the inbox no
+// longer derives one from the other. #3463 pushed `AND access_count = 0`
+// into this builder so the narrowing ran before `LIMIT`; retiring the axis
+// dissolves that problem rather than reverting the fix — with no read rows to
+// hide, there is nothing for the limit to be spent on.
 
 /// v0.7.0 H6 (round-2) — truncate a `DateTime<Utc>` to microsecond
 /// precision. Companion of the same-named helper in
@@ -412,7 +412,10 @@ fn emit_why_trace_signal(mem: &Memory, refused: bool) {
             disposition,
             "covenant.why_trace",
             REQUIRE_WHY_TRACE_ENV,
-            serde_json::json!({ "title": mem.title, "namespace": mem.namespace }),
+            // #3647 — the title is tenant content: commitment only.
+            crate::governance::audit::ForensicPayload::new()
+                .commit("title", &mem.title)
+                .ident("namespace", &mem.namespace),
         );
     }
 }
@@ -558,10 +561,9 @@ pub fn consult_authorship_immutable_gate(
             disposition,
             "covenant.authorship_immutable",
             REQUIRE_IMMUTABLE_AUTHORSHIP_ENV,
-            serde_json::json!({
-                "existing_agent_id": existing_id,
-                "attempted_agent_id": incoming_id,
-            }),
+            crate::governance::audit::ForensicPayload::new()
+                .ident("existing_agent_id", existing_id)
+                .ident("attempted_agent_id", incoming_id),
         );
         return Err(anyhow::Error::new(GovernanceRefusal {
             reason: format!(
@@ -866,12 +868,18 @@ mod doctor;
 /// reconciles what the FTS5 + ANN recall indexes cover against the
 /// `memories` table so recall can report its coverage honestly.
 pub mod embed_skip;
+/// v1.0.0 #3288 — sqlite half of the bounded, keyset-paged admin export.
+pub mod export_page;
 pub mod index_coverage;
 /// #1965 [P1] — corpus-lifecycle EXPIRE / EVICT / DISTILL contract: the
 /// spec + scoring layer that names the three bounded-growth transitions and
 /// classifies which one a candidate is under (mirrors the live gc / size_gc
 /// / consolidation triggers; changes no eviction behaviour).
 pub mod lifecycle;
+/// v1.0.0 (#3435) — the ORDER-INDEPENDENT acyclicity verdict a bulk lineage
+/// import (`migrate` / `sync`) asserts ONCE over the complete final graph,
+/// in place of the per-write wall-clock guard those imports bypass.
+pub mod lineage_import;
 pub mod lockout;
 pub mod migration_meta;
 pub mod migrations;
@@ -899,18 +907,23 @@ pub mod schema_integrity;
 /// accounting SQLite then skips, so every surface that asks "is this database
 /// sound?" gets the same fail-closed answer.
 pub mod sqlite_integrity;
+/// v1.0.0 #3675 — moves a `sync_state` row keyed by a RAW (credential-bearing)
+/// peer URL onto its allowlist-rendered key, cursors preserved, raw row deleted.
+pub mod sync_state_rekey;
 
 // #1802 S1 — itemized re-export shim for the extracted doctor module
 // (M-NO-GLOB-REEXPORTS: explicit list, so any accidental visibility
 // widening or loss is visible in review).
 pub use doctor::{
-    CapabilityExpansionRow, ReflectionDepthRow, count_active_governance_rules,
-    count_pending_actions_by_status, count_subscriptions, doctor_dim_violations,
-    doctor_governance_coverage, doctor_governance_depth_distribution, doctor_max_sync_skew_secs,
-    doctor_oldest_pending_age_secs, doctor_reflection_depth_distribution,
-    doctor_reflection_depth_exceeded_count, doctor_reflection_totals_by_namespace,
-    doctor_webhook_delivery_totals, is_namespace_standard, list_active_governance_policies,
-    list_capability_expansions, record_capability_expansion, sweep_pending_action_timeouts,
+    CapabilityExpansionRow, ReflectionDepthRow, SyncPeerWatermark, SyncWatermarks,
+    WEBHOOK_AUDIT_SETTLE_SECS, count_active_governance_rules, count_pending_actions_by_status,
+    count_subscriptions, doctor_dim_violations, doctor_governance_coverage,
+    doctor_governance_depth_distribution, doctor_oldest_pending_age_secs,
+    doctor_reflection_depth_distribution, doctor_reflection_depth_exceeded_count,
+    doctor_reflection_totals_by_namespace, doctor_sync_peer_watermarks,
+    doctor_webhook_audit_pending, doctor_webhook_delivery_totals, is_namespace_standard,
+    list_active_governance_policies, list_capability_expansions, record_capability_expansion,
+    sweep_pending_action_timeouts,
 };
 
 // Re-exports — every `pub` item that previously lived in `src/db.rs`
@@ -1292,7 +1305,11 @@ fn row_to_memory_with_policy(
                     crate::metrics::record_corrupt_provenance(field_names::ENCRYPTED_ENVELOPE);
                     return Ok(None);
                 }
-                return Err(undecryptable_row_error(format!("decrypt failed: {e}")));
+                // #3718 — an ABSENT key renders as its class, never as a
+                // wrong-recipient "decrypt failed", and never with a path.
+                return Err(undecryptable_row_error(
+                    crate::encryption::read_failure_detail(&e),
+                ));
             }
         }
     }
@@ -1435,15 +1452,71 @@ impl UpsertSeal {
 /// Cost: ONE indexed lookup, and ONLY when at-rest encryption is enabled —
 /// the default path returns the incoming id without touching the connection,
 /// so an encryption-off deployment is byte-identical to pre-#2383.
+/// #3718 (review) — seal `content` for `agent_id` WITHOUT forking the key
+/// generation. When at-rest encryption is on and no live key is loadable for
+/// `agent_id`, the seal path is the one place a key may be minted — but only
+/// for a genuinely fresh agent. An agent that already has sealed rows
+/// (`encrypted_envelope IS NOT NULL`) and no key has LOST its key (or the
+/// key directory was wiped); minting a new one would strand every existing
+/// row behind a key nobody holds. This wrapper probes the sealed-row count
+/// for exactly that case and refuses with the typed
+/// [`crate::encryption::SealRefusedSealedRowsExist`] naming the count; the
+/// expected key path goes to the operator log. Every SQLite seal path goes
+/// through here — `crate::encryption::seal_content` is never called
+/// directly from this module or from the importer.
+///
+/// # Errors
+/// The sealed-rows refusal above, the key directory being unreadable, or the
+/// seal itself failing.
+pub(crate) fn seal_content_guarded(
+    conn: &Connection,
+    content: &str,
+    agent_id: &str,
+) -> Result<Option<(Vec<u8>, String)>> {
+    if crate::encryption::seal_would_mint(content, agent_id)? {
+        let sealed_rows = sealed_row_count_for_agent(conn, agent_id)?;
+        if sealed_rows > 0 {
+            return Err(crate::encryption::seal_refusal_for_sealed_rows(
+                agent_id,
+                sealed_rows,
+            ));
+        }
+    }
+    crate::encryption::seal_content(content, agent_id)
+}
+
+/// #3718 (review) — how many rows owned by `agent_id` are sealed at rest.
+/// The owner of an envelope is the row's `metadata.agent_id` (the id the
+/// content was keyed to — see [`retained_agent_id_for_upsert`]).
+///
+/// # Errors
+/// The count query fails.
+pub(crate) fn sealed_row_count_for_agent(conn: &Connection, agent_id: &str) -> Result<u64> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM memories \
+         WHERE encrypted_envelope IS NOT NULL \
+           AND json_extract(metadata, '$.agent_id') = ?1",
+        params![agent_id],
+        |r| r.get(0),
+    )?;
+    Ok(u64::try_from(n).unwrap_or(0))
+}
+
 fn retained_agent_id_for_upsert(conn: &Connection, mem: &Memory) -> Result<String> {
     let incoming = memory_agent_id(mem);
     if !crate::encryption::encryption_enabled(None) {
         return Ok(incoming.to_string());
     }
     use rusqlite::OptionalExtension;
+    // #3690 — the surviving row is the LIVE slot holder: a tombstone holds no
+    // slot (the v100 partial index excludes it), so its metadata must not
+    // pick the seal recipient for a row that will land BESIDE it.
     let existing_metadata: Option<String> = conn
         .query_row(
-            "SELECT metadata FROM memories WHERE title = ?1 AND namespace = ?2",
+            &format!(
+                "SELECT metadata FROM memories WHERE title = ?1 AND namespace = ?2 AND {}",
+                crate::models::TITLE_SLOT_INDEX_PREDICATE
+            ),
             params![mem.title, mem.namespace],
             |r| r.get(0),
         )
@@ -1459,8 +1532,12 @@ fn retained_agent_id_for_upsert(conn: &Connection, mem: &Memory) -> Result<Strin
         // rather than guessing here.
         return Ok(incoming.to_string());
     };
+    // #3626 — an UNSTAMPED surviving row retains NO owner after the merge
+    // (the arm drops the incoming id), so there is no recipient key: return
+    // the empty id and let the seal gate refuse fail-closed rather than seal
+    // to an identity the row will never carry.
     Ok(metadata_agent_id_slot(&parsed)
-        .unwrap_or(incoming)
+        .unwrap_or_default()
         .to_string())
 }
 
@@ -1472,7 +1549,7 @@ fn seal_content_for_upsert(conn: &Connection, mem: &Memory) -> Result<UpsertSeal
     // Fail-closed: an enabled gate over a row that will retain NO agent id
     // has no recipient key, and `seal_content` refuses rather than silently
     // storing plaintext.
-    let sealed = crate::encryption::seal_content(&mem.content, &sealed_under)?;
+    let sealed = seal_content_guarded(conn, &mem.content, &sealed_under)?;
     Ok(match sealed {
         Some((envelope, placeholder)) => UpsertSeal {
             content_to_store: placeholder,
@@ -1542,7 +1619,7 @@ fn reconcile_envelope_owner(
     // Re-seal the SAME plaintext under the retained identity. `seal_content`
     // fails closed when the retained id is empty, which rolls the enclosing
     // transaction back rather than leaving an unreadable row on disk.
-    let repaired = crate::encryption::seal_content(plaintext, &retained)?;
+    let repaired = seal_content_guarded(conn, plaintext, &retained)?;
     let Some((repaired_envelope, placeholder)) = repaired else {
         // Encryption was disabled between the seal and this check. Nothing
         // safe to write here; leave the row untouched and surface loudly.
@@ -1586,7 +1663,7 @@ const ENVELOPE_OWNER_RECONCILED_MSG: &str = "upsert-merge landed on a row that r
 /// and the `SELECT` would return the wrong row id. `SQLite` 3.35+
 /// supports `RETURNING`; it executes atomically within the `INSERT`.
 pub fn insert(conn: &Connection, mem: &Memory) -> Result<String> {
-    insert_inner(conn, mem, true, InsertConflictArm::Merge)
+    insert_inner(conn, mem, true, InsertConflictArm::Merge, None)
 }
 
 /// v1.0.0 #2771/#2887 — the `(title, namespace)` conflict-resolution arm the
@@ -1630,7 +1707,38 @@ pub enum InsertConflictArm {
 ///   already exists — the existing row is left byte-identical.
 /// * Otherwise identical to [`insert`].
 pub fn insert_no_overwrite(conn: &Connection, mem: &Memory) -> Result<String> {
-    insert_inner(conn, mem, true, InsertConflictArm::Refuse)
+    insert_inner(conn, mem, true, InsertConflictArm::Refuse, None)
+}
+
+/// #3696 — [`insert`] with the caller's READ-visibility identity: a
+/// `(title, namespace)` holder the `viewer` cannot read (another agent's
+/// `scope=private` row) is refused with a typed conflict that names NO row,
+/// exactly like a lifecycle-hidden one (`visibility::title_slot_admission`).
+/// `viewer` is the value the surface's read lanes resolve (MCP
+/// `identity::resolve_read_visibility_caller()`, HTTP the resolved request
+/// agent); `None` is the single-tenant trust-all posture [`insert`] keeps.
+///
+/// # Errors
+///
+/// As [`insert`], plus the typed [`ConflictError`] (empty `existing_id`) for
+/// a holder hidden from `viewer` on either axis.
+pub fn insert_as(conn: &Connection, mem: &Memory, viewer: Option<&str>) -> Result<String> {
+    insert_inner(conn, mem, true, InsertConflictArm::Merge, viewer)
+}
+
+/// #3696 — [`insert_no_overwrite`] with the caller's READ-visibility
+/// identity (see [`insert_as`]).
+///
+/// # Errors
+///
+/// As [`insert_no_overwrite`]; a holder hidden from `viewer` on either axis
+/// is the same typed, unnamed conflict.
+pub fn insert_no_overwrite_as(
+    conn: &Connection,
+    mem: &Memory,
+    viewer: Option<&str>,
+) -> Result<String> {
+    insert_inner(conn, mem, true, InsertConflictArm::Refuse, viewer)
 }
 
 /// v1.0.0 #2887 — RESTORE-SAFE atomic re-store for the reversible rollback
@@ -1653,7 +1761,7 @@ pub fn insert_no_overwrite(conn: &Connection, mem: &Memory) -> Result<String> {
 ///   `(mem.title, mem.namespace)` — the existing row is left byte-identical.
 /// * Otherwise identical to [`insert`].
 pub fn insert_restore_same_id(conn: &Connection, mem: &Memory) -> Result<String> {
-    insert_inner(conn, mem, true, InsertConflictArm::RestoreSameId)
+    insert_inner(conn, mem, true, InsertConflictArm::RestoreSameId, None)
 }
 
 /// v1.0.0 #2211 — REMOTE-ADMISSION insert for the Portability-v2 importer.
@@ -1672,7 +1780,7 @@ pub fn insert_restore_same_id(conn: &Connection, mem: &Memory) -> Result<String>
 ///
 /// Identical to [`insert`].
 pub fn insert_imported(conn: &Connection, mem: &Memory) -> Result<String> {
-    insert_inner(conn, mem, false, InsertConflictArm::Merge)
+    insert_inner(conn, mem, false, InsertConflictArm::Merge, None)
 }
 
 /// v1.0.0 #2878 — FAIL-CLOSED remote-admission insert: the no-overwrite twin
@@ -1693,7 +1801,7 @@ pub fn insert_imported(conn: &Connection, mem: &Memory) -> Result<String> {
 ///   already exists — the existing row is left byte-identical.
 /// * Otherwise identical to [`insert_imported`].
 pub fn insert_imported_no_overwrite(conn: &Connection, mem: &Memory) -> Result<String> {
-    insert_inner(conn, mem, false, InsertConflictArm::Refuse)
+    insert_inner(conn, mem, false, InsertConflictArm::Refuse, None)
 }
 
 /// Shared body of [`insert`] / [`insert_imported`] / [`insert_no_overwrite`] /
@@ -1791,8 +1899,11 @@ fn probe_federation_merge_preimage(
         return Ok(None);
     }
     conn.query_row(
-        "SELECT updated_at, id, version, content, encrypted_envelope \
-         FROM memories WHERE title = ?1 AND namespace = ?2",
+        &format!(
+            "SELECT updated_at, id, version, content, encrypted_envelope \
+             FROM memories WHERE title = ?1 AND namespace = ?2 AND {}",
+            crate::models::TITLE_SLOT_INDEX_PREDICATE
+        ),
         params![title, namespace],
         |r| {
             Ok(FederationMergePreimage {
@@ -1876,11 +1987,247 @@ fn emit_federation_newer_wins_supersede_leaf_if_enabled(
     )
 }
 
+/// #1579 B6 / #3690 — the ONE `insert` upsert literal, built ONCE: the
+/// conflict target is [`crate::models::TITLE_SLOT_CONFLICT_TARGET`] (the v100
+/// partial index — a tombstone holds no slot, so a re-store beside it is a
+/// fresh row and never a write into the hidden one) and the DO UPDATE arm
+/// carries [`crate::models::title_slot_merge_backstop`] (a hidden occupant
+/// makes the merge update NOTHING, atomically, so the funnel's typed
+/// non-naming conflict holds even against a quarantine that raced the
+/// admission probe). `prepare_cached` keys on this text, so the format runs
+/// once per process and the statement is re-parsed once per connection.
+static INSERT_UPSERT_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    // APPEND-ONLY-SANCTIONED (#1823 G6 / #2948 / #3690) — this static IS the
+    // COW-supersede statement `insert_inner` executes; the fn carries the
+    // sanction and the revision emission, the text lives here so
+    // `prepare_cached` keys on one string. The guard reads both.
+    format!(
+        "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, last_accessed_at, expires_at, metadata, reflection_depth, memory_kind, entity_id, persona_version, citations, source_uri, source_span, confidence_source, confidence_signals, confidence_decayed_at, mentioned_entity_id, lifecycle_state, encrypted_envelope, cid, cid_genesis, kind_provenance, valid_from, valid_until)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33)
+             {conflict_target} DO UPDATE SET
+                -- v0.9.0 G8 (#1825) — the surviving row KEEPS its own genesis
+                -- content-id + pre-image (self-assign, never the excluded
+                -- value): an upsert-merge mutates content but the memory's
+                -- GENESIS identity is fixed at creation.
+                cid = memories.cid,
+                cid_genesis = memories.cid_genesis,
+                content = excluded.content,
+                -- #228 Commit B — content + envelope move together on upsert so
+                -- a re-store under encryption replaces both the placeholder and
+                -- the ciphertext (and a re-store under encryption-off writes the
+                -- plaintext + NULL envelope, clearing any stale ciphertext).
+                encrypted_envelope = excluded.encrypted_envelope,
+                tags = excluded.tags,
+                priority = MAX(memories.priority, excluded.priority),
+                confidence = MAX(memories.confidence, excluded.confidence),
+                source = excluded.source,
+                tier = CASE WHEN excluded.tier = 'long' THEN 'long'
+                            WHEN memories.tier = 'long' THEN 'long'
+                            WHEN excluded.tier = 'mid' THEN 'mid'
+                            ELSE memories.tier END,
+                updated_at = excluded.updated_at,
+                -- v1.0.0 #2515 (GA Wave-1 data-integrity blocker) — a re-store /
+                -- upsert must FLOOR the TTL, never SHORTEN it. The bare
+                -- COALESCE(excluded.expires_at, memories.expires_at) adopted the
+                -- incoming row's expiry verbatim, so re-storing the same
+                -- (title, namespace) with an EARLIER expiry silently rolled a
+                -- live row's TTL backwards — a #1596 never-move-expiry-earlier
+                -- violation (premature GC reap; under the v70 auto-eviction
+                -- posture that ALSO meant permanent link-edge loss — #3161 has
+                -- since closed that half, but a premature reap is still a
+                -- reap). Mirrors EXACTLY the shipped
+                -- #2335 federation extension-FLOOR lattice join (scalar MAX over
+                -- the COALESCE'd pair, both operands funnel-canonical per #2332):
+                -- the merge converges on the LATER expiry regardless of store
+                -- order. Long⇒NULL keeps the #1626 immortality coupling. EXPLICIT
+                -- shortening stays ONLY on the memory_update / db::update path.
+                expires_at = CASE WHEN excluded.tier = 'long' OR memories.tier = 'long' THEN NULL
+                                  ELSE MAX(COALESCE(excluded.expires_at, memories.expires_at),
+                                           COALESCE(memories.expires_at, excluded.expires_at)) END,
+                -- #1784 — preserve immutable provenance keys (agent_id + the
+                -- consolidation derived_from / consolidated_from_agents arrays)
+                -- across upsert. json_patch overlays the existing row's
+                -- provenance object on top of excluded (existing-wins) and
+                -- preserves nested array values that the prior agent_id-only
+                -- json_set handled but the array keys would have double-encoded.
+                -- v1.0.0 #2941 — reserved set, lockstep-gated across all 13
+                -- preserve-sites on `crate::RESERVED_UPSERT_METADATA_KEYS`. Now
+                -- covers the agent-registration pubkey PAIR, whose absence let
+                -- an idempotent re-register silently unbind an agent's key and
+                -- downgrade every later signed write to `claimed`.
+                -- #3626 — and an UNSTAMPED existing row (missing / null / empty
+                -- agent_id, `owner_stamp::sqlite_unstamped_predicate`) stays
+                -- unstamped: the merged object has `agent_id` REMOVED, so the
+                -- incoming caller's id never claims a legacy-unowned row
+                -- (claiming stays `ai-memory reown`). The patch expression is
+                -- spelled twice because SQLite evaluates one CASE arm only.
+                metadata = CASE WHEN {unstamped_owner}
+                    THEN json_remove(json_patch(
+                        excluded.metadata,
+                        COALESCE(
+                            (SELECT json_group_object(key, value)
+                             FROM json_each(memories.metadata)
+                             WHERE key IN ('agent_id', 'derived_from', 'consolidated_from_agents', 'agent_pubkey', 'pubkey_bound_at')),
+                            '{{}}'
+                        )
+                    ), '$.agent_id')
+                    ELSE json_patch(
+                        excluded.metadata,
+                        COALESCE(
+                            (SELECT json_group_object(key, value)
+                             FROM json_each(memories.metadata)
+                             WHERE key IN ('agent_id', 'derived_from', 'consolidated_from_agents', 'agent_pubkey', 'pubkey_bound_at')),
+                            '{{}}'
+                        )
+                    ) END,
+                -- v0.7.0 Task 1/8 — recursion depth takes the max across upsert
+                -- so a subsequent reflection at higher depth doesn't lose its
+                -- provenance signal when re-stored at the same (title, namespace).
+                reflection_depth = MAX(memories.reflection_depth, excluded.reflection_depth),
+                -- v0.7.0 L1-1 — kind is sticky: once Reflection, always Reflection.
+                -- An upsert of an observation onto an existing reflection row must
+                -- not downgrade the kind (reflect is not reversible by re-store).
+                -- v0.7.0 QW-2 — Persona is also sticky once set; the engine
+                -- writes new versions via fresh rows under a unique
+                -- `__persona_<entity>_v<n>` title rather than upsert.
+                memory_kind = CASE WHEN memories.memory_kind = 'reflection' THEN 'reflection'
+                                   WHEN memories.memory_kind = 'persona' THEN 'persona'
+                                   ELSE excluded.memory_kind END,
+                -- v0.7.0 QW-2 — entity_id + persona_version stay attached to
+                -- the row they were minted with (Persona-kind upserts use
+                -- versioned titles so the conflict path is exercised only
+                -- on accidental same-title collisions).
+                entity_id = COALESCE(memories.entity_id, excluded.entity_id),
+                persona_version = COALESCE(memories.persona_version, excluded.persona_version),
+                -- v0.7.0 Form 4 — fact-provenance: when the incoming row
+                -- carries a non-empty citations array, replace the stored
+                -- value (caller re-asserted provenance); otherwise keep
+                -- the existing value (silent merge would lose freshly-cited
+                -- evidence). source_uri / source_span follow COALESCE
+                -- semantics so a new write that omits them does not blank
+                -- out existing provenance pointers.
+                citations = CASE WHEN excluded.citations = '[]'
+                                 THEN memories.citations
+                                 ELSE excluded.citations END,
+                source_uri = COALESCE(excluded.source_uri, memories.source_uri),
+                source_span = COALESCE(excluded.source_span, memories.source_span),
+                -- v0.7.0 Form 5 / v1.0.0 #2395 — the confidence field-set is
+                -- ATOMIC. `confidence` merges by MAX (above), so the
+                -- calibration record that DESCRIBES that number —
+                -- `confidence_source`, `confidence_signals`,
+                -- `confidence_decayed_at` — must come from the SAME operand
+                -- that won the MAX. Pre-#2395 the three provenance columns
+                -- used a DIFFERENT selector (explicit-non-default replaces /
+                -- COALESCE), so merging a stored (0.9, auto_derived, S1) with
+                -- an incoming (0.4, calibrated, S2) durably produced
+                -- `confidence = 0.9` labelled `calibrated` carrying S2 — a
+                -- value from one operand wearing another operand's label and
+                -- evidence. That is a self-inconsistent calibration record on
+                -- the durable tier (Form-5 semantics corrupted), and it is
+                -- silent: every downstream consumer of the pair reads it as
+                -- fact.
+                --
+                -- The selector below IS the MAX winner, applied as a unit:
+                --   * excluded.confidence > memories.confidence -> incoming tuple
+                --   * excluded.confidence < memories.confidence -> stored tuple
+                --   * EQUAL -> the pre-#2395 tie rule verbatim (an incoming
+                --     explicit non-`caller_provided` source replaces; a
+                --     default `caller_provided` keeps the stored provenance so
+                --     a plain re-store never blanks an auto-derived or
+                --     calibrated value) — except that it now carries the WHOLE
+                --     tuple rather than one column, which is the fix.
+                -- The `=`/`<`/`>` comparisons form a total order on the pair;
+                -- exact equality is only the tie BRANCH (if the two REALs are
+                -- not bit-identical, one is strictly greater), never a logical
+                -- float-equality test.
+                confidence_source = CASE WHEN excluded.confidence > memories.confidence THEN excluded.confidence_source
+                                         WHEN excluded.confidence < memories.confidence THEN memories.confidence_source
+                                         WHEN excluded.confidence_source != 'caller_provided' THEN excluded.confidence_source
+                                         ELSE memories.confidence_source END,
+                confidence_signals = CASE WHEN excluded.confidence > memories.confidence THEN excluded.confidence_signals
+                                          WHEN excluded.confidence < memories.confidence THEN memories.confidence_signals
+                                          WHEN excluded.confidence_source != 'caller_provided' THEN excluded.confidence_signals
+                                          ELSE memories.confidence_signals END,
+                confidence_decayed_at = CASE WHEN excluded.confidence > memories.confidence THEN excluded.confidence_decayed_at
+                                             WHEN excluded.confidence < memories.confidence THEN memories.confidence_decayed_at
+                                             WHEN excluded.confidence_source != 'caller_provided' THEN excluded.confidence_decayed_at
+                                             ELSE memories.confidence_decayed_at END,
+                -- v0.7.0 polish PERF-8 (#781) — denormalised mention tag.
+                -- COALESCE keeps any pre-existing tag (re-write that
+                -- omits the structured entity_id metadata should NOT
+                -- blank out the indexed column) while letting a fresh
+                -- extraction populate previously-NULL rows.
+                mentioned_entity_id = COALESCE(excluded.mentioned_entity_id, memories.mentioned_entity_id),
+                -- v0.8.0 Pillar 2 (#1709) — lifecycle_state is preserved across
+                -- a plain re-store: the stored value wins so a re-store of an
+                -- already-`active`/`done` row does NOT reset it to the incoming
+                -- (typically `open`) initial state. Lifecycle ADVANCES go
+                -- through the typed `memory_update` transition gate, never a
+                -- silent upsert.
+                lifecycle_state = memories.lifecycle_state,
+                -- #1632 — upsert-merge IS a mutation (content/tags/priority
+                -- can change), so the Gap-1 optimistic-concurrency counter
+                -- bumps here exactly like db::update. Pre-#1632 a re-store
+                -- rewrote content while version stood still, so a stale
+                -- If-Match could overwrite the merge invisibly. The decay
+                -- sweep remains the only documented non-bumping mutator
+                -- (tests/non_version_bumping_sites_1036.rs).
+                version = memories.version + 1,
+                -- v1.0.0 (#1945) + v1.0.0 #2394 — the epistemic-typing
+                -- provenance FOLLOWS THE KIND THAT ACTUALLY WON. `memory_kind`
+                -- above is STICKY (a stored `reflection` / `persona` is never
+                -- downgraded), but the bare
+                -- `COALESCE(excluded.kind_provenance, memories.kind_provenance)`
+                -- adopted the incoming provenance unconditionally: a row stored
+                -- as `reflection` (kind_provenance = `declared`) that received
+                -- an upsert claiming `observation` via `llm` kept kind
+                -- `reflection` while relabelling its provenance `llm` — the
+                -- stored provenance then described a kind the merge REJECTED.
+                -- Downstream consumers (decorrelation, typed-cognition
+                -- analytics) read that as fact, so it is durable metadata
+                -- corruption, not a cosmetic skew.
+                --
+                -- The CASE mirrors the `memory_kind` CASE above exactly:
+                --   * kind UNCHANGED -> COALESCE (the #1945 rule: an incoming
+                --     carrier wins, an omitted one must not blank the marker);
+                --   * kind changed and the STORED kind survived (sticky
+                --     reflection / persona) -> keep the stored provenance;
+                --   * otherwise the INCOMING kind was adopted -> take its
+                --     provenance verbatim, NULL included (a provenance
+                --     describing the superseded kind would be a lie).
+                -- NULL-safe by construction: a NULL `memory_kind` fails both
+                -- WHENs and lands on the ELSE, which is the same operand the
+                -- `memory_kind` CASE picks.
+                kind_provenance = CASE WHEN excluded.memory_kind = memories.memory_kind
+                                            THEN COALESCE(excluded.kind_provenance, memories.kind_provenance)
+                                       WHEN memories.memory_kind IN ('reflection', 'persona')
+                                            THEN memories.kind_provenance
+                                       ELSE excluded.kind_provenance END,
+                -- v1.0.0 #1834 — claim-bitemporal validity. `valid_from` is
+                -- IMMUTABLE once set (a correction is a supersede, not a mutation),
+                -- so the stored value always wins on upsert. `valid_until` is the
+                -- one caller-updatable bound (closing a claim), so a re-store that
+                -- carries a non-NULL upper bound sets it; else the existing value
+                -- is kept (COALESCE, matching the Form-4/5 provenance columns).
+                valid_from = memories.valid_from,
+                valid_until = COALESCE(excluded.valid_until, memories.valid_until)
+             {merge_backstop}
+             RETURNING id",
+        conflict_target = crate::models::TITLE_SLOT_CONFLICT_TARGET,
+        merge_backstop = crate::models::title_slot_merge_backstop("memories"),
+        unstamped_owner =
+            crate::identity::owner_stamp::sqlite_unstamped_predicate(
+                crate::identity::owner_stamp::UPSERT_SURVIVING_METADATA_COL,
+            ),
+    )
+});
+
 fn insert_inner(
     conn: &Connection,
     mem: &Memory,
     stamp_local_clock: bool,
     conflict_arm: InsertConflictArm,
+    viewer: Option<&str>,
 ) -> Result<String> {
     use rusqlite::OptionalExtension;
     // #1955 R45 — record-stop fence: outermost of the write funnel, so a
@@ -2046,13 +2393,54 @@ fn insert_inner(
         // `v` is the pre-supersede `version` the leaf records as `prior_version`
         // (the `db::update` convention). Under the `BEGIN IMMEDIATE` write lock
         // this read cannot race the upsert.
+        //
+        // #3690 / #3695 / #3626 — TITLE-SLOT ADMISSION, read BEFORE the
+        // statement from the ONE predicate (`LifecycleState::
+        // title_slot_admission`) the statement's conflict target and merge
+        // backstop also encode. `slot_holder` is the LIVE occupant of
+        // `(title, namespace)` (the v100 partial index excludes tombstones,
+        // so a tombstone is not a holder and the write lands beside it as a
+        // fresh, visible row — the #3690 fix). A holder that is hidden for a
+        // SECURITY reason (`quarantined` / `contaminated`, or a state this
+        // binary cannot read) keeps its slot and REFUSES every arm with a
+        // typed conflict whose `existing_id` is EMPTY — the funnel never
+        // names the hidden row (#3695), and never writes the local author's
+        // text into a peer-attributed row (#3626's laundering half). The
+        // statement re-asserts this atomically (`title_slot_merge_backstop`),
+        // so a quarantine that lands between this read and the write still
+        // updates nothing.
+        let slot_holder = title_slot_holder(conn, &mem.title, &mem.namespace, viewer)?;
+        // The same-id row under this key that is NOT the holder (hidden), read
+        // only when no live holder exists.
+        let same_id_hidden = if slot_holder.is_none() {
+            same_id_hidden_row_under_key(conn, mem)?
+        } else {
+            None
+        };
+        // ONE arm × occupant matrix for all three arms on both adapters
+        // (`visibility::title_slot_disposition`); this funnel only routes.
+        let facts = crate::visibility::TitleSlotFacts {
+            holder: slot_holder.as_ref().map(|h| (h.id.clone(), h.admission)),
+            same_id_hidden: same_id_hidden.as_ref().map(|r| r.admission),
+        };
+        let restore_tombstone_by_id =
+            match crate::visibility::title_slot_disposition(conflict_arm, &mem.id, &facts) {
+                crate::visibility::TitleSlotDisposition::Proceed => false,
+                crate::visibility::TitleSlotDisposition::ProceedByPrimaryKey => true,
+                crate::visibility::TitleSlotDisposition::Refuse { named } => {
+                    return Err(ConflictError {
+                        existing_id: named.unwrap_or_default(),
+                        title: mem.title.clone(),
+                        namespace: mem.namespace.clone(),
+                    }
+                    .into());
+                }
+            };
         let prior_version_on_conflict: Option<i64> = if crate::config::append_only_enabled() {
-            conn.query_row(
-                "SELECT version FROM memories WHERE title = ?1 AND namespace = ?2",
-                params![mem.title, mem.namespace],
-                |r| r.get(0),
-            )
-            .optional()?
+            slot_holder
+                .as_ref()
+                .map(|h| h.version)
+                .or_else(|| same_id_hidden.as_ref().map(|r| r.version))
         } else {
             None
         };
@@ -2088,201 +2476,7 @@ fn insert_inner(
         // substrate (every store / upsert / capture-turn / federation push
         // lands here). `prepare_cached` skips the re-parse of this ~60-line
         // upsert on every call after the first.
-        let upsert_sql =
-            "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, last_accessed_at, expires_at, metadata, reflection_depth, memory_kind, entity_id, persona_version, citations, source_uri, source_span, confidence_source, confidence_signals, confidence_decayed_at, mentioned_entity_id, lifecycle_state, encrypted_envelope, cid, cid_genesis, kind_provenance, valid_from, valid_until)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33)
-             ON CONFLICT(title, namespace) DO UPDATE SET
-                -- v0.9.0 G8 (#1825) — the surviving row KEEPS its own genesis
-                -- content-id + pre-image (self-assign, never the excluded
-                -- value): an upsert-merge mutates content but the memory's
-                -- GENESIS identity is fixed at creation.
-                cid = memories.cid,
-                cid_genesis = memories.cid_genesis,
-                content = excluded.content,
-                -- #228 Commit B — content + envelope move together on upsert so
-                -- a re-store under encryption replaces both the placeholder and
-                -- the ciphertext (and a re-store under encryption-off writes the
-                -- plaintext + NULL envelope, clearing any stale ciphertext).
-                encrypted_envelope = excluded.encrypted_envelope,
-                tags = excluded.tags,
-                priority = MAX(memories.priority, excluded.priority),
-                confidence = MAX(memories.confidence, excluded.confidence),
-                source = excluded.source,
-                tier = CASE WHEN excluded.tier = 'long' THEN 'long'
-                            WHEN memories.tier = 'long' THEN 'long'
-                            WHEN excluded.tier = 'mid' THEN 'mid'
-                            ELSE memories.tier END,
-                updated_at = excluded.updated_at,
-                -- v1.0.0 #2515 (GA Wave-1 data-integrity blocker) — a re-store /
-                -- upsert must FLOOR the TTL, never SHORTEN it. The bare
-                -- COALESCE(excluded.expires_at, memories.expires_at) adopted the
-                -- incoming row's expiry verbatim, so re-storing the same
-                -- (title, namespace) with an EARLIER expiry silently rolled a
-                -- live row's TTL backwards — a #1596 never-move-expiry-earlier
-                -- violation (premature GC reap; under the v70 auto-eviction
-                -- posture that ALSO meant permanent link-edge loss — #3161 has
-                -- since closed that half, but a premature reap is still a
-                -- reap). Mirrors EXACTLY the shipped
-                -- #2335 federation extension-FLOOR lattice join (scalar MAX over
-                -- the COALESCE'd pair, both operands funnel-canonical per #2332):
-                -- the merge converges on the LATER expiry regardless of store
-                -- order. Long⇒NULL keeps the #1626 immortality coupling. EXPLICIT
-                -- shortening stays ONLY on the memory_update / db::update path.
-                expires_at = CASE WHEN excluded.tier = 'long' OR memories.tier = 'long' THEN NULL
-                                  ELSE MAX(COALESCE(excluded.expires_at, memories.expires_at),
-                                           COALESCE(memories.expires_at, excluded.expires_at)) END,
-                -- #1784 — preserve immutable provenance keys (agent_id + the
-                -- consolidation derived_from / consolidated_from_agents arrays)
-                -- across upsert. json_patch overlays the existing row's
-                -- provenance object on top of excluded (existing-wins) and
-                -- preserves nested array values that the prior agent_id-only
-                -- json_set handled but the array keys would have double-encoded.
-                -- v1.0.0 #2941 — reserved set, lockstep-gated across all 13
-                -- preserve-sites on `crate::RESERVED_UPSERT_METADATA_KEYS`. Now
-                -- covers the agent-registration pubkey PAIR, whose absence let
-                -- an idempotent re-register silently unbind an agent's key and
-                -- downgrade every later signed write to `claimed`.
-                metadata = json_patch(
-                    excluded.metadata,
-                    COALESCE(
-                        (SELECT json_group_object(key, value)
-                         FROM json_each(memories.metadata)
-                         WHERE key IN ('agent_id', 'derived_from', 'consolidated_from_agents', 'agent_pubkey', 'pubkey_bound_at')),
-                        '{}'
-                    )
-                ),
-                -- v0.7.0 Task 1/8 — recursion depth takes the max across upsert
-                -- so a subsequent reflection at higher depth doesn't lose its
-                -- provenance signal when re-stored at the same (title, namespace).
-                reflection_depth = MAX(memories.reflection_depth, excluded.reflection_depth),
-                -- v0.7.0 L1-1 — kind is sticky: once Reflection, always Reflection.
-                -- An upsert of an observation onto an existing reflection row must
-                -- not downgrade the kind (reflect is not reversible by re-store).
-                -- v0.7.0 QW-2 — Persona is also sticky once set; the engine
-                -- writes new versions via fresh rows under a unique
-                -- `__persona_<entity>_v<n>` title rather than upsert.
-                memory_kind = CASE WHEN memories.memory_kind = 'reflection' THEN 'reflection'
-                                   WHEN memories.memory_kind = 'persona' THEN 'persona'
-                                   ELSE excluded.memory_kind END,
-                -- v0.7.0 QW-2 — entity_id + persona_version stay attached to
-                -- the row they were minted with (Persona-kind upserts use
-                -- versioned titles so the conflict path is exercised only
-                -- on accidental same-title collisions).
-                entity_id = COALESCE(memories.entity_id, excluded.entity_id),
-                persona_version = COALESCE(memories.persona_version, excluded.persona_version),
-                -- v0.7.0 Form 4 — fact-provenance: when the incoming row
-                -- carries a non-empty citations array, replace the stored
-                -- value (caller re-asserted provenance); otherwise keep
-                -- the existing value (silent merge would lose freshly-cited
-                -- evidence). source_uri / source_span follow COALESCE
-                -- semantics so a new write that omits them does not blank
-                -- out existing provenance pointers.
-                citations = CASE WHEN excluded.citations = '[]'
-                                 THEN memories.citations
-                                 ELSE excluded.citations END,
-                source_uri = COALESCE(excluded.source_uri, memories.source_uri),
-                source_span = COALESCE(excluded.source_span, memories.source_span),
-                -- v0.7.0 Form 5 / v1.0.0 #2395 — the confidence field-set is
-                -- ATOMIC. `confidence` merges by MAX (above), so the
-                -- calibration record that DESCRIBES that number —
-                -- `confidence_source`, `confidence_signals`,
-                -- `confidence_decayed_at` — must come from the SAME operand
-                -- that won the MAX. Pre-#2395 the three provenance columns
-                -- used a DIFFERENT selector (explicit-non-default replaces /
-                -- COALESCE), so merging a stored (0.9, auto_derived, S1) with
-                -- an incoming (0.4, calibrated, S2) durably produced
-                -- `confidence = 0.9` labelled `calibrated` carrying S2 — a
-                -- value from one operand wearing another operand's label and
-                -- evidence. That is a self-inconsistent calibration record on
-                -- the durable tier (Form-5 semantics corrupted), and it is
-                -- silent: every downstream consumer of the pair reads it as
-                -- fact.
-                --
-                -- The selector below IS the MAX winner, applied as a unit:
-                --   * excluded.confidence > memories.confidence -> incoming tuple
-                --   * excluded.confidence < memories.confidence -> stored tuple
-                --   * EQUAL -> the pre-#2395 tie rule verbatim (an incoming
-                --     explicit non-`caller_provided` source replaces; a
-                --     default `caller_provided` keeps the stored provenance so
-                --     a plain re-store never blanks an auto-derived or
-                --     calibrated value) — except that it now carries the WHOLE
-                --     tuple rather than one column, which is the fix.
-                -- The `=`/`<`/`>` comparisons form a total order on the pair;
-                -- exact equality is only the tie BRANCH (if the two REALs are
-                -- not bit-identical, one is strictly greater), never a logical
-                -- float-equality test.
-                confidence_source = CASE WHEN excluded.confidence > memories.confidence THEN excluded.confidence_source
-                                         WHEN excluded.confidence < memories.confidence THEN memories.confidence_source
-                                         WHEN excluded.confidence_source != 'caller_provided' THEN excluded.confidence_source
-                                         ELSE memories.confidence_source END,
-                confidence_signals = CASE WHEN excluded.confidence > memories.confidence THEN excluded.confidence_signals
-                                          WHEN excluded.confidence < memories.confidence THEN memories.confidence_signals
-                                          WHEN excluded.confidence_source != 'caller_provided' THEN excluded.confidence_signals
-                                          ELSE memories.confidence_signals END,
-                confidence_decayed_at = CASE WHEN excluded.confidence > memories.confidence THEN excluded.confidence_decayed_at
-                                             WHEN excluded.confidence < memories.confidence THEN memories.confidence_decayed_at
-                                             WHEN excluded.confidence_source != 'caller_provided' THEN excluded.confidence_decayed_at
-                                             ELSE memories.confidence_decayed_at END,
-                -- v0.7.0 polish PERF-8 (#781) — denormalised mention tag.
-                -- COALESCE keeps any pre-existing tag (re-write that
-                -- omits the structured entity_id metadata should NOT
-                -- blank out the indexed column) while letting a fresh
-                -- extraction populate previously-NULL rows.
-                mentioned_entity_id = COALESCE(excluded.mentioned_entity_id, memories.mentioned_entity_id),
-                -- v0.8.0 Pillar 2 (#1709) — lifecycle_state is preserved across
-                -- a plain re-store: the stored value wins so a re-store of an
-                -- already-`active`/`done` row does NOT reset it to the incoming
-                -- (typically `open`) initial state. Lifecycle ADVANCES go
-                -- through the typed `memory_update` transition gate, never a
-                -- silent upsert.
-                lifecycle_state = memories.lifecycle_state,
-                -- #1632 — upsert-merge IS a mutation (content/tags/priority
-                -- can change), so the Gap-1 optimistic-concurrency counter
-                -- bumps here exactly like db::update. Pre-#1632 a re-store
-                -- rewrote content while version stood still, so a stale
-                -- If-Match could overwrite the merge invisibly. The decay
-                -- sweep remains the only documented non-bumping mutator
-                -- (tests/non_version_bumping_sites_1036.rs).
-                version = memories.version + 1,
-                -- v1.0.0 (#1945) + v1.0.0 #2394 — the epistemic-typing
-                -- provenance FOLLOWS THE KIND THAT ACTUALLY WON. `memory_kind`
-                -- above is STICKY (a stored `reflection` / `persona` is never
-                -- downgraded), but the bare
-                -- `COALESCE(excluded.kind_provenance, memories.kind_provenance)`
-                -- adopted the incoming provenance unconditionally: a row stored
-                -- as `reflection` (kind_provenance = `declared`) that received
-                -- an upsert claiming `observation` via `llm` kept kind
-                -- `reflection` while relabelling its provenance `llm` — the
-                -- stored provenance then described a kind the merge REJECTED.
-                -- Downstream consumers (decorrelation, typed-cognition
-                -- analytics) read that as fact, so it is durable metadata
-                -- corruption, not a cosmetic skew.
-                --
-                -- The CASE mirrors the `memory_kind` CASE above exactly:
-                --   * kind UNCHANGED -> COALESCE (the #1945 rule: an incoming
-                --     carrier wins, an omitted one must not blank the marker);
-                --   * kind changed and the STORED kind survived (sticky
-                --     reflection / persona) -> keep the stored provenance;
-                --   * otherwise the INCOMING kind was adopted -> take its
-                --     provenance verbatim, NULL included (a provenance
-                --     describing the superseded kind would be a lie).
-                -- NULL-safe by construction: a NULL `memory_kind` fails both
-                -- WHENs and lands on the ELSE, which is the same operand the
-                -- `memory_kind` CASE picks.
-                kind_provenance = CASE WHEN excluded.memory_kind = memories.memory_kind
-                                            THEN COALESCE(excluded.kind_provenance, memories.kind_provenance)
-                                       WHEN memories.memory_kind IN ('reflection', 'persona')
-                                            THEN memories.kind_provenance
-                                       ELSE excluded.kind_provenance END,
-                -- v1.0.0 #1834 — claim-bitemporal validity. `valid_from` is
-                -- IMMUTABLE once set (a correction is a supersede, not a mutation),
-                -- so the stored value always wins on upsert. `valid_until` is the
-                -- one caller-updatable bound (closing a claim), so a re-store that
-                -- carries a non-NULL upper bound sets it; else the existing value
-                -- is kept (COALESCE, matching the Form-4/5 provenance columns).
-                valid_from = memories.valid_from,
-                valid_until = COALESCE(excluded.valid_until, memories.valid_until)
-             RETURNING id";
+        let upsert_sql: &str = &INSERT_UPSERT_SQL;
         // #2771/#2887 — the column list + VALUES head + the whole DO UPDATE SET
         // arm are single-sourced from the ONE `upsert_sql` literal (above): each
         // non-`Merge` disposition is DERIVED from it, so a future column add lands
@@ -2300,17 +2494,35 @@ fn insert_inner(
         //     nothing (documented upsert semantics — the DO-NOTHING analogue) →
         //     the same typed ConflictError below, leaving the foreign row
         //     byte-identical. Closes the rollback probe-then-store lost-update.
+        //   * `RestoreSameId` against a same-id TOMBSTONE (#3690, vote Q3) —
+        //     the tombstone is NOT in the v100 partial index, so the key does
+        //     not conflict; the row conflicts on its PRIMARY KEY instead. The
+        //     SAME `DO UPDATE SET` arm is re-targeted `ON CONFLICT (id)` with
+        //     the visible-only merge backstop removed (the occupant is, by
+        //     construction, the caller's own tombstone), so the restore
+        //     merges in place exactly as before v100 and the row stays
+        //     tombstoned. Reached only when NO live row holds the key.
         let sql: std::borrow::Cow<'_, str> = match conflict_arm {
             InsertConflictArm::Merge => std::borrow::Cow::Borrowed(upsert_sql),
             InsertConflictArm::Refuse => {
                 let head = upsert_sql.split("ON CONFLICT").next().unwrap_or(upsert_sql);
-                std::borrow::Cow::Owned(
-                    [
-                        head,
-                        "ON CONFLICT(title, namespace) DO NOTHING\n             RETURNING id",
-                    ]
-                    .concat(),
-                )
+                std::borrow::Cow::Owned(format!(
+                    "{head}{} DO NOTHING\n             RETURNING id",
+                    crate::models::TITLE_SLOT_CONFLICT_TARGET
+                ))
+            }
+            InsertConflictArm::RestoreSameId if restore_tombstone_by_id => {
+                let body = upsert_sql
+                    .rsplit_once(crate::models::TITLE_SLOT_MERGE_BACKSTOP_HEAD)
+                    .map_or(upsert_sql, |(head, _)| head);
+                std::borrow::Cow::Owned(format!(
+                    "{}\n             RETURNING id",
+                    body.replacen(
+                        crate::models::TITLE_SLOT_CONFLICT_TARGET,
+                        "ON CONFLICT (id)",
+                        1
+                    )
+                ))
             }
             InsertConflictArm::RestoreSameId => {
                 let body = upsert_sql
@@ -2319,7 +2531,7 @@ fn insert_inner(
                 std::borrow::Cow::Owned(
                     [
                         body,
-                        "WHERE memories.id = excluded.id\n             RETURNING id",
+                        "AND memories.id = excluded.id\n             RETURNING id",
                     ]
                     .concat(),
                 )
@@ -2377,10 +2589,14 @@ fn insert_inner(
                 // RETURNed row). Refuse fail-closed with the typed conflict —
                 // NEVER overwrite. Re-probe for the occupant's id best-effort; a
                 // TOCTOU gap (winner deleted between the conflict and this read)
-                // degrades to an empty id, never a retry-as-create. `Merge` always
-                // RETURNs a row, so this branch is unreachable under it.
+                // degrades to an empty id, never a retry-as-create. #3690: `Merge`
+                // reaches here too when the occupant is HIDDEN (the
+                // `title_slot_merge_backstop` made the DO UPDATE fire on no
+                // row), and `find_by_title_namespace` answers only with a
+                // VISIBLE occupant, so the hidden row is never named (#3695).
                 let existing_id =
-                    find_by_title_namespace(conn, &mem.title, &mem.namespace)?.unwrap_or_default();
+                    find_by_title_namespace(conn, &mem.title, &mem.namespace, viewer)?
+                        .unwrap_or_default();
                 return Err(ConflictError {
                     existing_id,
                     title: mem.title.clone(),
@@ -3008,7 +3224,9 @@ pub fn insert_with_conflict(conn: &Connection, mem: &Memory, mode: ConflictMode)
             // still fires loud, and the caller's retry sees the new
             // state. Reading the id is best-effort context for the
             // diagnostic.
-            if let Some(existing_id) = find_by_title_namespace(conn, &mem.title, &mem.namespace)? {
+            if let Some(existing_id) =
+                find_by_title_namespace(conn, &mem.title, &mem.namespace, None)?
+            {
                 return Err(ConflictError {
                     existing_id,
                     title: mem.title.clone(),
@@ -3055,7 +3273,7 @@ pub fn insert_with_conflict(conn: &Connection, mem: &Memory, mode: ConflictMode)
             // existing-wins overlay here and therefore no identity to
             // reconcile against — adding the pre-read would be a pure cost.
             let agent_id = memory_agent_id(mem);
-            let sealed = crate::encryption::seal_content(&mem.content, agent_id)?;
+            let sealed = seal_content_guarded(conn, &mem.content, agent_id)?;
             let content_to_store = sealed
                 .as_ref()
                 .map_or(mem.content.as_str(), |(_, ph)| ph.as_str());
@@ -3686,6 +3904,22 @@ impl std::fmt::Display for InvalidTransition {
 
 impl std::error::Error for InvalidTransition {}
 
+/// #3691 — a consolidation SOURCE stopped being caller-visible (quarantined
+/// / contaminated / tombstoned by another writer) between the curator's
+/// snapshot read and the tombstone write. Rendered as the SAME
+/// [`InvalidTransition`] shape both adapters already map to the HTTP 409
+/// CONFLICT body (`StoreError::InvalidTransition` on postgres), because that
+/// is what it is: a system move out of a hidden state is not a permitted
+/// transition. The cluster is aborted; every source stays as it is.
+#[must_use]
+pub fn consolidate_source_hidden(id: &str) -> InvalidTransition {
+    InvalidTransition {
+        id: id.to_string(),
+        from: crate::models::LifecycleState::Quarantined,
+        to: crate::models::LifecycleState::Tombstoned,
+    }
+}
+
 /// v0.8.0 Pillar 2 (#1709 / #1726) — persist a lifecycle-state transition
 /// on a single memory, ENFORCING the transition machine
 /// ([`crate::models::LifecycleState::can_transition_to`]). The current
@@ -4193,7 +4427,7 @@ pub fn update_with_expected_version(
     let update_agent_id = metadata_agent_id_slot(&existing.metadata)
         .or_else(|| metadata_agent_id_slot(metadata))
         .unwrap_or("");
-    let update_sealed = crate::encryption::seal_content(new_content, update_agent_id)?;
+    let update_sealed = seal_content_guarded(conn, new_content, update_agent_id)?;
     let update_content_to_store = update_sealed
         .as_ref()
         .map_or(new_content, |(_, ph)| ph.as_str());
@@ -5654,6 +5888,48 @@ pub fn undo_in_place_edit(
     })
 }
 
+/// v1.0.0 #3124 — the by-id caller-scoped mutation admission for the sqlite
+/// ARCHIVE funnels ([`archive_memory_for_caller`] and the SAL
+/// `archive_by_ids`). Reads the live row's `metadata` and applies the ONE
+/// predicate ([`crate::identity::owner_stamp::metadata_admits_mutation`],
+/// inbox carve-out enabled — the recipient may archive a message addressed to
+/// it), replacing the pre-#3124 four-way SQL arm whose unstamped disjunct
+/// ignored the posture knob. `Ok(false)` for a missing id or unparseable
+/// metadata (never admitted — a row whose owner cannot be read is not
+/// provably the caller's). A read fault propagates (ERRORS-19, #3296).
+///
+/// # Errors
+///
+/// Propagates the owner-probe query failure.
+pub(crate) fn caller_may_mutate_live_row(
+    conn: &Connection,
+    id: &str,
+    caller: &str,
+    funnel: &'static str,
+) -> Result<bool> {
+    use rusqlite::OptionalExtension;
+    let metadata: Option<String> = conn
+        .query_row(
+            "SELECT metadata FROM memories WHERE id = ?1",
+            params![id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(metadata) = metadata else {
+        return Ok(false);
+    };
+    let Ok(metadata) = serde_json::from_str::<serde_json::Value>(&metadata) else {
+        return Ok(false);
+    };
+    Ok(crate::identity::owner_stamp::metadata_admits_mutation(
+        &metadata,
+        id,
+        caller,
+        true,
+        crate::identity::owner_stamp::MutationSite::sqlite(funnel),
+    ))
+}
+
 /// #940 (security-high, 2026-05-20) — caller-scoped archive variant.
 /// Mirrors [`archive_memory`] but constrains the soft-move to rows
 /// in the live `memories` table whose `metadata->'agent_id'` JSON
@@ -5686,22 +5962,15 @@ pub fn archive_memory_for_caller(
     let reason = reason.unwrap_or(crate::models::field_names::ARCHIVE_REASON_DEFAULT);
     let write_txn = connection::WriteTxn::begin(conn)?;
     let result = (|| -> Result<bool> {
-        // Owner gate: row must exist AND match the caller (or be an
-        // inbox-target row whose recipient is the caller).
-        let owned: bool = conn
-            .query_row(
-                "SELECT COUNT(*) > 0 FROM memories \
-                 WHERE id = ?1 \
-                   AND ( \
-                     json_extract(metadata, '$.agent_id') = ?2 OR \
-                     json_extract(metadata, '$.target_agent_id') = ?2 OR \
-                     json_extract(metadata, '$.agent_id') IS NULL OR \
-                     json_extract(metadata, '$.agent_id') = '' \
-                   )",
-                params![id, caller],
-                |r| r.get(0),
-            )
-            .unwrap_or(false);
+        // Owner gate: row must exist AND be mutable by the caller under the
+        // ONE #3124 predicate (owner, or inbox recipient of a stamped row, or
+        // an unstamped row admitted by `AI_MEMORY_UNSTAMPED_MUTATION`).
+        let owned = caller_may_mutate_live_row(
+            conn,
+            id,
+            caller,
+            crate::identity::owner_stamp::funnel::ARCHIVE,
+        )?;
         if !owned {
             return Ok(false);
         }
@@ -5967,6 +6236,67 @@ pub fn forget_distinct_namespaces(
     Ok(rows)
 }
 
+/// v1.0.0 #3124 — the `metadata` column as qualified by the `m` alias the
+/// FTS-joined forget statements use (one spelling for every owner-predicate
+/// call site).
+const SQL_COL_M_METADATA: &str = "m.metadata";
+
+/// v1.0.0 #3124 — the caller-scoped OWNER predicate for every forget-by-filter
+/// SQL arm: `(col.agent_id = ?{idx} [OR <unstamped>])`. The unstamped arm (a
+/// missing / JSON-null / `''` owner — the ONE definition,
+/// [`crate::identity::owner_stamp::sqlite_unstamped_predicate`]) is present
+/// only under `AI_MEMORY_UNSTAMPED_MUTATION=warn`, so under `refuse` the
+/// preview, the count, the purge/tombstone set, the archive copy and the
+/// DELETE all shrink to the caller's OWN rows together. A malformed
+/// (non-string) owner never equals the text caller parameter.
+fn sql_owner_predicate(
+    col: &str,
+    idx: usize,
+    mode: crate::identity::owner_stamp::UnstampedMutationMode,
+) -> String {
+    format!(
+        "(json_extract({col},'$.agent_id') = ?{idx}{})",
+        crate::identity::owner_stamp::sqlite_unstamped_arm(col, mode)
+    )
+}
+
+/// v1.0.0 #3124 — count the UNSTAMPED rows a caller-scoped forget-by-filter
+/// is about to admit, so `warn` mode can report them (WARN + counter) before
+/// the DELETE. Same filter as the forget arms minus the owner clause (under
+/// `warn` every unstamped row matching the filter is in the victim set).
+fn forget_unstamped_victim_count(
+    conn: &Connection,
+    namespace: Option<&str>,
+    pattern: Option<&str>,
+    tier: Option<&Tier>,
+) -> Result<u64> {
+    let tier_str = tier.map(|t| t.as_str().to_string());
+    let count: i64 = if let Some(pat) = pattern {
+        let fts_query = forget_fts_query(pat)?;
+        conn.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM memories_fts fts JOIN memories m ON m.rowid = fts.rowid \
+                 WHERE memories_fts MATCH ?1 AND (?2 IS NULL OR m.namespace = ?2) \
+                 AND (?3 IS NULL OR m.tier = ?3) AND {}",
+                crate::identity::owner_stamp::sqlite_unstamped_predicate(SQL_COL_M_METADATA)
+            ),
+            params![fts_query, namespace, tier_str],
+            |r| r.get(0),
+        )?
+    } else {
+        conn.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM memories WHERE (?1 IS NULL OR namespace = ?1) \
+                 AND (?2 IS NULL OR tier = ?2) AND {}",
+                crate::identity::owner_stamp::sqlite_unstamped_predicate("metadata")
+            ),
+            params![namespace, tier_str],
+            |r| r.get(0),
+        )?
+    };
+    Ok(u64::try_from(count).unwrap_or(0))
+}
+
 /// v0.8.1 W2.1 (#1821 / gap G30) — purge the non-cascaded derived-store
 /// leaks (`federation_push_dlq` cleartext payload, `transcript_line_dedup`
 /// content-hash oracle) for the rows a forget is about to delete. MUST run
@@ -5991,6 +6321,7 @@ fn purge_and_tombstone_forget(
     tier: Option<&Tier>,
     caller: Option<&str>,
     now: &str,
+    mode: crate::identity::owner_stamp::UnstampedMutationMode,
 ) -> Result<()> {
     let tier_str = tier.map(|t| t.as_str().to_string());
     let mut bound: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
@@ -6005,11 +6336,10 @@ fn purge_and_tombstone_forget(
         );
         if let Some(c) = caller {
             bound.push(Box::new(c.to_string()));
-            q.push_str(
-                " AND (json_extract(m.metadata,'$.agent_id') = ?4 \
-                 OR json_extract(m.metadata,'$.agent_id') IS NULL \
-                 OR json_extract(m.metadata,'$.agent_id') = '')",
-            );
+            q.push_str(&format!(
+                " AND {}",
+                sql_owner_predicate(SQL_COL_M_METADATA, 4, mode)
+            ));
         }
         q
     } else {
@@ -6021,11 +6351,10 @@ fn purge_and_tombstone_forget(
         );
         if let Some(c) = caller {
             bound.push(Box::new(c.to_string()));
-            q.push_str(
-                " AND (json_extract(metadata,'$.agent_id') = ?3 \
-                 OR json_extract(metadata,'$.agent_id') IS NULL \
-                 OR json_extract(metadata,'$.agent_id') = '')",
-            );
+            q.push_str(&format!(
+                " AND {}",
+                sql_owner_predicate("metadata", 3, mode)
+            ));
         }
         q
     };
@@ -6841,6 +7170,8 @@ pub fn forget(
             tier,
             None,
             &Utc::now().to_rfc3339(),
+            // No caller → no owner clause; the posture is irrelevant.
+            crate::identity::owner_stamp::UnstampedMutationMode::Warn,
         )?;
 
         // Delete the same matched set (same tx, same write lock → same rows).
@@ -6974,6 +7305,7 @@ pub fn forget_count_for_caller(
     tier: Option<&Tier>,
     caller: &str,
 ) -> Result<usize> {
+    let mode = crate::identity::owner_stamp::mode();
     if pattern.is_none() && namespace.is_none() && tier.is_none() {
         // #962 typed envelope — 400 BAD_REQUEST via ValidationFailed.
         return Err(anyhow::Error::new(StorageError::InvalidArgument {
@@ -6984,16 +7316,17 @@ pub fn forget_count_for_caller(
         let fts_query = forget_fts_query(pat)?;
         let tier_str = tier.map(|t| t.as_str().to_string());
         let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM memories WHERE rowid IN (
+            &format!(
+                "SELECT COUNT(*) FROM memories WHERE rowid IN (
                 SELECT m.rowid FROM memories_fts fts
                 JOIN memories m ON m.rowid = fts.rowid
                 WHERE memories_fts MATCH ?1
                   AND (?2 IS NULL OR m.namespace = ?2)
                   AND (?3 IS NULL OR m.tier = ?3)
-                  AND (json_extract(m.metadata,'$.agent_id') = ?4
-                       OR json_extract(m.metadata,'$.agent_id') IS NULL
-                       OR json_extract(m.metadata,'$.agent_id') = '')
+                  AND {}
             )",
+                sql_owner_predicate(SQL_COL_M_METADATA, 4, mode)
+            ),
             params![fts_query, namespace, tier_str, caller],
             |r| r.get(0),
         )?;
@@ -7001,11 +7334,12 @@ pub fn forget_count_for_caller(
     }
     let tier_str = tier.map(|t| t.as_str().to_string());
     let count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM memories WHERE (?1 IS NULL OR namespace = ?1)
+        &format!(
+            "SELECT COUNT(*) FROM memories WHERE (?1 IS NULL OR namespace = ?1)
            AND (?2 IS NULL OR tier = ?2)
-           AND (json_extract(metadata,'$.agent_id') = ?3
-                OR json_extract(metadata,'$.agent_id') IS NULL
-                OR json_extract(metadata,'$.agent_id') = '')",
+           AND {}",
+            sql_owner_predicate("metadata", 3, mode)
+        ),
         params![namespace, tier_str, caller],
         |r| r.get(0),
     )?;
@@ -7031,19 +7365,19 @@ pub fn forget_distinct_namespaces_for_caller(
     tier: Option<&Tier>,
     caller: &str,
 ) -> Result<Vec<String>> {
+    let mode = crate::identity::owner_stamp::mode();
     let tier_str = tier.map(|t| t.as_str().to_string());
     if let Some(pat) = pattern {
         let fts_query = forget_fts_query(pat)?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare(&format!(
             "SELECT DISTINCT m.namespace
              FROM memories_fts fts
              JOIN memories m ON m.rowid = fts.rowid
              WHERE memories_fts MATCH ?1
                AND (?2 IS NULL OR m.tier = ?2)
-               AND (json_extract(m.metadata,'$.agent_id') = ?3
-                    OR json_extract(m.metadata,'$.agent_id') IS NULL
-                    OR json_extract(m.metadata,'$.agent_id') = '')",
-        )?;
+               AND {}",
+            sql_owner_predicate(SQL_COL_M_METADATA, 3, mode)
+        ))?;
         let rows = stmt
             .query_map(params![fts_query, tier_str, caller], |r| {
                 r.get::<_, String>(0)
@@ -7051,13 +7385,12 @@ pub fn forget_distinct_namespaces_for_caller(
             .collect::<rusqlite::Result<Vec<_>>>()?;
         return Ok(rows);
     }
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare(&format!(
         "SELECT DISTINCT namespace FROM memories
          WHERE (?1 IS NULL OR tier = ?1)
-           AND (json_extract(metadata,'$.agent_id') = ?2
-                OR json_extract(metadata,'$.agent_id') IS NULL
-                OR json_extract(metadata,'$.agent_id') = '')",
-    )?;
+           AND {}",
+        sql_owner_predicate("metadata", 2, mode)
+    ))?;
     let rows = stmt
         .query_map(params![tier_str, caller], |r| r.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -7078,6 +7411,7 @@ pub fn forget_matches_for_caller(
     limit: usize,
     caller: &str,
 ) -> Result<Vec<ForgetMatch>> {
+    let mode = crate::identity::owner_stamp::mode();
     if pattern.is_none() && namespace.is_none() && tier.is_none() {
         // #962 typed envelope — same refusal as `forget` / `forget_count`.
         return Err(anyhow::Error::new(StorageError::InvalidArgument {
@@ -7096,19 +7430,18 @@ pub fn forget_matches_for_caller(
     };
     if let Some(pat) = pattern {
         let fts_query = forget_fts_query(pat)?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare(&format!(
             "SELECT m.id, m.title, m.namespace, m.tier
              FROM memories_fts fts
              JOIN memories m ON m.rowid = fts.rowid
              WHERE memories_fts MATCH ?1
                AND (?2 IS NULL OR m.namespace = ?2)
                AND (?3 IS NULL OR m.tier = ?3)
-               AND (json_extract(m.metadata,'$.agent_id') = ?5
-                    OR json_extract(m.metadata,'$.agent_id') IS NULL
-                    OR json_extract(m.metadata,'$.agent_id') = '')
+               AND {}
              ORDER BY m.rowid
              LIMIT ?4",
-        )?;
+            sql_owner_predicate(SQL_COL_M_METADATA, 5, mode)
+        ))?;
         let rows = stmt
             .query_map(
                 params![fts_query, namespace, tier_str, limit_i64, caller],
@@ -7117,15 +7450,14 @@ pub fn forget_matches_for_caller(
             .collect::<rusqlite::Result<Vec<_>>>()?;
         return Ok(rows);
     }
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare(&format!(
         "SELECT id, title, namespace, tier FROM memories
          WHERE (?1 IS NULL OR namespace = ?1) AND (?2 IS NULL OR tier = ?2)
-           AND (json_extract(metadata,'$.agent_id') = ?4
-                OR json_extract(metadata,'$.agent_id') IS NULL
-                OR json_extract(metadata,'$.agent_id') = '')
+           AND {}
          ORDER BY rowid
          LIMIT ?3",
-    )?;
+        sql_owner_predicate("metadata", 4, mode)
+    ))?;
     let rows = stmt
         .query_map(
             params![namespace, tier_str, limit_i64, caller],
@@ -7159,12 +7491,30 @@ pub fn forget_for_caller(
         }));
     }
 
+    // #3124 — ONE posture for the whole statement set (preview-equivalent
+    // archive copy, purge/tombstone set and DELETE all use the same `mode`).
+    let mode = crate::identity::owner_stamp::mode();
+
     // #1776 — archive + delete MUST be ONE atomic transaction (see [`forget`]
     // for the full rationale). The owner clause (#1772) is pinned to the
     // identical row set across the archive SELECT and the DELETE because the
     // `BEGIN IMMEDIATE` write lock is held for the whole transaction.
     let write_txn = connection::WriteTxn::begin(conn)?;
     let result = (|| -> Result<usize> {
+        // #3124 — under `warn` report the unstamped rows this forget admits
+        // (WARN + counter); under `refuse` the owner predicate excludes them.
+        if !mode.refuses() {
+            let unstamped = forget_unstamped_victim_count(conn, namespace, pattern, tier)?;
+            let _admitted = crate::identity::owner_stamp::admit_unstamped_rows(
+                crate::identity::owner_stamp::MutationSite::sqlite(
+                    crate::identity::owner_stamp::funnel::FORGET,
+                ),
+                namespace.unwrap_or("*"),
+                caller,
+                unstamped,
+                mode,
+            );
+        }
         if archive {
             // Archive matching memories before deletion.
             let now = Utc::now().to_rfc3339();
@@ -7172,7 +7522,7 @@ pub fn forget_for_caller(
                 let fts_query = forget_fts_query(pat)?;
                 let tier_str = tier.map(|t| t.as_str().to_string());
                 conn.execute(
-                    "INSERT OR REPLACE INTO archived_memories
+                    &format!("INSERT OR REPLACE INTO archived_memories
                      (id, tier, namespace, title, content, tags, priority, confidence,
                       source, access_count, created_at, updated_at, last_accessed_at,
                       expires_at, archived_at, archive_reason, metadata,
@@ -7200,16 +7550,14 @@ pub fn forget_for_caller(
                         WHERE memories_fts MATCH ?1
                           AND (?2 IS NULL OR m.namespace = ?2)
                           AND (?3 IS NULL OR m.tier = ?3)
-                          AND (json_extract(m.metadata,'$.agent_id') = ?5
-                               OR json_extract(m.metadata,'$.agent_id') IS NULL
-                               OR json_extract(m.metadata,'$.agent_id') = '')
-                     )",
+                          AND {}
+                     )", sql_owner_predicate(SQL_COL_M_METADATA, 5, mode)),
                     params![fts_query, namespace, tier_str, now, caller],
                 )?;
             } else {
                 let tier_str = tier.map(|t| t.as_str().to_string());
                 conn.execute(
-                    "INSERT OR REPLACE INTO archived_memories
+                    &format!("INSERT OR REPLACE INTO archived_memories
                      (id, tier, namespace, title, content, tags, priority, confidence,
                       source, access_count, created_at, updated_at, last_accessed_at,
                       expires_at, archived_at, archive_reason, metadata,
@@ -7233,9 +7581,7 @@ pub fn forget_for_caller(
                     cid, cid_genesis
                      FROM memories WHERE (?1 IS NULL OR namespace = ?1)
                        AND (?2 IS NULL OR tier = ?2)
-                       AND (json_extract(metadata,'$.agent_id') = ?4
-                            OR json_extract(metadata,'$.agent_id') IS NULL
-                            OR json_extract(metadata,'$.agent_id') = '')",
+                       AND {}", sql_owner_predicate("metadata", 4, mode)),
                     params![namespace, tier_str, now, caller],
                 )?;
             }
@@ -7252,7 +7598,8 @@ pub fn forget_for_caller(
                 let fts_query = forget_fts_query(pat)?;
                 let tier_str = tier.map(|t| t.as_str().to_string());
                 conn.execute(
-                    "INSERT OR IGNORE INTO archived_memory_links
+                    &format!(
+                        "INSERT OR IGNORE INTO archived_memory_links
                          (source_id, target_id, relation, created_at, valid_from, valid_until,
                           observed_by, signature, attest_level, archived_at, source_cid, target_cid)
                      SELECT ml.source_id, ml.target_id, ml.relation, ml.created_at,
@@ -7265,9 +7612,7 @@ pub fn forget_for_caller(
                             WHERE memories_fts MATCH ?1
                               AND (?2 IS NULL OR m.namespace = ?2)
                               AND (?3 IS NULL OR m.tier = ?3)
-                              AND (json_extract(m.metadata,'$.agent_id') = ?5
-                                   OR json_extract(m.metadata,'$.agent_id') IS NULL
-                                   OR json_extract(m.metadata,'$.agent_id') = '')
+                              AND {}
                         )
                         OR ml.target_id IN (
                             SELECT m.id FROM memories_fts fts
@@ -7275,16 +7620,18 @@ pub fn forget_for_caller(
                             WHERE memories_fts MATCH ?1
                               AND (?2 IS NULL OR m.namespace = ?2)
                               AND (?3 IS NULL OR m.tier = ?3)
-                              AND (json_extract(m.metadata,'$.agent_id') = ?5
-                                   OR json_extract(m.metadata,'$.agent_id') IS NULL
-                                   OR json_extract(m.metadata,'$.agent_id') = '')
+                              AND {}
                         )",
+                        sql_owner_predicate(SQL_COL_M_METADATA, 5, mode),
+                        sql_owner_predicate(SQL_COL_M_METADATA, 5, mode)
+                    ),
                     params![fts_query, namespace, tier_str, now, caller],
                 )?;
             } else {
                 let tier_str = tier.map(|t| t.as_str().to_string());
                 conn.execute(
-                    "INSERT OR IGNORE INTO archived_memory_links
+                    &format!(
+                        "INSERT OR IGNORE INTO archived_memory_links
                          (source_id, target_id, relation, created_at, valid_from, valid_until,
                           observed_by, signature, attest_level, archived_at, source_cid, target_cid)
                      SELECT ml.source_id, ml.target_id, ml.relation, ml.created_at,
@@ -7294,17 +7641,16 @@ pub fn forget_for_caller(
                      WHERE ml.source_id IN (
                             SELECT id FROM memories
                             WHERE (?1 IS NULL OR namespace = ?1) AND (?2 IS NULL OR tier = ?2)
-                              AND (json_extract(metadata,'$.agent_id') = ?4
-                                   OR json_extract(metadata,'$.agent_id') IS NULL
-                                   OR json_extract(metadata,'$.agent_id') = '')
+                              AND {}
                         )
                         OR ml.target_id IN (
                             SELECT id FROM memories
                             WHERE (?1 IS NULL OR namespace = ?1) AND (?2 IS NULL OR tier = ?2)
-                              AND (json_extract(metadata,'$.agent_id') = ?4
-                                   OR json_extract(metadata,'$.agent_id') IS NULL
-                                   OR json_extract(metadata,'$.agent_id') = '')
+                              AND {}
                         )",
+                        sql_owner_predicate("metadata", 4, mode),
+                        sql_owner_predicate("metadata", 4, mode)
+                    ),
                     params![namespace, tier_str, now, caller],
                 )?;
             }
@@ -7321,6 +7667,7 @@ pub fn forget_for_caller(
             tier,
             Some(caller),
             &Utc::now().to_rfc3339(),
+            mode,
         )?;
 
         // Delete the same matched set (same tx, same write lock → same rows).
@@ -7331,26 +7678,28 @@ pub fn forget_for_caller(
             let fts_query = forget_fts_query(pat)?;
             let tier_str = tier.map(|t| t.as_str().to_string());
             conn.execute(
-                "DELETE FROM memories WHERE rowid IN (
+                &format!(
+                    "DELETE FROM memories WHERE rowid IN (
                     SELECT m.rowid FROM memories_fts fts
                     JOIN memories m ON m.rowid = fts.rowid
                     WHERE memories_fts MATCH ?1
                       AND (?2 IS NULL OR m.namespace = ?2)
                       AND (?3 IS NULL OR m.tier = ?3)
-                      AND (json_extract(m.metadata,'$.agent_id') = ?4
-                           OR json_extract(m.metadata,'$.agent_id') IS NULL
-                           OR json_extract(m.metadata,'$.agent_id') = '')
+                      AND {}
                 )",
+                    sql_owner_predicate(SQL_COL_M_METADATA, 4, mode)
+                ),
                 params![fts_query, namespace, tier_str, caller],
             )
         } else {
             let tier_str = tier.map(|t| t.as_str().to_string());
             conn.execute(
-                "DELETE FROM memories WHERE (?1 IS NULL OR namespace = ?1)
+                &format!(
+                    "DELETE FROM memories WHERE (?1 IS NULL OR namespace = ?1)
                    AND (?2 IS NULL OR tier = ?2)
-                   AND (json_extract(metadata,'$.agent_id') = ?3
-                        OR json_extract(metadata,'$.agent_id') IS NULL
-                        OR json_extract(metadata,'$.agent_id') = '')",
+                   AND {}",
+                    sql_owner_predicate("metadata", 3, mode)
+                ),
                 params![namespace, tier_str, caller],
             )
         }
@@ -7453,15 +7802,6 @@ pub fn build_list_query(
     // pushdown. `None` = no narrowing (byte-identical legacy SQL). See
     // `crate::store::MetadataEq`.
     metadata_eq: Option<(&str, &str)>,
-    // v1.0.0 #3463 — restrict to UNREAD rows (`access_count = 0`, the #3027
-    // unread marker) INSIDE the query, i.e. BEFORE `LIMIT`. The inbox surfaces
-    // used to prefetch the newest `limit` rows and drop the read ones in Rust
-    // afterwards, so an agent whose newest `limit` messages were all read was
-    // told it had NOTHING unread while older unread rows sat in the namespace —
-    // a silent false negative that any wake-then-read-once design inherits.
-    // `false` = no narrowing (byte-identical legacy SQL, hence the same cached
-    // plan for every pre-#3463 list shape).
-    unread_only: bool,
     limit: usize,
     offset: usize,
 ) -> (String, Vec<Box<dyn rusqlite::types::ToSql>>) {
@@ -7541,16 +7881,8 @@ pub fn build_list_query(
         params_vec.push(Box::new(k.to_string()));
         params_vec.push(Box::new(v.to_string()));
     }
-    // v1.0.0 #3463 — the unread axis, pushed down like every other filter:
-    // appended ONLY when requested, so the unfiltered shape keeps its exact
-    // legacy SQL. `access_count` is a real NOT NULL column on BOTH backends,
-    // and `= 0` is the SAME unread marker `#3027` pinned for the projection
-    // (`read: access_count > 0`), so the filter and the wire field can never
-    // disagree. Placed BEFORE `SQL_LIST_ORDER_LIMIT` — that is the whole point
-    // of the fix: the narrowing must precede `LIMIT`, never follow it.
-    if unread_only {
-        sql.push_str(SQL_FRAGMENT_AND_UNREAD);
-    }
+    // #3730 — no read-state narrowing here (see the note beside
+    // `SQL_LIST_ORDER_LIMIT`, where the #3463 fragment used to live).
     // v1.0.0 R19/A3 (#1948) — fail-closed lifecycle allow-list hides
     // Tombstoned/Quarantined (and any unknown state) from list. No alias in
     // SQL_LIST_BASE, so the unqualified column is used.
@@ -7593,9 +7925,6 @@ pub fn list(
         agent_id,
         valid_at,
         None,
-        // v1.0.0 #3463 — the historical `list` shape never narrowed on read
-        // state; `false` keeps every one of its ~30 call sites byte-identical.
-        false,
     )
 }
 
@@ -7625,9 +7954,6 @@ pub fn list_filtered(
     agent_id: Option<&str>,
     valid_at: Option<&str>,
     metadata_eq: Option<(&str, &str)>,
-    // v1.0.0 #3463 — narrow to UNREAD rows (`access_count = 0`) IN SQL, before
-    // the `LIMIT`. See [`build_list_query`]; `false` = no narrowing.
-    unread_only: bool,
 ) -> Result<Vec<Memory>> {
     let now = Utc::now().to_rfc3339();
     let (sql, params_vec) = build_list_query(
@@ -7641,7 +7967,6 @@ pub fn list_filtered(
         agent_id,
         valid_at,
         metadata_eq,
-        unread_only,
         limit,
         offset,
     );
@@ -8742,16 +9067,109 @@ pub fn find_by_title_namespace(
     conn: &Connection,
     title: &str,
     namespace: &str,
+    viewer: Option<&str>,
 ) -> Result<Option<String>> {
+    // #3690 / #3695 / #3696 — answer with an occupant the `viewer` may READ on
+    // BOTH axes, through THE ONE admission predicate
+    // (`visibility::title_slot_admission`). A tombstone holds no slot at v100
+    // (a store lands beside it); a hidden `quarantined` / `contaminated`
+    // occupant, or another agent's `scope=private` row, is never NAMED to the
+    // caller: the write funnels refuse it with an empty `existing_id`, and
+    // this is the probe those funnels (and the `on_conflict` pre-checks) read
+    // it from, so it must not hand the hidden id back either. `None` is the
+    // single-tenant trust-all posture (lifecycle axis only).
+    Ok(title_slot_holder(conn, title, namespace, viewer)?
+        .filter(|h| h.admission == crate::models::TitleSlotAdmission::Occupied)
+        .map(|h| h.id))
+}
+
+/// #3690 — the row that HOLDS the `(title, namespace)` slot (the occupant the
+/// v100 partial unique index knows about), with its admission derived ONCE
+/// from the lifecycle text the row carries. `None` when the slot is free —
+/// which includes "held only by a tombstone".
+struct TitleSlotHolder {
+    id: String,
+    version: i64,
+    admission: crate::models::TitleSlotAdmission,
+}
+
+/// The admission is decided by THE ONE two-axis predicate
+/// [`crate::visibility::title_slot_admission`] (lifecycle + the `viewer`'s
+/// scope visibility); a holder whose stored metadata is unparseable is read
+/// as `{}` (the `row_to_memory` fallback), i.e. owner-less private.
+fn title_slot_holder(
+    conn: &Connection,
+    title: &str,
+    namespace: &str,
+    viewer: Option<&str>,
+) -> Result<Option<TitleSlotHolder>> {
     use rusqlite::OptionalExtension;
-    let id: Option<String> = conn
+    conn.query_row(
+        &format!(
+            "SELECT id, version, lifecycle_state, namespace, metadata FROM memories \
+             WHERE title = ?1 AND namespace = ?2 AND {} LIMIT 1",
+            crate::models::TITLE_SLOT_INDEX_PREDICATE
+        ),
+        params![title, namespace],
+        |r| {
+            let id: String = r.get(0)?;
+            let state: String = r.get(2)?;
+            let ns: String = r.get(3)?;
+            let raw_meta: String = r.get(4)?;
+            let metadata: serde_json::Value = serde_json::from_str(&raw_meta)
+                .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()));
+            let admission = crate::visibility::title_slot_admission(
+                &crate::visibility::TitleSlotOccupant {
+                    id: &id,
+                    namespace: &ns,
+                    metadata: &metadata,
+                    lifecycle_state: &state,
+                },
+                viewer,
+            );
+            Ok(TitleSlotHolder {
+                id,
+                version: r.get(1)?,
+                admission,
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+/// #3690 — the row already stored under the INCOMING id, when it holds the
+/// same `(title, namespace)` key the write is about to claim but is NOT the
+/// slot holder (so it is hidden: a tombstone, or a quarantined /
+/// contaminated row). A same-id write cannot land beside it (PRIMARY KEY),
+/// so the funnel decides by admission: a restore updates a tombstone IN
+/// PLACE ([`InsertConflictArm::RestoreSameId`], the #2887 idempotent
+/// restore), and every other disposition is a typed conflict that does not
+/// name the row. `None` when no row carries the id, or when the row carries
+/// the id under a DIFFERENT key (the pre-#3690 PRIMARY KEY error stands).
+struct SameIdHiddenRow {
+    version: i64,
+    admission: crate::models::TitleSlotAdmission,
+}
+
+fn same_id_hidden_row_under_key(
+    conn: &Connection,
+    mem: &Memory,
+) -> Result<Option<SameIdHiddenRow>> {
+    use rusqlite::OptionalExtension;
+    let row: Option<(String, String, i64, String)> = conn
         .query_row(
-            "SELECT id FROM memories WHERE title = ?1 AND namespace = ?2 LIMIT 1",
-            params![title, namespace],
-            |r| r.get(0),
+            "SELECT title, namespace, version, lifecycle_state FROM memories WHERE id = ?1",
+            params![mem.id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
         .optional()?;
-    Ok(id)
+    Ok(row.and_then(|(title, namespace, version, state)| {
+        (title == mem.title && namespace == mem.namespace).then(|| SameIdHiddenRow {
+            version,
+            admission: crate::models::LifecycleState::title_slot_admission_for(&state),
+        })
+    }))
 }
 
 /// v0.6.3.1 P2 (G6) — pick a title that does not collide with an existing
@@ -8772,12 +9190,12 @@ pub fn next_versioned_title(
     base_title: &str,
     namespace: &str,
 ) -> Result<String> {
-    if find_by_title_namespace(conn, base_title, namespace)?.is_none() {
+    if find_by_title_namespace(conn, base_title, namespace, None)?.is_none() {
         return Ok(base_title.to_string());
     }
     for n in 2..=MAX_VERSION_SUFFIX {
         let candidate = format!("{base_title} ({n})");
-        if find_by_title_namespace(conn, &candidate, namespace)?.is_none() {
+        if find_by_title_namespace(conn, &candidate, namespace, None)?.is_none() {
             return Ok(candidate);
         }
     }
@@ -8868,7 +9286,12 @@ fn find_similar_title_candidates(
     limit: usize,
 ) -> Result<Vec<Memory>> {
     let fts_query = sanitize_fts_query(title, true);
-    let mut stmt = conn.prepare(
+    // #3693 — the fail-closed lifecycle allow-list (the #2600 precedent): a
+    // quarantined / contaminated / tombstoned row must reach neither the
+    // contradiction warning (its id would be reported to the caller) nor the
+    // Form-1 synthesis curator (its text would be merged into a visible
+    // memory, laundering the quarantine).
+    let mut stmt = conn.prepare(&format!(
         "SELECT m.id, m.tier, m.namespace, m.title, m.content, m.tags, m.priority,
                 m.confidence, m.source, m.access_count, m.created_at, m.updated_at,
                 m.last_accessed_at, m.expires_at, m.metadata, m.reflection_depth,
@@ -8878,10 +9301,11 @@ fn find_similar_title_candidates(
                 m.encrypted_envelope
          FROM memories_fts fts
          JOIN memories m ON m.rowid = fts.rowid
-         WHERE memories_fts MATCH ?1 AND m.namespace = ?2
+         WHERE memories_fts MATCH ?1 AND m.namespace = ?2 {lifecycle_vis}
          ORDER BY fts.rank
          LIMIT ?3",
-    )?;
+        lifecycle_vis = crate::models::lifecycle_visible_clause("m"),
+    ))?;
     let rows = stmt.query_map(
         params![fts_query, namespace, i64::try_from(limit).unwrap_or(20)],
         // v1.0.0 #2383 (N1) — discovery scan: skip undecryptable rows.
@@ -8917,13 +9341,27 @@ fn find_similar_title_candidates(
 /// `"kubernetes rolling deploy strategy"`, Jaccard 1/6 ≈ 0.167)
 /// without depending on whether 0.30 happens to be the right
 /// stopword-noise floor for the wire surface.
-pub fn find_contradictions(conn: &Connection, title: &str, namespace: &str) -> Result<Vec<Memory>> {
+///
+/// **Visibility** (#3712): this is a DISCRETIONARY probe whose output is
+/// echoed to the caller as `potential_contradictions`, so it is filtered
+/// through the caller's READ visibility (`viewer`: the value the read lanes
+/// resolve; `None` = single-tenant trust-all) BEFORE the wire cap — a row
+/// the caller cannot read is never named in a store response, and never
+/// consumes one of the five wire slots either. The same rule the
+/// near-duplicate funnel applies (`proactive_conflict_check`).
+pub fn find_contradictions(
+    conn: &Connection,
+    title: &str,
+    namespace: &str,
+    viewer: Option<&str>,
+) -> Result<Vec<Memory>> {
     // Stage 1 — FTS5 recall. Pull a wider candidate pool (20) so the
     // stage-2 Jaccard filter has headroom; the final cap of 5 is
     // applied after the filter so the wire shape is preserved.
     let candidates = find_similar_title_candidates(conn, title, namespace, 20)?;
 
-    // Stage 2 — Jaccard floor on stopword-stripped title tokens.
+    // Stage 2 — Jaccard floor on stopword-stripped title tokens, then the
+    // #3712 visibility filter, then the wire cap.
     let seed_tokens = contradiction_title_tokens(title);
     let mut filtered: Vec<Memory> = candidates
         .into_iter()
@@ -8932,6 +9370,7 @@ pub fn find_contradictions(conn: &Connection, title: &str, namespace: &str) -> R
             contradiction_title_jaccard(&seed_tokens, &cand_tokens)
                 >= CONTRADICTION_TITLE_JACCARD_FLOOR
         })
+        .filter(|cand| crate::visibility::is_readable_on_query(cand, viewer, Some(namespace)))
         .collect();
     filtered.truncate(5);
     Ok(filtered)
@@ -10462,7 +10901,7 @@ pub fn consolidate(
         // the envelope is NULL — byte-identical to pre-#2301 behaviour.
         // `consolidator_agent_id` is the authoritative NHI owner stamped into
         // `metadata.agent_id` above, so it is the correct seal key.
-        let sealed = crate::encryption::seal_content(summary, consolidator_agent_id)?;
+        let sealed = seal_content_guarded(conn, summary, consolidator_agent_id)?;
         let content_to_store = sealed.as_ref().map_or(summary, |(_, ph)| ph.as_str());
         let encrypted_envelope: Option<&[u8]> = sealed.as_ref().map(|(env, _)| env.as_slice());
 
@@ -10527,10 +10966,25 @@ pub fn consolidate(
                 // while keeping the row (and its cid) reachable as a lineage
                 // ancestor. Raw UPDATE — this is a system transition, not a
                 // caller-reachable `LifecycleState::can_transition_to` edge.
-                conn.execute(
-                    "UPDATE memories SET lifecycle_state = ?1, updated_at = ?2 WHERE id = ?3",
+                // #3691 — the tombstone is GUARDED by the visible allow-list
+                // (built from `RECALL_VISIBLE_LIFECYCLE_STATES`, never hand-typed):
+                // a source that was quarantined / contaminated between the
+                // snapshot read above and this write keeps its security state
+                // — overwriting it with `tombstoned` would lose the taint and let
+                // a later rollback (#2894) make the row visible again. Zero
+                // rows affected aborts the WHOLE cluster: the error unwinds the
+                // enclosing transaction, so no summary row and no edge commit.
+                let tombstoned = conn.execute(
+                    &format!(
+                        "UPDATE memories SET lifecycle_state = ?1, updated_at = ?2 \
+                         WHERE id = ?3 {}",
+                        crate::models::lifecycle_visible_clause("")
+                    ),
                     params![crate::models::LifecycleState::Tombstoned.as_str(), now, id],
                 )?;
+                if tombstoned != 1 {
+                    return Err(consolidate_source_hidden(id).into());
+                }
             }
         } else {
             // LEGACY hard-DELETE path. We intentionally do NOT create
@@ -11345,6 +11799,12 @@ pub fn proactive_conflict_check(
     conn: &Connection,
     mem: &Memory,
     query_embedding: &[f32],
+    // #3712 — the caller's READ-visibility identity (the value the read lanes
+    // resolve; `None` = single-tenant trust-all): a near-duplicate the caller
+    // cannot read (another agent's `scope=private` row) is dropped BEFORE
+    // scoring, so it neither refuses the write nor is named or described in
+    // the refusal — the #3696 non-disclosure rule on the near-duplicate lane.
+    viewer: Option<&str>,
 ) -> Result<Option<ProactiveConflict>> {
     if query_embedding.is_empty() {
         return Ok(None);
@@ -11384,16 +11844,20 @@ pub fn proactive_conflict_check(
     // gate (see the comment there) rather than relying on this one
     // transitively.
     let active_space = crate::embeddings::active_embedding_space();
-    let mut stmt = conn.prepare(
-        "SELECT id, title, content, embedding FROM memories
+    // #3693 — a hidden (quarantined / contaminated / tombstoned) row is never
+    // a conflict advisory's subject: its id would be named to the caller.
+    let mut stmt = conn.prepare(&format!(
+        "SELECT id, title, content, embedding, namespace, metadata FROM memories
          WHERE embedding IS NOT NULL
            AND (expires_at IS NULL OR expires_at > ?1)
            AND namespace = ?2
            AND (?4 IS NULL OR embedding_space = ?4)
+           {lifecycle_vis}
          ORDER BY updated_at DESC
          LIMIT ?3",
-    )?;
-    let rows: Vec<(String, String, String, Vec<u8>)> = stmt
+        lifecycle_vis = crate::models::lifecycle_visible_clause(""),
+    ))?;
+    let rows: Vec<ProactiveCandidateRow> = stmt
         .query_map(
             params![
                 now,
@@ -11401,18 +11865,15 @@ pub fn proactive_conflict_check(
                 i64::try_from(PROACTIVE_CONFLICT_SCAN_LIMIT).unwrap_or(i64::MAX),
                 active_space
             ],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, Vec<u8>>(3)?,
-                ))
-            },
+            read_proactive_candidate_row,
         )?
         .collect::<rusqlite::Result<Vec<_>>>()?;
 
-    Ok(proactive_conflict_verdict(mem, query_embedding, rows))
+    Ok(proactive_conflict_verdict(
+        mem,
+        query_embedding,
+        visible_proactive_candidates(rows, viewer),
+    ))
 }
 
 /// #1579 A5 — HNSW-routed entry point for the proactive conflict
@@ -11458,6 +11919,9 @@ pub fn proactive_conflict_check_with_index(
     mem: &Memory,
     query_embedding: &[f32],
     vector_index: Option<&dyn crate::hnsw::VectorSearchIndex>,
+    // #3712 — the caller's READ-visibility identity: an invisible near-
+    // duplicate neither refuses the write nor is named (`None` = trust-all).
+    viewer: Option<&str>,
 ) -> Result<Option<ProactiveConflict>> {
     if query_embedding.is_empty() {
         return Ok(None);
@@ -11472,14 +11936,14 @@ pub fn proactive_conflict_check_with_index(
     {
         let hits = idx.search(query_embedding, PROACTIVE_CONFLICT_INDEX_K, None);
         let ids: Vec<String> = hits.into_iter().map(|h| h.id).collect();
-        return proactive_conflict_check_candidates(conn, mem, query_embedding, &ids);
+        return proactive_conflict_check_candidates(conn, mem, query_embedding, &ids, viewer);
     }
     tracing::trace!(
         target: "proactive_conflict",
         namespace = %mem.namespace,
         "no fully-searchable (or empty) vector index — bounded recency-scan fallback (#1579 A5)"
     );
-    proactive_conflict_check(conn, mem, query_embedding)
+    proactive_conflict_check(conn, mem, query_embedding, viewer)
 }
 
 /// #1579 A5 — verify an ANN-derived candidate id list against the DB
@@ -11500,6 +11964,8 @@ pub fn proactive_conflict_check_candidates(
     mem: &Memory,
     query_embedding: &[f32],
     candidate_ids: &[String],
+    // #3712 — see `proactive_conflict_check`.
+    viewer: Option<&str>,
 ) -> Result<Option<ProactiveConflict>> {
     if query_embedding.is_empty() || candidate_ids.is_empty() {
         return Ok(None);
@@ -11527,15 +11993,19 @@ pub fn proactive_conflict_check_candidates(
     // when no active space is seeded.
     let active_space = crate::embeddings::active_embedding_space();
     let sql = format!(
-        "SELECT id, title, content, embedding FROM memories
+        "SELECT id, title, content, embedding, namespace, metadata FROM memories
          WHERE id IN ({placeholders})
            AND embedding IS NOT NULL
            AND (expires_at IS NULL OR expires_at > ?{p_now})
            AND namespace = ?{p_ns}
-           AND (?{p_space} IS NULL OR embedding_space = ?{p_space})",
+           AND (?{p_space} IS NULL OR embedding_space = ?{p_space})
+           {lifecycle_vis}",
         p_now = candidate_ids.len() + 1,
         p_ns = candidate_ids.len() + 2,
         p_space = candidate_ids.len() + 3,
+        // #3693 — the ANN index may still hold a row that was hidden after
+        // it was indexed; the row-side allow-list is the fail-closed gate.
+        lifecycle_vis = crate::models::lifecycle_visible_clause(""),
     );
     let mut stmt = conn.prepare(&sql)?;
     // Heterogeneous bind types (candidate ids + now + namespace are
@@ -11549,18 +12019,64 @@ pub fn proactive_conflict_check_candidates(
     binds.push(rusqlite::types::Value::Text(now));
     binds.push(rusqlite::types::Value::Text(mem.namespace.clone()));
     binds.push(active_space.map_or(rusqlite::types::Value::Null, rusqlite::types::Value::Text));
-    let rows: Vec<(String, String, String, Vec<u8>)> = stmt
-        .query_map(rusqlite::params_from_iter(binds), |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, Vec<u8>>(3)?,
-            ))
-        })?
+    let rows: Vec<ProactiveCandidateRow> = stmt
+        .query_map(
+            rusqlite::params_from_iter(binds),
+            read_proactive_candidate_row,
+        )?
         .collect::<rusqlite::Result<Vec<_>>>()?;
 
-    Ok(proactive_conflict_verdict(mem, query_embedding, rows))
+    Ok(proactive_conflict_verdict(
+        mem,
+        query_embedding,
+        visible_proactive_candidates(rows, viewer),
+    ))
+}
+
+/// #3712 — one near-duplicate candidate as both proactive SELECTs project
+/// it: the scoring tuple plus the `(namespace, metadata)` the scope
+/// predicate needs.
+struct ProactiveCandidateRow {
+    id: String,
+    title: String,
+    content: String,
+    embedding: Vec<u8>,
+    namespace: String,
+    metadata: String,
+}
+
+fn read_proactive_candidate_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<ProactiveCandidateRow> {
+    Ok(ProactiveCandidateRow {
+        id: row.get(0)?,
+        title: row.get(1)?,
+        content: row.get(2)?,
+        embedding: row.get(3)?,
+        namespace: row.get(4)?,
+        metadata: row.get(5)?,
+    })
+}
+
+/// #3712 — drop every candidate the `viewer` cannot READ before scoring, via
+/// the public [`crate::visibility::is_visible_by_fields`] (the predicate
+/// every read lane applies; not a copy of it). `None` keeps every row (the
+/// single-tenant trust-all posture). Unparseable stored metadata reads as
+/// `{}` (owner-less private), the `row_to_memory` fallback.
+fn visible_proactive_candidates(
+    rows: Vec<ProactiveCandidateRow>,
+    viewer: Option<&str>,
+) -> Vec<(String, String, String, Vec<u8>)> {
+    rows.into_iter()
+        .filter(|r| {
+            viewer.is_none_or(|caller| {
+                let metadata: serde_json::Value = serde_json::from_str(&r.metadata)
+                    .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()));
+                crate::visibility::is_visible_by_fields(&r.id, &r.namespace, &metadata, caller)
+            })
+        })
+        .map(|r| (r.id, r.title, r.content, r.embedding))
+        .collect()
 }
 
 /// #1579 A5 — shared scoring + verdict tail of the proactive conflict
@@ -14070,6 +14586,74 @@ pub fn register_agent(
 
 /// List every registered agent. Rows are drawn from the `_agents` namespace
 /// and parsed out of each memory's metadata.
+/// #3372 — one agent row's `metadata` JSON → [`AgentRegistration`]. Shared
+/// by [`list_agents`] and the targeted [`get_agent`] so the two cannot drift.
+fn agent_registration_from_metadata(raw: &str) -> Result<AgentRegistration> {
+    let meta: serde_json::Value =
+        serde_json::from_str(raw).context("failed to parse agent metadata as JSON")?;
+    let agent_id = meta
+        .get("agent_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let agent_type = meta
+        .get(field_names::AGENT_TYPE)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let capabilities: Vec<String> = meta
+        .get(field_names::CAPABILITIES)
+        .and_then(serde_json::Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    let registered_at = meta
+        .get(field_names::REGISTERED_AT)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let last_seen_at = meta
+        .get(field_names::LAST_SEEN_AT)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    Ok(AgentRegistration {
+        agent_id,
+        agent_type,
+        capabilities,
+        registered_at,
+        last_seen_at,
+    })
+}
+
+/// #3372 — the ONE live registration for `agent_id`, or `None`. A targeted
+/// lookup on the `(title, namespace)` key the registry already writes
+/// (`agent_registration_title`), with the same expiry predicate
+/// [`list_agents`] applies — never a scan of the `_agents` namespace.
+///
+/// # Errors
+/// The row's metadata is not valid JSON, or the query fails.
+pub fn get_agent(conn: &Connection, agent_id: &str) -> Result<Option<AgentRegistration>> {
+    use rusqlite::OptionalExtension;
+    let title = crate::models::agent_registration_title(agent_id);
+    let now = Utc::now().to_rfc3339();
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT metadata FROM memories
+             WHERE namespace = ?1 AND title = ?2
+               AND (expires_at IS NULL OR expires_at > ?3)",
+            params![AGENTS_NAMESPACE, &title, now],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    raw.as_deref()
+        .map(agent_registration_from_metadata)
+        .transpose()
+}
+
 pub fn list_agents(conn: &Connection) -> Result<Vec<AgentRegistration>> {
     let now = Utc::now().to_rfc3339();
     let mut stmt = conn.prepare(
@@ -14084,45 +14668,7 @@ pub fn list_agents(conn: &Connection) -> Result<Vec<AgentRegistration>> {
 
     let mut agents = Vec::new();
     for r in rows {
-        let raw = r?;
-        let meta: serde_json::Value =
-            serde_json::from_str(&raw).context("failed to parse agent metadata as JSON")?;
-        let agent_id = meta
-            .get("agent_id")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        let agent_type = meta
-            .get(field_names::AGENT_TYPE)
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        let capabilities: Vec<String> = meta
-            .get(field_names::CAPABILITIES)
-            .and_then(serde_json::Value::as_array)
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let registered_at = meta
-            .get(field_names::REGISTERED_AT)
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        let last_seen_at = meta
-            .get(field_names::LAST_SEEN_AT)
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        agents.push(AgentRegistration {
-            agent_id,
-            agent_type,
-            capabilities,
-            registered_at,
-            last_seen_at,
-        });
+        agents.push(agent_registration_from_metadata(&r?)?);
     }
     Ok(agents)
 }
@@ -16208,6 +16754,26 @@ const SQL_ARCHIVE_LIST_PROJECTION: &str = "SELECT id, tier, namespace, title, co
      atomised_into, atom_of, mentioned_entity_id \
      FROM archived_memories";
 
+/// v1.0.0 #3124 — the archive ownership prefilter for the RESTORE mutation.
+/// Under `AI_MEMORY_UNSTAMPED_MUTATION=warn` it is byte-identical to the
+/// read-side [`archive_owner_scope_clause`] (the pre-#3124 contract); under
+/// `refuse` it drops the unstamped arms and confines the inbox arm to a
+/// STAMPED row (an unstamped row is not an addressed inbox row), so the
+/// prefilter agrees with the ONE Rust predicate the restore re-checks.
+fn archive_owner_mutation_clause(
+    idx: usize,
+    mode: crate::identity::owner_stamp::UnstampedMutationMode,
+) -> String {
+    if !mode.refuses() {
+        return archive_owner_scope_clause(idx);
+    }
+    let unstamped = crate::identity::owner_stamp::sqlite_unstamped_predicate("metadata");
+    format!(
+        "(json_extract(metadata, '$.agent_id') = ?{idx} OR \
+          (json_extract(metadata, '$.target_agent_id') = ?{idx} AND NOT {unstamped}))"
+    )
+}
+
 /// #3382 archive ownership SQL prefilter; the final read decision also
 /// applies canonical query visibility before pagination or aggregation.
 fn archive_owner_scope_clause(idx: usize) -> String {
@@ -16708,7 +17274,7 @@ pub fn restore_archived_for_caller(conn: &Connection, id: &str, caller: &str) ->
         // require query visibility; restoration keeps its recovery contract.
         let owned_sql = format!(
             "SELECT COUNT(*) > 0 FROM archived_memories WHERE id = ?1 AND {}",
-            archive_owner_scope_clause(2)
+            archive_owner_mutation_clause(2, crate::identity::owner_stamp::mode())
         );
         let owned: bool = conn
             .query_row(&owned_sql, params![id, caller], |r| r.get(0))
@@ -16775,7 +17341,14 @@ pub fn restore_archived_for_caller(conn: &Connection, id: &str, caller: &str) ->
         // caller context); ownership gating already happened on the
         // SELECT above.
         let candidate = load_archived_as_memory(conn, id)?;
-        if !crate::visibility::caller_owns_for_mutation(&candidate, caller, true) {
+        if !crate::visibility::caller_owns_for_mutation(
+            &candidate,
+            caller,
+            true,
+            crate::identity::owner_stamp::MutationSite::sqlite(
+                crate::identity::owner_stamp::funnel::RESTORE,
+            ),
+        ) {
             return Ok(false);
         }
         consult_governance_pre_write(&candidate)?;
@@ -17263,7 +17836,7 @@ fn archive_row_readable(
     };
     Ok(
         crate::visibility::is_readable_on_query(&memory, caller, namespace)
-            && caller.is_none_or(|c| crate::visibility::caller_owns_for_mutation(&memory, c, true)),
+            && caller.is_none_or(|c| crate::visibility::legacy_owner_admits_read(&memory, c, true)),
     )
 }
 
@@ -17396,35 +17969,260 @@ pub fn export_links(conn: &Connection) -> Result<Vec<MemoryLink>> {
          JOIN memories ms ON ms.id = ml.source_id AND (ms.expires_at IS NULL OR ms.expires_at > ?1)
          JOIN memories mt ON mt.id = ml.target_id AND (mt.expires_at IS NULL OR mt.expires_at > ?1)",
     )?;
-    let rows = stmt.query_map(params![now], |row| {
-        let relation_str: String = row.get(2)?;
-        Ok(MemoryLink {
-            source_id: row.get(0)?,
-            target_id: row.get(1)?,
-            // v0.7.0 fix campaign R1-M4 — see `get_links` for rationale.
-            relation: crate::models::MemoryLinkRelation::from_str(&relation_str)
-                .unwrap_or_default(),
-            created_at: row.get(3)?,
-            signature: row.get::<_, Option<Vec<u8>>>(4)?,
-            observed_by: row.get::<_, Option<String>>(5)?,
-            valid_from: row.get::<_, Option<String>>(6)?,
-            valid_until: row.get::<_, Option<String>>(7)?,
-            // v0.7.0 #860 — `export_links` is the federation outbound
-            // path; the wire shape stays without `attest_level` so
-            // pre-v0.7 receivers do not see an unknown field. Leaving
-            // this `None` keeps `skip_serializing_if` from emitting it.
-            attest_level: None,
-            // v1.0.0 #2215 — carry the schema-v75 lineage-DAG cid mirror
-            // (`source_cid` / `target_cid`) so the Portability-v2 envelope
-            // round-trips it losslessly. NULL mirror rows stay `None` →
-            // `skip_serializing_if` keeps the federation wire byte-identical.
-            source_cid: row.get::<_, Option<String>>(8)?,
-            target_cid: row.get::<_, Option<String>>(9)?,
-        })
-    })?;
+    let rows = stmt.query_map(params![now], export_link_from_row)?;
     rows.collect::<rusqlite::Result<Vec<_>>>()
         .map_err(Into::into)
 }
+
+/// Map one `export_links`-shaped row (`source_id, target_id, relation,
+/// created_at, signature, observed_by, valid_from, valid_until, source_cid,
+/// target_cid`, in that column order) into a [`MemoryLink`]. Shared by
+/// [`export_links`] and the #3288 paged export so the two cannot drift.
+pub(crate) fn export_link_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryLink> {
+    let relation_str: String = row.get(2)?;
+    Ok(MemoryLink {
+        source_id: row.get(0)?,
+        target_id: row.get(1)?,
+        // v0.7.0 fix campaign R1-M4 — see `get_links` for rationale.
+        relation: crate::models::MemoryLinkRelation::from_str(&relation_str).unwrap_or_default(),
+        created_at: row.get(3)?,
+        signature: row.get::<_, Option<Vec<u8>>>(4)?,
+        observed_by: row.get::<_, Option<String>>(5)?,
+        valid_from: row.get::<_, Option<String>>(6)?,
+        valid_until: row.get::<_, Option<String>>(7)?,
+        // v0.7.0 #860 — `export_links` is the federation outbound
+        // path; the wire shape stays without `attest_level` so
+        // pre-v0.7 receivers do not see an unknown field. Leaving
+        // this `None` keeps `skip_serializing_if` from emitting it.
+        attest_level: None,
+        // v1.0.0 #2215 — carry the schema-v75 lineage-DAG cid mirror
+        // (`source_cid` / `target_cid`) so the Portability-v2 envelope
+        // round-trips it losslessly. NULL mirror rows stay `None` →
+        // `skip_serializing_if` keeps the federation wire byte-identical.
+        source_cid: row.get::<_, Option<String>>(8)?,
+        target_cid: row.get::<_, Option<String>>(9)?,
+    })
+}
+
+/// #3690 — the ONE federation newer-wins literal, built ONCE: its conflict
+/// target is [`crate::models::TITLE_SLOT_CONFLICT_TARGET`] (the v100 partial
+/// index), so a local consolidation tombstone is not a merge target for an
+/// inbound row of a different id — the row lands beside it, visible. What
+/// the lane does with a HIDDEN holder, and with an inbound row whose ID is
+/// already local under a tombstone, is #3699's by-id newer-wins ruling.
+static INSERT_IF_NEWER_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    // APPEND-ONLY-SANCTIONED (#1823 G6 / #2954 / #3690) — this static IS the
+    // federation newer-wins statement `insert_if_newer` executes; that fn
+    // carries the sanction and the revision emission, the text lives here.
+    format!(
+        "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, last_accessed_at, expires_at, metadata, reflection_depth, memory_kind, entity_id, persona_version, citations, source_uri, source_span, confidence_source, confidence_signals, confidence_decayed_at, mentioned_entity_id, version, lifecycle_state, encrypted_envelope, cid, cid_genesis, valid_from, valid_until, kind_provenance)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34)
+             {conflict_target} DO UPDATE SET
+                -- v0.9.0 G8 (#1825) — a federation merge NEVER overwrites the
+                -- surviving local row's genesis content-id: keep the local
+                -- `cid` / `cid_genesis` (self-assign, not excluded) so
+                -- `federation_merge_preserves_local_cid` holds.
+                cid = memories.cid,
+                cid_genesis = memories.cid_genesis,
+                content = CASE WHEN excluded.updated_at > memories.updated_at
+                                 OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
+                               THEN excluded.content ELSE memories.content END,
+                -- #228 Commit B — the at-rest ciphertext envelope moves with
+                -- `content` under the IDENTICAL newer-wins tiebreak so the
+                -- placeholder and its ciphertext are never split across the
+                -- winner boundary (a winner's placeholder with the loser's
+                -- ciphertext would be undecryptable).
+                encrypted_envelope = CASE WHEN excluded.updated_at > memories.updated_at
+                                            OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
+                                          THEN excluded.encrypted_envelope ELSE memories.encrypted_envelope END,
+                tags = CASE WHEN excluded.updated_at > memories.updated_at
+                              OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
+                            THEN excluded.tags ELSE memories.tags END,
+                priority = MAX(memories.priority, excluded.priority),
+                confidence = MAX(memories.confidence, excluded.confidence),
+                source = CASE WHEN excluded.updated_at > memories.updated_at
+                                OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
+                              THEN excluded.source ELSE memories.source END,
+                tier = CASE WHEN excluded.tier = 'long' THEN 'long'
+                            WHEN memories.tier = 'long' THEN 'long'
+                            WHEN excluded.tier = 'mid' THEN 'mid'
+                            ELSE memories.tier END,
+                updated_at = MAX(memories.updated_at, excluded.updated_at),
+                access_count = MAX(memories.access_count, excluded.access_count),
+                -- v1.0.0 #2335 (FBL-20) — expires_at was the ONLY LWW-class
+                -- column with NO newer-wins guard: the bare
+                -- COALESCE(excluded.expires_at, memories.expires_at) adopted a
+                -- STALE losing peer's expiry verbatim, silently shortening a
+                -- live row's TTL (recall fold-extensions raise expires_at
+                -- WITHOUT bumping updated_at, so routine bidirectional sync
+                -- rolled local extensions back and GC reaped early — under the
+                -- v70 auto-eviction posture that ALSO meant permanent link-edge
+                -- loss, closed by #3161; the premature reap itself remains).
+                -- The merge is now the extension-FLOOR lattice join (scalar
+                -- MAX, both operands funnel-canonicalized per #2332 so byte
+                -- order is chronological): both replicas converge to the LATER
+                -- expiry regardless of push order (MAX is commutative /
+                -- idempotent — a true CRDT join, strictly stronger than the
+                -- updated_at tiebreak for this column), and the #1596
+                -- never-move-expiry-earlier contract holds across federation.
+                -- The long⇒NULL arm keeps the #1626 immortality coupling.
+                expires_at = CASE WHEN excluded.tier = 'long' OR memories.tier = 'long' THEN NULL
+                                  ELSE MAX(COALESCE(excluded.expires_at, memories.expires_at),
+                                           COALESCE(memories.expires_at, excluded.expires_at)) END,
+                -- #1784 — preserve immutable provenance keys (agent_id + the
+                -- consolidation derived_from / consolidated_from_agents arrays)
+                -- across a newer-wins merge: json_patch overlays the existing
+                -- row's provenance object (existing-wins, array-safe) on top of
+                -- the newer-wins base (excluded if newer, else the existing row).
+                -- #3626 — an UNSTAMPED local row stays unstamped even when the
+                -- inbound row wins (same rule as the create funnel: the merged
+                -- object has `agent_id` removed; one CASE arm evaluates).
+                metadata = CASE WHEN {unstamped_owner}
+                    THEN json_remove(json_patch(
+                        CASE WHEN excluded.updated_at > memories.updated_at
+                                  OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
+                             THEN excluded.metadata
+                             ELSE memories.metadata END,
+                        COALESCE(
+                            -- #2941 — same reserved set: a newer-wins federation
+                            -- merge must not unbind a locally-bound key.
+                            (SELECT json_group_object(key, value)
+                             FROM json_each(memories.metadata)
+                             WHERE key IN ('agent_id', 'derived_from', 'consolidated_from_agents', 'agent_pubkey', 'pubkey_bound_at')),
+                            '{{}}'
+                        )
+                    ), '$.agent_id')
+                    ELSE json_patch(
+                        CASE WHEN excluded.updated_at > memories.updated_at
+                                  OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
+                             THEN excluded.metadata
+                             ELSE memories.metadata END,
+                        COALESCE(
+                            (SELECT json_group_object(key, value)
+                             FROM json_each(memories.metadata)
+                             WHERE key IN ('agent_id', 'derived_from', 'consolidated_from_agents', 'agent_pubkey', 'pubkey_bound_at')),
+                            '{{}}'
+                        )
+                    ) END,
+                -- v0.7.0 Task 1/8 — recursion depth takes max so the reflection
+                -- signal isn't lost on newer-wins federation merges.
+                reflection_depth = MAX(memories.reflection_depth, excluded.reflection_depth),
+                -- v0.7.0 L1-1 — kind is sticky across federation merges: a
+                -- reflection row must not be downgraded to observation by a
+                -- newer-wins merge from a peer that doesn't know about the kind.
+                -- v0.7.0 QW-2 — Persona is similarly sticky.
+                memory_kind = CASE WHEN memories.memory_kind = 'reflection' THEN 'reflection'
+                                   WHEN memories.memory_kind = 'persona' THEN 'persona'
+                                   ELSE excluded.memory_kind END,
+                -- v0.7.0 QW-2 — entity_id + persona_version are immutable
+                -- once set so a federation merge can't drop the persona
+                -- discriminator off a `memory_kind = 'persona'` row.
+                entity_id = COALESCE(memories.entity_id, excluded.entity_id),
+                persona_version = COALESCE(memories.persona_version, excluded.persona_version),
+                -- v0.7.0 Form 4 — fact-provenance: replace the stored
+                -- citations array only when the incoming row wins the
+                -- newer-wins tiebreak; source_uri / source_span follow
+                -- COALESCE semantics so a federation merge that lacks
+                -- provenance does not blank out a value the local row
+                -- already had.
+                citations = CASE WHEN excluded.updated_at > memories.updated_at
+                                      OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
+                                 THEN excluded.citations ELSE memories.citations END,
+                source_uri = COALESCE(excluded.source_uri, memories.source_uri),
+                source_span = COALESCE(excluded.source_span, memories.source_span),
+                -- v0.7.0 Form 5 / v1.0.0 #2395 — the confidence field-set is
+                -- ATOMIC on the federation lane too. `confidence` merges by
+                -- MAX (a commutative lattice join, above) while the three
+                -- provenance columns merged on the updated_at/id NEWER-WINS
+                -- tiebreak — a DIFFERENT selector, so a peer whose row lost
+                -- the MAX but won the timestamp durably relabelled the local
+                -- row: `confidence` from one replica, `confidence_source` /
+                -- `confidence_signals` / `confidence_decayed_at` from the
+                -- other. A self-inconsistent calibration record, converged to
+                -- identically on every peer, i.e. permanent.
+                --
+                -- The tuple now moves with the operand that wins the
+                -- LEXICOGRAPHIC order (confidence, updated_at, id) — whose
+                -- first component is exactly the MAX above, so the surviving
+                -- number and its calibration record always describe the same
+                -- write. The order is total and deterministic on both sides of
+                -- a bidirectional sync, so the merge stays commutative /
+                -- idempotent (a true CRDT join): both replicas converge on the
+                -- SAME tuple regardless of push order. Exact `=` on the REAL
+                -- is only the tie BRANCH of that total order, never a logical
+                -- float-equality test.
+                confidence_source = CASE WHEN excluded.confidence > memories.confidence
+                                              OR (excluded.confidence = memories.confidence
+                                                  AND (excluded.updated_at > memories.updated_at
+                                                       OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)))
+                                         THEN excluded.confidence_source ELSE memories.confidence_source END,
+                confidence_signals = CASE WHEN excluded.confidence > memories.confidence
+                                               OR (excluded.confidence = memories.confidence
+                                                   AND (excluded.updated_at > memories.updated_at
+                                                        OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)))
+                                          THEN excluded.confidence_signals ELSE memories.confidence_signals END,
+                confidence_decayed_at = CASE WHEN excluded.confidence > memories.confidence
+                                                  OR (excluded.confidence = memories.confidence
+                                                      AND (excluded.updated_at > memories.updated_at
+                                                           OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)))
+                                             THEN excluded.confidence_decayed_at ELSE memories.confidence_decayed_at END,
+                -- v0.7.0 polish PERF-8 (#781) — newer-wins on the mention
+                -- tag (the winning row's content is the one a future matcher
+                -- query expects to find); otherwise preserve the local tag
+                -- so a stale peer that lacks the structured entity_id
+                -- metadata cannot blank out a value the index serves.
+                mentioned_entity_id = CASE WHEN excluded.updated_at > memories.updated_at
+                                                OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
+                                           THEN COALESCE(excluded.mentioned_entity_id, memories.mentioned_entity_id)
+                                           ELSE memories.mentioned_entity_id END,
+                -- #1631 (decide-once, #1029 contract) — `version` IS
+                -- replicated state on the federation merge path: merge via
+                -- MAX(local, remote) so an out-of-order peer push can't
+                -- roll the Gap-1 optimistic-concurrency counter backwards.
+                -- Matches the pg `apply_remote_memory` GREATEST arm.
+                version = MAX(memories.version, excluded.version),
+                -- v0.8.0 Pillar 2 (#1709) — lifecycle_state on the newer-wins
+                -- federation merge: the timestamp winner's state is adopted so
+                -- a peer that advanced a Goal open→done replicates that state;
+                -- a stale peer push (loses the tiebreak) preserves the local
+                -- lifecycle. Transition legality is enforced at the originating
+                -- update site, so the replicated value is already-validated.
+                lifecycle_state = CASE WHEN excluded.updated_at > memories.updated_at
+                                            OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
+                                       THEN excluded.lifecycle_state ELSE memories.lifecycle_state END,
+                -- v1.0.0 #2333 (FBL-03) + v1.0.0 #2394 — the v79 denormalized
+                -- kind_provenance FOLLOWS THE KIND THAT ACTUALLY WON on the
+                -- federation lane too. `memory_kind` above is sticky (a local
+                -- `reflection` / `persona` is never downgraded by a peer that
+                -- does not know the kind), but the bare COALESCE adopted the
+                -- peer's provenance unconditionally — so a stale peer pushing
+                -- `observation`/`llm` relabelled a surviving local `reflection`
+                -- as `llm`-provenanced. The CASE mirrors the `memory_kind`
+                -- CASE exactly (kind unchanged -> COALESCE per FBL-03; stored
+                -- sticky kind survived -> keep the local provenance; incoming
+                -- kind adopted -> take its provenance verbatim), and is
+                -- NULL-safe by construction.
+                kind_provenance = CASE WHEN excluded.memory_kind = memories.memory_kind
+                                            THEN COALESCE(excluded.kind_provenance, memories.kind_provenance)
+                                       WHEN memories.memory_kind IN ('reflection', 'persona')
+                                            THEN memories.kind_provenance
+                                       ELSE excluded.kind_provenance END,
+                -- v1.0.0 #1834 — claim-bitemporal validity under federation LWW.
+                -- `valid_from` is immutable (local genesis wins, like `cid`);
+                -- `valid_until` follows the newer-wins tiebreak so a peer that
+                -- CLOSED a claim (set the upper bound) replicates that close.
+                valid_from = memories.valid_from,
+                valid_until = CASE WHEN excluded.updated_at > memories.updated_at
+                                     OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
+                                   THEN excluded.valid_until ELSE memories.valid_until END
+             RETURNING id",
+        conflict_target = crate::models::TITLE_SLOT_CONFLICT_TARGET,
+        unstamped_owner =
+            crate::identity::owner_stamp::sqlite_unstamped_predicate(
+                crate::identity::owner_stamp::UPSERT_SURVIVING_METADATA_COL,
+            ),
+    )
+});
 
 /// Insert with timestamp-aware conflict resolution for sync.
 /// Only overwrites if the incoming memory is newer (by `updated_at`,
@@ -17580,193 +18378,13 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
         // #1579 B6 — federation catch-up replays this newer-wins upsert
         // once per pulled row; `prepare_cached` amortises the parse of the
         // largest SQL statement in the file across the whole batch.
-        let mut newer_wins_stmt = conn.prepare_cached(
-            "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, last_accessed_at, expires_at, metadata, reflection_depth, memory_kind, entity_id, persona_version, citations, source_uri, source_span, confidence_source, confidence_signals, confidence_decayed_at, mentioned_entity_id, version, lifecycle_state, encrypted_envelope, cid, cid_genesis, valid_from, valid_until, kind_provenance)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34)
-             ON CONFLICT(title, namespace) DO UPDATE SET
-                -- v0.9.0 G8 (#1825) — a federation merge NEVER overwrites the
-                -- surviving local row's genesis content-id: keep the local
-                -- `cid` / `cid_genesis` (self-assign, not excluded) so
-                -- `federation_merge_preserves_local_cid` holds.
-                cid = memories.cid,
-                cid_genesis = memories.cid_genesis,
-                content = CASE WHEN excluded.updated_at > memories.updated_at
-                                 OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
-                               THEN excluded.content ELSE memories.content END,
-                -- #228 Commit B — the at-rest ciphertext envelope moves with
-                -- `content` under the IDENTICAL newer-wins tiebreak so the
-                -- placeholder and its ciphertext are never split across the
-                -- winner boundary (a winner's placeholder with the loser's
-                -- ciphertext would be undecryptable).
-                encrypted_envelope = CASE WHEN excluded.updated_at > memories.updated_at
-                                            OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
-                                          THEN excluded.encrypted_envelope ELSE memories.encrypted_envelope END,
-                tags = CASE WHEN excluded.updated_at > memories.updated_at
-                              OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
-                            THEN excluded.tags ELSE memories.tags END,
-                priority = MAX(memories.priority, excluded.priority),
-                confidence = MAX(memories.confidence, excluded.confidence),
-                source = CASE WHEN excluded.updated_at > memories.updated_at
-                                OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
-                              THEN excluded.source ELSE memories.source END,
-                tier = CASE WHEN excluded.tier = 'long' THEN 'long'
-                            WHEN memories.tier = 'long' THEN 'long'
-                            WHEN excluded.tier = 'mid' THEN 'mid'
-                            ELSE memories.tier END,
-                updated_at = MAX(memories.updated_at, excluded.updated_at),
-                access_count = MAX(memories.access_count, excluded.access_count),
-                -- v1.0.0 #2335 (FBL-20) — expires_at was the ONLY LWW-class
-                -- column with NO newer-wins guard: the bare
-                -- COALESCE(excluded.expires_at, memories.expires_at) adopted a
-                -- STALE losing peer's expiry verbatim, silently shortening a
-                -- live row's TTL (recall fold-extensions raise expires_at
-                -- WITHOUT bumping updated_at, so routine bidirectional sync
-                -- rolled local extensions back and GC reaped early — under the
-                -- v70 auto-eviction posture that ALSO meant permanent link-edge
-                -- loss, closed by #3161; the premature reap itself remains).
-                -- The merge is now the extension-FLOOR lattice join (scalar
-                -- MAX, both operands funnel-canonicalized per #2332 so byte
-                -- order is chronological): both replicas converge to the LATER
-                -- expiry regardless of push order (MAX is commutative /
-                -- idempotent — a true CRDT join, strictly stronger than the
-                -- updated_at tiebreak for this column), and the #1596
-                -- never-move-expiry-earlier contract holds across federation.
-                -- The long⇒NULL arm keeps the #1626 immortality coupling.
-                expires_at = CASE WHEN excluded.tier = 'long' OR memories.tier = 'long' THEN NULL
-                                  ELSE MAX(COALESCE(excluded.expires_at, memories.expires_at),
-                                           COALESCE(memories.expires_at, excluded.expires_at)) END,
-                -- #1784 — preserve immutable provenance keys (agent_id + the
-                -- consolidation derived_from / consolidated_from_agents arrays)
-                -- across a newer-wins merge: json_patch overlays the existing
-                -- row's provenance object (existing-wins, array-safe) on top of
-                -- the newer-wins base (excluded if newer, else the existing row).
-                metadata = json_patch(
-                    CASE WHEN excluded.updated_at > memories.updated_at
-                              OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
-                         THEN excluded.metadata
-                         ELSE memories.metadata END,
-                    COALESCE(
-                        -- #2941 — same reserved set: a newer-wins federation
-                        -- merge must not unbind a locally-bound key.
-                        (SELECT json_group_object(key, value)
-                         FROM json_each(memories.metadata)
-                         WHERE key IN ('agent_id', 'derived_from', 'consolidated_from_agents', 'agent_pubkey', 'pubkey_bound_at')),
-                        '{}'
-                    )
-                ),
-                -- v0.7.0 Task 1/8 — recursion depth takes max so the reflection
-                -- signal isn't lost on newer-wins federation merges.
-                reflection_depth = MAX(memories.reflection_depth, excluded.reflection_depth),
-                -- v0.7.0 L1-1 — kind is sticky across federation merges: a
-                -- reflection row must not be downgraded to observation by a
-                -- newer-wins merge from a peer that doesn't know about the kind.
-                -- v0.7.0 QW-2 — Persona is similarly sticky.
-                memory_kind = CASE WHEN memories.memory_kind = 'reflection' THEN 'reflection'
-                                   WHEN memories.memory_kind = 'persona' THEN 'persona'
-                                   ELSE excluded.memory_kind END,
-                -- v0.7.0 QW-2 — entity_id + persona_version are immutable
-                -- once set so a federation merge can't drop the persona
-                -- discriminator off a `memory_kind = 'persona'` row.
-                entity_id = COALESCE(memories.entity_id, excluded.entity_id),
-                persona_version = COALESCE(memories.persona_version, excluded.persona_version),
-                -- v0.7.0 Form 4 — fact-provenance: replace the stored
-                -- citations array only when the incoming row wins the
-                -- newer-wins tiebreak; source_uri / source_span follow
-                -- COALESCE semantics so a federation merge that lacks
-                -- provenance does not blank out a value the local row
-                -- already had.
-                citations = CASE WHEN excluded.updated_at > memories.updated_at
-                                      OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
-                                 THEN excluded.citations ELSE memories.citations END,
-                source_uri = COALESCE(excluded.source_uri, memories.source_uri),
-                source_span = COALESCE(excluded.source_span, memories.source_span),
-                -- v0.7.0 Form 5 / v1.0.0 #2395 — the confidence field-set is
-                -- ATOMIC on the federation lane too. `confidence` merges by
-                -- MAX (a commutative lattice join, above) while the three
-                -- provenance columns merged on the updated_at/id NEWER-WINS
-                -- tiebreak — a DIFFERENT selector, so a peer whose row lost
-                -- the MAX but won the timestamp durably relabelled the local
-                -- row: `confidence` from one replica, `confidence_source` /
-                -- `confidence_signals` / `confidence_decayed_at` from the
-                -- other. A self-inconsistent calibration record, converged to
-                -- identically on every peer, i.e. permanent.
-                --
-                -- The tuple now moves with the operand that wins the
-                -- LEXICOGRAPHIC order (confidence, updated_at, id) — whose
-                -- first component is exactly the MAX above, so the surviving
-                -- number and its calibration record always describe the same
-                -- write. The order is total and deterministic on both sides of
-                -- a bidirectional sync, so the merge stays commutative /
-                -- idempotent (a true CRDT join): both replicas converge on the
-                -- SAME tuple regardless of push order. Exact `=` on the REAL
-                -- is only the tie BRANCH of that total order, never a logical
-                -- float-equality test.
-                confidence_source = CASE WHEN excluded.confidence > memories.confidence
-                                              OR (excluded.confidence = memories.confidence
-                                                  AND (excluded.updated_at > memories.updated_at
-                                                       OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)))
-                                         THEN excluded.confidence_source ELSE memories.confidence_source END,
-                confidence_signals = CASE WHEN excluded.confidence > memories.confidence
-                                               OR (excluded.confidence = memories.confidence
-                                                   AND (excluded.updated_at > memories.updated_at
-                                                        OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)))
-                                          THEN excluded.confidence_signals ELSE memories.confidence_signals END,
-                confidence_decayed_at = CASE WHEN excluded.confidence > memories.confidence
-                                                  OR (excluded.confidence = memories.confidence
-                                                      AND (excluded.updated_at > memories.updated_at
-                                                           OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)))
-                                             THEN excluded.confidence_decayed_at ELSE memories.confidence_decayed_at END,
-                -- v0.7.0 polish PERF-8 (#781) — newer-wins on the mention
-                -- tag (the winning row's content is the one a future matcher
-                -- query expects to find); otherwise preserve the local tag
-                -- so a stale peer that lacks the structured entity_id
-                -- metadata cannot blank out a value the index serves.
-                mentioned_entity_id = CASE WHEN excluded.updated_at > memories.updated_at
-                                                OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
-                                           THEN COALESCE(excluded.mentioned_entity_id, memories.mentioned_entity_id)
-                                           ELSE memories.mentioned_entity_id END,
-                -- #1631 (decide-once, #1029 contract) — `version` IS
-                -- replicated state on the federation merge path: merge via
-                -- MAX(local, remote) so an out-of-order peer push can't
-                -- roll the Gap-1 optimistic-concurrency counter backwards.
-                -- Matches the pg `apply_remote_memory` GREATEST arm.
-                version = MAX(memories.version, excluded.version),
-                -- v0.8.0 Pillar 2 (#1709) — lifecycle_state on the newer-wins
-                -- federation merge: the timestamp winner's state is adopted so
-                -- a peer that advanced a Goal open→done replicates that state;
-                -- a stale peer push (loses the tiebreak) preserves the local
-                -- lifecycle. Transition legality is enforced at the originating
-                -- update site, so the replicated value is already-validated.
-                lifecycle_state = CASE WHEN excluded.updated_at > memories.updated_at
-                                            OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
-                                       THEN excluded.lifecycle_state ELSE memories.lifecycle_state END,
-                -- v1.0.0 #2333 (FBL-03) + v1.0.0 #2394 — the v79 denormalized
-                -- kind_provenance FOLLOWS THE KIND THAT ACTUALLY WON on the
-                -- federation lane too. `memory_kind` above is sticky (a local
-                -- `reflection` / `persona` is never downgraded by a peer that
-                -- does not know the kind), but the bare COALESCE adopted the
-                -- peer's provenance unconditionally — so a stale peer pushing
-                -- `observation`/`llm` relabelled a surviving local `reflection`
-                -- as `llm`-provenanced. The CASE mirrors the `memory_kind`
-                -- CASE exactly (kind unchanged -> COALESCE per FBL-03; stored
-                -- sticky kind survived -> keep the local provenance; incoming
-                -- kind adopted -> take its provenance verbatim), and is
-                -- NULL-safe by construction.
-                kind_provenance = CASE WHEN excluded.memory_kind = memories.memory_kind
-                                            THEN COALESCE(excluded.kind_provenance, memories.kind_provenance)
-                                       WHEN memories.memory_kind IN ('reflection', 'persona')
-                                            THEN memories.kind_provenance
-                                       ELSE excluded.kind_provenance END,
-                -- v1.0.0 #1834 — claim-bitemporal validity under federation LWW.
-                -- `valid_from` is immutable (local genesis wins, like `cid`);
-                -- `valid_until` follows the newer-wins tiebreak so a peer that
-                -- CLOSED a claim (set the upper bound) replicates that close.
-                valid_from = memories.valid_from,
-                valid_until = CASE WHEN excluded.updated_at > memories.updated_at
-                                     OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
-                                   THEN excluded.valid_until ELSE memories.valid_until END
-             RETURNING id",
-        )?;
+        // #3690 — the conflict target is the v100 PARTIAL index
+        // (`TITLE_SLOT_CONFLICT_TARGET`): a local tombstone holds no slot, so
+        // an inbound row of a different id lands beside it instead of being
+        // merged into a row nothing can see. The federation-lane admission of
+        // a HIDDEN holder and the same-id-under-a-tombstone case are #3699's
+        // (the by-id newer-wins vote), not this arm's.
+        let mut newer_wins_stmt = conn.prepare_cached(&INSERT_IF_NEWER_SQL)?;
         let actual_id: String = newer_wins_stmt.query_row(
             params![
                 mem.id,
@@ -17826,6 +18444,23 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
         // against the write-lock-held pre-image so it cannot diverge from the
         // live `CASE`). Mirrors the create-funnel #2948 wiring; the superseded
         // pre-merge content lives only in the row it replaced, never in the leaf.
+        // #3699 (5-agent vote 4d3ea1c5) — a CROSS-ID title merge (the inbound
+        // id was folded into a local row of a different id, and will never
+        // exist here) is counted and WARNed, never silent inside a 200: on a
+        // consolidating fleet it is the signature of a memory delivered before
+        // the tombstone that freed its title (see `federation::causal_apply_order`).
+        if actual_id != mem.id {
+            crate::metrics::inc_fed_cross_id_title_merge();
+            tracing::warn!(
+                target: crate::federation::CROSS_ID_TITLE_MERGE_TARGET,
+                inbound_id = %mem.id,
+                local_id = %actual_id,
+                namespace = %mem.namespace,
+                "federation newer-wins merge folded an inbound memory into a local row of a \
+                 different id under the same (title, namespace); the inbound id is not \
+                 created on this node (#3699)"
+            );
+        }
         emit_federation_newer_wins_supersede_leaf_if_enabled(
             conn,
             merge_preimage.as_ref(),
@@ -18092,7 +18727,7 @@ fn overwrite_full_row_by_id(conn: &Connection, mem: &Memory) -> Result<()> {
         .get("agent_id")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    let merge_sealed = crate::encryption::seal_content(&mem.content, merge_agent_id)?;
+    let merge_sealed = seal_content_guarded(conn, &mem.content, merge_agent_id)?;
     let merge_content_to_store = merge_sealed
         .as_ref()
         .map_or(mem.content.as_str(), |(_, ph)| ph.as_str());
@@ -19155,14 +19790,49 @@ pub fn set_embeddings_batch_reembed(
     Ok(rows_updated)
 }
 
+/// v1.0.0 #3124 (R4) — which rows a [`reown`] rewrites.
+///
+/// The pre-#3124 `claim_unowned: bool` hid a trap (F1 in the #3124 pre-read):
+/// `--claim-unowned` rewrote EVERY row in the namespace, owned rows included,
+/// so running it to claim legacy rows silently took rows from their real
+/// owners. The three selections are now named.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReownSelect {
+    /// Rows that already carry a (non-empty) `agent_id` — any current owner.
+    /// The historical default.
+    #[default]
+    Owned,
+    /// ONLY unstamped rows (missing / JSON null / `""` `agent_id` — the ONE
+    /// #3124 definition). Never touches a row that has an owner. The remedy
+    /// `ai-memory doctor` names for the unstamped-owner census.
+    OnlyUnowned,
+    /// Every row in scope, owned or not (`--claim-unowned`, claim-all).
+    All,
+}
+
+impl ReownSelect {
+    /// Stable wire token (JSON report + audit payload).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Owned => "owned",
+            Self::OnlyUnowned => "only_unowned",
+            Self::All => "all",
+        }
+    }
+}
+
 /// v0.8.0 #1709/#1720 WS-B B2 — outcome of a [`reown`] sweep.
 ///
 /// `matched` is the number of rows the namespace + ownership filter
 /// selected; `rewritten` is the number actually written (`0` under a
-/// dry-run, otherwise `== matched` because the `UPDATE` and the
-/// `COUNT` share the same `WHERE`). `dry_run` echoes the requested
-/// mode so the CLI / JSON envelope can render the right verb without
-/// re-deriving it.
+/// dry-run, otherwise `== matched` unless a concurrent writer changed a
+/// row's stamp between the `COUNT` and the `UPDATE`, which share one
+/// `WHERE`).
+/// `dry_run` echoes the requested mode so the CLI / JSON envelope can
+/// render the right verb without re-deriving it; `select` echoes which
+/// rows were in scope (#3124 R4).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ReownReport {
     /// Rows selected by the namespace + ownership filter.
@@ -19171,66 +19841,104 @@ pub struct ReownReport {
     pub rewritten: usize,
     /// Whether this was a dry-run (count only, no write).
     pub dry_run: bool,
+    /// Which rows the sweep selected (#3124 R4).
+    #[serde(default)]
+    pub select: ReownSelect,
 }
 
+/// v1.0.0 #3124 (R4) — the audit payload for one non-dry-run reown: the
+/// scope, the new owner, the selection and the count. Identity + counts only —
+/// never row content. Shared by both backends so the chain rows agree.
+#[must_use]
+pub fn reown_audit_payload(
+    namespace: Option<&str>,
+    to_id: &str,
+    select: ReownSelect,
+    rewritten: usize,
+) -> String {
+    format!(
+        "{}|{}|{to_id}|{}|{rewritten}",
+        crate::signed_events::event_types::MEMORY_REOWNED,
+        namespace.unwrap_or(REOWN_ALL_NAMESPACES_TOKEN),
+        select.as_str()
+    )
+}
+
+/// The namespace token recorded for an `--all-namespaces` reown.
+pub const REOWN_ALL_NAMESPACES_TOKEN: &str = "*";
+
 /// v0.8.0 #1709/#1720 WS-B B2 — rewrite `metadata.agent_id` (the NHI
-/// ownership stamp) on the memories in **exactly** `namespace` to
+/// ownership stamp) on the memories in **exactly** `namespace` (or, with
+/// `namespace = None`, every namespace — `--all-namespaces`, #3124 R4) to
 /// `to_id`, establishing durable ownership BEFORE an operator turns on
-/// `scope=private` visibility filtering (so a namespace can be claimed
-/// without the operator locking themselves out of legacy rows).
+/// `scope=private` visibility filtering or `AI_MEMORY_UNSTAMPED_MUTATION=refuse`.
 ///
-/// Semantics (least-surprising; documented in the CLI `--help`):
+/// Semantics (documented in the CLI `--help`):
 /// - Target rows are the EXACT-namespace match (`namespace = ?ns`), not
 ///   the namespace subtree — predictable + safe for an admin migration.
-/// - Default: rewrite every row whose `metadata.agent_id` is present
-///   (any current owner) to `to_id` — the operator is explicitly
-///   claiming the whole namespace. Rows with an absent/empty
-///   `agent_id` (legacy / unowned) are LEFT UNTOUCHED.
-/// - `claim_unowned`: ADDITIONALLY rewrite rows with NULL/empty
-///   `agent_id`, so the `empty_owner_blocks_named_caller` legacy class
-///   gets a durable owner too.
+/// - `select` ([`ReownSelect`]): `Owned` (default) rewrites rows that
+///   already carry an `agent_id`; `OnlyUnowned` rewrites ONLY unstamped rows
+///   and never an owned one; `All` rewrites every row in scope.
 /// - `dry_run`: COUNT the matched rows, write NOTHING, return
 ///   `rewritten = 0`.
 ///
 /// Only `metadata.agent_id` is touched (`json_set` of the single key) —
 /// every other metadata key is preserved, and the `agent_id_idx`
-/// generated column re-projects the new owner automatically (no schema
-/// change, no FTS sync — FTS tracks `(title, content, tags)` only).
-/// `to_id` is validated via [`crate::validate::validate_agent_id`] so a
-/// malformed owner can never be written.
+/// generated column re-projects the new owner automatically. #3124 R4: each
+/// rewritten row's `version` is bumped and `updated_at` stamped (so a
+/// replicated copy sees the change under LWW, and If-Match writers observe
+/// it), and ONE `memory.reowned` signed-chain row attributed to `actor` is
+/// appended IN THE SAME TRANSACTION (identity + counts only). The write is
+/// refused under record-stop. `to_id` is validated via
+/// [`crate::validate::validate_agent_id`] so a malformed owner can never be
+/// written.
 ///
-/// Idempotent: a second run rewrites the same rows to the same id with
-/// no error (the metadata is byte-identical after the first pass).
+/// Idempotent in effect: a second run rewrites the same rows to the same id
+/// (it bumps `version` again and records a second audit row).
 ///
 /// # Errors
 ///
 /// - `to_id` fails [`crate::validate::validate_agent_id`].
-/// - the underlying `COUNT` / `UPDATE` fails.
+/// - record-stop is engaged.
+/// - the underlying `COUNT` / `UPDATE` / audit append fails (the whole
+///   sweep rolls back — a reown without its trace is not worth having).
 pub fn reown(
     conn: &Connection,
-    namespace: &str,
+    namespace: Option<&str>,
     to_id: &str,
-    claim_unowned: bool,
+    select: ReownSelect,
     dry_run: bool,
+    actor: &str,
 ) -> Result<ReownReport> {
     crate::validate::validate_agent_id(to_id)
         .map_err(|e| anyhow::anyhow!("reown: invalid --to agent_id: {e}"))?;
+    if !dry_run {
+        crate::storage::record_stop::gate_storage_conn(conn)?;
+    }
 
-    // Ownership predicate. Default: rows that already carry an
-    // `agent_id` (any owner). `--claim-unowned`: ALSO rows with a
-    // NULL/empty `agent_id` — i.e. every row in the namespace.
-    let owner_filter = if claim_unowned {
-        ""
+    let owner_filter = match select {
+        ReownSelect::All => String::new(),
+        ReownSelect::Owned => " AND json_extract(metadata, '$.agent_id') IS NOT NULL \
+             AND json_extract(metadata, '$.agent_id') != ''"
+            .to_string(),
+        ReownSelect::OnlyUnowned => format!(
+            " AND {}",
+            crate::identity::owner_stamp::sqlite_unstamped_predicate("metadata")
+        ),
+    };
+    // COUNT binds the namespace as ?1; the UPDATE binds ?1 = to_id,
+    // ?2 = now, ?3 = namespace.
+    let (count_ns, update_ns) = if namespace.is_some() {
+        ("namespace = ?1", "namespace = ?3")
     } else {
-        " AND json_extract(metadata, '$.agent_id') IS NOT NULL \
-          AND json_extract(metadata, '$.agent_id') != ''"
+        ("1 = 1", "1 = 1")
     };
 
-    let matched: i64 = conn.query_row(
-        &format!("SELECT COUNT(*) FROM memories WHERE namespace = ?1{owner_filter}"),
-        params![namespace],
-        |row| row.get(0),
-    )?;
+    let count_sql = format!("SELECT COUNT(*) FROM memories WHERE {count_ns}{owner_filter}");
+    let matched: i64 = match namespace {
+        Some(ns) => conn.query_row(&count_sql, params![ns], |row| row.get(0))?,
+        None => conn.query_row(&count_sql, [], |row| row.get(0))?,
+    };
     let matched = usize::try_from(matched).unwrap_or(usize::MAX);
 
     if dry_run {
@@ -19238,24 +19946,67 @@ pub fn reown(
             matched,
             rewritten: 0,
             dry_run: true,
+            select,
         });
     }
 
-    // `json_set` rewrites ONLY `$.agent_id`, preserving the rest of the
-    // metadata object; the `agent_id_idx` generated column auto-updates.
-    let rewritten = conn.execute(
-        &format!(
+    let write_txn = connection::WriteTxn::begin(conn)?;
+    let result = (|| -> Result<usize> {
+        let now = Utc::now().to_rfc3339();
+        let update_sql = format!(
             "UPDATE memories \
-             SET metadata = json_set(metadata, '$.agent_id', ?2) \
-             WHERE namespace = ?1{owner_filter}"
-        ),
-        params![namespace, to_id],
-    )?;
-
+             SET metadata = json_set(metadata, '$.agent_id', ?1), \
+                 version = version + 1, updated_at = ?2 \
+             WHERE {update_ns}{owner_filter}"
+        );
+        let rewritten = match namespace {
+            Some(ns) => conn.execute(&update_sql, params![to_id, now, ns])?,
+            None => conn.execute(&update_sql, params![to_id, now])?,
+        };
+        let action_kind = crate::signed_events::event_types::MEMORY_REOWNED;
+        let payload = reown_audit_payload(namespace, to_id, select, rewritten);
+        let ph = crate::signed_events::payload_hash(payload.as_bytes());
+        let cause = crate::signed_events::compute_cause_hash(
+            actor,
+            action_kind,
+            namespace.unwrap_or(REOWN_ALL_NAMESPACES_TOKEN),
+            &payload,
+        );
+        let event = crate::signed_events::SignedEvent::with_daemon_signature(
+            ph,
+            actor.to_string(),
+            action_kind.to_string(),
+            now,
+            Some(&cause),
+        );
+        crate::signed_events::append_signed_event_no_tx(conn, &event)?;
+        Ok(rewritten)
+    })();
+    let rewritten = match result {
+        Ok(n) => {
+            write_txn.commit()?;
+            n
+        }
+        Err(e) => {
+            write_txn.rollback();
+            return Err(e);
+        }
+    };
+    tracing::warn!(
+        target: "ai_memory::reown",
+        namespace = namespace.unwrap_or(REOWN_ALL_NAMESPACES_TOKEN),
+        to = %to_id,
+        select = select.as_str(),
+        rewritten,
+        actor = %actor,
+        "reown: an operator re-stamped metadata.agent_id; a memory.reowned signed-chain row \
+         was appended in the same transaction (#3124)"
+    );
     Ok(ReownReport {
         matched,
         rewritten,
         dry_run: false,
+        select,
     })
 }
 
@@ -21195,6 +21946,39 @@ pub fn sync_state_last_pushed(conn: &Connection, agent_id: &str, peer_id: &str) 
     )
     .ok()
     .flatten()
+}
+
+/// v1.0.0 #3655 — record that `peer_id` ANSWERED a pull just now, apart
+/// from any data watermark. Called on every 2xx pull with a parseable
+/// envelope — empty window included — so a quiet, reachable peer is never
+/// mistaken for a stale one. `catchup_interval_secs` is the cadence of the
+/// loop that pulled (`None` when the writer did not know it; stored as NULL,
+/// never as a default), so an offline reader can apply the SAME reachability
+/// window the live daemon uses (#3654). Monotonic: an older stamp never
+/// regresses a newer one.
+///
+/// # Errors
+///
+/// Propagates the underlying `rusqlite` error.
+pub fn sync_peer_record_contact(
+    conn: &Connection,
+    agent_id: &str,
+    peer_id: &str,
+    catchup_interval_secs: Option<u64>,
+) -> Result<()> {
+    let now = Utc::now().to_rfc3339();
+    let cadence: Option<i64> = catchup_interval_secs.map(|s| i64::try_from(s).unwrap_or(i64::MAX));
+    conn.execute(
+        "INSERT INTO sync_peer_contact (agent_id, peer_id, last_contact_at, catchup_interval_secs) \
+         VALUES (?1, ?2, ?3, ?4) \
+         ON CONFLICT(agent_id, peer_id) DO UPDATE SET \
+            last_contact_at = CASE WHEN excluded.last_contact_at > last_contact_at \
+                                   THEN excluded.last_contact_at \
+                                   ELSE last_contact_at END, \
+            catchup_interval_secs = COALESCE(excluded.catchup_interval_secs, catchup_interval_secs)",
+        params![agent_id, peer_id, now, cadence],
+    )?;
+    Ok(())
 }
 
 /// Record that local memories up to `updated_at = pushed_at` have been
@@ -25311,7 +26095,8 @@ mod tests {
         )
         .unwrap();
 
-        let contradictions = find_contradictions(&conn, "Database is PostgreSQL", "infra").unwrap();
+        let contradictions =
+            find_contradictions(&conn, "Database is PostgreSQL", "infra", None).unwrap();
         assert!(!contradictions.is_empty());
     }
 
@@ -25354,7 +26139,8 @@ mod tests {
         .unwrap();
 
         // Tomato seed must not flag moon-landing or retrieval rows.
-        let hits = find_contradictions(&conn, "Tomatoes are red fruit", "v1-p5-disjoint").unwrap();
+        let hits =
+            find_contradictions(&conn, "Tomatoes are red fruit", "v1-p5-disjoint", None).unwrap();
         assert!(
             hits.iter().all(|m| m.title == "Tomatoes are red fruit"),
             "tomato seed leaked false positives: {:?}",
@@ -25362,8 +26148,13 @@ mod tests {
         );
 
         // Moon-landing seed must not flag tomato or retrieval rows.
-        let hits =
-            find_contradictions(&conn, "Moon landing happened in 1969", "v1-p5-disjoint").unwrap();
+        let hits = find_contradictions(
+            &conn,
+            "Moon landing happened in 1969",
+            "v1-p5-disjoint",
+            None,
+        )
+        .unwrap();
         assert!(
             hits.iter()
                 .all(|m| m.title == "Moon landing happened in 1969"),
@@ -25376,6 +26167,7 @@ mod tests {
             &conn,
             "Retrieval-augmented generation works by combining recall with synthesis",
             "v1-p5-disjoint",
+            None,
         )
         .unwrap();
         assert!(
@@ -25403,7 +26195,7 @@ mod tests {
             ),
         )
         .unwrap();
-        let hits = find_contradictions(&conn, "the is a", "v1-p5-stopword").unwrap();
+        let hits = find_contradictions(&conn, "the is a", "v1-p5-stopword", None).unwrap();
         assert!(
             hits.is_empty(),
             "pure-stopword seed pulled candidates: {:?}",
@@ -25430,7 +26222,8 @@ mod tests {
             &make_memory("Database is MySQL", "v1-p5-positive", Tier::Long, 5),
         )
         .unwrap();
-        let hits = find_contradictions(&conn, "Database is PostgreSQL", "v1-p5-positive").unwrap();
+        let hits =
+            find_contradictions(&conn, "Database is PostgreSQL", "v1-p5-positive", None).unwrap();
         let titles: Vec<&str> = hits.iter().map(|m| m.title.as_str()).collect();
         assert!(
             titles.contains(&"Database is MySQL"),
@@ -26888,7 +27681,15 @@ mod tests {
             serde_json::json!({"agent_id": "alice"}),
         );
 
-        let report = reown(&conn, "claim-ns", "bob", false, false).unwrap();
+        let report = reown(
+            &conn,
+            Some("claim-ns"),
+            "bob",
+            ReownSelect::Owned,
+            false,
+            "ai:operator",
+        )
+        .unwrap();
         assert_eq!(report.matched, 1);
         assert_eq!(report.rewritten, 1);
         assert!(!report.dry_run);
@@ -26923,7 +27724,15 @@ mod tests {
             "claim-ns",
             serde_json::json!({"agent_id": "alice"}),
         );
-        let report = reown(&conn, "claim-ns", "bob", false, true).unwrap();
+        let report = reown(
+            &conn,
+            Some("claim-ns"),
+            "bob",
+            ReownSelect::Owned,
+            true,
+            "ai:operator",
+        )
+        .unwrap();
         assert_eq!(report.matched, 1);
         assert_eq!(report.rewritten, 0);
         assert!(report.dry_run);
@@ -26956,11 +27765,27 @@ mod tests {
         );
 
         // Default leaves the unowned rows alone (matches only `owned`).
-        let default_report = reown(&conn, "claim-ns", "bob", false, true).unwrap();
+        let default_report = reown(
+            &conn,
+            Some("claim-ns"),
+            "bob",
+            ReownSelect::Owned,
+            true,
+            "ai:operator",
+        )
+        .unwrap();
         assert_eq!(default_report.matched, 1);
 
         // claim_unowned covers all three.
-        let report = reown(&conn, "claim-ns", "bob", true, false).unwrap();
+        let report = reown(
+            &conn,
+            Some("claim-ns"),
+            "bob",
+            ReownSelect::All,
+            false,
+            "ai:operator",
+        )
+        .unwrap();
         assert_eq!(report.matched, 3);
         assert_eq!(report.rewritten, 3);
         assert_eq!(agent_id_of(&conn, &owned).as_deref(), Some("bob"));
@@ -26982,8 +27807,24 @@ mod tests {
             "claim-ns",
             serde_json::json!({"agent_id": "alice"}),
         );
-        let first = reown(&conn, "claim-ns", "bob", false, false).unwrap();
-        let second = reown(&conn, "claim-ns", "bob", false, false).unwrap();
+        let first = reown(
+            &conn,
+            Some("claim-ns"),
+            "bob",
+            ReownSelect::Owned,
+            false,
+            "ai:operator",
+        )
+        .unwrap();
+        let second = reown(
+            &conn,
+            Some("claim-ns"),
+            "bob",
+            ReownSelect::Owned,
+            false,
+            "ai:operator",
+        )
+        .unwrap();
         assert_eq!(first.rewritten, 1);
         assert_eq!(second.matched, 1);
         assert_eq!(second.rewritten, 1);
@@ -27001,10 +27842,145 @@ mod tests {
             serde_json::json!({"agent_id": "alice"}),
         );
         // Whitespace / control chars are rejected by validate_agent_id.
-        let err = reown(&conn, "claim-ns", "bad id\n", false, false).unwrap_err();
+        let err = reown(
+            &conn,
+            Some("claim-ns"),
+            "bad id\n",
+            ReownSelect::Owned,
+            false,
+            "ai:operator",
+        )
+        .unwrap_err();
         assert!(format!("{err}").contains("agent_id"), "got: {err}");
         // No write happened.
         assert_eq!(agent_id_of(&conn, &owned).as_deref(), Some("alice"));
+    }
+
+    /// #3124 R4 — `OnlyUnowned` rewrites ONLY unstamped rows (missing / null /
+    /// `""`) and never an owned or malformed one — the F1 claim-all trap
+    /// `--claim-unowned` still carries is not reachable through it.
+    #[test]
+    fn reown_only_unowned_never_touches_an_owned_row_3124() {
+        let conn = test_db();
+        let owned = insert_with_meta(
+            &conn,
+            "o",
+            "claim-ns",
+            serde_json::json!({"agent_id": "alice"}),
+        );
+        let empty = insert_with_meta(&conn, "e", "claim-ns", serde_json::json!({"agent_id": ""}));
+        let null = insert_with_meta(
+            &conn,
+            "n",
+            "claim-ns",
+            serde_json::json!({"agent_id": null}),
+        );
+        let missing = insert_with_meta(&conn, "m", "claim-ns", serde_json::json!({"k": 1}));
+        let malformed =
+            insert_with_meta(&conn, "x", "claim-ns", serde_json::json!({"agent_id": 9}));
+        let report = reown(
+            &conn,
+            Some("claim-ns"),
+            "bob",
+            ReownSelect::OnlyUnowned,
+            false,
+            "ai:operator",
+        )
+        .unwrap();
+        assert_eq!(report.matched, 3);
+        assert_eq!(report.rewritten, 3);
+        assert_eq!(report.select, ReownSelect::OnlyUnowned);
+        assert_eq!(agent_id_of(&conn, &owned).as_deref(), Some("alice"));
+        for id in [&empty, &null, &missing] {
+            assert_eq!(agent_id_of(&conn, id).as_deref(), Some("bob"));
+        }
+        let meta = get(&conn, &malformed).unwrap().unwrap().metadata;
+        assert_eq!(meta["agent_id"], 9, "a malformed stamp is not unstamped");
+    }
+
+    /// #3124 R4 — a live reown bumps `version` + `updated_at` on every
+    /// rewritten row and appends exactly ONE `memory.reowned` chain row
+    /// attributed to the actor; a dry run appends nothing.
+    #[test]
+    fn reown_bumps_version_and_appends_one_audit_row_3124() {
+        let conn = test_db();
+        let a = insert_with_meta(&conn, "a", "claim-ns", serde_json::json!({}));
+        let b = insert_with_meta(&conn, "b", "other-ns", serde_json::json!({}));
+        let before_a = get(&conn, &a).unwrap().unwrap();
+        let audit_count = |conn: &Connection| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM signed_events WHERE event_type = ?1 AND agent_id = ?2",
+                params![
+                    crate::signed_events::event_types::MEMORY_REOWNED,
+                    "ai:operator"
+                ],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let dry = reown(
+            &conn,
+            None,
+            "bob",
+            ReownSelect::OnlyUnowned,
+            true,
+            "ai:operator",
+        )
+        .unwrap();
+        assert_eq!(dry.matched, 2, "--all-namespaces spans both namespaces");
+        assert_eq!(audit_count(&conn), 0, "a dry run writes no audit row");
+        let live = reown(
+            &conn,
+            None,
+            "bob",
+            ReownSelect::OnlyUnowned,
+            false,
+            "ai:operator",
+        )
+        .unwrap();
+        assert_eq!(live.rewritten, 2);
+        assert_eq!(
+            audit_count(&conn),
+            1,
+            "exactly one audit row per live sweep"
+        );
+        let after_a = get(&conn, &a).unwrap().unwrap();
+        assert_eq!(after_a.version, before_a.version + 1);
+        assert_ne!(after_a.updated_at, before_a.updated_at);
+        assert_eq!(agent_id_of(&conn, &b).as_deref(), Some("bob"));
+    }
+
+    /// #3124 R4 — a live reown is a record-plane write: refused under
+    /// record-stop (nothing rewritten); a dry run is a read and still counts.
+    #[test]
+    fn reown_is_refused_under_record_stop_3124() {
+        let conn = test_db();
+        let id = insert_with_meta(&conn, "rs", "claim-ns", serde_json::json!({}));
+        crate::storage::record_stop::actuate_sqlite(&conn, true, "ai:operator", "record-plane")
+            .unwrap();
+        let live = reown(
+            &conn,
+            Some("claim-ns"),
+            "bob",
+            ReownSelect::OnlyUnowned,
+            false,
+            "ai:operator",
+        );
+        let dry = reown(
+            &conn,
+            Some("claim-ns"),
+            "bob",
+            ReownSelect::OnlyUnowned,
+            true,
+            "ai:operator",
+        );
+        // Release BEFORE asserting: the in-memory registry key is the
+        // connection address, which a later test may reuse.
+        crate::storage::record_stop::actuate_sqlite(&conn, false, "ai:operator", "record-plane")
+            .unwrap();
+        assert!(live.is_err(), "a live reown must refuse under record-stop");
+        assert_eq!(dry.unwrap().matched, 1);
+        assert!(agent_id_of(&conn, &id).is_none(), "nothing rewritten");
     }
 
     /// #1598 — dry-run coverage counts, with and without the namespace
@@ -31358,10 +32334,119 @@ mod tests {
     }
 
     #[test]
-    fn doctor_max_sync_skew_secs_empty() {
+    fn doctor_sync_peer_watermarks_empty_3655() {
         let conn = test_db();
-        let skew = doctor_max_sync_skew_secs(&conn).unwrap();
-        assert_eq!(skew, None);
+        let w = doctor_sync_peer_watermarks(&conn, Utc::now()).unwrap();
+        assert_eq!(w, SyncWatermarks::default());
+        assert_eq!(w.row_count(), 0);
+    }
+
+    /// #3655 — a missing table is a FAILED probe, never `Ok(empty)`.
+    #[test]
+    fn doctor_sync_peer_watermarks_absent_table_is_err_3655() {
+        let conn = test_db();
+        conn.execute_batch("DROP TABLE sync_state;").unwrap();
+        assert!(doctor_sync_peer_watermarks(&conn, Utc::now()).is_err());
+    }
+
+    /// #3655 — malformed cursors are COUNTED and named, not skipped; equal
+    /// but old cursors age against `now`; a never-pushed peer stays `None`.
+    #[test]
+    fn doctor_sync_peer_watermarks_ages_rows_and_names_invalid_ones_3655() {
+        let conn = test_db();
+        let now = Utc::now();
+        let old = (now - chrono::Duration::seconds(2 * crate::SECS_PER_HOUR)).to_rfc3339();
+        let fresh = (now - chrono::Duration::seconds(30)).to_rfc3339();
+        let ahead = (now + chrono::Duration::seconds(crate::SECS_PER_HOUR)).to_rfc3339();
+        conn.execute_batch(&format!(
+            "INSERT INTO sync_state (agent_id, peer_id, last_seen_at, last_pulled_at, last_pushed_at) VALUES \
+             ('me', 'quiet-old', '{old}', '{old}', NULL), \
+             ('me', 'fresh', '{fresh}', '{fresh}', '{fresh}'), \
+             ('me', 'ahead', '{ahead}', '{fresh}', NULL), \
+             ('me', 'broken', 'not-a-timestamp', '{fresh}', NULL);"
+        ))
+        .unwrap();
+        let w = doctor_sync_peer_watermarks(&conn, now).unwrap();
+        assert_eq!(w.row_count(), 4);
+        assert_eq!(w.invalid.len(), 1);
+        assert_eq!(w.invalid[0].0, "me/broken");
+        assert!(w.invalid[0].1.contains("last_seen_at"), "{:?}", w.invalid);
+        let by_peer = |id: &str| w.peers.iter().find(|p| p.peer_id == id).unwrap();
+        let quiet = by_peer("quiet-old");
+        assert!(
+            quiet
+                .advanced_age_secs
+                .is_some_and(|a| a >= 2 * crate::SECS_PER_HOUR)
+        );
+        assert_eq!(quiet.clock_lead_secs, Some(0), "equal cursors are not skew");
+        assert_eq!(quiet.pushed_age_secs, None);
+        // Review rework: no contact row → contact is UNKNOWN (None), never 0.
+        assert_eq!(quiet.contact_age_secs, None);
+        assert_eq!(quiet.catchup_interval_secs, None);
+        let fresh_peer = by_peer("fresh");
+        assert!(
+            fresh_peer
+                .advanced_age_secs
+                .is_some_and(|a| (30..60).contains(&a))
+        );
+        assert!(fresh_peer.pushed_age_secs.is_some());
+        // A contact row joins in, aged against `now`, with its cadence; a
+        // contact without a cadence stays `None` for the cadence.
+        conn.execute_batch(&format!(
+            "INSERT INTO sync_peer_contact (agent_id, peer_id, last_contact_at, catchup_interval_secs) VALUES \
+             ('me', 'quiet-old', '{fresh}', 60), \
+             ('me', 'fresh', '{fresh}', NULL);"
+        ))
+        .unwrap();
+        let w2 = doctor_sync_peer_watermarks(&conn, now).unwrap();
+        let by_peer2 = |id: &str| w2.peers.iter().find(|p| p.peer_id == id).unwrap();
+        let quiet2 = by_peer2("quiet-old");
+        assert!(
+            quiet2
+                .contact_age_secs
+                .is_some_and(|c| (30..60).contains(&c))
+        );
+        assert_eq!(quiet2.catchup_interval_secs, Some(60));
+        assert!(
+            quiet2
+                .advanced_age_secs
+                .is_some_and(|a| a >= 2 * crate::SECS_PER_HOUR),
+            "data stamp unchanged"
+        );
+        let fresh2 = by_peer2("fresh");
+        assert!(fresh2.contact_age_secs.is_some());
+        assert_eq!(fresh2.catchup_interval_secs, None);
+        // v3 review: a contact-only peer (empty windows only, no sync_state
+        // row) is enumerated from the union with its data cursors None, and
+        // a URL-shaped peer id is redacted at construction.
+        conn.execute_batch(&format!(
+            "INSERT INTO sync_peer_contact (agent_id, peer_id, last_contact_at, catchup_interval_secs) VALUES \
+             ('me', 'https://bob:s3cret@quiet.example/api/v1/sync/push', '{fresh}', 60);"
+        ))
+        .unwrap();
+        let w3 = doctor_sync_peer_watermarks(&conn, now).unwrap();
+        assert_eq!(w3.row_count(), 5, "the contact-only peer is a row");
+        let only = w3
+            .peers
+            .iter()
+            .find(|p| p.peer_id.contains("quiet.example"))
+            .expect("contact-only peer must be enumerated");
+        assert!(!only.peer_id.contains("s3cret"), "{}", only.peer_id);
+        assert!(only.contact_age_secs.is_some());
+        assert_eq!(only.advanced_age_secs, None);
+        assert_eq!(only.data_age_secs, None);
+        assert_eq!(only.clock_lead_secs, None);
+        assert_eq!(only.pushed_age_secs, None);
+        let ahead_peer = by_peer("ahead");
+        assert!(
+            ahead_peer
+                .clock_lead_secs
+                .is_some_and(|l| l >= crate::SECS_PER_HOUR - 1)
+        );
+        assert!(
+            ahead_peer.data_age_secs.is_some_and(|d| d < 0),
+            "data stamped in the future ages negative"
+        );
     }
 
     // ---- v0.6.4-009 — capability-expansion audit log ----
@@ -31694,7 +32779,7 @@ mod tests {
             "expected typed ConflictError, got: {err}"
         );
         // First writer's content is preserved (no silent overwrite).
-        let row = find_by_title_namespace(&conn, "dup-title", "ns-conflict")
+        let row = find_by_title_namespace(&conn, "dup-title", "ns-conflict", None)
             .unwrap()
             .expect("first row still present");
         let fetched = get(&conn, &row).unwrap().unwrap();
@@ -31731,10 +32816,10 @@ mod tests {
         let id_b = insert_with_conflict(&conn, &m2, ConflictMode::Version).unwrap();
         assert_ne!(id_a, id_b, "version mode produces a distinct row");
         // Both titles are reachable: original + `(2)` suffix.
-        let original_id = find_by_title_namespace(&conn, "versioned", "ns-v")
+        let original_id = find_by_title_namespace(&conn, "versioned", "ns-v", None)
             .unwrap()
             .expect("original row");
-        let versioned_id = find_by_title_namespace(&conn, "versioned (2)", "ns-v")
+        let versioned_id = find_by_title_namespace(&conn, "versioned (2)", "ns-v", None)
             .unwrap()
             .expect("versioned row");
         assert_eq!(original_id, id_a);

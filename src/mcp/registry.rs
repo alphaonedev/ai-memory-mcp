@@ -1756,6 +1756,19 @@ mod d1_6_987_tests {
     //!   string understated the tool's real surface to every MCP client.
     //!   Corrected to list all 9 plus the `derived_from` /
     //!   `derives_from` directionality footgun.
+    //! - 2026-09-14 (#3659): `memory_subscription_replay.docs` said only
+    //!   "replay events ordered by delivered_at asc"; each replayed event
+    //!   carries `delivery_status`, and `pending` there can mean the
+    //!   delivery settled but its terminal status write FAILED (the #3659
+    //!   observed gap), not only in flight. The docs now say so at the field
+    //!   the caller reads; the reliable write is #3735 (v1.0.1).
+    //! - 2026-09-14 (#3730): `memory_inbox.docs` advertised `access_count==0`
+    //!   as "the unread marker" — a TOUCH counter that no inbox operation ever
+    //!   advanced (only a namespaced recall plus the periodic fold did), so
+    //!   the marker never meant handled and an inbox drained with `inbox` +
+    //!   `get` re-listed forever. The docs now state the shipped contract:
+    //!   the inbox is the pending set, handled = deleted by the recipient,
+    //!   `unread_only` narrows nothing.
     //! - 2026-09-10 (#3394): `memory_pending_approve` / `memory_pending_reject`
     //!   advertised `remember=forever` progressive trust. Forever cannot be
     //!   honoured durably (process-local `SYNTHETIC_RULES` only; #3580).
@@ -1788,7 +1801,10 @@ mod d1_6_987_tests {
         // client could discover it. Declaring them makes the advertised
         // contract match the enforced one; none of them is newly honoured.
         // ------------------------------------------------------------------
-        ("memory_agent_register", &["caller_agent_id"]),
+        // #3372 (2026-09-15) — `update` was honoured by the handler since the
+        // identity-overwrite refusal landed and undeclared until the sweep's
+        // #3171 gate named it; same disposition as the row above.
+        ("memory_agent_register", &["caller_agent_id", "update"]),
         ("memory_archive_purge", &["agent_id", "as_admin"]),
         ("memory_atomise", &["agent_id"]),
         ("memory_check_agent_action", &["kind_inner"]),
@@ -1894,6 +1910,10 @@ mod d1_6_987_tests {
         "memory_export_reflection",
         "memory_forget",
         "memory_gc",
+        // #3730 — advertised `access_count==0` as the unread marker, a touch
+        // counter no inbox operation advanced; the inbox is now the pending
+        // set and the docs say so (handled = deleted by the recipient).
+        "memory_inbox",
         "memory_ingest_multistep",
         "memory_kg_invalidate",
         "memory_lease_release",
@@ -1911,6 +1931,10 @@ mod d1_6_987_tests {
         // #3551: source admission replaces missing-source stubs before promotion.
         "memory_skill_promote_from_reflection",
         "memory_stats",
+        // #3659 — `delivery_status` on replayed events: `pending` can mean
+        // the terminal status write failed, not only in flight; the docs
+        // now say so at the field a caller reads.
+        "memory_subscription_replay",
     ];
 
     /// #3171 — tools whose short `description()` was deliberately CORRECTED.

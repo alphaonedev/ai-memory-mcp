@@ -179,7 +179,15 @@ async fn gate_consolidate_sources(
         ) {
             return Err(not_found(&mem.id));
         }
-        if !crate::visibility::caller_owns_for_mutation(mem, caller_principal, false) {
+        if !crate::visibility::caller_owns_for_mutation(
+            mem,
+            caller_principal,
+            false,
+            crate::identity::owner_stamp::MutationSite::new(
+                app.storage_backend.as_str(),
+                crate::identity::owner_stamp::funnel::CONSOLIDATE,
+            ),
+        ) {
             return Err((
                 StatusCode::FORBIDDEN,
                 Json(json!({"error": crate::errors::msg::CALLER_DOES_NOT_OWN_MEMORY})),
@@ -641,18 +649,9 @@ pub async fn consolidate_memories(
             consolidate_quota_op,
         ) {
             return match e {
-                crate::quotas::QuotaCheckError::Quota(qe) => (
-                    StatusCode::TOO_MANY_REQUESTS,
-                    Json(json!({
-                        "code": crate::errors::error_codes::QUOTA_EXCEEDED,
-                        "error": qe.to_string(),
-                        "limit": qe.limit.as_str(),
-                        "current": qe.current,
-                        "max": qe.max,
-                        "agent_id": qe.agent_id,
-                    })),
-                )
-                    .into_response(),
+                crate::quotas::QuotaCheckError::Quota(qe) => {
+                    crate::handlers::errors::quota_exceeded_response(&qe)
+                }
                 crate::quotas::QuotaCheckError::Sql(se) => {
                     tracing::error!("consolidate quota substrate error: {se}");
                     (

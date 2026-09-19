@@ -119,7 +119,7 @@ pub fn handle_entity_register(
         &extra_metadata,
         Some(&agent_id),
     )
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| crate::mcp::error_text::mcp_foreign_err("handle_entity_register", e))?;
 
     Ok(json!({
         "entity_id": reg.entity_id,

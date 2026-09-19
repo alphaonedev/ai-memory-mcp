@@ -10,7 +10,7 @@ layout: doc
 > is the supported deployment shape.
 >
 > **It is not a parity backend, and this guide does not claim it is.** At
-> v1.0.0 postgres serves **73 of the 86** unique production HTTP paths;
+> v1.0.0 postgres serves **75 of the 88** unique production HTTP paths;
 > the other **13 return `501 NOT IMPLEMENTED`**, and the **stdio MCP path
 > is SQLite-only** (`ai-memory mcp` always opens a local rusqlite
 > connection, so a postgres deployment serves MCP clients through the
@@ -51,15 +51,15 @@ choice. Switch to postgres+AGE when one or more of these is true:
   sharing the same store. Postgres is the supported topology;
   sqlite-over-NFS is not.
 
-The two backends are at **schema parity at v98**
-(`CURRENT_SCHEMA_VERSION = 98` on both ladders — the postgres upgrade
-ladder ends at `migrate_v98()`).
+The two backends are at **schema parity at v100**
+(`CURRENT_SCHEMA_VERSION = 100` on both ladders — the postgres upgrade
+ladder ends at `migrate_v100()`).
 
 **Schema parity is NOT feature parity.** Some postgres ladder arms are
 version-stamp no-ops rather than real DDL, so a matching version number
 does not mean a matching set of tables: postgres ships no `skills` table
 (`migrate_v82` is a no-op) and no `governance_rules` table. Concretely,
-**73 of the 86 unique production HTTP paths are served on postgres and
+**75 of the 88 unique production HTTP paths are served on postgres and
 13 return a uniform `501 NOT IMPLEMENTED`** (fail-closed — never a
 silent read/write against the wrong database), and the **stdio MCP path
 is SQLite-only**. See "The 13 fully-501 paths" below for the exact
@@ -329,8 +329,13 @@ a backend that *does* come up; use `doctor` to diagnose one that does not.
 way to bootstrap a fresh postgres backend:
 
 ```bash
-ai-memory schema-init --store-url postgres://aimemory:changeme-please@localhost:5432/aimemory
+ai-memory schema-init --store-url 'postgres://aimemory:changeme-please@localhost:5432/aimemory?sslmode=verify-full&sslrootcert=/etc/ai-memory/pg-ca.crt'
 ```
+
+Since v1.0.0 (#3705, "only encrypted data in transit") every DSN the
+daemon or CLI opens MUST pin `sslmode=verify-full&sslrootcert=<ca>`; a DSN
+without it is refused at the connect funnel before any socket is opened —
+there is no plaintext or `require`-only posture to select.
 
 What it does (see `src/cli/schema_init.rs`):
 
@@ -338,7 +343,7 @@ What it does (see `src/cli/schema_init.rs`):
    `migrate` verb uses — the open itself runs `INIT_SCHEMA` (the
    bundled `src/store/postgres_schema.sql`, idempotent `CREATE TABLE
    IF NOT EXISTS` throughout) plus the in-process upgrade ladder up to
-   schema v98 (the current `CURRENT_SCHEMA_VERSION`) as a side effect. The
+   schema v99 (the current `CURRENT_SCHEMA_VERSION`) as a side effect. The
    `vector` (pgvector) extension is
    **required** — `CREATE EXTENSION IF NOT EXISTS vector` failing
    aborts the bootstrap.
@@ -382,17 +387,18 @@ resolves the store URL in this order, first hit wins:
 
 ```bash
 # Preferred (v0.9.0+): non-argv channel
-export AI_MEMORY_STORE_URL='postgres://aimemory:PASSWORD@HOST:5432/aimemory'
+export AI_MEMORY_STORE_URL='postgres://aimemory:PASSWORD@HOST:5432/aimemory?sslmode=verify-full&sslrootcert=/etc/ai-memory/pg-ca.crt'
 ai-memory serve
 
 # Still accepted, but the password is exposed via /proc/<pid>/cmdline and `ps`
-ai-memory serve --store-url postgres://aimemory:PASSWORD@HOST:5432/aimemory
+ai-memory serve --store-url 'postgres://aimemory:PASSWORD@HOST:5432/aimemory?sslmode=verify-full&sslrootcert=/etc/ai-memory/pg-ca.crt'
 ```
 
 URL shapes accepted by `--store-url` (and the env/file channels above):
 
-- `postgres://user:pass@host:port/dbname`
-- `postgresql://user:pass@host:port/dbname` (alias)
+- `postgres://user:pass@host:port/dbname?sslmode=verify-full&sslrootcert=<ca.crt>`
+- `postgresql://user:pass@host:port/dbname?sslmode=verify-full&sslrootcert=<ca.crt>` (alias)
+- (#3705) the `sslmode=verify-full` + `sslrootcert` pair is mandatory on both
 - `sqlite:///absolute/path/to/file.db` (also valid — same semantics as `--db`)
 
 `--db` and `--store-url` are **mutually exclusive**. Passing both
@@ -509,7 +515,7 @@ and append the three flags to the `ExecStart=` line:
 ```ini
 [Service]
 ExecStart=/usr/local/bin/ai-memory serve \
-    --store-url postgres://aimemory:PWD@10.20.0.4:5432/aimemory \
+    --store-url 'postgres://aimemory:PWD@10.20.0.4:5432/aimemory?sslmode=verify-full&sslrootcert=/etc/ai-memory/pg-ca.crt' \
     --tls-cert /etc/ai-memory/tls/server.pem \
     --tls-key  /etc/ai-memory/tls/server.key \
     --mtls-allowlist /etc/ai-memory/tls/mtls-allowlist.txt
@@ -675,10 +681,10 @@ The eight remaining sqlite-only surfaces land here.
 > on a postgres-backed daemon, with "no residual 501 envelope on
 > standard endpoints" — the 501 being merely a safety net for unknown
 > or future routes. That OVERSTATED the delivered surface and is
-> **RETRACTED**. The measured, gate-pinned inventory is **73
-> pg-supported unique paths, 13 fully-501 paths, 86 unique paths
-> total** (`EXPECTED_PG_SUPPORTED_UNIQUE_PATHS = 73` /
-> `EXPECTED_FULLY_501_PATHS = 13` / `EXPECTED_TOTAL_UNIQUE_PATHS = 86`,
+> **RETRACTED**. The measured, gate-pinned inventory is **75
+> pg-supported unique paths, 13 fully-501 paths, 88 unique paths
+> total** (`EXPECTED_PG_SUPPORTED_UNIQUE_PATHS = 75` /
+> `EXPECTED_FULLY_501_PATHS = 13` / `EXPECTED_TOTAL_UNIQUE_PATHS = 88`,
 > `tests/pg_supported_route_inventory_gate_2799.rs`), and the
 > same gate freezes the allow-list membership so a silent match-arm
 > add or remove fails until the SSOT is updated in a reviewed edit. The

@@ -29,6 +29,18 @@ const HOST_KIND = "anthropic-sdk";
 // Capture transport (memory_capture_turn over MCP stdio; NEVER throws)
 // --------------------------------------------------------------------------- //
 
+/** #3555 payload inside a successful MCP capture result. Capture APIs remain boolean. */
+export interface CaptureTurnReceipt {
+  memory_id?: string;
+  dedup_hit?: boolean;
+  status?: string;
+  pending_id?: string;
+  durability_class: "local-only" | `quorum ${number}-of-${number}` | "replicated+backup";
+  fsync: string;
+  quorum_acks?: number;
+  quorum_n?: number;
+}
+
 export interface CaptureTurnParams {
   hostSessionId: string;
   hostTurnIndex: number;

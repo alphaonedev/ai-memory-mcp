@@ -33,7 +33,7 @@ db   = "/Users/fate/.claude/ai-memory.db"
 # ---------------------------------------------------------------------
 [llm]
 backend     = "xai"           # ollama | openai | xai | anthropic | gemini |
-                              # deepseek | kimi | qwen | mistral | groq |
+                              # kimi | qwen | mistral | groq |
                               # together | cerebras | openrouter |
                               # fireworks | lmstudio | vllm | openai-compatible
 model       = "grok-4.3"      # vendor-specific identifier
@@ -217,7 +217,7 @@ to certify a stack whose probed versions drift from the pins below).
 | Apache AGE | **1.8.0** | `AGE_APT_VERSION=1.8.0~rc0-2.pgdg13+1` (overlaid via pgdg apt on base `AGE_BASE_IMAGE=apache/age:release_PG18_1.7.0`; `CREATE EXTENSION age` reports extversion 1.8.0), `EXPECTED_AGE_VERSION=1.8.0` |
 | pgvector (server extension) | **0.8.6** | `PGVECTOR_APT_VERSION=0.8.6-1.pgdg13+1` |
 | pgvector (Rust binding crate) | **0.4** | `Cargo.toml` → `pgvector = "0.4"` |
-| ai-memory postgres schema | **v93** | postgres ladder pinned in lockstep with SQLite `CURRENT_SCHEMA_VERSION = 98` (`src/storage/migrations.rs`). NOTE: the `deploy/docker-1461` / `deploy/do-1461` provisioning configs are reproducibility anchors **pinned to the v0.7.0 release** (`EXPECTED_VERSION=0.7.0`, `EXPECTED_SCHEMA=57`, golden SHA), so their `57` is correct *for that pinned release* — it is not a stale copy of the current tip (`CURRENT_SCHEMA_VERSION = 91`). A deployment-validation anchor at the current schema would be a separate config. |
+| ai-memory postgres schema | **v93** | postgres ladder pinned in lockstep with SQLite `CURRENT_SCHEMA_VERSION = 100` (`src/storage/migrations.rs`). NOTE: the `deploy/docker-1461` / `deploy/do-1461` provisioning configs are reproducibility anchors **pinned to the v0.7.0 release** (`EXPECTED_VERSION=0.7.0`, `EXPECTED_SCHEMA=57`, golden SHA), so their `57` is correct *for that pinned release* — it is not a stale copy of the current tip (`CURRENT_SCHEMA_VERSION = 91`). A deployment-validation anchor at the current schema would be a separate config. |
 
 The bundled stacked image at
 [`deploy/docker-1461/Dockerfile.pg-age-vector`](../deploy/docker-1461/Dockerfile.pg-age-vector)
@@ -278,7 +278,7 @@ request_timeout_secs  = 60    # axum middleware ceiling (slowloris guard)
 llm_call_timeout_secs = 30    # wraps every spawn_blocking LLM call in tokio timeout
 
 # MCP-stdio → HTTP daemon write forwarder (federation fanout).
-mcp_federation_forward_url = "http://localhost:9077"
+mcp_federation_forward_url = "https://localhost:9077"
 ```
 
 | Field | Type | Default | Purpose |
@@ -402,12 +402,20 @@ max_decompressed_bytes = 16777216    # 16 MiB decompression-bomb cap (per fetch 
 `<redacted>` in `Debug`, and zeroized on drop. Keep the config file
 `chmod 600`. When unset, only per-subscription secrets apply.
 
-### `[subscriptions]` — webhook SSRF guard (H11, #628)
+### `[subscriptions]` — webhook SSRF guard (H11, #628) and private-PKI trust (#3705)
 
 ```toml
 [subscriptions]
 allow_loopback_webhooks = false   # default false closes an authenticated SSRF gadget
+ca_cert = "/etc/ai-memory/webhook-ca.pem"   # optional: PEM certificate/CA trusted IN ADDITION to the public roots
 ```
+
+`ca_cert` (v1.0.0 #3705) — webhook targets are `https://` only (plaintext
+is refused everywhere, loopback included), so a receiver behind a private
+PKI is reached by naming its certificate or CA here; the dispatcher trusts
+it in addition to the public roots (explicit trust, never a downgrade). It
+is installed once at boot; a configured file that cannot be read or parsed
+REFUSES boot — never silently ignored. Unset keeps the public roots only.
 
 Default-OFF rejects webhook URLs resolving to `127.0.0.0/8` /
 `localhost` / `::1` (which are reachable from the daemon and would
@@ -653,7 +661,6 @@ order:
    - `openai` → `OPENAI_API_KEY`
    - `anthropic` → `ANTHROPIC_API_KEY`
    - `gemini` → `GEMINI_API_KEY` (or `GOOGLE_API_KEY`)
-   - `deepseek` → `DEEPSEEK_API_KEY`
    - `kimi` / `moonshot` → `MOONSHOT_API_KEY` (or `KIMI_API_KEY`)
    - `qwen` / `dashscope` → `DASHSCOPE_API_KEY` (or `QWEN_API_KEY`)
    - `mistral` → `MISTRAL_API_KEY`
@@ -681,7 +688,6 @@ operator does not override:
 | `xai`            | `https://api.x.ai/v1`                             | `grok-4.3`                                      |
 | `anthropic`      | `https://api.anthropic.com/v1`                    | `claude-opus-4.7`                               |
 | `gemini`         | `https://generativelanguage.googleapis.com/v1beta/openai` | `gemini-2.0-flash`                      |
-| `deepseek`       | `https://api.deepseek.com/v1`                     | `deepseek-chat`                                 |
 | `kimi`/`moonshot`| `https://api.moonshot.cn/v1`                      | `moonshot-v1-8k`                                |
 | `qwen`/`dashscope`| `https://dashscope.aliyuncs.com/compatible-mode/v1` | `qwen-max`                                |
 | `mistral`        | `https://api.mistral.ai/v1`                       | `mistral-large-latest`                          |

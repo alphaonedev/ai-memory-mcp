@@ -433,8 +433,10 @@ fn forward_to_http_5xx_returns_structured_error() {
 
     let server = mock_runtime().block_on(async {
         let server = MockServer::start().await;
-        // The /api/v1/memories route returns 500 with a body that should
-        // be echoed back in the error string.
+        // The /api/v1/memories route returns 500 with a body. #3698: that
+        // body is FOREIGN TEXT and is never echoed to the MCP caller — the
+        // error carries the target and the status; the operator log gets
+        // the body's size and digest.
         Mock::given(method("POST"))
             .and(path("/api/v1/memories"))
             .respond_with(ResponseTemplate::new(500).set_body_string("upstream down"))
@@ -457,8 +459,12 @@ fn forward_to_http_5xx_returns_structured_error() {
     )
     .expect_err("5xx upstream must surface as Err");
     assert!(
-        err.contains("federation_forward") && err.contains("500") && err.contains("upstream down"),
-        "expected federation_forward 500 echo, got: {err}"
+        err.contains("federation_forward") && err.contains("500"),
+        "expected a federation_forward error naming the status, got: {err}"
+    );
+    assert!(
+        !err.contains("upstream down"),
+        "#3698: the peer's body must never reach the caller: {err}"
     );
 }
 
@@ -470,7 +476,7 @@ fn forward_to_http_connection_failure_surfaces_send_error() {
 
     // Localhost on a vanishingly unlikely-to-be-bound high port. The
     // test does NOT need to bind anything — we want the send() to fail.
-    let forward_url = "http://127.0.0.1:1";
+    let forward_url = "https://127.0.0.1:1";
 
     let err = run_store_with_forward(
         &conn,
@@ -519,8 +525,8 @@ fn forward_to_http_non_json_body_surfaces_parse_error() {
     )
     .expect_err("non-json body must surface as Err");
     assert!(
-        err.contains("parse body") && err.contains("not-json-at-all"),
-        "expected parse-body Err echo, got: {err}"
+        err.contains("parse body") && !err.contains("not-json-at-all"),
+        "expected a parse-body error that withholds the body (#3698), got: {err}"
     );
 }
 

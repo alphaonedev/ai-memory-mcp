@@ -131,7 +131,9 @@ pub fn handle_checkpoint_create(
         let bytes =
             crate::quotas::coordination_payload_bytes(&[&cp.title], &[&cp.condition, &cp.metadata]);
         crate::quotas::check_and_record_storage_only(conn, &cp.created_by, &cp.namespace, bytes)
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| {
+                crate::mcp::error_text::mcp_foreign_err("check_and_record_storage_only", e)
+            })?;
     }
 
     // PR-1 / L5 (#2708-sibling, CWE-284) — close the LOCAL creation path too: a
@@ -223,7 +225,8 @@ pub fn handle_checkpoint_resolve(
     // resolves but stays Unsigned (verify:false) — DEGRADE, never daemon-sign a
     // caller-mintable freeze anchor. ADVISORY (no gate; the daemon signs as
     // before) under standard posture so single-node dev is unaffected.
-    let stored = crate::checkpoints::get(conn, id).map_err(|e| e.to_string())?;
+    let stored = crate::checkpoints::get(conn, id)
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("get", e))?;
     // Engage the operator-attestation lane exactly when the SHARED
     // `withhold_daemon_signature` predicate (epoch_advance under the certified /
     // asi-hard posture) would refuse to daemon-sign this resolution — SINGLE-
@@ -320,7 +323,7 @@ pub fn handle_checkpoint_resolve(
         resolve_at,
         resolve_keypair,
     )
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| crate::mcp::error_text::mcp_foreign_err("handle_checkpoint_resolve", e))?;
     match resolved {
         crate::checkpoints::ResolveOutcome::NotFound => Err(format!("checkpoint not found: {id}")),
         // #2995 — first-resolution-wins: an already-resolved checkpoint is a
@@ -338,8 +341,9 @@ pub fn handle_checkpoint_resolve(
             // so `verify()` attests the resolution to the OPERATOR, not the
             // daemon (separation of duties). No-op on every other lane.
             if let Some((sig, pubkey)) = external_attestation {
-                crate::checkpoints::store_resolution_attestation(conn, id, &sig, &pubkey)
-                    .map_err(|e| e.to_string())?;
+                crate::checkpoints::store_resolution_attestation(conn, id, &sig, &pubkey).map_err(
+                    |e| crate::mcp::error_text::mcp_foreign_err("store_resolution_attestation", e),
+                )?;
                 cp.signature = sig;
                 cp.resolver_pubkey = pubkey;
             }
@@ -406,7 +410,7 @@ pub fn handle_checkpoint_query(
     let limit = usize::try_from(limit).unwrap_or(50);
 
     let checkpoints = crate::checkpoints::query(conn, namespace, condition_type, state, limit)
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("query", e))?;
     Ok(json!({
         "checkpoints": serde_json::to_value(&checkpoints).map_err(|e| e.to_string())?,
     }))
@@ -432,7 +436,8 @@ pub fn handle_checkpoint_verify(
     // checkpoint". Refuse instead — a verification verdict must never be
     // manufactured from a malformed request.
     let id = crate::mcp::param_guard::require_str(params, param_names::ID)?;
-    let found = crate::checkpoints::get(conn, id).map_err(|e| e.to_string())?;
+    let found = crate::checkpoints::get(conn, id)
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("get", e))?;
     match found {
         None => Ok(json!({ (RESP_CHECKPOINT): Value::Null, "verified": false })),
         Some(cp) => Ok(json!({
@@ -1022,7 +1027,7 @@ mod handler_tests {
             return;
         }
         let _g = crate::config::test_env_lock();
-        let key_dir = tempfile::tempdir().expect("key dir");
+        let key_dir = crate::identity::test_key_dir::private_tempdir();
         // SAFETY: single-threaded isolated child; guarded by test_env_lock.
         unsafe {
             std::env::set_var(
@@ -1077,7 +1082,7 @@ mod handler_tests {
             return;
         }
         let _g = crate::config::test_env_lock();
-        let key_dir = tempfile::tempdir().expect("key dir");
+        let key_dir = crate::identity::test_key_dir::private_tempdir();
         // SAFETY: single-threaded isolated child; guarded by test_env_lock.
         unsafe {
             std::env::set_var(

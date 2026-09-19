@@ -7,6 +7,136 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (#3654 — per-peer federation freshness)
+
+- **#3654 (observability) — a peer that stops converging is now visible
+  per peer, and sustained failure is no longer DEBUG-only.** New registry
+  `src/federation/freshness.rs` records, per configured peer and per
+  direction (`pull` catch-up / `push` writes), the last attempt, the last
+  success (a push counts only when the peer applied it, #2341), the
+  failure streak and its closed-set class, the peer's clock offset from
+  its HTTP `Date` header, and the per-peer push-DLQ backlog. Nine new
+  Prometheus series (`ai_memory_federation_peer_*` and
+  `ai_memory_federation_catchup_interval_seconds`) expose them; a series
+  appears only after its first observation, never as a fake `0`, and
+  every timestamp is taken from the local clock so a skewed peer cannot
+  look fresh. Catch-up failures stay at DEBUG for a transient and
+  escalate to a WARN (`federation.peer_freshness`) at 3 consecutive
+  failures, then only when the streak doubles; recovery logs one INFO.
+  A fan-out task that panics is now attributed to its peer
+  (`PeerTasks`), where every lane previously logged an anonymous join
+  error and `bulk_catchup_push` reported the peer as `"unknown"`. A 2xx
+  catch-up envelope with no `memories` array is now recorded as a
+  malformed response instead of being skipped silently. The `peer`
+  label is the minted `peer-h1…` id; an id of any other shape is hashed
+  first, since a legacy id can be a credential-bearing URL. The catch-up
+  cadence series exists only while a catch-up loop runs (a node without
+  one exports no sample, never a `0`). The per-peer block of
+  `/api/v1/monitoring/status` (#3646) is now populated from the registry:
+  `reachability` is derived from pulls only and is `unknown` (with a
+  reason) when there is no fresh pull, never healthy from silence, and
+  `last_successful_push_age_seconds` is the age of the last push the
+  peer applied. Every observed per-peer value is an
+  `{"state":"available","value":…}` signal object and every unobserved
+  one an explicit not-observed object, never a bare number. Not measured
+  by this change: per-peer replication lag and catch-up progress
+  (#3681), the `ai-memory sync-daemon` lane (#3682), and inbound-only
+  peers, which are not enumerated on the status surface (#3686).
+  peer applied, or an explicit not-observed object. Not measured by this
+  change: per-peer replication lag and catch-up progress (#3681), and
+  the `ai-memory sync-daemon` lane (#3682).
+### Fixed (#3655 — doctor no longer masks sync failures or stale peers)
+
+- **#3655 (observability, HIGH; audit #3645 F09) — the local doctor's `Sync`
+  section kept four states distinct and ages every cursor against the probe
+  time.** An unreadable `sync_state` is **Critical** (`sync_state =
+  unreadable` + `sync_query_error`), never `peer_count = 0` / "single-node";
+  rows with NULL or non-RFC 3339 cursors are counted and named
+  (`invalid_rows`, `peer::<agent>/<peer>::invalid`) as a **Warning** instead
+  of being skipped; each valid peer renders `reachability`,
+  `contact_age_secs`, `catchup_interval_secs`, `advanced_age_secs`,
+  `data_age_secs`, `pushed_age_secs` / `never_pushed`, and signed
+  `clock_lead_secs` (**Critical** beyond the sync daemon's 300s pull-cursor
+  future bound; a quiet peer's negative lead is no longer a false Critical).
+  `probed_at`, `stale_peers`, `unknown_peers` and the `max_*_age_secs`
+  facts are new; `max_skew_secs` is kept for consumers but no longer drives
+  severity. `storage::doctor_max_sync_skew_secs` (which turned a failed
+  `prepare` into "not observed") is replaced by
+  `doctor_sync_peer_watermarks`, which propagates the failure.
+- **#3655 review rework — contact is recorded apart from the data
+  watermark, and reachability uses #3654's one definition.**
+  `sync_state.last_pulled_at` moves only when a pull ADVANCED the watermark
+  (`sync_state_observe`), so a quiet peer answering every pull with an
+  empty window never touched it and the first cut called it stale. Schema
+  **v99** adds `sync_peer_contact` (`last_contact_at`,
+  `catchup_interval_secs`; postgres twin is a version stamp only): both pull
+  paths (`sync_cycle_once` and the `serve` catch-up loop) stamp it on every
+  2xx pull, empty window included, with the cadence the #3654 registry
+  published. The doctor classifies each peer with the registry's rule and
+  reason strings — `reachable` inside 3 × the recorded cadence,
+  `unknown:pull_observation_stale` (**Critical**) beyond it,
+  `unknown:no_pull_observation` / `unknown:no_catchup_loop` (**Warning**)
+  when no contact or cadence was recorded — and never renders an absent
+  contact as an age of 0. Tests: an empty-window `sync_cycle_once` stamps
+  contact and leaves `sync_state` untouched; old cursors + fresh contact is
+  Info; old contact is Critical; no contact is Warning.
+- **#3655 v3 review — the reader enumerates the UNION of `sync_state` and
+  `sync_peer_contact`.** A peer that has only ever answered empty windows
+  (contact row, no `sync_state` row) was invisible to the section; it is
+  now listed, reachable, with `advanced_age_secs` / `data_age_secs` /
+  `clock_lead_secs` = `never_pulled` (never 0, never invalid). Peer ids are
+  redacted at watermark construction (`logging::redact_url_password`) so a
+  credential-bearing legacy URL never reaches a fact or note. A non-2xx
+  pull is never stamped as contact (tested with a peer answering 500).
+### Added (#3714 / #3715 — the deployment shape is the primary configuration input; unknown config keys refuse)
+
+- `[deployment] shape = "singleton" | "team" | "production" | "federated" | "hive"`
+  — the ONE new top-level setting of the configuration programme. One
+  definition (`config::shape::DeploymentShape::derive`) yields a
+  `ShapeDerived` table where every row is a **FLOOR** (an override below it
+  refuses boot) or a **default** (an explicit value wins). `#3700` (posture)
+  and `#3709` (transit) consume that table, never the environment. A config
+  with no `[deployment]` block is a `singleton`; nothing ever promotes a
+  running node to a stricter shape — promotion is an operator act.
+- v1.0.0 enforces two rows at boot: `production` / `federated` / `hive` pin
+  `AI_MEMORY_SECURITY_PROFILE=asi-hard` when it is unset and refuse a
+  `standard` override; the same shapes REQUIRE at-rest encryption — and
+  because no recovery escrow for the at-rest key exists yet (#3717), the
+  requirement is DECLARED (boot WARN, `doctor` "Deployment shape" section,
+  #3557) rather than silently enabled: a lost key must never mean lost
+  memory. An explicit `[encryption].at_rest = false` under those shapes
+  refuses boot. Every other derived row is declared here and enforced by
+  its named consumer.
+- `ai-memory config show [--file]` renders the derivation table with the
+  marker on every row (no secrets, no effective values — what the SHAPE
+  says).
+- **Unknown config keys now REFUSE the boot loader at every nesting level**
+  (exit 78, the #3166 class). The accepted key tree is derived from
+  `AppConfig`'s schema (`schemars`), not a hand list — 174 leaf keys at this
+  release — so a new field is accepted the moment it exists. The refusal
+  names the full key path, the nearest accepted sibling by edit distance,
+  any section where a key of that name IS accepted, and the exact repair
+  command. Pre-v1.0.0 only top-level unknown keys WARNed; nested ones were
+  silent. **Run `ai-memory config check` BEFORE upgrading**: it is the
+  detector — valid TOML that the daemon would refuse exits **5** with the
+  same per-key report and never refuses anything itself. `config migrate`,
+  `config check`, `config show` and `governance migrate-to-permissions`
+  all parse through `toml::Value` and stay reachable from a refused
+  config (a fail-closed loader whose repair path is behind the same gate
+  is a lockout, not a control).
+
+### Fixed (#3555 — write receipts declare their durability)
+
+- HTTP create, update, bulk, capture/replay and sync-push receipts, local MCP
+  store/update/capture receipts, and CLI store/update/capture receipts declare
+  `durability_class` and `fsync`. Forwarded MCP stores retain the daemon receipt.
+- Local writes declare `local-only`; SQLite reads the live `synchronous` setting.
+  Successful quorum creates report the actual acknowledgement count and replica
+  count on SQLite and PostgreSQL. Explicit backup-posture attestation can raise
+  an acknowledged replicated write to `replicated+backup`.
+- SDK and shim wire types expose receipt evidence. The generated all-funnel
+  structural contract is deferred to #3558; no competing manifest is introduced.
+
 ### Corrected (#3273 — 2026-09-11: merge messages on #3240 / #3235)
 
 - **#3273 (governance / process integrity) — the merge commits `c3344757`
@@ -20,6 +150,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   correction. The technical work in those merges is assessed separately.
   The live merge gate requires a real Fable APPROVE-MERGE signal naming
   the head SHA.
+
+### Removed
+
+- **The `deepseek` LLM provider alias is removed from the product and every current doc** ([#3627](https://github.com/alphaonedev/ai-memory-mcp/issues/3627)). An explicit `AI_MEMORY_LLM_BACKEND` / `[llm].backend` of that token is now refused with the standard unknown-alias error naming the accepted selectors (no silent fallback to the Ollama default URL). Historical release records (earlier CHANGELOG sections, `.github/release-body-v0.8.0.md`, `docs/compliance/_inventory/v0.7.0-capabilities.json`) stay as past-release facts.
 
 ### Security (#3549 — one caller-authority resolver beneath every handler)
 

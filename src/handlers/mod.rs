@@ -50,7 +50,7 @@
 /// Tracing target for HTTP-layer authorization (ownership-gate /
 /// caller-resolution) denials, shared across the handler sub-modules
 /// (#1558 tracing-target SSOT).
-pub(crate) const AUTHZ_TRACE_TARGET: &str = "ai_memory::authz";
+pub const AUTHZ_TRACE_TARGET: &str = "ai_memory::authz";
 
 /// `tracing` target for HTTP authentication events (`api_key_auth` middleware,
 /// #2044 per-agent-key boot-seed). One SSOT const per the pm-v3.1 no-hardcoded-
@@ -134,6 +134,8 @@ pub mod kg;
 pub mod links;
 pub mod memories;
 pub mod memories_query;
+/// Authenticated health-only API and transport scope boundary (#3646).
+pub mod monitoring;
 pub mod parity;
 pub mod postgres_gate;
 pub mod power;
@@ -157,6 +159,7 @@ pub mod skills;
 pub mod subscriptions;
 pub mod system;
 pub mod transport;
+mod write_receipt;
 // #1579 B4 — HTTP response-format negotiation (json | toon |
 // toon_compact) for the recall/search surfaces.
 pub mod wire_format;
@@ -243,7 +246,9 @@ pub(crate) fn capability_from_headers(
                     "deny",
                     crate::governance::capability::AUDIT_KIND_REJECT,
                     crate::governance::capability::CapReject::Malformed.code(),
-                    serde_json::json!({ "stage": "edge-parse", "cause": "non-utf8-header" }),
+                    crate::governance::audit::ForensicPayload::new()
+                        .label("stage", "edge-parse")
+                        .label("cause", "non-utf8-header"),
                 );
                 return Err((
                     axum::http::StatusCode::FORBIDDEN,

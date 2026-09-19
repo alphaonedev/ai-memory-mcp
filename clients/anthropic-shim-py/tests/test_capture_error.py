@@ -56,3 +56,65 @@ def test_ok_result_response_is_success(monkeypatch: pytest.MonkeyPatch) -> None:
         _fake_run('{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"ok"}]}}\n'),
     )
     assert _call() is True
+
+
+def _ask_stdout() -> str:
+    """A capture_turn governance Ask result: status="ask", NO id — nothing persisted."""
+    import json as _json
+
+    inner = _json.dumps(
+        {"status": "ask", "reason": "approval requested", "action": "memory_capture_turn"}
+    )
+    outer = _json.dumps(
+        {"jsonrpc": "2.0", "id": 2, "result": {"content": [{"type": "text", "text": inner}]}}
+    )
+    return outer + "\n"
+
+
+def _pending_stdout(pending_id: str) -> str:
+    """A capture_turn Pending result: status="pending" + pending_id — DURABLY QUEUED."""
+    import json as _json
+
+    inner = _json.dumps(
+        {
+            "status": "pending",
+            "pending_id": pending_id,
+            "reason": "governance approval required",
+            "action": "memory_capture_turn",
+        }
+    )
+    outer = _json.dumps(
+        {"jsonrpc": "2.0", "id": 2, "result": {"content": [{"type": "text", "text": inner}]}}
+    )
+    return outer + "\n"
+
+
+def test_ask_status_is_not_captured_and_claims_no_recovery(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # #3544 — a governance Ask (capture_turn.rs:415) persists NOTHING and
+    # returns no id. It is not a captured turn, and the message must NOT claim
+    # a recovery that does not exist. Pre-fix the shim returned True here.
+    monkeypatch.setattr(_capture.subprocess, "run", _fake_run(_ask_stdout()))
+    assert _call() is False
+    err = capsys.readouterr().err
+    assert "status=ask" in err
+    assert "pending_id" not in err
+    assert "pending_approve" not in err
+
+
+def test_pending_status_is_not_captured_but_surfaces_pending_id(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # #3544 — a Pending (capture_turn.rs:467) is DURABLY QUEUED and recoverable
+    # via memory_pending_approve. It is not a captured turn, but the shim must
+    # NOT discard the pending_id — the only recovery handle — nor claim nothing
+    # persisted. The id must survive to the caller (stderr), distinct from Ask.
+    monkeypatch.setattr(
+        _capture.subprocess, "run", _fake_run(_pending_stdout("pend-xyz-42"))
+    )
+    assert _call() is False
+    err = capsys.readouterr().err
+    assert "status=pending" in err
+    assert "pend-xyz-42" in err
+    assert "pending_approve" in err

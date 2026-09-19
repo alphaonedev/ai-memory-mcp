@@ -244,6 +244,7 @@ pub async fn notify(
                 &namespace,
                 receipt_mem.map_or(&fallback_tier, |m| &m.tier),
                 receipt_mem.map_or(fallback_delivered_at.as_str(), |m| m.created_at.as_str()),
+                &body.title,
             )),
         )
             .into_response();
@@ -313,7 +314,8 @@ pub async fn notify(
 // contract. Scenario S33 uses a lighter shape (`{agent_id, namespace}`) to
 // express "subscribe this agent to a namespace". We accept both: when a
 // namespace is supplied without a URL we synthesize an internal loopback URL
-// (`http://localhost/_ns/<agent_id>/<namespace>`) that passes SSRF validation
+// (`https://localhost/_ns/<agent_id>/<namespace>` — https since #3705: no
+// plaintext URL is accepted anywhere, synthetic or not) that passes validation
 // and sets `agent_filter`/`namespace_filter` accordingly. This lets S33 round-
 // trip without needing a separate subscriptions table.
 
@@ -417,7 +419,7 @@ pub async fn subscribe(
         {
             url_was_synthesized = true;
         }
-        let synthetic = format!("http://localhost/_ns/{caller}/{ns}");
+        let synthetic = format!("https://localhost/_ns/{caller}/{ns}");
         (
             synthetic,
             Some(ns),

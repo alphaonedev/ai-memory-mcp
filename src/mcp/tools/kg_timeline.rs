@@ -99,8 +99,8 @@ pub fn handle_kg_timeline(
         .as_u64()
         .and_then(|n| usize::try_from(n).ok());
 
-    let mut events =
-        db::kg_timeline(conn, source_id, since, until, limit).map_err(|e| e.to_string())?;
+    let mut events = db::kg_timeline(conn, source_id, since, until, limit)
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("kg_timeline", e))?;
 
     // #3498/#3270: apply the same rule to every returned target, including
     // hidden lifecycle states. A lookup error drops the event; a genuinely

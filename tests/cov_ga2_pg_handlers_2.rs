@@ -964,6 +964,100 @@ pg_test!(
     }
 );
 
+pg_test!(
+    pg_memory_dependents_hides_quarantined_keeps_contaminated_3614,
+    url,
+    {
+        let r = pg_router(&url).await;
+        let ns = uniq_ns();
+        let owner = "ai:dep-owner-3614";
+        let pool = sqlx::PgPool::connect(&url).await.expect("pg pool");
+        let mut ids = Vec::new();
+        for title in [
+            "root-3614",
+            "open-3614",
+            "contaminated-3614",
+            "quarantined-3614",
+        ] {
+            let (status, body) = post_json_as(
+                &r,
+                "/api/v1/memories",
+                json!({"title": title, "content": "body", "namespace": ns, "agent_id": owner}),
+                owner,
+            )
+            .await;
+            assert!(status.is_success(), "seed status={status} body={body}");
+            ids.push(body["id"].as_str().expect("seed id").to_string());
+        }
+        for (id, state) in ids[1..].iter().zip(["open", "contaminated", "quarantined"]) {
+            let (status, body) = post_json_as(
+                &r,
+                "/api/v1/links",
+                json!({"source_id": id, "target_id": ids[0], "relation": "reflects_on"}),
+                owner,
+            )
+            .await;
+            assert!(status.is_success(), "seed link status={status} body={body}");
+            sqlx::query("UPDATE memories SET lifecycle_state = $1 WHERE id = $2")
+                .bind(state)
+                .bind(id)
+                .execute(&pool)
+                .await
+                .expect("stamp lifecycle");
+        }
+        // Pin the unscoped store result as well as the non-admin HTTP read gate.
+        let store = PostgresStore::connect(&url).await.expect("postgres store");
+        let dependents = store
+            .list_dependents_of_invalidated(&ids[0])
+            .await
+            .expect("list dependents");
+        assert_eq!(
+            dependents.len(),
+            2,
+            "#3614 unscoped lister must hide quarantine"
+        );
+        assert!(
+            dependents
+                .iter()
+                .all(|d| (d.id == ids[1] || d.id == ids[2]) && d.namespace == ns)
+        );
+        for (caller, count) in [(owner, 2), ("ai:dep-stranger-3614", 0)] {
+            let (status, body) = post_json_as(
+                &r,
+                "/api/v1/memory_dependents_of_invalidated",
+                json!({"memory_id": ids[0]}),
+                caller,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "body={body}");
+            assert_eq!(
+                body["count"],
+                json!(count),
+                "#3614 caller={caller} body={body}"
+            );
+            let deps = body["dependents"].as_array().expect("dependents array");
+            let expected = if count == 0 {
+                json!([])
+            } else {
+                json!([{"id": ids[1], "namespace": ns}, {"id": ids[2], "namespace": ns}])
+            };
+            assert_eq!(
+                deps.len(),
+                expected.as_array().expect("expected array").len()
+            );
+            for dependent in deps {
+                assert!(
+                    expected
+                        .as_array()
+                        .expect("expected array")
+                        .contains(dependent),
+                    "unexpected dependent: {dependent}"
+                );
+            }
+        }
+    }
+);
+
 pg_test!(pg_memory_export_reflection_not_501_3064, url, {
     // #3064 batch C — pre-fix 501. Seed an observation, reflect, export.
     let r = pg_router(&url).await;

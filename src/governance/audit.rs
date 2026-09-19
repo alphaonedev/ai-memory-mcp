@@ -3,9 +3,22 @@
 
 //! v0.7.0 #697 — Ed25519-signed forensic audit log.
 //!
-//! Every governance decision (allow / refuse / warn) emitted by the
-//! agent-action engine OR the deferred-audit pipeline lands in an
-//! append-only forensic log:
+//! The sink carries two row classes on ONE `prev_hash` chain (#3647):
+//!
+//! - **Integrity rows** ([`IntegrityRow`]) — system-generated, content-free
+//!   evidence: the #1850 truncation watermark and the #3199 unverified-restore
+//!   record. They are written whenever the sink is up, which it is on every
+//!   boot, so `verify-audit-trail`'s watermark lanes work by default.
+//! - **Governance decision rows** ([`record_decision`]) — also written
+//!   whenever the sink is up (Conductor ruling on #3647: the screening is the
+//!   fix, so the operator's evidence is kept, never suppressed). Their payload
+//!   is a [`ForensicPayload`], which has no way to carry free-form text: action
+//!   content, decision reasons and other free text become a keyed commitment
+//!   before signing, and `actor` / `rule_id` are sanitised at this chokepoint.
+//!   The commitment is DETERMINISTIC under one daemon key: identical content
+//!   gives an identical `content_mac`, so an operator can see that the same
+//!   command was refused twice without learning what it was. That is a
+//!   feature, not a leak to fix.
 //!
 //! ```text
 //! <forensic_dir>/forensic-<YYYY-MM-DD>.jsonl
@@ -50,7 +63,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 /// Tracing target for the forensic audit sink (#1558 tracing-target SSOT).
-const AUDIT_TRACE_TARGET: &str = "ai_memory::governance::audit";
+pub(crate) const AUDIT_TRACE_TARGET: &str = "ai_memory::governance::audit";
 
 /// Sentinel `prev_hash` for the first line of a fresh chain.
 pub const CHAIN_HEAD_PREV_HASH: &str =
@@ -337,27 +350,542 @@ pub fn try_sign_audit_payload(payload_hash: &[u8]) -> Option<(Vec<u8>, &'static 
 }
 
 /// `true` when the daemon has installed a process-wide audit-row
-/// signing key via `init`. Used by tests + diagnostics; production
+/// signing key via `init` or `init_audit_signers`. Used by tests + diagnostics; production
 /// code paths use `try_sign_audit_payload` directly.
 #[must_use]
 pub fn audit_key_is_installed() -> bool {
     DAEMON_AUDIT_KEY.get().is_some()
 }
 
+/// v1.0.0 #3354 — the issue tag every "ledger is unsigned" line carries, so
+/// an operator can grep one token for "why are my events unsigned".
+pub const UNSIGNED_LEDGER_ISSUE: &str = "#3354";
+
+/// #3354 — the ONE spelling of the command that provisions a signing key for
+/// `agent_id`. It is the real verb (`identity generate`); there is no
+/// top-level `keygen`, and a remedy that names a verb that does not exist is
+/// a support ticket.
+#[must_use]
+pub fn signing_key_provisioning_command(agent_id: &str) -> String {
+    format!("ai-memory identity generate --agent-id {agent_id}")
+}
+
+/// #3354 — the ONE spelling of the operator-visible warning a process emits
+/// when it will write UNSIGNED `signed_events` rows: no `<agent_id>.priv`
+/// under the key directory matches the resolved agent id, so
+/// [`try_sign_audit_payload`] has nothing to sign with and every row lands
+/// `attest_level=unsigned`. Shared by the boot line, the MCP
+/// `memory_session_start` response and the tests so the spelling cannot
+/// drift.
+#[must_use]
+pub fn unsigned_ledger_warning(agent_id: &str, key_dir: &Path) -> String {
+    format!(
+        "WARN {UNSIGNED_LEDGER_ISSUE}: signed-events ledger is UNSIGNED — no signing key for \
+         {agent_id} in {}; every signed_events row this process writes carries \
+         attest_level=unsigned. Fix: run `{}` (then restart)",
+        key_dir.display(),
+        signing_key_provisioning_command(agent_id)
+    )
+}
+
+/// #3354 — the WRITE-PATH fix: make sure the resolved agent id has a
+/// signing key BEFORE the process writes its first ledger row. Loads the
+/// key when it exists; when it does not, GENERATES it (the same helper the
+/// `daemon` label has always used at boot — automatic generation is not
+/// automatic trust, #3709: the new key signs this node's own ledger and
+/// binds nothing anywhere else) and loads it. Returns the key (`None` only
+/// when generation was disabled or the key could not be loaded afterwards)
+/// and the generation outcome (`None` when the key already existed).
+///
+/// Before #3354 a fresh store whose resolved id had no key wrote every
+/// `signed_events` row `unsigned` behind a debug-level log: a ledger that
+/// claimed a guarantee it did not provide.
+///
+/// # Errors
+/// The key directory cannot be resolved, or generation / persistence fails.
+pub fn ensure_daemon_signing_key(
+    agent_id: &str,
+) -> Result<(
+    Option<SigningKey>,
+    Option<crate::identity::keypair::EnsureOutcome>,
+)> {
+    if let Some(key) = load_daemon_signing_key(agent_id)? {
+        return Ok((Some(key), None));
+    }
+    let dir = crate::identity::keypair::default_key_dir()?;
+    let outcome = crate::identity::keypair::ensure_keypair(agent_id, &dir, false)?;
+    let key = load_daemon_signing_key(agent_id)?;
+    Ok((key, Some(outcome)))
+}
+
+/// #3354 — the refusal for a ledger-writing process whose resolved agent
+/// id has no signing key and could not be given one: the process must not
+/// append an unsigned row, so it does not start. Names the id, the cause
+/// and the remedy.
+///
+/// #3743 — the remedy is what is ACTIONABLE. This refusal fires only when
+/// the boot ensure could not write the key directory (the resolved id's key
+/// is generated automatically otherwise), so "run `identity generate`"
+/// would fail the same way; the fix is to make the key directory writable
+/// (or point `AI_MEMORY_KEY_DIR` at one that is) and retry — the next start
+/// generates the key — with `identity generate` named only as the explicit
+/// alternative once the directory is writable. A refusal whose remedy is a
+/// fiction is worse than one with no remedy (the #3709 item-five class).
+#[must_use]
+pub fn unsigned_ledger_refusal(agent_id: &str, cause: &str) -> String {
+    format!(
+        "{UNSIGNED_LEDGER_ISSUE}: refusing to start a ledger-writing command as `{agent_id}`: \
+         no signing key for that id is loadable and one could not be generated ({cause}). \
+         An unsigned signed_events row is a guarantee the ledger did not provide, so none is \
+         written. Fix: make the key directory writable by this user (or set \
+         AI_MEMORY_KEY_DIR to a directory that is), then retry — the key is generated on the \
+         next start; or, once the directory is writable, provision it explicitly with `{}`. \
+         Read-only verbs (`doctor`, `stats`, `recall`, the `verify-*` family) stay reachable.",
+        signing_key_provisioning_command(agent_id)
+    )
+}
+
+/// #3354 — the one-line notice when a key was generated for the resolved
+/// id at boot (loud on the daemons, tracing-only on one-shot verbs).
+#[must_use]
+pub fn signing_key_generated_notice(agent_id: &str, pub_path: &Path) -> String {
+    format!(
+        "{UNSIGNED_LEDGER_ISSUE}: generated an audit signing key for `{agent_id}` at {} — the \
+         ledger this process writes is signed from its first row. Automatic generation is not \
+         automatic trust: enrol the public key wherever this identity must verify.",
+        pub_path.display()
+    )
+}
+
+/// #3354 — content-free signing status of THIS process's ledger writer:
+/// whether a daemon audit key is installed, the agent id the process signs
+/// as, and the warning text when it does not. Carries no key material and
+/// no path other than the key directory named in the warning.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LedgerSigningStatus {
+    /// `true` when [`audit_key_is_installed`]: new `signed_events` rows are
+    /// `daemon_signed`. `false`: they are `unsigned`.
+    pub daemon_signed_events: bool,
+    /// The agent id this process resolved for signing (the same resolution
+    /// the boot path uses to look up `<agent_id>.priv`).
+    pub agent_id: String,
+    /// The operator-facing warning when unsigned; `None` when signed.
+    pub warning: Option<String>,
+}
+
+/// #3354 — read-only: resolve the ledger signing status of this process.
+#[must_use]
+pub fn ledger_signing_status() -> LedgerSigningStatus {
+    let agent_id =
+        crate::identity::resolve_agent_id(None, None).unwrap_or_else(|_| "ai-memory".to_string());
+    let daemon_signed_events = audit_key_is_installed();
+    let warning = if daemon_signed_events {
+        None
+    } else {
+        let key_dir = crate::identity::keypair::resolved_default_key_dir_path()
+            .unwrap_or_else(|_| PathBuf::from("<unresolved key directory>"));
+        Some(unsigned_ledger_warning(&agent_id, &key_dir))
+    };
+    LedgerSigningStatus {
+        daemon_signed_events,
+        agent_id,
+        warning,
+    }
+}
+
 struct ForensicSink {
     dir: PathBuf,
     last_hash: String,
     signing_key: Option<SigningKey>,
+    /// #3647 — commitment key derived once from `signing_key`; `None` when
+    /// the sink is unsigned (commitments are then withheld).
+    commitment_key: Option<zeroize::Zeroizing<[u8; 32]>>,
 }
 
-/// Initialise the forensic audit sink.
+// ---------------------------------------------------------------------------
+// #3647 — allowlisted forensic payloads
+// ---------------------------------------------------------------------------
+
+/// Longest identifier kept verbatim in a forensic row; longer values become a
+/// commitment.
+const FORENSIC_IDENT_MAX_LEN: usize = 256;
+
+/// Punctuation an identifier may carry verbatim, beyond ASCII alphanumerics:
+/// agent ids (`ai:x@host`), namespaces (`a/b/*`), rule ids (`#3464`), env names,
+/// uuids and standard base64 public keys (`+/=`). No whitespace, quotes, braces
+/// or control characters, so JSON, prose, commands and queries cannot pass.
+const FORENSIC_IDENT_PUNCT: &[u8] = b"_-:@./*#+=~";
+
+/// Prefix of a rendered keyed commitment: `hmac-sha256:<64 hex>`.
+pub const FORENSIC_COMMITMENT_PREFIX: &str = "hmac-sha256:";
+
+/// Rendered in place of a commitment when the sink has no signing key, so
+/// there is no secret to key it with. An unkeyed hash of low-entropy content
+/// (a short command, a title) could be confirmed by guessing, so none is
+/// written.
+pub const FORENSIC_COMMITMENT_WITHHELD: &str = "withheld:unsigned";
+
+/// HKDF domain-separation label for the commitment key, derived from the
+/// sink's Ed25519 signing key so the signing key itself is never reused as a
+/// MAC key.
+const FORENSIC_COMMITMENT_HKDF_INFO: &[u8] = b"ai-memory:forensic-commitment:v1";
+
+/// Payload key of the whole-content commitment written for agent actions.
+pub const FORENSIC_CONTENT_KEY: &str = "content_mac";
+
+/// Payload key / value marking a row whose content is commitment-only.
+const FORENSIC_SENSITIVE_FIELDS_KEY: &str = "sensitive_fields";
+const FORENSIC_SENSITIVE_FIELDS_HASH_ONLY: &str = "hash_only";
+
+/// One payload value. `Commitment` holds the preimage in memory only; the sink
+/// renders it (keyed, or withheld) and the preimage is never written.
+#[derive(Debug, Clone)]
+enum ForensicField {
+    Value(serde_json::Value),
+    Commitment(Vec<u8>),
+    Array(Vec<ForensicField>),
+}
+
+/// The payload of a governance decision row (#3647).
 ///
-/// # Errors
-/// - The directory cannot be created.
-pub fn init(dir: &Path, signing_key: Option<SigningKey>) -> Result<()> {
-    std::fs::create_dir_all(dir)
-        .with_context(|| format!("creating forensic audit dir {}", dir.display()))?;
-    let last_hash = read_chain_tail(dir).unwrap_or_else(|| CHAIN_HEAD_PREV_HASH.to_string());
+/// Fields are private and every constructor accepts only counts, flags,
+/// compile-time labels, sanitised identifiers, operator filesystem paths
+/// (credential spans masked) or commitments. There is no way to put free-form
+/// text, request content or arbitrary JSON into a forensic row: free text goes
+/// through [`ForensicPayload::commit`] and is written as a keyed commitment.
+///
+/// ```compile_fail
+/// // A raw JSON value is no longer a forensic payload.
+/// ai_memory::governance::audit::record_decision(
+///     "agent", "allow", "kind", "", serde_json::json!({"secret": "x"}),
+/// );
+/// ```
+#[derive(Debug, Clone, Default)]
+#[must_use]
+pub struct ForensicPayload {
+    fields: Vec<(&'static str, ForensicField)>,
+}
+
+impl ForensicPayload {
+    /// An empty payload.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// A payload committing to `content` as a whole (an agent action and its
+    /// decision, say): `{content_mac, sensitive_fields: "hash_only"}`.
+    ///
+    /// # Errors
+    /// Returns an error when `content` cannot be serialised. There is no
+    /// plaintext fallback: the caller emits no row.
+    pub fn content(content: &impl Serialize) -> Result<Self> {
+        // Normalise key order through `Value` before committing, matching the
+        // `signed_events` governance.check canonical shape.
+        let value = serde_json::to_value(content).context("building forensic commitment")?;
+        let bytes = serde_json::to_vec(&value).context("serialising forensic commitment")?;
+        Ok(Self::new()
+            .push(FORENSIC_CONTENT_KEY, ForensicField::Commitment(bytes))
+            .label(
+                FORENSIC_SENSITIVE_FIELDS_KEY,
+                FORENSIC_SENSITIVE_FIELDS_HASH_ONLY,
+            ))
+    }
+
+    fn push(mut self, key: &'static str, field: ForensicField) -> Self {
+        self.fields.push((key, field));
+        self
+    }
+
+    /// A number (count, sequence, threshold).
+    pub fn number(self, key: &'static str, n: impl Into<serde_json::Number>) -> Self {
+        self.push(
+            key,
+            ForensicField::Value(serde_json::Value::Number(n.into())),
+        )
+    }
+
+    /// An optional number; `None` renders `null`.
+    pub fn opt_number(self, key: &'static str, n: Option<impl Into<serde_json::Number>>) -> Self {
+        let value = n.map_or(serde_json::Value::Null, |n| {
+            serde_json::Value::Number(n.into())
+        });
+        self.push(key, ForensicField::Value(value))
+    }
+
+    /// A boolean.
+    pub fn flag(self, key: &'static str, b: bool) -> Self {
+        self.push(key, ForensicField::Value(serde_json::Value::Bool(b)))
+    }
+
+    /// A compile-time label from a closed vocabulary (an outcome token, a
+    /// mode). Being `'static`, it cannot carry request data.
+    pub fn label(self, key: &'static str, label: &'static str) -> Self {
+        self.push(key, ForensicField::Value(label.into()))
+    }
+
+    /// An optional label; `None` renders `null`.
+    pub fn opt_label(self, key: &'static str, label: Option<&'static str>) -> Self {
+        self.push(
+            key,
+            ForensicField::Value(label.map_or(serde_json::Value::Null, Into::into)),
+        )
+    }
+
+    /// An identifier (id, namespace, agent id, public key, fingerprint). Kept
+    /// verbatim when it is identifier-shaped and carries no credential,
+    /// otherwise written as a commitment.
+    pub fn ident(self, key: &'static str, id: &str) -> Self {
+        self.push(key, ident_field(id))
+    }
+
+    /// An optional identifier; `None` renders `null`.
+    pub fn opt_ident(self, key: &'static str, id: Option<&str>) -> Self {
+        let field = id.map_or(ForensicField::Value(serde_json::Value::Null), ident_field);
+        self.push(key, field)
+    }
+
+    /// A list of identifiers, each sanitised as [`Self::ident`].
+    pub fn idents<I, S>(self, key: &'static str, ids: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let items = ids.into_iter().map(|s| ident_field(s.as_ref())).collect();
+        self.push(key, ForensicField::Array(items))
+    }
+
+    /// An optional list of identifiers; `None` renders `null`, `Some(list)`
+    /// renders as [`Self::idents`] would (an empty list renders `[]`).
+    ///
+    /// #3372 — the optional twin of [`Self::idents`], so a row that records a
+    /// prior value only when something changed can render the key EVERY
+    /// time: `null` for "nothing was replaced" and `[]` for "the prior list
+    /// was empty" are distinct, and neither is confusable with a row written
+    /// before the key existed (which has no key at all). Its scalar sibling is
+    /// [`Self::opt_ident`]; a payload that carries one optional prior field
+    /// as `null` and omits the other cannot be read by a compliance reader.
+    pub fn opt_idents<I, S>(self, key: &'static str, ids: Option<I>) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        match ids {
+            Some(ids) => self.idents(key, ids),
+            None => self.push(key, ForensicField::Value(serde_json::Value::Null)),
+        }
+    }
+
+    /// An operator filesystem path, rendered lossily with every detected
+    /// credential span masked.
+    pub fn path(self, key: &'static str, path: &Path) -> Self {
+        let text = path.to_string_lossy();
+        let rendered = match crate::secret_screen::screen(&text) {
+            crate::secret_screen::ScreenOutcome::Clean => text.into_owned(),
+            crate::secret_screen::ScreenOutcome::Hit { redacted, .. } => redacted,
+        };
+        self.push(key, ForensicField::Value(rendered.into()))
+    }
+
+    /// Free-form text (a reason, an error message, a title), written only as
+    /// a keyed commitment.
+    pub fn commit(self, key: &'static str, text: &str) -> Self {
+        self.push(key, ForensicField::Commitment(text.as_bytes().to_vec()))
+    }
+
+    /// Optional free-form text as a commitment; `None` renders `null`.
+    pub fn opt_commit(self, key: &'static str, text: Option<&str>) -> Self {
+        let field = text.map_or(ForensicField::Value(serde_json::Value::Null), |t| {
+            ForensicField::Commitment(t.as_bytes().to_vec())
+        });
+        self.push(key, field)
+    }
+
+    /// Render for the signed row. `mac_key` is `None` when the sink is
+    /// unsigned.
+    fn render(&self, mac_key: Option<&[u8; 32]>) -> serde_json::Value {
+        let mut map = serde_json::Map::with_capacity(self.fields.len());
+        for (key, field) in &self.fields {
+            map.insert((*key).to_string(), render_field(field, mac_key));
+        }
+        serde_json::Value::Object(map)
+    }
+}
+
+fn render_field(field: &ForensicField, mac_key: Option<&[u8; 32]>) -> serde_json::Value {
+    match field {
+        ForensicField::Value(v) => v.clone(),
+        ForensicField::Commitment(preimage) => render_commitment(preimage, mac_key).into(),
+        ForensicField::Array(items) => items
+            .iter()
+            .map(|item| render_field(item, mac_key))
+            .collect(),
+    }
+}
+
+/// `true` when `s` may be written verbatim as an identifier: empty, or at most
+/// [`FORENSIC_IDENT_MAX_LEN`] bytes of ASCII alphanumerics and
+/// [`FORENSIC_IDENT_PUNCT`], with no detected credential.
+fn is_forensic_ident(s: &str) -> bool {
+    s.len() <= FORENSIC_IDENT_MAX_LEN
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || FORENSIC_IDENT_PUNCT.contains(&b))
+        && matches!(
+            crate::secret_screen::screen(s),
+            crate::secret_screen::ScreenOutcome::Clean
+        )
+}
+
+fn ident_field(s: &str) -> ForensicField {
+    if is_forensic_ident(s) {
+        ForensicField::Value(s.into())
+    } else {
+        ForensicField::Commitment(s.as_bytes().to_vec())
+    }
+}
+
+/// Render a commitment: `hmac-sha256:<hex>` under `mac_key`, or
+/// [`FORENSIC_COMMITMENT_WITHHELD`] when there is no key.
+fn render_commitment(preimage: &[u8], mac_key: Option<&[u8; 32]>) -> String {
+    use hmac::{Hmac, Mac};
+    let Some(key) = mac_key else {
+        return FORENSIC_COMMITMENT_WITHHELD.to_string();
+    };
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key)
+        .expect("HMAC-SHA256 accepts a key of any length");
+    mac.update(preimage);
+    format!(
+        "{FORENSIC_COMMITMENT_PREFIX}{}",
+        hex_encode(&mac.finalize().into_bytes())
+    )
+}
+
+/// Derive the forensic commitment key from the sink's signing key.
+fn forensic_commitment_key(signing_key: &SigningKey) -> zeroize::Zeroizing<[u8; 32]> {
+    let hk = hkdf::Hkdf::<Sha256>::new(None, &signing_key.to_bytes());
+    let mut okm = zeroize::Zeroizing::new([0u8; 32]);
+    // `expand` errors only above 255 * HashLen bytes; 32 is far below it.
+    hk.expand(FORENSIC_COMMITMENT_HKDF_INFO, okm.as_mut())
+        .expect("HKDF expand of 32 bytes is within the 255*HashLen limit");
+    okm
+}
+
+/// Recompute the commitment a sink signed with `signing_key` wrote for
+/// `preimage` — the verification primitive for an operator who holds the
+/// key and wants to confirm what a row committed to.
+#[must_use]
+pub fn forensic_commitment(signing_key: &SigningKey, preimage: &[u8]) -> String {
+    let key = forensic_commitment_key(signing_key);
+    render_commitment(preimage, Some(&key))
+}
+
+/// Sanitise a row-level string field (`actor`, `decision`, `rule_id`) at the
+/// sink: identifier-shaped values pass, anything else becomes a commitment.
+fn sanitize_row_field(s: &str, mac_key: Option<&[u8; 32]>) -> String {
+    if is_forensic_ident(s) {
+        s.to_string()
+    } else {
+        render_commitment(s.as_bytes(), mac_key)
+    }
+}
+
+/// Content-free integrity evidence (#3647). These rows are written whenever
+/// the sink is up, regardless of the decision-row gate, because
+/// `verify-audit-trail` and restore forensics depend on them. The set is
+/// closed: a new integrity row needs a new variant here, reviewed as such.
+pub(crate) enum IntegrityRow<'a> {
+    /// #1850 truncation anchor (see [`record_audit_watermark`]).
+    AuditWatermark {
+        head_sequence: i64,
+        head_canonical_hash: &'a str,
+        db_id: Option<&'a str>,
+    },
+    /// #1946 open-time rollback evidence (see
+    /// [`apply_rollback_disposition_at_open`]).
+    RollbackEvidence {
+        anchored_head: i64,
+        db_head: i64,
+        gap: i64,
+    },
+    /// #3199 a restore that no verified manifest vouched for.
+    RestoreUnverified {
+        actor: &'a str,
+        kind: &'static str,
+        outcome: &'static str,
+        detail: &'static str,
+        snapshot: &'a Path,
+        target: &'a Path,
+    },
+}
+
+impl IntegrityRow<'_> {
+    /// `(actor, decision, kind, payload)` for the signed row; integrity rows
+    /// carry an empty `rule_id`.
+    fn into_parts(self) -> (String, &'static str, &'static str, ForensicPayload) {
+        match self {
+            Self::AuditWatermark {
+                head_sequence,
+                head_canonical_hash,
+                db_id,
+            } => {
+                let mut payload = ForensicPayload::new()
+                    .number("v", AUDIT_WATERMARK_PAYLOAD_VERSION)
+                    .number("head_sequence", head_sequence)
+                    // System-computed hex; written verbatim for the readers.
+                    .push(
+                        "head_canonical_hash",
+                        ForensicField::Value(head_canonical_hash.into()),
+                    );
+                // v1.0.0 #2955 — PRESENT-ONLY db_id binding (see
+                // `record_audit_watermark`).
+                if let Some(id) = db_id {
+                    payload = payload.push("db_id", ForensicField::Value(id.into()));
+                }
+                (
+                    AUDIT_WATERMARK_ACTOR.to_string(),
+                    AUDIT_WATERMARK_DECISION,
+                    AUDIT_WATERMARK_KIND,
+                    payload,
+                )
+            }
+            Self::RollbackEvidence {
+                anchored_head,
+                db_head,
+                gap,
+            } => (
+                AUDIT_ROLLBACK_EVIDENCE_ACTOR.to_string(),
+                AUDIT_ROLLBACK_EVIDENCE_DECISION,
+                AUDIT_ROLLBACK_EVIDENCE_KIND,
+                ForensicPayload::new()
+                    .number("anchored_head", anchored_head)
+                    .number("db_head", db_head)
+                    .number("gap", gap),
+            ),
+            Self::RestoreUnverified {
+                actor,
+                kind,
+                outcome,
+                detail,
+                snapshot,
+                target,
+            } => (
+                actor.to_string(),
+                "allow",
+                kind,
+                ForensicPayload::new()
+                    .label("outcome", outcome)
+                    .label("detail", detail)
+                    .path("snapshot", snapshot)
+                    .path("target", target),
+            ),
+        }
+    }
+}
+
+/// Install database audit signers independently of forensic file enablement.
+///
+/// The first installed daemon/recorder key wins for the process lifetime.
+/// Missing recorder keys retain the existing unsigned/daemon fallback posture.
+pub fn init_audit_signers(signing_key: Option<&SigningKey>) {
     // v0.7.0 #1035 — install the same key into the process-wide
     // SQL-side audit-row signer if one was provided. Cloning the
     // ed25519 SigningKey is cheap (32-byte SecretKey copy); both
@@ -371,7 +899,7 @@ pub fn init(dir: &Path, signing_key: Option<SigningKey>) -> Result<()> {
     // repeatedly — the SqliteSignedEventsSink path keeps using the
     // first-installed key, which is the documented v0.7 posture
     // (one daemon == one signing identity per process lifetime).
-    if let Some(key) = signing_key.as_ref() {
+    if let Some(key) = signing_key {
         let _ = DAEMON_AUDIT_KEY.set(key.clone());
     }
     // v0.9.0 G9 (#1826) — co-install the process-static RECORDER signer
@@ -384,10 +912,24 @@ pub fn init(dir: &Path, signing_key: Option<SigningKey>) -> Result<()> {
             let _ = RECORDER_KEY.set(sk);
         }
     }
+}
+
+/// Initialise the forensic audit sink (#3647). Integrity rows and governance
+/// decision rows are both written once the sink is up.
+///
+/// # Errors
+/// - The directory cannot be created.
+pub fn init(dir: &Path, signing_key: Option<SigningKey>) -> Result<()> {
+    std::fs::create_dir_all(dir)
+        .with_context(|| format!("creating forensic audit dir {}", dir.display()))?;
+    let last_hash = read_chain_tail(dir).unwrap_or_else(|| CHAIN_HEAD_PREV_HASH.to_string());
+    init_audit_signers(signing_key.as_ref());
+    let commitment_key = signing_key.as_ref().map(forensic_commitment_key);
     let new_sink = ForensicSink {
         dir: dir.to_path_buf(),
         last_hash,
         signing_key,
+        commitment_key,
     };
     let mut guard = sink()
         .lock()
@@ -419,7 +961,8 @@ pub fn shutdown() {
     }
 }
 
-/// `true` when [`init`] has been called and the sink is active.
+/// `true` when [`init`] has been called and the sink is active. Integrity and
+/// governance decision rows are both written whenever this is true.
 #[must_use]
 pub fn is_enabled() -> bool {
     sink().lock().map(|g| g.is_some()).unwrap_or(false)
@@ -427,16 +970,50 @@ pub fn is_enabled() -> bool {
 
 /// Record a governance decision to the forensic log.
 ///
+/// A no-op unless the sink is up. `actor`, `decision` and `rule_id` are
+/// sanitised here: a value that is not
+/// identifier-shaped, or that carries a credential, is written as a keyed
+/// commitment. `kind` is a compile-time label.
+///
 /// # Errors
-/// - The current-day file cannot be opened for append.
 /// - Serialisation fails.
 /// - The mutex protecting the sink is poisoned.
+/// - The background writer has stopped.
 pub fn try_record_decision(
     actor: &str,
     decision: &str,
-    kind: &str,
+    kind: &'static str,
     rule_id: &str,
-    payload: serde_json::Value,
+    payload: ForensicPayload,
+) -> Result<()> {
+    append_row(actor, decision, kind, rule_id, &payload)
+}
+
+/// Record an [`IntegrityRow`]. Written whenever the sink is up.
+///
+/// # Errors
+/// As [`try_record_decision`].
+pub(crate) fn try_record_integrity(row: IntegrityRow<'_>) -> Result<()> {
+    let (actor, decision, kind, payload) = row.into_parts();
+    append_row(&actor, decision, kind, "", &payload)
+}
+
+/// Fire-and-forget [`try_record_integrity`]. Errors logged + swallowed.
+pub(crate) fn record_integrity(row: IntegrityRow<'_>) {
+    if let Err(e) = try_record_integrity(row) {
+        tracing::error!(
+            target: AUDIT_TRACE_TARGET,
+            "forensic: integrity emission failed: {e}"
+        );
+    }
+}
+
+fn append_row(
+    actor: &str,
+    decision: &str,
+    kind: &'static str,
+    rule_id: &str,
+    payload: &ForensicPayload,
 ) -> Result<()> {
     let mut guard = sink()
         .lock()
@@ -448,14 +1025,15 @@ pub fn try_record_decision(
     let now = Utc::now();
     let ts = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let prev_hash = s.last_hash.clone();
+    let mac_key = s.commitment_key.as_deref();
 
     let mut row = ForensicDecision {
         ts,
-        actor: actor.to_string(),
-        decision: decision.to_string(),
+        actor: sanitize_row_field(actor, mac_key),
+        decision: sanitize_row_field(decision, mac_key),
         kind: kind.to_string(),
-        rule_id: rule_id.to_string(),
-        payload,
+        rule_id: sanitize_row_field(rule_id, mac_key),
+        payload: payload.render(mac_key),
         prev_hash,
         sig: String::new(),
     };
@@ -486,13 +1064,13 @@ pub fn try_record_decision(
     Ok(())
 }
 
-/// Fire-and-forget wrapper. Errors logged + swallowed.
+/// Fire-and-forget [`try_record_decision`]. Errors logged + swallowed.
 pub fn record_decision(
     actor: &str,
     decision: &str,
-    kind: &str,
+    kind: &'static str,
     rule_id: &str,
-    payload: serde_json::Value,
+    payload: ForensicPayload,
 ) {
     if let Err(e) = try_record_decision(actor, decision, kind, rule_id, payload) {
         tracing::error!(
@@ -916,11 +1494,9 @@ pub fn load_daemon_signing_key(agent_id: &str) -> Result<Option<SigningKey>> {
         Ok(k) => k,
         Err(e) => {
             if signing_key_load_is_absent(&e) {
-                tracing::debug!(
-                    agent_id,
-                    "no daemon signing key enrolled; operating unsigned \
-                     (expected when no key is provisioned)"
-                );
+                // #3354 — LOUD, never debug: a process that will write
+                // unsigned ledger rows says so once, with the fix.
+                tracing::warn!(agent_id, "{}", unsigned_ledger_warning(agent_id, &dir));
             } else {
                 tracing::warn!(
                     agent_id,
@@ -1030,33 +1606,25 @@ static LAST_WATERMARKED_SEQ: AtomicI64 = AtomicI64::new(0);
 /// ordinal. The pair is carried in the forensic `payload` Value — NEVER a
 /// new [`ForensicDecision`] field (see the module-level T4 note).
 ///
-/// Fire-and-forget through [`record_decision`]: a no-op when the forensic
+/// Fire-and-forget [`IntegrityRow::AuditWatermark`] (#3647): written whenever
+/// the sink is up, independent of the decision-row gate; a no-op when the
 /// sink is not initialised, errors logged + swallowed otherwise.
+///
+/// v1.0.0 #2955 — `db_id` binds this database's genesis-derived identity so
+/// the SHARED on-host forensic watermark file filters PER DATABASE, mirroring
+/// the #2370 witness (`witness_resolution_json`) + head-anchor
+/// (`scan_head_anchor_log`) db_id-scoping siblings. PRESENT-ONLY (never a new
+/// `ForensicDecision` field — the T4 note): a db_id-less row stays
+/// byte-identical to a legacy watermark and older readers ignore the extra
+/// key, so the `v` gate is unchanged (no version bump). A watermark carrying
+/// a DIFFERENT db_id anchors a sibling DB sharing this sink and must never be
+/// read as THIS db's high-water (the cross-DB watermark bleed #2955 closes).
 pub fn record_audit_watermark(head_sequence: i64, head_canonical_hash: &str, db_id: Option<&str>) {
-    let mut payload = serde_json::json!({
-        "v": AUDIT_WATERMARK_PAYLOAD_VERSION,
-        "head_sequence": head_sequence,
-        "head_canonical_hash": head_canonical_hash,
+    record_integrity(IntegrityRow::AuditWatermark {
+        head_sequence,
+        head_canonical_hash,
+        db_id,
     });
-    // v1.0.0 #2955 — bind this database's genesis-derived identity so the SHARED
-    // on-host forensic watermark file filters PER DATABASE, mirroring the #2370
-    // witness (`witness_resolution_json`) + head-anchor (`scan_head_anchor_log`)
-    // db_id-scoping siblings. PRESENT-ONLY (never a new `ForensicDecision`
-    // field — the T4 note): a db_id-less row stays byte-identical to a legacy
-    // watermark and older readers ignore the extra key, so the `v` gate is
-    // unchanged (no version bump). A watermark carrying a DIFFERENT db_id
-    // anchors a sibling DB sharing this sink and must never be read as THIS
-    // db's high-water (the cross-DB watermark bleed #2955 closes).
-    if let Some(id) = db_id {
-        payload["db_id"] = serde_json::Value::String(id.to_string());
-    }
-    record_decision(
-        AUDIT_WATERMARK_ACTOR,
-        AUDIT_WATERMARK_DECISION,
-        AUDIT_WATERMARK_KIND,
-        "",
-        payload,
-    );
 }
 
 /// #1850 — cheap, non-claiming peek at the [`WATERMARK_INTERVAL`] throttle so a
@@ -1703,6 +2271,20 @@ pub fn load_enrolled_witness_pubkey() -> Result<Option<VerifyingKey>> {
 /// repeat). Resolve via [`resolve_audit_pubkey`].
 pub const AUDIT_PUBKEY_ENV: &str = "AI_MEMORY_AUDIT_PUBKEY";
 
+/// #3354 / #3479 — the ONE spelling of the require-mode limitation, rendered
+/// by `verify-audit-trail` beside a signature-coverage FAIL and cited by the
+/// `--audit-pubkey` / [`AUDIT_PUBKEY_ENV`] documentation. A customer who ran
+/// unsigned and later provisioned a key cannot bring the historical prefix
+/// under the pin: provisioning the key does not clear the past, and in
+/// v1.0.0 there is no supported in-product remedy (the epoch-seal /
+/// re-anchor of an unsigned prefix is #3479, v1.0.1). Require-mode is for
+/// chains signed from the beginning — which, since #3354, every fresh store
+/// is.
+pub const UNSIGNED_PREFIX_LIMITATION: &str = "rows written before this node's signing key \
+     existed are unsigned and stay unsigned: provisioning the key does not clear the past, \
+     and v1.0.0 has no in-product remedy (epoch-seal / re-anchor is #3479, v1.0.1). The \
+     AI_MEMORY_AUDIT_PUBKEY pin is for chains signed from their first row.";
+
 /// v1.0.0 L4 (PR-3) — resolve the out-of-band audit pin from the `--audit-pubkey`
 /// CLI flag (highest precedence — the universal CLI-flag-wins ladder; the value
 /// is a PUBLIC key, so world-readable argv is not a confidentiality concern) then
@@ -1786,7 +2368,7 @@ pub const REQUIRE_ROLE_SEPARATION_ENV: &str = "AI_MEMORY_REQUIRE_ROLE_SEPARATION
 /// separator keeps the concatenation unambiguous.
 pub const DOMAIN_RECORDER: &[u8] = b"ai-memory:gov-recorder:v1\x1f";
 
-/// Process-static RECORDER signing key, installed once by [`init`] (co-located
+/// Process-static RECORDER signing key, installed by [`init_audit_signers`] (co-located
 /// with [`DAEMON_AUDIT_KEY`]) so the per-row recorder signature stays off the
 /// key-file I/O path. Empty until a recorder key is enrolled (opt-in).
 static RECORDER_KEY: OnceLock<SigningKey> = OnceLock::new();
@@ -3239,18 +3821,13 @@ pub fn apply_rollback_disposition_at_open(
                  `ai-memory audit restore-attest --sign` to attest it; otherwise the DB file was \
                  rolled back (investigate + ship the forensic log off-host)."
             );
-            // Best-effort forensic evidence row (no-op when the sink is down).
-            record_decision(
-                AUDIT_ROLLBACK_EVIDENCE_ACTOR,
-                AUDIT_ROLLBACK_EVIDENCE_DECISION,
-                AUDIT_ROLLBACK_EVIDENCE_KIND,
-                "",
-                serde_json::json!({
-                    "anchored_head": anchored_head,
-                    "db_head": db_head,
-                    "gap": gap,
-                }),
-            );
+            // Best-effort forensic evidence row (no-op when the sink is down);
+            // an integrity row, so the decision-row gate never silences it.
+            record_integrity(IntegrityRow::RollbackEvidence {
+                anchored_head: *anchored_head,
+                db_head: *db_head,
+                gap,
+            });
         }
         RollbackCheck::Sanctioned {
             anchored_head,
@@ -3391,6 +3968,210 @@ mod tests {
         init(dir, key).expect("forensic init");
     }
 
+    /// Every forensic row in `dir`, in chain order.
+    fn rows_3647(dir: &Path) -> Vec<ForensicDecision> {
+        let mut rows = Vec::new();
+        for file in list_forensic_files(dir).expect("list") {
+            let body = std::fs::read_to_string(file).expect("read");
+            for line in body.lines().filter(|l| !l.trim().is_empty()) {
+                rows.push(serde_json::from_str(line).expect("row"));
+            }
+        }
+        rows
+    }
+
+    /// Conductor ruling on #3647: decision rows are written whenever the sink
+    /// is up, exactly like integrity rows, and stay screened.
+    #[test]
+    fn issue_3647_decision_rows_follow_the_sink_like_integrity_rows() {
+        let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        shutdown();
+        init(tmp.path(), Some(fresh_key())).expect("init");
+        assert!(is_enabled());
+        record_decision(
+            "ai:t",
+            "refuse",
+            "bash",
+            "R3647",
+            ForensicPayload::new().commit("reason", "ISSUE_3647_SCREENED"),
+        );
+        record_audit_watermark(128, &"cd".repeat(32), None);
+        let snapshot = std::path::Path::new("/srv/backups/snap.db");
+        record_integrity(IntegrityRow::RestoreUnverified {
+            actor: "ai:operator",
+            kind: "backup_restore_unverified",
+            outcome: "skipped",
+            detail: "--skip-verify: no manifest was read",
+            snapshot,
+            target: snapshot,
+        });
+        record_integrity(IntegrityRow::RollbackEvidence {
+            anchored_head: 200,
+            db_head: 150,
+            gap: 50,
+        });
+        shutdown();
+        let body: String = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| std::fs::read_to_string(e.path()).unwrap_or_default())
+            .collect();
+        assert!(
+            !body.contains("ISSUE_3647_SCREENED"),
+            "decision content is screened"
+        );
+        let rows = rows_3647(tmp.path());
+        let kinds: Vec<&str> = rows.iter().map(|r| r.kind.as_str()).collect();
+        assert_eq!(
+            kinds,
+            [
+                "bash",
+                AUDIT_WATERMARK_KIND,
+                "backup_restore_unverified",
+                AUDIT_ROLLBACK_EVIDENCE_KIND
+            ]
+        );
+        assert_eq!(rows[0].decision, "refuse");
+        assert!(
+            rows[0].payload["reason"]
+                .as_str()
+                .is_some_and(|r| r.starts_with(FORENSIC_COMMITMENT_PREFIX)),
+            "keyed commitment, never text: {:?}",
+            rows[0].payload
+        );
+        assert_eq!(rows[1].payload["head_sequence"], 128);
+        assert_eq!(rows[2].payload["snapshot"], "/srv/backups/snap.db");
+        assert_eq!(rows[3].payload["gap"], 50);
+    }
+
+    #[test]
+    fn issue_3647_sink_sanitises_row_fields_and_commits_free_text() {
+        let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let key = fresh_key();
+        fresh_init(tmp.path(), Some(key.clone()));
+        // A credential-shaped token: identifier characters, high entropy.
+        let token = "ghp_Q8zR2mV7kX4pL9wN3cT6yB1fH5jD0sA2eG7u";
+        record_decision(
+            "agent with spaces",
+            "refuse",
+            "bash",
+            token,
+            ForensicPayload::new()
+                .ident("kept", "ai:alice@host/ns-1")
+                .ident("spaced", "rm -rf /srv/x")
+                .ident("credential", token)
+                .commit("reason", "ISSUE_3647 free text")
+                .idents("list", ["ok-1", "not ok"]),
+        );
+        shutdown();
+        let rows = rows_3647(tmp.path());
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        let commitment = |s: &str| forensic_commitment(&key, s.as_bytes());
+        assert_eq!(row.actor, commitment("agent with spaces"));
+        assert_eq!(row.rule_id, commitment(token));
+        assert_eq!(row.decision, "refuse");
+        assert_eq!(row.payload["kept"], "ai:alice@host/ns-1");
+        assert_eq!(row.payload["spaced"], commitment("rm -rf /srv/x"));
+        assert_eq!(row.payload["credential"], commitment(token));
+        assert_eq!(row.payload["reason"], commitment("ISSUE_3647 free text"));
+        assert_eq!(
+            row.payload["list"],
+            serde_json::json!(["ok-1", commitment("not ok")])
+        );
+        let text = serde_json::to_string(row).unwrap();
+        assert!(!text.contains(token) && !text.contains("free text") && !text.contains("rm -rf"));
+    }
+
+    /// #3372 — `opt_idents` is the optional twin of `idents`: `None` renders
+    /// `null` (the key is PRESENT), `Some([])` renders `[]`, and `Some(list)`
+    /// sanitises each item exactly as `idents` does (identifier-shaped values
+    /// verbatim, everything else a keyed commitment). The three renderings
+    /// are pairwise distinct, which is what lets a reader tell "nothing was
+    /// replaced" from "the prior list was empty" from "field did not exist".
+    #[test]
+    fn issue_3372_opt_idents_renders_null_empty_and_sanitised_list() {
+        let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let key = fresh_key();
+        fresh_init(tmp.path(), Some(key.clone()));
+        let none: Option<Vec<&str>> = None;
+        record_decision(
+            "ai:t",
+            "allow",
+            "bash",
+            "",
+            ForensicPayload::new()
+                .opt_idents("absent", none)
+                .opt_idents("empty", Some(Vec::<&str>::new()))
+                .opt_idents("present", Some(["ai:worker", "not ok"]))
+                .opt_ident("scalar_absent", None)
+                .opt_ident("scalar_present", Some("ai:admin")),
+        );
+        shutdown();
+        let rows = rows_3647(tmp.path());
+        assert_eq!(rows.len(), 1);
+        let payload = &rows[0].payload;
+        assert!(
+            payload.get("absent").is_some(),
+            "a None list must render the KEY, not omit it: {payload}"
+        );
+        assert_eq!(payload["absent"], serde_json::Value::Null);
+        assert_eq!(payload["empty"], serde_json::json!([]));
+        assert_eq!(
+            payload["present"],
+            serde_json::json!(["ai:worker", forensic_commitment(&key, b"not ok")])
+        );
+        assert_eq!(payload["scalar_absent"], serde_json::Value::Null);
+        assert_eq!(payload["scalar_present"], "ai:admin");
+        let text = serde_json::to_string(&rows[0]).unwrap();
+        assert!(
+            !text.contains("not ok"),
+            "free text never reaches the row: {text}"
+        );
+    }
+
+    #[test]
+    fn issue_3647_unsigned_sink_withholds_commitments() {
+        let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        fresh_init(tmp.path(), None);
+        record_decision(
+            "ai:t",
+            "allow",
+            "bash",
+            "",
+            ForensicPayload::new().commit("reason", "ISSUE_3647 low entropy"),
+        );
+        shutdown();
+        let rows = rows_3647(tmp.path());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].payload["reason"], FORENSIC_COMMITMENT_WITHHELD);
+        assert!(rows[0].sig.is_empty());
+    }
+
+    #[test]
+    fn issue_3647_database_signer_does_not_enable_forensic_files() {
+        let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _ = crate::identity::test_key_dir::install();
+        shutdown();
+        let key = fresh_key();
+        init_audit_signers(Some(&key));
+        assert!(!is_enabled());
+        let content_hash = Sha256::digest(b"issue-3647-database-audit");
+        let (signature, _) =
+            try_sign_audit_payload(&content_hash).expect("database signer installed");
+        let verifier = resolve_daemon_verifying_key().expect("installed verifier");
+        verifier
+            .verify_strict(
+                &content_hash,
+                &Signature::from_slice(&signature).expect("signature"),
+            )
+            .expect("database signature verifies while file sink is disabled");
+    }
+
     #[test]
     fn record_then_verify_signed_chain() {
         let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
@@ -3404,7 +4185,7 @@ mod tests {
                 "allow",
                 "bash",
                 &format!("R00{i}"),
-                serde_json::json!({"command": format!("ls -la /{i}")}),
+                ForensicPayload::new().commit("command", &format!("ls -la /{i}")),
             );
         }
         shutdown();
@@ -3437,9 +4218,9 @@ mod tests {
             "refuse",
             "bash",
             "R001",
-            serde_json::json!({"r":"no"}),
+            ForensicPayload::new().label("r", "no"),
         );
-        record_decision("ai:t", "allow", "bash", "R002", serde_json::json!({}));
+        record_decision("ai:t", "allow", "bash", "R002", ForensicPayload::new());
         shutdown();
         let date = Utc::now().format("%Y-%m-%d").to_string();
         let path = tmp.path().join(format!("forensic-{date}.jsonl"));
@@ -3466,7 +4247,7 @@ mod tests {
             "refuse",
             "bash",
             "R001",
-            serde_json::json!({"r":"no"}),
+            ForensicPayload::new().label("r", "no"),
         );
         shutdown();
         let date = Utc::now().format("%Y-%m-%d").to_string();
@@ -3506,7 +4287,7 @@ mod tests {
         let key = fresh_key();
         let pubkey = key.verifying_key();
         fresh_init(tmp.path(), Some(key));
-        record_decision("ai:j", "allow", "bash", "R001", serde_json::json!({}));
+        record_decision("ai:j", "allow", "bash", "R001", ForensicPayload::new());
         shutdown();
         // #1913 — a backup tool drops a file with the `forensic-` prefix +
         // `.jsonl` suffix but a NON-date stem. Pre-#1913 `list_forensic_files`
@@ -3534,8 +4315,8 @@ mod tests {
         let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
         let tmp = TempDir::new().unwrap();
         fresh_init(tmp.path(), None);
-        record_decision("ai:t", "allow", "bash", "R001", serde_json::json!({}));
-        record_decision("ai:t", "allow", "bash", "R002", serde_json::json!({}));
+        record_decision("ai:t", "allow", "bash", "R001", ForensicPayload::new());
+        record_decision("ai:t", "allow", "bash", "R002", ForensicPayload::new());
         shutdown();
         let since = Utc::now().format("%Y-%m-%d").to_string();
         let report = verify_since(tmp.path(), &since, None).expect("verify");
@@ -3563,7 +4344,7 @@ mod tests {
     fn record_when_disabled_is_noop() {
         let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
         shutdown();
-        record_decision("ai:t", "allow", "bash", "R001", serde_json::json!({}));
+        record_decision("ai:t", "allow", "bash", "R001", ForensicPayload::new());
         assert!(!is_enabled());
     }
 
@@ -3729,7 +4510,7 @@ mod tests {
         let key_b = fresh_key();
         let pub_b = key_b.verifying_key();
         fresh_init(tmp.path(), Some(key_a));
-        record_decision("ai:t", "allow", "bash", "R001", serde_json::json!({}));
+        record_decision("ai:t", "allow", "bash", "R001", ForensicPayload::new());
         shutdown();
         let today = Utc::now().format("%Y-%m-%d").to_string();
         let report = verify_since(tmp.path(), &today, Some(&pub_b)).expect("verify ran");
@@ -3775,7 +4556,7 @@ mod tests {
         // Re-init with same key and same dir; sink reads chain tail from
         // the existing file so subsequent records chain off of old_hash.
         fresh_init(tmp.path(), Some(key));
-        record_decision("ai:new", "allow", "bash", "R001", serde_json::json!({}));
+        record_decision("ai:new", "allow", "bash", "R001", ForensicPayload::new());
         shutdown();
 
         let today = Utc::now().format("%Y-%m-%d").to_string();
@@ -3895,7 +4676,7 @@ mod tests {
         let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
         let tmp = TempDir::new().unwrap();
         fresh_init(tmp.path(), None);
-        record_decision("ai:t", "allow", "bash", "R001", serde_json::json!({}));
+        record_decision("ai:t", "allow", "bash", "R001", ForensicPayload::new());
         shutdown();
         let tail = read_chain_tail(tmp.path()).expect("tail present after record");
         assert!(!tail.is_empty());
@@ -4139,6 +4920,14 @@ mod tests {
         // function converts to Ok(None) (lines 464-467, 481-484).
         let tmp = TempDir::new().unwrap();
         std::fs::create_dir_all(tmp.path()).unwrap();
+        // #3354 — a key dir never inherits the ambient umask (0002 on the
+        // reference host yields 0775, which the #3198 check correctly
+        // refuses — that refusal is the product being right).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
         let _g = crate::identity::keypair::key_dir_env_lock()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -4213,7 +5002,7 @@ mod tests {
                 "allow",
                 "bash",
                 &format!("R00{i}"),
-                serde_json::json!({"a": i}),
+                ForensicPayload::new().number("a", i),
             );
         }
 
@@ -4229,7 +5018,7 @@ mod tests {
                 "allow",
                 "bash",
                 "R999",
-                serde_json::json!({"source": "background-thread"}),
+                ForensicPayload::new().label("source", "background-thread"),
             );
         });
         handle.join().expect("background thread");
@@ -4272,7 +5061,7 @@ mod tests {
             "allow",
             "bash",
             "R001",
-            serde_json::json!({"b": 1}),
+            ForensicPayload::new().number("b", 1),
         );
         shutdown();
 
@@ -4324,7 +5113,7 @@ mod tests {
                 "allow",
                 "bash",
                 "R001",
-                serde_json::json!({ "i": i }),
+                ForensicPayload::new().number("i", i),
             );
         }
         // No shutdown — flush_blocking alone must drain the writer.
@@ -4347,13 +5136,13 @@ mod tests {
         // First destination.
         let tmp_a = TempDir::new().unwrap();
         fresh_init(tmp_a.path(), None);
-        record_decision("ai:a", "allow", "bash", "R001", serde_json::json!({}));
+        record_decision("ai:a", "allow", "bash", "R001", ForensicPayload::new());
         shutdown();
         // Second, different destination — forces the writer's reopen arm
         // because the cached open file points at tmp_a, not tmp_b.
         let tmp_b = TempDir::new().unwrap();
         fresh_init(tmp_b.path(), None);
-        record_decision("ai:b", "allow", "bash", "R002", serde_json::json!({}));
+        record_decision("ai:b", "allow", "bash", "R002", ForensicPayload::new());
         shutdown();
         let date = Utc::now().format("%Y-%m-%d").to_string();
         let body_a =
@@ -4395,14 +5184,26 @@ mod tests {
         let path = tmp.path().join(format!("forensic-{date}.jsonl"));
 
         fresh_init(tmp.path(), None);
-        record_decision("ai:epoch-1", "allow", "bash", "R001", serde_json::json!({}));
+        record_decision(
+            "ai:epoch-1",
+            "allow",
+            "bash",
+            "R001",
+            ForensicPayload::new(),
+        );
         flush_blocking();
         assert!(path.exists(), "epoch-1 row created the file");
 
         // fresh_init removes the file (new inode on the next write) and
         // re-inits over the identical path.
         fresh_init(tmp.path(), None);
-        record_decision("ai:epoch-2", "allow", "bash", "R002", serde_json::json!({}));
+        record_decision(
+            "ai:epoch-2",
+            "allow",
+            "bash",
+            "R002",
+            ForensicPayload::new(),
+        );
         flush_blocking();
 
         let body = std::fs::read_to_string(&path).expect("epoch-2 row on the recreated file");
@@ -4724,5 +5525,53 @@ mod tests {
             parse_witness_dual_head(&verdict).is_none(),
             "parse declines a non-AuditHeadWitness checkpoint"
         );
+    }
+}
+
+#[cfg(test)]
+mod unsigned_ledger_3354_tests {
+    use super::*;
+
+    /// #3354 — the ONE warning spelling names the issue, the agent id, the
+    /// key directory, the `unsigned` level and the REAL provisioning verb.
+    #[test]
+    fn unsigned_ledger_warning_names_key_and_command_3354() {
+        let dir = Path::new("/keys/sandbox");
+        let w = unsigned_ledger_warning("ai:ledger-3354", dir);
+        assert!(w.starts_with("WARN #3354"), "{w}");
+        assert!(
+            w.contains("ai:ledger-3354") && w.contains("/keys/sandbox"),
+            "{w}"
+        );
+        assert!(w.contains("attest_level=unsigned"), "{w}");
+        assert!(
+            w.contains("`ai-memory identity generate --agent-id ai:ledger-3354`"),
+            "the remedy must be the real verb: {w}"
+        );
+        assert!(
+            !w.contains("keygen"),
+            "there is no top-level keygen verb: {w}"
+        );
+    }
+
+    /// #3354 — the status carries the warning exactly when no key is
+    /// installed, and its JSON shape is the caller-visible contract.
+    #[test]
+    fn ledger_signing_status_is_consistent_with_the_installed_key_3354() {
+        let _ = crate::identity::test_key_dir::install();
+        let status = ledger_signing_status();
+        assert_eq!(status.daemon_signed_events, audit_key_is_installed());
+        assert_eq!(status.warning.is_none(), status.daemon_signed_events);
+        let json = serde_json::to_value(&status).expect("serialise");
+        assert!(json["daemon_signed_events"].is_boolean());
+        assert!(json["agent_id"].is_string());
+        if !status.daemon_signed_events {
+            assert!(
+                json["warning"]
+                    .as_str()
+                    .is_some_and(|w| w.contains(UNSIGNED_LEDGER_ISSUE)),
+                "{json}"
+            );
+        }
     }
 }

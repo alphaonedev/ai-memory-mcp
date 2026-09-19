@@ -220,6 +220,15 @@ pub mod event_types {
     /// [#2402]: https://github.com/alphaonedev/ai-memory-mcp/issues/2402
     pub const MEMORY_DEQUARANTINED: &str = "memory.dequarantined";
 
+    /// v1.0.0 #3124 (R4) — `signed_events.event_type` for an operator
+    /// `ai-memory reown` sweep that re-stamped `metadata.agent_id` on one or
+    /// more rows. Ownership is the authority every caller-scoped mutation gate
+    /// keys on, so re-assigning it is exactly the kind of action that must
+    /// leave a signed, append-only trace naming WHO re-owned WHAT (scope, new
+    /// owner, selection, count — never content). Appended in the SAME
+    /// transaction as the rewrite on both backends.
+    pub const MEMORY_REOWNED: &str = "memory.reowned";
+
     /// `signed_events.event_type` for the recursive-learning depth-cap
     /// trip (`src/cli/doctor.rs::1904`). v0.7.0 #655 Task 1/8.
     pub const REFLECTION_DEPTH_EXCEEDED: &str = "reflection.depth_exceeded";

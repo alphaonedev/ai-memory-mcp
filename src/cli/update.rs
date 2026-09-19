@@ -255,9 +255,16 @@ pub fn run(
             ),
         ));
         if json_out {
-            writeln!(out.stdout, "{}", serde_json::to_string(&mem)?)?;
+            let mut receipt = serde_json::to_value(&mem)?;
+            crate::write_receipt::WriteDurability::sqlite(&conn)?.attach(&mut receipt)?;
+            writeln!(out.stdout, "{}", serde_json::to_string(&receipt)?)?;
         } else {
-            writeln!(out.stdout, "updated: {} [{}]", mem.id, mem.title)?;
+            let durability = crate::write_receipt::WriteDurability::sqlite(&conn)?;
+            writeln!(
+                out.stdout,
+                "updated: {} [{}] {durability}",
+                mem.id, mem.title
+            )?;
         }
     }
     Ok(())

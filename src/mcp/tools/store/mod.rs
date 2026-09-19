@@ -337,6 +337,54 @@ pub(crate) fn handle_store(
     // Batman Form-2 atomisation structurally inert product-wide.
     atomise: crate::hooks::pre_store::AtomiseWiring<'_>,
 ) -> Result<Value, String> {
+    let mut receipt = handle_store_inner(
+        conn,
+        db_path,
+        params,
+        embedder,
+        llm,
+        vector_index,
+        resolved_ttl,
+        autonomous_hooks,
+        mcp_client,
+        federation_forward_url,
+        active_keypair,
+        atomise,
+    )?;
+    if federation_forward_url.is_none() {
+        crate::write_receipt::WriteDurability::sqlite(conn)
+            .and_then(|durability| durability.attach(&mut receipt))
+            .map_err(|error| crate::mcp::error_text::mcp_foreign_err("attach", error))?;
+    }
+    Ok(receipt)
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn handle_store_inner(
+    conn: &rusqlite::Connection,
+    db_path: &Path,
+    params: &Value,
+    embedder: Option<&dyn Embed>,
+    llm: Option<&OllamaClient>,
+    vector_index: Option<&dyn VectorSearchIndex>,
+    resolved_ttl: &crate::config::ResolvedTtl,
+    autonomous_hooks: bool,
+    mcp_client: Option<&str>,
+    federation_forward_url: Option<&str>,
+    // Issue #1239 — synthesis Update / Delete verdicts now emit a
+    // `supersedes` link new → target via `db::create_link_signed`. The
+    // active daemon keypair (when configured) signs the link so the
+    // edge lands with `attest_level='self_signed'` — matching the
+    // legacy supersede path through `update_with_archive_on_supersede`.
+    active_keypair: Option<&crate::identity::keypair::AgentKeypair>,
+    // #2983/#2984/#2986 — the LIVE atomisation wiring, threaded from
+    // `ToolDispatchCtx::atomise_handler` (rebuilt on every `[llm]`
+    // hot-reload, #2172) plus the bounded background worker queue.
+    // Replaces the ABOLISHED process-global `AUTO_ATOMISE_DISPATCH`
+    // OnceLock, which had zero production callers and therefore made
+    // Batman Form-2 atomisation structurally inert product-wide.
+    atomise: crate::hooks::pre_store::AtomiseWiring<'_>,
+) -> Result<Value, String> {
     // #1885 (critical) — mandatory-hook-presence enforcement gate, consulted
     // BEFORE the store commits (and before any federation forward). Under
     // `[hooks].enforce_mode = enforce` with `pre_store` in `required_events` and
@@ -431,7 +479,7 @@ pub(crate) fn handle_store(
         crate::identity::attest_v2::parse_presented(params).map_err(|e| e.to_string())?;
     if let Some(v2) = presented_v2 {
         crate::identity::attest_v2::stamp_v2_sync(conn, &mut mem, &agent_id, &v2)
-            .map_err(|e| format!("{e:#}"))?;
+            .map_err(|e| crate::mcp::error_text::mcp_foreign_err("parse_presented", e))?;
     } else {
         let presented_sig = params["signature"]
             .as_str()
@@ -461,7 +509,7 @@ pub(crate) fn handle_store(
                 Some(&sig_bytes),
                 crate::identity::attest::WriteSurface::Mcp,
             )
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| crate::mcp::error_text::mcp_foreign_err("handle_store_inner", e))?;
             // #3419 (security-high) — admit-once replay guard. The signature has
             // now VERIFIED, so consult the durable ledger before the row is
             // stored: an Ed25519 signature is re-verifiable forever, so without
@@ -500,7 +548,7 @@ pub(crate) fn handle_store(
                 None,
                 crate::identity::attest::WriteSurface::Mcp,
             )
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| crate::mcp::error_text::mcp_foreign_err("handle_store_inner", e))?;
         }
     }
 
@@ -570,7 +618,7 @@ pub(crate) fn handle_store(
             &mem_payload,
             capability.as_ref(),
         )
-        .map_err(|e| e.to_string())?
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("as_ref", e))?
         {
             GovernanceDecision::Allow => {}
             GovernanceDecision::Deny(refusal) => {
@@ -855,7 +903,7 @@ pub(crate) fn handle_store(
         // existing memory's metadata.agent_id wins over anything in the
         // incoming store.
         let preserved_metadata =
-            crate::identity::preserve_provenance_keys(&dup.metadata, &mem.metadata);
+            crate::identity::preserve_provenance_keys_for_merge(&dup.metadata, &mem.metadata);
         let (_found, content_changed) = db::update(
             conn,
             &dup.id,
@@ -869,7 +917,7 @@ pub(crate) fn handle_store(
             None,                       // expires_at
             Some(&preserved_metadata),  // metadata (agent_id preserved)
         )
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("metadata", e))?;
         // Regenerate embedding if content changed during dedup update
         if content_changed && let Some(emb) = embedder {
             let text = crate::embeddings::embedding_document(&mem.title, &mem.content);
@@ -893,10 +941,15 @@ pub(crate) fn handle_store(
         // the response reported "short" while the row stayed "long".
         // Echo-read failures must not turn the already-committed write
         // into an error; fall back to the request values.
-        let (echo_tier, echo_namespace) = db::get(conn, &dup.id).ok().flatten().map_or_else(
-            || (mem.tier.clone(), mem.namespace.clone()),
-            |post| (post.tier, post.namespace),
-        );
+        // #3496 → Unit 1: the request-value default is EAGER (no fallback
+        // closure) — the only in-process vehicle that ever executed the lazy
+        // arm was a write into a quarantined row, which #3695 refuses, and a
+        // branch no honest test can reach must not exist as a branch.
+        let requested = (mem.tier.clone(), mem.namespace.clone());
+        let (echo_tier, echo_namespace) = db::get(conn, &dup.id)
+            .ok()
+            .flatten()
+            .map_or(requested, |post| (post.tier, post.namespace));
         return Ok(json!({
             "id": dup.id,
             "tier": echo_tier,
@@ -933,9 +986,16 @@ pub(crate) fn handle_store(
             // #1579 A5 — HNSW-routed candidate pool (O(log N)) with a
             // bounded-scan fallback; see
             // `db::proactive_conflict_check_with_index`.
-            if let Ok(Some(conflict)) =
-                db::proactive_conflict_check_with_index(conn, &mem, &query_embedding, vector_index)
-            {
+            if let Ok(Some(conflict)) = db::proactive_conflict_check_with_index(
+                conn,
+                &mem,
+                &query_embedding,
+                vector_index,
+                // #3712 — as the ENFORCED-read caller (the MCP read lanes'
+                // own viewer): an invisible near-duplicate never refuses
+                // the write nor is named in the refusal.
+                crate::identity::resolve_read_visibility_caller().as_deref(),
+            ) {
                 tracing::info!(
                     target: "memory_store",
                     namespace = %mem.namespace,
@@ -987,7 +1047,10 @@ pub(crate) fn handle_store(
             bytes: payload_bytes,
         },
     ) {
-        return Err(e.to_string());
+        return Err(crate::mcp::error_text::mcp_foreign_err(
+            "handle_store_inner",
+            e,
+        ));
     }
 
     // #2878 — under `on_conflict=error` the write must be ATOMICALLY
@@ -999,10 +1062,14 @@ pub(crate) fn handle_store(
     // stdio is sqlite-only per #1675, so `db::insert_no_overwrite` is the
     // path). `merge`/`version` keep the legacy `db::insert` upsert (merge =
     // opt-in upsert; version already suffixed the title to a free slot above).
+    // #3696 — the write's admission runs as the ENFORCED-read caller (the
+    // same viewer every MCP read lane resolves), so a `(title, namespace)`
+    // holder this caller cannot read is refused typed and unnamed.
+    let store_viewer = crate::identity::resolve_read_visibility_caller();
     let insert_result = if matches!(on_conflict, OnConflict::Error) {
-        db::insert_no_overwrite(conn, &mem)
+        db::insert_no_overwrite_as(conn, &mem, store_viewer.as_deref())
     } else {
-        db::insert(conn, &mem)
+        db::insert_as(conn, &mem, store_viewer.as_deref())
     };
     let actual_id = match insert_result {
         Ok(id) => id,
@@ -1051,7 +1118,10 @@ pub(crate) fn handle_store(
                 );
                 return Err(format!("GOVERNANCE_REFUSED: {}", refusal.reason));
             }
-            return Err(e.to_string());
+            return Err(crate::mcp::error_text::mcp_foreign_err(
+                "handle_store_inner",
+                e,
+            ));
         }
     };
 
@@ -1102,8 +1172,15 @@ pub(crate) fn handle_store(
     // omitted rather than silently echoing the un-filtered pool — the
     // synthesis path's verdicts still applied; only the wire-side
     // contradictions hint is suppressed.
-    let filtered_contradictions =
-        db::find_contradictions(conn, &mem.title, &mem.namespace).unwrap_or_default();
+    // #3712 — as the ENFORCED-read caller: a row this caller cannot read is
+    // never named in `potential_contradictions`.
+    let filtered_contradictions = db::find_contradictions(
+        conn,
+        &mem.title,
+        &mem.namespace,
+        crate::identity::resolve_read_visibility_caller().as_deref(),
+    )
+    .unwrap_or_default();
     let contradiction_ids: Vec<String> = filtered_contradictions
         .iter()
         .filter(|c| c.id != mem.id && c.id != actual_id)
@@ -1213,10 +1290,12 @@ pub(crate) fn handle_store(
     // so echo the post-write row's tier rather than the requested one.
     // Fallback to the request values when the row is no longer
     // readable (e.g. the synchronous atomise pass archived it above).
+    // #3496 → Unit 1: eager request-value default, see the dedup echo above.
+    let requested_tier = mem.tier.clone();
     let echo_tier = db::get(conn, &actual_id)
         .ok()
         .flatten()
-        .map_or_else(|| mem.tier.clone(), |post| post.tier);
+        .map_or(requested_tier, |post| post.tier);
     let mut response = json!({
         "id": actual_id,
         "tier": echo_tier,

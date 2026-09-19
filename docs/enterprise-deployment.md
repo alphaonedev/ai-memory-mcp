@@ -309,7 +309,7 @@ ai-memory serve --port 9077 --db /var/lib/ai-memory/ai-memory.db
 # Agent 1
 curl -H "X-Agent-Id: alice@team-finance" \
      -H "X-API-Key: $(cat /etc/ai-memory/api.key)" \
-     http://127.0.0.1:9077/api/v1/recall?q=quarterly+forecast
+     https://127.0.0.1:9077/api/v1/recall?q=quarterly+forecast
 
 # Agent 2 (using ai-memory CLI as a thin client)
 AI_MEMORY_AGENT_ID="bob@team-finance" ai-memory recall "quarterly forecast"
@@ -1718,6 +1718,7 @@ From `src/metrics.rs`:
 | `ai_memory_federation_fanout_retry_total` (counter) | Cross-peer retry events. Trend high under cross-DC partition. |
 | `ai_memory_federation_fanout_dropped_total` (counter) | Post-quorum drops (peer rewrote id or refused to ack). Page on sustained increment. |
 | `ai_memory_federation_partial_quorum_total` (counter) | Quorum met but some peer(s) didn't ack. Investigate trend lines. |
+| `ai_memory_federation_peer_last_success_timestamp_seconds{peer,direction}` (gauge) | Per-peer freshness (#3654). Page when `last_attempt` is newer than `last_success` for a peer for longer than your tolerance: that peer has stopped accepting pushes (`direction="push"`) or answering catch-up (`direction="pull"`). See `docs/federation.md` §Per-peer freshness. |
 | `recall_total` / `recall_latency_seconds` (histogram) | Recall throughput + latency profile. |
 | `memory_store_total` / `memory_store_latency_seconds` (histogram) | Write throughput + latency. |
 
@@ -1940,7 +1941,7 @@ shortcuts so a fleet operator does not audit each knob by hand:
 
 **`AI_MEMORY_SECURITY_PROFILE=asi-hard` — the NO-DISABLE hardened
 posture.** One named knob pins the fail-closed security floor: at boot
-the profile PINS **27** security env knobs to their hard value (SSOT)
+the profile PINS **28** security env knobs to their hard value (SSOT)
 `src/security_profile.rs::KNOBS`; the copy-deployable template is
 [`deploy/asi-hard.env`](deploy/asi-hard.env), pinned by
 `tests/deploy_templates.rs`) and **refuses to boot** if an operator set

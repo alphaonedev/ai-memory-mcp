@@ -13,8 +13,8 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use prometheus::{
-    Encoder, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, Registry,
-    TextEncoder,
+    Encoder, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec,
+    Registry, TextEncoder,
 };
 
 // =====================================================================
@@ -117,6 +117,17 @@ pub struct Metrics {
     pub contradiction_detected_total: IntCounter,
     pub webhook_dispatched_total: IntCounter,
     pub webhook_failed_total: IntCounter,
+    /// #3659 — `subscription_events.delivery_status` transitions that
+    /// reached the database. The persistence twin of the wire counters
+    /// above: "delivered" and "history persisted" are different claims.
+    pub webhook_audit_status_persisted_total: IntCounter,
+    /// #3659 — delivery-audit bookkeeping failures by stage (`open` |
+    /// `status_update` | `status_no_row` | `dispatch_counter`; closed set,
+    /// pre-touched to 0). Any increment means the persisted delivery
+    /// history disagrees with the wire outcome for some correlation id.
+    pub webhook_audit_update_failed_total: IntCounterVec,
+    /// #3659 — unix seconds of the last bookkeeping failure; `0` = none.
+    pub webhook_audit_last_failure_at_seconds: IntGauge,
     pub memories_gauge: IntGauge,
     /// v1.0.0 #2583 — UNIX seconds at which `memories_gauge` was last
     /// recomputed; `0` = never. Published in lockstep with the count by
@@ -149,6 +160,40 @@ pub struct Metrics {
     /// non-zero rate to detect mesh-divergence drift early — before a
     /// follow-up catchup sync surfaces the gap.
     pub federation_partial_quorum_total: IntCounter,
+    /// #3654 — configured federation membership (the census): `1` per
+    /// configured peer. `peer` is the minted `peer-h1…` id (or a hashed
+    /// label for an id of unknown shape — see `federation::freshness`).
+    pub federation_peer_configured: IntGaugeVec,
+    /// #3654 — unix seconds (local clock) of the last attempted exchange
+    /// with a peer, per `direction` (`pull` catch-up / `push` fan-out).
+    /// Absent until the first attempt.
+    pub federation_peer_last_attempt_timestamp_seconds: IntGaugeVec,
+    /// #3654 — unix seconds (local clock) of the last SUCCESSFUL exchange
+    /// with a peer, per `direction`. A push only counts when the peer's own
+    /// report says it applied the items (#2341). Absent until the first
+    /// success.
+    pub federation_peer_last_success_timestamp_seconds: IntGaugeVec,
+    /// #3654 — failed attempts since the last success, per peer and
+    /// `direction`.
+    pub federation_peer_consecutive_failures: IntGaugeVec,
+    /// #3654 — failed attempts per peer, `direction` and closed-set `class`.
+    pub federation_peer_failures_total: IntCounterVec,
+    /// #3654 — peer clock minus local clock, whole seconds, from the peer's
+    /// HTTP `Date` header on the last catch-up response.
+    pub federation_peer_clock_skew_seconds: IntGaugeVec,
+    /// #3654 — pending push-DLQ rows per peer, refreshed each replay tick.
+    pub federation_peer_push_dlq_depth: IntGaugeVec,
+    /// #3654 — unix seconds of the oldest pending push-DLQ failure per peer.
+    /// Absent when the peer's backlog is empty.
+    pub federation_peer_push_dlq_oldest_failed_timestamp_seconds: IntGaugeVec,
+    /// #3654 — the configured catch-up interval in seconds. A label-less
+    /// vector, not a scalar gauge: a vector exports nothing until a child
+    /// exists, so the series is ABSENT on a node that runs no catch-up loop
+    /// (a registered scalar would export `0`, which reads as "the interval is
+    /// zero seconds" and silently disarms the stall alert built on it). The
+    /// child exists exactly while a loop holds a
+    /// [`crate::federation::freshness::CatchupIntervalGuard`].
+    pub federation_catchup_interval_seconds: IntGaugeVec,
     /// Cluster-A COR-3 (v0.7.0): count of memory rows whose Form 4
     /// fact-provenance JSON columns (`citations`, `source_span`,
     /// `confidence_signals`, or pre-Form-4 `metadata`) failed to parse
@@ -211,6 +256,12 @@ pub struct Metrics {
     /// classifier maps the free-text `last_error` to one of the six
     /// values), never the raw string.
     pub federation_push_dlq_quarantined_by_cause: IntCounterVec,
+    /// v1.0.0 #3124 — caller-scoped mutations ADMITTED on an UNSTAMPED
+    /// (legacy-unowned) row under `AI_MEMORY_UNSTAMPED_MUTATION=warn`,
+    /// labeled by `backend` (`sqlite`|`postgres`) and `funnel` (the closed
+    /// `identity::owner_stamp::funnel` set). Non-zero means rows the
+    /// operator must re-own before flipping the knob to `refuse`.
+    pub unstamped_mutation_allowed_total: IntCounterVec,
     /// #2442 — push-DLQ rows skipped because their durable routing key is a
     /// pre-#2442 POSITIONAL peer id (`peer-0`, `peer-1`, …) that no longer
     /// resolves to any configured peer.
@@ -261,6 +312,18 @@ pub struct Metrics {
     /// dequarantine. Closes the #2444 silent-hide anti-pattern (the
     /// quarantine used to emit nothing while `/sync/push` returned 200).
     pub federation_quarantined_unattributed: IntCounter,
+
+    /// v1.0.0 #3699 (5-agent vote 4d3ea1c5) — monotonic count of inbound
+    /// federated memories folded into a LOCAL row of a DIFFERENT id by the
+    /// newer-wins `(title, namespace)` merge (the inbound id was never
+    /// created here). Legitimate for two nodes that independently stored
+    /// the same title; a non-zero rate on a fleet that consolidates is the
+    /// signature of out-of-CAUSAL-order delivery (a new memory arriving
+    /// before the tombstone that freed its title), which the receive loop's
+    /// causal ordering closes within one push body and NOT across pushes.
+    /// Paired with a per-merge WARN naming both ids at the merge site, so
+    /// the divergence is never silent inside an HTTP 200.
+    pub federation_cross_id_title_merge: IntCounter,
 
     /// v1.0.0 #2402 — the route-OUT twin of
     /// [`Self::federation_quarantined_unattributed`]: monotonic count of
@@ -577,6 +640,36 @@ impl Metrics {
         )?;
         registry.register(Box::new(webhook_failed_total.clone()))?;
 
+        // #3659 — delivery-audit persistence evidence.
+        let webhook_audit_status_persisted_total = IntCounter::new(
+            "ai_memory_webhook_audit_status_persisted_total",
+            "Webhook delivery-audit status transitions (ack/failed) that \
+             reached subscription_events since boot.",
+        )?;
+        registry.register(Box::new(webhook_audit_status_persisted_total.clone()))?;
+        let webhook_audit_update_failed_total = IntCounterVec::new(
+            prometheus::Opts::new(
+                "ai_memory_webhook_audit_update_failed_total",
+                "Webhook delivery-audit bookkeeping failures since boot, by \
+                 stage (open | status_update | status_no_row | \
+                 dispatch_counter). Any increment means the persisted \
+                 delivery history disagrees with the wire outcome.",
+            ),
+            &["stage"],
+        )?;
+        registry.register(Box::new(webhook_audit_update_failed_total.clone()))?;
+        for stage in crate::subscriptions::audit_status::AuditStage::ALL {
+            webhook_audit_update_failed_total
+                .with_label_values(&[stage.as_str()])
+                .reset();
+        }
+        let webhook_audit_last_failure_at_seconds = IntGauge::new(
+            "ai_memory_webhook_audit_last_failure_at_seconds",
+            "Unix seconds of the last webhook delivery-audit bookkeeping \
+             failure; 0 = none since boot.",
+        )?;
+        registry.register(Box::new(webhook_audit_last_failure_at_seconds.clone()))?;
+
         let memories_gauge = IntGauge::new(
             "ai_memory_memories",
             "Current count of non-archived memories.",
@@ -666,6 +759,95 @@ impl Metrics {
         )?;
         registry.register(Box::new(federation_partial_quorum_total.clone()))?;
 
+        // #3654 — per-peer federation freshness. The `peer` label is bounded
+        // by configured membership and never carries a URL.
+        let federation_peer_configured = IntGaugeVec::new(
+            prometheus::Opts::new(
+                "ai_memory_federation_peer_configured",
+                "1 for every peer in this node's configured federation membership (#3654).",
+            ),
+            &["peer"],
+        )?;
+        registry.register(Box::new(federation_peer_configured.clone()))?;
+        let federation_peer_last_attempt_timestamp_seconds = IntGaugeVec::new(
+            prometheus::Opts::new(
+                "ai_memory_federation_peer_last_attempt_timestamp_seconds",
+                "Unix seconds (local clock) of the last attempted exchange with a peer. \
+                 direction=pull|push. Absent until the first attempt (#3654).",
+            ),
+            &["peer", "direction"],
+        )?;
+        registry.register(Box::new(
+            federation_peer_last_attempt_timestamp_seconds.clone(),
+        ))?;
+        let federation_peer_last_success_timestamp_seconds = IntGaugeVec::new(
+            prometheus::Opts::new(
+                "ai_memory_federation_peer_last_success_timestamp_seconds",
+                "Unix seconds (local clock) of the last successful exchange with a peer; \
+                 a push counts only when the peer applied it. direction=pull|push. \
+                 Absent until the first success (#3654).",
+            ),
+            &["peer", "direction"],
+        )?;
+        registry.register(Box::new(
+            federation_peer_last_success_timestamp_seconds.clone(),
+        ))?;
+        let federation_peer_consecutive_failures = IntGaugeVec::new(
+            prometheus::Opts::new(
+                "ai_memory_federation_peer_consecutive_failures",
+                "Failed attempts since the last success with a peer. direction=pull|push (#3654).",
+            ),
+            &["peer", "direction"],
+        )?;
+        registry.register(Box::new(federation_peer_consecutive_failures.clone()))?;
+        let federation_peer_failures_total = IntCounterVec::new(
+            prometheus::Opts::new(
+                "ai_memory_federation_peer_failures_total",
+                "Failed exchanges with a peer. direction=pull|push; class=unauthorized|\
+                 throttled|rejected|server_error|unreachable|bad_response|not_applied|\
+                 task_failed|other (#3654).",
+            ),
+            &["peer", "direction", "class"],
+        )?;
+        registry.register(Box::new(federation_peer_failures_total.clone()))?;
+        let federation_peer_clock_skew_seconds = IntGaugeVec::new(
+            prometheus::Opts::new(
+                "ai_memory_federation_peer_clock_skew_seconds",
+                "Peer clock minus local clock in whole seconds, from the peer's HTTP Date \
+                 header on the last catch-up response (#3654).",
+            ),
+            &["peer"],
+        )?;
+        registry.register(Box::new(federation_peer_clock_skew_seconds.clone()))?;
+        let federation_peer_push_dlq_depth = IntGaugeVec::new(
+            prometheus::Opts::new(
+                "ai_memory_federation_peer_push_dlq_depth",
+                "Pending federation_push_dlq rows per peer, refreshed each replay tick (#3654).",
+            ),
+            &["peer"],
+        )?;
+        registry.register(Box::new(federation_peer_push_dlq_depth.clone()))?;
+        let federation_peer_push_dlq_oldest_failed_timestamp_seconds = IntGaugeVec::new(
+            prometheus::Opts::new(
+                "ai_memory_federation_peer_push_dlq_oldest_failed_timestamp_seconds",
+                "Unix seconds of the oldest pending federation_push_dlq failure per peer; \
+                 absent when the peer's backlog is empty (#3654).",
+            ),
+            &["peer"],
+        )?;
+        registry.register(Box::new(
+            federation_peer_push_dlq_oldest_failed_timestamp_seconds.clone(),
+        ))?;
+        let federation_catchup_interval_seconds = IntGaugeVec::new(
+            prometheus::Opts::new(
+                "ai_memory_federation_catchup_interval_seconds",
+                "Configured federation catch-up interval in seconds; absent when the \
+                 catch-up loop is not running (#3654).",
+            ),
+            &[],
+        )?;
+        registry.register(Box::new(federation_catchup_interval_seconds.clone()))?;
+
         // Cluster-A COR-3 (v0.7.0) — corrupt-provenance observability.
         let corrupt_provenance_rows_total = IntCounterVec::new(
             prometheus::Opts::new(
@@ -749,6 +931,20 @@ impl Metrics {
         )?;
         registry.register(Box::new(federation_push_dlq_quarantined_by_cause.clone()))?;
 
+        // v1.0.0 #3124 — unstamped-row mutation admissions (closed labels).
+        let unstamped_mutation_allowed_total = IntCounterVec::new(
+            prometheus::Opts::new(
+                "ai_memory_unstamped_mutation_allowed_total",
+                "Caller-scoped mutations admitted on an UNSTAMPED \
+                 (legacy-unowned, no metadata.agent_id) memory row under \
+                 AI_MEMORY_UNSTAMPED_MUTATION=warn, labeled by backend and \
+                 funnel. Non-zero means rows to re-own (ai-memory reown) \
+                 before setting the knob to refuse.",
+            ),
+            &["backend", "funnel"],
+        )?;
+        registry.register(Box::new(unstamped_mutation_allowed_total.clone()))?;
+
         // #2442 — legacy positional peer-id skips. Kept OFF the `cause` label
         // set above on purpose: see the field doc on
         // `federation_push_dlq_legacy_positional`.
@@ -796,6 +992,19 @@ impl Metrics {
              this node is black-holing. #2966.",
         )?;
         registry.register(Box::new(federation_quarantined_unattributed.clone()))?;
+
+        // #3699 (5-agent vote 4d3ea1c5) — cross-id title-merge observability.
+        let federation_cross_id_title_merge = IntCounter::new(
+            "ai_memory_fed_cross_id_title_merge_total",
+            "Monotonic count of inbound federated memories folded into a local \
+             row of a DIFFERENT id by the newer-wins (title, namespace) merge \
+             (the inbound id was never created on this node). Legitimate for \
+             two nodes that independently stored the same title; on a fleet \
+             that consolidates, a non-zero rate is the signature of a memory \
+             delivered before the tombstone that freed its title (#3699). Each \
+             increment pairs with a WARN naming both ids.",
+        )?;
+        registry.register(Box::new(federation_cross_id_title_merge.clone()))?;
 
         // v1.0.0 #2402 — the route-OUT counter. #1948 advertised "operator
         // dequarantine" as the way out of quarantine and shipped no caller, so
@@ -1079,6 +1288,9 @@ impl Metrics {
             contradiction_detected_total,
             webhook_dispatched_total,
             webhook_failed_total,
+            webhook_audit_status_persisted_total,
+            webhook_audit_update_failed_total,
+            webhook_audit_last_failure_at_seconds,
             memories_gauge,
             memories_gauge_refreshed_at,
             hnsw_size_gauge,
@@ -1089,15 +1301,26 @@ impl Metrics {
             federation_fanout_dropped_total,
             federation_fanout_retry_total,
             federation_partial_quorum_total,
+            federation_peer_configured,
+            federation_peer_last_attempt_timestamp_seconds,
+            federation_peer_last_success_timestamp_seconds,
+            federation_peer_consecutive_failures,
+            federation_peer_failures_total,
+            federation_peer_clock_skew_seconds,
+            federation_peer_push_dlq_depth,
+            federation_peer_push_dlq_oldest_failed_timestamp_seconds,
+            federation_catchup_interval_seconds,
             corrupt_provenance_rows_total,
             auto_export_spawn_failed_total,
             federation_push_dlq_depth,
             deferred_audit_drainer_terminal_state,
             federation_push_dlq_quarantined,
             federation_push_dlq_quarantined_by_cause,
+            unstamped_mutation_allowed_total,
             federation_push_dlq_legacy_positional,
             federation_erasure_superseded,
             federation_quarantined_unattributed,
+            federation_cross_id_title_merge,
             operator_dequarantined,
             hnsw_evictions_total,
             hnsw_last_eviction_at_nanos,
@@ -1253,11 +1476,45 @@ pub fn inc_fed_quarantined_unattributed() {
     registry().federation_quarantined_unattributed.inc();
 }
 
+/// v1.0.0 #3124 — record `rows` caller-scoped mutations admitted on
+/// UNSTAMPED rows (`AI_MEMORY_UNSTAMPED_MUTATION=warn`). Pairs with the
+/// `authz.unstamped` WARN at the call site
+/// ([`crate::identity::owner_stamp::admit_unstamped_rows`]).
+pub fn inc_unstamped_mutation_allowed(backend: &str, funnel: &str, rows: u64) {
+    registry()
+        .unstamped_mutation_allowed_total
+        .with_label_values(&[backend, funnel])
+        .inc_by(rows);
+}
+
+/// v1.0.0 #3124 — read the unstamped-admission counter for one label pair.
+/// Test-only accessor pinning the observability wiring.
+#[must_use]
+pub fn unstamped_mutation_allowed_count(backend: &str, funnel: &str) -> u64 {
+    registry()
+        .unstamped_mutation_allowed_total
+        .with_label_values(&[backend, funnel])
+        .get()
+}
+
 /// #2966 — read the current value of the route-IN quarantine counter.
 /// Test-only accessor for the regression that pins the observability wiring.
 #[must_use]
 pub fn fed_quarantined_unattributed_count() -> u64 {
     registry().federation_quarantined_unattributed.get()
+}
+
+/// v1.0.0 #3699 — record ONE inbound federated memory folded into a local
+/// row of a different id by the `(title, namespace)` newer-wins merge. The
+/// caller emits the paired WARN naming both ids (`federation.cross_id_merge`).
+pub fn inc_fed_cross_id_title_merge() {
+    registry().federation_cross_id_title_merge.inc();
+}
+
+/// #3699 — read the cross-id title-merge counter (test accessor).
+#[must_use]
+pub fn fed_cross_id_title_merge_count() -> u64 {
+    registry().federation_cross_id_title_merge.get()
 }
 
 /// v1.0.0 #2402 — record one quarantined memory released by an OPERATOR
@@ -1485,6 +1742,11 @@ mod tests {
             "ai_memory_contradiction_detected_total",
             "ai_memory_webhook_dispatched_total",
             "ai_memory_webhook_failed_total",
+            // #3659 — delivery-audit persistence evidence.
+            "ai_memory_webhook_audit_status_persisted_total",
+            "ai_memory_webhook_audit_update_failed_total{stage=\"open\"}",
+            "ai_memory_webhook_audit_update_failed_total{stage=\"status_no_row\"}",
+            "ai_memory_webhook_audit_last_failure_at_seconds",
             "ai_memory_memories",
             // v1.0.0 #2583 — the freshness twin of the pre-computed count.
             "ai_memory_memories_refreshed_at_seconds",
@@ -1732,6 +1994,38 @@ mod tests {
         enc.encode(&b.registry.gather(), &mut buf_b).unwrap();
         assert!(String::from_utf8_lossy(&buf_a).contains("ai_memory_store_total"));
         assert!(String::from_utf8_lossy(&buf_b).contains("ai_memory_store_total"));
+    }
+
+    /// #3654 D1 — the catch-up cadence series must not exist on a node that
+    /// runs no catch-up loop. A fresh registry (a process that never spawned
+    /// one) renders no sample at all; the series appears only while a child
+    /// exists and disappears again when the child is removed.
+    #[test]
+    fn catchup_interval_series_is_absent_until_a_loop_owns_it_3654() {
+        const NAME: &str = "ai_memory_federation_catchup_interval_seconds";
+        fn rendered(m: &super::Metrics) -> String {
+            let mut buf = Vec::new();
+            TextEncoder::new()
+                .encode(&m.registry.gather(), &mut buf)
+                .expect("encode");
+            String::from_utf8(buf).expect("utf8")
+        }
+        let m = super::Metrics::try_new().expect("fresh registry");
+        assert!(
+            !rendered(&m).contains(NAME),
+            "a node with no catch-up loop must not export the cadence (not even 0)"
+        );
+        m.federation_catchup_interval_seconds
+            .with_label_values(&[])
+            .set(47);
+        let sample = rendered(&m)
+            .lines()
+            .find_map(|l| l.strip_prefix(NAME).map(str::trim).map(str::to_owned));
+        assert_eq!(sample.as_deref(), Some("47"));
+        m.federation_catchup_interval_seconds
+            .remove_label_values(&[])
+            .expect("the child exists");
+        assert!(!rendered(&m).contains(NAME));
     }
 
     #[test]

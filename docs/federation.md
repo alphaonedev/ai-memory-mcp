@@ -929,6 +929,76 @@ For heterogeneous trust,
 §8.8 of `docs/enterprise-deployment.md` gives the correct answer:
 **use multiple disjoint swarms**, not one mesh with scopes.
 
+## Per-peer freshness (#3654)
+
+Before #3654 a catch-up failure (a non-2xx answer or an unreachable peer)
+was logged at DEBUG and no series said which peer had stopped
+converging, so a quiet peer, a partitioned one, a dead worker and a peer
+that silently rejects our pushes all looked the same. The registry in
+`src/federation/freshness.rs` now records, per configured peer and per
+direction (`pull` = our catch-up of the peer, `push` = our writes to it),
+the last attempt, the last success, the failure streak and the class of
+the last failure, plus the peer's clock offset and its push-DLQ backlog.
+The series are listed in `docs/API_REFERENCE.md`.
+
+Every timestamp comes from this node's clock at the moment it observed
+the outcome; a peer's own clock is measured (`clock_skew_seconds`) but
+never used as a freshness value, so a skewed peer cannot look fresh. A
+series appears only after its first observation: a peer we have never
+pushed to has no push timestamp at all, not a `0`.
+
+| Symptom | What the series show |
+|---|---|
+| Quiet (UNKNOWN, not healthy) | No recent attempt in either direction. Silence carries no liveness signal: a push happens only when there is something to push, so an old `last_success{direction="push"}` says nothing about whether the peer would accept the next write. The pull direction is the only periodic liveness probe, and where no catch-up loop runs there is none (the cadence series is then absent and `reachability` in `/api/v1/monitoring/status` is `unknown`). |
+| Responding | Pull attempts and successes advance every catch-up interval, and every push attempt succeeds. |
+| Stopped accepting our pushes | `last_attempt{direction="push"}` newer than `last_success{direction="push"}`; `consecutive_failures{direction="push"}` climbing; the class says why (`unauthorized`, `server_error`, `not_applied`, ...). |
+| Unreachable or partitioned | The same shape on `pull`, class `unreachable`. |
+| Catch-up worker stalled | `last_attempt{direction="pull"}` stops advancing; alert when `time() - last_attempt` exceeds a few multiples of `ai_memory_federation_catchup_interval_seconds`. |
+
+Logging stays quiet for transients and speaks up for sustained failure: a
+single failed attempt is still a DEBUG line, the third consecutive
+failure in one direction logs a WARN under the
+`federation.peer_freshness` target, and the WARN repeats only when the
+streak doubles (3, 6, 12, 24, ...), so a peer that is down for a day
+costs a dozen lines. The first success after an escalated streak logs
+one INFO naming how long the peer was failing. A fan-out task that
+panics is now attributed to its peer instead of being reported as an
+anonymous join error.
+
+A panicked or cancelled fan-out task counts toward that peer's push
+streak on purpose (the write it carried did not reach the peer), and the
+WARN says the cause was local (`task_failed`, "a panicked or cancelled
+fan-out task on this node, not a peer response").
+
+`ai_memory_federation_catchup_interval_seconds` exists only while a
+catch-up loop runs; a node with no catch-up loop exports no cadence at
+all, never a `0` that would read as a zero-second interval and silently
+disarm the stall alert. Clock skew is measured from the `Date` header of
+catch-up (pull) responses only, so a push-only node reports none.
+
+The same data backs the per-peer block of `/api/v1/monitoring/status`
+(#3646): `reachability` (pull-derived; `unknown` with a reason when no
+catch-up loop runs, no pull was observed, or the last pull is older than
+three catch-up intervals), `last_successful_push_age_seconds` and
+`last_accepted_push_at_seconds` (the last push the peer applied),
+`last_push_attempt_at_seconds`, `dlq_depth`, `dlq_oldest_age_seconds`
+and `clock_skew_seconds`. An observed field renders
+`{"state": "available", "value": ...}` and a field this node has not
+observed renders `{"state": "unavailable", "reason": ...}`, never a bare
+number.
+
+Deliberately not covered by #3654: per-peer replication lag and catch-up
+progress are NOT measured (the two status fields stay `unavailable`,
+tracked in #3681), and the `ai-memory sync-daemon` lane
+(`sync_cycle_once`) records no freshness at all (tracked in #3682); only
+the `serve` fan-out and catch-up lanes are observed.
+
+The `peer` label is the minted `peer-h1…` id, the same key the push DLQ
+and the boot `registered peer` log line use. An id of any other shape is
+hashed before it can reach a label or a log field, because older and
+test configurations have used the peer URL itself as the id and a URL
+can carry credentials.
+
 ## Troubleshooting
 
 | Symptom | Likely cause | Diagnostic recipe |

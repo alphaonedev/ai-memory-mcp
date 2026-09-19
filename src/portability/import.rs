@@ -694,7 +694,7 @@ fn apply_all_classes(
         // CLOBBERED an existing destination row's content whenever an
         // imported memory (different id) collided on `(title, namespace)`.
         let collision =
-            crate::storage::find_by_title_namespace(conn, &staged.title, &staged.namespace)
+            crate::storage::find_by_title_namespace(conn, &staged.title, &staged.namespace, None)
                 .with_context(|| format!("import: collision probe for memory {}", staged.id))?;
         // #2878 — whether the write below must be ATOMICALLY fail-closed
         // (`insert_imported_no_overwrite`, `INSERT … ON CONFLICT DO NOTHING`).
@@ -998,7 +998,7 @@ fn apply_all_classes(
         let row = row;
         let mem = &row.memory;
         let agent_id = crate::storage::memory_agent_id(mem);
-        let sealed = crate::encryption::seal_content(&mem.content, agent_id)?;
+        let sealed = crate::storage::seal_content_guarded(conn, &mem.content, agent_id)?;
         let content_to_store: &str = sealed.as_ref().map_or(mem.content.as_str(), |(_, ph)| ph);
         let encrypted_envelope: Option<&[u8]> = sealed.as_ref().map(|(env, _)| env.as_slice());
         // v1.0.0 #2385 — the v90 `archived_memories.cid` / `cid_genesis`

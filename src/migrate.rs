@@ -142,9 +142,23 @@ pub async fn open_store(url: &str) -> Result<Box<dyn MemoryStore>> {
 
     #[cfg(feature = "sal-postgres")]
     if is_postgres_url(url) {
+        // #3711 — the connect refusal names the store it could not reach,
+        // rendered from the allowlist (scheme://host:port/db, never the
+        // credentials): a caller reading "pool timed out" alone cannot tell
+        // WHICH destination was unreachable, and the raw DSN must never be
+        // the thing that tells them.
         let store = crate::store::postgres::PostgresStore::connect(url)
             .await
-            .context("connect postgres adapter")?;
+            .with_context(|| {
+                // MERGE (#3435 x #3711): the const supplies the text so it
+                // cannot drift across its three sites; url_display supplies the
+                // target so the refusal names WHICH destination was unreachable.
+                format!(
+                    "{} {}",
+                    crate::store::postgres::CTX_CONNECT_POSTGRES_ADAPTER,
+                    crate::url_display::store_url_display(url)
+                )
+            })?;
         return Ok(Box::new(store));
     }
 
@@ -152,13 +166,63 @@ pub async fn open_store(url: &str) -> Result<Box<dyn MemoryStore>> {
     // credentials in the userinfo; redact before echoing.
     anyhow::bail!(
         "unrecognised store URL: {} (expected sqlite:///path or postgres://...)",
-        crate::logging::redact_url_password(url)
+        crate::url_display::store_url_display(url)
+    )
+}
+
+/// v1.0.0 #3435 — open the migration SOURCE, which is only ever READ.
+///
+/// The `sqlite://` branch goes through [`SqliteStore::open_existing_read_only`]
+/// rather than [`SqliteStore::open`]: the writer funnel `Connection::open`s
+/// (CREATES) a missing path and then replays the bootstrap schema + ladder
+/// over it, so a mistyped `--from` used to produce an EMPTY store and a
+/// `memories_read: 0` "success". A missing source is now the typed
+/// [`crate::db::MISSING_DATABASE_REFUSAL`] error, and an existing one is
+/// opened `SQLITE_OPEN_READ_ONLY` so the copy can never mutate what it is
+/// copying from. The `postgres://` branch keeps the adapter's connect
+/// semantics: a missing database is refused by the server, never created.
+///
+/// # Errors
+///
+/// A missing / unreadable / schema-behind sqlite source, an unreachable
+/// postgres, or an unrecognised URL scheme.
+#[allow(clippy::unused_async)]
+pub async fn open_source_store(url: &str) -> Result<Box<dyn MemoryStore>> {
+    if let Some(path) = url.strip_prefix(SQLITE_URL_SCHEME) {
+        let clean = path
+            .strip_prefix('/')
+            .map_or(path, |p| if p.starts_with('/') { p } else { path });
+        let store = SqliteStore::open_existing_read_only(clean)
+            .context("open sqlite source (read-only, never created)")?;
+        return Ok(Box::new(store));
+    }
+
+    #[cfg(feature = "sal-postgres")]
+    if is_postgres_url(url) {
+        let store = crate::store::postgres::PostgresStore::connect(url)
+            .await
+            .context(crate::store::postgres::CTX_CONNECT_POSTGRES_ADAPTER)?;
+        return Ok(Box::new(store));
+    }
+
+    // The URL failed BOTH scheme matches, so nothing about its shape is
+    // known — it may carry a query-form password (#3667) or anything else a
+    // userinfo-only masker cannot see. Render from an allowlist: the scheme
+    // token and nothing else.
+    anyhow::bail!(
+        "unrecognised store URL scheme {:?} (expected sqlite:///path or postgres://...)",
+        url.split_once("://").map_or("<none>", |(scheme, _)| scheme)
     )
 }
 
 /// Run the migration. Streams through the source in pages of
 /// `batch_size`, writing each page to the destination. Idempotent on
 /// re-run — both adapters' `store` implementations upsert on memory id.
+///
+/// Under `dry_run` the destination is NEVER consulted (v1.0.0 #3435): the
+/// call is equivalent to [`plan`], and `to` may be any store. Callers that
+/// have no destination to hand — the CLI's `--dry-run`, which must not
+/// even CREATE one — call [`plan`] directly.
 pub async fn migrate(
     from: &dyn MemoryStore,
     to: &dyn MemoryStore,
@@ -166,6 +230,34 @@ pub async fn migrate(
     namespace_filter: Option<String>,
     dry_run: bool,
 ) -> MigrationReport {
+    let to = if dry_run { None } else { Some(to) };
+    run(from, to, batch_size, namespace_filter).await
+}
+
+/// v1.0.0 #3435 — the dry-run half of [`migrate`], with NO destination.
+///
+/// Sizes the migration (memories / embeddings / links read, and the
+/// order-independent lineage-DAG verdict over the SOURCE graph) without a
+/// destination store in scope at all, so a `--dry-run` cannot create, open
+/// or migrate its `--to` path. The report carries `dry_run: true`.
+pub async fn plan(
+    from: &dyn MemoryStore,
+    batch_size: usize,
+    namespace_filter: Option<String>,
+) -> MigrationReport {
+    run(from, None, batch_size, namespace_filter).await
+}
+
+/// Shared body of [`migrate`] / [`plan`]. `to == None` IS the dry run —
+/// the type makes "dry run touches the destination" unrepresentable.
+#[allow(clippy::too_many_lines)]
+async fn run(
+    from: &dyn MemoryStore,
+    to: Option<&dyn MemoryStore>,
+    batch_size: usize,
+    namespace_filter: Option<String>,
+) -> MigrationReport {
+    let dry_run = to.is_none();
     // #910 — migrate is an admin/operator surface that must round-
     // trip every row regardless of metadata.scope; use the admin
     // builder so the SAL-level visibility filter is bypassed.
@@ -209,6 +301,60 @@ pub async fn migrate(
     // #3060 F4 — ids that actually landed on the destination (or, under
     // `dry_run`, every unique source id). Phase 3 copies their embeddings.
     let mut migrated_ids: Vec<String> = Vec::new();
+    // ─────────────────────────────────────────────────────────────────
+    // Phase 0 — the ORDER-INDEPENDENT lineage-DAG verdict (v1.0.0 #3435).
+    //
+    // Read the source's complete edge set and the destination's existing
+    // one BEFORE any row is written, and assert acyclicity ONCE over their
+    // union — the graph that will exist after the import. The per-write
+    // Pass-0 wall-clock guard (#1859) is scoped to single-node writes: it
+    // refuses a genuinely-DAG `derived_from` edge whose source was minted
+    // on another clock later than its target (12 of 289 edges on the real
+    // store the CLI sweep measured). Phase 2 therefore writes edges through
+    // the inbound funnel that bypasses ONLY that heuristic, and THIS pass is
+    // the acyclicity guarantee it relies on. A genuine cycle refuses the
+    // WHOLE migration here, with nothing written — never a silently dropped
+    // edge. Under `dry_run` there is no destination to consult, so the
+    // verdict covers the source graph alone.
+    //
+    // #1876 — unlike `list`, `list_links` is NOT subject to the
+    // `LIST_MAX_LIMIT` clamp on EITHER adapter: both issue a single
+    // unbounded `SELECT ... ORDER BY (source_id, target_id, relation)`
+    // with no `LIMIT`, so one call returns the full edge set.
+    let link_filter = namespace_filter.as_deref();
+    let links = match from.list_links(link_filter).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            report.errors.push(format!("source list_links failed: {e}"));
+            return report;
+        }
+    };
+    // The destination snapshot is UNFILTERED on purpose: a cycle can close
+    // through an edge whose source lives outside the migrated namespace,
+    // and the same snapshot doubles as the written-vs-skipped attribution
+    // set for Phase 2 (a triple already present anywhere on the destination
+    // is a skip, whatever namespace it files under).
+    let dst_links: Vec<crate::models::MemoryLink> = match to {
+        Some(to) => match to.list_links(None).await {
+            Ok(rows) => rows,
+            Err(e) => {
+                report
+                    .errors
+                    .push(format!("destination list_links pre-snapshot failed: {e}"));
+                return report;
+            }
+        },
+        None => Vec::new(),
+    };
+    if let Err(cycle) = crate::storage::lineage_import::validate_complete_lineage_dag(
+        dst_links.iter().chain(links.iter()),
+    ) {
+        report
+            .errors
+            .push(format!("final lineage graph invalid: {cycle}"));
+        return report;
+    }
+
     let mut offset: usize = 0;
     loop {
         let filter = Filter {
@@ -245,20 +391,20 @@ pub async fn migrate(
                 return report;
             }
             report.memories_read += 1;
-            if dry_run {
-                // Tally the id so Phase 3 can size the embedding copy.
+            let Some(to) = to else {
+                // Dry run — tally the id so Phase 3 can size the embedding copy.
                 migrated_ids.push(mem.id.clone());
-            } else {
-                match to.store(&ctx, mem).await {
-                    Ok(_) => {
-                        report.memories_written += 1;
-                        // Only a row that actually landed can receive its
-                        // embedding in Phase 3 (a failed write leaves no
-                        // destination row to stamp).
-                        migrated_ids.push(mem.id.clone());
-                    }
-                    Err(e) => report.errors.push(format!("write {} failed: {e}", mem.id)),
+                continue;
+            };
+            match to.store(&ctx, mem).await {
+                Ok(_) => {
+                    report.memories_written += 1;
+                    // Only a row that actually landed can receive its
+                    // embedding in Phase 3 (a failed write leaves no
+                    // destination row to stamp).
+                    migrated_ids.push(mem.id.clone());
                 }
+                Err(e) => report.errors.push(format!("write {} failed: {e}", mem.id)),
             }
         }
         // A short page means the stable-ordered offset walk has reached the
@@ -381,15 +527,7 @@ pub async fn migrate(
                 report.embeddings_unattributed
             );
         }
-        if dry_run {
-            // Size the copy without writing (mirrors the memories/links
-            // dry-run tally). #3085 — an unattributed source vector is NOT
-            // copied, so the dry-run plan must report the same split the live
-            // run produces (`embeddings_unattributed` is already tallied by
-            // the scan above).
-            report.embeddings_copied =
-                source_embedded.saturating_sub(report.embeddings_unattributed);
-        } else {
+        if let Some(to) = to {
             for (space, entries) in &by_space {
                 for chunk in entries.chunks(page_size) {
                     match to.set_embeddings_batch(&ctx, chunk, space).await {
@@ -417,92 +555,85 @@ pub async fn migrate(
                     report.embeddings_copied, report.embeddings_unattributed
                 ));
             }
+        } else {
+            // Size the copy without writing (mirrors the memories/links
+            // dry-run tally). #3085 — an unattributed source vector is NOT
+            // copied, so the dry-run plan must report the same split the live
+            // run produces (`embeddings_unattributed` is already tallied by
+            // the scan above).
+            report.embeddings_copied =
+                source_embedded.saturating_sub(report.embeddings_unattributed);
         }
     }
 
     // ─────────────────────────────────────────────────────────────────
-    // Phase 2 — `memory_links` (v0.7.0 F6 Gap 2).
-    //
-    // After memories land we walk the source's `memory_links` table
-    // and replay each row into the destination. Both adapters'
-    // `link()` impls upsert via `ON CONFLICT DO NOTHING` /
-    // `INSERT OR IGNORE` on the `(source_id, target_id, relation)`
-    // unique key — re-running the migration is idempotent and the
-    // skipped rows surface in `links_skipped` rather than as errors.
-    //
-    // To distinguish "freshly written" from "already there" we
-    // pre-snapshot the destination link set BEFORE the write loop;
-    // any source link whose key was absent from the snapshot AND
-    // whose `link()` call returned Ok is counted as written. Source
-    // links whose key was already present are counted as skipped.
-    // This avoids a per-link RPC for the existence probe and keeps
-    // the total cost at O(|links|).
-    //
-    // The link write goes through the trait's `link()` rather than
-    // `link_signed()` because the source row already carries the
-    // (signature, observed_by, valid_from, valid_until) tuple — and
-    // `MemoryLink`'s round-trip from `list_links()` already preserves
-    // those fields. Re-signing on the destination would be wrong
-    // (we'd be claiming the link as the migration tool's own
-    // attestation rather than the original observer's), so we keep
-    // the rows opaque.
-    //
-    // Dry-run mode skips every write but still tallies `links_read`
-    // so operators can size the migration before committing.
-    // #1876 — unlike `list`, `list_links` is NOT subject to the
-    // `LIST_MAX_LIMIT` clamp on EITHER adapter: both `SqliteStore::list_links`
-    // and `PostgresStore::list_links` issue a single unbounded
-    // `SELECT ... ORDER BY (source_id, target_id, relation)` with no `LIMIT`,
-    // so this call returns the full edge set in one pass. There is no second
-    // silent-truncation path here to paginate; the deterministic key ordering
-    // is documented on both impls as resume-safe should that ever change.
-    let link_filter = namespace_filter.as_deref();
-    let links = match from.list_links(link_filter).await {
-        Ok(rows) => rows,
-        Err(e) => {
-            report.errors.push(format!("source list_links failed: {e}"));
-            return report;
-        }
-    };
+    // Phase 2 — `memory_links` (v0.7.0 F6 Gap 2), AFTER every node landed.
+    phase_links(to, &ctx, &links, &dst_links, &mut report).await;
 
-    // Pre-snapshot the destination so we can attribute writes vs
-    // skips deterministically. An empty destination is the common
-    // case (fresh migrate) and every source link will land in the
-    // `written` bucket.
-    let dst_pre: std::collections::BTreeSet<(String, String, String)> = if dry_run {
-        std::collections::BTreeSet::new()
-    } else {
-        match to.list_links(link_filter).await {
-            Ok(rows) => rows
-                .into_iter()
-                // v0.7.0 fix campaign R1-M4 — relation is now an enum.
-                // Project to its canonical wire string so the BTreeSet
-                // key shape is unchanged from pre-typed-relation.
-                .map(|l| (l.source_id, l.target_id, l.relation.as_str().to_string()))
-                .collect(),
-            Err(e) => {
-                report
-                    .errors
-                    .push(format!("destination list_links pre-snapshot failed: {e}"));
-                return report;
-            }
-        }
-    };
+    report
+}
 
-    for link in &links {
+/// Phase 2 of [`run`] — replay the source's `memory_links` onto the
+/// destination once every node exists there.
+///
+/// Both adapters' link inserts upsert on the `(source_id, target_id,
+/// relation)` unique key (`ON CONFLICT DO NOTHING` / `INSERT OR IGNORE`),
+/// so a re-run is idempotent: a triple already present in the pre-snapshot
+/// `dst_links` is counted in `links_skipped`, a fresh one in `links_written`.
+/// The pre-snapshot replaces a per-link existence RPC and keeps the phase at
+/// O(|links|).
+///
+/// v1.0.0 #3435 — the write goes through
+/// [`MemoryStore::apply_remote_link`], the inbound (federation) funnel, NOT
+/// [`MemoryStore::link`]. Two reasons, both load-bearing:
+///
+/// 1. The inbound funnel BYPASSES the per-write Pass-0 wall-clock lineage
+///    guard (#1859), whose single-clock proof does not hold for edges minted
+///    elsewhere; acyclicity was already asserted structurally over the
+///    COMPLETE final graph in Phase 0, so the import is order-independent
+///    for any valid DAG and every edge either lands or is a REPORTED error.
+/// 2. It persists the source row's `(signature, observed_by, valid_from,
+///    valid_until)` VERBATIM. Re-signing on the destination would claim the
+///    edge as the migration tool's own attestation rather than the original
+///    observer's; the row stays opaque, exactly as a federation receiver
+///    keeps it. The attestation LEVEL is carried when the source read
+///    surfaces it and floors at `unsigned` otherwise — never upgraded.
+///
+/// Under `to == None` (dry run) every link is tallied in `links_read` and
+/// nothing is written.
+async fn phase_links(
+    to: Option<&dyn MemoryStore>,
+    ctx: &CallerContext,
+    links: &[crate::models::MemoryLink],
+    dst_links: &[crate::models::MemoryLink],
+    report: &mut MigrationReport,
+) {
+    // v0.7.0 fix campaign R1-M4 — relation is an enum; project it to its
+    // canonical wire string so the set key shape is stable.
+    let dst_pre: std::collections::BTreeSet<(&str, &str, &str)> = dst_links
+        .iter()
+        .map(|l| {
+            (
+                l.source_id.as_str(),
+                l.target_id.as_str(),
+                l.relation.as_str(),
+            )
+        })
+        .collect();
+    let unsigned = crate::models::AttestLevel::Unsigned.as_str();
+    for link in links {
         report.links_read += 1;
-        if dry_run {
+        let Some(to) = to else {
             continue;
-        }
+        };
         let key = (
-            link.source_id.clone(),
-            link.target_id.clone(),
-            // v0.7.0 fix campaign R1-M4 — relation is `Copy`; project
-            // to its canonical wire string for the BTreeSet lookup.
-            link.relation.as_str().to_string(),
+            link.source_id.as_str(),
+            link.target_id.as_str(),
+            link.relation.as_str(),
         );
         let already_present = dst_pre.contains(&key);
-        match to.link(&ctx, link).await {
+        let attest_level = link.attest_level.as_deref().unwrap_or(unsigned);
+        match to.apply_remote_link(ctx, link, attest_level).await {
             Ok(()) => {
                 if already_present {
                     report.links_skipped += 1;
@@ -518,8 +649,6 @@ pub async fn migrate(
             }
         }
     }
-
-    report
 }
 
 #[cfg(test)]
@@ -1020,7 +1149,8 @@ mod tests {
             Err(e) => {
                 let msg = format!("{e:#}");
                 assert!(
-                    msg.contains("connect postgres adapter") || msg.contains("postgres"),
+                    msg.contains(crate::store::postgres::CTX_CONNECT_POSTGRES_ADAPTER)
+                        || msg.contains("postgres"),
                     "got: {msg}"
                 );
             }
@@ -1219,8 +1349,10 @@ mod tests {
         };
         let dst = SqliteStore::open(dst_tmp.path()).unwrap();
         let r = migrate(&src, &dst, 10, None, false).await;
-        // The memory phase succeeds; the link phase errors and returns.
-        assert_eq!(r.memories_written, 1);
+        // #3435 — the edge set is read in Phase 0, BEFORE any memory is
+        // written (the final-graph verdict needs it), so a source that
+        // cannot enumerate its links refuses with NOTHING written.
+        assert_eq!(r.memories_written, 0);
         assert!(
             r.errors
                 .iter()
@@ -1249,9 +1381,10 @@ mod tests {
             fail_list_links: std::sync::atomic::AtomicBool::new(true),
         };
         let r = migrate(&src_inner, &dst, 10, None, false).await;
-        // Memory phase succeeds, dst pre-snapshot fails, the verb
-        // returns early with the error logged.
-        assert!(r.memories_written >= 1);
+        // #3435 — the destination pre-snapshot is taken in Phase 0 (it is
+        // half of the final-graph verdict), so its failure refuses the
+        // migration BEFORE the memory phase: nothing is written.
+        assert_eq!(r.memories_written, 0);
         assert!(
             r.errors
                 .iter()
@@ -1321,5 +1454,136 @@ mod tests {
         assert_eq!(r.memories_written, 2);
         // Link is in the filtered namespace, so it should make it across.
         assert!(r.links_read >= 1);
+    }
+
+    /// v1.0.0 #3435 — `open_source_store` never creates: a missing sqlite
+    /// source is the typed refusal and the path stays absent.
+    #[tokio::test]
+    async fn open_source_store_refuses_missing_sqlite_without_creating_it_3435() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing-source.db");
+        let url = format!("sqlite://{}", missing.display());
+        let err = match open_source_store(&url).await {
+            Ok(_) => panic!("a missing source must be refused"),
+            Err(err) => err,
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(crate::storage::MISSING_DATABASE_REFUSAL),
+            "must be the typed read-only refusal: {msg}"
+        );
+        assert!(!missing.exists(), "the probe must not create the file");
+        // The scheme check still applies.
+        let err = open_source_store("nosql://x")
+            .await
+            .err()
+            .expect("bad scheme");
+        assert!(err.to_string().contains("unrecognised store URL"));
+    }
+
+    /// v1.0.0 #3435 — the read-only source funnel opens an EXISTING store
+    /// and serves every read the migration needs (`list`, `list_links`,
+    /// `get_embedding_with_space`) — a stray write would surface as an error
+    /// under `PRAGMA query_only`, so a clean plan proves the phase is pure.
+    #[tokio::test]
+    async fn plan_reads_a_read_only_source_and_needs_no_destination_3435() {
+        let src_tmp = tempfile::NamedTempFile::new().unwrap();
+        {
+            let writer = SqliteStore::open(src_tmp.path()).unwrap();
+            let ctx = CallerContext::for_agent("ai:seed");
+            for i in 0..3 {
+                writer
+                    .store(
+                        &ctx,
+                        &sample_memory(&format!("P{i}"), "ns", &format!("title {i}")),
+                    )
+                    .await
+                    .unwrap();
+            }
+            writer
+                .link(
+                    &ctx,
+                    &sample_link("P0", "P1", MemoryLinkRelation::RelatedTo),
+                )
+                .await
+                .unwrap();
+        }
+        let url = format!("sqlite://{}", src_tmp.path().display());
+        let src = open_source_store(&url)
+            .await
+            .expect("open read-only source");
+        let r = plan(src.as_ref(), 10, None).await;
+        assert!(r.errors.is_empty(), "errors: {:?}", r.errors);
+        assert!(r.dry_run);
+        assert_eq!(r.memories_read, 3);
+        assert_eq!(r.memories_written, 0);
+        assert_eq!(r.links_read, 1);
+        assert_eq!(r.links_written, 0);
+        // `migrate(.., dry_run = true)` is the same plan — its `to` is
+        // never consulted.
+        let dst_tmp = tempfile::NamedTempFile::new().unwrap();
+        let dst = SqliteStore::open(dst_tmp.path()).unwrap();
+        let via_migrate = migrate(src.as_ref(), &dst, 10, None, true).await;
+        assert_eq!(via_migrate.memories_read, r.memories_read);
+        assert_eq!(via_migrate.links_read, r.links_read);
+        assert!(dst.list_links(None).await.unwrap().is_empty());
+    }
+
+    /// v1.0.0 #3435 — a genuine provenance cycle in the source refuses the
+    /// WHOLE migration with the named error, before a single row lands.
+    #[tokio::test]
+    async fn migrate_refuses_source_lineage_cycle_before_writing_3435() {
+        let src_tmp = tempfile::NamedTempFile::new().unwrap();
+        let dst_tmp = tempfile::NamedTempFile::new().unwrap();
+        let src = SqliteStore::open(src_tmp.path()).unwrap();
+        let dst = SqliteStore::open(dst_tmp.path()).unwrap();
+        let ctx = CallerContext::for_agent("ai:seed");
+        for id in ["C0", "C1", "C2"] {
+            src.store(&ctx, &sample_memory(id, "ns", &format!("title {id}")))
+                .await
+                .unwrap();
+        }
+        // The inbound funnel bypasses the per-write wall-clock guard, which
+        // is exactly how a cycle assembled across nodes reaches a store.
+        let unsigned = crate::models::AttestLevel::Unsigned.as_str();
+        for (a, b) in [("C0", "C1"), ("C1", "C2"), ("C2", "C0")] {
+            src.apply_remote_link(
+                &ctx,
+                &sample_link(a, b, MemoryLinkRelation::DerivedFrom),
+                unsigned,
+            )
+            .await
+            .unwrap();
+        }
+        let r = migrate(&src, &dst, 10, None, false).await;
+        assert_eq!(r.errors.len(), 1, "errors: {:?}", r.errors);
+        assert!(
+            r.errors[0].contains("final lineage graph invalid")
+                && r.errors[0].contains(crate::storage::LINK_CYCLE_ERR_PREFIX),
+            "named error expected: {}",
+            r.errors[0]
+        );
+        assert_eq!(r.memories_read, 0);
+        assert_eq!(r.memories_written, 0);
+        assert_eq!(r.links_written, 0);
+        let dst_ctx = CallerContext::for_admin(crate::identity::sentinels::AI_MIGRATE);
+        assert!(
+            dst.list(&dst_ctx, &Filter::default())
+                .await
+                .unwrap()
+                .is_empty(),
+            "nothing may be written to the destination"
+        );
+        assert!(dst.list_links(None).await.unwrap().is_empty());
+        // The dry-run plan reports the same verdict.
+        let planned = plan(&src, 10, None).await;
+        assert!(
+            planned
+                .errors
+                .iter()
+                .any(|e| e.contains("final lineage graph invalid")),
+            "{:?}",
+            planned.errors
+        );
     }
 }

@@ -809,6 +809,23 @@ pub async fn bulk_create(
     headers: HeaderMap,
     Json(bodies): Json<Vec<CreateMemory>>,
 ) -> impl IntoResponse {
+    let response = bulk_create_write(State(app.clone()), headers, Json(bodies))
+        .await
+        .into_response();
+    super::write_receipt::complete(
+        &app,
+        response,
+        super::write_receipt::WriterConnection::Legacy,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_lines)]
+async fn bulk_create_write(
+    State(app): State<AppState>,
+    headers: HeaderMap,
+    Json(bodies): Json<Vec<CreateMemory>>,
+) -> impl IntoResponse {
     if bodies.len() > app.max_page_size {
         return (
             StatusCode::BAD_REQUEST,
@@ -960,7 +977,21 @@ pub async fn bulk_create(
             continue;
         }
         if let Err(e) = validate::RequestValidator::validate_create(body) {
-            ledger.reject(index, &e.field, &e.to_string());
+            // #3427 — a `validate_create` failure IS a validation failure by
+            // construction: classify it as VALIDATION_FAILED (400) instead of
+            // text-matching the message (an `invalid kind '…'` refusal used
+            // to fall through to INTERNAL_ERROR).
+            ledger.reject_class(
+                index,
+                &e.field,
+                crate::handlers::errors::BulkRowErrorClass {
+                    code: crate::errors::error_codes::VALIDATION_FAILED,
+                    label: crate::handlers::errors::VALIDATION_FAILED_LABEL,
+                    status: StatusCode::BAD_REQUEST,
+                    retryable: false,
+                },
+                &e.to_string(),
+            );
             continue;
         }
         // #2725 (CB-23) — parse the per-row `on_conflict` disposition up front,
@@ -971,7 +1002,19 @@ pub async fn bulk_create(
             match OnConflictMode::parse(body.on_conflict.as_deref().unwrap_or("error")) {
                 Ok(m) => m,
                 Err(msg) => {
-                    ledger.reject(index, ON_CONFLICT, &msg);
+                    // #3427 — an unknown `on_conflict` token is a validation
+                    // failure, never an internal error.
+                    ledger.reject_class(
+                        index,
+                        ON_CONFLICT,
+                        crate::handlers::errors::BulkRowErrorClass {
+                            code: crate::errors::error_codes::VALIDATION_FAILED,
+                            label: crate::handlers::errors::VALIDATION_FAILED_LABEL,
+                            status: StatusCode::BAD_REQUEST,
+                            retryable: false,
+                        },
+                        &msg,
+                    );
                     continue;
                 }
             };
@@ -1085,10 +1128,16 @@ async fn bulk_create_sqlite(
             }
             let key = (row.mem.title.clone(), row.mem.namespace.clone());
             if let std::collections::hash_map::Entry::Vacant(slot) = pre_existing.entry(key) {
-                let existing =
-                    db::find_by_title_namespace(&lock.0, &row.mem.title, &row.mem.namespace)
-                        .ok()
-                        .flatten();
+                // #3696 — as the bulk caller: an occupant it cannot read is
+                // never named (the write's admission refuses it unnamed).
+                let existing = db::find_by_title_namespace(
+                    &lock.0,
+                    &row.mem.title,
+                    &row.mem.namespace,
+                    Some(caller).filter(|c| !c.is_empty()),
+                )
+                .ok()
+                .flatten();
                 slot.insert(existing);
             }
         }
@@ -1289,10 +1338,11 @@ async fn bulk_create_sqlite(
             let key = (row.mem.title.clone(), row.mem.namespace.clone());
             let fail_closed =
                 row.on_conflict == OnConflictMode::Error && !landed_this_batch.contains(&key);
+            let bulk_viewer = Some(caller).filter(|c| !c.is_empty());
             let insert_result = if fail_closed {
-                db::insert_no_overwrite(&lock.0, &row.mem)
+                db::insert_no_overwrite_as(&lock.0, &row.mem, bulk_viewer)
             } else {
-                db::insert(&lock.0, &row.mem)
+                db::insert_as(&lock.0, &row.mem, bulk_viewer)
             };
             match insert_result {
                 Ok(returned_id) => {
@@ -1482,7 +1532,11 @@ async fn bulk_create_postgres(
             OnConflictMode::Error => {
                 match app
                     .store
-                    .find_by_title_namespace(&row.mem.title, &row.mem.namespace)
+                    .find_by_title_namespace(
+                        &row.mem.title,
+                        &row.mem.namespace,
+                        Some(caller).filter(|c| !c.is_empty()),
+                    )
                     .await
                 {
                     Ok(Some(existing_id)) => {

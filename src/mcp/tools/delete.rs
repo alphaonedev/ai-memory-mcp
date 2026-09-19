@@ -50,7 +50,9 @@ impl McpTool for DeleteTool {
     fn docs() -> &'static str {
         "Hard-delete by id (removes row, embedding, FTS, links). Use memory_forget for bulk \
          pattern delete (archives first). #3171: `id` also accepts a UNIQUE ID PREFIX on this \
-         IRREVERSIBLE delete — pass the full id unless you intend prefix resolution."
+         IRREVERSIBLE delete — pass the full id unless you intend prefix resolution. #3730: a \
+         message in the caller's inbox (_inbox/<agent>) is ARCHIVED instead (restorable via \
+         memory_archive_restore); the response says which: `archived: true|false`."
     }
     fn input_schema() -> Value {
         crate::mcp::registry::input_schema_for::<DeleteRequest>()
@@ -119,14 +121,17 @@ pub(super) fn handle_delete(
         "allow",
         crate::mcp::registry::tool_names::MEMORY_DELETE,
         "",
-        json!({ "id": id }),
+        crate::governance::audit::ForensicPayload::new().ident("id", id),
     );
 
     // Resolve the memory first so governance has owner context.
-    let target = if let Some(m) = db::get(conn, id).map_err(|e| e.to_string())? {
+    let target = if let Some(m) =
+        db::get(conn, id).map_err(|e| crate::mcp::error_text::mcp_foreign_err("get", e))?
+    {
         Some(m)
     } else {
-        db::get_by_prefix(conn, id).map_err(|e| e.to_string())?
+        db::get_by_prefix(conn, id)
+            .map_err(|e| crate::mcp::error_text::mcp_foreign_err("get", e))?
     };
     let Some(target) = target else {
         return Err(crate::errors::msg::MEMORY_NOT_FOUND.into());
@@ -232,7 +237,7 @@ pub(super) fn handle_delete(
             &payload,
             capability.as_ref(),
         )
-        .map_err(|e| e.to_string())?
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("as_ref", e))?
         {
             GovernanceDecision::Allow => {}
             GovernanceDecision::Deny(refusal) => {
@@ -264,15 +269,39 @@ pub(super) fn handle_delete(
     // fires ONLY when `AI_MEMORY_AGENT_ID` is set (the multi-tenant opt-in),
     // matching the read-path ownership posture (#1468/#1720 B1) so the
     // single-operator trust-all default is byte-unchanged. Lenient (unstamped /
-    // self-owned / daemon / inbox-target pass); `allow_inbox = true` mirrors the
-    // HTTP delete-side gate.
+    // self-owned / daemon / inbox-target pass). #3730 — the inbox-target
+    // admission is DERIVED from the namespace: the recipient is admitted only
+    // for a row `inbox_delete_retains` archives on delete (the disposition
+    // below), never for one it would erase — a bare `true` here let a
+    // non-owner erase any row addressed to it outside an inbox namespace
+    // (pinned by recipient_gate_derived_from_namespace_3730). Mirrors the HTTP
+    // delete-side gate and both SAL stores.
     if let Some(caller) = crate::identity::resolve_read_visibility_caller() {
-        if !crate::visibility::caller_owns_for_mutation(&target, &caller, true) {
+        if !crate::visibility::caller_owns_for_mutation(
+            &target,
+            &caller,
+            crate::visibility::inbox_delete_retains(&target.namespace),
+            crate::identity::owner_stamp::MutationSite::sqlite(
+                crate::identity::owner_stamp::funnel::DELETE,
+            ),
+        ) {
             return Err(crate::errors::msg::CALLER_DOES_NOT_OWN_MEMORY.into());
         }
     }
 
-    let deleted = db::delete(conn, &target.id).map_err(|e| e.to_string())?;
+    // #3730 — retention policy by namespace (`inbox_delete_retains`): a
+    // message in the recipient's inbox is ARCHIVED (restorable, listed by
+    // memory_archive_list), every other row is erased as before. The
+    // disposition is reported on the wire (`archived`) so a caller never has
+    // to consult documentation to know whether its data still exists.
+    let archived = crate::visibility::inbox_delete_retains(&target.namespace);
+    let deleted = if archived {
+        db::delete_archive_first(conn, &target.id)
+            .map_err(|e| crate::mcp::error_text::mcp_foreign_err("delete_archive_first", e))?
+    } else {
+        db::delete(conn, &target.id)
+            .map_err(|e| crate::mcp::error_text::mcp_foreign_err("delete_archive_first", e))?
+    };
     if deleted {
         // v1.0.0 #2446 — queue the erasure for federated fan-out. The MCP
         // surface never constructs a `FederationConfig` (it is HTTP-`serve`
@@ -323,7 +352,7 @@ pub(super) fn handle_delete(
                 tier: snapshot_tier,
             },
         );
-        Ok(json!({"deleted": true}))
+        Ok(json!({"deleted": true, "archived": archived}))
     } else {
         Err(crate::errors::msg::MEMORY_NOT_FOUND.into())
     }

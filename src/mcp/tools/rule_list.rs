@@ -81,7 +81,7 @@ pub fn handle_rule_list(conn: &rusqlite::Connection, arguments: &Value) -> Resul
     let rules: Vec<Rule> = if let Some(kind) = kind_filter {
         if enabled_only {
             rules_store::list_enabled_by_kind(conn, kind)
-                .map_err(|e| e.to_string())?
+                .map_err(|e| crate::mcp::error_text::mcp_foreign_err("list_enabled_by_kind", e))?
                 .into_iter()
                 .filter(|r| rules_store::enforced_rule_passes(r, operator_pubkey.as_ref()))
                 .collect()
@@ -91,19 +91,19 @@ pub fn handle_rule_list(conn: &rusqlite::Connection, arguments: &Value) -> Resul
             // governance_rules table is operator-scale (typical
             // deployment <100 rows) so the scan is fine.
             rules_store::list(conn)
-                .map_err(|e| e.to_string())?
+                .map_err(|e| crate::mcp::error_text::mcp_foreign_err("list", e))?
                 .into_iter()
                 .filter(|r| r.kind == kind)
                 .collect()
         }
     } else if enabled_only {
         rules_store::list(conn)
-            .map_err(|e| e.to_string())?
+            .map_err(|e| crate::mcp::error_text::mcp_foreign_err("list", e))?
             .into_iter()
             .filter(|r| r.enabled && rules_store::enforced_rule_passes(r, operator_pubkey.as_ref()))
             .collect()
     } else {
-        rules_store::list(conn).map_err(|e| e.to_string())?
+        rules_store::list(conn).map_err(|e| crate::mcp::error_text::mcp_foreign_err("list", e))?
     };
 
     let mut out = Vec::with_capacity(rules.len());

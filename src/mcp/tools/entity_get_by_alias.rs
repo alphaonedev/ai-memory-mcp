@@ -76,7 +76,9 @@ pub fn handle_entity_get_by_alias(
             Ok(None) | Err(_) => false,
         }
     };
-    match db::entity_get_by_alias(conn, alias, namespace).map_err(|e| e.to_string())? {
+    match db::entity_get_by_alias(conn, alias, namespace)
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("entity_get_by_alias", e))?
+    {
         Some(rec) if backing_row_readable(&rec.entity_id) => Ok(json!({
             "found": true,
             "entity_id": rec.entity_id,

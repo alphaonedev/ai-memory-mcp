@@ -113,7 +113,7 @@ min_line_coverage = 90.0
 "cli/backup.rs"            = 89    # tier B, measured 89.96 (2026-08-23 #3136 Fable-gate: consent-first RW probe, #2445 assert_schema_not_ahead, remove_stale_sidecars helper + pins). Was 90 / 95.74; four CI cycles of tests lifted 89.11 → 89.96, still 0.04 below 90 — floor follows the measurement, not a silent tighten. PRIOR: 90 measured 95.74.
 "cli/boot.rs"              = 90    # tier B, measured 97.90
 "cli/capability.rs"        = 80    # tier B, NEW MODULE (2026-07-02, #1827 G10.1): capability keygen/mint/attenuate/inspect/verify CLI; 6 in-file behavioural tests cover every verb happy-path + the mandatory-expiry lint / overwrite-refusal / malformed-token / unknown-issuer error arms. Conservative floor pending first CI measurement; ratchet up after.
-"cli/commands/atomise.rs"  = 90    # tier B, measured 89.03 (2026-05-19 cov-baseline @ 407a56744); 2026-05-19 coverage-uplift campaign added 3 tests (signer/db error messages, keyword tier short-circuit) — NEW MODULE
+"cli/commands/atomise.rs"  = 90    # tier B, measured 89.03 (2026-05-19 cov-baseline @ 407a56744); 2026-05-19 coverage-uplift campaign added 3 tests (signer/db error messages, keyword tier short-circuit). #3458 the e35ce473 batch left the live `atomise` verb's `run_with_curator` body uncovered — measured 88.33% (439/497) @ 8b4f65a2261477 — and #3458 added 4 `run_with_curator` tests (success + json + NotFound + DbError arms via the curator_override seam), re-measured 93.43% (640/685) on the same tree + these tests via `cargo llvm-cov --features sal,sal-postgres --lib` + drivers. Floor 90 held — now a MEASUREMENT, not a forecast.
 "cli/commands/skill.rs"    = 90    # tier B, measured 80.90 (2026-05-19 cov-baseline @ 407a56744); 2026-05-19 coverage-uplift campaign added 9 tests (non-JSON human-render paths, error-exit paths, manifest-file normalisation) — expected lift to ~92%, floor pending re-measurement — NEW MODULE
 "cli/consolidate.rs"       = 90    # tier B, measured 98.33
 "cli/crud.rs"              = 90    # tier B, measured 97.25
@@ -123,7 +123,7 @@ min_line_coverage = 90.0
 "cli/forget.rs"            = 90    # tier B, measured 99.55
 "cli/gc.rs"                = 90    # tier B, measured 98.86
 "cli/governance.rs"        = 90    # tier B, measured 97.64
-"cli/governance_install_defaults.rs" = 90    # tier B, measured 80.75 (2026-05-19 cov-baseline @ 407a56744); 2026-05-19 coverage-uplift campaign added 6 tests (render_preview branches, load_seed_row contract, open-db error) — expected lift to ~92%, floor pending re-measurement — NEW MODULE
+"cli/governance_install_defaults.rs" = 90    # tier B, measured 80.75 (2026-05-19 cov-baseline @ 407a56744); 2026-05-19 coverage-uplift campaign added 6 tests (render_preview branches, load_seed_row contract, open-db error) — expected lift to ~92%. #3458 RE-MEASURED 2026-09-14 @ 8b4f65a2261477 = 91.55% (542/592) via `cargo llvm-cov --features sal,sal-postgres --lib` + the module's drivers: the forecast lift landed (forecast ~92%, actual 91.55%). Floor 90 held — this floor is now a MEASUREMENT, not a forecast.
 "cli/governance_migrate.rs"= 90    # tier B, measured 97.07
 "cli/helpers.rs"           = 90    # tier B, measured 95.78 (C-3 #699 uplift; was 92.13 at L0.7-7)
 "cli/identity.rs"          = 90    # tier B, measured 98.38

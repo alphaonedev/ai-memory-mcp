@@ -939,4 +939,272 @@ mod tests {
         assert_eq!(v["atom_ids"][0], "a1");
         assert_eq!(v["archived_at"], "2026-05-14T00:00:00Z");
     }
+
+    // -----------------------------------------------------------------
+    // v1.0.0 #3458 — end-to-end `run_with_curator` coverage.
+    //
+    // Prior to these tests the CLI `atomise` verb's live entry point was
+    // exercised ONLY by `run_wrapper_delegates_..._keyword_tier_short_circuits`
+    // above, which returns at the tier gate before opening a DB or
+    // building a curator. The whole non-keyword body — the
+    // `curator_override` Some branch, the best-effort keypair load, the
+    // `atomise_sync` Ok arm feeding `emit_success`, and the `db::open` /
+    // `atomise_sync` Err arms feeding `emit_error` — was uncovered,
+    // which is the residual the e35ce473 batch left below the 90 floor.
+    // The `curator_override` test seam lets these run with a
+    // deterministic mock and no live LLM (the same seam the integration
+    // suite uses), so the coverage lands without a network dependency.
+    // -----------------------------------------------------------------
+
+    /// A deterministic curator that decomposes any input into two fixed
+    /// atoms — the CLI-side analogue of the integration suite's
+    /// `StatelessTwoAtomCurator`.
+    struct TwoAtomMock;
+    impl Curator for TwoAtomMock {
+        fn decompose(
+            &self,
+            _body: &str,
+            _max_atom_tokens: u32,
+            _max_retries: u32,
+        ) -> std::result::Result<
+            Vec<crate::atomisation::curator::Atom>,
+            crate::atomisation::curator::CuratorError,
+        > {
+            Ok(vec![
+                crate::atomisation::curator::Atom {
+                    text: "Deployments must pass health checks before promotion.".to_string(),
+                },
+                crate::atomisation::curator::Atom {
+                    text: "A failed canary rolls back within thirty seconds.".to_string(),
+                },
+            ])
+        }
+    }
+
+    /// A curator that MUST NOT be reached — the error-path tests bail
+    /// before decomposition, so a call here is a test-contract breach.
+    struct NeverCalledMock;
+    impl Curator for NeverCalledMock {
+        fn decompose(
+            &self,
+            _body: &str,
+            _max_atom_tokens: u32,
+            _max_retries: u32,
+        ) -> std::result::Result<
+            Vec<crate::atomisation::curator::Atom>,
+            crate::atomisation::curator::CuratorError,
+        > {
+            panic!("#3458: curator must not be called on an error path");
+        }
+    }
+
+    fn seed_source_memory(db_path: &std::path::Path, source_id: &str) {
+        let conn = crate::db::open(db_path).expect("open + init schema");
+        let mem = crate::models::Memory {
+            id: source_id.to_string(),
+            tier: crate::models::Tier::Long,
+            namespace: "atomise-cli-3458".to_string(),
+            title: format!("atomise-cli-source-{source_id}"),
+            // Body must exceed `max_atom_tokens` (20 below) or the
+            // substrate short-circuits with "already at or under
+            // --max-atom-tokens. No atomisation needed." — the source is
+            // deliberately several sentences so it clears that gate and
+            // reaches the (mock) curator.
+            content: "First, every deployment must pass its full health-check suite before it \
+                      is promoted to the production fleet. Second, a canary that fails any check \
+                      is rolled back automatically within thirty seconds of the failure being \
+                      observed. Third, the rollback restores the prior known-good revision and \
+                      re-runs the same health checks against it before traffic resumes. Fourth, \
+                      the operator is paged with the failing check, the revision, and the \
+                      rollback outcome so the incident is fully attributable after the fact."
+                .to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            metadata: serde_json::json!({ "agent_id": "ai:test-3458" }),
+            ..Default::default()
+        };
+        crate::db::insert(&conn, &mem).expect("seed source memory");
+    }
+
+    fn smart_cfg() -> AppConfig {
+        let mut cfg = AppConfig::default();
+        cfg.tier = Some("smart".to_string());
+        cfg
+    }
+
+    /// SUCCESS: a seeded source + an injected mock curator drives the
+    /// full happy path — `curator_override` Some branch, keypair load,
+    /// `atomise_sync` Ok, and the human `emit_success` summary — and
+    /// returns exit code 0.
+    #[test]
+    fn run_with_curator_success_path_atomises_and_emits_3458() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("atomise-success.db");
+        let source_id = uuid::Uuid::new_v4().to_string();
+        seed_source_memory(&db_path, &source_id);
+
+        let cfg = smart_cfg();
+        let args = AtomiseArgs {
+            memory_id: source_id.clone(),
+            max_atom_tokens: 20,
+            force: false,
+            json: false,
+            quiet: false,
+        };
+        let mut stdout = Vec::<u8>::new();
+        let mut stderr = Vec::<u8>::new();
+        let mut out = CliOutput {
+            stdout: &mut stdout,
+            stderr: &mut stderr,
+        };
+        let code = run_with_curator(
+            &db_path,
+            &args,
+            &cfg,
+            Some("ai:test-3458"),
+            &mut out,
+            Some(Box::new(TwoAtomMock)),
+        )
+        .expect("run_with_curator success path returns Ok");
+        assert_eq!(
+            code,
+            0,
+            "#3458: success exit code is 0; stderr={}",
+            String::from_utf8_lossy(&stderr)
+        );
+        let s = String::from_utf8(stdout).unwrap();
+        assert!(
+            s.contains("Atomised memory") && s.contains(&source_id),
+            "#3458: emit_success human summary names the source; got: {s}"
+        );
+    }
+
+    /// SUCCESS (JSON): same happy path with `--json`, covering the JSON
+    /// arm of `emit_success` through the live verb rather than the
+    /// direct `emit_success` unit test above.
+    #[test]
+    fn run_with_curator_success_json_envelope_3458() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("atomise-success-json.db");
+        let source_id = uuid::Uuid::new_v4().to_string();
+        seed_source_memory(&db_path, &source_id);
+
+        let cfg = smart_cfg();
+        let args = AtomiseArgs {
+            memory_id: source_id.clone(),
+            max_atom_tokens: 20,
+            force: false,
+            json: true,
+            quiet: false,
+        };
+        let mut stdout = Vec::<u8>::new();
+        let mut stderr = Vec::<u8>::new();
+        let mut out = CliOutput {
+            stdout: &mut stdout,
+            stderr: &mut stderr,
+        };
+        let code = run_with_curator(
+            &db_path,
+            &args,
+            &cfg,
+            Some("ai:test-3458"),
+            &mut out,
+            Some(Box::new(TwoAtomMock)),
+        )
+        .expect("run_with_curator json success returns Ok");
+        assert_eq!(code, 0);
+        let s = String::from_utf8(stdout).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(s.trim()).expect("#3458: success envelope is JSON");
+        assert_eq!(v["source_id"], source_id);
+        assert_eq!(v["atom_count"], 2);
+    }
+
+    /// ERROR: a valid smart-tier config + injected curator, but the
+    /// named source does not exist, so `atomise_sync` returns `NotFound`
+    /// and the verb routes through `emit_error` with the NotFound exit
+    /// code. The curator is never reached.
+    #[test]
+    fn run_with_curator_missing_source_maps_to_notfound_3458() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("atomise-missing.db");
+        // Initialise the schema but seed NO source row.
+        drop(crate::db::open(&db_path).expect("open + init schema"));
+
+        let cfg = smart_cfg();
+        let args = AtomiseArgs {
+            memory_id: uuid::Uuid::new_v4().to_string(),
+            max_atom_tokens: 100,
+            force: false,
+            json: false,
+            quiet: false,
+        };
+        let mut stdout = Vec::<u8>::new();
+        let mut stderr = Vec::<u8>::new();
+        let mut out = CliOutput {
+            stdout: &mut stdout,
+            stderr: &mut stderr,
+        };
+        let code = run_with_curator(
+            &db_path,
+            &args,
+            &cfg,
+            Some("ai:test-3458"),
+            &mut out,
+            Some(Box::new(NeverCalledMock)),
+        )
+        .expect("run_with_curator returns Ok even on an atomise NotFound");
+        assert_eq!(
+            code,
+            exit_code(&AtomiseError::NotFound),
+            "#3458: a missing source maps to the NotFound exit code"
+        );
+        assert!(
+            !String::from_utf8(stderr).unwrap().is_empty(),
+            "#3458: the refusal is written to stderr"
+        );
+    }
+
+    /// ERROR: the DB cannot be opened (its parent directory does not
+    /// exist), so the verb routes through the `db::open` Err arm into
+    /// `emit_error` with the DbError exit code, before any curator work.
+    #[test]
+    fn run_with_curator_unopenable_db_maps_to_db_error_3458() {
+        let dir = tempfile::tempdir().unwrap();
+        // Parent subdir is absent, so sqlite cannot create the file.
+        let db_path = dir.path().join("missing-parent").join("x.db");
+
+        let cfg = smart_cfg();
+        let args = AtomiseArgs {
+            memory_id: "src-id".to_string(),
+            max_atom_tokens: 100,
+            force: false,
+            json: false,
+            quiet: false,
+        };
+        let mut stdout = Vec::<u8>::new();
+        let mut stderr = Vec::<u8>::new();
+        let mut out = CliOutput {
+            stdout: &mut stdout,
+            stderr: &mut stderr,
+        };
+        let code = run_with_curator(
+            &db_path,
+            &args,
+            &cfg,
+            Some("ai:test-3458"),
+            &mut out,
+            Some(Box::new(NeverCalledMock)),
+        )
+        .expect("run_with_curator returns Ok even on a db-open failure");
+        assert_eq!(
+            code,
+            exit_code(&AtomiseError::DbError(String::new())),
+            "#3458: an unopenable db maps to the DbError exit code"
+        );
+        assert!(
+            !String::from_utf8(stderr).unwrap().is_empty(),
+            "#3458: the db-open failure is reported on stderr"
+        );
+    }
 }

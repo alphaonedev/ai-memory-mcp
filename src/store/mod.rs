@@ -62,6 +62,11 @@ pub mod postgres;
 #[cfg(feature = "sal-postgres")]
 pub(crate) mod postgres_parity;
 
+/// v1.0.0 #3288 — postgres half of the bounded, keyset-paged admin export,
+/// hosted beside `postgres` for the same QUAL-10 reason as `postgres_parity`.
+#[cfg(feature = "sal-postgres")]
+pub(crate) mod postgres_export_page;
+
 /// v1.0.0 #3525 — the probe ladder for the migration advisory lock, hosted
 /// beside `postgres` (which is at its QUAL-10 size ceiling) so the wait
 /// schedule #3519 introduced is testable as data rather than as literals
@@ -1164,28 +1169,6 @@ pub struct Filter {
     /// / `search`. Existing `..Default::default()` call sites are
     /// byte-identical.
     pub skip_access_ledger: bool,
-    /// v1.0.0 #3463 — narrow `list` to UNREAD rows only (`access_count == 0`,
-    /// the #3027 unread marker), pushed into SQL by BOTH adapters so the
-    /// narrowing happens BEFORE the `LIMIT`.
-    ///
-    /// The inbox surfaces previously fetched the newest `limit` rows and then
-    /// dropped the read ones in Rust. If those newest rows were all read, an
-    /// agent holding OLDER unread messages was told it had none — a silent
-    /// false negative, and an unsound foundation for any wake-then-read-once
-    /// push design. Applying the predicate in the query makes the returned
-    /// window the unread window on both backends.
-    ///
-    /// Default `false` (`#[derive(Default)]`): every existing
-    /// `..Default::default()` call site is byte-identical, and the emitted SQL
-    /// for `false` is unchanged (so cached plans are untouched). Honoured by
-    /// `list` on both adapters; ignored by `search` / `recall_hybrid`.
-    ///
-    /// Both adapters additionally re-apply the marker in-process on the rows
-    /// they return (the fail-closed re-check the [`MetadataEq`] axis
-    /// documents), so a hypothetical drift between the SQL fragment and the
-    /// canonical Rust predicate can only ever NARROW the result, never widen
-    /// it.
-    pub unread_only: bool,
 }
 
 impl Filter {
@@ -1229,6 +1212,16 @@ pub trait MemoryStore: Send + Sync {
     /// Capability bits advertised by this adapter. Stable across the
     /// process lifetime.
     fn capabilities(&self) -> Capabilities;
+
+    /// Observe the active writer's commit durability for a receipt (#3555).
+    ///
+    /// # Errors
+    /// Unsupported adapters fail closed; concrete adapters propagate observation errors.
+    async fn write_durability(&self) -> StoreResult<crate::write_receipt::WriteDurability> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "write_durability".to_owned(),
+        })
+    }
 
     /// v0.7.0.1 S75 — return the highest applied DB schema-migration
     /// version (the integer recorded in `schema_version.MAX(version)`)
@@ -1586,13 +1579,19 @@ pub trait MemoryStore: Send + Sync {
     /// namespace BEFORE enabling `scope=private` visibility filtering
     /// (avoiding a self-lockout from legacy / foreign-owned rows).
     ///
-    /// Default rewrites every OWNED row (any present `agent_id`);
-    /// `claim_unowned` additionally covers rows with a NULL/empty
-    /// `agent_id`. `dry_run` counts the matched rows and writes nothing.
-    /// Only the single `agent_id` metadata key is rewritten — every
-    /// other key is preserved and the `agent_id_idx` generated column
-    /// re-projects the new owner (no schema change). `to_id` is
-    /// validated; a malformed owner is rejected before any write.
+    /// `namespace = None` sweeps every namespace (`--all-namespaces`,
+    /// #3124 R4). `select` ([`crate::storage::ReownSelect`]) names the rows
+    /// in scope: `Owned` (default) rewrites rows with a present `agent_id`,
+    /// `OnlyUnowned` ONLY unstamped rows (never an owned one), `All` every
+    /// row. `dry_run` counts the matched rows and writes nothing. Only the
+    /// single `agent_id` metadata key is rewritten — every other key is
+    /// preserved and the `agent_id_idx` generated column re-projects the new
+    /// owner. #3124 R4: rewritten rows get `version + 1` and a fresh
+    /// `updated_at`, and ONE `memory.reowned` signed-chain row attributed to
+    /// `ctx.agent_id` is appended in the same transaction; the write is
+    /// refused under record-stop. `to_id` is validated; a malformed owner is
+    /// rejected before any write. Operator-only: callers pass an admin
+    /// context (the CLI verb is the only surface).
     ///
     /// Mirrors [`crate::storage::reown`] on the SQLite path. Default
     /// returns `UnsupportedCapability` so an in-memory/test adapter
@@ -1604,9 +1603,9 @@ pub trait MemoryStore: Send + Sync {
     async fn reown(
         &self,
         _ctx: &CallerContext,
-        _namespace: &str,
+        _namespace: Option<&str>,
         _to_id: &str,
-        _claim_unowned: bool,
+        _select: crate::storage::ReownSelect,
         _dry_run: bool,
     ) -> StoreResult<crate::storage::ReownReport> {
         Err(StoreError::UnsupportedCapability {
@@ -4291,6 +4290,42 @@ pub trait MemoryStore: Send + Sync {
         })
     }
 
+    /// v1.0.0 #3288 — one BOUNDED page of the admin export walk: at most
+    /// `limit` memory rows strictly after `cursor` in `(created_at, id)`
+    /// order, under the expiry cutoff `as_of`, plus the page's range, raw ids,
+    /// excluded counts and next cursor. The contract is
+    /// [`crate::export_paging`]; unlike [`Self::export_memories`] this never
+    /// materialises more than one page.
+    ///
+    /// Default returns `UnsupportedCapability`.
+    async fn export_memories_page(
+        &self,
+        _cursor: Option<&crate::export_paging::ExportCursor>,
+        _limit: usize,
+        _as_of: chrono::DateTime<chrono::Utc>,
+        _namespace: Option<&str>,
+    ) -> StoreResult<crate::export_paging::ExportMemoriesPage> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "EXPORT_PAGE".to_string(),
+        })
+    }
+
+    /// v1.0.0 #3288 — the graph edges one export page OWNS (see
+    /// [`crate::export_paging::plan_edge`]), emitted only when both endpoints
+    /// are carried by the export. `survivors` is the set of the page's rows
+    /// that passed the export confidentiality screen.
+    ///
+    /// Default returns `UnsupportedCapability`.
+    async fn export_links_page(
+        &self,
+        _scope: &crate::export_paging::ExportPageScope,
+        _survivors: &std::collections::HashSet<String>,
+    ) -> StoreResult<crate::export_paging::ExportLinksPage> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "EXPORT_LINKS_PAGE".to_string(),
+        })
+    }
+
     /// Notify a target agent. Stamps a memory in the `_inbox` namespace
     /// with the supplied payload + `metadata.target_agent_id =
     /// target_agent`. Returns the new memory's id.
@@ -4908,6 +4943,12 @@ pub trait MemoryStore: Send + Sync {
     ///
     /// Returns `Ok(None)` when no live row matches the tuple.
     ///
+    /// #3696 — `viewer` is the caller's READ-visibility identity (the value
+    /// the read lanes resolve; `None` = single-tenant trust-all): the probe
+    /// answers only with an occupant the viewer may read on BOTH axes
+    /// (`crate::visibility::title_slot_admission`), so the `409` it feeds
+    /// never names another agent's `scope=private` row or a hidden one.
+    ///
     /// # Errors
     ///
     /// Returns `Backend` when the underlying store reports an error.
@@ -4915,6 +4956,7 @@ pub trait MemoryStore: Send + Sync {
         &self,
         _title: &str,
         _namespace: &str,
+        _viewer: Option<&str>,
     ) -> StoreResult<Option<String>> {
         Err(StoreError::UnsupportedCapability {
             capability: "FIND_BY_TITLE_NAMESPACE".to_string(),
@@ -6637,7 +6679,9 @@ mod tests {
             StoreError::UnsupportedCapability { .. }
         ));
         assert!(matches!(
-            s.find_by_title_namespace("t", "ns").await.unwrap_err(),
+            s.find_by_title_namespace("t", "ns", None)
+                .await
+                .unwrap_err(),
             StoreError::UnsupportedCapability { .. }
         ));
         assert!(matches!(

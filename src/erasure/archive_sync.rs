@@ -1029,18 +1029,24 @@ fn insert_archived_row_from_payload(conn: &Connection, id: &str, payload: &[u8])
     Ok(())
 }
 
-/// Ownership predicate mirrored from the caller-scoped archive SQL (see
-/// `storage::restore_archived_for_caller`): the caller owns the row, is its
-/// inbox target, or the row is legacy-unowned.
+/// Ownership predicate for materialising a bundle on a caller's behalf: the
+/// ONE #3124 mutation predicate in its side-effect-free form
+/// ([`crate::identity::owner_stamp::metadata_would_admit`]) — the caller owns
+/// the row, is the inbox target of a STAMPED row, or the row is unstamped and
+/// `AI_MEMORY_UNSTAMPED_MUTATION` admits it. The restore gate re-decides (and
+/// reports) the same row afterwards, so this pre-check records nothing.
 fn payload_owned_by(columns: &serde_json::Map<String, serde_json::Value>, caller: &str) -> bool {
     let meta: serde_json::Value = columns
         .get("metadata")
         .and_then(|m| m.as_str())
         .and_then(|s| serde_json::from_str(s).ok())
         .unwrap_or(serde_json::Value::Null);
-    let field = |key: &str| meta.get(key).and_then(|v| v.as_str()).unwrap_or("");
-    let agent = field("agent_id");
-    agent == caller || field("target_agent_id") == caller || agent.is_empty()
+    crate::identity::owner_stamp::metadata_would_admit(
+        &meta,
+        caller,
+        true,
+        crate::identity::owner_stamp::mode(),
+    )
 }
 
 /// Reconstruct-on-read: when the archived row for `id` is MISSING from the

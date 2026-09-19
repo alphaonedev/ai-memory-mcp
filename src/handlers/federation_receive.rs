@@ -330,16 +330,7 @@ fn stale_policy_refusal_response(sender_seq: i64, local_seq: i64) -> Response {
 fn refuse_if_record_stopped(conn: &rusqlite::Connection) -> Option<Response> {
     match crate::storage::record_stop::gate_storage_conn(conn) {
         Ok(()) => None,
-        Err(e) => Some(
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({
-                    "code": crate::errors::error_codes::RECORD_STOPPED,
-                    "error": e.to_string(),
-                })),
-            )
-                .into_response(),
-        ),
+        Err(e) => Some(crate::handlers::errors::record_stopped_response(&e)),
     }
 }
 
@@ -1019,6 +1010,16 @@ pub(crate) struct InboundAttestationRejection {
     /// One of the four closed-set tokens in
     /// [`crate::federation::receive_auth`]; never free-form verifier text.
     cause: &'static str,
+}
+
+/// #3699 — render the per-item rejections in the sender's WIRE order (the
+/// receive loop applies in causal order; the response array stays positional).
+pub(crate) fn rejections_in_wire_order(
+    collected: &[(usize, InboundAttestationRejection)],
+) -> Vec<&InboundAttestationRejection> {
+    let mut ordered: Vec<&(usize, InboundAttestationRejection)> = collected.iter().collect();
+    ordered.sort_by_key(|(wire_idx, _)| *wire_idx);
+    ordered.into_iter().map(|(_, r)| r).collect()
 }
 
 /// Classify a per-write attestation refusal into its closed-set cause token.
@@ -2213,6 +2214,24 @@ pub async fn sync_push(
     cert_peer: Option<axum::Extension<crate::tls::ClientCertPeerId>>,
     body_bytes: Bytes,
 ) -> impl IntoResponse {
+    let response = sync_push_write(State(app.clone()), headers, cert_peer, body_bytes)
+        .await
+        .into_response();
+    super::write_receipt::complete(
+        &app,
+        response,
+        super::write_receipt::WriterConnection::Legacy,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_lines)]
+async fn sync_push_write(
+    State(app): State<AppState>,
+    headers: HeaderMap,
+    cert_peer: Option<axum::Extension<crate::tls::ClientCertPeerId>>,
+    body_bytes: Bytes,
+) -> impl IntoResponse {
     // v0.7.0 #791 — verify the per-message signature BEFORE
     // deserialising the body. Keeps the verifier's input identical
     // to the wire bytes (signer + verifier MUST agree byte-for-byte).
@@ -2536,7 +2555,10 @@ pub async fn sync_push(
     let mut applied = 0usize;
     let mut noop = 0usize;
     let mut skipped = 0usize;
-    let mut attestation_rejections = Vec::new();
+    // #3699 — collected with each item's WIRE index: the loop applies in causal
+    // order, but the sender's contract for this array is positional, so it is
+    // rendered back in wire order (`rejections_in_wire_order`).
+    let mut attestation_rejections: Vec<(usize, InboundAttestationRejection)> = Vec::new();
     let mut deleted = 0usize;
     let mut archived = 0usize;
     let mut restored = 0usize;
@@ -2618,7 +2640,10 @@ pub async fn sync_push(
         &attest_cfg,
         require_push_ns_scope,
     );
-    for mem in &body.memories {
+    // #3699 (5-agent vote 4d3ea1c5) — apply in CAUSAL order (updated_at, id)
+    // so a consolidation tombstone in this body lands BEFORE a new memory
+    // that reuses its freed title; see `federation::causal_apply_order`.
+    for (wire_idx, mem) in crate::federation::causal_apply_order(&body.memories) {
         if let Err(e) = validate::RequestValidator::validate_memory(mem) {
             tracing::warn!("sync_push: skipping memory {} ({}): {e}", mem.id, mem.title);
             skipped += 1;
@@ -2792,13 +2817,16 @@ pub async fn sync_push(
             author_bound_key.as_ref(),
             crate::federation::receive_auth::require_write_sig_enabled(),
         ) {
-            attestation_rejections.push(report_inbound_attestation_rejection(
-                &to_insert,
-                &attribute_agent,
-                &body.sender_agent_id,
-                author_bound_key.as_ref(),
-                crate::handlers::StorageBackend::Sqlite,
-                &e,
+            attestation_rejections.push((
+                wire_idx,
+                report_inbound_attestation_rejection(
+                    &to_insert,
+                    &attribute_agent,
+                    &body.sender_agent_id,
+                    author_bound_key.as_ref(),
+                    crate::handlers::StorageBackend::Sqlite,
+                    &e,
+                ),
             ));
             skipped += 1;
             continue;
@@ -2904,6 +2932,10 @@ pub async fn sync_push(
         // `sanitize` otherwise demotes it to `claimed`). `row_is_agent_attested`
         // reads the post-`apply` `to_insert` (THIS node's verdict, never a peer
         // self-assertion).
+        // #3631 — what the inbox row looked like before this apply, so a
+        // delivered notify can wake its recipient below (non-inbox rows: no
+        // read at all).
+        let inbox_wake_pre = crate::federation::applied_wake::probe_sqlite(&lock.0, &to_insert);
         match db::merge_inbound(&lock.0, &to_insert, row_is_agent_attested(&to_insert)) {
             Ok(actual_id) => {
                 applied += 1;
@@ -2915,6 +2947,15 @@ pub async fn sync_push(
                 if row_is_agent_attested(&to_insert) {
                     let _ = db::dequarantine(&lock.0, &actual_id);
                 }
+                // #3631 — the row is committed (no outer transaction on this
+                // funnel): wake the local recipient when this apply delivered
+                // an inbox message it has not seen.
+                crate::federation::applied_wake::fire_sqlite(
+                    &lock.0,
+                    inbox_wake_pre,
+                    &to_insert,
+                    &actual_id,
+                );
                 // #1566 / #1579 B1 — store a dim-matching shipped
                 // vector directly (no local embed at all); anything
                 // else falls back to the deferred background embed.
@@ -3056,7 +3097,7 @@ pub async fn sync_push(
                 "agent_id": q.agent_id,
                 "applied_before_refusal": applied,
                 (crate::handlers::QUOTA_REFUSED_FIELD): quota_refused,
-                (crate::handlers::ATTESTATION_REJECTIONS_FIELD): &attestation_rejections,
+                (crate::handlers::ATTESTATION_REJECTIONS_FIELD): rejections_in_wire_order(&attestation_rejections),
                 "reset_at": reset_at,
             })),
         )
@@ -4491,7 +4532,7 @@ pub async fn sync_push(
             "noop": noop,
             (crate::handlers::SKIPPED_FIELD): skipped,
             (crate::handlers::QUOTA_REFUSED_FIELD): quota_refused,
-            (crate::handlers::ATTESTATION_REJECTIONS_FIELD): &attestation_rejections,
+            (crate::handlers::ATTESTATION_REJECTIONS_FIELD): rejections_in_wire_order(&attestation_rejections),
             "dry_run": body.dry_run,
             "receiver_agent_id": local_agent_id,
             "receiver_clock": receiver_clock,
@@ -4848,7 +4889,7 @@ mod tests {
 
     #[test]
     fn historical_registry_miss_never_falls_back_to_current_keydir_3464() {
-        let dir = tempfile::tempdir().expect("key dir");
+        let dir = crate::identity::test_key_dir::private_tempdir();
         let author = "history-gap-author";
         let kp = keypair::generate(author).expect("gen");
         keypair::save(&kp, dir.path()).expect("enroll keydir key");
@@ -4891,7 +4932,7 @@ mod tests {
     /// itself — not passed in, unlike the push-side tests above.)
     #[test]
     fn pull_attestation_valid_sig_upgrades_and_applies_2715() {
-        let dir = tempfile::tempdir().expect("key dir");
+        let dir = crate::identity::test_key_dir::private_tempdir();
         let author = "alice";
         let kp = keypair::generate(author).expect("gen");
         keypair::save(&kp, dir.path()).expect("enroll alice");
@@ -5042,7 +5083,7 @@ mod tests {
     /// masking — the gate returns `false` on the explicit `Err`.
     #[test]
     fn pull_attestation_forged_sig_refused_2715() {
-        let dir = tempfile::tempdir().expect("key dir");
+        let dir = crate::identity::test_key_dir::private_tempdir();
         let author = "alice";
         let kp = keypair::generate(author).expect("gen");
         keypair::save(&kp, dir.path()).expect("enroll alice");
@@ -5069,7 +5110,7 @@ mod tests {
     /// overridden to `claimed` (a peer cannot self-assert attestation).
     #[test]
     fn pull_attestation_unsigned_lands_claimed_2715() {
-        let dir = tempfile::tempdir().expect("key dir");
+        let dir = crate::identity::test_key_dir::private_tempdir();
         let author = "alice";
         let kp = keypair::generate(author).expect("gen");
         keypair::save(&kp, dir.path()).expect("enroll alice");

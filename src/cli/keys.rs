@@ -36,7 +36,13 @@ pub enum KeysAction {
     },
 }
 
-pub fn run(db: &Path, args: KeysArgs, json: bool, out: &mut super::CliOutput<'_>) -> Result<()> {
+pub fn run(
+    db: &Path,
+    args: KeysArgs,
+    json: bool,
+    caller_agent_id: Option<&str>,
+    out: &mut super::CliOutput<'_>,
+) -> Result<()> {
     let KeysAction::Prune {
         yes,
         include_public_only,
@@ -51,6 +57,7 @@ pub fn run(db: &Path, args: KeysArgs, json: bool, out: &mut super::CliOutput<'_>
         &dir,
         yes,
         include_public_only,
+        caller_agent_id,
     )?;
     if json {
         writeln!(
@@ -103,12 +110,21 @@ pub(crate) fn inventory(
     dir: &Path,
     delete: bool,
     include_public_only: bool,
+    caller_agent_id: Option<&str>,
 ) -> Result<Inventory> {
+    // #3354 — the ledger is signed from its first row by the key of the
+    // RESOLVED agent id (`AI_MEMORY_AGENT_ID`, else `host:<hostname>`), which
+    // a ledger-writing verb generates on first use without registering the
+    // id. That key is reserved by construction: pruning it would leave every
+    // signed row without the key that signed it and hand the next writer a
+    // fresh one. Resolve it the way boot does and protect it alongside the
+    // registered ids — never re-derive the identity here.
+    let signer = crate::identity::resolve_agent_id(caller_agent_id, None)?;
     let url = crate::store_url::resolve_store_url(url)?;
     if let Some(url) = &url {
         if crate::store_url::is_postgres_url(url) {
             #[cfg(feature = "sal-postgres")]
-            return postgres(url, dir, delete, include_public_only);
+            return postgres(url, dir, delete, include_public_only, &signer);
             #[cfg(not(feature = "sal-postgres"))]
             bail!("PostgreSQL key registry requires the sal-postgres feature");
         }
@@ -120,10 +136,16 @@ pub(crate) fn inventory(
                 .context("unsupported key registry store URL")?,
         ),
     };
-    sqlite(db, dir, delete, include_public_only)
+    sqlite(db, dir, delete, include_public_only, &signer)
 }
 
-fn sqlite(db: &Path, dir: &Path, delete: bool, include_public_only: bool) -> Result<Inventory> {
+fn sqlite(
+    db: &Path,
+    dir: &Path,
+    delete: bool,
+    include_public_only: bool,
+    signer: &str,
+) -> Result<Inventory> {
     if !db.is_file() {
         bail!("key registry database does not exist; refusing key pruning");
     }
@@ -143,14 +165,21 @@ fn sqlite(db: &Path, dir: &Path, delete: bool, include_public_only: bool) -> Res
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?
     };
-    let ids = key_inventory::registered_ids(metadata)?;
+    let mut ids = key_inventory::registered_ids(metadata)?;
+    ids.insert(signer.to_owned());
     let result = key_inventory::inspect(dir, &ids, delete, include_public_only);
     conn.execute_batch("ROLLBACK")?;
     result
 }
 
 #[cfg(feature = "sal-postgres")]
-fn postgres(url: &str, dir: &Path, delete: bool, include_public_only: bool) -> Result<Inventory> {
+fn postgres(
+    url: &str,
+    dir: &Path,
+    delete: bool,
+    include_public_only: bool,
+    signer: &str,
+) -> Result<Inventory> {
     super::doctor::run_pg_probe(|| async {
         use sqlx::Connection as _;
         let operation = async {
@@ -168,7 +197,8 @@ fn postgres(url: &str, dir: &Path, delete: bool, include_public_only: bool) -> R
                     .bind(crate::models::AGENTS_NAMESPACE)
                     .fetch_all(&mut *tx)
                     .await?;
-            let ids = key_inventory::registered_ids(metadata)?;
+            let mut ids = key_inventory::registered_ids(metadata)?;
+            ids.insert(signer.to_owned());
             let result = key_inventory::inspect(dir, &ids, delete, include_public_only);
             tx.rollback().await?;
             result

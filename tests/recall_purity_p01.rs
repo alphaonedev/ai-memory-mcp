@@ -898,12 +898,15 @@ fn fold_chunk_boundary_beyond_chunk_limit() {
 }
 
 #[test]
-fn fold_flips_inbox_unread_marker() {
-    // Consumer condition (vote gap 9): the agent-inbox unread marker is
-    // `access_count == 0` (`memory_inbox` docs: "access_count==0 is the
-    // unread marker"). With recall pure, read-marking is eventually
-    // consistent — the FOLD is what flips a recalled inbox message to
-    // read.
+fn fold_bumps_access_count_but_never_hides_an_inbox_message_3730() {
+    // Was `fold_flips_inbox_unread_marker` (vote gap 9): it pinned that the
+    // FOLD is what flipped a recalled inbox message to "read"
+    // (`access_count == 0` was the unread marker). #3730 retired that marker:
+    // `access_count` counts TOUCHES, handled = deleted by the recipient, and
+    // `unread_only` narrows nothing. What is still true — and still pinned
+    // here — is the purity half: recall alone never writes, the fold is the
+    // only writer of `access_count`. What changed: a folded message must
+    // STILL list under `unread_only`, because a touch is not a handling.
     let _g = env_lock();
     clear_flags();
     let (conn, _dir) = fresh_db();
@@ -935,7 +938,25 @@ fn fold_flips_inbox_unread_marker() {
     assert_eq!(db::fold_recall_accesses(&conn, 3600, 86_400).unwrap(), 1);
     assert!(
         access_count(&conn, &id) > 0,
-        "fold flips the access_count==0 unread marker"
+        "the fold is the only writer of access_count"
+    );
+    // #3730 — a touched message is NOT a handled one: it still lists.
+    let inbox = ai_memory::mcp::handle_inbox(
+        &conn,
+        &serde_json::json!({"agent_id": "ai:bob", "unread_only": true}),
+        None,
+        Some("ai:bob"),
+    )
+    .expect("inbox");
+    assert_eq!(
+        inbox["messages"].as_array().map(Vec::len),
+        Some(1),
+        "#3730: a recalled-and-folded message must still list under unread_only; got={inbox}"
+    );
+    assert_eq!(inbox["messages"][0]["id"], serde_json::json!(id));
+    assert!(
+        inbox["messages"][0].get("read").is_none(),
+        "no read field on the wire"
     );
 }
 
@@ -1225,7 +1246,7 @@ fn v77_migration_backfills_preexisting_rows_folded() {
     // Fresh open reaches the current tip
     // with the v77 `folded` column present.
     let conn = db::open(&path).expect("open");
-    assert_eq!(db::migrations::current_schema_version_for_tests(), 98);
+    assert_eq!(db::migrations::current_schema_version_for_tests(), 100);
     let version: i64 = conn
         .query_row(
             "SELECT COALESCE(MAX(version), 0) FROM schema_version",

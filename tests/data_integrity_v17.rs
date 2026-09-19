@@ -288,14 +288,14 @@ fn store_on_conflict_error_returns_409() {
     let m = make_memory("conflict-g6", "g6/test", Tier::Long);
     db::insert(&conn, &m).expect("first insert");
 
-    let existing = db::find_by_title_namespace(&conn, &m.title, &m.namespace)
+    let existing = db::find_by_title_namespace(&conn, &m.title, &m.namespace, None)
         .expect("lookup")
         .expect("first row exists");
     assert_eq!(existing, m.id);
 
     // Negative case — different title returns None.
     let not_found =
-        db::find_by_title_namespace(&conn, "no-such-title", &m.namespace).expect("lookup");
+        db::find_by_title_namespace(&conn, "no-such-title", &m.namespace, None).expect("lookup");
     assert!(not_found.is_none());
 
     // version mode helper picks a free suffix.

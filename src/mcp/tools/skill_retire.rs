@@ -141,12 +141,11 @@ pub fn handle_skill_retire(
             "skill_retire"
         },
         "",
-        json!({
-            "namespace": namespace,
-            "name": name,
-            "skill_id": single_id,
-            "reason": reason,
-        }),
+        crate::governance::audit::ForensicPayload::new()
+            .ident("namespace", &namespace)
+            .ident("name", &name)
+            .opt_ident("skill_id", single_id.as_deref())
+            .opt_commit("reason", reason),
     );
 
     // All mutations inside ONE BEGIN IMMEDIATE tx (mirrors register_core):
@@ -154,7 +153,9 @@ pub fn handle_skill_retire(
     // the retire REFUSE in register_core cannot race a silent revive, and
     // the RAII drop of `tx` rolls back on any early `?` return.
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
-        .map_err(|e| format!("skill retire BEGIN IMMEDIATE: {e}"))?;
+        .map_err(|e| {
+        crate::mcp::error_text::mcp_foreign_err("skill retire BEGIN IMMEDIATE", e)
+    })?;
     let txn: &Connection = &tx;
 
     let now_secs = SystemTime::now()
@@ -218,7 +219,7 @@ pub fn handle_skill_retire(
     let _ = append_signed_event_no_tx(txn, &event);
 
     tx.commit()
-        .map_err(|e| format!("skill retire COMMIT: {e}"))?;
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("skill retire COMMIT", e))?;
 
     let flag = if unretire {
         field_names::UNRETIRED
@@ -324,7 +325,7 @@ pub fn handle_skill_delete(
     let rows: Vec<(String, Vec<u8>, Option<i64>)> = {
         let mut stmt = conn
             .prepare("SELECT id, digest, retired_at FROM skills WHERE namespace = ?1 AND name = ?2")
-            .map_err(|e| format!("skill_delete prepare: {e}"))?;
+            .map_err(|e| crate::mcp::error_text::mcp_foreign_err("skill_delete prepare", e))?;
         let out = stmt
             .query_map(params![namespace, name], |r| {
                 Ok((
@@ -333,7 +334,7 @@ pub fn handle_skill_delete(
                     r.get::<_, Option<i64>>(2)?,
                 ))
             })
-            .map_err(|e| format!("skill_delete query: {e}"))?
+            .map_err(|e| crate::mcp::error_text::mcp_foreign_err("skill_delete query", e))?
             .filter_map(Result::ok)
             .collect();
         out
@@ -364,16 +365,17 @@ pub fn handle_skill_delete(
         "allow",
         "skill_delete",
         "",
-        json!({
-            "namespace": namespace,
-            "name": name,
-            "skill_ids": skill_ids,
-            "force": force,
-        }),
+        crate::governance::audit::ForensicPayload::new()
+            .ident("namespace", &namespace)
+            .ident("name", &name)
+            .idents("skill_ids", &skill_ids)
+            .flag("force", force),
     );
 
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
-        .map_err(|e| format!("skill delete BEGIN IMMEDIATE: {e}"))?;
+        .map_err(|e| {
+        crate::mcp::error_text::mcp_foreign_err("skill delete BEGIN IMMEDIATE", e)
+    })?;
     let txn: &Connection = &tx;
 
     // Emit the signed PURGE audit row BEFORE the delete (the row outlives
@@ -402,10 +404,10 @@ pub fn handle_skill_delete(
             "DELETE FROM skills WHERE namespace = ?1 AND name = ?2",
             params![namespace, name],
         )
-        .map_err(|e| format!("skill_delete DELETE: {e}"))?;
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("skill_delete DELETE", e))?;
 
     tx.commit()
-        .map_err(|e| format!("skill delete COMMIT: {e}"))?;
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("skill delete COMMIT", e))?;
 
     Ok(json!({
         "purged": true,

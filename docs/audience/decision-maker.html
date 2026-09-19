@@ -113,7 +113,7 @@ footer a{color:var(--muted)}
       <tr><td>Operator-signed substrate rules</td><td class="no">No</td><td class="yes">L1&ndash;L6, key on disk</td></tr>
       <tr><td>HMAC-required event subscriptions</td><td class="no">No</td><td class="yes">SSRF gate by default</td></tr>
       <tr><td>NHI agent_id semantics</td><td class="no">No</td><td class="yes">Resolution ladder, preservation invariants</td></tr>
-      <tr><td>Autonomous tier (consolidate / contradict / auto-tag)</td><td class="no">No</td><td class="yes">LLM-backed, vendor-agnostic &mdash; Ollama local OR 15+ cloud vendors (xAI Grok, OpenAI, Anthropic, Gemini, DeepSeek, Kimi, Qwen, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks, LMStudio, vLLM)</td></tr>
+      <tr><td>Autonomous tier (consolidate / contradict / auto-tag)</td><td class="no">No</td><td class="yes">LLM-backed, vendor-agnostic &mdash; Ollama local OR 15+ cloud vendors (xAI Grok, OpenAI, Anthropic, Gemini, Kimi, Qwen, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks, LMStudio, vLLM)</td></tr>
       <tr><td>Single binary, zero cloud dependency</td><td class="meh">Often hosted</td><td class="yes">Single Rust binary, sqlite default</td></tr>
       <tr><td>Apache-2.0</td><td class="meh">Mixed</td><td class="yes">Yes</td></tr>
     </tbody>
@@ -130,7 +130,7 @@ footer a{color:var(--muted)}
     <div class="risk"><h4>Supply chain</h4><p>Rust, <code>cargo audit</code> required to be clean as a release gate. Binary is statically linkable; reproducible builds are on the v1.0 roadmap.</p></div>
     <div class="risk"><h4>Security posture</h4><p>v0.7.0 secure-default: permissions enforced by default, SSRF gate on webhooks, signed audit chain, HMAC subscriptions, optional sqlcipher for at-rest encryption.</p></div>
     <div class="risk"><h4>Operational risk</h4><p>One process, one DB file. Failure modes are SQLite failure modes (well-understood). Migrations dry-run-tested by the maintainer dogfood loop before every release tag.</p></div>
-    <div class="risk"><h4>Project maturity</h4><p>v1.0.0 is the latest major release. 103 MCP entries at <code>--profile full</code> (102 callable), 100 HTTP route registrations (86 unique paths), 91 CLI subcommands (93 with <code>--features sal</code> or <code>--features sal-postgres</code>). CI gates on Linux x64/arm64, macOS x64/arm64, Windows x64, plus iOS + Android cross-compile (Posture 1a, #1068). Test campaigns are reproducible and publicly logged under <code>docs/v0.7.0/test-campaign-*</code>.</p></div>
+    <div class="risk"><h4>Project maturity</h4><p>v1.0.0 is the latest major release. 103 MCP entries at <code>--profile full</code> (102 callable), 102 HTTP route registrations (88 unique paths), 91 CLI subcommands (93 with <code>--features sal</code> or <code>--features sal-postgres</code>). CI gates on Linux x64/arm64, macOS x64/arm64, Windows x64, plus iOS + Android cross-compile (Posture 1a, #1068). Test campaigns are reproducible and publicly logged under <code>docs/v0.7.0/test-campaign-*</code>.</p></div>
   </div>
 </section>
 
@@ -142,7 +142,7 @@ footer a{color:var(--muted)}
     <li><strong>Hosting: $0 to whatever you spend on the host.</strong> Single binary. Runs on a developer laptop; runs on a $5/mo VPS; runs on a multi-region fleet. No mandatory cloud.</li>
     <li><strong>Infrastructure: SQLite or Postgres+AGE.</strong> SQLite is bundled. Postgres+AGE is optional for the T3+ graph backend.</li>
     <li><strong>Ops: one process to monitor.</strong> Standard <code>tracing</code> output, append-only audit chain, capabilities endpoint for health checks.</li>
-    <li><strong>LLM cost: optional, vendor-agnostic, deployment-flexible.</strong> Post-#1067, every tier accepts any LLM provider via <code>AI_MEMORY_LLM_BACKEND</code> &mdash; Ollama for local/free, xAI Grok / OpenAI / Anthropic / Gemini / DeepSeek / Kimi / Qwen / Mistral / Groq / Together / Cerebras / OpenRouter / Fireworks / LMStudio / vLLM / llama.cpp-server for cloud or self-hosted GPU. GPU is optional &mdash; local Ollama needs one; cloud vendors shift inference to their side. Keyword and semantic tiers need no LLM at all.</li>
+    <li><strong>LLM cost: optional, vendor-agnostic, deployment-flexible.</strong> Post-#1067, every tier accepts any LLM provider via <code>AI_MEMORY_LLM_BACKEND</code> &mdash; Ollama for local/free, xAI Grok / OpenAI / Anthropic / Gemini / Kimi / Qwen / Mistral / Groq / Together / Cerebras / OpenRouter / Fireworks / LMStudio / vLLM / llama.cpp-server for cloud or self-hosted GPU. GPU is optional &mdash; local Ollama needs one; cloud vendors shift inference to their side. Keyword and semantic tiers need no LLM at all.</li>
   </ul>
   <p>There is no SaaS billing surface in ai-memory itself. The only cost you incur is your own hosting plus (optionally) your own LLM call budget, paid directly to whichever vendor you choose.</p>
 </section>

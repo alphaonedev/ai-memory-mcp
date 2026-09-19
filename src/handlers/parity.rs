@@ -502,6 +502,11 @@ mod require_caller_owns_memory_tests {
     use crate::models::{ConfidenceSource, Memory, MemoryKind, Tier};
     use serde_json::json;
 
+    const SITE: crate::identity::owner_stamp::MutationSite =
+        crate::identity::owner_stamp::MutationSite::sqlite(
+            crate::identity::owner_stamp::funnel::UPDATE,
+        );
+
     fn mem_with(metadata: serde_json::Value) -> Memory {
         Memory {
             cid: None,
@@ -540,27 +545,108 @@ mod require_caller_owns_memory_tests {
     #[test]
     fn owner_passes() {
         let mem = mem_with(json!({"agent_id": "alice"}));
-        assert!(require_caller_owns_memory(&mem, "alice", false).is_none());
+        assert!(require_caller_owns_memory(&mem, "alice", false, SITE).is_none());
     }
 
     #[test]
     fn non_owner_blocked() {
         let mem = mem_with(json!({"agent_id": "alice"}));
-        assert!(require_caller_owns_memory(&mem, "bob", false).is_some());
+        assert!(require_caller_owns_memory(&mem, "bob", false, SITE).is_some());
+    }
+
+    /// #3426 / #3339 — a row the caller cannot READ (another agent's
+    /// `private` row, the absent-scope default) is refused with the read
+    /// path's own `404`, never a `403` that confirms the id exists.
+    #[test]
+    fn invisible_cross_owner_row_masks_as_not_found_3426() {
+        let mem = mem_with(json!({"agent_id": "alice"}));
+        let resp = require_caller_owns_memory(&mem, "bob", false, SITE).expect("refused");
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// #3426 — a row the caller CAN read (`collective`) but does not own is
+    /// refused `403`: masking a readable row as missing would be a lie.
+    #[test]
+    fn visible_cross_owner_row_refuses_forbidden_3426() {
+        let mem = mem_with(json!({"agent_id": "alice", "scope": "collective"}));
+        let resp = require_caller_owns_memory(&mem, "bob", false, SITE).expect("refused");
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// #3426 — the shared constructor cannot name an owner: it has no owner
+    /// parameter, and the body it builds carries exactly the closed set of
+    /// keys `{error, code, caller, <ids>}`.
+    #[test]
+    fn owner_gate_refusal_body_is_closed_vocabulary_3426() {
+        let body = owner_gate_refusal_body(
+            crate::errors::msg::CALLER_DOES_NOT_OWN_MEMORY,
+            Some("bob"),
+            RefusedResource::Memory("m-1"),
+        );
+        let mut keys: Vec<&str> = body.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["caller", "code", "error", "id"]);
+        assert_eq!(body["code"], crate::errors::error_codes::NOT_OWNER);
+
+        let body = owner_gate_refusal_body(
+            crate::errors::msg::CALLER_NOT_LINK_ENDPOINT_OWNER,
+            None,
+            RefusedResource::Link {
+                source_id: "s",
+                target_id: "t",
+            },
+        );
+        let mut keys: Vec<&str> = body.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["code", "error", "source_id", "target_id"]);
+        assert!(body.get("owner").is_none());
+    }
+
+    /// #3124 rule (e) census — the pre-#3124 pin: an unstamped row passes
+    /// the HTTP gate. It is the `warn` (default) posture; the `refuse` twin
+    /// below is the single cross-backend policy's other half.
+    #[test]
+    fn legacy_unowned_passes() {
+        use crate::identity::owner_stamp::UnstampedMutationMode::Warn;
+        let mem = mem_with(json!({}));
+        assert!(require_caller_owns_memory_with_mode(&mem, "bob", false, SITE, Warn).is_none());
+        let mem = mem_with(json!({"agent_id": ""}));
+        assert!(require_caller_owns_memory_with_mode(&mem, "bob", false, SITE, Warn).is_none());
     }
 
     #[test]
-    fn legacy_unowned_passes() {
+    fn legacy_unowned_refused_under_refuse_3124() {
+        use crate::identity::owner_stamp::UnstampedMutationMode::Refuse;
+        for meta in [
+            json!({}),
+            json!({"agent_id": ""}),
+            json!({"agent_id": null}),
+        ] {
+            let mem = mem_with(meta);
+            assert!(
+                require_caller_owns_memory_with_mode(&mem, "bob", false, SITE, Refuse).is_some()
+            );
+        }
+        // The daemon pass-through is pre-existing and posture-independent.
         let mem = mem_with(json!({}));
-        assert!(require_caller_owns_memory(&mem, "bob", false).is_none());
-        let mem = mem_with(json!({"agent_id": ""}));
-        assert!(require_caller_owns_memory(&mem, "bob", false).is_none());
+        assert!(
+            require_caller_owns_memory_with_mode(&mem, "daemon", false, SITE, Refuse).is_none()
+        );
+    }
+
+    #[test]
+    fn malformed_owner_refused_in_both_postures_3124() {
+        use crate::identity::owner_stamp::UnstampedMutationMode::{Refuse, Warn};
+        let mem = mem_with(json!({"agent_id": 42}));
+        for mode in [Warn, Refuse] {
+            assert!(require_caller_owns_memory_with_mode(&mem, "42", false, SITE, mode).is_some());
+        }
     }
 
     #[test]
     fn daemon_passes() {
         let mem = mem_with(json!({"agent_id": "alice"}));
-        assert!(require_caller_owns_memory(&mem, "daemon", false).is_none());
+        assert!(require_caller_owns_memory(&mem, "daemon", false, SITE).is_none());
     }
 
     #[test]
@@ -571,7 +657,7 @@ mod require_caller_owns_memory_tests {
         }));
         // allow_inbox = true (DELETE case): bob is the inbox target,
         // permitted to consume the message.
-        assert!(require_caller_owns_memory(&mem, "bob", true).is_none());
+        assert!(require_caller_owns_memory(&mem, "bob", true, SITE).is_none());
     }
 
     #[test]
@@ -582,7 +668,7 @@ mod require_caller_owns_memory_tests {
         }));
         // allow_inbox = false (UPDATE/PROMOTE case): bob may NOT
         // mutate alice's row even though he's the inbox target.
-        assert!(require_caller_owns_memory(&mem, "bob", false).is_some());
+        assert!(require_caller_owns_memory(&mem, "bob", false, SITE).is_some());
     }
 
     #[test]
@@ -592,7 +678,7 @@ mod require_caller_owns_memory_tests {
             "target_agent_id": "carol",
         }));
         // bob is neither owner nor inbox target.
-        assert!(require_caller_owns_memory(&mem, "bob", true).is_some());
+        assert!(require_caller_owns_memory(&mem, "bob", true, SITE).is_some());
     }
 }
 
@@ -604,62 +690,243 @@ mod require_caller_owns_memory_tests {
 /// returns `Some(403 Forbidden response)` when ownership fails —
 /// caller short-circuits with `return` on the `Some` branch.
 ///
-/// **Carve-outs (preserved verbatim from the inline sites the helper
-/// replaces):**
-/// - `owner.is_empty()` → unowned/legacy row falls through to caller
-///   (legacy-unowned carve-out used across the codebase).
+/// The decision is the ONE mutation predicate
+/// ([`crate::identity::owner_stamp::metadata_admits_mutation`], #3124) plus
+/// the pre-existing sqlite `daemon` pass-through:
+/// - an UNSTAMPED row (missing / null / `""` `agent_id`) is admitted with a
+///   WARN + counter under `AI_MEMORY_UNSTAMPED_MUTATION=warn` (the default —
+///   the pre-#3124 legacy-unowned carve-out) and refused under `refuse`;
+/// - a MALFORMED (non-string) `agent_id` is never matched or admitted;
 /// - `caller == "daemon"` → daemon-origin path exempt; the audit
 ///   chain captures the daemon-origin write via signed_events.
-/// - `allow_inbox && metadata.target_agent_id == caller` → the
-///   sender-stamped inbox carve-out from the DELETE handler. Only
-///   the recipient of an inbox message may delete it; passing
+/// - `allow_inbox && metadata.target_agent_id == caller` on a row that is
+///   not unstamped → the sender-stamped inbox carve-out from the DELETE
+///   handler. Only the recipient of an inbox message may delete it; passing
 ///   `allow_inbox = false` disables this carve-out for handlers
 ///   (update / promote) where the inbox target should NOT be able
 ///   to mutate someone else's row.
 ///
-/// **Wire shape on rejection.** `403 Forbidden` with body
-/// `{"error": "caller does not own this memory", "owner": "<owner>",
-/// "caller": "<caller>"}` — matches the inline-site shape so test
-/// expectations + audit grep patterns remain valid.
+/// **Wire shape on rejection (#3426, folding #3339).** Two leak-resistant
+/// refusals, chosen by whether the caller may READ the row at all — the
+/// same two answers the postgres branch already gave, because its
+/// handlers fetch through a visibility-scoped SAL `get`:
+/// - not readable by the caller (another agent's `private` row — the
+///   default, since a row with no `metadata.scope` key is private) →
+///   [`hidden_row_refusal`]: `404 {"error": "not found"}`, byte-identical
+///   to the read path's answer, so the write path is no longer an
+///   existence oracle;
+/// - readable but not owned (a `collective` row, a subtree-scoped row in
+///   the caller's subtree, or an unstamped row under
+///   `AI_MEMORY_UNSTAMPED_MUTATION=refuse`) → [`owner_gate_refusal`]:
+///   `403 {"error": "caller does not own this memory", "code": "NOT_OWNER",
+///   "caller": "<caller>", "id": "<id>"}`. An unstamped refusal additionally
+///   carries `"reason"` naming the `reown` remedy (additive, #3124).
+///
+/// Neither body names the owning agent id. Pre-#3426 the refusal carried
+/// an `"owner"` field, disclosing WHO holds a row to a caller that is not
+/// entitled to it; the owner is now emitted only to the server-side
+/// [`super::AUTHZ_TRACE_TARGET`] warn line.
 #[must_use]
 pub fn require_caller_owns_memory(
     mem: &Memory,
     caller: &str,
     allow_inbox: bool,
+    site: crate::identity::owner_stamp::MutationSite,
 ) -> Option<axum::response::Response> {
-    let owner = mem
-        .metadata
-        .get("agent_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    if owner.is_empty() || owner == caller || caller == crate::identity::sentinels::DAEMON_PRINCIPAL
+    require_caller_owns_memory_with_mode(
+        mem,
+        caller,
+        allow_inbox,
+        site,
+        crate::identity::owner_stamp::mode(),
+    )
+}
+
+/// [`require_caller_owns_memory`] under an explicit unstamped-row posture —
+/// the seam unit tests use to pin both postures without touching the
+/// process environment.
+#[must_use]
+pub(crate) fn require_caller_owns_memory_with_mode(
+    mem: &Memory,
+    caller: &str,
+    allow_inbox: bool,
+    site: crate::identity::owner_stamp::MutationSite,
+    mode: crate::identity::owner_stamp::UnstampedMutationMode,
+) -> Option<axum::response::Response> {
+    use crate::identity::owner_stamp::{OwnerStamp, REASON_UNSTAMPED_REFUSED};
+    if caller == crate::identity::sentinels::DAEMON_PRINCIPAL
+        || crate::identity::owner_stamp::metadata_admits_mutation_with_mode(
+            &mem.metadata,
+            &mem.id,
+            caller,
+            allow_inbox,
+            site,
+            mode,
+        )
     {
         return None;
     }
-    if allow_inbox {
-        let target = mem
-            .metadata
-            .get("target_agent_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        if !target.is_empty() && target == caller {
-            return None;
-        }
-    }
+    let stamp = OwnerStamp::of(&mem.metadata);
+    let owner = stamp.owner_for_display();
+    // #3426 — the owner id stays SERVER-SIDE. Operators keep the full
+    // `caller != owner` attribution in this structured AUTHZ trace line;
+    // the refused caller gets a body that names neither.
     tracing::warn!(
         target: super::AUTHZ_TRACE_TARGET,
-        "ownership-gate 403: caller {caller} != owner {owner} (id={})",
+        "ownership-gate refusal: caller {caller} != owner {owner} (id={})",
         mem.id
     );
-    Some(
-        (
-            StatusCode::FORBIDDEN,
-            Json(json!({
-                "error": "caller does not own this memory",
-                "owner": owner,
-                "caller": caller,
-            })),
-        )
-            .into_response(),
-    )
+    // #3426 / #3339 — hide-on-write for a row the caller cannot READ.
+    // Pre-fix the sqlite branch answered `403 + owner` for a private row
+    // owned by someone else while `GET` answered `404`, so the write path
+    // was an existence AND identity oracle for rows the caller may not
+    // see. The postgres branch already masked these (its handlers fetch
+    // through a visibility-scoped `store.get`, which yields `NotFound` →
+    // 404), so this converges sqlite ONTO the standing postgres contract
+    // rather than inventing a third behaviour. Denial-preserving: a row
+    // refused before is still refused, only less informatively. The
+    // predicate is the canonical read funnel (#3348/#3549) with the row's
+    // own namespace named, exactly as the kg handlers consult it.
+    if !crate::visibility::is_readable_on_query(mem, Some(caller), Some(&mem.namespace)) {
+        return Some(hidden_row_refusal());
+    }
+    let resource = RefusedResource::Memory(&mem.id);
+    if stamp.is_unstamped() {
+        // #3124 — the unstamped-row refusal keeps its additive `reason`
+        // naming the `reown` remedy. There is no owner to leak here.
+        return Some(owner_gate_refusal_with_reason(
+            crate::errors::msg::CALLER_DOES_NOT_OWN_MEMORY,
+            Some(caller),
+            resource,
+            REASON_UNSTAMPED_REFUSED,
+        ));
+    }
+    Some(owner_gate_refusal(
+        crate::errors::msg::CALLER_DOES_NOT_OWN_MEMORY,
+        Some(caller),
+        resource,
+    ))
+}
+
+/// #3426 — which id(s) an [`owner_gate_refusal`] echoes back, as a closed
+/// set rather than caller-supplied key strings (rust-1.98 API-09 /
+/// ERRORS-09).
+///
+/// The gate sites differ only in what the refused row is CALLED on the
+/// wire — `id` for a memory the caller addressed directly, `source_id` for
+/// the source row of a graph edge, `source_id` + `target_id` for a link
+/// the caller asked to sever — and a closed enum keeps a future site from
+/// inventing a key (`"owner"` included) by passing a literal. Every value
+/// here was SUPPLIED by the refused caller, so echoing it discloses nothing
+/// it did not already know.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RefusedResource<'a> {
+    /// The memory the caller addressed directly, echoed as `id`.
+    Memory(&'a str),
+    /// The source row of a link / graph traversal, echoed as `source_id`.
+    SourceMemory(&'a str),
+    /// Both endpoints of a link the caller asked to sever, echoed as
+    /// `source_id` + `target_id`.
+    Link {
+        /// The edge's source memory id.
+        source_id: &'a str,
+        /// The edge's target memory id.
+        target_id: &'a str,
+    },
+}
+
+impl RefusedResource<'_> {
+    /// Insert this resource's id field(s) into a refusal body.
+    fn write_into(self, body: &mut serde_json::Map<String, serde_json::Value>) {
+        match self {
+            Self::Memory(id) => {
+                body.insert("id".to_string(), json!(id));
+            }
+            Self::SourceMemory(source_id) => {
+                body.insert("source_id".to_string(), json!(source_id));
+            }
+            Self::Link {
+                source_id,
+                target_id,
+            } => {
+                body.insert("source_id".to_string(), json!(source_id));
+                body.insert("target_id".to_string(), json!(target_id));
+            }
+        }
+    }
+}
+
+/// #3426 — the single leak-resistant wire shape for EVERY cross-owner
+/// authorization refusal on the HTTP surface.
+///
+/// The owning agent id is deliberately **not a parameter**: a refusal
+/// built through this constructor is structurally incapable of naming the
+/// owner, so a future gate cannot reintroduce the disclosure by copying a
+/// neighbouring `json!` literal. The owner belongs in the server-side
+/// [`super::AUTHZ_TRACE_TARGET`] warn line at the call site, never on the
+/// wire.
+///
+/// `caller` is `Option` because the postgres branch reaches this refusal
+/// through `postgres_gate::store_err_to_response`, which maps a bare
+/// [`crate::store::StoreError`] and has no caller principal in scope;
+/// omitting the field is strictly less disclosure, never more.
+///
+/// **Wire shape.** `403 Forbidden` with body
+/// `{"error": "<error>", "code": "NOT_OWNER", "caller": "<caller>", ...ids}`,
+/// where the id key(s) come from [`RefusedResource`] and `"caller"` is
+/// present only when known. `code` is the closed-vocabulary
+/// [`crate::errors::error_codes::NOT_OWNER`] slug on every site; `error`
+/// is the per-gate SSOT message (`errors::msg::CALLER_DOES_NOT_OWN_MEMORY`
+/// / `CALLER_NOT_SOURCE_MEMORY_OWNER` / `CALLER_NOT_LINK_ENDPOINT_OWNER`),
+/// byte-identical on both backends because it is the same const the SAL
+/// adapters put in `StoreError::PermissionDenied.reason`.
+#[must_use]
+pub fn owner_gate_refusal(
+    error: &str,
+    caller: Option<&str>,
+    resource: RefusedResource<'_>,
+) -> axum::response::Response {
+    let body = owner_gate_refusal_body(error, caller, resource);
+    (StatusCode::FORBIDDEN, Json(serde_json::Value::Object(body))).into_response()
+}
+
+/// [`owner_gate_refusal`] with an additive `"reason"` field — the #3124
+/// unstamped-row remedy. Still takes no owner parameter.
+#[must_use]
+pub fn owner_gate_refusal_with_reason(
+    error: &str,
+    caller: Option<&str>,
+    resource: RefusedResource<'_>,
+    reason: &str,
+) -> axum::response::Response {
+    let mut body = owner_gate_refusal_body(error, caller, resource);
+    body.insert("reason".to_string(), json!(reason));
+    (StatusCode::FORBIDDEN, Json(serde_json::Value::Object(body))).into_response()
+}
+
+fn owner_gate_refusal_body(
+    error: &str,
+    caller: Option<&str>,
+    resource: RefusedResource<'_>,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut body = serde_json::Map::new();
+    body.insert("error".to_string(), json!(error));
+    body.insert(
+        "code".to_string(),
+        json!(crate::errors::error_codes::NOT_OWNER),
+    );
+    if let Some(caller) = caller {
+        body.insert("caller".to_string(), json!(caller));
+    }
+    resource.write_into(&mut body);
+    body
+}
+
+/// #3426 / #3339 — the hide-on-write refusal for a row the caller is not
+/// entitled to READ, byte-identical to the `404` body the read path and
+/// the postgres branch already return, so a non-owner cannot tell
+/// "exists but not yours" from "does not exist".
+#[must_use]
+pub fn hidden_row_refusal() -> axum::response::Response {
+    (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response()
 }

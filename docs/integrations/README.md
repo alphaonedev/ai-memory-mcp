@@ -42,7 +42,7 @@ agents and humans always know exactly what's loaded and what's configured.
 ```
 
 > DOC-4 (med/low review batch) — example version + schema bumped to
-> match the current v1.0.0 substrate (`CURRENT_SCHEMA_VERSION = 98`).
+> match the current v1.0.0 substrate (`CURRENT_SCHEMA_VERSION = 100`).
 > The pre-v0.7.0 example showed v0.6.3 / schema v19, which was many
 > migrations behind the substrate and major releases behind the
 > daemon binary integrators land on today.
@@ -171,7 +171,7 @@ recipe's snippets and `ai-memory wrap <agent>` (PR-6).
 | [`networking.md`](networking.md) | macOS + Tailscale / VPN per-app intercept gotchas (#704) and tailnet-IP workarounds | n/a | n/a | reference |
 | [`global-claude-md-template.md`](global-claude-md-template.md) | `~/.claude/CLAUDE.md` belt-and-suspenders snippet | 1 fallback | n/a | reference |
 | [`v0.6.4-system-prompt-snippet.md`](v0.6.4-system-prompt-snippet.md) | v0.6.4 discovery-aware NHI bootstrap (drop-in for any harness) | n/a | n/a | reference |
-| [`llm-backends.md`](llm-backends.md) | Per-backend MCP `env:` block recipes (Ollama, LMStudio, xAI, OpenAI, Anthropic, Gemini, DeepSeek, Kimi, Qwen, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks, vLLM, llama.cpp). Closes #1144 (operator paper-cut: shell env doesn't reach MCP subprocesses). | n/a | n/a | reference |
+| [`llm-backends.md`](llm-backends.md) | Per-backend MCP `env:` block recipes (Ollama, LMStudio, xAI, OpenAI, Anthropic, Gemini, Kimi, Qwen, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks, vLLM, llama.cpp). Closes #1144 (operator paper-cut: shell env doesn't reach MCP subprocesses). | n/a | n/a | reference |
 | [`mobile.md`](mobile.md) | Consumer-signs-at-integration discipline for iOS + Android release artifacts (#1247 / PR #1283); xcframework + jniLibs layout, code-signing handoff to the consuming app, mobile-runtime CI subset. | n/a | n/a | reference |
 
 ## Failure modes (any recipe)

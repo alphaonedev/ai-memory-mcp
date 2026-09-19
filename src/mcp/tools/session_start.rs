@@ -90,7 +90,7 @@ pub(crate) fn handle_session_start(
         None,
         None, // #1834 valid_at (no as-of)
     )
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| crate::mcp::error_text::mcp_foreign_err("valid_at", e))?;
 
     // v0.7.0 #1420 — apply scope=private visibility filter. Pre-fix,
     // `handle_session_start` forwarded `db::list`'s un-filtered result

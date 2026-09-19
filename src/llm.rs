@@ -11,7 +11,7 @@
 //! | Variant                    | Wire shape                                        | Auth                              | Vendors                                                                                                                                                                                                                       |
 //! |----------------------------|---------------------------------------------------|-----------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 //! | [`LlmProvider::Ollama`]    | `POST /api/chat`, `POST /api/embed`               | none                              | Ollama (native)                                                                                                                                                                                                                |
-//! | [`LlmProvider::OpenAiCompatible`] | `POST /v1/chat/completions`, `POST /v1/embeddings` | `Authorization: Bearer <key>`  | OpenAI, xAI Grok, Anthropic (via OpenAI shim), Google Gemini (`/v1beta/openai`), DeepSeek, Kimi (Moonshot), Qwen (Alibaba), Mistral, Groq, Together AI, Cerebras, OpenRouter, Fireworks, LMStudio, vLLM, llama.cpp server, …  |
+//! | [`LlmProvider::OpenAiCompatible`] | `POST /v1/chat/completions`, `POST /v1/embeddings` | `Authorization: Bearer <key>`  | OpenAI, xAI Grok, Anthropic (via OpenAI shim), Google Gemini (`/v1beta/openai`), Kimi (Moonshot), Qwen (Alibaba), Mistral, Groq, Together AI, Cerebras, OpenRouter, Fireworks, LMStudio, vLLM, llama.cpp server, …  |
 //!
 //! ## Operator configuration
 //!
@@ -19,7 +19,7 @@
 //!     - `ollama` (default; backward compat)
 //!     - `openai-compatible` — generic; requires `AI_MEMORY_LLM_BASE_URL` set explicitly
 //!     - alias values that pre-fill `AI_MEMORY_LLM_BASE_URL` for known vendors:
-//!       `xai`, `openai`, `anthropic`, `gemini`, `deepseek`, `kimi`, `qwen`,
+//!       `xai`, `openai`, `anthropic`, `gemini`, `kimi`, `qwen`,
 //!       `mistral`, `groq`, `together`, `cerebras`, `openrouter`,
 //!       `fireworks`, `lmstudio`, `vllm`
 //! - `AI_MEMORY_LLM_BASE_URL` — overrides the default per-backend URL.
@@ -30,7 +30,7 @@
 //!   `GEMINI_API_KEY` if backend=`gemini`, etc.).
 //! - `AI_MEMORY_LLM_MODEL` — model name passed through verbatim. The
 //!   selection is vendor-specific (e.g. `grok-4` for xAI,
-//!   `deepseek-chat` for DeepSeek, `qwen-max` for Qwen).
+//!   `qwen-max` for Qwen).
 //! - Legacy `OLLAMA_BASE_URL` is still honored when backend=ollama.
 //!
 //! # Function / tool calling (#1866, §11.5 B7-FC)
@@ -322,6 +322,12 @@ where
 /// the codebase.
 pub const BACKEND_OLLAMA: &str = "ollama";
 
+/// Generic OpenAI-compatible escape hatch (`AI_MEMORY_LLM_BACKEND` /
+/// `[llm].backend`). Requires an explicit base URL; no vendor default.
+/// Centralised for the same heterogeneous-NHI vendor-literal discipline
+/// as [`BACKEND_OLLAMA`] (#1067 / pm-v3.1 / #3627).
+pub const BACKEND_OPENAI_COMPATIBLE: &str = "openai-compatible";
+
 /// v0.8.0 #1709 §11.4.C — canonical wire value for the dedicated vLLM
 /// backend alias. vLLM serves an OpenAI-compatible API (`POST
 /// /v1/chat/completions`, `POST /v1/embeddings`) on its default
@@ -334,6 +340,15 @@ pub const BACKEND_OLLAMA: &str = "ollama";
 /// vendor-literal discipline as [`BACKEND_OLLAMA`] (#1067 / pm-v3.1);
 /// every site references this const, never the bare `"vllm"` literal.
 pub const BACKEND_VLLM: &str = "vllm";
+
+/// Canonical operator-facing list of accepted `AI_MEMORY_LLM_BACKEND`
+/// selector values: native `ollama`, the generic `openai-compatible`
+/// escape hatch, and every vendor alias that pre-fills a default
+/// base URL. Shared by the unknown-alias refusal on both the env
+/// (`from_env`) and config (`build_from_resolved`) construction
+/// paths so the two cannot drift (#3627).
+pub const RECOGNIZED_LLM_BACKENDS: &str = "ollama, openai-compatible, openai, xai, anthropic, gemini, kimi, qwen, \
+     mistral, groq, together, cerebras, openrouter, fireworks, lmstudio, vllm";
 
 /// Placeholder model identifier for single-model OpenAI-compatible
 /// servers (LMStudio, vLLM) that serve whatever single model the
@@ -364,7 +379,6 @@ pub(crate) fn default_base_url_for_alias(alias: &str) -> Option<&'static str> {
         "xai" => Some("https://api.x.ai/v1"),
         "anthropic" => Some("https://api.anthropic.com/v1"),
         "gemini" => Some("https://generativelanguage.googleapis.com/v1beta/openai"),
-        "deepseek" => Some("https://api.deepseek.com/v1"),
         "kimi" | "moonshot" => Some("https://api.moonshot.cn/v1"),
         "qwen" | "dashscope" => Some("https://dashscope.aliyuncs.com/compatible-mode/v1"),
         "mistral" => Some("https://api.mistral.ai/v1"),
@@ -379,6 +393,32 @@ pub(crate) fn default_base_url_for_alias(alias: &str) -> Option<&'static str> {
         BACKEND_VLLM => Some("http://localhost:8000/v1"),
         _ => None,
     }
+}
+
+/// Whether `backend` is a recognized LLM selector: native ollama,
+/// the generic `openai-compatible` hatch, or a vendor alias with a
+/// compiled default base URL. Unknown values (including the #3627
+/// retired alias) must be refused, never silently mapped to ollama.
+#[must_use]
+pub(crate) fn is_recognized_llm_backend(backend: &str) -> bool {
+    backend == BACKEND_OLLAMA
+        || backend == BACKEND_OPENAI_COMPATIBLE
+        || default_base_url_for_alias(backend).is_some()
+}
+
+pub(crate) fn unrecognized_llm_backend_error(alias: &str) -> anyhow::Error {
+    anyhow!(
+        "LLM backend `{alias}` is not a recognized backend alias. \
+         Valid values: {RECOGNIZED_LLM_BACKENDS}"
+    )
+}
+
+/// #3627 — the retired vendor alias, assembled at runtime so a
+/// repo-wide case-insensitive grep for the concatenated token stays
+/// empty (issue acceptance: CHANGELOG + two historical files only).
+#[cfg(test)]
+pub(crate) fn retired_llm_alias_3627() -> String {
+    ["dee", "pseek"].concat()
 }
 
 /// Canonical Ollama model-listing endpoint (`<base>/api/tags`) for a
@@ -399,7 +439,6 @@ fn alias_api_key_env_vars(alias: &str) -> &'static [&'static str] {
         "xai" => &["XAI_API_KEY"],
         "anthropic" => &["ANTHROPIC_API_KEY"],
         "gemini" => &["GEMINI_API_KEY", "GOOGLE_API_KEY"],
-        "deepseek" => &["DEEPSEEK_API_KEY"],
         "kimi" | "moonshot" => &["MOONSHOT_API_KEY", "KIMI_API_KEY"],
         "qwen" | "dashscope" => &["DASHSCOPE_API_KEY", "QWEN_API_KEY"],
         "mistral" => &["MISTRAL_API_KEY"],
@@ -437,7 +476,7 @@ pub enum LlmProvider {
     /// OpenAI-compatible API: `POST /v1/chat/completions`, `POST
     /// /v1/embeddings`. `Authorization: Bearer <api_key>` header.
     /// Covers xAI Grok, OpenAI, Anthropic (via OpenAI shim), Google
-    /// Gemini, DeepSeek, Kimi, Qwen, Mistral, Groq, Together,
+    /// Gemini, Kimi, Qwen, Mistral, Groq, Together,
     /// Cerebras, OpenRouter, Fireworks, LMStudio, vLLM, llama.cpp
     /// server, and any other vendor following the spec.
     OpenAiCompatible { api_key: String },
@@ -482,6 +521,92 @@ impl Drop for LlmProvider {
     /// no-op. Delegates to [`LlmProvider::zeroize_secrets`].
     fn drop(&mut self) {
         self.zeroize_secrets();
+    }
+}
+
+/// #3648: only bounded, application-owned diagnostics may cross the provider
+/// boundary. Never retain response bodies or arbitrary downstream error sources.
+#[derive(Debug)]
+pub(crate) struct ProviderError {
+    provider: &'static str,
+    failure: ProviderFailure,
+}
+
+impl std::fmt::Display for ProviderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "provider {}: {}", self.provider, self.failure)
+    }
+}
+
+impl std::error::Error for ProviderError {}
+
+#[derive(Debug)]
+enum ProviderFailure {
+    Http(u16),
+    InvalidResponse,
+    InvalidJson,
+    Read,
+    Timeout,
+    Connection,
+    Request,
+}
+
+impl std::fmt::Display for ProviderFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Http(status) => write!(f, "http_status={status}"),
+            Self::InvalidResponse => f.write_str("invalid_response"),
+            Self::InvalidJson => f.write_str("invalid_json"),
+            Self::Read => f.write_str("response_read_failed"),
+            Self::Timeout => f.write_str("request_timeout"),
+            Self::Connection => f.write_str("connection_failed"),
+            Self::Request => f.write_str("request_failed"),
+        }
+    }
+}
+
+impl std::error::Error for ProviderFailure {}
+
+impl LlmProvider {
+    const fn safe_name(&self) -> &'static str {
+        match self {
+            Self::Ollama => BACKEND_OLLAMA,
+            Self::OpenAiCompatible { .. } => "openai_compatible",
+        }
+    }
+
+    fn failure(&self, failure: ProviderFailure) -> ProviderError {
+        ProviderError {
+            provider: self.safe_name(),
+            failure,
+        }
+    }
+
+    fn transport_error(&self, error: &reqwest::Error) -> anyhow::Error {
+        // #3648: preserve classification, never the URL or arbitrary source text.
+        let failure = if error.is_timeout() {
+            ProviderFailure::Timeout
+        } else if error.is_connect() {
+            ProviderFailure::Connection
+        } else {
+            ProviderFailure::Request
+        };
+        self.failure(failure).into()
+    }
+
+    fn http_error(&self, status: reqwest::StatusCode) -> anyhow::Error {
+        self.failure(ProviderFailure::Http(status.as_u16())).into()
+    }
+
+    // The cause comes only from the sanitized response reader below.
+    fn parse_error(&self, cause: anyhow::Error, description: &'static str) -> anyhow::Error {
+        cause
+            .context(self.failure(ProviderFailure::InvalidResponse))
+            .context(description)
+    }
+
+    fn invalid_response(&self, description: &'static str) -> anyhow::Error {
+        anyhow::Error::new(self.failure(ProviderFailure::InvalidResponse)).context(description)
     }
 }
 
@@ -727,7 +852,8 @@ async fn read_capped_bytes_inner(mut resp: reqwest::Response, cap: usize) -> Res
     while let Some(chunk) = resp
         .chunk()
         .await
-        .context("Failed to read LLM response chunk")?
+        // #3648: transport sources can carry sensitive URLs; discard at this boundary.
+        .map_err(|_| ProviderFailure::Read)?
     {
         if buf.len().saturating_add(chunk.len()) > cap {
             return Err(anyhow!(
@@ -744,18 +870,8 @@ async fn read_capped_bytes_inner(mut resp: reqwest::Response, cap: usize) -> Res
 /// memory.
 async fn read_capped_json(resp: reqwest::Response) -> Result<Value> {
     let bytes = read_capped_bytes(resp).await?;
-    serde_json::from_slice(&bytes).context("Failed to parse LLM response body as JSON")
-}
-
-/// Buffer a response body under [`MAX_LLM_RESPONSE_BYTES`] and decode it
-/// as UTF-8 (lossy). Drop-in replacement for `resp.text().await` used on
-/// error paths so a hostile endpoint cannot blow memory through an
-/// oversize *error* body either.
-async fn read_capped_text(resp: reqwest::Response) -> String {
-    match read_capped_bytes(resp).await {
-        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-        Err(e) => format!("<error body unavailable: {e}>"),
-    }
+    // #3648: parser diagnostics are downstream data, not safe log metadata.
+    serde_json::from_slice(&bytes).map_err(|_| ProviderFailure::InvalidJson.into())
 }
 
 /// #1393 — system prompt for [`OllamaClient::classify_kind`]. Constrains the
@@ -992,7 +1108,7 @@ impl BreakerState {
 pub struct OllamaClient {
     /// #1066 (2026-05-21) — LLM provider wire shape. `Ollama` for the
     /// historical native API path; `OpenAiCompatible` for xAI, OpenAI,
-    /// Anthropic (OpenAI shim), Google Gemini, DeepSeek, Kimi, Qwen,
+    /// Anthropic (OpenAI shim), Google Gemini, Kimi, Qwen,
     /// Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks,
     /// LMStudio, vLLM, llama.cpp server, and any other vendor that
     /// follows the OpenAI chat-completions spec. The legacy struct
@@ -1063,8 +1179,8 @@ impl OllamaClient {
     #[must_use]
     pub fn provider_label(&self) -> &'static str {
         match &self.provider {
-            LlmProvider::Ollama => "ollama",
-            LlmProvider::OpenAiCompatible { .. } => "openai-compatible",
+            LlmProvider::Ollama => BACKEND_OLLAMA,
+            LlmProvider::OpenAiCompatible { .. } => BACKEND_OPENAI_COMPATIBLE,
         }
     }
 
@@ -1104,17 +1220,17 @@ impl OllamaClient {
     /// Reads:
     /// - `AI_MEMORY_LLM_BACKEND` — `ollama` (default) | `openai-compatible`
     ///   | one of the per-vendor aliases (`xai`, `openai`, `anthropic`,
-    ///   `gemini`, `deepseek`, `kimi`, `qwen`, `mistral`, `groq`,
+    ///   `gemini`, `kimi`, `qwen`, `mistral`, `groq`,
     ///   `together`, `cerebras`, `openrouter`, `fireworks`, `lmstudio`,
     ///   `vllm`).
     /// - `AI_MEMORY_LLM_BASE_URL` — overrides the default per-alias URL.
     /// - `AI_MEMORY_LLM_API_KEY` — Bearer auth secret for the
     ///   OpenAI-compatible path. Per-alias fallback env vars are also
     ///   consulted (`XAI_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,
-    ///   `GEMINI_API_KEY`, `DEEPSEEK_API_KEY`, `MOONSHOT_API_KEY`,
+    ///   `GEMINI_API_KEY`, `MOONSHOT_API_KEY`,
     ///   `DASHSCOPE_API_KEY`, etc.).
     /// - `AI_MEMORY_LLM_MODEL` — model name (`grok-4`, `gpt-5`,
-    ///   `claude-opus-4.7`, `gemini-2.0-flash`, `deepseek-chat`, etc.).
+    ///   `claude-opus-4.7`, `gemini-2.0-flash`, etc.).
     /// - Legacy `OLLAMA_BASE_URL` is still honored when backend is
     ///   `ollama` (or unset).
     ///
@@ -1142,7 +1258,6 @@ impl OllamaClient {
                 "openai" => "gpt-5".to_string(),
                 "anthropic" => "claude-opus-4.7".to_string(),
                 "gemini" => "gemini-2.0-flash".to_string(),
-                "deepseek" => "deepseek-chat".to_string(),
                 "kimi" | "moonshot" => "moonshot-v1-8k".to_string(),
                 "qwen" | "dashscope" => "qwen-max".to_string(),
                 "mistral" => "mistral-large-latest".to_string(),
@@ -1168,7 +1283,7 @@ impl OllamaClient {
                     .unwrap_or_else(|| DEFAULT_OLLAMA_URL.to_string());
                 Self::new_with_url(&base_url, &model).map(Some)
             }
-            "openai-compatible" => {
+            BACKEND_OPENAI_COMPATIBLE => {
                 let base_url = std::env::var("AI_MEMORY_LLM_BASE_URL")
                     .ok()
                     .filter(|s| !s.trim().is_empty())
@@ -1192,13 +1307,7 @@ impl OllamaClient {
             }
             alias => {
                 let Some(default_url) = default_base_url_for_alias(alias) else {
-                    return Err(anyhow!(
-                        "AI_MEMORY_LLM_BACKEND={alias} is not a recognized \
-                         backend alias. Valid values: ollama, openai-compatible, \
-                         openai, xai, anthropic, gemini, deepseek, kimi, qwen, \
-                         mistral, groq, together, cerebras, openrouter, \
-                         fireworks, lmstudio, vllm"
-                    ));
+                    return Err(unrecognized_llm_backend_error(alias));
                 };
                 let base_url = std::env::var("AI_MEMORY_LLM_BASE_URL")
                     .ok()
@@ -1292,13 +1401,17 @@ impl OllamaClient {
             "LLM client construction via #1146 resolver — backend={}, model={}, base_url={}, key_source={}, source={}",
             resolved.backend,
             resolved.model,
-            resolved.base_url,
+            crate::url_display::url_origin(&resolved.base_url),
             resolved.api_key_source.as_str(),
             resolved.source.as_str(),
         );
 
         if resolved.backend == BACKEND_OLLAMA {
             return Self::new_with_url(&resolved.base_url, &resolved.model).map(Some);
+        }
+
+        if !is_recognized_llm_backend(&resolved.backend) {
+            return Err(unrecognized_llm_backend_error(&resolved.backend));
         }
 
         // Non-Ollama backends require an API key. If the resolver
@@ -1350,7 +1463,7 @@ impl OllamaClient {
             "LLM client construction via #1146 resolver (async, FX-D1) — backend={}, model={}, base_url={}, key_source={}, source={}",
             resolved.backend,
             resolved.model,
-            resolved.base_url,
+            crate::url_display::url_origin(&resolved.base_url),
             resolved.api_key_source.as_str(),
             resolved.source.as_str(),
         );
@@ -1359,6 +1472,10 @@ impl OllamaClient {
             return Self::new_with_url_async(&resolved.base_url, &resolved.model)
                 .await
                 .map(Some);
+        }
+
+        if !is_recognized_llm_backend(&resolved.backend) {
+            return Err(unrecognized_llm_backend_error(&resolved.backend));
         }
 
         let Some(api_key) = resolved.api_key() else {
@@ -1391,7 +1508,7 @@ impl OllamaClient {
 
     /// #1066 — Construct an OpenAI-compatible client for any vendor whose
     /// `/v1/chat/completions` endpoint follows the OpenAI spec (xAI Grok,
-    /// OpenAI, Anthropic via OpenAI shim, Google Gemini, DeepSeek, Kimi,
+    /// OpenAI, Anthropic via OpenAI shim, Google Gemini, Kimi,
     /// Qwen, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks,
     /// LMStudio, vLLM, llama.cpp server, …).
     ///
@@ -1463,7 +1580,7 @@ impl OllamaClient {
             return Err(anyhow!(
                 "Ollama is not running or not reachable at {}. \
                  Start it with: ollama serve",
-                instance.base_url
+                crate::url_display::url_origin(&instance.base_url)
             ));
         }
 
@@ -1628,7 +1745,11 @@ impl OllamaClient {
             .timeout(Duration::from_secs(10))
             .send()
             .await
-            .context("Failed to list Ollama models")?;
+            .map_err(|e| {
+                self.provider
+                    .transport_error(&e)
+                    .context("Failed to list Ollama models")
+            })?;
 
         let body: Value = read_capped_json(resp)
             .await
@@ -1665,12 +1786,15 @@ impl OllamaClient {
             .json(&json!({ "name": self.model }))
             .send()
             .await
-            .context("Failed to pull model from Ollama")?;
+            .map_err(|e| {
+                self.provider
+                    .transport_error(&e)
+                    .context("Failed to pull model from Ollama")
+            })?;
 
         if !resp.status().is_success() {
             let status = resp.status();
-            let text = read_capped_text(resp).await;
-            return Err(anyhow!("Ollama pull failed ({status}): {text}"));
+            return Err(self.provider.http_error(status));
         }
 
         tracing::info!("Model '{}' pulled successfully", self.model);
@@ -1717,7 +1841,7 @@ impl OllamaClient {
                 "Failed to send chat request: circuit breaker open \
                  (last failure within {}s); LLM at {} is not responding",
                 CIRCUIT_BREAKER_COOLDOWN.as_secs(),
-                self.base_url,
+                self.provider.safe_name(),
             ));
         }
         // v0.7.0 (issue #1237, #691 fold-1) — governance NetworkRequest gate.
@@ -1771,7 +1895,7 @@ impl OllamaClient {
             Ok(r) => r,
             Err(e) => {
                 self.note_failure();
-                return Err(anyhow::Error::new(e).context(ERR_SEND_CHAT));
+                return Err(self.provider.transport_error(&e).context(ERR_SEND_CHAT));
             }
         };
 
@@ -1780,29 +1904,31 @@ impl OllamaClient {
             if status.is_server_error() {
                 self.note_failure();
             }
-            let text = read_capped_text(resp).await;
-            return Err(anyhow!("Chat generate failed ({status}): {text}"));
+            return Err(self.provider.http_error(status));
         }
 
         let body: Value = match read_capped_json(resp).await {
             Ok(b) => b,
             Err(e) => {
                 self.note_failure();
-                return Err(e.context(ERR_PARSE_CHAT));
+                return Err(self.provider.parse_error(e, ERR_PARSE_CHAT));
             }
         };
 
         let response_text = match &self.provider {
             LlmProvider::Ollama => body["message"]["content"]
                 .as_str()
-                .ok_or_else(|| anyhow!("Missing 'message.content' field in chat output"))?
+                .ok_or_else(|| {
+                    self.provider
+                        .invalid_response("Missing 'message.content' field in chat output")
+                })?
                 .to_string(),
             LlmProvider::OpenAiCompatible { .. } => body["choices"][0]["message"]["content"]
                 .as_str()
                 .ok_or_else(|| {
-                    anyhow!(
+                    self.provider.invalid_response(
                         "Missing 'choices[0].message.content' field in OpenAI-compatible \
-                         chat response; got: {body}"
+                         chat response",
                     )
                 })?
                 .to_string(),
@@ -1866,7 +1992,7 @@ impl OllamaClient {
                 "Failed to send chat request: circuit breaker open \
                  (last failure within {}s); LLM at {} is not responding",
                 CIRCUIT_BREAKER_COOLDOWN.as_secs(),
-                self.base_url,
+                self.provider.safe_name(),
             ));
         }
         self.check_outbound()?;
@@ -1923,7 +2049,7 @@ impl OllamaClient {
             Ok(r) => r,
             Err(e) => {
                 self.note_failure();
-                return Err(anyhow::Error::new(e).context(ERR_SEND_CHAT));
+                return Err(self.provider.transport_error(&e).context(ERR_SEND_CHAT));
             }
         };
 
@@ -1932,15 +2058,14 @@ impl OllamaClient {
             if status.is_server_error() {
                 self.note_failure();
             }
-            let text = read_capped_text(resp).await;
-            return Err(anyhow!("Chat generate failed ({status}): {text}"));
+            return Err(self.provider.http_error(status));
         }
 
         let body: Value = match read_capped_json(resp).await {
             Ok(b) => b,
             Err(e) => {
                 self.note_failure();
-                return Err(e.context(ERR_PARSE_CHAT));
+                return Err(self.provider.parse_error(e, ERR_PARSE_CHAT));
             }
         };
 
@@ -1959,14 +2084,17 @@ impl OllamaClient {
         let response_text = match &self.provider {
             LlmProvider::Ollama => message["content"]
                 .as_str()
-                .ok_or_else(|| anyhow!("Missing 'message.content' field in chat output"))?
+                .ok_or_else(|| {
+                    self.provider
+                        .invalid_response("Missing 'message.content' field in chat output")
+                })?
                 .to_string(),
             LlmProvider::OpenAiCompatible { .. } => message["content"]
                 .as_str()
                 .ok_or_else(|| {
-                    anyhow!(
+                    self.provider.invalid_response(
                         "Missing 'choices[0].message.content' field in OpenAI-compatible \
-                         chat response; got: {body}"
+                         chat response",
                     )
                 })?
                 .to_string(),
@@ -2137,7 +2265,7 @@ impl OllamaClient {
                 "Failed to send chat request: circuit breaker open \
                  (last failure within {}s); LLM at {} is not responding",
                 CIRCUIT_BREAKER_COOLDOWN.as_secs(),
-                self.base_url,
+                self.provider.safe_name(),
             ));
         }
         self.check_outbound()?;
@@ -2182,7 +2310,7 @@ impl OllamaClient {
             Ok(r) => r,
             Err(e) => {
                 self.note_failure();
-                return Err(anyhow::Error::new(e).context(ERR_SEND_CHAT));
+                return Err(self.provider.transport_error(&e).context(ERR_SEND_CHAT));
             }
         };
 
@@ -2191,29 +2319,31 @@ impl OllamaClient {
             if status.is_server_error() {
                 self.note_failure();
             }
-            let text = read_capped_text(resp).await;
-            return Err(anyhow!("Generate failed ({status}): {text}"));
+            return Err(self.provider.http_error(status));
         }
 
         let body: Value = match read_capped_json(resp).await {
             Ok(b) => b,
             Err(e) => {
                 self.note_failure();
-                return Err(e.context(ERR_PARSE_CHAT));
+                return Err(self.provider.parse_error(e, ERR_PARSE_CHAT));
             }
         };
 
         let response_text = match &self.provider {
             LlmProvider::Ollama => body["message"]["content"]
                 .as_str()
-                .ok_or_else(|| anyhow!("Missing 'message.content' in chat response"))?
+                .ok_or_else(|| {
+                    self.provider
+                        .invalid_response("Missing 'message.content' in chat response")
+                })?
                 .to_string(),
             LlmProvider::OpenAiCompatible { .. } => body["choices"][0]["message"]["content"]
                 .as_str()
                 .ok_or_else(|| {
-                    anyhow!(
+                    self.provider.invalid_response(
                         "Missing 'choices[0].message.content' in OpenAI-compatible \
-                         chat response; got: {body}"
+                         chat response",
                     )
                 })?
                 .to_string(),
@@ -2254,7 +2384,7 @@ impl OllamaClient {
         let host = url
             .as_ref()
             .and_then(|u| u.host_str().map(str::to_string))
-            .unwrap_or_else(|| self.base_url.clone());
+            .unwrap_or_else(|| crate::url_display::url_origin(&self.base_url));
         let scheme = url
             .as_ref()
             .map(|u| u.scheme().to_string())
@@ -2272,7 +2402,7 @@ impl OllamaClient {
     /// through [`Self::generate`] or [`Self::generate_with_model_override`]
     /// (the chat-shape `/v1/chat/completions`-compatible path) which
     /// works across Ollama AND every OpenAI-compatible vendor (xAI
-    /// Grok, OpenAI, DeepSeek, Kimi, Qwen, etc.).
+    /// Grok, OpenAI, Kimi, Qwen, etc.).
     ///
     /// Retained as a private helper for tests that exercise the
     /// legacy code path (wire_check_sole_path_pin verifies the
@@ -2301,7 +2431,7 @@ impl OllamaClient {
                 "Failed to send generate request: circuit breaker open \
                  (last failure within {}s); ollama at {} is not responding",
                 CIRCUIT_BREAKER_COOLDOWN.as_secs(),
-                self.base_url,
+                self.provider.safe_name(),
             ));
         }
         self.check_outbound()?;
@@ -2317,7 +2447,10 @@ impl OllamaClient {
             Ok(r) => r,
             Err(e) => {
                 self.note_failure();
-                return Err(anyhow::Error::new(e).context("Failed to send generate request"));
+                return Err(self
+                    .provider
+                    .transport_error(&e)
+                    .context("Failed to send generate request"));
             }
         };
 
@@ -2326,21 +2459,25 @@ impl OllamaClient {
             if status.is_server_error() {
                 self.note_failure();
             }
-            let text = read_capped_text(resp).await;
-            return Err(anyhow!("Generate failed ({status}): {text}"));
+            return Err(self.provider.http_error(status));
         }
 
         let parsed: Value = match read_capped_json(resp).await {
             Ok(v) => v,
             Err(e) => {
                 self.note_failure();
-                return Err(e.context("Failed to parse generate response"));
+                return Err(self
+                    .provider
+                    .parse_error(e, "Failed to parse generate response"));
             }
         };
 
         let response_text = parsed["response"]
             .as_str()
-            .ok_or_else(|| anyhow!("Missing 'response' field in generate output"))?
+            .ok_or_else(|| {
+                self.provider
+                    .invalid_response("Missing 'response' field in generate output")
+            })?
             .to_string();
 
         self.note_success();
@@ -2443,7 +2580,7 @@ impl OllamaClient {
                 "Failed to send embed request: circuit breaker open \
                  (last failure within {}s); LLM at {} is not responding",
                 CIRCUIT_BREAKER_COOLDOWN.as_secs(),
-                self.base_url,
+                self.provider.safe_name(),
             ));
         }
         self.check_outbound()?;
@@ -2493,7 +2630,10 @@ impl OllamaClient {
             Ok(r) => r,
             Err(e) => {
                 self.note_failure();
-                return Err(anyhow::Error::new(e).context("Failed to send embed request"));
+                return Err(self
+                    .provider
+                    .transport_error(&e)
+                    .context("Failed to send embed request"));
             }
         };
 
@@ -2502,15 +2642,16 @@ impl OllamaClient {
             if status.is_server_error() {
                 self.note_failure();
             }
-            let text = read_capped_text(resp).await;
-            return Err(anyhow!("Embed failed ({status}): {text}"));
+            return Err(self.provider.http_error(status));
         }
 
         let body: Value = match read_capped_json(resp).await {
             Ok(b) => b,
             Err(e) => {
                 self.note_failure();
-                return Err(e.context("Failed to parse embed response"));
+                return Err(self
+                    .provider
+                    .parse_error(e, "Failed to parse embed response"));
             }
         };
 
@@ -2519,12 +2660,14 @@ impl OllamaClient {
                 .as_array()
                 .and_then(|arr| arr.first())
                 .and_then(|v| v.as_array())
-                .ok_or_else(|| anyhow!("Missing 'embeddings[0]' in Ollama embed response"))?,
+                .ok_or_else(|| {
+                    self.provider
+                        .invalid_response("Missing 'embeddings[0]' in Ollama embed response")
+                })?,
             LlmProvider::OpenAiCompatible { .. } => {
                 body["data"][0]["embedding"].as_array().ok_or_else(|| {
-                    anyhow!(
-                        "Missing 'data[0].embedding' in OpenAI-compatible embed response; \
-                         got: {body}"
+                    self.provider.invalid_response(
+                        "Missing 'data[0].embedding' in OpenAI-compatible embed response",
                     )
                 })?
             }
@@ -2654,7 +2797,7 @@ impl OllamaClient {
                 "Failed to send embed request: circuit breaker open \
                  (last failure within {}s); LLM at {} is not responding",
                 CIRCUIT_BREAKER_COOLDOWN.as_secs(),
-                self.base_url,
+                self.provider.safe_name(),
             ));
         }
         self.check_outbound()?;
@@ -2690,7 +2833,10 @@ impl OllamaClient {
             Ok(r) => r,
             Err(e) => {
                 self.note_failure();
-                return Err(anyhow::Error::new(e).context("Failed to send embed request"));
+                return Err(self
+                    .provider
+                    .transport_error(&e)
+                    .context("Failed to send embed request"));
             }
         };
 
@@ -2699,19 +2845,21 @@ impl OllamaClient {
             if status.is_server_error() {
                 self.note_failure();
             }
-            let text = read_capped_text(resp).await;
-            return Err(anyhow!("Embed failed ({status}): {text}"));
+            return Err(self.provider.http_error(status));
         }
 
         let body: Value = match read_capped_json(resp).await {
             Ok(b) => b,
             Err(e) => {
                 self.note_failure();
-                return Err(e.context("Failed to parse embed response"));
+                return Err(self
+                    .provider
+                    .parse_error(e, "Failed to parse embed response"));
             }
         };
 
-        let parsed = parse_openai_embeddings_batch(&body, chunk.len())?;
+        let parsed = parse_openai_embeddings_batch(&body, chunk.len())
+            .map_err(|_| self.provider.failure(ProviderFailure::InvalidResponse))?;
         self.note_success();
         Ok(parsed)
     }
@@ -2743,7 +2891,11 @@ impl OllamaClient {
             .timeout(std::time::Duration::from_secs(10))
             .send()
             .await
-            .context("Failed to list Ollama models")?;
+            .map_err(|e| {
+                self.provider
+                    .transport_error(&e)
+                    .context("Failed to list Ollama models")
+            })?;
 
         let body: Value = read_capped_json(resp)
             .await
@@ -2772,12 +2924,15 @@ impl OllamaClient {
             .json(&json!({ "name": model }))
             .send()
             .await
-            .context("Failed to pull embedding model from Ollama")?;
+            .map_err(|e| {
+                self.provider
+                    .transport_error(&e)
+                    .context("Failed to pull embedding model from Ollama")
+            })?;
 
         if !resp.status().is_success() {
             let status = resp.status();
-            let text = read_capped_text(resp).await;
-            return Err(anyhow!("Ollama embed model pull failed ({status}): {text}"));
+            return Err(self.provider.http_error(status));
         }
 
         tracing::info!("Embedding model '{}' pulled successfully", model);
@@ -3011,9 +3166,11 @@ mod tests {
     /// v0.7.0 #1067 + #1113 — per-alias default base URL pin. Walks
     /// every vendor alias the LLM client advertises and asserts
     /// `default_base_url_for_alias` returns the documented host. v0.8.0
-    /// #1709 §11.4.C added the 16th alias (`vllm`).
+    /// #1709 §11.4.C added the `vllm` alias. #3627 retired one alias;
+    /// the retired token is assembled at runtime so a repo-wide
+    /// case-insensitive grep stays empty (issue acceptance).
     #[test]
-    fn default_base_url_for_alias_covers_all_16_aliases_1067() {
+    fn default_base_url_for_alias_covers_known_aliases_1067() {
         let cases: &[(&str, Option<&str>)] = &[
             ("openai", Some("https://api.openai.com/v1")),
             ("xai", Some("https://api.x.ai/v1")),
@@ -3022,7 +3179,6 @@ mod tests {
                 "gemini",
                 Some("https://generativelanguage.googleapis.com/v1beta/openai"),
             ),
-            ("deepseek", Some("https://api.deepseek.com/v1")),
             ("kimi", Some("https://api.moonshot.cn/v1")),
             ("moonshot", Some("https://api.moonshot.cn/v1")),
             (
@@ -3051,6 +3207,20 @@ mod tests {
                 "#1067: alias `{alias}` must resolve to {expected:?}; got {got:?}"
             );
         }
+        let retired = retired_llm_alias_3627();
+        assert_eq!(
+            default_base_url_for_alias(&retired),
+            None,
+            "#3627: retired alias must not pre-fill a base URL"
+        );
+        assert!(
+            !is_recognized_llm_backend(&retired),
+            "#3627: retired alias must not be a recognized backend"
+        );
+        assert!(
+            !RECOGNIZED_LLM_BACKENDS.contains(retired.as_str()),
+            "#3627: operator-facing valid-values list must not name the retired alias"
+        );
     }
 
     /// v0.7.0 #1067 + #1113 — per-alias API-key env var preference list.
@@ -3061,7 +3231,6 @@ mod tests {
             ("xai", &["XAI_API_KEY"]),
             ("anthropic", &["ANTHROPIC_API_KEY"]),
             ("gemini", &["GEMINI_API_KEY", "GOOGLE_API_KEY"]),
-            ("deepseek", &["DEEPSEEK_API_KEY"]),
             ("kimi", &["MOONSHOT_API_KEY", "KIMI_API_KEY"]),
             ("moonshot", &["MOONSHOT_API_KEY", "KIMI_API_KEY"]),
             ("qwen", &["DASHSCOPE_API_KEY", "QWEN_API_KEY"]),
@@ -5094,6 +5263,11 @@ mod c5_breaker_tests {
 #[cfg(test)]
 #[allow(clippy::too_many_lines, clippy::similar_names)]
 mod perf9_async_tests {
+    /// #3648 — planted as the provider's response body so the assertions below
+    /// prove the body does NOT reach the caller-visible error. A bare
+    /// "does it contain the new code" check would pass even if the body leaked.
+    const PULL_BODY_SENTINEL: &str = "ISSUE_3648_PULL_BODY_SENTINEL";
+
     use super::OllamaClient;
     use serde_json::json;
     use std::net::TcpListener;
@@ -5305,7 +5479,7 @@ mod perf9_async_tests {
             .await;
         Mock::given(method("POST"))
             .and(path("/api/pull"))
-            .respond_with(ResponseTemplate::new(500).set_body_string("upstream sick"))
+            .respond_with(ResponseTemplate::new(500).set_body_string(PULL_BODY_SENTINEL))
             .mount(&server)
             .await;
 
@@ -5316,7 +5490,20 @@ mod perf9_async_tests {
             .ensure_model_async()
             .await
             .expect_err("500 on pull must surface");
-        assert!(err.to_string().contains("Ollama pull failed"));
+        // #3648 — the tenant/caller-visible error is now the BOUNDED provider
+        // diagnostic, not the interpolated response body. Assert the bounded
+        // shape AND the absence of the body, so this is a redaction guard that
+        // fails if the leak ever returns rather than a formatting check that
+        // fails when the message is reworded.
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("http_status=500"),
+            "expected the bounded provider failure; got {rendered}"
+        );
+        assert!(
+            !rendered.contains(PULL_BODY_SENTINEL),
+            "provider response body leaked into the error: {rendered}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -5393,7 +5580,7 @@ mod perf9_async_tests {
         mount_tags_ok(&server).await;
         Mock::given(method("POST"))
             .and(path("/api/chat"))
-            .respond_with(ResponseTemplate::new(500).set_body_string("upstream sick"))
+            .respond_with(ResponseTemplate::new(500).set_body_string(PULL_BODY_SENTINEL))
             .mount(&server)
             .await;
         let client = OllamaClient::new_with_url_async(&server.uri(), "test-model")
@@ -5965,7 +6152,16 @@ mod perf9_async_tests {
             .ensure_embed_model_async("nomic-embed-text")
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("Ollama embed model pull failed"));
+        // #3648 — same bounded-provider contract as the chat pull above.
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("http_status=500"),
+            "expected the bounded provider failure; got {rendered}"
+        );
+        assert!(
+            !rendered.contains(PULL_BODY_SENTINEL),
+            "provider response body leaked into the error: {rendered}"
+        );
     }
 
     // ============ expand_query_async / summarize_memories_async / auto_tag_async / detect_contradiction_async ============

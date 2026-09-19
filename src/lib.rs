@@ -437,7 +437,7 @@ pub const META_KEY_FAMILY: &str = "family";
 // Re-derived from the ACTUAL count on the rebase base rather than carried
 // forward: the pre-rebase branch read 99/85 against a 97/83 base, and adding
 // its own delta to a moved base is exactly how a route-count SSOT drifts.
-pub const EXPECTED_PRODUCTION_ROUTES_COUNT: usize = 100;
+pub const EXPECTED_PRODUCTION_ROUTES_COUNT: usize = 102;
 // 2026-06-22 (#1718 Commit C) — bumped 89 → 90: the coordination
 // action-transition write surface `POST /api/v1/actions/{id}/transition`
 // (`handlers::transition_action`) — local CAS write + W-of-N federation fanout.
@@ -477,7 +477,8 @@ pub const EXPECTED_TEST_ROUTES_COUNT: usize = 3;
 // 2026-09-06 (#3474) — bumped 84 → 86: the two new unique paths
 // `/api/v1/agents/{id}/api-key` (admin mint/bind) and
 // `/api/v1/agents/{id}/api-key/revoke` (admin revoke, approval-gated).
-pub const EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT: usize = 86;
+// #3646 adds authenticated monitoring status and numeric exposition.
+pub const EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT: usize = 88;
 
 // ---------------------------------------------------------------------------
 // v0.7.0 multi-agent literal-sweep (scanner A, finding F-A3.1) —
@@ -691,6 +692,33 @@ pub fn inbox_namespace(target_agent: &str) -> String {
     format!("{INBOX_NAMESPACE_PREFIX}{target_agent}")
 }
 
+/// v1.0.0 #3639 — metadata key that carries the caller's ORIGINAL notify
+/// title (the "subject" a recipient reads) on every inbox row.
+pub const INBOX_SUBJECT_META_KEY: &str = "subject";
+
+/// v1.0.0 #3639 — how many leading characters of the row id the stored
+/// inbox title carries as its uniqueness suffix.
+pub const INBOX_TITLE_ID_CHARS: usize = 8;
+
+/// v1.0.0 #3639 — the STORED title of an inbox row: `<subject> [<id prefix>]`.
+///
+/// Inbox rows are unique by construction. Before #3639 a repeated subject to
+/// the same recipient landed on the `(title, namespace)` upsert, which
+/// replaced the earlier body IN PLACE while keeping the FIRST sender's
+/// `metadata.agent_id` (loss plus impersonation on the durable A2A record)
+/// and handed both senders the same row id. Minting the stored title from
+/// the fresh row id means two deliveries can never share a key, every notify
+/// funnel on both backends inserts with the refuse-on-conflict arm, and the
+/// caller's subject is kept verbatim in `metadata.subject`. The subject part
+/// is bounded so the stored title never exceeds the validated title ceiling.
+#[must_use]
+pub fn inbox_stored_title(subject: &str, row_id: &str) -> String {
+    let prefix: String = row_id.chars().take(INBOX_TITLE_ID_CHARS).collect();
+    let budget = validate::MAX_TITLE_LEN.saturating_sub(INBOX_TITLE_ID_CHARS + 3);
+    let head: String = subject.trim().chars().take(budget).collect();
+    format!("{head} [{prefix}]")
+}
+
 pub mod approvals;
 // v0.7.0 WT-1-B — substrate-level atomisation engine. Decomposes
 // long-form memories into atomic propositions with full provenance
@@ -758,6 +786,8 @@ pub mod cost;
 pub mod curator;
 pub mod daemon_runtime;
 pub mod durability;
+/// Durability evidence carried by write receipts (#3555).
+pub mod write_receipt;
 // v1.0.0 #2064 (TRACT-gap G16, #1830) — opt-in erasure-coded archive
 // cold-tier redundancy layer (operator-authorized reed-solomon-simd dep).
 pub mod erasure;
@@ -769,6 +799,11 @@ pub mod erasure;
 pub mod storage;
 /// #1927/#2444/#2679 — store-URL channel resolution + fail-closed postgres scheme guard.
 pub mod store_url;
+/// v1.0.0 #3711 family — allowlist rendering of URLs (scheme / host / port /
+/// database) and the closed-vocabulary transport-failure class, for every
+/// log line, refusal, doctor fact and stored record that used to print a
+/// masked DSN or a `reqwest::Error`.
+pub mod url_display;
 
 // Backward-compat shim from L0.5-3 rename — preserves
 // `crate::db::*` paths used elsewhere in the codebase. To be
@@ -842,6 +877,9 @@ pub mod export_taxonomy;
 // markers (stderr WARN + additive in-payload `export_scope` / `excludes`
 // fields) so the CLI + HTTP export surfaces cannot drift.
 pub mod export_scope;
+// v1.0.0 #3288 — bounded, keyset-paged admin export: opaque cursor, page
+// ranges, and the pure edge-ownership decision shared by both backends.
+pub mod export_paging;
 pub mod hooks;
 pub mod identity;
 // v1.0.0 #3465 — the in-process agent WAKE bus for `memory_notify`.
@@ -981,8 +1019,16 @@ pub mod spawn_audit;
 pub mod subscriptions;
 pub mod synthesis;
 pub mod tls;
+// v1.0.0 #3705 — the operator mandate "only encrypted data in transit": the
+// one floor every transit surface consults (daemon listener, federation
+// peers, webhook targets, the PostgreSQL DSN, the MCP forward URL), the one
+// truthy grammar, and the refusals. Plaintext is impossible to select.
 pub mod toon;
 pub mod transcripts;
+pub mod transit_encryption;
+// v1.0.0 #3709 item 1 — zero-config TLS: local CA + server certificate
+// generated into the key directory on first boot, renewed automatically.
+pub mod tls_bootstrap;
 pub mod trust;
 pub mod validate;
 /// #951 (Track A QC sweep, 2026-05-20) — canonical
@@ -1170,6 +1216,7 @@ pub fn build_router_with_timeout(
     app_state: handlers::AppState,
     request_timeout: std::time::Duration,
 ) -> axum::Router {
+    let monitoring_state = handlers::monitoring::AccessState::new(api_key_state.clone());
     use axum::{
         extract::DefaultBodyLimit,
         routing::{delete, get, post, put},
@@ -1202,6 +1249,14 @@ pub fn build_router_with_timeout(
 
     let router = axum::Router::new()
         .route(handlers::routes::HEALTH, get(handlers::health))
+        .route(
+            handlers::routes::MONITORING_STATUS,
+            get(handlers::monitoring::status),
+        )
+        .route(
+            handlers::routes::MONITORING_METRICS,
+            get(handlers::monitoring::metrics),
+        )
         // v0.6.0.0: Prometheus scrape endpoint. Exposed at both /metrics
         // (the community convention) and /api/v1/metrics (consistent with
         // the rest of the REST surface).
@@ -1608,7 +1663,11 @@ pub fn build_router_with_timeout(
             app_state.clone(),
             postgres_route_gate_layer,
         ))
-        .layer(TraceLayer::new_for_http())
+        // #3649 — the span is built by `http_diagnostic_span`, never by
+        // tower-http's `DefaultMakeSpan`, which records the full request URI
+        // (query string included) and so copies recall text or a
+        // query-string credential into any sink that enables DEBUG.
+        .layer(TraceLayer::new_for_http().make_span_with(http_diagnostic_span))
         .layer(DefaultBodyLimit::max(HTTP_BODY_LIMIT_BYTES))
         // #1579 B4 — gzip response compression (4.6× measured
         // response-size win on recall payloads in the perf audit).
@@ -1635,7 +1694,51 @@ pub fn build_router_with_timeout(
     // (after `.with_state`, so it is the very first layer a request hits).
     // Reads the process-wide cap seeded at boot; `0` = disabled (no layer
     // composed, byte-identical to a build without admission control).
-    compose_admission_control(router, max_inflight_requests())
+    compose_admission_control(router, max_inflight_requests()).layer(
+        axum::middleware::from_fn_with_state(monitoring_state, handlers::monitoring::access),
+    )
+}
+
+/// Route label recorded on the HTTP diagnostic span when the request matched
+/// no registered route (it reached the router fallback).
+pub const HTTP_SPAN_UNMATCHED_ROUTE: &str = "<unmatched>";
+
+/// Tracing target of the HTTP diagnostic span. It is the module path
+/// tower-http's `DefaultMakeSpan` emitted from, so every filter directive an
+/// operator already uses to enable the span (`tower_http=debug`,
+/// `tower_http::trace=debug`, `tower_http::trace::make_span=debug`) still
+/// enables it.
+pub const HTTP_SPAN_TARGET: &str = "tower_http::trace::make_span";
+
+/// Build the per-request diagnostic span for the HTTP router (#3649).
+///
+/// Records the method, the HTTP version, and the matched route TEMPLATE
+/// (`/api/v1/memories/{id}`) — never the request URI. A query string can carry
+/// recall text or a credential, and a captured path segment can carry an
+/// identifier, so neither may reach a log sink. The template comes from
+/// axum's [`axum::extract::MatchedPath`], which is the router's own
+/// registration string, not caller input. A request that matched no route is
+/// labelled [`HTTP_SPAN_UNMATCHED_ROUTE`]; there is deliberately no fallback to
+/// the raw path. Headers are not recorded (same as tower-http's default).
+///
+/// The span is built here, at construction time, rather than redacted from
+/// rendered output: a filter over rendered logs would have to recognise every
+/// secret shape, and a span field that is never recorded cannot leak.
+fn http_diagnostic_span(request: &axum::extract::Request) -> tracing::Span {
+    let route = request
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .map_or(
+            HTTP_SPAN_UNMATCHED_ROUTE,
+            axum::extract::MatchedPath::as_str,
+        );
+    tracing::debug_span!(
+        target: HTTP_SPAN_TARGET,
+        "request",
+        method = %request.method(),
+        route,
+        version = ?request.version(),
+    )
 }
 
 /// #1733 (Pillar-4 4.A) — wrap `router` with the HTTP admission-control
@@ -1673,7 +1776,8 @@ fn compose_admission_control(router: axum::Router, cap: usize) -> axum::Router {
                 // Liveness/readiness + metrics scrape bypass the cap so an
                 // overloaded node still answers its orchestrator + scraper.
                 let path = req.uri().path();
-                if path == handlers::routes::HEALTH
+                if handlers::monitoring::is_health_path(path)
+                    || path == handlers::routes::HEALTH
                     || path == handlers::routes::METRICS
                     || path == handlers::routes::METRICS_BARE
                 {

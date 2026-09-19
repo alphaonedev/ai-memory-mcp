@@ -155,10 +155,9 @@ pub async fn register_agent(
                 "deny",
                 crate::governance::action_labels::REGISTER_AGENT,
                 "",
-                json!({
-                    "target_agent_id": body.agent_id,
-                    "outcome": "cross_register_requires_admin",
-                }),
+                crate::governance::audit::ForensicPayload::new()
+                    .ident("target_agent_id", &body.agent_id)
+                    .label("outcome", "cross_register_requires_admin"),
             );
             return resp;
         }
@@ -176,7 +175,8 @@ pub async fn register_agent(
             "deny",
             crate::governance::action_labels::REGISTER_AGENT,
             "",
-            json!({"outcome": "self_register_requires_attested_identity"}),
+            crate::governance::audit::ForensicPayload::new()
+                .label("outcome", "self_register_requires_attested_identity"),
         );
         return resp;
     }
@@ -188,12 +188,11 @@ pub async fn register_agent(
         "allow",
         crate::governance::action_labels::REGISTER_AGENT,
         "",
-        json!({
-            "new_agent_id": body.agent_id,
-            (field_names::AGENT_TYPE): body.agent_type,
-            (field_names::CAPABILITIES): capabilities,
-            "self_register": body.agent_id == caller,
-        }),
+        crate::governance::audit::ForensicPayload::new()
+            .ident("new_agent_id", &body.agent_id)
+            .ident(field_names::AGENT_TYPE, &body.agent_type)
+            .idents(field_names::CAPABILITIES, &capabilities)
+            .flag("self_register", body.agent_id == caller),
     );
 
     // v0.7.0 Wave-3 Continuation 3 — postgres-backed daemons route the
@@ -320,18 +319,17 @@ fn record_pubkey_bind_decision(
     decision: &str,
     agent_id: &str,
     pubkey_b64: &str,
-    reason: &str,
+    reason: &'static str,
 ) {
     crate::governance::audit::record_decision(
         caller,
         decision,
         BIND_AGENT_PUBKEY_ACTION,
         "#3464",
-        json!({
-            "agent_id": agent_id,
-            "pubkey_b64": pubkey_b64,
-            "reason": reason,
-        }),
+        crate::governance::audit::ForensicPayload::new()
+            .ident("agent_id", agent_id)
+            .ident("pubkey_b64", pubkey_b64)
+            .label("reason", reason),
     );
 }
 
@@ -949,7 +947,13 @@ pub async fn run_gc(State(app): State<AppState>, headers: HeaderMap) -> impl Int
     // forensic-chain entry MUST land before the storage write so the
     // audit trail captures the operator who triggered the sweep even
     // when the downstream collector errors.
-    crate::governance::audit::record_decision(&caller, "allow", "run_gc", "", json!({}));
+    crate::governance::audit::record_decision(
+        &caller,
+        "allow",
+        "run_gc",
+        "",
+        crate::governance::audit::ForensicPayload::new(),
+    );
 
     // v0.7.0 Wave-3 Continuation 3 (Phase 17) — postgres-backed daemons
     // route through the SAL trait. Returns the same `{expired_deleted}`
@@ -993,157 +997,288 @@ pub async fn run_gc(State(app): State<AppState>, headers: HeaderMap) -> impl Int
     }
 }
 
-/// v1.0.0 G28 (#1838) + Gate-3 unification (#1844) — the corpus-export egress
-/// screen. Thin delegator to the shared SSOT
-/// [`crate::export_taxonomy::screen_memories_for_export`] so the HTTP admin
-/// export, the CLI `export`, and the forensic bundle apply the SAME two
-/// guards and cannot drift: (1) secret-screen content/title/tags/metadata
-/// credential VALUES (#1844), then (2) fail-closed DROP any memory classified
-/// into a [`crate::export_taxonomy::ForbiddenExportClass`] (private key
-/// material / master-threshold secret / governance signing key / a
-/// producer-tagged biometric embedding) so it never leaves in the clear.
-/// When `audit_conn` is `Some` (the sqlite export path) each drop emits a
-/// signed `export.forbidden_class_refused` row; the postgres path has no
-/// rusqlite handle and WARN-only skips the audit row (documented honest
-/// boundary) — the DROP itself always holds.
-fn screen_exported_memories(
-    memories: Vec<crate::models::Memory>,
-    audit_conn: Option<&rusqlite::Connection>,
-) -> Vec<crate::models::Memory> {
-    crate::export_taxonomy::screen_memories_for_export(memories, audit_conn)
+/// v1.0.0 #3288 — query parameters of `GET /api/v1/export`. Both absent is
+/// the legacy one-shot body (bounded by the page ceiling); either present is
+/// paged mode. See [`crate::export_paging`].
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExportQuery {
+    /// Rows per page, `1..=max_page_size`.
+    pub limit: Option<usize>,
+    /// Opaque resume token from a previous page's `next_cursor`.
+    pub cursor: Option<String>,
+    /// #3427 — restrict the export to ONE namespace. Honoured on both
+    /// backends, on the legacy body and on every page (pinned in the cursor);
+    /// echoed back as `namespace` so the operator holding the file can see
+    /// the scope that was applied. Unknown query parameters are refused
+    /// (`deny_unknown_fields`): a parameter that claims to bound an egress
+    /// and does not is worse than no parameter, so silence is never an
+    /// option here.
+    pub namespace: Option<String>,
 }
 
-pub async fn export_memories(State(app): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+/// v1.0.0 #3288 — a 400 for paging parameters the export cannot serve.
+fn export_mode_error_response(
+    e: &crate::export_paging::ExportModeError,
+) -> axum::response::Response {
+    use crate::errors::error_codes;
+    use crate::export_paging::ExportModeError;
+    let body = match e {
+        ExportModeError::LimitOutOfRange { max } => json!({
+            "error": format!("export limit must be between 1 and {max}"),
+            "code": error_codes::EXPORT_LIMIT_OUT_OF_RANGE,
+            "max": max,
+        }),
+        ExportModeError::Cursor(c) => json!({
+            "error": c.to_string(),
+            "code": error_codes::EXPORT_CURSOR_INVALID,
+        }),
+    };
+    (StatusCode::BAD_REQUEST, Json(body)).into_response()
+}
+
+/// v1.0.0 #3288 — the legacy (unpaged) request over a corpus larger than the
+/// page ceiling. Refused, never truncated: a client that predates paging
+/// would keep a partial body as a complete backup.
+fn export_paging_required_response(ceiling: usize) -> axum::response::Response {
+    (
+        StatusCode::PAYLOAD_TOO_LARGE,
+        Json(json!({
+            "error": format!(
+                "the corpus exceeds {ceiling} rows; request it in pages with ?limit=N and follow next_cursor"
+            ),
+            "code": crate::errors::error_codes::EXPORT_PAGING_REQUIRED,
+            "max_rows": ceiling,
+        })),
+    )
+        .into_response()
+}
+
+/// v1.0.0 #3288 — one export body (a page, or the whole bounded legacy
+/// corpus). `memories` are the screened survivors of `page`; `ledger` is the
+/// screen's accounting. Carries the pre-existing
+/// `{memories, links, count, exported_at, export_scope, portability_complete,
+/// excludes}` shape plus the #2490 `withheld` ledger (with the page's
+/// `undecryptable` count), `partial`, and `next_cursor`.
+fn export_body(
+    memories: &[Memory],
+    links: &crate::export_paging::ExportLinksPage,
+    mut ledger: crate::export_scope::ExportWithholdLedger,
+    page: &crate::export_paging::ExportMemoriesPage,
+    storage_backend: Option<&str>,
+) -> axum::response::Response {
+    ledger.quarantined = page.excluded.quarantined;
+    ledger.tombstoned = page.excluded.tombstoned;
+    ledger.expired = page.excluded.expired;
+    let next_cursor = match page.next_cursor.as_ref().map(|c| c.encode()).transpose() {
+        Ok(c) => c,
+        Err(e) => return crate::handlers::errors::handler_error_500(&e),
+    };
+    if links.dangling > 0 {
+        tracing::warn!(
+            withheld_edges = links.dangling,
+            "export_memories: withheld {} graph edge(s) whose endpoint memory is not carried by \
+             this export (#3405)",
+            links.dangling
+        );
+    }
+    let mut withheld = ledger.in_band_marker();
+    if let Some(obj) = withheld.as_object_mut() {
+        obj.insert(
+            field_names::DANGLING_LINKS_WITHHELD.to_string(),
+            json!(links.dangling),
+        );
+        obj.insert(
+            field_names::UNDECRYPTABLE.to_string(),
+            json!(page.undecryptable),
+        );
+    }
+    let partial = ledger.is_partial() || page.undecryptable > 0;
+    let mut body = json!({
+        "memories": memories,
+        "links": links.links,
+        "count": memories.len(),
+        (field_names::EXPORTED_AT): Utc::now().to_rfc3339(),
+        // #1944 (B_WARN de-silencing) — additive scope markers; the
+        // pre-existing `{memories, links, count, exported_at}` shape is
+        // unchanged so downstream consumers keep parsing.
+        (field_names::EXPORT_SCOPE): crate::export_scope::SCOPE_MEMORIES_LINKS,
+        (field_names::PORTABILITY_COMPLETE): crate::export_scope::PORTABILITY_COMPLETE,
+        (field_names::EXCLUDES): crate::export_scope::OMITTED_SIGNED_CLASSES,
+        // #3288 — the rows this body does not carry, as COUNTS (never ids,
+        // #2490 objection O3), and whether the body is a faithful copy.
+        (field_names::WITHHELD): withheld,
+        (field_names::PARTIAL): partial,
+        (field_names::NEXT_CURSOR): next_cursor,
+        // #3427 — the scope that was APPLIED (null = whole corpus), so the
+        // operator holding the file can see it without trusting the request.
+        (field_names::NAMESPACE): page.scope.namespace,
+        // #3288 (amended acceptance 1/3) — a multi-page walk is a LIVE keyset
+        // scan, not a snapshot: declared in-band. See API_REFERENCE for what
+        // a live walk can miss (a row inserted with a backdated `created_at`
+        // that sorts before the cursor).
+        (field_names::SNAPSHOT): false,
+    });
+    if let (Some(backend), Some(obj)) = (storage_backend, body.as_object_mut()) {
+        obj.insert(field_names::STORAGE_BACKEND.to_string(), json!(backend));
+    }
+    Json(body).into_response()
+}
+
+/// The screened survivors' ids, for the page's edge survival check.
+fn survivor_ids(memories: &[Memory]) -> std::collections::HashSet<String> {
+    memories.iter().map(|m| m.id.clone()).collect()
+}
+
+pub async fn export_memories(
+    State(app): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<ExportQuery>,
+) -> impl IntoResponse {
     // #957 (security-critical, 2026-05-20) — admin-role gate.
     // Pre-#957 the handler took NO headers, accepted no caller, and
     // dispatched directly to the export path which intentionally
-    // bypasses every visibility filter (postgres SAL branch uses
-    // `for_agent("export")` — see `src/store/postgres.rs:8577` — and
-    // the sqlite branch reads the whole `memories` table via
-    // `db::export_all`). The legacy `api_key_auth` middleware passes
-    // through when `api_key` is unset (the default — see #946 RCA),
-    // so the endpoint was open by default and any authenticated
-    // caller could dump every memory across every owner, every
-    // namespace, every scope (including `scope=private`) plus every
+    // bypasses every visibility filter. The legacy `api_key_auth`
+    // middleware passes through when `api_key` is unset (the default —
+    // see #946 RCA), so the endpoint was open by default and any
+    // authenticated caller could dump every memory across every owner,
+    // every namespace, every scope (including `scope=private`) plus every
     // link in the graph.
     //
-    // Fix: require the caller's resolved `agent_id` (from
-    // `X-Agent-Id`, the same primitive every other handler uses)
-    // to appear in the operator-configured `[admin].agent_ids`
-    // allowlist before the corpus dump fires. Non-admin callers
-    // get `403 Forbidden` with the sanitised
-    // `{"error":"admin role required"}` body — intentionally
-    // generic so the rejection does not leak the allowlist
-    // configuration. The role decision is forensic-chain audited
-    // via `governance::audit::record_decision` whether admitted
-    // or rejected (`handlers::admin_role::require_admin`).
+    // Fix: require the caller's resolved `agent_id` to appear in the
+    // operator-configured `[admin].agent_ids` allowlist before the corpus
+    // dump fires. Non-admin callers get `403 Forbidden` with the sanitised
+    // `{"error":"admin role required"}` body. The role decision is
+    // forensic-chain audited via `governance::audit::record_decision`
+    // whether admitted or rejected. #3288: every PAGE re-runs this gate,
+    // so a cursor carries no authority of its own.
     let caller = match crate::handlers::admin_role::require_admin(&app, &headers, "export_memories")
     {
         Ok(c) => c,
         Err(resp) => return resp,
     };
+    let _ = &caller; // resolved + audited above; the export is owner-blind
+    // under the operator export contract.
+
+    // v1.0.0 #3288 — the export is BOUNDED. A request reads at most one
+    // page (`limit <= max_page_size`) and the page's edges; the legacy
+    // unpaged request is served only while the corpus fits the page
+    // ceiling, else refused with 413 rather than truncated. Pre-#3288 both
+    // backends materialised the whole corpus and the whole link table into
+    // one body, which OOM-kills the daemon on a large tenant.
+    // #3427 — the namespace scope is validated and threaded to the store on
+    // BOTH backends; the handler never post-filters (a post-filter would
+    // still read the whole corpus and break the page bound).
+    let namespace = match q.namespace.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(ns) => match crate::validate::validate_namespace(ns) {
+            Ok(()) => Some(ns.to_owned()),
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": format!("export namespace: {e}"),
+                        "code": crate::errors::error_codes::VALIDATION_FAILED,
+                    })),
+                )
+                    .into_response();
+            }
+        },
+    };
+    let mode = match crate::export_paging::resolve_mode(
+        q.limit,
+        q.cursor.as_deref(),
+        app.max_page_size,
+        Utc::now(),
+        namespace.as_deref(),
+    ) {
+        Ok(m) => m,
+        Err(e) => return export_mode_error_response(&e),
+    };
+    let (cursor, fetch_limit, as_of, legacy_ceiling) = match mode {
+        // Read one row past the ceiling: its presence is the refusal signal,
+        // so the legacy path never reads more than ceiling + 1 rows.
+        crate::export_paging::ExportMode::Legacy { ceiling, as_of } => {
+            (None, ceiling.saturating_add(1), as_of, Some(ceiling))
+        }
+        crate::export_paging::ExportMode::Paged {
+            cursor,
+            limit,
+            as_of,
+        } => (cursor, limit, as_of, None),
+    };
 
     // v0.7.0 Wave-3 Continuation 3 (Phase 18) — postgres-backed daemons
-    // route through the SAL trait. Wire shape preserved:
-    // `{memories, links, count, exported_at}`. The admin gate above
-    // is the load-bearing authorisation check; the SAL-level
-    // `for_admin(caller)` context just preserves the full-fidelity
-    // backup semantic (admin export round-trips every row regardless
-    // of `metadata.scope`).
+    // route through the SAL trait. The admin gate above is the load-bearing
+    // authorisation check; the SAL reads are owner-blind under the operator
+    // export contract (admin export round-trips every row regardless of
+    // `metadata.scope`).
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
-        let _ = &caller; // resolved + audited above; SAL methods are
-        // owner-blind under the operator export contract.
-        let mems = match app.store.export_memories().await {
-            Ok(v) => v,
+        let mut page = match app
+            .store
+            .export_memories_page(cursor.as_ref(), fetch_limit, as_of, namespace.as_deref())
+            .await
+        {
+            Ok(p) => p,
             Err(e) => return store_err_to_response(e),
         };
-        // v1.0.0 G28 (#1838) — forbidden-export-class gate (fail-closed).
-        // The postgres export has no rusqlite audit handle, so the signed
-        // refusal is skipped with a WARN (documented honest boundary); the
-        // fail-closed DROP still holds so a forbidden-class row never leaves.
-        let mems = screen_exported_memories(mems, None);
-        let links = match app.store.export_links().await {
-            Ok(v) => v,
-            Err(e) => return store_err_to_response(e),
-        };
-        // v1.0.0 #3405 — the HTTP export is the wire sibling of the CLI
-        // bundle and composed `memories` + `links` from two independent
-        // reads, so it emitted edges pointing at rows the screen (or the
-        // backend's own lifecycle allow-list) withheld. `POST /api/v1/import`
-        // and `ai-memory import` both refuse such an edge (the FK cannot
-        // resolve), so the payload could not round-trip. Same shared funnel
-        // as the CLI + `--full` paths — one control, every producer.
-        let (links, dangling) = crate::export_scope::retain_resolvable_links(&mems, links);
-        if !dangling.is_empty() {
-            tracing::warn!(
-                withheld_edges = dangling.len(),
-                "export_memories(postgres): withheld {} graph edge(s) whose endpoint memory is \
-                 not carried by this export (#3405)",
-                dangling.len()
-            );
+        if let Some(ceiling) = legacy_ceiling
+            && page.raw_rows() > ceiling
+        {
+            return export_paging_required_response(ceiling);
         }
-        let count = mems.len();
-        // #1944 (B_WARN de-silencing) — additive, non-breaking scope
-        // markers so the HTTP export is not a silent-lossy sibling of the
-        // CLI. Shape of the pre-existing fields is unchanged.
-        return Json(json!({
-            "memories": mems,
-            "links": links,
-            "count": count,
-            (field_names::EXPORTED_AT): Utc::now().to_rfc3339(),
-            (field_names::STORAGE_BACKEND): "postgres",
-            (field_names::EXPORT_SCOPE): crate::export_scope::SCOPE_MEMORIES_LINKS,
-            (field_names::PORTABILITY_COMPLETE): crate::export_scope::PORTABILITY_COMPLETE,
-            (field_names::EXCLUDES): crate::export_scope::OMITTED_SIGNED_CLASSES,
-        }))
-        .into_response();
+        // v1.0.0 G28 (#1838) / #1844 — the shared export confidentiality
+        // screen. The postgres export has no rusqlite audit handle, so the
+        // signed refusal is skipped with a WARN (documented honest
+        // boundary); the fail-closed DROP still holds and is COUNTED.
+        let (memories, ledger) = crate::export_taxonomy::screen_memories_for_export_audited(
+            std::mem::take(&mut page.memories),
+            None,
+        );
+        // v1.0.0 #3405 / #3288 — only the edges this page owns and whose
+        // endpoints are both carried by the export.
+        let links = match app
+            .store
+            .export_links_page(&page.scope, &survivor_ids(&memories))
+            .await
+        {
+            Ok(l) => l,
+            Err(e) => return store_err_to_response(e),
+        };
+        return export_body(&memories, &links, ledger, &page, Some("postgres"));
     }
 
-    let _ = &caller;
     let lock = app.db.lock().await;
-    match (db::export_all(&lock.0), db::export_links(&lock.0)) {
-        (Ok(memories), Ok(links)) => {
-            // v1.0.0 G28 (#1838) — forbidden-export-class gate (fail-closed);
-            // sqlite path holds the audit connection so a drop emits a signed
-            // `export.forbidden_class_refused` row.
-            let memories = screen_exported_memories(memories, Some(&lock.0));
-            // v1.0.0 #3405 — sqlite twin of the postgres branch above: an
-            // edge whose endpoint the lifecycle allow-list or the
-            // confidentiality screen withheld is not carryable by this
-            // artifact, so the artifact must not claim it.
-            let (links, dangling) = crate::export_scope::retain_resolvable_links(&memories, links);
-            if !dangling.is_empty() {
-                tracing::warn!(
-                    withheld_edges = dangling.len(),
-                    "export_memories: withheld {} graph edge(s) whose endpoint memory is not \
-                     carried by this export (#3405)",
-                    dangling.len()
-                );
-            }
-            let count = memories.len();
-            // #1944 (B_WARN de-silencing) — additive scope markers; the
-            // pre-existing `{memories, links, count, exported_at}` shape is
-            // unchanged so downstream consumers keep parsing.
-            Json(json!({
-                "memories": memories,
-                "links": links,
-                "count": count,
-                (field_names::EXPORTED_AT): Utc::now().to_rfc3339(),
-                (field_names::EXPORT_SCOPE): crate::export_scope::SCOPE_MEMORIES_LINKS,
-                (field_names::PORTABILITY_COMPLETE): crate::export_scope::PORTABILITY_COMPLETE,
-                (field_names::EXCLUDES): crate::export_scope::OMITTED_SIGNED_CLASSES,
-            }))
-            .into_response()
+    let read = db::export_page::memories_page(
+        &lock.0,
+        cursor.as_ref(),
+        fetch_limit,
+        as_of,
+        namespace.as_deref(),
+    )
+    .and_then(|mut page| {
+        if let Some(ceiling) = legacy_ceiling
+            && page.raw_rows() > ceiling
+        {
+            return Ok(Err(ceiling));
         }
-        (Err(e), _) | (_, Err(e)) => {
-            tracing::error!("export error: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": crate::errors::msg::INTERNAL_SERVER_ERROR})),
-            )
-                .into_response()
+        // v1.0.0 G28 (#1838) — forbidden-export-class gate (fail-closed);
+        // the sqlite path holds the audit connection so a drop emits a
+        // signed `export.forbidden_class_refused` row.
+        let (memories, ledger) = crate::export_taxonomy::screen_memories_for_export_audited(
+            std::mem::take(&mut page.memories),
+            Some(&lock.0),
+        );
+        let links = db::export_page::links_page(&lock.0, &page.scope, &survivor_ids(&memories))?;
+        Ok(Ok((memories, ledger, links, page)))
+    });
+    match read {
+        Ok(Ok((memories, ledger, links, page))) => {
+            export_body(&memories, &links, ledger, &page, None)
         }
+        Ok(Err(ceiling)) => export_paging_required_response(ceiling),
+        Err(e) => crate::handlers::errors::handler_error_500(&e),
     }
 }
 
@@ -1197,10 +1332,9 @@ pub async fn import_memories(
         "allow",
         "import_memories",
         "",
-        json!({
-            "memory_count": body.memories.len(),
-            "link_count": body.links.as_ref().map(Vec::len).unwrap_or(0),
-        }),
+        crate::governance::audit::ForensicPayload::new()
+            .number("memory_count", body.memories.len())
+            .number("link_count", body.links.as_ref().map_or(0, Vec::len)),
     );
 
     // v0.9.0 G10.1 (#1827) — edge-parse the optional
@@ -1698,15 +1832,15 @@ pub async fn tools_list(State(app): State<AppState>) -> impl IntoResponse {
 }
 
 // v1.0.0 G28 (#1838) — direct unit coverage for the fail-closed
-// `screen_exported_memories` corpus-export filter. These exercise the
+// corpus-export screen (`export_taxonomy::screen_memories_for_export`, the
+// SSOT the handler uses since #3288). These exercise the
 // helper's branches that the HTTP export path cannot reach without a live
 // backend — in particular the `audit_conn = None` arm the postgres SAL
 // export path takes (WARN-only, no rusqlite handle). test-cfg-test-module
-// (co-located `#[cfg(test)] mod`), test-use-super (parent-item access),
-// test-descriptive-names, test-arrange-act-assert.
+// (co-located `#[cfg(test)] mod`), test-descriptive-names,
+// test-arrange-act-assert.
 #[cfg(test)]
 mod g28_export_screen_tests {
-    use super::*;
     use crate::models::Memory;
     use crate::signed_events::event_types::EXPORT_FORBIDDEN_CLASS_REFUSED;
 
@@ -1755,7 +1889,7 @@ mod g28_export_screen_tests {
         let corpus = vec![clean_memory("a"), clean_memory("b")];
 
         // Act.
-        let kept = screen_exported_memories(corpus, Some(&conn));
+        let kept = crate::export_taxonomy::screen_memories_for_export(corpus, Some(&conn));
 
         // Assert: every row survives; no refusal row appended.
         assert_eq!(kept.len(), 2, "clean rows must all pass the screen");
@@ -1774,7 +1908,7 @@ mod g28_export_screen_tests {
         ];
 
         // Act.
-        let kept = screen_exported_memories(corpus, Some(&conn));
+        let kept = crate::export_taxonomy::screen_memories_for_export(corpus, Some(&conn));
 
         // Assert: the forbidden row is dropped, the clean rows remain, and
         // exactly one signed refusal row witnesses the redaction.
@@ -1797,7 +1931,7 @@ mod g28_export_screen_tests {
         let corpus = vec![clean_memory("ok"), biometric_memory("bio")];
 
         // Act: None audit conn — the postgres arm.
-        let kept = screen_exported_memories(corpus, None);
+        let kept = crate::export_taxonomy::screen_memories_for_export(corpus, None);
 
         // Assert: fail-closed drop still holds with no audit connection.
         assert_eq!(kept.len(), 1, "biometric row screened out even on pg path");
@@ -1816,7 +1950,10 @@ mod g28_export_screen_tests {
         let conn = crate::storage::open(std::path::Path::new(":memory:")).expect("open");
         let mut both = pem_key_memory("both");
         both.metadata = serde_json::json!({"embedding_class": "biometric"});
-        let kept = screen_exported_memories(vec![clean_memory("x"), both], Some(&conn));
+        let kept = crate::export_taxonomy::screen_memories_for_export(
+            vec![clean_memory("x"), both],
+            Some(&conn),
+        );
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].id, "x");
         assert_eq!(refusal_count(&conn), 1);

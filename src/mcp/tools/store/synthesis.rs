@@ -54,7 +54,14 @@ const SYNTHESIS_ALLOW_INBOX: bool = false;
 /// `mod.rs` and the per-site re-checks below can never drift apart.
 #[must_use]
 pub(super) fn caller_may_mutate(mem: &Memory, caller: &str) -> bool {
-    crate::visibility::caller_owns_for_mutation(mem, caller, SYNTHESIS_ALLOW_INBOX)
+    crate::visibility::caller_owns_for_mutation(
+        mem,
+        caller,
+        SYNTHESIS_ALLOW_INBOX,
+        crate::identity::owner_stamp::MutationSite::sqlite(
+            crate::identity::owner_stamp::funnel::SYNTHESIS,
+        ),
+    )
 }
 
 /// #3173 — emit the security audit row for a REFUSED cross-owner synthesis
@@ -441,7 +448,7 @@ pub(super) fn apply_synthesis_updates_and_deletes(
             continue;
         };
         let preserved_metadata =
-            crate::identity::preserve_provenance_keys(&target.metadata, &mem.metadata);
+            crate::identity::preserve_provenance_keys_for_merge(&target.metadata, &mem.metadata);
         let upd = db::update(
             conn,
             cand_id,
@@ -508,7 +515,7 @@ pub(super) fn apply_synthesis_updates_and_deletes(
         }
         provenance_row.content = merged_content.clone();
         provenance_row.metadata =
-            crate::identity::preserve_provenance_keys(&target.metadata, &mem.metadata);
+            crate::identity::preserve_provenance_keys_for_merge(&target.metadata, &mem.metadata);
         // #2122 — TRACT covenant clause 1: this provenance row is a GENUINE
         // internal bookkeeping writer — it exists only so the `supersedes`
         // edge has a structurally-valid FK endpoint after a synthesis Update
@@ -591,7 +598,7 @@ pub(super) fn apply_synthesis_updates_and_deletes(
         return Ok(None);
     };
     let preserved_metadata =
-        crate::identity::preserve_provenance_keys(&target.metadata, &mem.metadata);
+        crate::identity::preserve_provenance_keys_for_merge(&target.metadata, &mem.metadata);
     let echoed_agent_id = preserved_metadata
         .get(param_names::AGENT_ID)
         .and_then(|v| v.as_str())

@@ -77,6 +77,23 @@ pub async fn capture_turn(
     headers: HeaderMap,
     JsonOrBadRequest(req): JsonOrBadRequest<MemoryCaptureTurnRequest>,
 ) -> impl IntoResponse {
+    let response = capture_turn_write(State(app.clone()), headers, JsonOrBadRequest(req))
+        .await
+        .into_response();
+    super::write_receipt::complete(
+        &app,
+        response,
+        super::write_receipt::WriterConnection::Store,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_lines)]
+async fn capture_turn_write(
+    State(app): State<AppState>,
+    headers: HeaderMap,
+    JsonOrBadRequest(req): JsonOrBadRequest<MemoryCaptureTurnRequest>,
+) -> impl IntoResponse {
     let header_agent_id = headers
         .get(crate::HEADER_AGENT_ID)
         .and_then(|v| v.to_str().ok());

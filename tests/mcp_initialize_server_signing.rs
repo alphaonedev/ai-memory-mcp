@@ -237,11 +237,34 @@ fn tampered_daemon_id_field_breaks_signature_verification() {
 
 #[test]
 fn tampered_schema_version_field_breaks_signature_verification() {
+    const TAMPER: &str = "vTEST_TAMPERED";
     let kp = keypair_with_signing("ai:nhi@host", 22);
     let mut block = build_signed_identity(Some(&kp), TEST_TIMESTAMP)
         .unwrap()
         .unwrap();
-    block["schema_version"] = json!("v99");
+
+    // ALLOWED-PATH CONTROL: the UNTAMPERED block must verify, or the failure
+    // assertion below could pass because verification broke for an unrelated
+    // reason rather than because the tamper was detected.
+    verify_signed_identity(&block).expect("the untampered block must verify");
+
+    // A TEST SENTINEL THAT CAN BECOME A REAL VALUE IS NOT A SENTINEL. The old
+    // literal `"v99"` silently BECAME the real signed value once
+    // CURRENT_SCHEMA_VERSION reached 99 (#3655-v2): the "tamper" then wrote the
+    // value already there, a no-op that verify correctly accepted, and this
+    // assertion went vacuous (#3748). A `vTEST_` sentinel can never collide
+    // (production versions are numeric); machine-check it differs from the
+    // signed value so the NEXT collision fails LOUDLY here.
+    let signed = block["schema_version"]
+        .as_str()
+        .expect("schema_version present")
+        .to_owned();
+    assert_ne!(
+        signed, TAMPER,
+        "the tamper value must differ from the signed value, or the tamper is a          no-op and this test proves nothing"
+    );
+
+    block["schema_version"] = json!(TAMPER);
     assert!(verify_signed_identity(&block).is_err());
 }
 

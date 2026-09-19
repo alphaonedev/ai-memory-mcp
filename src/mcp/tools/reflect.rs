@@ -6,6 +6,7 @@
 use crate::db;
 use crate::embeddings::Embed;
 use crate::hnsw::VectorSearchIndex;
+use crate::mcp::param_guard;
 use crate::mcp::param_names;
 use crate::models::field_names;
 use crate::models::{GovernedAction, Tier};
@@ -38,65 +39,28 @@ use std::path::Path;
 /// inject) but the wire-string discipline they enforce must still
 /// stay pinned by the test suite.
 ///
-/// Stability contract — each branch maps to a stable string prefix:
-/// * `Validation(m)` → raw `m` (substrate sets the operator-readable
-///   reason; the MCP layer surfaces it verbatim).
-/// * `SourceNotFound(id)` → `"source memory not found: <id>"`.
-/// * `DepthExceeded { attempted, cap, namespace }` →
-///   `"REFLECTION_DEPTH_EXCEEDED: reflection depth N would exceed
-///    namespace max_reflection_depth M (namespace='ns')"` — Task 5/8
-///   audit emission keys off this prefix.
-/// * `HookVeto { reason, code }` →
-///   `"REFLECTION_HOOK_VETO (code=C): <reason>"`. Currently
-///   unreachable from the MCP dispatch path (no in-substrate hook
-///   registered) but pinned so the wire-shape can't drift under a
-///   future MCP-side hook wire-in.
-/// * `Database(m)` → raw `m`.
+/// #3638 confidentiality contract: policy and corpus diagnostics are for
+/// operator logs only. Stable refusal prefixes remain public, but values
+/// read through internal governance authority must never enter the wire text.
+/// Validation describes caller input; source-not-found names a requested ID.
+/// Hook and database failures can wrap private governance details, so they
+/// receive fixed messages too. The typed error and its Display stay intact
+/// for internal diagnostics and audit consumers.
 pub(crate) fn map_reflect_error_to_wire_string(err: db::ReflectError) -> String {
+    tracing::warn!(target: crate::storage::reflect::REFLECT_TRACE_TARGET, error = %err, "reflection refused");
     match err {
         db::ReflectError::Validation(m) => m,
         db::ReflectError::SourceNotFound(id) => format!("source memory not found: {id}"),
-        db::ReflectError::DepthExceeded {
-            attempted,
-            cap,
-            namespace,
-        } => {
-            // Stable error string shape — Task 5/8 will key its audit
-            // emission off this refusal. Keep the structured triple
-            // visible (attempted=N, cap=M, namespace='...') so the
-            // log analyser doesn't need a regex.
-            format!(
-                "REFLECTION_DEPTH_EXCEEDED: reflection depth {attempted} would exceed \
-                 namespace max_reflection_depth {cap} (namespace='{namespace}')"
-            )
+        db::ReflectError::DepthExceeded { .. } => {
+            "REFLECTION_DEPTH_EXCEEDED: reflection depth limit exceeded".into()
         }
-        db::ReflectError::HookVeto { reason, code } => {
-            // v0.7.0 Task 6/8 — a pre_reflect hook callback returned
-            // Deny, vetoing the reflection. The MCP handler today
-            // does NOT register any in-substrate hooks (the MCP-side
-            // hook chain wiring is G7+'s problem), so this arm is
-            // currently unreachable on the MCP path. We surface a
-            // stable error-string shape anyway so a future MCP-side
-            // hook wire-in lands without churning this arm.
-            format!("REFLECTION_HOOK_VETO (code={code}): {reason}")
+        db::ReflectError::HookVeto { .. } => "REFLECTION_HOOK_VETO: reflection refused".into(),
+        db::ReflectError::DecorrelationRefused { .. } => {
+            "REFLECTION_DECORRELATION_REFUSED: reflection decorrelation requirement not met".into()
         }
-        db::ReflectError::DecorrelationRefused {
-            distinct_attested_families,
-            attested_rows,
-            quorum_n,
-            namespace,
-        } => {
-            // v0.9.0 §25.3 S2 (D3-021, #1767) — enforce-mode refusal on an
-            // evidence-backed attested monoculture. Stable string shape
-            // keyed off `REFLECTION_DECORRELATION_REFUSED` (matches the
-            // signed audit event slug) with the structured counts visible.
-            format!(
-                "REFLECTION_DECORRELATION_REFUSED: attested model-family decorrelation quorum not \
-                 met ({distinct_attested_families} distinct attested families across \
-                 {attested_rows} attested rows < required {quorum_n}, namespace='{namespace}')"
-            )
+        db::ReflectError::Database(_) => {
+            "REFLECTION_FAILED: reflection could not be completed".into()
         }
-        db::ReflectError::Database(m) => m,
     }
 }
 
@@ -128,7 +92,7 @@ fn fold_entity_id_into_metadata(metadata: &mut Value, top_level: Option<&str>) {
         Some(present) => {
             if present != alias {
                 tracing::warn!(
-                    target: "mcp.reflect",
+                    target: crate::storage::reflect::REFLECT_TRACE_TARGET,
                     "top-level entity_id alias shadowed by metadata.entity_id (using metadata)"
                 );
             }
@@ -201,6 +165,72 @@ fn resolve_reflect_owner(
     }
 }
 
+/// #3390 — the type-strict OPTIONAL fields of a reflect request, parsed once
+/// for both entry points ([`parse_reflect_input`] behind [`handle_reflect`],
+/// and the caller-bound [`handle_reflect_caller`]).
+struct ReflectOptionals {
+    tier: Tier,
+    namespace: Option<String>,
+    priority: i32,
+    confidence: f64,
+    tags: Vec<String>,
+}
+
+/// #3390 — TYPE-STRICT and RANGE-STRICT optionals: an ABSENT key still takes
+/// its default, but a PRESENT wrong-typed value is REFUSED (the discipline the
+/// sibling tools apply through `param_guard`), and a correctly-typed value
+/// outside its documented domain is refused too. Pre-fix every optional was
+/// read with `.as_T().unwrap_or(default)` — `tier: 123` became "mid",
+/// `priority: "high"` became 5, `tags: "notarray"` became `[]`,
+/// `confidence: "hi"` became 1.0 — and a `priority` that fit an i64 but not
+/// an i32 (3_000_000_000) was silently written as 5: the caller asked for one
+/// thing, the system stored another, and said nothing.
+///
+/// # Errors
+/// The field-naming refusal for a present wrong-typed or out-of-range value.
+fn parse_reflect_optionals(params: &Value) -> Result<ReflectOptionals, String> {
+    let tier_str = param_guard::optional_str(params, "tier")?.unwrap_or(Tier::Mid.as_str());
+    let tier =
+        Tier::from_str(tier_str).ok_or_else(|| crate::errors::msg::invalid("tier", tier_str))?;
+    let namespace = param_guard::optional_str(params, "namespace")?.map(str::to_string);
+    // The documented domain is 1..=10 (`validate::validate_priority`); an
+    // integer outside it — including one that does not fit an i32 — is refused
+    // with that domain, never defaulted.
+    let priority = match param_guard::optional_i64(params, "priority")? {
+        None => 5,
+        Some(raw) => {
+            let p = i32::try_from(raw)
+                .map_err(|_| format!("priority must be between 1 and 10 (got {raw})"))?;
+            crate::validate::validate_priority(p).map_err(|e| e.to_string())?;
+            p
+        }
+    };
+    let confidence = match params.get(param_names::CONFIDENCE) {
+        None | Some(Value::Null) => 1.0,
+        Some(v) => v.as_f64().ok_or("confidence must be a number")?,
+    };
+    let tags: Vec<String> = match params.get("tags") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(v) => v
+            .as_array()
+            .ok_or("tags must be an array of strings")?
+            .iter()
+            .map(|t| {
+                t.as_str()
+                    .map(String::from)
+                    .ok_or("tags must be an array of strings")
+            })
+            .collect::<Result<_, _>>()?,
+    };
+    Ok(ReflectOptionals {
+        tier,
+        namespace,
+        priority,
+        confidence,
+        tags,
+    })
+}
+
 #[cfg_attr(not(feature = "sal"), allow(dead_code))]
 /// `authenticated_caller` is the #3423 transport-authenticated principal —
 /// `None` for every wire/MCP caller. See [`resolve_reflect_owner`].
@@ -230,20 +260,15 @@ pub(crate) fn parse_reflect_input(
         .as_str()
         .ok_or(crate::errors::msg::CONTENT_REQUIRED)?
         .to_string();
-    let tier_str = params["tier"].as_str().unwrap_or(Tier::Mid.as_str());
-    let tier =
-        Tier::from_str(tier_str).ok_or_else(|| crate::errors::msg::invalid("tier", tier_str))?;
-    let namespace = params["namespace"].as_str().map(str::to_string);
-    let priority = i32::try_from(params["priority"].as_i64().unwrap_or(5)).unwrap_or(5);
-    let confidence = params[param_names::CONFIDENCE].as_f64().unwrap_or(1.0);
-    let tags: Vec<String> = params["tags"]
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
+    // #3390 — the optionals are parsed ONCE, in `parse_reflect_optionals`,
+    // for both entry points (one concept, one definition).
+    let ReflectOptionals {
+        tier,
+        namespace,
+        priority,
+        confidence,
+        tags,
+    } = parse_reflect_optionals(params)?;
     let mut metadata = if params["metadata"].is_object() {
         params["metadata"].clone()
     } else {
@@ -379,20 +404,15 @@ pub fn handle_reflect_caller(
         .as_str()
         .ok_or(crate::errors::msg::CONTENT_REQUIRED)?
         .to_string();
-    let tier_str = params["tier"].as_str().unwrap_or(Tier::Mid.as_str());
-    let tier =
-        Tier::from_str(tier_str).ok_or_else(|| crate::errors::msg::invalid("tier", tier_str))?;
-    let namespace = params["namespace"].as_str().map(str::to_string);
-    let priority = i32::try_from(params["priority"].as_i64().unwrap_or(5)).unwrap_or(5);
-    let confidence = params[param_names::CONFIDENCE].as_f64().unwrap_or(1.0);
-    let tags: Vec<String> = params["tags"]
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
+    // #3390 — the optionals are parsed ONCE, in `parse_reflect_optionals`,
+    // for both entry points (one concept, one definition).
+    let ReflectOptionals {
+        tier,
+        namespace,
+        priority,
+        confidence,
+        tags,
+    } = parse_reflect_optionals(params)?;
     let mut metadata = if params["metadata"].is_object() {
         params["metadata"].clone()
     } else {
@@ -591,8 +611,17 @@ pub fn handle_reflect_caller(
                         &input.agent_id,
                         &payload,
                     )
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|e| {
+                        map_reflect_error_to_wire_string(db::ReflectError::Database(e.to_string()))
+                    })?;
                     crate::subscriptions::dispatch_approval_requested(conn, &pending_id, db_path);
+                    tracing::info!(
+                        target: crate::storage::reflect::REFLECT_TRACE_TARGET,
+                        namespace = %ns,
+                        proposed_depth = new_depth_u32,
+                        require_approval_above_depth = threshold,
+                        "reflection requires approval"
+                    );
                     return Ok(json!({
                         "status": "pending",
                         (field_names::PENDING_ID): pending_id,
@@ -600,7 +629,6 @@ pub fn handle_reflect_caller(
                         "action": "reflect",
                         "namespace": ns,
                         "proposed_depth": new_depth_u32,
-                        "require_approval_above_depth": threshold,
                     }));
                 }
             }
@@ -846,6 +874,83 @@ mod tests {
     //! - happy path without embedder (no-op for embedding side effect)
 
     use super::*;
+
+    // #3638: policy/corpus values are privileged even when the refusal is public.
+    #[test]
+    fn issue_3638_privileged_refusal_values_never_reach_wire() {
+        for (cap, namespace) in [(0, "victim/private"), (918_273, "secret/policy")] {
+            let err = db::ReflectError::DepthExceeded {
+                attempted: 918_274,
+                cap,
+                namespace: namespace.into(),
+            };
+            assert!(err.to_string().contains(&cap.to_string()));
+            assert_eq!(
+                map_reflect_error_to_wire_string(err),
+                "REFLECTION_DEPTH_EXCEEDED: reflection depth limit exceeded"
+            );
+        }
+        assert_eq!(
+            map_reflect_error_to_wire_string(db::ReflectError::DecorrelationRefused {
+                distinct_attested_families: 918_271,
+                attested_rows: 918_272,
+                quorum_n: 918_273,
+                namespace: "victim/private".into(),
+            }),
+            "REFLECTION_DECORRELATION_REFUSED: reflection decorrelation requirement not met"
+        );
+        assert_eq!(
+            map_reflect_error_to_wire_string(db::ReflectError::HookVeto {
+                reason: "private governance rule 918273".into(),
+                code: 403,
+            }),
+            "REFLECTION_HOOK_VETO: reflection refused"
+        );
+        assert_eq!(
+            map_reflect_error_to_wire_string(db::ReflectError::Database(
+                "private governance rule 918273".into(),
+            )),
+            "REFLECTION_FAILED: reflection could not be completed"
+        );
+    }
+
+    #[test]
+    fn issue_3638_operator_log_retains_private_depth_details() {
+        #[derive(Clone)]
+        struct Log(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Log {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("log mutex").extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let log = Log(std::sync::Arc::default());
+        let writer = log.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let wire = map_reflect_error_to_wire_string(db::ReflectError::DepthExceeded {
+                attempted: 918_274,
+                cap: 918_273,
+                namespace: "victim/private".into(),
+            });
+            assert_eq!(
+                wire,
+                "REFLECTION_DEPTH_EXCEEDED: reflection depth limit exceeded"
+            );
+        });
+        let bytes = log.0.lock().expect("log mutex");
+        let text = std::str::from_utf8(&bytes).expect("UTF-8 log");
+        assert!(text.contains("918274"), "{text}");
+        assert!(text.contains("918273"), "{text}");
+        assert!(text.contains("victim/private"), "{text}");
+    }
 
     // ── #3423 — the shared reflection-OWNER rule ────────────────────────
     //
@@ -1221,6 +1326,65 @@ mod tests {
     }
 
     // Validation: source_ids missing.
+    /// #3390 — type-strict optionals: a PRESENT wrong-typed value is refused
+    /// (naming the field), while a well-typed request with every optional
+    /// set still succeeds. Table-driven so a future optional joins the table
+    /// rather than inheriting `unwrap_or(default)`. ONE parser
+    /// (`parse_reflect_optionals`) serves both entry points — `handle_reflect`
+    /// via `parse_reflect_input`, and the caller-bound `handle_reflect_caller`
+    /// — so the table drives one definition through two doors.
+    #[test]
+    fn reflect_refuses_wrong_typed_optionals_3390() {
+        let (conn, tmp) = fresh_db();
+        let src = seed_observation(&conn, "ns-3390", "source for the reflect optionals");
+        let base = json!({ "source_ids": [src.clone()], "title": "t", "content": "c" });
+        let table = [
+            ("tier", json!(123), "expected a non-empty string"),
+            ("namespace", json!(7), "expected a non-empty string"),
+            ("priority", json!("high"), "must be an integer"),
+            // Wrong RANGE, correctly typed: outside the documented 1..=10
+            // domain, and an i64 that does not fit an i32 (pre-fix: silently 5).
+            ("priority", json!(0), "priority must be between 1 and 10"),
+            (
+                "priority",
+                json!(3_000_000_000_i64),
+                "priority must be between 1 and 10",
+            ),
+            ("tags", json!("notarray"), "tags must be an array"),
+            ("tags", json!(["ok", 5]), "tags must be an array"),
+            ("confidence", json!("hi"), "confidence must be a number"),
+        ];
+        for (key, bad, want) in &table {
+            let mut p = base.clone();
+            p[*key] = bad.clone();
+            let err = handle_reflect(&conn, tmp.path(), &p, None, None, None, None)
+                .expect_err("#3390: a present wrong-typed optional must be refused");
+            assert!(
+                err.contains(want),
+                "#3390 {key}={bad}: expected refusal naming the type, got: {err}"
+            );
+        }
+        // The caller-bound twin carries the same parser block: same table.
+        for (key, bad, want) in &table {
+            let mut p = base.clone();
+            p[*key] = bad.clone();
+            let err = handle_reflect_caller(&conn, tmp.path(), &p, None, None, None, None, None)
+                .expect_err("#3390: handle_reflect_caller refuses the same wrong-typed optional");
+            assert!(err.contains(want), "#3390 (caller) {key}={bad}: got: {err}");
+        }
+        // CONTROL — absent optionals default, and well-typed optionals succeed.
+        handle_reflect(&conn, tmp.path(), &base, None, None, None, None)
+            .expect("#3390: absent optionals still default");
+        let full = json!({
+            "source_ids": [src], "title": "t2", "content": "c2",
+            "tier": "long", "namespace": "ns-3390", "priority": 8,
+            "tags": ["a", "b"], "confidence": 0.9
+        });
+        let out = handle_reflect(&conn, tmp.path(), &full, None, None, None, None)
+            .expect("#3390: well-typed optionals succeed");
+        assert!(out.get("id").is_some(), "a reflection was written: {out}");
+    }
+
     #[test]
     fn missing_source_ids_errors() {
         let (conn, tmp) = fresh_db();
@@ -1725,29 +1889,29 @@ mod tests {
     /// on. Exercising the mapper directly closes the coverage gap
     /// without contorting `handle_reflect`'s production signature.
     #[test]
-    fn map_reflect_error_hook_veto_shape() {
+    fn issue_3638_map_reflect_error_hook_veto_redacted() {
         let err = db::ReflectError::HookVeto {
             reason: "operator denied".to_string(),
             code: 451,
         };
         let wire = map_reflect_error_to_wire_string(err);
-        assert_eq!(wire, "REFLECTION_HOOK_VETO (code=451): operator denied");
+        assert_eq!(wire, "REFLECTION_HOOK_VETO: reflection refused");
         assert!(
             wire.starts_with("REFLECTION_HOOK_VETO"),
             "HookVeto wire shape must lead with the stable slug"
         );
     }
 
-    /// Test 7 — `Database` arm: pin the raw-string passthrough. Also
+    /// #3638 — `Database` details belong only in operator logs. Also
     /// structurally unreachable from `handle_reflect` today (a SQL
     /// fault inside the atomic reflect transaction implies a corrupt
     /// DB the test harness can't fabricate cleanly); exercising the
     /// mapper covers the production line.
     #[test]
-    fn map_reflect_error_database_passthrough() {
+    fn issue_3638_map_reflect_error_database_redacted() {
         let err = db::ReflectError::Database("disk I/O error: device busy".to_string());
         let wire = map_reflect_error_to_wire_string(err);
-        assert_eq!(wire, "disk I/O error: device busy");
+        assert_eq!(wire, "REFLECTION_FAILED: reflection could not be completed");
     }
 
     /// Test 8 — `Validation` arm passthrough through the helper. The
@@ -1772,7 +1936,7 @@ mod tests {
     /// Test 10 — `DepthExceeded` arm formatting. Stable error string
     /// shape; Task 5/8 audit emission keys off this prefix.
     #[test]
-    fn map_reflect_error_depth_exceeded_format() {
+    fn issue_3638_map_reflect_error_depth_exceeded_redacted() {
         let err = db::ReflectError::DepthExceeded {
             attempted: 6,
             cap: 5,
@@ -1781,8 +1945,7 @@ mod tests {
         let wire = map_reflect_error_to_wire_string(err);
         assert_eq!(
             wire,
-            "REFLECTION_DEPTH_EXCEEDED: reflection depth 6 would exceed namespace \
-             max_reflection_depth 5 (namespace='research')"
+            "REFLECTION_DEPTH_EXCEEDED: reflection depth limit exceeded"
         );
         assert!(wire.starts_with("REFLECTION_DEPTH_EXCEEDED"));
     }

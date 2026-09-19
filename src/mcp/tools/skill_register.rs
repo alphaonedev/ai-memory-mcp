@@ -271,7 +271,9 @@ pub(super) fn register_core(
     // write lock up front, serialising concurrent registrations; RAII drop of
     // `tx` rolls back ALL writes on any early `?` return below.
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
-        .map_err(|e| format!("skill register BEGIN IMMEDIATE: {e}"))?;
+        .map_err(|e| {
+        crate::mcp::error_text::mcp_foreign_err("skill register BEGIN IMMEDIATE", e)
+    })?;
     let conn: &Connection = &tx;
 
     // Find the current (non-superseded) row for this (namespace, name),
@@ -321,7 +323,7 @@ pub(super) fn register_core(
             now_secs,
         ],
     )
-    .map_err(|e| format!("skills INSERT: {e}"))?;
+    .map_err(|e| crate::mcp::error_text::mcp_foreign_err("skills INSERT", e))?;
 
     // Insert resources.
     for (res_path, res_kind, res_content) in resources {
@@ -333,7 +335,7 @@ pub(super) fn register_core(
              VALUES (?1,?2,?3,?4,?5)",
             params![new_id, res_path, res_kind, res_blob, res_digest],
         )
-        .map_err(|e| format!("skill_resources INSERT ({res_path}): {e}"))?;
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("skill_resources INSERT", e))?;
     }
 
     // Update previous row's superseded_by.
@@ -342,7 +344,7 @@ pub(super) fn register_core(
             "UPDATE skills SET superseded_by = ?1 WHERE id = ?2",
             params![new_id, prev],
         )
-        .map_err(|e| format!("superseded_by UPDATE: {e}"))?;
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("superseded_by UPDATE", e))?;
         Some(prev.clone())
     } else {
         None
@@ -386,7 +388,7 @@ pub(super) fn register_core(
 
     // Commit the atomic register (skills + resources + supersede) as one unit.
     tx.commit()
-        .map_err(|e| format!("skill register COMMIT: {e}"))?;
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("skill register COMMIT", e))?;
 
     Ok(RegisterResult {
         id: new_id,
@@ -503,12 +505,11 @@ pub fn handle_skill_register(
         "allow",
         "skill_register",
         "",
-        json!({
-            "namespace": manifest.namespace,
-            "name": manifest.name,
-            "resource_count": resource_files.len(),
-            "signed": active_keypair.is_some(),
-        }),
+        crate::governance::audit::ForensicPayload::new()
+            .ident("namespace", &manifest.namespace)
+            .ident("name", &manifest.name)
+            .number("resource_count", resource_files.len())
+            .flag("signed", active_keypair.is_some()),
     );
 
     let body_bytes = manifest.body.as_bytes();
@@ -615,8 +616,16 @@ fn resolve_import_root(folder_str: &str, configured_root: Option<&str>) -> Resul
         ));
     }
     if let Some(root_str) = configured_root {
-        let root = std::fs::canonicalize(Path::new(root_str)).map_err(|_| {
-            format!("{SKILLS_IMPORT_ROOT_ENV} '{root_str}' is not a directory or does not exist")
+        // #3713 — the configured root is OPERATOR config; its path goes to the
+        // operator log, never to the caller's error text.
+        let root = std::fs::canonicalize(Path::new(root_str)).map_err(|e| {
+            tracing::error!(
+                target: crate::mcp::error_text::TRACE_TARGET,
+                root = root_str,
+                error = %e,
+                "{SKILLS_IMPORT_ROOT_ENV} is not a directory or does not exist"
+            );
+            format!("{SKILLS_IMPORT_ROOT_ENV} is not a directory or does not exist")
         })?;
         if !canonical.starts_with(&root) {
             return Err(format!(
@@ -639,18 +648,27 @@ fn reject_symlink_escape(path: &Path, root: &Path) -> Result<(), String> {
         return Ok(());
     };
     if meta.file_type().is_symlink() {
-        return Err(format!(
-            "refusing symlinked skill path '{}': symlinks are not followed (path-escape defence)",
-            path.display()
-        ));
+        // #3713 — the resolved path carries the operator's import root; the
+        // caller learns the verdict, the operator log names the entry.
+        tracing::warn!(
+            target: crate::mcp::error_text::TRACE_TARGET,
+            path = %path.display(),
+            "refusing symlinked skill path: symlinks are not followed (path-escape defence)"
+        );
+        return Err(
+            "refusing symlinked skill path: symlinks are not followed (path-escape defence)"
+                .to_owned(),
+        );
     }
     let resolved = std::fs::canonicalize(path)
-        .map_err(|e| format!("cannot resolve skill path '{}': {e}", path.display()))?;
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("cannot resolve skill path", e))?;
     if !resolved.starts_with(root) {
-        return Err(format!(
-            "refusing skill path '{}': resolved path escapes the import root",
-            path.display()
-        ));
+        tracing::warn!(
+            target: crate::mcp::error_text::TRACE_TARGET,
+            path = %path.display(),
+            "refusing skill path: resolved path escapes the import root"
+        );
+        return Err("refusing skill path: resolved path escapes the import root".to_owned());
     }
     Ok(())
 }
@@ -665,17 +683,18 @@ fn collect_resources(
     out: &mut Vec<(String, String, Vec<u8>)>,
     budget: &mut ImportBudget,
 ) -> Result<(), String> {
-    let entries =
-        std::fs::read_dir(dir).map_err(|e| format!("read_dir '{}': {e}", dir.display()))?;
+    let entries = std::fs::read_dir(dir)
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("read_dir", e))?;
     for entry in entries {
-        let entry = entry.map_err(|e| format!("dir entry error: {e}"))?;
+        let entry =
+            entry.map_err(|e| crate::mcp::error_text::mcp_foreign_err("dir entry error", e))?;
         let path = entry.path();
         // #1923 — inspect the entry WITHOUT following it. A symlink (to a
         // dir OR a file) is refused so a planted
         // `resources/loot -> /etc/shadow` cannot be read; walking only
         // real directories keeps the traversal inside `base`.
         let md = std::fs::symlink_metadata(&path)
-            .map_err(|e| format!("stat resource '{}': {e}", path.display()))?;
+            .map_err(|e| crate::mcp::error_text::mcp_foreign_err("stat resource", e))?;
         if md.file_type().is_symlink() {
             return Err(format!(
                 "refusing symlinked resource '{}': symlinks are not followed \
@@ -702,8 +721,9 @@ fn collect_resources(
             // Defense-in-depth: the fully-resolved regular file MUST remain
             // under the import root (catches any escape the symlink check
             // above could miss on an exotic filesystem).
-            let resolved = std::fs::canonicalize(&path)
-                .map_err(|e| format!("cannot resolve resource '{}': {e}", path.display()))?;
+            let resolved = std::fs::canonicalize(&path).map_err(|e| {
+                crate::mcp::error_text::mcp_foreign_err("cannot resolve resource", e)
+            })?;
             if !resolved.starts_with(base) {
                 return Err(format!(
                     "refusing resource '{}': resolved path escapes the import root",
@@ -711,7 +731,7 @@ fn collect_resources(
                 ));
             }
             let content = std::fs::read(&path)
-                .map_err(|e| format!("read resource '{}': {e}", path.display()))?;
+                .map_err(|e| crate::mcp::error_text::mcp_foreign_err("read resource", e))?;
             budget.charge(content.len() as u64)?;
             // Determine kind from sub-directory name or file extension.
             let kind = infer_kind(&rel);
@@ -1258,7 +1278,9 @@ mod tests {
             &mut ImportBudget::new(),
         )
         .unwrap_err();
-        assert!(err.contains("read_dir"));
+        // #3713 — the io error is OPERATOR-ONLY; the caller sees the class.
+        assert_eq!(err, crate::mcp::error_text::FILESYSTEM_ERROR_TEXT);
+        assert!(!err.contains("/does/not/exist"), "{err}");
     }
 
     // ---- hex module --------------------------------------------------------

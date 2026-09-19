@@ -163,12 +163,14 @@ fn list_dependents_of_invalidated_internal(
     conn: &Connection,
     invalidated_id: &str,
 ) -> Result<Vec<(String, String)>> {
-    let mut stmt = conn.prepare(
+    let sql = format!(
         "SELECT m.id, m.namespace
            FROM memory_links l
            JOIN memories m ON m.id = l.source_id
-          WHERE l.target_id = ?1 AND l.relation = 'reflects_on'",
-    )?;
+          WHERE l.target_id = ?1 AND l.relation = 'reflects_on' {}",
+        crate::models::quarantine_hidden_clause("m"),
+    );
+    let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(params![invalidated_id], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
     })?;
@@ -395,6 +397,40 @@ mod tests {
         assert!(ids.contains(&m1_id.as_str()));
         assert!(ids.contains(&m2_id.as_str()));
         assert!(!ids.contains(&m3_id.as_str()), "related_to leaked through");
+    }
+
+    #[test]
+    fn list_dependents_hides_quarantined_keeps_contaminated_3614() -> Result<()> {
+        let _lineage = crate::test_support::no_lineage_dag_guard();
+        let conn = fresh_conn();
+        let root = db::insert(
+            &conn,
+            &make_mem("root-3614", "ns-root", MemoryKind::Reflection),
+        )?;
+        let mut expected = Vec::new();
+        for state in ["open", "contaminated", "quarantined"] {
+            let namespace = format!("ns-{state}-3614");
+            let id = db::insert(&conn, &make_mem(state, &namespace, MemoryKind::Observation))?;
+            db::create_link(&conn, &id, &root, "reflects_on")?;
+            conn.execute(
+                "UPDATE memories SET lifecycle_state = ?1 WHERE id = ?2",
+                params![state, id],
+            )?;
+            if state != "quarantined" {
+                expected.push((id, namespace));
+            }
+        }
+        let mut actual: Vec<_> = list_dependents_of_invalidated(&conn, &root)?
+            .into_iter()
+            .map(|d| (d.id, d.namespace))
+            .collect();
+        actual.sort();
+        expected.sort();
+        assert_eq!(
+            actual, expected,
+            "#3614 quarantine must hide both id and namespace while retaining the review queue"
+        );
+        Ok(())
     }
 
     #[test]

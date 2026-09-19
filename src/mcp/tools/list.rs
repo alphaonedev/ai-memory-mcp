@@ -149,7 +149,7 @@ fn handle_list_capped(
         agent_id,
         valid_at,
     )
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| crate::mcp::error_text::mcp_foreign_err("handle_list_capped", e))?;
     // v1.0.0 #3348 — the visibility SSOT, not a caller-conditional filter. See
     // `crate::visibility::is_readable_on_query`: `caller == None` used to mean
     // "return every row", which surfaced other agents' `_messages/*` inbox mail

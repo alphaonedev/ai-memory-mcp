@@ -288,6 +288,20 @@ pub fn cmd_delete(
     // bulk `forget` has always had. `--hard` is the explicit, documented
     // opt-in to the pre-#3012 destroy-in-place behaviour. Both paths carry
     // the #1955 R45 record-stop fence.
+    // #3730 — `--hard` on an inbox message is legitimate (an operator erasing
+    // a payload that should not exist) but never silent: name what is being
+    // destroyed, then proceed. Plain `delete` archives it (the drain idiom).
+    if args.hard && crate::visibility::inbox_delete_retains(&target.namespace) {
+        writeln!(
+            out.stderr,
+            "warning: --hard on inbox message {} destroys the record of what {} was told \
+             (no archive copy, unrecoverable); plain `delete` would archive it",
+            target.id,
+            target
+                .namespace
+                .trim_start_matches(crate::INBOX_NAMESPACE_PREFIX)
+        )?;
+    }
     let removed = if args.hard {
         db::delete(&conn, &target.id)?
     } else {
