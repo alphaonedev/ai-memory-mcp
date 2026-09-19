@@ -669,6 +669,36 @@ generic `AI_MEMORY_DECISION_API_KEY` env var — a catch-all would ship
 the chat credential to a different vendor's host. Use
 `[decision].api_key_env` to name any env var you like.
 
+**Egress posture covers this endpoint too (#3806 W1b).** `[decision]`
+is a SECOND inference endpoint, so the `AI_MEMORY_INFERENCE_EGRESS`
+knob that gates the chat and embedding lanes (#1963) gates it as
+well, under its own egress class `inference_decision`:
+
+| `AI_MEMORY_INFERENCE_EGRESS` | remote `[decision]` provider | `provider = "local-nli"` |
+|---|---|---|
+| `allow` (compiled default) | constructed | constructed |
+| `loopback-only` | constructed **only** if the resolved `base_url` is loopback; otherwise refused | constructed |
+| `deny` | **REFUSED** — no provider is constructed and a signed refusal row is appended to the audit chain | constructed |
+
+The enforcement is the **absence of the provider**, decided once at
+boot in `build_decision_provider`, exactly as `build_llm_client`
+decides it for `[llm]` — not a per-request check somebody can forget.
+Every outbound decision call additionally re-checks the live posture
+before it is issued, so tightening the knob takes effect on a running
+daemon; a refusal there is an **abstain**, never a `false`. A
+`local-nli` provider is not gated because it opens no socket: its
+`base_url` is empty by construction and there is no egress to govern.
+An unrecognised `AI_MEMORY_INFERENCE_EGRESS` token fails CLOSED to
+`deny` for this endpoint exactly as for the others.
+
+`GET /api/v1/capabilities` (and MCP `memory_capabilities`) reports the
+result as `decision_provider.state`, from a CLOSED four-token
+vocabulary — `absent` | `configured` | `refused_by_egress` |
+`constructed` — so a fleet orchestrator can assert "this node's
+decider really is off" instead of parsing prose. The key is **omitted
+entirely** when no `[decision]` section is configured, which is what
+keeps an unconfigured deployment byte-identical to v1.0.0.
+
 Model-class advice, the air-gap ladder and the hosted-route census land
 with the rest of the `[decision]` documentation (#3806 W6).
 

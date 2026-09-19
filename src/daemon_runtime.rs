@@ -6793,6 +6793,17 @@ pub async fn bootstrap_serve(
     // degrades to operator-supplied tags only.
     let llm = build_llm_client(feature_tier, app_config, db_path).await;
 
+    // #3806 W1b — the `[decision]` boot chokepoint, mirroring the gate
+    // above one inference endpoint over: under `deny` (or loopback-only
+    // against a remote target) NO decision provider is constructed and a
+    // signed refusal row is written. `[decision]` unset returns `Absent`
+    // without resolving or opening anything (byte-identical v1.0.0). The
+    // handle is dropped because no seam consumes one yet (W2-W4); the two
+    // boot effects that matter now are recorded by the call itself.
+    drop(crate::decision_boot::build_decision_provider(
+        app_config, db_path,
+    ));
+
     let db_state: Db = Arc::new(Mutex::new((
         conn,
         db_path.to_path_buf(),

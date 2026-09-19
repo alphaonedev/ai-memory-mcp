@@ -351,6 +351,10 @@ fn build_capabilities_overlay(
     let mut caps = tier_config.capabilities_with_resolved(resolved_models);
     caps.federation_security = crate::federation::peer_posture::boot_report();
     caps.deployment_shape = crate::config::shape::detector::boot_assessment();
+    // #3806 W1b — the `[decision]` boot state, from a closed vocabulary.
+    // `None` (the unconfigured case) omits the key entirely, so a
+    // deployment that never set `[decision]` sees the v1.0.0 payload.
+    caps.decision_provider = crate::decision_boot::boot_report();
 
     // --- Reranker live state (P1) ---
     caps.features.reranker_active = match reranker {

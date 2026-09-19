@@ -202,6 +202,20 @@ api_key_env = "XAI_API_KEY"            # process-env-var name (NOT the literal k
 # string runs on the PRIMARY [llm] client) and WARN at boot (#3808).
 model   = "gemma3:4b"
 
+# [decision]                           # #3806: the SECOND inference endpoint
+# provider     = "openrouter"          # (structured decisions, not generation).
+# model        = "typesafe/jev-1.13"   # See CONFIG_SCHEMA.md for the full key
+# api_key_file = "/etc/ai-memory/keys/decision.key"   # table. Absent = no decision
+# timeout_secs = 2                     # provider, byte-identical v1.0.0.
+# fallback     = "abstain"
+# NOTE: AI_MEMORY_INFERENCE_EGRESS gates THIS endpoint too, under the
+# egress class `inference_decision`. Under `deny` no decision provider is
+# constructed and a signed refusal row is written; under `loopback-only`
+# only a loopback `base_url` is constructed; `provider = "local-nli"` opens
+# no socket and is always constructible. `GET /api/v1/capabilities` reports
+# `decision_provider.state` from the closed vocabulary
+# absent | configured | refused_by_egress | constructed.
+
 [embeddings]
 backend = "ollama"                     # #1598: also any #1067 alias (openrouter,
                                        # openai, gemini, ...) or "openai-compatible"

@@ -8,12 +8,13 @@
 //!    the shared API-key ladder to an OPTIONAL primary env var; if that
 //!    perturbed `[llm]` resolution, this golden changes. It also pins that a config with
 //!    no `[decision]` section resolves to NO provider.
-//! 2. A STRUCTURAL pin that no production call site consults the
-//!    decider. W1a deliberately adds the trait, the config and the
-//!    resolver and wires NOTHING: the boot chokepoint is W1b, the
-//!    clients W1c, the seams W2-W4. Until a seam is wired there is no
-//!    observable output to diff, and this test is what makes that claim
-//!    mechanical rather than asserted.
+//! 2. A STRUCTURAL pin that no SEAM consults the decider. W1a added the
+//!    trait, the config and the resolver and wired nothing; W1b adds the
+//!    boot chokepoint and its ONE `bootstrap_serve` call site, and still
+//!    wires no seam (the clients are W1c, the seams W2-W4). Until a seam
+//!    is wired there is no observable output to diff, and this test is
+//!    what makes that claim mechanical rather than asserted. The
+//!    allowlist grows only in lockstep with reviewed wiring.
 //!
 //! Both halves carry a PRESENCE control, so neither can pass vacuously.
 //!
@@ -163,6 +164,10 @@ const DECIDER_TOKENS: &[&str] = &[
     "resolve_decision",
     "decision_config",
     "crate::decision::",
+    // #3806 W1b — the boot chokepoint module itself. Added so wiring a
+    // seam to it is caught by this scan too: without this token W1b's
+    // own `daemon_runtime` call site would have been invisible here.
+    "decision_boot",
 ];
 
 /// The files this commit is ALLOWED to mention the decider in: the two
@@ -174,6 +179,15 @@ const ALLOWED: &[&str] = &[
     "src/decision_config.rs",
     "src/config.rs",
     "src/lib.rs",
+    // #3806 W1b, extended in lockstep with the wiring it admits:
+    // the boot chokepoint module, its ONE `bootstrap_serve` call site,
+    // the egress module that now names the `InferenceDecision` class in
+    // its docs, and the capability surface that renders the boot
+    // snapshot. A change in this list is a change someone reviewed.
+    "src/decision_boot.rs",
+    "src/daemon_runtime.rs",
+    "src/egress.rs",
+    "src/mcp/tools/capabilities.rs",
 ];
 
 fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -189,7 +203,7 @@ fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 #[test]
-fn no_production_call_site_consults_the_decider_yet() {
+fn no_seam_consults_the_decider_yet() {
     let mut files = Vec::new();
     rust_files(Path::new("src"), &mut files);
     assert!(files.len() > 100, "the walk must see the whole src tree");
@@ -213,15 +227,15 @@ fn no_production_call_site_consults_the_decider_yet() {
 
     assert!(
         offenders.is_empty(),
-        "W1a wires NO seam: the decider must not be consulted from any \
-         production call site yet (the boot chokepoint is W1b, the seams \
-         W2-W4). Offending sites:\n  {}",
+        "W1b wires the BOOT CHOKEPOINT and no seam: the decider must not be \
+         consulted from any seam yet (the clients are W1c, the seams W2-W4). \
+         Offending sites:\n  {}",
         offenders.join("\n  ")
     );
     // PRESENCE control — the scan really does find the tokens where they
     // ARE, so the emptiness above is not a broken grep.
     assert!(
-        allowed_hits >= 6,
+        allowed_hits >= 10,
         "the scan found only {allowed_hits} hits in the allowlisted files; \
          it is not actually matching the decider tokens"
     );

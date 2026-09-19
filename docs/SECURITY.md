@@ -103,7 +103,8 @@ with the substrate's current posture against each:
   with typed `503` shedding (`AI_MEMORY_MAX_INFLIGHT_REQUESTS`, #1733),
   adaptive federation DLQ replay with an edge-triggered depth WARN
   (#1544), the vector-index residency cap (#1005), and the
-  inference-plane egress gate (`AI_MEMORY_INFERENCE_EGRESS`, #1963)
+  inference-plane egress gate (`AI_MEMORY_INFERENCE_EGRESS`, #1963 —
+  covering the chat, embedding and, since #3806, `[decision]` lanes)
   bound the blast radius. This **supersedes the older blanket "DoS at
   the database layer is out of scope" note above for the
   availability-economics class**; raw SQLite write-mutex contention

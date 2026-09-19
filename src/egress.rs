@@ -14,7 +14,8 @@
 //! and forensic-export (secret-screened) lanes — to the **inference
 //! plane**: the outbound POSTs that ship memory content to an LLM /
 //! embedding vendor at the semantic / smart tiers ([`EgressClass::InferenceLlm`]
-//! and [`EgressClass::InferenceEmbedding`]).
+//! and [`EgressClass::InferenceEmbedding`]; #3806 W1b adds
+//! [`EgressClass::InferenceDecision`] for the `[decision]` endpoint).
 //!
 //! ## The knob
 //!
@@ -40,7 +41,8 @@
 //!
 //! - **ENFORCED (hard).** When the gate refuses, the inference client is
 //!   NOT constructed at the boot chokepoints ([`crate::daemon_runtime::build_llm_client`],
-//!   [`crate::daemon_runtime::build_embedder`], and the MCP stdio init in
+//!   [`crate::daemon_runtime::build_embedder`],
+//!   [`crate::decision_boot::build_decision_provider`], and the MCP stdio init in
 //!   `src/mcp/mod.rs`). A `None` client means no memory content can be
 //!   POSTed to the refused vendor — the enforcement is the absence of the
 //!   egress path, not a per-request check that could be bypassed.
@@ -78,6 +80,14 @@ pub enum EgressClass {
     InferenceLlm,
     /// Outbound embedding POST to an embedding vendor (#1963).
     InferenceEmbedding,
+    /// Outbound structured-decision POST to the `[decision]` endpoint
+    /// (#3806 W1b) — the SECOND inference endpoint. Named separately
+    /// from [`Self::InferenceLlm`] so an audit row says which endpoint
+    /// was refused and an operator can tell "my chat backend is gated"
+    /// from "my decider is gated"; gated identically, through the same
+    /// [`evaluate_inference_egress`] predicate and the same boot-time
+    /// absence enforcement (`crate::decision_boot::build_decision_provider`).
+    InferenceDecision,
 }
 
 impl EgressClass {
@@ -90,6 +100,7 @@ impl EgressClass {
             Self::ForensicExport => "forensic_export",
             Self::InferenceLlm => "inference_llm",
             Self::InferenceEmbedding => "inference_embedding",
+            Self::InferenceDecision => "inference_decision",
         }
     }
 
@@ -97,7 +108,10 @@ impl EgressClass {
     /// gate governs).
     #[must_use]
     pub fn is_inference(self) -> bool {
-        matches!(self, Self::InferenceLlm | Self::InferenceEmbedding)
+        matches!(
+            self,
+            Self::InferenceLlm | Self::InferenceEmbedding | Self::InferenceDecision
+        )
     }
 }
 
@@ -652,6 +666,50 @@ mod tests {
         assert_eq!(EgressClass::Webhook.as_str(), "webhook");
         assert!(EgressClass::InferenceLlm.is_inference());
         assert!(EgressClass::InferenceEmbedding.is_inference());
+        // #3806 W1b — the `[decision]` lane is classified and named
+        // like its siblings, and gated by the same predicate.
+        assert_eq!(
+            EgressClass::InferenceDecision.as_str(),
+            "inference_decision"
+        );
+        assert!(EgressClass::InferenceDecision.is_inference());
+        for (mode, expected_refusal) in [
+            (InferenceEgressMode::Allow, false),
+            (InferenceEgressMode::LoopbackOnly, true),
+            (InferenceEgressMode::Deny, true),
+        ] {
+            let remote = evaluate_inference_egress(
+                mode,
+                EgressClass::InferenceDecision,
+                "https://decide.example.invalid/v1",
+            );
+            assert_eq!(
+                remote.is_refused(),
+                expected_refusal,
+                "InferenceDecision must take the same posture as InferenceLlm under {mode:?}"
+            );
+            // Presence control: the same posture treats the chat lane
+            // identically, so the decision lane is not special-cased.
+            assert_eq!(
+                evaluate_inference_egress(
+                    mode,
+                    EgressClass::InferenceLlm,
+                    "https://decide.example.invalid/v1",
+                )
+                .is_refused(),
+                expected_refusal
+            );
+            // ...and a loopback target is permitted under loopback-only.
+            assert!(
+                !evaluate_inference_egress(
+                    mode,
+                    EgressClass::InferenceDecision,
+                    "http://127.0.0.1:11434/v1",
+                )
+                .is_refused()
+                    || mode == InferenceEgressMode::Deny
+            );
+        }
         assert!(!EgressClass::Webhook.is_inference());
         assert!(!EgressClass::Federation.is_inference());
         assert!(!EgressClass::ForensicExport.is_inference());
