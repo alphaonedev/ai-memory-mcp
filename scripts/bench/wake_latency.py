@@ -394,7 +394,24 @@ def load_sdk_wake(repo: Path):
         )
     import sys
 
-    spec = importlib.util.spec_from_file_location("ai_memory_wake_3473", path)
+    # #3849 -- `wake.py` imports its sibling `_ownedfile` RELATIVELY (#3784:
+    # "the SDK loads the agent private key through ONE owner-only reader"),
+    # which a bare file load cannot resolve ("attempted relative import with
+    # no known parent package"). So the file is loaded as a submodule of a
+    # SYNTHETIC package whose `__path__` is the SDK directory: relative
+    # imports resolve against the tree's own siblings, and the package
+    # `__init__` (httpx, pydantic) is still never executed -- the harness
+    # stays stdlib-only, and the client is still the shipped one.
+    import types
+
+    pkg_name = "ai_memory_wake_3473"
+    pkg = sys.modules.get(pkg_name)
+    if pkg is None:
+        pkg = types.ModuleType(pkg_name)
+        pkg.__path__ = [str(path.parent)]  # type: ignore[attr-defined]
+        pkg.__package__ = pkg_name
+        sys.modules[pkg_name] = pkg
+    spec = importlib.util.spec_from_file_location(f"{pkg_name}.wake", path)
     if spec is None or spec.loader is None:
         raise HarnessError(f"could not load {path}")
     module = importlib.util.module_from_spec(spec)
@@ -415,6 +432,11 @@ def load_sdk_wake(repo: Path):
         # next caller as if it had loaded.
         sys.modules.pop(spec.name, None)
         raise
+    # The "no private copy of the wire format" property, pinned rather than
+    # implied by the loader shape: what loaded is the file under THIS tree.
+    loaded = Path(getattr(module, "__file__", "")).resolve()
+    if loaded != path.resolve():
+        raise HarnessError(f"loaded {loaded}, expected the tree's own {path}")
     return module
 
 
@@ -1509,8 +1531,15 @@ def self_test() -> int:
     for symbol in ("WakeListener", "Frame", "Kind", "DelegationBundle"):
         check(hasattr(wake_mod, symbol),
               f"the shipped wake client must expose {symbol}")
-    check(sys.modules.get("ai_memory_wake_3473") is wake_mod,
+    # #3849 -- registered under the SYNTHETIC package's submodule name, so the
+    # relative `from ._ownedfile import ...` (#3784) resolves against the
+    # tree's own sibling, and the package `__init__` is never executed.
+    check(sys.modules.get("ai_memory_wake_3473.wake") is wake_mod,
           "the wake module must be registered in sys.modules under its spec name")
+    check("ai_memory_wake_3473._ownedfile" in sys.modules,
+          "the sibling owner-only reader must have loaded from the tree, not a copy")
+    check("ai_memory" not in sys.modules,
+          "the SDK package __init__ (httpx, pydantic) must not have been imported")
     # The frozen dataclasses are the exact construct that failed to decorate,
     # so touch one rather than trusting the import alone.
     check(getattr(wake_mod.Frame, "__dataclass_fields__", None) is not None,
