@@ -41,7 +41,7 @@ name: Per-Module Coverage Thresholds
 
 on:
   pull_request:
-    branches: [main, develop, "release/**", "feat/v0.7.0-grand-slam"]
+    branches: [main, develop, "release/**", "feat/v0.7.0-grand-slam", "next/v1.1.0"]
   push:
     branches: [main, develop, "feat/v0.7.0-grand-slam", "release/**"]
   # Merge Queue (#3089) — `Per-Module Coverage Thresholds` (+ the sibling
