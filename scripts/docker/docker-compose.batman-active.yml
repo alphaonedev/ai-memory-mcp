@@ -11,6 +11,7 @@
 # init container.
 #
 # Usage:
+#   AI_MEMORY_IMAGE=ai-memory:local \
 #   docker compose -f scripts/docker/docker-compose.batman-active.yml up -d
 #   docker compose -f scripts/docker/docker-compose.batman-active.yml logs -f curator
 #   docker compose -f scripts/docker/docker-compose.batman-active.yml exec curator \
@@ -30,7 +31,7 @@ services:
   # First-launch initializer: keygen + sign-seed + enable R001-R004 +
   # write a Batman standard memory. Exits 0 after activation. Idempotent.
   init-batman:
-    image: ${AI_MEMORY_IMAGE:-alphaonedev/ai-memory:0.7.0}
+    image: ${AI_MEMORY_IMAGE:?set AI_MEMORY_IMAGE to a v1.0.0+ ai-memory image (e.g. a local `docker build -t ai-memory:local .`); this stack assumes the TLS-only daemon}
     container_name: ai-memory-init-batman
     user: ${AI_MEMORY_UID:-1000}:${AI_MEMORY_GID:-1000}
     environment:
@@ -53,6 +54,15 @@ services:
         chmod +x /opt/scripts/*.sh 2>/dev/null || true
         # run the activator — idempotent
         bash /opt/scripts/install-batman-active.sh --db /data/ai-memory.db --namespace "$$BATMAN_NAMESPACE"
+        # #3838 -- `serve` takes no --tier flag (#703): the daemon's tier comes
+        # from config.toml, resolved under XDG_CONFIG_HOME. Write it once, on
+        # the shared data volume, so the mcp and curator services (which set
+        # XDG_CONFIG_HOME=/data/xdg) boot at the autonomous tier this stack
+        # documents. Idempotent: never overwrites an operator-edited file.
+        mkdir -p /data/xdg/ai-memory
+        if [ ! -f /data/xdg/ai-memory/config.toml ]; then
+          printf 'schema_version = 2\ntier = "autonomous"\n' > /data/xdg/ai-memory/config.toml
+        fi
         echo "init-batman complete"
     restart: "no"
 
@@ -60,7 +70,7 @@ services:
   # are on from the first request; Form 5 env vars come from the
   # environment block here, picked up by every spawned process.
   mcp:
-    image: ${AI_MEMORY_IMAGE:-alphaonedev/ai-memory:0.7.0}
+    image: ${AI_MEMORY_IMAGE:?set AI_MEMORY_IMAGE to a v1.0.0+ ai-memory image (e.g. a local `docker build -t ai-memory:local .`); this stack assumes the TLS-only daemon}
     container_name: ai-memory-mcp
     user: ${AI_MEMORY_UID:-1000}:${AI_MEMORY_GID:-1000}
     depends_on:
@@ -69,6 +79,7 @@ services:
     environment:
       AI_MEMORY_DB: /data/ai-memory.db
       AI_MEMORY_KEY_DIR: /keys
+      XDG_CONFIG_HOME: /data/xdg
       AI_MEMORY_AUTO_CONFIDENCE: "1"
       AI_MEMORY_CONFIDENCE_SHADOW: "1"
       AI_MEMORY_CONFIDENCE_DECAY: "1"
@@ -79,20 +90,25 @@ services:
     # Stdio MCP server. Compose isn't the right transport — exec into
     # this container for ad-hoc CLI calls, and point your MCP-stdio
     # client at `docker exec -i ai-memory-mcp ai-memory --db /data/ai-memory.db mcp --tier autonomous`.
+    # #3838 -- `serve` has `--host`/`--port` (no `--bind`) and no `--tier`
+    # (the tier is the config.toml the init service wrote, above).
     command:
       - ai-memory
       - --db
       - /data/ai-memory.db
       - serve
-      - --bind
-      - 0.0.0.0:9077
-      - --tier
-      - autonomous
+      - --host
+      - 0.0.0.0
+      - --port
+      - "9077"
     ports:
       - "127.0.0.1:9077:9077"
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-fs", "http://localhost:9077/api/v1/healthz"]
+      # TLS only (#3705): the daemon answers no plaintext, and `/healthz` was
+      # never a route (`handlers::routes::HEALTH` is `/api/v1/health`). The
+      # zero-config local CA (#3709) lives under AI_MEMORY_KEY_DIR (/keys).
+      test: ["CMD", "curl", "-fs", "--cacert", "/keys/tls/local-ca.pem", "https://localhost:9077/api/v1/health"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -102,7 +118,7 @@ services:
   # freshness-decay sweeps, Form 6 backfills, Rule-5 consolidation.
   # Always-on. Form 5 env vars baked in.
   curator:
-    image: ${AI_MEMORY_IMAGE:-alphaonedev/ai-memory:0.7.0}
+    image: ${AI_MEMORY_IMAGE:?set AI_MEMORY_IMAGE to a v1.0.0+ ai-memory image (e.g. a local `docker build -t ai-memory:local .`); this stack assumes the TLS-only daemon}
     container_name: ai-memory-curator
     user: ${AI_MEMORY_UID:-1000}:${AI_MEMORY_GID:-1000}
     depends_on:
@@ -111,6 +127,7 @@ services:
     environment:
       AI_MEMORY_DB: /data/ai-memory.db
       AI_MEMORY_KEY_DIR: /keys
+      XDG_CONFIG_HOME: /data/xdg
       AI_MEMORY_AUTO_CONFIDENCE: "1"
       AI_MEMORY_CONFIDENCE_SHADOW: "1"
       AI_MEMORY_CONFIDENCE_DECAY: "1"
@@ -132,10 +149,11 @@ services:
 
   # Optional: peer-to-peer sync daemon (Crack 6 — single-node mesh).
   # Disabled by default since it needs peer addresses. Enable by
-  # providing --peer addresses via SYNC_PEERS env var, then:
+  # providing the peer list via SYNC_PEERS (comma-separated https:// URLs —
+  # an http:// peer is refused at boot, #2477/#3705), then:
   #   docker compose --profile sync up -d
   sync:
-    image: ${AI_MEMORY_IMAGE:-alphaonedev/ai-memory:0.7.0}
+    image: ${AI_MEMORY_IMAGE:?set AI_MEMORY_IMAGE to a v1.0.0+ ai-memory image (e.g. a local `docker build -t ai-memory:local .`); this stack assumes the TLS-only daemon}
     container_name: ai-memory-sync
     profiles: ["sync"]
     user: ${AI_MEMORY_UID:-1000}:${AI_MEMORY_GID:-1000}
@@ -156,7 +174,7 @@ services:
           echo "no SYNC_PEERS set — sync daemon idle, exiting";
           exit 0;
         fi
-        exec ai-memory --db /data/ai-memory.db sync-daemon ${SYNC_PEERS}
+        exec ai-memory --db /data/ai-memory.db sync-daemon --peers "${SYNC_PEERS}"
     restart: unless-stopped
 
 volumes:
