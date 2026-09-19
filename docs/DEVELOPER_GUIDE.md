@@ -518,7 +518,7 @@ memories[id|title|tier|namespace|priority|confidence|score|access_count|tags|sou
 memories[id|title|tier|namespace|priority|score|tags]:
 ```
 
-The MCP server defaults to compact mode (`toon_compact`). Clients can request `"toon"` for full mode or `"json"` for standard JSON via the `format` parameter on recall, search, and list tools.
+The MCP server defaults to compact mode (`toon_compact`). Clients can request `"toon"` for full mode or `"json"` for standard JSON via the `format` parameter on recall, search, list, and session-start tools. The value is an enum on BOTH surfaces (#3803): the MCP dispatch parses it through `WireFormat::parse_mcp` before the handler runs, so a value outside `json` / `toon` / `toon_compact` (a wrong-case `TOON_COMPACT`, a non-string) is refused with `isError: true` and the same `invalid format '<got>': expected one of json, toon, toon_compact` sentence the HTTP surface returns as `400` — never a silent fall-through to pretty JSON (which, before #3803, cost a typo 10.7x the tokens of the default on every call). `memory_export_reflection` keeps its own `md` / `json` / `yaml` vocabulary; the rendering gate does not read it.
 
 #### Search Response Normalization
 

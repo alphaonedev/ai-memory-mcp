@@ -70,10 +70,42 @@ impl WireFormat {
     pub fn parse_http(raw: Option<&str>) -> Result<Self, String> {
         match raw {
             None => Ok(Self::Json),
-            Some(s) if s == FORMAT_JSON => Ok(Self::Json),
-            Some(s) if s == FORMAT_TOON => Ok(Self::Toon),
-            Some(s) if s == FORMAT_TOON_COMPACT => Ok(Self::ToonCompact),
-            Some(other) => Err(invalid_format_msg(other)),
+            Some(s) => Self::parse_named(s),
+        }
+    }
+
+    /// #3803 — parse the MCP `format` tool argument for the four
+    /// TOON-rendering tools (`memory_recall` / `memory_list` /
+    /// `memory_search` / `memory_session_start`). `None` (argument
+    /// omitted) resolves to the [`Self::ToonCompact`] MCP default; an
+    /// unrecognised value is the SAME `Err` [`parse_http`](Self::parse_http)
+    /// returns, so the two surfaces refuse the same vocabulary with the
+    /// same sentence. Before #3803 the dispatch matched four exact
+    /// literals and let everything else fall through to pretty JSON —
+    /// `format:"TOON_COMPACT"` cost 10.7x the tokens of the default on
+    /// every call and the caller was never told.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(message)` when `raw` is `Some` of anything other
+    /// than [`FORMAT_JSON`] / [`FORMAT_TOON`] / [`FORMAT_TOON_COMPACT`].
+    pub fn parse_mcp(raw: Option<&str>) -> Result<Self, String> {
+        match raw {
+            None => Ok(Self::ToonCompact),
+            Some(s) => Self::parse_named(s),
+        }
+    }
+
+    /// The ONE vocabulary both surfaces share — exact, case-sensitive.
+    fn parse_named(s: &str) -> Result<Self, String> {
+        if s == FORMAT_JSON {
+            Ok(Self::Json)
+        } else if s == FORMAT_TOON {
+            Ok(Self::Toon)
+        } else if s == FORMAT_TOON_COMPACT {
+            Ok(Self::ToonCompact)
+        } else {
+            Err(invalid_format_msg(s))
         }
     }
 }
@@ -308,9 +340,42 @@ mod tests {
         let err = WireFormat::parse_http(Some("yaml")).unwrap_err();
         assert_eq!(err, invalid_format_msg("yaml"));
         assert!(err.contains("json") && err.contains("toon") && err.contains("toon_compact"));
-        // Case-sensitive on purpose: the MCP dispatch matches the
-        // exact literals too, so the two surfaces agree.
+        // Case-sensitive on purpose, on BOTH surfaces: since #3803 the
+        // MCP dispatch parses through `parse_mcp`, which shares this
+        // vocabulary and this sentence, so the two surfaces agree by
+        // construction (before #3803 that agreement was asserted here
+        // but the dispatch silently fell through to JSON).
         assert!(WireFormat::parse_http(Some("TOON")).is_err());
+        assert_eq!(
+            WireFormat::parse_mcp(Some("TOON_COMPACT")).unwrap_err(),
+            invalid_format_msg("TOON_COMPACT")
+        );
+        assert_eq!(
+            WireFormat::parse_mcp(Some("yaml")),
+            WireFormat::parse_http(Some("yaml"))
+        );
+    }
+
+    // #3803 — the MCP half of the vocabulary: omitted defaults to the
+    // compact TOON the stdio surface has always shipped, the three named
+    // formats parse, nothing else does.
+    #[test]
+    fn issue_3803_wire_format_parse_mcp() {
+        assert_eq!(WireFormat::parse_mcp(None), Ok(WireFormat::ToonCompact));
+        assert_eq!(
+            WireFormat::parse_mcp(Some(FORMAT_JSON)),
+            Ok(WireFormat::Json)
+        );
+        assert_eq!(
+            WireFormat::parse_mcp(Some(FORMAT_TOON)),
+            Ok(WireFormat::Toon)
+        );
+        assert_eq!(
+            WireFormat::parse_mcp(Some(FORMAT_TOON_COMPACT)),
+            Ok(WireFormat::ToonCompact)
+        );
+        assert!(WireFormat::parse_mcp(Some("")).is_err());
+        assert!(WireFormat::parse_mcp(Some("Toon")).is_err());
     }
 
     #[test]

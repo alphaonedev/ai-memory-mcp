@@ -26,6 +26,7 @@ use crate::embeddings::{Embed, Embedder};
 use crate::hnsw::VectorSearchIndex;
 use crate::llm::OllamaClient;
 use crate::reranker::{BatchedReranker, CrossEncoder};
+use crate::toon::WireFormat;
 
 /// Effective-tier banner label for the fully-provisioned tier — the
 /// `config.rs` `FeatureTier` spellings are vendor-carve-out-frozen, so the
@@ -179,6 +180,30 @@ fn err_response(id: Value, code: i64, message: String) -> RpcResponse {
             message,
             data: None,
         }),
+    }
+}
+
+/// #3803 — resolve the rendering format for a `tools/call`.
+///
+/// `Ok(Some(_))` for the four TOON-rendering tools (`format` omitted
+/// resolves to the compact TOON default the stdio surface has always
+/// shipped); `Ok(None)` for every other tool, whose `format` argument —
+/// if it has one, e.g. `memory_export_reflection`'s `md|json|yaml` —
+/// belongs to that handler and is never read here. `Err` carries the
+/// SSOT [`crate::toon::invalid_format_msg`] sentence for an unrecognised
+/// or non-string value.
+fn mcp_wire_format(tool_name: &str, arguments: &Value) -> Result<Option<WireFormat>, String> {
+    use crate::mcp::registry::tool_names as tn;
+    if !matches!(
+        tool_name,
+        tn::MEMORY_RECALL | tn::MEMORY_LIST | tn::MEMORY_SEARCH | tn::MEMORY_SESSION_START
+    ) {
+        return Ok(None);
+    }
+    match arguments.get(param_names::FORMAT) {
+        None | Some(Value::Null) => WireFormat::parse_mcp(None).map(Some),
+        Some(Value::String(raw)) => WireFormat::parse_mcp(Some(raw)).map(Some),
+        Some(other) => Err(crate::toon::invalid_format_msg(&other.to_string())),
     }
 }
 
@@ -3710,6 +3735,25 @@ fn handle_request(
                     format!("unknown tool: {tool_name}"),
                 );
             };
+            // #3803 — the rendering `format` of the four TOON tools is an
+            // enum, parsed at the boundary BEFORE the handler runs (a
+            // recall writes the observation ledger; refusing after it ran
+            // would charge the caller for a call it did not get). An
+            // unrecognised value is a typed refusal carrying the SAME
+            // sentence the HTTP surface returns as 400 — never a silent
+            // fall-through to pretty JSON.
+            let wire_format = match mcp_wire_format(tool_name, arguments) {
+                Ok(format) => format,
+                Err(message) => {
+                    return ok_response(
+                        id,
+                        json!({
+                            "content": [{"type": "text", "text": message}],
+                            "isError": true
+                        }),
+                    );
+                }
+            };
             // #3384 — a panic in one synchronous handler must not unwind the
             // task that owns the shared stdio session. Transactions and locks
             // still unwind normally inside this boundary; the caller receives
@@ -3734,36 +3778,21 @@ fn handle_request(
 
             match result {
                 Ok(val) => {
-                    // Check if TOON format requested for recall/search/list
-                    let format_str = arguments
-                        .get("format")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or(crate::toon::FORMAT_TOON_COMPACT);
+                    // Render in the format parsed at the boundary above;
+                    // tools outside the rendering set always ship JSON.
                     use crate::mcp::registry::tool_names as tn;
-                    let text = match format_str {
-                        "toon"
-                            if matches!(
-                                tool_name,
-                                tn::MEMORY_RECALL | tn::MEMORY_LIST | tn::MEMORY_SESSION_START
-                            ) =>
-                        {
-                            crate::toon::memories_to_toon(&val, false)
-                        }
-                        crate::toon::FORMAT_TOON_COMPACT
-                            if matches!(
-                                tool_name,
-                                tn::MEMORY_RECALL | tn::MEMORY_LIST | tn::MEMORY_SESSION_START
-                            ) =>
-                        {
-                            crate::toon::memories_to_toon(&val, true)
-                        }
-                        "toon" if tool_name == tn::MEMORY_SEARCH => {
+                    let text = match wire_format {
+                        Some(WireFormat::Toon) if tool_name == tn::MEMORY_SEARCH => {
                             crate::toon::search_to_toon(&val, false)
                         }
-                        crate::toon::FORMAT_TOON_COMPACT if tool_name == tn::MEMORY_SEARCH => {
+                        Some(WireFormat::ToonCompact) if tool_name == tn::MEMORY_SEARCH => {
                             crate::toon::search_to_toon(&val, true)
                         }
-                        _ => serde_json::to_string_pretty(&val).unwrap_or_default(),
+                        Some(WireFormat::Toon) => crate::toon::memories_to_toon(&val, false),
+                        Some(WireFormat::ToonCompact) => crate::toon::memories_to_toon(&val, true),
+                        Some(WireFormat::Json) | None => {
+                            serde_json::to_string_pretty(&val).unwrap_or_default()
+                        }
                     };
                     ok_response(
                         id,
