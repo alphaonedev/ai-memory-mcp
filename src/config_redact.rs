@@ -530,8 +530,8 @@ peers = ["https://u:PEER_CANARY@peer.internal:8443/m"]
         // The rest are real config fields whose names merely contain a
         // secret word; over-redacting them would make the output useless.
         for key in [
-            "api_key_env",
-            "api_key_file",
+            crate::config::config_keys::API_KEY_ENV,
+            crate::config::config_keys::API_KEY_FILE,
             "api_key_source",
             "key_source",
             "keyword_search",

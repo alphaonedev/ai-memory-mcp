@@ -170,6 +170,30 @@ pub mod config_keys {
     pub const OLLAMA_URL: &str = "ollama_url";
     /// `[embeddings]` config-section name (#1146 sectioned schema).
     pub const SECTION_EMBEDDINGS: &str = "embeddings";
+    /// The `api_key_env` field name, shared by `[llm]` / `[embeddings]`
+    /// / `[decision]` (#3806; pm-v3.1 hardcoded-literal gate).
+    pub const API_KEY_ENV: &str = "api_key_env";
+    /// The `api_key_file` field name, shared by the same three sections.
+    pub const API_KEY_FILE: &str = "api_key_file";
+    /// The inline `api_key` trap field name, shared by the same three.
+    pub const API_KEY: &str = "api_key";
+    /// The `base_url` field name, shared by the same three sections.
+    pub const BASE_URL: &str = "base_url";
+}
+
+/// v0.7.x #1146 / #1598 / #3806 — the ONE inline-`api_key` refusal text.
+/// `[llm]`, `[embeddings]` and `[decision]` share it so the wording and
+/// the repair instructions cannot drift per section, and so the string
+/// lives in exactly one place (pm-v3.1 hardcoded-literal gate).
+#[must_use]
+pub(crate) fn inline_api_key_refusal(section: &str) -> String {
+    format!(
+        "inline `api_key = \"<literal>\"` in [{section}] is forbidden — \
+         use `api_key_env = \"<ENV_VAR_NAME>\"` to reference a process \
+         env var, or `api_key_file = \"/path/to/key\"` to reference a \
+         file (mode 0400 enforced). Inline secrets in config.toml \
+         (typically world-readable) are a credential leak."
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -3583,6 +3607,13 @@ pub struct AppConfig {
     /// `singleton`; an upgrade never promotes a node to a stricter shape.
     #[serde(default)]
     pub deployment: Option<DeploymentSection>,
+
+    /// #3806 — `[decision]` block: the structured-decision provider that
+    /// sits beside the generative `[llm]` backend. Absent = NO decision
+    /// provider and byte-identical v1.0.0 behaviour; see
+    /// [`crate::decision_config::resolve_decision`].
+    #[serde(default)]
+    pub decision: Option<crate::decision_config::DecisionSection>,
 }
 
 // #1454 (SEC, LOW) — manual `Debug` so the `api_key` secret renders as
@@ -3660,6 +3691,7 @@ impl std::fmt::Debug for AppConfig {
             .field("limits", &self.limits)
             .field("encryption", &self.encryption)
             .field("deployment", &self.deployment)
+            .field("decision", &self.decision)
             .finish()
     }
 }
@@ -3909,8 +3941,8 @@ impl std::fmt::Debug for LlmSection {
             .field("backend", &self.backend)
             .field("model", &self.model)
             .field("base_url", &self.base_url)
-            .field("api_key_env", &self.api_key_env)
-            .field("api_key_file", &self.api_key_file)
+            .field(config_keys::API_KEY_ENV, &self.api_key_env)
+            .field(config_keys::API_KEY_FILE, &self.api_key_file)
             .field(
                 "api_key",
                 &self.api_key.as_ref().map(|_| crate::REDACTED_PLACEHOLDER),
@@ -7769,7 +7801,7 @@ fn backend_default_model(backend: &str) -> &'static str {
 /// precedence layer. `openai-compatible` returns the empty string (the
 /// resolver does not validate this — surface plumbing surfaces the
 /// misconfiguration via the reachability probe in `ai-memory doctor`).
-fn backend_default_base_url(backend: &str) -> &'static str {
+pub(crate) fn backend_default_base_url(backend: &str) -> &'static str {
     match backend {
         "openai" => "https://api.openai.com/v1",
         "xai" => "https://api.x.ai/v1",
@@ -7933,7 +7965,7 @@ pub fn canonical_embedding_dim(model: &str) -> Option<u32> {
 /// [`resolve_embed_api_key`]).
 fn resolve_api_key(backend: &str, llm: Option<&LlmSection>) -> (Option<String>, KeySource) {
     resolve_api_key_ladder(
-        ENV_LLM_API_KEY,
+        Some(ENV_LLM_API_KEY),
         backend,
         llm.and_then(|l| l.api_key_env.as_deref()),
         llm.and_then(|l| l.api_key_file.as_deref()),
@@ -7959,7 +7991,7 @@ fn resolve_embed_api_key(
     embeddings: Option<&EmbeddingsSection>,
 ) -> (Option<String>, KeySource) {
     resolve_api_key_ladder(
-        ENV_EMBED_API_KEY,
+        Some(ENV_EMBED_API_KEY),
         backend,
         embeddings.and_then(|e| e.api_key_env.as_deref()),
         embeddings.and_then(|e| e.api_key_file.as_deref()),
@@ -7990,16 +8022,20 @@ pub fn is_api_embed_backend(backend: &str) -> bool {
 /// and surface failures as `KeySource::Error(reason)` so the daemon
 /// can boot and report the problem through `ai-memory doctor` rather
 /// than failing at config load.
-fn resolve_api_key_ladder(
-    primary_env: &str,
+pub(crate) fn resolve_api_key_ladder(
+    primary_env: Option<&str>,
     backend: &str,
     api_key_env: Option<&str>,
     api_key_file: Option<&str>,
     section: &str,
 ) -> (Option<String>, KeySource) {
-    // 1. Process env (highest).
-    if let Some(k) = std::env::var(primary_env)
-        .ok()
+    // 1. Process env (highest). `None` means the section has NO
+    // dedicated `AI_MEMORY_*_API_KEY` catch-all: `[decision]` (#3806)
+    // deliberately has none, so a chat credential in the process
+    // environment can never be shipped to a different vendor's decision
+    // endpoint.
+    if let Some(k) = primary_env
+        .and_then(|name| std::env::var(name).ok())
         .filter(|s| !s.trim().is_empty())
     {
         return (Some(k), KeySource::ProcessEnv);
@@ -8632,8 +8668,13 @@ impl AppConfig {
     /// 2. Both `api_key_env` and `api_key_file` set on `[llm]`.
     ///    Mutually exclusive — operator must pick one.
     ///
-    /// 3. Both `api_key_env` and `api_key_file` set on
-    ///    `[llm.auto_tag]`. Same mutex.
+    /// 3. (#3808) Any `[llm.auto_tag]` key that names a SECOND
+    ///    inference endpoint (`backend` / `base_url` / `api_key_env` /
+    ///    `api_key_file`). Those were documented but never read, and a
+    ///    second endpoint configured there would bypass the boot egress
+    ///    gate. Delegated to [`crate::decision_config::validate`], which
+    ///    also owns the `[decision]` selector + secret discipline
+    ///    (#3806); `[llm.auto_tag].model` is unaffected.
     ///
     /// 4. (#1598) Inline `api_key = "<literal>"` in `[embeddings]` —
     ///    same posture as rejection 1.
@@ -8649,13 +8690,7 @@ impl AppConfig {
         if let Some(llm) = &self.llm {
             // Rejection 1 — inline api_key literal.
             if llm.api_key.is_some() {
-                return Err("inline `api_key = \"<literal>\"` in [llm] is forbidden — \
-                     use `api_key_env = \"<ENV_VAR_NAME>\"` to reference a \
-                     process env var, or `api_key_file = \"/path/to/key\"` to \
-                     reference a file (mode 0400 enforced). Inline secrets in \
-                     config.toml (typically world-readable) are a credential \
-                     leak."
-                    .to_string());
+                return Err(inline_api_key_refusal("llm"));
             }
             // Rejection 2 — env vs file mutex.
             if llm.api_key_env.is_some() && llm.api_key_file.is_some() {
@@ -8664,28 +8699,12 @@ impl AppConfig {
                      to the per-vendor env-var chain)."
                     .to_string());
             }
-            // Rejection 3 — auto_tag env vs file mutex.
-            if let Some(auto_tag) = &llm.auto_tag {
-                if auto_tag.api_key_env.is_some() && auto_tag.api_key_file.is_some() {
-                    return Err("[llm.auto_tag].api_key_env and \
-                         [llm.auto_tag].api_key_file are mutually exclusive."
-                        .to_string());
-                }
-            }
         }
         if let Some(embeddings) = &self.embeddings {
             // #1598 Rejection 4 — inline [embeddings].api_key literal
             // (mirrors the [llm] rejection above).
             if embeddings.api_key.is_some() {
-                return Err(
-                    "inline `api_key = \"<literal>\"` in [embeddings] is forbidden — \
-                     use `api_key_env = \"<ENV_VAR_NAME>\"` to reference a \
-                     process env var, or `api_key_file = \"/path/to/key\"` to \
-                     reference a file (mode 0400 enforced). Inline secrets in \
-                     config.toml (typically world-readable) are a credential \
-                     leak."
-                        .to_string(),
-                );
+                return Err(inline_api_key_refusal(config_keys::SECTION_EMBEDDINGS));
             }
             // #1598 Rejection 5 — [embeddings] env vs file mutex.
             if embeddings.api_key_env.is_some() && embeddings.api_key_file.is_some() {
@@ -8697,6 +8716,12 @@ impl AppConfig {
                 );
             }
         }
+        // #3806 / #3808 — `[decision]` selector + secret discipline, and
+        // the retired `[llm.auto_tag]` endpoint keys. The predicate lives
+        // in `crate::decision_config` because this file is at its QUAL-10
+        // ceiling; this is the wiring line. It is a no-op for a config
+        // that carries neither section.
+        crate::decision_config::validate(self).map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -9459,77 +9484,24 @@ impl AppConfig {
         }
     }
 
-    /// v0.7.x (#1146) — resolve the `[llm.auto_tag]` fast-structured-
-    /// output sibling. Fields fall back to [`Self::resolve_llm`] field-
-    /// by-field; commonly only `model` is overridden (defaults to
-    /// `gemma3:4b` per the L15 fast-structured-output policy).
+    /// #3806 — resolve the `[decision]` structured-decision provider.
     ///
-    /// DOC-6: reads the legacy `auto_tag_model` field as the
-    /// lowest-precedence fallback layer (`#[allow(deprecated)]`).
+    /// Thin delegate to [`crate::decision_config::resolve_decision`],
+    /// which owns the ladder, the refusals and the key discipline (this
+    /// file is at its QUAL-10 ceiling). `None` means NO decision
+    /// provider: the section is absent, or it is present but could not
+    /// be honoured exactly as written — in which case the loader has
+    /// already refused it by name.
+    ///
+    /// Replaces `resolve_llm_auto_tag`, retired here (#3808): it did
+    /// full parent-fallback resolution of a second `[llm.auto_tag]`
+    /// endpoint that NOTHING ever called, so those keys were documented
+    /// and silently ignored. They are now refused at parse time, and a
+    /// genuine second endpoint belongs under `[decision]`, which is
+    /// resolved and gated.
     #[must_use]
-    #[allow(deprecated)]
-    pub fn resolve_llm_auto_tag(&self) -> ResolvedLlm {
-        let parent = self.resolve_llm(None, None, None);
-        let sub = self.llm.as_ref().and_then(|l| l.auto_tag.as_ref());
-
-        let backend = sub
-            .and_then(|s| s.backend.clone())
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| parent.backend.clone());
-
-        let model = sub
-            .and_then(|s| s.model.clone())
-            .filter(|s| !s.trim().is_empty())
-            .or_else(|| self.auto_tag_model.clone().filter(|s| !s.trim().is_empty()))
-            .unwrap_or_else(|| {
-                // L15 default: gemma3:4b for fast structured output,
-                // regardless of parent backend.
-                if backend == "ollama" {
-                    "gemma3:4b".to_string()
-                } else {
-                    // For non-Ollama backends, use the parent model
-                    // (no sane way to pick a "fast" model across vendors).
-                    parent.model.clone()
-                }
-            });
-
-        let base_url = sub
-            .and_then(|s| s.base_url.clone())
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| {
-                if backend == parent.backend {
-                    parent.base_url.clone()
-                } else {
-                    backend_default_base_url(&backend).to_string()
-                }
-            });
-
-        // api_key: inherit from parent if backend matches, else fresh resolve.
-        let (api_key, api_key_source) = if backend == parent.backend {
-            (parent.api_key.clone(), parent.api_key_source.clone())
-        } else {
-            // Synthesise a transient LlmSection-like view from the sub-table
-            // for fresh API-key resolution.
-            let synthetic = sub.map(|s| LlmSection {
-                backend: Some(backend.clone()),
-                model: None,
-                base_url: None,
-                api_key_env: s.api_key_env.clone(),
-                api_key_file: s.api_key_file.clone(),
-                api_key: None,
-                auto_tag: None,
-            });
-            resolve_api_key(&backend, synthetic.as_ref())
-        };
-
-        ResolvedLlm {
-            backend,
-            model,
-            base_url,
-            api_key,
-            api_key_source,
-            source: parent.source,
-        }
+    pub fn resolve_decision(&self) -> Option<crate::decision_config::ResolvedDecision> {
+        crate::decision_config::resolve_decision(self)
     }
 
     /// v0.7.x (#1146) — resolve the canonical embedder configuration.
@@ -12608,6 +12580,7 @@ legacy_scoring = false
             limits: Some(LimitsSection::default()),
             encryption: Some(EncryptionSection::default()),
             deployment: Some(DeploymentSection::default()),
+            decision: Some(crate::decision_config::DecisionSection::default()),
         };
 
         let serialised = toml::to_string(&cfg).expect("serialise AppConfig to TOML");

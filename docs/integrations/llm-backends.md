@@ -25,9 +25,10 @@ base_url    = "https://api.x.ai/v1"   # optional; vendor-default if unset
 api_key_env = "XAI_API_KEY"            # process-env-var name (NOT the literal key)
 # api_key_file = "/etc/ai-memory/keys/xai.key"   # alt — mode 0400 enforced
 
-[llm.auto_tag]                         # fast structured-output sibling; falls back to [llm]
-backend = "ollama"
-model   = "gemma3:4b"
+[llm.auto_tag]                         # ONLY `model` is accepted here
+model   = "gemma3:4b"                  # (`backend` / `base_url` / `api_key_*`
+                                       #  are refused at parse time, #3808 —
+                                       #  a second endpoint goes in [decision])
 ```
 
 Export `XAI_API_KEY` (or the relevant per-vendor key) in your shell rc (`.zshrc` / `.bashrc` / `.profile`) so every process — interactive shell, AI client, and the MCP-spawned subprocess it descends from — inherits it. **Inline keys in `config.toml` are rejected at parse time** (it's typically world-readable in `$HOME`). Use `api_key_env` (process-env reference) or `api_key_file` (file path; mode 0400 enforced).

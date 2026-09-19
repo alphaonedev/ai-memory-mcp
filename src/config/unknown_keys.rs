@@ -427,6 +427,9 @@ mod tests {
         assert!(leaves.contains(&"curator.confidence_decay_half_life_days.<key>".to_string()));
         assert!(leaves.contains(&"permissions.rules[].decision".to_string()));
         assert!(leaves.contains(&"api_key".to_string()));
+        // #3806 — the `[decision]` section must be in the accepted set,
+        // or #3715 would refuse a legitimate key as unknown.
+        assert!(leaves.contains(&"decision.provider".to_string()));
         // The two `deny_unknown_fields` sub-structs are structs here too
         // (their refusal already happens in serde; the schema agrees).
         assert!(leaves.iter().any(|l| l.starts_with("wake_hub.")));
@@ -440,8 +443,11 @@ mod tests {
         // change someone reviewed. Corpus census at 8b4f65a22 measured 173
         // leaves; #3714 added `deployment.shape` (174); #3705 added
         // `subscriptions.ca_cert` — the operator-installed root the webhook
-        // dispatcher trusts under the encrypted-transit floor (175).
-        assert_eq!(accepted_leaf_count(), 175, "{:#?}", accepted_leaf_keys());
+        // dispatcher trusts under the encrypted-transit floor (175);
+        // 2026-09-19 #3806 added the eight `[decision]` keys (`provider`,
+        // `model`, `base_url`, `api_key_env`, `api_key_file`, the
+        // write-only `api_key` trap, `timeout_secs`, `fallback`) — 183.
+        assert_eq!(accepted_leaf_count(), 183, "{:#?}", accepted_leaf_keys());
     }
 
     #[test]
