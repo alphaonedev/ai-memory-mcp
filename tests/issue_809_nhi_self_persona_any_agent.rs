@@ -323,6 +323,8 @@ fn nhi_self_persona_any_agent_substrate_resident() {
     // catch the regression where a refactor accidentally couples the
     // recipe to one model. The test agent_id is "fictional-test-bot" so
     // none of these substrings should appear.
+    // #3627: the retired provider left this family list in lockstep with
+    // the `src/identity/model_family.rs` stem it mirrored.
     for forbidden in [
         "claude", "gpt", "gemini", "llama", "grok", "qwen", "mistral", "phi",
     ] {

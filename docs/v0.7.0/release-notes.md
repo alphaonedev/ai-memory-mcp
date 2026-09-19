@@ -372,8 +372,8 @@ pre-configured vendor aliases.
   Treated as **secret** (never echoed in capabilities / banners / audit
   rows).
 - `AI_MEMORY_LLM_MODEL` — model identifier passed through verbatim.
-  Vendor-specific (e.g. `grok-4` for xAI,
-  `qwen-max` for Qwen, `gemma3:4b` for Ollama).
+  Vendor-specific (e.g. `grok-4` for xAI, `qwen-max` for Qwen,
+  `gemma3:4b` for Ollama).
 
 **Tier independence.** The substrate's tier no longer dictates which
 vendor speaks. Pre-#1067 the autonomous tier required local Ollama,

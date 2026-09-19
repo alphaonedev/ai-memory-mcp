@@ -289,7 +289,7 @@ sudo mv ai-memory /usr/local/bin/
 ## Network Requirements
 
 - **First run with `semantic` tier (or above)**: Downloads a ~100MB embedding model from HuggingFace. No account or API key is required. The model is cached in `~/.cache/huggingface/` for subsequent runs. After the initial download, no network access is needed for keyword or semantic tiers.
-- **Smart/autonomous tiers**: Require an LLM backend. Post-#1067 (v0.7.0) any of 15 OpenAI-compatible vendors (xAI, OpenAI, Anthropic, Gemini, Kimi/Moonshot, Qwen/DashScope, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks, LMStudio) or local Ollama works — selected via `AI_MEMORY_LLM_BACKEND`. Local Ollama is the default for zero-network installs; cloud backends require their respective API key.
+- **Smart/autonomous tiers**: Require an LLM backend. Post-#1067 (v0.7.0) any of 14 OpenAI-compatible vendors (xAI, OpenAI, Anthropic, Gemini, Kimi/Moonshot, Qwen/DashScope, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks, LMStudio) or local Ollama works — selected via `AI_MEMORY_LLM_BACKEND`. Local Ollama is the default for zero-network installs; cloud backends require their respective API key.
 
 ## Disk Space
 

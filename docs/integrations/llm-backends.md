@@ -19,7 +19,7 @@ tier = "autonomous"
 db   = "~/.claude/ai-memory.db"
 
 [llm]
-backend     = "xai"                    # any of the 16 selector values listed above
+backend     = "xai"                    # any of the 17 selector values listed above
 model       = "grok-4.3"               # vendor-specific identifier
 base_url    = "https://api.x.ai/v1"   # optional; vendor-default if unset
 api_key_env = "XAI_API_KEY"            # process-env-var name (NOT the literal key)
@@ -296,7 +296,6 @@ Gemini exposes an OpenAI-compatible endpoint at `https://generativelanguage.goog
 ```
 
 Fallback env vars: `GEMINI_API_KEY`, `GOOGLE_API_KEY`. Common tags: `gemini-2.5-pro`, `gemini-2.5-flash`.
-
 
 ## Kimi (Moonshot)
 

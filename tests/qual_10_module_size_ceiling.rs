@@ -1668,6 +1668,17 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
      * types and deletes `read_capped_text`, measuring 6_874. Raised to the
      * EXACT actual. The standing refactor-split into `src/llm/{…}.rs` is
      * now overdue and is tracked separately. */
+    //
+    // 2026-09-19 (#3627 re-cut on the rehearsal tip e179825c8) — re-MEASURED
+    // 6_917 (`wc -l`); ceiling 7_050 UNCHANGED (rule f: ceilings are not
+    // bumped). The rehearsal tip already carried the retired-alias removal
+    // with the refusal gate living HERE (325ab154f, 6_971); the re-cut moves
+    // that gate to `src/config.rs` beside the resolver mirror tables it
+    // guards (`RECOGNIZED_LLM_BACKENDS` / `is_recognized_llm_backend` /
+    // `unrecognized_llm_backend_error`), so this file goes DOWN by 54 and only
+    // the per-funnel wrapping that cannot live elsewhere stays. Submodule-
+    // over-bump, the `src/store/postgres.rs` shape, applied to a file whose
+    // refactor-split is still the tracked post-ship ARCH cleanup.
     ("src/llm.rs", 7_050),
 ];
 

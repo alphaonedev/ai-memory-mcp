@@ -96,6 +96,23 @@ ALLOWED_FILES=(
 # Vendor identifiers to gate. Keep this list narrow — over-broad gates
 # create reviewer friction. Add a new vendor only when an actual
 # alias-table entry lands in `src/llm.rs`.
+# #3627 (2026-09-18): the retired provider's token left this pattern in
+# lockstep with its alias-table arm leaving `src/llm.rs` (the documented
+# contract above: "Add a new vendor only when an actual alias-table entry
+# lands in src/llm.rs").
+#
+# The replacement is stricter OVER THIS GATE'S OWN SCOPE, which is what
+# GOVERNANCE §3.2 item 7 requires of a pattern removal. This gate walks
+# `src/` and `tools/` (the single `find` below), skipping comments,
+# `mod tests` regions and the 13 allowlisted files.
+# `tests/issue_3627_retired_llm_alias.rs::retired_alias_is_absent_from_
+# every_current_surface_3627` walks `src/` and `tools/` too — plus
+# `tests/`, `scripts/`, `docs/`, `changelog.d/` and four root docs — and
+# skips NONE of those exclusions, so every path this pattern covered for
+# the retired token is still covered, and more. It is NOT a full
+# mechanisation of the issue's repo-wide grep (`sdk/`, `clients/`,
+# `deploy/`, `migrations/` and most root files are outside both scopes);
+# that wider claim is not made and is not needed here.
 VENDOR_PATTERN='(claude|openai|xai|anthropic|gemini|groq|ollama|grok|mistral|cohere|huggingface)'
 
 # SECS_PER_* magic numbers. Catches the literal forms PR3 extracted

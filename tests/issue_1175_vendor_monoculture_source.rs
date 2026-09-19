@@ -98,6 +98,10 @@ const FORBIDDEN_VENDOR_DEFAULTS: &[&str] = &[
     "xai",
     "anthropic",
     "gemini",
+    // #3627: the retired provider left this list in lockstep with
+    // `scripts/check-vendor-literals.sh::VENDOR_PATTERN` and its
+    // `src/llm.rs` alias arm; `tests/issue_3627_retired_llm_alias.rs`
+    // carries the stricter repo-wide absence pin for that token.
     "groq",
     "mistral",
     "ollama",

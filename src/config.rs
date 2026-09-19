@@ -7791,8 +7791,67 @@ fn backend_default_base_url(backend: &str) -> &'static str {
         "fireworks" => "https://api.fireworks.ai/inference/v1",
         "lmstudio" => "http://localhost:1234/v1",
         // ollama / openai-compatible / unknown → localhost ollama.
+        //
+        // #3627 — what this arm does and does NOT guarantee. An
+        // UNRECOGNISED selector never reaches a client: every
+        // construction funnel refuses it first via
+        // [`is_recognized_llm_backend`], so for those this value is not
+        // dialled. A RECOGNISED selector with no arm in THIS mirror
+        // table does still land here, and that is a live mis-route, not
+        // a hypothetical: `vllm` is an arm of the SSOT
+        // `crate::llm::default_base_url_for_alias` (and is documented at
+        // `http://localhost:8000/v1`) but has no arm above, so
+        // `[llm].backend = "vllm"` resolves the loopback Ollama URL and
+        // builds an OpenAI-compatible client with a Bearer token against
+        // it. Pre-existing and tracked in #3811 — deliberately NOT fixed
+        // by #3627, which only closes the unrecognised-selector hole.
         _ => "http://localhost:11434",
     }
+}
+
+/// #3627 (2026-09-18) — the CLOSED set of accepted
+/// `AI_MEMORY_LLM_BACKEND` / `[llm].backend` / `[embeddings].backend`
+/// selectors, rendered for the refusal message. ONE source for the
+/// list, so the env funnel (`crate::llm::OllamaClient::from_env`), the
+/// two resolver funnels (`build_from_resolved` / `_async`) and the
+/// embed funnel (`crate::embeddings::Embedder::from_resolved`) cannot
+/// advertise different vocabularies. Retiring an alias means deleting
+/// its arm in `crate::llm::default_base_url_for_alias` — which stays
+/// the alias SSOT — AND its name here.
+pub(crate) const RECOGNIZED_LLM_BACKENDS: &str = "ollama, openai-compatible, openai, xai, \
+     anthropic, gemini, kimi, moonshot, qwen, dashscope, mistral, groq, together, cerebras, \
+     openrouter, fireworks, lmstudio, vllm";
+
+/// #3627 — true when `backend` names a selector the substrate can
+/// actually build a wire shape for.
+///
+/// Lives here, beside the resolver's mirror tables
+/// ([`backend_default_model`] / [`backend_default_base_url`] /
+/// [`alias_api_key_env_vars_for_resolver`]), because those are what it
+/// guards: their catch-all arms hand an UNRECOGNISED selector a
+/// plausible-looking default instead of refusing. The alias SSOT it
+/// consults remains `crate::llm::default_base_url_for_alias`, so a
+/// retired alias drops out of this predicate the moment its arm is
+/// deleted there.
+#[must_use]
+pub(crate) fn is_recognized_llm_backend(backend: &str) -> bool {
+    backend == crate::llm::BACKEND_OLLAMA
+        // The generic escape hatch has no alias-table row (the operator
+        // supplies the base URL), so it is admitted explicitly.
+        || backend == crate::llm::BACKEND_OPENAI_COMPATIBLE
+        || crate::llm::default_base_url_for_alias(backend).is_some()
+}
+
+/// #3627 — the ONE refusal for a selector no alias table recognises.
+/// Fail closed (ERRORS-01 / ERRORS-08): an unknown or RETIRED selector
+/// is an operator misconfiguration, never a licence to fall through to
+/// some other endpoint. The message names the accepted values and
+/// deliberately does NOT echo a retired token back as advice.
+pub(crate) fn unrecognized_llm_backend_error(backend: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "LLM backend `{backend}` is not a recognized backend alias. \
+         Valid values: {RECOGNIZED_LLM_BACKENDS}"
+    )
 }
 
 /// Per-alias environment variable fallback chain for the API key.
@@ -13879,6 +13938,82 @@ max_page_size = 1000000
         );
     }
 
+    /// #3627 — parity between the PREDICATE and the RENDERED vocabulary.
+    ///
+    /// `is_recognized_llm_backend` is derived from the alias SSOT
+    /// (`crate::llm::default_base_url_for_alias`), but
+    /// [`RECOGNIZED_LLM_BACKENDS`] — the list the refusal prints — is a
+    /// hand-maintained fourth copy of that vocabulary, and it had already
+    /// drifted: it omitted the documented synonyms `moonshot` and
+    /// `dashscope`, which the predicate accepts. A refusal that
+    /// under-advertises the accepted set sends an operator to the wrong
+    /// remedy, so the two are pinned to agree.
+    ///
+    /// PRESENCE half: every documented selector is accepted AND advertised.
+    /// ABSENCE half: the retired token and a typo are neither accepted nor
+    /// advertised — so this cannot pass by the string listing everything.
+    #[test]
+    fn every_recognized_selector_is_advertised_in_the_refusal_3627() {
+        // The documented vocabulary: docs/integrations/llm-backends.md
+        // (per-vendor sections + the fallback-key table) and CLAUDE.md env
+        // row 31.
+        const DOCUMENTED_SELECTORS: &[&str] = &[
+            "ollama",
+            "openai-compatible",
+            "openai",
+            "xai",
+            "anthropic",
+            "gemini",
+            "kimi",
+            "moonshot",
+            "qwen",
+            "dashscope",
+            "mistral",
+            "groq",
+            "together",
+            "cerebras",
+            "openrouter",
+            "fireworks",
+            "lmstudio",
+            "vllm",
+        ];
+        let advertised: Vec<&str> = RECOGNIZED_LLM_BACKENDS.split(", ").collect();
+        for selector in DOCUMENTED_SELECTORS {
+            assert!(
+                is_recognized_llm_backend(selector),
+                "#3627: documented selector `{selector}` must pass the gate"
+            );
+            assert!(
+                advertised.contains(selector),
+                "#3627: the gate accepts `{selector}` but the refusal does not \
+                 advertise it; RECOGNIZED_LLM_BACKENDS has drifted from the \
+                 alias SSOT"
+            );
+        }
+        assert_eq!(
+            advertised.len(),
+            DOCUMENTED_SELECTORS.len(),
+            "#3627: the refusal advertises a selector the documented set does \
+             not contain (or vice versa): {advertised:?}"
+        );
+
+        // ----- absence control, same two sinks -----------------------
+        // Assembled at runtime so the repo-wide acceptance grep stays clean.
+        let retired = ["dee", "pseek"].concat();
+        assert!(
+            !is_recognized_llm_backend(&retired),
+            "#3627: the retired selector must not pass the gate"
+        );
+        assert!(
+            !RECOGNIZED_LLM_BACKENDS.contains(&retired),
+            "#3627: the retired selector must not be advertised as valid"
+        );
+        assert!(
+            !is_recognized_llm_backend("opena1"),
+            "#3627 absence control: a typo'd selector must not pass the gate"
+        );
+    }
+
     #[test]
     fn resolve_llm_1146_compiled_default_when_nothing_configured() {
         let _g = env_var_lock();
@@ -13952,48 +14087,6 @@ max_page_size = 1000000
             "vendor-default base_url applied"
         );
         assert_eq!(resolved.source, ConfigSource::Config);
-    }
-
-    #[test]
-    fn resolve_llm_config_path_refuses_retired_alias_at_construct_3627() {
-        let _g = env_var_lock();
-        scrub_llm_env();
-        let alias = crate::llm::retired_llm_alias_3627();
-        let mut cfg = empty_app_config();
-        cfg.llm = Some(LlmSection {
-            backend: Some(alias.clone()),
-            ..LlmSection::default()
-        });
-        let resolved = cfg.resolve_llm(None, None, None);
-        assert_eq!(
-            resolved.backend, alias,
-            "#3627: resolver must surface the configured selector, not rewrite it"
-        );
-        // Match, not expect_err: OllamaClient is not Debug (holds the API key).
-        let err = match crate::llm::OllamaClient::build_from_resolved(&resolved) {
-            Ok(_) => panic!("#3627: config path must refuse the retired alias at construct"),
-            Err(e) => e,
-        };
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("not a recognized"),
-            "#3627: config refusal must use the standard unknown-alias error; got {msg}"
-        );
-        assert!(
-            msg.contains("ollama") && msg.contains("openai-compatible"),
-            "#3627: config refusal must name accepted aliases; got {msg}"
-        );
-        // The unknown-alias error quotes the rejected selector; only
-        // the Valid-values suffix is the operator-facing accepted list.
-        let valid = msg
-            .split("Valid values:")
-            .nth(1)
-            .expect("#3627: unknown-alias error must list Valid values");
-        assert!(
-            !valid.contains(&alias),
-            "#3627: valid-values list must not re-advertise the retired alias; got {msg}"
-        );
-        scrub_llm_env();
     }
 
     #[test]
