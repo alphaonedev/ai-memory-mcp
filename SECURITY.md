@@ -241,6 +241,104 @@ key) is satisfiable **only over HTTP with per-agent api keys**
 child environments. stdio is certified as ONE trust domain; multi-principal
 deployments serve MCP clients through the HTTP daemon.
 
+## MCP transport is stdio-only (#3829)
+
+**The provable claim is a property of our code.** The `ai-memory mcp` server's
+code owns **stdin/stdout** and nothing else: a length-capped `read_until(b'\n')`
+loop on stdin, JSON-RPC frames out on stdout, diagnostics on stderr
+(`src/mcp/mod.rs::run_mcp_server`). It **binds no server socket** — no
+`TcpListener` / `UnixListener`, no `axum::serve` / `hyper::server` — and
+**constructs no network client for its own transport**. That, and only that, is
+what this section certifies, and it is proven STATICALLY by
+`scripts/check-mcp-transport-isolation.py` (with a planted-violation
+`--self-test`, rule m) over `src/mcp/**` production code. Because MCP's code
+serves nothing over a socket, MCP-stdio is **out of the TLS /
+encryption-in-transit standard** that governs the HTTP daemon (§"v1.0.0
+secure-default changes" above) as a matter of what the binary DOES — there is no
+socket in the code for a transport cipher to apply to. A postgres-backed MCP
+client is served **through the HTTP daemon** (`--store-url` is wired on
+`serve`/`curator`, not on `ai-memory mcp` — #1675), where the TLS posture lives.
+It composes with the F13 ruling above: stdio is one trust domain.
+
+**What this does NOT certify: the deployment.** "No network-served surface" is a
+claim about the CODE, not about the running deployment, and the two can differ.
+The stdio loop reads fd 0, which the process is GIVEN, not something it opens, so
+what fd 0 actually is depends on how the operator wired it and the code cannot
+certify that. Two distinct exposures follow, and only the first is in reach of
+any fd inspection:
+
+- **A socket handed DIRECTLY as fd 0** (systemd `StandardInput=socket` with a
+  real socket; `socat …-LISTEN,nofork,EXEC` dup'ing the raw TCP socket onto
+  fd 0). Here fd 0 IS the network socket and the stdio loop would serve JSON-RPC
+  over it. This is observable, and `run_mcp_server` refuses it at init (the
+  guard below).
+- **A RELAY fronting a genuine local stdio channel** (`ssh host ai-memory mcp`;
+  `socat TCP-LISTEN,fork,EXEC:"ai-memory mcp"`, which terminates the TCP itself
+  and bridges it to the child). Here the protocol bytes cross the network but
+  fd 0 is a real pipe, char device, or `AF_UNIX` socketpair. **No fd-0 check can
+  detect this, and it is not meant to** — ssh-relayed MCP is a legitimate,
+  intended deployment whose transport security is the relay's (ssh's TLS), not
+  MCP's. This is out of the guard's reach BY CONSTRUCTION, not by omission (see
+  "the relay limit" below).
+
+**The runtime guard (defence-in-depth against the direct case).**
+`run_mcp_server` inspects fd 0 at init
+(`src/mcp/stdio_guard.rs::enforce_stdin_is_inherited_channel`) and requires
+POSITIVE evidence of a safe inherited channel: it proceeds only when fd 0
+`fstat`s as a pipe, a character device (tty / `/dev/null`), or a regular file,
+and **refuses to start** on everything else — a listening socket (any family), a
+non-`AF_UNIX` socket (`AF_INET`/`AF_INET6`, `AF_VSOCK`, or any other family), a
+socket whose family OR listening state cannot be read (e.g. getsockopt
+SO_ACCEPTCONN denied by a seccomp filter), an **uninspectable fd** (fstat denied by a
+seccomp/LSM filter, distinct from a genuinely-closed EBADF), or an unexpected fd
+type. Fail-CLOSED is deliberate: a guard that refuses only on positive evidence
+of DANGER has a security property equal to the availability of its evidence
+channel, and suppressing that channel is cheaper than forging it, so the
+permitted set is only what the guard can positively reason about (#3829
+amendment 2). The one non-refusing socket case is a positively-`AF_UNIX`
+connected socket, which is **warned, not refused**: a `socketpair` stdio channel
+is one inherited peer, and an accepted UDS connection is the Unix-domain-socket
+case whose control is peer-cred + socket mode (the `wake_hub` model), decided by
+the encryption lane in #3827 — that boundary is left to the UDS ruling.
+
+**The relay limit, stated so it is not mistaken for an oversight.** Detecting
+that fd 0 is a socket is not detecting that the socket is a network relay, and
+the second is impossible AT THE FD LAYER. The default `socat …,fork,EXEC` child
+transport is an `AF_UNIX` socketpair (pipes/pty are opt-in), so the guard DOES
+see a socket there and warns — but it cannot distinguish that relay socketpair
+from a legitimate local socketpair-stdio: `getpeername` is unnamed/autobind on
+both, and `SO_PEERCRED` returns the parent's pid on both. A guard cannot refuse
+on a property it cannot observe, and refusing every `AF_UNIX` socket would break
+legitimate socketpair-stdio. For ssh and `socat …,pipes`/`,pty`, fd 0 is a
+genuine pipe or char device and the guard sees an ordinary inherited channel. So
+across every relay wiring the guard cannot establish "not network-served" as a
+deployment property — which is why this section scopes its claim to the code,
+and why a relay's transport is the relay's responsibility.
+
+**The one documented exception, and why it does not change the code claim.**
+`src/mcp/tools/store/transport.rs` (#881/#318) constructs an **outbound**
+`reqwest` client so an MCP-stdio `memory_store` can join the HTTP daemon's
+federation fanout. That is a **client to the HTTP daemon** (whose own TLS, mTLS
+and plaintext-peer refusals — #2448/#2477 — cover that hop), **not** MCP's
+serving transport. MCP's code still serves nothing over a socket; the static
+gate allowlists exactly this one file and no other.
+
+**Pinned so it cannot decay.** `scripts/check-mcp-transport-isolation.py` refuses
+any server-socket construction anywhere under `src/mcp/**` and any network-client
+construction outside the single allowlisted forward file above, over production
+code (test modules and wiremock test servers are out of scope), with a
+`--self-test` that plants a `TcpListener::bind` and an out-of-allowlist `reqwest`
+client and proves the gate reds on each — a gate that cannot fail would pin
+nothing. The runtime guard is pinned separately by
+`src/mcp/stdio_guard.rs::classify_fd`'s unit tests, which assert that a listening
+socket, an `AF_INET`/`AF_INET6` socket, a non-`AF_UNIX` family such as
+`AF_VSOCK`, a socket whose family cannot be read, a socket whose listening state
+cannot be read (getsockopt denied), and an uninspectable fd are ALL
+refused, while an `AF_UNIX` socketpair is warned. Together the static gate and
+the runtime guard cover the two ways a socket can reach MCP DIRECTLY —
+constructed in the tree, or handed in as fd 0 — and neither covers the relay,
+which is the limit stated above.
+
 ## Supply-chain SBOM (#1973, v1.0.0)
 
 Starting at v1.0.0, every release artifact set on the [GitHub Releases page](https://github.com/alphaonedev/ai-memory-mcp/releases) ships a CycloneDX JSON Software Bill of Materials (`ai-memory.cdx.json`, generated by `cargo-cyclonedx` from `Cargo.lock`), enumerating every resolved dependency with its name, version, and package URL (SHA-256 present only for crates.io registry dependencies, since `Cargo.lock` carries no hash for git/path dependencies). **This is a dependency inventory, not a security guarantee** — it lists what is in the dependency graph and vouches for none of it; `cargo audit` against the RustSec advisory database remains the substrate's actual vulnerability-scanning gate, and both run independently in CI on every release.

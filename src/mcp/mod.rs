@@ -96,6 +96,12 @@ mod read_only_tools;
 #[doc(hidden)]
 pub mod dispatch_test_hook;
 
+// #3829 addendum — the fstat precondition guard that makes the SECURITY.md
+// "MCP transport is stdio-only" claim true BY CONSTRUCTION: refuse a network
+// socket handed in as fd 0 by a supervisor (the no-construction gate cannot
+// see an inherited fd). Paired with scripts/check-mcp-transport-isolation.py.
+pub(crate) mod stdio_guard;
+
 // v0.7.0 #972 D1.5 (#986) — shared parity-test helpers for the
 // schemars-derived `McpTool` impls vs. the legacy hand-coded
 // `tool_definitions()` catalog. Each `d1_5_986_tests` mod under
@@ -4463,6 +4469,19 @@ pub fn run_mcp_server(
     // `sync-daemon` so the guarantee is owned in ONE place instead of
     // being rediscovered per verb.
     crate::logging::init_console_tracing(&[]);
+
+    // #3829 - DEFENCE-IN-DEPTH: require POSITIVE evidence that fd 0 is a proven
+    // inherited stdio channel (pipe / tty / regular file, or an AF_UNIX
+    // socketpair which warns) before the stdio loop opens, and REFUSE otherwise
+    // - a socket handed directly as fd 0 (systemd StandardInput=socket, socat
+    // ...-LISTEN,nofork), a non-AF_UNIX / unreadable-family socket, or an
+    // uninspectable fd (fstat seccomp/LSM-denied, distinct from a closed EBADF).
+    // The static check-mcp-transport-isolation.py gate proves src/mcp constructs
+    // no socket; this guard covers a socket handed in AS fd 0. A supervisor
+    // RELAY (ssh, socat fork/EXEC) leaves fd 0 a genuine pipe and is OUT OF
+    // REACH of any fd check - its transport is the relay's (see SECURITY.md
+    // #3829). WARN-only on AF_UNIX (the #3827 UDS lane).
+    crate::mcp::stdio_guard::enforce_stdin_is_inherited_channel()?;
 
     // #3356: configured-but-invalid identity aborts boot rather than becoming unresolved.
     let _ = crate::identity::resolve_mcp_read_visibility_caller()?;

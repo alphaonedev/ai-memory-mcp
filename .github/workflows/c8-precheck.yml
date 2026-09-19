@@ -347,6 +347,32 @@ jobs:
         # empty sdk scan set both fail CLOSED.
         run: bash scripts/check-sdk-tls-scheme.sh --self-test
 
+  mcp-transport-isolation-gate:
+    # #3829 — MCP transport is stdio-only. The src/mcp stdio JSON-RPC loop
+    # owns stdin/stdout and MUST bind no server socket and construct no
+    # network client for its OWN transport (SECURITY.md "MCP transport is
+    # stdio-only (#3829)"). This gate HARD-BLOCKS a server socket
+    # ((Tcp|Unix)Listener::{bind,from_std}, axum::serve, hyper::server)
+    # anywhere under src/mcp/** production code, and a network CLIENT
+    # (reqwest, TcpStream::connect, hyper::client, hyper_util::client)
+    # except the ONE allowlisted federation-forward client
+    # src/mcp/tools/store/transport.rs (#881/#318, whose outbound TLS to the
+    # HTTP daemon is the documented exception). Deliberately NOT a bare
+    # `.bind(` (rusqlite SQL parameter binds are not socket binds).
+    name: MCP transport-isolation gate (#3829)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Run MCP transport-isolation gate
+        run: python3 scripts/check-mcp-transport-isolation.py
+      - name: Self-test the gate (regression evidence)
+        # Plants a TcpListener::bind, an axum::serve, and an
+        # out-of-allowlist reqwest client in mcp files (each must RED);
+        # near-miss controls that must PASS: the allowlisted transport.rs
+        # reqwest client, and a rusqlite `.bind(` SQL parameter.
+        run: python3 scripts/check-mcp-transport-isolation.py --self-test
+
   ci-job-claims-gate:
     # 3x7 claims register 3.3.3 — C-21 / C-23 / C-24 / C-31, all one
     # shape: "a control was removed and the prose was not". `ci.yml`'s
