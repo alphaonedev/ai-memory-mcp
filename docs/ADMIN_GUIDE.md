@@ -463,9 +463,8 @@ Below is a complete example showing every supported field with explanatory comme
 #   api_key_env = "XAI_API_KEY"              # mutually exclusive with api_key_file
 #   # api_key_file = "/etc/ai-memory/keys/xai.key"   # mode 0400 enforced
 #
-#   [llm.auto_tag]                            # fast structured-output sibling
-#   backend = "ollama"
-#   model   = "gemma3:4b"
+#   [llm.auto_tag]           # ONLY `model`; the endpoint keys are
+#   model   = "gemma3:4b"    # refused at parse time (#3808)
 #
 #   [embeddings]
 #   backend        = "ollama"     # #1598: or any #1067 alias (openrouter,

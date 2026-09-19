@@ -56,6 +56,23 @@ api_key_env = "XAI_API_KEY"
 model   = "gemma3:4b"
 
 # ---------------------------------------------------------------------
+# [decision] — structured-decision provider (#3806). Absent = no
+# decision provider and byte-identical v1.0.0 behaviour.
+# ---------------------------------------------------------------------
+[decision]
+provider     = "openrouter"   # any [llm] alias, plus systemone |
+                              # openai-compatible | ollama | local-nli
+model        = "typesafe/jev-1.13"   # REQUIRED unless provider ==
+                              # [llm].backend, which inherits [llm].model
+base_url     = "https://decide.internal.example.net"   # REQUIRED for
+                              # openai-compatible and systemone;
+                              # REFUSED for local-nli
+api_key_file = "/etc/ai-memory/keys/decision.key"   # or api_key_env;
+                              # inline api_key REJECTED at parse time
+timeout_secs = 2              # default 2; a timeout is an ABSTAIN
+fallback     = "abstain"      # abstain (default) | generative | refuse
+
+# ---------------------------------------------------------------------
 # [embeddings] — embedding-model configuration.
 #
 # #1598 — fully API-capable: `backend` accepts the same vendor-alias
@@ -495,7 +512,13 @@ consumes the corresponding `Resolved*` struct produced by these
 methods:
 
 - `AppConfig::resolve_llm(cli_backend, cli_model, cli_base_url)`
-- `AppConfig::resolve_llm_auto_tag()`
+- `AppConfig::resolve_decision()` — #3806: the `[decision]` provider
+  (`provider` > `[llm].backend`; `model` / `base_url` fall back to the
+  parent ONLY when the provider matches `[llm].backend`; the parent API
+  key travels ONLY when provider AND base URL both match, i.e. it is
+  literally the same endpoint). `None` = no decision provider. Replaces
+  `resolve_llm_auto_tag`, retired at v1.0.0 (#3808) — it resolved a
+  second `[llm.auto_tag]` endpoint that had no callers.
 - `AppConfig::resolve_embeddings()` — #1598: full per-field ladder
   (`AI_MEMORY_EMBED_*` env > `[embeddings]` section > legacy flat
   `embed_url`/`embedding_model`/`ollama_url` > compiled default), embed
@@ -578,8 +601,19 @@ are a credential leak.
 ```
 
 `[llm].api_key_env` and `[llm].api_key_file` are mutually exclusive
-— the daemon refuses to load a config that sets both. Same mutex
-applies to `[llm.auto_tag]`.
+— the daemon refuses to load a config that sets both. The same mutex
+applies to `[embeddings]` and to `[decision]`.
+
+`[llm.auto_tag].backend` / `.base_url` / `.api_key_env` /
+`.api_key_file` are **REFUSED at parse time** since v1.0.0
+([#3808](https://github.com/alphaonedev/ai-memory-mcp/issues/3808)).
+They were documented as a second inference endpoint but nothing ever
+read them (`resolve_llm_auto_tag` had zero callers; production threads
+the legacy flat `auto_tag_model`), and had they been wired as written
+the second endpoint would also have bypassed the boot egress gate. The
+repair is one deleted line, or the same endpoint expressed under
+`[decision]`. `[llm.auto_tag].model` is unaffected — `ai-memory config
+migrate` writes exactly that key.
 
 `[llm].api_key_file` requires `mode 0400` (or stricter). The check
 is skipped on non-Unix platforms. To opt out (operator-advisory,
@@ -591,6 +625,52 @@ export AI_MEMORY_PASSPHRASE_FILE_ALLOW_LAX_PERMS=1
 
 This is the same escape hatch [#1055](https://github.com/alphaonedev/ai-memory-mcp/issues/1055)
 introduced for `AI_MEMORY_DB_PASSPHRASE_FILE`.
+
+### `[decision]` — structured-decision provider (#3806)
+
+A small text-in / typed-decision-out model beside the generative
+`[llm]` backend: `choose` over a closed set, `score` on a range, and
+`judge` yes/no, each answering with a decision that may be **absent**.
+
+```toml
+[decision]
+provider     = "openrouter"
+model        = "typesafe/jev-1.13"
+base_url     = "https://decide.internal.example.net"
+api_key_file = "/etc/ai-memory/keys/decision.key"
+timeout_secs = 2
+fallback     = "abstain"
+```
+
+| Key | Required | Default | Notes |
+|---|---|---|---|
+| `provider` | no | `[llm].backend` | Any `[llm]` alias, plus `systemone`, `openai-compatible`, `ollama`, `local-nli`. An unrecognised value is REFUSED by name. |
+| `model` | yes, unless `provider == [llm].backend` | `[llm].model` | Never inferred from the provider. |
+| `base_url` | for `openai-compatible` and `systemone` | the alias default, or `[llm].base_url` when the provider matches | REFUSED for `local-nli` (it opens no socket). |
+| `api_key_env` / `api_key_file` | no | per-vendor env chain | Mutually exclusive. Inline `api_key` is REJECTED at parse time, as for `[llm]`. REFUSED for `local-nli`. |
+| `timeout_secs` | no | `2` | `0` is refused. A timeout is an **abstain**, never a `false`. |
+| `fallback` | no | `abstain` | `abstain` \| `generative` \| `refuse`. |
+
+**Unset `[decision]` is byte-identical v1.0.0 behaviour**: there is no
+provider, every seam consults the always-abstaining `NullDecider`, and
+no code path changes.
+
+**Abstain is a first-class value.** A timeout, a refused egress, an
+absent provider and an unparseable answer are all an *abstain* carrying
+a reason — never a default `false`. **Confidence is evidence-gated**:
+it is reported only where logprobs or calibration evidence exist, and a
+non-finite or out-of-range probability degrades to absent rather than
+being stored.
+
+**Credential isolation.** The parent `[llm]` API key is inherited only
+when the decision endpoint is literally the same endpoint (same
+provider AND same resolved base URL), and there is deliberately no
+generic `AI_MEMORY_DECISION_API_KEY` env var — a catch-all would ship
+the chat credential to a different vendor's host. Use
+`[decision].api_key_env` to name any env var you like.
+
+Model-class advice, the air-gap ladder and the hosted-route census land
+with the rest of the `[decision]` documentation (#3806 W6).
 
 ## Migration from v0.6.x (legacy flat fields)
 

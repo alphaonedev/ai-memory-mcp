@@ -180,6 +180,30 @@ pub mod config_keys {
     pub const OLLAMA_URL: &str = "ollama_url";
     /// `[embeddings]` config-section name (#1146 sectioned schema).
     pub const SECTION_EMBEDDINGS: &str = "embeddings";
+    /// The `api_key_env` field name, shared by `[llm]` / `[embeddings]`
+    /// / `[decision]` (#3806; pm-v3.1 hardcoded-literal gate).
+    pub const API_KEY_ENV: &str = "api_key_env";
+    /// The `api_key_file` field name, shared by the same three sections.
+    pub const API_KEY_FILE: &str = "api_key_file";
+    /// The inline `api_key` trap field name, shared by the same three.
+    pub const API_KEY: &str = "api_key";
+    /// The `base_url` field name, shared by the same three sections.
+    pub const BASE_URL: &str = "base_url";
+}
+
+/// v0.7.x #1146 / #1598 / #3806 — the ONE inline-`api_key` refusal text.
+/// `[llm]`, `[embeddings]` and `[decision]` share it so the wording and
+/// the repair instructions cannot drift per section, and so the string
+/// lives in exactly one place (pm-v3.1 hardcoded-literal gate).
+#[must_use]
+pub(crate) fn inline_api_key_refusal(section: &str) -> String {
+    format!(
+        "inline `api_key = \"<literal>\"` in [{section}] is forbidden — \
+         use `api_key_env = \"<ENV_VAR_NAME>\"` to reference a process \
+         env var, or `api_key_file = \"/path/to/key\"` to reference a \
+         file (mode 0400 enforced). Inline secrets in config.toml \
+         (typically world-readable) are a credential leak."
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -3599,6 +3623,13 @@ pub struct AppConfig {
     /// `singleton`; an upgrade never promotes a node to a stricter shape.
     #[serde(default)]
     pub deployment: Option<DeploymentSection>,
+
+    /// #3806 — `[decision]` block: the structured-decision provider that
+    /// sits beside the generative `[llm]` backend. Absent = NO decision
+    /// provider and byte-identical v1.0.0 behaviour; see
+    /// [`crate::decision_config::resolve_decision`].
+    #[serde(default)]
+    pub decision: Option<crate::decision_config::DecisionSection>,
 }
 
 // #1454 (SEC, LOW) — manual `Debug` so the `api_key` secret renders as
@@ -3676,6 +3707,7 @@ impl std::fmt::Debug for AppConfig {
             .field("limits", &self.limits)
             .field("encryption", &self.encryption)
             .field("deployment", &self.deployment)
+            .field("decision", &self.decision)
             .finish()
     }
 }
@@ -3925,8 +3957,8 @@ impl std::fmt::Debug for LlmSection {
             .field("backend", &self.backend)
             .field("model", &self.model)
             .field("base_url", &self.base_url)
-            .field("api_key_env", &self.api_key_env)
-            .field("api_key_file", &self.api_key_file)
+            .field(config_keys::API_KEY_ENV, &self.api_key_env)
+            .field(config_keys::API_KEY_FILE, &self.api_key_file)
             .field(
                 "api_key",
                 &self.api_key.as_ref().map(|_| crate::REDACTED_PLACEHOLDER),
@@ -7784,7 +7816,7 @@ fn backend_default_model(backend: &str) -> &'static str {
 /// resolvers. Alias URLs come only from the LLM SSOT (#3811/#3860).
 /// Only Ollama defaults to the Ollama endpoint. Generic/unknown selectors
 /// have no default; construction and doctor report invalid configuration.
-fn backend_default_base_url(backend: &str) -> &'static str {
+pub(crate) fn backend_default_base_url(backend: &str) -> &'static str {
     if backend == crate::llm::BACKEND_OLLAMA {
         crate::llm::DEFAULT_OLLAMA_URL
     } else {
@@ -7981,7 +8013,7 @@ pub fn canonical_embedding_dim(model: &str) -> Option<u32> {
 /// [`resolve_embed_api_key`]).
 fn resolve_api_key(backend: &str, llm: Option<&LlmSection>) -> (Option<String>, KeySource) {
     resolve_api_key_ladder(
-        ENV_LLM_API_KEY,
+        Some(ENV_LLM_API_KEY),
         backend,
         llm.and_then(|l| l.api_key_env.as_deref()),
         llm.and_then(|l| l.api_key_file.as_deref()),
@@ -8007,7 +8039,7 @@ fn resolve_embed_api_key(
     embeddings: Option<&EmbeddingsSection>,
 ) -> (Option<String>, KeySource) {
     resolve_api_key_ladder(
-        ENV_EMBED_API_KEY,
+        Some(ENV_EMBED_API_KEY),
         backend,
         embeddings.and_then(|e| e.api_key_env.as_deref()),
         embeddings.and_then(|e| e.api_key_file.as_deref()),
@@ -8061,16 +8093,20 @@ pub fn embed_lane_egresses(backend: &str, tier_model: Option<EmbeddingModel>) ->
 /// and surface failures as `KeySource::Error(reason)` so the daemon
 /// can boot and report the problem through `ai-memory doctor` rather
 /// than failing at config load.
-fn resolve_api_key_ladder(
-    primary_env: &str,
+pub(crate) fn resolve_api_key_ladder(
+    primary_env: Option<&str>,
     backend: &str,
     api_key_env: Option<&str>,
     api_key_file: Option<&str>,
     section: &str,
 ) -> (Option<String>, KeySource) {
-    // 1. Process env (highest).
-    if let Some(k) = std::env::var(primary_env)
-        .ok()
+    // 1. Process env (highest). `None` means the section has NO
+    // dedicated `AI_MEMORY_*_API_KEY` catch-all: `[decision]` (#3806)
+    // deliberately has none, so a chat credential in the process
+    // environment can never be shipped to a different vendor's decision
+    // endpoint.
+    if let Some(k) = primary_env
+        .and_then(|name| std::env::var(name).ok())
         .filter(|s| !s.trim().is_empty())
     {
         return (Some(k), KeySource::ProcessEnv);
@@ -8721,13 +8757,7 @@ impl AppConfig {
         if let Some(llm) = &self.llm {
             // Rejection 1 — inline api_key literal.
             if llm.api_key.is_some() {
-                return Err("inline `api_key = \"<literal>\"` in [llm] is forbidden — \
-                     use `api_key_env = \"<ENV_VAR_NAME>\"` to reference a \
-                     process env var, or `api_key_file = \"/path/to/key\"` to \
-                     reference a file (mode 0400 enforced). Inline secrets in \
-                     config.toml (typically world-readable) are a credential \
-                     leak."
-                    .to_string());
+                return Err(inline_api_key_refusal("llm"));
             }
             // Rejection 2 — env vs file mutex.
             if llm.api_key_env.is_some() && llm.api_key_file.is_some() {
@@ -8749,15 +8779,7 @@ impl AppConfig {
             // #1598 Rejection 4 — inline [embeddings].api_key literal
             // (mirrors the [llm] rejection above).
             if embeddings.api_key.is_some() {
-                return Err(
-                    "inline `api_key = \"<literal>\"` in [embeddings] is forbidden — \
-                     use `api_key_env = \"<ENV_VAR_NAME>\"` to reference a \
-                     process env var, or `api_key_file = \"/path/to/key\"` to \
-                     reference a file (mode 0400 enforced). Inline secrets in \
-                     config.toml (typically world-readable) are a credential \
-                     leak."
-                        .to_string(),
-                );
+                return Err(inline_api_key_refusal(config_keys::SECTION_EMBEDDINGS));
             }
             // #1598 Rejection 5 — [embeddings] env vs file mutex.
             if embeddings.api_key_env.is_some() && embeddings.api_key_file.is_some() {
@@ -8772,6 +8794,11 @@ impl AppConfig {
         // #3823 — rejection 6: a non-loopback plaintext inference endpoint.
         self.validate_inference_endpoint_transit()
             .map_err(|e| e.to_string())?;
+        // #3806 — `[decision]` selector + secret + transit discipline. The
+        // predicate lives in `crate::decision_config` because this file is
+        // at its QUAL-10 ceiling; this is the wiring line. It is a no-op
+        // for a config without a `[decision]` section.
+        crate::decision_config::validate(self).map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -9605,6 +9632,23 @@ impl AppConfig {
             api_key_source,
             source: parent.source,
         }
+    }
+
+    /// #3806 — resolve the `[decision]` structured-decision provider.
+    ///
+    /// Thin delegate to [`crate::decision_config::resolve_decision`],
+    /// which owns the ladder, the refusals and the key discipline (this
+    /// file is at its QUAL-10 ceiling). `None` means NO decision
+    /// provider: the section is absent, or it is present but could not
+    /// be honoured exactly as written — in which case the loader has
+    /// already refused it by name.
+    ///
+    /// Independent of `[llm.auto_tag]`: that sibling's endpoint keys stay
+    /// parsed-and-WARNed exactly as #3808 landed them (a boot WARN, not a
+    /// refusal), so a config without `[decision]` loads byte-identically.
+    #[must_use]
+    pub fn resolve_decision(&self) -> Option<crate::decision_config::ResolvedDecision> {
+        crate::decision_config::resolve_decision(self)
     }
 
     /// v0.7.x (#1146) — resolve the canonical embedder configuration.
@@ -12683,6 +12727,7 @@ legacy_scoring = false
             limits: Some(LimitsSection::default()),
             encryption: Some(EncryptionSection::default()),
             deployment: Some(DeploymentSection::default()),
+            decision: Some(crate::decision_config::DecisionSection::default()),
         };
 
         let serialised = toml::to_string(&cfg).expect("serialise AppConfig to TOML");
