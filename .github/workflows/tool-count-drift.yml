@@ -56,7 +56,7 @@ on:
   push:
     branches: [main, develop, "release/**"]
   pull_request:
-    branches: [main, develop, "feat/**", "release/**"]
+    branches: [main, develop, "feat/**", "release/**", "next/v1.1.0"]
 
 # #3591 — explicit GITHUB_TOKEN scope (CodeQL actions/missing-workflow-permissions).
 # Checkout + grep/scripts only; no PR comments, SARIF, or checks writes.
