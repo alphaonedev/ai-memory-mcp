@@ -39,7 +39,7 @@ So the 1.7.0 "list predicates are grammar keywords, not callable" claim
 is **stale for `ALL`/`ANY` on 1.8.0**. The find_paths guard still does
 not succeed (runtime, not parse). Restoring an AGE `find_paths` reader
 is follow-up [#3609](https://github.com/alphaonedev/ai-memory-mcp/issues/3609);
-this docs lane does not change the dispatcher.
+the E4 decision below retains the relational reader and pins the runtime distinction.
 
 ## EXPLAIN of a PARSEABLE AGE walk (no `ALL` guard)
 
@@ -60,10 +60,9 @@ vertices, VLE nested loop):
  Execution Time: 0.065 ms
 ```
 
-The outer side is a `Seq Scan` on `_ag_label_vertex`. That is the
-#2582 reason the dispatcher stays the relational CTE even if the
-`ALL(…)` guard were rewritten to parse: a parseable AGE walk still
-scales with `|V|`, not depth.
+The outer side in this captured plan is a `Seq Scan` on `_ag_label_vertex`.
+This is evidence for the measured corpus and plan, not a universal proof
+that AGE cannot win at any depth or after a supported rewrite.
 
 ## Production engine (unchanged)
 
@@ -72,5 +71,42 @@ scales with `|V|`, not depth.
 bounded BFS. `kg_query` / `kg_timeline` / `lineage` still execute
 AGE Cypher when the extension is present.
 
-Differential relational↔AGE suite for `find_paths`: stays v1.1 (V9)
-per the #3297 comment.
+## E4 decision and reproducible native pins (#3609)
+
+Retain the relational fallback on both `KgBackend` values. Since #3196,
+`find_paths_cte` is a legacy method name for bounded level-by-level BFS in
+Rust, fetching each frontier from `memory_links` with parameterized SQL.
+It does **not** currently execute a recursive CTE or an AGE path reader.
+The durable relational view preserves read-your-write behavior when the
+AGE projection is delayed, plus current-view, undirected, cycle, depth,
+prefix-budget and result-cap semantics. No per-request failing AGE probe
+is introduced. A future AGE rewrite requires its own execution, parity
+and workload measurements; scalar-list grammar support is insufficient.
+
+Run on a throwaway database with an explicit `AI_MEMORY_TEST_AGE_URL`:
+
+```sh
+timeout 1800 cargo test --features sal-postgres --lib path_predicate_tests \
+  -- --include-ignored --test-threads=1 --nocapture
+```
+
+`age_180_predicate_runtime_failure_has_a_live_control` is intentionally
+version-bound to AGE 1.8.0. It executes scalar-list ALL/ANY, a seeded path
+with and without the relationships predicate, and parse-rejected filter.
+If a later AGE fixes the predicate, this characterization goes RED so the
+engine decision is revisited. An unavailable or undeclared AGE fails when
+the ignored native tests are explicitly selected; it never passes as CTE.
+
+`age_dispatch_and_relational_dispatch_preserve_current_paths` executes the
+production dispatcher with both backend settings against the same native
+fixture and compares explicit expected paths. Its diamond, parallel edges,
+expired shortcut/leaf, isolated node, reverse direction, depth and cap
+checks prevent empty/empty equivalence. These are **two dispatch settings
+using one relational reader**, not an advertised AGE Cypher equivalence.
+The existing native postgres-ignored CI job selects both pins.
+
+On 2026-09-19, native PostgreSQL18.6/AGE1.8.0/vector0.8.6 again measured
+list ALL/ANY success, a two-row unguarded path control, and runtime
+`no relation entry for relid` under path ALL. Detailed SHA-bound RED/GREEN
+logs are retained under gitignored `.local-runs/path-predicates/` and in
+the E4 PR notes. Prior 2026-09-11 plan capture above remains historical.
