@@ -1,0 +1,63 @@
+name: Native federation data tier (f1)
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: astra-f1-native-data-tier
+  cancel-in-progress: false
+jobs:
+  native-federation:
+    name: Native federation PG18.6 AGE1.8.0 vector0.8.6
+    runs-on: [self-hosted, macos-fed]
+    timeout-minutes: 80
+    steps:
+      - name: Prepare isolated Astra checkout and resource gate
+        shell: bash
+        env:
+          REQUESTED_SHA: ${{ github.sha }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          umask 022
+          case "$REQUESTED_SHA" in *[!a-f0-9]*|'') exit 1;; esac
+          case "$RUN_ID-$RUN_ATTEMPT" in *[!0-9-]*) exit 1;; esac
+          work="/Volumes/f1dev/astra/wt/e5-ci-$RUN_ID-$RUN_ATTEMPT"
+          scratch="/Volumes/f1dev/astra/tmp/e5-ci-$RUN_ID-$RUN_ATTEMPT"
+          target="/Volumes/f1dev/astra/targets/e5-native-ci"
+          mkdir -p "$work" "$scratch" "$target"
+          chmod 700 "$scratch"
+          printf 'Signature: 8a477f597d28d172789f06886806bc55\n' > "$target/CACHEDIR.TAG"
+          git -C "$work" init
+          timeout 120 git -C "$work" fetch --depth=1 git@github.com:alphaonedev/ai-memory-mcp.git "$REQUESTED_SHA"
+          git -C "$work" checkout --detach FETCH_HEAD
+          {
+            echo "ASTRA_NATIVE_WORK=$work"
+            echo "CARGO_TARGET_DIR=$target"
+            echo "TMPDIR=$scratch"
+            echo "CARGO_BUILD_JOBS=2"
+          } >> "$GITHUB_ENV"
+          timeout 1300 python3 "$work/scripts/native/resource_gate.py"
+      - name: Run harness self-tests and certify native federation
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 022
+          cd "$ASTRA_NATIVE_WORK"
+          export PYTHONDONTWRITEBYTECODE=1
+          timeout 60 python3 -m unittest discover -s scripts/native -v
+          timeout 180 bash scripts/check-cert-leg-nonvacuity.sh --self-test
+          # This file is sourced, never printed. No DSN enters GITHUB_ENV or argv.
+          source /Users/fate/pg-age-stack/env.sh
+          echo "CARGO_TARGET_DIR=$CARGO_TARGET_DIR"
+          timeout 4000 python3 scripts/native/federation.py --require-native \
+            --psql /opt/homebrew/Cellar/postgresql@18/18.6/bin/psql
+      - name: Upload sanitized native evidence
+        if: always() && env.ASTRA_NATIVE_WORK != ''
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: native-federation-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.ASTRA_NATIVE_WORK }}/.local-runs/native-federation/
+          include-hidden-files: true
+          if-no-files-found: warn
