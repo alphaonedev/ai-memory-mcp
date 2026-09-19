@@ -16,6 +16,10 @@ TLS verification includes a successful certified connection and a deliberate
 hostname mismatch using the same loopback address. The latter must produce a
 certificate-name rejection; an arbitrary connection error is insufficient.
 Driver output stays in memory and is suppressed for provisioning failures.
+Each child command has a32MiB diagnostic-output budget and a finite timeout;
+exceeding either kills only its owned process group and fails certification.
+The byte limit protects shared-host memory and does not truncate a passing
+result or limit customer data.
 Child-test logs are redacted before writing a fresh UUID subdirectory under
 `.local-runs/native-federation/`; prior successful evidence cannot be reused by
 a later failed invocation. Termination/interrupt handling kills only the owned
