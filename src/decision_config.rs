@@ -292,13 +292,13 @@ impl Drop for ResolvedDecision {
 }
 
 /// Every provider selector accepted at GA, as one operator-facing
-/// string. Assembled from [`crate::llm::RECOGNIZED_LLM_BACKENDS`] so the
+/// string. Assembled from [`crate::config::RECOGNIZED_LLM_BACKENDS`] so the
 /// two lists cannot drift.
 #[must_use]
 pub fn recognized_providers() -> String {
     format!(
         "{}, {PROVIDER_SYSTEMONE}, {PROVIDER_LOCAL_NLI}",
-        crate::llm::RECOGNIZED_LLM_BACKENDS
+        crate::config::RECOGNIZED_LLM_BACKENDS
     )
 }
 
@@ -307,7 +307,7 @@ pub fn recognized_providers() -> String {
 pub fn is_recognized_provider(provider: &str) -> bool {
     provider == PROVIDER_SYSTEMONE
         || provider == PROVIDER_LOCAL_NLI
-        || crate::llm::is_recognized_llm_backend(provider)
+        || crate::config::is_recognized_llm_backend(provider)
 }
 
 /// The compiled default base URL for a decision provider, or `None`
