@@ -484,6 +484,7 @@ impl TierConfig {
             schema_version: "2".to_string(),
             federation_security: None,
             deployment_shape: None,
+            decision_provider: None,
             tier: self.tier.as_str().to_string(),
             version: crate::PKG_VERSION.to_string(),
             features: CapabilityFeatures {
@@ -643,6 +644,14 @@ pub struct Capabilities {
     /// process has not evaluated its shape.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deployment_shape: Option<crate::config::shape::detector::ShapeAssessment>,
+    /// #3806 W1b: the decision-provider boot state, from the CLOSED
+    /// vocabulary `absent` / `configured` / `refused_by_egress` /
+    /// `constructed`. OMITTED when this process has not run the
+    /// `[decision]` boot chokepoint, and when it ran and found no
+    /// `[decision]` section — so an operator who never configured one
+    /// sees the byte-identical v1.0.0 payload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_provider: Option<crate::decision_boot::DecisionBootReport>,
     /// Schema-version discriminator. Always `"2"` since v0.6.3.
     pub schema_version: String,
     pub tier: String,
@@ -2062,6 +2071,7 @@ impl Capabilities {
             schema_version: "3".to_string(),
             federation_security: self.federation_security.clone(),
             deployment_shape: self.deployment_shape.clone(),
+            decision_provider: self.decision_provider.clone(),
             summary,
             to_describe_to_user,
             tools,
@@ -2185,6 +2195,9 @@ pub struct CapabilitiesV3 {
     /// #3700: same deployment-shape snapshot as the v2 projection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deployment_shape: Option<crate::config::shape::detector::ShapeAssessment>,
+    /// #3806: same decision-provider boot snapshot as the v2 projection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_provider: Option<crate::decision_boot::DecisionBootReport>,
     /// Schema-version discriminator. Always `"3"` in v0.7.0.
     pub schema_version: String,
 
