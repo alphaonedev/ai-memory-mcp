@@ -403,9 +403,33 @@ pg_test!(pg_namespace_standard_set_get_clear_roundtrip, url, {
     );
 
     // GET via the postgres arm of get_namespace_standard_qs (non-inherit).
+    //
+    // #3861 / #3400 — the non-inherit GET envelope is the sqlite CANONICAL
+    // shape on both backends (`handle_namespace_get_standard`, pinned
+    // structurally equal across backends by
+    // `namespace_standard_wire_shape_matches_across_backends_3400`), so it
+    // carries NEITHER a `storage_backend` marker NOR `resolved_namespace`.
+    // This pin predated #3400 and asserted the pre-normalisation postgres
+    // shape; it now pins the ruled contract instead of the opposite one
+    // (the same inversion as `tests/cov_ga2_handlers_b.rs`, whose pins this
+    // live-postgres twin mirrors). The inherit GET and CLEAR below still
+    // carry the marker (#3874).
     let (get_status, get_body) = get(&r, &format!("/api/v1/namespaces?namespace={ns}")).await;
     assert_eq!(get_status, StatusCode::OK, "get body={get_body}");
-    assert_eq!(get_body["storage_backend"], "postgres");
+    assert_eq!(
+        get_body[ai_memory::models::field_names::STANDARD_ID],
+        json!(std_id)
+    );
+    assert!(
+        get_body["governance"].is_object(),
+        "canonical GET carries governance: {get_body}"
+    );
+    assert_eq!(
+        get_body["storage_backend"],
+        Value::Null,
+        "non-inherit GET is the canonical sqlite shape (#3400): no backend marker"
+    );
+    assert_eq!(get_body["resolved_namespace"], Value::Null);
 
     // GET with inherit=true exercises the chain-walk branch.
     let (inh_status, inh_body) = get(
@@ -430,10 +454,16 @@ pg_test!(pg_namespace_standard_get_unset_is_null_standard, url, {
     let ns = uniq_ns();
     // No standard set: the non-inherit pg arm returns 200 with a null
     // standard_id (Ok(None) fall-through).
+    //
+    // #3861 / #3400 — canonical unset envelope `{namespace, standard_id: null}`
+    // on both backends; no backend marker (see the note in
+    // `pg_namespace_standard_set_get_clear_roundtrip`).
     let (status, body) = get(&r, &format!("/api/v1/namespaces?namespace={ns}")).await;
     assert_eq!(status, StatusCode::OK, "body={body}");
-    assert_eq!(body["storage_backend"], "postgres");
-    assert!(body["standard_id"].is_null());
+    assert_eq!(
+        body,
+        json!({"namespace": ns, (ai_memory::models::field_names::STANDARD_ID): Value::Null})
+    );
 });
 
 pg_test!(pg_namespace_standard_clear_missing_is_404, url, {
