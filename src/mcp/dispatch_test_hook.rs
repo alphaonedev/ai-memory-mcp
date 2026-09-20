@@ -13,6 +13,24 @@ use serde_json::Value;
 
 use super::{RpcRequest, handle_request};
 
+/// #3818 — doc-hidden test accessor for the canonical full tool-name set
+/// (`registry` is `pub(super)`, unreachable from `tests/`).
+#[doc(hidden)]
+#[must_use]
+pub fn all_registry_tool_names_for_test() -> &'static [&'static str] {
+    super::registry::tool_names::ALL
+}
+
+/// #3818 — doc-hidden test accessor for the record-stop read-only inventory:
+/// call the FUNCTION (`mcp_tool_is_read_only`) so a test can enumerate the
+/// inventory by the same predicate the dispatch fence uses, never by parsing
+/// the source table (a parse can miss an entry and go silently vacuous).
+#[doc(hidden)]
+#[must_use]
+pub fn mcp_tool_is_read_only_for_test(name: &str) -> bool {
+    super::read_only_tools::mcp_tool_is_read_only(name)
+}
+
 /// Dispatch one JSON-RPC request through the real `handle_request` with the
 /// minimal scaffold (keyword tier, full profile, no LLM / embedder /
 /// keypair / hooks) and return the wire response as JSON.
@@ -21,7 +39,6 @@ use super::{RpcRequest, handle_request};
 /// Panics when `request` is not a well-formed JSON-RPC request object or the
 /// response cannot be serialised — both are test-fixture errors.
 #[doc(hidden)]
-#[must_use]
 pub fn handle_request_for_test(
     conn: &rusqlite::Connection,
     db_path: &Path,
