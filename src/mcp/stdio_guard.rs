@@ -34,9 +34,11 @@
 //! this guard requires POSITIVE proof of a safe inherited channel — fd 0 must
 //! `fstat` as a pipe, a character device (tty / `/dev/null`), or a regular file
 //! — and REFUSES on everything else, INCLUDING cannot-determine (fstat failed,
-//! or a socket whose family or listening state the kernel would not report)
-//! and any unexpected type. The one non-refusing socket case is a positively
-//! `AF_UNIX` connected socket, which is WARNED (not refused): a `socketpair`
+//! or a socket whose family the kernel would not report, or a socket that can
+//! prove not-listening through NEITHER channel — `SO_ACCEPTCONN` unanswered AND
+//! no connected peer from `getpeername`) and any unexpected type. The one
+//! non-refusing socket case is a positively `AF_UNIX` connected socket, which
+//! is WARNED (not refused): a `socketpair`
 //! stdio channel is one inherited peer, and an accepted UDS connection is the
 //! Unix-domain-socket case whose control is peer-cred + socket mode (the
 //! `wake_hub` ruling / #3827), not a transport cipher — that boundary is left
@@ -54,8 +56,10 @@ pub enum Fd0Kind {
     /// record loudly.
     UnixSocket,
     /// Anything NOT proven safe — a listening socket, a non-`AF_UNIX` socket, a
-    /// socket whose family could not be read, an fd that could not be inspected
-    /// (fstat failed), or an unexpected fd type. REFUSE. The payload names why.
+    /// socket whose family could not be read, a socket that can prove neither
+    /// not-listening (SO_ACCEPTCONN) nor a connected peer (getpeername), an fd
+    /// that could not be inspected (fstat failed), or an unexpected fd type.
+    /// REFUSE. The payload names why.
     Refuse(String),
 }
 
@@ -73,10 +77,23 @@ enum Fd0Probe {
     CharDevice,
     Regular,
     Socket {
-        /// `None` = the SO_ACCEPTCONN probe was DENIED (getsockopt filtered),
-        /// so the listening state is unknown; cannot-determine must refuse
-        /// (fail-CLOSED), consistent with the fstat + family probes.
+        /// `None` = the SO_ACCEPTCONN probe did not answer (getsockopt failed:
+        /// filtered, or the platform does not report it for this socket), so
+        /// the listening state is unknown from THIS channel.
         listening: Option<bool>,
+        /// `Some(true)` = `getpeername` succeeded: the socket HAS a connected
+        /// peer, which is positive evidence it is NOT a listening socket (a
+        /// listener has no peer — `getpeername` fails with ENOTCONN, and no
+        /// filter can make it succeed). `Some(false)` = `getpeername` reported
+        /// ENOTCONN; `None` = the call failed some other way (denied).
+        ///
+        /// #3829 macOS: `SO_ACCEPTCONN` is not readable for a `socketpair`
+        /// there, so `listening` is `None` for the legitimate socketpair-stdio
+        /// channel and the guard refused to start every macOS MCP server. The
+        /// peer probe is the SECOND positive-evidence channel: it lets a
+        /// connected socket prove itself not-listening on any platform, while
+        /// a socket that can prove neither still refuses (fail-CLOSED).
+        connected: Option<bool>,
         family: Option<i32>,
     },
     /// A directory, block device, symlink, or any other `S_IFMT` value — never
@@ -98,27 +115,38 @@ fn classify(probe: Fd0Probe) -> Fd0Kind {
             listening: Some(true),
             ..
         } => Fd0Kind::Refuse("a listening socket".to_string()),
-        // cannot-determine listening (getsockopt SO_ACCEPTCONN denied) is not
-        // evidence of safety -> refuse, consistent with the fstat + family probes.
+        // Listening state unknown from SO_ACCEPTCONN AND no connected peer
+        // proven by getpeername: nothing positive says this is not a listener
+        // -> refuse, consistent with the fstat + family probes (#3829 f2r
+        // residual). A socket with a CONNECTED PEER falls through: a listener
+        // has no peer, so `connected: Some(true)` is positive evidence of
+        // not-listening even where SO_ACCEPTCONN is unreadable (macOS
+        // socketpair, #3829 correction).
         Fd0Probe::Socket {
-            listening: None, ..
+            listening: None,
+            connected: Some(false) | None,
+            ..
         } => Fd0Kind::Refuse(
             "a socket whose listening state could not be read (getsockopt \
-             SO_ACCEPTCONN denied)"
+             SO_ACCEPTCONN unanswered) and that has no connected peer"
                 .to_string(),
         ),
-        // Positively not-listening (a connected socket): warn only on AF_UNIX.
+        // Positively not-listening (SO_ACCEPTCONN = 0, or a connected peer):
+        // warn only on AF_UNIX.
         Fd0Probe::Socket {
-            listening: Some(false),
+            listening: Some(false) | None,
             family: Some(f),
+            ..
         } if f == libc::AF_UNIX => Fd0Kind::UnixSocket,
         Fd0Probe::Socket {
-            listening: Some(false),
+            listening: Some(false) | None,
             family: Some(f),
+            ..
         } => Fd0Kind::Refuse(format!("a non-AF_UNIX socket (address family {f})")),
         Fd0Probe::Socket {
-            listening: Some(false),
+            listening: Some(false) | None,
             family: None,
+            ..
         } => Fd0Kind::Refuse("a socket whose address family could not be read".to_string()),
         // No positive evidence of safety -> refuse (fail-CLOSED). Absence of
         // evidence is not evidence of safety.
@@ -170,6 +198,28 @@ fn probe_fd(fd: std::os::unix::io::RawFd) -> Fd0Probe {
                     listening = Some(acceptconn != 0);
                 }
             }
+            // Second positive-evidence channel (#3829 macOS correction): a
+            // connected peer proves not-listening. ENOTCONN is a definite "no
+            // peer"; any other failure is cannot-determine.
+            let mut connected: Option<bool> = None;
+            let mut ps: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+            if let Ok(mut plen) =
+                libc::socklen_t::try_from(std::mem::size_of::<libc::sockaddr_storage>())
+            {
+                // SAFETY: `ps` is a correctly-typed, correctly-sized out-param.
+                let rc = unsafe {
+                    libc::getpeername(
+                        fd,
+                        std::ptr::from_mut(&mut ps).cast::<libc::sockaddr>(),
+                        &raw mut plen,
+                    )
+                };
+                if rc == 0 {
+                    connected = Some(true);
+                } else if std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOTCONN) {
+                    connected = Some(false);
+                }
+            }
             let mut family: Option<i32> = None;
             let mut ss: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
             if let Ok(mut slen) =
@@ -187,7 +237,11 @@ fn probe_fd(fd: std::os::unix::io::RawFd) -> Fd0Probe {
                     family = Some(i32::from(ss.ss_family));
                 }
             }
-            Fd0Probe::Socket { listening, family }
+            Fd0Probe::Socket {
+                listening,
+                connected,
+                family,
+            }
         }
         _ => Fd0Probe::OtherType,
     }
@@ -282,6 +336,7 @@ mod tests {
         assert!(matches!(
             classify(Fd0Probe::Socket {
                 listening: Some(true),
+                connected: Some(false),
                 family: Some(libc::AF_UNIX)
             }),
             Fd0Kind::Refuse(_)
@@ -289,6 +344,7 @@ mod tests {
         assert!(matches!(
             classify(Fd0Probe::Socket {
                 listening: Some(true),
+                connected: Some(false),
                 family: None
             }),
             Fd0Kind::Refuse(_)
@@ -300,17 +356,66 @@ mod tests {
         // #3829 f2r residual: SO_ACCEPTCONN denied (getsockopt filtered) leaves
         // the listening state unknown. An AF_UNIX listener would otherwise take
         // the WARN arm; cannot-determine must REFUSE, consistent with amendment 2.
+        for connected in [Some(false), None] {
+            assert!(matches!(
+                classify(Fd0Probe::Socket {
+                    listening: None,
+                    connected,
+                    family: Some(libc::AF_UNIX)
+                }),
+                Fd0Kind::Refuse(_)
+            ));
+            assert!(matches!(
+                classify(Fd0Probe::Socket {
+                    listening: None,
+                    connected,
+                    family: None
+                }),
+                Fd0Kind::Refuse(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn connected_peer_is_positive_evidence_of_not_listening() {
+        // #3829 macOS correction: SO_ACCEPTCONN is not readable for a socketpair
+        // there, so `listening` is None for the legitimate socketpair-stdio
+        // channel. A CONNECTED PEER (getpeername succeeded) is positive evidence
+        // the socket is not a listener — a listener has no peer — so the
+        // AF_UNIX warn arm stands on that evidence alone…
+        assert_eq!(
+            classify(Fd0Probe::Socket {
+                listening: None,
+                connected: Some(true),
+                family: Some(libc::AF_UNIX)
+            }),
+            Fd0Kind::UnixSocket
+        );
+        // …while the family and listening refusals are untouched: a connected
+        // non-AF_UNIX socket still refuses, an unreadable family still refuses,
+        // and a positively LISTENING socket refuses whatever the peer probe says
+        // (the two channels can only disagree under a fault; fail-CLOSED wins).
         assert!(matches!(
             classify(Fd0Probe::Socket {
                 listening: None,
-                family: Some(libc::AF_UNIX)
+                connected: Some(true),
+                family: Some(libc::AF_INET)
             }),
             Fd0Kind::Refuse(_)
         ));
         assert!(matches!(
             classify(Fd0Probe::Socket {
                 listening: None,
+                connected: Some(true),
                 family: None
+            }),
+            Fd0Kind::Refuse(_)
+        ));
+        assert!(matches!(
+            classify(Fd0Probe::Socket {
+                listening: Some(true),
+                connected: Some(true),
+                family: Some(libc::AF_UNIX)
             }),
             Fd0Kind::Refuse(_)
         ));
@@ -321,6 +426,7 @@ mod tests {
         assert!(matches!(
             classify(Fd0Probe::Socket {
                 listening: Some(false),
+                connected: Some(true),
                 family: Some(libc::AF_INET)
             }),
             Fd0Kind::Refuse(_)
@@ -328,6 +434,7 @@ mod tests {
         assert!(matches!(
             classify(Fd0Probe::Socket {
                 listening: Some(false),
+                connected: Some(true),
                 family: Some(libc::AF_INET6)
             }),
             Fd0Kind::Refuse(_)
@@ -345,6 +452,7 @@ mod tests {
                 matches!(
                     classify(Fd0Probe::Socket {
                         listening: Some(false),
+                        connected: Some(true),
                         family: Some(fam)
                     }),
                     Fd0Kind::Refuse(_)
@@ -361,6 +469,7 @@ mod tests {
         assert!(matches!(
             classify(Fd0Probe::Socket {
                 listening: Some(false),
+                connected: Some(true),
                 family: None
             }),
             Fd0Kind::Refuse(_)
@@ -374,6 +483,7 @@ mod tests {
         assert_eq!(
             classify(Fd0Probe::Socket {
                 listening: Some(false),
+                connected: Some(true),
                 family: Some(libc::AF_UNIX)
             }),
             Fd0Kind::UnixSocket

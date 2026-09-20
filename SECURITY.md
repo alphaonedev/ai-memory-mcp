@@ -288,8 +288,12 @@ POSITIVE evidence of a safe inherited channel: it proceeds only when fd 0
 `fstat`s as a pipe, a character device (tty / `/dev/null`), or a regular file,
 and **refuses to start** on everything else — a listening socket (any family), a
 non-`AF_UNIX` socket (`AF_INET`/`AF_INET6`, `AF_VSOCK`, or any other family), a
-socket whose family OR listening state cannot be read (e.g. getsockopt
-SO_ACCEPTCONN denied by a seccomp filter), an **uninspectable fd** (fstat denied by a
+socket whose family cannot be read, a socket that can prove not-listening
+through NEITHER channel (getsockopt SO_ACCEPTCONN unanswered AND no connected
+peer from getpeername — a listener has no peer, so a connected peer is positive
+evidence of not-listening; that second channel is what keeps a legitimate
+`socketpair` starting on macOS, where SO_ACCEPTCONN is not readable for it),
+an **uninspectable fd** (fstat denied by a
 seccomp/LSM filter, distinct from a genuinely-closed EBADF), or an unexpected fd
 type. Fail-CLOSED is deliberate: a guard that refuses only on positive evidence
 of DANGER has a security property equal to the availability of its evidence
@@ -333,8 +337,10 @@ nothing. The runtime guard is pinned separately by
 `src/mcp/stdio_guard.rs::classify_fd`'s unit tests, which assert that a listening
 socket, an `AF_INET`/`AF_INET6` socket, a non-`AF_UNIX` family such as
 `AF_VSOCK`, a socket whose family cannot be read, a socket whose listening state
-cannot be read (getsockopt denied), and an uninspectable fd are ALL
-refused, while an `AF_UNIX` socketpair is warned. Together the static gate and
+cannot be read (getsockopt denied) AND that has no connected peer, and an
+uninspectable fd are ALL refused, while an `AF_UNIX` socketpair is warned —
+including the macOS shape where SO_ACCEPTCONN is unreadable and the connected
+peer alone carries the evidence. Together the static gate and
 the runtime guard cover the two ways a socket can reach MCP DIRECTLY —
 constructed in the tree, or handed in as fd 0 — and neither covers the relay,
 which is the limit stated above.
