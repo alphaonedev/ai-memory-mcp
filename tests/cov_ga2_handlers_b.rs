@@ -725,13 +725,30 @@ async fn namespace_standard_postgres_set_get_clear_and_merge() {
     assert_eq!(status, StatusCode::CREATED, "pg merge set body={body}");
 
     // GET (qs form) on the postgres branch, non-inherit.
+    //
+    // #3861 / #3400 — the non-inherit GET envelope is the sqlite CANONICAL
+    // shape on both backends (`handle_namespace_get_standard`, pinned
+    // structurally equal across backends by
+    // `namespace_standard_wire_shape_matches_across_backends_3400`), so it
+    // carries NEITHER a `storage_backend` marker NOR `resolved_namespace`.
+    // This pin predated #3400 and asserted the pre-normalisation postgres
+    // shape; it now pins the ruled contract instead of the opposite one.
     let (status, body) = get(&r, &format!("/api/v1/namespaces?namespace={ns}")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
-        body[ai_memory::models::field_names::STORAGE_BACKEND],
-        json!("postgres")
+        body[ai_memory::models::field_names::STANDARD_ID],
+        json!(standard_id)
     );
-    assert_eq!(body["resolved_namespace"], json!(ns));
+    assert!(
+        body["governance"].is_object(),
+        "canonical GET carries governance: {body}"
+    );
+    assert_eq!(
+        body[ai_memory::models::field_names::STORAGE_BACKEND],
+        Value::Null,
+        "non-inherit GET is the canonical sqlite shape (#3400): no backend marker"
+    );
+    assert_eq!(body["resolved_namespace"], Value::Null);
 
     // GET with inherit=true exercises the chain-walk arm.
     let (status, body) = get(
@@ -778,13 +795,12 @@ async fn namespace_standard_postgres_get_unset_returns_null_envelope() {
     // null-standard_id 200 envelope on the postgres branch.
     let (status, body) = get(&r, "/api/v1/namespaces?namespace=ga2-pg-unset").await;
     assert_eq!(status, StatusCode::OK);
+    // #3861 / #3400 — canonical unset envelope `{namespace, standard_id: null}`
+    // on both backends; no backend marker (see the note in
+    // `namespace_standard_postgres_set_get_clear_and_merge`).
     assert_eq!(
-        body[ai_memory::models::field_names::STORAGE_BACKEND],
-        json!("postgres")
-    );
-    assert_eq!(
-        body[ai_memory::models::field_names::STANDARD_ID],
-        Value::Null
+        body,
+        json!({"namespace": "ga2-pg-unset", (ai_memory::models::field_names::STANDARD_ID): Value::Null})
     );
 }
 
