@@ -41,7 +41,8 @@ jobs:
           chmod 700 "$scratch"
           printf 'Signature: 8a477f597d28d172789f06886806bc55\n' > "$target/CACHEDIR.TAG"
           git -C "$work" init
-          timeout 120 git -C "$work" fetch --depth=1 git@github.com:alphaonedev/ai-memory-mcp.git "$REQUESTED_SHA"
+          # Public source fetch does not depend on an interactive SSH agent.
+          timeout 120 git -C "$work" fetch --depth=1 https://github.com/alphaonedev/ai-memory-mcp.git "$REQUESTED_SHA"
           git -C "$work" checkout --detach FETCH_HEAD
           {
             echo "ASTRA_NATIVE_WORK=$work"
