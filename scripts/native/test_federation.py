@@ -3,7 +3,12 @@
 import contextlib
 import io
 import os
+from pathlib import Path
+import signal
+import subprocess
 import sys
+import tempfile
+import time
 import tracemalloc
 import unittest
 from unittest.mock import patch
@@ -95,6 +100,46 @@ class HarnessTests(unittest.TestCase):
             tracemalloc.stop()
         # A 1KiB diagnostic limit must not retain a 2MiB termination payload.
         self.assertLess(peak,512 * 1024)
+
+    def test_timeout_kills_descendant_after_group_leader_exits(self):
+        code, text = native.command([sys.executable, '-c', 'print("control")'], os.environ.copy(), 5)
+        self.assertEqual((code, text), (0, 'control\n'))
+        with tempfile.TemporaryDirectory(dir=os.environ['TMPDIR']) as scratch:
+            pid_file = Path(scratch) / 'owned-child.pid'
+            env = dict(os.environ, OWNED_CHILD_PID_FILE=str(pid_file))
+            child = ('import os,signal,time\nfrom pathlib import Path\n'
+                     'signal.signal(signal.SIGTERM,signal.SIG_IGN)\n'
+                     'Path(os.environ["OWNED_CHILD_PID_FILE"]).write_text(str(os.getpid()))\n'
+                     'time.sleep(60)\n')
+            leader = ('import subprocess,sys,time\n'
+                      f'subprocess.Popen([sys.executable,"-c",{child!r}],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)\n'
+                      'time.sleep(60)\n')
+            descendant = None
+            try:
+                with self.assertRaises(native.Failure):
+                    native.command([sys.executable, '-c', leader], env, 3)
+                self.assertTrue(pid_file.is_file(), 'descendant must install SIGTERM refusal before timeout')
+                descendant = int(pid_file.read_text())
+                deadline = time.monotonic() + 2
+                while True:
+                    state = subprocess.run(['ps', '-o', 'stat=', '-p', str(descendant)],
+                                           capture_output=True, text=True, timeout=2)
+                    self.assertIn(state.returncode, (0, 1), 'process census must succeed')
+                    # An orphan awaiting reaping is dead; a sleeping child is a leak.
+                    if not state.stdout.strip() or state.stdout.strip().startswith('Z'):
+                        break
+                    if time.monotonic() >= deadline:
+                        self.fail('owned SIGTERM-ignoring descendant survived group cleanup')
+                    time.sleep(0.02)
+            finally:
+                # The RED test must not leave its deliberately stubborn child behind.
+                if descendant is None and pid_file.is_file():
+                    descendant = int(pid_file.read_text())
+                if descendant is not None:
+                    try:
+                        os.kill(descendant, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
 
 if __name__ == '__main__':
     unittest.main()

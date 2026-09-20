@@ -26,6 +26,10 @@ a later failed invocation. Termination/interrupt handling kills only the owned
 child process group and runs database cleanup. SIGKILL or host loss cannot run
 a cleanup handler; the printed UUID database name identifies that exceptional
 leak for the operator.
+On command timeout/interruption, cleanup escalates against the remaining owned
+process group even when its leader exits promptly; leader reaping alone does
+not prove that a SIGTERM-ignoring descendant terminated. This does not claim
+control over a process that deliberately escapes into a different session.
 No credentials or URLs are written to GitHub environment/artifact files.
 
 Prepare an isolated `CARGO_TARGET_DIR` with CACHEDIR.TAG, a mode0700 `TMPDIR`,

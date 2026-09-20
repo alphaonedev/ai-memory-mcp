@@ -99,8 +99,15 @@ def command(argv, env, seconds):
         try:
             process.wait(timeout=10)
         except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGKILL)
-            process.wait(timeout=10)
+            pass
+        finally:
+            # Reaping the leader does not prove its process group is empty.
+            # A descendant may ignore SIGTERM after the leader exits promptly.
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        process.wait(timeout=10)
         raise Failure('owned native command interrupted or exceeded its diagnostic/time budget') from None
     finally:
         process.stdout.close()
