@@ -1,5 +1,7 @@
 # ROADMAP v1.1.0 — ai-memory post-GA: use-time applicability, measurement, and docs truth
 
+> **Release-line home:** this document is the workstream detail for the v1.1.0 certification release. The release-line summary — the eight gates, the cost of each gap to an operator, and the 2026-09-09 freeze ruling that made v1.1.0 the certification release — is [`ROADMAP.md` §11.9](../ROADMAP.md). Read the two together.
+
 **Status:** Synthesized from 7 workstream drafts + 21 adversarial votes (3 per workstream). Every REQUIRED-CHANGES from REVISE votes is applied; nothing was REJECTed by a 2-of-3 majority, so there is no dropped item — but several items are **re-scoped** below, and one draft sub-claim is recorded as rejected in *Considered and rejected*.
 
 ---

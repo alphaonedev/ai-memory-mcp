@@ -108,6 +108,46 @@ functional test, security review, and documentation sync verification during PR 
 
 ---
 
+### 1.7 Scripts are Python; production components are Rust (#3831)
+
+**GA standard, operator ruling 2026-09-19. Forward-looking.**
+
+New tooling — setup, configuration, diagnostics, audits, one-shot analysis — is
+written in **Python**. New production components are written in **Rust**. No new
+shell scripts.
+
+The rule is forward-looking by design. The existing shell is **not**
+rewritten — 47 top-level `scripts/*.sh` (66 including subdirectories), of
+which 30 are `check-*.sh` gates and 29 are named by a workflow (counted at
+`f4ab2eb6d`). They are measured, proven
+and load-bearing, and churning them would spend real risk for no customer
+value. A gate that works is not a defect. Leave it alone.
+
+What the rule prevents is the next one. Shell accumulates silent failure modes
+that Python surfaces: unquoted expansion, `$?` captured after the wrong
+command, a pipeline whose exit status is the last stage rather than the failing
+one, arithmetic that stringifies.
+
+**One** of the three instrument defects found on 2026-09-19 was exactly this
+class: [#3825](https://github.com/alphaonedev/ai-memory-mcp/issues/3825)
+reported `basename`'s exit status instead of the gate's, because `$?` was read
+after a command substitution. Being precise about that matters, because the
+other two were not shell's fault —
+[#3837](https://github.com/alphaonedev/ai-memory-mcp/issues/3837) is cargo
+fingerprint semantics and
+[#3843](https://github.com/alphaonedev/ai-memory-mcp/issues/3843) is
+feature-flag derivation, and a Python driver issuing the same cargo commands
+would have produced the same 72-byte log and the same `running 0 tests`.
+Claiming all three would overstate the case for this rule in a document whose
+next section is about not overstating cases. What is true and sufficient: the
+audit that found #3843 was written in Python precisely so that it could be
+trusted.
+
+Where a task genuinely is a two-line binary invocation, shell is still the
+honest tool — but it belongs inside an existing script or a workflow step, not
+as a new file.
+
+
 ## 2. Test Standards
 
 ### 2.1 cargo test
@@ -234,6 +274,76 @@ Pointer from the config reference:
 ceilings".
 
 ---
+
+### 2.8 Gate legs must be non-vacuous, and the ordering rule (#3825, #3837, #3843)
+
+**A gate row that measured nothing is not a result.** Three instrument defects
+on 2026-09-19 all had the same shape: a leg reported success having checked,
+linted, or tested nothing at all, and the green was read as evidence.
+
+- [#3825](https://github.com/alphaonedev/ai-memory-mcp/issues/3825) — the
+  driver captured `$?` *after* a command substitution, so a script row reported
+  `basename`'s exit status rather than the gate's. A failing gate read as green.
+- [#3837](https://github.com/alphaonedev/ai-memory-mcp/issues/3837) — a clippy
+  leg whose target directory had just been warmed by `cargo test` finished in
+  under two seconds with a 72-byte log and exit 0, having checked nothing.
+  Cargo saw fresh fingerprints and did no work. That vacuous green is how a
+  red tip walked past a gate table.
+- [#3843](https://github.com/alphaonedev/ai-memory-mcp/issues/3843) — the
+  driver ran every derived integration binary under `--features sal`, but the
+  crate-gated `#![cfg(feature = "sal-postgres")]` files in `tests/` compile to
+  an **empty crate** without it — 132 such files at `2fe8b0ac5` where the
+  defect was found, 121 at `f4ab2eb6d`; a measurement is bound to its tree.
+  36 rows across six tables reported
+  `EXIT 0` on `running 0 tests`. The federation namespace-confinement pins on
+  Postgres had never been measured.
+
+#### The ordering rule
+
+**Lint before test, or give each leg its own target directory.** A `cargo
+clippy` leg that runs after `cargo test` in the same target directory may find
+every fingerprint fresh and do no work. Either order the legs so linting
+happens first, or isolate them with `CARGO_TARGET_DIR`. A leg that must run
+after a test run has to force the work — `cargo clean -p ai-memory` before the
+leg is the blunt, reliable form.
+
+#### What a leg must prove about itself
+
+Every gate leg asserts its own non-vacuity, and the assertion is part of the
+leg, not a thing a reviewer remembers to check:
+
+- A **clippy** leg whose log lacks `Checking ai-memory` did not check the
+  crate. Refuse it, whatever its exit status.
+- A **test** leg with no `test result:` line, or whose every `running N tests`
+  reads zero, ran nothing. Refuse it.
+- A **skip is not a pass.** A crate-gated Postgres binary with no
+  `AI_MEMORY_TEST_POSTGRES_URL` available compiles, runs, self-skips and exits
+  zero. It must report as skipped, never as green. A test row therefore has
+  **three** outcomes, not two.
+- Capture the exit status **first**, before any command substitution can
+  overwrite it.
+
+#### Measurements must be reproducible
+
+A figure that changes between runs is not a measurement, and it is the subtlest
+member of this family: a vacuous gate at least reports the same wrong thing
+every time, while a measurement contaminated by the clock reports a slightly
+different right-looking thing every time.
+
+A budget or ceiling pinned against rendered output containing **observed
+latencies, timestamps, or durations** varies run to run by the width of those
+values. Pin a fixed value in the fixture so the figure is the same integer on
+every run and every host, and say in a comment beside it why the value is
+fixed — the next person will want to make the test more realistic, and the
+comment is what stops them.
+
+#### Fixing a gate
+
+A gate fix must prove the gate still catches its target: replay the known-bad
+input and show it is refused, **and** pair that with an allowed-path control
+showing a healthy input still passes. A refusal pin with no allowed-path
+control pins nothing, and neither does a pin that cannot fail.
+
 
 ## 3. Security Review Standards
 

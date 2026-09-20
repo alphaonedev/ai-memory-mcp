@@ -142,6 +142,26 @@ const HISTORICAL_RECORD_CARVE_OUTS: &[(&str, &str)] = &[
          inherited; a shipped release's notes are not edited to match the \
          current tree (Conductor ruling, #3627 item 2)",
     ),
+    (
+        "docs/reviews/branch-hygiene-3x7-2026-09-18.md",
+        "branch-hygiene audit table; the token appears ONLY inside the name of the branch that performed the removal — a record of the removal is not a surface offering the provider",
+    ),
+    (
+        "docs/reviews/branch-hygiene-3x7-2026-09-18.tsv",
+        "the same hygiene table in data form, same branch-name occurrence; the two files must be carved together or the pin half-holds",
+    ),
+    (
+        "docs/reviews/issue-audit-3x7-r2-2026-09-18.md",
+        "quotes the #3627 operator directive verbatim — the mandate that the retired provider be removed from the product and project with zero references going forward; the document trips this gate by recording the rule that created it, and rewriting the quotation to drop the provider name would falsify the audit trail",
+    ),
+    (
+        "docs/reviews/opus5-1x3-baml-paw-20260919-evidence/assessor-A-licensing-supply-chain.md",
+        "third-party tool assessment (BAML/PAW); names the provider in evaluation prose about an EXTERNAL product, not an ai-memory surface",
+    ),
+    (
+        "docs/reviews/opus5-1x3-baml-paw-20260919-evidence/assessor-B-technical-fit.md",
+        "third-party tool assessment; the token appears inside a list of providers the EXTERNAL tool supports, alongside Gemini/Kimi/Qwen/Mistral/Groq — describing what that tool offers, never what this product offers",
+    ),
 ];
 
 /// File extensions worth scanning. Binary assets cannot carry a doc
