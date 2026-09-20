@@ -81,16 +81,36 @@
 # the run, and a revert can never clobber real edits to the file under test.
 # Evidence is written under .local-runs/.
 #
+# INSTRUMENT HONESTY (#3867 / #3868 — after the chain-9l CERT-RED read).
+#   * The guard child runs under `umask 022` (#3867). The harness inherits the
+#     caller's umask, and an ambient 0002 makes every tempdir the guard test
+#     creates group-writable, which the #3198 key-directory refusal correctly
+#     rejects — so BOTH legs of a row went RED for a reason that had nothing to
+#     do with the control. A CERT-RED that the instrument manufactured is not a
+#     finding; the harness now pins the umask the tests are specified for.
+#   * A broken leg whose output is a COMPILE ERROR is INCONCLUSIVE, never
+#     PROVEN (#3868). "broken -> non-zero" was read as "broken -> RED", but a
+#     mutation payload that does not type-check (the `Accept` unit-variant
+#     payload after #3164 gave the variant a `VerifyingKey`) also exits
+#     non-zero — before a single assertion runs. That proves the MUTATION is
+#     malformed, not that the CONTROL is load-bearing. `run_one` now inspects
+#     the broken leg's output for rustc/cargo compile failure, reports
+#     `[INCONCLUSIVE]`, skips the restored leg, and returns non-zero so the
+#     gate is RED until the row's mutation shape is repaired.
+#
 # USAGE:
 #   scripts/check-cert-removal-proof.sh                 # all controls
 #   scripts/check-cert-removal-proof.sh <control-name>  # one control
 #   scripts/check-cert-removal-proof.sh --list          # print the control map
 #   scripts/check-cert-removal-proof.sh --self-test     # prove the mutation
 #                                                        # shapes rewrite source
-#                                                        # as intended AND that
-#                                                        # an interrupted run
-#                                                        # leaves a clean tree
-#                                                        # (no cargo)
+#                                                        # as intended, that an
+#                                                        # interrupted run leaves
+#                                                        # a clean tree, that the
+#                                                        # guard child runs under
+#                                                        # umask 022, and that a
+#                                                        # non-compiling mutation
+#                                                        # is INCONCLUSIVE (no cargo)
 #   scripts/check-cert-removal-proof.sh --force-restore # recover a tree an
 #                                                        # aborted run left
 #                                                        # mutated (backs up
@@ -234,7 +254,14 @@ MAP=(
   # function to `return true` already bypasses this sub-check). The tofu unknown-peer
   # refusal (x_peer_id_not_in_allowlist) is a SEPARATE earlier envelope gate.
   "require_push_namespace_scope_enabled|return|return false;|src/federation/receive_auth.rs|federation_write_ns_scope_2447|enrolled_peer_without_declared_namespaces_denied_by_default_2447"
-  "authorize_remote_checkpoint_resolution|return|return CheckpointResolutionAuthz::Accept;|src/federation/receive_auth.rs|federation_1936_checkpoint_fed|strict_refuses_unenrolled_resolver"
+  # #3868 — `Accept` carries the enrolled `VerifyingKey` since #3164 (illegal
+  # states unrepresentable), so the former `return ...::Accept;` payload no
+  # longer type-checks and the row was "proven" by a compile error. The
+  # always-apply disposition an attacker wants is `AcceptUnverified` — both
+  # receive funnels apply it (it is the permissive-rollout verdict) and it
+  # needs no key — so the whole body is replaced with it (body shape), which
+  # makes the strict lane test's `checkpoints_applied == 0` assertion RED.
+  "authorize_remote_checkpoint_resolution|body|CheckpointResolutionAuthz::AcceptUnverified|src/federation/receive_auth.rs|federation_1936_checkpoint_fed|strict_refuses_unenrolled_resolver"
   # L4 (PR-3, forensic-audit-trail wave) — the fn that folds the per-row
   # audit-SIGNATURE coverage into is_clean. Neutralized to the always-clean
   # `Unenforced` verdict (body shape — a multi-branch verdict fn a single
@@ -621,9 +648,70 @@ RS
     rc=1
   fi
 
+  # ─── #3867 GUARD-CHILD UMASK ──────────────────────────────────────────────
+  # (6) Drive the real harness under an AMBIENT umask of 0002 (the #3862 host
+  # shape that redded chain 9l) and inspect the mode of the file the GUARD
+  # CHILD itself created: 0644 means the child ran under umask 022; the
+  # pre-#3867 harness inherits the ambient value and writes 0664.
+  rm -f "$sentinel"
+  local urc=0
+  ( umask 0002; CERT_PROOF_STUB_RUN="$sentinel" timeout 2 bash "$SELF" "$probe_ctl" ) \
+    >"$dir/umask.out" 2>&1 || urc=$?
+  local smode
+  smode="$(stat -c '%a' "$sentinel" 2>/dev/null || stat -f '%Lp' "$sentinel" 2>/dev/null || echo none)"
+  if [[ -f "$sentinel" && "$smode" == "644" ]] && _assert_interrupt_clean "guard-umask" "$urc"; then
+    echo "  [ok] guard-umask: under an ambient 0002 the guard child wrote mode 644 (umask 022 applied)"
+  else
+    echo "  [FAIL] guard-umask: guard-child artefact mode=$smode (want 644 under an ambient 0002)"
+    rc=1
+  fi
+
+  # ─── #3868 COMPILE ERROR IS INCONCLUSIVE, NEVER PROVEN ─────────────────────
+  # (7) The classifier, three shapes: a rustc/cargo compile failure is detected;
+  # a genuine assertion failure is not; a panic whose MESSAGE mentions the
+  # phrase mid-line is not (the anchor is load-bearing).
+  printf '%s\n' '   Compiling ai-memory v1.0.0' 'error[E0308]: mismatched types' \
+    'error: could not compile `ai-memory` (lib) due to 1 previous error' >"$dir/ce-compile.out"
+  printf '%s\n' 'running 1 test' "thread 'strict' panicked at tests/x.rs:1:1:" \
+    'assertion `left == right` failed' 'test result: FAILED. 0 passed; 1 failed' >"$dir/ce-assert.out"
+  printf '%s\n' 'running 1 test' "thread 'strict' panicked at tests/x.rs:1:1:" \
+    'resp said: error: could not compile the manifest, error[E0308] in message text' \
+    'test result: FAILED. 0 passed; 1 failed' >"$dir/ce-midline.out"
+  if guard_output_is_compile_failure "$dir/ce-compile.out" \
+     && ! guard_output_is_compile_failure "$dir/ce-assert.out" \
+     && ! guard_output_is_compile_failure "$dir/ce-midline.out"; then
+    echo "  [ok] compile-failure classifier: build failure detected; assertion failure and mid-line mention are not"
+  else
+    echo "  [FAIL] compile-failure classifier misclassified one of the three fixture shapes"; rc=1
+  fi
+
+  # (8) The VERDICT: drive the real harness with a stub whose broken leg is a
+  # compile failure. The row must read [INCONCLUSIVE], never [PROVEN] and never
+  # [CERT-RED] (that label means the control was exercised and found not
+  # load-bearing), the guard must have run EXACTLY ONCE (the restored leg is
+  # skipped — its verdict cannot rescue a proof that never started), the exit
+  # must be non-zero, and src/ must be clean afterwards.
+  rm -f "$sentinel"
+  local crc=0
+  CERT_PROOF_STUB_RUN="$sentinel" CERT_PROOF_STUB_COMPILE_ERROR=1 bash "$SELF" "$probe_ctl" \
+    >"$dir/compile-error.out" 2>&1 || crc=$?
+  local runs
+  runs="$(grep -c 'guard-run' "$sentinel" 2>/dev/null || echo 0)"
+  if grep -q '\[INCONCLUSIVE\]' "$dir/compile-error.out" \
+     && ! grep -q '\[PROVEN\]' "$dir/compile-error.out" \
+     && ! grep -q '\[CERT-RED\]' "$dir/compile-error.out" \
+     && [[ "$runs" == "1" ]] \
+     && _assert_interrupt_clean "compile-error" "$crc"; then
+    echo "  [ok] compile-error: broken leg that did not compile → [INCONCLUSIVE], guard ran once, rc=$crc, src/ clean"
+  else
+    echo "  [FAIL] compile-error: verdict/run-count wrong (guard runs=$runs, rc=$crc) — see $dir/compile-error.out"
+    rc=1
+  fi
+
   echo
   if [[ $rc -eq 0 ]]; then
-    echo "self-test: PASS — three mutation shapes sound; interrupted runs leave a clean tree"
+    echo "self-test: PASS — three mutation shapes sound; interrupted runs leave a clean tree;"
+    echo "           guard child runs under umask 022; a non-compiling mutation is INCONCLUSIVE"
   else
     echo "self-test: FAIL"
   fi
@@ -645,13 +733,34 @@ RS
 # and the restored leg are non-zero and run_one reports CERT-RED (fail closed).
 run_guard_test() {
   local crate="$1" fn="$2" out="$3"
+  # #3867 — the guard child runs under `umask 022`, INSIDE the subshell so the
+  # harness's own umask (and the caller's) is untouched. The lane tests create
+  # key directories and sqlite tempdirs whose modes the substrate checks
+  # (#3198); an inherited 0002 makes them group-writable and reds BOTH legs
+  # for a reason unrelated to the control under proof.
   if [[ -n "${CERT_PROOF_STUB_RUN:-}" ]]; then
     # `exec` so the backgrounded pid IS the sleep — kill_guard_child then reaps
-    # it directly instead of orphaning it under a dying subshell.
-    ( : >"$CERT_PROOF_STUB_RUN"; exec sleep 300 ) >"$out" 2>&1 &
+    # it directly instead of orphaning it under a dying subshell. The sentinel
+    # is APPENDED (one line per guard run) so a self-test leg can count how many
+    # times the guard was invoked. CERT_PROOF_STUB_COMPILE_ERROR=1 makes the
+    # stub emit a canned rustc/cargo compile failure and exit 101 (cargo's own
+    # code for that) instead of sleeping — the #3868 self-test shape. The stub
+    # still never returns 0.
+    ( umask 022
+      echo "guard-run" >>"$CERT_PROOF_STUB_RUN"
+      if [[ -n "${CERT_PROOF_STUB_COMPILE_ERROR:-}" ]]; then
+        printf '%s\n' \
+          '   Compiling ai-memory v1.0.0 (stub)' \
+          'error[E0308]: mismatched types' \
+          '  --> src/stub.rs:1:1' \
+          'error: could not compile `ai-memory` (lib) due to 1 previous error'
+        exit 101
+      fi
+      exec sleep 300 ) >"$out" 2>&1 &
   else
-    AI_MEMORY_NO_CONFIG=1 cargo test --features sal --test "$crate" "$fn" \
-      -- --exact --nocapture >"$out" 2>&1 &
+    ( umask 022
+      AI_MEMORY_NO_CONFIG=1 exec cargo test --features sal --test "$crate" "$fn" \
+        -- --exact --nocapture ) >"$out" 2>&1 &
   fi
   GUARD_CHILD_PID=$!
   local rc=0
@@ -660,6 +769,14 @@ run_guard_test() {
   # A stubbed run must NEVER read as a green guard test (fail closed).
   [[ -n "${CERT_PROOF_STUB_RUN:-}" && $rc -eq 0 ]] && rc=3
   return $rc
+}
+
+# #3868 — did the guard leg fail to COMPILE rather than fail an assertion?
+# Anchored at line start on rustc's `error[Exxxx]:` and cargo's
+# `error: could not compile` lines, so a test panic whose MESSAGE happens to
+# mention either phrase mid-line cannot be mistaken for a build failure.
+guard_output_is_compile_failure() {
+  grep -qE '^(error\[E[0-9]+\]|error: could not compile )' "$1"
 }
 
 run_one() {
@@ -705,6 +822,19 @@ run_one() {
     git diff HEAD -- "$tf" >&2 || true
     restore_mutations
     return 3
+  fi
+
+  # 3b. (#3868) a broken leg that did not COMPILE proves nothing about the
+  #     control — rustc refused the MUTATION before any assertion ran. Report
+  #     it as the instrument's failure, skip the restored leg (its verdict
+  #     cannot rescue a proof that never started), and return non-zero so the
+  #     gate stays RED until the row's mutation shape is repaired.
+  if guard_output_is_compile_failure "$EVIDENCE_DIR/removal-${ctl}-broken.out"; then
+    echo "  [INCONCLUSIVE] the MUTATED tree did not compile (rc=$broken_rc) — a compile error is"
+    echo "                 the instrument failing, not the control refusing; this row is NOT proven."
+    echo "                 Repair the row's mutation shape/payload (see the header) and re-run."
+    echo "                 evidence: $EVIDENCE_DIR/removal-${ctl}-broken.out"
+    return 1
   fi
 
   # 4. run again — MUST pass (GREEN) with the control restored
