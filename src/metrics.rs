@@ -39,6 +39,23 @@ use prometheus::{
 // measurable hot-path cost.
 // =====================================================================
 
+static RECORD_STOP_GATE_INDETERMINATE_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// #3877 — count one record-stop gate FAIL-CLOSED refusal: the audit chain could
+/// not be read, so a mutating write was refused rather than proceeding (vote
+/// `4d3ea1c5` = B). Bumped on the cold error branch only, so there is no hot-path
+/// cost. Process-local (resets on restart, like the eviction counters); the loud
+/// per-occurrence signal is the paired `signed_events`-target WARN.
+pub fn inc_record_stop_gate_indeterminate() {
+    RECORD_STOP_GATE_INDETERMINATE_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Cumulative record-stop gate fail-closed refusals since process start.
+#[must_use]
+pub fn record_stop_gate_indeterminate_total() -> u64 {
+    RECORD_STOP_GATE_INDETERMINATE_TOTAL.load(Ordering::Relaxed)
+}
+
 static HNSW_EVICTIONS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static HNSW_LAST_EVICTION_AT_NANOS: AtomicU64 = AtomicU64::new(0);
 

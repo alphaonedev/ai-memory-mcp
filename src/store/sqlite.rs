@@ -82,7 +82,16 @@ impl SqliteStore {
         // #1955 R45 — seed the per-DB record-stop flag from the audit
         // chain so a stop persisted before this open survives a restart.
         // A read hiccup is non-fatal (leaves the plane RUNNING).
-        let _ = crate::store::record_stop::seed_from_conn(&conn);
+        if let Err(e) = crate::store::record_stop::seed_from_conn(&conn) {
+            // #3877 — do not swallow the open-seed read failure silently. The
+            // per-write gate re-probes FAIL-CLOSED (de-latch), so this is not fatal
+            // to boot, but the operator must see that the persisted state could not
+            // be derived at open.
+            tracing::warn!(
+                target: crate::signed_events::SIGNED_EVENTS_TRACE_TARGET,
+                "record-stop open-seed read failed (the per-write gate re-probes fail-closed): {e}"
+            );
+        }
         // #1955 R45 — capture the connection's OWN resolved path as the
         // record-stop registry key so the SAL gate keys the SAME entry the
         // actuator/db-gate/status/seed use (see the `record_stop_key` field
@@ -125,7 +134,16 @@ impl SqliteStore {
     pub fn open_existing_read_only(path: impl Into<PathBuf>) -> StoreResult<Self> {
         let path = path.into();
         let conn = db::open_existing_read_only(&path).map_err(box_err)?;
-        let _ = crate::store::record_stop::seed_from_conn(&conn);
+        if let Err(e) = crate::store::record_stop::seed_from_conn(&conn) {
+            // #3877 — do not swallow the open-seed read failure silently. The
+            // per-write gate re-probes FAIL-CLOSED (de-latch), so this is not fatal
+            // to boot, but the operator must see that the persisted state could not
+            // be derived at open.
+            tracing::warn!(
+                target: crate::signed_events::SIGNED_EVENTS_TRACE_TARGET,
+                "record-stop open-seed read failed (the per-write gate re-probes fail-closed): {e}"
+            );
+        }
         let record_stop_key = crate::storage::record_stop::conn_key(&conn);
         let state = Arc::new(Mutex::new(conn));
         Ok(Self {
