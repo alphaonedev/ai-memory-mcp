@@ -139,9 +139,9 @@
   },
   {
     "path": "src/cli/wake_listen.rs",
-    "role": "Operator-resolved caller catch_up_read -> handle_inbox; metadata rendering; operator --exec via audited_tokio_command.",
+    "role": "Operator-resolved caller catch_up_read -> handle_inbox; refuses a Postgres store before opening the local sidecar (#3730, control-plane guard ahead of the content path); metadata rendering; operator --exec via audited_tokio_command.",
     "mode": "rust-production-tokens",
-    "sha256": "dbbf189d791c1ad8cf2bd89905d16f0a3c1730efa97aa35120fab1d4c4c025a6"
+    "sha256": "aa0ed659de0325d126e704b21390831f851bd338eaa6641a38b9591102ea51b2"
   },
   {
     "path": "src/inbox_wake.rs",
