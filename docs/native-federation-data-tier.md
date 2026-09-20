@@ -41,9 +41,9 @@ timeout 4000 python3 scripts/native/federation.py --require-native
 On shared f1, first run `timeout 1300 python3 scripts/native/resource_gate.py`;
 it backs off five minutes if swap exceeds4GiB, rustc count exceeds8, or free
 space is below80GiB on root /120GiB on f1dev. Serialize this with other local
-heavy work. The manual `Native federation data tier (f1)` workflow uses the
+heavy work. The `Native federation data tier (f1)` workflow uses the
 macos-fed runner, isolated Astra roots and the machine's existing environment
-file. Its concurrency group serializes manual native runs; it does not replace
+file. Its concurrency group serializes native runs; it does not replace
 operator scheduling against other workflows or local builds.
 The gate samples at most four times, backing off 300 seconds on each rejected
 sample, then exits nonzero without launching certification. Unknown swap output
@@ -57,11 +57,17 @@ when checkout fails. It validates numeric identifiers, anchors directory access
 with file descriptors, refuses symlinks and special files, and limits traversal
 to 100,000 visits, depth 64 and 60 seconds. Refusal fails the step and preserves
 any unremoved files for operator inspection; it never expands a glob or removes
-a parent. The shared `targets/e5-native-ci` Cargo cache is deliberately retained.
+a parent. The shared `targets/e5-native` Cargo cache is deliberately retained.
+This is the existing warm E5 target, reused to avoid duplicating dependency
+compilation and disk usage. Local E5 builds and native CI runs must be scheduled
+serially; the workflow concurrency group only serializes workflow runs.
 Harness tests extract and execute this exact workflow body against disposable
 fixtures, including sibling preservation, symlink attacks and a work-budget
 refusal. Job termination or host loss before the cleanup step can still leave
 the precisely named per-run directories; `if: always()` cannot survive host loss.
+The 110-minute job budget exceeds the sum of bounded admission, checkout,
+self-tests, certification, five-minute upload and cleanup steps, reserving room
+for cleanup after an ordinary command timeout.
 
 An unset/unreachable cluster emits **`skip: native-federation`** and exits77.
 `--require-native` turns that honest skip into exit1. Configuration, version,
@@ -81,8 +87,21 @@ reject it. Successful output requires all listed tests, at least the committed
 Existing GitHub cert and postgres-ignored workflows already use Linux native
 18.6/1.8.0/0.8.6 infrastructure. The PG16/AGE1.6 container is the separate
 coverage recipe; calling all GitHub coverage AGE1.8-certified is incorrect.
-The manual f1 workflow makes the available native machine reproducible without
-adding another automatic PR matrix to the shared runner queue.
+The f1 workflow supports manual dispatch and path-scoped pull requests to
+`next/v1.1.0` that change this native harness/workflow or its completeness guard
+and floor. Its job requires a same-repository PR head before accessing the
+self-hosted runner or sourcing the machine environment. Fork PRs skip the job;
+that skip is not a native certificate.
+Workflow edits themselves remain trusted code: a PR can change this condition,
+so repository workflow approval controls must require operator review for
+external contributors before self-hosted execution. The condition is not a
+sandbox against an approved malicious workflow rewrite.
+The PR run certifies GitHub's generated
+merge commit and records that source SHA in evidence. Path scoping avoids a
+native job for unrelated PRs while providing premerge evidence for this tier.
+The sanitized artifact also records `runner_name`, runtime hostname and source
+SHA in `runner.json`, allowing evidence to identify the actual executing host
+rather than inferring it from the runner label alone.
 
 This certifies the **data tier**, including real router/store operations and
 synthetic vector ingestion. Peer acknowledgements are loopback fixtures;

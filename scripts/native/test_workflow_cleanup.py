@@ -30,7 +30,7 @@ class WorkflowCleanupTests(unittest.TestCase):
             (run / 'nested').mkdir(parents=True)
             (run / 'nested' / 'evidence').write_text('owned')
             (self.root / parent / 'e5-ci-123-2').mkdir()
-        (self.root / 'targets' / 'e5-native-ci').mkdir()
+        (self.root / 'targets' / 'e5-native').mkdir()
 
     def run_cleanup(self, run_id='123', attempt='1'):
         self.cleanup['clean_run'](str(self.root), run_id, attempt)
@@ -40,7 +40,7 @@ class WorkflowCleanupTests(unittest.TestCase):
         for parent in ('wt', 'tmp'):
             self.assertFalse((self.root / parent / 'e5-ci-123-1').exists())
             self.assertTrue((self.root / parent / 'e5-ci-123-2').is_dir())
-        self.assertTrue((self.root / 'targets' / 'e5-native-ci').is_dir())
+        self.assertTrue((self.root / 'targets' / 'e5-native').is_dir())
         self.run_cleanup()  # Partial setup / already removed runs are harmless.
 
     def test_bad_identifiers_cannot_select_parents_or_siblings(self):
