@@ -12109,10 +12109,11 @@ impl PostgresStore {
                     target_id,
                     relation,
                     valid_from: valid_from.to_rfc3339(),
-                    // #3809 — match the canonical projected UTC stamp, including
-                    // fractional precision and None for a live edge.
-                    valid_until: valid_until
-                        .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)),
+                    // #3809 — share write-side canonicalization only for present stamps.
+                    // The helper maps None to now; a live edge must remain None.
+                    valid_until: valid_until.map(|t| {
+                        crate::storage::canonicalize_valid_until_stamp(Some(&t.to_rfc3339()))
+                    }),
                     observed_by,
                     title,
                     target_namespace,
