@@ -104,9 +104,9 @@ fn doctor_config_health_reports_compiled_defaults_when_config_absent_3885() {
 /// list, so the `.map()` produces `[]` and the field-projection lines never run.
 /// Here we write a one-hook `hooks.toml` at the default path (via
 /// `XDG_CONFIG_HOME`), so `doctor --hooks --json` loads it and emits the
-/// executor row. The CONTRACT (per the run_hooks doc: operators sanity-check
+/// executor row. The CONTRACT (per the `run_hooks` doc: operators sanity-check
 /// their `hooks.toml` through this output) is that the emitted JSON carries the
-/// hook's own event / mode / namespace / priority / timeout_ms / enabled.
+/// hook's own event / mode / namespace / priority / `timeout_ms` / enabled.
 // `config_dir()` honours `XDG_CONFIG_HOME` only on Linux; on macOS it resolves
 // ~/Library and would not find this hooks.toml. The coverage sweep runs on Linux.
 #[cfg(target_os = "linux")]
