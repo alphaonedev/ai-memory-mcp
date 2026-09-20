@@ -77,7 +77,7 @@ name: "Certified Postgres + AGE + pgvector tier (#2548)"
 
 on:
   pull_request:
-    branches: ["release/**"]
+    branches: ["release/**", "next/v1.1.0"]
   push:
     branches: ["release/**"]
   workflow_dispatch:
