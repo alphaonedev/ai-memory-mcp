@@ -293,6 +293,18 @@ async fn restore_age_extension(url: &str) -> Result<(), Box<dyn std::error::Erro
     .fetch_one(&mut *conn)
     .await?;
     if !graph_exists {
+        // #3881 — `DROP EXTENSION age CASCADE` removes the extension's
+        // MEMBERS (`ag_catalog`, its functions, the `ag_graph` registry),
+        // but a graph's data lives in a PLAIN SQL SCHEMA named after the
+        // graph, created by `create_graph` and NOT an extension member, so
+        // it survives the drop as an orphan. With the registry row gone the
+        // schema is garbage by definition, and `create_graph`'s first step
+        // (`CREATE SCHEMA`) fails on it with 42P06 "schema already exists"
+        // — the Per-Module Coverage red on a80b80af8. Drop the orphan first;
+        // this also heals a database an earlier failed run left this way.
+        sqlx::query(&format!("DROP SCHEMA IF EXISTS \"{AGE_GRAPH}\" CASCADE"))
+            .execute(&mut *conn)
+            .await?;
         sqlx::query(&format!("SELECT create_graph('{AGE_GRAPH}')"))
             .execute(&mut *conn)
             .await?;
