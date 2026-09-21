@@ -206,7 +206,7 @@ every transit surface consults it.
 | outbound federation peers (`--quorum-peers`, `sync-daemon --peers`) | `tls::validate_peer_url_scheme` | every `http://` peer is REFUSED, loopback included |
 | webhook targets | `subscriptions::validate_url` (create AND dispatch) | every `http://` target is REFUSED, loopback included; https only — a receiver behind a private PKI is trusted via `[subscriptions] ca_cert` (a PEM the dispatcher adds to the public roots; unreadable/unparseable refuses boot) |
 | PostgreSQL store DSN | `PostgresStore` connect funnel | a DSN that does not pin `sslmode=verify-full` (last `sslmode` wins) is REFUSED before a socket opens |
-| MCP → daemon forward URL (`mcp_federation_forward_url`) | boot (`transit_encryption::enforce_config_urls`) | an `http://` URL REFUSES boot |
+| MCP → daemon forward URL (`mcp_federation_forward_url`) | boot (`transit_encryption::enforce_config_urls`) | any URL that does not PARSE to `https://` REFUSES boot — decided by parsing (the grammar reqwest applies), not a prefix test, so the `http:/peer`, `http:peer` and `http:\\peer` spellings that normalise to cleartext `http://` are refused (#3863), and a non-http scheme or an unparseable value is refused at boot by name instead of failing on the first write |
 
 **One grammar.** `AI_MEMORY_REQUIRE_TLS` is now a floor: unset and every
 canonical truthy token (`1`/`true`/`yes`/`on`, `security_profile::is_truthy`)

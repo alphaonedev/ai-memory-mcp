@@ -219,14 +219,79 @@ pub fn plaintext_url_refusal(what: &str, url: &str) -> String {
     )
 }
 
-/// Whether a URL names the plaintext `http` scheme (case-insensitive,
-/// trimmed). A URL with no scheme is not "plaintext" by this predicate —
-/// callers refuse it on their own terms.
+/// How a config-carried outbound URL classifies under the mandate.
+///
+/// Decided by PARSING the value with the WHATWG grammar reqwest applies at
+/// request time (the `url` crate), never by a byte-prefix test. #3863: the
+/// former 7-byte `http://` prefix test read `http:/peer:9077`,
+/// `http:peer:9077` and `http:\\evil/x` as "not plaintext", while the parser
+/// normalises every one of them to `http://…` — a cleartext request the gate
+/// waved through. The non-`http` schemes (`httpx://`, `ws://`, a scheme-less
+/// `peer.example:9077`) were never that hole: reqwest refuses them at request
+/// time, so they were fail-closed all along; they are refused at BOOT here so
+/// the refusal names its cause instead of surfacing as an opaque transport
+/// error on the first write (the [`crate::tls::validate_peer_url_scheme`]
+/// disposition, copied).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OutboundUrlClass {
+    /// Parses to `https` — the only accepted class.
+    Https,
+    /// Parses to the plaintext `http` scheme, whatever bytes were typed.
+    PlaintextHttp,
+    /// Parses, but to a scheme that is neither (`ws`, `httpx`, a scheme-less
+    /// host the parser reads as its own scheme, …).
+    OtherScheme(String),
+    /// Does not parse as an absolute URL at all (empty, a bare path, …).
+    Unparseable,
+}
+
+/// Classify `raw` (trimmed) — see [`OutboundUrlClass`].
+#[must_use]
+pub fn classify_outbound_url(raw: &str) -> OutboundUrlClass {
+    match reqwest::Url::parse(raw.trim()) {
+        Ok(parsed) => match parsed.scheme() {
+            "https" => OutboundUrlClass::Https,
+            "http" => OutboundUrlClass::PlaintextHttp,
+            other => OutboundUrlClass::OtherScheme(other.to_string()),
+        },
+        Err(_) => OutboundUrlClass::Unparseable,
+    }
+}
+
+/// Refuse a config-carried outbound URL unless it parses to `https`
+/// (`what` names the surface, as in [`plaintext_url_refusal`]). Parse, then
+/// allowlist — the [`crate::tls::validate_peer_url_scheme`] shape.
+///
+/// # Errors
+/// The operator-facing refusal (origin only, never path/query/userinfo)
+/// when `raw` parses to plaintext `http`, to any other scheme, or not at all.
+/// (anyhow, not the legacy unit-over-String shape the QUAL-7 ratchet
+/// counts — `tests/qual_6_7_legacy_error_type_ceiling.rs`.)
+pub fn validate_outbound_url_scheme(what: &str, raw: &str) -> Result<()> {
+    match classify_outbound_url(raw) {
+        OutboundUrlClass::Https => Ok(()),
+        OutboundUrlClass::PlaintextHttp => bail!(plaintext_url_refusal(what, raw)),
+        OutboundUrlClass::OtherScheme(scheme) => bail!(
+            "{ISSUE_TAG}: refusing {what} {}: unsupported scheme {scheme:?} ({MANDATE}). \
+             Fix: {REMEDY_USE_HTTPS}.",
+            url_origin_for_refusal(raw)
+        ),
+        OutboundUrlClass::Unparseable => bail!(
+            "{ISSUE_TAG}: refusing {what} {}: not a valid absolute URL ({MANDATE}). \
+             Fix: {REMEDY_USE_HTTPS}.",
+            url_origin_for_refusal(raw)
+        ),
+    }
+}
+
+/// Whether a URL PARSES to the plaintext `http` scheme (trimmed;
+/// case-insensitive by the grammar). A URL with no scheme is not "plaintext"
+/// by this predicate — callers refuse it on their own terms. #3863: this is
+/// the parse-based reading, so the `http:/…`, `http:…` and `http:\\…`
+/// spellings that normalise to `http://` count as plaintext too.
 #[must_use]
 pub fn url_is_plaintext_http(url: &str) -> bool {
-    url.trim()
-        .get(..7)
-        .is_some_and(|p| p.eq_ignore_ascii_case("http://"))
+    classify_outbound_url(url) == OutboundUrlClass::PlaintextHttp
 }
 
 /// Whether a PostgreSQL DSN pins `sslmode=verify-full`. libpq honours the
@@ -296,19 +361,16 @@ pub fn enforce_process_floor() -> Result<()> {
     enforce_no_downgrade_paths()
 }
 
-/// Config-carried outbound URLs that must not be plaintext. Today: the MCP →
+/// Config-carried outbound URLs that must be `https`. Today: the MCP →
 /// daemon forward URL (every MCP write fans out through it). Read-only.
+/// Parse-then-allowlist ([`validate_outbound_url_scheme`], #3863) — a
+/// prefix test is not a gate.
 ///
 /// # Errors
-/// `mcp_federation_forward_url` names the plaintext `http` scheme.
+/// `mcp_federation_forward_url` does not parse to the `https` scheme.
 pub fn enforce_config_urls(app_config: &crate::config::AppConfig) -> Result<()> {
-    if let Some(url) = app_config.mcp_federation_forward_url.as_deref()
-        && url_is_plaintext_http(url)
-    {
-        bail!(plaintext_url_refusal(
-            "MCP forward URL (mcp_federation_forward_url)",
-            url
-        ));
+    if let Some(url) = app_config.mcp_federation_forward_url.as_deref() {
+        validate_outbound_url_scheme("MCP forward URL (mcp_federation_forward_url)", url)?;
     }
     Ok(())
 }
@@ -387,6 +449,122 @@ mod tests {
         assert!(!url_is_plaintext_http("https://127.0.0.1:9077"));
         assert!(!url_is_plaintext_http("httpx://h"));
         assert!(!url_is_plaintext_http("peer.example:9077"));
+    }
+
+    /// #3863 — the three `http:` spellings the 7-byte prefix test waved
+    /// through. Every one of them PARSES (WHATWG, the grammar reqwest uses at
+    /// request time) to a cleartext `http://host` request, so each must be
+    /// refused by the gate and classified as plaintext by the predicate.
+    #[test]
+    fn forward_url_http_variants_are_refused_3863() {
+        for raw in ["http:/peer:9077", "http:peer:9077", r"http:\\evil/x"] {
+            // The premise, pinned: the parser normalises the spelling to http.
+            let parsed = reqwest::Url::parse(raw).expect(raw);
+            assert_eq!(parsed.scheme(), "http", "{raw:?}");
+            assert!(parsed.host_str().is_some(), "{raw:?} resolves to a host");
+            assert!(
+                url_is_plaintext_http(raw),
+                "{raw:?} parses to http:// and must classify as plaintext"
+            );
+            let cfg = crate::config::AppConfig {
+                mcp_federation_forward_url: Some(raw.to_string()),
+                ..Default::default()
+            };
+            let err = enforce_config_urls(&cfg)
+                .expect_err("a forward URL that parses to http:// must refuse boot");
+            let msg = err.to_string();
+            assert!(msg.contains(ISSUE_TAG), "{raw:?}: {msg}");
+            assert!(msg.contains(REMEDY_USE_HTTPS), "{raw:?}: {msg}");
+            assert!(
+                !msg.contains("evil/x"),
+                "origin only, never the path: {msg}"
+            );
+        }
+    }
+
+    /// #3863 — the non-`http` schemes were never the hole (reqwest refuses
+    /// them at request time, fail-closed); pin that they STAY refused — now at
+    /// boot, by name — so a future relaxation cannot open them. `https` is the
+    /// one accepted class; unset stays accepted.
+    #[test]
+    fn forward_url_non_http_schemes_stay_refused_3863() {
+        for raw in [
+            "httpx://h",
+            "ws://h:9077",
+            "peer.example:9077",
+            "",
+            "   ",
+            "/just/a/path",
+        ] {
+            let cfg = crate::config::AppConfig {
+                mcp_federation_forward_url: Some(raw.to_string()),
+                ..Default::default()
+            };
+            assert!(
+                enforce_config_urls(&cfg).is_err(),
+                "{raw:?} is not https and must refuse boot"
+            );
+        }
+        for ok in ["https://peer:9077", "  HTTPS://Peer:9077/api?x=1  "] {
+            let cfg = crate::config::AppConfig {
+                mcp_federation_forward_url: Some(ok.to_string()),
+                ..Default::default()
+            };
+            assert!(enforce_config_urls(&cfg).is_ok(), "{ok:?} is https");
+        }
+        assert!(enforce_config_urls(&crate::config::AppConfig::default()).is_ok());
+    }
+
+    /// #3863 — the classifier the gate and doctor share: the `http:`
+    /// spellings are PlaintextHttp, `https` is the one accepted class, the
+    /// non-http schemes name themselves, and nothing else parses.
+    #[test]
+    fn outbound_url_classifier_3863() {
+        use OutboundUrlClass::{Https, OtherScheme, PlaintextHttp, Unparseable};
+        for raw in [
+            "http://peer:9077",
+            "  HTTP://localhost/x",
+            "http:/peer:9077",
+            "http:peer:9077",
+            r"http:\\evil/x",
+            r"http:\evil/x",
+        ] {
+            assert_eq!(classify_outbound_url(raw), PlaintextHttp, "{raw:?}");
+        }
+        assert_eq!(classify_outbound_url("https://peer:9077"), Https);
+        assert_eq!(classify_outbound_url(" HTTPS://Peer/x "), Https);
+        assert_eq!(
+            classify_outbound_url("httpx://h"),
+            OtherScheme("httpx".to_string())
+        );
+        assert_eq!(
+            classify_outbound_url("ws://h"),
+            OtherScheme("ws".to_string())
+        );
+        assert_eq!(
+            classify_outbound_url("peer.example:9077"),
+            OtherScheme("peer.example".to_string())
+        );
+        for raw in ["", "   ", "/just/a/path", "peer:9077"] {
+            // `peer:9077` parses as scheme `peer` — OtherScheme — so it is
+            // not in this list; the bare forms do not parse at all.
+            assert!(
+                matches!(classify_outbound_url(raw), Unparseable | OtherScheme(_)),
+                "{raw:?} must never be Https or PlaintextHttp: {:?}",
+                classify_outbound_url(raw)
+            );
+        }
+        // The validator's three refusal arms each name the tag and the fix.
+        for raw in ["http:/peer:9077", "ws://h", ""] {
+            let msg = validate_outbound_url_scheme("MCP forward URL", raw)
+                .expect_err(raw)
+                .to_string();
+            assert!(
+                msg.contains(ISSUE_TAG) && msg.contains(REMEDY_USE_HTTPS),
+                "{msg}"
+            );
+        }
+        assert!(validate_outbound_url_scheme("MCP forward URL", "https://h").is_ok());
     }
 
     /// #3709 item 5 — every refusal prints the command that resolves it.
