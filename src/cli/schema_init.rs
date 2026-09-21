@@ -1057,6 +1057,15 @@ mod tests {
     // found it.
     // ----------------------------------------------------------------
 
+    /// #3888 — the production teardown budget (see the `Drop` impl for the
+    /// full derivation: this must exceed a healthy restore yet stay well under
+    /// the ~2400s migration-lock budget that the store's own bootstrap can
+    /// inherit). The real teardown uses this; the RED-first tarpit test below
+    /// overrides it per-instance so it can drive the bound deterministically
+    /// and fast, without waiting out the production value.
+    #[cfg(feature = "sal-postgres")]
+    const RESTORE_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
     /// Drop-time worker that restores the shared `public.memories`
     /// embedding column back to the default 384 dim, regardless of
     /// whether the owning test completed normally or panicked
@@ -1064,27 +1073,68 @@ mod tests {
     #[cfg(feature = "sal-postgres")]
     struct RestoreDimOnDrop {
         url: String,
+        /// Wall-clock bound on the WHOLE Drop-time restore (#3888). Defaults to
+        /// [`RESTORE_BUDGET`] at the real construction sites.
+        budget: std::time::Duration,
     }
 
     #[cfg(feature = "sal-postgres")]
     impl Drop for RestoreDimOnDrop {
         fn drop(&mut self) {
             let url = self.url.clone();
+            let budget = self.budget;
             // `drop` is sync; the restore needs an async connection +
             // migration call. Spawn a thread with its own current-thread
             // runtime and join it so the restore completes before the
             // process moves on to the next test (mirrors
             // `SchemaCleanupGuard::drop` in
             // `tests/common/postgres_env.rs`).
+            //
+            // #3888 — the restore is bounded HERE, at the teardown. It was
+            // never "unbounded": the connect is already bounded by the pool
+            // `acquire_timeout` (30s), and an ordinary DDL lock wait is bounded
+            // by the `after_connect` envelope (`lock_timeout` 5s). The long
+            // wait is `migrate_embedding_dim`'s BOOTSTRAP taking the migration
+            // ADVISORY lock on a DEDICATED connection whose timeouts are
+            // CLEARED by `prepare_migration_lock_connection` (SQL_CLEAR_*),
+            // then polling `pg_try_advisory_lock` for up to
+            // `MIGRATION_LOCK_WAIT_TIMEOUT_MS` = 2 * `INDEX_BUILD_TIMEOUT_MS`
+            // = 1800s, with DDL statements under `DDL_STATEMENT_TIMEOUT_MS`
+            // = 600s. So a teardown whose bootstrap finds that lock held parks
+            // up to ~1800 + 600 = ~2400s — i.e. this test teardown INHERITS a
+            // 30-minute production index-build budget that EXCEEDS the #1492 CI
+            // watchdog (~2100s), which then reaps the whole binary AFTER every
+            // test already PASSED (no summary line, no process exit). The
+            // `join()` below blocks on that whole wait. Captured live on two
+            // independent runners: State S, this worker parked in `ep_poll`,
+            // the joiner in `futex_do_wait`, ZERO `anon_pipe_write` (a leaked
+            // runtime, not stdout backpressure). No PER-PHASE timeout can reach
+            // a budget that lives inside the store's own bootstrap, so the ONLY
+            // correct shape is a `tokio::time::timeout` around the WHOLE
+            // restore future — it bounds every phase (connect, TLS,
+            // `after_connect`, and the bootstrap advisory-lock poll + its DDL);
+            // the `enable_all()` current-thread runtime drives its own timer,
+            // so the bound fires even while the only pending future is parked
+            // on a socket or a lock. The restore is a best-effort tidy of the
+            // SHARED test schema — on timeout it is SKIPPED (a named,
+            // non-hanging failure), which can leave the column at 768 and red a
+            // later pg test that assumes 384; 30s trades that rare downstream
+            // red for the guarantee that matters (the join always returns, the
+            // binary always exits), and is generous headroom over a healthy
+            // restore while still ~70x under the migration-lock budget above.
+            // `budget` is `self.budget`, which the real teardown sets to
+            // `RESTORE_BUDGET` (30s) and the RED-first test overrides.
             let join = std::thread::spawn(move || {
                 let rt = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
                     .expect("build drop-time tokio runtime");
                 rt.block_on(async move {
-                    let store =
-                        match crate::store::postgres::PostgresStore::connect_with_dim(&url, 768)
-                            .await
+                    let restore = async {
+                        let store = match crate::store::postgres::PostgresStore::connect_with_dim(
+                            &url, 768,
+                        )
+                        .await
                         {
                             Ok(s) => s,
                             Err(e) => {
@@ -1094,14 +1144,20 @@ mod tests {
                                 return;
                             }
                         };
-                    // force=true: this is a shared TEST database and the
-                    // teardown's sole purpose is leaving the schema as
-                    // this test found it, so any 768-dim embeddings this
-                    // test itself produced are fine to NULL on the way
-                    // back down to 384.
-                    if let Err(e) = store.migrate_embedding_dim(384, true).await {
+                        // force=true: this is a shared TEST database and the
+                        // teardown's sole purpose is leaving the schema as
+                        // this test found it, so any 768-dim embeddings this
+                        // test itself produced are fine to NULL on the way
+                        // back down to 384.
+                        if let Err(e) = store.migrate_embedding_dim(384, true).await {
+                            eprintln!(
+                                "schema_init_postgres_embedding_dim_conversion: restore-to-384 teardown failed: {e}"
+                            );
+                        }
+                    };
+                    if tokio::time::timeout(budget, restore).await.is_err() {
                         eprintln!(
-                            "schema_init_postgres_embedding_dim_conversion: restore-to-384 teardown failed: {e}"
+                            "schema_init_postgres_embedding_dim_conversion: restore-to-384 teardown exceeded {budget:?} (postgres unreachable or lock-contended) — skipping restore to avoid blocking test teardown (#3888)"
                         );
                     }
                 });
@@ -1131,11 +1187,108 @@ mod tests {
         {
             let _guard = RestoreDimOnDrop {
                 url: "not-a-valid-postgres-url".to_string(),
+                budget: RESTORE_BUDGET,
             };
             // _guard drops at the end of this block, exercising
             // `RestoreDimOnDrop::drop` synchronously (the spawned
             // thread is joined before `drop` returns).
         }
+    }
+
+    /// #3888 RED-first — `RestoreDimOnDrop::drop` must RETURN within its
+    /// budget even when the teardown's postgres connect HANGS. A silent TCP
+    /// tarpit accepts the connection and never speaks the postgres startup
+    /// protocol, so `connect_with_dim` opens the socket and then parks reading
+    /// a reply that never comes — the exact `ep_poll` park the two live CI
+    /// captures show, and the state a real unreachable-or-lock-contended
+    /// teardown reaches. (The parse-failure test above returns SYNCHRONOUSLY
+    /// before any socket, so it never exercised the hang; this one does.)
+    ///
+    /// Deterministic RED without hanging the suite: the guard drops on a
+    /// dedicated thread and this test waits on a channel with `recv_timeout`,
+    /// so it FAILS (never hangs) when the drop does not return.
+    ///
+    /// This instance overrides `budget` to a SHORT 2 s rather than the 30 s
+    /// production `RESTORE_BUDGET`, which is what makes the RED strict at the
+    /// production budget: the connect against a tarpit is independently bounded
+    /// by the pool `acquire_timeout` (30 s), so a test tied to the 30 s default
+    /// could not tell a bounded restore from an unbounded `join()` (both land
+    /// near 30 s). With a 2 s budget the fix returns the drop in ~2 s, while the
+    /// UNBOUNDED code (remove the `tokio::time::timeout`) blocks on the hung
+    /// connect until `acquire_timeout` (~30 s) — past the 15 s deadline. So this
+    /// test FAILS the moment the whole-future bound is removed, independent of
+    /// `acquire_timeout`. No `AI_MEMORY_TEST_POSTGRES_URL` and no network: the
+    /// tarpit is a loopback listener this test owns. (Measured RED->GREEN:
+    /// unbounded FAILS at the deadline; bounded PASSES in ~2 s.)
+    #[cfg(feature = "sal-postgres")]
+    #[test]
+    fn restore_dim_on_drop_is_bounded_when_the_connect_hangs_3888() {
+        use std::net::TcpListener;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind tarpit");
+        let addr = listener.local_addr().expect("tarpit addr");
+        listener.set_nonblocking(true).expect("tarpit nonblocking");
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_t = Arc::clone(&stop);
+        // Tarpit: accept every inbound connection and HOLD it open, reading
+        // nothing back, so the client's postgres startup read never resolves.
+        let tarpit = std::thread::spawn(move || {
+            let mut held: Vec<std::net::TcpStream> = Vec::new();
+            while !stop_t.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((s, _)) => held.push(s),
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(_) => break,
+                }
+            }
+            drop(held);
+        });
+
+        let url = format!(
+            "postgres://u:p@{}:{}/db?sslmode=verify-full",
+            addr.ip(),
+            addr.port()
+        );
+        let (tx, rx) = mpsc::channel::<()>();
+        let dropper = std::thread::spawn(move || {
+            {
+                // Short per-instance budget (NOT the 30s production default) so
+                // the fix's bound, not the 30s pool `acquire_timeout`, is what
+                // returns the drop — see this test's doc for why that keeps the
+                // RED strict.
+                let _guard = RestoreDimOnDrop {
+                    url,
+                    budget: Duration::from_secs(2),
+                };
+                // `_guard` drops here, running `RestoreDimOnDrop::drop`.
+            }
+            let _ = tx.send(());
+        });
+
+        // 15s: comfortably past the 2s override budget (fixed code returns in
+        // ~2s) yet well under the ~30s `acquire_timeout` the UNBOUNDED code
+        // would wait, so the RED is unambiguous.
+        let verdict = rx.recv_timeout(Duration::from_secs(15));
+        stop.store(true, Ordering::Release);
+        let bounded = verdict.is_ok();
+        // Only join the dropper if it actually finished; on UNFIXED code it is
+        // blocked in `join()` and joining it here would hang the test itself.
+        if bounded {
+            let _ = dropper.join();
+        }
+        let _ = tarpit.join();
+        assert!(
+            bounded,
+            "RestoreDimOnDrop::drop did not return within its 2s budget + slack \
+             against a hung (tarpit) postgres connect — the #3888 whole-future \
+             teardown bound is missing"
+        );
     }
 
     #[cfg(feature = "sal-postgres")]
@@ -1148,7 +1301,10 @@ mod tests {
             .expect("AI_MEMORY_TEST_POSTGRES_URL must be set");
         // Registered BEFORE any schema-init call so a panic on any
         // step below still restores the shared column (RAII teardown).
-        let _restore_guard = RestoreDimOnDrop { url: url.clone() };
+        let _restore_guard = RestoreDimOnDrop {
+            url: url.clone(),
+            budget: RESTORE_BUDGET,
+        };
 
         // Step 1 — init at the default 384 dim.
         let mut stdout = Vec::<u8>::new();
