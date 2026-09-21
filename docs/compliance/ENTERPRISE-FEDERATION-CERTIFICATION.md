@@ -1195,7 +1195,13 @@ as Task C / [**#2915**](https://github.com/alphaonedev/ai-memory-mcp/pull/2915),
 merged 2026-08-13: the `cert-expiry-gate` job in
 `.github/workflows/c8-precheck.yml` runs `scripts/check-cert-expiry.sh`
 on every PR diff — a watched-surface change without a same-change edit
-to this document goes RED. Its reported context is declared in
+to this document goes RED. Since [**#3556**](https://github.com/alphaonedev/ai-memory-mcp/issues/3556)
+(2026-09-21) the gate also READS this banner: a same-change edit satisfies
+it only if the STATUS line or the Binds-to line changed (an incidental
+prose edit is not a re-issue), and a banner that says LIVE bound to a SHA
+with §7-watched drift between that SHA and HEAD goes RED on every PR until
+the document is re-issued at HEAD or its STATUS is set to VOID/EXPIRED —
+the one-line remedy the failure names. Its reported context is declared in
 `scripts/qc-allowlists/required-contexts-release.txt`; until the
 operator-gated branch-protection API call adds it to the live required
 set, the gate is a red check, not a merge block.)

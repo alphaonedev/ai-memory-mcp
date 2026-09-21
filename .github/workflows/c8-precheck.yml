@@ -1060,7 +1060,11 @@ jobs:
         # add/rename outside the path watches is RED; docs-only and
         # unrelated src edits are GREEN; pull_request-without-base
         # fail-closes; workflow_dispatch and a zero-SHA push skip;
-        # THIS checkout vs origin/release/v1.0.0 is GREEN.
+        # THIS checkout vs origin/release/v1.0.0 is GREEN; and (#3556) an
+        # incidental cert-doc edit does NOT satisfy the hatch, a LIVE
+        # banner over wire drift since its bound SHA is RED on an
+        # unrelated PR, a VOID/EXPIRED record clears it, a bind to a
+        # non-ancestor is N/A not red, an unparseable banner fail-closes.
         run: bash scripts/check-cert-expiry.sh --self-test
 
   foreign-text-to-caller-gate:
