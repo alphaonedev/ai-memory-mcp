@@ -65,6 +65,8 @@ mod api_key_revoke_3529;
 // another agent" seam, sharing the #3529 registry advisory lock. Own module
 // for the same qual_10 budget reason as `parity_3064` above.
 mod api_key_bind_3535;
+#[cfg(test)]
+mod path_predicate_tests;
 mod pubkey_history;
 // #3527 — the single funnel that allocates a hash-chain `sequence` and
 // appends the row claiming it, for BOTH postgres chains. Own module for the
@@ -87,12 +89,17 @@ mod tx_retry;
 // take NO relation-level DDL lock on connect. Own module for the same
 // qual_10 budget reason as `parity_3064` above.
 mod bootstrap_ddl;
+#[macro_use]
+mod graph_fetch;
+#[cfg(test)]
+mod graph_conformance;
 
 use crate::models::field_names;
 use std::time::Duration;
 
 #[cfg(test)]
 mod engine_divergence_tests;
+mod drainer;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -11444,12 +11451,12 @@ impl PostgresStore {
         // requirement: sqlx resolves declared parameter type OIDs
         // (`Agtype` → `ag_catalog.agtype`) BEFORE it writes `Parse`,
         // for the unnamed statement exactly as for a named one.
-        let rows = sqlx::query(&sql)
-            .bind(Agtype(params))
-            .persistent(false)
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(|e| to_store_err("cypher kg_query", e))?;
+        let rows = graph_fetch!(
+            sqlx::query(&sql).bind(Agtype(params)).persistent(false),
+            &mut *tx,
+            "age/query"
+        )
+        .map_err(|e| to_store_err("cypher kg_query", e))?;
 
         tx.commit()
             .await
@@ -11683,13 +11690,15 @@ impl PostgresStore {
         // is a stable prefix, never a random subset. PERF-07 — `TryFrom`,
         // never `as`.
         let row_cap = i64::try_from(kg_query_row_cap(None)).unwrap_or(i64::MAX);
-        let rows = sqlx::query(&sql)
-            .bind(source_id)
-            .bind(depth_cap)
-            .bind(row_cap)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| to_store_err("cte kg_query", e))?;
+        let rows = graph_fetch!(
+            sqlx::query(&sql)
+                .bind(source_id)
+                .bind(depth_cap)
+                .bind(row_cap),
+            &self.pool,
+            "cte/query"
+        )
+        .map_err(|e| to_store_err("cte kg_query", e))?;
 
         // Shadow the raw sqlx rows with the decoded traversal set.
         let mut rows = rows
@@ -11904,12 +11913,12 @@ impl PostgresStore {
         // #1482 — per-call-unique cypher text (since/until predicate +
         // cap); run unnamed so it never enters the prepared-statement
         // cache and evicts reusable hot statements.
-        let rows = sqlx::query(&sql)
-            .bind(Agtype(params))
-            .persistent(false)
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(|e| to_store_err("cypher kg_timeline", e))?;
+        let rows = graph_fetch!(
+            sqlx::query(&sql).bind(Agtype(params)).persistent(false),
+            &mut *tx,
+            "age/timeline"
+        )
+        .map_err(|e| to_store_err("cypher kg_timeline", e))?;
 
         // Decode the agtype payloads into raw Rust strings/options
         // first; we'll backfill `title` + `target_namespace` from
@@ -12077,9 +12086,7 @@ impl PostgresStore {
         }
         q = q.bind(cap_i64);
 
-        let rows = q
-            .fetch_all(&self.pool)
-            .await
+        let rows = graph_fetch!(q, &self.pool, "cte/timeline")
             .map_err(|e| to_store_err("cte kg_timeline", e))?;
 
         rows.iter()
@@ -12304,11 +12311,12 @@ impl PostgresStore {
         let read_sql = format!(
             "SELECT prior FROM cypher('memory_graph', $$ {read_cypher} $$, $1) AS (prior agtype)"
         );
-        let prior_rows = sqlx::query(&read_sql)
-            .bind(Agtype(read_params))
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(|e| to_store_err("cypher kg_invalidate read", e))?;
+        let prior_rows = graph_fetch!(
+            sqlx::query(&read_sql).bind(Agtype(read_params)),
+            &mut *tx,
+            "age/invalidate-read"
+        )
+        .map_err(|e| to_store_err("cypher kg_invalidate read", e))?;
 
         if prior_rows.is_empty() {
             // #2375 (FIX #7) — MATCH-miss fall-through. Under
@@ -12377,11 +12385,12 @@ impl PostgresStore {
             "SELECT affected FROM cypher('memory_graph', $$ {write_cypher} $$, $1) AS \
              (affected agtype)"
         );
-        let _ = sqlx::query(&write_sql)
-            .bind(Agtype(write_params))
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(|e| to_store_err("cypher kg_invalidate set", e))?;
+        let _ = graph_fetch!(
+            sqlx::query(&write_sql).bind(Agtype(write_params)),
+            &mut *tx,
+            "age/invalidate-set"
+        )
+        .map_err(|e| to_store_err("cypher kg_invalidate set", e))?;
 
         // Mirror the SET into the relational `memory_links` row so the
         // CTE-side reads and the AGE-side reads stay aligned. The AGE
@@ -12560,12 +12569,12 @@ impl PostgresStore {
             ORDER BY depth ASC, node_id ASC"
         );
 
-        let rows = sqlx::query(&sql)
-            .bind(root_id)
-            .bind(depth_cap)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| to_store_err("cte lineage", e))?;
+        let rows = graph_fetch!(
+            sqlx::query(&sql).bind(root_id).bind(depth_cap),
+            &self.pool,
+            "cte/lineage"
+        )
+        .map_err(|e| to_store_err("cte lineage", e))?;
 
         rows.iter()
             .map(|r| {
@@ -12736,12 +12745,12 @@ impl PostgresStore {
 
         // #1482 — per-call-unique cypher text (label alternation +
         // interpolated depth); run unnamed.
-        let rows = sqlx::query(&sql)
-            .bind(Agtype(params))
-            .persistent(false)
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(|e| to_store_err("cypher lineage", e))?;
+        let rows = graph_fetch!(
+            sqlx::query(&sql).bind(Agtype(params)).persistent(false),
+            &mut *tx,
+            "age/lineage"
+        )
+        .map_err(|e| to_store_err("cypher lineage", e))?;
         tx.commit()
             .await
             .map_err(|e| to_store_err(CTX_COMMIT_AGE_TX, e))?;
@@ -12849,63 +12858,18 @@ impl PostgresStore {
         max_depth: Option<usize>,
         max_results: Option<usize>,
     ) -> StoreResult<Vec<Vec<String>>> {
-        // v1.0.0 #2582 — the relational recursive CTE is now the ONLY
-        // `find_paths` implementation, on BOTH `KgBackend` values.
+        // #3609 — deliberately use the relational reader on both backends.
+        // AGE 1.8.0 executes scalar-list ALL/ANY, but the former ALL over
+        // relationships(p) fails at runtime on a seeded path. The native
+        // path_predicate_tests pin that limitation with a live control.
         //
-        // ## This changes zero answers
-        //
-        // `build_find_paths_current_view_cypher` (DELETED, #2613) emitted
-        // an `ALL(e IN relationships(p) WHERE …)` guard. On AGE **1.7.0**
-        // that was a PARSE rejection (`syntax error at or near "("`).
-        // The certified pin is now AGE **1.8.0** (`EXPECTED_AGE_VERSION`;
-        // `deploy/docker-1461/provision/lib.sh`). Re-verified #3297 on a
-        // live 1.8.0 extversion: `ALL(x IN [1,2,3] WHERE …)` and
-        // `ANY(…)` now PARSE and return; `filter(…)` still parse-rejects;
-        // the find_paths `ALL(e IN relationships(p) WHERE e.valid_until
-        // IS NULL)` still does NOT succeed — it fails at RUNTIME
-        // (`ERROR: no relation entry for relid 2`) on a seeded
-        // two-vertex graph. Capture: `docs/kg-find-paths-engine.md`.
-        // Restoring an AGE `find_paths` reader is follow-up #3609, not
-        // this path: the dispatcher stays the relational CTE on BOTH
-        // `KgBackend` values because even a PARSEABLE AGE walk is a
-        // `Seq Scan` over vertices (below). 100% of production
-        // `find_paths` answers already came from the CTE.
-        //
-        // ## And fixing the Cypher would be the wrong repair anyway
-        //
-        // Measured on a purpose-built 20,003-vertex / 60,000-edge graph
-        // (avg out-degree 3), a PARSEABLE depth-4 AGE traversal returning
-        // 120 rows takes **999 ms**; the equivalent relational recursive
-        // CTE over the same edges takes **1.139 ms** — ~877x. The AGE plan
-        // is a Nested Loop whose OUTER side is a `Seq Scan` over ALL 20,003
-        // vertices, with 2,400,240 rows removed by
-        // `age_match_vle_terminal_edge`, plus 70 ms inside `age_vle` itself.
-        // That cost scales with |V|, not with depth, so there is no depth K
-        // at which AGE wins and the crossover only moves further away as a
-        // corpus grows. A vertex-property index does not rescue it either
-        // (999 ms -> 979 ms; it fixes the O(V) START lookup, not the walk).
-        //
-        // ## Integrity
-        //
-        // Strictly a consistency IMPROVEMENT: `memory_links` is the durable
-        // relational truth while the AGE projection is a derived, disposable
-        // artifact that can lag it. #1735 already routed `deferred` mode
-        // here for exactly that read-your-own-write reason; `sync` mode now
-        // gets the same guarantee.
-        //
-        // v1.0.0 #2613 — `find_paths_cypher` + its
-        // `build_find_paths_current_view_cypher` builder are DELETED (not
-        // retained). Since #2582 the dispatcher hardcodes the CTE on BOTH
-        // backends and the measurements above prove the AGE traversal can
-        // never win at any depth, so a ported Cypher path would only ever be
-        // parseable dead code advertising a `KgBackend::Age` capability the
-        // runtime never reaches. Deleting it — and letting the surface
-        // honestly report path resolution as CTE-served on AGE (the connect-
-        // time WARN below) — closes the honesty gap rather than papering over
-        // it. 5-agent vote (4d3ea1c5), unanimous DELETE. The #2032 L4 Cypher-
-        // injection surface it guarded is gone WITH it (no inlined-id Cypher
-        // `find_paths` statement remains to guard), and the equivalence suites
-        // now exercise the `find_paths` dispatcher — what production serves.
+        // The legacy `_cte` name now denotes #3196's bounded frontier BFS
+        // over durable memory_links, retaining current-view, cycle, depth,
+        // prefix-budget and result-cap semantics even when AGE lags. No
+        // speculative Cypher reader or per-request failing probe is served.
+        // Earlier #2582 timings describe one corpus, not a universal claim
+        // that AGE can never win. Decision and reproducible pins:
+        // docs/kg-find-paths-engine.md.
         self.find_paths_cte(source_id, target_id, max_depth, max_results)
             .await
     }
@@ -13007,12 +12971,12 @@ impl PostgresStore {
                    UNION ALL \
                    SELECT source_id, target_id FROM memory_links \
                    WHERE (valid_until IS NULL OR valid_until > $2) AND target_id = ANY($1)";
-        let rows = sqlx::query(sql)
-            .bind(frontier)
-            .bind(now)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| to_store_err("cte find_paths frontier", e))?;
+        let rows = graph_fetch!(
+            sqlx::query(sql).bind(frontier).bind(now),
+            &self.pool,
+            "cte/paths"
+        )
+        .map_err(|e| to_store_err("cte find_paths frontier", e))?;
         rows.iter()
             .map(|r| {
                 let source: String = r
@@ -14015,60 +13979,6 @@ impl PostgresStore {
                 }
             }
         }
-    }
-
-    /// #1735 (Pillar-4 4.C) — spawn the cold-path AGE-projection drainer.
-    /// Drains once immediately at boot (crash-recovery: pick up any
-    /// `kg_projection_outbox` rows a previous process left pending between
-    /// the relational commit and the projection), then drains every
-    /// `interval`. Supervised by construction: every drain step returns a
-    /// `Result` that is logged and swallowed, so a transient AGE/DB error
-    /// never panics the task or aborts the loop.
-    ///
-    /// v1.0.0 batch-2 — spawned by `serve` on ANY postgres+AGE backend, not
-    /// only under `AI_MEMORY_AGE_PROJECTION_MODE=deferred`: sync mode now also
-    /// RECORDS unreconciled projections/unprojections here when an AGE runtime
-    /// failure prevents the inline write, so a sync deployment needs the same
-    /// self-heal. On a healthy sync deployment the queue is empty and every
-    /// tick is a single indexed no-op count.
-    pub fn spawn_drainer(
-        self: std::sync::Arc<Self>,
-        interval: std::time::Duration,
-    ) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move {
-            // Boot-recovery drain — self-heal projections orphaned by a crash.
-            if let Err(e) = self
-                .drain_kg_projection_outbox(Self::AGE_PROJECTION_DRAIN_BATCH)
-                .await
-            {
-                tracing::warn!(
-                    target: TRACE_TARGET_KG,
-                    err = %e,
-                    "kg_projection drainer: boot-recovery drain failed (will retry on tick)"
-                );
-            }
-            let mut ticker = tokio::time::interval(interval);
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                ticker.tick().await;
-                match self
-                    .drain_kg_projection_outbox(Self::AGE_PROJECTION_DRAIN_BATCH)
-                    .await
-                {
-                    Ok(n) if n > 0 => tracing::debug!(
-                        target: TRACE_TARGET_KG,
-                        projected = n,
-                        "kg_projection drainer: projected pending edges into memory_graph"
-                    ),
-                    Ok(_) => {}
-                    Err(e) => tracing::warn!(
-                        target: TRACE_TARGET_KG,
-                        err = %e,
-                        "kg_projection drainer: drain tick failed; will retry next interval"
-                    ),
-                }
-            }
-        })
     }
 
     /// Map a `memories` row into a [`Memory`], FAIL-CLOSED on an undecryptable
@@ -15438,14 +15348,21 @@ async fn pg_invalidate_link_relational_in_tx(
          WHERE source_id = $1 AND target_id = $2 AND relation = $3 \
          RETURNING valid_until"
     };
-    let now_until: Option<DateTime<Utc>> = sqlx::query_scalar(update_sql)
-        .bind(source_id)
-        .bind(target_id)
-        .bind(relation)
-        .bind(stamp)
-        .fetch_one(&mut **tx)
-        .await
-        .map_err(|e| to_store_err("cte kg_invalidate", e))?;
+    let updated = graph_fetch!(
+        sqlx::query(update_sql)
+            .bind(source_id)
+            .bind(target_id)
+            .bind(relation)
+            .bind(stamp),
+        &mut **tx,
+        "cte/invalidate"
+    )
+    .map_err(|e| to_store_err("cte kg_invalidate", e))?;
+    let now_until: Option<DateTime<Utc>> = updated
+        .first()
+        .ok_or_else(|| to_store_err("cte kg_invalidate", sqlx::Error::RowNotFound))?
+        .try_get(0)
+        .map_err(|e| to_store_err("cte kg_invalidate decode", e))?;
 
     if was_signed {
         let valid_from_str = prior_valid_from.map(|t| t.to_rfc3339());

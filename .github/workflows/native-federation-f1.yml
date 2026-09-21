@@ -1,0 +1,173 @@
+name: Native federation data tier (f1)
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [next/v1.1.0]
+    paths:
+      - '.github/workflows/native-federation-f1.yml'
+      - 'scripts/native/**'
+      - 'scripts/check-cert-leg-nonvacuity.sh'
+      - 'scripts/qc-allowlists/cert-leg-executed-ratchet.txt'
+permissions:
+  contents: read
+concurrency:
+  group: astra-f1-native-data-tier
+  cancel-in-progress: false
+jobs:
+  native-federation:
+    name: Native federation PG18.6 AGE1.8.0 vector0.8.6
+    # Never execute fork-controlled code beside the machine's native credentials.
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, macos-fed]
+    # Covers the bounded gate, certification, upload and cleanup budgets together.
+    timeout-minutes: 110
+    steps:
+      - name: Prepare isolated Astra checkout and resource gate
+        shell: bash
+        env:
+          REQUESTED_SHA: ${{ github.sha }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          umask 022
+          case "$REQUESTED_SHA" in *[!a-f0-9]*|'') exit 1;; esac
+          case "$RUN_ID" in *[!0-9]*|'') exit 1;; esac
+          case "$RUN_ATTEMPT" in *[!0-9]*|'') exit 1;; esac
+          work="/Volumes/f1dev/astra/wt/e5-ci-$RUN_ID-$RUN_ATTEMPT"
+          scratch="/Volumes/f1dev/astra/tmp/e5-ci-$RUN_ID-$RUN_ATTEMPT"
+          target="/Volumes/f1dev/astra/targets/e5-native"
+          mkdir -p "$work" "$scratch" "$target"
+          chmod 700 "$scratch"
+          printf 'Signature: 8a477f597d28d172789f06886806bc55\n' > "$target/CACHEDIR.TAG"
+          git -C "$work" init
+          # Public source fetch does not depend on an interactive SSH agent.
+          timeout 120 git -C "$work" fetch --depth=1 https://github.com/alphaonedev/ai-memory-mcp.git "$REQUESTED_SHA"
+          git -C "$work" checkout --detach FETCH_HEAD
+          {
+            echo "ASTRA_NATIVE_WORK=$work"
+            echo "CARGO_TARGET_DIR=$target"
+            echo "TMPDIR=$scratch"
+            echo "CARGO_BUILD_JOBS=2"
+          } >> "$GITHUB_ENV"
+          timeout 1300 python3 "$work/scripts/native/resource_gate.py"
+      - name: Run harness self-tests and certify native federation
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 022
+          cd "$ASTRA_NATIVE_WORK"
+          export PYTHONDONTWRITEBYTECODE=1
+          timeout 10 python3 - <<'PY'
+          import json, os, platform
+          from pathlib import Path
+          evidence = Path('.local-runs/native-federation')
+          evidence.mkdir(mode=0o700, parents=True, exist_ok=True)
+          identity = {'runner_name': os.environ['RUNNER_NAME'],
+                      'hostname': platform.node(), 'source_sha': os.environ['GITHUB_SHA']}
+          (evidence / 'runner.json').write_text(json.dumps(identity, indent=2) + '\n')
+          print('NATIVE_RUNNER ' + json.dumps(identity, sort_keys=True))
+          PY
+          timeout 60 python3 -m unittest discover -s scripts/native -v
+          timeout 180 bash scripts/check-cert-leg-nonvacuity.sh --self-test
+          # This file is sourced, never printed. No DSN enters GITHUB_ENV or argv.
+          source /Users/fate/pg-age-stack/env.sh
+          echo "CARGO_TARGET_DIR=$CARGO_TARGET_DIR"
+          timeout 4000 python3 scripts/native/federation.py --require-native \
+            --psql /opt/homebrew/Cellar/postgresql@18/18.6/bin/psql
+      - name: Upload sanitized native evidence
+        if: always() && env.ASTRA_NATIVE_WORK != ''
+        timeout-minutes: 5
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: native-federation-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.ASTRA_NATIVE_WORK }}/.local-runs/native-federation/
+          include-hidden-files: true
+          if-no-files-found: warn
+      - name: Remove exact per-run checkout and scratch
+        if: always()
+        timeout-minutes: 2
+        shell: python3 {0}
+        env:
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          # BEGIN NATIVE CLEANUP
+          import os
+          import re
+          import stat
+          import time
+
+          MAX_ENTRIES = 100000
+
+          def clean_run(root, run_id, attempt):
+              if not all(re.fullmatch(r'[0-9]+', value) for value in (run_id, attempt)):
+                  raise ValueError('invalid run identity; cleanup refused')
+              if not os.path.isabs(root) or '..' in root.split('/'):
+                  raise ValueError('invalid cleanup root')
+              deadline = time.monotonic() + 60
+              visits = 0
+
+              def budget(depth):
+                  nonlocal visits
+                  visits += 1
+                  if visits > MAX_ENTRIES or depth > 64 or time.monotonic() > deadline:
+                      raise ValueError('cleanup budget exceeded; remainder retained')
+
+              flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+              root_fd = os.open('/', flags)
+              try:
+                  # Anchor every component, including ancestors: no symlink traversal.
+                  for component in filter(None, root.split('/')):
+                      next_fd = os.open(component, flags, dir_fd=root_fd)
+                      os.close(root_fd)
+                      root_fd = next_fd
+
+                  def visit(parent_fd, name, remove, depth=0):
+                      budget(depth)
+                      try:
+                          item = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                      except FileNotFoundError:
+                          return
+                      if stat.S_ISLNK(item.st_mode):
+                          raise ValueError('symlink encountered; cleanup refused')
+                      if stat.S_ISDIR(item.st_mode):
+                          child_fd = os.open(name, flags, dir_fd=parent_fd)
+                          try:
+                              # Reject replacement between stat and anchored open.
+                              opened = os.fstat(child_fd)
+                              if (item.st_dev, item.st_ino) != (opened.st_dev, opened.st_ino):
+                                  raise ValueError('directory changed during cleanup')
+                              with os.scandir(child_fd) as entries:
+                                  for entry in entries:
+                                      visit(child_fd, entry.name, remove, depth + 1)
+                          finally:
+                              os.close(child_fd)
+                          if remove:
+                              os.rmdir(name, dir_fd=parent_fd)
+                      elif stat.S_ISREG(item.st_mode):
+                          if remove:
+                              os.unlink(name, dir_fd=parent_fd)
+                      else:
+                          raise ValueError('special file encountered; cleanup refused')
+
+                  parents = []
+                  try:
+                      for parent in ('wt', 'tmp'):
+                          parents.append(os.open(parent, flags, dir_fd=root_fd))
+                      name = 'e5-ci-' + run_id + '-' + attempt
+                      # Validate both trees first; then remove only these exact children.
+                      for remove in (False, True):
+                          for parent_fd in parents:
+                              visit(parent_fd, name, remove)
+                  finally:
+                      for parent_fd in parents:
+                          os.close(parent_fd)
+              finally:
+                  os.close(root_fd)
+
+          if __name__ == '__main__':
+              clean_run('/Volumes/f1dev/astra', os.environ['RUN_ID'], os.environ['RUN_ATTEMPT'])
+              # Deliberately retain targets/e5-native: the shared, bounded Cargo cache.
+              print('NATIVE_RUN_CLEANUP verified exact checkout and scratch absent; target retained')
+          # END NATIVE CLEANUP
