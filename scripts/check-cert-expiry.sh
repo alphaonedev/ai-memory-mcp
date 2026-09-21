@@ -129,27 +129,45 @@ is_cert_doc_path() {
     [[ "$1" == "$CERT_DOC" ]]
 }
 
-# The cert doc's two banner lines (#3556). Exact shapes, as the document
-# has carried them since the 2026-08-12 mint:
+# The cert doc's two banner lines (#3556). The document has carried them
+# in this shape since the 2026-08-12 mint:
 #   > ## STATUS — **LIVE as of 2026-09-21** (…)
 #   **Binds to:** `f32c18dadf8a659567960747cc2802186bac9de9` (…)
-STATUS_LINE_RE='^> ## STATUS — \*\*(LIVE|VOID|EXPIRED)'
-BINDS_LINE_RE='^\*\*Binds to:\*\* `[0-9a-f]{40}`'
+# The patterns are TOLERANT of formatting (#3556 ruling, fix 3): optional
+# blockquote, one to three `#`, flexible whitespace, em dash / en dash /
+# hyphen, optional backticks, case-insensitive hex. A gate that reds the
+# whole repository on a reformat while a one-line decoy walks past it is
+# worse than no gate. They are anchored at line start and require the
+# heading marker / the bold "Binds to", so the §7 history records that
+# QUOTE these words in prose do not match.
+STATUS_LINE_RE='^>?[[:space:]]*#{1,3}[[:space:]]*STATUS[[:space:]]*(—|–|-)[[:space:]]*\*\*[[:space:]]*(LIVE|VOID|EXPIRED)'
+BINDS_LINE_RE='^>?[[:space:]]*\*\*[[:space:]]*Binds[[:space:]]+to[[:space:]]*:?[[:space:]]*\*\*[[:space:]]*:?[[:space:]]*`?[0-9a-fA-F]{40}`?'
 
 # cert_banner REPO TREE — prints "<STATUS> <BINDS>" for the cert doc at
-# TREE: STATUS ∈ LIVE | VOID | EXPIRED | UNPARSEABLE (doc present, no
-# STATUS line) | ABSENT (no doc at TREE); BINDS = the 40-hex bound SHA or
-# "-" when the Binds-to line is missing. First match wins (the banner is
-# at the top; historical records below repeat the words in prose).
+# TREE. STATUS ∈ LIVE | VOID | EXPIRED | UNPARSEABLE (doc present, no
+# STATUS line) | DUPLICATE (two or more STATUS lines — #3556 ruling, fix
+# 1: a decoy inserted above the real banner must not be read as the
+# banner) | ABSENT (no doc at TREE). BINDS = the lowercase 40-hex bound
+# SHA, "-" when no Binds-to line matches, "DUPLICATE" when two or more do.
 cert_banner() {
-    local repo="$1" tree="$2" doc status binds
+    local repo="$1" tree="$2" doc status_lines binds_lines status binds
     if ! doc="$(git -C "$repo" show "${tree}:${CERT_DOC}" 2>/dev/null)"; then
         echo "ABSENT -"
         return 0
     fi
-    status="$(printf '%s\n' "$doc" | grep -oE "$STATUS_LINE_RE" | head -1 | grep -oE 'LIVE|VOID|EXPIRED' || true)"
-    binds="$(printf '%s\n' "$doc" | grep -oE "$BINDS_LINE_RE" | head -1 | grep -oE '[0-9a-f]{40}' || true)"
-    echo "${status:-UNPARSEABLE} ${binds:--}"
+    status_lines="$(printf '%s\n' "$doc" | grep -iE "$STATUS_LINE_RE" || true)"
+    binds_lines="$(printf '%s\n' "$doc" | grep -iE "$BINDS_LINE_RE" || true)"
+    case "$(printf '%s\n' "$status_lines" | sed '/^$/d' | wc -l | tr -d ' ')" in
+        0) status="UNPARSEABLE" ;;
+        1) status="$(printf '%s\n' "$status_lines" | grep -oiE 'LIVE|VOID|EXPIRED' | head -1 | tr '[:lower:]' '[:upper:]')" ;;
+        *) status="DUPLICATE" ;;
+    esac
+    case "$(printf '%s\n' "$binds_lines" | sed '/^$/d' | wc -l | tr -d ' ')" in
+        0) binds="-" ;;
+        1) binds="$(printf '%s\n' "$binds_lines" | grep -oiE '[0-9a-f]{40}' | head -1 | tr '[:upper:]' '[:lower:]')" ;;
+        *) binds="DUPLICATE" ;;
+    esac
+    echo "${status} ${binds}"
 }
 
 # wire_drift REPO FROM TO — prints the §7 surface that differs between the
@@ -342,16 +360,29 @@ check_change() {
 
     # (B) #3556 — the hatch is a REAL re-issue/voiding only if the banner
     # (STATUS line or Binds-to line) differs between merge-base and HEAD.
-    local incidental=0 banner_mb="" banner_head=""
+    local incidental=0 deleted=0 malformed=0 banner_mb="" banner_head=""
     if ((cert_touched == 1)); then
         banner_mb="$(cert_banner "$repo" "$mb")"
         banner_head="$(cert_banner "$repo" "$head")"
         if [[ "$banner_mb" == "$banner_head" ]]; then
             incidental=1
         fi
+        # #3556 ruling, fix 2: a DELETED cert doc is not a voiding record.
+        # Deleting the certification while rewiring federation must fail
+        # closed, not read as "the doc changed, hatch satisfied".
+        if [[ "$banner_head" == "ABSENT -" ]]; then
+            deleted=1
+        fi
+        # #3556 ruling, fix 1: a HEAD banner the gate cannot read as exactly
+        # one STATUS line and at most one Binds-to line is not a re-issue
+        # either (a decoy line above the real banner would otherwise count
+        # as "the banner changed").
+        case "$banner_head" in
+            DUPLICATE\ * | UNPARSEABLE\ * | *\ DUPLICATE) malformed=1 ;;
+        esac
     fi
 
-    if ((cert_touched == 1)) && ((incidental == 0)); then
+    if ((cert_touched == 1)) && ((incidental == 0)) && ((deleted == 0)) && ((malformed == 0)); then
         echo "check-cert-expiry: PASS — federation-wire surface changed AND cert doc re-issued/voided in the same change (${mb}..${head}; banner ${banner_mb} → ${banner_head})"
         check_banner_consistency "$repo" "$head"
         return
@@ -360,6 +391,12 @@ check_change() {
     echo "federation-wire surface changed → the enterprise-federation certification expires per its §7 → re-issue or void the cert doc in this same change."
     if ((incidental == 1)); then
         echo "The cert doc WAS edited in this change, but neither its STATUS line nor its Binds-to line changed (banner ${banner_head} at both ends) — an incidental edit is not a re-issue and not a voiding record (#3556)."
+    fi
+    if ((deleted == 1)); then
+        echo "The cert doc is ABSENT at HEAD (deleted in this change) while the federation-wire surface changed — deleting the certification is not a voiding record; record VOID/EXPIRED in the document instead (#3556)."
+    fi
+    if ((malformed == 1)); then
+        echo "The cert doc at HEAD does not carry exactly one STATUS banner line and at most one Binds-to line (parsed: ${banner_head}) — the gate reads one banner and will not guess; a duplicated or unparseable banner is not a re-issue and not a voiding record (#3556)."
     fi
     echo ""
     echo "Range: ${mb}..${head}  (merge-base of ${base} and ${head})"
@@ -399,7 +436,11 @@ check_banner_consistency() {
             return 0
             ;;
         UNPARSEABLE)
-            echo "check-cert-expiry: ERROR — ${CERT_DOC} at HEAD has no parseable STATUS line (expected '> ## STATUS — **LIVE|VOID|EXPIRED as of …**'; fail-closed, #3556)"
+            echo "check-cert-expiry: ERROR — ${CERT_DOC} at HEAD has no parseable STATUS line. Expected a line shaped like '> ## STATUS — **LIVE as of …**' (blockquote, heading level, dash style, spacing and hex case are tolerated). If this change reformatted the banner, restore that shape; if it removed the banner, the document must say LIVE, VOID or EXPIRED. Fail-closed, #3556."
+            return 1
+            ;;
+        DUPLICATE)
+            echo "check-cert-expiry: ERROR — ${CERT_DOC} at HEAD has two or more STATUS banner lines; the gate reads exactly one and will not guess which is the banner (a decoy line above the real banner is how a stale LIVE could be read as VOID). Remove the duplicate. Fail-closed, #3556."
             return 1
             ;;
         VOID | EXPIRED)
@@ -409,7 +450,11 @@ check_banner_consistency() {
     esac
     # LIVE
     if [[ "$binds" == "-" ]]; then
-        echo "check-cert-expiry: ERROR — ${CERT_DOC} at HEAD says STATUS LIVE but has no parseable Binds-to line (fail-closed, #3556)"
+        echo "check-cert-expiry: ERROR — ${CERT_DOC} at HEAD says STATUS LIVE but has no parseable Binds-to line. Expected a line shaped like '**Binds to:** \`<40-hex sha>\`' (spacing, backticks and hex case are tolerated). Fail-closed, #3556."
+        return 1
+    fi
+    if [[ "$binds" == "DUPLICATE" ]]; then
+        echo "check-cert-expiry: ERROR — ${CERT_DOC} at HEAD has two or more Binds-to lines; the gate reads exactly one and will not guess which SHA the LIVE claim binds to. Remove the duplicate. Fail-closed, #3556."
         return 1
     fi
     ensure_commit "$repo" "$binds" || true
@@ -957,6 +1002,129 @@ self_test() {
 
     git -C "$repo" reset -q --hard "$base_sha"
 
+    # ---- #3556 ruling: the three fixes, a cell each -----------------------
+
+    # (x1) RED — DECOY: a second STATUS line (VOID) inserted ABOVE the real
+    #      LIVE banner, with a wire change in the same range. A first-match
+    #      reader would read VOID and pass; the gate reads exactly one.
+    echo "// mutate" >>"$repo/src/federation/mod.rs"
+    write_banner LIVE "$genesis_sha"
+    sed -i '1i > ## STATUS — **VOID as of 2026-01-02** (decoy)' "$repo/docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md"
+    git -C "$repo" add src/federation/mod.rs "$CERT_DOC"
+    git -C "$repo" commit -q -m "violate: decoy STATUS line above the banner + wire change"
+    local decoy_status_sha
+    decoy_status_sha="$(git -C "$repo" rev-parse HEAD)"
+    if out="$(check_change "$repo" "$base_sha" "$decoy_status_sha" 2>&1)"; then
+        echo "self-test FAILED (x1): a decoy STATUS line above the real banner was NOT rejected" >&2
+        echo "$out" >&2
+        failed=1
+    else
+        if ! printf '%s\n' "$out" | grep -q 'not carry exactly one STATUS banner line'; then
+            echo "self-test FAILED (x1): rejection did not name the duplicated banner:" >&2
+            echo "$out" >&2
+            failed=1
+        fi
+    fi
+
+    git -C "$repo" reset -q --hard "$base_sha"
+
+    # (x2) RED — DECOY on the Binds-to line: a second Binds-to naming a
+    #      drift-free SHA above the real one, with a wire change.
+    echo "// mutate" >>"$repo/src/federation/mod.rs"
+    git -C "$repo" add src/federation/mod.rs
+    git -C "$repo" commit -q -m "wire change"
+    local wire_sha
+    wire_sha="$(git -C "$repo" rev-parse HEAD)"
+    write_banner LIVE "$genesis_sha"
+    sed -i "1i **Binds to:** \`${wire_sha}\` (decoy)" "$repo/docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md"
+    git -C "$repo" add "$CERT_DOC"
+    git -C "$repo" commit -q -m "violate: decoy Binds-to line above the real one"
+    local decoy_binds_sha
+    decoy_binds_sha="$(git -C "$repo" rev-parse HEAD)"
+    if out="$(check_change "$repo" "$base_sha" "$decoy_binds_sha" 2>&1)"; then
+        echo "self-test FAILED (x2): a decoy Binds-to line above the real one was NOT rejected" >&2
+        echo "$out" >&2
+        failed=1
+    else
+        if ! printf '%s\n' "$out" | grep -q 'at most one Binds-to line'; then
+            echo "self-test FAILED (x2): rejection did not name the duplicated Binds-to:" >&2
+            echo "$out" >&2
+            failed=1
+        fi
+    fi
+
+    git -C "$repo" reset -q --hard "$base_sha"
+
+    # (y) RED — the cert doc DELETED in the same change as a wire change:
+    #     ABSENT must fail closed, never read as "the doc changed".
+    echo "// mutate" >>"$repo/src/federation/mod.rs"
+    git -C "$repo" rm -q "$CERT_DOC"
+    git -C "$repo" add src/federation/mod.rs
+    git -C "$repo" commit -q -m "violate: delete the certification + wire change"
+    local deleted_sha
+    deleted_sha="$(git -C "$repo" rev-parse HEAD)"
+    if out="$(check_change "$repo" "$base_sha" "$deleted_sha" 2>&1)"; then
+        echo "self-test FAILED (y): deleting the cert doc alongside a wire change was NOT rejected" >&2
+        echo "$out" >&2
+        failed=1
+    else
+        if ! printf '%s\n' "$out" | grep -q 'ABSENT at HEAD (deleted in this change)'; then
+            echo "self-test FAILED (y): rejection did not name the deletion:" >&2
+            echo "$out" >&2
+            failed=1
+        fi
+    fi
+
+    git -C "$repo" reset -q --hard "$base_sha"
+
+    # (z) GREEN — a PURE REFORMAT of the banner on a docs-only change: no
+    #     blockquote, one hash, a hyphen for the dash, double spaces, an
+    #     UPPERCASE SHA with no backticks. Must parse (LIVE, bound to
+    #     genesis, zero drift) — a formatting change must never red the
+    #     whole repository.
+    {
+        printf '# Enterprise federation certification (fixture)\n\n'
+        printf '**Binds  to:**  %s  (reformatted)\n\n' "$(printf '%s' "$genesis_sha" | tr '[:lower:]' '[:upper:]')"
+        printf '#  STATUS  -  **LIVE as of 2026-01-01**  (reformatted)\n\nBody prose.\n'
+    } >"$repo/docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md"
+    git -C "$repo" add "$CERT_DOC"
+    git -C "$repo" commit -q -m "docs: reformat the banner"
+    local reformat_sha
+    reformat_sha="$(git -C "$repo" rev-parse HEAD)"
+    if ! out="$(check_change "$repo" "$base_sha" "$reformat_sha")"; then
+        echo "self-test FAILED (z): a pure banner reformat was REJECTED (typographic landmine):" >&2
+        echo "$out" >&2
+        failed=1
+    else
+        if ! printf '%s\n' "$out" | grep -q "banner LIVE bound to ${genesis_sha}; federation-wire surface unchanged since the bind"; then
+            echo "self-test FAILED (z): the reformatted banner did not parse to LIVE bound to genesis:" >&2
+            echo "$out" >&2
+            failed=1
+        fi
+    fi
+
+    # (z2) RED — the same reformat carried alongside a wire change is an
+    #      INCIDENTAL edit (the extracted pair is unchanged), not UNPARSEABLE
+    #      and not a re-issue.
+    echo "// mutate" >>"$repo/src/federation/mod.rs"
+    git -C "$repo" add src/federation/mod.rs
+    git -C "$repo" commit -q -m "violate: wire change over the reformatted banner"
+    local reformat_wire_sha
+    reformat_wire_sha="$(git -C "$repo" rev-parse HEAD)"
+    if out="$(check_change "$repo" "$base_sha" "$reformat_wire_sha" 2>&1)"; then
+        echo "self-test FAILED (z2): reformat + wire change was NOT rejected" >&2
+        echo "$out" >&2
+        failed=1
+    else
+        if ! printf '%s\n' "$out" | grep -q 'an incidental edit is not a re-issue'; then
+            echo "self-test FAILED (z2): rejection did not classify the reformat as incidental (pair unchanged):" >&2
+            echo "$out" >&2
+            failed=1
+        fi
+    fi
+
+    git -C "$repo" reset -q --hard "$base_sha"
+
     # (k) fail-closed — pull_request with missing PR_BASE_SHA.
     if (
         unset CERT_EXPIRY_BASE CERT_EXPIRY_HEAD PR_BASE_SHA PR_HEAD_SHA GITHUB_EVENT_BEFORE
@@ -1020,7 +1188,7 @@ self_test() {
         echo "check-cert-expiry self-test: FAIL" >&2
         exit 2
     fi
-    echo "check-cert-expiry self-test OK: (a) watched-path violation RED with the §7 expiry sentence; (b) same change + cert-doc GREEN; (c) AI_MEMORY_FED_* identifier-add outside the path watches RED; (d) identifier-add + cert-doc GREEN; (e) unrelated src/ edit GREEN; (f) cert-doc-only GREEN; (g) federation_receive.rs RED; (h) federation_signing_check.rs RED; (h2) nested src/federation/identity/** RED; (i) watched-file rename RED (old path still named); (j) identifier-rename RED (both names listed); (k) pull_request missing PR_BASE_SHA fail-closed; (l) workflow_dispatch skip; (m) push with zero before-SHA skip; (n) unresolvable range fail-closed; (o) this checkout vs origin/release/v1.0.0 GREEN; (p) non-ASCII watched path RED (core.quotePath bypass closed); (q) wire change + incidental cert-doc edit RED (#3556 B); (r) wire change + VOID record GREEN; (s) unrelated change over a LIVE banner with wire drift since the bind RED (#3556 C, names the bound SHA and the drift); (t) unrelated change over a VOID banner GREEN; (u) stale LIVE healed by recording EXPIRED GREEN; (v1) LIVE bound to a non-ancestor with an identical watched tree GREEN (squash-merge shape, tree diff); (v2) LIVE bound to a non-ancestor whose watched tree differs RED (the ancestry hatch would have silenced it); (w) unparseable STATUS line fail-closed."
+    echo "check-cert-expiry self-test OK: (a) watched-path violation RED with the §7 expiry sentence; (b) same change + cert-doc GREEN; (c) AI_MEMORY_FED_* identifier-add outside the path watches RED; (d) identifier-add + cert-doc GREEN; (e) unrelated src/ edit GREEN; (f) cert-doc-only GREEN; (g) federation_receive.rs RED; (h) federation_signing_check.rs RED; (h2) nested src/federation/identity/** RED; (i) watched-file rename RED (old path still named); (j) identifier-rename RED (both names listed); (k) pull_request missing PR_BASE_SHA fail-closed; (l) workflow_dispatch skip; (m) push with zero before-SHA skip; (n) unresolvable range fail-closed; (o) this checkout vs origin/release/v1.0.0 GREEN; (p) non-ASCII watched path RED (core.quotePath bypass closed); (q) wire change + incidental cert-doc edit RED (#3556 B); (r) wire change + VOID record GREEN; (s) unrelated change over a LIVE banner with wire drift since the bind RED (#3556 C, names the bound SHA and the drift); (t) unrelated change over a VOID banner GREEN; (u) stale LIVE healed by recording EXPIRED GREEN; (v1) LIVE bound to a non-ancestor with an identical watched tree GREEN (squash-merge shape, tree diff); (v2) LIVE bound to a non-ancestor whose watched tree differs RED (the ancestry hatch would have silenced it); (w) unparseable STATUS line fail-closed; (x1) decoy STATUS line above the banner RED (exactly-one rule); (x2) decoy Binds-to line RED; (y) cert doc deleted alongside a wire change RED (ABSENT fails closed); (z) pure banner reformat on a docs-only change GREEN (tolerant parse); (z2) reformat + wire change RED as incidental, not unparseable."
 }
 
 case "${1:-}" in
