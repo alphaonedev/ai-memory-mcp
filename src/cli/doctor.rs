@@ -3970,10 +3970,13 @@ fn section_capabilities_local() -> ReportSection {
 /// see WHERE the wiring came from and WHY the probe lands where it
 /// does.
 fn section_llm_reachability_1146() -> ReportSection {
-    use crate::config::{AppConfig, ConfigSource, KeySource};
-
-    let app_config = AppConfig::load();
+    let app_config = crate::config::AppConfig::load();
     let resolved = app_config.resolve_llm(None, None, None);
+    section_llm_reachability_from_resolved(&resolved)
+}
+
+fn section_llm_reachability_from_resolved(resolved: &crate::config::ResolvedLlm) -> ReportSection {
+    use crate::config::{ConfigSource, KeySource};
 
     let mut facts = vec![
         ("backend".into(), resolved.backend.clone()),
@@ -3991,6 +3994,30 @@ fn section_llm_reachability_1146() -> ReportSection {
             resolved.api_key_source.as_str().to_string(),
         ),
     ];
+
+    // #3811/#3860: this probe builds its own HTTP client, so enforce the
+    // same selector gate as both LLM builders before any credential or
+    // request is attached, even when the operator supplied an explicit URL.
+    if !crate::config::is_recognized_llm_backend(&resolved.backend) {
+        return ReportSection {
+            name: SECTION_LLM_REACHABILITY.into(),
+            severity: Severity::Critical,
+            facts,
+            note: Some(
+                crate::config::unrecognized_llm_backend_error(&resolved.backend).to_string(),
+            ),
+        };
+    }
+    if resolved.base_url.trim().is_empty() {
+        return ReportSection {
+            name: SECTION_LLM_REACHABILITY.into(),
+            severity: Severity::Critical,
+            facts,
+            note: Some(
+                "LLM backend has no default URL; configure [llm].base_url before probing".into(),
+            ),
+        };
+    }
 
     // If the key resolution surfaced an error during resolve (file
     // perms / missing env / etc.), call it out — but still try the
@@ -7932,6 +7959,73 @@ enabled = true
             "compiled-default note expected; got {:?}",
             section.note
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn llm_reachability_selector_gate_blocks_credentials_3860() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for (backend, explicit_url, allowed) in [
+            ("opena1", false, false),
+            ("opena1", true, false),
+            (crate::llm::BACKEND_OPENAI_COMPATIBLE, false, false),
+            (crate::llm::BACKEND_OPENAI_COMPATIBLE, true, true),
+            (crate::llm::BACKEND_VLLM, true, true),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/models"))
+                .and(header("authorization", "Bearer fixture-key-3860"))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(u64::from(allowed))
+                .mount(&server)
+                .await;
+            let resolved = {
+                // Hold both existing test locks only while resolving, never
+                // across await. Restore the fixture key before network I/O.
+                let _config = crate::config::test_env_lock();
+                let _reach = reach_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+                let _scope = EnvScope::set(&[
+                    ("AI_MEMORY_LLM_API_KEY", "fixture-key-3860"),
+                    ("AI_MEMORY_LLM_BASE_URL", ""),
+                ]);
+                crate::config::AppConfig::default().resolve_llm(
+                    Some(backend),
+                    Some("fixture-model"),
+                    explicit_url.then_some(server.uri()).as_deref(),
+                )
+            };
+            assert!(resolved.api_key().is_some());
+            if !explicit_url {
+                assert!(resolved.base_url.is_empty());
+            }
+            let section = tokio::task::spawn_blocking(move || {
+                section_llm_reachability_from_resolved(&resolved)
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                section.severity,
+                if allowed {
+                    Severity::Info
+                } else {
+                    Severity::Critical
+                }
+            );
+            let requests = server.received_requests().await.unwrap();
+            assert_eq!(requests.len(), usize::from(allowed));
+            if !allowed {
+                let reason = if backend == crate::llm::BACKEND_OPENAI_COMPATIBLE {
+                    "no default URL"
+                } else {
+                    "not a recognized backend alias"
+                };
+                assert!(section.note.as_deref().unwrap().contains(reason));
+                assert!(!section.facts.iter().any(|(key, _)| key == "probe_url"));
+            }
+            server.verify().await;
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -7770,42 +7770,15 @@ fn backend_default_model(backend: &str) -> &'static str {
     }
 }
 
-/// Backend-specific default base URL. Used by
-/// [`AppConfig::resolve_llm`] when no base_url is configured at any
-/// precedence layer. `openai-compatible` returns the empty string (the
-/// resolver does not validate this — surface plumbing surfaces the
-/// misconfiguration via the reachability probe in `ai-memory doctor`).
+/// Backend-specific default base URL, shared by the parent and auto-tag
+/// resolvers. Alias URLs come only from the LLM SSOT (#3811/#3860).
+/// Only Ollama defaults to the Ollama endpoint. Generic/unknown selectors
+/// have no default; construction and doctor report invalid configuration.
 fn backend_default_base_url(backend: &str) -> &'static str {
-    match backend {
-        "openai" => "https://api.openai.com/v1",
-        "xai" => "https://api.x.ai/v1",
-        "anthropic" => "https://api.anthropic.com/v1",
-        "gemini" => "https://generativelanguage.googleapis.com/v1beta/openai",
-        "kimi" | "moonshot" => "https://api.moonshot.cn/v1",
-        "qwen" | "dashscope" => "https://dashscope.aliyuncs.com/compatible-mode/v1",
-        "mistral" => "https://api.mistral.ai/v1",
-        "groq" => "https://api.groq.com/openai/v1",
-        "together" => "https://api.together.xyz/v1",
-        "cerebras" => "https://api.cerebras.ai/v1",
-        "openrouter" => "https://openrouter.ai/api/v1",
-        "fireworks" => "https://api.fireworks.ai/inference/v1",
-        "lmstudio" => "http://localhost:1234/v1",
-        // ollama / openai-compatible / unknown → localhost ollama.
-        //
-        // #3627 — what this arm does and does NOT guarantee. An
-        // UNRECOGNISED selector never reaches a client: every
-        // construction funnel refuses it first via
-        // [`is_recognized_llm_backend`], so for those this value is not
-        // dialled. A RECOGNISED selector with no arm in THIS mirror
-        // table does still land here, and that is a live mis-route, not
-        // a hypothetical: `vllm` is an arm of the SSOT
-        // `crate::llm::default_base_url_for_alias` (and is documented at
-        // `http://localhost:8000/v1`) but has no arm above, so
-        // `[llm].backend = "vllm"` resolves the loopback Ollama URL and
-        // builds an OpenAI-compatible client with a Bearer token against
-        // it. Pre-existing and tracked in #3811 — deliberately NOT fixed
-        // by #3627, which only closes the unrecognised-selector hole.
-        _ => "http://localhost:11434",
+    if backend == crate::llm::BACKEND_OLLAMA {
+        crate::llm::DEFAULT_OLLAMA_URL
+    } else {
+        crate::llm::default_base_url_for_alias(backend).unwrap_or_default()
     }
 }
 
@@ -14011,6 +13984,108 @@ max_page_size = 1000000
         assert!(
             !is_recognized_llm_backend("opena1"),
             "#3627 absence control: a typo'd selector must not pass the gate"
+        );
+    }
+
+    #[test]
+    fn resolve_llm_vllm_uses_documented_endpoint_3811() {
+        let _g = env_var_lock();
+        scrub_llm_env();
+        let cfg: AppConfig = toml::from_str("[llm]\nbackend = 'vllm'\n").unwrap();
+        let resolved = cfg.resolve_llm(None, None, None);
+        assert_eq!(resolved.backend, crate::llm::BACKEND_VLLM);
+        assert_eq!(resolved.base_url, "http://localhost:8000/v1");
+    }
+
+    #[test]
+    fn resolve_llm_alias_url_parity_and_auto_tag_3811() {
+        let _g = env_var_lock();
+        scrub_llm_env();
+        for backend in RECOGNIZED_LLM_BACKENDS.split(", ") {
+            let expected = if backend == crate::llm::BACKEND_OLLAMA {
+                crate::llm::DEFAULT_OLLAMA_URL
+            } else {
+                crate::llm::default_base_url_for_alias(backend).unwrap_or_default()
+            };
+            let cfg: AppConfig =
+                toml::from_str(&format!("[llm]\nbackend = '{backend}'\n")).unwrap();
+            assert_eq!(
+                cfg.resolve_llm(None, None, None).base_url,
+                expected,
+                "{backend}"
+            );
+            assert_eq!(
+                cfg.resolve_llm_auto_tag().base_url,
+                expected,
+                "inherited {backend}"
+            );
+
+            // A different auto-tag backend must use its own default, not
+            // inherit the parent's endpoint (and send credentials there).
+            let cfg: AppConfig = toml::from_str(&format!(
+                "[llm]\nbackend = 'openai'\n[llm.auto_tag]\nbackend = '{backend}'\n"
+            ))
+            .unwrap();
+            assert_eq!(
+                cfg.resolve_llm_auto_tag().base_url,
+                expected,
+                "override {backend}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_llm_unknown_has_no_default_and_builders_refuse_3860() {
+        let candidates = {
+            let _g = env_var_lock();
+            scrub_llm_env();
+            let cfg: AppConfig =
+                toml::from_str("[llm]\nbackend = 'opena1'\n[llm.auto_tag]\nbackend = 'vlln'\n")
+                    .unwrap();
+            let parent = cfg.resolve_llm(None, None, None);
+            let auto_tag = cfg.resolve_llm_auto_tag();
+            assert!(parent.base_url.is_empty());
+            assert!(auto_tag.base_url.is_empty());
+            let explicit = cfg.resolve_llm(None, None, Some("https://example.invalid/v1"));
+            assert_eq!(explicit.base_url, "https://example.invalid/v1");
+            [parent, auto_tag, explicit]
+        };
+        for resolved in candidates {
+            let err = crate::llm::OllamaClient::build_from_resolved(&resolved)
+                .err()
+                .expect("unknown backend must be refused");
+            assert!(err.to_string().contains("not a recognized backend alias"));
+            let err = crate::llm::OllamaClient::build_from_resolved_async(&resolved)
+                .await
+                .err()
+                .expect("unknown backend must be refused");
+            assert!(err.to_string().contains("not a recognized backend alias"));
+        }
+    }
+
+    #[test]
+    fn resolve_llm_explicit_url_precedence_and_generic_no_default_3811() {
+        let _g = env_var_lock();
+        scrub_llm_env();
+        let cfg: AppConfig =
+            toml::from_str("[llm]\nbackend = 'vllm'\nbase_url = 'https://configured.invalid/v1'\n")
+                .unwrap();
+        assert_eq!(
+            cfg.resolve_llm(None, None, None).base_url,
+            "https://configured.invalid/v1"
+        );
+        assert_eq!(
+            cfg.resolve_llm(None, None, Some("https://cli.invalid/v1"))
+                .base_url,
+            "https://cli.invalid/v1"
+        );
+        let generic: AppConfig = toml::from_str("[llm]\nbackend = 'openai-compatible'\n").unwrap();
+        assert!(generic.resolve_llm(None, None, None).base_url.is_empty());
+        assert_eq!(
+            generic
+                .resolve_llm(None, None, Some("https://generic.invalid/v1"))
+                .base_url,
+            "https://generic.invalid/v1"
         );
     }
 
