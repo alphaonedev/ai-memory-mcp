@@ -294,14 +294,111 @@ pub fn url_is_plaintext_http(url: &str) -> bool {
     classify_outbound_url(url) == OutboundUrlClass::PlaintextHttp
 }
 
-/// Whether a PostgreSQL DSN pins `sslmode=verify-full`. libpq honours the
-/// LAST occurrence of a repeated key, so a trailing `&sslmode=require`
-/// cannot be masked by an earlier `verify-full`. Shared by the connect
-/// funnel (the floor), the enterprise posture (check #15) and doctor.
+/// The transport a PostgreSQL DSN would open, read the way libpq and sqlx
+/// read it (#3866). A `host` (or `hostaddr`) query parameter overrides
+/// the authority host, the LAST occurrence wins, and a host that starts
+/// with `/` is a Unix-domain socket DIRECTORY; an empty authority with no
+/// `host`/`hostaddr` parameter is libpq's DEFAULT socket directory. TLS
+/// does not run on a socket, so `sslmode` is meaningless there — libpq
+/// silently ignores it (measured: connects, `ssl=f`) and sqlx refuses
+/// with "server does not support TLS" (measured). Either way the query
+/// string cannot establish the transport, which is why the floor must
+/// read this first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DsnTransport {
+    /// A TCP host (name or address) — the effective host after the
+    /// `host`/`hostaddr` override.
+    Tcp {
+        /// The host the driver would dial.
+        host: String,
+    },
+    /// A Unix-domain socket directory (`host=/…`, or libpq's default when
+    /// nothing names a host).
+    UnixSocket {
+        /// The socket directory, or [`LIBPQ_DEFAULT_SOCKET_DIR`].
+        dir: String,
+    },
+    /// Not a `postgres://` / `postgresql://` URL the drivers would parse
+    /// (a userinfo with an empty authority, another scheme, garbage).
+    Unparseable,
+}
+
+/// The label for libpq's compiled-in default socket directory, which this
+/// process cannot know (it depends on how the client library was built).
+pub const LIBPQ_DEFAULT_SOCKET_DIR: &str = "<libpq default socket directory>";
+
+/// Classify a PostgreSQL DSN's transport — see [`DsnTransport`].
 #[must_use]
-pub fn dsn_pins_sslmode_verify_full(dsn: &str) -> bool {
+pub fn dsn_transport(dsn: &str) -> DsnTransport {
+    let Ok(parsed) = reqwest::Url::parse(dsn.trim()) else {
+        return DsnTransport::Unparseable;
+    };
+    let scheme = parsed.scheme().to_ascii_lowercase();
+    if scheme != "postgres" && scheme != "postgresql" {
+        return DsnTransport::Unparseable;
+    }
+    // The last `host` / `hostaddr` parameter wins (libpq precedence);
+    // `query_pairs` percent-decodes, so `host=%2Fvar%2Frun` is a socket
+    // directory too.
+    let mut param_host: Option<String> = None;
+    for (k, v) in parsed.query_pairs() {
+        if k.eq_ignore_ascii_case("host") || k.eq_ignore_ascii_case("hostaddr") {
+            param_host = Some(v.trim().to_string());
+        }
+    }
+    let effective = match param_host {
+        Some(h) if !h.is_empty() => h,
+        _ => parsed.host_str().unwrap_or("").trim().to_string(),
+    };
+    if effective.is_empty() {
+        return DsnTransport::UnixSocket {
+            dir: LIBPQ_DEFAULT_SOCKET_DIR.to_string(),
+        };
+    }
+    if effective.starts_with('/') {
+        return DsnTransport::UnixSocket { dir: effective };
+    }
+    DsnTransport::Tcp { host: effective }
+}
+
+/// The transit floor's verdict on a PostgreSQL DSN (#3866): the transport
+/// first, then — on TCP only — whether the LAST `sslmode` in the query
+/// string is `verify-full` (libpq honours the last occurrence, so a
+/// trailing `&sslmode=require` cannot be masked by an earlier
+/// `verify-full`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SslmodeFloor {
+    /// TCP transport and `sslmode=verify-full` pinned.
+    Pinned {
+        /// The host the driver would dial.
+        host: String,
+    },
+    /// TCP transport, floor not pinned (absent, weaker, or overridden by a
+    /// later `sslmode`).
+    NotPinned {
+        /// The host the driver would dial.
+        host: String,
+    },
+    /// Unix-domain socket transport: TLS does not apply, so no query
+    /// parameter can satisfy the floor.
+    UnixSocket {
+        /// The socket directory, or [`LIBPQ_DEFAULT_SOCKET_DIR`].
+        dir: String,
+    },
+    /// Not a DSN the drivers parse.
+    Unparseable,
+}
+
+/// Evaluate the floor for `dsn` — see [`SslmodeFloor`].
+#[must_use]
+pub fn dsn_sslmode_floor(dsn: &str) -> SslmodeFloor {
+    let host = match dsn_transport(dsn) {
+        DsnTransport::Tcp { host } => host,
+        DsnTransport::UnixSocket { dir } => return SslmodeFloor::UnixSocket { dir },
+        DsnTransport::Unparseable => return SslmodeFloor::Unparseable,
+    };
     let Some((_, query)) = dsn.split_once('?') else {
-        return false;
+        return SslmodeFloor::NotPinned { host };
     };
     let mut last_sslmode: Option<&str> = None;
     for pair in query.split('&') {
@@ -311,7 +408,53 @@ pub fn dsn_pins_sslmode_verify_full(dsn: &str) -> bool {
             last_sslmode = Some(v.trim());
         }
     }
-    last_sslmode.is_some_and(|v| v.eq_ignore_ascii_case(PG_SSLMODE_FLOOR))
+    if last_sslmode.is_some_and(|v| v.eq_ignore_ascii_case(PG_SSLMODE_FLOOR)) {
+        SslmodeFloor::Pinned { host }
+    } else {
+        SslmodeFloor::NotPinned { host }
+    }
+}
+
+/// Whether a PostgreSQL DSN pins `sslmode=verify-full` ON A TCP TRANSPORT.
+/// Shared by the connect funnel (the floor), the enterprise posture (check
+/// #15) and doctor. #3866: a Unix-socket DSN is `false` whatever its query
+/// string says — TLS does not run on a socket; the three consumers render
+/// the transport via [`dsn_sslmode_floor`] rather than guessing from this
+/// bool.
+#[must_use]
+pub fn dsn_pins_sslmode_verify_full(dsn: &str) -> bool {
+    matches!(dsn_sslmode_floor(dsn), SslmodeFloor::Pinned { .. })
+}
+
+/// The refusal for a PostgreSQL DSN whose transport is a Unix-domain socket
+/// (#3866). Names the transport and the socket directory (a path, never a
+/// credential); never echoes the DSN. In v1.0.0 the floor has no in-kernel
+/// exemption — whether a socket counts as encrypted-by-locality is the
+/// question deferred to v1.0.x together with #3827, and one ruling must
+/// cover both; until then a socket DSN is refused by name instead of
+/// failing later with the driver's "server does not support TLS".
+#[must_use]
+pub fn pg_unix_socket_refusal(dir: &str) -> String {
+    format!(
+        "{ISSUE_TAG}: refusing the PostgreSQL store DSN: its transport is a Unix-domain socket \
+         (host={dir}), where sslmode does not apply — TLS cannot run on a socket, so \
+         `sslmode={PG_SSLMODE_FLOOR}` in the query string does not encrypt anything, and the \
+         transit-encryption floor has no in-kernel exemption in v1.0.0 ({MANDATE}; #3866 — the \
+         socket-as-IPC question is deferred to v1.0.x with #3827). Fix: connect over TCP and \
+         {REMEDY_PG_SSLMODE}."
+    )
+}
+
+/// The refusal for a PostgreSQL DSN the drivers would not parse (#3866).
+/// Never echoes the DSN.
+#[must_use]
+pub fn pg_dsn_unparseable_refusal() -> String {
+    format!(
+        "{ISSUE_TAG}: refusing the PostgreSQL store DSN: it is not a `postgres://` URL the \
+         driver parses (a userinfo with no host, another scheme, or malformed), so its transport \
+         cannot be established ({MANDATE}). Fix: `postgres://user:pass@host:port/db?` and \
+         {REMEDY_PG_SSLMODE}."
+    )
 }
 
 /// The refusal for a PostgreSQL DSN below the `sslmode` floor. Never echoes
@@ -440,6 +583,105 @@ mod tests {
         assert!(!dsn_pins_sslmode_verify_full(
             "postgres://u@h/db?sslmode=verify-ca"
         ));
+    }
+
+    /// #3866 — the transport classifier reads the DSN the way libpq and sqlx
+    /// do: `host`/`hostaddr` override the authority (last wins), a leading
+    /// `/` is a socket directory, an empty authority with no host parameter
+    /// is libpq's default socket, and only `postgres`/`postgresql` parse.
+    #[test]
+    fn dsn_transport_classifier_3866() {
+        use DsnTransport::{Tcp, UnixSocket, Unparseable};
+        let tcp = |h: &str| Tcp {
+            host: h.to_string(),
+        };
+        let sock = |d: &str| UnixSocket { dir: d.to_string() };
+        assert_eq!(
+            dsn_transport("postgres://u:p@db.example:5432/mem"),
+            tcp("db.example")
+        );
+        assert_eq!(dsn_transport("postgresql://u@[::1]/mem"), tcp("[::1]"));
+        assert_eq!(
+            dsn_transport("postgres:///mem?host=db.example"),
+            tcp("db.example")
+        );
+        assert_eq!(
+            dsn_transport("postgres:///mem?hostaddr=10.0.0.5"),
+            tcp("10.0.0.5")
+        );
+        assert_eq!(
+            dsn_transport("postgres://u@ignored/mem?host=/var/run/postgresql"),
+            sock("/var/run/postgresql")
+        );
+        assert_eq!(
+            dsn_transport("postgres:///mem?host=%2Fvar%2Frun%2Fpostgresql"),
+            sock("/var/run/postgresql")
+        );
+        // last host wins, both directions
+        assert_eq!(
+            dsn_transport("postgres:///mem?host=/tmp&host=db.example"),
+            tcp("db.example")
+        );
+        assert_eq!(
+            dsn_transport("postgres:///mem?host=db.example&host=/tmp"),
+            sock("/tmp")
+        );
+        // libpq default socket: nothing names a host
+        assert_eq!(
+            dsn_transport("postgres:///mem"),
+            sock(LIBPQ_DEFAULT_SOCKET_DIR)
+        );
+        assert_eq!(
+            dsn_transport("postgres:///mem?sslmode=verify-full"),
+            sock(LIBPQ_DEFAULT_SOCKET_DIR)
+        );
+        // not a DSN the drivers parse
+        assert_eq!(
+            dsn_transport("postgres://u:p@/mem"),
+            Unparseable,
+            "userinfo with an empty host"
+        );
+        assert_eq!(dsn_transport("mysql://h/db"), Unparseable);
+        assert_eq!(dsn_transport("not a url"), Unparseable);
+        assert_eq!(dsn_transport(""), Unparseable);
+    }
+
+    /// #3866 — the floor is transport-aware: verify-full pins only on TCP;
+    /// a socket is `UnixSocket` whatever the query says; the bool consumer
+    /// is `Pinned` and nothing else.
+    #[test]
+    fn dsn_sslmode_floor_is_transport_aware_3866() {
+        assert_eq!(
+            dsn_sslmode_floor("postgres://u@h/db?sslmode=verify-full"),
+            SslmodeFloor::Pinned {
+                host: "h".to_string()
+            }
+        );
+        assert_eq!(
+            dsn_sslmode_floor("postgres://u@h/db?sslmode=require"),
+            SslmodeFloor::NotPinned {
+                host: "h".to_string()
+            }
+        );
+        assert_eq!(
+            dsn_sslmode_floor("postgres:///mem?host=/var/run/postgresql&sslmode=verify-full"),
+            SslmodeFloor::UnixSocket {
+                dir: "/var/run/postgresql".to_string()
+            }
+        );
+        assert_eq!(
+            dsn_sslmode_floor("postgres://u:p@/mem?sslmode=verify-full"),
+            SslmodeFloor::Unparseable
+        );
+        assert!(!dsn_pins_sslmode_verify_full(
+            "postgres:///mem?host=/var/run/postgresql&sslmode=verify-full"
+        ));
+        assert!(!dsn_pins_sslmode_verify_full("garbage?sslmode=verify-full"));
+        // the three refusals name their cause and the fix, never a DSN
+        let sock = pg_unix_socket_refusal("/var/run/postgresql");
+        assert!(sock.contains("Unix-domain socket") && sock.contains("host=/var/run/postgresql"));
+        assert!(sock.contains(REMEDY_PG_SSLMODE) && sock.contains("#3827"));
+        assert!(pg_dsn_unparseable_refusal().contains(REMEDY_PG_SSLMODE));
     }
 
     #[test]

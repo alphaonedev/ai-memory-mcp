@@ -1313,13 +1313,29 @@ fn section_transit_encryption_3705(conn: Option<&rusqlite::Connection>) -> Repor
         {
             "sqlite (store URL is not postgres)".to_string()
         }
-        Ok(Some(dsn)) if transit_encryption::dsn_pins_sslmode_verify_full(&dsn) => {
-            format!("postgres: sslmode={PG_SSLMODE_FLOOR} pinned")
-        }
-        Ok(Some(_)) => {
-            refuses.push("store URL sslmode".to_string());
-            format!("postgres: sslmode={PG_SSLMODE_FLOOR} NOT pinned — REFUSES at connect")
-        }
+        // #3866 — the transport is rendered, never inferred from the query
+        // string: a Unix-socket DSN is refused at connect whatever it says.
+        Ok(Some(dsn)) => match transit_encryption::dsn_sslmode_floor(&dsn) {
+            transit_encryption::SslmodeFloor::Pinned { host } => {
+                format!("postgres over TCP ({host}): sslmode={PG_SSLMODE_FLOOR} pinned")
+            }
+            transit_encryption::SslmodeFloor::NotPinned { host } => {
+                refuses.push("store URL sslmode".to_string());
+                format!(
+                    "postgres over TCP ({host}): sslmode={PG_SSLMODE_FLOOR} NOT pinned — REFUSES at connect"
+                )
+            }
+            transit_encryption::SslmodeFloor::UnixSocket { dir } => {
+                refuses.push("store URL transport".to_string());
+                format!(
+                    "postgres over a Unix-domain socket (host={dir}): sslmode does not apply on this transport — REFUSES at connect (#3866)"
+                )
+            }
+            transit_encryption::SslmodeFloor::Unparseable => {
+                refuses.push("store URL".to_string());
+                "postgres: DSN not parseable by the driver — REFUSES at connect (#3866)".to_string()
+            }
+        },
         Err(e) => format!("unresolvable: {e:#}"),
     };
     let (webhook_targets, webhook_plaintext) = match conn {

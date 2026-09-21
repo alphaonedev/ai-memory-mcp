@@ -2606,10 +2606,26 @@ impl PostgresStore {
         // tests) goes through, so the sslmode=verify-full floor cannot be
         // bypassed. Refused BEFORE any socket is opened; the DSN is never
         // echoed (it may carry credentials).
-        if !crate::transit_encryption::dsn_pins_sslmode_verify_full(url) {
-            return Err(StoreError::InvalidInput {
-                detail: crate::transit_encryption::pg_sslmode_refusal(),
-            });
+        // #3866 — the TRANSPORT decides first: a Unix-domain socket cannot
+        // carry TLS, so it is refused BY NAME here rather than surfacing the
+        // driver's "server does not support TLS" on the first connect.
+        match crate::transit_encryption::dsn_sslmode_floor(url) {
+            crate::transit_encryption::SslmodeFloor::Pinned { .. } => {}
+            crate::transit_encryption::SslmodeFloor::UnixSocket { dir } => {
+                return Err(StoreError::InvalidInput {
+                    detail: crate::transit_encryption::pg_unix_socket_refusal(&dir),
+                });
+            }
+            crate::transit_encryption::SslmodeFloor::Unparseable => {
+                return Err(StoreError::InvalidInput {
+                    detail: crate::transit_encryption::pg_dsn_unparseable_refusal(),
+                });
+            }
+            crate::transit_encryption::SslmodeFloor::NotPinned { .. } => {
+                return Err(StoreError::InvalidInput {
+                    detail: crate::transit_encryption::pg_sslmode_refusal(),
+                });
+            }
         }
 
         let options: PgConnectOptions =
