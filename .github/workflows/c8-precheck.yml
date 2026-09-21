@@ -749,15 +749,15 @@ jobs:
         timeout-minutes: 1
         env:
           PYTHONDONTWRITEBYTECODE: '1'
-        # Three sample/quantile pins, four lifecycle pins and native-control accounting.
+        # Three sample/quantile pins, four lifecycle pins, native accounting and cleanup.
         # No native database or latency run: fail on missing, skipped or xfail tests.
         run: |
           python3 - <<'PY'
           import unittest
           suite = unittest.defaultTestLoader.discover('scripts/evidence', pattern='test_graph_baseline.py')
           listed = suite.countTestCases()
-          if listed < 8:
-              raise SystemExit('graph producer controls: fewer than eight tests listed')
+          if listed < 9:
+              raise SystemExit('graph producer controls: fewer than nine tests listed')
           result = unittest.TextTestRunner(verbosity=2).run(suite)
           if not result.wasSuccessful() or result.testsRun != listed or result.skipped or result.expectedFailures:
               raise SystemExit('graph producer controls: incomplete, failing, skipped or expected-failure tests')

@@ -52,6 +52,46 @@ class FixtureControlTests(unittest.TestCase):
             with self.subTest(listing=listed,output=result),self.assertRaises(baseline.Failure):
                 baseline.complete_fixture_controls(listed,result)
 
+class EvidenceCleanupTests(unittest.TestCase):
+    def test_cleanup_refuses_root_links_and_preserves_child_targets(self):
+        scratch=baseline.ROOT/'.local-runs'
+        scratch.mkdir(exist_ok=True)
+        source=(baseline.ROOT/'scripts/check-evidence-bundle.sh').read_text()
+        start=source.index('cleanup_evidence_selftest() {')
+        end=source.index('\n}\n\nrun_self_test()',start)+2
+        function=source[start:end]
+        def clean(path):
+            return subprocess.run(['bash','-c',function+'\ncleanup_evidence_selftest "$1"',
+                                   '--',str(path)],capture_output=True,text=True,timeout=15)
+        with tempfile.TemporaryDirectory(prefix='e6-cleanup-test-',dir=scratch) as tmp:
+            root=Path(tmp)
+            positive=root/'positive';positive.mkdir()
+            (positive/'fixture.json').write_text('{}')
+            self.assertEqual(clean(positive).returncode,0)
+            self.assertFalse(positive.exists())
+            target=root/'target';target.mkdir()
+            kept=target/'must-survive.json';kept.write_text('{}')
+            alias=root/'alias';alias.symlink_to(target,target_is_directory=True)
+            with self.subTest(boundary='root symlink'):
+                self.assertNotEqual(clean(alias).returncode,0)
+                self.assertTrue(kept.exists(),'cleanup followed its root symlink')
+            # Restore this independent positive control after a deliberately destructive RED.
+            kept.write_text('{}')
+            self.assertTrue(kept.exists())
+            child_links=root/'child-links';child_links.mkdir()
+            (child_links/'link').symlink_to(target,target_is_directory=True)
+            with self.subTest(boundary='child symlink'):
+                self.assertEqual(clean(child_links).returncode,0)
+                self.assertFalse(child_links.exists())
+                self.assertTrue(kept.exists(),'cleanup followed a child symlink')
+            nested=root/'nested';nested.mkdir()
+            (nested/'child').mkdir()
+            marker=nested/'fixture.json';marker.write_text('{}')
+            with self.subTest(boundary='unexpected directory'):
+                self.assertNotEqual(clean(nested).returncode,0)
+                self.assertTrue(marker.exists(),'refusal partially deleted fixtures')
+                self.assertTrue((nested/'child').is_dir())
+
 class ProcessTests(unittest.TestCase):
     """Real owned children; live executable hashing is stubbed for Python fixtures."""
     def setUp(self):

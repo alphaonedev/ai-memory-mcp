@@ -23,9 +23,9 @@ timeout 9000 python3 scripts/evidence/graph_baseline.py \
 ```
 
 The unconditional required-contexts job in `c8-precheck.yml` runs the Python
-producer controls on every covered PR. It requires at least eight listed and
+producer controls on every covered PR. It requires at least nine listed and
 executed tests, with no failures, skips or expected failures. This certifies
-the producer's synthetic controls; the native benchmark remains a separately
+the producer's synthetic controls, including cleanup root-link refusal; the native benchmark remains a separately
 measured run on the final source and native cluster.
 
 The tree must be clean and committed. First, E1 conformance must pass on that

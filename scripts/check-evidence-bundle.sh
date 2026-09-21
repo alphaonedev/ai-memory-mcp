@@ -122,10 +122,22 @@ cleanup_evidence_selftest() {
   # Delete only this test's flat fixture files; refuse unexpected directories.
   python3 - "$1" <<'PY_CLEANUP'
 from pathlib import Path
+import os
+import stat
 import sys
 root = Path(sys.argv[1])
-for child in root.iterdir():
-    child.unlink()
+# Open the root itself without following a link, then anchor every child
+# operation to that descriptor. Child symlinks are unlinked, never traversed.
+fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+try:
+    names = os.listdir(fd)
+    if any(stat.S_ISDIR(os.stat(name, dir_fd=fd, follow_symlinks=False).st_mode)
+           for name in names):
+        raise IsADirectoryError('unexpected self-test directory; cleanup refused')
+    for name in names:
+        os.unlink(name, dir_fd=fd)
+finally:
+    os.close(fd)
 root.rmdir()
 PY_CLEANUP
 }
