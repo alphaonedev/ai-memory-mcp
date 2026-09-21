@@ -65,6 +65,8 @@ mod api_key_revoke_3529;
 // another agent" seam, sharing the #3529 registry advisory lock. Own module
 // for the same qual_10 budget reason as `parity_3064` above.
 mod api_key_bind_3535;
+#[cfg(test)]
+mod path_predicate_tests;
 mod pubkey_history;
 // #3527 — the single funnel that allocates a hash-chain `sequence` and
 // appends the row claiming it, for BOTH postgres chains. Own module for the
@@ -12847,63 +12849,18 @@ impl PostgresStore {
         max_depth: Option<usize>,
         max_results: Option<usize>,
     ) -> StoreResult<Vec<Vec<String>>> {
-        // v1.0.0 #2582 — the relational recursive CTE is now the ONLY
-        // `find_paths` implementation, on BOTH `KgBackend` values.
+        // #3609 — deliberately use the relational reader on both backends.
+        // AGE 1.8.0 executes scalar-list ALL/ANY, but the former ALL over
+        // relationships(p) fails at runtime on a seeded path. The native
+        // path_predicate_tests pin that limitation with a live control.
         //
-        // ## This changes zero answers
-        //
-        // `build_find_paths_current_view_cypher` (DELETED, #2613) emitted
-        // an `ALL(e IN relationships(p) WHERE …)` guard. On AGE **1.7.0**
-        // that was a PARSE rejection (`syntax error at or near "("`).
-        // The certified pin is now AGE **1.8.0** (`EXPECTED_AGE_VERSION`;
-        // `deploy/docker-1461/provision/lib.sh`). Re-verified #3297 on a
-        // live 1.8.0 extversion: `ALL(x IN [1,2,3] WHERE …)` and
-        // `ANY(…)` now PARSE and return; `filter(…)` still parse-rejects;
-        // the find_paths `ALL(e IN relationships(p) WHERE e.valid_until
-        // IS NULL)` still does NOT succeed — it fails at RUNTIME
-        // (`ERROR: no relation entry for relid 2`) on a seeded
-        // two-vertex graph. Capture: `docs/kg-find-paths-engine.md`.
-        // Restoring an AGE `find_paths` reader is follow-up #3609, not
-        // this path: the dispatcher stays the relational CTE on BOTH
-        // `KgBackend` values because even a PARSEABLE AGE walk is a
-        // `Seq Scan` over vertices (below). 100% of production
-        // `find_paths` answers already came from the CTE.
-        //
-        // ## And fixing the Cypher would be the wrong repair anyway
-        //
-        // Measured on a purpose-built 20,003-vertex / 60,000-edge graph
-        // (avg out-degree 3), a PARSEABLE depth-4 AGE traversal returning
-        // 120 rows takes **999 ms**; the equivalent relational recursive
-        // CTE over the same edges takes **1.139 ms** — ~877x. The AGE plan
-        // is a Nested Loop whose OUTER side is a `Seq Scan` over ALL 20,003
-        // vertices, with 2,400,240 rows removed by
-        // `age_match_vle_terminal_edge`, plus 70 ms inside `age_vle` itself.
-        // That cost scales with |V|, not with depth, so there is no depth K
-        // at which AGE wins and the crossover only moves further away as a
-        // corpus grows. A vertex-property index does not rescue it either
-        // (999 ms -> 979 ms; it fixes the O(V) START lookup, not the walk).
-        //
-        // ## Integrity
-        //
-        // Strictly a consistency IMPROVEMENT: `memory_links` is the durable
-        // relational truth while the AGE projection is a derived, disposable
-        // artifact that can lag it. #1735 already routed `deferred` mode
-        // here for exactly that read-your-own-write reason; `sync` mode now
-        // gets the same guarantee.
-        //
-        // v1.0.0 #2613 — `find_paths_cypher` + its
-        // `build_find_paths_current_view_cypher` builder are DELETED (not
-        // retained). Since #2582 the dispatcher hardcodes the CTE on BOTH
-        // backends and the measurements above prove the AGE traversal can
-        // never win at any depth, so a ported Cypher path would only ever be
-        // parseable dead code advertising a `KgBackend::Age` capability the
-        // runtime never reaches. Deleting it — and letting the surface
-        // honestly report path resolution as CTE-served on AGE (the connect-
-        // time WARN below) — closes the honesty gap rather than papering over
-        // it. 5-agent vote (4d3ea1c5), unanimous DELETE. The #2032 L4 Cypher-
-        // injection surface it guarded is gone WITH it (no inlined-id Cypher
-        // `find_paths` statement remains to guard), and the equivalence suites
-        // now exercise the `find_paths` dispatcher — what production serves.
+        // The legacy `_cte` name now denotes #3196's bounded frontier BFS
+        // over durable memory_links, retaining current-view, cycle, depth,
+        // prefix-budget and result-cap semantics even when AGE lags. No
+        // speculative Cypher reader or per-request failing probe is served.
+        // Earlier #2582 timings describe one corpus, not a universal claim
+        // that AGE can never win. Decision and reproducible pins:
+        // docs/kg-find-paths-engine.md.
         self.find_paths_cte(source_id, target_id, max_depth, max_results)
             .await
     }
