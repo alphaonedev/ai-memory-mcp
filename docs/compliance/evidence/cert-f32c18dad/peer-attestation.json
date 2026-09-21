@@ -1,0 +1,1 @@
+{"peer-a":{"allowed_sender_agent_ids":["agent-a"],"allowed_namespaces":["team-x/ops","team-x/shared"]}}
