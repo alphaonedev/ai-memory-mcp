@@ -55,7 +55,15 @@ async fn deny_reason_carries_neither_hook_stdout_nor_the_command_path_3708() {
     let script = write_script(
         &dir,
         "unknown_action_with_secret.sh",
-        &format!("#!/bin/sh\nprintf '%s\\n' '{{\"action\":\"{SENTINEL}\"}}'\n"),
+        // #3708 — `cat >/dev/null` DRAINS stdin before printing. Without it the
+        // script exits the instant `printf` returns, closing its stdin read-end
+        // while `drive_exec_child` is still `write_all`-ing the envelope, so the
+        // parent's write races the child exit and hits EPIPE (BrokenPipe, os
+        // error 32) -> ExecutorError::Io -> a spurious fail-closed Deny 503 that
+        // pre-empts the `undecodable` verdict this test asserts. Measured: 836 of
+        // 960 fires EPIPE'd on the non-draining shape, 0 of 960 with the drain.
+        // Same convention as tests/hooks_executor_test.rs + hooks_hot_reload.rs.
+        &format!("#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' '{{\"action\":\"{SENTINEL}\"}}'\n"),
     );
     let script_name = script
         .file_name()
@@ -107,7 +115,10 @@ async fn a_well_formed_hook_is_unaffected_by_the_closed_vocabulary_3708() {
     let script = write_script(
         &dir,
         "well_formed_allow.sh",
-        "#!/bin/sh\nprintf '%s\\n' '{\"action\":\"allow\"}'\n",
+        // #3708 — drain stdin (see the note in the sibling test); a
+        // non-draining exit races `drive_exec_child`'s stdin write -> EPIPE ->
+        // a spurious fail-closed Deny that fails this allow-path control.
+        "#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' '{\"action\":\"allow\"}'\n",
     );
     let chain = HookChain::new(vec![cfg_for(script)]);
     let mut registry = ExecutorRegistry::new();
