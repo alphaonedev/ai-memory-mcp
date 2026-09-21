@@ -97,6 +97,8 @@ mod graph_conformance;
 use crate::models::field_names;
 use std::time::Duration;
 
+mod drainer;
+
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
@@ -13968,60 +13970,6 @@ impl PostgresStore {
                 }
             }
         }
-    }
-
-    /// #1735 (Pillar-4 4.C) — spawn the cold-path AGE-projection drainer.
-    /// Drains once immediately at boot (crash-recovery: pick up any
-    /// `kg_projection_outbox` rows a previous process left pending between
-    /// the relational commit and the projection), then drains every
-    /// `interval`. Supervised by construction: every drain step returns a
-    /// `Result` that is logged and swallowed, so a transient AGE/DB error
-    /// never panics the task or aborts the loop.
-    ///
-    /// v1.0.0 batch-2 — spawned by `serve` on ANY postgres+AGE backend, not
-    /// only under `AI_MEMORY_AGE_PROJECTION_MODE=deferred`: sync mode now also
-    /// RECORDS unreconciled projections/unprojections here when an AGE runtime
-    /// failure prevents the inline write, so a sync deployment needs the same
-    /// self-heal. On a healthy sync deployment the queue is empty and every
-    /// tick is a single indexed no-op count.
-    pub fn spawn_drainer(
-        self: std::sync::Arc<Self>,
-        interval: std::time::Duration,
-    ) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move {
-            // Boot-recovery drain — self-heal projections orphaned by a crash.
-            if let Err(e) = self
-                .drain_kg_projection_outbox(Self::AGE_PROJECTION_DRAIN_BATCH)
-                .await
-            {
-                tracing::warn!(
-                    target: TRACE_TARGET_KG,
-                    err = %e,
-                    "kg_projection drainer: boot-recovery drain failed (will retry on tick)"
-                );
-            }
-            let mut ticker = tokio::time::interval(interval);
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                ticker.tick().await;
-                match self
-                    .drain_kg_projection_outbox(Self::AGE_PROJECTION_DRAIN_BATCH)
-                    .await
-                {
-                    Ok(n) if n > 0 => tracing::debug!(
-                        target: TRACE_TARGET_KG,
-                        projected = n,
-                        "kg_projection drainer: projected pending edges into memory_graph"
-                    ),
-                    Ok(_) => {}
-                    Err(e) => tracing::warn!(
-                        target: TRACE_TARGET_KG,
-                        err = %e,
-                        "kg_projection drainer: drain tick failed; will retry next interval"
-                    ),
-                }
-            }
-        })
     }
 
     /// Map a `memories` row into a [`Memory`], FAIL-CLOSED on an undecryptable
