@@ -194,12 +194,24 @@ run_gate() {
     return 0
 }
 
+cleanup_selftest_files() {
+    # Only the flat files this self-test created; refuse unexpected directories.
+    python3 - "$1" <<'PY_CLEANUP'
+from pathlib import Path
+import sys
+root = Path(sys.argv[1])
+for child in root.iterdir():
+    child.unlink()
+root.rmdir()
+PY_CLEANUP
+}
+
 self_test() {
     local scratch
     scratch="$ROOT/.local-runs/cert-leg-nonvacuity-selftest-$$"
     mkdir -p "$scratch"
     # shellcheck disable=SC2064
-    trap "rm -rf '$scratch'" EXIT
+    trap "cleanup_selftest_files '$scratch'" EXIT
 
     local saved_r="$RATCHET_FILE" saved_a="$ALLOW_FILE"
     RATCHET_FILE="$scratch/ratchet.txt"
