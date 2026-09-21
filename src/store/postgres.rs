@@ -98,6 +98,8 @@ use crate::models::field_names;
 use std::time::Duration;
 
 mod drainer;
+#[cfg(test)]
+mod engine_divergence_tests;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -11572,15 +11574,16 @@ impl PostgresStore {
             .into_iter()
             .collect();
         decoded.retain(|r| visible.contains(&r.target_id));
-        // v1.0.0 batch-2 parity — mirror the CTE branch's deterministic order
-        // and row cap so the two postgres branches (and the sqlite SSOT) return
-        // the SAME bounded page for the same traversal. Sorting BEFORE
-        // truncating is what makes the cap a stable prefix rather than an
-        // arbitrary subset: DEGRADE (fewer rows), never WRONG rows.
+        // #3810 — total observable order before truncation. Parallel relations
+        // and diamond paths must select the same page as the PostgreSQL CTE.
+        // Its explicit C collation matches Rust's byte ordering. SQLite retains
+        // its separate temporal-priority ordering; no cross-backend order claim.
         decoded.sort_by(|a, b| {
             a.depth
                 .cmp(&b.depth)
                 .then_with(|| a.target_id.cmp(&b.target_id))
+                .then_with(|| a.relation.cmp(&b.relation))
+                .then_with(|| a.path.cmp(&b.path))
         });
         decoded.truncate(kg_query_row_cap(None));
         // #3424 — hydrate the five display fields on the FINAL, capped set.
@@ -11595,11 +11598,9 @@ impl PostgresStore {
 
     /// Recursive-CTE fallback for `kg_query` on Postgres.
     ///
-    /// Mirrors the SQLite recursive-CTE in `db::kg_query` so deployments
-    /// running vanilla Postgres (no AGE extension) still get the same
-    /// traversal semantics. Returns the shared [`KgQueryRow`] shape —
-    /// the dispatcher in [`Self::kg_query`] doesn't have to care which
-    /// branch ran.
+    /// Supports vanilla Postgres without AGE and returns the shared
+    /// [`KgQueryRow`] shape. Both PostgreSQL engines order by depth, target ID,
+    /// relation, and path; SQLite retains its separate temporal ordering.
     ///
     /// # Errors
     ///
@@ -11667,7 +11668,9 @@ impl PostgresStore {
                    array_to_string(nodes, '->') AS path
             FROM traversal
             WHERE EXISTS (SELECT 1 FROM memories m WHERE m.id = traversal.target_id {lifecycle_vis})
-            ORDER BY depth ASC, target_id ASC
+            ORDER BY depth ASC, target_id COLLATE \"C\" ASC,
+                     relation COLLATE \"C\" ASC,
+                     array_to_string(nodes, '->') COLLATE \"C\" ASC
             LIMIT $3",
             // v1.0.0 R19/A3 (#1948) — fail-closed lifecycle allow-list on the
             // general KG graph traversal, matching the SQLite `kg_query`
@@ -11681,7 +11684,7 @@ impl PostgresStore {
         // v1.0.0 batch-2 parity — bound the result set exactly as the sqlite
         // SSOT does (`crate::storage::kg_query` clamps to
         // KG_QUERY_DEFAULT_LIMIT/KG_QUERY_MAX_LIMIT). Applied AFTER the
-        // deterministic `ORDER BY depth ASC, target_id ASC`, so the capped page
+        // total `(depth, target_id, relation, path)` order, so the capped page
         // is a stable prefix, never a random subset. PERF-07 — `TryFrom`,
         // never `as`.
         let row_cap = i64::try_from(kg_query_row_cap(None)).unwrap_or(i64::MAX);
@@ -12111,7 +12114,11 @@ impl PostgresStore {
                     target_id,
                     relation,
                     valid_from: valid_from.to_rfc3339(),
-                    valid_until: valid_until.map(|t| t.to_rfc3339()),
+                    // #3809 — share write-side canonicalization only for present stamps.
+                    // The helper maps None to now; a live edge must remain None.
+                    valid_until: valid_until.map(|t| {
+                        crate::storage::canonicalize_valid_until_stamp(Some(&t.to_rfc3339()))
+                    }),
                     observed_by,
                     title,
                     target_namespace,
@@ -18571,8 +18578,8 @@ const KG_TIMELINE_MAX_LIMIT_SAL: usize = 1000;
 
 /// v1.0.0 batch-2 cross-backend parity — postgres mirror of the sqlite
 /// `kg_query` default row cap (`crate::storage::KG_QUERY_DEFAULT_LIMIT`). The
-/// sqlite SAL adapter always passes `limit = None`, so 200 is the row count
-/// BOTH backends return for the same traversal.
+/// SQLite SAL adapter always passes `limit = None`; both backends therefore
+/// cap at 200 rows, but their different ordering contracts can select different rows.
 const KG_QUERY_DEFAULT_LIMIT_SAL: usize = 200;
 
 /// v1.0.0 batch-2 cross-backend parity — postgres mirror of the sqlite
@@ -18586,10 +18593,10 @@ const KG_QUERY_MAX_LIMIT_SAL: usize = 1000;
 /// `[1, KG_QUERY_MAX_LIMIT_SAL]`; both postgres traversal branches carried NO
 /// row cap at all, so a dense graph could materialize every simple path up to
 /// depth 5 (combinatorial) into memory and onto the wire, AND returned a
-/// different result set than sqlite for an identical call. DEGRADE (fewer
-/// rows, deterministic order), never CORRUPT: both branches order by
-/// `(depth ASC, target_id ASC)` before truncating, so the capped page is a
-/// stable prefix of the full result — identical to what sqlite returns.
+/// different row count than SQLite for an identical call. Both PostgreSQL
+/// branches now order by `(depth, target_id, relation, path)` before truncating,
+/// selecting the same stable prefix when their candidate sets agree. SQLite
+/// retains its independent temporal ordering; only the row cap is shared.
 fn kg_query_row_cap(limit: Option<usize>) -> usize {
     limit
         .unwrap_or(KG_QUERY_DEFAULT_LIMIT_SAL)

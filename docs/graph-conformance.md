@@ -45,8 +45,11 @@ edge whose stamp is independently checked in both stores **before** reads.
 Query depth 1/2/3, lineage in both directions, timeline, and invalidation run
 both engines directly. `find_paths` is honestly classified as relational on
 an AGE-enabled store (#2582/#2613); it is not counted as two-engine coverage.
-The raw historical timestamp discrepancy is deliberately pinned as a known
-divergence (#3809) pending E2; convergence must turn that pin red.
+E2 (#3809) made the known historical timestamp-divergence pin fail by
+canonicalizing both engines to UTC `Z`. The pin now requires each engine to
+return the expected stamp and requires equality between them. The historical
+`divergence-timeline-*` evidence labels remain stable; these cells now prove
+canonical timestamp parity.
 
 `python3 scripts/check_graph_conformance_log.py --self-test` runs the Python
 gate's positive/negative controls and the Rust-AST inventory guard with its
