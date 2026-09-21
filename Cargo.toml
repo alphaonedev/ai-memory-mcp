@@ -655,3 +655,16 @@ too_many_lines = { level = "warn", priority = -1 }
 [lib]
 name = "ai_memory"
 crate-type = ["rlib", "staticlib", "cdylib"]
+
+[[bench]]
+name = "graph_native_baseline"
+harness = false
+required-features = ["sal-postgres"]
+
+# Reproducible optimized measurement profile; avoid fat-LTO memory pressure
+# on the shared native host. This is not the shipping release profile.
+[profile.graph-bench]
+inherits = "release"
+lto = false
+codegen-units = 16
+debug = 0
