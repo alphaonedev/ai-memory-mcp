@@ -72,11 +72,12 @@
 #     bound to <sha> must have NO wire-surface drift between <sha> and
 #     HEAD (paths and AI_MEMORY_FED_* identifiers, the same surface as
 #     TASK C); otherwise the gate FAILS naming the drift. STATUS VOID or
-#     EXPIRED makes no live claim and is never failed by (C). The bound
-#     SHA must be an ancestor of HEAD for drift to be measurable — a
-#     squash-merge severs that ancestry, and (C) then reports N/A rather
-#     than a false red; an unparseable banner or a bound SHA absent from
-#     the repository is fail-closed. (C) is deliberately NOT "diff against
+#     EXPIRED makes no live claim and is never failed by (C). Drift is a
+#     TREE comparison (`git diff <sha> HEAD`), so ancestry is not
+#     required: a squash-merge whose watched surface equals the bound
+#     tree passes on zero drift, and a bind to an unrelated commit reds
+#     on the drift it carries; an unparseable banner or a bound SHA
+#     absent from the repository is fail-closed. (C) is deliberately NOT "diff against
 #     the pinned SHA as the PR range" (TASK C forbids that as a PR
 #     gate): it asks whether the DOC'S OWN CLAIM is true at HEAD, and
 #     the one-line remedy — record VOID/EXPIRED — is accepted by (B).
@@ -416,10 +417,12 @@ check_banner_consistency() {
         echo "check-cert-expiry: ERROR — banner is LIVE bound to ${binds} but that commit is not in this repository, so the claim cannot be checked (fail-closed, #3556)"
         return 1
     fi
-    if ! git -C "$repo" merge-base --is-ancestor "$binds" "$head"; then
-        echo "check-cert-expiry: banner LIVE bound to ${binds}, which is not an ancestor of HEAD — wire drift since the bind is not measurable on this history (N/A, #3556)"
-        return 0
-    fi
+    # Ancestry is deliberately NOT required: `git diff <binds> <head>` is a
+    # tree-to-tree comparison, so a squash-merge whose watched surface
+    # equals the bound tree passes on zero drift, and a bind pointed at
+    # some unrelated commit (an evasion) reds on the drift it carries. An
+    # ancestry-based N/A hatch was cut first and withdrawn — it was a
+    # defeat: any existing side commit would have silenced (C).
     local drift
     drift="$(wire_drift "$repo" "$binds" "$head")"
     if [[ -z "$drift" ]]; then
@@ -875,28 +878,57 @@ self_test() {
 
     git -C "$repo" reset -q --hard "$base_sha"
 
-    # (v) N/A — LIVE bound to a commit that is NOT an ancestor of HEAD (the
-    #     squash-merge shape): drift is unmeasurable on this history and the
-    #     gate says so instead of inventing a red.
+    # (v1) GREEN — LIVE bound to a commit that is NOT an ancestor of HEAD
+    #      but whose §7 watched tree equals HEAD's (the squash-merge shape):
+    #      drift is a tree comparison, so this is measurable and clean.
     git -C "$repo" checkout -q -b side "$genesis_sha"
     echo "// side" >>"$repo/src/unrelated.rs"
     git -C "$repo" add src/unrelated.rs
-    git -C "$repo" commit -q -m "side commit"
+    git -C "$repo" commit -q -m "side commit (unwatched)"
     local side_sha
     side_sha="$(git -C "$repo" rev-parse HEAD)"
     git -C "$repo" checkout -q main
     write_banner LIVE "$side_sha"
     git -C "$repo" add "$CERT_DOC"
-    git -C "$repo" commit -q -m "bind to a non-ancestor"
+    git -C "$repo" commit -q -m "bind to a non-ancestor with an identical watched tree"
     local nonancestor_sha
     nonancestor_sha="$(git -C "$repo" rev-parse HEAD)"
     if ! out="$(check_change "$repo" "$base_sha" "$nonancestor_sha")"; then
-        echo "self-test FAILED (v): a bind to a non-ancestor commit was REJECTED (must be N/A, not a false red):" >&2
+        echo "self-test FAILED (v1): a bind to a non-ancestor with an identical watched tree was REJECTED:" >&2
         echo "$out" >&2
         failed=1
     else
-        if ! printf '%s\n' "$out" | grep -q 'not an ancestor of HEAD'; then
-            echo "self-test FAILED (v): pass output did not say the drift is unmeasurable:" >&2
+        if ! printf '%s\n' "$out" | grep -q 'federation-wire surface unchanged since the bind'; then
+            echo "self-test FAILED (v1): pass output did not report zero drift since the bind:" >&2
+            echo "$out" >&2
+            failed=1
+        fi
+    fi
+
+    git -C "$repo" reset -q --hard "$base_sha"
+
+    # (v2) RED — LIVE bound to a non-ancestor commit whose watched tree
+    #      DIFFERS from HEAD's (a bind pointed somewhere convenient): the
+    #      ancestry-N/A hatch would have silenced this; the tree diff reds it.
+    git -C "$repo" checkout -q -b side2 "$genesis_sha"
+    echo "// side wire" >>"$repo/src/federation/mod.rs"
+    git -C "$repo" add src/federation/mod.rs
+    git -C "$repo" commit -q -m "side commit (watched)"
+    local side2_sha
+    side2_sha="$(git -C "$repo" rev-parse HEAD)"
+    git -C "$repo" checkout -q main
+    write_banner LIVE "$side2_sha"
+    git -C "$repo" add "$CERT_DOC"
+    git -C "$repo" commit -q -m "bind to a non-ancestor whose watched tree differs"
+    local evasive_sha
+    evasive_sha="$(git -C "$repo" rev-parse HEAD)"
+    if out="$(check_change "$repo" "$base_sha" "$evasive_sha" 2>&1)"; then
+        echo "self-test FAILED (v2): a bind to a non-ancestor with a DIFFERENT watched tree was NOT rejected (evasion open)" >&2
+        echo "$out" >&2
+        failed=1
+    else
+        if ! printf '%s\n' "$out" | grep -q "claims LIVE bound to ${side2_sha}"; then
+            echo "self-test FAILED (v2): rejection did not name the evasive bound SHA:" >&2
             echo "$out" >&2
             failed=1
         fi
@@ -988,7 +1020,7 @@ self_test() {
         echo "check-cert-expiry self-test: FAIL" >&2
         exit 2
     fi
-    echo "check-cert-expiry self-test OK: (a) watched-path violation RED with the §7 expiry sentence; (b) same change + cert-doc GREEN; (c) AI_MEMORY_FED_* identifier-add outside the path watches RED; (d) identifier-add + cert-doc GREEN; (e) unrelated src/ edit GREEN; (f) cert-doc-only GREEN; (g) federation_receive.rs RED; (h) federation_signing_check.rs RED; (h2) nested src/federation/identity/** RED; (i) watched-file rename RED (old path still named); (j) identifier-rename RED (both names listed); (k) pull_request missing PR_BASE_SHA fail-closed; (l) workflow_dispatch skip; (m) push with zero before-SHA skip; (n) unresolvable range fail-closed; (o) this checkout vs origin/release/v1.0.0 GREEN; (p) non-ASCII watched path RED (core.quotePath bypass closed); (q) wire change + incidental cert-doc edit RED (#3556 B); (r) wire change + VOID record GREEN; (s) unrelated change over a LIVE banner with wire drift since the bind RED (#3556 C, names the bound SHA and the drift); (t) unrelated change over a VOID banner GREEN; (u) stale LIVE healed by recording EXPIRED GREEN; (v) LIVE bound to a non-ancestor N/A not red; (w) unparseable STATUS line fail-closed."
+    echo "check-cert-expiry self-test OK: (a) watched-path violation RED with the §7 expiry sentence; (b) same change + cert-doc GREEN; (c) AI_MEMORY_FED_* identifier-add outside the path watches RED; (d) identifier-add + cert-doc GREEN; (e) unrelated src/ edit GREEN; (f) cert-doc-only GREEN; (g) federation_receive.rs RED; (h) federation_signing_check.rs RED; (h2) nested src/federation/identity/** RED; (i) watched-file rename RED (old path still named); (j) identifier-rename RED (both names listed); (k) pull_request missing PR_BASE_SHA fail-closed; (l) workflow_dispatch skip; (m) push with zero before-SHA skip; (n) unresolvable range fail-closed; (o) this checkout vs origin/release/v1.0.0 GREEN; (p) non-ASCII watched path RED (core.quotePath bypass closed); (q) wire change + incidental cert-doc edit RED (#3556 B); (r) wire change + VOID record GREEN; (s) unrelated change over a LIVE banner with wire drift since the bind RED (#3556 C, names the bound SHA and the drift); (t) unrelated change over a VOID banner GREEN; (u) stale LIVE healed by recording EXPIRED GREEN; (v1) LIVE bound to a non-ancestor with an identical watched tree GREEN (squash-merge shape, tree diff); (v2) LIVE bound to a non-ancestor whose watched tree differs RED (the ancestry hatch would have silenced it); (w) unparseable STATUS line fail-closed."
 }
 
 case "${1:-}" in
