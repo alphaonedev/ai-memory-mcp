@@ -12,48 +12,117 @@
     {
       "id": "continuity-cycle",
       "script": "scripts/evidence/continuity-cycle.py",
-      "outputs": ["continuity-cycle.json"],
-      "figures": ["clock_1_harness_restart_to_health_ok_ms"],
-      "binds": ["run_id", "daemon_binary_sha256", "source_commit"]
+      "outputs": [
+        "continuity-cycle.json"
+      ],
+      "figures": [
+        "clock_1_harness_restart_to_health_ok_ms"
+      ],
+      "binds": [
+        "run_id",
+        "daemon_binary_sha256",
+        "source_commit"
+      ]
     },
     {
       "id": "big10-regression",
       "script": "scripts/evidence/big10-regression.sh",
-      "outputs": ["big10-regression.json"],
-      "figures": ["plaintext_listener_absent", "anonymous_write_refused"],
-      "binds": ["run_id", "daemon_binary_sha256", "source_commit"]
+      "outputs": [
+        "big10-regression.json"
+      ],
+      "figures": [
+        "plaintext_listener_absent",
+        "anonymous_write_refused"
+      ],
+      "binds": [
+        "run_id",
+        "daemon_binary_sha256",
+        "source_commit"
+      ]
     },
     {
       "id": "mcp-tools-state",
       "script": "scripts/evidence/mcp-tools-state.py",
-      "outputs": ["mcp-tools-state.json"],
-      "figures": ["mcp_tools_functional", "mcp_tools_validated", "mcp_tools_failclosed"],
-      "binds": ["run_id", "source_commit"],
+      "outputs": [
+        "mcp-tools-state.json"
+      ],
+      "figures": [
+        "mcp_tools_functional",
+        "mcp_tools_validated",
+        "mcp_tools_failclosed"
+      ],
+      "binds": [
+        "run_id",
+        "source_commit"
+      ],
       "note": "Refuses to invent a percentage. Requires --run-dir of a named tools/list capture. The unpublished 95 % dashboard figure has no producer and is retired until a named run is supplied."
     },
     {
       "id": "collect-evidence-2921",
       "script": "scripts/bench/collect-evidence.sh",
-      "outputs": ["docs/bench/evidence-2921/"],
-      "figures": ["ops_p50_p99", "mesh_rung_summary"],
-      "binds": ["run_id"],
+      "outputs": [
+        "docs/bench/evidence-2921/"
+      ],
+      "figures": [
+        "ops_p50_p99",
+        "mesh_rung_summary"
+      ],
+      "binds": [
+        "run_id"
+      ],
       "note": "Existing tracked sanitiser. Does not produce continuity or Big-10."
     },
     {
       "id": "test-attestation",
       "script": "infra/do-hive/crypto/test-attestation.sh",
-      "outputs": ["attestation-summary"],
-      "figures": ["attest_level_agent_attested"],
-      "binds": ["run_id", "daemon_binary_sha256"],
+      "outputs": [
+        "attestation-summary"
+      ],
+      "figures": [
+        "attest_level_agent_attested"
+      ],
+      "binds": [
+        "run_id",
+        "daemon_binary_sha256"
+      ],
       "note": "#3543: stored attest_level mismatch is a non-zero exit; the inert XDG tier=keyword override is removed."
     },
     {
       "id": "swarm-coverage",
       "script": "sdk/python/swarm/coverage.py",
-      "outputs": ["coverage-matrix"],
-      "figures": ["swarm_covered", "swarm_pending"],
-      "binds": ["run_id"],
+      "outputs": [
+        "coverage-matrix"
+      ],
+      "figures": [
+        "swarm_covered",
+        "swarm_pending"
+      ],
+      "binds": [
+        "run_id"
+      ],
       "note": "#3543: covered requires a persisted memory_id or documented EXPECTED_REFUSAL; pending is its own bucket."
+    },
+    {
+      "id": "native-graph-baseline",
+      "script": "scripts/evidence/graph_baseline.py",
+      "outputs": [
+        ".local-runs/graph-baseline/<run_id>/bundle.json",
+        ".local-runs/graph-baseline/<run_id>/raw.json"
+      ],
+      "figures": [
+        "kg_query_depth_1_2_3_p50_p95_p99_us",
+        "kg_timeline_p50_p95_p99_us",
+        "projection_drain_64_p50_p95_p99_us"
+      ],
+      "binds": [
+        "run_id",
+        "source_commit",
+        "source_tree_sha",
+        "daemon_binary_sha256",
+        "addressed_exe_sha256",
+        "raw_samples_sha256"
+      ],
+      "note": "Descriptive nearest-rank percentiles from 200 pooled raw samples per scenario; no SLA PASS or mean-of-p99."
     }
   ]
 }

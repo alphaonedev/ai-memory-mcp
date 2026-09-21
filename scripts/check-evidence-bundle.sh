@@ -118,11 +118,35 @@ print("PASS: bundle %s run_id=%s bound sha256=%s" % (path, run_id, daemon[:12]))
 PY
 }
 
+cleanup_evidence_selftest() {
+  # Delete only this test's flat fixture files; refuse unexpected directories.
+  python3 - "$1" <<'PY_CLEANUP'
+from pathlib import Path
+import os
+import stat
+import sys
+root = Path(sys.argv[1])
+# Open the root itself without following a link, then anchor every child
+# operation to that descriptor. Child symlinks are unlinked, never traversed.
+fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+try:
+    names = os.listdir(fd)
+    if any(stat.S_ISDIR(os.stat(name, dir_fd=fd, follow_symlinks=False).st_mode)
+           for name in names):
+        raise IsADirectoryError('unexpected self-test directory; cleanup refused')
+    for name in names:
+        os.unlink(name, dir_fd=fd)
+finally:
+    os.close(fd)
+root.rmdir()
+PY_CLEANUP
+}
+
 run_self_test() {
   local tmp="$ROOT/.local-runs/evidence-bundle-selftest-$$"
   mkdir -p "$tmp"
   # RETURN, not EXIT: EXIT fires after the function's locals are gone (set -u).
-  trap 'rm -rf "'"$tmp"'"' RETURN
+  trap 'cleanup_evidence_selftest "'"$tmp"'"' RETURN
 
   # (1) Live map on this tree must pass (the scripts we just added will be
   # untracked until the commit — so self-test uses a fixture map of files

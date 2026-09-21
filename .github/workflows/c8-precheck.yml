@@ -741,6 +741,29 @@ jobs:
         # continuity 200-by-id, attest claimed, swarm pending) fail-closed.
         run: bash scripts/check-evidence-bundle.sh --self-test
 
+      - name: Provision Python for graph producer controls (#3851)
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - name: Graph baseline producer controls (#3851)
+        timeout-minutes: 1
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        # Three sample/quantile pins, four lifecycle pins, native accounting and cleanup.
+        # No native database or latency run: fail on missing, skipped or xfail tests.
+        run: |
+          python3 - <<'PY'
+          import unittest
+          suite = unittest.defaultTestLoader.discover('scripts/evidence', pattern='test_graph_baseline.py')
+          listed = suite.countTestCases()
+          if listed < 9:
+              raise SystemExit('graph producer controls: fewer than nine tests listed')
+          result = unittest.TextTestRunner(verbosity=2).run(suite)
+          if not result.wasSuccessful() or result.testsRun != listed or result.skipped or result.expectedFailures:
+              raise SystemExit('graph producer controls: incomplete, failing, skipped or expected-failure tests')
+          print(f'GRAPH_PRODUCER_TESTS listed={listed} executed={result.testsRun} skip=0 expected_failures=0')
+          PY
+
   git-dependency-source-gate:
     # Issues #2050 / #2512 — SUPPLY-CHAIN reproducibility. `Cargo.toml` pinned
     # `paste = { git = "https://github.com/alphaonedev/paste", rev = "6a30252" }`
