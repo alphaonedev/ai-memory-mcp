@@ -67,7 +67,7 @@ on:
   push:
     branches: [main, develop, "release/**"]
   pull_request:
-    branches: [main, develop, "release/**"]
+    branches: [main, develop, "release/**", "next/v1.1.0"]
   # Merge Queue (#3089) — this workflow carries several REQUIRED gate contexts,
   # so it MUST report on the `merge_group` ref or the queue wedges. Its jobs
   # have no docs-only/event `if:` gating (the two event-scoped gates —

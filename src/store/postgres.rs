@@ -87,6 +87,10 @@ mod tx_retry;
 // take NO relation-level DDL lock on connect. Own module for the same
 // qual_10 budget reason as `parity_3064` above.
 mod bootstrap_ddl;
+#[macro_use]
+mod graph_fetch;
+#[cfg(test)]
+mod graph_conformance;
 
 use crate::models::field_names;
 use std::time::Duration;
@@ -11441,12 +11445,12 @@ impl PostgresStore {
         // requirement: sqlx resolves declared parameter type OIDs
         // (`Agtype` → `ag_catalog.agtype`) BEFORE it writes `Parse`,
         // for the unnamed statement exactly as for a named one.
-        let rows = sqlx::query(&sql)
-            .bind(Agtype(params))
-            .persistent(false)
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(|e| to_store_err("cypher kg_query", e))?;
+        let rows = graph_fetch!(
+            sqlx::query(&sql).bind(Agtype(params)).persistent(false),
+            &mut *tx,
+            "age/query"
+        )
+        .map_err(|e| to_store_err("cypher kg_query", e))?;
 
         tx.commit()
             .await
@@ -11677,13 +11681,15 @@ impl PostgresStore {
         // is a stable prefix, never a random subset. PERF-07 — `TryFrom`,
         // never `as`.
         let row_cap = i64::try_from(kg_query_row_cap(None)).unwrap_or(i64::MAX);
-        let rows = sqlx::query(&sql)
-            .bind(source_id)
-            .bind(depth_cap)
-            .bind(row_cap)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| to_store_err("cte kg_query", e))?;
+        let rows = graph_fetch!(
+            sqlx::query(&sql)
+                .bind(source_id)
+                .bind(depth_cap)
+                .bind(row_cap),
+            &self.pool,
+            "cte/query"
+        )
+        .map_err(|e| to_store_err("cte kg_query", e))?;
 
         // Shadow the raw sqlx rows with the decoded traversal set.
         let mut rows = rows
@@ -11898,12 +11904,12 @@ impl PostgresStore {
         // #1482 — per-call-unique cypher text (since/until predicate +
         // cap); run unnamed so it never enters the prepared-statement
         // cache and evicts reusable hot statements.
-        let rows = sqlx::query(&sql)
-            .bind(Agtype(params))
-            .persistent(false)
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(|e| to_store_err("cypher kg_timeline", e))?;
+        let rows = graph_fetch!(
+            sqlx::query(&sql).bind(Agtype(params)).persistent(false),
+            &mut *tx,
+            "age/timeline"
+        )
+        .map_err(|e| to_store_err("cypher kg_timeline", e))?;
 
         // Decode the agtype payloads into raw Rust strings/options
         // first; we'll backfill `title` + `target_namespace` from
@@ -12071,9 +12077,7 @@ impl PostgresStore {
         }
         q = q.bind(cap_i64);
 
-        let rows = q
-            .fetch_all(&self.pool)
-            .await
+        let rows = graph_fetch!(q, &self.pool, "cte/timeline")
             .map_err(|e| to_store_err("cte kg_timeline", e))?;
 
         rows.iter()
@@ -12294,11 +12298,12 @@ impl PostgresStore {
         let read_sql = format!(
             "SELECT prior FROM cypher('memory_graph', $$ {read_cypher} $$, $1) AS (prior agtype)"
         );
-        let prior_rows = sqlx::query(&read_sql)
-            .bind(Agtype(read_params))
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(|e| to_store_err("cypher kg_invalidate read", e))?;
+        let prior_rows = graph_fetch!(
+            sqlx::query(&read_sql).bind(Agtype(read_params)),
+            &mut *tx,
+            "age/invalidate-read"
+        )
+        .map_err(|e| to_store_err("cypher kg_invalidate read", e))?;
 
         if prior_rows.is_empty() {
             // #2375 (FIX #7) — MATCH-miss fall-through. Under
@@ -12367,11 +12372,12 @@ impl PostgresStore {
             "SELECT affected FROM cypher('memory_graph', $$ {write_cypher} $$, $1) AS \
              (affected agtype)"
         );
-        let _ = sqlx::query(&write_sql)
-            .bind(Agtype(write_params))
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(|e| to_store_err("cypher kg_invalidate set", e))?;
+        let _ = graph_fetch!(
+            sqlx::query(&write_sql).bind(Agtype(write_params)),
+            &mut *tx,
+            "age/invalidate-set"
+        )
+        .map_err(|e| to_store_err("cypher kg_invalidate set", e))?;
 
         // Mirror the SET into the relational `memory_links` row so the
         // CTE-side reads and the AGE-side reads stay aligned. The AGE
@@ -12550,12 +12556,12 @@ impl PostgresStore {
             ORDER BY depth ASC, node_id ASC"
         );
 
-        let rows = sqlx::query(&sql)
-            .bind(root_id)
-            .bind(depth_cap)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| to_store_err("cte lineage", e))?;
+        let rows = graph_fetch!(
+            sqlx::query(&sql).bind(root_id).bind(depth_cap),
+            &self.pool,
+            "cte/lineage"
+        )
+        .map_err(|e| to_store_err("cte lineage", e))?;
 
         rows.iter()
             .map(|r| {
@@ -12726,12 +12732,12 @@ impl PostgresStore {
 
         // #1482 — per-call-unique cypher text (label alternation +
         // interpolated depth); run unnamed.
-        let rows = sqlx::query(&sql)
-            .bind(Agtype(params))
-            .persistent(false)
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(|e| to_store_err("cypher lineage", e))?;
+        let rows = graph_fetch!(
+            sqlx::query(&sql).bind(Agtype(params)).persistent(false),
+            &mut *tx,
+            "age/lineage"
+        )
+        .map_err(|e| to_store_err("cypher lineage", e))?;
         tx.commit()
             .await
             .map_err(|e| to_store_err(CTX_COMMIT_AGE_TX, e))?;
@@ -12997,12 +13003,12 @@ impl PostgresStore {
                    UNION ALL \
                    SELECT source_id, target_id FROM memory_links \
                    WHERE (valid_until IS NULL OR valid_until > $2) AND target_id = ANY($1)";
-        let rows = sqlx::query(sql)
-            .bind(frontier)
-            .bind(now)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| to_store_err("cte find_paths frontier", e))?;
+        let rows = graph_fetch!(
+            sqlx::query(sql).bind(frontier).bind(now),
+            &self.pool,
+            "cte/paths"
+        )
+        .map_err(|e| to_store_err("cte find_paths frontier", e))?;
         rows.iter()
             .map(|r| {
                 let source: String = r
@@ -15428,14 +15434,21 @@ async fn pg_invalidate_link_relational_in_tx(
          WHERE source_id = $1 AND target_id = $2 AND relation = $3 \
          RETURNING valid_until"
     };
-    let now_until: Option<DateTime<Utc>> = sqlx::query_scalar(update_sql)
-        .bind(source_id)
-        .bind(target_id)
-        .bind(relation)
-        .bind(stamp)
-        .fetch_one(&mut **tx)
-        .await
-        .map_err(|e| to_store_err("cte kg_invalidate", e))?;
+    let updated = graph_fetch!(
+        sqlx::query(update_sql)
+            .bind(source_id)
+            .bind(target_id)
+            .bind(relation)
+            .bind(stamp),
+        &mut **tx,
+        "cte/invalidate"
+    )
+    .map_err(|e| to_store_err("cte kg_invalidate", e))?;
+    let now_until: Option<DateTime<Utc>> = updated
+        .first()
+        .ok_or_else(|| to_store_err("cte kg_invalidate", sqlx::Error::RowNotFound))?
+        .try_get(0)
+        .map_err(|e| to_store_err("cte kg_invalidate decode", e))?;
 
     if was_signed {
         let valid_from_str = prior_valid_from.map(|t| t.to_rfc3339());

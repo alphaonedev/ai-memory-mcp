@@ -77,7 +77,7 @@ name: "Certified Postgres + AGE + pgvector tier (#2548)"
 
 on:
   pull_request:
-    branches: ["release/**"]
+    branches: ["release/**", "next/v1.1.0"]
   push:
     branches: ["release/**"]
   workflow_dispatch:
@@ -380,6 +380,18 @@ jobs:
           bash scripts/check-cert-leg-nonvacuity.sh \
             --leg cert-postgres-age --log "$TEST_OUT" --listed "$LISTED"
           exit "$rc"
+
+      - name: Differential relational AGE conformance (#3573)
+        run: python3 scripts/check_graph_conformance_log.py
+
+      - name: Store differential executed plans (#3573)
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: graph-conformance-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .local-runs/graph-conformance/
+          include-hidden-files: true
+          if-no-files-found: error
 
       - name: Cluster-A cert-posture armability gate (#3061 #3016 #3067)
         run: |

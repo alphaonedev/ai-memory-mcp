@@ -356,6 +356,9 @@ fs-notify = ["dep:notify"]
 vectorlite = ["rusqlite/load_extension"]
 
 [dev-dependencies]
+# #3573 recursive Rust AST inventory; already present in Cargo.lock.
+syn = { version = "2", features = ["full", "visit"] }
+proc-macro2 = "1"
 ai-memory = { path = ".", features = ["test-support"] }
 proptest = "1"
 criterion = { version = "0.5", features = ["html_reports"] }
