@@ -7006,8 +7006,8 @@ pub async fn bootstrap_serve(
     // #1735 (Pillar-4 4.C) — spawn the cold-path AGE-projection drainer on a
     // postgres backend. Independent of federation: deferred link writes enqueue
     // to `kg_projection_outbox` in the same tx as the relational row, and this
-    // worker projects them into `memory_graph` out-of-band (drain-once
-    // boot-recovery + periodic tick, supervised).
+    // worker projects them into `memory_graph` out-of-band (bounded immediate
+    // boot recovery + jittered periodic passes, supervised).
     //
     // v1.0.0 batch-2 (cross-backend parity) — spawned in SYNC mode too. Sync
     // mode used to enqueue nothing, so the drainer was pointless there; it now

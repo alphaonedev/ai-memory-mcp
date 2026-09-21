@@ -1210,7 +1210,7 @@ traversals see them. `AI_MEMORY_AGE_PROJECTION_MODE` selects the posture
 - `deferred` enqueues a `kg_projection_outbox` row (schema v69) in the
   same transaction as the relational `memory_links` INSERT and skips the
   inline MERGE; a cold drainer worker (spawned by `serve`, with a
-  drain-once boot-recovery pass plus an interval loop) projects the
+  bounded immediate boot-recovery pass plus a completion-relative jittered loop) projects the
   pending rows into `memory_graph` out-of-band, taking the synchronous
   AGE round-trips off the link-write hot path. Failed projections retry
   up to `MAX_AGE_PROJECTION_ATTEMPTS` then quarantine.
