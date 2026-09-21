@@ -700,6 +700,14 @@ operator does not override:
 | `vllm`           | `http://localhost:8000/v1`                        | `local-model`                                   |
 | `openai-compatible` | _(no meaningful default — operator must set `base_url`; the env-var path errors without it)_ | `gemma3:4b` (legacy fallthrough)                |
 
+Alias URLs for both `[llm]` and `[llm.auto_tag]` are resolved from the same
+canonical table as the environment-based client. Only `ollama` defaults to
+port 11434; `vllm` defaults to port 8000 with `/v1`. `openai-compatible`
+requires an explicit `base_url`. An unknown or misspelled backend has no
+default URL and is refused by client construction and the LLM reachability
+probe in `doctor`, including when an explicit URL and API key are present.
+`doctor` reports the invalid backend without sending a request (#3811, #3860).
+
 The model defaults are intentionally aggressive — operators MUST
 verify the chosen model exists on their account before relying on it.
 
