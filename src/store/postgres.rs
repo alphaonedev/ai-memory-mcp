@@ -97,9 +97,9 @@ mod graph_conformance;
 use crate::models::field_names;
 use std::time::Duration;
 
+mod drainer;
 #[cfg(test)]
 mod engine_divergence_tests;
-mod drainer;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -11598,11 +11598,9 @@ impl PostgresStore {
 
     /// Recursive-CTE fallback for `kg_query` on Postgres.
     ///
-    /// Mirrors the SQLite recursive-CTE in `db::kg_query` so deployments
-    /// running vanilla Postgres (no AGE extension) still get the same
-    /// traversal semantics. Returns the shared [`KgQueryRow`] shape —
-    /// the dispatcher in [`Self::kg_query`] doesn't have to care which
-    /// branch ran.
+    /// Supports vanilla Postgres without AGE and returns the shared
+    /// [`KgQueryRow`] shape. Both PostgreSQL engines order by depth, target ID,
+    /// relation, and path; SQLite retains its separate temporal ordering.
     ///
     /// # Errors
     ///
@@ -18580,8 +18578,8 @@ const KG_TIMELINE_MAX_LIMIT_SAL: usize = 1000;
 
 /// v1.0.0 batch-2 cross-backend parity — postgres mirror of the sqlite
 /// `kg_query` default row cap (`crate::storage::KG_QUERY_DEFAULT_LIMIT`). The
-/// sqlite SAL adapter always passes `limit = None`, so 200 is the row count
-/// BOTH backends return for the same traversal.
+/// SQLite SAL adapter always passes `limit = None`; both backends therefore
+/// cap at 200 rows, but their different ordering contracts can select different rows.
 const KG_QUERY_DEFAULT_LIMIT_SAL: usize = 200;
 
 /// v1.0.0 batch-2 cross-backend parity — postgres mirror of the sqlite
@@ -18595,10 +18593,10 @@ const KG_QUERY_MAX_LIMIT_SAL: usize = 1000;
 /// `[1, KG_QUERY_MAX_LIMIT_SAL]`; both postgres traversal branches carried NO
 /// row cap at all, so a dense graph could materialize every simple path up to
 /// depth 5 (combinatorial) into memory and onto the wire, AND returned a
-/// different result set than sqlite for an identical call. DEGRADE (fewer
-/// rows, deterministic order), never CORRUPT: both branches order by
-/// `(depth ASC, target_id ASC)` before truncating, so the capped page is a
-/// stable prefix of the full result — identical to what sqlite returns.
+/// different row count than SQLite for an identical call. Both PostgreSQL
+/// branches now order by `(depth, target_id, relation, path)` before truncating,
+/// selecting the same stable prefix when their candidate sets agree. SQLite
+/// retains its independent temporal ordering; only the row cap is shared.
 fn kg_query_row_cap(limit: Option<usize>) -> usize {
     limit
         .unwrap_or(KG_QUERY_DEFAULT_LIMIT_SAL)

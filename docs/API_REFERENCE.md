@@ -1166,8 +1166,8 @@ Response:
 }
 ```
 
-Ordering: `depth ASC, COALESCE(valid_from, link_created_at) ASC,
-link_created_at ASC`.
+SQLite ordering: `depth ASC, COALESCE(valid_from, link_created_at) ASC,
+link_created_at ASC`. PostgreSQL orders by `(depth, target_id, relation, path)`; see [PostgreSQL graph result stability](postgres-graph-order.md).
 
 ### `POST /api/v1/kg/find_paths`
 

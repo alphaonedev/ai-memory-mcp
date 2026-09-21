@@ -9,7 +9,7 @@ use super::{
 };
 
 #[tokio::test]
-#[ignore = "live AGE certification; scripts/check-graph-conformance.sh"]
+#[ignore = "live AGE certification; scripts/check_graph_conformance_log.py"]
 async fn executed_graph_matrix() {
     let f = Fixture::new().await;
     for depth in 1..=3 {
@@ -93,8 +93,8 @@ async fn executed_graph_matrix() {
 }
 
 #[tokio::test]
-#[ignore = "live AGE certification; scripts/check-graph-conformance.sh"]
-async fn executed_invalidation_and_timestamp_divergence() {
+#[ignore = "live AGE certification; scripts/check_graph_conformance_log.py"]
+async fn executed_invalidation_and_timestamp_parity() {
     let f = Fixture::new().await;
     let (cte, plans) =
         capture(
@@ -152,10 +152,7 @@ async fn executed_invalidation_and_timestamp_divergence() {
         .iter()
         .find(|r| r.relation == "supersedes")
         .expect("AGE historical edge");
-    assert_eq!(c.valid_until.as_deref(), Some("2020-01-01T00:00:00+00:00"));
+    assert_eq!(c.valid_until.as_deref(), Some(STAMP));
     assert_eq!(a.valid_until.as_deref(), Some(STAMP));
-    assert_ne!(
-        c.valid_until, a.valid_until,
-        "#3809 converged: replace this known-divergence pin in E2"
-    );
+    assert_eq!(c.valid_until, a.valid_until, "#3809 canonical stamp parity");
 }
