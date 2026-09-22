@@ -39,8 +39,13 @@ impl AppConfig {
     // Reads the deprecated legacy `ollama_url` / `embed_url` twins on purpose:
     // they are still live resolution inputs, so a plaintext non-loopback legacy
     // endpoint is the same cleartext-egress path and must be refused too.
+    // Returns `anyhow::Result` — the canonical error type in config.rs's
+    // load/validate neighbourhood (MemoryError is doc-only there). The one
+    // caller `validate_secret_handling` maps it back to its `String` contract,
+    // so nothing above changes (#3823 qual_6_7: this validator no longer adds a
+    // String-typed Result to the burn-down ceiling).
     #[allow(deprecated)]
-    pub(crate) fn validate_inference_endpoint_transit(&self) -> Result<(), String> {
+    pub(crate) fn validate_inference_endpoint_transit(&self) -> anyhow::Result<()> {
         // (config key label, configured value) for every inference endpoint.
         let mut candidates: Vec<(&str, Option<&str>)> = Vec::new();
         if let Some(llm) = &self.llm {
@@ -64,13 +69,13 @@ impl AppConfig {
                 continue;
             };
             if is_offhost_plaintext(url) {
-                return Err(format!(
+                anyhow::bail!(
                     "inference endpoint `{key}` uses the plaintext `http` scheme to a \
                      non-loopback host, so memory content would leave this host \
                      UNENCRYPTED. Use an `https://` endpoint (or a local \
                      TLS-terminating proxy). A loopback endpoint (127.0.0.1 / \
                      localhost) over http is the permitted allowed-path control."
-                ));
+                );
             }
         }
         Ok(())
@@ -152,7 +157,7 @@ mod tests {
         for (key, cfg) in &cases {
             match cfg.validate_inference_endpoint_transit() {
                 Err(err) => assert!(
-                    err.contains(key),
+                    err.to_string().contains(key),
                     "the refusal for `{key}` must name that key: {err}"
                 ),
                 Ok(()) => panic!(
