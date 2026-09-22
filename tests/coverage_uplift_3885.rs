@@ -80,6 +80,16 @@ fn doctor_config_health_reports_compiled_defaults_when_config_absent_3885() {
         // NOT AI_MEMORY_NO_CONFIG — we need skip_config() == false so the
         // load_for_boot() Ok arm is reached.
         .env_remove("AI_MEMORY_NO_CONFIG")
+        // HOME too, not XDG alone. `dirs::config_dir()` honours XDG only on
+        // Linux; on macOS `resolve_config_path_choice` takes
+        // `$HOME/.config/ai-memory/config.toml` and never consults XDG (the
+        // rule its sibling `doctor_hooks_json_..._3885` is `cfg(linux)`-gated
+        // for). Without HOME this cell read the RUNNER's real config on macOS
+        // and still passed, because the asserted string covers BOTH "ok" and
+        // "absent" — it measured a different proposition than its name. With
+        // HOME at an empty tempdir the absent-config path is measured on both
+        // platforms, so the cell needs no target gate.
+        .env("HOME", tmp.path())
         .env("XDG_CONFIG_HOME", &empty_xdg) // no hooks.toml / config.toml here
         .env("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "0")
         .args(["--db", db.to_str().unwrap(), "doctor", "--json"])
