@@ -197,7 +197,9 @@ api_key_env = "XAI_API_KEY"            # process-env-var name (NOT the literal k
 # api_key_file = "/etc/ai-memory/keys/xai.key"   # mode 0400 enforced; alt to api_key_env
 
 [llm.auto_tag]                         # fast structured-output sibling
-backend = "ollama"
+# v1.0.0: ONLY `model` is consumed. `backend` / `base_url` /
+# `api_key_env` / `api_key_file` are parsed but IGNORED (the model
+# string runs on the PRIMARY [llm] client) and WARN at boot (#3808).
 model   = "gemma3:4b"
 
 [embeddings]

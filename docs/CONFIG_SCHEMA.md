@@ -46,10 +46,13 @@ api_key_env = "XAI_API_KEY"
 # api_key_file = "/etc/ai-memory/keys/xai.key"   # mode 0400 enforced
 
 # Fast structured-output sibling (auto_tag, query expansion,
-# contradiction detection). Field-by-field fallback to parent [llm];
-# commonly only `model` is overridden.
+# contradiction detection). At v1.0.0 ONLY `model` is consumed.
+# `backend` / `base_url` / `api_key_env` / `api_key_file` are parsed
+# but IGNORED — production threads the model string through the
+# PRIMARY [llm] client — and setting any of them emits a boot WARN
+# naming the ignored key (#3808). There is no second auto_tag
+# endpoint at v1.0.0.
 [llm.auto_tag]
-backend = "ollama"
 model   = "gemma3:4b"
 
 # ---------------------------------------------------------------------
