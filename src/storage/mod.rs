@@ -18221,8 +18221,13 @@ static INSERT_IF_NEWER_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::n
                 -- federation merge: the timestamp winner's state is adopted so
                 -- a peer that advanced a Goal open→done replicates that state;
                 -- a stale peer push (loses the tiebreak) preserves the local
-                -- lifecycle. Transition legality is enforced at the originating
-                -- update site, so the replicated value is already-validated.
+                -- lifecycle. #3750 — the can_transition_to graph
+                -- (open/active/blocked/done/abandoned) is validated at the
+                -- originating update site, but the system-only states
+                -- (tombstoned / quarantined / contaminated) are set by raw
+                -- UPDATE and never pass can_transition_to, so the replicated
+                -- lifecycle value is NOT uniformly transition-validated -- the
+                -- enforcement gap is deferred to v1.1 per #3750.
                 lifecycle_state = CASE WHEN excluded.updated_at > memories.updated_at
                                             OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
                                        THEN excluded.lifecycle_state ELSE memories.lifecycle_state END,

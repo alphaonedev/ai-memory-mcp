@@ -1190,8 +1190,11 @@ REFUSES at next boot`; `unreadable`), `require_tls_token` (`unset
 `unrecognised … — REFUSES boot`), `downgrade_paths_armed` (the removed
 `AI_MEMORY_ALLOW_PLAINTEXT_NONLOOPBACK` / `AI_MEMORY_FED_ALLOW_PLAINTEXT_PEERS`
 hatches, each refusing boot when set), `mcp_federation_forward_url`,
-`store_url_sslmode` (`sqlite` / `postgres: sslmode=verify-full pinned` /
-`… NOT pinned — REFUSES at connect`), `webhook_plaintext_targets` (folded in
+`store_url_sslmode` (`sqlite` / `postgres over TCP (<host>): sslmode=verify-full
+pinned` / `… NOT pinned — REFUSES at connect` / `postgres over a Unix-domain
+socket (host=<dir>): sslmode does not apply on this transport — REFUSES at
+connect (#3866)` / `postgres: DSN not parseable by the driver — REFUSES at
+connect (#3866)`), `webhook_plaintext_targets` (folded in
 from the store once open; refused at dispatch and at create),
 `llm_egress_plaintext` (DETECTED only — model-server egress awaits the
 operator's ruling) and `boot_verdict`. Critical when anything will refuse or

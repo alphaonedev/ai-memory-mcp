@@ -7522,8 +7522,11 @@ pub async fn bootstrap_serve(
         #[cfg(feature = "sal")]
         store: store_handle,
         llm: Arc::new(crate::reload::SwappableLlm::new(llm)),
-        // v0.7.0 L15 — dedicated auto_tag model from config.toml.
-        auto_tag_model: Arc::new(app_config.auto_tag_model.clone()),
+        // v0.7.0 L15 — dedicated auto_tag model from config.toml. #3819: use
+        // the effective resolver so `[llm.auto_tag].model` (the #1146
+        // replacement `config migrate` writes) is honoured, not silently
+        // dropped in favour of the legacy flat `auto_tag_model` alone.
+        auto_tag_model: Arc::new(app_config.effective_auto_tag_model()),
         // v0.7.0 H8 (round-2) — per-LLM-call timeout (default 30s).
         llm_call_timeout: Duration::from_secs(app_config.effective_llm_call_timeout_secs()),
         // v0.7.0 H5 (round-2) — fresh per-process replay cache + the

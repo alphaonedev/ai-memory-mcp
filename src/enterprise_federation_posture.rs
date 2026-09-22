@@ -589,6 +589,18 @@ pub fn evaluate_with_live(
     if backend_is_postgres {
         let dsn = resolved_store_url.as_deref().unwrap_or_default();
         let tls_verify_full = dsn_pins_sslmode_verify_full(dsn);
+        // #3866 — the `actual` names the TRANSPORT so a socket DSN reads as
+        // "TLS not applicable on this transport", never as a pinned floor.
+        let transport = match crate::transit_encryption::dsn_sslmode_floor(dsn) {
+            crate::transit_encryption::SslmodeFloor::Pinned { host }
+            | crate::transit_encryption::SslmodeFloor::NotPinned { host } => {
+                format!("tcp host={host}")
+            }
+            crate::transit_encryption::SslmodeFloor::UnixSocket { dir } => {
+                format!("unix-socket host={dir} (TLS not applicable on this transport; #3866)")
+            }
+            crate::transit_encryption::SslmodeFloor::Unparseable => "unparseable DSN".to_string(),
+        };
         let attested_raw =
             std::env::var(ENV_PG_AT_REST_ATTESTED).unwrap_or_else(|_| "(unset)".to_string());
         let attested = is_truthy(&attested_raw);
@@ -598,7 +610,8 @@ pub fn evaluate_with_live(
              AI_MEMORY_PG_AT_REST_ATTESTED truthy (operator-vouched volume/tablespace encryption \
              — NOT machine-proven at-rest encryption)",
             format!(
-                "sslmode=verify-full={tls_verify_full}; {ENV_PG_AT_REST_ATTESTED}={attested_raw}"
+                "transport={transport}; sslmode=verify-full={tls_verify_full}; \
+                 {ENV_PG_AT_REST_ATTESTED}={attested_raw}"
             ),
             tls_verify_full && attested,
             "add `?sslmode=verify-full` to the store DSN AND, after confirming the postgres data \
@@ -2152,6 +2165,47 @@ mod tests {
              required so a MITM cannot read the at-rest ciphertext key material in flight: {c:?}"
         );
         assert!(c.actual.contains("sslmode=verify-full=false"));
+        assert!(!all_pass(&checks));
+    }
+
+    /// #3866 — a Unix-socket DSN carrying `sslmode=verify-full` must NOT
+    /// render check #15 as a pinned floor: the transport cannot carry TLS,
+    /// the daemon cannot open it, and a PASS here was a false attestation.
+    #[test]
+    fn postgres_backend_over_unix_socket_is_not_a_pinned_floor_3866() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "enterprise_federation_posture::tests::postgres_backend_over_unix_socket_is_not_a_pinned_floor_3866",
+        ) {
+            return;
+        }
+        let _g = env_lock();
+        unsafe {
+            clear_all();
+        }
+        let _cleanup = EnvGuard;
+        // No attestation env is set here on purpose: the pin is the TLS half,
+        // and the `actual` text must name the transport so the FAIL cannot be
+        // read as "just the attestation is missing" (this also keeps the
+        // file's env-mutation count at its #3517 baseline).
+        let _fp =
+            set_postgres_backend("postgres:///mem?host=/var/run/postgresql&sslmode=verify-full");
+
+        let checks = evaluate(&AppConfig::default());
+        let c = find(&checks, ENV_PG_AT_REST_ATTESTED);
+        assert!(
+            !c.pass,
+            "verify-full on a Unix-socket transport encrypts nothing; the control must FAIL: {c:?}"
+        );
+        assert!(
+            c.actual.contains("sslmode=verify-full=false"),
+            "{}",
+            c.actual
+        );
+        assert!(
+            c.actual.contains("unix-socket host=/var/run/postgresql"),
+            "the transport is named, not inferred from the query string: {}",
+            c.actual
+        );
         assert!(!all_pass(&checks));
     }
 

@@ -49,7 +49,10 @@ Fields ([`src/hooks/config.rs:174-190`](../src/hooks/config.rs)):
   `MAX_TIMEOUT_MS = 30_000` ([`src/hooks/config.rs:138`](../src/hooks/config.rs)).
   Exceeded → executor returns `Timeout`; chain converts per `fail_mode`.
 - **`mode`** — `daemon` (long-lived subprocess, stdin JSON-RPC) or
-  `exec` (one-shot fork+exec). Optional in TOML; missing values resolve
+  `exec` (one-shot fork+exec; the helper MUST drain its stdin to EOF
+  before exiting — see the exec stdin contract in §"Operator workflow",
+  or it can be denied under load on `fail_mode = "closed"`). Optional in
+  TOML; missing values resolve
   via `default_mode_for_event` ([`src/hooks/config.rs:157`](../src/hooks/config.rs))
   — daemon for hot-path events (`post_recall`, `post_search`,
   `pre_recall_expand`), exec otherwise.
@@ -343,6 +346,28 @@ Pinned by [`tests/hooks_executor_test.rs`](../tests/hooks_executor_test.rs),
    reference (`tools/auto-link-detector/src/main.rs`). Speak JSON-RPC
    over stdin/stdout for `mode = "daemon"`; one-shot exec for
    `mode = "exec"`.
+
+   **`mode = "exec"` stdin contract (required).** The executor writes the
+   JSON envelope plus a newline to the helper's stdin and then closes it
+   (EOF); the helper MUST read stdin to EOF before it writes its decision
+   line and exits. A helper that emits its output and exits WITHOUT
+   draining stdin closes the read end while the executor is still writing
+   the envelope, so the write hits `EPIPE` (broken pipe) — surfaced as
+   `ExecutorError::Io` ("an I/O error occurred talking to the hook").
+   Under the default `fail_mode = "open"` that is logged and the hook is
+   treated as `Allow`; under `fail_mode = "closed"` it is a hard **`Deny`
+   (503)**. The write-versus-exit race widens under load, so a helper that
+   is correct in isolation can still be denied INTERMITTENTLY on a busy
+   runner — with no line of this document, before this one, telling the
+   author to drain stdin. The drain is one line in `sh`: `cat >/dev/null`
+   (or a `read`-to-EOF loop) before emitting the decision. The shipped
+   exec-mode test helpers do exactly this
+   ([`tests/hooks_executor_test.rs`](../tests/hooks_executor_test.rs),
+   [`tests/hooks_hot_reload.rs`](../tests/hooks_hot_reload.rs)); the
+   executor side is `drive_exec_child` in
+   [`src/hooks/executor.rs`](../src/hooks/executor.rs). (`mode = "daemon"`
+   helpers already read stdin by construction — they loop reading framed
+   requests — so the contract binds `exec` helpers specifically.)
 2. **Drop the binary on `PATH`** and `chmod +x`.
 3. **Edit `~/.config/ai-memory/hooks.toml`** with the row schema above.
 4. **Reload** with `kill -HUP $(pgrep -f 'ai-memory mcp')` or restart
@@ -403,6 +428,7 @@ For deployment sizes:
 | Recall p95 regressed after enabling hook | Hook is `mode = "exec"` on a hot-path event | Switch to `mode = "daemon"`. If already daemon, reduce `timeout_ms` and inspect helper-binary tracing for the slow path. |
 | `timeout_violations_total` growing | A hook's class deadline tripping | Compare to per-hook `ExecutorMetrics` ([`src/hooks/executor.rs:530`](../src/hooks/executor.rs)) to identify the slow hook; widen its `timeout_ms` (cap is 30s) or migrate work off the synchronous path. |
 | Daemon-mode hook respawn loop | Helper binary panics on framed stdin | Inspect daemon log for the `hook spawn failed for <command>` error. Fix the helper, redeploy, `SIGHUP`. The chain fails open in the meantime (per `fail_mode = "open"` default). |
+| `mode = "exec"` hook intermittently DENIED under load (or spuriously fails-open) | The helper emits its decision and exits WITHOUT reading stdin, so the executor's envelope write hits `EPIPE` → `ExecutorError::Io` ("an I/O error occurred talking to the hook") | Make the exec helper drain stdin to EOF before writing its decision (`cat >/dev/null` in `sh`, or a `read`-to-EOF loop). See the exec stdin contract in §"Operator workflow". Daemon-mode helpers already read stdin and are unaffected. |
 | Reload didn't pick up new hook | TOML parse error | Look for `hooks: SIGHUP reload failed; keeping previous config` in the log. Validate the file with `cat ~/.config/ai-memory/hooks.toml | toml --check` (or `taplo lint`). |
 
 ## Operator runbook (3am procedures)

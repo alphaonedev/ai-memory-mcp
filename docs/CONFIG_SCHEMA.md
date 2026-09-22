@@ -46,10 +46,13 @@ api_key_env = "XAI_API_KEY"
 # api_key_file = "/etc/ai-memory/keys/xai.key"   # mode 0400 enforced
 
 # Fast structured-output sibling (auto_tag, query expansion,
-# contradiction detection). Field-by-field fallback to parent [llm];
-# commonly only `model` is overridden.
+# contradiction detection). At v1.0.0 ONLY `model` is consumed.
+# `backend` / `base_url` / `api_key_env` / `api_key_file` are parsed
+# but IGNORED — production threads the model string through the
+# PRIMARY [llm] client — and setting any of them emits a boot WARN
+# naming the ignored key (#3808). There is no second auto_tag
+# endpoint at v1.0.0.
 [llm.auto_tag]
-backend = "ollama"
 model   = "gemma3:4b"
 
 # ---------------------------------------------------------------------
@@ -699,6 +702,14 @@ operator does not override:
 | `lmstudio`       | `http://localhost:1234/v1`                        | `local-model`                                   |
 | `vllm`           | `http://localhost:8000/v1`                        | `local-model`                                   |
 | `openai-compatible` | _(no meaningful default — operator must set `base_url`; the env-var path errors without it)_ | `gemma3:4b` (legacy fallthrough)                |
+
+Alias URLs for both `[llm]` and `[llm.auto_tag]` are resolved from the same
+canonical table as the environment-based client. Only `ollama` defaults to
+port 11434; `vllm` defaults to port 8000 with `/v1`. `openai-compatible`
+requires an explicit `base_url`. An unknown or misspelled backend has no
+default URL and is refused by client construction and the LLM reachability
+probe in `doctor`, including when an explicit URL and API key are present.
+`doctor` reports the invalid backend without sending a request (#3811, #3860).
 
 The model defaults are intentionally aggressive — operators MUST
 verify the chosen model exists on their account before relying on it.

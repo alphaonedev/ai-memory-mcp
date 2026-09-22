@@ -219,24 +219,186 @@ pub fn plaintext_url_refusal(what: &str, url: &str) -> String {
     )
 }
 
-/// Whether a URL names the plaintext `http` scheme (case-insensitive,
-/// trimmed). A URL with no scheme is not "plaintext" by this predicate —
-/// callers refuse it on their own terms.
-#[must_use]
-pub fn url_is_plaintext_http(url: &str) -> bool {
-    url.trim()
-        .get(..7)
-        .is_some_and(|p| p.eq_ignore_ascii_case("http://"))
+/// How a config-carried outbound URL classifies under the mandate.
+///
+/// Decided by PARSING the value with the WHATWG grammar reqwest applies at
+/// request time (the `url` crate), never by a byte-prefix test. #3863: the
+/// former 7-byte `http://` prefix test read `http:/peer:9077`,
+/// `http:peer:9077` and `http:\\evil/x` as "not plaintext", while the parser
+/// normalises every one of them to `http://…` — a cleartext request the gate
+/// waved through. The non-`http` schemes (`httpx://`, `ws://`, a scheme-less
+/// `peer.example:9077`) were never that hole: reqwest refuses them at request
+/// time, so they were fail-closed all along; they are refused at BOOT here so
+/// the refusal names its cause instead of surfacing as an opaque transport
+/// error on the first write (the [`crate::tls::validate_peer_url_scheme`]
+/// disposition, copied).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OutboundUrlClass {
+    /// Parses to `https` — the only accepted class.
+    Https,
+    /// Parses to the plaintext `http` scheme, whatever bytes were typed.
+    PlaintextHttp,
+    /// Parses, but to a scheme that is neither (`ws`, `httpx`, a scheme-less
+    /// host the parser reads as its own scheme, …).
+    OtherScheme(String),
+    /// Does not parse as an absolute URL at all (empty, a bare path, …).
+    Unparseable,
 }
 
-/// Whether a PostgreSQL DSN pins `sslmode=verify-full`. libpq honours the
-/// LAST occurrence of a repeated key, so a trailing `&sslmode=require`
-/// cannot be masked by an earlier `verify-full`. Shared by the connect
-/// funnel (the floor), the enterprise posture (check #15) and doctor.
+/// Classify `raw` (trimmed) — see [`OutboundUrlClass`].
 #[must_use]
-pub fn dsn_pins_sslmode_verify_full(dsn: &str) -> bool {
+pub fn classify_outbound_url(raw: &str) -> OutboundUrlClass {
+    match reqwest::Url::parse(raw.trim()) {
+        Ok(parsed) => match parsed.scheme() {
+            "https" => OutboundUrlClass::Https,
+            "http" => OutboundUrlClass::PlaintextHttp,
+            other => OutboundUrlClass::OtherScheme(other.to_string()),
+        },
+        Err(_) => OutboundUrlClass::Unparseable,
+    }
+}
+
+/// Refuse a config-carried outbound URL unless it parses to `https`
+/// (`what` names the surface, as in [`plaintext_url_refusal`]). Parse, then
+/// allowlist — the [`crate::tls::validate_peer_url_scheme`] shape.
+///
+/// # Errors
+/// The operator-facing refusal (origin only, never path/query/userinfo)
+/// when `raw` parses to plaintext `http`, to any other scheme, or not at all.
+/// (anyhow, not the legacy unit-over-String shape the QUAL-7 ratchet
+/// counts — `tests/qual_6_7_legacy_error_type_ceiling.rs`.)
+pub fn validate_outbound_url_scheme(what: &str, raw: &str) -> Result<()> {
+    match classify_outbound_url(raw) {
+        OutboundUrlClass::Https => Ok(()),
+        OutboundUrlClass::PlaintextHttp => bail!(plaintext_url_refusal(what, raw)),
+        OutboundUrlClass::OtherScheme(scheme) => bail!(
+            "{ISSUE_TAG}: refusing {what} {}: unsupported scheme {scheme:?} ({MANDATE}). \
+             Fix: {REMEDY_USE_HTTPS}.",
+            url_origin_for_refusal(raw)
+        ),
+        OutboundUrlClass::Unparseable => bail!(
+            "{ISSUE_TAG}: refusing {what} {}: not a valid absolute URL ({MANDATE}). \
+             Fix: {REMEDY_USE_HTTPS}.",
+            url_origin_for_refusal(raw)
+        ),
+    }
+}
+
+/// Whether a URL PARSES to the plaintext `http` scheme (trimmed;
+/// case-insensitive by the grammar). A URL with no scheme is not "plaintext"
+/// by this predicate — callers refuse it on their own terms. #3863: this is
+/// the parse-based reading, so the `http:/…`, `http:…` and `http:\\…`
+/// spellings that normalise to `http://` count as plaintext too.
+#[must_use]
+pub fn url_is_plaintext_http(url: &str) -> bool {
+    classify_outbound_url(url) == OutboundUrlClass::PlaintextHttp
+}
+
+/// The transport a PostgreSQL DSN would open, read the way libpq and sqlx
+/// read it (#3866). A `host` (or `hostaddr`) query parameter overrides
+/// the authority host, the LAST occurrence wins, and a host that starts
+/// with `/` is a Unix-domain socket DIRECTORY; an empty authority with no
+/// `host`/`hostaddr` parameter is libpq's DEFAULT socket directory. TLS
+/// does not run on a socket, so `sslmode` is meaningless there — libpq
+/// silently ignores it (measured: connects, `ssl=f`) and sqlx refuses
+/// with "server does not support TLS" (measured). Either way the query
+/// string cannot establish the transport, which is why the floor must
+/// read this first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DsnTransport {
+    /// A TCP host (name or address) — the effective host after the
+    /// `host`/`hostaddr` override.
+    Tcp {
+        /// The host the driver would dial.
+        host: String,
+    },
+    /// A Unix-domain socket directory (`host=/…`, or libpq's default when
+    /// nothing names a host).
+    UnixSocket {
+        /// The socket directory, or [`LIBPQ_DEFAULT_SOCKET_DIR`].
+        dir: String,
+    },
+    /// Not a `postgres://` / `postgresql://` URL the drivers would parse
+    /// (a userinfo with an empty authority, another scheme, garbage).
+    Unparseable,
+}
+
+/// The label for libpq's compiled-in default socket directory, which this
+/// process cannot know (it depends on how the client library was built).
+pub const LIBPQ_DEFAULT_SOCKET_DIR: &str = "<libpq default socket directory>";
+
+/// Classify a PostgreSQL DSN's transport — see [`DsnTransport`].
+#[must_use]
+pub fn dsn_transport(dsn: &str) -> DsnTransport {
+    let Ok(parsed) = reqwest::Url::parse(dsn.trim()) else {
+        return DsnTransport::Unparseable;
+    };
+    let scheme = parsed.scheme().to_ascii_lowercase();
+    if scheme != "postgres" && scheme != "postgresql" {
+        return DsnTransport::Unparseable;
+    }
+    // The last `host` / `hostaddr` parameter wins (libpq precedence);
+    // `query_pairs` percent-decodes, so `host=%2Fvar%2Frun` is a socket
+    // directory too.
+    let mut param_host: Option<String> = None;
+    for (k, v) in parsed.query_pairs() {
+        if k.eq_ignore_ascii_case("host") || k.eq_ignore_ascii_case("hostaddr") {
+            param_host = Some(v.trim().to_string());
+        }
+    }
+    let effective = match param_host {
+        Some(h) if !h.is_empty() => h,
+        _ => parsed.host_str().unwrap_or("").trim().to_string(),
+    };
+    if effective.is_empty() {
+        return DsnTransport::UnixSocket {
+            dir: LIBPQ_DEFAULT_SOCKET_DIR.to_string(),
+        };
+    }
+    if effective.starts_with('/') {
+        return DsnTransport::UnixSocket { dir: effective };
+    }
+    DsnTransport::Tcp { host: effective }
+}
+
+/// The transit floor's verdict on a PostgreSQL DSN (#3866): the transport
+/// first, then — on TCP only — whether the LAST `sslmode` in the query
+/// string is `verify-full` (libpq honours the last occurrence, so a
+/// trailing `&sslmode=require` cannot be masked by an earlier
+/// `verify-full`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SslmodeFloor {
+    /// TCP transport and `sslmode=verify-full` pinned.
+    Pinned {
+        /// The host the driver would dial.
+        host: String,
+    },
+    /// TCP transport, floor not pinned (absent, weaker, or overridden by a
+    /// later `sslmode`).
+    NotPinned {
+        /// The host the driver would dial.
+        host: String,
+    },
+    /// Unix-domain socket transport: TLS does not apply, so no query
+    /// parameter can satisfy the floor.
+    UnixSocket {
+        /// The socket directory, or [`LIBPQ_DEFAULT_SOCKET_DIR`].
+        dir: String,
+    },
+    /// Not a DSN the drivers parse.
+    Unparseable,
+}
+
+/// Evaluate the floor for `dsn` — see [`SslmodeFloor`].
+#[must_use]
+pub fn dsn_sslmode_floor(dsn: &str) -> SslmodeFloor {
+    let host = match dsn_transport(dsn) {
+        DsnTransport::Tcp { host } => host,
+        DsnTransport::UnixSocket { dir } => return SslmodeFloor::UnixSocket { dir },
+        DsnTransport::Unparseable => return SslmodeFloor::Unparseable,
+    };
     let Some((_, query)) = dsn.split_once('?') else {
-        return false;
+        return SslmodeFloor::NotPinned { host };
     };
     let mut last_sslmode: Option<&str> = None;
     for pair in query.split('&') {
@@ -246,7 +408,53 @@ pub fn dsn_pins_sslmode_verify_full(dsn: &str) -> bool {
             last_sslmode = Some(v.trim());
         }
     }
-    last_sslmode.is_some_and(|v| v.eq_ignore_ascii_case(PG_SSLMODE_FLOOR))
+    if last_sslmode.is_some_and(|v| v.eq_ignore_ascii_case(PG_SSLMODE_FLOOR)) {
+        SslmodeFloor::Pinned { host }
+    } else {
+        SslmodeFloor::NotPinned { host }
+    }
+}
+
+/// Whether a PostgreSQL DSN pins `sslmode=verify-full` ON A TCP TRANSPORT.
+/// Shared by the connect funnel (the floor), the enterprise posture (check
+/// #15) and doctor. #3866: a Unix-socket DSN is `false` whatever its query
+/// string says — TLS does not run on a socket; the three consumers render
+/// the transport via [`dsn_sslmode_floor`] rather than guessing from this
+/// bool.
+#[must_use]
+pub fn dsn_pins_sslmode_verify_full(dsn: &str) -> bool {
+    matches!(dsn_sslmode_floor(dsn), SslmodeFloor::Pinned { .. })
+}
+
+/// The refusal for a PostgreSQL DSN whose transport is a Unix-domain socket
+/// (#3866). Names the transport and the socket directory (a path, never a
+/// credential); never echoes the DSN. In v1.0.0 the floor has no in-kernel
+/// exemption — whether a socket counts as encrypted-by-locality is the
+/// question deferred to v1.0.x together with #3827, and one ruling must
+/// cover both; until then a socket DSN is refused by name instead of
+/// failing later with the driver's "server does not support TLS".
+#[must_use]
+pub fn pg_unix_socket_refusal(dir: &str) -> String {
+    format!(
+        "{ISSUE_TAG}: refusing the PostgreSQL store DSN: its transport is a Unix-domain socket \
+         (host={dir}), where sslmode does not apply — TLS cannot run on a socket, so \
+         `sslmode={PG_SSLMODE_FLOOR}` in the query string does not encrypt anything, and the \
+         transit-encryption floor has no in-kernel exemption in v1.0.0 ({MANDATE}; #3866 — the \
+         socket-as-IPC question is deferred to v1.0.x with #3827). Fix: connect over TCP and \
+         {REMEDY_PG_SSLMODE}."
+    )
+}
+
+/// The refusal for a PostgreSQL DSN the drivers would not parse (#3866).
+/// Never echoes the DSN.
+#[must_use]
+pub fn pg_dsn_unparseable_refusal() -> String {
+    format!(
+        "{ISSUE_TAG}: refusing the PostgreSQL store DSN: it is not a `postgres://` URL the \
+         driver parses (a userinfo with no host, another scheme, or malformed), so its transport \
+         cannot be established ({MANDATE}). Fix: `postgres://user:pass@host:port/db?` and \
+         {REMEDY_PG_SSLMODE}."
+    )
 }
 
 /// The refusal for a PostgreSQL DSN below the `sslmode` floor. Never echoes
@@ -296,19 +504,16 @@ pub fn enforce_process_floor() -> Result<()> {
     enforce_no_downgrade_paths()
 }
 
-/// Config-carried outbound URLs that must not be plaintext. Today: the MCP →
+/// Config-carried outbound URLs that must be `https`. Today: the MCP →
 /// daemon forward URL (every MCP write fans out through it). Read-only.
+/// Parse-then-allowlist ([`validate_outbound_url_scheme`], #3863) — a
+/// prefix test is not a gate.
 ///
 /// # Errors
-/// `mcp_federation_forward_url` names the plaintext `http` scheme.
+/// `mcp_federation_forward_url` does not parse to the `https` scheme.
 pub fn enforce_config_urls(app_config: &crate::config::AppConfig) -> Result<()> {
-    if let Some(url) = app_config.mcp_federation_forward_url.as_deref()
-        && url_is_plaintext_http(url)
-    {
-        bail!(plaintext_url_refusal(
-            "MCP forward URL (mcp_federation_forward_url)",
-            url
-        ));
+    if let Some(url) = app_config.mcp_federation_forward_url.as_deref() {
+        validate_outbound_url_scheme("MCP forward URL (mcp_federation_forward_url)", url)?;
     }
     Ok(())
 }
@@ -380,6 +585,105 @@ mod tests {
         ));
     }
 
+    /// #3866 — the transport classifier reads the DSN the way libpq and sqlx
+    /// do: `host`/`hostaddr` override the authority (last wins), a leading
+    /// `/` is a socket directory, an empty authority with no host parameter
+    /// is libpq's default socket, and only `postgres`/`postgresql` parse.
+    #[test]
+    fn dsn_transport_classifier_3866() {
+        use DsnTransport::{Tcp, UnixSocket, Unparseable};
+        let tcp = |h: &str| Tcp {
+            host: h.to_string(),
+        };
+        let sock = |d: &str| UnixSocket { dir: d.to_string() };
+        assert_eq!(
+            dsn_transport("postgres://u:p@db.example:5432/mem"),
+            tcp("db.example")
+        );
+        assert_eq!(dsn_transport("postgresql://u@[::1]/mem"), tcp("[::1]"));
+        assert_eq!(
+            dsn_transport("postgres:///mem?host=db.example"),
+            tcp("db.example")
+        );
+        assert_eq!(
+            dsn_transport("postgres:///mem?hostaddr=10.0.0.5"),
+            tcp("10.0.0.5")
+        );
+        assert_eq!(
+            dsn_transport("postgres://u@ignored/mem?host=/var/run/postgresql"),
+            sock("/var/run/postgresql")
+        );
+        assert_eq!(
+            dsn_transport("postgres:///mem?host=%2Fvar%2Frun%2Fpostgresql"),
+            sock("/var/run/postgresql")
+        );
+        // last host wins, both directions
+        assert_eq!(
+            dsn_transport("postgres:///mem?host=/tmp&host=db.example"),
+            tcp("db.example")
+        );
+        assert_eq!(
+            dsn_transport("postgres:///mem?host=db.example&host=/tmp"),
+            sock("/tmp")
+        );
+        // libpq default socket: nothing names a host
+        assert_eq!(
+            dsn_transport("postgres:///mem"),
+            sock(LIBPQ_DEFAULT_SOCKET_DIR)
+        );
+        assert_eq!(
+            dsn_transport("postgres:///mem?sslmode=verify-full"),
+            sock(LIBPQ_DEFAULT_SOCKET_DIR)
+        );
+        // not a DSN the drivers parse
+        assert_eq!(
+            dsn_transport("postgres://u:p@/mem"),
+            Unparseable,
+            "userinfo with an empty host"
+        );
+        assert_eq!(dsn_transport("mysql://h/db"), Unparseable);
+        assert_eq!(dsn_transport("not a url"), Unparseable);
+        assert_eq!(dsn_transport(""), Unparseable);
+    }
+
+    /// #3866 — the floor is transport-aware: verify-full pins only on TCP;
+    /// a socket is `UnixSocket` whatever the query says; the bool consumer
+    /// is `Pinned` and nothing else.
+    #[test]
+    fn dsn_sslmode_floor_is_transport_aware_3866() {
+        assert_eq!(
+            dsn_sslmode_floor("postgres://u@h/db?sslmode=verify-full"),
+            SslmodeFloor::Pinned {
+                host: "h".to_string()
+            }
+        );
+        assert_eq!(
+            dsn_sslmode_floor("postgres://u@h/db?sslmode=require"),
+            SslmodeFloor::NotPinned {
+                host: "h".to_string()
+            }
+        );
+        assert_eq!(
+            dsn_sslmode_floor("postgres:///mem?host=/var/run/postgresql&sslmode=verify-full"),
+            SslmodeFloor::UnixSocket {
+                dir: "/var/run/postgresql".to_string()
+            }
+        );
+        assert_eq!(
+            dsn_sslmode_floor("postgres://u:p@/mem?sslmode=verify-full"),
+            SslmodeFloor::Unparseable
+        );
+        assert!(!dsn_pins_sslmode_verify_full(
+            "postgres:///mem?host=/var/run/postgresql&sslmode=verify-full"
+        ));
+        assert!(!dsn_pins_sslmode_verify_full("garbage?sslmode=verify-full"));
+        // the three refusals name their cause and the fix, never a DSN
+        let sock = pg_unix_socket_refusal("/var/run/postgresql");
+        assert!(sock.contains("Unix-domain socket") && sock.contains("host=/var/run/postgresql"));
+        assert!(sock.contains(REMEDY_PG_SSLMODE) && sock.contains("#3827"));
+        assert!(pg_dsn_unparseable_refusal().contains(REMEDY_PG_SSLMODE));
+    }
+
     #[test]
     fn plaintext_scheme_predicate_3705() {
         assert!(url_is_plaintext_http("http://127.0.0.1:9077"));
@@ -387,6 +691,122 @@ mod tests {
         assert!(!url_is_plaintext_http("https://127.0.0.1:9077"));
         assert!(!url_is_plaintext_http("httpx://h"));
         assert!(!url_is_plaintext_http("peer.example:9077"));
+    }
+
+    /// #3863 — the three `http:` spellings the 7-byte prefix test waved
+    /// through. Every one of them PARSES (WHATWG, the grammar reqwest uses at
+    /// request time) to a cleartext `http://host` request, so each must be
+    /// refused by the gate and classified as plaintext by the predicate.
+    #[test]
+    fn forward_url_http_variants_are_refused_3863() {
+        for raw in ["http:/peer:9077", "http:peer:9077", r"http:\\evil/x"] {
+            // The premise, pinned: the parser normalises the spelling to http.
+            let parsed = reqwest::Url::parse(raw).expect(raw);
+            assert_eq!(parsed.scheme(), "http", "{raw:?}");
+            assert!(parsed.host_str().is_some(), "{raw:?} resolves to a host");
+            assert!(
+                url_is_plaintext_http(raw),
+                "{raw:?} parses to http:// and must classify as plaintext"
+            );
+            let cfg = crate::config::AppConfig {
+                mcp_federation_forward_url: Some(raw.to_string()),
+                ..Default::default()
+            };
+            let err = enforce_config_urls(&cfg)
+                .expect_err("a forward URL that parses to http:// must refuse boot");
+            let msg = err.to_string();
+            assert!(msg.contains(ISSUE_TAG), "{raw:?}: {msg}");
+            assert!(msg.contains(REMEDY_USE_HTTPS), "{raw:?}: {msg}");
+            assert!(
+                !msg.contains("evil/x"),
+                "origin only, never the path: {msg}"
+            );
+        }
+    }
+
+    /// #3863 — the non-`http` schemes were never the hole (reqwest refuses
+    /// them at request time, fail-closed); pin that they STAY refused — now at
+    /// boot, by name — so a future relaxation cannot open them. `https` is the
+    /// one accepted class; unset stays accepted.
+    #[test]
+    fn forward_url_non_http_schemes_stay_refused_3863() {
+        for raw in [
+            "httpx://h",
+            "ws://h:9077",
+            "peer.example:9077",
+            "",
+            "   ",
+            "/just/a/path",
+        ] {
+            let cfg = crate::config::AppConfig {
+                mcp_federation_forward_url: Some(raw.to_string()),
+                ..Default::default()
+            };
+            assert!(
+                enforce_config_urls(&cfg).is_err(),
+                "{raw:?} is not https and must refuse boot"
+            );
+        }
+        for ok in ["https://peer:9077", "  HTTPS://Peer:9077/api?x=1  "] {
+            let cfg = crate::config::AppConfig {
+                mcp_federation_forward_url: Some(ok.to_string()),
+                ..Default::default()
+            };
+            assert!(enforce_config_urls(&cfg).is_ok(), "{ok:?} is https");
+        }
+        assert!(enforce_config_urls(&crate::config::AppConfig::default()).is_ok());
+    }
+
+    /// #3863 — the classifier the gate and doctor share: the `http:`
+    /// spellings are PlaintextHttp, `https` is the one accepted class, the
+    /// non-http schemes name themselves, and nothing else parses.
+    #[test]
+    fn outbound_url_classifier_3863() {
+        use OutboundUrlClass::{Https, OtherScheme, PlaintextHttp, Unparseable};
+        for raw in [
+            "http://peer:9077",
+            "  HTTP://localhost/x",
+            "http:/peer:9077",
+            "http:peer:9077",
+            r"http:\\evil/x",
+            r"http:\evil/x",
+        ] {
+            assert_eq!(classify_outbound_url(raw), PlaintextHttp, "{raw:?}");
+        }
+        assert_eq!(classify_outbound_url("https://peer:9077"), Https);
+        assert_eq!(classify_outbound_url(" HTTPS://Peer/x "), Https);
+        assert_eq!(
+            classify_outbound_url("httpx://h"),
+            OtherScheme("httpx".to_string())
+        );
+        assert_eq!(
+            classify_outbound_url("ws://h"),
+            OtherScheme("ws".to_string())
+        );
+        assert_eq!(
+            classify_outbound_url("peer.example:9077"),
+            OtherScheme("peer.example".to_string())
+        );
+        for raw in ["", "   ", "/just/a/path", "peer:9077"] {
+            // `peer:9077` parses as scheme `peer` — OtherScheme — so it is
+            // not in this list; the bare forms do not parse at all.
+            assert!(
+                matches!(classify_outbound_url(raw), Unparseable | OtherScheme(_)),
+                "{raw:?} must never be Https or PlaintextHttp: {:?}",
+                classify_outbound_url(raw)
+            );
+        }
+        // The validator's three refusal arms each name the tag and the fix.
+        for raw in ["http:/peer:9077", "ws://h", ""] {
+            let msg = validate_outbound_url_scheme("MCP forward URL", raw)
+                .expect_err(raw)
+                .to_string();
+            assert!(
+                msg.contains(ISSUE_TAG) && msg.contains(REMEDY_USE_HTTPS),
+                "{msg}"
+            );
+        }
+        assert!(validate_outbound_url_scheme("MCP forward URL", "https://h").is_ok());
     }
 
     /// #3709 item 5 — every refusal prints the command that resolves it.

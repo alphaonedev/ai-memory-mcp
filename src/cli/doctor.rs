@@ -1227,6 +1227,33 @@ fn section_deployment_shape_detector_3700(registered_agents: Option<usize>) -> R
     }
 }
 
+/// The `mcp_federation_forward_url` posture line: the fact text and whether
+/// the next boot REFUSES on it. #3863 — decided by the SAME parse-then-
+/// allowlist classifier the boot gate uses, so a spelling the gate refuses
+/// (`http:/peer`, `http:peer`, `http:\\peer`, a non-http scheme, an empty
+/// value) can never be attested here as `https`. Origin only — a forward
+/// URL can carry a token; never echo it.
+fn forward_url_posture(url: Option<&str>) -> (String, bool) {
+    use crate::transit_encryption::{self, OutboundUrlClass};
+    match url {
+        None => ("unset".to_string(), false),
+        Some(u) => match transit_encryption::classify_outbound_url(u) {
+            OutboundUrlClass::Https => (
+                format!("https ({})", transit_encryption::url_origin_for_refusal(u)),
+                false,
+            ),
+            OutboundUrlClass::PlaintextHttp => ("PLAINTEXT http — REFUSES boot".to_string(), true),
+            OutboundUrlClass::OtherScheme(scheme) => (
+                format!("unsupported scheme {scheme:?} — REFUSES boot"),
+                true,
+            ),
+            OutboundUrlClass::Unparseable => {
+                ("not a valid absolute URL — REFUSES boot".to_string(), true)
+            }
+        },
+    }
+}
+
 /// v1.0.0 #3705 — every transit surface versus the mandate.
 ///
 /// Read-only. The daemon's own listener is argv-only (`--tls-cert` /
@@ -1271,15 +1298,11 @@ fn section_transit_encryption_3705(conn: Option<&rusqlite::Connection>) -> Repor
         refuses.extend(armed.iter().map(|s| (*s).to_string()));
         format!("{} — REFUSES boot", armed.join(", "))
     };
-    let forward_url = match app_config.mcp_federation_forward_url.as_deref() {
-        None => "unset".to_string(),
-        Some(u) if transit_encryption::url_is_plaintext_http(u) => {
-            refuses.push(crate::config::shape::detector::SIGNAL_MCP_FEDERATION_FORWARD.to_string());
-            "PLAINTEXT http — REFUSES boot".to_string()
-        }
-        // Origin only — a forward URL can carry a token; never echo it.
-        Some(u) => format!("https ({})", transit_encryption::url_origin_for_refusal(u)),
-    };
+    let (forward_url, forward_refuses) =
+        forward_url_posture(app_config.mcp_federation_forward_url.as_deref());
+    if forward_refuses {
+        refuses.push(crate::config::shape::detector::SIGNAL_MCP_FEDERATION_FORWARD.to_string());
+    }
     let store_url_sslmode = match crate::store_url::resolve_store_url(None) {
         Ok(None) => "sqlite (no store URL)".to_string(),
         Ok(Some(dsn))
@@ -1290,13 +1313,29 @@ fn section_transit_encryption_3705(conn: Option<&rusqlite::Connection>) -> Repor
         {
             "sqlite (store URL is not postgres)".to_string()
         }
-        Ok(Some(dsn)) if transit_encryption::dsn_pins_sslmode_verify_full(&dsn) => {
-            format!("postgres: sslmode={PG_SSLMODE_FLOOR} pinned")
-        }
-        Ok(Some(_)) => {
-            refuses.push("store URL sslmode".to_string());
-            format!("postgres: sslmode={PG_SSLMODE_FLOOR} NOT pinned — REFUSES at connect")
-        }
+        // #3866 — the transport is rendered, never inferred from the query
+        // string: a Unix-socket DSN is refused at connect whatever it says.
+        Ok(Some(dsn)) => match transit_encryption::dsn_sslmode_floor(&dsn) {
+            transit_encryption::SslmodeFloor::Pinned { host } => {
+                format!("postgres over TCP ({host}): sslmode={PG_SSLMODE_FLOOR} pinned")
+            }
+            transit_encryption::SslmodeFloor::NotPinned { host } => {
+                refuses.push("store URL sslmode".to_string());
+                format!(
+                    "postgres over TCP ({host}): sslmode={PG_SSLMODE_FLOOR} NOT pinned — REFUSES at connect"
+                )
+            }
+            transit_encryption::SslmodeFloor::UnixSocket { dir } => {
+                refuses.push("store URL transport".to_string());
+                format!(
+                    "postgres over a Unix-domain socket (host={dir}): sslmode does not apply on this transport — REFUSES at connect (#3866)"
+                )
+            }
+            transit_encryption::SslmodeFloor::Unparseable => {
+                refuses.push("store URL".to_string());
+                "postgres: DSN not parseable by the driver — REFUSES at connect (#3866)".to_string()
+            }
+        },
         Err(e) => format!("unresolvable: {e:#}"),
     };
     let (webhook_targets, webhook_plaintext) = match conn {
@@ -3970,10 +4009,13 @@ fn section_capabilities_local() -> ReportSection {
 /// see WHERE the wiring came from and WHY the probe lands where it
 /// does.
 fn section_llm_reachability_1146() -> ReportSection {
-    use crate::config::{AppConfig, ConfigSource, KeySource};
-
-    let app_config = AppConfig::load();
+    let app_config = crate::config::AppConfig::load();
     let resolved = app_config.resolve_llm(None, None, None);
+    section_llm_reachability_from_resolved(&resolved)
+}
+
+fn section_llm_reachability_from_resolved(resolved: &crate::config::ResolvedLlm) -> ReportSection {
+    use crate::config::{ConfigSource, KeySource};
 
     let mut facts = vec![
         ("backend".into(), resolved.backend.clone()),
@@ -3991,6 +4033,30 @@ fn section_llm_reachability_1146() -> ReportSection {
             resolved.api_key_source.as_str().to_string(),
         ),
     ];
+
+    // #3811/#3860: this probe builds its own HTTP client, so enforce the
+    // same selector gate as both LLM builders before any credential or
+    // request is attached, even when the operator supplied an explicit URL.
+    if !crate::config::is_recognized_llm_backend(&resolved.backend) {
+        return ReportSection {
+            name: SECTION_LLM_REACHABILITY.into(),
+            severity: Severity::Critical,
+            facts,
+            note: Some(
+                crate::config::unrecognized_llm_backend_error(&resolved.backend).to_string(),
+            ),
+        };
+    }
+    if resolved.base_url.trim().is_empty() {
+        return ReportSection {
+            name: SECTION_LLM_REACHABILITY.into(),
+            severity: Severity::Critical,
+            facts,
+            note: Some(
+                "LLM backend has no default URL; configure [llm].base_url before probing".into(),
+            ),
+        };
+    }
 
     // If the key resolution surfaced an error during resolve (file
     // perms / missing env / etc.), call it out — but still try the
@@ -5284,6 +5350,48 @@ mod tests {
             "a singleton (fresh store, no fleet signal) may mint its local certificate: {:?}",
             fact(transit, "local_tls_material")
         );
+    }
+
+    /// #3863 — doctor must never render a forward URL the boot gate refuses as
+    /// `https`. The three `http:` spellings that parse (WHATWG, the grammar
+    /// reqwest uses) to a cleartext `http://` request, the non-http schemes
+    /// and an empty value all render as REFUSES, and the line agrees with the
+    /// gate itself.
+    #[test]
+    fn doctor_never_renders_a_bypassing_forward_url_as_https_3863() {
+        for raw in [
+            "http:/peer:9077",
+            "http:peer:9077",
+            r"http:\\evil/x",
+            "http://peer:9077",
+            "ws://h:9077",
+            "httpx://h",
+            "peer.example:9077",
+            "",
+        ] {
+            let (text, refuses) = forward_url_posture(Some(raw));
+            assert!(
+                !text.starts_with("https"),
+                "{raw:?} rendered as {text:?} — a false attestation"
+            );
+            assert!(refuses, "{raw:?}: the line must say the next boot refuses");
+            assert!(text.contains("REFUSES boot"), "{raw:?}: {text:?}");
+            let cfg = crate::config::AppConfig {
+                mcp_federation_forward_url: Some(raw.to_string()),
+                ..Default::default()
+            };
+            assert!(
+                crate::transit_encryption::enforce_config_urls(&cfg).is_err(),
+                "{raw:?}: doctor says REFUSES, so the gate must refuse"
+            );
+        }
+        let (text, refuses) = forward_url_posture(Some("https://user:tok@peer:9077/api?k=v"));
+        assert_eq!(
+            text, "https (https://peer:9077)",
+            "origin only, never the token"
+        );
+        assert!(!refuses);
+        assert_eq!(forward_url_posture(None), ("unset".to_string(), false));
     }
 
     /// v1.0.0 #3700 — the detector section renders right after Configuration
@@ -7932,6 +8040,73 @@ enabled = true
             "compiled-default note expected; got {:?}",
             section.note
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn llm_reachability_selector_gate_blocks_credentials_3860() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for (backend, explicit_url, allowed) in [
+            ("opena1", false, false),
+            ("opena1", true, false),
+            (crate::llm::BACKEND_OPENAI_COMPATIBLE, false, false),
+            (crate::llm::BACKEND_OPENAI_COMPATIBLE, true, true),
+            (crate::llm::BACKEND_VLLM, true, true),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/models"))
+                .and(header("authorization", "Bearer fixture-key-3860"))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(u64::from(allowed))
+                .mount(&server)
+                .await;
+            let resolved = {
+                // Hold both existing test locks only while resolving, never
+                // across await. Restore the fixture key before network I/O.
+                let _config = crate::config::test_env_lock();
+                let _reach = reach_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+                let _scope = EnvScope::set(&[
+                    ("AI_MEMORY_LLM_API_KEY", "fixture-key-3860"),
+                    ("AI_MEMORY_LLM_BASE_URL", ""),
+                ]);
+                crate::config::AppConfig::default().resolve_llm(
+                    Some(backend),
+                    Some("fixture-model"),
+                    explicit_url.then_some(server.uri()).as_deref(),
+                )
+            };
+            assert!(resolved.api_key().is_some());
+            if !explicit_url {
+                assert!(resolved.base_url.is_empty());
+            }
+            let section = tokio::task::spawn_blocking(move || {
+                section_llm_reachability_from_resolved(&resolved)
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                section.severity,
+                if allowed {
+                    Severity::Info
+                } else {
+                    Severity::Critical
+                }
+            );
+            let requests = server.received_requests().await.unwrap();
+            assert_eq!(requests.len(), usize::from(allowed));
+            if !allowed {
+                let reason = if backend == crate::llm::BACKEND_OPENAI_COMPATIBLE {
+                    "no default URL"
+                } else {
+                    "not a recognized backend alias"
+                };
+                assert!(section.note.as_deref().unwrap().contains(reason));
+                assert!(!section.facts.iter().any(|(key, _)| key == "probe_url"));
+            }
+            server.verify().await;
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -657,10 +657,11 @@ api_key_env = "XAI_API_KEY"            # env-var name reference (mutually
 
 [llm.auto_tag]
 # Fast structured-output sibling of [llm] (auto_tag, query expansion,
-# contradiction detection). Field-by-field fallback to parent [llm];
-# operators commonly override only `model` to point at a fast local
-# Ollama variant.
-backend = "ollama"
+# contradiction detection). At v1.0.0 ONLY `model` is consumed — point
+# it at a fast local variant. `backend` / `base_url` / `api_key_env` /
+# `api_key_file` are parsed but IGNORED (the model string is threaded
+# through the PRIMARY [llm] client), and setting any of them emits a
+# boot WARN naming the ignored key (#3808).
 model   = "gemma3:4b"
 
 [embeddings]

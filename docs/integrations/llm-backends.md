@@ -25,8 +25,11 @@ base_url    = "https://api.x.ai/v1"   # optional; vendor-default if unset
 api_key_env = "XAI_API_KEY"            # process-env-var name (NOT the literal key)
 # api_key_file = "/etc/ai-memory/keys/xai.key"   # alt — mode 0400 enforced
 
-[llm.auto_tag]                         # fast structured-output sibling; falls back to [llm]
-backend = "ollama"
+[llm.auto_tag]                         # fast structured-output sibling
+# v1.0.0: ONLY `model` is consumed — it runs on the PRIMARY [llm]
+# client. `backend` / `base_url` / `api_key_env` / `api_key_file`
+# are parsed but IGNORED and WARN at boot (#3808); there is no
+# second auto_tag endpoint.
 model   = "gemma3:4b"
 ```
 

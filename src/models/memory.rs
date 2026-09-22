@@ -614,10 +614,14 @@ pub const TITLE_SLOT_INDEX_PREDICATE: &str = "lifecycle_state <> 'tombstoned'";
 
 /// #3690 — what a write funnel may do when a row already holds the
 /// `(title, namespace)` it is about to claim. Derived ONCE from the row's
-/// [`LifecycleState`] and consulted by every create / federation funnel on
-/// both adapters BEFORE its statement runs, so the admission and the
-/// disposition read the same value (the #3730 rule: a gate that runs before
-/// the lookup that qualifies it is not a gate).
+/// [`LifecycleState`] and consulted by every CREATE funnel on both adapters
+/// BEFORE its statement runs, so the admission and the disposition read the
+/// same value (the #3730 rule: a gate that runs before the lookup that
+/// qualifies it is not a gate). #3750 — the FEDERATION funnels do NOT consult
+/// it: `merge_inbound` / `apply_remote_memory` resolve an existing row by `id`
+/// and merge `lifecycle_state` by LWW (`crate::models::crdt_merge`), so on the
+/// replication path the #3730 gate is currently unenforced — a known gap whose
+/// code fix is deferred to v1.1 per #3750, not a property this predicate holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TitleSlotAdmission {
     /// The occupant is a live, caller-visible row: the funnel's ordinary

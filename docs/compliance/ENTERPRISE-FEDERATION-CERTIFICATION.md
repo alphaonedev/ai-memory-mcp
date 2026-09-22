@@ -12,15 +12,15 @@
 > (`docs/audit/3x7-v1-cutline-ruling-2026-08-01.md`) is the standard this
 > certification answers to; this document is the evidence-bound answer.
 
-**Binds to:** `f32c18dadf8a659567960747cc2802186bac9de9` (the v1.0.0 promotion-candidate tip;
-re-issued 2026-09-21 after **12 §7-watched federation-wire files changed** since the prior bind
-`ab6f2175` (2498 insertions / 317 deletions) — §5.4(2)–(5) re-run at the new SHA per §7). The
-2026-09-12 #3607 re-bind at `ab6f2175`, the 2026-09-11 re-issue at `b0483115`, the 2026-09-11
-#3595 re-issue at `ad60bead` and the original 2026-08-12 mint `e22bc93c` remain as historical
-records. Any change to the federation wire path or the `AI_MEMORY_FED_*` surface **voids this
+**Binds to:** `92209ad91054e5e354499e383f403dd091f4d88d` (the promotion-2 rehearsal tip;
+re-issued 2026-09-22 after **2 §7-watched federation-wire files changed** since the prior bind
+`f32c18dad` — 22 changed lines, **0 of them code** — §5.4(2)–(5) re-run at the new SHA per §7). The
+2026-09-21 re-issue at `f32c18dad`, the 2026-09-12 #3607 re-bind at `ab6f2175`, the 2026-09-11
+re-issue at `b0483115`, the 2026-09-11 #3595 re-issue at `ad60bead` and the original 2026-08-12
+mint `e22bc93c` remain as historical records. Any change to the federation wire path or the `AI_MEMORY_FED_*` surface **voids this
 certification and triggers re-cert** (see §7).
 
-> ## STATUS — **LIVE as of 2026-09-21** (re-issued at the v1.0.0 promotion tip `f32c18dad` at 22 checks after 12 §7-watched federation-wire files changed; supersedes the 2026-09-12 #3607 bind at `ab6f2175`)
+> ## STATUS — **LIVE as of 2026-09-22** (re-issued at the promotion-2 rehearsal tip `92209ad91` at 22 checks after 2 §7-watched federation-wire files changed by a COMMENT-ONLY diff; supersedes the 2026-09-21 bind at `f32c18dad`)
 >
 > Re-validated and re-bound against `f32c18dadf8a659567960747cc2802186bac9de9`
 > at the v1.0.0 promotion tip on 2026-09-21: §5.4(2) posture legs re-measured at 22 checks
@@ -78,6 +78,59 @@ certification and triggers re-cert** (see §7).
 > `git diff --stat e22bc93c b80e7fff` is empty). This re-issue adds the
 > committed evidence bundle under `docs/compliance/evidence/cert-54/`
 > and this document's own ratification / caveat corrections.
+>
+> **Re-issue (2026-09-22, promotion 2 @ `92209ad91`).** The §7 re-cert trigger
+> FIRED: two watched federation-wire paths changed between `f32c18dad` and
+> `92209ad91` — `src/handlers/federation_receive.rs` and
+> `src/handlers/federation_signing_check.rs`. **The diff is 22 lines, ZERO of
+> them code.** Measured: with comment lines stripped, BOTH files hash
+> IDENTICAL across the two SHAs; the `AI_MEMORY_FED_*` identifier set is
+> IDENTICAL; `src/federation/**` has no diff at all. The change is the #3750
+> correction of four false in-code comments (one of which claimed
+> `merge_inbound` PRESERVES an existing row's `lifecycle_state`, which it does
+> not — it resolves by LWW).
+>
+> §7 states the certification expires on **any** change to the federation wire
+> path and carries no comment-only carve-out, so tree-equivalence does not
+> discharge it. Nor does an amendment-without-re-mint: that route (used by the
+> 2026-08-28 and 2026-09-02 amendments) was closed by #3556, which hardened
+> `check-cert-expiry.sh` so predicate (B) requires the banner itself to move
+> and predicate (C) fails a LIVE banner over watched drift. **Discharged by
+> full re-issue**, not by argument.
+>
+> §5.4(2)–(5) were **re-run at `92209ad91`**, not carried forward — the same
+> batch moved `doctor --posture` check #15 (#3866) and the pg connect funnel,
+> so re-citing the `f32c18dad` numbers unmeasured would have been a false
+> claim. Every figure below was measured on this SHA.
+>
+> **§5.4(2) posture legs** (evidence: `docs/compliance/evidence/cert-92209ad91/`):
+> leg 1 bare — exit **2**, 12 PASS / 10 FAIL; leg 2 hardened, gate unarmed —
+> exit **2**, 20 / 2; leg 3 hardened, gate ARMED — exit **1**, refuses boot;
+> leg 4 certified configuration (sqlcipher build, `ENCRYPT_AT_REST=1`, gate
+> ARMED) — exit **0**, **22 PASS / 0 FAIL**. Leg 4 carries
+> `[PASS] AI_MEMORY_ENCRYPT_AT_REST`, `actual: env=1 sqlcipher_build=true` —
+> the check whose rendering #3866 changed; it holds.
+>
+> **§5.4(4)/(7) acceptance battery** — 11 invocations, default features, one
+> filter each; **11/11 green, zero failures**:
+> `boot_fail_closed_config_3166` 15 · `doctor_posture_exit_code_3003` 2 ·
+> `doctor_synchronous_posture_3553` 3 · `federation_catchup_posture_3582` 1 ·
+> `federation_namespace_gate_3582` 3 · `federation_peer_posture_3582` 10 ·
+> `federation_write_ns_scope_2447` 6 · `posture_control15_pg_resolution_3106` 4 ·
+> `--lib enterprise_federation_posture` **39** · `--lib federation::peer_posture` 5 ·
+> `--lib cli::backup::tests` 81. The posture count is **39 where `f32c18dad`
+> recorded 38**: the +1 is the `#3866` cell this batch added. Recorded as
+> measured rather than reproduced.
+>
+> **§5.4(5) removal proof** — `scripts/check-cert-removal-proof.sh`, all 15
+> controls, no flags: **`overall: PASS`, 15 `[PROVEN]`, 0 `[CERT-RED]`**, rc 0.
+> Verified non-vacuous by reading broken/restored pairs: the mutated controls
+> fail at TEST level (`test result: FAILED. 0 passed; 1 failed`, assertion
+> panic) and not at compile level — a broken leg that merely failed to compile
+> would be inconclusive, not a proof.
+>
+> **§5.4(3)** pg+AGE and the self-hosted federation lanes are cited from CI on
+> PR #3903, whose merge commit carries this exact tree.
 >
 > **Amendment (2026-08-13 re-capture).** The original three-file,
 > docs/harness-only delta above describes the CERTIFICATION LANDING at
@@ -1195,7 +1248,13 @@ as Task C / [**#2915**](https://github.com/alphaonedev/ai-memory-mcp/pull/2915),
 merged 2026-08-13: the `cert-expiry-gate` job in
 `.github/workflows/c8-precheck.yml` runs `scripts/check-cert-expiry.sh`
 on every PR diff — a watched-surface change without a same-change edit
-to this document goes RED. Its reported context is declared in
+to this document goes RED. Since [**#3556**](https://github.com/alphaonedev/ai-memory-mcp/issues/3556)
+(2026-09-21) the gate also READS this banner: a same-change edit satisfies
+it only if the STATUS line or the Binds-to line changed (an incidental
+prose edit is not a re-issue), and a banner that says LIVE bound to a SHA
+with §7-watched drift between that SHA and HEAD goes RED on every PR until
+the document is re-issued at HEAD or its STATUS is set to VOID/EXPIRED —
+the one-line remedy the failure names. Its reported context is declared in
 `scripts/qc-allowlists/required-contexts-release.txt`; until the
 operator-gated branch-protection API call adds it to the live required
 set, the gate is a red check, not a merge block.)
