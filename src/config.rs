@@ -135,6 +135,9 @@ pub use shape::{
     AtRestPolicy, DeploymentSection, DeploymentShape, Requirement, ShapeBootReport, ShapeDerived,
     StorageBackend,
 };
+/// #3808 + #3819 — the `[llm.auto_tag]` reality gap (ignored endpoint keys +
+/// the live model override). Child module so config.rs stays under its ceiling.
+mod auto_tag_endpoint;
 /// v1.0.0 #3715 item 3 — the key deprecation lifecycle, as data.
 pub mod deprecated_keys;
 /// #3715 — unknown-key refusal at the loader, schema-derived.
@@ -8577,6 +8580,7 @@ impl AppConfig {
             .map_err(|reason| anyhow::anyhow!("config rejected ({}): {reason}", path.display()))?;
         eprintln!("ai-memory: loaded config from {}", path.display());
         cfg.warn_legacy_schema_drift(path);
+        cfg.warn_ignored_auto_tag_endpoint_keys(path); // #3808
         Ok(cfg)
     }
 
