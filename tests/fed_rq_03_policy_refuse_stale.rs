@@ -250,6 +250,14 @@ async fn stale_policy_version_is_refused_before_apply() {
 /// transient `SQLITE_BUSY` / corrupted-read fault takes at this call site.
 async fn break_policy_read(db: &ai_memory::handlers::Db) {
     let lock = db.lock().await;
+    // #3877 — the fail-CLOSED record-stop gate ALSO reads `signed_events`
+    // (`read_state_sqlite`). Seed it from the HEALTHY chain BEFORE the policy-read
+    // fault so it uses its cached clean state — exactly as production caches at the
+    // first gated write / open-seed — and this test isolates the POLICY read fault,
+    // not the orthogonal record-stop plane. This never weakens the gate: a genuine
+    // first-touch unreadable chain still refuses.
+    ai_memory::storage::record_stop::seed_from_conn(&lock.0)
+        .expect("seed record-stop from the healthy chain before the policy fault");
     lock.0
         .execute_batch("ALTER TABLE signed_events RENAME COLUMN event_type TO event_type_broken;")
         .expect("break the policy-version read");

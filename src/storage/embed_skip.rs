@@ -540,6 +540,13 @@ mod tests {
         )
         .expect("stub memories");
         conn.execute_batch(MIGRATION_V96_SQLITE).expect("v96 ddl");
+        // #3877 — gated write fns here (`invalidate_stale_sqlite` et al.) read
+        // `signed_events` via the fail-CLOSED record-stop gate, so the fixture
+        // must ship that table or every gated call refuses.
+        conn.execute_batch(include_str!(
+            "../../migrations/sqlite/0020_v07_signed_events.sql"
+        ))
+        .expect("apply v20 signed_events migration");
         conn
     }
 
