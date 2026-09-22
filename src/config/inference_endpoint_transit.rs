@@ -51,7 +51,10 @@ impl AppConfig {
         }
         if let Some(emb) = &self.embeddings {
             candidates.push(("[embeddings].base_url", emb.base_url.as_deref()));
-            candidates.push(("[embeddings].url", emb.url.as_deref()));
+            candidates.push((
+                crate::config::config_keys::EMBEDDINGS_URL,
+                emb.url.as_deref(),
+            ));
         }
         candidates.push(("ollama_url", self.ollama_url.as_deref()));
         candidates.push(("embed_url", self.embed_url.as_deref()));
@@ -121,7 +124,7 @@ mod tests {
                 },
             ),
             (
-                "[embeddings].url",
+                crate::config::config_keys::EMBEDDINGS_URL,
                 AppConfig {
                     embeddings: Some(EmbeddingsSection {
                         url: Some("http://embed2.internal:8080".into()),

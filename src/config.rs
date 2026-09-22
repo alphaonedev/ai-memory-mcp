@@ -166,6 +166,10 @@ pub mod config_keys {
     pub const DEFAULT_NAMESPACE: &str = "default_namespace";
     /// Legacy flat `embedding_model` key (v2: `[embeddings].model`).
     pub const EMBEDDING_MODEL: &str = "embedding_model";
+    /// `[embeddings].url` sectioned config-key label (#3823 SSOT so the
+    /// bracketed label is not scattered across the deprecation replacement,
+    /// the transit-scheme validator, and the doctor egress readout).
+    pub const EMBEDDINGS_URL: &str = "[embeddings].url";
     /// Legacy flat `max_memory_mb` key. PARSED but NOT ENFORCED (FBL-13):
     /// it has no runtime consumer — it does not cap memory or storage and is
     /// NOT an auto-tier-selection input on any live path. `resolve_storage`
