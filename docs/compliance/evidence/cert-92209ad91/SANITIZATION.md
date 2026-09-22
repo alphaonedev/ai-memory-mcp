@@ -34,6 +34,20 @@ comment-only carve-out, and the amendment-without-re-mint route was closed by
 | `removal-proof-full.log` | The §5.4(5) removal proof over all 15 controls: `overall: PASS`, 15 `[PROVEN]`, 0 `[CERT-RED]`, rc 0. |
 | `peer-fingerprints.txt`, `peer-attestation.json` | Throwaway fixtures generated for the run. |
 
+## Provenance note — the `@ d5c596a69` in the exit-codes header
+
+`posture-legs-exit-codes.txt` carries a header ending `@ d5c596a69`, which is
+the recapture script's own `git rev-parse --short HEAD` of the worktree it ran
+in, recorded verbatim. The banner and this document bind the certification to
+`92209ad91`. Both are correct and the difference is not a discrepancy:
+
+`git diff 92209ad91 d5c596a69 -- . ':!tests'` is **empty** — the two commits
+differ only under `tests/` (the macOS config-redirect fix), so the release
+binaries built for the posture legs are built from the `92209ad91` source tree
+exactly. The generated header is left as the script emitted it rather than
+edited, because a provenance line that records what actually ran is worth more
+than one that has been tidied to match the banner.
+
 ## Sanitization
 
 No secret material is recorded here.
