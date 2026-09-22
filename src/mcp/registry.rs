@@ -1016,6 +1016,42 @@ pub(crate) fn families_overview(profile: &crate::profile::Profile) -> Value {
 /// - Unknown family → `Err` with diagnostic listing valid families.
 /// - Empty family name → `Err`.
 /// - Allowlist deny → `Err` with structured reason.
+/// #3818 — `tracing` target for the capability-expansion audit gate.
+const CAPABILITIES_TRACE_TARGET: &str = "mcp.capabilities";
+
+/// #3818 (Conductor ruling, option (a) — the established ratio from the 5-agent
+/// vote `4d3ea1c5`): the capability-expansion audit row is an ACCESS AUDIT OF A
+/// READ on a read-only-listed, ALWAYS-ON tool. Under an ENGAGED record-stop it
+/// is SKIPPED and the drilldown CONTINUES — the response never depended on the
+/// row (`record_capability_expansion` swallows its own error), so the schema is
+/// still returned and a DENIED probe is still refused; only the audit row is
+/// withheld, counted + WARNed so the gap is visible. An INDETERMINATE stop state
+/// (#3877) fails closed on the write the same way. Gated at the CALL SITE, so
+/// `record_capability_expansion` itself stays ungated and its B7 allowlist row
+/// stays accurate.
+fn record_capability_expansion_unless_stopped(
+    conn: &rusqlite::Connection,
+    agent_id: Option<&str>,
+    family: &str,
+    granted: bool,
+) {
+    match crate::storage::record_stop::gate_storage_conn(conn) {
+        Ok(()) => crate::db::record_capability_expansion(conn, agent_id, family, granted, None),
+        Err(e) => {
+            crate::metrics::inc_capability_expansion_audit_suppressed();
+            tracing::warn!(
+                target: CAPABILITIES_TRACE_TARGET,
+                agent_id = ?agent_id,
+                family,
+                granted,
+                error = %e,
+                "#3818: capability-expansion audit row SUPPRESSED under record-stop \
+                 (drilldown still served; resume clears)"
+            );
+        }
+    }
+}
+
 pub fn handle_capabilities_family(
     family_name: &str,
     include_schema: bool,
@@ -1050,12 +1086,11 @@ pub fn handle_capabilities_family(
                 // v0.6.4-009 — record the deny so operators can see
                 // attempted-but-blocked expansion patterns.
                 if let Some(conn) = audit_conn {
-                    crate::db::record_capability_expansion(
+                    record_capability_expansion_unless_stopped(
                         conn,
                         agent_id,
                         family.name(),
                         false,
-                        None,
                     );
                 }
                 return Err(format!(
@@ -1073,7 +1108,7 @@ pub fn handle_capabilities_family(
     // Lightweight name-list calls are not audited (they're informational
     // only — no schema material released).
     if include_schema && let Some(conn) = audit_conn {
-        crate::db::record_capability_expansion(conn, agent_id, family.name(), true, None);
+        record_capability_expansion_unless_stopped(conn, agent_id, family.name(), true);
     }
 
     let mut defs = tool_definitions();
