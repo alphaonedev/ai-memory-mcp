@@ -2987,10 +2987,14 @@ async fn sync_push_write(
             Ok(actual_id) => {
                 applied += 1;
                 // v1.0.0 R19/A3 (#1948) — route-OUT dequarantine-on-attest.
-                // `merge_inbound` PRESERVES an existing row's lifecycle_state
-                // on conflict, so when the author's write NOW verifies
-                // (agent_attested) we clear any prior quarantine via a raw
-                // UPDATE (no-op on a non-quarantined row).
+                // #3750 — `merge_inbound` does NOT preserve an existing row's
+                // lifecycle_state: `merge_memory` resolves it by LWW
+                // (`crate::models::crdt_merge`), so the local quarantine
+                // survives ONLY when the local row wins the tiebreak; when the
+                // inbound row wins, its state is adopted. So when the author's
+                // write NOW verifies (agent_attested) we clear any prior
+                // quarantine EXPLICITLY via a raw UPDATE, regardless of how the
+                // merge resolved (no-op on a non-quarantined row).
                 if row_is_agent_attested(&to_insert) {
                     let _ = db::dequarantine(&lock.0, &actual_id);
                 }

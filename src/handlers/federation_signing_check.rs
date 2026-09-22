@@ -685,10 +685,12 @@ pub(super) async fn sync_push_via_store(
             Ok(applied_id) => {
                 applied += 1;
                 // v1.0.0 R19/A3 (#1948) — route-OUT dequarantine-on-attest
-                // (postgres twin). `merge_inbound` PRESERVES an existing
-                // row's lifecycle_state (merge_memory keeps the local
-                // state), so a now-attested write clears any prior
-                // quarantine via the SAL raw-UPDATE surface.
+                // (postgres twin). #3750 — `merge_inbound` does NOT preserve
+                // an existing row's lifecycle_state: `merge_memory` resolves
+                // it by LWW, so the local quarantine survives only when the
+                // local row wins the tiebreak. So a now-attested write clears
+                // any prior quarantine EXPLICITLY via the SAL raw-UPDATE
+                // surface, regardless of how the merge resolved.
                 if crate::handlers::federation_receive::row_is_agent_attested(&to_insert) {
                     let _ = app.store.dequarantine(&applied_id).await;
                 }
