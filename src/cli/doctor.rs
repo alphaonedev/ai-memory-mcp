@@ -1369,7 +1369,7 @@ fn section_transit_encryption_3705(conn: Option<&rusqlite::Connection>) -> Repor
         .and_then(|e| e.url.as_deref().or(e.base_url.as_deref()))
         .is_some_and(transit_encryption::url_is_plaintext_http)
     {
-        egress.push("[embeddings].url");
+        egress.push(crate::config::config_keys::EMBEDDINGS_URL);
     }
     if app_config.ollama_url.is_some()
         && transit_encryption::url_is_plaintext_http(app_config.effective_ollama_url())
