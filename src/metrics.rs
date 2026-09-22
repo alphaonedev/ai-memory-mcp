@@ -56,6 +56,43 @@ pub fn record_stop_gate_indeterminate_total() -> u64 {
     RECORD_STOP_GATE_INDETERMINATE_TOTAL.load(Ordering::Relaxed)
 }
 
+static GOVERNANCE_CHECK_AUDIT_SUPPRESSED_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// #3818 — count one `governance.check` audit row SKIPPED because the record
+/// plane is stopped (or its stop state is indeterminate, #3877 fail-closed). The
+/// verdict itself was still returned and the forensic-file emit still ran; this
+/// counts the audit-chain gap so it is visible rather than silent. Same shape as
+/// [`inc_record_stop_gate_indeterminate`]: cold branch only, process-local, the
+/// loud per-occurrence signal is the paired `governance.rules`-target WARN.
+pub fn inc_governance_check_audit_suppressed() {
+    GOVERNANCE_CHECK_AUDIT_SUPPRESSED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Cumulative `governance.check` audit rows suppressed under record-stop since
+/// process start.
+#[must_use]
+pub fn governance_check_audit_suppressed_total() -> u64 {
+    GOVERNANCE_CHECK_AUDIT_SUPPRESSED_TOTAL.load(Ordering::Relaxed)
+}
+
+static CAPABILITY_EXPANSION_AUDIT_SUPPRESSED_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// #3818 — count one `audit_log` capability-expansion row SKIPPED because the
+/// record plane is stopped (or its stop state is indeterminate). A SEPARATE
+/// counter from [`inc_governance_check_audit_suppressed`]: different subsystem,
+/// different table — one counter for two causes is a number nobody can
+/// interpret. Same shape as the #3877 indeterminate counter.
+pub fn inc_capability_expansion_audit_suppressed() {
+    CAPABILITY_EXPANSION_AUDIT_SUPPRESSED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Cumulative capability-expansion audit rows suppressed under record-stop since
+/// process start.
+#[must_use]
+pub fn capability_expansion_audit_suppressed_total() -> u64 {
+    CAPABILITY_EXPANSION_AUDIT_SUPPRESSED_TOTAL.load(Ordering::Relaxed)
+}
+
 static HNSW_EVICTIONS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static HNSW_LAST_EVICTION_AT_NANOS: AtomicU64 = AtomicU64::new(0);
 

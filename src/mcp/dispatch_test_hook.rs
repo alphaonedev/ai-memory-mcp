@@ -39,6 +39,7 @@ pub fn mcp_tool_is_read_only_for_test(name: &str) -> bool {
 /// Panics when `request` is not a well-formed JSON-RPC request object or the
 /// response cannot be serialised — both are test-fixture errors.
 #[doc(hidden)]
+#[must_use]
 pub fn handle_request_for_test(
     conn: &rusqlite::Connection,
     db_path: &Path,
