@@ -8747,7 +8747,8 @@ impl AppConfig {
             }
         }
         // #3823 — rejection 6: a non-loopback plaintext inference endpoint.
-        self.validate_inference_endpoint_transit()?;
+        self.validate_inference_endpoint_transit()
+            .map_err(|e| e.to_string())?;
         Ok(())
     }
 
