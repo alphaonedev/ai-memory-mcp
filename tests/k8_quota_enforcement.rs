@@ -420,6 +420,7 @@ async fn k8_http_link_at_links_per_day_limit_returns_429_1621() {
                 ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty(),
             ),
             identity_mode: ai_memory::config::HttpIdentityMode::default(),
+            ..Default::default()
         },
         app_state,
     );

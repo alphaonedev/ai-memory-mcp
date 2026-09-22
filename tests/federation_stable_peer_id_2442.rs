@@ -44,6 +44,8 @@ use std::time::Duration;
 use ai_memory::federation::FederationConfig;
 use ai_memory::federation::peer::is_legacy_positional_peer_id;
 
+mod common;
+
 const PEER_A: &str = "https://peer-a.example:8443/base";
 const PEER_B: &str = "https://peer-b.example:8443/base";
 const PEER_C: &str = "https://peer-c.example:8443/base";
@@ -277,7 +279,6 @@ mod replay {
     use axum::extract::State;
     use axum::http::StatusCode;
     use axum::routing::post;
-    use tokio::net::TcpListener;
     use tokio::sync::Mutex;
 
     use ai_memory::federation::FederationConfig;
@@ -309,16 +310,21 @@ mod replay {
         )
     }
 
+    /// #3705 — every `http://` peer is refused by `FederationConfig::build`
+    /// (loopback included), so the mock peer serves TLS with the per-binary
+    /// leaf and `config_for` hands `build` that leaf as `--quorum-ca-cert`;
+    /// the quorum client verifies the peer the way it would verify an
+    /// operator's CA — no verification bypass.
     async fn spawn_mock_peer(state: PeerState) -> String {
         let app = Router::new()
             .route("/api/v1/sync/push", post(push_handler))
             .with_state(state);
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.ok();
-        });
-        format!("http://{addr}")
+        let tls = super::common::tls::shared(&std::env::temp_dir());
+        let (port, handle) = tls.serve_router(app).await;
+        // Keep the server alive for the test binary's lifetime (the handle
+        // shuts the listener down when dropped).
+        std::mem::forget(handle);
+        super::common::tls::TestTls::base_url(port)
     }
 
     fn fresh_db() -> (tempfile::TempDir, ai_memory::handlers::Db) {
@@ -340,13 +346,14 @@ mod replay {
         // positive-control delivery would never land. First-writer-wins.
         let _ = ai_memory::governance::wire_check::GOVERNANCE_PRE_ACTION
             .set(Box::new(|_action| Ok(())));
+        let tls = super::common::tls::shared(&std::env::temp_dir());
         let mut cfg = FederationConfig::build(
             1,
             urls,
             Duration::from_secs(2),
             None,
             None,
-            None,
+            Some(tls.ca_path()),
             "ai:2442-replay".to_string(),
             None,
         )

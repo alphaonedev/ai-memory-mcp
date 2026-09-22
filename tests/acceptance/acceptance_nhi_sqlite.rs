@@ -46,9 +46,14 @@
 //! * [`config1_mcp_stdio_full_profile_smoke`] — a thin `ai-memory mcp --profile
 //!   full` stdio smoke proving JSON-RPC 2.0 framing + the tool surface.
 //!
-//! Runs under `AI_MEMORY_NO_CONFIG=1` — no embedder, no LLM, no network
-//! dependencies. All daemon children are behind RAII kill guards; every wait is
-//! bounded so a hung daemon fails the test rather than hanging CI.
+//! Runs under `AI_MEMORY_NO_CONFIG=1`, which resolves to the Semantic tier
+//! (`config::effective_tier(None)` = `FeatureTier::Semantic`), so each daemon
+//! DOES build the MiniLM embedder — but hermetically: `spawn_daemon` denies the
+//! network (`AI_MEMORY_EMBED_OFFLINE=1`) and forwards the real `HF_HOME` so the
+//! embedder loads from the #2019-staged HuggingFace cache instead of cold-fetching
+//! from the Hub (#3788). No LLM, and no network dependency. All daemon children
+//! are behind RAII kill guards; every wait is bounded so a hung daemon fails the
+//! test rather than hanging CI.
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -100,7 +105,7 @@ struct DaemonChild {
 
 impl DaemonChild {
     fn url(&self, path: &str) -> String {
-        format!("http://127.0.0.1:{}{}", self.port, path)
+        format!("https://127.0.0.1:{}{}", self.port, path)
     }
 
     /// Captured child stderr so far (for panic diagnostics).
@@ -144,6 +149,49 @@ fn http_client() -> reqwest::blocking::Client {
         .expect("build blocking http client")
 }
 
+/// #3776 / #3709 — a blocking client that trusts the daemon's ZERO-CONFIG local
+/// CA (`<key_dir>/tls/local-ca.pem`, written on first boot; the CA-issued leaf's
+/// SANs cover `127.0.0.1`) for FULL verification — NOT `danger_accept_invalid_certs`.
+/// `key_dir` is the process-wide `AI_MEMORY_KEY_DIR` sandbox every daemon shares,
+/// so one CA validates every daemon this suite spawns. Returns `None` until the
+/// daemon has written the CA (early boot, before it binds), so the readiness loop
+/// can call it every tick and start probing the moment TLS material exists.
+fn local_ca_client(
+    key_dir: &std::path::Path,
+    timeout: Duration,
+) -> Option<reqwest::blocking::Client> {
+    let ca_path = key_dir
+        .join(ai_memory::tls_bootstrap::TLS_SUBDIR)
+        .join(ai_memory::tls_bootstrap::LOCAL_CA_CERT_FILE);
+    let pem = std::fs::read(&ca_path).ok()?;
+    let ca = reqwest::Certificate::from_pem(&pem).ok()?;
+    Some(
+        reqwest::blocking::Client::builder()
+            .use_rustls_tls()
+            .add_root_certificate(ca)
+            .timeout(timeout)
+            .build()
+            .expect("build verify-full client trusting the #3709 local CA"),
+    )
+}
+
+/// #3788 — the real HuggingFace cache to forward as `HF_HOME` to the daemon
+/// child so the OFFLINE embedder resolves the #2019-staged model despite the
+/// per-test HOME override. hf-hub reads `HF_HOME` (else `$HOME/.cache/huggingface`);
+/// coverage.yml stages under `~/.cache/huggingface` and sets no `HF_HOME`, so
+/// derive it from the test process's real `$HOME` (unchanged by the child override).
+fn real_hf_home() -> Option<String> {
+    if let Ok(hf) = std::env::var("HF_HOME")
+        && !hf.trim().is_empty()
+    {
+        return Some(hf);
+    }
+    std::env::var("HOME")
+        .ok()
+        .filter(|h| !h.trim().is_empty())
+        .map(|h| format!("{h}/.cache/huggingface"))
+}
+
 /// Spawn `ai-memory --db <db> serve --host 127.0.0.1 --port <p>` with
 /// `extra_envs` layered on the hermetic base env, and wait (bounded) for
 /// `/api/v1/health` to return 2xx. Retries only on a `free_port()` bind race;
@@ -153,17 +201,41 @@ fn http_client() -> reqwest::blocking::Client {
 /// — it `env_remove`s it so the compiled default posture is in force
 /// (HTTP-direct fails CLOSED), which is exactly the shipped default this
 /// acceptance harness must exercise.
+/// #3817 — a PER-CELL key dir under the cell's own db tempdir. Every
+/// daemon-spawning cell used to share `key_dir_sandbox::pin()` (one
+/// process-wide sandbox), so under `cargo test` parallelism two first-boot
+/// daemons raced the #3705/#3709 auto-TLS mint/renew in ONE `<key_dir>/tls`:
+/// a concurrent `server.key` replace ENOENTs a peer -> #3705 fail-closed ->
+/// exit 75; or a CA regenerated under a live daemon leaves the verify-full
+/// probe trusting a CA that no longer matches the served leaf -> 60s timeout.
+/// Deriving from `db.parent()` isolates each cell while keeping the SAME dir
+/// across a same-db restart, so the #3776 durability cell still adopts one
+/// identity + one local CA.
+fn acc_key_dir(db: &std::path::Path) -> std::path::PathBuf {
+    db.parent().expect("fixture database parent").join("keys")
+}
+
 fn spawn_daemon(db: &std::path::Path, extra_envs: &[(&str, &str)]) -> DaemonChild {
+    // #3817 — arm the #3516 key-dir guard for children (idempotent, process-wide),
+    // then hand this daemon its OWN 0700 key dir instead of the shared sandbox.
+    let _ = key_dir_sandbox::pin();
+    let key_dir = acc_key_dir(db);
+    key_dir_sandbox::mkdir_0700(&key_dir);
+    // #3817 — HOME is a per-cell SUBDIR (sibling of the key dir), never the db
+    // tempdir itself, so `key_dir` (db.parent()/keys) does NOT resolve under HOME
+    // and the #3355 `assert_isolated` guard admits this isolated key dir.
+    let home_dir = db.parent().expect("fixture database parent").join("home");
+    std::fs::create_dir_all(&home_dir).expect("#3817 mkdir per-cell home");
     let mut last_stderr = String::new();
     for attempt in 1..=BIND_RETRY_ATTEMPTS {
         let port = free_port();
         let port_s = port.to_string();
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_ai-memory"));
         cmd.env("AI_MEMORY_NO_CONFIG", "1")
-            .env("HOME", db.parent().expect("fixture database parent"))
+            .env("HOME", &home_dir)
             // #3198 — sandboxed 0700 keystore so the daemon never touches the
             // host operator keys and never fails closed on a 0775 host dir.
-            .env("AI_MEMORY_KEY_DIR", key_dir_sandbox::pin())
+            .env("AI_MEMORY_KEY_DIR", &key_dir)
             // Use the COMPILED default attestation posture (HTTP-direct
             // required / fail-closed). Clear any inherited opt-out.
             .env_remove("AI_MEMORY_REQUIRE_AGENT_ATTESTATION")
@@ -180,7 +252,18 @@ fn spawn_daemon(db: &std::path::Path, extra_envs: &[(&str, &str)]) -> DaemonChil
             // security-critical WRITE attestation is UNAFFECTED — every store is
             // still a real Ed25519 signature verified against the bound key.
             .env("AI_MEMORY_ADMIN_HEADER_TRUST", "1")
+            // #3788 — AI_MEMORY_NO_CONFIG=1 resolves to the Semantic tier, so the
+            // daemon DOES build the embedder. Deny the network so a boot never
+            // cold-fetches ~90 MB from the Hub (the #2019 hermetic-coverage
+            // guarantee); the model comes from the staged cache forwarded below.
+            .env("AI_MEMORY_EMBED_OFFLINE", "1")
             .env_remove("AI_MEMORY_DB");
+        // #3788 — the HOME override above hides the real HF cache the offline
+        // loader reads; forward it (hf-hub honours HF_HOME). Set BEFORE extra_envs
+        // so a cell can override it (the absence control points it at an empty dir).
+        if let Some(hf_home) = real_hf_home() {
+            cmd.env("HF_HOME", hf_home);
+        }
         for (k, v) in extra_envs {
             cmd.env(k, v);
         }
@@ -214,11 +297,16 @@ fn spawn_daemon(db: &std::path::Path, extra_envs: &[(&str, &str)]) -> DaemonChil
             })
         });
 
-        let probe = reqwest::blocking::Client::builder()
-            .timeout(READINESS_PROBE_TIMEOUT)
-            .build()
-            .expect("build readiness probe client");
-        let health_url = format!("http://127.0.0.1:{port}/api/v1/health");
+        // #3776 — the #3709 first-boot daemon serves HTTPS from a local CA it
+        // writes early in boot; probe the scheme it ANNOUNCES, trusting that CA
+        // (verify-full), never plaintext. `probe` is built lazily the moment the
+        // CA file appears (before the daemon binds), so the loop covers the
+        // CA-write -> bind window; a plain-http probe here would never see this
+        // daemon ready (that refusal is pinned by
+        // `first_boot_daemon_refuses_plain_http_3776`).
+        let health_url = format!("https://127.0.0.1:{port}/api/v1/health");
+        let mut probe: Option<reqwest::blocking::Client> = None;
+        let mut last_probe_err = String::from("(no probe attempt yet)");
         let deadline = Instant::now() + SPAWN_TIMEOUT;
         loop {
             if Instant::now() >= deadline {
@@ -228,19 +316,41 @@ fn spawn_daemon(db: &std::path::Path, extra_envs: &[(&str, &str)]) -> DaemonChil
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .clone();
+                let ca_path = key_dir
+                    .join(ai_memory::tls_bootstrap::TLS_SUBDIR)
+                    .join(ai_memory::tls_bootstrap::LOCAL_CA_CERT_FILE);
                 panic!(
-                    "daemon never became ready within {SPAWN_TIMEOUT:?}\n--- stderr ---\n{stderr}"
+                    "daemon never became ready within {SPAWN_TIMEOUT:?}\n\
+                     [F2H-INSTRUMENT] probe_built={} ca_path={} ca_exists={}\n\
+                     [F2H-INSTRUMENT] last_probe_err={last_probe_err}\n--- stderr ---\n{stderr}",
+                    probe.is_some(),
+                    ca_path.display(),
+                    ca_path.exists()
                 );
             }
-            if let Ok(resp) = probe.get(&health_url).send()
-                && resp.status().is_success()
-            {
-                return DaemonChild {
-                    child: Some(child),
-                    port,
-                    stderr: stderr_buf,
-                    stderr_handle,
-                };
+            if probe.is_none() {
+                probe = local_ca_client(&key_dir, READINESS_PROBE_TIMEOUT);
+            }
+            if let Some(p) = probe.as_ref() {
+                match p.get(&health_url).send() {
+                    Ok(resp) if resp.status().is_success() => {
+                        return DaemonChild {
+                            child: Some(child),
+                            port,
+                            stderr: stderr_buf,
+                            stderr_handle,
+                        };
+                    }
+                    Ok(resp) => {
+                        last_probe_err = format!("GET {health_url} -> HTTP {}", resp.status());
+                    }
+                    Err(e) => {
+                        last_probe_err = format!("GET {health_url} -> ERR {e}");
+                    }
+                }
+            } else {
+                last_probe_err =
+                    String::from("local_ca_client returned None (CA not readable yet)");
             }
             if let Ok(Some(status)) = child.try_wait() {
                 if let Some(h) = stderr_handle {
@@ -460,7 +570,8 @@ fn config1_full_surface_attested_nhi_e2e() {
     let tmp = TempDir::new().expect("tempdir");
     let db = tmp.path().join("acc-nhi.db");
     let daemon = spawn_daemon(&db, &[("AI_MEMORY_ADMIN_AGENT_IDS", NHI_AGENT)]);
-    let client = http_client();
+    let client = local_ca_client(&acc_key_dir(&db), REQUEST_TIMEOUT)
+        .expect("#3709 zero-config local CA present after the daemon became ready");
     let kp = ai_memory::identity::keypair::generate(NHI_AGENT).expect("nhi keypair");
     let ns = "acc-nhi";
 
@@ -824,11 +935,15 @@ fn config1_durability_across_daemon_restart() {
     let ns = "acc-restart";
     let content = "durable truth survives a daemon restart — TEXT is the source of truth";
     let kp = ai_memory::identity::keypair::generate(NHI_AGENT).expect("nhi keypair");
-    let client = http_client();
 
     // Boot #1: enroll + attested store, confirm readable.
     let id = {
         let daemon = spawn_daemon(&db, &[("AI_MEMORY_ADMIN_AGENT_IDS", NHI_AGENT)]);
+        // #3776 — build the verify-full client AFTER the daemon wrote its #3709
+        // local CA (spawn_daemon returns only once its CA-trusting readiness
+        // probe passed, so the CA is on disk here).
+        let client = local_ca_client(&acc_key_dir(&db), REQUEST_TIMEOUT)
+            .expect("#3709 local CA present after the daemon became ready");
         register_and_enroll(&client, &daemon, &kp);
         let id = store_signed(
             &client,
@@ -850,6 +965,11 @@ fn config1_durability_across_daemon_restart() {
     // Boot #2: same on-disk DB, brand-new process → the row is still there,
     // byte-for-byte, and still attributable to the same NHI principal.
     let daemon2 = spawn_daemon(&db, &[("AI_MEMORY_ADMIN_AGENT_IDS", NHI_AGENT)]);
+    // #3776/#3817 — same-CA verify-full client for the restarted daemon: the
+    // restart reuses this cell's OWN key dir (acc_key_dir(&db)), so daemon2 adopts
+    // the identity + #3709 local CA daemon wrote there.
+    let client = local_ca_client(&acc_key_dir(&db), REQUEST_TIMEOUT)
+        .expect("#3709 local CA present after the daemon became ready");
     let got = get_memory(&client, &daemon2, &id)
         .expect("durable memory must survive a daemon restart on the same DB");
     assert_eq!(
@@ -872,7 +992,6 @@ fn config1_encryption_at_rest_http_roundtrip() {
     let db = tmp.path().join("acc-encrypted.db");
     let ns = "acc-crypt";
     let secret = "at-rest secret content that must NOT be plaintext on disk";
-    let client = http_client();
 
     let id = {
         // Permissive attestation for THIS test only: the at-rest envelope
@@ -890,6 +1009,10 @@ fn config1_encryption_at_rest_http_roundtrip() {
                 ("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "0"),
             ],
         );
+        // #3776 — build the verify-full client AFTER the daemon wrote its #3709
+        // local CA.
+        let client = local_ca_client(&acc_key_dir(&db), REQUEST_TIMEOUT)
+            .expect("#3709 local CA present after the daemon became ready");
         let resp = client
             .post(daemon.url("/api/v1/memories"))
             .header("X-Agent-Id", NHI_AGENT)
@@ -1236,5 +1359,100 @@ fn config1_mcp_stdio_full_profile_smoke() {
     assert!(
         recall_text.contains("mcpacctoken") || recall_text.contains("mcp-acc"),
         "recall must return the stored memory: {recall_text}"
+    );
+}
+
+/// #3776 — ABSENCE PIN. The #3709 first-boot daemon auto-generates a local CA
+/// and is HTTPS-ONLY (it refuses to serve plaintext, loopback included). A
+/// PLAIN-HTTP GET to its port must therefore NOT succeed — this is what makes
+/// the harness's https+verify-full readiness probe load-bearing rather than
+/// incidental: the pre-#3776 plain-http probe could never observe this daemon
+/// as ready, which was the whole `config1_*` "never became ready" failure.
+#[test]
+fn first_boot_daemon_refuses_plain_http_3776() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = tmp.path().join("acc-http-refused.db");
+    // spawn_daemon's own probe already proved the daemon is up over HTTPS.
+    let daemon = spawn_daemon(&db, &[]);
+    let plain = http_client();
+    let http_url = format!("http://127.0.0.1:{}/api/v1/health", daemon.port);
+    match plain.get(&http_url).send() {
+        // A TLS listener handed a plaintext HTTP request resets / fails the
+        // handshake; reqwest surfaces a transport error. That IS the refusal.
+        Err(_) => {}
+        // If any bytes come back, they must never be a healthy 2xx.
+        Ok(resp) => assert!(
+            !resp.status().is_success(),
+            "#3776: a plain-http GET against the first-boot HTTPS daemon must not \
+             return success, got {}",
+            resp.status()
+        ),
+    }
+}
+
+/// #3788 — daemon-sink ABSENCE control: with the network denied
+/// (`AI_MEMORY_EMBED_OFFLINE=1`, as spawn_daemon sets) and HF_HOME pointed at an
+/// EMPTY cache, `serve` reports the embedder fallback miss on stderr and degrades
+/// to keyword — it does NOT cold-fetch. The allowed-path counterpart is the
+/// config1_* cells, which load the embedder from the #2019 staged cache in the
+/// coverage job (they need the #3776 https-readiness fix, chain 9d, to reach the
+/// probe — this control spawns `serve` directly and reads the boot stderr, which
+/// precedes binding, so it is independent of the readiness probe).
+#[test]
+fn embedder_offline_empty_cache_reports_fallback_miss_not_coldfetch_3788() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = tmp.path().join("acc-nocache.db");
+    let home = tmp.path().join("home");
+    let empty_hf = tmp.path().join("empty-hf");
+    std::fs::create_dir_all(&home).expect("home");
+    std::fs::create_dir_all(&empty_hf).expect("empty hf");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ai-memory"))
+        .env("AI_MEMORY_NO_CONFIG", "1")
+        .env("HOME", &home)
+        .env("AI_MEMORY_KEY_DIR", key_dir_sandbox::pin())
+        .env("AI_MEMORY_EMBED_OFFLINE", "1")
+        .env("HF_HOME", &empty_hf)
+        .args([
+            "--db",
+            db.to_str().expect("utf8"),
+            "serve",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            &free_port().to_string(),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn serve");
+    // Read boot stderr until the embedder verdict or a bounded deadline; the
+    // embedder loads (or misses) BEFORE the listener binds, so this never depends
+    // on the (#3776-gated) readiness probe.
+    let stderr = child.stderr.take().expect("stderr");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut seen = String::new();
+    let mut verdict = None;
+    for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+        seen.push_str(&line);
+        seen.push('\n');
+        if line.contains("EMBEDDER LOAD FAILED")
+            || line.contains("model files not found")
+            || line.contains("semantic recall enabled")
+            || line.contains("listening on")
+        {
+            verdict = Some(line);
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    let verdict =
+        verdict.unwrap_or_else(|| panic!("no embedder verdict on stderr within 30s:\n{seen}"));
+    assert!(
+        verdict.contains("EMBEDDER LOAD FAILED") || verdict.contains("model files not found"),
+        "#3788: offline + empty HF_HOME must report the fallback miss (never cold-fetch), got: {verdict}\n{seen}"
     );
 }

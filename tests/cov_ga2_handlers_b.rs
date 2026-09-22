@@ -158,6 +158,7 @@ fn sqlite_router() -> (axum::Router, tempfile::NamedTempFile) {
             ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty(),
         ),
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
+        ..Default::default()
     };
     (ai_memory::build_router(api_key_state, app_state), db_tmp)
 }
@@ -190,6 +191,7 @@ fn fake_pg_router() -> (axum::Router, std::path::PathBuf) {
             ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty(),
         ),
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
+        ..Default::default()
     };
     (
         ai_memory::build_router(api_key_state, app_state),
@@ -390,7 +392,8 @@ async fn inbox_populated_via_notify_round_trips() {
         "sender should carry alice; got {from}"
     );
     assert_eq!(body["messages"][0]["title"], json!("hello-bob"));
-    assert_eq!(body["messages"][0]["read"], json!(false));
+    // #3730 — no `read` field on the inbox wire shape.
+    assert!(body["messages"][0].get("read").is_none());
 }
 
 #[tokio::test]
@@ -450,6 +453,7 @@ async fn live_notify_inbox_wire_contract_3401() {
             ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty(),
         ),
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
+        ..Default::default()
     };
     let postgres_path = ai_memory::build_router(keys, state);
     assert_inbox_contract_3401(&sqlite, &postgres_path).await;
@@ -548,7 +552,6 @@ async fn assert_inbox_contract_3401(sqlite: &axum::Router, postgres_path: &axum:
         "priority",
         "tier",
         "namespace",
-        "read",
         "access_count",
         "target_agent_id",
     ] {
@@ -722,13 +725,30 @@ async fn namespace_standard_postgres_set_get_clear_and_merge() {
     assert_eq!(status, StatusCode::CREATED, "pg merge set body={body}");
 
     // GET (qs form) on the postgres branch, non-inherit.
+    //
+    // #3861 / #3400 — the non-inherit GET envelope is the sqlite CANONICAL
+    // shape on both backends (`handle_namespace_get_standard`, pinned
+    // structurally equal across backends by
+    // `namespace_standard_wire_shape_matches_across_backends_3400`), so it
+    // carries NEITHER a `storage_backend` marker NOR `resolved_namespace`.
+    // This pin predated #3400 and asserted the pre-normalisation postgres
+    // shape; it now pins the ruled contract instead of the opposite one.
     let (status, body) = get(&r, &format!("/api/v1/namespaces?namespace={ns}")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
-        body[ai_memory::models::field_names::STORAGE_BACKEND],
-        json!("postgres")
+        body[ai_memory::models::field_names::STANDARD_ID],
+        json!(standard_id)
     );
-    assert_eq!(body["resolved_namespace"], json!(ns));
+    assert!(
+        body["governance"].is_object(),
+        "canonical GET carries governance: {body}"
+    );
+    assert_eq!(
+        body[ai_memory::models::field_names::STORAGE_BACKEND],
+        Value::Null,
+        "non-inherit GET is the canonical sqlite shape (#3400): no backend marker"
+    );
+    assert_eq!(body["resolved_namespace"], Value::Null);
 
     // GET with inherit=true exercises the chain-walk arm.
     let (status, body) = get(
@@ -775,13 +795,12 @@ async fn namespace_standard_postgres_get_unset_returns_null_envelope() {
     // null-standard_id 200 envelope on the postgres branch.
     let (status, body) = get(&r, "/api/v1/namespaces?namespace=ga2-pg-unset").await;
     assert_eq!(status, StatusCode::OK);
+    // #3861 / #3400 — canonical unset envelope `{namespace, standard_id: null}`
+    // on both backends; no backend marker (see the note in
+    // `namespace_standard_postgres_set_get_clear_and_merge`).
     assert_eq!(
-        body[ai_memory::models::field_names::STORAGE_BACKEND],
-        json!("postgres")
-    );
-    assert_eq!(
-        body[ai_memory::models::field_names::STANDARD_ID],
-        Value::Null
+        body,
+        json!({"namespace": "ga2-pg-unset", (ai_memory::models::field_names::STANDARD_ID): Value::Null})
     );
 }
 
@@ -1209,6 +1228,7 @@ async fn approval_decide_live_postgres_missing_id_is_404() {
             ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty(),
         ),
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
+        ..Default::default()
     };
     let r = ai_memory::build_router(api_key_state, app_state);
 

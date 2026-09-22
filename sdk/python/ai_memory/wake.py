@@ -81,7 +81,7 @@ Example
 ...     "/home/alice/.config/ai-memory/keys/ai:alice.a2a-hub.json",
 ...     hub_id="ai-memory-wake-hub",
 ... )
->>> client = AiMemoryClient(base_url="http://localhost:9077")  # doctest: +SKIP
+>>> client = AiMemoryClient(base_url="https://localhost:9077")  # doctest: +SKIP
 >>> def catch_up(signal):  # doctest: +SKIP
 ...     print(signal.reason, client.inbox(agent_id=bundle.agent_id, unread_only=True))
 >>> WakeListener("/run/user/1000/ai-memory/wake-hub.sock", bundle, catch_up).run()  # doctest: +SKIP
@@ -104,6 +104,8 @@ from pathlib import Path
 from typing import Any, Callable, Protocol
 
 import json
+
+from ._ownedfile import check_owned_stat, read_owner_only_text
 
 __all__ = [
     "BACKSTOP_POLL_MAX",
@@ -458,6 +460,31 @@ class _Certificate:
         )
 
 
+def _check_bundle_stat(p: Path, st: os.stat_result) -> None:
+    """Apply the bundle's on-disk standard to an ALREADY-OBTAINED stat.
+
+    Thin alias for :func:`ai_memory._ownedfile.check_owned_stat` with the
+    bundle's wording. The body moved to ``_ownedfile`` in #3784 so the
+    attestation key loader applies the IDENTICAL standard; the words, the
+    order of the three refusals and the exception type are unchanged.
+    """
+    check_owned_stat(p, st, error=WakeError)
+
+
+def _read_owner_only(p: Path) -> str:
+    """Read a credential no other local user could read or replace, through
+    ONE descriptor (#3780).
+
+    The descriptor-bound discipline — open ONCE with
+    ``O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC``, ``fstat`` THAT descriptor, refuse
+    non-regular / ``mode & 0o077`` / other-owner, read from the same
+    descriptor, with the documented Windows path-based fallback — lives in
+    :mod:`ai_memory._ownedfile` since #3784, shared verbatim with the
+    attestation private-key loader. Behaviour and wording here are unchanged.
+    """
+    return read_owner_only_text(p, error=WakeError)
+
+
 class DelegationBundle:
     """The scoped ``a2a-hub/join/v1`` credential, loaded from the key dir.
 
@@ -503,25 +530,15 @@ class DelegationBundle:
         hub_id: str = DEFAULT_HUB_ID,
         now: float | None = None,
     ) -> "DelegationBundle":
-        """Load and check a bundle. Every failure is a refusal."""
+        """Load and check a bundle. Every failure is a refusal.
+
+        The checks are proven against ONE descriptor and the bytes are read
+        from that SAME descriptor (:func:`_read_owner_only`). There is
+        deliberately no second resolution of ``path`` between check and read.
+        """
         p = Path(path)
-        st = p.lstat()
-        if stat.S_ISLNK(st.st_mode):
-            raise WakeError(
-                f"{p} is a symlink: a credential reached through a link is one whose "
-                "permissions were checked on the wrong file"
-            )
-        if not stat.S_ISREG(st.st_mode):
-            raise WakeError(f"{p} is not a regular file")
-        if st.st_mode & 0o077:
-            raise WakeError(
-                f"{p} is mode {st.st_mode & 0o7777:04o}; a bundle holding a private key "
-                "must be 0600, or another local user can join the hub as this agent"
-            )
-        if st.st_uid != os.geteuid():
-            raise WakeError(f"{p} is owned by uid {st.st_uid}, not by the caller")
         return cls.from_mapping(
-            json.loads(p.read_text(encoding="utf-8")),
+            json.loads(_read_owner_only(p)),
             hub_id=hub_id,
             source=str(p),
             now=now,

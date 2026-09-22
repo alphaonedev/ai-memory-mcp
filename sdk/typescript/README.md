@@ -30,13 +30,76 @@ yarn add @alphaone/ai-memory
 > This SDK is not yet published to npm. During the alpha, consume it via
 > the workspace directly or a tarball (`npm pack`). See the root ROADMAP.
 
+## Trust the daemon's CA
+
+Every daemon listener serves **TLS** — since #3705/#3709 `tls_bind_guard`
+refuses to bind a plaintext listener, loopback included, so there is no
+`http://` endpoint to talk to. Base URLs are `https://` even for
+`localhost`.
+
+On first boot a zero-config daemon generates its own local CA and issues
+itself a server certificate from it. No public root signs that certificate,
+so a client must be handed the CA explicitly:
+
+| What | Where |
+|---|---|
+| CA certificate | `<key_dir>/tls/local-ca.pem` |
+| `<key_dir>` (Linux) | `$AI_MEMORY_KEY_DIR`, else `~/.config/ai-memory/keys` |
+| `<key_dir>` (macOS) | `$AI_MEMORY_KEY_DIR`, else `~/Library/Application Support/ai-memory/keys` |
+
+So on Linux, with no `AI_MEMORY_KEY_DIR` override, the file is
+`~/.config/ai-memory/keys/tls/local-ca.pem`.
+
+Pin it with the client's `caCert` option, which takes the PEM **contents**
+(the SDK never reads the filesystem, so the browser build stays
+dependency-free):
+
+```ts
+import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
+
+import { AiMemoryClient } from "@alphaone/ai-memory";
+
+const keyDir =
+  process.env.AI_MEMORY_KEY_DIR ?? join(homedir(), ".config", "ai-memory", "keys");
+
+const memory = new AiMemoryClient({
+  baseUrl: "https://localhost:9077",
+  caCert: readFileSync(join(keyDir, "tls", "local-ca.pem"), "utf8"),
+});
+```
+
+`caCert` reaches Node's TLS `ca` option, which **replaces** the bundled public
+roots rather than adding to them (Node's documented behaviour). A client that
+also calls out to the internet should pass
+`[...require("node:tls").rootCertificates, pem]`. Verification stays full
+either way — chain + hostname, and the daemon's leaf carries `localhost`,
+`127.0.0.1`, `::1` and the machine hostname as SANs. There is deliberately no
+"accept any certificate" option. Two ways to avoid passing `caCert` per
+client:
+
+- install `local-ca.pem` into the OS trust store (`update-ca-certificates`,
+  `security add-trusted-cert`), or point `NODE_EXTRA_CA_CERTS` at it;
+- run the daemon with an operator-supplied `--tls-cert`/`--tls-key` pair from
+  a CA your hosts already trust, in which case no pinning is needed at all.
+
+If the CA file is absent, the daemon has not booted yet — it is written
+before the listener binds.
+
 ## Quickstart
 
 ```ts
+import { readFileSync } from "node:fs";
+
 import { AiMemoryClient, AgentSigningKey } from "@alphaone/ai-memory";
 
+// ~/.config/ai-memory/keys/tls/local-ca.pem on Linux — see below.
+const caPath = `${process.env.HOME}/.config/ai-memory/keys/tls/local-ca.pem`;
+
 const memory = new AiMemoryClient({
-  baseUrl: "http://localhost:9077",
+  baseUrl: "https://localhost:9077",         // https: the daemon serves no plaintext
+  caCert: readFileSync(caPath, "utf8"),      // see "Trust the daemon's CA" above
   apiKey: process.env.AI_MEMORY_API_KEY,     // optional
   agentId: "ai:claude-opus-4.7@laptop:pid-1234", // optional default header
 });
@@ -336,9 +399,11 @@ const memory = new AiMemoryClient({
 
 ### mTLS
 
-ai-memory itself is HTTP-only by design. Terminate TLS and client-certificate
-auth at a reverse proxy (nginx, Caddy, Envoy) in front of the daemon, then
-forward the verified identity via a header to the backend.
+Client-certificate auth is terminated at a reverse proxy (nginx, Caddy, Envoy)
+in front of the daemon, which forwards the verified identity via a header. The
+**backend hop is HTTPS too** — since #3705/#3709 the daemon has no plaintext
+listener to proxy to, so the proxy must trust the daemon's CA on that hop
+exactly as a direct client does.
 
 Example nginx snippet:
 
@@ -352,7 +417,13 @@ server {
 
   location / {
     proxy_set_header X-Agent-Id $ssl_client_s_dn_cn;
-    proxy_pass http://127.0.0.1:9077;
+    proxy_pass https://127.0.0.1:9077;
+    # The daemon serves its own CA-issued certificate; verify it (never
+    # `proxy_ssl_verify off`).
+    proxy_ssl_trusted_certificate /home/<daemon-user>/.config/ai-memory/keys/tls/local-ca.pem;
+    proxy_ssl_verify       on;
+    proxy_ssl_verify_depth 2;
+    proxy_ssl_name         127.0.0.1;
   }
 }
 ```
@@ -372,7 +443,8 @@ const bundle = DelegationBundle.load(
   "/home/alice/.config/ai-memory/keys/ai:alice.a2a-hub.json",
   { hubId: "ai-memory-wake-hub" },
 );
-const client = new AiMemoryClient({ baseUrl: "http://localhost:9077" });
+// `caCert` omitted for brevity — see "Trust the daemon's CA".
+const client = new AiMemoryClient({ baseUrl: "https://localhost:9077", caCert });
 
 const listener = new WakeListener(
   "/run/user/1000/ai-memory/wake-hub.sock",
@@ -477,7 +549,8 @@ CI hook:
 
 ```ts
 import { AiMemoryClient } from "@alphaone/ai-memory";
-const mem = new AiMemoryClient({ baseUrl: "http://localhost:9077" });
+// `caCert` is the daemon CA PEM — see "Trust the daemon's CA".
+const mem = new AiMemoryClient({ baseUrl: "https://localhost:9077", caCert });
 await mem.storeBulk(newFacts.map(f => ({ title: f.title, content: f.body, tier: "long" })));
 ```
 

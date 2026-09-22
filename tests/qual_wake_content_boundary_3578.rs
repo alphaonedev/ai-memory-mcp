@@ -204,9 +204,12 @@ fn admitted_read_render_and_audited_operator_edges_are_pinned() {
     );
     let emit = function(&src, "emit");
     assert!(contains(&emit, "if let Some(cmd) = args.exec.as_deref()"));
+    // #3642 — emit CATCHES run_exec_hook's spawn error and continues (the `?`
+    // that terminated the listener is gone). Pin the catch shape so a revert to
+    // `?`-propagation is caught here.
     assert!(contains(
         &emit,
-        "run_exec_hook(cmd, resolved, signal, count).await?"
+        "if let Err(e) = run_exec_hook(cmd, resolved, signal, count).await"
     ));
     let hook = function(&src, "run_exec_hook");
     assert!(contains(
@@ -301,8 +304,8 @@ fn mutations_at_producer_decoder_consumer_and_audit_boundaries_are_refused() {
         ),
         (
             "src/wake_client/mod.rs",
-            "match session.next_event().await?",
-            "notify(signal); match session.next_event().await?",
+            "match session.next_event(metrics).await?",
+            "notify(signal); match session.next_event(metrics).await?",
         ),
         (
             "src/cli/wake_listen.rs",

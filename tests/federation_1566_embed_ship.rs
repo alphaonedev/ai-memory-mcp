@@ -123,6 +123,7 @@ fn build_receiver(embedder: Option<Embedder>) -> Receiver {
             ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty(),
         ),
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
+        ..Default::default()
     };
     let app_state = AppState {
         db: db.clone(),

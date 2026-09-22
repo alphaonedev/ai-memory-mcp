@@ -92,7 +92,7 @@ pub fn handle_offload(
     let off = ContextOffloader::new(conn, None, OffloadConfig::default());
     let result = off
         .offload(content, &namespace, ttl_seconds, agent_id)
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("offload", e))?;
     Ok(json!({
         "ref_id": result.ref_id,
         (crate::models::field_names::CONTENT_SHA256): result.content_sha256,
@@ -121,7 +121,7 @@ pub fn handle_deref(
     let off = ContextOffloader::new(conn, None, OffloadConfig::default());
     let result = off
         .deref(ref_id, Some(agent_id))
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("deref", e))?;
     Ok(json!({
         "ref_id": ref_id,
         "content": result.content,
@@ -273,6 +273,43 @@ mod tests {
         let conn = fresh_conn();
         let err = handle_deref(&conn, &json!({}), "ai:alice").unwrap_err();
         assert!(err.contains("ref_id"));
+    }
+
+    #[test]
+    fn handle_deref_refuses_expired_blob_3392() {
+        // #3392 (RETENTION) — TTL must be enforced on READ, not only by the
+        // write-side reaper. An already-expired blob (stored_at far in the past +
+        // a tiny ttl) must be REFUSED to a caller (leak-resistant NotFound), never
+        // served verbatim. The ttl gate fires right after the row read, before
+        // decompression, so a placeholder content_zstd is fine — we assert the
+        // refusal, which precedes it.
+        let conn = fresh_conn();
+        conn.execute(
+            "INSERT INTO offloaded_blobs
+                (ref_id, namespace, content_zstd, content_sha256,
+                 stored_at, ttl_seconds, agent_id, signature_b64)
+             VALUES ('expired-ref', 'mcp/test', X'00', 'deadbeef', 1000, 60, 'ai:alice', '')",
+            [],
+        )
+        .expect("seed expired blob");
+        let err = handle_deref(&conn, &json!({"ref_id": "expired-ref"}), "ai:alice")
+            .expect_err("#3392: an expired blob must be refused on deref");
+        assert!(
+            err.contains("not found"),
+            "#3392: expired deref must be leak-resistant NotFound, got: {err}"
+        );
+        // CONTROL — a freshly offloaded (non-expired) blob is still served, so the
+        // ttl gate does not over-refuse. Use the real write path (valid zstd + sha).
+        let off = handle_offload(
+            &conn,
+            &json!({"content": "live", "namespace": "mcp/test", "ttl_seconds": 3600}),
+            "ai:alice",
+        )
+        .expect("offload live blob");
+        let live_ref = off["ref_id"].as_str().expect("ref_id").to_string();
+        let ok = handle_deref(&conn, &json!({"ref_id": live_ref}), "ai:alice")
+            .expect("#3392: a non-expired blob is still served");
+        assert_eq!(ok["content"].as_str(), Some("live"));
     }
 
     #[test]

@@ -7,7 +7,7 @@ The suite is split in two:
 * **Offline tests** (always run) — exercise the pure-Python parts: model
   serialization, webhook HMAC, error mapping.
 * **Daemon tests** (opt-in) — run only when ``AI_MEMORY_TEST_DAEMON=1`` is
-  set and a daemon is reachable at ``http://localhost:9077``. Every daemon
+  set and a daemon is reachable at ``https://localhost:9077``. Every daemon
   test writes and deletes its own namespace to avoid polluting shared state.
 """
 
@@ -31,7 +31,7 @@ from ai_memory import (
 from ai_memory.errors import raise_for_status
 from ai_memory.models import Memory
 
-TEST_BASE_URL = os.environ.get("AI_MEMORY_TEST_BASE_URL", "http://localhost:9077")
+TEST_BASE_URL = os.environ.get("AI_MEMORY_TEST_BASE_URL", "https://localhost:9077")
 DAEMON_ENABLED = os.environ.get("AI_MEMORY_TEST_DAEMON") == "1"
 
 
@@ -229,6 +229,61 @@ def test_unsubscribe_targets_collection_path_with_id_query() -> None:
     assert request.url.params.get("id") == "sub-abc-123"
     # Guard the exact regression: no `/api/v1/subscriptions/<id>` form.
     assert "/api/v1/subscriptions/" not in str(request.url)
+
+
+# ---------------------------------------------------------------------------
+# v1.0.0 #3288 — the bounded admin export. ``export_pages`` walks
+# ``GET /api/v1/export?limit=&cursor=`` following ``next_cursor``; when the
+# daemon's page ceiling is below the default page size it names the ceiling
+# in a typed 400 and the helper pages at that instead. Offline.
+# ---------------------------------------------------------------------------
+
+
+def test_export_pages_follows_next_cursor_and_adapts_to_the_ceiling() -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        params = request.url.params
+        limit = int(params["limit"])
+        if limit > 2:
+            return httpx.Response(
+                400,
+                json={"error": "too big", "code": "EXPORT_LIMIT_OUT_OF_RANGE", "max": 2},
+            )
+        cursor = params.get("cursor")
+        if cursor is None:
+            return httpx.Response(
+                200, json={"memories": [{"id": "a"}, {"id": "b"}], "next_cursor": "c1"}
+            )
+        assert cursor == "c1"
+        return httpx.Response(200, json={"memories": [{"id": "c"}], "next_cursor": None})
+
+    client = AiMemoryClient(base_url=TEST_BASE_URL)
+    client._client = httpx.Client(  # noqa: SLF001 - offline paging probe
+        base_url=TEST_BASE_URL, transport=httpx.MockTransport(handler)
+    )
+
+    pages = list(client.export_pages())
+
+    assert [m["id"] for p in pages for m in p["memories"]] == ["a", "b", "c"]
+    assert [r.url.params.get("limit") for r in seen] == ["1000", "2", "2"]
+    assert all(r.url.path == "/api/v1/export" for r in seen)
+
+
+def test_export_pages_does_not_mask_a_refusal_for_an_explicit_limit() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            400, json={"error": "too big", "code": "EXPORT_LIMIT_OUT_OF_RANGE", "max": 2}
+        )
+
+    client = AiMemoryClient(base_url=TEST_BASE_URL)
+    client._client = httpx.Client(  # noqa: SLF001 - offline paging probe
+        base_url=TEST_BASE_URL, transport=httpx.MockTransport(handler)
+    )
+
+    with pytest.raises(AiMemoryError):
+        list(client.export_pages(limit=50))
 
 
 class _FakeSigningKey:

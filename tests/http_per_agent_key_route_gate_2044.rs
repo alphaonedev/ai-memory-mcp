@@ -104,6 +104,7 @@ fn build_enforce_router() -> (axum::Router, AppState, NamedTempFile) {
         mtls_enforced: false,
         enrolled_agent_keys: enrolled,
         identity_mode: HttpIdentityMode::Enforce,
+        ..Default::default()
     };
     let router = ai_memory::build_router(api_key_state, app_state.clone());
     (router, app_state, f)

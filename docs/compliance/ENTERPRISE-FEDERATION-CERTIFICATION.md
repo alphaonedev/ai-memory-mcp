@@ -12,21 +12,27 @@
 > (`docs/audit/3x7-v1-cutline-ruling-2026-08-01.md`) is the standard this
 > certification answers to; this document is the evidence-bound answer.
 
-**Binds to:** `ab6f2175077afd47e0a0ac65d5121db97e1d22d5` (the chain-10 candidate tip gated by push gate v3 on
-2026-09-12, published to `origin/release/v1.0.0` in the same push as this re-bind; carries #3204
-inside the §5 watch set on top of the 2026-09-11 tip `b0483115`; re-bound by
-[#3607](https://github.com/alphaonedev/ai-memory-mcp/issues/3607)). The 2026-09-11 re-issue at `b0483115`, the
-2026-09-11 #3595 re-issue at `ad60bead` and the The original
-2026-08-12 mint remains `e22bc93c` as a historical record. Any change to the
-federation wire path or the `AI_MEMORY_FED_*` surface **voids this
+**Binds to:** `f32c18dadf8a659567960747cc2802186bac9de9` (the v1.0.0 promotion-candidate tip;
+re-issued 2026-09-21 after **12 §7-watched federation-wire files changed** since the prior bind
+`ab6f2175` (2498 insertions / 317 deletions) — §5.4(2)–(5) re-run at the new SHA per §7). The
+2026-09-12 #3607 re-bind at `ab6f2175`, the 2026-09-11 re-issue at `b0483115`, the 2026-09-11
+#3595 re-issue at `ad60bead` and the original 2026-08-12 mint `e22bc93c` remain as historical
+records. Any change to the federation wire path or the `AI_MEMORY_FED_*` surface **voids this
 certification and triggers re-cert** (see §7).
 
-> ## STATUS — **LIVE as of 2026-09-12** (re-bound after #3204 at 22 checks; re-issued 2026-09-11 after #3549 / #3553 / #3199)
+> ## STATUS — **LIVE as of 2026-09-21** (re-issued at the v1.0.0 promotion tip `f32c18dad` at 22 checks after 12 §7-watched federation-wire files changed; supersedes the 2026-09-12 #3607 bind at `ab6f2175`)
 >
-> Re-validated and re-bound against `ab6f2175077afd47e0a0ac65d5121db97e1d22d5`
-> by [#3607](https://github.com/alphaonedev/ai-memory-mcp/issues/3607)
-> (posture legs re-measured at 22 checks and the §7 battery re-run on both backends at that exact tip on 2026-09-12;
-> the 2026-09-11 re-issue at `b0483115` is superseded and kept in §7);
+> Re-validated and re-bound against `f32c18dadf8a659567960747cc2802186bac9de9`
+> at the v1.0.0 promotion tip on 2026-09-21: §5.4(2) posture legs re-measured at 22 checks
+> (release builds of this SHA; exits **2 / 2 / 1 / 0**; certified sqlcipher + encrypt-at-rest +
+> boot-gate config **22 PASS / 0 FAIL**), the §5.4(4)/(7) acceptance battery re-run (eight named
+> integration binaries + three lib-slice invocations, all green, zero failures — the lib slice
+> as THREE separate invocations, not one, so no vacuous aggregate hides a leg), and the §5.4(5)
+> removal proof re-run (15 controls, each broken→RED / restored→GREEN, `overall: PASS`).
+> §5.4(3) Postgres+AGE and the live-pg §5.4(4) lanes executed GREEN in CI on this exact tip
+> (`Certified pg+AGE cells` run 35544846676; `Check (linux-fed/macos-fed,enterprise-fed)` run
+> 35544846618). Evidence in `docs/compliance/evidence/cert-f32c18dad/` and the new §7 record.
+> The 2026-09-12 #3607 bind at `ab6f2175` is superseded and kept in §7);
 > the earlier same-day re-issue by [#3595](https://github.com/alphaonedev/ai-memory-mcp/issues/3595)
 > at `ad60bead` is superseded and kept as history in §7.
 > [#3582](https://github.com/alphaonedev/ai-memory-mcp/issues/3582) changed
@@ -598,11 +604,21 @@ directory's `SANITIZATION.md` + `MANIFEST.sha256`):
 > present in the key directory. `cert-3607/` is the posture-leg evidence of
 > record; the `cert-55/` 20-check captures are dated history. The table
 > below reads at 22 checks.
+>
+> **Evidence note (f32c18dad re-issue, 2026-09-21):** the four-leg captures
+> were **re-measured at 22 checks** on release-built binaries of the v1.0.0
+> promotion tip `f32c18dad` (`docs/compliance/evidence/cert-f32c18dad/`):
+> bare 12 PASS / 10 FAIL (exit 2); hardened non-sqlcipher 20 / 2 (exit 2,
+> the same two remaining); boot gate armed → refuses to boot (exit 1);
+> sqlcipher + `ENCRYPT_AT_REST=1` + boot gate → **22 PASS / 0 FAIL (exit 0)**
+> — identical to the `ab6f2175` bind. `cert-f32c18dad/` is the posture-leg
+> evidence of record after this re-issue; `cert-3607/` is dated history. The
+> table below reads at 22 checks and is unchanged by this re-bind.
 
 | Environment | Exit | Result |
 |---|---|---|
 | Bare (`AI_MEMORY_NO_CONFIG=1`, no posture knobs) | **2** | `overall: FAIL`, **exactly 10 `[FAIL]` rows of 22** (named below; `cert-3607/posture-bare-env.out`) |
-| Fully hardened, **non-sqlcipher** binary, boot gate not armed | **2** | `overall: FAIL`, exactly TWO remaining: `AI_MEMORY_ENCRYPT_AT_REST` (requires `--features sqlcipher`) and `AI_MEMORY_REQUIRE_ENTERPRISE_FEDERATION_POSTURE` (the boot gate itself, unset on this leg by construction). Pins **27/27** at floor. |
+| Fully hardened, **non-sqlcipher** binary, boot gate not armed | **2** | `overall: FAIL`, exactly TWO remaining: `AI_MEMORY_ENCRYPT_AT_REST` (requires `--features sqlcipher`) and `AI_MEMORY_REQUIRE_ENTERPRISE_FEDERATION_POSTURE` (the boot gate itself, unset on this leg by construction). Pins **27/27** at floor at the bound tip (pre-#3124; a post-#3124 re-bind measures 28/28). |
 | Same hardened non-sqlcipher env **with the boot gate ARMED** | **1** | the binary **refuses to boot**, naming the below-floor control (`posture-hardened-boot-refusal.out`) — #2911 item 1's enforcement demonstrated, not merely reported |
 | Fully hardened, **sqlcipher** binary + `ENCRYPT_AT_REST=1`, boot gate ARMED | **0** | `overall: PASS` (`cert-3607/posture-sqlcipher-pass.out`; 22 `[PASS]`, 0 `[FAIL]`) — the certified configuration boots under the armed gate and passes clean |
 
@@ -618,7 +634,7 @@ code.)
 2. `asi-hard pinned knobs` — post-#2927 this row **FAILs honestly under
    a `standard` profile** (`profile=standard — asi-hard pins not in
    force; the N-knob hard floor was not evaluated`, where N is
-   `pinned_knobs().len()` — **27** post-#3201, 17 in the captured
+   `pinned_knobs().len()` — **30** post-#3813, 28 post-#3124, 17 in the captured
    evidence below) instead of the pre-#2927 vacuous
    `N/N at floor` PASS (#2923). **Evidence note (#3033, #3113, #3168, #3201):** the
    `cert-54/` `.out` captures in §2 predate all three and render the
@@ -636,9 +652,12 @@ code.)
    `AI_MEMORY_FED_CERT_PEER_BINDING` were pinned (#3201 — the unenrolled
    hatch of the already-pinned `REQUIRE_PEER_ENROLLMENT`, plus cert↔peer-id
    binding Enforce; the documented `standard` unset default stays Warn),
-   and the doctor render is `pinned_knobs().len()`-driven. The
-   `cert-55/` recapture **measures** `27/27 at floor` on the hardened
-   non-sqlcipher leg. The PASS/FAIL verdict per leg is unchanged (the
+   and to 28 when `AI_MEMORY_UNSTAMPED_MUTATION` was pinned to `refuse`
+   (#3124 — a caller-scoped mutation of an UNSTAMPED, legacy-unowned row
+   is refused on every funnel of both backends; the documented `standard`
+   default stays `warn`), and the doctor render is
+   `pinned_knobs().len()`-driven. The `cert-55/` and `cert-3607/` recaptures (both pre-#3124)
+   **measure** `27/27 at floor` on the hardened non-sqlcipher leg. The PASS/FAIL verdict per leg is unchanged (the
    row is one check regardless of the knob count).
 3. `AI_MEMORY_FED_TRUST_DOMAIN` (unset)
 4. `AI_MEMORY_FED_PEER_FINGERPRINTS` (unset)
@@ -1181,6 +1200,68 @@ to this document goes RED. Its reported context is declared in
 operator-gated branch-protection API call adds it to the live required
 set, the gate is a red check, not a merge block.)
 
+**Re-cert trigger — FIRED (12 §7-watched federation-wire files changed
+`ab6f2175` → `f32c18dad`) and DISCHARGED by re-issue (`f32c18dad`,
+2026-09-21).** Between the prior bind `ab6f2175` (2026-09-12 #3607) and the
+v1.0.0 promotion tip `f32c18dad`, **twelve** files under the §7 watched
+paths changed (2498 insertions / 317 deletions): `src/federation/applied_wake.rs`,
+`freshness.rs`, `peer_tasks.rs` (all new), `identity/issuer.rs`, `mod.rs`,
+`peer.rs`, `peer_posture.rs`, `push_dlq.rs`, `receive.rs`, `sync.rs`, plus
+`src/handlers/federation_receive.rs` and `src/handlers/federation_signing_check.rs`.
+The `AI_MEMORY_FED_*` identifier NAME set is **UNCHANGED** across the range
+(a code-only change; the mechanized env-surface trigger did not fire). Per
+this clause the drift EXPIRED the certification for the changed wire surface,
+which the top-of-document STATUS did not reflect; this record DISCHARGES it by
+re-running §5.4(2)–(5) at `f32c18dad` and re-binding STATUS/Binds-to to that
+SHA. The posture is strictly no weaker than at `ab6f2175` — the FAIL/PASS
+counts match exactly.
+
+*Posture legs (22 checks, release builds of `f32c18dad`; reproducible with
+`scripts/recapture-cert-f32c-posture.sh`; captures in
+`docs/compliance/evidence/cert-f32c18dad/`).* Bare: exit 2, 12 PASS / 10 FAIL.
+Hardened non-sqlcipher, boot gate not armed: exit 2, 20 / 2. Hardened
+non-sqlcipher, boot gate ARMED: exit 1, refuses to boot. Certified
+configuration (sqlcipher, encrypt-at-rest, boot gate,
+`AI_MEMORY_DB_SYNCHRONOUS=FULL`, operator key pair): **exit 0, 22 PASS /
+0 FAIL**. The four exit statuses **2 / 2 / 1 / 0** are recorded in
+`cert-f32c18dad/posture-legs-exit-codes.txt`.
+
+*§5.4(4)/(7) acceptance battery (exact `test result:` lines; zero `FAILED`;
+captured 2026-09-21 at `f32c18dad`, default features; the live-pg lanes are
+cited from CI below).*
+
+| Invocation | Exact `test result:` line |
+|---|---|
+| default `--test boot_fail_closed_config_3166` | `ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.93s` |
+| default `--test doctor_posture_exit_code_3003` | `ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s` |
+| default `--test doctor_synchronous_posture_3553` | `ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.67s` |
+| default `--test federation_catchup_posture_3582` | `ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 20.79s` |
+| default `--test federation_namespace_gate_3582` | `ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s` |
+| default `--test federation_peer_posture_3582` | `ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.82s` |
+| default `--test federation_write_ns_scope_2447` | `ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.59s` |
+| default `--test posture_control15_pg_resolution_3106` | `ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.26s` |
+| default `--lib enterprise_federation_posture` (own invocation) | `ok. 38 passed; 0 failed; 0 ignored; 0 measured; 8645 filtered out; finished in 0.30s` |
+| default `--lib federation::peer_posture` (own invocation) | `ok. 5 passed; 0 failed; 0 ignored; 0 measured; 8678 filtered out; finished in 0.01s` |
+| default `--lib cli::backup::tests` (own invocation) | `ok. 81 passed; 0 failed; 0 ignored; 0 measured; 8602 filtered out; finished in 44.61s` |
+
+The lib slice was run as **three separate** `cargo test --lib <filter>`
+invocations, one filter each. A single invocation with three positional
+filters is REFUSED by cargo (`error: unexpected argument`) before any test
+runs — a vacuous leg that certifies nothing and must never be cited.
+
+*§5.4(3) Postgres + AGE + pgvector, and the live-pg §5.4(4) negative lanes:
+executed GREEN in CI on `f32c18dad`.* `Certified pg+AGE cells (live PG 18.6 +
+AGE 1.8.0 + pgvector 0.8.6)` — run
+[`35544846676`](https://github.com/alphaonedev/ai-memory-mcp/actions/runs/35544846676)
+(success). `Check (linux-fed,enterprise-fed)` + `Check (macos-fed,enterprise-fed)`
+— the federation namespace-scope negative lanes on both backends — run
+[`35544846618`](https://github.com/alphaonedev/ai-memory-mcp/actions/runs/35544846618)
+(success).
+
+*§5.4(5) removal proof (`scripts/check-cert-removal-proof.sh`, bare full
+harness at `f32c18dad`): `overall: PASS` — all **15** controls broken → RED
+(rc=101) / restored → GREEN (rc=0), each shown load-bearing.*
+
 **Re-cert trigger — FIRED, pending re-affirmation (PR #2946, L5
 reserved-anchor refusal).** The federation-wire surface changed:
 `src/federation/receive_auth.rs` (the new pure predicate
@@ -1545,6 +1626,21 @@ reproducible with `scripts/recapture-cert-3607-posture.sh`.
 ---
 
 ## 8. Current determination
+
+**Status at `f32c18dadf8a659567960747cc2802186bac9de9` (2026-09-21
+re-issue; the v1.0.0 promotion candidate; supersedes the 2026-09-12 #3607
+bind at `ab6f2175` below).** The seven §5.4 falsifiability requirements hold
+on this SHA — §5.4(1) canonical doc = this document (LIVE banner); §5.4(2)
+machine-checked posture = CLOSED at **22 checks** (`cert-f32c18dad/`, four
+legs re-measured on release builds of this tip, exits 2/2/1/0, certified
+config 22 PASS / 0 FAIL); §5.4(3) Postgres+AGE = executed GREEN in CI on this
+tip (`Certified pg+AGE cells`, run 35544846676); §5.4(4) negative lanes =
+green (eight named integration binaries + three lib-slice invocations local,
+plus `Check (linux-fed/macos-fed,enterprise-fed)` in CI on both backends);
+§5.4(5) removal proof = 15 controls load-bearing (`overall: PASS`); §5.4(7)
+disconfirmation = §7, discharged for the 12-file wire-path drift
+`ab6f2175 → f32c18dad` by this re-issue's acceptance battery. The 2026-09-12
+#3607 bind at `ab6f2175` below is superseded and kept as history.
 
 **Status at `ab6f2175077afd47e0a0ac65d5121db97e1d22d5` (2026-09-12
 re-bind, [#3607](https://github.com/alphaonedev/ai-memory-mcp/issues/3607);

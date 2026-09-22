@@ -33,7 +33,7 @@
 //! OSS path stops at file-based 0600 storage. TPM 2.0, PKCS#11 HSMs,
 //! Apple Secure Enclave / TEE, AWS KMS / GCP KMS / Azure Key Vault
 //! are intentionally **not** implemented in this crate. Operators who
-//! need any of those should look at the **AgenticMem™** commercial
+//! need any of those should look at the **AgenticMem** commercial
 //! layer — same `AgentKeypair` shape, same wire format, hardware-backed
 //! signing under the hood.
 //!
@@ -73,7 +73,7 @@
 //!    the overwrite (forward security — a retired signing key never signs
 //!    again, so keeping a copy is pure attack surface).
 //! 4. **Out of scope** — hardware-backed storage (TPM / HSM / KMS /
-//!    Secure Enclave) is the commercial AgenticMem™ boundary documented
+//!    Secure Enclave) is the commercial AgenticMem boundary documented
 //!    above; revocation lists and a key-id-stamped multi-key
 //!    signed-events verifier are not implemented in the OSS crate.
 //!
@@ -384,7 +384,7 @@ pub fn save(keypair: &AgentKeypair, dir: &Path) -> Result<()> {
     write_with_mode(&priv_path, &private.to_bytes(), 0o600)
         .with_context(|| format!("writing private key {}", priv_path.display()))?;
     write_with_mode(&pub_path, &keypair.public.to_bytes(), 0o644)
-        .with_context(|| format!("writing public key {}", pub_path.display()))?;
+        .with_context(|| writing_public_key_context(&pub_path))?;
     Ok(())
 }
 
@@ -403,20 +403,20 @@ pub fn save_public_only(keypair: &AgentKeypair, dir: &Path) -> Result<()> {
     //           pub-write closure (line 178) — reachable on EACCES/
     //           ENOSPC; not portable to unit tests on macOS/Linux.
     write_with_mode(&pub_path, &keypair.public.to_bytes(), 0o644)
-        .with_context(|| format!("writing public key {}", pub_path.display()))?;
+        .with_context(|| writing_public_key_context(&pub_path))?;
     Ok(())
 }
 
 /// Path of `agent_id`'s public-key file under `dir`. Single home for the
 /// `<agent_id>.pub` shape so the literal is not scattered (pm-v3.1 lint).
-fn agent_pub_path(dir: &Path, agent_id: &str) -> PathBuf {
+pub(crate) fn agent_pub_path(dir: &Path, agent_id: &str) -> PathBuf {
     dir.join(format!("{agent_id}{PUB_SUFFIX}"))
 }
 
 /// `<dir>/<agent_id>.priv` — the private half. #3147 made this a named helper
 /// because the existence GATE must consult both halves, not just the public
 /// one; it was previously formatted inline in [`load`] only.
-fn agent_priv_path(dir: &Path, agent_id: &str) -> PathBuf {
+pub(crate) fn agent_priv_path(dir: &Path, agent_id: &str) -> PathBuf {
     dir.join(format!("{agent_id}{PRIV_SUFFIX}"))
 }
 
@@ -1170,17 +1170,75 @@ pub fn ensure_keypair(agent_id: &str, dir: &Path, disabled: bool) -> Result<Ensu
 /// a four-way state table.
 fn ensure_generate(agent_id: &str, dir: &Path, pub_path: PathBuf) -> Result<EnsureOutcome> {
     let kp = generate(agent_id)?;
-    save(&kp, dir)?;
-    // COVERAGE: tracing::info! lazy-format closure (lines 411-417)
-    //           — the format args are constructed lazily; the closure
-    //           body runs when the INFO subscriber is enabled. Coverage
-    //           depends on test subscriber config. Documented per L0.7
-    //           playbook §3c.
-    tracing::info!(
-        "auto-generated identity keypair at {} — consider backing up",
-        pub_path.display()
-    );
-    Ok(EnsureOutcome::Generated { pub_path })
+    let priv_path = agent_priv_path(dir, agent_id);
+    // #3772 — CONCURRENT-GENERATE RACE. `serve`, `curator`, and one-shot CLI
+    // invocations SHARE one key directory (CLAUDE.md: "MCP stdio, curator,
+    // serve and every CLI invocation share one" per host), and several can boot
+    // at once — the macOS `Check (macos-fed,sqlite)` acceptance suite spawns
+    // parallel `serve` children against ONE process-wide `test_key_dir::install`
+    // sandbox. Two callers that both observed `(false, false)` in the gate above
+    // each `generate()` a DIFFERENT keypair; the prior `save()` wrote each half
+    // with a CLOBBERING rename, so their `.priv`/`.pub` writes could interleave
+    // into a TORN pair (`.priv` from one identity, `.pub` from the other).
+    // `load`'s private-derives-public cross-check then bails,
+    // `governance::audit::load_daemon_signing_key` maps that `Err` to `Ok(None)`,
+    // and the daemon refuses to start with "#3354 … no key was loadable after
+    // the ensure step" — a key it had just generated.
+    //
+    // The fix CLAIMS `.priv` with an atomic first-writer-wins primitive
+    // ([`claim_new_with_mode`]: stage the fully-written bytes, then `hard_link`
+    // them onto the final name). The FIRST caller wins the identity; every
+    // losing caller's claim fails with `AlreadyExists` and re-resolves through
+    // `ensure_keypair` to ADOPT the winner's key, so the on-disk pair is ALWAYS
+    // consistent. Private-first (#3146) and the both-halves gate (#3147) are
+    // preserved: `.priv` is committed (complete — the link never exposes a
+    // zero-byte name) before `.pub`, and a losing caller that observes the
+    // winner's `.priv` with a not-yet-written `.pub` self-heals `.pub` FROM that
+    // `.priv`, byte-identical to what the winner writes, so no torn pair results.
+    ensure_parent(&priv_path)?;
+    ensure_parent(&pub_path)?;
+    enforce_key_path_chain_secure(dir, &priv_path)?;
+    let private = kp
+        .private
+        .as_ref()
+        .ok_or_else(|| anyhow!("generated keypair for {agent_id} has no private key"))?;
+    match claim_new_with_mode(&priv_path, &private.to_bytes(), 0o600) {
+        Ok(()) => {
+            // Won the claim. `.pub` is a deterministic function of the `.priv`
+            // just committed, so even a concurrent self-heal writing `.pub`
+            // writes byte-identical bytes — the pair cannot tear.
+            write_with_mode(&pub_path, &kp.public.to_bytes(), 0o644)
+                .with_context(|| writing_public_key_context(&pub_path))?;
+            // COVERAGE: tracing::info! lazy-format closure — the format args are
+            //           constructed lazily; the closure body runs when the INFO
+            //           subscriber is enabled. Documented per L0.7 playbook §3c.
+            tracing::info!(
+                "auto-generated identity keypair at {} — consider backing up",
+                pub_path.display()
+            );
+            Ok(EnsureOutcome::Generated { pub_path })
+        }
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            // Lost the race: another caller claimed `.priv` first. Discard the
+            // key just generated and re-resolve — the on-disk `.priv` is the
+            // winner's identity, and `ensure_keypair`'s existing/self-heal arms
+            // adopt it (its `.pub` is loaded if present, or re-derived from the
+            // winner's complete `.priv` if still mid-write). `.priv` now exists,
+            // so the re-entry can only hit `(true,true)` or `(false,true)` and
+            // terminates in one step.
+            tracing::warn!(
+                target: KEYPAIR_TRACE_TARGET,
+                "identity: lost the first-run key-generation race for {} — another \
+                 process claimed {} first; adopting the existing identity (#3772).",
+                agent_id,
+                priv_path.display(),
+            );
+            ensure_keypair(agent_id, dir, false)
+        }
+        Err(e) => {
+            Err(anyhow!(e)).with_context(|| format!("claiming private key {}", priv_path.display()))
+        }
+    }
 }
 
 /// Create the parent directory of `path` (recursive `mkdir`).
@@ -1209,6 +1267,12 @@ pub(crate) fn ensure_parent(path: &Path) -> Result<()> {
 /// is owner-only even under the `umask 0002` this fleet runs.
 #[cfg(unix)]
 const KEY_DIR_MODE: u32 = 0o700;
+
+/// One rendering of the "writing public key" context (pm-v3.1 literal
+/// ratchet: the three write sites share it instead of repeating the text).
+fn writing_public_key_context(pub_path: &std::path::Path) -> String {
+    format!("writing public key {}", pub_path.display())
+}
 
 /// The group/other WRITE bits (#3198). A key directory carrying either of them
 /// lets a second local UID unlink and replace `<agent>.priv`/`<agent>.pub`, so
@@ -1470,7 +1534,7 @@ fn sync_dir(dir: &Path) {
 /// `chattr -i` checks, because a read-only or immutable key directory is the
 /// common cause and the bare errno points at the wrong file.
 #[cfg(unix)]
-pub(crate) fn write_with_mode(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
+pub fn write_with_mode(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
 
@@ -1564,6 +1628,88 @@ fn create_new_with_mode(path: &Path, bytes: &[u8], _mode: u32) -> io::Result<()>
     }
 }
 
+/// #3772 — atomically CLAIM `path` for `bytes` at `mode`, FIRST-WRITER-WINS,
+/// exposing the final name only ever as a COMPLETE file.
+///
+/// This is the concurrent-safe key-generation primitive. Its two siblings are
+/// each wrong for that job on their own:
+///
+/// * [`write_with_mode`] stages then `rename`s, and a `rename` CLOBBERS — two
+///   concurrent generators writing DIFFERENT keys can interleave their
+///   `.priv`/`.pub` writes into a torn pair (`.priv` from one, `.pub` from the
+///   other), which [`load`]'s private-derives-public cross-check then rejects
+///   (the #3772 macOS boot refusal);
+/// * [`create_new_with_mode`] makes the FINAL name visible at `create_new` time
+///   — i.e. as a ZERO-BYTE file, BEFORE the bytes are written — so a concurrent
+///   reader (a sibling's `load`/self-heal) can observe a truncated key.
+///
+/// The claim here stages the fully-written, `fsync`'d bytes under a unique
+/// sibling and then `hard_link`s that inode onto `path`. The link is atomic and
+/// fails with [`io::ErrorKind::AlreadyExists`] when another caller already
+/// claimed the name, so only the FIRST caller wins and the final file is never
+/// observed incomplete. The staging sibling is always unlinked (the winning
+/// link keeps the inode alive through `path`).
+#[cfg(unix)]
+fn claim_new_with_mode(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let dir = key_file_dir(path)?;
+    let staged = staging_sibling(path);
+
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .open(&staged)
+        .map_err(|e| annotate_staging_error(&e, &dir, path))?;
+
+    let commit = || -> io::Result<()> {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        // Atomic exclusive-create of the FINAL name pointing at the complete
+        // inode: `hard_link` fails with `AlreadyExists` if the name is taken.
+        fs::hard_link(&staged, path)?;
+        sync_dir(&dir);
+        Ok(())
+    };
+    let result = commit();
+    // The staging sibling is ours to remove on every path: on success the hard
+    // link keeps the key inode alive through `path`; on failure it is a partial
+    // temp that must not linger.
+    let _ = fs::remove_file(&staged);
+    result
+}
+
+/// #3772 — non-Unix twin of [`claim_new_with_mode`]. `hard_link` is
+/// cross-platform, so the same stage-then-link atomic claim holds; the Unix
+/// mode bits do not apply.
+#[cfg(not(unix))]
+fn claim_new_with_mode(path: &Path, bytes: &[u8], _mode: u32) -> io::Result<()> {
+    use std::io::Write;
+
+    let dir = key_file_dir(path)?;
+    let staged = staging_sibling(path);
+
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&staged)?;
+
+    let commit = || -> io::Result<()> {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        fs::hard_link(&staged, path)?;
+        sync_dir(&dir);
+        Ok(())
+    };
+    let result = commit();
+    let _ = fs::remove_file(&staged);
+    result
+}
+
 /// #3146 — archive `pub_bytes` as a timestamped, PUBLIC-ONLY sibling of
 /// `<agent_id>.pub`, NEVER overwriting an existing archive.
 ///
@@ -1609,7 +1755,7 @@ fn archive_public_key_at(dir: &Path, agent_id: &str, pub_bytes: &[u8], ts: i64) 
 }
 
 #[cfg(not(unix))]
-pub(crate) fn write_with_mode(path: &Path, bytes: &[u8], _mode: u32) -> io::Result<()> {
+pub fn write_with_mode(path: &Path, bytes: &[u8], _mode: u32) -> io::Result<()> {
     // Non-Unix: mode bits don't apply. The file inherits the parent
     // directory ACL. (Linux and macOS, the supported platforms, take the
     // unix path above; this branch is a defensive fallback only.)
@@ -2550,9 +2696,12 @@ mod tests {
         // the contract here so a future refactor doesn't quietly drop
         // the override.
         let _g = key_dir_env_lock().lock().unwrap_or_else(|e| e.into_inner());
-        // Bind the override path once (OS-agnostic temp root) and assert
-        // the same value round-trips, so the contract can't desync.
-        let override_path = std::env::temp_dir().join("ai-memory-key-dir-override-probe");
+        // #3859 — take the override base from the isolation helper, which now
+        // roots its sandbox OUTSIDE HOME by construction (was `std::env::temp_dir()`,
+        // i.e. `$TMPDIR`, which can be under HOME and then trips the #3355 guard).
+        // The override subdir need not exist; `default_key_dir` accepts it.
+        let override_path =
+            crate::identity::test_key_dir::install().join("ai-memory-key-dir-override-probe");
         // SAFETY: env mutation serialised by `key_dir_env_lock` for
         // the duration of this test.
         unsafe {

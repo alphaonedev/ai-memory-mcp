@@ -127,8 +127,13 @@ mod tests {
 
     #[tokio::test]
     async fn history_write_gate_does_not_reacquire_exhausted_pool_3464() {
-        let url =
-            std::env::var("AI_MEMORY_TEST_POSTGRES_URL").expect("own PostgreSQL test URL required");
+        // Self-skip without a cluster, the way every sibling pg cell does
+        // (`bootstrap_ddl.rs`, `tx_retry.rs`): an `expect` here made the
+        // whole `sal,sal-postgres` lib suite RED on any host without the env.
+        let Ok(url) = std::env::var("AI_MEMORY_TEST_POSTGRES_URL") else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
         let store = PostgresStore::connect(&url).await.expect("store");
         let agent = format!("ai:pool-gate-{}", uuid::Uuid::new_v4());
         let ctx = CallerContext::for_admin(&agent);

@@ -223,6 +223,7 @@ async fn spawn_daemon_with_federation(
             ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty(),
         ),
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
+        ..Default::default()
     };
     let app_state = build_postgres_app_state(url, federation).await;
     let shutdown = Arc::new(Notify::new());
@@ -368,7 +369,11 @@ async fn notify_fanout_postgres_reaches_w_of_n_peers() {
     );
 
     // Inspect the wire shape — every peer received an `_inbox/<recipient>`
-    // memory whose title matches what we POSTed.
+    // memory carrying what we POSTed. #3639: every inbox delivery is a NEW
+    // row whose STORED title is `<subject> [<id prefix>]`
+    // (`ai_memory::inbox_stored_title`) with the caller's subject verbatim
+    // in `metadata.subject`; the wire carries the stored row, so the match
+    // is on the subject plus the row-id tag, never on an exact title.
     let recorded = peer1.recorded.lock().await;
     let payload = recorded
         .iter()
@@ -377,7 +382,10 @@ async fn notify_fanout_postgres_reaches_w_of_n_peers() {
                 .and_then(|m| m.as_array())
                 .is_some_and(|arr| {
                     arr.iter().any(|m| {
-                        m.get("title").and_then(|t| t.as_str()) == Some(title.as_str())
+                        let id = m.get("id").and_then(|i| i.as_str()).unwrap_or_default();
+                        let stored = ai_memory::inbox_stored_title(&title, id);
+                        m.get("title").and_then(|t| t.as_str()) == Some(stored.as_str())
+                            && m["metadata"][ai_memory::INBOX_SUBJECT_META_KEY] == title.as_str()
                             && m.get("namespace")
                                 .and_then(|n| n.as_str())
                                 .is_some_and(|ns| ns == format!("_inbox/{recipient}"))
@@ -1049,7 +1057,7 @@ async fn consolidate_fanout_postgres_under_replicated_is_202_2861() {
 
     // A dead peer: a free port with nothing listening → connection refused
     // → AckOutcome::Fail, so W=2 is never reached.
-    let dead_url = format!("http://127.0.0.1:{}", free_port());
+    let dead_url = format!("https://127.0.0.1:{}", free_port());
     let cfg = federation_cfg_for_test(&[dead_url], 2);
 
     let (base, shutdown, handle) = spawn_daemon_with_federation(&url, Some(cfg)).await;

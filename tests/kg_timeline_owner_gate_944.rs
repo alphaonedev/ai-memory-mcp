@@ -174,6 +174,7 @@ fn build_router_fixture(db_path: &std::path::Path) -> axum::Router {
             ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty(),
         ),
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
+        ..Default::default()
     };
     ai_memory::build_router(api_key_state, app_state)
 }
@@ -214,10 +215,24 @@ async fn bob_cannot_read_alice_timeline_944() {
         Some("bob"),
         "#944: 403 envelope must echo the rejected caller; body={body}"
     );
+    // #3426 — INVERTED. The 403 envelope previously echoed the source
+    // row's OWNING agent id back to a caller that is not entitled to the
+    // row, an identity oracle across tenants. The owner now goes only to
+    // the server-side `ai_memory::authz` trace line; the refusal is built
+    // by `parity::owner_gate_refusal`, which does not take an owner
+    // parameter at all, so the field cannot come back.
+    assert!(
+        body.get("owner").is_none(),
+        "#944 / #3426: refusal MUST NOT disclose the owning agent id; body={body}"
+    );
+    assert!(
+        !body.to_string().contains("alice"),
+        "#944 / #3426: no part of the refusal may name the owner; body={body}"
+    );
     assert_eq!(
-        body["owner"].as_str(),
-        Some("alice"),
-        "#944: 403 envelope must echo the source's recorded owner; body={body}"
+        body["code"].as_str(),
+        Some(ai_memory::errors::error_codes::NOT_OWNER),
+        "#944 / #3426: refusal carries the closed-vocabulary code; body={body}"
     );
     assert!(
         body.get("events").is_none(),

@@ -265,6 +265,9 @@ fn mcp_store_rejects_malformed_valid_from() {
 
 fn cli_store_args(title: &str, ns: &str) -> ai_memory::cli::store::StoreArgs {
     ai_memory::cli::store::StoreArgs {
+        // #3409 — a --sign write whose caller is not bound to its key is refused
+        // unless the caller opts into the degraded (claimed) posture explicitly.
+        allow_claimed: false,
         tier: "long".to_string(),
         namespace: Some(ns.to_string()),
         title: title.to_string(),
@@ -400,6 +403,7 @@ fn build_router_fixture() -> (axum::Router, NamedTempFile) {
             ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty(),
         ),
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
+        ..Default::default()
     };
     let router = ai_memory::build_router(api_key_state, app_state);
     (router, f)

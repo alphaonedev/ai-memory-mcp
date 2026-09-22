@@ -214,7 +214,7 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
 <nav class="topnav">
   <div class="inner">
     <div class="left">
-      <a class="brand" href="./">ai-memory&trade;</a>
+      <a class="brand" href="./">ai-memory</a>
     </div>
     <div class="right">
       <a href="learn/" style="color:var(--p1);font-weight:600">Learn ai-memory</a>
@@ -247,6 +247,7 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
           <a href="knowledge-graph.html">Knowledge Graph</a>
           <a href="autonomous.html">Autonomous</a>
           <a href="a2a-messaging.html">A2A Messaging</a>
+          <a href="a2a-integration.html">Integrate an Agent</a>
           <a href="lifecycle.html">Lifecycle</a>
           <a href="performance.html">Performance</a>
           <a href="agent-identity.html">Agent Identity (NHI)</a>
@@ -327,6 +328,7 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
         <a href="knowledge-graph.html">Knowledge Graph</a>
         <a href="autonomous.html">Autonomous</a>
         <a href="a2a-messaging.html">A2A Messaging</a>
+          <a href="a2a-integration.html">Integrate an Agent</a>
         <a href="lifecycle.html">Lifecycle</a>
         <a href="performance.html">Performance</a>
         <a href="agent-identity.html">Agent Identity (NHI)</a>
@@ -375,7 +377,7 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
       <span>Local-first &middot; air-gappable</span>
       <span>Model-neutral (MCP)</span>
       <span>104 MCP tools</span>
-      <span>100 HTTP routes (86 unique paths)</span>
+      <span>102 HTTP routes (88 unique paths)</span>
       <span>91 CLI subcommands (default build; 93 with <code>sal</code> features)</span>
       <span>Ed25519 attested audit chain</span>
       <span>SQLite&nbsp;+&nbsp;Postgres&#x202F;/&#x202F;AGE</span>
@@ -515,7 +517,7 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
       <div class="feat green">
         <span class="tag green">Provider-agnostic LLM</span>
         <h3>15+ vendor backends</h3>
-        <p>Ollama, OpenAI, xAI Grok, Anthropic, Gemini, DeepSeek, Kimi, Qwen, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks, LMStudio. One env var selects.</p>
+        <p>Ollama, OpenAI, xAI Grok, Anthropic, Gemini, Kimi, Qwen, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks, LMStudio. One env var selects.</p>
       </div>
       <div class="feat green">
         <span class="tag green">Capabilities v3</span>
@@ -615,7 +617,7 @@ cd ai-memory-mcp &amp;&amp; cargo build --release</code></pre>
       <p class="lede" style="margin-top:0.5rem">
         ai-memory ships a provider-agnostic LLM client. Any of 16+ backends &mdash; local
         <a href="https://ollama.com">Ollama</a>, LMStudio, vLLM, llama.cpp server,
-        <strong>xAI Grok</strong>, OpenAI, Anthropic, Google Gemini, DeepSeek, Kimi (Moonshot), Qwen
+        <strong>xAI Grok</strong>, OpenAI, Anthropic, Google Gemini, Kimi (Moonshot), Qwen
         (DashScope), Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks
         &mdash; configured via a <code>[llm]</code> section in <code>~/.config/ai-memory/config.toml</code>
         (recommended, post-<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1146">#1146</a>)
@@ -742,7 +744,7 @@ api_key_env = "XAI_API_KEY"            # env-var name (inline keys rejected at p
       <a class="int-card" href="API_REFERENCE.html">
         <div class="label">HTTP</div>
         <h4>REST API</h4>
-        <p>100 routes (86 unique paths) at <code>/api/v1/</code>. Axum daemon on port 9077. mTLS optional.</p>
+        <p>102 routes (88 unique paths) at <code>/api/v1/</code>. Axum daemon on port 9077. mTLS optional.</p>
         <span class="arrow">API reference &rarr;</span>
       </a>
       <a class="int-card" href="CLI_REFERENCE.html">
@@ -947,7 +949,7 @@ api_key_env = "XAI_API_KEY"            # env-var name (inline keys rejected at p
       <a class="lk" href="evidence.html"><strong>Evidence &mdash; frozen claims</strong><span class="desc">Every public number, pinned to a commit + test artifact. 15,951/0 (2026-05-31 final baseline, v0.7.0 tree &mdash; see evidence.html).</span></a>
       <a class="lk" href="USER_GUIDE.html"><strong>User guide</strong><span class="desc">End-to-end MCP tool reference</span></a>
       <a class="lk" href="DEVELOPER_GUIDE.html"><strong>Developer guide</strong><span class="desc">Build from source, extend, add tools</span></a>
-      <a class="lk" href="API_REFERENCE.html"><strong>HTTP API</strong><span class="desc">100 routes (86 unique paths)</span></a>
+      <a class="lk" href="API_REFERENCE.html"><strong>HTTP API</strong><span class="desc">102 routes (88 unique paths)</span></a>
       <a class="lk" href="CLI_REFERENCE.html"><strong>CLI reference</strong><span class="desc">91 subcommands</span></a>
       <a class="lk" href="GLOSSARY.html"><strong>Glossary</strong><span class="desc">Every concept, one place</span></a>
       <a class="lk" href="knowledge-graph.html"><strong>Knowledge graph</strong><span class="desc">Typed links, temporal validity</span></a>
@@ -974,7 +976,7 @@ api_key_env = "XAI_API_KEY"            # env-var name (inline keys rejected at p
     <a href="credits.html">Credits</a>
     <a href="whats-new-v09.html">What's new</a>
   </div>
-  <div>ai-memory&trade; &middot; Apache-2.0 &middot; &copy; 2026 <a href="https://alphaonedev.com">AlphaOne LLC</a></div>
+  <div>ai-memory &middot; Apache-2.0 &middot; &copy; 2026 <a href="https://alphaonedev.com">AlphaOne LLC</a></div>
   <div class="legal">Built for AI Non-Human Identity agents that need to remember &mdash; from a phone to a planet.</div>
   <div class="legal" style="margin-top:.55rem; font-size:.72rem; opacity:.85; max-width:64rem">
     <strong>NSA non-endorsement.</strong> References to the National Security Agency Cybersecurity Information document on MCP security (U/OO/6030316-26 | PP-26-1834, May 2026 v1.0) describe ai-memory's substrate-level posture relative to NSA-issued guidance. The NSA, the Department of Defense, and the United States Government do not endorse, certify, or recommend ai-memory, AgenticMem, AlphaOne LLC, or any commercial product. Full mapping + citation: <a href="compliance/nsa-csi-mcp.html">compliance/nsa-csi-mcp.html</a>.

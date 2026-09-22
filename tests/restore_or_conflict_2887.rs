@@ -119,7 +119,10 @@ fn restore_same_id_merges_2887() {
 /// consolidate-tombstone disposition that retains the id + key). The restore
 /// must still SUCCEED (the CAS `WHERE memories.id = excluded.id` is true) — the
 /// case that `store_with_embedding_no_overwrite` (#2771 DO NOTHING) would
-/// wrongly refuse, which is exactly why this new primitive exists.
+/// wrongly refuse, which is exactly why this new primitive exists — AND since
+/// #2894 it must RE-OPEN the row to the snapshot's visible lifecycle via the
+/// ONE re-open predicate, so the restored original is reachable again (a
+/// restore the caller cannot see is not a restore).
 #[test]
 fn restore_same_id_against_tombstoned_row_merges_2887() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -138,13 +141,17 @@ fn restore_same_id_against_tombstoned_row_merges_2887() {
     let id = ai_memory::db::insert_restore_same_id(&conn, &restore)
         .expect("same-id restore against a tombstoned row must succeed, not refuse");
     assert_eq!(id, "id-orig");
-    // Restore CAS preserves lifecycle_state (insert_inner DO UPDATE keeps
-    // memories.lifecycle_state), so the row stays tombstoned and #2402
-    // hides it from db::get. Merged content + residency are proven on
-    // the unfiltered SQL the update path uses.
-    assert!(
-        ai_memory::db::get(&conn, "id-orig").expect("get").is_none(),
-        "#2402: restored-but-still-tombstoned row is hidden from get"
+    // #2894: the restore CAS re-opens the consolidation tombstone to the
+    // snapshot's visible lifecycle, so the restored original is reachable on
+    // the normal read path (presence on the same sink that used to assert
+    // absence). Merged content + residency are proven on both the read path
+    // and the unfiltered SQL the update path uses.
+    let row = ai_memory::db::get(&conn, "id-orig")
+        .expect("get")
+        .expect("#2894: the restored original must be visible via get");
+    assert_eq!(
+        row.content, "restored content",
+        "tombstoned same-id restored"
     );
     let (content, state): (String, String) = conn
         .query_row(
@@ -155,8 +162,8 @@ fn restore_same_id_against_tombstoned_row_merges_2887() {
         .expect("row still resident after same-id restore");
     assert_eq!(content, "restored content", "tombstoned same-id restored");
     assert_eq!(
-        state, "tombstoned",
-        "restore CAS must not un-tombstone; lifecycle advances go through the typed gate"
+        state, "open",
+        "#2894: a rollback restore re-opens the tombstone (lifecycle advances still go through the typed gate)"
     );
 }
 

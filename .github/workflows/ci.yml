@@ -702,26 +702,47 @@ jobs:
             runner: '["ubuntu-latest"]'
             node: ubuntu-latest
             tier: sqlite
-            # 2026-09-08 (#3538): 55 KILLED this leg twice, both times mid
-            # `Build release`, both times as a nameless `cancelled` that reads
-            # exactly like a product red: 70c20c8d (job 100354894089, 3319s,
-            # 09-02) and 25ebe4a7 attempt 1 (job 101978130955, 3316s, 09-08;
-            # the re-run passed in 3083s). This is the ONE leg that also
-            # carries the 2x2-invariant extras (cargo-audit + the release
-            # profile smoke), and on a FULL-impact diff its measured wall time
-            # grew 2897s (d41050df, 09-02) -> 3271s (3017ea05, 09-07 — the
-            # LONGEST run that completed) = 54.5 min against a 55 min cap, i.e.
-            # 29s of margin. 75 min is ~1.38x that measured max AND clears
-            # 3865s (64.4 min), the sum of every step's individually observed
-            # maximum (free-disk 187s + impact-aware tests 2441s + a COLD
-            # `cargo install cargo-audit` 413s + release smoke 787s +
-            # setup/post ~37s) — a combination no single run has hit yet but
-            # any run may. The #1492 watchdog below stays the inner bound and
-            # the hang detector (worst case ~55 min: 970s compile + 2100s
-            # watchdog + 224s setup), so a genuine hang still fails with a
-            # NAMED ::error:: ~20 min before this outer cap. Re-derive when a
-            # measured full run comes within 20 % of this value.
-            timeout: 75
+            # 2026-09-21 (#3538 recurrence on the v1.0.0 promotion PR #3769,
+            # run 35637375308 job 106458091476 at 562e61c82): 75 KILLED this
+            # leg once more, mid `Build release`, as a nameless `cancelled`
+            # that `gh pr checks` renders as `fail` — zero test failures,
+            # `Run tests (impact-aware)` SUCCESS, `Security audit` SUCCESS,
+            # the job died at 75 min 24 s. The cap was STALE before it fired:
+            # the previous green run of this leg (run 35544846618 at
+            # f32c18dad) took release smoke to 1225 s when the maximum
+            # recorded below was 787 s, and passed with 4 min 4 s of margin —
+            # inside the "re-derive when within 20 %" rule this comment set.
+            #
+            # Measured today (UTC 18:17–19:32, the cancelled run): free-disk
+            # 160 s + impact-aware tests 2708 s (a full-impact diff — the
+            # rehearsal→release PR runs everything) + security audit 438 s +
+            # trim 2 s + release smoke ≥1225 s (the previous green run's
+            # measured value; today's was cut off at 1185 s) + setup/post
+            # ~40 s = ~4600 s = 76.7 min, the sum of every step's observed
+            # maximum. 95 min is ~1.24x that sum.
+            #
+            # WHY RAISING THIS IS NOT BUDGET INFLATION. This value is the
+            # OUTER cap: a ceiling on HONEST work, whose only job is to fit
+            # the sum of the steps when every one of them takes its longest
+            # observed time. It is NOT the hang detector. The #1492 INNER
+            # watchdog below (worst case ~55 min: ~970 s compile + 2100 s
+            # watchdog + ~224 s setup) is the instrument that catches a hung
+            # test process, and it is unchanged: a genuine hang still fails
+            # with a NAMED ::error:: at ~55 min, roughly 40 min BEFORE this
+            # outer cap. Raising the ceiling on honest work cannot mask a hang
+            # the inner watchdog already catches; lowering it only converts
+            # slow-but-green runs into nameless cancellations that read as
+            # product reds (#3538: 70c20c8d 09-02 and 25ebe4a7 attempt 1
+            # 09-08, both cancelled mid `Build release`, the re-run passing in
+            # 3083 s — and now 562e61c82). Re-derive when a measured full run
+            # comes within 20 % of this value.
+            #
+            # History: 55 → 75 on 2026-09-08 (#3538) against a longest
+            # completed run of 3271 s and a step-max sum of 3865 s
+            # (free-disk 187 + tests 2441 + cold cargo-audit 413 + release
+            # smoke 787 + setup ~37); both maxima have since moved (tests
+            # 2708, release smoke 1225).
+            timeout: 95
             # `once` marks the ONE leg that carries the 2x2-invariant extras
             # (cargo-audit, the release-profile smoke build) so they do not
             # multiply across four legs. It is an explicit flag rather than a

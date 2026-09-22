@@ -2,6 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #![cfg(unix)]
+// #3733 — key dirs created 0700 (not the ambient umask; the #3198 guard
+// refuses a group-writable key dir at umask 0002).
+#[path = "common/key_dir_sandbox.rs"]
+mod key_dir_sandbox;
+
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
@@ -19,7 +24,7 @@ impl Fixture {
         let home = root.join("home");
         let keys = root.join("keys");
         std::fs::create_dir(&home).unwrap();
-        std::fs::create_dir(&keys).unwrap();
+        key_dir_sandbox::mkdir_0700(&keys);
         let db = root.join("registry.db");
         let conn = ai_memory::db::open(&db).unwrap();
         ai_memory::db::register_agent(&conn, "registered-3355", "system", &[]).unwrap();
@@ -364,6 +369,92 @@ async fn postgres_registry_controls_doctor_preview_delete_and_refusal() {
         b"sentinel"
     );
     pool.close().await;
+}
+
+/// #3354 × #3355 — the key the ledger is signed with is never an orphan.
+///
+/// #3354 generates the RESOLVED agent id's signing key (`AI_MEMORY_AGENT_ID`,
+/// else `host:<hostname>`) on the first ledger-writing verb, without
+/// registering the id. Pre-fix, `keys prune` classified that pair as orphans
+/// — and `--yes` DELETED the key every signed row was signed with, handing
+/// the next writer a fresh one. The pair is now protected alongside the
+/// registered ids, resolved the way boot resolves it.
+///
+/// RED on 9ff03deeb (#3354-v2): the two pre-existing cells above count four
+/// orphans, and this cell finds the signing key gone after `--yes`.
+#[test]
+fn resolved_ledger_signing_key_survives_prune_3354() {
+    use std::io::Write as _;
+    let f = Fixture::new();
+    let signer = ai_memory::identity::resolve_agent_id(None, None).expect("resolved id");
+    let params = serde_json::json!({
+        "host_session_id": "sess-3354-prune",
+        "host_turn_index": 1,
+        "role": "assistant",
+        "content": "one ledger-writing verb generates the signing key",
+        "host_kind": "claude-code",
+    });
+    let mut child = f
+        .command()
+        .args(["capture-turn", "--json"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn capture-turn");
+    child
+        .stdin
+        .take()
+        .expect("piped stdin")
+        .write_all(params.to_string().as_bytes())
+        .expect("write stdin");
+    let out = child.wait_with_output().expect("capture-turn output");
+    assert!(
+        out.status.success(),
+        "capture-turn: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let priv_name = format!("{signer}.priv");
+    let pub_name = format!("{signer}.pub");
+    assert!(
+        f.keys.join(&priv_name).is_file(),
+        "#3354 generated the signing key for the resolved id"
+    );
+
+    let preview = successful(&f.prune(&["--dry-run"]));
+    let orphans = preview["inventory"]["orphan_files"].as_array().unwrap();
+    assert!(
+        !orphans
+            .iter()
+            .any(|o| o == priv_name.as_str() || o == pub_name.as_str()),
+        "the ledger-signing key is never an orphan: {orphans:?}"
+    );
+    assert_eq!(
+        orphans.len(),
+        2,
+        "only the fixture's orphan pair: {orphans:?}"
+    );
+    let protected = preview["inventory"]["protected_files"].as_array().unwrap();
+    assert!(
+        protected.iter().any(|p| p == priv_name.as_str())
+            && protected.iter().any(|p| p == pub_name.as_str()),
+        "the signing pair is listed as protected: {protected:?}"
+    );
+
+    let value = successful(&f.prune(&["--yes"]));
+    assert_eq!(
+        value["inventory"]["deleted_files"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert!(
+        f.keys.join(&priv_name).is_file(),
+        "prune --yes keeps the signing key"
+    );
+    assert!(f.keys.join(&pub_name).is_file(), "and its public half");
+    assert!(!f.keys.join("orphan-3355.priv").exists());
 }
 
 fn assert_public_inventory(value: &serde_json::Value) {

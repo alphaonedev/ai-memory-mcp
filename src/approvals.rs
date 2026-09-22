@@ -969,12 +969,11 @@ pub mod signed {
             decision_label,
             "approval_quorum_met",
             "",
-            serde_json::json!({
-                "pending_id": pending_id,
-                "threshold": quorum.threshold,
-                "distinct_signers": quorum.distinct_signers,
-                "signer_pubkeys": quorum.signer_pubkeys_b64,
-            }),
+            crate::governance::audit::ForensicPayload::new()
+                .ident("pending_id", pending_id)
+                .number("threshold", quorum.threshold)
+                .number("distinct_signers", quorum.distinct_signers)
+                .idents("signer_pubkeys", &quorum.signer_pubkeys_b64),
         );
     }
 

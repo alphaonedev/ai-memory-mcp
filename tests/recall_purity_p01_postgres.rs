@@ -280,6 +280,7 @@ async fn postgres_recall_purity_sal_and_http_entry_paths() {
                     ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty(),
                 ),
                 identity_mode: ai_memory::config::HttpIdentityMode::default(),
+                ..Default::default()
             },
             app_state,
         );

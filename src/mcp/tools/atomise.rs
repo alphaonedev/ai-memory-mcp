@@ -321,7 +321,16 @@ pub fn handle_atomise(
             (field_names::CURRENT_TIER): tier.as_str(),
             (field_names::REQUIRED_TIER): REQUIRED_TIER,
         })),
-        Err(AtomiseError::CuratorFailed(detail)) => Err(format!("CURATOR_FAILED: {detail}")),
+        // #3713 — the stable slug stays (the CLI / HTTP twins key on it); the
+        // detail behind it is the curator's own text and goes to the operator
+        // log through the ONE funnel, which renders the class to the caller.
+        Err(AtomiseError::CuratorFailed(detail)) => Err(format!(
+            "CURATOR_FAILED: {}",
+            crate::mcp::error_text::mcp_foreign_err(
+                "atomise curator",
+                crate::mcp::error_text::llm(detail)
+            )
+        )),
         Err(AtomiseError::SourceTooSmall) => Ok(json!({
             "source_too_small": true,
             "source_id": memory_id,
@@ -335,8 +344,22 @@ pub fn handle_atomise(
             // index without a second roundtrip.
             Err(format!("GOVERNANCE_REFUSED: {detail}"))
         }
-        Err(AtomiseError::SignerError(detail)) => Err(format!("SIGNER_ERROR: {detail}")),
-        Err(AtomiseError::DbError(detail)) => Err(format!("DB_ERROR: {detail}")),
+        Err(AtomiseError::SignerError(detail)) => {
+            tracing::error!(
+                target: crate::mcp::error_text::TRACE_TARGET,
+                context = "atomise signer",
+                detail,
+                "#3713: signer failure kept on the operator log"
+            );
+            Err("SIGNER_ERROR: signing the atomisation record failed".to_owned())
+        }
+        Err(AtomiseError::DbError(detail)) => Err(format!(
+            "DB_ERROR: {}",
+            crate::mcp::error_text::mcp_foreign_err(
+                "atomise store",
+                crate::errors::MemoryError::DatabaseError(detail)
+            )
+        )),
         // ARCH-5 (FX-6) — recursive-primitive refusal mirroring the
         // `REFLECTION_DEPTH_EXCEEDED` / `SYNTHESIS_DEPTH_EXCEEDED` wire
         // shape on the MCP surface (Err string prefixed with the stable

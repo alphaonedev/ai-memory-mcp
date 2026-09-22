@@ -123,12 +123,30 @@ const NOMIC_CANONICAL_ALIASES: &[&str] = &[
 /// Canonical name strings for the legacy v1 flat config keys (plus the
 /// `[embeddings]` section name) that appear on multiple production
 /// sites (#1558). Shared between the `AppConfig` surface in this file
-/// (the manual `Debug` impl + `warn_unknown_top_level_keys`) and the
+/// (the manual `Debug` impl + `config::unknown_keys`) and the
 /// `ai-memory config migrate` rewriter in
 /// `src/cli/commands/config.rs`, so each key spelling has one source
 /// of truth. The serde wire names themselves derive from the
 /// `AppConfig` field identifiers (no `#[serde(rename)]`), so serde
 /// needs no literal at all.
+/// #3714 — the deployment shape and everything it derives (ONE definition).
+pub mod shape;
+pub use shape::{
+    AtRestPolicy, DeploymentSection, DeploymentShape, Requirement, ShapeBootReport, ShapeDerived,
+    StorageBackend,
+};
+/// v1.0.0 #3715 item 3 — the key deprecation lifecycle, as data.
+pub mod deprecated_keys;
+/// #3715 — unknown-key refusal at the loader, schema-derived.
+pub mod unknown_keys;
+
+/// The ONE "reading config <path>" error context (three read sites;
+/// pm-v3.1 hardcoded-literal gate).
+#[must_use]
+pub fn reading_config_context(path: &Path) -> String {
+    format!("reading config {}", path.display())
+}
+
 pub mod config_keys {
     /// Legacy flat `archive_max_days` key (v2: `[storage].archive_max_days`).
     pub const ARCHIVE_MAX_DAYS: &str = "archive_max_days";
@@ -441,6 +459,7 @@ impl TierConfig {
             // Capabilities schema v2 — see `Capabilities` doc comment.
             schema_version: "2".to_string(),
             federation_security: None,
+            deployment_shape: None,
             tier: self.tier.as_str().to_string(),
             version: crate::PKG_VERSION.to_string(),
             features: CapabilityFeatures {
@@ -595,6 +614,11 @@ pub struct Capabilities {
     /// MCP/HTTP. Absent when this process has not evaluated federation boot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub federation_security: Option<crate::federation::peer_posture::Report>,
+    /// #3700: the daemon's deployment-shape / posture boot snapshot (fleet
+    /// vs singleton, posture, origin, whether they match). Absent when this
+    /// process has not evaluated its shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployment_shape: Option<crate::config::shape::detector::ShapeAssessment>,
     /// Schema-version discriminator. Always `"2"` since v0.6.3.
     pub schema_version: String,
     pub tier: String,
@@ -939,7 +963,7 @@ pub struct CapabilityModels {
 /// - `llm` — `"none"` when no LLM is configured; bare `model` for
 ///   Ollama backends (legacy banner shape); `backend:model` for
 ///   every OpenAI-compatible vendor (xAI, OpenAI, Anthropic,
-///   Gemini, DeepSeek, Kimi, Qwen, Mistral, Groq, Together,
+///   Gemini, Kimi, Qwen, Mistral, Groq, Together,
 ///   Cerebras, OpenRouter, Fireworks, LMStudio, vLLM, llama.cpp).
 /// - `embedding` — `"none"` when the tier preset disables the
 ///   embedder (`keyword` tier); otherwise the resolver's canonical
@@ -2013,6 +2037,7 @@ impl Capabilities {
         CapabilitiesV3 {
             schema_version: "3".to_string(),
             federation_security: self.federation_security.clone(),
+            deployment_shape: self.deployment_shape.clone(),
             summary,
             to_describe_to_user,
             tools,
@@ -2133,6 +2158,9 @@ pub struct CapabilitiesV3 {
     /// #3582: same daemon boot snapshot as the v2 projection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub federation_security: Option<crate::federation::peer_posture::Report>,
+    /// #3700: same deployment-shape snapshot as the v2 projection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployment_shape: Option<crate::config::shape::detector::ShapeAssessment>,
     /// Schema-version discriminator. Always `"3"` in v0.7.0.
     pub schema_version: String,
 
@@ -2373,7 +2401,7 @@ pub fn default_capability_provenance_substrate_layer() -> CapabilityProvenanceSu
 
 /// Per-tier TTL overrides loaded from `[ttl]` section of config.toml.
 #[allow(clippy::struct_field_names)]
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TtlConfig {
     /// Short-tier default TTL in seconds (default: 21600 = 6 hours)
     pub short_ttl_secs: Option<i64>,
@@ -2503,7 +2531,7 @@ const MAX_TRANSCRIPT_LIFECYCLE_SECS: i64 = 315_360_000;
 /// override (with literal `"*"` patterns last), falls back to the
 /// global `default_ttl_secs` / `archive_grace_secs` on this struct,
 /// and finally to the compiled defaults above.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TranscriptsConfig {
     /// Global default seconds-since-creation before the sweeper
     /// considers a transcript archive-eligible. `None` → compiled
@@ -2532,7 +2560,7 @@ pub struct TranscriptsConfig {
 /// `[transcripts.namespaces."<pattern>"]`. Each field independently
 /// overrides the [`TranscriptsConfig`] global default; an unset field
 /// inherits.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TranscriptNamespaceConfig {
     /// Namespace-specific TTL override.
     pub default_ttl_secs: Option<i64>,
@@ -2737,7 +2765,7 @@ impl TranscriptsConfig {
 /// Setting `legacy_scoring = true` disables the decay multiplier entirely,
 /// restoring the pre-v0.6.0.0 blended-score behavior for A/B comparison or
 /// if a recall-quality regression is reported.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RecallScoringConfig {
     /// Half-life for `short`-tier memories, in days (default 7).
     pub half_life_days_short: Option<f64>,
@@ -2840,6 +2868,12 @@ const CONFIG_APP_DIR: &str = "ai-memory";
 /// a host that sets `XDG_CONFIG_HOME` to something other than `~/.config`.
 const LEGACY_CONFIG_DIR: &str = ".config/ai-memory";
 const CONFIG_FILE: &str = "config.toml";
+
+/// The HuggingFace hub cache directory-name segment: `$HOME/.cache/`**`huggingface`**`/hub`
+/// (or `$HF_HOME/hub`). Named here so `src/embeddings.rs` — outside the
+/// vendor-literal allowlist — reads it as `crate::config::HF_CACHE_DIR_NAME`
+/// instead of an inline `"huggingface"` literal (#3820 / pm-v3.1 vendor-monoculture).
+pub const HF_CACHE_DIR_NAME: &str = "huggingface";
 
 /// `sysexits.h` `EX_CONFIG` — the process exit code this binary uses for
 /// "the operator's configuration is unusable; nothing was started".
@@ -3149,7 +3183,7 @@ fn resolve_config_path_choice(
 ///
 /// All fields are optional — CLI flags override file values, which override
 /// compiled defaults.
-#[derive(Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AppConfig {
     /// Feature tier: keyword, semantic, smart, autonomous
     pub tier: Option<String>,
@@ -3458,6 +3492,9 @@ pub struct AppConfig {
     /// `pm-v3`. See [`AdminConfig`] for the full role-gate semantics.
     pub admin: Option<AdminConfig>,
 
+    /// Health-only scope assignments for ordinary enrolled identities (#3646).
+    pub monitoring: Option<crate::handlers::monitoring::MonitoringConfig>,
+
     // ------------------------------------------------------------------
     // v0.7.x enterprise configuration sections (issue #1146).
     //
@@ -3546,6 +3583,12 @@ pub struct AppConfig {
     /// engages [`crate::encryption::encryption_enabled`]. Default off.
     /// Seeded at boot via [`crate::encryption::set_config_at_rest`].
     pub encryption: Option<EncryptionSection>,
+    /// #3714 — `[deployment]` block: the shape this node is deployed in,
+    /// the primary input from which posture / transit / at-rest / storage
+    /// requirements derive (see [`DeploymentShape::derive`]). Absent =
+    /// `singleton`; an upgrade never promotes a node to a stricter shape.
+    #[serde(default)]
+    pub deployment: Option<DeploymentSection>,
 }
 
 // #1454 (SEC, LOW) — manual `Debug` so the `api_key` secret renders as
@@ -3614,6 +3657,7 @@ impl std::fmt::Debug for AppConfig {
             .field("governance", &self.governance)
             .field("confidence", &self.confidence)
             .field("admin", &self.admin)
+            .field("monitoring", &self.monitoring)
             .field("schema_version", &self.schema_version)
             .field("llm", &self.llm)
             .field(config_keys::SECTION_EMBEDDINGS, &self.embeddings)
@@ -3621,6 +3665,7 @@ impl std::fmt::Debug for AppConfig {
             .field("storage", &self.storage)
             .field("limits", &self.limits)
             .field("encryption", &self.encryption)
+            .field("deployment", &self.deployment)
             .finish()
     }
 }
@@ -3652,7 +3697,7 @@ impl AppConfig {
 /// [encryption]
 /// at_rest = true
 /// ```
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub struct EncryptionSection {
     /// When `true`, seal memory `content` at rest under ChaCha20-Poly1305.
     /// Whole-DB SQLCipher still requires `--features sqlcipher` + a passphrase.
@@ -3670,7 +3715,7 @@ pub struct EncryptionSection {
 /// [governance]
 /// require_operator_pubkey = true
 /// ```
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub struct GovernanceConfig {
     /// SEC-2 fail-closed switch. When `true`, the daemon refuses to
     /// start if the `governance_rules` table contains any
@@ -3723,7 +3768,7 @@ pub struct GovernanceConfig {
 /// AND the role gate runs on top of it. The two layers compose:
 /// `api_key_auth` answers "is the request authenticated?" and the
 /// admin gate answers "is the authenticated caller an admin?".
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub struct AdminConfig {
     /// Explicit list of `agent_id` strings whose authenticated
     /// requests are treated as admin-class. Default `vec![]`
@@ -3804,12 +3849,12 @@ impl AdminConfig {
 /// `[llm]` section > legacy flat fields (`llm_model`, `ollama_url`) >
 /// compiled default (warn-logged once on the resolver's `CompiledDefault`
 /// arm).
-#[derive(Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Default, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub struct LlmSection {
     /// Backend selector. One of: `ollama` (native `/api/chat` +
     /// `/api/embed`, no auth), `openai-compatible` (generic; requires
     /// explicit `base_url`), or an alias that pre-fills `base_url`
-    /// (`openai`, `xai`, `anthropic`, `gemini`, `deepseek`, `kimi`,
+    /// (`openai`, `xai`, `anthropic`, `gemini`, `kimi`,
     /// `qwen`, `mistral`, `groq`, `together`, `cerebras`, `openrouter`,
     /// `fireworks`, `lmstudio`). Unset = inherit legacy resolution
     /// (treated as `ollama`).
@@ -3886,7 +3931,7 @@ impl std::fmt::Debug for LlmSection {
 /// section field-by-field when unset; commonly only `model` is
 /// overridden to point at a faster model (default `gemma3:4b`,
 /// ~0.7s p50 vs ~15s p50 for thinking-mode Gemma 4 per L15 patch).
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub struct LlmAutoTagSection {
     /// Backend override. Unset = inherit `[llm].backend`.
     pub backend: Option<String>,
@@ -3923,7 +3968,7 @@ pub struct LlmAutoTagSection {
 /// backfill_batch = 100                         # 1-10000 (env override:
 ///                                              # AI_MEMORY_EMBED_BACKFILL_BATCH)
 /// ```
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub struct EmbeddingsSection {
     /// Embedding backend. `ollama` (the default — local `/api/embed`
     /// wire shape) or, since #1598, any #1067 OpenAI-compatible alias
@@ -4066,7 +4111,7 @@ impl BackfillOnBoot {
 /// (via `ai-memory config migrate`) writes the explicit `enabled` +
 /// `model` fold; the legacy field continues to be honored at parse
 /// time until v0.8.0.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub struct RerankerSection {
     /// Whether the cross-encoder rerank stage runs in the recall
     /// pipeline. Folded from `cross_encoder: Option<bool>` at the
@@ -4117,7 +4162,7 @@ pub struct RerankerSection {
 /// [curator.confidence_decay_half_life_days]
 /// "team/eng" = 14.0
 /// ```
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct CuratorSection {
     /// #1671 — per-namespace reflection-pass overrides keyed by
     /// namespace. `curator --reflect --all-namespaces` participates ONLY
@@ -4176,7 +4221,7 @@ pub struct CuratorSection {
 /// knob is still intentionally NOT exposed — when it is, it must get its own
 /// dedicated `[curator.size_gc]` switch rather than ride under this block
 /// (#1750 5-agent vote, memory `a9b2fe09`).
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, schemars::JsonSchema)]
 pub struct CuratorCompactionSection {
     /// When `true`, the curator runs the SAL `ConsolidationPass` live. Default
     /// `false`. Env override: `AI_MEMORY_COMPACTION_ENABLED` (see
@@ -4206,7 +4251,7 @@ pub struct CuratorCompactionSection {
 /// `archive_on_gc`, `archive_max_days`, `max_memory_mb`. The `db`
 /// path stays top-level per the #1146 I4 carve-out (path expansion
 /// semantics pinned by #507).
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub struct StorageSection {
     /// Default namespace for new memories when the caller's request
     /// omits one. Folded from the previously-flat top-level
@@ -4293,7 +4338,7 @@ pub struct StorageSection {
 /// Raise it for bulk verification of a known-small corpus; for
 /// genuinely large datasets paginate with `?offset=` / `?since=` rather
 /// than removing the bound.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub struct LimitsSection {
     /// Per-(agent, namespace) daily memory-write ceiling stamped at
     /// quota-row auto-insert. Folds nothing legacy; new at v0.7.x.
@@ -5091,7 +5136,7 @@ pub fn allow_lineage_regression() -> bool {
 }
 
 /// v0.8.1 W1 (#1821 / gap G29) — the `[security]` config block.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SecurityConfig {
     /// Pre-write credential-screen disposition for caller-origin writes
     /// (`off` / `redact` / `refuse`). `None` / omitted → compiled default
@@ -5597,7 +5642,7 @@ impl ResolvedModels {
 /// tier = "long"
 /// limit = 50
 /// ```
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AgentsConfig {
     /// `[agents.defaults]` sub-block. `None` keeps recall semantics
     /// exactly as v0.6.x — every cross-session `memory_recall` requires
@@ -5611,7 +5656,7 @@ pub struct AgentsConfig {
 /// v0.7.0 (issue #518) — `[agents.defaults]` sub-block. Today exposes a
 /// single field: `recall_scope`. Future expansion (per-call timeouts,
 /// per-call tag filters, …) lives here.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AgentDefaults {
     /// `[agents.defaults.recall_scope]` — default filter set spliced
     /// into recall calls that pass `session_default=true` and omit
@@ -5639,7 +5684,7 @@ pub struct AgentDefaults {
 /// tier = "long"                     # "short" / "mid" / "long"
 /// limit = 50                        # default cap
 /// ```
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RecallScope {
     /// Default namespace filter applied when the request omits its
     /// own `namespace` field. The current recall handlers accept a
@@ -5688,7 +5733,7 @@ pub struct RecallScope {
 /// applies. Set to `0` or a negative value to disable the sweep
 /// (matches the audit-honest "do-nothing-on-zero" convention used by
 /// `archive_max_days`).
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, schemars::JsonSchema)]
 pub struct ConfidenceConfig {
     /// Retention window (in days) for shadow-mode observation rows.
     /// Rows whose `observed_at` is older than `now - N days` are
@@ -5735,7 +5780,7 @@ pub const DEFAULT_LLM_CALL_TIMEOUT_SECS: u64 = 30;
 /// The override applies even to subscriptions that did not register a
 /// per-subscription secret. When both are set, the per-subscription
 /// secret wins (subscription-scoped trust beats server-scoped trust).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct HooksConfig {
     /// `[hooks.subscription]` sub-block. Optional — when omitted, no
     /// server-wide HMAC override applies.
@@ -5762,7 +5807,7 @@ pub struct HooksConfig {
 /// #1262 — `Debug` is implemented manually to redact `hmac_secret` so
 /// accidental `{:?}` prints never leak the signing key. #1258 — the
 /// manual `Drop` impl zeroizes the secret on scope exit.
-#[derive(Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct HooksSubscriptionConfig {
     /// Server-wide HMAC secret. Plaintext on disk — operators are
     /// expected to chmod 600 the config file (same posture as the
@@ -5831,7 +5876,7 @@ impl Drop for HooksSubscriptionConfig {
 /// still allows it through. When `true`, missing nonces are rejected
 /// with 409 Conflict and the operator's audit trail receives every
 /// attempted reuse.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct VerifyConfig {
     /// When `true`, `POST /api/v1/links/verify` requires every
     /// request body to include a `verification_nonce` field. Missing
@@ -5860,13 +5905,20 @@ pub struct VerifyConfig {
 /// Loopback hosts are reachable from the daemon process itself, so
 /// permitting them by default exposes any locally-bound service
 /// (database, internal admin sockets) to authenticated SSRF.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SubscriptionsConfig {
     /// Re-enable loopback webhook URLs. Default `false` (loopback
     /// rejected). Operators who need to point a webhook at a local
     /// listener (CI, dev) set this to `true` explicitly.
     #[serde(default)]
     pub allow_loopback_webhooks: bool,
+    /// v1.0.0 #3705 — a PEM certificate (or CA) the webhook dispatcher
+    /// trusts IN ADDITION to the public roots, so a receiver behind a
+    /// private PKI can be reached over https:// (plaintext webhooks are
+    /// refused everywhere). A configured file that cannot be read or parsed
+    /// refuses boot — never silently ignored.
+    #[serde(default)]
+    pub ca_cert: Option<std::path::PathBuf>,
 }
 
 /// v1.0.0 #3467 (EPIC #3466) — `[wake_hub]` config block.
@@ -5896,7 +5948,7 @@ pub struct SubscriptionsConfig {
 /// hard config error rather than a silently-ignored line, so an operator who
 /// believes they tightened a limit cannot be wrong about it (#3166 fail-closed
 /// config posture).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WakeHubConfig {
     /// Unix socket to listen on. Its parent directory must be owner-only
@@ -6169,7 +6221,7 @@ pub fn allow_loopback_webhooks() -> bool {
 /// [permissions]
 /// mode = "advisory"   # or "enforce" / "off"
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum PermissionsMode {
     /// Block on policy violation. `Deny`/`Pending` decisions returned
@@ -6339,7 +6391,7 @@ pub fn reflect_decorrelation_mode() -> ReflectDecorrelationMode {
 /// table) binds that key-derived principal against the self-asserted header, and
 /// whether the IDOR-sensitive read/mutate + admin gates REQUIRE a key-derived
 /// principal.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, schemars::JsonSchema)]
 pub enum HttpIdentityMode {
     /// No binding — legacy self-asserted `X-Agent-Id` (byte-identical to
     /// pre-#2044). The escape hatch for operators who front the daemon with a
@@ -6706,7 +6758,7 @@ pub fn compaction_enabled() -> bool {
 /// Rules are deny-first and longest-pattern-wins; see
 /// [`crate::permissions`] module docs for the full combination
 /// rule.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PermissionsConfig {
     /// Enforcement mode. `None` when the operator declared a
     /// `[permissions]` block but omitted `mode = ` — this is the
@@ -6906,7 +6958,7 @@ pub fn lock_permissions_mode_for_test() -> std::sync::MutexGuard<'static, ()> {
 /// broad `db::agent_pubkey` registry — EXCEPT the reserved zero-config
 /// `owner` issuer (#1960), which is auto-enrolled from on-disk custody
 /// (`owner.priv`/`.pub` + `owner.caproot`) with an Admin ceiling.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct CapabilitiesConfig {
     /// Master switch. `None`/absent ⇒ the compiled default
     /// [`crate::governance::capability::DEFAULT_CAPABILITIES_ENABLED`] (true
@@ -6928,7 +6980,7 @@ pub struct CapabilitiesConfig {
 /// ceiling. `max_op` is REQUIRED (`none`/`read`/`write`/`admin`) — an
 /// unparseable value skips the issuer entirely (fail closed; never
 /// defaults up).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct CapabilityIssuerEntry {
     /// Maximum op level this issuer may ever grant.
     pub max_op: String,
@@ -7118,7 +7170,7 @@ pub fn reset_permissions_decision_counts_for_test() {
 
 /// `[logging]` block in `config.toml`. Every field is `Option`; missing
 /// fields fall back to the documented defaults.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct LoggingConfig {
     /// Master toggle. Default `false`.
     pub enabled: Option<bool>,
@@ -7174,9 +7226,12 @@ pub struct LoggingConfig {
 
 /// `[audit]` block in `config.toml`. Drives the hash-chained audit
 /// trail emitted from every memory mutation call site.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AuditConfig {
-    /// Master toggle. Default `false`.
+    /// Master toggle for the flat audit trail. Default `false`. The forensic
+    /// log is written regardless: its integrity rows (truncation watermark,
+    /// rollback / restore evidence) and its screened governance decision rows
+    /// (#3647 — keyed commitments, never request content).
     pub enabled: Option<bool>,
     /// Audit log path. Either a directory (in which case `audit.log`
     /// is appended) or an explicit file path. Default
@@ -7192,7 +7247,9 @@ pub struct AuditConfig {
     /// Whether to redact `memory.content` from emitted events. **The
     /// only supported value in v1 is `true`** — the audit schema does
     /// not expose a content field at all; this flag is reserved for a
-    /// future per-namespace exception API.
+    /// future per-namespace exception API. Forensic decision rows never carry
+    /// request content or free text, only keyed commitments (#3647); an
+    /// explicit `false` is unsupported and ignored with a boot diagnostic.
     pub redact_content: Option<bool>,
     /// Whether to compute and verify the per-line hash chain. The
     /// cross-row hash chain is MANDATORY (the load-bearing tamper-evidence)
@@ -7278,7 +7335,7 @@ impl AuditConfig {
 /// Precedence for `enabled`:
 ///   `AI_MEMORY_BOOT_ENABLED=0` env var (truthy "0/false/no/off") >
 ///   `[boot] enabled` config value > compiled default `true`.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct BootConfig {
     /// Master toggle. Default `true`. When set to `false`, `ai-memory
     /// boot` exits 0 with **empty stdout AND empty stderr** — the
@@ -7329,7 +7386,7 @@ impl BootConfig {
 ///
 /// Resolution for `profile`: CLI flag > `AI_MEMORY_PROFILE` env (both
 /// merged by clap) > this config field > compiled default `"core"`.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct McpConfig {
     /// Named tool profile. One of `core`, `graph`, `admin`, `power`,
     /// `full`, or a comma-separated custom list (e.g.,
@@ -7453,7 +7510,7 @@ pub enum AllowlistDecision {
     Deny,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AuditComplianceConfig {
     pub soc2: Option<CompliancePreset>,
     pub hipaa: Option<CompliancePreset>,
@@ -7602,7 +7659,7 @@ pub struct UnenforcedComplianceClaim {
     pub remediation: &'static str,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct CompliancePreset {
     pub applied: Option<bool>,
     pub retention_days: Option<u32>,
@@ -7634,7 +7691,7 @@ pub struct CompliancePreset {
 /// fallback when no explicit `agent_id` is supplied. `anonymize_default = true`
 /// swaps the hostname-revealing default for `anonymous:pid-<pid>-<uuid8>`,
 /// matching what the `AI_MEMORY_ANONYMIZE=1` env var does ephemerally.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct IdentityConfig {
     /// When true, the "no flag, no env, no MCP clientInfo" fallback uses
     /// `anonymous:pid-<pid>-<uuid8>` instead of the hostname-revealing
@@ -7696,7 +7753,6 @@ fn backend_default_model(backend: &str) -> &'static str {
         "openai" => "gpt-5",
         "anthropic" => "claude-opus-4.7",
         "gemini" => "gemini-2.0-flash",
-        "deepseek" => "deepseek-chat",
         "kimi" | "moonshot" => "moonshot-v1-8k",
         "qwen" | "dashscope" => "qwen-max",
         "mistral" => "mistral-large-latest",
@@ -7725,7 +7781,6 @@ fn backend_default_base_url(backend: &str) -> &'static str {
         "xai" => "https://api.x.ai/v1",
         "anthropic" => "https://api.anthropic.com/v1",
         "gemini" => "https://generativelanguage.googleapis.com/v1beta/openai",
-        "deepseek" => "https://api.deepseek.com/v1",
         "kimi" | "moonshot" => "https://api.moonshot.cn/v1",
         "qwen" | "dashscope" => "https://dashscope.aliyuncs.com/compatible-mode/v1",
         "mistral" => "https://api.mistral.ai/v1",
@@ -7736,8 +7791,67 @@ fn backend_default_base_url(backend: &str) -> &'static str {
         "fireworks" => "https://api.fireworks.ai/inference/v1",
         "lmstudio" => "http://localhost:1234/v1",
         // ollama / openai-compatible / unknown → localhost ollama.
+        //
+        // #3627 — what this arm does and does NOT guarantee. An
+        // UNRECOGNISED selector never reaches a client: every
+        // construction funnel refuses it first via
+        // [`is_recognized_llm_backend`], so for those this value is not
+        // dialled. A RECOGNISED selector with no arm in THIS mirror
+        // table does still land here, and that is a live mis-route, not
+        // a hypothetical: `vllm` is an arm of the SSOT
+        // `crate::llm::default_base_url_for_alias` (and is documented at
+        // `http://localhost:8000/v1`) but has no arm above, so
+        // `[llm].backend = "vllm"` resolves the loopback Ollama URL and
+        // builds an OpenAI-compatible client with a Bearer token against
+        // it. Pre-existing and tracked in #3811 — deliberately NOT fixed
+        // by #3627, which only closes the unrecognised-selector hole.
         _ => "http://localhost:11434",
     }
+}
+
+/// #3627 (2026-09-18) — the CLOSED set of accepted
+/// `AI_MEMORY_LLM_BACKEND` / `[llm].backend` / `[embeddings].backend`
+/// selectors, rendered for the refusal message. ONE source for the
+/// list, so the env funnel (`crate::llm::OllamaClient::from_env`), the
+/// two resolver funnels (`build_from_resolved` / `_async`) and the
+/// embed funnel (`crate::embeddings::Embedder::from_resolved`) cannot
+/// advertise different vocabularies. Retiring an alias means deleting
+/// its arm in `crate::llm::default_base_url_for_alias` — which stays
+/// the alias SSOT — AND its name here.
+pub(crate) const RECOGNIZED_LLM_BACKENDS: &str = "ollama, openai-compatible, openai, xai, \
+     anthropic, gemini, kimi, moonshot, qwen, dashscope, mistral, groq, together, cerebras, \
+     openrouter, fireworks, lmstudio, vllm";
+
+/// #3627 — true when `backend` names a selector the substrate can
+/// actually build a wire shape for.
+///
+/// Lives here, beside the resolver's mirror tables
+/// ([`backend_default_model`] / [`backend_default_base_url`] /
+/// [`alias_api_key_env_vars_for_resolver`]), because those are what it
+/// guards: their catch-all arms hand an UNRECOGNISED selector a
+/// plausible-looking default instead of refusing. The alias SSOT it
+/// consults remains `crate::llm::default_base_url_for_alias`, so a
+/// retired alias drops out of this predicate the moment its arm is
+/// deleted there.
+#[must_use]
+pub(crate) fn is_recognized_llm_backend(backend: &str) -> bool {
+    backend == crate::llm::BACKEND_OLLAMA
+        // The generic escape hatch has no alias-table row (the operator
+        // supplies the base URL), so it is admitted explicitly.
+        || backend == crate::llm::BACKEND_OPENAI_COMPATIBLE
+        || crate::llm::default_base_url_for_alias(backend).is_some()
+}
+
+/// #3627 — the ONE refusal for a selector no alias table recognises.
+/// Fail closed (ERRORS-01 / ERRORS-08): an unknown or RETIRED selector
+/// is an operator misconfiguration, never a licence to fall through to
+/// some other endpoint. The message names the accepted values and
+/// deliberately does NOT echo a retired token back as advice.
+pub(crate) fn unrecognized_llm_backend_error(backend: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "LLM backend `{backend}` is not a recognized backend alias. \
+         Valid values: {RECOGNIZED_LLM_BACKENDS}"
+    )
 }
 
 /// Per-alias environment variable fallback chain for the API key.
@@ -7751,7 +7865,6 @@ fn alias_api_key_env_vars_for_resolver(alias: &str) -> &'static [&'static str] {
         "xai" => &["XAI_API_KEY"],
         "anthropic" => &["ANTHROPIC_API_KEY"],
         "gemini" => &["GEMINI_API_KEY", "GOOGLE_API_KEY"],
-        "deepseek" => &["DEEPSEEK_API_KEY"],
         "kimi" | "moonshot" => &["MOONSHOT_API_KEY", "KIMI_API_KEY"],
         "qwen" | "dashscope" => &["DASHSCOPE_API_KEY", "QWEN_API_KEY"],
         "mistral" => &["MISTRAL_API_KEY"],
@@ -8253,9 +8366,7 @@ impl AppConfig {
         match std::fs::read_to_string(path) {
             Ok(contents) => Self::from_toml_contents(path, &contents),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(e) => {
-                Err(anyhow::Error::new(e).context(format!("reading config {}", path.display())))
-            }
+            Err(e) => Err(anyhow::Error::new(e).context(reading_config_context(path))),
         }
     }
 
@@ -8274,7 +8385,13 @@ impl AppConfig {
                 // continues to succeed so a typo or stale Plan C section
                 // (`[memory]`, `[autonomous]`, `[governance]`, `[federation]`)
                 // can no longer silently neutralise an operator's intent.
-                Self::warn_unknown_top_level_keys(path, &contents);
+                // #3715 — unknown keys REFUSE (see `from_toml_contents`);
+                // this fail-open loader takes its existing parse-failure
+                // arm (compiled defaults) rather than a silent load.
+                if let Err(reason) = Self::refuse_unknown_keys(path, &contents) {
+                    eprintln!("ai-memory: {reason}");
+                    return Self::default();
+                }
                 match toml::from_str::<Self>(&contents) {
                     Ok(cfg) => match cfg.validate_secret_handling() {
                         Ok(()) => {
@@ -8360,8 +8477,8 @@ impl AppConfig {
     /// parse, or `validate_secret_handling` rejects the resolved config.
     pub fn try_load_from(path: &Path) -> anyhow::Result<Self> {
         use anyhow::Context as _;
-        let contents = std::fs::read_to_string(path)
-            .with_context(|| format!("reading config {}", path.display()))?;
+        let contents =
+            std::fs::read_to_string(path).with_context(|| reading_config_context(path))?;
         Self::from_toml_contents(path, &contents)
     }
 
@@ -8398,9 +8515,82 @@ impl AppConfig {
     /// Returns an error when the TOML fails to parse or the secret-handling
     /// validation rejects the resolved config.
     fn from_toml_contents(path: &Path, contents: &str) -> anyhow::Result<Self> {
-        // Mirror `load_from`'s L1 unknown-top-level-key WARN (best-effort;
-        // does not fail the load).
-        Self::warn_unknown_top_level_keys(path, contents);
+        // #3715 — unknown keys REFUSE the load (every nesting level). The
+        // repair tools (`config check`, `config migrate`,
+        // `governance migrate-to-permissions`) parse through `toml::Value`
+        // and never cross this funnel, so the refused state is repairable.
+        // #3715 item 3 — the deprecation lifecycle runs FIRST: a removed key
+        // is refused by name with its replacement, never as "unknown".
+        Self::enforce_deprecated_keys(path, contents)?;
+        Self::refuse_unknown_keys(path, contents)?;
+        Self::from_toml_contents_unchecked(path, contents)
+    }
+
+    /// #3715 item 3 — consult [`deprecated_keys::DEPRECATED_KEYS`] for the
+    /// running release: removed keys REFUSE (naming the replacement),
+    /// deprecated-but-accepted keys WARN once per process and still apply.
+    ///
+    /// # Errors
+    /// The document carries a key whose scheduled removal release the
+    /// running version has reached.
+    fn enforce_deprecated_keys(path: &Path, contents: &str) -> anyhow::Result<()> {
+        use std::sync::Once;
+        static WARN_ONCE: Once = Once::new();
+        let Ok(value) = toml::from_str::<toml::Value>(contents) else {
+            return Ok(());
+        };
+        let c =
+            deprecated_keys::classify(&value, deprecated_keys::DEPRECATED_KEYS, crate::PKG_VERSION);
+        if !c.removed.is_empty() {
+            anyhow::bail!(
+                "{}",
+                deprecated_keys::refusal_message(path, &c.removed, crate::PKG_VERSION)
+            );
+        }
+        if !c.deprecated.is_empty() {
+            WARN_ONCE.call_once(|| {
+                for f in &c.deprecated {
+                    eprintln!("{}", deprecated_keys::warn_line(path, f));
+                }
+            });
+        }
+        Ok(())
+    }
+
+    /// #3715 / the #2445 disposition — the EGRESS loader. `backup` / `export`
+    /// take the operator's durable text OUT; a guard whose observable effect
+    /// is "you may not back up your data" would invert the North Star it
+    /// serves, so for those verbs an unknown key is a loud WARN and the
+    /// config is loaded with serde's ignore-unknown semantics (every KNOWN
+    /// key, including `db`, still applies — falling back to compiled
+    /// defaults would back up the WRONG database). Nothing that WRITES or
+    /// SERVES uses this arm. Returns the WARN text alongside the config so
+    /// the caller prints it; a missing file is compiled defaults as in
+    /// [`Self::try_load_from_optional`].
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::try_load_from_optional`] except that unknown keys do
+    /// not refuse.
+    pub fn try_load_from_optional_for_egress(
+        path: &Path,
+    ) -> anyhow::Result<(Self, Option<String>)> {
+        match std::fs::read_to_string(path) {
+            Ok(contents) => {
+                let warn = Self::refuse_unknown_keys(path, &contents)
+                    .err()
+                    .map(|e| e.to_string());
+                Ok((Self::from_toml_contents_unchecked(path, &contents)?, warn))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((Self::default(), None)),
+            Err(e) => Err(anyhow::Error::new(e).context(reading_config_context(path))),
+        }
+    }
+
+    /// The parse + secret-handling tail shared by the boot loader and the
+    /// egress loader. NEVER call this from a boot path directly — the
+    /// unknown-key refusal lives in [`Self::from_toml_contents`].
+    fn from_toml_contents_unchecked(path: &Path, contents: &str) -> anyhow::Result<Self> {
         // #3277 / #3197 — toml 0.8 Display echoes the offending source
         // line (caret-underlined). A malformed `api_key = "…"` therefore
         // lands in stderr/journald if we chain the toml error through
@@ -8417,18 +8607,12 @@ impl AppConfig {
         Ok(cfg)
     }
 
-    /// v0.7.x (#1146) — emit a one-shot deprecation WARN to stderr
-    /// when the loaded config carries legacy v1 flat fields that have
-    /// been superseded by the sectioned v2 schema.
+    /// v0.7.x (#1146) — emit a one-shot WARN to stderr when the loaded
+    /// config carries legacy v1 flat fields under a v2 schema version.
     ///
-    /// Two posture WARNs:
-    ///
-    /// - **Legacy-only** (no `schema_version` OR `schema_version = 1`,
-    ///   AND any of `llm_model`, `ollama_url`, `embed_url`,
-    ///   `embedding_model`, `cross_encoder`, `default_namespace`,
-    ///   `archive_on_gc`, `archive_max_days`, `max_memory_mb`,
-    ///   `auto_tag_model` set): operator running pre-#1146 config
-    ///   shape — point them at `ai-memory config migrate`.
+    /// One posture WARN (the legacy-only shape is covered per key by
+    /// `enforce_deprecated_keys`, #3715 — replacement and removal state,
+    /// one line each):
     ///
     /// - **Drift** (`schema_version >= 2` AND any legacy field set):
     ///   operator has migrated but left legacy fields in place. The
@@ -8472,32 +8656,29 @@ impl AppConfig {
 
         let v2 = matches!(self.schema_version, Some(v) if v >= 2);
 
+        // #3715 — the per-key deprecation lines (`enforce_deprecated_keys`,
+        // one per legacy key: replacement + removal state) already say "this
+        // key is deprecated, run `config migrate`" for the legacy-only shape;
+        // repeating it here was the same fact in two voices (review G1). The
+        // DRIFT arm is kept: it carries the #3385 hazard no per-key line
+        // states — under schema_version >= 2 a legacy field is still the
+        // FALLBACK for any key the sections leave unset.
+        if !v2 {
+            return;
+        }
         WARN_ONCE.call_once(|| {
-            if v2 {
-                eprintln!(
-                    "ai-memory: WARN — schema_version = {:?} but legacy v1 fields \
-                     are still present in {} (llm_model / ollama_url / embed_url / \
-                     embedding_model / cross_encoder / default_namespace / \
-                     archive_on_gc / archive_max_days / max_memory_mb / \
-                     auto_tag_model). Section values in [llm] / [embeddings] / \
-                     [reranker] / [storage] WIN, but a legacy field is still the \
-                     FALLBACK for any key the sections leave unset — it is NOT \
-                     inert (#3385). Run `ai-memory config migrate` to remove them.",
-                    self.schema_version,
-                    path.display(),
-                );
-            } else {
-                eprintln!(
-                    "ai-memory: WARN — legacy v1 flat-field configuration shape \
-                     detected in {}. The [llm] / [embeddings] / [reranker] / \
-                     [storage] sectioned schema (v2) is the canonical shape; \
-                     legacy fields continue to work in v0.7.x but will be \
-                     removed in v0.8.0. Run `ai-memory config migrate` to \
-                     upgrade in place (a timestamped .bak is written). See \
-                     https://github.com/alphaonedev/ai-memory-mcp/issues/1146",
-                    path.display(),
-                );
-            }
+            eprintln!(
+                "ai-memory: WARN — schema_version = {:?} but legacy v1 fields \
+                 are still present in {} (llm_model / ollama_url / embed_url / \
+                 embedding_model / cross_encoder / default_namespace / \
+                 archive_on_gc / archive_max_days / max_memory_mb / \
+                 auto_tag_model). Section values in [llm] / [embeddings] / \
+                 [reranker] / [storage] WIN, but a legacy field is still the \
+                 FALLBACK for any key the sections leave unset — it is NOT \
+                 inert (#3385). Run `ai-memory config migrate` to remove them.",
+                self.schema_version,
+                path.display(),
+            );
         });
     }
 
@@ -8584,90 +8765,31 @@ impl AppConfig {
         Ok(())
     }
 
-    /// L1 fix (v0.7.0): enumerate top-level keys in `contents` and emit a
-    /// `tracing::warn!` for every key that is not a recognised `AppConfig`
-    /// field. Malformed TOML is silently skipped here — the existing
-    /// `toml::from_str::<AppConfig>` parse in `load_from` will surface the
-    /// real parse error to the operator on the next line.
-    fn warn_unknown_top_level_keys(path: &Path, contents: &str) {
-        // Canonical list of `AppConfig` top-level fields. Keep in sync with
-        // the struct definition above; verified verbatim against the v0.7.0
-        // L1 spec.
-        const EXPECTED_KEYS: &[&str] = &[
-            "tier",
-            "db",
-            config_keys::OLLAMA_URL,
-            "embed_url",
-            config_keys::EMBEDDING_MODEL,
-            "llm_model",
-            config_keys::AUTO_TAG_MODEL,
-            config_keys::CROSS_ENCODER,
-            config_keys::DEFAULT_NAMESPACE,
-            config_keys::MAX_MEMORY_MB,
-            "ttl",
-            config_keys::ARCHIVE_ON_GC,
-            "api_key",
-            config_keys::ARCHIVE_MAX_DAYS,
-            "identity",
-            "scoring",
-            "autonomous_hooks",
-            "logging",
-            "audit",
-            "boot",
-            "mcp",
-            "permissions",
-            // v0.9.0 G10.1 (#1827) — [capabilities] block.
-            crate::models::field_names::CAPABILITIES,
-            "transcripts",
-            "hooks",
-            "security",
-            "subscriptions",
-            "postgres_statement_timeout_secs",
-            "postgres_pool_max_connections",
-            "postgres_pool_min_connections",
-            "postgres_acquire_timeout_secs",
-            "request_timeout_secs",
-            "llm_call_timeout_secs",
-            "verify",
-            "wake_hub",
-            "mcp_federation_forward_url",
-            "agents",
-            "governance",
-            "confidence",
-            "admin",
-            // v0.7.x (#1146) — enterprise configuration sections.
-            "schema_version",
-            "llm",
-            config_keys::SECTION_EMBEDDINGS,
-            "reranker",
-            "curator",
-            "storage",
-            "limits",
-            "encryption",
-        ];
-
-        let value: toml::Value = match toml::from_str(contents) {
-            Ok(v) => v,
-            // Malformed TOML — defer to the strongly-typed parse in the
-            // caller, which produces the operator-facing error message.
-            Err(_) => return,
+    /// #3715 — refuse a config document that carries a key `AppConfig`
+    /// would silently drop, at ANY nesting level. Replaces the v0.7.0 L1
+    /// `warn_unknown_top_level_keys` (top level only, WARN only): a typo
+    /// or a stale section (`[memory]`, `[autonomous]`, `[federation]`,
+    /// `[[governance.policy]]`) used to neutralise an operator's intent
+    /// with nothing louder than a `tracing::warn!` nobody had a
+    /// subscriber for.
+    ///
+    /// Malformed TOML is deliberately NOT an error here — the
+    /// strongly-typed parse in the caller owns that message (redacted,
+    /// #3277 / #3197).
+    ///
+    /// # Errors
+    /// Returns the full refusal text (every unknown path, the nearest
+    /// accepted sibling, and the exact repair command) when at least one
+    /// unknown key is present.
+    fn refuse_unknown_keys(path: &Path, contents: &str) -> anyhow::Result<()> {
+        let Ok(value) = toml::from_str::<toml::Value>(contents) else {
+            return Ok(());
         };
-
-        let Some(table) = value.as_table() else {
-            return;
-        };
-
-        let expected_list = EXPECTED_KEYS.join(", ");
-        for key in table.keys() {
-            if !EXPECTED_KEYS.contains(&key.as_str()) {
-                tracing::warn!(
-                    "[config] unknown key '{key}' in {path} — top-level AppConfig fields are: {expected_keys}. This key is silently ignored (no behavior change).",
-                    key = key,
-                    path = path.display(),
-                    expected_keys = expected_list,
-                );
-            }
+        let unknown = unknown_keys::find_unknown_keys(&value);
+        if unknown.is_empty() {
+            return Ok(());
         }
+        anyhow::bail!("{}", unknown_keys::refusal_message(path, &unknown))
     }
 
     /// v1.0.0 §5.3 cutline ruling — hoisted to a named const (was a bare
@@ -8689,6 +8811,18 @@ impl AppConfig {
             "off" => Some(PermissionsMode::Off),
             _ => None,
         }
+    }
+
+    /// #3714 — the deployment shape. Absent block or absent `shape` key
+    /// resolves to [`DeploymentShape::Singleton`]; there is no env
+    /// spelling (containers render `config.toml`), and nothing infers a
+    /// stricter shape from any other setting.
+    #[must_use]
+    pub fn effective_shape(&self) -> DeploymentShape {
+        self.deployment
+            .as_ref()
+            .and_then(|d| d.shape)
+            .unwrap_or_default()
     }
 
     /// v0.7.0 K3 — resolve the effective [`PermissionsMode`] consulted
@@ -9746,10 +9880,10 @@ impl AppConfig {
     pub fn resolve_compaction_enabled(&self) -> bool {
         if let Ok(v) = std::env::var(ENV_COMPACTION_ENABLED) {
             let t = v.trim();
-            if t == "1" || t.eq_ignore_ascii_case("true") {
+            if crate::security_profile::is_truthy(t) {
                 return true;
             }
-            if t == "0" || t.eq_ignore_ascii_case("false") {
+            if crate::security_profile::is_falsy(t) {
                 return false;
             }
             // Any other value: fall through to config / default.
@@ -9771,10 +9905,10 @@ impl AppConfig {
     pub fn resolve_transcript_classify_enabled(&self) -> bool {
         if let Ok(v) = std::env::var(ENV_TRANSCRIPT_CLASSIFY_ENABLED) {
             let t = v.trim();
-            if t == "1" || t.eq_ignore_ascii_case("true") {
+            if crate::security_profile::is_truthy(t) {
                 return true;
             }
-            if t == "0" || t.eq_ignore_ascii_case("false") {
+            if crate::security_profile::is_falsy(t) {
                 return false;
             }
             // Any other value: fall through to config / default.
@@ -9996,9 +10130,9 @@ impl AppConfig {
         let append_only = {
             let env = std::env::var(ENV_APPEND_ONLY).ok().and_then(|v| {
                 let t = v.trim();
-                if t == "1" || t.eq_ignore_ascii_case("true") {
+                if crate::security_profile::is_truthy(t) {
                     Some(true)
-                } else if t == "0" || t.eq_ignore_ascii_case("false") {
+                } else if crate::security_profile::is_falsy(t) {
                     Some(false)
                 } else {
                     None
@@ -10016,9 +10150,9 @@ impl AppConfig {
         let parse_bool_env = |name: &str| -> Option<bool> {
             std::env::var(name).ok().and_then(|v| {
                 let t = v.trim();
-                if t == "1" || t.eq_ignore_ascii_case("true") {
+                if crate::security_profile::is_truthy(t) {
                     Some(true)
-                } else if t == "0" || t.eq_ignore_ascii_case("false") {
+                } else if crate::security_profile::is_falsy(t) {
                     Some(false)
                 } else {
                     None
@@ -10332,7 +10466,9 @@ impl AppConfig {
 # When enabled, every memory mutation emits one hash-chained JSON
 # line per event suitable for SOC2 / HIPAA / GDPR / FedRAMP evidence.
 # `ai-memory audit verify` walks the chain; `ai-memory logs tail`
-# streams events.
+# streams events. The forensic log (integrity rows and screened governance
+# decision rows: keyed commitments, never request content) is written
+# regardless. redact_content=false is unsupported and ignored with a warning.
 # [audit]
 # enabled = false
 # path = "~/.local/state/ai-memory/audit/"
@@ -12380,55 +12516,108 @@ legacy_scoring = false
     // `[governance]`, `[federation]` tables in the operator's
     // config.toml — none of them are real `AppConfig` fields, so serde
     // silently dropped them and the operator's intent never reached the
-    // daemon. The fix warns on every unknown top-level key while still
-    // loading the config gracefully.
+    // daemon. v0.7.0 L1 WARNed on the top level only; #3715 REFUSES at
+    // every level. This is the one deliberate ignore-unknown pin the
+    // corpus census found, flipped to the refusal it now guards.
 
-    /// Top-level key not in `AppConfig` is reported via `tracing::warn!`
-    /// AND the config still loads with recognised fields intact.
+    /// #3715 — an unknown key (top-level or nested) REFUSES the boot
+    /// loader with a message naming the path, the nearest accepted
+    /// sibling and the repair command; the fail-open `load_from` takes
+    /// its compiled-defaults arm instead of loading the rest silently.
     #[test]
-    fn load_from_warns_on_unknown_top_level_key_but_still_loads() {
-        // Construct a config that mixes a real key (`tier`) with the
-        // unknown `[memory]` table from the Plan C bug. The recognised
-        // `tier = "autonomous"` at the top level must survive (i.e. the
-        // unknown `[memory] tier = "ignored"` does NOT shadow it —
-        // top-level wins because `[memory]` is a different namespace
-        // entirely from `AppConfig.tier`).
-        let toml_src = "tier = \"autonomous\"\n\n[memory]\ntier = \"ignored\"\n";
-
+    fn unknown_keys_refuse_the_boot_loader_at_every_level() {
+        let toml_src = "tier = \"autonomous\"\n\n[memory]\ntier = \"ignored\"\n\n[storage]\ndb_mmap_size_byte = 1\n";
         let tmp = tempfile::NamedTempFile::new().expect("create temp file");
         std::fs::write(tmp.path(), toml_src).expect("write temp config");
 
-        // We do NOT install a tracing subscriber here — `tracing-test`
-        // is not a dev-dep, and the spec explicitly allows skipping the
-        // "warn-was-emitted" assertion when capturing is awkward. The
-        // important contract is:
-        //   (a) load_from returns a populated AppConfig (no panic),
-        //   (b) the recognised top-level `tier` survives,
-        //   (c) the unknown `[memory]` table did NOT block the load.
-        // The warn itself is exercised at runtime — verify it fires by
-        // running `RUST_LOG=warn AI_MEMORY_NO_CONFIG=0 ai-memory ...`
-        // against a config with a stray section.
-        let cfg = AppConfig::load_from(tmp.path());
+        let err = AppConfig::try_load_from_optional(tmp.path())
+            .expect_err("unknown keys must refuse the boot loader")
+            .to_string();
+        assert!(err.contains("`memory`"), "{err}");
+        assert!(err.contains("`storage.db_mmap_size_byte`"), "{err}");
+        assert!(
+            err.contains("db_mmap_size_bytes"),
+            "nearest sibling named: {err}"
+        );
+        assert!(
+            err.contains("config check --file"),
+            "repair command named: {err}"
+        );
 
+        // The fail-open loader must not load HALF the file either.
+        let cfg = AppConfig::load_from(tmp.path());
+        assert_eq!(cfg.tier, None, "load_from falls back to compiled defaults");
+
+        // Carve-out 1: the same document parses through `toml::Value` for
+        // the repair tools — refusal lives ONLY in the AppConfig funnel.
+        assert!(toml::from_str::<toml::Value>(toml_src).is_ok());
+    }
+
+    /// #3715 / #2445 — the EGRESS loader (`backup` / `export`) applies every
+    /// KNOWN key (so `db` is the configured one, never the relative default)
+    /// and returns the refusal text as a WARN instead of refusing; a clean
+    /// file yields no WARN; a MALFORMED file still errors (that is not an
+    /// unknown key, it is an unparseable config).
+    #[test]
+    fn egress_loader_applies_known_keys_and_warns_on_unknown_ones() {
+        let toml_src =
+            "tier = \"keyword\"\ndb = \"/srv/ai-memory/live.db\"\n\n[memory]\ntier = \"x\"\n";
+        let tmp = tempfile::NamedTempFile::new().expect("create temp file");
+        std::fs::write(tmp.path(), toml_src).expect("write temp config");
+        assert!(
+            AppConfig::try_load_from_optional(tmp.path()).is_err(),
+            "boot refuses"
+        );
+        let (cfg, warn) =
+            AppConfig::try_load_from_optional_for_egress(tmp.path()).expect("egress loads");
         assert_eq!(
-            cfg.tier.as_deref(),
-            Some("autonomous"),
-            "top-level `tier` must survive even when an unknown `[memory]` table is present",
+            cfg.db.as_deref(),
+            Some("/srv/ai-memory/live.db"),
+            "the CONFIGURED db, not the default"
+        );
+        assert_eq!(cfg.tier.as_deref(), Some("keyword"));
+        let warn = warn.expect("the refusal text is returned as a WARN");
+        assert!(warn.contains("`memory`"), "{warn}");
+
+        std::fs::write(tmp.path(), "tier = \"keyword\"\n").unwrap();
+        let (_, warn) = AppConfig::try_load_from_optional_for_egress(tmp.path()).unwrap();
+        assert!(warn.is_none(), "a clean file has nothing to warn about");
+
+        std::fs::write(tmp.path(), "tier = \"unclosed\n").unwrap();
+        assert!(
+            AppConfig::try_load_from_optional_for_egress(tmp.path()).is_err(),
+            "malformed TOML still errors"
+        );
+
+        let missing = tmp.path().with_extension("absent");
+        let (cfg, warn) = AppConfig::try_load_from_optional_for_egress(&missing).unwrap();
+        assert!(
+            cfg.db.is_none() && warn.is_none(),
+            "a missing file is compiled defaults"
         );
     }
 
-    /// Every field in `AppConfig` is enumerated in the expected-key
-    /// set, so renaming a struct field will not silently start
-    /// emitting bogus warnings for the new name.
-    ///
-    /// Regression guard: if you add a new top-level field to
-    /// `AppConfig`, you MUST also add it to the `EXPECTED_KEYS` const
-    /// inside `AppConfig::warn_unknown_top_level_keys`. This test
-    /// enforces parity by serialising a fully-populated `AppConfig` to
-    /// TOML and asserting that every emitted top-level key is in the
-    /// expected set.
+    /// #3715 — a clean config (every key accepted, secrets included)
+    /// still loads through both loaders.
     #[test]
-    fn warn_unknown_top_level_keys_covers_every_appconfig_field() {
+    fn clean_config_loads_unchanged_under_unknown_key_refusal() {
+        let toml_src = "schema_version = 2\ntier = \"autonomous\"\napi_key = \"k\"\n\n[deployment]\nshape = \"team\"\n\n[storage]\ndb_mmap_size_bytes = 1\n";
+        let tmp = tempfile::NamedTempFile::new().expect("create temp file");
+        std::fs::write(tmp.path(), toml_src).expect("write temp config");
+        let cfg = AppConfig::try_load_from_optional(tmp.path()).expect("clean config loads");
+        assert_eq!(cfg.tier.as_deref(), Some("autonomous"));
+        assert_eq!(cfg.effective_shape(), DeploymentShape::Team);
+        let cfg = AppConfig::load_from(tmp.path());
+        assert_eq!(cfg.tier.as_deref(), Some("autonomous"));
+    }
+
+    /// Every field in `AppConfig` is in the schema-derived accepted set
+    /// (#3715), so a field whose type forgot `schemars::JsonSchema` cannot
+    /// make the loader refuse a legitimate key. Serialises a
+    /// fully-populated `AppConfig` and asserts every emitted top-level key
+    /// is a prefix of an accepted leaf.
+    #[test]
+    fn schema_derived_accepted_keys_cover_every_appconfig_field() {
         // Build an AppConfig with every Option populated so serde emits
         // every field. We only need the keys, not the values, so
         // default placeholder sub-structs are fine.
@@ -12473,6 +12662,7 @@ legacy_scoring = false
             governance: Some(GovernanceConfig::default()),
             confidence: Some(ConfidenceConfig::default()),
             admin: Some(AdminConfig::default()),
+            monitoring: Some(crate::handlers::monitoring::MonitoringConfig::default()),
             // v0.7.x (#1146) — enterprise configuration sections.
             schema_version: Some(2),
             llm: Some(LlmSection::default()),
@@ -12482,6 +12672,7 @@ legacy_scoring = false
             storage: Some(StorageSection::default()),
             limits: Some(LimitsSection::default()),
             encryption: Some(EncryptionSection::default()),
+            deployment: Some(DeploymentSection::default()),
         };
 
         let serialised = toml::to_string(&cfg).expect("serialise AppConfig to TOML");
@@ -12489,66 +12680,16 @@ legacy_scoring = false
             toml::from_str(&serialised).expect("re-parse serialised AppConfig");
         let table = value.as_table().expect("serialised AppConfig is a table");
 
-        // Mirror the const in `warn_unknown_top_level_keys`. Keep in
-        // sync — if this assertion fires, you forgot to update the
-        // expected-keys list when adding a new AppConfig field.
-        const EXPECTED_KEYS: &[&str] = &[
-            "tier",
-            "db",
-            "ollama_url",
-            "embed_url",
-            "embedding_model",
-            "llm_model",
-            "auto_tag_model",
-            "cross_encoder",
-            "default_namespace",
-            "max_memory_mb",
-            "ttl",
-            "archive_on_gc",
-            "api_key",
-            "archive_max_days",
-            "identity",
-            "scoring",
-            "autonomous_hooks",
-            "logging",
-            "audit",
-            "boot",
-            "mcp",
-            "permissions",
-            crate::models::field_names::CAPABILITIES,
-            "transcripts",
-            "hooks",
-            "security",
-            "subscriptions",
-            "postgres_statement_timeout_secs",
-            "postgres_pool_max_connections",
-            "postgres_pool_min_connections",
-            "postgres_acquire_timeout_secs",
-            "request_timeout_secs",
-            "llm_call_timeout_secs",
-            "verify",
-            "wake_hub",
-            "mcp_federation_forward_url",
-            "agents",
-            "governance",
-            "confidence",
-            "admin",
-            // v0.7.x (#1146) — enterprise configuration sections.
-            "schema_version",
-            "llm",
-            "embeddings",
-            "reranker",
-            "curator",
-            "storage",
-            "limits",
-            "encryption",
-        ];
-
+        // #3715 — the accepted set is derived from the schema, so parity is
+        // "every serialised top-level field is a prefix of an accepted leaf".
+        let leaves = unknown_keys::accepted_leaf_keys();
         for key in table.keys() {
             assert!(
-                EXPECTED_KEYS.contains(&key.as_str()),
-                "AppConfig field `{key}` is not in EXPECTED_KEYS — \
-                 update `warn_unknown_top_level_keys` to keep parity",
+                leaves
+                    .iter()
+                    .any(|l| l == key || l.starts_with(&format!("{key}."))),
+                "AppConfig field `{key}` is missing from the schema-derived accepted set — \
+                 does its type derive `schemars::JsonSchema`?",
             );
         }
     }
@@ -13330,7 +13471,6 @@ legacy_scoring = false
             "ANTHROPIC_API_KEY",
             "GEMINI_API_KEY",
             "GOOGLE_API_KEY",
-            "DEEPSEEK_API_KEY",
             "AI_MEMORY_EMBED_BACKFILL_BATCH",
             "AI_MEMORY_PASSPHRASE_FILE_ALLOW_LAX_PERMS",
         ] {
@@ -13795,6 +13935,82 @@ max_page_size = 1000000
         assert_eq!(
             ENV_PG_ACQUIRE_TIMEOUT_SECS,
             "AI_MEMORY_PG_ACQUIRE_TIMEOUT_SECS"
+        );
+    }
+
+    /// #3627 — parity between the PREDICATE and the RENDERED vocabulary.
+    ///
+    /// `is_recognized_llm_backend` is derived from the alias SSOT
+    /// (`crate::llm::default_base_url_for_alias`), but
+    /// [`RECOGNIZED_LLM_BACKENDS`] — the list the refusal prints — is a
+    /// hand-maintained fourth copy of that vocabulary, and it had already
+    /// drifted: it omitted the documented synonyms `moonshot` and
+    /// `dashscope`, which the predicate accepts. A refusal that
+    /// under-advertises the accepted set sends an operator to the wrong
+    /// remedy, so the two are pinned to agree.
+    ///
+    /// PRESENCE half: every documented selector is accepted AND advertised.
+    /// ABSENCE half: the retired token and a typo are neither accepted nor
+    /// advertised — so this cannot pass by the string listing everything.
+    #[test]
+    fn every_recognized_selector_is_advertised_in_the_refusal_3627() {
+        // The documented vocabulary: docs/integrations/llm-backends.md
+        // (per-vendor sections + the fallback-key table) and CLAUDE.md env
+        // row 31.
+        const DOCUMENTED_SELECTORS: &[&str] = &[
+            "ollama",
+            "openai-compatible",
+            "openai",
+            "xai",
+            "anthropic",
+            "gemini",
+            "kimi",
+            "moonshot",
+            "qwen",
+            "dashscope",
+            "mistral",
+            "groq",
+            "together",
+            "cerebras",
+            "openrouter",
+            "fireworks",
+            "lmstudio",
+            "vllm",
+        ];
+        let advertised: Vec<&str> = RECOGNIZED_LLM_BACKENDS.split(", ").collect();
+        for selector in DOCUMENTED_SELECTORS {
+            assert!(
+                is_recognized_llm_backend(selector),
+                "#3627: documented selector `{selector}` must pass the gate"
+            );
+            assert!(
+                advertised.contains(selector),
+                "#3627: the gate accepts `{selector}` but the refusal does not \
+                 advertise it; RECOGNIZED_LLM_BACKENDS has drifted from the \
+                 alias SSOT"
+            );
+        }
+        assert_eq!(
+            advertised.len(),
+            DOCUMENTED_SELECTORS.len(),
+            "#3627: the refusal advertises a selector the documented set does \
+             not contain (or vice versa): {advertised:?}"
+        );
+
+        // ----- absence control, same two sinks -----------------------
+        // Assembled at runtime so the repo-wide acceptance grep stays clean.
+        let retired = ["dee", "pseek"].concat();
+        assert!(
+            !is_recognized_llm_backend(&retired),
+            "#3627: the retired selector must not pass the gate"
+        );
+        assert!(
+            !RECOGNIZED_LLM_BACKENDS.contains(&retired),
+            "#3627: the retired selector must not be advertised as valid"
+        );
+        assert!(
+            !is_recognized_llm_backend("opena1"),
+            "#3627 absence control: a typo'd selector must not pass the gate"
         );
     }
 

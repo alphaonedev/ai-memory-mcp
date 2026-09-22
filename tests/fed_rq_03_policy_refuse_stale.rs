@@ -99,6 +99,7 @@ fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
             ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty(),
         ),
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
+        ..Default::default()
     };
     let router = ai_memory::build_router(api_key_state, app_state);
     (router, db)
@@ -534,6 +535,7 @@ async fn stale_policy_version_refused_on_postgres_backend() {
                 ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty(),
             ),
             identity_mode: ai_memory::config::HttpIdentityMode::default(),
+            ..Default::default()
         },
         app_state,
     );

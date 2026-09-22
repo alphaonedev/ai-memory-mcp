@@ -204,6 +204,8 @@ pub struct ClientMetrics {
     coalesced: AtomicU64,
     sessions: AtomicU64,
     reconnects: AtomicU64,
+    malformed_frames_skipped: AtomicU64,
+    refused_frames_skipped: AtomicU64,
 }
 
 /// A point-in-time copy of [`ClientMetrics`].
@@ -217,6 +219,15 @@ pub struct ClientMetricsSnapshot {
     pub sessions: u64,
     /// Reconnect attempts made after a failed or lost session.
     pub reconnects: u64,
+    /// Wakes skipped because their peer-authored metadata would not decode
+    /// (#3642). The frame FRAMED correctly (a `Frame::decode` failure is fatal
+    /// and reconnects instead); only this one message's content was bad, so it
+    /// is dropped, never rendered, and the session survives.
+    pub malformed_frames_skipped: u64,
+    /// Per-message hub refusals the listener skipped without ending the session
+    /// (#3641): a `Kind::Error` whose code the hub keeps the session open for
+    /// (403/404/429/507/500). A session-fatal code ends the session instead.
+    pub refused_frames_skipped: u64,
 }
 
 impl ClientMetrics {
@@ -228,7 +239,23 @@ impl ClientMetrics {
             coalesced: self.coalesced.load(Ordering::Relaxed),
             sessions: self.sessions.load(Ordering::Relaxed),
             reconnects: self.reconnects.load(Ordering::Relaxed),
+            malformed_frames_skipped: self.malformed_frames_skipped.load(Ordering::Relaxed),
+            refused_frames_skipped: self.refused_frames_skipped.load(Ordering::Relaxed),
         }
+    }
+
+    /// Count a wake skipped because its peer-authored metadata would not decode
+    /// (#3642). Incremented from [`super::session::Session::next_event`].
+    pub fn malformed_frame_skipped(&self) {
+        self.malformed_frames_skipped
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count a per-message hub refusal the listener skipped without ending the
+    /// session (#3641). Incremented from
+    /// [`super::session::Session::next_event`].
+    pub fn refused_frame_skipped(&self) {
+        self.refused_frames_skipped.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -490,7 +517,7 @@ async fn run_session(
 
     let mut seq = SeqTracker::default();
     loop {
-        match session.next_event().await? {
+        match session.next_event(metrics).await? {
             SessionEvent::Wake(meta) => {
                 let missed = seq.observe(meta.seq_high_watermark);
                 let signal = WakeSignal {

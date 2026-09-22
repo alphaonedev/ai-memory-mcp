@@ -19,6 +19,8 @@
 import { spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 
+import { classifyCaptureResponse, isCaptured } from "./captureOutcome.ts";
+
 const DEFAULT_BIN = "ai-memory";
 const CALL_ID = 2;
 const TIMEOUT_MS = 30_000;
@@ -28,6 +30,18 @@ const HOST_KIND = "anthropic-sdk";
 // --------------------------------------------------------------------------- //
 // Capture transport (memory_capture_turn over MCP stdio; NEVER throws)
 // --------------------------------------------------------------------------- //
+
+/** #3555 payload inside a successful MCP capture result. Capture APIs remain boolean. */
+export interface CaptureTurnReceipt {
+  memory_id?: string;
+  dedup_hit?: boolean;
+  status?: string;
+  pending_id?: string;
+  durability_class: "local-only" | `quorum ${number}-of-${number}` | "replicated+backup";
+  fsync: string;
+  quorum_acks?: number;
+  quorum_n?: number;
+}
 
 export interface CaptureTurnParams {
   hostSessionId: string;
@@ -111,21 +125,14 @@ export function captureTurn(p: CaptureTurnParams): boolean {
     warn(`substrate exited ${String(result.status)}`);
     return false;
   }
-  const resp = pickCallResponse(result.stdout ?? "");
-  if (!resp) {
-    warn("no capture response from substrate");
-    return false;
-  }
-  // A top-level JSON-RPC `error` member (unknown-method / invalid-params / etc.)
-  // is a FAILURE, not a success — it carries no `result`, so it would otherwise
-  // slip past the `isError` check below and be mis-counted as a captured turn.
-  if (resp.error != null) {
-    warn("substrate returned JSON-RPC error");
-    return false;
-  }
-  const inner = resp.result as Record<string, unknown> | undefined;
-  if (inner && typeof inner === "object" && inner.isError === true) {
-    warn("substrate returned isError:true");
+  // #3544 — the verdict is the PRESENCE of a persisted `memory_id`, never the
+  // ABSENCE of an enumerated failure. `status: "ask"`, `status: "pending"`, an
+  // unreadable payload, and any status a later substrate release grows all
+  // fail CLOSED here; `./captureOutcome.ts` is the whole predicate and is
+  // byte-identical in the sibling shim.
+  const outcome = classifyCaptureResponse(pickCallResponse(result.stdout ?? ""));
+  if (!isCaptured(outcome)) {
+    warn(outcome.detail);
     return false;
   }
   return true;
@@ -179,10 +186,11 @@ export function captureTurnAsync(p: CaptureTurnParams): Promise<boolean> {
         finish(false);
         return;
       }
-      const resp = pickCallResponse(stdout);
-      const inner = resp?.result as Record<string, unknown> | undefined;
-      if (!resp || resp.error != null || (inner && inner.isError === true)) {
-        warn("substrate returned a failed capture response");
+      // #3544 — the SAME presence predicate as the sync transport. This arm
+      // is the one wrapped clients actually take, so it carried the same lie.
+      const outcome = classifyCaptureResponse(pickCallResponse(stdout));
+      if (!isCaptured(outcome)) {
+        warn(outcome.detail);
         finish(false);
         return;
       }

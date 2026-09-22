@@ -158,6 +158,16 @@ pub(crate) fn plan(
     if routine.state != crate::models::RoutineState::Frozen {
         return Err(crate::routines::ROUTINE_NOT_FROZEN.to_string());
     }
+    // #3616: present attestations must verify, including legacy untagged or
+    // incomplete pairs. Never downgrade a failed attestation to unsigned.
+    if (!routine.signature.is_empty() || !routine.signer_pubkey.is_empty())
+        && !crate::routines::verify(routine)
+    {
+        return Err(
+            "routine freeze attestation verification failed; review the template and parameters, then re-freeze with memory_routine_freeze using an active signing key before running"
+                .to_string(),
+        );
+    }
     crate::coordination_guard::require_payload_size("template", &routine.template)?;
     crate::coordination_guard::require_payload_size("arguments", arguments)?;
     let arguments = arguments
@@ -322,7 +332,11 @@ pub(crate) fn materialize_template_for_caller(
     let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
     let mut ids = Vec::with_capacity(plan.actions.len());
     for action in plan.actions {
-        ids.push(crate::actions::create_guarded_in_transaction(&tx, action)?.id);
+        ids.push(
+            crate::actions::create_guarded_in_transaction(&tx, action)
+                .map_err(|e| e.message())?
+                .id,
+        );
     }
     for (from, to, edge_type) in plan.edges {
         match crate::actions::add_edge(&tx, &from, &to, edge_type, now)

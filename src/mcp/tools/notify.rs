@@ -33,7 +33,8 @@ pub fn handle_notify(
 ) -> Result<Value, String> {
     let input = parse_notify(params).map_err(|e| e.message())?;
     let sender = crate::identity::resolve_agent_id(None, mcp_client).map_err(|e| e.to_string())?;
-    persist_notify(conn, db_path, input, resolved_ttl, &sender).map_err(|e| e.message())
+    persist_notify(conn, db_path, input, resolved_ttl, &sender)
+        .map_err(|e| crate::mcp::error_text::mcp_error_text(&e))
 }
 
 /// #3579: HTTP has already resolved and validated this sender. Never feed it
@@ -124,10 +125,18 @@ fn persist_notify(
         .ttl_for_tier(&tier)
         .map(|s| (now + chrono::Duration::seconds(s)).to_rfc3339());
 
+    // #3639 — every delivery is a NEW row: the stored title is minted from
+    // the fresh row id (unique by construction) and the caller's subject is
+    // kept verbatim in `metadata.subject`, so a repeated subject can never
+    // land on the `(title, namespace)` upsert, overwrite an earlier body, or
+    // inherit the earlier sender's attribution.
+    let row_id = uuid::Uuid::new_v4().to_string();
+    let stored_title = crate::inbox_stored_title(title, &row_id);
     let mut metadata = json!({
         "agent_id": sender,
         (field_names::TARGET_AGENT_ID): target,
         "notify": true,
+        (crate::INBOX_SUBJECT_META_KEY): title,
     });
     // #2122 — covenant clause-1 why_trace path for `memory_notify`. The
     // notification `payload` is VERBATIM caller content, so the substrate
@@ -144,10 +153,10 @@ fn persist_notify(
         cid: None, // v0.9.0 G8 (#1825) — stamped by db::insert / read via row_to_memory
         valid_from: None,
         valid_until: None,
-        id: uuid::Uuid::new_v4().to_string(),
+        id: row_id,
         tier,
         namespace: namespace.clone(),
-        title: title.to_string(),
+        title: stored_title,
         content: payload.to_string(),
         tags: vec!["notify".to_string()],
         priority,
@@ -182,9 +191,12 @@ fn persist_notify(
         bytes: payload_bytes,
     };
     crate::quotas::check_and_record(conn, sender, &mem.namespace, quota_op)
-        .map_err(|e| MemoryError::DatabaseError(e.to_string()))?;
+        .map_err(|e| crate::mcp::error_text::log_foreign("check_and_record", e))?;
 
-    let actual_id = match db::insert(conn, &mem) {
+    // #3639 — refuse-on-conflict: an inbox delivery must NEVER merge into an
+    // existing row (the minted title makes a collision practically
+    // impossible; if one ever happens it is a visible error, not a merge).
+    let actual_id = match db::insert_no_overwrite(conn, &mem) {
         Ok(id) => id,
         Err(e) => {
             // The quota increment commits before the insert. Restore it on
@@ -195,7 +207,7 @@ fn persist_notify(
             {
                 crate::quotas::log_refund_op_failed(sender, &refund_err);
             }
-            return Err(MemoryError::DatabaseError(e.to_string()));
+            return Err(crate::mcp::error_text::log_foreign("persist_notify", e));
         }
     };
 
@@ -224,6 +236,7 @@ fn persist_notify(
         &namespace,
         &mem.tier,
         &mem.created_at,
+        title,
     ))
 }
 
@@ -235,7 +248,12 @@ pub(crate) fn notify_receipt(
     namespace: &str,
     tier: &Tier,
     delivered_at: &str,
+    subject: &str,
 ) -> Value {
+    // #3639 — `title` is the SUBJECT the sender wrote. The unique stored
+    // title (`<subject> [<id8>]`, `crate::inbox_stored_title`) is an internal
+    // uniqueness key that no caller was ever promised; it never leaks into a
+    // response. `id` already names exactly which row the delivery became.
     json!({
         "id": id,
         "from": sender,
@@ -243,6 +261,8 @@ pub(crate) fn notify_receipt(
         "namespace": namespace,
         "tier": tier,
         "delivered_at": delivered_at,
+        "title": subject,
+        (crate::INBOX_SUBJECT_META_KEY): subject,
     })
 }
 
@@ -268,10 +288,21 @@ pub(crate) fn inbox_message(m: &Memory) -> Value {
         .namespace
         .strip_prefix(crate::LEGACY_INBOX_NAMESPACE_PREFIX)
         .map_or_else(|| m.namespace.clone(), crate::inbox_namespace);
+    // #3639 — `title` is the subject the sender wrote: `metadata.subject`
+    // on a post-#3639 row, the verbatim stored title on a pre-#3639 row (which
+    // carried no subject and was stored verbatim). One shape across the
+    // migration boundary; the unique stored form (`<subject> [<id8>]`) is an
+    // internal uniqueness key and never reaches a caller.
+    let subject = m
+        .metadata
+        .get(crate::INBOX_SUBJECT_META_KEY)
+        .and_then(Value::as_str)
+        .unwrap_or(m.title.as_str());
     json!({
         "id": m.id,
         "from": sender,
-        "title": m.title,
+        "title": subject,
+        (crate::INBOX_SUBJECT_META_KEY): subject,
         "payload": m.content,
         "content": m.content,
         "priority": m.priority,
@@ -280,7 +311,10 @@ pub(crate) fn inbox_message(m: &Memory) -> Value {
         "metadata": m.metadata,
         (field_names::CREATED_AT): m.created_at,
         (field_names::UPDATED_AT): m.updated_at,
-        "read": m.access_count > 0,
+        // #3730 — no `read` field. `access_count` counts TOUCHES (a recall
+        // landed by the fold); it was reported as `read`, which no inbox
+        // operation ever sets and which a consumer took for HANDLED. The
+        // count stays on the wire under its own name; the claim does not.
         (field_names::ACCESS_COUNT): m.access_count,
         "agent_id": sender,
         (field_names::FROM_AGENT_ID): from_agent_id,
@@ -289,21 +323,23 @@ pub(crate) fn inbox_message(m: &Memory) -> Value {
 }
 
 /// Canonical backend-blind inbox response envelope (#3401).
+///
+/// #3730 — every message still in the inbox is one the recipient has not
+/// declared handled (handled = the recipient deleted it), so `unread_count`
+/// equals `count` by contract. It is kept on the wire, with that contract,
+/// rather than removed: a value is not a lie when its contract says what it
+/// measures. `unread_only` is echoed back as sent.
 pub(crate) fn inbox_envelope(
     owner: &str,
     namespace: &str,
     unread_only: bool,
     messages: Vec<Value>,
 ) -> Value {
-    let unread_count = messages
-        .iter()
-        .filter(|message| message.get("read").and_then(Value::as_bool) != Some(true))
-        .count();
     json!({
         "agent_id": owner,
         "namespace": namespace,
         "count": messages.len(),
-        "unread_count": unread_count,
+        "unread_count": messages.len(),
         (field_names::UNREAD_ONLY): unread_only,
         "messages": messages,
     })
@@ -367,28 +403,31 @@ pub(crate) fn handle_inbox_with_policy(
             }
         }
     };
-    // #3374 — both were read with a silent fallback. `unread_only: "yes"` (a
-    // string, the shape an LLM caller emits most often) read as `false`, so a
-    // caller asking for its UNREAD messages got its ENTIRE inbox back — more
-    // rows than it asked for, and no signal that the filter was ignored. And
-    // `limit` was read `as_u64()`, for which any NEGATIVE is indistinguishable
-    // from absent, so `limit: -5` silently became the 50-row default. Refuse
-    // the wrong type; ABSENT still takes the documented default, and the 500
-    // cap still applies.
+    // #3374 — both were read with a silent fallback (`unread_only: "yes"`
+    // read as `false`; `limit: -5` became the 50-row default). Refuse the
+    // wrong type; ABSENT still takes the documented default, and the 500 cap
+    // still applies. #3730 — `unread_only` no longer narrows (see below), but
+    // a wrong TYPE is still a malformed call and is still refused.
     let unread_only =
         crate::mcp::param_guard::optional_bool(params, field_names::UNREAD_ONLY)?.unwrap_or(false);
     let limit = crate::mcp::param_guard::optional_non_negative_u64(params, param_names::LIMIT)?
         .map_or(50, |n| usize::try_from(n).unwrap_or(usize::MAX))
         .min(500);
     let namespace = crate::inbox_namespace(&owner);
-    // v1.0.0 #3463 — the unread narrowing is PUSHED DOWN into the query
-    // (`list_filtered`'s `unread_only` axis -> `AND access_count = 0` before the
-    // SQL `LIMIT`). It used to run in Rust on the already-limited page, so an
-    // agent whose newest `limit` messages were all read got `count: 0` for
-    // `unread_only: true` while OLDER unread messages sat in its inbox — a
-    // silent false negative that a wake-then-read-once push design would
-    // inherit wholesale. The `limit` now bounds the UNREAD set, not the set the
-    // unread rows are looked for in.
+    // #3730 — `unread_only` narrows NOTHING. It used to mean
+    // `access_count == 0`, a TOUCH counter that no inbox operation ever
+    // advanced (only a namespaced recall plus the periodic fold did), so an
+    // agent draining with `inbox` then `get` never marked anything read and a
+    // redelivery loop keyed on the marker re-sent the same message forever.
+    // The inbox is now the PENDING set: a message leaves it when its recipient
+    // deletes it (the one recipient-side mutation the product authorises on a
+    // message — `caller_owns_for_mutation(.., allow_inbox = true)`), and every
+    // message still listed is one nobody has declared handled. The parameter
+    // is accepted (and still type-checked, #3374) for wire compatibility and
+    // is echoed back; its contract is stated in the tool docs. Retiring the
+    // #3463 `AND access_count = 0` pushdown dissolves the problem #3463 fixed
+    // rather than reverting it: with no read rows in the inbox, a page cannot
+    // be spent on them.
     let items = db::list_filtered(
         conn,
         Some(&namespace),
@@ -402,18 +441,9 @@ pub(crate) fn handle_inbox_with_policy(
         None,
         None, // #1834 valid_at (no as-of)
         None, // #2580 metadata_eq (no narrowing)
-        unread_only,
     )
-    .map_err(|e| e.to_string())?;
-    // #3463 belt-and-suspenders: the SAME marker re-checked in-process, so a
-    // drift between the SQL fragment and this predicate can only NARROW what
-    // the agent is shown, never widen it. With the pushdown in place this is a
-    // no-op on every correct path.
-    let filtered: Vec<&Memory> = items
-        .iter()
-        .filter(|m| !unread_only || m.access_count == 0)
-        .collect();
-    let messages = filtered.into_iter().map(inbox_message).collect();
+    .map_err(|e| crate::mcp::error_text::mcp_foreign_err("metadata_eq", e))?;
+    let messages = items.iter().map(inbox_message).collect();
     Ok(inbox_envelope(&owner, &namespace, unread_only, messages))
 }
 
@@ -481,7 +511,8 @@ pub struct InboxRequest {
     #[serde(default)]
     pub agent_id: Option<String>,
 
-    /// access_count==0 only.
+    /// Accepted for compatibility; narrows nothing (#3730). Every message
+    /// still in the inbox is unhandled: drain by deleting what you handled.
     #[serde(default)]
     pub unread_only: Option<bool>,
 
@@ -502,16 +533,19 @@ impl McpTool for InboxTool {
         "List messages sent to an agent via memory_notify."
     }
     fn docs() -> &'static str {
-        // v0.9.0 P0-1 (#1869) — recall is pure by default, so
-        // read-marking is EVENTUALLY consistent: recalling a message
-        // appends a ledger row and the periodic fold (default 60 s;
-        // gc-tick fallback) is what bumps access_count past 0. A
-        // just-recalled message can list as unread for up to one fold
-        // interval. Pinned by
-        // `tests/recall_purity_p01.rs::fold_flips_inbox_unread_marker`.
-        "Read _messages/<agent_id>. access_count==0 is the unread marker \
-         (eventually consistent under pure recall: the periodic \
-         recall-access fold, default 60s, read-marks recalled messages)."
+        // #3730 — the inbox is the PENDING set. There is no read marker:
+        // `access_count` counts touches (a recall landed by the #1869 fold),
+        // which no inbox operation advances and which never meant handled.
+        // A recipient declares a message handled by deleting it
+        // (`memory_delete` — authorised for the addressee). `unread_only`
+        // is accepted for compatibility and narrows nothing; it is echoed
+        // back so a caller can see what it sent. Pinned by
+        // `tests/inbox_drain_not_touch_3730.rs`.
+        "Read _messages/<agent_id>: the messages the recipient has not yet \
+         handled. Handled = deleted by the recipient (memory_delete); reads \
+         never mark anything. unread_only is accepted for compatibility and \
+         narrows nothing — every listed message is unhandled. access_count \
+         counts touches, not handling."
     }
     fn input_schema() -> Value {
         crate::mcp::registry::input_schema_for::<InboxRequest>()
@@ -697,7 +731,9 @@ mod d1_5_986_tests {
             &sender,
         )
         .expect_err("pre-resolved sender must hit the same quota refusal");
-        assert!(matches!(typed, MemoryError::DatabaseError(_)));
+        // #3713 — the quota refusal now has its own typed variant (it used
+        // to ride `DatabaseError` as text) and still passes through verbatim.
+        assert!(matches!(typed, MemoryError::QuotaExceeded(_)));
         assert_eq!(typed.message(), err);
         let inbox_rows: i64 = conn
             .query_row(
@@ -887,6 +923,189 @@ mod d1_5_986_tests {
             handle_inbox_with_policy(&conn, &json!({"agent_id": owner}), None, None, true).unwrap();
         assert_eq!(response["count"].as_u64(), Some(1));
         assert_eq!(response["agent_id"].as_str(), Some(owner));
+    }
+
+    // ---- #3639 — the response `title` is the subject on BOTH sides of the ---
+    // ---- migration boundary; the unique stored form never leaks ------------
+    #[test]
+    fn inbox_title_is_the_subject_for_pre_and_post_3639_rows() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        // A pre-#3639 row: stored verbatim, no metadata.subject.
+        let now = chrono::Utc::now().to_rfc3339();
+        let legacy = Memory {
+            cid: None,
+            valid_from: None,
+            valid_until: None,
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: Tier::Short,
+            namespace: crate::inbox_namespace("ai:bob"),
+            title: "deploy approval".to_string(),
+            content: "legacy body".to_string(),
+            tags: vec!["notify".to_string()],
+            priority: 5,
+            confidence: 1.0,
+            source: "notify".to_string(),
+            access_count: 0,
+            created_at: now.clone(),
+            updated_at: now,
+            last_accessed_at: None,
+            expires_at: None,
+            metadata: json!({"agent_id": "ai:alice", "target_agent_id": "ai:bob", "notify": true}),
+            reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
+            entity_id: None,
+            persona_version: None,
+            citations: Vec::new(),
+            source_uri: None,
+            source_span: None,
+            confidence_source: ConfidenceSource::CallerProvided,
+            confidence_signals: None,
+            confidence_decayed_at: None,
+            version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
+        };
+        let legacy_id = db::insert(&conn, &legacy).unwrap();
+        // A post-#3639 row through the real funnel with the same subject,
+        // sent AS `ai:mallory` (the resolved sender, not an mcp_client label
+        // the resolver would derive into `ai:<sanitised>@<host>`).
+        let receipt = notify_as(&conn, "ai:mallory", "ai:bob", "deploy approval", "new body");
+        assert_eq!(
+            receipt["title"], "deploy approval",
+            "the receipt names the subject"
+        );
+        let new_id = receipt["id"].as_str().unwrap().to_string();
+        assert_ne!(new_id, legacy_id, "a new row, never a merge");
+
+        let legacy_row = db::get(&conn, &legacy_id).unwrap().unwrap();
+        let new_row = db::get(&conn, &new_id).unwrap().unwrap();
+        assert_ne!(new_row.title, legacy_row.title, "stored titles stay unique");
+        let a = inbox_message(&legacy_row);
+        let b = inbox_message(&new_row);
+        assert_eq!(a["title"], "deploy approval");
+        assert_eq!(b["title"], "deploy approval");
+        assert_eq!(
+            a["title"], b["title"],
+            "one shape across the migration boundary"
+        );
+        assert_eq!(a["from"], "ai:alice");
+        assert_eq!(b["from"], "ai:mallory");
+        assert!(
+            !b["title"].as_str().unwrap().contains('['),
+            "the internal uniqueness tag never reaches a caller: {b}"
+        );
+    }
+
+    // ---- #3639 — a repeated subject never overwrites or re-attributes -----
+
+    fn notify_as(
+        conn: &rusqlite::Connection,
+        sender: &str,
+        target: &str,
+        title: &str,
+        body: &str,
+    ) -> Value {
+        handle_notify_as_sender(
+            conn,
+            std::path::Path::new(":memory:"),
+            &json!({"target_agent_id": target, "title": title, "payload": body}),
+            &crate::config::ResolvedTtl::default(),
+            sender,
+        )
+        .expect("notify delivers")
+    }
+
+    /// On the release head both deliveries returned the SAME id, the inbox
+    /// held ONE row, attributed to alice, carrying mallory's body.
+    #[test]
+    fn notify_repeated_title_never_overwrites_or_reattributes_3639() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let a = notify_as(
+            &conn,
+            "ai:alice",
+            "ai:bob",
+            "deploy approval",
+            "ALICE: approve 42",
+        );
+        let b = notify_as(
+            &conn,
+            "ai:mallory",
+            "ai:bob",
+            "deploy approval",
+            "MALLORY-FORGED: approve 666",
+        );
+        assert_ne!(a["id"], b["id"], "#3639: a second delivery is a NEW row");
+        let inbox = handle_inbox_with_policy(
+            &conn,
+            &json!({"agent_id": "ai:bob"}),
+            None,
+            Some("ai:bob"),
+            false,
+        )
+        .unwrap();
+        assert_eq!(inbox["count"].as_u64(), Some(2), "{inbox}");
+        assert_eq!(inbox["unread_count"].as_u64(), Some(2), "{inbox}");
+        let msgs = inbox["messages"].as_array().unwrap();
+        let by_id = |id: &Value| msgs.iter().find(|m| m["id"] == *id).expect("row listed");
+        let ra = by_id(&a["id"]);
+        let rb = by_id(&b["id"]);
+        assert_eq!(ra["from"], "ai:alice");
+        assert_eq!(ra["agent_id"], "ai:alice");
+        assert_eq!(ra["content"], "ALICE: approve 42");
+        assert_eq!(rb["from"], "ai:mallory");
+        assert_eq!(rb["agent_id"], "ai:mallory");
+        assert_eq!(rb["content"], "MALLORY-FORGED: approve 666");
+        for r in [ra, rb] {
+            // #3730 retired the read marker (no `read` field on the wire;
+            // pinned by inbox_drain_not_touch_3730).
+            assert!(r.get("read").is_none(), "{r}");
+            assert_eq!(r["subject"], "deploy approval");
+            // The consumer-facing field is the SUBJECT (review round 2): the
+            // uniqueness tag is internal and never reaches a caller.
+            assert_eq!(r["title"], "deploy approval");
+        }
+        assert_ne!(ra["id"], rb["id"], "two rows, never one overwritten");
+        // The stored titles are the unique `<subject> [<id8>]` form — read
+        // straight from the rows, not from the rendered listing.
+        let stored_a = db::get(&conn, a["id"].as_str().unwrap()).unwrap().unwrap();
+        let stored_b = db::get(&conn, b["id"].as_str().unwrap()).unwrap().unwrap();
+        assert!(
+            stored_a.title.starts_with("deploy approval ["),
+            "{}",
+            stored_a.title
+        );
+        assert!(
+            stored_b.title.starts_with("deploy approval ["),
+            "{}",
+            stored_b.title
+        );
+        assert_ne!(stored_a.title, stored_b.title, "stored titles stay unique");
+    }
+
+    #[test]
+    fn notify_response_carries_new_id_and_subject_3639() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let r = notify_as(&conn, "ai:alice", "ai:bob", "STATUS", "all green");
+        let id = r["id"].as_str().unwrap();
+        assert_eq!(r["subject"], "STATUS");
+        // Review round 2: the receipt's `title` is the SUBJECT the caller
+        // sent; the unique stored form is on the row, not on the wire.
+        assert_eq!(r["title"], "STATUS");
+        let stored = db::get(&conn, id).unwrap().unwrap();
+        assert_eq!(stored.title, crate::inbox_stored_title("STATUS", id));
+        assert!(stored.title.ends_with(&format!(" [{}]", &id[..8])));
+    }
+
+    #[test]
+    fn inbox_stored_title_is_unique_and_bounded_3639() {
+        let a = crate::inbox_stored_title("deploy approval", "0123456789abcdef");
+        let b = crate::inbox_stored_title("deploy approval", "fedcba9876543210");
+        assert_eq!(a, "deploy approval [01234567]");
+        assert_ne!(a, b);
+        let long = "x".repeat(600);
+        let stored = crate::inbox_stored_title(&long, "0123456789abcdef");
+        assert!(stored.chars().count() <= 512, "{}", stored.chars().count());
+        assert!(stored.ends_with(" [01234567]"));
+        assert!(validate::validate_title(&stored).is_ok());
     }
 }
 

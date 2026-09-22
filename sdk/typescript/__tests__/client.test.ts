@@ -5,7 +5,7 @@
  * Integration tests for `AiMemoryClient`.
  *
  * These tests hit a real ai-memory daemon at `AI_MEMORY_TEST_URL`
- * (default `http://localhost:9077`). The entire block is skipped unless
+ * (default `https://localhost:9077`). The entire block is skipped unless
  * `AI_MEMORY_TEST_DAEMON=1` is set, so CI without a daemon stays green.
  *
  * Start a daemon for local testing:
@@ -16,12 +16,12 @@
  * ```
  */
 
-import { AiMemoryClient } from "../src/client.js";
+import { AiMemoryClient, connectOptions } from "../src/client.js";
 import { AgentSigningKey } from "../src/attestation.js";
 import { ValidationError, NotFoundError } from "../src/errors.js";
 import type { Memory } from "../src/types.js";
 
-const BASE_URL = process.env.AI_MEMORY_TEST_URL ?? "http://localhost:9077";
+const BASE_URL = process.env.AI_MEMORY_TEST_URL ?? "https://localhost:9077";
 const DAEMON_ENABLED = process.env.AI_MEMORY_TEST_DAEMON === "1";
 const describeIntegration = DAEMON_ENABLED ? describe : describe.skip;
 
@@ -109,15 +109,59 @@ describe("Memory typed fields (#2834)", () => {
   });
 });
 
+describe("caCert trust anchor (#3782)", () => {
+  // Every daemon listener serves TLS since #3705/#3709, and a zero-config
+  // daemon's leaf is issued by the local CA it wrote to
+  // `<key_dir>/tls/local-ca.pem` — no public root signs it. `caCert` is the
+  // option that pins it. These assert the option reaches undici's connector
+  // build options (where `ca` is a TLS `ConnectionOptions` field), that it is
+  // ABSENT by default, and that it can never be a silent no-op.
+  const PEM = "-----BEGIN CERTIFICATE-----\nZmFrZQ==\n-----END CERTIFICATE-----\n";
+
+  test("no caCert leaves the connector untouched", () => {
+    // `{}` and not `{ connect: { ca: undefined } }`: the latter would replace
+    // undici's default connector build options with a ca-less object.
+    expect(connectOptions(undefined)).toEqual({});
+  });
+
+  test("a PEM string becomes the connector's `ca`", () => {
+    expect(connectOptions(PEM)).toEqual({ connect: { ca: PEM } });
+  });
+
+  test("an array of PEMs is passed through (a chain / several anchors)", () => {
+    expect(connectOptions([PEM, PEM])).toEqual({ connect: { ca: [PEM, PEM] } });
+  });
+
+  test("an EMPTY caCert is refused rather than silently trusting nothing", () => {
+    expect(() => connectOptions("")).toThrow(/non-empty PEM/);
+    expect(() => connectOptions([])).toThrow(/non-empty PEM/);
+  });
+
+  test("the constructor accepts caCert and still serves requests", async () => {
+    const fetchImpl = jest.fn(async () =>
+      new Response(JSON.stringify({ status: "ok" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    const c = new AiMemoryClient(
+      { baseUrl: "https://localhost:9077", caCert: PEM },
+      fetchImpl as never,
+    );
+    await expect(c.health()).resolves.toEqual({ status: "ok" });
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe("AiMemoryClient constructor", () => {
   test("requires baseUrl", () => {
     expect(() => new AiMemoryClient({ baseUrl: "" })).toThrow();
   });
 
   test("strips trailing slash", () => {
-    const c = new AiMemoryClient({ baseUrl: "http://localhost:9077/" });
+    const c = new AiMemoryClient({ baseUrl: "https://localhost:9077/" });
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    expect((c as any).baseUrl).toBe("http://localhost:9077");
+    expect((c as any).baseUrl).toBe("https://localhost:9077");
   });
 
   test("strips multiple trailing slashes; leaves a slash-free URL unchanged (#3592)", () => {
@@ -126,10 +170,10 @@ describe("AiMemoryClient constructor", () => {
     expect(base("https://host:port/")).toBe("https://host:port");
     expect(base("https://host:port")).toBe("https://host:port");
     expect(base("https://host:port///")).toBe("https://host:port");
-    expect(base("http://localhost:9077/api/v1/")).toBe(
-      "http://localhost:9077/api/v1",
+    expect(base("https://localhost:9077/api/v1/")).toBe(
+      "https://localhost:9077/api/v1",
     );
-    expect(base("http://localhost:9077//v1")).toBe("http://localhost:9077//v1");
+    expect(base("https://localhost:9077//v1")).toBe("https://localhost:9077//v1");
   });
 
   test("trailing-slash trim is linear on a 100k-slash input (#3592)", () => {
@@ -171,7 +215,7 @@ describe("AiMemoryClient bind proof-of-possession (#3464)", () => {
       };
     };
     const client = new AiMemoryClient(
-      { baseUrl: "http://localhost:9077" },
+      { baseUrl: "https://localhost:9077" },
       fetchImpl as never,
     );
     const key = AgentSigningKey.fromSeed(
@@ -191,12 +235,12 @@ describe("AiMemoryClient bind proof-of-possession (#3464)", () => {
     const encoded = "spiffe%3A%2F%2Fexample.org%2Fns%2Fprod";
     expect(seen).toEqual([
       {
-        url: `http://localhost:9077/api/v1/agents/${encoded}/pubkey/challenge`,
+        url: `https://localhost:9077/api/v1/agents/${encoded}/pubkey/challenge`,
         method: "POST",
         body: { pubkey_b64: "_FHNjmIYoaONpH7QAjDwWAgW7RO6MwOsXeuRFUiQgCU" },
       },
       {
-        url: `http://localhost:9077/api/v1/agents/${encoded}/pubkey`,
+        url: `https://localhost:9077/api/v1/agents/${encoded}/pubkey`,
         method: "PUT",
         body: {
           pubkey_b64: "_FHNjmIYoaONpH7QAjDwWAgW7RO6MwOsXeuRFUiQgCU",
@@ -290,7 +334,7 @@ describe("AiMemoryClient.unsubscribe URL shape (C-20)", () => {
   test("targets the collection path with ?id=<id>", async () => {
     const { fetchImpl, seen } = captureUrl();
     const client = new AiMemoryClient(
-      { baseUrl: "http://localhost:9077" },
+      { baseUrl: "https://localhost:9077" },
       fetchImpl,
     );
 
@@ -340,6 +384,8 @@ describe("AiMemoryClient.storeBulk wire shape (#2646)", () => {
 
   test("sends a BARE ARRAY body, never an object wrapper", async () => {
     const envelope = {
+      durability_class: "local-only",
+      fsync: "per-checkpoint",
       sent: 2,
       created: 2,
       updated: 0,
@@ -350,7 +396,7 @@ describe("AiMemoryClient.storeBulk wire shape (#2646)", () => {
     };
     const { fetchImpl, seenBody } = capture(envelope, 200);
     const client = new AiMemoryClient(
-      { baseUrl: "http://localhost:9077" },
+      { baseUrl: "https://localhost:9077" },
       fetchImpl,
     );
 
@@ -369,6 +415,8 @@ describe("AiMemoryClient.storeBulk wire shape (#2646)", () => {
 
   test("parses the ledger envelope including a rejected row (207)", async () => {
     const envelope = {
+      durability_class: "local-only",
+      fsync: "per-checkpoint",
       sent: 4,
       created: 1,
       updated: 1,
@@ -389,7 +437,7 @@ describe("AiMemoryClient.storeBulk wire shape (#2646)", () => {
     };
     const { fetchImpl } = capture(envelope, 207);
     const client = new AiMemoryClient(
-      { baseUrl: "http://localhost:9077" },
+      { baseUrl: "https://localhost:9077" },
       fetchImpl,
     );
 

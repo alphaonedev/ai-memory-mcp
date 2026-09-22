@@ -674,36 +674,35 @@ pub async fn create_link(
                 .into_response();
         }
     };
-    let source_owner = source_mem
-        .metadata
-        .get("agent_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let source_target = source_mem
-        .metadata
-        .get(field_names::TARGET_AGENT_ID)
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let is_unowned_legacy = source_owner.is_empty();
-    if !is_unowned_legacy
-        && source_owner != caller
-        && source_target != caller
-        && caller != sentinels::DAEMON_PRINCIPAL
+    // #3124 — the ONE cross-backend mutation predicate (inbox recipient of a
+    // stamped row admitted; an unstamped row decided by
+    // `AI_MEMORY_UNSTAMPED_MUTATION`; a malformed owner never matched).
+    let source_owner =
+        crate::identity::owner_stamp::OwnerStamp::of(&source_mem.metadata).owner_for_display();
+    if caller != sentinels::DAEMON_PRINCIPAL
+        && !crate::identity::owner_stamp::metadata_admits_mutation(
+            &source_mem.metadata,
+            &source_id,
+            &caller,
+            true,
+            crate::identity::owner_stamp::MutationSite::sqlite(
+                crate::identity::owner_stamp::funnel::LINK,
+            ),
+        )
     {
         tracing::warn!(
             target: super::AUTHZ_TRACE_TARGET,
             "POST /api/v1/links 403: caller {caller} != source owner {source_owner} (source_id={source_id})"
         );
-        return (
-            StatusCode::FORBIDDEN,
-            Json(json!({
-                "error": crate::errors::msg::CALLER_NOT_SOURCE_MEMORY_OWNER,
-                "owner": source_owner,
-                "caller": caller,
-                "source_id": source_id,
-            })),
-        )
-            .into_response();
+        // #3426 — leak-resistant refusal: the source row's owning agent id
+        // stays in the AUTHZ trace line above and never reaches the refused
+        // caller. Converges the sqlite branch onto the postgres SAL link
+        // gate, which already refused with the bare SSOT message.
+        return crate::handlers::parity::owner_gate_refusal(
+            crate::errors::msg::CALLER_NOT_SOURCE_MEMORY_OWNER,
+            Some(caller.as_str()),
+            crate::handlers::parity::RefusedResource::SourceMemory(&source_id),
+        );
     }
 
     // #1621 — K8 link-quota parity with the MCP path
@@ -722,18 +721,9 @@ pub async fn create_link(
             crate::quotas::QuotaOp::Link,
         ) {
             return match e {
-                crate::quotas::QuotaCheckError::Quota(qe) => (
-                    StatusCode::TOO_MANY_REQUESTS,
-                    Json(json!({
-                        "code": crate::errors::error_codes::QUOTA_EXCEEDED,
-                        "error": qe.to_string(),
-                        "limit": qe.limit.as_str(),
-                        "current": qe.current,
-                        "max": qe.max,
-                        "agent_id": qe.agent_id,
-                    })),
-                )
-                    .into_response(),
+                crate::quotas::QuotaCheckError::Quota(qe) => {
+                    crate::handlers::errors::quota_exceeded_response(&qe)
+                }
                 crate::quotas::QuotaCheckError::Sql(se) => {
                     tracing::error!("create_link: quota substrate error: {se}");
                     (
@@ -977,11 +967,10 @@ pub async fn delete_link(
         "allow",
         "link_delete",
         "",
-        json!({
-            "source_id": source_id,
-            "target_id": target_id,
-            "relation": relation,
-        }),
+        crate::governance::audit::ForensicPayload::new()
+            .ident("source_id", &source_id)
+            .ident("target_id", &target_id)
+            .ident("relation", &relation),
     );
 
     // FBL-08 (v1.0.0 pre-ship 3x7) — route the destructive link delete
@@ -1000,50 +989,48 @@ pub async fn delete_link(
         // hold an edge), mirroring the sqlite missing-source path.
         match app.store.get(&ctx, &source_id).await {
             Ok(source_mem) => {
-                let source_owner = source_mem
-                    .metadata
-                    .get("agent_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let source_target = source_mem
-                    .metadata
-                    .get(field_names::TARGET_AGENT_ID)
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let target_mem_owner = app.store.get(&ctx, &target_id).await.ok().and_then(|m| {
-                    m.metadata
-                        .get("agent_id")
-                        .and_then(|v| v.as_str())
-                        .map(str::to_string)
+                let source_owner =
+                    crate::identity::owner_stamp::OwnerStamp::of(&source_mem.metadata)
+                        .owner_for_display()
+                        .to_string();
+                let target_meta = app
+                    .store
+                    .get(&ctx, &target_id)
+                    .await
+                    .ok()
+                    .map(|m| m.metadata);
+                let target_mem_owner = target_meta.as_ref().map(|m| {
+                    crate::identity::owner_stamp::OwnerStamp::of(m)
+                        .owner_for_display()
+                        .to_string()
                 });
-                let is_unowned_legacy =
-                    source_owner.is_empty() && target_mem_owner.as_deref().unwrap_or("").is_empty();
-                let owns_source = source_owner == caller || source_target == caller;
-                let owns_target = target_mem_owner.as_deref() == Some(caller.as_str());
-                if !is_unowned_legacy
-                    && !owns_source
-                    && !owns_target
-                    && caller != sentinels::DAEMON_PRINCIPAL
+                // #3124 — the ONE predicate, link-delete (symmetric) form.
+                if caller != sentinels::DAEMON_PRINCIPAL
+                    && !crate::identity::owner_stamp::unlink_admitted(
+                        &source_mem.metadata,
+                        target_meta.as_ref(),
+                        &source_id,
+                        &caller,
+                        crate::identity::owner_stamp::MutationSite::postgres(
+                            crate::identity::owner_stamp::funnel::UNLINK,
+                        ),
+                    )
                 {
                     tracing::warn!(
                         target: super::AUTHZ_TRACE_TARGET,
                         "DELETE /api/v1/links 403 (postgres): caller {caller} owns neither source {source_owner} nor target {} (source_id={source_id})",
                         target_mem_owner.as_deref().unwrap_or("")
                     );
-                    return (
-                        StatusCode::FORBIDDEN,
-                        Json(json!({
-                            "error": "caller does not own either endpoint of this link",
-                            "source_owner": source_owner,
-                            "target_owner": target_mem_owner.unwrap_or_default(),
-                            "caller": caller,
-                            "source_id": source_id,
-                            "target_id": target_id,
-                        })),
-                    )
-                        .into_response();
+                    // #3426 — leak-resistant refusal: both endpoint owners
+                    // stay in the AUTHZ trace line above, never on the wire.
+                    return crate::handlers::parity::owner_gate_refusal(
+                        crate::errors::msg::CALLER_NOT_LINK_ENDPOINT_OWNER,
+                        Some(caller.as_str()),
+                        crate::handlers::parity::RefusedResource::Link {
+                            source_id: &source_id,
+                            target_id: &target_id,
+                        },
+                    );
                 }
             }
             Err(crate::store::StoreError::NotFound { .. }) => {}
@@ -1102,47 +1089,46 @@ pub async fn delete_link(
             };
         }
     };
-    let target_mem_owner = db::get(&lock.0, &target_id).ok().flatten().and_then(|m| {
-        m.metadata
-            .get("agent_id")
-            .and_then(|v| v.as_str())
-            .map(str::to_string)
+    let target_meta = db::get(&lock.0, &target_id)
+        .ok()
+        .flatten()
+        .map(|m| m.metadata);
+    let target_mem_owner = target_meta.as_ref().map(|m| {
+        crate::identity::owner_stamp::OwnerStamp::of(m)
+            .owner_for_display()
+            .to_string()
     });
-    let source_owner = source_mem
-        .metadata
-        .get("agent_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
+    let source_owner = crate::identity::owner_stamp::OwnerStamp::of(&source_mem.metadata)
+        .owner_for_display()
         .to_string();
-    let source_target = source_mem
-        .metadata
-        .get(field_names::TARGET_AGENT_ID)
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    let is_unowned_legacy =
-        source_owner.is_empty() && target_mem_owner.as_deref().unwrap_or("").is_empty();
-    let owns_source = source_owner == caller || source_target == caller;
-    let owns_target = target_mem_owner.as_deref() == Some(caller.as_str());
-    if !is_unowned_legacy && !owns_source && !owns_target && caller != sentinels::DAEMON_PRINCIPAL {
+    // #3124 — the ONE predicate, link-delete (symmetric) form.
+    if caller != sentinels::DAEMON_PRINCIPAL
+        && !crate::identity::owner_stamp::unlink_admitted(
+            &source_mem.metadata,
+            target_meta.as_ref(),
+            &source_id,
+            &caller,
+            crate::identity::owner_stamp::MutationSite::sqlite(
+                crate::identity::owner_stamp::funnel::UNLINK,
+            ),
+        )
+    {
         drop(lock);
         tracing::warn!(
             target: super::AUTHZ_TRACE_TARGET,
             "DELETE /api/v1/links 403: caller {caller} owns neither source {source_owner} nor target {} (source_id={source_id})",
             target_mem_owner.as_deref().unwrap_or("")
         );
-        return (
-            StatusCode::FORBIDDEN,
-            Json(json!({
-                "error": "caller does not own either endpoint of this link",
-                "source_owner": source_owner,
-                "target_owner": target_mem_owner.unwrap_or_default(),
-                "caller": caller,
-                "source_id": source_id,
-                "target_id": target_id,
-            })),
-        )
-            .into_response();
+        // #3426 — leak-resistant refusal: both endpoint owners stay in the
+        // AUTHZ trace line above, never on the wire.
+        return crate::handlers::parity::owner_gate_refusal(
+            crate::errors::msg::CALLER_NOT_LINK_ENDPOINT_OWNER,
+            Some(caller.as_str()),
+            crate::handlers::parity::RefusedResource::Link {
+                source_id: &source_id,
+                target_id: &target_id,
+            },
+        );
     }
 
     let delete_result = db::delete_link(&lock.0, &source_id, &target_id);

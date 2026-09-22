@@ -125,7 +125,7 @@ impl RootBindAuthority {
             Self::GuardianRecovery
         } else if value == DAEMON_KEY_DIR_AUTHORITY {
             Self::DaemonKeyDir
-        } else if value == "legacy_unproven" {
+        } else if value == LEGACY_UNPROVEN_AUTHORITY {
             Self::LegacyUnproven
         } else {
             Self::Unrecognised
@@ -171,6 +171,11 @@ impl RootBindAuthority {
 /// reading a newer snapshot fails CLOSED rather than admitting a binding it
 /// does not understand.
 pub const DAEMON_KEY_DIR_AUTHORITY: &str = "daemon_key_dir";
+
+/// The `bind_authority` value for [`RootBindAuthority::LegacyUnproven`] — and
+/// the value an entry that OMITS the field is read as (#3464: an unstated
+/// provenance is not a proven one). Named once (pm-v3.1 ratchet).
+pub const LEGACY_UNPROVEN_AUTHORITY: &str = "legacy_unproven";
 
 /// An agent's enrolled root key, with the provenance of its binding.
 #[derive(Debug, Clone)]
@@ -1079,7 +1084,7 @@ pub struct AllowlistEntry {
 }
 
 fn legacy_unproven() -> String {
-    "legacy_unproven".to_string()
+    LEGACY_UNPROVEN_AUTHORITY.to_string()
 }
 
 /// v1.0.0 #3505 — bound and sanity-check one entry's proven-read prefixes at

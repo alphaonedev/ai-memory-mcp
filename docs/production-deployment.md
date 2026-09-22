@@ -70,8 +70,8 @@ The HTTP daemon takes an optional shared API key from the `api_key` field of `~/
 **The only supported credential channel is the `x-api-key` request header** (constant-time compared in `handlers::transport::api_key_auth`). The `?api_key=` query-parameter form is **rejected with `401` at v1.0.0** ([#2032](https://github.com/alphaonedev/ai-memory-mcp/issues/2032) L1): a credential in the URL leaks into access logs, `Referer` headers, and proxy logs, all of which may outlive your key-rotation window. It was deprecated at v0.7.0 ([#1574](https://github.com/alphaonedev/ai-memory-mcp/issues/1574)) — accepted for back-compat with a once-per-process operator-visible WARN — and v1.0.0 removed it outright: there is **no opt-back-in escape hatch**. A request that still presents `?api_key=` is refused (a once-per-process WARN fires on the first such refusal). Use the header:
 
 ```bash
-curl -H "x-api-key: $KEY" http://127.0.0.1:9077/api/v1/stats   # supported
-curl "http://127.0.0.1:9077/api/v1/stats?api_key=$KEY"         # REJECTED (401) since v1.0.0
+curl -H "x-api-key: $KEY" https://127.0.0.1:9077/api/v1/stats   # supported
+curl "https://127.0.0.1:9077/api/v1/stats?api_key=$KEY"         # REJECTED (401) since v1.0.0
 ```
 
 mTLS-authenticated federation peers bypass the api-key check on `/api/v1/sync/*` only (they have already cleared a stronger gate; see [`federation.md`](federation.html)).
@@ -201,7 +201,7 @@ Migration failures roll back; the database is never left in a half-migrated stat
 
 Out-of-the-box observability lands in three places:
 
-- **Tracing spans on stderr.** Every MCP tool call, every governance decision, every federation event emits a `tracing::info!` span. `RUST_LOG=ai_memory=info` is the default; `RUST_LOG=ai_memory=debug` for deep traces. Note (post-#1562, 2026-06-09): the postgres SAL adapter emits under the literal targets `store::postgres` / `store::postgres::kg`, which an `ai_memory=...` filter does not match — postgres-backed deployments wanting those events must add e.g. `store::postgres=debug` to the filter.
+- **Tracing spans on stderr.** Every MCP tool call, every governance decision, every federation event emits a `tracing::info!` span. `RUST_LOG=info` is the default (post-#3650 a bare level admitting every target, including the postgres SAL adapter's literal `store::postgres` / `store::postgres::kg` targets); `RUST_LOG=ai_memory=debug` for deep traces, e.g. `store::postgres=debug` for the postgres adapter specifically.
 - **File logging.** Opt-in via `[logging]` in `config.toml` (path, rotation size, retention days, `structured = true` for JSON). Routes to a rotating appender; off by default.
 - **`ai-memory doctor`.** A 13-section health dashboard run locally: Storage / Index / Embedding Space Census (#2167) / Recall Index Coverage (#1964) / Corpus Lifecycle (#1965) / Recall / Governance / Sync / Webhook / Capabilities / Reflection Health / LLM Reachability (#1146) / Embeddings Reachability (#1598). Nothing leaves the host except the opt-in reachability probes against your configured LLM / embedding backends. (`ai-memory doctor --remote <url>` becomes a fleet doctor against a running daemon.)
 
@@ -289,7 +289,7 @@ plumbing required.
 For MCP usage, the LLM env vars MUST live inside the MCP server
 config's `env:` block. Copy-pasteable per-backend recipes (Ollama,
 LMStudio, vLLM, llama.cpp server, xAI, OpenAI, Anthropic, Gemini,
-DeepSeek, Kimi, Qwen, Mistral, Groq, Together, Cerebras, OpenRouter,
+Kimi, Qwen, Mistral, Groq, Together, Cerebras, OpenRouter,
 Fireworks) + multi-agent / multi-DC / fleet considerations:
 [`integrations/llm-backends.md`](integrations/llm-backends.html).
 

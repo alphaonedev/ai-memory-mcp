@@ -94,9 +94,10 @@
 //! response carries `Cache-Control: no-store`. Only `sha256(token)` is ever
 //! persisted (the [#2044] contract) and only its
 //! [`FINGERPRINT_HEX_LEN`]-character prefix is ever audited or logged. The
-//! router's `TraceLayer` records method + URI only — never bodies, never
-//! headers — so there is no request-logging middleware to exclude this route
-//! from; the redaction here is by construction, not by policy.
+//! router's `TraceLayer` records method + matched route template only
+//! (`crate::http_diagnostic_span`, #3649) — never the URI, never bodies,
+//! never headers — so there is no request-logging middleware to exclude this
+//! route from; the redaction here is by construction, not by policy.
 //!
 //! **Confidential transport.** A mint hands a bearer secret to the wire, so it
 //! is refused unless the daemon's own bind posture is confidential — loopback
@@ -703,12 +704,14 @@ fn audit(
         decision,
         endpoint,
         "",
-        json!({
-            "issue": "#3474",
-            (crate::models::field_names::TARGET_AGENT_ID): target_agent_id,
-            "outcome": outcome,
-            (FIELD_KEY_FINGERPRINT): token_sha256.map(key_fingerprint),
-        }),
+        crate::governance::audit::ForensicPayload::new()
+            .label("issue", "#3474")
+            .ident(crate::models::field_names::TARGET_AGENT_ID, target_agent_id)
+            .ident("outcome", outcome)
+            .opt_ident(
+                FIELD_KEY_FINGERPRINT,
+                token_sha256.map(key_fingerprint).as_deref(),
+            ),
     );
 }
 

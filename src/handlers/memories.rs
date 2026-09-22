@@ -284,6 +284,24 @@ pub async fn update_memory(
     headers: HeaderMap,
     Json(body): Json<UpdateMemory>,
 ) -> impl IntoResponse {
+    let response = update_memory_write(State(app.clone()), Path(id), headers, Json(body))
+        .await
+        .into_response();
+    super::write_receipt::complete(
+        &app,
+        response,
+        super::write_receipt::WriterConnection::Legacy,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_lines)]
+async fn update_memory_write(
+    State(app): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<UpdateMemory>,
+) -> impl IntoResponse {
     let state = app.db.clone();
     if let Err(e) = validate::validate_id(&id) {
         return (
@@ -631,9 +649,14 @@ pub async fn update_memory(
         // same 403 wire shape. Inbox carve-out disabled here: the
         // inbox target should NOT be able to mutate an out-of-band
         // sender's row via PUT.
-        if let Some(resp) =
-            crate::handlers::parity::require_caller_owns_memory(existing, &caller, false)
-        {
+        if let Some(resp) = crate::handlers::parity::require_caller_owns_memory(
+            existing,
+            &caller,
+            false,
+            crate::identity::owner_stamp::MutationSite::sqlite(
+                crate::identity::owner_stamp::funnel::UPDATE,
+            ),
+        ) {
             return resp;
         }
     }
@@ -691,18 +714,7 @@ pub async fn update_memory(
                     Ok(0) => None,
                     Ok(delta) => Some((owner, eff_ns, delta)),
                     Err(crate::quotas::QuotaCheckError::Quota(qe)) => {
-                        return (
-                            StatusCode::TOO_MANY_REQUESTS,
-                            Json(json!({
-                                "code": crate::errors::error_codes::QUOTA_EXCEEDED,
-                                "error": qe.to_string(),
-                                "limit": qe.limit.as_str(),
-                                "current": qe.current,
-                                "max": qe.max,
-                                "agent_id": qe.agent_id,
-                            })),
-                        )
-                            .into_response();
+                        return crate::handlers::errors::quota_exceeded_response(&qe);
                     }
                     Err(crate::quotas::QuotaCheckError::Sql(se)) => {
                         tracing::error!("update_memory: quota substrate error: {se}");
@@ -803,15 +815,23 @@ pub async fn update_memory(
             // v0.6.0.1: fan out the mutation to peers so remote readers
             // see the update, not the pre-update row. insert_if_newer on
             // peers sees a newer updated_at and applies.
+            let mut receipt = json!(mem);
             if let (Some(fed), Some(m)) = (app.federation.as_ref(), mem.as_ref())
                 && let Ok(tracker) = crate::federation::broadcast_store_quorum(fed, m).await
-                && let Err(err) = crate::federation::finalise_quorum(&tracker)
             {
-                // #869 — typed 503 envelope via the shared helper.
-                let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
-                return super::under_replicated_response(&payload);
+                match crate::federation::finalise_quorum(&tracker) {
+                    Ok(got) => {
+                        receipt[crate::write_receipt::QUORUM_ACKS_FIELD] = json!(got);
+                        receipt[crate::write_receipt::QUORUM_N_FIELD] = json!(fed.policy.n);
+                        receipt[crate::write_receipt::QUORUM_REQUIRED_FIELD] = json!(fed.policy.w);
+                    }
+                    Err(err) => {
+                        let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
+                        return super::under_replicated_response(&payload);
+                    }
+                }
             }
-            Json(json!(mem)).into_response()
+            Json(receipt).into_response()
         }
         Ok((false, _)) => {
             // FBL-12 — refund the growth charge when the row vanished
@@ -924,7 +944,7 @@ pub async fn delete_memory(
         "allow",
         crate::mcp::registry::tool_names::MEMORY_DELETE,
         "",
-        json!({ "id": &id }),
+        crate::governance::audit::ForensicPayload::new().ident("id", &id),
     );
 
     // v0.7.0 Wave-3 — Postgres-backed daemons dispatch through the
@@ -1083,7 +1103,16 @@ pub async fn delete_memory(
                     )
                     .await;
                 }
-                (StatusCode::OK, Json(json!({"deleted": true, "id": id}))).into_response()
+                // #3730 — the SAL `delete` applied the same namespace
+                // retention policy (`inbox_delete_retains`); report it.
+                let archived = target
+                    .as_ref()
+                    .is_some_and(|m| crate::visibility::inbox_delete_retains(&m.namespace));
+                (
+                    StatusCode::OK,
+                    Json(json!({"deleted": true, "id": id, "archived": archived})),
+                )
+                    .into_response()
             }
             Err(e) => store_err_to_response(e),
         };
@@ -1149,13 +1178,23 @@ pub async fn delete_memory(
         // PROMOTE (commit 49739bb46) and #938 / #940 / #939+#941.
         //
         // #954 (Track A QC sweep, 2026-05-20) — delegated to the
-        // canonical DRY helper. Inbox carve-out enabled: the
-        // recipient of an inbox message (`metadata.target_agent_id`)
-        // IS permitted to delete that message after consuming it,
-        // per the pre-#954 inline behaviour.
-        if let Some(resp) =
-            crate::handlers::parity::require_caller_owns_memory(&target, &agent_id, true)
-        {
+        // canonical DRY helper. Inbox carve-out: the recipient of an
+        // inbox message (`metadata.target_agent_id`) IS permitted to
+        // delete that message after consuming it, per the pre-#954
+        // inline behaviour — #3730: ONLY for a row `inbox_delete_retains`
+        // archives on delete (the disposition below). The admission is
+        // derived from the namespace, never asserted beside it: a bare
+        // `true` let a non-owner erase any row addressed to it outside an
+        // inbox namespace (pinned by
+        // recipient_gate_derived_from_namespace_3730).
+        if let Some(resp) = crate::handlers::parity::require_caller_owns_memory(
+            &target,
+            &agent_id,
+            crate::visibility::inbox_delete_retains(&target.namespace),
+            crate::identity::owner_stamp::MutationSite::sqlite(
+                crate::identity::owner_stamp::funnel::DELETE,
+            ),
+        ) {
             return resp;
         }
         let payload = json!({"id": target.id, "title": target.title});
@@ -1238,7 +1277,15 @@ pub async fn delete_memory(
         }
     }
 
-    let delete_outcome = db::delete(&lock.0, &target.id);
+    // #3730 — retention policy by namespace (`inbox_delete_retains`): an
+    // inbox message is archived, everything else erased; `archived` is on
+    // the wire so the caller can tell which happened.
+    let archived = crate::visibility::inbox_delete_retains(&target.namespace);
+    let delete_outcome = if archived {
+        db::delete_archive_first(&lock.0, &target.id)
+    } else {
+        db::delete(&lock.0, &target.id)
+    };
     // v0.6.4-017 — G9 HTTP webhook parity. Fire `memory_delete` after
     // the row is gone (mirrors the MCP pattern at mcp.rs:2227). Snapshot
     // fields come from the pre-delete `target`. Best-effort,
@@ -1306,7 +1353,7 @@ pub async fn delete_memory(
                 let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
                 return super::under_replicated_response(&payload);
             }
-            Json(json!({"deleted": true})).into_response()
+            Json(json!({"deleted": true, "archived": archived})).into_response()
         }
         _ => (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response(),
     }
@@ -1646,9 +1693,14 @@ pub async fn promote_memory(
         // canonical DRY helper at `parity::require_caller_owns_memory`.
         // Inbox carve-out disabled: the inbox target should not be
         // able to promote / TTL-change the sender's row.
-        if let Some(resp) =
-            crate::handlers::parity::require_caller_owns_memory(&target, &agent_id, false)
-        {
+        if let Some(resp) = crate::handlers::parity::require_caller_owns_memory(
+            &target,
+            &agent_id,
+            false,
+            crate::identity::owner_stamp::MutationSite::sqlite(
+                crate::identity::owner_stamp::funnel::PROMOTE,
+            ),
+        ) {
             return resp;
         }
         let payload = json!({"id": target.id});

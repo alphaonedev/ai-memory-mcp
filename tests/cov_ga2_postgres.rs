@@ -953,8 +953,8 @@ async fn archive_and_list_archived_via_store() {
         .await
         .expect("archive_stats_via_store");
     assert!(
-        stats.get("total_archived").is_some(),
-        "archive_stats carries a total_archived field"
+        stats.get("archived_total").is_some(),
+        "archive_stats carries an archived_total field"
     );
     assert!(
         stats.get("by_namespace").is_some(),

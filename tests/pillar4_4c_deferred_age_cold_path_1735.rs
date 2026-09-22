@@ -24,6 +24,7 @@ use ai_memory::config::{AgeProjectionMode, set_age_projection_mode};
 use ai_memory::models::{Memory, MemoryLink, MemoryLinkRelation, Tier};
 use ai_memory::store::postgres::PostgresStore;
 use ai_memory::store::{CallerContext, KgBackend, MemoryStore};
+use std::fmt::Write as _;
 
 fn pg_url() -> Option<String> {
     std::env::var("AI_MEMORY_TEST_AGE_URL")
@@ -41,6 +42,43 @@ fn mk_memory(namespace: &str, title: &str, now: &str) -> Memory {
         created_at: now.to_string(),
         updated_at: now.to_string(),
         ..Memory::default()
+    }
+}
+
+/// The pending half of the `kg_projection_outbox` ledger, rendered for a
+/// panic message. When the drain reports fewer projections than the test
+/// enqueued, the ONLY record of WHY is this table — `attempt_count` says
+/// whether the drainer took the row at all, `last_error` carries the AGE
+/// error that rolled the projection back (a missing `memory_graph`, an
+/// unloaded extension, a `search_path` that does not resolve `cypher`, …).
+/// Without it a CI red reads "got 0" and nothing else, which is what the
+/// coverage job on the promotion head produced; with it the ledger is in
+/// the CI log where the next measurement has to come from.
+async fn pending_outbox_ledger(store: &PostgresStore) -> String {
+    /// One pending `kg_projection_outbox` row: `(id, attempt_count, relation, last_error)`.
+    type OutboxRow = (i64, i32, String, Option<String>);
+    let rows: Result<Vec<OutboxRow>, sqlx::Error> = sqlx::query_as(
+        "SELECT id, attempt_count, relation, last_error \
+         FROM kg_projection_outbox WHERE projected_at IS NULL",
+    )
+    .fetch_all(store.pool())
+    .await;
+    match rows {
+        Ok(rows) if rows.is_empty() => "kg_projection_outbox: no pending rows".to_string(),
+        Ok(rows) => {
+            let mut out = format!("kg_projection_outbox pending rows ({}):", rows.len());
+            for (id, attempt_count, relation, last_error) in rows {
+                // The ledger string is best-effort diagnostics; a failed
+                // `write!` into a `String` cannot happen, so the result is
+                // deliberately ignored rather than unwrapped in a panic path.
+                let _ = write!(
+                    out,
+                    "\n  id={id} attempt_count={attempt_count} relation={relation} last_error={last_error:?}"
+                );
+            }
+            out
+        }
+        Err(e) => format!("kg_projection_outbox: ledger read failed: {e}"),
     }
 }
 
@@ -130,7 +168,9 @@ async fn deferred_link_enqueues_drains_and_find_paths_via_cte_1735() {
         .expect("drain kg_projection_outbox");
     assert!(
         projected >= 1,
-        "drain must project at least the one pending row, got {projected}"
+        "drain must project at least the one pending row, got {projected} \
+         (link {a_id} -> {b_id}, namespace {ns}); {}",
+        pending_outbox_ledger(&store).await
     );
 
     // Idempotent: an already-projected row (projected_at set) is excluded
@@ -140,8 +180,10 @@ async fn deferred_link_enqueues_drains_and_find_paths_via_cte_1735() {
         .await
         .expect("second drain");
     assert_eq!(
-        again, 0,
-        "already-projected rows must not be re-drained, got {again}"
+        again,
+        0,
+        "already-projected rows must not be re-drained, got {again}; {}",
+        pending_outbox_ledger(&store).await
     );
 
     // find_paths still returns the edge after projection.

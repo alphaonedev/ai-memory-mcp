@@ -124,7 +124,7 @@ pub fn handle_skill_promote_from_reflection(
         &caller,
         read_caller.as_deref(),
     )
-    .map_err(|error| error.to_string())
+    .map_err(|error| crate::mcp::error_text::mcp_foreign_err("as_deref", error))
 }
 
 /// Shared SQLite promotion body. HTTP preserves its authenticated actor separately
@@ -142,19 +142,25 @@ pub(crate) fn handle_skill_promote_for_caller(
         .as_str()
         .filter(|s| !s.is_empty())
         .ok_or_else(|| {
-            anyhow::anyhow!("memory_skill_promote_from_reflection requires 'reflection_id'")
+            crate::errors::invalid_input(
+                "memory_skill_promote_from_reflection requires 'reflection_id'",
+            )
         })?;
     let skill_name = params[param_names::SKILL_NAME]
         .as_str()
         .filter(|s| !s.is_empty())
         .ok_or_else(|| {
-            anyhow::anyhow!("memory_skill_promote_from_reflection requires 'skill_name'")
+            crate::errors::invalid_input(
+                "memory_skill_promote_from_reflection requires 'skill_name'",
+            )
         })?;
     let skill_description = params[field_names::SKILL_DESCRIPTION]
         .as_str()
         .filter(|s| !s.is_empty())
         .ok_or_else(|| {
-            anyhow::anyhow!("memory_skill_promote_from_reflection requires 'skill_description'")
+            crate::errors::invalid_input(
+                "memory_skill_promote_from_reflection requires 'skill_description'",
+            )
         })?;
     // v0.9.0 §11.5 B7-SKILL (#1865) — widened from `!v.is_null() &&
     // v.is_object()` to `!v.is_null()` so a non-object value reaches
@@ -166,7 +172,8 @@ pub(crate) fn handle_skill_promote_for_caller(
 
     // Validate skill name against agentskills.io §3.1 BEFORE any DB work
     // so the caller sees the parse error at the boundary.
-    crate::parsing::skill_md::validate_skill_name(skill_name).map_err(anyhow::Error::msg)?;
+    crate::parsing::skill_md::validate_skill_name(skill_name)
+        .map_err(crate::errors::invalid_input)?;
 
     // v0.9.0 §11.5 B7-SKILL (#1865) — FAIL CLOSED on a malformed
     // parameters_schema here too, same structural gate `skill_register`
@@ -175,16 +182,18 @@ pub(crate) fn handle_skill_promote_for_caller(
     // path instead.
     if let Some(schema) = parameters_schema {
         validate_parameters_schema(schema).map_err(|e| {
-            anyhow::anyhow!("parameters_schema rejected at promote (fail-closed): {e}")
+            crate::errors::invalid_input(format!(
+                "parameters_schema rejected at promote (fail-closed): {e}"
+            ))
         })?;
     }
 
     if skill_description.len() > 1024 {
-        return Err(anyhow::anyhow!(
+        return Err(crate::errors::invalid_input(format!(
             "skill 'description' must be ≤ 1024 characters \
              (agentskills.io spec §3.2): got {} characters",
             skill_description.len()
-        ));
+        )));
     }
 
     // ─── 2. Fetch + validate the source reflection ─────────────────────
@@ -196,11 +205,11 @@ pub(crate) fn handle_skill_promote_for_caller(
     )?;
 
     if reflection.memory_kind != MemoryKind::Reflection {
-        return Err(anyhow::anyhow!(
+        return Err(crate::errors::refusal(format!(
             "memory '{reflection_id}' is memory_kind='{}', expected 'reflection' \
              (memory_skill_promote_from_reflection is reflection-only)",
             reflection.memory_kind
-        ));
+        )));
     }
 
     // Resolve the per-namespace threshold; compiled default is 1.
@@ -213,14 +222,12 @@ pub(crate) fn handle_skill_promote_for_caller(
     #[allow(clippy::cast_sign_loss)]
     let actual_depth_u32: u32 = reflection.reflection_depth.max(0) as u32;
     if actual_depth_u32 < min_depth {
-        return Err(anyhow::anyhow!(
+        return Err(crate::errors::refusal(format!(
             "reflection '{reflection_id}' has reflection_depth={} but \
              namespace '{}' requires skill_promotion_min_depth={} — \
              a depth-0 reflection carries no synthesised insight to promote",
-            reflection.reflection_depth,
-            reflection.namespace,
-            min_depth,
-        ));
+            reflection.reflection_depth, reflection.namespace, min_depth,
+        )));
     }
 
     // ─── 3. Walk reflects_on edges → source resources ──────────────────
@@ -229,8 +236,7 @@ pub(crate) fn handle_skill_promote_for_caller(
     // ReflectsOn). The substrate `reflect` writer is the only producer
     // of these edges, so the order matches the original source_ids
     // input order at the wire level.
-    let links = crate::db::get_links(conn, reflection_id)
-        .map_err(|e| anyhow::anyhow!("loading reflects_on edges: {e}"))?;
+    let links = crate::db::get_links(conn, reflection_id).context("loading reflects_on edges")?;
     let mut source_ids: Vec<String> = links
         .into_iter()
         .filter(|l| l.source_id == reflection_id && l.relation == MemoryLinkRelation::ReflectsOn)
@@ -254,10 +260,9 @@ pub(crate) fn handle_skill_promote_for_caller(
         "allow",
         "skill_promote_from_reflection",
         "",
-        serde_json::json!({
-            (field_names::REFLECTION_ID): reflection_id,
-            (field_names::SKILL_NAME): skill_name,
-        }),
+        crate::governance::audit::ForensicPayload::new()
+            .ident(field_names::REFLECTION_ID, reflection_id)
+            .ident(field_names::SKILL_NAME, skill_name),
     );
     let mut resources: Vec<(String, String, Vec<u8>)> = Vec::with_capacity(sources.len());
     for (i, m) in sources.iter().enumerate() {
@@ -402,6 +407,7 @@ pub(crate) fn handle_skill_promote_for_caller(
 // --- D1.5 (#986): per-tool McpTool impl for memory_skill_promote_from_reflection ---
 
 use crate::mcp::registry::McpTool;
+use anyhow::Context as _;
 use schemars::JsonSchema;
 use serde::Deserialize;
 

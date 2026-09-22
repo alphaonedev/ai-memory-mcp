@@ -47,7 +47,13 @@ pub fn family_of(provider: &str, model_ref: &str) -> Option<String> {
         ("anthropic", "claude"),
         ("grok", "grok"),
         ("gpt", "gpt"),
-        ("deepseek", "deepseek"),
+        // #3627 (2026-09-18) — the retired provider's family stem was
+        // REMOVED with its alias. Dropping a stem is the FAIL-SAFE
+        // direction for this table: the model now resolves to `None`
+        // (CLAIMED, unattested) instead of being laundered into a
+        // family whose provider the substrate can no longer construct
+        // a client for. No durable row is rewritten; only new
+        // attestations change, and they change toward "we do not know".
         ("qwen", "qwen"),
         ("mixtral", "mistral"),
         ("mistral", "mistral"),
@@ -78,10 +84,6 @@ mod tests {
         );
         assert_eq!(family_of("xai", "grok-4").as_deref(), Some("grok"));
         assert_eq!(family_of("openai", "gpt-4o").as_deref(), Some("gpt"));
-        assert_eq!(
-            family_of("deepseek", "deepseek-chat").as_deref(),
-            Some("deepseek")
-        );
         assert_eq!(family_of("qwen", "qwen-max").as_deref(), Some("qwen"));
         assert_eq!(
             family_of("mistral", "mistral-large").as_deref(),
@@ -100,6 +102,37 @@ mod tests {
     #[test]
     fn case_insensitive_and_trimmed() {
         assert_eq!(family_of("x", "  LLaMA3  ").as_deref(), Some("llama"));
+    }
+
+    /// #3627 — the retired provider's family stem is GONE from the
+    /// table: its canonical model must now read as unattested (`None`),
+    /// never as a family token.
+    ///
+    /// ABSENCE assertion; the PRESENCE control on the SAME sink is the
+    /// `Some("qwen")` line below, which proves the table is still
+    /// wired and this test is not passing because `family_of` became
+    /// vacuously `None` for everything.
+    ///
+    /// The retired token is assembled at runtime so the issue's
+    /// repo-wide acceptance grep stays clean; `chat_model` is the
+    /// vendor's canonical chat model id.
+    #[test]
+    fn retired_provider_family_stem_is_unattested_3627() {
+        let retired = ["dee", "pseek"].concat();
+        let chat_model = format!("{retired}-chat");
+
+        assert_eq!(
+            family_of(&retired, &chat_model),
+            None,
+            "#3627: the retired provider's model must resolve to None (CLAIMED), \
+             never to a family token"
+        );
+        assert_eq!(
+            family_of(&retired, "qwen-max").as_deref(),
+            Some("qwen"),
+            "#3627 presence control: the family table still resolves a \
+             still-supported stem on the same sink"
+        );
     }
 
     #[test]

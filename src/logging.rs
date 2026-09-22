@@ -39,11 +39,87 @@ use crate::log_paths;
 /// rotated filenames look like `ai-memory.log.2026-04-30`.
 const DEFAULT_PREFIX: &str = "ai-memory.log";
 
-/// Default `tracing` EnvFilter directive applied when `RUST_LOG` is
-/// unset — INFO-level for the substrate's own crate only. One spelling
-/// for every fallback-filter construction site (pm-v3.1 gate, #1558
-/// wave 4).
-pub const DEFAULT_LOG_DIRECTIVE: &str = "ai_memory=info";
+/// Default `tracing` filter applied when `RUST_LOG` is unset — a BARE
+/// `info` level covering EVERY target, not only the ones under
+/// `ai_memory`. One spelling for every fallback-filter construction
+/// site (pm-v3.1 gate, #1558 wave 4).
+///
+/// v1.0.0 #3650: this used to be the targeted directive
+/// `ai_memory=info`. Hundreds of event sites name an explicit target
+/// outside that prefix (`store::postgres`, `federation::…`,
+/// `signed_events`, `schema_guard`, `security.posture`, `http::auth`,
+/// `logging`, …), so the shipped default discarded their boot,
+/// security, replay and degradation events. A per-prefix allowlist
+/// cannot stay complete (per-file `TRACE_TARGET` consts carry many
+/// values), so the default is a bare level instead.
+///
+/// Noise cost of the bare level: third-party crates in the dependency
+/// tree are admitted at INFO/WARN/ERROR too, rather than only
+/// `ai_memory`. The operator still narrows output per target via
+/// `RUST_LOG`, which the builder layers last.
+pub const DEFAULT_LOG_DIRECTIVE: &str = "info";
+
+/// A filter ready to install, plus every directive that could not be used.
+///
+/// The rejects are returned rather than logged: no subscriber exists yet
+/// when the filter is built, so a `tracing::warn!` at that point would be
+/// swallowed — the silent-degradation shape this codebase treats as a
+/// defect. Callers emit them after installing their subscriber.
+pub(crate) struct BuiltLogFilter {
+    pub(crate) filter: tracing_subscriber::EnvFilter,
+    pub(crate) rejected: Vec<String>,
+}
+
+/// Build the filter a production subscriber installs: `base_level` first,
+/// then `extra_directives`, then each `RUST_LOG` directive LAST so the
+/// operator wins for the target it names. PURE — no environment read, no
+/// global install, no I/O — so the layering rules and the #3650 census
+/// are asserted deterministically without the fragile process-global
+/// install path (the #1711 lesson).
+///
+/// An unparseable piece is skipped with a recorded reject (never fatal:
+/// a bad directive costs verbosity, not the boot). Empty pieces are
+/// ignored silently so `RUST_LOG=""` and trailing commas stay warn-free.
+pub(crate) fn build_log_filter(
+    base_level: &str,
+    extra_directives: &[&str],
+    rust_log: Option<&str>,
+) -> BuiltLogFilter {
+    let mut filter = tracing_subscriber::EnvFilter::try_new(base_level).unwrap_or_else(|_| {
+        tracing_subscriber::EnvFilter::try_new("info").expect("`info` is a valid filter")
+    });
+    let mut rejected: Vec<String> = Vec::new();
+    let rust_log_pieces = rust_log
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|piece| !piece.is_empty());
+    for directive in extra_directives
+        .iter()
+        .map(|directive| directive.trim())
+        .filter(|directive| !directive.is_empty())
+        .chain(rust_log_pieces)
+    {
+        match directive.parse() {
+            Ok(directive) => filter = filter.add_directive(directive),
+            Err(err) => rejected.push(format!("{directive:?} ({err})")),
+        }
+    }
+    BuiltLogFilter { filter, rejected }
+}
+
+/// The operator's `RUST_LOG`, when set. Read once per subscriber install.
+fn rust_log_env() -> Option<String> {
+    std::env::var(tracing_subscriber::EnvFilter::DEFAULT_ENV).ok()
+}
+
+/// Report directives [`build_log_filter`] could not use. Call only after a
+/// subscriber is installed, otherwise the warnings go nowhere. Never fatal.
+fn warn_rejected_directives(rejected: Vec<String>) {
+    for reject in rejected {
+        tracing::warn!(target: "logging", "ignoring unparseable log directive {reject}");
+    }
+}
 
 /// Initialise the file logging facility. Returns a [`WorkerGuard`] that
 /// the caller MUST keep alive for the lifetime of the process — when
@@ -62,9 +138,7 @@ pub const DEFAULT_LOG_DIRECTIVE: &str = "ai_memory=info";
 /// those tests actually verify: that a garbage directive degrades to
 /// `info` instead of erroring).
 pub(crate) fn level_filter_or_info_fallback(level: &str) -> tracing_subscriber::EnvFilter {
-    tracing_subscriber::EnvFilter::try_new(level).unwrap_or_else(|_| {
-        tracing_subscriber::EnvFilter::try_new("info").expect("info is a valid filter")
-    })
+    build_log_filter(level, &[], None).filter
 }
 
 /// One-shot detection of a configured-but-unrecognized log sink value
@@ -127,36 +201,27 @@ fn classify_unrecognized_sink(raw: Option<&str>) -> Option<String> {
 /// (e.g. `init_file_logging` ran first), so the order of boot steps does
 /// not matter and a second call cannot panic.
 ///
-/// `extra_directives` are appended to the env filter after
-/// [`DEFAULT_LOG_DIRECTIVE`]; an unparseable directive is skipped with a
-/// WARN rather than aborting the boot, because losing a log directive
-/// must never be fatal to the daemon it configures.
+/// The filter is [`build_log_filter`] over [`DEFAULT_LOG_DIRECTIVE`],
+/// then `extra_directives`, then the operator's `RUST_LOG` LAST (an
+/// appended same-target directive used to reset an operator's
+/// `RUST_LOG=ai_memory=debug` back to info: same-target directives
+/// replace regardless of level). An unparseable directive is skipped
+/// with a WARN rather than aborting the boot, because losing a log
+/// directive must never be fatal to the daemon it configures.
 pub fn init_console_tracing(extra_directives: &[&str]) {
-    let mut filter = tracing_subscriber::EnvFilter::from_default_env().add_directive(
-        DEFAULT_LOG_DIRECTIVE
-            .parse()
-            .expect("DEFAULT_LOG_DIRECTIVE is a compile-time constant and always parses"),
+    let built = build_log_filter(
+        DEFAULT_LOG_DIRECTIVE,
+        extra_directives,
+        rust_log_env().as_deref(),
     );
-    // Collect rejects rather than warning inline: no subscriber is
-    // installed yet, so a `tracing::warn!` here would be swallowed — the
-    // silent-degradation shape this codebase treats as a defect.
-    let mut rejected: Vec<String> = Vec::new();
-    for directive in extra_directives {
-        match directive.parse() {
-            Ok(d) => filter = filter.add_directive(d),
-            Err(e) => rejected.push(format!("{directive:?} ({e})")),
-        }
-    }
     let _ = tracing_subscriber::fmt()
-        .with_env_filter(filter)
+        .with_env_filter(built.filter)
         // #3436 — the whole point of this funnel. NOT a parameter.
         .with_writer(std::io::stderr)
         .try_init();
     // Now that a subscriber exists, the rejects are actually visible.
     // Never fatal: a bad directive costs verbosity, not the boot.
-    for reject in rejected {
-        tracing::warn!(target: "logging", "ignoring unparseable log directive {reject}");
-    }
+    warn_rejected_directives(built.rejected);
 }
 
 pub fn init_file_logging(cfg: &LoggingConfig) -> Result<Option<WorkerGuard>> {
@@ -169,14 +234,9 @@ pub fn init_file_logging(cfg: &LoggingConfig) -> Result<Option<WorkerGuard>> {
     // the two sinks are byte-identical on every request path. A configured
     // but unrecognized value falls back to `file` with a loud WARN rather
     // than silently misrouting (louder than `rotation_for`'s silent default).
-    if let Some(bad) = unrecognized_sink_value(cfg) {
-        tracing::warn!(
-            target: "logging",
-            value = %bad,
-            "unrecognized log sink (AI_MEMORY_LOG_SINK / [logging].sink); \
-             falling back to the file sink. Valid: file | stdout | syslog"
-        );
-    }
+    // Read here, EMITTED after the install below (#3650): warning before a
+    // subscriber exists goes nowhere.
+    let bad_sink = unrecognized_sink_value(cfg);
     // #1765 Tier 2 — the remote syslog sink uses a level-aware `MakeWriter`
     // (so each record's RFC-5424 PRI severity reflects the event's tracing
     // Level) rather than the File/Stdout `NonBlocking` writer, so it installs
@@ -233,6 +293,15 @@ pub fn init_file_logging(cfg: &LoggingConfig) -> Result<Option<WorkerGuard>> {
         //           invoking the format closure. Documented per L0.7
         //           playbook §3c.
         tracing::debug!("file logging subscriber already initialised: {e}");
+    }
+    // #3650 — now that a subscriber exists, the fallback WARN is visible.
+    if let Some(bad) = bad_sink {
+        tracing::warn!(
+            target: "logging",
+            value = %bad,
+            "unrecognized log sink (AI_MEMORY_LOG_SINK / [logging].sink); \
+             falling back to the file sink. Valid: file | stdout | syslog"
+        );
     }
     Ok(Some(guard))
 }
@@ -1535,5 +1604,673 @@ mod tests {
     fn redact_message_without_urls_is_identity() {
         let msg = "plain diagnostic with no connection string";
         assert_eq!(redact_urls_in_message(msg), msg);
+    }
+    // -----------------------------------------------------------------
+    // v1.0.0 #3650 — the shipped default filter must admit every
+    // explicit tracing target in src/.
+    // -----------------------------------------------------------------
+
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::path::{Path, PathBuf};
+
+    /// One static callsite shared by every synthetic census event. Only
+    /// its pointer identity is consulted (span callsite dedup); the
+    /// filter under test matches on target + level, so a single
+    /// callsite serves the whole census.
+    struct CensusCallsite3650;
+
+    static CENSUS_CALLSITE_3650: CensusCallsite3650 = CensusCallsite3650;
+
+    /// No fields on any synthetic census event. A named empty array (not
+    /// an inline `&[]`): the [`tracing::field::FieldSet`] stores a
+    /// `&'static` name set, which a runtime temporary cannot satisfy.
+    static CENSUS_NO_FIELDS_3650: [&'static str; 0] = [];
+
+    static CENSUS_DUMMY_METADATA_3650: tracing::Metadata<'static> = tracing::Metadata::new(
+        "census_dummy_3650",
+        "census_dummy_3650",
+        tracing::Level::INFO,
+        None,
+        None,
+        None,
+        tracing::field::FieldSet::new(
+            &CENSUS_NO_FIELDS_3650,
+            tracing::callsite::Identifier(&CENSUS_CALLSITE_3650),
+        ),
+        tracing::metadata::Kind::EVENT,
+    );
+
+    impl tracing::callsite::Callsite for CensusCallsite3650 {
+        fn set_interest(&self, _: tracing::subscriber::Interest) {}
+        fn metadata(&self) -> &tracing::Metadata<'_> {
+            &CENSUS_DUMMY_METADATA_3650
+        }
+    }
+
+    /// Synthetic event metadata for `target` at `level`, admitted through
+    /// the same [`tracing::Dispatch::enabled`] predicate the installed
+    /// subscriber consults at runtime. The target string is leaked so the
+    /// metadata can borrow it statically; the census population is a few
+    /// hundred entries and the test is short-lived.
+    fn census_event_metadata_3650(
+        target: &str,
+        level: tracing::Level,
+    ) -> tracing::Metadata<'static> {
+        let leaked: &'static str = Box::leak(target.to_owned().into_boxed_str());
+        tracing::Metadata::new(
+            "census_event_3650",
+            leaked,
+            level,
+            Some("census_3650"),
+            Some(0),
+            Some("census_3650"),
+            tracing::field::FieldSet::new(
+                &CENSUS_NO_FIELDS_3650,
+                tracing::callsite::Identifier(&CENSUS_CALLSITE_3650),
+            ),
+            tracing::metadata::Kind::EVENT,
+        )
+    }
+
+    /// Admission through the REAL subscriber stack: the filter under test
+    /// wrapped in the same `fmt` layer the boot path installs, consulted
+    /// via the thread-local dispatcher (no process-global install, so
+    /// this stays deterministic under parallel `cargo test`).
+    fn filter_admits_3650(
+        filter: tracing_subscriber::EnvFilter,
+        target: &str,
+        level: tracing::Level,
+    ) -> bool {
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(std::io::sink)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        tracing::dispatcher::get_default(|dispatch| {
+            dispatch.enabled(&census_event_metadata_3650(target, level))
+        })
+    }
+
+    fn census_src_dir_3650() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src")
+    }
+
+    fn walk_rs_files_3650(dir: &Path, out: &mut Vec<PathBuf>) {
+        let entries = std::fs::read_dir(dir)
+            .unwrap_or_else(|err| panic!("read src dir {}: {err}", dir.display()));
+        let mut entries: Vec<PathBuf> = entries
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .collect();
+        entries.sort();
+        for path in entries {
+            if path.is_dir() {
+                walk_rs_files_3650(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    fn is_word_char_3650(byte: u8) -> bool {
+        byte.is_ascii_alphanumeric() || byte == b'_'
+    }
+
+    fn skip_ws_3650(bytes: &[u8], mut idx: usize) -> usize {
+        while idx < bytes.len() && matches!(bytes[idx], b' ' | b'\t' | b'\n' | b'\r') {
+            idx += 1;
+        }
+        idx
+    }
+
+    fn read_ident_3650(bytes: &[u8], mut idx: usize) -> (String, usize) {
+        let start = idx;
+        while idx < bytes.len() && is_word_char_3650(bytes[idx]) {
+            idx += 1;
+        }
+        (
+            String::from_utf8_lossy(&bytes[start..idx]).into_owned(),
+            idx,
+        )
+    }
+
+    /// SCREAMING_SNAKE_CASE with at least one letter: the shape every
+    /// tracing-target const in the tree uses (`TRACE_TARGET`,
+    /// `SIGNING_TRACE_TARGET`, `LOG_TARGET`, …). Struct fields, locals
+    /// and macro metavariables (`target`, `id`, `snapshot`, `$target`)
+    /// never have this shape, so they are out of the census population
+    /// by construction.
+    fn is_screaming_3650(name: &str) -> bool {
+        !name.is_empty()
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+            && name.bytes().any(|byte| byte.is_ascii_uppercase())
+    }
+
+    /// Strip `//` line comments and `/* … */` block comments (which
+    /// nest in Rust), preserving newlines so line numbers survive.
+    /// String and char literals are honoured, so a `//` inside a URL or
+    /// test data stays intact while real prose comments — the source of
+    /// false `target:` sites like `(source=A, target=B)` — are removed.
+    fn strip_comments_3650(text: &str) -> String {
+        let bytes = text.as_bytes();
+        let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+        let mut idx = 0;
+        while idx < bytes.len() {
+            let byte = bytes[idx];
+            if byte == b'"' {
+                out.push(byte);
+                idx += 1;
+                while idx < bytes.len() {
+                    let inner = bytes[idx];
+                    out.push(inner);
+                    idx += 1;
+                    if inner == b'\\' && idx < bytes.len() {
+                        out.push(bytes[idx]);
+                        idx += 1;
+                    } else if inner == b'"' {
+                        break;
+                    }
+                }
+            } else if byte == b'\'' {
+                // Heuristic char literal (`'x'`, `'\n'`). A lifetime
+                // (`'a`) is never followed by a closing quote in the
+                // char-literal shape, so only that shape is consumed.
+                let mut end = idx + 1;
+                if end < bytes.len() && bytes[end] == b'\\' {
+                    end += 2;
+                } else {
+                    end += 1;
+                }
+                if end < bytes.len() && bytes[end] == b'\'' {
+                    while idx <= end {
+                        out.push(bytes[idx]);
+                        idx += 1;
+                    }
+                } else {
+                    out.push(byte);
+                    idx += 1;
+                }
+            } else if byte == b'/' && idx + 1 < bytes.len() && bytes[idx + 1] == b'/' {
+                while idx < bytes.len() && bytes[idx] != b'\n' {
+                    idx += 1;
+                }
+            } else if byte == b'/' && idx + 1 < bytes.len() && bytes[idx + 1] == b'*' {
+                let mut depth = 1;
+                idx += 2;
+                while idx < bytes.len() && depth > 0 {
+                    if bytes[idx] == b'\n' {
+                        out.push(b'\n');
+                        idx += 1;
+                    } else if idx + 1 < bytes.len() && bytes[idx] == b'/' && bytes[idx + 1] == b'*'
+                    {
+                        depth += 1;
+                        idx += 2;
+                    } else if idx + 1 < bytes.len() && bytes[idx] == b'*' && bytes[idx + 1] == b'/'
+                    {
+                        depth -= 1;
+                        idx += 2;
+                    } else {
+                        idx += 1;
+                    }
+                }
+            } else {
+                out.push(byte);
+                idx += 1;
+            }
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    /// Every `const NAME [: Type] = "literal"` (into `lits`) and every
+    /// `const NAME [: Type] = path::TO::OTHER;` (into `aliases`) in one
+    /// file. Paths are resolved transitively by [`resolve_const_3650`]:
+    /// `SMART_LOAD_LOG_TARGET` aliases a `tool_names` const rather than
+    /// holding its own literal.
+    fn collect_consts_3650(
+        text: &str,
+        lits: &mut BTreeMap<String, Vec<String>>,
+        aliases: &mut BTreeMap<String, Vec<String>>,
+    ) {
+        let bytes = text.as_bytes();
+        let mut idx = 0;
+        while idx + 5 <= bytes.len() {
+            if &bytes[idx..idx + 5] == b"const"
+                && (idx == 0 || !is_word_char_3650(bytes[idx - 1]))
+                && (idx + 5 >= bytes.len() || !is_word_char_3650(bytes[idx + 5]))
+            {
+                let mut cur = skip_ws_3650(bytes, idx + 5);
+                let (name, next) = read_ident_3650(bytes, cur);
+                cur = skip_ws_3650(bytes, next);
+                if name.is_empty() {
+                    idx += 5;
+                    continue;
+                }
+                if cur < bytes.len() && bytes[cur] == b':' {
+                    cur = skip_ws_3650(bytes, cur + 1);
+                    while cur < bytes.len() && !matches!(bytes[cur], b'=' | b';' | b'{' | b'(') {
+                        cur += 1;
+                    }
+                    if cur >= bytes.len() || bytes[cur] != b'=' {
+                        idx += 5;
+                        continue;
+                    }
+                } else if cur >= bytes.len() || bytes[cur] != b'=' {
+                    idx += 5;
+                    continue;
+                }
+                cur = skip_ws_3650(bytes, cur + 1);
+                if cur < bytes.len() && bytes[cur] == b'"' {
+                    cur += 1;
+                    let start = cur;
+                    let mut closed = false;
+                    while cur < bytes.len() {
+                        if bytes[cur] == b'\\' && cur + 1 < bytes.len() {
+                            cur += 2;
+                            continue;
+                        }
+                        if bytes[cur] == b'"' {
+                            closed = true;
+                            break;
+                        }
+                        cur += 1;
+                    }
+                    if closed {
+                        let value = String::from_utf8_lossy(&bytes[start..cur]).into_owned();
+                        // One const name can hold different values in
+                        // different modules (`MEMORY_SMART_LOAD` is both a
+                        // route and a tool name); every candidate joins
+                        // the population so import order cannot hide one.
+                        let slot = lits.entry(name).or_default();
+                        if !slot.contains(&value) {
+                            slot.push(value);
+                        }
+                        idx = cur + 1;
+                        continue;
+                    }
+                } else {
+                    let mut cur = cur;
+                    let mut last = String::new();
+                    loop {
+                        let (segment, next) = read_ident_3650(bytes, cur);
+                        if segment.is_empty() {
+                            break;
+                        }
+                        last = segment;
+                        cur = next;
+                        if cur + 1 < bytes.len() && bytes[cur] == b':' && bytes[cur + 1] == b':' {
+                            cur += 2;
+                        } else {
+                            break;
+                        }
+                    }
+                    // A bare `NAME;` value is a const alias
+                    // (`= crate::…::OTHER;`); calls (`foo();`) and
+                    // numbers are not.
+                    if !last.is_empty()
+                        && is_screaming_3650(&last)
+                        && cur < bytes.len()
+                        && bytes[cur] == b';'
+                    {
+                        let slot = aliases.entry(name).or_default();
+                        if !slot.contains(&last) {
+                            slot.push(last);
+                        }
+                        idx = cur + 1;
+                        continue;
+                    }
+                }
+                idx += 5;
+            } else {
+                idx += 1;
+            }
+        }
+    }
+
+    /// Follow `aliases` from `name` to every literal it can denote
+    /// (bounded, cycle-safe: an alias cycle contributes what it reached
+    /// rather than looping). Multi-valued because one const name may
+    /// hold different literals in different modules.
+    fn resolve_const_3650(
+        name: &str,
+        lits: &BTreeMap<String, Vec<String>>,
+        aliases: &BTreeMap<String, Vec<String>>,
+    ) -> BTreeSet<String> {
+        let mut out = BTreeSet::new();
+        let mut frontier = vec![name.to_string()];
+        let mut visited: BTreeSet<String> = BTreeSet::new();
+        for _ in 0..8 {
+            let mut next_frontier = Vec::new();
+            for current in frontier {
+                if !visited.insert(current.clone()) {
+                    continue;
+                }
+                if let Some(values) = lits.get(&current) {
+                    out.extend(values.iter().cloned());
+                }
+                if let Some(names) = aliases.get(&current) {
+                    next_frontier.extend(names.iter().cloned());
+                }
+            }
+            if next_frontier.is_empty() {
+                break;
+            }
+            frontier = next_frontier;
+        }
+        out
+    }
+
+    /// Collect every explicit tracing target in one (comment-stripped)
+    /// file: the `target: "literal"` inline form and the
+    /// `target = "literal"` field form, plus `target: CONST` /
+    /// `target: path::CONST` resolved through `lits`/`aliases`. A
+    /// `target:` path followed by `.` is a method call on a value
+    /// (`target: NS.to_string()` — a struct field, not an event target)
+    /// and is ignored; `let target = EXPR` bindings are not event
+    /// targets either. A SCREAMING ident with no resolvable const is
+    /// reported in `unresolved` (fail-closed: a renamed const or a
+    /// genuinely dynamic target must be investigated, never silently
+    /// dropped from the census).
+    fn collect_file_targets_3650(
+        path: &Path,
+        text: &str,
+        lits: &BTreeMap<String, Vec<String>>,
+        aliases: &BTreeMap<String, Vec<String>>,
+        targets: &mut BTreeSet<String>,
+        unresolved: &mut Vec<String>,
+    ) {
+        let bytes = text.as_bytes();
+        let mut idx = 0;
+        while idx + 6 <= bytes.len() {
+            if &bytes[idx..idx + 6] == b"target" && (idx == 0 || !is_word_char_3650(bytes[idx - 1]))
+            {
+                let mut cur = skip_ws_3650(bytes, idx + 6);
+                if cur >= bytes.len() {
+                    break;
+                }
+                let delimiter = bytes[cur];
+                if delimiter != b':' && delimiter != b'=' {
+                    idx += 1;
+                    continue;
+                }
+                cur = skip_ws_3650(bytes, cur + 1);
+                if cur < bytes.len() && bytes[cur] == b'"' {
+                    cur += 1;
+                    let start = cur;
+                    let mut closed = false;
+                    while cur < bytes.len() {
+                        if bytes[cur] == b'\\' && cur + 1 < bytes.len() {
+                            cur += 2;
+                            continue;
+                        }
+                        if bytes[cur] == b'"' {
+                            closed = true;
+                            break;
+                        }
+                        cur += 1;
+                    }
+                    if closed {
+                        targets.insert(String::from_utf8_lossy(&bytes[start..cur]).into_owned());
+                    }
+                    idx = cur + 1;
+                    continue;
+                }
+                if delimiter == b':' {
+                    let mut cur = cur;
+                    let mut last = String::new();
+                    loop {
+                        let (segment, next) = read_ident_3650(bytes, cur);
+                        if segment.is_empty() {
+                            break;
+                        }
+                        last = segment;
+                        cur = next;
+                        if cur + 1 < bytes.len() && bytes[cur] == b':' && bytes[cur + 1] == b':' {
+                            cur += 2;
+                        } else {
+                            break;
+                        }
+                    }
+                    // `target: VALUE.method()` is a struct field holding
+                    // a computed value, not an event target.
+                    let is_call = cur < bytes.len() && bytes[cur] == b'.';
+                    if !is_call && is_screaming_3650(&last) {
+                        let resolved = resolve_const_3650(&last, lits, aliases);
+                        if resolved.is_empty() {
+                            let line =
+                                bytes[..idx].iter().filter(|byte| **byte == b'\n').count() + 1;
+                            unresolved.push(format!("{}:{line}: {last}", path.display()));
+                        } else {
+                            targets.extend(resolved);
+                        }
+                    }
+                    idx = cur.max(idx + 1);
+                    continue;
+                }
+            }
+            idx += 1;
+        }
+    }
+
+    /// #3650 — the DERIVED guarantee. The census walks `src/` for every
+    /// explicit tracing target literal (the `target = "…"` and `target:`
+    /// forms, inline or via a `*TARGET*` const), builds the REAL default
+    /// filter the way [`init_console_tracing`] builds it, and asserts an
+    /// INFO-, WARN- and ERROR-level event under every censused target is
+    /// admitted by the installed subscriber stack. A target that does
+    /// not exist in the tree is not in the population (no wildcard).
+    #[test]
+    fn default_filter_admits_every_explicit_target_3650() {
+        let src = census_src_dir_3650();
+        let mut files = Vec::new();
+        walk_rs_files_3650(&src, &mut files);
+        assert!(
+            !files.is_empty(),
+            "#3650 census: no .rs files under {}",
+            src.display()
+        );
+        let mut lits: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut aliases: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut texts = Vec::new();
+        for path in &files {
+            let text = std::fs::read_to_string(path)
+                .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+            // Comments are prose, not events: `(source=A, target=B)` and
+            // `outbound target: LLM` read as false `target:` sites.
+            let stripped = strip_comments_3650(&text);
+            collect_consts_3650(&stripped, &mut lits, &mut aliases);
+            texts.push(stripped);
+        }
+        let mut targets: BTreeSet<String> = BTreeSet::new();
+        let mut unresolved = Vec::new();
+        for (path, text) in files.iter().zip(texts.iter()) {
+            collect_file_targets_3650(
+                path,
+                text,
+                &lits,
+                &mut aliases,
+                &mut targets,
+                &mut unresolved,
+            );
+        }
+        assert!(
+            unresolved.is_empty(),
+            "#3650 census: SCREAMING `target:` idents with no resolvable const \
+             definition (renamed const or dynamic target — investigate, do \
+             not silently drop):\n{}",
+            unresolved.join("\n")
+        );
+        assert!(
+            !targets.is_empty(),
+            "#3650 census: empty population means the scanner is broken, not \
+             that the filter is complete"
+        );
+        let built = build_log_filter(super::DEFAULT_LOG_DIRECTIVE, &[], None);
+        assert!(
+            built.rejected.is_empty(),
+            "#3650 census: the default filter itself must not produce rejects, \
+             got {:?}",
+            built.rejected
+        );
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(built.filter)
+            .with_writer(std::io::sink)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let mut dropped = Vec::new();
+        for target in &targets {
+            for level in [
+                tracing::Level::INFO,
+                tracing::Level::WARN,
+                tracing::Level::ERROR,
+            ] {
+                let admitted = tracing::dispatcher::get_default(|dispatch| {
+                    dispatch.enabled(&census_event_metadata_3650(target, level))
+                });
+                if !admitted {
+                    dropped.push(format!("{target} at {level}"));
+                }
+            }
+        }
+        let dropped_targets: BTreeSet<&str> = dropped
+            .iter()
+            .filter_map(|line| line.split(" at ").next())
+            .collect();
+        assert!(
+            dropped.is_empty(),
+            "#3650: the shipped default filter ({:?}) drops {} of {} censused \
+             explicit targets ({} target-level pairs at INFO/WARN/ERROR; \
+             operator-visible boot, security, replay, schema and degradation \
+             events disappear):\n{}",
+            super::DEFAULT_LOG_DIRECTIVE,
+            dropped_targets.len(),
+            targets.len(),
+            dropped.len(),
+            dropped.join("\n")
+        );
+    }
+
+    /// #3650 ruling 2 — ONE SSOT for the default filter string:
+    /// `src/logging.rs` owns it; the shipped systemd units must carry
+    /// exactly it. The default must additionally be a BARE level (no
+    /// `target=` prefix): a targeted default is the defect — it
+    /// discards every explicit target outside its prefix.
+    /// Design lock (#3650 review NIT-2): this pin asserts the directive is a
+    /// BARE level (no `=`). A future family-directive redesign must change
+    /// this pin deliberately, together with the census above.
+    #[test]
+    fn shipped_units_agree_with_default_filter_ssot_3650() {
+        assert!(
+            !super::DEFAULT_LOG_DIRECTIVE.contains('='),
+            "#3650: DEFAULT_LOG_DIRECTIVE must be a bare global level (e.g. \
+             `info`) covering every target, got {:?}",
+            super::DEFAULT_LOG_DIRECTIVE
+        );
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let units = [
+            "packaging/systemd/ai-memory.service",
+            "packaging/systemd/ai-memory-sync.service",
+            "packaging/systemd/ai-memory-wake-hub.service",
+        ];
+        for unit in units {
+            let text = std::fs::read_to_string(root.join(unit))
+                .unwrap_or_else(|err| panic!("read {unit}: {err}"));
+            let values: Vec<String> = text
+                .lines()
+                .filter_map(|line| line.strip_prefix("Environment=RUST_LOG="))
+                .map(|value| value.trim().to_string())
+                .collect();
+            assert_eq!(
+                values.len(),
+                1,
+                "#3650: {unit} must export exactly one RUST_LOG value, got \
+                 {values:?}"
+            );
+            assert_eq!(
+                values[0],
+                super::DEFAULT_LOG_DIRECTIVE,
+                "#3650: {unit} RUST_LOG must equal DEFAULT_LOG_DIRECTIVE"
+            );
+        }
+        tracing_subscriber::EnvFilter::try_new(super::DEFAULT_LOG_DIRECTIVE)
+            .unwrap_or_else(|err| panic!("DEFAULT_LOG_DIRECTIVE must parse: {err}"));
+    }
+
+    /// #3650 — the operator wins for the target it names: `RUST_LOG`
+    /// layers LAST, after the base and the caller extras.
+    #[test]
+    fn default_filter_builder_layers_rust_log_last_3650() {
+        let built = build_log_filter("info", &["tower_http=info"], Some("ai_memory=debug"));
+        assert!(
+            built.rejected.is_empty(),
+            "valid directives must not produce rejects, got {:?}",
+            built.rejected
+        );
+        assert!(
+            filter_admits_3650(
+                built.filter,
+                "ai_memory::storage::migrations",
+                tracing::Level::DEBUG
+            ),
+            "RUST_LOG=ai_memory=debug must enable ai_memory DEBUG over an info base"
+        );
+        // The allowed-path control on the same sink: a global
+        // `RUST_LOG=error` still narrows everything (absence), while
+        // ERROR itself stays admitted (presence).
+        let built = build_log_filter("info", &[], Some("error"));
+        assert!(
+            !filter_admits_3650(
+                built.filter,
+                "ai_memory::storage::migrations",
+                tracing::Level::INFO
+            ),
+            "RUST_LOG=error must still suppress INFO on the same sink"
+        );
+        let built = build_log_filter("info", &[], Some("error"));
+        assert!(
+            filter_admits_3650(
+                built.filter,
+                "ai_memory::storage::migrations",
+                tracing::Level::ERROR
+            ),
+            "RUST_LOG=error must still admit ERROR on the same sink"
+        );
+    }
+
+    /// #3650 — unparseable pieces are recorded, never fatal; empty pieces
+    /// (including an empty `RUST_LOG`) stay warn-free.
+    #[test]
+    fn default_filter_builder_records_rejects_3650() {
+        let built = build_log_filter("info", &["@invalid@directive@"], Some(""));
+        assert_eq!(
+            built.rejected.len(),
+            1,
+            "one garbage directive must produce exactly one reject, got {:?}",
+            built.rejected
+        );
+        // Not vacuous: valid extras produce no rejects.
+        let clean = build_log_filter("info", &["tower_http=info"], None);
+        assert!(
+            clean.rejected.is_empty(),
+            "valid extras must not produce rejects, got {:?}",
+            clean.rejected
+        );
+    }
+
+    /// #3650 — a garbage base level still falls back to `info`, matching
+    /// the [`level_filter_or_info_fallback`] contract.
+    #[test]
+    fn default_filter_builder_falls_back_to_info_on_garbage_base_3650() {
+        let garbage = build_log_filter("@invalid@directive@", &[], None);
+        assert!(
+            garbage.rejected.is_empty(),
+            "the base fallback is silent, got {:?}",
+            garbage.rejected
+        );
+        assert_eq!(
+            garbage.filter.to_string(),
+            build_log_filter("info", &[], None).filter.to_string(),
+            "a garbage base must degrade to the `info` filter"
+        );
     }
 }

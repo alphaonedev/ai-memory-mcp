@@ -2291,9 +2291,13 @@ mod postgres_side {
     /// row with a non-NULL envelope whose recipient key cannot decrypt
     /// (sealed to agent A but the row names agent B) must FAIL the read
     /// (mapped to a StoreError), never leak the empty placeholder.
+    /// A WRONG key, not an ABSENT one — renamed under #3718 (the absent-key
+    /// case is `tests/encryption_key_absent_3718_pg.rs`).
+    /// A WRONG key, not an ABSENT one — renamed under #3718 (the absent-key
+    /// case is `tests/encryption_key_absent_3718_pg.rs`).
     #[tokio::test]
     #[ignore = "requires AI_MEMORY_TEST_POSTGRES_URL — Track C blocker per issue #79"]
-    async fn pg_commit_b_missing_key_fails_closed_on_read_228() {
+    async fn pg_commit_b_wrong_key_fails_closed_on_read_228() {
         use ai_memory::encryption::{encrypt, get_or_create_keypair};
         use ai_memory::store::MemoryStore;
         let Some(pg) = live_pg().await else {
@@ -2306,6 +2310,8 @@ mod postgres_side {
         let seal_agent = "pg-commit-b-seal";
         let wrong_agent = "pg-commit-b-wrong";
         let kp = get_or_create_keypair(seal_agent).expect("keypair");
+        // #3718 — the wrong agent must own a key (a read no longer mints).
+        let _wrong_kp = get_or_create_keypair(wrong_agent).expect("wrong agent's own key");
         let env_bytes = encrypt("pg secret for seal_agent", &kp.public)
             .expect("encrypt")
             .to_bytes();

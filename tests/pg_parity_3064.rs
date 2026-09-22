@@ -190,6 +190,7 @@ async fn spawn(
             ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty(),
         ),
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
+        ..Default::default()
     };
     let shutdown = Arc::new(Notify::new());
     let shutdown_for_daemon = shutdown.clone();

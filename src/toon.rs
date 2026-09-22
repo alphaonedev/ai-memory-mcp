@@ -70,10 +70,42 @@ impl WireFormat {
     pub fn parse_http(raw: Option<&str>) -> Result<Self, String> {
         match raw {
             None => Ok(Self::Json),
-            Some(s) if s == FORMAT_JSON => Ok(Self::Json),
-            Some(s) if s == FORMAT_TOON => Ok(Self::Toon),
-            Some(s) if s == FORMAT_TOON_COMPACT => Ok(Self::ToonCompact),
-            Some(other) => Err(invalid_format_msg(other)),
+            Some(s) => Self::parse_named(s),
+        }
+    }
+
+    /// #3803 — parse the MCP `format` tool argument for the four
+    /// TOON-rendering tools (`memory_recall` / `memory_list` /
+    /// `memory_search` / `memory_session_start`). `None` (argument
+    /// omitted) resolves to the [`Self::ToonCompact`] MCP default; an
+    /// unrecognised value is the SAME `Err` [`parse_http`](Self::parse_http)
+    /// returns, so the two surfaces refuse the same vocabulary with the
+    /// same sentence. Before #3803 the dispatch matched four exact
+    /// literals and let everything else fall through to pretty JSON —
+    /// `format:"TOON_COMPACT"` cost 10.7x the tokens of the default on
+    /// every call and the caller was never told.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(message)` when `raw` is `Some` of anything other
+    /// than [`FORMAT_JSON`] / [`FORMAT_TOON`] / [`FORMAT_TOON_COMPACT`].
+    pub fn parse_mcp(raw: Option<&str>) -> Result<Self, String> {
+        match raw {
+            None => Ok(Self::ToonCompact),
+            Some(s) => Self::parse_named(s),
+        }
+    }
+
+    /// The ONE vocabulary both surfaces share — exact, case-sensitive.
+    fn parse_named(s: &str) -> Result<Self, String> {
+        if s == FORMAT_JSON {
+            Ok(Self::Json)
+        } else if s == FORMAT_TOON {
+            Ok(Self::Toon)
+        } else if s == FORMAT_TOON_COMPACT {
+            Ok(Self::ToonCompact)
+        } else {
+            Err(invalid_format_msg(s))
         }
     }
 }
@@ -144,6 +176,24 @@ pub fn memories_to_toon(response: &Value, compact: bool) -> String {
     }
     if let Some(budget) = response.get(field_names::BUDGET_TOKENS) {
         meta.push(format!("budget_tokens:{budget}"));
+    }
+    // #3802: a budget-truncated recall must be distinguishable from a
+    // small result on the DEFAULT wire format. The recall handler files
+    // the truncation verdict under the nested `meta` object
+    // (`memories_dropped` / `budget_overflow` / `budget_tokens_remaining`,
+    // `src/mcp/tools/recall.rs::decorate_budget`); before this fix the
+    // TOON renderer discarded that object and only the JSON twin of the
+    // same call could show four of five memories were withheld.
+    if let Some(budget_meta) = response.get("meta").and_then(Value::as_object) {
+        for key in [
+            field_names::MEMORIES_DROPPED,
+            field_names::BUDGET_OVERFLOW,
+            field_names::BUDGET_TOKENS_REMAINING,
+        ] {
+            if let Some(value) = budget_meta.get(key) {
+                meta.push(format!("{key}:{value}"));
+            }
+        }
     }
     if !meta.is_empty() {
         out.push_str(&meta.join("|"));
@@ -290,9 +340,42 @@ mod tests {
         let err = WireFormat::parse_http(Some("yaml")).unwrap_err();
         assert_eq!(err, invalid_format_msg("yaml"));
         assert!(err.contains("json") && err.contains("toon") && err.contains("toon_compact"));
-        // Case-sensitive on purpose: the MCP dispatch matches the
-        // exact literals too, so the two surfaces agree.
+        // Case-sensitive on purpose, on BOTH surfaces: since #3803 the
+        // MCP dispatch parses through `parse_mcp`, which shares this
+        // vocabulary and this sentence, so the two surfaces agree by
+        // construction (before #3803 that agreement was asserted here
+        // but the dispatch silently fell through to JSON).
         assert!(WireFormat::parse_http(Some("TOON")).is_err());
+        assert_eq!(
+            WireFormat::parse_mcp(Some("TOON_COMPACT")).unwrap_err(),
+            invalid_format_msg("TOON_COMPACT")
+        );
+        assert_eq!(
+            WireFormat::parse_mcp(Some("yaml")),
+            WireFormat::parse_http(Some("yaml"))
+        );
+    }
+
+    // #3803 — the MCP half of the vocabulary: omitted defaults to the
+    // compact TOON the stdio surface has always shipped, the three named
+    // formats parse, nothing else does.
+    #[test]
+    fn issue_3803_wire_format_parse_mcp() {
+        assert_eq!(WireFormat::parse_mcp(None), Ok(WireFormat::ToonCompact));
+        assert_eq!(
+            WireFormat::parse_mcp(Some(FORMAT_JSON)),
+            Ok(WireFormat::Json)
+        );
+        assert_eq!(
+            WireFormat::parse_mcp(Some(FORMAT_TOON)),
+            Ok(WireFormat::Toon)
+        );
+        assert_eq!(
+            WireFormat::parse_mcp(Some(FORMAT_TOON_COMPACT)),
+            Ok(WireFormat::ToonCompact)
+        );
+        assert!(WireFormat::parse_mcp(Some("")).is_err());
+        assert!(WireFormat::parse_mcp(Some("Toon")).is_err());
     }
 
     #[test]
@@ -684,6 +767,72 @@ mod tests {
         let toon = memories_to_toon(&resp, true);
         assert!(toon.contains("tokens_used:100"));
         assert!(toon.contains("budget_tokens:500"));
+    }
+
+    // #3802 — the nested recall `meta` budget block reaches the TOON meta
+    // line for both projections, and its absence leaves the line unchanged.
+    #[test]
+    fn issue_3802_meta_line_carries_budget_truncation_verdict() {
+        let truncated = json!({
+            "memories": [{"id": "a", "title": "t1"}],
+            "count": 1,
+            "mode": "hybrid",
+            "tokens_used": 34,
+            "budget_tokens": 60,
+            "meta": {
+                "budget_tokens_used": 34,
+                "budget_tokens_remaining": 26,
+                "memories_dropped": 4,
+                "budget_overflow": false,
+            },
+        });
+        for compact in [true, false] {
+            let toon = memories_to_toon(&truncated, compact);
+            let meta_line = toon.lines().next().unwrap_or_default();
+            assert_eq!(
+                meta_line,
+                "count:1|mode:hybrid|tokens_used:34|budget_tokens:60\
+                 |memories_dropped:4|budget_overflow:false|budget_tokens_remaining:26",
+                "compact={compact}: {toon}"
+            );
+        }
+
+        let untruncated = json!({
+            "memories": [{"id": "a", "title": "t1"}],
+            "count": 1,
+            "mode": "hybrid",
+            "tokens_used": 34,
+            "budget_tokens": 600,
+            "meta": {
+                "budget_tokens_used": 34,
+                "budget_tokens_remaining": 566,
+                "memories_dropped": 0,
+                "budget_overflow": false,
+            },
+        });
+        let toon = memories_to_toon(&untruncated, true);
+        assert!(
+            toon.starts_with(
+                "count:1|mode:hybrid|tokens_used:34|budget_tokens:600|memories_dropped:0|"
+            ),
+            "{toon}"
+        );
+
+        // No budget supplied: the recall handler emits no budget block and
+        // the meta line stays exactly as before #3802.
+        let no_budget = json!({
+            "memories": [{"id": "a", "title": "t1"}],
+            "count": 1,
+            "mode": "hybrid",
+            "tokens_used": 34,
+            "meta": {"reranker": "lexical"},
+        });
+        let toon = memories_to_toon(&no_budget, true);
+        assert_eq!(
+            toon.lines().next(),
+            Some("count:1|mode:hybrid|tokens_used:34"),
+            "{toon}"
+        );
     }
 
     #[test]

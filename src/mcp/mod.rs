@@ -26,6 +26,7 @@ use crate::embeddings::{Embed, Embedder};
 use crate::hnsw::VectorSearchIndex;
 use crate::llm::OllamaClient;
 use crate::reranker::{BatchedReranker, CrossEncoder};
+use crate::toon::WireFormat;
 
 /// Effective-tier banner label for the fully-provisioned tier — the
 /// `config.rs` `FeatureTier` spellings are vendor-carve-out-frozen, so the
@@ -71,6 +72,9 @@ mod param_shapes_3365_tests;
 // error codes, method names, MCP protocol revision.
 pub mod jsonrpc;
 
+/// #3713 — the ONE renderer of tool errors into caller-visible text.
+pub mod error_text;
+
 // #3374 — table-driven regression suite for the NUMERIC / BOOLEAN parameter
 // shapes that silently took a server default (`action_create.priority`,
 // `lease_*.ttl_secs`, `signal_send.ttl_secs`, `signal_inbox`/`inbox.limit`,
@@ -91,6 +95,12 @@ mod read_only_tools;
 // `handle_archive_purge_for_test`.
 #[doc(hidden)]
 pub mod dispatch_test_hook;
+
+// #3829 addendum — the fstat precondition guard that makes the SECURITY.md
+// "MCP transport is stdio-only" claim true BY CONSTRUCTION: refuse a network
+// socket handed in as fd 0 by a supervisor (the no-construction gate cannot
+// see an inherited fd). Paired with scripts/check-mcp-transport-isolation.py.
+pub(crate) mod stdio_guard;
 
 // v0.7.0 #972 D1.5 (#986) — shared parity-test helpers for the
 // schemars-derived `McpTool` impls vs. the legacy hand-coded
@@ -178,6 +188,35 @@ fn err_response(id: Value, code: i64, message: String) -> RpcResponse {
         }),
     }
 }
+
+/// #3803 — resolve the rendering format for a `tools/call`.
+///
+/// `Ok(Some(_))` for the four TOON-rendering tools (`format` omitted
+/// resolves to the compact TOON default the stdio surface has always
+/// shipped); `Ok(None)` for every other tool, whose `format` argument —
+/// if it has one, e.g. `memory_export_reflection`'s `md|json|yaml` —
+/// belongs to that handler and is never read here. `Err` carries the
+/// SSOT [`crate::toon::invalid_format_msg`] sentence for an unrecognised
+/// or non-string value.
+fn mcp_wire_format(tool_name: &str, arguments: &Value) -> Result<Option<WireFormat>, String> {
+    use crate::mcp::registry::tool_names as tn;
+    if !matches!(
+        tool_name,
+        tn::MEMORY_RECALL | tn::MEMORY_LIST | tn::MEMORY_SEARCH | tn::MEMORY_SESSION_START
+    ) {
+        return Ok(None);
+    }
+    match arguments.get(param_names::FORMAT) {
+        None | Some(Value::Null) => WireFormat::parse_mcp(None).map(Some),
+        Some(Value::String(raw)) => WireFormat::parse_mcp(Some(raw)).map(Some),
+        Some(other) => Err(crate::toon::invalid_format_msg(&other.to_string())),
+    }
+}
+
+#[cfg(test)]
+mod provider_echo_sinks_3648_tests;
+#[cfg(test)]
+mod provider_redaction_3648_tests;
 
 /// PR-5 (issue #487): emit an audit event for an MCP `tools/call`
 /// dispatch. Per-handler emissions inside `handle_store` /
@@ -273,9 +312,12 @@ fn resolve_mcp_agent_id(arguments: &Value, mcp_client: Option<&str>) -> String {
         .filter(|id| crate::validate::validate_agent_id(id).is_ok())
         .map(str::to_string)
         .unwrap_or_else(|| {
-            mcp_client
-                .map(|c| format!("ai:{c}"))
-                .unwrap_or_else(|| "anonymous".into())
+            // #3393 — the fallback is the canonical durable derivation
+            // (`ai:<sanitised client>@<hostname>`, env first), never a raw
+            // client-chosen string prefixed with `ai:`: the audit actor
+            // must be an identity, not a label the client typed.
+            crate::identity::resolve_agent_id(None, mcp_client)
+                .unwrap_or_else(|_| "anonymous".into())
         })
 }
 
@@ -290,14 +332,18 @@ fn observe_capture_nag(
     nag_watcher: Option<&crate::recover::nag::CaptureNagWatcher>,
     session_id: &str,
     tool_name: &str,
-    arguments: &Value,
     mcp_client: Option<&str>,
 ) -> crate::recover::nag::NagAction {
     use crate::recover::nag::{NagAction, classify_tool};
     let Some(watcher) = nag_watcher else {
         return NagAction::None;
     };
-    let agent_id = resolve_mcp_agent_id(arguments, mcp_client);
+    // #3393 — the streak is keyed on the CALLER (env identity, else the
+    // canonical `ai:<client>@<host>` derivation), never on a body-claimed
+    // `agent_id`: a store that claims some other id must not reset or fork
+    // the caller's own capture streak. Pre-#3393 the raw `ai:<client>`
+    // stamp happened to coincide with such claims, which is what hid this.
+    let agent_id = resolve_mcp_agent_id(&Value::Null, mcp_client);
     let action = watcher.observe_tool_call(&agent_id, session_id, classify_tool(tool_name));
     match action {
         NagAction::None => {}
@@ -670,6 +716,8 @@ pub(crate) use namespace::authorize_namespace_standard_bind;
 // delegates parent authorization to `handle_namespace_set_standard`).
 #[cfg(feature = "sal")]
 pub(crate) use namespace::authorize_namespace_standard_parent;
+#[cfg(feature = "sal")]
+pub(crate) use namespace::merge_governance_for_response;
 // v0.7.0 G-PHASE-E-2 (#707) — promoted to `pub` so the integration
 // regression at `tests/g_phase_e_2_namespace_set_standard_governance_passthrough.rs`
 // can exercise the merge path directly. The handler is still routed
@@ -2827,7 +2875,14 @@ fn dispatch_memory_quota_status(ctx: &ToolDispatchCtx<'_>) -> Result<Value, Stri
 /// #1415 signed_events row carry the authenticated-via-MCP-
 /// handshake caller identity rather than a body-claimed one.
 fn dispatch_memory_capture_turn(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
-    handle_capture_turn(ctx.conn, ctx.arguments, ctx.mcp_client)
+    // #3393 — the RESOLVED authority principal, never the raw handshake
+    // `clientInfo.name` (which the row could then never be read back by).
+    // The handler is `anyhow`-typed (QUAL-6); the legacy envelope's String
+    // error is rendered here, at the dispatch boundary, through the ONE
+    // #3713 funnel: a typed refusal riding the chain keeps its message, a
+    // driver chain is logged for the operator and rendered as its class.
+    capture_turn::handle_capture_turn_mcp(ctx.conn, ctx.arguments, ctx.authority)
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("capture_turn", e))
 }
 
 fn dispatch_memory_check_agent_action(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
@@ -3612,13 +3667,7 @@ fn handle_request(
             // consecutive-non-capture-tool-call threshold. Strictly
             // observation-only: the returned action does not gate or
             // alter the dispatch below.
-            observe_capture_nag(
-                nag_watcher,
-                nag_session_id,
-                tool_name,
-                arguments,
-                mcp_client,
-            );
+            observe_capture_nag(nag_watcher, nag_session_id, tool_name, mcp_client);
 
             // v1.0.0 #3549 — THE caller-authority chokepoint: resolve ONCE,
             // before the table lookup; an unusable configured identity refuses
@@ -3692,6 +3741,25 @@ fn handle_request(
                     format!("unknown tool: {tool_name}"),
                 );
             };
+            // #3803 — the rendering `format` of the four TOON tools is an
+            // enum, parsed at the boundary BEFORE the handler runs (a
+            // recall writes the observation ledger; refusing after it ran
+            // would charge the caller for a call it did not get). An
+            // unrecognised value is a typed refusal carrying the SAME
+            // sentence the HTTP surface returns as 400 — never a silent
+            // fall-through to pretty JSON.
+            let wire_format = match mcp_wire_format(tool_name, arguments) {
+                Ok(format) => format,
+                Err(message) => {
+                    return ok_response(
+                        id,
+                        json!({
+                            "content": [{"type": "text", "text": message}],
+                            "isError": true
+                        }),
+                    );
+                }
+            };
             // #3384 — a panic in one synchronous handler must not unwind the
             // task that owns the shared stdio session. Transactions and locks
             // still unwind normally inside this boundary; the caller receives
@@ -3716,36 +3784,21 @@ fn handle_request(
 
             match result {
                 Ok(val) => {
-                    // Check if TOON format requested for recall/search/list
-                    let format_str = arguments
-                        .get("format")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or(crate::toon::FORMAT_TOON_COMPACT);
+                    // Render in the format parsed at the boundary above;
+                    // tools outside the rendering set always ship JSON.
                     use crate::mcp::registry::tool_names as tn;
-                    let text = match format_str {
-                        "toon"
-                            if matches!(
-                                tool_name,
-                                tn::MEMORY_RECALL | tn::MEMORY_LIST | tn::MEMORY_SESSION_START
-                            ) =>
-                        {
-                            crate::toon::memories_to_toon(&val, false)
-                        }
-                        crate::toon::FORMAT_TOON_COMPACT
-                            if matches!(
-                                tool_name,
-                                tn::MEMORY_RECALL | tn::MEMORY_LIST | tn::MEMORY_SESSION_START
-                            ) =>
-                        {
-                            crate::toon::memories_to_toon(&val, true)
-                        }
-                        "toon" if tool_name == tn::MEMORY_SEARCH => {
+                    let text = match wire_format {
+                        Some(WireFormat::Toon) if tool_name == tn::MEMORY_SEARCH => {
                             crate::toon::search_to_toon(&val, false)
                         }
-                        crate::toon::FORMAT_TOON_COMPACT if tool_name == tn::MEMORY_SEARCH => {
+                        Some(WireFormat::ToonCompact) if tool_name == tn::MEMORY_SEARCH => {
                             crate::toon::search_to_toon(&val, true)
                         }
-                        _ => serde_json::to_string_pretty(&val).unwrap_or_default(),
+                        Some(WireFormat::Toon) => crate::toon::memories_to_toon(&val, false),
+                        Some(WireFormat::ToonCompact) => crate::toon::memories_to_toon(&val, true),
+                        Some(WireFormat::Json) | None => {
+                            serde_json::to_string_pretty(&val).unwrap_or_default()
+                        }
                     };
                     ok_response(
                         id,
@@ -4416,6 +4469,19 @@ pub fn run_mcp_server(
     // `sync-daemon` so the guarantee is owned in ONE place instead of
     // being rediscovered per verb.
     crate::logging::init_console_tracing(&[]);
+
+    // #3829 - DEFENCE-IN-DEPTH: require POSITIVE evidence that fd 0 is a proven
+    // inherited stdio channel (pipe / tty / regular file, or an AF_UNIX
+    // socketpair which warns) before the stdio loop opens, and REFUSE otherwise
+    // - a socket handed directly as fd 0 (systemd StandardInput=socket, socat
+    // ...-LISTEN,nofork), a non-AF_UNIX / unreadable-family socket, or an
+    // uninspectable fd (fstat seccomp/LSM-denied, distinct from a closed EBADF).
+    // The static check-mcp-transport-isolation.py gate proves src/mcp constructs
+    // no socket; this guard covers a socket handed in AS fd 0. A supervisor
+    // RELAY (ssh, socat fork/EXEC) leaves fd 0 a genuine pipe and is OUT OF
+    // REACH of any fd check - its transport is the relay's (see SECURITY.md
+    // #3829). WARN-only on AF_UNIX (the #3827 UDS lane).
+    crate::mcp::stdio_guard::enforce_stdin_is_inherited_channel()?;
 
     // #3356: configured-but-invalid identity aborts boot rather than becoming unresolved.
     let _ = crate::identity::resolve_mcp_read_visibility_caller()?;
@@ -5688,7 +5754,7 @@ mod tests {
 
     #[test]
     fn issue_811_load_active_keypair_for_mcp_picks_agent_specific_when_present() {
-        let dir = tempfile::TempDir::new().unwrap();
+        let dir = crate::identity::test_key_dir::private_tempdir();
         let kp = crate::identity::keypair::generate("ai:alice").unwrap();
         crate::identity::keypair::save(&kp, dir.path()).unwrap();
         let loaded = super::load_active_keypair_for_mcp_in(dir.path(), Some("ai:alice"))
@@ -5707,7 +5773,7 @@ mod tests {
         // ever exists; the substrate-managed `daemon` key sat on disk
         // unused. This asserts the fallback so the persona pipeline
         // signs end-to-end even without a per-NHI keypair enrolled.
-        let dir = tempfile::TempDir::new().unwrap();
+        let dir = crate::identity::test_key_dir::private_tempdir();
         let daemon_kp = crate::identity::keypair::generate("daemon").unwrap();
         crate::identity::keypair::save(&daemon_kp, dir.path()).unwrap();
         let loaded =
@@ -5722,7 +5788,7 @@ mod tests {
 
     #[test]
     fn issue_811_load_active_keypair_for_mcp_returns_none_when_neither_present() {
-        let dir = tempfile::TempDir::new().unwrap();
+        let dir = crate::identity::test_key_dir::private_tempdir();
         let loaded = super::load_active_keypair_for_mcp_in(dir.path(), Some("ai:none"));
         assert!(
             loaded.is_none(),
@@ -5734,7 +5800,7 @@ mod tests {
     fn issue_811_load_active_keypair_for_mcp_falls_back_when_agent_id_unresolvable() {
         // `agent_id = None` simulates `resolve_agent_id` failing entirely;
         // daemon fallback must still engage.
-        let dir = tempfile::TempDir::new().unwrap();
+        let dir = crate::identity::test_key_dir::private_tempdir();
         let daemon_kp = crate::identity::keypair::generate("daemon").unwrap();
         crate::identity::keypair::save(&daemon_kp, dir.path()).unwrap();
         let loaded = super::load_active_keypair_for_mcp_in(dir.path(), None)
@@ -7081,7 +7147,10 @@ mod tests {
     /// Build a fully-defaulted handle_request invocation against an
     /// in-memory connection. Returns the response so individual tests
     /// can assert on `error` / `result` shape.
-    fn invoke_handle_request(conn: &rusqlite::Connection, req: &RpcRequest) -> RpcResponse {
+    pub(super) fn invoke_handle_request(
+        conn: &rusqlite::Connection,
+        req: &RpcRequest,
+    ) -> RpcResponse {
         // #1751 — pin the lib-test binary to the explicit permissive
         // attestation opt-out so unsigned `memory_store` dispatches keep
         // exercising their actual subject matter.
@@ -7184,8 +7253,76 @@ mod tests {
     #[test]
     fn observe_capture_nag_none_watcher_is_noop() {
         use crate::recover::nag::NagAction;
-        let action = observe_capture_nag(None, "s", "memory_recall", &json!({}), Some("c"));
+        let action = observe_capture_nag(None, "s", "memory_recall", Some("c"));
         assert_eq!(action, NagAction::None);
+    }
+
+    /// #3393 (required before merge) — the streak is keyed on the CALLER,
+    /// never on a body-claimed `agent_id`: two observations for the same
+    /// caller whose bodies claim DIFFERENT agent ids land on one continuous
+    /// streak, and neither claimed id acquires a streak of its own. Drives
+    /// `observe_capture_nag` directly (its keying), then the real
+    /// `handle_request` path with the claims in the request body (the route
+    /// a client actually has), so the pin holds even if `mcp_client`
+    /// derivation or the null-body resolver changes later.
+    #[test]
+    fn observe_capture_nag_keys_on_caller_not_body_claimed_agent_id_3393() {
+        use crate::recover::nag::{CaptureNagWatcher, NagAction};
+        let _g = crate::audit::sink_test_lock();
+        let buf: std::sync::Arc<std::sync::Mutex<Vec<u8>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        crate::audit::init_for_test(buf.clone());
+
+        let session = "sess-3393-keying";
+        let client = Some("keyingclient");
+        let caller = resolve_mcp_agent_id(&Value::Null, client);
+        assert!(
+            caller.starts_with("ai:"),
+            "the caller resolves canonically: {caller}"
+        );
+
+        // Direct: the function has no body parameter at all, so the two
+        // calls can only be keyed on the caller. Threshold 5 keeps every
+        // observation below the WARN line so the streak itself is what is
+        // asserted, not an emission.
+        let watcher = CaptureNagWatcher::new(5, 0);
+        let first = observe_capture_nag(Some(&watcher), session, "memory_recall", client);
+        let second = observe_capture_nag(Some(&watcher), session, "memory_recall", client);
+        assert_eq!((first, second), (NagAction::None, NagAction::None));
+        assert_eq!(
+            watcher.streak_for(&caller, session),
+            2,
+            "one continuous streak for the caller"
+        );
+
+        // Through the dispatcher: the same caller, two bodies that each claim
+        // a different agent id. The claims must neither reset nor fork the
+        // caller's streak.
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let claim_a = make_tools_call(
+            "memory_recall",
+            json!({"query": "x", "agent_id": "ai:claimed-a"}),
+        );
+        let claim_b = make_tools_call(
+            "memory_recall",
+            json!({"query": "x", "agent_id": "ai:claimed-b"}),
+        );
+        invoke_handle_request_with_nag(&conn, &claim_a, &watcher, session, client);
+        invoke_handle_request_with_nag(&conn, &claim_b, &watcher, session, client);
+        assert_eq!(
+            watcher.streak_for(&caller, session),
+            4,
+            "the caller's streak is continuous across differently-claimed bodies"
+        );
+        assert_eq!(watcher.streak_for("ai:claimed-a", session), 0);
+        assert_eq!(watcher.streak_for("ai:claimed-b", session), 0);
+        assert_eq!(
+            count_capture_lag_lines(&buf),
+            0,
+            "below threshold: no emission; the keying alone is under test"
+        );
+
+        crate::audit::shutdown_for_test();
     }
 
     /// The dispatch loop honours the watcher: N consecutive non-capture
@@ -8486,15 +8623,33 @@ mod tests {
     /// #3204 item 4 — a reserved sentinel must not stamp the audit actor.
     #[test]
     fn resolve_mcp_agent_id_rejects_reserved_sentinel_3204() {
+        // #3393 — the synthesized fallback is the canonical durable
+        // `ai:<client>@<hostname>` derivation, never the raw `ai:<client>`.
+        let _id = crate::identity::test_agent_id::AgentIdOverride::unset();
         let forged = resolve_mcp_agent_id(&json!({"agent_id": "daemon"}), Some("claude"));
-        assert_eq!(
-            forged, "ai:claude",
-            "reserved sentinel must fall through to the synthesized client id"
+        assert!(
+            forged.starts_with("ai:claude@"),
+            "reserved sentinel must fall through to the synthesized client id: {forged}"
         );
+        crate::validate::validate_agent_id(&forged).expect("synthesized id is valid");
         let ok = resolve_mcp_agent_id(&json!({"agent_id": "alice"}), None);
         assert_eq!(ok, "alice");
         let newline = resolve_mcp_agent_id(&json!({"agent_id": "a\nb"}), Some("claude"));
-        assert_eq!(newline, "ai:claude");
+        assert!(newline.starts_with("ai:claude@"), "{newline}");
+    }
+
+    /// #3393 — a client name the id grammar forbids never reaches the audit
+    /// actor raw (control characters were a log-injection vector, #3204).
+    #[test]
+    fn resolve_mcp_agent_id_never_stamps_raw_client_name_3393() {
+        let _id = crate::identity::test_agent_id::AgentIdOverride::unset();
+        let actor = resolve_mcp_agent_id(&json!({}), Some("bad name\nwith newline"));
+        assert!(!actor.contains('\n') && !actor.contains(' '), "{actor}");
+        crate::validate::validate_agent_id(&actor).expect("actor is a valid id");
+        let env = crate::identity::test_agent_id::AgentIdOverride::set("ai:env-owner");
+        let actor = resolve_mcp_agent_id(&json!({}), Some("claude"));
+        assert_eq!(actor, "ai:env-owner", "the configured identity wins");
+        drop(env);
     }
 
     #[test]
@@ -12800,9 +12955,24 @@ mod tests {
             text.contains("REFLECTION_DEPTH_EXCEEDED"),
             "expected typed error prefix; got {text}",
         );
-        assert!(text.contains("depth 2"), "got {text}");
-        assert!(text.contains("max_reflection_depth 1"), "got {text}",);
-        assert!(text.contains("namespace='team/r-depth'"), "got {text}",);
+        // #3638 — the tenant gets the typed code and nothing else. The
+        // attempted depth, the namespace's configured cap and the namespace
+        // name are PRIVATE POLICY: they go to the operator's log, never to
+        // the caller who tripped the limit. Asserting their ABSENCE is the
+        // point of this test now — it is the redaction guard, not a
+        // formatting check.
+        assert!(
+            !text.contains("depth 2"),
+            "attempted depth leaked to the tenant: {text}",
+        );
+        assert!(
+            !text.contains("max_reflection_depth"),
+            "configured cap leaked to the tenant: {text}",
+        );
+        assert!(
+            !text.contains("team/r-depth"),
+            "namespace leaked to the tenant: {text}",
+        );
     }
 
     // ─── C. Authorization / approval-gate path (L1-8) ────────────────
@@ -12836,8 +13006,15 @@ mod tests {
         assert!(payload["pending_id"].is_string());
         assert_eq!(payload["action"], "reflect");
         assert_eq!(payload["namespace"], "team/r-approve");
+        // The caller's OWN proposed depth is their input coming back and
+        // stays. The namespace's configured approval threshold does not:
+        // #3638 moved it to the operator log, because it tells a tenant
+        // where another namespace's policy boundary sits.
         assert_eq!(payload["proposed_depth"], 2);
-        assert_eq!(payload["require_approval_above_depth"], 1);
+        assert!(
+            payload.get("require_approval_above_depth").is_none(),
+            "private approval threshold leaked to the tenant: {payload}",
+        );
     }
 
     #[test]
@@ -13996,7 +14173,7 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let prev = std::env::var("AI_MEMORY_KEY_DIR").ok();
-        let key_tmp = tempfile::TempDir::new().expect("key tempdir");
+        let key_tmp = crate::identity::test_key_dir::private_tempdir();
         // SAFETY: lock acquired above; env writes serialised.
         unsafe {
             std::env::set_var("AI_MEMORY_KEY_DIR", key_tmp.path());
@@ -14095,7 +14272,7 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let prev = std::env::var("AI_MEMORY_KEY_DIR").ok();
-        let key_tmp = tempfile::TempDir::new().expect("key tempdir");
+        let key_tmp = crate::identity::test_key_dir::private_tempdir();
         // SAFETY: lock acquired above; env writes serialised.
         unsafe {
             std::env::set_var("AI_MEMORY_KEY_DIR", key_tmp.path());
@@ -14377,6 +14554,46 @@ mod tests {
         assert!(
             ids.contains(&b_id),
             "{owner_b}'s own collective row is visible"
+        );
+    }
+
+    #[test]
+    fn load_family_reports_measured_confidence_source_not_default_3373() {
+        // #3373 — a MEASURED confidence_source (!= caller_provided) must read back the
+        // SAME through load_family as through get. A projection that omits the column
+        // defaults it to caller_provided — a DEFAULT that reads like a MEASUREMENT.
+        let (ns, fam) = ("cs-fam-3373", "core");
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let id = chunkc_seed_family_memory(&conn, ns, fam);
+        conn.execute(
+            "UPDATE memories SET confidence_source = 'auto_derived' WHERE id = ?1",
+            [&id],
+        )
+        .unwrap();
+        let via_get = db::get(&conn, &id).unwrap().unwrap().confidence_source;
+        let resp = crate::mcp::handle_load_family(
+            &conn,
+            &json!({"family": fam, "namespace": ns, "k": 10}),
+            None,
+        )
+        .unwrap();
+        let via_lf = resp["memories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"] == json!(id))
+            .expect("#3373: seeded row present in load_family result")["confidence_source"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            via_lf,
+            via_get.as_str(),
+            "#3373: load_family must report the MEASURED confidence_source, not the default"
+        );
+        assert_ne!(
+            via_lf, "caller_provided",
+            "#3373: seeded source was auto_derived; caller_provided means the projection defaulted it"
         );
     }
 

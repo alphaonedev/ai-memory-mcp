@@ -155,6 +155,7 @@ async fn spawn_daemon(
             ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty(),
         ),
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
+        ..Default::default()
     };
     let app_state = build_postgres_app_state(url).await;
     let shutdown = Arc::new(Notify::new());
@@ -410,9 +411,14 @@ async fn bucket_b_notify_delivers_to_inbox() {
 /// (`src/mcp/tools/notify.rs`), and reading a message bumps `access_count` on
 /// BOTH backends.
 #[tokio::test(flavor = "multi_thread")]
-async fn bucket_b_inbox_unread_marker_is_access_count_3027() {
+async fn bucket_b_inbox_touched_message_still_lists_3730() {
+    // Was `bucket_b_inbox_unread_marker_is_access_count_3027`: it pinned that
+    // `unread_only` EXCLUDED a message whose `access_count` had been bumped.
+    // #3730 retired that marker — `access_count` counts touches, handled =
+    // deleted by the recipient — so the same fixture now pins the opposite:
+    // a touched message is still pending, on postgres exactly as on sqlite.
     let Some(url) = postgres_url() else {
-        eprintln!("skipping bucket_b_inbox_unread_marker_is_access_count_3027");
+        eprintln!("skipping bucket_b_inbox_touched_message_still_lists_3730");
         return;
     };
     let (base, shutdown, handle) = spawn_daemon(&url).await;
@@ -478,27 +484,31 @@ async fn bucket_b_inbox_unread_marker_is_access_count_3027() {
     let remaining = after["messages"].as_array().expect("messages array");
     assert_eq!(
         remaining.len(),
-        1,
-        "#3027: unread_only must now EXCLUDE the read message. Pre-fix the pg arm filtered \
-         on metadata.read — a key no writer sets — so unread_only filtered nothing and \
-         every message stayed 'unread' forever. got={remaining:?}"
+        2,
+        "#3730: `unread_only` narrows nothing — a touched message is still pending. \
+         got={remaining:?}"
     );
-    assert_ne!(remaining[0]["id"].as_str(), Some(first_id.as_str()));
-    assert_eq!(after["unread_count"].as_u64(), Some(1));
+    assert_eq!(
+        after["unread_count"].as_u64(),
+        Some(2),
+        "unread_count == count"
+    );
 
-    // The unfiltered projection must expose the SAME derived pair the
-    // sqlite/MCP inbox does, so a client cannot be told a message is unread by
-    // one backend and read by the other.
+    // The unfiltered projection is the same set, with no `read` field and
+    // the touch count under its own name, on both backends.
     let all = inbox(false).await;
     let all_msgs = all["messages"].as_array().expect("messages array");
     assert_eq!(all_msgs.len(), 2);
-    let read_row = all_msgs
+    let touched_row = all_msgs
         .iter()
         .find(|m| m["id"].as_str() == Some(first_id.as_str()))
         .expect("the touched message is still listed");
-    assert_eq!(read_row["read"].as_bool(), Some(true));
-    assert_eq!(read_row["access_count"].as_u64(), Some(1));
-    assert_eq!(all["unread_count"].as_u64(), Some(1));
+    assert!(
+        touched_row.get("read").is_none(),
+        "#3730: no `read` field: {touched_row}"
+    );
+    assert_eq!(touched_row["access_count"].as_u64(), Some(1));
+    assert_eq!(all["unread_count"].as_u64(), Some(2));
 
     shutdown.notify_one();
     let _ = handle.await;
@@ -514,10 +524,169 @@ async fn bucket_b_inbox_unread_marker_is_access_count_3027() {
 /// unsound foundation for any wake-then-read-once push design. The narrowing is
 /// now a SQL predicate (`AND access_count = 0`) applied before the `LIMIT`, the
 /// exact twin of the sqlite builder's `SQL_FRAGMENT_AND_UNREAD`.
+/// #3730 — on postgres, the recipient's `DELETE /api/v1/memories/{id}` ARCHIVES
+/// an inbox message (the inbox's delete retention policy), says so on the
+/// wire, and drains it from inbox / get / recall while `GET /api/v1/archive`
+/// holds it. The negative control keeps the policy inbox-only.
 #[tokio::test(flavor = "multi_thread")]
-async fn bucket_b_inbox_unread_only_narrows_before_limit_3463() {
+async fn bucket_b_inbox_recipient_delete_archives_and_drains_3730() {
     let Some(url) = postgres_url() else {
-        eprintln!("skipping bucket_b_inbox_unread_only_narrows_before_limit_3463");
+        eprintln!("skipping bucket_b_inbox_recipient_delete_archives_and_drains_3730");
+        return;
+    };
+    let (base, shutdown, handle) = spawn_daemon(&url).await;
+    let client = pg_test_client("ai:parity-test");
+    let bob = format!("b3730-bob-{}", &uuid::Uuid::new_v4().to_string()[..8]);
+    let alice = format!("b3730-alice-{}", &uuid::Uuid::new_v4().to_string()[..8]);
+    let ns = ai_memory::inbox_namespace(&bob);
+
+    let resp = client
+        .post(format!("{base}/api/v1/notify"))
+        .header("x-agent-id", &alice)
+        .json(&json!({
+            "target_agent_id": bob,
+            "title": "kumquat directive 3730",
+            "payload": format!("payload-{}", uuid::Uuid::new_v4()),
+        }))
+        .send()
+        .await
+        .expect("notify POST");
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+    let id = resp.json::<Value>().await.expect("notify body")["id"]
+        .as_str()
+        .expect("notify id")
+        .to_string();
+
+    let inbox = |unread_only: bool| {
+        let client = client.clone();
+        let base = base.clone();
+        let bob = bob.clone();
+        async move {
+            let mut req = client.get(format!("{base}/api/v1/inbox"));
+            if unread_only {
+                req = req.query(&[("unread_only", "true")]);
+            }
+            let resp = req
+                .header("x-agent-id", &bob)
+                .send()
+                .await
+                .expect("inbox GET");
+            assert_eq!(resp.status(), reqwest::StatusCode::OK);
+            resp.json::<Value>().await.expect("inbox body")
+        }
+    };
+    let before = inbox(true).await;
+    assert_eq!(before["count"].as_u64(), Some(1), "{before}");
+
+    // The recipient declares it handled: delete. Disposition on the wire.
+    let resp = client
+        .delete(format!("{base}/api/v1/memories/{id}"))
+        .header("x-agent-id", &bob)
+        .send()
+        .await
+        .expect("DELETE");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body = resp.json::<Value>().await.expect("delete body");
+    assert_eq!(body["deleted"], json!(true), "{body}");
+    assert_eq!(
+        body["archived"],
+        json!(true),
+        "#3730: an inbox message is ARCHIVED on delete and the response says so: {body}"
+    );
+
+    // Gone from every read surface ...
+    let after = inbox(false).await;
+    assert_eq!(after["count"].as_u64(), Some(0), "inbox drained: {after}");
+    let got = client
+        .get(format!("{base}/api/v1/memories/{id}"))
+        .header("x-agent-id", &bob)
+        .send()
+        .await
+        .expect("GET");
+    assert_eq!(
+        got.status(),
+        reqwest::StatusCode::NOT_FOUND,
+        "get must not find an archived row"
+    );
+    let recalled = client
+        .post(format!("{base}/api/v1/recall"))
+        .header("x-agent-id", &bob)
+        .json(&json!({"query": "kumquat directive 3730", "namespace": ns, "limit": 10}))
+        .send()
+        .await
+        .expect("recall");
+    let recalled_text = recalled.text().await.expect("recall body");
+    assert!(
+        !recalled_text.contains(&id),
+        "recall must not surface an archived row: {recalled_text}"
+    );
+
+    // ... and present in the archive. `GET /api/v1/archive` is ADMIN-ONLY
+    // by design (`handlers::archive::list_archive` -> `require_admin`; a
+    // recipient must not enumerate the archive), so the archive is read
+    // through a probe store on the same database, the pattern the other
+    // pins in this file use, never through a relaxed route.
+    let probe = PostgresStore::connect(&url)
+        .await
+        .expect("connect probe pool");
+    let archived = probe
+        .list_archived(Some(ns.as_str()), 50, 0)
+        .await
+        .expect("list_archived via store");
+    let ids: Vec<&str> = archived.iter().filter_map(|m| m["id"].as_str()).collect();
+    assert_eq!(
+        ids,
+        vec![id.as_str()],
+        "the archive holds the drained message: {archived:?}"
+    );
+
+    // Negative control: an ordinary row deleted the same way is ERASED.
+    let resp = client
+        .post(format!("{base}/api/v1/memories"))
+        .header("x-agent-id", &bob)
+        .json(&json!({
+            "title": "ordinary note",
+            "content": "not an inbox message",
+            "namespace": "notes-3730",
+        }))
+        .send()
+        .await
+        .expect("store POST");
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED, "store");
+    let note_id = resp.json::<Value>().await.expect("store body")["id"]
+        .as_str()
+        .expect("store id")
+        .to_string();
+    let resp = client
+        .delete(format!("{base}/api/v1/memories/{note_id}"))
+        .header("x-agent-id", &bob)
+        .send()
+        .await
+        .expect("DELETE note");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body = resp.json::<Value>().await.expect("delete body");
+    assert_eq!(body["archived"], json!(false), "negative control: {body}");
+    let archived = probe
+        .list_archived(Some("notes-3730"), 50, 0)
+        .await
+        .expect("list_archived via store");
+    assert!(
+        archived.is_empty(),
+        "an ordinary delete leaves no archive copy: {archived:?}"
+    );
+
+    shutdown.notify_one();
+    let _ = handle.await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn bucket_b_inbox_page_lists_touched_rows_3463_dissolved_by_3730() {
+    // Was `bucket_b_inbox_unread_only_narrows_before_limit_3463`: #3463 pushed
+    // the unread narrowing into SQL so a page of "read" rows could not hide an
+    // older unread one. #3730 dissolved that problem — there are no read rows
+    // (touched is not handled), so the page is the page on both backends.
+    let Some(url) = postgres_url() else {
+        eprintln!("skipping bucket_b_inbox_page_lists_touched_rows_3463_dissolved_by_3730");
         return;
     };
     let (base, shutdown, handle) = spawn_daemon(&url).await;
@@ -604,33 +773,45 @@ async fn bucket_b_inbox_unread_only_narrows_before_limit_3463() {
     let msgs = unread["messages"].as_array().expect("messages array");
     assert_eq!(
         msgs.len(),
-        1,
-        "#3463 REGRESSED: `unread_only` was applied AFTER the SQL LIMIT, so a full \
-         page of newer READ messages hid the older unread one and the agent was told \
-         it had nothing unread. got={unread}"
+        3,
+        "#3730: the 3-row page is the three newest (touched) rows under unread_only too — \
+         a touch is not a handling; got={unread}"
     );
-    assert_eq!(msgs[0]["id"].as_str(), Some(unread_id.as_str()));
-    assert_eq!(msgs[0]["read"].as_bool(), Some(false));
-    assert_eq!(unread["unread_count"].as_u64(), Some(1));
-    assert_eq!(unread["count"].as_u64(), Some(1));
-    assert_eq!(unread["unread_only"].as_bool(), Some(true));
+    assert!(
+        msgs.iter().all(|m| m["access_count"].as_u64() == Some(1)),
+        "{msgs:?}"
+    );
+    assert!(
+        msgs.iter().all(|m| m.get("read").is_none()),
+        "no `read` field: {msgs:?}"
+    );
+    assert_eq!(
+        unread["unread_count"].as_u64(),
+        Some(3),
+        "unread_count == count"
+    );
+    assert_eq!(unread["count"].as_u64(), Some(3));
+    assert_eq!(
+        unread["unread_only"].as_bool(),
+        Some(true),
+        "echoed as sent"
+    );
 
-    // ALLOWED path — without the axis the same window is the legacy page of
-    // three read rows, unchanged.
-    let all = inbox(false, 3).await;
+    let all = inbox(false, 50).await;
     let all_msgs = all["messages"].as_array().expect("messages array");
     assert_eq!(
         all_msgs.len(),
-        3,
-        "with `unread_only` absent the inbox must return the SAME first page it \
-         always did; got={all}"
+        4,
+        "the full window lists every row; got={all}"
     );
     assert!(
-        all_msgs.iter().all(|m| m["read"].as_bool() == Some(true)),
-        "the high-priority page is the three READ rows; got={all_msgs:?}"
+        all_msgs
+            .iter()
+            .any(|m| m["id"].as_str() == Some(unread_id.as_str())),
+        "the older untouched row is in the window; got={all_msgs:?}"
     );
-    assert_eq!(all["unread_count"].as_u64(), Some(0));
-    assert_eq!(all["count"].as_u64(), Some(3));
+    assert_eq!(all["unread_count"].as_u64(), Some(4));
+    assert_eq!(all["count"].as_u64(), Some(4));
 
     shutdown.notify_one();
     let _ = handle.await;

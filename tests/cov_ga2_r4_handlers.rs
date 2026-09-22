@@ -206,6 +206,7 @@ fn sqlite_router() -> (axum::Router, tempfile::NamedTempFile, Db) {
             ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty(),
         ),
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
+        ..Default::default()
     };
     (
         ai_memory::build_router(api_key_state, app_state),
@@ -274,6 +275,7 @@ fn sqlite_router_strict_nonce() -> (axum::Router, tempfile::NamedTempFile) {
             ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty(),
         ),
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
+        ..Default::default()
     };
     (ai_memory::build_router(api_key_state, app_state), db_tmp)
 }
@@ -338,6 +340,7 @@ fn router_for_pg(store_concrete: PostgresStore) -> axum::Router {
             ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty(),
         ),
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
+        ..Default::default()
     };
     ai_memory::build_router(api_key_state, app_state)
 }
@@ -1766,7 +1769,10 @@ pg_test!(pg_stats_and_gc_postgres_arms, url, {
 pg_test!(pg_export_postgres_arm, url, {
     enable_admin_header_trust();
     let (_store, router) = pg_store_and_router(&url).await;
-    let (status, body) = get_as(&router, "/api/v1/export", ADMIN_AGENT).await;
+    // #3288 — the shared pg test database can exceed the unpaged ceiling,
+    // where an unpaged export is now refused (413); one bounded page drives
+    // the same postgres arm.
+    let (status, body) = get_as(&router, "/api/v1/export?limit=10", ADMIN_AGENT).await;
     assert_eq!(status, StatusCode::OK, "export body={body}");
     assert_eq!(body["storage_backend"], "postgres");
     assert!(body.get("memories").is_some());

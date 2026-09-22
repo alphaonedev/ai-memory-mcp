@@ -137,6 +137,9 @@ pub async fn skill_register_route(
     let kp = (*app.active_keypair).as_ref();
     match crate::mcp::handle_skill_register(&lock.0, &body, kp) {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
+        // #3762 — forward the renderer's closed-vocabulary text verbatim so
+        // HTTP says byte-identically what MCP says; the absolute jail path
+        // lives on the operator log at the refusal site, never here.
         Err(e) => (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response(),
     }
 }
@@ -333,6 +336,9 @@ pub async fn skill_export_route(
     let kp = (*app.active_keypair).as_ref();
     // #3357 — `lock.1` is the resolved store path; it anchors the default
     // export jail root (`<db parent>/skills-export`).
+    // #3762 — the `Err` text below is the renderer's closed vocabulary
+    // forwarded verbatim (byte-identical with the MCP surface); see the
+    // register route above.
     match crate::mcp::handle_skill_export(&lock.0, &lock.1, &params, kp) {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(e) => {

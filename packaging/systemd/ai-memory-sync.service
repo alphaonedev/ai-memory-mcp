@@ -21,7 +21,7 @@ ExecStart=/bin/sh -c '/usr/bin/ai-memory sync-daemon --peers "$PEERS" --interval
 Restart=on-failure
 RestartSec=15s
 
-Environment=RUST_LOG=ai_memory=info
+Environment=RUST_LOG=info
 
 # --- hardening ---
 NoNewPrivileges=yes

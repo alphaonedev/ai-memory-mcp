@@ -6,7 +6,7 @@
 
 1. **MCP tool server** -- stdio JSON-RPC server exposing 104 advertised entries at `--profile full` (103 callable memory tools + the always-on `memory_capabilities` bootstrap) + 2 MCP prompts for any MCP-compatible AI client (Claude AI, OpenAI ChatGPT, xAI Grok, META Llama, and others)
 2. **CLI tool** -- direct SQLite operations for store, recall, search, list, etc. (completely AI-agnostic)
-3. **HTTP daemon** -- an Axum web server exposing the same operations as a REST API with 100 route registrations / 86 unique URL paths (completely AI-agnostic)
+3. **HTTP daemon** -- an Axum web server exposing the same operations as a REST API with 102 route registrations / 88 unique URL paths (completely AI-agnostic)
 
 **Key architectural features:** Zero token cost (no context loaded until recall), TOON compact default response format (79% smaller than JSON), MCP prompts capability (`recall-first` behavioral rules + `memory-workflow` reference card), 4 feature tiers with optional local LLMs via Ollama, true dedup on title+namespace, 6-factor recall scoring with score field in responses.
 
@@ -17,7 +17,7 @@ main.rs            -- Thin CLI shim (W6 refactor); top-level Command enum now li
 daemon_runtime.rs  -- HTTP daemon `serve` bootstrap, MCP `mcp` dispatch, top-level clap Command enum
 models/            -- Data structures: Memory (30 fields at v1.0.0), MemoryLink (9 relations at v0.8.0), MemoryKind (Batman Form-6 + Goal/Plan/Step), LifecycleState (v0.8.0 Pillar-2 state machine), Citation/SourceSpan (Form-4), query types, constants
 handlers/          -- HTTP request handlers split per domain (http.rs, federation_receive.rs, hook_subscribers.rs, transport.rs, plus per-surface modules: recall.rs, memories.rs, admin.rs, kg.rs, …); Axum extractors + JSON responses; error sanitization. Route-path SSOT in handlers/routes.rs (#1558 batch 4 — one const per production route path; lib.rs registers them, the postgres gate / federation receiver / doctor match on them)
-storage/           -- sqlite SQL primitives; CRUD, FTS5, recall scoring, GC, migration (CURRENT_SCHEMA_VERSION = 98)
+storage/           -- sqlite SQL primitives; CRUD, FTS5, recall scoring, GC, migration (CURRENT_SCHEMA_VERSION = 100)
 store/             -- SAL `MemoryStore` trait + adapter implementations (sqlite + postgres + AGE feature gates); new DB operations land here FIRST (post-#961)
 mcp/               -- MCP server over stdio JSON-RPC; tool registry (registry.rs incl. the tool_names const module), per-tool handlers under tools/, JSON-RPC wire-constant SSOT (mcp/jsonrpc.rs, #1558 batch 3 — version tag, reserved error codes, method names), tool-call param-name SSOT (mcp/param_names.rs), notification handling
 identity/          -- NHI identity: keypair storage (keypair.rs — DAEMON_KEYPAIR_LABEL), reserved-principal sentinel SSOT (sentinels.rs, #1558 batch 2 — DAEMON_PRINCIPAL, ANONYMOUS_INVALID, …; validate::RESERVED_AGENT_IDS is built from these), attestation (attest.rs), signing/verification (sign.rs/verify.rs), replay protection (replay.rs)
@@ -73,7 +73,7 @@ When running at the `semantic` tier or higher, ai-memory loads a HuggingFace emb
 - `ListArgs` includes `--offset` flag for pagination
 - `auto_namespace()` -- detects namespace from git remote URL or directory name
 - `human_age()` -- formats ISO timestamps as "2h ago", "3d ago" for CLI output
-- `serve()` -- starts the Axum server with all routes (**100 production `.route(...)` registrations / 86 unique URL paths** — includes `POST /memories/{id}/promote`, the 4 archive endpoints, namespace-standard endpoints, webhook subscription endpoints, KG endpoints, approval-SSE, quota status, link-verify, capture_turn, share, skills, the 14 #1111 MCP-parity paths, federation sync, the v0.9.0 #1859 lineage read endpoint), spawns GC task, handles graceful shutdown via SIGINT with WAL checkpoint
+- `serve()` -- starts the Axum server with all routes (**102 production `.route(...)` registrations / 88 unique URL paths** — includes `POST /memories/{id}/promote`, the 4 archive endpoints, namespace-standard endpoints, webhook subscription endpoints, KG endpoints, approval-SSE, quota status, link-verify, capture_turn, share, skills, the 14 #1111 MCP-parity paths, federation sync, the v0.9.0 #1859 lineage read endpoint), spawns GC task, handles graceful shutdown via SIGINT with WAL checkpoint
 - `cmd_*()` functions -- one per CLI command, each opens the DB directly
 
 ### `src/models/`
@@ -168,7 +168,7 @@ Structured error types for the HTTP API:
 
 ### `src/handlers/`
 
-All HTTP handlers for the **100 production `.route(...)` registrations / 86 unique URL paths** (canonical count from CLAUDE.md §Architecture; counted via `codegraph_search kind=route limit=100`). The pre-Wave-1 monolithic `src/handlers.rs` (~17.8k LOC) is GONE — split into `src/handlers/{mod,http,transport,federation_receive,hook_subscribers}.rs`. State is the `Db = Arc<Mutex<(Connection, PathBuf, ResolvedTtl, bool)>>` extractor defined in `src/handlers/transport.rs`. Each handler acquires the lock, validates input via `crate::validate::RequestValidator` (#966 Wave-2 Tier-C1), performs DB operations through the SAL `MemoryStore` trait (`src/store/`), and returns JSON.
+All HTTP handlers for the **102 production `.route(...)` registrations / 88 unique URL paths** (canonical count from CLAUDE.md §Architecture; counted via `codegraph_search kind=route limit=102`). The pre-Wave-1 monolithic `src/handlers.rs` (~17.8k LOC) is GONE — split into `src/handlers/{mod,http,transport,federation_receive,hook_subscribers}.rs`. State is the `Db = Arc<Mutex<(Connection, PathBuf, ResolvedTtl, bool)>>` extractor defined in `src/handlers/transport.rs`. Each handler acquires the lock, validates input via `crate::validate::RequestValidator` (#966 Wave-2 Tier-C1), performs DB operations through the SAL `MemoryStore` trait (`src/store/`), and returns JSON.
 
 Key handlers:
 - `create_memory` / `bulk_create` -- memory creation with deduplication (bulk limited to 1,000 items)
@@ -238,7 +238,7 @@ Embedding pipeline for `semantic+` tiers. Loads HuggingFace sentence-transformer
 
 ### `src/llm.rs`
 
-Provider-agnostic LLM client (#1067) for query expansion, auto-tagging, and contradiction detection. Two wire shapes — Ollama-native (`/api/chat` + `/api/embed`, no auth) and OpenAI-compatible (`/v1/chat/completions` + `/v1/embeddings`, Bearer auth). Backend selected by `AI_MEMORY_LLM_BACKEND` env var with 15 vendor aliases (xai, openai, anthropic, gemini, deepseek, kimi, qwen, mistral, groq, together, cerebras, openrouter, fireworks, lmstudio, plus the generic `openai-compatible` escape hatch). The struct name `OllamaClient` is preserved post-#1066 for call-site backward compat (rename to `LlmClient` is non-breaking and tracked separately). Vendor identifiers in this module are legitimate per the substrate-canonical-discipline carve-out enforced by `scripts/check-vendor-literals.sh` (#1200). Supplies the production implementation of the `AutonomyLlm` trait (see `src/autonomy.rs`). Prompts are kept short and structured to minimize token cost; failures are non-fatal — the curator and autonomy passes log and continue.
+Provider-agnostic LLM client (#1067) for query expansion, auto-tagging, and contradiction detection. Two wire shapes — Ollama-native (`/api/chat` + `/api/embed`, no auth) and OpenAI-compatible (`/v1/chat/completions` + `/v1/embeddings`, Bearer auth). Backend selected by `AI_MEMORY_LLM_BACKEND` env var with 14 vendor aliases (xai, openai, anthropic, gemini, kimi, qwen, mistral, groq, together, cerebras, openrouter, fireworks, lmstudio, plus the generic `openai-compatible` escape hatch). The struct name `OllamaClient` is preserved post-#1066 for call-site backward compat (rename to `LlmClient` is non-breaking and tracked separately). Vendor identifiers in this module are legitimate per the substrate-canonical-discipline carve-out enforced by `scripts/check-vendor-literals.sh` (#1200). Supplies the production implementation of the `AutonomyLlm` trait (see `src/autonomy.rs`). Prompts are kept short and structured to minimize token cost; failures are non-fatal — the curator and autonomy passes log and continue.
 
 ### `src/mine.rs`
 
@@ -458,6 +458,14 @@ count:3|mode:hybrid
 
 If there are no metadata fields, this line is omitted entirely.
 
+When a recall was issued with `budget_tokens`, the meta line also carries the budget verdict, in this order after `budget_tokens`: `memories_dropped` (rows that matched but were withheld to honour the budget), `budget_overflow` (`true` when even the first row did not fit), and `budget_tokens_remaining`. They are mirrored from the response's nested `meta` budget block, so the TOON line reports the SAME numbers as the JSON twin of the identical call (#3802 — before that fix the default `toon_compact` format rendered a budget-truncated recall as `count:1|mode:hybrid|tokens_used:34|budget_tokens:60`, indistinguishable from a recall that genuinely matched one row):
+
+```
+count:1|mode:hybrid|tokens_used:34|budget_tokens:60|memories_dropped:4|budget_overflow:false|budget_tokens_remaining:26
+```
+
+`memories_dropped:0` is emitted for an untruncated budgeted recall — the absence of truncation is stated, not implied. A recall issued without `budget_tokens` carries none of these keys.
+
 #### Header Line Syntax
 
 The header declares the array name followed by field names in square brackets, pipe-delimited, ending with a colon:
@@ -510,7 +518,7 @@ memories[id|title|tier|namespace|priority|confidence|score|access_count|tags|sou
 memories[id|title|tier|namespace|priority|score|tags]:
 ```
 
-The MCP server defaults to compact mode (`toon_compact`). Clients can request `"toon"` for full mode or `"json"` for standard JSON via the `format` parameter on recall, search, and list tools.
+The MCP server defaults to compact mode (`toon_compact`). Clients can request `"toon"` for full mode or `"json"` for standard JSON via the `format` parameter on recall, search, list, and session-start tools. The value is an enum on BOTH surfaces (#3803): the MCP dispatch parses it through `WireFormat::parse_mcp` before the handler runs, so a value outside `json` / `toon` / `toon_compact` (a wrong-case `TOON_COMPACT`, a non-string) is refused with `isError: true` and the same `invalid format '<got>': expected one of json, toon, toon_compact` sentence the HTTP surface returns as `400` — never a silent fall-through to pretty JSON (which, before #3803, cost a typo 10.7x the tokens of the default on every call). `memory_export_reflection` keeps its own `md` / `json` / `yaml` vocabulary; the rendering gate does not read it.
 
 #### Search Response Normalization
 
@@ -551,11 +559,11 @@ To parse TOON:
 
 ## API Reference
 
-Base URL: `http://127.0.0.1:9077/api/v1`
+Base URL: `https://127.0.0.1:9077/api/v1`
 
 All responses are JSON. Error responses include `{"error": "message"}`. Database errors are sanitized -- clients receive `"Internal server error"` instead of raw SQLite error details.
 
-The HTTP API exposes **100 production `.route(...)` registrations / 86 unique URL paths** (canonical count via codegraph `codegraph_search kind=route limit=100` filtered to `src/lib.rs` excluding the `#[cfg(test)]`-gated test-only routes; multi-line-aware path extraction via `awk '/\.route\(/{in=1}in&&/"\/[^"]*"/{match($0,/"\/[^"]*"/);print substr($0,RSTART,RLENGTH);in=0}' src/lib.rs | sort -u`; v0.6.3.1 baseline of 50 and v0.6.3 baseline of 42 are frozen on the [evidence page](https://alphaonedev.github.io/ai-memory-mcp/evidence.html)).
+The HTTP API exposes **102 production `.route(...)` registrations / 88 unique URL paths** (canonical count via codegraph `codegraph_search kind=route limit=102` filtered to `src/lib.rs` excluding the `#[cfg(test)]`-gated test-only routes; multi-line-aware path extraction via `awk '/\.route\(/{in=1}in&&/"\/[^"]*"/{match($0,/"\/[^"]*"/);print substr($0,RSTART,RLENGTH);in=0}' src/lib.rs | sort -u`; v0.6.3.1 baseline of 50 and v0.6.3 baseline of 42 are frozen on the [evidence page](https://alphaonedev.github.io/ai-memory-mcp/evidence.html)).
 
 ### Health Check
 
@@ -848,7 +856,7 @@ Global flags:
 
 ### `serve`
 
-Start the HTTP daemon (100 route registrations / 86 unique URL paths).
+Start the HTTP daemon (102 route registrations / 88 unique URL paths).
 
 ```bash
 ai-memory serve --host 127.0.0.1 --port 9077

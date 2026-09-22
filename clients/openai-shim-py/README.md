@@ -61,6 +61,31 @@ client = wrap(
   wrapped client; pass a stable `host_session_id` (as above) to deduplicate
   across process re-runs.
 
+## What `capture_turn` returns (#3544)
+
+`capture_turn()` returns `True` **only when the substrate confirms the turn
+was persisted** — that is, when the `memory_capture_turn` envelope carries a
+non-empty `memory_id` (`src/mcp/tools/capture_turn.rs`; the field RFC-0001
+lists in the tool result's `required` set). Every other outcome returns
+`False` and names itself on stderr:
+
+| Envelope | Returns | Meaning |
+| --- | --- | --- |
+| `memory_id` present (`dedup_hit` either way) | `True` | The turn is stored. A dedup hit is an idempotent re-delivery of a turn that is already stored. |
+| `status: "ask"` | `False` | Governance asked for approval. **Nothing was persisted and there is no recovery handle** — re-send the turn if you need it. |
+| `status: "pending"` | `False` | The write is **durably queued, not lost**. The `pending_id` is printed on stderr; redeem the turn with `memory_pending_approve`. |
+| anything else | `False` | Transport fault, unreadable payload, or an envelope this shim does not recognise. It fails **closed** rather than claim a success it cannot prove. |
+
+`False` is therefore "this turn is not stored", never "this turn is lost" —
+the stderr line is what tells those apart. A pre-#3544 shim returned `True`
+for `ask` and `pending`, and any release before this one returned `True` for
+every envelope it did not enumerate.
+
+The predicate lives in `_capture_outcome.py`, which is byte-identical in the
+OpenAI and Anthropic shim packages and pinned as such by
+`tests/test_capture_outcome_parity.py` in both — the two published wheels
+cannot drift into disagreeing about what "captured" means.
+
 ## Tests
 
 ```bash

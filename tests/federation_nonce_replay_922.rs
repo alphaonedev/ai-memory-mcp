@@ -102,6 +102,7 @@ fn setup() -> TwoHosts {
             ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty(),
         ),
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
+        ..Default::default()
     };
     let app_state = AppState {
         db,

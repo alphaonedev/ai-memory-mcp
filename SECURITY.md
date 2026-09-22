@@ -77,7 +77,7 @@ v1.0.0 flips the federation-receive and federation-transport lanes to fail-close
 - **Store-path agent attestation is REQUIRED by default on the HTTP direct-write surface** (`AI_MEMORY_REQUIRE_AGENT_ATTESTATION` unset → an unsigned HTTP `POST /api/v1/memories` (+`/bulk`) is **rejected**, `403 ATTESTATION_FAILED`, rather than landing `attest_level="claimed"`). The MCP `memory_store` and CLI `store` operator-as-actor surfaces stay **permissive** by default (surface-scoped by #1985, correcting the v0.9.0 require-everywhere default that was unsatisfiable on MCP hosts — #1981); `=1` forces strict everywhere, `=0` permissive everywhere. See the table above (#1751/#1985). `metadata.agent_id` is a *claimed* identity even under attestation — do not use it for authorization decisions without checking `attest_level`.
 - **Federation is NOT end-to-end encrypted — it replicates PLAINTEXT content.** The federation transport is mutually authenticated TLS (rustls, TLS 1.3, mTLS fingerprint pinning), but the memory *content* travels as cleartext **inside** the TLS session and lands in cleartext on every receiving, enrolled, in-scope peer. The #228 at-rest envelope (below) is an at-rest primitive and is **not** applied across the federation wire. Do not federate content across a trust boundary you would not hand the cleartext to. End-to-end content encryption across federation (a reduced-capability blind-replica / ciphertext-only relay mode) is tracked as [#1968](https://github.com/alphaonedev/ai-memory-mcp/issues/1968) and is **OPEN**. This is the stated rationale for the v1.0.0 `AI_MEMORY_FED_REQUIRE_SERVER_VERIFY` (#2448) and plaintext-peer-refusal (#2477) secure defaults above. See [`docs/encryption.html`](docs/encryption.html).
 - **At-rest content encryption (#228)** is wired on both backends but **off by default** (verbatim plaintext); enable with `AI_MEMORY_ENCRYPT_AT_REST=1` (or `[storage] encrypt_at_rest = true`). It is an application-layer ChaCha20-Poly1305 / X25519 / HKDF per-memory **content**-only envelope (title / tags / metadata stay plaintext), independent of the SQLCipher build — so it works on plain SQLite *and* Postgres (the two are orthogonal and compose). Fail-closed on write when enabled without an `agent_id` to key to, and on read when the keying material is missing. Whole-database at-rest encryption (SQLCipher `PRAGMA key`, AES-256) is a **separate** primitive that requires a `--features sqlcipher` build — **the stock binary is sqlite-bundled and ships no SQLCipher**. Crypto-erase (per-record key destruction) applies only to the R56 `0x03` envelope on an encryption-enabled deployment; see [`docs/security/crypto-erase.md`](docs/security/crypto-erase.md).
-- **Hardened `asi-hard` posture (`AI_MEMORY_SECURITY_PROFILE=asi-hard`).** For procurement-tier deployments, this named posture engages a NO-DISABLE contract: at boot it PINS a fixed set of fail-closed security knobs ON and REFUSES to boot if an operator set any pinned knob below its hard floor. The pinned SSOT (`src/security_profile.rs::KNOBS`) is **27 knobs** — `AI_MEMORY_SECRET_SCREEN_MODE=refuse`, `AI_MEMORY_REQUIRE_AGENT_ATTESTATION`, `AI_MEMORY_FED_REQUIRE_WRITE_SIG`, `AI_MEMORY_FED_REQUIRE_SIGNAL_SIG`, `AI_MEMORY_FED_REQUIRE_TRANSITION_SIG`, `AI_MEMORY_FED_REQUIRE_CHECKPOINT_SIG`, the four OUTER federation-TRANSPORT gates added by [#3033](https://github.com/alphaonedev/ai-memory-mcp/issues/3033) — `AI_MEMORY_FED_REQUIRE_SIG` (per-message Ed25519 signature), `AI_MEMORY_FED_REQUIRE_NONCE` (per-message nonce freshness), `AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT` (the inbound `X-Peer-Id` must resolve to an enrolled key) and `AI_MEMORY_FED_REQUIRE_PUSH_NAMESPACE_SCOPE` (inbound-write namespace confinement), all four already default fail-closed so pinning them only removes the ability to DISABLE them — `AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED`, `AI_MEMORY_CID_ENFORCE`, `AI_MEMORY_REQUIRE_ROLLBACK_CHECK`, `AI_MEMORY_REQUIRE_WITNESS`, `AI_MEMORY_REQUIRE_CAUSE_BINDING`, `AI_MEMORY_REQUIRE_ROLE_SEPARATION`, `AI_MEMORY_REQUIRE_IDENTITY_LINEAGE`, `AI_MEMORY_FED_REQUIRE_SERVER_VERIFY=1`, `AI_MEMORY_DB_SYNCHRONOUS=FULL`, and `AI_MEMORY_MIGRATION_REQUIRE_CORE_TABLES=1` ([#3113](https://github.com/alphaonedev/ai-memory-mcp/issues/3113) — the first SCHEMA-INTEGRITY pin: a migration REFUSES to stamp a schema version whose ladder-created core relations were lost, rather than merely warning) — plus the two permissive-inverse pins whose hard floor is that the knob be ABSENT / non-truthy: `AI_MEMORY_ALLOW_SCHEMA_AHEAD` (must be unset) and `AI_MEMORY_FED_ALLOW_PLAINTEXT_PEERS` (must be non-truthy) — plus the three #3168 residual #3033 knobs: `AI_MEMORY_PERMISSIONS_MODE=enforce`, `AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR` (hatch CLOSED), `AI_MEMORY_FED_REQUIRE_POLICY_CURRENT=1` — plus the two #3201 federation escape hatches: `AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS` (hatch CLOSED) and `AI_MEMORY_FED_CERT_PEER_BINDING=enforce` (documented `standard` unset default stays Warn). The enumeration above is the whole set; it is pinned name-by-name against `KNOBS` by `src/security_profile.rs::tests::pinned_knobs_doc_table_matches_the_knobs_ssot_exactly` and the count by the `ASI_HARD_PINNED_KNOB_COUNT` rule in `scripts/check-docs-vs-ssot.sh`. It additionally bridges `[governance].require_operator_pubkey = true`. The canonical deploy template is `docs/deploy/asi-hard.env`.
+- **Hardened `asi-hard` posture (`AI_MEMORY_SECURITY_PROFILE=asi-hard`).** For procurement-tier deployments, this named posture engages a NO-DISABLE contract: at boot it PINS a fixed set of fail-closed security knobs ON and REFUSES to boot if an operator set any pinned knob below its hard floor. The pinned SSOT (`src/security_profile.rs::KNOBS`) is **30 knobs** — `AI_MEMORY_SECRET_SCREEN_MODE=refuse`, `AI_MEMORY_REQUIRE_AGENT_ATTESTATION`, `AI_MEMORY_FED_REQUIRE_WRITE_SIG`, `AI_MEMORY_FED_REQUIRE_SIGNAL_SIG`, `AI_MEMORY_FED_REQUIRE_TRANSITION_SIG`, `AI_MEMORY_FED_REQUIRE_CHECKPOINT_SIG`, the four OUTER federation-TRANSPORT gates added by [#3033](https://github.com/alphaonedev/ai-memory-mcp/issues/3033) — `AI_MEMORY_FED_REQUIRE_SIG` (per-message Ed25519 signature), `AI_MEMORY_FED_REQUIRE_NONCE` (per-message nonce freshness), `AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT` (the inbound `X-Peer-Id` must resolve to an enrolled key) and `AI_MEMORY_FED_REQUIRE_PUSH_NAMESPACE_SCOPE` (inbound-write namespace confinement), all four already default fail-closed so pinning them only removes the ability to DISABLE them — `AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED`, `AI_MEMORY_CID_ENFORCE`, `AI_MEMORY_REQUIRE_ROLLBACK_CHECK`, `AI_MEMORY_REQUIRE_WITNESS`, `AI_MEMORY_REQUIRE_CAUSE_BINDING`, `AI_MEMORY_REQUIRE_ROLE_SEPARATION`, `AI_MEMORY_REQUIRE_IDENTITY_LINEAGE`, `AI_MEMORY_FED_REQUIRE_SERVER_VERIFY=1`, `AI_MEMORY_DB_SYNCHRONOUS=FULL`, and `AI_MEMORY_MIGRATION_REQUIRE_CORE_TABLES=1` ([#3113](https://github.com/alphaonedev/ai-memory-mcp/issues/3113) — the first SCHEMA-INTEGRITY pin: a migration REFUSES to stamp a schema version whose ladder-created core relations were lost, rather than merely warning) — plus the two permissive-inverse pins whose hard floor is that the knob be ABSENT / non-truthy: `AI_MEMORY_ALLOW_SCHEMA_AHEAD` (must be unset) and `AI_MEMORY_FED_ALLOW_PLAINTEXT_PEERS` (must be non-truthy) — plus the three #3168 residual #3033 knobs: `AI_MEMORY_PERMISSIONS_MODE=enforce`, `AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR` (hatch CLOSED), `AI_MEMORY_FED_REQUIRE_POLICY_CURRENT=1` — plus the two #3201 federation escape hatches: `AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS` (hatch CLOSED) and `AI_MEMORY_FED_CERT_PEER_BINDING=enforce` (documented `standard` unset default stays Warn) — plus the [#3124](https://github.com/alphaonedev/ai-memory-mcp/issues/3124) `AI_MEMORY_UNSTAMPED_MUTATION=refuse` (a caller-scoped mutation of an UNSTAMPED, legacy-unowned row is refused on every funnel of both backends; documented `standard` default stays `warn`) — plus the two [#3813] secret-FILE lax-perms hatches whose hard floor is that the knob be ABSENT / non-truthy: `AI_MEMORY_STORE_URL_FILE_ALLOW_LAX_PERMS` (#1927 store-url file channel) and `AI_MEMORY_AGENT_API_KEY_FILE_ALLOW_LAX_PERMS` (#3781 per-agent api-key token file). The enumeration above is the whole set; it is pinned name-by-name against `KNOBS` by `src/security_profile.rs::tests::pinned_knobs_doc_table_matches_the_knobs_ssot_exactly` and the count by the `ASI_HARD_PINNED_KNOB_COUNT` rule in `scripts/check-docs-vs-ssot.sh`. It additionally bridges `[governance].require_operator_pubkey = true`. The canonical deploy template is `docs/deploy/asi-hard.env`.
 - **The curator daemon reads across all tenants** (`bypass_visibility`, admin-class) to perform background maintenance (reflect/consolidate/decay). Treat curator credentials as root-equivalent; it is C8-allowlist-gated in CI but is a privileged in-process actor.
 - **Namespace governance is allow-on-silence (#1569)**: a namespace with no configured standard defaults to `write/promote: Any`. `enforce` permissions mode does nothing until you install rules / namespace standards. Configure explicit standards for production / multi-tenant namespaces.
 
@@ -241,6 +241,110 @@ key) is satisfiable **only over HTTP with per-agent api keys**
 child environments. stdio is certified as ONE trust domain; multi-principal
 deployments serve MCP clients through the HTTP daemon.
 
+## MCP transport is stdio-only (#3829)
+
+**The provable claim is a property of our code.** The `ai-memory mcp` server's
+code owns **stdin/stdout** and nothing else: a length-capped `read_until(b'\n')`
+loop on stdin, JSON-RPC frames out on stdout, diagnostics on stderr
+(`src/mcp/mod.rs::run_mcp_server`). It **binds no server socket** — no
+`TcpListener` / `UnixListener`, no `axum::serve` / `hyper::server` — and
+**constructs no network client for its own transport**. That, and only that, is
+what this section certifies, and it is proven STATICALLY by
+`scripts/check-mcp-transport-isolation.py` (with a planted-violation
+`--self-test`, rule m) over `src/mcp/**` production code. Because MCP's code
+serves nothing over a socket, MCP-stdio is **out of the TLS /
+encryption-in-transit standard** that governs the HTTP daemon (§"v1.0.0
+secure-default changes" above) as a matter of what the binary DOES — there is no
+socket in the code for a transport cipher to apply to. A postgres-backed MCP
+client is served **through the HTTP daemon** (`--store-url` is wired on
+`serve`/`curator`, not on `ai-memory mcp` — #1675), where the TLS posture lives.
+It composes with the F13 ruling above: stdio is one trust domain.
+
+**What this does NOT certify: the deployment.** "No network-served surface" is a
+claim about the CODE, not about the running deployment, and the two can differ.
+The stdio loop reads fd 0, which the process is GIVEN, not something it opens, so
+what fd 0 actually is depends on how the operator wired it and the code cannot
+certify that. Two distinct exposures follow, and only the first is in reach of
+any fd inspection:
+
+- **A socket handed DIRECTLY as fd 0** (systemd `StandardInput=socket` with a
+  real socket; `socat …-LISTEN,nofork,EXEC` dup'ing the raw TCP socket onto
+  fd 0). Here fd 0 IS the network socket and the stdio loop would serve JSON-RPC
+  over it. This is observable, and `run_mcp_server` refuses it at init (the
+  guard below).
+- **A RELAY fronting a genuine local stdio channel** (`ssh host ai-memory mcp`;
+  `socat TCP-LISTEN,fork,EXEC:"ai-memory mcp"`, which terminates the TCP itself
+  and bridges it to the child). Here the protocol bytes cross the network but
+  fd 0 is a real pipe, char device, or `AF_UNIX` socketpair. **No fd-0 check can
+  detect this, and it is not meant to** — ssh-relayed MCP is a legitimate,
+  intended deployment whose transport security is the relay's (ssh's TLS), not
+  MCP's. This is out of the guard's reach BY CONSTRUCTION, not by omission (see
+  "the relay limit" below).
+
+**The runtime guard (defence-in-depth against the direct case).**
+`run_mcp_server` inspects fd 0 at init
+(`src/mcp/stdio_guard.rs::enforce_stdin_is_inherited_channel`) and requires
+POSITIVE evidence of a safe inherited channel: it proceeds only when fd 0
+`fstat`s as a pipe, a character device (tty / `/dev/null`), or a regular file,
+and **refuses to start** on everything else — a listening socket (any family), a
+non-`AF_UNIX` socket (`AF_INET`/`AF_INET6`, `AF_VSOCK`, or any other family), a
+socket whose family cannot be read, a socket that can prove not-listening
+through NEITHER channel (getsockopt SO_ACCEPTCONN unanswered AND no connected
+peer from getpeername — a listener has no peer, so a connected peer is positive
+evidence of not-listening; that second channel is what keeps a legitimate
+`socketpair` starting on macOS, where SO_ACCEPTCONN is not readable for it),
+an **uninspectable fd** (fstat denied by a
+seccomp/LSM filter, distinct from a genuinely-closed EBADF), or an unexpected fd
+type. Fail-CLOSED is deliberate: a guard that refuses only on positive evidence
+of DANGER has a security property equal to the availability of its evidence
+channel, and suppressing that channel is cheaper than forging it, so the
+permitted set is only what the guard can positively reason about (#3829
+amendment 2). The one non-refusing socket case is a positively-`AF_UNIX`
+connected socket, which is **warned, not refused**: a `socketpair` stdio channel
+is one inherited peer, and an accepted UDS connection is the Unix-domain-socket
+case whose control is peer-cred + socket mode (the `wake_hub` model), decided by
+the encryption lane in #3827 — that boundary is left to the UDS ruling.
+
+**The relay limit, stated so it is not mistaken for an oversight.** Detecting
+that fd 0 is a socket is not detecting that the socket is a network relay, and
+the second is impossible AT THE FD LAYER. The default `socat …,fork,EXEC` child
+transport is an `AF_UNIX` socketpair (pipes/pty are opt-in), so the guard DOES
+see a socket there and warns — but it cannot distinguish that relay socketpair
+from a legitimate local socketpair-stdio: `getpeername` is unnamed/autobind on
+both, and `SO_PEERCRED` returns the parent's pid on both. A guard cannot refuse
+on a property it cannot observe, and refusing every `AF_UNIX` socket would break
+legitimate socketpair-stdio. For ssh and `socat …,pipes`/`,pty`, fd 0 is a
+genuine pipe or char device and the guard sees an ordinary inherited channel. So
+across every relay wiring the guard cannot establish "not network-served" as a
+deployment property — which is why this section scopes its claim to the code,
+and why a relay's transport is the relay's responsibility.
+
+**The one documented exception, and why it does not change the code claim.**
+`src/mcp/tools/store/transport.rs` (#881/#318) constructs an **outbound**
+`reqwest` client so an MCP-stdio `memory_store` can join the HTTP daemon's
+federation fanout. That is a **client to the HTTP daemon** (whose own TLS, mTLS
+and plaintext-peer refusals — #2448/#2477 — cover that hop), **not** MCP's
+serving transport. MCP's code still serves nothing over a socket; the static
+gate allowlists exactly this one file and no other.
+
+**Pinned so it cannot decay.** `scripts/check-mcp-transport-isolation.py` refuses
+any server-socket construction anywhere under `src/mcp/**` and any network-client
+construction outside the single allowlisted forward file above, over production
+code (test modules and wiremock test servers are out of scope), with a
+`--self-test` that plants a `TcpListener::bind` and an out-of-allowlist `reqwest`
+client and proves the gate reds on each — a gate that cannot fail would pin
+nothing. The runtime guard is pinned separately by
+`src/mcp/stdio_guard.rs::classify_fd`'s unit tests, which assert that a listening
+socket, an `AF_INET`/`AF_INET6` socket, a non-`AF_UNIX` family such as
+`AF_VSOCK`, a socket whose family cannot be read, a socket whose listening state
+cannot be read (getsockopt denied) AND that has no connected peer, and an
+uninspectable fd are ALL refused, while an `AF_UNIX` socketpair is warned —
+including the macOS shape where SO_ACCEPTCONN is unreadable and the connected
+peer alone carries the evidence. Together the static gate and
+the runtime guard cover the two ways a socket can reach MCP DIRECTLY —
+constructed in the tree, or handed in as fd 0 — and neither covers the relay,
+which is the limit stated above.
+
 ## Supply-chain SBOM (#1973, v1.0.0)
 
 Starting at v1.0.0, every release artifact set on the [GitHub Releases page](https://github.com/alphaonedev/ai-memory-mcp/releases) ships a CycloneDX JSON Software Bill of Materials (`ai-memory.cdx.json`, generated by `cargo-cyclonedx` from `Cargo.lock`), enumerating every resolved dependency with its name, version, and package URL (SHA-256 present only for crates.io registry dependencies, since `Cargo.lock` carries no hash for git/path dependencies). **This is a dependency inventory, not a security guarantee** — it lists what is in the dependency graph and vouches for none of it; `cargo audit` against the RustSec advisory database remains the substrate's actual vulnerability-scanning gate, and both run independently in CI on every release.
@@ -263,4 +367,4 @@ Per [`ROADMAP.md`](ROADMAP.md) §15: ai-memory is Apache 2.0 forever. Security f
 
 ---
 
-Last updated: 2026-09-11 (#3549 caller-authority boundary + the #3125 / F13 rulings). Previous: 2026-08-16 (v1.0.0 federation secure-default flips #2448/#2477/#1801→#1954/#1936/#1947/#2447 documented; federation-is-plaintext (#1968 OPEN) posture note added; `asi-hard` 27-knob hardened profile cross-referenced; honest tamper-evidence-not-proof / rollback-estimable-not-attestable boundary added; SQLCipher whole-DB at-rest build-flag caveat added. 2026-07-11: v1.0.0 supply-chain CycloneDX SBOM, #1973).
+Last updated: 2026-09-11 (#3549 caller-authority boundary + the #3125 / F13 rulings). Previous: 2026-08-16 (v1.0.0 federation secure-default flips #2448/#2477/#1801→#1954/#1936/#1947/#2447 documented; federation-is-plaintext (#1968 OPEN) posture note added; `asi-hard` 30-knob hardened profile cross-referenced; honest tamper-evidence-not-proof / rollback-estimable-not-attestable boundary added; SQLCipher whole-DB at-rest build-flag caveat added. 2026-07-11: v1.0.0 supply-chain CycloneDX SBOM, #1973).

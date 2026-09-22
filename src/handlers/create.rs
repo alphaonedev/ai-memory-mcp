@@ -502,11 +502,14 @@ fn resolve_create_conflict_title(
     conn: &rusqlite::Connection,
     body: &CreateMemory,
     on_conflict_mode: crate::mcp::tools::OnConflictMode,
+    // #3696 — the resolved request agent: the probe names only an occupant
+    // this caller may read on both axes (`visibility::title_slot_admission`).
+    viewer: Option<&str>,
 ) -> Result<String, axum::response::Response> {
     use crate::mcp::tools::OnConflictMode;
     match on_conflict_mode {
         OnConflictMode::Error => {
-            match db::find_by_title_namespace(conn, &body.title, &body.namespace) {
+            match db::find_by_title_namespace(conn, &body.title, &body.namespace, viewer) {
                 Ok(Some(existing_id)) => Err(conflict_409_response(
                     &body.title,
                     &body.namespace,
@@ -728,6 +731,8 @@ fn insert_create_with_quota(
     // REFUSED atomically (409 CONFLICT) instead of upsert-merged. `false`
     // (`merge`/`version`) keeps the legacy `db::insert` upsert.
     fail_on_conflict: bool,
+    // #3696 — the resolved request agent (see `resolve_create_conflict_title`).
+    viewer: Option<&str>,
 ) -> Result<String, axum::response::Response> {
     // v0.7.0 Round-2 F7 — per-agent quota gate. Round-1 evidence: 500
     // HTTP stores from a single agent_id incremented zero rows in
@@ -793,18 +798,9 @@ fn insert_create_with_quota(
             // on the limit name. Substrate errors bubble up as 500
             // because the row was never written.
             return Err(match e {
-                crate::quotas::QuotaCheckError::Quota(qe) => (
-                    StatusCode::TOO_MANY_REQUESTS,
-                    Json(json!({
-                        "code": crate::errors::error_codes::QUOTA_EXCEEDED,
-                        "error": qe.to_string(),
-                        "limit": qe.limit.as_str(),
-                        "current": qe.current,
-                        "max": qe.max,
-                        "agent_id": qe.agent_id,
-                    })),
-                )
-                    .into_response(),
+                crate::quotas::QuotaCheckError::Quota(qe) => {
+                    crate::handlers::errors::quota_exceeded_response(&qe)
+                }
                 crate::quotas::QuotaCheckError::Sql(se) => {
                     tracing::error!("quota substrate error: {se}");
                     (
@@ -818,9 +814,9 @@ fn insert_create_with_quota(
     }
 
     let insert_result = if fail_on_conflict {
-        db::insert_no_overwrite(&lock.0, mem)
+        db::insert_no_overwrite_as(&lock.0, mem, viewer)
     } else {
-        db::insert(&lock.0, mem)
+        db::insert_as(&lock.0, mem, viewer)
     };
     match insert_result {
         Ok(actual_id) => {
@@ -1042,7 +1038,9 @@ async fn fanout_and_assemble_create_response(
         {
             Ok(tracker) => match crate::federation::finalise_quorum(&tracker) {
                 Ok(got) => {
-                    response["quorum_acks"] = json!(got);
+                    response[crate::write_receipt::QUORUM_ACKS_FIELD] = json!(got);
+                    response[crate::write_receipt::QUORUM_N_FIELD] = json!(fed.policy.n);
+                    response[crate::write_receipt::QUORUM_REQUIRED_FIELD] = json!(fed.policy.w);
                     return (StatusCode::CREATED, Json(response)).into_response();
                 }
                 Err(err) => {
@@ -1162,7 +1160,7 @@ async fn create_memory_postgres(
         OnConflictMode::Error => {
             match app
                 .store
-                .find_by_title_namespace(&body.title, &body.namespace)
+                .find_by_title_namespace(&body.title, &body.namespace, Some(agent_id))
                 .await
             {
                 Ok(Some(existing_id)) => {
@@ -1235,11 +1233,17 @@ async fn create_memory_postgres(
             )
             .await
             {
+                tracing::warn!(error = %e, "attestation failed (signed path)");
                 return (
                     StatusCode::FORBIDDEN,
                     Json(json!({
                         "code": crate::errors::error_codes::ATTESTATION_FAILED,
-                        "error": e.to_string(),
+                        // #3707 — `stamp_attestation_async` returns
+                        // `anyhow::Result` and takes the store, so its chain can
+                        // wrap a `StoreError` and carry driver text out here.
+                        // The machine-readable `code` IS the contract and is
+                        // unchanged; the detail goes to the operator log.
+                        "error": crate::handlers::errors::ATTESTATION_FAILED_MSG,
                     })),
                 )
                     .into_response();
@@ -1275,11 +1279,13 @@ async fn create_memory_postgres(
         )
         .await
         {
+            tracing::warn!(error = %e, "attestation failed (unsigned path)");
             return (
                 StatusCode::FORBIDDEN,
                 Json(json!({
                     "code": crate::errors::error_codes::ATTESTATION_FAILED,
-                    "error": e.to_string(),
+                    // #3707 — see above: anyhow chain can carry store text.
+                    "error": crate::handlers::errors::ATTESTATION_FAILED_MSG,
                 })),
             )
                 .into_response();
@@ -1521,15 +1527,16 @@ async fn create_memory_postgres(
     // #1480 — evaluate the pipelined quorum result now that the local
     // write is durable and audit/dispatch have fired. A failed quorum
     // returns 503 but never rolls back the local write (ADR-0001).
+    let mut receipt_quorum = None;
     if let Some(quorum_res) = quorum_outcome {
         match quorum_res {
-            Ok(tracker) => {
-                if let Err(err) = crate::federation::finalise_quorum(&tracker) {
-                    // #869 — typed 503 envelope via the shared helper.
+            Ok(tracker) => match crate::federation::finalise_quorum(&tracker) {
+                Ok(got) => receipt_quorum = Some(got),
+                Err(err) => {
                     let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
                     return super::under_replicated_response(&payload);
                 }
-            }
+            },
             Err(err) => {
                 let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
                 return super::under_replicated_response(&payload);
@@ -1563,6 +1570,11 @@ async fn create_memory_postgres(
         Ok(v) => v,
         Err(resp) => return resp,
     };
+    if let (Some(got), Some(fed)) = (receipt_quorum, app.federation.as_ref()) {
+        payload[crate::write_receipt::QUORUM_ACKS_FIELD] = json!(got);
+        payload[crate::write_receipt::QUORUM_N_FIELD] = json!(fed.policy.n);
+        payload[crate::write_receipt::QUORUM_REQUIRED_FIELD] = json!(fed.policy.w);
+    }
     if let Some(obj) = payload.as_object_mut() {
         obj.insert("id".to_string(), serde_json::Value::String(id));
         if let Some(field) = auto_tag_outcome.response_field() {
@@ -1580,6 +1592,23 @@ async fn create_memory_postgres(
 }
 
 pub async fn create_memory(
+    State(app): State<AppState>,
+    headers: HeaderMap,
+    JsonOrBadRequest(body): JsonOrBadRequest<CreateMemory>,
+) -> impl IntoResponse {
+    let response = create_memory_write(State(app.clone()), headers, JsonOrBadRequest(body))
+        .await
+        .into_response();
+    super::write_receipt::complete(
+        &app,
+        response,
+        super::write_receipt::WriterConnection::Legacy,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_lines)]
+async fn create_memory_write(
     State(app): State<AppState>,
     headers: HeaderMap,
     JsonOrBadRequest(body): JsonOrBadRequest<CreateMemory>,
@@ -1708,10 +1737,11 @@ pub async fn create_memory(
     );
 
     // Stage 2 — on_conflict resolution against the live connection.
-    let resolved_title = match resolve_create_conflict_title(&lock.0, &body, on_conflict_mode) {
-        Ok(t) => t,
-        Err(resp) => return resp,
-    };
+    let resolved_title =
+        match resolve_create_conflict_title(&lock.0, &body, on_conflict_mode, Some(&agent_id)) {
+            Ok(t) => t,
+            Err(resp) => return resp,
+        };
 
     // #2587 — `body.tags.clone()` verbatim; auto-tags are no longer
     // merged in before the durable insert (see the comment near the top
@@ -1769,11 +1799,17 @@ pub async fn create_memory(
                 Some(&sig_bytes),
                 crate::identity::attest::WriteSurface::HttpDirect,
             ) {
+                tracing::warn!(error = %e, "attestation failed (sync signed path)");
                 return (
                     StatusCode::FORBIDDEN,
                     Json(json!({
                         "code": crate::errors::error_codes::ATTESTATION_FAILED,
-                        "error": e.to_string(),
+                        // #3707 — `stamp_attestation_async` returns
+                        // `anyhow::Result` and takes the store, so its chain can
+                        // wrap a `StoreError` and carry driver text out here.
+                        // The machine-readable `code` IS the contract and is
+                        // unchanged; the detail goes to the operator log.
+                        "error": crate::handlers::errors::ATTESTATION_FAILED_MSG,
                     })),
                 )
                     .into_response();
@@ -1803,11 +1839,13 @@ pub async fn create_memory(
             None,
             crate::identity::attest::WriteSurface::HttpDirect,
         ) {
+            tracing::warn!(error = %e, "attestation failed (sync unsigned path)");
             return (
                 StatusCode::FORBIDDEN,
                 Json(json!({
                     "code": crate::errors::error_codes::ATTESTATION_FAILED,
-                    "error": e.to_string(),
+                    // #3707 — see above: anyhow chain can carry store text.
+                    "error": crate::handlers::errors::ATTESTATION_FAILED_MSG,
                 })),
             )
                 .into_response();
@@ -1828,8 +1866,11 @@ pub async fn create_memory(
     // contradiction hint to "none found" rather than blocking the
     // store. The proactive #519 check (below) is the load-bearing
     // duplicate gate.
+    // #3712 — as the resolved request agent: a row this caller cannot read
+    // is never named in `potential_contradictions`.
     let contradictions =
-        db::find_contradictions(&lock.0, &mem.title, &mem.namespace).unwrap_or_default();
+        db::find_contradictions(&lock.0, &mem.title, &mem.namespace, Some(&agent_id))
+            .unwrap_or_default();
     let contradiction_ids: Vec<String> = contradictions
         .iter()
         .filter(|c| c.id != mem.id)
@@ -1848,9 +1889,13 @@ pub async fn create_memory(
         // #1579 A5 — verify the pre-lock ANN candidates (point lookups
         // + exact cosine recompute) when an index was available;
         // bounded recency scan otherwise.
+        // #3712 — as the resolved request agent: a near-duplicate this caller
+        // cannot read neither refuses the write nor is named in the 409.
         let check_result = match &conflict_candidate_ids {
-            Some(ids) => db::proactive_conflict_check_candidates(&lock.0, &mem, qe, ids),
-            None => db::proactive_conflict_check(&lock.0, &mem, qe),
+            Some(ids) => {
+                db::proactive_conflict_check_candidates(&lock.0, &mem, qe, ids, Some(&agent_id))
+            }
+            None => db::proactive_conflict_check(&lock.0, &mem, qe, Some(&agent_id)),
         };
         match check_result {
             Ok(Some(conflict)) => {
@@ -1910,6 +1955,7 @@ pub async fn create_memory(
         &embedding,
         create_space.as_deref(),
         fail_on_conflict,
+        Some(&agent_id),
     ) {
         Ok(id) => id,
         Err(resp) => return resp,
@@ -2098,7 +2144,7 @@ mod tests {
         let mut body = make_body("dup-title");
         body.namespace = "ns-x".to_string();
         use crate::mcp::tools::OnConflictMode;
-        let err = resolve_create_conflict_title(&conn, &body, OnConflictMode::Error)
+        let err = resolve_create_conflict_title(&conn, &body, OnConflictMode::Error, None)
             .expect_err("must return CONFLICT");
         assert_eq!(err.status(), StatusCode::CONFLICT);
     }
@@ -2118,7 +2164,7 @@ mod tests {
         let mut body = make_body("vers-title");
         body.namespace = "ns-v".to_string();
         use crate::mcp::tools::OnConflictMode;
-        let resolved = resolve_create_conflict_title(&conn, &body, OnConflictMode::Version)
+        let resolved = resolve_create_conflict_title(&conn, &body, OnConflictMode::Version, None)
             .expect("version path returns Ok");
         // `next_versioned_title` appends a free numeric suffix when the
         // base name is taken (`vers-title (2)`-style). The exact suffix
@@ -2140,7 +2186,7 @@ mod tests {
         // path is documented as a no-op (UPSERT happens inside
         // `db::insert`).
         use crate::mcp::tools::OnConflictMode;
-        let resolved = resolve_create_conflict_title(&conn, &body, OnConflictMode::Merge)
+        let resolved = resolve_create_conflict_title(&conn, &body, OnConflictMode::Merge, None)
             .expect("merge path returns Ok");
         assert_eq!(resolved, "merge-title");
     }

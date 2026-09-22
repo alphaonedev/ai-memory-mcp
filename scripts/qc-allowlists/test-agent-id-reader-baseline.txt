@@ -1,0 +1,52 @@
+# scripts/qc-allowlists/test-agent-id-reader-baseline.txt -- issue #3517 ratchet baseline.
+#
+# Format: <unguarded AI_MEMORY_AGENT_ID reader tests> <path>
+#
+# A lib test that reaches an identity-resolving entry point (see the
+# arm (h) header in scripts/check-test-env-lock.sh) and cites none of
+# agent_id_env_unset_guard / agent_id_env_test_lock / test_agent_id::
+# in its own body. Counts may fall, never rise; burn down to zero.
+# Regenerate with: scripts/check-test-env-lock.sh --update-baseline
+# A regenerated baseline that RAISES any number is a deliberate,
+# reviewable widening -- justify it in review.
+2 src/cli/commands/entity_get_by_alias.rs
+3 src/cli/commands/list_subscriptions.rs
+1 src/cli/commands/replay.rs
+8 src/cli/commands/skill.rs
+2 src/cli/commands/subscribe.rs
+3 src/cli/commands/unsubscribe.rs
+2 src/cli/offload.rs
+1 src/cli/rules.rs
+39 src/cli/shell.rs
+1 src/cli/store.rs
+2 src/identity/mod.rs
+16 src/mcp/mod.rs
+2 src/mcp/param_shapes_3365_tests.rs
+12 src/mcp/tools/action.rs
+7 src/mcp/tools/agent.rs
+14 src/mcp/tools/archive.rs
+16 src/mcp/tools/atomise.rs
+1 src/mcp/tools/capture_turn.rs
+20 src/mcp/tools/check_agent_action.rs
+12 src/mcp/tools/checkpoint.rs
+19 src/mcp/tools/consolidate.rs
+7 src/mcp/tools/delete.rs
+7 src/mcp/tools/entity_register.rs
+7 src/mcp/tools/export_reflection.rs
+2 src/mcp/tools/forget.rs
+7 src/mcp/tools/link.rs
+18 src/mcp/tools/namespace.rs
+7 src/mcp/tools/notify.rs
+5 src/mcp/tools/pending.rs
+3 src/mcp/tools/promote.rs
+17 src/mcp/tools/reflect.rs
+1 src/mcp/tools/routine/freeze_3616.rs
+12 src/mcp/tools/routine.rs
+17 src/mcp/tools/signal.rs
+16 src/mcp/tools/skill_get.rs
+6 src/mcp/tools/skill_promote.rs
+15 src/mcp/tools/skill_register.rs
+69 src/mcp/tools/store/tests.rs
+14 src/mcp/tools/subscribe.rs
+2 src/mcp/tools/swarm_rewind.rs
+1 src/mcp/tools/update.rs

@@ -1009,14 +1009,11 @@ This standard is consistent with and subordinate to:
 If anything in this document conflicts with the legal-floor documents above, the
 legal-floor documents win.
 
-### 10.2 OIN, trademark, third-party licenses
+### 10.2 OIN and third-party licenses
 
 Per [`ENGINEERING_STANDARDS.md` §5](ENGINEERING_STANDARDS.html):
 
 - AlphaOne LLC is an active OIN member (3,900+ member cross-license).
-- `ai-memory(TM)` is a pending USPTO mark (Serial No. 99761257). AI agents must not
-  alter trademark notices or use the mark in a manner inconsistent with the maintainer's
-  guidance.
 - New dependencies must be license-compatible with Apache 2.0 (§6.5).
 
 ### 10.3 Versioning of this document

@@ -34,6 +34,11 @@
 //! require the daemon to finish coming up — only to reach the boot-report
 //! block.
 
+// #3733 — key dirs created 0700 (not the ambient umask; the #3198 guard
+// refuses a group-writable key dir at umask 0002).
+#[path = "common/key_dir_sandbox.rs"]
+mod key_dir_sandbox;
+
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -80,7 +85,7 @@ fn serve_boot_lines(needle: &str, budget: Duration) -> Vec<String> {
     let dir = scratch("serve-banner");
     let db = dir.path().join("ai-memory.db");
     let keys = dir.path().join("witness-keys");
-    std::fs::create_dir_all(&keys).ok();
+    key_dir_sandbox::mkdir_0700(&keys);
     let port = free_port().to_string();
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_ai-memory"))

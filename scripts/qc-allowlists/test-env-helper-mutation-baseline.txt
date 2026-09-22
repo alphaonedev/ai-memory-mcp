@@ -26,7 +26,7 @@
 73 src/log_paths.rs
 7 src/mcp/mod.rs
 1 src/mcp/param_numeric_3374_tests.rs
-9 src/mcp/tools/action.rs
+10 src/mcp/tools/action.rs
 2 src/mcp/tools/check_agent_action.rs
 10 src/mcp/tools/link.rs
 3 src/mcp/tools/list.rs
@@ -43,3 +43,4 @@
 10 src/storage/connection.rs
 1 src/storage/migrations.rs
 6 src/test_support.rs
+4 src/transit_encryption.rs

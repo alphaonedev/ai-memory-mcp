@@ -100,7 +100,7 @@ fn proactive_conflict_returns_none_on_low_similarity() {
     let mem_b = make_mem("beta", "the speed of light is c", "global");
     let emb_b = vec![0.0_f32, 1.0, 0.0, 0.0];
 
-    let conflict = proactive_conflict_check(&conn, &mem_b, &emb_b).expect("check ok");
+    let conflict = proactive_conflict_check(&conn, &mem_b, &emb_b, None).expect("check ok");
     assert!(
         conflict.is_none(),
         "orthogonal embeddings must not trigger the proactive conflict guard"
@@ -122,7 +122,7 @@ fn proactive_conflict_returns_some_on_near_duplicate_with_differing_content() {
     mem_a_prime.id = uuid::Uuid::new_v4().to_string();
     let emb_a_prime = emb_a.clone();
 
-    let conflict = proactive_conflict_check(&conn, &mem_a_prime, &emb_a_prime)
+    let conflict = proactive_conflict_check(&conn, &mem_a_prime, &emb_a_prime, None)
         .expect("check ok")
         .expect("near-duplicate with differing content must be a conflict");
     assert!(
@@ -149,7 +149,7 @@ fn proactive_conflict_skips_same_content_near_duplicates() {
     mem_a_dup.id = uuid::Uuid::new_v4().to_string();
     let emb_dup = emb_a.clone();
 
-    let conflict = proactive_conflict_check(&conn, &mem_a_dup, &emb_dup).expect("check ok");
+    let conflict = proactive_conflict_check(&conn, &mem_a_dup, &emb_dup, None).expect("check ok");
     assert!(
         conflict.is_none(),
         "same-content near-duplicate must NOT trigger the conflict guard"
@@ -170,7 +170,7 @@ fn proactive_conflict_excludes_self_match() {
     let mut replay = make_mem("self-replay", "version 2 of the fact", "global");
     replay.id = id;
 
-    let conflict = proactive_conflict_check(&conn, &replay, &emb).expect("check ok");
+    let conflict = proactive_conflict_check(&conn, &replay, &emb, None).expect("check ok");
     assert!(
         conflict.is_none(),
         "self-match (same memory id) must be excluded from the conflict scan"
@@ -189,7 +189,7 @@ fn proactive_conflict_scoped_to_namespace() {
     let mut mem_beta = make_mem("shared-title", "fact body beta", "ns-beta");
     mem_beta.id = uuid::Uuid::new_v4().to_string();
 
-    let conflict = proactive_conflict_check(&conn, &mem_beta, &emb).expect("check ok");
+    let conflict = proactive_conflict_check(&conn, &mem_beta, &emb, None).expect("check ok");
     assert!(
         conflict.is_none(),
         "cross-namespace near-duplicate must NOT trigger the guard"
@@ -208,7 +208,7 @@ fn proactive_conflict_ignores_candidates_without_embedding() {
     mem_a_prime.id = uuid::Uuid::new_v4().to_string();
     let emb = vec![1.0_f32, 1.0];
 
-    let conflict = proactive_conflict_check(&conn, &mem_a_prime, &emb).expect("check ok");
+    let conflict = proactive_conflict_check(&conn, &mem_a_prime, &emb, None).expect("check ok");
     assert!(
         conflict.is_none(),
         "embedding-less candidates must not trigger the guard"
@@ -222,7 +222,7 @@ fn proactive_conflict_empty_embedding_short_circuits() {
     let conn = fresh_conn();
     let mem = make_mem("anything", "anything", "global");
     let emb: Vec<f32> = vec![];
-    let conflict = proactive_conflict_check(&conn, &mem, &emb).expect("check ok");
+    let conflict = proactive_conflict_check(&conn, &mem, &emb, None).expect("check ok");
     assert!(
         conflict.is_none(),
         "empty query embedding must short-circuit to None"
@@ -301,7 +301,7 @@ fn a5_1579_false_409_noise_near_duplicate_is_not_a_conflict() {
     incoming.id = uuid::Uuid::new_v4().to_string();
     assert_ne!(existing.content, incoming.content, "payloads are distinct");
 
-    let conflict = proactive_conflict_check(&conn, &incoming, &emb).expect("check ok");
+    let conflict = proactive_conflict_check(&conn, &incoming, &emb, None).expect("check ok");
     assert!(
         conflict.is_none(),
         "#1579 A5 regression: cosine-clustered noise with disjoint content \
@@ -329,7 +329,7 @@ fn a5_1579_genuine_restatement_still_conflicts() {
     );
     incoming.id = uuid::Uuid::new_v4().to_string();
 
-    let conflict = proactive_conflict_check(&conn, &incoming, &emb)
+    let conflict = proactive_conflict_check(&conn, &incoming, &emb, None)
         .expect("check ok")
         .expect("real restatement must still 409");
     assert_eq!(conflict.existing_title, "migration-deadline");
@@ -372,7 +372,8 @@ fn a5_1579_bounded_scan_horizon_and_indexed_path() {
 
     // Bounded fallback: the conflict row fell off the recency horizon
     // — the write is allowed (the documented safe-direction miss).
-    let scan_verdict = proactive_conflict_check(&conn, &incoming, &conflict_emb).expect("scan ok");
+    let scan_verdict =
+        proactive_conflict_check(&conn, &incoming, &conflict_emb, None).expect("scan ok");
     assert!(
         scan_verdict.is_none(),
         "bounded scan must not see beyond its recency horizon"
@@ -382,7 +383,7 @@ fn a5_1579_bounded_scan_horizon_and_indexed_path() {
     let idx = VectorIndex::build(entries);
     assert!(idx.is_fully_searchable());
     let indexed_verdict =
-        proactive_conflict_check_with_index(&conn, &incoming, &conflict_emb, Some(&idx))
+        proactive_conflict_check_with_index(&conn, &incoming, &conflict_emb, Some(&idx), None)
             .expect("indexed ok")
             .expect("indexed path must surface the buried near-duplicate");
     assert_eq!(indexed_verdict.existing_id, conflict_id);
@@ -412,9 +413,14 @@ fn a5_1579_candidates_path_applies_namespace_and_liveness_filters() {
     let mut incoming = make_mem("shared-fact-new", "the answer is 43", "ns-mine");
     incoming.id = uuid::Uuid::new_v4().to_string();
 
-    let verdict =
-        proactive_conflict_check_candidates(&conn, &incoming, &emb, &[foreign_id, expired_id])
-            .expect("candidates ok");
+    let verdict = proactive_conflict_check_candidates(
+        &conn,
+        &incoming,
+        &emb,
+        &[foreign_id, expired_id],
+        None,
+    )
+    .expect("candidates ok");
     assert!(
         verdict.is_none(),
         "foreign-namespace + expired candidates must be filtered out"
@@ -467,6 +473,7 @@ fn embedding_space_2188_candidates_path_excludes_foreign_space_row() {
         &incoming,
         &emb,
         std::slice::from_ref(&foreign_id),
+        None,
     )
     .expect("candidates ok");
 
@@ -480,8 +487,8 @@ fn embedding_space_2188_candidates_path_excludes_foreign_space_row() {
         &ai_memory::embeddings::embedding_space_fingerprint("test-space"),
     )
     .expect("restamp active space");
-    let control =
-        proactive_conflict_check_candidates(&conn, &incoming, &emb, &[foreign_id]).expect("ok");
+    let control = proactive_conflict_check_candidates(&conn, &incoming, &emb, &[foreign_id], None)
+        .expect("ok");
 
     // Restore the process-global BEFORE asserting so a failed assertion
     // can't leak the seeded space into a parallel test.
@@ -520,7 +527,7 @@ fn a5_1579_warm_window_falls_back_to_bounded_scan() {
     let mut incoming = make_mem("port-fact-2", "daemon binds port 9099 by default", ns);
     incoming.id = uuid::Uuid::new_v4().to_string();
 
-    let verdict = proactive_conflict_check_with_index(&conn, &incoming, &emb, Some(&idx))
+    let verdict = proactive_conflict_check_with_index(&conn, &incoming, &emb, Some(&idx), None)
         .expect("ok")
         .expect("warm-window fallback (bounded scan) must find the recent conflict");
     assert_eq!(verdict.existing_id, existing_id);
@@ -555,7 +562,7 @@ fn a5_1579_empty_index_boot_load_phase_routes_to_bounded_scan() {
     let mut incoming = make_mem("cache-fact-2", "cache ttl is ninety seconds", ns);
     incoming.id = uuid::Uuid::new_v4().to_string();
 
-    let verdict = proactive_conflict_check_with_index(&conn, &incoming, &emb, Some(&idx))
+    let verdict = proactive_conflict_check_with_index(&conn, &incoming, &emb, Some(&idx), None)
         .expect("ok")
         .expect(
             "empty-index dispatch must route to the bounded scan, not silently \

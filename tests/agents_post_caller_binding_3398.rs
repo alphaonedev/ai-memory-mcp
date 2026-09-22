@@ -116,6 +116,7 @@ fn router_from(app_state: AppState, enrolled: Arc<EnrolledAgentKeys>) -> axum::R
         mtls_enforced: false,
         enrolled_agent_keys: enrolled,
         identity_mode: HttpIdentityMode::Enforce,
+        ..Default::default()
     };
     ai_memory::build_router(api_key_state, app_state)
 }

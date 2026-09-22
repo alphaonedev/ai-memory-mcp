@@ -141,6 +141,7 @@ fn build_fixture(
             ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty(),
         ),
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
+        ..Default::default()
     };
     let router = ai_memory::build_router(api_key_state, app_state);
     (router, f)
@@ -371,6 +372,7 @@ async fn entity_get_by_alias_blocks_cross_tenant_private_entity_947() {
             ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty(),
         ),
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
+        ..Default::default()
     };
     let router = ai_memory::build_router(api_key_state, app_state);
 

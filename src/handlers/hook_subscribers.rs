@@ -96,43 +96,23 @@ pub async fn get_inbox(
             .and_then(|n| usize::try_from(n).ok())
             .unwrap_or(50)
             .min(500);
+        // #3730 — `unread_only` narrows nothing on either backend: the inbox
+        // is the pending set (a message leaves it when its recipient deletes
+        // it), and `access_count` counts touches, not handling. The parameter
+        // is accepted for compatibility and echoed back. #3027 made this arm
+        // derive the marker from `access_count` like the sqlite twin, and
+        // #3463 pushed the narrowing into SQL; both are dissolved, not
+        // reverted — there is no marker to derive and no read rows to page past.
         let unread_only = q.unread_only.unwrap_or(false);
         let filter = crate::store::Filter {
             namespace: Some(ns.clone()),
             limit: cap,
-            // v1.0.0 #3463 — push the unread narrowing into the SQL (`AND
-            // access_count = 0` before `LIMIT`) instead of dropping read rows in
-            // Rust AFTER the limit had already been spent. Pre-fix, an agent
-            // whose newest `cap` inbox rows were all read got `unread_count: 0`
-            // while older unread messages sat in the namespace.
-            unread_only,
             ..Default::default()
         };
         return match app.store.list(&ctx, &filter).await {
             Ok(rows) => {
-                let messages: Vec<serde_json::Value> = rows
-                    .into_iter()
-                    .filter(|m| {
-                        // v1.0.0 #3027 — the unread marker is `access_count`,
-                        // exactly as the sqlite/MCP twin derives it
-                        // (`src/mcp/tools/notify.rs`: `!unread_only ||
-                        // m.access_count == 0`). The pre-fix pg arm filtered on
-                        // `metadata.read == true`, a key NO production writer
-                        // ever sets — so `unread_only=true` filtered NOTHING and
-                        // `unread_count` equalled `messages.len()` forever, while
-                        // the in-code comment claimed sqlite parity. Reading a
-                        // message bumps `access_count`, which is a real column on
-                        // BOTH backends (`memories.access_count`, populated by
-                        // the postgres row mapper), so the two arms now derive the
-                        // SAME fact from the SAME durable field.
-                        //
-                        // #3463 — this is now a belt-and-suspenders re-check of a
-                        // predicate the QUERY already applied (see `unread_only`
-                        // on the `Filter` above); it can only narrow, never widen.
-                        !unread_only || m.access_count == 0
-                    })
-                    .map(|m| crate::mcp::inbox_message(&m))
-                    .collect();
+                let messages: Vec<serde_json::Value> =
+                    rows.iter().map(crate::mcp::inbox_message).collect();
                 (
                     StatusCode::OK,
                     Json(crate::mcp::inbox_envelope(
@@ -301,12 +281,11 @@ async fn set_namespace_standard_inner(
         "allow",
         "namespace_set_standard",
         "",
-        json!({
-            "namespace": ns,
-            (field_names::STANDARD_ID): body.id.clone(),
-            "parent": body.parent.clone(),
-            "has_governance": body.governance.is_some(),
-        }),
+        crate::governance::audit::ForensicPayload::new()
+            .ident_or_commit("namespace", &ns)
+            .opt_ident(field_names::STANDARD_ID, body.id.as_deref())
+            .opt_ident("parent", body.parent.as_deref())
+            .flag("has_governance", body.governance.is_some()),
     );
 
     let body = flatten_standard_body(body);
@@ -456,6 +435,51 @@ async fn set_namespace_standard_inner(
             crate::store::CallerContext::for_admin(sentinels::AI_HTTP_INTERNAL);
         let caller_principal = ctx.effective_principal();
 
+        // #3758 — the REBIND gate, BEFORE any write this arm performs (the
+        // placeholder store and the governance merge below would otherwise
+        // land in the victim's namespace for a caller the bind then refuses).
+        // The standard CURRENTLY bound decides, through the same predicate
+        // CLEAR uses; the adapter re-runs it inside the upsert transaction as
+        // the fail-closed floor. A severed / dangling pointer is the SET repair
+        // path and passes; a read fault refuses.
+        let current_binding = match app
+            .store
+            .get_namespace_standard(&ownership_probe_ctx, ns)
+            .await
+        {
+            Ok(None) => crate::store::NamespaceStandardBinding::NoMetaRow,
+            Ok(Some((current_sid, _))) => {
+                match app.store.get(&ownership_probe_ctx, &current_sid).await {
+                    Ok(current) => crate::store::NamespaceStandardBinding::Resolved(
+                        current
+                            .metadata
+                            .get(crate::mcp::param_names::AGENT_ID)
+                            .and_then(|v| v.as_str())
+                            .map(str::to_owned),
+                    ),
+                    Err(crate::store::StoreError::NotFound { .. }) => {
+                        crate::store::NamespaceStandardBinding::Unresolvable
+                    }
+                    Err(e) => return store_err_to_response(e),
+                }
+            }
+            Err(e) => return store_err_to_response(e),
+        };
+        if let Err(crate::store::StoreError::PermissionDenied { reason, .. }) =
+            crate::store::authorize_namespace_standard_mutation(
+                &ctx,
+                ns,
+                &current_binding,
+                crate::store::NamespaceStandardOp::Set,
+            )
+        {
+            return crate::handlers::parity::owner_gate_refusal(
+                &reason,
+                Some(caller_principal),
+                crate::handlers::parity::RefusedResource::Namespace(ns),
+            );
+        }
+
         // #2542 — resolve the DECLARED parent's currently-bound standard memory
         // so the bind gate can refuse a graft onto a parent chain the caller
         // does not own (a tenant-isolation + approval-bypass hazard). Fetch it
@@ -502,14 +526,13 @@ async fn set_namespace_standard_inner(
                         target: super::AUTHZ_TRACE_TARGET,
                         "POST /namespaces/{{ns}}/standard 403 (postgres path): {msg} (ns={ns}, id={standard_id})"
                     );
-                    return (
-                        StatusCode::FORBIDDEN,
-                        Json(json!({
-                            "error": msg,
-                            "caller": caller_principal
-                        })),
-                    )
-                        .into_response();
+                    // #3407 — the ONE closed refusal shape (403 `NOT_OWNER`);
+                    // `msg` is the bare SSOT const, never the owner.
+                    return crate::handlers::parity::owner_gate_refusal(
+                        &msg,
+                        Some(caller_principal),
+                        crate::handlers::parity::RefusedResource::Namespace(ns),
+                    );
                 }
             }
             // Genuinely-absent id — parity with the sqlite `Ok(None)` arm (the
@@ -525,14 +548,13 @@ async fn set_namespace_standard_inner(
                         target: super::AUTHZ_TRACE_TARGET,
                         "POST /namespaces/{{ns}}/standard 403 (postgres path, parent graft): {msg} (ns={ns})"
                     );
-                    return (
-                        StatusCode::FORBIDDEN,
-                        Json(json!({
-                            "error": msg,
-                            "caller": caller_principal
-                        })),
-                    )
-                        .into_response();
+                    // #3407 — the ONE closed refusal shape (403 `NOT_OWNER`);
+                    // `msg` is the bare SSOT const, never the owner.
+                    return crate::handlers::parity::owner_gate_refusal(
+                        &msg,
+                        Some(caller_principal),
+                        crate::handlers::parity::RefusedResource::Namespace(ns),
+                    );
                 }
             }
             Err(e) => return store_err_to_response(e),
@@ -617,6 +639,17 @@ async fn set_namespace_standard_inner(
                 })),
             )
                 .into_response(),
+            // #3758 — the adapter's own rebind refusal (a bind that raced the
+            // pre-check above), in the same closed shape with the caller.
+            Err(crate::store::StoreError::PermissionDenied { reason, .. })
+                if reason == crate::errors::msg::CALLER_DOES_NOT_OWN_NAMESPACE_STANDARD =>
+            {
+                crate::handlers::parity::owner_gate_refusal(
+                    crate::errors::msg::CALLER_DOES_NOT_OWN_NAMESPACE_STANDARD,
+                    Some(caller_principal),
+                    crate::handlers::parity::RefusedResource::Namespace(ns),
+                )
+            }
             Err(e) => store_err_to_response(e),
         };
     }
@@ -625,6 +658,42 @@ async fn set_namespace_standard_inner(
     // an `id`. S34's body is `{governance: …}` with no id — we create a
     // minimal standard memory so the governance policy has a home.
     let lock = app.db.lock().await;
+    // #3758 — the REBIND gate, BEFORE the placeholder seed below lands a row
+    // in the victim's namespace for a caller the bind then refuses. Same
+    // predicate as CLEAR and as the MCP funnel this arm delegates to (which
+    // re-runs it as the fail-closed floor); a read fault refuses.
+    {
+        let binding = match db::namespace_standard_binding(&lock.0, ns) {
+            Ok(b) => b,
+            Err(e) => {
+                drop(lock);
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": format!(
+                        "cannot verify the current namespace-standard owner (error={e}); \
+                         refusing the bind rather than treating the standard as unowned"
+                    )})),
+                )
+                    .into_response();
+            }
+        };
+        if crate::visibility::namespace_standard_mutation_admission(
+            &caller,
+            caller == sentinels::DAEMON_PRINCIPAL,
+            ns,
+            &binding,
+            crate::visibility::NamespaceStandardOp::Set,
+        )
+        .is_err()
+        {
+            drop(lock);
+            return crate::handlers::parity::owner_gate_refusal(
+                crate::errors::msg::CALLER_DOES_NOT_OWN_NAMESPACE_STANDARD,
+                Some(caller.as_str()),
+                crate::handlers::parity::RefusedResource::Namespace(ns),
+            );
+        }
+    }
     let resolved_id = if let Some(id) = body.id.clone() {
         id
     } else {
@@ -655,14 +724,12 @@ async fn set_namespace_standard_inner(
                     target: super::AUTHZ_TRACE_TARGET,
                     "POST /namespaces/{{ns}}/standard 403: {msg} (ns={ns})"
                 );
-                return (
-                    StatusCode::FORBIDDEN,
-                    Json(json!({
-                        "error": msg,
-                        "caller": caller
-                    })),
-                )
-                    .into_response();
+                // #3407 — the ONE closed refusal shape (403 `NOT_OWNER`).
+                return crate::handlers::parity::owner_gate_refusal(
+                    &msg,
+                    Some(caller.as_str()),
+                    crate::handlers::parity::RefusedResource::Namespace(ns),
+                );
             }
             m.id
         } else {
@@ -743,14 +810,12 @@ async fn set_namespace_standard_inner(
                 target: super::AUTHZ_TRACE_TARGET,
                 "POST /namespaces/{{ns}}/standard 403 (body.id path): {msg} (ns={ns}, id={resolved_id})"
             );
-            return (
-                StatusCode::FORBIDDEN,
-                Json(json!({
-                    "error": msg,
-                    "caller": caller
-                })),
-            )
-                .into_response();
+            // #3407 — the ONE closed refusal shape (403 `NOT_OWNER`).
+            return crate::handlers::parity::owner_gate_refusal(
+                &msg,
+                Some(caller.as_str()),
+                crate::handlers::parity::RefusedResource::Namespace(ns),
+            );
         }
     }
 
@@ -803,6 +868,16 @@ async fn set_namespace_standard_inner(
                 }
             }
             (StatusCode::CREATED, Json(v)).into_response()
+        }
+        // #3758 / #3407 — the rebind refusal raised by the shared predicate is
+        // the ONE closed shape (403 `NOT_OWNER`, `namespace` echoed, owner
+        // never named), byte-identical to the postgres arm above.
+        Err(e) if e == crate::errors::msg::CALLER_DOES_NOT_OWN_NAMESPACE_STANDARD => {
+            crate::handlers::parity::owner_gate_refusal(
+                crate::errors::msg::CALLER_DOES_NOT_OWN_NAMESPACE_STANDARD,
+                Some(caller.as_str()),
+                crate::handlers::parity::RefusedResource::Namespace(ns),
+            )
         }
         Err(e) => (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response(),
     }
@@ -1040,43 +1115,53 @@ pub async fn get_namespace_standard_qs(
         }
         // Non-inherit form — single exact-match lookup.
         match app.store.get_namespace_standard(&bind_ctx, &ns).await {
-            Ok(Some((standard_id, parent))) => {
-                // #2543 — if the bound memory exists and is not visible,
-                // do not leak its id (MCP honesty shape).
+            Ok(Some((standard_id, _parent))) => {
                 match app.store.get(&bind_ctx, &standard_id).await {
-                    Ok(m)
+                    Ok(m) => {
+                        // #2543 — if the bound memory exists and is not visible,
+                        // do not leak its id (MCP honesty shape).
                         if !crate::visibility::is_readable_on_query(
                             &m,
                             Some(&visibility_caller),
                             Some(m.namespace.as_str()),
-                        ) =>
-                    {
+                        ) {
+                            return (
+                                StatusCode::OK,
+                                Json(json!({
+                                    "namespace": ns,
+                                    (field_names::STANDARD_ID): serde_json::Value::Null,
+                                    (field_names::STANDARDS_WITHHELD): 1,
+                                })),
+                            )
+                                .into_response();
+                        }
                         return (
                             StatusCode::OK,
                             Json(json!({
                                 "namespace": ns,
-                                (field_names::STANDARD_ID): serde_json::Value::Null,
-                                "id": serde_json::Value::Null,
-                                (field_names::STANDARDS_WITHHELD): 1,
-                                (field_names::STORAGE_BACKEND): "postgres",
+                                (field_names::STANDARD_ID): standard_id,
+                                "title": m.title,
+                                "content": m.content,
+                                "priority": m.priority,
+                                (field_names::GOVERNANCE):
+                                    crate::mcp::merge_governance_for_response(&m.metadata),
                             })),
                         )
                             .into_response();
                     }
-                    _ => {}
+                    Err(crate::store::StoreError::NotFound { .. }) => {
+                        return (
+                            StatusCode::OK,
+                            Json(json!({
+                                "namespace": ns,
+                                (field_names::STANDARD_ID): standard_id,
+                                "warning": "standard memory not found — may have been deleted",
+                            })),
+                        )
+                            .into_response();
+                    }
+                    Err(e) => return store_err_to_response(e),
                 }
-                return (
-                    StatusCode::OK,
-                    Json(json!({
-                        "namespace": ns,
-                        "resolved_namespace": ns,
-                        (field_names::STANDARD_ID): standard_id,
-                        "id": standard_id,
-                        (field_names::PARENT_NAMESPACE): parent,
-                        (field_names::STORAGE_BACKEND): "postgres",
-                    })),
-                )
-                    .into_response();
             }
             Ok(None) => {}
             Err(e) => return store_err_to_response(e),
@@ -1086,9 +1171,6 @@ pub async fn get_namespace_standard_qs(
             Json(json!({
                 "namespace": ns,
                 (field_names::STANDARD_ID): serde_json::Value::Null,
-                "id": serde_json::Value::Null,
-                (field_names::PARENT_NAMESPACE): serde_json::Value::Null,
-                (field_names::STORAGE_BACKEND): "postgres",
             })),
         )
             .into_response();
@@ -1169,9 +1251,7 @@ async fn clear_namespace_standard_inner(
         "allow",
         crate::mcp::AUDIT_KIND_NAMESPACE_CLEAR_STANDARD,
         "",
-        json!({
-            "namespace": ns,
-        }),
+        crate::governance::audit::ForensicPayload::new().ident_or_commit("namespace", &ns),
     );
 
     // v0.7.0 Wave-3 Continuation 2 (Phase 11) — postgres-backed clear.
@@ -1198,6 +1278,19 @@ async fn clear_namespace_standard_inner(
                 Json(json!({"error": "no namespace_meta row matched"})),
             )
                 .into_response(),
+            // #3407 — the owner-gate refusal is rendered HERE, where the
+            // caller principal is in scope, so the body is byte-identical to
+            // the sqlite arm below (`store_err_to_response` maps the same
+            // reason to the same shape but cannot name the caller).
+            Err(crate::store::StoreError::PermissionDenied { reason, .. })
+                if reason == crate::errors::msg::CALLER_DOES_NOT_OWN_NAMESPACE_STANDARD =>
+            {
+                crate::handlers::parity::owner_gate_refusal(
+                    crate::errors::msg::CALLER_DOES_NOT_OWN_NAMESPACE_STANDARD,
+                    Some(caller.as_str()),
+                    crate::handlers::parity::RefusedResource::Namespace(ns),
+                )
+            }
             Err(e) => store_err_to_response(e),
         };
     }
@@ -1241,6 +1334,17 @@ async fn clear_namespace_standard_inner(
                 }
             }
             (StatusCode::OK, Json(v)).into_response()
+        }
+        // #3407 — the owner-gate refusal is the ONE closed shape on both
+        // backends (403 `NOT_OWNER`, `namespace` echoed, owner never named);
+        // pre-#3407 this arm answered 400 with a text that named the owner,
+        // while the postgres arm above answered 403 with the same disclosure.
+        Err(e) if e == crate::errors::msg::CALLER_DOES_NOT_OWN_NAMESPACE_STANDARD => {
+            crate::handlers::parity::owner_gate_refusal(
+                crate::errors::msg::CALLER_DOES_NOT_OWN_NAMESPACE_STANDARD,
+                Some(caller.as_str()),
+                crate::handlers::parity::RefusedResource::Namespace(ns),
+            )
         }
         Err(e) => (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response(),
     }

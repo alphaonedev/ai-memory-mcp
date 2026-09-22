@@ -73,7 +73,7 @@ pub const ENV_ADMIN_HEADER_TRUST: &str = "AI_MEMORY_ADMIN_HEADER_TRUST";
 #[must_use]
 pub fn admin_header_trust_enabled() -> bool {
     std::env::var(ENV_ADMIN_HEADER_TRUST)
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .map(|v| crate::security_profile::is_truthy(&v))
         .unwrap_or(false)
 }
 
@@ -365,11 +365,11 @@ pub fn require_admin(
                 "deny",
                 "admin_role",
                 "",
-                json!({
-                    "endpoint": endpoint,
-                    "outcome": "agent_id_resolve_failed",
-                    "reason": e.to_string(),
-                }),
+                crate::governance::audit::ForensicPayload::new()
+                    .label("endpoint", endpoint)
+                    .label("outcome", "agent_id_resolve_failed")
+                    // The error text can echo the hostile header value.
+                    .commit("reason", &e.to_string()),
             );
             return Err((
                 StatusCode::BAD_REQUEST,
@@ -411,10 +411,9 @@ pub fn require_admin(
         if admitted { "allow" } else { "deny" },
         "admin_role",
         "",
-        json!({
-            "endpoint": endpoint,
-            "outcome": outcome,
-        }),
+        crate::governance::audit::ForensicPayload::new()
+            .label("endpoint", endpoint)
+            .label("outcome", outcome),
     );
 
     if admitted {

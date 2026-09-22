@@ -14,7 +14,7 @@
 //! TPM 2.0, PKCS#11 HSMs, Apple Secure Enclave, and cloud KMS adapters
 //! are intentionally not in this subcommand. See the module-level
 //! comment on [`crate::identity::keypair`] and `ROADMAP.md` —
-//! AgenticMem™ is the commercial home for those backends.
+//! AgenticMem is the commercial home for those backends.
 
 use std::path::{Path, PathBuf};
 

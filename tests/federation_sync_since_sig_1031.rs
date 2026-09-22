@@ -89,6 +89,7 @@ fn setup() -> Fixture {
             ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty(),
         ),
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
+        ..Default::default()
     };
     let app_state = AppState {
         db,
@@ -368,6 +369,7 @@ async fn sync_since_mtls_bypass_still_requires_signature_under_require_sig_1040(
             ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty(),
         ),
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
+        ..Default::default()
     };
     let app_state = AppState {
         db,

@@ -105,7 +105,8 @@ pub fn handle_routine_create(conn: &rusqlite::Connection, params: &Value) -> Res
         metadata,
     };
 
-    crate::routines::routine_insert(conn, &r).map_err(|e| e.to_string())?;
+    crate::routines::routine_insert(conn, &r)
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("routine_insert", e))?;
 
     // #1722 — coordination observability: best-effort audit row for the
     // create, attributed to the creating agent (`created_by`, "" when
@@ -144,8 +145,8 @@ pub fn handle_routine_freeze(
         .ok_or_else(|| "id is required".to_string())?;
     let now = chrono::Utc::now().timestamp();
 
-    let frozen =
-        crate::routines::routine_freeze(conn, id, now, keypair).map_err(|e| e.to_string())?;
+    let frozen = crate::routines::routine_freeze(conn, id, now, keypair)
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("routine_freeze", e))?;
     match frozen {
         None => Err(format!("routine not found: {id}")),
         Some(r) => {
@@ -200,7 +201,7 @@ pub fn handle_routine_run(conn: &rusqlite::Connection, params: &Value) -> Result
 
     // (1) Load the routine; it must exist AND be frozen before a run.
     let routine = crate::routines::routine_get(conn, routine_id)
-        .map_err(|e| e.to_string())?
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("routine_get", e))?
         .ok_or_else(|| format!("routine not found: {routine_id}"))?;
     if routine.state != RoutineState::Frozen {
         return Err(crate::routines::ROUTINE_NOT_FROZEN.to_string());
@@ -223,7 +224,8 @@ pub fn handle_routine_run(conn: &rusqlite::Connection, params: &Value) -> Result
         error: None,
         metadata: json!({"agent_id": actor}),
     };
-    let run_id = crate::routines::run_insert(conn, &run).map_err(|e| e.to_string())?;
+    let run_id = crate::routines::run_insert(conn, &run)
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("run_insert", e))?;
 
     // #1722 — coordination observability: best-effort audit row for the run,
     // attributed to the admitted caller, also used for actions and quota.
@@ -248,9 +250,9 @@ pub fn handle_routine_run(conn: &rusqlite::Connection, params: &Value) -> Result
                 None,
                 Some(&err),
             )
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| crate::mcp::error_text::mcp_foreign_err(SITE_HANDLE_ROUTINE_RUN, e))?;
             Ok(json!({
-                (RESP_RUN): serde_json::to_value(&failed).map_err(|e| e.to_string())?,
+                (RESP_RUN): serde_json::to_value(&failed).map_err(|e| crate::mcp::error_text::mcp_foreign_err(SITE_HANDLE_ROUTINE_RUN, e))?,
                 "error": err,
             }))
         }
@@ -264,9 +266,9 @@ pub fn handle_routine_run(conn: &rusqlite::Connection, params: &Value) -> Result
                 Some(&ids_json),
                 None,
             )
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| crate::mcp::error_text::mcp_foreign_err(SITE_HANDLE_ROUTINE_RUN, e))?;
             Ok(json!({
-                (RESP_RUN): serde_json::to_value(&completed).map_err(|e| e.to_string())?,
+                (RESP_RUN): serde_json::to_value(&completed).map_err(|e| crate::mcp::error_text::mcp_foreign_err(SITE_HANDLE_ROUTINE_RUN, e))?,
                 "created_action_ids": ids_json,
             }))
         }
@@ -288,7 +290,8 @@ pub fn handle_routine_status(conn: &rusqlite::Connection, params: &Value) -> Res
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .ok_or_else(|| "run_id is required".to_string())?;
-    let found = crate::routines::run_get(conn, run_id).map_err(|e| e.to_string())?;
+    let found = crate::routines::run_get(conn, run_id)
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("run_get", e))?;
     Ok(json!({
         (RESP_RUN): match found {
             Some(r) => serde_json::to_value(&r).map_err(|e| e.to_string())?,
@@ -317,8 +320,8 @@ pub fn handle_routine_list(conn: &rusqlite::Connection, params: &Value) -> Resul
         .unwrap_or(50);
     let limit = usize::try_from(limit).unwrap_or(50);
 
-    let routines =
-        crate::routines::routine_list(conn, namespace, state, limit).map_err(|e| e.to_string())?;
+    let routines = crate::routines::routine_list(conn, namespace, state, limit)
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("routine_list", e))?;
     Ok(json!({
         "routines": serde_json::to_value(&routines).map_err(|e| e.to_string())?,
     }))
@@ -329,6 +332,9 @@ pub fn handle_routine_list(conn: &rusqlite::Connection, params: &Value) -> Resul
 use crate::mcp::registry::McpTool;
 use schemars::JsonSchema;
 use serde::Deserialize;
+
+// pm-v3.1 hardcoded-literal ratchet: a string spelled 2+ times in this file is named once.
+const SITE_HANDLE_ROUTINE_RUN: &str = "handle_routine_run";
 
 /// v0.8.0 Pillar 1 (#1709) — request body for `memory_routine_create`.
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
@@ -590,8 +596,23 @@ mod handler_tests {
         crate::storage::open(std::path::Path::new(":memory:")).expect("open in-memory db")
     }
 
+    /// #3722 — resolve the caller as if `AI_MEMORY_AGENT_ID` were ABSENT on
+    /// THIS thread, whatever a sibling test writes into the process
+    /// environment. Every handler in this module resolves the caller
+    /// (`create` through `coordination_guard::resolve_actor`, `run` through
+    /// `authorize_run`, twice), and this module installed no isolation while
+    /// twelve sibling lib modules `set_var` that variable process-wide under
+    /// the crate lock: a mutator's window landing inside a run here made
+    /// `authorize_run` refuse `agent-a` as the foreign caller (the chain-12
+    /// gate's `agent_id mismatch: caller 'ai:cert-fed-proxy'`). The #3523
+    /// seam is thread-local, so it needs no global lock and cannot be raced.
+    fn unset_caller() -> crate::identity::test_agent_id::AgentIdOverride {
+        crate::identity::test_agent_id::AgentIdOverride::unset()
+    }
+
     #[test]
     fn run_guard_failures_are_atomic_and_arguments_are_bounded_3359() {
+        let _id = unset_caller();
         let conn = fresh();
         let created = handle_routine_create(
             &conn,
@@ -634,6 +655,7 @@ mod handler_tests {
     /// Completed, status returns it, and list finds the routine.
     #[test]
     fn create_freeze_run_status_list_roundtrips_over_mcp() {
+        let _id = unset_caller();
         let conn = fresh();
         // Create a routine whose one action's title is a `{{what}}` placeholder.
         let created = handle_routine_create(
@@ -665,11 +687,21 @@ mod handler_tests {
             &json!({ "routine_id": routine_id, "arguments": {"what": "ship it"} }),
         )
         .expect("run ok");
+        // #3722 — the handler answers in TWO shapes: `{run, created_action_ids}`
+        // on success and `{run, error}` when materialisation failed (the run
+        // row persists as `failed` in that arm). Read the arm before reaching
+        // for a success-only key, and fail NAMING the error the daemon had
+        // ready, never with a shape panic that hides it.
+        assert_eq!(
+            ran["run"]["state"].as_str(),
+            Some("completed"),
+            "run did not complete; daemon error: {}",
+            ran["error"].as_str().unwrap_or("<no error field>")
+        );
         let action_ids = ran["created_action_ids"]
             .as_array()
-            .expect("created_action_ids array");
-        assert_eq!(action_ids.len(), 1, "one action materialised");
-        assert_eq!(ran["run"]["state"].as_str(), Some("completed"));
+            .expect("created_action_ids is present on the completed arm");
+        assert_eq!(action_ids.len(), 1, "one action materialised: {ran}");
         let run_id = ran["run"]["id"].as_str().expect("run id").to_string();
 
         // The created action's title is the SUBSTITUTED value (proves
@@ -688,8 +720,106 @@ mod handler_tests {
         // List finds the routine.
         let listed = handle_routine_list(&conn, &json!({ "namespace": "_rt" })).expect("list ok");
         let arr = listed["routines"].as_array().expect("routines array");
-        assert_eq!(arr.len(), 1);
-        assert_eq!(arr[0]["id"].as_str(), Some(routine_id.as_str()));
+        // #3722 — a SET assertion, not a count: name the routine that must be
+        // there and everything else that is, so an extra row is diagnostic.
+        let ids: Vec<&str> = arr.iter().filter_map(|r| r["id"].as_str()).collect();
+        assert!(ids.contains(&routine_id.as_str()), "listed ids: {ids:?}");
+        assert_eq!(
+            ids,
+            vec![routine_id.as_str()],
+            "unexpected extra routines listed: {ids:?}"
+        );
+    }
+
+    /// #3722 P1 — the contamination MECHANISM, pinned deterministically. With
+    /// the caller resolved as a FOREIGN principal (what a sibling test's
+    /// process-wide env-var install of the caller identity — the variable
+    /// `AI_MEMORY_AGENT_ID` holding `ai:cert-fed-proxy` — did to this thread
+    /// in the chain-12 gate), running a routine owned by `agent-a` is
+    /// refused with the exact string the gate captured — at the first
+    /// `authorize_run` (an `Err`) or, if the window opens later, in the
+    /// failure envelope (`run.state == failed`, top-level `error`). Either
+    /// arm carries the message; neither is a shape panic.
+    #[test]
+    fn run_under_a_foreign_caller_is_an_agent_id_mismatch_not_a_shape_panic_3722() {
+        let conn = fresh();
+        let routine_id = {
+            let _id = unset_caller();
+            let created = handle_routine_create(
+                &conn,
+                &json!({
+                    "namespace": "_rt3722",
+                    "name": "deploy",
+                    "template": {"actions": [{"kind": "task.do", "title": "{{what}}"}]},
+                    "parameters": ["what"],
+                    "created_by": "agent-a",
+                }),
+            )
+            .expect("create ok");
+            let id = created[param_names::ID].as_str().expect("id").to_string();
+            handle_routine_freeze(&conn, &json!({ "id": id }), None).expect("freeze ok");
+            id
+        };
+        let _foreign = crate::identity::test_agent_id::AgentIdOverride::set("ai:cert-fed-proxy");
+        let outcome = handle_routine_run(
+            &conn,
+            &json!({ "routine_id": routine_id, "arguments": {"what": "ship it"} }),
+        );
+        let message = match outcome {
+            Err(e) => e,
+            Ok(ran) => {
+                assert_eq!(ran["run"]["state"].as_str(), Some("failed"), "{ran}");
+                ran["error"]
+                    .as_str()
+                    .expect("failure arm carries error")
+                    .to_string()
+            }
+        };
+        assert!(message.contains("agent_id mismatch"), "{message}");
+        assert!(
+            message.contains(
+                "caller 'ai:cert-fed-proxy' may only run routine as itself (requested 'agent-a')"
+            ),
+            "{message}"
+        );
+    }
+
+    /// #3722 P2 — the control: the same routine, caller resolved as ABSENT
+    /// (the single-operator posture this module's tests assume), completes
+    /// with exactly one materialised action.
+    #[test]
+    fn run_with_the_caller_unset_completes_with_one_action_3722() {
+        let _id = unset_caller();
+        let conn = fresh();
+        let created = handle_routine_create(
+            &conn,
+            &json!({
+                "namespace": "_rt3722",
+                "name": "deploy",
+                "template": {"actions": [{"kind": "task.do", "title": "{{what}}"}]},
+                "parameters": ["what"],
+                "created_by": "agent-a",
+            }),
+        )
+        .expect("create ok");
+        let routine_id = created[param_names::ID].as_str().expect("id").to_string();
+        handle_routine_freeze(&conn, &json!({ "id": routine_id }), None).expect("freeze ok");
+        let ran = handle_routine_run(
+            &conn,
+            &json!({ "routine_id": routine_id, "arguments": {"what": "ship it"} }),
+        )
+        .expect("run ok");
+        assert_eq!(
+            ran["run"]["state"].as_str(),
+            Some("completed"),
+            "daemon error: {}",
+            ran["error"].as_str().unwrap_or("<none>")
+        );
+        assert_eq!(
+            ran["created_action_ids"].as_array().map(Vec::len),
+            Some(1),
+            "{ran}"
+        );
     }
 
     /// #1722 — running a frozen routine appends one `coordination.routine_run`
@@ -697,6 +827,7 @@ mod handler_tests {
     /// chain stays intact.
     #[test]
     fn run_emits_signed_events_audit_row_1722() {
+        let _id = unset_caller();
         let conn = fresh();
         let created = handle_routine_create(
             &conn,
@@ -737,6 +868,7 @@ mod handler_tests {
 
     #[test]
     fn run_unfrozen_routine_errors() {
+        let _id = unset_caller();
         let conn = fresh();
         let created =
             handle_routine_create(&conn, &json!({ "namespace": "_rt", "name": "draft-only" }))
@@ -752,6 +884,7 @@ mod handler_tests {
 
     #[test]
     fn run_malformed_template_records_failed_run_not_panic() {
+        let _id = unset_caller();
         let conn = fresh();
         // `actions` is a string, not an array — materialisation must fail
         // gracefully and record the run as Failed (not panic, not lose the run).
@@ -787,6 +920,7 @@ mod handler_tests {
     /// silently dropping the key and reporting completed/error:null.
     #[test]
     fn run_unknown_template_key_records_failed_run_3010() {
+        let _id = unset_caller();
         let conn = fresh();
         let created = handle_routine_create(
             &conn,
@@ -828,6 +962,7 @@ mod handler_tests {
     /// inserted actions back — the frontier is empty.
     #[test]
     fn run_rejected_edge_strands_no_actions_3191() {
+        let _id = unset_caller();
         let conn = fresh();
         let created = handle_routine_create(
             &conn,
@@ -873,6 +1008,7 @@ mod handler_tests {
     /// outcome, not `state:completed, error:null` (the silent-no-op #2444 shape).
     #[test]
     fn run_zero_materialized_actions_is_failed_3010() {
+        let _id = unset_caller();
         let conn = fresh();
         let created = handle_routine_create(
             &conn,
@@ -899,6 +1035,7 @@ mod handler_tests {
     /// attributes a resolved actor (an omitted `created_by` no longer stores "").
     #[test]
     fn create_validates_namespace_and_attributes_actor_2998() {
+        let _id = unset_caller();
         let conn = fresh();
         assert!(
             handle_routine_create(&conn, &json!({ "namespace": "../x", "name": "n" })).is_err(),
@@ -916,6 +1053,7 @@ mod handler_tests {
 
     #[test]
     fn status_absent_returns_null_run() {
+        let _id = unset_caller();
         let conn = fresh();
         let got = handle_routine_status(&conn, &json!({ "run_id": "missing" })).expect("status ok");
         assert!(got["run"].is_null());
@@ -923,6 +1061,7 @@ mod handler_tests {
 
     #[test]
     fn list_filters_by_state() {
+        let _id = unset_caller();
         let conn = fresh();
         let a = handle_routine_create(&conn, &json!({ "namespace": "_rt", "name": "a" }))
             .expect("create a");
@@ -944,6 +1083,7 @@ mod handler_tests {
     /// for `draft` only — routines it must not treat as editable.
     #[test]
     fn routine_list_refuses_unknown_state_3171() {
+        let _id = unset_caller();
         let conn = fresh();
         handle_routine_create(&conn, &json!({ "namespace": "_rt", "name": "a" }))
             .expect("create a");
@@ -960,3 +1100,7 @@ mod handler_tests {
         assert_eq!(all["routines"].as_array().expect("array").len(), 1);
     }
 }
+
+#[cfg(test)]
+#[path = "routine/freeze_3616.rs"]
+mod freeze_3616;

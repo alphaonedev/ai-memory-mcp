@@ -103,11 +103,12 @@ const PEER_ID_DERIVATION_DOMAIN: &[u8] = b"ai-memory:peer-id:v1\0";
 ///   colliding with a SPECIFIC existing peer's URL.
 /// * The id must nevertheless stay SHORT and FIXED-WIDTH — it is a durable
 ///   routing key in `federation_push_dlq.peer_id` and `sync_state.peer_id`,
-///   and a structured log field. `peer-h` + 32 = 38 ASCII characters,
-///   bounded and constant. Note the `#304` label-space concern that the
-///   pre-#2442 comment cited does NOT apply: `PeerEndpoint.id` reaches zero
-///   Prometheus labels at v1.0.0 (see the corrected comment in `build`), so
-///   widening the digest costs no cardinality.
+///   and a structured log field. `peer-h1` + 32 = 39 ASCII characters,
+///   bounded and constant. Since #3654 the id IS a Prometheus label (the
+///   per-peer freshness series in `federation::freshness`), and that is fine
+///   for the same reason: the label space is bounded by configured
+///   membership, not by the digest width, so widening the digest costs no
+///   cardinality.
 const STABLE_PEER_ID_HASH_NIBBLES: usize = 32;
 
 /// #2442 — canonical form of a peer URL for IDENTITY purposes.
@@ -188,6 +189,40 @@ fn first_peer_id_collision<'a>(ids: &[(&'a str, &'a str)]) -> Option<(&'a str, &
         }
     }
     None
+}
+
+/// #3654 — true when `peer_id` has exactly the shape [`stable_peer_id`]
+/// mints: [`STABLE_PEER_ID_PREFIX`] followed by
+/// [`STABLE_PEER_ID_HASH_NIBBLES`] lowercase hex nibbles. Such an id is
+/// short, fixed-width and carries no part of the peer URL, so it is safe to
+/// use verbatim as a metric label.
+#[must_use]
+pub fn is_minted_peer_id(peer_id: &str) -> bool {
+    peer_id
+        .strip_prefix(STABLE_PEER_ID_PREFIX)
+        .is_some_and(|rest| {
+            rest.len() == STABLE_PEER_ID_HASH_NIBBLES
+                && rest.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        })
+}
+
+/// #3667 in the #3711 idiom — the peer-id collision refusal, rendered from
+/// the allowlist: each peer as its origin + path (the #3675 identity),
+/// never its userinfo or query. Pure so the RENDERING is pinned directly;
+/// the collision itself is a 128-bit SHA-256 prefix collision that no
+/// caller-reachable pair of URLs can drive (two spellings that normalise
+/// identically are caught by the duplicate check first), so there is no
+/// honest end-to-end pin for it — only for what it would say.
+#[must_use]
+fn peer_id_collision_refusal(first_raw: &str, duplicate_raw: &str, id: &str) -> String {
+    let first = crate::url_display::url_origin_and_path(first_raw);
+    let duplicate = crate::url_display::url_origin_and_path(duplicate_raw);
+    format!(
+        "federation peer-id collision in --quorum-peers: {first} and {duplicate} both \
+         derive the stable peer id {id} — refusing to start, because a shared routing \
+         key would merge the two peers' federation_push_dlq rows and deliver queued \
+         writes to the wrong host (#2442). Change one peer's URL spelling."
+    )
 }
 
 /// #2442 — true when `peer_id` carries the pre-#2442 POSITIONAL shape
@@ -279,9 +314,14 @@ impl FederationConfig {
             crate::tls::validate_peer_url_scheme(raw).map_err(|e| anyhow::anyhow!("{e}"))?;
             let normalized = normalize_peer_url(raw);
             if !seen_urls.insert(normalized.clone()) {
+                // #3667/#3711 — a refusal is a sink: render the peer as its
+                // origin + path (its identity, #3675), never its userinfo or
+                // query.
                 return Err(anyhow::anyhow!(
-                    "duplicate peer URL in --quorum-peers: {raw} (normalized: {normalized}) \
-                     — duplicates would let a single peer contribute to quorum more than once"
+                    "duplicate peer URL in --quorum-peers: {} (normalized: {}) \
+                     — duplicates would let a single peer contribute to quorum more than once",
+                    crate::url_display::url_origin_and_path(raw),
+                    crate::url_display::url_origin_and_path(&normalized)
                 ));
             }
         }
@@ -298,14 +338,14 @@ impl FederationConfig {
                 //
                 //  * It said "`id` is used as a Prometheus metric label; keep
                 //    it low-cardinality (#304 nit — prior form
-                //    `peer-{i}:{url}` blew up the label space)". VERIFIED
-                //    FALSE at v1.0.0: `PeerEndpoint.id` reaches ZERO metric
-                //    labels. Every `with_label_values` call in the federation
-                //    lane takes a closed-set token — `cause` in
-                //    `push_dlq.rs`, `outcome`/`reason` in `sync.rs` — and
-                //    `federation_partial_quorum_total` is a bare IntCounter.
-                //    The id is a structured LOG field and, far more
-                //    importantly, a DURABLE KEY.
+                //    `peer-{i}:{url}` blew up the label space)". Through
+                //    #2442 the id reached ZERO metric labels. Since #3654 it
+                //    labels the per-peer freshness series
+                //    (`federation::freshness`), where cardinality is bounded
+                //    by configured membership and an id of unknown shape is
+                //    hashed before it can reach a label. It is also a
+                //    structured LOG field and, far more importantly, a
+                //    DURABLE KEY.
                 //  * Treating it as "just a label" is what let it be
                 //    positional. It is the routing key of the push DLQ
                 //    (`federation_push_dlq.peer_id`) and of the `sync_state`
@@ -331,7 +371,7 @@ impl FederationConfig {
                     target: FED_LOG_TARGET,
                     peer_index = i,
                     peer_id = %id,
-                    url = trimmed,
+                    url = %crate::url_display::url_origin_and_path(trimmed),
                     "registered peer (#2442: peer_id is derived from the URL, not the \
                      flag position; this line is the id -> url map for DLQ triage)"
                 );
@@ -344,7 +384,7 @@ impl FederationConfig {
 
         // #2442 — fail CLOSED on an actually-observed peer-id collision.
         //
-        // The 48-bit truncation makes this astronomically unlikely at the
+        // The 128-bit truncation makes this astronomically unlikely at the
         // fleet sizes v1.0.0 certifies (see `STABLE_PEER_ID_HASH_NIBBLES`),
         // but "unlikely" is not a data-integrity guarantee: two peers sharing
         // a routing key would merge their DLQ rows and misroute content
@@ -369,12 +409,14 @@ impl FederationConfig {
             .collect();
         if let Some((first, duplicate, id)) = first_peer_id_collision(&id_url_pairs) {
             return Err(anyhow::anyhow!(
-                "federation peer-id collision in --quorum-peers: {first} and {duplicate} both \
-                 derive the stable peer id {id} — refusing to start, because a shared routing \
-                 key would merge the two peers' federation_push_dlq rows and deliver queued \
-                 writes to the wrong host (#2442). Change one peer's URL spelling."
+                "{}",
+                peer_id_collision_refusal(first, duplicate, id)
             ));
         }
+
+        // #3654 — publish the configured membership (the census) so a peer
+        // that never answers is still visible as an expected peer.
+        super::freshness::note_configured(&peers);
 
         // Federation client tuning.
         //
@@ -590,6 +632,67 @@ mod build_pinning_tests {
     use super::FederationConfig;
     use std::time::Duration;
 
+    /// #3667 in the #3711 idiom — the duplicate-peer refusal is a sink: it
+    /// names each peer as its origin + path (the #3675 identity) and never
+    /// its userinfo password or query token. Positive half: the host and
+    /// path are present; negative half: the canaries are not.
+    #[test]
+    fn duplicate_peer_refusal_renders_the_peer_from_the_allowlist_3667() {
+        let url = "https://u:AUTH_CANARY@peer.example:8443/m?%70assword=QUERY_CANARY".to_string();
+        let err = match FederationConfig::build(
+            1,
+            &[url.clone(), url],
+            Duration::from_secs(1),
+            None,
+            None,
+            None,
+            "test-agent".into(),
+            None,
+        ) {
+            Ok(_) => panic!("duplicate peers must fail before client construction"),
+            Err(err) => err,
+        };
+        let text = err.to_string();
+        assert!(text.contains("duplicate peer URL"), "{text}");
+        assert!(
+            text.contains("https://peer.example:8443/m"),
+            "the refusal must NAME the peer's origin + path: {text}"
+        );
+        for leaked in ["AUTH_CANARY", "QUERY_CANARY", "query_canary", "u:"] {
+            assert!(!text.contains(leaked), "leaked {leaked:?}: {text}");
+        }
+    }
+
+    /// #3667 — the peer-id collision refusal renders both spellings from
+    /// the allowlist. The collision cannot be driven through
+    /// `FederationConfig::build` (the stable id hashes the NORMALISED URL,
+    /// userinfo included, so two spellings either normalise identically —
+    /// and hit the duplicate check first — or hash to distinct 128-bit
+    /// prefixes); the renderer is therefore pinned directly.
+    #[test]
+    fn peer_id_collision_refusal_renders_the_peers_from_the_allowlist_3667() {
+        let a = "https://alice:FIRST_CANARY@peer.example:8443/m?%70assword=Q1_CANARY";
+        let b = "https://bob:SECOND_CANARY@peer.example:8443/n?password=Q2_CANARY";
+        let text = super::peer_id_collision_refusal(a, b, "peer-0123456789abcdef");
+        assert!(text.contains("peer-id collision"), "{text}");
+        assert!(
+            text.contains("https://peer.example:8443/m")
+                && text.contains("https://peer.example:8443/n"),
+            "the refusal must NAME each peer's origin + path: {text}"
+        );
+        for leaked in [
+            "FIRST_CANARY",
+            "SECOND_CANARY",
+            "Q1_CANARY",
+            "Q2_CANARY",
+            "alice",
+            "bob",
+            "assword=",
+        ] {
+            assert!(!text.contains(leaked), "leaked {leaked:?}: {text}");
+        }
+    }
+
     /// #1678 — exercise the outbound-pinning branch of `build()`: with
     /// `AI_MEMORY_FED_PEER_FINGERPRINTS` set to a valid host→fp file, the
     /// shared quorum client is constructed via `use_preconfigured_tls` with
@@ -684,5 +787,28 @@ mod build_pinning_tests {
             super::stable_peer_id("https://p.example:9443"),
             "a port change is a DIFFERENT peer and must mint a different key"
         );
+    }
+}
+
+#[cfg(test)]
+mod minted_peer_id_tests_3654 {
+    use super::{is_legacy_positional_peer_id, is_minted_peer_id, stable_peer_id};
+
+    #[test]
+    fn every_minted_id_is_recognised_and_nothing_else_is() {
+        for url in [
+            "https://peer-a.example:9077",
+            "https://user:secret@peer-b.example",
+            "http://127.0.0.1:4001/",
+        ] {
+            let id = stable_peer_id(url);
+            assert!(is_minted_peer_id(&id), "{id} minted from {url}");
+            assert!(!is_legacy_positional_peer_id(&id));
+        }
+        assert!(!is_minted_peer_id("peer-3"));
+        assert!(!is_minted_peer_id("peer-h1"));
+        assert!(!is_minted_peer_id(&format!("peer-h1{}", "A".repeat(32))));
+        assert!(!is_minted_peer_id(&format!("peer-h1{}", "0".repeat(33))));
+        assert!(!is_minted_peer_id("peer-0:https://peer.example"));
     }
 }

@@ -428,6 +428,31 @@ pub enum ExecutorError {
     GovernanceRefused { command: String, reason: String },
 }
 
+/// #3708 — the CLOSED VOCABULARY a CALLER may see when a hook fails.
+///
+/// A hook subprocess is FOREIGN TEXT BY DEFINITION. Its stdout is whatever the
+/// hook chose to print (`Decode.reason` embeds it verbatim via
+/// `DecisionParseError::UnknownAction`), its stderr rides on `ChildExit`, and
+/// the `command` on `Spawn` / `GovernanceRefused` is OPERATOR CONFIG — a
+/// filesystem path the caller is not entitled to. `ChainResult::Deny.reason`
+/// crosses to the JSON-RPC / HTTP caller, so none of that may travel on it.
+///
+/// This renders from the VARIANT ALONE. The detail is not masked or redacted —
+/// it never enters the string. It still reaches the operator through the
+/// `tracing` line at each call site, which is the deliberate split: the
+/// operator reading logs may see more than the caller receiving an error.
+pub(crate) fn caller_safe_kind(e: &ExecutorError) -> &'static str {
+    match e {
+        ExecutorError::Spawn { .. } => "the hook command could not be spawned",
+        ExecutorError::Io(_) => "an I/O error occurred talking to the hook",
+        ExecutorError::ChildExit { .. } => "the hook exited without a decision",
+        ExecutorError::Decode { .. } => "the hook returned an undecodable decision",
+        ExecutorError::Timeout { .. } => "the hook timed out",
+        ExecutorError::DaemonUnavailable { .. } => "the hook daemon was unreachable",
+        ExecutorError::GovernanceRefused { .. } => "the hook was refused by governance",
+    }
+}
+
 impl std::fmt::Display for ExecutorError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -795,7 +820,13 @@ async fn drive_exec_child(
     if !output.stderr.is_empty() {
         let trimmed_len = output.stderr.len().min(STDERR_RING_CAPACITY);
         let start = output.stderr.len() - trimmed_len;
-        let stderr_tail = String::from_utf8_lossy(&output.stderr[start..]);
+        // #3708 — screen the tail through `redact_stderr_tail`, the same
+        // treatment the daemon path applies at `warn_stderr_tail`. The exec
+        // path had been logging it RAW, which also made the doc comment above
+        // ("in the operator log (redacted)") untrue for this branch. A hook
+        // that echoes its environment before its verdict must not plant a
+        // credential in the operator log verbatim.
+        let stderr_tail = redact_stderr_tail(&String::from_utf8_lossy(&output.stderr[start..]));
         tracing::debug!(
             command,
             stderr_bytes = output.stderr.len(),

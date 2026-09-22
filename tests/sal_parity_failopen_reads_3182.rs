@@ -216,12 +216,12 @@ async fn sqlite_find_by_title_namespace_propagates_substrate_fault_3182() {
 
     // CONTROL — a healthy DB distinguishes hit from miss.
     assert!(
-        ai_memory::db::find_by_title_namespace(&raw, "seed", "parity/3182/dedup")
+        ai_memory::db::find_by_title_namespace(&raw, "seed", "parity/3182/dedup", None)
             .expect("healthy hit")
             .is_some()
     );
     assert!(
-        ai_memory::db::find_by_title_namespace(&raw, "absent", "parity/3182/dedup")
+        ai_memory::db::find_by_title_namespace(&raw, "absent", "parity/3182/dedup", None)
             .expect("healthy miss")
             .is_none(),
         "a genuine miss must stay Ok(None)"
@@ -233,6 +233,6 @@ async fn sqlite_find_by_title_namespace_propagates_substrate_fault_3182() {
     // PRE-FIX: `Ok(None)` — indistinguishable from the healthy miss above, so
     // every `on_conflict` caller read it as "safe to insert a new row" and
     // forked a duplicate lineage instead of updating the existing memory.
-    ai_memory::db::find_by_title_namespace(&raw, "seed", "parity/3182/dedup")
+    ai_memory::db::find_by_title_namespace(&raw, "seed", "parity/3182/dedup", None)
         .expect_err("a substrate fault must not read as 'no such (title, namespace)'");
 }

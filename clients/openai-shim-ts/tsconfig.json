@@ -11,7 +11,8 @@
     "esModuleInterop": true,
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
-    "types": ["node"]
+    "types": ["node"],
+    "rewriteRelativeImportExtensions": true
   },
   "include": ["src"],
   "exclude": ["__tests__", "dist", "node_modules"]

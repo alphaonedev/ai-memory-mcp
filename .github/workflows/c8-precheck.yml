@@ -118,6 +118,25 @@ jobs:
         # allowlist, a broken test-boundary heuristic) trips here.
         run: bash scripts/check-vendor-literals.sh --self-test
 
+  # QUOTED (rule e): the job name contains ` #`, which unquoted opens a YAML
+  # comment and truncates the reported check-run name.
+  truthy-grammar-gate:
+    name: "Truthy-grammar consolidation gate (#3200)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Run truthy-grammar gate
+        # #3200 — HARD-BLOCK the narrow 2-term truthy/falsy env grammar
+        # (`== "1" || eq_ignore_ascii_case("true")` and the falsy twin) that
+        # silently dropped `yes`/`on`|`no`/`off`. Every env boolean routes
+        # through security_profile::{is_truthy,is_falsy}; the ONE documented
+        # deliberate-narrow exception (governance_fail_open, #3168) is
+        # allowlisted in scripts/qc-allowlists/truthy-grammar-narrow-allow.txt.
+        run: bash scripts/check-truthy-grammar.sh
+      - name: Self-test the gate (regression evidence)
+        run: bash scripts/check-truthy-grammar.sh --self-test
+
   l3-boundary-gate:
     # QUOTED DELIBERATELY (#2473). Unquoted, the ` #1853)` opened a YAML
     # comment and the job name parsed as 44 chars — GitHub reported the
@@ -298,6 +317,62 @@ jobs:
         # scan set fails CLOSED so the gate cannot no-op to green.
         run: bash scripts/check-sdk-route-paths.sh --self-test
 
+  sdk-tls-scheme-gate:
+    # #3782 (3x7 adopter lens, workstream G on PR #3769). Since
+    # #3705/#3709 `tls_bind_guard` refuses to bind a plaintext listener,
+    # loopback included, yet both SDK quickstarts, both clients' DEFAULT
+    # base URL and 36 further occurrences under `sdk/` said
+    # `http://localhost:9077` — a scheme no daemon will answer, so every
+    # adopter's FIRST call failed. The gate is a PAIR: the ABSENCE of
+    # `http://localhost` / `http://127.0.0.1` under `sdk/`, and the
+    # PRESENCE in BOTH SDK READMEs of a CA-trust section naming the
+    # daemon-generated CA (`<key_dir>/tls/local-ca.pem`) and the client
+    # option that pins it. Scheme-only would still fail the adopter, at
+    # certificate verification instead of at connect.
+    name: SDK TLS-scheme + CA-trust gate (#3782)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Run SDK TLS-scheme gate
+        run: bash scripts/check-sdk-tls-scheme.sh
+      - name: Self-test the gate (regression evidence)
+        # Plants the #3782 defect in an SDK default, an SDK source and a
+        # README quickstart, and plants each PRESENCE failure (no
+        # section, a heading-only stub, the CA file named without the
+        # pinning option, a missing README). Near-miss controls that
+        # must PASS: the corrected https loopback URLs in both host
+        # spellings, an abstract `http://mock` host, a public http URL,
+        # and `http://localhost` OUTSIDE `sdk/`. A scanner fault and an
+        # empty sdk scan set both fail CLOSED.
+        run: bash scripts/check-sdk-tls-scheme.sh --self-test
+
+  mcp-transport-isolation-gate:
+    # #3829 — MCP transport is stdio-only. The src/mcp stdio JSON-RPC loop
+    # owns stdin/stdout and MUST bind no server socket and construct no
+    # network client for its OWN transport (SECURITY.md "MCP transport is
+    # stdio-only (#3829)"). This gate HARD-BLOCKS a server socket
+    # ((Tcp|Unix)Listener::{bind,from_std}, axum::serve, hyper::server)
+    # anywhere under src/mcp/** production code, and a network CLIENT
+    # (reqwest, TcpStream::connect, hyper::client, hyper_util::client)
+    # except the ONE allowlisted federation-forward client
+    # src/mcp/tools/store/transport.rs (#881/#318, whose outbound TLS to the
+    # HTTP daemon is the documented exception). Deliberately NOT a bare
+    # `.bind(` (rusqlite SQL parameter binds are not socket binds).
+    name: MCP transport-isolation gate (#3829)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Run MCP transport-isolation gate
+        run: python3 scripts/check-mcp-transport-isolation.py
+      - name: Self-test the gate (regression evidence)
+        # Plants a TcpListener::bind, an axum::serve, and an
+        # out-of-allowlist reqwest client in mcp files (each must RED);
+        # near-miss controls that must PASS: the allowlisted transport.rs
+        # reqwest client, and a rusqlite `.bind(` SQL parameter.
+        run: python3 scripts/check-mcp-transport-isolation.py --self-test
+
   ci-job-claims-gate:
     # 3x7 claims register 3.3.3 — C-21 / C-23 / C-24 / C-31, all one
     # shape: "a control was removed and the prose was not". `ci.yml`'s
@@ -454,6 +529,37 @@ jobs:
         # former and pass the latter.
         run: bash scripts/check-cloud-init-ascii.sh --self-test
 
+  declaration-hash-gate:
+    # #3557 (N22) — the §0.2 SLO/RPO/RTO declaration is PRE-REGISTERED: the
+    # Mission-Critical Certification Standard requires it written before
+    # testing, hashed, and never revised after a miss. This gate pins the
+    # declaration's SHA-256 (scripts/qc-allowlists/declaration.sha256), refuses
+    # a change without a `revision:` bump and a dated "revised after miss"
+    # line, refuses a re-pin that does not raise the revision (D1b, against
+    # the PR base), refuses placeholders, and checks that every N-id the
+    # standard's §6 cites is indexed to a filed issue (§7.4). No toolchain.
+    name: "Declaration hash gate (#3557)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - name: Run declaration hash gate
+        env:
+          # D1b compares the pin against its content at the PR base (a push
+          # compares against the previous head); an absent ref is tolerated
+          # only by SKIPPING D1b, never the hash check itself.
+          DECLARATION_GATE_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: bash scripts/check-declaration-hash.sh
+      - name: Self-test the gate (regression evidence)
+        # Plants a softened target without a re-pin (D1), a re-pin without a
+        # revision bump (D1b), a bump without the dated reason (D2), a TBD
+        # placeholder (D3) and a dropped §6 N-id row (D4) in a throwaway
+        # copy under .local-runs/, with the clean and legal-revision
+        # controls that must PASS; each refusal must come from its own rule.
+        run: bash scripts/check-declaration-hash.sh --self-test
+
   test-stdin-gate:
     # Issue #1989 — full-suite-wedge regression guard. HARD-BLOCKS any
     # test-reachable acquisition of the process-global `io::stdin()`
@@ -475,6 +581,22 @@ jobs:
         # --self-test stages a tests/ file that blocking-reads the real
         # process stdin in a #[test]; the gate must reject it.
         run: bash scripts/check-test-stdin-reads.sh --self-test
+
+  test-keydir-mode-gate:
+    # #3733 — a test that creates a directory it uses as a key dir MUST use
+    # tests/common/key_dir_sandbox.rs::mkdir_0700 (create + chmod 0700),
+    # never a bare create_dir[_all]: a bare-created key dir is 0o755 at
+    # umask 022 but 0o775 at umask 0002, and the #3198 key-dir guard
+    # CORRECTLY refuses a group-writable key dir. Three fixtures hit that
+    # shape this release (#3705, #3733, #3582/#3436); this gate keeps the
+    # next one from being mistaken for a product defect.
+    name: Test key-dir mode gate (#3733)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Run key-dir mode gate
+        run: bash scripts/check-test-keydir-mode.sh
 
   migration-ladder-gate:
     # v1.0.0 guardrail-D (2x5-vote decision memory b682c76a) — fail-closed
@@ -940,6 +1062,59 @@ jobs:
         # fail-closes; workflow_dispatch and a zero-SHA push skip;
         # THIS checkout vs origin/release/v1.0.0 is GREEN.
         run: bash scripts/check-cert-expiry.sh --self-test
+
+  foreign-text-to-caller-gate:
+    # #3688 gate 7 (Conductor ruling on the reviewer-f2r secret-to-sink sweep,
+    # 2026-09-13). Keyed on SOURCE x SINK, never on a binding's name: a
+    # FOREIGN value (a backend driver's error Display, a peer's / provider's
+    # response body, a subprocess's stdout, an operator path / DSN label) must
+    # never be RENDERED into a CALLER-FACING sink (an HTTP JSON error body, an
+    # MCP tool error string, a hook Deny.reason, a MemoryError payload, a
+    # stored record a caller reads back). The passing state is rendered from
+    # an allowlist (a typed mapper such as store_err_to_response /
+    # handler_error_500, a msg:: constant, a closed vocabulary) or DROPPED,
+    # never masked: redact_*/mask_*/scrub_* are TRANSPARENT to the taint and a
+    # ledger entry that names one is itself a FAIL. A validator echoing the
+    # CALLER'S OWN input is cleared by provenance, not by name.
+    #
+    # scripts/check-foreign-text-to-caller.py walks every rendered identifier
+    # to its producer (the gate-8 python-core shape). Since #3760 the SINK SET
+    # is DERIVED from the tree on every run, never enumerated: every handler
+    # `src/lib.rs` routes (+ `from_fn` middleware) closed over its
+    # response-shaped callees, and every `register_mcp_tool!` dispatch entry
+    # closed over its verbatim-propagating `Result<_, String>` callees; every
+    # json!() value at ANY key inside them is a sink (the import envelope's
+    # `"errors": [..]` array was invisible to the old `"error"`-keyed, path-
+    # prefixed enumeration). The live findings on the chain-12 tree
+    # (311 instances / 170 keys) are held in
+    # scripts/qc-allowlists/foreign-text-to-caller.txt as `pending:#issue`
+    # under #3713 / #3707 / #3724 / #3708 / #3674 / #3698 (+ #3760 / #3761 /
+    # #3762, what the derivation surfaced); the summary reports
+    # LIVE renders separately from what the ledger holds (a green run says
+    # "tracked", never "none"). A fix lands by deleting the ledger line; a
+    # stale line is a NOTICE (the correction lane may land first).
+    #
+    # No `needs:`, no job-level `if:`, no `paths:` -- always runs. Declared in
+    # required-contexts-not-required.txt at introduction (rule (f) of gate 7
+    # of the lint set); REQUIRE it mirror-first when the required set is next
+    # revised (#3554 ORDER rule).
+    name: "Foreign-text-to-caller gate (#3688 gate 7)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Run foreign-text-to-caller gate
+        run: bash scripts/check-foreign-text-to-caller.sh
+      - name: Self-test the gate (regression evidence)
+        # Plants the finding classes (a funnel arm carrying an operator path,
+        # a redact_*-masked render, a bare destructured field, a prefix
+        # wrapper, a DLQ record, a Deny.reason) that must stay RED and the
+        # controls (the typed funnels, echo validators, a typed refusal, a
+        # declared mapper, CLI --json) that must pass, plus the ledger legs
+        # (pending holds a sink AND a funnel arm as INFO and is counted LIVE;
+        # a stale entry is a NOTICE; keys are deterministic) in a throwaway
+        # tree under .local-runs/ -- never /tmp.
+        run: bash scripts/check-foreign-text-to-caller.sh --self-test
 
   external-pr-operator-approval-gate:
     # 2026-08-26 operator directive — "we want collaboration with rigid security

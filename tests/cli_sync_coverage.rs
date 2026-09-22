@@ -149,6 +149,14 @@ fn args_for(remote: PathBuf, dir: &str) -> SyncArgs {
     }
 }
 
+/// #3435 — `sync` never creates a store it was asked to READ: the remote
+/// must pre-exist on every direction, and the LOCAL must pre-exist under
+/// `--dry-run` (both are opened read-only). Materialise an empty schema
+/// through the write funnel first.
+fn create_empty_db(path: &std::path::Path) {
+    drop(db::open(path).expect("create empty sync test database"));
+}
+
 // ---------------------------------------------------------------------------
 // run() — pull / push / merge — JSON-output branches
 // ---------------------------------------------------------------------------
@@ -185,6 +193,7 @@ fn push_json_output_branch() {
     let remote_env = Env::fresh();
     let remote = remote_env.db_path.clone();
     seed(&local, "ns", "to-remote", "data");
+    create_empty_db(&remote);
     let args = args_for(remote, "push");
     {
         let mut out = env.output();
@@ -284,6 +293,7 @@ fn push_skips_invalid_memory() {
     let remote = remote_env.db_path.clone();
     seed(&local, "ns", "valid", "x");
     let _ = seed_invalid_memory(&local, "ns");
+    create_empty_db(&remote);
     let args = args_for(remote, "push");
     {
         let mut out = env.output();
@@ -337,6 +347,7 @@ fn push_handles_valid_and_invalid_links() {
     let remote = remote_env.db_path.clone();
     seed_valid_link(&local, "ns");
     seed_invalid_link(&local);
+    create_empty_db(&remote);
     let args = args_for(remote, "push");
     {
         let mut out = env.output();
@@ -350,8 +361,14 @@ fn merge_handles_links_on_both_sides() {
     let local = env.db_path.clone();
     let remote_env = Env::fresh();
     let remote = remote_env.db_path.clone();
-    seed_valid_link(&local, "ns");
-    seed_valid_link(&remote, "ns");
+    // Distinct namespaces: the two link fixtures share titles, and the
+    // `(title, namespace)` unique index would collapse the merged memories
+    // onto one id per side — leaving an edge whose endpoint never landed.
+    // #3435 — such an edge is now a REPORTED error (it used to be swallowed
+    // by `let _ = db::create_link(..)`), so this test seeds two genuinely
+    // importable edge sets and pins that both cross.
+    seed_valid_link(&local, "local-ns");
+    seed_valid_link(&remote, "remote-ns");
     seed_invalid_link(&local);
     seed_invalid_link(&remote);
     let args = args_for(remote, "merge");
@@ -444,6 +461,7 @@ fn dry_run_text_output_pull_only() {
     let remote_env = Env::fresh();
     let remote = remote_env.db_path.clone();
     seed(&remote, "ns", "R", "R");
+    create_empty_db(&local);
     let mut args = args_for(remote, "pull");
     args.dry_run = true;
     {
@@ -463,6 +481,7 @@ fn dry_run_text_output_push_only() {
     let remote_env = Env::fresh();
     let remote = remote_env.db_path.clone();
     seed(&local, "ns", "L", "L");
+    create_empty_db(&remote);
     let mut args = args_for(remote, "push");
     args.dry_run = true;
     {
@@ -701,7 +720,7 @@ async fn run_daemon_clamps_interval_and_batch_size() {
     // pre-flight (which contains the clamp arithmetic) executes
     // without panicking.
     let args = SyncDaemonArgs {
-        peers: vec!["http://127.0.0.1:1/".to_string()],
+        peers: vec!["https://127.0.0.1:1/".to_string()],
         interval: 0,
         api_key: Some("k".to_string()),
         batch_size: 0,
@@ -727,7 +746,7 @@ async fn run_daemon_mtls_client_path_runs_through_tls_builder() {
     let key = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/tls/valid_key_pkcs8.pem");
     let args = SyncDaemonArgs {
-        peers: vec!["http://127.0.0.1:1/".to_string()],
+        peers: vec!["https://127.0.0.1:1/".to_string()],
         interval: 1,
         api_key: None,
         batch_size: 10,
@@ -758,7 +777,7 @@ async fn run_daemon_mtls_with_insecure_skip_is_refused_by_default_2448() {
     let key = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/tls/valid_key_pkcs8.pem");
     let args = SyncDaemonArgs {
-        peers: vec!["http://127.0.0.1:1/".to_string()],
+        peers: vec!["https://127.0.0.1:1/".to_string()],
         interval: 1,
         api_key: None,
         batch_size: 10,
@@ -787,7 +806,7 @@ async fn run_daemon_mtls_with_insecure_skip_is_refused_by_default_2448() {
         std::env::set_var(ai_memory::tls::FED_REQUIRE_SERVER_VERIFY_ENV, "0");
     }
     let permissive = SyncDaemonArgs {
-        peers: vec!["http://127.0.0.1:1/".to_string()],
+        peers: vec!["https://127.0.0.1:1/".to_string()],
         interval: 1,
         api_key: None,
         batch_size: 10,
@@ -810,7 +829,7 @@ async fn run_daemon_mtls_with_missing_cert_file_errors() {
     let env = Env::fresh();
     let db = env.db_path.clone();
     let args = SyncDaemonArgs {
-        peers: vec!["http://127.0.0.1:1/".to_string()],
+        peers: vec!["https://127.0.0.1:1/".to_string()],
         interval: 1,
         api_key: None,
         batch_size: 10,
@@ -833,7 +852,7 @@ async fn run_daemon_ca_cert_valid_runs_1794() {
     let ca = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/tls/valid_cert.pem");
     let args = SyncDaemonArgs {
-        peers: vec!["http://127.0.0.1:1/".to_string()],
+        peers: vec!["https://127.0.0.1:1/".to_string()],
         interval: 1,
         api_key: None,
         batch_size: 10,
@@ -856,7 +875,7 @@ async fn run_daemon_ca_cert_malformed_errors_1794() {
     let db = env.db_path.clone();
     let not_pem = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
     let args = SyncDaemonArgs {
-        peers: vec!["http://127.0.0.1:1/".to_string()],
+        peers: vec!["https://127.0.0.1:1/".to_string()],
         interval: 1,
         api_key: None,
         batch_size: 10,
@@ -884,7 +903,7 @@ async fn run_daemon_no_mtls_uses_default_client() {
     let env = Env::fresh();
     let db = env.db_path.clone();
     let args = SyncDaemonArgs {
-        peers: vec!["http://127.0.0.1:1/".to_string()],
+        peers: vec!["https://127.0.0.1:1/".to_string()],
         interval: 1,
         api_key: None,
         batch_size: 1,

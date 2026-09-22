@@ -385,15 +385,38 @@ pub fn run_autonomy_passes(
             }
             report.operations_attempted += 1;
             match consolidate_cluster(conn, llm, &cluster, dry_run) {
-                Ok(Some(entry)) => {
-                    let proceed = note_rollback_write(conn, &entry, dry_run, &mut report);
+                Ok(Some(ClusterOutcome { entry, persisted })) => {
+                    // #3692 — real mode persisted the entry write-ahead (and
+                    // committed it); the dry run counts a simulated row.
+                    let proceed = if persisted {
+                        report.rollback_entries_written += 1;
+                        true
+                    } else {
+                        note_rollback_write(conn, &entry, dry_run, &mut report)
+                    };
                     if let RollbackEntry::Consolidate { originals, .. } = entry {
                         report.memories_consolidated += originals.len();
                     }
                     halted = !proceed;
                 }
                 Ok(None) => {}
-                Err(e) => report.errors.push(format!("consolidate failed: {e}")),
+                Err(e) => {
+                    let text = format!("consolidate failed: {e}");
+                    // #3692 — an unwritable rollback log halts the destructive
+                    // passes exactly as a post-hoc write failure did (fewer
+                    // actions, never un-reversible ones), with nothing touched.
+                    report.errors.push(text.clone());
+                    if text.contains(ROLLBACK_WRITE_AHEAD_FAILED) {
+                        report.rollback_log_degraded = true;
+                        report.errors.push(
+                            "autonomy passes halted for this cycle: the rollback log is not \
+                             writable, so no destructive action can be made reversible; \
+                             nothing was consolidated and remaining destructive work is deferred"
+                                .to_string(),
+                        );
+                        halted = true;
+                    }
+                }
             }
         }
     }
@@ -586,12 +609,26 @@ fn jaccard_similarity(a: &str, b: &str) -> f64 {
     }
 }
 
+/// What Pass-1 did for one cluster: the reversible entry, and whether this
+/// call already PERSISTED it (#3692 write-ahead — real mode) or left it
+/// for the caller to count (dry run).
+struct ClusterOutcome {
+    entry: RollbackEntry,
+    persisted: bool,
+}
+
+/// v1.0.0 #3692 — the ONE error text for a write-ahead that could not be
+/// persisted: the cluster is left untouched (nothing deleted, nothing
+/// tombstoned) and the cycle's destructive passes halt.
+pub(crate) const ROLLBACK_WRITE_AHEAD_FAILED: &str =
+    "rollback write-ahead failed — consolidation NOT applied (sources untouched)";
+
 fn consolidate_cluster(
     conn: &Connection,
     llm: &dyn AutonomyLlm,
     cluster: &[Memory],
     dry_run: bool,
-) -> Result<Option<RollbackEntry>> {
+) -> Result<Option<ClusterOutcome>> {
     if cluster.len() < 2 {
         return Ok(None);
     }
@@ -618,9 +655,12 @@ fn consolidate_cluster(
     let title = format!("[consolidated] {base_title}");
 
     if dry_run {
-        return Ok(Some(RollbackEntry::Consolidate {
-            originals: cluster.to_vec(),
-            result_id: "dry-run".to_string(),
+        return Ok(Some(ClusterOutcome {
+            entry: RollbackEntry::Consolidate {
+                originals: cluster.to_vec(),
+                result_id: "dry-run".to_string(),
+            },
+            persisted: false,
         }));
     }
 
@@ -638,7 +678,14 @@ fn consolidate_cluster(
     // already-gated rows; no external caller reaches this path), so it claims
     // the substrate-authored why_trace stamp — the same posture as the SAL
     // `ConsolidationPass`, which runs `for_admin` (bypass_visibility).
-    let result_id = db::consolidate(
+    // #3692 — WRITE-AHEAD: the exact originals reach the rollback log
+    // BEFORE `consolidate` deletes (or tombstones) a single one of them. A
+    // write-ahead that fails aborts the cluster with nothing touched; the
+    // pre-#3692 order (merge first, log after, best-effort) left the only
+    // exact copy of each hard-deleted source in this stack frame.
+    let entry_id = persist_write_ahead(conn, cluster)
+        .map_err(|e| anyhow::anyhow!("{ROLLBACK_WRITE_AHEAD_FAILED}: {e}"))?;
+    let result_id = match db::consolidate(
         conn,
         &ids,
         &title,
@@ -648,11 +695,32 @@ fn consolidate_cluster(
         CURATOR_SOURCE_LABEL,
         crate::identity::sentinels::AI_CURATOR,
         true,
-    )?;
-
-    Ok(Some(RollbackEntry::Consolidate {
+    ) {
+        Ok(id) => id,
+        Err(e) => {
+            // The merge failed atomically (nothing deleted); the pending row
+            // has nothing to reverse. Best-effort removal; a leftover pending
+            // row is an honest over-retention, never a loss.
+            let _ = db::delete(conn, &entry_id);
+            return Err(e);
+        }
+    };
+    let entry = RollbackEntry::Consolidate {
         originals: cluster.to_vec(),
-        result_id,
+        result_id: result_id.clone(),
+    };
+    // Commit: fill the summary id and clear the pending mark. A failed
+    // commit leaves the PENDING row — which still holds the originals and
+    // still reverses — and is reported, never silently dropped.
+    commit_write_ahead(conn, &entry_id, cluster, &result_id).map_err(|e| {
+        anyhow::anyhow!(
+            "consolidation applied (summary {result_id}) but the rollback entry could not be \
+             committed; the pending entry {entry_id} still holds the originals: {e}"
+        )
+    })?;
+    Ok(Some(ClusterOutcome {
+        entry,
+        persisted: true,
     }))
 }
 
@@ -902,6 +970,103 @@ fn persist_rollback_entry(conn: &Connection, entry: &RollbackEntry) -> Result<()
     Ok(())
 }
 
+/// v1.0.0 #3692 — the metadata key that marks a `_curator/rollback` entry
+/// as WRITE-AHEAD: written before the destructive merge, with an empty
+/// `result_id`, and committed (the key cleared, the id filled) only after
+/// the merge verified. An entry still pending after a crash holds the exact
+/// originals; `reverse_rollback_entry` restores them and skips the summary
+/// delete it cannot name.
+pub const ROLLBACK_PENDING_KEY: &str = "pending";
+
+/// The `_curator/rollback` row metadata for `entry` — ONE shape for the
+/// write-ahead row, its commit and the plain (post-hoc) entries.
+fn rollback_entry_metadata(entry: &RollbackEntry, pending: bool) -> serde_json::Value {
+    let mut meta = serde_json::json!({
+        "agent_id": crate::identity::sentinels::AI_CURATOR,
+        "action": entry.action_tag(),
+        "why_trace": crate::storage::WHY_TRACE_SUBSTRATE_SYSTEM,
+    });
+    if pending {
+        meta[ROLLBACK_PENDING_KEY] = serde_json::Value::Bool(true);
+    }
+    meta
+}
+
+/// v1.0.0 #3692 — the write-ahead `Consolidate` entry for `originals`: the
+/// snapshot the rollback log holds BEFORE `consolidate` deletes or
+/// tombstones a single source. `result_id` is empty until the commit.
+#[must_use]
+pub(crate) fn write_ahead_entry(originals: &[Memory]) -> RollbackEntry {
+    RollbackEntry::Consolidate {
+        originals: originals.to_vec(),
+        result_id: String::new(),
+    }
+}
+
+/// v1.0.0 #3692 — the `_curator/rollback` row for a write-ahead entry
+/// (tagged [`ROLLBACK_PENDING_KEY`]). Backend-agnostic: the SAL pass stores
+/// it through `MemoryStore::store`, the sqlite Pass-1 through `db::insert`.
+pub(crate) fn build_write_ahead_memory(originals: &[Memory]) -> Result<Memory> {
+    let entry = write_ahead_entry(originals);
+    let mut mem = build_rollback_memory(&entry)?;
+    mem.metadata = rollback_entry_metadata(&entry, true);
+    Ok(mem)
+}
+
+/// v1.0.0 #3692 — the committed content + metadata for a write-ahead row
+/// once the merge that minted `result_id` verified: the same
+/// [`RollbackEntry::Consolidate`] with the id filled and the pending mark
+/// cleared. Returned as `(content, metadata)` so each backend applies it
+/// through its own update funnel.
+pub(crate) fn commit_write_ahead_patch(
+    originals: &[Memory],
+    result_id: &str,
+) -> Result<(String, serde_json::Value)> {
+    let entry = RollbackEntry::Consolidate {
+        originals: originals.to_vec(),
+        result_id: result_id.to_string(),
+    };
+    Ok((
+        serde_json::to_string(&entry)?,
+        rollback_entry_metadata(&entry, false),
+    ))
+}
+
+/// sqlite twin of the write-ahead: persist the pending row, returning its id.
+fn persist_write_ahead(conn: &Connection, originals: &[Memory]) -> Result<String> {
+    let mem = build_write_ahead_memory(originals)?;
+    db::insert(conn, &mem)?;
+    Ok(mem.id)
+}
+
+/// sqlite twin of the commit: fill the id, clear the pending mark. The row
+/// keeps its title/tier/etc.; only content + metadata change.
+fn commit_write_ahead(
+    conn: &Connection,
+    entry_id: &str,
+    originals: &[Memory],
+    result_id: &str,
+) -> Result<()> {
+    let (content, metadata) = commit_write_ahead_patch(originals, result_id)?;
+    let (found, _) = db::update(
+        conn,
+        entry_id,
+        None,
+        Some(&content),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(&metadata),
+    )?;
+    if !found {
+        anyhow::bail!("rollback write-ahead entry {entry_id} vanished before its commit");
+    }
+    Ok(())
+}
+
 /// Build the `_curator/rollback` `Memory` row for a [`RollbackEntry`] —
 /// the serialised, operator-reversible snapshot that
 /// [`reverse_rollback_entry`] (and `ai-memory curator --rollback`)
@@ -937,11 +1102,7 @@ pub(crate) fn build_rollback_memory(entry: &RollbackEntry) -> Result<Memory> {
         // #2110 — curator rollback rows are substrate-authored, reached via a
         // direct `db::insert`; record the substrate why_trace so the write
         // satisfies AI_MEMORY_REQUIRE_WHY_TRACE without a kind-exemption hole.
-        metadata: serde_json::json!({
-            "agent_id": crate::identity::sentinels::AI_CURATOR,
-            "action": entry.action_tag(),
-            "why_trace": crate::storage::WHY_TRACE_SUBSTRATE_SYSTEM,
-        }),
+        metadata: rollback_entry_metadata(entry, false),
         reflection_depth: 0,
         memory_kind: crate::models::MemoryKind::Observation,
         entity_id: None,
@@ -1921,7 +2082,8 @@ mod tests {
         let cluster = vec![a.clone(), b.clone()];
         let entry = consolidate_cluster(&conn, &llm, &cluster, false)
             .unwrap()
-            .expect("expected rollback entry");
+            .expect("expected rollback entry")
+            .entry;
         match entry {
             RollbackEntry::Consolidate {
                 originals,
@@ -1961,7 +2123,8 @@ mod tests {
         let cluster = vec![a.clone(), b.clone()];
         let entry = consolidate_cluster(&conn, &llm, &cluster, true)
             .unwrap()
-            .expect("dry-run returns entry");
+            .expect("dry-run returns entry")
+            .entry;
         if let RollbackEntry::Consolidate { result_id, .. } = entry {
             assert_eq!(result_id, "dry-run");
         }
@@ -1994,7 +2157,8 @@ mod tests {
         let cluster = vec![a.clone(), b.clone()];
         let entry = consolidate_cluster(&conn, &llm, &cluster, false)
             .unwrap()
-            .expect("entry");
+            .expect("entry")
+            .entry;
 
         // After consolidation, originals should be gone (merged into
         // the result id).
@@ -2404,10 +2568,11 @@ mod tests {
         let cluster = vec![a.clone(), b.clone()];
         let entry = consolidate_cluster(&conn, &llm, &cluster, false)
             .unwrap()
-            .expect("rollback entry");
+            .expect("rollback entry")
+            .entry;
 
-        // Persist the entry
-        persist_rollback_entry(&conn, &entry).unwrap();
+        // #3692 — real mode already persisted the entry write-ahead and
+        // committed it; a second post-hoc row would double the log.
 
         // Verify it's in the rollback log
         let log = db::list(
@@ -2426,6 +2591,100 @@ mod tests {
         .unwrap();
         assert_eq!(log.len(), 1);
         assert!(log[0].content.contains("consolidate"));
+        // #3692 — the committed row carries the real summary id and no
+        // pending mark; it deserialises to the entry the call returned.
+        let stored: RollbackEntry = serde_json::from_str(&log[0].content).unwrap();
+        match (&stored, &entry) {
+            (
+                RollbackEntry::Consolidate {
+                    result_id: stored_id,
+                    originals: stored_originals,
+                },
+                RollbackEntry::Consolidate {
+                    result_id,
+                    originals,
+                },
+            ) => {
+                assert_eq!(stored_id, result_id);
+                assert!(!result_id.is_empty());
+                assert_eq!(stored_originals.len(), originals.len());
+            }
+            other => panic!("not a consolidate entry: {other:?}"),
+        }
+        assert!(
+            log[0].metadata.get(ROLLBACK_PENDING_KEY).is_none(),
+            "committed entries carry no pending mark: {}",
+            log[0].metadata
+        );
+    }
+
+    /// #3692 — the write-ahead order, pinned: the rollback row for a cluster
+    /// exists BEFORE `consolidate` runs (the originals are on disk while the
+    /// sources still are), marked pending with an empty result id; after the
+    /// commit it names the summary and the mark is gone. A pending row, when
+    /// it is all a crash left, still reverses (originals restored).
+    #[test]
+    fn issue_3692_write_ahead_row_exists_before_the_merge_and_reverses() {
+        let (_tmp, conn) = setup_conn();
+        let a = sample_mem("wa-a", "ns", "WA Title A", "alpha text", Tier::Mid);
+        let b = sample_mem("wa-b", "ns", "WA Title B", "beta text", Tier::Mid);
+        db::insert(&conn, &a).unwrap();
+        db::insert(&conn, &b).unwrap();
+        let cluster = vec![a.clone(), b.clone()];
+
+        // The write-ahead half on its own: the row lands with the sources
+        // still live and untouched.
+        let pending_id = persist_write_ahead(&conn, &cluster).unwrap();
+        let row = db::get(&conn, &pending_id).unwrap().expect("pending row");
+        assert_eq!(
+            row.metadata[ROLLBACK_PENDING_KEY],
+            serde_json::Value::Bool(true)
+        );
+        let pending: RollbackEntry = serde_json::from_str(&row.content).unwrap();
+        match &pending {
+            RollbackEntry::Consolidate {
+                originals,
+                result_id,
+            } => {
+                assert!(result_id.is_empty(), "no summary exists yet");
+                assert_eq!(originals.len(), 2);
+                assert_eq!(originals[0].content, "alpha text");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(db::get(&conn, "wa-a").unwrap().is_some());
+        assert!(db::get(&conn, "wa-b").unwrap().is_some());
+
+        // Simulate the crash window: the sources are hard-deleted (what
+        // `consolidate` does with tombstoning off) and NO commit happened.
+        db::delete(&conn, "wa-a").unwrap();
+        db::delete(&conn, "wa-b").unwrap();
+        assert!(db::get(&conn, "wa-a").unwrap().is_none());
+        // The pending row alone brings the exact originals back.
+        let applied = reverse_rollback_entry(&conn, &pending).unwrap();
+        assert!(!applied, "there was no summary to remove");
+        assert_eq!(
+            db::get(&conn, "wa-a").unwrap().expect("restored").content,
+            "alpha text"
+        );
+        assert_eq!(
+            db::get(&conn, "wa-b").unwrap().expect("restored").content,
+            "beta text"
+        );
+
+        // The commit half: the id lands, the mark clears.
+        commit_write_ahead(&conn, &pending_id, &cluster, "summary-xyz").unwrap();
+        let row = db::get(&conn, &pending_id).unwrap().expect("committed row");
+        assert!(
+            row.metadata.get(ROLLBACK_PENDING_KEY).is_none(),
+            "{}",
+            row.metadata
+        );
+        let committed: RollbackEntry = serde_json::from_str(&row.content).unwrap();
+        assert!(matches!(
+            committed,
+            RollbackEntry::Consolidate { ref result_id, .. } if result_id == "summary-xyz"
+        ));
     }
 
     #[test]

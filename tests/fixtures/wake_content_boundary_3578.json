@@ -3,7 +3,7 @@
     "path": "src/wake_hub/allowlist_reload.rs",
     "role": "Hub routing and bounded codecs; only public verification/visibility dependencies admitted by the separate zero-authority gate.",
     "mode": "rust-production-tokens",
-    "sha256": "28c723598ac8af20a75353a8b696eee923c0fc82f0b62fb1a577ad54db6f1d99"
+    "sha256": "3042ba3a2cac43c1b6e1429a09207fb9f582445b405363ce49c7d26b824f118f"
   },
   {
     "path": "src/wake_hub/codec.rs",
@@ -15,19 +15,19 @@
     "path": "src/wake_hub/conn.rs",
     "role": "Hub routing and bounded codecs; only public verification/visibility dependencies admitted by the separate zero-authority gate.",
     "mode": "rust-production-tokens",
-    "sha256": "e8c34fdc7414999bd5a6b9dc6827bfea983c7cc1816fcfb888a6b6e84aefd514"
+    "sha256": "b19f4585f5887a43e1554835a256c930f6b3e8fd1b97575cb2d617d67986a203"
   },
   {
     "path": "src/wake_hub/delegation_verifier.rs",
     "role": "Hub routing and bounded codecs; only public verification/visibility dependencies admitted by the separate zero-authority gate.",
     "mode": "rust-production-tokens",
-    "sha256": "e0a9a4a6e170b4daa9e8368ca781e4576c8f5302411fb6cd6f6bff01f03864a2"
+    "sha256": "aa72f645c77a4c4b995f19a3cbea6830ec5a0c9412a3ca371a1431cdfa2ff1c9"
   },
   {
     "path": "src/wake_hub/frame.rs",
     "role": "Hub routing and bounded codecs; only public verification/visibility dependencies admitted by the separate zero-authority gate.",
     "mode": "rust-production-tokens",
-    "sha256": "13c85d9b3d54868ff0ab68acf3e94447bb1dc6db42b5b88c1019af9af3dd89ca"
+    "sha256": "5d237fbc52e5fff0a8cd7746517c146cb60881d8d3c45ac9644bce173e813d3f"
   },
   {
     "path": "src/wake_hub/health.rs",
@@ -75,7 +75,7 @@
     "path": "src/wake_hub/routing.rs",
     "role": "Hub routing and bounded codecs; only public verification/visibility dependencies admitted by the separate zero-authority gate.",
     "mode": "rust-production-tokens",
-    "sha256": "680990a9359a3c01bb1b254206a699b58e04ec48dc66a8021c48b39b524ad070"
+    "sha256": "521f82ca5e4c50814e6afe763a06a66fbe73336817f01fdb4cd0192847486323"
   },
   {
     "path": "src/wake_hub/server.rs",
@@ -99,13 +99,13 @@
     "path": "src/wake_client/mod.rs",
     "role": "Client bundle/session/signal boundary; decode hints and request a read, never write memory.",
     "mode": "rust-production-tokens",
-    "sha256": "230797bdf68e1547c23eb7cadac19f75f8d82a6bc67ed34071aea9f6c9cb3740"
+    "sha256": "7b85c545a8d265773aca45e4f0de989c59ec63b5e6185f451fb4a3f33b1f0c3b"
   },
   {
     "path": "src/wake_client/session.rs",
     "role": "Client bundle/session/signal boundary; decode hints and request a read, never write memory.",
     "mode": "rust-production-tokens",
-    "sha256": "91db62a326c6e46add4b1f4d33cf862aabf23c774c7adf3373eb50898d44aabe"
+    "sha256": "f74b56a0e231734044212b7c323499afd66251d17ad45ebc8cb782b1e3e45caf"
   },
   {
     "path": "src/wake_sink/boot.rs",
@@ -123,7 +123,7 @@
     "path": "src/wake_sink/mod.rs",
     "role": "Daemon producer boundary; enrolled producer credential and metadata-only bus-to-hub delivery.",
     "mode": "rust-production-tokens",
-    "sha256": "3c764b92ee7029ea8d817187e110aa97101572cad1676113114cf23e72de5c44"
+    "sha256": "16fa7c182666277b06eaab670ee077a08ca59af687040c09f7031906a4aa8df2"
   },
   {
     "path": "src/wake_sink/producer_identity.rs",
@@ -135,13 +135,13 @@
     "path": "src/wake_sink/uds.rs",
     "role": "Daemon producer boundary; enrolled producer credential and metadata-only bus-to-hub delivery.",
     "mode": "rust-production-tokens",
-    "sha256": "ff383dc5214ae44ce772e44c97461d7502fc5a272bb3c077c9f79fe049cf0731"
+    "sha256": "17ae8b6c3de09f07e733d0b266c0e94d130bcf18920694f1b5a8fa324b3878a8"
   },
   {
     "path": "src/cli/wake_listen.rs",
-    "role": "Operator-resolved caller catch_up_read -> handle_inbox; metadata rendering; operator --exec via audited_tokio_command.",
+    "role": "Operator-resolved caller catch_up_read -> handle_inbox; refuses a Postgres store before opening the local sidecar (#3730, control-plane guard ahead of the content path); metadata rendering; operator --exec via audited_tokio_command.",
     "mode": "rust-production-tokens",
-    "sha256": "d2116bdc1d9eda67c39fd8c84d9eb18403de3c0a6a7f3a25399f527daed41653"
+    "sha256": "aa0ed659de0325d126e704b21390831f851bd338eaa6641a38b9591102ea51b2"
   },
   {
     "path": "src/inbox_wake.rs",
@@ -159,7 +159,7 @@
     "path": "sdk/python/ai_memory/wake.py",
     "role": "Python decoder -> metadata WakeSignal -> operator-provided on_signal callback; external trust boundary.",
     "mode": "sdk-source-bytes",
-    "sha256": "d488d9e67b4df038844125259d9870647e139509bb847157c003a80a4c3cf8af"
+    "sha256": "3f4a521bbf4aa0bb3e090708dcbe1c134b9b2214296870f803d19997157e93fb"
   },
   {
     "path": "sdk/python/swarm/wake.py",
@@ -171,6 +171,6 @@
     "path": "sdk/typescript/src/wake.ts",
     "role": "TypeScript decoder/state machine -> metadata WakeSignal -> operator-provided onSignal callback; external trust boundary.",
     "mode": "sdk-source-bytes",
-    "sha256": "10bdca0697a5d9478cd8801ea3032ab44fa9b52d6a2b306ee2464839bc6a9be1"
+    "sha256": "de28c5a4f2315a1b150437d8714db79a01c41c654beebb9c52753db693630a3d"
   }
 ]

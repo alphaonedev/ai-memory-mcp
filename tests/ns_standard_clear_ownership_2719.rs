@@ -149,6 +149,7 @@ fn build_router(db_path: &std::path::Path) -> axum::Router {
             ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty(),
         ),
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
+        ..Default::default()
     };
     ai_memory::build_router(api_key_state, app_state)
 }
@@ -180,6 +181,37 @@ fn bound_standard_id(db_path: &std::path::Path, ns: &str) -> Option<String> {
     ai_memory::db::get_namespace_standard(&conn, ns).expect("get_namespace_standard")
 }
 
+/// #3407 — the ONE closed owner-gate refusal shape: exactly the keys
+/// `caller` / `code` / `error` / `namespace`, the SSOT reason, and NEVER the
+/// occupant's name (the owner is the fact the refusal must not confirm).
+fn assert_closed_owner_gate_refusal(body: &str, caller: &str) {
+    let parsed: Value = serde_json::from_str(body).expect("json refusal body");
+    let mut keys: Vec<&str> = parsed
+        .as_object()
+        .expect("object body")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        ["caller", "code", "error", "namespace"],
+        "closed shape; got {body}"
+    );
+    assert_eq!(parsed["code"], "NOT_OWNER", "got {body}");
+    assert_eq!(
+        parsed["error"],
+        ai_memory::errors::msg::CALLER_DOES_NOT_OWN_NAMESPACE_STANDARD,
+        "got {body}"
+    );
+    assert_eq!(parsed["caller"], caller, "got {body}");
+    assert_eq!(parsed["namespace"], NS, "got {body}");
+    assert!(
+        !body.contains(ALICE),
+        "the owner must never be named: {body}"
+    );
+}
+
 #[tokio::test]
 async fn foreign_caller_cannot_clear_owned_standard_2719() {
     let tmp = NamedTempFile::new().expect("tempfile");
@@ -191,13 +223,16 @@ async fn foreign_caller_cannot_clear_owned_standard_2719() {
 
     // THE #2545 ATTACK on the sqlite network surface: mallory (a foreign named
     // caller) deletes alice's namespace standard. Pre-fix this returned 200 +
-    // cleared:true. It must be REFUSED (400 via the #1777 gate).
+    // cleared:true. It must be REFUSED — since #3407 with the ONE closed
+    // owner-gate shape (403 `NOT_OWNER`, the SSOT const, the caller, the
+    // namespace) rather than the pre-#3407 400 prose.
     let (status, body) = delete_standard(&router, NS, Some(MALLORY)).await;
     assert_eq!(
         status,
-        StatusCode::BAD_REQUEST,
+        StatusCode::FORBIDDEN,
         "#2719: a foreign caller must NOT clear alice's owned namespace standard; got {status}: {body}"
     );
+    assert_closed_owner_gate_refusal(&body, MALLORY);
     assert_eq!(
         bound_standard_id(tmp.path(), NS).as_deref(),
         Some("alice-std-2719"),
@@ -219,9 +254,17 @@ async fn keyless_caller_cannot_clear_owned_standard_2719() {
     let (status, body) = delete_standard(&router, NS, None).await;
     assert_eq!(
         status,
-        StatusCode::BAD_REQUEST,
+        StatusCode::FORBIDDEN,
         "#2719: a keyless caller must NOT clear alice's owned namespace standard; got {status}: {body}"
     );
+    let parsed: Value = serde_json::from_str(&body).expect("json refusal body");
+    assert!(
+        parsed["caller"]
+            .as_str()
+            .is_some_and(|c| c.starts_with("anonymous:")),
+        "#2719: the keyless caller is the synthesized anonymous principal; got {body}"
+    );
+    assert_closed_owner_gate_refusal(&body, parsed["caller"].as_str().unwrap());
     assert_eq!(
         bound_standard_id(tmp.path(), NS).as_deref(),
         Some("alice-std-2719"),

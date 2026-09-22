@@ -37,6 +37,8 @@ use ai_memory::config::{FeatureTier, ResolvedScoring, ResolvedTtl, set_allow_loo
 use ai_memory::handlers::{ApiKeyState, AppState, Db};
 use ai_memory::subscriptions::{self, NewSubscription};
 
+mod common;
+
 /// #1751 — the v0.9 HTTP-direct default is REQUIRED; opt out so the unsigned
 /// store fixtures below exercise the post-commit stages, not a 403.
 fn permissive_attestation_for_tests() {
@@ -105,6 +107,7 @@ fn build_router(db_path: &Path) -> axum::Router {
             ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty(),
         ),
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
+        ..Default::default()
     };
     ai_memory::build_router(api_key_state, app_state)
 }
@@ -237,37 +240,18 @@ async fn bulk_emits_one_store_audit_row_per_persisted_row_2724() {
 /// webhook is invoked once per committed row and never for a rejected one.
 #[tokio::test]
 async fn bulk_dispatches_memory_store_event_per_persisted_row_2724() {
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    /// The dispatcher counts a delivery successful ONLY on a 2xx whose body
-    /// echoes `{"status":"ack","correlation_id":<the sent id>}`; anything else
-    /// is retried on the [200ms, 1s, 5s] ladder (which would double the
-    /// observed request count). Echo the id so each delivery lands once.
-    struct AckEcho;
-    impl wiremock::Respond for AckEcho {
-        fn respond(&self, req: &wiremock::Request) -> ResponseTemplate {
-            let corr = serde_json::from_slice::<Value>(&req.body)
-                .ok()
-                .and_then(|v| {
-                    v.get("correlation_id")
-                        .and_then(|c| c.as_str().map(str::to_string))
-                })
-                .unwrap_or_else(|| "missing".to_string());
-            ResponseTemplate::new(200)
-                .set_body_json(json!({"status": "ack", "correlation_id": corr}))
-        }
-    }
-
-    // Wiremock binds loopback; the SSRF guard rejects loopback by default.
+    // The receiver binds loopback; the SSRF guard rejects loopback by
+    // default. #3705 — it serves TLS (every `http://` target is refused,
+    // loopback included) and the dispatcher trusts the fixture leaf. The
+    // dispatcher counts a delivery successful ONLY on a 2xx whose body echoes
+    // `{"status":"ack","correlation_id":<the sent id>}`; anything else is
+    // retried on the [200ms, 1s, 5s] ladder (which would double the observed
+    // request count), so the receiver echoes the id and each delivery lands
+    // once.
     set_allow_loopback_webhooks(true);
-
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/hook"))
-        .respond_with(AckEcho)
-        .mount(&server)
-        .await;
+    let tls = common::tls_receiver::dispatch_tls(&std::env::temp_dir());
+    let server =
+        common::tls_receiver::TlsReceiver::start_with(tls, common::tls_receiver::ack_echo()).await;
 
     let (_dir, db_path) = fresh_db();
     let hook_url = format!("{}/hook", server.uri());

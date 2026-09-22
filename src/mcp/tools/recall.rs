@@ -9,7 +9,7 @@ use crate::mcp::param_names;
 use crate::mcp::registry::McpTool;
 use crate::models::{
     AttestLevel, CandidateCounts, ConfidenceTier, Memory, MemoryKind, RecallMeta, RecallTelemetry,
-    SemanticWithheld,
+    SemanticWithheld, field_names,
 };
 use crate::observations;
 use crate::reranker::BatchedReranker;
@@ -730,14 +730,55 @@ pub fn decorate_memory_many(
             if let Some(level) = attest_map.get(&mem.id) {
                 obj.insert("latest_link_attest_level".to_string(), json!(level));
             }
-            // v0.8.0 #1709 §2.5 T1 (C1a) — provenance_tier decoration
-            // composed PURELY from already-fetched data (the row's
-            // confidence_source + the batched attest level). No new DB
-            // query, no LLM. Decoration only — NOT a ranking key.
+            // v0.8.0 #1709 §2.5 T1 (C1a); #3548 Part A — the EDGE-derived
+            // attestation, composed PURELY from already-fetched data (the row's
+            // confidence_source + the batched strongest-incident-link attest
+            // level). No new DB query, no LLM. Decoration only — NOT a ranking
+            // key. This is a property of HOW the memory was reached (the
+            // incident link), not of the memory itself.
+            let link_attestation = provenance_tier(mem.confidence_source, attest_level);
+            // #3548 Part A — `link_attestation` is the first-class, honestly
+            // named field for the edge-derived value. `provenance_tier` is kept
+            // as its documented ALIAS for one release (v1.0.0 → removed v1.0.1)
+            // so existing consumers keep working.
+            obj.insert("link_attestation".to_string(), json!(link_attestation));
+            obj.insert("provenance_tier".to_string(), json!(link_attestation));
+            // #3548 Part A (rework) — `content_attestation` is the row's OWN write
+            // attestation: a VERBATIM pass-through of the memory's top-level
+            // `metadata.attest_level`, whose CLOSED value set is owned by
+            // `identity::verify::ATTEST_LEVEL_MEMORY_STAMP_VALUES` — `claimed` /
+            // `agent_attested` from the identity and store paths, `self_signed` /
+            // `signed_by_peer` from the L4 capture channel (its host-key
+            // attestation, kept distinct from the agent key on purpose). It is
+            // NOT parsed with any enum: parsing it with the link enum returned
+            // `None` for every stored row and read an agent_attested row as
+            // unsigned (the reviewer-f2r finding); it is a different concept from
+            // `link_attestation` (the strongest incident EDGE) even where a
+            // spelling coincides. Absent stamp ⇒ `claimed`, the write path's own
+            // insert-if-absent default (`identity::attest::stamp_claimed_if_absent`).
+            let content_attestation = mem
+                .metadata
+                .get(field_names::ATTEST_LEVEL)
+                .and_then(serde_json::Value::as_str)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(crate::identity::verify::AttestLevel::Claimed.as_str());
             obj.insert(
-                "provenance_tier".to_string(),
-                json!(provenance_tier(mem.confidence_source, attest_level)),
+                "content_attestation".to_string(),
+                json!(content_attestation),
             );
+            // #3548 Part B (additive half, v1.0.0) — surface the confidence CLAIM
+            // beside its derived tier. `confidence_value` is the raw stored
+            // number; `confidence_source` is already serialized from the Memory
+            // struct. NB: `confidence_tier` is NUMERIC-ONLY in v1.0.0
+            // (`ConfidenceTier::from_confidence` thresholds the value; the source
+            // is NOT consulted), so a caller-asserted 1.0 and a measured 1.0 both
+            // read `confirmed`. Redefining `confirmed` to require engine/curator/
+            // calibrated/peer-signed provenance OR corroboration ≥ N is DEFERRED
+            // to v1.0.1 with the crossroads vote — a threshold chosen in the
+            // abstract would be exactly the unbacked-claim defect this family
+            // describes. The field stays honest because its contract says plainly
+            // what it measures.
+            obj.insert("confidence_value".to_string(), json!(mem.confidence));
             // v0.8.0 #1709 §2.5 T4 (D1-anchor) — deterministic
             // scheduled-fact validity recomputed from the row's ANCHOR
             // (`effective_expires_at`), emitted ONLY when confidence-decay
@@ -1216,10 +1257,11 @@ pub fn handle_recall_dto(
                 .expect("recall response is always a JSON object")
                 .entry("meta".to_string())
                 .or_insert_with(|| json!({}));
-            meta["budget_tokens_used"] = json!(outcome.tokens_used);
-            meta["budget_tokens_remaining"] = json!(outcome.tokens_remaining.unwrap_or(0));
-            meta["memories_dropped"] = json!(outcome.memories_dropped);
-            meta["budget_overflow"] = json!(outcome.budget_overflow);
+            meta[field_names::BUDGET_TOKENS_USED] = json!(outcome.tokens_used);
+            meta[field_names::BUDGET_TOKENS_REMAINING] =
+                json!(outcome.tokens_remaining.unwrap_or(0));
+            meta[field_names::MEMORIES_DROPPED] = json!(outcome.memories_dropped);
+            meta[field_names::BUDGET_OVERFLOW] = json!(outcome.budget_overflow);
         }
     };
 
@@ -1342,7 +1384,7 @@ pub fn handle_recall_dto(
                     // v1.0.0 #1834 — claim-bitemporal AS-OF instant.
                     valid_at,
                 )
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| crate::mcp::error_text::mcp_foreign_err("handle_recall_dto", e))?;
                 let results = crate::cli::recall::apply_form4_recall_filters(
                     results,
                     has_citations_filter,
@@ -1465,7 +1507,7 @@ pub fn handle_recall_dto(
         caller,
         valid_at,
     )
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| crate::mcp::error_text::mcp_foreign_err("handle_recall_dto", e))?;
     let results = crate::cli::recall::apply_form4_recall_filters(
         results,
         has_citations_filter,

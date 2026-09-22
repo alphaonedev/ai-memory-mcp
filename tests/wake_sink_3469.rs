@@ -352,6 +352,86 @@ async fn the_uds_forwarder_delivers_a_wake_across_a_real_socket_3469() {
     harness.stop().await;
 }
 
+/// #3641 — a per-frame hub refusal (a 404 to an agent the hub has NEVER seen)
+/// must NOT tear the forwarder's session down. It is COUNTED on its own drop
+/// cause and the producer connection SURVIVES, so the NEXT wake to a real
+/// recipient is still forwarded across the SAME session. This drives the
+/// failure path through the whole `connect_and_pump` loop (not just the unit),
+/// with a presence assertion on the same sink: tearing the session down on one
+/// 404 collapsed host-wide wakes to the backstop.
+#[tokio::test]
+async fn a_hub_404_is_per_frame_and_the_forwarder_keeps_pumping_3641() {
+    let recipient = uid("frank");
+    let producer_key = SigningKey::from_bytes(&[43u8; 32]);
+    let recipient_key = SigningKey::from_bytes(&[44u8; 32]);
+    let mut verifier = TestVerifier::new();
+    verifier.allow(WAKE_HUB_PRODUCER, &producer_key);
+    verifier.allow(&recipient, &recipient_key);
+
+    let harness = Harness::with_verifier(verifier);
+    let mut client = harness.connect().await;
+    client.hello(&recipient, &recipient_key, &[]).await;
+    assert_eq!(client.expect_frame().await.kind, Kind::Welcome);
+
+    let mut cfg = UdsSinkConfig::with_socket_path(harness.socket.clone());
+    cfg.hub_id = harness.hub_id.clone();
+    let sink = UdsWakeSink::spawn(cfg, Arc::new(TestCredential(producer_key)))
+        .expect("the forwarder must start for an enrolled producer credential");
+    let metrics = sink.metrics();
+
+    // (1) A wake to an agent the hub has NEVER seen -> hub answers 404 on the
+    // producer session. The forwarder must COUNT it per-frame and KEEP pumping.
+    sink.on_wake(&InboxEvent::AgentNotified {
+        seq: 1,
+        recipient_agent_id: "ai:never-seen-3641".into(),
+        correlation_id: "sha256:x".into(),
+        inbox_row_id: "row-404".into(),
+        namespace: "_inbox/ai:never-seen-3641".into(),
+        sender_agent_id: "ai:alice".into(),
+        content_digest: format!("sha256:{}", "11".repeat(32)),
+        notified_at: "2026-09-05T00:00:00Z".into(),
+    });
+    let mut counted = false;
+    for _ in 0..300 {
+        if metrics.snapshot().dropped_unknown >= 1 {
+            counted = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        counted,
+        "the hub 404 to a never-seen agent must be counted per-frame"
+    );
+
+    // (2) A wake to the KNOWN recipient IS delivered across the SAME session,
+    // proving the forwarder did not tear the connection down on the 404.
+    sink.on_wake(&InboxEvent::AgentNotified {
+        seq: 2,
+        recipient_agent_id: recipient.clone(),
+        correlation_id: "sha256:y".into(),
+        inbox_row_id: "row-after-404".into(),
+        namespace: format!("_inbox/{recipient}"),
+        sender_agent_id: "ai:alice".into(),
+        content_digest: format!("sha256:{}", "22".repeat(32)),
+        notified_at: "2026-09-05T00:00:01Z".into(),
+    });
+    let frame = client.expect_frame().await;
+    assert_eq!(frame.kind, Kind::Wake);
+    let meta = WakeMeta::decode(&frame.payload).expect("meta");
+    assert_eq!(
+        meta.inbox_row_id, "row-after-404",
+        "the wake after the 404 survives on the same producer session"
+    );
+    let snap = metrics.snapshot();
+    assert_eq!(snap.dropped_unknown, 1, "exactly the one 404 was counted");
+    assert_eq!(
+        snap.written, 2,
+        "both wakes were written to the hub (bytes out)"
+    );
+    harness.stop().await;
+}
+
 /// DENIED: the shipped credential refuses, so the forwarder refuses to START
 /// rather than opening a socket it could not authenticate on. No flag swaps it.
 #[tokio::test]
@@ -414,8 +494,8 @@ async fn a_forwarder_the_hub_refuses_delivers_nothing_3469() {
     let snap = sink.metrics().snapshot();
     assert_eq!(snap.wakes_seen, 4);
     assert_eq!(
-        snap.delivered, 0,
-        "an unadmitted forwarder delivers nothing"
+        snap.written, 0,
+        "an unadmitted forwarder writes nothing to the hub"
     );
     assert_eq!(snap.dropped_transport_full, 2);
     assert!(snap.total_dropped() >= 2, "every drop is counted: {snap:?}");
@@ -683,7 +763,7 @@ async fn the_boot_wired_forwarder_joins_a_real_hub_and_delivers_3469() {
     let meta = WakeMeta::decode(&frame.payload).expect("meta");
     assert_eq!(meta.inbox_row_id, "row-boot");
     assert_eq!(meta.seq_high_watermark, 3469);
-    assert_eq!(sink.metrics().snapshot().delivered, 1);
+    assert_eq!(sink.metrics().snapshot().written, 1);
 
     harness.stop().await;
 }
@@ -755,9 +835,9 @@ async fn without_the_producer_row_the_forwarder_is_refused_3469() {
         "the hub must refuse a producer with no allowlist row: {snap:?}"
     );
     assert_eq!(
-        sink.metrics().snapshot().delivered,
+        sink.metrics().snapshot().written,
         0,
-        "an unadmitted forwarder delivers nothing"
+        "an unadmitted forwarder writes nothing to the hub"
     );
     assert!(
         tokio::time::timeout(Duration::from_millis(400), client.read_frame())

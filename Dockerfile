@@ -26,6 +26,15 @@ COPY benches/ benches/
 # explicit [[test]] targets (including feature-gated ones); omitting the files
 # makes even `cargo build --release` fail during manifest validation (#3488).
 COPY tests/ tests/
+# #3870 — the same manifest-validation class as #3488, one target kind over.
+# #3858 made examples/fed_issue.rs an EXPLICIT `[[example]]` (so its cfg(test)
+# security pin is a real test target). Cargo resolves every EXPLICITLY declared
+# target's source file when it LOADS the manifest, before it compiles anything:
+# an auto-discovered example that is absent from the build context is simply
+# not declared, but an explicitly declared one that is absent is a hard
+# manifest error ("can't find `fed_issue` example at `examples/fed_issue.rs`",
+# exit 101) — `cargo build --release` never starts. Stage examples/ like tests/.
+COPY examples/ examples/
 # v0.6.3 added include_str! references to migration SQL files
 # (Streams A-C schema v15: migrations/sqlite/0010_v063_hierarchy_kg.sql).
 # Without the migrations/ directory in the build context, cargo build

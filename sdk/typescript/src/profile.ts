@@ -19,7 +19,7 @@
  * ```ts
  * import { AiMemoryClient, requireProfile, ProfileNotLoaded } from "ai-memory";
  *
- * const client = new AiMemoryClient({ baseUrl: "http://localhost:9077" });
+ * const client = new AiMemoryClient({ baseUrl: "https://localhost:9077" });
  * try {
  *   await requireProfile(client, "graph");
  * } catch (e) {

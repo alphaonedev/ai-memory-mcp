@@ -78,7 +78,7 @@ const SECRET_DIR_MODE: u32 = 0o700;
 /// issuer host; the fan-out step lands it 0400 on the node.
 ///
 /// Not `#[cfg(unix)]`-gated: it is passed unconditionally to
-/// [`write_with_mode`], which applies the mode on Unix and no-ops on other
+/// [`ai_memory::identity::keypair::write_with_mode`], which applies the mode on Unix and no-ops on other
 /// platforms — so the constant must exist on every target.
 const CRED_FILE_MODE: u32 = 0o600;
 /// A published issuer verifying key is world-readable (it is public).
@@ -372,7 +372,7 @@ fn export_bundle(key_dir: &Path, issuer_id: &str, bundle_dir: &Path) -> Result<P
     if let Some(parent) = dest.parent() {
         ensure_dir(parent)?;
     }
-    write_with_mode(&dest, &keypair.public.to_bytes(), PUB_FILE_MODE)
+    ai_memory::identity::keypair::write_with_mode(&dest, &keypair.public.to_bytes(), PUB_FILE_MODE)
         .with_context(|| format!("write bundle entry {}", dest.display()))?;
     Ok(dest)
 }
@@ -403,7 +403,7 @@ fn issue_credential(
     if let Some(parent) = out.parent() {
         ensure_dir(parent)?;
     }
-    write_with_mode(out, header.as_bytes(), CRED_FILE_MODE)
+    keypair::write_with_mode(out, header.as_bytes(), CRED_FILE_MODE)
         .with_context(|| format!("write credential {}", out.display()))?;
     Ok(())
 }
@@ -445,22 +445,6 @@ fn ensure_secret_dir(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Write `bytes` to `path`, then set its Unix mode (no-op on non-Unix).
-fn write_with_mode(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
-    fs::write(path, bytes).with_context(|| format!("write {}", path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(mode))
-            .with_context(|| format!("chmod {mode:o} {}", path.display()))?;
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = mode;
-    }
-    Ok(())
-}
-
 /// Persist a freshly generated node keypair (test helper analogue of the
 /// node-side `ai-memory identity generate`), returning its public key.
 #[cfg(test)]
@@ -484,7 +468,17 @@ mod tests {
     const NODE_ID: &str = "hive-1461/nyc3/hive-peer-nyc3-01";
 
     fn tmp() -> tempfile::TempDir {
-        tempfile::tempdir().expect("tempdir")
+        let d = tempfile::tempdir().expect("tempdir");
+        // #3783 — 0700 so the #3198 key-dir guard admits it under ANY umask; a
+        // permissive umask (e.g. 000) otherwise yields a 0777 dir the guard
+        // refuses, which is a fixture artefact, not the property under test.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(d.path(), std::fs::Permissions::from_mode(0o700))
+                .expect("chmod 0700 tempdir");
+        }
+        d
     }
 
     #[test]
@@ -549,6 +543,41 @@ mod tests {
         assert_eq!(verified.issuer_id, ISSUER_ID);
         assert_eq!(verified.trust_domain, TRUST_DOMAIN);
         assert_eq!(verified.subject_pubkey, node_pub.to_bytes());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn issued_credential_file_is_0600_from_creation_3783() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let keys = tmp();
+        let nodekeys = tmp();
+        let out = tmp();
+        mint_ca(keys.path(), ISSUER_ID).expect("mint");
+        generate_node_pub(nodekeys.path(), NODE_ID).expect("node key");
+        let subject_pub_file = nodekeys.path().join(format!("{NODE_ID}.pub"));
+        let cred_path = out.path().join("peer-1.cred");
+        issue_credential(
+            keys.path(),
+            ISSUER_ID,
+            TRUST_DOMAIN,
+            DEFAULT_CREDENTIAL_TTL_SECS,
+            NODE_ID,
+            &subject_pub_file,
+            &cred_path,
+        )
+        .expect("issue");
+        // #3783 — the credential is written through the atomic
+        // `keypair::write_with_mode` (create-at-mode + rename), so it lands
+        // 0600 from CREATION with no group/world-readable window. Pin the mode.
+        let mode = fs::metadata(&cred_path)
+            .expect("stat cred")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, CRED_FILE_MODE,
+            "credential must be {CRED_FILE_MODE:o} from creation, got {mode:o}"
+        );
     }
 
     #[test]

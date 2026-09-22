@@ -92,6 +92,7 @@ fn build_router(storage_backend: StorageBackend) -> (axum::Router, NamedTempFile
             ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty(),
         ),
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
+        ..Default::default()
     };
     (ai_memory::build_router(api_keys, state), file)
 }

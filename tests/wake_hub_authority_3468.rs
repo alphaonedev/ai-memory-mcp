@@ -148,57 +148,11 @@ fn expired_cache_and_future_cache_are_refused() {
     }
 }
 
-/// The database segment of a `postgres://…/<db>?…` URL (empty when absent).
-fn database_name(url: &str) -> &str {
-    url.split('/')
-        .next_back()
-        .unwrap_or_default()
-        .split('?')
-        .next()
-        .unwrap_or_default()
-}
-
-/// The port segment of a `postgres://user:pass@host:port/db` URL, if any.
-fn port_of(url: &str) -> Option<u16> {
-    let authority = url.split("//").nth(1)?.split('/').next()?;
-    let host_port = authority.rsplit('@').next()?;
-    host_port.rsplit(':').next()?.parse().ok()
-}
-
-/// The certified tier's port on both nodes; the `:9077` test-fleet daemon's
-/// shared `ai_memory_test` database lives there and nowhere else.
-const SHARED_LIVE_STORE_PORT: u16 = 5445;
-
-/// True only for the shared live store: the `ai_memory_test` database on the
-/// certified tier's port. A same-named database on any other port (the CI
-/// coverage service container on :5432) is a throwaway and may be used.
-fn is_shared_live_store(url: &str) -> bool {
-    database_name(url) == "ai_memory_test" && port_of(url) == Some(SHARED_LIVE_STORE_PORT)
-}
-
-#[test]
-fn shared_live_store_guard_cases() {
-    assert!(is_shared_live_store(
-        "postgres://ai_memory:pw@127.0.0.1:5445/ai_memory_test?sslmode=verify-full"
-    ));
-    assert!(is_shared_live_store(
-        "postgres://ai_memory:pw@localhost:5445/ai_memory_test"
-    ));
-    // CI coverage service container: same name, throwaway port.
-    assert!(!is_shared_live_store(
-        "postgres://ai_memory:ai_memory_test@127.0.0.1:5432/ai_memory_test"
-    ));
-    // Isolated lane / gate databases on the certified tier.
-    assert!(!is_shared_live_store(
-        "postgres://ai_memory:pw@127.0.0.1:5445/ai_memory_gate_tip4?sslmode=verify-full"
-    ));
-    assert!(!is_shared_live_store(
-        "postgres://ai_memory:pw@127.0.0.1:5445/ai_memory_test_ci_123_x"
-    ));
-    assert_eq!(database_name("postgres://u:p@h:5445/db?x=1"), "db");
-    assert_eq!(port_of("postgres://u:p@h:5445/db?x=1"), Some(5445));
-    assert_eq!(port_of("postgres://u:p@h/db"), None);
-}
+// #3777 — the lane-database predicate lives in `tests/common/lane_db.rs`
+// (the ONE guard every guarded pg cell calls); this file no longer carries
+// a private copy of it.
+#[path = "common/lane_db.rs"]
+mod lane_db;
 
 #[cfg(feature = "sal-postgres")]
 #[tokio::test]
@@ -222,15 +176,10 @@ async fn postgres_proven_root_and_revocation_match_sqlite_and_audit_the_decision
     // shared live store is the one on the certified tier's port (:5445);
     // `is_shared_live_store` keys on BOTH the name and that port, with the
     // cases pinned in `shared_live_store_guard_cases` below.
-    assert!(
-        !is_shared_live_store(&url),
-        "refusing to run against the shared live store; point \
-         AI_MEMORY_TEST_POSTGRES_URL at this lane's own isolated database"
-    );
-    assert!(
-        !database_name(&url).is_empty(),
-        "AI_MEMORY_TEST_POSTGRES_URL must name a database"
-    );
+    // #3777 — the ONE lane-database predicate (name + port for the shared
+    // store, the operator database, the `ai_memory_` prefix).
+    lane_db::assert_lane_database(&url);
+    assert!(!lane_db::is_shared_live_store(&url) && !lane_db::database_name(&url).is_empty());
     let store = ai_memory::store::postgres::PostgresStore::connect(&url)
         .await
         .unwrap();

@@ -54,8 +54,9 @@ pub fn handle_reflection_origin(
     // cannot read answers the SAME `memory not found` text an unknown id
     // does, so peer / signing provenance is not an existence oracle over
     // another tenant's private reflections (the #3426 leak-resistant shape).
-    let mem = crate::storage::get(conn, memory_id)
-        .map_err(|e| format!("reflection_origin substrate error: {e}"))?;
+    let mem = crate::storage::get(conn, memory_id).map_err(|e| {
+        crate::mcp::error_text::mcp_foreign_err("reflection_origin substrate error", e)
+    })?;
     let origin = mem
         .filter(|m| crate::visibility::is_readable_on_query(m, caller, Some(m.namespace.as_str())))
         .map(|m| crate::federation::reflection_bookkeeping::reflection_origin_from_memory(&m));

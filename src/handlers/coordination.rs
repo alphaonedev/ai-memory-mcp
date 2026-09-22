@@ -38,7 +38,9 @@ use crate::handlers::AppState;
 
 /// Response field carrying the W-of-N acknowledgement count on a successful
 /// fanout (one spelling, pm-v3.1 literal gate).
-const QUORUM_ACKS_FIELD: &str = "quorum_acks";
+use crate::write_receipt::QUORUM_ACKS_FIELD;
+
+// pm-v3.1 hardcoded-literal ratchet: a string spelled 2+ times in this file is named once.
 
 /// Rejection detail for a non-terminal `state` on the checkpoint-resolve route
 /// (one spelling, pm-v3.1 literal gate). Mirrors the MCP handler's wording.
@@ -335,9 +337,15 @@ pub async fn send_signal(
     if let Some(kp) = app.active_keypair.as_ref().as_ref() {
         if kp.can_sign() {
             if let Err(e) = crate::signals::sign_into(&mut signal, kp) {
+                // #3707 — `sign_signal` returns `anyhow::Result`: today its only
+                // sources are "no private key" and a CBOR encode error, but an
+                // anyhow chain is an OPEN BAG and any future `?` reaches this
+                // body with no compiler involvement. Bounded by inspection is
+                // not bounded. Log the chain, return the constant.
+                tracing::error!(error = %e, "sign signal failed");
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": format!("sign signal failed: {e}")})),
+                    Json(json!({"error": "sign signal failed"})),
                 )
                     .into_response();
             }
@@ -403,12 +411,25 @@ pub async fn send_signal(
                     .signal_send(&ctx, &signal, None)
                     .await
                     .map(|_| ())
-                    .map_err(|e| signal_insert_error(&e.to_string()))
+                    // #3707 — a `StoreError` carries sqlx server text (query
+                    // fragments, `Key (…)=(…)` tenant content, host, paths).
+                    // Route it through the ONE typed funnel every other handler
+                    // uses; the route-specific prefix belongs on the log line,
+                    // not in the caller's body.
+                    .map_err(|e| {
+                        tracing::error!(error = %e, "signal insert failed (pg)");
+                        crate::handlers::postgres_gate::store_err_to_response(e)
+                    })
             } else {
                 let lock = app.db.lock().await;
                 crate::signals::insert(&lock.0, &signal)
                     .map(|_| ())
-                    .map_err(|e| signal_insert_error(&e.to_string()))
+                    // #3707 — rusqlite text names tables and columns. Log it,
+                    // return the opaque shared 500.
+                    .map_err(|e| {
+                        tracing::error!(error = %e, "signal insert failed (sqlite)");
+                        signal_insert_error()
+                    })
             }
         }
         #[cfg(not(feature = "sal"))]
@@ -416,7 +437,11 @@ pub async fn send_signal(
             let lock = app.db.lock().await;
             crate::signals::insert(&lock.0, &signal)
                 .map(|_| ())
-                .map_err(|e| signal_insert_error(&e.to_string()))
+                // #3707 — rusqlite text names tables and columns.
+                .map_err(|e| {
+                    tracing::error!(error = %e, "signal insert failed (sqlite)");
+                    signal_insert_error()
+                })
         }
     };
     if let Err(resp) = insert_res {
@@ -454,10 +479,16 @@ pub async fn send_signal(
 }
 
 /// Shared `500` response for a failed signal insert (one spelling, literal gate).
-fn signal_insert_error(detail: &str) -> Response {
+///
+/// #3707 — this used to take a `detail: &str` that every caller filled with
+/// `e.to_string()`, so driver text crossed to the HTTP caller. The parameter is
+/// GONE rather than sanitised: a helper that cannot be handed foreign text
+/// cannot leak it, which is a structural guarantee where screening is a habit.
+/// The detail lives on the caller's `tracing::error!`.
+fn signal_insert_error() -> Response {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
-        Json(json!({"error": format!("signal insert failed: {detail}")})),
+        Json(json!({"error": "signal insert failed"})),
     )
         .into_response()
 }
@@ -515,9 +546,15 @@ async fn local_transition_via_db(
     let lease = match crate::actions::lease_get(&lock.0, action_id) {
         Ok(l) => l,
         Err(e) => {
+            // #3707 F1 (reviewer-f2r) — a rusqlite Display (SQL text, table and
+            // column names, `database is locked`) went straight into the 500
+            // body. The two calls BELOW this one in the same fn were converted
+            // by the first #3707 pass; this arm was walked past. Detail to the
+            // operator log, constant to the caller -- the same three-line shape.
+            tracing::error!(error = %e, action_id, "lease_get failed");
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("lease_get failed: {e}")})),
+                Json(json!({"error": "lease_get failed"})),
             )
                 .into_response());
         }
@@ -533,9 +570,13 @@ async fn local_transition_via_db(
             return Err(action_not_found(action_id));
         }
         Err(e) => {
+            // #3707 — the driver text stays with the OPERATOR. Dropping it from
+            // the body without logging it would trade a leak for an
+            // undiagnosable 500, which is the #3708 mistake one plane over.
+            tracing::error!(error = %e, action_id, "action_get failed");
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("action_get failed: {e}")})),
+                Json(json!({"error": crate::handlers::errors::ACTION_GET_FAILED})),
             )
                 .into_response());
         }
@@ -544,21 +585,15 @@ async fn local_transition_via_db(
     // Wave-2 B5 — local action CAS is a record-plane mutation. Reads
     // (the `get` above) stay live; the write is fenced (ERRORS-09).
     if let Err(e) = crate::storage::record_stop::gate_storage_conn(&lock.0) {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({
-                "code": crate::errors::error_codes::RECORD_STOPPED,
-                "error": e.to_string(),
-            })),
-        )
-            .into_response());
+        return Err(crate::handlers::errors::record_stopped_response(&e));
     }
     let outcome =
         crate::actions::transition_cas(&lock.0, action_id, from_state, to, claimed_by, now)
             .map_err(|e| {
+                tracing::error!(error = %e, action_id, "action_transition failed");
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": format!("action_transition failed: {e}")})),
+                    Json(json!({"error": crate::handlers::errors::ACTION_TRANSITION_FAILED})),
                 )
                     .into_response()
             })?;
@@ -595,9 +630,13 @@ async fn local_transition_via_store(
             return Err(action_not_found(action_id));
         }
         Err(e) => {
+            // #3707 — the driver text stays with the OPERATOR. Dropping it from
+            // the body without logging it would trade a leak for an
+            // undiagnosable 500, which is the #3708 mistake one plane over.
+            tracing::error!(error = %e, action_id, "action_get failed");
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("action_get failed: {e}")})),
+                Json(json!({"error": crate::handlers::errors::ACTION_GET_FAILED})),
             )
                 .into_response());
         }
@@ -608,9 +647,10 @@ async fn local_transition_via_store(
         .action_transition_cas(&ctx, action_id, from_state, to, claimed_by, now)
         .await
         .map_err(|e| {
+            tracing::error!(error = %e, action_id, "action_transition failed");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("action_transition failed: {e}")})),
+                Json(json!({"error": crate::handlers::errors::ACTION_TRANSITION_FAILED})),
             )
                 .into_response()
         })?;
@@ -757,7 +797,10 @@ pub async fn resolve_checkpoint(
                         app.active_keypair.as_ref().as_ref(),
                     )
                     .await
-                    .map_err(|e| checkpoint_resolve_error(&e.to_string()))
+                    .map_err(|e| {
+                        tracing::error!(error = %e, "{}", super::errors::CHECKPOINT_RESOLVE_FAILED);
+                        checkpoint_resolve_error()
+                    })
             } else {
                 local_resolve_via_db(&app, &checkpoint_id, state, &node_agent_id, &body, now).await
             }
@@ -853,14 +896,21 @@ async fn local_resolve_via_db(
         now,
         app.active_keypair.as_ref().as_ref(),
     )
-    .map_err(|e| checkpoint_resolve_error(&e.to_string()))
+    .map_err(|e| {
+        tracing::error!(error = %e, "{}", super::errors::CHECKPOINT_RESOLVE_FAILED);
+        checkpoint_resolve_error()
+    })
 }
 
 /// Shared `500` for a failed checkpoint resolve (one spelling, literal gate).
-fn checkpoint_resolve_error(detail: &str) -> Response {
+///
+/// #3707 — the `detail: &str` parameter is GONE. Every caller filled it with
+/// `e.to_string()` over a `StoreError` / rusqlite error, so driver text reached
+/// the HTTP caller. A helper that cannot be handed foreign text cannot leak it.
+fn checkpoint_resolve_error() -> Response {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
-        Json(json!({"error": format!("checkpoint resolve failed: {detail}")})),
+        Json(json!({"error": super::errors::CHECKPOINT_RESOLVE_FAILED})),
     )
         .into_response()
 }

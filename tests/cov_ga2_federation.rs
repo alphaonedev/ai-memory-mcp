@@ -157,6 +157,7 @@ fn sqlite_router() -> (axum::Router, tempfile::NamedTempFile) {
             ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty(),
         ),
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
+        ..Default::default()
     };
     (ai_memory::build_router(api_key_state, app_state), db_tmp)
 }
@@ -1207,7 +1208,7 @@ fn unreachable_peer() -> ai_memory::federation::PeerEndpoint {
     ai_memory::federation::PeerEndpoint {
         id: "peer-ga2-dead".to_string(),
         // 127.0.0.1:1 is reserved + unbound → connection refused fast.
-        sync_push_url: "http://127.0.0.1:1/api/v1/sync/push".to_string(),
+        sync_push_url: "https://127.0.0.1:1/api/v1/sync/push".to_string(),
     }
 }
 
@@ -1344,6 +1345,7 @@ async fn pg_router(url: &str) -> axum::Router {
             ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty(),
         ),
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
+        ..Default::default()
     };
     ai_memory::build_router(api_key_state, app_state)
 }

@@ -18,6 +18,11 @@
 //! No process env is mutated in this binary: identity is passed to the CHILD
 //! process environment only.
 
+// #3733 — key dirs created 0700 (not the ambient umask; the #3198 guard
+// refuses a group-writable key dir at umask 0002).
+#[path = "common/key_dir_sandbox.rs"]
+mod key_dir_sandbox;
+
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -92,6 +97,7 @@ fn router(api_key: Option<&str>, admins: Vec<String>) -> axum::Router {
         mtls_enforced: false,
         enrolled_agent_keys: enrolled,
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
+        ..Default::default()
     };
     ai_memory::build_router(api_key_state, app_state)
 }
@@ -283,7 +289,7 @@ fn spawn_mcp(agent_id: Option<&str>) -> (McpChild, ChildStdin, mpsc::Receiver<St
     let dir = scratch_dir();
     let db = dir.join(format!("mcp-{}.db", uuid::Uuid::new_v4()));
     let key_dir = dir.join(format!("keys-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&key_dir).expect("key dir");
+    key_dir_sandbox::mkdir_0700(&key_dir);
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_ai-memory"));
     cmd.env("AI_MEMORY_NO_CONFIG", "1")
         .env("AI_MEMORY_KEY_DIR", &key_dir)

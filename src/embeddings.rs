@@ -387,10 +387,6 @@ const MAX_SEQ_LEN: usize = 256;
 /// budget we abandon it and fall back to the offline/keyword path
 /// (`load_from_fallback`), matching the existing degraded-load contract.
 const HF_DOWNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
-/// Fallback subdirectory under $HOME for pre-downloaded `MiniLM` model files
-const FALLBACK_MODEL_SUBDIR: &str =
-    ".cache/huggingface/hub/models--sentence-transformers--all-MiniLM-L6-v2/snapshots/main";
-
 /// Nomic model ID and Ollama tag
 pub(crate) const NOMIC_OLLAMA_MODEL: &str = "nomic-embed-text";
 /// #1598 — case-insensitive substring identifying the nomic-embed
@@ -1142,6 +1138,26 @@ impl Embedder {
             // Keyword tier — embeddings disabled by the tier preset.
             return Ok(None);
         };
+        // #3627 — fail closed on a RETIRED or unknown embed selector.
+        // `is_api_embed_backend` classifies EVERYTHING that is not
+        // `ollama` as an API backend, and the URL ladder in
+        // `resolve_embeddings` ends at the loopback Ollama default, so an
+        // unrecognised selector would otherwise build an
+        // OpenAI-compatible embedder pointed at the wrong endpoint and
+        // return vectors from a model the operator never chose. Wrong
+        // vectors are wrong RANKING, i.e. wrong results — refuse instead
+        // (the #1593 degrade-loudly posture applied at construction).
+        // The accepted vocabulary is the documented one (`ollama`, the
+        // #1067 vendor aliases, or `openai-compatible` for self-hosted
+        // TEI / vLLM / llama.cpp), rendered once by
+        // `crate::config::RECOGNIZED_LLM_BACKENDS`.
+        if !crate::config::is_recognized_llm_backend(&resolved.backend) {
+            return Err(
+                crate::config::unrecognized_llm_backend_error(&resolved.backend)
+                    .context("refusing to build an embedder for an unrecognized backend (#3627)"),
+            );
+        }
+
         if crate::config::is_api_embed_backend(&resolved.backend) {
             let Some(dim) = resolved.embedding_dim else {
                 // v1.0.0 #2626 — this is also where an UNUSABLE
@@ -1439,8 +1455,13 @@ impl Embedder {
             ),
             Ok(v) => (Some(v), EmbedStatus::Indexed),
             Err(e) => {
-                let reason = format!("{e:#}");
-                tracing::warn!(target: "embeddings.degrade", reason = %reason, "embed_with_status: embedder failed");
+                // #3648: arbitrary local/remote error chains are not caller-safe.
+                // Downcast only the bounded provider diagnostic; discard all contexts.
+                let reason = e
+                    .downcast_ref::<crate::llm::ProviderError>()
+                    .map_or_else(|| "embedding_failed".to_string(), ToString::to_string);
+                // Provider errors are sanitized upstream; preserve local causes for operators.
+                tracing::warn!(target: "embeddings.degrade", reason = %format_args!("{e:#}"), "embed_with_status: embedder failed");
                 (None, EmbedStatus::Failed(reason))
             }
         }
@@ -1825,7 +1846,9 @@ impl Embedder {
     /// a pre-staged cache. Honors the de-facto-standard `HF_HUB_OFFLINE` plus
     /// the dedicated `AI_MEMORY_EMBED_OFFLINE` knob. Used by hermetic CI (the
     /// integration suite sets it to dodge the #1501 cold-download race) and by
-    /// air-gapped operators who pre-stage the weights in `FALLBACK_MODEL_SUBDIR`.
+    /// air-gapped operators who pre-stage the weights in the standard HuggingFace
+    /// cache (`HF_HOME`/hub, else `$HOME/.cache/huggingface/hub`; see
+    /// [`Self::staged_model_snapshot_dir`]).
     ///
     /// `pub(crate)` (#2086) — the reranker's cross-encoder loader
     /// (`crate::reranker::CrossEncoder::resolve_cross_encoder_files`) shares
@@ -1841,22 +1864,63 @@ impl Embedder {
         truthy("AI_MEMORY_EMBED_OFFLINE") || truthy("HF_HUB_OFFLINE")
     }
 
-    fn load_from_fallback() -> Result<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf)>
-    {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-        let dir = std::path::PathBuf::from(home).join(FALLBACK_MODEL_SUBDIR);
-        let dir = dir.as_path();
-        let config = dir.join(HF_CONFIG_FILE);
-        let tokenizer = dir.join(HF_TOKENIZER_FILE);
-        let weights = dir.join(HF_WEIGHTS_FILE);
+    /// Resolve the pre-staged MiniLM model files from the offline HuggingFace
+    /// cache (see [`Self::staged_model_snapshot_dir`]). Public so the hermetic
+    /// `tests/hf_cache_staged_3788.rs` own-binary test can drive the #3788
+    /// resolver order without mutating `$HOME`/`HF_HOME` in the shared lib
+    /// test binary (check-test-env-lock arm (d)).
+    ///
+    /// # Errors
+    /// Returns an error when the model files are not present under the
+    /// resolved snapshot directory (the offline fallback miss).
+    pub fn load_from_fallback()
+    -> Result<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf)> {
+        let snapshot_dir = Self::staged_model_snapshot_dir();
+        let config = snapshot_dir.join(HF_CONFIG_FILE);
+        let tokenizer = snapshot_dir.join(HF_TOKENIZER_FILE);
+        let weights = snapshot_dir.join(HF_WEIGHTS_FILE);
         if config.exists() && tokenizer.exists() && weights.exists() {
             Ok((config, tokenizer, weights))
         } else {
             anyhow::bail!(
-                "model files not found in fallback dir: {}. Download them manually from https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2",
-                dir.display()
+                "model files not found in the pre-staged HuggingFace cache: {} \
+                 (resolved refs/main -> snapshots/<commit>, else snapshots/main). Download them \
+                 from https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2",
+                snapshot_dir.display()
             )
         }
+    }
+
+    /// #3788 — resolve the pre-staged MiniLM model directory the way
+    /// `hf-hub 0.5.0`'s `Cache` does, so the OFFLINE loader honours a forwarded
+    /// `HF_HOME` (the #2019 coverage cache) rather than only `$HOME`. hf-hub 0.5.0
+    /// reads ONLY `HF_HOME` (never `HF_HUB_CACHE`), so no new knob is introduced;
+    /// when `HF_HOME` is unset the hub root is `$HOME/.cache/huggingface/hub` — the
+    /// SAME base as before, so behaviour is unchanged for an HF_HOME-less operator.
+    /// The snapshot dir is read from `refs/main` -> the commit dir under `snapshots/`
+    /// (the hf-hub cache-first layout), falling back to the pre-#3788 `snapshots/main`
+    /// layout so a legacy air-gapped stage is byte-for-byte unchanged.
+    fn staged_model_snapshot_dir() -> std::path::PathBuf {
+        let hub_root = match std::env::var("HF_HOME") {
+            Ok(hf_home) if !hf_home.trim().is_empty() => {
+                std::path::PathBuf::from(hf_home).join("hub")
+            }
+            _ => {
+                let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+                std::path::PathBuf::from(home)
+                    .join(".cache")
+                    .join(crate::config::HF_CACHE_DIR_NAME)
+                    .join("hub")
+            }
+        };
+        let repo = hub_root.join(format!("models--{}", MINILM_MODEL_ID.replace('/', "--")));
+        // hf-hub: `refs/main` -> commit hash -> `snapshots/<commit>`.
+        let commit_snapshot = std::fs::read_to_string(repo.join("refs").join("main"))
+            .ok()
+            .map(|commit| repo.join("snapshots").join(commit.trim()))
+            .filter(|p| p.is_dir());
+        // Legacy pre-#3788 layout (also the HF_HOME-unset no-behaviour-change path).
+        commit_snapshot.unwrap_or_else(|| repo.join("snapshots").join("main"))
     }
 }
 

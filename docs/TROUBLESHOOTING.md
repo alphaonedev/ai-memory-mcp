@@ -262,10 +262,10 @@ prints `applied` for a reversal that did not land.
 in `config.toml` — there is no `--api-key` serve flag). Pass the key:
 
 ```bash
-curl -H "X-API-Key: YOUR_KEY" http://127.0.0.1:9077/api/v1/stats
+curl -H "X-API-Key: YOUR_KEY" https://127.0.0.1:9077/api/v1/stats
 # or (DEPRECATED #1574 — URL keys leak into access/proxy logs;
 # accepted with a WARN at v0.7.0, slated for v0.8 rejection)
-curl 'http://127.0.0.1:9077/api/v1/stats?api_key=YOUR_KEY'
+curl 'https://127.0.0.1:9077/api/v1/stats?api_key=YOUR_KEY'
 ```
 
 `/api/v1/health` is always exempt — use it as a reachability probe.

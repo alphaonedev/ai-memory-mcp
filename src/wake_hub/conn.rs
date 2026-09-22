@@ -383,6 +383,15 @@ impl Conn {
             .router
             .register(&agent, self.session, self.handle.clone())
         {
+            // #3640 — the topic index is keyed by agent id, not session, and
+            // the displaced session's own `unsubscribe_all` cleanup is skipped
+            // (its `unregister` no longer matches this route). Reset the index
+            // to exactly THIS session's revalidated `subscribed` so a topic the
+            // displaced session added at runtime cannot leak in and escape the
+            // #3505 revalidation.
+            self.state
+                .router
+                .reset_subscriptions(&agent, &self.subscribed);
             // A second hello for the same agent id wins; the older session is
             // told why and closed rather than left silently blackholed.
             if let Ok(b) = Frame::new(
@@ -791,11 +800,11 @@ impl Conn {
             .as_ref()
             .map_or_else(String::new, |a| a.agent_id.clone());
         let queued = self.send(Kind::Error, to, encode_error(code, reason));
-        queued
-            && !matches!(
-                code,
-                ErrorCode::Unauthorized | ErrorCode::Malformed | ErrorCode::TooLarge
-            )
+        // Rule s — the ONE predicate (`ErrorCode::is_session_fatal`) the wake
+        // plane classifies by. The connection is kept open for a per-message
+        // refusal and closed for a session-fatal code; every client mirrors
+        // this exact split (pinned over every variant in `tests`).
+        queued && !code.is_session_fatal()
     }
 }
 

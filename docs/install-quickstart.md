@@ -159,7 +159,7 @@ might want to set once and forget:
 |---|---|---|
 | Database path | `export AI_MEMORY_DB=/path/to/db` | Move the SQLite file anywhere on disk. |
 | Default agent ID | `export AI_MEMORY_AGENT_ID=alice` | Stamps every memory `alice` wrote with that ID (instead of the `host:<hostname>` fallback (still exposes the hostname)). Recommended on shared machines. |
-| LLM backend | **Recommended:** `[llm]` section in `~/.config/ai-memory/config.toml` (see below). **Override:** `export AI_MEMORY_LLM_BACKEND=xai` etc. | Picks which LLM the `smart` and `autonomous` tiers talk to. Aliases for `ollama`, `openai`, `xai`, `anthropic`, `gemini`, `deepseek`, `kimi`, `qwen`, `mistral`, `groq`, `together`, `cerebras`, `openrouter`, `fireworks`, `lmstudio` are recognized. Pair with `api_key_env = "<NAME>"` (config-file path) or `AI_MEMORY_LLM_API_KEY=…` / per-vendor env (override path) for hosted providers; `ollama` and `lmstudio` need no key. See [`CONFIG_SCHEMA.md`](CONFIG_SCHEMA.html) for the canonical `[llm]` schema, [`integrations/llm-backends.md`](integrations/llm-backends.html) for per-backend MCP env-block recipes, and [#1144](https://github.com/alphaonedev/ai-memory-mcp/issues/1144) → [#1146](https://github.com/alphaonedev/ai-memory-mcp/issues/1146) for the operator paper-cut history + retirement. |
+| LLM backend | **Recommended:** `[llm]` section in `~/.config/ai-memory/config.toml` (see below). **Override:** `export AI_MEMORY_LLM_BACKEND=xai` etc. | Picks which LLM the `smart` and `autonomous` tiers talk to. Aliases for `ollama`, `openai`, `xai`, `anthropic`, `gemini`, `kimi`, `qwen`, `mistral`, `groq`, `together`, `cerebras`, `openrouter`, `fireworks`, `lmstudio` are recognized. Pair with `api_key_env = "<NAME>"` (config-file path) or `AI_MEMORY_LLM_API_KEY=…` / per-vendor env (override path) for hosted providers; `ollama` and `lmstudio` need no key. See [`CONFIG_SCHEMA.md`](CONFIG_SCHEMA.html) for the canonical `[llm]` schema, [`integrations/llm-backends.md`](integrations/llm-backends.html) for per-backend MCP env-block recipes, and [#1144](https://github.com/alphaonedev/ai-memory-mcp/issues/1144) → [#1146](https://github.com/alphaonedev/ai-memory-mcp/issues/1146) for the operator paper-cut history + retirement. |
 | Permissions mode | `export AI_MEMORY_PERMISSIONS_MODE=advisory` | Loosens v0.7.0's enforced governance gate to the v0.6.x permissive posture. Default is `enforce` and you should leave it on unless you're debugging. |
 | Encrypted DB | `export AI_MEMORY_ENCRYPT_AT_REST=1` | Requires a sqlcipher build + `--db-passphrase-file`. See [`docs/INSTALL.md`](INSTALL.html) § encrypted-at-rest. |
 
@@ -349,7 +349,7 @@ The Path-B doc set, in reading order:
 7. **[`integrations/llm-backends.md`](integrations/llm-backends.html)** —
    MCP env-block recipes for every supported LLM provider (Ollama /
    LMStudio / vLLM / llama.cpp server / xAI / OpenAI / Anthropic /
-   Gemini / DeepSeek / Kimi / Qwen / Mistral / Groq / Together /
+   Gemini / Kimi / Qwen / Mistral / Groq / Together /
    Cerebras / OpenRouter / Fireworks). Includes a fleet / multi-agent
    / multi-DC considerations section.
 8. **[`batman-active-mode.md`](batman-active-mode.html)** — multi-agent

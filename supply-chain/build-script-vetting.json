@@ -28,19 +28,19 @@
     },
     {
       "name": "aws-lc-rs",
-      "version": "1.16.3",
+      "version": "1.18.1",
       "source": "registry",
-      "checksum": "0ec6fb3fe69024a75fa7e1bfb48aa6cf59706a101658ea01bfd33b2b248a038f",
+      "checksum": "b281d307588d634de920874890732659e2e7672f72b5e10e81badc1a8a83621e",
       "disposition": "inventoried",
-      "first_seen": "2026-08-01"
+      "first_seen": "2026-09-19"
     },
     {
       "name": "aws-lc-sys",
-      "version": "0.40.0",
+      "version": "0.45.0",
       "source": "registry",
-      "checksum": "f50037ee5e1e41e7b8f9d161680a725bd1626cb6f8c7e901f91f942850852fe7",
+      "checksum": "9bff6c3b54fad79a2e60b8102caf565819711497c1f5f092f49508e2f5c31b27",
       "disposition": "inventoried",
-      "first_seen": "2026-08-01"
+      "first_seen": "2026-09-19"
     },
     {
       "name": "blake3",
@@ -363,11 +363,11 @@
     },
     {
       "name": "rustls",
-      "version": "0.23.38",
+      "version": "0.23.45",
       "source": "registry",
-      "checksum": "69f9466fb2c14ea04357e91413efb882e2a6d4a406e625449bc0a5d360d53a21",
+      "checksum": "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634",
       "disposition": "inventoried",
-      "first_seen": "2026-08-01"
+      "first_seen": "2026-09-19"
     },
     {
       "name": "rustversion",

@@ -80,11 +80,13 @@ enum SpawnFailure {
 struct ServeChild {
     child: Option<Child>,
     port: u16,
+    /// #3705 — the leaf the daemon serves; every client trusts exactly it.
+    tls: common::tls::TestTls,
 }
 
 impl ServeChild {
     fn url(&self, path: &str) -> String {
-        format!("http://127.0.0.1:{}{}", self.port, path)
+        format!("{}{}", common::tls::TestTls::base_url(self.port), path)
     }
 }
 
@@ -153,6 +155,10 @@ fn try_spawn_serve_once(
 ) -> Result<ServeChild, SpawnFailure> {
     let port = free_port();
     let port_s = port.to_string();
+    // #3705 — the daemon refuses every plaintext bind; a per-spawn leaf.
+    let tls = common::tls::TestTls::generate(
+        &db.parent().expect("db lives in a tempdir").join("tls-3705"),
+    );
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_ai-memory"));
     cmd.env("AI_MEMORY_NO_CONFIG", "1")
         // #1751 — permissive attestation opt-out; this suite's unsigned
@@ -178,6 +184,7 @@ fn try_spawn_serve_once(
             "--port",
             &port_s,
         ])
+        .args(tls.serve_arg_strs())
         .args(extra_args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -212,11 +219,8 @@ fn try_spawn_serve_once(
         stderr_buf.lock().unwrap().clone()
     };
 
-    let client = reqwest::blocking::Client::builder()
-        .timeout(READINESS_PROBE_TIMEOUT)
-        .build()
-        .unwrap();
-    let url = format!("http://127.0.0.1:{port}/api/v1/health");
+    let client = tls.client_with_timeout(READINESS_PROBE_TIMEOUT);
+    let url = format!("{}/api/v1/health", common::tls::TestTls::base_url(port));
     let deadline = Instant::now() + SPAWN_TIMEOUT;
     while Instant::now() < deadline {
         if let Ok(resp) = client.get(&url).send()
@@ -225,6 +229,7 @@ fn try_spawn_serve_once(
             return Ok(ServeChild {
                 child: Some(child),
                 port,
+                tls,
             });
         }
         // Bail early if the child crashed — don't burn the full timeout.
@@ -245,11 +250,9 @@ fn try_spawn_serve_once(
     })
 }
 
-fn http_client() -> reqwest::blocking::Client {
-    reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .unwrap()
+/// #3705 — a client that verifies the spawned daemon's leaf.
+fn http_client(serve: &ServeChild) -> reqwest::blocking::Client {
+    serve.tls.client_with_timeout(Duration::from_secs(5))
 }
 
 /// Bounded retry window for a test's *first* real HTTP request against a
@@ -320,7 +323,7 @@ fn serve_health_endpoint_returns_200() {
     let tmp = TempDir::new().unwrap();
     let db = tmp.path().join("ai-memory.db");
     let serve = spawn_serve(&db, &[], &[]);
-    let resp = send_first_request(|| http_client().get(serve.url("/api/v1/health")));
+    let resp = send_first_request(|| http_client(&serve).get(serve.url("/api/v1/health")));
     assert!(resp.status().is_success());
     let body: serde_json::Value = resp.json().unwrap();
     assert_eq!(body["status"], "ok");
@@ -332,7 +335,7 @@ fn serve_metrics_endpoint_at_root_path() {
     let tmp = TempDir::new().unwrap();
     let db = tmp.path().join("ai-memory.db");
     let serve = spawn_serve(&db, &[], &[]);
-    let resp = send_first_request(|| http_client().get(serve.url("/metrics")));
+    let resp = send_first_request(|| http_client(&serve).get(serve.url("/metrics")));
     assert!(resp.status().is_success());
     let ct = resp
         .headers()
@@ -357,7 +360,7 @@ fn serve_metrics_endpoint_at_v1_path() {
     let tmp = TempDir::new().unwrap();
     let db = tmp.path().join("ai-memory.db");
     let serve = spawn_serve(&db, &[], &[]);
-    let resp = send_first_request(|| http_client().get(serve.url("/api/v1/metrics")));
+    let resp = send_first_request(|| http_client(&serve).get(serve.url("/api/v1/metrics")));
     assert!(resp.status().is_success());
     let body = resp.text().unwrap();
     assert!(body.contains("# HELP") || body.contains("# TYPE"));
@@ -376,7 +379,7 @@ fn serve_create_then_get_memory() {
     let tmp = TempDir::new().unwrap();
     let db = tmp.path().join("ai-memory.db");
     let serve = spawn_serve(&db, &[], &[]);
-    let client = http_client();
+    let client = http_client(&serve);
 
     // POST /api/v1/memories
     let create_body = serde_json::json!({
@@ -438,7 +441,10 @@ fn serve_api_key_required_when_configured() {
     // `wait_for_health` cannot tell our child from the leftover — retry
     // the whole spawn on a fresh port when /stats is not 401. Same
     // attempt budget as `spawn_serve`'s bind-race loop.
-    let client = http_client();
+    // #3705 — the daemon refuses every plaintext bind; one leaf for the
+    // retry loop, trusted by the probe client.
+    let tls = common::tls::TestTls::generate(&tmp.path().join("tls-3705"));
+    let client = tls.client_with_timeout(Duration::from_secs(5));
     let mut last_err = String::new();
     for attempt in 1..=SPAWN_BIND_RETRY_ATTEMPTS {
         let port = free_port();
@@ -465,6 +471,7 @@ fn serve_api_key_required_when_configured() {
                 "--port",
                 &port_s,
             ])
+            .args(tls.serve_arg_strs())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -484,11 +491,12 @@ fn serve_api_key_required_when_configured() {
             });
         }
 
-        let url = format!("http://127.0.0.1:{port}");
+        let url = common::tls::TestTls::base_url(port);
         let ready = wait_for_health(&client, &url, SPAWN_TIMEOUT);
         let guard = ServeChild {
             child: Some(child),
             port,
+            tls: tls.clone(),
         };
         if !ready {
             last_err = format!(
