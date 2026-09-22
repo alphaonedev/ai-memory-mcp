@@ -600,15 +600,18 @@ would land `claimed`) is **stored** with the system-only lifecycle state
 - **Operator dequarantine (manual).** The `dequarantine` storage/SAL
   primitive raw-clears `quarantined → open` (idempotent; a no-op on any
   non-quarantined row).
-- **Federation LWW overwrite (incidental, #3750).** Inbound merges resolve
-  `lifecycle_state` by LWW (`crate::models::crdt_merge`), so a peer that pushes
-  a newer `updated_at` for the same `id` — carrying a NON-quarantined state —
-  wins the tiebreak and overwrites the local `quarantined` value, clearing the
-  quarantine with no attest and no operator action. This is an incidental
-  consequence of the replication merge, NOT a control: it is not gated, and
-  the catch-up lane's preserved-metadata set does not carry the contamination
-  anchor, so it is not reversible. (The merge itself is deferred to v1.1 per
-  #3750; described here so the route-out list is complete.)
+- **Federation LWW overwrite (incidental, #3750).** A peer that pushes a newer
+  `updated_at` for the same `id`, carrying a NON-quarantined state, wins the
+  replication tiebreak and overwrites the local `quarantined` lifecycle value —
+  clearing the quarantine with no attest and no operator action. It is not a
+  control (ungated). **What survives the overwrite DIFFERS BY BACKEND (#3905):**
+  on SQLite the write takes `insert_if_newer`, whose 5-key metadata rebuild
+  DESTROYS the contamination record, so the `prior_lifecycle_state` reversibility
+  anchor is gone; on PostgreSQL `merge_inbound` reads the row raw and
+  field-merges via `merge_memory`, whose deep metadata merge PRESERVES the
+  contamination record. (The merge is deferred to v1.1 per #3750; the
+  preserve-vs-destroy asymmetry is filed as #3905. Described here so the
+  route-out list is complete.)
 
 > **Honest caveat.** A quarantined row **does not relay onward** from this
 > node — it is a local black-hole until it is dequarantined. Quarantine

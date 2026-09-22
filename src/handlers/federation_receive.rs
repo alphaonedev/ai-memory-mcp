@@ -2987,14 +2987,22 @@ async fn sync_push_write(
             Ok(actual_id) => {
                 applied += 1;
                 // v1.0.0 R19/A3 (#1948) — route-OUT dequarantine-on-attest.
-                // #3750 — `merge_inbound` does NOT preserve an existing row's
-                // lifecycle_state: `merge_memory` resolves it by LWW
-                // (`crate::models::crdt_merge`), so the local quarantine
-                // survives ONLY when the local row wins the tiebreak; when the
-                // inbound row wins, its state is adopted. So when the author's
-                // write NOW verifies (agent_attested) we clear any prior
-                // quarantine EXPLICITLY via a raw UPDATE, regardless of how the
-                // merge resolved (no-op on a non-quarantined row).
+                // #3750 — on THIS (sqlite) funnel `merge_inbound` does NOT
+                // field-merge a quarantined row's lifecycle_state via crdt_merge.
+                // Its same-id branch opens with `db::get`, which returns
+                // `lifecycle_state.is_recall_visible().then_some(row)` (#2402), so
+                // a quarantined / contaminated row reads back None and the branch
+                // is UNREACHABLE for it. The write falls through to
+                // `insert_if_newer`, whose SQL `CASE WHEN excluded.updated_at >
+                // memories.updated_at` arm resolves lifecycle by LWW and whose
+                // metadata REBUILD keeps only {agent_id, derived_from,
+                // consolidated_from_agents, agent_pubkey, pubkey_bound_at} — the
+                // contamination record is NOT among them, so it is DESTROYED
+                // (postgres PRESERVES it: the #3905 cross-backend parity gap).
+                // crdt_merge/LWW is the mechanism only for RECALL-VISIBLE states,
+                // which `db::get` returns. So we clear any prior quarantine
+                // EXPLICITLY via a raw UPDATE, independent of the merge (no-op on
+                // a non-quarantined row).
                 if row_is_agent_attested(&to_insert) {
                     let _ = db::dequarantine(&lock.0, &actual_id);
                 }
