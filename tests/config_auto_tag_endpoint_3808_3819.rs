@@ -82,7 +82,15 @@ fn ignored_endpoint_keys_empty_for_model_only_3808() {
 fn config_load_warns_on_dead_auto_tag_endpoint_key_3808() {
     fn stderr_of(section_body: &str) -> String {
         let dir = tempfile::tempdir().expect("tempdir");
-        let cfgdir = dir.path().join("ai-memory");
+        // Portable config redirect (#3808 CI fix). Linux resolves
+        // `$XDG_CONFIG_HOME/ai-memory/config.toml`; macOS makes
+        // `$HOME/.config/ai-memory/config.toml` PRIMARY and does NOT consult
+        // XDG at all (`resolve_config_path_choice`, the #3329 sibling). Setting
+        // HOME=<dir> AND XDG_CONFIG_HOME=<dir>/.config makes both platforms read
+        // the SAME file. Without HOME, the macOS runner read its own real
+        // ~/.config/ai-memory/config.toml. Shape copied from
+        // `tests/archive_on_gc_config_3385.rs`.
+        let cfgdir = dir.path().join(".config").join("ai-memory");
         std::fs::create_dir_all(&cfgdir).expect("mkdir");
         std::fs::write(
             cfgdir.join("config.toml"),
@@ -96,7 +104,8 @@ fn config_load_warns_on_dead_auto_tag_endpoint_key_3808() {
         // #3808 WARN. Exit code is irrelevant; we assert on stderr.
         let out = assert_cmd::Command::cargo_bin("ai-memory")
             .expect("bin")
-            .env("XDG_CONFIG_HOME", dir.path())
+            .env("HOME", dir.path())
+            .env("XDG_CONFIG_HOME", dir.path().join(".config"))
             .env_remove("AI_MEMORY_NO_CONFIG")
             .args(["--db", db.to_str().unwrap(), "doctor", "--json"])
             .output()
@@ -164,7 +173,10 @@ fn effective_auto_tag_model_precedence_and_absence_3819() {
 #[test]
 fn config_migrate_preserves_the_auto_tag_model_override_3819() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let cfgdir = dir.path().join("ai-memory");
+    // Portable config redirect — see the note in `stderr_of` above. `config
+    // migrate` WRITES, so a Linux-only redirect does not merely fail on macOS:
+    // it resolves the RUNNER's real config and rewrites that instead.
+    let cfgdir = dir.path().join(".config").join("ai-memory");
     std::fs::create_dir_all(&cfgdir).expect("mkdir");
     let cfg_path = cfgdir.join("config.toml");
     // Legacy v1: llm_model triggers the [llm] block; auto_tag_model is the
@@ -177,7 +189,8 @@ fn config_migrate_preserves_the_auto_tag_model_override_3819() {
     let db = dir.path().join("m.db");
     let assert = assert_cmd::Command::cargo_bin("ai-memory")
         .expect("bin")
-        .env("XDG_CONFIG_HOME", dir.path())
+        .env("HOME", dir.path())
+        .env("XDG_CONFIG_HOME", dir.path().join(".config"))
         .env_remove("AI_MEMORY_NO_CONFIG")
         .args(["--db", db.to_str().unwrap(), "config", "migrate"])
         .assert()
@@ -186,6 +199,21 @@ fn config_migrate_preserves_the_auto_tag_model_override_3819() {
 
     // The rewritten config is v2 with [llm.auto_tag].model; it must still
     // resolve the override (pre-#3819 it landed in a dead key -> None).
+    // NON-VACUITY (#3843/#3825 shape): `effective_auto_tag_model` falls back to
+    // the LEGACY FLAT `auto_tag_model`, so it returns "custom-x" even if migrate
+    // never touched this file at all — the assertion below cannot, on its own,
+    // distinguish "migrate worked" from "migrate ran somewhere else". Pin the
+    // rewrite itself first: the file must now BE v2 sectioned, with the flat
+    // key consumed.
+    let migrated_text = std::fs::read_to_string(&cfg_path).expect("read migrated config");
+    assert!(
+        migrated_text.contains("[llm.auto_tag]"),
+        "#3819: migrate must rewrite this file to v2 sectioned form; got:\n{migrated_text}"
+    );
+    assert!(
+        !migrated_text.contains("\nauto_tag_model"),
+        "#3819: the legacy flat auto_tag_model must be consumed by the migration; got:\n{migrated_text}"
+    );
     ai_memory::config::suppress_config_boot_warnings();
     let migrated = AppConfig::load_from(&cfg_path);
     assert_eq!(
