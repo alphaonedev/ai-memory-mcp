@@ -536,8 +536,9 @@ pub const EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT: usize = 88;
 /// bounded `<=60 s` backstop poll), bumping 93 → 94; v1.0.0 #3587 U4
 /// added `CaptureTurn` for the `ai-memory capture-turn` CLI twin of the
 /// `memory_capture_turn` MCP tool + the Claude Code `Stop` hook sink,
-/// bumping 95 → 96.)
-pub const EXPECTED_CLI_SUBCOMMANDS_DEFAULT: usize = 96;
+/// bumping 95 → 96; v1.0.0 #3709 item 2 added `Tls` for the `ai-memory tls
+/// init|import|status` listener-material verbs, bumping 96 → 97.)
+pub const EXPECTED_CLI_SUBCOMMANDS_DEFAULT: usize = 97;
 
 /// Variants in `pub enum Command` that COMPILE under `--features sal`
 /// (or `sal-postgres`, which implies sal in `Cargo.toml`). Equals the
@@ -565,8 +566,9 @@ pub const EXPECTED_CLI_SUBCOMMANDS_DEFAULT: usize = 96;
 /// long-lived wake-hub client behind `ai-memory wake-listen`), bumping
 /// 95 → 96; v1.0.0 #3587 U4 added `CaptureTurn` (CLI twin of the
 /// `memory_capture_turn` MCP tool + the Claude Code `Stop` hook sink),
-/// bumping 97 → 98.
-pub const EXPECTED_CLI_SUBCOMMANDS_SAL: usize = 98;
+/// bumping 97 → 98; v1.0.0 #3709 item 2 added `Tls` (the `ai-memory tls
+/// init|import|status` listener-material verbs), bumping 98 → 99.
+pub const EXPECTED_CLI_SUBCOMMANDS_SAL: usize = 99;
 
 // ---------------------------------------------------------------------------
 // ARCH-10 (FX-C4-batch2, 2026-05-26) — minimal FFI self-identification
