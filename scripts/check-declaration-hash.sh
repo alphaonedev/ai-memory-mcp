@@ -32,6 +32,17 @@
 # legal-revision control (bump + dated reason + re-pin) that must PASS.
 set -euo pipefail
 
+# --- #3801 portable in-place edit (BSD + GNU) --------------------------------
+# GNU and BSD/macOS `sed -i` disagree: BSD reads the next token as a mandatory
+# backup suffix, so the GNU `sed -i EXPR FILE` form errors (or eats the script)
+# on macOS. Writing to a sibling temp then mv is byte-identical on both. Same
+# args as `sed -i`: sed_i EXPR FILE. No change to what the gate checks.
+sed_i() {
+    local __expr=$1 __file=$2 __tmp
+    __tmp="${__file}.sedi.$$"
+    sed "$__expr" "$__file" >"$__tmp" && mv "$__tmp" "$__file"
+}
+
 ROOT="${DECLARATION_GATE_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 DECL="${ROOT}/docs/compliance/v1.0.0-DECLARATION.md"
 PIN="${ROOT}/scripts/qc-allowlists/declaration.sha256"
@@ -113,19 +124,19 @@ self_test() {
   local D="$scratch/docs/compliance/v1.0.0-DECLARATION.md" P="$scratch/scripts/qc-allowlists/declaration.sha256"
   repin() { local rev="$1"; printf '%s  %s\n' "$(sha_of "$D")" "$rev" > "$P"; }
   legal_bump() { # bump to revision 2 with a dated reason line, re-pin
-    sed -i 's/^revision: 1$/revision: 2/' "$D"
+    sed_i 's/^revision: 1$/revision: 2/' "$D"
     printf '| 2 | 2026-09-19 | revised after miss (2026-09-19): self-test leg — the hot keyword p95 was missed at 10k on the qualification host |\n' >> "$D"
     repin 2
   }
   leg "clean control" pass
   # D1: an edited target without a re-pin
-  sed -i 's/^| `memory_recall` hot, keyword (depth 1) | SQLite | 40 | 80 | 150 |/| `memory_recall` hot, keyword (depth 1) | SQLite | 40 | 800 | 1500 |/' "$D"
+  sed_i 's/^| `memory_recall` hot, keyword (depth 1) | SQLite | 40 | 80 | 150 |/| `memory_recall` hot, keyword (depth 1) | SQLite | 40 | 800 | 1500 |/' "$D"
   leg "D1 target softened, pin untouched" fail D1
   # D1b: re-pinned (sha moved) but revision not bumped
   repin 1
   leg "D1b re-pinned without a revision bump (pin sha moved, revision still 1)" fail D1b
   # D2: revision bumped + re-pinned but no dated reason line
-  sed -i 's/^revision: 1$/revision: 2/' "$D"; repin 2
+  sed_i 's/^revision: 1$/revision: 2/' "$D"; repin 2
   leg "D2 revision bumped, re-pinned, no dated reason line" fail D2
   # legal revision: reason line present
   printf '| 2 | 2026-09-19 | revised after miss (2026-09-19): self-test leg — the hot keyword p95 was missed at 10k on the qualification host |\n' >> "$D"; repin 2
@@ -135,7 +146,7 @@ self_test() {
   leg "D3 placeholder TBD" fail D3
   cp "$DECL" "$D"; cp "$PIN" "$P"
   # D4: drop an N-id row the standard cites (on top of a legal revision so only D4 can refuse)
-  legal_bump; sed -i '/^| N16 | #3559 |/d' "$D"; repin 2
+  legal_bump; sed_i '/^| N16 | #3559 |/d' "$D"; repin 2
   leg "D4 standard cites N16 but the declaration index lost its row" fail D4
   cp "$DECL" "$D"; cp "$PIN" "$P"
   leg "clean control (restored)" pass
