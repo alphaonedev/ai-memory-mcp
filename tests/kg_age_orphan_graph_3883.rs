@@ -165,8 +165,7 @@ fn quarantined_total() -> u64 {
 async fn age_orphan_graph_quarantines_and_self_heals_3883() {
     let Some(url) = pg_url() else {
         eprintln!(
-            "skipping age_orphan_graph_quarantines_and_self_heals_3883: \
-             AI_MEMORY_TEST_AGE_URL / AI_MEMORY_TEST_POSTGRES_URL not set"
+            "skip: kg_age_orphan_graph_3883 requires AI_MEMORY_TEST_AGE_URL / AI_MEMORY_TEST_POSTGRES_URL (unset)"
         );
         return;
     };
@@ -177,8 +176,7 @@ async fn age_orphan_graph_quarantines_and_self_heals_3883() {
     let store = PostgresStore::connect(&url).await.expect("connect store");
     if store.kg_backend() != KgBackend::Age {
         eprintln!(
-            "skipping age_orphan_graph_quarantines_and_self_heals_3883: \
-             backend is not AGE (no projection to orphan)"
+            "skip: kg_age_orphan_graph_3883 requires the AGE backend (kg_backend resolved to CTE; no projection to orphan)"
         );
         return;
     }
