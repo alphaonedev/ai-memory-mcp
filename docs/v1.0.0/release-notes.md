@@ -743,6 +743,18 @@ or overclaim).
   rollbacks until upgraded (one-release conservatism: old readers never
   mint a FALSE verdict, and the new reader still counts legacy id-less
   lines toward Evidence).
+- **The swarm-cascade MVG does not reach Postgres (#3926).**
+  `memory_swarm_rewind` (#3322) and `Contaminated` lifecycle stamping
+  (#3324) are implemented on the SQLite MCP/CLI path only — there is no
+  Postgres implementation and no HTTP route, and the `swarm-rewind` CLI
+  refuses a Postgres store rather than rewinding a local sidecar
+  (#3924). Even on SQLite, stamping fires only on an MCP `supersedes`
+  link between two reflections, not on `kg_invalidate`. On Postgres the
+  #3323 per-lineage token/cost counters are written but no surface reads
+  the rollup yet. An enterprise Postgres fleet can therefore hide rows
+  that already carry `contaminated` but cannot create that state, rewind
+  a cascade, or report its cost at v1.0.0. PG parity, together with the
+  cascade sensor and corroboration gate, is v1.1 scope (#3266).
 - **Claimed-vs-attested identity and diversity.** `metadata.agent_id`
   and the reflection-decorrelation probe's model-family signal are
   CLAIMED (self-asserted by the caller) unless independently attested
