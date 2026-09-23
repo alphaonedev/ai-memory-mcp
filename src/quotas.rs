@@ -1285,6 +1285,14 @@ mod tests {
 
     fn fresh_db() -> Connection {
         let conn = Connection::open_in_memory().expect("open in-memory");
+        // #3877 — the record-stop write gate is fail-CLOSED: every gated write
+        // reads `signed_events` via `read_state_sqlite`, so a bare fixture must
+        // ship that table or the gate refuses with RecordStopIndeterminate.
+        // Self-sufficient under a filtered run (no reliance on cross-test cache).
+        conn.execute_batch(include_str!(
+            "../migrations/sqlite/0020_v07_signed_events.sql"
+        ))
+        .expect("apply v20 signed_events migration");
         // Apply the K8 substrate via the production migration ladder:
         // v28 creates the legacy single-PK table; v50 migrates it to
         // the compound `(agent_id, namespace)` PK shape #1156 ships.

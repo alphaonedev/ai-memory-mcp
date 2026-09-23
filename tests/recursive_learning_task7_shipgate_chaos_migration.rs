@@ -741,6 +741,13 @@ fn audit_write_failure_does_not_block_cap_refusal_propagation() {
     // append errors but the refusal still propagates. We exercise the
     // missing-table case by dropping signed_events after open.
     let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+    // #3877 — seed the fail-CLOSED record-stop gate from the HEALTHY chain
+    // BEFORE pruning signed_events, so the gate uses its cached clean state (as
+    // production caches at open / first write) and this test exercises the
+    // best-effort-AUDIT contract, not a first-touch unreadable-chain refusal.
+    // Never weakens the gate: a fresh open over a pruned chain still refuses.
+    ai_memory::storage::record_stop::seed_from_conn(&conn)
+        .expect("seed record-stop from the healthy chain before pruning signed_events");
     conn.execute("DROP TABLE signed_events", [])
         .expect("drop signed_events");
 
