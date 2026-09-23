@@ -12,15 +12,15 @@
 > (`docs/audit/3x7-v1-cutline-ruling-2026-08-01.md`) is the standard this
 > certification answers to; this document is the evidence-bound answer.
 
-**Binds to:** `92209ad91054e5e354499e383f403dd091f4d88d` (the promotion-2 rehearsal tip;
-re-issued 2026-09-22 after **2 §7-watched federation-wire files changed** since the prior bind
-`f32c18dad` — 22 changed lines, **0 of them code** — §5.4(2)–(5) re-run at the new SHA per §7). The
-2026-09-21 re-issue at `f32c18dad`, the 2026-09-12 #3607 re-bind at `ab6f2175`, the 2026-09-11
+**Binds to:** `eae99be435da643f107f0335ec45e2387ea7a545` (the promotion-3 rehearsal tip;
+re-issued 2026-09-23 after **2 §7-watched federation-wire files changed** since the prior bind
+`92209ad91` — 42 changed lines, **0 of them code** — §5.4(2)–(5) re-run at the new SHA per §7). The
+2026-09-22 re-issue at `92209ad91`, the 2026-09-21 re-issue at `f32c18dad`, the 2026-09-12 #3607 re-bind at `ab6f2175`, the 2026-09-11
 re-issue at `b0483115`, the 2026-09-11 #3595 re-issue at `ad60bead` and the original 2026-08-12
 mint `e22bc93c` remain as historical records. Any change to the federation wire path or the `AI_MEMORY_FED_*` surface **voids this
 certification and triggers re-cert** (see §7).
 
-> ## STATUS — **LIVE as of 2026-09-22** (re-issued at the promotion-2 rehearsal tip `92209ad91` at 22 checks after 2 §7-watched federation-wire files changed by a COMMENT-ONLY diff; supersedes the 2026-09-21 bind at `f32c18dad`)
+> ## STATUS — **LIVE as of 2026-09-23** (re-issued at the promotion-3 rehearsal tip `eae99be43` at 22 checks after 2 §7-watched federation-wire files changed by a COMMENT-ONLY diff; supersedes the 2026-09-22 bind at `92209ad91`)
 >
 > Re-validated and re-bound against `f32c18dadf8a659567960747cc2802186bac9de9`
 > at the v1.0.0 promotion tip on 2026-09-21: §5.4(2) posture legs re-measured at 22 checks
@@ -78,6 +78,67 @@ certification and triggers re-cert** (see §7).
 > `git diff --stat e22bc93c b80e7fff` is empty). This re-issue adds the
 > committed evidence bundle under `docs/compliance/evidence/cert-54/`
 > and this document's own ratification / caveat corrections.
+>
+> **Re-issue (2026-09-23, promotion 3 @ `eae99be43`).** The §7 re-cert trigger
+> FIRED: two watched federation-wire paths changed between `92209ad91` and
+> `eae99be43` — `src/handlers/federation_receive.rs` (+16/−8) and
+> `src/handlers/federation_signing_check.rs` (+12/−6), both from ONE commit,
+> `37b0c3a8e` (`docs(3750): correct the federation lifecycle-merge comments PER
+> BACKEND (no behaviour)`). **The diff is 42 lines (28 insertions / 14 deletions),
+> ZERO of them code** — measured with comment lines stripped (`git diff -U0`,
+> every `+`/`−` line begins with `//`, `/*`, `*` or is blank). The
+> `AI_MEMORY_FED_*` identifier set is IDENTICAL across the range;
+> `src/federation/**` has no diff at all. Both facts belong in the record: §7
+> is a DIFF-SHAPE trigger with no comment-only carve-out, so **the gate is not
+> wrong to fire** — and the measured substance is nil. A record stating only the
+> second reads as an excuse; only the first hides what changed. Discharged by
+> full re-issue, not by argument (the amendment-without-re-mint route was closed
+> by #3556).
+>
+> §5.4(2)–(5) were **re-run at `eae99be43`**, not carried forward: between the
+> two binds rehearsal also took #3877 (record-stop gate fail-CLOSED + fixture
+> fix), #3818 (record-stop read-only fence + rework), #3709 (`tls
+> init|import|status`), #3823 (plaintext inference-endpoint refusal) and the B7
+> allowlist cleanup — none on the watched surface, all on the binary the legs
+> certify. Every figure below was measured on this SHA.
+>
+> **§5.4(2) posture legs** (evidence: `docs/compliance/evidence/cert-eae99be43/`;
+> reproducible with `scripts/recapture-cert-3607-posture.sh`, whose header
+> declares the 22 checks): leg 1 bare — exit **2**, 12 PASS /
+> 10 FAIL; leg 2 hardened, gate unarmed — exit **2**, 20 /
+> 2; leg 3 hardened, gate ARMED — exit **1**, refuses boot; leg 4
+> certified configuration (sqlcipher build, `ENCRYPT_AT_REST=1`, gate ARMED,
+> `AI_MEMORY_DB_SYNCHRONOUS=FULL`, operator key pair) — exit **0**,
+> **22 PASS / 0 FAIL**. The four exit statuses are recorded in
+> `cert-eae99be43/posture-legs-exit-codes.txt`.
+>
+> **§5.4(4)/(7) acceptance battery** — 11 invocations, default features, one
+> filter each; **11/11 green, zero failures**:
+> `boot_fail_closed_config_3166` 15 · `doctor_posture_exit_code_3003` 2 ·
+> `doctor_synchronous_posture_3553` 3 · `federation_catchup_posture_3582` 1 ·
+> `federation_namespace_gate_3582` 3 · `federation_peer_posture_3582` 10 ·
+> `federation_write_ns_scope_2447` 6 · `posture_control15_pg_resolution_3106` 4 ·
+> `--lib enterprise_federation_posture` **39** · `--lib federation::peer_posture` 5 ·
+> `--lib cli::backup::tests` 81. The lib slice was run as THREE separate
+> invocations (a single invocation with three positional filters is REFUSED by
+> cargo before any test runs — a vacuous leg that certifies nothing). Exact
+> `test result:` lines in `cert-eae99be43/test-results.txt`.
+>
+> **§5.4(5) removal proof** — `scripts/check-cert-removal-proof.sh`, all 15
+> controls, no flags: **`overall: PASS`, 15 `[PROVEN]`, 0
+> `[CERT-RED]`**, rc 0. Verified non-vacuous by reading broken/restored
+> pairs: the mutated controls fail at TEST level (assertion panic), not at
+> compile level. Full log `cert-eae99be43/removal-proof-full.log`.
+>
+> **§5.4(3)** pg+AGE and the self-hosted federation lanes are cited from CI on
+> PR #3910 (the standing promotion-3 carrier), whose merge commit carries this
+> exact tree: `Certified pg+AGE cells` run [`35800724362`](https://github.com/alphaonedev/ai-memory-mcp/actions/runs/35800724362) (success);
+> `Check (linux-fed,enterprise-fed)` run [`35800724328`](https://github.com/alphaonedev/ai-memory-mcp/actions/runs/35800724328) (the linux-fed enterprise-fed job success; the run itself carries one unrelated macOS lib flake, #3916).
+>
+> Labour split, recorded: f2r RAN the legs; the Conductor WROTE this record;
+> f2r VERIFIED every number above against the committed evidence; the
+> Conductor generated `MANIFEST.sha256` LAST, after every attested file was
+> final.
 >
 > **Re-issue (2026-09-22, promotion 2 @ `92209ad91`).** The §7 re-cert trigger
 > FIRED: two watched federation-wire paths changed between `f32c18dad` and

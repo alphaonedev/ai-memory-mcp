@@ -1,0 +1,14 @@
+# cert-eae99be43 §5.4(4)/(7) acceptance battery — exact test result lines (2026-09-23, eae99be43, default features)
+# eight named integration binaries:
+boot_fail_closed_config_3166	test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.87s
+doctor_posture_exit_code_3003	test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+doctor_synchronous_posture_3553	test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.57s
+federation_catchup_posture_3582	test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 20.70s
+federation_namespace_gate_3582	test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+federation_peer_posture_3582	test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.52s
+federation_write_ns_scope_2447	test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.11s
+posture_control15_pg_resolution_3106	test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.61s
+# three lib-slice invocations (each its OWN cargo test --lib <filter>):
+enterprise_federation_posture  test result: ok. 39 passed; 0 failed; 0 ignored; 0 measured; 8667 filtered out; finished in 0.16s
+federation::peer_posture       test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 8701 filtered out; finished in 0.01s
+cli::backup::tests             test result: ok. 81 passed; 0 failed; 0 ignored; 0 measured; 8625 filtered out; finished in 41.20s
