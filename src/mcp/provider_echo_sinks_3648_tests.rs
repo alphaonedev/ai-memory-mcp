@@ -181,6 +181,15 @@ fn run_matrix(uri: String, ollama: bool, status: u16, malformed: bool) {
     // lock, held for the whole SYNCHRONOUS dispatch window (this fn runs on
     // a blocking thread, so the std guard never spans an `.await`).
     let _audit_sink = crate::audit::sink_test_lock();
+    // #3909 — `memory_detect_contradiction` resolves its read-visibility
+    // principal from the process-global `AI_MEMORY_AGENT_ID`; a sibling lib
+    // test exporting it mid-window masked the seeded (default-private) rows
+    // ("memory A not found"). Hold the AGENT-ID env lock — the one every
+    // mutator of that variable takes (`identity::agent_id_env_*_guard`) —
+    // for the same synchronous window. Read side only: this test mutates
+    // nothing (check-test-env-lock arm (e)); holding the lock is what excludes
+    // the writers, and each writer restores the variable before releasing it.
+    let _agent_id_env = crate::identity::agent_id_env_test_lock();
     let conn = crate::db::open(std::path::Path::new(":memory:")).unwrap();
     let a = seed(&conn, "echo-a");
     let b = seed(&conn, "echo-b");
