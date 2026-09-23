@@ -39,60 +39,6 @@ use prometheus::{
 // measurable hot-path cost.
 // =====================================================================
 
-static RECORD_STOP_GATE_INDETERMINATE_TOTAL: AtomicU64 = AtomicU64::new(0);
-
-/// #3877 — count one record-stop gate FAIL-CLOSED refusal: the audit chain could
-/// not be read, so a mutating write was refused rather than proceeding (vote
-/// `4d3ea1c5` = B). Bumped on the cold error branch only, so there is no hot-path
-/// cost. Process-local (resets on restart, like the eviction counters); the loud
-/// per-occurrence signal is the paired `signed_events`-target WARN.
-pub fn inc_record_stop_gate_indeterminate() {
-    RECORD_STOP_GATE_INDETERMINATE_TOTAL.fetch_add(1, Ordering::Relaxed);
-}
-
-/// Cumulative record-stop gate fail-closed refusals since process start.
-#[must_use]
-pub fn record_stop_gate_indeterminate_total() -> u64 {
-    RECORD_STOP_GATE_INDETERMINATE_TOTAL.load(Ordering::Relaxed)
-}
-
-static GOVERNANCE_CHECK_AUDIT_SUPPRESSED_TOTAL: AtomicU64 = AtomicU64::new(0);
-
-/// #3818 — count one `governance.check` audit row SKIPPED because the record
-/// plane is stopped (or its stop state is indeterminate, #3877 fail-closed). The
-/// verdict itself was still returned and the forensic-file emit still ran; this
-/// counts the audit-chain gap so it is visible rather than silent. Same shape as
-/// [`inc_record_stop_gate_indeterminate`]: cold branch only, process-local, the
-/// loud per-occurrence signal is the paired `governance.rules`-target WARN.
-pub fn inc_governance_check_audit_suppressed() {
-    GOVERNANCE_CHECK_AUDIT_SUPPRESSED_TOTAL.fetch_add(1, Ordering::Relaxed);
-}
-
-/// Cumulative `governance.check` audit rows suppressed under record-stop since
-/// process start.
-#[must_use]
-pub fn governance_check_audit_suppressed_total() -> u64 {
-    GOVERNANCE_CHECK_AUDIT_SUPPRESSED_TOTAL.load(Ordering::Relaxed)
-}
-
-static CAPABILITY_EXPANSION_AUDIT_SUPPRESSED_TOTAL: AtomicU64 = AtomicU64::new(0);
-
-/// #3818 — count one `audit_log` capability-expansion row SKIPPED because the
-/// record plane is stopped (or its stop state is indeterminate). A SEPARATE
-/// counter from [`inc_governance_check_audit_suppressed`]: different subsystem,
-/// different table — one counter for two causes is a number nobody can
-/// interpret. Same shape as the #3877 indeterminate counter.
-pub fn inc_capability_expansion_audit_suppressed() {
-    CAPABILITY_EXPANSION_AUDIT_SUPPRESSED_TOTAL.fetch_add(1, Ordering::Relaxed);
-}
-
-/// Cumulative capability-expansion audit rows suppressed under record-stop since
-/// process start.
-#[must_use]
-pub fn capability_expansion_audit_suppressed_total() -> u64 {
-    CAPABILITY_EXPANSION_AUDIT_SUPPRESSED_TOTAL.load(Ordering::Relaxed)
-}
-
 static HNSW_EVICTIONS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static HNSW_LAST_EVICTION_AT_NANOS: AtomicU64 = AtomicU64::new(0);
 
@@ -583,6 +529,26 @@ pub struct Metrics {
     /// MISCONFIGURATION signal, not load: the knob is set and
     /// structurally dead. `ai-memory doctor` names the same condition.
     pub atomise_no_curator_total: IntCounter,
+
+    /// #3877 — monotonic count of record-stop gate FAIL-CLOSED refusals: the
+    /// audit chain could not be read, so a mutating write was refused rather
+    /// than proceeding (vote `4d3ea1c5` = B). Bumped on the cold error branch
+    /// only, so there is no hot-path cost. The loud per-occurrence signal is
+    /// the paired `signed_events`-target WARN; this is the RATE an operator
+    /// alerts on. A sustained non-zero rate means the chain is unreadable
+    /// and every gated write is being refused (#3915: rendered, not hidden).
+    pub record_stop_gate_indeterminate_total: IntCounter,
+
+    /// #3818 — monotonic count of `governance.check` audit appends SUPPRESSED
+    /// under an engaged record-stop: the read-side check still answers, the
+    /// audit row is skipped and a WARN names it. Non-zero only while a stop
+    /// is engaged; a rising rate after the stop is released is a defect.
+    pub governance_check_audit_suppressed_total: IntCounter,
+
+    /// #3818 — monotonic count of capability-expansion audit appends
+    /// SUPPRESSED under an engaged record-stop (the expansion itself still
+    /// resolves). Same contract as `governance_check_audit_suppressed_total`.
+    pub capability_expansion_audit_suppressed_total: IntCounter,
 
     /// #1735 (Pillar-4 4.C) — current depth of the `kg_projection_outbox`
     /// (pending AGE projections not yet drained: `projected_at IS NULL`).
@@ -1332,6 +1298,33 @@ impl Metrics {
         )?;
         registry.register(Box::new(atomise_no_curator_total.clone()))?;
 
+        let record_stop_gate_indeterminate_total = IntCounter::new(
+            "ai_memory_record_stop_gate_indeterminate_total",
+            "Monotonic counter of record-stop gate FAIL-CLOSED refusals: the \
+             audit chain could not be read, so the mutating write was \
+             refused rather than proceeding (#3877, vote 4d3ea1c5). Alert \
+             on a sustained rate: every gated write is being refused.",
+        )?;
+        registry.register(Box::new(record_stop_gate_indeterminate_total.clone()))?;
+
+        let governance_check_audit_suppressed_total = IntCounter::new(
+            "ai_memory_governance_check_audit_suppressed_total",
+            "Monotonic counter of governance.check audit appends SUPPRESSED \
+             under an engaged record-stop (#3818): the check still answers, \
+             the audit row is skipped and a WARN names it.",
+        )?;
+        registry.register(Box::new(governance_check_audit_suppressed_total.clone()))?;
+
+        let capability_expansion_audit_suppressed_total = IntCounter::new(
+            "ai_memory_capability_expansion_audit_suppressed_total",
+            "Monotonic counter of capability-expansion audit appends \
+             SUPPRESSED under an engaged record-stop (#3818); the expansion \
+             itself still resolves.",
+        )?;
+        registry.register(Box::new(
+            capability_expansion_audit_suppressed_total.clone(),
+        ))?;
+
         let age_projection_pending_depth = IntGauge::new(
             "ai_memory_age_projection_pending_depth",
             "Current depth of the kg_projection_outbox (pending deferred AGE \
@@ -1424,6 +1417,9 @@ impl Metrics {
             atomise_applied_total,
             atomise_degraded_total,
             atomise_no_curator_total,
+            record_stop_gate_indeterminate_total,
+            governance_check_audit_suppressed_total,
+            capability_expansion_audit_suppressed_total,
             age_projection_pending_depth,
             age_projection_failed_total,
             age_projection_quarantined_total,
@@ -1694,6 +1690,25 @@ pub fn inc_atomise_degraded() {
 /// `pre_store.auto_atomise` WARN and the `ai-memory doctor` section.
 pub fn inc_atomise_no_curator() {
     registry().atomise_no_curator_total.inc();
+}
+
+/// #3877 — count one record-stop gate FAIL-CLOSED refusal (the audit chain
+/// could not be read, so the mutating write was refused). Cold error branch
+/// only. Rendered on `/api/v1/monitoring/metrics` (#3915).
+pub fn inc_record_stop_gate_indeterminate() {
+    registry().record_stop_gate_indeterminate_total.inc();
+}
+
+/// #3818 — count one `governance.check` audit append suppressed under an
+/// engaged record-stop. Rendered on `/api/v1/monitoring/metrics` (#3915).
+pub fn inc_governance_check_audit_suppressed() {
+    registry().governance_check_audit_suppressed_total.inc();
+}
+
+/// #3818 — count one capability-expansion audit append suppressed under an
+/// engaged record-stop. Rendered on `/api/v1/monitoring/metrics` (#3915).
+pub fn inc_capability_expansion_audit_suppressed() {
+    registry().capability_expansion_audit_suppressed_total.inc();
 }
 
 /// v0.7-polish SEC-15 / COR-11 (issue #780) — read the current value
