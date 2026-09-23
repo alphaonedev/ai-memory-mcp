@@ -239,6 +239,25 @@ if [ "$SELF_TEST" -eq 1 ]; then
   ALLOW=/dev/null   # the live baseline must never soften a control
   # Fixtures live in throwaway worktrees under the repo's gitignored .local-runs/ (never /tmp).
   T=.local-runs/shared-claims-selftest; rm -rf "$T"; mkdir -p "$T"; ok=1
+  # #3913 — derive the fixture schema versions from the SSOT at run time
+  # (CURRENT+1, CURRENT+2) instead of hardcoding them, so this self-test does
+  # not go stale as the migration ladder advances (it hardcoded v99/v100 and
+  # went red the moment CURRENT_SCHEMA_VERSION reached 100). Reuse
+  # check-migration-ladder.sh::read_current_schema_version — the
+  # check-doc-symbol-anchors.sh precedent — so there is no third reader and no
+  # hardcoded version literal. Self-test content only; bare gate behaviour is
+  # unchanged.
+  _RR="$(git rev-parse --show-toplevel)"
+  _reader="$(awk '/^read_current_schema_version\(\) \{/,/^\}/' "$_RR/scripts/check-migration-ladder.sh")"
+  if [ -z "$_reader" ]; then
+    echo "self-test ABORT: could not extract read_current_schema_version() from scripts/check-migration-ladder.sh — reuse the SSOT reader, do not hardcode versions" >&2; exit 1
+  fi
+  eval "$_reader"
+  _CSV="$(read_current_schema_version "$_RR/src/store/postgres.rs")"
+  if ! printf '%s' "$_CSV" | grep -qE '^[0-9]+$'; then
+    echo "self-test ABORT: could not read CURRENT_SCHEMA_VERSION from src/store/postgres.rs" >&2; exit 1
+  fi
+  V1=$((_CSV + 1)); V2=$((_CSV + 2))   # two NEW versions, ahead of the base
   mk() { # $1 name  $2 base ; then commands run inside the worktree via stdin
     git worktree add -q --detach "$T/$1" "$2" 2>/dev/null || return 1
     ( cd "$T/$1" && bash -s && git add -A >/dev/null && git -c user.name=g -c user.email=g@x commit -q -m "fixture $1" ) && git -C "$T/$1" rev-parse HEAD; }
@@ -253,12 +272,12 @@ SH
   }
   B=$(git rev-parse HEAD)
   # (1) two branches at the SAME new version with DIFFERENT bodies -> CRITICAL
-  A1=$(bump_schema 99 sync_peer_contact | mk a1 "$B"); A2=$(bump_schema 99 tombstone_store | mk a2 "$B")
+  A1=$(bump_schema "$V1" sync_peer_contact | mk a1 "$B"); A2=$(bump_schema "$V1" tombstone_store | mk a2 "$B")
   out=$(run_check "$B" "$A1" "$A2"); rc=$?
-  if [ $rc -ne 1 ] || ! printf '%s' "$out" | grep -q 'CRITICAL\] schema:v99'; then echo "self-test FAIL (1): same-version different-body not CRITICAL: $out"; ok=0; fi
+  if [ $rc -ne 1 ] || ! printf '%s' "$out" | grep -q "CRITICAL\] schema:v$V1"; then echo "self-test FAIL (1): same-version different-body not CRITICAL: $out"; ok=0; fi
   # (1b) negative control: two branches at DIFFERENT new versions -> pass (rung prefixes differ too)
-  A3=$(bump_schema 100 tombstone_store | mk a3 "$B")
-  git -C "$T/a3" mv migrations/sqlite/0083_v100_tombstone_store.sql migrations/sqlite/0084_v100_tombstone_store.sql 2>/dev/null; git -C "$T/a3" mv migrations/postgres/0056_v100_tombstone_store.sql migrations/postgres/0057_v100_tombstone_store.sql 2>/dev/null; git -C "$T/a3" -c user.name=g -c user.email=g@x commit -q -am "renumber" 2>/dev/null; A3=$(git -C "$T/a3" rev-parse HEAD)
+  A3=$(bump_schema "$V2" tombstone_store | mk a3 "$B")
+  git -C "$T/a3" mv migrations/sqlite/0083_v${V2}_tombstone_store.sql migrations/sqlite/0084_v${V2}_tombstone_store.sql 2>/dev/null; git -C "$T/a3" mv migrations/postgres/0056_v${V2}_tombstone_store.sql migrations/postgres/0057_v${V2}_tombstone_store.sql 2>/dev/null; git -C "$T/a3" -c user.name=g -c user.email=g@x commit -q -am "renumber" 2>/dev/null; A3=$(git -C "$T/a3" rev-parse HEAD)
   out=$(run_check "$B" "$A1" "$A3"); rc=$?
   if [ $rc -ne 0 ]; then echo "self-test FAIL (1b): different versions flagged: $out"; ok=0; fi
   # (2) ceiling: identical pair on one file + a third different value -> FAIL naming the pair and both verdicts
