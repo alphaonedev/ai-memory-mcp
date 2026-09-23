@@ -1444,8 +1444,10 @@ impl Metrics {
             "Current depth of the kg_projection_outbox (pending deferred AGE \
              projections, projected_at IS NULL), refreshed each cold-drainer \
              tick. Sustained non-zero = AGE graph lagging the relational \
-             memory_links truth (Pillar-4 4.C, #1735). Always 0 under the \
-             default sync projection mode.",
+             memory_links truth (Pillar-4 4.C, #1735). Non-zero in SYNC mode \
+             too: an inline projection failure records a pending row here and \
+             the drainer reconciles it, so this is NOT always 0 in sync mode \
+             (#3883).",
             &mut err,
         );
 
