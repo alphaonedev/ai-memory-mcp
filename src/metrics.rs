@@ -579,6 +579,58 @@ pub fn registry() -> &'static Metrics {
     HANDLE.get_or_init(Metrics::new_or_panic)
 }
 
+// #3917 — ONE fallible registration helper per collector kind. Each constructs
+// AND registers, so this module carries a single structurally-unreachable `?`
+// Err path per HELPER (a compile-time-named metric cannot fail to construct or
+// collide against the fresh per-call `Registry`) instead of two per metric.
+// Every `try_new` site calls one of these; no metric name, help text, or
+// behaviour changes. See `coverage/thresholds.toml` and issue #3917.
+fn int_counter(registry: &Registry, name: &str, help: &str) -> prometheus::Result<IntCounter> {
+    let c = IntCounter::new(name, help)?;
+    registry.register(Box::new(c.clone()))?;
+    Ok(c)
+}
+
+fn int_gauge(registry: &Registry, name: &str, help: &str) -> prometheus::Result<IntGauge> {
+    let g = IntGauge::new(name, help)?;
+    registry.register(Box::new(g.clone()))?;
+    Ok(g)
+}
+
+fn int_counter_vec(
+    registry: &Registry,
+    name: &str,
+    help: &str,
+    labels: &[&str],
+) -> prometheus::Result<IntCounterVec> {
+    let c = IntCounterVec::new(prometheus::Opts::new(name, help), labels)?;
+    registry.register(Box::new(c.clone()))?;
+    Ok(c)
+}
+
+fn int_gauge_vec(
+    registry: &Registry,
+    name: &str,
+    help: &str,
+    labels: &[&str],
+) -> prometheus::Result<IntGaugeVec> {
+    let g = IntGaugeVec::new(prometheus::Opts::new(name, help), labels)?;
+    registry.register(Box::new(g.clone()))?;
+    Ok(g)
+}
+
+fn histogram_vec(
+    registry: &Registry,
+    name: &str,
+    help: &str,
+    buckets: Vec<f64>,
+    labels: &[&str],
+) -> prometheus::Result<HistogramVec> {
+    let h = HistogramVec::new(HistogramOpts::new(name, help).buckets(buckets), labels)?;
+    registry.register(Box::new(h.clone()))?;
+    Ok(h)
+}
+
 impl Metrics {
     fn new_or_panic() -> Self {
         // Registration can only fail on duplicate-name conflict; with a
@@ -588,166 +640,149 @@ impl Metrics {
         Self::try_new().expect("prometheus registry init failed")
     }
 
-    // COVERAGE: every `?` Err-arm closure on `IntCounterVec::new(...)?`,
-    //           `IntCounter::new(...)?`, `IntGauge::new(...)?`,
-    //           `HistogramVec::new(...)?`, and
-    //           `registry.register(Box::new(...))?` in this function
-    //           is structurally unreachable in production:
+    // COVERAGE: #3917 — every collector is constructed AND registered through
+    //           one of the five module-level helpers (`int_counter`,
+    //           `int_gauge`, `int_counter_vec`, `int_gauge_vec`,
+    //           `histogram_vec`), so the ONLY structurally-unreachable `?`
+    //           Err-arms in this file are the single construct + register pair
+    //           inside each helper — no longer two per metric inlined here.
+    //           Every `try_new` site below propagates the helper's `Result`
+    //           with one `?` on the covered `Ok` path.
     //
-    //           1. The function constructs a fresh `Registry::new()`
-    //              per call (no shared state). Registration can only
-    //              fail on duplicate metric name; with a fresh registry
-    //              and unique names per counter, collision is
-    //              impossible.
-    //           2. Every metric name + label name passed to the
-    //              constructors is a compile-time string literal that
-    //              already matches the Prometheus regex
-    //              `[a-zA-Z_:][a-zA-Z0-9_:]*` — construction cannot
-    //              fail on name-validation grounds.
-    //
-    //           The Err-arms exist because the prometheus crate's
-    //           API returns `Result<...>` from these constructors, and
-    //           the `?` propagation is the idiomatic Rust pattern.
-    //           Triggering coverage would require a synthetic
-    //           registry-injection layer that doesn't exist (and
-    //           shouldn't — try_new owns its registry by design).
-    //           Documented per L0.7 playbook §3c.
+    //           The helper Err-arms are unreachable in production:
+    //           1. `try_new` builds a fresh `Registry::new()` per call (no
+    //              shared state); registration can only fail on a duplicate
+    //              name, and every name registered here is unique.
+    //           2. Every metric + label name is a compile-time string literal
+    //              already matching the Prometheus regex
+    //              `[a-zA-Z_:][a-zA-Z0-9_:]*`, so construction cannot fail on
+    //              name validation.
+    //           They exist only because the prometheus crate's constructors
+    //           return `Result`. See coverage/thresholds.toml and issue #3917;
+    //           documented per L0.7 playbook §3c.
     #[allow(clippy::too_many_lines)]
     pub(crate) fn try_new() -> prometheus::Result<Self> {
         let registry = Registry::new();
 
-        let store_total = IntCounterVec::new(
-            prometheus::Opts::new(
-                "ai_memory_store_total",
-                "Total memory_store calls, labeled by tier and result.",
-            ),
+        let store_total = int_counter_vec(
+            &registry,
+            "ai_memory_store_total",
+            "Total memory_store calls, labeled by tier and result.",
             &["tier", "result"],
         )?;
-        registry.register(Box::new(store_total.clone()))?;
 
-        let recall_total = IntCounterVec::new(
-            prometheus::Opts::new(
-                "ai_memory_recall_total",
-                "Total memory_recall calls, labeled by mode.",
-            ),
+        let recall_total = int_counter_vec(
+            &registry,
+            "ai_memory_recall_total",
+            "Total memory_recall calls, labeled by mode.",
             &["mode"],
         )?;
-        registry.register(Box::new(recall_total.clone()))?;
 
-        let recall_latency_seconds = HistogramVec::new(
-            HistogramOpts::new(
-                "ai_memory_recall_latency_seconds",
-                "Recall latency in seconds, labeled by mode.",
-            )
-            .buckets(vec![
+        let recall_latency_seconds = histogram_vec(
+            &registry,
+            "ai_memory_recall_latency_seconds",
+            "Recall latency in seconds, labeled by mode.",
+            vec![
                 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
-            ]),
+            ],
             &["mode"],
         )?;
-        registry.register(Box::new(recall_latency_seconds.clone()))?;
 
-        let autonomy_hook_total = IntCounterVec::new(
-            prometheus::Opts::new(
-                "ai_memory_autonomy_hook_total",
-                "Post-store autonomy hook invocations, labeled by kind and result.",
-            ),
+        let autonomy_hook_total = int_counter_vec(
+            &registry,
+            "ai_memory_autonomy_hook_total",
+            "Post-store autonomy hook invocations, labeled by kind and result.",
             &["kind", "result"],
         )?;
-        registry.register(Box::new(autonomy_hook_total.clone()))?;
 
-        let contradiction_detected_total = IntCounter::new(
+        let contradiction_detected_total = int_counter(
+            &registry,
             "ai_memory_contradiction_detected_total",
             "Count of contradictions the LLM hook confirmed.",
         )?;
-        registry.register(Box::new(contradiction_detected_total.clone()))?;
 
-        let webhook_dispatched_total = IntCounter::new(
+        let webhook_dispatched_total = int_counter(
+            &registry,
             "ai_memory_webhook_dispatched_total",
             "Total webhook deliveries attempted.",
         )?;
-        registry.register(Box::new(webhook_dispatched_total.clone()))?;
 
-        let webhook_failed_total = IntCounter::new(
+        let webhook_failed_total = int_counter(
+            &registry,
             "ai_memory_webhook_failed_total",
             "Webhook deliveries that failed after all retries.",
         )?;
-        registry.register(Box::new(webhook_failed_total.clone()))?;
 
         // #3659 — delivery-audit persistence evidence.
-        let webhook_audit_status_persisted_total = IntCounter::new(
+        let webhook_audit_status_persisted_total = int_counter(
+            &registry,
             "ai_memory_webhook_audit_status_persisted_total",
             "Webhook delivery-audit status transitions (ack/failed) that \
              reached subscription_events since boot.",
         )?;
-        registry.register(Box::new(webhook_audit_status_persisted_total.clone()))?;
-        let webhook_audit_update_failed_total = IntCounterVec::new(
-            prometheus::Opts::new(
-                "ai_memory_webhook_audit_update_failed_total",
-                "Webhook delivery-audit bookkeeping failures since boot, by \
+        let webhook_audit_update_failed_total = int_counter_vec(
+            &registry,
+            "ai_memory_webhook_audit_update_failed_total",
+            "Webhook delivery-audit bookkeeping failures since boot, by \
                  stage (open | status_update | status_no_row | \
                  dispatch_counter). Any increment means the persisted \
                  delivery history disagrees with the wire outcome.",
-            ),
             &["stage"],
         )?;
-        registry.register(Box::new(webhook_audit_update_failed_total.clone()))?;
         for stage in crate::subscriptions::audit_status::AuditStage::ALL {
             webhook_audit_update_failed_total
                 .with_label_values(&[stage.as_str()])
                 .reset();
         }
-        let webhook_audit_last_failure_at_seconds = IntGauge::new(
+        let webhook_audit_last_failure_at_seconds = int_gauge(
+            &registry,
             "ai_memory_webhook_audit_last_failure_at_seconds",
             "Unix seconds of the last webhook delivery-audit bookkeeping \
              failure; 0 = none since boot.",
         )?;
-        registry.register(Box::new(webhook_audit_last_failure_at_seconds.clone()))?;
 
-        let memories_gauge = IntGauge::new(
+        let memories_gauge = int_gauge(
+            &registry,
             "ai_memory_memories",
             "Current count of non-archived memories.",
         )?;
-        registry.register(Box::new(memories_gauge.clone()))?;
 
-        let memories_gauge_refreshed_at = IntGauge::new(
+        let memories_gauge_refreshed_at = int_gauge(
+            &registry,
             "ai_memory_memories_refreshed_at_seconds",
             "UNIX time at which ai_memory_memories was last recomputed (0 = never).",
         )?;
-        registry.register(Box::new(memories_gauge_refreshed_at.clone()))?;
 
-        let hnsw_size_gauge = IntGauge::new(
+        let hnsw_size_gauge = int_gauge(
+            &registry,
             "ai_memory_hnsw_size",
             "Current HNSW vector index population.",
         )?;
-        registry.register(Box::new(hnsw_size_gauge.clone()))?;
 
-        let subscriptions_active_gauge = IntGauge::new(
+        let subscriptions_active_gauge = int_gauge(
+            &registry,
             "ai_memory_subscriptions_active",
             "Current count of active webhook subscriptions.",
         )?;
-        registry.register(Box::new(subscriptions_active_gauge.clone()))?;
 
-        let curator_cycles_total = IntCounter::new(
+        let curator_cycles_total = int_counter(
+            &registry,
             "ai_memory_curator_cycles_total",
             "Total curator sweep cycles completed.",
         )?;
-        registry.register(Box::new(curator_cycles_total.clone()))?;
 
-        let curator_operations_total = IntCounterVec::new(
-            prometheus::Opts::new(
-                "ai_memory_curator_operations_total",
-                "Curator operations, labeled by kind (auto_tag|contradiction|persist) and result.",
-            ),
+        let curator_operations_total = int_counter_vec(
+            &registry,
+            "ai_memory_curator_operations_total",
+            "Curator operations, labeled by kind (auto_tag|contradiction|persist) and result.",
             &["kind", "result"],
         )?;
-        registry.register(Box::new(curator_operations_total.clone()))?;
 
-        let curator_cycle_duration_seconds = HistogramVec::new(
-            HistogramOpts::new(
-                "ai_memory_curator_cycle_duration_seconds",
-                "Curator sweep cycle wall-clock duration, labeled by dry_run.",
-            )
-            .buckets(vec![
+        let curator_cycle_duration_seconds = histogram_vec(
+            &registry,
+            "ai_memory_curator_cycle_duration_seconds",
+            "Curator sweep cycle wall-clock duration, labeled by dry_run.",
+            vec![
                 0.1,
                 0.5,
                 1.0,
@@ -757,146 +792,116 @@ impl Metrics {
                 300.0,
                 900.0,
                 crate::SECS_PER_HOUR as f64,
-            ]),
+            ],
             &["dry_run"],
         )?;
-        registry.register(Box::new(curator_cycle_duration_seconds.clone()))?;
 
-        let federation_fanout_dropped_total = IntCounterVec::new(
-            prometheus::Opts::new(
-                "ai_memory_federation_fanout_dropped_total",
-                "Post-quorum fanout tasks whose outcome could not be observed. \
+        let federation_fanout_dropped_total = int_counter_vec(
+            &registry,
+            "ai_memory_federation_fanout_dropped_total",
+            "Post-quorum fanout tasks whose outcome could not be observed. \
                  reason=shutdown|panic|join_error. Non-zero indicates mesh divergence risk.",
-            ),
             &["reason"],
         )?;
-        registry.register(Box::new(federation_fanout_dropped_total.clone()))?;
 
-        let federation_fanout_retry_total = IntCounterVec::new(
-            prometheus::Opts::new(
-                "ai_memory_federation_fanout_retry_total",
-                "Peer POSTs that hit a transient failure on first attempt and \
+        let federation_fanout_retry_total = int_counter_vec(
+            &registry,
+            "ai_memory_federation_fanout_retry_total",
+            "Peer POSTs that hit a transient failure on first attempt and \
                  were retried once via the Idempotency-Key path. \
                  outcome=ok|fail|id_drift. Non-zero ok indicates the retry \
                  recovered a row that would otherwise be missing on a peer.",
-            ),
             &["outcome"],
         )?;
-        registry.register(Box::new(federation_fanout_retry_total.clone()))?;
 
         // H9 (v0.7.0 round-2) — partial-quorum observability.
-        let federation_partial_quorum_total = IntCounter::new(
+        let federation_partial_quorum_total = int_counter(
+            &registry,
             "ai_memory_federation_partial_quorum_total",
             "Quorum writes that succeeded (W met) but where at least one \
              configured peer did not ack inside the deadline.",
         )?;
-        registry.register(Box::new(federation_partial_quorum_total.clone()))?;
 
         // #3654 — per-peer federation freshness. The `peer` label is bounded
         // by configured membership and never carries a URL.
-        let federation_peer_configured = IntGaugeVec::new(
-            prometheus::Opts::new(
-                "ai_memory_federation_peer_configured",
-                "1 for every peer in this node's configured federation membership (#3654).",
-            ),
+        let federation_peer_configured = int_gauge_vec(
+            &registry,
+            "ai_memory_federation_peer_configured",
+            "1 for every peer in this node's configured federation membership (#3654).",
             &["peer"],
         )?;
-        registry.register(Box::new(federation_peer_configured.clone()))?;
-        let federation_peer_last_attempt_timestamp_seconds = IntGaugeVec::new(
-            prometheus::Opts::new(
-                "ai_memory_federation_peer_last_attempt_timestamp_seconds",
-                "Unix seconds (local clock) of the last attempted exchange with a peer. \
+        let federation_peer_last_attempt_timestamp_seconds = int_gauge_vec(
+            &registry,
+            "ai_memory_federation_peer_last_attempt_timestamp_seconds",
+            "Unix seconds (local clock) of the last attempted exchange with a peer. \
                  direction=pull|push. Absent until the first attempt (#3654).",
-            ),
             &["peer", "direction"],
         )?;
-        registry.register(Box::new(
-            federation_peer_last_attempt_timestamp_seconds.clone(),
-        ))?;
-        let federation_peer_last_success_timestamp_seconds = IntGaugeVec::new(
-            prometheus::Opts::new(
-                "ai_memory_federation_peer_last_success_timestamp_seconds",
-                "Unix seconds (local clock) of the last successful exchange with a peer; \
+        let federation_peer_last_success_timestamp_seconds = int_gauge_vec(
+            &registry,
+            "ai_memory_federation_peer_last_success_timestamp_seconds",
+            "Unix seconds (local clock) of the last successful exchange with a peer; \
                  a push counts only when the peer applied it. direction=pull|push. \
                  Absent until the first success (#3654).",
-            ),
             &["peer", "direction"],
         )?;
-        registry.register(Box::new(
-            federation_peer_last_success_timestamp_seconds.clone(),
-        ))?;
-        let federation_peer_consecutive_failures = IntGaugeVec::new(
-            prometheus::Opts::new(
-                "ai_memory_federation_peer_consecutive_failures",
-                "Failed attempts since the last success with a peer. direction=pull|push (#3654).",
-            ),
+        let federation_peer_consecutive_failures = int_gauge_vec(
+            &registry,
+            "ai_memory_federation_peer_consecutive_failures",
+            "Failed attempts since the last success with a peer. direction=pull|push (#3654).",
             &["peer", "direction"],
         )?;
-        registry.register(Box::new(federation_peer_consecutive_failures.clone()))?;
-        let federation_peer_failures_total = IntCounterVec::new(
-            prometheus::Opts::new(
-                "ai_memory_federation_peer_failures_total",
-                "Failed exchanges with a peer. direction=pull|push; class=unauthorized|\
+        let federation_peer_failures_total = int_counter_vec(
+            &registry,
+            "ai_memory_federation_peer_failures_total",
+            "Failed exchanges with a peer. direction=pull|push; class=unauthorized|\
                  throttled|rejected|server_error|unreachable|bad_response|not_applied|\
                  task_failed|other (#3654).",
-            ),
             &["peer", "direction", "class"],
         )?;
-        registry.register(Box::new(federation_peer_failures_total.clone()))?;
-        let federation_peer_clock_skew_seconds = IntGaugeVec::new(
-            prometheus::Opts::new(
-                "ai_memory_federation_peer_clock_skew_seconds",
-                "Peer clock minus local clock in whole seconds, from the peer's HTTP Date \
+        let federation_peer_clock_skew_seconds = int_gauge_vec(
+            &registry,
+            "ai_memory_federation_peer_clock_skew_seconds",
+            "Peer clock minus local clock in whole seconds, from the peer's HTTP Date \
                  header on the last catch-up response (#3654).",
-            ),
             &["peer"],
         )?;
-        registry.register(Box::new(federation_peer_clock_skew_seconds.clone()))?;
-        let federation_peer_push_dlq_depth = IntGaugeVec::new(
-            prometheus::Opts::new(
-                "ai_memory_federation_peer_push_dlq_depth",
-                "Pending federation_push_dlq rows per peer, refreshed each replay tick (#3654).",
-            ),
+        let federation_peer_push_dlq_depth = int_gauge_vec(
+            &registry,
+            "ai_memory_federation_peer_push_dlq_depth",
+            "Pending federation_push_dlq rows per peer, refreshed each replay tick (#3654).",
             &["peer"],
         )?;
-        registry.register(Box::new(federation_peer_push_dlq_depth.clone()))?;
-        let federation_peer_push_dlq_oldest_failed_timestamp_seconds = IntGaugeVec::new(
-            prometheus::Opts::new(
-                "ai_memory_federation_peer_push_dlq_oldest_failed_timestamp_seconds",
-                "Unix seconds of the oldest pending federation_push_dlq failure per peer; \
+        let federation_peer_push_dlq_oldest_failed_timestamp_seconds = int_gauge_vec(
+            &registry,
+            "ai_memory_federation_peer_push_dlq_oldest_failed_timestamp_seconds",
+            "Unix seconds of the oldest pending federation_push_dlq failure per peer; \
                  absent when the peer's backlog is empty (#3654).",
-            ),
             &["peer"],
         )?;
-        registry.register(Box::new(
-            federation_peer_push_dlq_oldest_failed_timestamp_seconds.clone(),
-        ))?;
-        let federation_catchup_interval_seconds = IntGaugeVec::new(
-            prometheus::Opts::new(
-                "ai_memory_federation_catchup_interval_seconds",
-                "Configured federation catch-up interval in seconds; absent when the \
+        let federation_catchup_interval_seconds = int_gauge_vec(
+            &registry,
+            "ai_memory_federation_catchup_interval_seconds",
+            "Configured federation catch-up interval in seconds; absent when the \
                  catch-up loop is not running (#3654).",
-            ),
             &[],
         )?;
-        registry.register(Box::new(federation_catchup_interval_seconds.clone()))?;
 
         // Cluster-A COR-3 (v0.7.0) — corrupt-provenance observability.
-        let corrupt_provenance_rows_total = IntCounterVec::new(
-            prometheus::Opts::new(
-                "ai_memory_corrupt_provenance_rows_total",
-                "Memory rows whose Form 4 fact-provenance JSON columns \
+        let corrupt_provenance_rows_total = int_counter_vec(
+            &registry,
+            "ai_memory_corrupt_provenance_rows_total",
+            "Memory rows whose Form 4 fact-provenance JSON columns \
                  failed to deserialise and were silently defaulted. \
                  Non-zero indicates schema drift, writer-side corruption, \
                  or a migration leaving malformed JSON.",
-            ),
             &["column"],
         )?;
-        registry.register(Box::new(corrupt_provenance_rows_total.clone()))?;
 
         // v0.7-polish SEC-15 / COR-11 (issue #780) — auto-export
         // detached-worker failure observability.
-        let auto_export_spawn_failed_total = IntCounter::new(
+        let auto_export_spawn_failed_total = int_counter(
+            &registry,
             "ai_memory_auto_export_spawn_failed_total",
             "Detached post_reflect.auto_export worker invocations whose \
              outcome was a panic or returned Err. Non-zero means at \
@@ -904,10 +909,10 @@ impl Metrics {
              on-disk markdown/json artefact did not land — operators \
              use this to alert on otherwise-silent disk-write failures.",
         )?;
-        registry.register(Box::new(auto_export_spawn_failed_total.clone()))?;
 
         // v0.7.0 Track D #933 — federation push DLQ depth gauge.
-        let federation_push_dlq_depth = IntGauge::new(
+        let federation_push_dlq_depth = int_gauge(
+            &registry,
             "ai_memory_federation_push_dlq_depth",
             "Current count of pending federation_push_dlq rows \
              (replayed_at IS NULL). Refreshed on every replay tick. \
@@ -915,10 +920,10 @@ impl Metrics {
              persistently unreachable; healthy meshes drain back to 0 \
              within one replay interval after peer recovery.",
         )?;
-        registry.register(Box::new(federation_push_dlq_depth.clone()))?;
 
         // v1.0.0 #3164 — deferred-audit drainer terminal-state gauge.
-        let deferred_audit_drainer_terminal_state = IntGauge::new(
+        let deferred_audit_drainer_terminal_state = int_gauge(
+            &registry,
             "ai_memory_deferred_audit_drainer_terminal_state",
             "Terminal state of the deferred-audit drainer supervisor: 0 = \
              running/graceful, 1 = sink unresolved past max_restarts, 2 = \
@@ -926,10 +931,10 @@ impl Metrics {
              refusals are NO LONGER reaching signed_events on this node; the \
              daemon keeps serving but is audit-degraded until restarted.",
         )?;
-        registry.register(Box::new(deferred_audit_drainer_terminal_state.clone()))?;
 
         // #1032 (HIGH, 2026-05-21) — federation push DLQ quarantine counter.
-        let federation_push_dlq_quarantined = IntCounter::new(
+        let federation_push_dlq_quarantined = int_counter(
+            &registry,
             "ai_memory_federation_push_dlq_quarantined_total",
             "Monotonic counter of federation_push_dlq rows the replay \
              worker has skipped because their attempt_count exceeded \
@@ -939,49 +944,45 @@ impl Metrics {
              --quarantined`. Pre-#1032 the worker retried these \
              forever, amplifying network load against rejecting peers.",
         )?;
-        registry.register(Box::new(federation_push_dlq_quarantined.clone()))?;
 
         // #1544 — cause-labeled quarantine counter (closed-set label).
-        let federation_push_dlq_quarantined_by_cause = IntCounterVec::new(
-            prometheus::Opts::new(
-                "ai_memory_federation_push_dlq_quarantined_by_cause_total",
-                // #2442 — the enumeration below had drifted TWO causes behind
-                // `classify_quarantine_cause` (it was missing
-                // `unenrolled_author_strict` from #1464/#1801 and
-                // `namespace_probe_unresolvable` from #2488, both of which
-                // docs/federation.md already carried). Re-synced here; this
-                // HELP string, `classify_quarantine_cause`, and
-                // docs/federation.md are the three mirrors of one closed set.
-                "Federation push-DLQ rows quarantined, labeled by the \
+        let federation_push_dlq_quarantined_by_cause = int_counter_vec(
+            &registry,
+            "ai_memory_federation_push_dlq_quarantined_by_cause_total",
+            // #2442 — the enumeration below had drifted TWO causes behind
+            // `classify_quarantine_cause` (it was missing
+            // `unenrolled_author_strict` from #1464/#1801 and
+            // `namespace_probe_unresolvable` from #2488, both of which
+            // docs/federation.md already carried). Re-synced here; this
+            // HELP string, `classify_quarantine_cause`, and
+            // docs/federation.md are the three mirrors of one closed set.
+            "Federation push-DLQ rows quarantined, labeled by the \
                  classified cause (quota|unenrolled_peer|\
                  unenrolled_author_strict|namespace_probe_unresolvable|\
                  id_drift|permanent|peer_removed|other). `quota` is \
                  operator-actionable (raise AI_MEMORY_MAX_MEMORIES_PER_DAY or \
                  wait for the daily reset); `permanent` is a broken row \
                  needing a manual drain. #1544.",
-            ),
             &["cause"],
         )?;
-        registry.register(Box::new(federation_push_dlq_quarantined_by_cause.clone()))?;
 
         // v1.0.0 #3124 — unstamped-row mutation admissions (closed labels).
-        let unstamped_mutation_allowed_total = IntCounterVec::new(
-            prometheus::Opts::new(
-                "ai_memory_unstamped_mutation_allowed_total",
-                "Caller-scoped mutations admitted on an UNSTAMPED \
+        let unstamped_mutation_allowed_total = int_counter_vec(
+            &registry,
+            "ai_memory_unstamped_mutation_allowed_total",
+            "Caller-scoped mutations admitted on an UNSTAMPED \
                  (legacy-unowned, no metadata.agent_id) memory row under \
                  AI_MEMORY_UNSTAMPED_MUTATION=warn, labeled by backend and \
                  funnel. Non-zero means rows to re-own (ai-memory reown) \
                  before setting the knob to refuse.",
-            ),
             &["backend", "funnel"],
         )?;
-        registry.register(Box::new(unstamped_mutation_allowed_total.clone()))?;
 
         // #2442 — legacy positional peer-id skips. Kept OFF the `cause` label
         // set above on purpose: see the field doc on
         // `federation_push_dlq_legacy_positional`.
-        let federation_push_dlq_legacy_positional = IntCounter::new(
+        let federation_push_dlq_legacy_positional = int_counter(
+            &registry,
             "ai_memory_federation_push_dlq_legacy_positional_total",
             "Federation push-DLQ rows skipped because their durable routing \
              key is a pre-#2442 POSITIONAL peer id (the --quorum-peers flag \
@@ -993,10 +994,10 @@ impl Metrics {
              means legacy rows remain; see docs/TROUBLESHOOTING.md \
              §federation-push-DLQ for the operator-gated re-key. #2442.",
         )?;
-        registry.register(Box::new(federation_push_dlq_legacy_positional.clone()))?;
 
         // #2716 (CB-12) — federated erasure/delete supersede observability.
-        let federation_erasure_superseded = IntCounter::new(
+        let federation_erasure_superseded = int_counter(
+            &registry,
             "ai_memory_federation_erasure_superseded_total",
             "Federation pending erasures/deletes SUPERSEDED (not propagated) \
              because the target id is LIVE again locally with an updated_at \
@@ -1006,7 +1007,6 @@ impl Metrics {
              operator-requested erasure; a sustained rate may mean an erasure \
              is being undone by a resurrection and warrants a re-issue. #2716.",
         )?;
-        registry.register(Box::new(federation_erasure_superseded.clone()))?;
 
         // #2966 (L6 5-agent vote 4d3ea1c5) — route-IN quarantine
         // observability. The provenance gate used to flip a row to
@@ -1014,7 +1014,8 @@ impl Metrics {
         // returned 200 (the #2444 silent-hide shape); this counter + a
         // per-quarantine WARN at the quarantine site make the black-hole
         // visible.
-        let federation_quarantined_unattributed = IntCounter::new(
+        let federation_quarantined_unattributed = int_counter(
+            &registry,
             "ai_memory_fed_quarantined_unattributed_total",
             "Monotonic count of inbound relayed memories quarantined by the \
              route-IN provenance gate (AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED): \
@@ -1024,10 +1025,10 @@ impl Metrics {
              non-zero rate means a peer is relaying provenance-less content \
              this node is black-holing. #2966.",
         )?;
-        registry.register(Box::new(federation_quarantined_unattributed.clone()))?;
 
         // #3699 (5-agent vote 4d3ea1c5) — cross-id title-merge observability.
-        let federation_cross_id_title_merge = IntCounter::new(
+        let federation_cross_id_title_merge = int_counter(
+            &registry,
             "ai_memory_fed_cross_id_title_merge_total",
             "Monotonic count of inbound federated memories folded into a local \
              row of a DIFFERENT id by the newer-wins (title, namespace) merge \
@@ -1037,13 +1038,13 @@ impl Metrics {
              delivered before the tombstone that freed its title (#3699). Each \
              increment pairs with a WARN naming both ids.",
         )?;
-        registry.register(Box::new(federation_cross_id_title_merge.clone()))?;
 
         // v1.0.0 #2402 — the route-OUT counter. #1948 advertised "operator
         // dequarantine" as the way out of quarantine and shipped no caller, so
         // there was nothing to count; now that the verb exists, releasing a
         // contained row must be as visible as containing one.
-        let operator_dequarantined = IntCounter::new(
+        let operator_dequarantined = int_counter(
+            &registry,
             "ai_memory_operator_dequarantined_total",
             "Monotonic count of quarantined memories released by an OPERATOR \
              through `ai-memory quarantine release` or \
@@ -1053,7 +1054,6 @@ impl Metrics {
              authenticated caller, in the same transaction as the state change. A \
              no-op release (the id is not quarantined) does not increment.",
         )?;
-        registry.register(Box::new(operator_dequarantined.clone()))?;
 
         // pm-v3.1 PR8 (issue #1174) — HNSW eviction observability moved
         // from process-global atomics in `src/hnsw.rs` into the metrics
@@ -1062,7 +1062,8 @@ impl Metrics {
         // wall-clock timestamp (0 if no eviction has occurred). Both
         // are surfaced at `/metrics` so the eviction signal is
         // scrape-visible without going through `memory_stats`.
-        let hnsw_evictions_total = IntCounter::new(
+        let hnsw_evictions_total = int_counter(
+            &registry,
             "ai_memory_hnsw_evictions_total",
             "Cumulative HNSW oldest-eviction count since process start. \
              Non-zero indicates the in-memory vector index has hit \
@@ -1070,18 +1071,18 @@ impl Metrics {
              may have degraded for evicted ids until they are \
              re-inserted on next access.",
         )?;
-        registry.register(Box::new(hnsw_evictions_total.clone()))?;
 
-        let hnsw_last_eviction_at_nanos = IntGauge::new(
+        let hnsw_last_eviction_at_nanos = int_gauge(
+            &registry,
             "ai_memory_hnsw_last_eviction_at_nanos",
             "Wall-clock UNIX nanoseconds of the most recent HNSW \
              eviction (0 if none). Capabilities derives \
              hnsw.evicted_recently from this with a 60s rolling window.",
         )?;
-        registry.register(Box::new(hnsw_last_eviction_at_nanos.clone()))?;
 
         // #1253 (MED, 2026-05-25) — subscription DLQ overflow counter.
-        let subscription_dlq_overflow_total = IntCounter::new(
+        let subscription_dlq_overflow_total = int_counter(
+            &registry,
             "ai_memory_subscription_dlq_overflow_total",
             "Monotonic counter of subscription_dlq inserts refused \
              because the per-subscription DLQ depth had already hit \
@@ -1091,10 +1092,10 @@ impl Metrics {
              Operators drain the queue via `ai-memory subscription dlq \
              drain <subscription_id>` before resetting.",
         )?;
-        registry.register(Box::new(subscription_dlq_overflow_total.clone()))?;
 
         // v1.0.0 #2592 — truncated subscription-dispatch scans.
-        let subscription_dispatch_truncated_total = IntCounter::new(
+        let subscription_dispatch_truncated_total = int_counter(
+            &registry,
             "ai_memory_subscription_dispatch_truncated_total",
             "Monotonic counter of subscription-dispatch ticks whose \
              subscriber scan hit SUBSCRIPTION_DISPATCH_LIMIT (1000) and was \
@@ -1103,39 +1104,35 @@ impl Metrics {
              same tail is cut on every write. Reduce the subscription \
              population or split the deployment.",
         )?;
-        registry.register(Box::new(subscription_dispatch_truncated_total.clone()))?;
 
         // FED-P4-e (federation-identity-at-scale §8) — federation
         // identity SLO surfaces: verify-failure-rate, signed-vs-unsigned
         // ratio, max cred age, renewal lag.
-        let federation_cred_verify_total = IntCounterVec::new(
-            prometheus::Opts::new(
-                "ai_memory_federation_cred_verify_total",
-                "Federation credential-verification outcomes on the \
+        let federation_cred_verify_total = int_counter_vec(
+            &registry,
+            "ai_memory_federation_cred_verify_total",
+            "Federation credential-verification outcomes on the \
                  receiver path, labeled result (ok|fail). \
                  verify-failure-rate SLO = fail / (ok + fail). Non-zero \
                  sustained fail rate means peers present credentials the \
                  local trust bundle cannot verify (expired leaf, revoked \
                  issuer, clock skew, or a chain that fails to anchor).",
-            ),
             &["result"],
         )?;
-        registry.register(Box::new(federation_cred_verify_total.clone()))?;
 
-        let federation_inbound_cred_total = IntCounterVec::new(
-            prometheus::Opts::new(
-                "ai_memory_federation_inbound_cred_total",
-                "Inbound federation requests bucketed by whether they \
+        let federation_inbound_cred_total = int_counter_vec(
+            &registry,
+            "ai_memory_federation_inbound_cred_total",
+            "Inbound federation requests bucketed by whether they \
                  presented a signed credential, labeled presence \
                  (signed|unsigned). signed-vs-unsigned-ratio SLO = \
                  signed / (signed + unsigned). Climbs toward 1.0 as \
                  peers upgrade to credential-presenting builds.",
-            ),
             &["presence"],
         )?;
-        registry.register(Box::new(federation_inbound_cred_total.clone()))?;
 
-        let federation_cred_max_age_seconds = IntGauge::new(
+        let federation_cred_max_age_seconds = int_gauge(
+            &registry,
             "ai_memory_federation_cred_max_age_seconds",
             "Age in seconds of the local outbound leaf credential \
              (now - issued_at), refreshed on every renewal tick. \
@@ -1144,9 +1141,9 @@ impl Metrics {
              the refresh worker has stalled and outbound sync will \
              start failing peer verification.",
         )?;
-        registry.register(Box::new(federation_cred_max_age_seconds.clone()))?;
 
-        let federation_renewal_lag_seconds = IntGauge::new(
+        let federation_renewal_lag_seconds = int_gauge(
+            &registry,
             "ai_memory_federation_renewal_lag_seconds",
             "Seconds since the last successful outbound-credential \
              renewal (now - last-renew wall clock), refreshed on every \
@@ -1155,9 +1152,9 @@ impl Metrics {
              larger than the interval means renewals are silently \
              failing even though the worker thread is still alive.",
         )?;
-        registry.register(Box::new(federation_renewal_lag_seconds.clone()))?;
 
-        let admission_shed_total = IntCounter::new(
+        let admission_shed_total = int_counter(
+            &registry,
             "ai_memory_admission_shed_total",
             "Monotonic counter of HTTP requests shed by the admission-control \
              layer because the in-flight-request cap \
@@ -1167,21 +1164,21 @@ impl Metrics {
              up. Always zero on deployments that have not opted into admission \
              control (the cap defaults to disabled).",
         )?;
-        registry.register(Box::new(admission_shed_total.clone()))?;
 
-        let auth_failures_total = IntCounter::new(
+        let auth_failures_total = int_counter(
+            &registry,
             "ai_memory_auth_failures_total",
             "Total HTTP transport-auth failures (missing or unknown API key) since boot, all sources, no per-source label.",
         )?;
-        registry.register(Box::new(auth_failures_total.clone()))?;
 
-        let auth_backoff_episodes_total = IntCounter::new(
+        let auth_backoff_episodes_total = int_counter(
+            &registry,
             "ai_memory_auth_backoff_episodes_total",
             "Backoff episodes begun since boot: times one source's auth failures crossed the threshold into 429 refusal (edge-triggered; a later success does not decrement).",
         )?;
-        registry.register(Box::new(auth_backoff_episodes_total.clone()))?;
 
-        let recall_embed_degraded_total = IntCounter::new(
+        let recall_embed_degraded_total = int_counter(
+            &registry,
             "ai_memory_recall_embed_degraded_total",
             "Monotonic counter of recalls that fell back to keyword/FTS because \
              the query-embedding call failed or exceeded \
@@ -1192,9 +1189,9 @@ impl Metrics {
              for this deployment's embedding provider or the provider is \
              unhealthy. Always zero on keyword-tier deployments.",
         )?;
-        registry.register(Box::new(recall_embed_degraded_total.clone()))?;
 
-        let rerank_budget_degraded_total = IntCounter::new(
+        let rerank_budget_degraded_total = int_counter(
+            &registry,
             "ai_memory_rerank_budget_degraded_total",
             "Monotonic counter of autonomous-tier recalls whose cross-encoder \
              rerank was SKIPPED because its estimated forward cost exceeded \
@@ -1206,27 +1203,27 @@ impl Metrics {
              mis-sized for this corpus. Always zero when the budget is \
              disabled (=0) or on non-neural reranker deployments.",
         )?;
-        registry.register(Box::new(rerank_budget_degraded_total.clone()))?;
 
-        let query_embed_cache_hits_total = IntCounter::new(
+        let query_embed_cache_hits_total = int_counter(
+            &registry,
             "ai_memory_query_embed_cache_hits_total",
             "Monotonic counter of recall query embeddings served from the \
              process-local bounded cache instead of a remote round trip \
              (#2577). Zero under repeated traffic means the cache is disabled \
              (AI_MEMORY_QUERY_EMBED_CACHE_ENTRIES=0) or every query is unique.",
         )?;
-        registry.register(Box::new(query_embed_cache_hits_total.clone()))?;
 
-        let autotag_enqueued_total = IntCounter::new(
+        let autotag_enqueued_total = int_counter(
+            &registry,
             "ai_memory_autotag_enqueued_total",
             "Monotonic counter of auto_tag jobs successfully enqueued onto \
              the bounded background worker after a durable HTTP create-memory \
              write (#2587). Rising with autonomous-tier write traffic is the \
              healthy shape.",
         )?;
-        registry.register(Box::new(autotag_enqueued_total.clone()))?;
 
-        let autotag_dropped_total = IntCounter::new(
+        let autotag_dropped_total = int_counter(
+            &registry,
             "ai_memory_autotag_dropped_total",
             "Monotonic counter of auto_tag jobs DROPPED because the bounded \
              queue (AI_MEMORY_AUTOTAG_QUEUE_CAPACITY) was full, or no worker \
@@ -1235,17 +1232,17 @@ impl Metrics {
              sustained increment rate: the queue is under-sized for the \
              write burst.",
         )?;
-        registry.register(Box::new(autotag_dropped_total.clone()))?;
 
-        let autotag_applied_total = IntCounter::new(
+        let autotag_applied_total = int_counter(
+            &registry,
             "ai_memory_autotag_applied_total",
             "Monotonic counter of auto_tag jobs the background worker applied \
              successfully — tags merged onto the row, never a blind \
              overwrite (#2587).",
         )?;
-        registry.register(Box::new(autotag_applied_total.clone()))?;
 
-        let autotag_degraded_total = IntCounter::new(
+        let autotag_degraded_total = int_counter(
+            &registry,
             "ai_memory_autotag_degraded_total",
             "Monotonic counter of auto_tag jobs the background worker gave up \
              on — LLM error, LLM call exceeded llm_call_timeout, the row was \
@@ -1254,16 +1251,16 @@ impl Metrics {
              data corruption — the durable write this job followed already \
              succeeded.",
         )?;
-        registry.register(Box::new(autotag_degraded_total.clone()))?;
 
-        let atomise_enqueued_total = IntCounter::new(
+        let atomise_enqueued_total = int_counter(
+            &registry,
             "ai_memory_atomise_enqueued_total",
             "Monotonic counter of auto-atomise jobs enqueued onto the bounded \
              single-consumer background worker after a durable write (#2986).",
         )?;
-        registry.register(Box::new(atomise_enqueued_total.clone()))?;
 
-        let atomise_dropped_total = IntCounter::new(
+        let atomise_dropped_total = int_counter(
+            &registry,
             "ai_memory_atomise_dropped_total",
             "Monotonic counter of auto-atomise jobs DROPPED because the bounded \
              queue (AI_MEMORY_ATOMISE_QUEUE_CAPACITY) was full or no worker was \
@@ -1271,24 +1268,24 @@ impl Metrics {
              DEGRADE (no atoms; `memory_atomise` recovers it), never a write \
              failure. Alert on a sustained increment rate.",
         )?;
-        registry.register(Box::new(atomise_dropped_total.clone()))?;
 
-        let atomise_applied_total = IntCounter::new(
+        let atomise_applied_total = int_counter(
+            &registry,
             "ai_memory_atomise_applied_total",
             "Monotonic counter of auto-atomise passes that landed atoms — the \
              synchronous MCP path or a drained background job (#2986).",
         )?;
-        registry.register(Box::new(atomise_applied_total.clone()))?;
 
-        let atomise_degraded_total = IntCounter::new(
+        let atomise_degraded_total = int_counter(
+            &registry,
             "ai_memory_atomise_degraded_total",
             "Monotonic counter of auto-atomise passes that FAILED (curator \
              error, db-open failure) (#2986). A DEGRADE, never data loss — the \
              durable source row is untouched on every failure arm.",
         )?;
-        registry.register(Box::new(atomise_degraded_total.clone()))?;
 
-        let atomise_no_curator_total = IntCounter::new(
+        let atomise_no_curator_total = int_counter(
+            &registry,
             "ai_memory_atomise_no_curator_total",
             "Monotonic counter of writes whose namespace standard REQUESTED \
              auto_atomise on a daemon with NO curator — no LLM wired, or \
@@ -1296,36 +1293,34 @@ impl Metrics {
              MISCONFIGURATION, not load: the knob is set and structurally \
              dead. `ai-memory doctor` names the same condition.",
         )?;
-        registry.register(Box::new(atomise_no_curator_total.clone()))?;
 
-        let record_stop_gate_indeterminate_total = IntCounter::new(
+        let record_stop_gate_indeterminate_total = int_counter(
+            &registry,
             "ai_memory_record_stop_gate_indeterminate_total",
             "Monotonic counter of record-stop gate FAIL-CLOSED refusals: the \
              audit chain could not be read, so the mutating write was \
              refused rather than proceeding (#3877, vote 4d3ea1c5). Alert \
              on a sustained rate: every gated write is being refused.",
         )?;
-        registry.register(Box::new(record_stop_gate_indeterminate_total.clone()))?;
 
-        let governance_check_audit_suppressed_total = IntCounter::new(
+        let governance_check_audit_suppressed_total = int_counter(
+            &registry,
             "ai_memory_governance_check_audit_suppressed_total",
             "Monotonic counter of governance.check audit appends SUPPRESSED \
              under an engaged record-stop (#3818): the check still answers, \
              the audit row is skipped and a WARN names it.",
         )?;
-        registry.register(Box::new(governance_check_audit_suppressed_total.clone()))?;
 
-        let capability_expansion_audit_suppressed_total = IntCounter::new(
+        let capability_expansion_audit_suppressed_total = int_counter(
+            &registry,
             "ai_memory_capability_expansion_audit_suppressed_total",
             "Monotonic counter of capability-expansion audit appends \
              SUPPRESSED under an engaged record-stop (#3818); the expansion \
              itself still resolves.",
         )?;
-        registry.register(Box::new(
-            capability_expansion_audit_suppressed_total.clone(),
-        ))?;
 
-        let age_projection_pending_depth = IntGauge::new(
+        let age_projection_pending_depth = int_gauge(
+            &registry,
             "ai_memory_age_projection_pending_depth",
             "Current depth of the kg_projection_outbox (pending deferred AGE \
              projections, projected_at IS NULL), refreshed each cold-drainer \
@@ -1333,23 +1328,22 @@ impl Metrics {
              memory_links truth (Pillar-4 4.C, #1735). Always 0 under the \
              default sync projection mode.",
         )?;
-        registry.register(Box::new(age_projection_pending_depth.clone()))?;
 
-        let age_projection_failed_total = IntCounter::new(
+        let age_projection_failed_total = int_counter(
+            &registry,
             "ai_memory_age_projection_failed_total",
             "Monotonic count of deferred AGE-projection drain attempts that \
              errored (MERGE failed; row attempt_count bumped, retried until \
              quarantine). Pillar-4 4.C (#1735).",
         )?;
-        registry.register(Box::new(age_projection_failed_total.clone()))?;
 
-        let age_projection_quarantined_total = IntCounter::new(
+        let age_projection_quarantined_total = int_counter(
+            &registry,
             "ai_memory_age_projection_quarantined_total",
             "Monotonic count of kg_projection_outbox rows that hit the \
              drain attempt ceiling and were quarantined (relational edge \
              exists but never reached the AGE graph). Pillar-4 4.C (#1735).",
         )?;
-        registry.register(Box::new(age_projection_quarantined_total.clone()))?;
 
         Ok(Self {
             registry,
