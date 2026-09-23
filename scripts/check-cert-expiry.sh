@@ -105,6 +105,15 @@
 
 set -euo pipefail
 
+# --- #3801 portable "insert TEXT as the new first line" (BSD + GNU) -----------
+# Replaces the GNU-only `sed -i '1i TEXT'` one-liner (BSD `i` needs `i\<newline>`).
+# printf + cat yields the identical file on both. prepend_line TEXT FILE.
+prepend_line() {
+    local __line=$1 __file=$2 __tmp
+    __tmp="${__file}.pre.$$"
+    { printf '%s\n' "$__line"; cat "$__file"; } >"$__tmp" && mv "$__tmp" "$__file"
+}
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 CERT_DOC="docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md"
@@ -1009,7 +1018,7 @@ self_test() {
     #      reader would read VOID and pass; the gate reads exactly one.
     echo "// mutate" >>"$repo/src/federation/mod.rs"
     write_banner LIVE "$genesis_sha"
-    sed -i '1i > ## STATUS — **VOID as of 2026-01-02** (decoy)' "$repo/docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md"
+    prepend_line '> ## STATUS — **VOID as of 2026-01-02** (decoy)' "$repo/docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md"
     git -C "$repo" add src/federation/mod.rs "$CERT_DOC"
     git -C "$repo" commit -q -m "violate: decoy STATUS line above the banner + wire change"
     local decoy_status_sha
@@ -1036,7 +1045,7 @@ self_test() {
     local wire_sha
     wire_sha="$(git -C "$repo" rev-parse HEAD)"
     write_banner LIVE "$genesis_sha"
-    sed -i "1i **Binds to:** \`${wire_sha}\` (decoy)" "$repo/docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md"
+    prepend_line "**Binds to:** \`${wire_sha}\` (decoy)" "$repo/docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md"
     git -C "$repo" add "$CERT_DOC"
     git -C "$repo" commit -q -m "violate: decoy Binds-to line above the real one"
     local decoy_binds_sha

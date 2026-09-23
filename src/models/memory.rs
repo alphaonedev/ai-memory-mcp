@@ -618,10 +618,18 @@ pub const TITLE_SLOT_INDEX_PREDICATE: &str = "lifecycle_state <> 'tombstoned'";
 /// BEFORE its statement runs, so the admission and the disposition read the
 /// same value (the #3730 rule: a gate that runs before the lookup that
 /// qualifies it is not a gate). #3750 — the FEDERATION funnels do NOT consult
-/// it: `merge_inbound` / `apply_remote_memory` resolve an existing row by `id`
-/// and merge `lifecycle_state` by LWW (`crate::models::crdt_merge`), so on the
-/// replication path the #3730 gate is currently unenforced — a known gap whose
-/// code fix is deferred to v1.1 per #3750, not a property this predicate holds.
+/// it, so on the replication path the #3730 gate is unenforced (a known gap,
+/// code fix deferred to v1.1). The same-id merge path also DIVERGES by backend
+/// for the system-only states (`quarantined` / `contaminated`), so there is no
+/// single mechanism to name here: sqlite `db::merge_inbound` reaches them
+/// through `db::get`, which HIDES a non-recall-visible row (#2402), so the write
+/// takes `insert_if_newer` (SQL-CASE LWW + a 5-key metadata rebuild that
+/// DESTROYS the contamination record); postgres `merge_inbound` reads the row
+/// RAW (no lifecycle filter) and field-merges via `merge_memory`
+/// (`crate::models::crdt_merge`), whose deep metadata merge PRESERVES it. For
+/// RECALL-VISIBLE states both backends field-merge via crdt_merge. That
+/// preserve-vs-destroy asymmetry is the #3905 cross-backend parity defect
+/// (described here, not fixed).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TitleSlotAdmission {
     /// The occupant is a live, caller-visible row: the funnel's ordinary

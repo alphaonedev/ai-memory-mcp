@@ -63,25 +63,28 @@ pub const PG_SSLMODE_FLOOR: &str = "verify-full";
 
 /// #3709 item 5 — every fail-closed refusal names what resolves it, worded
 /// as what EXISTS in this commit (the `--tls-cert/--tls-key` flags, the
-/// literal DSN parameters, the files under `<key_dir>/tls`). A refusal whose
-/// remedy is a fiction is worse than one with no remedy: the operator does
-/// what we told them, gets "unrecognized subcommand", and distrusts the
-/// message. The `ai-memory tls …` / `db check-tls` verbs (#3709 items 2-4,
-/// v1.0.1) re-point these constants when they ship — nothing else changes.
-pub const REMEDY_SUPPLY_TLS: &str = "supply --tls-cert <fullchain.pem> --tls-key <key.pem> (on the \
-     singleton shape leave both unset and first boot mints the local certificate under \
-     <key_dir>/tls/)";
-pub const REMEDY_TLS_RENEW: &str = "replace <key_dir>/tls/server.pem and server.key with fresh material \
-     (operator-supplied files are re-read by the daily reload; a locally minted leaf is \
-     re-issued at the next boot)";
+/// literal DSN parameters, the files under `<key_dir>/tls`, and since #3709
+/// item 2 the `ai-memory tls init` / `tls import` / `tls status` verbs). A
+/// refusal whose remedy is a fiction is worse than one with no remedy: the
+/// operator does what we told them, gets "unrecognized subcommand", and
+/// distrusts the message. `db check-tls` (#3709 item 4) is NOT shipped and
+/// no remedy names it; `every_refusal_names_its_fix_3709` pins both halves.
+pub const REMEDY_SUPPLY_TLS: &str = "supply --tls-cert <fullchain.pem> --tls-key <key.pem>, or install a pair \
+     with `ai-memory tls import --cert <fullchain.pem> --key <key.pem>` (on the singleton \
+     shape leave both unset and first boot mints the local certificate under <key_dir>/tls/, \
+     as does `ai-memory tls init`)";
+pub const REMEDY_TLS_RENEW: &str = "install fresh material with `ai-memory tls import --cert <fullchain.pem> \
+     --key <key.pem>` (or replace <key_dir>/tls/server.pem and server.key by hand); a locally \
+     minted leaf is re-issued at the next boot; `ai-memory tls status` shows the expiry";
 pub const REMEDY_PG_SSLMODE: &str = "add `sslmode=verify-full&sslrootcert=<ca.crt>` to the store URL's \
      query (`?…` or `&…` after an existing query; AI_MEMORY_STORE_URL / --store-url)";
 pub const REMEDY_USE_HTTPS: &str = "change the URL to https://";
 /// #3709 (3x7 audit ruling): a deployment whose DECLARED shape is not
 /// `singleton` takes ENTERPRISE PKI — bring your own certificate; the
 /// product never mints an unmanaged CA into an estate.
-pub const REMEDY_ENTERPRISE_PKI: &str = "supply a certificate issued by your PKI: --tls-cert <fullchain.pem> --tls-key <key.pem>; \
-     see docs/SECURITY.md \"Bring your own certificate\"";
+pub const REMEDY_ENTERPRISE_PKI: &str = "supply a certificate issued by your PKI: --tls-cert <fullchain.pem> --tls-key <key.pem>, \
+     or install it once with `ai-memory tls import --cert <fullchain.pem> --key <key.pem> \
+     [--ca <ca.pem>]`; see docs/SECURITY.md \"Bring your own certificate\"";
 
 /// Canonical falsy tokens (the substrate-wide grammar's negative half).
 fn is_falsy(v: &str) -> bool {
@@ -815,8 +818,19 @@ mod tests {
         assert!(plaintext_listener_refusal("127.0.0.1", 9077).contains(REMEDY_SUPPLY_TLS));
         assert!(plaintext_url_refusal("webhook target", "http://x").contains(REMEDY_USE_HTTPS));
         assert!(pg_sslmode_refusal().contains(REMEDY_PG_SSLMODE));
-        // #3705 review: every remedy names what EXISTS in this commit — no
-        // `ai-memory tls …` / `db check-tls` verb (v1.0.1) is promised.
+        // #3705 review / #3709 item 2: every remedy names what EXISTS in this
+        // commit. The `ai-memory tls` verbs ship with item 2, so the three
+        // certificate remedies MUST name them (presence); `db check-tls`
+        // (item 4) does not ship, so no remedy may promise it (absence).
+        for remedy in [REMEDY_SUPPLY_TLS, REMEDY_TLS_RENEW, REMEDY_ENTERPRISE_PKI] {
+            assert!(remedy.contains("ai-memory tls"), "{remedy}");
+        }
+        assert!(
+            REMEDY_SUPPLY_TLS
+                .contains("`ai-memory tls import --cert <fullchain.pem> --key <key.pem>`")
+        );
+        assert!(REMEDY_SUPPLY_TLS.contains("`ai-memory tls init`"));
+        assert!(REMEDY_TLS_RENEW.contains("`ai-memory tls status`"));
         for remedy in [
             REMEDY_SUPPLY_TLS,
             REMEDY_TLS_RENEW,
@@ -824,7 +838,6 @@ mod tests {
             REMEDY_USE_HTTPS,
             REMEDY_ENTERPRISE_PKI,
         ] {
-            assert!(!remedy.contains("ai-memory tls"), "{remedy}");
             assert!(!remedy.contains("check-tls"), "{remedy}");
         }
         assert!(REMEDY_SUPPLY_TLS.contains("--tls-cert <fullchain.pem> --tls-key <key.pem>"));

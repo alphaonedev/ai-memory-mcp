@@ -78,6 +78,17 @@
 
 set -euo pipefail
 
+# --- #3801 portable in-place edit (BSD + GNU) --------------------------------
+# GNU and BSD/macOS `sed -i` disagree: BSD reads the next token as a mandatory
+# backup suffix, so the GNU `sed -i EXPR FILE` form errors (or eats the script)
+# on macOS. Writing to a sibling temp then mv is byte-identical on both. Same
+# args as `sed -i`: sed_i EXPR FILE. No change to what the gate checks.
+sed_i() {
+    local __expr=$1 __file=$2 __tmp
+    __tmp="${__file}.sedi.$$"
+    sed "$__expr" "$__file" >"$__tmp" && mv "$__tmp" "$__file"
+}
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CORPUS_ROOT="${REPO_ROOT}/conformance"
 MANIFEST="${CORPUS_ROOT}/manifest.json"
@@ -589,7 +600,7 @@ run_self_test() {
     # merely prints PASS lines sails through. This is what separates
     # "two interpreters ran" from "a reader verified".
     d="${base}/p2"; stage_corpus_copy "$d"
-    sed -i 's/"verdict": "signature-invalid"/"verdict": "signature-valid"/' "${d}/manifest.json"
+    sed_i 's/"verdict": "signature-invalid"/"verdict": "signature-valid"/' "${d}/manifest.json"
     expect_corpus_reject "tampered vector re-labelled valid" "$d" "reader run FAILED"
 
     # ---- P3: a no-op reader that exits 0 printing nothing ------------------

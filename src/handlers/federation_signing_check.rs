@@ -685,12 +685,18 @@ pub(super) async fn sync_push_via_store(
             Ok(applied_id) => {
                 applied += 1;
                 // v1.0.0 R19/A3 (#1948) — route-OUT dequarantine-on-attest
-                // (postgres twin). #3750 — `merge_inbound` does NOT preserve
-                // an existing row's lifecycle_state: `merge_memory` resolves
-                // it by LWW, so the local quarantine survives only when the
-                // local row wins the tiebreak. So a now-attested write clears
-                // any prior quarantine EXPLICITLY via the SAL raw-UPDATE
-                // surface, regardless of how the merge resolved.
+                // (postgres twin). #3750 — this funnel's path DIFFERS from the
+                // sqlite one: `PostgresStore::merge_inbound` reads the existing
+                // row via a RAW `SELECT ... WHERE id = $1` (no lifecycle filter —
+                // it deliberately bypasses the visibility gate), so a quarantined
+                // / contaminated row IS returned and is field-merged via
+                // `crate::models::merge_memory` — crdt_merge resolves
+                // lifecycle_state by LWW, and its `deep_merge_json` starts from
+                // the LOCAL metadata, so a local-only contamination record is
+                // PRESERVED (sqlite DESTROYS it via `insert_if_newer`'s rebuild:
+                // the #3905 cross-backend parity gap). The dequarantine below
+                // still clears any prior quarantine EXPLICITLY on attest,
+                // independent of the merge outcome.
                 if crate::handlers::federation_receive::row_is_agent_attested(&to_insert) {
                     let _ = app.store.dequarantine(&applied_id).await;
                 }

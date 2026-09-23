@@ -361,7 +361,7 @@ pub(crate) async fn metrics() -> Response {
     let m = crate::metrics::registry();
     // Explicit scalar collectors only. Never forward the global registry:
     // labels elsewhere may contain tenant-controlled strings or peer URLs.
-    let collectors: [&dyn Collector; 15] = [
+    let collectors: [&dyn Collector; 18] = [
         &m.federation_partial_quorum_total,
         &m.admission_shed_total,
         &m.auth_failures_total,
@@ -377,6 +377,9 @@ pub(crate) async fn metrics() -> Response {
         &m.atomise_dropped_total,
         &m.atomise_applied_total,
         &m.atomise_degraded_total,
+        &m.record_stop_gate_indeterminate_total,
+        &m.governance_check_audit_suppressed_total,
+        &m.capability_expansion_audit_suppressed_total,
     ];
     let families: Vec<_> = collectors.iter().flat_map(|c| c.collect()).collect();
     let mut bytes = Vec::new();

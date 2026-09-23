@@ -1333,6 +1333,52 @@ fn emit_check_event(
     action: &AgentAction,
     decision: &Decision,
 ) -> Result<()> {
+    // #3818 (5-agent vote `4d3ea1c5`, #3818 comments 5774193216 + 5774241939) —
+    // under an ENGAGED record-stop the `governance.check` row is a record-plane
+    // mutation, so it is SKIPPED and the verdict CONTINUES: this helper never
+    // returns `Err` for the stop (its `:1277`-class caller takes `?`, so an `Err`
+    // would make `check_agent_action` FAIL under stop — the delist shape the vote
+    // gave zero votes, and one a harness reads as tool-unavailable-proceed). The
+    // gate lives INSIDE the emitter so BOTH funnels — `check_agent_action_cached`
+    // and `gate_read` (search / get / list / recall once a read rule exists) —
+    // and any future caller are covered at the class. It cannot wedge resume:
+    // this is a governance helper, not the primitive; it is not on the B7
+    // allowlist, and resume appends through `append_attestation_sqlite` ->
+    // `append_signed_event`, never through here. Stated cost, intended: the
+    // judge-signed `GovernanceVerdict` (`maybe_emit_governance_verdict`, opt-in)
+    // is suppressed with the row — it is a record-plane artefact too. The
+    // forensic-file emit (`emit_forensic_decision`) is the CALLER's and stays
+    // LIVE, so an operator keeps visibility during the window. The gap is
+    // counted + WARNed so it is visible, never silent. An INDETERMINATE gate
+    // (#3877: chain unreadable) fails CLOSED on the write the same way.
+    match crate::storage::record_stop::gate_storage_conn(conn) {
+        Ok(()) => {}
+        Err(crate::storage::StorageError::RecordStopped { issued_by, scope }) => {
+            crate::metrics::inc_governance_check_audit_suppressed();
+            tracing::warn!(
+                target: crate::governance::GOVERNANCE_RULES_TRACE_TARGET,
+                agent_id,
+                kind = action.kind(),
+                issued_by = %issued_by,
+                scope = %scope,
+                "#3818: governance.check audit row SUPPRESSED under record-stop \
+                 (verdict returned; forensic emit live; resume clears)"
+            );
+            return Ok(());
+        }
+        Err(e) => {
+            crate::metrics::inc_governance_check_audit_suppressed();
+            tracing::warn!(
+                target: crate::governance::GOVERNANCE_RULES_TRACE_TARGET,
+                agent_id,
+                kind = action.kind(),
+                error = %e,
+                "#3818: governance.check audit row SUPPRESSED — record-stop state \
+                 indeterminate, failing closed on the write (verdict returned)"
+            );
+            return Ok(());
+        }
+    }
     // Canonical representation: serialize {action, decision} as a
     // stable JSON object and hash it. A future format-agility
     // change recomputes the hash over a different canonical

@@ -49,7 +49,10 @@ pub(crate) fn mcp_tool_is_read_only(name: &str) -> bool {
             | t::MEMORY_SIGNAL_THREAD
             | t::MEMORY_SKILL_GET
             | t::MEMORY_SKILL_LIST
-            | t::MEMORY_SKILL_EXPORT
+            // #3818 (vote 4d3ea1c5): MEMORY_SKILL_EXPORT is DELISTED — it does
+            // create_dir_all + fs::write of a SKILL bundle + resources tree onto
+            // operator disk (a real mutation no whole-DB table-hash can observe),
+            // so it must be FENCED under record-stop, not merely de-written.
             | t::MEMORY_SKILL_RESOURCE
             | t::MEMORY_SKILL_COMPOSITIONAL_CONTEXT
             | t::MEMORY_ARCHIVE_LIST

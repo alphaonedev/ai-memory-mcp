@@ -47,7 +47,6 @@ read	memory_skill_get	skills substrate (collective artefacts, not memory rows); 
 read	memory_skill_list	skills substrate listing (collective artefacts); not memory rows
 read	memory_skill_resource	skill resource blob (bounded zstd, #1933); skills are collective artefacts, not memory rows
 read	memory_skill_compositional_context	skill composition view over skill artefacts; not memory rows
-read	memory_skill_export	writes a skill bundle into the export jail (#3357); skill artefact, not memory rows
 read	memory_deref	offload blob keyed by ref_id and bound to the resolved agent_id (offload.rs); not a memory-row read
 # (c) memory rows gated by a sibling predicate the inventory cannot see in the handler file
 read	memory_archive_list	owner-scoped *_for_caller twin over archived_memories (#3382) — the gate is the SAL query, not the row predicate

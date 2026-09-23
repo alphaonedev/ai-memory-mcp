@@ -297,6 +297,18 @@ async fn issue_3646_tls_auth_revocation_and_health_contract() {
             body.contains("# TYPE ai_memory_admission_shed_total counter"),
             "{body}"
         );
+        // #3915 — the three record-stop counters (#3877 / #3818) must RENDER,
+        // not merely increment: a counter nothing exposes is the #2444 shape.
+        for name in [
+            "ai_memory_record_stop_gate_indeterminate_total",
+            "ai_memory_governance_check_audit_suppressed_total",
+            "ai_memory_capability_expansion_audit_suppressed_total",
+        ] {
+            assert!(
+                body.contains(&format!("# TYPE {name} counter")),
+                "{name} missing from the monitoring metrics render: {body}"
+            );
+        }
     }
     keys.install(std::collections::HashMap::new());
     assert_eq!(

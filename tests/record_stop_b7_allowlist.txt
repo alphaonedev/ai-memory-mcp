@@ -2,6 +2,12 @@
 # Do NOT add a MUST_BE_GATED name here. Actuator rows keep resume live.
 src/signed_events.rs	append_signed_event_no_tx
 src/storage/record_stop.rs	append_attestation_sqlite
+# Reviewed false positives (f2r 2026-09-22 sweep of ALL 67 rows): NEITHER function writes.
+# `query` is the pure SELECT `CHECKPOINT_SELECT_SQL` (prepare + query_map, zero write SQL);
+# `is_constraint_violation` is a 7-line `matches!` over a `rusqlite::Error` that takes no
+# Connection and executes nothing. KEPT, not deleted, because the boundary heuristic still
+# attributes the adjacent SQL to them — exactly as for `close_timeout_relaxed_conn` and
+# `usd_string` below.
 src/checkpoints/mod.rs	query
 src/checkpoints/mod.rs	is_constraint_violation
 src/actions/mod.rs	sweep_expired_leases_reclaim
@@ -55,10 +61,12 @@ src/storage/sync_state_rekey.rs	rekey_peer
 # rows above and the #3659 delivery-audit rows below. Reviewed (f2r).
 src/storage/mod.rs	sync_peer_record_contact
 src/storage/mod.rs	memories_updated_since_counted
+# Reviewed false positive (f2r 2026-09-22): one `query_row` of
+# `SELECT COUNT(*) FROM memories WHERE embedding IS NOT NULL ...` — a read used by `stats`.
+# No write SQL, no `execute`. Kept for the same attribution reason as the rows above.
 src/storage/mod.rs	dim_violations
 src/storage/mod.rs	revoke_agent_api_key
 src/storage/mod.rs	insert_subkey_cert
-src/storage/mod.rs	revoke_agent_pubkey
 src/storage/doctor.rs	record_capability_expansion
 src/storage/model_attest.rs	record_loader_observed
 src/storage/model_attest.rs	enroll_operator_signed

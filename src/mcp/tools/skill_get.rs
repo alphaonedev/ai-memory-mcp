@@ -61,7 +61,16 @@ fn record_skill_invocation(
         timestamp: recorded_at.clone(),
         ..crate::signed_events::SignedEvent::default()
     };
-    let _ = crate::signed_events::append_signed_event(conn, &event); // best-effort
+    // #3818 (5-agent vote 4d3ea1c5) — gate the SKILL_INVOKED audit append at the
+    // CALL SITE: under record-stop, skip it. A read must not mutate the audit
+    // chain while stopped (record-stop = no record-plane mutation, reads stay
+    // live). NOT inside `append_signed_event`: the record-stop RESUME actuator
+    // appends through it (`append_attestation_sqlite`, B7-allowlisted), so gating
+    // the primitive would wedge the stop unreleasable. The best-effort `let _ =`
+    // already absorbs the skip.
+    if crate::storage::record_stop::gate_storage_conn_rusqlite(conn).is_ok() {
+        let _ = crate::signed_events::append_signed_event(conn, &event); // best-effort
+    }
     json!({
         "event_id": event_id,
         "recorded_at": recorded_at,

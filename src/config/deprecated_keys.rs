@@ -65,7 +65,7 @@ pub const DEPRECATED_KEYS: &[DeprecatedKey] = &[
     },
     DeprecatedKey {
         key: "embed_url",
-        replacement: "[embeddings].url",
+        replacement: crate::config::config_keys::EMBEDDINGS_URL,
         deprecated_in: V1_FLAT_DEPRECATED_IN,
         removed_in: None,
     },

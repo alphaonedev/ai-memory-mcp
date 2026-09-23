@@ -267,9 +267,11 @@ fn fleet_shape_without_certs_refuses_naming_enterprise_pki_3709() {
         assert!(err.contains("FLEET-shaped"), "{err}");
         assert!(err.contains("enterprise PKI"), "{err}");
         assert!(err.contains("--tls-cert <fullchain.pem>"), "{err}");
+        // #3709 item 2 — the `ai-memory tls` verbs exist now, so the remedy
+        // names one (`tls import`); the inverse pin held while it was fiction.
         assert!(
-            !err.contains("ai-memory tls"),
-            "no fictional verb in a remedy: {err}"
+            err.contains("`ai-memory tls import"),
+            "the remedy names the verb that now exists: {err}"
         );
         assert!(err.contains("Bring your own certificate"), "{err}");
         assert!(
@@ -298,4 +300,97 @@ fn fleet_shape_without_certs_refuses_naming_enterprise_pki_3709() {
             .join(ai_memory::tls_bootstrap::SERVER_CERT_FILE)
             .is_file()
     );
+}
+
+// ---------------------------------------------------------------------------
+// #3709 F7 — the verdict predicate must see the KEY as well as the certificate.
+// An operator `server.pem` installed WITHOUT its `server.key` previously read
+// back as `ServesOperator` (a false attestation) while `resolve_tls_material`
+// fell through to the local bootstrap and minted a local certificate OVER it.
+// Both halves of a broken pair are now a TYPED REFUSAL on EVERY shape, naming
+// the missing file and the fix. RED-first per cell (asserted via `refuses()` /
+// `render()`, which exist before and after the fix): before the fix a
+// cert-without-key is `ServesOperator` (`refuses() == false`, no `server.key`
+// in the message) and a key-without-cert is `MintsLocal` / `RefusesFleetNeedsPki`
+// (no `server.pem` in the message).
+// ---------------------------------------------------------------------------
+
+fn install_leaf_dir(root: &Path) -> std::path::PathBuf {
+    let kd = key_dir(root);
+    key_dir_sandbox::mkdir_0700(&kd);
+    let tls = kd.join(ai_memory::tls_bootstrap::TLS_SUBDIR);
+    key_dir_sandbox::mkdir_0700(&tls);
+    tls
+}
+
+#[test]
+fn cert_without_key_is_a_typed_refusal_naming_server_key_3709_f7() {
+    use ai_memory::tls_bootstrap::{
+        SERVER_CERT_FILE, SERVER_KEY_FILE, leaf_status, listener_verdict,
+    };
+    let root = tempfile::tempdir().unwrap();
+    let tls = install_leaf_dir(root.path());
+    // A valid (operator-shaped) certificate, WITHOUT its private key.
+    let pair = TestTls::generate(&root.path().join("gen"));
+    std::fs::copy(&pair.cert_path, tls.join(SERVER_CERT_FILE)).unwrap();
+    assert!(
+        !tls.join(SERVER_KEY_FILE).exists(),
+        "the key is deliberately absent"
+    );
+
+    for shape in [singleton_shape(), fleet_shape()] {
+        let status = leaf_status(&key_dir(root.path())).unwrap();
+        assert!(status.present, "the certificate is installed");
+        let verdict = listener_verdict(&status, shape);
+        assert!(
+            verdict.refuses(),
+            "#3709 F7: a certificate without its key must REFUSE on {shape:?}, not serve (a lone \
+             cert falls through to the local bootstrap and mints OVER it while attesting it is \
+             served); got {verdict:?}"
+        );
+        let msg = verdict.render(shape);
+        assert!(
+            msg.contains(SERVER_KEY_FILE),
+            "the refusal must NAME the missing key file so the operator need not read source: {msg}"
+        );
+        assert!(
+            msg.contains("ai-memory tls import"),
+            "the refusal must name the remedy: {msg}"
+        );
+    }
+}
+
+#[test]
+fn key_without_cert_is_a_typed_refusal_naming_server_pem_3709_f7() {
+    use ai_memory::tls_bootstrap::{
+        SERVER_CERT_FILE, SERVER_KEY_FILE, leaf_status, listener_verdict,
+    };
+    let root = tempfile::tempdir().unwrap();
+    let tls = install_leaf_dir(root.path());
+    // A private key, WITHOUT its certificate.
+    let pair = TestTls::generate(&root.path().join("gen"));
+    std::fs::copy(&pair.key_path, tls.join(SERVER_KEY_FILE)).unwrap();
+    assert!(
+        !tls.join(SERVER_CERT_FILE).exists(),
+        "the certificate is deliberately absent"
+    );
+
+    for shape in [singleton_shape(), fleet_shape()] {
+        let status = leaf_status(&key_dir(root.path())).unwrap();
+        assert!(!status.present, "the certificate is absent");
+        let verdict = listener_verdict(&status, shape);
+        assert!(
+            verdict.refuses(),
+            "#3709 F7: a private key without its certificate must REFUSE on {shape:?}; got {verdict:?}"
+        );
+        let msg = verdict.render(shape);
+        assert!(
+            msg.contains(SERVER_CERT_FILE),
+            "the refusal must NAME the missing certificate file: {msg}"
+        );
+        assert!(
+            msg.contains("ai-memory tls import"),
+            "the refusal must name the remedy: {msg}"
+        );
+    }
 }

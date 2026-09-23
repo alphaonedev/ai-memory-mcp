@@ -62,6 +62,17 @@
 
 set -euo pipefail
 
+# --- #3801 portable in-place edit (BSD + GNU) --------------------------------
+# GNU and BSD/macOS `sed -i` disagree: BSD reads the next token as a mandatory
+# backup suffix, so the GNU `sed -i EXPR FILE` form errors (or eats the script)
+# on macOS. Writing to a sibling temp then mv is byte-identical on both. Same
+# args as `sed -i`: sed_i EXPR FILE. No change to what the gate checks.
+sed_i() {
+    local __expr=$1 __file=$2 __tmp
+    __tmp="${__file}.sedi.$$"
+    sed "$__expr" "$__file" >"$__tmp" && mv "$__tmp" "$__file"
+}
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 INSTALLER="${REPO_ROOT}/install.sh"
 WORKFLOW="${REPO_ROOT}/.github/workflows/release.yml"
@@ -489,7 +500,7 @@ run_static_self_test() {
 
     # P2 — the exact #2449 warn-and-continue branch put back.
     d="${base}/p2"; stage_repo_copy "$d"
-    sed -i 's|^    echo "Verifying checksum\.\.\."$|    echo "Warning: Checksum file not available, skipping verification."|' "${d}/install.sh"
+    sed_i 's|^    echo "Verifying checksum\.\.\."$|    echo "Warning: Checksum file not available, skipping verification."|' "${d}/install.sh"
     expect_static "install.sh fail-open phrase" "$d" fail
 
     # P3 — an abort branch removed (the gate counts abort sites, so
@@ -507,14 +518,14 @@ PY
     # P4 — the release.yml checksum sweep steps deleted, which is how the
     # glob-published tarballs silently lose their .sha256 again.
     d="${base}/p4"; stage_repo_copy "$d"
-    sed -i "s|# ${SWEEP_SENTINEL}||g" "${d}/.github/workflows/release.yml"
+    sed_i "s|# ${SWEEP_SENTINEL}||g" "${d}/.github/workflows/release.yml"
     expect_static "release.yml sweep removed" "$d" fail
 
     # P5 — a concrete artifact published with its sibling .sha256 entry
     # dropped from the same files: list (how a NEW artifact type would
     # ship unverified).
     d="${base}/p5"; stage_repo_copy "$d"
-    sed -i '/dist\/ai-memory-ios\.xcframework\.tar\.gz\.sha256/d' "${d}/.github/workflows/release.yml"
+    sed_i '/dist\/ai-memory-ios\.xcframework\.tar\.gz\.sha256/d' "${d}/.github/workflows/release.yml"
     expect_static "release.yml sibling dropped" "$d" fail
 
     rm -rf "$base"

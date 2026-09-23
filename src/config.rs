@@ -140,6 +140,9 @@ pub use shape::{
 mod auto_tag_endpoint;
 /// v1.0.0 #3715 item 3 — the key deprecation lifecycle, as data.
 pub mod deprecated_keys;
+/// #3823 — refuse a non-loopback plaintext inference endpoint at config
+/// time, naming the key. Child module so config.rs stays under its ceiling.
+mod inference_endpoint_transit;
 /// #3715 — unknown-key refusal at the loader, schema-derived.
 pub mod unknown_keys;
 
@@ -163,6 +166,10 @@ pub mod config_keys {
     pub const DEFAULT_NAMESPACE: &str = "default_namespace";
     /// Legacy flat `embedding_model` key (v2: `[embeddings].model`).
     pub const EMBEDDING_MODEL: &str = "embedding_model";
+    /// `[embeddings].url` sectioned config-key label (#3823 SSOT so the
+    /// bracketed label is not scattered across the deprecation replacement,
+    /// the transit-scheme validator, and the doctor egress readout).
+    pub const EMBEDDINGS_URL: &str = "[embeddings].url";
     /// Legacy flat `max_memory_mb` key. PARSED but NOT ENFORCED (FBL-13):
     /// it has no runtime consumer — it does not cap memory or storage and is
     /// NOT an auto-tier-selection input on any live path. `resolve_storage`
@@ -8739,6 +8746,9 @@ impl AppConfig {
                 );
             }
         }
+        // #3823 — rejection 6: a non-loopback plaintext inference endpoint.
+        self.validate_inference_endpoint_transit()
+            .map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -14285,6 +14295,62 @@ max_page_size = 1000000
             err.contains("api_key_env") && err.contains("api_key_file"),
             "error must call out the mutex: {err}"
         );
+    }
+
+    #[test]
+    fn validate_3823_refuses_offhost_plaintext_inference_endpoint_naming_the_key() {
+        // #3823 — a NON-LOOPBACK plaintext `http` inference endpoint configured in
+        // [llm]/[embeddings] ships memory content in cleartext off the host. Refuse
+        // it at config-load time, naming the key and the scheme, never the
+        // credential. Loopback is the PINNED allowed-path control.
+        // [llm].base_url off-host plaintext -> REFUSED, names the key.
+        let mut cfg = empty_app_config();
+        cfg.llm = Some(LlmSection {
+            backend: Some("openai-compatible".into()),
+            base_url: Some("http://gpu.internal:11434".into()),
+            ..LlmSection::default()
+        });
+        let err = cfg
+            .validate_secret_handling()
+            .expect_err("off-host plaintext [llm].base_url must be refused");
+        assert!(err.contains("base_url"), "error names the key: {err}");
+        assert!(err.contains("plaintext"), "error names the scheme: {err}");
+        assert!(err.contains("https"), "error names the fix: {err}");
+        // Names the KEY, never echoes the endpoint VALUE (which could carry userinfo).
+        assert!(
+            !err.contains("gpu.internal"),
+            "must not echo the endpoint value: {err}"
+        );
+
+        // [embeddings].base_url off-host plaintext -> REFUSED.
+        let mut cfg = empty_app_config();
+        cfg.embeddings = Some(EmbeddingsSection {
+            backend: Some("openai-compatible".into()),
+            base_url: Some("http://chat.internal:1234/v1".into()),
+            ..EmbeddingsSection::default()
+        });
+        cfg.validate_secret_handling()
+            .expect_err("off-host plaintext [embeddings].base_url must be refused");
+
+        // Loopback plaintext -> PINNED accepted (local models over http).
+        let mut cfg = empty_app_config();
+        cfg.llm = Some(LlmSection {
+            backend: Some("ollama".into()),
+            base_url: Some("http://127.0.0.1:11434".into()),
+            ..LlmSection::default()
+        });
+        cfg.validate_secret_handling()
+            .expect("loopback plaintext [llm].base_url is the allowed-path control");
+
+        // Off-host HTTPS -> accepted (encrypted in transit).
+        let mut cfg = empty_app_config();
+        cfg.llm = Some(LlmSection {
+            backend: Some("openai".into()),
+            base_url: Some("https://api.openai.com/v1".into()),
+            ..LlmSection::default()
+        });
+        cfg.validate_secret_handling()
+            .expect("https off-host endpoint is encrypted and permitted");
     }
 
     #[test]

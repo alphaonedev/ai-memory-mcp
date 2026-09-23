@@ -551,6 +551,7 @@ fn ledger_writer(cmd: &daemon_runtime::Command) -> bool {
                 | daemon_runtime::Command::Man
                 | daemon_runtime::Command::Identity(_)
                 | daemon_runtime::Command::Keys(_)
+                | daemon_runtime::Command::Tls(_)
                 | daemon_runtime::Command::Stats
                 | daemon_runtime::Command::Namespaces
                 | daemon_runtime::Command::Get(_)

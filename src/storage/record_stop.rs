@@ -277,20 +277,46 @@ pub fn seed_from_conn(conn: &rusqlite::Connection) -> Result<()> {
 /// [`crate::storage::StorageError::RecordStopped`] when stopped.
 pub fn gate_storage_conn(conn: &rusqlite::Connection) -> Result<(), crate::storage::StorageError> {
     let key = conn_key(conn);
-    let (flag, freshly_created) = {
-        let mut reg = flag_registry();
-        let existed = reg.contains_key(&key);
-        let flag = reg.entry(key.clone()).or_default().clone();
-        (flag, !existed)
-    };
-    if freshly_created {
-        // First touch of this DB in-process: derive the persisted state.
-        // A read failure is non-fatal (leave RUNNING) — never wedge a
-        // write on an audit-read hiccup.
-        if let Ok(status) = read_state_sqlite(conn) {
+    // #3877 (5-agent vote 4d3ea1c5 = B, fail-closed + de-latch). DE-LATCH: probe
+    // the registry WITHOUT inserting, and cache ONLY after a SUCCESSFUL read. The
+    // pre-#3877 `entry(key).or_default()` inserted a RUNNING entry BEFORE the read,
+    // so a single failed read left the entry present, `freshly_created` false for
+    // the rest of the process, and — with no sqlite TTL refresh — disabled
+    // record-stop for the life of the process, not merely the first touch.
+    if let Some(flag) = flag_registry().get(&key).cloned() {
+        return stop_refusal_result(&flag);
+    }
+    // First touch: derive the persisted state from the chain. FAIL-CLOSED (B) — a
+    // read we cannot complete may be hiding an engaged stop, so refuse this mutating
+    // write rather than proceed (reads stay live: the fence gates only mutating
+    // tools). The error path caches NOTHING, so the very next gated write re-probes:
+    // a caller-paced, self-healing retry with no loop and no TTL. (WEDGE: the
+    // sibling `actuate_sqlite` fix keeps a `--resume` over a persisted stop from
+    // silently no-opping under the same unreadable-chain condition.)
+    match read_state_sqlite(conn) {
+        Ok(status) => {
+            let flag = flag_registry().entry(key).or_default().clone();
             flag.apply(&status);
+            stop_refusal_result(&flag)
+        }
+        Err(e) => {
+            crate::metrics::inc_record_stop_gate_indeterminate();
+            tracing::warn!(
+                target: crate::signed_events::SIGNED_EVENTS_TRACE_TARGET,
+                "record-stop gate could not read the audit chain; FAIL-CLOSED — \
+                 refusing this mutating write and re-probing on the next (no state \
+                 cached): {e}"
+            );
+            Err(crate::storage::StorageError::RecordStopIndeterminate {
+                reason: e.to_string(),
+            })
         }
     }
+}
+
+/// Shared stop-refusal mapping: a cached STOPPED flag → typed
+/// [`crate::storage::StorageError::RecordStopped`], else `Ok`.
+fn stop_refusal_result(flag: &RecordStopFlag) -> Result<(), crate::storage::StorageError> {
     match flag.stop_refusal() {
         Some((issued_by, scope)) => {
             Err(crate::storage::StorageError::RecordStopped { issued_by, scope })
@@ -323,7 +349,16 @@ pub fn actuate_sqlite(
     scope: &str,
 ) -> Result<bool> {
     let key = conn_key(conn);
+    // #3877 (vote 4d3ea1c5) — seed the cache from the persisted chain FIRST,
+    // FAIL-CLOSED. Without this a fresh CLI process (or a poisoned cache) actuated
+    // on a default-RUNNING flag: a `--resume` over a PERSISTED stop returned
+    // `Ok(false)` "already resumed", exited 0, and emitted NO attestation while
+    // every write still refused — a SILENT NO-OP resume the operator could not
+    // tell from a real clear. The chain is the truth; refuse to actuate on a state
+    // we could not read.
+    let seeded = read_state_sqlite(conn)?;
     let flag = flag_for_key(&key);
+    flag.apply(&seeded);
     if flag.is_stopped() == engage {
         return Ok(false); // already in the desired state — no duplicate event
     }

@@ -52,7 +52,18 @@ pub(crate) const CURATOR_SOURCE_LABEL: &str = "ai-memory curator (autonomy)";
 
 /// Minimum Jaccard-keyword overlap required to treat two memories as
 /// "near-duplicates" candidates for a consolidation cluster. Tuned
-/// loosely — actual merge decision is still gated by an LLM pass.
+/// loosely — the merge decision is NOT judged by a model. A pair merges
+/// iff it clears BOTH this pre-filter AND the stored-embedding cosine
+/// gate at [`CONSOLIDATE_COSINE_THRESHOLD`]; those two fixed thresholds
+/// are the whole predicate (`find_consolidation_clusters`). The model's
+/// only role in `consolidate_cluster` is to write the summary TEXT via
+/// `AutonomyLlm::summarize_memories`, after the cluster is already
+/// decided — nothing between that call and the destructive
+/// `db::consolidate` re-examines whether the merge should happen. (The
+/// call does propagate its error, so an LLM *failure* aborts the merge;
+/// that makes the model a hard dependency, not an arbiter.) The SAL
+/// successor states the same contract in `src/curator/compaction.rs`,
+/// where the per-pair decision is the pure `curator::cluster::pair_merges`.
 ///
 /// v0.7.0 R3-S2 — Jaccard is a *cheap pre-filter* (O(N) per pair);
 /// cosine on the 384d MiniLM embeddings is the primary signal at

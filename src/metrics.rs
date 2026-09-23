@@ -530,6 +530,26 @@ pub struct Metrics {
     /// structurally dead. `ai-memory doctor` names the same condition.
     pub atomise_no_curator_total: IntCounter,
 
+    /// #3877 — monotonic count of record-stop gate FAIL-CLOSED refusals: the
+    /// audit chain could not be read, so a mutating write was refused rather
+    /// than proceeding (vote `4d3ea1c5` = B). Bumped on the cold error branch
+    /// only, so there is no hot-path cost. The loud per-occurrence signal is
+    /// the paired `signed_events`-target WARN; this is the RATE an operator
+    /// alerts on. A sustained non-zero rate means the chain is unreadable
+    /// and every gated write is being refused (#3915: rendered, not hidden).
+    pub record_stop_gate_indeterminate_total: IntCounter,
+
+    /// #3818 — monotonic count of `governance.check` audit appends SUPPRESSED
+    /// under an engaged record-stop: the read-side check still answers, the
+    /// audit row is skipped and a WARN names it. Non-zero only while a stop
+    /// is engaged; a rising rate after the stop is released is a defect.
+    pub governance_check_audit_suppressed_total: IntCounter,
+
+    /// #3818 — monotonic count of capability-expansion audit appends
+    /// SUPPRESSED under an engaged record-stop (the expansion itself still
+    /// resolves). Same contract as `governance_check_audit_suppressed_total`.
+    pub capability_expansion_audit_suppressed_total: IntCounter,
+
     /// #1735 (Pillar-4 4.C) — current depth of the `kg_projection_outbox`
     /// (pending AGE projections not yet drained: `projected_at IS NULL`).
     /// Refreshed each cold-drainer tick. Sustained non-zero depth means the
@@ -1278,6 +1298,33 @@ impl Metrics {
         )?;
         registry.register(Box::new(atomise_no_curator_total.clone()))?;
 
+        let record_stop_gate_indeterminate_total = IntCounter::new(
+            "ai_memory_record_stop_gate_indeterminate_total",
+            "Monotonic counter of record-stop gate FAIL-CLOSED refusals: the \
+             audit chain could not be read, so the mutating write was \
+             refused rather than proceeding (#3877, vote 4d3ea1c5). Alert \
+             on a sustained rate: every gated write is being refused.",
+        )?;
+        registry.register(Box::new(record_stop_gate_indeterminate_total.clone()))?;
+
+        let governance_check_audit_suppressed_total = IntCounter::new(
+            "ai_memory_governance_check_audit_suppressed_total",
+            "Monotonic counter of governance.check audit appends SUPPRESSED \
+             under an engaged record-stop (#3818): the check still answers, \
+             the audit row is skipped and a WARN names it.",
+        )?;
+        registry.register(Box::new(governance_check_audit_suppressed_total.clone()))?;
+
+        let capability_expansion_audit_suppressed_total = IntCounter::new(
+            "ai_memory_capability_expansion_audit_suppressed_total",
+            "Monotonic counter of capability-expansion audit appends \
+             SUPPRESSED under an engaged record-stop (#3818); the expansion \
+             itself still resolves.",
+        )?;
+        registry.register(Box::new(
+            capability_expansion_audit_suppressed_total.clone(),
+        ))?;
+
         let age_projection_pending_depth = IntGauge::new(
             "ai_memory_age_projection_pending_depth",
             "Current depth of the kg_projection_outbox (pending deferred AGE \
@@ -1370,6 +1417,9 @@ impl Metrics {
             atomise_applied_total,
             atomise_degraded_total,
             atomise_no_curator_total,
+            record_stop_gate_indeterminate_total,
+            governance_check_audit_suppressed_total,
+            capability_expansion_audit_suppressed_total,
             age_projection_pending_depth,
             age_projection_failed_total,
             age_projection_quarantined_total,
@@ -1640,6 +1690,25 @@ pub fn inc_atomise_degraded() {
 /// `pre_store.auto_atomise` WARN and the `ai-memory doctor` section.
 pub fn inc_atomise_no_curator() {
     registry().atomise_no_curator_total.inc();
+}
+
+/// #3877 — count one record-stop gate FAIL-CLOSED refusal (the audit chain
+/// could not be read, so the mutating write was refused). Cold error branch
+/// only. Rendered on `/api/v1/monitoring/metrics` (#3915).
+pub fn inc_record_stop_gate_indeterminate() {
+    registry().record_stop_gate_indeterminate_total.inc();
+}
+
+/// #3818 — count one `governance.check` audit append suppressed under an
+/// engaged record-stop. Rendered on `/api/v1/monitoring/metrics` (#3915).
+pub fn inc_governance_check_audit_suppressed() {
+    registry().governance_check_audit_suppressed_total.inc();
+}
+
+/// #3818 — count one capability-expansion audit append suppressed under an
+/// engaged record-stop. Rendered on `/api/v1/monitoring/metrics` (#3915).
+pub fn inc_capability_expansion_audit_suppressed() {
+    registry().capability_expansion_audit_suppressed_total.inc();
 }
 
 /// v0.7-polish SEC-15 / COR-11 (issue #780) — read the current value

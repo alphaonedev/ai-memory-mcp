@@ -127,6 +127,16 @@ pub enum StorageError {
     /// [`crate::store::StoreError::Stopped`]; reads are unaffected.
     RecordStopped { issued_by: String, scope: String },
 
+    /// #3877 [P1] — a mutating `db::` write refused because the substrate
+    /// record-stop state could NOT be read from the audit chain (a transient
+    /// `signed_events` read failure). FAIL-CLOSED (5-agent vote `4d3ea1c5` = B):
+    /// a state we cannot read may be hiding an engaged stop, so the write is
+    /// refused rather than proceeding. The gate caches nothing on this path, so
+    /// the next write re-probes (self-healing). DISTINCT from
+    /// [`Self::RecordStopped`], which asserts the plane IS stopped — the fact
+    /// NOT in evidence here.
+    RecordStopIndeterminate { reason: String },
+
     /// v1.0.0 #3196 — a `find_paths` traversal was refused because it would
     /// materialise more than
     /// [`crate::storage::FIND_PATHS_MAX_PREFIXES`] path-prefixes. Emitted by
@@ -207,6 +217,11 @@ impl std::fmt::Display for StorageError {
                 "substrate record plane stopped by {issued_by} (scope={scope}); \
                  mutating operations refused until resume",
             ),
+            Self::RecordStopIndeterminate { reason } => write!(
+                f,
+                "substrate record-stop state could not be read (fail-closed; \
+                 mutating operation refused, retry): {reason}",
+            ),
             // #3196 — routed through the shared message builder so the SQLite
             // and Postgres budget-exceeded surfaces are byte-identical.
             Self::TraversalBudgetExceeded => {
@@ -261,6 +276,9 @@ impl StorageError {
                 crate::errors::error_codes::SQLCIPHER_MISSING_PASSPHRASE
             }
             Self::RecordStopped { .. } => crate::errors::error_codes::RECORD_STOPPED,
+            Self::RecordStopIndeterminate { .. } => {
+                crate::errors::error_codes::RECORD_STOP_INDETERMINATE
+            }
             Self::TraversalBudgetExceeded => crate::errors::error_codes::TRAVERSAL_BUDGET_EXCEEDED,
         }
     }

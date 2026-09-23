@@ -275,6 +275,41 @@ fn host_of(base_url: &str) -> Option<String> {
 /// This is side-effect-free and the single SSOT for the decision — the
 /// enforcement chokepoints and any audit re-evaluation both call it so the
 /// logic cannot drift between "did we refuse?" and "what do we audit?".
+/// #3823 — the config-time transit-encryption floor's egress-layer BACKSTOP. A
+/// plaintext `http://` endpoint to a NON-LOOPBACK host would ship memory content
+/// off the host UNENCRYPTED. This catches the env / CLI / hot-swap base_url that
+/// bypasses config validation (MEASURED: `build_llm_client` / `build_embedder` /
+/// `reload` resolve from env and route the resolved base_url through
+/// [`evaluate_inference_egress`]). Loopback stays the PINNED allowed-path control
+/// (the loopback-INCLUDED standard is #3824, deferred past v1.0.0).
+///
+/// The scheme judgement is the SSOT
+/// [`crate::transit_encryption::url_is_plaintext_http`] and the boundary is
+/// [`target_is_loopback`] — this module grows no second predicate. Returns
+/// `Some(Refuse)` naming the plaintext scheme and the `https` fix (the target
+/// field carries the non-secret base URL) when the endpoint is off-host
+/// plaintext; `None` otherwise.
+fn refuse_offhost_plaintext_inference_egress(
+    class: EgressClass,
+    base_url: &str,
+) -> Option<EgressDecision> {
+    if crate::transit_encryption::url_is_plaintext_http(base_url) && !target_is_loopback(base_url) {
+        Some(EgressDecision::Refuse {
+            class,
+            target: base_url.to_string(),
+            reason: format!(
+                "inference-plane egress refused: the target uses the plaintext `http` \
+                 scheme to a non-loopback host, so memory content for {class} would leave \
+                 the host UNENCRYPTED. Use an `https://` endpoint (or a local \
+                 TLS-terminating proxy); a loopback endpoint over http is permitted.",
+                class = class.as_str()
+            ),
+        })
+    } else {
+        None
+    }
+}
+
 #[must_use]
 pub fn evaluate_inference_egress(
     mode: InferenceEgressMode,
@@ -282,7 +317,13 @@ pub fn evaluate_inference_egress(
     base_url: &str,
 ) -> EgressDecision {
     match mode {
-        InferenceEgressMode::Allow => EgressDecision::Allow,
+        InferenceEgressMode::Allow => {
+            // #3823 — the GA defect was this arm returning `Allow`
+            // UNCONDITIONALLY. Refuse a NON-LOOPBACK plaintext endpoint by
+            // scheme; loopback stays the pinned allowed-path control.
+            refuse_offhost_plaintext_inference_egress(class, base_url)
+                .unwrap_or(EgressDecision::Allow)
+        }
         InferenceEgressMode::Deny => EgressDecision::Refuse {
             class,
             target: base_url.to_string(),
@@ -561,6 +602,63 @@ mod tests {
                 assert!(!reason.contains("api_key"));
             }
             EgressDecision::Allow => panic!("external must refuse under loopback-only"),
+        }
+    }
+
+    #[test]
+    fn allow_mode_refuses_offhost_plaintext_http_pins_loopback_and_https_3823() {
+        // #3823 — GA defect: the `allow` Allow arm returned `Allow`
+        // UNCONDITIONALLY, so a NON-LOOPBACK plaintext `http` inference endpoint
+        // (a corporate-internal model host) received memory content IN CLEARTEXT
+        // off the host. This is the defence-in-depth backstop for the env / CLI /
+        // hot-swap base_url that bypasses config-time validation (MEASURED:
+        // build_llm_client / build_embedder / reload all resolve from env and
+        // route the resolved base_url through here). Loopback stays the PINNED
+        // allowed-path control (the loopback-included standard is #3824, deferred
+        // past v1.0.0); a plaintext OFF-HOST endpoint is refused by scheme.
+        let d = evaluate_inference_egress(
+            InferenceEgressMode::Allow,
+            EgressClass::InferenceLlm,
+            "http://gpu.internal:11434",
+        );
+        assert!(
+            d.is_refused(),
+            "a non-loopback plaintext http endpoint must be refused even under allow"
+        );
+        match d {
+            EgressDecision::Refuse { target, reason, .. } => {
+                assert_eq!(target, "http://gpu.internal:11434");
+                assert!(
+                    reason.contains("plaintext"),
+                    "reason names the scheme: {reason}"
+                );
+                assert!(reason.contains("https"), "reason names the fix: {reason}");
+                // The api key is never part of the target/reason.
+                assert!(!reason.contains("api_key"));
+            }
+            EgressDecision::Allow => unreachable!("asserted refused above"),
+        }
+        // Encrypted off-host is permitted (https).
+        assert_eq!(
+            evaluate_inference_egress(
+                InferenceEgressMode::Allow,
+                EgressClass::InferenceLlm,
+                "https://gpu.internal:11434"
+            ),
+            EgressDecision::Allow
+        );
+        // Loopback plaintext is the PINNED allowed-path control — local models
+        // over http do not leave the host. Both spellings, both inference classes.
+        for loopback in ["http://127.0.0.1:11434", "http://localhost:11434"] {
+            assert_eq!(
+                evaluate_inference_egress(
+                    InferenceEgressMode::Allow,
+                    EgressClass::InferenceEmbedding,
+                    loopback
+                ),
+                EgressDecision::Allow,
+                "loopback plaintext must stay permitted: {loopback}"
+            );
         }
     }
 

@@ -133,6 +133,12 @@ pub mod error_codes {
     /// CLI surfaces emit one canonical code.
     pub const RECORD_STOPPED: &str = "RECORD_STOPPED";
 
+    /// #3877 — the record-stop state could not be read from the audit chain, so
+    /// a mutating write was refused FAIL-CLOSED (vote `4d3ea1c5` = B). DISTINCT
+    /// from [`RECORD_STOPPED`]: this asserts "cannot determine", not "stopped";
+    /// the de-latch makes the next write re-probe, so it is a transient/retry code.
+    pub const RECORD_STOP_INDETERMINATE: &str = "RECORD_STOP_INDETERMINATE";
+
     /// v1.0.0 #2445 — this database's schema is AHEAD of the running binary's
     /// migration ladder, so the substrate refuses to operate it rather than
     /// write rows an older code path shapes wrongly. Un-prefixed (the
@@ -704,6 +710,7 @@ mod arch_9_slug_tests {
                 issued_by: "ai:operator".into(),
                 scope: "record-plane".into(),
             },
+            StorageError::RecordStopIndeterminate { reason: "r".into() },
             StorageError::TraversalBudgetExceeded,
         ];
         let expected = [
@@ -721,6 +728,7 @@ mod arch_9_slug_tests {
             ARCHIVE_SUPERSEDE_FAILED,
             SQLCIPHER_MISSING_PASSPHRASE,
             RECORD_STOPPED,
+            RECORD_STOP_INDETERMINATE,
             TRAVERSAL_BUDGET_EXCEEDED,
         ];
         // #3196 — pin the lengths so a variant added to only one array is a
@@ -1103,9 +1111,13 @@ impl From<anyhow::Error> for MemoryError {
                 // surfaces in the governance-refusal family (403 +
                 // clear "record plane stopped" message).
                 | SE::RecordStopped { .. } => Self::RefusedByGovernance(se.to_string()),
-                SE::ArchiveSupersedeFailed { .. } | SE::SqlcipherMissingPassphrase => {
-                    Self::DatabaseError(se.to_string())
-                }
+                // #3877 — RecordStopIndeterminate is a fail-closed refusal caused by
+                // a transient audit-read failure; it is retry-appropriate (the de-latch
+                // re-probes), so it joins the DatabaseError family, NOT the 403
+                // RefusedByGovernance family RecordStopped uses.
+                SE::ArchiveSupersedeFailed { .. }
+                | SE::SqlcipherMissingPassphrase
+                | SE::RecordStopIndeterminate { .. } => Self::DatabaseError(se.to_string()),
                 // #3196 — a find_paths traversal-budget refusal is a
                 // caller-triggerable 400 (the request is too broad to serve
                 // within budget), matching the SAL twin's BAD_REQUEST and the

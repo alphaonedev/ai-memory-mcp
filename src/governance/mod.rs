@@ -50,6 +50,12 @@ pub(crate) const GOVERNANCE_TRACE_TARGET: &str = "governance";
 /// string is not scattered (pm-v3.1 no-scattered-literals discipline).
 pub const GOVERNANCE_GATE_TRACE_TARGET: &str = "ai_memory::governance";
 
+/// #3818 - `tracing` target for rule-engine / audit-emission events
+/// (the `governance.check` suppression under record-stop, inert-matcher
+/// errors). Named once here so the literal is not duplicated across call
+/// sites (pm-v3.1 hardcoded-literal ratchet).
+pub(crate) const GOVERNANCE_RULES_TRACE_TARGET: &str = "governance.rules";
+
 // v0.7.0 (issue #691) — substrate-level agent-action rules engine.
 // The K9 pipeline below gates substrate-INTERNAL ops (memory_store,
 // memory_link, ...). `agent_action` adds the parallel engine for
