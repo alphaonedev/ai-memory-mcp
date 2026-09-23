@@ -1000,7 +1000,7 @@ fn test_ttl_assignment() {
 // --- Auto-promotion ---
 
 #[test]
-fn test_auto_promotion() {
+fn test_recall_fold_no_longer_auto_promotes() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
     let db_path = integration_scratch_db("promote-auto");
 
@@ -1044,16 +1044,17 @@ fn test_auto_promotion() {
         assert!(output.status.success());
     }
 
-    // #1869 — the FOLD applies the promotion ladder from the ledgered
-    // recalls; `ai-memory gc` folds first (the CLI-topology fold
-    // trigger), so promotion lands here, not at recall time.
+    // `ai-memory gc` folds first (the CLI-topology fold trigger). v1.0.0
+    // Boids item 1 (5-agent vote 4d3ea1c5): the fold applies the access
+    // ladder but NO LONGER escalates — recall popularity can no longer
+    // promote a row's tier (`memory_promote` is the sole tier-raising
+    // verb). So after 6 recalls the mid row stays mid.
     let output = cmd(binary)
         .args(["--db", db_path.to_str().unwrap(), "--json", "gc"])
         .output()
         .unwrap();
     assert!(output.status.success());
 
-    // Verify it became long-term
     let output = cmd(binary)
         .args(["--db", db_path.to_str().unwrap(), "--json", "get", &id])
         .output()
@@ -1061,12 +1062,12 @@ fn test_auto_promotion() {
     assert!(output.status.success());
     let got: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(
-        got["memory"]["tier"], "long",
-        "memory should have been auto-promoted to long by the recall-access fold"
+        got["memory"]["tier"], "mid",
+        "R2: the recall-access fold no longer auto-promotes mid→long"
     );
     assert!(
-        got["memory"]["expires_at"].is_null(),
-        "promoted memory should have no expiry"
+        !got["memory"]["expires_at"].is_null(),
+        "R2: the un-promoted mid row keeps its (floor-extended) expiry"
     );
 
     let _ = std::fs::remove_file(&db_path);

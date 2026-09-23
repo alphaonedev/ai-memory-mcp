@@ -736,8 +736,14 @@ fn fold_twin_db_equivalence_with_touch_many() {
         let (ac_a, tier_a, pr_a, exp_a, la_a) = read(&conn_a);
         let (ac_b, tier_b, pr_b, exp_b, la_b) = read(&conn_b);
         assert_eq!(ac_a, ac_b, "{id}: access_count equivalence");
-        assert_eq!(tier_a, tier_b, "{id}: tier equivalence (promotion)");
-        assert_eq!(pr_a, pr_b, "{id}: priority equivalence (decade ladder)");
+        assert_eq!(
+            tier_a, tier_b,
+            "{id}: tier equivalence (both stay put post-R2)"
+        );
+        assert_eq!(
+            pr_a, pr_b,
+            "{id}: priority equivalence (neither bumps post-R2)"
+        );
         // Timestamps: legacy anchors on touch-call time, fold on
         // observed_at — both within this test's execution window, so
         // compare with a small tolerance (or exact NULL equality).
@@ -759,14 +765,17 @@ fn fold_twin_db_equivalence_with_touch_many() {
             "{id}: last_accessed_at ≈ ({la_a:?} vs {la_b:?})"
         );
     }
-    // Sanity on the fixture itself: the mid row promoted, the short
-    // row crossed a decade.
+    // Sanity on the fixture itself (v1.0.0 Boids item 1, 5-agent vote
+    // 4d3ea1c5): the mid row's 3 folds cross the historical promotion
+    // threshold and the short row's crosses a decade, yet NEITHER
+    // escalates any more — tier stays `mid`, priority stays 5. Access
+    // still folds (asserted equivalent above).
     let tier: String = conn_b
         .query_row("SELECT tier FROM memories WHERE id = 'twin-mid'", [], |r| {
             r.get(0)
         })
         .unwrap();
-    assert_eq!(tier, "long", "mid row promoted at PROMOTION_THRESHOLD");
+    assert_eq!(tier, "mid", "R2: fold no longer auto-promotes the mid row");
     let pr: i64 = conn_b
         .query_row(
             "SELECT priority FROM memories WHERE id = 'twin-short'",
@@ -774,28 +783,29 @@ fn fold_twin_db_equivalence_with_touch_many() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(
-        pr, 6,
-        "short row crossed the 10-access decade → priority 5→6"
-    );
+    assert_eq!(pr, 5, "R2: fold no longer bumps priority across a decade");
 }
 
 #[test]
-fn fold_promotion_priority_and_cap_edges() {
+fn fold_access_cap_edges_without_escalation() {
     let _g = env_lock();
     clear_flags();
     let (conn, _dir) = fresh_db();
     let created = chrono::Utc::now().to_rfc3339();
-    // (id, tier, access_count, priority, n_observations)
+    // (id, tier, access_count, priority, n_observations). v1.0.0 Boids
+    // item 1 (5-agent vote 4d3ea1c5): the fold NO LONGER escalates —
+    // these fixtures cross the historical promotion threshold and decade
+    // boundaries yet tier + priority stay put; only access_count folds
+    // (and still caps at 1M).
     let fixtures: &[(&str, &str, i64, i64, usize)] = &[
-        // Crosses BOTH the promotion threshold (5) and a decade (10)
-        // inside a single fold window.
+        // Would have crossed BOTH the promotion threshold (5) and a
+        // decade (10): now neither fires.
         ("edge-both", "mid", 2, 5, 9),
-        // Priority already at the cap: stays 10.
+        // Long row, priority 10: unchanged (no bump path any more).
         ("edge-prcap", "long", 9, 10, 1),
         // Access ceiling: MIN(999_998 + 5, 1_000_000) = 1_000_000.
         ("edge-accap", "long", 999_998, 5, 5),
-        // Multiple decades in one window: 0 → 25 crosses 10 and 20.
+        // Would have crossed multiple decades (0 → 25): priority stays 5.
         ("edge-2dec", "long", 0, 5, 25),
     ];
     for (id, tier, ac, pr, _) in fixtures {
@@ -835,18 +845,21 @@ fn fold_promotion_priority_and_cap_edges() {
         .unwrap()
     };
     let (ac, tier, pr, exp) = read("edge-both");
-    assert_eq!(ac, 11);
-    assert_eq!(tier, "long", "promoted at >= 5");
-    assert_eq!(pr, 6, "one decade crossed (2 → 11)");
-    assert!(exp.is_none(), "promotion clears expires_at");
+    assert_eq!(ac, 11, "access still folds (2 + 9)");
+    assert_eq!(
+        tier, "mid",
+        "R2: no auto-promote despite crossing threshold 5"
+    );
+    assert_eq!(pr, 5, "R2: no priority bump despite crossing a decade");
+    assert!(exp.is_none(), "seeded with no expiry; fold leaves it NULL");
     let (ac, _, pr, _) = read("edge-prcap");
     assert_eq!(ac, 10);
-    assert_eq!(pr, 10, "priority capped at 10");
+    assert_eq!(pr, 10, "priority unchanged (no bump path any more)");
     let (ac, _, _, _) = read("edge-accap");
-    assert_eq!(ac, 1_000_000, "access_count capped at 1M");
+    assert_eq!(ac, 1_000_000, "access_count still caps at 1M");
     let (ac, _, pr, _) = read("edge-2dec");
     assert_eq!(ac, 25);
-    assert_eq!(pr, 7, "two decades crossed (0 → 25) → priority 5→7");
+    assert_eq!(pr, 5, "R2: no priority bump despite crossing two decades");
 }
 
 #[test]

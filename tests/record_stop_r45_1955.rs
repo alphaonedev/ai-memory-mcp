@@ -1213,7 +1213,8 @@ fn b9_pg_reflect_embedding_and_sqlite_lease_source_pin() {
     );
 }
 
-/// Wave-2 B10 — `fold_recall` (mid→long promote) must gate on sqlite SSOT
+/// Wave-2 B10 — `fold_recall` (a record-plane access-bookkeeping
+/// mutation) must gate on sqlite SSOT
 /// and both SAL adapters; reads stay live because callers WARN.
 #[test]
 fn b10_fold_recall_accesses_gates_source_pin() {

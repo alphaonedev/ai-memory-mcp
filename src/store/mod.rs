@@ -3191,14 +3191,16 @@ pub trait MemoryStore: Send + Sync {
     }
 
     /// v0.9.0 P0-1 (#1869) — FOLD maintenance verb: batch-apply the
-    /// legacy recall-touch ladders (access_count bump capped at 1M,
-    /// `last_accessed_at`, per-tier TTL floor-extend anchored on
-    /// `observed_at`, mid→long promotion at the promotion threshold,
-    /// priority decade ladder capped at 10, and — when
-    /// `AI_MEMORY_CONFIDENCE_DECAY=1` — the confidence-decay stamp)
-    /// from unfolded `recall_observations` ledger rows, marking them
-    /// folded once applied. Idempotent: a second fold over the same
-    /// ledger is a no-op.
+    /// recall-access ladders from unfolded `recall_observations` ledger
+    /// rows, marking them folded once applied: access_count bump capped
+    /// at 1M, `last_accessed_at`, per-tier TTL floor-extend anchored on
+    /// `observed_at`, and — when `AI_MEMORY_CONFIDENCE_DECAY=1` — the
+    /// confidence-decay stamp. v1.0.0 Boids item 1 (5-agent vote
+    /// 4d3ea1c5) removed the mid→long promotion, the promotion
+    /// `updated_at` rewrite and the priority decade ladder: recall
+    /// popularity no longer rewrites a row's tier, recency or priority
+    /// (`memory_promote` is the sole tier-raising verb). Idempotent: a
+    /// second fold over the same ledger is a no-op.
     ///
     /// Returns the number of distinct memories folded.
     ///
