@@ -1917,6 +1917,11 @@ it, and flip it back.
 > gate — did not. If your control requires that no peer ever holds
 > plaintext, **do not federate that namespace**: scope it out with
 > `allowed_namespaces`, or run a separate non-federated deployment.
+> This covers **`scope=private` rows and private-by-default inbox rows
+> too**: the write-time push lane replicates them to every configured
+> peer (the pull/catch-up lane withholds them). The peer re-applies the
+> owner predicate, so its other agents cannot read them, but the peer's
+> operator holds them under the peer's custody (#3928).
 
 - [ ] Federated namespaces reviewed against the plaintext-at-peer property above; namespaces under a no-plaintext control are excluded from federation scope.
 - [ ] Binary built with `--features sqlcipher`; `AI_MEMORY_ENCRYPT_AT_REST=1`.
