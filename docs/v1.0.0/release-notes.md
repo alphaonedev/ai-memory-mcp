@@ -468,10 +468,16 @@ tier via `cert-postgres-age.yml` and honestly labels the PG 16 alternate.
   Cleared via `dequarantine` (on-attest or operator).
 - **Inference-plane egress gate ([#1963](https://github.com/alphaonedev/ai-memory-mcp/issues/1963), R68/D14).**
   `AI_MEMORY_INFERENCE_EGRESS` (env-table row #131, default `allow`) is a
-  three-state egress class for LLM + API-embedder construction:
+  four-state egress class for LLM + API-embedder construction:
   `loopback-only` permits only localhost inference targets (local Ollama /
   self-hosted TEI) and refuses external-vendor egress; `deny` refuses ALL
-  inference egress (keyword-only posture). Enforced at the boot
+  inference egress (keyword-only posture);
+  `internal-only` ([#3822](https://github.com/alphaonedev/ai-memory-mcp/issues/3822),
+  5-agent vote) permits only targets whose EVERY resolved address is internal
+  (loopback / RFC1918 / ULA / CGNAT, none link-local/special, none a
+  cloud-metadata literal) — it resolves the target and PINS the resolved
+  addresses into the client (redirects disabled, `.no_proxy()`), failing closed
+  on a DNS failure or any public / DNS-rebind address. Enforced at the boot
   chokepoints — on refuse the outbound client is not constructed, so no
   memory content can be POSTed to the refused vendor. A best-effort signed
   `egress.inference_refused` row records the class + non-secret target.

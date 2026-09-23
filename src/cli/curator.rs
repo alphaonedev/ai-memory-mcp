@@ -150,31 +150,34 @@ fn build_curator_llm(
     // signed refusal. Default `allow` → no-op (byte-identical legacy).
     // ENFORCED here (no client → no egress); mirrors the precedent at
     // `daemon_runtime::build_llm_client` + `reload::resolve_and_build_mcp_llm`.
-    {
+    // #3822 (A2) — resolve-then-pin.
+    let egress_pin = {
         use crate::egress::{
-            EgressClass, EgressDecision, InferenceEgressMode, evaluate_inference_egress,
+            EgressClass, EgressDecision, InferenceEgressMode, admit_inference_target,
         };
-        if let EgressDecision::Refuse {
-            class,
-            target,
-            reason,
-        } = evaluate_inference_egress(
+        match admit_inference_target(
             InferenceEgressMode::resolve(),
             EgressClass::InferenceLlm,
             &resolved.base_url,
         ) {
-            tracing::warn!(
-                "curator LLM client DISABLED by inference-plane egress gate \
-                 (target={target}); {reason} (#2388)"
-            );
-            // #1991 — audit against the operator-resolved `db_path` threaded from
-            // the caller, NOT a recomputed `effective_db(DEFAULT_DB)` (which would
-            // misfile the row to CWD `ai-memory.db` under a non-default `--db`).
-            crate::egress::refuse_inference_egress_audited(db_path, class, &target, &reason);
-            return None;
+            Ok(pin) => pin,
+            Err(EgressDecision::Refuse {
+                class,
+                target,
+                reason,
+            }) => {
+                tracing::warn!(
+                    "curator LLM client DISABLED by inference-plane egress gate \
+                     (target={target}); {reason} (#2388/#3822)"
+                );
+                // #1991 — audit against the operator-resolved `db_path`.
+                crate::egress::refuse_inference_egress_audited(db_path, class, &target, &reason);
+                return None;
+            }
+            Err(EgressDecision::Allow) => None,
         }
-    }
-    llm::OllamaClient::build_from_resolved(&resolved)
+    };
+    llm::OllamaClient::build_from_resolved_pinned(&resolved, egress_pin.as_ref())
         .ok()
         .flatten()
 }

@@ -156,6 +156,19 @@ Use `AI_MEMORY_INFERENCE_EGRESS=deny` for a fully air-gapped node (no
 inference egress at all — recall degrades to keyword/FTS). `allow` is the
 legacy default and is **not** hardened.
 
+`AI_MEMORY_INFERENCE_EGRESS=internal-only` (#3822) permits inference against a
+private-network endpoint: every resolved address of the target must be an
+internal address (loopback / RFC1918 / RFC4193 ULA / RFC6598 CGNAT), none
+link-local / multicast / broadcast / unspecified, and none a cloud-metadata
+literal. It **resolves** the target and **pins** the resolved addresses into
+the outbound client (`resolve_to_addrs`, redirects disabled, `.no_proxy()` — a
+pinned address a proxy never connects to would defeat the pin; a proxied
+internal endpoint is v1.x) and fails **closed** on a DNS failure or any public /
+DNS-rebind address (`AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL` does not apply). A DNS
+change after boot needs a client swap. `asi-hard.env` stays on `loopback-only`;
+an operator running a co-located internal inference endpoint chooses
+`internal-only`.
+
 ## Applying a template
 
 ```bash

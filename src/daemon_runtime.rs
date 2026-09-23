@@ -3646,36 +3646,41 @@ pub async fn build_embedder(
     // Default `allow` → no-op. ENFORCED here (no embedder → semantic recall
     // degrades to keyword, the existing #1593 fail-closed path); the
     // signed-refusal audit is best-effort.
-    if crate::config::is_api_embed_backend(&resolved_embeddings.backend) {
+    // #3822 — resolve-then-pin for the API-embed lane (the only embed lane the
+    // gate fires on). `Some(pin)` under internal-only; `None` otherwise.
+    let egress_pin = if crate::config::is_api_embed_backend(&resolved_embeddings.backend) {
         use crate::egress::{
-            EgressClass, EgressDecision, InferenceEgressMode, evaluate_inference_egress,
+            EgressClass, EgressDecision, InferenceEgressMode, admit_inference_target,
         };
         let mode = InferenceEgressMode::resolve();
-        if let EgressDecision::Refuse {
-            class,
-            target,
-            reason,
-        } = evaluate_inference_egress(
+        match admit_inference_target(
             mode,
             EgressClass::InferenceEmbedding,
             &resolved_embeddings.url,
         ) {
-            tracing::warn!(
-                "embedder DISABLED by inference-plane egress gate \
-                 (tier={} backend={} target={target} mode={}); {reason} \
-                 — semantic recall degrades to keyword (#1963)",
-                feature_tier.as_str(),
-                resolved_embeddings.backend,
-                mode.as_str()
-            );
-            // #1991 — audit the refusal against the operator-resolved
-            // `db_path` threaded from boot (honours `--db` / `AI_MEMORY_DB`),
-            // NOT a recomputed `effective_db(DEFAULT_DB)` which ignored a
-            // non-default `--db` and misfiled the row to CWD `ai-memory.db`.
-            crate::egress::refuse_inference_egress_audited(db_path, class, &target, &reason);
-            return None;
+            Ok(pin) => pin,
+            Err(EgressDecision::Refuse {
+                class,
+                target,
+                reason,
+            }) => {
+                tracing::warn!(
+                    "embedder DISABLED by inference-plane egress gate \
+                     (tier={} backend={} target={target} mode={}); {reason} \
+                     — semantic recall degrades to keyword (#1963/#3822)",
+                    feature_tier.as_str(),
+                    resolved_embeddings.backend,
+                    mode.as_str()
+                );
+                // #1991 — audit against the operator-resolved `db_path`.
+                crate::egress::refuse_inference_egress_audited(db_path, class, &target, &reason);
+                return None;
+            }
+            Err(EgressDecision::Allow) => None,
         }
-    }
+    } else {
+        None
+    };
     // The HF-Hub sync API and candle model-load are blocking CPU work that
     // internally spin their own tokio runtime. Running them directly in this
     // async context panics with "Cannot drop a runtime in a context where
@@ -3683,7 +3688,11 @@ pub async fn build_embedder(
     // pool so the inner runtime is owned by a dedicated thread.
     let resolved_for_build = resolved_embeddings.clone();
     let build = match tokio::task::spawn_blocking(move || {
-        embeddings::Embedder::from_resolved(&resolved_for_build, Some(emb_model))
+        embeddings::Embedder::from_resolved_pinned(
+            &resolved_for_build,
+            Some(emb_model),
+            egress_pin.as_ref(),
+        )
     })
     .await
     {
@@ -3823,30 +3832,35 @@ pub async fn build_llm_client(
     // and emit a best-effort signed refusal. Default `allow` → no-op
     // (byte-identical legacy). ENFORCED here (no client → no egress);
     // the signed-refusal audit is best-effort (opens a fresh conn).
-    {
+    // #3822 (5-agent vote 4d3ea1c5) — resolve-then-pin. Under `internal-only`
+    // the target is resolved and its addresses pinned into the client
+    // (`Some(pin)`); other postures return `None` (no pin). A refusal DISABLES
+    // the client (the enforcement is the absence of the egress path).
+    let egress_pin = {
         use crate::egress::{
-            EgressClass, EgressDecision, InferenceEgressMode, evaluate_inference_egress,
+            EgressClass, EgressDecision, InferenceEgressMode, admit_inference_target,
         };
         let mode = InferenceEgressMode::resolve();
-        if let EgressDecision::Refuse {
-            class,
-            target,
-            reason,
-        } = evaluate_inference_egress(mode, EgressClass::InferenceLlm, &resolved.base_url)
-        {
-            tracing::warn!(
-                "L5: LLM client DISABLED by inference-plane egress gate \
-                 (tier={tier_str} backend={backend} target={target} mode={}); {reason} (#1963)",
-                mode.as_str()
-            );
-            // #1991 — audit against the operator-resolved `db_path` threaded
-            // from boot (honours `--db` / `AI_MEMORY_DB`) instead of a
-            // recomputed `effective_db(DEFAULT_DB)` that misfiled the row to
-            // CWD `ai-memory.db` under a non-default `--db`.
-            crate::egress::refuse_inference_egress_audited(db_path, class, &target, &reason);
-            return None;
+        match admit_inference_target(mode, EgressClass::InferenceLlm, &resolved.base_url) {
+            Ok(pin) => pin,
+            Err(EgressDecision::Refuse {
+                class,
+                target,
+                reason,
+            }) => {
+                tracing::warn!(
+                    "L5: LLM client DISABLED by inference-plane egress gate \
+                     (tier={tier_str} backend={backend} target={target} mode={}); {reason} (#1963/#3822)",
+                    mode.as_str()
+                );
+                // #1991 — audit against the operator-resolved `db_path` threaded
+                // from boot (honours `--db` / `AI_MEMORY_DB`).
+                crate::egress::refuse_inference_egress_audited(db_path, class, &target, &reason);
+                return None;
+            }
+            Err(EgressDecision::Allow) => None,
         }
-    }
+    };
 
     // FX-D1 (2026-05-27): call the async constructor directly. The
     // pre-FX-D1 `spawn_blocking` wrapper drove the sync constructor
@@ -3855,7 +3869,8 @@ pub async fn build_llm_client(
     // path skips the sync→async bridge entirely so the construction
     // runs on whichever tokio runtime the caller brought, with no
     // re-entry hazard.
-    let build = llm::OllamaClient::build_from_resolved_async(&resolved).await;
+    let build =
+        llm::OllamaClient::build_from_resolved_async_pinned(&resolved, egress_pin.as_ref()).await;
 
     match build {
         Ok(Some(client)) => {

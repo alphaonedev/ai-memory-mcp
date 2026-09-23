@@ -1216,6 +1216,62 @@ impl Embedder {
         }
     }
 
+    /// #3822 (5-agent vote 4d3ea1c5, option A) — pinned sibling of
+    /// [`Self::from_resolved`] for the `internal-only` egress posture. The pin
+    /// applies ONLY to the API-embed lane (the only embed lane the #1963/#3822
+    /// gate fires on, `is_api_embed_backend`); `None` and the local / Ollama
+    /// lanes delegate to the byte-identical-legacy [`Self::from_resolved`].
+    ///
+    /// # Errors
+    /// Same conditions as [`Self::from_resolved`], plus a pinned-client build
+    /// failure.
+    pub fn from_resolved_pinned(
+        resolved: &crate::config::ResolvedEmbeddings,
+        tier_model: Option<crate::config::EmbeddingModel>,
+        pin: Option<&crate::egress::PinnedTarget>,
+    ) -> Result<Option<Self>> {
+        let Some(pin) = pin else {
+            return Self::from_resolved(resolved, tier_model);
+        };
+        if !crate::config::is_api_embed_backend(&resolved.backend) {
+            // The gate only pins the API-embed lane; every other lane is
+            // unchanged (a local embedder never egresses).
+            return Self::from_resolved(resolved, tier_model);
+        }
+        if tier_model.is_none() {
+            return Ok(None);
+        }
+        if !crate::config::is_recognized_llm_backend(&resolved.backend) {
+            return Err(
+                crate::config::unrecognized_llm_backend_error(&resolved.backend)
+                    .context("refusing to build an embedder for an unrecognized backend (#3627)"),
+            );
+        }
+        let Some(dim) = resolved.embedding_dim else {
+            anyhow::bail!(
+                "embedding model {:?} (backend {:?}) has no known vector dim — pin the width with {} (env) or `[embeddings].dim` (#1598, #2626)",
+                resolved.model,
+                resolved.backend,
+                crate::config::ENV_EMBED_DIM,
+            );
+        };
+        let api_key = resolved.api_key().unwrap_or_default();
+        let client = crate::llm::OllamaClient::new_openai_compatible_pinned(
+            &resolved.url,
+            &resolved.model,
+            api_key,
+            &pin.host,
+            &pin.addrs,
+        )
+        .context("failed to build pinned OpenAI-compatible embed client (#3822)")?
+        .with_embed_dimensions(resolved.requested_dim);
+        Ok(Some(Self::new_remote(
+            Arc::new(client),
+            resolved.model.clone(),
+            dim as usize,
+        )))
+    }
+
     /// Create an embedder for the specified model.
     ///
     /// - `MiniLmL6V2` → local candle embedder
