@@ -9,9 +9,11 @@
 //!
 //! An ORPHANED graph is a `memory_graph` SCHEMA that exists with NO
 //! `ag_catalog.ag_graph` registry row — the #3881 real-world shape:
-//! `DROP EXTENSION age CASCADE` removes `ag_catalog` + the registry but leaves
-//! the plain `memory_graph` schema behind, and re-`CREATE EXTENSION age` brings
-//! `ag_catalog` back with no registry row for the surviving schema. Against it
+//! `DROP EXTENSION age CASCADE` removes `ag_catalog` + the registry but (on
+//! some AGE versions) leaves the plain `memory_graph` schema behind, and
+//! re-`CREATE EXTENSION age` brings `ag_catalog` back with no registry row for
+//! the surviving schema. The fixture builds that shape version-independently
+//! (see `orphan_the_graph`). Against it
 //! `create_graph` raises 42P06 `schema "memory_graph" already exists` and every
 //! projection MERGE fails — a STRUCTURAL fault, not a transient one.
 //!
@@ -67,24 +69,53 @@ fn mk_memory(namespace: &str, title: &str, now: &str) -> Memory {
     }
 }
 
-/// Reproduce the #3881 orphan with AGE still INSTALLED: drop the extension
-/// (registry gone, `memory_graph` schema survives as an orphan), then re-create
-/// the extension so `ag_catalog` is back — but WITHOUT `create_graph`, so the
-/// surviving schema has no registry row. DROP/CREATE EXTENSION is global state,
-/// hence the single-test design.
+/// Reproduce the #3881 orphan with AGE still INSTALLED: remove the graph's
+/// `ag_label` rows and then its `ag_catalog.ag_graph` registry row, in one
+/// transaction, leaving the `memory_graph` SCHEMA in place with no registry
+/// row, which is the exact shape `create_graph` then refuses with 42P06.
+///
+/// Why not `DROP EXTENSION age CASCADE` + `CREATE EXTENSION age` (the #3881
+/// real-world path): the survival of the schema across that drop is
+/// VERSION-DEPENDENT. MEASURED by f1 on PG 18.6 / AGE 1.8.0 (the certified
+/// tier): the drop takes the schema with it, so the fixture produced
+/// (schema absent, registry absent), the link re-created the graph, and the
+/// cell failed on a missing outbox row for a reason that had nothing to do
+/// with the product. The catalog-row construction is version-independent, and
+/// the caller asserts BOTH halves of the orphan shape before relying on it.
 async fn orphan_the_graph(url: &str) -> Result<(), Box<dyn std::error::Error>> {
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(1)
         .connect(url)
         .await?;
-    let mut conn = pool.acquire().await?;
-    sqlx::query("DROP EXTENSION IF EXISTS age CASCADE")
-        .execute(&mut *conn)
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "DELETE FROM ag_catalog.ag_label WHERE graph = \
+         (SELECT graphid FROM ag_catalog.ag_graph WHERE name = $1::name)",
+    )
+    .bind(AGE_GRAPH)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("DELETE FROM ag_catalog.ag_graph WHERE name = $1::name")
+        .bind(AGE_GRAPH)
+        .execute(&mut *tx)
         .await?;
-    sqlx::query("CREATE EXTENSION IF NOT EXISTS age")
-        .execute(&mut *conn)
-        .await?;
+    tx.commit().await?;
     Ok(())
+}
+
+/// Does the `memory_graph` schema physically exist (the other half of the
+/// orphan shape: present schema, absent registry row)?
+async fn graph_schema_present(url: &str) -> Result<bool, Box<dyn std::error::Error>> {
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(url)
+        .await?;
+    Ok(
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = $1::name)")
+            .bind(AGE_GRAPH)
+            .fetch_one(&pool)
+            .await?,
+    )
 }
 
 /// Heal the orphan: drop the surviving schema and re-create the graph so the
@@ -228,6 +259,12 @@ async fn age_orphan_graph_quarantines_and_self_heals_3883() {
             .await
             .expect("probe orphan state"),
         "fixture precondition: ag_graph registry row must be ABSENT after orphaning"
+    );
+    assert!(
+        graph_schema_present(&url)
+            .await
+            .expect("probe orphan schema"),
+        "fixture precondition: the memory_graph SCHEMA must SURVIVE orphaning (else this is an absent graph, not an orphan)"
     );
 
     let q_before = quarantined_total();
