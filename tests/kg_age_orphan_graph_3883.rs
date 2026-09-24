@@ -135,17 +135,23 @@ async fn heal_the_graph(url: &str) -> Result<(), Box<dyn std::error::Error>> {
         .await?;
     // #3935 — teardown that survives all THREE entry states heal_the_graph is
     // called against (:174 recovers a crashed prior run): healthy (ag_graph row
-    // + schema), ORPHAN (schema present, NO ag_graph row — the file-header
-    // shape), and fully absent. A REGISTERED graph MUST be torn down with AGE's
-    // `drop_graph`: a raw `DROP SCHEMA ... CASCADE` fires AGE's object_access
-    // hook (`2BP01 table "_ag_label_edge" is for label`), and that hook is
-    // GLOBAL when `age` is in `shared_preload_libraries` (MEASURED on the lane:
-    // AGE 1.8.0 / PG 18.6, `shared_preload_libraries = age`), so a separate
-    // connection that never issues `LOAD age` does NOT avoid it. `drop_graph`
-    // cooperates with the hook but ERRORs "graph does not exist" without a
-    // registry row, so it is used ONLY when the `ag_graph` row is present; an
-    // orphan schema (no row) is dropped raw — its tables are not registered
-    // labels, so the hook does not fire on them.
+    // + schema), ORPHAN (schema present, NO ag_graph row — the `orphan_the_graph`
+    // shape: it deletes the `ag_label` + `ag_graph` rows and leaves the schema,
+    // version-independent since `DROP EXTENSION age` takes the schema with it on
+    // AGE 1.8), and fully absent. A REGISTERED graph MUST be torn down with AGE's
+    // `drop_graph`, for a reason that holds regardless of the lane's
+    // `shared_preload_libraries`: a raw `DROP SCHEMA ... CASCADE` under an active
+    // AGE session fires the object_access hook (`2BP01 table "_ag_label_edge" is
+    // for label`); and even where a no-`LOAD age` connection lets the raw drop
+    // through (a lane with EMPTY `shared_preload_libraries`), the drop removes the
+    // SCHEMA but LEAVES the `ag_graph` registry row — an INVERTED orphan — so the
+    // `create_graph` that follows in this fn then FAILS ("graph already exists").
+    // Only `drop_graph`, which removes BOTH the registry row and the schema, is a
+    // clean teardown of a registered graph. But `drop_graph` ERRORs "graph does
+    // not exist" without a registry row, so it is used ONLY when the `ag_graph`
+    // row is present; an orphan schema (no row) is dropped raw — `orphan_the_graph`
+    // already removed its `ag_label` rows, so the leftover tables are not
+    // registered labels and the hook does not fire on them.
     let graph_registered: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM ag_catalog.ag_graph WHERE name = $1::name)",
     )
