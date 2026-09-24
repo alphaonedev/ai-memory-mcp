@@ -1918,8 +1918,10 @@ it, and flip it back.
 > plaintext, **do not federate that namespace**: scope it out with
 > `allowed_namespaces`, or run a separate non-federated deployment.
 > This covers **`scope=private` rows and private-by-default inbox rows
-> too**: the write-time push lane replicates them to every configured
-> peer (the pull/catch-up lane withholds them). The peer re-applies the
+> too**: both push paths replicate them to every configured peer, the
+> write-time push and the `bulk_catchup_push` terminal batch after
+> `bulk_create` (a push despite its name). Only the `/sync/since` PULL
+> lane withholds them (#948). The peer re-applies the
 > owner predicate, so its other agents cannot read them, but the peer's
 > operator holds them under the peer's custody (#3928).
 
