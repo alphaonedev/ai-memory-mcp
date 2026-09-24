@@ -100,6 +100,7 @@ pub mod age_version;
 // v1.0.0 #3124 R4 — the audited `reown` sweep. Own module for the same
 // qual_10 budget reason as `parity_3064` above.
 mod reown_3124;
+mod swarm_rewind;
 
 use crate::models::field_names;
 use std::time::Duration;
@@ -29095,6 +29096,31 @@ impl MemoryStore for PostgresStore {
             self.gate_record_stop().await?;
         }
         self.reown_pg(ctx, namespace, to_id, select, dry_run).await
+    }
+
+    async fn swarm_rewind(
+        &self,
+        ctx: &CallerContext,
+        root_id: &str,
+        max_depth: usize,
+        target_kind: &str,
+        freeze_routine_ids: &[String],
+        dry_run: bool,
+    ) -> StoreResult<crate::storage::SwarmRewindReport> {
+        // Boids item 3 (#3266) — gate taken HERE and in the submodule, the
+        // `reown` shape (B8 parity scan reads this file, B7 the write site).
+        if !dry_run {
+            self.gate_record_stop().await?;
+        }
+        self.swarm_rewind_pg(
+            ctx,
+            root_id,
+            max_depth,
+            target_kind,
+            freeze_routine_ids,
+            dry_run,
+        )
+        .await
     }
 
     async fn action_create(

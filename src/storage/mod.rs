@@ -859,6 +859,7 @@ pub(crate) fn escape_like_pattern(s: &str) -> String {
 // `pub use storage as db;` shim in `src/lib.rs` preserves the
 // historical `crate::db::*` paths used elsewhere.
 pub(crate) mod connection;
+pub(crate) mod contamination_marker;
 // `pub` (rather than `pub(crate)`) so the V-4 closeout
 // integration test suite (`tests/signed_events_chain_v34.rs`) can
 // invoke `migrate_v34_backfill_chain` directly to exercise the
@@ -13481,24 +13482,10 @@ fn contaminate_row(
         .filter(serde_json::Value::is_object)
         .unwrap_or_else(|| serde_json::json!({}));
     if let Some(map) = meta.as_object_mut() {
-        // Base marker keys in the historical (#3324) order; `extra_marker`
-        // appends provenance (e.g. `via`, `rewind`) without disturbing them.
-        let mut marker = serde_json::Map::new();
-        marker.insert(
-            "prior_lifecycle_state".to_string(),
-            serde_json::json!(cur.as_str()),
-        );
-        marker.insert(
-            "contaminated_from".to_string(),
-            serde_json::json!(contaminated_from),
-        );
-        marker.insert("stamped_at".to_string(), serde_json::json!(now));
-        for (k, v) in extra_marker {
-            marker.insert((*k).to_string(), v.clone());
-        }
+        // Shared builder (sqlite + postgres): base keys in the #3324 order.
         map.insert(
             CONTAMINATION_METADATA_KEY.to_string(),
-            serde_json::Value::Object(marker),
+            contamination_marker::build(cur, contaminated_from, now, extra_marker),
         );
     }
     let meta_ser = serde_json::to_string(&meta)?;
@@ -13629,7 +13616,7 @@ pub struct SwarmRewindCost {
 }
 
 impl SwarmRewindCost {
-    fn from_rollup(r: &crate::cost::CostRollup) -> Self {
+    pub(crate) fn from_rollup(r: &crate::cost::CostRollup) -> Self {
         Self {
             scope_key: r.scope_key.clone(),
             tokens_written: r.tokens_written,
@@ -13686,7 +13673,7 @@ pub struct SwarmRewindReport {
 /// marker to make a `swarm_rewind` IDEMPOTENT: a re-run detects an already-set
 /// `rewind: true` marker and short-circuits without re-stamping or appending a
 /// duplicate audit row.
-const SWARM_REWIND_MARKER_KEY: &str = "rewind";
+pub(crate) const SWARM_REWIND_MARKER_KEY: &str = "rewind";
 
 /// Shared SELECT of a memory's `(lifecycle_state, metadata)` by id — used by
 /// both the #3324 auto-stamp sweep and the #3322 swarm_rewind orchestration
@@ -13917,7 +13904,10 @@ pub fn swarm_rewind(
                     "via".to_string(),
                     serde_json::json!(crate::governance::action_labels::SWARM_REWIND),
                 );
-                cont.insert("rewound_at".to_string(), serde_json::json!(now));
+                cont.insert(
+                    contamination_marker::REWOUND_AT_KEY.to_string(),
+                    serde_json::json!(now),
+                );
                 obj.insert(
                     CONTAMINATION_METADATA_KEY.to_string(),
                     serde_json::Value::Object(cont),
@@ -14006,7 +13996,7 @@ pub fn swarm_rewind(
 /// v1.0.0 #3322 — canonical bytes committed by a `swarm.rewind` signed event.
 /// The event's `payload_hash` is `SHA-256` over this, binding the rewind's
 /// identity into the tamper-evident chain.
-fn swarm_rewind_audit_payload(
+pub(crate) fn swarm_rewind_audit_payload(
     root_id: &str,
     target_kind: &str,
     contaminated: usize,

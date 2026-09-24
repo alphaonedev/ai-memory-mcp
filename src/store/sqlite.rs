@@ -2423,6 +2423,33 @@ impl MemoryStore for SqliteStore {
             .map_err(box_err)
     }
 
+    async fn swarm_rewind(
+        &self,
+        ctx: &CallerContext,
+        root_id: &str,
+        max_depth: usize,
+        target_kind: &str,
+        freeze_routine_ids: &[String],
+        dry_run: bool,
+    ) -> StoreResult<crate::storage::SwarmRewindReport> {
+        // Boids item 3 (#3266) — delegates to the existing funnel, which gates
+        // record-stop itself on a real run.
+        if !dry_run {
+            self.gate_record_stop()?;
+        }
+        let conn = self.state.lock().await;
+        crate::storage::swarm_rewind(
+            &conn,
+            root_id,
+            max_depth,
+            &ctx.agent_id,
+            target_kind,
+            freeze_routine_ids,
+            dry_run,
+        )
+        .map_err(box_err)
+    }
+
     async fn action_create(
         &self,
         _ctx: &CallerContext,

@@ -1618,6 +1618,29 @@ pub trait MemoryStore: Send + Sync {
         })
     }
 
+    /// Boids predator plan item 3 (#3266, vote `4d3ea1c5`) — contaminate a
+    /// cascade root + its bounded `derives_from` descendants, freeze the named
+    /// routines, append one signed `swarm.rewind` event (one transaction).
+    /// `ctx.agent_id` is the recorded issuer. `root_id` is already resolved
+    /// (memory or checkpoint target) by the caller.
+    ///
+    /// # Errors
+    ///
+    /// Adapter-specific; `UnsupportedCapability` by default.
+    async fn swarm_rewind(
+        &self,
+        _ctx: &CallerContext,
+        _root_id: &str,
+        _max_depth: usize,
+        _target_kind: &str,
+        _freeze_routine_ids: &[String],
+        _dry_run: bool,
+    ) -> StoreResult<crate::storage::SwarmRewindReport> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "SWARM_REWIND".to_string(),
+        })
+    }
+
     /// #1393 sub-unit 2 — reclassify a memory's `memory_kind` (the curator
     /// transcript-classify pass: a recovered `Observation` → an
     /// LLM-classified kind). This is a DEDICATED, audited path, NOT a field
