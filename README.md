@@ -1259,6 +1259,18 @@ score = (fts_relevance * -1)
 > reads); the controls for declaration-gaming — corroboration and
 > Sybil-correct independent writers (plan items 5-6) — are behind the
 > benchmark gate, not in GA.
+> A quantified residual on the confidence term: the schema-v39 SQLite
+> migration added `confidence_source` as `TEXT NOT NULL DEFAULT
+> 'caller_provided'`, so **every row predating v39 was backfilled to
+> `caller_provided` and keeps the full +2.0** — and those are the oldest,
+> most-recalled rows. The same holds on Postgres, whose `memories`
+> `confidence_source` is likewise `NOT NULL DEFAULT 'caller_provided'`
+> (bootstrap + migrate_v38), so legacy rows there are also backfilled to
+> `caller_provided`. Only a `'default'` provenance (caller omitted
+> confidence) is neutralised; a legacy `caller_provided` row is
+> indistinguishable from an explicit caller value and is not. (The CASE's
+> `OR ... IS NULL` arm is defensive-dead on `memories`, NOT NULL on both
+> backends.)
 
 ---
 

@@ -17,11 +17,15 @@
 //! `ConfidenceSource::Default`) scores as neutral 0.5 instead of the
 //! compiled 1.0 fallback; an explicitly-asserted confidence keeps full
 //! weight. A11 (f2r security pre-cut): the legacy / NULL arm is pinned
-//! EXPLICITLY, asserted not assumed — a genuinely-unattested NULL
-//! provenance row (postgres-only; the sqlite column is `NOT NULL DEFAULT
-//! 'caller_provided'`) takes the neutral branch, while a legacy /
-//! explicit `'caller_provided'` row takes ELSE and keeps its stored
-//! confidence. `'caller_provided'` is stamped for BOTH explicit-caller
+//! EXPLICITLY, asserted not assumed. Measured schema reality:
+//! `memories.confidence_source` is `TEXT NOT NULL DEFAULT 'caller_provided'`
+//! on BOTH backends (sqlite v39; postgres bootstrap `postgres_schema.sql`
+//! plus `migrate_v38` / `0020_...sql`), so a genuinely-NULL provenance row does
+//! NOT exist in `memories` on either backend and the CASE's `OR ... IS NULL`
+//! arm is DEFENSIVE-DEAD there (the only nullable `confidence_source` is on
+//! `archived_memories`, which the score sites never read). What A11 turns on
+//! and what is testable: a legacy/explicit `'caller_provided'` row takes ELSE
+//! and keeps its stored confidence. `'caller_provided'` is stamped for BOTH explicit-caller
 //! and legacy-backfill rows (`mcp/tools/store/validation.rs`), so it
 //! CANNOT be neutralized without de-weighting explicit values — that
 //! residual is disclosed in the GA line (A10).
@@ -281,9 +285,10 @@ fn default_provenance_row_ranks_below_explicit_confidence_3922() {
 /// `'caller_provided'` and takes the CASE ELSE branch (keeps its stored
 /// confidence, +2.0 at 1.0) — it CANNOT be neutralized without also
 /// de-weighting explicit caller confidences, which share the same
-/// string. The genuinely-unattested NULL arm (possible only on postgres,
-/// where the column is nullable) takes the NEUTRAL branch; that half is
-/// pinned in `tests/boids_rank_trust_3922_pg.rs`.
+/// string. The `OR ... IS NULL` arm is defensive-dead on `memories`
+/// (NOT NULL on both backends); the postgres twin pins the same
+/// `'default'`-vs-`'caller_provided'` behaviour on postgres
+/// (`tests/boids_rank_trust_3922_pg.rs`).
 #[test]
 fn a11_legacy_caller_provided_takes_else_not_neutral_3922() {
     let (conn, _d) = fresh_db();
@@ -408,10 +413,7 @@ fn fold_no_longer_escalates_tier_priority_updated_at_3922() {
     // TTL floor-extend still applies: the mid window (1 day) floors the
     // near-future expiry forward.
     let exp = exp.expect("mid row keeps a non-NULL expiry");
-    assert!(
-        exp.as_str() > TS,
-        "TTL floor-extend still applies: {exp}"
-    );
+    assert!(exp.as_str() > TS, "TTL floor-extend still applies: {exp}");
 }
 
 #[test]

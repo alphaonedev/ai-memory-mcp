@@ -723,6 +723,17 @@ or overclaim).
   of self-asserted rank with zero reads; the controls for
   declaration-gaming — corroboration and Sybil-correct independent
   writers (plan items 5-6) — are behind the benchmark gate, not in GA.
+  A quantified residual on the confidence term: the schema-v39 SQLite
+  migration added `confidence_source` as `TEXT NOT NULL DEFAULT
+  'caller_provided'`, so every row predating v39 was backfilled to
+  `caller_provided` and keeps the full +2.0 — and those are the oldest,
+  most-recalled rows. The same holds on Postgres (its `memories`
+  `confidence_source` is also `NOT NULL DEFAULT 'caller_provided'`), so
+  legacy rows there are backfilled identically. Only a `'default'`
+  provenance is neutralised; a legacy `caller_provided` row is
+  indistinguishable from an explicit caller value. The CASE's
+  `OR ... IS NULL` arm is defensive-dead on `memories` (NOT NULL on both
+  backends).
 - **Tamper-evidence bounds (interior-rewrite residual).** The
   `signed_events` cross-row hash chain plus the #1850 forensic
   watermark and the #1873/#2202 head-hash anchor detect **tail

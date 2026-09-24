@@ -14,13 +14,17 @@
 //! ```
 //!
 //! Same three contracts as the sqlite half (R1 cap, R3 provenance-aware
-//! confidence, R2 no fold/touch escalation). PLUS the A11 NULL arm that
-//! the sqlite half CANNOT exercise: on postgres the `confidence_source`
-//! column is nullable (`ADD COLUMN ... TEXT`, no default), so a
-//! genuinely-unattested legacy row is NULL — and the R3 CASE (`= 'default'
-//! OR IS NULL`) neutralizes it to 0.5, asserted here. A legacy /
-//! explicit `'caller_provided'` row still takes ELSE (keeps its stored
-//! confidence). The postgres `recall_hybrid` score is `fts_score /
+//! confidence, R2 no fold/touch escalation). PLUS the A11 arm on postgres:
+//! measured schema reality is that `memories.confidence_source` is
+//! `TEXT NOT NULL DEFAULT 'caller_provided'` on BOTH backends (postgres
+//! bootstrap `postgres_schema.sql:188` + `migrate_v38`; the nullable
+//! `confidence_source` at `postgres.rs:5144` is `archived_memories`, a
+//! DIFFERENT table the score sites never read). So a genuinely-NULL
+//! provenance row cannot exist in `memories` (forcing one is refused with
+//! PG 23502), and the R3 CASE's `OR ... IS NULL` arm is defensive-dead here.
+//! The testable, load-bearing A11 behaviour — a `'default'` row neutralised
+//! while a `'caller_provided'` row keeps its stored confidence — is pinned
+//! below. The postgres `recall_hybrid` score is `fts_score /
 //! max_fts` — a per-query monotonic normalization of the real formula, so
 //! equal inputs give equal scores (a tie on the pre-cut tip) and strict
 //! `>` is a sound RED-first assertion; exact gaps (sqlite half) are not
@@ -84,7 +88,12 @@ fn row(
 /// byte-identical for every seeded row (the store stamps its own
 /// timestamps on write; scoring parity requires equal recency).
 async fn pin_timestamps(pool: &sqlx::PgPool, ns: &str) {
-    sqlx::query("UPDATE memories SET created_at = $1, updated_at = $1 WHERE namespace = $2")
+    sqlx::query(
+        // #3922 f2r fix — cast the &str-bound param to timestamptz; sqlx binds a
+        // &str as text and postgres will not implicitly cast text -> timestamptz
+        // in an UPDATE SET (PG 42804). The sqlite twin is fine (TEXT column).
+        "UPDATE memories SET created_at = $1::timestamptz, updated_at = $1::timestamptz WHERE namespace = $2",
+    )
         .bind(TS)
         .bind(ns)
         .execute(pool)
@@ -206,14 +215,14 @@ async fn pg_default_ranks_below_explicit_confidence_3922() {
     );
 }
 
-/// A11 (f2r pre-cut security amendment), postgres-only NULL arm: a
-/// genuinely-unattested row (`confidence_source IS NULL`, reachable only
-/// on postgres) takes the NEUTRAL branch, while a legacy / explicit
+/// A11 (f2r pre-cut security amendment), postgres arm: a `'default'`
+/// (unassessed) row is neutralised while a legacy/explicit
 /// `'caller_provided'` row takes ELSE and keeps its stored confidence.
-/// Asserted, not assumed.
+/// Asserted, not assumed. The `OR ... IS NULL` arm is defensive-dead on
+/// `memories` (NOT NULL on both backends — see the fn-body note).
 #[tokio::test]
 #[ignore = "requires AI_MEMORY_TEST_POSTGRES_URL (live postgres); run with --include-ignored"]
-async fn pg_a11_null_provenance_is_neutral_caller_provided_is_full_3922() {
+async fn pg_a11_default_is_neutral_caller_provided_is_full_3922() {
     common::permissive_attestation_for_tests();
     let Some(env) = PostgresTestEnv::new("boids_a11").await else {
         eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
@@ -223,15 +232,29 @@ async fn pg_a11_null_provenance_is_neutral_caller_provided_is_full_3922() {
     let admin = CallerContext::for_admin("operator:boids");
     let ns = "boids/a11";
     let content = "boida11pg shared trust body";
+    // A11, measured schema reality: `memories.confidence_source` is
+    // `TEXT NOT NULL DEFAULT 'caller_provided'` on BOTH backends (postgres
+    // bootstrap `postgres_schema.sql` + `migrate_v38` / `0020_...sql`; sqlite
+    // schema v39). So a genuinely-NULL provenance row CANNOT exist in
+    // `memories` on either backend — a `UPDATE ... SET confidence_source =
+    // NULL` is refused with PG 23502 (not_null_violation). The R3/A11 CASE's
+    // `OR confidence_source IS NULL` arm is therefore DEFENSIVE-DEAD on the
+    // recall-scored `memories` table (it costs nothing and correctly handles
+    // a hypothetical nullable source, e.g. the nullable `archived_memories`
+    // column, which the score sites never query). What IS testable — and what
+    // A11 actually turns on — is that a legacy/explicit `'caller_provided'`
+    // row keeps its full weight while an unassessed `'default'` row is
+    // neutralised; that is pinned here on postgres, mirroring the sqlite
+    // `a11_legacy_caller_provided_takes_else_not_neutral_3922` cell.
     for m in [
         row(
-            "nullprov",
+            "deflt",
             "alpha",
             content,
             ns,
             0,
             1.0,
-            ConfidenceSource::CallerProvided,
+            ConfidenceSource::Default,
         ),
         row(
             "legacy",
@@ -247,19 +270,13 @@ async fn pg_a11_null_provenance_is_neutral_caller_provided_is_full_3922() {
     }
     let pool = inspection_pool(env.url()).await;
     pin_timestamps(&pool, ns).await;
-    // Force the genuinely-unattested NULL provenance the postgres column
-    // allows (the sqlite twin cannot: NOT NULL DEFAULT 'caller_provided').
-    sqlx::query("UPDATE memories SET confidence_source = NULL WHERE id = 'nullprov'")
-        .execute(&pool)
-        .await
-        .expect("null the provenance");
 
     let scored = recall_scored(&store, "boida11pg", ns).await;
-    // NULL provenance → neutral (+1.0); 'caller_provided' → ELSE (+2.0).
+    // 'caller_provided' → ELSE (+2.0); 'default' → neutral (+1.0).
     assert!(
-        score_of(&scored, "legacy") > score_of(&scored, "nullprov"),
-        "legacy 'caller_provided' (ELSE, +2.0) must outrank a NULL-provenance \
-         neutral row (+1.0)"
+        score_of(&scored, "legacy") > score_of(&scored, "deflt"),
+        "legacy 'caller_provided' (ELSE, +2.0) must outrank a neutralised \
+         'default' row (+1.0)"
     );
 }
 
