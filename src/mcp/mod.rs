@@ -808,6 +808,16 @@ pub use kg_invalidate::handle_kg_invalidate;
 pub use kg_timeline::handle_kg_timeline;
 pub use subscribe::{handle_list_subscriptions, handle_subscribe};
 pub use swarm_rewind::handle_swarm_rewind;
+/// Boids item 3 part 2 — shared with `handlers::swarm_rewind_http` so the HTTP
+/// route resolves targets and renders the envelope exactly as the MCP tool does.
+pub(crate) use swarm_rewind::{
+    TARGET_KIND_CHECKPOINT as REWIND_TARGET_KIND_CHECKPOINT,
+    TARGET_KIND_MEMORY as REWIND_TARGET_KIND_MEMORY,
+    checkpoint_has_no_root as rewind_checkpoint_has_no_root,
+    checkpoint_root_memory_id as checkpoint_rewind_root,
+    checkpoint_root_not_found as rewind_checkpoint_root_not_found,
+    render_report as render_swarm_rewind_report, target_not_found as rewind_target_not_found,
+};
 pub use verify::handle_verify;
 // v0.7.0 L1-5 / L2-6 — test-and-integration access to the skill
 // substrate handlers. These are public so the L2-6 regression suite

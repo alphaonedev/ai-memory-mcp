@@ -107,7 +107,7 @@ CLI subcommands):
 |---|---|
 | MCP tools (`--profile full`) | **103 advertised** (102 callable + the always-on `memory_capabilities` bootstrap) |
 | MCP tools (`--profile core`) | **7** (original 5 + `memory_load_family` + `memory_smart_load`) + the `memory_capabilities` bootstrap |
-| HTTP routes | **102 production `.route(...)` registrations** / 88 unique URL paths |
+| HTTP routes | **103 production `.route(...)` registrations** / 89 unique URL paths |
 | CLI subcommands | **90 default build** / **92 under `--features sal`** (the `capability init` sub-verb rides the existing `Capability` command, so the top-level count is unchanged) |
 | `MemoryKind` variants | **16** (adds v1.0.0 epistemic typing `Told` / `Instruction` / `Intervention`, [#1945](https://github.com/alphaonedev/ai-memory-mcp/issues/1945)) |
 | Schema | **v100** (`CURRENT_SCHEMA_VERSION`, both adapters). Not uniformly additive: v79–v85 are additive, **v86 and v87 rewrite stored rows**, v88 is index-only, v89 redefines the postgres FTS `tsv` generated column (derived data, no stored-row rewrite), and v90–v97 are additive; v98 adds legacy inbox namespace aliases; v99 (#3655) adds the per-peer contact stamp; v100 (#3690) makes the `(title, namespace)` unique index PARTIAL (`WHERE lifecycle_state <> 'tombstoned'`) so a consolidation tombstone gives its slot up — index-only, no stored-row rewrite. Per-rung detail + the true bound of the migration evidence: §"Schema ladder v78 → v100" |
@@ -775,18 +775,18 @@ or overclaim).
   rollbacks until upgraded (one-release conservatism: old readers never
   mint a FALSE verdict, and the new reader still counts legacy id-less
   lines toward Evidence).
-- **The swarm-cascade MVG does not reach Postgres (#3926).**
-  `memory_swarm_rewind` (#3322) and `Contaminated` lifecycle stamping
-  (#3324) are implemented on the SQLite MCP/CLI path only — there is no
-  Postgres implementation and no HTTP route, and the `swarm-rewind` CLI
-  refuses a Postgres store rather than rewinding a local sidecar
-  (#3924). Even on SQLite, stamping fires only on an MCP `supersedes`
-  link between two reflections, not on `kg_invalidate`. On Postgres the
-  #3323 per-lineage token/cost counters are written but no surface reads
-  the rollup yet. An enterprise Postgres fleet can therefore hide rows
-  that already carry `contaminated` but cannot create that state, rewind
-  a cascade, or report its cost at v1.0.0. PG parity, together with the
-  cascade sensor and corroboration gate, is v1.1 scope (#3266).
+- **Swarm-cascade containment on Postgres: rewind yes, auto-stamp not
+  yet, node-local only (#3926, #3266 item 3).** `memory_swarm_rewind`
+  (#3322) runs on BOTH backends through the admin-only
+  `POST /api/v1/memory_swarm_rewind`; the MCP tool stays stdio/SQLite-only
+  and the `swarm-rewind` CLI refuses a Postgres store (#3924), so on
+  Postgres the route is the rewind. Its report carries the lineage's
+  #3323 token/cost rollup on both backends; no other surface reads the PG
+  rollup yet. The automatic `Contaminated` stamp (#3324) is still
+  SQLite-only, and even there fires only on an MCP `supersedes` link
+  between two reflections, not on `kg_invalidate`. Containment is
+  node-local: a rewind does not propagate to federated peers. The cascade
+  sensor and corroboration gate are v1.1 scope (#3266).
 - **Claimed-vs-attested identity and diversity.** `metadata.agent_id`
   and the reflection-decorrelation probe's model-family signal are
   CLAIMED (self-asserted by the caller) unless independently attested

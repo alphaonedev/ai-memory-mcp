@@ -101,6 +101,28 @@ impl McpTool for SwarmRewindTool {
 /// its `condition`/`metadata` is consulted for a `memory_id`/`root_id`
 /// pointing at the cascade root. Fail-closed: an unresolvable target, or a
 /// checkpoint that names no root, is an error rather than a silent no-op.
+/// Target kinds a rewind `to` resolves to (one spelling for MCP and HTTP).
+pub(crate) const TARGET_KIND_MEMORY: &str = "memory";
+/// See [`TARGET_KIND_MEMORY`].
+pub(crate) const TARGET_KIND_CHECKPOINT: &str = "checkpoint";
+
+/// The caller-facing refusal texts of target resolution — ONE spelling shared
+/// by the MCP tool and both HTTP arms, so the surfaces cannot drift.
+pub(crate) fn target_not_found(to: &str) -> String {
+    format!("swarm_rewind: target {to} not found")
+}
+/// See [`target_not_found`].
+pub(crate) fn checkpoint_has_no_root(to: &str) -> String {
+    format!(
+        "swarm_rewind: checkpoint {to} references no rewind root \
+         (condition/metadata.memory_id|root_id)"
+    )
+}
+/// See [`target_not_found`].
+pub(crate) fn checkpoint_root_not_found(to: &str) -> String {
+    format!("swarm_rewind: checkpoint {to} root memory not found")
+}
+
 fn resolve_rewind_target(
     conn: &rusqlite::Connection,
     to: &str,
@@ -110,7 +132,7 @@ fn resolve_rewind_target(
         .map_err(|e| crate::mcp::error_text::mcp_foreign_err("swarm_rewind target probe", e))?
         .is_some()
     {
-        return Ok((to.to_string(), "memory"));
+        return Ok((to.to_string(), TARGET_KIND_MEMORY));
     }
 
     // Checkpoint arm — resolve the checkpoint, then extract a root memory id
@@ -118,12 +140,7 @@ fn resolve_rewind_target(
     if let Some(cp) = crate::checkpoints::get(conn, to)
         .map_err(|e| crate::mcp::error_text::mcp_foreign_err("swarm_rewind checkpoint probe", e))?
     {
-        let root = checkpoint_root_memory_id(&cp).ok_or_else(|| {
-            format!(
-                "swarm_rewind: checkpoint {to} references no rewind root \
-                 (condition/metadata.memory_id|root_id)"
-            )
-        })?;
+        let root = checkpoint_root_memory_id(&cp).ok_or_else(|| checkpoint_has_no_root(to))?;
         if db::namespace_by_id(conn, &root)
             .map_err(|e| {
                 crate::mcp::error_text::mcp_foreign_err("swarm_rewind checkpoint root probe", e)
@@ -138,20 +155,18 @@ fn resolve_rewind_target(
                 root,
                 "swarm_rewind: checkpoint root memory not found"
             );
-            return Err(format!(
-                "swarm_rewind: checkpoint {to} root memory not found"
-            ));
+            return Err(checkpoint_root_not_found(to));
         }
-        return Ok((root, "checkpoint"));
+        return Ok((root, TARGET_KIND_CHECKPOINT));
     }
 
-    Err(format!("swarm_rewind: target {to} not found"))
+    Err(target_not_found(to))
 }
 
 /// Pull a `memory_id` / `root_id` string out of a checkpoint's `condition` or
 /// `metadata` JSON. Present-only: `None` when the checkpoint carries no such
 /// reference.
-fn checkpoint_root_memory_id(cp: &crate::models::Checkpoint) -> Option<String> {
+pub(crate) fn checkpoint_root_memory_id(cp: &crate::models::Checkpoint) -> Option<String> {
     for obj in [&cp.condition, &cp.metadata] {
         for key in ["memory_id", "root_id"] {
             if let Some(s) = obj
@@ -298,7 +313,7 @@ pub fn handle_swarm_rewind(conn: &rusqlite::Connection, params: &Value) -> Resul
 }
 
 /// Render a [`crate::storage::SwarmRewindReport`] into the wire envelope.
-fn render_report(r: &crate::storage::SwarmRewindReport) -> Value {
+pub(crate) fn render_report(r: &crate::storage::SwarmRewindReport) -> Value {
     json!({
         "root_id": r.root_id,
         (crate::storage::SWARM_REWIND_TARGET_KIND_KEY): r.target_kind,
