@@ -1917,6 +1917,15 @@ it, and flip it back.
 > gate — did not. If your control requires that no peer ever holds
 > plaintext, **do not federate that namespace**: scope it out with
 > `allowed_namespaces`, or run a separate non-federated deployment.
+> This covers **`scope=private` rows and private-by-default inbox rows
+> too**: EVERY push path replicates them to every configured peer
+> without a scope filter — the write-time push
+> (`federation::broadcast_store_quorum_with_embedding`), the bulk
+> catch-up push (`federation::bulk_catchup_push`, a push despite its
+> name), and the sync-daemon cycle (`daemon_runtime::sync_cycle_once`).
+> Only the `/sync/since` PULL lane withholds them (#948). The peer re-applies the
+> owner predicate, so its other agents cannot read them, but the peer's
+> operator holds them under the peer's custody (#3928).
 
 - [ ] Federated namespaces reviewed against the plaintext-at-peer property above; namespaces under a no-plaintext control are excluded from federation scope.
 - [ ] Binary built with `--features sqlcipher`; `AI_MEMORY_ENCRYPT_AT_REST=1`.

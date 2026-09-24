@@ -68,7 +68,13 @@ pub fn cmd_swarm_rewind(
     args: &SwarmRewindArgs,
     out: &mut CliOutput<'_>,
 ) -> Result<()> {
-    let conn = db::open(db_path)?;
+    // v1.0.0 #3924 — REFUSE on a Postgres store BEFORE the local open. A rewind
+    // contaminates a subtree, freezes routines and appends a signed
+    // `swarm.rewind` event; on a pg deployment that would phantom-land in a
+    // throwaway SQLite file while the operator believes the fleet was rewound.
+    // Same shared funnel as the other class-(a) verbs; see `refuse_pg_store`.
+    let db_path = crate::cli::backup::refuse_pg_store(db_path, "swarm-rewind", out)?;
+    let conn = db::open(&db_path)?;
 
     let mut params = json!({
         param_names::TO: args.to,
@@ -137,4 +143,70 @@ pub fn cmd_swarm_rewind(
         )?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::test_utils::TestEnv;
+
+    /// v1.0.0 #3924 — `swarm-rewind` opens the local SQLite `--db` and
+    /// REWRITES it (contaminates a subtree, freezes routines, appends the
+    /// signed `swarm.rewind` event). On a Postgres-served node it must
+    /// REFUSE through the shared #2572 funnel BEFORE any open: otherwise the
+    /// rewind phantom-lands in a throwaway SQLite file while the operator
+    /// believes the PG fleet was rewound. Asserts the typed refusal (HTTP-daemon
+    /// remedy, DSN redacted) AND that no SQLite file is ever created.
+    #[test]
+    fn swarm_rewind_refuses_postgres_store_and_never_opens_sqlite_3924() {
+        let _g = crate::store_url::store_url_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // SAFETY: env mutation is serialized by `store_url_env_lock`; these keys
+        // are read only by `resolve_store_url`, held for this whole test.
+        unsafe {
+            std::env::remove_var(crate::store_url::STORE_URL_FILE_ENV);
+            std::env::set_var(
+                crate::store_url::STORE_URL_ENV,
+                "postgres://ai_memory:hunter2@127.0.0.1:5432/ai_memory",
+            );
+        }
+
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        assert!(!db.exists(), "precondition: TestEnv does not create the db");
+        let args = SwarmRewindArgs {
+            to: "cascade-root".into(),
+            max_depth: None,
+            freeze_routine: Vec::new(),
+            dry_run: false,
+            agent_id: None,
+            json: true,
+        };
+        let result = {
+            let mut out = env.output();
+            cmd_swarm_rewind(&db, &args, &mut out)
+        };
+        // SAFETY: see above.
+        unsafe {
+            std::env::remove_var(crate::store_url::STORE_URL_ENV);
+        }
+
+        let msg = result
+            .expect_err("a postgres:// store must refuse swarm-rewind (#3924)")
+            .to_string();
+        assert!(msg.contains("#2572"), "refusal must cite #2572: {msg}");
+        assert!(
+            msg.contains("HTTP daemon"),
+            "refusal must name the HTTP-daemon remedy: {msg}"
+        );
+        assert!(
+            !msg.contains("hunter2"),
+            "refusal must redact the DSN password: {msg}"
+        );
+        assert!(
+            !db.exists(),
+            "swarm-rewind must never open (and so create) the local SQLite on a pg store (#3924)"
+        );
+    }
 }

@@ -8210,8 +8210,13 @@ impl PostgresStore {
     /// read gate (`handlers::route_1111::pg_row_readable`) runs its own
     /// scope predicate over the row that exists, so the gate is
     /// lifecycle-NEUTRAL — it never changes which lifecycle states the
-    /// surface it guards discloses (the `supersedes` path, #3324, stamps
-    /// dependents `contaminated` before the curator lists them).
+    /// surface it guards discloses: it discloses whatever state the row
+    /// already carries. On Postgres no path WRITES `contaminated` at
+    /// v1.0.0 — the only #3324 stamper is the SQLite MCP `supersedes` path
+    /// (`mcp/tools/link.rs`, reflection-to-reflection only); PG `kg_invalidate`
+    /// and `link_signed` stamp nothing, so a PG row carries the state only
+    /// when it arrives already stamped (e.g. replicated from a SQLite node).
+    /// PG parity for the stamp is tracked on #3926 / #3266 (#3925).
     ///
     /// This is an authz-precondition read ONLY — never a caller-facing
     /// content read (the #3270 rule); it is reached through the concrete
