@@ -8040,8 +8040,16 @@ pub fn is_api_embed_backend(backend: &str) -> bool {
 /// embedder. [`is_api_embed_backend`] stays the gate for wire-shape / dim
 /// resolution; this is the gate for whether the socket opens.
 #[must_use]
+#[allow(clippy::match_like_matches_macro)] // #3933 — exhaustive on purpose (below)
 pub fn embed_lane_egresses(backend: &str, tier_model: Option<EmbeddingModel>) -> bool {
-    is_api_embed_backend(backend) || matches!(tier_model, Some(EmbeddingModel::NomicEmbedV15))
+    // #3933 — the model half is an EXHAUSTIVE match (deliberately NOT `matches!`)
+    // so a THIRD `EmbeddingModel` variant is a COMPILE ERROR here rather than
+    // silently defaulting to no-egress (a silent escape past this gate).
+    is_api_embed_backend(backend)
+        || match tier_model {
+            Some(EmbeddingModel::NomicEmbedV15) => true,
+            Some(EmbeddingModel::MiniLmL6V2) | None => false,
+        }
 }
 
 /// Shared API-key resolution ladder for the `[llm]` and `[embeddings]`

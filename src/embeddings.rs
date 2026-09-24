@@ -1245,8 +1245,13 @@ impl Embedder {
             // #3933 — the ollama backend + Nomic model builds an OllamaClient to
             // the resolved URL and EGRESSES, so it must be pinned to the
             // boot-resolved addrs exactly as the API lane is, not left unpinned.
+            // `embed_lane_egresses` admits a NON-API lane here ONLY for
+            // `Some(NomicEmbedV15)`, so `tier_model` is Some — the else arm is
+            // UNREACHABLE, and failing loud beats silently disabling the embedder.
             let Some(tier_model) = tier_model else {
-                return Ok(None);
+                unreachable!(
+                    "embed_lane_egresses admits a non-API embed lane only for Some(NomicEmbedV15) (#3933)"
+                )
             };
             let client = crate::llm::OllamaClient::new_with_url_pinned(
                 &resolved.url,

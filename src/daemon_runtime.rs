@@ -3640,15 +3640,11 @@ pub async fn build_embedder(
         );
         return None;
     };
-    // v1.0.0 #1963 (R68/D14) — inference-plane egress gate for EGRESSING embed
-    // lanes (the ones that open a socket to an embedding endpoint: every API
-    // backend, plus the ollama+Nomic lane — #3933). The local in-process candle
-    // embedder never egresses and is NOT gated.
-    // Default `allow` → no-op. ENFORCED here (no embedder → semantic recall
-    // degrades to keyword, the existing #1593 fail-closed path); the
-    // signed-refusal audit is best-effort.
-    // #3822 — resolve-then-pin for the egressing lane. `Some(pin)` under
-    // internal-only; `None` otherwise. #3933 gates on transport, not backend name.
+    // v1.0.0 #1963 (R68/D14) + #3933 — inference-plane egress gate for EGRESSING
+    // embed lanes (every API backend + the ollama+Nomic lane open a socket; the
+    // local candle embedder never egresses, NOT gated). Default `allow` → no-op;
+    // ENFORCED here (no embedder → keyword recall, #1593); audit best-effort.
+    // #3822 resolve-then-pins the egressing lane; #3933 gates transport not name.
     let egress_pin =
         if crate::config::embed_lane_egresses(&resolved_embeddings.backend, Some(emb_model)) {
             use crate::egress::{
