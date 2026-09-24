@@ -383,3 +383,75 @@ fn recall_embedder_egress_allow_default_falls_through_to_real_construction() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+// ─── #3822 internal-only posture (5-agent vote 4d3ea1c5) ─────────────────
+// The fourth token on the SAME knob. Under `internal-only` the boot
+// chokepoint RESOLVE-THEN-PINs: an external target is refused (DNS failure
+// fails CLOSED with no hatch — `.invalid` never resolves), while a loopback
+// http target is ADMITTED (loopback http stays permitted; #3824 is v1.x) and
+// falls through to real, pinned client construction.
+
+#[test]
+fn expand_llm_egress_internal_only_refuses_external_target_and_records_signed_event() {
+    // `internal-only` must refuse an external vendor target. The base_url
+    // uses the reserved `.invalid` TLD (RFC 6761) which never resolves, so
+    // `admit_inference_target` fails CLOSED (empty/failed resolve → Refuse)
+    // with NO live DNS and NO `AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL` hatch (A2).
+    let (_dir, workdir) = fresh_workdir("expand-internal-only-refuse");
+    let envs: &[(&str, &str)] = &[
+        ("AI_MEMORY_LLM_BACKEND", "openai-compatible"),
+        (
+            "AI_MEMORY_LLM_BASE_URL",
+            "https://inference.example.invalid/v1",
+        ),
+        ("AI_MEMORY_LLM_API_KEY", "test-key-3822"),
+        ("AI_MEMORY_INFERENCE_EGRESS", "internal-only"),
+    ];
+
+    let out = run_ai_memory_in(&workdir, &["expand", "hello world", "--json"], envs);
+
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "expected EXIT_NO_LLM(2); stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        count_egress_refusals(&workdir.join("ai-memory.db")),
+        1,
+        "internal-only must refuse the external target and record one refusal"
+    );
+}
+
+#[test]
+fn expand_llm_egress_internal_only_admits_loopback_and_falls_through() {
+    // Control: `internal-only` ADMITS a loopback http target (127.0.0.1 is
+    // loopback; plaintext to loopback stays permitted, A5). The client is
+    // built pinned to the loopback address and the real connection attempt
+    // fails fast (`ECONNREFUSED` on unbound :1) — proving the refuse arm
+    // evaluated FALSE and construction fell through, with no refusal recorded.
+    let (_dir, workdir) = fresh_workdir("expand-internal-only-loopback");
+    let envs: &[(&str, &str)] = &[
+        ("AI_MEMORY_LLM_BACKEND", "openai-compatible"),
+        ("AI_MEMORY_LLM_BASE_URL", "http://127.0.0.1:1"),
+        ("AI_MEMORY_LLM_API_KEY", "test-key-3822"),
+        ("AI_MEMORY_INFERENCE_EGRESS", "internal-only"),
+    ];
+
+    let out = run_ai_memory_in(&workdir, &["expand", "hello world", "--json"], envs);
+
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "expected EXIT_LLM_FAILED(3) (loopback admitted, client built, upstream call failed); \
+         stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        count_egress_refusals(&workdir.join("ai-memory.db")),
+        0,
+        "internal-only must NOT record a refusal when the loopback target is admitted"
+    );
+}

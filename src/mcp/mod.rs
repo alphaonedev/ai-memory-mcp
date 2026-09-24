@@ -4756,36 +4756,43 @@ pub fn run_mcp_server(
     // v1.0.0 #1963 (R68/D14) — inference-plane egress gate for API embed
     // backends (the ones that POST memory content to an embedding vendor);
     // the local in-process embedder never egresses and is NOT gated.
-    let embed_egress_refused = crate::config::is_api_embed_backend(&resolved_embeddings.backend)
-        && match crate::egress::evaluate_inference_egress(
+    // #3822 (A2) — resolve-then-pin for the API-embed lane.
+    let (embed_egress_refused, embed_egress_pin) = if crate::config::is_api_embed_backend(
+        &resolved_embeddings.backend,
+    ) {
+        match crate::egress::admit_inference_target(
             crate::egress::InferenceEgressMode::resolve(),
             crate::egress::EgressClass::InferenceEmbedding,
             &resolved_embeddings.url,
         ) {
-            crate::egress::EgressDecision::Refuse {
+            Ok(pin) => (false, pin),
+            Err(crate::egress::EgressDecision::Refuse {
                 class,
                 target,
                 reason,
-            } => {
+            }) => {
                 eprintln!(
                     "ai-memory: embedder DISABLED by inference-plane egress gate \
-                     (target={target}); {reason} — semantic recall degrades to keyword (#1963)"
+                         (target={target}); {reason} — semantic recall degrades to keyword (#1963/#3822)"
                 );
-                // #3429 (sibling of #1991) — audit the refusal into the store
-                // this MCP process actually opened (`db_path`, resolved once by
-                // the top-level parser), NOT a recomputed
-                // `effective_db(DEFAULT_DB)`, which discards a non-default
-                // `--db`/`AI_MEMORY_DB` and misfiles the signed row into CWD
-                // `ai-memory.db` / the config store.
+                // #3429 (sibling of #1991) — audit into the store this MCP
+                // process actually opened (`db_path`).
                 crate::egress::refuse_inference_egress_audited(db_path, class, &target, &reason);
-                true
+                (true, None)
             }
-            crate::egress::EgressDecision::Allow => false,
-        };
+            Err(crate::egress::EgressDecision::Allow) => (false, None),
+        }
+    } else {
+        (false, None)
+    };
     let embedder = if embed_egress_refused {
         None
     } else {
-        match Embedder::from_resolved(&resolved_embeddings, tier_config.embedding_model) {
+        match Embedder::from_resolved_pinned(
+            &resolved_embeddings,
+            tier_config.embedding_model,
+            embed_egress_pin.as_ref(),
+        ) {
             Ok(Some(emb)) => {
                 eprintln!("ai-memory: embedder loaded ({})", emb.model_description());
                 // v0.7.0 issue #1260 — batch size from the canonical #1146

@@ -1679,7 +1679,14 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // the per-funnel wrapping that cannot live elsewhere stays. Submodule-
     // over-bump, the `src/store/postgres.rs` shape, applied to a file whose
     // refactor-split is still the tracked post-ship ARCH cleanup.
-    ("src/llm.rs", 7_050),
+    // 2026-09-23 (#3822 internal-only inference egress, 5-agent vote 4d3ea1c5):
+    // the seven `*_pinned` reqwest-client constructors + `apply_internal_egress_pin`
+    // + their docs (resolve-then-pin for the InternalOnly posture: resolve_to_addrs
+    // + redirect Policy::none + no_proxy) land llm.rs at MEASURED 7_128 (`wc -l`,
+    // up from 6_923 at base aff5748f0, +205). Ceiling 7_050 -> 7_200 (+72 headroom,
+    // lockstep, never lower). Pinned-constructor family is the new inference-egress
+    // pin surface and cannot live elsewhere (it wraps the LlmClient builders).
+    ("src/llm.rs", 7_200),
 ];
 
 #[test]

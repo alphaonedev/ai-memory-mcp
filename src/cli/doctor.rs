@@ -4591,11 +4591,17 @@ fn section_atomisation_curator_2985(conn: &rusqlite::Connection) -> ReportSectio
     // A curator exists only when the resolved client would actually be
     // constructed: an LLM must be configured AND the #1963 inference-egress
     // gate must permit the resolved target.
-    let egress = crate::egress::evaluate_inference_egress(
+    // #3822 (A2) — under `internal-only` this RESOLVES the target (a doctor
+    // diagnostic probe) so the reported availability matches what the daemon
+    // would admit; the returned decision drives the fact below.
+    let egress = match crate::egress::admit_inference_target(
         crate::egress::resolve_inference_egress_mode(),
         crate::egress::EgressClass::InferenceLlm,
         &resolved.base_url,
-    );
+    ) {
+        Ok(_) => crate::egress::EgressDecision::Allow,
+        Err(decision) => decision,
+    };
     let curator_available = !curator_model.trim().is_empty() && !egress.is_refused();
 
     facts.push(("curator_impl".into(), "LlmCurator".into()));
