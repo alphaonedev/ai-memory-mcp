@@ -349,6 +349,17 @@ async fn k7_hmac_worker_signs_with_dispatch_time_secret_snapshot_3941() {
     let _guard = K7_HMAC_GLOBAL_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // #3941 — the red-first determinism REQUIRES current_thread: the spawned
+    // worker must not be runnable until this cell first awaits, so the
+    // `set_active_hooks_hmac_secret(None)` below is provably before the worker's
+    // read. Two `flavor = "multi_thread"` siblings live in this file; asserting
+    // the flavour makes a copy-pasted `flavor` a LOUD failure instead of
+    // silently turning the RED half into decoration (f2r).
+    assert_eq!(
+        tokio::runtime::Handle::current().runtime_flavor(),
+        tokio::runtime::RuntimeFlavor::CurrentThread,
+        "#3941: the red-first determinism requires the current_thread runtime",
+    );
     let tls = common::tls_receiver::dispatch_tls(&std::env::temp_dir());
     let server = TlsReceiver::start_with(tls, ack_echo()).await;
     let unique = uuid::Uuid::new_v4().simple().to_string();
