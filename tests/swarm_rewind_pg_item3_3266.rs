@@ -65,12 +65,22 @@ fn mem(ns: &str, title: &str) -> Memory {
 }
 
 async fn connect() -> Option<PostgresStore> {
+    static WARMED: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
     let url = std::env::var("AI_MEMORY_TEST_POSTGRES_URL").ok()?;
-    Some(
-        PostgresStore::connect(&url)
-            .await
-            .expect("connect postgres"),
-    )
+    let store = PostgresStore::connect(&url)
+        .await
+        .expect("connect postgres");
+    // On a FRESH database, parallel first-touch AGE label creation can defer
+    // one `derives_from` edge's graph projection to the outbox, and the
+    // (sync-mode AGE) lineage walk then misses it — a pre-existing
+    // AGE-projection window, not what these cells measure. Seed one lineage
+    // serially first so every cell's own edges project normally.
+    WARMED
+        .get_or_init(|| async {
+            seed(&store).await;
+        })
+        .await;
+    Some(store)
 }
 
 /// root <- child <- grandchild (`derives_from`), plus an off-DAG row, each in a
@@ -113,26 +123,38 @@ async fn state(store: &PostgresStore, id: &str) -> String {
     s
 }
 
-async fn rewind_events(store: &PostgresStore) -> i64 {
-    let (n,): (i64,) = sqlx::query_as("SELECT count(*) FROM signed_events WHERE event_type = $1")
-        .bind(ai_memory::signed_events::event_types::SWARM_REWIND)
-        .fetch_one(store.pool())
-        .await
-        .expect("count events");
+/// `swarm.rewind` events issued by THIS cell's `issuer` — scoped so cells
+/// running in parallel against the shared database cannot skew the count.
+async fn rewind_events(store: &PostgresStore, issuer: &str) -> i64 {
+    let (n,): (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM signed_events WHERE event_type = $1 AND agent_id = $2",
+    )
+    .bind(ai_memory::signed_events::event_types::SWARM_REWIND)
+    .bind(issuer)
+    .fetch_one(store.pool())
+    .await
+    .expect("count events");
     n
 }
 
-fn admin() -> CallerContext {
-    CallerContext::for_admin_checked(ISSUER, true)
+/// A per-cell admin issuer (the event's `agent_id`), so event counts are
+/// scoped to the cell.
+fn cell_issuer() -> String {
+    format!("{ISSUER}-{}", uuid::Uuid::new_v4().simple())
+}
+
+fn admin(issuer: &str) -> CallerContext {
+    CallerContext::for_admin_checked(issuer, true)
 }
 
 #[tokio::test]
 #[ignore = "live postgres: AI_MEMORY_TEST_POSTGRES_URL (postgres-ignored tier)"]
 async fn pg_swarm_rewind_stamps_root_and_descendants_3266() {
     let Some(store) = connect().await else { return };
+    let issuer = cell_issuer();
     let (root, child, grandchild, off) = seed(&store).await;
     let r = store
-        .swarm_rewind(&admin(), &root.id, DEPTH, "memory", &[], false)
+        .swarm_rewind(&admin(&issuer), &root.id, DEPTH, "memory", &[], false)
         .await
         .expect("pg swarm_rewind must be implemented (RED on the parent: UnsupportedCapability)");
     assert!(r.root_contaminated, "root is stamped");
@@ -162,20 +184,21 @@ async fn pg_swarm_rewind_stamps_root_and_descendants_3266() {
 #[ignore = "live postgres: AI_MEMORY_TEST_POSTGRES_URL (postgres-ignored tier)"]
 async fn pg_swarm_rewind_idempotent_single_audit_3266() {
     let Some(store) = connect().await else { return };
+    let issuer = cell_issuer();
     let (root, ..) = seed(&store).await;
-    let before = rewind_events(&store).await;
+    let before = rewind_events(&store, &issuer).await;
     store
-        .swarm_rewind(&admin(), &root.id, DEPTH, "memory", &[], false)
+        .swarm_rewind(&admin(&issuer), &root.id, DEPTH, "memory", &[], false)
         .await
         .expect("first rewind");
     let again = store
-        .swarm_rewind(&admin(), &root.id, DEPTH, "memory", &[], false)
+        .swarm_rewind(&admin(&issuer), &root.id, DEPTH, "memory", &[], false)
         .await
         .expect("second rewind is a no-op, not an error");
     assert!(again.already_rewound, "second call reports already_rewound");
     assert_eq!(again.signed_event_id, None, "no second audit event");
     assert_eq!(
-        rewind_events(&store).await,
+        rewind_events(&store, &issuer).await,
         before + 1,
         "exactly ONE swarm.rewind appended"
     );
@@ -185,15 +208,16 @@ async fn pg_swarm_rewind_idempotent_single_audit_3266() {
 #[ignore = "live postgres: AI_MEMORY_TEST_POSTGRES_URL (postgres-ignored tier)"]
 async fn pg_swarm_rewind_refuses_system_only_root_3266() {
     let Some(store) = connect().await else { return };
+    let issuer = cell_issuer();
     let (root, child, ..) = seed(&store).await;
     sqlx::query("UPDATE memories SET lifecycle_state = 'quarantined' WHERE id = $1")
         .bind(&root.id)
         .execute(store.pool())
         .await
         .expect("quarantine root");
-    let before = rewind_events(&store).await;
+    let before = rewind_events(&store, &issuer).await;
     let err = store
-        .swarm_rewind(&admin(), &root.id, DEPTH, "memory", &[], false)
+        .swarm_rewind(&admin(&issuer), &root.id, DEPTH, "memory", &[], false)
         .await
         .expect_err("a quarantined root is already contained");
     assert!(
@@ -206,7 +230,7 @@ async fn pg_swarm_rewind_refuses_system_only_root_3266() {
         "zero writes on refusal"
     );
     assert_eq!(
-        rewind_events(&store).await,
+        rewind_events(&store, &issuer).await,
         before,
         "no audit event on refusal"
     );
@@ -216,10 +240,11 @@ async fn pg_swarm_rewind_refuses_system_only_root_3266() {
 #[ignore = "live postgres: AI_MEMORY_TEST_POSTGRES_URL (postgres-ignored tier)"]
 async fn pg_swarm_rewind_dry_run_zero_writes_3266() {
     let Some(store) = connect().await else { return };
+    let issuer = cell_issuer();
     let (root, child, grandchild, _) = seed(&store).await;
-    let before = rewind_events(&store).await;
+    let before = rewind_events(&store, &issuer).await;
     let r = store
-        .swarm_rewind(&admin(), &root.id, DEPTH, "memory", &[], true)
+        .swarm_rewind(&admin(&issuer), &root.id, DEPTH, "memory", &[], true)
         .await
         .expect("dry run");
     assert!(r.dry_run);
@@ -232,7 +257,7 @@ async fn pg_swarm_rewind_dry_run_zero_writes_3266() {
         assert_eq!(state(&store, id).await, "open", "dry run writes nothing");
     }
     assert_eq!(
-        rewind_events(&store).await,
+        rewind_events(&store, &issuer).await,
         before,
         "dry run appends no event"
     );
@@ -242,10 +267,11 @@ async fn pg_swarm_rewind_dry_run_zero_writes_3266() {
 #[ignore = "live postgres: AI_MEMORY_TEST_POSTGRES_URL (postgres-ignored tier)"]
 async fn pg_sqlite_contamination_marker_parity_3266() {
     let Some(store) = connect().await else { return };
+    let issuer = cell_issuer();
     // Postgres side.
     let (root, child, ..) = seed(&store).await;
     store
-        .swarm_rewind(&admin(), &root.id, DEPTH, "memory", &[], false)
+        .swarm_rewind(&admin(&issuer), &root.id, DEPTH, "memory", &[], false)
         .await
         .expect("pg rewind");
     let (pg_meta,): (serde_json::Value,) =
@@ -297,9 +323,10 @@ async fn pg_sqlite_contamination_marker_parity_3266() {
 #[ignore = "live postgres: AI_MEMORY_TEST_POSTGRES_URL (postgres-ignored tier)"]
 async fn pg_swarm_rewind_cost_is_lineage_rollup_pg_3323() {
     let Some(store) = connect().await else { return };
+    let issuer = cell_issuer();
     let (root, ..) = seed(&store).await;
     let r = store
-        .swarm_rewind(&admin(), &root.id, DEPTH, "memory", &[], true)
+        .swarm_rewind(&admin(&issuer), &root.id, DEPTH, "memory", &[], true)
         .await
         .expect("dry run");
     let rollup = ai_memory::cost::postgres::lineage_rollup_pg(store.pool(), &root.id, DEPTH)

@@ -278,8 +278,23 @@ async fn pg_router(url: &str) -> (axum::Router, ai_memory::store::postgres::Post
     )
 }
 
+/// On a FRESH database, parallel first-touch AGE label creation can defer one
+/// `derives_from` edge's graph projection to the outbox and the (sync-mode
+/// AGE) lineage walk then misses it — a pre-existing AGE-projection window,
+/// not what these cells measure. One lineage is seeded serially first.
 #[cfg(feature = "sal-postgres")]
 async fn seed_pg(pg: &ai_memory::store::postgres::PostgresStore) -> (Memory, Memory) {
+    static WARMED: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+    WARMED
+        .get_or_init(|| async {
+            seed_pg_rows(pg).await;
+        })
+        .await;
+    seed_pg_rows(pg).await
+}
+
+#[cfg(feature = "sal-postgres")]
+async fn seed_pg_rows(pg: &ai_memory::store::postgres::PostgresStore) -> (Memory, Memory) {
     let ns = format!("route-{}", uuid::Uuid::new_v4().simple());
     let ctx = ai_memory::store::CallerContext::for_agent("ai:tester");
     let (root, child) = (mem(&ns, "root"), mem(&ns, "child"));
@@ -539,19 +554,24 @@ async fn pg_enforce_key_attested_admin_is_the_issuer_and_a_spoof_is_refused_3266
     let store: Arc<dyn MemoryStore> = Arc::new(pg);
     let router = router_from(enforce_state(db, store, StorageBackend::Postgres));
     let (root, child) = seed_pg(&handle).await;
-    let events = |h: &ai_memory::store::postgres::PostgresStore| {
+    // Scoped to THIS cell's root, not a global event count (a sibling PG cell
+    // signs as the same ADMIN in parallel on the shared database). The event
+    // and the root's `contamination.rewind` marker commit in ONE transaction,
+    // so "this root carries no rewind marker" is exactly "no swarm.rewind
+    // event was committed for this root".
+    let root_rewound = |h: &ai_memory::store::postgres::PostgresStore, id: String| {
         let pool = h.pool().clone();
         async move {
-            let (n,): (i64,) =
-                sqlx::query_as("SELECT count(*) FROM signed_events WHERE event_type = $1")
-                    .bind(ai_memory::signed_events::event_types::SWARM_REWIND)
-                    .fetch_one(&pool)
-                    .await
-                    .expect("count");
-            n
+            let (marker,): (Option<serde_json::Value>,) = sqlx::query_as(
+                "SELECT metadata->'contamination'->'rewind' FROM memories WHERE id = $1",
+            )
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .expect("root marker");
+            marker == Some(json!(true))
         }
     };
-    let before = events(&handle).await;
     let (status, _) = call(
         &router,
         post_with_key(KEY, Some(ADMIN), &json!({"to": root.id})),
@@ -562,10 +582,9 @@ async fn pg_enforce_key_attested_admin_is_the_issuer_and_a_spoof_is_refused_3266
         StatusCode::FORBIDDEN,
         "shared-key admin-header spoof must be refused"
     );
-    assert_eq!(
-        events(&handle).await,
-        before,
-        "no swarm.rewind event from a spoof"
+    assert!(
+        !root_rewound(&handle, root.id.clone()).await,
+        "no swarm.rewind committed for this root by a spoof"
     );
     let (st,): (String,) = sqlx::query_as("SELECT lifecycle_state FROM memories WHERE id = $1")
         .bind(&child.id)
@@ -589,5 +608,9 @@ async fn pg_enforce_key_attested_admin_is_the_issuer_and_a_spoof_is_refused_3266
     assert_eq!(
         issuer, ADMIN,
         "issued_by is the key-attested admin principal"
+    );
+    assert!(
+        root_rewound(&handle, root.id.clone()).await,
+        "non-vacuity: the admitted rewind DOES mark this root"
     );
 }

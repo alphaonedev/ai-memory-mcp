@@ -58,12 +58,22 @@ fn mem(ns: &str, title: &str) -> Memory {
 }
 
 async fn connect() -> Option<PostgresStore> {
+    static WARMED: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
     let url = std::env::var("AI_MEMORY_TEST_POSTGRES_URL").ok()?;
-    Some(
-        PostgresStore::connect(&url)
-            .await
-            .expect("connect postgres"),
-    )
+    let store = PostgresStore::connect(&url)
+        .await
+        .expect("connect postgres");
+    // On a FRESH database, parallel first-touch AGE label creation can defer
+    // one `derives_from` edge's graph projection to the outbox, and the
+    // (sync-mode AGE) lineage walk then misses it — a pre-existing
+    // AGE-projection window, not what these cells measure. Seed one lineage
+    // serially first so every cell's own edges project normally.
+    WARMED
+        .get_or_init(|| async {
+            seed(&store).await;
+        })
+        .await;
+    Some(store)
 }
 
 fn edge(child: &Memory, parent: &Memory) -> MemoryLink {
