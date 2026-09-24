@@ -72,12 +72,38 @@ fn write_sql_line(line: &str) -> bool {
 
 fn is_fn_start(line: &str) -> Option<(usize, String)> {
     let indent = line.len() - line.trim_start().len();
-    let t = line.trim_start();
-    let t = t
-        .strip_prefix("pub(crate) ")
-        .or_else(|| t.strip_prefix("pub "))
-        .unwrap_or(t);
-    let t = t.strip_prefix("async ").unwrap_or(t);
+    let mut t = line.trim_start();
+
+    // #3934 — recognise ANY visibility, not just `pub(crate)`/`pub`. A
+    // `pub(super) fn` / `pub(self) fn` / `pub(in a::b) fn` line was NOT a
+    // function start under the old two-case strip, so its body merged into
+    // the PRECEDING recognised fn and B7 read gate presence from the merged
+    // text (both directions: an ungated `pub(restricted)` write "passed" on
+    // the preceding fn's gate, and a private helper inherited a following
+    // `pub(restricted)` fn's gate). Strip `pub` plus an optional balanced
+    // parenthesised restriction (`(crate)`/`(super)`/`(self)`/`(in path)`),
+    // then any `const`/`unsafe`/`async` qualifiers.
+    if t.starts_with("pub(") {
+        // Restriction parens are non-nested (`crate`/`super`/`self`/`in a::b`),
+        // so the first `)` closes them.
+        if let Some(close) = t.find(')') {
+            t = t[close + 1..].trim_start();
+        }
+    } else if let Some(rest) = t.strip_prefix("pub ") {
+        t = rest.trim_start();
+    } else if let Some(rest) = t.strip_prefix("pub\t") {
+        t = rest.trim_start();
+    }
+    loop {
+        let next = t
+            .strip_prefix("const ")
+            .or_else(|| t.strip_prefix("unsafe "))
+            .or_else(|| t.strip_prefix("async "));
+        match next {
+            Some(rest) => t = rest.trim_start(),
+            None => break,
+        }
+    }
     if let Some(rest) = t.strip_prefix("fn ") {
         let name: String = rest
             .chars()
@@ -171,6 +197,133 @@ fn fn_body_has_gate(src: &str, fn_name: &str) -> bool {
         .unwrap_or(rest.len().min(8000));
     let body = &rest[..end];
     GATE_MARKERS.iter().any(|g| body.contains(g))
+}
+
+/// #3934 — the boundary+gate core B7 uses, factored so the self-test can
+/// drive it with EITHER the shipped `is_fn_start` or a frozen pre-fix copy.
+/// Returns the write-SQL functions whose attributed body (nearest preceding
+/// fn start .. next fn start) carries no [`GATE_MARKERS`] marker. This is the
+/// exact detection the #3934 widening affects; the main test layers the
+/// skip/test/migrate/allowlist/const-boundary filters on top of the same
+/// core.
+fn ungated_write_fns_for(
+    text: &str,
+    start_of: impl Fn(&str) -> Option<(usize, String)>,
+) -> Vec<String> {
+    let lines: Vec<&str> = text.lines().collect();
+    let starts: Vec<(usize, String)> = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(i, l)| start_of(l).map(|(_, n)| (i, n)))
+        .collect();
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for (idx, line) in lines.iter().enumerate() {
+        if !write_sql_line(line) {
+            continue;
+        }
+        let Some(&(start, ref name)) = starts.iter().rev().find(|(s, _)| *s <= idx) else {
+            continue;
+        };
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        let end = starts
+            .iter()
+            .find(|(s, _)| *s > start)
+            .map_or(lines.len(), |(s, _)| *s);
+        let body = &lines[start..end];
+        let has_gate = body
+            .iter()
+            .any(|l| GATE_MARKERS.iter().any(|g| l.contains(g)));
+        if !has_gate {
+            out.push(name.clone());
+        }
+    }
+    out
+}
+
+/// #3934 R-203 — the EXACT pre-fix `is_fn_start` (strips only `pub(crate) `
+/// / `pub ` then `async `), frozen so the self-test can prove the blind spot
+/// the widening closes: this predicate ACCEPTS (fails to flag) a planted
+/// ungated `pub(super)` write fn, while the shipped [`is_fn_start`] REDs it.
+fn is_fn_start_prefix_frozen(line: &str) -> Option<(usize, String)> {
+    let indent = line.len() - line.trim_start().len();
+    let t = line.trim_start();
+    let t = t
+        .strip_prefix("pub(crate) ")
+        .or_else(|| t.strip_prefix("pub "))
+        .unwrap_or(t);
+    let t = t.strip_prefix("async ").unwrap_or(t);
+    if let Some(rest) = t.strip_prefix("fn ") {
+        let name: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        if name.is_empty() {
+            return None;
+        }
+        return Some((indent, name));
+    }
+    None
+}
+
+/// #3934 — sensitivity + R-203 specificity for the `is_fn_start` widening.
+/// A gated fn is followed by an ungated `pub(super)` write fn (and, for good
+/// measure, an ungated `pub(in crate::x)` write fn). The SHIPPED scanner must
+/// flag both (RED = the blind spot is closed); the FROZEN pre-fix scanner
+/// must NOT flag either (it merges each into the preceding gated fn — the bug
+/// this reproduces). A gated `pub(self)` write fn must NOT be flagged by the
+/// shipped scanner (no false positive).
+#[test]
+fn b7_scanner_sees_pub_restricted_write_fns_3934() {
+    let planted = r#"
+    pub(crate) async fn gated_before(conn: &Connection) -> Result<()> {
+        gate_record_stop(conn)?;
+        conn.execute("UPDATE memories SET x = 1", [])?;
+        Ok(())
+    }
+
+    pub(super) async fn plant_pub_super_ungated(conn: &Connection) -> Result<()> {
+        conn.execute("UPDATE memories SET y = 2", [])?;
+        Ok(())
+    }
+
+    pub(in crate::store) fn plant_pub_in_ungated(conn: &Connection) -> Result<()> {
+        conn.execute("DELETE FROM memories WHERE z = 3", [])?;
+        Ok(())
+    }
+
+    pub(self) async fn plant_pub_self_gated(conn: &Connection) -> Result<()> {
+        gate_record_stop(conn)?;
+        conn.execute("UPDATE memories SET w = 4", [])?;
+        Ok(())
+    }
+"#;
+
+    let shipped = ungated_write_fns_for(planted, is_fn_start);
+    assert!(
+        shipped.contains(&"plant_pub_super_ungated".to_string()),
+        "sensitivity: the widened scanner must FLAG an ungated pub(super)          write fn (got {shipped:?})"
+    );
+    assert!(
+        shipped.contains(&"plant_pub_in_ungated".to_string()),
+        "sensitivity: the widened scanner must FLAG an ungated pub(in ..)          write fn (got {shipped:?})"
+    );
+    assert!(
+        !shipped.contains(&"plant_pub_self_gated".to_string()),
+        "specificity: a GATED pub(self) write fn must NOT be flagged (got {shipped:?})"
+    );
+
+    // R-203 — the frozen pre-fix predicate reproduces the blind spot: it does
+    // NOT recognise the pub(super)/pub(in ..) fn starts, so their writes merge
+    // into the preceding gated fn and are read as gated (accepted, not flagged).
+    let frozen = ungated_write_fns_for(planted, is_fn_start_prefix_frozen);
+    assert!(
+        !frozen.contains(&"plant_pub_super_ungated".to_string())
+            && !frozen.contains(&"plant_pub_in_ungated".to_string()),
+        "R-203: the frozen pre-fix scanner must be BLIND to pub(restricted)          write fns (that is the #3934 bug); got {frozen:?}"
+    );
 }
 
 #[test]
