@@ -8634,6 +8634,19 @@ pub fn recall_with_telemetry(
 /// itself: clearing the marker (the G7 rollback) restores full rank.
 pub const SOFT_LOSER_SCORE_FACTOR: f64 = 0.5;
 
+/// #3927 (Boids item 3 part 4) — the ONE hybrid-lane predicate: the fused
+/// recall score multiplier for a row carrying the G7 soft-loser marker
+/// (`SOFT_LOSER_SCORE_FACTOR`), else `1.0`. Applied to the FUSED score on BOTH
+/// backends so the keyword AND the semantic halves are down-weighted (#2338).
+#[must_use]
+pub fn soft_loser_penalty(metadata: &serde_json::Value) -> f64 {
+    let loser = metadata
+        .get(crate::models::field_names::CONTRADICTION_SOFT_LOSER)
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    if loser { SOFT_LOSER_SCORE_FACTOR } else { 1.0 }
+}
+
 pub fn recall(
     conn: &Connection,
     context: &str,
@@ -21424,16 +21437,7 @@ fn blend_and_rank(
             // fts_score penalty alone would leave the loser fully ranked
             // through the cosine half). Reversible: the G7 rollback clears
             // the marker and full rank returns.
-            let soft_loser = mem
-                .metadata
-                .get(crate::models::field_names::CONTRADICTION_SOFT_LOSER)
-                .and_then(serde_json::Value::as_bool)
-                == Some(true);
-            let penalty = if soft_loser {
-                SOFT_LOSER_SCORE_FACTOR
-            } else {
-                1.0
-            };
+            let penalty = soft_loser_penalty(&mem.metadata);
             (mem, blended * decay * penalty)
         })
         .collect();

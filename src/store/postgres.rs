@@ -26003,7 +26003,11 @@ impl MemoryStore for PostgresStore {
                     0.50 - 0.35 * ((cl - 500.0) / 4500.0)
                 };
                 let blended = semantic_weight * cosine + (1.0 - semantic_weight) * norm_fts;
-                (mem, blended)
+                // #3927 — the G7 soft-loser down-weight on the FUSED score,
+                // the sqlite hybrid twin's placement (#2338): an FTS-pool-only
+                // SQL penalty would leave the loser fully ranked via cosine.
+                let penalty = crate::storage::soft_loser_penalty(&mem.metadata);
+                (mem, blended * penalty)
             })
             .collect();
 
