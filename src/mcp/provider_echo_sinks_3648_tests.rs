@@ -189,6 +189,11 @@ fn run_matrix(uri: String, ollama: bool, status: u16, malformed: bool) {
     // for the same synchronous window. Read side only: this test mutates
     // nothing (check-test-env-lock arm (e)); holding the lock is what excludes
     // the writers, and each writer restores the variable before releasing it.
+    //
+    // LOCK ORDER (required): `audit::sink_test_lock` FIRST, then
+    // `identity::agent_id_env_test_lock`. This fn is the SOLE holder of both
+    // in the crate; any future fn taking them in the opposite order would form
+    // an ABBA deadlock pair with this one. Keep this order everywhere.
     let _agent_id_env = crate::identity::agent_id_env_test_lock();
     let conn = crate::db::open(std::path::Path::new(":memory:")).unwrap();
     let a = seed(&conn, "echo-a");
