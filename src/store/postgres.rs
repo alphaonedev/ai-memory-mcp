@@ -275,6 +275,13 @@ const SQL_MARK_KG_OUTBOX_PROJECTED: &str =
 const SQL_ENQUEUE_KG_PROJECTION: &str =
     "INSERT INTO kg_projection_outbox      (source_id, target_id, relation) VALUES ($1, $2, $3)";
 
+/// #3883 — enqueue an AGE edge projection ALREADY QUARANTINED (attempt_count +
+/// last_error bound) — the orphan-graph path. The drainer take-query excludes
+/// `attempt_count >= MAX`, so this row does not retry until the A3 self-heal
+/// resets it once the registry row reappears.
+const SQL_ENQUEUE_KG_PROJECTION_QUARANTINED: &str = "INSERT INTO kg_projection_outbox (source_id, target_id, relation, attempt_count, last_error) \
+     VALUES ($1, $2, $3, $4, $5)";
+
 /// #3008 parity (v1.0.0 batch-2) — the single advisory-lock key that
 /// serializes every `action_edges` write, so the cycle probe and the INSERT
 /// are atomic with respect to each other. See
@@ -13453,27 +13460,21 @@ impl PostgresStore {
                         // swallowed: it propagates, because at that point we
                         // could neither project nor remember, and committing the
                         // relational row would leave undetectable drift.
-                        sqlx::query(SQL_ENQUEUE_KG_PROJECTION)
-                            .bind(&link.source_id)
-                            .bind(&link.target_id)
-                            .bind(link.relation.as_str())
-                            .execute(&mut *tx)
-                            .await
-                            .map_err(|e2| to_store_err("record unreconciled kg projection", e2))?;
-                        crate::metrics::registry().age_projection_failed_total.inc();
-                        tracing::warn!(
-                            target: TRACE_TARGET_KG,
-                            source_id = %link.source_id,
-                            target_id = %link.target_id,
-                            relation = link.relation.as_str(),
-                            err = %e,
-                            "AGE projection deferred on link insert (runtime failure) — \
-                             relational memory_links row committed and the pending \
-                             projection was RECORDED in kg_projection_outbox for \
-                             reconciliation by the drainer. kg_query/kg_timeline over \
-                             this edge may lag until it drains; find_paths reads \
-                             memory_links via the CTE and stays correct."
-                        );
+                        // #3883 (A1/A3) — route through the shared classifier:
+                        // an orphaned graph is enqueued QUARANTINED (no MAX-retry
+                        // storm) and self-heals once the AGE registry is repaired;
+                        // a transient failure enqueues pending. Both ride THIS tx
+                        // and carry the `reason` field. ERRORS-19: a failure to
+                        // RECORD propagates rather than committing silent drift.
+                        record_failed_age_projection(
+                            &mut tx,
+                            "link_insert",
+                            &link.source_id,
+                            &link.target_id,
+                            link.relation.as_str(),
+                            &e,
+                        )
+                        .await?;
                     }
                     Err(e) => return Err(e),
                 }
@@ -13523,6 +13524,33 @@ impl PostgresStore {
     /// backends (the outbox is only ever written when the AGE backend is
     /// active under deferred mode).
     pub async fn drain_kg_projection_outbox(&self, batch: i64) -> StoreResult<usize> {
+        // #3883 follow-up — a record-stop must halt background AGE-projection
+        // writes too: this fn holds inline `UPDATE kg_projection_outbox` SQL (the
+        // A3 self-heal reset below, and a pre-existing pending-row UPDATE), so it
+        // gates on the same idempotent read-probe as the `apply_remote_*` twins
+        // BEFORE any write. gate_record_stop is a cheap read; a stop returns
+        // early with the typed refusal rather than draining.
+        self.gate_record_stop().await?;
+        // #3883 A3 — self-heal orphan-quarantined rows. If the AGE graph
+        // registry row is present again (an operator repaired the orphan), un-
+        // quarantine the rows parked at attempt_count = MAX with the orphan
+        // prefix so THIS pass reprojects them; a still-absent registry leaves
+        // them quarantined (the probe returns false). Best-effort — a probe or
+        // reset failure must NOT abort the drain. One cheap catalog count per
+        // pass; the UPDATE matches nothing in steady state.
+        if age_graph_registry_present_pool(&self.pool)
+            .await
+            .unwrap_or(false)
+        {
+            let _ = sqlx::query(
+                "UPDATE kg_projection_outbox SET attempt_count = 0, last_error = NULL \
+                 WHERE projected_at IS NULL AND attempt_count >= $1 AND last_error LIKE $2",
+            )
+            .bind(Self::MAX_AGE_PROJECTION_ATTEMPTS)
+            .bind(format!("{AGE_GRAPH_ORPHAN_LAST_ERROR_PREFIX}%"))
+            .execute(&self.pool)
+            .await;
+        }
         let rows: Vec<(i64, i32, String, String, String)> = sqlx::query_as(
             "SELECT id, attempt_count, source_id, target_id, relation \
              FROM kg_projection_outbox \
@@ -13881,35 +13909,63 @@ impl PostgresStore {
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             // Boot-recovery drain — self-heal projections orphaned by a crash.
-            if let Err(e) = self
+            match self
                 .drain_kg_projection_outbox(Self::AGE_PROJECTION_DRAIN_BATCH)
                 .await
             {
-                tracing::warn!(
+                Ok(_) => {}
+                // #3883 follow-up — a record-stop gates the drainer (derived-data
+                // maintenance is still a record-plane write); that is INTENDED,
+                // not a fault, so log at INFO rather than WARN.
+                Err(StoreError::Stopped { .. }) => tracing::info!(
+                    target: TRACE_TARGET_KG,
+                    "kg_projection drainer: boot-recovery drain frozen by record-stop; will resume when it lifts"
+                ),
+                Err(e) => tracing::warn!(
                     target: TRACE_TARGET_KG,
                     err = %e,
                     "kg_projection drainer: boot-recovery drain failed (will retry on tick)"
-                );
+                ),
             }
             let mut ticker = tokio::time::interval(interval);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // #3883 follow-up — a record-stop freezes the drainer for its whole
+            // duration; latch so the "frozen" line is logged ONCE per stop
+            // episode (at INFO — intended), not per tick as a WARN fault. Reset
+            // whenever the drainer runs again so a later stop re-announces.
+            let mut stopped_logged = false;
             loop {
                 ticker.tick().await;
                 match self
                     .drain_kg_projection_outbox(Self::AGE_PROJECTION_DRAIN_BATCH)
                     .await
                 {
-                    Ok(n) if n > 0 => tracing::debug!(
-                        target: TRACE_TARGET_KG,
-                        projected = n,
-                        "kg_projection drainer: projected pending edges into memory_graph"
-                    ),
-                    Ok(_) => {}
-                    Err(e) => tracing::warn!(
-                        target: TRACE_TARGET_KG,
-                        err = %e,
-                        "kg_projection drainer: drain tick failed; will retry next interval"
-                    ),
+                    Ok(n) if n > 0 => {
+                        stopped_logged = false;
+                        tracing::debug!(
+                            target: TRACE_TARGET_KG,
+                            projected = n,
+                            "kg_projection drainer: projected pending edges into memory_graph"
+                        );
+                    }
+                    Ok(_) => stopped_logged = false,
+                    Err(StoreError::Stopped { .. }) => {
+                        if !stopped_logged {
+                            tracing::info!(
+                                target: TRACE_TARGET_KG,
+                                "kg_projection drainer: frozen by record-stop; will resume when it lifts"
+                            );
+                            stopped_logged = true;
+                        }
+                    }
+                    Err(e) => {
+                        stopped_logged = false;
+                        tracing::warn!(
+                            target: TRACE_TARGET_KG,
+                            err = %e,
+                            "kg_projection drainer: drain tick failed; will retry next interval"
+                        );
+                    }
                 }
             }
         })
@@ -18253,6 +18309,22 @@ fn is_age_adapter_statement_defect(err: &StoreError) -> bool {
 /// The matching operator-side surface is documented in
 /// `docs/kg-backend-fallback.md`.
 fn warn_age_fallback(op: &str, source_id: &str, err: &StoreError) {
+    // #3883 — the THIRD reason class: an orphaned AGE graph (schema present,
+    // ag_catalog.ag_graph row absent). STRUCTURAL, not transient — so the read
+    // consumers (kg_query / kg_timeline / find_paths) stop calling it transient.
+    if is_age_graph_orphan(err) {
+        tracing::warn!(
+            target: TRACE_TARGET_KG_ADAPTER_DEFECT,
+            op = op,
+            source_id = source_id,
+            backend = "age",
+            fallback = "cte",
+            reason = AGE_FALLBACK_REASON_GRAPH_ORPHAN,
+            error = %err,
+            "AGE graph ORPHANED (memory_graph schema present, ag_catalog.ag_graph registry row absent): kg_{op}=<{source_id}> served by the relational CTE. STRUCTURAL fault — create_graph cannot succeed against an orphan schema, so this is NOT a transient outage. Repair the AGE registry (see docs/kg-backend-fallback.md)."
+        );
+        return;
+    }
     if is_age_adapter_statement_defect(err) {
         tracing::warn!(
             target: TRACE_TARGET_KG_ADAPTER_DEFECT,
@@ -18286,6 +18358,21 @@ fn warn_age_fallback(op: &str, source_id: &str, err: &StoreError) {
 /// the two-id `find_paths` operation, where the structured event
 /// needs both `source_id` and `target_id`.
 fn warn_age_fallback_pair(op: &str, source_id: &str, target_id: &str, err: &StoreError) {
+    // #3883 — the THIRD reason class, two-id variant (find_paths).
+    if is_age_graph_orphan(err) {
+        tracing::warn!(
+            target: TRACE_TARGET_KG_ADAPTER_DEFECT,
+            op = op,
+            source_id = source_id,
+            target_id = target_id,
+            backend = "age",
+            fallback = "cte",
+            reason = AGE_FALLBACK_REASON_GRAPH_ORPHAN,
+            error = %err,
+            "AGE graph ORPHANED (memory_graph schema present, ag_catalog.ag_graph registry row absent): kg_{op}=<{source_id}->{target_id}> served by the relational CTE. STRUCTURAL fault — create_graph cannot succeed against an orphan schema, NOT a transient outage. Repair the AGE registry (see docs/kg-backend-fallback.md)."
+        );
+        return;
+    }
     if is_age_adapter_statement_defect(err) {
         tracing::warn!(
             target: TRACE_TARGET_KG_ADAPTER_DEFECT,
@@ -18316,6 +18403,178 @@ fn warn_age_fallback_pair(op: &str, source_id: &str, target_id: &str, err: &Stor
         error = %err,
         "AGE backend unreachable; falling back to CTE for kg_{op}=<{source_id}->{target_id}>"
     );
+}
+
+// ---------------------------------------------------------------------------
+// #3883 — AGE orphaned-graph structural classification (5-agent vote 4d3ea1c5,
+// option A). An ORPHANED graph is a `memory_graph` SCHEMA that exists with NO
+// `ag_catalog.ag_graph` registry row (the 42P06 `schema "memory_graph" already
+// exists` shape — e.g. after `DROP EXTENSION age CASCADE` leaves the plain
+// schema behind). `create_graph` can NEVER succeed against it and every MERGE
+// fails, so it is a STRUCTURAL fault: reported honestly and quarantined
+// immediately, never retried MAX transient-sounding times. REPORT, never
+// repair. See docs/kg-backend-fallback.md.
+// ---------------------------------------------------------------------------
+
+/// #3883 — `reason` field value for a fallback caused by an ORPHANED AGE graph
+/// (schema present, `ag_catalog.ag_graph` registry row absent). A THIRD reason
+/// class beside [`AGE_FALLBACK_REASON_UNREACHABLE`] /
+/// [`AGE_FALLBACK_REASON_STATEMENT_DEFECT`] — STRUCTURAL, not transient; never
+/// folded into either (the #2511 "classifier may only under-report" rule).
+const AGE_FALLBACK_REASON_GRAPH_ORPHAN: &str = "age_graph_orphan";
+
+/// #3883 — `last_error` prefix stamped on a `kg_projection_outbox` row parked
+/// (quarantined at `attempt_count = MAX`) because the AGE graph is orphaned.
+/// DISTINCT so the drainer self-heal targets exactly these rows: once the
+/// registry row reappears their `attempt_count` is reset and they drain.
+const AGE_GRAPH_ORPHAN_LAST_ERROR_PREFIX: &str = "age_graph_orphan:";
+
+/// #3883 — the 42P06 message shape `create_graph` raises when the `memory_graph`
+/// SCHEMA already exists (the orphan), as opposed to the benign 42P07 `graph
+/// "memory_graph" already exists` steady-state duplicate. Used ONLY to gate the
+/// registry probe so steady state (42P07) never probes — zero steady-state cost.
+const AGE_ORPHAN_SCHEMA_ERR_SIGNATURE: &str = "schema \"memory_graph\" already exists";
+
+/// #3883 — count of the `memory_graph` registry row in `ag_catalog.ag_graph`
+/// (the registry AGE itself consults). NEVER `pg_namespace` / `to_regnamespace`,
+/// which would see the orphan schema and wrongly answer "present".
+const SQL_COUNT_AGE_GRAPH_REGISTRY: &str =
+    "SELECT count(*) FROM ag_catalog.ag_graph WHERE name = 'memory_graph'";
+
+/// #3883 — true when an AGE fallback was classified as an ORPHANED graph by
+/// [`project_link_into_age`]'s A2 probe (the [`AGE_GRAPH_ORPHAN_LAST_ERROR_PREFIX`]
+/// carried in the error detail). Sub-classification of `BackendUnavailable`,
+/// mirroring [`is_age_adapter_statement_defect`].
+fn is_age_graph_orphan(err: &StoreError) -> bool {
+    let StoreError::BackendUnavailable { detail, .. } = err else {
+        return false;
+    };
+    detail.contains(AGE_GRAPH_ORPHAN_LAST_ERROR_PREFIX)
+}
+
+/// #3883 — probe `ag_catalog.ag_graph` for the `memory_graph` registry row
+/// INSIDE an open transaction (the [`project_link_into_age`] A2 path). Wrapped
+/// in a SAVEPOINT so a probe error (permission blip / conn drop) leaves the
+/// caller's tx healthy for the transient fall-through — the probe NEVER
+/// quarantines on its own failure. Ok(true) when registered.
+async fn age_graph_registry_present_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> StoreResult<bool> {
+    sqlx::query("SAVEPOINT age_orphan_probe")
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| to_store_err("savepoint age_orphan_probe", e))?;
+    match sqlx::query_as::<_, (i64,)>(SQL_COUNT_AGE_GRAPH_REGISTRY)
+        .fetch_one(&mut **tx)
+        .await
+    {
+        Ok((n,)) => {
+            sqlx::query("RELEASE SAVEPOINT age_orphan_probe")
+                .execute(&mut **tx)
+                .await
+                .map_err(|e| to_store_err("release savepoint age_orphan_probe", e))?;
+            Ok(n > 0)
+        }
+        Err(e) => {
+            sqlx::query("ROLLBACK TO SAVEPOINT age_orphan_probe")
+                .execute(&mut **tx)
+                .await
+                .map_err(|e2| to_store_err("rollback savepoint age_orphan_probe", e2))?;
+            sqlx::query("RELEASE SAVEPOINT age_orphan_probe")
+                .execute(&mut **tx)
+                .await
+                .map_err(|e2| to_store_err("release savepoint age_orphan_probe (err)", e2))?;
+            Err(to_store_err("probe ag_catalog.ag_graph (orphan check)", e))
+        }
+    }
+}
+
+/// #3883 — pool-level probe of the `memory_graph` registry row. Used by the
+/// drainer's orphan self-heal (A3) and the `doctor` `ag_graph_registered` fact
+/// (A5). Same SSOT SQL as [`age_graph_registry_present_tx`].
+pub(crate) async fn age_graph_registry_present_pool(pool: &PgPool) -> StoreResult<bool> {
+    let (n,): (i64,) = sqlx::query_as(SQL_COUNT_AGE_GRAPH_REGISTRY)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| to_store_err("probe ag_catalog.ag_graph (registered?)", e))?;
+    Ok(n > 0)
+}
+
+/// #3883 (A1/A3) — record an unreconciled inline (sync-mode) AGE projection in
+/// `kg_projection_outbox`, classifying ORPHAN vs transient. The caller has
+/// already rolled back to its projection SAVEPOINT and the relational
+/// `memory_links` row is committing in the SAME tx (the source of truth).
+///
+/// * ORPHAN ([`is_age_graph_orphan`]) — enqueue already QUARANTINED
+///   (`attempt_count = MAX`, [`AGE_GRAPH_ORPHAN_LAST_ERROR_PREFIX`] `last_error`)
+///   so the drainer does NOT burn MAX transient retries; tick
+///   `age_projection_quarantined_total` ONCE. Self-heals via the drainer once
+///   the registry is repaired.
+/// * transient — enqueue pending (`attempt_count = 0`); tick
+///   `age_projection_failed_total`.
+///
+/// Emits the structured WARN carrying the `reason` field (A5). Shared by all
+/// four inline absorb sites so their disposition cannot drift.
+async fn record_failed_age_projection(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    op: &str,
+    source_id: &str,
+    target_id: &str,
+    relation: &str,
+    err: &StoreError,
+) -> StoreResult<()> {
+    let metrics = crate::metrics::registry();
+    if is_age_graph_orphan(err) {
+        sqlx::query(SQL_ENQUEUE_KG_PROJECTION_QUARANTINED)
+            .bind(source_id)
+            .bind(target_id)
+            .bind(relation)
+            .bind(PostgresStore::MAX_AGE_PROJECTION_ATTEMPTS)
+            .bind(format!("{AGE_GRAPH_ORPHAN_LAST_ERROR_PREFIX} {err}"))
+            .execute(&mut **tx)
+            .await
+            .map_err(|e| to_store_err("enqueue quarantined kg_projection_outbox (orphan)", e))?;
+        metrics.age_projection_quarantined_total.inc();
+        tracing::warn!(
+            target: TRACE_TARGET_KG,
+            op = op,
+            source_id = %source_id,
+            target_id = %target_id,
+            relation = %relation,
+            reason = AGE_FALLBACK_REASON_GRAPH_ORPHAN,
+            error = %err,
+            "AGE graph ORPHANED (memory_graph schema present, ag_catalog.ag_graph \
+             registry row absent) on {op}: the relational memory_links row \
+             committed; the projection is enqueued QUARANTINED — a STRUCTURAL \
+             fault, not a transient one (no retry storm) — and self-heals once the \
+             AGE registry is repaired. Readers stay correct via the relational \
+             CTE. Operator action required (see docs/kg-backend-fallback.md)."
+        );
+    } else {
+        sqlx::query(SQL_ENQUEUE_KG_PROJECTION)
+            .bind(source_id)
+            .bind(target_id)
+            .bind(relation)
+            .execute(&mut **tx)
+            .await
+            .map_err(|e| to_store_err("record unreconciled kg projection", e))?;
+        metrics.age_projection_failed_total.inc();
+        tracing::warn!(
+            target: TRACE_TARGET_KG,
+            op = op,
+            source_id = %source_id,
+            target_id = %target_id,
+            relation = %relation,
+            reason = AGE_FALLBACK_REASON_UNREACHABLE,
+            error = %err,
+            "AGE projection deferred on {op} (runtime failure): relational \
+             memory_links row committed and the pending projection was RECORDED in \
+             kg_projection_outbox for reconciliation by the drainer. kg_query / \
+             kg_timeline over this edge may lag until it drains; find_paths reads \
+             memory_links via the CTE and stays correct."
+        );
+    }
+    Ok(())
 }
 
 /// Issue an `ALTER TABLE ... ADD COLUMN` only when the column is not
@@ -19564,6 +19823,40 @@ async fn ensure_memory_graph(pool: &PgPool) -> StoreResult<()> {
                 .map_err(|e| to_store_err("rollback create_age_graph savepoint", e))?;
         }
     }
+    // #3882/#3883 A6 — after tolerating the create_graph error, VERIFY the AGE
+    // registry actually carries the memory_graph row. `create_graph` raising
+    // 42P06 `schema "memory_graph" already exists` while ag_catalog.ag_graph has
+    // NO row is the ORPHAN state: create_graph can never succeed against it and
+    // every projection MERGE will fail. REPORT it loudly at boot naming the
+    // repair — never repair (the ruling: absorb + honest structural
+    // classification). The savepoint-wrapped probe keeps the tx healthy for the
+    // commit below even if the probe itself errors.
+    match age_graph_registry_present_tx(&mut tx).await {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::warn!(
+                target: TRACE_TARGET_KG_ADAPTER_DEFECT,
+                reason = AGE_FALLBACK_REASON_GRAPH_ORPHAN,
+                "AGE graph ORPHANED at boot: the `memory_graph` SCHEMA exists but its \
+                 ag_catalog.ag_graph registry row is ABSENT — create_graph cannot \
+                 succeed against an orphan schema, so every KG projection falls back \
+                 to the relational CTE and link writes quarantine their projections. \
+                 STRUCTURAL fault requiring operator repair of the AGE registry (drop \
+                 the orphan schema, then re-create the graph — see \
+                 docs/kg-backend-fallback.md). The substrate CONTINUES: the relational \
+                 memory_links store is the source of truth and readers stay correct \
+                 via the CTE. This node never repairs the registry itself."
+            );
+        }
+        Err(e) => {
+            tracing::debug!(
+                target: TRACE_TARGET_KG,
+                err = %e,
+                "ensure_memory_graph: ag_catalog.ag_graph registry probe failed \
+                 (non-fatal; NOT treated as an orphan verdict)"
+            );
+        }
+    }
     tx.commit()
         .await
         .map_err(|e| to_store_err("commit ensure_memory_graph tx", e))?;
@@ -19730,6 +20023,31 @@ async fn project_link_into_age(
                 .map_err(|err| to_store_err("release savepoint bootstrap_memory_graph", err))?;
             if !msg.contains(PG_ERR_ALREADY_EXISTS) {
                 return Err(to_store_err("create_graph memory_graph (project_link)", e));
+            }
+            // #3883 A2 — distinguish the benign 42P07 `graph already exists`
+            // (steady state) from the orphan 42P06 `schema "memory_graph" already
+            // exists`: the schema is present but its ag_catalog.ag_graph registry
+            // row is not, so create_graph can never succeed and every MERGE below
+            // fails. Probe ONLY on the orphan message shape — steady state (42P07)
+            // never probes, so zero steady-state cost. Registry row ABSENT =>
+            // structural orphan: classify with the orphan prefix so the caller
+            // enqueues QUARANTINED instead of burning MAX transient retries. A
+            // probe ERROR (permission blip / conn drop) or a present row falls
+            // through to the existing transient path — NEVER quarantine on a probe
+            // failure (the classifier may only under-report). REPORT, never repair.
+            if msg
+                .to_ascii_lowercase()
+                .contains(AGE_ORPHAN_SCHEMA_ERR_SIGNATURE)
+            {
+                if let Ok(false) = age_graph_registry_present_tx(tx).await {
+                    return Err(StoreError::BackendUnavailable {
+                        backend: "postgres".to_string(),
+                        sqlstate: None,
+                        detail: format!(
+                            "{AGE_GRAPH_ORPHAN_LAST_ERROR_PREFIX} the memory_graph schema exists but its ag_catalog.ag_graph registry row is absent — create_graph cannot succeed against an orphan schema; an operator must repair the AGE registry (docs/kg-backend-fallback.md)"
+                        ),
+                    });
+                }
             }
         }
     }
@@ -25605,7 +25923,19 @@ impl MemoryStore for PostgresStore {
                         .execute(&mut *tx)
                         .await
                         .map_err(|e2| to_store_err("rollback savepoint age_link_projection", e2))?;
-                    warn_age_fallback("apply_remote_link", &link.source_id, &e);
+                    // #3883 (A1) — was WARN-only; now RECORD the unreconciled
+                    // projection (orphan => quarantined, transient => pending) so
+                    // a federated relay's committed edge is not silently dropped
+                    // from AGE forever.
+                    record_failed_age_projection(
+                        &mut tx,
+                        "apply_remote_link",
+                        &link.source_id,
+                        &link.target_id,
+                        link.relation.as_str(),
+                        &e,
+                    )
+                    .await?;
                 }
                 Err(e) => return Err(e),
             }
@@ -28714,7 +29044,16 @@ impl MemoryStore for PostgresStore {
                                             e2,
                                         )
                                     })?;
-                                warn_age_fallback_pair("consolidate_lineage_edge", &new_id, id, &e);
+                                // #3883 (A1) — was WARN-only; now RECORD.
+                                record_failed_age_projection(
+                                    &mut tx,
+                                    "consolidate_lineage_edge",
+                                    &new_id,
+                                    id,
+                                    crate::models::MemoryLinkRelation::DerivedFrom.as_str(),
+                                    &e,
+                                )
+                                .await?;
                             }
                             Err(e) => {
                                 sqlx::query("ROLLBACK TO SAVEPOINT age_consolidate_projection")
@@ -31163,19 +31502,16 @@ impl MemoryStore for PostgresStore {
                                                 e2,
                                             )
                                         })?;
-                                    tracing::warn!(
-                                        target: TRACE_TARGET_KG,
-                                        source_id = %src,
-                                        target_id = %dst,
-                                        relation = %rel,
-                                        err = %e,
-                                        "AGE projection skipped on archive_restore — \
-                                         relational memory_links row still committed. \
-                                         kg_query/kg_timeline over this edge may see a \
-                                         stale AGE projection until it is rebuilt; \
-                                         find_paths reads memory_links via the CTE and \
-                                         stays correct."
-                                    );
+                                    // #3883 (A1) — was WARN-only; now RECORD.
+                                    record_failed_age_projection(
+                                        &mut tx,
+                                        "archive_restore",
+                                        src,
+                                        dst,
+                                        rel,
+                                        &e,
+                                    )
+                                    .await?;
                                 }
                                 Err(e) => return Err(e),
                             }
@@ -36753,7 +37089,57 @@ mod tests {
             TRACE_TARGET_KG_ADAPTER_DEFECT,
             "store::postgres::kg::adapter_defect"
         );
+        // #3883 — the THIRD reason class + its outbox last_error prefix.
+        assert_eq!(AGE_FALLBACK_REASON_GRAPH_ORPHAN, "age_graph_orphan");
+        assert_eq!(AGE_GRAPH_ORPHAN_LAST_ERROR_PREFIX, "age_graph_orphan:");
+        assert_ne!(
+            AGE_FALLBACK_REASON_GRAPH_ORPHAN,
+            AGE_FALLBACK_REASON_UNREACHABLE
+        );
+        assert_ne!(
+            AGE_FALLBACK_REASON_GRAPH_ORPHAN,
+            AGE_FALLBACK_REASON_STATEMENT_DEFECT
+        );
         assert!(TRACE_TARGET_KG_ADAPTER_DEFECT.starts_with(TRACE_TARGET_KG));
+    }
+
+    #[test]
+    fn issue_3883_orphan_classifier_distinguishes_shapes() {
+        // #3883 — the orphan classifier is a THIRD class that must never be
+        // folded into the substrate-unreachable or adapter-defect classes (the
+        // #2511 "may only under-report" discipline). sqlite-free unit pin so the
+        // Linux sal-postgres lanes measure it without a live database.
+        let mk = |detail: &str| StoreError::BackendUnavailable {
+            backend: "postgres".to_string(),
+            sqlstate: None,
+            detail: detail.to_string(),
+        };
+
+        // An orphan-classified error (carries the prefix project_link stamps).
+        let orphan = mk(&format!(
+            "{AGE_GRAPH_ORPHAN_LAST_ERROR_PREFIX} the memory_graph schema exists but \
+             its ag_catalog.ag_graph registry row is absent"
+        ));
+        assert!(is_age_graph_orphan(&orphan));
+        assert!(is_age_runtime_failure(&orphan)); // still a BackendUnavailable
+        assert!(
+            !is_age_adapter_statement_defect(&orphan),
+            "orphan must not be folded into the adapter-defect class"
+        );
+
+        // A plain substrate outage is NOT an orphan.
+        let outage = mk("begin age tx: pool timed out while waiting for a connection");
+        assert!(!is_age_graph_orphan(&outage));
+
+        // An adapter statement defect is NOT an orphan.
+        let defect = mk("cypher kg_query: third argument of cypher function must be a parameter");
+        assert!(!is_age_graph_orphan(&defect));
+        assert!(is_age_adapter_statement_defect(&defect));
+
+        // A non-BackendUnavailable error is never an orphan.
+        assert!(!is_age_graph_orphan(&StoreError::InvalidInput {
+            detail: format!("{AGE_GRAPH_ORPHAN_LAST_ERROR_PREFIX} not a backend error"),
+        }));
     }
 
     #[test]
