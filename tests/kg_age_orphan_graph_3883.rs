@@ -214,8 +214,8 @@ fn quarantined_total() -> u64 {
         .get()
 }
 
-// Single `#[tokio::test]` (deterministic ordering; DROP/CREATE EXTENSION is
-// global). `#[ignore]` + env-skip, mirroring the AGE cert siblings.
+// Single `#[tokio::test]` (deterministic ordering; the orphan fixture mutates the
+// global AGE catalog). `#[ignore]` + env-skip, mirroring the AGE cert siblings.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires a live AGE-enabled postgres (AI_MEMORY_TEST_AGE_URL); run in cert-postgres-age"]
 async fn age_orphan_graph_quarantines_and_self_heals_3883() {
@@ -229,7 +229,7 @@ async fn age_orphan_graph_quarantines_and_self_heals_3883() {
     // Start clean so a prior failed run's orphan does not skew the fixture.
     heal_the_graph(&url).await.expect("heal graph before test");
 
-    let store = PostgresStore::connect(&url).await.expect("connect store");
+    let mut store = PostgresStore::connect(&url).await.expect("connect store");
     if store.kg_backend() != KgBackend::Age {
         eprintln!(
             "skip: kg_age_orphan_graph_3883 requires the AGE backend (kg_backend resolved to CTE; no projection to orphan)"
@@ -266,6 +266,16 @@ async fn age_orphan_graph_quarantines_and_self_heals_3883() {
             .expect("probe orphan schema"),
         "fixture precondition: the memory_graph SCHEMA must SURVIVE orphaning (else this is an absent graph, not an orphan)"
     );
+    // NEVER reuse a backend that saw the graph before the raw catalog delete. MEASURED in CI on
+    // f2-linux-fed-2 (PG 18.6 / AGE 1.8.0, 2026-09-24 15:13 EDT): a pooled connection that had
+    // cached `memory_graph` ran the link's cypher MERGE after the ag_graph/ag_label rows were
+    // deleted under it and AGE SEGFAULTED the backend ("terminated by signal 11"), which
+    // restarts the WHOLE shared cluster. A raw DELETE sends AGE no cache invalidation, so the
+    // store is rebuilt on fresh backends that only ever see the orphan state.
+    store.pool().close().await;
+    store = PostgresStore::connect(&url)
+        .await
+        .expect("reconnect on fresh backends after orphaning");
 
     let q_before = quarantined_total();
     let link = MemoryLink {
@@ -379,6 +389,12 @@ async fn age_orphan_graph_quarantines_and_self_heals_3883() {
             .expect("probe healed state"),
         "ag_graph registry row must be present again after healing"
     );
+    // Same rule in the other direction: these backends cached the ORPHAN state; heal through
+    // fresh ones so no connection straddles a catalog change it was not told about.
+    store.pool().close().await;
+    store = PostgresStore::connect(&url)
+        .await
+        .expect("reconnect on fresh backends after healing");
     let projected = store
         .drain_kg_projection_outbox(64)
         .await
