@@ -102,9 +102,34 @@ async fn heal_the_graph(url: &str) -> Result<(), Box<dyn std::error::Error>> {
     sqlx::query("SET search_path = ag_catalog, \"$user\", public")
         .execute(&mut *conn)
         .await?;
-    sqlx::query(&format!("DROP SCHEMA IF EXISTS \"{AGE_GRAPH}\" CASCADE"))
-        .execute(&mut *conn)
-        .await?;
+    // #3935 — teardown that survives all THREE entry states heal_the_graph is
+    // called against (:174 recovers a crashed prior run): healthy (ag_graph row
+    // + schema), ORPHAN (schema present, NO ag_graph row — the file-header
+    // shape), and fully absent. A REGISTERED graph MUST be torn down with AGE's
+    // `drop_graph`: a raw `DROP SCHEMA ... CASCADE` fires AGE's object_access
+    // hook (`2BP01 table "_ag_label_edge" is for label`), and that hook is
+    // GLOBAL when `age` is in `shared_preload_libraries` (MEASURED on the lane:
+    // AGE 1.8.0 / PG 18.6, `shared_preload_libraries = age`), so a separate
+    // connection that never issues `LOAD age` does NOT avoid it. `drop_graph`
+    // cooperates with the hook but ERRORs "graph does not exist" without a
+    // registry row, so it is used ONLY when the `ag_graph` row is present; an
+    // orphan schema (no row) is dropped raw — its tables are not registered
+    // labels, so the hook does not fire on them.
+    let graph_registered: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM ag_catalog.ag_graph WHERE name = $1::name)",
+    )
+    .bind(AGE_GRAPH)
+    .fetch_one(&mut *conn)
+    .await?;
+    if graph_registered {
+        sqlx::query(&format!("SELECT drop_graph('{AGE_GRAPH}', true)"))
+            .execute(&mut *conn)
+            .await?;
+    } else {
+        sqlx::query(&format!("DROP SCHEMA IF EXISTS \"{AGE_GRAPH}\" CASCADE"))
+            .execute(&mut *conn)
+            .await?;
+    }
     sqlx::query(&format!("SELECT create_graph('{AGE_GRAPH}')"))
         .execute(&mut *conn)
         .await?;
