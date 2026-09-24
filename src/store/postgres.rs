@@ -13524,6 +13524,13 @@ impl PostgresStore {
     /// backends (the outbox is only ever written when the AGE backend is
     /// active under deferred mode).
     pub async fn drain_kg_projection_outbox(&self, batch: i64) -> StoreResult<usize> {
+        // #3883 follow-up — a record-stop must halt background AGE-projection
+        // writes too: this fn holds inline `UPDATE kg_projection_outbox` SQL (the
+        // A3 self-heal reset below, and a pre-existing pending-row UPDATE), so it
+        // gates on the same idempotent read-probe as the `apply_remote_*` twins
+        // BEFORE any write. gate_record_stop is a cheap read; a stop returns
+        // early with the typed refusal rather than draining.
+        self.gate_record_stop().await?;
         // #3883 A3 — self-heal orphan-quarantined rows. If the AGE graph
         // registry row is present again (an operator repaired the orphan), un-
         // quarantine the rows parked at attempt_count = MAX with the orphan
@@ -13902,35 +13909,63 @@ impl PostgresStore {
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             // Boot-recovery drain — self-heal projections orphaned by a crash.
-            if let Err(e) = self
+            match self
                 .drain_kg_projection_outbox(Self::AGE_PROJECTION_DRAIN_BATCH)
                 .await
             {
-                tracing::warn!(
+                Ok(_) => {}
+                // #3883 follow-up — a record-stop gates the drainer (derived-data
+                // maintenance is still a record-plane write); that is INTENDED,
+                // not a fault, so log at INFO rather than WARN.
+                Err(StoreError::Stopped { .. }) => tracing::info!(
+                    target: TRACE_TARGET_KG,
+                    "kg_projection drainer: boot-recovery drain frozen by record-stop; will resume when it lifts"
+                ),
+                Err(e) => tracing::warn!(
                     target: TRACE_TARGET_KG,
                     err = %e,
                     "kg_projection drainer: boot-recovery drain failed (will retry on tick)"
-                );
+                ),
             }
             let mut ticker = tokio::time::interval(interval);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // #3883 follow-up — a record-stop freezes the drainer for its whole
+            // duration; latch so the "frozen" line is logged ONCE per stop
+            // episode (at INFO — intended), not per tick as a WARN fault. Reset
+            // whenever the drainer runs again so a later stop re-announces.
+            let mut stopped_logged = false;
             loop {
                 ticker.tick().await;
                 match self
                     .drain_kg_projection_outbox(Self::AGE_PROJECTION_DRAIN_BATCH)
                     .await
                 {
-                    Ok(n) if n > 0 => tracing::debug!(
-                        target: TRACE_TARGET_KG,
-                        projected = n,
-                        "kg_projection drainer: projected pending edges into memory_graph"
-                    ),
-                    Ok(_) => {}
-                    Err(e) => tracing::warn!(
-                        target: TRACE_TARGET_KG,
-                        err = %e,
-                        "kg_projection drainer: drain tick failed; will retry next interval"
-                    ),
+                    Ok(n) if n > 0 => {
+                        stopped_logged = false;
+                        tracing::debug!(
+                            target: TRACE_TARGET_KG,
+                            projected = n,
+                            "kg_projection drainer: projected pending edges into memory_graph"
+                        );
+                    }
+                    Ok(_) => stopped_logged = false,
+                    Err(StoreError::Stopped { .. }) => {
+                        if !stopped_logged {
+                            tracing::info!(
+                                target: TRACE_TARGET_KG,
+                                "kg_projection drainer: frozen by record-stop; will resume when it lifts"
+                            );
+                            stopped_logged = true;
+                        }
+                    }
+                    Err(e) => {
+                        stopped_logged = false;
+                        tracing::warn!(
+                            target: TRACE_TARGET_KG,
+                            err = %e,
+                            "kg_projection drainer: drain tick failed; will retry next interval"
+                        );
+                    }
                 }
             }
         })
