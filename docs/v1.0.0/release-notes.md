@@ -775,16 +775,17 @@ or overclaim).
   rollbacks until upgraded (one-release conservatism: old readers never
   mint a FALSE verdict, and the new reader still counts legacy id-less
   lines toward Evidence).
-- **Swarm-cascade containment on Postgres: rewind yes, auto-stamp not
-  yet, node-local only (#3926, #3266 item 3).** `memory_swarm_rewind`
+- **Swarm-cascade containment on Postgres: rewind and auto-stamp,
+  node-local only (#3926, #3266 item 3).** `memory_swarm_rewind`
   (#3322) runs on BOTH backends through the admin-only
   `POST /api/v1/memory_swarm_rewind`; the MCP tool stays stdio/SQLite-only
   and the `swarm-rewind` CLI refuses a Postgres store (#3924), so on
   Postgres the route is the rewind. Its report carries the lineage's
   #3323 token/cost rollup on both backends; no other surface reads the PG
-  rollup yet. The automatic `Contaminated` stamp (#3324) is still
-  SQLite-only, and even there fires only on an MCP `supersedes` link
-  between two reflections, not on `kg_invalidate`. Containment is
+  rollup yet. The automatic `Contaminated` stamp (#3324) fires only on a
+  `supersedes` link between two reflections: sqlite stamps on the MCP
+  link tool; Postgres on HTTP `POST /links`, its only link surface.
+  Neither backend stamps on `kg_invalidate`. Containment is
   node-local: a rewind does not propagate to federated peers. The cascade
   sensor and corroboration gate are v1.1 scope (#3266).
 - **Claimed-vs-attested identity and diversity.** `metadata.agent_id`

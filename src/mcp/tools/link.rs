@@ -434,7 +434,7 @@ pub(super) fn handle_link(
                 Ok(ids) => invalidation_notified = ids,
                 Err(e) => {
                     tracing::warn!(
-                        target: "notification.invalidation",
+                        target: crate::notification::invalidation::TRACE_TARGET,
                         invalidated_id = target_id,
                         invalidating_id = source_id,
                         "reflection invalidation walker failed: {e}"
@@ -462,7 +462,7 @@ pub(super) fn handle_link(
                 Ok(report) => contaminated_stamped = report.stamped,
                 Err(e) => {
                     tracing::warn!(
-                        target: "notification.invalidation",
+                        target: crate::notification::invalidation::TRACE_TARGET,
                         invalidated_id = target_id,
                         invalidating_id = source_id,
                         "contaminated auto-stamp failed: {e}"

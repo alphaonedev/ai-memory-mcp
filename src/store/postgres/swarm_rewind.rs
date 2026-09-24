@@ -107,6 +107,100 @@ impl PostgresStore {
         })
     }
 
+    /// Item 3 part 3 (R3) — the postgres twin of
+    /// [`crate::storage::stamp_contaminated_descendants`]: taint the bounded
+    /// `derives_from` DESCENDANTS of a superseded root (the root itself is not
+    /// stamped), in ONE transaction, with the empty extra marker the sqlite
+    /// auto-stamp writes, so a row reads byte-identically whichever backend
+    /// stamped it. Idempotent (already-contaminated rows are counted, not
+    /// rewritten), never downgrades `Tombstoned` / `Quarantined`, and the
+    /// durable memory TEXT is never touched.
+    ///
+    /// # Errors
+    ///
+    /// The record-stop refusal, the lineage walk, or any transaction / query
+    /// failure — each rolls the whole sweep back.
+    pub async fn stamp_contaminated_descendants_pg(
+        &self,
+        root_id: &str,
+        max_depth: usize,
+    ) -> StoreResult<crate::storage::ContaminationStampReport> {
+        self.gate_record_stop().await?;
+        let descendants = self.lineage_descendants(root_id, max_depth).await?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut report = crate::storage::ContaminationStampReport {
+            root_id: root_id.to_string(),
+            ..crate::storage::ContaminationStampReport::default()
+        };
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("contaminated stamp begin", e))?;
+        for node in &descendants {
+            match self
+                .contaminate_row_pg(&mut tx, &node.id, root_id, &now, &[])
+                .await?
+            {
+                Stamp::Stamped => report.stamped += 1,
+                Stamp::AlreadyContaminated => report.already_contaminated += 1,
+                Stamp::SkippedSystemOnly => report.skipped_system_only += 1,
+                Stamp::Vanished => {}
+            }
+        }
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("contaminated stamp commit", e))?;
+        Ok(report)
+    }
+
+    /// Item 3 part 3 (R3, amendment A13) — the postgres twin of the sqlite
+    /// #3324 auto-stamp TRIGGER (`mcp/tools/link.rs`), and exactly as narrow:
+    /// fires only for a `supersedes` edge whose source AND target are both
+    /// `memory_kind = reflection`, and stamps the DESCENDANTS of the superseded
+    /// target to [`crate::storage::LINEAGE_MAX_DEPTH`]. Called from
+    /// `link_signed` (the HTTP `POST /links` path, Postgres's only link
+    /// surface) AFTER the edge committed. Best-effort like sqlite: a failure
+    /// logs and does NOT roll the committed edge back (the stamp is internally
+    /// atomic and idempotent, so it self-heals on the next supersede).
+    pub(super) async fn stamp_on_reflection_supersedes_pg(&self, link: &crate::models::MemoryLink) {
+        if link.relation != crate::models::MemoryLinkRelation::Supersedes {
+            return;
+        }
+        let is_reflection = |m: Option<crate::models::Memory>| {
+            m.is_some_and(|m| m.memory_kind == crate::models::MemoryKind::Reflection)
+        };
+        let (src, tgt) = match (
+            self.get_any(&link.source_id).await,
+            self.get_any(&link.target_id).await,
+        ) {
+            (Ok(s), Ok(t)) => (s, t),
+            (Err(e), _) | (_, Err(e)) => {
+                tracing::warn!(
+                    target: crate::notification::invalidation::TRACE_TARGET,
+                    invalidated_id = %link.target_id,
+                    invalidating_id = %link.source_id,
+                    "contaminated auto-stamp skipped: kind probe failed: {e}"
+                );
+                return;
+            }
+        };
+        if !(is_reflection(src) && is_reflection(tgt)) {
+            return;
+        }
+        if let Err(e) = self
+            .stamp_contaminated_descendants_pg(&link.target_id, crate::storage::LINEAGE_MAX_DEPTH)
+            .await
+        {
+            tracing::warn!(
+                target: crate::notification::invalidation::TRACE_TARGET,
+                invalidated_id = %link.target_id,
+                invalidating_id = %link.source_id,
+                "contaminated auto-stamp failed: {e}"
+            );
+        }
+    }
+
     /// Item 3 — the postgres `swarm_rewind`. `ctx.agent_id` is the issuer
     /// recorded in the signed event; the HTTP route passes the server-resolved
     /// admin principal (ruling Q1), never a wire header.
