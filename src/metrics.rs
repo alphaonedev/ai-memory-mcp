@@ -599,13 +599,11 @@ fn int_counter(
             c
         }
         // Construct is infallible for the compile-time-constant metric names
-        // this module passes; record the (unreachable) failure into the shared
-        // slot for uniformity and diverge. try_new discards Self when the slot
-        // is set, so this value is never observed.
-        Err(e) => {
-            err.get_or_insert(e);
-            unreachable!()
-        }
+        // this module passes (only an invalid name errors); diverge with a
+        // message naming the metric and the error. The sole caller
+        // `try_new().expect(...)` already panics on any registry-init failure,
+        // so this arm changes no behaviour — it only reads honestly.
+        Err(e) => unreachable!("int_counter metric {name}: {e}"),
     }
 }
 
@@ -622,10 +620,7 @@ fn int_gauge(
             }
             g
         }
-        Err(e) => {
-            err.get_or_insert(e);
-            unreachable!()
-        }
+        Err(e) => unreachable!("int_gauge metric {name}: {e}"),
     }
 }
 
@@ -643,10 +638,7 @@ fn int_counter_vec(
             }
             c
         }
-        Err(e) => {
-            err.get_or_insert(e);
-            unreachable!()
-        }
+        Err(e) => unreachable!("int_counter_vec metric {name}: {e}"),
     }
 }
 
@@ -664,10 +656,7 @@ fn int_gauge_vec(
             }
             g
         }
-        Err(e) => {
-            err.get_or_insert(e);
-            unreachable!()
-        }
+        Err(e) => unreachable!("int_gauge_vec metric {name}: {e}"),
     }
 }
 
@@ -686,10 +675,7 @@ fn histogram_vec(
             }
             h
         }
-        Err(e) => {
-            err.get_or_insert(e);
-            unreachable!()
-        }
+        Err(e) => unreachable!("histogram_vec metric {name}: {e}"),
     }
 }
 
