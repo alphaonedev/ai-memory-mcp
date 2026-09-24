@@ -1060,6 +1060,16 @@ pub fn dispatch_event_to_subs(
     // ALL run under `#[tokio::main]`, so this fallback is the cold
     // path.
     let handle = tokio::runtime::Handle::try_current().ok();
+    // #3941 — snapshot the process-wide server-wide HMAC secret ONCE, at
+    // dispatch time, on the CALLER thread before any `rt.spawn`, so every
+    // worker this call spawns signs against the secret in effect when the
+    // dispatch was DECIDED. The worker would otherwise read it lazily (the
+    // `None` arm of the signature match below), and a sibling that flips
+    // `set_active_hooks_hmac_secret` between this call and a still-queued
+    // worker's run would make that worker sign-or-refuse against the WRONG
+    // secret. In production the setter runs once at boot, so this only
+    // removes a test-visible race; the value is behaviour-identical.
+    let server_wide_secret = crate::config::active_hooks_hmac_secret();
     for (sub, sub_secret_hash) in matching {
         // v0.7.0 K6 — UUIDv7 correlation id is generated per
         // (subscription, event) pair so receivers can correlate ACKs
@@ -1090,6 +1100,7 @@ pub fn dispatch_event_to_subs(
         let ts = timestamp.clone();
         let db_path = db_path.to_path_buf();
         let secret_hash_owned = sub_secret_hash.clone();
+        let server_wide_secret_owned = server_wide_secret.clone();
 
         // PERF-3 (FX-10) — the entire per-subscriber delivery body
         // is captured by a `FnOnce()` closure so it can run either
@@ -1181,6 +1192,7 @@ pub fn dispatch_event_to_subs(
                 return;
             }
             let secret_hash = secret_hash_owned;
+            let server_wide_secret = server_wide_secret_owned;
             // Canonical string: "<timestamp>.<body>". Keyed HMAC over
             // the DB-stored secret hash. Receivers verify by computing
             // SHA256(plaintext_secret) and then
@@ -1198,8 +1210,8 @@ pub fn dispatch_event_to_subs(
             let canonical = format!("{ts}.{body}");
             let signature = match secret_hash.as_deref() {
                 Some(h) => Some(hmac_sha256_hex(h, &canonical)),
-                None => crate::config::active_hooks_hmac_secret().map(|plain| {
-                    let key_hash = sha256_hex(&plain);
+                None => server_wide_secret.as_deref().map(|plain| {
+                    let key_hash = sha256_hex(plain);
                     hmac_sha256_hex(&key_hash, &canonical)
                 }),
             };
