@@ -4753,12 +4753,15 @@ pub fn run_mcp_server(
     // breadcrumb — it NEVER routes embedding requests through the
     // chat LLM client (the pre-#1143 silent-wrong-wire-shape trap).
     let resolved_embeddings = app_config.resolve_embeddings();
-    // v1.0.0 #1963 (R68/D14) — inference-plane egress gate for API embed
-    // backends (the ones that POST memory content to an embedding vendor);
-    // the local in-process embedder never egresses and is NOT gated.
-    // #3822 (A2) — resolve-then-pin for the API-embed lane.
-    let (embed_egress_refused, embed_egress_pin) = if crate::config::is_api_embed_backend(
+    // v1.0.0 #1963 (R68/D14) — inference-plane egress gate for EGRESSING embed
+    // lanes (every API backend, plus the ollama+Nomic lane — #3933, which opens
+    // a socket to the resolved URL); the local in-process candle embedder never
+    // egresses and is NOT gated.
+    // #3822 (A2) — resolve-then-pin for the egressing lane; #3933 gates on
+    // transport, not backend name.
+    let (embed_egress_refused, embed_egress_pin) = if crate::config::embed_lane_egresses(
         &resolved_embeddings.backend,
+        tier_config.embedding_model,
     ) {
         match crate::egress::admit_inference_target(
             crate::egress::InferenceEgressMode::resolve(),

@@ -1218,9 +1218,11 @@ impl Embedder {
 
     /// #3822 (5-agent vote 4d3ea1c5, option A) — pinned sibling of
     /// [`Self::from_resolved`] for the `internal-only` egress posture. The pin
-    /// applies ONLY to the API-embed lane (the only embed lane the #1963/#3822
-    /// gate fires on, `is_api_embed_backend`); `None` and the local / Ollama
-    /// lanes delegate to the byte-identical-legacy [`Self::from_resolved`].
+    /// applies to EGRESSING embed lanes ([`crate::config::embed_lane_egresses`]):
+    /// the API-embed lane via `new_openai_compatible_pinned`, and the
+    /// ollama+Nomic lane via `new_with_url_pinned` (#3933). `None` and the local
+    /// in-process candle embedder never egress and delegate to the
+    /// byte-identical-legacy [`Self::from_resolved`].
     ///
     /// # Errors
     /// Same conditions as [`Self::from_resolved`], plus a pinned-client build
@@ -1233,10 +1235,32 @@ impl Embedder {
         let Some(pin) = pin else {
             return Self::from_resolved(resolved, tier_model);
         };
-        if !crate::config::is_api_embed_backend(&resolved.backend) {
-            // The gate only pins the API-embed lane; every other lane is
-            // unchanged (a local embedder never egresses).
+        if !crate::config::embed_lane_egresses(&resolved.backend, tier_model) {
+            // #3933 — only an EGRESSING embed lane is gated/pinned; the local
+            // in-process candle embedder (MiniLmL6V2) never opens a socket, so
+            // it delegates unpinned to the byte-identical-legacy path.
             return Self::from_resolved(resolved, tier_model);
+        }
+        if !crate::config::is_api_embed_backend(&resolved.backend) {
+            // #3933 — the ollama backend + Nomic model builds an OllamaClient to
+            // the resolved URL and EGRESSES, so it must be pinned to the
+            // boot-resolved addrs exactly as the API lane is, not left unpinned.
+            // `embed_lane_egresses` admits a NON-API lane here ONLY for
+            // `Some(NomicEmbedV15)`, so `tier_model` is Some — the else arm is
+            // UNREACHABLE, and failing loud beats silently disabling the embedder.
+            let Some(tier_model) = tier_model else {
+                unreachable!(
+                    "embed_lane_egresses admits a non-API embed lane only for Some(NomicEmbedV15) (#3933)"
+                )
+            };
+            let client = crate::llm::OllamaClient::new_with_url_pinned(
+                &resolved.url,
+                NOMIC_OLLAMA_MODEL,
+                &pin.host,
+                &pin.addrs,
+            )
+            .context("failed to build pinned Ollama embed client (#3933)")?;
+            return Self::for_model(tier_model, Some(Arc::new(client))).map(Some);
         }
         if tier_model.is_none() {
             return Ok(None);

@@ -3640,47 +3640,47 @@ pub async fn build_embedder(
         );
         return None;
     };
-    // v1.0.0 #1963 (R68/D14) — inference-plane egress gate for API embed
-    // backends (the ones that POST memory content to an embedding vendor).
-    // The local in-process embedder never egresses and is NOT gated.
-    // Default `allow` → no-op. ENFORCED here (no embedder → semantic recall
-    // degrades to keyword, the existing #1593 fail-closed path); the
-    // signed-refusal audit is best-effort.
-    // #3822 — resolve-then-pin for the API-embed lane (the only embed lane the
-    // gate fires on). `Some(pin)` under internal-only; `None` otherwise.
-    let egress_pin = if crate::config::is_api_embed_backend(&resolved_embeddings.backend) {
-        use crate::egress::{
-            EgressClass, EgressDecision, InferenceEgressMode, admit_inference_target,
-        };
-        let mode = InferenceEgressMode::resolve();
-        match admit_inference_target(
-            mode,
-            EgressClass::InferenceEmbedding,
-            &resolved_embeddings.url,
-        ) {
-            Ok(pin) => pin,
-            Err(EgressDecision::Refuse {
-                class,
-                target,
-                reason,
-            }) => {
-                tracing::warn!(
-                    "embedder DISABLED by inference-plane egress gate \
+    // v1.0.0 #1963 (R68/D14) + #3933 — inference-plane egress gate for EGRESSING
+    // embed lanes (every API backend + the ollama+Nomic lane open a socket; the
+    // local candle embedder never egresses, NOT gated). Default `allow` → no-op;
+    // ENFORCED here (no embedder → keyword recall, #1593); audit best-effort.
+    // #3822 resolve-then-pins the egressing lane; #3933 gates transport not name.
+    let egress_pin =
+        if crate::config::embed_lane_egresses(&resolved_embeddings.backend, Some(emb_model)) {
+            use crate::egress::{
+                EgressClass, EgressDecision, InferenceEgressMode, admit_inference_target,
+            };
+            let mode = InferenceEgressMode::resolve();
+            match admit_inference_target(
+                mode,
+                EgressClass::InferenceEmbedding,
+                &resolved_embeddings.url,
+            ) {
+                Ok(pin) => pin,
+                Err(EgressDecision::Refuse {
+                    class,
+                    target,
+                    reason,
+                }) => {
+                    tracing::warn!(
+                        "embedder DISABLED by inference-plane egress gate \
                      (tier={} backend={} target={target} mode={}); {reason} \
                      — semantic recall degrades to keyword (#1963/#3822)",
-                    feature_tier.as_str(),
-                    resolved_embeddings.backend,
-                    mode.as_str()
-                );
-                // #1991 — audit against the operator-resolved `db_path`.
-                crate::egress::refuse_inference_egress_audited(db_path, class, &target, &reason);
-                return None;
+                        feature_tier.as_str(),
+                        resolved_embeddings.backend,
+                        mode.as_str()
+                    );
+                    // #1991 — audit against the operator-resolved `db_path`.
+                    crate::egress::refuse_inference_egress_audited(
+                        db_path, class, &target, &reason,
+                    );
+                    return None;
+                }
+                Err(EgressDecision::Allow) => None,
             }
-            Err(EgressDecision::Allow) => None,
-        }
-    } else {
-        None
-    };
+        } else {
+            None
+        };
     // The HF-Hub sync API and candle model-load are blocking CPU work that
     // internally spin their own tokio runtime. Running them directly in this
     // async context panics with "Cannot drop a runtime in a context where
