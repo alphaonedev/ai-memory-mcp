@@ -93,15 +93,24 @@ pub async fn handle_swarm_rewind_http(
     // The admin gate's RETURN VALUE is the issuer: an id that passed the admin
     // allowlist, the #1570 authn requirement and (under `enforce`) the #2044
     // key-attestation binding. The handler never reads `X-Agent-Id` itself.
-    let caller = match crate::handlers::admin_role::require_admin(&app, &headers, ENDPOINT) {
-        Ok(c) => c,
-        Err(resp) => return resp,
-    };
+    // `is_admin` is bound ONLY in the gate's Ok arm and threaded into the
+    // admin-context constructor below (the #1062 `for_admin_checked` typed
+    // dependency, the archive.rs / kg.rs majority pattern): removing or moving
+    // the gate is a compile error, never a silent admin context.
+    let (caller, is_admin) =
+        match crate::handlers::admin_role::require_admin(&app, &headers, ENDPOINT) {
+            Ok(c) => (c, true),
+            Err(resp) => return resp,
+        };
     let args = match parse(&body) {
         Ok(a) => a,
         Err(resp) => return resp,
     };
     // Forensic-chain entry BEFORE the write (the `release_quarantined` shape).
+    // Ordering note: this precedes the backend branch, the dry-run check and
+    // the record-stop gate, and that is NOT a record-plane write under stop —
+    // `record_decision` appends to the forensic FILE sink, opens no database
+    // connection, and records the ATTEMPT (allowed or later refused alike).
     crate::governance::audit::record_decision(
         &caller,
         "allow",
@@ -112,8 +121,12 @@ pub async fn handle_swarm_rewind_http(
 
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
-        return rewind_via_store(&app, &caller, &args).await;
+        return rewind_via_store(&app, &caller, is_admin, &args).await;
     }
+    // Only the Postgres arm builds an admin context; the sqlite funnel takes
+    // the principal directly, so the proof is consumed here in that build.
+    #[cfg(not(feature = "sal"))]
+    let _ = is_admin;
 
     let lock = app.db.lock().await;
     let (root_id, kind) = match resolve_target_sqlite(&lock.0, &args.to) {
@@ -183,10 +196,15 @@ fn resolve_target_sqlite(
 /// already-rewound root re-resolves idempotently, or a checkpoint that names a
 /// root) through the unfiltered authz read, then `MemoryStore::swarm_rewind`.
 #[cfg(feature = "sal")]
-async fn rewind_via_store(app: &AppState, caller: &str, args: &RewindArgs) -> Response {
-    // `for_admin_checked` — `require_admin` returned Ok above; there is no
-    // other way to reach this line.
-    let ctx = crate::store::CallerContext::for_admin_checked(caller.to_string(), true);
+async fn rewind_via_store(
+    app: &AppState,
+    caller: &str,
+    is_admin: bool,
+    args: &RewindArgs,
+) -> Response {
+    // `is_admin` is threaded from the `require_admin` Ok arm (never a literal):
+    // the type-level dependency `for_admin_checked` exists for.
+    let ctx = crate::store::CallerContext::for_admin_checked(caller.to_string(), is_admin);
     let (root_id, kind) = match resolve_target_store(app, &ctx, &args.to).await {
         Ok(t) => t,
         Err(resp) => return resp,
