@@ -1207,6 +1207,19 @@ For the swarm topology:
   symmetrically on both peers' substrate. This is the A2A-6 pattern:
   cross-agent contradictions are first-class graph edges, not
   individual-side rejections.
+- **Containment is node-local (#3266 item 3, R2.6).** A swarm rewind
+  (`memory_swarm_rewind`) and the `Contaminated` taint are applied to
+  THIS node's copy only: **a peer does not inherit a rewind — each node
+  rewinds its own copy** (run the rewind on every node that holds the
+  cascade). Replication cannot undo or spread it: the lifecycle merge
+  keeps a LOCAL `contaminated` / `quarantined` state against any newer
+  peer write, and a wire `contaminated` / `quarantined` lifecycle (plus
+  any wire `metadata.contamination` marker) is normalised to `open` at
+  every receive funnel, on both backends. A lifecycle `tombstoned`, by
+  contrast, is a replicated deletion and still converges. The route
+  OUT is the audited operator release (`ai-memory quarantine release`),
+  which decontaminates to the recorded prior visible state and appends a
+  signed `swarm.decontaminate` event.
 
 ### 8.4 Trust bootstrap (TOFU allowlist)
 

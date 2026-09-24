@@ -35,6 +35,12 @@ use crate::storage::{
 };
 use crate::store::MemoryStore;
 
+/// The locked `(lifecycle_state, metadata)` read shared by the stamp, the
+/// rewind root-marker upgrade (f1-review F2) and the R2.5 release: the row
+/// lock is held to commit, so every later write decides on this read.
+pub(super) const SELECT_STATE_METADATA_FOR_UPDATE: &str =
+    "SELECT lifecycle_state, metadata FROM memories WHERE id = $1 FOR UPDATE";
+
 /// Per-row outcome of the contaminating compare-and-set (sqlite
 /// `ContaminateOutcome` twin).
 enum Stamp {
@@ -67,6 +73,85 @@ fn object_or_empty(v: Option<serde_json::Value>) -> serde_json::Value {
 }
 
 impl PostgresStore {
+    /// Boids item 3 R2.5 (#3266) — the postgres twin of
+    /// `storage::decontaminate::observe_and_release_sqlite`: inside the
+    /// `operator_dequarantine` transaction, which read the row `FOR UPDATE`
+    /// (lock held to commit) and OBSERVED `contaminated`, restore the planned
+    /// state, delete `metadata.contamination` with an atomic `jsonb -` (never a
+    /// write-back of the copy read earlier — f1-review F2), append ONE signed
+    /// `swarm.decontaminate` event (the same canonical payload as sqlite) and
+    /// commit. Gated in its own body
+    /// for the B7 scan. `Ok(false)` = nothing written (the CAS missed).
+    pub(super) async fn release_contaminated_pg(
+        &self,
+        mut tx: sqlx::Transaction<'_, sqlx::Postgres>,
+        ctx: &CallerContext,
+        id: &str,
+        metadata: Option<serde_json::Value>,
+    ) -> StoreResult<bool> {
+        self.gate_record_stop().await?;
+        let plan = crate::storage::decontaminate::plan_release(metadata.as_ref());
+        let now_dt = crate::storage::decontaminate::release_now();
+        let now = now_dt.to_rfc3339();
+        let n = sqlx::query(
+            "UPDATE memories SET lifecycle_state = $1, metadata = CASE WHEN \
+             jsonb_typeof(metadata) = 'object' THEN metadata - $2::text ELSE '{}'::jsonb END, \
+             updated_at = $3, version = version + 1 WHERE id = $4 AND lifecycle_state = $5",
+        )
+        .bind(plan.target.as_str())
+        .bind(CONTAMINATION_METADATA_KEY)
+        .bind(now_dt)
+        .bind(id)
+        .bind(LifecycleState::Contaminated.as_str())
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("decontaminate update", e))?
+        .rows_affected();
+        if n == 0 {
+            return Ok(false);
+        }
+        let kind = crate::signed_events::event_types::SWARM_DECONTAMINATE;
+        let payload = crate::storage::decontaminate::decontaminate_audit_payload(
+            id,
+            &plan,
+            &ctx.agent_id,
+            &now,
+        )
+        .map_err(|e| StoreError::BackendUnavailable {
+            backend: "postgres".to_string(),
+            detail: format!("decontaminate audit payload: {e}"),
+            sqlstate: None,
+        })?;
+        let cause = crate::signed_events::compute_cause_hash(&ctx.agent_id, kind, id, id);
+        let event = crate::signed_events::SignedEvent::with_daemon_signature(
+            crate::signed_events::payload_hash(&payload),
+            ctx.agent_id.clone(),
+            kind.to_string(),
+            now,
+            Some(&cause),
+        );
+        pg_append_signed_event_with_chain_in_tx(
+            &mut tx,
+            PgSignedEventInsert {
+                id: &event.id,
+                agent_id: &event.agent_id,
+                event_type: &event.event_type,
+                payload_hash: &event.payload_hash,
+                signature: event.signature.as_deref(),
+                attest_level: &event.attest_level,
+                timestamp: now_dt,
+                cause_hash: event.cause_hash.as_deref(),
+            },
+        )
+        .await
+        .map_err(|e| to_store_err("decontaminate append signed_event", e))?;
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("decontaminate commit", e))?;
+        crate::storage::decontaminate::warn_released(id, &ctx.agent_id, plan.target);
+        Ok(true)
+    }
+
     /// Contaminate one row inside `tx` (sqlite `contaminate_row` twin).
     ///
     /// Gated in its OWN body, not only by its caller: `gate_record_stop` is an
@@ -88,13 +173,12 @@ impl PostgresStore {
         authority: StampAuthority<'_>,
     ) -> StoreResult<Stamp> {
         self.gate_record_stop().await?;
-        let row: Option<(String, Option<serde_json::Value>)> = sqlx::query_as(
-            "SELECT lifecycle_state, metadata FROM memories WHERE id = $1 FOR UPDATE",
-        )
-        .bind(id)
-        .fetch_optional(&mut **tx)
-        .await
-        .map_err(|e| to_store_err("swarm_rewind read row", e))?;
+        let row: Option<(String, Option<serde_json::Value>)> =
+            sqlx::query_as(SELECT_STATE_METADATA_FOR_UPDATE)
+                .bind(id)
+                .fetch_optional(&mut **tx)
+                .await
+                .map_err(|e| to_store_err("swarm_rewind read row", e))?;
         let Some((cur_str, meta)) = row else {
             return Ok(Stamp::Vanished);
         };
@@ -374,13 +458,12 @@ impl PostgresStore {
         // two concurrent rewinds serialise here and the second one sees the
         // first's committed `rewind` marker (no duplicate signed event). An
         // early return drops `tx`, rolling it back.
-        let locked: Option<(String, Option<serde_json::Value>)> = sqlx::query_as(
-            "SELECT lifecycle_state, metadata FROM memories WHERE id = $1 FOR UPDATE",
-        )
-        .bind(root_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|e| to_store_err("swarm_rewind lock root", e))?;
+        let locked: Option<(String, Option<serde_json::Value>)> =
+            sqlx::query_as(SELECT_STATE_METADATA_FOR_UPDATE)
+                .bind(root_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("swarm_rewind lock root", e))?;
         let Some((locked_state_str, locked_meta)) = locked else {
             return Err(StoreError::InvalidInput {
                 detail: crate::storage::contamination_marker::rewind_root_not_found(root_id),

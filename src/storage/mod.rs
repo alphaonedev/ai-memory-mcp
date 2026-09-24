@@ -861,6 +861,7 @@ pub(crate) fn escape_like_pattern(s: &str) -> String {
 pub(crate) mod connection;
 pub(crate) mod contamination_marker;
 pub(crate) use contamination_marker::StampAuthority;
+pub(crate) mod decontaminate;
 // `pub` (rather than `pub(crate)`) so the V-4 closeout
 // integration test suite (`tests/signed_events_chain_v34.rs`) can
 // invoke `migrate_v34_backfill_chain` directly to exercise the
@@ -4090,6 +4091,9 @@ pub fn list_quarantined(
 /// writes NO audit row, so a released row cannot be re-released and a
 /// tombstoned row cannot be revived.
 ///
+/// Boids item 3 R2.5 (#3266): a CONTAMINATED row is decontaminated by the
+/// same call (see [`decontaminate`]); the state read under the lock decides.
+///
 /// [#2402]: https://github.com/alphaonedev/ai-memory-mcp/issues/2402
 ///
 /// # Errors
@@ -4115,6 +4119,17 @@ pub fn operator_dequarantine(conn: &mut Connection, id: &str, agent_id: &str) ->
     // function non-load-bearing, so a later edit cannot silently reintroduce
     // the race by moving a read above the UPDATE.
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    // Boids item 3 R2.5 (#3266) — the path is chosen by the state observed
+    // under the write lock, never by the caller (`decontaminate`).
+    match decontaminate::observe_and_release_sqlite(&tx, id, agent_id)? {
+        decontaminate::Observed::Quarantined => {}
+        decontaminate::Observed::Decontaminated(target) => {
+            tx.commit()?;
+            decontaminate::warn_released(id, agent_id, target);
+            return Ok(true);
+        }
+        decontaminate::Observed::NotContained => return Ok(false),
+    }
     let changed = tx.execute(
         "UPDATE memories SET lifecycle_state = ?1, updated_at = ?2, version = version + 1 \
          WHERE id = ?3 AND lifecycle_state = ?4",
@@ -4149,7 +4164,7 @@ pub fn operator_dequarantine(conn: &mut Connection, id: &str, agent_id: &str) ->
     // BACKEND primitive rather than each caller so no surface (CLI, admin
     // HTTP, either backend) can be added later and silently skip them.
     tracing::warn!(
-        target: "ai_memory::quarantine",
+        target: decontaminate::QUARANTINE_TRACE_TARGET,
         memory_id = %id,
         operator = %agent_id,
         "quarantine.operator_release: an operator RELEASED a quarantined memory back to          lifecycle_state=open, overriding the #1948 federation containment decision; a          memory.dequarantined signed-chain row was appended in the same transaction (#2402)"
@@ -18263,9 +18278,9 @@ static INSERT_IF_NEWER_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::n
                 -- UPDATE and never pass can_transition_to, so the replicated
                 -- lifecycle value is NOT uniformly transition-validated -- the
                 -- enforcement gap is deferred to v1.1 per #3750.
-                lifecycle_state = CASE WHEN excluded.updated_at > memories.updated_at
-                                            OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
-                                       THEN excluded.lifecycle_state ELSE memories.lifecycle_state END,
+                -- Boids item 3 R2.1: local system-only never replaced, remote
+                -- system-only never adopted, else newer-wins (one shared twin).
+                lifecycle_state = {lifecycle_case},
                 -- v1.0.0 #2333 (FBL-03) + v1.0.0 #2394 — the v79 denormalized
                 -- kind_provenance FOLLOWS THE KIND THAT ACTUALLY WON on the
                 -- federation lane too. `memory_kind` above is sticky (a local
@@ -18293,6 +18308,7 @@ static INSERT_IF_NEWER_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::n
                                    THEN excluded.valid_until ELSE memories.valid_until END
              RETURNING id",
         conflict_target = crate::models::TITLE_SLOT_CONFLICT_TARGET,
+        lifecycle_case = crate::models::crdt_merge::lifecycle_local_taint_wins_case("excluded", "memories"),
         unstamped_owner =
             crate::identity::owner_stamp::sqlite_unstamped_predicate(
                 crate::identity::owner_stamp::UPSERT_SURVIVING_METADATA_COL,
@@ -18613,7 +18629,7 @@ pub fn archived_namespace_by_id(conn: &Connection, id: &str) -> Result<Option<St
 /// taken up front so a concurrent peer push can't slip a write between the
 /// read and the merge, and a failure rolls the whole merge back.
 ///
-/// 1. Look up the existing row BY `inbound.id` ([`get`]).
+/// 1. Look up the existing row BY `inbound.id` ([`get_any`] — ANY lifecycle).
 /// 2. **Existing row found** → `merged = merge_memory(&existing, inbound)`
 ///    (the SAME pure #224 reconciler the postgres adapter calls in Rust,
 ///    so there is no per-backend merge drift) and persist the FULL merged
@@ -18655,7 +18671,12 @@ pub fn merge_inbound(
     // `consolidate` / `size_gc`).
     let write_txn = connection::WriteTxn::begin(conn)?;
     let tx_result = (|| -> Result<Option<String>> {
-        match get(conn, &inbound.id)? {
+        // Boids item 3 R2.2 (#3905) — `get_any`, not `get`: `get` hides
+        // system-only rows, so a contaminated local row fell through to the
+        // insert lane instead of reaching `merge_memory` (whose R2.1
+        // predicate keeps the local taint). The postgres twin already reads
+        // the raw row by id (`SQL_SELECT_MEMORY_ROW_BY_ID`).
+        match get_any(conn, &inbound.id)? {
             Some(existing) => {
                 // #2123 — backend parity with `PostgresStore::merge_inbound`:
                 // the same-`id` field-merge path persists via

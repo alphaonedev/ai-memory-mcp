@@ -33,7 +33,9 @@
 //!   through [`crate::store::MemoryStore::operator_dequarantine`], which
 //!   clears the row and appends a `memory.dequarantined` signed-chain row in
 //!   ONE transaction on BOTH backends, so a release always leaves a signed
-//!   trace naming who released what.
+//!   trace naming who released what. Boids item 3 R2.5 (#3266): a
+//!   `contaminated` row is decontaminated by the same verb (signed
+//!   `swarm.decontaminate`).
 //!
 //! There is deliberately no `re-quarantine` verb. A release makes a row
 //! VISIBLE again; it destroys nothing and loses nothing, so the reverse is a

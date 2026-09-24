@@ -20881,6 +20881,11 @@ impl MemoryStore for PostgresStore {
     /// `memory.dequarantined` chain row, so this backend cannot silently ship
     /// the state change without the audit — the #1552 SAL-port-fanout failure
     /// mode this method is explicitly written against.
+    ///
+    /// Boids item 3 R2.5 (#3266): a CONTAMINATED row is released too — the
+    /// path is chosen by the state observed under `SELECT ... FOR UPDATE`,
+    /// never by the caller (sqlite `operator_dequarantine` twin); see
+    /// [`PostgresStore::release_contaminated_pg`].
     async fn operator_dequarantine(&self, ctx: &CallerContext, id: &str) -> StoreResult<bool> {
         self.gate_record_stop().await?;
         let mut tx = self
@@ -20888,6 +20893,19 @@ impl MemoryStore for PostgresStore {
             .begin()
             .await
             .map_err(|e| to_store_err("operator_dequarantine begin", e))?;
+        let observed: Option<(String, Option<serde_json::Value>)> =
+            sqlx::query_as(swarm_rewind::SELECT_STATE_METADATA_FOR_UPDATE)
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("operator_dequarantine read", e))?;
+        match observed {
+            Some((st, _)) if st == crate::models::LifecycleState::Quarantined.as_str() => {}
+            Some((st, meta)) if st == crate::models::LifecycleState::Contaminated.as_str() => {
+                return self.release_contaminated_pg(tx, ctx, id, meta).await;
+            }
+            _ => return Ok(false),
+        }
         let changed = sqlx::query(
             "UPDATE memories SET lifecycle_state = $1, updated_at = NOW(), \
              version = version + 1 WHERE id = $2 AND lifecycle_state = $3",
@@ -20938,7 +20956,7 @@ impl MemoryStore for PostgresStore {
         // so neither surface nor backend can skip it — the #1552 SAL-port-fanout
         // failure mode applied to the observability half.
         tracing::warn!(
-            target: "ai_memory::quarantine",
+            target: crate::storage::decontaminate::QUARANTINE_TRACE_TARGET,
             memory_id = %id,
             operator = %ctx.agent_id,
             "quarantine.operator_release: an operator RELEASED a quarantined memory back to \
@@ -25114,13 +25132,8 @@ impl MemoryStore for PostgresStore {
                 -- Goal open→done replicates that state; a stale push keeps
                 -- the local lifecycle. Transition legality was enforced at
                 -- the originating update site.
-                lifecycle_state = CASE
-                    WHEN EXCLUDED.updated_at > memories.updated_at
-                         OR (EXCLUDED.updated_at = memories.updated_at
-                             AND EXCLUDED.id > memories.id)
-                        THEN EXCLUDED.lifecycle_state
-                    ELSE memories.lifecycle_state
-                END,
+                -- Boids item 3 R2.1: the SAME shared twin as sqlite.
+                lifecycle_state = {lifecycle_case},
                 -- v1.0.0 #1834 — sqlite federation-merge parity: valid_from is
                 -- immutable (local genesis wins, like cid); valid_until follows
                 -- the newer-wins tiebreak so a peer that CLOSED a claim
@@ -25158,6 +25171,8 @@ impl MemoryStore for PostgresStore {
                 -- SET: the surviving local row keeps its genesis cid on a
                 -- federation-merge (preserves the local genesis pre-image).
             RETURNING id",
+            lifecycle_case =
+                crate::models::crdt_merge::lifecycle_local_taint_wins_case("EXCLUDED", "memories"),
             conflict_target = crate::models::TITLE_SLOT_CONFLICT_TARGET,
             unstamped_owner_drop =
                 crate::identity::owner_stamp::pg_upsert_unstamped_owner_drop(

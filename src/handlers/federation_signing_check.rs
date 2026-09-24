@@ -570,6 +570,13 @@ pub(super) async fn sync_push_via_store(
             skipped += 1;
             continue;
         }
+        // Boids item 3 R2.3 (#3266) — normalise a WIRE contaminated /
+        // quarantined overlay to `open` (dropping any wire contamination
+        // marker) FIRST, so the only `quarantined` the merge sees is this
+        // node's own route-IN verdict (sqlite-funnel parity).
+        crate::handlers::federation_receive::normalise_inbound_node_local_overlay_or_warn(
+            &mut to_insert,
+        );
         // v1.0.0 R19/A3 (#1948) — route-IN quarantine of a provenance-less
         // (non-`agent_attested`) relayed write (postgres twin). Opt-in +
         // permissive default; sets lifecycle_state=Quarantined so the
@@ -685,18 +692,14 @@ pub(super) async fn sync_push_via_store(
             Ok(applied_id) => {
                 applied += 1;
                 // v1.0.0 R19/A3 (#1948) — route-OUT dequarantine-on-attest
-                // (postgres twin). #3750 — this funnel's path DIFFERS from the
-                // sqlite one: `PostgresStore::merge_inbound` reads the existing
-                // row via a RAW `SELECT ... WHERE id = $1` (no lifecycle filter —
-                // it deliberately bypasses the visibility gate), so a quarantined
-                // / contaminated row IS returned and is field-merged via
-                // `crate::models::merge_memory` — crdt_merge resolves
-                // lifecycle_state by LWW, and its `deep_merge_json` starts from
-                // the LOCAL metadata, so a local-only contamination record is
-                // PRESERVED (sqlite DESTROYS it via `insert_if_newer`'s rebuild:
-                // the #3905 cross-backend parity gap). The dequarantine below
-                // still clears any prior quarantine EXPLICITLY on attest,
-                // independent of the merge outcome.
+                // (postgres twin). `PostgresStore::merge_inbound` reads the
+                // existing row via a RAW `SELECT ... WHERE id = $1` (no lifecycle
+                // filter), so a quarantined / contaminated row IS field-merged via
+                // `crate::models::merge_memory`, whose R2.1 predicate keeps the
+                // LOCAL overlay and whose metadata merge keeps the local
+                // contamination marker — the sqlite funnel now does the same
+                // (R2.2 `get_any`, #3905 closed). The dequarantine below clears a
+                // prior quarantine EXPLICITLY on attest (never a contaminated row).
                 if crate::handlers::federation_receive::row_is_agent_attested(&to_insert) {
                     let _ = app.store.dequarantine(&applied_id).await;
                 }

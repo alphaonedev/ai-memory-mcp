@@ -38,6 +38,10 @@
 //! [`crate::db::operator_dequarantine`] (sqlite), each of which lands the
 //! state change and the `memory.dequarantined` signed-chain row in ONE
 //! transaction, so this surface cannot release a row without leaving a trace.
+//! Boids item 3 R2.5 (#3266): the same release also DECONTAMINATES a
+//! `contaminated` row (prior visible state restored, marker removed, a signed
+//! `swarm.decontaminate` row appended) — the path is chosen by the state the
+//! backend observes under its lock, never by this handler.
 //!
 //! [#2402]: https://github.com/alphaonedev/ai-memory-mcp/issues/2402
 //! [#1948]: https://github.com/alphaonedev/ai-memory-mcp/issues/1948

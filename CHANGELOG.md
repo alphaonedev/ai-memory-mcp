@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed (#3266 — Boids item 3 part 5 (R2): containment is node-local)
+
+- **Lifecycle merge (R2.1, fixes #3750).** A LOCAL `contaminated` /
+  `quarantined` state is never replaced by a peer's newer write, and a remote
+  `contaminated` is never adopted — one predicate
+  (`crdt_merge::merge_lifecycle_local_taint_wins`) plus its SQL twin in both
+  upsert `ON CONFLICT` arms (sqlite + postgres). `tombstoned` keeps
+  newer-wins adoption: a lifecycle tombstone is a REPLICATED deletion
+  (`federation_causal_order_3699` 6/0; ruling tmux-22 variant B).
+- **SQLite same-id receive lane reads `get_any` (R2.2, closes #3905).** A
+  hidden local row now reaches `merge_memory`, so its
+  `metadata.contamination` marker survives exactly as on PostgreSQL.
+- **Receive normalisation (R2.3).** Every inbound federation funnel (push on
+  both backends, the pull / catch-up lanes) turns a wire `contaminated` /
+  `quarantined` lifecycle into `open` and drops a wire `metadata.contamination`
+  marker BEFORE the #1948 route-IN verdict — which therefore still
+  quarantines over an existing row.
+- **Decontaminate (R2.5).** `ai-memory quarantine release` /
+  `POST /api/v1/admin/quarantine/{id}/release` (no new surface) also release a
+  `contaminated` row on both backends: restore the recorded prior visible
+  state (else `open`), remove the marker, append a signed
+  `swarm.decontaminate` event. The quarantined release keeps
+  `memory.dequarantined` unchanged.
+- **Disclosure (R2.6).** Containment is node-local at GA: a peer does not
+  inherit a rewind; each node rewinds its own copy
+  (`docs/compliance/honest-limitations.md` §5.1,
+  `docs/enterprise-deployment.md` §8.3).
+
 ### Fixed (#3782 — SDK quickstarts pointed at a scheme the daemon never serves)
 
 - **#3782 (adopter lens, 3x7 workstream G on PR #3769; GA-blocker) — every
