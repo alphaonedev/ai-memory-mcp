@@ -8029,6 +8029,21 @@ pub fn is_api_embed_backend(backend: &str) -> bool {
         .eq_ignore_ascii_case(crate::llm::BACKEND_OLLAMA)
 }
 
+/// #3933 — does the embed lane for `(backend, tier_model)` open a network
+/// socket? The inference-egress gate (#1963/#3822) must fire on TRANSPORT,
+/// not on the backend NAME: the ollama backend paired with
+/// [`EmbeddingModel::NomicEmbedV15`] builds an [`crate::llm::OllamaClient`] to
+/// the resolved URL and EGRESSES, while [`EmbeddingModel::MiniLmL6V2`] runs the
+/// local in-process candle embedder and never leaves the host. So the lane
+/// egresses iff it is an API-embed backend (every non-ollama backend) OR it is
+/// the ollama+Nomic lane. `None` (no model resolved) can build no egressing
+/// embedder. [`is_api_embed_backend`] stays the gate for wire-shape / dim
+/// resolution; this is the gate for whether the socket opens.
+#[must_use]
+pub fn embed_lane_egresses(backend: &str, tier_model: Option<EmbeddingModel>) -> bool {
+    is_api_embed_backend(backend) || matches!(tier_model, Some(EmbeddingModel::NomicEmbedV15))
+}
+
 /// Shared API-key resolution ladder for the `[llm]` and `[embeddings]`
 /// sections (#1146 / #1598). `primary_env` is the section's dedicated
 /// `AI_MEMORY_*_API_KEY` env var; `section` is the bare section name
