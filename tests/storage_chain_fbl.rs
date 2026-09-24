@@ -388,9 +388,15 @@ fn priority_of(conn: &Connection, id: &str) -> i64 {
 
 /// R2 (#3922 / 5-agent vote 4d3ea1c5): recall touch no longer ESCALATES
 /// priority — the priority decade ladder is REMOVED, so `db::touch` bumps
-/// nothing across a decade boundary at ANY band. The operator-band row
-/// (8-10) was never rewritten by the access ladder; under R2 that is a
-/// fortiori true, and now holds for every band, not just the operator one.
+/// nothing across a decade boundary at ANY band.
+///
+/// SENSITIVITY: on the touch path only the `below` row discriminates. Pre-R2
+/// the decade bump was guarded by `priority < ACCESS_PRIORITY_CEILING` (= 7),
+/// so only a sub-ceiling row could move: `below` (priority 6) bumped 6 -> 7
+/// pre-R2 and stays 6 under R2. `at` (7) and `operator` (9) were ceiling-guarded
+/// pre-R2 (`7 < 7` and `9 < 7` are both false), so they stayed put under BOTH
+/// products — they cover the ceiling-guarded bands, they do not discriminate a
+/// re-introduced ladder.
 #[test]
 fn fbl34_touch_no_longer_escalates_priority() {
     let conn = fresh_sqlite();
@@ -411,7 +417,8 @@ fn fbl34_touch_no_longer_escalates_priority() {
     assert_eq!(
         priority_of(&conn, &at),
         7,
-        "R2: priority unchanged (pre-R2 this row bumped 7 → 8 on the decade)"
+        "R2: priority unchanged; pre-R2 this row also stayed 7 — the ladder \
+         was guarded by priority < ceiling"
     );
     assert_eq!(
         priority_of(&conn, &operator),
