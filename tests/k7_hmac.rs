@@ -289,28 +289,25 @@ async fn k7_hmac_unset_refuses_dispatch_when_no_per_sub_secret() {
         );
     }
 
-    // Poll: the wiremock must NOT see any request, AND a DLQ row
-    // must materialise with the "dispatch refused" error.
-    let path_for_poll = db_path.clone();
-    let sub_for_poll = sub_id.clone();
-    let dlq_outcome = tokio::task::spawn_blocking(move || {
-        for _ in 0..40 {
-            let conn = Connection::open(&path_for_poll).unwrap();
-            let entries = subscriptions::list_dlq(&conn, Some(&sub_for_poll)).unwrap();
-            if !entries.is_empty() {
-                return Some(entries);
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        None
-    })
-    .await
-    .unwrap();
+    // #3908 — observe the refusal through the dispatcher's own idle signal,
+    // not a fixed wall-clock window. The refusal + `record_dlq` run INSIDE
+    // the fire-and-forget `work` closure (`subscriptions.rs`, the R3-S1.HMAC
+    // arm), and `dispatch_event` increments `DISPATCH_IN_FLIGHT` SYNCHRONOUSLY
+    // before spawning that worker, so `drain_dispatches` waits on the
+    // dispatcher's `DISPATCH_IDLE` notify until the worker has dropped its
+    // `DispatchInFlightGuard`. Once it returns, the DLQ row is materialised —
+    // or the refusal genuinely wrote none, which the assertions below catch.
+    // The old 40 x 100 ms poll could give up before a loaded runner's worker
+    // landed the row (#3908); the `SHUTDOWN_DRAIN_TIMEOUT` here is a hang
+    // detector (> the retry ladder), not an observation window — a worker
+    // still in flight fails loudly with exactly that meaning, and the six
+    // sibling webhook tests already observe dispatch this way.
+    let drained = subscriptions::drain_dispatches(subscriptions::shutdown_drain_timeout()).await;
 
-    // #1201 — filter by per-test path to be robust against any
-    // straggler from a sibling test landing on this server even if
-    // port reuse aligned (with the dedicated listener, this is now
-    // essentially impossible — the filter is defense in depth).
+    // The wiremock must NOT have seen the unsigned body (the refusal is
+    // correct). #1201 — filter by per-test path against any straggler from a
+    // sibling test landing on this server (with the dedicated listener this is
+    // essentially impossible; the filter is defense in depth).
     let received: Vec<_> = server
         .received_requests()
         .await
@@ -323,8 +320,16 @@ async fn k7_hmac_unset_refuses_dispatch_when_no_per_sub_secret() {
         "dispatcher must NOT post an unsigned body — got {} request(s)",
         received.len()
     );
-    let dlq = dlq_outcome.expect("DLQ row must materialise for refused dispatch");
-    assert_eq!(dlq.len(), 1, "exactly one DLQ row");
+    assert!(
+        drained,
+        "dispatch worker never drained within {:?} (subscriptions::wait_dispatch_idle) — the refusal + record_dlq run inside the worker, so a stuck worker means no DLQ row",
+        subscriptions::shutdown_drain_timeout(),
+    );
+    // The worker has drained: the DLQ row is now present (or the refusal wrote
+    // none, which the assertions below catch).
+    let conn = Connection::open(&db_path).unwrap();
+    let dlq = subscriptions::list_dlq(&conn, Some(&sub_id)).unwrap();
+    assert_eq!(dlq.len(), 1, "exactly one DLQ row for the refused dispatch");
     assert!(
         dlq[0].last_error.contains("dispatch refused")
             || dlq[0].last_error.contains("R3-S1.HMAC")
