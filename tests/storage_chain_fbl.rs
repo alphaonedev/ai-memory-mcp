@@ -386,12 +386,15 @@ fn priority_of(conn: &Connection, id: &str) -> i64 {
     .expect("row")
 }
 
-/// The touch decade ladder stops at `ACCESS_PRIORITY_CEILING` and never
-/// touches rows already in the operator band (8-10).
+/// R2 (#3922 / 5-agent vote 4d3ea1c5): recall touch no longer ESCALATES
+/// priority — the priority decade ladder is REMOVED, so `db::touch` bumps
+/// nothing across a decade boundary at ANY band. The operator-band row
+/// (8-10) was never rewritten by the access ladder; under R2 that is a
+/// fortiori true, and now holds for every band, not just the operator one.
 #[test]
-fn fbl34_touch_decade_bump_caps_at_access_ceiling() {
+fn fbl34_touch_no_longer_escalates_priority() {
     let conn = fresh_sqlite();
-    // 9 accesses → the next touch crosses the decade.
+    // 9 accesses → the NEXT touch would have crossed the decade pre-R2.
     let below = seed_with_priority(&conn, "fbl34-below", 6, 9);
     let at = seed_with_priority(&conn, "fbl34-at", 7, 9);
     let operator = seed_with_priority(&conn, "fbl34-op", 9, 9);
@@ -402,13 +405,13 @@ fn fbl34_touch_decade_bump_caps_at_access_ceiling() {
 
     assert_eq!(
         priority_of(&conn, &below),
-        7,
-        "a below-ceiling row still bumps on the decade"
+        6,
+        "R2: touch no longer bumps priority across a decade (pre-R2: 6 → 7)"
     );
     assert_eq!(
         priority_of(&conn, &at),
         7,
-        "the access ratchet stops AT the ceiling"
+        "R2: priority unchanged (pre-R2 this row bumped 7 → 8 on the decade)"
     );
     assert_eq!(
         priority_of(&conn, &operator),
@@ -417,12 +420,17 @@ fn fbl34_touch_decade_bump_caps_at_access_ceiling() {
     );
 }
 
-/// The v77 fold decade ladder honors the same ceiling (and never lowers a
-/// row already above it).
+/// R2 (#3922): the v77 recall-access fold no longer ESCALATES priority
+/// either — folding unfolded observations (pre-R2: two decades crossed)
+/// leaves priority byte-identical at every band. `fbl34-fold-op` is seeded at
+/// priority 10, ABOVE the (now-removed) `ACCESS_PRIORITY_CEILING` of 7: under
+/// R2 its priority is unchanged for the GENERAL reason — the fold does no
+/// access-driven priority change at all — NOT because a band clamp held it
+/// (that ceiling exists nowhere in the code post-R2).
 #[test]
-fn fbl34_fold_decade_bump_caps_at_access_ceiling() {
+fn fbl34_fold_no_longer_escalates_priority() {
     let conn = fresh_sqlite();
-    // 25 unfolded observations = 2 decades crossed from access_count 0.
+    // 25 unfolded observations = pre-R2 two decades crossed from access_count 0.
     let inflating = seed_with_priority(&conn, "fbl34-fold", 6, 0);
     let operator = seed_with_priority(&conn, "fbl34-fold-op", 10, 0);
     for (n, id) in [(25usize, &inflating), (25usize, &operator)] {
@@ -445,13 +453,15 @@ fn fbl34_fold_decade_bump_caps_at_access_ceiling() {
 
     assert_eq!(
         priority_of(&conn, &inflating),
-        7,
-        "the fold's decade bump caps at the ceiling (pre-fix: 6 + 2 = 8)"
+        6,
+        "R2: fold no longer bumps priority across a decade (pre-R2: 6 + 2 = 8)"
     );
     assert_eq!(
         priority_of(&conn, &operator),
         10,
-        "a row already above the ceiling keeps its priority byte-identical"
+        "R2: priority unchanged for the GENERAL reason (the fold does no \
+         access-driven priority change); fbl34-fold-op at 10 is above the \
+         removed ACCESS_PRIORITY_CEILING of 7 — not a band clamp"
     );
 }
 
