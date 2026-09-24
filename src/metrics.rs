@@ -585,16 +585,48 @@ pub fn registry() -> &'static Metrics {
 // collide against the fresh per-call `Registry`) instead of two per metric.
 // Every `try_new` site calls one of these; no metric name, help text, or
 // behaviour changes. See `coverage/thresholds.toml` and issue #3917.
-fn int_counter(registry: &Registry, name: &str, help: &str) -> prometheus::Result<IntCounter> {
-    let c = IntCounter::new(name, help)?;
-    registry.register(Box::new(c.clone()))?;
-    Ok(c)
+fn int_counter(
+    registry: &Registry,
+    name: &str,
+    help: &str,
+    err: &mut Option<prometheus::Error>,
+) -> IntCounter {
+    match IntCounter::new(name, help) {
+        Ok(c) => {
+            if let Err(e) = registry.register(Box::new(c.clone())) {
+                err.get_or_insert(e);
+            }
+            c
+        }
+        // Construct is infallible for the compile-time-constant metric names
+        // this module passes; record the (unreachable) failure into the shared
+        // slot for uniformity and diverge. try_new discards Self when the slot
+        // is set, so this value is never observed.
+        Err(e) => {
+            err.get_or_insert(e);
+            unreachable!()
+        }
+    }
 }
 
-fn int_gauge(registry: &Registry, name: &str, help: &str) -> prometheus::Result<IntGauge> {
-    let g = IntGauge::new(name, help)?;
-    registry.register(Box::new(g.clone()))?;
-    Ok(g)
+fn int_gauge(
+    registry: &Registry,
+    name: &str,
+    help: &str,
+    err: &mut Option<prometheus::Error>,
+) -> IntGauge {
+    match IntGauge::new(name, help) {
+        Ok(g) => {
+            if let Err(e) = registry.register(Box::new(g.clone())) {
+                err.get_or_insert(e);
+            }
+            g
+        }
+        Err(e) => {
+            err.get_or_insert(e);
+            unreachable!()
+        }
+    }
 }
 
 fn int_counter_vec(
@@ -602,10 +634,20 @@ fn int_counter_vec(
     name: &str,
     help: &str,
     labels: &[&str],
-) -> prometheus::Result<IntCounterVec> {
-    let c = IntCounterVec::new(prometheus::Opts::new(name, help), labels)?;
-    registry.register(Box::new(c.clone()))?;
-    Ok(c)
+    err: &mut Option<prometheus::Error>,
+) -> IntCounterVec {
+    match IntCounterVec::new(prometheus::Opts::new(name, help), labels) {
+        Ok(c) => {
+            if let Err(e) = registry.register(Box::new(c.clone())) {
+                err.get_or_insert(e);
+            }
+            c
+        }
+        Err(e) => {
+            err.get_or_insert(e);
+            unreachable!()
+        }
+    }
 }
 
 fn int_gauge_vec(
@@ -613,10 +655,20 @@ fn int_gauge_vec(
     name: &str,
     help: &str,
     labels: &[&str],
-) -> prometheus::Result<IntGaugeVec> {
-    let g = IntGaugeVec::new(prometheus::Opts::new(name, help), labels)?;
-    registry.register(Box::new(g.clone()))?;
-    Ok(g)
+    err: &mut Option<prometheus::Error>,
+) -> IntGaugeVec {
+    match IntGaugeVec::new(prometheus::Opts::new(name, help), labels) {
+        Ok(g) => {
+            if let Err(e) = registry.register(Box::new(g.clone())) {
+                err.get_or_insert(e);
+            }
+            g
+        }
+        Err(e) => {
+            err.get_or_insert(e);
+            unreachable!()
+        }
+    }
 }
 
 fn histogram_vec(
@@ -625,10 +677,20 @@ fn histogram_vec(
     help: &str,
     buckets: Vec<f64>,
     labels: &[&str],
-) -> prometheus::Result<HistogramVec> {
-    let h = HistogramVec::new(HistogramOpts::new(name, help).buckets(buckets), labels)?;
-    registry.register(Box::new(h.clone()))?;
-    Ok(h)
+    err: &mut Option<prometheus::Error>,
+) -> HistogramVec {
+    match HistogramVec::new(HistogramOpts::new(name, help).buckets(buckets), labels) {
+        Ok(h) => {
+            if let Err(e) = registry.register(Box::new(h.clone())) {
+                err.get_or_insert(e);
+            }
+            h
+        }
+        Err(e) => {
+            err.get_or_insert(e);
+            unreachable!()
+        }
+    }
 }
 
 impl Metrics {
@@ -663,20 +725,26 @@ impl Metrics {
     #[allow(clippy::too_many_lines)]
     pub(crate) fn try_new() -> prometheus::Result<Self> {
         let registry = Registry::new();
+        // #3917 follow-up — a SINGLE error slot threaded through every helper;
+        // the first construct-or-register failure lands here and is surfaced
+        // ONCE at the end of try_new, so no per-metric call site carries `?`.
+        let mut err: Option<prometheus::Error> = None;
 
         let store_total = int_counter_vec(
             &registry,
             "ai_memory_store_total",
             "Total memory_store calls, labeled by tier and result.",
             &["tier", "result"],
-        )?;
+            &mut err,
+        );
 
         let recall_total = int_counter_vec(
             &registry,
             "ai_memory_recall_total",
             "Total memory_recall calls, labeled by mode.",
             &["mode"],
-        )?;
+            &mut err,
+        );
 
         let recall_latency_seconds = histogram_vec(
             &registry,
@@ -686,32 +754,37 @@ impl Metrics {
                 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
             ],
             &["mode"],
-        )?;
+            &mut err,
+        );
 
         let autonomy_hook_total = int_counter_vec(
             &registry,
             "ai_memory_autonomy_hook_total",
             "Post-store autonomy hook invocations, labeled by kind and result.",
             &["kind", "result"],
-        )?;
+            &mut err,
+        );
 
         let contradiction_detected_total = int_counter(
             &registry,
             "ai_memory_contradiction_detected_total",
             "Count of contradictions the LLM hook confirmed.",
-        )?;
+            &mut err,
+        );
 
         let webhook_dispatched_total = int_counter(
             &registry,
             "ai_memory_webhook_dispatched_total",
             "Total webhook deliveries attempted.",
-        )?;
+            &mut err,
+        );
 
         let webhook_failed_total = int_counter(
             &registry,
             "ai_memory_webhook_failed_total",
             "Webhook deliveries that failed after all retries.",
-        )?;
+            &mut err,
+        );
 
         // #3659 — delivery-audit persistence evidence.
         let webhook_audit_status_persisted_total = int_counter(
@@ -719,7 +792,8 @@ impl Metrics {
             "ai_memory_webhook_audit_status_persisted_total",
             "Webhook delivery-audit status transitions (ack/failed) that \
              reached subscription_events since boot.",
-        )?;
+            &mut err,
+        );
         let webhook_audit_update_failed_total = int_counter_vec(
             &registry,
             "ai_memory_webhook_audit_update_failed_total",
@@ -728,7 +802,8 @@ impl Metrics {
                  dispatch_counter). Any increment means the persisted \
                  delivery history disagrees with the wire outcome.",
             &["stage"],
-        )?;
+            &mut err,
+        );
         for stage in crate::subscriptions::audit_status::AuditStage::ALL {
             webhook_audit_update_failed_total
                 .with_label_values(&[stage.as_str()])
@@ -739,44 +814,51 @@ impl Metrics {
             "ai_memory_webhook_audit_last_failure_at_seconds",
             "Unix seconds of the last webhook delivery-audit bookkeeping \
              failure; 0 = none since boot.",
-        )?;
+            &mut err,
+        );
 
         let memories_gauge = int_gauge(
             &registry,
             "ai_memory_memories",
             "Current count of non-archived memories.",
-        )?;
+            &mut err,
+        );
 
         let memories_gauge_refreshed_at = int_gauge(
             &registry,
             "ai_memory_memories_refreshed_at_seconds",
             "UNIX time at which ai_memory_memories was last recomputed (0 = never).",
-        )?;
+            &mut err,
+        );
 
         let hnsw_size_gauge = int_gauge(
             &registry,
             "ai_memory_hnsw_size",
             "Current HNSW vector index population.",
-        )?;
+            &mut err,
+        );
 
         let subscriptions_active_gauge = int_gauge(
             &registry,
             "ai_memory_subscriptions_active",
             "Current count of active webhook subscriptions.",
-        )?;
+            &mut err,
+        );
 
         let curator_cycles_total = int_counter(
             &registry,
             "ai_memory_curator_cycles_total",
             "Total curator sweep cycles completed.",
-        )?;
+            &mut err,
+        );
 
         let curator_operations_total = int_counter_vec(
             &registry,
             "ai_memory_curator_operations_total",
             "Curator operations, labeled by kind (auto_tag|contradiction|persist) and result.",
             &["kind", "result"],
-        )?;
+            &mut err,
+        );
 
         let curator_cycle_duration_seconds = histogram_vec(
             &registry,
@@ -794,7 +876,8 @@ impl Metrics {
                 crate::SECS_PER_HOUR as f64,
             ],
             &["dry_run"],
-        )?;
+            &mut err,
+        );
 
         let federation_fanout_dropped_total = int_counter_vec(
             &registry,
@@ -802,7 +885,8 @@ impl Metrics {
             "Post-quorum fanout tasks whose outcome could not be observed. \
                  reason=shutdown|panic|join_error. Non-zero indicates mesh divergence risk.",
             &["reason"],
-        )?;
+            &mut err,
+        );
 
         let federation_fanout_retry_total = int_counter_vec(
             &registry,
@@ -812,7 +896,8 @@ impl Metrics {
                  outcome=ok|fail|id_drift. Non-zero ok indicates the retry \
                  recovered a row that would otherwise be missing on a peer.",
             &["outcome"],
-        )?;
+            &mut err,
+        );
 
         // H9 (v0.7.0 round-2) — partial-quorum observability.
         let federation_partial_quorum_total = int_counter(
@@ -820,7 +905,8 @@ impl Metrics {
             "ai_memory_federation_partial_quorum_total",
             "Quorum writes that succeeded (W met) but where at least one \
              configured peer did not ack inside the deadline.",
-        )?;
+            &mut err,
+        );
 
         // #3654 — per-peer federation freshness. The `peer` label is bounded
         // by configured membership and never carries a URL.
@@ -829,14 +915,16 @@ impl Metrics {
             "ai_memory_federation_peer_configured",
             "1 for every peer in this node's configured federation membership (#3654).",
             &["peer"],
-        )?;
+            &mut err,
+        );
         let federation_peer_last_attempt_timestamp_seconds = int_gauge_vec(
             &registry,
             "ai_memory_federation_peer_last_attempt_timestamp_seconds",
             "Unix seconds (local clock) of the last attempted exchange with a peer. \
                  direction=pull|push. Absent until the first attempt (#3654).",
             &["peer", "direction"],
-        )?;
+            &mut err,
+        );
         let federation_peer_last_success_timestamp_seconds = int_gauge_vec(
             &registry,
             "ai_memory_federation_peer_last_success_timestamp_seconds",
@@ -844,13 +932,15 @@ impl Metrics {
                  a push counts only when the peer applied it. direction=pull|push. \
                  Absent until the first success (#3654).",
             &["peer", "direction"],
-        )?;
+            &mut err,
+        );
         let federation_peer_consecutive_failures = int_gauge_vec(
             &registry,
             "ai_memory_federation_peer_consecutive_failures",
             "Failed attempts since the last success with a peer. direction=pull|push (#3654).",
             &["peer", "direction"],
-        )?;
+            &mut err,
+        );
         let federation_peer_failures_total = int_counter_vec(
             &registry,
             "ai_memory_federation_peer_failures_total",
@@ -858,34 +948,39 @@ impl Metrics {
                  throttled|rejected|server_error|unreachable|bad_response|not_applied|\
                  task_failed|other (#3654).",
             &["peer", "direction", "class"],
-        )?;
+            &mut err,
+        );
         let federation_peer_clock_skew_seconds = int_gauge_vec(
             &registry,
             "ai_memory_federation_peer_clock_skew_seconds",
             "Peer clock minus local clock in whole seconds, from the peer's HTTP Date \
                  header on the last catch-up response (#3654).",
             &["peer"],
-        )?;
+            &mut err,
+        );
         let federation_peer_push_dlq_depth = int_gauge_vec(
             &registry,
             "ai_memory_federation_peer_push_dlq_depth",
             "Pending federation_push_dlq rows per peer, refreshed each replay tick (#3654).",
             &["peer"],
-        )?;
+            &mut err,
+        );
         let federation_peer_push_dlq_oldest_failed_timestamp_seconds = int_gauge_vec(
             &registry,
             "ai_memory_federation_peer_push_dlq_oldest_failed_timestamp_seconds",
             "Unix seconds of the oldest pending federation_push_dlq failure per peer; \
                  absent when the peer's backlog is empty (#3654).",
             &["peer"],
-        )?;
+            &mut err,
+        );
         let federation_catchup_interval_seconds = int_gauge_vec(
             &registry,
             "ai_memory_federation_catchup_interval_seconds",
             "Configured federation catch-up interval in seconds; absent when the \
                  catch-up loop is not running (#3654).",
             &[],
-        )?;
+            &mut err,
+        );
 
         // Cluster-A COR-3 (v0.7.0) — corrupt-provenance observability.
         let corrupt_provenance_rows_total = int_counter_vec(
@@ -896,7 +991,8 @@ impl Metrics {
                  Non-zero indicates schema drift, writer-side corruption, \
                  or a migration leaving malformed JSON.",
             &["column"],
-        )?;
+            &mut err,
+        );
 
         // v0.7-polish SEC-15 / COR-11 (issue #780) — auto-export
         // detached-worker failure observability.
@@ -908,7 +1004,8 @@ impl Metrics {
              least one reflection was committed to the DB but its \
              on-disk markdown/json artefact did not land — operators \
              use this to alert on otherwise-silent disk-write failures.",
-        )?;
+            &mut err,
+        );
 
         // v0.7.0 Track D #933 — federation push DLQ depth gauge.
         let federation_push_dlq_depth = int_gauge(
@@ -919,7 +1016,8 @@ impl Metrics {
              Non-zero sustained depth indicates one or more peers are \
              persistently unreachable; healthy meshes drain back to 0 \
              within one replay interval after peer recovery.",
-        )?;
+            &mut err,
+        );
 
         // v1.0.0 #3164 — deferred-audit drainer terminal-state gauge.
         let deferred_audit_drainer_terminal_state = int_gauge(
@@ -930,7 +1028,8 @@ impl Metrics {
              sink panicked past max_restarts. Non-zero means governance \
              refusals are NO LONGER reaching signed_events on this node; the \
              daemon keeps serving but is audit-degraded until restarted.",
-        )?;
+            &mut err,
+        );
 
         // #1032 (HIGH, 2026-05-21) — federation push DLQ quarantine counter.
         let federation_push_dlq_quarantined = int_counter(
@@ -943,7 +1042,8 @@ impl Metrics {
              intervention via `ai-memory federation dlq drain \
              --quarantined`. Pre-#1032 the worker retried these \
              forever, amplifying network load against rejecting peers.",
-        )?;
+            &mut err,
+        );
 
         // #1544 — cause-labeled quarantine counter (closed-set label).
         let federation_push_dlq_quarantined_by_cause = int_counter_vec(
@@ -964,7 +1064,8 @@ impl Metrics {
                  wait for the daily reset); `permanent` is a broken row \
                  needing a manual drain. #1544.",
             &["cause"],
-        )?;
+            &mut err,
+        );
 
         // v1.0.0 #3124 — unstamped-row mutation admissions (closed labels).
         let unstamped_mutation_allowed_total = int_counter_vec(
@@ -976,7 +1077,8 @@ impl Metrics {
                  funnel. Non-zero means rows to re-own (ai-memory reown) \
                  before setting the knob to refuse.",
             &["backend", "funnel"],
-        )?;
+            &mut err,
+        );
 
         // #2442 — legacy positional peer-id skips. Kept OFF the `cause` label
         // set above on purpose: see the field doc on
@@ -993,7 +1095,8 @@ impl Metrics {
              Payloads are retained, not deleted. Non-zero after an upgrade \
              means legacy rows remain; see docs/TROUBLESHOOTING.md \
              §federation-push-DLQ for the operator-gated re-key. #2442.",
-        )?;
+            &mut err,
+        );
 
         // #2716 (CB-12) — federated erasure/delete supersede observability.
         let federation_erasure_superseded = int_counter(
@@ -1006,7 +1109,8 @@ impl Metrics {
              the replay-POST-path restore-race guard. A supersede cancels an \
              operator-requested erasure; a sustained rate may mean an erasure \
              is being undone by a resurrection and warrants a re-issue. #2716.",
-        )?;
+            &mut err,
+        );
 
         // #2966 (L6 5-agent vote 4d3ea1c5) — route-IN quarantine
         // observability. The provenance gate used to flip a row to
@@ -1024,7 +1128,8 @@ impl Metrics {
              Always zero when the quarantine knob is off (the default); a \
              non-zero rate means a peer is relaying provenance-less content \
              this node is black-holing. #2966.",
-        )?;
+            &mut err,
+        );
 
         // #3699 (5-agent vote 4d3ea1c5) — cross-id title-merge observability.
         let federation_cross_id_title_merge = int_counter(
@@ -1037,7 +1142,8 @@ impl Metrics {
              that consolidates, a non-zero rate is the signature of a memory \
              delivered before the tombstone that freed its title (#3699). Each \
              increment pairs with a WARN naming both ids.",
-        )?;
+            &mut err,
+        );
 
         // v1.0.0 #2402 — the route-OUT counter. #1948 advertised "operator
         // dequarantine" as the way out of quarantine and shipped no caller, so
@@ -1053,7 +1159,8 @@ impl Metrics {
              also appends a `memory.dequarantined` signed-chain row naming the \
              authenticated caller, in the same transaction as the state change. A \
              no-op release (the id is not quarantined) does not increment.",
-        )?;
+            &mut err,
+        );
 
         // pm-v3.1 PR8 (issue #1174) — HNSW eviction observability moved
         // from process-global atomics in `src/hnsw.rs` into the metrics
@@ -1070,7 +1177,8 @@ impl Metrics {
              MAX_ENTRIES and dropped older embeddings; recall quality \
              may have degraded for evicted ids until they are \
              re-inserted on next access.",
-        )?;
+            &mut err,
+        );
 
         let hnsw_last_eviction_at_nanos = int_gauge(
             &registry,
@@ -1078,7 +1186,8 @@ impl Metrics {
             "Wall-clock UNIX nanoseconds of the most recent HNSW \
              eviction (0 if none). Capabilities derives \
              hnsw.evicted_recently from this with a 60s rolling window.",
-        )?;
+            &mut err,
+        );
 
         // #1253 (MED, 2026-05-25) — subscription DLQ overflow counter.
         let subscription_dlq_overflow_total = int_counter(
@@ -1091,7 +1200,8 @@ impl Metrics {
              otherwise fill the operator's disk with quarantined rows. \
              Operators drain the queue via `ai-memory subscription dlq \
              drain <subscription_id>` before resetting.",
-        )?;
+            &mut err,
+        );
 
         // v1.0.0 #2592 — truncated subscription-dispatch scans.
         let subscription_dispatch_truncated_total = int_counter(
@@ -1103,7 +1213,8 @@ impl Metrics {
              received NO event; the scan is ordered and cursor-less, so the \
              same tail is cut on every write. Reduce the subscription \
              population or split the deployment.",
-        )?;
+            &mut err,
+        );
 
         // FED-P4-e (federation-identity-at-scale §8) — federation
         // identity SLO surfaces: verify-failure-rate, signed-vs-unsigned
@@ -1118,7 +1229,8 @@ impl Metrics {
                  local trust bundle cannot verify (expired leaf, revoked \
                  issuer, clock skew, or a chain that fails to anchor).",
             &["result"],
-        )?;
+            &mut err,
+        );
 
         let federation_inbound_cred_total = int_counter_vec(
             &registry,
@@ -1129,7 +1241,8 @@ impl Metrics {
                  signed / (signed + unsigned). Climbs toward 1.0 as \
                  peers upgrade to credential-presenting builds.",
             &["presence"],
-        )?;
+            &mut err,
+        );
 
         let federation_cred_max_age_seconds = int_gauge(
             &registry,
@@ -1140,7 +1253,8 @@ impl Metrics {
              — a credential aging past its TTL without a renewal means \
              the refresh worker has stalled and outbound sync will \
              start failing peer verification.",
-        )?;
+            &mut err,
+        );
 
         let federation_renewal_lag_seconds = int_gauge(
             &registry,
@@ -1151,7 +1265,8 @@ impl Metrics {
              configured refresh interval by a safety margin: a lag \
              larger than the interval means renewals are silently \
              failing even though the worker thread is still alive.",
-        )?;
+            &mut err,
+        );
 
         let admission_shed_total = int_counter(
             &registry,
@@ -1163,19 +1278,22 @@ impl Metrics {
              alert on a sustained increment rate to size the cap or the fleet \
              up. Always zero on deployments that have not opted into admission \
              control (the cap defaults to disabled).",
-        )?;
+            &mut err,
+        );
 
         let auth_failures_total = int_counter(
             &registry,
             "ai_memory_auth_failures_total",
             "Total HTTP transport-auth failures (missing or unknown API key) since boot, all sources, no per-source label.",
-        )?;
+            &mut err,
+        );
 
         let auth_backoff_episodes_total = int_counter(
             &registry,
             "ai_memory_auth_backoff_episodes_total",
             "Backoff episodes begun since boot: times one source's auth failures crossed the threshold into 429 refusal (edge-triggered; a later success does not decrement).",
-        )?;
+            &mut err,
+        );
 
         let recall_embed_degraded_total = int_counter(
             &registry,
@@ -1188,7 +1306,8 @@ impl Metrics {
              a provider hiccup, a sustained rate means the budget is mis-sized \
              for this deployment's embedding provider or the provider is \
              unhealthy. Always zero on keyword-tier deployments.",
-        )?;
+            &mut err,
+        );
 
         let rerank_budget_degraded_total = int_counter(
             &registry,
@@ -1202,7 +1321,8 @@ impl Metrics {
              long-content tail, a sustained rate means the budget is \
              mis-sized for this corpus. Always zero when the budget is \
              disabled (=0) or on non-neural reranker deployments.",
-        )?;
+            &mut err,
+        );
 
         let query_embed_cache_hits_total = int_counter(
             &registry,
@@ -1211,7 +1331,8 @@ impl Metrics {
              process-local bounded cache instead of a remote round trip \
              (#2577). Zero under repeated traffic means the cache is disabled \
              (AI_MEMORY_QUERY_EMBED_CACHE_ENTRIES=0) or every query is unique.",
-        )?;
+            &mut err,
+        );
 
         let autotag_enqueued_total = int_counter(
             &registry,
@@ -1220,7 +1341,8 @@ impl Metrics {
              the bounded background worker after a durable HTTP create-memory \
              write (#2587). Rising with autonomous-tier write traffic is the \
              healthy shape.",
-        )?;
+            &mut err,
+        );
 
         let autotag_dropped_total = int_counter(
             &registry,
@@ -1231,7 +1353,8 @@ impl Metrics {
              — a DEGRADE (no tags), never a write failure. Alert on a \
              sustained increment rate: the queue is under-sized for the \
              write burst.",
-        )?;
+            &mut err,
+        );
 
         let autotag_applied_total = int_counter(
             &registry,
@@ -1239,7 +1362,8 @@ impl Metrics {
             "Monotonic counter of auto_tag jobs the background worker applied \
              successfully — tags merged onto the row, never a blind \
              overwrite (#2587).",
-        )?;
+            &mut err,
+        );
 
         let autotag_degraded_total = int_counter(
             &registry,
@@ -1250,14 +1374,16 @@ impl Metrics {
              concurrency race lost twice in a row (#2587). A DEGRADE, never \
              data corruption — the durable write this job followed already \
              succeeded.",
-        )?;
+            &mut err,
+        );
 
         let atomise_enqueued_total = int_counter(
             &registry,
             "ai_memory_atomise_enqueued_total",
             "Monotonic counter of auto-atomise jobs enqueued onto the bounded \
              single-consumer background worker after a durable write (#2986).",
-        )?;
+            &mut err,
+        );
 
         let atomise_dropped_total = int_counter(
             &registry,
@@ -1267,14 +1393,16 @@ impl Metrics {
              wired (#2986). The durable write always succeeds regardless — a \
              DEGRADE (no atoms; `memory_atomise` recovers it), never a write \
              failure. Alert on a sustained increment rate.",
-        )?;
+            &mut err,
+        );
 
         let atomise_applied_total = int_counter(
             &registry,
             "ai_memory_atomise_applied_total",
             "Monotonic counter of auto-atomise passes that landed atoms — the \
              synchronous MCP path or a drained background job (#2986).",
-        )?;
+            &mut err,
+        );
 
         let atomise_degraded_total = int_counter(
             &registry,
@@ -1282,7 +1410,8 @@ impl Metrics {
             "Monotonic counter of auto-atomise passes that FAILED (curator \
              error, db-open failure) (#2986). A DEGRADE, never data loss — the \
              durable source row is untouched on every failure arm.",
-        )?;
+            &mut err,
+        );
 
         let atomise_no_curator_total = int_counter(
             &registry,
@@ -1292,7 +1421,8 @@ impl Metrics {
              inference egress refused (#2985). Non-zero means a \
              MISCONFIGURATION, not load: the knob is set and structurally \
              dead. `ai-memory doctor` names the same condition.",
-        )?;
+            &mut err,
+        );
 
         let record_stop_gate_indeterminate_total = int_counter(
             &registry,
@@ -1301,7 +1431,8 @@ impl Metrics {
              audit chain could not be read, so the mutating write was \
              refused rather than proceeding (#3877, vote 4d3ea1c5). Alert \
              on a sustained rate: every gated write is being refused.",
-        )?;
+            &mut err,
+        );
 
         let governance_check_audit_suppressed_total = int_counter(
             &registry,
@@ -1309,7 +1440,8 @@ impl Metrics {
             "Monotonic counter of governance.check audit appends SUPPRESSED \
              under an engaged record-stop (#3818): the check still answers, \
              the audit row is skipped and a WARN names it.",
-        )?;
+            &mut err,
+        );
 
         let capability_expansion_audit_suppressed_total = int_counter(
             &registry,
@@ -1317,7 +1449,8 @@ impl Metrics {
             "Monotonic counter of capability-expansion audit appends \
              SUPPRESSED under an engaged record-stop (#3818); the expansion \
              itself still resolves.",
-        )?;
+            &mut err,
+        );
 
         let age_projection_pending_depth = int_gauge(
             &registry,
@@ -1327,7 +1460,8 @@ impl Metrics {
              tick. Sustained non-zero = AGE graph lagging the relational \
              memory_links truth (Pillar-4 4.C, #1735). Always 0 under the \
              default sync projection mode.",
-        )?;
+            &mut err,
+        );
 
         let age_projection_failed_total = int_counter(
             &registry,
@@ -1335,7 +1469,8 @@ impl Metrics {
             "Monotonic count of deferred AGE-projection drain attempts that \
              errored (MERGE failed; row attempt_count bumped, retried until \
              quarantine). Pillar-4 4.C (#1735).",
-        )?;
+            &mut err,
+        );
 
         let age_projection_quarantined_total = int_counter(
             &registry,
@@ -1343,7 +1478,14 @@ impl Metrics {
             "Monotonic count of kg_projection_outbox rows that hit the \
              drain attempt ceiling and were quarantined (relational edge \
              exists but never reached the AGE graph). Pillar-4 4.C (#1735).",
-        )?;
+            &mut err,
+        );
+
+        // #3917 follow-up — the ONE surface point: if any helper recorded a
+        // failure, return it here (the single `?`-equivalent for the whole fn).
+        if let Some(e) = err {
+            return Err(e);
+        }
 
         Ok(Self {
             registry,
