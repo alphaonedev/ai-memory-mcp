@@ -13918,6 +13918,33 @@ pub fn swarm_rewind(
               WHERE id = ?4 AND lifecycle_state = ?5",
         )?;
 
+        // f1-review F2/F3 parity (pre-existing since #3322): the autocommit
+        // read above is a preview only. Re-read and re-decide UNDER the
+        // IMMEDIATE write lock, so a rewind or metadata writer on another
+        // connection can neither duplicate the signed event nor be overwritten
+        // by a stale marker copy. Any early return rolls `tx` back.
+        let locked: Option<(String, Option<String>)> = read
+            .query_row(params![root_id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?;
+        let Some((locked_state, locked_meta)) = locked else {
+            return Err(anyhow::Error::new(StorageError::InvalidArgument {
+                reason: contamination_marker::rewind_root_not_found(root_id),
+            }));
+        };
+        let root_state = crate::models::LifecycleState::from_str(&locked_state).unwrap_or_default();
+        let root_meta: serde_json::Value = locked_meta
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .filter(serde_json::Value::is_object)
+            .unwrap_or_else(|| serde_json::json!({}));
+        if root_state == crate::models::LifecycleState::Contaminated
+            && root_meta[CONTAMINATION_METADATA_KEY][SWARM_REWIND_MARKER_KEY].as_bool()
+                == Some(true)
+        {
+            report.already_rewound = true;
+            return Ok(report);
+        }
+
         // 1a. Contaminate the downstream cascade. `via` records the taint
         // provenance; the base marker (prior_lifecycle_state/...) is identical
         // to the auto-stamp so a future restore reads it uniformly.
