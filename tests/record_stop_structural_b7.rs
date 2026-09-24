@@ -70,30 +70,53 @@ fn write_sql_line(line: &str) -> bool {
         || (upper.contains("UPDATE ") && upper.contains(" SET"))
 }
 
+/// #3934 — strip a leading visibility modifier (`pub`, `pub(crate)`,
+/// `pub(super)`, `pub(self)`, `pub(in a::b)`) from an already-`trim_start`ed
+/// line, returning the remainder. Restriction parens are non-nested (the
+/// first `)` closes them); a malformed unterminated `pub(` is left as-is.
+/// Shared by [`is_fn_start`] and the #3484 [`is_item_boundary_line`]
+/// const/static/mod probe so BOTH recognise restricted visibilities — before
+/// #3934 an ungated `pub(restricted)` item "passed" on a neighbour's gate.
+fn strip_visibility(t: &str) -> &str {
+    if t.starts_with("pub(") {
+        return match t.find(')') {
+            Some(close) => t[close + 1..].trim_start(),
+            None => t,
+        };
+    }
+    if let Some(rest) = t.strip_prefix("pub ") {
+        return rest.trim_start();
+    }
+    if let Some(rest) = t.strip_prefix("pub\t") {
+        return rest.trim_start();
+    }
+    t
+}
+
+/// #3934 (addendum) — is `line` a module/impl-level `const`/`static`/`mod`
+/// item at or shallower than `fn_indent` (the #3484 boundary that ends the
+/// preceding fn's attributed body)? Recognises restricted visibilities via
+/// [`strip_visibility`], so a `pub(super) const` holding write SQL counts as a
+/// boundary exactly like a bare `const`; the pre-addendum two-case strip
+/// (`pub(crate)`/`pub` only) missed it and mis-attributed the const's write
+/// SQL to the preceding fn.
+fn is_item_boundary_line(line: &str, fn_indent: usize) -> bool {
+    let indent = line.len() - line.trim_start().len();
+    if indent > fn_indent {
+        return false;
+    }
+    let t = strip_visibility(line.trim_start());
+    t.starts_with("const ") || t.starts_with("static ") || t.starts_with("mod ")
+}
+
 fn is_fn_start(line: &str) -> Option<(usize, String)> {
     let indent = line.len() - line.trim_start().len();
-    let mut t = line.trim_start();
-
-    // #3934 — recognise ANY visibility, not just `pub(crate)`/`pub`. A
-    // `pub(super) fn` / `pub(self) fn` / `pub(in a::b) fn` line was NOT a
-    // function start under the old two-case strip, so its body merged into
-    // the PRECEDING recognised fn and B7 read gate presence from the merged
-    // text (both directions: an ungated `pub(restricted)` write "passed" on
-    // the preceding fn's gate, and a private helper inherited a following
-    // `pub(restricted)` fn's gate). Strip `pub` plus an optional balanced
-    // parenthesised restriction (`(crate)`/`(super)`/`(self)`/`(in path)`),
-    // then any `const`/`unsafe`/`async` qualifiers.
-    if t.starts_with("pub(") {
-        // Restriction parens are non-nested (`crate`/`super`/`self`/`in a::b`),
-        // so the first `)` closes them.
-        if let Some(close) = t.find(')') {
-            t = t[close + 1..].trim_start();
-        }
-    } else if let Some(rest) = t.strip_prefix("pub ") {
-        t = rest.trim_start();
-    } else if let Some(rest) = t.strip_prefix("pub\t") {
-        t = rest.trim_start();
-    }
+    // #3934 — recognise ANY visibility (incl. `pub(super)`/`pub(self)`/
+    // `pub(in a::b)`) via `strip_visibility`, then any `const`/`unsafe`/`async`
+    // qualifier, before requiring `fn `. A restricted-visibility fn was NOT a
+    // function start under the old two-case strip, so its body merged into the
+    // PRECEDING recognised fn and B7 read gate presence from the merged text.
+    let mut t = strip_visibility(line.trim_start());
     loop {
         let next = t
             .strip_prefix("const ")
@@ -304,11 +327,11 @@ fn b7_scanner_sees_pub_restricted_write_fns_3934() {
     let shipped = ungated_write_fns_for(planted, is_fn_start);
     assert!(
         shipped.contains(&"plant_pub_super_ungated".to_string()),
-        "sensitivity: the widened scanner must FLAG an ungated pub(super)          write fn (got {shipped:?})"
+        "sensitivity: the widened scanner must FLAG an ungated pub(super) write fn (got {shipped:?})"
     );
     assert!(
         shipped.contains(&"plant_pub_in_ungated".to_string()),
-        "sensitivity: the widened scanner must FLAG an ungated pub(in ..)          write fn (got {shipped:?})"
+        "sensitivity: the widened scanner must FLAG an ungated pub(in ..) write fn (got {shipped:?})"
     );
     assert!(
         !shipped.contains(&"plant_pub_self_gated".to_string()),
@@ -322,7 +345,52 @@ fn b7_scanner_sees_pub_restricted_write_fns_3934() {
     assert!(
         !frozen.contains(&"plant_pub_super_ungated".to_string())
             && !frozen.contains(&"plant_pub_in_ungated".to_string()),
-        "R-203: the frozen pre-fix scanner must be BLIND to pub(restricted)          write fns (that is the #3934 bug); got {frozen:?}"
+        "R-203: the frozen pre-fix scanner must be BLIND to pub(restricted) write fns (that is the #3934 bug); got {frozen:?}"
+    );
+}
+
+/// #3934 (addendum) — the #3484 item-boundary probe must recognise a
+/// RESTRICTED-visibility item, the same widening `is_fn_start` got. A
+/// `pub(super) const` holding write SQL is a module-level item, NOT the body
+/// of the preceding fn, so it must register as a boundary. (25
+/// restricted-visibility consts exist in `src/` today; 0 hold write SQL — this
+/// pins the scanner before one does.) The pre-addendum two-case strip returned
+/// false here, mis-attributing the const's write SQL to the fn above.
+#[test]
+fn item_boundary_recognises_restricted_visibility_const_3934() {
+    // At or shallower than the fn indent → a boundary (the fix).
+    assert!(
+        is_item_boundary_line(
+            "    pub(super) const SQL_X: &str = \"INSERT INTO x VALUES (1)\";",
+            4
+        ),
+        "a pub(super) const at fn-indent must register as a #3484 item boundary"
+    );
+    assert!(
+        is_item_boundary_line(
+            "pub(in crate::store) static SQL_Y: &str = \"DELETE FROM y\";",
+            0
+        ),
+        "a pub(in ..) static must register as a boundary"
+    );
+    // A bare (private) const is a boundary — unchanged by the widening.
+    assert!(is_item_boundary_line(
+        "const SQL_Z: &str = \"UPDATE z SET a = 1\";",
+        0
+    ));
+    // Specificity: DEEPER than the fn indent → inside the fn body, NOT a boundary.
+    assert!(
+        !is_item_boundary_line(
+            "        pub(super) const INNER: &str = \"INSERT INTO w VALUES (2)\";",
+            4
+        ),
+        "a const deeper than the fn indent is inside the fn body, not a boundary"
+    );
+    // Specificity: a restricted-visibility FN is a fn start (is_fn_start's job),
+    // NOT a const/static/mod item boundary.
+    assert!(
+        !is_item_boundary_line("    pub(super) fn helper() {", 4),
+        "a pub(super) fn is a fn start, not a const/static/mod item boundary"
     );
 }
 
@@ -385,18 +453,9 @@ fn record_stop_write_sql_fns_are_gated_or_allowlisted_b7() {
             // (Const-reference tracking, so the fn that EXECUTES the const
             // is scanned instead, is #3485.)
             let fn_indent = lines[start].len() - lines[start].trim_start().len();
-            let item_boundary_between = lines[start + 1..=idx].iter().any(|l| {
-                let indent = l.len() - l.trim_start().len();
-                let t = l.trim_start();
-                let t = t
-                    .strip_prefix("pub(crate) ")
-                    .or_else(|| t.strip_prefix("pub "))
-                    .unwrap_or(t);
-                indent <= fn_indent
-                    && (t.starts_with("const ")
-                        || t.starts_with("static ")
-                        || t.starts_with("mod "))
-            });
+            let item_boundary_between = lines[start + 1..=idx]
+                .iter()
+                .any(|&l| is_item_boundary_line(l, fn_indent));
             if item_boundary_between {
                 continue;
             }
