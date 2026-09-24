@@ -41,3 +41,54 @@ pub(crate) fn build(
     }
     serde_json::Value::Object(marker)
 }
+
+/// Boids item 3 f1-review F1 (ruling `ITEM3-P1P4-f1`) — the authority a
+/// contamination AUTO-stamp runs under. The stamp is an effect of the CALLER's
+/// authority, never of source ownership alone: an admin (the sqlite
+/// single-operator trust-all posture counts as one) taints the whole closure;
+/// a non-admin taints ONLY rows it may mutate. Cross-owner containment is the
+/// admin `swarm_rewind` route's job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StampAuthority<'a> {
+    /// Operator / admin: every row in the closure.
+    Admin,
+    /// A non-admin principal: only rows it owns for mutation.
+    Caller(&'a str),
+}
+
+impl StampAuthority<'_> {
+    /// `true` when this authority may stamp the row whose `metadata` is
+    /// given — the SAME ownership SSOT every mutation funnel uses
+    /// (`metadata_admits_mutation`, #3124 unstamped knob included; inbox
+    /// recipients are NOT owners here).
+    pub(crate) fn admits(
+        self,
+        metadata: &serde_json::Value,
+        id: &str,
+        site: crate::identity::owner_stamp::MutationSite,
+    ) -> bool {
+        match self {
+            Self::Admin => true,
+            Self::Caller(caller) => {
+                caller == crate::identity::sentinels::DAEMON_PRINCIPAL
+                    || crate::identity::owner_stamp::metadata_admits_mutation(
+                        metadata, id, caller, false, site,
+                    )
+            }
+        }
+    }
+}
+
+/// The ONE structured WARN for rows a non-admin auto-stamp left untouched:
+/// a COUNT only — never ids or content, which the caller cannot see.
+pub(crate) fn warn_skipped_unauthorized(root_id: &str, skipped: usize) {
+    if skipped > 0 {
+        tracing::warn!(
+            target: crate::notification::invalidation::TRACE_TARGET,
+            invalidated_id = %root_id,
+            skipped_unauthorized = skipped,
+            "contaminated auto-stamp left rows outside the caller's authority untouched; \
+             cross-owner containment is the admin swarm_rewind route"
+        );
+    }
+}

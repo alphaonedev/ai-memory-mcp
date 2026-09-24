@@ -454,10 +454,20 @@ pub(super) fn handle_link(
             // the stamp is internally atomic, so a failure here logs and does
             // NOT roll the edge back (the taint self-heals on the next
             // invalidation of the same root, being idempotent).
-            match crate::db::stamp_contaminated_descendants(
+            // Item 3 f1-review F1: the stamp runs under the CALLER's
+            // authority — trust-all (no `AI_MEMORY_AGENT_ID`) is the single
+            // operator, else only the caller's own descendants (the #1929
+            // target gate above already required it to own the target).
+            let stamp_caller = crate::identity::resolve_read_visibility_caller();
+            let authority = stamp_caller.as_deref().map_or(
+                crate::storage::StampAuthority::Admin,
+                crate::storage::StampAuthority::Caller,
+            );
+            match crate::storage::stamp_contaminated_descendants_as(
                 conn,
                 target_id,
                 crate::db::LINEAGE_MAX_DEPTH,
+                authority,
             ) {
                 Ok(report) => contaminated_stamped = report.stamped,
                 Err(e) => {

@@ -30,7 +30,8 @@ use super::{
 };
 use crate::models::LifecycleState;
 use crate::storage::{
-    CONTAMINATION_METADATA_KEY, SWARM_REWIND_MARKER_KEY, SwarmRewindCost, SwarmRewindReport,
+    CONTAMINATION_METADATA_KEY, SWARM_REWIND_MARKER_KEY, StampAuthority, SwarmRewindCost,
+    SwarmRewindReport,
 };
 use crate::store::MemoryStore;
 
@@ -40,8 +41,17 @@ enum Stamp {
     Stamped,
     AlreadyContaminated,
     SkippedSystemOnly,
+    /// Outside a non-admin caller's authority — left untouched (f1 F1).
+    Unauthorized,
     Vanished,
 }
+
+/// The ownership site every PG contamination-stamp authority check is
+/// labelled with (the stamp is an effect of the link write).
+const STAMP_SITE: crate::identity::owner_stamp::MutationSite =
+    crate::identity::owner_stamp::MutationSite::postgres(
+        crate::identity::owner_stamp::funnel::LINK,
+    );
 
 /// A malformed / absent metadata blob is treated as an empty object (the
 /// marker is additive, never destructive) — sqlite parity.
@@ -63,6 +73,7 @@ impl PostgresStore {
         contaminated_from: &str,
         now: &str,
         extra: &[(&str, serde_json::Value)],
+        authority: StampAuthority<'_>,
     ) -> StoreResult<Stamp> {
         self.gate_record_stop().await?;
         let row: Option<(String, Option<serde_json::Value>)> =
@@ -74,6 +85,10 @@ impl PostgresStore {
         let Some((cur_str, meta)) = row else {
             return Ok(Stamp::Vanished);
         };
+        let mut meta = object_or_empty(meta);
+        if !authority.admits(&meta, id, STAMP_SITE) {
+            return Ok(Stamp::Unauthorized);
+        }
         let cur = LifecycleState::from_str(&cur_str).unwrap_or_default();
         if cur == LifecycleState::Contaminated {
             return Ok(Stamp::AlreadyContaminated);
@@ -81,7 +96,6 @@ impl PostgresStore {
         if cur.is_system_only() {
             return Ok(Stamp::SkippedSystemOnly);
         }
-        let mut meta = object_or_empty(meta);
         if let Some(map) = meta.as_object_mut() {
             map.insert(
                 CONTAMINATION_METADATA_KEY.to_string(),
@@ -116,6 +130,9 @@ impl PostgresStore {
     /// rewritten), never downgrades `Tombstoned` / `Quarantined`, and the
     /// durable memory TEXT is never touched.
     ///
+    /// Runs with ADMIN authority (the whole closure); the `link_signed`
+    /// trigger uses [`Self::stamp_contaminated_descendants_pg_as`].
+    ///
     /// # Errors
     ///
     /// The record-stop refusal, the lineage walk, or any transaction / query
@@ -124,6 +141,19 @@ impl PostgresStore {
         &self,
         root_id: &str,
         max_depth: usize,
+    ) -> StoreResult<crate::storage::ContaminationStampReport> {
+        self.stamp_contaminated_descendants_pg_as(root_id, max_depth, StampAuthority::Admin)
+            .await
+    }
+
+    /// [`Self::stamp_contaminated_descendants_pg`] under an explicit caller
+    /// `authority` (f1-review F1): a non-admin stamps only the descendants it
+    /// owns; the rest are counted in `skipped_unauthorized` (one WARN, no ids).
+    async fn stamp_contaminated_descendants_pg_as(
+        &self,
+        root_id: &str,
+        max_depth: usize,
+        authority: StampAuthority<'_>,
     ) -> StoreResult<crate::storage::ContaminationStampReport> {
         self.gate_record_stop().await?;
         let descendants = self.lineage_descendants(root_id, max_depth).await?;
@@ -139,18 +169,23 @@ impl PostgresStore {
             .map_err(|e| to_store_err("contaminated stamp begin", e))?;
         for node in &descendants {
             match self
-                .contaminate_row_pg(&mut tx, &node.id, root_id, &now, &[])
+                .contaminate_row_pg(&mut tx, &node.id, root_id, &now, &[], authority)
                 .await?
             {
                 Stamp::Stamped => report.stamped += 1,
                 Stamp::AlreadyContaminated => report.already_contaminated += 1,
                 Stamp::SkippedSystemOnly => report.skipped_system_only += 1,
+                Stamp::Unauthorized => report.skipped_unauthorized += 1,
                 Stamp::Vanished => {}
             }
         }
         tx.commit()
             .await
             .map_err(|e| to_store_err("contaminated stamp commit", e))?;
+        crate::storage::contamination_marker::warn_skipped_unauthorized(
+            root_id,
+            report.skipped_unauthorized,
+        );
         Ok(report)
     }
 
@@ -163,11 +198,20 @@ impl PostgresStore {
     /// surface) AFTER the edge committed. Best-effort like sqlite: a failure
     /// logs and does NOT roll the committed edge back (the stamp is internally
     /// atomic and idempotent, so it self-heals on the next supersede).
-    pub(super) async fn stamp_on_reflection_supersedes_pg(&self, link: &crate::models::MemoryLink) {
+    ///
+    /// f1-review F1: the stamp is an effect of the CALLER's authority, never
+    /// of source ownership alone. It runs only when `ctx` is admin
+    /// (`bypass_visibility`) or owns the superseded TARGET, and a non-admin
+    /// then stamps only the descendants it owns.
+    pub(super) async fn stamp_on_reflection_supersedes_pg(
+        &self,
+        ctx: &CallerContext,
+        link: &crate::models::MemoryLink,
+    ) {
         if link.relation != crate::models::MemoryLinkRelation::Supersedes {
             return;
         }
-        let is_reflection = |m: Option<crate::models::Memory>| {
+        let is_reflection = |m: Option<&crate::models::Memory>| {
             m.is_some_and(|m| m.memory_kind == crate::models::MemoryKind::Reflection)
         };
         let (src, tgt) = match (
@@ -185,11 +229,28 @@ impl PostgresStore {
                 return;
             }
         };
-        if !(is_reflection(src) && is_reflection(tgt)) {
+        if !(is_reflection(src.as_ref()) && is_reflection(tgt.as_ref())) {
+            return;
+        }
+        let authority = if ctx.bypass_visibility {
+            StampAuthority::Admin
+        } else {
+            StampAuthority::Caller(ctx.effective_principal())
+        };
+        let max_depth = crate::storage::LINEAGE_MAX_DEPTH;
+        if tgt.is_some_and(|t| !authority.admits(&t.metadata, &t.id, STAMP_SITE)) {
+            let skipped = self
+                .lineage_descendants(&link.target_id, max_depth)
+                .await
+                .map_or(0, |d| d.len());
+            crate::storage::contamination_marker::warn_skipped_unauthorized(
+                &link.target_id,
+                skipped,
+            );
             return;
         }
         if let Err(e) = self
-            .stamp_contaminated_descendants_pg(&link.target_id, crate::storage::LINEAGE_MAX_DEPTH)
+            .stamp_contaminated_descendants_pg_as(&link.target_id, max_depth, authority)
             .await
         {
             tracing::warn!(
@@ -301,13 +362,20 @@ impl PostgresStore {
         let desc_extra = [("via", via.clone())];
         for node in &descendants {
             match self
-                .contaminate_row_pg(&mut tx, &node.id, root_id, &now, &desc_extra)
+                .contaminate_row_pg(
+                    &mut tx,
+                    &node.id,
+                    root_id,
+                    &now,
+                    &desc_extra,
+                    StampAuthority::Admin,
+                )
                 .await?
             {
                 Stamp::Stamped => report.descendants_stamped += 1,
                 Stamp::AlreadyContaminated => report.descendants_already_contaminated += 1,
                 Stamp::SkippedSystemOnly => report.descendants_skipped_system_only += 1,
-                Stamp::Vanished => {}
+                Stamp::Unauthorized | Stamp::Vanished => {}
             }
         }
 
@@ -361,7 +429,14 @@ impl PostgresStore {
                 ("via", via.clone()),
             ];
             match self
-                .contaminate_row_pg(&mut tx, root_id, root_id, &now, &root_extra)
+                .contaminate_row_pg(
+                    &mut tx,
+                    root_id,
+                    root_id,
+                    &now,
+                    &root_extra,
+                    StampAuthority::Admin,
+                )
                 .await?
             {
                 Stamp::Stamped => report.root_contaminated = true,

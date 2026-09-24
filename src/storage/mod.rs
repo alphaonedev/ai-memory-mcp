@@ -860,6 +860,7 @@ pub(crate) fn escape_like_pattern(s: &str) -> String {
 // historical `crate::db::*` paths used elsewhere.
 pub(crate) mod connection;
 pub(crate) mod contamination_marker;
+pub(crate) use contamination_marker::StampAuthority;
 // `pub` (rather than `pub(crate)`) so the V-4 closeout
 // integration test suite (`tests/signed_events_chain_v34.rs`) can
 // invoke `migrate_v34_backfill_chain` directly to exercise the
@@ -13421,6 +13422,9 @@ pub struct ContaminationStampReport {
     /// non-destructive: a logical-delete / quarantine posture is never
     /// downgraded to a taint).
     pub skipped_system_only: usize,
+    /// Descendants outside a non-admin caller's authority — left untouched
+    /// (item 3 f1-review F1; counted for the WARN, never named).
+    pub skipped_unauthorized: usize,
 }
 
 /// Outcome of one [`contaminate_row`] stamp attempt on a single memory row.
@@ -13560,6 +13564,25 @@ pub fn stamp_contaminated_descendants(
     root_id: &str,
     max_depth: usize,
 ) -> Result<ContaminationStampReport> {
+    stamp_contaminated_descendants_as(conn, root_id, max_depth, StampAuthority::Admin)
+}
+
+/// [`stamp_contaminated_descendants`] under an explicit caller `authority`
+/// (item 3 f1-review F1): a non-admin stamps ONLY the descendants it owns for
+/// mutation; every other row is left untouched and counted in
+/// `skipped_unauthorized` (one WARN, no ids). Pre-existing on sqlite since
+/// #3324: the MCP narrow trigger tainted the whole closure.
+///
+/// # Errors
+///
+/// As [`stamp_contaminated_descendants`].
+pub(crate) fn stamp_contaminated_descendants_as(
+    conn: &Connection,
+    root_id: &str,
+    max_depth: usize,
+    authority: StampAuthority<'_>,
+) -> Result<ContaminationStampReport> {
+    use rusqlite::OptionalExtension;
     // #1955 R45 write-funnel fence — this is a lifecycle-mutating write and is
     // reachable from the CLI-local and HTTP-sqlite lanes that bypass
     // `SqliteStore::gate_record_stop`; gate here, where every other sqlite
@@ -13590,6 +13613,21 @@ pub fn stamp_contaminated_descendants(
               WHERE id = ?4 AND lifecycle_state = ?5",
         )?;
         for node in &descendants {
+            if authority != StampAuthority::Admin {
+                let meta: Option<Option<String>> =
+                    read.query_row(params![node.id], |r| r.get(1)).optional()?;
+                let meta = meta
+                    .flatten()
+                    .and_then(|m| serde_json::from_str(&m).ok())
+                    .unwrap_or_else(|| serde_json::json!({}));
+                let site = crate::identity::owner_stamp::MutationSite::sqlite(
+                    crate::identity::owner_stamp::funnel::LINK,
+                );
+                if !authority.admits(&meta, &node.id, site) {
+                    report.skipped_unauthorized += 1;
+                    continue;
+                }
+            }
             // Empty `extra_marker` reproduces the historical #3324 contamination
             // marker byte-for-byte.
             match contaminate_row(&mut read, &mut upd, &node.id, root_id, &now, &[])? {
@@ -13601,6 +13639,7 @@ pub fn stamp_contaminated_descendants(
         }
     }
     tx.commit()?;
+    contamination_marker::warn_skipped_unauthorized(root_id, report.skipped_unauthorized);
     Ok(report)
 }
 

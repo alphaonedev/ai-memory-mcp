@@ -24327,7 +24327,7 @@ impl MemoryStore for PostgresStore {
         let attest = self.link_internal(ctx, link, keypair).await?;
         // Boids item 3 part 3 (R3 / A13): the sqlite #3324 auto-stamp's narrow
         // trigger, best-effort after the edge has committed.
-        self.stamp_on_reflection_supersedes_pg(link).await;
+        self.stamp_on_reflection_supersedes_pg(ctx, link).await;
         Ok(attest)
     }
 
