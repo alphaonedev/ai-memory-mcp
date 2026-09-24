@@ -53,6 +53,12 @@ const STAMP_SITE: crate::identity::owner_stamp::MutationSite =
         crate::identity::owner_stamp::funnel::LINK,
     );
 
+/// `true` when a root in `state` already carries the `rewind: true` marker.
+fn is_rewound(state: LifecycleState, meta: &serde_json::Value) -> bool {
+    state == LifecycleState::Contaminated
+        && meta[CONTAMINATION_METADATA_KEY][SWARM_REWIND_MARKER_KEY].as_bool() == Some(true)
+}
+
 /// A malformed / absent metadata blob is treated as an empty object (the
 /// marker is additive, never destructive) — sqlite parity.
 fn object_or_empty(v: Option<serde_json::Value>) -> serde_json::Value {
@@ -66,6 +72,12 @@ impl PostgresStore {
     /// Gated in its OWN body, not only by its caller: `gate_record_stop` is an
     /// idempotent read-probe (a TTL-cached flag load), so the repeat call is
     /// cheap and this write site is self-evidently fenced for the B7 scan.
+    ///
+    /// f1-review F2 (lost update): the row is read `FOR UPDATE`, so the
+    /// authority / state decision is taken on the latest committed version and
+    /// held until commit, and the write is an atomic jsonb MERGE of the one
+    /// `contamination` key — it never replaces the object with a copy read
+    /// earlier, so a concurrently committed metadata key survives.
     async fn contaminate_row_pg(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -76,17 +88,17 @@ impl PostgresStore {
         authority: StampAuthority<'_>,
     ) -> StoreResult<Stamp> {
         self.gate_record_stop().await?;
-        let row: Option<(String, Option<serde_json::Value>)> =
-            sqlx::query_as("SELECT lifecycle_state, metadata FROM memories WHERE id = $1")
-                .bind(id)
-                .fetch_optional(&mut **tx)
-                .await
-                .map_err(|e| to_store_err("swarm_rewind read row", e))?;
+        let row: Option<(String, Option<serde_json::Value>)> = sqlx::query_as(
+            "SELECT lifecycle_state, metadata FROM memories WHERE id = $1 FOR UPDATE",
+        )
+        .bind(id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|e| to_store_err("swarm_rewind read row", e))?;
         let Some((cur_str, meta)) = row else {
             return Ok(Stamp::Vanished);
         };
-        let mut meta = object_or_empty(meta);
-        if !authority.admits(&meta, id, STAMP_SITE) {
+        if !authority.admits(&object_or_empty(meta), id, STAMP_SITE) {
             return Ok(Stamp::Unauthorized);
         }
         let cur = LifecycleState::from_str(&cur_str).unwrap_or_default();
@@ -96,18 +108,17 @@ impl PostgresStore {
         if cur.is_system_only() {
             return Ok(Stamp::SkippedSystemOnly);
         }
-        if let Some(map) = meta.as_object_mut() {
-            map.insert(
-                CONTAMINATION_METADATA_KEY.to_string(),
-                crate::storage::contamination_marker::build(cur, contaminated_from, now, extra),
-            );
-        }
+        let marker =
+            crate::storage::contamination_marker::build(cur, contaminated_from, now, extra);
         let n = sqlx::query(
-            "UPDATE memories SET lifecycle_state = $1, metadata = $2, updated_at = NOW(), \
-             version = version + 1 WHERE id = $3 AND lifecycle_state = $4",
+            "UPDATE memories SET lifecycle_state = $1, metadata = (CASE WHEN \
+             jsonb_typeof(metadata) = 'object' THEN metadata ELSE '{}'::jsonb END) \
+             || jsonb_build_object($2::text, $3::jsonb), updated_at = NOW(), \
+             version = version + 1 WHERE id = $4 AND lifecycle_state = $5",
         )
         .bind(LifecycleState::Contaminated.as_str())
-        .bind(&meta)
+        .bind(CONTAMINATION_METADATA_KEY)
+        .bind(&marker)
         .bind(id)
         .bind(&cur_str)
         .execute(&mut **tx)
@@ -156,7 +167,9 @@ impl PostgresStore {
         authority: StampAuthority<'_>,
     ) -> StoreResult<crate::storage::ContaminationStampReport> {
         self.gate_record_stop().await?;
-        let descendants = self.lineage_descendants(root_id, max_depth).await?;
+        let mut descendants = self.lineage_descendants(root_id, max_depth).await?;
+        // CONCURRENCY-04: one global row-lock order (by id) across sweeps.
+        descendants.sort_by(|a, b| a.id.cmp(&b.id));
         let now = chrono::Utc::now().to_rfc3339();
         let mut report = crate::storage::ContaminationStampReport {
             root_id: root_id.to_string(),
@@ -289,16 +302,15 @@ impl PostgresStore {
                 .map_err(|e| to_store_err("swarm_rewind read root", e))?;
         let Some((root_state_str, root_meta)) = root else {
             return Err(StoreError::InvalidInput {
-                detail: format!("swarm_rewind: root memory {root_id} not found"),
+                detail: crate::storage::contamination_marker::rewind_root_not_found(root_id),
             });
         };
         let root_state = LifecycleState::from_str(&root_state_str).unwrap_or_default();
-        let root_meta = object_or_empty(root_meta);
-        let already_rewound = root_state == LifecycleState::Contaminated
-            && root_meta[CONTAMINATION_METADATA_KEY][SWARM_REWIND_MARKER_KEY].as_bool()
-                == Some(true);
+        let already_rewound = is_rewound(root_state, &object_or_empty(root_meta));
 
-        let descendants = self.lineage_descendants(root_id, max_depth).await?;
+        let mut descendants = self.lineage_descendants(root_id, max_depth).await?;
+        // CONCURRENCY-04: one global row-lock order (by id) across sweeps.
+        descendants.sort_by(|a, b| a.id.cmp(&b.id));
         let rollup = crate::cost::postgres::lineage_rollup_pg(&self.pool, root_id, max_depth)
             .await
             .map_err(|e| to_store_err("swarm_rewind lineage cost", e))?;
@@ -358,6 +370,37 @@ impl PostgresStore {
             .await
             .map_err(|e| to_store_err("swarm_rewind begin", e))?;
 
+        // f1-review F3: lock the ROOT first and re-decide under that lock, so
+        // two concurrent rewinds serialise here and the second one sees the
+        // first's committed `rewind` marker (no duplicate signed event). An
+        // early return drops `tx`, rolling it back.
+        let locked: Option<(String, Option<serde_json::Value>)> = sqlx::query_as(
+            "SELECT lifecycle_state, metadata FROM memories WHERE id = $1 FOR UPDATE",
+        )
+        .bind(root_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("swarm_rewind lock root", e))?;
+        let Some((locked_state_str, locked_meta)) = locked else {
+            return Err(StoreError::InvalidInput {
+                detail: crate::storage::contamination_marker::rewind_root_not_found(root_id),
+            });
+        };
+        let root_state = LifecycleState::from_str(&locked_state_str).unwrap_or_default();
+        if is_rewound(root_state, &object_or_empty(locked_meta)) {
+            report.already_rewound = true;
+            return Ok(report);
+        }
+        if root_state.is_system_only() && root_state != LifecycleState::Contaminated {
+            return Err(StoreError::InvalidInput {
+                detail: format!(
+                    "swarm_rewind: root memory {root_id} is in a system-only terminal state \
+                     ({}); already contained, nothing to rewind",
+                    root_state.as_str()
+                ),
+            });
+        }
+
         // 1a. The downstream cascade.
         let desc_extra = [("via", via.clone())];
         for node in &descendants {
@@ -383,33 +426,28 @@ impl PostgresStore {
         if root_state == LifecycleState::Contaminated {
             // Already tainted (a prior stamp as another root's descendant):
             // upgrade its marker in place, keeping the prior-state anchor. CAS
-            // on the observed state; 0 rows means the root moved — roll back
-            // (the sqlite #3327 Sec-F4 fail-closed rule).
-            let mut meta = root_meta.clone();
-            if let Some(obj) = meta.as_object_mut() {
-                let mut cont = obj
-                    .get(CONTAMINATION_METADATA_KEY)
-                    .and_then(serde_json::Value::as_object)
-                    .cloned()
-                    .unwrap_or_default();
-                cont.insert(SWARM_REWIND_MARKER_KEY.to_string(), serde_json::json!(true));
-                cont.insert("via".to_string(), via.clone());
-                cont.insert(
-                    crate::storage::contamination_marker::REWOUND_AT_KEY.to_string(),
-                    serde_json::json!(now),
-                );
-                obj.insert(
-                    CONTAMINATION_METADATA_KEY.to_string(),
-                    serde_json::Value::Object(cont),
-                );
-            }
+            // on the observed state AND the absent `rewind` marker; 0 rows
+            // means the root moved — roll back (the sqlite #3327 Sec-F4
+            // fail-closed rule). f1-review F2: an atomic jsonb merge of the
+            // marker keys, never a whole-object replace from an earlier read.
+            let patch = serde_json::json!({
+                SWARM_REWIND_MARKER_KEY: true,
+                "via": via.clone(),
+                (crate::storage::contamination_marker::REWOUND_AT_KEY): now,
+            });
             let n = sqlx::query(
-                "UPDATE memories SET metadata = $1, updated_at = NOW(), version = version + 1 \
-                 WHERE id = $2 AND lifecycle_state = $3",
+                "UPDATE memories SET metadata = (CASE WHEN jsonb_typeof(metadata) = 'object' \
+                 THEN metadata ELSE '{}'::jsonb END) || jsonb_build_object($1::text, \
+                 (CASE WHEN jsonb_typeof(metadata->$1) = 'object' THEN metadata->$1 \
+                 ELSE '{}'::jsonb END) || $2::jsonb), updated_at = NOW(), \
+                 version = version + 1 WHERE id = $3 AND lifecycle_state = $4 \
+                 AND (metadata->$1->$5) IS DISTINCT FROM 'true'::jsonb",
             )
-            .bind(&meta)
+            .bind(CONTAMINATION_METADATA_KEY)
+            .bind(&patch)
             .bind(root_id)
             .bind(LifecycleState::Contaminated.as_str())
+            .bind(SWARM_REWIND_MARKER_KEY)
             .execute(&mut *tx)
             .await
             .map_err(|e| to_store_err("swarm_rewind root marker", e))?

@@ -13825,7 +13825,7 @@ pub fn swarm_rewind(
         .optional()?;
     let Some((root_state_str, root_meta_str)) = root_row else {
         return Err(anyhow::Error::new(StorageError::InvalidArgument {
-            reason: format!("swarm_rewind: root memory {root_id} not found"),
+            reason: contamination_marker::rewind_root_not_found(root_id),
         }));
     };
     let root_state = crate::models::LifecycleState::from_str(&root_state_str).unwrap_or_default();

@@ -31,9 +31,10 @@ use ai_memory::store::postgres::PostgresStore;
 use ai_memory::store::{CallerContext, MemoryStore};
 use axum::body::{Body, to_bytes};
 use axum::http::Request;
-use serde_json::json;
+use serde_json::{Value, json};
 use tower::ServiceExt as _;
 
+const DEPTH: usize = ai_memory::storage::LINEAGE_MAX_DEPTH;
 const VICTIM: &str = "ai:f1fix-victim";
 const BOB: &str = "ai:f1fix-bob";
 const ADMIN: &str = "ai:f1fix-admin";
@@ -165,6 +166,71 @@ async fn state(pg: &PostgresStore, id: &str) -> String {
         .fetch_one(pg.pool())
         .await
         .expect("state")
+}
+
+async fn metadata(pg: &PostgresStore, id: &str) -> Value {
+    sqlx::query_scalar("SELECT metadata FROM memories WHERE id = $1")
+        .bind(id)
+        .fetch_one(pg.pool())
+        .await
+        .expect("metadata")
+}
+
+/// Wait until `n` backends are blocked behind `holder_pid`'s locks — directly,
+/// or queued behind a waiter that is (a second `FOR UPDATE` waiter on the same
+/// row blocks on the first waiter's tuple lock, not on the holder).
+async fn wait_blocked_behind(pg: &PostgresStore, holder_pid: i32, n: i64) {
+    let end = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let blocked: i64 = sqlx::query_scalar(
+            "WITH w AS (SELECT pid, pg_blocking_pids(pid) AS b FROM pg_stat_activity) \
+             SELECT count(*) FROM w WHERE $1 = ANY(w.b) OR EXISTS \
+             (SELECT 1 FROM w AS v WHERE v.pid = ANY(w.b) AND $1 = ANY(v.b))",
+        )
+        .bind(holder_pid)
+        .fetch_one(pg.pool())
+        .await
+        .expect("barrier probe");
+        if blocked >= n {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < end,
+            "barrier not reached: {blocked}/{n} blocked"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
+/// Open a transaction holding `FOR UPDATE` on `id`; returns it + its pid.
+async fn hold_row_lock(
+    pg: &PostgresStore,
+    id: &str,
+) -> (sqlx::Transaction<'static, sqlx::Postgres>, i32) {
+    let mut tx = pg.pool().begin().await.expect("lock tx");
+    let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *tx)
+        .await
+        .expect("pid");
+    sqlx::query("SELECT id FROM memories WHERE id = $1 FOR UPDATE")
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await
+        .expect("lock row");
+    (tx, pid)
+}
+
+/// The concurrent writer: commit a new metadata key under the held lock.
+async fn commit_concurrent_key(mut tx: sqlx::Transaction<'static, sqlx::Postgres>, id: &str) {
+    sqlx::query(
+        "UPDATE memories SET metadata = jsonb_set(metadata, '{concurrent_committed}', \
+         'true'::jsonb), version = version + 1 WHERE id = $1",
+    )
+    .bind(id)
+    .execute(&mut *tx)
+    .await
+    .expect("concurrent writer");
+    tx.commit().await.expect("commit concurrent metadata");
 }
 
 // ---------------------------------------------------------------- F1 ----
@@ -333,4 +399,148 @@ async fn pg_admin_supersedes_stamps_across_owners_f1() {
         "contaminated",
         "an admin's supersede stamps across owners"
     );
+}
+
+// ---------------------------------------------------------------- F2 ----
+
+/// f1's PROBE_LOST_UPDATE: the stamp blocks behind a concurrent writer's row
+/// lock; that writer commits a new metadata key; the stamp must keep it.
+#[tokio::test]
+#[ignore = "live postgres: AI_MEMORY_TEST_POSTGRES_URL (postgres-ignored tier)"]
+async fn pg_stamp_preserves_concurrently_committed_metadata_f2() {
+    let Some(pg) = connect().await else { return };
+    let n = ns("race");
+    let root = mem(&n, "metadata root", VICTIM);
+    let leaf = mem(&n, "metadata leaf", VICTIM);
+    seed(&pg, &[&root, &leaf]).await;
+    derive(&pg, &leaf, &root).await;
+    let (lock, holder) = hold_row_lock(&pg, &leaf.id).await;
+    let handle = Arc::clone(&pg);
+    let rid = root.id.clone();
+    let stamp =
+        tokio::spawn(async move { handle.stamp_contaminated_descendants_pg(&rid, DEPTH).await });
+    wait_blocked_behind(&pg, holder, 1).await;
+    commit_concurrent_key(lock, &leaf.id).await;
+    let outcome = stamp.await.expect("join").expect("stamp");
+    assert_eq!(outcome.stamped, 1, "{outcome:?}");
+    let meta = metadata(&pg, &leaf.id).await;
+    assert_eq!(
+        meta.get("concurrent_committed"),
+        Some(&json!(true)),
+        "the concurrently committed key must survive the stamp: {meta}"
+    );
+    assert!(
+        meta.get("contamination").is_some(),
+        "marker written: {meta}"
+    );
+    assert_eq!(state(&pg, &leaf.id).await, "contaminated");
+}
+
+/// Seed a root already contaminated (no `rewind` marker) — f1's fixture.
+async fn contaminated_root(pg: &PostgresStore, tag: &str) -> Memory {
+    let mut root = mem(&ns(tag), "already tainted root", VICTIM);
+    root.metadata = json!({
+        "agent_id": VICTIM,
+        "contamination": {"prior_lifecycle_state": "open", "contaminated_from": "fixture"},
+    });
+    seed(pg, &[&root]).await;
+    sqlx::query("UPDATE memories SET lifecycle_state = 'contaminated' WHERE id = $1")
+        .bind(&root.id)
+        .execute(pg.pool())
+        .await
+        .expect("initial taint");
+    root
+}
+
+/// The same lost update on the rewind's ROOT-marker upgrade.
+#[tokio::test]
+#[ignore = "live postgres: AI_MEMORY_TEST_POSTGRES_URL (postgres-ignored tier)"]
+async fn pg_rewind_root_marker_preserves_concurrently_committed_metadata_f2() {
+    let Some(pg) = connect().await else { return };
+    let root = contaminated_root(&pg, "root-race").await;
+    let (lock, holder) = hold_row_lock(&pg, &root.id).await;
+    let handle = Arc::clone(&pg);
+    let id = root.id.clone();
+    let rewind = tokio::spawn(async move {
+        handle
+            .swarm_rewind(
+                &CallerContext::for_admin_checked(ADMIN, true),
+                &id,
+                DEPTH,
+                "memory",
+                &[],
+                false,
+            )
+            .await
+    });
+    wait_blocked_behind(&pg, holder, 1).await;
+    commit_concurrent_key(lock, &root.id).await;
+    let report = rewind.await.expect("join").expect("rewind");
+    assert!(!report.already_rewound, "{report:?}");
+    let meta = metadata(&pg, &root.id).await;
+    assert_eq!(
+        meta.get("concurrent_committed"),
+        Some(&json!(true)),
+        "the concurrently committed key must survive the root marker: {meta}"
+    );
+    assert_eq!(meta["contamination"]["rewind"], json!(true), "{meta}");
+    assert_eq!(
+        meta["contamination"]["prior_lifecycle_state"],
+        json!("open"),
+        "the reversibility anchor is kept: {meta}"
+    );
+}
+
+// ---------------------------------------------------------------- F3 ----
+
+/// f1's PROBE_CONCURRENT_REWIND: two rewinds of an already-contaminated root,
+/// both parked behind a held root lock, then released together.
+#[tokio::test]
+#[ignore = "live postgres: AI_MEMORY_TEST_POSTGRES_URL (postgres-ignored tier)"]
+async fn pg_concurrent_rewinds_append_exactly_one_signed_event_f3() {
+    let Some(pg) = connect().await else { return };
+    let root = contaminated_root(&pg, "idempotency").await;
+    // A per-test issuer so a sibling cell's events cannot skew the count.
+    let issuer = format!("ai:f1fix-f3-{}", uuid::Uuid::new_v4().simple());
+    let count = || async {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM signed_events WHERE event_type = 'swarm.rewind' \
+             AND agent_id = $1",
+        )
+        .bind(&issuer)
+        .fetch_one(pg.pool())
+        .await
+        .expect("count")
+    };
+    let before = count().await;
+    let (lock, holder) = hold_row_lock(&pg, &root.id).await;
+    let mut calls = Vec::new();
+    for _ in 0..2 {
+        let (handle, id, who) = (Arc::clone(&pg), root.id.clone(), issuer.clone());
+        calls.push(tokio::spawn(async move {
+            handle
+                .swarm_rewind(
+                    &CallerContext::for_admin_checked(who, true),
+                    &id,
+                    DEPTH,
+                    "memory",
+                    &[],
+                    false,
+                )
+                .await
+        }));
+    }
+    wait_blocked_behind(&pg, holder, 2).await;
+    lock.commit().await.expect("release root");
+    let mut already = 0;
+    for c in calls {
+        let r = c.await.expect("join").expect("rewind succeeds");
+        already += usize::from(r.already_rewound);
+    }
+    assert_eq!(
+        count().await - before,
+        1,
+        "exactly ONE new swarm.rewind event"
+    );
+    assert_eq!(already, 1, "exactly one call reports already_rewound");
 }

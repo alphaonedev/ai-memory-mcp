@@ -92,3 +92,9 @@ pub(crate) fn warn_skipped_unauthorized(root_id: &str, skipped: usize) {
         );
     }
 }
+
+/// The ONE refusal text for a rewind root that does not exist — both
+/// backends, both the preview read and the locked re-read.
+pub(crate) fn rewind_root_not_found(root_id: &str) -> String {
+    format!("swarm_rewind: root memory {root_id} not found")
+}
