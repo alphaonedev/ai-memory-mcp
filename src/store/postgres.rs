@@ -9461,8 +9461,8 @@ impl PostgresStore {
                           ELSE ts_rank(tsv, to_tsquery('english', $1))
                      END
                      + (priority * 0.5)
-                     + (LEAST(access_count, 50) * 0.1)
-                     + (confidence * 2.0)
+                     + (LEAST(access_count, {cap}) * 0.1)
+                     + (CASE WHEN confidence_source = 'default' OR confidence_source IS NULL THEN 0.5 ELSE confidence END * 2.0)
                      + CASE tier
                            WHEN 'long' THEN 3.0
                            WHEN 'mid'  THEN 1.0
@@ -9526,6 +9526,7 @@ impl PostgresStore {
             // v1.0.0 R19/A3 (#1948) — fail-closed lifecycle allow-list.
             lifecycle_vis = crate::models::lifecycle_visible_clause(""),
             soft_loser_factor = crate::storage::SOFT_LOSER_SCORE_FACTOR,
+            cap = crate::models::ACCESS_SCORE_CAP,
         ))
         .bind(or_tsquery.as_deref())
         .bind(filter.namespace.as_ref())
@@ -25774,8 +25775,8 @@ impl MemoryStore for PostgresStore {
             "SELECT {cols},
                     ts_rank(tsv, to_tsquery('english', $1))
                     + (priority * 0.5)
-                    + (LEAST(access_count, 50) * 0.1)
-                    + (confidence * 2.0)
+                    + (LEAST(access_count, {cap}) * 0.1)
+                    + (CASE WHEN confidence_source = 'default' OR confidence_source IS NULL THEN 0.5 ELSE confidence END * 2.0)
                     + CASE tier
                           WHEN 'long' THEN 3.0
                           WHEN 'mid'  THEN 1.0
@@ -25812,6 +25813,7 @@ impl MemoryStore for PostgresStore {
             // v1.0.0 #2585 — explicit projection (see MEMORY_READ_COLUMNS).
             cols = MEMORY_READ_COLUMNS,
             lifecycle_vis = crate::models::lifecycle_visible_clause(""),
+            cap = crate::models::ACCESS_SCORE_CAP,
         ))
         .bind(&or_tsquery)
         .bind(filter.namespace.as_ref())
@@ -26394,57 +26396,36 @@ impl MemoryStore for PostgresStore {
         //   * expires_at — extension FLOOR per tier (#1607, the
         //     postgres twin of the sqlite #1596 fix):
         //     GREATEST(expires_at, NOW() + window) with 1h short /
-        //     1d mid windows (cleared when a mid→long promotion
-        //     fires this round). An access can extend a row's life
+        //     1d mid windows. An access can extend a row's life
         //     but can never move its expiry EARLIER — the pre-#1607
         //     replacement form pulled a fresh mid-tier row's +7d
         //     create-time backstop in to now+1d on first recall.
-        //   * tier — auto-promote mid → long once access_count + 1
-        //     would land at or above PROMOTION_THRESHOLD (5)
-        //   * updated_at — bumped only when the tier flip actually
-        //     fires, matching the original two-statement contract
-        //   * priority — bumped by 1 (capped at 10) every 10th
-        //     touch, evaluated against the post-increment / capped
-        //     access_count to remain bit-identical with the original
-        //     two-statement sequence even at the 1_000_000 ceiling
+        //   * tier / updated_at / priority — NO LONGER TOUCHED.
+        //     v1.0.0 Boids item 1 (5-agent vote 4d3ea1c5) removed the
+        //     mid→long auto-promotion, the promotion updated_at rewrite
+        //     and the priority decade ladder from this recall MAINTENANCE
+        //     verb (sqlite touch/touch_many/fold parity): recall
+        //     popularity can no longer rewrite a row's tier, recency or
+        //     priority. `memory_promote` is the sole tier-raising verb.
         //
         // All CASE predicates read the pre-UPDATE row values per the
         // SQL standard (RHS of SET evaluates against the OLD row),
         // so the `access_count + 1` / `LEAST(...)` arithmetic
         // mirrors what the original ordered sequence saw.
-        sqlx::query(&format!(
+        sqlx::query(
             "UPDATE memories SET
                 access_count = LEAST(access_count + 1, 1000000),
                 last_accessed_at = NOW(),
                 expires_at = CASE
-                    WHEN tier = 'mid' AND access_count + 1 >= 5 THEN NULL
                     WHEN tier = 'long' THEN expires_at
                     WHEN tier = 'short' AND expires_at IS NOT NULL
                         THEN GREATEST(expires_at, NOW() + INTERVAL '1 hour')
                     WHEN tier = 'mid' AND expires_at IS NOT NULL
                         THEN GREATEST(expires_at, NOW() + INTERVAL '1 day')
                     ELSE expires_at
-                END,
-                tier = CASE
-                    WHEN tier = 'mid' AND access_count + 1 >= 5 THEN 'long'
-                    ELSE tier
-                END,
-                updated_at = CASE
-                    WHEN tier = 'mid' AND access_count + 1 >= 5 THEN NOW()
-                    ELSE updated_at
-                END,
-                priority = CASE
-                    WHEN LEAST(access_count + 1, 1000000) > 0
-                         AND LEAST(access_count + 1, 1000000) % 10 = 0
-                         AND priority < {ceiling}
-                        THEN LEAST(priority + 1, {ceiling})
-                    ELSE priority
                 END
              WHERE id = ANY($1)",
-            // v1.0.0 #2339 (FBL-34) — access bumps stop at the named
-            // ceiling (sqlite touch/touch_many parity).
-            ceiling = crate::models::ACCESS_PRIORITY_CEILING,
-        ))
+        )
         .bind(ids)
         .execute(&self.pool)
         .await
@@ -29035,7 +29016,7 @@ impl MemoryStore for PostgresStore {
             // verb applying metadata-only access bookkeeping (the same
             // sanction class as the legacy touch); it never rewrites
             // memory content.
-            let folded_ids: Vec<String> = sqlx::query_scalar(&format!(
+            let folded_ids: Vec<String> = sqlx::query_scalar(
                 "WITH batch AS (
                     SELECT memory_id
                       FROM recall_observations
@@ -29058,37 +29039,20 @@ impl MemoryStore for PostgresStore {
                 )
                 UPDATE memories m SET
                     access_count = LEAST(m.access_count + a.n, 1000000),
-                    priority = CASE WHEN m.priority >= {ceiling} THEN m.priority
-                        ELSE LEAST(m.priority
-                            + (LEAST(m.access_count + a.n, 1000000) / 10
-                               - m.access_count / 10)::int, {ceiling}) END,
                     last_accessed_at = GREATEST(
                         COALESCE(m.last_accessed_at, a.t_max), a.t_max),
                     expires_at = CASE
-                        WHEN m.tier = 'mid' AND m.access_count + a.n >= 5 THEN NULL
                         WHEN m.tier = 'long' THEN m.expires_at
                         WHEN m.tier = 'short' AND m.expires_at IS NOT NULL
                             THEN GREATEST(m.expires_at, a.t_max + INTERVAL '1 hour')
                         WHEN m.tier = 'mid' AND m.expires_at IS NOT NULL
                             THEN GREATEST(m.expires_at, a.t_max + INTERVAL '1 day')
                         ELSE m.expires_at
-                    END,
-                    tier = CASE
-                        WHEN m.tier = 'mid' AND m.access_count + a.n >= 5 THEN 'long'
-                        ELSE m.tier
-                    END,
-                    updated_at = CASE
-                        WHEN m.tier = 'mid' AND m.access_count + a.n >= 5 THEN NOW()
-                        ELSE m.updated_at
                     END
                  FROM agg a
                  WHERE m.id = a.memory_id
                 RETURNING m.id",
-                // v1.0.0 #2339 (FBL-34) — the fold's decade bump stops at
-                // the named ceiling (sqlite fold_recall_accesses parity);
-                // rows already above it keep their priority byte-identical.
-                ceiling = crate::models::ACCESS_PRIORITY_CEILING,
-            ))
+            )
             .bind(chunk_limit)
             .fetch_all(&self.pool)
             .await

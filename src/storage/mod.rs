@@ -208,8 +208,8 @@ pub(crate) fn canonicalize_valid_until_stamp(valid_until: Option<&str>) -> Strin
 use crate::models::{
     AGENTS_NAMESPACE, AgentRegistration, Approval, ApproverType, ConfidenceSource, DuplicateCheck,
     DuplicateMatch, GovernanceDecision, GovernanceLevel, GovernancePolicy, GovernedAction,
-    MAX_NAMESPACE_DEPTH, Memory, MemoryKind, MemoryLink, NamespaceCount, PROMOTION_THRESHOLD,
-    PendingAction, SourceSpan, Stats, Taxonomy, TaxonomyNode, Tier, TierCount, namespace_ancestors,
+    MAX_NAMESPACE_DEPTH, Memory, MemoryKind, MemoryLink, NamespaceCount, PendingAction, SourceSpan,
+    Stats, Taxonomy, TaxonomyNode, Tier, TierCount, namespace_ancestors,
 };
 
 // #962 — typed substrate-layer error envelope. Substrate code emits
@@ -3524,7 +3524,9 @@ pub fn resolve_id(conn: &Connection, id: &str) -> Result<Option<Memory>> {
     get_by_prefix(conn, id)
 }
 
-/// Bump access count, extend TTL, auto-promote — atomic via transaction.
+/// Bump access count and extend the per-tier TTL floor — atomic via
+/// transaction. v1.0.0 Boids item 1 (5-agent vote 4d3ea1c5): this recall
+/// MAINTENANCE verb no longer auto-promotes or bumps priority.
 pub fn touch(conn: &Connection, id: &str, short_extend: i64, mid_extend: i64) -> Result<()> {
     let now = Utc::now();
     let now_str = now.to_rfc3339();
@@ -3564,20 +3566,6 @@ pub fn touch(conn: &Connection, id: &str, short_extend: i64, mid_extend: i64) ->
             params![now_str, short_expires, mid_expires, id],
         )?;
 
-        conn.execute(
-            "UPDATE memories SET tier = 'long', expires_at = NULL, updated_at = ?1
-             WHERE id = ?2 AND tier = 'mid' AND access_count >= ?3",
-            params![now_str, id, PROMOTION_THRESHOLD],
-        )?;
-
-        // v1.0.0 #2339 (FBL-34) — access-driven bumps stop at the named
-        // ceiling; rows already above it (operator band 8-10) are untouched.
-        conn.execute(
-            "UPDATE memories SET priority = MIN(priority + 1, ?2)
-             WHERE id = ?1 AND access_count > 0 AND access_count % 10 = 0 AND priority < ?2",
-            params![id, crate::models::ACCESS_PRIORITY_CEILING],
-        )?;
-
         Ok(())
     })();
 
@@ -3599,10 +3587,11 @@ pub fn touch(conn: &Connection, id: &str, short_extend: i64, mid_extend: i64) ->
 /// collapses the per-row `BEGIN IMMEDIATE` … `COMMIT` cycle into a
 /// SINGLE outer transaction so a K-row batch pays the SQLite
 /// write-lock + commit cost ONCE instead of K times. The three
-/// per-row UPDATE statements still run (same semantics: access bump
-/// + TTL extend, mid→long promotion at `PROMOTION_THRESHOLD`,
-/// priority+1 every 10 accesses); only the transaction framing
-/// changes.
+/// per-row UPDATE now applies only the access bump + per-tier TTL
+/// floor-extend; v1.0.0 Boids item 1 (5-agent vote 4d3ea1c5) removed
+/// the mid→long promotion and the priority decade ladder from this
+/// recall MAINTENANCE verb (`memory_promote` is the sole tier-raising
+/// verb). Only the transaction framing differs from [`touch`].
 ///
 /// v0.9.0 P0-1 (#1869) — this is the EXPLICIT touch verb and stays
 /// ungated. v1.0.0 (#1953): the RECALL paths no longer call it at
@@ -3673,20 +3662,8 @@ pub fn touch_many(
                 END
              WHERE id = ?4",
         )?;
-        let mut promote_stmt = conn.prepare_cached(
-            "UPDATE memories SET tier = 'long', expires_at = NULL, updated_at = ?1
-             WHERE id = ?2 AND tier = 'mid' AND access_count >= ?3",
-        )?;
-        // v1.0.0 #2339 (FBL-34) — access-driven bumps stop at the named
-        // ceiling; rows already above it (operator band 8-10) are untouched.
-        let mut priority_stmt = conn.prepare_cached(
-            "UPDATE memories SET priority = MIN(priority + 1, ?2)
-             WHERE id = ?1 AND access_count > 0 AND access_count % 10 = 0 AND priority < ?2",
-        )?;
         for id in ids {
             bump_stmt.execute(params![now_str, short_expires, mid_expires, id])?;
-            promote_stmt.execute(params![now_str, id, PROMOTION_THRESHOLD])?;
-            priority_stmt.execute(params![id, crate::models::ACCESS_PRIORITY_CEILING])?;
         }
         Ok(())
     })();
@@ -3718,12 +3695,6 @@ pub fn touch_many(
 ///   extension anchored on the LAST observation, which is what the
 ///   legacy per-recall MAX chain converged to; `long` / NULL-expiry
 ///   rows untouched)
-/// * mid→long promotion at `access_count' >= PROMOTION_THRESHOLD`
-///   (`expires_at = NULL`, `updated_at = now`)
-/// * `priority = MIN(priority + (ac'/10 − ac/10), 10)` — decade
-///   boundaries crossed ≡ the legacy per-step `% 10 == 0` firing
-///   (the sole divergence is at the 1M access ceiling, where the
-///   legacy per-step form kept firing; accepted, documented)
 /// * when `AI_MEMORY_CONFIDENCE_DECAY=1`, the confidence-decay stamp
 ///   ([`crate::confidence::decay::apply_decay_touch`]) moves off the
 ///   recall path onto the fold
@@ -3801,23 +3772,22 @@ pub fn fold_recall_accesses(
             if agg.is_empty() {
                 return Ok(0);
             }
-            let now_str = Utc::now().to_rfc3339();
             // APPEND-ONLY-SANCTIONED (#1823 G6 / #1869 P0-1) —
             // forward-compat documentation for the append-only
             // discipline: these UPDATEs are the explicit FOLD
             // maintenance verb applying metadata-only access
             // bookkeeping (the same sanction class as the legacy
             // touch); they never rewrite memory content.
-            // v1.0.0 #2339 (FBL-34) — the fold's decade bump stops at the
-            // named ceiling; rows already above it (operator band 8-10)
-            // keep their priority byte-identical.
-            let mut bump_stmt = conn.prepare_cached(&format!(
+            // v1.0.0 Boids item 1 (5-agent vote 4d3ea1c5) — the fold no
+            // longer ESCALATES: the mid→long promotion, its updated_at
+            // rewrite and the priority decade ladder are removed, so recall
+            // popularity cannot rewrite a row's tier, recency or priority
+            // (memory_promote is the sole tier-raising verb). The fold still
+            // applies access_count (cap 1M), last_accessed_at and the
+            // per-tier TTL floor-extend (#1596).
+            let mut bump_stmt = conn.prepare_cached(
                 "UPDATE memories SET
                     access_count = MIN(access_count + ?1, 1000000),
-                    priority = CASE WHEN priority >= {ceiling} THEN priority
-                        ELSE MIN(priority
-                            + (MIN(access_count + ?1, 1000000) / 10 - access_count / 10),
-                            {ceiling}) END,
                     last_accessed_at = CASE
                         WHEN last_accessed_at IS NULL OR last_accessed_at < ?2 THEN ?2
                         ELSE last_accessed_at
@@ -3829,11 +3799,6 @@ pub fn fold_recall_accesses(
                         ELSE expires_at
                     END
                  WHERE id = ?5",
-                ceiling = crate::models::ACCESS_PRIORITY_CEILING,
-            ))?;
-            let mut promote_stmt = conn.prepare_cached(
-                "UPDATE memories SET tier = 'long', expires_at = NULL, updated_at = ?1
-                 WHERE id = ?2 AND tier = 'mid' AND access_count >= ?3",
             )?;
             let mut mark_stmt = conn.prepare_cached(
                 "UPDATE recall_observations SET folded = 1
@@ -3858,7 +3823,6 @@ pub fn fold_recall_accesses(
                     t_max + chrono::Duration::seconds(mid_extend),
                 );
                 bump_stmt.execute(params![n, t_max_str, short_exp, mid_exp, id])?;
-                promote_stmt.execute(params![now_str, id, PROMOTION_THRESHOLD])?;
                 if decay {
                     // #1572 parity — the decay stamp moves off the
                     // recall path onto the fold.
@@ -8158,8 +8122,8 @@ pub fn search_with_source_uri(
            {lifecycle_vis}
          ORDER BY ((fts.rank * -1)
            + (m.priority * 0.5)
-           + (MIN(m.access_count, 50) * 0.1)
-           + (m.confidence * 2.0)
+           + (MIN(m.access_count, {cap}) * 0.1)
+           + (CASE WHEN m.confidence_source = 'default' OR m.confidence_source IS NULL THEN 0.5 ELSE m.confidence END * 2.0)
            + (1.0 / (1.0 + (julianday('now') - julianday(m.updated_at)) * 0.1)))
            -- v1.0.0 #2338 (FBL-33) — G7 soft-loser down-weight (see recall).
            * (CASE WHEN json_extract(m.metadata, '$.contradiction_soft_loser') = 1
@@ -8175,6 +8139,7 @@ pub fn search_with_source_uri(
         soft_loser_factor = SOFT_LOSER_SCORE_FACTOR,
         // #3279 — instant-based `created_at` since/until window (?6/?7).
         created_at_window = created_at_instant_window("m.", 6, 7),
+        cap = crate::models::ACCESS_SCORE_CAP,
     );
     // #3279 — canonicalize the since/until bounds so the SQL `strftime`
     // comparison (which also normalizes the stored column) is exactly
@@ -8754,8 +8719,8 @@ pub fn recall(
         "SELECT {cols},
                 ((fts.rank * -1)
                 + (m.priority * 0.5)
-                + (MIN(m.access_count, 50) * 0.1)
-                + (m.confidence * 2.0)
+                + (MIN(m.access_count, {cap}) * 0.1)
+                + (CASE WHEN m.confidence_source = 'default' OR m.confidence_source IS NULL THEN 0.5 ELSE m.confidence END * 2.0)
                 + (CASE m.tier WHEN 'long' THEN 3.0 WHEN 'mid' THEN 1.0 ELSE 0.0 END)
                 + (1.0 / (1.0 + (julianday('now') - julianday(m.updated_at)) * 0.1)))
                 -- v1.0.0 #2338 (FBL-33) — the promised G7 soft down-weight:
@@ -8796,6 +8761,7 @@ pub fn recall(
         soft_loser_factor = SOFT_LOSER_SCORE_FACTOR,
         // #3279 — instant-based `created_at` since/until window (?5/?6).
         created_at_window = created_at_instant_window("m.", 5, 6),
+        cap = crate::models::ACCESS_SCORE_CAP,
     );
     // #3279 — canonicalize the since/until bounds; the SQL `strftime`
     // normalizes both sides so byte order equals instant order.
@@ -20822,8 +20788,8 @@ fn fts_keyword_phase(
     let fts_limit = limit.saturating_mul(3).max(30);
     let fts_sql = format!(
         "SELECT {cols}, m.embedding, m.{emb_space_col},
-                (fts.rank * -1) + (m.priority * 0.5) + (MIN(m.access_count, 50) * 0.1)
-                + (m.confidence * 2.0)
+                (fts.rank * -1) + (m.priority * 0.5) + (MIN(m.access_count, {cap}) * 0.1)
+                + (CASE WHEN m.confidence_source = 'default' OR m.confidence_source IS NULL THEN 0.5 ELSE m.confidence END * 2.0)
                 + (CASE m.tier WHEN 'long' THEN 3.0 WHEN 'mid' THEN 1.0 ELSE 0.0 END)
                 + (1.0 / (1.0 + (julianday('now') - julianday(m.updated_at)) * 0.1))
                 AS fts_score
@@ -20861,6 +20827,7 @@ fn fts_keyword_phase(
         // v1.0.0 R19/A3 (#1948) — fail-closed lifecycle allow-list on the
         // hybrid-recall FTS branch.
         lifecycle_vis = crate::models::lifecycle_visible_clause("m"),
+        cap = crate::models::ACCESS_SCORE_CAP,
     );
     // #3279 — canonicalize the since/until bounds; the SQL `strftime`
     // normalizes the stored column and the bound identically, so byte
@@ -30842,18 +30809,21 @@ mod tests {
         conn
     }
 
-    /// Test 1 — the access-count auto-promote (fold/touch MAINTENANCE verb) is
-    /// COURT-BLIND: a `mid` row in a `promote: Owner` namespace still flips to
-    /// `long` at `PROMOTION_THRESHOLD`, because the fold is callerless frecency
-    /// bookkeeping and never consults the promote court.
+    /// Test 1 — v1.0.0 Boids item 1 (5-agent vote 4d3ea1c5): the recall
+    /// MAINTENANCE verb no longer auto-promotes. `touch` on a `mid` row whose
+    /// access_count crosses the historical `PROMOTION_THRESHOLD` leaves the tier
+    /// `mid` — recall popularity can no longer rewrite a row's tier, so the
+    /// court-blindness question is moot (there is no callerless tier change to
+    /// gate). `memory_promote` remains the sole tier-raising verb (still court-
+    /// gated — Test 2).
     #[test]
-    fn g10_3_access_count_auto_promote_is_court_blind() {
+    fn g10_3_touch_no_longer_auto_promotes() {
         let ns = "g10-3/court";
         let conn = court_ns_conn(ns);
         let mut m = make_memory("hot", ns, Tier::Mid, 5);
-        m.access_count = PROMOTION_THRESHOLD - 1;
+        m.access_count = crate::models::PROMOTION_THRESHOLD - 1;
         let id = insert(&conn, &m).unwrap();
-        // Drive the maintenance auto-promote (one bump crosses the threshold).
+        // One bump crosses the historical threshold; post-R2 it must NOT promote.
         touch(
             &conn,
             &id,
@@ -30861,17 +30831,22 @@ mod tests {
             crate::models::MID_TTL_EXTEND_SECS,
         )
         .unwrap();
-        let tier: String = conn
+        let (tier, access_count): (String, i64) = conn
             .query_row(
-                "SELECT tier FROM memories WHERE id = ?1",
+                "SELECT tier, access_count FROM memories WHERE id = ?1",
                 params![id],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
         assert_eq!(
-            tier, "long",
-            "access-count auto-promote is maintenance-exempt / court-blind (G10.3 §13); \
-             a v1.x suppress-in-adjudicated-namespaces opt-in would keep it 'mid'"
+            tier, "mid",
+            "post-Boids-R2 touch does not auto-promote — recall popularity no \
+             longer rewrites tier (memory_promote is the sole tier-raising verb)"
+        );
+        assert_eq!(
+            access_count,
+            crate::models::PROMOTION_THRESHOLD,
+            "access_count still folds (the bump the fold/touch keeps)"
         );
     }
 

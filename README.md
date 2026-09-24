@@ -1233,8 +1233,8 @@ Every recall query ranks memories by 6 factors:
 ```
 score = (fts_relevance * -1)
       + (priority * 0.5)
-      + (MIN(access_count, 50) * 0.1)
-      + (confidence * 2.0)
+      + (MIN(access_count, 10) * 0.1)          -- ACCESS_SCORE_CAP=10 ⇒ max +1.0 (Boids item 1)
+      + (confidence_provenance * 2.0)         -- unassessed/NULL provenance ⇒ neutral 0.5
       + tier_boost
       + recency_decay
 ```
@@ -1243,10 +1243,34 @@ score = (fts_relevance * -1)
 |--------|--------|-------|
 | FTS relevance | -1.0x | SQLite FTS5 rank (negative = better match) |
 | Priority | 0.5x | User-assigned 1-10 scale |
-| Access count | 0.1x | How often recalled (capped at 50 for scoring) |
-| Confidence | 2.0x | 0.0-1.0 certainty score |
+| Access count | 0.1x | How often recalled (capped at `ACCESS_SCORE_CAP` = 10 for scoring ⇒ max +1.0, Boids item 1) |
+| Confidence | 2.0x | 0.0-1.0 certainty; **provenance-aware** — an unassessed row (caller omitted confidence, or a NULL provenance) scores neutral 0.5 |
 | Tier boost | +3.0 / +1.0 / +0.0 | long / mid / short |
 | Recency decay | `1/(1 + days*0.1)` | Recent memories rank higher |
+
+> **Trust posture (GA disclosure, Boids items 1+2 / #3922, 5-agent vote `4d3ea1c5`).**
+> At v1.0.0 recall popularity is capped (+1.0 max) and no longer escalates
+> priority or tier; unassessed rows score as neutral confidence. Per-reader
+> trust weighting (distinct readers) is NOT in GA — it needs bound reader
+> identity in the recall ledger (v1.1, with items 4-6). Note the residual:
+> **priority, tier and an explicit confidence remain caller-asserted and
+> unattested and now dominate the score** (a writer declaring priority 10 /
+> tier long / confidence 1.0 earns ~+10.0 of self-asserted rank with zero
+> reads); the controls for declaration-gaming — corroboration and
+> Sybil-correct independent writers (plan items 5-6) — are behind the
+> benchmark gate, not in GA.
+> A quantified residual on the confidence term: the schema-v39 SQLite
+> migration added `confidence_source` as `TEXT NOT NULL DEFAULT
+> 'caller_provided'`, so **every row predating v39 was backfilled to
+> `caller_provided` and keeps the full +2.0** — and those are the oldest,
+> most-recalled rows. The same holds on Postgres, whose `memories`
+> `confidence_source` is likewise `NOT NULL DEFAULT 'caller_provided'`
+> (bootstrap + migrate_v38), so legacy rows there are also backfilled to
+> `caller_provided`. Only a `'default'` provenance (caller omitted
+> confidence) is neutralised; a legacy `caller_provided` row is
+> indistinguishable from an explicit caller value and is not. (The CASE's
+> `OR ... IS NULL` arm is defensive-dead on `memories`, NOT NULL on both
+> backends.)
 
 ---
 

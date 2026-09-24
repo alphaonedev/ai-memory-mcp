@@ -714,6 +714,32 @@ real but scoped — this section states the residual bounds honestly
 rather than overclaiming, per the North Star (degrade, never corrupt
 or overclaim).
 
+- **Recall trust weighting is bounded (Boids items 1+2, #3922, 5-agent
+  vote `4d3ea1c5`).** At v1.0.0 recall popularity is capped (+1.0 max,
+  `models::ACCESS_SCORE_CAP` = 10) and no longer escalates priority or
+  tier (the fold/touch maintenance verbs stopped auto-promoting and
+  stopped the priority decade ladder on both backends); unassessed rows
+  (caller omitted confidence ⇒ `confidence_source='default'`, or a
+  genuinely-unattested NULL provenance) score as neutral confidence.
+  Per-reader trust weighting (distinct readers) is NOT in GA — it needs
+  bound reader identity in the recall ledger (v1.1, with items 4-6). The
+  residual, stated plainly: **priority, tier and an explicit confidence
+  remain caller-asserted and unattested and now dominate the score** — a
+  writer declaring priority 10 / tier long / confidence 1.0 earns ~+10.0
+  of self-asserted rank with zero reads; the controls for
+  declaration-gaming — corroboration and Sybil-correct independent
+  writers (plan items 5-6) — are behind the benchmark gate, not in GA.
+  A quantified residual on the confidence term: the schema-v39 SQLite
+  migration added `confidence_source` as `TEXT NOT NULL DEFAULT
+  'caller_provided'`, so every row predating v39 was backfilled to
+  `caller_provided` and keeps the full +2.0 — and those are the oldest,
+  most-recalled rows. The same holds on Postgres (its `memories`
+  `confidence_source` is also `NOT NULL DEFAULT 'caller_provided'`), so
+  legacy rows there are backfilled identically. Only a `'default'`
+  provenance is neutralised; a legacy `caller_provided` row is
+  indistinguishable from an explicit caller value. The CASE's
+  `OR ... IS NULL` arm is defensive-dead on `memories` (NOT NULL on both
+  backends).
 - **Tamper-evidence bounds (interior-rewrite residual).** The
   `signed_events` cross-row hash chain plus the #1850 forensic
   watermark and the #1873/#2202 head-hash anchor detect **tail

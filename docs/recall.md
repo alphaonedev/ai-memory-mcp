@@ -6,13 +6,13 @@ layout: doc
 `memory_recall` (MCP) / `POST /api/v1/recall` (HTTP) / `ai-memory recall`
 (CLI) returns the highest-ranked memories matching a query context.
 Recall is multi-stage and **never read-only** — every successful recall
-mutates the database (touch, TTL extension, auto-promotion).
+mutates the database (touch, TTL extension — but NOT tier/priority escalation, removed at v1.0.0 by Boids item 1, vote 4d3ea1c5).
 
 ## Pipeline
 
 1. **FTS5 keyword search** — fuzzy OR query over the bundled SQLite
    `memories_fts` virtual table; scored by
-   `(fts.rank * -1) + priority*0.5 + MIN(access_count, 50)*0.1 + confidence*2.0 + tier_bonus + recency_factor`
+   `(fts.rank * -1) + priority*0.5 + MIN(access_count, 10)*0.1 + (CASE WHEN confidence_source='default' OR confidence_source IS NULL THEN 0.5 ELSE confidence END)*2.0 + tier_bonus + recency_factor` (v1.0.0 Boids item 1, vote 4d3ea1c5: popularity capped at `ACCESS_SCORE_CAP`=10 ⇒ max +1.0; confidence reads provenance so an unassessed/NULL row scores neutral 0.5)
    (the access-count term is capped at 50 so high-traffic rows can't
    dominate; tier bonus is long=3.0 / mid=1.0 / short=0).
 2. **Semantic search** — cosine similarity via the in-memory HNSW index
@@ -38,7 +38,7 @@ mutates the database (touch, TTL extension, auto-promotion).
    TTL floor-extend (`expires_at = MAX(expires_at, now + 1h)` short /
    `MAX(expires_at, now + 1d)` mid, an access can never move an expiry
    earlier per [#1596](https://github.com/alphaonedev/ai-memory-mcp/issues/1596);
-   long-tier rows are untouched), auto-promote mid → long at 5 accesses,
+   long-tier rows are untouched). v1.0.0 Boids item 1 (vote 4d3ea1c5) REMOVED the recall-driven mid→long auto-promote and the priority ladder;
    increment priority every 10 — are applied out of band by the periodic
    fold job (`db::fold_recall_accesses`, default every 60 s, plus a fold
    at the top of every GC tick), never inline on the recall path.
