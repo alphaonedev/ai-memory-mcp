@@ -538,6 +538,26 @@ pub trait DecisionProvider: fmt::Debug + Send + Sync {
         let _ = capability;
         true
     }
+
+    /// Judge `prompt` yes/no WITHOUT any fallback leg (#3806 W4).
+    ///
+    /// For a leaf provider this is [`Self::judge`]. For a chain it asks
+    /// the PRIMARY only and returns its answer verbatim — an abstain the
+    /// chain would otherwise re-ask of its generative stand-in comes back
+    /// as that abstain. A seam whose v1.0.0 instrument was NO decision
+    /// (the consolidation merge judge, a narrowing gate on the delete
+    /// path) calls this: "falling back" there has nothing to fall back
+    /// TO, so the stand-in call would POST memory content across the
+    /// egress boundary for an answer the seam discards by construction.
+    ///
+    /// Deliberately NOT defaulted (5-agent vote `4d3ea1c5`, W4): a default
+    /// body of `self.judge(prompt)` is the permissive arm, and a hand-
+    /// forwarding wrapper that forgot the override would silently put the
+    /// stand-in back with no failing test — the `AutonomyLlm::judge_merge`
+    /// / `SwappableLlm` lesson. Required, a forgetful wrapper is a compile
+    /// error. A wrapper implements it as `inner.judge_primary(prompt)`,
+    /// never `inner.judge(prompt)`.
+    async fn judge_primary(&self, prompt: &str) -> Judgement;
 }
 
 /// #3806 R6 — the three questions a [`DecisionProvider`] can be asked.
@@ -598,6 +618,10 @@ impl DecisionProvider for NullDecider {
     async fn judge(&self, _prompt: &str) -> Judgement {
         Judgement::abstain(AbstainReason::NoProvider, DecisionSource::Deterministic)
     }
+
+    async fn judge_primary(&self, prompt: &str) -> Judgement {
+        self.judge(prompt).await
+    }
 }
 
 /// The process-wide absent-provider singleton.
@@ -639,6 +663,10 @@ mod tests {
         }
         async fn judge(&self, _prompt: &str) -> Judgement {
             Judgement::decided(true, Some(0.75), DecisionSource::DecisionModel)
+        }
+
+        async fn judge_primary(&self, prompt: &str) -> Judgement {
+            self.judge(prompt).await
         }
     }
 

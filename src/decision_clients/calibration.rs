@@ -74,6 +74,32 @@ impl CalibrationSeam {
             Self::ConsolidationMerge => "consolidation_merge",
         }
     }
+
+    /// The confidence a decided `yes` must carry before a DESTRUCTIVE seam
+    /// acts on it (#3806 W4, GOD ruling 3). `None` — the seam thresholds
+    /// nothing and uses verdicts as-is (the two W2 seams). `Some(floor)` —
+    /// the seam permits ONLY through `Decision::is_confident_at_least`,
+    /// which an absent confidence never clears, so a `yes` without
+    /// evidence is treated as an abstain there.
+    ///
+    /// `Option` rather than `0.0`: a floor of zero is NOT "no floor" —
+    /// `is_confident_at_least(0.0)` still refuses an ABSENT confidence,
+    /// which would silently change what a W2 seam means if it were ever
+    /// routed through here. Whether a seam thresholds at all belongs in
+    /// the type. ONE accessor for every destructive seam: a unit that adds
+    /// one adds an arm here with its own named const, not a comparison in
+    /// its seam function (f2r, 3806-W3-THRESHOLD-COORDINATE-WITH-W4-FLOOR).
+    #[must_use]
+    pub fn confidence_floor(self) -> Option<f64> {
+        match self {
+            Self::ClassifyKind | Self::DetectContradiction => None,
+            // W3 wires this arm with its own named const and ruling.
+            Self::SynthesisVerdict => None,
+            Self::ConsolidationMerge => {
+                Some(crate::decision_seams::CONSOLIDATION_MERGE_CONFIDENCE_FLOOR)
+            }
+        }
+    }
 }
 
 impl std::fmt::Display for CalibrationSeam {
@@ -210,6 +236,40 @@ impl CalibrationRow {
 
 #[cfg(test)]
 mod tests {
+    /// #3806 W4 — the per-seam floor is ONE accessor: the merge seam
+    /// thresholds at the named const, the W2 seams threshold nothing,
+    /// and `None` is distinguishable from a zero floor (an absent
+    /// confidence never clears any `Some`, however low).
+    #[test]
+    fn confidence_floor_is_some_only_on_the_merge_seam_today() {
+        use super::CalibrationSeam;
+        assert_eq!(
+            CalibrationSeam::ConsolidationMerge.confidence_floor(),
+            Some(crate::decision_seams::CONSOLIDATION_MERGE_CONFIDENCE_FLOOR)
+        );
+        assert!(
+            (CalibrationSeam::ConsolidationMerge
+                .confidence_floor()
+                .unwrap()
+                - 0.80)
+                .abs()
+                < f64::EPSILON
+        );
+        assert_eq!(CalibrationSeam::ClassifyKind.confidence_floor(), None);
+        assert_eq!(
+            CalibrationSeam::DetectContradiction.confidence_floor(),
+            None
+        );
+        // A `yes` with NO confidence clears no `Some` floor, even 0.0 —
+        // which is why "no floor" is `None` and not `Some(0.0)`.
+        let bare_yes = crate::decision::Judgement::decided(
+            true,
+            None,
+            crate::decision::DecisionSource::DecisionModel,
+        );
+        assert!(!bare_yes.is_confident_at_least(0.0));
+    }
+
     use super::*;
     use crate::decision::AbstainReason;
 

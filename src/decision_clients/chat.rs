@@ -415,6 +415,11 @@ impl DecisionProvider for OpenAiCompatibleDecider {
         let confidence = Self::confidence_for(&answer, token);
         Judgement::decided(token == super::VERDICT_YES, confidence, NETWORK_SOURCE)
     }
+
+    /// A leaf has no fallback leg: primary-only IS `judge` (#3806 W4).
+    async fn judge_primary(&self, prompt: &str) -> Judgement {
+        self.judge(prompt).await
+    }
 }
 
 /// The two things a structured response carries: the schema field, and

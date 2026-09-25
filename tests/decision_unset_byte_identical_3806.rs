@@ -243,6 +243,15 @@ const DECIDER_ALLOWED: &[&str] = &[
     // type its decision series are keyed on (a label SINK, never a call
     // site: it cannot obtain or consult a decider).
     "src/metrics.rs",
+    // #3806 W4 — the two CONSOLIDATION funnels. They name
+    // `decision_seams::MergeJudgement` / `crate::decision::DecisionSource`
+    // only to READ the verdict `AutonomyLlm::judge_merge` returns and to
+    // label their reports; the judge itself runs in `decision_seams.rs`
+    // on the handle `attach_decider` attached. Neither obtains a decider:
+    // no `build_decision_provider`, no `attach_decider`, no handle type
+    // (all three pinned below), so the chokepoint stays the ONE source.
+    "src/autonomy.rs",
+    "src/curator/compaction.rs",
 ];
 
 /// The chokepoint entry points (`build_decision_provider`,

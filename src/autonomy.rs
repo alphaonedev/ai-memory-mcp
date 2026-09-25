@@ -52,18 +52,31 @@ pub(crate) const CURATOR_SOURCE_LABEL: &str = "ai-memory curator (autonomy)";
 
 /// Minimum Jaccard-keyword overlap required to treat two memories as
 /// "near-duplicates" candidates for a consolidation cluster. Tuned
-/// loosely — the merge decision is NOT judged by a model. A pair merges
-/// iff it clears BOTH this pre-filter AND the stored-embedding cosine
-/// gate at [`CONSOLIDATE_COSINE_THRESHOLD`]; those two fixed thresholds
-/// are the whole predicate (`find_consolidation_clusters`). The model's
-/// only role in `consolidate_cluster` is to write the summary TEXT via
-/// `AutonomyLlm::summarize_memories`, after the cluster is already
-/// decided — nothing between that call and the destructive
-/// `db::consolidate` re-examines whether the merge should happen. (The
-/// call does propagate its error, so an LLM *failure* aborts the merge;
-/// that makes the model a hard dependency, not an arbiter.) The SAL
-/// successor states the same contract in `src/curator/compaction.rs`,
-/// where the per-pair decision is the pure `curator::cluster::pair_merges`.
+/// loosely. Whether a model judges the merge has THREE cases (#3806 W4):
+///
+/// * `[decision]` UNSET (the default) — **no model judges.** A pair
+///   merges iff it clears BOTH this pre-filter AND the stored-embedding
+///   cosine gate at [`CONSOLIDATE_COSINE_THRESHOLD`]; those two fixed
+///   thresholds are the whole predicate (`find_consolidation_clusters`),
+///   and the model's only role in `consolidate_cluster` is to write the
+///   summary TEXT via `AutonomyLlm::summarize_memories` after the cluster
+///   is decided. (The summary call propagates its error, so an LLM
+///   *failure* aborts the merge; that makes the model a hard dependency,
+///   not an arbiter.)
+/// * `[decision]` SET and the judge answered **yes** with a calibrated
+///   confidence at or above
+///   [`crate::decision_seams::CONSOLIDATION_MERGE_CONFIDENCE_FLOOR`] — a
+///   model PERMITTED the merge, which only confirms what the two fixed
+///   gates had already admitted.
+/// * everything else with `[decision]` SET (judge unavailable,
+///   declined, decided no, or a yes without a sufficient confidence) —
+///   the merge is BLOCKED and the sources are untouched.
+///
+/// The judge is therefore a NARROWING third gate behind Jaccard AND
+/// cosine (`AutonomyLlm::judge_merge`): it can veto a cluster those two
+/// admitted and can never cause one they refused. The SAL successor
+/// states the same contract in `src/curator/compaction.rs`, where the
+/// per-pair decision is the pure `curator::cluster::pair_merges`.
 ///
 /// v0.7.0 R3-S2 — Jaccard is a *cheap pre-filter* (O(N) per pair);
 /// cosine on the 384d MiniLM embeddings is the primary signal at
@@ -158,6 +171,30 @@ pub trait AutonomyLlm {
     ) -> Result<Option<crate::models::MemoryKind>> {
         Ok(None)
     }
+
+    /// #3806 W4 — the consolidation MERGE JUDGE: a NARROWING third gate
+    /// behind Jaccard AND cosine. Asked about a cluster those two gates
+    /// have already admitted, and its answer can only REMOVE the cluster:
+    /// [`MergeJudgement::Block`] leaves every source untouched;
+    /// [`MergeJudgement::Permit`] confirms what the fixed gates decided.
+    ///
+    /// The default is [`MergeJudgement::NoDecider`] — "there is no judge",
+    /// which is NOT a permit: it is the `[decision]`-unset arm and means
+    /// the funnel runs exactly its v1.0.0 body. The 17 stub/mock impls
+    /// therefore compile unchanged; only the real [`OllamaClient`]
+    /// overrides it (the [`Self::classify_kind`] precedent).
+    ///
+    /// # Errors
+    /// Only under `[decision].fallback = "refuse"`, and only when the
+    /// provider was UNAVAILABLE (case 2): the operator asked for the
+    /// consolidation to fail loudly rather than proceed without a
+    /// judgement. A decline is never an error.
+    fn judge_merge(
+        &self,
+        _members: &[(String, String)],
+    ) -> Result<crate::decision_seams::MergeJudgement> {
+        Ok(crate::decision_seams::MergeJudgement::NoDecider)
+    }
 }
 
 impl AutonomyLlm for OllamaClient {
@@ -179,6 +216,12 @@ impl AutonomyLlm for OllamaClient {
         content: &str,
     ) -> Result<Option<crate::models::MemoryKind>> {
         Self::classify_kind(self, title, content)
+    }
+    fn judge_merge(
+        &self,
+        members: &[(String, String)],
+    ) -> Result<crate::decision_seams::MergeJudgement> {
+        crate::decision_seams::judge_merge(self, members)
     }
 }
 
@@ -257,6 +300,19 @@ impl RollbackEntry {
 pub struct AutonomyPassReport {
     pub clusters_formed: usize,
     pub memories_consolidated: usize,
+    /// #3806 W4 — the merge judge's counters for a REAL run (blocked /
+    /// permitted / who answered / why blocked). `None` whenever
+    /// `[decision]` is unset — the judge is never consulted, and the key
+    /// is OMITTED from every serialized form so the unset output stays
+    /// byte-identical to v1.0.0 (GOD ruling, 3806-W3W4-DESIGN-RULINGS).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_judge: Option<crate::decision_seams::MergeJudgeReport>,
+    /// #3806 W4 (D4) — a DRY run's judge counters, under their own key: a
+    /// PREVIEW of what the judge would say, labelled by DecisionSource and
+    /// block reason. Not a claim that any hook would permit. `None` when
+    /// `[decision]` is unset, or in a real run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub judge_preview: Option<crate::decision_seams::MergeJudgeReport>,
     pub memories_forgotten: usize,
     pub priority_adjustments: usize,
     /// Rollback rows actually PERSISTED this pass. A dry-run persists
@@ -396,7 +452,21 @@ pub fn run_autonomy_passes(
             }
             report.operations_attempted += 1;
             match consolidate_cluster(conn, llm, &cluster, dry_run) {
-                Ok(Some(ClusterOutcome { entry, persisted })) => {
+                Ok(ClusterStep::Done(ClusterOutcome {
+                    entry,
+                    persisted,
+                    judge,
+                })) => {
+                    // #3806 W4 — a judge that PERMITTED is counted and labelled
+                    // by source; `NoDecider` (the v1.0.0 path) notes nothing and
+                    // creates no report, so the unset output is unchanged. A
+                    // dry run's counters live under `judge_preview` (D4).
+                    let slot = if dry_run {
+                        &mut report.judge_preview
+                    } else {
+                        &mut report.merge_judge
+                    };
+                    crate::decision_seams::MergeJudgeReport::note(slot, &judge);
                     // #3692 — real mode persisted the entry write-ahead (and
                     // committed it); the dry run counts a simulated row.
                     let proceed = if persisted {
@@ -410,7 +480,17 @@ pub fn run_autonomy_passes(
                     }
                     halted = !proceed;
                 }
-                Ok(None) => {}
+                // #3806 W4 — the third gate fired: counted, labelled by who
+                // answered, nothing touched, nothing to roll back.
+                Ok(ClusterStep::Blocked(judgement)) => {
+                    let slot = if dry_run {
+                        &mut report.judge_preview
+                    } else {
+                        &mut report.merge_judge
+                    };
+                    crate::decision_seams::MergeJudgeReport::note(slot, &judgement);
+                }
+                Ok(ClusterStep::Skipped) => {}
                 Err(e) => {
                     let text = format!("consolidate failed: {e}");
                     // #3692 — an unwritable rollback log halts the destructive
@@ -626,6 +706,44 @@ fn jaccard_similarity(a: &str, b: &str) -> f64 {
 struct ClusterOutcome {
     entry: RollbackEntry,
     persisted: bool,
+    /// #3806 W4 — the judge's answer for this cluster: a `Permit` when a
+    /// judge was consulted, `NoDecider` on the v1.0.0 path (not a permit).
+    judge: crate::decision_seams::MergeJudgement,
+}
+
+/// #3806 W4 — what `consolidate_cluster` did with one cluster.
+///
+/// Three arms, not `Option`, because "the cluster was skipped" and "the
+/// merge judge BLOCKED the cluster" are different facts the pass report
+/// must count differently: a skip is a non-event, a block is the third
+/// gate firing after Jaccard and cosine had admitted the cluster.
+enum ClusterStep {
+    /// Too small, or inside a reserved namespace. Nothing consulted.
+    Skipped,
+    /// The merge judge said no (or could not say yes). Sources untouched;
+    /// no summary was requested. Carries the whole `Block` judgement so the
+    /// report can label it by source AND reason.
+    Blocked(crate::decision_seams::MergeJudgement),
+    /// Consolidated (real run) or would have been (dry run).
+    Done(ClusterOutcome),
+}
+
+#[cfg(test)]
+impl ClusterStep {
+    /// The outcome when the cluster was consolidated (or previewed);
+    /// `None` for a skip or a block.
+    fn into_outcome(self) -> Option<ClusterOutcome> {
+        match self {
+            Self::Done(outcome) => Some(outcome),
+            Self::Skipped | Self::Blocked(_) => None,
+        }
+    }
+
+    /// Nothing was consulted and nothing happened (too small, or a
+    /// reserved namespace).
+    fn is_skipped(&self) -> bool {
+        matches!(self, Self::Skipped)
+    }
 }
 
 /// v1.0.0 #3692 — the ONE error text for a write-ahead that could not be
@@ -639,20 +757,43 @@ fn consolidate_cluster(
     llm: &dyn AutonomyLlm,
     cluster: &[Memory],
     dry_run: bool,
-) -> Result<Option<ClusterOutcome>> {
+) -> Result<ClusterStep> {
     if cluster.len() < 2 {
-        return Ok(None);
+        return Ok(ClusterStep::Skipped);
     }
     // Skip clusters inside reserved namespaces (defensive; already
     // filtered at find_consolidation_clusters).
     if cluster.iter().any(|m| m.namespace.starts_with('_')) {
-        return Ok(None);
+        return Ok(ClusterStep::Skipped);
     }
 
     let input: Vec<(String, String)> = cluster
         .iter()
         .map(|m| (m.title.clone(), m.content.clone()))
         .collect();
+    // #3806 W4 — the merge judge, a NARROWING third gate. It runs AFTER
+    // Jaccard and cosine admitted this cluster (`find_consolidation_
+    // clusters`) and BEFORE the summary is requested, so a blocked cluster
+    // costs no generative call and touches no row. It is consulted in a
+    // dry run too — a dry run previews what the live run would do — and
+    // the report carries the answer's `DecisionSource`. With `[decision]`
+    // unset it returns `NoDecider` and this body is byte-identical to
+    // v1.0.0. A `?` here is the `fallback = "refuse"` case only.
+    let judgement = llm.judge_merge(&input)?;
+    let judge = match judgement {
+        blocked @ crate::decision_seams::MergeJudgement::Block { reason, source } => {
+            tracing::warn!(
+                cluster_size = cluster.len(),
+                namespace = %cluster[0].namespace,
+                reason = %reason,
+                source = source.as_str(),
+                "autonomy: merge judge BLOCKED the cluster — consolidation withheld, \
+                 sources untouched (#3806 W4)"
+            );
+            return Ok(ClusterStep::Blocked(blocked));
+        }
+        other => other,
+    };
     let summary = llm.summarize_memories(&input)?;
     // Prefix the consolidated title so it never collides with one of
     // the source memories' (title, namespace) UNIQUE key. Source
@@ -666,12 +807,13 @@ fn consolidate_cluster(
     let title = format!("[consolidated] {base_title}");
 
     if dry_run {
-        return Ok(Some(ClusterOutcome {
+        return Ok(ClusterStep::Done(ClusterOutcome {
             entry: RollbackEntry::Consolidate {
                 originals: cluster.to_vec(),
                 result_id: "dry-run".to_string(),
             },
             persisted: false,
+            judge,
         }));
     }
 
@@ -729,9 +871,10 @@ fn consolidate_cluster(
              committed; the pending entry {entry_id} still holds the originals: {e}"
         )
     })?;
-    Ok(Some(ClusterOutcome {
+    Ok(ClusterStep::Done(ClusterOutcome {
         entry,
         persisted: true,
+        judge,
     }))
 }
 
@@ -1148,7 +1291,7 @@ pub fn persist_self_report(
 ) -> Result<()> {
     let now = chrono::Utc::now();
     let ts = now.to_rfc3339();
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "cycle_ts": ts,
         "cycle_duration_ms": cycle_duration_ms,
         "auto_tagged": auto_tagged,
@@ -1170,6 +1313,15 @@ pub fn persist_self_report(
         "autonomy_ops_skipped_cap": pass_report.operations_skipped_cap,
         "errors_total": errors_total,
     });
+    // #3806 W4 — the merge judge's counters, PRESENT only when a judge was
+    // consulted: an unset `[decision]` run serializes byte-identically to
+    // v1.0.0 (GOD ruling — conditional omission, never a default-zero key).
+    if let Some(judge) = &pass_report.merge_judge {
+        body["merge_judge"] = serde_json::to_value(judge)?;
+    }
+    if let Some(preview) = &pass_report.judge_preview {
+        body["judge_preview"] = serde_json::to_value(preview)?;
+    }
     let mem = Memory {
         cid: None, // v0.9.0 G8 (#1825) — stamped by db::insert / read via row_to_memory
         valid_from: None,
@@ -2093,6 +2245,7 @@ mod tests {
         let cluster = vec![a.clone(), b.clone()];
         let entry = consolidate_cluster(&conn, &llm, &cluster, false)
             .unwrap()
+            .into_outcome()
             .expect("expected rollback entry")
             .entry;
         match entry {
@@ -2134,6 +2287,7 @@ mod tests {
         let cluster = vec![a.clone(), b.clone()];
         let entry = consolidate_cluster(&conn, &llm, &cluster, true)
             .unwrap()
+            .into_outcome()
             .expect("dry-run returns entry")
             .entry;
         if let RollbackEntry::Consolidate { result_id, .. } = entry {
@@ -2168,6 +2322,7 @@ mod tests {
         let cluster = vec![a.clone(), b.clone()];
         let entry = consolidate_cluster(&conn, &llm, &cluster, false)
             .unwrap()
+            .into_outcome()
             .expect("entry")
             .entry;
 
@@ -2579,6 +2734,7 @@ mod tests {
         let cluster = vec![a.clone(), b.clone()];
         let entry = consolidate_cluster(&conn, &llm, &cluster, false)
             .unwrap()
+            .into_outcome()
             .expect("rollback entry")
             .entry;
 
@@ -2976,7 +3132,7 @@ mod tests {
         let llm = StubLlm::new("never called");
         let solo = sample_mem("a", "ns", "T", "content body word word", Tier::Mid);
         let result = consolidate_cluster(&conn, &llm, std::slice::from_ref(&solo), false).unwrap();
-        assert!(result.is_none());
+        assert!(result.is_skipped());
     }
 
     /// `consolidate_cluster` defensively skips clusters whose members
@@ -2990,7 +3146,7 @@ mod tests {
         let b = sample_mem("b", "_curator/rollback", "T2", "abc abc abc abc", Tier::Mid);
         let result = consolidate_cluster(&conn, &llm, &[a, b], false).unwrap();
         assert!(
-            result.is_none(),
+            result.is_skipped(),
             "reserved-namespace cluster must be skipped"
         );
     }

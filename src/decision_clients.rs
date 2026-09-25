@@ -581,12 +581,22 @@ impl DecisionProvider for FallbackChain {
             _ => first,
         }
     }
+
+    /// The primary's answer VERBATIM — the secondary is never consulted,
+    /// whatever the abstain reason (#3806 W4). This is the one method a
+    /// seam with no legacy instrument calls; see
+    /// [`DecisionProvider::judge_primary`].
+    async fn judge_primary(&self, prompt: &str) -> crate::decision::Judgement {
+        self.primary.judge_primary(prompt).await
+    }
 }
 
 /// #3806 R6 — the capabilities the WIRED seams ask of a provider:
-/// `classify_kind` chooses, `detect_contradiction` judges. A unit that
-/// wires a new seam adds its capability here, so the boot chokepoint
-/// refuses a provider that could never answer it.
+/// `classify_kind` chooses; `detect_contradiction` judges; the W4
+/// consolidation merge judge judges too (through `judge_primary`, the
+/// same capability). A unit that wires a new seam adds its capability
+/// here, so the boot chokepoint refuses a provider that could never
+/// answer it.
 pub const SEAM_CAPABILITIES: [DecisionCapability; 2] =
     [DecisionCapability::Choose, DecisionCapability::Judge];
 
@@ -731,6 +741,9 @@ mod tests {
         }
         async fn judge(&self, _p: &str) -> crate::decision::Judgement {
             crate::decision::Judgement::abstain(AbstainReason::Unusable, NETWORK_SOURCE)
+        }
+        async fn judge_primary(&self, prompt: &str) -> crate::decision::Judgement {
+            self.judge(prompt).await
         }
         fn supports(&self, capability: DecisionCapability) -> bool {
             capability != DecisionCapability::Choose
