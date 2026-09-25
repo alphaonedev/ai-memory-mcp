@@ -1677,6 +1677,7 @@ impl OllamaClient {
             client,
             breaker: Mutex::new(BreakerState::new()),
             embed_dimensions: None,
+            decider: None,
         })
     }
 
@@ -1706,6 +1707,7 @@ impl OllamaClient {
             client,
             breaker: Mutex::new(BreakerState::new()),
             embed_dimensions: None,
+            decider: None,
         })
     }
 
