@@ -758,6 +758,13 @@ ask. Everything else is unavailability, and unavailability is what
 `fallback` governs. The outbound check runs before every request,
 including the retry and the fallback leg.
 
+**A dead endpoint is not dialled for every row.** After 3 consecutive
+unavailability abstains (timeout, transport failure, non-2xx) a
+surface's seams stop calling the decision endpoint for 30 seconds and
+answer with the same `unavailable` abstain the call would have produced
+— so `fallback` still governs it — then let one probe through. A decline
+never trips it; any answer closes it.
+
 Model-class advice, the air-gap ladder and the hosted-route census land
 with the rest of the `[decision]` documentation (#3806 W6).
 
