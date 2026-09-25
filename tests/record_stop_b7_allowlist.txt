@@ -140,3 +140,10 @@ src/cost/mod.rs	usd_string
 # file carried implicitly is made explicit and reviewed here.
 src/subscriptions/audit_status.rs	persist_event_status
 src/subscriptions/audit_status.rs	persist_dispatch_counter
+# #3942 — in-tx free fn. Its `UPDATE memories SET metadata …` is split
+# across a `\` continuation, so the pre-fix single-line predicate never
+# saw it. The fn takes the caller's transaction and has no `&self`, so
+# it cannot call `gate_record_stop`. Both production callers gate before
+# that transaction: `update_with_expected_version_once` (postgres.rs)
+# and `PostgresStore::update`.
+src/store/postgres.rs	pg_apply_entitled_attestation_in_tx
