@@ -31,7 +31,12 @@
 //! |---|---|---|
 //! | `allow` (default) | constructed | constructed |
 //! | `loopback-only` | constructed iff the resolved `base_url` is loopback | constructed |
+//! | `internal-only` (#3822) | constructed iff EVERY address the endpoint resolves to is internal; the addresses are PINNED into the client | constructed |
 //! | `deny` | REFUSED — no handle, signed refusal row | constructed |
+//!
+//! Every posture also refuses a non-loopback plaintext `http` endpoint
+//! (#3823) — at config time in `decision_config::plan`, and again here
+//! as the egress backstop.
 //!
 //! `local-nli` runs in process and its `base_url` is EMPTY by
 //! construction (`src/decision_config.rs` refuses one), so the gate is
@@ -77,7 +82,10 @@ use crate::decision::{AbstainReason, DecisionProvider, decider_or_null};
 use crate::decision_config::{
     DecisionFallback, ResolvedDecision, fallback_phrase, resolve_decision,
 };
-use crate::egress::{EgressClass, EgressDecision, InferenceEgressMode, evaluate_inference_egress};
+use crate::egress::{
+    EgressClass, EgressDecision, InferenceEgressMode, PinnedTarget, admit_inference_target,
+    evaluate_inference_egress, evaluate_inference_egress_resolved,
+};
 
 /// The CLOSED vocabulary for the decision-provider boot state.
 ///
@@ -210,17 +218,22 @@ impl std::error::Error for DecisionEgressRefused {}
 /// effect without waiting for a restart. (It can only ever TIGHTEN in
 /// effect: boot already refused to construct anything the boot posture
 /// forbade.)
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct DecisionEgressGuard {
     base_url: String,
     local: bool,
+    /// #3822 — the boot-resolved addresses admitted under
+    /// `internal-only`, which the client pins. `None` under the
+    /// name-based postures (byte-identical legacy shape).
+    pin: Option<PinnedTarget>,
 }
 
 impl DecisionEgressGuard {
-    fn for_resolved(resolved: &ResolvedDecision) -> Self {
+    fn for_resolved(resolved: &ResolvedDecision, pin: Option<PinnedTarget>) -> Self {
         Self {
             base_url: resolved.base_url.clone(),
             local: resolved.is_local(),
+            pin,
         }
     }
 
@@ -228,6 +241,13 @@ impl DecisionEgressGuard {
     #[must_use]
     pub fn target(&self) -> &str {
         &self.base_url
+    }
+
+    /// The boot-resolved addresses pinned under `internal-only` (#3822):
+    /// the ONLY addresses a client built from this handle connects to.
+    #[must_use]
+    pub fn pinned(&self) -> Option<&PinnedTarget> {
+        self.pin.as_ref()
     }
 
     /// Check whether an outbound decision call may proceed RIGHT NOW.
@@ -263,7 +283,22 @@ impl DecisionEgressGuard {
         if self.local {
             return Ok(());
         }
-        match evaluate_inference_egress(mode, EgressClass::InferenceDecision, &self.base_url) {
+        // #3822 — under `internal-only` the client connects to the PINNED
+        // addresses, so those are what the per-call check classifies (no
+        // DNS at call time). With no pin — a handle built under a
+        // name-based posture that has since TIGHTENED to `internal-only`
+        // — the name-based arm refuses a hostname it cannot classify:
+        // fail closed, never a lookup the client would not then honour.
+        let decision = match (mode, &self.pin) {
+            (InferenceEgressMode::InternalOnly, Some(pin)) => evaluate_inference_egress_resolved(
+                mode,
+                EgressClass::InferenceDecision,
+                &self.base_url,
+                &pin.addrs,
+            ),
+            _ => evaluate_inference_egress(mode, EgressClass::InferenceDecision, &self.base_url),
+        };
+        match decision {
             EgressDecision::Allow => Ok(()),
             EgressDecision::Refuse { target, reason, .. } => {
                 Err(DecisionEgressRefused { target, reason })
@@ -424,7 +459,12 @@ impl DecisionProviderHandle {
         // The PRIMARY client POSTs to the gated decision endpoint and
         // only there.
         let outbound = self.outbound_check(&[self.resolved.base_url.as_str()]);
-        match crate::decision_clients::construct(&self.resolved, outbound, secondary) {
+        match crate::decision_clients::construct_pinned(
+            &self.resolved,
+            outbound,
+            secondary,
+            self.guard.pinned(),
+        ) {
             Ok(provider) => self.with_provider(Arc::from(provider)),
             Err(e) => {
                 tracing::warn!(
@@ -577,8 +617,10 @@ fn record(report: Option<DecisionBootReport>) {
 /// [`crate::daemon_runtime::build_llm_client`] does for the chat
 /// endpoint. Records the `/capabilities` snapshot as a side effect.
 ///
-/// Synchronous and socket-free by construction: it performs no I/O
-/// except the refusal-row append on the refuse arm, so "the boot path
+/// Synchronous and makes zero decision calls by construction: its only
+/// I/O is the refusal-row append on the refuse arm and, under
+/// `internal-only` alone, the one DNS resolution the carrier's
+/// resolve-then-pin gate performs (which fails CLOSED). "The boot path
 /// makes zero decision calls" is a property of the code shape, not of a
 /// timeout. W1c attaches its client to the returned handle after
 /// constructing it asynchronously.
@@ -631,30 +673,41 @@ pub(crate) fn build_decision_provider_under(
     // provider is SKIPPED, not waived: it opens no socket and its
     // `base_url` is empty by construction, so there is no egress to
     // govern. Everything else is gated on the endpoint it will POST to.
+    //
+    // #3822 — through the carrier's RESOLVE-THEN-PIN entry point, the one
+    // every `[llm]` / embedding chokepoint uses: under `internal-only` it
+    // refuses off-host plaintext first, resolves the target (DNS fails
+    // CLOSED), requires EVERY resolved address to be internal, and hands
+    // back the addresses the client must pin. Under the name-based
+    // postures it is exactly `evaluate_inference_egress` with no pin.
+    let mut pin = None;
     if !resolved.is_local() {
-        if let EgressDecision::Refuse {
-            class,
-            target,
-            reason,
-        } = evaluate_inference_egress(mode, EgressClass::InferenceDecision, &resolved.base_url)
-        {
-            tracing::warn!(
-                "[decision] provider DISABLED by the inference-plane egress gate \
+        match admit_inference_target(mode, EgressClass::InferenceDecision, &resolved.base_url) {
+            Ok(admitted) => pin = admitted,
+            Err(EgressDecision::Allow) => {}
+            Err(EgressDecision::Refuse {
+                class,
+                target,
+                reason,
+            }) => {
+                tracing::warn!(
+                    "[decision] provider DISABLED by the inference-plane egress gate \
                  (provider={} model={} target={target} mode={}); {reason} (#1963/#3806)",
-                resolved.provider,
-                resolved.model,
-                mode.as_str()
-            );
-            record(Some(DecisionBootReport {
-                state: DecisionProviderState::RefusedByEgress,
-                provider: resolved.provider.clone(),
-                model: resolved.model.clone(),
-                local: false,
-                egress_mode: mode.as_str().to_string(),
-            }));
-            // #1991 — audit against the operator-resolved db_path.
-            crate::egress::refuse_inference_egress_audited(db_path, class, &target, &reason);
-            return DecisionBootOutcome::RefusedByEgress;
+                    resolved.provider,
+                    resolved.model,
+                    mode.as_str()
+                );
+                record(Some(DecisionBootReport {
+                    state: DecisionProviderState::RefusedByEgress,
+                    provider: resolved.provider.clone(),
+                    model: resolved.model.clone(),
+                    local: false,
+                    egress_mode: mode.as_str().to_string(),
+                }));
+                // #1991 — audit against the operator-resolved db_path.
+                crate::egress::refuse_inference_egress_audited(db_path, class, &target, &reason);
+                return DecisionBootOutcome::RefusedByEgress;
+            }
         }
     }
 
@@ -675,7 +728,7 @@ pub(crate) fn build_decision_provider_under(
         local: resolved.is_local(),
         egress_mode: mode.as_str().to_string(),
     }));
-    let guard = DecisionEgressGuard::for_resolved(&resolved);
+    let guard = DecisionEgressGuard::for_resolved(&resolved, pin);
     DecisionBootOutcome::Constructed(Box::new(DecisionProviderHandle {
         resolved,
         guard,
@@ -1015,6 +1068,95 @@ mod tests {
             crate::decision_config::DEFAULT_TIMEOUT_SECS
         );
         assert!(handle.api_key().is_none());
+    }
+
+    const INTERNAL: InferenceEgressMode = InferenceEgressMode::InternalOnly;
+
+    // PIN (#3822 posture 3, the decision lane) — under `internal-only`
+    // the chokepoint uses the carrier's RESOLVE-THEN-PIN entry point, not
+    // the name-based gate: a HOSTNAME that resolves to internal addresses
+    // is admitted, the resolved addresses are carried on the handle for
+    // the client to pin, and no refusal row is written. The name-based
+    // gate refuses every hostname under `internal-only` (it cannot
+    // classify without DNS), so before this the decision lane could not
+    // serve posture 3 at all. ABSENCE on the same sink: a PUBLIC target
+    // and a cloud-metadata literal are refused with a signed row. (An
+    // off-host plaintext target never gets this far: `plan` refuses it
+    // at config time, #3823.)
+    #[test]
+    fn internal_only_admits_and_pins_an_internal_hostname_3822() {
+        let _snapshot = snapshot_guard();
+        // PRESENCE — `localhost` is a hostname the name-based gate cannot
+        // classify; it resolves to loopback, which is internal.
+        let (_hold_a, db_a) = fresh_db("internal-host");
+        let cfg = remote_cfg("https://localhost:8443/v1");
+        let outcome = build_decision_provider_under(INTERNAL, &cfg, &db_a);
+        assert_eq!(
+            outcome.state(),
+            DecisionProviderState::Constructed,
+            "internal-only must admit a hostname that resolves internal (#3822)"
+        );
+        let handle = outcome.handle().expect("constructed");
+        let pin = handle
+            .egress()
+            .pinned()
+            .expect("internal-only carries the boot-resolved addresses to the client");
+        assert_eq!(pin.host, "localhost");
+        assert!(
+            !pin.addrs.is_empty() && pin.addrs.iter().all(|a| a.ip().is_loopback()),
+            "{:?}",
+            pin.addrs
+        );
+        assert_eq!(refusal_rows(&db_a), 0, "an admitted target writes no row");
+
+        // ABSENCE — a public target, and an off-host plaintext target.
+        for (label, url) in [
+            ("public", "https://8.8.8.8/v1"),
+            ("metadata", "https://169.254.169.254/v1"),
+        ] {
+            let (_hold, db) = fresh_db(label);
+            let outcome = build_decision_provider_under(INTERNAL, &remote_cfg(url), &db);
+            assert_eq!(
+                outcome.state(),
+                DecisionProviderState::RefusedByEgress,
+                "{label}"
+            );
+            assert_eq!(refusal_rows(&db), 1, "{label}: one signed refusal row");
+        }
+
+        // The name-based postures carry NO pin (byte-identical legacy).
+        let (_hold_b, db_b) = fresh_db("allow-nopin");
+        let outcome = build_decision_provider_under(ALLOW, &cfg, &db_b);
+        assert!(outcome.handle().expect("allow").egress().pinned().is_none());
+    }
+
+    // PIN — the per-call re-check under `internal-only` classifies the
+    // PINNED addresses (what the client will actually connect to), not
+    // the hostname. Without the pin the name-based arm would refuse
+    // every call to the host it just admitted.
+    #[test]
+    fn per_call_internal_only_checks_the_pinned_addresses_3822() {
+        let _snapshot = snapshot_guard();
+        let (_hold, db) = fresh_db("internal-per-call");
+        let cfg = remote_cfg("https://localhost:8443/v1");
+        let outcome = build_decision_provider_under(INTERNAL, &cfg, &db);
+        let handle = outcome.handle().expect("constructed");
+        assert!(
+            handle.egress().check_outbound_under(INTERNAL).is_ok(),
+            "a pinned internal target must pass the per-call check"
+        );
+        // A handle built under `allow` has no pin; tightening the live
+        // posture to `internal-only` refuses (fail closed, never a DNS
+        // lookup at call time).
+        let (_hold_b, db_b) = fresh_db("internal-tightened");
+        let outcome = build_decision_provider_under(ALLOW, &cfg, &db_b);
+        let refused = outcome
+            .handle()
+            .expect("allow")
+            .egress()
+            .check_outbound_under(INTERNAL)
+            .expect_err("no pin => internal-only cannot classify a hostname => refuse");
+        assert_eq!(refused.abstain_reason(), AbstainReason::EgressRefused);
     }
 
     // PIN — a `[decision]` section that cannot resolve yields NO

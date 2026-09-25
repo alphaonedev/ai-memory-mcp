@@ -678,7 +678,21 @@ well, under its own egress class `inference_decision`:
 |---|---|---|
 | `allow` (compiled default) | constructed | constructed |
 | `loopback-only` | constructed **only** if the resolved `base_url` is loopback; otherwise refused | constructed |
+| `internal-only` (#3822) | constructed **only** if EVERY address the endpoint resolves to is internal (loopback / RFC1918 / ULA / CGNAT, never a cloud-metadata literal); those boot-resolved addresses are **pinned** into the client, which connects to nothing else and never through a proxy. DNS failure refuses. | constructed |
 | `deny` | **REFUSED** — no provider is constructed and a signed refusal row is appended to the audit chain | constructed |
+
+**Transit floor (#3823).** Under every posture a `[decision]` endpoint
+that is plaintext `http://` to a **non-loopback** host is REFUSED — at
+config load, naming `[decision].base_url` (or `[llm].base_url` when the
+decision endpoint inherits it) and the scheme, and again at the boot
+gate. A loopback endpoint over `http` is the permitted control, as for
+`[llm]`. A `systemone` `base_url` that already ends in `/v1/systemone`
+is refused too: the client appends the route itself.
+
+**No redirect is followed.** The per-call check approves the ORIGIN of
+the request; a `307`/`308` would re-send the body to an origin no gate
+saw, so decision clients never follow one. A redirect is reported as an
+outage (`unavailable`), never as a verdict.
 
 The enforcement is the **absence of the provider**, decided once at
 boot in `build_decision_provider`, exactly as `build_llm_client`

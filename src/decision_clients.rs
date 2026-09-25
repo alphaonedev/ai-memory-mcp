@@ -425,8 +425,32 @@ pub(crate) async fn post_json(call: HttpCall<'_>) -> Result<Value, CallFailure> 
 }
 
 /// Build the HTTP pool every network decision client uses.
-fn decision_http_client(timeout: Duration) -> Result<reqwest::Client> {
-    reqwest::Client::builder()
+///
+/// Two transport rules the carrier's inference egress plane applies to the
+/// `[llm]` / embedding lanes, applied here too (#3822 / #3823):
+///
+/// * **No redirect is ever followed, in every posture.** The per-call
+///   outbound check approves the ORIGIN of the URL this client builds; a
+///   `307` / `308` would have reqwest re-POST the same body (memory
+///   content) to wherever `Location` points AFTER that check ran — to an
+///   origin no gate saw, possibly in plaintext. A redirect is therefore
+///   not followed; it surfaces as a non-2xx status, which is an OUTAGE
+///   (`Unavailable`, case 2), never a verdict.
+/// * **Under `internal-only`, the pin is the destination.** `pin` is the
+///   target the boot chokepoint resolved and admitted; the client
+///   connects ONLY to those addresses (`resolve_to_addrs`, closing the
+///   DNS-rebind window) and never through a proxy, which would connect on
+///   its own terms and defeat the pin.
+fn decision_http_client(
+    timeout: Duration,
+    pin: Option<&crate::egress::PinnedTarget>,
+) -> Result<reqwest::Client> {
+    let builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
+    let builder = match pin {
+        Some(pin) => builder.resolve_to_addrs(&pin.host, &pin.addrs).no_proxy(),
+        None => builder,
+    };
+    builder
         // Strictly LONGER than the per-call `tokio::time::timeout`, so the
         // authoritative guard in `post_json` always wins the race and the
         // abstain reason is deterministic. This is a backstop against a
@@ -583,6 +607,22 @@ pub fn construct(
     outbound: OutboundCheck,
     generative: Option<fallback::GenerativeFallbackDecider>,
 ) -> Result<Box<dyn DecisionProvider>> {
+    construct_pinned(resolved, outbound, generative, None)
+}
+
+/// [`construct`] with the `internal-only` egress pin (#3822): `pin` is
+/// the boot-resolved target the chokepoint admitted, and every network
+/// client this builds connects ONLY to those addresses (no proxy, no
+/// redirect). `None` is the name-based postures' shape.
+///
+/// # Errors
+/// As [`construct`].
+pub fn construct_pinned(
+    resolved: &ResolvedDecision,
+    outbound: OutboundCheck,
+    generative: Option<fallback::GenerativeFallbackDecider>,
+    pin: Option<&crate::egress::PinnedTarget>,
+) -> Result<Box<dyn DecisionProvider>> {
     if resolved.provider == PROVIDER_LOCAL_NLI {
         bail!(
             "[decision].provider = \"{PROVIDER_LOCAL_NLI}\" is not available in this build; \
@@ -591,14 +631,16 @@ pub fn construct(
     }
 
     let primary: Box<dyn DecisionProvider> = if resolved.provider == PROVIDER_SYSTEMONE {
-        Box::new(systemone::SystemOneDecider::new(
+        Box::new(systemone::SystemOneDecider::new_pinned(
             resolved,
             Arc::clone(&outbound),
+            pin,
         )?)
     } else {
-        Box::new(chat::OpenAiCompatibleDecider::new(
+        Box::new(chat::OpenAiCompatibleDecider::new_pinned(
             resolved,
             Arc::clone(&outbound),
+            pin,
         )?)
     };
 

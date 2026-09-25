@@ -214,7 +214,19 @@ impl SystemOneDecider {
     /// When `base_url` does not join to a valid `http`/`https` URL, or
     /// when the HTTP pool cannot be built.
     pub fn new(resolved: &ResolvedDecision, outbound: OutboundCheck) -> Result<Self> {
-        Self::with_wire(resolved, outbound, Arc::new(DefaultSystemOneWire))
+        Self::new_pinned(resolved, outbound, None)
+    }
+
+    /// [`Self::new`] with the `internal-only` egress pin (#3822).
+    ///
+    /// # Errors
+    /// As [`Self::new`].
+    pub fn new_pinned(
+        resolved: &ResolvedDecision,
+        outbound: OutboundCheck,
+        pin: Option<&crate::egress::PinnedTarget>,
+    ) -> Result<Self> {
+        Self::build(resolved, outbound, Arc::new(DefaultSystemOneWire), pin)
     }
 
     /// Build a client against a caller-supplied wire shape.
@@ -226,13 +238,22 @@ impl SystemOneDecider {
         outbound: OutboundCheck,
         wire: Arc<dyn SystemOneWire>,
     ) -> Result<Self> {
+        Self::build(resolved, outbound, wire, None)
+    }
+
+    fn build(
+        resolved: &ResolvedDecision,
+        outbound: OutboundCheck,
+        wire: Arc<dyn SystemOneWire>,
+        pin: Option<&crate::egress::PinnedTarget>,
+    ) -> Result<Self> {
         let timeout = resolved.timeout();
         Ok(Self {
             provider_id: resolved.provider.clone(),
             model: resolved.model.clone(),
             endpoint: endpoint_url(&resolved.base_url, wire.route())?,
             api_key: SecretKey::new(resolved.api_key()),
-            http: decision_http_client(timeout)?,
+            http: decision_http_client(timeout, pin)?,
             timeout,
             outbound,
             wire,

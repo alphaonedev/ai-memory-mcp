@@ -442,6 +442,46 @@ fn plan(cfg: &AppConfig, parent: &ResolvedLlm) -> anyhow::Result<Option<Decision
         }
     };
 
+    // 6b — #3823: the carrier's transit floor, applied to the SECOND
+    // inference endpoint. A non-loopback plaintext `http` endpoint would
+    // ship memory content off the host UNENCRYPTED; it is refused here
+    // whether the URL was written under `[decision]` or INHERITED from
+    // `[llm]`, with the SAME predicate pair the `[llm]` / `[embeddings]`
+    // config check and the boot egress backstop read
+    // (`url_is_plaintext_http` + `target_is_loopback`). The refusal names
+    // the key and the scheme, never the host. Loopback stays the pinned
+    // allowed path (the loopback-included standard is #3824, deferred).
+    if !local
+        && crate::transit_encryption::url_is_plaintext_http(&base_url)
+        && !crate::egress::target_is_loopback(&base_url)
+    {
+        let key = if non_empty(section.base_url.as_ref()).is_some() {
+            format!("[{SECTION}].{}", config_keys::BASE_URL)
+        } else {
+            format!("[llm].{} (inherited by [{SECTION}])", config_keys::BASE_URL)
+        };
+        anyhow::bail!(format!(
+            "inference endpoint `{key}` uses the plaintext `http` scheme to a \
+             non-loopback host, so memory content would leave this host \
+             UNENCRYPTED (#3823). Use an `https://` endpoint (or a local \
+             TLS-terminating proxy); a loopback endpoint over http is permitted."
+        ));
+    }
+
+    // 6c — W1c ruling 2: a `systemone` base URL that already carries the
+    // route would POST to the route twice. Refused, naming the suffix.
+    if provider == PROVIDER_SYSTEMONE {
+        let route = crate::decision_clients::systemone::DefaultSystemOneWire::ROUTE;
+        if base_url.trim_end_matches('/').ends_with(route) {
+            anyhow::bail!(format!(
+                "[{SECTION}].{} must be the server root, not the route: it ends in \
+                 `{route}`, which the client appends itself, so every call would go to \
+                 `{route}{route}`. Remove the `{route}` suffix.",
+                config_keys::BASE_URL
+            ));
+        }
+    }
+
     // 7 — a zero timeout would make every call an instant abstain.
     let timeout_secs = match section.timeout_secs {
         Some(0) => {
@@ -819,15 +859,95 @@ mod tests {
         assert!(resolve_decision(&cfg).is_none());
 
         // PRESENCE control — the same provider as the parent inherits.
+        // #3823: over a LOOPBACK endpoint, the pinned allowed path.
         let cfg = parse(
             "[llm]\nbackend = \"ollama\"\nmodel = \"gemma3:4b\"\n\
-             base_url = \"http://gpu.internal:11434\"\n\n\
+             base_url = \"http://127.0.0.1:11434\"\n\n\
              [decision]\nprovider = \"ollama\"\n",
         );
         assert!(validate(&cfg).is_ok());
         let resolved = resolve_decision(&cfg).expect("resolves");
         assert_eq!(resolved.model, "gemma3:4b");
-        assert_eq!(resolved.base_url, "http://gpu.internal:11434");
+        assert_eq!(resolved.base_url, "http://127.0.0.1:11434");
+    }
+
+    // ---- #3823: the two acceptances that encoded the defect ---------
+    /// #3823 named these two values: W1a pinned that a NON-LOOPBACK
+    /// plaintext `http` endpoint RESOLVES. They are now refusal pins —
+    /// at config time (the loader names the key) AND in the resolver
+    /// (an in-memory config never reaches a client) — whether the URL
+    /// is written under `[decision]` or INHERITED from `[llm]`. The
+    /// loopback and `https` spellings of the same endpoints are the
+    /// allowed-path controls on the same sink.
+    #[test]
+    fn a_non_loopback_plaintext_decision_endpoint_is_refused_3823() {
+        // Inherited from `[llm]` (the gpu.internal acceptance, inverted).
+        let inherited = parse(
+            "[llm]\nbackend = \"ollama\"\nmodel = \"gemma3:4b\"\n\
+             base_url = \"http://gpu.internal:11434\"\n\n\
+             [decision]\nprovider = \"ollama\"\n",
+        );
+        // Written under `[decision]` (the chat.internal acceptance, inverted).
+        let explicit = parse(
+            "[decision]\nprovider = \"lmstudio\"\nmodel = \"vendor/decider-1\"\n\
+             base_url = \"http://chat.internal:1234/v1\"\n",
+        );
+        for (label, cfg) in [("inherited", &inherited), ("explicit", &explicit)] {
+            let err = expect_refusal(cfg, "off-host plaintext must be refused");
+            assert!(
+                err.contains("base_url"),
+                "{label}: must name the key: {err}"
+            );
+            assert!(err.contains("http"), "{label}: must name the scheme: {err}");
+            assert!(
+                !err.contains("gpu.internal") && !err.contains("chat.internal"),
+                "{label}: the refusal names the key and scheme, not the host: {err}"
+            );
+            assert!(resolve_decision(cfg).is_none(), "{label}: no provider");
+        }
+        // ALLOWED-PATH controls: https off-host, and http on loopback.
+        for url in [
+            "https://chat.internal:1234/v1",
+            "http://127.0.0.1:1234/v1",
+            "http://localhost:1234/v1",
+            "http://[::1]:1234/v1",
+        ] {
+            let cfg = parse(&format!(
+                "[decision]\nprovider = \"lmstudio\"\nmodel = \"vendor/decider-1\"\n\
+                 base_url = \"{url}\"\n"
+            ));
+            assert!(validate(&cfg).is_ok(), "{url} must be accepted");
+            assert_eq!(resolve_decision(&cfg).expect("resolves").base_url, url);
+        }
+    }
+
+    /// W1c ruling 2 (2026-09-19) — a `systemone` `base_url` that already
+    /// ends in the route path would POST to `/v1/systemone/v1/systemone`.
+    /// Refused at config time, naming the key and the offending suffix.
+    #[test]
+    fn a_systemone_base_url_carrying_the_route_is_refused() {
+        for url in [
+            "https://decide.example.net/v1/systemone",
+            "https://decide.example.net/v1/systemone/",
+        ] {
+            let cfg = parse(&format!(
+                "[decision]\nprovider = \"systemone\"\nmodel = \"m\"\nbase_url = \"{url}\"\n"
+            ));
+            let err = expect_refusal(&cfg, "a doubled route must be refused");
+            assert!(err.contains("base_url"), "{err}");
+            assert!(err.contains("/v1/systemone"), "names the suffix: {err}");
+            assert!(resolve_decision(&cfg).is_none());
+        }
+        // ALLOWED-PATH control: the server root, and a prefix path.
+        for url in [
+            "https://decide.example.net",
+            "https://decide.example.net/gw",
+        ] {
+            let cfg = parse(&format!(
+                "[decision]\nprovider = \"systemone\"\nmodel = \"m\"\nbase_url = \"{url}\"\n"
+            ));
+            assert!(validate(&cfg).is_ok(), "{url}");
+        }
     }
 
     #[test]
@@ -905,7 +1025,7 @@ mod tests {
         let llm = LlmSection {
             backend: Some("lmstudio".to_string()),
             model: Some("vendor/chat-1".to_string()),
-            base_url: Some("http://chat.internal:1234/v1".to_string()),
+            base_url: Some("https://chat.internal:1234/v1".to_string()),
             api_key_env: None,
             api_key_file: Some(key_path),
             api_key: None,
@@ -923,7 +1043,7 @@ mod tests {
             ..AppConfig::default()
         };
         let resolved = resolve_decision(&cfg).expect("resolves");
-        assert_eq!(resolved.base_url, "http://chat.internal:1234/v1");
+        assert_eq!(resolved.base_url, "https://chat.internal:1234/v1");
         assert!(
             resolved.api_key().is_some(),
             "the SAME endpoint inherits the parent credential"
@@ -935,13 +1055,13 @@ mod tests {
             decision: Some(DecisionSection {
                 provider: Some("lmstudio".to_string()),
                 model: Some("vendor/decider-1".to_string()),
-                base_url: Some("http://decide.internal:1234/v1".to_string()),
+                base_url: Some("https://decide.internal:1234/v1".to_string()),
                 ..DecisionSection::default()
             }),
             ..AppConfig::default()
         };
         let resolved = resolve_decision(&cfg).expect("resolves");
-        assert_eq!(resolved.base_url, "http://decide.internal:1234/v1");
+        assert_eq!(resolved.base_url, "https://decide.internal:1234/v1");
         assert_eq!(
             resolved.api_key(),
             None,
@@ -964,7 +1084,10 @@ mod tests {
             let cfg = parse(&format!(
                 "[llm]\nbackend = \"ollama\"\n\n[llm.auto_tag]\n{key}\n"
             ));
-            assert!(validate(&cfg).is_ok(), "{key} must still parse (#3808 WARN)");
+            assert!(
+                validate(&cfg).is_ok(),
+                "{key} must still parse (#3808 WARN)"
+            );
         }
     }
 

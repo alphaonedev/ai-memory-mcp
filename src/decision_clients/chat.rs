@@ -149,6 +149,19 @@ impl OpenAiCompatibleDecider {
     /// When `base_url` does not join to a valid `http`/`https` URL, or
     /// when the HTTP pool cannot be built.
     pub fn new(resolved: &ResolvedDecision, outbound: OutboundCheck) -> Result<Self> {
+        Self::new_pinned(resolved, outbound, None)
+    }
+
+    /// [`Self::new`] with the `internal-only` egress pin (#3822): the
+    /// client connects ONLY to the boot-resolved addresses in `pin`.
+    ///
+    /// # Errors
+    /// As [`Self::new`].
+    pub fn new_pinned(
+        resolved: &ResolvedDecision,
+        outbound: OutboundCheck,
+        pin: Option<&crate::egress::PinnedTarget>,
+    ) -> Result<Self> {
         let route = if resolved.provider == crate::llm::BACKEND_OLLAMA {
             OLLAMA_CHAT_ROUTE
         } else {
@@ -160,7 +173,7 @@ impl OpenAiCompatibleDecider {
             model: resolved.model.clone(),
             endpoint: endpoint_url(&resolved.base_url, route)?,
             api_key: SecretKey::new(resolved.api_key()),
-            http: decision_http_client(timeout)?,
+            http: decision_http_client(timeout, pin)?,
             timeout,
             outbound,
             logprobs: AtomicBool::new(true),
@@ -488,7 +501,7 @@ mod tests {
             model: "vendor/decision-1".to_string(),
             endpoint: endpoint_url(base_url, CHAT_ROUTE).expect("test base_url parses"),
             api_key: SecretKey::new(key),
-            http: decision_http_client(Duration::from_secs(2)).expect("test client builds"),
+            http: decision_http_client(Duration::from_secs(2), None).expect("test client builds"),
             timeout: Duration::from_secs(2),
             outbound: Arc::new(|_: &Url| Ok(())),
             logprobs: AtomicBool::new(true),
