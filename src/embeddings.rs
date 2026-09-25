@@ -11,6 +11,10 @@ use tokenizers::Tokenizer;
 
 use crate::config::EmbeddingModel;
 
+/// The de-facto-standard HuggingFace offline knob, honoured alongside
+/// `AI_MEMORY_EMBED_OFFLINE` (one name for the reader and its test).
+const HF_HUB_OFFLINE_ENV: &str = "HF_HUB_OFFLINE";
+
 /// #1558 batch 5 wave 2 — the canonical embedding/rerank document
 /// template: `"{title} {content}"`.
 ///
@@ -1941,7 +1945,7 @@ impl Embedder {
                 .map(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "on"))
                 .unwrap_or(false)
         };
-        truthy("AI_MEMORY_EMBED_OFFLINE") || truthy("HF_HUB_OFFLINE")
+        truthy("AI_MEMORY_EMBED_OFFLINE") || truthy(HF_HUB_OFFLINE_ENV)
     }
 
     /// Resolve the pre-staged MiniLM model files from the offline HuggingFace
@@ -3416,29 +3420,48 @@ fn offline_env_skips_network_and_errors_fast_on_empty_cache() {
         uuid::Uuid::new_v4()
     ));
     std::fs::create_dir_all(&tmp).expect("mk empty home");
-    let prev_home = std::env::var("HOME").ok();
-    let prev_off = std::env::var("AI_MEMORY_EMBED_OFFLINE").ok();
+    // f1 goal4 — the test OWNS every variable the offline resolver reads, and
+    // restores them on Drop (also on a panic): `HOME`, `HF_HOME` (the hub root
+    // when set, #3788 — a harness's forwarded cache made the "empty cache"
+    // premise false), `AI_MEMORY_EMBED_OFFLINE` (the knob under test) and
+    // `HF_HUB_OFFLINE` (REMOVED, so only the knob under test can produce the
+    // offline posture — no vacuous green from an ambient OR arm).
+    struct EnvGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (k, v) in &self.0 {
+                // SAFETY: serialized via the crate env LOCK held by the test.
+                unsafe {
+                    match v {
+                        Some(v) => std::env::set_var(k, v),
+                        None => std::env::remove_var(k),
+                    }
+                }
+            }
+        }
+    }
+    let keys = [
+        "HOME",
+        "HF_HOME",
+        "AI_MEMORY_EMBED_OFFLINE",
+        HF_HUB_OFFLINE_ENV,
+    ];
+    let restore = EnvGuard(keys.iter().map(|k| (*k, std::env::var_os(k))).collect());
     // SAFETY: serialized via LOCK; no other thread mutates these here.
     unsafe {
         std::env::set_var("HOME", &tmp);
+        std::env::set_var("HF_HOME", tmp.join("hf-home"));
         std::env::set_var("AI_MEMORY_EMBED_OFFLINE", "1");
+        std::env::remove_var(HF_HUB_OFFLINE_ENV);
     }
     assert!(
         Embedder::remote_fetch_disabled(),
         "offline knob must be honored"
     );
     let result = Embedder::new_local();
-    // Restore env before any assertion that could panic.
-    unsafe {
-        match prev_home {
-            Some(p) => std::env::set_var("HOME", p),
-            None => std::env::remove_var("HOME"),
-        }
-        match prev_off {
-            Some(v) => std::env::set_var("AI_MEMORY_EMBED_OFFLINE", v),
-            None => std::env::remove_var("AI_MEMORY_EMBED_OFFLINE"),
-        }
-    }
+    // Restore env before any assertion that could panic (Drop covers a panic
+    // above).
+    drop(restore);
     let _ = std::fs::remove_dir_all(&tmp);
     let msg = match result {
         Ok(_) => panic!("empty cache + offline must error (degrades to keyword)"),

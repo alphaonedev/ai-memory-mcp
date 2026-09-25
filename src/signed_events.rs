@@ -343,6 +343,19 @@ pub mod event_types {
     /// L3-boundary lexical gate (mirrors [`EPOCH_APPLIED`]).
     pub const SWARM_REWIND: &str = "swarm.rewind";
 
+    /// Boids item 3 R2.5 (#3266, ruling tmux-22 item 3) —
+    /// `signed_events.event_type` for an operator DECONTAMINATE: the
+    /// deliberate route OUT of `LifecycleState::Contaminated`, reached
+    /// through the existing operator release (`ai-memory quarantine release`
+    /// or its admin HTTP twin — no new surface) when the state observed under
+    /// the compare-and-set is `contaminated`. `agent_id` = the releasing
+    /// principal; `payload_hash` commits `{action, memory_id, restored_to,
+    /// prior_lifecycle_state, contaminated_from, stamped_at, released_by,
+    /// timestamp}` — the released marker the row itself loses. Appended in the
+    /// SAME transaction as the state change on both backends. The quarantined
+    /// release keeps [`MEMORY_DEQUARANTINED`] unchanged.
+    pub const SWARM_DECONTAMINATE: &str = "swarm.decontaminate";
+
     /// #2503 — `signed_events.event_type` for a GOVERNANCE-BINDING SEVERANCE:
     /// a memory reap (delete / archive / size-gc eviction) that severed one or
     /// more `namespace_meta.standard_id` bindings, or a gc sweep that healed a
