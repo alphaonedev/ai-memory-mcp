@@ -205,6 +205,30 @@ impl AutonomyLlm for SwappableLlm {
             None => Ok(None),
         }
     }
+
+    /// #3806 W4 — forwarded EXPLICITLY, never left to the trait default.
+    /// The default is `NoDecider`, the PERMISSIVE arm ("run the v1.0.0
+    /// body"), and a hot-swap handle that is currently `None` is not
+    /// "no judge configured" — it is a provider that is UNAVAILABLE, which
+    /// on this destructive seam must BLOCK (case 2). This is the same
+    /// disposition `summarize_memories` takes above (`Err`, not a quiet
+    /// degrade) for the same reason: it sits on the delete-the-sources
+    /// path. Pinned by the production-impl census in
+    /// `tests/decision_merge_judge_3806.rs`.
+    fn judge_merge(
+        &self,
+        members: &[(String, String)],
+    ) -> anyhow::Result<crate::decision_seams::MergeJudgement> {
+        match self.current().as_ref() {
+            Some(client) => AutonomyLlm::judge_merge(client, members),
+            None => Ok(crate::decision_seams::MergeJudgement::Block {
+                reason: crate::decision_seams::MergeBlockReason::Unavailable(
+                    crate::decision::AbstainReason::NoProvider,
+                ),
+                source: crate::decision::DecisionSource::Deterministic,
+            }),
+        }
+    }
 }
 
 /// Resolve + build the synchronous MCP `[llm]` client from `app_config`.

@@ -218,6 +218,11 @@ impl DecisionProvider for GenerativeFallbackDecider {
             None => Judgement::abstain(AbstainReason::Unusable, SOURCE),
         }
     }
+
+    /// A leaf has no fallback leg: primary-only IS `judge` (#3806 W4).
+    async fn judge_primary(&self, prompt: &str) -> Judgement {
+        self.judge(prompt).await
+    }
 }
 
 #[cfg(test)]
