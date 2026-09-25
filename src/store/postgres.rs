@@ -100,6 +100,7 @@ pub mod age_version;
 // v1.0.0 #3124 R4 — the audited `reown` sweep. Own module for the same
 // qual_10 budget reason as `parity_3064` above.
 mod reown_3124;
+mod swarm_rewind;
 
 use crate::models::field_names;
 use std::time::Duration;
@@ -24641,7 +24642,11 @@ impl MemoryStore for PostgresStore {
         keypair: Option<&crate::identity::keypair::AgentKeypair>,
     ) -> StoreResult<&'static str> {
         self.gate_record_stop().await?;
-        self.link_internal(ctx, link, keypair).await
+        let attest = self.link_internal(ctx, link, keypair).await?;
+        // Boids item 3 part 3 (R3 / A13): the sqlite #3324 auto-stamp's narrow
+        // trigger, best-effort after the edge has committed.
+        self.stamp_on_reflection_supersedes_pg(ctx, link).await;
+        Ok(attest)
     }
 
     async fn list_links(&self, namespace: Option<&str>) -> StoreResult<Vec<MemoryLink>> {
@@ -26328,7 +26333,11 @@ impl MemoryStore for PostgresStore {
                     0.50 - 0.35 * ((cl - 500.0) / 4500.0)
                 };
                 let blended = semantic_weight * cosine + (1.0 - semantic_weight) * norm_fts;
-                (mem, blended)
+                // #3927 — the G7 soft-loser down-weight on the FUSED score,
+                // the sqlite hybrid twin's placement (#2338): an FTS-pool-only
+                // SQL penalty would leave the loser fully ranked via cosine.
+                let penalty = crate::storage::soft_loser_penalty(&mem.metadata);
+                (mem, blended * penalty)
             })
             .collect();
 
@@ -29434,6 +29443,31 @@ impl MemoryStore for PostgresStore {
             self.gate_record_stop().await?;
         }
         self.reown_pg(ctx, namespace, to_id, select, dry_run).await
+    }
+
+    async fn swarm_rewind(
+        &self,
+        ctx: &CallerContext,
+        root_id: &str,
+        max_depth: usize,
+        target_kind: &str,
+        freeze_routine_ids: &[String],
+        dry_run: bool,
+    ) -> StoreResult<crate::storage::SwarmRewindReport> {
+        // Boids item 3 (#3266) — gate taken HERE and in the submodule, the
+        // `reown` shape (B8 parity scan reads this file, B7 the write site).
+        if !dry_run {
+            self.gate_record_stop().await?;
+        }
+        self.swarm_rewind_pg(
+            ctx,
+            root_id,
+            max_depth,
+            target_kind,
+            freeze_routine_ids,
+            dry_run,
+        )
+        .await
     }
 
     async fn action_create(

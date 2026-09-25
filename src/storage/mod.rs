@@ -859,6 +859,8 @@ pub(crate) fn escape_like_pattern(s: &str) -> String {
 // `pub use storage as db;` shim in `src/lib.rs` preserves the
 // historical `crate::db::*` paths used elsewhere.
 pub(crate) mod connection;
+pub(crate) mod contamination_marker;
+pub(crate) use contamination_marker::StampAuthority;
 // `pub` (rather than `pub(crate)`) so the V-4 closeout
 // integration test suite (`tests/signed_events_chain_v34.rs`) can
 // invoke `migrate_v34_backfill_chain` directly to exercise the
@@ -8633,6 +8635,19 @@ pub fn recall_with_telemetry(
 /// itself: clearing the marker (the G7 rollback) restores full rank.
 pub const SOFT_LOSER_SCORE_FACTOR: f64 = 0.5;
 
+/// #3927 (Boids item 3 part 4) — the ONE hybrid-lane predicate: the fused
+/// recall score multiplier for a row carrying the G7 soft-loser marker
+/// (`SOFT_LOSER_SCORE_FACTOR`), else `1.0`. Applied to the FUSED score on BOTH
+/// backends so the keyword AND the semantic halves are down-weighted (#2338).
+#[must_use]
+pub fn soft_loser_penalty(metadata: &serde_json::Value) -> f64 {
+    let loser = metadata
+        .get(crate::models::field_names::CONTRADICTION_SOFT_LOSER)
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    if loser { SOFT_LOSER_SCORE_FACTOR } else { 1.0 }
+}
+
 pub fn recall(
     conn: &Connection,
     context: &str,
@@ -13407,6 +13422,9 @@ pub struct ContaminationStampReport {
     /// non-destructive: a logical-delete / quarantine posture is never
     /// downgraded to a taint).
     pub skipped_system_only: usize,
+    /// Descendants outside a non-admin caller's authority — left untouched
+    /// (item 3 f1-review F1; counted for the WARN, never named).
+    pub skipped_unauthorized: usize,
 }
 
 /// Outcome of one [`contaminate_row`] stamp attempt on a single memory row.
@@ -13481,24 +13499,10 @@ fn contaminate_row(
         .filter(serde_json::Value::is_object)
         .unwrap_or_else(|| serde_json::json!({}));
     if let Some(map) = meta.as_object_mut() {
-        // Base marker keys in the historical (#3324) order; `extra_marker`
-        // appends provenance (e.g. `via`, `rewind`) without disturbing them.
-        let mut marker = serde_json::Map::new();
-        marker.insert(
-            "prior_lifecycle_state".to_string(),
-            serde_json::json!(cur.as_str()),
-        );
-        marker.insert(
-            "contaminated_from".to_string(),
-            serde_json::json!(contaminated_from),
-        );
-        marker.insert("stamped_at".to_string(), serde_json::json!(now));
-        for (k, v) in extra_marker {
-            marker.insert((*k).to_string(), v.clone());
-        }
+        // Shared builder (sqlite + postgres): base keys in the #3324 order.
         map.insert(
             CONTAMINATION_METADATA_KEY.to_string(),
-            serde_json::Value::Object(marker),
+            contamination_marker::build(cur, contaminated_from, now, extra_marker),
         );
     }
     let meta_ser = serde_json::to_string(&meta)?;
@@ -13560,6 +13564,25 @@ pub fn stamp_contaminated_descendants(
     root_id: &str,
     max_depth: usize,
 ) -> Result<ContaminationStampReport> {
+    stamp_contaminated_descendants_as(conn, root_id, max_depth, StampAuthority::Admin)
+}
+
+/// [`stamp_contaminated_descendants`] under an explicit caller `authority`
+/// (item 3 f1-review F1): a non-admin stamps ONLY the descendants it owns for
+/// mutation; every other row is left untouched and counted in
+/// `skipped_unauthorized` (one WARN, no ids). Pre-existing on sqlite since
+/// #3324: the MCP narrow trigger tainted the whole closure.
+///
+/// # Errors
+///
+/// As [`stamp_contaminated_descendants`].
+pub(crate) fn stamp_contaminated_descendants_as(
+    conn: &Connection,
+    root_id: &str,
+    max_depth: usize,
+    authority: StampAuthority<'_>,
+) -> Result<ContaminationStampReport> {
+    use rusqlite::OptionalExtension;
     // #1955 R45 write-funnel fence — this is a lifecycle-mutating write and is
     // reachable from the CLI-local and HTTP-sqlite lanes that bypass
     // `SqliteStore::gate_record_stop`; gate here, where every other sqlite
@@ -13590,6 +13613,21 @@ pub fn stamp_contaminated_descendants(
               WHERE id = ?4 AND lifecycle_state = ?5",
         )?;
         for node in &descendants {
+            if authority != StampAuthority::Admin {
+                let meta: Option<Option<String>> =
+                    read.query_row(params![node.id], |r| r.get(1)).optional()?;
+                let meta = meta
+                    .flatten()
+                    .and_then(|m| serde_json::from_str(&m).ok())
+                    .unwrap_or_else(|| serde_json::json!({}));
+                let site = crate::identity::owner_stamp::MutationSite::sqlite(
+                    crate::identity::owner_stamp::funnel::LINK,
+                );
+                if !authority.admits(&meta, &node.id, site) {
+                    report.skipped_unauthorized += 1;
+                    continue;
+                }
+            }
             // Empty `extra_marker` reproduces the historical #3324 contamination
             // marker byte-for-byte.
             match contaminate_row(&mut read, &mut upd, &node.id, root_id, &now, &[])? {
@@ -13601,6 +13639,7 @@ pub fn stamp_contaminated_descendants(
         }
     }
     tx.commit()?;
+    contamination_marker::warn_skipped_unauthorized(root_id, report.skipped_unauthorized);
     Ok(report)
 }
 
@@ -13629,7 +13668,7 @@ pub struct SwarmRewindCost {
 }
 
 impl SwarmRewindCost {
-    fn from_rollup(r: &crate::cost::CostRollup) -> Self {
+    pub(crate) fn from_rollup(r: &crate::cost::CostRollup) -> Self {
         Self {
             scope_key: r.scope_key.clone(),
             tokens_written: r.tokens_written,
@@ -13686,7 +13725,7 @@ pub struct SwarmRewindReport {
 /// marker to make a `swarm_rewind` IDEMPOTENT: a re-run detects an already-set
 /// `rewind: true` marker and short-circuits without re-stamping or appending a
 /// duplicate audit row.
-const SWARM_REWIND_MARKER_KEY: &str = "rewind";
+pub(crate) const SWARM_REWIND_MARKER_KEY: &str = "rewind";
 
 /// Shared SELECT of a memory's `(lifecycle_state, metadata)` by id — used by
 /// both the #3324 auto-stamp sweep and the #3322 swarm_rewind orchestration
@@ -13786,7 +13825,7 @@ pub fn swarm_rewind(
         .optional()?;
     let Some((root_state_str, root_meta_str)) = root_row else {
         return Err(anyhow::Error::new(StorageError::InvalidArgument {
-            reason: format!("swarm_rewind: root memory {root_id} not found"),
+            reason: contamination_marker::rewind_root_not_found(root_id),
         }));
     };
     let root_state = crate::models::LifecycleState::from_str(&root_state_str).unwrap_or_default();
@@ -13879,6 +13918,33 @@ pub fn swarm_rewind(
               WHERE id = ?4 AND lifecycle_state = ?5",
         )?;
 
+        // f1-review F2/F3 parity (pre-existing since #3322): the autocommit
+        // read above is a preview only. Re-read and re-decide UNDER the
+        // IMMEDIATE write lock, so a rewind or metadata writer on another
+        // connection can neither duplicate the signed event nor be overwritten
+        // by a stale marker copy. Any early return rolls `tx` back.
+        let locked: Option<(String, Option<String>)> = read
+            .query_row(params![root_id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?;
+        let Some((locked_state, locked_meta)) = locked else {
+            return Err(anyhow::Error::new(StorageError::InvalidArgument {
+                reason: contamination_marker::rewind_root_not_found(root_id),
+            }));
+        };
+        let root_state = crate::models::LifecycleState::from_str(&locked_state).unwrap_or_default();
+        let root_meta: serde_json::Value = locked_meta
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .filter(serde_json::Value::is_object)
+            .unwrap_or_else(|| serde_json::json!({}));
+        if root_state == crate::models::LifecycleState::Contaminated
+            && root_meta[CONTAMINATION_METADATA_KEY][SWARM_REWIND_MARKER_KEY].as_bool()
+                == Some(true)
+        {
+            report.already_rewound = true;
+            return Ok(report);
+        }
+
         // 1a. Contaminate the downstream cascade. `via` records the taint
         // provenance; the base marker (prior_lifecycle_state/...) is identical
         // to the auto-stamp so a future restore reads it uniformly.
@@ -13917,7 +13983,10 @@ pub fn swarm_rewind(
                     "via".to_string(),
                     serde_json::json!(crate::governance::action_labels::SWARM_REWIND),
                 );
-                cont.insert("rewound_at".to_string(), serde_json::json!(now));
+                cont.insert(
+                    contamination_marker::REWOUND_AT_KEY.to_string(),
+                    serde_json::json!(now),
+                );
                 obj.insert(
                     CONTAMINATION_METADATA_KEY.to_string(),
                     serde_json::Value::Object(cont),
@@ -14006,7 +14075,7 @@ pub fn swarm_rewind(
 /// v1.0.0 #3322 — canonical bytes committed by a `swarm.rewind` signed event.
 /// The event's `payload_hash` is `SHA-256` over this, binding the rewind's
 /// identity into the tamper-evident chain.
-fn swarm_rewind_audit_payload(
+pub(crate) fn swarm_rewind_audit_payload(
     root_id: &str,
     target_kind: &str,
     contaminated: usize,
@@ -21434,16 +21503,7 @@ fn blend_and_rank(
             // fts_score penalty alone would leave the loser fully ranked
             // through the cosine half). Reversible: the G7 rollback clears
             // the marker and full rank returns.
-            let soft_loser = mem
-                .metadata
-                .get(crate::models::field_names::CONTRADICTION_SOFT_LOSER)
-                .and_then(serde_json::Value::as_bool)
-                == Some(true);
-            let penalty = if soft_loser {
-                SOFT_LOSER_SCORE_FACTOR
-            } else {
-                1.0
-            };
+            let penalty = soft_loser_penalty(&mem.metadata);
             (mem, blended * decay * penalty)
         })
         .collect();
