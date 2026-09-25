@@ -64,6 +64,32 @@ pub enum CalibrationSeam {
 }
 
 impl CalibrationSeam {
+    /// Every preregistered seam, in table order. A seam added to the enum
+    /// without an entry here is a compile error (the array length).
+    pub const ALL: [Self; 4] = [
+        Self::ClassifyKind,
+        Self::DetectContradiction,
+        Self::SynthesisVerdict,
+        Self::ConsolidationMerge,
+    ];
+
+    /// The per-seam confidence floors that are DECLARED (`Some`), keyed by
+    /// wire token — what `/capabilities` renders under
+    /// `decision_provider.confidence_floors` so an operator can read the
+    /// destructive seams' posture without reading source (GOD landed-base
+    /// ruling: the threshold's home is the seam table, readable through
+    /// `/capabilities`; no config key at GA).
+    #[must_use]
+    pub fn confidence_floors() -> std::collections::BTreeMap<String, f64> {
+        Self::ALL
+            .into_iter()
+            .filter_map(|seam| {
+                seam.confidence_floor()
+                    .map(|f| (seam.as_str().to_string(), f))
+            })
+            .collect()
+    }
+
     /// The preregistered wire token.
     #[must_use]
     pub fn as_str(self) -> &'static str {
@@ -240,6 +266,18 @@ mod tests {
     /// thresholds at the named const, the W2 seams threshold nothing,
     /// and `None` is distinguishable from a zero floor (an absent
     /// confidence never clears any `Some`, however low).
+    /// `/capabilities` renders exactly the DECLARED floors, keyed by wire
+    /// token; a seam with `None` is absent, not rendered as zero.
+    #[test]
+    fn confidence_floors_render_only_the_declared_seams() {
+        use super::CalibrationSeam;
+        let floors = CalibrationSeam::confidence_floors();
+        assert_eq!(floors.len(), 1, "{floors:?}");
+        assert!((floors["consolidation_merge"] - 0.80).abs() < f64::EPSILON);
+        assert!(!floors.contains_key("classify_kind"));
+        assert_eq!(CalibrationSeam::ALL.len(), 4);
+    }
+
     #[test]
     fn confidence_floor_is_some_only_on_the_merge_seam_today() {
         use super::CalibrationSeam;
