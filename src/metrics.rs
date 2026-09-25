@@ -1940,29 +1940,34 @@ pub fn record_store(tier: &str, ok: bool) {
 
 /// #3806 W2 — record ONE `[decision]` seam call.
 ///
-/// `seam` is the preregistered `CalibrationSeam` token and `outcome` is
-/// the closed five-value set, so the two series' cardinality is bounded
-/// by construction rather than by what a caller happens to pass. Both
-/// children are created LAZILY by the first call, which is half of
-/// "`[decision]` unset is byte-identical": an unconfigured deployment
-/// never reaches this function, so its `/metrics` body is unchanged.
+/// #3806 R5 — every label is DERIVED from a closed type: `seam` from the
+/// preregistered [`CalibrationSeam`] and both `outcome` and `reason` from
+/// [`DecisionOutcome`]. The series' cardinality is therefore bounded by
+/// construction (4 seams x 5 outcomes, 4 x 6 reasons) — a caller cannot
+/// pass a label at all. Both children are created LAZILY by the first
+/// call, which is half of "`[decision]` unset is byte-identical": an
+/// unconfigured deployment never reaches this function, so its
+/// `/metrics` body is unchanged.
+///
+/// [`CalibrationSeam`]: crate::decision_clients::calibration::CalibrationSeam
+/// [`DecisionOutcome`]: crate::decision::DecisionOutcome
 pub fn record_decision(
-    seam: &str,
-    outcome: &str,
-    abstain_reason: Option<&str>,
+    seam: crate::decision_clients::calibration::CalibrationSeam,
+    outcome: crate::decision::DecisionOutcome,
     latency_seconds: f64,
 ) {
+    let seam = seam.as_str();
     registry()
         .decision_latency_seconds
         .with_label_values(&[seam])
         .observe(latency_seconds);
     registry()
         .decision_outcome_total
-        .with_label_values(&[seam, outcome])
+        .with_label_values(&[seam, outcome.outcome_label()])
         .inc();
     // Only an abstain has a reason, so the "why not" series is exactly
     // the abstains and never dilutes them with decisions.
-    if let Some(reason) = abstain_reason {
+    if let Some(reason) = outcome.reason_label() {
         registry()
             .decision_abstain_total
             .with_label_values(&[seam, reason])

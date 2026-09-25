@@ -130,7 +130,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, anyhow};
 
 use crate::config::AppConfig;
-use crate::decision::{AbstainReason, Decision, DecisionSource};
+use crate::decision::{AbstainReason, Decision, DecisionOutcome, DecisionSource};
 use crate::decision_boot::{DecisionBootOutcome, DecisionProviderHandle, build_decision_provider};
 use crate::decision_clients::calibration::CalibrationSeam;
 use crate::decision_config::{DecisionFallback, fallback_phrase};
@@ -143,23 +143,6 @@ use crate::models::MemoryKind;
 /// honours its deadline always reports [`AbstainReason::Timeout`]
 /// rather than being cut off by the bridge with a less specific error.
 const SEAM_BRIDGE_SLACK: Duration = Duration::from_secs(1);
-
-/// `decision_outcome` label values. A CLOSED set: every
-/// [`Decision`] maps onto exactly one of these, so the metric's
-/// cardinality is bounded by construction (4 seams x 5 outcomes).
-mod outcome {
-    /// The decision model answered.
-    pub(super) const DECIDED: &str = "decided";
-    /// The generative fallback answered in its place.
-    pub(super) const FALLBACK: &str = "fallback";
-    /// The per-call budget elapsed.
-    pub(super) const TIMEOUT: &str = "timeout";
-    /// The egress posture refused the outbound call.
-    pub(super) const EGRESS_REFUSED: &str = "egress_refused";
-    /// No opinion for any other reason (no provider, unusable answer,
-    /// unsupported question).
-    pub(super) const ABSTAINED: &str = "abstained";
-}
 
 /// What a seam should do with the decider's answer.
 ///
@@ -242,8 +225,7 @@ impl DecisionSeams {
     fn no_provider<T>(&self, seam: CalibrationSeam) -> Result<SeamOutcome<T>> {
         record(
             seam,
-            outcome_for_reason(AbstainReason::NoProvider),
-            Some(AbstainReason::NoProvider),
+            DecisionOutcome::Abstained(AbstainReason::NoProvider),
             Instant::now(),
         );
         self.on_abstain(AbstainReason::NoProvider)
@@ -288,28 +270,17 @@ impl DecisionSeams {
     }
 }
 
-/// The `decision_outcome` label for an ABSTAIN. Total over
-/// [`AbstainReason`], so no abstain can go unlabelled.
-fn outcome_for_reason(reason: AbstainReason) -> &'static str {
-    match reason {
-        AbstainReason::Timeout => outcome::TIMEOUT,
-        AbstainReason::EgressRefused => outcome::EGRESS_REFUSED,
-        AbstainReason::NoProvider
-        | AbstainReason::Unavailable
-        | AbstainReason::Unusable
-        | AbstainReason::Unsupported => outcome::ABSTAINED,
-    }
-}
-
-/// The `decision_outcome` label for one answer. Total over
-/// [`Decision`], so no answer can go unlabelled.
-fn outcome_of<T>(decision: &Decision<T>) -> &'static str {
+/// The outcome for one answer the seam USED. Total over [`Decision`],
+/// so no answer can go unlabelled.
+fn outcome_of<T>(decision: &Decision<T>) -> DecisionOutcome {
     match decision.abstain_reason() {
         None => match decision.source() {
-            DecisionSource::GenerativeFallback => outcome::FALLBACK,
-            DecisionSource::DecisionModel | DecisionSource::Deterministic => outcome::DECIDED,
+            DecisionSource::GenerativeFallback => DecisionOutcome::Fallback,
+            DecisionSource::DecisionModel | DecisionSource::Deterministic => {
+                DecisionOutcome::Decided
+            }
         },
-        Some(reason) => outcome_for_reason(reason),
+        Some(reason) => DecisionOutcome::Abstained(reason),
     }
 }
 
@@ -324,18 +295,8 @@ fn outcome_of<T>(decision: &Decision<T>) -> &'static str {
 /// Both series are created lazily by the first observation, so an
 /// unconfigured deployment's `/metrics` gains nothing — which is half of
 /// "unset is byte-identical".
-fn record(
-    seam: CalibrationSeam,
-    outcome: &'static str,
-    reason: Option<AbstainReason>,
-    started: Instant,
-) {
-    crate::metrics::record_decision(
-        seam.as_str(),
-        outcome,
-        reason.map(AbstainReason::as_str),
-        started.elapsed().as_secs_f64(),
-    );
+fn record(seam: CalibrationSeam, outcome: DecisionOutcome, started: Instant) {
+    crate::metrics::record_decision(seam, outcome, started.elapsed().as_secs_f64());
 }
 
 /// The closed vocabulary `classify_kind` chooses over: EVERY
@@ -384,7 +345,6 @@ pub(crate) fn classify_kind(
         record(
             CalibrationSeam::ClassifyKind,
             outcome_of(&decision),
-            None,
             started,
         );
         return Ok(SeamOutcome::Decided(kind));
@@ -392,8 +352,7 @@ pub(crate) fn classify_kind(
     let reason = decision.abstain_reason().unwrap_or(AbstainReason::Unusable);
     record(
         CalibrationSeam::ClassifyKind,
-        outcome_for_reason(reason),
-        Some(reason),
+        DecisionOutcome::Abstained(reason),
         started,
     );
     seams.on_abstain(reason)
@@ -426,7 +385,6 @@ pub(crate) async fn judge_contradiction(
         record(
             CalibrationSeam::DetectContradiction,
             outcome_of(&decision),
-            None,
             started,
         );
         return Ok(SeamOutcome::Decided(verdict));
@@ -434,8 +392,7 @@ pub(crate) async fn judge_contradiction(
     let reason = decision.abstain_reason().unwrap_or(AbstainReason::Unusable);
     record(
         CalibrationSeam::DetectContradiction,
-        outcome_for_reason(reason),
-        Some(reason),
+        DecisionOutcome::Abstained(reason),
         started,
     );
     seams.on_abstain(reason)

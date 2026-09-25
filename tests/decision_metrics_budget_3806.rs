@@ -16,6 +16,7 @@
 //! by all five `outcome` values and all six `AbstainReason` values. W2
 //! wires two seams, so nothing this deployment can do produces more.
 
+use ai_memory::decision::DecisionOutcome;
 use ai_memory::decision_clients::calibration::CalibrationSeam;
 use ai_memory::metrics;
 
@@ -93,20 +94,34 @@ fn the_decision_series_worst_case_fits_the_3654_budget() {
         CalibrationSeam::SynthesisVerdict,
         CalibrationSeam::ConsolidationMerge,
     ];
+    // #3806 R5 — the typed API is the only way in, so the worst case is
+    // EVERY value of the closed type on EVERY seam; no caller can mint a
+    // child outside it.
     for seam in seams {
-        for outcome in OUTCOMES {
-            metrics::record_decision(seam.as_str(), outcome, None, FIXED_LATENCY_SECONDS);
-        }
-        for reason in REASONS {
-            metrics::record_decision(
-                seam.as_str(),
-                "abstained",
-                Some(reason),
-                FIXED_LATENCY_SECONDS,
-            );
+        for outcome in DecisionOutcome::all() {
+            metrics::record_decision(seam, outcome, FIXED_LATENCY_SECONDS);
         }
     }
     let full = metrics::render();
+
+    // PRESENCE: EVERY child of the closed vocabularies exists, so the
+    // measurement below is the whole worst case and not a subset of it.
+    for seam in seams {
+        for outcome in OUTCOMES {
+            let child = format!(
+                "ai_memory_decision_outcome_total{{outcome=\"{outcome}\",seam=\"{}\"}}",
+                seam.as_str()
+            );
+            assert!(full.contains(&child), "missing worst-case child {child}");
+        }
+        for reason in REASONS {
+            let child = format!(
+                "ai_memory_decision_abstain_total{{reason=\"{reason}\",seam=\"{}\"}}",
+                seam.as_str()
+            );
+            assert!(full.contains(&child), "missing worst-case child {child}");
+        }
+    }
 
     // PRESENCE: the worst case really was created, so the size below is
     // a measurement of something rather than of nothing.

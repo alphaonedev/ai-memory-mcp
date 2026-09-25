@@ -74,7 +74,9 @@ use anyhow::{Result, anyhow, bail};
 use reqwest::Url;
 use serde_json::Value;
 
-use crate::decision::{AbstainReason, DecisionProvider, DecisionSource, ScoreRange};
+use crate::decision::{
+    AbstainReason, DecisionCapability, DecisionProvider, DecisionSource, ScoreRange,
+};
 use crate::decision_config::{
     DecisionFallback, PROVIDER_LOCAL_NLI, PROVIDER_SYSTEMONE, ResolvedDecision, fallback_phrase,
 };
@@ -546,6 +548,12 @@ impl DecisionProvider for FallbackChain {
         self.primary.provider_id()
     }
 
+    /// A chain answers with its PRIMARY's capabilities: the fallback leg
+    /// covers unavailability, never a question the primary cannot ask.
+    fn supports(&self, capability: DecisionCapability) -> bool {
+        self.primary.supports(capability)
+    }
+
     async fn choose(&self, prompt: &str, options: &[&str]) -> crate::decision::Choice {
         let first = self.primary.choose(prompt, options).await;
         match first.abstain_reason() {
@@ -573,6 +581,43 @@ impl DecisionProvider for FallbackChain {
             _ => first,
         }
     }
+}
+
+/// #3806 R6 — the capabilities the WIRED seams ask of a provider:
+/// `classify_kind` chooses, `detect_contradiction` judges. A unit that
+/// wires a new seam adds its capability here, so the boot chokepoint
+/// refuses a provider that could never answer it.
+pub const SEAM_CAPABILITIES: [DecisionCapability; 2] =
+    [DecisionCapability::Choose, DecisionCapability::Judge];
+
+/// #3806 R6 — refuse, BY NAME and at construction, a provider that cannot
+/// answer a capability a wired seam requires.
+///
+/// The vote (4d3ea1c5, R6): `Unsupported` is a PERMANENT capability
+/// mismatch, so it belongs at the boot chokepoint with the `local-nli`
+/// refusal below, not rediscovered as a per-call abstain on every seam
+/// call. A refused construction leaves the handle on the always-
+/// abstaining `NullDecider` and reports `configured`, so every seam takes
+/// its `fallback` branch (case 2) — visibly, once, at boot.
+///
+/// # Errors
+/// Names every seam capability `provider` does not support.
+pub fn require_seam_capabilities(provider: &dyn DecisionProvider) -> Result<()> {
+    let missing: Vec<&str> = SEAM_CAPABILITIES
+        .into_iter()
+        .filter(|capability| !provider.supports(*capability))
+        .map(DecisionCapability::as_str)
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "[decision].provider = {:?} cannot answer {} — a question a wired seam asks. \
+         Refused at construction so every seam takes its `fallback` branch rather than \
+         abstaining `unsupported` on every call (#3806)",
+        provider.provider_id(),
+        missing.join(", ")
+    )
 }
 
 /// Build the decision provider a seam will consult.
@@ -644,6 +689,9 @@ pub fn construct_pinned(
         )?)
     };
 
+    // #3806 R6 — a permanent capability mismatch is a boot refusal.
+    require_seam_capabilities(primary.as_ref())?;
+
     match resolved.fallback {
         DecisionFallback::Generative => {
             let secondary = generative.ok_or_else(|| {
@@ -665,6 +713,52 @@ pub(crate) const NETWORK_SOURCE: DecisionSource = DecisionSource::DecisionModel;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A provider that can judge and score but never choose.
+    #[derive(Debug)]
+    struct JudgeOnly;
+
+    #[async_trait::async_trait]
+    impl DecisionProvider for JudgeOnly {
+        fn provider_id(&self) -> &str {
+            "stub-provider"
+        }
+        async fn choose(&self, _p: &str, _o: &[&str]) -> crate::decision::Choice {
+            crate::decision::Choice::abstain(AbstainReason::Unsupported, NETWORK_SOURCE)
+        }
+        async fn score(&self, _p: &str, _r: ScoreRange) -> crate::decision::Scored {
+            crate::decision::Scored::abstain(AbstainReason::Unusable, NETWORK_SOURCE)
+        }
+        async fn judge(&self, _p: &str) -> crate::decision::Judgement {
+            crate::decision::Judgement::abstain(AbstainReason::Unusable, NETWORK_SOURCE)
+        }
+        fn supports(&self, capability: DecisionCapability) -> bool {
+            capability != DecisionCapability::Choose
+        }
+    }
+
+    /// #3806 R6 — a PERMANENT capability mismatch is refused at the boot
+    /// chokepoint, by name, instead of surfacing as `Unsupported` on every
+    /// seam call. PRESENCE control: a provider that supports every wired
+    /// capability passes the same gate, so the refusal is the mismatch's
+    /// doing and not a gate that refuses everything.
+    #[test]
+    fn a_provider_missing_a_seam_capability_is_refused_at_construction() {
+        let refusal = require_seam_capabilities(&JudgeOnly)
+            .expect_err("a provider that cannot `choose` must not back the classify_kind seam");
+        let text = refusal.to_string();
+        assert!(text.contains("choose"), "names the capability: {text}");
+        assert!(
+            !text.contains("judge"),
+            "names ONLY the missing one: {text}"
+        );
+        assert!(require_seam_capabilities(&crate::decision::NullDecider).is_ok());
+        // The wired set is exactly the two W2 seams' questions.
+        assert_eq!(
+            SEAM_CAPABILITIES,
+            [DecisionCapability::Choose, DecisionCapability::Judge]
+        );
+    }
 
     #[test]
     fn a_strict_parser_accepts_the_vocabulary_and_refuses_prose() {

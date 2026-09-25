@@ -239,6 +239,10 @@ const DECIDER_ALLOWED: &[&str] = &[
     "src/llm.rs",
     "src/reload.rs",
     "src/cli/curator.rs",
+    // #3806 vote R5 — `metrics.rs` names the closed `DecisionOutcome`
+    // type its decision series are keyed on (a label SINK, never a call
+    // site: it cannot obtain or consult a decider).
+    "src/metrics.rs",
 ];
 
 /// The chokepoint entry points (`build_decision_provider`,

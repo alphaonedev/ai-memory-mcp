@@ -180,11 +180,88 @@ impl AbstainReason {
     pub fn is_unavailable(self) -> bool {
         !matches!(self, Self::Unusable)
     }
+
+    /// Every reason in the closed vocabulary. Exists so the metrics
+    /// budget and a doc can enumerate the set without re-typing it.
+    #[must_use]
+    pub fn all() -> [Self; 6] {
+        [
+            Self::NoProvider,
+            Self::Timeout,
+            Self::EgressRefused,
+            Self::Unavailable,
+            Self::Unusable,
+            Self::Unsupported,
+        ]
+    }
 }
 
 impl fmt::Display for AbstainReason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+/// #3806 R5 — what a seam ACTED on, as the ONLY input the decision
+/// metric series accept.
+///
+/// The vote (4d3ea1c5, R5) found `metrics::record_decision` claiming its
+/// cardinality was "bounded by construction" while taking three bare
+/// `&str`s — so it was bounded only by what a caller happened to pass.
+/// This type makes the claim true: the `outcome` label and the `reason`
+/// label are both DERIVED from a value of a closed enum, so no caller can
+/// mint a new child, and a reason can exist only on an abstain (an
+/// "answered, with a reason" row is unrepresentable, ERRORS-09).
+///
+/// `#[non_exhaustive]` for the same reason as [`AbstainReason`] (API-07).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum DecisionOutcome {
+    /// The decision model answered, and the seam used the answer.
+    Decided,
+    /// The generative fallback answered in the decision model's place.
+    Fallback,
+    /// No answer the seam could use, for this reason.
+    Abstained(AbstainReason),
+}
+
+impl DecisionOutcome {
+    /// The `outcome` label: one of a CLOSED five (`decided`, `fallback`,
+    /// `timeout`, `egress_refused`, `abstained`). A timeout and an egress
+    /// refusal are named at this level because an operator alerts on
+    /// them; every other abstain is `abstained`, and the reason series
+    /// says why.
+    #[must_use]
+    pub fn outcome_label(self) -> &'static str {
+        match self {
+            Self::Decided => "decided",
+            Self::Fallback => "fallback",
+            Self::Abstained(AbstainReason::Timeout) => "timeout",
+            Self::Abstained(AbstainReason::EgressRefused) => "egress_refused",
+            Self::Abstained(
+                AbstainReason::NoProvider
+                | AbstainReason::Unavailable
+                | AbstainReason::Unusable
+                | AbstainReason::Unsupported,
+            ) => "abstained",
+        }
+    }
+
+    /// The `reason` label — present exactly when the seam abstained.
+    #[must_use]
+    pub fn reason_label(self) -> Option<&'static str> {
+        match self {
+            Self::Decided | Self::Fallback => None,
+            Self::Abstained(reason) => Some(reason.as_str()),
+        }
+    }
+
+    /// Every value: the two answers plus one abstain per reason.
+    #[must_use]
+    pub fn all() -> Vec<Self> {
+        let mut out = vec![Self::Decided, Self::Fallback];
+        out.extend(AbstainReason::all().into_iter().map(Self::Abstained));
+        out
     }
 }
 
@@ -447,6 +524,45 @@ pub trait DecisionProvider: fmt::Debug + Send + Sync {
 
     /// Judge `prompt` yes/no.
     async fn judge(&self, prompt: &str) -> Judgement;
+
+    /// #3806 R6 — whether this provider can answer `capability` AT ALL.
+    ///
+    /// A permanent capability mismatch (a provider that cannot `choose`,
+    /// say) is a property of the provider, not of a call, so it is
+    /// decided ONCE at the boot chokepoint
+    /// ([`crate::decision_clients::require_seam_capabilities`]) rather
+    /// than rediscovered as [`AbstainReason::Unsupported`] on every seam
+    /// call. Defaults to `true`: every provider this build constructs
+    /// answers all three.
+    fn supports(&self, capability: DecisionCapability) -> bool {
+        let _ = capability;
+        true
+    }
+}
+
+/// #3806 R6 — the three questions a [`DecisionProvider`] can be asked.
+/// `#[non_exhaustive]` (API-07), like the other public decision enums.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum DecisionCapability {
+    /// [`DecisionProvider::choose`].
+    Choose,
+    /// [`DecisionProvider::score`].
+    Score,
+    /// [`DecisionProvider::judge`].
+    Judge,
+}
+
+impl DecisionCapability {
+    /// The canonical token for this capability.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Choose => "choose",
+            Self::Score => "score",
+            Self::Judge => "judge",
+        }
+    }
 }
 
 /// The absent-provider path: a decider that ALWAYS abstains.

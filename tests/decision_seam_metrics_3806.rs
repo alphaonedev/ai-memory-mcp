@@ -45,6 +45,7 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use ai_memory::config::{AppConfig, LlmSection};
+use ai_memory::decision::DecisionOutcome;
 use ai_memory::decision_clients::calibration::CalibrationSeam;
 use ai_memory::decision_config::{DecisionFallback, DecisionSection};
 use ai_memory::decision_seams::attach_decider;
@@ -274,11 +275,8 @@ async fn the_decision_series_are_lazy_and_keep_an_outage_distinct_from_a_decline
         CalibrationSeam::ConsolidationMerge,
     ];
     for seam in seams {
-        for outcome in OUTCOMES {
-            metrics::record_decision(seam.as_str(), outcome, None, 0.042);
-        }
-        for reason in REASONS {
-            metrics::record_decision(seam.as_str(), "abstained", Some(reason), 0.042);
+        for outcome in DecisionOutcome::all() {
+            metrics::record_decision(seam, outcome, 0.042);
         }
     }
     let full = metrics::render();
@@ -303,5 +301,36 @@ async fn the_decision_series_are_lazy_and_keep_an_outage_distinct_from_a_decline
                 seam.as_str()
             );
         }
+    }
+}
+
+/// #3806 R5 — "bounded by construction" is now a property of the TYPE:
+/// the labels `record_decision` can emit are exactly the values of
+/// [`DecisionOutcome`], and they are EXACTLY the documented closed
+/// vocabularies — no label outside them is producible, and every label
+/// in them is (presence both ways, so neither set can drift silently).
+/// Before R5 the signature took three bare `&str`s and an arbitrary
+/// label became a new child (red probe recorded in the #3806 W125
+/// handoff); that code no longer compiles.
+#[test]
+fn the_decision_label_sets_are_the_closed_type_and_nothing_else() {
+    use std::collections::BTreeSet;
+    let outcomes: BTreeSet<&str> = DecisionOutcome::all()
+        .into_iter()
+        .map(DecisionOutcome::outcome_label)
+        .collect();
+    let reasons: BTreeSet<&str> = DecisionOutcome::all()
+        .into_iter()
+        .filter_map(DecisionOutcome::reason_label)
+        .collect();
+    assert_eq!(outcomes, OUTCOMES.into_iter().collect::<BTreeSet<_>>());
+    assert_eq!(reasons, REASONS.into_iter().collect::<BTreeSet<_>>());
+    // A reason exists ONLY on an abstain.
+    for outcome in DecisionOutcome::all() {
+        assert_eq!(
+            outcome.reason_label().is_some(),
+            matches!(outcome, DecisionOutcome::Abstained(_)),
+            "{outcome:?}"
+        );
     }
 }
