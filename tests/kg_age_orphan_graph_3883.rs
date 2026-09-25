@@ -259,6 +259,10 @@ async fn age_orphan_graph_quarantines_and_self_heals_3883() {
         .expect("store c");
 
     // ---- Cell 1 — orphan → link Ok + QUARANTINED outbox row, +1 not +MAX ----
+    // f1 goal4 fixture hardening: NO pooled backend may hold the graph while
+    // the raw catalog is mutated — close the store BEFORE orphaning (the
+    // reconnect below then only ever sees the orphan state).
+    store.pool().close().await;
     orphan_the_graph(&url).await.expect("orphan the graph");
     assert!(
         !ag_graph_row_present(&url)
@@ -388,6 +392,12 @@ async fn age_orphan_graph_quarantines_and_self_heals_3883() {
     );
 
     // ---- Cell 3 — heal → next drain SELF-HEALS (resets + projects) ----
+    // f1 goal4 fixture hardening: close the store AND boot2 BEFORE healing, so
+    // no backend that cached the orphan state straddles the catalog change.
+    store.pool().close().await;
+    if let Ok(b) = boot2.as_ref() {
+        b.pool().close().await;
+    }
     heal_the_graph(&url).await.expect("heal the graph");
     assert!(
         ag_graph_row_present(&url)
@@ -425,6 +435,8 @@ async fn age_orphan_graph_quarantines_and_self_heals_3883() {
     // an orphan, so the caller enqueues transient — attempt_count 0 — never
     // quarantines).
 
-    // In-file hygiene: leave the graph healthy for the next AGE test binary.
+    // In-file hygiene: leave the graph healthy for the next AGE test binary —
+    // with no pooled backend open across the catalog change (f1 goal4).
+    store.pool().close().await;
     heal_the_graph(&url).await.expect("heal graph after test");
 }
