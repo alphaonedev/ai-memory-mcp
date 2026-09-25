@@ -10,6 +10,14 @@
 //! nor allowlisted fails this test — that is the durable round-N
 //! guarantee (LESSON-5). `append_signed_event` stays ungated so resume
 //! can persist the attestation.
+//!
+//! #3942 — a Rust string literal may escape a newline with a trailing
+//! `\`, and the write verb and its companion keyword then sit on
+//! different physical lines. [`join_string_continuations`] collapses
+//! that escape before [`write_sql_line`], so a split `UPDATE` / `SET`
+//! (and the same split of `INSERT` / `INTO` or `DELETE` / `FROM`) is
+//! classified. The predicate itself stays single-line; the pre-#3942
+//! scanner is the frozen leg of `b7_scanner_sees_backslash_continued_write_sql_3942`.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -68,6 +76,63 @@ fn write_sql_line(line: &str) -> bool {
         && (upper.contains(" INTO ") || upper.contains("INTO\n") || upper.contains("INTO "))
         || upper.contains("DELETE FROM")
         || (upper.contains("UPDATE ") && upper.contains(" SET"))
+}
+
+/// #3942 — the pre-fix predicate, frozen verbatim. It is [`write_sql_line`]
+/// as it stood when both tokens had to share one physical line. The
+/// sensitivity test calls this on the UNJOINED source so a split
+/// `UPDATE \` / `SET` stays invisible, which is the bug.
+fn write_sql_line_single_line_frozen(line: &str) -> bool {
+    let t = line.trim_start();
+    if t.starts_with("//") {
+        return false;
+    }
+    let upper = line.to_ascii_uppercase();
+    (upper.contains("INSERT INTO") || upper.contains("INSERT OR"))
+        && (upper.contains(" INTO ") || upper.contains("INTO\n") || upper.contains("INTO "))
+        || upper.contains("DELETE FROM")
+        || (upper.contains("UPDATE ") && upper.contains(" SET"))
+}
+
+/// A line ends by escaping the newline when it has an odd run of
+/// trailing backslashes (Rust string-literal rule). An even run is a
+/// literal backslash and does not continue.
+fn escapes_newline(line: &str) -> bool {
+    let n = line.chars().rev().take_while(|c| *c == '\\').count();
+    n % 2 == 1
+}
+
+/// Collapse a `\`-escaped newline inside a string literal into one
+/// logical line, then drop the leading whitespace of the continued
+/// line (the string-literal rule). When that would glue two word
+/// characters (`UPDATE\` + `SET`), keep a single space so the keyword
+/// boundary the predicate looks for still exists.
+fn join_string_continuations(src: &str) -> String {
+    let lines: Vec<&str> = src.lines().collect();
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    let mut i = 0;
+    while i < lines.len() {
+        let mut acc = lines[i].to_string();
+        while escapes_newline(&acc) {
+            let Some(next) = lines.get(i + 1) else {
+                break;
+            };
+            let _ = acc.pop();
+            i += 1;
+            let continued = next.trim_start();
+            let glue = matches!(
+                (acc.chars().last(), continued.chars().next()),
+                (Some(a), Some(b)) if a.is_ascii_alphanumeric() && b.is_ascii_alphanumeric()
+            );
+            if glue {
+                acc.push(' ');
+            }
+            acc.push_str(continued);
+        }
+        out.push(acc);
+        i += 1;
+    }
+    out.join("\n")
 }
 
 /// #3934 — strip a leading visibility modifier (`pub`, `pub(crate)`,
@@ -232,6 +297,7 @@ fn fn_body_has_gate(src: &str, fn_name: &str) -> bool {
 fn ungated_write_fns_for(
     text: &str,
     start_of: impl Fn(&str) -> Option<(usize, String)>,
+    classify: impl Fn(&str) -> bool,
 ) -> Vec<String> {
     let lines: Vec<&str> = text.lines().collect();
     let starts: Vec<(usize, String)> = lines
@@ -242,7 +308,7 @@ fn ungated_write_fns_for(
     let mut out = Vec::new();
     let mut seen = HashSet::new();
     for (idx, line) in lines.iter().enumerate() {
-        if !write_sql_line(line) {
+        if !classify(line) {
             continue;
         }
         let Some(&(start, ref name)) = starts.iter().rev().find(|(s, _)| *s <= idx) else {
@@ -324,7 +390,7 @@ fn b7_scanner_sees_pub_restricted_write_fns_3934() {
     }
 "#;
 
-    let shipped = ungated_write_fns_for(planted, is_fn_start);
+    let shipped = ungated_write_fns_for(planted, is_fn_start, write_sql_line);
     assert!(
         shipped.contains(&"plant_pub_super_ungated".to_string()),
         "sensitivity: the widened scanner must FLAG an ungated pub(super) write fn (got {shipped:?})"
@@ -341,7 +407,7 @@ fn b7_scanner_sees_pub_restricted_write_fns_3934() {
     // R-203 — the frozen pre-fix predicate reproduces the blind spot: it does
     // NOT recognise the pub(super)/pub(in ..) fn starts, so their writes merge
     // into the preceding gated fn and are read as gated (accepted, not flagged).
-    let frozen = ungated_write_fns_for(planted, is_fn_start_prefix_frozen);
+    let frozen = ungated_write_fns_for(planted, is_fn_start_prefix_frozen, write_sql_line);
     assert!(
         !frozen.contains(&"plant_pub_super_ungated".to_string())
             && !frozen.contains(&"plant_pub_in_ungated".to_string()),
@@ -394,6 +460,91 @@ fn item_boundary_recognises_restricted_visibility_const_3934() {
     );
 }
 
+/// #3942 — a split `UPDATE \` / `SET` in an ungated fn must be flagged.
+/// The shipped scanner joins the continuation first. The frozen
+/// single-line predicate, run on the physical lines, stays blind to it
+/// (that is the gap). A gated split is not flagged, and a single-line
+/// `DELETE FROM` is still flagged.
+#[test]
+fn b7_scanner_sees_backslash_continued_write_sql_3942() {
+    let planted = r#"
+    pub fn plant_split_update_ungated(conn: &Connection) -> Result<()> {
+        conn.execute(
+            "UPDATE x \
+             SET y = 1",
+            [],
+        )?;
+        Ok(())
+    }
+
+    pub fn plant_split_insert_ungated(conn: &Connection) -> Result<()> {
+        conn.execute(
+            "INSERT \
+             INTO memories (id) VALUES (1)",
+            [],
+        )?;
+        Ok(())
+    }
+
+    pub fn plant_split_delete_ungated(conn: &Connection) -> Result<()> {
+        conn.execute(
+            "DELETE \
+             FROM memories WHERE id = 1",
+            [],
+        )?;
+        Ok(())
+    }
+
+    pub fn plant_split_update_gated(conn: &Connection) -> Result<()> {
+        gate_record_stop(conn)?;
+        conn.execute(
+            "UPDATE x \
+             SET y = 2",
+            [],
+        )?;
+        Ok(())
+    }
+
+    pub fn plant_single_line_still_seen(conn: &Connection) -> Result<()> {
+        conn.execute("DELETE FROM memories WHERE id = 3", [])?;
+        Ok(())
+    }
+"#;
+
+    let shipped = ungated_write_fns_for(
+        &join_string_continuations(planted),
+        is_fn_start,
+        write_sql_line,
+    );
+    for name in [
+        "plant_split_update_ungated",
+        "plant_split_insert_ungated",
+        "plant_split_delete_ungated",
+        "plant_single_line_still_seen",
+    ] {
+        assert!(
+            shipped.iter().any(|n| n == name),
+            "sensitivity: joined scanner must FLAG ungated `{name}` (got {shipped:?})"
+        );
+    }
+    assert!(
+        !shipped.iter().any(|n| n == "plant_split_update_gated"),
+        "specificity: a GATED split UPDATE must NOT be flagged (got {shipped:?})"
+    );
+
+    let frozen = ungated_write_fns_for(planted, is_fn_start, write_sql_line_single_line_frozen);
+    assert!(
+        !frozen.iter().any(|n| n == "plant_split_update_ungated")
+            && !frozen.iter().any(|n| n == "plant_split_insert_ungated")
+            && !frozen.iter().any(|n| n == "plant_split_delete_ungated"),
+        "R-203: the frozen single-line predicate must be BLIND to a \\-continued write (that is the #3942 gap); got {frozen:?}"
+    );
+    assert!(
+        frozen.iter().any(|n| n == "plant_single_line_still_seen"),
+        "R-203 control: the frozen predicate must still FLAG a single-line DELETE (got {frozen:?})"
+    );
+}
+
 #[test]
 fn record_stop_write_sql_fns_are_gated_or_allowlisted_b7() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -427,7 +578,7 @@ fn record_stop_write_sql_fns_are_gated_or_allowlisted_b7() {
         let Ok(raw) = fs::read_to_string(&path) else {
             continue;
         };
-        let text = strip_test_mod(&raw);
+        let text = join_string_continuations(strip_test_mod(&raw));
         let lines: Vec<&str> = text.lines().collect();
 
         // Pair every write-SQL line with the nearest preceding `fn`
