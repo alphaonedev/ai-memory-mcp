@@ -6790,19 +6790,9 @@ pub async fn bootstrap_serve(
     // `crate::mcp::handle_store` (auto-tag block)). When the configured tier has no
     // `llm_model` (keyword/semantic) or the Ollama endpoint is
     // unreachable, the client stays `None` and the hook silently
-    // degrades to operator-supplied tags only.
-    // #3806 W2 — the `[decision]` boot chokepoint runs here, exactly
-    // once, and its gated decider is ATTACHED to the client this
-    // surface's seams reach. `attach_decider` runs the chokepoint
-    // whether or not an `[llm]` client exists, so the `/capabilities`
-    // snapshot and the signed egress-refusal row W1b introduced are
-    // recorded exactly as before. `[decision]` unset returns the client
-    // untouched and both seams run their v1.0.0 bodies.
-    let llm = crate::decision_seams::attach_decider(
-        build_llm_client(feature_tier, app_config, db_path).await,
-        app_config,
-        db_path,
-    );
+    // degrades to operator-supplied tags only. #3806: attach_decider runs the [decision] gate.
+    let llm = build_llm_client(feature_tier, app_config, db_path).await;
+    let llm = crate::decision_seams::attach_decider(llm, app_config, db_path);
 
     let db_state: Db = Arc::new(Mutex::new((
         conn,

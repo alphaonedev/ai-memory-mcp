@@ -361,7 +361,7 @@ fn plan(cfg: &AppConfig, parent: &ResolvedLlm) -> anyhow::Result<Option<Decision
 
     // 1 — inline api_key literal (mirrors the [llm] rejection verbatim).
     if section.api_key.is_some() {
-        anyhow::bail!(crate::config::inline_api_key_refusal(SECTION));
+        anyhow::bail!(crate::config::secret_refusal::inline_key_refusal(SECTION));
     }
 
     // 2 — env vs file mutex.
@@ -563,6 +563,22 @@ pub fn resolve_decision(cfg: &AppConfig) -> Option<ResolvedDecision> {
         fallback: plan.fallback,
         source: ConfigSource::Config,
     })
+}
+
+impl AppConfig {
+    /// #3806 — resolve the `[decision]` structured-decision provider.
+    ///
+    /// Delegates to [`resolve_decision`], which owns the ladder, the
+    /// refusals and the key discipline. `None` means NO decision
+    /// provider: the section is absent, or it is present but could not be
+    /// honoured exactly as written — in which case the loader has already
+    /// refused it by name. Lives here, not in `src/config.rs`, because that
+    /// file is at its QUAL-10 ceiling. Independent of `[llm.auto_tag]`,
+    /// whose ignored endpoint keys keep the #3808 boot WARN.
+    #[must_use]
+    pub fn resolve_decision(&self) -> Option<ResolvedDecision> {
+        resolve_decision(self)
+    }
 }
 
 /// Parse-time refusals for `[decision]`. Called from

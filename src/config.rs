@@ -143,6 +143,7 @@ pub mod deprecated_keys;
 /// #3823 — refuse a non-loopback plaintext inference endpoint at config
 /// time, naming the key. Child module so config.rs stays under its ceiling.
 mod inference_endpoint_transit;
+pub(crate) mod secret_refusal; // #3806 — key names + the ONE inline-`api_key` refusal text.
 /// #3715 — unknown-key refusal at the loader, schema-derived.
 pub mod unknown_keys;
 
@@ -180,30 +181,7 @@ pub mod config_keys {
     pub const OLLAMA_URL: &str = "ollama_url";
     /// `[embeddings]` config-section name (#1146 sectioned schema).
     pub const SECTION_EMBEDDINGS: &str = "embeddings";
-    /// The `api_key_env` field name, shared by `[llm]` / `[embeddings]`
-    /// / `[decision]` (#3806; pm-v3.1 hardcoded-literal gate).
-    pub const API_KEY_ENV: &str = "api_key_env";
-    /// The `api_key_file` field name, shared by the same three sections.
-    pub const API_KEY_FILE: &str = "api_key_file";
-    /// The inline `api_key` trap field name, shared by the same three.
-    pub const API_KEY: &str = "api_key";
-    /// The `base_url` field name, shared by the same three sections.
-    pub const BASE_URL: &str = "base_url";
-}
-
-/// v0.7.x #1146 / #1598 / #3806 — the ONE inline-`api_key` refusal text.
-/// `[llm]`, `[embeddings]` and `[decision]` share it so the wording and
-/// the repair instructions cannot drift per section, and so the string
-/// lives in exactly one place (pm-v3.1 hardcoded-literal gate).
-#[must_use]
-pub(crate) fn inline_api_key_refusal(section: &str) -> String {
-    format!(
-        "inline `api_key = \"<literal>\"` in [{section}] is forbidden — \
-         use `api_key_env = \"<ENV_VAR_NAME>\"` to reference a process \
-         env var, or `api_key_file = \"/path/to/key\"` to reference a \
-         file (mode 0400 enforced). Inline secrets in config.toml \
-         (typically world-readable) are a credential leak."
-    )
+    pub use super::secret_refusal::{API_KEY, API_KEY_ENV, API_KEY_FILE, BASE_URL}; // #3806
 }
 
 // ---------------------------------------------------------------------------
@@ -654,12 +632,7 @@ pub struct Capabilities {
     /// process has not evaluated its shape.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deployment_shape: Option<crate::config::shape::detector::ShapeAssessment>,
-    /// #3806 W1b: the decision-provider boot state, from the CLOSED
-    /// vocabulary `absent` / `configured` / `refused_by_egress` /
-    /// `constructed`. OMITTED when this process has not run the
-    /// `[decision]` boot chokepoint, and when it ran and found no
-    /// `[decision]` section — so an operator who never configured one
-    /// sees the byte-identical v1.0.0 payload.
+    /// #3806: decision-provider boot state; OMITTED when unset (byte-identical v1.0.0).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decision_provider: Option<crate::decision_boot::DecisionBootReport>,
     /// Schema-version discriminator. Always `"2"` since v0.6.3.
@@ -2205,7 +2178,6 @@ pub struct CapabilitiesV3 {
     /// #3700: same deployment-shape snapshot as the v2 projection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deployment_shape: Option<crate::config::shape::detector::ShapeAssessment>,
-    /// #3806: same decision-provider boot snapshot as the v2 projection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decision_provider: Option<crate::decision_boot::DecisionBootReport>,
     /// Schema-version discriminator. Always `"3"` in v0.7.0.
@@ -3636,11 +3608,7 @@ pub struct AppConfig {
     /// `singleton`; an upgrade never promotes a node to a stricter shape.
     #[serde(default)]
     pub deployment: Option<DeploymentSection>,
-
-    /// #3806 — `[decision]` block: the structured-decision provider that
-    /// sits beside the generative `[llm]` backend. Absent = NO decision
-    /// provider and byte-identical v1.0.0 behaviour; see
-    /// [`crate::decision_config::resolve_decision`].
+    /// #3806 — `[decision]` provider beside `[llm]`; absent = byte-identical v1.0.0.
     #[serde(default)]
     pub decision: Option<crate::decision_config::DecisionSection>,
 }
@@ -8113,11 +8081,7 @@ pub(crate) fn resolve_api_key_ladder(
     api_key_file: Option<&str>,
     section: &str,
 ) -> (Option<String>, KeySource) {
-    // 1. Process env (highest). `None` means the section has NO
-    // dedicated `AI_MEMORY_*_API_KEY` catch-all: `[decision]` (#3806)
-    // deliberately has none, so a chat credential in the process
-    // environment can never be shipped to a different vendor's decision
-    // endpoint.
+    // 1. Process env (highest). `None` (#3806 `[decision]`): no catch-all key.
     if let Some(k) = primary_env
         .and_then(|name| std::env::var(name).ok())
         .filter(|s| !s.trim().is_empty())
@@ -8770,7 +8734,7 @@ impl AppConfig {
         if let Some(llm) = &self.llm {
             // Rejection 1 — inline api_key literal.
             if llm.api_key.is_some() {
-                return Err(inline_api_key_refusal("llm"));
+                return Err(secret_refusal::inline_key_refusal("llm"));
             }
             // Rejection 2 — env vs file mutex.
             if llm.api_key_env.is_some() && llm.api_key_file.is_some() {
@@ -8792,7 +8756,9 @@ impl AppConfig {
             // #1598 Rejection 4 — inline [embeddings].api_key literal
             // (mirrors the [llm] rejection above).
             if embeddings.api_key.is_some() {
-                return Err(inline_api_key_refusal(config_keys::SECTION_EMBEDDINGS));
+                return Err(secret_refusal::inline_key_refusal(
+                    config_keys::SECTION_EMBEDDINGS,
+                ));
             }
             // #1598 Rejection 5 — [embeddings] env vs file mutex.
             if embeddings.api_key_env.is_some() && embeddings.api_key_file.is_some() {
@@ -8807,10 +8773,6 @@ impl AppConfig {
         // #3823 — rejection 6: a non-loopback plaintext inference endpoint.
         self.validate_inference_endpoint_transit()
             .map_err(|e| e.to_string())?;
-        // #3806 — `[decision]` selector + secret + transit discipline. The
-        // predicate lives in `crate::decision_config` because this file is
-        // at its QUAL-10 ceiling; this is the wiring line. It is a no-op
-        // for a config without a `[decision]` section.
         crate::decision_config::validate(self).map_err(|e| e.to_string())?;
         Ok(())
     }
@@ -9645,23 +9607,6 @@ impl AppConfig {
             api_key_source,
             source: parent.source,
         }
-    }
-
-    /// #3806 — resolve the `[decision]` structured-decision provider.
-    ///
-    /// Thin delegate to [`crate::decision_config::resolve_decision`],
-    /// which owns the ladder, the refusals and the key discipline (this
-    /// file is at its QUAL-10 ceiling). `None` means NO decision
-    /// provider: the section is absent, or it is present but could not
-    /// be honoured exactly as written — in which case the loader has
-    /// already refused it by name.
-    ///
-    /// Independent of `[llm.auto_tag]`: that sibling's endpoint keys stay
-    /// parsed-and-WARNed exactly as #3808 landed them (a boot WARN, not a
-    /// refusal), so a config without `[decision]` loads byte-identically.
-    #[must_use]
-    pub fn resolve_decision(&self) -> Option<crate::decision_config::ResolvedDecision> {
-        crate::decision_config::resolve_decision(self)
     }
 
     /// v0.7.x (#1146) — resolve the canonical embedder configuration.
