@@ -581,6 +581,64 @@ pub fn attach_decider(
 mod tests {
     use super::*;
 
+    /// #3806 HARD CONSTRAINT — "the decider may only NARROW a destructive
+    /// path, never widen one". At the seam, every no-verdict outcome is
+    /// exhaustively one of: the conservative NON-ACTION, the v1.0.0 path
+    /// exactly as it ran without a decider (`generative`, case 2 only), or
+    /// an error (`refuse`, case 2 only). No abstain, under any posture,
+    /// can produce a verdict — so a decider can never cause an action the
+    /// v1.0.0 path would not also have taken — and a DECLINE never
+    /// re-opens the v1.0.0 text parse (case 3).
+    #[test]
+    fn no_abstain_under_any_posture_can_act_or_reask_a_decline() {
+        for fallback in [
+            DecisionFallback::Abstain,
+            DecisionFallback::Generative,
+            DecisionFallback::Refuse,
+        ] {
+            let seams = DecisionSeams {
+                state: SeamState::NoProvider { fallback },
+                breaker: SeamBreaker::default(),
+            };
+            for reason in AbstainReason::all() {
+                let outcome = seams.on_abstain::<bool>(reason);
+                match outcome {
+                    Ok(SeamOutcome::Decided(_)) => {
+                        panic!("{fallback:?}/{reason}: an abstain produced a verdict")
+                    }
+                    Ok(SeamOutcome::RunLegacy) => {
+                        assert!(
+                            fallback == DecisionFallback::Generative && reason.is_unavailable(),
+                            "{fallback:?}/{reason}: only case 2 under `generative` may run \
+                             the v1.0.0 path"
+                        );
+                    }
+                    Err(_) => assert!(
+                        fallback == DecisionFallback::Refuse && reason.is_unavailable(),
+                        "{fallback:?}/{reason}: only case 2 under `refuse` may error"
+                    ),
+                    Ok(SeamOutcome::Conservative) => {}
+                }
+            }
+            // PRESENCE — each posture's own branch is reachable, so the
+            // loop above is not vacuously all-Conservative.
+            let expected_case2 = seams.on_abstain::<bool>(AbstainReason::Unavailable);
+            match fallback {
+                DecisionFallback::Abstain => {
+                    assert!(matches!(expected_case2, Ok(SeamOutcome::Conservative)));
+                }
+                DecisionFallback::Generative => {
+                    assert!(matches!(expected_case2, Ok(SeamOutcome::RunLegacy)));
+                }
+                DecisionFallback::Refuse => assert!(expected_case2.is_err()),
+            }
+            assert!(matches!(
+                seams.on_abstain::<bool>(AbstainReason::Unusable),
+                Ok(SeamOutcome::Conservative)
+            ));
+        }
+    }
+
     /// #3806 R9 — the breaker's state machine, on explicit instants: it
     /// opens at the threshold, stays open for the cooldown, lets ONE
     /// probe through after it, re-opens if that probe fails, and closes

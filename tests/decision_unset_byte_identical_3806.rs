@@ -563,3 +563,67 @@ fn assert_handle_is_unforgeable() {
         sites.len()
     );
 }
+
+/// The trees that must NEVER consult a decider: governance holds
+/// `Permissions::evaluate` (`src/governance/mod.rs`), and federation holds
+/// the LWW merge (`src/federation/receive_auth.rs`).
+const NEVER_DECIDES: &[&str] = &["src/governance", "src/federation"];
+
+/// #3806 HARD CONSTRAINT (issue body, ratified by the 2026-09-19
+/// admission): the decider "never sits in `Permissions::evaluate` or the
+/// federation LWW merge". Pinned on its own, not left implied by the
+/// general allowlist above, because the allowlist is a list a reviewer
+/// may extend — and neither tree may ever be on it.
+///
+/// * ABSENCE — no file under either tree names ANY decider token, in code
+///   or in prose, and neither tree has an allowlist entry.
+/// * PRESENCE — the walk reached both trees AND the two named homes of the
+///   constraint (so an empty result is not a mis-rooted walk), and the
+///   same token scan DOES fire on a file that legitimately consults a
+///   decider (so it is not a broken matcher).
+#[test]
+fn the_decider_never_reaches_permissions_or_the_federation_merge_3806() {
+    let mut offenders = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
+    for root in NEVER_DECIDES {
+        let mut files = Vec::new();
+        rust_files(Path::new(root), &mut files);
+        assert!(files.len() > 5, "{root}: the walk must see the tree");
+        for path in files {
+            let rel = path.to_string_lossy().replace('\\', "/");
+            let body = fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {rel}: {e}"));
+            for token in DECIDER_TOKENS {
+                if body.contains(token) {
+                    offenders.push(format!("{rel}: {token}"));
+                }
+            }
+            seen.push(rel);
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "the decider must NEVER sit in Permissions::evaluate or the federation LWW merge \
+         (#3806 hard constraint):\n  {}",
+        offenders.join("\n  ")
+    );
+    for home in ["src/governance/mod.rs", "src/federation/receive_auth.rs"] {
+        assert!(seen.iter().any(|s| s == home), "{home} must be scanned");
+    }
+    let governance = fs::read_to_string("src/governance/mod.rs").expect("read governance");
+    assert!(
+        governance.contains("pub fn evaluate("),
+        "Permissions::evaluate must still live where this pin looks for it"
+    );
+    for entry in DECIDER_ALLOWED {
+        assert!(
+            !NEVER_DECIDES.iter().any(|root| entry.starts_with(root)),
+            "{entry}: neither tree may ever be allowlisted to name the decider"
+        );
+    }
+    // PRESENCE — the same scan fires where a decider IS consulted.
+    let seams = fs::read_to_string("src/decision_seams.rs").expect("read seams");
+    assert!(
+        DECIDER_TOKENS.iter().any(|t| seams.contains(t)),
+        "the token scan must match a file that legitimately names the decider"
+    );
+}
