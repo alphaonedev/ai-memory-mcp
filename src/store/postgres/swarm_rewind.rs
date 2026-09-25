@@ -21,7 +21,7 @@
 //! preview, per-row compare-and-set so a row that moved between read and write
 //! is left alone (`Vanished`), never downgrade `Tombstoned` / `Quarantined`,
 //! the durable memory TEXT is never touched. Cost comes from
-//! [`crate::cost::postgres::lineage_rollup_pg`] — the first production reader
+//! [`crate::cost::postgres::lineage_nodes_rollup_pg`] — the first production reader
 //! of the #3323 postgres counters.
 
 use super::{
@@ -33,7 +33,6 @@ use crate::storage::{
     CONTAMINATION_METADATA_KEY, SWARM_REWIND_MARKER_KEY, StampAuthority, SwarmRewindCost,
     SwarmRewindReport,
 };
-use crate::store::MemoryStore;
 
 /// Per-row outcome of the contaminating compare-and-set (sqlite
 /// `ContaminateOutcome` twin).
@@ -167,7 +166,9 @@ impl PostgresStore {
         authority: StampAuthority<'_>,
     ) -> StoreResult<crate::storage::ContaminationStampReport> {
         self.gate_record_stop().await?;
-        let mut descendants = self.lineage_descendants(root_id, max_depth).await?;
+        // #3946: a safety decision reads the relational source of truth;
+        // healthy AGE may still be missing edges queued for projection.
+        let mut descendants = self.lineage_cte(root_id, max_depth, false).await?;
         // CONCURRENCY-04: one global row-lock order (by id) across sweeps.
         descendants.sort_by(|a, b| a.id.cmp(&b.id));
         let now = chrono::Utc::now().to_rfc3339();
@@ -253,7 +254,7 @@ impl PostgresStore {
         let max_depth = crate::storage::LINEAGE_MAX_DEPTH;
         if tgt.is_some_and(|t| !authority.admits(&t.metadata, &t.id, STAMP_SITE)) {
             let skipped = self
-                .lineage_descendants(&link.target_id, max_depth)
+                .lineage_cte(&link.target_id, max_depth, false)
                 .await
                 .map_or(0, |d| d.len());
             crate::storage::contamination_marker::warn_skipped_unauthorized(
@@ -308,10 +309,17 @@ impl PostgresStore {
         let root_state = LifecycleState::from_str(&root_state_str).unwrap_or_default();
         let already_rewound = is_rewound(root_state, &object_or_empty(root_meta));
 
-        let mut descendants = self.lineage_descendants(root_id, max_depth).await?;
+        // #3946: a safety decision reads the relational source of truth;
+        // healthy AGE may still be missing edges queued for projection.
+        let mut descendants = self.lineage_cte(root_id, max_depth, false).await?;
         // CONCURRENCY-04: one global row-lock order (by id) across sweeps.
         descendants.sort_by(|a, b| a.id.cmp(&b.id));
-        let rollup = crate::cost::postgres::lineage_rollup_pg(&self.pool, root_id, max_depth)
+        // Meter precisely the same closure (plus its root), including the
+        // walk's quarantine filtering, without a second graph traversal.
+        let node_ids: Vec<&str> = std::iter::once(root_id)
+            .chain(descendants.iter().map(|node| node.id.as_str()))
+            .collect();
+        let rollup = crate::cost::postgres::lineage_nodes_rollup_pg(&self.pool, root_id, &node_ids)
             .await
             .map_err(|e| to_store_err("swarm_rewind lineage cost", e))?;
         let mut report = SwarmRewindReport {
