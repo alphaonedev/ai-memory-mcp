@@ -409,6 +409,7 @@ fn report_vocabulary_is_closed() {
     vocabulary.insert("operator_supplied".to_string());
     vocabulary.insert("PASS".to_string());
     vocabulary.insert("FAIL".to_string());
+    vocabulary.insert("PARTIAL".to_string());
     for token in [
         "pass",
         "fail_ece",
@@ -745,4 +746,61 @@ fn report_is_written_for_the_evidence_producer() {
         }
         std::fs::write(&path, &rendered).expect("write the requested report");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Campaign completeness (f1 F4, #3806)
+// ---------------------------------------------------------------------------
+
+/// f1 F4 — an operator corpus holding ONE seam's held-out set and NO
+/// negative control used to report an unqualified PASS, although a green
+/// report is documented to demonstrate negative-control discrimination
+/// across the campaign. It now reports `PARTIAL`: every set it measured
+/// met its expectation, but the corpus does not certify the W5 contract,
+/// and a partial report is never a PASS. PRESENCE control on the same
+/// builder: the full in-repo corpus (every seam + the miscalibrated
+/// control) still reports PASS, and dropping ONLY the negative control
+/// from it is PARTIAL too.
+#[test]
+fn a_partial_campaign_is_never_a_pass() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let one = tmp.path().join("one-seam");
+    std::fs::create_dir_all(&one).expect("mkdir");
+    let name = "classify_kind.heldout.jsonl";
+    let bytes = std::fs::read(fixture_dir().join(name)).expect("read fixture");
+    std::fs::write(one.join(name), &bytes).expect("write fixture");
+    std::fs::write(
+        one.join(MANIFEST_FILE),
+        format!("{}  {name}\n", sha256_hex(&bytes)),
+    )
+    .expect("write manifest");
+    let partial = build(&one, FixtureDirKind::OperatorSupplied, CALIBRATION_SEED)
+        .expect("a preregistered one-seam corpus measures");
+    assert_eq!(partial.seams.len(), 1);
+    assert!(
+        partial.seams[0].expectation_met,
+        "the one set it has is fine"
+    );
+    assert_eq!(
+        partial.verdict,
+        ReportVerdict::Partial,
+        "one seam and no negative control must never certify the campaign as PASS"
+    );
+
+    // Every seam, but NO negative control: still not a PASS.
+    let (_hold, dir) = scratch_copy();
+    std::fs::remove_file(dir.join("synthesis_verdict.miscalibrated.jsonl")).expect("rm");
+    let manifest = std::fs::read_to_string(dir.join(MANIFEST_FILE)).expect("read manifest");
+    let kept: String = manifest
+        .lines()
+        .filter(|l| !l.ends_with("synthesis_verdict.miscalibrated.jsonl"))
+        .flat_map(|l| [l, "\n"])
+        .collect();
+    std::fs::write(dir.join(MANIFEST_FILE), kept).expect("rewrite manifest");
+    let no_control =
+        build(&dir, FixtureDirKind::OperatorSupplied, CALIBRATION_SEED).expect("measures");
+    assert_eq!(no_control.verdict, ReportVerdict::Partial);
+
+    // PRESENCE — the complete corpus is still a PASS.
+    assert_eq!(report().verdict, ReportVerdict::Pass);
 }

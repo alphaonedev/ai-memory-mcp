@@ -32,7 +32,9 @@
 #   decision-calibration.json   the report
 #   bundle.json                 the evidence bundle
 #
-# Exit: 0 clean · 1 the harness or the bundle check refused · 2 usage.
+# Exit: 0 the report verdict is PASS · 1 the harness or the bundle check
+# refused, OR the report verdict is FAIL / PARTIAL (the report and bundle are
+# still written first) · 2 usage.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -99,6 +101,30 @@ verify_manifest_independently() {
   return "$rc"
 }
 
+# --- f1 F3 (#3806): the report's verdict decides the EXIT ---------------------
+# The report and the bundle are written FIRST, whatever the verdict — failing
+# evidence is still evidence — and only then does a non-PASS verdict turn into
+# a non-zero exit, so an exit-code consumer (CI) can never read a FAIL or a
+# PARTIAL campaign as success.
+exit_for_verdict() {
+  case "$1" in
+    PASS) echo 0 ;;
+    *) echo 1 ;;
+  esac
+}
+
+# The report's verdict in the evidence-bundle closed vocabulary. PARTIAL (f1
+# F4: the corpus did not cover the campaign) has no bundle token of its own and
+# must never bind as PASS, so it binds as BLOCKED with a closed-set reason.
+bundle_verdict_for() {
+  case "$1" in
+    PASS) echo PASS ;;
+    FAIL) echo FAIL ;;
+    PARTIAL) echo 'BLOCKED{partial_campaign}' ;;
+    *) echo FAIL ;;
+  esac
+}
+
 # --- --self-test: prove the independent check is load-bearing ---------------
 if [[ "$SELF_TEST" -eq 1 ]]; then
   scratch="$ROOT/.local-runs/decision-calibration-selftest-$$"
@@ -119,7 +145,18 @@ if [[ "$SELF_TEST" -eq 1 ]]; then
     echo "FAIL: self-test — an unpreregistered held-out set was accepted" >&2
     exit 2
   fi
-  echo "PASS: self-test — mutated and unpreregistered held-out sets both refused"
+  # f1 F3 — the EXIT follows the report's verdict, after the artifacts.
+  for pair in "PASS:0" "FAIL:1" "PARTIAL:1" "garbage:1" ":1"; do
+    v="${pair%%:*}"; want="${pair##*:}"
+    got="$(exit_for_verdict "$v")"
+    if [[ "$got" != "$want" ]]; then
+      echo "FAIL: self-test — verdict '$v' would exit $got, not $want" >&2
+      exit 2
+    fi
+  done
+  [[ "$(bundle_verdict_for PARTIAL)" == 'BLOCKED{partial_campaign}' ]] \
+    || { echo "FAIL: self-test — PARTIAL must not bind to a PASS bundle" >&2; exit 2; }
+  echo "PASS: self-test — mutated and unpreregistered held-out sets both refused; a non-PASS verdict exits non-zero"
   exit 0
 fi
 
@@ -167,7 +204,7 @@ print(json.load(open(sys.argv[1], encoding="utf-8"))["verdict"])
   --out "$BUNDLE" \
   --producer "$PRODUCER_ID" \
   --binary "$BIN" \
-  --verdict "$VERDICT" \
+  --verdict "$(bundle_verdict_for "$VERDICT")" \
   --oracle-kind independent \
   --p99-method not-applicable \
   --started-at "$STARTED"
@@ -186,3 +223,10 @@ for s in doc["seams"]:
              s["provider"]["ece_bootstrap_p95"], s["coverage"],
              s["gate"]["verdict"], s["expectation"]))
 ' "$REPORT"
+
+# f1 F3 — every artifact is written; now the verdict decides the exit.
+RC="$(exit_for_verdict "$VERDICT")"
+if [[ "$RC" -ne 0 ]]; then
+  echo "REFUSED: report verdict is $VERDICT, not PASS — exiting non-zero (report: $REPORT)" >&2
+fi
+exit "$RC"

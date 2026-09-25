@@ -230,10 +230,24 @@ pub fn build(
     }
     seams.sort_by(|a, b| a.fixture_file.cmp(&b.fixture_file));
 
-    let verdict = if seams.iter().all(|s| s.expectation_met) {
+    // f1 F4 (#3806) — PASS certifies the CAMPAIGN, not just the rows
+    // present: every seam's held-out set AND at least one negative control
+    // (a miscalibrated set the gate must fail). A corpus whose rows all met
+    // their expectations but that lacks any of these is PARTIAL — reported
+    // as such, never as PASS, and the producer exits non-zero on it.
+    let complete = super::Seam::ALL.iter().all(|seam| {
+        seams
+            .iter()
+            .any(|s| s.seam == *seam && s.variant == super::FixtureVariant::Heldout)
+    }) && seams
+        .iter()
+        .any(|s| s.variant == super::FixtureVariant::Miscalibrated);
+    let verdict = if !seams.iter().all(|s| s.expectation_met) {
+        ReportVerdict::Fail
+    } else if complete {
         ReportVerdict::Pass
     } else {
-        ReportVerdict::Fail
+        ReportVerdict::Partial
     };
 
     Ok(CalibrationReport {

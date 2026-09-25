@@ -133,6 +133,17 @@ Coverage and item-count refusals are evaluated BEFORE the ECE ceiling, so
   control was caught by the ECE arm specifically. A green report therefore
   proves the gate discriminates, not merely that today's numbers were
   flattering.
+* `verdict` is `PARTIAL` (never `PASS`) when every set present met its
+  expectation but the corpus does not cover the campaign — every seam's
+  `heldout` set AND at least one `miscalibrated` negative control (#3806, f1
+  F4). A one-seam operator corpus reports `PARTIAL`: its numbers are real, but
+  it cannot certify the contract. The bundle binds it as
+  `BLOCKED{partial_campaign}`.
+* `scripts/evidence/decision-calibration.sh` exits `0` ONLY on `PASS`. On
+  `FAIL` or `PARTIAL` it still writes the report and the bundle — failing
+  evidence is evidence — and then exits `1`, so a CI consumer that reads only
+  the exit code can never mistake a failing calibration for success (#3806,
+  f1 F3).
 
 ## What a corpus of this size can and cannot support
 

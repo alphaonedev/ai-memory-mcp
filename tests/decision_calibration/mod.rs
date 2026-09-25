@@ -281,6 +281,12 @@ pub enum ReportVerdict {
     Pass,
     #[serde(rename = "FAIL")]
     Fail,
+    /// f1 F4 — every set the corpus holds met its expectation, but the
+    /// corpus does not cover the campaign (every seam's held-out set AND at
+    /// least one negative control), so it cannot certify the W5 contract.
+    /// Never a PASS; the producer exits non-zero on it.
+    #[serde(rename = "PARTIAL")]
+    Partial,
 }
 
 // ---------------------------------------------------------------------------
