@@ -862,6 +862,7 @@ pub(crate) mod connection;
 pub(crate) mod contamination_marker;
 pub(crate) use contamination_marker::StampAuthority;
 pub(crate) mod decontaminate;
+mod lifecycle_write;
 // `pub` (rather than `pub(crate)`) so the V-4 closeout
 // integration test suite (`tests/signed_events_chain_v34.rs`) can
 // invoke `migrate_v34_backfill_chain` directly to exercise the
@@ -3933,64 +3934,7 @@ pub fn consolidate_source_hidden(id: &str) -> InvalidTransition {
     }
 }
 
-/// v0.8.0 Pillar 2 (#1709 / #1726) — persist a lifecycle-state transition
-/// on a single memory, ENFORCING the transition machine
-/// ([`crate::models::LifecycleState::can_transition_to`]). The current
-/// state is read and an illegal edge (`open → done`, a move out of a
-/// terminal state, a self-loop) is rejected with a typed
-/// [`InvalidTransition`] BEFORE any write — #1726 wired this gate, which
-/// the v64 column previously left inert. Bumps the Gap-1 `version` counter
-/// because a lifecycle advance IS a mutation observable to
-/// optimistic-concurrency callers.
-///
-/// Returns `true` when a row was updated, `false` when `id` did not match
-/// a live row (no transition to validate).
-///
-/// # Errors
-///
-/// * [`InvalidTransition`] — the `current → state` edge is not permitted.
-/// * Propagates rusqlite errors from the SELECT / UPDATE.
-pub fn set_lifecycle_state(
-    conn: &Connection,
-    id: &str,
-    state: crate::models::LifecycleState,
-) -> Result<bool> {
-    // #1726 — read the current state and validate the edge before writing.
-    use rusqlite::OptionalExtension;
-    let current: Option<String> = conn
-        .query_row(
-            "SELECT lifecycle_state FROM memories WHERE id = ?1",
-            params![id],
-            |r| r.get(0),
-        )
-        .optional()?;
-    let Some(current_str) = current else {
-        return Ok(false);
-    };
-    let from = crate::models::LifecycleState::from_str(&current_str).unwrap_or_default();
-    // A no-op (requested == current) is idempotent success, not a self-loop
-    // error — mirrors the `memory_update` handler contract ("a request equal
-    // to the stored state is a no-op, no error"). Lets the patch / HTTP
-    // callers pass the current state through without a pre-check.
-    if from == state {
-        return Ok(true);
-    }
-    if !from.can_transition_to(state) {
-        return Err(InvalidTransition {
-            id: id.to_string(),
-            from,
-            to: state,
-        }
-        .into());
-    }
-    let now = Utc::now().to_rfc3339();
-    let n = conn.execute(
-        "UPDATE memories SET lifecycle_state = ?1, updated_at = ?2, version = version + 1 \
-         WHERE id = ?3",
-        params![state.as_str(), now, id],
-    )?;
-    Ok(n > 0)
-}
+pub use lifecycle_write::set_lifecycle_state;
 
 /// v1.0.0 [#2402] — the operator INSPECTION half of the quarantine route-OUT
 /// contract: list the rows currently held in
@@ -18167,7 +18111,7 @@ static INSERT_IF_NEWER_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::n
                     THEN json_remove(json_patch(
                         CASE WHEN excluded.updated_at > memories.updated_at
                                   OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
-                             THEN excluded.metadata
+                             THEN {newer_metadata}
                              ELSE memories.metadata END,
                         COALESCE(
                             -- #2941 — same reserved set: a newer-wins federation
@@ -18181,7 +18125,7 @@ static INSERT_IF_NEWER_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::n
                     ELSE json_patch(
                         CASE WHEN excluded.updated_at > memories.updated_at
                                   OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
-                             THEN excluded.metadata
+                             THEN {newer_metadata}
                              ELSE memories.metadata END,
                         COALESCE(
                             (SELECT json_group_object(key, value)
@@ -18309,6 +18253,7 @@ static INSERT_IF_NEWER_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::n
              RETURNING id",
         conflict_target = crate::models::TITLE_SLOT_CONFLICT_TARGET,
         lifecycle_case = crate::models::crdt_merge::lifecycle_local_taint_wins_case("excluded", "memories"),
+        newer_metadata = crate::models::crdt_merge::sqlite_title_slot_newer_metadata(),
         unstamped_owner =
             crate::identity::owner_stamp::sqlite_unstamped_predicate(
                 crate::identity::owner_stamp::UPSERT_SURVIVING_METADATA_COL,

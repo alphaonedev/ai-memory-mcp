@@ -693,6 +693,36 @@ const SQL_SELECT_MEMORY_ROW_STAR_MID_LADDER: &str = "SELECT * FROM memories WHER
 static SQL_SELECT_MEMORY_ROW_BY_ID: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     format!("SELECT {MEMORY_READ_COLUMNS} FROM memories WHERE id = $1")
 });
+/// f1 goal4 FA (#3266) — the same-id federation merge's locked read: the row
+/// lock is held to commit, so the merge is computed from the row it overwrites.
+static SQL_SELECT_MEMORY_ROW_BY_ID_FOR_UPDATE: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| format!("{} FOR UPDATE", *SQL_SELECT_MEMORY_ROW_BY_ID));
+
+/// The same-id federation merge's full-row UPDATE (`merge_inbound`). The
+/// node-local metadata keys are overlaid from the row being updated by an
+/// atomic jsonb merge (f1 goal4 FA/FB), never written back from a copy.
+static SQL_MERGE_INBOUND_FULL_ROW_UPDATE: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| {
+        format!(
+            "UPDATE memories SET
+                tier = $2, namespace = $3, title = $4, content = $5, tags = $6,
+                priority = $7, confidence = $8, source = $9, access_count = $10,
+                created_at = $11, updated_at = $12, last_accessed_at = $13,
+                expires_at = $14, metadata = {metadata}, reflection_depth = $16,
+                memory_kind = $17, citations = $18, source_uri = $19,
+                source_span = $20, confidence_source = $21, confidence_signals = $22,
+                confidence_decayed_at = $23, entity_id = $24, persona_version = $25,
+                version = $26, mentioned_entity_id = $27, lifecycle_state = $28,
+                valid_from = $29, valid_until = $30,
+                -- #2292 — the sealed envelope is written in lockstep with
+                -- `content = $5` (both come from the already-resolved `merged`
+                -- row); an encryption-off merge writes plaintext + NULL,
+                -- clearing any stale ciphertext.
+                encrypted_envelope = $31
+             WHERE id = $1",
+            metadata = crate::models::crdt_merge::pg_node_local_overlay("$15::jsonb"),
+        )
+    });
 const SQL_SELECT_METADATA_BY_NS_TITLE: &str =
     "SELECT metadata FROM memories WHERE namespace = $1 AND title = $2";
 /// #1823 G6 — title-keyed id lookup, shared by the append-only spine's
@@ -8357,10 +8387,21 @@ impl PostgresStore {
         let Some(target) = target else {
             return Ok(());
         };
+        // f1 goal4 FC (#3266, GOD ruling): read, validate and write in ONE
+        // transaction — the row is read `FOR UPDATE` on the transaction's own
+        // connection (never the pool), and the UPDATE carries the validated
+        // `from` as a compare-and-set. A route-IN quarantine or a contamination
+        // stamp that commits before this read is SEEN (and refused by the
+        // transition machine); one that commits after it waits for this commit.
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("lifecycle transition begin tx", e))?;
         let current: Option<(String,)> =
-            sqlx::query_as("SELECT lifecycle_state FROM memories WHERE id = $1")
+            sqlx::query_as("SELECT lifecycle_state FROM memories WHERE id = $1 FOR UPDATE")
                 .bind(id)
-                .fetch_optional(&self.pool)
+                .fetch_optional(&mut *tx)
                 .await
                 .map_err(|e| to_store_err("read lifecycle_state for transition gate", e))?;
         let Some((current_str,)) = current else {
@@ -8372,22 +8413,33 @@ impl PostgresStore {
         if from == target {
             return Ok(());
         }
+        let illegal = |from: &str| StoreError::InvalidTransition {
+            detail: format!(
+                "CONFLICT: illegal lifecycle transition for memory {id}: {from} -> {target} is not permitted"
+            ),
+        };
         if !from.can_transition_to(target) {
-            return Err(StoreError::InvalidTransition {
-                detail: format!(
-                    "CONFLICT: illegal lifecycle transition for memory {id}: {from} -> {target} is not permitted"
-                ),
-            });
+            return Err(illegal(from.as_str()));
         }
-        sqlx::query(
+        let n = sqlx::query(
             "UPDATE memories SET lifecycle_state = $1, updated_at = NOW(), version = version + 1 \
-             WHERE id = $2",
+             WHERE id = $2 AND lifecycle_state = $3",
         )
         .bind(target.as_str())
         .bind(id)
-        .execute(&self.pool)
+        .bind(&current_str)
+        .execute(&mut *tx)
         .await
-        .map_err(|e| to_store_err("update lifecycle_state", e))?;
+        .map_err(|e| to_store_err("update lifecycle_state", e))?
+        .rows_affected();
+        // Unreachable under the held row lock; the CAS is the structural guard,
+        // and a miss is a typed conflict, never a silent no-op.
+        if n == 0 {
+            return Err(illegal(from.as_str()));
+        }
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("lifecycle transition commit", e))?;
         Ok(())
     }
 
@@ -25032,8 +25084,9 @@ impl MemoryStore for PostgresStore {
                         -- #1784 — on a newer-wins federation merge, overlay the
                         -- existing row's immutable provenance keys (agent_id +
                         -- consolidation derived_from / consolidated_from_agents)
-                        -- on top of EXCLUDED so they survive the merge.
-                        (EXCLUDED.metadata || (
+                        -- on top of EXCLUDED so they survive the merge. f1 goal4 FB:
+                        -- the LOCAL node-local keys survive, a peer's never lands.
+                        ({newer_metadata} || (
                             SELECT COALESCE(jsonb_object_agg(prov.k, prov.v), '{{}}'::jsonb)
                             FROM jsonb_each(memories.metadata) AS prov(k, v)
                             -- #2941 — reserved set, lockstep-gated on crate::RESERVED_UPSERT_METADATA_KEYS.
@@ -25173,6 +25226,7 @@ impl MemoryStore for PostgresStore {
             RETURNING id",
             lifecycle_case =
                 crate::models::crdt_merge::lifecycle_local_taint_wins_case("EXCLUDED", "memories"),
+            newer_metadata = crate::models::crdt_merge::pg_title_slot_newer_metadata(),
             conflict_target = crate::models::TITLE_SLOT_CONFLICT_TARGET,
             unstamped_owner_drop =
                 crate::identity::owner_stamp::pg_upsert_unstamped_owner_drop(
@@ -25358,14 +25412,28 @@ impl MemoryStore for PostgresStore {
         // row matches by id, fall through to `apply_remote_memory` (the
         // postgres `insert_if_newer` twin) for the fresh-insert +
         // (title, namespace) dedup-upsert LWW path.
-        let existing_row = sqlx::query(&SQL_SELECT_MEMORY_ROW_BY_ID)
+        //
+        // f1 goal4 FA (#3266, GOD ruling): the read and the write share ONE
+        // transaction. The row is read `FOR UPDATE` inside it and the lock is
+        // held to commit, so the merge (and its local-wins lifecycle predicate)
+        // is computed from the row actually being overwritten — a local rewind
+        // or release that commits while this peer write is in flight is either
+        // seen here or waits for it; never undone from a stale snapshot.
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("merge_inbound begin tx", e))?;
+        let existing_row = sqlx::query(&SQL_SELECT_MEMORY_ROW_BY_ID_FOR_UPDATE)
             .bind(&inbound.id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *tx)
             .await
             .map_err(|e| to_store_err("merge_inbound select by id", e))?;
 
         let Some(row) = existing_row else {
-            // No row by this id — defer to the unchanged LWW path.
+            // No row by this id — defer to the unchanged LWW path (the empty
+            // transaction is rolled back on drop).
+            drop(tx);
             return self.apply_remote_memory(ctx, inbound).await;
         };
 
@@ -25443,80 +25511,60 @@ impl MemoryStore for PostgresStore {
         // `update()` seal at ~4947.
         // Full-row UPDATE by id — every column is written verbatim from
         // the already-resolved merged row (NO CASE / GREATEST / COALESCE
-        // re-application; `merge_memory` resolved every field). Wrapped in
-        // a transaction so the read-merge-write is atomic.
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| to_store_err("merge_inbound begin tx", e))?;
+        // re-application; `merge_memory` resolved every field), in the SAME
+        // transaction that holds the row lock (f1 goal4 FA). The node-local
+        // metadata keys are overlaid from the locked row by an atomic jsonb
+        // merge (`pg_node_local_overlay`), never from a copy.
         let (merge_content, merge_envelope) = seal_content_for_insert(&mut *tx, &merged).await?;
-        sqlx::query(
-            "UPDATE memories SET
-                tier = $2, namespace = $3, title = $4, content = $5, tags = $6,
-                priority = $7, confidence = $8, source = $9, access_count = $10,
-                created_at = $11, updated_at = $12, last_accessed_at = $13,
-                expires_at = $14, metadata = $15, reflection_depth = $16,
-                memory_kind = $17, citations = $18, source_uri = $19,
-                source_span = $20, confidence_source = $21, confidence_signals = $22,
-                confidence_decayed_at = $23, entity_id = $24, persona_version = $25,
-                version = $26, mentioned_entity_id = $27, lifecycle_state = $28,
-                valid_from = $29, valid_until = $30,
-                -- #2292 — the sealed envelope is written in lockstep with
-                -- `content = $5` (both come from the already-resolved `merged`
-                -- row); an encryption-off merge writes plaintext + NULL,
-                -- clearing any stale ciphertext.
-                encrypted_envelope = $31
-             WHERE id = $1",
-        )
-        .bind(&merged.id)
-        .bind(merged.tier.as_str())
-        .bind(&merged.namespace)
-        .bind(&merged.title)
-        // #2292 — sealed placeholder ("" under an enabled gate, else content).
-        .bind(&merge_content)
-        .bind(&tags_json)
-        .bind(merged.priority)
-        .bind(merged.confidence)
-        .bind(&merged.source)
-        .bind(merged.access_count)
-        .bind(created_at)
-        .bind(updated_at)
-        .bind(last_accessed_at)
-        .bind(expires_at)
-        .bind(&merged.metadata)
-        .bind(merged.reflection_depth)
-        .bind(merged.memory_kind.as_str())
-        .bind(&citations_json)
-        .bind(merged.source_uri.as_ref())
-        .bind(source_span_json.as_deref())
-        .bind(merged.confidence_source.as_str())
-        .bind(confidence_signals_json.as_deref())
-        .bind(confidence_decayed_at)
-        .bind(merged.entity_id.as_ref())
-        .bind(merged.persona_version)
-        .bind(merged.version)
-        .bind(mentioned_entity_id.as_deref())
-        .bind(merged.lifecycle_state.as_str())
-        // #2207 — the #1834 claim-bitemporal VALID-time interval (TEXT
-        // RFC3339). The same-`id` federation merge lane MUST persist the
-        // merged `valid_until` so a peer that CLOSED a claim replicates the
-        // close by id (newer-wins in `merge_memory`) → replicas converge on
-        // VALID-time. `valid_from` is local-immutable in `merge_memory`; the
-        // overwrite is a no-op (matches the `apply_remote_memory` upsert
-        // arm's `valid_from = memories.valid_from` genesis-wins rule).
-        // Canonicalized to the fixed UTC rendering (pre-ship 3x7).
-        .bind(crate::validate::canonical_valid_time_opt(
-            merged.valid_from.as_deref(),
-        ))
-        .bind(crate::validate::canonical_valid_time_opt(
-            merged.valid_until.as_deref(),
-        ))
-        // #2292 — sealed ciphertext envelope ($31); NULL when encryption off.
-        .bind(merge_envelope)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| to_store_err("merge_inbound full-row update", e))?;
+        sqlx::query(&SQL_MERGE_INBOUND_FULL_ROW_UPDATE)
+            .bind(&merged.id)
+            .bind(merged.tier.as_str())
+            .bind(&merged.namespace)
+            .bind(&merged.title)
+            // #2292 — sealed placeholder ("" under an enabled gate, else content).
+            .bind(&merge_content)
+            .bind(&tags_json)
+            .bind(merged.priority)
+            .bind(merged.confidence)
+            .bind(&merged.source)
+            .bind(merged.access_count)
+            .bind(created_at)
+            .bind(updated_at)
+            .bind(last_accessed_at)
+            .bind(expires_at)
+            .bind(&merged.metadata)
+            .bind(merged.reflection_depth)
+            .bind(merged.memory_kind.as_str())
+            .bind(&citations_json)
+            .bind(merged.source_uri.as_ref())
+            .bind(source_span_json.as_deref())
+            .bind(merged.confidence_source.as_str())
+            .bind(confidence_signals_json.as_deref())
+            .bind(confidence_decayed_at)
+            .bind(merged.entity_id.as_ref())
+            .bind(merged.persona_version)
+            .bind(merged.version)
+            .bind(mentioned_entity_id.as_deref())
+            .bind(merged.lifecycle_state.as_str())
+            // #2207 — the #1834 claim-bitemporal VALID-time interval (TEXT
+            // RFC3339). The same-`id` federation merge lane MUST persist the
+            // merged `valid_until` so a peer that CLOSED a claim replicates the
+            // close by id (newer-wins in `merge_memory`) → replicas converge on
+            // VALID-time. `valid_from` is local-immutable in `merge_memory`; the
+            // overwrite is a no-op (matches the `apply_remote_memory` upsert
+            // arm's `valid_from = memories.valid_from` genesis-wins rule).
+            // Canonicalized to the fixed UTC rendering (pre-ship 3x7).
+            .bind(crate::validate::canonical_valid_time_opt(
+                merged.valid_from.as_deref(),
+            ))
+            .bind(crate::validate::canonical_valid_time_opt(
+                merged.valid_until.as_deref(),
+            ))
+            // #2292 — sealed ciphertext envelope ($31); NULL when encryption off.
+            .bind(merge_envelope)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("merge_inbound full-row update", e))?;
         // APPEND-ONLY-SANCTIONED (#1823 G6) — COW SUPERSEDE: the federation
         // LWW full-row overwrite rewrites content in place (same id); the
         // pre-merge content lives in the merge snapshot, never in the leaf.

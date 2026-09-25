@@ -724,6 +724,315 @@ async fn quarantined_release_keeps_memory_dequarantined(backend: &Backend) {
     );
 }
 
+// ---------------------------------------------------------------------------
+// f1 goal4 FB (#3266, GOD ruling on the landing candidate) — the title-slot
+// (different-id, same (title, namespace)) newer-wins upsert arm on BOTH
+// adapters keeps the LOCAL node-local metadata keys and never adopts a peer's.
+// ---------------------------------------------------------------------------
+
+/// f1's `PROBE_TITLE`: a newer peer row with a DIFFERENT id and the SAME title
+/// lands on a contaminated local holder. The holder stays contaminated AND
+/// keeps its marker (the restore anchor), so a later release restores the
+/// recorded prior state (`active`), not the `open` fallback.
+async fn title_slot_keeps_local_marker_then_release_restores_prior(backend: &Backend) {
+    let peer = uniq("ai:peer-fb");
+    let ns = uniq("r2-fb");
+    let (id, title) = (uniq("holder"), uniq("t"));
+    let _posture = Posture::new(&peer, &ns, false);
+    let (router, store, db) = router(backend).await;
+    seed_open(backend, &db, &store, &id, &ns, &title, &peer).await;
+    let marker = local_marker("active");
+    let meta = json!({"agent_id": peer, MARKER: marker});
+    force_state(backend, &db, &store, &id, "contaminated", &meta).await;
+
+    let wire = memory_json(&uniq("other-id"), &ns, &title, "peer text", &peer, T_NEW);
+    let (status, report) = push(&router, &peer, vec![wire]).await;
+    assert!(status.is_success(), "{status} {report}");
+    let got = row(backend, &db, &store, &id).await.expect("holder kept");
+    assert_eq!(got.state, "contaminated", "{got:?}");
+    assert_eq!(
+        got.metadata[MARKER], marker,
+        "the title-slot newer-wins arm must keep the local marker: {got:?}"
+    );
+    let operator = uniq("operator");
+    assert!(release(backend, &db, &store, &id, &operator).await);
+    let released = row(backend, &db, &store, &id).await.expect("row");
+    assert_eq!(
+        released.state, "active",
+        "release restores the recorded prior, not the open fallback: {released:?}"
+    );
+}
+
+/// Upsert one peer row through the adapter's title-slot newer-wins arm
+/// directly (below the receive normalisation).
+#[allow(unused_variables)] // `store` is read by the pg arm only
+async fn upsert_peer_row(
+    backend: &Backend,
+    db: &Db,
+    store: &Arc<dyn MemoryStore>,
+    peer: &str,
+    wire: Value,
+) {
+    let m: ai_memory::models::Memory = serde_json::from_value(wire).expect("memory");
+    match backend {
+        Backend::Sqlite => {
+            let guard = db.lock().await;
+            ai_memory::db::insert_if_newer(&guard.0, &m).expect("upsert");
+        }
+        #[cfg(feature = "sal-postgres")]
+        Backend::Postgres(_) => {
+            store
+                .apply_remote_memory(&ai_memory::store::CallerContext::for_agent(peer), &m)
+                .await
+                .expect("upsert");
+        }
+    }
+}
+
+/// EACH of the four node-local keys (`crdt_merge::NODE_LOCAL_METADATA_KEYS`:
+/// `contamination` + the three G7 `contradiction_*`) is kept from the LOCAL
+/// holder by the title-slot newer-wins arm, and a peer's value for each is
+/// never adopted — on a holder that has them and on one that has none.
+async fn title_slot_never_adopts_peer_node_local_keys(backend: &Backend) {
+    let peer = uniq("ai:peer-fb");
+    let ns = uniq("r2-fb");
+    let (_router, store, db) = router(backend).await;
+    let local_values = json!({
+        "contamination": {"prior_lifecycle_state": "active", "contaminated_from": "local-root"},
+        "contradiction_conserved": "local-conserved",
+        "contradiction_soft_loser": true,
+        "contradiction_winner_id": "local-winner",
+    });
+    let peer_values = json!({
+        "contamination": {"prior_lifecycle_state": "done", "contaminated_from": "peer-root"},
+        "contradiction_conserved": "peer-conserved",
+        "contradiction_soft_loser": false,
+        "contradiction_winner_id": "peer-winner",
+    });
+    for local_has_keys in [true, false] {
+        let (id, title) = (uniq("holder"), uniq("t"));
+        seed_open(backend, &db, &store, &id, &ns, &title, &peer).await;
+        let mut local_meta = json!({"agent_id": peer});
+        if local_has_keys {
+            for (k, v) in local_values.as_object().expect("object") {
+                local_meta[k] = v.clone();
+            }
+        }
+        force_state(backend, &db, &store, &id, "open", &local_meta).await;
+        let mut wire = memory_json(&uniq("other-id"), &ns, &title, "peer text", &peer, T_NEW);
+        wire["metadata"] = json!({"agent_id": peer, "peer_note": 1});
+        for (k, v) in peer_values.as_object().expect("object") {
+            wire["metadata"][k] = v.clone();
+        }
+        upsert_peer_row(backend, &db, &store, &peer, wire).await;
+        let got = row(backend, &db, &store, &id).await.expect("holder kept");
+        assert_eq!(
+            got.content, "peer text",
+            "the newer peer row still wins: {got:?}"
+        );
+        assert_eq!(
+            got.metadata["peer_note"], 1,
+            "ordinary keys still merge: {got:?}"
+        );
+        for key in [
+            "contamination",
+            "contradiction_conserved",
+            "contradiction_soft_loser",
+            "contradiction_winner_id",
+        ] {
+            if local_has_keys {
+                assert_eq!(
+                    got.metadata.get(key),
+                    local_values.get(key),
+                    "local {key} must survive: {got:?}"
+                );
+            } else {
+                assert!(
+                    got.metadata.get(key).is_none(),
+                    "peer {key} must never be adopted: {got:?}"
+                );
+            }
+        }
+    }
+}
+
+/// The G7 soft-loser down-weight SURVIVES a title-slot peer push, as a RANKING
+/// effect (not only key presence): a conserved loser that out-ranks its
+/// winner on priority stays BELOW the winner after a newer different-id peer
+/// row lands on the loser's slot. Without the fix the key is dropped, the
+/// scoring CASE takes its no-penalty arm, and the loser silently wins.
+#[allow(unused_variables)] // `store` is read by the pg arm only
+async fn soft_loser_rank_survives_title_slot_peer_push(backend: &Backend) {
+    let peer = uniq("ai:peer-g7");
+    let tok = format!("g7tok{}", uniq("x").replace('-', ""));
+    let (loser_ns, winner_ns) = (uniq("g7-loser"), uniq("g7-winner"));
+    let _posture = Posture::new(&peer, &loser_ns, false);
+    let (router, store, db) = router(backend).await;
+    let title = format!("directive {tok}");
+    let content = format!("the canonical {tok}");
+    let mk = |id: &str, ns: &str, priority: i32, loser: bool| {
+        let mut v = memory_json(id, ns, &title, &content, &peer, T_OLD);
+        v["priority"] = json!(priority);
+        if loser {
+            v["metadata"]["contradiction_soft_loser"] = json!(true);
+        }
+        let m: ai_memory::models::Memory = serde_json::from_value(v).expect("memory");
+        m
+    };
+    let (loser, winner) = (uniq("loser"), uniq("winner"));
+    for m in [
+        mk(&loser, &loser_ns, 9, true),
+        mk(&winner, &winner_ns, 2, false),
+    ] {
+        match backend {
+            Backend::Sqlite => {
+                let guard = db.lock().await;
+                ai_memory::db::insert(&guard.0, &m).expect("seed");
+            }
+            #[cfg(feature = "sal-postgres")]
+            Backend::Postgres(_) => {
+                store
+                    .store(&ai_memory::store::CallerContext::for_agent(&peer), &m)
+                    .await
+                    .expect("seed");
+            }
+        }
+    }
+    let ranked = |order: Vec<String>| {
+        order
+            .into_iter()
+            .filter(|id| *id == loser || *id == winner)
+            .collect::<Vec<_>>()
+    };
+    let rank = || async {
+        match backend {
+            Backend::Sqlite => {
+                let guard = db.lock().await;
+                let (rows, _) = ai_memory::db::recall(
+                    &guard.0,
+                    &tok,
+                    None,
+                    10,
+                    None,
+                    None,
+                    None,
+                    ai_memory::SECS_PER_HOUR,
+                    ai_memory::SECS_PER_DAY,
+                    None,
+                    None,
+                    false,
+                    None,
+                    None,
+                    None,
+                )
+                .expect("recall");
+                ranked(rows.into_iter().map(|(m, _)| m.id).collect())
+            }
+            #[cfg(feature = "sal-postgres")]
+            Backend::Postgres(_) => {
+                let mut f = ai_memory::store::Filter::new();
+                f.limit = 10;
+                let rows = pg_store(&store)
+                    .search_with_source_uri(
+                        &ai_memory::store::CallerContext::for_agent(&peer),
+                        &tok,
+                        &f,
+                        None,
+                    )
+                    .await
+                    .expect("search");
+                ranked(rows.into_iter().map(|m| m.id).collect())
+            }
+        }
+    };
+    assert_eq!(
+        rank().await,
+        [winner.clone(), loser.clone()],
+        "precondition: the down-weight sinks the high-priority loser"
+    );
+    let wire = memory_json(&uniq("peer-id"), &loser_ns, &title, &content, &peer, T_NEW);
+    let (status, report) = push(&router, &peer, vec![wire]).await;
+    assert!(status.is_success(), "{status} {report}");
+    assert_eq!(
+        rank().await,
+        [winner.clone(), loser.clone()],
+        "a peer push must not restore a demoted soft-loser to full recall weight"
+    );
+    let held = row(backend, &db, &store, &loser)
+        .await
+        .expect("loser holder kept");
+    assert_eq!(held.metadata["contradiction_soft_loser"], true, "{held:?}");
+}
+
+/// f1 goal4 FC (#3266): a caller lifecycle transition that races a raw
+/// quarantine never overwrites it. SQLite: a second connection holds the
+/// write lock with the row quarantined but uncommitted; the caller's
+/// `set_lifecycle_state(open -> active)` blocks (the busy handler is the
+/// barrier), the quarantine commits, and the caller must then observe
+/// `quarantined` and refuse — the row stays quarantined.
+#[test]
+fn sqlite_set_lifecycle_state_never_overwrites_a_racing_quarantine_f1_goal4() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static BUSY_SEEN: AtomicBool = AtomicBool::new(false);
+    fn busy(_attempt: i32) -> bool {
+        BUSY_SEEN.store(true, Ordering::Release);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        true
+    }
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("fc.db");
+    let setup = ai_memory::db::open(&path).expect("open");
+    let m: ai_memory::models::Memory = serde_json::from_value(memory_json(
+        "fc-row", "fc", "fc title", "body", "ai:fc", T_OLD,
+    ))
+    .expect("memory");
+    ai_memory::db::insert(&setup, &m).expect("seed");
+    drop(setup);
+
+    let holder = ai_memory::db::open(&path).expect("holder conn");
+    holder.execute_batch("BEGIN IMMEDIATE").expect("write lock");
+    holder
+        .execute(
+            "UPDATE memories SET lifecycle_state = 'quarantined' WHERE id = 'fc-row'",
+            [],
+        )
+        .expect("quarantine (uncommitted)");
+    BUSY_SEEN.store(false, Ordering::Release);
+    let caller_path = path.clone();
+    let caller = std::thread::spawn(move || {
+        let conn = ai_memory::db::open(&caller_path).expect("caller conn");
+        conn.busy_handler(Some(busy)).expect("busy handler");
+        ai_memory::db::set_lifecycle_state(
+            &conn,
+            "fc-row",
+            ai_memory::models::LifecycleState::Active,
+        )
+        .map_err(|e| e.to_string())
+    });
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !BUSY_SEEN.load(Ordering::Acquire) {
+        assert!(std::time::Instant::now() < end, "caller never blocked");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    holder.execute_batch("COMMIT").expect("commit quarantine");
+    let outcome = caller.join().expect("caller thread");
+    let state: String = holder
+        .query_row(
+            "SELECT lifecycle_state FROM memories WHERE id = 'fc-row'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("state");
+    assert_eq!(
+        state, "quarantined",
+        "a caller transition validated against `open` overwrote a racing quarantine: {outcome:?}"
+    );
+    assert!(
+        outcome.is_err(),
+        "quarantined -> active is illegal: the caller must be refused, not silently succeed"
+    );
+}
+
 macro_rules! sqlite_cells {
     ($($name:ident => $body:ident),* $(,)?) => {$(
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -745,6 +1054,12 @@ sqlite_cells! {
     sqlite_release_of_non_contained_row_is_refused_3266 => release_of_non_contained_row_is_refused,
     sqlite_quarantined_release_keeps_memory_dequarantined_2402 =>
         quarantined_release_keeps_memory_dequarantined,
+    sqlite_title_slot_keeps_local_marker_then_release_restores_prior_f1_goal4 =>
+        title_slot_keeps_local_marker_then_release_restores_prior,
+    sqlite_title_slot_never_adopts_peer_node_local_keys_f1_goal4 =>
+        title_slot_never_adopts_peer_node_local_keys,
+    sqlite_soft_loser_rank_survives_title_slot_peer_push_f1_goal4 =>
+        soft_loser_rank_survives_title_slot_peer_push,
 }
 
 #[cfg(feature = "sal-postgres")]
@@ -754,6 +1069,9 @@ mod pg {
         local_taint_survives_remote_clean_row, quarantined_release_keeps_memory_dequarantined,
         release_of_non_contained_row_is_refused, remote_taint_not_adopted_existing_row,
         remote_taint_not_adopted_fresh_row, route_in_quarantine_still_applies_over_existing_row,
+        soft_loser_rank_survives_title_slot_peer_push,
+        title_slot_keeps_local_marker_then_release_restores_prior,
+        title_slot_never_adopts_peer_node_local_keys,
     };
 
     fn pg_backend() -> Option<Backend> {
@@ -788,6 +1106,12 @@ mod pg {
         pg_release_of_non_contained_row_is_refused_3266 => release_of_non_contained_row_is_refused,
         pg_quarantined_release_keeps_memory_dequarantined_2402 =>
             quarantined_release_keeps_memory_dequarantined,
+        pg_title_slot_keeps_local_marker_then_release_restores_prior_f1_goal4 =>
+            title_slot_keeps_local_marker_then_release_restores_prior,
+        pg_title_slot_never_adopts_peer_node_local_keys_f1_goal4 =>
+            title_slot_never_adopts_peer_node_local_keys,
+        pg_soft_loser_rank_survives_title_slot_peer_push_f1_goal4 =>
+            soft_loser_rank_survives_title_slot_peer_push,
     }
 }
 
@@ -956,5 +1280,278 @@ mod pg_race {
         assert!(released, "the locked read sees quarantined and releases it");
         assert_eq!(row(&pg, &id).await.0, "open");
         assert_eq!(event_kinds(&pg, &operator).await, ["memory.dequarantined"]);
+    }
+}
+
+/// f1 goal4 FA (#3266, GOD ruling on the landing candidate): the PG same-id
+/// peer merge reads the row `FOR UPDATE` INSIDE its write transaction, so a
+/// local rewind / release that commits while the peer is in flight is never
+/// undone by a merge computed from a stale snapshot. f1's interleaving: a
+/// SHARE table lock admits the peer's read but holds its write; the local op
+/// then queues; `pg_blocking_pids` (transitively) proves both are waiting
+/// before the lock is released.
+#[cfg(feature = "sal-postgres")]
+mod pg_merge_race {
+    use super::{
+        Backend, FED_ENV_LOCK, MARKER, Posture, T_NEW, force_state, local_marker, memory_json,
+        pg_store, push, router, row, seed_open, uniq,
+    };
+    use ai_memory::store::postgres::PostgresStore;
+    use serde_json::json;
+    use std::sync::Arc;
+
+    /// Wait until `n` backends are blocked behind `holder_pid` — directly, or
+    /// queued behind a waiter that is.
+    async fn wait_blocked_behind(pg: &PostgresStore, holder_pid: i32, n: i64) {
+        let end = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let blocked: i64 = sqlx::query_scalar(
+                "WITH w AS (SELECT pid, pg_blocking_pids(pid) AS b FROM pg_stat_activity \
+                 WHERE datname = current_database()) \
+                 SELECT count(*) FROM w WHERE $1 = ANY(w.b) OR EXISTS \
+                 (SELECT 1 FROM w AS v WHERE v.pid = ANY(w.b) AND $1 = ANY(v.b))",
+            )
+            .bind(holder_pid)
+            .fetch_one(pg.pool())
+            .await
+            .expect("barrier probe");
+            if blocked >= n {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < end,
+                "barrier not reached: {blocked}/{n}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    async fn merge_race(release_mode: bool) {
+        let _g = FED_ENV_LOCK.lock().await;
+        let Ok(url) = std::env::var("AI_MEMORY_TEST_POSTGRES_URL") else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let backend = Backend::Postgres(url);
+        let peer = uniq("ai:peer-race");
+        let ns = uniq("race");
+        let (id, title) = (uniq("local"), uniq("title"));
+        let _posture = Posture::new(&peer, &ns, false);
+        let (router, store, db) = router(&backend).await;
+        seed_open(&backend, &db, &store, &id, &ns, &title, &peer).await;
+        if release_mode {
+            let meta = json!({"agent_id": peer, MARKER: local_marker("active")});
+            force_state(&backend, &db, &store, &id, "contaminated", &meta).await;
+        }
+        let pg = pg_store(&store);
+        let mut hold = pg.pool().begin().await.expect("hold tx");
+        let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *hold)
+            .await
+            .expect("pid");
+        sqlx::query("LOCK TABLE memories IN SHARE MODE")
+            .execute(&mut *hold)
+            .await
+            .expect("share lock");
+        let wire = memory_json(&id, &ns, &title, "new peer text", &peer, T_NEW);
+        let pp = peer.clone();
+        let peer_push = tokio::spawn(async move { push(&router, &pp, vec![wire]).await });
+        wait_blocked_behind(pg, pid, 1).await;
+        let local_store = Arc::clone(&store);
+        let (rid, operator) = (id.clone(), uniq("operator"));
+        let actor = operator.clone();
+        let local = tokio::spawn(async move {
+            let ctx = ai_memory::store::CallerContext::for_admin(actor);
+            if release_mode {
+                assert!(
+                    local_store
+                        .operator_dequarantine(&ctx, &rid)
+                        .await
+                        .expect("release")
+                );
+            } else {
+                let r = local_store
+                    .swarm_rewind(&ctx, &rid, 5, "memory", &[], false)
+                    .await
+                    .expect("rewind");
+                assert!(r.root_contaminated, "{r:?}");
+            }
+        });
+        wait_blocked_behind(pg, pid, 2).await;
+        hold.commit().await.expect("release share lock");
+        local.await.expect("local op");
+        let (status, report) = peer_push.await.expect("peer push");
+        assert!(status.is_success(), "{status} {report}");
+        let got = row(&backend, &db, &store, &id).await.expect("row");
+        let kinds: Vec<String> =
+            sqlx::query_scalar("SELECT event_type FROM signed_events WHERE agent_id = $1")
+                .bind(&operator)
+                .fetch_all(pg.pool())
+                .await
+                .expect("events");
+        if release_mode {
+            assert_eq!(kinds, ["swarm.decontaminate"]);
+            assert_eq!(
+                got.state, "active",
+                "a peer merge must not re-taint a locally released row: {got:?}"
+            );
+            assert!(got.metadata.get(MARKER).is_none(), "{got:?}");
+        } else {
+            assert_eq!(kinds, ["swarm.rewind"]);
+            assert_eq!(
+                got.state, "contaminated",
+                "a peer merge must not clear a committed local rewind: {got:?}"
+            );
+            assert!(got.metadata.get(MARKER).is_some(), "{got:?}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "live postgres: AI_MEMORY_TEST_POSTGRES_URL (postgres-ignored tier)"]
+    async fn pg_peer_merge_must_not_undo_release_f1_goal4() {
+        merge_race(true).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "live postgres: AI_MEMORY_TEST_POSTGRES_URL (postgres-ignored tier)"]
+    async fn pg_peer_merge_must_not_undo_rewind_f1_goal4() {
+        merge_race(false).await;
+    }
+}
+
+/// f1 goal4 FC (#3266), postgres: a caller lifecycle transition
+/// (`update` with a lifecycle target → `apply_lifecycle_patch`) and a racing
+/// quarantine never lose the quarantine. The competing writer attempts its
+/// quarantine AFTER the patch has read the row and BEFORE the patch writes
+/// (f2r's window): with the read locked in the write transaction the
+/// quarantine waits for the patch and lands after it; with an unlocked read
+/// (the pre-fix pool SELECT, or `FOR UPDATE` on the pool — f2r's trap) and no
+/// CAS, the patch overwrites a committed quarantine.
+///
+/// Deterministic interleaving (no sleeps): H holds `embed_skip` in SHARE mode,
+/// so the caller's main update M (a content edit) stalls in the
+/// `memories_embed_skip_clear` trigger while holding the row lock; S queues a
+/// SHARE lock on `memories` behind M; H commits → M commits → S is granted;
+/// the patch P reads the row, and its UPDATE queues behind S; Q then runs
+/// `SELECT … FOR UPDATE` (compatible with S) — it blocks on P's row lock iff
+/// P's read is locked — and queues its quarantine UPDATE behind S; S commits.
+#[cfg(feature = "sal-postgres")]
+mod pg_fc_race {
+    use super::{T_OLD, uniq};
+    use ai_memory::store::postgres::PostgresStore;
+    use ai_memory::store::{CallerContext, MemoryStore, UpdatePatch};
+    use std::sync::Arc;
+
+    async fn blocked_behind(pg: &PostgresStore, holder_pid: i32) -> i64 {
+        sqlx::query_scalar(
+            "WITH w AS (SELECT pid, pg_blocking_pids(pid) AS b FROM pg_stat_activity \
+             WHERE datname = current_database()) \
+             SELECT count(*) FROM w WHERE $1 = ANY(w.b) OR EXISTS \
+             (SELECT 1 FROM w AS v WHERE v.pid = ANY(w.b) AND $1 = ANY(v.b))",
+        )
+        .bind(holder_pid)
+        .fetch_one(pg.pool())
+        .await
+        .expect("barrier probe")
+    }
+
+    async fn wait_blocked(pg: &PostgresStore, holder_pid: i32, n: i64) {
+        let end = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        while blocked_behind(pg, holder_pid).await < n {
+            assert!(tokio::time::Instant::now() < end, "barrier not reached");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    async fn locked_tx(pg: &PostgresStore) -> (sqlx::Transaction<'static, sqlx::Postgres>, i32) {
+        let mut tx = pg.pool().begin().await.expect("tx");
+        let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *tx)
+            .await
+            .expect("pid");
+        (tx, pid)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "live postgres: AI_MEMORY_TEST_POSTGRES_URL (postgres-ignored tier)"]
+    async fn pg_lifecycle_patch_never_overwrites_a_racing_quarantine_f1_goal4() {
+        let Ok(url) = std::env::var("AI_MEMORY_TEST_POSTGRES_URL") else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let pg = Arc::new(PostgresStore::connect(&url).await.expect("connect"));
+        let owner = uniq("ai:fc-owner");
+        let ctx = CallerContext::for_agent(owner.clone());
+        let seed_row: ai_memory::models::Memory = serde_json::from_value(super::memory_json(
+            &uniq("fc"),
+            &uniq("fc-ns"),
+            &uniq("t"),
+            "body",
+            &owner,
+            T_OLD,
+        ))
+        .expect("memory");
+        let id = pg.store(&ctx, &seed_row).await.expect("seed");
+
+        // H: stall M inside its own row lock.
+        let (mut holder, h_pid) = locked_tx(&pg).await;
+        sqlx::query("LOCK TABLE embed_skip IN SHARE MODE")
+            .execute(&mut *holder)
+            .await
+            .expect("H lock");
+        let (store, rid, caller_ctx) = (Arc::clone(&pg), id.clone(), ctx.clone());
+        let caller = tokio::spawn(async move {
+            let patch = UpdatePatch {
+                content: Some("edited by caller".to_string()),
+                lifecycle_state: Some(ai_memory::models::LifecycleState::Active),
+                ..UpdatePatch::default()
+            };
+            store.update(&caller_ctx, &rid, patch).await
+        });
+        wait_blocked(&pg, h_pid, 1).await;
+        // S: a SHARE lock on `memories`, queued behind M's ROW EXCLUSIVE.
+        let (mut share, s_pid) = locked_tx(&pg).await;
+        let s_task = tokio::spawn(async move {
+            sqlx::query("LOCK TABLE memories IN SHARE MODE")
+                .execute(&mut *share)
+                .await
+                .expect("S lock");
+            share
+        });
+        wait_blocked(&pg, h_pid, 2).await;
+        holder.commit().await.expect("H release");
+        let share = s_task.await.expect("S join");
+        // P has read the row; its UPDATE waits on S.
+        wait_blocked(&pg, s_pid, 1).await;
+        // Q: lock the row (compatible with S), then quarantine (waits on S).
+        let (mut quarantiner, _q_pid) = locked_tx(&pg).await;
+        let qid = id.clone();
+        let q_task = tokio::spawn(async move {
+            sqlx::query("SELECT id FROM memories WHERE id = $1 FOR UPDATE")
+                .bind(&qid)
+                .fetch_one(&mut *quarantiner)
+                .await
+                .expect("Q lock");
+            sqlx::query("UPDATE memories SET lifecycle_state = 'quarantined' WHERE id = $1")
+                .bind(&qid)
+                .execute(&mut *quarantiner)
+                .await
+                .expect("Q quarantine");
+            quarantiner.commit().await.expect("Q commit");
+        });
+        wait_blocked(&pg, s_pid, 2).await;
+        share.commit().await.expect("S release");
+        q_task.await.expect("Q join");
+        let outcome = caller.await.expect("caller join");
+        let state: String =
+            sqlx::query_scalar("SELECT lifecycle_state FROM memories WHERE id = $1")
+                .bind(&id)
+                .fetch_one(pg.pool())
+                .await
+                .expect("state");
+        assert_eq!(
+            state, "quarantined",
+            "a caller transition overwrote a racing quarantine (outcome {outcome:?})"
+        );
     }
 }

@@ -537,12 +537,7 @@ fn merge_metadata(local: &Memory, remote: &Memory) -> Value {
         // Boids item 3 R2.3 (#3266) — the #3324 `contamination` marker is
         // node-local by the SAME rule: a local taint's marker (its restore
         // anchor) survives a peer write, and a peer's marker is never adopted.
-        for key in [
-            field_names::CONTRADICTION_CONSERVED,
-            field_names::CONTRADICTION_SOFT_LOSER,
-            field_names::CONTRADICTION_WINNER_ID,
-            crate::storage::CONTAMINATION_METADATA_KEY,
-        ] {
+        for key in NODE_LOCAL_METADATA_KEYS {
             match local.metadata.get(key) {
                 Some(local_val) => {
                     map.insert(key.to_string(), local_val.clone());
@@ -789,6 +784,67 @@ pub fn lifecycle_local_taint_wins_case(new: &str, old: &str) -> String {
          WHEN {new}.updated_at > {old}.updated_at \
               OR ({new}.updated_at = {old}.updated_at AND {new}.id > {old}.id) \
          THEN {new}.lifecycle_state ELSE {old}.lifecycle_state END"
+    )
+}
+
+/// The node-local metadata keys (#1824 G7 `contradiction_*` + the #3324
+/// `contamination` marker): a LOCAL value survives every federation merge and
+/// a peer's is never adopted — in [`merge_memory`] and in the title-slot
+/// newer-wins SQL arm of BOTH adapters (f1 goal4 FB). One source.
+pub const NODE_LOCAL_METADATA_KEYS: [&str; 4] = [
+    field_names::CONTRADICTION_CONSERVED,
+    field_names::CONTRADICTION_SOFT_LOSER,
+    field_names::CONTRADICTION_WINNER_ID,
+    crate::storage::CONTAMINATION_METADATA_KEY,
+];
+
+fn node_local_keys_sql() -> String {
+    NODE_LOCAL_METADATA_KEYS
+        .map(|k| format!("'{k}'"))
+        .join(", ")
+}
+
+/// SQLite title-slot newer-wins metadata base (f1 goal4 FB): the incoming
+/// row's metadata with every node-local key removed, then the LOCAL row's
+/// node-local keys patched back on. `excluded` / `memories` are the upsert
+/// aliases.
+#[must_use]
+pub fn sqlite_title_slot_newer_metadata() -> String {
+    let paths = NODE_LOCAL_METADATA_KEYS
+        .map(|k| format!("'$.{k}'"))
+        .join(", ");
+    // `json_each.value` is an SQL value: a JSON boolean surfaces as 0/1 and a
+    // string loses its quotes, so each value is re-typed through `json(...)`
+    // from its `type` — the G7 soft-loser marker stays the JSON boolean the
+    // writer stamped (the postgres predicate matches `'true'`).
+    format!(
+        "json_patch(json_remove(excluded.metadata, {paths}), COALESCE((SELECT \
+         json_group_object(key, json(CASE type WHEN 'true' THEN 'true' WHEN 'false' THEN 'false' \
+         WHEN 'object' THEN value WHEN 'array' THEN value ELSE json_quote(value) END)) \
+         FROM json_each(memories.metadata) WHERE key IN ({})), '{{}}'))",
+        node_local_keys_sql()
+    )
+}
+
+/// The postgres twin of [`sqlite_title_slot_newer_metadata`] (`EXCLUDED` /
+/// `memories` aliases, `jsonb`).
+#[must_use]
+pub fn pg_title_slot_newer_metadata() -> String {
+    pg_node_local_overlay("EXCLUDED.metadata")
+}
+
+/// `incoming` (a `jsonb` expression) with every node-local key removed, then
+/// the node-local keys of the row being UPDATED (`memories.metadata`, read in
+/// the same statement) overlaid — an atomic jsonb merge, so a writer never
+/// writes back a node-local value from a copy it read earlier (f1 goal4 FA/FB).
+#[must_use]
+pub fn pg_node_local_overlay(incoming: &str) -> String {
+    let keys = node_local_keys_sql();
+    format!(
+        "(({incoming} - ARRAY[{keys}]::text[]) || COALESCE((SELECT \
+         jsonb_object_agg(nl.k, nl.v) FROM jsonb_each(CASE WHEN jsonb_typeof(memories.metadata) \
+         = 'object' THEN memories.metadata ELSE '{{}}'::jsonb END) AS nl(k, v) WHERE nl.k IN ({keys})), \
+         '{{}}'::jsonb))"
     )
 }
 
@@ -1187,6 +1243,21 @@ mod tests {
         m.metadata = json!({ key: {} });
         assert!(normalise_inbound_node_local_overlay(&mut m));
         assert!(m.metadata.get(key).is_none());
+    }
+
+    #[test]
+    fn title_slot_metadata_sql_names_every_node_local_key_f1_goal4() {
+        let (sqlite, pg) = (
+            sqlite_title_slot_newer_metadata(),
+            pg_title_slot_newer_metadata(),
+        );
+        for key in NODE_LOCAL_METADATA_KEYS {
+            assert!(sqlite.contains(&format!("'$.{key}'")), "{sqlite}");
+            assert!(sqlite.contains(&format!("'{key}'")), "{sqlite}");
+            assert!(pg.contains(&format!("'{key}'")), "{pg}");
+        }
+        assert!(pg.starts_with("((EXCLUDED.metadata - ARRAY["), "{pg}");
+        assert!(pg_node_local_overlay("$15::jsonb").starts_with("(($15::jsonb - ARRAY["));
     }
 
     #[test]

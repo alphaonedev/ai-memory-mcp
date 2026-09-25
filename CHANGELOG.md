@@ -30,6 +30,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   state (else `open`), remove the marker, append a signed
   `swarm.decontaminate` event. The quarantined release keeps
   `memory.dequarantined` unchanged.
+- **f1 goal4 FA (HIGH) — PG same-id peer merge is one locked transaction.**
+  `PostgresStore::merge_inbound` now reads the existing row `FOR UPDATE`
+  INSIDE its write transaction (previously on the pool, before a separate
+  transaction), computes the merge — including the local-wins lifecycle
+  predicate — from that locked row, and overlays the node-local metadata keys
+  from the row being updated by an atomic jsonb merge. A peer push racing a
+  committed local rewind or release can no longer undo it.
+- **f1 goal4 FB (MEDIUM) — title-slot newer-wins keeps node-local keys, both
+  adapters.** The different-id / same-(title, namespace) upsert arm now keeps
+  the LOCAL `contamination` and `contradiction_*` keys and never adopts a
+  peer's (`crdt_merge::NODE_LOCAL_METADATA_KEYS`, one source for the Rust merge
+  and both SQL arms), so a later release restores the recorded prior state.
+- **f1 goal4 FC (GA, same class as FA) — caller lifecycle transitions are
+  compare-and-set on both adapters.** `storage::set_lifecycle_state` now reads,
+  validates and writes inside one `BEGIN IMMEDIATE` transaction, and
+  `PostgresStore::apply_lifecycle_patch` reads the row `FOR UPDATE` on its
+  write transaction's connection; both UPDATEs carry the validated `from`
+  state in their `WHERE`. A racing #1948 quarantine or contamination stamp is
+  never overwritten; a lost race is a typed 409 conflict, distinct from an
+  absent row.
 - **Disclosure (R2.6).** Containment is node-local at GA: a peer does not
   inherit a rewind; each node rewinds its own copy
   (`docs/compliance/honest-limitations.md` §5.1,
