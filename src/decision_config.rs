@@ -173,15 +173,31 @@ pub struct DecisionSection {
     pub fallback: Option<DecisionFallback>,
 }
 
+/// f1 F7 (#3806) — an endpoint for a `Debug` / log sink: `scheme://host[:port]`
+/// through the shared URL funnel ([`crate::url_display::url_origin`]), so
+/// userinfo (`user:password@`), a query-string key and a path-borne token
+/// never render. Empty stays empty (a local provider has no endpoint).
+pub(crate) fn redacted_endpoint(url: &str) -> String {
+    if url.trim().is_empty() {
+        String::new()
+    } else {
+        crate::url_display::url_origin(url)
+    }
+}
+
 // Manual `Debug` so a `{:?}` of a `DecisionSection` never echoes an
 // inline secret, mirroring `LlmSection` / `ResolvedLlm`. `api_key_env` /
-// `api_key_file` are NAMES, not secrets, and render verbatim.
+// `api_key_file` are NAMES, not secrets, and render verbatim; the
+// endpoint renders as its origin only (f1 F7).
 impl std::fmt::Debug for DecisionSection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DecisionSection")
             .field("provider", &self.provider)
             .field("model", &self.model)
-            .field("base_url", &self.base_url)
+            .field(
+                config_keys::BASE_URL,
+                &self.base_url.as_deref().map(redacted_endpoint),
+            )
             .field(config_keys::API_KEY_ENV, &self.api_key_env)
             .field(config_keys::API_KEY_FILE, &self.api_key_file)
             .field(
@@ -270,7 +286,7 @@ impl std::fmt::Debug for ResolvedDecision {
         f.debug_struct("ResolvedDecision")
             .field("provider", &self.provider)
             .field("model", &self.model)
-            .field("base_url", &self.base_url)
+            .field(config_keys::BASE_URL, &redacted_endpoint(&self.base_url))
             .field(
                 "api_key",
                 &self.api_key.as_ref().map(|_| crate::REDACTED_PLACEHOLDER),

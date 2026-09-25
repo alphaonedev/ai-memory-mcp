@@ -56,7 +56,7 @@
 
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use reqwest::Url;
@@ -285,6 +285,7 @@ impl OpenAiCompatibleDecider {
         prompt: &str,
         task: &DecisionTask<'_>,
         with_logprobs: bool,
+        budget: Duration,
     ) -> Result<StructuredAnswer, CallFailure> {
         let body = self.request_body(prompt, task, with_logprobs);
         let response = post_json(HttpCall {
@@ -292,14 +293,13 @@ impl OpenAiCompatibleDecider {
             endpoint: &self.endpoint,
             api_key: self.api_key.expose(),
             body: &body,
-            timeout: self.timeout,
+            timeout: budget,
             outbound: &self.outbound,
             provider_id: &self.provider_id,
         })
         .await?;
         let (field, _) = Self::schema_for(task);
-        let mut answer = read_structured_answer(&response, field)
-            .ok_or(CallFailure::Abstain(AbstainReason::Unusable))?;
+        let mut answer = read_structured_answer(&response, field).map_err(CallFailure::Abstain)?;
         if !with_logprobs {
             // We did not ASK for logprobs, so anything the endpoint (or a
             // proxy in front of it) volunteered in that field is evidence
@@ -318,8 +318,15 @@ impl OpenAiCompatibleDecider {
         prompt: &str,
         task: &DecisionTask<'_>,
     ) -> Result<StructuredAnswer, AbstainReason> {
+        // f1 F8 (#3806) — ONE deadline for the whole logical call. The
+        // `logprobs` retry spends what is LEFT of `[decision].timeout_secs`,
+        // never a fresh budget, so the documented per-call bound holds.
+        let deadline = Instant::now() + self.timeout;
         let wanted_logprobs = self.logprobs_enabled();
-        match self.attempt(prompt, task, wanted_logprobs).await {
+        match self
+            .attempt(prompt, task, wanted_logprobs, self.timeout)
+            .await
+        {
             Ok(answer) => Ok(answer),
             Err(CallFailure::Status(status)) if wanted_logprobs && status.is_client_error() => {
                 // The endpoint rejected the request while `logprobs` was
@@ -334,7 +341,11 @@ impl OpenAiCompatibleDecider {
                     "decision endpoint refused `logprobs`; retrying without it, and every \
                      answer from this provider will now carry NO confidence"
                 );
-                self.attempt(prompt, task, false)
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(AbstainReason::Timeout);
+                }
+                self.attempt(prompt, task, false, remaining)
                     .await
                     .map_err(CallFailure::reason)
             }
@@ -416,22 +427,51 @@ struct StructuredAnswer {
 /// Pull `field` out of `choices[0].message.content` (a JSON document
 /// encoded as a string, per the OpenAI spec) plus the token logprobs.
 ///
-/// Returns `None` — which every caller turns into
-/// [`AbstainReason::Unusable`] — when the response is not shaped like a
-/// chat completion, when the content is not a JSON object, or when the
-/// schema field is missing. Absent logprobs are NOT a failure; they are
-/// an absent confidence.
-fn read_structured_answer(response: &Value, field: &str) -> Option<StructuredAnswer> {
-    let choice = response.get("choices")?.get(0)?;
-    let content = choice.get("message")?.get("content")?.as_str()?;
-    let document: Value = serde_json::from_str(content).ok()?;
-    let payload = document.get(field)?.clone();
+/// Two failure classes, kept apart because the seam treats them
+/// differently (f1 F6, #3806):
+///
+/// * [`AbstainReason::Unavailable`] — there is NO model answer: the body
+///   is not a chat completion at all (`{}`, a proxy's JSON error, no
+///   `choices[0].message.content` string). The provider never formed an
+///   opinion, so this is an outage and `fallback` governs it (case 2).
+/// * [`AbstainReason::Unusable`] — the model ANSWERED and the answer is
+///   not a decision: an explicit `message.refusal`, content that is not a
+///   JSON object, or a document without the schema field. That is the
+///   decline, terminal under every posture (case 3).
+///
+/// Absent logprobs are NOT a failure; they are an absent confidence.
+fn read_structured_answer(
+    response: &Value,
+    field: &str,
+) -> Result<StructuredAnswer, AbstainReason> {
+    let choice = response.get("choices").and_then(|c| c.get(0));
+    let message = choice.and_then(|c| c.get("message"));
+    let Some(content) = message
+        .and_then(|m| m.get("content"))
+        .and_then(Value::as_str)
+    else {
+        // The OpenAI structured-output refusal: `content` is null and the
+        // model's decline is in `message.refusal`. That IS an answer.
+        let refused = message
+            .and_then(|m| m.get("refusal"))
+            .and_then(Value::as_str)
+            .is_some();
+        return Err(if refused {
+            AbstainReason::Unusable
+        } else {
+            AbstainReason::Unavailable
+        });
+    };
+    let payload = serde_json::from_str::<Value>(content)
+        .ok()
+        .and_then(|document| document.get(field).cloned())
+        .ok_or(AbstainReason::Unusable)?;
     let logprobs = choice
-        .get("logprobs")
+        .and_then(|c| c.get("logprobs"))
         .and_then(|block| block.get("content"))
         .and_then(Value::as_array)
         .cloned();
-    Some(StructuredAnswer { payload, logprobs })
+    Ok(StructuredAnswer { payload, logprobs })
 }
 
 /// The probability the endpoint assigned to `label`, or `None` when it
@@ -565,28 +605,37 @@ mod tests {
         let no_logprobs = json!({
             "choices": [{"message": {"content": "{\"choice\":\"Fact\"}"}}],
         });
-        let answer =
-            read_structured_answer(&no_logprobs, FIELD_CHOICE).expect("logprobs are optional");
+        let answer = read_structured_answer(&no_logprobs, FIELD_CHOICE)
+            .unwrap_or_else(|r| panic!("logprobs are optional: {r}"));
         assert_eq!(answer.payload.as_str(), Some("Fact"));
         assert!(answer.logprobs.is_none(), "absent logprobs, not an error");
 
-        // Malformed shapes are refusals.
-        assert!(read_structured_answer(&json!({}), FIELD_CHOICE).is_none());
-        assert!(
-            read_structured_answer(
-                &json!({"choices": [{"message": {"content": "not json"}}]}),
-                FIELD_CHOICE
-            )
-            .is_none()
-        );
-        assert!(
-            read_structured_answer(
-                &json!({"choices": [{"message": {"content": "{\"other\":1}"}}]}),
-                FIELD_CHOICE
-            )
-            .is_none(),
-            "a body missing the schema field is unusable"
-        );
+        // f1 F6 — NO model answer (not a chat completion) is an OUTAGE.
+        for body in [
+            json!({}),
+            json!({"choices": []}),
+            json!({"choices": [{"message": {}}]}),
+            json!({"choices": [{"message": {"content": null}}]}),
+            json!({"error": {"message": "upstream overloaded"}}),
+        ] {
+            assert_eq!(
+                read_structured_answer(&body, FIELD_CHOICE).err(),
+                Some(AbstainReason::Unavailable),
+                "{body}"
+            );
+        }
+        // ...while an ANSWER that is not a decision is the DECLINE.
+        for body in [
+            json!({"choices": [{"message": {"content": "not json"}}]}),
+            json!({"choices": [{"message": {"content": "{\"other\":1}"}}]}),
+            json!({"choices": [{"message": {"content": null, "refusal": "I can't."}}]}),
+        ] {
+            assert_eq!(
+                read_structured_answer(&body, FIELD_CHOICE).err(),
+                Some(AbstainReason::Unusable),
+                "{body}"
+            );
+        }
     }
 
     #[test]

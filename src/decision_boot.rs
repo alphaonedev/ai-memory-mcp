@@ -174,10 +174,23 @@ pub struct DecisionBootReport {
 /// Returned by [`DecisionEgressGuard::check_outbound`] inside a
 /// `Result`, so a W1c client cannot proceed past a refusal by ignoring a
 /// bool. Carries no credential.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct DecisionEgressRefused {
     target: String,
     reason: String,
+}
+
+// f1 F7 (#3806) — origin-only endpoint, like `Display`.
+impl std::fmt::Debug for DecisionEgressRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DecisionEgressRefused")
+            .field(
+                "target",
+                &crate::decision_config::redacted_endpoint(&self.target),
+            )
+            .field("reason", &self.reason)
+            .finish()
+    }
 }
 
 impl DecisionEgressRefused {
@@ -203,7 +216,12 @@ impl DecisionEgressRefused {
 
 impl std::fmt::Display for DecisionEgressRefused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} (target={})", self.reason, self.target)
+        write!(
+            f,
+            "{} (target={})",
+            self.reason,
+            crate::decision_config::redacted_endpoint(&self.target)
+        )
     }
 }
 
@@ -218,7 +236,7 @@ impl std::error::Error for DecisionEgressRefused {}
 /// effect without waiting for a restart. (It can only ever TIGHTEN in
 /// effect: boot already refused to construct anything the boot posture
 /// forbade.)
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct DecisionEgressGuard {
     base_url: String,
     local: bool,
@@ -226,6 +244,21 @@ pub struct DecisionEgressGuard {
     /// `internal-only`, which the client pins. `None` under the
     /// name-based postures (byte-identical legacy shape).
     pin: Option<PinnedTarget>,
+}
+
+// f1 F7 (#3806) — the endpoint renders as its origin only; a pinned
+// target's addresses are not credentials and render as-is.
+impl std::fmt::Debug for DecisionEgressGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DecisionEgressGuard")
+            .field(
+                "base_url",
+                &crate::decision_config::redacted_endpoint(&self.base_url),
+            )
+            .field("local", &self.local)
+            .field("pin", &self.pin)
+            .finish()
+    }
 }
 
 impl DecisionEgressGuard {
@@ -638,8 +671,9 @@ fn audit_refusal_without_migrating(db_path: &Path, class: EgressClass, target: &
     };
     tracing::warn!(
         "[decision] egress refusal NOT recorded in the signed audit chain ({why_not}); the \
-         provider is still refused (class={} target={target}) (#3806 R8)",
-        class.as_str()
+         provider is still refused (class={} target={}) (#3806 R8)",
+        class.as_str(),
+        crate::decision_config::redacted_endpoint(target)
     );
 }
 
@@ -751,9 +785,10 @@ pub(crate) fn build_decision_provider_under(
             }) => {
                 tracing::warn!(
                     "[decision] provider DISABLED by the inference-plane egress gate \
-                 (provider={} model={} target={target} mode={}); {reason} (#1963/#3806)",
+                 (provider={} model={} target={} mode={}); {reason} (#1963/#3806)",
                     resolved.provider,
                     resolved.model,
+                    crate::decision_config::redacted_endpoint(&target),
                     mode.as_str()
                 );
                 record(Some(DecisionBootReport {

@@ -48,8 +48,9 @@
 //!
 //! Everything else in this file is shape-independent: the outbound check
 //! still runs before every request, the timeout is still
-//! `[decision].timeout_secs`, a malformed or off-vocabulary answer is
-//! still an abstain with [`AbstainReason::Unusable`], and the credential
+//! `[decision].timeout_secs`, an off-vocabulary answer is still an
+//! abstain with [`AbstainReason::Unusable`] (a body with no decision field
+//! at all is no answer — [`AbstainReason::Unavailable`]), and the credential
 //! is still redacted in `Debug` and zeroized on `Drop`.
 
 use std::fmt;
@@ -116,9 +117,11 @@ pub trait SystemOneWire: fmt::Debug + Send + Sync {
     /// Build the request body for one question.
     fn request_body(&self, model: &str, prompt: &str, task: &DecisionTask<'_>) -> Value;
 
-    /// Read the decision out of a 2xx response body. `None` means the
-    /// response was not a decision, which the caller turns into
-    /// [`AbstainReason::Unusable`].
+    /// Read the decision out of a 2xx response body. `None` means the body
+    /// is not the documented envelope at all — no model answer — which the
+    /// caller turns into [`AbstainReason::Unavailable`] (an outage, case 2).
+    /// A decision value the caller cannot match to the closed vocabulary is
+    /// the DECLINE, [`AbstainReason::Unusable`].
     fn read_answer(&self, response: &Value) -> Option<SystemOneAnswer>;
 }
 
@@ -290,9 +293,13 @@ impl SystemOneDecider {
         })
         .await
         .map_err(super::CallFailure::reason)?;
+        // f1 F6 parity (#3806): `read_answer` is `None` only when the body
+        // is not the documented envelope (no decision field at all) — no
+        // answer, so an OUTAGE. A decision value outside the closed
+        // vocabulary is refused by the caller as the DECLINE (`Unusable`).
         self.wire
             .read_answer(&response)
-            .ok_or(AbstainReason::Unusable)
+            .ok_or(AbstainReason::Unavailable)
     }
 }
 
