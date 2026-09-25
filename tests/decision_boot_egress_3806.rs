@@ -62,6 +62,10 @@ fn the_public_chokepoint_reads_the_egress_posture_from_the_environment_3806() {
     // --- ABSENCE: `deny` in the environment refuses the remote endpoint
     // and audits it.
     let denied = holder.path().join("denied.db");
+    // The store every surface already holds when it reaches the
+    // chokepoint; the decision lane appends to it and never creates or
+    // migrates one itself (#3806 R8).
+    drop(ai_memory::db::open(&denied).expect("seed the store"));
     // SAFETY: this test binary is a process of its own and contains
     // exactly one test, so there is no concurrent reader or writer of
     // the process environment.

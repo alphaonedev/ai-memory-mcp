@@ -608,6 +608,65 @@ fn record(report: Option<DecisionBootReport>) {
         .unwrap_or_else(std::sync::PoisonError::into_inner) = report;
 }
 
+/// #3806 vote R8 — append the signed egress-refusal row for the decision
+/// lane WITHOUT becoming a second migrating writer.
+///
+/// The shared `crate::egress::refuse_inference_egress_audited` opens
+/// through `db::open`, which replays the bootstrap DDL, walks the
+/// migration ladder, installs triggers, may append rollback evidence, and
+/// CREATES a database where none exists. The decision chokepoint runs on
+/// every SIGHUP, every MCP config change and every CLI curator run —
+/// always against a store the surface ALREADY opened and migrated — so
+/// that was a DDL-issuing writer racing the live one for an audit row.
+///
+/// This appends to an EXISTING store whose schema stamp is EXACTLY this
+/// binary's (`open_unmigrated` + `probe_schema_stamp`), and to nothing
+/// else: no store at the path, a stamp behind or ahead, or any open/probe
+/// failure is a loud WARN and no row. The enforcement never depends on
+/// the row — the provider is already absent — so this can only lose an
+/// audit row, never widen egress or touch a memory. The `[llm]` /
+/// embedding lanes keep the shared helper unchanged.
+fn audit_refusal_without_migrating(db_path: &Path, class: EgressClass, target: &str, reason: &str) {
+    let why_not = if db_path.exists() {
+        match append_to_current_store(db_path, class, target, reason) {
+            Ok(()) => return,
+            Err(e) => format!("{e:#}"),
+        }
+    } else {
+        "no store exists at the configured path, and the decision lane never creates one"
+            .to_string()
+    };
+    tracing::warn!(
+        "[decision] egress refusal NOT recorded in the signed audit chain ({why_not}); the \
+         provider is still refused (class={} target={target}) (#3806 R8)",
+        class.as_str()
+    );
+}
+
+fn append_to_current_store(
+    db_path: &Path,
+    class: EgressClass,
+    target: &str,
+    reason: &str,
+) -> anyhow::Result<()> {
+    let conn = crate::db::open_unmigrated(db_path)?;
+    let stamp = crate::db::probe_schema_stamp(&conn)?;
+    let current = crate::storage::migrations::current_schema_version();
+    if stamp != crate::storage::schema_guard::SchemaStamp::Known(current) {
+        anyhow::bail!(
+            "the store's schema stamp is {stamp:?}, not this binary's {current}; the decision \
+             lane does not migrate"
+        );
+    }
+    crate::egress::emit_inference_egress_refusal(
+        &conn,
+        class,
+        target,
+        crate::identity::sentinels::DAEMON_PRINCIPAL,
+        reason,
+    )
+}
+
 /// THE boot chokepoint for `[decision]`.
 ///
 /// Resolves the section, runs the inference-plane egress gate for the
@@ -705,7 +764,8 @@ pub(crate) fn build_decision_provider_under(
                     egress_mode: mode.as_str().to_string(),
                 }));
                 // #1991 — audit against the operator-resolved db_path.
-                crate::egress::refuse_inference_egress_audited(db_path, class, &target, &reason);
+                // #3806 R8 — WITHOUT a migrating open (see the fn).
+                audit_refusal_without_migrating(db_path, class, &target, &reason);
                 return DecisionBootOutcome::RefusedByEgress;
             }
         }
@@ -812,6 +872,17 @@ mod tests {
         (holder, db)
     }
 
+    /// A per-test db that EXISTS and is migrated — the state every
+    /// production surface is in when it reaches the chokepoint (each
+    /// opens its store before building clients). #3806 R8: the decision
+    /// lane appends its refusal row to an existing store and never
+    /// creates or migrates one itself.
+    fn existing_db(label: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let (holder, db) = fresh_db(label);
+        drop(crate::db::open(&db).expect("seed the store the surface would already hold"));
+        (holder, db)
+    }
+
     /// Count the signed egress-refusal rows in `db`. A db file that was
     /// never created counts as zero — which is itself the assertion for
     /// the arms that must write nothing.
@@ -837,7 +908,7 @@ mod tests {
     fn deny_refuses_a_remote_provider_and_records_a_signed_refusal_3806() {
         let _snapshot = snapshot_guard();
         // --- ABSENCE: deny => no handle + exactly one refusal row.
-        let (_hold_a, db_a) = fresh_db("deny-remote");
+        let (_hold_a, db_a) = existing_db("deny-remote");
         let cfg = remote_cfg("https://decide.internal.example.net/v1");
         let outcome = build_decision_provider_under(DENY, &cfg, &db_a);
         assert_eq!(outcome.state(), DecisionProviderState::RefusedByEgress);
@@ -872,7 +943,7 @@ mod tests {
         // --- The discriminator: the SAME loopback-only posture against a
         // REMOTE target still refuses, so the presence control above is
         // not passing because loopback-only is a no-op.
-        let (_hold_c, db_c) = fresh_db("loopback-remote");
+        let (_hold_c, db_c) = existing_db("loopback-remote");
         let cfg = remote_cfg("https://decide.internal.example.net/v1");
         let outcome = build_decision_provider_under(LOOPBACK, &cfg, &db_c);
         assert_eq!(outcome.state(), DecisionProviderState::RefusedByEgress);
@@ -1072,6 +1143,38 @@ mod tests {
 
     const INTERNAL: InferenceEgressMode = InferenceEgressMode::InternalOnly;
 
+    // PIN (#3806 vote R8) — the decision chokepoint is not a second
+    // MIGRATING writer. `refuse_inference_egress_audited` goes through
+    // `db::open`, which runs the bootstrap DDL, the migration ladder, the
+    // lineage watermark and the rollback-evidence check — and CREATES a
+    // database at a path that has none. The chokepoint runs on every
+    // SIGHUP, every MCP config change and every CLI curator run, so that
+    // was a DDL-issuing writer racing the live one. ABSENCE: with no store
+    // at the path, a refusal creates NOTHING. PRESENCE on the same sink: an
+    // existing store still receives exactly one signed row.
+    #[test]
+    fn the_decision_refusal_never_creates_or_migrates_a_store_r8() {
+        let _snapshot = snapshot_guard();
+        let cfg = remote_cfg("https://decide.internal.example.net/v1");
+
+        let (_hold_a, absent) = fresh_db("r8-absent");
+        let outcome = build_decision_provider_under(DENY, &cfg, &absent);
+        assert_eq!(outcome.state(), DecisionProviderState::RefusedByEgress);
+        assert!(
+            !absent.exists(),
+            "the decision chokepoint must never CREATE a database to audit into (R8)"
+        );
+
+        let (_hold_b, present) = existing_db("r8-present");
+        let outcome = build_decision_provider_under(DENY, &cfg, &present);
+        assert_eq!(outcome.state(), DecisionProviderState::RefusedByEgress);
+        assert_eq!(
+            refusal_rows(&present),
+            1,
+            "an existing store still receives the signed refusal row"
+        );
+    }
+
     // PIN (#3822 posture 3, the decision lane) — under `internal-only`
     // the chokepoint uses the carrier's RESOLVE-THEN-PIN entry point, not
     // the name-based gate: a HOSTNAME that resolves to internal addresses
@@ -1114,7 +1217,7 @@ mod tests {
             ("public", "https://8.8.8.8/v1"),
             ("metadata", "https://169.254.169.254/v1"),
         ] {
-            let (_hold, db) = fresh_db(label);
+            let (_hold, db) = existing_db(label);
             let outcome = build_decision_provider_under(INTERNAL, &remote_cfg(url), &db);
             assert_eq!(
                 outcome.state(),

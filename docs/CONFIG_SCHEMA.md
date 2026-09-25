@@ -679,7 +679,7 @@ well, under its own egress class `inference_decision`:
 | `allow` (compiled default) | constructed | constructed |
 | `loopback-only` | constructed **only** if the resolved `base_url` is loopback; otherwise refused | constructed |
 | `internal-only` (#3822) | constructed **only** if EVERY address the endpoint resolves to is internal (loopback / RFC1918 / ULA / CGNAT, never a cloud-metadata literal); those boot-resolved addresses are **pinned** into the client, which connects to nothing else and never through a proxy. DNS failure refuses. | constructed |
-| `deny` | **REFUSED** — no provider is constructed and a signed refusal row is appended to the audit chain | constructed |
+| `deny` | **REFUSED** — no provider is constructed and a signed refusal row is appended to the audit chain of the store the surface already holds (the decision lane never creates or migrates a store to record it; a missing or non-current store is a WARN, and the provider is refused either way) | constructed |
 
 **Transit floor (#3823).** Under every posture a `[decision]` endpoint
 that is plaintext `http://` to a **non-loopback** host is REFUSED — at
