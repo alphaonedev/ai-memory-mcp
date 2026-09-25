@@ -153,7 +153,8 @@ impl std::fmt::Display for DecisionProviderState {
 /// `/capabilities` is a broadly-readable surface and a `base_url` may
 /// carry userinfo. What a caller needs here is the POSTURE, not the
 /// address.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+// `PartialEq` only: `confidence_floors` carries `f64` (W4), which has no `Eq`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DecisionBootReport {
     /// One token from the closed [`DecisionProviderState`] vocabulary.
     pub state: DecisionProviderState,
@@ -167,6 +168,14 @@ pub struct DecisionBootReport {
     /// The inference-plane egress posture observed at the chokepoint
     /// (`allow` / `loopback-only` / `deny`).
     pub egress_mode: String,
+    /// #3806 W4 — the DECLARED per-seam confidence floors, keyed by seam
+    /// token (`consolidation_merge` → `0.80`, …): the destructive seams'
+    /// posture, readable here instead of from source. A compiled constant
+    /// per seam at GA (no config key), so it never carries a credential.
+    /// Empty entries are omitted; the whole report is omitted when
+    /// `[decision]` is unset, so unset output stays byte-identical.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub confidence_floors: std::collections::BTreeMap<String, f64>,
 }
 
 /// A refused outbound decision call.
@@ -564,6 +573,8 @@ fn record_client_attach_failure(resolved: &ResolvedDecision) {
         model: resolved.model.clone(),
         local: resolved.is_local(),
         egress_mode,
+        confidence_floors: crate::decision_clients::calibration::CalibrationSeam::confidence_floors(
+        ),
     }));
 }
 
@@ -758,6 +769,8 @@ pub(crate) fn build_decision_provider_under(
             model: String::new(),
             local: false,
             egress_mode: mode.as_str().to_string(),
+            confidence_floors:
+                crate::decision_clients::calibration::CalibrationSeam::confidence_floors(),
         }));
         return DecisionBootOutcome::Configured;
     };
@@ -797,6 +810,8 @@ pub(crate) fn build_decision_provider_under(
                     model: resolved.model.clone(),
                     local: false,
                     egress_mode: mode.as_str().to_string(),
+                    confidence_floors:
+                        crate::decision_clients::calibration::CalibrationSeam::confidence_floors(),
                 }));
                 // #1991 — audit against the operator-resolved db_path.
                 // #3806 R8 — WITHOUT a migrating open (see the fn).
@@ -822,6 +837,8 @@ pub(crate) fn build_decision_provider_under(
         model: resolved.model.clone(),
         local: resolved.is_local(),
         egress_mode: mode.as_str().to_string(),
+        confidence_floors: crate::decision_clients::calibration::CalibrationSeam::confidence_floors(
+        ),
     }));
     let guard = DecisionEgressGuard::for_resolved(&resolved, pin);
     DecisionBootOutcome::Constructed(Box::new(DecisionProviderHandle {

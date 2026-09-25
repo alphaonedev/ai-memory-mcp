@@ -929,6 +929,19 @@ including the curator's self-report memory — is byte-identical to
 v1.0.0. A destructive seam whose `confidence_floor()` is `None` is a
 contract failure and FAILS CLOSED (`no_floor`), never permissive.
 
+**Which consolidation paths the judge gates.** The two AUTONOMOUS,
+substrate-authored merges: the curator's autonomy Pass-1
+(`consolidate_cluster`) and the SAL `ConsolidationPass` (curator
+compaction, sqlite and postgres alike — the pass is backend-blind). The
+operator-EXPLICIT consolidations, where the caller names the ids — MCP
+`memory_consolidate`, CLI `ai-memory consolidate`, HTTP
+`power_consolidation` — are NOT judged, by design: they are tenant
+authoring writes (the summary is verbatim caller content), not the
+substrate deciding on its own that two memories are one, and a model
+second-guessing an explicit operator instruction would be the judge
+WIDENING its remit. Federation receive never consults the decider (the
+never-in-governance/federation pin).
+
 ## Migration from v0.6.x (legacy flat fields)
 
 The v0.6.x flat-field shape (`llm_model`, `ollama_url`, `embed_url`,
