@@ -119,8 +119,11 @@ impl CalibrationSeam {
     pub fn confidence_floor(self) -> Option<f64> {
         match self {
             Self::ClassifyKind | Self::DetectContradiction => None,
-            // W3 wires this arm with its own named const and ruling.
-            Self::SynthesisVerdict => None,
+            // #3806 W3 — a synthesis Delete is destructive, so it clears
+            // the same GA floor as the merge seam (5-agent vote 4d3ea1c5).
+            Self::SynthesisVerdict => {
+                Some(crate::decision_seams::SYNTHESIS_DELETE_CONFIDENCE_FLOOR)
+            }
             Self::ConsolidationMerge => {
                 Some(crate::decision_seams::CONSOLIDATION_MERGE_CONFIDENCE_FLOOR)
             }
@@ -272,27 +275,37 @@ mod tests {
     fn confidence_floors_render_only_the_declared_seams() {
         use super::CalibrationSeam;
         let floors = CalibrationSeam::confidence_floors();
-        assert_eq!(floors.len(), 1, "{floors:?}");
+        // #3806 W3 — a SECOND destructive seam (synthesis_verdict) now
+        // declares a floor, so the rendered map has two entries.
+        assert_eq!(floors.len(), 2, "{floors:?}");
         assert!((floors["consolidation_merge"] - 0.80).abs() < f64::EPSILON);
+        assert!((floors["synthesis_verdict"] - 0.80).abs() < f64::EPSILON);
         assert!(!floors.contains_key("classify_kind"));
         assert_eq!(CalibrationSeam::ALL.len(), 4);
     }
 
+    /// #3806 — the per-seam floor is ONE accessor. BOTH destructive
+    /// seams (consolidation-merge and synthesis-delete) threshold at
+    /// their named const; the W2 non-destructive seams threshold
+    /// nothing; and `None` is distinguishable from a zero floor (an
+    /// absent confidence never clears any `Some`, however low).
     #[test]
-    fn confidence_floor_is_some_only_on_the_merge_seam_today() {
+    fn confidence_floor_is_some_on_every_destructive_seam() {
         use super::CalibrationSeam;
         assert_eq!(
             CalibrationSeam::ConsolidationMerge.confidence_floor(),
             Some(crate::decision_seams::CONSOLIDATION_MERGE_CONFIDENCE_FLOOR)
         );
-        assert!(
-            (CalibrationSeam::ConsolidationMerge
-                .confidence_floor()
-                .unwrap()
-                - 0.80)
-                .abs()
-                < f64::EPSILON
+        assert_eq!(
+            CalibrationSeam::SynthesisVerdict.confidence_floor(),
+            Some(crate::decision_seams::SYNTHESIS_DELETE_CONFIDENCE_FLOOR)
         );
+        for floor in [
+            CalibrationSeam::ConsolidationMerge.confidence_floor(),
+            CalibrationSeam::SynthesisVerdict.confidence_floor(),
+        ] {
+            assert!((floor.unwrap() - 0.80).abs() < f64::EPSILON);
+        }
         assert_eq!(CalibrationSeam::ClassifyKind.confidence_floor(), None);
         assert_eq!(
             CalibrationSeam::DetectContradiction.confidence_floor(),

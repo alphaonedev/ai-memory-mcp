@@ -276,7 +276,69 @@ pub(super) fn run_synthesis_pass(
                         // curator's verdict is advice; the K9 pipeline
                         // remains authoritative.
                         if k9_allows_synthesis_delete(&mem.namespace, agent_id, &v.candidate_id) {
-                            deletes.push(v.candidate_id.clone());
+                            // #3806 W3 — the synthesis Delete verdict is
+                            // ADVICE. A low-confidence Delete collapses to
+                            // NoOp; the deterministic K9 gate above stays
+                            // authoritative. The Delete survives ONLY on
+                            // `Permit`; `NoDecider` (`[decision]` unset) is
+                            // the byte-identical v1.0.0 path; any `Block`
+                            // — including a fail-closed unavailable — is
+                            // NoOp. The decider can only NARROW: this arm
+                            // is the sole gate, never wired into
+                            // Permissions::evaluate or the federation LWW
+                            // merge.
+                            // The candidate is always present: `parse_response`
+                            // (synthesis/mod.rs) rejects any verdict whose
+                            // `candidate_id` is not in the vetted `cands` set, so
+                            // `find` succeeds and the `map_or("")` default is
+                            // unreachable — it is only the fail-safe direction
+                            // were that membership check ever relaxed (f2r).
+                            let candidate = existing.iter().find(|c| c.id == v.candidate_id);
+                            match crate::decision_seams::judge_synthesis_delete(
+                                llm,
+                                &mem.title,
+                                &mem.content,
+                                candidate.map_or("", |c| c.title.as_str()),
+                                candidate.map_or("", |c| c.content.as_str()),
+                            ) {
+                                Ok(j) => {
+                                    if j.permits() {
+                                        deletes.push(v.candidate_id.clone());
+                                    } else if let crate::decision_seams::MergeJudgement::Block {
+                                        reason,
+                                        source,
+                                    } = j
+                                    {
+                                        // Distinguish an outage from a considered
+                                        // `no`: bind the block reason + source
+                                        // rather than one message for all five
+                                        // `MergeBlockReason` variants (W4
+                                        // precedent, compaction.rs).
+                                        tracing::info!(
+                                            target: "synthesis",
+                                            namespace = %mem.namespace,
+                                            reason = reason.as_str(),
+                                            source = ?source,
+                                            "synthesis.delete_judged_noop; Block verdict collapses to NoOp",
+                                        );
+                                    }
+                                }
+                                // `judge_synthesis_delete` returns Err ONLY under
+                                // `fallback = "refuse"` with an unavailable
+                                // provider. Per the #3806 ruling a destructive
+                                // seam takes NO destructive effect when the
+                                // decider is configured-but-unavailable under ANY
+                                // fallback, so W3 collapses this to NoOp (the
+                                // store proceeds; the delete is skipped) rather
+                                // than failing the store — the fail-safe
+                                // direction. WARN so the refuse posture is seen.
+                                Err(e) => tracing::warn!(
+                                    target: "synthesis",
+                                    namespace = %mem.namespace,
+                                    error = %e,
+                                    "synthesis.delete_judge_refused; fail-closed NoOp",
+                                ),
+                            }
                         }
                     }
                     crate::synthesis::SynthesisVerb::Add

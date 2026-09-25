@@ -539,6 +539,14 @@ pub(crate) async fn judge_contradiction(
 /// `docs/CONFIG_SCHEMA.md` (`[decision]`).
 pub const CONSOLIDATION_MERGE_CONFIDENCE_FLOOR: f64 = 0.80;
 
+/// #3806 W3 — the confidence floor a synthesis Delete verdict must clear
+/// before the curator's advice is allowed to remove a memory. A POSTURE
+/// (a deliberate bar), not a measurement; equal to the merge seam's
+/// [`CONSOLIDATION_MERGE_CONFIDENCE_FLOOR`] because both are destructive
+/// seams and GA sets one bar for all of them. Stated in
+/// `docs/CONFIG_SCHEMA.md` (`[decision]`).
+pub const SYNTHESIS_DELETE_CONFIDENCE_FLOOR: f64 = 0.80;
+
 /// Per-member cap on the content the merge judge is shown. The judge
 /// answers a yes/no over a closed vocabulary; it does not need the whole
 /// row, and a bounded prompt keeps the per-cluster cost predictable.
@@ -974,6 +982,59 @@ pub(crate) fn judge_merge(
         client,
         CalibrationSeam::ConsolidationMerge,
         &merge_judge_prompt(members),
+    )
+}
+
+/// #3806 W3 — the synthesis DELETE judge: [`destructive_judge`] on
+/// [`CalibrationSeam::SynthesisVerdict`] with the delete prompt.
+///
+/// The synthesis pass proposes a Delete when a newer memory is said to
+/// subsume a candidate; this is a NARROWING veto on that advice. The
+/// answer can only KEEP the candidate (block the delete), never create
+/// one — the deterministic K9 pipeline stays authoritative, and this is
+/// the SOLE gate: it is never wired into `Permissions::evaluate` or the
+/// federation LWW merge.
+///
+/// # Errors
+/// As [`destructive_judge`].
+pub(crate) fn judge_synthesis_delete(
+    client: &OllamaClient,
+    new_title: &str,
+    new_content: &str,
+    candidate_title: &str,
+    candidate_content: &str,
+) -> Result<MergeJudgement> {
+    destructive_judge(
+        client,
+        CalibrationSeam::SynthesisVerdict,
+        &synthesis_delete_prompt(new_title, new_content, candidate_title, candidate_content),
+    )
+}
+
+/// The prompt the synthesis delete judge answers. A closed yes/no
+/// question: is it safe to delete the candidate because the newer memory
+/// already subsumes it? Both bodies capped at [`MERGE_JUDGE_MEMBER_CHARS`].
+pub(crate) fn synthesis_delete_prompt(
+    new_title: &str,
+    new_content: &str,
+    candidate_title: &str,
+    candidate_content: &str,
+) -> String {
+    let new_capped: String = new_content.chars().take(MERGE_JUDGE_MEMBER_CHARS).collect();
+    let candidate_capped: String = candidate_content
+        .chars()
+        .take(MERGE_JUDGE_MEMBER_CHARS)
+        .collect();
+    format!(
+        "You are the delete judge for a memory store. A synthesis pass proposed \
+         DELETING the candidate memory below because the newer memory is said to \
+         subsume it. Answer yes ONLY if the newer memory already contains every \
+         distinct claim, entity, number, date or decision in the candidate, so that \
+         deleting the candidate loses nothing. Answer no if the candidate carries \
+         any information the newer memory does not.\n\n\
+         Newer memory: {new_title}\n{new_capped}\n\n\
+         Candidate to delete: {candidate_title}\n{candidate_capped}\n\n\
+         Is it safe to delete the candidate? (yes/no)"
     )
 }
 

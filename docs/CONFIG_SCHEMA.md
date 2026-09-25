@@ -942,6 +942,33 @@ second-guessing an explicit operator instruction would be the judge
 WIDENING its remit. Federation receive never consults the decider (the
 never-in-governance/federation pin).
 
+#### The synthesis delete judge (#3806 W3)
+
+The `synthesis_verdict` seam is the SECOND destructive seam and shares
+the merge judge's contract exactly. The online synthesis pass
+(`run_synthesis_pass`, at `memory_store` time) may emit a `delete`
+verdict when a newer memory is said to subsume a candidate; with
+`[decision]` set, that verdict is **advice**, and the judge is a
+narrowing veto on it. The seam sits at the SOLE enqueue point — inside
+the `SynthesisVerb::Delete` arm, AFTER the authoritative K9 re-check and
+BEFORE the deferred `db::delete` — so a K9 refusal or the
+`synthesis_max_deletes_per_call` cap still decides first; the decider
+can only KEEP a candidate, never create a delete, and is never wired
+into `Permissions::evaluate` or the federation LWW merge.
+
+It calls the same shared `destructive_judge` on
+`CalibrationSeam::SynthesisVerdict`, reads its floor through the same
+`CalibrationSeam::confidence_floor` accessor —
+`SYNTHESIS_DELETE_CONFIDENCE_FLOOR = 0.80`, equal to the merge seam
+because both are destructive and GA sets one bar for all destructive
+seams (no new config key at GA; a per-seam compiled constant) — and its
+disposition table is identical: the candidate is deleted ONLY on `yes`
+with a confidence at or above the floor; a low-confidence `yes`, a `yes`
+with no confidence, a `no`, a declined/off-vocabulary answer, or an
+UNAVAILABLE provider all BLOCK, and the candidate survives (fail-safe
+toward non-destruction). `[decision]` unset consults nobody: the Delete
+arm is byte-identical v1.0.0.
+
 ## Migration from v0.6.x (legacy flat fields)
 
 The v0.6.x flat-field shape (`llm_model`, `ollama_url`, `embed_url`,
