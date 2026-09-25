@@ -855,6 +855,80 @@ row on every invocation under `egress = "deny"`.
 directions, so the exclusion is a reviewed decision rather than an
 oversight.
 
+#### The consolidation merge judge (#3806 W4)
+
+The third seam sits on the one path that DELETES data: the curator's
+consolidation merge (the autonomy Pass-1 in `src/autonomy.rs` and its
+SAL successor in `src/curator/compaction.rs`, before `db::consolidate`).
+Whether two memories are near-duplicates is decided by two fixed gates
+that a model never touches — the Jaccard keyword pre-filter and the
+stored-embedding cosine gate. With `[decision]` set, the judge is a
+**narrowing third gate behind both**: it is asked a closed yes/no
+question about a cluster the two fixed gates already admitted, and it
+can only veto. It can never cause a merge the fixed gates refused, and
+`[decision]` unset consults nobody — the two-gate v1.0.0 predicate runs
+byte-identically.
+
+Because a wrong permit is unrecoverable in a way a wrong block is not,
+this seam is stricter than the two above it. The merge is PERMITTED only
+when **all three** hold: the verdict is `yes`, a confidence is present,
+and that confidence is at or above the seam's floor —
+`CONSOLIDATION_MERGE_CONFIDENCE_FLOOR = 0.80` (a compiled default until
+the W5 calibration evidence for the `consolidation_merge` seam sets it;
+W6 makes it configurable). The seam reads its floor through the ONE
+per-seam accessor `CalibrationSeam::confidence_floor` — `Some(floor)`
+for a destructive seam, `None` for a seam that uses verdicts as-is —
+and clears it only through `Decision::is_confident_at_least`, which an
+absent confidence never satisfies. Everything else BLOCKS the cluster
+and leaves the sources untouched:
+
+| The judge… | Disposition | Counted as |
+|---|---|---|
+| answered `yes` with confidence ≥ 0.80 | **permit** — the admitted merge runs | `outcome="decided"` |
+| answered `yes` with NO confidence (no logprobs, or a generative fallback) | **block** — treated as an abstain | `outcome="abstained"`, `reason="unusable"` |
+| answered `yes` below the floor | **block** | `outcome="abstained"`, `reason="unusable"` |
+| answered `no` | **block** | `outcome="decided"` |
+| answered and declined (prose, off-vocabulary) — case 3 | **block** | `outcome="abstained"` |
+| was UNAVAILABLE (timeout, egress, no provider, a hot-reload handle that is `None`) — case 2 | **block** under `fallback = "abstain"` AND under `fallback = "generative"`; the operation FAILS under `fallback = "refuse"` | `outcome="timeout"` / `"egress_refused"` / `"abstained"` (the primary's own reason; the stand-in is not asked) |
+
+Note the case-2 row: on this seam `fallback = "generative"` does **not**
+widen the path back to the two-gate merge. The `[llm]` model wrote the
+summary text before and still does, but it never judged the merge, so
+there is no "old instrument" to fall back to — a generative fallback
+here would be a model that was refused as a judge deciding the merge
+anyway. So on this seam the stand-in is **never asked**: the seam calls
+`DecisionProvider::judge_primary`, which returns the primary's own
+answer verbatim and skips the chain's generative leg — a call that would
+carry the members' content across the `AI_MEMORY_INFERENCE_EGRESS`
+boundary for an answer the seam discards by construction. The block
+names the primary's own abstain (`timeout`, `egress_refused`, …). The
+generative client decides nothing here; it writes the summary only
+AFTER a permit. (Defence in depth: should a `generative_fallback`-sourced
+answer ever reach the seam anyway, it is blocked as UNAVAILABLE and
+recorded on the `fallback` series, never treated as a verdict.)
+
+**Order of the gates in a REAL run (D4):** the `pre_compaction` hook
+first, THEN the judge, THEN the summary — so a hook Deny means the judge
+is never asked (zero judge calls, no content leaves for a cluster the
+operator's hook refused), and a judge Block means no summary and no
+persist. A **dry run** does NOT run the hook; it runs the judge as a
+PREVIEW and still writes nothing — zero summarise, zero write-ahead,
+zero persist.
+
+Both funnels carry a `merge_judge` report on a real run and a
+`judge_preview` report on a dry run — the same shape (`blocked`,
+`permitted`, `sources`: a count per `DecisionSource` token —
+`decision_model` / `generative_fallback` / `deterministic`;
+`block_reasons`: a count per block reason — `unavailable` / `abstained`
+/ `decided_no` / `low_confidence` / `no_floor`) so a block from an
+outage is never mistaken for a model's verdict, and a preview is never
+mistaken for a claim that the hook would have permitted. **Unset
+`[decision]` carries NEITHER key**: the judge is never consulted, the
+keys are omitted rather than serialized as zero, and the unset report —
+including the curator's self-report memory — is byte-identical to
+v1.0.0. A destructive seam whose `confidence_floor()` is `None` is a
+contract failure and FAILS CLOSED (`no_floor`), never permissive.
+
 ## Migration from v0.6.x (legacy flat fields)
 
 The v0.6.x flat-field shape (`llm_model`, `ollama_url`, `embed_url`,

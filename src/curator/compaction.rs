@@ -217,6 +217,14 @@ pub(crate) struct ConsolidationRunReport {
     /// hook (or declared it a `required_event` with none configured) and the
     /// curator boot installed the process-global enforce gate.
     pub(crate) clusters_denied_by_hook: usize,
+    /// #3806 W4 — the merge judge's counters for a REAL run. `None` when
+    /// `[decision]` is unset (the judge is never consulted) — the same
+    /// conditional-omission rule the Pass-1 report follows.
+    pub(crate) merge_judge: Option<crate::decision_seams::MergeJudgeReport>,
+    /// #3806 W4 (D4) — a DRY run's judge counters: a PREVIEW, labelled by
+    /// DecisionSource and block reason, NOT a claim the hook would permit
+    /// (the hook does not run in a dry run). `None` when unset.
+    pub(crate) judge_preview: Option<crate::decision_seams::MergeJudgeReport>,
     /// Per-cluster errors (summarise / persist / verify). Best-effort: one
     /// cluster failing does not abort the sweep.
     pub(crate) errors: Vec<String>,
@@ -571,8 +579,26 @@ impl<'a> ConsolidationPass<'a> {
             }
             report.eligible_clusters += 1;
 
-            // Shadow stops here: count eligibility, do not mutate.
+            let judge_input: Vec<(String, String)> = members
+                .iter()
+                .map(|m| (m.title.clone(), m.content.clone()))
+                .collect();
+
+            // #3806 W4 (D4) — DRY RUN: the hook does NOT run; the judge runs
+            // as a PREVIEW of what it would say, labelled by source and
+            // block reason under `judge_preview`. Nothing mutates: no
+            // summarise, no write-ahead, no persist. `NoDecider` notes
+            // nothing, so an unset `[decision]` dry run is byte-identical.
             if self.dry_run {
+                match self.llm.judge_merge(&judge_input) {
+                    Ok(judgement) => crate::decision_seams::MergeJudgeReport::note(
+                        &mut report.judge_preview,
+                        &judgement,
+                    ),
+                    Err(e) => report
+                        .errors
+                        .push(format!("{}: merge judge refused: {e}", self.name())),
+                }
                 continue;
             }
 
@@ -600,6 +626,44 @@ impl<'a> ConsolidationPass<'a> {
                     "pre_compaction hook DENIED the cluster — destructive merge aborted (#2637)"
                 );
                 continue;
+            }
+
+            // #3806 W4 (D4) — REAL run: hook, THEN judge, THEN summarize. A
+            // hook Deny above means the judge was never asked (zero judge
+            // calls); a judge Block here means no summary and no persist.
+            // The judge is a NARROWING third gate behind Jaccard and cosine
+            // (`pair_merges` admitted this cluster). `NoDecider` notes nothing
+            // and this body is byte-identical to v1.0.0. A `?`-shaped error
+            // is the `fallback = "refuse"` case only, and it is per-cluster.
+            match self.llm.judge_merge(&judge_input) {
+                Ok(blocked @ crate::decision_seams::MergeJudgement::Block { reason, source }) => {
+                    crate::decision_seams::MergeJudgeReport::note(
+                        &mut report.merge_judge,
+                        &blocked,
+                    );
+                    tracing::warn!(
+                        target: COMPACTION_TRACE_TARGET,
+                        pass = self.name(),
+                        cluster_size = members.len(),
+                        reason = %reason,
+                        source = source.as_str(),
+                        "merge judge BLOCKED the cluster — consolidation withheld, sources \
+                         untouched (#3806 W4)"
+                    );
+                    continue;
+                }
+                Ok(judgement) => {
+                    crate::decision_seams::MergeJudgeReport::note(
+                        &mut report.merge_judge,
+                        &judgement,
+                    );
+                }
+                Err(e) => {
+                    report
+                        .errors
+                        .push(format!("{}: merge judge refused: {e}", self.name()));
+                    continue;
+                }
             }
 
             let summary = match self.summarize(&members) {
@@ -979,6 +1043,12 @@ mod tests {
         struct StubLlm {
             summary: String,
             calls: Mutex<Vec<String>>,
+            /// #3806 W4 — the scripted merge judgement. `None` leaves the
+            /// trait default in force (`NoDecider`: no `[decision]` set).
+            judge: Option<crate::decision_seams::MergeJudgement>,
+            /// #3806 W4 — `Some(msg)` makes `judge_merge` return `Err(msg)`
+            /// (the `fallback = "refuse"` shape).
+            judge_error: Option<String>,
         }
 
         impl StubLlm {
@@ -986,7 +1056,37 @@ mod tests {
                 Self {
                     summary: summary.to_string(),
                     calls: Mutex::new(Vec::new()),
+                    judge: None,
+                    judge_error: None,
                 }
+            }
+
+            fn with_judge(mut self, judgement: crate::decision_seams::MergeJudgement) -> Self {
+                self.judge = Some(judgement);
+                self
+            }
+
+            fn with_judge_error(mut self, msg: &str) -> Self {
+                self.judge_error = Some(msg.to_string());
+                self
+            }
+
+            fn judge_calls(&self) -> usize {
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|c| c.starts_with("judge:"))
+                    .count()
+            }
+
+            fn summarize_calls(&self) -> usize {
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|c| c.starts_with("summarize:"))
+                    .count()
             }
         }
 
@@ -1003,6 +1103,21 @@ mod tests {
                     .unwrap()
                     .push(format!("summarize:{}", memories.len()));
                 Ok(self.summary.clone())
+            }
+            fn judge_merge(
+                &self,
+                members: &[(String, String)],
+            ) -> Result<crate::decision_seams::MergeJudgement> {
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push(format!("judge:{}", members.len()));
+                if let Some(msg) = &self.judge_error {
+                    anyhow::bail!("{msg}");
+                }
+                Ok(self
+                    .judge
+                    .unwrap_or(crate::decision_seams::MergeJudgement::NoDecider))
             }
         }
 
@@ -1457,11 +1572,10 @@ mod tests {
             assert!(out.clusters_formed >= 1, "should form ≥1 cluster");
             assert!(out.eligible_clusters >= 1, "the dup cluster is eligible");
             assert_eq!(out.memories_consolidated, 0, "dry-run must not consolidate");
-            // No LLM summarise happened in dry-run.
-            assert!(
-                llm.calls.lock().unwrap().is_empty(),
-                "dry-run skips summarize"
-            );
+            // No LLM summarise happened in dry-run. (#3806 W4: the merge
+            // JUDGE is consulted in dry-run by ruling, so "no LLM call at
+            // all" is no longer the invariant — "no summarise" is.)
+            assert_eq!(llm.summarize_calls(), 0, "dry-run skips summarize");
             // No `[consolidated]` row was written; both sources still live.
             let rows = crate::db::list(
                 &conn,
@@ -1590,8 +1704,16 @@ mod tests {
             );
 
             // The summariser was never reached — the gate short-circuited first.
-            assert!(
-                llm.calls.lock().unwrap().is_empty(),
+            // (#3806 W4 D4: hook, THEN judge, THEN summarize — so a Deny also
+            // means the merge judge was never asked.)
+            assert_eq!(
+                llm.judge_calls(),
+                0,
+                "D4: a hook Deny means the judge is never asked"
+            );
+            assert_eq!(
+                llm.summarize_calls(),
+                0,
                 "Deny must short-circuit BEFORE summarize"
             );
 
@@ -1615,6 +1737,266 @@ mod tests {
                 !rows.iter().any(|m| m.title.starts_with("[consolidated]")),
                 "no consolidated row on a denied cluster"
             );
+        }
+
+        // ================================================== #3806 W4 merge judge
+
+        /// The stub's default judgement is the trait default — `NoDecider`.
+        /// A `[decision]`-less curator carries NO judge report at all (the
+        /// key is absent, not zero) and merges exactly as v1.0.0 did.
+        #[tokio::test]
+        async fn judge_unset_merges_with_no_judge_report_3806_w4() {
+            let (store, _dir) = open_db();
+            let conn = conn_of(&store);
+            let candidates = seed_two_dupes(&conn);
+            let llm = StubLlm::new("merged summary");
+            let out = ConsolidationPass::new(&store, &llm, false)
+                .run(&candidates)
+                .await
+                .unwrap();
+            assert_eq!(out.eligible_clusters, 1);
+            assert_eq!(
+                out.memories_consolidated, 2,
+                "unset [decision] merges as before"
+            );
+            assert!(
+                out.merge_judge.is_none(),
+                "no judge report without a decider"
+            );
+            assert!(out.judge_preview.is_none(), "no preview without a decider");
+            assert_eq!(llm.summarize_calls(), 1);
+        }
+
+        /// GOD D4 (3806-W3W4-DESIGN-RULINGS) — the full hook × judge × mode
+        /// matrix, twelve cells. REAL: hook, THEN judge, THEN summarize — a
+        /// hook Deny means the judge is never asked. DRY: the hook does NOT
+        /// run, the judge runs as a PREVIEW under `judge_preview` (labelled
+        /// by source and block reason; not a claim the hook would permit),
+        /// and nothing mutates: zero summarise, zero write-ahead, zero
+        /// persist in every dry cell. At the parent the judge ran BEFORE the
+        /// hook and before the dry-run stop, so the Deny cells saw one judge
+        /// call and the dry cells reported under the real key.
+        #[tokio::test]
+        async fn hook_judge_mode_matrix_3806_w4_d4() {
+            use crate::decision::{AbstainReason, DecisionSource};
+            use crate::decision_seams::{MergeBlockReason, MergeJudgement};
+            #[derive(Clone, Copy, Debug)]
+            enum Hook {
+                Allow,
+                Deny,
+            }
+            #[derive(Clone, Copy, Debug)]
+            enum Judge {
+                Yes,
+                No,
+                Timeout,
+            }
+            let judgement_for = |j: Judge| match j {
+                Judge::Yes => MergeJudgement::Permit {
+                    confidence: 0.97,
+                    source: DecisionSource::DecisionModel,
+                },
+                Judge::No => MergeJudgement::Block {
+                    reason: MergeBlockReason::DecidedNo,
+                    source: DecisionSource::DecisionModel,
+                },
+                Judge::Timeout => MergeJudgement::Block {
+                    reason: MergeBlockReason::Unavailable(AbstainReason::Timeout),
+                    source: DecisionSource::Deterministic,
+                },
+            };
+            for hook in [Hook::Allow, Hook::Deny] {
+                for judge in [Judge::Yes, Judge::No, Judge::Timeout] {
+                    for dry_run in [true, false] {
+                        let cell = format!(
+                            "{hook:?}/{judge:?}/{}",
+                            if dry_run { "dry" } else { "real" }
+                        );
+                        let (store, _dir) = open_db();
+                        let conn = conn_of(&store);
+                        let candidates = seed_two_dupes(&conn);
+                        let llm = StubLlm::new("merged summary").with_judge(judgement_for(judge));
+                        let fired = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                        let fired_probe = std::sync::Arc::clone(&fired);
+                        let gate: PreCompactionGate = std::sync::Arc::new(
+                            move |_ns: &[String], _payload: &serde_json::Value| {
+                                fired_probe.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                match hook {
+                                    Hook::Allow => Ok(()),
+                                    Hook::Deny => Err("refused by hooks.enforce gate (code 503): \
+                                         pre_compaction REQUIRED but NO enabled hook"
+                                        .to_string()),
+                                }
+                            },
+                        );
+                        let out = ConsolidationPass::new(&store, &llm, dry_run)
+                            .with_pre_compaction_gate(gate)
+                            .run(&candidates)
+                            .await
+                            .unwrap();
+                        let fired = fired.load(std::sync::atomic::Ordering::SeqCst);
+                        assert_eq!(out.eligible_clusters, 1, "{cell}: the pair is eligible");
+                        assert!(out.errors.is_empty(), "{cell}: {:?}", out.errors);
+                        let rows = crate::db::list(
+                            &conn,
+                            Some("ns"),
+                            None,
+                            16,
+                            0,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                        )
+                        .unwrap();
+                        if dry_run {
+                            // DRY — no hook, judge as preview, nothing written.
+                            assert_eq!(fired, 0, "{cell}: the hook does not run in a dry run");
+                            assert_eq!(llm.judge_calls(), 1, "{cell}: the judge previews");
+                            assert_eq!(llm.summarize_calls(), 0, "{cell}: zero summarise");
+                            assert_eq!(out.memories_consolidated, 0, "{cell}: zero persist");
+                            assert_eq!(out.rollback_entries_written, 0, "{cell}: zero write-ahead");
+                            assert_eq!(out.clusters_denied_by_hook, 0, "{cell}");
+                            assert!(
+                                out.merge_judge.is_none(),
+                                "{cell}: a dry run reports a PREVIEW"
+                            );
+                            let preview = out.judge_preview.as_ref().unwrap_or_else(|| {
+                                panic!("{cell}: the preview is present and labelled")
+                            });
+                            match judge {
+                                Judge::Yes => {
+                                    assert_eq!(preview.permitted, 1, "{cell}");
+                                    assert_eq!(
+                                        preview.sources.get("decision_model").copied(),
+                                        Some(1)
+                                    );
+                                }
+                                Judge::No => {
+                                    assert_eq!(preview.blocked, 1, "{cell}");
+                                    assert_eq!(
+                                        preview.block_reasons.get("decided_no").copied(),
+                                        Some(1)
+                                    );
+                                    assert_eq!(
+                                        preview.sources.get("decision_model").copied(),
+                                        Some(1)
+                                    );
+                                }
+                                Judge::Timeout => {
+                                    assert_eq!(preview.blocked, 1, "{cell}");
+                                    assert_eq!(
+                                        preview.block_reasons.get("unavailable").copied(),
+                                        Some(1)
+                                    );
+                                    assert_eq!(
+                                        preview.sources.get("deterministic").copied(),
+                                        Some(1)
+                                    );
+                                }
+                            }
+                            assert_eq!(rows.len(), 2, "{cell}: both sources survive a dry run");
+                            continue;
+                        }
+                        // REAL — hook first.
+                        assert_eq!(fired, 1, "{cell}: the hook fires once in a real run");
+                        assert!(
+                            out.judge_preview.is_none(),
+                            "{cell}: no preview in a real run"
+                        );
+                        if matches!(hook, Hook::Deny) {
+                            assert_eq!(
+                                llm.judge_calls(),
+                                0,
+                                "{cell}: hook Deny ⇒ the judge is never asked"
+                            );
+                            assert_eq!(out.clusters_denied_by_hook, 1, "{cell}");
+                            assert!(out.merge_judge.is_none(), "{cell}: nothing to report");
+                            assert_eq!(out.memories_consolidated, 0, "{cell}");
+                            assert_eq!(llm.summarize_calls(), 0, "{cell}");
+                            assert_eq!(rows.len(), 2, "{cell}");
+                            continue;
+                        }
+                        // REAL + Allow — then the judge, then (only on a permit) summarise.
+                        assert_eq!(
+                            llm.judge_calls(),
+                            1,
+                            "{cell}: the judge is asked after the hook"
+                        );
+                        assert_eq!(out.clusters_denied_by_hook, 0, "{cell}");
+                        let report = out.merge_judge.as_ref().unwrap_or_else(|| {
+                            panic!("{cell}: a real run with a judge carries the report")
+                        });
+                        match judge {
+                            Judge::Yes => {
+                                assert_eq!(report.permitted, 1, "{cell}");
+                                assert_eq!(out.memories_consolidated, 2, "{cell}: a permit merges");
+                                assert_eq!(llm.summarize_calls(), 1, "{cell}");
+                                assert!(
+                                    rows.iter().any(|m| m.title.starts_with("[consolidated]")),
+                                    "{cell}"
+                                );
+                            }
+                            Judge::No | Judge::Timeout => {
+                                assert_eq!(report.blocked, 1, "{cell}");
+                                assert_eq!(
+                                    out.memories_consolidated, 0,
+                                    "{cell}: a block withholds"
+                                );
+                                assert_eq!(
+                                    llm.summarize_calls(),
+                                    0,
+                                    "{cell}: Block short-circuits BEFORE summarize"
+                                );
+                                assert_eq!(out.rollback_entries_written, 0, "{cell}");
+                                assert_eq!(rows.len(), 2, "{cell}: both sources survive");
+                                let key = if matches!(judge, Judge::No) {
+                                    "decided_no"
+                                } else {
+                                    "unavailable"
+                                };
+                                assert_eq!(
+                                    report.block_reasons.get(key).copied(),
+                                    Some(1),
+                                    "{cell}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        /// `fallback = "refuse"` surfaces as `Err` from the judge: the cluster
+        /// is skipped with a per-cluster error naming the refusal, the pass
+        /// continues, and nothing is written.
+        #[tokio::test]
+        async fn judge_refusal_is_a_per_cluster_error_not_a_merge_3806_w4() {
+            let (store, _dir) = open_db();
+            let conn = conn_of(&store);
+            let candidates = seed_two_dupes(&conn);
+            let llm = StubLlm::new("must-not-be-summarised").with_judge_error(
+                "decision provider unavailable (timeout) and [decision].fallback = \"refuse\"",
+            );
+            let out = ConsolidationPass::new(&store, &llm, false)
+                .run(&candidates)
+                .await
+                .unwrap();
+            assert_eq!(out.eligible_clusters, 1);
+            assert_eq!(out.memories_consolidated, 0);
+            assert!(
+                out.merge_judge.is_none(),
+                "a refusal is an error, not a counted block"
+            );
+            assert_eq!(out.errors.len(), 1, "{:?}", out.errors);
+            assert!(
+                out.errors[0].contains("merge judge refused"),
+                "{:?}",
+                out.errors
+            );
+            assert_eq!(llm.summarize_calls(), 0);
         }
 
         #[tokio::test]
