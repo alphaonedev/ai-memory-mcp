@@ -252,6 +252,14 @@ const DECIDER_ALLOWED: &[&str] = &[
     // (all three pinned below), so the chokepoint stays the ONE source.
     "src/autonomy.rs",
     "src/curator/compaction.rs",
+    // #3806 W3 — the SYNTHESIS delete funnel. `run_synthesis_pass` names
+    // `decision_seams::judge_synthesis_delete` only to gate a Delete
+    // verdict on the judge's `MergeJudgement`; like the two W4
+    // consolidation funnels above it obtains NO decider (no
+    // `build_decision_provider`, no `attach_decider`, no handle type), so
+    // the chokepoint stays the ONE source. The judge runs in
+    // `decision_seams.rs` on the handle `attach_decider` attached.
+    "src/mcp/tools/store/synthesis.rs",
 ];
 
 /// The chokepoint entry points (`build_decision_provider`,
