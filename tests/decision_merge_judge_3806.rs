@@ -1132,3 +1132,96 @@ fn every_judge_primary_body_forwards_to_judge_primary_or_its_own_judge() {
          restores the generative leg on the merge seam: {offenders:?}"
     );
 }
+
+/// The merge judge is consulted from EXACTLY the two autonomous
+/// consolidation funnels — the curator's Pass-1 (`src/autonomy.rs`) and
+/// the SAL `ConsolidationPass` (`src/curator/compaction.rs`) — plus the
+/// hot-reload wrapper's forward (`src/reload.rs`) and its own definition
+/// site. The operator-EXPLICIT consolidations (MCP `memory_consolidate`,
+/// CLI `consolidate`, HTTP `power_consolidation`) and the federation
+/// receive path must NEVER call it: the judge narrows the substrate's own
+/// merges, not an operator's instruction (W125 READY §8 audit item).
+#[test]
+fn judge_merge_is_called_only_from_the_two_autonomous_funnels() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = Vec::new();
+    rust_files(&root, &mut files);
+    files.sort();
+    let mut callers: Vec<String> = Vec::new();
+    for file in &files {
+        let text = std::fs::read_to_string(file).expect("read source");
+        let production: String = text
+            .lines()
+            .take_while(|l| !l.trim_start().starts_with("mod tests"))
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .fold(String::new(), |mut acc, l| {
+                acc.push_str(l);
+                acc.push('\n');
+                acc
+            });
+        if production.contains(".judge_merge(") || production.contains("::judge_merge(") {
+            let rel = file
+                .strip_prefix(&root)
+                .unwrap_or(file)
+                .display()
+                .to_string();
+            callers.push(rel);
+        }
+    }
+    let expected = ["autonomy.rs", "curator/compaction.rs", "reload.rs"];
+    assert_eq!(
+        callers, expected,
+        "the merge judge may be consulted only by the two autonomous funnels and the reload \
+         forward — an operator-explicit consolidation or a federation path must not appear here"
+    );
+    for forbidden in [
+        "mcp/tools/consolidate.rs",
+        "cli/consolidate.rs",
+        "handlers/power_consolidation.rs",
+    ] {
+        let path = root.join(forbidden);
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{forbidden}: {e}"));
+        assert!(
+            !text.contains("judge_merge"),
+            "{forbidden}: an operator-explicit consolidation must not consult the merge judge"
+        );
+    }
+}
+
+/// The landed-base ruling: the threshold's home is the seam table,
+/// READABLE THROUGH `/capabilities`. With `[decision]` configured the boot
+/// report carries `confidence_floors` keyed by seam token — the merge
+/// seam at its posture, 0.80 — and serializes it under that key; with
+/// `[decision]` unset there is no report at all (pinned elsewhere), so the
+/// unset envelope is byte-identical.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn capabilities_report_carries_the_declared_seam_floors() {
+    let _serialized = serialize().await;
+    let decision = MockServer::start().await;
+    let generative = MockServer::start().await;
+    mount_verdict(&decision, "yes", 0.95).await;
+    let db = tmpdir();
+    let cfg = cfg_with_decision(
+        &decision.uri(),
+        &generative.uri(),
+        DecisionFallback::Abstain,
+    );
+    let _client = client_for(&cfg, &generative.uri(), db.path());
+    let report = ai_memory::decision_boot::boot_report().expect("configured: a report exists");
+    assert!(
+        (report.confidence_floors["consolidation_merge"] - CONSOLIDATION_MERGE_CONFIDENCE_FLOOR)
+            .abs()
+            < f64::EPSILON,
+        "{:?}",
+        report.confidence_floors
+    );
+    let json = serde_json::to_value(&report).expect("serialize");
+    assert_eq!(
+        json["confidence_floors"]["consolidation_merge"], 0.80,
+        "{json}"
+    );
+    assert!(
+        json["confidence_floors"].get("classify_kind").is_none(),
+        "undeclared seams are absent"
+    );
+}
