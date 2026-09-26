@@ -27,6 +27,12 @@
 #     the count is what makes an ADDITIONAL site visible. Same shape as
 #     the sibling `check-hardcoded-literals.sh` baseline
 #     (`<site-count><TAB><literal>`), which trips on +1.
+#     RESIDUAL (stated, not closed): the count is per FILE, so it licenses
+#     "any <count> sites of <literal> in <file>", not "these reviewed sites".
+#     Removing an approved site and adding one elsewhere in the same file
+#     (a SWAP, e.g. moving a GOVERNANCE_INTERNAL read into a tenant-reachable
+#     function: the #3638 shape) keeps the count and passes. Keying by the
+#     enclosing function closes it (follow-up #3970).
 #
 # What it deliberately does NOT do (out of scope for v0.7.0):
 #   - Symbol removal / dangling-caller detection. Codegraph indexes
