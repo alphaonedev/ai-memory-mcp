@@ -1118,7 +1118,7 @@ cannot see, because a mutation routed through
 `crate::test_support::EnvGuard` spells neither verb and leaves the
 calling file's arm (d) count at zero). All are
 HARD-BLOCK. Eleven are wired into `.github/workflows/c8-precheck.yml`,
-whose TWENTY-THREE jobs are `c8-precheck`, `vendor-literal-gate`,
+whose TWENTY-SIX jobs are `c8-precheck`, `vendor-literal-gate`,
 `l3-boundary-gate`, `hardcoded-literal-gate`, `docs-vs-ssot-drift`,
 `doc-symbol-anchor-gate`, `sdk-route-path-gate`, `ci-job-claims-gate`,
 `doc-surface-completeness-gate`, `capacity-claim-gate`,
@@ -1129,6 +1129,12 @@ whose TWENTY-THREE jobs are `c8-precheck`, `vendor-literal-gate`,
 `commit-signing-posture-gate`, `cert-expiry-gate` (the
 enterprise-federation cert §7 expiry trigger, #2915 — an integrity
 gate, not one of the twelve numbered lint gates below),
+`url-sink-redaction-gate`, `stale-contract-assertions-gate` and
+`claude-plugin-gate` (#3967 — three of the FIVE `check-*.sh` gates
+that existed and were referenced by NO workflow; the other two,
+`check-count-assertion-declared.sh` and `check-shared-namespace-claims.sh`,
+carry dated entries in `scripts/qc-allowlists/gates-not-wired.txt`
+naming why each cannot run on a PR event yet),
 `declaration-hash-gate` (#3557 — the pre-registered §0.2 SLO/RPO/RTO
 declaration's SHA-256 pin, `scripts/check-declaration-hash.sh`; an
 integrity gate in the same sense), plus the two test-guard jobs above. (This job list re-synced at #2915: it had
@@ -1623,10 +1629,29 @@ fails — so it cannot silently narrow. It is deliberately NOT repo-wide
 encodes a policy judgement that must be authored per workflow, and
 sweeping in the ~45 jobs of `release.yml` / `publish-sdks.yml` / `yank.yml`
 etc. — none of which fire on `pull_request` — would build a junk drawer
-readers skim past. The ledger is EMPTY today, which is the passing state.
-Data-integrity guardrail (North Star: a control that reports success
-while doing nothing is worse than a missing control, because 22 green
-checks actively imply rigor that is not present).
+readers skim past. Every ledger entry is a dated decision record, not an
+absolution. Data-integrity guardrail (North Star: a control that reports
+success while doing nothing is worse than a missing control, because 22
+green checks actively imply rigor that is not present). **(g) HARD-FAIL,
+added #3967** — rule (f) audits jobs that EXIST; a `scripts/check-*.sh`
+with no job is invisible to it, and FIVE of forty gates sat in exactly
+that state — including `check-url-sink-redaction.sh`, the credential-leak
+gate written AFTER its class recurred four times (#3648 #3649 #3667
+#3674) — all passing by hand, none able to fail, because nothing called
+them. Every gate script must now be referenced by basename on a
+NON-COMMENT line of some workflow under `.github/workflows/` (a
+commented-out `run:` is exactly the shape that switches a gate off in
+place and still reads as wired), or carry a dated, tracked entry in
+`scripts/qc-allowlists/gates-not-wired.txt` (`<check-*.sh> <YYYY-MM-DD>
+#<issue>`). Stale entries are FATAL in both directions (a listed script a
+workflow does reference; a listed script that no longer exists), a
+malformed entry is fatal, and an empty script set fails closed. The
+self-test plants the unwired script, the commented-out reference, the
+dated entry (PASS), and each hygiene failure. Three of the five were
+wired by #3967 (`url-sink-redaction-gate`, `stale-contract-assertions-gate`,
+`claude-plugin-gate`, declared in the not-required ledger until the
+branch-protection call promotes them); the two that cannot run on a PR
+event yet are ledgered with the reason.
 
 **8. Build-script custom-build ledger gate (#2259 / #2635)** —
 `scripts/check-build-script-vetting.py`, run by the `Build-script
