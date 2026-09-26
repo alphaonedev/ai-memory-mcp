@@ -215,8 +215,10 @@ pub struct DecisionSeams {
 /// `[decision].timeout_secs`). After [`BREAKER_THRESHOLD`] consecutive
 /// timeouts / transport failures / non-2xx answers the breaker opens and
 /// the seam short-circuits to the SAME `unavailable` abstain the call
-/// would have produced, for [`BREAKER_COOLDOWN`]; then one probe is let
-/// through. It can only shorten an outage's cost: `fallback` still
+/// would have produced, for [`BREAKER_COOLDOWN`]; then EXACTLY ONE probe
+/// is let through, claimed atomically, while every concurrent caller keeps
+/// short-circuiting until the probe's result closes or re-opens it (f1
+/// delta N2). It can only shorten an outage's cost: `fallback` still
 /// governs the short-circuited abstain exactly as it governs a real one
 /// (case 2). A DECLINE is an answer — it resets the count, as a decision
 /// does — and an egress refusal or a capability mismatch costs no socket
@@ -235,6 +237,49 @@ struct SeamBreaker {
 struct BreakerState {
     consecutive_unavailable: u32,
     opened_at: Option<Instant>,
+    /// f1 delta N2 — a half-open probe is in flight. Claimed and released
+    /// only under `state`'s lock, so "who probes" is decided atomically.
+    probing: bool,
+}
+
+/// f1 delta N2 — what the breaker lets a caller do.
+enum Admission<'a> {
+    /// Closed: dial the endpoint and fold the result in with
+    /// [`SeamBreaker::observe`].
+    Proceed,
+    /// Half-open: THIS caller is the one probe. Its [`ProbeTicket`] must be
+    /// completed with the result; dropping it uncompleted (a cancelled
+    /// future) counts as a FAILED probe, so the slot is never held forever.
+    Probe(ProbeTicket<'a>),
+    /// Open, or another caller holds the probe: answer `unavailable`
+    /// without a socket.
+    ShortCircuit,
+}
+
+/// f1 delta N2 — the single half-open probe slot.
+struct ProbeTicket<'a> {
+    breaker: &'a SeamBreaker,
+    done: bool,
+}
+
+impl ProbeTicket<'_> {
+    /// Fold the probe's result in and release the slot.
+    fn complete(&mut self, reason: Option<AbstainReason>, now: Instant) {
+        self.done = true;
+        self.breaker.observe(reason, now);
+    }
+}
+
+impl Drop for ProbeTicket<'_> {
+    fn drop(&mut self) {
+        if !self.done {
+            // Cancelled mid-probe: fail closed for one more cooldown and
+            // release the slot. Never panics (OWNERSHIP-25).
+            let mut state = self.breaker.lock();
+            state.probing = false;
+            state.opened_at = Some(Instant::now());
+        }
+    }
 }
 
 impl SeamBreaker {
@@ -244,18 +289,34 @@ impl SeamBreaker {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Whether a call made at `now` must be short-circuited.
-    fn is_open(&self, now: Instant) -> bool {
-        let state = self.lock();
-        state.consecutive_unavailable >= BREAKER_THRESHOLD
-            && state
-                .opened_at
-                .is_some_and(|opened| now.saturating_duration_since(opened) < BREAKER_COOLDOWN)
+    /// Decide, ATOMICALLY under the lock, what a call made at `now` may do.
+    /// After the cooldown exactly one caller claims the probe; every other
+    /// concurrent caller short-circuits until that probe's result is
+    /// folded in (f1 delta N2).
+    fn admit(&self, now: Instant) -> Admission<'_> {
+        let mut state = self.lock();
+        if state.consecutive_unavailable < BREAKER_THRESHOLD {
+            return Admission::Proceed;
+        }
+        let cooling = state
+            .opened_at
+            .is_some_and(|opened| now.saturating_duration_since(opened) < BREAKER_COOLDOWN);
+        if cooling || state.probing {
+            return Admission::ShortCircuit;
+        }
+        state.probing = true;
+        drop(state);
+        Admission::Probe(ProbeTicket {
+            breaker: self,
+            done: false,
+        })
     }
 
-    /// Fold one real call's result into the breaker.
+    /// Fold one real call's result into the breaker (and release the probe
+    /// slot, if one was held).
     fn observe(&self, reason: Option<AbstainReason>, now: Instant) {
         let mut state = self.lock();
+        state.probing = false;
         match reason {
             // An answer — a decision or a decline — closes the breaker.
             None | Some(AbstainReason::Unusable) => {
@@ -278,8 +339,35 @@ impl SeamBreaker {
                 }
             }
             // No socket was spent (egress refusal, capability mismatch,
-            // no provider): nothing to learn about the endpoint.
-            Some(_) => {}
+            // no provider): nothing to learn about the endpoint. A probe
+            // that learned nothing leaves the breaker open for one more
+            // cooldown rather than admitting a wave.
+            Some(_) => {
+                if state.consecutive_unavailable >= BREAKER_THRESHOLD {
+                    state.opened_at = Some(now);
+                }
+            }
+        }
+    }
+
+    /// Run one call through the breaker: admission, then the result.
+    /// `None` means short-circuited (no call was made).
+    async fn guarded<T, F>(&self, call: F) -> Option<Decision<T>>
+    where
+        F: std::future::Future<Output = Decision<T>>,
+    {
+        match self.admit(Instant::now()) {
+            Admission::ShortCircuit => None,
+            Admission::Proceed => {
+                let decision = call.await;
+                self.observe(decision.abstain_reason(), Instant::now());
+                Some(decision)
+            }
+            Admission::Probe(mut ticket) => {
+                let decision = call.await;
+                ticket.complete(decision.abstain_reason(), Instant::now());
+                Some(decision)
+            }
         }
     }
 }
@@ -430,21 +518,26 @@ pub(crate) fn classify_kind(
         return seams.no_provider(CalibrationSeam::ClassifyKind);
     };
     let started = Instant::now();
-    if seams.breaker.is_open(started) {
-        return seams.short_circuit(CalibrationSeam::ClassifyKind, started);
-    }
     let options = kind_options();
     let prompt = crate::llm::classify_kind_prompt(title, content);
     // The provider enforces `[decision].timeout_secs` itself; the bridge
     // budget is the outer ceiling for the sync call position. A bridge
-    // failure is an ABSTAIN, never a guess.
+    // failure is an ABSTAIN, never a guess. The breaker (R9 / f1 N2) runs
+    // INSIDE the bridge so the probe slot is released on every exit.
     let decision = crate::llm::block_on_local_bounded(seams.bridge_budget(), || {
-        handle.provider().choose(&prompt, &options)
+        seams
+            .breaker
+            .guarded(handle.provider().choose(&prompt, &options))
     })
-    .unwrap_or_else(|_| Decision::abstain(AbstainReason::Timeout, DecisionSource::Deterministic));
-    seams
-        .breaker
-        .observe(decision.abstain_reason(), Instant::now());
+    .unwrap_or_else(|_| {
+        Some(Decision::abstain(
+            AbstainReason::Timeout,
+            DecisionSource::Deterministic,
+        ))
+    });
+    let Some(decision) = decision else {
+        return seams.short_circuit(CalibrationSeam::ClassifyKind, started);
+    };
 
     // The client returns the VOCABULARY's spelling, so this parse cannot
     // fail for a decided answer; if it somehow did, an unmappable label
@@ -489,13 +582,9 @@ pub(crate) async fn judge_contradiction(
         return seams.no_provider(CalibrationSeam::DetectContradiction);
     };
     let started = Instant::now();
-    if seams.breaker.is_open(started) {
+    let Some(decision) = seams.breaker.guarded(handle.provider().judge(prompt)).await else {
         return seams.short_circuit(CalibrationSeam::DetectContradiction, started);
-    }
-    let decision = handle.provider().judge(prompt).await;
-    seams
-        .breaker
-        .observe(decision.abstain_reason(), Instant::now());
+    };
 
     if let Some(verdict) = decision.verdict() {
         record(
@@ -522,9 +611,12 @@ pub(crate) async fn judge_contradiction(
 /// the signed refusal row whether or not `llm` is `Some`, so those boot
 /// effects never become a function of the chat lane's availability.
 ///
-/// Returns `llm` unchanged when `[decision]` is unset or the chokepoint
-/// refused to build a provider: the surface then has no decider, every
-/// seam returns [`SeamOutcome::RunLegacy`], and behaviour is v1.0.0.
+/// Returns `llm` unchanged ONLY when `[decision]` is unset (case 1): the
+/// surface then has no decider, every seam returns
+/// [`SeamOutcome::RunLegacy`], and behaviour is v1.0.0. A configured
+/// section whose provider was never built (egress refusal, unresolvable)
+/// attaches the `NoProvider` state instead, so `fallback` governs it
+/// (case 2, vote R2) — including `refuse`.
 #[must_use]
 pub fn attach_decider(
     llm: Option<OllamaClient>,
@@ -639,6 +731,93 @@ mod tests {
         }
     }
 
+    /// f1 delta N2 — a TRUE half-open: after the cooldown, of N callers
+    /// racing through admission at once, EXACTLY ONE claims the probe and
+    /// every other one short-circuits until that probe's result is folded
+    /// in. Recovery control: a successful probe closes the breaker and the
+    /// next wave is admitted in full; a failed one re-opens it.
+    #[test]
+    fn after_the_cooldown_exactly_one_concurrent_caller_probes() {
+        const CALLERS: usize = 16;
+        let breaker = SeamBreaker::default();
+        let t0 = Instant::now();
+        for _ in 0..BREAKER_THRESHOLD {
+            breaker.observe(Some(AbstainReason::Unavailable), t0);
+        }
+        let after = t0 + BREAKER_COOLDOWN;
+        let barrier = std::sync::Barrier::new(CALLERS);
+        let admitted: Vec<Admission<'_>> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..CALLERS)
+                .map(|_| {
+                    s.spawn(|| {
+                        barrier.wait();
+                        breaker.admit(after)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("join"))
+                .collect()
+        });
+        let probes = admitted
+            .iter()
+            .filter(|a| matches!(a, Admission::Probe(_)))
+            .count();
+        let shorted = admitted
+            .iter()
+            .filter(|a| matches!(a, Admission::ShortCircuit))
+            .count();
+        assert_eq!(probes, 1, "exactly ONE half-open probe");
+        assert_eq!(shorted, CALLERS - 1, "every other caller fails closed");
+        // A second wave while the probe is still in flight: still closed.
+        assert!(matches!(breaker.admit(after), Admission::ShortCircuit));
+        // The probe fails: re-opened for a fresh cooldown.
+        let mut admitted = admitted;
+        let ticket = admitted
+            .iter_mut()
+            .find_map(|a| match a {
+                Admission::Probe(t) => Some(t),
+                _ => None,
+            })
+            .expect("the probe");
+        ticket.complete(Some(AbstainReason::Unavailable), after);
+        drop(admitted);
+        assert!(matches!(breaker.admit(after), Admission::ShortCircuit));
+        // After the next cooldown, a SUCCESSFUL probe closes it...
+        let later = after + BREAKER_COOLDOWN;
+        match breaker.admit(later) {
+            Admission::Probe(mut t) => t.complete(None, later),
+            _ => panic!("one probe after the second cooldown"),
+        }
+        // ...and the next wave is admitted in full (recovery control).
+        for _ in 0..CALLERS {
+            assert!(matches!(breaker.admit(later), Admission::Proceed));
+        }
+    }
+
+    /// f1 delta N2 — a probe that is DROPPED without a result (a cancelled
+    /// async seam) must not wedge the breaker half-open forever: it counts
+    /// as a failed probe (fail closed for one more cooldown), and the next
+    /// cooldown admits a fresh probe.
+    #[test]
+    fn a_cancelled_probe_releases_the_slot() {
+        let breaker = SeamBreaker::default();
+        let t0 = Instant::now();
+        for _ in 0..BREAKER_THRESHOLD {
+            breaker.observe(Some(AbstainReason::Timeout), t0);
+        }
+        let after = t0 + BREAKER_COOLDOWN;
+        let probe = breaker.admit(after);
+        assert!(matches!(probe, Admission::Probe(_)));
+        drop(probe);
+        let next = Instant::now() + BREAKER_COOLDOWN;
+        assert!(
+            matches!(breaker.admit(next), Admission::Probe(_)),
+            "the slot must be released, not held forever"
+        );
+    }
+
     /// #3806 R9 — the breaker's state machine, on explicit instants: it
     /// opens at the threshold, stays open for the cooldown, lets ONE
     /// probe through after it, re-opens if that probe fails, and closes
@@ -647,30 +826,36 @@ mod tests {
     #[test]
     fn the_breaker_opens_cools_down_probes_and_closes() {
         let breaker = SeamBreaker::default();
+        let closed = |b: &SeamBreaker, t| matches!(b.admit(t), Admission::Proceed);
         let t0 = Instant::now();
         for _ in 0..BREAKER_THRESHOLD - 1 {
             breaker.observe(Some(AbstainReason::Unavailable), t0);
-            assert!(!breaker.is_open(t0), "below the threshold stays closed");
+            assert!(closed(&breaker, t0), "below the threshold stays closed");
         }
         breaker.observe(Some(AbstainReason::EgressRefused), t0);
-        assert!(!breaker.is_open(t0), "an egress refusal is not an outage");
+        assert!(closed(&breaker, t0), "an egress refusal is not an outage");
         breaker.observe(Some(AbstainReason::Timeout), t0);
-        assert!(breaker.is_open(t0), "the threshold-th outage opens it");
-        let later = t0 + BREAKER_COOLDOWN - Duration::from_millis(1);
-        assert!(breaker.is_open(later), "open for the whole cooldown");
-        let probe = t0 + BREAKER_COOLDOWN;
         assert!(
-            !breaker.is_open(probe),
-            "after the cooldown one probe is allowed"
+            matches!(breaker.admit(t0), Admission::ShortCircuit),
+            "the threshold-th outage opens it"
         );
-        breaker.observe(Some(AbstainReason::Unavailable), probe);
-        assert!(breaker.is_open(probe), "a failed probe re-opens it");
+        let later = t0 + BREAKER_COOLDOWN - Duration::from_millis(1);
+        assert!(matches!(breaker.admit(later), Admission::ShortCircuit));
+        let probe = t0 + BREAKER_COOLDOWN;
+        match breaker.admit(probe) {
+            Admission::Probe(mut t) => t.complete(Some(AbstainReason::Unavailable), probe),
+            _ => panic!("after the cooldown one probe is allowed"),
+        }
+        assert!(
+            matches!(breaker.admit(probe), Admission::ShortCircuit),
+            "a failed probe re-opens it"
+        );
         breaker.observe(Some(AbstainReason::Unusable), probe);
-        assert!(!breaker.is_open(probe), "a decline is an answer: closed");
+        assert!(closed(&breaker, probe), "a decline is an answer: closed");
         for _ in 0..BREAKER_THRESHOLD {
             breaker.observe(Some(AbstainReason::Unavailable), probe);
         }
         breaker.observe(None, probe);
-        assert!(!breaker.is_open(probe), "a decision closes it");
+        assert!(closed(&breaker, probe), "a decision closes it");
     }
 }

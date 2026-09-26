@@ -153,9 +153,10 @@ impl GenerativeFallbackDecider {
             // `Unusable`. The model never ANSWERED: the transport
             // failed, or the response was not a completion at all. As
             // `Unusable` it classified as a DECLINE, which is terminal
-            // under the 2026-09-19 ruling, so `fallback = "refuse"`
-            // returned `Conservative` during an outage — failing OPEN on
-            // the exact failure that posture exists to refuse. The
+            // under the 2026-09-19 ruling, so under `fallback =
+            // "generative"` (the ONLY posture that builds this adapter —
+            // vote correction 2026-09-19 21:10Z) a total outage returned
+            // a definite verdict (`Ok(false)`) instead of case 2. The
             // module header of `crate::decision_seams` has always listed
             // "transport error" under CASE 2; the doc was right and the
             // code was wrong.

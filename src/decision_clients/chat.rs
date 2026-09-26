@@ -435,7 +435,8 @@ struct StructuredAnswer {
 ///   `choices[0].message.content` string). The provider never formed an
 ///   opinion, so this is an outage and `fallback` governs it (case 2).
 /// * [`AbstainReason::Unusable`] — the model ANSWERED and the answer is
-///   not a decision: an explicit `message.refusal`, content that is not a
+///   not a decision: an explicit non-empty `message.refusal` (checked
+///   FIRST, whatever `content` holds — f1 delta N1), content that is not a
 ///   JSON object, or a document without the schema field. That is the
 ///   decline, terminal under every posture (case 3).
 ///
@@ -446,21 +447,25 @@ fn read_structured_answer(
 ) -> Result<StructuredAnswer, AbstainReason> {
     let choice = response.get("choices").and_then(|c| c.get(0));
     let message = choice.and_then(|c| c.get("message"));
+    // f1 delta N1 — an explicit, non-empty `message.refusal` is the model
+    // DECLINING, and it is terminal BEFORE the content is read: a body that
+    // carries both a refusal and a parseable verdict is contradictory, and a
+    // contradictory protocol state is never collapsed into an actionable
+    // decision (ERRORS-09).
+    if message
+        .and_then(|m| m.get("refusal"))
+        .and_then(Value::as_str)
+        .is_some_and(|r| !r.trim().is_empty())
+    {
+        return Err(AbstainReason::Unusable);
+    }
     let Some(content) = message
         .and_then(|m| m.get("content"))
         .and_then(Value::as_str)
     else {
-        // The OpenAI structured-output refusal: `content` is null and the
-        // model's decline is in `message.refusal`. That IS an answer.
-        let refused = message
-            .and_then(|m| m.get("refusal"))
-            .and_then(Value::as_str)
-            .is_some();
-        return Err(if refused {
-            AbstainReason::Unusable
-        } else {
-            AbstainReason::Unavailable
-        });
+        // No content and no refusal (a non-empty refusal returned above):
+        // no model answer at all — an outage.
+        return Err(AbstainReason::Unavailable);
     };
     let payload = serde_json::from_str::<Value>(content)
         .ok()
@@ -629,6 +634,11 @@ mod tests {
             json!({"choices": [{"message": {"content": "not json"}}]}),
             json!({"choices": [{"message": {"content": "{\"other\":1}"}}]}),
             json!({"choices": [{"message": {"content": null, "refusal": "I can't."}}]}),
+            // f1 delta N1 — an explicit refusal is terminal even when the
+            // content ALSO parses: contradictory envelope fields are never
+            // collapsed into an actionable decision (ERRORS-09).
+            json!({"choices": [{"message": {
+                "content": "{\"verdict\":\"yes\"}", "refusal": "I decline"}}]}),
         ] {
             assert_eq!(
                 read_structured_answer(&body, FIELD_CHOICE).err(),
