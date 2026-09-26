@@ -42,9 +42,11 @@ use ai_memory::db;
 use ai_memory::decision::{AbstainReason, DecisionSource};
 use ai_memory::decision_config::{DecisionFallback, DecisionSection};
 use ai_memory::decision_seams::{
-    BREAKER_THRESHOLD, CONSOLIDATION_MERGE_CONFIDENCE_FLOOR, MergeBlockReason, MergeJudgeReport,
-    MergeJudgement, attach_decider,
+    BREAKER_THRESHOLD, CONSOLIDATION_MERGE_CONFIDENCE_FLOOR, MERGE_JUDGE_MEMBER_CHARS,
+    MergeBlockReason, MergeJudgeReport, MergeJudgement, attach_decider,
 };
+
+mod common;
 
 /// The judge counters a funnel run carried, from whichever key it used:
 /// `merge_judge` (real) or `judge_preview` (dry). Empty when neither is
@@ -1224,4 +1226,313 @@ async fn capabilities_report_carries_the_declared_seam_floors() {
         json["confidence_floors"].get("classify_kind").is_none(),
         "undeclared seams are absent"
     );
+}
+
+// ================================================ code-review F2: examinability
+
+/// Code-review F2 — the judge is asked about the bodies it is SHOWN, and a
+/// body longer than the judge window would reach it truncated, so a
+/// "confident yes" over an excerpt would be a permit to merge (or, on W3,
+/// delete) text the judge never examined. The SHARED destructive entry
+/// BLOCKS such a question before any prompt is built: the decision
+/// endpoint is never dialled (ABSENCE: hits stay 0), the block is an
+/// `unusable` abstain (no new label value), and the control — the same
+/// pair at EXACTLY the window — is asked and permitted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_overlength_member_is_blocked_without_asking_the_judge() {
+    let _serialized = serialize().await;
+    let decision = MockServer::start().await;
+    let generative = MockServer::start().await;
+    mount_verdict(&decision, "yes", 0.95).await;
+    let db = tmpdir();
+    let cfg = cfg_with_decision(
+        &decision.uri(),
+        &generative.uri(),
+        DecisionFallback::Abstain,
+    );
+    let client = client_for(&cfg, &generative.uri(), db.path());
+
+    let over: String = "x".repeat(MERGE_JUDGE_MEMBER_CHARS + 1);
+    let overlength = vec![
+        (TITLE_A.to_string(), over),
+        (TITLE_B.to_string(), CONTENT.to_string()),
+    ];
+    let before = outcome_count(SEAM, "abstained");
+    let judgement = client
+        .judge_merge(&overlength)
+        .expect("an unexaminable body is a block, not an error");
+    assert!(
+        matches!(
+            judgement,
+            MergeJudgement::Block {
+                reason: MergeBlockReason::Abstained(AbstainReason::Unusable),
+                source: DecisionSource::Deterministic,
+            }
+        ),
+        "a body past the window must block as unexaminable, got {judgement:?}"
+    );
+    assert_eq!(
+        hits(&decision).await,
+        0,
+        "ABSENCE: the judge is never asked about text it could not be shown"
+    );
+    assert_eq!(outcome_count(SEAM, "abstained"), before + 1);
+
+    // CONTROL — exactly at the window: asked, and permitted at 0.95.
+    let at: String = "y".repeat(MERGE_JUDGE_MEMBER_CHARS);
+    let at_window = vec![
+        (TITLE_A.to_string(), at),
+        (TITLE_B.to_string(), CONTENT.to_string()),
+    ];
+    let judgement = client.judge_merge(&at_window).expect("permit");
+    assert!(
+        matches!(judgement, MergeJudgement::Permit { .. }),
+        "a body AT the window is examinable and permits, got {judgement:?}"
+    );
+    assert_eq!(hits(&decision).await, 1, "the control was asked");
+}
+
+// ============================================ code-review F1: the outer report
+
+/// Code-review F1 / D4 — "the outer curator report carries the source/
+/// block counts" — in the build that SHIPS (`--features sal`), where the
+/// SAL `ConsolidationPass` is the live consolidator and Pass-1 is
+/// suppressed. Drives the real `curator::run_once` with a decider attached
+/// through the boot chokepoint, in the reviewer's four cells: block/permit
+/// real, block dry, and the Pass-1 control (compaction off). At the parent
+/// the SAL fold dropped both keys, so the three compaction-on cells
+/// serialized with no `merge_judge` / `judge_preview` at all.
+#[cfg(feature = "sal")]
+#[test]
+fn sal_outer_curator_report_carries_the_judge_counts() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .build()
+        .expect("runtime");
+    let _serialized = rt.block_on(serialize());
+    for (label, verdict, dry_run, compaction) in [
+        ("control_pass1_no_real", "no", false, false),
+        ("no_real", "no", false, true),
+        ("yes_real", "yes", false, true),
+        ("no_dry", "no", true, true),
+    ] {
+        let (decision, generative) = rt.block_on(async {
+            let decision = MockServer::start().await;
+            let generative = MockServer::start().await;
+            mount_verdict(&decision, verdict, 0.99).await;
+            mount_generative(&generative, "merged summary").await;
+            Mock::given(method("POST"))
+                .and(path("/api/generate"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"response": ""})))
+                .mount(&generative)
+                .await;
+            (decision, generative)
+        });
+        let dir = tmpdir();
+        let cfg = cfg_with_decision(
+            &decision.uri(),
+            &generative.uri(),
+            DecisionFallback::Abstain,
+        );
+        let client = client_for(&cfg, &generative.uri(), dir.path());
+        let (conn, _candidates) = store_with_admitted_pair(dir.path());
+        let mut ccfg = ai_memory::curator::CuratorConfig::default();
+        ccfg.compaction.enabled = compaction;
+        ccfg.dry_run = dry_run;
+        let report =
+            ai_memory::curator::run_once(&conn, Some(&client), &ccfg, None).expect("run_once");
+        let serialized = serde_json::to_string(&report).expect("serialize");
+        let judge = report.autonomy.merge_judge.as_ref();
+        let preview = report.autonomy.judge_preview.as_ref();
+        match (label, verdict, dry_run) {
+            (_, "no", false) => {
+                assert_eq!(judge.map(|j| j.blocked), Some(1), "{label}: {serialized}");
+                assert!(preview.is_none(), "{label}: a real run carries no preview");
+                assert_eq!(report.autonomy.memories_consolidated, 0, "{label}");
+                assert!(
+                    serialized.contains("\"merge_judge\""),
+                    "{label}: {serialized}"
+                );
+            }
+            (_, "yes", false) => {
+                assert_eq!(judge.map(|j| j.permitted), Some(1), "{label}: {serialized}");
+                assert_eq!(
+                    report.autonomy.memories_consolidated, 2,
+                    "{label}: a permit merges"
+                );
+            }
+            (_, "no", true) => {
+                assert_eq!(preview.map(|p| p.blocked), Some(1), "{label}: {serialized}");
+                assert!(judge.is_none(), "{label}: a dry run reports a PREVIEW");
+                assert_eq!(
+                    report.autonomy.memories_consolidated, 0,
+                    "{label}: dry writes nothing"
+                );
+                assert!(
+                    serialized.contains("\"judge_preview\""),
+                    "{label}: {serialized}"
+                );
+            }
+            _ => unreachable!(),
+        }
+        assert!(report.errors.is_empty(), "{label}: {:?}", report.errors);
+    }
+}
+
+// ================================= code-review F4: the remaining acceptance cells
+
+/// f1's acceptance table, the cells the reviewer found missing OVER THE
+/// WIRE: an unparseable logprob (`NaN` is not JSON), an infinite one
+/// (`1e999`) and an out-of-range one (a POSITIVE logprob, probability > 1)
+/// never permit — the client degrades them to ABSENT and the seam blocks;
+/// the judge WAS asked each time (PRESENCE), so the block is the seam
+/// refusing the number, not a silent endpoint.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_malformed_or_out_of_range_confidence_never_permits_over_the_wire() {
+    let _serialized = serialize().await;
+    let document = json!({ FIELD_VERDICT: "yes" }).to_string();
+    let bodies: [(&str, String); 3] = [
+        (
+            "nan",
+            format!(
+                r#"{{"choices":[{{"message":{{"role":"assistant","content":{}}},"logprobs":{{"content":[{{"token":"yes","logprob":NaN}}]}}}}]}}"#,
+                serde_json::to_string(&document).unwrap()
+            ),
+        ),
+        (
+            "infinity",
+            format!(
+                r#"{{"choices":[{{"message":{{"role":"assistant","content":{}}},"logprobs":{{"content":[{{"token":"yes","logprob":1e999}}]}}}}]}}"#,
+                serde_json::to_string(&document).unwrap()
+            ),
+        ),
+        (
+            "positive_logprob_p_gt_1",
+            format!(
+                r#"{{"choices":[{{"message":{{"role":"assistant","content":{}}},"logprobs":{{"content":[{{"token":"yes","logprob":0.5}}]}}}}]}}"#,
+                serde_json::to_string(&document).unwrap()
+            ),
+        ),
+    ];
+    for (label, body) in bodies {
+        let decision = MockServer::start().await;
+        let generative = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(DECISION_PATH))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(body.into_bytes(), "application/json"),
+            )
+            .mount(&decision)
+            .await;
+        let db = tmpdir();
+        let cfg = cfg_with_decision(
+            &decision.uri(),
+            &generative.uri(),
+            DecisionFallback::Abstain,
+        );
+        let client = client_for(&cfg, &generative.uri(), db.path());
+        let judgement = client
+            .judge_merge(&members())
+            .expect("{label}: an unusable number is a block, not an error");
+        assert!(
+            !judgement.permits(),
+            "{label}: a confidence that is not a probability must never permit, got {judgement:?}"
+        );
+        assert!(
+            matches!(judgement, MergeJudgement::Block { .. }),
+            "{label}: {judgement:?}"
+        );
+        assert_eq!(
+            hits(&decision).await,
+            1,
+            "{label}: the judge was asked (PRESENCE)"
+        );
+    }
+}
+
+/// A number WITHOUT a verdict — the document carries a confidence field
+/// and no `verdict` — is no decision: the strict parser abstains and the
+/// seam blocks as `abstained`; the number is never read as a yes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_number_without_a_verdict_blocks() {
+    let _serialized = serialize().await;
+    let decision = MockServer::start().await;
+    let generative = MockServer::start().await;
+    mount_decision(
+        &decision,
+        decision_body(&json!({"confidence": 0.99}).to_string()),
+    )
+    .await;
+    let db = tmpdir();
+    let cfg = cfg_with_decision(
+        &decision.uri(),
+        &generative.uri(),
+        DecisionFallback::Abstain,
+    );
+    let client = client_for(&cfg, &generative.uri(), db.path());
+    let before = outcome_count(SEAM, "abstained");
+    let judgement = client
+        .judge_merge(&members())
+        .expect("a decline is not an error");
+    assert!(
+        matches!(
+            judgement,
+            MergeJudgement::Block {
+                reason: MergeBlockReason::Abstained(AbstainReason::Unusable),
+                ..
+            }
+        ),
+        "no verdict means no decision, got {judgement:?}"
+    );
+    assert_eq!(outcome_count(SEAM, "abstained"), before + 1);
+    assert_eq!(hits(&decision).await, 1);
+}
+
+/// D1 — a `[decision]` section that is CONFIGURED but whose provider was
+/// REFUSED AT BOOT (`AI_MEMORY_INFERENCE_EGRESS=deny`) is a permanent
+/// case 2, distinct from a constructed provider that times out: the seam
+/// BLOCKS as `unavailable` (`no_provider`) under `abstain`, ERRORS under
+/// `refuse`, and never runs the legacy path — the decision endpoint is
+/// never dialled. Only an EXPLICITLY ABSENT section is `NoDecider`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_boot_refused_decider_blocks_as_configured_unavailable_never_legacy() {
+    let _serialized = serialize().await;
+    let _egress = common::EnvVarGuard::set("AI_MEMORY_INFERENCE_EGRESS", "deny".to_string());
+    for fallback in [DecisionFallback::Abstain, DecisionFallback::Refuse] {
+        let decision = MockServer::start().await;
+        let generative = MockServer::start().await;
+        mount_verdict(&decision, "yes", 0.99).await;
+        let dir = tmpdir();
+        let store = dir.path().join("boot.db");
+        drop(db::open(&store).expect("seed the store the refusal row lands in"));
+        let cfg = cfg_with_decision(&decision.uri(), &generative.uri(), fallback);
+        let client = client_for(&cfg, &generative.uri(), &store);
+        let before = outcome_count(SEAM, "abstained");
+        let judgement = client.judge_merge(&members());
+        if matches!(fallback, DecisionFallback::Refuse) {
+            assert!(
+                judgement.is_err(),
+                "refuse + boot refusal is an error, got {judgement:?}"
+            );
+        } else {
+            let judgement = judgement.expect("abstain posture is not an error");
+            assert!(
+                matches!(
+                    judgement,
+                    MergeJudgement::Block {
+                        reason: MergeBlockReason::Unavailable(AbstainReason::NoProvider),
+                        source: DecisionSource::Deterministic,
+                    }
+                ),
+                "configured-but-unbuilt is case 2, not legacy, got {judgement:?}"
+            );
+            assert_eq!(outcome_count(SEAM, "abstained"), before + 1);
+        }
+        assert_eq!(
+            hits(&decision).await,
+            0,
+            "a refused destination is never dialled"
+        );
+    }
 }

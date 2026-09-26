@@ -762,6 +762,18 @@ fn run_consolidation_pass(
             report.autonomy.clusters_formed += out.eligible_clusters;
             report.autonomy.memories_consolidated += out.memories_consolidated;
             report.autonomy.rollback_entries_written += out.rollback_entries_written;
+            // #3806 W4 (D4; code-review F1) — the merge judge's counts
+            // travel with the outer report in the build that ships. `None`
+            // stays `None`, so an unset `[decision]` self-report is
+            // byte-identical.
+            crate::decision_seams::MergeJudgeReport::fold_into(
+                &mut report.autonomy.merge_judge,
+                out.merge_judge.as_ref(),
+            );
+            crate::decision_seams::MergeJudgeReport::fold_into(
+                &mut report.autonomy.judge_preview,
+                out.judge_preview.as_ref(),
+            );
             // SAL-specific counters (no AutonomyPassReport home).
             report.compaction_pass_clusters_eligible += out.eligible_clusters;
             report.compaction_pass_rolled_back += out.rolled_back;

@@ -550,7 +550,11 @@ pub const SYNTHESIS_DELETE_CONFIDENCE_FLOOR: f64 = 0.80;
 /// Per-member cap on the content the merge judge is shown. The judge
 /// answers a yes/no over a closed vocabulary; it does not need the whole
 /// row, and a bounded prompt keeps the per-cluster cost predictable.
-const MERGE_JUDGE_MEMBER_CHARS: usize = 2_000;
+/// The judge WINDOW: a body longer than this is not shown truncated — the
+/// destructive question is BLOCKED as unexaminable before any prompt is
+/// built (`destructive_judge`, code-review F2). The prompt builders still
+/// cap defensively, but with the check in front the cap never bites.
+pub const MERGE_JUDGE_MEMBER_CHARS: usize = 2_000;
 
 /// Why the merge judge BLOCKED a cluster. Total, so a report can label
 /// every block; the wire tokens are stable. (`PartialEq` only: the
@@ -643,6 +647,26 @@ pub struct MergeJudgeReport {
 }
 
 impl MergeJudgeReport {
+    /// Fold ANOTHER report's counters into `slot` additively (code-review
+    /// F1: the outer curator report must carry the SAL consolidator's
+    /// judge counts, D4). `None` folded into anything leaves it unchanged,
+    /// and `Some` folded into `None` creates the report — so an unset
+    /// `[decision]` run still serializes with no key.
+    pub fn fold_into(slot: &mut Option<Self>, other: Option<&Self>) {
+        let Some(other) = other else {
+            return;
+        };
+        let report = slot.get_or_insert_with(Self::default);
+        report.blocked += other.blocked;
+        report.permitted += other.permitted;
+        for (k, v) in &other.sources {
+            *report.sources.entry(k.clone()).or_default() += v;
+        }
+        for (k, v) in &other.block_reasons {
+            *report.block_reasons.entry(k.clone()).or_default() += v;
+        }
+    }
+
     /// Fold one judgement into `slot`, creating the report on the FIRST
     /// judge answer. [`MergeJudgement::NoDecider`] folds NOTHING and
     /// creates nothing — that is what keeps an unset `[decision]` run's
@@ -913,12 +937,46 @@ pub(crate) fn destructive_judgement_of(
 pub(crate) fn destructive_judge(
     client: &OllamaClient,
     seam: CalibrationSeam,
+    bodies: &[&str],
     prompt: &str,
 ) -> Result<MergeJudgement> {
     let Some(seams) = client.decider() else {
         return Ok(MergeJudgement::NoDecider);
     };
     let started = Instant::now();
+    // EXAMINABILITY (W3/W4 code review F2). The judge is asked about the
+    // bodies it is SHOWN; a body longer than the judge window would reach
+    // it truncated, and a "confident yes" over an excerpt is no assurance
+    // about the text outside it — on a destructive seam that is a false
+    // permit to delete what was never examined. So a destructive question
+    // whose bodies do not fit the window is BLOCKED here, before any
+    // prompt is built or any byte leaves the host: recorded as an
+    // `unusable` abstain (no new label value), never a verdict. Both
+    // wrappers pass their bodies — the signature is what makes the check
+    // impossible to skip.
+    if let Some(over) = bodies
+        .iter()
+        .position(|body| body.chars().count() > MERGE_JUDGE_MEMBER_CHARS)
+    {
+        record(
+            seam,
+            DecisionOutcome::Abstained(AbstainReason::Unusable),
+            started,
+        );
+        tracing::warn!(
+            target: "decision.destructive.unexaminable",
+            seam = seam.as_str(),
+            body_index = over,
+            chars = bodies[over].chars().count(),
+            window = MERGE_JUDGE_MEMBER_CHARS,
+            "destructive judge could not examine a body that exceeds the judge window — \
+             blocked without asking (#3806 F2)"
+        );
+        return Ok(MergeJudgement::Block {
+            reason: MergeBlockReason::Abstained(AbstainReason::Unusable),
+            source: DecisionSource::Deterministic,
+        });
+    }
     // `[decision]` configured, no provider ever built (egress refused at
     // boot): CASE 2, permanent. Recorded like any other abstain so the
     // boot refusal is visible on this seam too; `fallback` governs.
@@ -978,9 +1036,14 @@ pub(crate) fn judge_merge(
     client: &OllamaClient,
     members: &[(String, String)],
 ) -> Result<MergeJudgement> {
+    let bodies: Vec<&str> = members
+        .iter()
+        .map(|(_, content)| content.as_str())
+        .collect();
     destructive_judge(
         client,
         CalibrationSeam::ConsolidationMerge,
+        &bodies,
         &merge_judge_prompt(members),
     )
 }
@@ -1007,6 +1070,7 @@ pub(crate) fn judge_synthesis_delete(
     destructive_judge(
         client,
         CalibrationSeam::SynthesisVerdict,
+        &[new_content, candidate_content],
         &synthesis_delete_prompt(new_title, new_content, candidate_title, candidate_content),
     )
 }
@@ -1381,5 +1445,33 @@ mod tests {
             "a destructive seam with no floor is a contract failure: {no_floor:?}"
         );
         assert!(!no_floor.permits());
+    }
+
+    /// Code-review F1 — the outer curator report carries the SAL
+    /// consolidator's judge counts: `fold_into` is additive, creates the
+    /// report on the first `Some`, and leaves `None` as `None` (so an
+    /// unset `[decision]` cycle still serializes with no judge key).
+    #[test]
+    fn fold_into_is_additive_and_keeps_none_as_none() {
+        let mut slot: Option<MergeJudgeReport> = None;
+        MergeJudgeReport::fold_into(&mut slot, None);
+        assert!(slot.is_none(), "None folded into None stays None");
+        let mut a = MergeJudgeReport::default();
+        a.blocked = 2;
+        a.sources.insert("decision_model".into(), 2);
+        a.block_reasons.insert("decided_no".into(), 2);
+        MergeJudgeReport::fold_into(&mut slot, Some(&a));
+        let mut b = MergeJudgeReport::default();
+        b.permitted = 1;
+        b.blocked = 1;
+        b.sources.insert("decision_model".into(), 2);
+        b.block_reasons.insert("unavailable".into(), 1);
+        MergeJudgeReport::fold_into(&mut slot, Some(&b));
+        MergeJudgeReport::fold_into(&mut slot, None);
+        let got = slot.expect("created on the first Some");
+        assert_eq!((got.blocked, got.permitted), (3, 1));
+        assert_eq!(got.sources.get("decision_model").copied(), Some(4));
+        assert_eq!(got.block_reasons.get("decided_no").copied(), Some(2));
+        assert_eq!(got.block_reasons.get("unavailable").copied(), Some(1));
     }
 }
