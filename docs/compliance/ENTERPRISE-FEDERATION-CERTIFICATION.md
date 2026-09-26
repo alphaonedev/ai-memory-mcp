@@ -1369,9 +1369,12 @@ is observed:**
    `.github/workflows/cert-postgres-age.yml`) hard-fails the job on any
    mismatch against those pins.
 
-**Expiry / re-cert trigger.** This certification binds to
-`ad60beadf602823c4451ff82067f62091aba9a04` (2026-09-11 re-issue; historical
-mint `e22bc93c`) and
+**Expiry / re-cert trigger.** This certification binds to the SHA in the
+**Binds to:** line at the head of this document (historical mint `e22bc93c`;
+the re-issue chain is recorded in the "Status at …" sections below — the
+SHA is deliberately NOT restated here, because a restated bind drifted six
+re-issues behind the head line before #3966 caught it, and the gate's
+anchored regex can only police the head line) and
 **expires on any change to the federation wire path (`src/federation/**`,
 `src/handlers/federation_receive.rs`, `src/handlers/federation_signing_check.rs`)
 or the `AI_MEMORY_FED_*` env surface.** Any such change requires re-running

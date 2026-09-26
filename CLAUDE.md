@@ -1465,8 +1465,10 @@ skipped-vs-ran disposition of the fail-open was not itself required —
 `Classify changes` (ci.yml) and `Coverage classify (docs-only
 short-circuit)` (coverage.yml) between them governed ELEVEN required
 contexts while being required by nothing. Both are now DECLARED in the
-mirror (29 declared contexts as of #2636/#2635; the live set is 24 until the companion
-branch-protection API call lands — for an ADDITION the mirror lands
+mirror (the declared set is `scripts/qc-allowlists/required-contexts-release.txt`; the LIVE set is
+pinned at `scripts/qc-allowlists/required-contexts-live-pin.txt` and the two are held equal by the
+wired, fail-closed `scripts/check-required-contexts-live.sh` (#3554), so the integers are deliberately
+not restated here — restating them drifted twice, #3968 — for an ADDITION the mirror lands
 FIRST, because the gate can only prove a context sound once the mirror
 declares it, so mirror-first means "prove, then enforce"; the reverse
 order leaves a live-required context that no in-repo file declares,
