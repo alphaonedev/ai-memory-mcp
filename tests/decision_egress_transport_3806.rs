@@ -131,23 +131,89 @@ async fn a_redirect_never_carries_the_decision_body_to_a_second_origin() {
 // 2. The internal-only pin reaches the socket.
 // ---------------------------------------------------------------------
 
-/// A mock bound to `127.0.0.2` — a loopback address `localhost` does
-/// NOT resolve to, so a request for `localhost:<port>` reaches this
-/// server ONLY if the client honours the pin.
-async fn server_on_127_0_0_2() -> (MockServer, u16) {
-    let listener = TcpListener::bind("127.0.0.2:0").expect("bind 127.0.0.2");
-    let port = listener.local_addr().expect("local addr").port();
+/// A mock bound to `ip:0` that answers every POST with a decided `yes`,
+/// or `Err` when this host cannot bind `ip` (macOS has no `127.0.0.2`
+/// unless an alias is installed: `AddrNotAvailable`, f1 delta N3).
+async fn server_on(ip: [u8; 4]) -> std::io::Result<(MockServer, u16)> {
+    let listener = TcpListener::bind(SocketAddr::from((ip, 0)))?;
+    let port = listener.local_addr()?.port();
     let server = MockServer::builder().listener(listener).start().await;
     Mock::given(method("POST"))
         .respond_with(ResponseTemplate::new(200).set_body_json(yes_chat()))
         .mount(&server)
         .await;
-    (server, port)
+    Ok((server, port))
 }
 
+const PROMPT: &str = "do these two records conflict?";
+
+/// PORTABLE half (every platform, f1 delta N3). The mock listens on
+/// `127.0.0.1`, which the system resolver reaches for `localhost`:
+///
+/// * CONTROL — the UNPINNED client reaches it through the resolver;
+/// * the pin OVERRIDES resolution — the same section pinned to `[::1]`
+///   (nothing listens on `[::1]:<port>`; the mock is IPv4-only) does NOT
+///   reach it, although the resolver would have: the client dialled the
+///   pinned address and only that;
+/// * PRESENCE — pinned to `127.0.0.1`, it reaches the mock.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_internal_only_pin_overrides_resolution_portable() {
+    let (server, port) = server_on([127, 0, 0, 1]).await.expect("bind 127.0.0.1");
+    let resolved = resolve_for("openai-compatible", &format!("http://localhost:{port}"));
+
+    let unpinned = construct_pinned(&resolved, permit(), None, None).expect("unpinned");
+    assert_eq!(unpinned.judge(PROMPT).await.verdict(), Some(true));
+    assert_eq!(
+        hits(&server).await,
+        1,
+        "control: the resolver reaches 127.0.0.1"
+    );
+
+    let elsewhere = PinnedTarget {
+        host: "localhost".to_string(),
+        addrs: vec![SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, port))],
+    };
+    let pinned_away =
+        construct_pinned(&resolved, permit(), None, Some(&elsewhere)).expect("pinned");
+    let judgement = pinned_away.judge(PROMPT).await;
+    assert_eq!(judgement.verdict(), None, "pinned elsewhere: no answer");
+    assert_eq!(
+        hits(&server).await,
+        1,
+        "a client pinned to [::1] must not fall back to the resolver's 127.0.0.1"
+    );
+
+    let here = PinnedTarget {
+        host: "localhost".to_string(),
+        addrs: vec![SocketAddr::from(([127, 0, 0, 1], port))],
+    };
+    let pinned = construct_pinned(&resolved, permit(), None, Some(&here)).expect("pinned");
+    assert_eq!(pinned.judge(PROMPT).await.verdict(), Some(true));
+    assert_eq!(hits(&server).await, 2);
+}
+
+/// SECOND-LOOPBACK half: the pin reaches an address the resolver NEVER
+/// yields for `localhost` (`127.0.0.2`). Needs `127.0.0.2` to be bindable —
+/// true on Linux, where this assertion is always alive. Where the platform
+/// genuinely cannot express the case (macOS without an alias), it says so
+/// with a `skip:` line and the portable half above still carries the
+/// pin-overrides-resolution assertion; any OTHER bind failure is a FAIL.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_internal_only_pin_is_what_the_client_connects_to() {
-    let (server, port) = server_on_127_0_0_2().await;
+    let (server, port) = match server_on([127, 0, 0, 2]).await {
+        Ok(bound) => bound,
+        Err(e)
+            if e.kind() == std::io::ErrorKind::AddrNotAvailable && !cfg!(target_os = "linux") =>
+        {
+            println!(
+                "skip: 127.0.0.2 is not a configured loopback address on this host ({e}); \
+                 the portable pin test the_internal_only_pin_overrides_resolution_portable \
+                 still asserts the pin (f1 delta N3)"
+            );
+            return;
+        }
+        Err(e) => panic!("bind 127.0.0.2: {e}"),
+    };
     let resolved = resolve_for("openai-compatible", &format!("http://localhost:{port}"));
 
     // PRESENCE — pinned to 127.0.0.2, the client reaches the server and
@@ -157,7 +223,7 @@ async fn the_internal_only_pin_is_what_the_client_connects_to() {
         addrs: vec![SocketAddr::from(([127, 0, 0, 2], port))],
     };
     let pinned = construct_pinned(&resolved, permit(), None, Some(&pin)).expect("pinned");
-    let judgement = pinned.judge("do these two records conflict?").await;
+    let judgement = pinned.judge(PROMPT).await;
     assert_eq!(
         judgement.verdict(),
         Some(true),
@@ -171,7 +237,7 @@ async fn the_internal_only_pin_is_what_the_client_connects_to() {
     // never yields 127.0.0.2, so the server is not reached: the presence
     // above is the pin's doing and not a resolver accident.
     let unpinned = construct_pinned(&resolved, permit(), None, None).expect("unpinned");
-    let judgement = unpinned.judge("do these two records conflict?").await;
+    let judgement = unpinned.judge(PROMPT).await;
     assert_eq!(judgement.verdict(), None);
     assert_eq!(
         hits(&server).await,
