@@ -1015,47 +1015,40 @@ Forever. Including:
 > certification work: defects, sweeps and CI hygiene that land on the patch line after GA. It is ordered by cost
 > to an operator, not by effort. Items here are *deferred*, never dropped — each has an open carrier issue,
 > verified open at the 2026-09-18 revision.
+> #3152 (one commit per logical update) was on this line and is no longer: the 2026-09-26 GA-freeze audit
+> (#3969) pulled it into v1.0.0 and it ships there.
 
-1. **[#3152](https://github.com/alphaonedev/ai-memory-mcp/issues/3152) — “SAL update splits the content patch and the lifecycle transition across two commits on
-   BOTH backends — crash between them persists the patch and drops the transition.”** One logical update
-   persisted in two commits, on SQLite *and* PostgreSQL. **Ruled deferred at the freeze line and placed first on
-   this line.** *Cost to an operator:* if the process dies between the two commits, the content patch is on disk
-   and the lifecycle transition is not, while the call returned `Err` — so the operator was told the write
-   failed and the row says otherwise, and nothing in the store marks the row as half-applied. It is deferred
-   rather than dropped because the caller does receive an error (it is not a silent false success) and the fix
-   restructures the update transaction on both backends, which is not a change to make at a freeze line.
-
-2. **[#3717](https://github.com/alphaonedev/ai-memory-mcp/issues/3717) — “make ALL encryption manageable … rotation and tested recovery for every role.”**
+1. **[#3717](https://github.com/alphaonedev/ai-memory-mcp/issues/3717) — “make ALL encryption manageable … rotation and tested recovery for every role.”**
    Stages S2–S4: key rotation for the non-identity roles. *Cost to an operator:* 11 of the 12 key roles have no
    rotation path, so rotating after a suspected compromise is a hand-run procedure, and a botched hand-run
    rotation loses the at-rest key — and with it the memory text that key protects.
 
-3. **[#3777](https://github.com/alphaonedev/ai-memory-mcp/issues/3777) — “postgres integration cells hard-code a developer lane database name in their guard.”**
+2. **[#3777](https://github.com/alphaonedev/ai-memory-mcp/issues/3777) — “postgres integration cells hard-code a developer lane database name in their guard.”**
    The 234-file PostgreSQL lane-guard sweep, per the ruling on that issue. *Cost to an operator:* the
    enterprise-federation checks can never pass in CI as written, so the PostgreSQL evidence an operator would
    re-run to satisfy themselves does not actually run.
 
-4. **[#3786](https://github.com/alphaonedev/ai-memory-mcp/issues/3786) — “branch hygiene for v1.0.1 — retire 395 content-free remote branches, archive 216
+3. **[#3786](https://github.com/alphaonedev/ai-memory-mcp/issues/3786) — “branch hygiene for v1.0.1 — retire 395 content-free remote branches, archive 216
    unmerged ones.”** Parts 2–4 of the four-part procedure. *Cost to an operator:* an operator or auditor looking
    at the remote cannot tell which branches are live work and which are residue, so “what is actually in the
    release” takes a person rather than a listing.
 
-5. **[#3796](https://github.com/alphaonedev/ai-memory-mcp/issues/3796) — “coverage job headroom ~5 min of 75: add a step-level timeout … so exhaustion fails
+4. **[#3796](https://github.com/alphaonedev/ai-memory-mcp/issues/3796) — “coverage job headroom ~5 min of 75: add a step-level timeout … so exhaustion fails
    loud, not by cancellation.”** *Cost to an operator:* when the coverage job runs out of budget it is reported
    as a cancellation rather than a failure, so a genuine regression is indistinguishable from CI flake and gets
    retried instead of investigated.
 
-6. **[#3702](https://github.com/alphaonedev/ai-memory-mcp/issues/3702) — “two live branches can claim the same schema version, ceiling entry or count pin — git
+5. **[#3702](https://github.com/alphaonedev/ai-memory-mcp/issues/3702) — “two live branches can claim the same schema version, ceiling entry or count pin — git
    merges it silently.”** *Cost to an operator:* two migrations can ship under one schema number, and the
    operator's upgrade then applies a ladder whose rungs do not correspond one-to-one to the versions recorded in
    their database.
 
-7. **[#3725](https://github.com/alphaonedev/ai-memory-mcp/issues/3725) — “`--keep` is inert on a default install with no operator key: every snapshot is
+6. **[#3725](https://github.com/alphaonedev/ai-memory-mcp/issues/3725) — “`--keep` is inert on a default install with no operator key: every snapshot is
    `kept_unverified`, rotation never prunes.”** *Cost to an operator:* backup retention silently does nothing on
    a default install — the disk fills, and the flag the operator set to bound it reports success while bounding
    nothing.
 
-8. **[#3200](https://github.com/alphaonedev/ai-memory-mcp/issues/3200) — the truthy-SSOT consolidation: “two truthy grammars in one binary …
+7. **[#3200](https://github.com/alphaonedev/ai-memory-mcp/issues/3200) — the truthy-SSOT consolidation: “two truthy grammars in one binary …
    `=yes` makes a TLS MANDATE silently inert.”** One truth-value grammar for every boolean env knob.
    *Cost to an operator:* an operator who writes `AI_MEMORY_REQUIRE_TLS=yes` — valid in the documented project
    grammar — gets a daemon with no TLS mandate and no warning. The required-context lockstep owed once

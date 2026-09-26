@@ -79,14 +79,27 @@ pub(super) async fn apply_lifecycle_patch_in_tx(
             ),
         });
     }
-    sqlx::query(
+    // f1 goal4 FC (#3266): the UPDATE carries the validated `from` as a
+    // compare-and-set. Unreachable under the `FOR UPDATE` row lock above, so
+    // it is the structural guard: a miss is a typed conflict naming the edge,
+    // never a silent no-op that would let the caller believe it moved.
+    let n = sqlx::query(
         "UPDATE memories SET lifecycle_state = $1, updated_at = NOW(), version = version + 1 \
-         WHERE id = $2",
+         WHERE id = $2 AND lifecycle_state = $3",
     )
     .bind(target.as_str())
     .bind(id)
+    .bind(&current_str)
     .execute(&mut **tx)
     .await
-    .map_err(|e| to_store_err("update lifecycle_state", e))?;
+    .map_err(|e| to_store_err("update lifecycle_state", e))?
+    .rows_affected();
+    if n == 0 {
+        return Err(StoreError::InvalidTransition {
+            detail: format!(
+                "CONFLICT: illegal lifecycle transition for memory {id}: {from} -> {target} is not permitted"
+            ),
+        });
+    }
     Ok(true)
 }
