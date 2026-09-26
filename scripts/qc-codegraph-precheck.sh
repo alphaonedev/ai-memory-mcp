@@ -18,7 +18,15 @@
 #     (not a variable reference). Test code is excluded — see
 #     `is_production_site` below.
 #   - Same scan for `for_admin("<lit>")`.
-#   - Each surviving site must appear in the corresponding allowlist.
+#   - Each surviving site must appear in the corresponding allowlist,
+#     keyed `<file>:<literal>:<count>` (#3965). The count is the number of
+#     production sites in that file using that literal. More sites than
+#     the entry allows is a HARD-BLOCK, so an approved entry licenses a
+#     KNOWN NUMBER of reviewed sites, never "any number in this file".
+#     Line numbers stay out of the key (they drift on unrelated edits);
+#     the count is what makes an ADDITIONAL site visible. Same shape as
+#     the sibling `check-hardcoded-literals.sh` baseline
+#     (`<site-count><TAB><literal>`), which trips on +1.
 #
 # What it deliberately does NOT do (out of scope for v0.7.0):
 #   - Symbol removal / dangling-caller detection. Codegraph indexes
@@ -60,12 +68,9 @@ fi
 if [[ "${1:-}" == "--self-test" ]]; then
     # The load-bearing DETECTOR probes (#1651 for_admin, #3943
     # for_admin_checked) run FIRST so a failure in the #3623 scenario harness
-    # below cannot stop them from running. The harness used to run here under
-    # `set -e`; on this base it fails cases 19/20/22 (a PRE-EXISTING
-    # GOVERNANCE_INTERNAL carve-out line-pin staleness after the carrier moved
-    # store/postgres.rs — unrelated to #3943, reported separately) and aborted
-    # the whole self-test before any probe ran. It now runs LAST, so its status
-    # is still the self-test's exit while the detector probes stay reachable.
+    # below cannot stop them from running. The harness runs LAST and its status
+    # is the self-test's exit. (It was red on cases 19/20/22 until #3965 keyed
+    # the allowlist by site count; CI runs this self-test since #3965.)
     PROBE="${ROOT}/src/c8_probe_1651.rs"
     trap 'rm -f "${PROBE}"' EXIT
     cat > "${PROBE}" <<'PROBE_EOF'
@@ -151,8 +156,7 @@ PROBE3943_EOF
     echo "C8 SELF-TEST PASS (#3943): production literal second-arg HARD-BLOCKed; threaded / #[cfg(test)] / comment forms accepted"
 
     # #3623 production-boundary scenario harness runs LAST (see the note at the
-    # top of this block). Its exit status is the self-test's. On this base it
-    # fails cases 19/20/22 (pre-existing, unrelated to #3943).
+    # top of this block). Its exit status is the self-test's.
     set +e
     python3 "${ROOT}/scripts/tests/gate-production-3623.py" "$(basename "$0")"
     harness_rc=$?
@@ -225,17 +229,6 @@ collect_sites () {
                 # Strip the absolute prefix so the allowlist is
                 # repo-root-relative (and stable across checkouts).
                 local rel="${f#"${ROOT}/"}"
-                # #3623 Conductor ruling: this one tenant-reachable governance
-                # read is adjudicated separately by #3638 (policy disclosure
-                # redaction). It is NOT an approved system-internal bypass.
-                # Re-pinned at release e8d8eb67a after the authorized rebase.
-                # Pin the exact release-base site, not the file/principal: a
-                # moved, changed, or additional call must be reviewed again.
-                if [[ "$mode" == "any-arg" && "$rel" == "src/store/postgres.rs" \
-                    && "$lineno" == 31500 \
-                    && "$content" == '            let ctx = CallerContext::for_admin(crate::identity::sentinels::GOVERNANCE_INTERNAL);' ]]; then
-                    continue
-                fi
                 out+="${rel}:${lineno}:${literal}"$'\n'
             fi
         done <<< "${matches}"
@@ -248,39 +241,76 @@ CURRENT_FOR_AGENT="$(collect_sites 'CallerContext::for_agent')"
 CURRENT_FOR_ADMIN="$(collect_sites 'CallerContext::for_admin' any-arg)"
 
 # Strip the line-number column from a "file:line:literal" stream so
-# the allowlist contract is `file:literal` only — line numbers drift
-# on every unrelated edit and would otherwise flood the diff.
-# Literals can contain `:` (e.g. `ai:seed`, `ai:http-internal`), so
-# we use sed with a regex that requires the second column to be
-# digits — preserves the rest of the line verbatim.
+# the key is `file:literal` — line numbers drift on every unrelated edit
+# and would otherwise flood the diff. Literals can contain `:` (e.g.
+# `ai:seed`, `ai:http-internal`), so the regex requires the second column
+# to be digits and preserves the rest of the line verbatim.
 strip_line () {
     sed -E 's/^([^:]+):[0-9]+:(.*)$/\1:\2/'
 }
 
-CURRENT_FOR_AGENT_NORM="$(printf '%s' "$CURRENT_FOR_AGENT" | strip_line | LC_ALL=C sort -u)"
-CURRENT_FOR_ADMIN_NORM="$(printf '%s' "$CURRENT_FOR_ADMIN" | strip_line | LC_ALL=C sort -u)"
+# #3965 — collapse the per-site stream to `file:literal:<count>`. Before
+# #3965 the stream was `sort -u`'d to bare `file:literal`, which made one
+# allowlist entry a licence for an UNLIMITED number of bypass sites of that
+# literal in that file: a second identical `for_admin(DAEMON_PRINCIPAL)`
+# added to an already-listed file was reported as nothing at all.
+count_sites () {
+    { strip_line | grep -v '^$' | LC_ALL=C sort | uniq -c \
+        | sed -E 's/^ *([0-9]+) (.*)$/\2:\1/' | LC_ALL=C sort; } || true
+}
 
-write_allowlist () {
+CURRENT_FOR_AGENT_NORM="$(printf '%s' "$CURRENT_FOR_AGENT" | count_sites)"
+CURRENT_FOR_ADMIN_NORM="$(printf '%s' "$CURRENT_FOR_ADMIN" | count_sites)"
+
+ALLOW_FORMAT_LINE='# Format: <repo-root-relative-file>:<literal>:<count>   (#3965: <count> = production sites of <literal> in <file>)'
+
+# --update rewrites ONLY the entry lines: every comment (each entry's review
+# justification) is kept in place, an entry whose key is still present gets
+# its current count, a key no longer present is dropped, and a NEW key is
+# appended at the end for a reviewer to justify. Accepts the legacy
+# count-less `file:literal` form so the #3965 migration is one --update.
+update_allowlist () {
     local out="$1"
     local payload="$2"
     local title="$3"
-    {
-        printf '# %s\n' "$title"
-        printf '# Auto-generated by scripts/qc-codegraph-precheck.sh --update.\n'
-        printf '# Format: <repo-root-relative-file>:<literal>\n'
-        printf '# Edit deliberately — every entry should be a reviewed exception.\n'
-        printf '# See CLAUDE.md §"Enforceable Orchestrator Safeguards" (C8).\n'
-        printf '\n'
-        printf '%s\n' "$payload"
-    } > "$out"
+    if [[ ! -f "$out" ]]; then
+        {
+            printf '# %s\n' "$title"
+            printf '# Auto-generated by scripts/qc-codegraph-precheck.sh --update.\n'
+            printf '%s\n' "$ALLOW_FORMAT_LINE"
+            printf '# Edit deliberately — every entry should be a reviewed exception.\n'
+            printf '# See CLAUDE.md §"Enforceable Orchestrator Safeguards" (C8).\n'
+            printf '\n'
+        } > "$out"
+    fi
+    local tmp="${out}.update.$$"
+    printf '%s\n' "$payload" | awk -v fmt="$ALLOW_FORMAT_LINE" '
+        FNR == NR {
+            if ($0 == "") next
+            m = match($0, /:[0-9]+$/)
+            key = substr($0, 1, m - 1); cur[key] = substr($0, m + 1); order[++n] = key
+            next
+        }
+        /^# Format:/ { print fmt; next }
+        /^#/ || /^[[:space:]]*$/ { print; next }
+        {
+            key = $0
+            if (match(key, /:[0-9]+$/)) key = substr(key, 1, RSTART - 1)
+            if (key in cur && !(key in done)) { print key ":" cur[key]; done[key] = 1 }
+        }
+        END {
+            for (i = 1; i <= n; i++) if (!(order[i] in done)) print order[i] ":" cur[order[i]]
+        }
+    ' - "$out" > "$tmp"
+    mv "$tmp" "$out"
 }
 
 if (( UPDATE )); then
-    write_allowlist "$ALLOW_FOR_AGENT" "$CURRENT_FOR_AGENT_NORM" \
+    update_allowlist "$ALLOW_FOR_AGENT" "$CURRENT_FOR_AGENT_NORM" \
         "CallerContext::for_agent(\"<literal>\") allowlist (C8 safeguard)."
-    write_allowlist "$ALLOW_FOR_ADMIN" "$CURRENT_FOR_ADMIN_NORM" \
+    update_allowlist "$ALLOW_FOR_ADMIN" "$CURRENT_FOR_ADMIN_NORM" \
         "CallerContext::for_admin(\"<literal>\") privacy-bypass allowlist (C8 safeguard)."
-    echo "Allowlists regenerated:"
+    echo "Allowlists regenerated (entry comments preserved):"
     echo "  ${ALLOW_FOR_AGENT}"
     echo "  ${ALLOW_FOR_ADMIN}"
     exit 0
@@ -292,49 +322,78 @@ if [[ ! -f "$ALLOW_FOR_AGENT" || ! -f "$ALLOW_FOR_ADMIN" ]]; then
 fi
 
 # The allowlist files carry a comment header (lines starting with `#`)
-# + a blank line; the payload is `<file>:<literal>` pairs. Strip
+# + a blank line; the payload is `<file>:<literal>:<count>` entries. Strip
 # comments + blanks before diffing.
 strip_comments () {
     # `grep -v` returns 1 when its input is empty after filtering;
     # that triggers `set -e` + `pipefail` and aborts the script. The
     # `|| true` swallows the non-zero so an empty allowlist body
     # (e.g. the for_agent file post-#955) is treated as legitimate.
-    { grep -v '^#' "$1" | grep -v '^$' | LC_ALL=C sort -u; } || true
+    { grep -v '^#' "$1" | grep -v '^[[:space:]]*$' | LC_ALL=C sort; } || true
+}
+
+# #3965 — an entry without a trailing `:<count>` is REFUSED, not read as
+# "unlimited" (that reading IS the defect) nor silently as 1. Fail closed
+# and name the line so the fix is one `--update`.
+require_counted () {
+    local file="$1"
+    local body="$2"
+    local bad
+    bad="$(printf '%s\n' "$body" | grep -v '^$' | grep -vE ':[1-9][0-9]*$' || true)"
+    if [[ -n "$bad" ]]; then
+        echo "C8 ERROR (#3965): allowlist entries without a site count in ${file#"${ROOT}/"}:" >&2
+        printf '  %s\n' "$bad" >&2
+        echo "  Format is <file>:<literal>:<count>. Run \`scripts/qc-codegraph-precheck.sh --update\`" >&2
+        echo "  and review the counts it writes before committing." >&2
+        exit 2
+    fi
 }
 
 ALLOW_FOR_AGENT_BODY="$(strip_comments "$ALLOW_FOR_AGENT")"
 ALLOW_FOR_ADMIN_BODY="$(strip_comments "$ALLOW_FOR_ADMIN")"
+require_counted "$ALLOW_FOR_AGENT" "$ALLOW_FOR_AGENT_BODY"
+require_counted "$ALLOW_FOR_ADMIN" "$ALLOW_FOR_ADMIN_BODY"
 
 violations=0
+
+# Compare `key:count` streams. OVER = more sites than allowlisted (includes a
+# key absent from the allowlist, allowed 0) → HARD-BLOCK. UNDER = fewer sites
+# than allowlisted (including 0) → WARN only, so an unrelated refactor that
+# deletes a site does not fail an unrelated PR; `--update` lowers the count.
+compare_counts () {
+    awk '
+        function split_key(line) { m = match(line, /:[0-9]+$/); K = substr(line, 1, m - 1); C = substr(line, m + 1) + 0 }
+        FNR == NR { if ($0 == "") next; split_key($0); allow[K] = C; next }
+        { if ($0 == "") next; split_key($0); cur[K] = C
+          a = (K in allow) ? allow[K] : 0
+          if (C > a) printf "OVER\t%s\t%d\t%d\n", K, C, a }
+        END { for (k in allow) { c = (k in cur) ? cur[k] : 0
+                if (c < allow[k]) printf "UNDER\t%s\t%d\t%d\n", k, c, allow[k] } }
+    ' <(printf '%s\n' "$2") <(printf '%s\n' "$1") | LC_ALL=C sort
+}
 
 check_diff () {
     local label="$1"
     local current="$2"
     local allow="$3"
-    # New sites = lines in current not in allow.
-    local new_sites
-    new_sites="$(LC_ALL=C comm -23 \
-        <(printf '%s\n' "$current") \
-        <(printf '%s\n' "$allow") || true)"
-    if [[ -n "${new_sites//[[:space:]]/}" ]]; then
+    local result over under
+    result="$(compare_counts "$current" "$allow")"
+    over="$(printf '%s\n' "$result" | awk -F'\t' '$1 == "OVER" { printf "%s  (%d site(s) in source, %d allowlisted)\n", $2, $3, $4 }')"
+    under="$(printf '%s\n' "$result" | awk -F'\t' '$1 == "UNDER" { printf "%s  (%d site(s) in source, %d allowlisted)\n", $2, $3, $4 }')"
+    if [[ -n "${over//[[:space:]]/}" ]]; then
         echo "C8 HARD-BLOCK: new ${label} site(s) not in allowlist:" >&2
-        printf '  %s\n' "${new_sites}" >&2
+        printf '  %s\n' "${over}" >&2
         echo "" >&2
+        echo "An allowlist entry licenses a COUNTED number of sites (#3965); an additional" >&2
+        echo "site of an approved literal needs the same review as a new literal." >&2
         echo "If these are deliberate exceptions, run:" >&2
         echo "  scripts/qc-codegraph-precheck.sh --update" >&2
         echo "and review the diff to ${ALLOW_DIR%/}/*.txt before committing." >&2
         violations=$(( violations + 1 ))
     fi
-    # Stale entries = lines in allow not in current. Surface as a
-    # WARN — not a hard block — so unrelated refactors that delete a
-    # site don't fail unrelated PRs.
-    local stale
-    stale="$(LC_ALL=C comm -13 \
-        <(printf '%s\n' "$current") \
-        <(printf '%s\n' "$allow") || true)"
-    if [[ -n "${stale//[[:space:]]/}" ]]; then
-        echo "C8 WARN: stale ${label} allowlist entries (no longer present in source):" >&2
-        printf '  %s\n' "${stale}" >&2
+    if [[ -n "${under//[[:space:]]/}" ]]; then
+        echo "C8 WARN: stale ${label} allowlist entries (fewer sites in source than allowlisted):" >&2
+        printf '  %s\n' "${under}" >&2
         echo "  → run \`scripts/qc-codegraph-precheck.sh --update\` to prune." >&2
     fi
 }
@@ -373,4 +432,6 @@ if (( violations > 0 )); then
     exit 1
 fi
 
-echo "C8 precheck OK (for_agent: $(printf '%s\n' "$CURRENT_FOR_AGENT_NORM" | grep -c . || true) sites, for_admin: $(printf '%s\n' "$CURRENT_FOR_ADMIN_NORM" | grep -c . || true) sites)."
+# Sites = the sum of the per-key counts; keys = distinct file:literal pairs.
+sum_sites () { printf '%s\n' "$1" | awk '/:[0-9]+$/ { m = match($0, /:[0-9]+$/); t += substr($0, m + 1) } END { print t + 0 }'; }
+echo "C8 precheck OK (for_agent: $(sum_sites "$CURRENT_FOR_AGENT_NORM") sites, for_admin: $(sum_sites "$CURRENT_FOR_ADMIN_NORM") sites in $(printf '%s\n' "$CURRENT_FOR_ADMIN_NORM" | grep -c . || true) counted entries)."

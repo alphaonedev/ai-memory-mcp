@@ -99,6 +99,16 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Run C8 precheck
         run: bash scripts/qc-codegraph-precheck.sh
+      - name: Self-test the gate (regression evidence)
+        # #3965: this was the one gate in this workflow whose --self-test CI
+        # never ran, and it was red (3 of 22 #3623 cases) because the
+        # allowlist keyed `file:literal` licensed any number of additional
+        # sites of an approved literal. Keyed `file:literal:<count>` now; the
+        # self-test proves the sentinel-form detector (#1651), the literal
+        # second-arg detector (#3943), and the #3623 production-boundary
+        # cases, including "an additional site of an approved literal is
+        # blocked" and "a moved site is not".
+        run: bash scripts/qc-codegraph-precheck.sh --self-test
 
   vendor-literal-gate:
     name: Vendor-monoculture + SECS_PER_* lint-gate (#1174 PR10)

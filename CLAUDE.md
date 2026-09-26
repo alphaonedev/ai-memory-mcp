@@ -1197,6 +1197,16 @@ over time.
 `CallerContext::for_admin("<literal>")` site outside
 `scripts/qc-codegraph-allowlists/*.txt`. See the §"Enforceable
 Orchestrator Safeguards" section above for the full contract.
+Entries are keyed `<file>:<literal>:<count>` (#3965): an entry licenses
+exactly `<count>` production sites of that literal in that file, so an
+ADDITIONAL site of an already-approved literal is a HARD-BLOCK just like
+a new literal. Before #3965 the key was a bare `file:literal`, which made
+each entry an unlimited-multiplicity licence (31 real sites stood behind
+the 25 entries the gate reported). Line numbers stay out of the key on
+purpose, so a moved site is the same reviewed site. An entry without a
+count is refused. `--update` rewrites only the entry lines and keeps every
+justification comment. The job runs `--self-test` too, which includes the
+#3623 production-boundary cases for the counted contract.
 
 **2. Vendor-monoculture + SECS_PER_* gate** —
 `scripts/check-vendor-literals.sh`. Blocks regressions in two

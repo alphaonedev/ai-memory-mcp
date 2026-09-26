@@ -47,15 +47,27 @@ for gate in gates:
         if gate == 'qc-codegraph-precheck.sh':
             marker = 'GOVERNANCE_INTERNAL'
             site = '            let ctx = CallerContext::for_admin(crate::identity::sentinels::GOVERNANCE_INTERNAL);'
-            # #3638 exclusion must not hide any neighboring or new bypass.
+            # #3965: an allowlist entry is `<file>:<literal>:<count>` and
+            # licenses exactly <count> sites. The allowlist copied into this
+            # tree carries `src/store/postgres.rs:GOVERNANCE_INTERNAL:1` and
+            # `src/cli/agents.rs:DAEMON_PRINCIPAL:2`. Before #3965 the key was
+            # a bare `file:literal`, so an ADDITIONAL site of an approved
+            # literal was invisible (the pre-#3965 cases 19/20/22 were red).
+            # Line position is deliberately NOT part of the key (it drifts on
+            # every unrelated edit): a MOVED site is the same reviewed site.
+            # What must trip is a site the count does not cover, or a new
+            # literal in the file.
+            daemon = '    let ctx = CallerContext::for_admin(crate::identity::sentinels::DAEMON_PRINCIPAL);'
             cases = [(name, source, blocked, 'production-probe-3623')
                      for name, source, blocked in cases]
             cases += [
                 ('store/postgres.rs', '\n' * 31499 + site, False, marker),
-                ('store/postgres.rs', '\n' * 31500 + site, True, marker),
+                ('store/postgres.rs', '\n' * 31500 + site, False, marker),
                 ('store/postgres.rs', '\n' * 31499 + site + '\n' + site, True, marker),
                 ('store/other.rs', '\n' * 31499 + site, True, marker),
-                ('store/postgres.rs', '\n' * 31499 + site.replace('let ctx', 'let other'), True, marker),
+                ('store/postgres.rs', '\n' * 31499 + site.replace('GOVERNANCE_INTERNAL', 'DAEMON_PRINCIPAL'), True, 'DAEMON_PRINCIPAL'),
+                ('cli/agents.rs', daemon + '\n' + daemon, False, 'DAEMON_PRINCIPAL'),
+                ('cli/agents.rs', daemon + '\n' + daemon + '\n' + daemon, True, 'DAEMON_PRINCIPAL'),
             ]
         else:
             cases = [(name, source, blocked, marker) for name, source, blocked in cases]
