@@ -1501,8 +1501,11 @@ pub fn decision_wire_parts(decision: &Decision) -> (&'static str, &str, &str) {
 /// * **Best-effort audit (NON-FATAL).** When read rules exist, the
 ///   decision is appended to `signed_events`, but an append failure is
 ///   logged and the read PROCEEDS — read availability is never coupled to
-///   audit-sink liveness (the SPLIT fail-posture; the deferred-audit DLQ
-///   keeps the trail recoverable). This is why it does NOT reuse
+///   audit-sink liveness (the SPLIT fail-posture). There is NO spool,
+///   queue or retry behind a failed append (#3660): that decision is
+///   absent from `signed_events` for good, and its only other trace is
+///   the best-effort forensic JSONL emit (when enabled — a writer-queue
+///   accept, not a confirmed write) plus the WARN. This is why it does NOT reuse
 ///   `check_agent_action`'s fatal `emit_check_event(...)?`.
 /// * **Fail-CLOSED on a blocking verdict** (`Refuse` / `Escalate`) and on a
 ///   rule-LOAD error — unless the operator opted into
@@ -1549,9 +1552,13 @@ pub fn gate_read(
     let decision = engine.evaluate(agent_id, action);
 
     // Best-effort audit — a read is NEVER blocked by an audit-append
-    // failure (SPLIT fail-posture; the DLQ keeps the trail recoverable).
+    // failure (SPLIT fail-posture). #3660: nothing spools, queues or
+    // retries a failed append; the decision is lost from `signed_events`
+    // and the WARN must say so rather than imply recovery.
     if let Err(e) = emit_check_event(conn, agent_id, action, &decision) {
-        tracing::warn!("read-gate: audit append failed (read proceeds; DLQ-backed): {e:#}");
+        tracing::warn!(
+            "read-gate: audit append failed (read proceeds; decision NOT recorded in              signed_events and NOT queued, spooled or retried; only the best-effort              forensic emit, if enabled, may hold it): {e:#}"
+        );
     }
     emit_forensic_decision(agent_id, action, &decision);
 
