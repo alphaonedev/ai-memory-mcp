@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security (#3901 — attested cross-id title merge no longer dequarantines a different local row)
+
+- **Route-OUT dequarantine-on-attest (#1948) is gated on the applied row being
+  the inbound row, on both backends.** An inbound id absent locally resolves
+  through the `(title, namespace)` title-slot upsert, which returns the id of a
+  DIFFERENT local row; both receive funnels (sqlite `federation_receive`,
+  postgres `federation_signing_check`) then lifted that row's quarantine on the
+  strength of an attestation that never covered it — a node-local containment
+  bypass (#3266 item 3 part 5). One shared gate
+  (`attest_dequarantine_target`) now requires `agent_attested` AND
+  `applied_id == inbound.id`; the cross-id case keeps the other row
+  quarantined (the push still applies) and the dequarantine result is logged
+  on failure instead of discarded. Pinned red-first on sqlite and live
+  postgres (`tests/federation_dequarantine_crossid_3901.rs`), with a same-id
+  control that still dequarantines.
+
 ### Changed (#3266 — Boids item 3 part 5 (R2): containment is node-local)
 
 - **Lifecycle merge (R2.1, fixes #3750).** A LOCAL `contaminated` /
