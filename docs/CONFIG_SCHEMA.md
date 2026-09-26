@@ -765,8 +765,53 @@ answer with the same `unavailable` abstain the call would have produced
 — so `fallback` still governs it — then let one probe through. A decline
 never trips it; any answer closes it.
 
-Model-class advice, the air-gap ladder and the hosted-route census land
-with the rest of the `[decision]` documentation (#3806 W6).
+#### Which model class belongs in `[decision]` (#3806 W6)
+
+Not a chat model. The slot wants a **small, structured-output decision
+model** — one that answers a closed vocabulary or a yes/no with
+logprobs, at a latency that fits `timeout_secs = 2`, and that a seam can
+call on every row of a curator batch without the cost of a generation.
+A generative chat model *can* sit here (any `[llm]` alias is accepted),
+but it answers slowly, without calibrated confidence, and with a
+temptation to explain — which the strict parser refuses. One shipped
+example of the intended class is `typesafe/jev-1.13` on OpenRouter; it
+is an example of the CLASS, not an endorsement of a vendor, and the
+substrate compiles no vendor default for it (`openai-compatible` and
+`systemone` have no compiled `base_url`; a missing one is refused, never
+guessed).
+
+The 0.80 confidence floor the two destructive seams apply is a **per-seam
+compiled constant and a posture choice**, not a measured probability: it
+stays until the W5 calibration evidence for `synthesis_verdict` and
+`consolidation_merge` says otherwise, it is readable on `/capabilities`
+(`decision_provider.confidence_floors`), and there is **no config key**
+for it at GA — a tunable key is post-GA.
+
+#### Deployment ladder, by egress posture
+
+| `AI_MEMORY_INFERENCE_EGRESS` | What `[decision]` may point at | Typical shape |
+|---|---|---|
+| `allow` | any endpoint, hosted or local | OpenRouter (`provider = "openrouter"`, a structured-output model) or a self-hosted `openai-compatible` server |
+| `internal-only` | only an endpoint whose EVERY resolved address is internal (loopback / RFC1918 / ULA / CGNAT), resolved at boot and PINNED into the client — TLS, no proxy, no redirects, DNS failure refuses | a `systemone` or `openai-compatible` decision route inside the perimeter |
+| `loopback-only` | loopback / localhost only | a local `vllm` / `lmstudio` / `llama.cpp` server on `127.0.0.1`, or Ollama's OpenAI-compatible surface |
+| `deny` | nothing — no provider is constructed, a signed refusal row is appended, every seam takes its `fallback` branch | fully air-gapped; the in-process `local-nli` provider is the one shape that would still decide here, and it is **not in this build** (it is refused by name at construction) |
+
+Under every posture a non-loopback plaintext `http` decision endpoint is
+refused at config load (#3823), decision clients never follow a redirect,
+and the outbound check runs before every request including the
+`logprobs` retry and the generative fallback leg.
+
+#### Hosted-route census (dated 2026-09-19)
+
+| Route | Wire | Status |
+|---|---|---|
+| OpenRouter (`provider = "openrouter"`, any structured-output model) | structured chat-completions with `response_format` json_schema, `logprobs`, `temperature = 0`, fixed `seed` | shipped |
+| TypeSafe SystemOne (`provider = "systemone"`, `POST <base_url>/v1/systemone`) | direct decision route; the request/response BODY this build sends is an explicit, replaceable assumption (`SystemOneDecider::with_wire`) | shipped, body-shape assumed |
+| Cloudflare (Workers AI / AI Gateway) | — | **parked**: no alias, no compiled catalog, no per-alias `account_id` key; use `openai-compatible` with an explicit `base_url` if you front it yourself |
+
+The census is a snapshot of what this tree can reach on that date; it is
+not a recommendation, and it is re-dated when a route is added or
+retired.
 
 #### What the seams do with an answer (#3806 W2)
 
@@ -873,9 +918,10 @@ Because a wrong permit is unrecoverable in a way a wrong block is not,
 this seam is stricter than the two above it. The merge is PERMITTED only
 when **all three** hold: the verdict is `yes`, a confidence is present,
 and that confidence is at or above the seam's floor —
-`CONSOLIDATION_MERGE_CONFIDENCE_FLOOR = 0.80` (a compiled default until
-the W5 calibration evidence for the `consolidation_merge` seam sets it;
-W6 makes it configurable). The seam reads its floor through the ONE
+`CONSOLIDATION_MERGE_CONFIDENCE_FLOOR = 0.80` (a per-seam compiled
+constant and a POSTURE choice, pending the W5 calibration evidence for
+the `consolidation_merge` seam; no config key at GA — a tunable key is
+post-GA). The seam reads its floor through the ONE
 per-seam accessor `CalibrationSeam::confidence_floor` — `Some(floor)`
 for a destructive seam, `None` for a seam that uses verdicts as-is —
 and clears it only through `Decision::is_confident_at_least`, which an

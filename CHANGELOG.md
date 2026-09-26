@@ -7,6 +7,119 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (#3806 — the `[decision]` structured-decision provider slot; W1a/W1b/W1c/W2/W3/W4/W5/W6, the 5-agent vote `4d3ea1c5`, #3822/#3823, f1's security review)
+
+- **The slot.** A `[decision]` config section beside `[llm]` selects a small
+  text-in / typed-decision-out model: `choose` over a closed set, `score` on a
+  range, `judge` yes/no (`DecisionProvider`, `src/decision.rs`). Three
+  invariants are unrepresentable rather than documented: the decision is
+  `Option<T>` — an **abstain is a first-class value carrying an
+  `AbstainReason`** (`no_provider` / `timeout` / `egress_refused` /
+  `unavailable` / `unusable` / `unsupported`), never a default `false`;
+  `confidence` is `Option<f64>`, present only where logprobs or calibration
+  evidence back it, and a `NaN` / out-of-range probability DEGRADES to absent
+  instead of being stored; every answer carries a `DecisionSource`
+  (`decision_model` / `generative_fallback` / `deterministic`). **Unset
+  `[decision]` is byte-identical v1.0.0 behaviour**, including serialized
+  output — no provider, no seam consult, no new key. Keys: `provider` (any
+  `[llm]` alias plus `systemone`, `openai-compatible`, `ollama`, `local-nli`;
+  unrecognised is refused by name), `model` (never inferred), `base_url`
+  (never guessed for `openai-compatible` / `systemone`), `api_key_env` |
+  `api_key_file` (inline `api_key` rejected at parse; the `[llm]` credential is
+  inherited ONLY for the literally-same endpoint, and there is deliberately no
+  generic `AI_MEMORY_DECISION_API_KEY`), `timeout_secs` (default 2; `0`
+  refused), `fallback` (`abstain` default | `generative` | `refuse`).
+  **Breaking, absorbed (#3808):** `[llm.auto_tag].backend` / `.base_url` /
+  `.api_key_env` / `.api_key_file` — documented as a second endpoint but
+  never resolved — are now a boot WARN (the landed-base ruling: existing
+  configs load byte-identically); `[llm.auto_tag].model` still parses.
+- **One boot chokepoint, gated by the egress plane.** `build_decision_provider`
+  (`src/decision_boot.rs`) is the single construction site; `EgressClass::
+  InferenceDecision` joins the `AI_MEMORY_INFERENCE_EGRESS` taxonomy. Under
+  `deny`, and under `loopback-only` / `internal-only` against a non-admitted
+  target, **no provider is constructed** and a signed `egress.inference_refused`
+  row is appended (to the existing, schema-current store — never a migrating
+  open, vote R8); `internal-only` resolves-and-pins the decision endpoint
+  exactly as the `[llm]` lane (#3822); a non-loopback plaintext `http` endpoint
+  is refused at config load (#3823); decision clients never follow a redirect.
+  `GET /api/v1/capabilities` / MCP `memory_capabilities` carry
+  `decision_provider` — `state` from the closed vocabulary `absent` |
+  `configured` | `refused_by_egress` | `constructed`, plus, from W4, the
+  declared per-seam `confidence_floors` — and the key is OMITTED when unset.
+  A provider that cannot answer a question a wired seam asks is refused by name
+  at construction (vote R6, `SEAM_CAPABILITIES`).
+- **Clients** (`src/decision_clients/`): a STRUCTURED chat-completions client
+  (`response_format` json_schema with the closed vocabulary as an `enum`,
+  `logprobs`, `temperature = 0`, fixed `seed`; confidence = `exp(Σ logprob)`
+  over exactly one token run spelling the label, else absent; an endpoint that
+  rejects `logprobs` latches it OFF one-way and the retry spends what is LEFT
+  of the budget), a direct `systemone` decision-route adapter (route fixed,
+  body an explicit replaceable assumption via `SystemOneDecider::with_wire`),
+  a generative fallback over the existing `[llm]` client that parses strictly
+  (prose ABSTAINS; no confidence, ever), and the calibration-row adapter.
+  Endpoints render as `scheme://host[:port]` in every `Debug` / `Display` /
+  log sink; a missing chat envelope is an outage, an explicit `message.refusal`
+  a decline (f1 review). `local-nli` is refused by name — not in this build.
+- **Seams, and what `fallback` means (W2).** `classify_kind` becomes a CHOICE
+  over all sixteen `MemoryKind` variants (the prompt named eight) and
+  `detect_contradiction` a typed JUDGEMENT (its `starts_with("yes")` read a
+  refusal, a preamble and a hedge as `true`). Three cases: (1) unset — the
+  v1.0.0 path, byte-identical; (2) provider UNAVAILABLE — `fallback` governs
+  (`abstain` = conservative non-action, `generative` = the old path,
+  `refuse` = error); (3) provider ANSWERED AND DECLINED — terminal, never
+  re-asked, under every posture. Every surface (HTTP, MCP stdio + its reload,
+  CLI curator) obtains its decider from the one chokepoint; the decider never
+  sits in `Permissions::evaluate` or the federation LWW merge (pinned). A
+  per-surface circuit breaker (vote R9: 3 consecutive unavailability abstains,
+  30 s cooldown, one probe) stops a curator batch dialling a dead endpoint per
+  row; its short-circuit is the same `unavailable` abstain.
+- **The two DESTRUCTIVE seams share ONE contract (W3 + W4, GOD rulings).**
+  `destructive_judge(client, seam, prompt)` → `destructive_judgement_of`
+  (`src/decision_seams.rs`): PRIMARY-ONLY through the new REQUIRED
+  `DecisionProvider::judge_primary` (the generative stand-in is never asked on
+  a delete path — 5/5 vote); a configured-but-unbuilt provider is a permanent
+  case 2; a `None` floor FAILS CLOSED (`no_floor`); permit ONLY on an explicit
+  `yes` with a validated confidence at or above the seam's floor —
+  `CalibrationSeam::confidence_floor`, **0.80 for both `synthesis_verdict` and
+  `consolidation_merge`, a per-seam compiled constant and a posture choice
+  pending the W5 evidence, no config key at GA**. W3: the online synthesis
+  pass's `delete` verdict becomes advice; at the sole enqueue point (after the
+  K9 re-check, before the deferred delete) a low-confidence / confidence-less /
+  `no` / declined / unavailable verdict collapses to NoOp and the candidate
+  survives. W4: the curator's consolidation merge gains a NARROWING third gate
+  behind Jaccard AND cosine on both funnels (autonomy Pass-1 and the SAL
+  `ConsolidationPass`, sqlite and postgres); real order is hook → judge →
+  summarise (a hook Deny means zero judge calls), a dry run skips the hook and
+  previews the judge under `judge_preview`; reports carry `merge_judge` /
+  `judge_preview` (blocked / permitted / sources / block_reasons), OMITTED when
+  unset; the operator-explicit `memory_consolidate` / `ai-memory consolidate` /
+  `power_consolidation` paths are deliberately not judged, and federation
+  receive never consults. Structural pins: every production `AutonomyLlm`
+  overrides `judge_merge`; every `judge_primary` body forwards correctly; the
+  judge is called only from the two autonomous funnels.
+- **Metrics (vote R5).** `ai_memory_decision_latency_seconds{seam}`,
+  `ai_memory_decision_outcome_total{seam,outcome}` and
+  `ai_memory_decision_abstain_total{seam,reason}`, keyed by a typed
+  `DecisionOutcome` so cardinality is bounded by the type (a `reason` exists
+  only on an abstain); created lazily, so an unset deployment's exposition is
+  unchanged; the worst case fits the unchanged 8 KiB inner budget with the
+  64 KiB read cap (#3654) untouched. See `docs/telemetry.md`.
+- **Calibration harness (W5, evidence).** `tests/decision_calibration/`
+  computes Brier, ten-bin ECE and the reliability curve from preregistered
+  held-out sets whose digests are committed BEFORE any result; the
+  always-abstain null baseline reports an ABSENT ECE (never a flattering
+  `0.0`), an overconfident control MUST fail, and the producer exits non-zero
+  on FAIL or PARTIAL (a corpus that does not cover every seam plus a negative
+  control is PARTIAL, never PASS — f1 F3/F4). Test-only; nothing lands in a
+  production path. Guide: `docs/decision-calibration.md`.
+- **Docs (W6).** `docs/CONFIG_SCHEMA.md` §`[decision]` carries the model-class
+  advice (a structured-output decision model; `typesafe/jev-1.13` as one
+  example of the class, no vendor endorsement), the deployment ladder by
+  posture, the hosted-route census dated 2026-09-19 (OpenRouter + TypeSafe
+  SystemOne shipped; Cloudflare parked), and the W3/W4 seam subsections; the
+  `AI_MEMORY_INFERENCE_EGRESS` env row names the `[decision]` lane; no new env
+  var was added by any #3806 unit.
+
 ### Fixed (#3782 — SDK quickstarts pointed at a scheme the daemon never serves)
 
 - **#3782 (adopter lens, 3x7 workstream G on PR #3769; GA-blocker) — every
