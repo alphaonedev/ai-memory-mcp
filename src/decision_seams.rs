@@ -1082,19 +1082,27 @@ pub(crate) fn destructive_judge(
         });
     };
     // #3806 R9 — an open breaker is the same `unavailable` abstain a real
-    // call to a dead endpoint would produce, without the socket.
-    if seams.breaker.is_open(started) {
-        record(
-            seam,
-            DecisionOutcome::Abstained(AbstainReason::Unavailable),
-            started,
-        );
-        let reason = seams.on_destructive_abstain(AbstainReason::Unavailable)?;
-        return Ok(MergeJudgement::Block {
-            reason,
-            source: DecisionSource::Deterministic,
-        });
-    }
+    // call to a dead endpoint would produce, without the socket. The
+    // destructive path is synchronous (the sync→async bridge below), so it
+    // runs the same half-open admission `guarded` does, by hand: a probe
+    // ticket is held across the bridged call and completed with its result
+    // (f1 delta N2 — a dropped ticket counts as a failed probe).
+    let ticket = match seams.breaker.admit(started) {
+        Admission::ShortCircuit => {
+            record(
+                seam,
+                DecisionOutcome::Abstained(AbstainReason::Unavailable),
+                started,
+            );
+            let reason = seams.on_destructive_abstain(AbstainReason::Unavailable)?;
+            return Ok(MergeJudgement::Block {
+                reason,
+                source: DecisionSource::Deterministic,
+            });
+        }
+        Admission::Proceed => None,
+        Admission::Probe(ticket) => Some(ticket),
+    };
     // `judge_primary`, not `judge`: under `fallback = "generative"` the
     // chain would otherwise re-ask the generative stand-in — a NETWORK
     // call carrying memory content — for an answer a destructive seam
@@ -1104,9 +1112,13 @@ pub(crate) fn destructive_judge(
         handle.provider().judge_primary(prompt)
     })
     .unwrap_or_else(|_| Decision::abstain(AbstainReason::Timeout, DecisionSource::Deterministic));
-    seams
-        .breaker
-        .observe(decision.abstain_reason(), Instant::now());
+    let observed_at = Instant::now();
+    match ticket {
+        Some(mut ticket) => ticket.complete(decision.abstain_reason(), observed_at),
+        None => seams
+            .breaker
+            .observe(decision.abstain_reason(), observed_at),
+    }
     // The floor is the seam's, read through the ONE per-seam accessor
     // (`CalibrationSeam::confidence_floor`); `None` fails closed inside.
     destructive_judgement_of(seams, seam, &decision, seam.confidence_floor(), started)
