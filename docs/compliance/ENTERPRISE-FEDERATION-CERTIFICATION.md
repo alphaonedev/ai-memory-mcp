@@ -12,15 +12,15 @@
 > (`docs/audit/3x7-v1-cutline-ruling-2026-08-01.md`) is the standard this
 > certification answers to; this document is the evidence-bound answer.
 
-**Binds to:** `eae99be435da643f107f0335ec45e2387ea7a545` (the promotion-3 rehearsal tip;
-re-issued 2026-09-23 after **2 §7-watched federation-wire files changed** since the prior bind
-`92209ad91` — 42 changed lines, **0 of them code** — §5.4(2)–(5) re-run at the new SHA per §7). The
-2026-09-22 re-issue at `92209ad91`, the 2026-09-21 re-issue at `f32c18dad`, the 2026-09-12 #3607 re-bind at `ab6f2175`, the 2026-09-11
+**Binds to:** `eba96b30791f34cf7583e0ddc912857d4bbb1a54` (the promotion-4 rehearsal tip;
+re-issued 2026-09-26 after **2 §7-watched federation-wire files changed** since the prior bind
+`eae99be43` — 188 changed lines, **92 of them code**, from two commits — §5.4(2)–(5) re-run at the
+new SHA per §7). The 2026-09-23 re-issue at `eae99be43`, the 2026-09-22 re-issue at `92209ad91`, the 2026-09-21 re-issue at `f32c18dad`, the 2026-09-12 #3607 re-bind at `ab6f2175`, the 2026-09-11
 re-issue at `b0483115`, the 2026-09-11 #3595 re-issue at `ad60bead` and the original 2026-08-12
 mint `e22bc93c` remain as historical records. Any change to the federation wire path or the `AI_MEMORY_FED_*` surface **voids this
 certification and triggers re-cert** (see §7).
 
-> ## STATUS — **LIVE as of 2026-09-23** (re-issued at the promotion-3 rehearsal tip `eae99be43` at 22 checks after 2 §7-watched federation-wire files changed by a COMMENT-ONLY diff; supersedes the 2026-09-22 bind at `92209ad91`)
+> ## STATUS — **LIVE as of 2026-09-26** (re-issued at the promotion-4 rehearsal tip `eba96b307` at 22 checks after 2 §7-watched federation-wire files changed by REAL CODE — #3266 item 3 part 5 and #3901; supersedes the 2026-09-23 bind at `eae99be43`)
 >
 > Re-validated and re-bound against `f32c18dadf8a659567960747cc2802186bac9de9`
 > at the v1.0.0 promotion tip on 2026-09-21: §5.4(2) posture legs re-measured at 22 checks
@@ -78,6 +78,82 @@ certification and triggers re-cert** (see §7).
 > `git diff --stat e22bc93c b80e7fff` is empty). This re-issue adds the
 > committed evidence bundle under `docs/compliance/evidence/cert-54/`
 > and this document's own ratification / caveat corrections.
+>
+> **Re-issue (2026-09-26, promotion 4 @ `eba96b307`).** The §7 re-cert trigger
+> FIRED: two watched federation-wire paths changed between `eae99be43` and
+> `eba96b307` — `src/handlers/federation_receive.rs` (+121/−18) and
+> `src/handlers/federation_signing_check.rs` (+35/−14) — from TWO commits:
+> `1359f5407` (`feat(#3266)`: containment is node-local — local-wins lifecycle
+> merge, receive normalisation, signed decontaminate; item 3 part 5) and
+> `30fec9b3b` (`fix(#3901)`: an attested cross-id title merge never
+> dequarantines a different local row, both backends — the shared
+> `attest_dequarantine_target` gate). **The diff is 188 lines, 92 of them
+> code** (measured with `git diff -U0`, comment / blank lines stripped: 96),
+> so unlike the 2026-09-23 re-issue this one records SUBSTANCE on the wire
+> surface, not a comment-only touch. The `AI_MEMORY_FED_*` identifier set is
+> IDENTICAL across the range (30 = 30); `src/federation/**` has no diff at all.
+> Discharged by full re-issue.
+>
+> §5.4(2)–(5) were **re-run at `eba96b307`**, not carried forward: the range
+> `eae99be43..eba96b307` is 92 commits — the #3266 item-3 landing (parts 2–5,
+> the f1 goal-4 FA/FB/FC fixes, the PG stamp/rewind lock-then-merge), #3941,
+> #3946, #3942, #3883/#3935, #3937, #3927, #3933/#3934, and the four refs
+> landed on 2026-09-26 (#3943, #3953, #3872, #3901) plus the #3960 G6 marker —
+> two on the watched surface, all on the binary the legs certify. Every figure
+> below was measured on this SHA.
+>
+> **§5.4(2) posture legs** (evidence: `docs/compliance/evidence/cert-eba96b307/`;
+> reproducible with `scripts/recapture-cert-eba96b307-posture.sh`, a copy of
+> the #3607 recapture script retargeted to this bundle, whose header declares
+> the 22 checks): leg 1 bare — exit **2**, 12 PASS / 10 FAIL; leg 2 hardened,
+> gate unarmed — exit **2**, 20 / 2; leg 3 hardened, gate ARMED — exit **1**,
+> refuses boot; leg 4 certified configuration (sqlcipher build,
+> `ENCRYPT_AT_REST=1`, gate ARMED, `AI_MEMORY_DB_SYNCHRONOUS=FULL`, operator
+> key pair) — exit **0**, **22 PASS / 0 FAIL**. The four exit statuses are
+> recorded in `cert-eba96b307/posture-legs-exit-codes.txt`.
+>
+> **§5.4(4)/(7) acceptance battery** — 11 invocations, default features, one
+> filter each; **11/11 green, zero failures**:
+> `boot_fail_closed_config_3166` 15 · `doctor_posture_exit_code_3003` 2 ·
+> `doctor_synchronous_posture_3553` 3 · `federation_catchup_posture_3582` 1 ·
+> `federation_namespace_gate_3582` 3 · `federation_peer_posture_3582` 10 ·
+> `federation_write_ns_scope_2447` 6 · `posture_control15_pg_resolution_3106` 4 ·
+> `--lib enterprise_federation_posture` **39** · `--lib federation::peer_posture` 5 ·
+> `--lib cli::backup::tests` 81. The lib slice was run as THREE separate
+> invocations. Exact `test result:` lines in `cert-eba96b307/test-results.txt`.
+>
+> **§5.4(5) removal proof** — `scripts/check-cert-removal-proof.sh`, all 15
+> controls, no flags, umask 022: **`overall: PASS`, 15 `[PROVEN]`
+> (`broken→RED (rc=101), restored→GREEN (rc=0)` each), 0 `[CERT-RED]`**, rc 0;
+> the tracked tree was byte-identical after the run. Full log
+> `cert-eba96b307/removal-proof-full.log`.
+>
+> **§5.4(3)** pg+AGE and the self-hosted federation lanes are cited from CI on
+> PR #3931 (the standing promotion-4 carrier), whose merge commit carries this
+> exact tree (the merge-base with `release/v1.0.0` is the release tip
+> `a1403c742`): `Certified pg+AGE cells (live PG 18.6 + AGE 1.8.0 + pgvector
+> 0.8.6)` run [`36253489794`](https://github.com/alphaonedev/ai-memory-mcp/actions/runs/36253489794) (success);
+> `Check (macos-fed,enterprise-fed)` in run [`36253489960`](https://github.com/alphaonedev/ai-memory-mcp/actions/runs/36253489960) (success);
+> `Postgres ignored tests (sal-postgres --ignored)` run [`36253489868`](https://github.com/alphaonedev/ai-memory-mcp/actions/runs/36253489868) (success).
+> `Check (linux-fed,enterprise-fed)` runs on the SAME self-hosted node that
+> produced this bundle, and its first attempt (job `108435829070`) FAILED
+> while that node was carrying the release builds and the removal proof above:
+> one 3-second `wait_until` cell (`auto_atomise::core::test_auto_atomise_inheritance`)
+> timed out, and the #1492 per-invocation watchdog (4800 s) terminated the
+> suite while tests were still completing (the last `ok` line lands 300 ms
+> before the kill — a slow suite, not a hang). The cell passes 3/3 locally on
+> this tree under the tier's `--features sal-postgres` (7/7 each run). The job
+> was re-run as job [`108461065938`](https://github.com/alphaonedev/ai-memory-mcp/actions/runs/36253489960/job/108461065938)
+> once the node was quiet: **success** (18:26–19:42Z), and run `36253489960`
+> concluded **success** as a whole. The first attempt is recorded, not hidden:
+> a certification whose own evidence run loaded the node it certifies on is a
+> fact the reader should have.
+>
+> Labour split, recorded: GOD (god-zsg, sole merger for the 2026-09-26
+> landing) RAN every leg, WROTE this record and generated `MANIFEST.sha256`
+> LAST; f2r is asked to VERIFY every number against the committed evidence
+> (author ≠ reviewer) — until that is recorded here the re-issue is
+> author-attested only.
 >
 > **Re-issue (2026-09-23, promotion 3 @ `eae99be43`).** The §7 re-cert trigger
 > FIRED: two watched federation-wire paths changed between `92209ad91` and
