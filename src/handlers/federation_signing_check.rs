@@ -1286,13 +1286,16 @@ pub(super) async fn sync_push_via_store(
             .claimed_by
             .as_deref()
             .and_then(crate::identity::verify::lookup_peer_public_key);
-        let lease_holder = app
-            .store
-            .lease_get(&ctx, &op.action_id)
-            .await
-            .ok()
-            .flatten()
-            .map(|l| l.holder);
+        // #3729 — only a LIVE lease binds a remote transition (same helper
+        // as the sqlite funnel, so the two cannot drift).
+        let lease_holder = crate::actions::live_lease_holder(
+            app.store
+                .lease_get(&ctx, &op.action_id)
+                .await
+                .ok()
+                .flatten(),
+            chrono::Utc::now().timestamp(),
+        );
         let signable = crate::identity::sign::SignableTransition {
             action_id: &op.action_id,
             namespace: &local.namespace,

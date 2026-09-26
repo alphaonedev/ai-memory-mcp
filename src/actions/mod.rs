@@ -735,6 +735,30 @@ pub fn lease_get(
         .optional()
 }
 
+/// The ONE liveness predicate for a lease at `now` (unix seconds): live iff
+/// `expires_at > now`. Shared by the local transition bind
+/// ([`authorize_claimed_by`]) and both federation receive funnels
+/// ([`live_lease_holder`]) so the local and federated lanes cannot disagree
+/// about whether a lapsed, not-yet-swept lease still holds the action (#3729).
+#[must_use]
+pub fn lease_is_live(lease: &crate::models::Lease, now: i64) -> bool {
+    lease.expires_at > now
+}
+
+/// #3729 — the holder of `lease` iff it is LIVE at `now`, else `None`.
+///
+/// Both `/sync/push` transition funnels (sqlite `federation_receive`,
+/// postgres `federation_signing_check`) read the local lease with the raw
+/// [`lease_get`] and handed its holder to
+/// `receive_auth::authorize_remote_transition`, so an EXPIRED lease the
+/// sweep had not yet reclaimed refused a peer's validly signed transition —
+/// the federated lane stricter than the local lane on a stale row, and two
+/// nodes disagreeing about the action until something reclaimed the lease.
+#[must_use]
+pub fn live_lease_holder(lease: Option<crate::models::Lease>, now: i64) -> Option<String> {
+    lease.filter(|l| lease_is_live(l, now)).map(|l| l.holder)
+}
+
 /// #3009 / #3226 / #3360 — shape-validate an OPTIONAL caller-supplied
 /// `claimed_by` and bind it to the live lease holder.
 ///
@@ -771,7 +795,7 @@ pub fn authorize_claimed_by(
     action_id: &str,
 ) -> Result<(), String> {
     let live_holder = lease
-        .filter(|l| l.expires_at > now)
+        .filter(|l| lease_is_live(l, now))
         .map(|l| l.holder.as_str());
     let Some(claimed_by) = claimed_by else {
         return match live_holder {
@@ -1676,6 +1700,30 @@ mod tests {
             persisted.holder, winners[0],
             "the persisted holder must be the reported winner"
         );
+    }
+
+    /// #3729 — `live_lease_holder` returns the holder only while the lease is
+    /// live, with the SAME boundary as `authorize_claimed_by` (expires_at > now).
+    #[test]
+    fn live_lease_holder_filters_expired_3729() {
+        let lease = |expires_at| crate::models::Lease {
+            action_id: "act-1".to_string(),
+            holder: "ai:w1".to_string(),
+            acquired_at: 1,
+            expires_at,
+            heartbeat_at: 1,
+        };
+        assert_eq!(
+            live_lease_holder(Some(lease(11)), 10).as_deref(),
+            Some("ai:w1")
+        );
+        assert_eq!(
+            live_lease_holder(Some(lease(10)), 10),
+            None,
+            "expires_at == now is lapsed"
+        );
+        assert_eq!(live_lease_holder(Some(lease(5)), 10), None);
+        assert_eq!(live_lease_holder(None, 10), None);
     }
 
     /// #3009 / #3226 — `authorize_claimed_by` shape-validates and binds to

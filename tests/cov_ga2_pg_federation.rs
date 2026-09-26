@@ -681,6 +681,131 @@ async fn pg_sync_push_via_store_applies_action_transition() {
     assert_eq!(unsigned_got.state, ai_memory::models::ActionState::Pending);
 }
 
+// #3729 — pg twin: an EXPIRED local lease (not yet swept) must not refuse a
+// peer's validly signed transition; a LIVE lease held by someone else still
+// does. Pre-fix the pg funnel handed the raw `lease_get` holder to the gate.
+#[tokio::test]
+async fn pg_sync_push_expired_local_lease_does_not_block_signed_transition_3729() {
+    let _g = FED_ENV_LOCK.lock().await;
+    let Some(url) = pg_url() else {
+        eprintln!(
+            "SKIP pg_sync_push_expired_local_lease_does_not_block_signed_transition_3729: env unset"
+        );
+        return;
+    };
+    clear_fed_env();
+    let keydir = tempfile::tempdir().expect("keydir");
+    let actor = uniq("ai:cov-ga2-pg-lease-b");
+    let kp = ai_memory::identity::keypair::generate(&actor).expect("kp");
+    ai_memory::identity::keypair::save(&kp, keydir.path()).expect("save");
+    // SAFETY: holds FED_ENV_LOCK for the duration.
+    unsafe {
+        std::env::set_var(ai_memory::federation::signing::REQUIRE_SIG_ENV, "0");
+        std::env::set_var(
+            ai_memory::federation::peer_attestation::TRUST_BODY_AGENT_ID_ENV,
+            "1",
+        );
+        std::env::set_var(ai_memory::identity::keypair::KEY_DIR_ENV, keydir.path());
+    }
+    let ns = uniq("covga2pglease");
+    let _scope = NamespaceScopeGuard::new(&actor, &ns);
+    let aid_expired = uniq("ga2pg-3729-expired");
+    let aid_live = uniq("ga2pg-3729-live");
+    let ctx = ai_memory::store::CallerContext::for_agent(actor.clone());
+    let seeder = PostgresStore::connect(&url).await.expect("seed connect");
+    let far_future = chrono::Utc::now().timestamp() + 86_400;
+    for (id, lease_expires) in [(&aid_expired, 1_i64), (&aid_live, far_future)] {
+        seeder
+            .action_create(
+                &ctx,
+                &ai_memory::models::Action {
+                    id: id.clone(),
+                    namespace: ns.clone(),
+                    kind: "test".to_string(),
+                    state: ai_memory::models::ActionState::Pending,
+                    title: "lease".to_string(),
+                    payload: json!({}),
+                    priority: 5,
+                    agent_id: Some(actor.clone()),
+                    claimed_by: None,
+                    vector_clock: json!({}),
+                    metadata: json!({}),
+                    created_at: 1_700_009_000,
+                    updated_at: 1_700_009_000,
+                },
+            )
+            .await
+            .expect("seed action");
+        sqlx::query(
+            "INSERT INTO leases (action_id, holder, acquired_at, expires_at, heartbeat_at) \
+             VALUES ($1, 'ai:cov-ga2-pg-lease-a', 0, $2, 0)",
+        )
+        .bind(id.as_str())
+        .bind(lease_expires)
+        .execute(seeder.pool())
+        .await
+        .expect("seed lease held by A");
+    }
+    let r = pg_router(&url).await;
+    let mut ops = Vec::new();
+    for (i, id) in [&aid_expired, &aid_live].into_iter().enumerate() {
+        let nonce = format!("cov-ga2-pg-3729-{i}").into_bytes();
+        let signable = ai_memory::identity::sign::SignableTransition {
+            action_id: id,
+            namespace: &ns,
+            from_state: "pending",
+            to_state: "claimed",
+            claimed_by: Some(&actor),
+            nonce: &nonce,
+            created_at: 1_700_009_100,
+        };
+        let sig = ai_memory::identity::sign::sign_transition(&kp, &signable).expect("sign");
+        ops.push(
+            serde_json::to_value(ai_memory::federation::sync::ActionTransitionOp {
+                action_id: id.clone(),
+                from_state: ai_memory::models::ActionState::Pending,
+                to_state: ai_memory::models::ActionState::Claimed,
+                claimed_by: Some(actor.clone()),
+                vector_clock: json!({}),
+                updated_at: 1_700_009_100,
+                signature: sig,
+                signer_pubkey: kp.public.to_bytes().to_vec(),
+                nonce,
+            })
+            .unwrap(),
+        );
+    }
+    let body = serde_json::to_vec(&json!({
+        "sender_agent_id": actor,
+        "sender_clock": {"entries": {}},
+        "sender_wall_clock": chrono::Utc::now().to_rfc3339(),
+        "memories": [],
+        "action_transitions": ops,
+    }))
+    .unwrap();
+    let (status, b) = decode(&r, push_req(&body, &[(PEER_HEADER, actor.as_str())])).await;
+    clear_fed_env();
+    assert!(status.is_success(), "status={status} body={b}");
+    assert_eq!(b["storage_backend"], "postgres");
+    assert_eq!(
+        b["action_transitions_applied"].as_i64().unwrap_or(-1),
+        1,
+        "exactly the expired-lease transition applies; body={b}"
+    );
+    let expired = seeder
+        .action_get(&ctx, &aid_expired)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(expired.state, ai_memory::models::ActionState::Claimed);
+    let live = seeder.action_get(&ctx, &aid_live).await.unwrap().unwrap();
+    assert_eq!(
+        live.state,
+        ai_memory::models::ActionState::Pending,
+        "CONTROL: a live lease binds"
+    );
+}
+
 #[tokio::test]
 async fn pg_sync_push_via_store_shipped_embedding_defers_no_embedder() {
     let _g = FED_ENV_LOCK.lock().await;

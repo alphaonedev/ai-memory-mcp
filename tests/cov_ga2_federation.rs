@@ -533,6 +533,126 @@ async fn sync_push_applies_action_transition_sqlite() {
     assert_eq!(unsigned_got.state, ai_memory::models::ActionState::Pending);
 }
 
+/// #3729 — an EXPIRED local lease (not yet swept) must not refuse a peer's
+/// validly signed transition; a LIVE lease held by someone else still does.
+/// Pre-fix both funnels read the raw `lease_get` holder, so BOTH transitions
+/// below were refused (`action_transitions_applied` = 0).
+#[tokio::test]
+async fn sync_push_expired_local_lease_does_not_block_signed_transition_3729() {
+    let _g = FED_ENV_LOCK.lock().await;
+    let actor = "ai:cov-ga2-lease-b";
+    let ns = "covga2lease";
+    let _scope = NamespaceScopeGuard::new(actor, ns);
+    let keydir = tempfile::tempdir().expect("keydir");
+    let kp = ai_memory::identity::keypair::generate(actor).expect("kp");
+    ai_memory::identity::keypair::save(&kp, keydir.path()).expect("save");
+    unsafe {
+        std::env::set_var(ai_memory::federation::signing::REQUIRE_SIG_ENV, "0");
+        std::env::set_var(
+            ai_memory::federation::peer_attestation::TRUST_BODY_AGENT_ID_ENV,
+            "1",
+        );
+        std::env::set_var(ai_memory::identity::keypair::KEY_DIR_ENV, keydir.path());
+    }
+    let (r, t) = sqlite_router();
+    let far_future = chrono::Utc::now().timestamp() + 86_400;
+    {
+        let conn = ai_memory::db::open(t.path()).expect("seed conn");
+        for (id, lease_expires) in [("act-3729-expired", 1_i64), ("act-3729-live", far_future)] {
+            let action = ai_memory::models::Action {
+                id: id.to_string(),
+                namespace: ns.to_string(),
+                kind: "test".to_string(),
+                state: ai_memory::models::ActionState::Pending,
+                title: "lease".to_string(),
+                payload: json!({}),
+                priority: 5,
+                agent_id: Some(actor.to_string()),
+                claimed_by: None,
+                vector_clock: json!({}),
+                metadata: json!({}),
+                created_at: 1_700_009_000,
+                updated_at: 1_700_009_000,
+            };
+            ai_memory::actions::create(&conn, &action).expect("seed action");
+            conn.execute(
+                "INSERT INTO leases (action_id, holder, acquired_at, expires_at, heartbeat_at) \
+                 VALUES (?1, 'ai:cov-ga2-lease-a', 0, ?2, 0)",
+                rusqlite::params![id, lease_expires],
+            )
+            .expect("seed lease held by A");
+        }
+    }
+    let mut ops = Vec::new();
+    for (i, id) in ["act-3729-expired", "act-3729-live"]
+        .into_iter()
+        .enumerate()
+    {
+        let nonce = format!("cov-ga2-3729-nonce-{i}").into_bytes();
+        let signable = ai_memory::identity::sign::SignableTransition {
+            action_id: id,
+            namespace: ns,
+            from_state: "pending",
+            to_state: "claimed",
+            claimed_by: Some(actor),
+            nonce: &nonce,
+            created_at: 1_700_009_100,
+        };
+        let sig = ai_memory::identity::sign::sign_transition(&kp, &signable).expect("sign");
+        ops.push(
+            serde_json::to_value(ai_memory::federation::sync::ActionTransitionOp {
+                action_id: id.to_string(),
+                from_state: ai_memory::models::ActionState::Pending,
+                to_state: ai_memory::models::ActionState::Claimed,
+                claimed_by: Some(actor.to_string()),
+                vector_clock: json!({}),
+                updated_at: 1_700_009_100,
+                signature: sig,
+                signer_pubkey: kp.public.to_bytes().to_vec(),
+                nonce,
+            })
+            .unwrap(),
+        );
+    }
+    let body = serde_json::to_vec(&json!({
+        "sender_agent_id": actor,
+        "sender_clock": {"entries": {}},
+        "sender_wall_clock": chrono::Utc::now().to_rfc3339(),
+        "memories": [],
+        "action_transitions": ops,
+    }))
+    .unwrap();
+    let (status, b) = decode(&r, push_req(&body, &[(PEER_HEADER, actor)])).await;
+    unsafe {
+        std::env::remove_var(ai_memory::federation::signing::REQUIRE_SIG_ENV);
+        std::env::remove_var(ai_memory::federation::peer_attestation::TRUST_BODY_AGENT_ID_ENV);
+        std::env::remove_var(ai_memory::identity::keypair::KEY_DIR_ENV);
+    }
+    assert!(status.is_success(), "status={status} body={b}");
+    assert_eq!(
+        b["action_transitions_applied"].as_i64().unwrap_or(-1),
+        1,
+        "exactly the expired-lease transition applies; the live-lease one is refused; body={b}"
+    );
+    let conn = ai_memory::db::open(t.path()).expect("verify conn");
+    let expired = ai_memory::actions::get(&conn, "act-3729-expired")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        expired.state,
+        ai_memory::models::ActionState::Claimed,
+        "expired lease did not bind"
+    );
+    let live = ai_memory::actions::get(&conn, "act-3729-live")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        live.state,
+        ai_memory::models::ActionState::Pending,
+        "CONTROL: a live lease still binds"
+    );
+}
+
 /// #1805 — a captured signed action-transition re-wrapped in a fresh push
 /// envelope must be REFUSED on the second delivery via the per-peer nonce
 /// cache, BEFORE it reaches the CAS. The transition signature alone is not

@@ -4201,10 +4201,15 @@ async fn sync_push_write(
             .claimed_by
             .as_deref()
             .and_then(crate::identity::verify::lookup_peer_public_key);
-        let lease_holder = crate::actions::lease_get(&lock.0, &op.action_id)
-            .ok()
-            .flatten()
-            .map(|l| l.holder);
+        // #3729 — only a LIVE lease binds a remote transition (the local
+        // funnels' `authorize_claimed_by` predicate); an expired, unswept
+        // lease must not refuse a peer's signed transition.
+        let lease_holder = crate::actions::live_lease_holder(
+            crate::actions::lease_get(&lock.0, &op.action_id)
+                .ok()
+                .flatten(),
+            chrono::Utc::now().timestamp(),
+        );
         let signable = crate::identity::sign::SignableTransition {
             action_id: &op.action_id,
             namespace: &local.namespace,
