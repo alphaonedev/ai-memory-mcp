@@ -8116,62 +8116,34 @@ impl PostgresStore {
     // ─────────────────────────────────────────────────────────────────
 
     /// #1412/#1628 — owner pre-fetch for the caller-owns mutation gate.
-    /// One declaration site (pm-v3.1) for the three gate consumers.
-    /// Two-column + `FOR UPDATE`: archive (#3193) needs the inbox-target
-    /// arm (Fable #3243 item 1) and a row lock so a concurrent re-own
-    /// cannot slip between probe and INSERT/DELETE (item 4). On the
-    /// autocommit pool (update/delete) the lock releases at statement
-    /// end — same TOCTOU those verbs already had.
+    /// One declaration site (pm-v3.1) for every gate consumer.
+    /// `FOR UPDATE` is load-bearing ONLY on the write transaction: the row
+    /// lock then spans probe → write, so a concurrent re-own cannot slip
+    /// between them (#3193 item 4, #3953). On an autocommit pool handle the
+    /// lock releases at statement end and guards nothing.
     const SQL_SELECT_OWNER_AGENT_ID_BY_ID: &'static str = "SELECT jsonb_typeof(metadata->'agent_id'), metadata->>'agent_id', \
          metadata->>'target_agent_id' FROM memories WHERE id = $1 FOR UPDATE";
 
-    /// #1412 caller-owns mutation gate shared by the tenant-facing
-    /// write paths: the trait `update`, the trait `delete`, and the
-    /// inherent `update_with_expected_version` (#1628). Threat model:
-    /// cross-tenant write hijack on postgres-backed daemons. Admin
-    /// paths skip via `ctx.bypass_visibility`; tenant-facing handlers
-    /// MUST NOT pass a bypass context.
+    /// #1412/#1628 caller-owns mutation gate shared by the tenant-facing
+    /// write paths (trait `update` / `delete`, `update_with_expected_version`,
+    /// `archive_by_ids`). Threat model: cross-tenant write hijack on
+    /// postgres-backed daemons. Admin paths skip via `ctx.bypass_visibility`;
+    /// tenant-facing handlers MUST NOT pass a bypass context.
     ///
     /// `action` names the refused operation in the `PermissionDenied`
     /// envelope; `unstamped_reason` is the wire-pinned refusal text for
-    /// legacy rows carrying no `metadata.agent_id` stamp (the verb
-    /// differs between the write and delete gates —
-    /// [`REASON_UNSTAMPED_TENANT_WRITE`] /
-    /// [`REASON_UNSTAMPED_TENANT_DELETE`]). Hoisted per the pm-v3.1
-    /// hardcoded-literal gate when #1628 added the third copy of the
-    /// previously-inlined gate.
-    async fn assert_caller_owns_for_mutation(
-        &self,
-        ctx: &CallerContext,
-        id: &str,
-        action: &str,
-        unstamped_reason: &str,
-    ) -> StoreResult<()> {
-        Self::assert_caller_owns_for_mutation_on(
-            &self.pool,
-            ctx,
-            id,
-            action,
-            unstamped_reason,
-            false,
-        )
-        .await
-    }
-
-    /// #3193 — executor-parameterised core of
-    /// [`Self::assert_caller_owns_for_mutation`]. Identical logic and
-    /// byte-identical refusal envelopes; the only difference is WHERE the
-    /// owner probe runs.
+    /// legacy rows carrying no `metadata.agent_id` stamp
+    /// ([`REASON_UNSTAMPED_TENANT_WRITE`] / [`REASON_UNSTAMPED_TENANT_DELETE`]
+    /// / [`REASON_UNSTAMPED_TENANT_ARCHIVE`]).
     ///
-    /// The `&self.pool` wrapper above is the right shape for the
-    /// single-statement verbs (`update` / `delete` /
-    /// `update_with_expected_version`) whose write is its own statement.
-    /// `archive_by_ids` is different: it copies the row to cold storage and
-    /// then HARD-DELETES the live row inside one multi-statement
-    /// transaction, so its gate MUST read through that same transaction —
-    /// a pool-borrowed probe would run on a different connection and could
-    /// observe a pre-tx snapshot of `metadata.agent_id` (a TOCTOU window
-    /// against a concurrent re-own). Passing `&mut *tx` closes it.
+    /// #3953 — an AUTHORITATIVE gate MUST pass the write transaction
+    /// (`&mut *tx`): the probe's `FOR UPDATE` then holds the row until that
+    /// transaction ends, so the owner it saw is the owner at write time and a
+    /// concurrent re-own either commits first (the probe re-reads it and
+    /// refuses with the same envelope as any owner mismatch) or waits for
+    /// the write. A pool handle is autocommit — the lock is released before
+    /// the write — so a pool call is at most an advisory early refusal
+    /// (`delete`'s inbox-routing admission), never the gate of record.
     async fn assert_caller_owns_for_mutation_on<'e, E>(
         executor: E,
         ctx: &CallerContext,
@@ -8491,16 +8463,10 @@ impl PostgresStore {
     ) -> StoreResult<Option<i64>> {
         // Wave-2 B8 — inner CAS attempt of If-Match update (ERRORS-09).
         self.gate_record_stop().await?;
-        // #1628 — caller-owns write gate, mirroring the trait `update`
-        // (#1412). This method gained its first production caller (the
-        // HTTP `PUT /memories/{id}` If-Match branch), so it must apply
-        // the SAME tenant-isolation gate; admin paths skip via
-        // `ctx.bypass_visibility`.
-        self.assert_caller_owns_for_mutation(ctx, id, "update", REASON_UNSTAMPED_TENANT_WRITE)
-            .await?;
         // Pre-read the current version so a CONFLICT carries the
-        // observed-current value in the typed error. The UPDATE
-        // re-asserts the gate atomically below.
+        // observed-current value in the typed error; the UPDATE re-asserts
+        // that VERSION (the $11 bind) — it carries no ownership predicate.
+        // Ownership is held instead by the in-tx gate's row lock (#3953).
         // #1451 (SEC, HIGH) — fetch the governance-relevant columns
         // alongside `version` so the pre-write hook can evaluate the
         // POST-MERGE row before the UPDATE (parity with the SQLite
@@ -8516,6 +8482,19 @@ impl PostgresStore {
             .begin()
             .await
             .map_err(|e| to_store_err("begin update tx", e))?;
+        // #1628 — caller-owns write gate, mirroring the trait `update`
+        // (#1412); admin paths skip via `ctx.bypass_visibility`. #3953 — on
+        // the write tx, BEFORE the version pre-read: its `FOR UPDATE` holds
+        // the row to commit, so no re-own can land between gate and UPDATE.
+        Self::assert_caller_owns_for_mutation_on(
+            &mut *tx,
+            ctx,
+            id,
+            "update",
+            REASON_UNSTAMPED_TENANT_WRITE,
+            false,
+        )
+        .await?;
         let current_row: Option<(
             i64,
             String,
@@ -23832,9 +23811,8 @@ impl MemoryStore for PostgresStore {
         // every row regardless of ownership. Tenant-facing handlers
         // MUST NOT pass a bypass context.
         // #1628 refactor — shared caller-owns gate (byte-equal wire
-        // errors; see assert_caller_owns_for_mutation).
-        self.assert_caller_owns_for_mutation(ctx, id, "update", REASON_UNSTAMPED_TENANT_WRITE)
-            .await?;
+        // errors; see assert_caller_owns_for_mutation_on). #3953 — it runs
+        // on the write tx opened below, not here on the pool.
 
         // #1726 — capture the optional lifecycle target before the binds
         // below move the rest of `patch` (LifecycleState is Copy); applied
@@ -23864,6 +23842,19 @@ impl MemoryStore for PostgresStore {
             .begin()
             .await
             .map_err(|e| to_store_err("update begin tx", e))?;
+        // #3953 — the gate of record: `FOR UPDATE` on THIS tx holds the row
+        // until commit. The UPDATE below is `WHERE id = $1` with no owner
+        // predicate, so a pool-side gate let a concurrent re-own land in
+        // between and the caller's write hit a row it no longer owned.
+        Self::assert_caller_owns_for_mutation_on(
+            &mut *tx,
+            ctx,
+            id,
+            "update",
+            REASON_UNSTAMPED_TENANT_WRITE,
+            false,
+        )
+        .await?;
 
         // Read the current title+content for the content-change check. A
         // missing row → NotFound (the tx drops / rolls back). This also
@@ -24271,7 +24262,7 @@ impl MemoryStore for PostgresStore {
         // daemons) and same gate semantics (admin paths skip via
         // `bypass_visibility`, tenant-facing handlers MUST NOT bypass).
         // #1628 refactor — shared caller-owns gate (byte-equal wire
-        // errors; see assert_caller_owns_for_mutation).
+        // errors; see assert_caller_owns_for_mutation_on).
         // #3730 — the ADDRESSED RECIPIENT may delete a message sent to it
         // (parity with the sqlite adapter; the wrapper hard-coded
         // `allow_inbox = false` for every action, so a recipient draining its
@@ -24296,22 +24287,25 @@ impl MemoryStore for PostgresStore {
         let retains = namespace
             .as_deref()
             .is_some_and(crate::visibility::inbox_delete_retains);
-        Self::assert_caller_owns_for_mutation_on(
-            &self.pool,
-            ctx,
-            id,
-            "delete",
-            REASON_UNSTAMPED_TENANT_DELETE,
-            retains,
-        )
-        .await?;
 
         // #3730 — retention policy by namespace, the twin of the sqlite
         // adapter: an inbox message is ARCHIVED through the existing
         // `archive_by_ids` path (`archive_reason = "delete"`, same owner /
         // recipient predicate, same AGE unprojection), every other row is
-        // erased below. Same predicate as the gate above, by construction.
+        // erased below.
         if retains {
+            // #3953 — ADVISORY pool pre-check: it keeps the `delete` refusal
+            // envelope for a non-recipient. The gate of record is the one
+            // `archive_by_ids` runs on its own tx (`FOR UPDATE`, inbox arm).
+            Self::assert_caller_owns_for_mutation_on(
+                &self.pool,
+                ctx,
+                id,
+                "delete",
+                REASON_UNSTAMPED_TENANT_DELETE,
+                true,
+            )
+            .await?;
             let moved = self
                 .archive_by_ids(
                     ctx,
@@ -24348,6 +24342,22 @@ impl MemoryStore for PostgresStore {
                     .begin()
                     .await
                     .map_err(|e| to_store_err("delete begin tx", e))?;
+                // #3953 — the gate of record for the IRREVERSIBLE path, on
+                // THIS tx: `SQL_DELETE_MEMORY_BY_ID` has no owner predicate,
+                // so only the probe's `FOR UPDATE` held to commit keeps a
+                // concurrent re-own from landing between check and erase.
+                // A re-own that commits first is re-read and refused here
+                // (same envelope as any mismatch; PermissionDenied is not a
+                // retryable SQLSTATE, so `retry.consider` returns it as-is).
+                Self::assert_caller_owns_for_mutation_on(
+                    &mut *tx,
+                    ctx,
+                    id,
+                    "delete",
+                    REASON_UNSTAMPED_TENANT_DELETE,
+                    false,
+                )
+                .await?;
                 let rows = pg_hard_delete_in_tx(&mut tx, id)
                     .await
                     .map_err(|e| to_store_err("delete", e))?;
