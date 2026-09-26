@@ -3170,17 +3170,19 @@ async fn sync_push_write(
             }
             Err(e) => {
                 // Best-effort refund so a downstream insert failure
-                // doesn't leak quota counters. `refund_op` saturates at
-                // zero so a buggy double-refund cannot poison the row.
-                // #1156 — refund on the same `(agent_id, namespace)`
-                // row the check_and_record above incremented.
-                let _ = crate::quotas::refund_op(
+                // doesn't leak quota counters; saturates at zero.
+                // #1156 — refund on the same `(agent_id, namespace)` row.
+                // #3963 — the receive path charges storage-bytes ONLY
+                // (`check_and_record_storage_only`, #1544 vote), so it
+                // refunds storage ONLY — the postgres funnel's mirror.
+                // `refund_op(QuotaOp::Memory)` also decremented
+                // `current_memories_today`, a dimension never charged here,
+                // so every failed merge handed the author a free daily write.
+                let _ = crate::quotas::refund_storage_only(
                     &lock.0,
                     &attribute_agent,
                     &mem.namespace,
-                    crate::quotas::QuotaOp::Memory {
-                        bytes: bytes_estimate,
-                    },
+                    bytes_estimate,
                 );
                 tracing::warn!("sync_push: merge_inbound failed for {}: {e}", mem.id);
                 skipped += 1;
