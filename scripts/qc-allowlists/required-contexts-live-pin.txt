@@ -10,8 +10,8 @@
 # ============================================================================ 
 #
 # fetched-from: alphaonedev/ai-memory-mcp release/v1.0.0
-# fetched-at:   2026-09-11T07:44Z
-# count:        40
+# fetched-at:   2026-09-26T20:23Z
+# count:        43
 # enforce_admins: true
 # strict:         true
 #
@@ -25,6 +25,7 @@ Check (macos-fed,enterprise-fed)
 Check (macos-fed,sqlite)
 Check (ubuntu-latest,sqlite)
 Classify changes
+Claude plugin manifest gate (#3967)
 Cloud-init ASCII gate
 Coverage classify (docs-only short-circuit)
 Cross-compile (aarch64-apple-ios)
@@ -50,8 +51,10 @@ Postgres ignored tests (sal-postgres --ignored)
 Required-context + classify-base soundness gate (#2494/#2496/#2508)
 SAL-only feature gate
 SDK-path vs routes.rs membership gate (#2629)
+Stale contract-assertion gate (#3688 / #3967)
 Test-env $HOME-lock gate (#2146)
 Test-reachable stdin-read gate (#1989)
+URL-sink redaction gate (#3688 / #3967)
 Vendor-monoculture + SECS_PER_* lint-gate (#1174 PR10)
 actionlint (workflow-injection guard)
 vectorlite feature gate
