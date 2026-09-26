@@ -711,44 +711,53 @@ fn decision_hits(server: &MockServer) -> usize {
 /// ±0.01 margin is far larger than any `ln`/`exp` round-trip error, so the
 /// boundary is pinned without a flaky exact-`0.80` dependency.
 #[test]
-fn at_the_floor_delete_permits_above_and_blocks_below() {
+fn at_the_floor_delete_permits_at_and_above_blocks_below() {
     let _g = synthesis_lock().lock().unwrap_or_else(|p| p.into_inner());
 
-    let (conn, db_path) = open_db();
-    let cand = seed_existing(&conn, "obsolete deploy note", "old", "ns-floor-hi");
-    let server = mock_server(
-        delete_verdict(&cand),
-        Some(decision_body_with_confidence(
-            "yes",
+    // The seam's gate is `is_confident_at_least(floor)` = `c >= floor` (INCLUSIVE,
+    // src/decision.rs), so a confidence of EXACTLY the floor must PERMIT. The wire
+    // round-trip is bit-exact at this value — `exp(ln(0.80f64)) == 0.80f64` — so an
+    // exactly-at-floor cell genuinely discriminates the inclusive `>=` from a `>`
+    // refactor (which would block at exactly 0.80, the documented GA floor and the
+    // single most likely value emitted/configured). Three points bound the boundary:
+    // AT permits, ABOVE permits, BELOW blocks.
+    for (label, ns, p, deleted) in [
+        ("at", "ns-floor-at", SYNTHESIS_DELETE_CONFIDENCE_FLOOR, true),
+        (
+            "above",
+            "ns-floor-hi",
             SYNTHESIS_DELETE_CONFIDENCE_FLOOR + 0.01,
-        )),
-    );
-    let llm = llm_with_decider(&server.uri(), &db_path, DecisionFallback::Abstain);
-    run_store(&conn, &db_path, &llm, store_req("ns-floor-hi")).expect("ok");
-    let ids = surviving_ids(&conn, "ns-floor-hi");
-    assert!(
-        !ids.contains(&cand),
-        "at/above the floor permits the delete; candidate removed"
-    );
-
-    let (conn2, db_path2) = open_db();
-    let cand2 = seed_existing(&conn2, "obsolete deploy note", "old", "ns-floor-lo");
-    let server2 = mock_server(
-        delete_verdict(&cand2),
-        Some(decision_body_with_confidence(
-            "yes",
+            true,
+        ),
+        (
+            "below",
+            "ns-floor-lo",
             SYNTHESIS_DELETE_CONFIDENCE_FLOOR - 0.01,
-        )),
-    );
-    let llm2 = llm_with_decider(&server2.uri(), &db_path2, DecisionFallback::Abstain);
-    run_store(&conn2, &db_path2, &llm2, store_req("ns-floor-lo")).expect("ok");
-    let ids2 = surviving_ids(&conn2, "ns-floor-lo");
-    assert!(
-        ids2.contains(&cand2),
-        "just below the floor blocks; candidate survives"
-    );
+            false,
+        ),
+    ] {
+        let (conn, db_path) = open_db();
+        let cand = seed_existing(&conn, "obsolete deploy note", "old", ns);
+        let server = mock_server(
+            delete_verdict(&cand),
+            Some(decision_body_with_confidence("yes", p)),
+        );
+        let llm = llm_with_decider(&server.uri(), &db_path, DecisionFallback::Abstain);
+        run_store(&conn, &db_path, &llm, store_req(ns)).expect("ok");
+        let survives = surviving_ids(&conn, ns).contains(&cand);
+        if deleted {
+            assert!(
+                !survives,
+                "{label} the floor ({p}) is at-least-confident and PERMITS the delete; candidate removed"
+            );
+        } else {
+            assert!(
+                survives,
+                "{label} the floor ({p}) is below the floor and BLOCKS; candidate survives"
+            );
+        }
+    }
 }
-
 /// F4 — an unparseable (`NaN`), infinite (`1e999`) or out-of-range
 /// (positive logprob ⇒ p > 1) confidence OVER THE WIRE never permits: the
 /// client degrades each to ABSENT and the destructive seam BLOCKS, so the
