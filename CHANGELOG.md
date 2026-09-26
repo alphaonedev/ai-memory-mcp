@@ -59,7 +59,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (prose ABSTAINS; no confidence, ever), and the calibration-row adapter.
   Endpoints render as `scheme://host[:port]` in every `Debug` / `Display` /
   log sink; a missing chat envelope is an outage, an explicit `message.refusal`
-  a decline (f1 review). `local-nli` is refused by name — not in this build.
+  a decline (f1 review) — and a non-empty refusal is TERMINAL even when the
+  content beside it also parses to a verdict (f1 delta N1). `local-nli` is
+  refused by name — not in this build.
 - **Seams, and what `fallback` means (W2).** `classify_kind` becomes a CHOICE
   over all sixteen `MemoryKind` variants (the prompt named eight) and
   `detect_contradiction` a typed JUDGEMENT (its `starts_with("yes")` read a
@@ -72,7 +74,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sits in `Permissions::evaluate` or the federation LWW merge (pinned). A
   per-surface circuit breaker (vote R9: 3 consecutive unavailability abstains,
   30 s cooldown, one probe) stops a curator batch dialling a dead endpoint per
-  row; its short-circuit is the same `unavailable` abstain.
+  row; its short-circuit is the same `unavailable` abstain. The breaker is a
+  TRUE half-open (f1 delta N2): after the cooldown exactly one caller probes
+  the endpoint while every concurrent caller keeps short-circuiting until that
+  probe's result closes or re-opens it; a cancelled probe counts as failed and
+  frees the slot. The socket-pin pin runs on every platform (f1 delta N3).
 - **The two DESTRUCTIVE seams share ONE contract (W3 + W4, GOD rulings).**
   `destructive_judge(client, seam, prompt)` → `destructive_judgement_of`
   (`src/decision_seams.rs`): PRIMARY-ONLY through the new REQUIRED
@@ -82,7 +88,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `yes` with a validated confidence at or above the seam's floor —
   `CalibrationSeam::confidence_floor`, **0.80 for both `synthesis_verdict` and
   `consolidation_merge`, a per-seam compiled constant and a posture choice
-  pending the W5 evidence, no config key at GA**. W3: the online synthesis
+  pending the W5 evidence, no config key at GA**. The judge is asked ONLY
+  about bodies it can be shown in full: a member longer than the judge window
+  (`MERGE_JUDGE_MEMBER_CHARS`, 2000) BLOCKS before any prompt is built —
+  `unusable` abstain, endpoint never dialled — so a confident `yes` over a
+  truncated excerpt can never permit merging or deleting text the judge never
+  examined (code review F2). Under `--features sal` the outer curator report
+  carries the SAL consolidator's `merge_judge` / `judge_preview` counts (code
+  review F1; they were dropped in the fold). W3: the online synthesis
   pass's `delete` verdict becomes advice; at the sole enqueue point (after the
   K9 re-check, before the deferred delete) a low-confidence / confidence-less /
   `no` / declined / unavailable verdict collapses to NoOp and the candidate
