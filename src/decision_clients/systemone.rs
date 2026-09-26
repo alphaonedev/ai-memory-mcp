@@ -112,7 +112,7 @@ pub struct SystemOneAnswer {
 /// changes.
 pub trait SystemOneWire: fmt::Debug + Send + Sync {
     /// The route appended to `[decision].base_url`.
-    fn route(&self) -> &str;
+    fn path(&self) -> &str;
 
     /// Build the request body for one question.
     fn request_body(&self, model: &str, prompt: &str, task: &DecisionTask<'_>) -> Value;
@@ -137,7 +137,7 @@ impl DefaultSystemOneWire {
 }
 
 impl SystemOneWire for DefaultSystemOneWire {
-    fn route(&self) -> &str {
+    fn path(&self) -> &str {
         Self::ROUTE
     }
 
@@ -254,7 +254,7 @@ impl SystemOneDecider {
         Ok(Self {
             provider_id: resolved.provider.clone(),
             model: resolved.model.clone(),
-            endpoint: endpoint_url(&resolved.base_url, wire.route())?,
+            endpoint: endpoint_url(&resolved.base_url, wire.path())?,
             api_key: SecretKey::new(resolved.api_key()),
             http: decision_http_client(timeout, pin)?,
             timeout,
@@ -420,7 +420,7 @@ mod tests {
                 "range": {"min": 0.0, "max": 1.0},
             })
         );
-        assert_eq!(wire.route(), "/v1/systemone");
+        assert_eq!(wire.path(), "/v1/systemone");
     }
 
     #[test]
