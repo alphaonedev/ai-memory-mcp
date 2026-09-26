@@ -1418,6 +1418,46 @@ pub(super) fn row_is_agent_attested(mem: &Memory) -> bool {
         == Some(crate::identity::verify::AttestLevel::AgentAttested.as_str())
 }
 
+/// #3901 (SEC, containment) — the row the #1948 route-OUT dequarantine-on-attest
+/// may clear after `merge_inbound` returned `applied_id`, shared by the sqlite
+/// and postgres receive funnels so the gate cannot diverge between backends.
+///
+/// `Some(applied_id)` only when BOTH hold:
+/// * the inbound unit is `agent_attested` (THIS node's verified verdict, never
+///   a peer self-assertion — [`row_is_agent_attested`]); and
+/// * the row `merge_inbound` wrote IS the inbound row (`applied_id ==
+///   inbound.id`).
+///
+/// An inbound id absent locally resolves through the `(title, namespace)`
+/// title-slot upsert on both backends, which returns the id of a DIFFERENT
+/// local row. The attestation covered the inbound unit only — never that other
+/// row, nor this node's decision to quarantine it (containment is node-local,
+/// #3266 item 3 part 5) — so the cross-id case is `None` and the other row's
+/// quarantine is left untouched (fail closed: at worst a legitimately
+/// attestable row stays hidden until an operator release; never an un-hide the
+/// attestation did not cover).
+#[must_use]
+pub(super) fn attest_dequarantine_target<'a>(
+    inbound: &Memory,
+    applied_id: &'a str,
+) -> Option<&'a str> {
+    if !row_is_agent_attested(inbound) {
+        return None;
+    }
+    if applied_id != inbound.id {
+        tracing::info!(
+            target: ATTESTATION_TRACE_TARGET,
+            inbound_id = %inbound.id,
+            applied_id = %applied_id,
+            "federation receive: attested inbound merged into a different local row via \
+             the (title, namespace) slot — route-OUT dequarantine skipped; that row's \
+             node-local containment is preserved (#3901)"
+        );
+        return None;
+    }
+    Some(applied_id)
+}
+
 /// #1920 (CWE-862) — authorship gate for an inbound federated PENDING
 /// action, mirroring [`resolve_inbound_attribution`] (memories) and
 /// [`signal_author_authorized`] (signals). A pending action is an
@@ -3026,8 +3066,21 @@ async fn sync_push_write(
                 // therefore never clears a quarantine; the attest upgrade clears
                 // it EXPLICITLY via a raw UPDATE (no-op on a non-quarantined row,
                 // and never touches a contaminated one).
-                if row_is_agent_attested(&to_insert) {
-                    let _ = db::dequarantine(&lock.0, &actual_id);
+                // #3901 — only when the row written IS the inbound row: a
+                // cross-id title-slot merge returns a DIFFERENT local row's id,
+                // whose quarantine the attestation never covered.
+                if let Some(target) = attest_dequarantine_target(&to_insert, &actual_id)
+                    && let Err(e) = db::dequarantine(&lock.0, target)
+                {
+                    // The merge is committed; the row simply stays
+                    // quarantined (fail closed) — surface it, never swallow.
+                    tracing::warn!(
+                        target: ATTESTATION_TRACE_TARGET,
+                        memory_id = %target,
+                        error = %e,
+                        "sync_push: route-OUT dequarantine-on-attest failed; \
+                         row stays quarantined (#1948/#3901)"
+                    );
                 }
                 // #3631 — the row is committed (no outer transaction on this
                 // funnel): wake the local recipient when this apply delivered

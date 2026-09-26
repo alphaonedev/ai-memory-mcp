@@ -700,8 +700,26 @@ pub(super) async fn sync_push_via_store(
                 // contamination marker — the sqlite funnel now does the same
                 // (R2.2 `get_any`, #3905 closed). The dequarantine below clears a
                 // prior quarantine EXPLICITLY on attest (never a contaminated row).
-                if crate::handlers::federation_receive::row_is_agent_attested(&to_insert) {
-                    let _ = app.store.dequarantine(&applied_id).await;
+                // #3901 — sqlite parity via the SAME shared gate: only when the
+                // row written IS the inbound row. `merge_inbound`'s title-slot
+                // path returns a DIFFERENT local row's id on an inbound id that
+                // is absent locally; the attestation never covered that row.
+                if let Some(target) =
+                    crate::handlers::federation_receive::attest_dequarantine_target(
+                        &to_insert,
+                        &applied_id,
+                    )
+                    && let Err(e) = app.store.dequarantine(target).await
+                {
+                    // The merge is committed; the row simply stays
+                    // quarantined (fail closed) — surface it, never swallow.
+                    tracing::warn!(
+                        target: ATTESTATION_TRACE_TARGET,
+                        memory_id = %target,
+                        error = %e,
+                        "sync_push (postgres): route-OUT dequarantine-on-attest failed; \
+                         row stays quarantined (#1948/#3901)"
+                    );
                 }
                 // #3631 — wake the local recipient when this apply delivered
                 // an inbox message it has not seen (postgres twin).
