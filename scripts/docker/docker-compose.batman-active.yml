@@ -10,8 +10,8 @@
 # expose it). Form 7 operator key is generated on first launch by the
 # init container.
 #
-# Usage:
-#   AI_MEMORY_IMAGE=ai-memory:local \
+# Usage (both variables are REQUIRED; compose refuses to render without them):
+#   AI_MEMORY_IMAGE=ai-memory:local AI_MEMORY_API_KEY="$(openssl rand -hex 32)" \
 #   docker compose -f scripts/docker/docker-compose.batman-active.yml up -d
 #   docker compose -f scripts/docker/docker-compose.batman-active.yml logs -f curator
 #   docker compose -f scripts/docker/docker-compose.batman-active.yml exec curator \
@@ -38,6 +38,11 @@ services:
       AI_MEMORY_DB: /data/ai-memory.db
       AI_MEMORY_KEY_DIR: /keys
       BATMAN_NAMESPACE: ${BATMAN_NAMESPACE:-main}
+      # #3838 — REQUIRED. `serve` refuses a keyless non-loopback bind
+      # (`api_key_bind_guard`, #1458) and the mcp service binds 0.0.0.0 so the
+      # published port can reach it. The key goes into the 0600 config.toml
+      # below, never into argv and never into this file.
+      AI_MEMORY_API_KEY: ${AI_MEMORY_API_KEY:?set AI_MEMORY_API_KEY — serve refuses a keyless non-loopback bind (#1458); it is written to the 0600 config.toml, never to argv}
     volumes:
       - ai-memory-data:/data
       - ai-memory-keys:/keys
@@ -59,10 +64,28 @@ services:
         # the shared data volume, so the mcp and curator services (which set
         # XDG_CONFIG_HOME=/data/xdg) boot at the autonomous tier this stack
         # documents. Idempotent: never overwrites an operator-edited file.
+        #
+        # The same file carries `api_key` (#3838), so it is a secret: 0700
+        # directory, 0600 file, written under umask 077, and every service runs
+        # as the same AI_MEMORY_UID. The key is added (at the top, where a TOML
+        # top-level key must go) only when the file has none, so an
+        # operator-set key is never replaced.
+        case "$$AI_MEMORY_API_KEY" in
+          ''|*[!A-Za-z0-9._~+/=-]*)
+            echo "init-batman: AI_MEMORY_API_KEY must be non-empty and use only [A-Za-z0-9._~+/=-]" >&2
+            exit 64 ;;
+        esac
         mkdir -p /data/xdg/ai-memory
-        if [ ! -f /data/xdg/ai-memory/config.toml ]; then
-          printf 'schema_version = 2\ntier = "autonomous"\n' > /data/xdg/ai-memory/config.toml
+        chmod 700 /data/xdg /data/xdg/ai-memory
+        cfg=/data/xdg/ai-memory/config.toml
+        if [ ! -f "$$cfg" ]; then
+          (umask 077; printf 'schema_version = 2\ntier = "autonomous"\n' > "$$cfg")
         fi
+        if ! grep -q '^api_key[[:space:]]*=' "$$cfg"; then
+          (umask 077; { printf 'api_key = "%s"\n' "$$AI_MEMORY_API_KEY"; cat "$$cfg"; } > "$$cfg.new")
+          mv "$$cfg.new" "$$cfg"
+        fi
+        chmod 600 "$$cfg"
         echo "init-batman complete"
     restart: "no"
 
@@ -91,7 +114,11 @@ services:
     # this container for ad-hoc CLI calls, and point your MCP-stdio
     # client at `docker exec -i ai-memory-mcp ai-memory --db /data/ai-memory.db mcp --tier autonomous`.
     # #3838 -- `serve` has `--host`/`--port` (no `--bind`) and no `--tier`
-    # (the tier is the config.toml the init service wrote, above).
+    # (the tier is the config.toml the init service wrote, above). The HTTP API
+    # requires the AI_MEMORY_API_KEY from that same file on every call except
+    # the `/api/v1/health` probe below. The bind is 0.0.0.0 because the port
+    # mapping only reaches a listener on the container's 0.0.0.0; the published
+    # port stays host-loopback (127.0.0.1:9077).
     command:
       - ai-memory
       - --db
