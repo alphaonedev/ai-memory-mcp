@@ -1223,10 +1223,43 @@ traversals see them. `AI_MEMORY_AGE_PROJECTION_MODE` selects the posture
   AGE round-trips off the link-write hot path. Failed projections retry
   up to `MAX_AGE_PROJECTION_ATTEMPTS` then quarantine.
 
-Under `deferred`, postgres `find_paths` routes through the
-always-current relational recursive-CTE so reads stay read-your-own-write
-correct during the projection window; `kg_query` / `kg_timeline` may
-observe a bounded staleness window until the drainer catches up.
+postgres `find_paths` always reads the relational recursive-CTE (on both
+backends, in both modes), so it stays read-your-own-write correct whatever
+the projection's state.
+
+**`kg_query` / `kg_timeline` can return incomplete results in BOTH modes,
+including the default `sync` (#3887).** They read the AGE projection and
+fall back to the relational CTE only when AGE *errors*
+(`is_age_runtime_failure`, i.e. `BackendUnavailable`). A projection that is
+healthy but *behind* answers successfully with fewer edges, so no fallback
+fires and the caller gets an `Ok` result that is silently missing edges.
+How the projection falls behind:
+
+- `deferred`: every link is enqueued and reaches `memory_graph` only when
+  the drainer processes it.
+- `sync` (default): if the inline projection hits an AGE runtime failure,
+  the link write still commits the relational `memory_links` row and
+  records a `kg_projection_outbox` row in the same transaction instead of
+  failing (the `link_insert` arm of `link_internal`). `memory_link` still
+  returns success, with no field saying the edge is not yet in AGE; the
+  failure is visible only as a WARN log and in the outbox metrics below.
+
+The drainer is spawned by `serve` in both modes and retries each outbox
+row up to `MAX_AGE_PROJECTION_ATTEMPTS` (100). A row that exhausts the
+retries is quarantined and excluded from further drains; only rows
+quarantined because the AGE graph was orphaned are un-quarantined
+automatically once the graph registry is present again. Until an edge is
+projected, `kg_query` / `kg_timeline` over AGE omit it. The relational
+`memory_links` table is the source of truth throughout — no link is lost —
+but these two readers are not guaranteed read-your-own-write on AGE. If
+you need complete results from them, watch
+`ai_memory_age_projection_pending_depth` (non-zero means the graph is
+behind the relational truth; it counts quarantined rows too, since they
+stay pending) and `ai_memory_age_projection_quarantined_total` (any
+increase means a row stopped being retried). The CTE KG backend, which a
+postgres without the AGE extension uses, does not have this window. Routing these readers to the CTE
+whenever outbox depth is non-zero is tracked in #3887.
+
 Observability: `ai_memory_age_projection_{pending_depth,failed_total,quarantined_total}`.
 Resolved via `AppConfig::resolve_storage()` (env > `[storage].age_projection_mode`
 > compiled `sync`).
