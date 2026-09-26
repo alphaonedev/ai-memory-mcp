@@ -710,6 +710,8 @@ static SQL_SELECT_MEMORY_ROW_BY_ID_FOR_UPDATE: std::sync::LazyLock<String> =
 /// atomic jsonb merge (f1 goal4 FA/FB), never written back from a copy.
 static SQL_MERGE_INBOUND_FULL_ROW_UPDATE: std::sync::LazyLock<String> =
     std::sync::LazyLock::new(|| {
+        // APPEND-ONLY-SANCTIONED (#1823 G6) — routed at the use site in merge_inbound,
+        // which emits a RecordKind::Supersede leaf in the same tx (pg_emit_revision_leaf_if_enabled).
         format!(
             "UPDATE memories SET
                 tier = $2, namespace = $3, title = $4, content = $5, tags = $6,
