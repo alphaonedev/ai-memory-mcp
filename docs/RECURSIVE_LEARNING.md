@@ -49,8 +49,11 @@ Cybersecurity Information document on Model Context Protocol
 security (`U/OO/6030316-26`, May 2026). Substrate compliance with
 those requirements is documented at
 [`docs/compliance/nsa-csi-mcp-security-mapping.md`](compliance/nsa-csi-mcp-security-mapping.html)
-(10 of 10 NSA concerns + 7 of 7 NSA recommendations structurally
-addressed at v0.7.0); the honest-limitations framing for what the
+(9 of 10 NSA concerns structurally addressed as shipped + 7 of 7 NSA
+recommendations; concern (a) access control is structurally addressed
+only under the `enforce` identity-binding posture with per-agent keys
+enrolled, and the shipped `advisory` default is finding H1 — so the
+flat "10 of 10" headline is retired); the honest-limitations framing for what the
 substrate does NOT defend against is at
 [`docs/compliance/honest-limitations.md`](compliance/honest-limitations.html).
 
