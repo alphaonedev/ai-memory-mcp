@@ -793,20 +793,33 @@ async fn store_backed_consolidation_sweep(
 /// report is all-zero).
 #[cfg(feature = "sal")]
 fn log_store_backed_consolidation(report: &curator::compaction::ConsolidationRunReport) {
-    if report.clusters_formed == 0 && report.memories_consolidated == 0 && report.errors.is_empty()
+    if report.clusters_formed == 0
+        && report.memories_consolidated == 0
+        && report.errors.is_empty()
+        && report.merge_judge.is_none()
+        && report.judge_preview.is_none()
     {
         return;
     }
+    // #3806 W4 (D4; code-review F1) — a judge block is never invisible: the
+    // line carries the judge's counts (0/0 when no judge answered).
+    let judge = report.merge_judge.as_ref();
+    let preview = report.judge_preview.as_ref();
     tracing::info!(
         target: curator::compaction::COMPACTION_TRACE_TARGET,
         "curator SAL consolidation: clusters_formed={} eligible={} consolidated={} \
-         rollback_entries={} rolled_back={} errors={}",
+         rollback_entries={} rolled_back={} errors={} judge_blocked={} judge_permitted={} \
+         preview_blocked={} preview_permitted={}",
         report.clusters_formed,
         report.eligible_clusters,
         report.memories_consolidated,
         report.rollback_entries_written,
         report.rolled_back,
         report.errors.len(),
+        judge.map_or(0, |j| j.blocked),
+        judge.map_or(0, |j| j.permitted),
+        preview.map_or(0, |p| p.blocked),
+        preview.map_or(0, |p| p.permitted),
     );
 }
 
