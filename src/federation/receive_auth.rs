@@ -642,7 +642,19 @@ pub const FED_QUARANTINE_UNATTRIBUTED_ENV: &str = "AI_MEMORY_FED_QUARANTINE_UNAT
 pub fn quarantine_unattributed_enabled() -> bool {
     std::env::var(FED_QUARANTINE_UNATTRIBUTED_ENV)
         .ok()
-        .is_some_and(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
+        .is_some_and(|v| quarantine_unattributed_value(&v))
+}
+
+/// #3619 — the ONE value-level decision for [`FED_QUARANTINE_UNATTRIBUTED_ENV`],
+/// shared by the live reader above AND the `asi-hard` KNOBS floor
+/// (`security_profile::KNOBS`), so the two cannot disagree. The reader used a
+/// CASE-SENSITIVE `matches!` while the floor used the case-insensitive house
+/// grammar, so `=TRUE` / `=Yes` / `=ON` met the hardened floor (boot reported
+/// `AlreadyCompliant`) while quarantine stayed OFF on both receive funnels —
+/// a hardened posture reporting a control as engaged while it was not.
+#[must_use]
+pub fn quarantine_unattributed_value(v: &str) -> bool {
+    crate::security_profile::is_truthy(v)
 }
 
 // ---------------------------------------------------------------------------
@@ -2213,6 +2225,35 @@ mod tests {
             assert!(!quarantine_unattributed_enabled(), "{falsy:?} → permissive");
         }
         unsafe { std::env::remove_var(FED_QUARANTINE_UNATTRIBUTED_ENV) };
+    }
+
+    /// #3619 — no token may be compliant-but-off: every value the asi-hard
+    /// floor accepts must ENGAGE the quarantine, including case variants the
+    /// pre-fix case-sensitive reader rejected, and the floor and the reader
+    /// must be the SAME function.
+    #[test]
+    fn quarantine_reader_and_asi_hard_floor_agree_on_case_variants_3619() {
+        for v in [
+            "TRUE", "True", "Yes", "YES", "ON", "On", " TRUE ", "1", "true", "on",
+        ] {
+            assert!(
+                quarantine_unattributed_value(v),
+                "{v:?} meets the asi-hard floor, so it must engage quarantine"
+            );
+            assert_eq!(
+                quarantine_unattributed_value(v),
+                crate::security_profile::knob_meets_floor(FED_QUARANTINE_UNATTRIBUTED_ENV, v),
+                "{v:?}: reader and floor disagree"
+            );
+        }
+        for v in ["0", "false", "FALSE", "no", "Off", "", "tru", "enabled"] {
+            assert!(!quarantine_unattributed_value(v), "{v:?} must not engage");
+            assert_eq!(
+                quarantine_unattributed_value(v),
+                crate::security_profile::knob_meets_floor(FED_QUARANTINE_UNATTRIBUTED_ENV, v),
+                "{v:?}: reader and floor disagree"
+            );
+        }
     }
 
     #[test]

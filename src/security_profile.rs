@@ -423,9 +423,11 @@ const KNOBS: &[KnobSpec] = &[
         meets_floor: crate::federation::receive_auth::flag_value_default_on,
     },
     KnobSpec {
-        env: "AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED",
+        env: crate::federation::receive_auth::FED_QUARANTINE_UNATTRIBUTED_ENV,
         hard_value: "1",
-        meets_floor: is_truthy,
+        // #3619 — the live reader's own value function, so a token cannot
+        // meet the floor while the reader leaves quarantine off.
+        meets_floor: crate::federation::receive_auth::quarantine_unattributed_value,
     },
     KnobSpec {
         env: "AI_MEMORY_CID_ENFORCE",
@@ -572,6 +574,18 @@ const KNOBS: &[KnobSpec] = &[
 /// rows behind for an entire release); `scripts/check-docs-vs-ssot.sh` resolves
 /// this same count from source and fails the build when a prose site disagrees.
 pub const PINNED_KNOB_COUNT: usize = KNOBS.len();
+
+/// Test-only lookup of a pinned knob's floor predicate by env name, so a
+/// knob's live reader can be pinned against the SAME floor the boot check
+/// applies (#3619). Panics on an unpinned name: a typo must not pass.
+#[cfg(test)]
+pub(crate) fn knob_meets_floor(env: &str, value: &str) -> bool {
+    let knob = KNOBS
+        .iter()
+        .find(|k| k.env == env)
+        .unwrap_or_else(|| panic!("{env} is not a pinned asi-hard knob"));
+    (knob.meets_floor)(value)
+}
 
 /// What happened to one knob during enforcement (for the boot log).
 #[derive(Debug, Clone, PartialEq, Eq)]
