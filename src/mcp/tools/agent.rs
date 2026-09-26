@@ -275,6 +275,11 @@ mod tests {
         // #3372 — re-registering an existing agent_id with a DIFFERENT type/caps
         // must be REFUSED (the reown shape), not silently overwrite the identity.
         // `update: true` opts in; an idempotent re-register still refreshes.
+        // #3916 — the wire `caller_agent_id` is BOUND to `AI_MEMORY_AGENT_ID`
+        // when set, so a sibling lib test exporting `ai:bob` mid-window made the
+        // first register refuse. Hold the AGENT-ID env lock (the one every
+        // mutator of that variable takes) for the test; read side only.
+        let _agent_id_env = crate::identity::agent_id_env_test_lock();
         let conn = open_conn();
         handle_agent_register(
             &conn,

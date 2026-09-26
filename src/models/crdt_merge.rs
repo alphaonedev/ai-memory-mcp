@@ -84,7 +84,7 @@ use serde_json::{Map, Value};
 use super::crdt_primitives::{OrSet, PnCounter};
 use super::field_names;
 use super::link::VectorClock;
-use super::memory::Memory;
+use super::memory::{LifecycleState, Memory};
 use crate::identity::verify::AttestLevel;
 use crate::mcp::param_names;
 
@@ -533,11 +533,11 @@ fn merge_metadata(local: &Memory, remote: &Memory) -> Value {
         // trip on a marker it never authored (and a remote could otherwise
         // silently soft-down-weight a local row). LOCAL wins: keep local's
         // value, drop any remote-introduced key.
-        for key in [
-            field_names::CONTRADICTION_CONSERVED,
-            field_names::CONTRADICTION_SOFT_LOSER,
-            field_names::CONTRADICTION_WINNER_ID,
-        ] {
+        //
+        // Boids item 3 R2.3 (#3266) — the #3324 `contamination` marker is
+        // node-local by the SAME rule: a local taint's marker (its restore
+        // anchor) survives a peer write, and a peer's marker is never adopted.
+        for key in NODE_LOCAL_METADATA_KEYS {
             match local.metadata.get(key) {
                 Some(local_val) => {
                     map.insert(key.to_string(), local_val.clone());
@@ -707,15 +707,173 @@ pub fn merge_memory(local: &Memory, remote: &Memory) -> Memory {
         // #224: version not in design table — max (PN-Counter; monotonic
         // optimistic-concurrency counter; never roll backwards).
         version: merge_counter(local.version, remote.version),
-        // #224: lifecycle_state not in design table — LWW per table
-        // philosophy (a conscious state transition, like memory_kind).
-        lifecycle_state: lww(
-            local,
-            remote,
-            &local.lifecycle_state,
-            &remote.lifecycle_state,
-        ),
+        // Boids item 3 R2.1 (#3266 / #3750 / #3905, vote `4d3ea1c5`, ruling
+        // variant B): LWW for ordinary states (tombstoned included), but a
+        // LOCAL contaminated / quarantined overlay is never replaced and a
+        // remote taint is never adopted. See `merge_lifecycle_local_taint_wins`.
+        lifecycle_state: merge_lifecycle_local_taint_wins(local, remote),
     }
+}
+
+/// Boids item 3 R2 (#3266, ruling tmux-22 variant B) — the node-local
+/// containment overlay states: the #3324 taint and the #1948 route-IN
+/// quarantine. `tombstoned` is deliberately NOT here: a lifecycle tombstone is
+/// a REPLICATED deletion that must converge fleet-wide (the title-slot
+/// supersede lane, pinned by `federation_causal_order_3699`), so it keeps its
+/// newer-wins adoption. One source for the Rust predicate, the SQL twin and
+/// the receive-gate normalisation.
+pub const NODE_LOCAL_LIFECYCLE_STATES: [LifecycleState; 2] =
+    [LifecycleState::Contaminated, LifecycleState::Quarantined];
+
+/// Whether `state` is a node-local containment overlay
+/// ([`NODE_LOCAL_LIFECYCLE_STATES`]).
+#[must_use]
+pub fn is_node_local_lifecycle(state: LifecycleState) -> bool {
+    NODE_LOCAL_LIFECYCLE_STATES.contains(&state)
+}
+
+/// Boids item 3 R2.1 (#3266; fixes #3750) — the ONE lifecycle merge
+/// predicate.
+///
+/// * A LOCAL `contaminated` / `quarantined` state (a node-local overlay) is
+///   never replaced by the remote, whatever the timestamps say — the
+///   LOCAL-wins precedent of the node-local `contradiction_*` keys and
+///   `governance`. Reversal is a deliberate, signed act (the operator
+///   decontaminate / dequarantine route-OUT, R2.5), never a peer write.
+/// * A REMOTE `contaminated` is never adopted (only this node's own stamp or
+///   rewind may taint a row; the per-write signature does not cover
+///   `lifecycle_state`, so a wire taint is unattested).
+/// * A REMOTE `quarantined` takes the ordinary newer-wins pick. Every inbound
+///   federation funnel normalises a WIRE overlay to `open`
+///   ([`normalise_inbound_node_local_overlay`], R2.3) BEFORE the #1948
+///   route-IN verdict, so a `quarantined` that reaches the merge is THIS
+///   node's own route-IN decision — keying the refusal on it would silently
+///   disable #1948 over an existing row (spec R2.3: key on the LOCAL state).
+/// * Everything else — including `tombstoned` — is the #224 last-writer-wins.
+///
+/// Deliberately NOT commutative when a side is a node-local overlay.
+#[must_use]
+pub fn merge_lifecycle_local_taint_wins(local: &Memory, remote: &Memory) -> LifecycleState {
+    if is_node_local_lifecycle(local.lifecycle_state)
+        || remote.lifecycle_state == LifecycleState::Contaminated
+    {
+        return local.lifecycle_state;
+    }
+    lww(
+        local,
+        remote,
+        &local.lifecycle_state,
+        &remote.lifecycle_state,
+    )
+}
+
+/// The SQL twin of [`merge_lifecycle_local_taint_wins`] for the upsert
+/// `ON CONFLICT` arms of BOTH backends (`new` = the incoming row alias,
+/// `old` = the stored row alias), so sqlite and postgres cannot drift. The
+/// state lists are built from [`NODE_LOCAL_LIFECYCLE_STATES`] (one source).
+#[must_use]
+pub fn lifecycle_local_taint_wins_case(new: &str, old: &str) -> String {
+    let local_wins = NODE_LOCAL_LIFECYCLE_STATES
+        .map(|s| format!("'{}'", s.as_str()))
+        .join(", ");
+    let contaminated = LifecycleState::Contaminated.as_str();
+    format!(
+        "CASE WHEN {old}.lifecycle_state IN ({local_wins}) \
+              OR {new}.lifecycle_state = '{contaminated}' \
+         THEN {old}.lifecycle_state \
+         WHEN {new}.updated_at > {old}.updated_at \
+              OR ({new}.updated_at = {old}.updated_at AND {new}.id > {old}.id) \
+         THEN {new}.lifecycle_state ELSE {old}.lifecycle_state END"
+    )
+}
+
+/// The node-local metadata keys (#1824 G7 `contradiction_*` + the #3324
+/// `contamination` marker): a LOCAL value survives every federation merge and
+/// a peer's is never adopted — in [`merge_memory`] and in the title-slot
+/// newer-wins SQL arm of BOTH adapters (f1 goal4 FB). One source.
+pub const NODE_LOCAL_METADATA_KEYS: [&str; 4] = [
+    field_names::CONTRADICTION_CONSERVED,
+    field_names::CONTRADICTION_SOFT_LOSER,
+    field_names::CONTRADICTION_WINNER_ID,
+    crate::storage::CONTAMINATION_METADATA_KEY,
+];
+
+fn node_local_keys_sql() -> String {
+    NODE_LOCAL_METADATA_KEYS
+        .map(|k| format!("'{k}'"))
+        .join(", ")
+}
+
+/// SQLite title-slot newer-wins metadata base (f1 goal4 FB): the incoming
+/// row's metadata with every node-local key removed, then the LOCAL row's
+/// node-local keys patched back on. `excluded` / `memories` are the upsert
+/// aliases.
+#[must_use]
+pub fn sqlite_title_slot_newer_metadata() -> String {
+    let paths = NODE_LOCAL_METADATA_KEYS
+        .map(|k| format!("'$.{k}'"))
+        .join(", ");
+    // `json_each.value` is an SQL value: a JSON boolean surfaces as 0/1 and a
+    // string loses its quotes, so each value is re-typed through `json(...)`
+    // from its `type` — the G7 soft-loser marker stays the JSON boolean the
+    // writer stamped (the postgres predicate matches `'true'`).
+    format!(
+        "json_patch(json_remove(excluded.metadata, {paths}), COALESCE((SELECT \
+         json_group_object(key, json(CASE type WHEN 'true' THEN 'true' WHEN 'false' THEN 'false' \
+         WHEN 'object' THEN value WHEN 'array' THEN value ELSE json_quote(value) END)) \
+         FROM json_each(memories.metadata) WHERE key IN ({})), '{{}}'))",
+        node_local_keys_sql()
+    )
+}
+
+/// The postgres twin of [`sqlite_title_slot_newer_metadata`] (`EXCLUDED` /
+/// `memories` aliases, `jsonb`).
+#[must_use]
+pub fn pg_title_slot_newer_metadata() -> String {
+    pg_node_local_overlay("EXCLUDED.metadata")
+}
+
+/// `incoming` (a `jsonb` expression) with every node-local key removed, then
+/// the node-local keys of the row being UPDATED (`memories.metadata`, read in
+/// the same statement) overlaid — an atomic jsonb merge, so a writer never
+/// writes back a node-local value from a copy it read earlier (f1 goal4 FA/FB).
+#[must_use]
+pub fn pg_node_local_overlay(incoming: &str) -> String {
+    let keys = node_local_keys_sql();
+    format!(
+        "(({incoming} - ARRAY[{keys}]::text[]) || COALESCE((SELECT \
+         jsonb_object_agg(nl.k, nl.v) FROM jsonb_each(CASE WHEN jsonb_typeof(memories.metadata) \
+         = 'object' THEN memories.metadata ELSE '{{}}'::jsonb END) AS nl(k, v) WHERE nl.k IN ({keys})), \
+         '{{}}'::jsonb))"
+    )
+}
+
+/// Boids item 3 R2.3 (#3266) — the receive-gate normalisation of an INBOUND
+/// row, applied by every federation funnel (push, both backends, and the pull
+/// lanes via `sanitize_inbound_pull_memory`) BEFORE the #1948 route-IN
+/// quarantine verdict:
+///
+/// * a wire `contaminated` / `quarantined` lifecycle becomes `open` — a fresh
+///   row lands `open`, and over an existing row the LOCAL-wins merge applies;
+/// * a wire `metadata.contamination` marker is removed — never adopted, the
+///   same rule as the node-local `contradiction_*` keys.
+///
+/// Neither field is inside the per-write signed surface (`SignableWrite`
+/// commits agent / namespace / title / kind / created_at / content hash), so
+/// this never invalidates a presented `write_signature`. Returns `true` when
+/// the row was changed.
+pub fn normalise_inbound_node_local_overlay(mem: &mut Memory) -> bool {
+    let mut changed = false;
+    if is_node_local_lifecycle(mem.lifecycle_state) {
+        mem.lifecycle_state = LifecycleState::Open;
+        changed = true;
+    }
+    if let Some(obj) = mem.metadata.as_object_mut() {
+        changed |= obj
+            .remove(crate::storage::CONTAMINATION_METADATA_KEY)
+            .is_some();
+    }
+    changed
 }
 
 /// `max` of two RFC3339-string `Option`s with absence as the floor: a
@@ -952,38 +1110,164 @@ mod tests {
     }
 
     #[test]
-    fn merge_memory_contaminated_state_participates_in_lww() {
-        // v1.0.0 #3324 — the auto-propagated `Contaminated` taint is carried
-        // by the generic lifecycle_state LWW (like every other state, it is
-        // "not in the design table" — merged last-writer-wins per #224). A
-        // newer contaminated stamp WINS over an older visible state, so the
-        // taint converges across replicas; conversely a genuinely newer
-        // deliberate edit can clear it (the reversibility the North Star
-        // requires). Both directions are pinned here.
-        let mut older_open = base("a", "2026-06-16T00:00:00+00:00");
-        older_open.lifecycle_state = LifecycleState::Open;
-        let mut newer_contaminated = base("a", "2026-06-16T09:00:00+00:00");
-        newer_contaminated.lifecycle_state = LifecycleState::Contaminated;
-
-        // Newer taint wins regardless of argument order (convergence).
-        assert_eq!(
-            merge_memory(&older_open, &newer_contaminated).lifecycle_state,
-            LifecycleState::Contaminated
-        );
-        assert_eq!(
-            merge_memory(&newer_contaminated, &older_open).lifecycle_state,
-            LifecycleState::Contaminated
-        );
-
-        // A strictly-newer deliberate state supersedes an older taint (a taint
-        // is not a permanent sink — it is undoable).
+    fn merge_memory_local_taint_survives_and_remote_taint_is_not_adopted() {
+        // Boids item 3 R2.4 (#3266 / #3750) — REWRITTEN from the pre-R2
+        // `..._participates_in_lww` pin, which asserted the opposite: that a
+        // newer remote visible state CLEARS a local taint (and a newer remote
+        // taint is ADOPTED). Under R2.1 (variant B) containment is a
+        // node-local overlay: a local contaminated / quarantined state is never
+        // replaced by the wire, and a wire taint is never adopted. Reversal is
+        // the signed operator decontaminate (R2.5), never a peer write.
         let mut older_contaminated = base("a", "2026-06-16T00:00:00+00:00");
         older_contaminated.lifecycle_state = LifecycleState::Contaminated;
         let mut newer_open = base("a", "2026-06-16T09:00:00+00:00");
         newer_open.lifecycle_state = LifecycleState::Open;
+        // FLIPPED: the local taint survives a strictly-newer remote visible state.
         assert_eq!(
             merge_memory(&older_contaminated, &newer_open).lifecycle_state,
+            LifecycleState::Contaminated
+        );
+        // A remote taint is NOT adopted over a local visible state (a
+        // hand-crafted push cannot taint-DoS a node).
+        assert_eq!(
+            merge_memory(&newer_open, &older_contaminated).lifecycle_state,
             LifecycleState::Open
+        );
+        // A LOCAL quarantine (the #1948 overlay) also survives a newer remote.
+        let mut local_q = base("a", "2026-06-16T00:00:00+00:00");
+        local_q.lifecycle_state = LifecycleState::Quarantined;
+        assert_eq!(
+            merge_memory(&local_q, &newer_open).lifecycle_state,
+            LifecycleState::Quarantined
+        );
+        // A remote taint is not adopted even when the local row is tombstoned.
+        let mut local_t = base("a", "2026-06-16T00:00:00+00:00");
+        local_t.lifecycle_state = LifecycleState::Tombstoned;
+        let mut newer_c = base("a", "2026-06-16T09:00:00+00:00");
+        newer_c.lifecycle_state = LifecycleState::Contaminated;
+        assert_eq!(
+            merge_memory(&local_t, &newer_c).lifecycle_state,
+            LifecycleState::Tombstoned
+        );
+        // Ruling variant B: `tombstoned` is a REPLICATED deletion — it keeps
+        // newer-wins in BOTH directions (the #3699 title-slot convergence).
+        let mut newer_t = base("a", "2026-06-16T09:00:00+00:00");
+        newer_t.lifecycle_state = LifecycleState::Tombstoned;
+        let mut older_open2 = base("a", "2026-06-16T00:00:00+00:00");
+        older_open2.lifecycle_state = LifecycleState::Open;
+        assert_eq!(
+            merge_memory(&older_open2, &newer_t).lifecycle_state,
+            LifecycleState::Tombstoned
+        );
+        assert_eq!(
+            merge_memory(&local_t, &newer_open).lifecycle_state,
+            LifecycleState::Open
+        );
+        // A `quarantined` reaching the merge is THIS node's #1948 route-IN
+        // verdict (the wire value was normalised to `open` first, R2.3), so it
+        // takes the ordinary newer-wins pick over a visible local row.
+        let mut newer_q = base("a", "2026-06-16T09:00:00+00:00");
+        newer_q.lifecycle_state = LifecycleState::Quarantined;
+        assert_eq!(
+            merge_memory(&older_open2, &newer_q).lifecycle_state,
+            LifecycleState::Quarantined
+        );
+        // SYMMETRY KEPT for non-taint states: ordinary LWW, both argument orders.
+        let mut older_open = base("a", "2026-06-16T00:00:00+00:00");
+        older_open.lifecycle_state = LifecycleState::Open;
+        let mut newer_done = base("a", "2026-06-16T09:00:00+00:00");
+        newer_done.lifecycle_state = LifecycleState::Done;
+        assert_eq!(
+            merge_memory(&older_open, &newer_done).lifecycle_state,
+            LifecycleState::Done
+        );
+        assert_eq!(
+            merge_memory(&newer_done, &older_open).lifecycle_state,
+            LifecycleState::Done
+        );
+    }
+
+    #[test]
+    fn merge_memory_contamination_marker_is_node_local_3266() {
+        // Boids item 3 R2.3 — the local marker (the restore anchor) survives a
+        // newer remote clean row; a remote marker is never adopted.
+        let key = crate::storage::CONTAMINATION_METADATA_KEY;
+        let mut local = base("a", "2026-06-16T00:00:00+00:00");
+        local.lifecycle_state = LifecycleState::Contaminated;
+        local.metadata = json!({ key: { "prior_lifecycle_state": "done" } });
+        let mut remote = base("a", "2026-06-16T09:00:00+00:00");
+        remote.metadata = json!({ "note": "peer" });
+        let merged = merge_memory(&local, &remote);
+        assert_eq!(merged.metadata[key]["prior_lifecycle_state"], "done");
+        assert_eq!(merged.metadata["note"], "peer");
+
+        let clean_local = base("a", "2026-06-16T00:00:00+00:00");
+        let mut marked_remote = base("a", "2026-06-16T09:00:00+00:00");
+        marked_remote.metadata = json!({ key: { "prior_lifecycle_state": "open" } });
+        assert!(
+            merge_memory(&clean_local, &marked_remote)
+                .metadata
+                .get(key)
+                .is_none(),
+            "a remote contamination marker must never be adopted"
+        );
+    }
+
+    #[test]
+    fn normalise_inbound_node_local_overlay_3266() {
+        // Boids item 3 R2.3 — the receive gate: a wire taint / quarantine lands
+        // `open` with no marker; a wire tombstone and ordinary states pass
+        // through untouched (variant B).
+        let key = crate::storage::CONTAMINATION_METADATA_KEY;
+        for st in NODE_LOCAL_LIFECYCLE_STATES {
+            let mut m = base("a", "2026-06-16T00:00:00+00:00");
+            m.lifecycle_state = st;
+            m.metadata = json!({ key: { "prior_lifecycle_state": "done" }, "k": 1 });
+            assert!(normalise_inbound_node_local_overlay(&mut m));
+            assert_eq!(m.lifecycle_state, LifecycleState::Open);
+            assert!(m.metadata.get(key).is_none());
+            assert_eq!(m.metadata["k"], 1);
+        }
+        for st in [
+            LifecycleState::Tombstoned,
+            LifecycleState::Done,
+            LifecycleState::Open,
+        ] {
+            let mut m = base("a", "2026-06-16T00:00:00+00:00");
+            m.lifecycle_state = st;
+            assert!(!normalise_inbound_node_local_overlay(&mut m));
+            assert_eq!(m.lifecycle_state, st);
+        }
+        // A marker alone (on a visible row) is still stripped.
+        let mut m = base("a", "2026-06-16T00:00:00+00:00");
+        m.metadata = json!({ key: {} });
+        assert!(normalise_inbound_node_local_overlay(&mut m));
+        assert!(m.metadata.get(key).is_none());
+    }
+
+    #[test]
+    fn title_slot_metadata_sql_names_every_node_local_key_f1_goal4() {
+        let (sqlite, pg) = (
+            sqlite_title_slot_newer_metadata(),
+            pg_title_slot_newer_metadata(),
+        );
+        for key in NODE_LOCAL_METADATA_KEYS {
+            assert!(sqlite.contains(&format!("'$.{key}'")), "{sqlite}");
+            assert!(sqlite.contains(&format!("'{key}'")), "{sqlite}");
+            assert!(pg.contains(&format!("'{key}'")), "{pg}");
+        }
+        assert!(pg.starts_with("((EXCLUDED.metadata - ARRAY["), "{pg}");
+        assert!(pg_node_local_overlay("$15::jsonb").starts_with("(($15::jsonb - ARRAY["));
+    }
+
+    #[test]
+    fn lifecycle_case_sql_twin_names_only_the_variant_b_set_3266() {
+        let case = lifecycle_local_taint_wins_case("excluded", "memories");
+        assert!(case.contains("memories.lifecycle_state IN ('contaminated', 'quarantined')"));
+        assert!(case.contains("excluded.lifecycle_state = 'contaminated'"));
+        assert!(
+            !case.contains("tombstoned"),
+            "tombstoned keeps newer-wins adoption (ruling variant B): {case}"
         );
     }
 

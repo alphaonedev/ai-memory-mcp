@@ -51,6 +51,18 @@ pub const MAX_CONTENT_SIZE: usize = 65_536;
 
 pub const PROMOTION_THRESHOLD: i64 = 5;
 
+/// v1.0.0 Boids item 1 (5-agent vote 4d3ea1c5) — ceiling for the recall
+/// POPULARITY term. Every recall score site adds `MIN(access_count, CAP) *
+/// 0.1`; at the former literal 50 a hot row bought +5.0, dwarfing the
+/// content signal (fts rank, +2.0 confidence, +3.0 long-tier) and letting
+/// pure popularity dominate textual relevance. Capped at 10 the popularity
+/// gain is at most +1.0 — a tiebreak, not a driver. Referenced by name at
+/// EVERY score site on BOTH backends (src/storage/mod.rs search /
+/// search_with_source_uri / recall_hybrid; src/store/postgres.rs search /
+/// recall_hybrid); the separate `skill_compositional_context` scorer and
+/// the `legacy_scoring` A/B hatch keep their own formula by design.
+pub const ACCESS_SCORE_CAP: i64 = 10;
+
 /// v1.0.0 #2339 (FBL-34) — ceiling for ACCESS-DRIVEN priority bumps (the
 /// touch/fold decade ladders + the curator feedback up-arm). Priority was
 /// a monotonic ratchet: ~70 recalls drove ANY row to 10, destroying the

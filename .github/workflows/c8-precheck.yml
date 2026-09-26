@@ -767,6 +767,14 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0  # #3872 requires complete ancestry, not the merge checkout alone.
+      # #3872: the original PR head must contain the pinned release base.
+      # The synthetic merge checkout would always hide BEHIND geometry.
+      - name: Promotion ancestry soundness (#3872)
+        run: bash scripts/check-promotion-geometry.sh --github-event "$GITHUB_EVENT_PATH"
+      - name: Self-test promotion ancestry (including BEHIND negative control)
+        run: bash scripts/check-promotion-geometry.sh --self-test
       - name: Run required-contexts gate
         run: bash scripts/check-required-contexts.sh
       - name: Declared-vs-live required-context drift (#3554 / #2712)

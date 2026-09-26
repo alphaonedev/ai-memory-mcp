@@ -380,31 +380,34 @@ fn build_llm_curator(
     // signed refusal. Default `allow` → no-op (byte-identical legacy).
     // ENFORCED here (no client → no egress); mirrors the precedent at
     // `daemon_runtime::build_llm_client` + `reload::resolve_and_build_mcp_llm`.
-    {
+    // #3822 (A2) — resolve-then-pin.
+    let egress_pin = {
         use crate::egress::{
-            EgressClass, EgressDecision, InferenceEgressMode, evaluate_inference_egress,
+            EgressClass, EgressDecision, InferenceEgressMode, admit_inference_target,
         };
-        if let EgressDecision::Refuse {
-            class,
-            target,
-            reason,
-        } = evaluate_inference_egress(
+        match admit_inference_target(
             InferenceEgressMode::resolve(),
             EgressClass::InferenceLlm,
             &resolved.base_url,
         ) {
-            // #1991 — audit against the operator-resolved `db_path` threaded from
-            // the caller, NOT a recomputed `effective_db(DEFAULT_DB)` (which would
-            // misfile the row to CWD `ai-memory.db` under a non-default `--db`).
-            crate::egress::refuse_inference_egress_audited(db_path, class, &target, &reason);
-            return Err(format!(
-                "atomise: inference-plane egress refused ({reason}); no curator LLM client \
-                 constructed — set AI_MEMORY_INFERENCE_EGRESS=allow or loopback-only to a \
-                 local endpoint"
-            ));
+            Ok(pin) => pin,
+            Err(EgressDecision::Refuse {
+                class,
+                target,
+                reason,
+            }) => {
+                // #1991 — audit against the operator-resolved `db_path`.
+                crate::egress::refuse_inference_egress_audited(db_path, class, &target, &reason);
+                return Err(format!(
+                    "atomise: inference-plane egress refused ({reason}); no curator LLM client \
+                     constructed — set AI_MEMORY_INFERENCE_EGRESS=allow, loopback-only, or \
+                     internal-only to a reachable endpoint"
+                ));
+            }
+            Err(EgressDecision::Allow) => None,
         }
-    }
-    match OllamaClient::build_from_resolved(&resolved) {
+    };
+    match OllamaClient::build_from_resolved_pinned(&resolved, egress_pin.as_ref()) {
         Ok(Some(client)) => {
             let model = client.model_name().to_string();
             Ok((Box::new(LlmCurator::new(client)), model))

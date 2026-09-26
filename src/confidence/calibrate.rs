@@ -218,7 +218,9 @@ pub struct PerSourceBaseline {
 
 /// v1.0.0 §11.5 (#1707) — measured evidence for whether the recall-usage
 /// consume signal carries information the recall blend's existing
-/// `MIN(access_count, 50) * 0.1` usage proxy does not.
+/// `MIN(access_count, ACCESS_SCORE_CAP) * 0.1` usage proxy does not
+/// (`ACCESS_SCORE_CAP` = 10 at v1.0.0, Boids item 1 — the literal 50 was
+/// removed at the cut).
 ///
 /// The #1707 gate ships the live recall-utility term ONLY IF this shows a
 /// meaningful divergence; otherwise the signal is redundant and #1707 is

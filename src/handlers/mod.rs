@@ -158,6 +158,7 @@ pub mod routes;
 pub mod share;
 pub mod skills;
 pub mod subscriptions;
+pub mod swarm_rewind_http;
 pub mod system;
 pub mod transport;
 mod write_receipt;

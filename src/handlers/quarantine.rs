@@ -38,6 +38,10 @@
 //! [`crate::db::operator_dequarantine`] (sqlite), each of which lands the
 //! state change and the `memory.dequarantined` signed-chain row in ONE
 //! transaction, so this surface cannot release a row without leaving a trace.
+//! Boids item 3 R2.5 (#3266): the same release also DECONTAMINATES a
+//! `contaminated` row (prior visible state restored, marker removed, a signed
+//! `swarm.decontaminate` row appended) — the path is chosen by the state the
+//! backend observes under its lock, never by this handler.
 //!
 //! [#2402]: https://github.com/alphaonedev/ai-memory-mcp/issues/2402
 //! [#1948]: https://github.com/alphaonedev/ai-memory-mcp/issues/1948
@@ -152,11 +156,22 @@ pub async fn release_quarantined(
     // #2044 key-attestation binding. The handler never reads `X-Agent-Id`
     // itself — that is what keeps the signed row for an operator override from
     // being attacker-chosen.
-    let caller = match crate::handlers::admin_role::require_admin(&app, &headers, RELEASE_ENDPOINT)
-    {
-        Ok(c) => c,
-        Err(resp) => return resp,
-    };
+    // #3943 — bind `is_admin` ONLY in the gate's Ok arm and thread it into
+    // `for_admin_checked` below (the blessed swarm_rewind_http.rs shape):
+    // deleting or moving this gate leaves `is_admin` undefined — a COMPILE
+    // error — instead of a free-standing `true` that would still compile and
+    // silently yield an admin-bypass context.
+    let (caller, is_admin) =
+        match crate::handlers::admin_role::require_admin(&app, &headers, RELEASE_ENDPOINT) {
+            Ok(c) => (c, true),
+            Err(resp) => return resp,
+        };
+    // `is_admin` is consumed only on the sal/postgres lane's admin
+    // `CallerContext` below; the sqlite/default lane releases through the
+    // caller-id path and needs no bypass flag. Bind-and-consume here so gate
+    // removal is a compile error on every build, not only the sal one.
+    #[cfg(not(feature = "sal"))]
+    let _ = is_admin;
 
     // Forensic-chain entry BEFORE the write, matching `run_gc` / `import` /
     // `export`: the operator who triggered an override is captured even if
@@ -175,11 +190,12 @@ pub async fn release_quarantined(
         // than a hand-built struct: it makes the dependency on the admin gate
         // visible in the TYPE SIGNATURE instead of leaving a bare
         // `bypass_visibility: true` for a reviewer to correlate with a
-        // `require_admin` call twenty lines up. The `true` is sound because
-        // `require_admin` returned `Ok` above; there is no other way to reach
-        // this line. Quarantined rows are hidden from tenant visibility, so
-        // the release lane must bypass the scope filter to see the row at all.
-        let ctx = crate::store::CallerContext::for_admin_checked(caller.clone(), true);
+        // `require_admin` call twenty lines up. The second argument is
+        // `is_admin`, threaded from the `require_admin` Ok arm above — NEVER a
+        // literal (#3943): remove the gate and this stops compiling. Quarantined
+        // rows are hidden from tenant visibility, so the release lane must
+        // bypass the scope filter to see the row at all.
+        let ctx = crate::store::CallerContext::for_admin_checked(caller.clone(), is_admin);
         return match app.store.operator_dequarantine(&ctx, &id).await {
             Ok(released) => Json(release_body(&id, released)).into_response(),
             Err(e) => super::store_err_to_response(e),

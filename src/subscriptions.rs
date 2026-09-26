@@ -1060,6 +1060,16 @@ pub fn dispatch_event_to_subs(
     // ALL run under `#[tokio::main]`, so this fallback is the cold
     // path.
     let handle = tokio::runtime::Handle::try_current().ok();
+    // #3941 — snapshot the process-wide server-wide HMAC secret ONCE, at
+    // dispatch time, on the CALLER thread before any `rt.spawn`, so every
+    // worker this call spawns signs against the secret in effect when the
+    // dispatch was DECIDED. The worker would otherwise read it lazily (the
+    // `None` arm of the signature match below), and a sibling that flips
+    // `set_active_hooks_hmac_secret` between this call and a still-queued
+    // worker's run would make that worker sign-or-refuse against the WRONG
+    // secret. In production the setter runs once at boot, so this only
+    // removes a test-visible race; the value is behaviour-identical.
+    let server_wide_secret = crate::config::active_hooks_hmac_secret();
     for (sub, sub_secret_hash) in matching {
         // v0.7.0 K6 — UUIDv7 correlation id is generated per
         // (subscription, event) pair so receivers can correlate ACKs
@@ -1090,6 +1100,7 @@ pub fn dispatch_event_to_subs(
         let ts = timestamp.clone();
         let db_path = db_path.to_path_buf();
         let secret_hash_owned = sub_secret_hash.clone();
+        let server_wide_secret_owned = server_wide_secret.clone();
 
         // PERF-3 (FX-10) — the entire per-subscriber delivery body
         // is captured by a `FnOnce()` closure so it can run either
@@ -1181,6 +1192,7 @@ pub fn dispatch_event_to_subs(
                 return;
             }
             let secret_hash = secret_hash_owned;
+            let server_wide_secret = server_wide_secret_owned;
             // Canonical string: "<timestamp>.<body>". Keyed HMAC over
             // the DB-stored secret hash. Receivers verify by computing
             // SHA256(plaintext_secret) and then
@@ -1198,8 +1210,8 @@ pub fn dispatch_event_to_subs(
             let canonical = format!("{ts}.{body}");
             let signature = match secret_hash.as_deref() {
                 Some(h) => Some(hmac_sha256_hex(h, &canonical)),
-                None => crate::config::active_hooks_hmac_secret().map(|plain| {
-                    let key_hash = sha256_hex(&plain);
+                None => server_wide_secret.as_deref().map(|plain| {
+                    let key_hash = sha256_hex(plain);
                     hmac_sha256_hex(&key_hash, &canonical)
                 }),
             };
@@ -1925,12 +1937,21 @@ pub fn validate_url_dns(url: &str) -> Result<()> {
 /// the userinfo. Userinfo is a credential in the row as well (#3697), and
 /// is stripped here rather than refused so the caller's error names the
 /// real host it targeted.
-fn authority_without_userinfo(rest: &str) -> &str {
+pub(crate) fn authority_without_userinfo(rest: &str) -> &str {
     let host_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let authority = &rest[..host_end];
     authority
         .rfind('@')
         .map_or(authority, |at| &authority[at + 1..])
+}
+
+/// #3822 — append the default HTTP port (`:80`) to a bracket/colon-normalized
+/// `host_port` that omits one, so `ToSocketAddrs` resolves it. Single home of
+/// the `host:80` default-port literal, shared by the webhook SSRF lane
+/// (`validate_url_dns_with`) and the egress inference lane (`egress::host_of`
+/// via the #3744 one-helper rule).
+pub(crate) fn host_port_with_default_http_port(host_port: &str) -> String {
+    format!("{host_port}:80")
 }
 
 pub(crate) fn validate_url_dns_resolved(
@@ -2030,13 +2051,13 @@ fn validate_url_dns_with(
                 host_port.to_string()
             } else {
                 // [ipv6] without port — append default
-                format!("{host_port}:80")
+                host_port_with_default_http_port(host_port)
             }
         } else if host_port.contains(':') {
             // IPv4:port or hostname:port — use as-is
             host_port.to_string()
         } else {
-            format!("{host_port}:80")
+            host_port_with_default_http_port(host_port)
         };
     // v0.7.0 #1053 (Agent-2 #3) — fail-CLOSED on DNS resolution
     // failure. Pre-#1053 a SERVFAIL / timeout / hang at the daemon's
@@ -2248,7 +2269,7 @@ fn validate_url_with(url: &str, allow_loopback: bool) -> Result<()> {
 // IPv4 form before applying SSRF checks. Without this, `Ipv6Addr::is_loopback()`
 // and the v6 branch of `is_private` silently miss `::ffff:127.0.0.1`,
 // `::ffff:10.0.0.1`, `::ffff:169.254.1.1`, and similar bypasses.
-fn normalize_ip(ip: IpAddr) -> IpAddr {
+pub(crate) fn normalize_ip(ip: IpAddr) -> IpAddr {
     match ip {
         IpAddr::V6(v6) => {
             let canonical = v6.to_canonical();
@@ -2272,42 +2293,78 @@ fn normalize_ip(ip: IpAddr) -> IpAddr {
     }
 }
 
-fn is_loopback_normalized(ip: IpAddr) -> bool {
+pub(crate) fn is_loopback_normalized(ip: IpAddr) -> bool {
     normalize_ip(ip).is_loopback()
 }
 
-fn is_private(ip: IpAddr) -> bool {
-    match normalize_ip(ip) {
+// #3822 (A4, 5-agent vote 4d3ea1c5) — `is_private` split into named
+// pub(crate) sub-predicates so the internal-only inference-egress classifier
+// (`src/egress.rs`) can reuse the EXACT same specificity leg. Each predicate
+// takes an ALREADY-`normalize_ip`'d address (the caller normalizes once);
+// `is_private` recomposes them BYTE-IDENTICALLY (the OR of the same set it
+// always had). The SSRF pins are the specificity leg and stay green.
+
+/// RFC1918 IPv4 private space (10/8, 172.16/12, 192.168/16) OR RFC4193 IPv6
+/// ULA (fc00::/7). Input is `normalize_ip`'d.
+pub(crate) fn is_rfc1918_or_ula(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_private(),
+        IpAddr::V6(v6) => (v6.segments()[0] & 0xfe00) == 0xfc00, // ULA fc00::/7
+    }
+}
+
+/// RFC6598 CGNAT / carrier-grade-NAT space (100.64.0.0/10). IPv4-only; input
+/// is `normalize_ip`'d. #1847.
+pub(crate) fn is_cgnat(ip: IpAddr) -> bool {
+    match ip {
         IpAddr::V4(v4) => {
-            // SSRF fix (W11): include `is_unspecified` (0.0.0.0). On most
-            // OSes the kernel routes 0.0.0.0 to a local listener, so an
-            // attacker-controlled hostname resolving to 0.0.0.0 hits the
-            // local box.
-            // #1847 (security review S4, CWE-918) — RFC 6598 CGNAT
-            // (100.64.0.0/10) is not covered by `is_private()` but is a
-            // routable-to-internal range on AWS EKS secondary-CIDR / GKE /
-            // carrier-grade-NAT topologies, so SSRF-reject it too.
             let o = v4.octets();
-            let is_cgnat = o[0] == 100 && (o[1] & 0xc0) == 0x40;
-            v4.is_private()
-                || v4.is_link_local()
-                || v4.is_multicast()
-                || v4.is_broadcast()
-                || v4.is_unspecified()
-                || is_cgnat
+            o[0] == 100 && (o[1] & 0xc0) == 0x40
+        }
+        IpAddr::V6(_) => false,
+    }
+}
+
+/// Link-local / multicast / broadcast / unspecified — addresses that are
+/// never a legitimate off-host internal endpoint (the kernel routes
+/// `0.0.0.0` / `[::]` to a local listener; link-local is unrouted). Input is
+/// `normalize_ip`'d.
+pub(crate) fn is_link_local_or_special(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_link_local() || v4.is_multicast() || v4.is_broadcast() || v4.is_unspecified()
         }
         IpAddr::V6(v6) => {
-            // Conservative: reject unique-local (fc00::/7), link-local
-            // (fe80::/10), multicast, and the unspecified address `::`.
-            // SSRF fix (W11): `is_unspecified` covers `[::]`, which most
-            // kernels route to local services.
-            let segs = v6.segments();
-            v6.is_multicast()
-                || v6.is_unspecified()
-                || (segs[0] & 0xfe00) == 0xfc00 // ULA
-                || (segs[0] & 0xffc0) == 0xfe80 // link-local
+            v6.is_multicast() || v6.is_unspecified() || (v6.segments()[0] & 0xffc0) == 0xfe80
+            // link-local fe80::/10
         }
     }
+}
+
+/// #3822 — a KNOWN cloud-metadata-service literal. NOT part of `is_private`
+/// (169.254.169.254 is already link-local, fd00:ec2::254 already ULA); this
+/// is a NEW predicate the internal-only egress classifier consults so a
+/// metadata literal is refused even when it falls inside an otherwise-allowed
+/// range — notably `100.100.100.200` (Alibaba metadata) is inside the CGNAT
+/// /10, so "metadata beats CGNAT". Input is `normalize_ip`'d.
+pub(crate) fn is_metadata_literal(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            o == [169, 254, 169, 254] || o == [100, 100, 100, 200]
+        }
+        // fd00:ec2::254 (AWS IMDS over IPv6).
+        IpAddr::V6(v6) => v6.segments() == [0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254],
+    }
+}
+
+fn is_private(ip: IpAddr) -> bool {
+    // Recompose BYTE-IDENTICALLY: the OR of exactly the same set as before,
+    // over the normalized address. (`is_metadata_literal` is deliberately NOT
+    // ORed in here — it is an egress-classifier concern, and every metadata
+    // literal is already covered by link-local / ULA above.)
+    let ip = normalize_ip(ip);
+    is_rfc1918_or_ula(ip) || is_cgnat(ip) || is_link_local_or_special(ip)
 }
 
 /// v0.7.0 #1072 — kept for the existing test harness and the

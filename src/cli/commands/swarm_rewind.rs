@@ -68,7 +68,13 @@ pub fn cmd_swarm_rewind(
     args: &SwarmRewindArgs,
     out: &mut CliOutput<'_>,
 ) -> Result<()> {
-    let conn = db::open(db_path)?;
+    // v1.0.0 #3924 — REFUSE on a Postgres store BEFORE the local open. A rewind
+    // contaminates a subtree, freezes routines and appends a signed
+    // `swarm.rewind` event; on a pg deployment that would phantom-land in a
+    // throwaway SQLite file while the operator believes the fleet was rewound.
+    // Same shared funnel as the other class-(a) verbs; see `refuse_pg_store`.
+    let db_path = crate::cli::backup::refuse_pg_store(db_path, "swarm-rewind", out)?;
+    let conn = db::open(&db_path)?;
 
     let mut params = json!({
         param_names::TO: args.to,

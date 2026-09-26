@@ -229,6 +229,18 @@ fn calibrate_confidence_emits_its_report_3885() {
 fn check_duplicate_reports_no_duplicate_on_a_fresh_corpus_3885() {
     let tmp = TempDir::new().unwrap();
     let db = tmp.path().join("dup.db");
+    // #3911 — the precondition is an out-of-tree artefact (the offline HF
+    // model cache, the #1501 hermetic-CI arrangement). Probe it with the
+    // product's OWN resolver first and fail LOUDLY with a named prerequisite,
+    // so a host without the cache reports that — not a red that carries no
+    // information about `check-duplicate`. Never a silent skip (a skip would
+    // read as a pass that measured nothing).
+    if let Err(e) = ai_memory::embeddings::Embedder::load_from_fallback() {
+        panic!(
+            "prerequisite missing: offline embedder cache ({e}). Stage it per \
+             #1501 or run on CI; this is NOT a check-duplicate failure (#3911)"
+        );
+    }
     // check-duplicate builds the semantic embedder; under EMBED_OFFLINE it relies on a pre-staged HF model cache, so a host without one fails at embedder build, not at the assertion below.
     let out = ai_memory(&db)
         .env("AI_MEMORY_EMBED_OFFLINE", "1")

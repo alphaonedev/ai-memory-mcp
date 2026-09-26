@@ -7,6 +7,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security (#3901 — attested cross-id title merge no longer dequarantines a different local row)
+
+- **Route-OUT dequarantine-on-attest (#1948) is gated on the applied row being
+  the inbound row, on both backends.** An inbound id absent locally resolves
+  through the `(title, namespace)` title-slot upsert, which returns the id of a
+  DIFFERENT local row; both receive funnels (sqlite `federation_receive`,
+  postgres `federation_signing_check`) then lifted that row's quarantine on the
+  strength of an attestation that never covered it — a node-local containment
+  bypass (#3266 item 3 part 5). One shared gate
+  (`attest_dequarantine_target`) now requires `agent_attested` AND
+  `applied_id == inbound.id`; the cross-id case keeps the other row
+  quarantined (the push still applies) and the dequarantine result is logged
+  on failure instead of discarded. Pinned red-first on sqlite and live
+  postgres (`tests/federation_dequarantine_crossid_3901.rs`), with a same-id
+  control that still dequarantines.
+
+### Changed (#3266 — Boids item 3 part 5 (R2): containment is node-local)
+
+- **Lifecycle merge (R2.1, fixes #3750).** A LOCAL `contaminated` /
+  `quarantined` state is never replaced by a peer's newer write, and a remote
+  `contaminated` is never adopted — one predicate
+  (`crdt_merge::merge_lifecycle_local_taint_wins`) plus its SQL twin in both
+  upsert `ON CONFLICT` arms (sqlite + postgres). `tombstoned` keeps
+  newer-wins adoption: a lifecycle tombstone is a REPLICATED deletion
+  (`federation_causal_order_3699` 6/0; ruling tmux-22 variant B).
+- **SQLite same-id receive lane reads `get_any` (R2.2, closes #3905).** A
+  hidden local row now reaches `merge_memory`, so its
+  `metadata.contamination` marker survives exactly as on PostgreSQL.
+- **Receive normalisation (R2.3).** Every inbound federation funnel (push on
+  both backends, the pull / catch-up lanes) turns a wire `contaminated` /
+  `quarantined` lifecycle into `open` and drops a wire `metadata.contamination`
+  marker BEFORE the #1948 route-IN verdict — which therefore still
+  quarantines over an existing row.
+- **Decontaminate (R2.5).** `ai-memory quarantine release` /
+  `POST /api/v1/admin/quarantine/{id}/release` (no new surface) also release a
+  `contaminated` row on both backends: restore the recorded prior visible
+  state (else `open`), remove the marker, append a signed
+  `swarm.decontaminate` event. The quarantined release keeps
+  `memory.dequarantined` unchanged.
+- **f1 goal4 FA (HIGH) — PG same-id peer merge is one locked transaction.**
+  `PostgresStore::merge_inbound` now reads the existing row `FOR UPDATE`
+  INSIDE its write transaction (previously on the pool, before a separate
+  transaction), computes the merge — including the local-wins lifecycle
+  predicate — from that locked row, and overlays the node-local metadata keys
+  from the row being updated by an atomic jsonb merge. A peer push racing a
+  committed local rewind or release can no longer undo it.
+- **f1 goal4 FB (MEDIUM) — title-slot newer-wins keeps node-local keys, both
+  adapters.** The different-id / same-(title, namespace) upsert arm now keeps
+  the LOCAL `contamination` and `contradiction_*` keys and never adopts a
+  peer's (`crdt_merge::NODE_LOCAL_METADATA_KEYS`, one source for the Rust merge
+  and both SQL arms), so a later release restores the recorded prior state.
+- **f1 goal4 FC (GA, same class as FA) — caller lifecycle transitions are
+  compare-and-set on both adapters.** `storage::set_lifecycle_state` now reads,
+  validates and writes inside one `BEGIN IMMEDIATE` transaction, and
+  `PostgresStore::apply_lifecycle_patch` reads the row `FOR UPDATE` on its
+  write transaction's connection; both UPDATEs carry the validated `from`
+  state in their `WHERE`. A racing #1948 quarantine or contamination stamp is
+  never overwritten; a lost race is a typed 409 conflict, distinct from an
+  absent row.
+- **Disclosure (R2.6).** Containment is node-local at GA: a peer does not
+  inherit a rewind; each node rewinds its own copy
+  (`docs/compliance/honest-limitations.md` §5.1,
+  `docs/enterprise-deployment.md` §8.3).
+
 ### Fixed (#3782 — SDK quickstarts pointed at a scheme the daemon never serves)
 
 - **#3782 (adopter lens, 3x7 workstream G on PR #3769; GA-blocker) — every

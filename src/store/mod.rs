@@ -1618,6 +1618,29 @@ pub trait MemoryStore: Send + Sync {
         })
     }
 
+    /// Boids predator plan item 3 (#3266, vote `4d3ea1c5`) — contaminate a
+    /// cascade root + its bounded `derives_from` descendants, freeze the named
+    /// routines, append one signed `swarm.rewind` event (one transaction).
+    /// `ctx.agent_id` is the recorded issuer. `root_id` is already resolved
+    /// (memory or checkpoint target) by the caller.
+    ///
+    /// # Errors
+    ///
+    /// Adapter-specific; `UnsupportedCapability` by default.
+    async fn swarm_rewind(
+        &self,
+        _ctx: &CallerContext,
+        _root_id: &str,
+        _max_depth: usize,
+        _target_kind: &str,
+        _freeze_routine_ids: &[String],
+        _dry_run: bool,
+    ) -> StoreResult<crate::storage::SwarmRewindReport> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "SWARM_REWIND".to_string(),
+        })
+    }
+
     /// #1393 sub-unit 2 — reclassify a memory's `memory_kind` (the curator
     /// transcript-classify pass: a recovered `Observation` → an
     /// LLM-classified kind). This is a DEDICATED, audited path, NOT a field
@@ -3191,14 +3214,16 @@ pub trait MemoryStore: Send + Sync {
     }
 
     /// v0.9.0 P0-1 (#1869) — FOLD maintenance verb: batch-apply the
-    /// legacy recall-touch ladders (access_count bump capped at 1M,
-    /// `last_accessed_at`, per-tier TTL floor-extend anchored on
-    /// `observed_at`, mid→long promotion at the promotion threshold,
-    /// priority decade ladder capped at 10, and — when
-    /// `AI_MEMORY_CONFIDENCE_DECAY=1` — the confidence-decay stamp)
-    /// from unfolded `recall_observations` ledger rows, marking them
-    /// folded once applied. Idempotent: a second fold over the same
-    /// ledger is a no-op.
+    /// recall-access ladders from unfolded `recall_observations` ledger
+    /// rows, marking them folded once applied: access_count bump capped
+    /// at 1M, `last_accessed_at`, per-tier TTL floor-extend anchored on
+    /// `observed_at`, and — when `AI_MEMORY_CONFIDENCE_DECAY=1` — the
+    /// confidence-decay stamp. v1.0.0 Boids item 1 (5-agent vote
+    /// 4d3ea1c5) removed the mid→long promotion, the promotion
+    /// `updated_at` rewrite and the priority decade ladder: recall
+    /// popularity no longer rewrites a row's tier, recency or priority
+    /// (`memory_promote` is the sole tier-raising verb). Idempotent: a
+    /// second fold over the same ledger is a no-op.
     ///
     /// Returns the number of distinct memories folded.
     ///

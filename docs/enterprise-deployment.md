@@ -1207,6 +1207,19 @@ For the swarm topology:
   symmetrically on both peers' substrate. This is the A2A-6 pattern:
   cross-agent contradictions are first-class graph edges, not
   individual-side rejections.
+- **Containment is node-local (#3266 item 3, R2.6).** A swarm rewind
+  (`memory_swarm_rewind`) and the `Contaminated` taint are applied to
+  THIS node's copy only: **a peer does not inherit a rewind — each node
+  rewinds its own copy** (run the rewind on every node that holds the
+  cascade). Replication cannot undo or spread it: the lifecycle merge
+  keeps a LOCAL `contaminated` / `quarantined` state against any newer
+  peer write, and a wire `contaminated` / `quarantined` lifecycle (plus
+  any wire `metadata.contamination` marker) is normalised to `open` at
+  every receive funnel, on both backends. A lifecycle `tombstoned`, by
+  contrast, is a replicated deletion and still converges. The route
+  OUT is the audited operator release (`ai-memory quarantine release`),
+  which decontaminates to the recorded prior visible state and appends a
+  signed `swarm.decontaminate` event.
 
 ### 8.4 Trust bootstrap (TOFU allowlist)
 
@@ -1917,6 +1930,15 @@ it, and flip it back.
 > gate — did not. If your control requires that no peer ever holds
 > plaintext, **do not federate that namespace**: scope it out with
 > `allowed_namespaces`, or run a separate non-federated deployment.
+> This covers **`scope=private` rows and private-by-default inbox rows
+> too**: EVERY push path replicates them to every configured peer
+> without a scope filter — the write-time push
+> (`federation::broadcast_store_quorum_with_embedding`), the bulk
+> catch-up push (`federation::bulk_catchup_push`, a push despite its
+> name), and the sync-daemon cycle (`daemon_runtime::sync_cycle_once`).
+> Only the `/sync/since` PULL lane withholds them (#948). The peer re-applies the
+> owner predicate, so its other agents cannot read them, but the peer's
+> operator holds them under the peer's custody (#3928).
 
 - [ ] Federated namespaces reviewed against the plaintext-at-peer property above; namespaces under a no-plaintext control are excluded from federation scope.
 - [ ] Binary built with `--features sqlcipher`; `AI_MEMORY_ENCRYPT_AT_REST=1`.

@@ -600,18 +600,21 @@ would land `claimed`) is **stored** with the system-only lifecycle state
 - **Operator dequarantine (manual).** The `dequarantine` storage/SAL
   primitive raw-clears `quarantined → open` (idempotent; a no-op on any
   non-quarantined row).
-- **Federation LWW overwrite (incidental, #3750).** A peer that pushes a newer
-  `updated_at` for the same `id`, carrying a NON-quarantined state, wins the
-  replication tiebreak and overwrites the local `quarantined` lifecycle value —
-  clearing the quarantine with no attest and no operator action. It is not a
-  control (ungated). **What survives the overwrite DIFFERS BY BACKEND (#3905):**
-  on SQLite the write takes `insert_if_newer`, whose 5-key metadata rebuild
-  DESTROYS the contamination record, so the `prior_lifecycle_state` reversibility
-  anchor is gone; on PostgreSQL `merge_inbound` reads the row raw and
-  field-merges via `merge_memory`, whose deep metadata merge PRESERVES the
-  contamination record. (The merge is deferred to v1.1 per #3750; the
-  preserve-vs-destroy asymmetry is filed as #3905. Described here so the
-  route-out list is complete.)
+- **Operator release (audited, #2402).** `ai-memory quarantine release <id>`
+  (or the admin HTTP twin) clears `quarantined → open` and appends a signed
+  `memory.dequarantined` event in the same transaction. The same verb also
+  releases a `contaminated` row (Boids item 3 R2.5, #3266): it restores the
+  recorded `metadata.contamination.prior_lifecycle_state` when that is a
+  visible state (else `open`), removes the marker, and appends a signed
+  `swarm.decontaminate` event binding the released marker.
+- **No federation overwrite (#3750, closed by #3266 item 3 R2).** A peer's newer
+  write can NOT clear a local `quarantined` or `contaminated` state: the
+  lifecycle merge keeps the LOCAL overlay on both backends, and the SQLite
+  same-id lane now reads the hidden row (`get_any`) so the contamination record
+  survives the merge exactly as on PostgreSQL (#3905 closed). A wire
+  `quarantined` / `contaminated` value is normalised to `open` before the
+  route-IN verdict, so a peer can neither set nor clear this node's
+  containment.
 
 > **Honest caveat.** A quarantined row **does not relay onward** from this
 > node — it is a local black-hole until it is dequarantined. Quarantine

@@ -808,6 +808,16 @@ pub use kg_invalidate::handle_kg_invalidate;
 pub use kg_timeline::handle_kg_timeline;
 pub use subscribe::{handle_list_subscriptions, handle_subscribe};
 pub use swarm_rewind::handle_swarm_rewind;
+/// Boids item 3 part 2 — shared with `handlers::swarm_rewind_http` so the HTTP
+/// route resolves targets and renders the envelope exactly as the MCP tool does.
+pub(crate) use swarm_rewind::{
+    TARGET_KIND_CHECKPOINT as REWIND_TARGET_KIND_CHECKPOINT,
+    TARGET_KIND_MEMORY as REWIND_TARGET_KIND_MEMORY,
+    checkpoint_has_no_root as rewind_checkpoint_has_no_root,
+    checkpoint_root_memory_id as checkpoint_rewind_root,
+    checkpoint_root_not_found as rewind_checkpoint_root_not_found,
+    render_report as render_swarm_rewind_report, target_not_found as rewind_target_not_found,
+};
 pub use verify::handle_verify;
 // v0.7.0 L1-5 / L2-6 — test-and-integration access to the skill
 // substrate handlers. These are public so the L2-6 regression suite
@@ -4753,39 +4763,49 @@ pub fn run_mcp_server(
     // breadcrumb — it NEVER routes embedding requests through the
     // chat LLM client (the pre-#1143 silent-wrong-wire-shape trap).
     let resolved_embeddings = app_config.resolve_embeddings();
-    // v1.0.0 #1963 (R68/D14) — inference-plane egress gate for API embed
-    // backends (the ones that POST memory content to an embedding vendor);
-    // the local in-process embedder never egresses and is NOT gated.
-    let embed_egress_refused = crate::config::is_api_embed_backend(&resolved_embeddings.backend)
-        && match crate::egress::evaluate_inference_egress(
+    // v1.0.0 #1963 (R68/D14) — inference-plane egress gate for EGRESSING embed
+    // lanes (every API backend, plus the ollama+Nomic lane — #3933, which opens
+    // a socket to the resolved URL); the local in-process candle embedder never
+    // egresses and is NOT gated.
+    // #3822 (A2) — resolve-then-pin for the egressing lane; #3933 gates on
+    // transport, not backend name.
+    let (embed_egress_refused, embed_egress_pin) = if crate::config::embed_lane_egresses(
+        &resolved_embeddings.backend,
+        tier_config.embedding_model,
+    ) {
+        match crate::egress::admit_inference_target(
             crate::egress::InferenceEgressMode::resolve(),
             crate::egress::EgressClass::InferenceEmbedding,
             &resolved_embeddings.url,
         ) {
-            crate::egress::EgressDecision::Refuse {
+            Ok(pin) => (false, pin),
+            Err(crate::egress::EgressDecision::Refuse {
                 class,
                 target,
                 reason,
-            } => {
+            }) => {
                 eprintln!(
                     "ai-memory: embedder DISABLED by inference-plane egress gate \
-                     (target={target}); {reason} — semantic recall degrades to keyword (#1963)"
+                         (target={target}); {reason} — semantic recall degrades to keyword (#1963/#3822)"
                 );
-                // #3429 (sibling of #1991) — audit the refusal into the store
-                // this MCP process actually opened (`db_path`, resolved once by
-                // the top-level parser), NOT a recomputed
-                // `effective_db(DEFAULT_DB)`, which discards a non-default
-                // `--db`/`AI_MEMORY_DB` and misfiles the signed row into CWD
-                // `ai-memory.db` / the config store.
+                // #3429 (sibling of #1991) — audit into the store this MCP
+                // process actually opened (`db_path`).
                 crate::egress::refuse_inference_egress_audited(db_path, class, &target, &reason);
-                true
+                (true, None)
             }
-            crate::egress::EgressDecision::Allow => false,
-        };
+            Err(crate::egress::EgressDecision::Allow) => (false, None),
+        }
+    } else {
+        (false, None)
+    };
     let embedder = if embed_egress_refused {
         None
     } else {
-        match Embedder::from_resolved(&resolved_embeddings, tier_config.embedding_model) {
+        match Embedder::from_resolved_pinned(
+            &resolved_embeddings,
+            tier_config.embedding_model,
+            embed_egress_pin.as_ref(),
+        ) {
             Ok(Some(emb)) => {
                 eprintln!("ai-memory: embedder loaded ({})", emb.model_description());
                 // v0.7.0 issue #1260 — batch size from the canonical #1146

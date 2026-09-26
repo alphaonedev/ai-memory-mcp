@@ -100,6 +100,7 @@ pub mod age_version;
 // v1.0.0 #3124 R4 — the audited `reown` sweep. Own module for the same
 // qual_10 budget reason as `parity_3064` above.
 mod reown_3124;
+mod swarm_rewind;
 
 use crate::models::field_names;
 use std::time::Duration;
@@ -274,6 +275,13 @@ const SQL_MARK_KG_OUTBOX_PROJECTED: &str =
 /// projection-failure recovery arm.
 const SQL_ENQUEUE_KG_PROJECTION: &str =
     "INSERT INTO kg_projection_outbox      (source_id, target_id, relation) VALUES ($1, $2, $3)";
+
+/// #3883 — enqueue an AGE edge projection ALREADY QUARANTINED (attempt_count +
+/// last_error bound) — the orphan-graph path. The drainer take-query excludes
+/// `attempt_count >= MAX`, so this row does not retry until the A3 self-heal
+/// resets it once the registry row reappears.
+const SQL_ENQUEUE_KG_PROJECTION_QUARANTINED: &str = "INSERT INTO kg_projection_outbox (source_id, target_id, relation, attempt_count, last_error) \
+     VALUES ($1, $2, $3, $4, $5)";
 
 /// #3008 parity (v1.0.0 batch-2) — the single advisory-lock key that
 /// serializes every `action_edges` write, so the cycle probe and the INSERT
@@ -692,6 +700,38 @@ const SQL_SELECT_MEMORY_ROW_STAR_MID_LADDER: &str = "SELECT * FROM memories WHER
 static SQL_SELECT_MEMORY_ROW_BY_ID: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     format!("SELECT {MEMORY_READ_COLUMNS} FROM memories WHERE id = $1")
 });
+/// f1 goal4 FA (#3266) — the same-id federation merge's locked read: the row
+/// lock is held to commit, so the merge is computed from the row it overwrites.
+static SQL_SELECT_MEMORY_ROW_BY_ID_FOR_UPDATE: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| format!("{} FOR UPDATE", *SQL_SELECT_MEMORY_ROW_BY_ID));
+
+/// The same-id federation merge's full-row UPDATE (`merge_inbound`). The
+/// node-local metadata keys are overlaid from the row being updated by an
+/// atomic jsonb merge (f1 goal4 FA/FB), never written back from a copy.
+static SQL_MERGE_INBOUND_FULL_ROW_UPDATE: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| {
+        // APPEND-ONLY-SANCTIONED (#1823 G6) — routed at the use site in merge_inbound,
+        // which emits a RecordKind::Supersede leaf in the same tx (pg_emit_revision_leaf_if_enabled).
+        format!(
+            "UPDATE memories SET
+                tier = $2, namespace = $3, title = $4, content = $5, tags = $6,
+                priority = $7, confidence = $8, source = $9, access_count = $10,
+                created_at = $11, updated_at = $12, last_accessed_at = $13,
+                expires_at = $14, metadata = {metadata}, reflection_depth = $16,
+                memory_kind = $17, citations = $18, source_uri = $19,
+                source_span = $20, confidence_source = $21, confidence_signals = $22,
+                confidence_decayed_at = $23, entity_id = $24, persona_version = $25,
+                version = $26, mentioned_entity_id = $27, lifecycle_state = $28,
+                valid_from = $29, valid_until = $30,
+                -- #2292 — the sealed envelope is written in lockstep with
+                -- `content = $5` (both come from the already-resolved `merged`
+                -- row); an encryption-off merge writes plaintext + NULL,
+                -- clearing any stale ciphertext.
+                encrypted_envelope = $31
+             WHERE id = $1",
+            metadata = crate::models::crdt_merge::pg_node_local_overlay("$15::jsonb"),
+        )
+    });
 const SQL_SELECT_METADATA_BY_NS_TITLE: &str =
     "SELECT metadata FROM memories WHERE namespace = $1 AND title = $2";
 /// #1823 G6 — title-keyed id lookup, shared by the append-only spine's
@@ -8078,62 +8118,34 @@ impl PostgresStore {
     // ─────────────────────────────────────────────────────────────────
 
     /// #1412/#1628 — owner pre-fetch for the caller-owns mutation gate.
-    /// One declaration site (pm-v3.1) for the three gate consumers.
-    /// Two-column + `FOR UPDATE`: archive (#3193) needs the inbox-target
-    /// arm (Fable #3243 item 1) and a row lock so a concurrent re-own
-    /// cannot slip between probe and INSERT/DELETE (item 4). On the
-    /// autocommit pool (update/delete) the lock releases at statement
-    /// end — same TOCTOU those verbs already had.
+    /// One declaration site (pm-v3.1) for every gate consumer.
+    /// `FOR UPDATE` is load-bearing ONLY on the write transaction: the row
+    /// lock then spans probe → write, so a concurrent re-own cannot slip
+    /// between them (#3193 item 4, #3953). On an autocommit pool handle the
+    /// lock releases at statement end and guards nothing.
     const SQL_SELECT_OWNER_AGENT_ID_BY_ID: &'static str = "SELECT jsonb_typeof(metadata->'agent_id'), metadata->>'agent_id', \
          metadata->>'target_agent_id' FROM memories WHERE id = $1 FOR UPDATE";
 
-    /// #1412 caller-owns mutation gate shared by the tenant-facing
-    /// write paths: the trait `update`, the trait `delete`, and the
-    /// inherent `update_with_expected_version` (#1628). Threat model:
-    /// cross-tenant write hijack on postgres-backed daemons. Admin
-    /// paths skip via `ctx.bypass_visibility`; tenant-facing handlers
-    /// MUST NOT pass a bypass context.
+    /// #1412/#1628 caller-owns mutation gate shared by the tenant-facing
+    /// write paths (trait `update` / `delete`, `update_with_expected_version`,
+    /// `archive_by_ids`). Threat model: cross-tenant write hijack on
+    /// postgres-backed daemons. Admin paths skip via `ctx.bypass_visibility`;
+    /// tenant-facing handlers MUST NOT pass a bypass context.
     ///
     /// `action` names the refused operation in the `PermissionDenied`
     /// envelope; `unstamped_reason` is the wire-pinned refusal text for
-    /// legacy rows carrying no `metadata.agent_id` stamp (the verb
-    /// differs between the write and delete gates —
-    /// [`REASON_UNSTAMPED_TENANT_WRITE`] /
-    /// [`REASON_UNSTAMPED_TENANT_DELETE`]). Hoisted per the pm-v3.1
-    /// hardcoded-literal gate when #1628 added the third copy of the
-    /// previously-inlined gate.
-    async fn assert_caller_owns_for_mutation(
-        &self,
-        ctx: &CallerContext,
-        id: &str,
-        action: &str,
-        unstamped_reason: &str,
-    ) -> StoreResult<()> {
-        Self::assert_caller_owns_for_mutation_on(
-            &self.pool,
-            ctx,
-            id,
-            action,
-            unstamped_reason,
-            false,
-        )
-        .await
-    }
-
-    /// #3193 — executor-parameterised core of
-    /// [`Self::assert_caller_owns_for_mutation`]. Identical logic and
-    /// byte-identical refusal envelopes; the only difference is WHERE the
-    /// owner probe runs.
+    /// legacy rows carrying no `metadata.agent_id` stamp
+    /// ([`REASON_UNSTAMPED_TENANT_WRITE`] / [`REASON_UNSTAMPED_TENANT_DELETE`]
+    /// / [`REASON_UNSTAMPED_TENANT_ARCHIVE`]).
     ///
-    /// The `&self.pool` wrapper above is the right shape for the
-    /// single-statement verbs (`update` / `delete` /
-    /// `update_with_expected_version`) whose write is its own statement.
-    /// `archive_by_ids` is different: it copies the row to cold storage and
-    /// then HARD-DELETES the live row inside one multi-statement
-    /// transaction, so its gate MUST read through that same transaction —
-    /// a pool-borrowed probe would run on a different connection and could
-    /// observe a pre-tx snapshot of `metadata.agent_id` (a TOCTOU window
-    /// against a concurrent re-own). Passing `&mut *tx` closes it.
+    /// #3953 — an AUTHORITATIVE gate MUST pass the write transaction
+    /// (`&mut *tx`): the probe's `FOR UPDATE` then holds the row until that
+    /// transaction ends, so the owner it saw is the owner at write time and a
+    /// concurrent re-own either commits first (the probe re-reads it and
+    /// refuses with the same envelope as any owner mismatch) or waits for
+    /// the write. A pool handle is autocommit — the lock is released before
+    /// the write — so a pool call is at most an advisory early refusal
+    /// (`delete`'s inbox-routing admission), never the gate of record.
     async fn assert_caller_owns_for_mutation_on<'e, E>(
         executor: E,
         ctx: &CallerContext,
@@ -8210,8 +8222,13 @@ impl PostgresStore {
     /// read gate (`handlers::route_1111::pg_row_readable`) runs its own
     /// scope predicate over the row that exists, so the gate is
     /// lifecycle-NEUTRAL — it never changes which lifecycle states the
-    /// surface it guards discloses (the `supersedes` path, #3324, stamps
-    /// dependents `contaminated` before the curator lists them).
+    /// surface it guards discloses: it discloses whatever state the row
+    /// already carries. On Postgres no path WRITES `contaminated` at
+    /// v1.0.0 — the only #3324 stamper is the SQLite MCP `supersedes` path
+    /// (`mcp/tools/link.rs`, reflection-to-reflection only); PG `kg_invalidate`
+    /// and `link_signed` stamp nothing, so a PG row carries the state only
+    /// when it arrives already stamped (e.g. replicated from a SQLite node).
+    /// PG parity for the stamp is tracked on #3926 / #3266 (#3925).
     ///
     /// This is an authz-precondition read ONLY — never a caller-facing
     /// content read (the #3270 rule); it is reached through the concrete
@@ -8351,10 +8368,21 @@ impl PostgresStore {
         let Some(target) = target else {
             return Ok(());
         };
+        // f1 goal4 FC (#3266, GOD ruling): read, validate and write in ONE
+        // transaction — the row is read `FOR UPDATE` on the transaction's own
+        // connection (never the pool), and the UPDATE carries the validated
+        // `from` as a compare-and-set. A route-IN quarantine or a contamination
+        // stamp that commits before this read is SEEN (and refused by the
+        // transition machine); one that commits after it waits for this commit.
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("lifecycle transition begin tx", e))?;
         let current: Option<(String,)> =
-            sqlx::query_as("SELECT lifecycle_state FROM memories WHERE id = $1")
+            sqlx::query_as("SELECT lifecycle_state FROM memories WHERE id = $1 FOR UPDATE")
                 .bind(id)
-                .fetch_optional(&self.pool)
+                .fetch_optional(&mut *tx)
                 .await
                 .map_err(|e| to_store_err("read lifecycle_state for transition gate", e))?;
         let Some((current_str,)) = current else {
@@ -8366,22 +8394,33 @@ impl PostgresStore {
         if from == target {
             return Ok(());
         }
+        let illegal = |from: &str| StoreError::InvalidTransition {
+            detail: format!(
+                "CONFLICT: illegal lifecycle transition for memory {id}: {from} -> {target} is not permitted"
+            ),
+        };
         if !from.can_transition_to(target) {
-            return Err(StoreError::InvalidTransition {
-                detail: format!(
-                    "CONFLICT: illegal lifecycle transition for memory {id}: {from} -> {target} is not permitted"
-                ),
-            });
+            return Err(illegal(from.as_str()));
         }
-        sqlx::query(
+        let n = sqlx::query(
             "UPDATE memories SET lifecycle_state = $1, updated_at = NOW(), version = version + 1 \
-             WHERE id = $2",
+             WHERE id = $2 AND lifecycle_state = $3",
         )
         .bind(target.as_str())
         .bind(id)
-        .execute(&self.pool)
+        .bind(&current_str)
+        .execute(&mut *tx)
         .await
-        .map_err(|e| to_store_err("update lifecycle_state", e))?;
+        .map_err(|e| to_store_err("update lifecycle_state", e))?
+        .rows_affected();
+        // Unreachable under the held row lock; the CAS is the structural guard,
+        // and a miss is a typed conflict, never a silent no-op.
+        if n == 0 {
+            return Err(illegal(from.as_str()));
+        }
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("lifecycle transition commit", e))?;
         Ok(())
     }
 
@@ -8426,16 +8465,10 @@ impl PostgresStore {
     ) -> StoreResult<Option<i64>> {
         // Wave-2 B8 — inner CAS attempt of If-Match update (ERRORS-09).
         self.gate_record_stop().await?;
-        // #1628 — caller-owns write gate, mirroring the trait `update`
-        // (#1412). This method gained its first production caller (the
-        // HTTP `PUT /memories/{id}` If-Match branch), so it must apply
-        // the SAME tenant-isolation gate; admin paths skip via
-        // `ctx.bypass_visibility`.
-        self.assert_caller_owns_for_mutation(ctx, id, "update", REASON_UNSTAMPED_TENANT_WRITE)
-            .await?;
         // Pre-read the current version so a CONFLICT carries the
-        // observed-current value in the typed error. The UPDATE
-        // re-asserts the gate atomically below.
+        // observed-current value in the typed error; the UPDATE re-asserts
+        // that VERSION (the $11 bind) — it carries no ownership predicate.
+        // Ownership is held instead by the in-tx gate's row lock (#3953).
         // #1451 (SEC, HIGH) — fetch the governance-relevant columns
         // alongside `version` so the pre-write hook can evaluate the
         // POST-MERGE row before the UPDATE (parity with the SQLite
@@ -8451,6 +8484,19 @@ impl PostgresStore {
             .begin()
             .await
             .map_err(|e| to_store_err("begin update tx", e))?;
+        // #1628 — caller-owns write gate, mirroring the trait `update`
+        // (#1412); admin paths skip via `ctx.bypass_visibility`. #3953 — on
+        // the write tx, BEFORE the version pre-read: its `FOR UPDATE` holds
+        // the row to commit, so no re-own can land between gate and UPDATE.
+        Self::assert_caller_owns_for_mutation_on(
+            &mut *tx,
+            ctx,
+            id,
+            "update",
+            REASON_UNSTAMPED_TENANT_WRITE,
+            false,
+        )
+        .await?;
         let current_row: Option<(
             i64,
             String,
@@ -9461,8 +9507,8 @@ impl PostgresStore {
                           ELSE ts_rank(tsv, to_tsquery('english', $1))
                      END
                      + (priority * 0.5)
-                     + (LEAST(access_count, 50) * 0.1)
-                     + (confidence * 2.0)
+                     + (LEAST(access_count, {cap}) * 0.1)
+                     + (CASE WHEN confidence_source = 'default' OR confidence_source IS NULL THEN 0.5 ELSE confidence END * 2.0)
                      + CASE tier
                            WHEN 'long' THEN 3.0
                            WHEN 'mid'  THEN 1.0
@@ -9526,6 +9572,7 @@ impl PostgresStore {
             // v1.0.0 R19/A3 (#1948) — fail-closed lifecycle allow-list.
             lifecycle_vis = crate::models::lifecycle_visible_clause(""),
             soft_loser_factor = crate::storage::SOFT_LOSER_SCORE_FACTOR,
+            cap = crate::models::ACCESS_SCORE_CAP,
         ))
         .bind(or_tsquery.as_deref())
         .bind(filter.namespace.as_ref())
@@ -13447,27 +13494,21 @@ impl PostgresStore {
                         // swallowed: it propagates, because at that point we
                         // could neither project nor remember, and committing the
                         // relational row would leave undetectable drift.
-                        sqlx::query(SQL_ENQUEUE_KG_PROJECTION)
-                            .bind(&link.source_id)
-                            .bind(&link.target_id)
-                            .bind(link.relation.as_str())
-                            .execute(&mut *tx)
-                            .await
-                            .map_err(|e2| to_store_err("record unreconciled kg projection", e2))?;
-                        crate::metrics::registry().age_projection_failed_total.inc();
-                        tracing::warn!(
-                            target: TRACE_TARGET_KG,
-                            source_id = %link.source_id,
-                            target_id = %link.target_id,
-                            relation = link.relation.as_str(),
-                            err = %e,
-                            "AGE projection deferred on link insert (runtime failure) — \
-                             relational memory_links row committed and the pending \
-                             projection was RECORDED in kg_projection_outbox for \
-                             reconciliation by the drainer. kg_query/kg_timeline over \
-                             this edge may lag until it drains; find_paths reads \
-                             memory_links via the CTE and stays correct."
-                        );
+                        // #3883 (A1/A3) — route through the shared classifier:
+                        // an orphaned graph is enqueued QUARANTINED (no MAX-retry
+                        // storm) and self-heals once the AGE registry is repaired;
+                        // a transient failure enqueues pending. Both ride THIS tx
+                        // and carry the `reason` field. ERRORS-19: a failure to
+                        // RECORD propagates rather than committing silent drift.
+                        record_failed_age_projection(
+                            &mut tx,
+                            "link_insert",
+                            &link.source_id,
+                            &link.target_id,
+                            link.relation.as_str(),
+                            &e,
+                        )
+                        .await?;
                     }
                     Err(e) => return Err(e),
                 }
@@ -13517,6 +13558,33 @@ impl PostgresStore {
     /// backends (the outbox is only ever written when the AGE backend is
     /// active under deferred mode).
     pub async fn drain_kg_projection_outbox(&self, batch: i64) -> StoreResult<usize> {
+        // #3883 follow-up — a record-stop must halt background AGE-projection
+        // writes too: this fn holds inline `UPDATE kg_projection_outbox` SQL (the
+        // A3 self-heal reset below, and a pre-existing pending-row UPDATE), so it
+        // gates on the same idempotent read-probe as the `apply_remote_*` twins
+        // BEFORE any write. gate_record_stop is a cheap read; a stop returns
+        // early with the typed refusal rather than draining.
+        self.gate_record_stop().await?;
+        // #3883 A3 — self-heal orphan-quarantined rows. If the AGE graph
+        // registry row is present again (an operator repaired the orphan), un-
+        // quarantine the rows parked at attempt_count = MAX with the orphan
+        // prefix so THIS pass reprojects them; a still-absent registry leaves
+        // them quarantined (the probe returns false). Best-effort — a probe or
+        // reset failure must NOT abort the drain. One cheap catalog count per
+        // pass; the UPDATE matches nothing in steady state.
+        if age_graph_registry_present_pool(&self.pool)
+            .await
+            .unwrap_or(false)
+        {
+            let _ = sqlx::query(
+                "UPDATE kg_projection_outbox SET attempt_count = 0, last_error = NULL \
+                 WHERE projected_at IS NULL AND attempt_count >= $1 AND last_error LIKE $2",
+            )
+            .bind(Self::MAX_AGE_PROJECTION_ATTEMPTS)
+            .bind(format!("{AGE_GRAPH_ORPHAN_LAST_ERROR_PREFIX}%"))
+            .execute(&self.pool)
+            .await;
+        }
         let rows: Vec<(i64, i32, String, String, String)> = sqlx::query_as(
             "SELECT id, attempt_count, source_id, target_id, relation \
              FROM kg_projection_outbox \
@@ -13875,35 +13943,63 @@ impl PostgresStore {
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             // Boot-recovery drain — self-heal projections orphaned by a crash.
-            if let Err(e) = self
+            match self
                 .drain_kg_projection_outbox(Self::AGE_PROJECTION_DRAIN_BATCH)
                 .await
             {
-                tracing::warn!(
+                Ok(_) => {}
+                // #3883 follow-up — a record-stop gates the drainer (derived-data
+                // maintenance is still a record-plane write); that is INTENDED,
+                // not a fault, so log at INFO rather than WARN.
+                Err(StoreError::Stopped { .. }) => tracing::info!(
+                    target: TRACE_TARGET_KG,
+                    "kg_projection drainer: boot-recovery drain frozen by record-stop; will resume when it lifts"
+                ),
+                Err(e) => tracing::warn!(
                     target: TRACE_TARGET_KG,
                     err = %e,
                     "kg_projection drainer: boot-recovery drain failed (will retry on tick)"
-                );
+                ),
             }
             let mut ticker = tokio::time::interval(interval);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // #3883 follow-up — a record-stop freezes the drainer for its whole
+            // duration; latch so the "frozen" line is logged ONCE per stop
+            // episode (at INFO — intended), not per tick as a WARN fault. Reset
+            // whenever the drainer runs again so a later stop re-announces.
+            let mut stopped_logged = false;
             loop {
                 ticker.tick().await;
                 match self
                     .drain_kg_projection_outbox(Self::AGE_PROJECTION_DRAIN_BATCH)
                     .await
                 {
-                    Ok(n) if n > 0 => tracing::debug!(
-                        target: TRACE_TARGET_KG,
-                        projected = n,
-                        "kg_projection drainer: projected pending edges into memory_graph"
-                    ),
-                    Ok(_) => {}
-                    Err(e) => tracing::warn!(
-                        target: TRACE_TARGET_KG,
-                        err = %e,
-                        "kg_projection drainer: drain tick failed; will retry next interval"
-                    ),
+                    Ok(n) if n > 0 => {
+                        stopped_logged = false;
+                        tracing::debug!(
+                            target: TRACE_TARGET_KG,
+                            projected = n,
+                            "kg_projection drainer: projected pending edges into memory_graph"
+                        );
+                    }
+                    Ok(_) => stopped_logged = false,
+                    Err(StoreError::Stopped { .. }) => {
+                        if !stopped_logged {
+                            tracing::info!(
+                                target: TRACE_TARGET_KG,
+                                "kg_projection drainer: frozen by record-stop; will resume when it lifts"
+                            );
+                            stopped_logged = true;
+                        }
+                    }
+                    Err(e) => {
+                        stopped_logged = false;
+                        tracing::warn!(
+                            target: TRACE_TARGET_KG,
+                            err = %e,
+                            "kg_projection drainer: drain tick failed; will retry next interval"
+                        );
+                    }
                 }
             }
         })
@@ -18247,6 +18343,22 @@ fn is_age_adapter_statement_defect(err: &StoreError) -> bool {
 /// The matching operator-side surface is documented in
 /// `docs/kg-backend-fallback.md`.
 fn warn_age_fallback(op: &str, source_id: &str, err: &StoreError) {
+    // #3883 — the THIRD reason class: an orphaned AGE graph (schema present,
+    // ag_catalog.ag_graph row absent). STRUCTURAL, not transient — so the read
+    // consumers (kg_query / kg_timeline / find_paths) stop calling it transient.
+    if is_age_graph_orphan(err) {
+        tracing::warn!(
+            target: TRACE_TARGET_KG_ADAPTER_DEFECT,
+            op = op,
+            source_id = source_id,
+            backend = "age",
+            fallback = "cte",
+            reason = AGE_FALLBACK_REASON_GRAPH_ORPHAN,
+            error = %err,
+            "AGE graph ORPHANED (memory_graph schema present, ag_catalog.ag_graph registry row absent): kg_{op}=<{source_id}> served by the relational CTE. STRUCTURAL fault — create_graph cannot succeed against an orphan schema, so this is NOT a transient outage. Repair the AGE registry (see docs/kg-backend-fallback.md)."
+        );
+        return;
+    }
     if is_age_adapter_statement_defect(err) {
         tracing::warn!(
             target: TRACE_TARGET_KG_ADAPTER_DEFECT,
@@ -18280,6 +18392,21 @@ fn warn_age_fallback(op: &str, source_id: &str, err: &StoreError) {
 /// the two-id `find_paths` operation, where the structured event
 /// needs both `source_id` and `target_id`.
 fn warn_age_fallback_pair(op: &str, source_id: &str, target_id: &str, err: &StoreError) {
+    // #3883 — the THIRD reason class, two-id variant (find_paths).
+    if is_age_graph_orphan(err) {
+        tracing::warn!(
+            target: TRACE_TARGET_KG_ADAPTER_DEFECT,
+            op = op,
+            source_id = source_id,
+            target_id = target_id,
+            backend = "age",
+            fallback = "cte",
+            reason = AGE_FALLBACK_REASON_GRAPH_ORPHAN,
+            error = %err,
+            "AGE graph ORPHANED (memory_graph schema present, ag_catalog.ag_graph registry row absent): kg_{op}=<{source_id}->{target_id}> served by the relational CTE. STRUCTURAL fault — create_graph cannot succeed against an orphan schema, NOT a transient outage. Repair the AGE registry (see docs/kg-backend-fallback.md)."
+        );
+        return;
+    }
     if is_age_adapter_statement_defect(err) {
         tracing::warn!(
             target: TRACE_TARGET_KG_ADAPTER_DEFECT,
@@ -18310,6 +18437,178 @@ fn warn_age_fallback_pair(op: &str, source_id: &str, target_id: &str, err: &Stor
         error = %err,
         "AGE backend unreachable; falling back to CTE for kg_{op}=<{source_id}->{target_id}>"
     );
+}
+
+// ---------------------------------------------------------------------------
+// #3883 — AGE orphaned-graph structural classification (5-agent vote 4d3ea1c5,
+// option A). An ORPHANED graph is a `memory_graph` SCHEMA that exists with NO
+// `ag_catalog.ag_graph` registry row (the 42P06 `schema "memory_graph" already
+// exists` shape — e.g. after `DROP EXTENSION age CASCADE` leaves the plain
+// schema behind). `create_graph` can NEVER succeed against it and every MERGE
+// fails, so it is a STRUCTURAL fault: reported honestly and quarantined
+// immediately, never retried MAX transient-sounding times. REPORT, never
+// repair. See docs/kg-backend-fallback.md.
+// ---------------------------------------------------------------------------
+
+/// #3883 — `reason` field value for a fallback caused by an ORPHANED AGE graph
+/// (schema present, `ag_catalog.ag_graph` registry row absent). A THIRD reason
+/// class beside [`AGE_FALLBACK_REASON_UNREACHABLE`] /
+/// [`AGE_FALLBACK_REASON_STATEMENT_DEFECT`] — STRUCTURAL, not transient; never
+/// folded into either (the #2511 "classifier may only under-report" rule).
+const AGE_FALLBACK_REASON_GRAPH_ORPHAN: &str = "age_graph_orphan";
+
+/// #3883 — `last_error` prefix stamped on a `kg_projection_outbox` row parked
+/// (quarantined at `attempt_count = MAX`) because the AGE graph is orphaned.
+/// DISTINCT so the drainer self-heal targets exactly these rows: once the
+/// registry row reappears their `attempt_count` is reset and they drain.
+const AGE_GRAPH_ORPHAN_LAST_ERROR_PREFIX: &str = "age_graph_orphan:";
+
+/// #3883 — the 42P06 message shape `create_graph` raises when the `memory_graph`
+/// SCHEMA already exists (the orphan), as opposed to the benign 42P07 `graph
+/// "memory_graph" already exists` steady-state duplicate. Used ONLY to gate the
+/// registry probe so steady state (42P07) never probes — zero steady-state cost.
+const AGE_ORPHAN_SCHEMA_ERR_SIGNATURE: &str = "schema \"memory_graph\" already exists";
+
+/// #3883 — count of the `memory_graph` registry row in `ag_catalog.ag_graph`
+/// (the registry AGE itself consults). NEVER `pg_namespace` / `to_regnamespace`,
+/// which would see the orphan schema and wrongly answer "present".
+const SQL_COUNT_AGE_GRAPH_REGISTRY: &str =
+    "SELECT count(*) FROM ag_catalog.ag_graph WHERE name = 'memory_graph'";
+
+/// #3883 — true when an AGE fallback was classified as an ORPHANED graph by
+/// [`project_link_into_age`]'s A2 probe (the [`AGE_GRAPH_ORPHAN_LAST_ERROR_PREFIX`]
+/// carried in the error detail). Sub-classification of `BackendUnavailable`,
+/// mirroring [`is_age_adapter_statement_defect`].
+fn is_age_graph_orphan(err: &StoreError) -> bool {
+    let StoreError::BackendUnavailable { detail, .. } = err else {
+        return false;
+    };
+    detail.contains(AGE_GRAPH_ORPHAN_LAST_ERROR_PREFIX)
+}
+
+/// #3883 — probe `ag_catalog.ag_graph` for the `memory_graph` registry row
+/// INSIDE an open transaction (the [`project_link_into_age`] A2 path). Wrapped
+/// in a SAVEPOINT so a probe error (permission blip / conn drop) leaves the
+/// caller's tx healthy for the transient fall-through — the probe NEVER
+/// quarantines on its own failure. Ok(true) when registered.
+async fn age_graph_registry_present_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> StoreResult<bool> {
+    sqlx::query("SAVEPOINT age_orphan_probe")
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| to_store_err("savepoint age_orphan_probe", e))?;
+    match sqlx::query_as::<_, (i64,)>(SQL_COUNT_AGE_GRAPH_REGISTRY)
+        .fetch_one(&mut **tx)
+        .await
+    {
+        Ok((n,)) => {
+            sqlx::query("RELEASE SAVEPOINT age_orphan_probe")
+                .execute(&mut **tx)
+                .await
+                .map_err(|e| to_store_err("release savepoint age_orphan_probe", e))?;
+            Ok(n > 0)
+        }
+        Err(e) => {
+            sqlx::query("ROLLBACK TO SAVEPOINT age_orphan_probe")
+                .execute(&mut **tx)
+                .await
+                .map_err(|e2| to_store_err("rollback savepoint age_orphan_probe", e2))?;
+            sqlx::query("RELEASE SAVEPOINT age_orphan_probe")
+                .execute(&mut **tx)
+                .await
+                .map_err(|e2| to_store_err("release savepoint age_orphan_probe (err)", e2))?;
+            Err(to_store_err("probe ag_catalog.ag_graph (orphan check)", e))
+        }
+    }
+}
+
+/// #3883 — pool-level probe of the `memory_graph` registry row. Used by the
+/// drainer's orphan self-heal (A3) and the `doctor` `ag_graph_registered` fact
+/// (A5). Same SSOT SQL as [`age_graph_registry_present_tx`].
+pub(crate) async fn age_graph_registry_present_pool(pool: &PgPool) -> StoreResult<bool> {
+    let (n,): (i64,) = sqlx::query_as(SQL_COUNT_AGE_GRAPH_REGISTRY)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| to_store_err("probe ag_catalog.ag_graph (registered?)", e))?;
+    Ok(n > 0)
+}
+
+/// #3883 (A1/A3) — record an unreconciled inline (sync-mode) AGE projection in
+/// `kg_projection_outbox`, classifying ORPHAN vs transient. The caller has
+/// already rolled back to its projection SAVEPOINT and the relational
+/// `memory_links` row is committing in the SAME tx (the source of truth).
+///
+/// * ORPHAN ([`is_age_graph_orphan`]) — enqueue already QUARANTINED
+///   (`attempt_count = MAX`, [`AGE_GRAPH_ORPHAN_LAST_ERROR_PREFIX`] `last_error`)
+///   so the drainer does NOT burn MAX transient retries; tick
+///   `age_projection_quarantined_total` ONCE. Self-heals via the drainer once
+///   the registry is repaired.
+/// * transient — enqueue pending (`attempt_count = 0`); tick
+///   `age_projection_failed_total`.
+///
+/// Emits the structured WARN carrying the `reason` field (A5). Shared by all
+/// four inline absorb sites so their disposition cannot drift.
+async fn record_failed_age_projection(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    op: &str,
+    source_id: &str,
+    target_id: &str,
+    relation: &str,
+    err: &StoreError,
+) -> StoreResult<()> {
+    let metrics = crate::metrics::registry();
+    if is_age_graph_orphan(err) {
+        sqlx::query(SQL_ENQUEUE_KG_PROJECTION_QUARANTINED)
+            .bind(source_id)
+            .bind(target_id)
+            .bind(relation)
+            .bind(PostgresStore::MAX_AGE_PROJECTION_ATTEMPTS)
+            .bind(format!("{AGE_GRAPH_ORPHAN_LAST_ERROR_PREFIX} {err}"))
+            .execute(&mut **tx)
+            .await
+            .map_err(|e| to_store_err("enqueue quarantined kg_projection_outbox (orphan)", e))?;
+        metrics.age_projection_quarantined_total.inc();
+        tracing::warn!(
+            target: TRACE_TARGET_KG,
+            op = op,
+            source_id = %source_id,
+            target_id = %target_id,
+            relation = %relation,
+            reason = AGE_FALLBACK_REASON_GRAPH_ORPHAN,
+            error = %err,
+            "AGE graph ORPHANED (memory_graph schema present, ag_catalog.ag_graph \
+             registry row absent) on {op}: the relational memory_links row \
+             committed; the projection is enqueued QUARANTINED — a STRUCTURAL \
+             fault, not a transient one (no retry storm) — and self-heals once the \
+             AGE registry is repaired. Readers stay correct via the relational \
+             CTE. Operator action required (see docs/kg-backend-fallback.md)."
+        );
+    } else {
+        sqlx::query(SQL_ENQUEUE_KG_PROJECTION)
+            .bind(source_id)
+            .bind(target_id)
+            .bind(relation)
+            .execute(&mut **tx)
+            .await
+            .map_err(|e| to_store_err("record unreconciled kg projection", e))?;
+        metrics.age_projection_failed_total.inc();
+        tracing::warn!(
+            target: TRACE_TARGET_KG,
+            op = op,
+            source_id = %source_id,
+            target_id = %target_id,
+            relation = %relation,
+            reason = AGE_FALLBACK_REASON_UNREACHABLE,
+            error = %err,
+            "AGE projection deferred on {op} (runtime failure): relational \
+             memory_links row committed and the pending projection was RECORDED in \
+             kg_projection_outbox for reconciliation by the drainer. kg_query / \
+             kg_timeline over this edge may lag until it drains; find_paths reads \
+             memory_links via the CTE and stays correct."
+        );
+    }
+    Ok(())
 }
 
 /// Issue an `ALTER TABLE ... ADD COLUMN` only when the column is not
@@ -19558,6 +19857,40 @@ async fn ensure_memory_graph(pool: &PgPool) -> StoreResult<()> {
                 .map_err(|e| to_store_err("rollback create_age_graph savepoint", e))?;
         }
     }
+    // #3882/#3883 A6 — after tolerating the create_graph error, VERIFY the AGE
+    // registry actually carries the memory_graph row. `create_graph` raising
+    // 42P06 `schema "memory_graph" already exists` while ag_catalog.ag_graph has
+    // NO row is the ORPHAN state: create_graph can never succeed against it and
+    // every projection MERGE will fail. REPORT it loudly at boot naming the
+    // repair — never repair (the ruling: absorb + honest structural
+    // classification). The savepoint-wrapped probe keeps the tx healthy for the
+    // commit below even if the probe itself errors.
+    match age_graph_registry_present_tx(&mut tx).await {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::warn!(
+                target: TRACE_TARGET_KG_ADAPTER_DEFECT,
+                reason = AGE_FALLBACK_REASON_GRAPH_ORPHAN,
+                "AGE graph ORPHANED at boot: the `memory_graph` SCHEMA exists but its \
+                 ag_catalog.ag_graph registry row is ABSENT — create_graph cannot \
+                 succeed against an orphan schema, so every KG projection falls back \
+                 to the relational CTE and link writes quarantine their projections. \
+                 STRUCTURAL fault requiring operator repair of the AGE registry (drop \
+                 the orphan schema, then re-create the graph — see \
+                 docs/kg-backend-fallback.md). The substrate CONTINUES: the relational \
+                 memory_links store is the source of truth and readers stay correct \
+                 via the CTE. This node never repairs the registry itself."
+            );
+        }
+        Err(e) => {
+            tracing::debug!(
+                target: TRACE_TARGET_KG,
+                err = %e,
+                "ensure_memory_graph: ag_catalog.ag_graph registry probe failed \
+                 (non-fatal; NOT treated as an orphan verdict)"
+            );
+        }
+    }
     tx.commit()
         .await
         .map_err(|e| to_store_err("commit ensure_memory_graph tx", e))?;
@@ -19724,6 +20057,31 @@ async fn project_link_into_age(
                 .map_err(|err| to_store_err("release savepoint bootstrap_memory_graph", err))?;
             if !msg.contains(PG_ERR_ALREADY_EXISTS) {
                 return Err(to_store_err("create_graph memory_graph (project_link)", e));
+            }
+            // #3883 A2 — distinguish the benign 42P07 `graph already exists`
+            // (steady state) from the orphan 42P06 `schema "memory_graph" already
+            // exists`: the schema is present but its ag_catalog.ag_graph registry
+            // row is not, so create_graph can never succeed and every MERGE below
+            // fails. Probe ONLY on the orphan message shape — steady state (42P07)
+            // never probes, so zero steady-state cost. Registry row ABSENT =>
+            // structural orphan: classify with the orphan prefix so the caller
+            // enqueues QUARANTINED instead of burning MAX transient retries. A
+            // probe ERROR (permission blip / conn drop) or a present row falls
+            // through to the existing transient path — NEVER quarantine on a probe
+            // failure (the classifier may only under-report). REPORT, never repair.
+            if msg
+                .to_ascii_lowercase()
+                .contains(AGE_ORPHAN_SCHEMA_ERR_SIGNATURE)
+            {
+                if let Ok(false) = age_graph_registry_present_tx(tx).await {
+                    return Err(StoreError::BackendUnavailable {
+                        backend: "postgres".to_string(),
+                        sqlstate: None,
+                        detail: format!(
+                            "{AGE_GRAPH_ORPHAN_LAST_ERROR_PREFIX} the memory_graph schema exists but its ag_catalog.ag_graph registry row is absent — create_graph cannot succeed against an orphan schema; an operator must repair the AGE registry (docs/kg-backend-fallback.md)"
+                        ),
+                    });
+                }
             }
         }
     }
@@ -20874,6 +21232,11 @@ impl MemoryStore for PostgresStore {
     /// `memory.dequarantined` chain row, so this backend cannot silently ship
     /// the state change without the audit — the #1552 SAL-port-fanout failure
     /// mode this method is explicitly written against.
+    ///
+    /// Boids item 3 R2.5 (#3266): a CONTAMINATED row is released too — the
+    /// path is chosen by the state observed under `SELECT ... FOR UPDATE`,
+    /// never by the caller (sqlite `operator_dequarantine` twin); see
+    /// [`PostgresStore::release_contaminated_pg`].
     async fn operator_dequarantine(&self, ctx: &CallerContext, id: &str) -> StoreResult<bool> {
         self.gate_record_stop().await?;
         let mut tx = self
@@ -20881,6 +21244,19 @@ impl MemoryStore for PostgresStore {
             .begin()
             .await
             .map_err(|e| to_store_err("operator_dequarantine begin", e))?;
+        let observed: Option<(String, Option<serde_json::Value>)> =
+            sqlx::query_as(swarm_rewind::SELECT_STATE_METADATA_FOR_UPDATE)
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("operator_dequarantine read", e))?;
+        match observed {
+            Some((st, _)) if st == crate::models::LifecycleState::Quarantined.as_str() => {}
+            Some((st, meta)) if st == crate::models::LifecycleState::Contaminated.as_str() => {
+                return self.release_contaminated_pg(tx, ctx, id, meta).await;
+            }
+            _ => return Ok(false),
+        }
         let changed = sqlx::query(
             "UPDATE memories SET lifecycle_state = $1, updated_at = NOW(), \
              version = version + 1 WHERE id = $2 AND lifecycle_state = $3",
@@ -20931,7 +21307,7 @@ impl MemoryStore for PostgresStore {
         // so neither surface nor backend can skip it — the #1552 SAL-port-fanout
         // failure mode applied to the observability half.
         tracing::warn!(
-            target: "ai_memory::quarantine",
+            target: crate::storage::decontaminate::QUARANTINE_TRACE_TARGET,
             memory_id = %id,
             operator = %ctx.agent_id,
             "quarantine.operator_release: an operator RELEASED a quarantined memory back to \
@@ -23437,9 +23813,8 @@ impl MemoryStore for PostgresStore {
         // every row regardless of ownership. Tenant-facing handlers
         // MUST NOT pass a bypass context.
         // #1628 refactor — shared caller-owns gate (byte-equal wire
-        // errors; see assert_caller_owns_for_mutation).
-        self.assert_caller_owns_for_mutation(ctx, id, "update", REASON_UNSTAMPED_TENANT_WRITE)
-            .await?;
+        // errors; see assert_caller_owns_for_mutation_on). #3953 — it runs
+        // on the write tx opened below, not here on the pool.
 
         // #1726 — capture the optional lifecycle target before the binds
         // below move the rest of `patch` (LifecycleState is Copy); applied
@@ -23469,6 +23844,19 @@ impl MemoryStore for PostgresStore {
             .begin()
             .await
             .map_err(|e| to_store_err("update begin tx", e))?;
+        // #3953 — the gate of record: `FOR UPDATE` on THIS tx holds the row
+        // until commit. The UPDATE below is `WHERE id = $1` with no owner
+        // predicate, so a pool-side gate let a concurrent re-own land in
+        // between and the caller's write hit a row it no longer owned.
+        Self::assert_caller_owns_for_mutation_on(
+            &mut *tx,
+            ctx,
+            id,
+            "update",
+            REASON_UNSTAMPED_TENANT_WRITE,
+            false,
+        )
+        .await?;
 
         // Read the current title+content for the content-change check. A
         // missing row → NotFound (the tx drops / rolls back). This also
@@ -23876,7 +24264,7 @@ impl MemoryStore for PostgresStore {
         // daemons) and same gate semantics (admin paths skip via
         // `bypass_visibility`, tenant-facing handlers MUST NOT bypass).
         // #1628 refactor — shared caller-owns gate (byte-equal wire
-        // errors; see assert_caller_owns_for_mutation).
+        // errors; see assert_caller_owns_for_mutation_on).
         // #3730 — the ADDRESSED RECIPIENT may delete a message sent to it
         // (parity with the sqlite adapter; the wrapper hard-coded
         // `allow_inbox = false` for every action, so a recipient draining its
@@ -23901,22 +24289,25 @@ impl MemoryStore for PostgresStore {
         let retains = namespace
             .as_deref()
             .is_some_and(crate::visibility::inbox_delete_retains);
-        Self::assert_caller_owns_for_mutation_on(
-            &self.pool,
-            ctx,
-            id,
-            "delete",
-            REASON_UNSTAMPED_TENANT_DELETE,
-            retains,
-        )
-        .await?;
 
         // #3730 — retention policy by namespace, the twin of the sqlite
         // adapter: an inbox message is ARCHIVED through the existing
         // `archive_by_ids` path (`archive_reason = "delete"`, same owner /
         // recipient predicate, same AGE unprojection), every other row is
-        // erased below. Same predicate as the gate above, by construction.
+        // erased below.
         if retains {
+            // #3953 — ADVISORY pool pre-check: it keeps the `delete` refusal
+            // envelope for a non-recipient. The gate of record is the one
+            // `archive_by_ids` runs on its own tx (`FOR UPDATE`, inbox arm).
+            Self::assert_caller_owns_for_mutation_on(
+                &self.pool,
+                ctx,
+                id,
+                "delete",
+                REASON_UNSTAMPED_TENANT_DELETE,
+                true,
+            )
+            .await?;
             let moved = self
                 .archive_by_ids(
                     ctx,
@@ -23953,6 +24344,22 @@ impl MemoryStore for PostgresStore {
                     .begin()
                     .await
                     .map_err(|e| to_store_err("delete begin tx", e))?;
+                // #3953 — the gate of record for the IRREVERSIBLE path, on
+                // THIS tx: `SQL_DELETE_MEMORY_BY_ID` has no owner predicate,
+                // so only the probe's `FOR UPDATE` held to commit keeps a
+                // concurrent re-own from landing between check and erase.
+                // A re-own that commits first is re-read and refused here
+                // (same envelope as any mismatch; PermissionDenied is not a
+                // retryable SQLSTATE, so `retry.consider` returns it as-is).
+                Self::assert_caller_owns_for_mutation_on(
+                    &mut *tx,
+                    ctx,
+                    id,
+                    "delete",
+                    REASON_UNSTAMPED_TENANT_DELETE,
+                    false,
+                )
+                .await?;
                 let rows = pg_hard_delete_in_tx(&mut tx, id)
                     .await
                     .map_err(|e| to_store_err("delete", e))?;
@@ -24317,7 +24724,11 @@ impl MemoryStore for PostgresStore {
         keypair: Option<&crate::identity::keypair::AgentKeypair>,
     ) -> StoreResult<&'static str> {
         self.gate_record_stop().await?;
-        self.link_internal(ctx, link, keypair).await
+        let attest = self.link_internal(ctx, link, keypair).await?;
+        // Boids item 3 part 3 (R3 / A13): the sqlite #3324 auto-stamp's narrow
+        // trigger, best-effort after the edge has committed.
+        self.stamp_on_reflection_supersedes_pg(ctx, link).await;
+        Ok(attest)
     }
 
     async fn list_links(&self, namespace: Option<&str>) -> StoreResult<Vec<MemoryLink>> {
@@ -25003,8 +25414,9 @@ impl MemoryStore for PostgresStore {
                         -- #1784 — on a newer-wins federation merge, overlay the
                         -- existing row's immutable provenance keys (agent_id +
                         -- consolidation derived_from / consolidated_from_agents)
-                        -- on top of EXCLUDED so they survive the merge.
-                        (EXCLUDED.metadata || (
+                        -- on top of EXCLUDED so they survive the merge. f1 goal4 FB:
+                        -- the LOCAL node-local keys survive, a peer's never lands.
+                        ({newer_metadata} || (
                             SELECT COALESCE(jsonb_object_agg(prov.k, prov.v), '{{}}'::jsonb)
                             FROM jsonb_each(memories.metadata) AS prov(k, v)
                             -- #2941 — reserved set, lockstep-gated on crate::RESERVED_UPSERT_METADATA_KEYS.
@@ -25103,13 +25515,8 @@ impl MemoryStore for PostgresStore {
                 -- Goal open→done replicates that state; a stale push keeps
                 -- the local lifecycle. Transition legality was enforced at
                 -- the originating update site.
-                lifecycle_state = CASE
-                    WHEN EXCLUDED.updated_at > memories.updated_at
-                         OR (EXCLUDED.updated_at = memories.updated_at
-                             AND EXCLUDED.id > memories.id)
-                        THEN EXCLUDED.lifecycle_state
-                    ELSE memories.lifecycle_state
-                END,
+                -- Boids item 3 R2.1: the SAME shared twin as sqlite.
+                lifecycle_state = {lifecycle_case},
                 -- v1.0.0 #1834 — sqlite federation-merge parity: valid_from is
                 -- immutable (local genesis wins, like cid); valid_until follows
                 -- the newer-wins tiebreak so a peer that CLOSED a claim
@@ -25147,6 +25554,9 @@ impl MemoryStore for PostgresStore {
                 -- SET: the surviving local row keeps its genesis cid on a
                 -- federation-merge (preserves the local genesis pre-image).
             RETURNING id",
+            lifecycle_case =
+                crate::models::crdt_merge::lifecycle_local_taint_wins_case("EXCLUDED", "memories"),
+            newer_metadata = crate::models::crdt_merge::pg_title_slot_newer_metadata(),
             conflict_target = crate::models::TITLE_SLOT_CONFLICT_TARGET,
             unstamped_owner_drop =
                 crate::identity::owner_stamp::pg_upsert_unstamped_owner_drop(
@@ -25332,14 +25742,28 @@ impl MemoryStore for PostgresStore {
         // row matches by id, fall through to `apply_remote_memory` (the
         // postgres `insert_if_newer` twin) for the fresh-insert +
         // (title, namespace) dedup-upsert LWW path.
-        let existing_row = sqlx::query(&SQL_SELECT_MEMORY_ROW_BY_ID)
+        //
+        // f1 goal4 FA (#3266, GOD ruling): the read and the write share ONE
+        // transaction. The row is read `FOR UPDATE` inside it and the lock is
+        // held to commit, so the merge (and its local-wins lifecycle predicate)
+        // is computed from the row actually being overwritten — a local rewind
+        // or release that commits while this peer write is in flight is either
+        // seen here or waits for it; never undone from a stale snapshot.
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("merge_inbound begin tx", e))?;
+        let existing_row = sqlx::query(&SQL_SELECT_MEMORY_ROW_BY_ID_FOR_UPDATE)
             .bind(&inbound.id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *tx)
             .await
             .map_err(|e| to_store_err("merge_inbound select by id", e))?;
 
         let Some(row) = existing_row else {
-            // No row by this id — defer to the unchanged LWW path.
+            // No row by this id — defer to the unchanged LWW path (the empty
+            // transaction is rolled back on drop).
+            drop(tx);
             return self.apply_remote_memory(ctx, inbound).await;
         };
 
@@ -25417,80 +25841,60 @@ impl MemoryStore for PostgresStore {
         // `update()` seal at ~4947.
         // Full-row UPDATE by id — every column is written verbatim from
         // the already-resolved merged row (NO CASE / GREATEST / COALESCE
-        // re-application; `merge_memory` resolved every field). Wrapped in
-        // a transaction so the read-merge-write is atomic.
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| to_store_err("merge_inbound begin tx", e))?;
+        // re-application; `merge_memory` resolved every field), in the SAME
+        // transaction that holds the row lock (f1 goal4 FA). The node-local
+        // metadata keys are overlaid from the locked row by an atomic jsonb
+        // merge (`pg_node_local_overlay`), never from a copy.
         let (merge_content, merge_envelope) = seal_content_for_insert(&mut *tx, &merged).await?;
-        sqlx::query(
-            "UPDATE memories SET
-                tier = $2, namespace = $3, title = $4, content = $5, tags = $6,
-                priority = $7, confidence = $8, source = $9, access_count = $10,
-                created_at = $11, updated_at = $12, last_accessed_at = $13,
-                expires_at = $14, metadata = $15, reflection_depth = $16,
-                memory_kind = $17, citations = $18, source_uri = $19,
-                source_span = $20, confidence_source = $21, confidence_signals = $22,
-                confidence_decayed_at = $23, entity_id = $24, persona_version = $25,
-                version = $26, mentioned_entity_id = $27, lifecycle_state = $28,
-                valid_from = $29, valid_until = $30,
-                -- #2292 — the sealed envelope is written in lockstep with
-                -- `content = $5` (both come from the already-resolved `merged`
-                -- row); an encryption-off merge writes plaintext + NULL,
-                -- clearing any stale ciphertext.
-                encrypted_envelope = $31
-             WHERE id = $1",
-        )
-        .bind(&merged.id)
-        .bind(merged.tier.as_str())
-        .bind(&merged.namespace)
-        .bind(&merged.title)
-        // #2292 — sealed placeholder ("" under an enabled gate, else content).
-        .bind(&merge_content)
-        .bind(&tags_json)
-        .bind(merged.priority)
-        .bind(merged.confidence)
-        .bind(&merged.source)
-        .bind(merged.access_count)
-        .bind(created_at)
-        .bind(updated_at)
-        .bind(last_accessed_at)
-        .bind(expires_at)
-        .bind(&merged.metadata)
-        .bind(merged.reflection_depth)
-        .bind(merged.memory_kind.as_str())
-        .bind(&citations_json)
-        .bind(merged.source_uri.as_ref())
-        .bind(source_span_json.as_deref())
-        .bind(merged.confidence_source.as_str())
-        .bind(confidence_signals_json.as_deref())
-        .bind(confidence_decayed_at)
-        .bind(merged.entity_id.as_ref())
-        .bind(merged.persona_version)
-        .bind(merged.version)
-        .bind(mentioned_entity_id.as_deref())
-        .bind(merged.lifecycle_state.as_str())
-        // #2207 — the #1834 claim-bitemporal VALID-time interval (TEXT
-        // RFC3339). The same-`id` federation merge lane MUST persist the
-        // merged `valid_until` so a peer that CLOSED a claim replicates the
-        // close by id (newer-wins in `merge_memory`) → replicas converge on
-        // VALID-time. `valid_from` is local-immutable in `merge_memory`; the
-        // overwrite is a no-op (matches the `apply_remote_memory` upsert
-        // arm's `valid_from = memories.valid_from` genesis-wins rule).
-        // Canonicalized to the fixed UTC rendering (pre-ship 3x7).
-        .bind(crate::validate::canonical_valid_time_opt(
-            merged.valid_from.as_deref(),
-        ))
-        .bind(crate::validate::canonical_valid_time_opt(
-            merged.valid_until.as_deref(),
-        ))
-        // #2292 — sealed ciphertext envelope ($31); NULL when encryption off.
-        .bind(merge_envelope)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| to_store_err("merge_inbound full-row update", e))?;
+        sqlx::query(&SQL_MERGE_INBOUND_FULL_ROW_UPDATE)
+            .bind(&merged.id)
+            .bind(merged.tier.as_str())
+            .bind(&merged.namespace)
+            .bind(&merged.title)
+            // #2292 — sealed placeholder ("" under an enabled gate, else content).
+            .bind(&merge_content)
+            .bind(&tags_json)
+            .bind(merged.priority)
+            .bind(merged.confidence)
+            .bind(&merged.source)
+            .bind(merged.access_count)
+            .bind(created_at)
+            .bind(updated_at)
+            .bind(last_accessed_at)
+            .bind(expires_at)
+            .bind(&merged.metadata)
+            .bind(merged.reflection_depth)
+            .bind(merged.memory_kind.as_str())
+            .bind(&citations_json)
+            .bind(merged.source_uri.as_ref())
+            .bind(source_span_json.as_deref())
+            .bind(merged.confidence_source.as_str())
+            .bind(confidence_signals_json.as_deref())
+            .bind(confidence_decayed_at)
+            .bind(merged.entity_id.as_ref())
+            .bind(merged.persona_version)
+            .bind(merged.version)
+            .bind(mentioned_entity_id.as_deref())
+            .bind(merged.lifecycle_state.as_str())
+            // #2207 — the #1834 claim-bitemporal VALID-time interval (TEXT
+            // RFC3339). The same-`id` federation merge lane MUST persist the
+            // merged `valid_until` so a peer that CLOSED a claim replicates the
+            // close by id (newer-wins in `merge_memory`) → replicas converge on
+            // VALID-time. `valid_from` is local-immutable in `merge_memory`; the
+            // overwrite is a no-op (matches the `apply_remote_memory` upsert
+            // arm's `valid_from = memories.valid_from` genesis-wins rule).
+            // Canonicalized to the fixed UTC rendering (pre-ship 3x7).
+            .bind(crate::validate::canonical_valid_time_opt(
+                merged.valid_from.as_deref(),
+            ))
+            .bind(crate::validate::canonical_valid_time_opt(
+                merged.valid_until.as_deref(),
+            ))
+            // #2292 — sealed ciphertext envelope ($31); NULL when encryption off.
+            .bind(merge_envelope)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("merge_inbound full-row update", e))?;
         // APPEND-ONLY-SANCTIONED (#1823 G6) — COW SUPERSEDE: the federation
         // LWW full-row overwrite rewrites content in place (same id); the
         // pre-merge content lives in the merge snapshot, never in the leaf.
@@ -25599,7 +26003,19 @@ impl MemoryStore for PostgresStore {
                         .execute(&mut *tx)
                         .await
                         .map_err(|e2| to_store_err("rollback savepoint age_link_projection", e2))?;
-                    warn_age_fallback("apply_remote_link", &link.source_id, &e);
+                    // #3883 (A1) — was WARN-only; now RECORD the unreconciled
+                    // projection (orphan => quarantined, transient => pending) so
+                    // a federated relay's committed edge is not silently dropped
+                    // from AGE forever.
+                    record_failed_age_projection(
+                        &mut tx,
+                        "apply_remote_link",
+                        &link.source_id,
+                        &link.target_id,
+                        link.relation.as_str(),
+                        &e,
+                    )
+                    .await?;
                 }
                 Err(e) => return Err(e),
             }
@@ -25774,8 +26190,8 @@ impl MemoryStore for PostgresStore {
             "SELECT {cols},
                     ts_rank(tsv, to_tsquery('english', $1))
                     + (priority * 0.5)
-                    + (LEAST(access_count, 50) * 0.1)
-                    + (confidence * 2.0)
+                    + (LEAST(access_count, {cap}) * 0.1)
+                    + (CASE WHEN confidence_source = 'default' OR confidence_source IS NULL THEN 0.5 ELSE confidence END * 2.0)
                     + CASE tier
                           WHEN 'long' THEN 3.0
                           WHEN 'mid'  THEN 1.0
@@ -25812,6 +26228,7 @@ impl MemoryStore for PostgresStore {
             // v1.0.0 #2585 — explicit projection (see MEMORY_READ_COLUMNS).
             cols = MEMORY_READ_COLUMNS,
             lifecycle_vis = crate::models::lifecycle_visible_clause(""),
+            cap = crate::models::ACCESS_SCORE_CAP,
         ))
         .bind(&or_tsquery)
         .bind(filter.namespace.as_ref())
@@ -25991,7 +26408,11 @@ impl MemoryStore for PostgresStore {
                     0.50 - 0.35 * ((cl - 500.0) / 4500.0)
                 };
                 let blended = semantic_weight * cosine + (1.0 - semantic_weight) * norm_fts;
-                (mem, blended)
+                // #3927 — the G7 soft-loser down-weight on the FUSED score,
+                // the sqlite hybrid twin's placement (#2338): an FTS-pool-only
+                // SQL penalty would leave the loser fully ranked via cosine.
+                let penalty = crate::storage::soft_loser_penalty(&mem.metadata);
+                (mem, blended * penalty)
             })
             .collect();
 
@@ -26394,57 +26815,36 @@ impl MemoryStore for PostgresStore {
         //   * expires_at — extension FLOOR per tier (#1607, the
         //     postgres twin of the sqlite #1596 fix):
         //     GREATEST(expires_at, NOW() + window) with 1h short /
-        //     1d mid windows (cleared when a mid→long promotion
-        //     fires this round). An access can extend a row's life
+        //     1d mid windows. An access can extend a row's life
         //     but can never move its expiry EARLIER — the pre-#1607
         //     replacement form pulled a fresh mid-tier row's +7d
         //     create-time backstop in to now+1d on first recall.
-        //   * tier — auto-promote mid → long once access_count + 1
-        //     would land at or above PROMOTION_THRESHOLD (5)
-        //   * updated_at — bumped only when the tier flip actually
-        //     fires, matching the original two-statement contract
-        //   * priority — bumped by 1 (capped at 10) every 10th
-        //     touch, evaluated against the post-increment / capped
-        //     access_count to remain bit-identical with the original
-        //     two-statement sequence even at the 1_000_000 ceiling
+        //   * tier / updated_at / priority — NO LONGER TOUCHED.
+        //     v1.0.0 Boids item 1 (5-agent vote 4d3ea1c5) removed the
+        //     mid→long auto-promotion, the promotion updated_at rewrite
+        //     and the priority decade ladder from this recall MAINTENANCE
+        //     verb (sqlite touch/touch_many/fold parity): recall
+        //     popularity can no longer rewrite a row's tier, recency or
+        //     priority. `memory_promote` is the sole tier-raising verb.
         //
         // All CASE predicates read the pre-UPDATE row values per the
         // SQL standard (RHS of SET evaluates against the OLD row),
         // so the `access_count + 1` / `LEAST(...)` arithmetic
         // mirrors what the original ordered sequence saw.
-        sqlx::query(&format!(
+        sqlx::query(
             "UPDATE memories SET
                 access_count = LEAST(access_count + 1, 1000000),
                 last_accessed_at = NOW(),
                 expires_at = CASE
-                    WHEN tier = 'mid' AND access_count + 1 >= 5 THEN NULL
                     WHEN tier = 'long' THEN expires_at
                     WHEN tier = 'short' AND expires_at IS NOT NULL
                         THEN GREATEST(expires_at, NOW() + INTERVAL '1 hour')
                     WHEN tier = 'mid' AND expires_at IS NOT NULL
                         THEN GREATEST(expires_at, NOW() + INTERVAL '1 day')
                     ELSE expires_at
-                END,
-                tier = CASE
-                    WHEN tier = 'mid' AND access_count + 1 >= 5 THEN 'long'
-                    ELSE tier
-                END,
-                updated_at = CASE
-                    WHEN tier = 'mid' AND access_count + 1 >= 5 THEN NOW()
-                    ELSE updated_at
-                END,
-                priority = CASE
-                    WHEN LEAST(access_count + 1, 1000000) > 0
-                         AND LEAST(access_count + 1, 1000000) % 10 = 0
-                         AND priority < {ceiling}
-                        THEN LEAST(priority + 1, {ceiling})
-                    ELSE priority
                 END
              WHERE id = ANY($1)",
-            // v1.0.0 #2339 (FBL-34) — access bumps stop at the named
-            // ceiling (sqlite touch/touch_many parity).
-            ceiling = crate::models::ACCESS_PRIORITY_CEILING,
-        ))
+        )
         .bind(ids)
         .execute(&self.pool)
         .await
@@ -28728,7 +29128,16 @@ impl MemoryStore for PostgresStore {
                                             e2,
                                         )
                                     })?;
-                                warn_age_fallback_pair("consolidate_lineage_edge", &new_id, id, &e);
+                                // #3883 (A1) — was WARN-only; now RECORD.
+                                record_failed_age_projection(
+                                    &mut tx,
+                                    "consolidate_lineage_edge",
+                                    &new_id,
+                                    id,
+                                    crate::models::MemoryLinkRelation::DerivedFrom.as_str(),
+                                    &e,
+                                )
+                                .await?;
                             }
                             Err(e) => {
                                 sqlx::query("ROLLBACK TO SAVEPOINT age_consolidate_projection")
@@ -29035,7 +29444,7 @@ impl MemoryStore for PostgresStore {
             // verb applying metadata-only access bookkeeping (the same
             // sanction class as the legacy touch); it never rewrites
             // memory content.
-            let folded_ids: Vec<String> = sqlx::query_scalar(&format!(
+            let folded_ids: Vec<String> = sqlx::query_scalar(
                 "WITH batch AS (
                     SELECT memory_id
                       FROM recall_observations
@@ -29058,37 +29467,20 @@ impl MemoryStore for PostgresStore {
                 )
                 UPDATE memories m SET
                     access_count = LEAST(m.access_count + a.n, 1000000),
-                    priority = CASE WHEN m.priority >= {ceiling} THEN m.priority
-                        ELSE LEAST(m.priority
-                            + (LEAST(m.access_count + a.n, 1000000) / 10
-                               - m.access_count / 10)::int, {ceiling}) END,
                     last_accessed_at = GREATEST(
                         COALESCE(m.last_accessed_at, a.t_max), a.t_max),
                     expires_at = CASE
-                        WHEN m.tier = 'mid' AND m.access_count + a.n >= 5 THEN NULL
                         WHEN m.tier = 'long' THEN m.expires_at
                         WHEN m.tier = 'short' AND m.expires_at IS NOT NULL
                             THEN GREATEST(m.expires_at, a.t_max + INTERVAL '1 hour')
                         WHEN m.tier = 'mid' AND m.expires_at IS NOT NULL
                             THEN GREATEST(m.expires_at, a.t_max + INTERVAL '1 day')
                         ELSE m.expires_at
-                    END,
-                    tier = CASE
-                        WHEN m.tier = 'mid' AND m.access_count + a.n >= 5 THEN 'long'
-                        ELSE m.tier
-                    END,
-                    updated_at = CASE
-                        WHEN m.tier = 'mid' AND m.access_count + a.n >= 5 THEN NOW()
-                        ELSE m.updated_at
                     END
                  FROM agg a
                  WHERE m.id = a.memory_id
                 RETURNING m.id",
-                // v1.0.0 #2339 (FBL-34) — the fold's decade bump stops at
-                // the named ceiling (sqlite fold_recall_accesses parity);
-                // rows already above it keep their priority byte-identical.
-                ceiling = crate::models::ACCESS_PRIORITY_CEILING,
-            ))
+            )
             .bind(chunk_limit)
             .fetch_all(&self.pool)
             .await
@@ -29126,6 +29518,31 @@ impl MemoryStore for PostgresStore {
             self.gate_record_stop().await?;
         }
         self.reown_pg(ctx, namespace, to_id, select, dry_run).await
+    }
+
+    async fn swarm_rewind(
+        &self,
+        ctx: &CallerContext,
+        root_id: &str,
+        max_depth: usize,
+        target_kind: &str,
+        freeze_routine_ids: &[String],
+        dry_run: bool,
+    ) -> StoreResult<crate::storage::SwarmRewindReport> {
+        // Boids item 3 (#3266) — gate taken HERE and in the submodule, the
+        // `reown` shape (B8 parity scan reads this file, B7 the write site).
+        if !dry_run {
+            self.gate_record_stop().await?;
+        }
+        self.swarm_rewind_pg(
+            ctx,
+            root_id,
+            max_depth,
+            target_kind,
+            freeze_routine_ids,
+            dry_run,
+        )
+        .await
     }
 
     async fn action_create(
@@ -31194,19 +31611,16 @@ impl MemoryStore for PostgresStore {
                                                 e2,
                                             )
                                         })?;
-                                    tracing::warn!(
-                                        target: TRACE_TARGET_KG,
-                                        source_id = %src,
-                                        target_id = %dst,
-                                        relation = %rel,
-                                        err = %e,
-                                        "AGE projection skipped on archive_restore — \
-                                         relational memory_links row still committed. \
-                                         kg_query/kg_timeline over this edge may see a \
-                                         stale AGE projection until it is rebuilt; \
-                                         find_paths reads memory_links via the CTE and \
-                                         stays correct."
-                                    );
+                                    // #3883 (A1) — was WARN-only; now RECORD.
+                                    record_failed_age_projection(
+                                        &mut tx,
+                                        "archive_restore",
+                                        src,
+                                        dst,
+                                        rel,
+                                        &e,
+                                    )
+                                    .await?;
                                 }
                                 Err(e) => return Err(e),
                             }
@@ -36784,7 +37198,57 @@ mod tests {
             TRACE_TARGET_KG_ADAPTER_DEFECT,
             "store::postgres::kg::adapter_defect"
         );
+        // #3883 — the THIRD reason class + its outbox last_error prefix.
+        assert_eq!(AGE_FALLBACK_REASON_GRAPH_ORPHAN, "age_graph_orphan");
+        assert_eq!(AGE_GRAPH_ORPHAN_LAST_ERROR_PREFIX, "age_graph_orphan:");
+        assert_ne!(
+            AGE_FALLBACK_REASON_GRAPH_ORPHAN,
+            AGE_FALLBACK_REASON_UNREACHABLE
+        );
+        assert_ne!(
+            AGE_FALLBACK_REASON_GRAPH_ORPHAN,
+            AGE_FALLBACK_REASON_STATEMENT_DEFECT
+        );
         assert!(TRACE_TARGET_KG_ADAPTER_DEFECT.starts_with(TRACE_TARGET_KG));
+    }
+
+    #[test]
+    fn issue_3883_orphan_classifier_distinguishes_shapes() {
+        // #3883 — the orphan classifier is a THIRD class that must never be
+        // folded into the substrate-unreachable or adapter-defect classes (the
+        // #2511 "may only under-report" discipline). sqlite-free unit pin so the
+        // Linux sal-postgres lanes measure it without a live database.
+        let mk = |detail: &str| StoreError::BackendUnavailable {
+            backend: "postgres".to_string(),
+            sqlstate: None,
+            detail: detail.to_string(),
+        };
+
+        // An orphan-classified error (carries the prefix project_link stamps).
+        let orphan = mk(&format!(
+            "{AGE_GRAPH_ORPHAN_LAST_ERROR_PREFIX} the memory_graph schema exists but \
+             its ag_catalog.ag_graph registry row is absent"
+        ));
+        assert!(is_age_graph_orphan(&orphan));
+        assert!(is_age_runtime_failure(&orphan)); // still a BackendUnavailable
+        assert!(
+            !is_age_adapter_statement_defect(&orphan),
+            "orphan must not be folded into the adapter-defect class"
+        );
+
+        // A plain substrate outage is NOT an orphan.
+        let outage = mk("begin age tx: pool timed out while waiting for a connection");
+        assert!(!is_age_graph_orphan(&outage));
+
+        // An adapter statement defect is NOT an orphan.
+        let defect = mk("cypher kg_query: third argument of cypher function must be a parameter");
+        assert!(!is_age_graph_orphan(&defect));
+        assert!(is_age_adapter_statement_defect(&defect));
+
+        // A non-BackendUnavailable error is never an orphan.
+        assert!(!is_age_graph_orphan(&StoreError::InvalidInput {
+            detail: format!("{AGE_GRAPH_ORPHAN_LAST_ERROR_PREFIX} not a backend error"),
+        }));
     }
 
     #[test]

@@ -5,8 +5,10 @@
 //!
 //! The WAL read-pool change splits HTTP recall into two phases: the
 //! FTS5/HNSW SELECT runs on a read-only pool connection (PHASE 1) and the
-//! authoritative `touch_many` (access-count bump + mid→long promotion +
-//! TTL floor-extension) runs on the writer connection (PHASE 2). The
+//! authoritative `touch_many` (access-count bump + TTL floor-extension;
+//! v1.0.0 Boids item 1 (5-agent vote 4d3ea1c5) removed the mid→long
+//! promotion + priority ladder) runs on the writer connection (PHASE 2).
+//! The
 //! enabler is that `touch_many` no-ops on a connection with
 //! `PRAGMA query_only = ON` (the read-pool posture) so the read phase
 //! performs no writes.
@@ -17,9 +19,9 @@
 //!
 //!  1. `touch_many` on a read-only connection is a NO-OP — `access_count`
 //!     is unchanged (the PHASE 1 skip).
-//!  2. `touch_many` on the writer connection applies the FULL ladder —
-//!     `access_count` 4→5, `tier` mid→long at `PROMOTION_THRESHOLD`,
-//!     `expires_at` cleared on promotion (the PHASE 2 authoritative touch).
+//!  2. `touch_many` on the writer connection bumps `access_count` 4→5 and
+//!     floor-extends `expires_at`, but (post-R2) does NOT promote the mid
+//!     row or bump priority (the PHASE 2 authoritative touch).
 //!  3. A full `recall` dispatched on the read-only connection still
 //!     RETURNS the row (the SELECT works) but does NOT touch it — proving
 //!     the read phase is write-free end-to-end.
@@ -88,8 +90,9 @@ fn touch_many_noop_on_readonly_then_full_ladder_on_writer() {
         "tier must be unchanged on the read phase"
     );
 
-    // PHASE 2 — writer connection: the authoritative touch applies the
-    // full ladder (bump 4→5, then mid→long promotion at the threshold).
+    // PHASE 2 — writer connection: the authoritative touch bumps
+    // access_count and floor-extends the TTL, but (post-R2) does NOT
+    // escalate tier or priority.
     let touched = ai_memory::storage::touch_many(&writer, &["m1"], SHORT_EXTEND, MID_EXTEND)
         .expect("touch_many on writer");
     assert_eq!(touched, 1, "writer touch_many reports one row");
@@ -100,8 +103,8 @@ fn touch_many_noop_on_readonly_then_full_ladder_on_writer() {
     );
     assert_eq!(
         read_tier(&writer, "m1"),
-        "long",
-        "writer touch must promote mid→long at PROMOTION_THRESHOLD (access_count >= 5)"
+        "mid",
+        "R2: writer touch no longer promotes mid→long at the historical threshold"
     );
     let expires_at: Option<String> = writer
         .query_row("SELECT expires_at FROM memories WHERE id = 'm1'", [], |r| {
@@ -109,8 +112,8 @@ fn touch_many_noop_on_readonly_then_full_ladder_on_writer() {
         })
         .expect("read expires_at");
     assert!(
-        expires_at.is_none(),
-        "promotion to long clears expires_at (got {expires_at:?})"
+        expires_at.is_some(),
+        "R2: mid row keeps a non-NULL expiry (no promotion clear); TTL floor-extends (got {expires_at:?})"
     );
 }
 
