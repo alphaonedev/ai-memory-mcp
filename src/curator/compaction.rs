@@ -1578,6 +1578,8 @@ mod tests {
                 assert!(!report.errors.is_empty());
                 let mut filter = crate::store::Filter::new();
                 filter.namespace = Some(namespace.clone());
+                // Ask for one extra row so an unexpected summary is observable.
+                filter.limit = candidates.len() + 1;
                 assert_eq!(
                     store.list(&ctx, &filter).await.unwrap().len(),
                     2,
