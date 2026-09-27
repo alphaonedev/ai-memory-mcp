@@ -231,6 +231,18 @@ collect_sites () {
                 fi
                 literal="${literal##*::}"
             fi
+            if [[ -z "${literal}" ]]; then
+                # #3965 follow-up (Codex review): the regexes above cannot
+                # read an argument that contains parentheses or starts with a
+                # quote but is not a bare literal (`caller.clone()`,
+                # `"x".to_owned()`), and the call used to be DISCARDED: a new
+                # privacy-bypass site that never reached the count. Read the
+                # real argument with a paren-balanced parser instead; a call it
+                # still cannot read is keyed `<unparsed>`, so it HARD-BLOCKs
+                # rather than vanishing (fail closed).
+                literal="$(python3 "${ROOT}/scripts/tests/c8-arg-extract-3965.py" "$f" "$lineno" "${pattern}")"
+                literal="${literal:-<unparsed>}"
+            fi
             if [[ -n "${literal}" ]]; then
                 # Strip the absolute prefix so the allowlist is
                 # repo-root-relative (and stable across checkouts).

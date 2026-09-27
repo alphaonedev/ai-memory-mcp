@@ -104,3 +104,19 @@ src/handlers/links.rs:caller:1
 # did not detect this call site; #3623 restored that coverage, which is what
 # this entry records.
 src/store/postgres.rs:GOVERNANCE_INTERNAL:1
+
+# #3965 follow-up (Codex review, 2026-09-27) — two PRE-EXISTING sites the gate
+# never counted: their argument (`x.clone()`) defeated the old extractor, so the
+# call was discarded. Recorded here as reviewed exceptions now that the gate sees
+# them; neither is new code.
+# `ai-memory quarantine release` (CLI-only, sal build): an OPERATOR admin lane.
+# Quarantined rows are hidden from tenant visibility, so release must bypass the
+# scope filter; reaching the verb requires the store credentials, and the recorded
+# actor is the resolved CLI principal (`resolve_agent_id`), never request data.
+src/cli/quarantine.rs:agent_id.clone():1
+# #1804 postgres `kg_timeline` per-TARGET visibility filter: each target row is
+# read with this context only to decide whether the caller may see the event, and
+# an event is kept only when `visibility::is_readable_on_query` passes for the
+# caller. Nothing it reads is returned directly. Tracked for review (#3982):
+# a caller-scoped read may reach the same verdict without the bypass.
+src/handlers/kg.rs:caller.clone():1

@@ -68,6 +68,18 @@ for gate in gates:
                 ('store/postgres.rs', '\n' * 31499 + site.replace('GOVERNANCE_INTERNAL', 'DAEMON_PRINCIPAL'), True, 'DAEMON_PRINCIPAL'),
                 ('cli/agents.rs', daemon + '\n' + daemon, False, 'DAEMON_PRINCIPAL'),
                 ('cli/agents.rs', daemon + '\n' + daemon + '\n' + daemon, True, 'DAEMON_PRINCIPAL'),
+                # #3965 follow-up (Codex review): an argument the old regexes
+                # could not read made the call DISAPPEAR before counting, so a
+                # NEW tenant-side site in an approved file passed. Each form
+                # below is a NEW site in handlers/links.rs, whose allowlist
+                # entry is `src/handlers/links.rs:caller:1`.
+                ('handlers/links.rs', '    let c = CallerContext::for_admin(caller.clone());', True, 'caller.clone()'),
+                ('handlers/links.rs', '    let c = CallerContext::for_admin("ai:review-tenant".to_owned());', True, 'to_owned()'),
+                ('handlers/links.rs', '    let c = CallerContext::for_admin(\n        make_caller(a, b),\n    );', True, 'make_caller'),
+                ('handlers/links.rs', '    let c = CallerContext::for_admin(', True, '<unparsed>'),
+                # Control: the ONE approved `caller` site stays clean, so the
+                # cells above are not passing by blocking everything.
+                ('handlers/links.rs', '    let c = CallerContext::for_admin(&caller);', False, 'caller'),
             ]
         else:
             cases = [(name, source, blocked, marker) for name, source, blocked in cases]

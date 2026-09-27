@@ -1207,7 +1207,11 @@ purpose, so a moved site is the same reviewed site. Residual, stated:
 the count is per FILE, so a SWAP (remove an approved site, add one of the
 same literal elsewhere in the same file, the #3638 relocation shape) keeps
 the count and passes; keying by enclosing function is the follow-up #3970. An
-entry without a count is refused. `--update` rewrites only the entry lines and keeps every
+entry without a count is refused. Every constructor call is counted
+whatever its argument spelling: an argument the regexes cannot read
+(`caller.clone()`, `"x".to_owned()`) is read by a paren-balanced parser,
+and a call that still cannot be read is keyed `<unparsed>` and blocks
+(fail closed; before this a call with such an argument was DISCARDED). `--update` rewrites only the entry lines and keeps every
 justification comment. The job runs `--self-test` too, which includes the
 #3623 production-boundary cases for the counted contract.
 
