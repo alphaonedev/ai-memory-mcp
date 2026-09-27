@@ -89,6 +89,12 @@ pub const ARCHIVE_REASON_DELETE: &str = "delete";
 /// or `archive_stats` report must not be able to tell the two backends apart,
 /// which is the exact drift `ARCHIVE_REASON_DEFAULT` above was minted to close.
 pub const ARCHIVE_REASON_SYNC_PUSH: &str = "sync_push";
+
+/// #1773 / #3961 — `archive_reason` for the pre-merge snapshot a federation
+/// LWW full-row overwrite takes on BOTH backends (sqlite
+/// `overwrite_full_row_by_id`, postgres `merge_inbound`). One spelling, so the
+/// two backends cannot drift on the reason `archive list` shows.
+pub const ARCHIVE_REASON_FEDERATION_MERGE: &str = "federation_merge";
 /// `atomisation_archived_at` — wire/row field name.
 pub const ATOMISATION_ARCHIVED_AT: &str = "atomisation_archived_at";
 /// `atom_count` — wire/row field name.

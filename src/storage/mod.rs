@@ -18737,7 +18737,7 @@ fn overwrite_full_row_by_id(conn: &Connection, mem: &Memory) -> Result<()> {
     // copy instead of permanently discarding prior local content. INSERT OR
     // REPLACE so a repeated merge of the same id is idempotent; archives the
     // CURRENT row (incl its encrypted_envelope) before the UPDATE below.
-    archive_memory_insert_only(conn, &mem.id, "federation_merge")?;
+    archive_memory_insert_only(conn, &mem.id, field_names::ARCHIVE_REASON_FEDERATION_MERGE)?;
 
     let tags_json = serde_json::to_string(&mem.tags)?;
     let metadata_json = serde_json::to_string(&mem.metadata)?;
