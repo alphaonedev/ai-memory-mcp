@@ -643,7 +643,10 @@ fn test_auto_atomise_above_threshold_triggers() {
 
     // Wait up to 3s for the worker thread to land (100ms initial
     // sleep + DB open + curator + per-atom write).
-    let ok = wait_until(Duration::from_secs(3), || {
+    // #3976 — a generous CEILING, not a delay: `wait_until` returns as soon
+    // as the worker has atomised the row. 3 s flaked under self-hosted
+    // runner load (2 of 4 attempts on PR #3931).
+    let ok = wait_until(Duration::from_secs(30), || {
         read_atomised_into(&conn, &mem.id)
             .map(|n| n > 0)
             .unwrap_or(false)
@@ -794,7 +797,10 @@ fn test_auto_atomise_inheritance() {
         "expected Enqueued via ancestor inheritance, got {outcome:?}"
     );
 
-    let ok = wait_until(Duration::from_secs(3), || {
+    // #3976 — a generous CEILING, not a delay: `wait_until` returns as soon
+    // as the worker has atomised the row. 3 s flaked under self-hosted
+    // runner load (2 of 4 attempts on PR #3931).
+    let ok = wait_until(Duration::from_secs(30), || {
         read_atomised_into(&conn, &mem.id)
             .map(|n| n > 0)
             .unwrap_or(false)
