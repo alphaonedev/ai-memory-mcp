@@ -258,6 +258,8 @@ mod tests {
 
     #[test]
     fn test_auto_namespace_in_git_repo() {
+        // auto_namespace() reads the process cwd (an indirect reader, #4016).
+        let _cwd = crate::test_support::cwd_lock();
         // The worktree DOES have a git origin; this should yield a
         // repo-name-like value (non-empty). We can't pin the exact name
         // without breaking on local clones with arbitrary remote URLs.
@@ -267,6 +269,8 @@ mod tests {
 
     #[test]
     fn test_auto_namespace_no_git_uses_dirname() {
+        // auto_namespace() reads the process cwd (an indirect reader, #4016).
+        let _cwd = crate::test_support::cwd_lock();
         // Run inside a git-free temp dir. Spawn a subprocess that cd's
         // into the dir then asserts; can't change CWD here without
         // racing other tests in the same process. Simpler: just assert
@@ -277,6 +281,8 @@ mod tests {
 
     #[test]
     fn test_auto_namespace_falls_back_to_global() {
+        // auto_namespace() reads the process cwd (an indirect reader, #4016).
+        let _cwd = crate::test_support::cwd_lock();
         // The "global" literal is the last-resort branch. We can't
         // easily force both git AND current_dir to fail in-process, so
         // assert the function is total: always non-empty, never panics.
