@@ -36,7 +36,7 @@ Spans do **not** contain memory content, embeddings, prompts, recall results, or
 
 `ai-memory` makes one binding commitment about telemetry that distinguishes it from competing memory stacks and most observability libraries:
 
-> **No outbound network connection is initiated by the binary except to destinations the operator has explicitly configured.**
+> **No outbound network connection is initiated by the binary except to destinations the operator has explicitly configured, plus the one-time HuggingFace model download described below, which the default `semantic` tier performs on first start.**
 
 That means:
 
@@ -44,7 +44,7 @@ That means:
 - **No third-party SaaS sinks compiled in.** There is no Datadog client, no Honeycomb client, no Sentry hook, and no PostHog beacon in the binary. Adding one is an operator choice via the file-logging path or a custom hook.
 - **`RUST_LOG` controls verbosity, not destination.** Setting `RUST_LOG=ai_memory=debug` increases what the binary records to stderr or your configured file sink. It does not change where logs go.
 
-If you build with default Cargo features, the only outbound network calls the binary can make are: (a) federation push/pull to peers on your mTLS allowlist, (b) embedder fetches from HuggingFace if you have explicitly enabled the smart tier, and (c) LLM completions to your configured Ollama endpoint if you have enabled the autonomous tier. All three are off by default and named in the verbose `ai-memory doctor` report.
+If you build with default Cargo features, the only outbound network calls the binary can make are: (a) federation push/pull to peers on your mTLS allowlist, (b) model downloads from HuggingFace, and (c) LLM calls to your configured Ollama endpoint if you have enabled the `smart` or `autonomous` tier. (a) and (c) are off by default. **(b) is on by default:** the default `semantic` tier downloads the all-MiniLM-L6-v2 embedder weights from HuggingFace on first start when they are not already in the local HuggingFace cache (the `autonomous` tier also fetches its cross-encoder reranker the same way). The download is skipped under the `keyword` tier, or when `AI_MEMORY_EMBED_OFFLINE=1` or `HF_HUB_OFFLINE=1` is set. The weights are cached under `~/.cache/huggingface/`, so later starts do not need network access for it (see [INSTALL, Network Requirements](INSTALL.md#network-requirements)).
 
 ---
 
