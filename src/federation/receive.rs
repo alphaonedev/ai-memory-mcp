@@ -462,6 +462,20 @@ pub fn spawn_catchup_loop_with_store(
     })
 }
 
+/// Drive one production apply window for deterministic integration regressions.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub async fn catchup_apply_once_for_tests(
+    config: &FederationConfig,
+    db: &crate::handlers::Db,
+    #[cfg(feature = "sal")] store: Option<&std::sync::Arc<dyn crate::store::MemoryStore>>,
+) {
+    #[cfg(feature = "sal")]
+    catchup_once_with_store(config, db, store).await;
+    #[cfg(not(feature = "sal"))]
+    catchup_once_legacy(config, db).await;
+}
+
 /// Legacy two-arg wrapper preserved so existing tests + non-SAL builds
 /// keep dispatching through the sqlite path. Postgres-backed daemons
 /// should invoke [`catchup_once_with_store`] directly via

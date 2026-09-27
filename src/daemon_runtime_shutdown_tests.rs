@@ -84,3 +84,25 @@ async fn serve_tls_bind_failure_uses_the_same_certified_shutdown_path() {
             .is_some_and(|detail| !detail.is_empty())
     );
 }
+
+#[tokio::test]
+async fn bootstrap_accounts_for_live_atomise_writer_4062() {
+    let _no_pass = crate::test_support::no_passphrase_guard();
+    let _sandbox = crate::identity::test_key_dir::install();
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("atomise.db");
+    let bs = bootstrap_serve(&path, &bind_failure_args(), &keyword_config())
+        .await
+        .unwrap();
+    assert!(bs.app_state.atomise_queue.is_some());
+    for task in bs.task_handles {
+        task.abort();
+        let _ = task.await;
+    }
+    // With all periodic tasks joined, the still-live atomise consumer must
+    // remain accounted until admission closes and its buffered jobs drain.
+    assert!(
+        bs.blocking_tasks.load(Ordering::SeqCst) > 0,
+        "live atomise worker is absent from the daemon writer barrier"
+    );
+}

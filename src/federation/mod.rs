@@ -103,7 +103,10 @@ pub use receive::spawn_catchup_loop_with_store;
 // `tests/federation_catchup_api_key.rs`. Marked `#[doc(hidden)]` on
 // the source-side so it doesn't appear in rustdoc, but kept `pub`
 // here so the integration test (separate crate) can import it.
+#[cfg(any(test, feature = "test-support"))]
+pub use receive::catchup_apply_once_for_tests;
 pub use receive::catchup_once_for_tests;
+
 pub use sync::*;
 // v0.7.0 Track D #933 — re-export push DLQ surface for daemon bootstrap +
 // integration tests.
