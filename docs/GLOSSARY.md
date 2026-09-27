@@ -223,8 +223,10 @@ for memories with `access_count ≥ 10` last accessed within 7 days;
 ## Quorum (W-of-N)
 
 Federation write contract from ADR-0001. `N` = peer count, `W` = how
-many peers must ack before the write returns OK. The operator sets `W`
-explicitly via `--quorum-writes` (default `0` = federation off); the
+many acknowledgements the write needs before it returns OK, **counting the
+local commit** — so W−1 remote peers must ack, and `W=1` needs none
+(#4004). The operator sets `W` explicitly via `--quorum-writes` (default `0`
+= federation off); the
 `QuorumPolicy::majority` convenience targets a simple majority.
 
 ## Recall

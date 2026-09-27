@@ -107,3 +107,29 @@ fn security_md_does_not_call_federation_mtls_unconditional_4003() {
         ISSUE,
     );
 }
+
+/// #4004 — W counts the local commit (`acks.len() + 1 >= w`), so `W=1`
+/// needs no remote acknowledgement.
+#[test]
+fn quorum_writes_row_counts_the_local_commit_4004() {
+    const ISSUE: &str = "#4004";
+    assert_absent("docs/CLI_REFERENCE.md", "W (peer acks required)", ISSUE);
+    assert_present(
+        "docs/CLI_REFERENCE.md",
+        "acknowledgements required **including the local commit**",
+        ISSUE,
+    );
+    assert_present(
+        "docs/CLI_REFERENCE.md",
+        "`W=1` requires no remote acknowledgement",
+        ISSUE,
+    );
+    assert_absent("docs/GLOSSARY.md", "`W` = how many peers must ack", ISSUE);
+    assert_present("docs/GLOSSARY.md", "**counting the local commit**", ISSUE);
+    // Anchor: the doc is only true while the tracker counts local + peers.
+    assert_present(
+        "src/replication.rs",
+        "let total = self.acks.len() + 1;",
+        ISSUE,
+    );
+}
