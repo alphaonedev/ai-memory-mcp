@@ -133,3 +133,52 @@ fn quorum_writes_row_counts_the_local_commit_4004() {
         ISSUE,
     );
 }
+
+/// #4008 — `cert-postgres-age.yml` runs against the runner's native tier; it
+/// has no `docker build` / `docker run` step, so no doc may say it BUILDS the
+/// deploy Dockerfile or ships "the SAME artifact".
+#[test]
+fn release_notes_do_not_claim_the_cert_workflow_builds_the_image_4008() {
+    const ISSUE: &str = "#4008";
+    let workflow = read(".github/workflows/cert-postgres-age.yml");
+    let has_docker_step = workflow
+        .lines()
+        .map(str::trim_start)
+        .filter(|l| !l.starts_with('#'))
+        .any(|l| l.contains("docker build") || l.contains("docker run"));
+    if has_docker_step {
+        // The workflow builds an image again: the gate's premise is gone and
+        // the notes may describe it. Nothing to pin.
+        return;
+    }
+    for rel in ["docs/v1.0.0/release-notes.md", "docs/postgres-age-guide.md"] {
+        assert_absent(rel, "SAME artifact the deploy SSOT", ISSUE);
+        assert_absent(
+            rel,
+            "`.github/workflows/cert-postgres-age.yml` BUILDS",
+            ISSUE,
+        );
+        assert_absent(rel, "cert-postgres-age.yml`, which BUILDS", ISSUE);
+        assert_absent(
+            rel,
+            "BUILDS `deploy/docker-1461/Dockerfile.pg-age-vector`",
+            ISSUE,
+        );
+        assert_absent(
+            rel,
+            "runs the resulting image as the postgres under test",
+            ISSUE,
+        );
+        assert_absent(rel, "against the certified image CI builds", ISSUE);
+        assert_absent(
+            rel,
+            "runs `deploy/docker-1461/Dockerfile.pg-age-vector` built",
+            ISSUE,
+        );
+    }
+    assert_present(
+        "docs/v1.0.0/release-notes.md",
+        "per-job database on the self-hosted runner's native PostgreSQL/AGE/pgvector tier",
+        ISSUE,
+    );
+}
