@@ -893,3 +893,131 @@ fn refuse_posture_on_an_unavailable_judge_fails_closed_to_noop() {
         "refuse fails closed to NoOp; candidate survives"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #3806 P1 (Codex/f2r, withdrawal of 63e3033b0): the confidence must be the
+// VERDICT field's own, never an unrelated field's. GOD's routing ruling makes
+// this W3 pin a LANDING CONDITION for #3806.
+// ---------------------------------------------------------------------------
+
+/// A decision body whose `content` is `document` and whose logprob stream
+/// is exactly `tokens` (text, probability), so a cell controls which token
+/// carries which confidence.
+fn decision_body_with_stream(document: &str, tokens: &[(&str, f64)]) -> Value {
+    let content: Vec<Value> = tokens
+        .iter()
+        .map(|(token, p)| json!({"token": token, "logprob": p.ln()}))
+        .collect();
+    json!({"choices": [{
+        "message": {"role": "assistant", "content": document},
+        "logprobs": {"content": content},
+    }]})
+}
+
+/// P1 pin. The verdict is `yes`, but its token arrives FUSED with the
+/// opening quote (`"yes`, p = 0.01), so it never spells the bare label. An
+/// unrelated `note` field emits a clean `yes` token at p = 0.99. The
+/// verdict's own confidence is 0.01, below the 0.80 floor, so the delete
+/// must be blocked and the candidate must survive.
+///
+/// RED at 63e3033b0: `label_probability` searches the WHOLE stream, finds
+/// exactly one clean `yes` run (the note's), and attributes its 0.99 to the
+/// verdict, so the candidate is DELETED on a confidence the verdict never
+/// had. GREEN on any fix that anchors the confidence to the verdict field.
+/// Whether the fix reads the fused token (0.01) or treats it as
+/// unlocatable (no confidence), both block the delete.
+#[test]
+fn unrelated_field_confidence_never_licenses_a_delete_3806_p1() {
+    let _g = synthesis_lock().lock().unwrap_or_else(|p| p.into_inner());
+    let (conn, db_path) = open_db();
+    let cand = seed_existing(&conn, "obsolete deploy note", "old", "ns-p1-misattr");
+    let document = json!({ FIELD_VERDICT: "yes", "note": "yes" }).to_string();
+    let server = mock_server(
+        delete_verdict(&cand),
+        Some(decision_body_with_stream(
+            &document,
+            &[
+                ("{\"", 0.99),
+                (FIELD_VERDICT, 0.99),
+                ("\":", 0.99),
+                ("\"yes", 0.01),
+                ("\",\"", 0.99),
+                ("note", 0.99),
+                ("\":\"", 0.99),
+                ("yes", 0.99),
+                ("\"}", 0.99),
+            ],
+        )),
+    );
+    let llm = llm_with_decider(&server.uri(), &db_path, DecisionFallback::Abstain);
+
+    run_store(
+        &conn,
+        &db_path,
+        &llm,
+        json!({
+            "title": "current deploy strategy",
+            "content": BASE_CONTENT,
+            "namespace": "ns-p1-misattr",
+            "on_conflict": "version",
+        }),
+    )
+    .expect("ok");
+
+    let ids = surviving_ids(&conn, "ns-p1-misattr");
+    assert!(
+        ids.contains(&cand),
+        "the verdict's own confidence is 0.01; an unrelated field's 0.99 must never license the delete"
+    );
+    assert_eq!(ids.len(), 2, "the candidate AND the new row both survive");
+}
+
+/// Control for the P1 pin: the SAME stream shape, but the verdict's own
+/// token is a clean `yes` at p = 0.99 and the note says something else, so
+/// the verdict really is confident and the delete must go through. This
+/// proves the pin is not passing by blocking every delete.
+#[test]
+fn verdict_field_confidence_still_licenses_a_delete_3806_p1_control() {
+    let _g = synthesis_lock().lock().unwrap_or_else(|p| p.into_inner());
+    let (conn, db_path) = open_db();
+    let cand = seed_existing(&conn, "obsolete deploy note", "old", "ns-p1-control");
+    let document = json!({ FIELD_VERDICT: "yes", "note": "stale" }).to_string();
+    let server = mock_server(
+        delete_verdict(&cand),
+        Some(decision_body_with_stream(
+            &document,
+            &[
+                ("{\"", 0.99),
+                (FIELD_VERDICT, 0.99),
+                ("\":\"", 0.99),
+                ("yes", 0.99),
+                ("\",\"", 0.99),
+                ("note", 0.99),
+                ("\":\"", 0.99),
+                ("stale", 0.99),
+                ("\"}", 0.99),
+            ],
+        )),
+    );
+    let llm = llm_with_decider(&server.uri(), &db_path, DecisionFallback::Abstain);
+
+    run_store(
+        &conn,
+        &db_path,
+        &llm,
+        json!({
+            "title": "current deploy strategy",
+            "content": BASE_CONTENT,
+            "namespace": "ns-p1-control",
+            "on_conflict": "version",
+        }),
+    )
+    .expect("ok");
+
+    let ids = surviving_ids(&conn, "ns-p1-control");
+    assert!(
+        !ids.contains(&cand),
+        "a verdict confident in its own token (0.99) permits the delete"
+    );
+    assert_eq!(ids.len(), 1, "delete + insert = one row");
+}
