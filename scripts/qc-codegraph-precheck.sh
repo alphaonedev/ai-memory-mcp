@@ -200,6 +200,14 @@ collect_sites () {
             matches="$(printf '%s\n' "$production" | grep -n "${pattern}(\"" || true)"
         fi
         [[ -z "${matches}" ]] && continue
+        # #3970 — the enclosing-function key of every candidate line in this
+        # file, from ONE scope-aware lex of the whole file (comments and
+        # string/char literals skipped, brace stack). The first cut took the
+        # nearest preceding `fn <name>` TEXT, so a comment, a string, or a
+        # nested item naming an approved fn re-keyed a moved site to it.
+        local scopes
+        scopes="$(python3 "${ROOT}/scripts/tests/c8-enclosing-fn-3970.py" "$f" "${pattern}" \
+            $(printf '%s\n' "${matches}" | cut -d: -f1))"
         while IFS=: read -r lineno content; do
             # Skip blank/no-match
             [[ -z "${lineno}" ]] && continue
@@ -247,18 +255,16 @@ collect_sites () {
                 # Strip the absolute prefix so the allowlist is
                 # repo-root-relative (and stable across checkouts).
                 local rel="${f#"${ROOT}/"}"
-                # #3970 — key the site by its ENCLOSING FUNCTION too: the
-                # nearest preceding `fn <name>` in the production text (comment
-                # lines skipped; `<top>` when there is none, e.g. a static
-                # initialiser). A site moved into a DIFFERENT function becomes a
+                # #3970 — key the site by its ENCLOSING FUNCTION too, from the
+                # scope lex above: the innermost fn whose body contains the call,
+                # qualified by mod/trait/impl-type/outer fn and joined with `.`
+                # (`<top>` outside any fn; `<unparsed>` if the file does not lex,
+                # which blocks). A site moved into a DIFFERENT function becomes a
                 # new key and HARD-BLOCKs; a site moved within its function
                 # keeps its key (line numbers stay out of it).
                 local encl
-                encl="$(printf '%s\n' "$production" | sed -n "1,${lineno}p" \
-                    | grep -vE '^[[:space:]]*(//|\*)' \
-                    | grep -oE '(^|[^A-Za-z0-9_])fn[[:space:]]+[A-Za-z_][A-Za-z0-9_]*' \
-                    | tail -1 | sed -E 's/.*fn[[:space:]]+//' || true)"
-                encl="${encl:-<top>}"
+                encl="$(printf '%s\n' "${scopes}" | awk -F '\t' -v l="${lineno}" '$1 == l { print $2; exit }')"
+                encl="${encl:-<unparsed>}"
                 out+="${rel}:${lineno}:${encl}:${literal}"$'\n'
             fi
         done <<< "${matches}"
@@ -326,6 +332,15 @@ update_allowlist () {
             i1 = index(key, ":"); rest = substr(key, i1 + 1); i2 = index(rest, ":")
             legacy = substr(key, 1, i1) substr(rest, i2 + 1)
             bylegacy[legacy] = bylegacy[legacy] SUBSEP key
+            # The first #3970 cut keyed by the BARE fn name (`resolve_governance_policy`);
+            # the scope key qualifies it (`PostgresStore.resolve_governance_policy`).
+            # Map the bare form to the qualified one too, so that line is also
+            # replaced in place. (The fn field never contains `:`.)
+            fnq = substr(rest, 1, i2 - 1); nseg = split(fnq, seg, ".")
+            if (nseg > 1) {
+                bare = substr(key, 1, i1) seg[nseg] ":" substr(rest, i2 + 1)
+                bylegacy[bare] = bylegacy[bare] SUBSEP key
+            }
             next
         }
         /^# Format:/ { print fmt; next }

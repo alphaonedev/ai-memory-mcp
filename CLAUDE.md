@@ -1202,12 +1202,20 @@ entry licenses exactly `<count>` production sites of that literal inside
 that ENCLOSING FUNCTION of that file, so an ADDITIONAL site of an
 already-approved literal, or an approved site MOVED into a different
 function (the #3638 relocation shape), is a HARD-BLOCK just like a new
-literal. Before #3965 the key was a bare `file:literal`, which made each
-entry an unlimited-multiplicity licence (31 real sites stood behind the
-25 entries the gate reported). Line numbers stay out of the key on
-purpose, so a site moved within its function is the same reviewed site;
-the remaining granularity is the function (two sites of one literal inside
-one function are interchangeable, and the count bounds them). An
+literal. `<fn>` comes from SCOPE, not text: `scripts/tests/c8-enclosing-fn-3970.py`
+lexes the whole file (skipping comments and string/raw-string/char literals,
+keeping a brace stack) and names the innermost fn whose body contains the
+call, qualified by `mod`/`trait`/`impl <Type>`/outer fn and joined with `.`
+(`PostgresStore.resolve_governance_policy`; `<top>` outside any fn;
+`<unparsed>`, which blocks, if the file does not lex). A textual
+"nearest preceding `fn`" key was spoofable by one comment, string or nested
+item naming an approved fn. Before #3965 the key was a bare `file:literal`,
+which made each entry an unlimited-multiplicity licence (31 real sites
+stood behind the 25 entries the gate reported). Line numbers stay out of
+the key on purpose, so a site moved within its function is the same
+reviewed site; the remaining granularity is the function (two sites of
+one literal inside one function are interchangeable, and the count bounds
+them). An
 entry without a count is refused. Every constructor call is counted
 whatever its argument spelling: an argument the regexes cannot read
 (`caller.clone()`, `"x".to_owned()`) is read by a paren-balanced parser,

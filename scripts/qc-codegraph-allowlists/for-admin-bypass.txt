@@ -17,10 +17,10 @@ src/cli/curator.rs:run_store_backed_prune_reports:AI_CURATOR:1
 src/cli/curator.rs:run_store_backed_rollback:AI_CURATOR:1
 src/cli/curator.rs:store_backed_consolidation_sweep:AI_CURATOR:1
 src/cli/stop.rs:cmd_stop:AI_OPERATOR:1
-src/curator/compaction.rs:new:CONSOLIDATOR_AGENT_ID:1
+src/curator/compaction.rs:ConsolidationPass.new:CONSOLIDATOR_AGENT_ID:1
 src/curator/decorrelation_probe.rs:run_decorrelation_probe:agent_id:1
 src/curator/reflection_pass.rs:curator_caller_context:agent_id:1
-src/curator/transcript_classify_pass.rs:new:agent_id:1
+src/curator/transcript_classify_pass.rs:TranscriptClassifyPass.new:agent_id:1
 # FBL-22 (#2342) — postgres serve maintenance loop (spawn_postgres_maintenance_
 # loop_if_enabled): the periodic archive_purge must cover EVERY owner's stale
 # archives, mirroring the sqlite loop's unscoped db::auto_purge_archive. The
@@ -109,7 +109,7 @@ src/handlers/links.rs:create_link:caller:1
 # breaking governance resolution for private namespaces. The older precheck
 # did not detect this call site; #3623 restored that coverage, which is what
 # this entry records.
-src/store/postgres.rs:resolve_governance_policy:GOVERNANCE_INTERNAL:1
+src/store/postgres.rs:PostgresStore.resolve_governance_policy:GOVERNANCE_INTERNAL:1
 
 # #3965 follow-up (Codex review, 2026-09-27) — two PRE-EXISTING sites the gate
 # never counted: their argument (`x.clone()`) defeated the old extractor, so the
