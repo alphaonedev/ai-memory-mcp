@@ -66,7 +66,7 @@ use std::time::Duration;
 
 use anyhow::{Result, bail};
 use rand_core::RngCore as _;
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Notify, mpsc, watch};
 
 pub use bundle::{BUNDLE_MODE, HubJoinBundle, SignedHello};
 pub use session::{Session, SessionConfig, SessionEvent, assert_socket_is_owner_only};
@@ -164,6 +164,34 @@ impl WakeSignal {
             missed: 0,
         }
     }
+}
+
+/// Whether this listener can currently RECEIVE hub-driven wakes.
+///
+/// `inbox --wait` is a one-shot wait whose only observable output is the
+/// read it performs afterwards, so a listener whose hub session never opens
+/// looks exactly like a quiet inbox that happened to wait out its timeout.
+/// That is the silent degradation this state exists to end: the consumer can
+/// watch it and say, once and on a channel the operator actually sees, that
+/// wakes cannot arrive and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HubLink {
+    /// No hub is configured for this listener: the backstop poll is the
+    /// whole delivery mechanism, by the operator's choice.
+    NotConfigured,
+    /// A session is being established; nothing is known yet.
+    Connecting,
+    /// The hub admitted this agent: hub-driven wakes will arrive.
+    Admitted,
+    /// The last session attempt failed. `cause` is the full error chain;
+    /// `refused` is `true` when the hub itself answered with a refusal (the
+    /// agent is not admitted), as opposed to the hub being unreachable.
+    Down {
+        /// The session error, with its cause chain.
+        cause: String,
+        /// The hub was reached and refused this agent.
+        refused: bool,
+    },
 }
 
 /// Tracks `seq_high_watermark` so a gap becomes exactly one extra read.
@@ -318,6 +346,7 @@ pub struct WakeStream {
     rx: mpsc::Receiver<WakeSignal>,
     read_done: Arc<Notify>,
     metrics: Arc<ClientMetrics>,
+    link: watch::Receiver<HubLink>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
@@ -362,6 +391,12 @@ impl WakeStream {
         let read_done = Arc::new(Notify::new());
         let metrics = Arc::new(ClientMetrics::default());
 
+        let (link_tx, link) = watch::channel(if hub.is_some() {
+            HubLink::Connecting
+        } else {
+            HubLink::NotConfigured
+        });
+
         let mut tasks = Vec::with_capacity(2);
         {
             let tx = tx.clone();
@@ -375,7 +410,7 @@ impl WakeStream {
         if let Some((session_cfg, bundle)) = hub {
             let metrics = Arc::clone(&metrics);
             tasks.push(handle.spawn(async move {
-                hub_loop(cfg, session_cfg, bundle, tx, metrics).await;
+                hub_loop(cfg, session_cfg, bundle, tx, metrics, link_tx).await;
             }));
         } else {
             tracing::info!(
@@ -387,8 +422,58 @@ impl WakeStream {
             rx,
             read_done,
             metrics,
+            link,
             tasks,
         })
+    }
+
+    /// A stream whose ONLY producer besides the test is the production
+    /// backstop, so a test can inject hub-shaped signals (an empty welcome, a
+    /// wake) against the real backstop clock. Test-only: nothing in the
+    /// product can hand-craft a hub signal.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::start`].
+    #[cfg(test)]
+    pub(crate) fn start_injectable(
+        cfg: WakeClientConfig,
+    ) -> Result<(Self, mpsc::Sender<WakeSignal>, watch::Sender<HubLink>)> {
+        cfg.validate()?;
+        let (tx, rx) = mpsc::channel::<WakeSignal>(SIGNAL_QUEUE_DEPTH);
+        let read_done = Arc::new(Notify::new());
+        let metrics = Arc::new(ClientMetrics::default());
+        let (link_tx, link) = watch::channel(HubLink::Connecting);
+        let backstop = {
+            let tx = tx.clone();
+            let read_done = Arc::clone(&read_done);
+            let metrics = Arc::clone(&metrics);
+            tokio::spawn(backstop_loop(cfg.poll_interval, tx, read_done, metrics))
+        };
+        Ok((
+            Self {
+                rx,
+                read_done,
+                metrics,
+                link,
+                tasks: vec![backstop],
+            },
+            tx,
+            link_tx,
+        ))
+    }
+
+    /// Whether hub-driven wakes can currently arrive. See [`HubLink`].
+    #[must_use]
+    pub fn hub_link(&self) -> HubLink {
+        self.link.borrow().clone()
+    }
+
+    /// A watcher over [`HubLink`], so a consumer can observe the link beside
+    /// [`Self::next`] in one `select!` without borrowing the stream twice.
+    #[must_use]
+    pub fn hub_link_watch(&self) -> watch::Receiver<HubLink> {
+        self.link.clone()
     }
 
     /// This listener's live counters.
@@ -440,6 +525,7 @@ async fn hub_loop(
     bundle: Arc<HubJoinBundle>,
     tx: mpsc::Sender<WakeSignal>,
     metrics: Arc<ClientMetrics>,
+    link: watch::Sender<HubLink>,
 ) {
     let mut attempt: u32 = 0;
     loop {
@@ -447,12 +533,19 @@ async fn hub_loop(
             return;
         }
         let started = tokio::time::Instant::now();
-        match run_session(&session_cfg, &bundle, &tx, &metrics).await {
+        match run_session(&session_cfg, &bundle, &tx, &metrics, &link).await {
             Ok(()) => {
                 tracing::info!("wake listener: stopping because the consumer went away");
                 return;
             }
             Err(e) => {
+                // `send_replace`, not `send`: the state must be recorded even
+                // while no consumer is watching, so a later `hub_link()` read
+                // is never stale.
+                link.send_replace(HubLink::Down {
+                    refused: session::is_hub_refusal(&e),
+                    cause: format!("{e:#}"),
+                });
                 if started.elapsed() >= HEALTHY_SESSION {
                     attempt = 0;
                 }
@@ -477,6 +570,7 @@ async fn run_session(
     bundle: &HubJoinBundle,
     tx: &mpsc::Sender<WakeSignal>,
     metrics: &ClientMetrics,
+    link: &watch::Sender<HubLink>,
 ) -> Result<()> {
     // An expired credential is a configuration problem, not a network one.
     // Say so before dialling, so the operator sees the remediation instead of
@@ -493,6 +587,7 @@ async fn run_session(
 
     let mut session = session::connect(session_cfg, bundle).await?;
     metrics.sessions.fetch_add(1, Ordering::Relaxed);
+    link.send_replace(HubLink::Admitted);
     let welcome = *session.welcome();
     tracing::info!(
         agent = bundle.agent_id(),

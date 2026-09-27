@@ -66,7 +66,7 @@ use crate::cli::CliOutput;
 use crate::config::AppConfig;
 use crate::identity::keypair;
 use crate::wake_client::{
-    HubJoinBundle, SessionConfig, WakeClientConfig, WakeReason, WakeSignal, WakeStream,
+    HubJoinBundle, HubLink, SessionConfig, WakeClientConfig, WakeReason, WakeSignal, WakeStream,
 };
 use crate::wake_hub::DEFAULT_HUB_ID;
 use crate::wake_sink::BACKSTOP_POLL_MAX;
@@ -396,6 +396,73 @@ pub async fn run_exec_hook(
     Ok(())
 }
 
+/// Why a wait cannot currently receive hub-driven wakes.
+///
+/// Reported by [`wait_for_wake_or_backstop_reporting`] at most once per cause
+/// kind, the moment it is known. Every variant is a DEGRADED wait, never a
+/// failed one: the always-armed backstop still bounds it and the read after it
+/// still returns the durable truth. What each variant must never be again is
+/// SILENT — an `inbox --wait` whose hub session never opened looked exactly
+/// like a quiet inbox that waited out its timeout (#4087).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WaitDegraded {
+    /// The hub credential (the `a2a-hub` delegation bundle) would not load,
+    /// so no session was even attempted.
+    Credential {
+        /// The load error, with its cause chain.
+        cause: String,
+    },
+    /// The hub was reached and REFUSED this agent: it is not on the hub's
+    /// allowlist snapshot, the snapshot is stale, or the delegation does not
+    /// verify against the enrolled key the snapshot carries.
+    Refused {
+        /// The refusal, with its cause chain.
+        cause: String,
+    },
+    /// The hub could not be reached (not running, wrong socket path).
+    Unreachable {
+        /// The connect error, with its cause chain.
+        cause: String,
+    },
+}
+
+impl WaitDegraded {
+    /// Render the operator-facing explanation for `resolved`, naming the
+    /// remediation. One line, so it survives log shippers intact.
+    #[must_use]
+    pub fn explain(&self, resolved: &Resolved) -> String {
+        let agent = &resolved.agent_id;
+        let hub = &resolved.hub_id;
+        let socket = resolved
+            .socket
+            .as_ref()
+            .map_or_else(|| "-".to_owned(), |p| p.display().to_string());
+        let bound = resolved.client.poll_interval;
+        let admit = format!(
+            "the agent needs a delegation for hub {hub:?} (`ai-memory identity delegate --scope \
+             a2a-hub --agent-id {agent} --hub-id {hub}`) AND a row in the hub's allowlist \
+             snapshot (`ai-memory identity hub-cache --include-agent {agent}` in the \
+             refresher); `ai-memory doctor --agent-id {agent}` checks both"
+        );
+        match self {
+            Self::Credential { cause } => format!(
+                "inbox --wait: agent {agent} has no usable wake-hub credential ({cause}); this \
+                 wait CANNOT receive hub wakes and is bounded only by the backstop poll (at \
+                 most {bound:?}). To receive wakes, {admit}"
+            ),
+            Self::Refused { cause } => format!(
+                "inbox --wait: the wake-hub at {socket} REFUSED agent {agent} ({cause}); this \
+                 wait CANNOT receive hub wakes and is bounded only by the backstop poll (at \
+                 most {bound:?}). To be admitted, {admit}"
+            ),
+            Self::Unreachable { cause } => format!(
+                "inbox --wait: the wake-hub at {socket} is unreachable ({cause}); this wait \
+                 falls back to the backstop poll (at most {bound:?}) until the hub is back"
+            ),
+        }
+    }
+}
+
 /// Block until a wake is due, then return the signal.
 ///
 /// A `Welcome` that carries NO offline backlog is deliberately NOT returned:
@@ -404,25 +471,65 @@ pub async fn run_exec_hook(
 /// coalesced wakes, or one flagged `lagged`, DOES return — there is mail
 /// waiting.
 ///
+/// The ignored empty welcome does NOT restart the backstop clock (#4058): no
+/// read happened, and `WakeStream::note_read` means "a catch-up read just
+/// completed". Acknowledging a read that never ran let every reconnect that
+/// ended in an empty welcome postpone the backstop by up to a full interval,
+/// breaking the shipped `<= poll interval` bound of `inbox --wait` without
+/// `--timeout` — and the hub's welcome counts its in-memory hint set, not the
+/// durable inbox, so an empty welcome never proved an empty inbox.
+///
+/// `on_link` sees every [`HubLink::Down`] transition the moment it happens,
+/// so a caller can say — once, where the operator looks — that wakes cannot
+/// arrive and why.
+///
 /// `None` means the caller's timeout expired, or every producer stopped —
 /// a bounded, honest "nothing arrived".
-async fn wait_on(stream: &mut WakeStream, timeout: Option<Duration>) -> Option<WakeSignal> {
+async fn wait_on(
+    stream: &mut WakeStream,
+    timeout: Option<Duration>,
+    on_link: &mut dyn FnMut(&HubLink),
+) -> Option<WakeSignal> {
     let deadline = timeout.map(|t| tokio::time::Instant::now() + t);
+    let mut link = stream.hub_link_watch();
+    // A state recorded before this wait started (a refusal that raced ahead
+    // of us) must be reported too, not only later transitions.
+    let initial = link.borrow_and_update().clone();
+    if matches!(initial, HubLink::Down { .. }) {
+        on_link(&initial);
+    }
+    let mut link_open = true;
     loop {
-        let signal = match deadline {
-            Some(at) => match tokio::time::timeout_at(at, stream.next()).await {
-                Ok(next) => next,
-                Err(_) => return None,
-            },
-            None => stream.next().await,
+        let expired = async {
+            match deadline {
+                Some(at) => tokio::time::sleep_until(at).await,
+                None => std::future::pending::<()>().await,
+            }
         };
-        let signal = signal?;
-        if signal.reason == WakeReason::Welcome && signal.pending_count == 0 {
-            // An empty welcome is "you are attached", not "you have mail".
-            stream.note_read();
-            continue;
+        tokio::select! {
+            () = expired => return None,
+            changed = link.changed(), if link_open => {
+                if changed.is_err() {
+                    // The hub task is gone; the backstop alone remains.
+                    link_open = false;
+                    continue;
+                }
+                let state = link.borrow_and_update().clone();
+                if matches!(state, HubLink::Down { .. }) {
+                    on_link(&state);
+                }
+            }
+            signal = stream.next() => {
+                let signal = signal?;
+                if signal.reason == WakeReason::Welcome && signal.pending_count == 0 {
+                    // An empty welcome is "you are attached", not "you have
+                    // mail" — and it is NOT a read, so the backstop clock is
+                    // left alone (#4058).
+                    continue;
+                }
+                return Some(signal);
+            }
         }
-        return Some(signal);
     }
 }
 
@@ -441,11 +548,27 @@ pub async fn wait_for_wake(
     timeout: Option<Duration>,
 ) -> Result<Option<WakeSignal>> {
     let mut stream = start_stream(resolved)?;
-    Ok(wait_on(&mut stream, timeout).await)
+    Ok(wait_on(&mut stream, timeout, &mut |_| {}).await)
 }
 
 /// Block until a wake is due, DEGRADING to the bounded poll when the hub
-/// credential will not load.
+/// credential will not load. Degradations are logged at WARN; see
+/// [`wait_for_wake_or_backstop_reporting`] for the form that also hands them
+/// to the caller.
+///
+/// # Errors
+///
+/// As [`wait_for_wake_or_backstop_reporting`].
+pub async fn wait_for_wake_or_backstop(
+    resolved: &Resolved,
+    timeout: Option<Duration>,
+) -> Result<Option<WakeSignal>> {
+    wait_for_wake_or_backstop_reporting(resolved, timeout, &mut |_| {}).await
+}
+
+/// Block until a wake is due, DEGRADING to the bounded poll when the hub
+/// credential will not load, and REPORTING every reason this wait cannot
+/// receive hub wakes to `report` the moment it is known.
 ///
 /// The shape `ai-memory inbox --wait` wants, and the one the plane's own
 /// contract requires. `--wait` promises "the hub when one is configured,
@@ -455,36 +578,59 @@ pub async fn wait_for_wake(
 /// bundle expired, or was minted for another hub — [`start_stream`] fails
 /// BEFORE any stream exists, and returning that error would make the caller
 /// read immediately. In a loop that is a hot loop: one process boot per
-/// iteration, a warning each time, and none of the pacing the recipe it
-/// replaced provided.
+/// iteration, and none of the pacing the recipe it replaced provided.
 ///
-/// A hub that is merely DOWN never had this problem — the bundle loads, the
-/// session loop backs off, and the always-armed backstop returns on schedule.
-/// This closes the case where the CREDENTIAL, not the hub, is what is
-/// missing: the refusal is logged once at WARN with its full cause chain (so
-/// the operator sees the re-mint remediation), and the wait then runs on a
-/// hub-less stream, staying bounded by `min(timeout, poll_interval)`.
+/// So a credential failure, a hub that REFUSES the agent, and a hub that is
+/// unreachable all degrade to the always-armed backstop, bounded by
+/// `min(timeout, poll_interval)` — and each is handed to `report` exactly once
+/// per kind (as well as logged at WARN). The caller decides where the operator
+/// sees it: `inbox --wait` installs no tracing subscriber, so a WARN alone
+/// went nowhere and the degradation was silent (#4087).
 ///
 /// # Errors
 ///
 /// Only a failure to start the hub-LESS stream — an invalid poll interval or
 /// no Tokio runtime. Neither is recoverable by waiting.
-pub async fn wait_for_wake_or_backstop(
+pub async fn wait_for_wake_or_backstop_reporting(
     resolved: &Resolved,
     timeout: Option<Duration>,
+    report: &mut dyn FnMut(&WaitDegraded),
 ) -> Result<Option<WakeSignal>> {
     let mut stream = match start_stream(resolved) {
         Ok(stream) => stream,
         Err(e) => {
-            tracing::warn!(
-                "inbox --wait: the wake-hub credential could not be loaded ({e:#}); waiting on \
-                 the bounded backstop poll instead (at most {:?})",
-                resolved.client.poll_interval
-            );
+            let degraded = WaitDegraded::Credential {
+                cause: format!("{e:#}"),
+            };
+            tracing::warn!("{}", degraded.explain(resolved));
+            report(&degraded);
             WakeStream::start(resolved.client.clone(), None)?
         }
     };
-    Ok(wait_on(&mut stream, timeout).await)
+    let (mut refused_reported, mut unreachable_reported) = (false, false);
+    let mut on_link = |state: &HubLink| {
+        let HubLink::Down { cause, refused } = state else {
+            return;
+        };
+        let degraded = if *refused {
+            if std::mem::replace(&mut refused_reported, true) {
+                return;
+            }
+            WaitDegraded::Refused {
+                cause: cause.clone(),
+            }
+        } else {
+            if std::mem::replace(&mut unreachable_reported, true) {
+                return;
+            }
+            WaitDegraded::Unreachable {
+                cause: cause.clone(),
+            }
+        };
+        tracing::warn!("{}", degraded.explain(resolved));
+        report(&degraded);
+    };
+    Ok(wait_on(&mut stream, timeout, &mut on_link).await)
 }
 
 /// Serve `ai-memory wake-listen` until SIGINT / SIGTERM.
@@ -867,3 +1013,9 @@ mod tests_3642 {
         );
     }
 }
+
+// #4058 / #4087 — the one-shot wait's backstop bound and its degradation
+// reporting, pinned against the PRODUCTION backstop clock in its own file.
+#[cfg(test)]
+#[path = "wake_listen_wait_tests.rs"]
+mod wait_tests;

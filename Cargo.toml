@@ -435,6 +435,11 @@ libc = "0.2"
 # hash chain, not the file flag.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+# v1.0.0 #4057 — the wake-hub stale-socket probe needs ONE non-blocking
+# AF_UNIX connect (a blocking one hangs on a live listener whose accept queue
+# is full). socket2 is already in the tree via tokio/hyper, so this adds no new
+# crate to the build — only a direct, safe-code edge to it.
+socket2 = "0.6"
 
 # CONFIG-1 full-spectrum AI-NHI acceptance harness (sqlite-bundled build).
 # Declared explicitly because it lives in the tests/acceptance/ subdirectory

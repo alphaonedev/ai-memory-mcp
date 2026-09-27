@@ -1787,6 +1787,7 @@ fn run_local(db_path: &Path, caller_agent_id: Option<&str>) -> Report {
     // the database connection above.
     sections.push(crate::cli::doctor_wake_hub::section_wake_hub_3471(
         &crate::config::AppConfig::load(),
+        caller_agent_id,
     ));
 
     Report {

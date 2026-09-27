@@ -87,6 +87,24 @@ pub fn run(db_path: &Path, args: &HubCacheArgs, out: &mut crate::cli::CliOutput<
         &extra,
     )?;
     crate::identity::hub_cache::publish(&args.out, &snapshot)?;
+    // #4087 — an `--include-agent` with no possession-proved key binding
+    // is dropped by the derivation (it cannot delegate), and pre-fix that
+    // drop was SILENT: the publish line said `"agents": N`, the snapshot
+    // simply lacked the agent, and its `inbox --wait` could only ever return
+    // on the backstop. Refusing would be worse — this runs every 30 s for
+    // the whole fleet, and one unenrolled name would stop every agent's
+    // refresh — so it publishes and NAMES the omission, on stdout (machine)
+    // and stderr (human).
+    let omitted = omitted_agents(&agents, &snapshot);
+    for agent in &omitted {
+        writeln!(
+            out.stderr,
+            "warning: --include-agent {agent} was OMITTED from the allowlist: it has no \
+             current possession-proved key binding in this store, so the hub cannot admit \
+             it and its `inbox --wait` / `wake-listen` will never receive a hub wake. \
+             Enroll it (generate a key and bind it with a possession proof), then refresh."
+        )?;
+    }
     writeln!(
         out.stdout,
         "{}",
@@ -107,9 +125,20 @@ pub fn run(db_path: &Path, args: &HubCacheArgs, out: &mut crate::cli::CliOutput<
                 .sum::<usize>(),
             "max_readable_prefixes_per_agent":
                 crate::wake_hub::limits::MAX_READABLE_PREFIXES,
+            // #4087 — requested principals the snapshot could not carry.
+            "omitted_agents": omitted,
         }))?
     )?;
     Ok(())
+}
+
+/// Requested principals that did not make it into `snapshot` (#4087).
+fn omitted_agents(requested: &[String], snapshot: &AllowlistFile) -> Vec<String> {
+    requested
+        .iter()
+        .filter(|a| !snapshot.agents.iter().any(|e| &e.agent_id == *a))
+        .cloned()
+        .collect()
 }
 
 /// Read the selected durable backend; optionally audit a publication.
@@ -203,6 +232,37 @@ pub fn derive_with_extra(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #4087 — a requested agent with no enrolled binding is published
+    /// around, but NAMED, never silently dropped.
+    #[test]
+    fn an_unenrolled_include_agent_is_named_not_silently_dropped_4087() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("x.db");
+        let _ = crate::db::open(&db).expect("db");
+        let args = HubCacheArgs {
+            agents: vec!["ai:codex-f2".to_owned()],
+            out: dir.path().join("allow.json"),
+            store_url: None,
+            daemon_producer: false,
+        };
+        let mut sink = Vec::new();
+        let mut err_sink = Vec::new();
+        let mut out = crate::cli::CliOutput {
+            stdout: &mut sink,
+            stderr: &mut err_sink,
+        };
+        run(&db, &args, &mut out).expect("publishes");
+        let line: serde_json::Value =
+            serde_json::from_slice(&sink).expect("one JSON line on stdout");
+        assert_eq!(line["agents"], 0);
+        assert_eq!(line["omitted_agents"], serde_json::json!(["ai:codex-f2"]));
+        let err = String::from_utf8(err_sink).expect("utf8");
+        assert!(
+            err.contains("--include-agent ai:codex-f2 was OMITTED"),
+            "stderr: {err}"
+        );
+    }
 
     /// DENIED: naming a reserved principal is refused outright.
     ///

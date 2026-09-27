@@ -95,6 +95,7 @@ dependencies = [
  "serde_json",
  "serde_yaml_ng",
  "sha2",
+ "socket2",
  "sqlx",
  "subtle",
  "tempfile",

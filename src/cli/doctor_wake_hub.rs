@@ -51,6 +51,15 @@ pub const SECTION_WAKE_HUB: &str = "Wake hub (#3471)";
 /// Fact key for whether the host is running a wake hub at all.
 const FACT_CONFIGURED: &str = "configured";
 
+/// #4087 fact keys: whether the named agent can RECEIVE hub wakes.
+const FACT_RECEIVER_AGENT_ID: &str = "receiver_agent_id";
+/// The named agent's `a2a-hub` delegation bundle state.
+const FACT_RECEIVER_BUNDLE: &str = "receiver_bundle";
+/// Whether the named agent has a row in the hub's allowlist snapshot.
+const FACT_RECEIVER_ALLOWLISTED: &str = "receiver_allowlisted";
+/// Age of the allowlist snapshot the hub reads.
+const FACT_ALLOWLIST_AGE_SECS: &str = "allowlist_age_secs";
+
 /// The systemd unit this repository ships for the hub.
 pub const SYSTEMD_UNIT_NAME: &str = "ai-memory-wake-hub.service";
 
@@ -71,7 +80,10 @@ const SYSTEMD_UNIT_DIRS: &[&str] = &[
 /// connects. `doctor` is the verb an operator reaches for when things are
 /// already wrong, so this section must not itself be able to hang.
 #[must_use]
-pub fn section_wake_hub_3471(app_config: &AppConfig) -> ReportSection {
+pub fn section_wake_hub_3471(
+    app_config: &AppConfig,
+    caller_agent_id: Option<&str>,
+) -> ReportSection {
     let socket_path = resolve_socket_path(app_config);
     let configured_block = app_config.wake_hub.is_some();
     let posture = socket_path.as_deref().map(SocketPosture::read);
@@ -184,6 +196,32 @@ pub fn section_wake_hub_3471(app_config: &AppConfig) -> ReportSection {
         }
     }
 
+    // --- receiver readiness (#4087) -----------------------------------------
+    // Only for an agent the operator NAMED (`--agent-id` / `AI_MEMORY_AGENT_ID`)
+    // on a host that runs a hub: a synthesized default id has never been meant
+    // to listen, and warning about it would break the fresh-host invariant.
+    if in_use && let Some(agent) = caller_agent_id.filter(|a| !a.trim().is_empty()) {
+        let readiness = receiver_readiness(
+            app_config,
+            agent,
+            crate::identity::keypair::default_key_dir(),
+            &chrono::Utc::now(),
+        );
+        facts.extend(readiness.facts);
+        if !readiness.problems.is_empty() {
+            severity = max_severity(severity, Severity::Warning);
+            notes.push(format!(
+                "agent {agent} CANNOT receive hub wakes ({}): `inbox --wait` degrades to the \
+                 <=60 s backstop poll and `wake-listen` refuses. Fix: `ai-memory identity \
+                 delegate --scope a2a-hub --agent-id {agent} --hub-id {hub}`, and add \
+                 `--include-agent {agent}` to the allowlist refresher (`ai-memory identity \
+                 hub-cache`)",
+                readiness.problems.join("; "),
+                hub = readiness.hub_id,
+            ));
+        }
+    }
+
     // --- supervisor unit (informational only) --------------------------------
     let unit = installed_unit();
     facts.push((
@@ -200,6 +238,107 @@ pub fn section_wake_hub_3471(app_config: &AppConfig) -> ReportSection {
         } else {
             Some(notes.join("; "))
         },
+    }
+}
+
+/// What a named agent needs to RECEIVE hub wakes, as doctor facts plus the
+/// reasons it cannot (#4087).
+struct ReceiverReadiness {
+    facts: Vec<(String, String)>,
+    problems: Vec<String>,
+    hub_id: String,
+}
+
+/// Check the two things a hub admission needs, without dialling the hub: a
+/// loadable `a2a-hub` delegation bundle for THIS hub, and a row for the agent
+/// in a FRESH allowlist snapshot. Either missing means `inbox --wait` can only
+/// ever return on the backstop — the f2 incident, where an agent absent from
+/// both waited out every timeout with no visible cause.
+fn receiver_readiness(
+    app_config: &AppConfig,
+    agent: &str,
+    key_dir: anyhow::Result<PathBuf>,
+    now: &chrono::DateTime<chrono::Utc>,
+) -> ReceiverReadiness {
+    let block = app_config.wake_hub.clone().unwrap_or_default();
+    let hub_id = block
+        .hub_id
+        .clone()
+        .unwrap_or_else(|| crate::wake_hub::DEFAULT_HUB_ID.to_owned());
+    let mut facts = vec![(FACT_RECEIVER_AGENT_ID.to_owned(), agent.to_owned())];
+    let mut problems = Vec::new();
+
+    // Half 1: the credential the listener presents.
+    match key_dir {
+        Ok(key_dir) => {
+            let bundle = crate::wake_client::HubJoinBundle::default_path(&key_dir, agent);
+            let stamp = now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            match crate::wake_client::HubJoinBundle::load(&bundle, &hub_id, &key_dir, &stamp) {
+                Ok(b) => facts.push((
+                    FACT_RECEIVER_BUNDLE.into(),
+                    format!("valid until {}", b.not_after()),
+                )),
+                Err(e) => {
+                    facts.push((FACT_RECEIVER_BUNDLE.into(), format!("unusable: {e:#}")));
+                    problems.push(format!(
+                        "no usable delegation bundle at {}",
+                        bundle.display()
+                    ));
+                }
+            }
+        }
+        Err(e) => {
+            facts.push((
+                FACT_RECEIVER_BUNDLE.into(),
+                format!("key dir unresolvable: {e:#}"),
+            ));
+            problems.push("the key directory cannot be resolved".into());
+        }
+    }
+
+    // Half 2: the hub's admission list.
+    match block.allowlist.as_deref() {
+        None => facts.push((
+            FACT_RECEIVER_ALLOWLISTED.into(),
+            "unknown ([wake_hub].allowlist not set in this config)".into(),
+        )),
+        Some(path) => match crate::wake_hub::delegation_verifier::AllowlistCache::read_file(path) {
+            Ok(file) => {
+                let listed = file.agents.iter().any(|a| a.agent_id == agent);
+                facts.push((FACT_RECEIVER_ALLOWLISTED.into(), listed.to_string()));
+                if !listed {
+                    problems.push(format!("not in the hub allowlist {}", path.display()));
+                }
+                let age = file
+                    .refreshed_at
+                    .as_deref()
+                    .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+                    .map(|t| (*now - t.with_timezone(&chrono::Utc)).num_seconds());
+                facts.push((
+                    FACT_ALLOWLIST_AGE_SECS.into(),
+                    age.map_or_else(|| "unknown".into(), |a| a.to_string()),
+                ));
+                if age.is_none_or(|a| a > crate::identity::hub_cache::MAX_CACHE_AGE_SECS) {
+                    problems.push(format!(
+                        "the allowlist snapshot is older than {} s (or undated), so the \
+                             hub refuses every hello — the refresher is not running",
+                        crate::identity::hub_cache::MAX_CACHE_AGE_SECS
+                    ));
+                }
+            }
+            Err(e) => {
+                facts.push((
+                    FACT_RECEIVER_ALLOWLISTED.into(),
+                    format!("unreadable: {e:#}"),
+                ));
+                problems.push(format!("the allowlist {} is unreadable", path.display()));
+            }
+        },
+    }
+    ReceiverReadiness {
+        facts,
+        problems,
+        hub_id,
     }
 }
 
@@ -275,6 +414,93 @@ mod tests {
         app
     }
 
+    /// The pre-#4087 call shape: no named receiver.
+    fn section_wake_hub_3471_none(app: &AppConfig) -> ReportSection {
+        section_wake_hub_3471(app, None)
+    }
+
+    fn private_dir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("chmod 0700");
+        dir
+    }
+
+    fn write_allowlist(path: &Path, agents: &[&str], refreshed_at: &str) {
+        let rows: Vec<serde_json::Value> = agents
+            .iter()
+            .map(|a| {
+                serde_json::json!({
+                    "agent_id": a,
+                    "pubkey_b64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                    "bind_authority": "possession_proof",
+                    "bound_at": "2026-09-01T00:00:00Z",
+                })
+            })
+            .collect();
+        let body = serde_json::json!({
+            "version": crate::wake_hub::delegation_verifier::ALLOWLIST_FILE_VERSION,
+            "refreshed_at": refreshed_at,
+            "agents": rows,
+        });
+        std::fs::write(path, serde_json::to_vec(&body).expect("json")).expect("write");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+    }
+
+    /// #4087 — the f2 incident, reproduced as configuration: a hub is
+    /// configured, the named agent has no bundle and is not on the
+    /// allowlist. Doctor must WARN and name both halves of the fix.
+    #[test]
+    fn an_agent_absent_from_bundle_and_allowlist_is_a_warning_4087() {
+        let dir = private_dir();
+        let allow = dir.path().join("allow.json");
+        let now = chrono::Utc::now();
+        write_allowlist(&allow, &["ai:fable"], &now.to_rfc3339());
+        let mut app = app_with_socket(dir.path().join("hub.sock"));
+        if let Some(w) = app.wake_hub.as_mut() {
+            w.allowlist = Some(allow);
+            w.hub_id = Some("ai-memory-team-f2".into());
+        }
+        let r = receiver_readiness(&app, "ai:codex-f2", Ok(dir.path().to_path_buf()), &now);
+        assert_eq!(r.problems.len(), 2, "{:?}", r.problems);
+        assert!(r.problems.iter().any(|p| p.contains("delegation bundle")));
+        assert!(
+            r.problems
+                .iter()
+                .any(|p| p.contains("not in the hub allowlist"))
+        );
+        assert_eq!(r.hub_id, "ai-memory-team-f2");
+
+        // And the listed agent is only missing its bundle.
+        let r = receiver_readiness(&app, "ai:fable", Ok(dir.path().to_path_buf()), &now);
+        assert_eq!(r.problems.len(), 1, "{:?}", r.problems);
+    }
+
+    /// A stale snapshot refuses everyone; doctor must say so.
+    #[test]
+    fn a_stale_allowlist_snapshot_is_a_problem_4087() {
+        let dir = private_dir();
+        let allow = dir.path().join("allow.json");
+        let now = chrono::Utc::now();
+        write_allowlist(
+            &allow,
+            &["ai:codex-f2"],
+            &(now - chrono::TimeDelta::seconds(600)).to_rfc3339(),
+        );
+        let mut app = app_with_socket(dir.path().join("hub.sock"));
+        if let Some(w) = app.wake_hub.as_mut() {
+            w.allowlist = Some(allow);
+        }
+        let r = receiver_readiness(&app, "ai:codex-f2", Ok(dir.path().to_path_buf()), &now);
+        assert!(
+            r.problems
+                .iter()
+                .any(|p| p.contains("refresher is not running")),
+            "{:?}",
+            r.problems
+        );
+    }
+
     fn fact<'a>(s: &'a ReportSection, key: &str) -> &'a str {
         s.facts
             .iter()
@@ -297,7 +523,7 @@ mod tests {
         std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(SOCKET_MODE))
             .expect("chmod");
 
-        let s = section_wake_hub_3471(&app_with_socket(sock.clone()));
+        let s = section_wake_hub_3471_none(&app_with_socket(sock.clone()));
         assert_eq!(fact(&s, FACT_CONFIGURED), "yes");
         assert_eq!(fact(&s, "socket_present"), "yes");
         assert_eq!(fact(&s, KEY_SOCKET_MODE), fmt_mode(SOCKET_MODE));
@@ -323,7 +549,7 @@ mod tests {
         let _l = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
         std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o666)).expect("chmod");
 
-        let s = section_wake_hub_3471(&app_with_socket(sock));
+        let s = section_wake_hub_3471_none(&app_with_socket(sock));
         assert_eq!(s.severity, Severity::Critical);
         let note = s.note.expect("a critical finding must explain itself");
         assert!(note.contains("mode"), "{note}");
@@ -342,7 +568,7 @@ mod tests {
         std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(SOCKET_MODE))
             .expect("chmod sock");
 
-        let s = section_wake_hub_3471(&app_with_socket(sock));
+        let s = section_wake_hub_3471_none(&app_with_socket(sock));
         assert_eq!(s.severity, Severity::Critical);
         let note = s.note.expect("note");
         assert!(note.contains("owner-only"), "{note}");
@@ -360,7 +586,7 @@ mod tests {
         bare.wake_hub = None;
         let _ = app;
 
-        let s = section_wake_hub_3471(&bare);
+        let s = section_wake_hub_3471_none(&bare);
         // The default socket path almost certainly does not exist in the test
         // environment; if it DID, this host really is running a hub and the
         // section is entitled to report on it.
@@ -375,7 +601,7 @@ mod tests {
     #[test]
     fn a_configured_host_with_no_socket_is_not_critical() {
         let tmp = tempfile::tempdir().expect("tmp");
-        let s = section_wake_hub_3471(&app_with_socket(tmp.path().join("absent.sock")));
+        let s = section_wake_hub_3471_none(&app_with_socket(tmp.path().join("absent.sock")));
         assert_eq!(fact(&s, FACT_CONFIGURED), "yes");
         assert_eq!(fact(&s, "socket_present"), "no");
         assert_ne!(s.severity, Severity::Critical);
@@ -384,7 +610,7 @@ mod tests {
     #[test]
     fn the_fd_budget_facts_are_always_reported() {
         let tmp = tempfile::tempdir().expect("tmp");
-        let s = section_wake_hub_3471(&app_with_socket(tmp.path().join("x.sock")));
+        let s = section_wake_hub_3471_none(&app_with_socket(tmp.path().join("x.sock")));
         assert_eq!(
             fact(&s, "rlimit_nofile_desired"),
             DESIRED_NOFILE.to_string()

@@ -174,7 +174,45 @@ pub async fn cmd_inbox_waiting(
         // immediately, and the fleet recipe that swaps `sleep 180;
         // ai-memory inbox` for this command would become a hot loop of
         // immediate reads with a warning per iteration.
-        match crate::cli::wake_listen::wait_for_wake_or_backstop(&resolved, timeout).await {
+        // #4087 — a wait that cannot receive hub wakes must SAY so, on
+        // stderr, because this verb installs no tracing subscriber: the WARN
+        // the wait logs went nowhere, and a refused or credential-less agent
+        // looked exactly like a quiet inbox that waited out its timeout.
+        //
+        // A missing credential is only news on a host that runs a hub. With
+        // no `[wake_hub]` block and no socket on disk the backstop poll is
+        // the documented delivery mechanism, not a fault, and saying so on
+        // every call would train operators to ignore the line.
+        let hub_expected = app_config.wake_hub.is_some()
+            || resolved
+                .socket
+                .as_deref()
+                .is_some_and(|p| std::fs::symlink_metadata(p).is_ok());
+        let mut report = |degraded: &crate::cli::wake_listen::WaitDegraded| {
+            use std::io::Write as _;
+            if !hub_expected
+                && matches!(
+                    degraded,
+                    crate::cli::wake_listen::WaitDegraded::Credential { .. }
+                )
+            {
+                return;
+            }
+            // Best effort by design: a closed stderr must not stop the read
+            // this command exists to perform (ERRORS-19, discard is explicit).
+            let _ = writeln!(
+                std::io::stderr().lock(),
+                "warning: {}",
+                degraded.explain(&resolved)
+            );
+        };
+        match crate::cli::wake_listen::wait_for_wake_or_backstop_reporting(
+            &resolved,
+            timeout,
+            &mut report,
+        )
+        .await
+        {
             Ok(Some(signal)) => {
                 tracing::debug!(reason = signal.reason.label(), "inbox --wait: woken");
             }

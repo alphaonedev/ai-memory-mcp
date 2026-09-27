@@ -1212,6 +1212,51 @@ impl Filter {
 /// this filter — either by accepting a `&CallerContext` and routing
 /// through `is_visible_to_caller`, or by documenting an
 /// admin-/operator-only contract that bypasses the filter.
+/// v1.0.0 #4056 — one notify, as [`MemoryStore::notify_request`] takes it.
+///
+/// A struct rather than an eighth positional argument: every field is a
+/// caller decision, and `tier_ttl_secs` sitting positionally beside
+/// `priority` is exactly the kind of `Option<i32>`/`Option<i64>` pair a call
+/// site transposes without a compiler noticing.
+#[derive(Debug, Clone, Copy)]
+pub struct NotifyRequest<'a> {
+    /// Recipient agent; the row lands in its `_inbox/<agent>` namespace.
+    pub target_agent: &'a str,
+    /// The caller's subject, kept verbatim in `metadata.subject`.
+    pub title: &'a str,
+    /// Verbatim caller payload.
+    pub payload: &'a str,
+    /// Priority; `None` is the adapter default.
+    pub priority: Option<i32>,
+    /// Tier; `None` is `short`.
+    pub tier: Option<&'a Tier>,
+    /// Caller-supplied covenant clause-1 rationale (#2122).
+    pub why_trace: Option<&'a str>,
+    /// The OPERATOR-resolved TTL for the row's tier, in seconds
+    /// (`ResolvedTtl::ttl_for_tier`). `None` leaves the expiry to the shared
+    /// insert funnel, i.e. the compiled tier default — exactly what the
+    /// SQLite `persist_notify` path does for an unset tier TTL, so the two
+    /// backends agree on every input. A `long` row never expires either way.
+    pub tier_ttl_secs: Option<i64>,
+}
+
+impl NotifyRequest<'_> {
+    /// The `expires_at` this request stamps on a row created at `now` with
+    /// `tier`: `now + tier_ttl_secs`, `None` for `long` (permanent on every
+    /// lane, #2399) or when no TTL was resolved. An out-of-range sum is `None`
+    /// (the funnel default applies) rather than a panic.
+    #[must_use]
+    pub fn expires_at(&self, now: chrono::DateTime<chrono::Utc>, tier: &Tier) -> Option<String> {
+        if matches!(tier, Tier::Long) {
+            return None;
+        }
+        self.tier_ttl_secs
+            .and_then(chrono::TimeDelta::try_seconds)
+            .and_then(|d| now.checked_add_signed(d))
+            .map(|at| at.to_rfc3339())
+    }
+}
+
 #[async_trait::async_trait]
 pub trait MemoryStore: Send + Sync {
     /// Capability bits advertised by this adapter. Stable across the
@@ -4367,16 +4412,46 @@ pub trait MemoryStore: Send + Sync {
     /// `AI_MEMORY_REQUIRE_WHY_TRACE=1` a why_trace-less notify is refused
     /// by the store gate.
     ///
-    /// Default returns `UnsupportedCapability`.
+    /// The row expires at the COMPILED tier default. A caller that holds the
+    /// operator's `[ttl]` resolution must use [`Self::notify_request`] with
+    /// [`NotifyRequest::tier_ttl_secs`] set — the HTTP funnel does (#4056).
+    ///
+    /// Default delegates to [`Self::notify_request`].
     async fn notify(
         &self,
+        ctx: &CallerContext,
+        target_agent: &str,
+        title: &str,
+        payload: &str,
+        priority: Option<i32>,
+        tier: Option<&Tier>,
+        why_trace: Option<&str>,
+    ) -> StoreResult<String> {
+        self.notify_request(
+            ctx,
+            NotifyRequest {
+                target_agent,
+                title,
+                payload,
+                priority,
+                tier,
+                why_trace,
+                tier_ttl_secs: None,
+            },
+        )
+        .await
+    }
+
+    /// v1.0.0 #4056 — [`Self::notify`] carrying the operator-resolved TTL for
+    /// the row's tier, so the persisted `expires_at` honours `[ttl]` on every
+    /// backend. The expiry is set on the row BEFORE the atomic no-overwrite
+    /// insert — never patched afterwards.
+    ///
+    /// Default returns `UnsupportedCapability`.
+    async fn notify_request(
+        &self,
         _ctx: &CallerContext,
-        _target_agent: &str,
-        _title: &str,
-        _payload: &str,
-        _priority: Option<i32>,
-        _tier: Option<&Tier>,
-        _why_trace: Option<&str>,
+        _req: NotifyRequest<'_>,
     ) -> StoreResult<String> {
         Err(StoreError::UnsupportedCapability {
             capability: "NOTIFY".to_string(),

@@ -350,30 +350,86 @@ pub fn prepare_socket_path(path: &Path) -> Result<()> {
             path.display()
         );
     }
-    // A BLOCKING connect, deliberately: this runs once at start-up, before the
-    // listener exists, and the alternative — unlinking whatever is at the path —
-    // is how a mistyped socket path becomes data loss. The probe targets a local
-    // AF_UNIX socket, so it resolves immediately in both outcomes.
-    match std::os::unix::net::UnixStream::connect(path) {
-        Ok(_) => bail!(
+    match probe_socket_liveness(path) {
+        SocketLiveness::Live => bail!(
             "wake-hub: another wake-hub is already listening on {}. Refusing to \
              take over a live socket.",
             path.display()
         ),
-        Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => fs::remove_file(path)
-            .with_context(|| {
-                format!(
-                    "wake-hub: could not remove the stale socket {}",
-                    path.display()
-                )
-            }),
-        Err(e) => Err(e).with_context(|| {
+        SocketLiveness::Busy => bail!(
+            "wake-hub: {} is held by a live listener whose accept queue is FULL (a \
+             wedged or paused hub). Refusing to take over a live socket; stop that \
+             process first.",
+            path.display()
+        ),
+        SocketLiveness::Stale => fs::remove_file(path).with_context(|| {
+            format!(
+                "wake-hub: could not remove the stale socket {}",
+                path.display()
+            )
+        }),
+        SocketLiveness::Unknown(e) => Err(e).with_context(|| {
             format!(
                 "wake-hub: {} is a socket but could not be probed; refusing to \
                  unlink a socket whose state is unknown",
                 path.display()
             )
         }),
+    }
+}
+
+/// What a single NON-BLOCKING connect says about the socket at a path.
+#[derive(Debug)]
+pub enum SocketLiveness {
+    /// A listener accepted the connection: a live hub owns the path.
+    Live,
+    /// A listener exists but its accept queue is full (`EAGAIN`): live, and
+    /// wedged or paused. Never takeover material.
+    Busy,
+    /// Nothing is bound to the path (`ECONNREFUSED`): the one DEFINITE-stale
+    /// outcome, and the only one that licenses an unlink.
+    Stale,
+    /// Anything else. Ambiguous, so it is treated as "do not unlink".
+    Unknown(io::Error),
+}
+
+/// Probe the socket at `path` with ONE non-blocking connect (#4057).
+///
+/// The probe used to be a BLOCKING `UnixStream::connect` on the premise that an
+/// `AF_UNIX` connect "resolves immediately in both outcomes". That is false on
+/// Linux: when the target is a live listener whose accept backlog is full, a
+/// blocking connect sleeps in `unix_wait_for_peer` until queue space appears —
+/// for a wedged hub, never — and this runs inside `WakeHub::bind`, before any
+/// serve loop or shutdown future exists, so `wake-hub` start-up hung with no
+/// program-level bound. A non-blocking socket cannot sleep there: the same
+/// condition returns `EAGAIN` at once. (Wrapping the blocking connect in an
+/// async timeout would not have helped — it cannot be cancelled.)
+///
+/// Only `ECONNREFUSED` is definite-stale. Every other outcome — accepted,
+/// queue-full, or any error — is live-or-unknown, and refuses takeover.
+#[must_use]
+pub fn probe_socket_liveness(path: &Path) -> SocketLiveness {
+    use socket2::{Domain, SockAddr, Socket, Type};
+    let attempt = || -> io::Result<()> {
+        let sock = Socket::new(Domain::UNIX, Type::STREAM, None)?;
+        sock.set_nonblocking(true)?;
+        sock.connect(&SockAddr::unix(path)?)
+        // `sock` drops here: a probe that connected closes at once, exactly as
+        // the blocking probe did.
+    };
+    match attempt() {
+        Ok(()) => SocketLiveness::Live,
+        Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => SocketLiveness::Stale,
+        // Linux reports a full accept queue on a non-blocking AF_UNIX connect
+        // as EAGAIN. EINPROGRESS cannot occur for AF_UNIX on Linux, but if a
+        // platform ever returns it, a connect in flight is a listener.
+        Err(e)
+            if e.kind() == io::ErrorKind::WouldBlock
+                || e.raw_os_error() == Some(libc::EINPROGRESS) =>
+        {
+            SocketLiveness::Busy
+        }
+        Err(e) => SocketLiveness::Unknown(e),
     }
 }
 

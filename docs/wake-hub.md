@@ -661,13 +661,35 @@ A hub that is merely DOWN is already covered by the always-armed backstop: the
 credential loads, the session loop backs off, and the poll returns on schedule.
 When the CREDENTIAL itself will not load — no `ai-memory identity delegate` was
 ever run on this host, the bundle expired, or it was minted for another hub —
-`--wait` logs that refusal once at `WARN` with its cause chain and then waits
-on the bounded poll anyway. That is deliberate: `--wait` is the drop-in for
+`--wait` prints that refusal once on stderr (a `warning:` line with its cause
+chain and remediation) and then waits on the bounded poll anyway. That is deliberate: `--wait` is the drop-in for
 `sleep 180; ai-memory inbox`, and a version that returned immediately on a
 credential error would replace a paced poll with a hot loop. `ai-memory
 wake-listen` keeps the hard refusal, because an operator who started the
 listener explicitly asked for a hub session and needs to see why it will not
 open.
+
+#### Receiving wakes: both halves of admission (#4087)
+
+An agent receives hub wakes only when the hub ADMITS it, and admission has two
+halves that are configured in two different places:
+
+1. **A delegation bundle for this hub**, on the host that waits:
+   `ai-memory identity delegate --scope a2a-hub --agent-id <agent> --hub-id <hub>`.
+   It needs the agent's enrolled key (`identity generate` + a possession-proved
+   `agents bind-key`).
+2. **A row in the hub's allowlist snapshot**: `--include-agent <agent>` in the
+   refresher that runs `ai-memory identity hub-cache` every 30 s. An agent with
+   no possession-proved binding is OMITTED from the snapshot — the publish line
+   now lists it under `omitted_agents` and prints a `warning:` on stderr.
+
+Missing either half, the hub never admits the agent, and `inbox --wait` can
+only ever return on the backstop poll. That is a degraded wait, not a failed
+one — but it is announced: `inbox --wait` prints a `warning:` line naming the
+refusal and both remedies the moment the hub refuses, and `ai-memory doctor
+--agent-id <agent>` reports `receiver_bundle` / `receiver_allowlisted` /
+`allowlist_age_secs` in the **Wake hub** section and raises a Warning when the
+agent cannot be admitted.
 
 ## Keeping the snapshot fresh: the refresher is not optional
 
@@ -1081,3 +1103,10 @@ absence is never a finding, because running the hub in the foreground or under
 another supervisor is a legitimate deployment. On a host with no `[wake_hub]`
 configuration and no socket on disk the section reports `configured = no` and
 nothing else.
+
+On a host that runs a hub, `doctor --agent-id <agent>` also checks whether
+that agent can RECEIVE wakes (#4087): a loadable delegation bundle for the
+configured hub, a row in the `[wake_hub].allowlist` snapshot, and a snapshot
+younger than 60 s. Any of them missing is a **Warning** naming the exact
+commands that fix it — the configuration under which `inbox --wait` can only
+ever return on the backstop.

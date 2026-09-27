@@ -194,7 +194,12 @@ impl Session {
                 // so one per-frame error — e.g. a refused subscribe on ONE topic
                 // — does not tear the whole listener down.
                 if ErrorCode::wire_is_session_fatal(code) {
-                    bail!("the hub refused this session: {code} {reason}");
+                    return Err(HubRefusal {
+                        stage: RefusalStage::Session,
+                        code,
+                        reason,
+                    }
+                    .into());
                 }
                 metrics.refused_frame_skipped();
                 tracing::debug!(
@@ -332,10 +337,60 @@ async fn handshake(
         Kind::Error => {
             let (code, reason) =
                 decode_error(&reply.payload).unwrap_or((0, CTX_UNPARSEABLE_REFUSAL.to_owned()));
-            bail!("the hub refused the handshake: {code} {reason}");
+            Err(HubRefusal {
+                stage: RefusalStage::Handshake,
+                code,
+                reason,
+            }
+            .into())
         }
         other => bail!("the hub answered the hello with {other}, not a welcome"),
     }
+}
+
+/// The hub was REACHED and answered the hello with a refusal.
+///
+/// Typed (rather than a message string) so a consumer can tell "this agent is
+/// not admitted by that hub" — an operator must change the allowlist or the
+/// delegation — from "the hub is unreachable", which the reconnect ladder and
+/// the backstop already cover. See [`is_hub_refusal`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HubRefusal {
+    /// Whether the hub refused the hello or ended an admitted session (the
+    /// one-second revalidation found the agent no longer admitted).
+    pub stage: RefusalStage,
+    /// The wire status code the hub answered with (`0` when unparseable).
+    pub code: u16,
+    /// The hub's reason text.
+    pub reason: String,
+}
+
+impl std::fmt::Display for HubRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let what = match self.stage {
+            RefusalStage::Handshake => "the handshake",
+            RefusalStage::Session => "this session",
+        };
+        write!(f, "the hub refused {what}: {} {}", self.code, self.reason)
+    }
+}
+
+/// Where in a session's life the hub refused it. The rendered text of each is
+/// byte-identical to the pre-#4087 message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefusalStage {
+    /// The hello was refused: the agent was never admitted.
+    Handshake,
+    /// An admitted session was ended with a session-fatal code.
+    Session,
+}
+
+impl std::error::Error for HubRefusal {}
+
+/// `true` when `err` (anywhere in its chain) is a [`HubRefusal`].
+#[must_use]
+pub fn is_hub_refusal(err: &anyhow::Error) -> bool {
+    err.chain().any(|c| c.is::<HubRefusal>())
 }
 
 /// Read exactly one decoded frame, bounded by `timeout`.

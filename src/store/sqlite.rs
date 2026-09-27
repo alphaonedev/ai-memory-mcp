@@ -3968,21 +3968,29 @@ impl MemoryStore for SqliteStore {
             .map_err(box_err)
     }
 
-    async fn notify(
+    async fn notify_request(
         &self,
         ctx: &CallerContext,
-        target_agent: &str,
-        title: &str,
-        payload: &str,
-        priority: Option<i32>,
-        tier: Option<&Tier>,
-        why_trace: Option<&str>,
+        req: crate::store::NotifyRequest<'_>,
     ) -> StoreResult<String> {
+        let crate::store::NotifyRequest {
+            target_agent,
+            title,
+            payload,
+            priority,
+            tier,
+            why_trace,
+            tier_ttl_secs: _,
+        } = req;
         // Compose the notify memory using the same shape as
         // `mcp::handle_notify`: a memory in `_inbox/<target_agent>` with
         // `metadata.target_agent_id` set so subsequent inbox pulls find it.
-        let now = chrono::Utc::now().to_rfc3339();
+        let now_dt = chrono::Utc::now();
+        let now = now_dt.to_rfc3339();
         let resolved_tier = tier.cloned().unwrap_or(Tier::Short);
+        // #4056 — the operator's `[ttl]` for this tier, set on the row BEFORE
+        // the no-overwrite insert (the funnel only backfills a `None`).
+        let expires_at = req.expires_at(now_dt, &resolved_tier);
         let priority = priority.unwrap_or(5);
         // #3639 — unique stored title + verbatim subject (see
         // `crate::inbox_stored_title`); inserted refuse-on-conflict below.
@@ -4014,7 +4022,7 @@ impl MemoryStore for SqliteStore {
             created_at: now.clone(),
             updated_at: now,
             last_accessed_at: None,
-            expires_at: None,
+            expires_at,
             metadata,
             reflection_depth: 0,
             memory_kind: crate::models::MemoryKind::Observation,

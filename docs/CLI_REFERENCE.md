@@ -2284,9 +2284,10 @@ alias for `inbox`); a welcome that reports coalesced wakes, or one flagged
 
 When the hub CREDENTIAL will not load — a host that never ran
 `ai-memory identity delegate`, an expired bundle, one minted for another hub —
-the command logs that refusal once at `WARN` with its full cause chain (so the
-re-mint remediation is visible) and then **waits on the bounded backstop poll
-anyway**, which is what "otherwise the bounded backstop poll" above means. It
+the command prints that refusal once on **stderr** as a `warning:` line with
+its full cause chain and the remediation (on a host that runs a hub: a
+`[wake_hub]` block or a socket on disk), and then **waits on the bounded
+backstop poll anyway**, which is what "otherwise the bounded backstop poll" above means. It
 does NOT read immediately: a `--wait` that returned at once on a credential
 error would turn the `sleep 180; ai-memory inbox` replacement into a hot loop
 of immediate reads. `ai-memory wake-listen` keeps the hard refusal instead —
@@ -2294,6 +2295,19 @@ an operator who started the listener explicitly asked for a hub session and
 needs to see why it will not open. Only a failure to start the hub-LESS
 stream (an invalid poll interval, no runtime) makes the command read at once,
 because neither is recoverable by waiting.
+
+The same `warning:` line is printed, once, the moment the hub **refuses** the
+agent (it is not in the hub's allowlist snapshot, the snapshot is stale, or
+the delegation does not verify) or cannot be **reached**. Each is a degraded
+wait bounded by the backstop, never a failure — but never a silent one
+either: before [#4087](https://github.com/alphaonedev/ai-memory-mcp/issues/4087) this command installed no log subscriber, so the
+`WARN` went nowhere and an agent the hub could not admit looked exactly like
+a quiet inbox that waited out its timeout. A wait can receive hub wakes only
+when BOTH halves of admission hold — a delegation bundle for this hub
+(`ai-memory identity delegate --scope a2a-hub --agent-id <agent> --hub-id
+<hub>`) and a row in the allowlist snapshot (`ai-memory identity hub-cache
+--include-agent <agent>` in the refresher). `ai-memory doctor --agent-id
+<agent>` checks both.
 
 ## Shell, completions, man
 

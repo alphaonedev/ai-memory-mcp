@@ -175,16 +175,30 @@ pub async fn notify(
             }
         };
         let ctx = crate::store::CallerContext::for_agent(&sender);
+        // #4056 — honour the operator's `[ttl]` tier override, exactly as the
+        // sqlite branch below does (`lock.2` handed to
+        // `handle_notify_as_sender`). Pre-fix this branch carried a tier and
+        // no TTL, the row was built with `expires_at: None`, and the insert
+        // funnel backfilled the COMPILED default — a `short_ttl_secs = 86400`
+        // deployment persisted a 6 h expiry here and 24 h on sqlite, so
+        // unhandled A2A messages vanished from the recipient's inbox early.
+        // `ResolvedTtl` lives in the `app.db` tuple on BOTH backends (#1911);
+        // snapshot it and release the lock before the store call.
+        let resolved_ttl = app.db.lock().await.2.clone();
+        let row_tier = resolved_tier.clone().unwrap_or(Tier::Short);
         let new_id = match app
             .store
-            .notify(
+            .notify_request(
                 &ctx,
-                &body.target_agent_id,
-                &body.title,
-                &payload,
-                priority_i32,
-                resolved_tier.as_ref(),
-                body.why_trace.as_deref(),
+                crate::store::NotifyRequest {
+                    target_agent: &body.target_agent_id,
+                    title: &body.title,
+                    payload: &payload,
+                    priority: priority_i32,
+                    tier: resolved_tier.as_ref(),
+                    why_trace: body.why_trace.as_deref(),
+                    tier_ttl_secs: resolved_ttl.ttl_for_tier(&row_tier),
+                },
             )
             .await
         {
