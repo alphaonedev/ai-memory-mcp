@@ -2231,12 +2231,20 @@ shell word-splitting.
 | `AI_MEMORY_WAKE_HUB_ID` | the hub this session joined |
 | `AI_MEMORY_WAKE_INBOX_ROW_ID` | the durable row the hint names (empty when none) |
 | `AI_MEMORY_WAKE_NAMESPACE` | namespace the row landed in |
-| `AI_MEMORY_WAKE_SENDER` | agent that wrote the row |
+| `AI_MEMORY_WAKE_SENDER` | the sender the wake CLAIMS — peer-asserted, **not authenticated** (#3637) |
 | `AI_MEMORY_WAKE_DIGEST` | lowercase hex SHA-256 **of the body** — never the body |
 | `AI_MEMORY_WAKE_SEQ` | the producer's wake watermark at mint time |
 | `AI_MEMORY_WAKE_MISSED` | wakes this listener demonstrably did not see |
 | `AI_MEMORY_WAKE_PENDING` | wakes the hub coalesced while this agent was offline |
 | `AI_MEMORY_WAKE_INBOX_COUNT` | messages the catch-up read returned |
+
+**None of these values is authenticated (#3637).** Any admitted hub peer can
+send a direct wake to any agent with arbitrary `sender`, `namespace`, row id
+and digest; the listener presents the payload's claims, not the hub-stamped
+sender. Treat the metadata as a hint to read the inbox, and decide on the
+durable row the catch-up read returns (its recorded author, and a digest you
+recompute), never on `AI_MEMORY_WAKE_SENDER`. See `docs/wake-hub.md`,
+"The wake metadata is peer-asserted".
 
 These are EMITTED into the hook's environment; they are not knobs the substrate
 reads, so they carry no precedence ladder and appear in no `AI_MEMORY_*`

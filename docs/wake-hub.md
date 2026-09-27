@@ -291,7 +291,8 @@ A substrate wake is stamped with the reserved `wake-hub-producer` identity, NOT
 with the notifying agent's id. No hub session ever authenticated that agent for
 that frame, so putting its id on the frame's `from` would be a claim the hub
 never checked. The real sender rides in the wake metadata, where it is plainly
-metadata.
+metadata — and metadata is exactly what it is: **nothing authenticates it.**
+See [The wake metadata is peer-asserted](#the-wake-metadata-is-peer-asserted-3637).
 
 `wake-hub-producer` is a reserved agent id, so no wire caller can register it or
 claim it through `X-Agent-Id`, an MCP tool argument, or an HTTP body. "May wake
@@ -617,6 +618,36 @@ word-splitting):
 
 `_DIGEST` is what lets a hook verify what it later reads without the hub ever
 having seen it. There is no body variable because there is no body on the wire.
+
+### The wake metadata is peer-asserted (#3637)
+
+**`AI_MEMORY_WAKE_SENDER` is NOT an authenticator, and neither is any other
+wake field.** Treat `_SENDER`, `_NAMESPACE`, `_INBOX_ROW_ID`, `_DIGEST` and
+`_SEQ` — and the `from=` / `ns=` / `row=` the console prints — as an
+unverified HINT that there may be mail, never as a statement of who sent it.
+
+* **Who can forge it.** Any peer the hub has admitted may send a direct
+  `to=<agent>` wake to any agent; direct wakes are not scope-gated. The hub
+  stamps the frame's `from` with the authenticated sender, but it relays the
+  metadata payload byte-for-byte, and the listener presents the payload's
+  `sender` — not the hub-stamped `from` — to the console and the hook. So
+  `ai:mallory` can make alice's hook see `AI_MEMORY_WAKE_SENDER=ai:ceo`,
+  `AI_MEMORY_WAKE_NAMESPACE=finance` and a plausible row id.
+* **What is still trustworthy.** Only the durable row. The catch-up read the
+  listener performs goes through the store's own access checks, and the row's
+  own recorded author is the fact. A hook that makes a decision based on who
+  sent something must read the row (by `_INBOX_ROW_ID`, then check the row's
+  author and recompute `_DIGEST` over what it read), and must treat a row that
+  is missing, or whose author or digest does not match, as a forged or stale
+  hint and do nothing.
+* **What the forgery costs the victim.** Each forged wake costs the victim one
+  inbox read and, with `--exec`, one hook run plus one signed
+  `process.spawn_audited` row. An admitted peer can therefore make a victim's
+  hook run and its audit spine grow at the hub's per-peer rate limit.
+* **Tracked.** Carrying the hub-stamped `from` through to the listener and
+  trusting the metadata only from the reserved `wake-hub-producer` identity is
+  the structural fix; it is tracked in #3972. Until it
+  lands, this section is the contract.
 These variables are EMITTED by the listener, not read by the substrate, so they
 carry no precedence ladder and appear in no `AI_MEMORY_*` resolution table.
 

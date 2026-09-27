@@ -39,12 +39,18 @@
 //! | `AI_MEMORY_WAKE_HUB_ID` | the hub this session joined |
 //! | `AI_MEMORY_WAKE_INBOX_ROW_ID` | the durable row the hint names (empty when none) |
 //! | `AI_MEMORY_WAKE_NAMESPACE` | namespace the row landed in |
-//! | `AI_MEMORY_WAKE_SENDER` | agent that wrote the row |
+//! | `AI_MEMORY_WAKE_SENDER` | the sender the wake CLAIMS — peer-asserted, NOT authenticated (#3637) |
 //! | `AI_MEMORY_WAKE_DIGEST` | lowercase hex SHA-256 OF THE BODY — never the body |
 //! | `AI_MEMORY_WAKE_SEQ` | the producer's wake watermark at mint time |
 //! | `AI_MEMORY_WAKE_MISSED` | wakes this listener demonstrably did not see |
 //! | `AI_MEMORY_WAKE_PENDING` | wakes the hub coalesced while offline |
 //! | `AI_MEMORY_WAKE_INBOX_COUNT` | messages the catch-up read returned |
+//!
+//! **None of these values is authenticated (#3637 M1).** Any admitted hub peer
+//! can send a direct wake carrying arbitrary metadata, and the listener
+//! presents the payload's `sender`, not the hub-stamped frame `from`. A hook
+//! must decide on the durable row the catch-up read returns, never on
+//! `AI_MEMORY_WAKE_SENDER`.
 //!
 //! A hook is bounded by [`EXEC_HOOK_TIMEOUT`] and killed past it: a hung hook
 //! must not become a listener that stops reading its inbox. The spawn itself
