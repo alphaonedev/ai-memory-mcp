@@ -1208,7 +1208,10 @@ keeping a brace stack) and names the innermost fn whose body contains the
 call, qualified by `mod`/`trait`/`impl <Type>` (a trait impl is
 `<Type>[<Trait>]`, so an inherent and a trait method of one name differ) /
 outer fn and joined with `.` (`PostgresStore[MemoryStore].resolve_governance_policy`;
-`<top>` outside any fn;
+`<top>` outside any fn; a fn under an ITEM-LEVEL anonymous block, i.e. a
+`const`/`static` initializer or a `macro_rules!` body, is `<unparsed>`, which
+blocks, because an anonymous scope has no name to key on; a header opens its
+body only at angle depth 0, so a const-generic `Gk<{ .. }>` is not the body;
 `<unparsed>`, which blocks, if the file does not lex). A textual
 "nearest preceding `fn`" key was spoofable by one comment, string or nested
 item naming an approved fn. Before #3965 the key was a bare `file:literal`,

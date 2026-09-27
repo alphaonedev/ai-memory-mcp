@@ -116,6 +116,20 @@ for gate in gates:
                 ('store/postgres.rs', '\n' * 31499 + in_pg(in_fn(gov_fn, site), in_fn('execute_pending_action', '    let mk = CallerContext::for_admin_checked;')), True, 'execute_pending_action:<unparsed>'),
                 # Counted per CALL: two approved calls on ONE line exceed the entry.
                 ('store/postgres.rs', '\n' * 31499 + in_pg(in_fn(gov_fn, f'    let (a, b) = (CallerContext::for_admin({gov}), CallerContext::for_admin({gov}));')), True, '2 site(s) in source, 1 allowlisted'),
+                # tmux-22's retest (G1-G4, reproduced by f2r): an ITEM-LEVEL
+                # anonymous scope used to vanish from the key, so a fn inside it
+                # keyed like the approved top-level fn and the move passed.
+                # G1: a fn inside a const initializer block (fail closed).
+                ('store/postgres.rs', '\n' * 31499 + in_pg(in_fn(gov_fn)) + f'\nconst G1: fn() = {{\n    fn {gov_fn}() {{\n        let ctx = CallerContext::for_admin({gov});\n    }}\n    {gov_fn}\n}};', True, '<unparsed>:GOVERNANCE_INTERNAL'),
+                # G2: a fn inside a macro_rules! body (fail closed).
+                ('store/postgres.rs', '\n' * 31499 + in_pg(in_fn(gov_fn)) + f'\nmacro_rules! g2 {{\n    () => {{{{\n        fn {gov_fn}() {{\n            let ctx = CallerContext::for_admin({gov});\n        }}\n    }}}};\n}}', True, '<unparsed>:GOVERNANCE_INTERNAL'),
+                # G3: a const-generic `{..}` in the impl header is not the body.
+                ('store/postgres.rs', '\n' * 31499 + in_pg(in_fn(gov_fn)) + f'\nimpl Gk<{{ core::mem::size_of::<u8>() }}> {{\n    fn {gov_fn}() {{\n        let ctx = CallerContext::for_admin({gov});\n    }}\n}}', True, 'Gk.resolve_governance_policy:GOVERNANCE_INTERNAL'),
+                # G4: a const-generic `{..}` in a fn's return type is not the body.
+                ('store/postgres.rs', '\n' * 31499 + in_pg(in_fn(gov_fn)) + f'\nfn gw() -> Gw<{{ core::mem::size_of::<u8>() }}> {{\n    fn {gov_fn}() {{\n        let ctx = CallerContext::for_admin({gov});\n    }}\n}}', True, 'gw.resolve_governance_policy:GOVERNANCE_INTERNAL'),
+                # Control: a block INSIDE the approved fn is ordinary control flow;
+                # the approved site in it keeps its key and stays clean.
+                ('store/postgres.rs', '\n' * 31499 + in_pg(in_fn(gov_fn, '    if true {', site, '    }')), False, marker),
                 # Control: the approved site under an explicit `Self::`-free full
                 # path keeps its key (no alias involved) and stays clean.
                 ('store/postgres.rs', '\n' * 31499 + in_pg(in_fn(gov_fn, f'    let ctx = crate::store::CallerContext::for_admin({gov});')), False, marker),

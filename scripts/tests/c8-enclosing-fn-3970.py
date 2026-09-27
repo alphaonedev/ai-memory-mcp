@@ -127,7 +127,11 @@ def scan(text, method, literal_only=False):
     line = 1
     stack = []  # entries: (kind, name, paren_depth_at_open)
     paren = 0
-    pending = None  # ("fn"|"impl"|"trait"|"mod", name_or_tokens, paren_depth)
+    # [kind, name_or_tokens, paren_depth, brace_depth, angle_depth]. A header's
+    # body opens only at the header's own paren AND brace depth, and only
+    # when no `<` it opened is still unclosed: a const-generic argument
+    # `Gk<{ .. }>` is otherwise mistaken for the body (tmux-22's G3/G4).
+    pending = None
     prev = None  # previous significant token
     sites = []
     renames = []
@@ -137,16 +141,38 @@ def scan(text, method, literal_only=False):
     ref_only = {"for_admin_checked"} if method == "for_admin" else set()
 
     def key():
+        # Anonymous scopes are not in the key, so a fn inside an ITEM-LEVEL
+        # anonymous block (a const/static initializer `= { .. }`, a
+        # `macro_rules!` body, an item-level macro invocation) would key
+        # exactly like a top-level fn of the same name. That was tmux-22's
+        # G1/G2 retest gap on #3970. Such a fn is keyed `<unparsed>` (fail
+        # closed, which blocks). A block INSIDE a fn body is ordinary control
+        # flow; a helper fn nested there keeps its `outer.inner` key.
         names = []
         innermost_fn = -1
-        for idx, (kind, name, _) in enumerate(stack):
-            if kind != "block":
-                names.append((kind, name))
-                if kind == "fn":
-                    innermost_fn = len(names) - 1
+        seen_fn = False
+        item_block = False
+        for kind, name, _depth in stack:
+            if kind == "block":
+                if not seen_fn:
+                    item_block = True
+                continue
+            if kind == "fn":
+                if item_block:
+                    return UNPARSED
+                seen_fn = True
+            names.append((kind, name))
+            if kind == "fn":
+                innermost_fn = len(names) - 1
         if innermost_fn < 0:
             return TOP
         return ".".join(name for _, name in names[: innermost_fn + 1])
+
+    def in_header(pend):
+        # A token belongs to the pending header only at the header's own
+        # paren and brace depth; anything nested (a const expression inside
+        # `{ .. }`, a parenthesised argument list) is not part of it.
+        return pend is not None and pend[2] == paren and pend[3] == len(stack)
 
     def skip_ws_comments(k):
         nonlocal line
@@ -331,7 +357,7 @@ def scan(text, method, literal_only=False):
                 end = j
                 while end < n and is_ident_char(text[end]):
                     end += 1
-                pending = ("fn", text[j:end], paren)
+                pending = ["fn", text[j:end], paren, len(stack), 0]
                 i = end
                 prev = "<fnname>"
                 continue
@@ -339,14 +365,14 @@ def scan(text, method, literal_only=False):
             None, ";", "}", "{", "]", "unsafe", "default", "pub", "auto", ")",
         ):
             if tok == "impl":
-                pending = ("impl", [], paren)
+                pending = ["impl", [], paren, len(stack), 0]
             else:
                 j = skip_ws_comments(i)
                 end = j
                 while end < n and is_ident_char(text[end]):
                     end += 1
                 if end > j:
-                    pending = (tok, text[j:end], paren)
+                    pending = [tok, text[j:end], paren, len(stack), 0]
                     i = end
                     prev = "<itemname>"
                     continue
@@ -354,9 +380,13 @@ def scan(text, method, literal_only=False):
             paren += 1
         elif tok in (")", "]"):
             paren -= 1
+        elif tok in ("<", ">") and in_header(pending):
+            # `->` and `=>` are separate two-char tokens, so a bare `>` here
+            # only ever closes a generic.
+            pending[4] = pending[4] + 1 if tok == "<" else max(0, pending[4] - 1)
         elif tok == "{":
-            if pending is not None and pending[2] == paren:
-                kind, name, _ = pending
+            if in_header(pending) and pending[4] == 0:
+                kind, name = pending[0], pending[1]
                 if kind == "impl":
                     name = impl_type_name(name)
                 stack.append((kind, name, paren))
@@ -367,7 +397,7 @@ def scan(text, method, literal_only=False):
             if not stack:
                 raise LexError(f"unbalanced }} at line {line}")
             stack.pop()
-        elif tok == ";" and pending is not None and pending[2] == paren:
+        elif tok == ";" and in_header(pending):
             pending = None
         if pending is not None and pending[0] == "impl" and tok not in ("impl", "{"):
             pending[1].append(tok)
