@@ -645,4 +645,46 @@ mod tests {
             "#3577: simulate_production_lineage_seed must restore both flags on drop"
         );
     }
+
+    /// #4015 class guard: no `.local-runs` fixture root under `src/` may be
+    /// built from `std::env::current_dir()`. A cwd-derived root resolves
+    /// against whatever directory a concurrent test moved the process to;
+    /// `local_runs_root` exists so none has to.
+    #[test]
+    fn no_local_runs_root_is_built_from_the_process_cwd_4015() {
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).expect("read src dir") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        walk(&src, &mut files);
+        assert!(files.len() > 100, "the scan must see the source tree");
+        // Built at run time so this file does not match its own needle.
+        let needle = format!("{}(\"{}\")", ".join", ".local-runs");
+        let mut offenders = Vec::new();
+        for file in &files {
+            let text = std::fs::read_to_string(file).expect("read source file");
+            let lines: Vec<&str> = text.lines().collect();
+            for (i, line) in lines.iter().enumerate() {
+                if !line.contains(&needle) {
+                    continue;
+                }
+                let from = i.saturating_sub(3);
+                if lines[from..=i].iter().any(|l| l.contains("current_dir()")) {
+                    offenders.push(format!("{}:{}", file.display(), i + 1));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "use test_support::local_runs_root (or CARGO_MANIFEST_DIR) instead of the process cwd: {offenders:?}"
+        );
+    }
 }
