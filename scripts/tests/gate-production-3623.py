@@ -47,39 +47,49 @@ for gate in gates:
         if gate == 'qc-codegraph-precheck.sh':
             marker = 'GOVERNANCE_INTERNAL'
             site = '            let ctx = CallerContext::for_admin(crate::identity::sentinels::GOVERNANCE_INTERNAL);'
-            # #3965: an allowlist entry is `<file>:<literal>:<count>` and
-            # licenses exactly <count> sites. The allowlist copied into this
-            # tree carries `src/store/postgres.rs:GOVERNANCE_INTERNAL:1` and
-            # `src/cli/agents.rs:DAEMON_PRINCIPAL:2`. Before #3965 the key was
-            # a bare `file:literal`, so an ADDITIONAL site of an approved
-            # literal was invisible (the pre-#3965 cases 19/20/22 were red).
-            # Line position is deliberately NOT part of the key (it drifts on
-            # every unrelated edit): a MOVED site is the same reviewed site.
-            # What must trip is a site the count does not cover, or a new
-            # literal in the file.
+            # #3965/#3970: an allowlist entry is `<file>:<fn>:<literal>:<count>`
+            # and licenses exactly <count> sites of <literal> inside <fn>. The
+            # allowlist copied into this tree carries (among others)
+            # `src/store/postgres.rs:resolve_governance_policy:GOVERNANCE_INTERNAL:1`,
+            # `src/cli/agents.rs:run_bind_api_key:DAEMON_PRINCIPAL:1` +
+            # `src/cli/agents.rs:run_revoke_api_key:DAEMON_PRINCIPAL:1`, and
+            # `src/handlers/links.rs:create_link:caller:1`. Line position is NOT
+            # part of the key (it drifts on every unrelated edit), so a site
+            # MOVED within its function is the same reviewed site; a site in a
+            # DIFFERENT function is a new key (#3970, the #3638 relocation).
+            def in_fn(name, *lines):
+                return 'fn ' + name + '() {\n' + '\n'.join(lines) + '\n}'
+            gov_fn = 'resolve_governance_policy'
             daemon = '    let ctx = CallerContext::for_admin(crate::identity::sentinels::DAEMON_PRINCIPAL);'
             cases = [(name, source, blocked, 'production-probe-3623')
                      for name, source, blocked in cases]
             cases += [
-                ('store/postgres.rs', '\n' * 31499 + site, False, marker),
-                ('store/postgres.rs', '\n' * 31500 + site, False, marker),
-                ('store/postgres.rs', '\n' * 31499 + site + '\n' + site, True, marker),
-                ('store/other.rs', '\n' * 31499 + site, True, marker),
-                ('store/postgres.rs', '\n' * 31499 + site.replace('GOVERNANCE_INTERNAL', 'DAEMON_PRINCIPAL'), True, 'DAEMON_PRINCIPAL'),
-                ('cli/agents.rs', daemon + '\n' + daemon, False, 'DAEMON_PRINCIPAL'),
-                ('cli/agents.rs', daemon + '\n' + daemon + '\n' + daemon, True, 'DAEMON_PRINCIPAL'),
+                ('store/postgres.rs', '\n' * 31499 + in_fn(gov_fn, site), False, marker),
+                ('store/postgres.rs', '\n' * 31500 + in_fn(gov_fn, '', site), False, marker),
+                ('store/postgres.rs', '\n' * 31499 + in_fn(gov_fn, site, site), True, marker),
+                ('store/other.rs', '\n' * 31499 + in_fn(gov_fn, site), True, marker),
+                ('store/postgres.rs', '\n' * 31499 + in_fn(gov_fn, site.replace('GOVERNANCE_INTERNAL', 'DAEMON_PRINCIPAL')), True, 'DAEMON_PRINCIPAL'),
+                # #3970 SWAP: the approved site REMOVED from its function and the
+                # same literal added in another function of the same file. The
+                # count per file is unchanged; the fn-keyed count is not.
+                ('store/postgres.rs', '\n' * 31499 + in_fn('tenant_reachable_handler', site), True, 'tenant_reachable_handler'),
+                ('cli/agents.rs', in_fn('run_bind_api_key', daemon) + '\n' + in_fn('run_revoke_api_key', daemon), False, 'DAEMON_PRINCIPAL'),
+                ('cli/agents.rs', in_fn('run_bind_api_key', daemon, daemon) + '\n' + in_fn('run_revoke_api_key', daemon), True, 'DAEMON_PRINCIPAL'),
                 # #3965 follow-up (Codex review): an argument the old regexes
                 # could not read made the call DISAPPEAR before counting, so a
                 # NEW tenant-side site in an approved file passed. Each form
-                # below is a NEW site in handlers/links.rs, whose allowlist
-                # entry is `src/handlers/links.rs:caller:1`.
-                ('handlers/links.rs', '    let c = CallerContext::for_admin(caller.clone());', True, 'caller.clone()'),
-                ('handlers/links.rs', '    let c = CallerContext::for_admin("ai:review-tenant".to_owned());', True, 'to_owned()'),
-                ('handlers/links.rs', '    let c = CallerContext::for_admin(\n        make_caller(a, b),\n    );', True, 'make_caller'),
-                ('handlers/links.rs', '    let c = CallerContext::for_admin(', True, '<unparsed>'),
-                # Control: the ONE approved `caller` site stays clean, so the
-                # cells above are not passing by blocking everything.
-                ('handlers/links.rs', '    let c = CallerContext::for_admin(&caller);', False, 'caller'),
+                # below is a NEW site in `create_link`, whose only approved
+                # entry is `caller`.
+                ('handlers/links.rs', in_fn('create_link', '    let c = CallerContext::for_admin(caller.clone());'), True, 'caller.clone()'),
+                ('handlers/links.rs', in_fn('create_link', '    let c = CallerContext::for_admin("ai:review-tenant".to_owned());'), True, 'to_owned()'),
+                ('handlers/links.rs', in_fn('create_link', '    let c = CallerContext::for_admin(', '        make_caller(a, b),', '    );'), True, 'make_caller'),
+                ('handlers/links.rs', in_fn('create_link', '    let c = CallerContext::for_admin('), True, '<unparsed>'),
+                # Control: the ONE approved `caller` site in `create_link` stays
+                # clean, so the cells above are not passing by blocking everything.
+                ('handlers/links.rs', in_fn('create_link', '    let c = CallerContext::for_admin(&caller);'), False, 'caller'),
+                # #3970 SWAP on the tenant surface: the approved `caller` site
+                # moved into ANOTHER handler of the same file.
+                ('handlers/links.rs', in_fn('get_links', '    let c = CallerContext::for_admin(&caller);'), True, 'get_links'),
             ]
         else:
             cases = [(name, source, blocked, marker) for name, source, blocked in cases]

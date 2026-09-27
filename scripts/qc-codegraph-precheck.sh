@@ -27,12 +27,12 @@
 #     the count is what makes an ADDITIONAL site visible. Same shape as
 #     the sibling `check-hardcoded-literals.sh` baseline
 #     (`<site-count><TAB><literal>`), which trips on +1.
-#     RESIDUAL (stated, not closed): the count is per FILE, so it licenses
-#     "any <count> sites of <literal> in <file>", not "these reviewed sites".
-#     Removing an approved site and adding one elsewhere in the same file
-#     (a SWAP, e.g. moving a GOVERNANCE_INTERNAL read into a tenant-reachable
-#     function: the #3638 shape) keeps the count and passes. Keying by the
-#     enclosing function closes it (follow-up #3970).
+#     #3970: the key also names the ENCLOSING FUNCTION (`<file>:<fn>:
+#     <literal>:<count>`), so moving an approved site into a DIFFERENT
+#     function (the #3638 shape: a GOVERNANCE_INTERNAL read relocated into a
+#     tenant-reachable handler) is a new key and HARD-BLOCKs. The remaining
+#     granularity is the function: two sites of the same literal inside ONE
+#     function are interchangeable, which the count still bounds.
 #
 # What it deliberately does NOT do (out of scope for v0.7.0):
 #   - Symbol removal / dangling-caller detection. Codegraph indexes
@@ -247,7 +247,19 @@ collect_sites () {
                 # Strip the absolute prefix so the allowlist is
                 # repo-root-relative (and stable across checkouts).
                 local rel="${f#"${ROOT}/"}"
-                out+="${rel}:${lineno}:${literal}"$'\n'
+                # #3970 — key the site by its ENCLOSING FUNCTION too: the
+                # nearest preceding `fn <name>` in the production text (comment
+                # lines skipped; `<top>` when there is none, e.g. a static
+                # initialiser). A site moved into a DIFFERENT function becomes a
+                # new key and HARD-BLOCKs; a site moved within its function
+                # keeps its key (line numbers stay out of it).
+                local encl
+                encl="$(printf '%s\n' "$production" | sed -n "1,${lineno}p" \
+                    | grep -vE '^[[:space:]]*(//|\*)' \
+                    | grep -oE '(^|[^A-Za-z0-9_])fn[[:space:]]+[A-Za-z_][A-Za-z0-9_]*' \
+                    | tail -1 | sed -E 's/.*fn[[:space:]]+//' || true)"
+                encl="${encl:-<top>}"
+                out+="${rel}:${lineno}:${encl}:${literal}"$'\n'
             fi
         done <<< "${matches}"
     done < <(find "${ROOT}/src" -type f -name '*.rs' -print0)
@@ -280,7 +292,7 @@ count_sites () {
 CURRENT_FOR_AGENT_NORM="$(printf '%s' "$CURRENT_FOR_AGENT" | count_sites)"
 CURRENT_FOR_ADMIN_NORM="$(printf '%s' "$CURRENT_FOR_ADMIN" | count_sites)"
 
-ALLOW_FORMAT_LINE='# Format: <repo-root-relative-file>:<literal>:<count>   (#3965: <count> = production sites of <literal> in <file>)'
+ALLOW_FORMAT_LINE='# Format: <repo-root-relative-file>:<fn>:<literal>:<count>   (#3965/#3970: <count> = production sites of <literal> in <fn> of <file>)'
 
 # --update rewrites ONLY the entry lines: every comment (each entry's review
 # justification) is kept in place, an entry whose key is still present gets
@@ -307,6 +319,13 @@ update_allowlist () {
             if ($0 == "") next
             m = match($0, /:[0-9]+$/)
             key = substr($0, 1, m - 1); cur[key] = substr($0, m + 1); order[++n] = key
+            # #3970 migration: the pre-fn key of `file:fn:literal` is
+            # `file:literal`. Remember every fn-keyed entry per legacy key so a
+            # legacy line is REPLACED IN PLACE (its justification comment stays
+            # above the entries it justified).
+            i1 = index(key, ":"); rest = substr(key, i1 + 1); i2 = index(rest, ":")
+            legacy = substr(key, 1, i1) substr(rest, i2 + 1)
+            bylegacy[legacy] = bylegacy[legacy] SUBSEP key
             next
         }
         /^# Format:/ { print fmt; next }
@@ -314,7 +333,12 @@ update_allowlist () {
         {
             key = $0
             if (match(key, /:[0-9]+$/)) key = substr(key, 1, RSTART - 1)
-            if (key in cur && !(key in done)) { print key ":" cur[key]; done[key] = 1 }
+            if (key in cur) {
+                if (!(key in done)) { print key ":" cur[key]; done[key] = 1 }
+            } else if (key in bylegacy) {
+                k = split(bylegacy[key], parts, SUBSEP)
+                for (j = 2; j <= k; j++) if (!(parts[j] in done)) { print parts[j] ":" cur[parts[j]]; done[parts[j]] = 1 }
+            }
         }
         END {
             for (i = 1; i <= n; i++) if (!(order[i] in done)) print order[i] ":" cur[order[i]]

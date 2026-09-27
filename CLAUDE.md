@@ -1197,16 +1197,17 @@ over time.
 `CallerContext::for_admin("<literal>")` site outside
 `scripts/qc-codegraph-allowlists/*.txt`. See the §"Enforceable
 Orchestrator Safeguards" section above for the full contract.
-Entries are keyed `<file>:<literal>:<count>` (#3965): an entry licenses
-exactly `<count>` production sites of that literal in that file, so an
-ADDITIONAL site of an already-approved literal is a HARD-BLOCK just like
-a new literal. Before #3965 the key was a bare `file:literal`, which made
-each entry an unlimited-multiplicity licence (31 real sites stood behind
-the 25 entries the gate reported). Line numbers stay out of the key on
-purpose, so a moved site is the same reviewed site. Residual, stated:
-the count is per FILE, so a SWAP (remove an approved site, add one of the
-same literal elsewhere in the same file, the #3638 relocation shape) keeps
-the count and passes; keying by enclosing function is the follow-up #3970. An
+Entries are keyed `<file>:<fn>:<literal>:<count>` (#3965, #3970): an
+entry licenses exactly `<count>` production sites of that literal inside
+that ENCLOSING FUNCTION of that file, so an ADDITIONAL site of an
+already-approved literal, or an approved site MOVED into a different
+function (the #3638 relocation shape), is a HARD-BLOCK just like a new
+literal. Before #3965 the key was a bare `file:literal`, which made each
+entry an unlimited-multiplicity licence (31 real sites stood behind the
+25 entries the gate reported). Line numbers stay out of the key on
+purpose, so a site moved within its function is the same reviewed site;
+the remaining granularity is the function (two sites of one literal inside
+one function are interchangeable, and the count bounds them). An
 entry without a count is refused. Every constructor call is counted
 whatever its argument spelling: an argument the regexes cannot read
 (`caller.clone()`, `"x".to_owned()`) is read by a paren-balanced parser,
