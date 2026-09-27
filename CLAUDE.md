@@ -1205,8 +1205,10 @@ function (the #3638 relocation shape), is a HARD-BLOCK just like a new
 literal. `<fn>` comes from SCOPE, not text: `scripts/tests/c8-enclosing-fn-3970.py`
 lexes the whole file (skipping comments and string/raw-string/char literals,
 keeping a brace stack) and names the innermost fn whose body contains the
-call, qualified by `mod`/`trait`/`impl <Type>`/outer fn and joined with `.`
-(`PostgresStore.resolve_governance_policy`; `<top>` outside any fn;
+call, qualified by `mod`/`trait`/`impl <Type>` (a trait impl is
+`<Type>[<Trait>]`, so an inherent and a trait method of one name differ) /
+outer fn and joined with `.` (`PostgresStore[MemoryStore].resolve_governance_policy`;
+`<top>` outside any fn;
 `<unparsed>`, which blocks, if the file does not lex). A textual
 "nearest preceding `fn`" key was spoofable by one comment, string or nested
 item naming an approved fn. Before #3965 the key was a bare `file:literal`,

@@ -109,7 +109,7 @@ src/handlers/links.rs:create_link:caller:1
 # breaking governance resolution for private namespaces. The older precheck
 # did not detect this call site; #3623 restored that coverage, which is what
 # this entry records.
-src/store/postgres.rs:PostgresStore.resolve_governance_policy:GOVERNANCE_INTERNAL:1
+src/store/postgres.rs:PostgresStore[MemoryStore].resolve_governance_policy:GOVERNANCE_INTERNAL:1
 
 # #3965 follow-up (Codex review, 2026-09-27) — two PRE-EXISTING sites the gate
 # never counted: their argument (`x.clone()`) defeated the old extractor, so the

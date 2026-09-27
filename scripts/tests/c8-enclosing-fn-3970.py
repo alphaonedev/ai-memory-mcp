@@ -9,10 +9,13 @@ Prints one `<lineno>\t<key>` line per requested line number.
 <key> names the innermost function whose `{ ... }` body CONTAINS the first
 code occurrence of `<pattern>(` on that line. It is qualified by every named
 scope around it, outermost first: `mod`, `trait`, `impl <Type>` (the
-implementing type, generics stripped), and enclosing functions, joined by
+implementing type, generics stripped, with `[Trait]` appended for a trait
+impl so an inherent method and a trait method of one name differ), and
+enclosing functions, joined by
 `.` so the key never contains `:` (the allowlist entry is colon-delimited and
 a literal may itself contain `:`). Examples:
-`PostgresStore.resolve_governance_policy`, `outer.inner`. A site inside no
+`PostgresStore[MemoryStore].resolve_governance_policy`, `Foo.new`,
+`outer.inner`. A site inside no
 function is `<top>`.
 
 Why a lexer: the first #3970 cut took "the nearest preceding `fn <name>`"
@@ -77,21 +80,30 @@ def impl_type_name(toks):
         elif depth == 0 and t == "for":
             last_for = j
     rest = rest[:cut]
+    trait = None
     if last_for is not None:
+        trait = path_last_ident(rest[:last_for])
         rest = rest[last_for + 1 :]
+    name = path_last_ident(rest) or "<impl>"
+    # f2r's #3970 review: an inherent impl and a trait impl on one type may
+    # both define `get`; keyed `Type.get` alike, a site could move between
+    # them silently. A trait impl is keyed `Type[Trait]`.
+    return f"{name}[{trait}]" if trait else name
+
+
+def path_last_ident(toks):
+    """Last segment of the first type path in `toks`, generics ignored."""
     name = None
     j = 0
-    while j < len(rest) and rest[j] in ("&", "mut", "dyn", "(", "!") or (
-        j < len(rest) and rest[j].startswith("'")
-    ):
+    while j < len(toks) and (toks[j] in ("&", "mut", "dyn", "(", "!") or toks[j].startswith("'")):
         j += 1
-    while j < len(rest) and is_ident_start(rest[j][0]):
-        name = rest[j]
-        if j + 1 < len(rest) and rest[j + 1] == "::":
+    while j < len(toks) and is_ident_start(toks[j][0]):
+        name = toks[j]
+        if j + 1 < len(toks) and toks[j + 1] == "::":
             j += 2
             continue
         break
-    return name or "<impl>"
+    return name
 
 
 def scan(text, pattern):

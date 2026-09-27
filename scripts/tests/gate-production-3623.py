@@ -50,7 +50,7 @@ for gate in gates:
             # #3965/#3970: an allowlist entry is `<file>:<fn>:<literal>:<count>`
             # and licenses exactly <count> sites of <literal> inside <fn>. The
             # allowlist copied into this tree carries (among others)
-            # `src/store/postgres.rs:PostgresStore.resolve_governance_policy:GOVERNANCE_INTERNAL:1`,
+            # `src/store/postgres.rs:PostgresStore[MemoryStore].resolve_governance_policy:GOVERNANCE_INTERNAL:1`,
             # `src/cli/agents.rs:run_bind_api_key:DAEMON_PRINCIPAL:1` +
             # `src/cli/agents.rs:run_revoke_api_key:DAEMON_PRINCIPAL:1`, and
             # `src/handlers/links.rs:create_link:caller:1`. Line position is NOT
@@ -64,7 +64,7 @@ for gate in gates:
                 return 'fn ' + name + '() {\n' + '\n'.join(lines) + '\n}'
 
             def in_pg(*fns):
-                return 'impl PostgresStore {\n' + '\n'.join(fns) + '\n}'
+                return 'impl MemoryStore for PostgresStore {\n' + '\n'.join(fns) + '\n}'
             gov_fn = 'resolve_governance_policy'
             # f2r's review of 58a916fa1: one line between a moved site and its
             # real fn re-keyed it under the textual nearest-`fn` rule. Every
@@ -91,15 +91,18 @@ for gate in gates:
                 # #3970 SWAP: the approved site REMOVED from its function and the
                 # same literal added in another function of the same file. The
                 # count per file is unchanged; the fn-keyed count is not.
-                ('store/postgres.rs', '\n' * 31499 + in_pg(in_fn('tenant_reachable_handler', site)), True, 'PostgresStore.tenant_reachable_handler'),
+                ('store/postgres.rs', '\n' * 31499 + in_pg(in_fn('tenant_reachable_handler', site)), True, 'PostgresStore[MemoryStore].tenant_reachable_handler'),
                 # A site in trailing code after the approved fn's body closes is
                 # NOT inside it (the textual rule said it was).
                 ('store/postgres.rs', '\n' * 31499 + in_pg(in_fn(gov_fn), 'const _X: () = { ' + site.strip() + ' };'), True, '<top>'),
+                # f2r's #3970 nit: the SAME fn name in the INHERENT impl of the
+                # same type is a different scope from the trait impl's.
+                ('store/postgres.rs', '\n' * 31499 + 'impl PostgresStore {\n' + in_fn(gov_fn, site) + '\n}', True, 'PostgresStore.resolve_governance_policy:GOVERNANCE_INTERNAL'),
                 # A site after a nested helper fn is still in the OUTER fn.
                 ('store/postgres.rs', '\n' * 31499 + in_pg(in_fn(gov_fn, '    fn helper() {}', site)), False, marker),
             ]
             cases += [
-                ('store/postgres.rs', '\n' * 31499 + in_pg(in_fn(gov_fn), in_fn('execute_pending_action', spoof, site)), True, 'PostgresStore.execute_pending_action')
+                ('store/postgres.rs', '\n' * 31499 + in_pg(in_fn(gov_fn), in_fn('execute_pending_action', spoof, site)), True, 'PostgresStore[MemoryStore].execute_pending_action')
                 for spoof in spoofs
             ]
             cases += [

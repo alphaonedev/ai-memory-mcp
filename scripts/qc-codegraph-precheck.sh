@@ -341,6 +341,13 @@ update_allowlist () {
                 bare = substr(key, 1, i1) seg[nseg] ":" substr(rest, i2 + 1)
                 bylegacy[bare] = bylegacy[bare] SUBSEP key
             }
+            # A trait impl is keyed `Type[Trait]`; an entry written before
+            # that (`Type.method`) maps to its bracketed form in place too.
+            unbr = fnq; gsub(/\[[^]]*\]/, "", unbr)
+            if (unbr != fnq) {
+                pre = substr(key, 1, i1) unbr ":" substr(rest, i2 + 1)
+                bylegacy[pre] = bylegacy[pre] SUBSEP key
+            }
             next
         }
         /^# Format:/ { print fmt; next }
