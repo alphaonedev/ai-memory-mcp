@@ -241,6 +241,33 @@ fn unusable_audit_directory_refuses_boot_3651() {
     assert_audit_refusal(&out, "audit log");
 }
 
+/// #3974: an enabled trail pointed at a WORLD-WRITABLE directory refuses boot,
+/// as docs/security/audit-trail.md promises, instead of silently writing the
+/// trail to the platform default.
+#[cfg(unix)]
+#[test]
+fn world_writable_audit_directory_refuses_boot_3974() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = sandbox();
+    let dir = home.path().join("world-writable-audit");
+    std::fs::create_dir_all(&dir).expect("create audit dir");
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).expect("chmod 0777");
+    let out = run_with_section(
+        home.path(),
+        "audit",
+        &format!("enabled = true\npath = \"{}\"\n", dir.display()),
+        &["stats"],
+    );
+    assert_audit_refusal(&out, "world-writable");
+    assert!(
+        std::fs::read_dir(&dir)
+            .expect("list audit dir")
+            .next()
+            .is_none(),
+        "nothing may be written to the refused directory"
+    );
+}
+
 #[test]
 fn doctor_still_runs_with_a_refused_audit_trail_3651() {
     let home = sandbox();

@@ -1065,10 +1065,20 @@ fn resolve_path(
         return std::path::PathBuf::from(crate::audit::expand_tilde(p));
     }
     let cfg = app_config.effective_audit();
-    if let Ok((p, _src)) = resolve_audit_path_with_override(cli_audit_dir, &cfg) {
-        return p;
+    match resolve_audit_path_with_override(cli_audit_dir, &cfg) {
+        Ok((p, _src)) => p,
+        Err(refusal) => {
+            // #3974: never read a DIFFERENT trail silently. `audit verify` on
+            // the fallback would otherwise report on a file the operator did
+            // not name.
+            let fallback = resolve_audit_path(&cfg);
+            eprintln!(
+                "{}",
+                crate::audit::audit_path_fallback_notice(&refusal, "reading", &fallback)
+            );
+            fallback
+        }
     }
-    resolve_audit_path(&cfg)
 }
 
 fn run_verify(

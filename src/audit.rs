@@ -943,7 +943,12 @@ pub fn init_from_config(cfg: &crate::config::AuditConfig) -> Result<()> {
         warn_attestation_reserved_once(cadence);
     }
 
-    let resolved_path = resolve_audit_path(cfg);
+    // #3974: resolve STRICTLY. The non-strict `resolve_audit_path` maps a
+    // refused directory (world-writable) to the platform default, so an
+    // enabled trail silently moved somewhere the operator never configured and
+    // every query against the configured path found nothing. The error now
+    // reaches main.rs, which refuses boot (#3651) and names the escape hatch.
+    let (resolved_path, _source) = resolve_audit_path_with_override(None, cfg)?;
     init(
         &resolved_path,
         cfg.redact_content.unwrap_or(true),
@@ -976,8 +981,11 @@ fn warn_attestation_reserved_once(cadence_minutes: u32) {
 /// > `[audit] path` in config > platform default. Appends `audit.log`
 /// when the resolved path looks like a directory.
 ///
-/// Backwards-compatible wrapper that doesn't take a CLI override —
-/// subcommand wiring uses [`resolve_audit_path_with_override`].
+/// NON-STRICT: a refused directory (world-writable) silently becomes the
+/// platform default. Never use it to decide where the trail is WRITTEN
+/// (#3974: [`init_from_config`] uses [`resolve_audit_path_with_override`] and
+/// refuses). A caller that falls back to it must say which path it used; see
+/// [`audit_path_fallback_notice`].
 #[must_use]
 pub fn resolve_audit_path(cfg: &crate::config::AuditConfig) -> PathBuf {
     let resolved = crate::log_paths::resolve_audit_dir(None, cfg.path.as_deref())
@@ -986,6 +994,23 @@ pub fn resolve_audit_path(cfg: &crate::config::AuditConfig) -> PathBuf {
             crate::log_paths::platform_default(crate::log_paths::DirKind::Audit).path
         });
     finalize_audit_file(resolved, cfg.path.as_deref())
+}
+
+/// #3974: the one stderr line a caller prints when the strict resolver refused
+/// the configured audit directory and it is about to use `fallback` instead,
+/// so the relocation is never silent. `use_of_path` says what the caller does
+/// with it ("writing the forensic trail to", "reading").
+#[must_use]
+pub fn audit_path_fallback_notice(
+    refusal: &anyhow::Error,
+    use_of_path: &str,
+    fallback: &Path,
+) -> String {
+    format!(
+        "ai-memory: the configured audit directory was refused ({refusal}); \
+         {use_of_path} {} instead",
+        fallback.display()
+    )
 }
 
 /// Strict variant: takes an optional `--audit-dir` override, returns
@@ -2191,10 +2216,12 @@ mod tests {
     }
 
     #[test]
-    fn resolve_audit_path_falls_back_to_platform_default_when_resolver_errs() {
-        // Lines 807-811: `resolve_audit_dir` returns Err when the
+    fn read_side_resolve_audit_path_falls_back_to_platform_default_when_resolver_errs() {
+        // READ-SIDE ONLY (#3974): `resolve_audit_dir` returns Err when the
         // configured dir is world-writable; `resolve_audit_path` (the
-        // non-strict variant) silently falls back to `platform_default`.
+        // non-strict variant) falls back to `platform_default`. The WRITE
+        // side (`init_from_config`) no longer uses it: see
+        // `init_from_config_refuses_a_world_writable_audit_dir_3974`.
         // We exercise the fallback by chmodding a tempdir to 0777 and
         // pointing AuditConfig.path at it. After the call:
         //   * Function must return Ok-like PathBuf (no panic)
@@ -2221,6 +2248,32 @@ mod tests {
                 p.display()
             );
         }
+    }
+
+    /// #3974: an ENABLED trail pointed at a world-writable directory refuses,
+    /// rather than silently writing to the platform default. The refusal
+    /// happens before `init`, so the process-global sink is never touched.
+    #[cfg(unix)]
+    #[test]
+    fn init_from_config_refuses_a_world_writable_audit_dir_3974() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let www = tmp.path().join("world_writable");
+        std::fs::create_dir_all(&www).unwrap();
+        std::fs::set_permissions(&www, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let cfg = crate::config::AuditConfig {
+            enabled: Some(true),
+            path: Some(www.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let err = super::init_from_config(&cfg)
+            .expect_err("a world-writable audit directory must refuse")
+            .to_string();
+        assert!(err.contains("world-writable"), "got: {err}");
+        assert!(
+            err.contains(&*www.to_string_lossy()),
+            "names the dir: {err}"
+        );
     }
 
     #[test]

@@ -692,7 +692,24 @@ fn init_forensic_audit(
     // resolving or being creatable (#3647) — and they take the ENSURED key
     // (#3354), never a plain load that could predate generation.
     ai_memory::governance::audit::init_audit_signers(signing_key.as_ref());
-    let log_path = ai_memory::audit::resolve_audit_path(&audit_cfg);
+    // #3974: the forensic trail is best-effort ("continuing unsigned" below),
+    // so a refused [audit].path still falls back rather than dropping the
+    // evidence, but the relocation is named on stderr instead of silent.
+    let log_path = match ai_memory::audit::resolve_audit_path_with_override(None, &audit_cfg) {
+        Ok((p, _source)) => p,
+        Err(refusal) => {
+            let fallback = ai_memory::audit::resolve_audit_path(&audit_cfg);
+            eprintln!(
+                "{}",
+                ai_memory::audit::audit_path_fallback_notice(
+                    &refusal,
+                    "writing the forensic trail beside",
+                    &fallback
+                )
+            );
+            fallback
+        }
+    };
     let Some(dir) = log_path.parent() else {
         eprintln!("ai-memory: forensic init skipped (could not resolve audit dir)");
         return Ok(());
