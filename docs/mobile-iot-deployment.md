@@ -391,13 +391,19 @@ A future release will add `riscv64gc-unknown-linux-gnu` to the
 prebuilt-artifact matrix in `release.yml` (it is not in the v1.0.0
 matrix). Until then, build-from-source is the only supported path.
 
-## 8. Resource envelope (reference numbers)
+## 8. Resource envelope (illustrative, unmeasured)
 
-The numbers below are measured on a release build, sqlite-bundled,
-`semantic` tier, MiniLM-L6-v2 384-dim embeddings, on a
-benchmark host running ai-memory's own `cargo bench --bench
-recall` after a representative seed corpus. Use them to size
-provisioning for a fleet.
+> **Provenance: these figures are illustrative estimates, not
+> measurements.** No harness in this repository produces them and no
+> receipt is committed. `cargo bench --bench recall`
+> (`benches/recall.rs`) seeds a fixed 1,000 rows and times recall
+> only; it has no scale parameter and samples no RSS, disk size or
+> battery draw. Treat the table and the battery figures below as a
+> rough starting point, and measure on your own hardware before you
+> size a fleet (#3992).
+
+The rows assume a release build, sqlite-bundled, `semantic` tier and
+MiniLM-L6-v2 384-dim embeddings.
 
 | Memories | Disk (.db) | HNSW resident RAM | FTS5 index RAM | Total RSS at recall p95 | Recall p95 (cold) | Recall p95 (warm) |
 |---|---|---|---|---|---|---|
@@ -406,17 +412,16 @@ provisioning for a fleet.
 | 100,000 | ~520 MB | ~220 MB | ~38 MB | ~430 MB | ~85 ms | ~45 ms |
 | 1,000,000 | ~5.0 GB | ~1.8 GB | ~310 MB | ~2.4 GB | ~280 ms | ~140 ms |
 
-**Numbers above are on a Cortex-A76 / M2 / Ryzen 7 class host.**
-Cortex-A72 / Cortex-A53 boards see 1.5–2.5× higher latency at the
-same corpus size. The HNSW + embedder path is CPU-bound; recall
+**The estimates above assume a Cortex-A76 / M2 / Ryzen 7 class host.**
+Expect Cortex-A72 / Cortex-A53 boards to be slower at the same corpus
+size (the 1.5–2.5× range often quoted is unmeasured here). The HNSW + embedder path is CPU-bound; recall
 latency scales roughly with single-core performance up to the
 HNSW saturation point (typically 100k+ vectors).
 
-**Battery on a phone**: on a Pixel 8 Pro running ai-memory in
-Termux, an idle daemon (`serve` with no traffic) consumes ~0.4%
-battery / hour. Under continuous recall load (~10 req/s), it
-consumes ~3.5% / hour. The phone radio dominates total power; the
-ai-memory daemon itself is a small fraction.
+**Battery on a phone**: no battery measurement is committed for any
+device. An idle daemon (`serve` with no traffic) still wakes for its
+periodic GC and fold work (see §9), so measure idle and loaded drain on
+your own device (for example in Termux) before you rely on it.
 
 ## 9. Battery considerations
 
@@ -438,8 +443,9 @@ Tuning knobs that matter on battery:
   (below) over a resident daemon.
 - **`keyword` tier** (`tier = "keyword"` in `config.toml` for the
   daemon; `--tier keyword` on `mcp` / `store` / `recall`) — disables
-  the embedder + reranker. Cuts recall RAM by ~250 MB and recall CPU
-  by ~80%, at the cost of the semantic blend. Good default for
+  the embedder + reranker. This removes the model's RAM and the
+  embedding CPU cost from recall (no measured figure is committed), at
+  the cost of the semantic blend. Good default for
   low-power IoT sensors that only ever do tag / FTS5 lookups.
 
 ### Ephemeral mode (CLI invocation per call)
@@ -448,7 +454,7 @@ Tuning knobs that matter on battery:
 ai-memory recall "what did the user say about pizza"
 ```
 
-Each invocation pays the binary-startup cost (~80–120 ms cold) but
+Each invocation pays the binary-startup cost (unmeasured here) but
 consumes zero battery between calls. Best for: cron-driven sensors
 that emit one memory row per hour, drones that only consult memory
 at waypoints, wearables that wake every few minutes.
