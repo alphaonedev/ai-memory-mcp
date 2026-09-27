@@ -753,6 +753,10 @@ mod tests {
 
     #[test]
     fn handle_archive_restore_missing_id_errors() {
+        // #4085/#3517: this test reaches a caller-resolving handler, which reads
+        // AI_MEMORY_AGENT_ID; hold the shared reader lock so a concurrent writer
+        // (another module setting `ai:alice`) cannot change the caller mid-test.
+        let _agent_id_env_lock = crate::identity::agent_id_env_test_lock();
         // Hits the `id is required` branch on line 24.
         let conn = open_conn();
         let err = handle_archive_restore(&conn, &json!({}), None).unwrap_err();
@@ -761,6 +765,10 @@ mod tests {
 
     #[test]
     fn handle_archive_restore_invalid_id_maps_validator_error() {
+        // #4085/#3517: this test reaches a caller-resolving handler, which reads
+        // AI_MEMORY_AGENT_ID; hold the shared reader lock so a concurrent writer
+        // (another module setting `ai:alice`) cannot change the caller mid-test.
+        let _agent_id_env_lock = crate::identity::agent_id_env_test_lock();
         // Covers `validate_id(...).map_err(...)` on line 25.
         let conn = open_conn();
         let err =
@@ -770,6 +778,10 @@ mod tests {
 
     #[test]
     fn handle_archive_restore_unknown_uuid_returns_not_found() {
+        // #4085/#3517: this test reaches a caller-resolving handler, which reads
+        // AI_MEMORY_AGENT_ID; hold the shared reader lock so a concurrent writer
+        // (another module setting `ai:alice`) cannot change the caller mid-test.
+        let _agent_id_env_lock = crate::identity::agent_id_env_test_lock();
         // Well-formed UUID but no row exists → line 28 "not found in archive".
         let conn = open_conn();
         let err = handle_archive_restore(
@@ -783,6 +795,10 @@ mod tests {
 
     #[test]
     fn handle_archive_list_default_paging_returns_empty() {
+        // #4085/#3517: this test reaches a caller-resolving handler, which reads
+        // AI_MEMORY_AGENT_ID; hold the shared reader lock so a concurrent writer
+        // (another module setting `ai:alice`) cannot change the caller mid-test.
+        let _agent_id_env_lock = crate::identity::agent_id_env_test_lock();
         // Exercises `params["limit"].as_u64().unwrap_or(50)` and
         // `params["offset"].as_u64().unwrap_or(0)` defaults on lines 13-14.
         let conn = open_conn();
@@ -793,6 +809,10 @@ mod tests {
 
     #[test]
     fn handle_archive_stats_returns_object() {
+        // #4085/#3517: this test reaches a caller-resolving handler, which reads
+        // AI_MEMORY_AGENT_ID; hold the shared reader lock so a concurrent writer
+        // (another module setting `ai:alice`) cannot change the caller mid-test.
+        let _agent_id_env_lock = crate::identity::agent_id_env_test_lock();
         // Covers the `archive_stats(...).map_err(...)` happy path
         // (line 73) on an empty DB. The stats schema is an object.
         let conn = open_conn();
@@ -852,6 +872,10 @@ mod tests {
     /// `metadata.agent_id`.
     #[test]
     fn archive_list_is_owner_scoped_3382() {
+        // #4085/#3517: this test reaches a caller-resolving handler, which reads
+        // AI_MEMORY_AGENT_ID; hold the shared reader lock so a concurrent writer
+        // (another module setting `ai:alice`) cannot change the caller mid-test.
+        let _agent_id_env_lock = crate::identity::agent_id_env_test_lock();
         let conn = open_conn();
         seed_archived(&conn, "alice/notes", "alice-archived-secret", "ai:alice");
         seed_archived(&conn, "bob/notes", "bob-archived", "ai:bob");
@@ -870,6 +894,10 @@ mod tests {
     /// way the listing is.
     #[test]
     fn archive_stats_is_owner_scoped_3382() {
+        // #4085/#3517: this test reaches a caller-resolving handler, which reads
+        // AI_MEMORY_AGENT_ID; hold the shared reader lock so a concurrent writer
+        // (another module setting `ai:alice`) cannot change the caller mid-test.
+        let _agent_id_env_lock = crate::identity::agent_id_env_test_lock();
         let conn = open_conn();
         seed_archived(&conn, "alice/notes", "alice-archived-secret", "ai:alice");
         seed_archived(&conn, "bob/notes", "bob-archived", "ai:bob");
@@ -886,6 +914,10 @@ mod tests {
     /// SAME message an absent id produces (no archived-id oracle).
     #[test]
     fn archive_restore_refuses_non_owner_3382() {
+        // #4085/#3517: this test reaches a caller-resolving handler, which reads
+        // AI_MEMORY_AGENT_ID; hold the shared reader lock so a concurrent writer
+        // (another module setting `ai:alice`) cannot change the caller mid-test.
+        let _agent_id_env_lock = crate::identity::agent_id_env_test_lock();
         let conn = open_conn();
         let alice = seed_archived(&conn, "alice/notes", "alice-archived-secret", "ai:alice");
 
@@ -915,6 +947,10 @@ mod tests {
     /// row. The gate must not cost the legitimate path.
     #[test]
     fn archive_restore_allows_owner_3382() {
+        // #4085/#3517: this test reaches a caller-resolving handler, which reads
+        // AI_MEMORY_AGENT_ID; hold the shared reader lock so a concurrent writer
+        // (another module setting `ai:alice`) cannot change the caller mid-test.
+        let _agent_id_env_lock = crate::identity::agent_id_env_test_lock();
         let conn = open_conn();
         let alice = seed_archived(&conn, "alice/notes", "alice-archived-secret", "ai:alice");
 
@@ -933,6 +969,10 @@ mod tests {
     /// `AI_MEMORY_AGENT_ID`) is byte-for-byte unchanged on all three verbs.
     #[test]
     fn archive_reads_unscoped_for_single_operator_3382() {
+        // #4085/#3517: this test reaches a caller-resolving handler, which reads
+        // AI_MEMORY_AGENT_ID; hold the shared reader lock so a concurrent writer
+        // (another module setting `ai:alice`) cannot change the caller mid-test.
+        let _agent_id_env_lock = crate::identity::agent_id_env_test_lock();
         let conn = open_conn();
         let alice = seed_archived(&conn, "alice/notes", "alice-archived-secret", "ai:alice");
         seed_archived(&conn, "bob/notes", "bob-archived", "ai:bob");
@@ -950,6 +990,10 @@ mod tests {
 
     #[test]
     fn handle_gc_dry_run_on_empty_db_returns_zero() {
+        // #4085/#3517: this test reaches a caller-resolving handler, which reads
+        // AI_MEMORY_AGENT_ID; hold the shared reader lock so a concurrent writer
+        // (another module setting `ai:alice`) cannot change the caller mid-test.
+        let _agent_id_env_lock = crate::identity::agent_id_env_test_lock();
         // Covers the `dry_run = true` branch on lines 82-92.
         let conn = open_conn();
         let result = handle_gc(&conn, &json!({"dry_run": true}), false).expect("gc dry-run ok");
@@ -959,6 +1003,10 @@ mod tests {
 
     #[test]
     fn handle_gc_actual_run_on_empty_db_returns_zero() {
+        // #4085/#3517: this test reaches a caller-resolving handler, which reads
+        // AI_MEMORY_AGENT_ID; hold the shared reader lock so a concurrent writer
+        // (another module setting `ai:alice`) cannot change the caller mid-test.
+        let _agent_id_env_lock = crate::identity::agent_id_env_test_lock();
         // Covers the actual-gc branch on lines 94-95 with archive=true.
         let conn = open_conn();
         let result = handle_gc(&conn, &json!({"dry_run": false}), true).expect("gc run ok");
@@ -968,6 +1016,10 @@ mod tests {
 
     #[test]
     fn handle_archive_purge_default_no_filter_succeeds_on_empty_db() {
+        // #4085/#3517: this test reaches a caller-resolving handler, which reads
+        // AI_MEMORY_AGENT_ID; hold the shared reader lock so a concurrent writer
+        // (another module setting `ai:alice`) cannot change the caller mid-test.
+        let _agent_id_env_lock = crate::identity::agent_id_env_test_lock();
         // Covers the `older_than_days` None path on line 37, and the
         // permission-Allow happy path (lines 53-54), and the
         // `purge_archive(...)` success branch on lines 68-69.
@@ -984,6 +1036,10 @@ mod tests {
 
     #[test]
     fn archive_purge_refuses_huge_days_and_allows_maximum_3384() {
+        // #4085/#3517: this test reaches a caller-resolving handler, which reads
+        // AI_MEMORY_AGENT_ID; hold the shared reader lock so a concurrent writer
+        // (another module setting `ai:alice`) cannot change the caller mid-test.
+        let _agent_id_env_lock = crate::identity::agent_id_env_test_lock();
         let conn = open_conn();
         let err = handle_archive_purge(
             &conn,

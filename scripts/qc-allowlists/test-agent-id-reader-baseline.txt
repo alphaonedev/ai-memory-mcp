@@ -23,8 +23,7 @@
 16 src/mcp/mod.rs
 2 src/mcp/param_shapes_3365_tests.rs
 12 src/mcp/tools/action.rs
-7 src/mcp/tools/agent.rs
-14 src/mcp/tools/archive.rs
+6 src/mcp/tools/agent.rs
 16 src/mcp/tools/atomise.rs
 1 src/mcp/tools/capture_turn.rs
 20 src/mcp/tools/check_agent_action.rs
@@ -41,7 +40,6 @@
 3 src/mcp/tools/promote.rs
 17 src/mcp/tools/reflect.rs
 1 src/mcp/tools/routine/freeze_3616.rs
-12 src/mcp/tools/routine.rs
 17 src/mcp/tools/signal.rs
 16 src/mcp/tools/skill_get.rs
 6 src/mcp/tools/skill_promote.rs
