@@ -270,7 +270,7 @@ async fn postgres_final_witness_binds_active_heads_and_failure_exits_75_4070() {
         );
         let child_url = url.clone();
         tokio::task::spawn_blocking(move || {
-            exercise_shutdown("INT", Some(&child_url), anchor_fault)
+            exercise_shutdown("INT", Some(&child_url), anchor_fault);
         })
         .await
         .unwrap();
