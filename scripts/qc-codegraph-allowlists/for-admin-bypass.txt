@@ -126,3 +126,10 @@ src/cli/quarantine.rs:run_store:agent_id.clone():1
 # caller. Nothing it reads is returned directly. Tracked for review (#3982):
 # a caller-scoped read may reach the same verdict without the bypass.
 src/handlers/kg.rs:kg_timeline:caller.clone():1
+# #4020 — the admin arm of the #1062 checked constructor itself:
+# `CallerContext::for_admin_checked(agent, is_admin)` returns `Self::for_admin`
+# only when `is_admin` is true (threaded from the admin gate; a LITERAL bool at
+# any call site is refused by the #3943 matcher). The text-matched finder never
+# saw this `Self::` call; the #4020 token finder does. Every caller of the
+# checked constructor is reviewed at its own site, not here.
+src/store/mod.rs:CallerContext.for_admin_checked:agent_id:1

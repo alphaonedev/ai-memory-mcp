@@ -31,6 +31,7 @@ literal or comment, or unbalanced braces), or if the requested line has no
 code occurrence of `<pattern>(`, the key is `<unparsed>`. The gate treats that
 as a site it cannot license, so it blocks.
 """
+import re
 import sys
 
 UNPARSED = "<unparsed>"
@@ -106,8 +107,21 @@ def path_last_ident(toks):
     return name
 
 
-def scan(text, pattern):
-    """Map each line holding a code occurrence of `pattern(` to its key."""
+def scan(text, method, literal_only=False):
+    """Find every site of `<anything>::<method>` in code.
+
+    Returns `(sites, renames)`. `sites` is a list of `(line, key, arg)`, one
+    per CALL (two calls on one line are two sites); `arg` is the normalised
+    first argument, or `<unparsed>` for a bare function-item reference such as
+    `let mk = CallerContext::for_admin;`. `renames` lists the lines of a
+    `CallerContext as <alias>` renaming import.
+
+    #4020: the gate used to find sites by the TEXT `CallerContext::for_admin(`,
+    so `use ..::CallerContext as Cc; Cc::for_admin(x)` and a fn-item reference
+    both escaped it. Any path prefix counts here (`Cc::`, `Self::`, `<T>::`).
+    With `literal_only` (the for_agent literal gate) only a call whose first
+    argument starts with a string literal is a site, as before.
+    """
     n = len(text)
     i = 0
     line = 1
@@ -115,8 +129,12 @@ def scan(text, pattern):
     paren = 0
     pending = None  # ("fn"|"impl"|"trait"|"mod", name_or_tokens, paren_depth)
     prev = None  # previous significant token
-    sites = {}
-    call = pattern + "("
+    sites = []
+    renames = []
+    # A bare reference to the checked constructor is how an alias would dodge
+    # #3943's `for_admin_checked(.., <literal>)` matcher, so it is a
+    # for_admin site too (keyed `<unparsed>`). Its CALLS stay #3943's.
+    ref_only = {"for_admin_checked"} if method == "for_admin" else set()
 
     def key():
         names = []
@@ -269,8 +287,6 @@ def scan(text, pattern):
                     pending[1].append("'lt")
                 continue
             if is_ident_start(ch):
-                if text.startswith(call, i) and line not in sites:
-                    sites[line] = key()
                 end = i
                 while end < n and is_ident_char(text[end]):
                     end += 1
@@ -293,6 +309,20 @@ def scan(text, pattern):
                 else:
                     tok = ch
                     i += 1
+
+        # Sites (#4020): a code token `<method>` right after `::`.
+        if prev == "::" and (tok == method or tok in ref_only):
+            arg = first_arg(text, i)
+            if tok in ref_only:
+                if arg is None:
+                    sites.append((line, key(), UNPARSED))
+            elif arg is None:
+                if not literal_only:
+                    sites.append((line, key(), UNPARSED))
+            elif not literal_only or arg.lstrip().startswith('"'):
+                sites.append((line, key(), normalise_arg(arg)))
+        elif tok == "as" and prev == "CallerContext":
+            renames.append(line)
 
         # Structure.
         if tok == "fn" and pending is None:
@@ -344,19 +374,127 @@ def scan(text, pattern):
         prev = tok
     if stack or paren != 0:
         raise LexError("unbalanced at end of file")
-    return sites
+    return sites, renames
+
+
+def first_arg(text, k):
+    """Source text of the first argument of a call whose name ends at `k`,
+    or None when no `(` follows (a function-item reference). Literals and
+    comments are skipped the same way the main lexer skips them, so a `,` or
+    `)` inside one never ends the argument."""
+    n = len(text)
+
+    def skip_trivia(j):
+        while j < n:
+            if text[j].isspace():
+                j += 1
+            elif text.startswith("//", j):
+                while j < n and text[j] != "\n":
+                    j += 1
+            elif text.startswith("/*", j):
+                depth = 0
+                while j < n:
+                    if text.startswith("/*", j):
+                        depth, j = depth + 1, j + 2
+                    elif text.startswith("*/", j):
+                        depth, j = depth - 1, j + 2
+                        if depth == 0:
+                            break
+                    else:
+                        j += 1
+            else:
+                break
+        return j
+
+    j = skip_trivia(k)
+    if j >= n or text[j] != "(":
+        return None
+    j += 1
+    start = j
+    depth = 0
+    while j < n:
+        ch = text[j]
+        if ch == '"':
+            j += 1
+            while j < n and text[j] != '"':
+                j += 2 if text[j] == "\\" else 1
+            j += 1
+            continue
+        if ch == "r" and text[j + 1 : j + 2] in ('"', "#") and not is_ident_char(text[j - 1]):
+            h = j + 1
+            while h < n and text[h] == "#":
+                h += 1
+            if h < n and text[h] == '"':
+                close = '"' + "#" * (h - j - 1)
+                end = text.find(close, h + 1)
+                j = n if end < 0 else end + len(close)
+                continue
+        if ch == "'" and j + 2 < n and (text[j + 1] == "\\" or text[j + 2] == "'"):
+            # A char literal (`'x'`, `'\''`, `'\u{..}'`); a lifetime is left
+            # to the default arm, which just steps over the `'`.
+            j += 1
+            while j < n and text[j] != "'":
+                j += 2 if text[j] == "\\" else 1
+            j += 1
+            continue
+        if text.startswith("//", j) or text.startswith("/*", j):
+            j = skip_trivia(j)
+            continue
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            if depth == 0:
+                return text[start:j]
+            depth -= 1
+        elif ch == "," and depth == 0:
+            return text[start:j]
+        j += 1
+    return ""
+
+
+def normalise_arg(arg):
+    """The #3965 key for a first argument, byte-identical to the old gate:
+    whitespace removed, one leading `&` dropped, a pure string literal is its
+    content, a pure path is its last `::` segment, anything else verbatim.
+    An empty argument is `<unparsed>`."""
+    expr = re.sub(r"\s+", "", arg)
+    if expr.startswith("&"):
+        expr = expr[1:]
+    if not expr:
+        return UNPARSED
+    lit = re.fullmatch(r'"([^"\\]*)"', expr)
+    if lit:
+        return lit.group(1)
+    if re.fullmatch(r"[A-Za-z0-9_:]+", expr):
+        return expr.split("::")[-1]
+    return expr
 
 
 def main():
-    path, pattern = sys.argv[1], sys.argv[2]
-    wanted = [int(x) for x in sys.argv[3:]]
+    """`c8-enclosing-fn-3970.py <file> <method> <literal|any-arg>`, with the
+    file's PRODUCTION text (test regions blanked, line numbers preserved) on
+    stdin. Prints `site\t<line>\t<fn key>\t<arg>` per call and
+    `rename\t<line>` per `CallerContext as` import, on production lines only.
+    A file that does not lex yields one `<unparsed>` site, which blocks."""
+    path, method, mode = sys.argv[1], sys.argv[2], sys.argv[3]
+    production = sys.stdin.read().split("\n")
+
+    def is_production(ln):
+        return 0 < ln <= len(production) and production[ln - 1].strip() != ""
+
     try:
         with open(path, encoding="utf-8", errors="replace") as fh:
-            sites = scan(fh.read(), pattern)
-    except (OSError, LexError):
-        sites = {}
-    for ln in wanted:
-        print(f"{ln}\t{sites.get(ln, UNPARSED)}")
+            sites, renames = scan(fh.read(), method, literal_only=(mode == "literal"))
+    except (OSError, LexError) as e:
+        print(f"site\t0\t{UNPARSED}\t{UNPARSED}")
+        print(f"lexerror\t{e}", file=sys.stderr)
+        return
+    for ln, key, arg in sites:
+        if is_production(ln):
+            print(f"site\t{ln}\t{key}\t{arg}")
+    for ln in renames:
+        if is_production(ln):
+            print(f"rename\t{ln}")
 
 
 if __name__ == "__main__":

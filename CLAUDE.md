@@ -1218,11 +1218,17 @@ the key on purpose, so a site moved within its function is the same
 reviewed site; the remaining granularity is the function (two sites of
 one literal inside one function are interchangeable, and the count bounds
 them). An
-entry without a count is refused. Every constructor call is counted
-whatever its argument spelling: an argument the regexes cannot read
-(`caller.clone()`, `"x".to_owned()`) is read by a paren-balanced parser,
-and a call that still cannot be read is keyed `<unparsed>` and blocks
-(fail closed; before this a call with such an argument was DISCARDED). `--update` rewrites only the entry lines and keeps every
+entry without a count is refused. Sites are FOUND by the same lexer (#4020),
+not by text: every code token `<path>::for_admin`, whatever the path prefix
+and whether or not it is called, is a site, counted per call. So
+`Cc::for_admin(..)` after `use ..::CallerContext as Cc` is a site, a bare
+fn-item reference (`let mk = CallerContext::for_admin;`, or
+`::for_admin_checked`) is keyed `<unparsed>` and blocks, and a
+`CallerContext as <alias>` import is refused outright. Every constructor call
+is counted whatever its argument spelling (`caller.clone()`,
+`"x".to_owned()` are read by the lexer's argument scanner), and a call that
+cannot be read is keyed `<unparsed>` and blocks (fail closed). `--update`
+rewrites only the entry lines and keeps every
 justification comment. The job runs `--self-test` too, which includes the
 #3623 production-boundary cases for the counted contract.
 

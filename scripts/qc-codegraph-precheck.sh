@@ -13,11 +13,15 @@
 #   scripts/qc-codegraph-precheck.sh --update   # regenerate allowlists from current state
 #
 # What it checks:
-#   - Every line in src/ matching `CallerContext::for_agent("<lit>")`
-#     OR `for_agent("<lit>")` where the literal is a static string
-#     (not a variable reference). Test code is excluded — see
-#     `is_production_site` below.
-#   - Same scan for `for_admin("<lit>")`.
+#   - Every production CALL of `<path>::for_agent(..)` whose first argument
+#     is a string literal, and every production `<path>::for_admin` token, call
+#     or bare fn-item reference, whatever the path prefix (#4020: the site
+#     finder is the scope lexer `scripts/tests/c8-enclosing-fn-3970.py`, not a
+#     text match, so `Cc::for_admin(..)` after `use ..::CallerContext as Cc`
+#     and `let mk = CallerContext::for_admin;` are sites; a bare reference,
+#     including to `for_admin_checked`, is keyed `<unparsed>` and blocks).
+#     Counted per call, not per line. Test code is excluded via
+#     `production_lines`. A `CallerContext as <alias>` import is refused.
 #   - Each surviving site must appear in the corresponding allowlist,
 #     keyed `<file>:<literal>:<count>` (#3965). The count is the number of
 #     production sites in that file using that literal. More sites than
@@ -37,7 +41,7 @@
 # What it deliberately does NOT do (out of scope for v0.7.0):
 #   - Symbol removal / dangling-caller detection. Codegraph indexes
 #     are per-developer and not available in CI; this script uses
-#     `grep` as the load-bearing detector. The deeper codegraph
+#     a token lexer (python3) as the load-bearing detector. The deeper codegraph
 #     integration is tracked separately and can layer on top of the
 #     allowlist contract this script enforces.
 #
@@ -172,109 +176,52 @@ fi
 
 # Enumerate production sites through the shared #3623 item filter.
 collect_sites () {
-    local pattern="$1"
+    # #4020 — the scope lexer is the site FINDER as well as the keyer. Before,
+    # sites were found by the TEXT `CallerContext::for_admin(`, so a renaming
+    # import (`use ..::CallerContext as Cc; Cc::for_admin(x)`) and a fn-item
+    # reference (`let mk = CallerContext::for_admin; mk(x)`) both passed. The
+    # lexer flags every code token `::<method>` whatever its path prefix, one
+    # site per CALL; a bare reference is keyed `<unparsed>` (blocks). The
+    # argument key is byte-identical to the #3965 normalisation, and the
+    # enclosing-fn key is the #3970 scope key. A file that does not lex yields
+    # an `<unparsed>` site (fail closed). `CallerContext as <alias>` imports
+    # are reported as `RENAME:<file>:<line>` lines and refused below.
+    local method="$1"
     local mode="${2:-literal}"
     local out=""
-    # Find src files; production_lines applies the test exclusions.
     while IFS= read -r -d '' f; do
+        # Cheap prefilter: a file without the text cannot hold the token.
+        grep -q -- "${method}" "$f" || continue
         local production
         production="$(production_lines "$f")"
-        # Find matching lines with original source line numbers.
-        # Pattern format: `for_agent("LIT")` or `for_admin("LIT")`.
-        #
-        # NOTE: the inner match list is captured into a variable and fed
-        # to the loop via a here-string (`<<<`) rather than a second
-        # process substitution. A process substitution nested inside the
-        # outer `< <(find ...)` one reliably SIGTRAPs (exit 133) under
-        # macOS system bash 3.2 on arm64; the here-string is behaviour-
-        # identical and runs the loop in the current shell so `out`
-        # still accumulates.
-        local matches
-        if [[ "${mode}" == "any-arg" ]]; then
-            # #1651 — for_admin is a privacy-bypass CONSTRUCTION; the
-            # bypass is the call itself, in ANY argument form. The
-            # pre-#1651 literal-only grep went blind when #1558 moved
-            # every site onto sentinel consts.
-            matches="$(printf '%s\n' "$production" | grep -n "${pattern}(" || true)"
-        else
-            matches="$(printf '%s\n' "$production" | grep -n "${pattern}(\"" || true)"
-        fi
-        [[ -z "${matches}" ]] && continue
-        # #3970 — the enclosing-function key of every candidate line in this
-        # file, from ONE scope-aware lex of the whole file (comments and
-        # string/char literals skipped, brace stack). The first cut took the
-        # nearest preceding `fn <name>` TEXT, so a comment, a string, or a
-        # nested item naming an approved fn re-keyed a moved site to it.
-        local scopes
-        scopes="$(python3 "${ROOT}/scripts/tests/c8-enclosing-fn-3970.py" "$f" "${pattern}" \
-            $(printf '%s\n' "${matches}" | cut -d: -f1))"
-        while IFS=: read -r lineno content; do
-            # Skip blank/no-match
-            [[ -z "${lineno}" ]] && continue
-            # Skip comment lines (//, ///, block-comment continuations) —
-            # prose mentioning the call is not a call site (#1651).
-            if printf '%s\n' "$content" | grep -qE '^[[:space:]]*(//|\*)'; then
-                continue
-            fi
-            # Extract the literal between `${pattern}("` and `")`.
-            local literal
-            literal=$(printf '%s\n' "$content" | sed -nE "s/.*${pattern}\(\"([^\"]+)\"\).*/\1/p" | head -1)
-            if [[ -z "${literal}" && "${mode}" == "any-arg" ]]; then
-                # #1651 — non-literal argument: key on the argument
-                # expression (identifier / sentinel path / variable),
-                # normalized to its last `::` segment so the allowlist
-                # stays stable across import-style refactors.
-                literal=$(printf '%s\n' "$content" \
-                    | sed -nE "s/.*${pattern}\(([^\")(,]+)[,)].*/\1/p" \
-                    | head -1 | tr -d ' &')
-                if [[ -z "${literal}" ]] \
-                    && printf '%s\n' "$content" | grep -qE "${pattern}\($"; then
-                    # Call split across lines (rustfmt reflow): take
-                    # the first token of the next source line.
-                    local nextline
-                    nextline=$(sed -n "$((lineno + 1))p" "$f")
-                    literal=$(printf '%s\n' "$nextline" | sed -nE 's/^[[:space:]]*"([^"]+)".*/\1/p')
-                    [[ -z "${literal}" ]] && literal=$(printf '%s\n' "$nextline" \
-                        | sed -nE 's/^[[:space:]]*([A-Za-z0-9_:&]+).*/\1/p' | tr -d '&')
-                fi
-                literal="${literal##*::}"
-            fi
-            if [[ -z "${literal}" ]]; then
-                # #3965 follow-up (Codex review): the regexes above cannot
-                # read an argument that contains parentheses or starts with a
-                # quote but is not a bare literal (`caller.clone()`,
-                # `"x".to_owned()`), and the call used to be DISCARDED: a new
-                # privacy-bypass site that never reached the count. Read the
-                # real argument with a paren-balanced parser instead; a call it
-                # still cannot read is keyed `<unparsed>`, so it HARD-BLOCKs
-                # rather than vanishing (fail closed).
-                literal="$(python3 "${ROOT}/scripts/tests/c8-arg-extract-3965.py" "$f" "$lineno" "${pattern}")"
-                literal="${literal:-<unparsed>}"
-            fi
-            if [[ -n "${literal}" ]]; then
-                # Strip the absolute prefix so the allowlist is
-                # repo-root-relative (and stable across checkouts).
-                local rel="${f#"${ROOT}/"}"
-                # #3970 — key the site by its ENCLOSING FUNCTION too, from the
-                # scope lex above: the innermost fn whose body contains the call,
-                # qualified by mod/trait/impl-type/outer fn and joined with `.`
-                # (`<top>` outside any fn; `<unparsed>` if the file does not lex,
-                # which blocks). A site moved into a DIFFERENT function becomes a
-                # new key and HARD-BLOCKs; a site moved within its function
-                # keeps its key (line numbers stay out of it).
-                local encl
-                encl="$(printf '%s\n' "${scopes}" | awk -F '\t' -v l="${lineno}" '$1 == l { print $2; exit }')"
-                encl="${encl:-<unparsed>}"
-                out+="${rel}:${lineno}:${encl}:${literal}"$'\n'
-            fi
-        done <<< "${matches}"
+        # (A test-only file yields an empty production text; the lexer then
+        # reports no production site. No bash-side emptiness test: a pattern
+        # substitution over a multi-megabyte file is quadratic.)
+        local rel="${f#"${ROOT}/"}"
+        local found
+        found="$(printf '%s\n' "$production" \
+            | python3 "${ROOT}/scripts/tests/c8-enclosing-fn-3970.py" "$f" "${method}" "${mode}")"
+        [[ -z "${found}" ]] && continue
+        local kind lineno encl literal
+        while IFS=$'\t' read -r kind lineno encl literal; do
+            case "${kind}" in
+                site) out+="${rel}:${lineno}:${encl}:${literal}"$'\n' ;;
+                rename) out+="RENAME:${rel}:${lineno}"$'\n' ;;
+            esac
+        done <<< "${found}"
     done < <(find "${ROOT}/src" -type f -name '*.rs' -print0)
-    # Sort + dedup so the diff against the allowlist is order-stable.
-    printf '%s' "$out" | LC_ALL=C sort -u
+    # Sorted for an order-stable diff; NOT deduplicated, because two calls on
+    # one line are two sites (#4020).
+    printf '%s' "$out" | LC_ALL=C sort
 }
 
-CURRENT_FOR_AGENT="$(collect_sites 'CallerContext::for_agent')"
-CURRENT_FOR_ADMIN="$(collect_sites 'CallerContext::for_admin' any-arg)"
+CURRENT_FOR_AGENT_RAW="$(collect_sites for_agent)"
+CURRENT_FOR_ADMIN_RAW="$(collect_sites for_admin any-arg)"
+# #4020 — renaming imports of CallerContext, from both passes.
+CURRENT_RENAMES="$(printf '%s\n%s\n' "$CURRENT_FOR_AGENT_RAW" "$CURRENT_FOR_ADMIN_RAW" \
+    | grep '^RENAME:' | LC_ALL=C sort -u || true)"
+CURRENT_FOR_AGENT="$(printf '%s\n' "$CURRENT_FOR_AGENT_RAW" | grep -v '^RENAME:' || true)"
+CURRENT_FOR_ADMIN="$(printf '%s\n' "$CURRENT_FOR_ADMIN_RAW" | grep -v '^RENAME:' || true)"
 
 # Strip the line-number column from a "file:line:literal" stream so
 # the key is `file:literal` — line numbers drift on every unrelated edit
@@ -487,6 +434,17 @@ if [[ -n "${checked_literal_hits}" ]]; then
     echo "  The second argument must be threaded from the admin gate (require_admin Ok" >&2
     echo "  arm), never a literal — a literal still compiles after the gate is removed." >&2
     printf '%s\n' "${checked_literal_hits}" | sed 's/^/    /' >&2
+    violations=$(( violations + 1 ))
+fi
+
+# #4020 — a renaming import of CallerContext is refused outright. Every
+# `<alias>::for_admin(..)` is already found as a site above, whatever the
+# prefix; this closes the shape at its source so an alias never needs review.
+if [[ -n "${CURRENT_RENAMES}" ]]; then
+    echo "C8 HARD-BLOCK (#4020): CallerContext renaming import(s) in production:" >&2
+    printf '%s\n' "${CURRENT_RENAMES}" | sed 's/^RENAME:/    /' >&2
+    echo "  Import CallerContext under its own name; an alias hides privacy-bypass" >&2
+    echo "  constructors from review." >&2
     violations=$(( violations + 1 ))
 fi
 

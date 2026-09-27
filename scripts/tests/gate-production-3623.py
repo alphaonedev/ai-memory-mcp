@@ -105,6 +105,21 @@ for gate in gates:
                 ('store/postgres.rs', '\n' * 31499 + in_pg(in_fn(gov_fn), in_fn('execute_pending_action', spoof, site)), True, 'PostgresStore[MemoryStore].execute_pending_action')
                 for spoof in spoofs
             ]
+            # #4020 (f2r): the site finder was the TEXT `CallerContext::for_admin(`.
+            # A renaming import and a fn-item reference both escaped it; each is
+            # a site now, and the renaming import is refused outright.
+            gov = 'crate::identity::sentinels::GOVERNANCE_INTERNAL'
+            cases += [
+                ('store/postgres.rs', 'use crate::store::CallerContext as Cc;\n' + '\n' * 31498 + in_pg(in_fn(gov_fn, f'            let ctx = Cc::for_admin({gov});')), True, 'renaming import'),
+                ('store/postgres.rs', '\n' * 31499 + in_pg(in_fn(gov_fn), in_fn('execute_pending_action', '    let mk = CallerContext::for_admin;', f'    let c = mk({gov});')), True, 'execute_pending_action:<unparsed>'),
+                # A bare reference to the CHECKED constructor would dodge #3943.
+                ('store/postgres.rs', '\n' * 31499 + in_pg(in_fn(gov_fn, site), in_fn('execute_pending_action', '    let mk = CallerContext::for_admin_checked;')), True, 'execute_pending_action:<unparsed>'),
+                # Counted per CALL: two approved calls on ONE line exceed the entry.
+                ('store/postgres.rs', '\n' * 31499 + in_pg(in_fn(gov_fn, f'    let (a, b) = (CallerContext::for_admin({gov}), CallerContext::for_admin({gov}));')), True, '2 site(s) in source, 1 allowlisted'),
+                # Control: the approved site under an explicit `Self::`-free full
+                # path keeps its key (no alias involved) and stays clean.
+                ('store/postgres.rs', '\n' * 31499 + in_pg(in_fn(gov_fn, f'    let ctx = crate::store::CallerContext::for_admin({gov});')), False, marker),
+            ]
             cases += [
                 ('cli/agents.rs', in_fn('run_bind_api_key', daemon) + '\n' + in_fn('run_revoke_api_key', daemon), False, 'DAEMON_PRINCIPAL'),
                 ('cli/agents.rs', in_fn('run_bind_api_key', daemon, daemon) + '\n' + in_fn('run_revoke_api_key', daemon), True, 'DAEMON_PRINCIPAL'),
