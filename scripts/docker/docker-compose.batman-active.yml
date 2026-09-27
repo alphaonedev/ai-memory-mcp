@@ -119,8 +119,13 @@ services:
     # the `/api/v1/health` probe below. The bind is 0.0.0.0 because the port
     # mapping only reaches a listener on the container's 0.0.0.0; the published
     # port stays host-loopback (127.0.0.1:9077).
+    # #3838 (Codex review): the entrypoint is EXPLICIT on every service. The root
+    # Dockerfile sets ENTRYPOINT ["ai-memory"] and Dockerfile.batman-active sets
+    # none, so a command that also starts with `ai-memory` ran
+    # `ai-memory ai-memory ...` (exit 2) under the image the usage line names.
+    # With the entrypoint pinned here the stack boots the same under either.
+    entrypoint: ["ai-memory"]
     command:
-      - ai-memory
       - --db
       - /data/ai-memory.db
       - serve
@@ -162,8 +167,8 @@ services:
       - ai-memory-data:/data
       - ai-memory-keys:/keys
       - ../../scripts:/opt/scripts:ro
+    entrypoint: ["ai-memory"]
     command:
-      - ai-memory
       - --db
       - /data/ai-memory.db
       - curator
@@ -190,18 +195,22 @@ services:
     environment:
       AI_MEMORY_DB: /data/ai-memory.db
       AI_MEMORY_KEY_DIR: /keys
+      SYNC_PEERS: ${SYNC_PEERS:-}
     volumes:
       - ai-memory-data:/data
       - ai-memory-keys:/keys
+    entrypoint: ["sh", "-c"]
+    # #3838 (Codex review) — a LITERAL block (`|`), not a folded one (`>`): the
+    # folded scalar joined `fi` and `exec` onto one line, a shell syntax error,
+    # so this service could never start. `$$` defers SYNC_PEERS to the container
+    # shell (it arrives through `environment:` above) instead of compose.
     command:
-      - sh
-      - -c
-      - >
-        if [ -z "${SYNC_PEERS:-}" ]; then
-          echo "no SYNC_PEERS set — sync daemon idle, exiting";
-          exit 0;
+      - |
+        if [ -z "$${SYNC_PEERS:-}" ]; then
+          echo "no SYNC_PEERS set — sync daemon idle, exiting"
+          exit 0
         fi
-        exec ai-memory --db /data/ai-memory.db sync-daemon --peers "${SYNC_PEERS}"
+        exec ai-memory --db /data/ai-memory.db sync-daemon --peers "$${SYNC_PEERS}"
     restart: unless-stopped
 
 volumes:

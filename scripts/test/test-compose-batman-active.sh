@@ -20,14 +20,26 @@
 #   3. Run the rendered init-batman script on the host against a scratch
 #      /data + /keys + a COPY of scripts/, with `ai-memory` = $AI_MEMORY_BIN.
 #   4. Assert the config.toml it wrote is mode 0600 and carries the key.
-#   5. Start the rendered mcp argv (`serve --host 0.0.0.0 ...`) on a free port
-#      and run the RENDERED healthcheck (curl --cacert <key dir>/tls/local-ca.pem
+#   5. Start the mcp service's EFFECTIVE argv (entrypoint + command, exactly
+#      what the container runtime executes) on a free port and run the
+#      RENDERED healthcheck (curl --cacert <key dir>/tls/local-ca.pem
 #      https://localhost:<port>/api/v1/health) until it answers. The daemon
 #      exiting first is a FAIL, reported with its output.
+#   6. Start the curator's effective argv and require it still running after a
+#      few seconds (an argv the CLI rejects exits 2 at once).
+#   7. Run the sync service's effective argv with no SYNC_PEERS: it must reach
+#      its documented idle exit 0 (the shell script parses and runs).
 #
-# Container paths are rewritten to scratch paths and 9077 to a free port. That
-# is the only difference from the container, and it is what lets this run
-# anywhere a release binary exists, with no image build.
+# Every service must declare its entrypoint EXPLICITLY (#3838, Codex review):
+# the root Dockerfile sets ENTRYPOINT ["ai-memory"] and Dockerfile.batman-active
+# sets none, so a command that relied on the image entrypoint ran
+# `ai-memory ai-memory ...` under the image the compose usage line names.
+#
+# Container paths are rewritten to scratch paths and 9077 to a free port; argv
+# is otherwise run exactly as rendered, with `ai-memory` resolving (via PATH) to
+# the binary under test. LINUX ONLY: the stack runs in Linux containers, and on
+# macOS the daemon's config resolution does not honour XDG_CONFIG_HOME, so a
+# native macOS run would test a different config path than the container uses.
 #
 # Usage: AI_MEMORY_BIN=target/release/ai-memory scripts/test/test-compose-batman-active.sh
 # Scratch lives under .local-runs/ (project rule: never /tmp).
@@ -40,6 +52,7 @@ BOOT_TIMEOUT_SECS="${BOOT_TIMEOUT_SECS:-60}"
 
 fail() { echo "FAIL (#3838 compose smoke): $*" >&2; exit 1; }
 
+[[ "$(uname -s)" == Linux ]] || fail "Linux only: the stack runs in Linux containers, and macOS config resolution ignores XDG_CONFIG_HOME (see the header)"
 command -v docker >/dev/null || fail "docker is required (docker compose config renders the stack)"
 docker compose version >/dev/null 2>&1 || fail "the docker compose plugin is required"
 command -v python3 >/dev/null || fail "python3 is required"
@@ -51,11 +64,14 @@ T="${ROOT}/.local-runs/compose-smoke-3838-$$"
 rm -rf "${T}"
 mkdir -p "${T}/data" "${T}/keys" "${T}/bin" "${T}/home" "${T}/tmp"
 DAEMON_PID=""
+CURATOR_PID=""
 cleanup() {
-    if [[ -n "${DAEMON_PID}" ]] && kill -0 "${DAEMON_PID}" 2>/dev/null; then
-        kill "${DAEMON_PID}" 2>/dev/null || true
-        wait "${DAEMON_PID}" 2>/dev/null || true
-    fi
+    for pid in "${DAEMON_PID}" "${CURATOR_PID}"; do
+        if [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null; then
+            kill "${pid}" 2>/dev/null || true
+            wait "${pid}" 2>/dev/null || true
+        fi
+    done
     if [[ "${KEEP_SMOKE_DIR:-0}" != 1 ]]; then rm -rf "${T}"; fi
 }
 trap cleanup EXIT
@@ -76,8 +92,8 @@ echo "ok 1 - compose refuses to render without AI_MEMORY_IMAGE / AI_MEMORY_API_K
 
 # ---- 2. render ---------------------------------------------------------------
 API_KEY="smoke3838$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
-AI_MEMORY_IMAGE=smoke:local AI_MEMORY_API_KEY="${API_KEY}" \
-    docker compose -f "${COMPOSE}" config --format json > "${T}/rendered.json"
+AI_MEMORY_IMAGE=smoke:local AI_MEMORY_API_KEY="${API_KEY}" SYNC_PEERS= \
+    docker compose -f "${COMPOSE}" --profile sync config --format json > "${T}/rendered.json"
 PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
 
 # Emit shell-safe, path-rewritten pieces of the rendered stack.
@@ -96,26 +112,42 @@ def rw(s):
 def env_arr(name):
     env = svc[name].get("environment") or {}
     return " ".join(shlex.quote(f"{k}={rw(str(v))}") for k, v in env.items())
-init = svc["init-batman"]
-assert init["entrypoint"] == ["/bin/bash", "-c"], init["entrypoint"]
-cmd = init["command"]
-script = cmd[0] if isinstance(cmd, list) else cmd
-open(f"{t}/init.sh", "w").write(rw(script))
-mcp = svc["mcp"]
-argv = [rw(a) for a in mcp["command"]]
-i = argv.index("--port"); argv[i + 1] = port
-hc = [rw(a) for a in mcp["healthcheck"]["test"]]
+def effective(name):
+    # What the container runtime executes: the service's entrypoint + command.
+    # The entrypoint must be EXPLICIT, or the image's own ENTRYPOINT decides
+    # (and differs between the two Dockerfiles this stack can run on).
+    ep = svc[name].get("entrypoint")
+    assert ep, f"{name}: no explicit entrypoint; the image ENTRYPOINT would prefix its command"
+    cmd = svc[name].get("command") or []
+    if isinstance(cmd, str):
+        cmd = [cmd]
+    return [rw(a) for a in list(ep) + list(cmd)]
+def arr(name, argv):
+    return f"{name}=(" + " ".join(shlex.quote(a) for a in argv) + ")"
+init = effective("init-batman")
+assert init[:2] == ["/bin/bash", "-c"], init[:2]
+mcp = effective("mcp")
+assert mcp[0] == "ai-memory" and mcp[1] != "ai-memory", mcp[:2]
+i = mcp.index("--port"); mcp[i + 1] = port
+cur = effective("curator")
+assert cur[0] == "ai-memory" and cur[1] != "ai-memory", cur[:2]
+syn = effective("sync")
+assert syn[:2] == ["sh", "-c"], syn[:2]
+hc = [rw(a) for a in svc["mcp"]["healthcheck"]["test"]]
 assert hc[0] == "CMD", hc
-print("INIT_ENV=(" + env_arr("init-batman") + ")")
-print("MCP_ENV=(" + env_arr("mcp") + ")")
-print("MCP_ARGV=(" + " ".join(shlex.quote(a) for a in argv) + ")")
-print("HEALTH_ARGV=(" + " ".join(shlex.quote(a) for a in hc[1:]) + ")")
+for name, var in (("init-batman", "INIT_ENV"), ("mcp", "MCP_ENV"), ("curator", "CURATOR_ENV"), ("sync", "SYNC_ENV")):
+    print(f"{var}=(" + env_arr(name) + ")")
+print(arr("INIT_ARGV", init))
+print(arr("MCP_ARGV", mcp))
+print(arr("CURATOR_ARGV", cur))
+print(arr("SYNC_ARGV", syn))
+print(arr("HEALTH_ARGV", hc[1:]))
 PYEOF
 # shellcheck disable=SC1091
 source "${T}/plan.sh"
 [[ " ${MCP_ARGV[*]} " == *" --host 0.0.0.0 "* ]] \
     || fail "the rendered mcp service no longer binds 0.0.0.0 (the published port needs it): ${MCP_ARGV[*]}"
-echo "ok 2 - rendered: ${MCP_ARGV[*]}"
+echo "ok 2 - rendered; every service declares its entrypoint; mcp runs: ${MCP_ARGV[*]}"
 
 # A container starts with ONLY its image env + the rendered environment block.
 # `env -i` reproduces that, so no host AI_MEMORY_* (e.g. AI_MEMORY_NO_CONFIG,
@@ -123,7 +155,7 @@ echo "ok 2 - rendered: ${MCP_ARGV[*]}"
 BASE_ENV=(PATH="${T}/bin:/usr/local/bin:/usr/bin:/bin" HOME="${T}/home" TMPDIR="${T}/tmp")
 
 # ---- 3. run the rendered init-batman script ---------------------------------
-env -i "${BASE_ENV[@]}" "${INIT_ENV[@]}" bash "${T}/init.sh" > "${T}/init.log" 2>&1 \
+env -i "${BASE_ENV[@]}" "${INIT_ENV[@]}" "${INIT_ARGV[@]}" > "${T}/init.log" 2>&1 \
     || fail "rendered init-batman script failed:"$'\n'"$(tail -30 "${T}/init.log")"
 grep -q 'init-batman complete' "${T}/init.log" || fail "init-batman did not complete: $(tail -10 "${T}/init.log")"
 echo "ok 3 - rendered init-batman script completed"
@@ -138,7 +170,7 @@ grep -q '^tier = "autonomous"$' "${CFG}" || fail "config.toml lost the autonomou
 echo "ok 4 - config.toml is mode 600 and carries api_key + tier"
 
 # ---- 5. the rendered serve argv boots and the rendered healthcheck answers --
-env -i "${BASE_ENV[@]}" "${MCP_ENV[@]}" "${BIN}" "${MCP_ARGV[@]:1}" > "${T}/serve.log" 2>&1 &
+env -i "${BASE_ENV[@]}" "${MCP_ENV[@]}" "${MCP_ARGV[@]}" > "${T}/serve.log" 2>&1 &
 DAEMON_PID=$!
 deadline=$(( SECONDS + BOOT_TIMEOUT_SECS ))
 healthy=0
@@ -152,5 +184,22 @@ while (( SECONDS < deadline )); do
     sleep 1
 done
 (( healthy )) || fail "no healthy answer within ${BOOT_TIMEOUT_SECS}s from: ${HEALTH_ARGV[*]}"$'\n'"$(tail -20 "${T}/serve.log")"
-echo "ok 5 - rendered serve argv is up and the rendered TLS healthcheck answers"
-echo "PASS (#3838 compose smoke): the batman-active stack's init + serve boot as rendered"
+echo "ok 5 - the mcp service's effective argv is up and the rendered TLS healthcheck answers"
+
+# ---- 6. the curator's effective argv parses and keeps running ---------------
+env -i "${BASE_ENV[@]}" "${CURATOR_ENV[@]}" "${CURATOR_ARGV[@]}" > "${T}/curator.log" 2>&1 &
+CURATOR_PID=$!
+sleep "${CURATOR_SETTLE_SECS:-6}"
+if ! kill -0 "${CURATOR_PID}" 2>/dev/null; then
+    wait "${CURATOR_PID}" && rc=0 || rc=$?
+    CURATOR_PID=""
+    fail "the curator service's effective argv EXITED (rc=${rc}):"$'\n'"$(tail -20 "${T}/curator.log")"
+fi
+echo "ok 6 - the curator service's effective argv is running"
+
+# ---- 7. the sync service's script parses and idles without peers -------------
+env -i "${BASE_ENV[@]}" "${SYNC_ENV[@]}" "${SYNC_ARGV[@]}" > "${T}/sync.log" 2>&1 \
+    || fail "the sync service's effective argv failed with no SYNC_PEERS:"$'\n'"$(tail -10 "${T}/sync.log")"
+grep -q 'sync daemon idle' "${T}/sync.log" || fail "the sync service did not reach its idle exit: $(tail -5 "${T}/sync.log")"
+echo "ok 7 - the sync service's effective argv idles cleanly without peers"
+echo "PASS (#3838 compose smoke): the batman-active stack's services run as the container runtime runs them"
