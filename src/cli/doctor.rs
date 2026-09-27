@@ -1951,10 +1951,12 @@ fn section_postgres_unstamped_owners_3124() -> Option<ReportSection> {
     let census: Result<crate::identity::owner_stamp::UnstampedCensus> =
         run_pg_probe(|| async move {
             let probe = async {
+                // #3674 — the DSN screen, never a raw `.connect(url)`.
+                let options = crate::store::postgres::dsn::connect_options(&url)?;
                 let pool = sqlx::postgres::PgPoolOptions::new()
                     .max_connections(1)
                     .acquire_timeout(PG_PROBE_TIMEOUT)
-                    .connect(&url)
+                    .connect_with(options)
                     .await?;
                 let (unstamped, malformed, archived): (i64, i64, i64) =
                     sqlx::query_as(crate::identity::owner_stamp::PG_CENSUS_SQL)
@@ -2039,10 +2041,12 @@ fn section_postgres_extensions_3264() -> Option<ReportSection> {
         // unbounded, so a server that accepts a connection and then never
         // answers hung `ai-memory doctor` indefinitely.
         let probe = async {
+            // #3674 — the DSN screen, never a raw `.connect(url)`.
+            let options = crate::store::postgres::dsn::connect_options(&url)?;
             let pool = sqlx::postgres::PgPoolOptions::new()
                 .max_connections(1)
                 .acquire_timeout(PG_PROBE_TIMEOUT)
-                .connect(&url)
+                .connect_with(options)
                 .await?;
             let facts = probe_pgvector_preflight(&pool).await?;
             let vector_version = probe_extension_version(&pool, PGVECTOR_EXTENSION_NAME).await?;

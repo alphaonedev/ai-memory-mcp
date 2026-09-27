@@ -97,6 +97,9 @@ mod lineage;
 // canonical pins mirroring the SSOT) shared by `ai-memory doctor` and the
 // `serve` boot WARN. Own module: pure, no sqlx, unit-tested without a cluster.
 pub mod age_version;
+// v1.0.0 #3674 — the ONE funnel a store DSN crosses on its way into sqlx:
+// query parameters sqlx would log instead of honour are removed first.
+pub mod dsn;
 // v1.0.0 #3124 R4 — the audited `reown` sweep. Own module for the same
 // qual_10 budget reason as `parity_3064` above.
 mod reown_3124;
@@ -2693,17 +2696,18 @@ impl PostgresStore {
             }
         }
 
+        // #3674 — through the DSN screen, never `url.parse()`: sqlx logs every
+        // query parameter it does not recognise with its VALUE at WARN.
         let options: PgConnectOptions =
-            url.parse()
-                .map_err(|e: sqlx::Error| StoreError::BackendUnavailable {
-                    backend: "postgres".to_string(),
-                    sqlstate: None,
-                    // #1579 A3 (SECURITY) — sqlx parse errors can
-                    // interpolate the raw URL (credential included)
-                    // into their Display; scrub any embedded URL's
-                    // password before the detail leaves the adapter.
-                    detail: format!("parse url: {e}"),
-                })?;
+            dsn::connect_options(url).map_err(|e: sqlx::Error| StoreError::BackendUnavailable {
+                backend: "postgres".to_string(),
+                sqlstate: None,
+                // #1579 A3 (SECURITY) — sqlx parse errors can
+                // interpolate the raw URL (credential included)
+                // into their Display; scrub any embedded URL's
+                // password before the detail leaves the adapter.
+                detail: format!("parse url: {e}"),
+            })?;
         // v0.7.0 M4/M7 — `after_connect` hook fires the moment a new
         // connection is acquired. We use it to apply per-session
         // `statement_timeout` + `lock_timeout` so a runaway query
