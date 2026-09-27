@@ -1081,7 +1081,8 @@ pub struct OllamaClient {
     /// name is preserved for call-site backward compatibility; a
     /// future rename to `LlmClient` is non-breaking.
     provider: LlmProvider,
-    base_url: String,
+    base_url: reqwest::Url,
+    egress_pin: Option<crate::egress::PinnedTarget>,
     model: String,
     /// PERF-9 (v0.7.0 FX-C1, 2026-05-26) — async `reqwest::Client`.
     /// Pre-PERF-9 this was `reqwest::blocking::Client`, which pinned
@@ -1108,6 +1109,16 @@ pub struct OllamaClient {
 }
 
 impl OllamaClient {
+    /// Append a provider endpoint without reparsing or replacing the authority.
+    fn endpoint_url(&self, suffix: &str) -> reqwest::Url {
+        let mut url = self.base_url.clone();
+        url.set_path(&format!(
+            "{}{suffix}",
+            self.base_url.path().trim_end_matches('/')
+        ));
+        url
+    }
+
     /// v0.7.0 (issue #1244) — accessor for the resolved model name.
     ///
     /// Returns the model identifier the client was constructed with
@@ -1132,6 +1143,7 @@ impl OllamaClient {
         Self {
             provider: self.provider.clone(),
             base_url: self.base_url.clone(),
+            egress_pin: self.egress_pin.clone(),
             model: model.into(),
             client: self.client.clone(),
             breaker: Mutex::new(BreakerState::new()),
@@ -1166,7 +1178,9 @@ impl OllamaClient {
     pub fn new_for_testing(model: &str) -> Self {
         Self {
             provider: LlmProvider::Ollama,
-            base_url: DEFAULT_OLLAMA_URL.trim_end_matches('/').to_string(),
+            base_url: crate::subscriptions::parse_http_target(DEFAULT_OLLAMA_URL)
+                .expect("valid default URL"),
+            egress_pin: None,
             model: model.to_string(),
             client: reqwest::Client::builder()
                 .timeout(GENERATE_TIMEOUT)
@@ -1493,7 +1507,8 @@ impl OllamaClient {
             provider: LlmProvider::OpenAiCompatible {
                 api_key: api_key.to_string(),
             },
-            base_url: base_url.trim_end_matches('/').to_string(),
+            base_url: crate::subscriptions::parse_http_target(base_url)?,
+            egress_pin: None,
             model: model.to_string(),
             client,
             breaker: Mutex::new(BreakerState::new()),
@@ -1548,7 +1563,7 @@ impl OllamaClient {
             return Err(anyhow!(
                 "Ollama is not running or not reachable at {}. \
                  Start it with: ollama serve",
-                crate::url_display::url_origin(&instance.base_url)
+                crate::url_display::url_origin(instance.base_url.as_str())
             ));
         }
 
@@ -1580,7 +1595,8 @@ impl OllamaClient {
 
         Ok(Self {
             provider: LlmProvider::Ollama,
-            base_url: base_url.trim_end_matches('/').to_string(),
+            base_url: crate::subscriptions::parse_http_target(base_url)?,
+            egress_pin: None,
             model: model.to_string(),
             client,
             breaker: Mutex::new(BreakerState::new()),
@@ -1617,18 +1633,16 @@ impl OllamaClient {
     /// # Errors
     /// Returns an error if the HTTP client fails to build.
     pub fn new_openai_compatible_pinned(
-        base_url: &str,
+        pin: &crate::egress::PinnedTarget,
         model: &str,
         api_key: &str,
-        host: &str,
-        addrs: &[std::net::SocketAddr],
     ) -> Result<Self> {
         let client = Self::apply_internal_egress_pin(
             reqwest::Client::builder()
                 .timeout(GENERATE_TIMEOUT)
                 .connect_timeout(CONNECT_TIMEOUT),
-            host,
-            addrs,
+            &pin.host,
+            &pin.addrs,
         )
         .build()
         .context("Failed to build pinned HTTP client (internal-only egress)")?;
@@ -1636,7 +1650,8 @@ impl OllamaClient {
             provider: LlmProvider::OpenAiCompatible {
                 api_key: api_key.to_string(),
             },
-            base_url: base_url.trim_end_matches('/').to_string(),
+            base_url: pin.url.clone(),
+            egress_pin: Some(pin.clone()),
             model: model.to_string(),
             client,
             breaker: Mutex::new(BreakerState::new()),
@@ -1649,23 +1664,22 @@ impl OllamaClient {
     /// # Errors
     /// Returns an error if the HTTP client fails to build.
     pub fn new_with_url_no_health_check_pinned(
-        base_url: &str,
+        pin: &crate::egress::PinnedTarget,
         model: &str,
-        host: &str,
-        addrs: &[std::net::SocketAddr],
     ) -> Result<Self> {
         let client = Self::apply_internal_egress_pin(
             reqwest::Client::builder()
                 .timeout(GENERATE_TIMEOUT)
                 .connect_timeout(CONNECT_TIMEOUT),
-            host,
-            addrs,
+            &pin.host,
+            &pin.addrs,
         )
         .build()
         .context("Failed to build pinned HTTP client (internal-only egress)")?;
         Ok(Self {
             provider: LlmProvider::Ollama,
-            base_url: base_url.trim_end_matches('/').to_string(),
+            base_url: pin.url.clone(),
+            egress_pin: Some(pin.clone()),
             model: model.to_string(),
             client,
             breaker: Mutex::new(BreakerState::new()),
@@ -1679,16 +1693,14 @@ impl OllamaClient {
     /// # Errors
     /// Client build failure, or Ollama not reachable at the pinned target.
     pub async fn new_with_url_async_pinned(
-        base_url: &str,
+        pin: &crate::egress::PinnedTarget,
         model: &str,
-        host: &str,
-        addrs: &[std::net::SocketAddr],
     ) -> Result<Self> {
-        let instance = Self::new_with_url_no_health_check_pinned(base_url, model, host, addrs)?;
+        let instance = Self::new_with_url_no_health_check_pinned(pin, model)?;
         if !instance.is_available_async().await {
             return Err(anyhow!(
                 "Ollama is not running or not reachable at the pinned internal target {}. Start it with: ollama serve",
-                crate::url_display::url_origin(&instance.base_url)
+                crate::url_display::url_origin(instance.base_url.as_str())
             ));
         }
         Ok(instance)
@@ -1699,14 +1711,9 @@ impl OllamaClient {
     ///
     /// # Errors
     /// Client build failure, or Ollama not reachable.
-    pub fn new_with_url_pinned(
-        base_url: &str,
-        model: &str,
-        host: &str,
-        addrs: &[std::net::SocketAddr],
-    ) -> Result<Self> {
+    pub fn new_with_url_pinned(pin: &crate::egress::PinnedTarget, model: &str) -> Result<Self> {
         block_on_local_bounded(BRIDGE_HEALTH_BUDGET, || {
-            Self::new_with_url_async_pinned(base_url, model, host, addrs)
+            Self::new_with_url_async_pinned(pin, model)
         })?
     }
 
@@ -1727,13 +1734,7 @@ impl OllamaClient {
             return Err(unrecognized_llm_backend_error(&resolved.backend));
         }
         if resolved.backend == BACKEND_OLLAMA {
-            return Self::new_with_url_pinned(
-                &resolved.base_url,
-                &resolved.model,
-                &pin.host,
-                &pin.addrs,
-            )
-            .map(Some);
+            return Self::new_with_url_pinned(pin, &resolved.model).map(Some);
         }
         let Some(api_key) = resolved.api_key() else {
             return Err(anyhow!(
@@ -1742,14 +1743,7 @@ impl OllamaClient {
                 resolved.api_key_source.as_str(),
             ));
         };
-        Self::new_openai_compatible_pinned(
-            &resolved.base_url,
-            &resolved.model,
-            api_key,
-            &pin.host,
-            &pin.addrs,
-        )
-        .map(Some)
+        Self::new_openai_compatible_pinned(pin, &resolved.model, api_key).map(Some)
     }
 
     /// #3822 — pinned async sibling of [`Self::build_from_resolved_async`].
@@ -1767,14 +1761,9 @@ impl OllamaClient {
             return Err(unrecognized_llm_backend_error(&resolved.backend));
         }
         if resolved.backend == BACKEND_OLLAMA {
-            return Self::new_with_url_async_pinned(
-                &resolved.base_url,
-                &resolved.model,
-                &pin.host,
-                &pin.addrs,
-            )
-            .await
-            .map(Some);
+            return Self::new_with_url_async_pinned(pin, &resolved.model)
+                .await
+                .map(Some);
         }
         let Some(api_key) = resolved.api_key() else {
             return Err(anyhow!(
@@ -1783,14 +1772,7 @@ impl OllamaClient {
                 resolved.api_key_source.as_str(),
             ));
         };
-        Self::new_openai_compatible_pinned(
-            &resolved.base_url,
-            &resolved.model,
-            api_key,
-            &pin.host,
-            &pin.addrs,
-        )
-        .map(Some)
+        Self::new_openai_compatible_pinned(pin, &resolved.model, api_key).map(Some)
     }
 
     /// v1.0.0 #3523 — TEST-ONLY probe-free constructor (#3509 load-flake
@@ -1872,12 +1854,12 @@ impl OllamaClient {
     /// Same semantics; no thread blocked.
     pub async fn is_available_async(&self) -> bool {
         let (url, bearer) = match &self.provider {
-            LlmProvider::Ollama => (ollama_tags_url(&self.base_url), None),
+            LlmProvider::Ollama => (self.endpoint_url("/api/tags"), None),
             LlmProvider::OpenAiCompatible { api_key } => {
-                (format!("{}/models", self.base_url), Some(api_key.as_str()))
+                (self.endpoint_url("/models"), Some(api_key.as_str()))
             }
         };
-        let mut req = self.client.get(&url).timeout(HEALTH_TIMEOUT);
+        let mut req = self.client.get(url).timeout(HEALTH_TIMEOUT);
         if let Some(key) = bearer {
             req = req.bearer_auth(key);
         }
@@ -1911,10 +1893,10 @@ impl OllamaClient {
         if matches!(self.provider, LlmProvider::OpenAiCompatible { .. }) {
             return Ok(());
         }
-        let url = ollama_tags_url(&self.base_url);
+        let url = self.endpoint_url("/api/tags");
         let resp = self
             .client
-            .get(&url)
+            .get(url)
             .timeout(Duration::from_secs(10))
             .send()
             .await
@@ -1948,14 +1930,15 @@ impl OllamaClient {
             self.model
         );
 
-        let pull_url = format!("{}/api/pull", self.base_url);
-        let pull_client = reqwest::Client::builder()
-            .timeout(PULL_TIMEOUT)
-            .build()
-            .context("Failed to build pull client")?;
+        let pull_url = self.endpoint_url("/api/pull");
+        let mut builder = reqwest::Client::builder().timeout(PULL_TIMEOUT);
+        if let Some(pin) = &self.egress_pin {
+            builder = Self::apply_internal_egress_pin(builder, &pin.host, &pin.addrs);
+        }
+        let pull_client = builder.build().context("Failed to build pull client")?;
 
         let resp = pull_client
-            .post(&pull_url)
+            .post(pull_url)
             .json(&json!({ "name": self.model }))
             .send()
             .await
@@ -2020,7 +2003,7 @@ impl OllamaClient {
         // v0.7.0 (issue #1237, #691 fold-1) — governance NetworkRequest gate.
         self.check_outbound()?;
 
-        let (url, payload, bearer): (String, Value, Option<&str>) = match &self.provider {
+        let (url, payload, bearer): (reqwest::Url, Value, Option<&str>) = match &self.provider {
             LlmProvider::Ollama => {
                 let mut messages = Vec::new();
                 if let Some(sys) = system {
@@ -2028,7 +2011,7 @@ impl OllamaClient {
                 }
                 messages.push(json!({"role": "user", "content": prompt}));
                 (
-                    self.base_url.clone() + OLLAMA_CHAT_PATH,
+                    self.endpoint_url(OLLAMA_CHAT_PATH),
                     json!({
                         "model": self.model,
                         "messages": messages,
@@ -2044,7 +2027,7 @@ impl OllamaClient {
                 }
                 messages.push(json!({"role": "user", "content": prompt}));
                 (
-                    self.base_url.clone() + OPENAI_CHAT_PATH,
+                    self.endpoint_url(OPENAI_CHAT_PATH),
                     json!({
                         "model": self.model,
                         "messages": messages,
@@ -2057,7 +2040,7 @@ impl OllamaClient {
 
         let mut req = self
             .client
-            .post(&url)
+            .post(url)
             .timeout(GENERATE_TIMEOUT)
             .json(&payload);
         if let Some(key) = bearer {
@@ -2170,7 +2153,7 @@ impl OllamaClient {
         }
         self.check_outbound()?;
 
-        let (url, payload, bearer): (String, Value, Option<&str>) = match &self.provider {
+        let (url, payload, bearer): (reqwest::Url, Value, Option<&str>) = match &self.provider {
             LlmProvider::Ollama => {
                 let mut messages = Vec::new();
                 if let Some(sys) = system {
@@ -2185,7 +2168,7 @@ impl OllamaClient {
                 if !tools.is_empty() {
                     body["tools"] = Value::Array(tools.iter().map(ToolDef::to_wire).collect());
                 }
-                (self.base_url.clone() + OLLAMA_CHAT_PATH, body, None)
+                (self.endpoint_url(OLLAMA_CHAT_PATH), body, None)
             }
             LlmProvider::OpenAiCompatible { api_key } => {
                 let mut messages = Vec::new();
@@ -2202,7 +2185,7 @@ impl OllamaClient {
                     body["tools"] = Value::Array(tools.iter().map(ToolDef::to_wire).collect());
                 }
                 (
-                    self.base_url.clone() + OPENAI_CHAT_PATH,
+                    self.endpoint_url(OPENAI_CHAT_PATH),
                     body,
                     Some(api_key.as_str()),
                 )
@@ -2211,7 +2194,7 @@ impl OllamaClient {
 
         let mut req = self
             .client
-            .post(&url)
+            .post(url)
             .timeout(GENERATE_TIMEOUT)
             .json(&payload);
         if let Some(key) = bearer {
@@ -2444,7 +2427,7 @@ impl OllamaClient {
         self.check_outbound()?;
         let model = model_override.unwrap_or(&self.model);
 
-        let (url, payload, bearer): (String, Value, Option<&str>) = match &self.provider {
+        let (url, payload, bearer): (reqwest::Url, Value, Option<&str>) = match &self.provider {
             LlmProvider::Ollama => {
                 let mut messages = Vec::new();
                 if let Some(sys) = system {
@@ -2452,7 +2435,7 @@ impl OllamaClient {
                 }
                 messages.push(json!({"role": "user", "content": prompt}));
                 (
-                    self.base_url.clone() + OLLAMA_CHAT_PATH,
+                    self.endpoint_url(OLLAMA_CHAT_PATH),
                     json!({"model": model, "messages": messages, "stream": false}),
                     None,
                 )
@@ -2464,7 +2447,7 @@ impl OllamaClient {
                 }
                 messages.push(json!({"role": "user", "content": prompt}));
                 (
-                    self.base_url.clone() + OPENAI_CHAT_PATH,
+                    self.endpoint_url(OPENAI_CHAT_PATH),
                     json!({"model": model, "messages": messages, "stream": false}),
                     Some(api_key.as_str()),
                 )
@@ -2473,7 +2456,7 @@ impl OllamaClient {
 
         let mut req = self
             .client
-            .post(&url)
+            .post(url)
             .timeout(GENERATE_TIMEOUT)
             .json(&payload);
         if let Some(key) = bearer {
@@ -2553,15 +2536,8 @@ impl OllamaClient {
     /// degrades to "no LLM tags this call" rather than crashing the
     /// store handler.
     fn check_outbound(&self) -> Result<()> {
-        let url = reqwest::Url::parse(&self.base_url).ok();
-        let host = url
-            .as_ref()
-            .and_then(|u| u.host_str().map(str::to_string))
-            .unwrap_or_else(|| crate::url_display::url_origin(&self.base_url));
-        let scheme = url
-            .as_ref()
-            .map(|u| u.scheme().to_string())
-            .unwrap_or_default();
+        let host = self.base_url.host_str().unwrap_or_default().to_string();
+        let scheme = self.base_url.scheme().to_string();
         let action = crate::governance::agent_action::AgentAction::NetworkRequest {
             host: host.clone(),
             scheme,
@@ -2608,10 +2584,10 @@ impl OllamaClient {
             ));
         }
         self.check_outbound()?;
-        let url = format!("{}/api/generate", self.base_url);
+        let url = self.endpoint_url("/api/generate");
         let resp = match self
             .client
-            .post(&url)
+            .post(url)
             .timeout(GENERATE_TIMEOUT)
             .json(body)
             .send()
@@ -2758,7 +2734,7 @@ impl OllamaClient {
         }
         self.check_outbound()?;
 
-        let (url, payload, bearer): (String, Value, Option<&str>) = match &self.provider {
+        let (url, payload, bearer): (reqwest::Url, Value, Option<&str>) = match &self.provider {
             // #1595 — `"truncate": true` makes Ollama clip an
             // over-context-length input to the model's window instead
             // of failing the call with `{"error":"the input length
@@ -2768,7 +2744,7 @@ impl OllamaClient {
             // all; the client-side `EMBED_MAX_BYTES` guard still caps
             // pathological inputs before they are sent.
             LlmProvider::Ollama => (
-                format!("{}/api/embed", self.base_url),
+                self.endpoint_url("/api/embed"),
                 json!({"model": embed_model, "input": text, "truncate": true}),
                 None,
             ),
@@ -2779,7 +2755,7 @@ impl OllamaClient {
             // pgvector `vector(768)` fleet schemas + ANN indexes
             // (<=2000-dim limit) usable with high-dim API models.
             LlmProvider::OpenAiCompatible { api_key } => (
-                format!("{}{}", self.base_url, OPENAI_COMPAT_EMBEDDINGS_PATH),
+                self.endpoint_url(OPENAI_COMPAT_EMBEDDINGS_PATH),
                 match self.embed_dimensions {
                     Some(dims) => {
                         json!({"model": embed_model, "input": text, "dimensions": dims})
@@ -2792,7 +2768,7 @@ impl OllamaClient {
 
         let mut req = self
             .client
-            .post(&url)
+            .post(url)
             .timeout(GENERATE_TIMEOUT)
             .json(&payload);
         if let Some(key) = bearer {
@@ -2993,10 +2969,7 @@ impl OllamaClient {
 
         let resp = match self
             .client
-            .post(format!(
-                "{}{}",
-                self.base_url, OPENAI_COMPAT_EMBEDDINGS_PATH
-            ))
+            .post(self.endpoint_url(OPENAI_COMPAT_EMBEDDINGS_PATH))
             .timeout(GENERATE_TIMEOUT)
             .json(&payload)
             .bearer_auth(api_key)
@@ -3057,10 +3030,10 @@ impl OllamaClient {
         if matches!(self.provider, LlmProvider::OpenAiCompatible { .. }) {
             return Ok(());
         }
-        let url = ollama_tags_url(&self.base_url);
+        let url = self.endpoint_url("/api/tags");
         let resp = self
             .client
-            .get(&url)
+            .get(url)
             .timeout(std::time::Duration::from_secs(10))
             .send()
             .await
@@ -3087,13 +3060,14 @@ impl OllamaClient {
         }
 
         tracing::info!("Pulling Ollama embedding model '{}'...", model);
-        let pull_url = format!("{}/api/pull", self.base_url);
-        let pull_client = reqwest::Client::builder()
-            .timeout(PULL_TIMEOUT)
-            .build()
-            .context("Failed to build pull client")?;
+        let pull_url = self.endpoint_url("/api/pull");
+        let mut builder = reqwest::Client::builder().timeout(PULL_TIMEOUT);
+        if let Some(pin) = &self.egress_pin {
+            builder = Self::apply_internal_egress_pin(builder, &pin.host, &pin.addrs);
+        }
+        let pull_client = builder.build().context("Failed to build pull client")?;
         let resp = pull_client
-            .post(&pull_url)
+            .post(pull_url)
             .json(&json!({ "name": model }))
             .send()
             .await
@@ -3151,6 +3125,48 @@ impl OllamaClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn regression_4018_requests_keep_admitted_authority() {
+        use crate::egress::{EgressClass, InferenceEgressMode, admit_inference_target};
+        for raw in [
+            "https://127.1:8443/v1/?key=value#fragment",
+            "https://[0:0:0:0:0:0:0:1]:8443/prefix/",
+            "https://%31%32%37.0.0.1:8443/v1",
+        ] {
+            let pin = admit_inference_target(
+                InferenceEgressMode::InternalOnly,
+                EgressClass::InferenceLlm,
+                raw,
+            )
+            .expect("internal target")
+            .expect("pin");
+            let client = OllamaClient::new_openai_compatible_pinned(&pin, "model", "key")
+                .expect("pinned client");
+            for suffix in [
+                OLLAMA_CHAT_PATH,
+                OPENAI_CHAT_PATH,
+                OPENAI_COMPAT_EMBEDDINGS_PATH,
+                "/api/embed",
+                "/api/generate",
+                "/api/tags",
+                "/api/pull",
+                "/models",
+            ] {
+                let request = client
+                    .client
+                    .post(client.endpoint_url(suffix))
+                    .build()
+                    .expect("request");
+                assert_eq!(request.url().origin(), pin.url.origin(), "{raw:?} {suffix}");
+                assert_eq!(request.url().query(), pin.url.query());
+                assert_eq!(
+                    request.url().path(),
+                    format!("{}{suffix}", pin.url.path().trim_end_matches('/'))
+                );
+            }
+        }
+    }
 
     #[test]
     fn test_prompt_templates_have_placeholders() {
@@ -5195,7 +5211,8 @@ mod wiremock_tests {
             "#1143: AI_MEMORY_LLM_MODEL must override the legacy model arg"
         );
         assert_eq!(
-            client.base_url, "https://api.x.ai/v1",
+            client.base_url.as_str(),
+            "https://api.x.ai/v1",
             "#1143: xai default base URL must override the legacy URL arg"
         );
     }
@@ -5520,7 +5537,7 @@ mod perf9_async_tests {
         let mut client500 = OllamaClient::new_for_testing("test-model");
         // Stamp the right base_url on the test client.
         // (Tests under `super::` can read/write private fields.)
-        client500.base_url = server500.uri().trim_end_matches('/').to_string();
+        client500.base_url = reqwest::Url::parse(&server500.uri()).unwrap();
         let _ = client; // keep first client alive long enough; suppress unused
         assert!(!client500.is_available_async().await);
     }
@@ -5531,7 +5548,7 @@ mod perf9_async_tests {
         let port = listener.local_addr().unwrap().port();
         drop(listener);
         let mut client = OllamaClient::new_for_testing("test-model");
-        client.base_url = format!("http://127.0.0.1:{port}");
+        client.base_url = reqwest::Url::parse(&format!("http://127.0.0.1:{port}")).unwrap();
         assert!(!client.is_available_async().await);
     }
 
@@ -5677,7 +5694,7 @@ mod perf9_async_tests {
             .mount(&server)
             .await;
         let mut client = OllamaClient::new_for_testing("test-model");
-        client.base_url = server.uri().trim_end_matches('/').to_string();
+        client.base_url = reqwest::Url::parse(&server.uri()).unwrap();
         let err = client
             .ensure_model_async()
             .await

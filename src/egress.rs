@@ -56,7 +56,7 @@
 
 use anyhow::Result;
 use rusqlite::Connection;
-use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr};
 
 /// Env var selecting the inference-plane egress posture.
 pub const ENV_INFERENCE_EGRESS: &str = "AI_MEMORY_INFERENCE_EGRESS";
@@ -235,6 +235,10 @@ pub fn target_is_loopback(base_url: &str) -> bool {
     let Some(host) = host_of(base_url) else {
         return false;
     };
+    host_is_loopback(&host)
+}
+
+fn host_is_loopback(host: &str) -> bool {
     let host = host.to_ascii_lowercase();
     if matches!(host.as_str(), "localhost" | "localhost.localdomain") {
         return true;
@@ -251,27 +255,8 @@ pub fn target_is_loopback(base_url: &str) -> bool {
 /// Extract the host from a `scheme://[user@]host[:port][/path]` base URL.
 /// Returns `None` when no authority can be found.
 fn host_of(base_url: &str) -> Option<String> {
-    let after_scheme = base_url
-        .split_once("://")
-        .map_or(base_url, |(_, rest)| rest);
-    // #3744 (A4) — ONE userinfo-stripping helper shared with the subscriptions
-    // SSRF lane, so egress and the webhook guard read the identical host.
-    let host_port = crate::subscriptions::authority_without_userinfo(after_scheme);
-    if host_port.is_empty() {
-        return None;
-    }
-    // Strip the port. IPv6 literals are bracketed, so a `]` guards the
-    // port split from eating a `:` inside the address.
-    let host = if let Some(end) = host_port.find(']') {
-        &host_port[..=end]
-    } else {
-        host_port.split(':').next().unwrap_or(host_port)
-    };
-    if host.is_empty() {
-        None
-    } else {
-        Some(host.to_string())
-    }
+    let url = crate::subscriptions::parse_http_target(base_url).ok()?;
+    crate::subscriptions::parsed_target_host(&url).ok()
 }
 
 /// The pure inference-plane egress gate. Given the resolved posture, the
@@ -300,19 +285,23 @@ fn refuse_offhost_plaintext_inference_egress(
     base_url: &str,
 ) -> Option<EgressDecision> {
     if crate::transit_encryption::url_is_plaintext_http(base_url) && !target_is_loopback(base_url) {
-        Some(EgressDecision::Refuse {
-            class,
-            target: base_url.to_string(),
-            reason: format!(
-                "inference-plane egress refused: the target uses the plaintext `http` \
+        Some(plaintext_inference_refusal(class, base_url))
+    } else {
+        None
+    }
+}
+
+fn plaintext_inference_refusal(class: EgressClass, base_url: &str) -> EgressDecision {
+    EgressDecision::Refuse {
+        class,
+        target: base_url.to_string(),
+        reason: format!(
+            "inference-plane egress refused: the target uses the plaintext `http` \
                  scheme to a non-loopback host, so memory content for {class} would leave \
                  the host UNENCRYPTED. Use an `https://` endpoint (or a local \
                  TLS-terminating proxy); a loopback endpoint over http is permitted.",
-                class = class.as_str()
-            ),
-        })
-    } else {
-        None
+            class = class.as_str()
+        ),
     }
 }
 
@@ -433,40 +422,65 @@ pub fn evaluate_inference_egress_resolved(
     addrs: &[SocketAddr],
 ) -> EgressDecision {
     match mode {
-        InferenceEgressMode::InternalOnly => {
-            // A5 — refuse off-host plaintext http FIRST (loopback http stays permitted).
-            if let Some(refusal) = refuse_offhost_plaintext_inference_egress(class, url) {
-                return refusal;
-            }
-            if addrs.is_empty() {
-                return EgressDecision::Refuse {
-                    class,
-                    target: url.to_string(),
-                    reason: format!(
-                        "inference-plane egress refused: {ENV_INFERENCE_EGRESS}=internal-only \
+        InferenceEgressMode::InternalOnly => match crate::subscriptions::parse_http_target(url) {
+            Ok(parsed) => evaluate_internal_egress_resolved(class, &parsed, addrs),
+            Err(e) => EgressDecision::Refuse {
+                class,
+                target: url.to_string(),
+                reason: e.to_string(),
+            },
+        },
+        // The name-based postures ignore the resolved addresses.
+        _ => evaluate_inference_egress(mode, class, url),
+    }
+}
+
+fn refuse_offhost_plaintext_parsed(
+    class: EgressClass,
+    url: &reqwest::Url,
+) -> Option<EgressDecision> {
+    let host = crate::subscriptions::parsed_target_host(url).ok()?;
+    if url.scheme() == "http" && !host_is_loopback(&host) {
+        Some(plaintext_inference_refusal(class, url.as_str()))
+    } else {
+        None
+    }
+}
+
+fn evaluate_internal_egress_resolved(
+    class: EgressClass,
+    url: &reqwest::Url,
+    addrs: &[SocketAddr],
+) -> EgressDecision {
+    // A5 — refuse off-host plaintext http FIRST (loopback http stays permitted).
+    if let Some(refusal) = refuse_offhost_plaintext_parsed(class, url) {
+        return refusal;
+    }
+    if addrs.is_empty() {
+        return EgressDecision::Refuse {
+            class,
+            target: url.to_string(),
+            reason: format!(
+                "inference-plane egress refused: {ENV_INFERENCE_EGRESS}=internal-only \
                          and the target resolved to NO addresses — failing closed ({class})",
-                        class = class.as_str()
-                    ),
-                };
-            }
-            if addrs.iter().all(|sa| addr_is_internal(sa.ip())) {
-                EgressDecision::Allow
-            } else {
-                EgressDecision::Refuse {
-                    class,
-                    target: url.to_string(),
-                    reason: format!(
-                        "inference-plane egress refused: {ENV_INFERENCE_EGRESS}=internal-only \
+                class = class.as_str()
+            ),
+        };
+    }
+    if addrs.iter().all(|sa| addr_is_internal(sa.ip())) {
+        EgressDecision::Allow
+    } else {
+        EgressDecision::Refuse {
+            class,
+            target: url.to_string(),
+            reason: format!(
+                "inference-plane egress refused: {ENV_INFERENCE_EGRESS}=internal-only \
                          but the target resolves to a NON-internal address (public / DNS-rebind / \
                          cloud-metadata literal) — every resolved address must be loopback / \
                          RFC1918 / ULA / CGNAT ({class})",
-                        class = class.as_str()
-                    ),
-                }
-            }
+                class = class.as_str()
+            ),
         }
-        // The name-based postures ignore the resolved addresses.
-        _ => evaluate_inference_egress(mode, class, url),
     }
 }
 
@@ -479,43 +493,18 @@ pub struct PinnedTarget {
     pub host: String,
     /// The boot-resolved socket addresses to pin.
     pub addrs: Vec<SocketAddr>,
+    /// The exact parsed URL admitted by the gate and used for requests.
+    pub(crate) url: reqwest::Url,
 }
 
 /// #3822 (A2) — resolve the URL's authority to socket addresses. An IP literal
 /// resolves without DNS; a hostname uses the system resolver. Failure / empty
 /// set is an `Err` (fail CLOSED — `AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL` does
 /// NOT apply on this lane). Returns `(resolved_host, addrs)`.
-fn resolve_inference_authority(url: &str) -> Result<(String, Vec<SocketAddr>), String> {
-    let lower = url.to_ascii_lowercase();
-    let rest = lower.split_once("://").map_or(lower.as_str(), |(_, r)| r);
-    let host_port = crate::subscriptions::authority_without_userinfo(rest);
-    if host_port.is_empty() {
-        return Err("target URL has no authority to resolve".to_string());
-    }
-    // Bracket/port-stripped host (the reqwest resolve key), and a resolvable
-    // `host:port` (default 80 when the URL omits the port), mirroring the
-    // subscriptions SSRF lane's normalization.
-    let (resolved_host, resolv_target) =
-        if let Some(close) = host_port.strip_prefix('[').and(host_port.find(']')) {
-            let inner = host_port[1..close].to_string();
-            let after = &host_port[close + 1..];
-            let tgt = if after.starts_with(':') {
-                host_port.to_string()
-            } else {
-                crate::subscriptions::host_port_with_default_http_port(host_port)
-            };
-            (inner, tgt)
-        } else if let Some(idx) = host_port.rfind(':') {
-            (host_port[..idx].to_string(), host_port.to_string())
-        } else {
-            (
-                host_port.to_string(),
-                crate::subscriptions::host_port_with_default_http_port(host_port),
-            )
-        };
-    match resolv_target.to_socket_addrs() {
-        Ok(iter) => {
-            let addrs: Vec<SocketAddr> = iter.collect();
+fn resolve_inference_authority(url: &reqwest::Url) -> Result<(String, Vec<SocketAddr>), String> {
+    let resolved_host = crate::subscriptions::parsed_target_host(url).map_err(|e| e.to_string())?;
+    match url.socket_addrs(|| None) {
+        Ok(addrs) => {
             if addrs.is_empty() {
                 Err(format!(
                     "target host {resolved_host} resolved to no addresses (internal-only fails closed)"
@@ -547,17 +536,28 @@ pub fn admit_inference_target(
 ) -> std::result::Result<Option<PinnedTarget>, EgressDecision> {
     match mode {
         InferenceEgressMode::InternalOnly => {
-            if let Some(refusal) = refuse_offhost_plaintext_inference_egress(class, url) {
+            let parsed = crate::subscriptions::parse_http_target(url).map_err(|e| {
+                EgressDecision::Refuse {
+                    class,
+                    target: url.to_string(),
+                    reason: e.to_string(),
+                }
+            })?;
+            if let Some(refusal) = refuse_offhost_plaintext_parsed(class, &parsed) {
                 return Err(refusal);
             }
             let (host, addrs) =
-                resolve_inference_authority(url).map_err(|reason| EgressDecision::Refuse {
+                resolve_inference_authority(&parsed).map_err(|reason| EgressDecision::Refuse {
                     class,
                     target: url.to_string(),
                     reason,
                 })?;
-            match evaluate_inference_egress_resolved(mode, class, url, &addrs) {
-                EgressDecision::Allow => Ok(Some(PinnedTarget { host, addrs })),
+            match evaluate_internal_egress_resolved(class, &parsed, &addrs) {
+                EgressDecision::Allow => Ok(Some(PinnedTarget {
+                    host,
+                    addrs,
+                    url: parsed,
+                })),
                 refusal => Err(refusal),
             }
         }
@@ -641,6 +641,34 @@ pub fn refuse_inference_egress_audited(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn regression_4018_admitted_host_equals_request_host() {
+        for raw in [
+            "https://8.8.8.8\\@127.0.0.1/",
+            "https://8.8.8.8\\user:pass@127.0.0.1/",
+            "https://127.1/",
+            "https://0177.0.0.1/",
+            "https://0x7f000001/",
+            "https://2130706433/",
+            "https://%31%32%37.0.0.1/",
+            "https://local\thost/",
+            "https://[0:0:0:0:0:0:0:1]/",
+        ] {
+            let request = reqwest::Url::parse(raw).expect("valid HTTP client URL");
+            if let Ok(Some(pin)) = admit_inference_target(
+                InferenceEgressMode::InternalOnly,
+                EgressClass::InferenceLlm,
+                raw,
+            ) {
+                assert_eq!(
+                    pin.host,
+                    request.host_str().expect("host").trim_matches(['[', ']']),
+                    "admission and request disagree for {raw:?}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn class_tokens_are_stable_and_inference_flagged() {
@@ -876,7 +904,7 @@ mod tests {
         assert!(target_is_loopback("http://127.0.0.1:11434/api/embed"));
         assert!(target_is_loopback("http://[::1]:11434"));
         assert!(target_is_loopback("http://0.0.0.0:8080"));
-        assert!(target_is_loopback("localhost:11434")); // scheme-less
+        assert!(!target_is_loopback("localhost:11434")); // missing HTTP scheme fails closed
         // External vendors are NOT loopback.
         assert!(!target_is_loopback("https://api.openai.com/v1"));
         assert!(!target_is_loopback("https://openrouter.ai/api/v1"));

@@ -1550,6 +1550,12 @@ SHA-256 hash; dispatched events carry an
 subscription `id`. Equivalent MCP tool: `memory_subscribe`
 (`src/mcp/tools/subscribe.rs`).
 
+Webhook targets and internal-only inference targets use the HTTP client's URL parser
+for admission and DNS pinning (#4018). Backslashes, control characters, surrounding
+whitespace, and missing or repaired authorities are refused. Dispatch keeps the
+parsed authority through request construction; canonical numeric IP forms are
+checked as their normalized addresses. This applies to both storage backends.
+
 ### `DELETE /api/v1/subscriptions?id=<id>` — unregister webhook
 
 Returns `{"deleted": true}`. Equivalent MCP tool: `memory_unsubscribe`

@@ -1257,13 +1257,8 @@ impl Embedder {
                     "embed_lane_egresses admits a non-API embed lane only for Some(NomicEmbedV15) (#3933)"
                 )
             };
-            let client = crate::llm::OllamaClient::new_with_url_pinned(
-                &resolved.url,
-                NOMIC_OLLAMA_MODEL,
-                &pin.host,
-                &pin.addrs,
-            )
-            .context("failed to build pinned Ollama embed client (#3933)")?;
+            let client = crate::llm::OllamaClient::new_with_url_pinned(pin, NOMIC_OLLAMA_MODEL)
+                .context("failed to build pinned Ollama embed client (#3933)")?;
             return Self::for_model(tier_model, Some(Arc::new(client))).map(Some);
         }
         if tier_model.is_none() {
@@ -1284,15 +1279,10 @@ impl Embedder {
             );
         };
         let api_key = resolved.api_key().unwrap_or_default();
-        let client = crate::llm::OllamaClient::new_openai_compatible_pinned(
-            &resolved.url,
-            &resolved.model,
-            api_key,
-            &pin.host,
-            &pin.addrs,
-        )
-        .context("failed to build pinned OpenAI-compatible embed client (#3822)")?
-        .with_embed_dimensions(resolved.requested_dim);
+        let client =
+            crate::llm::OllamaClient::new_openai_compatible_pinned(pin, &resolved.model, api_key)
+                .context("failed to build pinned OpenAI-compatible embed client (#3822)")?
+                .with_embed_dimensions(resolved.requested_dim);
         Ok(Some(Self::new_remote(
             Arc::new(client),
             resolved.model.clone(),
