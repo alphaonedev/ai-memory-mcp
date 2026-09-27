@@ -7327,6 +7327,11 @@ pub async fn bootstrap_serve(
             let Some(emb) = backfill_embedder.as_ref() else {
                 return;
             };
+            // #3988 — an owned handle so each chunk's embed can run on the
+            // blocking pool. `Embedder` is all-`Arc` inside (model weights,
+            // tokenizer, remote client, the shared `degraded` flag), so this
+            // clone shares every piece of state with the daemon's embedder.
+            let emb: Arc<dyn crate::embeddings::Embed> = Arc::new(emb.clone());
             // Operator-level maintenance path: must see (and re-embed)
             // every row regardless of metadata.scope — same posture as
             // the federation catchup loop. Sentinel principal, not a

@@ -193,8 +193,12 @@ async fn a4_backfill_sweep_embeds_null_embedding_rows() {
     let bounded = store.list_unembedded(&ctx, 3).await.expect("bounded scan");
     assert_eq!(bounded.len(), 3, "LIMIT must bound the scan");
 
-    let emb = IntegrationMockEmbedder;
-    let written = run_embedding_backfill_on_store(store.as_ref(), &ctx, &emb, 3).await;
+    // #3988 — the sweep takes an owned handle so each chunk embeds on the
+    // blocking pool.
+    let emb: std::sync::Arc<dyn Embed> =
+        std::sync::Arc::new(IntegrationMockEmbedder);
+    let written =
+        run_embedding_backfill_on_store(store.as_ref(), &ctx, std::sync::Arc::clone(&emb), 3).await;
     assert_eq!(written, 7, "sweep must embed all 7 rows across 3 passes");
 
     let post = store
@@ -208,7 +212,7 @@ async fn a4_backfill_sweep_embeds_null_embedding_rows() {
     );
 
     // Idempotence: a second sweep is a true no-op.
-    let again = run_embedding_backfill_on_store(store.as_ref(), &ctx, &emb, 3).await;
+    let again = run_embedding_backfill_on_store(store.as_ref(), &ctx, emb, 3).await;
     assert_eq!(again, 0, "re-running the sweep on a drained store writes 0");
 
     // Belt-and-suspenders: the vectors are actually on the rows.

@@ -5726,7 +5726,7 @@ pub struct ReplayTranscriptEntry {
 pub async fn run_embedding_backfill_on_store(
     store: &dyn MemoryStore,
     ctx: &CallerContext,
-    emb: &dyn crate::embeddings::Embed,
+    emb: std::sync::Arc<dyn crate::embeddings::Embed>,
     batch_size: usize,
 ) -> usize {
     // Defensive: a zero chunk size would make the scan a no-op loop.
@@ -5755,12 +5755,36 @@ pub async fn run_embedding_backfill_on_store(
             .iter()
             .map(|(_, t, c)| crate::embeddings::embedding_document(t, c))
             .collect();
-        let text_refs: Vec<&str> = texts.iter().map(String::as_str).collect();
-        let embeddings = match emb.embed_batch(&text_refs) {
-            Ok(v) => v,
-            Err(e) => {
+        // #3988 (rust-1.98 CONCURRENCY-22) — `embed_batch` is a CPU-bound
+        // model forward pass (seconds per chunk in a debug build). Run it on
+        // the blocking pool, never inline on a runtime worker: inline, it
+        // held a worker for the whole chunk, and since tokio 1.52.2 reverted
+        // LIFO-slot stealing a task parked in that worker's LIFO slot (the
+        // postgres pool acquire behind `/health`) stayed stranded until the
+        // embed returned — a daemon booted over a backlog was alive and
+        // listening but never healthy.
+        let chunk_emb = std::sync::Arc::clone(&emb);
+        let embedded = tokio::task::spawn_blocking(move || {
+            let text_refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+            chunk_emb.embed_batch(&text_refs)
+        })
+        .await;
+        let embeddings = match embedded {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => {
                 tracing::warn!(
                     "embedding backfill: embed_batch failed for chunk of {} rows: {e} \
+                     (sweep stopped; remaining rows retry on next boot)",
+                    chunk.len()
+                );
+                break;
+            }
+            // A panicked or cancelled embed wrote nothing: stop the sweep
+            // (fail safe — the rows stay unembedded and keyword-recallable,
+            // and the next boot retries them).
+            Err(e) => {
+                tracing::warn!(
+                    "embedding backfill: embed task for chunk of {} rows did not complete: {e} \
                      (sweep stopped; remaining rows retry on next boot)",
                     chunk.len()
                 );
@@ -7050,7 +7074,7 @@ mod tests {
             ),
         }
         let emb = crate::embeddings::test_support::MockEmbedder::new_ollama();
-        let written = run_embedding_backfill_on_store(&s, &ctx, &emb, 8).await;
+        let written = run_embedding_backfill_on_store(&s, &ctx, std::sync::Arc::new(emb), 8).await;
         assert_eq!(
             written, 0,
             "an unsupported scan writes nothing (and logs the refusal)"
@@ -7102,7 +7126,7 @@ mod tests {
         let emb = crate::embeddings::test_support::MockEmbedder::new_ollama();
         let written = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            run_embedding_backfill_on_store(&s, &ctx, &emb, 0),
+            run_embedding_backfill_on_store(&s, &ctx, std::sync::Arc::new(emb), 0),
         )
         .await
         .expect("zero-progress sweep must terminate, not loop forever");
@@ -7139,11 +7163,86 @@ mod tests {
         let ctx = CallerContext::for_admin(crate::identity::sentinels::EMBEDDING_BACKFILL);
         let written = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            run_embedding_backfill_on_store(&s, &ctx, &MisalignedEmbedder, 8),
+            run_embedding_backfill_on_store(&s, &ctx, std::sync::Arc::new(MisalignedEmbedder), 8),
         )
         .await
         .expect("misaligned sweep must terminate, not loop forever");
         assert_eq!(written, 0, "misaligned chunk must be dropped, not written");
+    }
+
+    /// #3988 — the per-chunk `embed_batch` is CPU-bound (a candle forward
+    /// pass, seconds per chunk in a debug build) and MUST run off the async
+    /// runtime's worker threads (rust-1.98 CONCURRENCY-22). Pre-#3988 it ran
+    /// inline in the detached serve-boot task, occupying a worker for the
+    /// whole chunk; since tokio 1.52.2 reverted LIFO-slot stealing, a task
+    /// parked in that worker's LIFO slot (the postgres pool acquire behind
+    /// `/health`) stayed stranded for the entire embed, so a daemon booted
+    /// over a backlog of unembedded rows was alive, listening, and never
+    /// healthy (Promotion 4, `signed_events_fresh_store_signs_3354_pg`).
+    ///
+    /// Deterministic shape: ONE worker, an embedder that blocks for
+    /// `EMBED_BLOCK` and signals when it is inside the embed, then a
+    /// freshly spawned task measures how long it waited to be polled. With
+    /// the embed on the blocking pool the worker is free and the probe runs
+    /// at once; inline, it waits out the whole embed.
+    #[test]
+    fn backfill_sweep_embeds_off_the_runtime_worker_3988() {
+        const EMBED_BLOCK: std::time::Duration = std::time::Duration::from_secs(2);
+        /// Holds the calling thread for `EMBED_BLOCK` — a stand-in for a
+        /// CPU-bound model forward pass — after announcing it has started.
+        struct BlockingEmbedder {
+            entered: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>,
+        }
+        impl crate::embeddings::Embed for BlockingEmbedder {
+            fn embed(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+                Ok(vec![0.0_f32])
+            }
+            fn embed_batch(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+                if let Some(tx) = self
+                    .entered
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+                {
+                    let _ = tx.send(());
+                }
+                std::thread::sleep(EMBED_BLOCK);
+                Ok(texts.iter().map(|_| vec![0.0_f32]).collect())
+            }
+        }
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("one-worker runtime");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let emb = std::sync::Arc::new(BlockingEmbedder {
+            entered: std::sync::Mutex::new(Some(tx)),
+        });
+        // One pass: three candidate rows, zero written, so the
+        // zero-progress guard ends the sweep after a single embed.
+        let store = std::sync::Arc::new(StalledBackfillStore {
+            rows: 3,
+            written_per_chunk: 0,
+        });
+        let sweep = rt.spawn(async move {
+            let ctx = CallerContext::for_admin(crate::identity::sentinels::EMBEDDING_BACKFILL);
+            run_embedding_backfill_on_store(store.as_ref(), &ctx, emb, 8).await
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the sweep reached embed_batch");
+        let spawned_at = std::time::Instant::now();
+        let waited = rt
+            .block_on(async move { tokio::spawn(async move { spawned_at.elapsed() }).await })
+            .expect("probe task joined");
+        let written = rt.block_on(sweep).expect("sweep joined");
+        assert_eq!(written, 0, "zero-progress pass writes nothing");
+        assert!(
+            waited < EMBED_BLOCK / 4,
+            "#3988: a task spawned while the backfill embeds waited {waited:?} to run; the \
+             embed is occupying the runtime worker instead of the blocking pool"
+        );
     }
 
     // -----------------------------------------------------------------
