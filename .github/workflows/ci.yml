@@ -758,7 +758,10 @@ jobs:
             tier: enterprise-fed
             # #3525/#3976: compile (~6 min) + the 8100 s full-suite watchdog +
             # the ephemeral-db setup/teardown must fit inside this outer bound.
-            timeout: 145
+            # 160 (f2r): measured non-test overhead ~970 s, so 145 min let the
+            # job cap pre-empt a near-budget watchdog (8700 - 970 < 8100); the
+            # watchdog must be what fires, NAMED.
+            timeout: 160
           - leg: macos-fed,sqlite
             runner: '["self-hosted","macos-fed"]'
             node: macos-fed
@@ -770,7 +773,10 @@ jobs:
             tier: enterprise-fed
             # #3525/#3976: compile (~6 min) + the 8100 s full-suite watchdog +
             # the ephemeral-db setup/teardown must fit inside this outer bound.
-            timeout: 145
+            # 160 (f2r): measured non-test overhead ~970 s, so 145 min let the
+            # job cap pre-empt a near-budget watchdog (8700 - 970 < 8100); the
+            # watchdog must be what fires, NAMED.
+            timeout: 160
     steps:
       # 2026-08-26 rigid-security-controls: a fork PR must NEVER have its code
       # checked out on a self-hosted node (f2 = the operator's home gateway,
