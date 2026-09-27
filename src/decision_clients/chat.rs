@@ -491,15 +491,118 @@ fn read_structured_answer(
     })
 }
 
+/// #3806 P1 (f2r escape bypass) — the byte offset, inside the reassembled
+/// answer `text`, of `label` as the string value of the TOP-LEVEL (depth 1)
+/// key `field`, or `None`.
+///
+/// A minimal JSON scanner, deliberately strict: it tracks object/array depth
+/// and string boundaries (so a key inside a nested object never anchors),
+/// and it FAILS CLOSED on any backslash escape inside the anchored key or
+/// value (`"y\u0065s"` decodes to `yes` for the payload, but its bytes are
+/// not the label's, so its token confidence cannot be attributed). Exactly
+/// one depth-1 `field` key must exist; a duplicate is ambiguous.
+fn top_level_string_value_offset(text: &str, field: &str, label: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut depth = 0usize;
+    let mut i = 0usize;
+    let mut found: Option<usize> = None;
+    // Whether the next string at depth 1 is in KEY position.
+    let mut expect_key = false;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'{' => {
+                depth += 1;
+                expect_key = depth == 1;
+                i += 1;
+            }
+            b'[' => {
+                depth += 1;
+                expect_key = false;
+                i += 1;
+            }
+            b'}' | b']' => {
+                depth = depth.checked_sub(1)?;
+                i += 1;
+            }
+            b',' => {
+                expect_key = depth == 1;
+                i += 1;
+            }
+            b'"' => {
+                // Scan the string; note whether it contains an escape.
+                let open = i;
+                i += 1;
+                let mut escaped = false;
+                while i < bytes.len() && bytes[i] != b'"' {
+                    if bytes[i] == b'\\' {
+                        escaped = true;
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                if i >= bytes.len() {
+                    return None; // unterminated string
+                }
+                let raw = &text[open + 1..i];
+                i += 1; // closing quote
+                if depth == 1 && expect_key {
+                    expect_key = false;
+                    if escaped {
+                        // An escaped top-level KEY could decode to `field`
+                        // (`"verd\u0069ct"`): never guess — fail closed.
+                        return None;
+                    }
+                    if raw != field {
+                        continue;
+                    }
+                    // The key is `field`: skip whitespace and `:`.
+                    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                        i += 1;
+                    }
+                    if bytes.get(i) != Some(&b':') {
+                        return None;
+                    }
+                    i += 1;
+                    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                        i += 1;
+                    }
+                    if bytes.get(i) != Some(&b'"') {
+                        return None; // the verdict is not a string
+                    }
+                    let value_open = i + 1;
+                    let mut j = value_open;
+                    while j < bytes.len() && bytes[j] != b'"' {
+                        if bytes[j] == b'\\' {
+                            return None; // escaped value: fail closed
+                        }
+                        j += 1;
+                    }
+                    if j >= bytes.len() || &text[value_open..j] != label {
+                        return None;
+                    }
+                    if found.is_some() {
+                        return None; // duplicate depth-1 key: ambiguous
+                    }
+                    found = Some(value_open);
+                    i = j + 1;
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    found
+}
+
 /// The probability the endpoint assigned to `label` AS THE VALUE OF
 /// `field`, or `None` when it cannot be attributed.
 ///
 /// `content` is the OpenAI `choices[0].logprobs.content` array of
 /// `{token, logprob}` entries; their concatenation is the answer document.
 /// The rule, stated once here and pinned in the tests:
-/// 1. ANCHOR — in the concatenated text, find the value of `field`: the
-///    `"<field>"` key, optional whitespace, `:`, optional whitespace, then
-///    the quoted `label`. Exactly ONE such occurrence must exist.
+/// 1. ANCHOR — in the concatenated text, find the value of the TOP-LEVEL
+///    key `field` with a depth-aware scanner
+///    ([`top_level_string_value_offset`]); it must be exactly `label`, with
+///    no escape in key or value, and the key must occur exactly once.
 /// 2. ALIGN — the label's byte span must start and end on token
 ///    boundaries; the probability is `exp(Σ logprob)` over exactly the
 ///    tokens covering it.
@@ -530,30 +633,11 @@ fn label_probability(content: &[Value], field: &str, label: &str) -> Option<f64>
         text.push_str(token);
     }
 
-    let key = format!("\"{field}\"");
-    let mut anchored: Vec<usize> = Vec::new();
-    let mut from = 0;
-    while let Some(pos) = text[from..].find(&key) {
-        let key_at = from + pos;
-        from = key_at + key.len();
-        let rest = &text[from..];
-        let after_ws = rest.trim_start();
-        let Some(after_colon) = after_ws.strip_prefix(':') else {
-            continue;
-        };
-        let value = after_colon.trim_start();
-        if let Some(tail) = value.strip_prefix('"')
-            && tail.strip_prefix(label).is_some_and(|t| t.starts_with('"'))
-        {
-            // byte offset of the label inside `text`
-            anchored.push(text.len() - tail.len());
-        }
-    }
-    if anchored.len() != 1 {
+    let Some(start) = top_level_string_value_offset(&text, field, label) else {
         return None;
-    }
-    let (start, end) = (anchored[0], anchored[0] + label.len());
+    };
 
+    let end = start + label.len();
     let mut total = 0.0_f64;
     let (mut starts_aligned, mut ends_aligned) = (false, false);
     for (idx, (token_start, logprob)) in spans.iter().enumerate() {
@@ -699,19 +783,51 @@ mod tests {
         );
     }
 
-    /// f2r's optional cell — a NESTED `verdict` key elsewhere in the
-    /// document makes the anchor ambiguous, so no confidence is attributed
-    /// (fail closed), even though the top-level verdict is aligned.
+    /// f2r escape bypass (891cfafee CHANGES REQUIRED) — the payload is
+    /// serde-DECODED, so `"y\u0065s"` reads as `yes`; its bytes are not the
+    /// label's, and a nested `verdict` key must never lend its 0.99. Every
+    /// escaped key or value at the anchor fails closed.
     #[test]
-    fn a_nested_verdict_key_makes_the_anchor_ambiguous_3806_p1() {
-        let nested = [
+    fn an_escaped_verdict_value_or_key_fails_closed_3806_p1_escape() {
+        let escaped_value = [
+            token("{\"note\":{\"verdict\":\"", -0.01),
+            token("yes", 0.99_f64.ln()),
+            token("\"},\"verdict\":\"", -0.01),
+            token("y\\u0065s", 0.01_f64.ln()),
+            token("\"}", -0.01),
+        ];
+        assert_eq!(
+            label_probability(&escaped_value, "verdict", "yes"),
+            None,
+            "an escaped verdict VALUE must not borrow the nested key's confidence"
+        );
+        let escaped_key = [
+            token("{\"note\":{\"verdict\":\"", -0.01),
+            token("yes", 0.99_f64.ln()),
+            token("\"},\"verd\\u0069ct\":\"", -0.01),
+            token("yes", 0.01_f64.ln()),
+            token("\"}", -0.01),
+        ];
+        assert_eq!(
+            label_probability(&escaped_key, "verdict", "yes"),
+            None,
+            "an escaped verdict KEY must not borrow the nested key's confidence"
+        );
+        // CONTROL — a top-level verdict with a nested `verdict` elsewhere is
+        // anchored at DEPTH 1 only: the top-level value's own 0.01.
+        let nested_then_plain = [
             token("{\"note\":{\"verdict\":\"", -0.01),
             token("yes", 0.99_f64.ln()),
             token("\"},\"verdict\":\"", -0.01),
             token("yes", 0.01_f64.ln()),
             token("\"}", -0.01),
         ];
-        assert_eq!(label_probability(&nested, "verdict", "yes"), None);
+        let p = label_probability(&nested_then_plain, "verdict", "yes")
+            .expect("the depth-1 verdict anchors");
+        assert!(
+            (p - 0.01).abs() < 1e-9,
+            "depth-1 value's probability, got {p}"
+        );
     }
 
     #[test]

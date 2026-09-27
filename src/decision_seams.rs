@@ -330,12 +330,15 @@ impl SeamBreaker {
         let mut state = self.lock();
         if release_probe {
             state.probing = false;
-        } else if state.probing {
+        } else if state.probing || state.opened_at.is_some() {
             // #3806 Codex P2 — while a probe owns the half-open slot, a STALE
             // Proceed result (admitted while closed, finishing now) decides
             // nothing: a stale SUCCESS used to reset the failure counter and
             // close the breaker under the probe, defeating half-open. The
             // probe's own result is the only one that may move the state.
+            // f2r (891cfafee addendum): the same holds while the breaker is
+            // OPEN and still cooling down, BEFORE any probe — a stale success
+            // must not close it early without a probe having run.
             return;
         }
         match reason {
@@ -1528,13 +1531,31 @@ mod tests {
             matches!(breaker.admit(probe), Admission::ShortCircuit),
             "a failed probe re-opens it"
         );
+        // Only a PROBE's result may close an open breaker (f2r, 891cfafee
+        // addendum): a non-probe result while open is stale and ignored.
         breaker.observe(Some(AbstainReason::Unusable), probe);
-        assert!(closed(&breaker, probe), "a decline is an answer: closed");
-        for _ in 0..BREAKER_THRESHOLD {
-            breaker.observe(Some(AbstainReason::Unavailable), probe);
+        assert!(
+            matches!(breaker.admit(probe), Admission::ShortCircuit),
+            "a stale (non-probe) decline while open does not close it"
+        );
+        let probe2 = probe + BREAKER_COOLDOWN;
+        match breaker.admit(probe2) {
+            Admission::Probe(mut t) => t.complete(Some(AbstainReason::Unusable), probe2),
+            _ => panic!("after the cooldown one probe is allowed"),
         }
-        breaker.observe(None, probe);
-        assert!(closed(&breaker, probe), "a decision closes it");
+        assert!(
+            closed(&breaker, probe2),
+            "a probe that is DECLINED is an answer: closed"
+        );
+        for _ in 0..BREAKER_THRESHOLD {
+            breaker.observe(Some(AbstainReason::Unavailable), probe2);
+        }
+        let probe3 = probe2 + BREAKER_COOLDOWN;
+        match breaker.admit(probe3) {
+            Admission::Probe(mut t) => t.complete(None, probe3),
+            _ => panic!("after the cooldown one probe is allowed"),
+        }
+        assert!(closed(&breaker, probe3), "a probe that DECIDES closes it");
     }
 
     /// #3806 W4 — f1's acceptance cells for the merge seam, on the exact
@@ -1919,6 +1940,32 @@ mod review_sync_probe_cells {
     /// probe is admitted while the first ticket is still held. Reachable
     /// only when `[decision].timeout_secs` (unbounded above) exceeds
     /// `BREAKER_COOLDOWN` (30 s): the stale call must outlive a cooldown.
+    /// f2r (891cfafee addendum) — a stale SUCCESSFUL Proceed that finishes
+    /// while the breaker is open and COOLING DOWN (no probe yet) must not
+    /// close it: the next caller inside the cooldown still short-circuits.
+    #[test]
+    fn a_stale_success_during_the_cooldown_does_not_close_the_breaker() {
+        let breaker = SeamBreaker::default();
+        let t0 = Instant::now();
+        let stale = breaker.admit(t0);
+        assert!(
+            matches!(stale, Admission::Proceed),
+            "closed: the slow call P proceeds"
+        );
+        for _ in 0..BREAKER_THRESHOLD {
+            breaker.observe(Some(AbstainReason::Unavailable), t0);
+        }
+        // P succeeds while the breaker is open, BEFORE the cooldown elapses.
+        breaker.observe(None, t0 + Duration::from_secs(1));
+        assert!(
+            matches!(
+                breaker.admit(t0 + Duration::from_secs(2)),
+                Admission::ShortCircuit
+            ),
+            "a stale success inside the cooldown must not close the breaker without a probe"
+        );
+    }
+
     /// #3806 Codex P2 — a stale SUCCESSFUL Proceed finishing while a probe
     /// holds the half-open slot must not close the breaker under it.
     #[test]
