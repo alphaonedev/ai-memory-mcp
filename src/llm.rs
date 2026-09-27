@@ -1082,7 +1082,6 @@ pub struct OllamaClient {
     /// future rename to `LlmClient` is non-breaking.
     provider: LlmProvider,
     base_url: reqwest::Url,
-    egress_pin: Option<crate::egress::PinnedTarget>,
     model: String,
     /// PERF-9 (v0.7.0 FX-C1, 2026-05-26) — async `reqwest::Client`.
     /// Pre-PERF-9 this was `reqwest::blocking::Client`, which pinned
@@ -1143,7 +1142,6 @@ impl OllamaClient {
         Self {
             provider: self.provider.clone(),
             base_url: self.base_url.clone(),
-            egress_pin: self.egress_pin.clone(),
             model: model.into(),
             client: self.client.clone(),
             breaker: Mutex::new(BreakerState::new()),
@@ -1180,7 +1178,6 @@ impl OllamaClient {
             provider: LlmProvider::Ollama,
             base_url: crate::subscriptions::parse_http_target(DEFAULT_OLLAMA_URL)
                 .expect("valid default URL"),
-            egress_pin: None,
             model: model.to_string(),
             client: reqwest::Client::builder()
                 .timeout(GENERATE_TIMEOUT)
@@ -1508,7 +1505,6 @@ impl OllamaClient {
                 api_key: api_key.to_string(),
             },
             base_url: crate::subscriptions::parse_http_target(base_url)?,
-            egress_pin: None,
             model: model.to_string(),
             client,
             breaker: Mutex::new(BreakerState::new()),
@@ -1596,7 +1592,6 @@ impl OllamaClient {
         Ok(Self {
             provider: LlmProvider::Ollama,
             base_url: crate::subscriptions::parse_http_target(base_url)?,
-            egress_pin: None,
             model: model.to_string(),
             client,
             breaker: Mutex::new(BreakerState::new()),
@@ -1651,7 +1646,6 @@ impl OllamaClient {
                 api_key: api_key.to_string(),
             },
             base_url: pin.url.clone(),
-            egress_pin: Some(pin.clone()),
             model: model.to_string(),
             client,
             breaker: Mutex::new(BreakerState::new()),
@@ -1679,7 +1673,6 @@ impl OllamaClient {
         Ok(Self {
             provider: LlmProvider::Ollama,
             base_url: pin.url.clone(),
-            egress_pin: Some(pin.clone()),
             model: model.to_string(),
             client,
             breaker: Mutex::new(BreakerState::new()),
@@ -1887,8 +1880,7 @@ impl OllamaClient {
     /// # Errors
     ///
     /// Returns an error if the `/api/tags` listing fails, the response
-    /// JSON cannot be parsed, the pull-client cannot be built, or the
-    /// pull request fails.
+    /// JSON cannot be parsed, or the pull request fails.
     pub async fn ensure_model_async(&self) -> Result<()> {
         if matches!(self.provider, LlmProvider::OpenAiCompatible { .. }) {
             return Ok(());
@@ -1931,14 +1923,13 @@ impl OllamaClient {
         );
 
         let pull_url = self.endpoint_url("/api/pull");
-        let mut builder = reqwest::Client::builder().timeout(PULL_TIMEOUT);
-        if let Some(pin) = &self.egress_pin {
-            builder = Self::apply_internal_egress_pin(builder, &pin.host, &pin.addrs);
-        }
-        let pull_client = builder.build().context("Failed to build pull client")?;
+        // #4048: retain the admitted DNS pin, redirect and proxy policy for pulls.
+        // A per-request timeout overrides GENERATE_TIMEOUT without a new client.
 
-        let resp = pull_client
+        let resp = self
+            .client
             .post(pull_url)
+            .timeout(PULL_TIMEOUT)
             .json(&json!({ "name": self.model }))
             .send()
             .await
@@ -3061,13 +3052,12 @@ impl OllamaClient {
 
         tracing::info!("Pulling Ollama embedding model '{}'...", model);
         let pull_url = self.endpoint_url("/api/pull");
-        let mut builder = reqwest::Client::builder().timeout(PULL_TIMEOUT);
-        if let Some(pin) = &self.egress_pin {
-            builder = Self::apply_internal_egress_pin(builder, &pin.host, &pin.addrs);
-        }
-        let pull_client = builder.build().context("Failed to build pull client")?;
-        let resp = pull_client
+        // #4048: retain the admitted DNS pin, redirect and proxy policy for pulls.
+        // A per-request timeout overrides GENERATE_TIMEOUT without a new client.
+        let resp = self
+            .client
             .post(pull_url)
+            .timeout(PULL_TIMEOUT)
             .json(&json!({ "name": model }))
             .send()
             .await

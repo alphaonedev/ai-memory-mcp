@@ -126,3 +126,21 @@ fn non_pinned_constructors_do_not_carry_the_pin_3822() {
         );
     }
 }
+
+#[test]
+fn model_pulls_reuse_the_admitted_client_and_override_only_timeout_4048() {
+    let src = llm_src();
+    for pull in ["fn ensure_model_async(", "fn ensure_embed_model_async("] {
+        let body = fn_body(&src, pull);
+        assert!(
+            !body.contains("Client::builder()"),
+            "{pull} must not rebuild a client that can discard egress policy"
+        );
+        assert!(
+            body.contains(
+                ".client\n            .post(pull_url)\n            .timeout(PULL_TIMEOUT)"
+            ),
+            "{pull} must retain the client policy and the longer pull timeout"
+        );
+    }
+}
