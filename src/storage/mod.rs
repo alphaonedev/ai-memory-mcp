@@ -5313,7 +5313,17 @@ pub fn reverse_conserve_contradiction(
 /// Returns an error if the INSERT-SELECT or DELETE fails.
 pub fn archive_memory(conn: &Connection, id: &str, reason: Option<&str>) -> Result<bool> {
     crate::storage::record_stop::gate_storage_conn(conn)?;
-    let write_txn = connection::WriteTxn::begin(conn)?;
+    // #3957 — transaction-aware, the `update_with_expected_version` /
+    // `delete` precedent: the SAL delete funnel now runs its ownership gate
+    // and this archive-then-delete in ONE caller-owned `BEGIN IMMEDIATE`, so
+    // open our own tx only when none is active and otherwise join the caller's.
+    let Some(write_txn) = conn
+        .is_autocommit()
+        .then(|| connection::WriteTxn::begin(conn))
+        .transpose()?
+    else {
+        return archive_memory_no_tx(conn, id, reason);
+    };
     let result = archive_memory_no_tx(conn, id, reason);
     match result {
         Ok(moved) => {

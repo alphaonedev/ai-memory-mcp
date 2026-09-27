@@ -47,7 +47,14 @@ pub fn set_lifecycle_state(
     use crate::models::LifecycleState;
     use rusqlite::OptionalExtension;
     super::record_stop::gate_storage_conn(conn)?;
-    let txn = super::connection::WriteTxn::begin(conn)?;
+    // #3957 — transaction-aware (the `update_with_expected_version` precedent):
+    // the SAL `update` funnel runs its ownership gate, the content write and
+    // this transition in ONE caller-owned `BEGIN IMMEDIATE`, so join the
+    // caller's transaction when one is open instead of failing on a nested BEGIN.
+    let txn = conn
+        .is_autocommit()
+        .then(|| super::connection::WriteTxn::begin(conn))
+        .transpose()?;
     let outcome = (|| -> Result<bool> {
         // #1726 — read the current state (under the write lock) and validate.
         let current: Option<String> = conn
@@ -91,14 +98,16 @@ pub fn set_lifecycle_state(
         }
         Ok(true)
     })();
-    match outcome {
-        Ok(v) => {
+    match (outcome, txn) {
+        (Ok(v), Some(txn)) => {
             txn.commit()?;
             Ok(v)
         }
-        Err(e) => {
+        (Err(e), Some(txn)) => {
             txn.rollback();
             Err(e)
         }
+        // Joined a caller-owned transaction: its commit/rollback governs.
+        (outcome, None) => outcome,
     }
 }
