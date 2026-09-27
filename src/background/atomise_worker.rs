@@ -159,6 +159,7 @@ impl AtomiseQueue {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(tx) = sender.as_ref() else {
+            drop(sender);
             crate::metrics::inc_atomise_dropped();
             return false;
         };
