@@ -234,7 +234,13 @@ fn handle_update_inner(
     // underlying storage::update_with_expected_version refuses the
     // mutation with a typed VersionConflict envelope if the stored
     // row's `version` no longer matches.
-    let mut expected_version = params["expected_version"].as_i64();
+    // #4061 — a PRESENT, non-null value that is not a JSON integer (a string
+    // `"1"`, a boolean, a fraction, an out-of-i64 integer) is REFUSED here,
+    // before any write. `as_i64()` used to read it as `None`, which storage
+    // treats as "no precondition": the caller's compare-and-swap fence
+    // vanished and a stale write silently overwrote newer content. Omitted /
+    // null still means the documented last-write-wins.
+    let mut expected_version = crate::mcp::param_guard::optional_i64(params, "expected_version")?;
     // #1974 — opt-in content patch primitive. Assemble the FULL replacement
     // content from the CURRENT stored content plus a single append XOR
     // unique-match replace op, then thread the result through the SAME

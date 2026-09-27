@@ -277,6 +277,30 @@ fn parse_pg_conflict_stored_version(detail: &str) -> Option<i64> {
         .ok()
 }
 
+/// #4061 — parse the `If-Match` optimistic-concurrency header.
+///
+/// `Ok(None)`: header absent, or the RFC 9110 wildcard `*` (no version
+/// precondition — last-write-wins). `Ok(Some(v))`: a bare or quoted integer
+/// version (`42` / `"42"`). `Err`: a PRESENT header that names no version —
+/// refused (fail closed) rather than read as "no precondition", which would
+/// silently drop the caller's compare-and-swap fence.
+fn parse_if_match_version(headers: &HeaderMap) -> Result<Option<i64>, String> {
+    let Some(raw) = headers.get("if-match") else {
+        return Ok(None);
+    };
+    let text = raw
+        .to_str()
+        .map_err(|_| "If-Match must be an integer memory version".to_string())?
+        .trim();
+    if text == "*" {
+        return Ok(None);
+    }
+    text.trim_matches('"')
+        .parse::<i64>()
+        .map(Some)
+        .map_err(|_| format!("If-Match must be an integer memory version, got {text:?}"))
+}
+
 #[allow(clippy::too_many_lines)]
 pub async fn update_memory(
     State(app): State<AppState>,
@@ -331,17 +355,21 @@ async fn update_memory_write(
     // a parseable integer, the storage::update_with_expected_version
     // path refuses the mutation with a 409 CONFLICT envelope carrying
     // both expected + current versions when the stored row has
-    // drifted. When the header is absent or unparseable, the legacy
-    // last-write-wins behaviour is preserved.
-    let if_match_version: Option<i64> = headers
-        .get("if-match")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| {
-            // Allow both bare integers and quoted ETag-style values
-            // ("42" or 42).
-            let trimmed = s.trim().trim_matches('"');
-            trimmed.parse::<i64>().ok()
-        });
+    // drifted. When the header is absent (or the RFC 9110 wildcard `*`,
+    // "any current representation"), the legacy last-write-wins
+    // behaviour is preserved.
+    //
+    // #4061 (sibling of the MCP `expected_version` defect) — a PRESENT
+    // header that is not a version (`If-Match: not-an-integer`, a weak
+    // `W/"3"` tag, a non-ASCII value) used to be read as "no precondition",
+    // silently dropping the caller's compare-and-swap fence so a stale write
+    // overwrote newer content. It is now REFUSED with 400 before any write.
+    let if_match_version: Option<i64> = match parse_if_match_version(&headers) {
+        Ok(v) => v,
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response();
+        }
+    };
 
     // v0.7.0 Wave-3 — Postgres-backed daemons take the SAL trait
     // dispatch path. The trait's `update` accepts an `UpdatePatch`

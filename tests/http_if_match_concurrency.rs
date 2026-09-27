@@ -231,24 +231,49 @@ async fn http_put_with_quoted_if_match_etag_style_value_parses() {
     );
 }
 
+/// #4061 — a PRESENT `If-Match` that names no version used to be read as
+/// "no precondition": the compare-and-swap fence vanished and the stale
+/// write landed. It is now refused with 400 and the row is left untouched
+/// (fail closed; data integrity over convenience). The RFC 9110 wildcard
+/// `*` ("any current representation") still means last-write-wins.
 #[tokio::test]
-async fn http_put_with_unparseable_if_match_falls_through_to_legacy() {
-    // If the header is present but the value is not a valid integer,
-    // the gate is silently skipped (treated as None) and the update
-    // succeeds. The contract is "opt-in, integer-only" — a malformed
-    // header should not fail-closed and brick the caller.
+async fn http_put_with_unparseable_if_match_is_refused_4061() {
     let (router, file) = build_test_router();
     let id = seed(file.path(), "bogus-header");
-    let (status, _) = put_with_if_match(
-        &router,
-        &id,
-        Some("not-an-integer"),
-        json!({"content": "fallback"}),
-    )
-    .await;
+    for bogus in ["not-an-integer", "W/\"1\"", "1.5", "99999999999999999999"] {
+        let (status, body) = put_with_if_match(
+            &router,
+            &id,
+            Some(bogus),
+            json!({"content": "stale overwrite"}),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "If-Match {bogus:?} must be refused, not silently dropped: {body}"
+        );
+    }
+    let conn = ai_memory::db::open(file.path()).expect("reopen");
+    let row = ai_memory::db::get(&conn, &id)
+        .expect("get")
+        .expect("row still present");
+    assert_eq!(row.content, "v1 body", "a refused If-Match must not write");
+    assert_eq!(
+        row.version, 1,
+        "a refused If-Match must not bump the version"
+    );
+}
+
+#[tokio::test]
+async fn http_put_with_wildcard_if_match_is_last_write_wins_4061() {
+    let (router, file) = build_test_router();
+    let id = seed(file.path(), "wildcard-header");
+    let (status, body) =
+        put_with_if_match(&router, &id, Some("*"), json!({"content": "any"})).await;
     assert_eq!(
         status,
         StatusCode::OK,
-        "unparseable If-Match value falls through to legacy path"
+        "If-Match: * is no precondition: {body}"
     );
 }
