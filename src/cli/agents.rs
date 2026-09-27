@@ -132,9 +132,10 @@ pub enum AgentsAction {
     /// HTTP api-key so an `X-Agent-Id: <agent>` on the HTTP surface must prove
     /// possession of THIS token (the server stores only `sha256(token)`; the
     /// raw token is never persisted). v1.0.0 #3418 — the daemon re-reads the
-    /// enrolled set on a bounded cadence, so this takes effect within that
-    /// refresh window with NO restart (`AI_MEMORY_AGENT_KEY_REFRESH_SECS`,
-    /// default 15s; `0` restores the pre-#3418 restart-required behaviour).
+    /// enrolled set every `AI_MEMORY_AGENT_KEY_REFRESH_SECS` (default 15s; `0`
+    /// restores the pre-#3418 restart-required behaviour), so this takes effect
+    /// at its next SUCCESSFUL refresh with NO restart (#4001: a failed refresh
+    /// keeps the previous key map).
     ///
     /// v1.0.0 #3535 — re-binding the same token to the SAME agent is an
     /// idempotent no-op; re-binding it to a DIFFERENT agent is REFUSED and
@@ -180,9 +181,10 @@ pub enum AgentsAction {
     /// v1.0.0 #2095 — revoke (invalidate) EVERY enrolled per-agent HTTP api-key
     /// bound to `agent_id`. The PK is the token digest, so a leaked key can only
     /// be invalidated by revoking the agent's binding(s). v1.0.0 #3418 — the
-    /// revocation stops the key authenticating within the daemon's refresh
-    /// window with NO restart; that window is the upper bound on how long a
-    /// leaked key stays live, so keep it short on a fleet.
+    /// revocation stops the key authenticating at the daemon's next SUCCESSFUL
+    /// refresh, with NO restart. The refresh interval is NOT an upper bound on
+    /// how long a leaked key stays live (#4001): a failed refresh keeps the
+    /// previous key map, so watch the daemon's refresh-failure WARN.
     RevokeApiKey {
         /// Agent identifier whose api-key binding(s) to remove.
         #[arg(long)]
@@ -674,7 +676,7 @@ pub fn run_agents(
                 writeln!(
                     out.stdout,
                     "bound api-key for {agent_id} (sha256={token_sha256}); \
-                     live within the daemon's refresh window (#3418)"
+                     takes effect at the daemon's next successful refresh (#3418)"
                 )?;
             }
         }
@@ -699,7 +701,7 @@ pub fn run_agents(
                 writeln!(
                     out.stdout,
                     "revoked {removed} api-key binding(s) for {agent_id}; \
-                     live within the daemon's refresh window (#3418)"
+                     takes effect at the daemon's next successful refresh (#3418)"
                 )?;
             }
         }
@@ -1125,7 +1127,7 @@ pub async fn run_bind_api_key(
     } else {
         println!(
             "bound api-key for {agent_id} (sha256={token_sha256}); \
-             live within the daemon's refresh window (#3418)"
+             takes effect at the daemon's next successful refresh (#3418)"
         );
     }
     Ok(())
@@ -1159,7 +1161,7 @@ pub async fn run_revoke_api_key(
     } else {
         println!(
             "revoked {removed} api-key binding(s) for {agent_id}; \
-             live within the daemon's refresh window (#3418)"
+             takes effect at the daemon's next successful refresh (#3418)"
         );
     }
     Ok(())

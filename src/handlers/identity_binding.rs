@@ -218,7 +218,10 @@ impl EnrolledAgentKeys {
 /// Env var resolving how often the daemon re-reads `agent_api_keys`.
 ///
 /// Named here rather than in `config.rs` because the VALUE is identity-binding
-/// policy: it is the upper bound on how long a REVOKED key keeps working.
+/// policy: it is the cadence at which a revocation is picked up. It does NOT
+/// bound how long a REVOKED key keeps working (#4001): a revocation
+/// lands at the next SUCCESSFUL refresh, and a failed refresh keeps the
+/// previous key map with no staleness deadline ([`apply_agent_key_refresh`]).
 pub const ENV_AGENT_KEY_REFRESH_SECS: &str = "AI_MEMORY_AGENT_KEY_REFRESH_SECS";
 
 /// Compiled default refresh cadence, in seconds.
@@ -274,10 +277,15 @@ pub fn resolve_agent_key_refresh_interval() -> Option<std::time::Duration> {
 #[must_use]
 pub fn refresh_posture_note(interval: Option<std::time::Duration>) -> String {
     match interval {
+        // #4001 — the interval is a CADENCE, not a bound: a failed refresh keeps
+        // the previous key map (see `apply_agent_key_refresh`) and nothing
+        // expires it, so the boot line must not promise a revocation deadline.
         Some(d) => format!(
-            "per-agent api-key registry refreshes every {}s (#3418): enrollment and \
-             REVOCATION take effect within that window with no daemon restart",
-            d.as_secs()
+            "per-agent api-key registry refreshes every {secs}s (#3418): enrollment and \
+             REVOCATION take effect at the next SUCCESSFUL refresh with no daemon restart; \
+             a failed refresh keeps the previous key map (no staleness deadline), so {secs}s \
+             is the refresh cadence, not an upper bound on a revoked key's lifetime (#4001)",
+            secs = d.as_secs()
         ),
         None => format!(
             "per-agent api-key live refresh is DISABLED ({ENV_AGENT_KEY_REFRESH_SECS}=0): \
@@ -316,9 +324,11 @@ pub enum AgentKeyRefresh {
 /// a transient store error would silently disarm the identity gate — an empty
 /// registry makes [`enforce_for_request`] inert in EVERY mode (the #1985
 /// unsatisfiable-default rule), so a blip on the data tier would quietly
-/// downgrade an `enforce` deployment to self-asserted identity. Staleness is a
-/// bounded, observable degrade; disarming is a silent one. Degrade, never
-/// corrupt.
+/// downgrade an `enforce` deployment to self-asserted identity. Staleness is an
+/// observable degrade (the WARN below, on every failed pass); disarming is a
+/// silent one. Degrade, never corrupt. Staleness is NOT time-bounded (#4001):
+/// there is no maximum-staleness deadline, so while reads keep failing a key
+/// revoked in the store keeps authenticating from the retained map.
 pub fn apply_agent_key_refresh<E: std::fmt::Display>(
     registry: &EnrolledAgentKeys,
     loaded: Result<Vec<(String, String)>, E>,

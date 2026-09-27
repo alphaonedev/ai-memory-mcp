@@ -6,8 +6,8 @@
 //! # Why this exists
 //!
 //! [#3418] made the enrolled `sha256(token) -> agent_id` registry LIVE (a
-//! revoked key stops authenticating within the refresh window instead of at
-//! the next restart) and gave the CLI a `--store-url` so a postgres data tier
+//! revoked key stops authenticating at the next successful refresh instead of
+//! at the next restart) and gave the CLI a `--store-url` so a postgres data tier
 //! is addressable. What it deliberately did NOT ship was the network surface:
 //! a route that MINTS a bearer credential is its own security design — who may
 //! call it, how the raw token is transported and never logged, how it is

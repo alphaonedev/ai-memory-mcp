@@ -107,10 +107,12 @@ finding H1 (High, OWASP A01/A07).** Closing it is two steps:
 enrolled key map is a LIVE registry, not a boot snapshot: a running `serve`
 re-reads it from the configured backend (sqlite or postgres) every
 `AI_MEMORY_AGENT_KEY_REFRESH_SECS` seconds (default 15; `0` restores the
-previous restart-required behaviour and says so at boot), so enrollment — and,
-materially for this section, **REVOCATION** — takes effect within that window
-with no restart. That window is therefore the upper bound on how long a leaked
-per-agent key stays live, and `ai-memory doctor` reports it. Enrolling against
+previous restart-required behaviour and says so at boot). Enrollment — and,
+materially for this section, **REVOCATION** — takes effect after a successful
+refresh, with no restart. Failed or delayed refreshes retain the previous key
+map (there is no maximum-staleness deadline), so the interval is **not** an
+upper bound on a revoked key's lifetime; each failed refresh logs a WARN, and
+`ai-memory doctor` reports the configured interval (#4001). Enrolling against
 a postgres data tier uses
 `ai-memory agents bind-api-key --store-url <url> …`. As of v1.0.0 #3474 the
 same enrolment is reachable over the network without shell access to the data

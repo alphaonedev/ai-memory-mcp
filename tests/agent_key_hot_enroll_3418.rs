@@ -183,8 +183,8 @@ fn reinstalling_the_same_map_is_not_a_change_3418() {
 /// transient store error would make `enforce_for_request` inert in every mode
 /// (an empty registry is the #1985 unsatisfiable-default escape hatch), i.e. a
 /// blip on the data tier would silently downgrade an `enforce` deployment to
-/// self-asserted identity. Staleness is a bounded, observable degrade;
-/// disarming is a silent one.
+/// self-asserted identity. Staleness is an observable (not time-bounded,
+/// #4001) degrade; disarming is a silent one.
 #[test]
 fn a_failed_refresh_keeps_the_last_known_snapshot_3418() {
     let registry = EnrolledAgentKeys::from_map(enrolled_map("alice-token", "alice"));
@@ -215,6 +215,64 @@ fn a_failed_refresh_keeps_the_last_known_snapshot_3418() {
         !registry.is_empty(),
         "an empty registry would disarm the identity gate entirely — the one \
          outcome worse than a stale one"
+    );
+}
+
+/// #4001 — the refresh interval is a CADENCE, not a revocation deadline.
+///
+/// A key is revoked in the store, then every subsequent refresh FAILS. The
+/// retained map keeps authenticating the revoked key for as long as the reads
+/// keep failing (there is no staleness deadline), and it stops only at the
+/// first SUCCESSFUL refresh. The docs, the boot line and `--help` used to call
+/// the interval "the upper bound on how long a leaked per-agent key stays
+/// live"; this pins the behaviour that made that false, and the boot line that
+/// now says so.
+#[test]
+fn a_revoked_key_outlives_the_interval_while_refreshes_fail_4001() {
+    let registry = EnrolledAgentKeys::from_map(enrolled_map("alice-token", "alice"));
+    let headers = headers_with_key("alice-token");
+
+    // The operator revokes alice's key in the store; the daemon's next reads
+    // fail. However many intervals pass, the retained map still admits her.
+    for _ in 0..8 {
+        assert_eq!(
+            apply_agent_key_refresh(
+                &registry,
+                Err::<Vec<(String, String)>, _>("store unreachable"),
+            ),
+            AgentKeyRefresh::KeptLastKnown(1)
+        );
+        assert_eq!(
+            resolve_auth_level(&registry, &headers, "alice"),
+            AuthLevel::KeyAuthenticated,
+            "while refreshes fail the revoked key keeps authenticating — the \
+             interval bounds nothing (#4001)"
+        );
+    }
+
+    // The first SUCCESSFUL refresh (the store no longer lists alice) is what
+    // actually lands the revocation.
+    assert_eq!(
+        apply_agent_key_refresh(&registry, Ok::<_, String>(Vec::new())),
+        AgentKeyRefresh::Installed(0)
+    );
+    assert_eq!(
+        resolve_auth_level(&registry, &headers, "alice"),
+        AuthLevel::Claimed,
+        "a successful refresh revokes the key"
+    );
+
+    // The boot line states the cadence and disclaims the bound.
+    let note = refresh_posture_note(Some(std::time::Duration::from_secs(15)));
+    assert!(
+        !note.contains("within that window"),
+        "the boot line must not promise revocation within the interval: {note}"
+    );
+    assert!(
+        note.contains("next SUCCESSFUL refresh")
+            && note.contains("not an upper bound on a revoked key's lifetime"),
+        "the boot line must say revocation lands on a successful refresh and \
+         that the interval is not a bound: {note}"
     );
 }
 

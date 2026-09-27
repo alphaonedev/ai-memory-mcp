@@ -1422,8 +1422,11 @@ AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url ai-memory agents bind-api-key 
 You generate the token; the CLI stores only its SHA-256 digest and never the
 token. Make it at least 32 bytes — the HTTP route refuses anything shorter, and
 a weaker secret is no better for being typed on a shell. Enrolment and
-revocation reach a RUNNING daemon within `AI_MEMORY_AGENT_KEY_REFRESH_SECS`
-(default 15 s) with no restart, so this is not a "restart to pick it up" path.
+revocation reach a RUNNING daemon at its next successful refresh — the daemon
+polls every `AI_MEMORY_AGENT_KEY_REFRESH_SECS` (default 15 s) — with no
+restart, so this is not a "restart to pick it up" path. A failed or delayed
+refresh retains the previous key map, so the interval is not an upper bound on
+a revoked key's lifetime (#4001); each failed refresh logs a WARN.
 
 **2. Bind the daemon to loopback and put the proxy in front of it on the same
 host.** This is the smallest change and it makes the marker confidential for
