@@ -47,14 +47,17 @@
 //! }
 //! ```
 //!
-//! Clients implement Trust On First Use (TOFU): on the first
-//! `initialize` response from a given daemon, the client captures the
-//! `ai_memory_identity` blob and stores its `signature`. On subsequent
-//! connects, the client re-verifies the daemon presents the same
-//! signed identity. A daemon swap with a different keypair on disk
-//! (operator key rotation OR adversary substitution) produces a
-//! distinguishable `signature`, allowing the client to refuse the
-//! mismatched server.
+//! Clients implement Trust On First Use (TOFU) by pinning the daemon's
+//! IDENTITY, not its signature bytes: on the first `initialize` response
+//! from a given daemon, verify the `ai_memory_identity` envelope and pin
+//! its `public_key` and `daemon_id`. On subsequent connects, require the
+//! same pinned `public_key` and `daemon_id` and verify each envelope's
+//! `signature` against the pinned key. Do NOT pin the `signature`: it
+//! covers a fresh `signed_at` taken on every `initialize`, so its bytes
+//! change on every connect and a signature pin would reject every
+//! legitimate reconnect (#4002). A daemon with a different keypair on disk
+//! (operator key rotation OR adversary substitution) presents a different
+//! `public_key`; accept that only with explicit approval.
 //!
 //! # Backwards compatibility
 //!

@@ -206,3 +206,24 @@ fn release_notes_do_not_claim_the_abort_harness_proves_power_cut_durability_4009
     );
     assert_absent("CLAUDE.md", "simulating a power cut / SIGKILL", ISSUE);
 }
+
+/// #4002 — the identity signature covers a fresh `signed_at`, so it changes
+/// on every connect; the published TOFU recipe must pin the public key and
+/// daemon id, not the signature bytes.
+#[test]
+fn tofu_recipe_pins_identity_not_signature_4002() {
+    const ISSUE: &str = "#4002";
+    for rel in [
+        "docs/compliance/nsa-csi-mcp-security-mapping.md",
+        "docs/compliance/nsa-csi-mcp.html",
+    ] {
+        assert_absent(rel, "capture the signature on first connect", ISSUE);
+        assert_absent(rel, "present a different signature", ISSUE);
+        assert_present(rel, "pin the daemon's public key and daemon ID", ISSUE);
+    }
+    assert_absent(
+        "src/mcp/server_identity.rs",
+        "stores its `signature`",
+        ISSUE,
+    );
+}

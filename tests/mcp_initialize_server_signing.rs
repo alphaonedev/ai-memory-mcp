@@ -397,8 +397,11 @@ fn client_tofu_pin_detects_keypair_rotation() {
     // Simulated client workflow:
     //   1. First connect to daemon — captures identity block A with signature S_A
     //   2. Daemon operator rotates keypair (different .priv on disk)
-    //   3. Second connect produces identity block B with signature S_B
-    //   4. Client compares S_B to pinned S_A → mismatch → refuses
+    //   3. Second connect produces identity block B
+    //   4. Client compares B's public_key to the pinned key → mismatch →
+    //      refuses (or asks for explicit rotation approval). The pin is the
+    //      public key + daemon id, NOT the signature bytes, which change on
+    //      every connect because `signed_at` is fresh (#4002).
     let kp_v1 = keypair_with_signing("ai:nhi@host", 41);
     let block_v1 = build_signed_identity(Some(&kp_v1), TEST_TIMESTAMP)
         .unwrap()
@@ -413,7 +416,11 @@ fn client_tofu_pin_detects_keypair_rotation() {
 
     assert_ne!(
         sig_v1, sig_v2,
-        "keypair rotation produces distinguishable signatures (the TOFU defense)"
+        "keypair rotation produces distinguishable signatures"
+    );
+    assert_ne!(
+        block_v1["public_key"], block_v2["public_key"],
+        "keypair rotation changes the pinned public key (the TOFU defense, #4002)"
     );
 
     // Each individually verifies against its own embedded public key.
@@ -438,6 +445,46 @@ fn timestamp_freshness_prevents_replay_within_session() {
     assert_ne!(
         sig_t0, sig_t1,
         "different timestamps → different signatures"
+    );
+}
+
+/// #4002 — what a TOFU client must pin. Two `initialize` responses from the
+/// SAME daemon keypair at different seconds carry DIFFERENT signature bytes
+/// (`signed_at` is inside the signed bytes) but the SAME `public_key` and
+/// `daemon_id`, and each verifies. So the stable pin is the identity, and a
+/// client that pinned the signature bytes (the recipe the docs used to
+/// publish) would reject every legitimate reconnect. The module doc must
+/// teach the identity pin.
+#[test]
+fn tofu_pin_is_the_identity_not_the_signature_bytes_4002() {
+    let kp = keypair_with_signing("ai:nhi@host", 71);
+    let first = build_signed_identity(Some(&kp), "2026-05-23T16:30:22Z")
+        .unwrap()
+        .unwrap();
+    let reconnect = build_signed_identity(Some(&kp), "2026-05-23T16:31:05Z")
+        .unwrap()
+        .unwrap();
+
+    assert_ne!(
+        first["signature"], reconnect["signature"],
+        "a fresh signed_at changes the signature bytes on every connect"
+    );
+    assert_eq!(first["public_key"], reconnect["public_key"]);
+    assert_eq!(first["daemon_id"], reconnect["daemon_id"]);
+    verify_signed_identity(&first).expect("first envelope verifies");
+    verify_signed_identity(&reconnect).expect("reconnect envelope verifies");
+
+    let module_doc = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mcp/server_identity.rs"),
+    )
+    .expect("read server_identity.rs");
+    assert!(
+        !module_doc.contains("stores its `signature`"),
+        "the module doc must not tell clients to pin the signature bytes (#4002)"
+    );
+    assert!(
+        module_doc.contains("Do NOT pin the `signature`"),
+        "the module doc must tell clients to pin public_key + daemon_id (#4002)"
     );
 }
 
