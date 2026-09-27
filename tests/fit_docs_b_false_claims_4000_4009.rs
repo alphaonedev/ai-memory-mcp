@@ -75,3 +75,35 @@ fn key_refresh_interval_is_not_called_a_revocation_bound_4001() {
         ISSUE,
     );
 }
+
+/// #4003 — federation mTLS is opt-in on both ends, and the listener
+/// negotiates TLS 1.2 or 1.3; `SECURITY.md` must not call the transport
+/// mutually authenticated without the qualifier.
+#[test]
+fn security_md_does_not_call_federation_mtls_unconditional_4003() {
+    const ISSUE: &str = "#4003";
+    assert_absent(
+        "SECURITY.md",
+        "The federation transport is mutually authenticated TLS",
+        ISSUE,
+    );
+    assert_absent(
+        "SECURITY.md",
+        "rustls, TLS 1.3, mTLS fingerprint pinning",
+        ISSUE,
+    );
+    assert_present("SECURITY.md", "it is opt-in on both ends", ISSUE);
+    assert_present("SECURITY.md", "TLS 1.2 floor, TLS 1.3 preferred", ISSUE);
+    // The qualifier must stay anchored to shipped code: the protocol list and
+    // the opt-in server flag the sentence names must exist.
+    assert_present(
+        "src/tls.rs",
+        "&[&rustls::version::TLS13, &rustls::version::TLS12];",
+        ISSUE,
+    );
+    assert_present(
+        "src/daemon_runtime.rs",
+        "pub mtls_allowlist: Option<PathBuf>,",
+        ISSUE,
+    );
+}
