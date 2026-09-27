@@ -94,7 +94,10 @@ pub fn auto_namespace_in(dir: Option<&std::path::Path>) -> String {
             }
         }
     }
-    dir.map(std::path::Path::to_path_buf)
+    // Canonicalize, as `current_dir()` did after the old `chdir(dir)`: a
+    // relative `--cwd .` or a symlinked dir names the REAL directory. A dir
+    // that does not exist keeps its basename as given.
+    dir.map(|d| std::fs::canonicalize(d).unwrap_or_else(|_| d.to_path_buf()))
         .or_else(|| std::env::current_dir().ok())
         .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
         .unwrap_or_else(|| crate::DEFAULT_NAMESPACE.to_string())
@@ -325,6 +328,21 @@ mod tests {
             cwd_before,
             "inferring a namespace for a dir must not move the process cwd"
         );
+    }
+
+    /// #4014: the pre-fix `chdir(dir)` + `current_dir()` named the REAL
+    /// directory behind a symlink (or a relative path); the explicit-dir form
+    /// must too.
+    #[cfg(unix)]
+    #[test]
+    fn auto_namespace_in_names_the_real_dir_behind_a_symlink_4014() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let real = tmp.path().join("real-dir-4014");
+        std::fs::create_dir_all(&real).expect("mkdir real");
+        let link = tmp.path().join("link-4014");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        let ns = with_git_ceiling(tmp.path(), || auto_namespace_in(Some(&link)));
+        assert_eq!(ns, "real-dir-4014");
     }
 
     #[test]
