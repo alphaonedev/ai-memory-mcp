@@ -410,6 +410,7 @@ fn the_posture_reports_the_snapshot_age_in_both_renderings_3504() {
         // #3643's admit-readiness gate; this posture test exercises the report,
         // not the exit gate, so it stays false.
         require_admits: false,
+        publish_snapshot: None,
         json: false,
     };
     let cfg = resolve_config(&args, &ai_memory::config::AppConfig::default()).expect("resolve");

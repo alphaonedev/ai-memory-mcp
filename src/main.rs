@@ -66,6 +66,17 @@ fn main() -> Result<()> {
     // `--db-passphrase-file`.
     let cli = Cli::parse();
 
+    // #3637 (M4) — `wake-hub --publish-snapshot` is the ROOT hand-off the
+    // packaged refresher runs (`ExecStartPost=+`). It needs nothing but its two
+    // explicit paths, so it runs here, before config load, file logging, the
+    // audit trail and key initialisation: a root step must not read, create or
+    // sign anything under root's home it was not asked to.
+    if let daemon_runtime::Command::WakeHub(args) = &cli.command
+        && let (Some(source), Some(dest)) = (&args.publish_snapshot, &args.allowlist)
+    {
+        return ai_memory::cli::wake_hub::run_publish_snapshot(source, dest);
+    }
+
     // #3329 / TASK-01 — config-path advisories are emitted before tracing is
     // initialised, so an explicitly quiet boot seeds the one-way suppression
     // latch before config resolution. Path selection remains unchanged.

@@ -31,16 +31,28 @@ Group=ai-memory
 # daemon pushes wakes (see docs/wake-hub.md).
 # Derive as User=ai-memory (this unit OPENS the store). The hub process
 # is User=ai-memory-hub and AllowlistFile::load_from_file requires the
-# snapshot be owned by THAT uid at exact mode 0600, so ExecStartPost
-# install(1)s the file into the hub runtime directory as root (`+`
-# prefix ignores User= and the sandbox — CAP_CHOWN is otherwise
-# unavailable to ai-memory).
+# snapshot be owned by THAT uid at exact mode 0600, so ExecStartPost hands
+# the file into the hub runtime directory as root (`+` prefix ignores User=
+# and the sandbox — CAP_CHOWN is otherwise unavailable to ai-memory).
+#
+# #3637 (M4) — the root step is `wake-hub --publish-snapshot`, NOT
+# install(1). /var/lib/ai-memory is writable by the ai-memory uid, and
+# install(1) dereferences its source and unlinks-then-recreates its
+# destination: a symlink swapped in there made root copy any file it can
+# read into the hub directory (CWE-59), and the hub could find no snapshot
+# mid-copy. --publish-snapshot follows no symlink on either path, accepts
+# only a single-link 0600 source owned by its directory's owner, fully
+# validates the snapshot, and renames a 0600 inode owned by the hub
+# directory's owner into place atomically. A refusal publishes nothing.
+# AI_MEMORY_NO_CONFIG=1 keeps the root step from reading (or seeding) root's
+# ai-memory config: it needs nothing but the two explicit paths.
 ExecStart=/usr/bin/ai-memory --db /var/lib/ai-memory/ai-memory.db \
     identity hub-cache \
     --include-agent REPLACE_AGENT_ID \
     --out /var/lib/ai-memory/hub-allow.json
-ExecStartPost=+/usr/bin/install -o ai-memory-hub -g ai-memory-hub -m 0600 \
-    /var/lib/ai-memory/hub-allow.json /run/ai-memory-hub/hub-allow.json
+ExecStartPost=+/usr/bin/env AI_MEMORY_NO_CONFIG=1 /usr/bin/ai-memory wake-hub \
+    --publish-snapshot /var/lib/ai-memory/hub-allow.json \
+    --allowlist /run/ai-memory-hub/hub-allow.json
 
 # --- hardening ---
 NoNewPrivileges=yes
@@ -66,7 +78,8 @@ CapabilityBoundingSet=
 AmbientCapabilities=
 # Staging snapshot (public keys only) lives next to the store. The hub
 # runtime directory is 0700 ai-memory-hub, so this unit cannot write it
-# directly; ExecStartPost=+install is the hand-off (#3578).
+# directly; ExecStartPost=+wake-hub --publish-snapshot is the hand-off
+# (#3578, hardened by #3637).
 # The DIRECTORY, not the database file, exactly as ai-memory.service grants it
 # ("Only touch AI_MEMORY_DB's parent"). SQLite runs the store in WAL mode, and
 # WAL mode creates and locks `ai-memory.db-wal` and `ai-memory.db-shm` BESIDE

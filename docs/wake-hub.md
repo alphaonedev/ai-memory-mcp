@@ -711,8 +711,33 @@ is refused. On Linux the hub runtime directory is created `0700` by the hub
 unit (`RuntimeDirectory=ai-memory-hub`, `User=ai-memory-hub`,
 `RuntimeDirectoryPreserve=yes`). The refresher is a DISTINCT user
 (`User=ai-memory`) because it opens the store; it cannot write the 0700 hub
-directory, so `ExecStartPost=+/usr/bin/install -o ai-memory-hub …` is the
+directory, so `ExecStartPost=+/usr/bin/env AI_MEMORY_NO_CONFIG=1 /usr/bin/ai-memory wake-hub --publish-snapshot …` is the
 hand-off that satisfies the hub's owner-only 0600 allowlist gate (#3578).
+
+That root step is deliberately NOT `install(1)` (#3637). The staging file
+lives in `/var/lib/ai-memory`, which the `ai-memory` uid can write, and
+`install(1)` dereferences its source and unlinks-then-recreates its
+destination: a symlink swapped in there made root copy any file it can read
+into the hub directory (CWE-59), and the hub could find no snapshot mid-copy.
+`wake-hub --publish-snapshot SRC --allowlist DEST`:
+
+* walks BOTH parent directories from `/` one component at a time with
+  `O_NOFOLLOW`, so a symlink anywhere on either path is refused, never
+  followed — both paths must be absolute and canonical;
+* opens the source relative to its pinned directory and proves, through that
+  same descriptor, that it is a regular file with exactly one link, mode
+  `0600`, owned by the directory's owner (the refresher); a FIFO, device,
+  hard link, symlink or widened mode is refused;
+* reads at most 1 MiB and FULLY validates the snapshot with the code the hub
+  admits against (format version, keys, the 60 s freshness ceiling);
+* refuses a destination directory that is group- or world-writable, and —
+  when not run as root — one owned by another uid;
+* writes a canonical re-encoding to an `O_EXCL` temp file in the destination
+  directory, hands that inode to the directory's owner at mode `0600`,
+  `fsync`s it, `renameat`s it over the old snapshot and `fsync`s the directory.
+
+Any refusal publishes nothing: the previous snapshot stays in place and ages
+out, which refuses hellos — the fail-closed direction.
 
 **Grant the database's DIRECTORY, not the database file.** The systemd
 refresher runs under `ProtectSystem=strict`, so every path it writes has to be
@@ -734,11 +759,14 @@ admitting nobody and stays that way until the refresher has run once — which i
 exactly what `OnBootSec=15s` (systemd) and `RunAtLoad` (launchd) are for. The
 first post-boot refresh is what lets the hub admit anyone at all.
 
-Three properties make that safe to run on a timer. It publishes ATOMICALLY: the
-snapshot goes to a temp file created in the SAME directory, set to mode 0600
-before a byte is written, then written, `fsync`ed and renamed into place over
-the old inode, so a hub reading concurrently
-sees the whole old snapshot or the whole new one and never a truncated file. It
+Three properties make that safe to run on a timer. It publishes ATOMICALLY, at
+BOTH hops: `identity hub-cache --out` writes a temp file created in the SAME
+directory, set to mode 0600 before a byte is written, then written, `fsync`ed
+and renamed into place over the old inode; and on Linux the root hand-off
+(`wake-hub --publish-snapshot`, above) repeats that temp-file-plus-`renameat`
+in the hub directory, so a hub reading concurrently sees the whole old
+snapshot or the whole new one and never a missing or truncated file. (Until
+#3637 the second hop was `install(1)`, which was NOT atomic.) It
 publishes NOTHING on failure: a store error, a record-stop or a failed audit
 leaves the previous snapshot alone, which then ages out and refuses — the
 fail-closed direction. And it can only ever NARROW: the snapshot is complete, so

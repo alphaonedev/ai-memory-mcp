@@ -167,9 +167,19 @@ fn refresher_stays_the_store_opener_and_installs_as_the_hub_uid_3578() {
         trimmed_lines(&unit).any(|l| l == "User=ai-memory"),
         "refresher must keep User=ai-memory — it opens the store"
     );
+    // #3637 (M4) — the root hand-off is `wake-hub --publish-snapshot`
+    // (symlink-free, validated, atomic rename to the hub dir's owner), never
+    // install(1), which dereferences the ai-memory-writable source and
+    // unlinks-then-recreates the destination.
     assert!(
-        unit.contains("ExecStartPost=+/usr/bin/install -o ai-memory-hub"),
-        "refresher must install(1) the snapshot as the hub uid (0600 owner check)"
+        trimmed_lines(&unit)
+            .any(|l| l.starts_with("ExecStartPost=+") && l.contains("/usr/bin/ai-memory wake-hub"))
+            && unit.contains("--publish-snapshot /var/lib/ai-memory/hub-allow.json"),
+        "refresher must hand the snapshot over with wake-hub --publish-snapshot as root"
+    );
+    assert!(
+        !trimmed_lines(&unit).any(|l| l.starts_with("ExecStartPost=") && l.contains("install")),
+        "refresher must not hand the snapshot over with install(1) (#3637 CWE-59)"
     );
     assert!(
         unit.contains("/run/ai-memory-hub/hub-allow.json"),
