@@ -670,6 +670,14 @@ mod tests {
     /// lockstep.
     #[tokio::test]
     async fn broadcast_emits_entry_line_log_for_track_d_grep() {
+        // #4088: the `tracing` callsite-interest cache is process-global; a
+        // sibling test with no subscriber can pin a callsite to `never` and this
+        // capture then reads nothing (the #3426 mechanism). Run alone in a child.
+        if crate::config::run_env_isolated_child_or_spawn(
+            "federation::tests::broadcast_emits_entry_line_log_for_track_d_grep",
+        ) {
+            return;
+        }
         use tracing_subscriber::Registry;
         use tracing_subscriber::layer::SubscriberExt;
 
