@@ -6611,6 +6611,15 @@ mod tests {
     /// instrumentation production exporters key off.
     #[test]
     fn tools_call_emits_span_with_tool_name_and_elapsed_ms() {
+        // #4088: the `tracing` callsite-interest cache is process-global, so a
+        // sibling test with no INFO subscriber can pin `mcp_tool_call` to
+        // `never` and this capture reads an empty trace (the #3426
+        // mechanism). Run the body alone in a re-exec'd child process.
+        if crate::config::run_env_isolated_child_or_spawn(
+            "mcp::tests::tools_call_emits_span_with_tool_name_and_elapsed_ms",
+        ) {
+            return;
+        }
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();
         let tier_config = FeatureTier::Keyword.config();
         let resolved_ttl = crate::config::ResolvedTtl::default();
@@ -6671,6 +6680,15 @@ mod tests {
     /// dashboards can alert on per-tool error rate.
     #[test]
     fn tools_call_emits_warn_event_on_handler_error() {
+        // #4088: the `tracing` callsite-interest cache is process-global, so a
+        // sibling test with no INFO subscriber can pin `mcp_tool_call` to
+        // `never` and this capture reads an empty trace (the #3426
+        // mechanism). Run the body alone in a re-exec'd child process.
+        if crate::config::run_env_isolated_child_or_spawn(
+            "mcp::tests::tools_call_emits_warn_event_on_handler_error",
+        ) {
+            return;
+        }
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();
         let tier_config = FeatureTier::Keyword.config();
         let resolved_ttl = crate::config::ResolvedTtl::default();

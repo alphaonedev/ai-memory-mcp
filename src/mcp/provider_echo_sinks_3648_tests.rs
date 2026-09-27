@@ -257,6 +257,14 @@ fn run_matrix(uri: String, ollama: bool, status: u16, malformed: bool) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn mcp_chat_tool_sinks_never_carry_the_provider_body_3648() {
+    // #4088: the `tracing` callsite-interest cache is process-global; a
+    // sibling test with no subscriber can pin a callsite to `never` and this
+    // capture then reads nothing (the #3426 mechanism). Run alone in a child.
+    if crate::config::run_env_isolated_child_or_spawn(
+        "mcp::provider_echo_sinks_3648_tests::mcp_chat_tool_sinks_never_carry_the_provider_body_3648",
+    ) {
+        return;
+    }
     for ollama in [false, true] {
         for (status, malformed) in [(401, false), (200, true)] {
             let server = MockServer::start().await;

@@ -1610,6 +1610,14 @@ mod tests {
     /// (b) a WARN was observed describing the out-of-order pair.
     #[test]
     fn audit_init_warns_on_out_of_order_sequence() {
+        // #4088: the `tracing` callsite-interest cache is process-global; a
+        // sibling test with no subscriber can pin a callsite to `never` and this
+        // capture then reads nothing (the #3426 mechanism). Run alone in a child.
+        if crate::config::run_env_isolated_child_or_spawn(
+            "audit::tests::audit_init_warns_on_out_of_order_sequence",
+        ) {
+            return;
+        }
         let _g = sink_lock();
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("audit.log");

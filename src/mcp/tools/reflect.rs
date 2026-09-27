@@ -978,6 +978,14 @@ mod tests {
 
     #[test]
     fn issue_3638_operator_log_retains_private_depth_details() {
+        // #4088: the `tracing` callsite-interest cache is process-global; a
+        // sibling test with no subscriber can pin a callsite to `never` and this
+        // capture then reads nothing (the #3426 mechanism). Run alone in a child.
+        if crate::config::run_env_isolated_child_or_spawn(
+            "mcp::reflect::tests::issue_3638_operator_log_retains_private_depth_details",
+        ) {
+            return;
+        }
         #[derive(Clone)]
         struct Log(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
         impl std::io::Write for Log {
