@@ -212,6 +212,11 @@ fn uncommitted_at_fault_point_body() {
 /// store crash tests only compile under `--features sal`.
 #[test]
 fn mcp_crash_child_3152() {
+    // #3517: `handle_update` resolves the caller from AI_MEMORY_AGENT_ID. The
+    // child already starts from a cleared environment (`spawn_test_child` runs
+    // it under `env_clear`), so holding the shared reader lock is enough: the
+    // read cannot race a writer in this binary, and no env is mutated.
+    let _agent_id_env_lock = crate::identity::agent_id_env_test_lock();
     if !child_role_is(ROLE_MCP_UPDATE) {
         return;
     }

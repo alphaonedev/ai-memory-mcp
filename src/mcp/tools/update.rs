@@ -644,7 +644,10 @@ fn handle_update_inner(
                 .lifecycle_state;
             if requested != current {
                 if !current.can_transition_to(requested) {
-                    anyhow::bail!(
+                    // #3713: a typed root (the caller's own bad input), so the
+                    // MCP funnel passes the text through verbatim instead of
+                    // flattening it to the storage-error class.
+                    return Err(crate::errors::invalid_input(format!(
                         "illegal lifecycle transition '{}' -> '{}' (legal: {})",
                         current.as_str(),
                         requested.as_str(),
@@ -654,7 +657,7 @@ fn handle_update_inner(
                             .map(|s| s.as_str())
                             .collect::<Vec<_>>()
                             .join("|"),
-                    );
+                    )));
                 }
                 db::set_lifecycle_state(conn, &resolved_id, requested)?;
             }
