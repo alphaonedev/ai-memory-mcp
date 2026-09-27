@@ -378,6 +378,8 @@ pub const LAST_SEEN_AT: &str = "last_seen_at";
 pub const LATENCY_MS: &str = "latency_ms";
 /// `latest_updated_at` — wire/row field name.
 pub const LATEST_UPDATED_AT: &str = "latest_updated_at";
+/// `line_number` — wire field name (`audit verify` failure object, #4021).
+pub const LINE_NUMBER: &str = "line_number";
 /// `local_depth_at_arrival` — wire/row field name.
 pub const LOCAL_DEPTH_AT_ARRIVAL: &str = "local_depth_at_arrival";
 /// `memories_dropped` — wire/row field name.
