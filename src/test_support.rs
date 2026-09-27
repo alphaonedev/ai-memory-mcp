@@ -878,6 +878,41 @@ mod tests {
         }
     }
 
+    /// Whether the `if` opened on normalised line `j` has a body that
+    /// `return`s. `run_env_isolated_child_or_spawn` answers `true` in the
+    /// PARENT after the child has run, so an `if` without a `return` lets the
+    /// parent run the rest of the test in-process: that is not isolation.
+    fn isolation_block_returns(norm: &[String], j: usize) -> bool {
+        let mut depth = 0usize;
+        let mut body = String::new();
+        for line in &norm[j..] {
+            for ch in line.chars() {
+                match ch {
+                    '{' => {
+                        depth += 1;
+                        if depth == 1 {
+                            continue;
+                        }
+                    }
+                    '}' if depth > 0 => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return names_ident(&body, "return");
+                        }
+                    }
+                    _ => {}
+                }
+                if depth > 0 {
+                    body.push(ch);
+                }
+            }
+            if depth > 0 {
+                body.push(' ');
+            }
+        }
+        false
+    }
+
     /// #4015/#4016 class rule, as a pure function so its own mutants can be
     /// tested: the 0-based indices of TEST-code lines that reach the process
     /// cwd (`current_dir` / `set_current_dir` / `chdir` / `getcwd`, named as
@@ -927,8 +962,11 @@ mod tests {
                 let mut depth: i64 = 0;
                 let mut held: Vec<(String, i64)> = Vec::new();
                 let mut isolated = false;
-                for l in &norm[start..i] {
-                    if l.starts_with("if ") && l.contains(isolate.as_str()) {
+                for (j, l) in norm.iter().enumerate().take(i).skip(start) {
+                    if l.starts_with("if ")
+                        && l.contains(isolate.as_str())
+                        && isolation_block_returns(&norm, j)
+                    {
                         isolated = true;
                     }
                     held.retain(|(name, _)| !l.contains(&format!("drop({name})")));
@@ -1067,6 +1105,18 @@ mod tests {
                 "locked libc chdir",
                 "fn t() {\n    let _l = cwd_lock();\n    unsafe { libc::chdir(p) };\n}",
                 vec![2],
+            ),
+            // f2r @ 35d1475cd: the helper answers true in the PARENT, so an `if`
+            // that does not `return` is not isolation.
+            (
+                "isolation without return",
+                "fn t() {\n    if run_env_isolated_child_or_spawn(\"x\") {}\n    std::env::set_current_dir(p).unwrap();\n}",
+                vec![2],
+            ),
+            (
+                "isolation block without return",
+                "fn t() {\n    if run_env_isolated_child_or_spawn(\"x\") {\n        let _n = 1;\n    }\n    std::env::set_current_dir(p).unwrap();\n}",
+                vec![4],
             ),
             (
                 "lock in another fn",
