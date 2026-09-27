@@ -123,11 +123,11 @@ async fn duplicate_validity(remote: bool) {
     );
 }
 
-async fn wait_blocked(store: &PostgresStore, blocker: i32) {
+async fn wait_blocked(store: &PostgresStore, owner_pid: i32) {
     tokio::time::timeout(Duration::from_secs(8), async {
         loop {
             let blocked: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid)))")
-                .bind(blocker).fetch_one(store.pool()).await.expect("blocking probe");
+                .bind(owner_pid).fetch_one(store.pool()).await.expect("blocking probe");
             if blocked { break; }
             tokio::task::yield_now().await;
         }
