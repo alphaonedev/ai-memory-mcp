@@ -135,12 +135,33 @@ fn command(sb: &Sandbox, url: &str) -> Command {
         .env("AI_MEMORY_NO_CONFIG", "1")
         .env("AI_MEMORY_AGENT_ID", AGENT_ID)
         .env("AI_MEMORY_STORE_URL", url)
-        .env("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "0");
+        .env("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "0")
+        // #4019 — hermetic boot. With `AI_MEMORY_NO_CONFIG=1` the daemon runs
+        // the compiled default tier (semantic), and a fresh sandbox HOME has
+        // no model cache, so EVERY boot downloaded ~88 MB of MiniLM from
+        // Hugging Face before `/health` answered — the 60 s deadline was a
+        // network-speed test. Offline, the embedder fails closed to keyword
+        // mode (#1593); this cell's claim is key generation, not embeddings.
+        .env("AI_MEMORY_EMBED_OFFLINE", "1");
     cmd
 }
 
 struct Daemon {
     child: Child,
+    /// #4019 — the daemon's stderr, DRAINED continuously by a reader thread.
+    /// A piped-but-undrained stderr blocks the child once the OS pipe buffer
+    /// (~64 KiB) fills, and a daemon blocked on a log write never answers
+    /// `/health`; draining also lets a HANG (not only an exit) report what
+    /// the daemon printed.
+    stderr: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+}
+
+impl Daemon {
+    fn stderr_tail(&self) -> String {
+        let buf = self.stderr.lock().map(|b| b.clone()).unwrap_or_default();
+        let start = buf.len().saturating_sub(16 * 1024);
+        String::from_utf8_lossy(&buf[start..]).into_owned()
+    }
 }
 
 impl Drop for Daemon {
@@ -163,7 +184,27 @@ fn serve(sb: &Sandbox, url: &str) -> (Daemon, u16) {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn serve");
-    let mut daemon = Daemon { child };
+    let mut child = child;
+    let sink = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    if let Some(mut pipe) = child.stderr.take() {
+        let sink = std::sync::Arc::clone(&sink);
+        std::thread::spawn(move || {
+            use std::io::Read as _;
+            let mut chunk = [0u8; 8192];
+            while let Ok(n) = pipe.read(&mut chunk) {
+                if n == 0 {
+                    break;
+                }
+                if let Ok(mut b) = sink.lock() {
+                    b.extend_from_slice(&chunk[..n]);
+                }
+            }
+        });
+    }
+    let mut daemon = Daemon {
+        child,
+        stderr: sink,
+    };
     let client = tls_client(sb, Duration::from_secs(2));
     let health_url = format!("{}/api/v1/health", base_url(port));
     let deadline = Instant::now() + Duration::from_secs(60);
@@ -174,14 +215,17 @@ fn serve(sb: &Sandbox, url: &str) -> (Daemon, u16) {
             break;
         }
         if let Ok(Some(status)) = daemon.child.try_wait() {
-            let mut err = String::new();
-            if let Some(mut e) = daemon.child.stderr.take() {
-                use std::io::Read as _;
-                let _ = e.read_to_string(&mut err);
-            }
-            panic!("serve exited before /health ({status}): {err}");
+            std::thread::sleep(Duration::from_millis(200));
+            panic!(
+                "serve exited before /health ({status}): {}",
+                daemon.stderr_tail()
+            );
         }
-        assert!(Instant::now() < deadline, "serve never became healthy");
+        assert!(
+            Instant::now() < deadline,
+            "serve never became healthy within 60 s; daemon stderr (tail):\n{}",
+            daemon.stderr_tail()
+        );
         std::thread::sleep(Duration::from_millis(200));
     }
     (daemon, port)
