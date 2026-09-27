@@ -1576,6 +1576,16 @@ mod tests {
                     "invalid or stale summary must be refused"
                 );
                 assert!(!report.errors.is_empty());
+                let mut filter = crate::store::Filter::new();
+                filter.namespace = Some(namespace.clone());
+                assert_eq!(
+                    store.list(&ctx, &filter).await.unwrap().len(),
+                    2,
+                    "refused consolidation must not commit a summary"
+                );
+                if !edit {
+                    assert_eq!(report.rollback_entries_written, 0);
+                }
                 for (index, source) in candidates.iter().enumerate() {
                     let row = store.get(&ctx, &source.id).await.unwrap();
                     let expected = if edit && index == 0 {
