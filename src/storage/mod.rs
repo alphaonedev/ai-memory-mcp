@@ -395,7 +395,8 @@ fn emit_why_trace_signal(mem: &Memory, refused: bool) {
     let disposition = if refused { "refused" } else { "advisory" };
     tracing::warn!(
         target: "covenant.why_trace",
-        title = %mem.title,
+        // #3990 — the title is tenant content: log the id, never the title.
+        memory_id = %mem.id,
         namespace = %mem.namespace,
         disposition,
         "write missing metadata.{} provenance rationale ({}; set {}=1 to enforce)",

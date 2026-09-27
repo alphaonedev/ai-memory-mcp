@@ -386,7 +386,12 @@ pub(super) async fn sync_push_via_store(
     // that reuses its freed title; see `federation::causal_apply_order`.
     for (wire_idx, mem) in crate::federation::causal_apply_order(&body.memories) {
         if let Err(e) = validate::RequestValidator::validate_memory(mem) {
-            tracing::warn!("sync_push: skipping memory {} ({}): {e}", mem.id, mem.title);
+            // #3990 — id + namespace only; the title is tenant content.
+            tracing::warn!(
+                "sync_push: skipping memory {} (namespace {}): {e}",
+                mem.id,
+                mem.namespace
+            );
             skipped += 1;
             continue;
         }

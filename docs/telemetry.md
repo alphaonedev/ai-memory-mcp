@@ -28,7 +28,7 @@ duration_us        // wall-clock microseconds
 result             // "ok" | "denied" | "error"
 ```
 
-Spans do **not** contain memory content, embeddings, prompts, recall results, or any payload bytes. The substrate emits operation metadata only.
+Spans and log events do **not** contain a memory's `title`, `content` or `metadata`, embeddings, prompts, or recall results. The substrate emits operation metadata (ids, namespaces, counts, dispositions). The title/content/metadata exclusion is enforced mechanically, see §4.
 
 ---
 
@@ -81,7 +81,7 @@ Three substrate behaviors give operators a defensible privacy posture without ch
 
 **`AI_MEMORY_ANONYMIZE=1`.** When set (or `[identity] anonymize_default = true` in `config.toml`), the binary replaces the resolved `agent_id` in every emitted span with a stable anonymized hash. The original id is still recorded inside the database for the operator's own audit needs; only externally-visible spans carry the redacted form. Shipped via issue #198 closure.
 
-**Memory content is never in spans.** This is structural, not policy: the `tracing::info!` call sites never receive `content`, `title`, or `metadata` payloads. Adding a span macro that violated this would fail code review against [`docs/AI_DEVELOPER_GOVERNANCE.md`](AI_DEVELOPER_GOVERNANCE.html) §Hard Prohibitions. Operators can audit this themselves: `grep -rn "tracing::\(info\|warn\|error\)" src/` against the field set of `models::Memory`.
+**Memory content is never in spans or log events.** No `trace!` / `debug!` / `info!` / `warn!` / `error!` / `event!` call site in `src/` reads a memory's `title`, `content` or `metadata` as a value (a length or emptiness probe is allowed). This is enforced by the source-census test `tests/tracing_no_memory_payload_3990.rs`, which fails CI on any new call site that does. Before v1.0.0 GA four `warn!` sites (write-provenance warning, consolidation rollback conflict, and the two `sync_push` rejected-memory skips) logged the memory title; they now log the memory id and namespace instead ([#3990](https://github.com/alphaonedev/ai-memory-mcp/issues/3990)). Operators can audit this themselves by running that test or `grep -rn "tracing::\(info\|warn\|error\)" src/` against the field set of `models::Memory`.
 
 **Agent-id resolution is local.** The precedence ladder (CLI flag > env > MCP `clientInfo` > `host:<hostname>`) is resolved entirely in-process. There is no central agent registry to consult. If the resolved id contains a hostname you do not want surfaced (the default fallback `host:<hostname>` is durable + pid-free since #1720, so it exposes only the hostname; only the `AI_MEMORY_ANONYMIZE=1` / hostname-unavailable `anonymous:pid-…` fallback still carries a PID), set `AI_MEMORY_AGENT_ID` to an opaque value. Tracking history: issue #198.
 

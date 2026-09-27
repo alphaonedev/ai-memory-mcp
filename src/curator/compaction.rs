@@ -777,7 +777,7 @@ impl<'a> ConsolidationPass<'a> {
                 Err(StoreError::Conflict { id: occupant }) => {
                     tracing::warn!(
                         target: COMPACTION_TRACE_TARGET,
-                        title = %m.title,
+                        // #3990 — the title is tenant content: never in a log line.
                         namespace = %m.namespace,
                         occupant = %occupant,
                         original = %m.id,

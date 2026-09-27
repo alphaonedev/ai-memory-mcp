@@ -20,7 +20,17 @@ re-issue at `b0483115`, the 2026-09-11 #3595 re-issue at `ad60bead` and the orig
 mint `e22bc93c` remain as historical records. Any change to the federation wire path or the `AI_MEMORY_FED_*` surface **voids this
 certification and triggers re-cert** (see §7).
 
-> ## STATUS — **LIVE as of 2026-09-26** (re-issued at the promotion-4 rehearsal tip `eba96b307` at 22 checks after 2 §7-watched federation-wire files changed by REAL CODE — #3266 item 3 part 5 and #3901; supersedes the 2026-09-23 bind at `eae99be43`)
+> ## STATUS — **EXPIRED as of 2026-09-27** (§7 trigger fired by [#3990](https://github.com/alphaonedev/ai-memory-mcp/issues/3990): `src/handlers/federation_receive.rs` and `src/handlers/federation_signing_check.rs` changed; re-issue at the merge tip is pending. The 2026-09-26 bind at `eba96b307` below was LIVE until this change.)
+>
+> **§7 expiry record (2026-09-27, #3990).** Branch `fix/found-in-testing-docs-a-3989-3999` changes one
+> `tracing::warn!` line in each of the two watched handlers: the `sync_push` validation-skip warning
+> now logs the memory id and namespace instead of the memory title (tenant content must not reach
+> log sinks, `docs/telemetry.md` §4). No control flow, wire format, authorization, or
+> `AI_MEMORY_FED_*` identifier changed. The change is small, but §7 makes no exception for size, so
+> the certification is recorded EXPIRED here rather than argued LIVE; re-run §5.4(2)–(5) and re-bind
+> at the tip that carries this change.
+>
+> **Prior STATUS (superseded by the expiry above):** LIVE as of 2026-09-26 (re-issued at the promotion-4 rehearsal tip `eba96b307` at 22 checks after 2 §7-watched federation-wire files changed by REAL CODE — #3266 item 3 part 5 and #3901; supersedes the 2026-09-23 bind at `eae99be43`)
 >
 > Re-validated and re-bound against `f32c18dadf8a659567960747cc2802186bac9de9`
 > at the v1.0.0 promotion tip on 2026-09-21: §5.4(2) posture legs re-measured at 22 checks
