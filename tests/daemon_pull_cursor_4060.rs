@@ -203,37 +203,7 @@ async fn check_puller(sync_daemon: bool) {
         } else {
             AFTER
         };
-        if !sync_daemon {
-            let db = db();
-            ai_memory::db::sync_state_observe(&db.lock().await.0, LOCAL, PEER, BEFORE).unwrap();
-            catchup(&config, &db).await;
-            let actual = ai_memory::db::sync_state_load(&db.lock().await.0, LOCAL).unwrap();
-            assert_eq!(
-                actual.entries[PEER], expected,
-                "serve cursor for {cursor:?}"
-            );
-            assert!(
-                ai_memory::db::get(&db.lock().await.0, &rows[0].id)
-                    .unwrap()
-                    .is_some()
-            );
-            if cursor == Some(Value::Null) {
-                let third = enlarge_page(&payload, &rows);
-                catchup(&config, &db).await;
-                assert!(
-                    ai_memory::db::get(&db.lock().await.0, &third.id)
-                        .unwrap()
-                        .is_some(),
-                    "the formerly omitted tie row must arrive"
-                );
-                assert_eq!(
-                    ai_memory::db::sync_state_load(&db.lock().await.0, LOCAL)
-                        .unwrap()
-                        .entries[PEER],
-                    AFTER
-                );
-            }
-        } else {
+        if sync_daemon {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("sync.db");
             let url = config.peers[0]
@@ -269,6 +239,36 @@ async fn check_puller(sync_daemon: bool) {
                     ai_memory::db::sync_state_load(&conn, LOCAL)
                         .unwrap()
                         .entries[url],
+                    AFTER
+                );
+            }
+        } else {
+            let db = db();
+            ai_memory::db::sync_state_observe(&db.lock().await.0, LOCAL, PEER, BEFORE).unwrap();
+            catchup(&config, &db).await;
+            let actual = ai_memory::db::sync_state_load(&db.lock().await.0, LOCAL).unwrap();
+            assert_eq!(
+                actual.entries[PEER], expected,
+                "serve cursor for {cursor:?}"
+            );
+            assert!(
+                ai_memory::db::get(&db.lock().await.0, &rows[0].id)
+                    .unwrap()
+                    .is_some()
+            );
+            if cursor == Some(Value::Null) {
+                let third = enlarge_page(&payload, &rows);
+                catchup(&config, &db).await;
+                assert!(
+                    ai_memory::db::get(&db.lock().await.0, &third.id)
+                        .unwrap()
+                        .is_some(),
+                    "the formerly omitted tie row must arrive"
+                );
+                assert_eq!(
+                    ai_memory::db::sync_state_load(&db.lock().await.0, LOCAL)
+                        .unwrap()
+                        .entries[PEER],
                     AFTER
                 );
             }
