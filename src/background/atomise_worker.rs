@@ -125,7 +125,7 @@ pub type AtomiserProvider = Arc<dyn Fn() -> Option<Arc<Atomiser>> + Send + Sync>
 /// the MCP stdio loop.
 #[derive(Clone)]
 pub struct AtomiseQueue {
-    tx: std::sync::mpsc::SyncSender<AtomiseJob>,
+    tx: Arc<std::sync::Mutex<Option<std::sync::mpsc::SyncSender<AtomiseJob>>>>,
 }
 
 impl std::fmt::Debug for AtomiseQueue {
@@ -135,18 +135,36 @@ impl std::fmt::Debug for AtomiseQueue {
 }
 
 impl AtomiseQueue {
+    /// Close admission across every producer clone. Already accepted jobs drain.
+    pub fn close(&self) {
+        self.tx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+    }
+
     /// Non-blocking enqueue. Returns `false` when the bounded queue is
     /// full or the consumer has gone away — the caller reports
     /// `skipped_queue_full` and the durable write (already committed)
     /// is untouched.
     ///
-    /// NEVER blocks: `try_send` on a `SyncSender` returns immediately in
-    /// both directions, which is what makes this callable from an async
+    /// Never waits for channel capacity or consumer work. The admission mutex
+    /// covers only `try_send` or close, making this callable from an async
     /// handler and from the synchronous MCP stdio loop alike.
     #[must_use]
     pub fn try_enqueue(&self, job: AtomiseJob) -> bool {
         let id = job.memory_id.clone();
-        match self.tx.try_send(job) {
+        let sender = self
+            .tx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(tx) = sender.as_ref() else {
+            crate::metrics::inc_atomise_dropped();
+            return false;
+        };
+        let result = tx.try_send(job);
+        drop(sender);
+        match result {
             Ok(()) => {
                 crate::metrics::inc_atomise_enqueued();
                 true
@@ -198,7 +216,7 @@ pub fn resolve_queue_capacity() -> usize {
 /// Spawn the single-consumer atomise worker and return the producer
 /// handle.
 ///
-/// The consumer exits when every [`AtomiseQueue`] clone is dropped
+/// The consumer exits when admission closes or every [`AtomiseQueue`] clone is dropped
 /// (process shutdown), so `provider` MUST NOT capture anything that
 /// transitively owns the queue — otherwise the sender is kept alive by
 /// the worker itself and the thread never joins. Production providers
@@ -217,22 +235,46 @@ pub fn spawn(provider: AtomiserProvider) -> Option<AtomiseQueue> {
 
 /// Like [`spawn`] but also hands back the consumer thread's [`JoinHandle`].
 ///
-/// The consumer exits when every [`AtomiseQueue`] sender is dropped: closing
+/// The consumer exits on explicit close or when every producer is dropped: closing
 /// the channel makes `rx.recv()` return `Err` only AFTER every buffered job has
 /// been drained, so `handle.join()` is a DETERMINISTIC "await full drain" —
-/// no wall-clock deadline. Production uses the handle-less [`spawn`] (the
-/// daemon-lifetime thread is never joined); tests use this to observe that the
+/// no wall-clock deadline. The daemon uses an accounted, joinable worker and
+/// bounds its shutdown wait; tests use this to observe that the
 /// deferred atoms have landed without racing a timer (#2986: the old 15s poll
 /// flaked under llvm-cov instrumentation, which slows the worker past the
 /// deadline even though it always completes).
 pub fn spawn_joinable(
     provider: AtomiserProvider,
 ) -> Option<(AtomiseQueue, std::thread::JoinHandle<()>)> {
+    spawn_accounted(provider, None)
+}
+
+/// Spawn a daemon-owned worker, accounting for its entire OS-thread lifetime.
+pub(crate) fn spawn_tracked(
+    provider: AtomiserProvider,
+    tracker: Arc<std::sync::atomic::AtomicUsize>,
+) -> Option<(AtomiseQueue, std::thread::JoinHandle<()>)> {
+    tracker.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    spawn_accounted(provider, Some(WorkerAccounting(tracker)))
+}
+
+struct WorkerAccounting(Arc<std::sync::atomic::AtomicUsize>);
+impl Drop for WorkerAccounting {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+fn spawn_accounted(
+    provider: AtomiserProvider,
+    accounting: Option<WorkerAccounting>,
+) -> Option<(AtomiseQueue, std::thread::JoinHandle<()>)> {
     let capacity = resolve_queue_capacity();
     let (tx, rx) = std::sync::mpsc::sync_channel::<AtomiseJob>(capacity);
     let spawned = std::thread::Builder::new()
         .name(WORKER_THREAD_NAME.to_string())
         .spawn(move || {
+            let _accounting = accounting;
             tracing::info!(
                 target: TRACE_TARGET,
                 "atomise worker started (bounded capacity={capacity}, single consumer)"
@@ -243,7 +285,12 @@ pub fn spawn_joinable(
             tracing::info!(target: TRACE_TARGET, "atomise worker stopped");
         });
     match spawned {
-        Ok(handle) => Some((AtomiseQueue { tx }, handle)),
+        Ok(handle) => Some((
+            AtomiseQueue {
+                tx: Arc::new(std::sync::Mutex::new(Some(tx))),
+            },
+            handle,
+        )),
         Err(e) => {
             tracing::error!(
                 target: TRACE_TARGET,
@@ -363,7 +410,9 @@ mod tests {
         // The load-bearing bound: a rendezvous channel with NO consumer
         // must refuse immediately, never block the caller's write path.
         let (tx, rx) = std::sync::mpsc::sync_channel::<AtomiseJob>(0);
-        let q = AtomiseQueue { tx };
+        let q = AtomiseQueue {
+            tx: Arc::new(std::sync::Mutex::new(Some(tx))),
+        };
         let job = AtomiseJob {
             db_path: PathBuf::from("/nonexistent/ai-memory.db"),
             memory_id: "m-1".into(),
@@ -447,5 +496,135 @@ mod tests {
         }
         assert_eq!(atoms, 2, "the worker must land the curator's two atoms");
         drop(q);
+    }
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+    use crate::atomisation::{
+        AtomiserConfig,
+        curator::{Atom, Curator, CuratorError},
+    };
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+        mpsc,
+    };
+    use std::time::Duration;
+
+    struct LatchedCurator {
+        entered: mpsc::SyncSender<()>,
+        release: Mutex<mpsc::Receiver<()>>,
+    }
+
+    impl Curator for LatchedCurator {
+        fn decompose(
+            &self,
+            _body: &str,
+            _tokens: u32,
+            _retries: u32,
+        ) -> Result<Vec<Atom>, CuratorError> {
+            self.entered.send(()).unwrap();
+            self.release.lock().unwrap().recv().unwrap();
+            Ok(vec![
+                Atom {
+                    text: "first durable atom".into(),
+                },
+                Atom {
+                    text: "second durable atom".into(),
+                },
+            ])
+        }
+    }
+
+    #[test]
+    fn admission_closes_across_clones_and_writer_remains_accounted_until_drain_4062() {
+        let _no_pass = crate::test_support::no_passphrase_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("latched.db");
+        let conn = crate::db::open(&path).unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        let source = crate::models::Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            title: "latched source".into(),
+            namespace: "shutdown4062".into(),
+            tier: crate::models::Tier::Mid,
+            content: "A deployment must pass its readiness checks before receiving traffic. "
+                .repeat(100),
+            created_at: now.clone(),
+            updated_at: now,
+            metadata: serde_json::json!({"agent_id":"ai:test"}),
+            ..Default::default()
+        };
+        let id = crate::db::insert(&conn, &source).unwrap();
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let atomiser = Arc::new(Atomiser::new(
+            Box::new(LatchedCurator {
+                entered: entered_tx,
+                release: Mutex::new(release_rx),
+            }),
+            None,
+            AtomiserConfig::default(),
+            crate::config::FeatureTier::Smart,
+        ));
+        let provider: AtomiserProvider = Arc::new(move || Some(atomiser.clone()));
+        let tracker = Arc::new(AtomicUsize::new(0));
+        let (queue, worker) = spawn_tracked(provider, tracker.clone()).unwrap();
+        let retained_request_sender = queue.clone();
+        let job = AtomiseJob {
+            db_path: path,
+            memory_id: id.clone(),
+            namespace: source.namespace,
+            agent_id: "ai:test".into(),
+            max_atom_tokens: 50,
+        };
+        assert!(queue.try_enqueue(job.clone()));
+        entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        queue.close();
+        assert!(
+            !retained_request_sender.try_enqueue(job),
+            "shutdown must close every AppState clone's admission"
+        );
+        assert_eq!(
+            tracker.load(Ordering::SeqCst),
+            1,
+            "the held curator must keep the certification barrier closed"
+        );
+        assert!(!worker.is_finished());
+        let before: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE atom_of = ?1",
+                [&id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(before, 0);
+        release_tx.send(()).unwrap();
+        worker.join().unwrap();
+        assert_eq!(tracker.load(Ordering::SeqCst), 0);
+        let after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE atom_of = ?1",
+                [&id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            after, 2,
+            "all admitted derivations must land before the barrier opens"
+        );
+        let completed: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM signed_events WHERE event_type = 'atomisation_complete'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            completed, 1,
+            "the worker's final audit append precedes certification"
+        );
     }
 }

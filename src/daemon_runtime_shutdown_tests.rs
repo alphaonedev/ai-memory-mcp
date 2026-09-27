@@ -1,6 +1,6 @@
 use super::*;
 
-fn bind_failure_args() -> ServeArgs {
+pub(super) fn bind_failure_args() -> ServeArgs {
     ServeArgs {
         host: "127.0.0.1".to_string(),
         port: 0,

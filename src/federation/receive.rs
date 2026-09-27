@@ -343,19 +343,24 @@ fn advance_catchup_watermark(latest_ts: &mut Option<String>, halted: bool, row_t
 ///    strictly ahead of the current cursor) — because it is written into the
 ///    monotonic (refuse-to-regress) `sync_state` upsert; on rejection, or for a
 ///    legacy peer that publishes no `next_since`, fall back to `latest_ts`.
+#[allow(clippy::option_option)] // Missing is legacy; explicit null is a mandatory hold.
 fn resolve_catchup_advance(
     halted: bool,
     latest_ts: Option<&str>,
-    next_since: Option<&str>,
+    next_since: Option<Option<&str>>,
     current_since: Option<&str>,
     peer_id: &str,
 ) -> Option<String> {
+    if next_since == Some(None) {
+        tracing::warn!(peer = %peer_id, "catchup: peer held next_since; increase the pull page limit to include the timestamp tie group");
+        return None;
+    }
     if halted {
         // #2714 — hold at the last durable success; do NOT honour next_since.
         return latest_ts.map(str::to_string);
     }
     match next_since {
-        Some(candidate) => {
+        Some(Some(candidate)) => {
             match crate::daemon_runtime::validate_pull_cursor(candidate, current_since) {
                 Ok(()) => Some(candidate.to_string()),
                 Err(reason) => {
@@ -372,6 +377,7 @@ fn resolve_catchup_advance(
             }
         }
         None => latest_ts.map(str::to_string),
+        Some(None) => None,
     }
 }
 
@@ -568,10 +574,9 @@ pub(super) async fn catchup_once_with_store(
         // #2441 stall, which #2663 fixed on `sync_cycle_once` but never on this
         // `serve` puller. See `resolve_catchup_advance` for the halt-gated,
         // validated advance (the legacy `latest_ts` remains the fallback).
-        let next_since: Option<String> = body
+        let next_since = body
             .get("next_since")
-            .and_then(|v| v.as_str())
-            .map(str::to_string);
+            .map(|value| value.as_str().map(str::to_string));
 
         // #935 (v0.7.0 Track D, 2026-05-20): emit an info-level
         // success line on every accepted pull so operators tailing
@@ -742,7 +747,7 @@ pub(super) async fn catchup_once_with_store(
             if let Some(ts) = resolve_catchup_advance(
                 catchup_halted,
                 latest_ts.as_deref(),
-                next_since.as_deref(),
+                next_since.as_ref().map(Option::as_deref),
                 since_opt.as_deref(),
                 &peer.id,
             ) {
@@ -835,7 +840,7 @@ pub(super) async fn catchup_once_with_store(
             if let Some(ts) = resolve_catchup_advance(
                 catchup_halted,
                 latest_ts.as_deref(),
-                next_since.as_deref(),
+                next_since.as_ref().map(Option::as_deref),
                 since_opt.as_deref(),
                 &peer.id,
             ) && let Err(e) = crate::db::sync_state_observe(&lock.0, &local_id, &peer.id, &ts)
@@ -908,10 +913,9 @@ async fn catchup_once_legacy(config: &FederationConfig, db: &crate::handlers::Db
 
         // #2441 (CB-11) — consume the peer's examined-watermark so an
         // all-out-of-scope (count:0) window still advances (see the SAL branch).
-        let next_since: Option<String> = body
+        let next_since = body
             .get("next_since")
-            .and_then(|v| v.as_str())
-            .map(str::to_string);
+            .map(|value| value.as_str().map(str::to_string));
 
         // #935 — emit the canonical "pull: <peer> ok" success line
         // pinned by `tests/federation_catchup_api_key.rs`.
@@ -1028,7 +1032,7 @@ async fn catchup_once_legacy(config: &FederationConfig, db: &crate::handlers::Db
             if let Some(ts) = resolve_catchup_advance(
                 catchup_halted,
                 latest_ts.as_deref(),
-                next_since.as_deref(),
+                next_since.as_ref().map(Option::as_deref),
                 since_opt.as_deref(),
                 &peer.id,
             ) && let Err(e) = crate::db::sync_state_observe(&lock.0, &local_id, &peer.id, &ts)
@@ -1283,6 +1287,17 @@ mod issue_2714_2441_tests {
     const T3: &str = "2026-06-15T00:00:03Z";
 
     #[test]
+    fn explicit_null_holds_even_after_a_partial_apply_4060() {
+        for halted in [false, true] {
+            assert_eq!(
+                resolve_catchup_advance(halted, Some(T2), Some(None), Some(T1), "peer-x"),
+                None,
+                "an explicit hold must take precedence over any delivered-row fallback"
+            );
+        }
+    }
+
+    #[test]
     fn catchup_does_not_leap_skipped_ns() {
         // #3233 — a receiver-side skip of a *delivered* row (ns-scope or
         // attest) is the same cursor disposition as an apply halt: do NOT
@@ -1290,13 +1305,15 @@ mod issue_2714_2441_tests {
         // skipped high-water. Empty/all-peer-filtered windows still
         // advance via `next_since` (#2441) because nothing was delivered.
         let skipped = true;
-        let advance = resolve_catchup_advance(skipped, Some(T1), Some(T3), Some(T1), "peer-x");
+        let advance =
+            resolve_catchup_advance(skipped, Some(T1), Some(Some(T3)), Some(T1), "peer-x");
         assert_eq!(
             advance.as_deref(),
             Some(T1),
             "row-loss guard: a skipped delivered row must not leap to next_since"
         );
-        let skipped_no_apply = resolve_catchup_advance(skipped, None, Some(T3), Some(T1), "peer-x");
+        let skipped_no_apply =
+            resolve_catchup_advance(skipped, None, Some(Some(T3)), Some(T1), "peer-x");
         assert_eq!(
             skipped_no_apply, None,
             "all-skipped delivered window holds the cursor so the rows re-pull"
@@ -1309,7 +1326,7 @@ mod issue_2714_2441_tests {
         // examined-watermark `next_since` (T3) is FAR past the last durable
         // success (T1). The cursor MUST hold at T1 so the un-applied row is
         // re-pulled — never leap to T3 (which would drop it forever, #2714).
-        let advance = resolve_catchup_advance(true, Some(T1), Some(T3), Some(T1), "peer-x");
+        let advance = resolve_catchup_advance(true, Some(T1), Some(Some(T3)), Some(T1), "peer-x");
         assert_eq!(
             advance.as_deref(),
             Some(T1),
@@ -1321,7 +1338,7 @@ mod issue_2714_2441_tests {
     fn halted_with_no_success_holds_cursor_2714() {
         // The very first row failed transiently: no durable success this window.
         // The cursor MUST NOT advance at all (None) so the window is re-pulled.
-        let advance = resolve_catchup_advance(true, None, Some(T3), Some(T1), "peer-x");
+        let advance = resolve_catchup_advance(true, None, Some(Some(T3)), Some(T1), "peer-x");
         assert_eq!(
             advance, None,
             "row-loss guard: no durable success => no advance, whole window re-pulled"
@@ -1332,7 +1349,7 @@ mod issue_2714_2441_tests {
     fn clean_window_consumes_next_since_2441() {
         // A clean window (not halted) advances to the peer's honest
         // examined-watermark so an all-filtered (count:0) window converges.
-        let advance = resolve_catchup_advance(false, Some(T2), Some(T3), Some(T1), "peer-x");
+        let advance = resolve_catchup_advance(false, Some(T2), Some(Some(T3)), Some(T1), "peer-x");
         assert_eq!(
             advance.as_deref(),
             Some(T3),
@@ -1346,7 +1363,7 @@ mod issue_2714_2441_tests {
         // applied (latest_ts None) and NOT halted. Pre-fix the cursor never
         // advanced and the identical window re-pulled forever. `next_since` now
         // advances it past the filtered rows.
-        let advance = resolve_catchup_advance(false, None, Some(T3), Some(T1), "peer-x");
+        let advance = resolve_catchup_advance(false, None, Some(Some(T3)), Some(T1), "peer-x");
         assert_eq!(
             advance.as_deref(),
             Some(T3),
@@ -1359,7 +1376,8 @@ mod issue_2714_2441_tests {
         // A peer-advertised far-future cursor must be REFUSED (cursor-poisoning
         // guard); advance only to the honest last durable success instead.
         let poison = "2999-01-01T00:00:00Z";
-        let advance = resolve_catchup_advance(false, Some(T2), Some(poison), Some(T1), "peer-x");
+        let advance =
+            resolve_catchup_advance(false, Some(T2), Some(Some(poison)), Some(T1), "peer-x");
         assert_eq!(
             advance.as_deref(),
             Some(T2),

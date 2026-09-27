@@ -43,6 +43,15 @@
 //! mirroring #2088's api-key-dispatch move).
 
 use crate::models::field_names;
+#[path = "daemon_pull.rs"]
+mod pull;
+use pull::{SyncSinceResponse, urlencoding_minimal};
+#[path = "daemon_shutdown.rs"]
+mod shutdown;
+#[cfg(feature = "sal")]
+pub use shutdown::shutdown_active_store_witness;
+pub use shutdown::shutdown_witness_flush_and_checkpoint;
+
 use std::io::Write as _;
 use std::path::Path;
 use std::path::PathBuf;
@@ -1144,7 +1153,7 @@ pub struct ServeArgs {
     #[arg(long, requires = "tls_cert")]
     pub mtls_allowlist: Option<PathBuf>,
     /// Seconds to wait for in-flight requests to complete on graceful
-    /// shutdown (SIGINT). Default 30. Bumped from 10 in v0.6.0 because
+    /// shutdown (SIGINT, or SIGTERM on Unix). Default 30. Bumped from 10 in v0.6.0 because
     /// large `/sync/push` batches can take longer than 10s under load
     /// (red-team #233).
     #[arg(long, default_value_t = 30)]
@@ -4905,6 +4914,7 @@ pub struct ServeBootstrap {
     /// Receiver-owned shutdown barrier for the deferred-audit supervisor.
     pub(crate) deferred_audit_shutdown: crate::governance::deferred_audit::DeferredAuditShutdown,
     pub(crate) blocking_tasks: Arc<AtomicUsize>,
+    pub(crate) atomise_worker: Option<std::thread::JoinHandle<()>>,
 }
 
 /// v0.7.0 Wave-3 — resolve a [`MemoryStore`] handle from the operator's
@@ -7169,7 +7179,8 @@ pub async fn bootstrap_serve(
     // present, so the marker is what BOUNDS the outbox: a deployment
     // nothing will drain accumulates ZERO rows, forever.
     //
-    // Stamped only when ALL THREE hold: federation is configured, the
+    // Stamped only when replay is enabled (positive catchup interval and a
+    // resolved sink), federation is configured, the
     // build carries `--features sal` (the whole push-DLQ surface is gated
     // on it, so a default-features binary has no replay worker), and the
     // resolved sink is the SQLITE one — i.e. the worker drains the SAME
@@ -7181,8 +7192,10 @@ pub async fn bootstrap_serve(
     {
         #[cfg(feature = "sal")]
         let drainable_peers: Option<usize> = federation.as_ref().and_then(|fed| {
-            matches!(storage_backend, crate::handlers::StorageBackend::Sqlite)
-                .then(|| fed.peer_count())
+            (matches!(storage_backend, crate::handlers::StorageBackend::Sqlite)
+                && args.catchup_interval_secs > 0
+                && fed.dlq_sink.is_some())
+            .then(|| fed.peer_count())
         });
         #[cfg(not(feature = "sal"))]
         let drainable_peers: Option<usize> = None;
@@ -7741,6 +7754,7 @@ pub async fn bootstrap_serve(
     // swappable handle + tier + keypair, never `app_state`: capturing the
     // state would keep the queue's own `SyncSender` alive and the worker
     // thread would never exit at shutdown.
+    let mut atomise_worker = None;
     if matches!(
         app_state.storage_backend,
         crate::handlers::StorageBackend::Sqlite
@@ -7748,13 +7762,19 @@ pub async fn bootstrap_serve(
         let provider_llm = Arc::clone(&app_state.llm);
         let provider_tier = Arc::clone(&app_state.tier_config);
         let provider_keypair = Arc::clone(&app_state.active_keypair);
-        app_state.atomise_queue = crate::background::atomise_worker::spawn(Arc::new(move || {
-            crate::atomisation::build_atomiser_from_swappable(
-                &provider_llm,
-                provider_tier.tier,
-                provider_keypair.as_ref().as_ref(),
-            )
-        }));
+        if let Some((queue, worker)) = crate::background::atomise_worker::spawn_tracked(
+            Arc::new(move || {
+                crate::atomisation::build_atomiser_from_swappable(
+                    &provider_llm,
+                    provider_tier.tier,
+                    provider_keypair.as_ref().as_ref(),
+                )
+            }),
+            Arc::clone(&blocking_tasks),
+        ) {
+            app_state.atomise_queue = Some(queue);
+            atomise_worker = Some(worker);
+        }
     }
 
     // Automatic GC. Cluster G (#767) — pass through the operator-
@@ -7990,6 +8010,7 @@ pub async fn bootstrap_serve(
         deferred_audit_metrics,
         deferred_audit_shutdown,
         blocking_tasks,
+        atomise_worker,
     })
 }
 
@@ -8107,6 +8128,8 @@ fn classify_server_failure(error: anyhow::Error) -> anyhow::Error {
 #[allow(clippy::too_many_lines)]
 pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) -> Result<()> {
     init_tracing();
+    #[cfg(unix)]
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
 
     let mut bootstrap = match bootstrap_serve(&db_path, &args, app_config).await {
         Ok(bootstrap) => bootstrap,
@@ -8247,7 +8270,7 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
         }));
     }
 
-    // Graceful shutdown. The signal future only waits for ctrl_c and
+    // Graceful shutdown. The signal future waits for SIGINT or Unix SIGTERM and
     // then resolves, which tells axum to begin graceful shutdown of
     // in-flight requests. The deferred-audit drain + WAL checkpoint run
     // AFTER the server has fully quiesced (below `serve`), so:
@@ -8260,9 +8283,24 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
     // before in-flight requests (and the audit drainer) had quiesced —
     // so refusal rows submitted during graceful shutdown could be lost.
     let checkpoint_state = bootstrap.db_state.clone();
+    #[cfg(feature = "sal")]
+    let certification_store = Arc::clone(&bootstrap.app_state.store);
+    #[cfg(feature = "sal")]
+    let certification_backend = bootstrap.app_state.storage_backend;
     let drain_metrics = bootstrap.deferred_audit_metrics.clone();
+    let atomise_admission = bootstrap.app_state.atomise_queue.clone();
+    let signal_admission = atomise_admission.clone();
     let shutdown = async move {
+        #[cfg(unix)]
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {},
+            _ = terminate.recv() => {},
+        }
+        #[cfg(not(unix))]
         let _ = tokio::signal::ctrl_c().await;
+        if let Some(queue) = signal_admission {
+            queue.close();
+        }
         tracing::info!("shutting down — draining deferred-audit queue then checkpointing WAL");
     };
     let api_key_state = bootstrap.api_key_state;
@@ -8307,7 +8345,7 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
             let socket_addr: std::net::SocketAddr = addr.parse()?;
             // axum-server doesn't have a direct graceful-shutdown on the
             // TLS builder yet; spawn the signal listener on the Handle
-            // instead so ctrl_c triggers a graceful shutdown. Window is
+            // instead so either shutdown signal triggers a graceful shutdown. Window is
             // operator-configurable via --shutdown-grace-secs (default 30,
             // bumped from 10 in v0.6.0 — red-team #233).
             let grace = std::time::Duration::from_secs(args.shutdown_grace_secs);
@@ -8465,34 +8503,18 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
             .drain(..),
     );
 
-    // Stop and join every periodic/background writer before establishing the
-    // deferred-audit receiver-close barrier. Dropping a Tokio JoinHandle would
-    // detach the task and permit a late write after the final checkpoint.
-    for task in &bootstrap.task_handles {
-        task.abort();
+    if let Some(queue) = atomise_admission {
+        queue.close();
     }
-    let task_join_deadline = tokio::time::Instant::now()
-        + crate::governance::deferred_audit::DEFAULT_SHUTDOWN_DRAIN_TIMEOUT;
-    for task in bootstrap.task_handles {
-        match tokio::time::timeout_at(task_join_deadline, task).await {
-            Err(_) => {
-                return Err(fatal_shutdown(
-                    "background writer shutdown deadline exceeded",
-                ));
-            }
-            Ok(Err(error)) if !error.is_cancelled() => {
-                tracing::error!(%error, "background writer task failed before shutdown");
-                return Err(fatal_shutdown("background writer task failed"));
-            }
-            Ok(Ok(())) | Ok(Err(_)) => {}
-        }
-    }
-    while bootstrap.blocking_tasks.load(Ordering::SeqCst) != 0 {
-        if tokio::time::Instant::now() >= task_join_deadline {
-            return Err(fatal_shutdown("blocking writer shutdown deadline exceeded"));
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+
+    shutdown::join_background_writers(
+        bootstrap.task_handles,
+        &bootstrap.blocking_tasks,
+        bootstrap.atomise_worker,
+        tokio::time::Instant::now()
+            + crate::governance::deferred_audit::DEFAULT_SHUTDOWN_DRAIN_TIMEOUT,
+    )
+    .await?;
     // #3403 — the SHARED drain (`subscriptions::drain_dispatches`), also
     // used by the one-shot CLI epilogue in `run`. The daemon's severity is
     // FATAL: a late delivery worker could write after the final audit
@@ -8538,10 +8560,21 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
     // appends share this database's WAL file, so this single checkpoint
     // folds them in even though the drainer holds its own connection.
     let certification_state = checkpoint_state.clone();
-    let mut certification_task =
-        tokio::spawn(
-            async move { shutdown_witness_flush_and_checkpoint(&certification_state).await },
-        );
+    let mut certification_task = tokio::spawn(async move {
+        #[cfg(feature = "sal")]
+        {
+            shutdown_active_store_witness(certification_store.as_ref()).await?;
+            if matches!(
+                certification_backend,
+                crate::handlers::StorageBackend::Sqlite
+            ) {
+                return Ok(());
+            }
+            // The sidecar still owns local deferred-audit writes and a WAL.
+            // Certify it too, after certifying the selected corpus.
+        }
+        shutdown_witness_flush_and_checkpoint(&certification_state).await
+    });
     match tokio::time::timeout(FINAL_CERTIFICATION_TIMEOUT, &mut certification_task).await {
         Ok(Ok(Ok(()))) => {}
         Ok(Ok(Err(error))) => {
@@ -8566,28 +8599,6 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
         return Err(classify_server_failure(error));
     }
     Ok(())
-}
-
-/// v0.9.0 G5b (#1822 follow-up) — graceful-shutdown audit flush: emit a
-/// final dual-chain audit-head witness anchor for the CURRENT chain head
-/// (bypassing the `WATERMARK_INTERVAL` throttle), then run the final WAL
-/// checkpoint so the witness row itself is folded in.
-///
-/// Called by [`serve`] AFTER the HTTP server has fully quiesced and the
-/// deferred-audit queue has drained, so the witnessed head includes every
-/// append of the daemon's life. Inherits the emitter's own gating: with no
-/// enrolled witness key the emission is a no-op (byte-identical legacy
-/// shutdown). The caller must treat any witness/checkpoint failure as an
-/// uncertified shutdown. A failure can leave a witness checkpoint or
-/// off-table anchor partially committed; neither is a clean-shutdown claim,
-/// and both remain available for operator triage and idempotent recovery.
-///
-/// # Errors
-/// Returns an error when final witness emission or the WAL checkpoint fails.
-pub async fn shutdown_witness_flush_and_checkpoint(db_state: &Db) -> Result<()> {
-    let lock = db_state.lock().await;
-    crate::signed_events::try_force_emit_audit_head_witness(&lock.0)?;
-    db::checkpoint(&lock.0)
 }
 
 // ---------------------------------------------------------------------------
@@ -9068,8 +9079,12 @@ pub async fn sync_cycle_once(
     // on rejection do NOT advance (leave `sync_state` unchanged) and WARN.
     // The pulled rows still apply below — we simply re-pull the same window
     // next cycle rather than skipping forward over undelivered rows.
-    let advance_to: Option<String> = match pulled.next_since.as_deref() {
-        Some(candidate) => match validate_pull_cursor(candidate, since.as_deref()) {
+    let advance_to: Option<String> = match pulled.next_since.as_ref().map(Option::as_deref) {
+        Some(None) => {
+            tracing::warn!(peer = %peer_key, "sync-daemon: peer held next_since; increase the pull page limit to include the timestamp tie group");
+            None
+        }
+        Some(Some(candidate)) => match validate_pull_cursor(candidate, since.as_deref()) {
             Ok(()) => Some(candidate.to_string()),
             Err(reason) => {
                 tracing::warn!(
@@ -9178,7 +9193,9 @@ pub async fn sync_cycle_once(
         // examined-watermark (`advance_to`) past the un-applied row; advance only
         // to the last durable success. On a clean window keep the #2441/#2663
         // `next_since` behaviour (advance to the validated peer watermark).
-        let observe_to: Option<&str> = if apply_halted {
+        let observe_to: Option<&str> = if pulled.next_since == Some(None) {
+            None
+        } else if apply_halted {
             last_durable.as_deref()
         } else {
             advance_to.as_deref()
@@ -9497,47 +9514,6 @@ pub async fn run_curator_daemon_with_primitives(
 // helpers
 // -----------------------------------------------------------------------
 
-/// Minimal URL-component encoder — only the characters the sync-daemon
-/// queries actually emit (RFC3339 timestamps with `:` and `+`, and
-/// agent ids with `:`/`@`/`/`). Mirror of the pre-W6
-/// `main.rs::urlencoding_minimal`.
-fn urlencoding_minimal(s: &str) -> String {
-    use std::fmt::Write as _;
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char);
-            }
-            _ => {
-                let _ = write!(out, "%{b:02X}");
-            }
-        }
-    }
-    out
-}
-
-/// Mirrors the pre-W6 `main.rs::SyncSinceResponse` — the fields we
-/// deserialize from the peer's `/api/v1/sync/since` body. `count` and
-/// `limit` are present in the wire payload but unused on the receive
-/// side; allowed to be dead so `clippy::pedantic` doesn't trip.
-#[derive(serde::Deserialize)]
-struct SyncSinceResponse {
-    #[allow(dead_code)]
-    count: usize,
-    #[allow(dead_code)]
-    limit: usize,
-    memories: Vec<crate::models::Memory>,
-    /// #2441 — the peer's PULL CURSOR, derived from the rows it
-    /// EXAMINED rather than the rows it projected. Absent on a
-    /// pre-#2441 peer (`#[serde(default)]` → `None`), in which case
-    /// [`sync_cycle_once`] falls back to the legacy
-    /// `memories.last().updated_at` so a mixed-version mesh keeps
-    /// working exactly as before.
-    #[serde(default)]
-    next_since: Option<String>,
-}
-
 /// Re-export the `Instant`/`Duration` types so test crate use sites stay
 /// terse.  Kept private — internal to this module.
 #[allow(dead_code)]
@@ -9547,6 +9523,9 @@ fn _imports_in_use(_: Instant, _: Duration) {}
 // Tests
 // ===========================================================================
 
+#[cfg(test)]
+#[path = "daemon_atomise_shutdown_tests.rs"]
+mod daemon_atomise_shutdown_tests;
 #[cfg(test)]
 #[path = "daemon_runtime_shutdown_tests.rs"]
 mod daemon_runtime_shutdown_tests;
@@ -11087,6 +11066,18 @@ mod tests {
         assert!(digital_ocean.contains("KillSignal=SIGINT"));
         assert!(digital_ocean.contains("TimeoutStopSec=90"));
         assert!(digital_ocean.contains("RestartPreventExitStatus=75"));
+
+        let image =
+            std::fs::read_to_string(root.join("Dockerfile")).expect("read image stop signal");
+        assert!(
+            image
+                .lines()
+                .any(|line| line.trim() == "STOPSIGNAL SIGTERM")
+        );
+        let guide =
+            std::fs::read_to_string(root.join("docs/ADMIN_GUIDE.md")).expect("read stop budget");
+        assert!(guide.contains("docker stop --timeout 90"));
+        assert!(guide.contains("terminationGracePeriodSeconds: 90"));
 
         let default_shutdown_budget = Duration::from_secs(30)
             + crate::governance::deferred_audit::DEFAULT_SHUTDOWN_DRAIN_TIMEOUT

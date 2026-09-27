@@ -83,5 +83,6 @@ EXPOSE 9077
 
 USER aimem
 
+STOPSIGNAL SIGTERM
 ENTRYPOINT ["ai-memory"]
 CMD ["serve", "--host", "0.0.0.0"]

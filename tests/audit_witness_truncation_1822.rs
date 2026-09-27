@@ -520,7 +520,12 @@ fn daemon_shutdown_path_wires_the_witness_flush() {
          shutdown_witness_flush_and_checkpoint"
     );
     assert!(
-        src.contains("try_force_emit_audit_head_witness(&lock.0)"),
+        std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/daemon_shutdown.rs"
+        ))
+        .expect("read shutdown certification helper")
+        .contains("try_force_emit_audit_head_witness(&lock.0)"),
         "the shutdown flush helper must force-emit the audit-head witness \
          before the final WAL checkpoint"
     );

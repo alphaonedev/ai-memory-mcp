@@ -20,7 +20,17 @@ re-issue at `b0483115`, the 2026-09-11 #3595 re-issue at `ad60bead` and the orig
 mint `e22bc93c` remain as historical records. Any change to the federation wire path or the `AI_MEMORY_FED_*` surface **voids this
 certification and triggers re-cert** (see §7).
 
-> ## STATUS — **LIVE as of 2026-09-26** (re-issued at the promotion-4 rehearsal tip `eba96b307` at 22 checks after 2 §7-watched federation-wire files changed by REAL CODE — #3266 item 3 part 5 and #3901; supersedes the 2026-09-23 bind at `eae99be43`)
+> ## STATUS — **VOID as of 2026-09-27** (daemon lifecycle fixes #4060 and #4067 change the §7-watched federation receiver and erasure replay paths)
+>
+> The previous bind at `eba96b30791f34cf7583e0ddc912857d4bbb1a54` is retained as
+> historical evidence. Branch `fix/4060-4072-daemon-lifecycle`, based on
+> `57014b067a29bd13f11ac19751d55322c257b072`, preserves explicit null pull cursors
+> and gates erasure admission on a running replay configuration. These are
+> federation-wire changes. The lifecycle regression battery does not re-issue
+> the enterprise certificate: §5.4(2)–(5) must be re-run and this document rebound
+> to the resulting release candidate before it may claim LIVE again.
+>
+> **Historical certification evidence follows.**
 >
 > Re-validated and re-bound against `f32c18dadf8a659567960747cc2802186bac9de9`
 > at the v1.0.0 promotion tip on 2026-09-21: §5.4(2) posture legs re-measured at 22 checks

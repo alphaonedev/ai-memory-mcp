@@ -47,6 +47,9 @@
 #[path = "postgres_hub.rs"]
 mod hub;
 
+#[path = "postgres_shutdown.rs"]
+mod shutdown;
+
 use crate::models::ConfidenceSource;
 mod coordination_create;
 // #3064 lane L-PGP — postgres SAL for the tools whose HTTP mirrors were
@@ -15595,23 +15598,51 @@ async fn pg_emit_audit_head_witness_in_tx(
     signed_head_seq: i64,
     signed_head_hash: &str,
 ) -> Result<(), sqlx::Error> {
-    use crate::governance::audit as witness;
-    if !witness::witness_interval_reached(signed_head_seq) {
-        return Ok(());
+    if let Some(cp) =
+        pg_build_audit_head_witness_in_tx(tx, signed_head_seq, signed_head_hash, false).await?
+    {
+        crate::governance::audit::append_head_anchor(&cp);
     }
-    let keypair = match witness::load_witness_signing_key() {
-        Ok(Some(kp)) => kp,
-        Ok(None) => return Ok(()),
-        Err(e) => {
-            tracing::warn!(
-                target: crate::signed_events::SIGNED_EVENTS_TRACE_TARGET,
-                "audit-witness key load failed (pg, swallowed): {e:#}"
-            );
-            return Ok(());
+    Ok(())
+}
+
+async fn pg_build_audit_head_witness_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    signed_head_seq: i64,
+    signed_head_hash: &str,
+    force: bool,
+) -> Result<Option<crate::models::Checkpoint>, sqlx::Error> {
+    use crate::governance::audit as witness;
+    if !force && !witness::witness_interval_reached(signed_head_seq) {
+        return Ok(None);
+    }
+    let keypair = if force {
+        match witness::inspect_witness_custody()
+            .map_err(|e| sqlx::Error::Encode(format!("witness custody: {e:#}").into()))?
+        {
+            witness::WitnessCustody::Absent => return Ok(None),
+            witness::WitnessCustody::Unloadable(detail) => {
+                return Err(sqlx::Error::Encode(
+                    format!("witness custody is enrolled but unloadable: {detail}").into(),
+                ));
+            }
+            witness::WitnessCustody::Signer(keypair) => *keypair,
+        }
+    } else {
+        match witness::load_witness_signing_key() {
+            Ok(Some(kp)) => kp,
+            Ok(None) => return Ok(None),
+            Err(e) => {
+                tracing::warn!(
+                    target: crate::signed_events::SIGNED_EVENTS_TRACE_TARGET,
+                    "audit-witness key load failed (pg, swallowed): {e:#}"
+                );
+                return Ok(None);
+            }
         }
     };
-    if !witness::witness_claim_slot(signed_head_seq, false) {
-        return Ok(());
+    if !witness::witness_claim_slot(signed_head_seq, force) {
+        return Ok(None);
     }
     let (mem_seq, mem_hash_hex) = pg_read_revision_head_in_tx(tx).await?;
     let dual = witness::WitnessDualHead {
@@ -15663,10 +15694,7 @@ async fn pg_emit_audit_head_witness_in_tx(
     .bind(cp.metadata.to_string())
     .execute(&mut **tx)
     .await?;
-    // v1.0.0 #1946 B — mirror the signed anchor OFF-TABLE (fire-and-forget) so
-    // the pg-backed daemon also seeds the open-time rollback high-water mark.
-    witness::append_head_anchor(&cp);
-    Ok(())
+    Ok(Some(cp))
 }
 
 /// v0.9.0 G5b (#1822) — read the pg `memory_revisions` chain head as
@@ -21147,6 +21175,12 @@ impl PostgresStore {
 
 #[async_trait]
 impl MemoryStore for PostgresStore {
+    async fn certify_shutdown(&self) -> StoreResult<()> {
+        self.force_shutdown_witness()
+            .await
+            .map_err(|error| StoreError::Backend(super::BoxBackendError::new(error.to_string())))
+    }
+
     async fn write_durability(&self) -> StoreResult<crate::write_receipt::WriteDurability> {
         let (fsync, synchronous_commit): (String, String) = sqlx::query_as(
             "SELECT current_setting('fsync'), current_setting('synchronous_commit')",

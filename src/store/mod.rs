@@ -1218,6 +1218,18 @@ pub trait MemoryStore: Send + Sync {
     /// process lifetime.
     fn capabilities(&self) -> Capabilities;
 
+    /// Force the final witness for this corpus after all local writers quiesce.
+    /// SQLite also checkpoints its WAL; PostgreSQL commits the checkpoint and
+    /// durably persists the independent anchor. Unsupported adapters fail closed.
+    ///
+    /// # Errors
+    /// Returns custody, signing, persistence, or unsupported-adapter errors.
+    async fn certify_shutdown(&self) -> StoreResult<()> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "certify_shutdown".to_owned(),
+        })
+    }
+
     /// Observe the active writer's commit durability for a receipt (#3555).
     ///
     /// # Errors

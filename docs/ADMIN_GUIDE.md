@@ -891,7 +891,7 @@ See [Database Management → Backup](#backup) and [Database Management → Resto
 
 ## Graceful Shutdown
 
-The HTTP daemon handles SIGINT (Ctrl+C) gracefully:
+The HTTP daemon handles SIGINT (Ctrl+C) and Unix SIGTERM gracefully:
 
 1. Stops accepting new connections
 2. Waits for in-flight requests to complete
@@ -903,7 +903,7 @@ default 30-second HTTP request grace period plus the bounded background-writer,
 webhook-delivery, deferred-audit drain, and final witness/checkpoint phases,
 leaving time for the visible exit-75 failure path.
 
-> **Note:** The HTTP daemon handles SIGINT (Ctrl+C) gracefully with WAL checkpoint. Systemd sends SIGTERM by default -- the service file sets `KillSignal=SIGINT` to ensure clean shutdown.
+> **Note:** The HTTP daemon handles SIGINT (Ctrl+C) and Unix SIGTERM gracefully with a final backend witness and SQLite WAL checkpoint. Systemd sends SIGTERM by default -- the service file sets `KillSignal=SIGINT` for compatibility; either signal now enters the same drain path. Containers should allow at least 90 seconds with the default daemon settings (`docker stop --timeout 90`, or Kubernetes `terminationGracePeriodSeconds: 90`). Increase that budget if the HTTP grace period is raised.
 
 The daemon exits with status **75 (`EX_TEMPFAIL`)** when it cannot certify a
 safe shutdown or safely drop its Tokio runtime. Before final certification,
@@ -1670,7 +1670,7 @@ SQLite WAL mode creates two additional files alongside the database:
 - `ai-memory.db-wal` -- write-ahead log
 - `ai-memory.db-shm` -- shared memory file
 
-Both are cleaned up on graceful shutdown (the daemon runs `PRAGMA wal_checkpoint(TRUNCATE)` on SIGINT). If the daemon crashes, these files persist but are automatically recovered on next open.
+Both are cleaned up on graceful shutdown (the daemon runs `PRAGMA wal_checkpoint(TRUNCATE)` on SIGINT or Unix SIGTERM). If the daemon crashes, these files persist but are automatically recovered on next open.
 
 ## HTTP API Endpoints
 

@@ -292,7 +292,7 @@ pub fn apply_drainability(conn: &Connection, drainable_peers: Option<usize>) {
             Ok(true) => tracing::info!(
                 target: ERASURE_OUTBOX_TRACE_TARGET,
                 "federation erasure outbox DISABLED for this database (federation off, \
-                 postgres-backed, or a non-sal build): cleared the drainability marker so \
+                 replay disabled, postgres-backed, or a non-sal build): cleared the drainability marker so \
                  MCP/CLI erasures stop queueing (#2446)"
             ),
             Ok(false) => {}

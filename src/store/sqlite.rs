@@ -411,6 +411,12 @@ fn assert_caller_owns_for_mutation(
 
 #[async_trait::async_trait]
 impl MemoryStore for SqliteStore {
+    async fn certify_shutdown(&self) -> StoreResult<()> {
+        let conn = self.state.lock().await;
+        crate::signed_events::try_force_emit_audit_head_witness(&conn).map_err(box_err)?;
+        db::checkpoint(&conn).map_err(box_err)
+    }
+
     async fn write_durability(&self) -> StoreResult<crate::write_receipt::WriteDurability> {
         let conn = self.state.lock().await;
         crate::write_receipt::WriteDurability::sqlite(&conn).map_err(box_err)
