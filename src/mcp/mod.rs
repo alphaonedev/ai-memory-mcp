@@ -54,6 +54,7 @@ pub mod param_names;
 // the handler's fallback branch (empty-success / filter dropped /
 // negative-as-absent / stringy-bool). These helpers refuse instead.
 pub mod param_guard;
+pub mod stdio_drain;
 
 // #3378 unit 2 — inline JSON-Schema `enum` lists for closed MCP string
 // fields (`to` / `edge_type` / `signal_type` / `condition_type` / `state`).
@@ -5221,39 +5222,31 @@ pub fn run_mcp_server(
         }
         let overrun = line_buf.last() != Some(&b'\n') && n > MCP_MAX_LINE_BYTES;
         if overrun {
-            // Drain the rest of this line so the next iteration starts
-            // on a clean boundary. We discard the bytes; this also caps
-            // the drain so a never-ending stream of non-newline bytes
-            // doesn't spin forever in the drain loop.
-            let mut scratch = [0u8; 8192];
-            let mut drained: usize = 0;
-            loop {
-                if drained >= MCP_MAX_DRAIN_BYTES {
-                    // Hard ceiling on drain — close the loop rather than
-                    // serve an infinitely-streaming peer.
-                    let resp = err_response(
-                        Value::Null,
-                        jsonrpc::PARSE_ERROR,
-                        format!(
-                            "parse error: line exceeded {MCP_MAX_LINE_BYTES} bytes \
-                             and drain ceiling {MCP_MAX_DRAIN_BYTES} hit; closing stream"
-                        ),
-                    );
-                    let out = serde_json::to_string(&resp)?;
-                    writeln!(stdout, "{out}")?;
-                    stdout.flush()?;
-                    let _ = db::checkpoint(&conn);
-                    eprintln!("ai-memory MCP server stopped (drain ceiling exceeded)");
-                    return Ok(());
-                }
-                let m = stdin_locked.read(&mut scratch)?;
-                if m == 0 {
-                    break;
-                }
-                drained = drained.saturating_add(m);
-                if scratch[..m].contains(&b'\n') {
-                    break;
-                }
+            // Drain the rest of this line so the next iteration starts on a
+            // clean boundary. #4064 — `drain_oversize_line` consumes through
+            // the offending line's newline ONLY (`fill_buf`/`consume`), so a
+            // request pipelined behind it in the same buffered chunk is
+            // served, not discarded. The drain is capped so a never-ending
+            // stream of non-newline bytes cannot spin here forever.
+            if stdio_drain::drain_oversize_line(&mut stdin_locked, MCP_MAX_DRAIN_BYTES)?
+                == stdio_drain::DrainOutcome::CeilingHit
+            {
+                // Hard ceiling on drain — close the loop rather than
+                // serve an infinitely-streaming peer.
+                let resp = err_response(
+                    Value::Null,
+                    jsonrpc::PARSE_ERROR,
+                    format!(
+                        "parse error: line exceeded {MCP_MAX_LINE_BYTES} bytes \
+                         and drain ceiling {MCP_MAX_DRAIN_BYTES} hit; closing stream"
+                    ),
+                );
+                let out = serde_json::to_string(&resp)?;
+                writeln!(stdout, "{out}")?;
+                stdout.flush()?;
+                let _ = db::checkpoint(&conn);
+                eprintln!("ai-memory MCP server stopped (drain ceiling exceeded)");
+                return Ok(());
             }
             let resp = err_response(
                 Value::Null,
