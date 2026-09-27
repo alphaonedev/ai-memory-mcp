@@ -191,7 +191,7 @@ The sqlite storage layer. The pre-#961 monolithic `src/db.rs` is GONE — split 
 | `open()` | Opens DB, sets WAL mode, creates schema, runs migrations |
 | `insert()` | Upsert on `(title, namespace)` -- never downgrades tier, keeps max priority |
 | `get()` | Fetch by ID |
-| `touch()` | Bump access count, extend TTL, auto-promote mid->long at 5 accesses, reinforce priority every 10 accesses. **Uses BEGIN IMMEDIATE/COMMIT transaction** for atomicity. |
+| `touch()` | Bump access count and last-accessed time, floor-extend the per-tier TTL. Never changes tier or priority (auto-promotion and the priority ladder were removed at v1.0.0, Boids item 1). **Uses BEGIN IMMEDIATE/COMMIT transaction** for atomicity. |
 | `update()` | Partial update of any fields |
 | `delete()` | Delete by ID (links cascade) |
 | `forget()` | Bulk delete by namespace + FTS pattern + tier |

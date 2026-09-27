@@ -782,9 +782,8 @@ Beyond MCP, ai-memory also exposes a full HTTP REST API (103 route registrations
 - **Hybrid recall** -- FTS5 keyword + cosine similarity with adaptive blending: the semantic weight varies 0.50 (short content) → 0.15 (long content) because embeddings lose information on long text
 - **6-factor recall scoring** -- FTS relevance + priority + access frequency + confidence + tier boost + recency decay
 - **Pure recall** -- a recall writes nothing to `memories`; it appends one `recall_observations` ledger row ([#1953](https://github.com/alphaonedev/ai-memory-mcp/issues/1953)). Safe on a read replica, idempotent under retry.
-- **Auto-promotion** -- memories accessed 5+ times promote from mid to long, applied by the fold job
 - **TTL extension** -- a recorded access raises expiry (short +1h, mid +1d; floor-only, never earlier), applied by the fold job
-- **Priority reinforcement** -- +1 every 10 accesses (max 10), applied by the fold job
+- **No popularity escalation** -- recall access never changes a memory's tier or priority; promotion is the explicit `memory_promote` verb and priority changes go through `update`
 - **Contradiction detection** -- warns when storing memories that conflict with existing ones
 - **Deduplication** -- upsert on title+namespace, tier never downgrades
 - **Confidence scoring** -- 0.0-1.0 certainty factored into ranking
@@ -1285,11 +1284,10 @@ score = (fts_relevance * -1)
 
 ### Automatic Behaviors
 
-Recall records the access in the append-only `recall_observations` ledger and returns without touching `memories`. The three ladders below are applied by the periodic **fold job** (`db::fold_recall_accesses`, `AI_MEMORY_ACCESS_FOLD_INTERVAL_SECS`, default 60 s, plus a fold at the top of every GC tick) — so on an MCP-stdio-only deployment with no `ai-memory serve` daemon they do not fire until a gc chokepoint.
+Recall records the access in the append-only `recall_observations` ledger and returns without touching `memories`. The access bookkeeping below (access count, last-accessed time, TTL floor-extend) is applied by the periodic **fold job** (`db::fold_recall_accesses`, `AI_MEMORY_ACCESS_FOLD_INTERVAL_SECS`, default 60 s, plus a fold at the top of every GC tick) — so on an MCP-stdio-only deployment with no `ai-memory serve` daemon it does not apply until a gc chokepoint.
 
 - **TTL extension on a recorded access**: short memories get +1 hour, mid memories get +1 day (floor-only — an access can extend a memory's life, never shorten it)
-- **Auto-promotion**: mid-tier memories accessed 5+ times promote to long (expiry cleared)
-- **Priority reinforcement**: every 10 accesses, priority increases by 1 (capped at 10)
+- **No tier or priority change on access**: recall access extends TTL only; tier promotion and priority changes are explicit operations (`memory_promote`, `update`). The mid→long auto-promotion and the every-10-accesses priority ladder were removed at v1.0.0 (Boids item 1, #3922)
 - **Contradiction detection**: warns when a new memory conflicts with an existing one in the same namespace
 - **Deduplication**: upsert on title+namespace; tier never downgrades on update
 
