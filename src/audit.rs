@@ -866,12 +866,31 @@ pub fn verify_chain_from_reader<R: Read>(reader: R) -> Result<VerifyReport> {
 // Bootstrap — read AppConfig and bring the sink up.
 // ---------------------------------------------------------------------------
 
+/// #3651 — the message the binary prints when it refuses to start because an
+/// ENABLED audit trail could not be initialised (see [`init_from_config`]).
+/// Names the one escape hatch, turning the trail off, because an audit trail
+/// that is enabled but silently absent is the outcome this refusal replaces.
+#[must_use]
+pub fn boot_refusal_message(err: &anyhow::Error) -> String {
+    format!(
+        "ai-memory: refusing to start: [audit] is enabled but the audit trail could not be \
+         initialised: {err:#}\n  Fix the [audit] section in config.toml (or the audit \
+         directory it names), or set [audit].enabled = false to run without the flat audit \
+         trail. `ai-memory doctor` still runs."
+    )
+}
+
 /// Initialise the audit sink from a parsed [`crate::config::AuditConfig`].
-/// Returns `Ok(())` whether or not audit is enabled — it is a no-op when
-/// disabled.
+/// Returns `Ok(())` when audit is disabled (a no-op) or initialised.
+///
+/// The binary REFUSES to start on any `Err` here (#3651, exit 78; `doctor`
+/// excepted), so every error below is a boot refusal, never a silent
+/// "continue without an audit trail".
 ///
 /// # Errors
-/// - The audit directory or file cannot be opened.
+/// - An explicit `schema_version` that is not the binary's emitted version.
+/// - An explicit `hash_chain = false` (the chain is mandatory).
+/// - The audit directory or file cannot be created or opened.
 pub fn init_from_config(cfg: &crate::config::AuditConfig) -> Result<()> {
     if !cfg.enabled.unwrap_or(false) {
         if let Ok(mut guard) = RuntimeContext::global().audit.sink.write() {
