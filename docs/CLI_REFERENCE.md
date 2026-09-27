@@ -271,8 +271,11 @@ error: invalid tier: Long (use short, mid, long)
 and a non-zero exit, on every surface that takes one (`forget`,
 `search`, `list`, `update`, `store`, `mine`, and the MCP
 `memory_forget` / `memory_search` / `memory_list` / `memory_update`
-tools). The refusal happens before the database is opened, so nothing
-is deleted and nothing is returned.
+tools). The CLI verbs refuse before the database is opened (for `store`
+and `update` since #4007 — `store` used to open the database and run its
+expired-row GC first); the MCP tools, whose database is already open,
+refuse before they delete, change or return any memory. Nothing is
+deleted and nothing is returned.
 
 Before v1.0.0 an unrecognised value parsed to "no tier filter", which
 WIDENED the request instead of narrowing it: `forget --tier Long`

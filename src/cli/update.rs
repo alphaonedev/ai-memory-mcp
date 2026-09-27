@@ -83,6 +83,14 @@ pub fn run(
     // v1.0.0 #2572 — REFUSE this write on a Postgres store (see `refuse_pg_store`).
     let db_path = crate::cli::backup::refuse_pg_store(db_path, "update", out)?;
     let db_path = db_path.as_path();
+    // v1.0.0 #3130 — FAIL CLOSED on an unrecognised `--tier`. `None`
+    // means "leave the tier alone" on this path, so a typo silently
+    // NO-OPed the retier the operator asked for and still reported
+    // success (a short-tier row the operator believed was promoted to
+    // long is then GC'd on schedule — the same data-loss class).
+    // #4007 — parsed BEFORE `db::open` (which creates / migrates the
+    // database), so a refused command touches nothing.
+    let tier = Tier::parse_optional(args.tier.as_deref()).map_err(|e| anyhow::anyhow!(e))?;
     let conn = db::open(db_path)?;
     let resolved_id = if db::get(&conn, &args.id)?.is_some() {
         args.id.clone()
@@ -92,12 +100,6 @@ pub fn run(
         writeln!(out.stderr, "{}", crate::errors::msg::not_found(&args.id))?;
         std::process::exit(1);
     };
-    // v1.0.0 #3130 — FAIL CLOSED on an unrecognised `--tier`. `None`
-    // means "leave the tier alone" on this path, so a typo silently
-    // NO-OPed the retier the operator asked for and still reported
-    // success (a short-tier row the operator believed was promoted to
-    // long is then GC'd on schedule — the same data-loss class).
-    let tier = Tier::parse_optional(args.tier.as_deref()).map_err(|e| anyhow::anyhow!(e))?;
     let tags: Option<Vec<String>> = args.tags.as_ref().map(|t| {
         t.split(',')
             .map(|s| s.trim().to_string())

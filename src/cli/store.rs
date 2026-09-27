@@ -242,12 +242,16 @@ pub(crate) fn run_with_curator(
     // v1.0.0 #2572 — REFUSE this write on a Postgres store (see `refuse_pg_store`).
     let db_path = crate::cli::backup::refuse_pg_store(db_path, "store", out)?;
     let db_path = db_path.as_path();
+    // v1.0.0 #3130 — already fail-closed; routed through the shared
+    // `Tier::parse_strict` so the refusal wording is single-sourced.
+    // #4007 — parsed BEFORE `db::open`: the open is followed by
+    // `gc_if_needed`, which archives (or, with `archive_on_gc=false`,
+    // erases) every expired row and commits. A refused command must touch
+    // nothing, as `docs/CLI_REFERENCE.md` promises.
+    let tier = Tier::parse_strict(&args.tier).map_err(|e| anyhow::anyhow!(e))?;
     let conn = db::open(db_path)?;
     let resolved_ttl = app_config.effective_ttl();
     let _ = db::gc_if_needed(&conn, app_config.effective_archive_on_gc());
-    // v1.0.0 #3130 — already fail-closed; routed through the shared
-    // `Tier::parse_strict` so the refusal wording is single-sourced.
-    let tier = Tier::parse_strict(&args.tier).map_err(|e| anyhow::anyhow!(e))?;
     // #1590 — explicit --namespace > configured [storage].default_namespace
     // > git remote > cwd basename > "global" (see `cli::helpers`).
     let namespace = crate::cli::helpers::resolve_namespace(args.namespace);
