@@ -134,6 +134,14 @@ pub struct VerifyArgs {
     /// a non-default identity.
     #[arg(long, value_name = "AGENT_ID")]
     pub forensic_agent_id: Option<String>,
+    /// #4021 — sequence gaps (events sequenced but never written) that the
+    /// operator KNOWS about and accepts, as the exact `FROM-TO` ranges verify
+    /// printed, comma-separated. A gap passes only if it EQUALS a listed
+    /// range; any other gap still fails, so this can never become a blanket
+    /// pass. Unsigned: it records an operational decision, it is not a tamper
+    /// control (see docs/security/audit-trail.md).
+    #[arg(long, value_name = "FROM-TO", value_delimiter = ',')]
+    pub acknowledge_gaps: Vec<crate::audit::SequenceGap>,
 }
 
 #[derive(Args)]
@@ -1107,6 +1115,13 @@ fn run_verify(
         return Ok(0);
     }
     let report = verify_chain(&path)?;
+    // #4021: gaps are reported on EVERY outcome (additive `gaps` +
+    // `gap_count`); the `failure` object keeps its shape and kinds.
+    let gaps_json: Vec<serde_json::Value> = report
+        .gaps
+        .iter()
+        .map(|g| serde_json::json!({"from": g.from, "to": g.to}))
+        .collect();
     if let Some(failure) = &report.first_failure {
         if args.json {
             writeln!(
@@ -1116,10 +1131,12 @@ fn run_verify(
                     "status": "fail",
                     (field_names::TOTAL_LINES): report.total_lines,
                     "failure": {
-                        "line_number": failure.line_number,
+                        (field_names::LINE_NUMBER): failure.line_number,
                         "kind": format!("{:?}", failure.kind),
                         "detail": failure.detail,
                     },
+                    "gaps": gaps_json,
+                    "gap_count": report.gaps.len(),
                     "path": path.display().to_string(),
                 })
             )?;
@@ -1132,22 +1149,92 @@ fn run_verify(
         }
         return Ok(2);
     }
+    // #4021 (5-agent vote 4d3ea1c5, decision 491afb1f): a gap is a lost event
+    // and FAILS by default, as its own class. Only an EXACT acknowledgement
+    // passes it.
+    let unacknowledged = report.unacknowledged_gaps(&args.acknowledge_gaps);
+    if !unacknowledged.is_empty() {
+        let message = crate::audit::lost_events_message(&unacknowledged);
+        if args.json {
+            let missing: Vec<serde_json::Value> = unacknowledged
+                .iter()
+                .map(|g| serde_json::json!({"from": g.from, "to": g.to}))
+                .collect();
+            writeln!(
+                out.stdout,
+                "{}",
+                serde_json::json!({
+                    "status": "fail",
+                    (field_names::TOTAL_LINES): report.total_lines,
+                    "failure": {
+                        (field_names::LINE_NUMBER): serde_json::Value::Null,
+                        "kind": "SequenceGap",
+                        "detail": message,
+                    },
+                    "gaps": gaps_json,
+                    "gap_count": report.gaps.len(),
+                    "unacknowledged_gaps": missing,
+                    "path": path.display().to_string(),
+                })
+            )?;
+        } else {
+            writeln!(out.stderr, "audit verify FAIL: {message}")?;
+        }
+        return Ok(2);
+    }
+    // An acknowledgement that matched nothing is reported, so a stale one
+    // left in a cron line is visible rather than silently inert.
+    let unused: Vec<String> = args
+        .acknowledge_gaps
+        .iter()
+        .filter(|a| !report.gaps.contains(a))
+        .map(ToString::to_string)
+        .collect();
+    let status = if report.gaps.is_empty() {
+        "ok"
+    } else {
+        "ok_acknowledged_gaps"
+    };
     if args.json {
         writeln!(
             out.stdout,
             "{}",
             serde_json::json!({
-                "status": "ok",
+                "status": status,
                 (field_names::TOTAL_LINES): report.total_lines,
+                "gaps": gaps_json,
+                "gap_count": report.gaps.len(),
+                "unmatched_acknowledgements": unused,
                 "path": path.display().to_string(),
             })
         )?;
-    } else {
+    } else if report.gaps.is_empty() {
         writeln!(
             out.stdout,
             "audit verify OK: {} line(s) verified at {}",
             report.total_lines,
             path.display()
+        )?;
+    } else {
+        let ranges = report
+            .gaps
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        writeln!(
+            out.stdout,
+            "audit verify OK WITH ACKNOWLEDGED GAPS: {} line(s) verified at {}; \
+             missing sequence ranges {ranges} were acknowledged as lost events",
+            report.total_lines,
+            path.display()
+        )?;
+    }
+    if !unused.is_empty() {
+        writeln!(
+            out.stderr,
+            "audit verify: --acknowledge-gaps range(s) {} match no gap in this trail",
+            unused.join(",")
         )?;
     }
     Ok(0)
@@ -1225,7 +1312,7 @@ fn run_forensic_verify(
                     "unsigned_lines": report.unsigned_lines,
                     "failure": {
                         "file": failure.file.display().to_string(),
-                        "line_number": failure.line_number,
+                        (field_names::LINE_NUMBER): failure.line_number,
                         "kind": format!("{:?}", failure.kind),
                         "detail": failure.detail,
                     },
@@ -1433,6 +1520,7 @@ mod tests {
                 json: true,
                 since: None,
                 forensic_agent_id: None,
+                acknowledge_gaps: Vec::new(),
             },
             None,
             &cfg,
@@ -1444,6 +1532,84 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(s.trim()).unwrap();
         assert_eq!(v["status"], "ok");
         assert_eq!(v["total_lines"], 3);
+    }
+
+    /// #4021: run `audit verify` over the real-mechanism gapped trail (one
+    /// event lost to a failed write) with the given acknowledgements.
+    fn verify_gapped(json: bool, ack: &[&str]) -> (i32, String, String) {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("audit.log");
+        fs::write(&p, crate::audit::gapped_trail_for_test()).unwrap();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
+        let exit = run_verify(
+            &VerifyArgs {
+                path: Some(p.to_string_lossy().into_owned()),
+                json,
+                since: None,
+                forensic_agent_id: None,
+                acknowledge_gaps: ack.iter().map(|a| a.parse().unwrap()).collect(),
+            },
+            None,
+            &AppConfig::default(),
+            &mut out,
+        )
+        .unwrap();
+        (
+            exit,
+            String::from_utf8(stdout).unwrap(),
+            String::from_utf8(stderr).unwrap(),
+        )
+    }
+
+    /// #4021: pre-fix this trail printed `status: ok`. A gap is a lost event:
+    /// exit 2, its own `SequenceGap` kind, additive `gaps` / `gap_count`.
+    #[test]
+    fn audit_verify_fails_on_an_unacknowledged_gap_4021() {
+        let (exit, stdout, _) = verify_gapped(true, &[]);
+        assert_eq!(exit, 2);
+        let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+        assert_eq!(v["status"], "fail");
+        assert_eq!(v["failure"]["kind"], "SequenceGap");
+        assert_eq!(v["gap_count"], 1);
+        assert_eq!(v["gaps"][0]["from"], 3);
+        assert_eq!(v["gaps"][0]["to"], 3);
+        assert_eq!(v["unacknowledged_gaps"][0]["from"], 3);
+        let detail = v["failure"]["detail"].as_str().unwrap();
+        assert!(detail.contains("--acknowledge-gaps 3-3"), "{detail}");
+    }
+
+    /// #4021: the exact acknowledgement passes, and the pass never reads as a
+    /// plain `ok` (a parser keyed on `"ok"` fails closed).
+    #[test]
+    fn audit_verify_passes_an_exactly_acknowledged_gap_4021() {
+        let (exit, stdout, stderr) = verify_gapped(true, &["3-3"]);
+        assert_eq!(exit, 0, "stderr: {stderr}");
+        let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+        assert_eq!(v["status"], "ok_acknowledged_gaps");
+        assert_eq!(v["gap_count"], 1);
+        let (exit, text, _) = verify_gapped(false, &["3-3"]);
+        assert_eq!(exit, 0);
+        assert!(text.contains("OK WITH ACKNOWLEDGED GAPS"), "{text}");
+    }
+
+    /// #4021: a broad range is not a blanket pass, and a stale range is shown.
+    #[test]
+    fn audit_verify_refuses_a_broad_acknowledgement_4021() {
+        let (exit, stdout, _) = verify_gapped(true, &["1-100"]);
+        assert_eq!(
+            exit, 2,
+            "a range that merely CONTAINS the gap must not pass"
+        );
+        let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+        assert_eq!(v["failure"]["kind"], "SequenceGap");
+        let (exit, _, stderr) = verify_gapped(false, &["3-3", "8-9"]);
+        assert_eq!(exit, 0);
+        assert!(
+            stderr.contains("8-9") && stderr.contains("match no gap"),
+            "{stderr}"
+        );
     }
 
     #[test]
@@ -1464,6 +1630,7 @@ mod tests {
                 json: true,
                 since: None,
                 forensic_agent_id: None,
+                acknowledge_gaps: Vec::new(),
             },
             None,
             &cfg,
@@ -1489,6 +1656,7 @@ mod tests {
                 json: false,
                 since: None,
                 forensic_agent_id: None,
+                acknowledge_gaps: Vec::new(),
             },
             None,
             &cfg,
@@ -1565,6 +1733,7 @@ mod tests {
                 json: true,
                 since: None,
                 forensic_agent_id: None,
+                acknowledge_gaps: Vec::new(),
             }),
             audit_dir: None,
         };
@@ -1860,6 +2029,7 @@ mod tests {
                 json: true,
                 since: None,
                 forensic_agent_id: None,
+                acknowledge_gaps: Vec::new(),
             },
             None,
             &cfg,
@@ -1893,6 +2063,7 @@ mod tests {
                 json: false,
                 since: None,
                 forensic_agent_id: None,
+                acknowledge_gaps: Vec::new(),
             },
             None,
             &cfg,
@@ -1922,6 +2093,7 @@ mod tests {
                 json: false,
                 since: None,
                 forensic_agent_id: None,
+                acknowledge_gaps: Vec::new(),
             },
             None,
             &cfg,
@@ -2094,6 +2266,7 @@ mod tests {
                 json: true,
                 since: Some("2026-01-01".into()),
                 forensic_agent_id: Some("ai:nobody-test".into()),
+                acknowledge_gaps: Vec::new(),
             },
             None,
             &cfg,
@@ -2124,6 +2297,7 @@ mod tests {
                 json: false,
                 since: Some("2026-01-01".into()),
                 forensic_agent_id: None,
+                acknowledge_gaps: Vec::new(),
             },
             None,
             &cfg,
@@ -2154,6 +2328,7 @@ mod tests {
                 json: true,
                 since: Some("not-a-date".into()),
                 forensic_agent_id: None,
+                acknowledge_gaps: Vec::new(),
             },
             None,
             &cfg,
