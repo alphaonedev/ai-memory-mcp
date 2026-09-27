@@ -391,6 +391,13 @@ async fn benign_default_arms_degrade_without_refusing() {
             .await
             .expect("dequarantine default")
     );
+    // #4017 — an adapter that cannot prove the stored bytes are the attested
+    // unit never releases (fail closed), and that is not an error either.
+    assert!(
+        !s.dequarantine_if_attested_unit(&probe_memory())
+            .await
+            .expect("dequarantine_if_attested_unit default")
+    );
     // No watermark → the federation catch-up never short-circuits.
     assert!(
         s.agent_max_created_at("agent-a")

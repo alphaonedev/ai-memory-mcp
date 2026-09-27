@@ -1743,6 +1743,29 @@ pub trait MemoryStore: Send + Sync {
         Ok(false)
     }
 
+    /// #4017 (SEC, containment) — the route-OUT dequarantine-on-attest for the
+    /// federation receive funnels: release the quarantined row `verified.id`
+    /// ONLY when the STORED row is the attested unit
+    /// ([`crate::models::stored_row_is_attested_unit`] against `verified`, the
+    /// row the receiver verified before any receive-side rewrite). The read,
+    /// the comparison and the release are one atomic unit (row lock /
+    /// `BEGIN IMMEDIATE`), so a concurrent write is never released on the
+    /// strength of an attestation over different bytes.
+    ///
+    /// A same-id merge is NOT that proof: it can keep the local content or
+    /// attribution, or store a redacted body — each leaves the row quarantined.
+    ///
+    /// Returns `true` only when a quarantined row was released.
+    ///
+    /// # Errors
+    ///
+    /// Adapter-specific backend error (nothing is released). The default is
+    /// `Ok(false)`: an adapter that cannot prove the stored bytes never
+    /// releases (fail closed).
+    async fn dequarantine_if_attested_unit(&self, _verified: &Memory) -> StoreResult<bool> {
+        Ok(false)
+    }
+
     /// v1.0.0 [#2402] — the OPERATOR release: clear a quarantined row AND
     /// append a `memory.dequarantined` signed event in the SAME transaction.
     ///

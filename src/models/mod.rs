@@ -29,7 +29,7 @@ pub use capture_turn::*;
 pub use checkpoint::*;
 pub use crdt_merge::{
     clamp_inbound_updated_at, merge_memory, reassert_verified_attestation,
-    sanitize_inbound_attestation, stamp_version_vector,
+    sanitize_inbound_attestation, stamp_version_vector, stored_row_is_attested_unit,
 };
 #[allow(unused_imports)]
 pub use crdt_primitives::{OrSet, PnCounter};

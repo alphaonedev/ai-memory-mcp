@@ -699,26 +699,32 @@ pub(super) async fn sync_push_via_store(
                 // LOCAL overlay and whose metadata merge keeps the local
                 // contamination marker — the sqlite funnel now does the same
                 // (R2.2 `get_any`, #3905 closed). The dequarantine below clears a
-                // prior quarantine EXPLICITLY on attest (never a contaminated row).
-                // #3901 — sqlite parity via the SAME shared gate: only when the
-                // row written IS the inbound row. `merge_inbound`'s title-slot
-                // path returns a DIFFERENT local row's id on an inbound id that
-                // is absent locally; the attestation never covered that row.
-                if let Some(target) =
-                    crate::handlers::federation_receive::attest_dequarantine_target(
-                        &to_insert,
-                        &applied_id,
-                    )
-                    && let Err(e) = app.store.dequarantine(target).await
+                // prior quarantine EXPLICITLY on attest (never a contaminated row,
+                // and — #4017 — only when the stored row is the attested unit).
+                // #3901 — sqlite parity via the SAME shared gate: only for the
+                // inbound's OWN id. `merge_inbound`'s title-slot path returns a
+                // DIFFERENT local row's id on an inbound id that is absent
+                // locally; the attestation never covered that row.
+                // #4017 — and only when the STORED row is the attested unit
+                // (same id is not proof: the merge can keep the local content /
+                // attribution or a redacted body). The SAL primitive re-reads
+                // the row `FOR UPDATE` and compares it to `to_insert` in the
+                // same transaction as the release.
+                if crate::handlers::federation_receive::attest_dequarantine_target(
+                    &to_insert,
+                    &applied_id,
+                )
+                .is_some()
+                    && let Err(e) = app.store.dequarantine_if_attested_unit(&to_insert).await
                 {
                     // The merge is committed; the row simply stays
                     // quarantined (fail closed) — surface it, never swallow.
                     tracing::warn!(
                         target: ATTESTATION_TRACE_TARGET,
-                        memory_id = %target,
+                        memory_id = %to_insert.id,
                         error = %e,
                         "sync_push (postgres): route-OUT dequarantine-on-attest failed; \
-                         row stays quarantined (#1948/#3901)"
+                         row stays quarantined (#1948/#3901/#4017)"
                     );
                 }
                 // #3631 — wake the local recipient when this apply delivered

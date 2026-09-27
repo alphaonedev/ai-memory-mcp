@@ -203,6 +203,27 @@ pub fn reassert_verified_attestation(
     merged
 }
 
+/// #4017 (SEC, containment) — does the STORED row provably equal the unit this
+/// node verified? The route-OUT dequarantine-on-attest (#1948) may lift a
+/// quarantine only on a row whose persisted bytes ARE the attested unit: the
+/// same 6-field `SignableWrite` surface (content, title, namespace, memory
+/// kind, `created_at` instant, `agent_id`) and the same non-empty
+/// `write_signature` as `verified` — the exact predicate the #2863 re-assert
+/// uses to decide the persisted row is `agent_attested`.
+///
+/// Same-id identity is NOT that proof: a same-id merge into a quarantined
+/// local row can keep the LOCAL content (the inbound loses LWW), keep the local
+/// `agent_id` (immutable-to-local), or carry a redacted body (secret screen).
+/// Each of those is a mismatch here, so the quarantine stays (fail closed).
+///
+/// `verified` must be the row the receiver verified BEFORE any receive-side
+/// rewrite (in particular before the secret-screen redaction), so a redacted
+/// body never matches.
+#[must_use]
+pub fn stored_row_is_attested_unit(stored: &Memory, verified: &Memory) -> bool {
+    stored.id == verified.id && signed_surface_matches(stored, verified)
+}
+
 /// #2863 — do two rows carry a byte-identical 6-field `SignableWrite` surface
 /// (`agent_id` + `namespace` + `title` + `memory_kind` + `created_at` +
 /// `content`) AND the same non-empty `write_signature`? The signature commits to
@@ -948,6 +969,58 @@ mod tests {
     /// `valid_until`, newer `updated_at`) replaces the local OPEN value
     /// (`None`); a stale remote open (`None`, older `updated_at`) does NOT
     /// clobber a fresher local close; `valid_from` stays LOCAL-immutable.
+    /// #4017 — the release predicate: the stored row must BE the signed unit.
+    /// Same id alone never suffices; every signed-surface field and the
+    /// signature must match, and the id must match too.
+    #[test]
+    fn stored_row_is_attested_unit_requires_the_full_signed_unit_4017() {
+        let mut signed = base("m-4017", "2026-01-02T00:00:00Z");
+        signed.metadata = json!({"agent_id": "ai:alice", "write_signature": "c2ln"});
+        assert!(stored_row_is_attested_unit(&signed, &signed));
+
+        let mut local_text = signed.clone();
+        local_text.content = "retained local text".to_string();
+        assert!(
+            !stored_row_is_attested_unit(&local_text, &signed),
+            "LWW loser"
+        );
+
+        let mut local_author = signed.clone();
+        local_author.metadata["agent_id"] = json!("ai:mallory");
+        assert!(
+            !stored_row_is_attested_unit(&local_author, &signed),
+            "local agent_id"
+        );
+
+        let mut local_genesis = signed.clone();
+        local_genesis.created_at = "2025-01-01T00:00:00Z".to_string();
+        assert!(
+            !stored_row_is_attested_unit(&local_genesis, &signed),
+            "min created_at"
+        );
+
+        let mut unsigned = signed.clone();
+        unsigned.metadata = json!({"agent_id": "ai:alice"});
+        assert!(
+            !stored_row_is_attested_unit(&unsigned, &unsigned),
+            "no signature"
+        );
+
+        let mut other_id = signed.clone();
+        other_id.id = "m-other".to_string();
+        assert!(
+            !stored_row_is_attested_unit(&other_id, &signed),
+            "different row"
+        );
+
+        // A non-surface field (e.g. the node-local lifecycle overlay or a
+        // max-merged counter) does not make the stored row a different unit.
+        let mut overlay = signed.clone();
+        overlay.lifecycle_state = LifecycleState::Quarantined;
+        overlay.priority = 9;
+        assert!(stored_row_is_attested_unit(&overlay, &signed));
+    }
+
     #[test]
     fn merge_memory_valid_until_close_wins_and_valid_from_local() {
         // (a) remote-newer close wins over local open.

@@ -21227,6 +21227,54 @@ impl MemoryStore for PostgresStore {
         self.dequarantine_raw(id).await
     }
 
+    /// #4017 (SEC, containment) — attested-unit-gated route-OUT dequarantine
+    /// (postgres twin of [`crate::storage::dequarantine_if_attested_unit`]).
+    /// The row is read `FOR UPDATE` inside ONE transaction that also carries
+    /// the guarded release, so the stored bytes compared are the bytes
+    /// released — a write racing in after the merge is either seen here or
+    /// waits. `row_to_memory` opens a sealed envelope (plaintext compare) and
+    /// fails closed on an undecryptable one (nothing released).
+    async fn dequarantine_if_attested_unit(&self, verified: &Memory) -> StoreResult<bool> {
+        self.gate_record_stop().await?;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("dequarantine_if_attested_unit begin tx", e))?;
+        let row = sqlx::query(&SQL_SELECT_MEMORY_ROW_BY_ID_FOR_UPDATE)
+            .bind(&verified.id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("dequarantine_if_attested_unit select", e))?;
+        // No row, a non-quarantined row, or a row that is not the attested
+        // unit: nothing to release (the transaction rolls back on drop).
+        let Some(row) = row else {
+            return Ok(false);
+        };
+        let stored = Self::row_to_memory(&row)?;
+        if stored.lifecycle_state != crate::models::LifecycleState::Quarantined {
+            return Ok(false);
+        }
+        if !crate::models::stored_row_is_attested_unit(&stored, verified) {
+            crate::storage::warn_attest_release_refused(&verified.id);
+            return Ok(false);
+        }
+        let res = sqlx::query(
+            "UPDATE memories SET lifecycle_state = $1, updated_at = NOW(), version = version + 1 \
+             WHERE id = $2 AND lifecycle_state = $3",
+        )
+        .bind(crate::models::LifecycleState::Open.as_str())
+        .bind(&verified.id)
+        .bind(crate::models::LifecycleState::Quarantined.as_str())
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("dequarantine_if_attested_unit update", e))?;
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("dequarantine_if_attested_unit commit", e))?;
+        Ok(res.rows_affected() > 0)
+    }
+
     /// v1.0.0 #2402 — the AUDITED operator release (postgres twin). ONE
     /// transaction carries the guarded `UPDATE` out of `quarantined` and the
     /// `memory.dequarantined` chain row, so this backend cannot silently ship

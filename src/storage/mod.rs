@@ -4149,6 +4149,71 @@ pub fn dequarantine(conn: &Connection, id: &str) -> Result<bool> {
     Ok(n > 0)
 }
 
+/// #4017 (SEC, containment) — the route-OUT dequarantine-on-attest (#1948),
+/// gated on the STORED row being the attested unit.
+///
+/// Pre-#4017 the receive funnel called [`dequarantine`] whenever the id
+/// `merge_inbound` returned equalled the inbound id. Same id is not proof: a
+/// same-id merge into a quarantined local row keeps the LOCAL content when the
+/// inbound loses LWW, keeps the local `agent_id`, and stores a redacted body
+/// when the secret screen fires — so the release could un-hide content the
+/// attestation never covered.
+///
+/// This reads the row back by id and releases it ONLY when
+/// [`crate::models::stored_row_is_attested_unit`] holds against `verified` (the
+/// row the receiver verified, before any receive-side rewrite). The read, the
+/// comparison and the release share one `BEGIN IMMEDIATE` transaction, so a
+/// write that lands between the merge and this call is either seen here or
+/// waits — the release is never decided from a stale copy. An undecryptable
+/// row is an `Err` (the full-row mapper fails closed) and stays quarantined.
+///
+/// Returns `true` only when a quarantined row was released.
+///
+/// # Errors
+/// Propagates the record-stop refusal and any `rusqlite` read/update error;
+/// on error nothing is released.
+pub fn dequarantine_if_attested_unit(conn: &Connection, verified: &Memory) -> Result<bool> {
+    crate::storage::record_stop::gate_storage_conn(conn)?;
+    let write_txn = connection::WriteTxn::begin(conn)?;
+    let decided = (|| -> Result<bool> {
+        let Some(stored) = get_any(conn, &verified.id)? else {
+            return Ok(false);
+        };
+        if stored.lifecycle_state != crate::models::LifecycleState::Quarantined {
+            return Ok(false);
+        }
+        if !crate::models::stored_row_is_attested_unit(&stored, verified) {
+            warn_attest_release_refused(&verified.id);
+            return Ok(false);
+        }
+        dequarantine(conn, &verified.id)
+    })();
+    match decided {
+        Ok(released) => {
+            write_txn.commit()?;
+            Ok(released)
+        }
+        Err(e) => {
+            write_txn.rollback();
+            Err(e)
+        }
+    }
+}
+
+/// #4017 — the ONE refusal signal for a same-id attested push whose stored row
+/// is not the attested unit, emitted by both backends' release primitive.
+/// Names the id only (never content).
+pub(crate) fn warn_attest_release_refused(id: &str) {
+    tracing::warn!(
+        target: decontaminate::QUARANTINE_TRACE_TARGET,
+        memory_id = %id,
+        "federation receive: attested inbound shares the id of a QUARANTINED row, but the \
+         stored row is not the attested unit (the merge kept local content/attribution, or \
+         the body was redacted) — route-OUT dequarantine refused, row stays quarantined \
+         (#4017 fail-closed)"
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn update(
     conn: &Connection,

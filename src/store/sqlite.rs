@@ -891,6 +891,15 @@ impl MemoryStore for SqliteStore {
         db::dequarantine(&conn, id).map_err(box_err)
     }
 
+    /// #4017 — attested-unit-gated route-OUT dequarantine (delegates to
+    /// [`crate::storage::dequarantine_if_attested_unit`]).
+    async fn dequarantine_if_attested_unit(&self, verified: &Memory) -> StoreResult<bool> {
+        // Wave-2 B5 — route-OUT dequarantine is a record-plane mutation.
+        self.gate_record_stop()?;
+        let conn = self.state.lock().await;
+        db::dequarantine_if_attested_unit(&conn, verified).map_err(box_err)
+    }
+
     /// v1.0.0 #2402 — the AUDITED operator release. Delegates to the sqlite
     /// reference free fn [`db::operator_dequarantine`], which carries the
     /// guarded `UPDATE` out of `quarantined` and the `memory.dequarantined`
