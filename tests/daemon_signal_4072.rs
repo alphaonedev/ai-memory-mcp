@@ -83,9 +83,6 @@ fn final_witness_persistence_failure_exits_75() {
 fn exercise_shutdown(signal: &str, postgres_url: Option<&str>, anchor_fault: bool) {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("daemon.db");
-    let config_dir = dir.path().join("config/ai-memory");
-    std::fs::create_dir_all(&config_dir).unwrap();
-    std::fs::write(config_dir.join("config.toml"), "tier = \"keyword\"\n").unwrap();
     let log = dir.path().join("daemon.log");
     let custody = dir.path().join("witness");
     let key =
@@ -118,7 +115,7 @@ fn exercise_shutdown(signal: &str, postgres_url: Option<&str>, anchor_fault: boo
             .env_clear()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("TMPDIR", std::env::var_os("TMPDIR").unwrap())
-            .env("XDG_CONFIG_HOME", dir.path().join("config"))
+            .env("AI_MEMORY_NO_CONFIG", "1")
             .env("XDG_CACHE_HOME", dir.path().join("cache"))
             .env("AI_MEMORY_AUDIT_DIR", dir.path().join("audit"))
             .env(ai_memory::governance::audit::WITNESS_KEY_DIR_ENV, &custody)
