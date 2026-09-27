@@ -29,6 +29,11 @@ const GATE_MARKERS: &[&str] = &[
     "gate_record_stop",
     "refuse_if_record_stopped",
     "record_stop_status",
+    // R4-G2: the SAL record-stop primitive (`store::record_stop::gate_flag`)
+    // that pg `gate_record_stop` wraps. Pre-R4-G2 the in-transaction wrapper
+    // `gate_record_stop_in_transaction` "counted" only because its name
+    // CONTAINS `gate_record_stop`; it is now proven by its own call to this.
+    "gate_flag",
 ];
 
 /// Functions that MUST be gated (the B7 enumerated siblings). If any of
@@ -174,6 +179,23 @@ fn is_item_boundary_line(line: &str, fn_indent: usize) -> bool {
     t.starts_with("const ") || t.starts_with("static ") || t.starts_with("mod ")
 }
 
+/// R4-G2 — strip an `extern` qualifier with or without an ABI string
+/// (`extern "C" `, `extern "system" `, bare `extern `). Before this an
+/// `extern "C" fn` was not a function start at all, so the preceding
+/// function's slice ran into it and borrowed its gate.
+fn strip_extern_abi(t: &str) -> Option<&str> {
+    let rest = t.strip_prefix("extern")?;
+    if let Some(r) = rest.strip_prefix(' ') {
+        let r = r.trim_start();
+        if let Some(q) = r.strip_prefix('"') {
+            let close = q.find('"')?;
+            return Some(q[close + 1..].trim_start());
+        }
+        return Some(r);
+    }
+    None
+}
+
 fn is_fn_start(line: &str) -> Option<(usize, String)> {
     let indent = line.len() - line.trim_start().len();
     // #3934 — recognise ANY visibility (incl. `pub(super)`/`pub(self)`/
@@ -186,7 +208,8 @@ fn is_fn_start(line: &str) -> Option<(usize, String)> {
         let next = t
             .strip_prefix("const ")
             .or_else(|| t.strip_prefix("unsafe "))
-            .or_else(|| t.strip_prefix("async "));
+            .or_else(|| t.strip_prefix("async "))
+            .or_else(|| strip_extern_abi(t));
         match next {
             Some(rest) => t = rest.trim_start(),
             None => break,
@@ -273,42 +296,264 @@ fn rel_src(path: &Path, root: &Path) -> String {
         .replace('\\', "/")
 }
 
-/// #4052 — the ONE function-boundary routine every B7 slicer uses. Returns
-/// `(start, end, name)` for each function start `start_of` recognises, where
-/// a body runs from its own start line up to (not including) the NEXT
-/// recognised start, or to the end of the text. Before #4052 the parity
-/// helper [`fn_body_has_gate`] kept its own ad-hoc boundary (`\n    async fn `
-/// or `\npub fn ` only), so a following indented sync fn or a
-/// `pub(restricted)` fn did not end the body and the NEXT function's gate was
-/// credited to an ungated parity target.
+/// R4-G2 — a copy of `text` in which every comment and every string / char
+/// literal body is blanked to spaces, line structure preserved (an escaped
+/// newline inside a string keeps its `\n`). Function boundaries (braces,
+/// `;`) and gate CALLS are read from this mask, so a brace, a `fn`, or a
+/// gate name inside a comment or a string literal can neither end a body
+/// nor count as a gate (before R4-G2 `// TODO: gate_record_stop();` and a
+/// `const EXPLANATION: &str = "gate_record_stop ..."` both "gated" an
+/// ungated write fn). Handles `//`, nested `/* */`, `"…"` with escapes, raw
+/// strings `r#"…"#` (and `br`), and char literals vs lifetimes.
+fn code_mask(text: &str) -> String {
+    let c: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let blank = |out: &mut String, ch: char| out.push(if ch == '\n' { '\n' } else { ' ' });
+    let is_ident = |ch: char| ch.is_alphanumeric() || ch == '_';
+    let mut i = 0;
+    while i < c.len() {
+        let ch = c[i];
+        let next = c.get(i + 1).copied();
+        if ch == '/' && next == Some('/') {
+            while i < c.len() && c[i] != '\n' {
+                blank(&mut out, c[i]);
+                i += 1;
+            }
+            continue;
+        }
+        if ch == '/' && next == Some('*') {
+            let mut depth = 0usize;
+            while i < c.len() {
+                if c[i] == '/' && c.get(i + 1) == Some(&'*') {
+                    depth += 1;
+                    out.push_str("  ");
+                    i += 2;
+                } else if c[i] == '*' && c.get(i + 1) == Some(&'/') {
+                    depth -= 1;
+                    out.push_str("  ");
+                    i += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                } else {
+                    blank(&mut out, c[i]);
+                    i += 1;
+                }
+            }
+            continue;
+        }
+        let prev_ident = i > 0 && is_ident(c[i - 1]);
+        // Raw string: r"…", r#"…"#, br#"…"# (not an identifier ending in r).
+        let raw_at = if ch == 'r' && !prev_ident {
+            Some(i + 1)
+        } else if ch == 'b' && next == Some('r') && !prev_ident {
+            Some(i + 2)
+        } else {
+            None
+        };
+        if let Some(mut j) = raw_at {
+            let mut hashes = 0usize;
+            while c.get(j) == Some(&'#') {
+                hashes += 1;
+                j += 1;
+            }
+            if c.get(j) == Some(&'"') {
+                for &k in &c[i..=j] {
+                    out.push(k);
+                }
+                i = j + 1;
+                while i < c.len() {
+                    if c[i] == '"' && (1..=hashes).all(|h| c.get(i + h) == Some(&'#')) {
+                        out.push('"');
+                        out.extend(std::iter::repeat_n('#', hashes));
+                        i += 1 + hashes;
+                        break;
+                    }
+                    blank(&mut out, c[i]);
+                    i += 1;
+                }
+                continue;
+            }
+        }
+        if ch == '"' {
+            out.push('"');
+            i += 1;
+            while i < c.len() {
+                if c[i] == '\\' {
+                    blank(&mut out, c[i]);
+                    if let Some(&e) = c.get(i + 1) {
+                        blank(&mut out, e);
+                    }
+                    i += 2;
+                    continue;
+                }
+                if c[i] == '"' {
+                    out.push('"');
+                    i += 1;
+                    break;
+                }
+                blank(&mut out, c[i]);
+                i += 1;
+            }
+            continue;
+        }
+        if ch == '\'' {
+            // Char literal ('x', '\n', '\u{..}') vs lifetime ('a).
+            let is_char = next == Some('\\') || c.get(i + 2) == Some(&'\'');
+            if is_char {
+                out.push('\'');
+                i += 1;
+                while i < c.len() {
+                    if c[i] == '\\' {
+                        out.push_str("  ");
+                        i += 2;
+                        continue;
+                    }
+                    if c[i] == '\'' {
+                        out.push('\'');
+                        i += 1;
+                        break;
+                    }
+                    blank(&mut out, c[i]);
+                    i += 1;
+                }
+                continue;
+            }
+        }
+        out.push(ch);
+        i += 1;
+    }
+    out
+}
+
+/// R4-G2 — does this MASKED line CALL a gate? A marker counts only as an
+/// identifier (not a suffix of a longer one, not followed by more
+/// identifier characters) immediately followed by `(` or a `::<` turbofish.
+/// A bare mention (a doc link, a fn pointer) is not a call.
+fn line_calls_gate(masked: &str, wrappers: &[String]) -> bool {
+    let is_ident = |ch: char| ch.is_alphanumeric() || ch == '_';
+    GATE_MARKERS
+        .iter()
+        .copied()
+        .chain(wrappers.iter().map(String::as_str))
+        .any(|g| {
+            masked.match_indices(g).any(|(pos, _)| {
+                let before_ok = masked[..pos]
+                    .chars()
+                    .next_back()
+                    .is_none_or(|ch| !is_ident(ch));
+                let after = &masked[pos + g.len()..];
+                before_ok && (after.starts_with('(') || after.starts_with("::<"))
+            })
+        })
+}
+
+/// R4-G2 — same-file gate WRAPPERS: a fn named `<marker>_<suffix>` (e.g.
+/// `gate_record_stop_actions`, `gate_record_stop_in_transaction`) counts as
+/// a gate only when its OWN span calls a gate (a marker or an already
+/// proven wrapper). Pre-R4-G2 any identifier merely CONTAINING a marker
+/// counted, proven or not.
+fn gate_wrappers(masked: &[&str], spans: &[(usize, usize, String)]) -> Vec<String> {
+    let mut wrappers: Vec<String> = Vec::new();
+    loop {
+        let before = wrappers.len();
+        for (s, e, name) in spans {
+            let named = GATE_MARKERS
+                .iter()
+                .any(|g| name.strip_prefix(g).is_some_and(|r| r.starts_with('_')));
+            if named && !wrappers.contains(name) && span_has_gate(masked, spans, *s, *e, &wrappers)
+            {
+                wrappers.push(name.clone());
+            }
+        }
+        if wrappers.len() == before {
+            return wrappers;
+        }
+    }
+}
+
+/// #4052 + R4-G2 — the ONE function-boundary routine every B7 slicer uses.
+/// Returns `(start, end, name)` for each function start `start_of`
+/// recognises on the MASKED lines, where `end` is one past the line holding
+/// the function's REAL closing brace (brace-matched on the mask, so braces
+/// in comments/strings are ignored), or one past the `;` of a body-less
+/// declaration. Before R4-G2 a body ran to the NEXT recognised start, so an
+/// unrecognised following item (an `extern "C" fn`, a `const`) was absorbed
+/// and its gate credited to the ungated function before it. An unterminated
+/// body runs to the end of the text.
 fn fn_spans(
-    lines: &[&str],
+    masked: &[&str],
     start_of: impl Fn(&str) -> Option<(usize, String)>,
 ) -> Vec<(usize, usize, String)> {
-    let starts: Vec<(usize, String)> = lines
-        .iter()
-        .enumerate()
-        .filter_map(|(i, l)| start_of(l).map(|(_, n)| (i, n)))
-        .collect();
-    starts
-        .iter()
-        .enumerate()
-        .map(|(k, (s, n))| {
-            let end = starts.get(k + 1).map_or(lines.len(), |(e, _)| *e);
-            (*s, end, n.clone())
-        })
-        .collect()
+    let mut spans = Vec::new();
+    for (s, line) in masked.iter().enumerate() {
+        let Some((_, name)) = start_of(line) else {
+            continue;
+        };
+        let mut paren = 0i64;
+        let mut brace = 0i64;
+        let mut opened = false;
+        let mut end = masked.len();
+        'scan: for (j, l) in masked.iter().enumerate().skip(s) {
+            for ch in l.chars() {
+                if opened {
+                    match ch {
+                        '{' => brace += 1,
+                        '}' => {
+                            brace -= 1;
+                            if brace == 0 {
+                                end = j + 1;
+                                break 'scan;
+                            }
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+                match ch {
+                    '(' | '[' => paren += 1,
+                    ')' | ']' => paren -= 1,
+                    '{' if paren == 0 => {
+                        opened = true;
+                        brace = 1;
+                    }
+                    ';' if paren == 0 => {
+                        end = j + 1;
+                        break 'scan;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        spans.push((s, end, name));
+    }
+    spans
 }
 
-/// The span of the function enclosing line `idx` (the nearest recognised
-/// start at or before it), per [`fn_spans`].
+/// The INNERMOST span containing line `idx` (a write inside a nested fn is
+/// that nested fn's), or `None` when `idx` is outside every function.
 fn enclosing_span(spans: &[(usize, usize, String)], idx: usize) -> Option<&(usize, usize, String)> {
-    spans.iter().rev().find(|(s, _, _)| *s <= idx)
+    spans
+        .iter()
+        .filter(|(s, e, _)| *s <= idx && idx < *e)
+        .max_by_key(|(s, _, _)| *s)
 }
 
-fn body_has_gate(body: &[&str]) -> bool {
-    body.iter()
-        .any(|l| GATE_MARKERS.iter().any(|g| l.contains(g)))
+/// Does span `(s, e)` itself CALL a gate? Lines of NESTED fn spans are
+/// excluded — a nested helper's gate is the helper's, not the outer fn's.
+fn span_has_gate(
+    masked: &[&str],
+    spans: &[(usize, usize, String)],
+    s: usize,
+    e: usize,
+    wrappers: &[String],
+) -> bool {
+    (s..e).any(|k| {
+        let nested = spans
+            .iter()
+            .any(|(ns, ne, _)| *ns > s && *ne <= e && *ns <= k && k < *ne);
+        !nested && line_calls_gate(masked[k], wrappers)
+    })
 }
 
 /// #4052 — gate verdict of EVERY production function named exactly `fn_name`
@@ -322,11 +567,14 @@ fn fn_gate_verdicts(
     start_of: impl Fn(&str) -> Option<(usize, String)>,
 ) -> Vec<bool> {
     let text = join_string_continuations(strip_test_mod(src));
-    let lines: Vec<&str> = text.lines().collect();
-    fn_spans(&lines, start_of)
+    let mask = code_mask(&text);
+    let masked: Vec<&str> = mask.lines().collect();
+    let spans = fn_spans(&masked, start_of);
+    let wrappers = gate_wrappers(&masked, &spans);
+    spans
         .iter()
         .filter(|(_, _, n)| n == fn_name)
-        .map(|(s, e, _)| body_has_gate(&lines[*s..*e]))
+        .map(|(s, e, _)| span_has_gate(&masked, &spans, *s, *e, &wrappers))
         .collect()
 }
 
@@ -376,20 +624,26 @@ fn ungated_write_fns_for(
     classify: impl Fn(&str) -> bool,
 ) -> Vec<String> {
     let lines: Vec<&str> = text.lines().collect();
-    let spans = fn_spans(&lines, start_of);
+    let mask = code_mask(text);
+    let masked: Vec<&str> = mask.lines().collect();
+    let spans = fn_spans(&masked, start_of);
+    let wrappers = gate_wrappers(&masked, &spans);
     let mut out = Vec::new();
     let mut seen = HashSet::new();
     for (idx, line) in lines.iter().enumerate() {
         if !classify(line) {
             continue;
         }
+        // R4-G2: a write outside every recognised fn is reported, never
+        // silently dropped (fail closed).
         let Some((start, end, name)) = enclosing_span(&spans, idx) else {
+            out.push(format!("<no enclosing fn @{}>", idx + 1));
             continue;
         };
         if !seen.insert(name.clone()) {
             continue;
         }
-        if !body_has_gate(&lines[*start..*end]) {
+        if !span_has_gate(&masked, &spans, *start, *end, &wrappers) {
             out.push(name.clone());
         }
     }
@@ -469,8 +723,10 @@ fn b7_scanner_sees_pub_restricted_write_fns_3934() {
     );
 
     // R-203 — the frozen pre-fix predicate reproduces the blind spot: it does
-    // NOT recognise the pub(super)/pub(in ..) fn starts, so their writes merge
-    // into the preceding gated fn and are read as gated (accepted, not flagged).
+    // NOT recognise the pub(super)/pub(in ..) fn starts, so it can never flag
+    // them BY NAME. (Pre-R4-G2 their writes merged into the preceding gated
+    // fn and read as gated; with brace-matched spans they now surface only
+    // as `<no enclosing fn>` — still not the named function.)
     let frozen = ungated_write_fns_for(planted, is_fn_start_prefix_frozen, write_sql_line);
     assert!(
         !frozen.contains(&"plant_pub_super_ungated".to_string())
@@ -678,6 +934,114 @@ impl PostgresStore {
     );
 }
 
+/// R4-G2 — a gate counts only when the TARGET function itself CALLS it.
+/// Sensitivity (each must read UNGATED, on the parity read, the twin read
+/// and the main-scanner core): an ungated write fn followed by a gated
+/// `extern "C" fn`; followed by a `const` whose string mentions a gate;
+/// with the gate only in a `//` comment, a `/* */` comment or a string
+/// literal; and with the gate only inside a NESTED helper fn. Specificity
+/// (each must read GATED): a real call after a nested helper, a real call
+/// on a line that also carries a brace-bearing string, and a `::<T>`
+/// turbofish call. Fail-closed: a write outside every fn is reported.
+#[test]
+fn b7_gate_must_be_called_by_the_target_itself_r4_g2() {
+    let ungated_plants = [
+        (
+            "following extern fn",
+            "impl Store {\n    async fn set_embeddings_batch(&self) {\n        execute(\"UPDATE memories SET x = 1\");\n    }\n    extern \"C\" fn helper() { gate_record_stop(); }\n}",
+        ),
+        (
+            "following const mention",
+            "impl Store {\n    async fn set_embeddings_batch(&self) {\n        execute(\"UPDATE memories SET x = 1\");\n    }\n    const EXPLANATION: &str = \"gate_record_stop is required here\";\n}",
+        ),
+        (
+            "line comment",
+            "impl Store {\n    async fn set_embeddings_batch(&self) {\n        // TODO: gate_record_stop();\n        execute(\"UPDATE memories SET x = 1\");\n    }\n}",
+        ),
+        (
+            "block comment",
+            "impl Store {\n    async fn set_embeddings_batch(&self) {\n        /* gate_record_stop(); { */\n        execute(\"UPDATE memories SET x = 1\");\n    }\n}",
+        ),
+        (
+            "string literal",
+            "impl Store {\n    async fn set_embeddings_batch(&self) {\n        log(\"call gate_record_stop() first }\");\n        execute(\"UPDATE memories SET x = 1\");\n    }\n}",
+        ),
+        (
+            "nested helper only",
+            "impl Store {\n    async fn set_embeddings_batch(&self) {\n        fn inner() { gate_record_stop(); }\n        execute(\"UPDATE memories SET x = 1\");\n    }\n}",
+        ),
+        (
+            "raw string mention",
+            "impl Store {\n    async fn set_embeddings_batch(&self) {\n        let _s = r#\"gate_record_stop(); \"}\"#;\n        execute(\"UPDATE memories SET x = 1\");\n    }\n}",
+        ),
+    ];
+    for (label, plant) in ungated_plants {
+        assert!(
+            !fn_body_has_gate(plant, "set_embeddings_batch"),
+            "sensitivity ({label}): parity read credited a gate the target never calls"
+        );
+        assert!(
+            !fn_any_body_has_gate(plant, "set_embeddings_batch"),
+            "sensitivity ({label}): twin read credited a gate the target never calls"
+        );
+        let core = ungated_write_fns_for(plant, is_fn_start, write_sql_line);
+        assert!(
+            core.iter().any(|n| n == "set_embeddings_batch"),
+            "sensitivity ({label}): the main-scanner core must flag the target (got {core:?})"
+        );
+    }
+
+    let gated_plants = [
+        (
+            "call after a nested helper",
+            "impl Store {\n    async fn set_embeddings_batch(&self) {\n        fn inner() -> u8 { 1 }\n        self.gate_record_stop().await?;\n        execute(\"UPDATE memories SET x = 1\");\n    }\n}",
+        ),
+        (
+            "call beside a brace-bearing string",
+            "impl Store {\n    async fn set_embeddings_batch(&self) {\n        let _t = \"{\"; gate_storage_conn(&c)?;\n        execute(\"UPDATE memories SET x = 1\");\n    }\n}",
+        ),
+        (
+            "turbofish call",
+            "impl Store {\n    async fn set_embeddings_batch(&self) {\n        record_stop_status::<Db>(&c)?;\n        execute(\"UPDATE memories SET x = 1\");\n    }\n}",
+        ),
+        (
+            "call split from its await",
+            "impl Store {\n    async fn set_embeddings_batch(&self) {\n        self.gate_record_stop()\n            .await?;\n        execute(\"UPDATE memories SET x = 1\");\n    }\n}",
+        ),
+    ];
+    for (label, plant) in gated_plants {
+        assert!(
+            fn_body_has_gate(plant, "set_embeddings_batch"),
+            "specificity ({label}): a real gate call must be credited"
+        );
+        let core = ungated_write_fns_for(plant, is_fn_start, write_sql_line);
+        assert!(
+            !core.iter().any(|n| n == "set_embeddings_batch"),
+            "specificity ({label}): the core must not flag a gated target (got {core:?})"
+        );
+    }
+
+    // Wrappers: a proven same-file wrapper is a gate; an UNPROVEN one (its
+    // own body never calls a gate) is not.
+    let proven = "fn gate_record_stop_actions(c: &C) -> R { gate_storage_conn_rusqlite(c) }\nfn create(c: &C) -> R {\n    gate_record_stop_actions(c)?;\n    c.execute(\"INSERT INTO actions VALUES (1)\")\n}\n";
+    assert!(
+        fn_body_has_gate(proven, "create"),
+        "specificity: a proven gate wrapper must be credited"
+    );
+    let unproven = "fn gate_record_stop_actions(c: &C) -> R { Ok(()) }\nfn create(c: &C) -> R {\n    gate_record_stop_actions(c)?;\n    c.execute(\"INSERT INTO actions VALUES (1)\")\n}\n";
+    assert!(
+        !fn_body_has_gate(unproven, "create"),
+        "sensitivity: a wrapper whose body never calls a gate must NOT be credited"
+    );
+
+    let outside = "static Q: &[&str] = &[];\nmacro_rules! m { () => { execute(\"DELETE FROM memories\") } }\n";
+    let core = ungated_write_fns_for(outside, is_fn_start, write_sql_line);
+    assert!(
+        core.iter().any(|n| n.starts_with("<no enclosing fn")),
+        "fail-closed: a write outside every fn must be reported, not dropped (got {core:?})"
+    );
+}
+
 #[test]
 fn record_stop_write_sql_fns_are_gated_or_allowlisted_b7() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -717,13 +1081,31 @@ fn record_stop_write_sql_fns_are_gated_or_allowlisted_b7() {
         // Pair every write-SQL line with the nearest preceding `fn`
         // (impl methods sit at indent 4; do not swallow them as nested
         // inside an earlier indent-0 helper).
-        let spans = fn_spans(&lines, is_fn_start);
+        let mask = code_mask(&text);
+        let masked: Vec<&str> = mask.lines().collect();
+        let spans = fn_spans(&masked, is_fn_start);
+        let wrappers = gate_wrappers(&masked, &spans);
         let mut seen: HashSet<(String, String)> = HashSet::new();
         for (idx, line) in lines.iter().enumerate() {
             if !write_sql_line(line) {
                 continue;
             }
             let Some(&(start, end, ref name)) = enclosing_span(&spans, idx) else {
+                // R4-G2: outside every fn. Write SQL held in a module/impl
+                // `const`/`static` item is the #3484 case (the executor is
+                // #3485); anything else is reported, never dropped.
+                let prev_end = spans
+                    .iter()
+                    .filter(|(_, e, _)| *e <= idx)
+                    .map(|(_, e, _)| *e)
+                    .max()
+                    .unwrap_or(0);
+                let in_item = lines[prev_end..=idx]
+                    .iter()
+                    .any(|&l| is_item_boundary_line(l, usize::MAX));
+                if !in_item {
+                    ungated.push((rel.clone(), "<no enclosing fn>".to_string(), idx + 1));
+                }
                 continue;
             };
             // #3484 — write SQL held in a module/impl-level `const`/`static`
@@ -748,7 +1130,7 @@ fn record_stop_write_sql_fns_are_gated_or_allowlisted_b7() {
             {
                 continue;
             }
-            if body_has_gate(&lines[start..end]) {
+            if span_has_gate(&masked, &spans, start, end, &wrappers) {
                 if let Some(flag) = gated_hits.get_mut(name) {
                     *flag = true;
                 }

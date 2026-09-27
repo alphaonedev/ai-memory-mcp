@@ -683,10 +683,16 @@ read_list() {
     [ -f "$file" ] || return 0
     while IFS= read -r line || [ -n "$line" ]; do
         line="${line%$'\r'}"
-        case "$(printf '%s' "$line" | sed -e 's/^[[:space:]]*//')" in
+        # R4-G1 sibling: trim ONLY ASCII space and tab. The old
+        # `sed [[:space:]]` trim was locale-dependent and, under a UTF-8
+        # locale, erased a leading/trailing U+2003/U+00A0 — so a mirror name
+        # "<U+2003>Classify changes" matched the job "Classify changes".
+        line="${line#"${line%%[!$' \t']*}"}"
+        line="${line%"${line##*[!$' \t']}"}"
+        case "$line" in
             '' | '#'*) continue ;;
         esac
-        printf '%s\n' "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
+        printf '%s\n' "$line"
     done < "$file"
 }
 
@@ -1063,6 +1069,12 @@ run_gate() {
     # into the mirror in the same commit; a declaration that lands first
     # fails check-required-contexts-live.sh. Comments are scanned too — the
     # wrong order was first taught in this file's header.
+    # R4-G3: the ledger must not claim to be empty while it holds entries —
+    # "every job is declared required" is then a false enforcement claim.
+    if [ "${#notreq_lines[@]}" -gt 0 ] && grep -qiE 'file[[:space:]]+is[[:space:]]+currently[[:space:]]+empty' "$NOTREQ_FILE" 2>/dev/null; then
+        fail "NOT-REQUIRED LEDGER FALSE EMPTY CLAIM (R4-G3) — $NOTREQ_FILE says it is currently empty but holds ${#notreq_lines[@]} entr$([ "${#notreq_lines[@]}" -eq 1 ] && echo y || echo ies)."
+        echo "     FIX: say what the entries are (jobs that run but block nothing, each dated and tracked); an empty ledger is the TARGET, not the current state." >&2
+    fi
     local order_inv
     order_inv="$(grep -niE 'mirror[ -]+first' "$NOTREQ_FILE" 2>/dev/null || true)"
     if [ -n "$order_inv" ]; then
@@ -1491,6 +1503,24 @@ TXT
     fi
     echo "  [a] mirror context matching no parsed job name (the #2473 truncation class): CAUGHT"
 
+    # ---- R4-G1 sibling: a non-ASCII-space-padded mirror name is NOT the
+    # job's name, in C and in a UTF-8 locale (the pre-fix `[[:space:]]`
+    # trim erased U+2003 under UTF-8 and the mirror "matched").
+    local g1_loc
+    for g1_loc in C en_US.UTF-8 de_DE.UTF-8; do
+        write_clean
+        sed -i "s/^Classify changes\$/$(printf '\xe2\x80\x83')Classify changes/" "$mi"
+        grep -q "$(printf '\xe2\x80\x83')Classify changes" "$mi" || {
+            echo "  [a/R4-G1] fixture injection FAILED (self-test is broken, not the gate)" >&2; return 2; }
+        rc="$(LC_ALL="$g1_loc" run_fixture)"
+        if [ "$rc" = "0" ]; then
+            echo "  [a/R4-G1] under LC_ALL=$g1_loc a U+2003-padded mirror name matched the ASCII job name — NOT CAUGHT — FAIL" >&2
+            return 2
+        fi
+    done
+    write_clean
+    echo "  [a/R4-G1] a U+2003-padded mirror name is not the job's name (C, en_US, de_DE): CAUGHT"
+
     # ---- (c) a paths:-filtered carrier
     write_clean
     perl -0pi -e "s/(  pull_request:\n    branches: \[main, develop, \"release\/\*\*\"\]\n)/\$1    paths:\n      - 'src\/**'\n/" "$wf/ci.yml"
@@ -1912,7 +1942,13 @@ YAML
     g_expect "#3985 ledger comment instructing mirror-first" nonzero "NOT-REQUIRED LEDGER ORDER INVERSION (#3985)" || return 2
     printf '# promote via the #3554 lockstep: live protection, --pin-from-live, then move the name\n' > "$nrq"
     g_expect "#3985 ledger with the lockstep wording" 0 "" || return 2
+    # R4-G3: a header claiming the ledger is empty, alongside an entry.
+    printf '# *** THIS FILE IS CURRENTLY EMPTY, AND THAT IS THE PASSING STATE. ***\nci.yml classify 2026-09-27 #3985\n' > "$nrq"
+    g_expect "R4-G3 'currently empty' header over a real entry" nonzero "NOT-REQUIRED LEDGER FALSE EMPTY CLAIM (R4-G3)" || return 2
+    printf '# *** THIS FILE IS CURRENTLY EMPTY, AND THAT IS THE PASSING STATE. ***\n' > "$nrq"
+    g_expect "R4-G3 'currently empty' header over a truly empty ledger" 0 "" || return 2
     : > "$nrq"
+    echo "  [R4-G3] a ledger that claims to be empty while holding an entry: CAUGHT (a truly empty ledger with the claim passes)"
     echo "  [#3985] a not-required ledger that instructs 'mirror first': CAUGHT (the lockstep wording passes)"
 
     echo "  [g] a gate script no workflow references: CAUGHT BY RULE (g) (a commented-out reference does not count; a dated+tracked ledger entry passes; undated / non-#issue / stale / wired-but-ledgered entries and an empty script set all FAIL)"

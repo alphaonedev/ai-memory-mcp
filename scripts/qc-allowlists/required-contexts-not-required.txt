@@ -2,9 +2,16 @@
 # for the gating workflows, enforced by rule (f) of
 # `scripts/check-required-contexts.sh` (#2636).
 #
-# =====================================================================# *** THIS FILE IS CURRENTLY EMPTY, AND THAT IS THE PASSING STATE. ***
-# =====================================================================# Empty means every job in every gating workflow is DECLARED REQUIRED in
-# `required-contexts-release.txt`. The teeth are in the rule, not the contents:
+# =====================================================================
+# *** EVERY ENTRY BELOW IS A JOB THAT RUNS ON EVERY PR BUT BLOCKS NOTHING. ***
+# =====================================================================
+# The TARGET state is an empty ledger: every job in every gating workflow
+# DECLARED REQUIRED in `required-contexts-release.txt`. This file is NOT at
+# that target: each entry below is a dated, issue-tracked decision to leave
+# one job unrequired for now. (R4-G3: this header used to say the file was
+# "CURRENTLY" empty and that this was the passing state while it held nine
+# entries; `check-required-contexts.sh` now refuses that claim alongside
+# any entry.) The teeth are in the rule, not the contents:
 # from now on a newly-added job in a gating workflow must be declared one way
 # or the other, and cannot DEFAULT to unenforced.
 #

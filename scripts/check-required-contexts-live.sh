@@ -71,6 +71,13 @@
 
 set -euo pipefail
 
+# #3984 / R4-G1 — the WHOLE script runs byte-exact. A context name is an
+# opaque byte string: collation (`comm`/`sort`) and character classes must
+# not depend on the caller's locale. Under en_US/de_DE/ja_JP a
+# `[[:space:]]` trim erased a leading/trailing U+2003 EM SPACE, so a
+# declared "\u2003Security gate" compared EQUAL to live "Security gate".
+export LC_ALL=C
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 MIRROR_FILE="${RQC_MIRROR_FILE:-$ROOT/scripts/qc-allowlists/required-contexts-release.txt}"
@@ -96,10 +103,15 @@ read_list() {
     [ -f "$file" ] || return 0
     while IFS= read -r line || [ -n "$line" ]; do
         line="${line%$'\r'}"
-        case "$(printf '%s' "$line" | sed -e 's/^[[:space:]]*//')" in
+        # R4-G1: trim ONLY ASCII space and tab (byte-exact under LC_ALL=C).
+        # Any other byte — including a UTF-8 U+2003/U+00A0 — is part of the
+        # name, so two different names can never be normalised equal.
+        line="${line#"${line%%[!$' \t']*}"}"
+        line="${line%"${line##*[!$' \t']}"}"
+        case "$line" in
             '' | '#'*) continue ;;
         esac
-        printf '%s\n' "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
+        printf '%s\n' "$line"
     done < "$file"
 }
 
@@ -514,7 +526,41 @@ TXT
         echo "required-contexts-live self-test: note — no non-C collation locale installed; #3984 behavioural leg (11b) skipped, static leg (11a) enforced" >&2
     fi
 
-    echo "required-contexts-live self-test: PASS (load-bearing — catches the #3554 38-vs-35 shape, extra live context, enforce_admins=false, strict=false, empty live, missing declaration, missing pin, stale pin, locale-dependent comm (#3984); spares equal sets and an inline-# context name)"
+    # (12) R4-G1: a leading or trailing non-ASCII space is PART of the name.
+    #      Declaration + pin "<U+2003>Security gate" vs live "Security gate"
+    #      are DIFFERENT contexts and MUST FAIL — in C and in every non-C
+    #      locale present (the pre-fix `[[:space:]]` trim erased U+2003 under
+    #      UTF-8 locales and reported "declaration == live"). Controls: the
+    #      equal ASCII set passes; ASCII space/tab padding is still trimmed.
+    local em nbsp
+    em=$'\xe2\x80\x83'
+    nbsp=$'\xc2\xa0'
+    printf '%s\n' 'Security gate' >"$scratch/ascii.txt"
+    printf '%s\n' "${em}Security gate" >"$scratch/lead-em.txt"
+    printf '%s\n' "Security gate${em}" >"$scratch/trail-em.txt"
+    printf '%s\n' "${nbsp}Security gate" >"$scratch/lead-nbsp.txt"
+    printf ' \t%s\t \n' 'Security gate' >"$scratch/ascii-padded.txt"
+    local u_loc u_variant
+    for u_loc in C ${nonc:+"$nonc"} de_DE.UTF-8 ja_JP.UTF-8; do
+        for u_variant in lead-em trail-em lead-nbsp; do
+            if LC_ALL="$u_loc" RQC_MIRROR_FILE="$scratch/$u_variant.txt" RQC_PIN_FILE="$scratch/$u_variant.txt" \
+                RQC_LIVE_CONTEXTS_FILE="$scratch/ascii.txt" \
+                RQC_LIVE_ENFORCE_ADMINS=true RQC_LIVE_STRICT=true \
+                "$ROOT/scripts/check-required-contexts-live.sh" >/dev/null 2>"$scratch/errunicode"; then
+                echo "self-test FAILED: under LC_ALL=$u_loc a $u_variant U+2003/U+00A0 context compared EQUAL to its ASCII name (R4-G1)" >&2
+                exit 2
+            fi
+        done
+        if ! LC_ALL="$u_loc" RQC_MIRROR_FILE="$scratch/ascii-padded.txt" RQC_PIN_FILE="$scratch/ascii.txt" \
+            RQC_LIVE_CONTEXTS_FILE="$scratch/ascii.txt" \
+            RQC_LIVE_ENFORCE_ADMINS=true RQC_LIVE_STRICT=true \
+            "$ROOT/scripts/check-required-contexts-live.sh" >/dev/null 2>&1; then
+            echo "self-test FAILED: under LC_ALL=$u_loc ASCII space/tab padding was not trimmed (control)" >&2
+            exit 2
+        fi
+    done
+
+    echo "required-contexts-live self-test: PASS (load-bearing — catches the #3554 38-vs-35 shape, extra live context, enforce_admins=false, strict=false, empty live, missing declaration, missing pin, stale pin, locale-dependent comm (#3984), a U+2003/U+00A0-padded name compared equal to its ASCII twin (R4-G1); spares equal sets and an inline-# context name)"
 }
 
 case "${1:-}" in
