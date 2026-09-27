@@ -217,9 +217,10 @@ If you run `ai-memory serve --store-url postgres://…` with the
 store walks the in-process `migrate_v34()…migrate_v55()` async
 ladder as a side effect (there is no `--upgrade` flag). Apache AGE
 (`memory_graph`) is provisioned by the same command if the `age`
-extension is installed. Note the pre-built release binaries are
-default-feature builds without `migrate`/`schema-init` — use a
-`--features sal,sal-postgres` build for the postgres path.
+extension is installed. The pre-built release binaries are built
+with `--features sal` (they include `migrate`/`schema-init`) but not
+`sal-postgres`, so use a `--features sal,sal-postgres` source build
+for the postgres path.
 See [`docs/migration-v0.7.0-postgres.md`](migration-v0.7.0-postgres.html)
 for the postgres-specific recipe.
 

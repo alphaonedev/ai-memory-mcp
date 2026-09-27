@@ -322,8 +322,9 @@ upgrade path differs because schema bumps land via the `ai-memory schema-init
 --store-url <url>` command (opening the store runs the migration ladder as a
 side effect; there is no `--upgrade` flag) rather than via the daemon's
 first-boot ladder. Note `schema-init`/`migrate` exist only in
-`--features sal` / `sal,sal-postgres` builds — the pre-built release
-binaries are default-feature builds without them.
+`--features sal` builds; current pre-built release binaries are built
+with `--features sal` and include them, but the postgres path needs a
+`--features sal,sal-postgres` source build.
 
 **Read [`migration-v0.7.0-postgres.md`](migration-v0.7.0-postgres.html) for the
 full runbook.** It covers schema-init upgrades, the postgres upgrade ladder,
