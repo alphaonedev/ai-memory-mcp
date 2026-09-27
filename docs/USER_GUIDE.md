@@ -1450,7 +1450,7 @@ pass `--agent-id` or `AI_MEMORY_AGENT_ID` to scrub that exposure. Tracking issue
 
 ## Zero Token Cost
 
-Unlike built-in memory systems (Claude Code auto-memory, ChatGPT memory) that load your entire memory into every conversation, ai-memory uses **zero context tokens until recalled**. Only relevant memories come back, ranked by a 6-factor scoring algorithm. For Claude Code users: disable auto-memory (`"autoMemoryEnabled": false` in settings.json) to stop paying for 200+ lines of idle context.
+Unlike built-in memory systems (Claude Code auto-memory, ChatGPT memory) that load your entire memory into every conversation, ai-memory puts **no memory content into the context until recalled**; its MCP tool schemas still cost a fixed per-request token budget that depends on the tool profile. Only relevant memories come back, ranked by a 6-factor scoring algorithm. For Claude Code users: disable auto-memory (`"autoMemoryEnabled": false` in settings.json) to stop paying for 200+ lines of idle context.
 
 ## TOON Format (Token-Oriented Object Notation)
 

@@ -211,7 +211,7 @@ layout: doc
 
    **ChatGPT:** Settings > Personalization > Memory > turn off (ai-memory replaces it via MCP/HTTP)
 
-   This stops the built-in system from injecting 200+ lines of memory context into every conversation. ai-memory uses zero tokens until `memory_recall` is called -- only relevant memories are returned, ranked by score.
+   This stops the built-in system from injecting 200+ lines of memory context into every conversation. ai-memory adds no memory content to the context until `memory_recall` (or another read tool) is called -- only relevant memories are returned, ranked by score. Its MCP tool schemas still cost a fixed number of tokens per request, set by the tool profile.
 
 7. **Token savings are automatic.** All recall, search, and list responses use TOON compact format by default -- eliminating 40-60% of repeated field-name tokens vs JSON. The MCP server also provides `recall-first` and `memory-workflow` prompts that teach AI clients to use memory proactively.
 
