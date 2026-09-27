@@ -146,7 +146,7 @@ async fn http_create_writer_blocks_certification_and_deadline_is_fatal_4062() {
         } else {
             Duration::from_secs(10)
         };
-        let mut shutdown = tokio::spawn(async move {
+        let mut shutdown = Box::pin(async move {
             super::shutdown::join_background_writers(
                 bs.task_handles,
                 &tracker,
@@ -156,10 +156,12 @@ async fn http_create_writer_blocks_certification_and_deadline_is_fatal_4062() {
             .await?;
             super::shutdown_witness_flush_and_checkpoint(&db).await
         });
+        let first_poll = std::future::poll_fn(|context| {
+            std::task::Poll::Ready(std::future::Future::poll(shutdown.as_mut(), context))
+        })
+        .await;
         assert!(
-            tokio::time::timeout(Duration::from_millis(20), &mut shutdown)
-                .await
-                .is_err(),
+            first_poll.is_pending(),
             "certification raced the held writer"
         );
         let during: i64 = conn
@@ -171,7 +173,10 @@ async fn http_create_writer_blocks_certification_and_deadline_is_fatal_4062() {
             .unwrap();
         assert_eq!(during, before);
         if deadline_expires {
-            let error = shutdown.await.unwrap().unwrap_err();
+            let error = tokio::time::timeout(Duration::from_secs(5), shutdown)
+                .await
+                .expect("writer deadline must be bounded")
+                .unwrap_err();
             assert!(
                 error.is::<FatalShutdownError>(),
                 "must select the binary's exit-75 marker: {error}"
@@ -192,7 +197,7 @@ async fn http_create_writer_blocks_certification_and_deadline_is_fatal_4062() {
             }
         } else {
             release_tx.send(()).unwrap();
-            shutdown.await.unwrap().unwrap();
+            shutdown.await.unwrap();
             let completed: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM signed_events WHERE event_type='atomisation_complete'",
