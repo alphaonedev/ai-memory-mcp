@@ -5,20 +5,15 @@
 //! the paced FTS5 index-integrity checker and the cached verdict
 //! `GET /api/v1/health` renders.
 //!
-//! **What this replaces.** `db::health_check` used to run
-//! `INSERT INTO memories_fts(memories_fts) VALUES('integrity-check')` on
-//! EVERY `/health` request. `memories_fts` is an **external-content** FTS5
-//! table (`content=memories`), so that command does not merely walk the
-//! index — it re-tokenizes every row's `title`/`content`/`tags` out of
-//! `memories` and compares the derived doclists. The cost is therefore
-//! O(corpus) in TOKENS, measured at 22-30 us/row on a real corpus
-//! (0.24 s at 8k rows, 2.8 s at 130k rows), and it is issued as an INSERT,
-//! so SQLite prepares it as a NON-readonly statement that takes the single
-//! WAL writer lock for its whole duration. A liveness probe scraped on a
-//! fixed interval by Kubernetes / systemd therefore (a) exceeded its probe
-//! timeout on exactly the largest corpora, killing healthy pods, and (b)
-//! kept a write transaction perpetually open under a sustained scrape,
-//! which prevents WAL checkpointing.
+//! **What this replaces.** `db::health_check` used to issue an FTS5
+//! `integrity-check` on every `/health` request. That command checks the
+//! internal index and takes SQLite's writer lock; it is unsuitable for a
+//! constant-cost liveness probe. The old command omitted `rank=1`, so it
+//! did not compare postings against the external `memories` table (#4036).
+//!
+//! The deep check now supplies `rank=1`: it also re-tokenizes external
+//! content and detects stale postings. Its work grows with the corpus,
+//! and it still holds the WAL writer lock for the check's duration.
 //!
 //! **What this does instead.** The full check runs here, on a paced,
 //! jittered cadence, on its OWN connection — never the daemon's single

@@ -36,6 +36,8 @@
 // during the awaited HTTP round-trip.
 #![allow(clippy::await_holding_lock)]
 
+mod common;
+
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -55,7 +57,7 @@ use ai_memory::identity::keypair as kp_mod;
 struct TwoHosts {
     router: axum::Router,
     alice: kp_mod::AgentKeypair,
-    _db_tmp: tempfile::NamedTempFile,
+    db_tmp: tempfile::NamedTempFile,
     _key_tmp: TempDir,
 }
 
@@ -150,7 +152,7 @@ fn setup() -> TwoHosts {
     TwoHosts {
         router,
         alice,
-        _db_tmp: db_tmp,
+        db_tmp,
         _key_tmp: key_tmp,
     }
 }
@@ -353,4 +355,70 @@ async fn replay_922_legacy_fallback_accepts_unsigned_nonce_when_env_is_zero() {
         StatusCode::OK,
         "legacy replay accepted under REQUIRE_NONCE=0 (documented permissive)"
     );
+}
+
+/// A transport retry signs a fresh nonce but must retain the content preimage.
+#[tokio::test(flavor = "current_thread")]
+async fn fresh_signed_envelopes_preserve_merge_snapshot_4035() {
+    let _g = env_lock();
+    let _env = common::MultiEnvVarGuard::apply(&[
+        (REQUIRE_SIG_ENV, Some("1")),
+        (REQUIRE_NONCE_ENV, Some("1")),
+        (
+            ai_memory::federation::receive_auth::REQUIRE_PUSH_NAMESPACE_SCOPE_ENV,
+            Some("0"),
+        ),
+        (
+            ai_memory::federation::receive_auth::REQUIRE_WRITE_SIG_ENV,
+            Some("0"),
+        ),
+        ("AI_MEMORY_KEY_DIR", None),
+    ]);
+    let host = setup();
+    let conn = ai_memory::db::open(host.db_tmp.path()).unwrap();
+    let a = ai_memory::models::Memory {
+        id: uuid::Uuid::new_v4().to_string(),
+        title: "receive replay recovery".into(),
+        content: "authored original".into(),
+        namespace: "global".into(),
+        tier: ai_memory::models::Tier::Long,
+        created_at: "2026-01-01T00:00:00+00:00".into(),
+        updated_at: "2026-01-01T00:00:00+00:00".into(),
+        ..Default::default()
+    };
+    ai_memory::db::insert(&conn, &a).unwrap();
+    let mut b = a.clone();
+    b.content = "peer replacement".into();
+    b.updated_at = "2026-01-02T00:00:00+00:00".into();
+    let mut body = sample_body();
+    body["memories"] = json!([b]);
+    let bytes = serde_json::to_vec(&body).unwrap();
+    for _ in 0..2 {
+        let nonce = uuid::Uuid::new_v4().to_string();
+        let sig = sign_body_with_nonce_header(host.alice.private.as_ref().unwrap(), &bytes, &nonce);
+        let (status, response) = post(
+            &host.router,
+            bytes.clone(),
+            Some(&sig),
+            Some(&nonce),
+            &host.alice.agent_id,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        assert_eq!(
+            ai_memory::db::get(&conn, &a.id).unwrap().unwrap().content,
+            b.content
+        );
+        let prior: String = conn
+            .query_row(
+                "SELECT content FROM archived_memories WHERE id=?1",
+                [&a.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            prior, a.content,
+            "#4035: fresh signed envelope cannot erase recovery"
+        );
+    }
 }

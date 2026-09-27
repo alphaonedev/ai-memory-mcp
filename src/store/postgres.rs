@@ -8497,6 +8497,8 @@ impl PostgresStore {
             false,
         )
         .await?;
+        // #4034: the admin context bypasses the owner probe, so this
+        // pre-read must itself hold the row through snapshot and UPDATE.
         let current_row: Option<(
             i64,
             String,
@@ -8507,7 +8509,7 @@ impl PostgresStore {
             String,
         )> = sqlx::query_as(
             "SELECT version, namespace, tier, title, memory_kind, metadata, content \
-                 FROM memories WHERE id = $1",
+                 FROM memories WHERE id = $1 FOR UPDATE",
         )
         .bind(id)
         .fetch_optional(&mut *tx)
@@ -8665,13 +8667,9 @@ impl PostgresStore {
         // overwrites it, under archive_reason='in_place_edit', SAME
         // memory_id (no fork). DELETE+INSERT mirrors sqlite's
         // `INSERT OR REPLACE`, keeping the MOST-RECENT pre-edit snapshot
-        // (the "immediately-prior content"). The DELETE only ever removes
-        // a prior in_place_edit snapshot of this id: supersede forks a new
-        // id + deletes the old live row, GC deletes the live row, and
-        // restore removes the archive row on success — so a live,
-        // in-place-editable row can never collide with a different
-        // archive_reason's record. Runs inside the tx; a 0-row UPDATE
-        // below rolls it back.
+        // (the "immediately-prior content"). This replaces the single recovery
+        // snapshot, whether the previous edit was local or federated. Runs
+        // inside the tx; a 0-row UPDATE below rolls it back.
         if content_changed {
             sqlx::query(SQL_DELETE_ARCHIVED_MEMORY_BY_ID)
                 .bind(id)
@@ -23867,10 +23865,12 @@ impl MemoryStore for PostgresStore {
         // governance pre-write gate below can evaluate the POST-MERGE row
         // (the hook payload is namespace/tier/memory_kind/title, see
         // `install_governance_pre_write_hook` in src/daemon_runtime.rs).
+        // #4034: the admin context bypasses the owner probe, so this
+        // pre-read must itself hold the row through snapshot and UPDATE.
         let cur: Option<(String, String, serde_json::Value, String, String, String)> =
             sqlx::query_as(
                 "SELECT title, content, metadata, namespace, tier, memory_kind \
-                 FROM memories WHERE id = $1",
+                 FROM memories WHERE id = $1 FOR UPDATE",
             )
             .bind(id)
             .fetch_optional(&mut *tx)
@@ -23988,12 +23988,9 @@ impl MemoryStore for PostgresStore {
 
         // #1799 — DELETE+INSERT the prior content into `archived_memories`
         // under archive_reason='in_place_edit', SAME memory_id (no fork),
-        // copying the exact 37-column list from the optimistic path's
-        // snapshot block (~L3722). The DELETE only ever removes a stale
-        // in_place_edit snapshot of this id (supersede forks a new id +
-        // deletes the old live row; GC deletes the live row; restore
-        // removes the archive row on success — so a live, in-place-
-        // editable row can never collide with a different archive_reason).
+        // copying the column-complete optimistic-path snapshot. This
+        // replaces the single recovery snapshot from a local or federated
+        // content edit, atomically with the new content below.
         if content_changed {
             sqlx::query(SQL_DELETE_ARCHIVED_MEMORY_BY_ID)
                 .bind(id)
@@ -25845,6 +25842,41 @@ impl MemoryStore for PostgresStore {
         // transaction that holds the row lock (f1 goal4 FA). The node-local
         // metadata keys are overlaid from the locked row by an atomic jsonb
         // merge (`pg_node_local_overlay`), never from a copy.
+        // #4035/#3961: archive only a logical title/plaintext change, under
+        // the existing row lock. Ciphertext is randomized, so compare before
+        // sealing. A replay must not replace the last recoverable preimage.
+        if merged.title != existing.title || merged.content != existing.content {
+            sqlx::query(SQL_DELETE_ARCHIVED_MEMORY_BY_ID)
+                .bind(&merged.id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("clear prior federation snapshot", e))?;
+            sqlx::query(
+                "INSERT INTO archived_memories
+                    (id, tier, namespace, title, content, tags, priority, confidence,
+                     source, access_count, created_at, updated_at, last_accessed_at,
+                     expires_at, archived_at, archive_reason, metadata,
+                     embedding, embedding_dim, embedding_space, original_tier, original_expires_at,
+                     reflection_depth, atomised_into, atom_of, memory_kind,
+                     entity_id, persona_version, citations, source_uri, source_span,
+                     confidence_source, confidence_signals, confidence_decayed_at,
+                     mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until, cid, cid_genesis)
+                 SELECT id, tier, namespace, title, content, tags, priority, confidence,
+                        source, access_count, created_at, updated_at, last_accessed_at,
+                        expires_at, NOW(), $2, metadata,
+                        embedding, embedding_dim, embedding_space, tier, expires_at,
+                        reflection_depth, atomised_into, atom_of, memory_kind,
+                        entity_id, persona_version, citations, source_uri, source_span,
+                        confidence_source, confidence_signals, confidence_decayed_at,
+                        mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until, cid, cid_genesis
+                 FROM memories WHERE id = $1",
+            )
+            .bind(&merged.id)
+            .bind(crate::models::field_names::ARCHIVE_REASON_FEDERATION_MERGE)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("archive prior federation content", e))?;
+        }
         let (merge_content, merge_envelope) = seal_content_for_insert(&mut *tx, &merged).await?;
         sqlx::query(&SQL_MERGE_INBOUND_FULL_ROW_UPDATE)
             .bind(&merged.id)
@@ -25897,7 +25929,7 @@ impl MemoryStore for PostgresStore {
             .map_err(|e| to_store_err("merge_inbound full-row update", e))?;
         // APPEND-ONLY-SANCTIONED (#1823 G6) — COW SUPERSEDE: the federation
         // LWW full-row overwrite rewrites content in place (same id); the
-        // pre-merge content lives in the merge snapshot, never in the leaf.
+        // prior content is archived above when logical title/content changes.
         // Append ONE identity-only SUPERSEDE leaf in this tx.
         pg_emit_revision_leaf_if_enabled(
             &mut tx,

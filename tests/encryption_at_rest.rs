@@ -670,6 +670,38 @@ fn federation_merge_seals_content_and_snapshots_1773() {
         snap_count, 1,
         "#1773: federation merge must snapshot the pre-merge row"
     );
+    // #4035: randomized ciphertext must not turn a logical replay into an
+    // overwrite of the recovery snapshot. Compare the archived envelope too.
+    let archived = || -> Vec<u8> {
+        conn.query_row(
+            "SELECT encrypted_envelope FROM archived_memories WHERE id=?1",
+            [&id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    let original_envelope = archived();
+    db::merge_inbound(&conn, &inbound, false).unwrap();
+    assert_eq!(archived(), original_envelope, "#4035 encrypted replay");
+    db::merge_inbound(&conn, &existing, false).unwrap();
+    assert_eq!(archived(), original_envelope, "#4035 losing inbound");
+    let mut newer = inbound.clone();
+    newer.content = "third plaintext".into();
+    newer.updated_at = "2026-07-01T00:00:00+00:00".into();
+    let live_before: Vec<u8> = conn
+        .query_row(
+            "SELECT encrypted_envelope FROM memories WHERE id=?1",
+            [&id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    db::merge_inbound(&conn, &newer, false).unwrap();
+    assert_eq!(
+        archived(),
+        live_before,
+        "archive actual overwritten ciphertext"
+    );
+    assert_eq!(db::get(&conn, &id).unwrap().unwrap().content, newer.content);
 }
 
 #[test]
@@ -857,4 +889,61 @@ fn issue_2301_consolidate_off_path_is_byte_identical() {
 
     let fetched = db::get(&conn, &new_id).expect("get").expect("exists");
     assert_eq!(fetched.content, summary);
+}
+
+#[cfg(feature = "sal-postgres")]
+#[test]
+fn postgres_encrypted_merge_replay_preserves_preimage_4035() {
+    use ai_memory::store::postgres::PostgresStore;
+    use ai_memory::store::{CallerContext, MemoryStore};
+
+    let Ok(url) = std::env::var("AI_MEMORY_TEST_POSTGRES_URL") else {
+        eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+        return;
+    };
+    let _gate = EncryptGate::on();
+    let _ = key_dir_sandbox::pin();
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let store = PostgresStore::connect(&url).await.unwrap();
+            let owner = format!("ai:4035-encrypted-{}", uuid::Uuid::new_v4());
+            let ctx = CallerContext::for_admin(&owner);
+            let ns = format!("encrypted-4035-{}", uuid::Uuid::new_v4());
+            let mut a = make_mem("encrypted merge parity", "original plaintext", &ns);
+            a.metadata = serde_json::json!({"agent_id": owner});
+            a.updated_at = "2026-01-01T00:00:00+00:00".into();
+            store.store(&ctx, &a).await.unwrap();
+            let mut b = a.clone();
+            b.content = "replacement plaintext".into();
+            b.updated_at = "2026-01-02T00:00:00+00:00".into();
+            let mut c = b.clone();
+            c.content = "latest plaintext".into();
+            c.updated_at = "2026-01-03T00:00:00+00:00".into();
+            let mut expected_snapshot: Option<Vec<u8>> = None;
+            for (inbound, prior) in [(&b, &a), (&b, &a), (&a, &a), (&c, &b)] {
+                // The public read path opens either envelope version. Capture
+                // its exact ciphertext before a real replacement; replay must
+                // preserve those bytes and the identity needed to open them.
+                let current = store.get(&ctx, &a.id).await.unwrap();
+                if current.content == prior.content {
+                    expected_snapshot = Some(sqlx::query_scalar("SELECT encrypted_envelope FROM memories WHERE id=$1")
+                        .bind(&a.id).fetch_one(store.pool()).await.unwrap());
+                }
+                store.merge_inbound(&ctx, inbound, false).await.unwrap();
+                let (raw, envelope, metadata): (String, Vec<u8>, serde_json::Value) = sqlx::query_as(
+                    "SELECT content, encrypted_envelope, metadata FROM archived_memories WHERE id=$1 AND archive_reason='federation_merge'",
+                )
+                .bind(&a.id)
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+                assert!(raw.is_empty(), "archive must not contain plaintext at rest");
+                assert_eq!(Some(&envelope), expected_snapshot.as_ref(), "retain the exact decryptable preimage on replay");
+                assert_eq!(metadata["agent_id"], owner, "retain the snapshot's decryption identity");
+                assert_eq!(store.get(&ctx, &a.id).await.unwrap().content, if inbound.content == a.content { &b.content } else { &inbound.content }.as_str());
+            }
+        });
 }

@@ -4206,6 +4206,16 @@ pub fn update_with_expected_version(
 ) -> Result<(bool, bool)> {
     // #1955 R45 — record-stop fence for the update funnel.
     crate::storage::record_stop::gate_storage_conn(conn)?;
+    // #4034: resolve omitted fields, governance, and the recovery snapshot
+    // from the row protected by this write transaction. A late BEGIN could
+    // overwrite another connection's acknowledged content with our pre-read.
+    // Reuse caller-owned transactions; this guard rolls back on early exits.
+    let owns_tx = conn.is_autocommit();
+    let write_txn = if owns_tx {
+        Some(connection::WriteTxn::begin(conn)?)
+    } else {
+        None
+    };
     let mut stmt = conn.prepare_cached(SQL_SELECT_MEMORY_ROW_BY_ID)?;
     let mut rows = stmt.query_map(params![id], row_to_memory)?;
     let Some(Ok(existing)) = rows.next() else {
@@ -4222,9 +4232,8 @@ pub fn update_with_expected_version(
     let valid_until = valid_until_canon.as_deref();
 
     // v0.7.0 Provenance Gap 1 (#884) — pre-check optimistic gate.
-    // The same predicate is also asserted atomically inside the
-    // UPDATE statement below so a racing writer that slipped in
-    // between the SELECT and the UPDATE still fails CONFLICT.
+    // The write lock pins this version through UPDATE; retain the SQL
+    // predicate as a defensive check and preserve the typed conflict.
     if let Some(expected) = expected_version
         && existing.version != expected
     {
@@ -4443,12 +4452,6 @@ pub fn update_with_expected_version(
     // (`is_autocommit()` is true only outside a transaction); when the
     // caller owns the tx, the archive + UPDATE run inside it and the
     // caller's commit/rollback covers atomicity.
-    let owns_tx = conn.is_autocommit();
-    let write_txn = if owns_tx {
-        Some(connection::WriteTxn::begin(conn)?)
-    } else {
-        None
-    };
     let txn_result = (|| -> Result<(bool, bool)> {
         if content_changed {
             archive_memory_insert_only(
@@ -4641,6 +4644,9 @@ pub fn update_with_archive_on_supersede(
     expected_version: Option<i64>,
     edit_source: crate::models::EditSource,
 ) -> Result<SupersedeResult> {
+    // #4034: the append-and-archive sibling also resolves omitted fields
+    // and its version gate from the row it will actually replace.
+    let write_txn = connection::WriteTxn::begin(conn)?;
     // Read the existing row so we can compose the patched NEW row.
     let mut stmt = conn.prepare_cached(SQL_SELECT_MEMORY_ROW_BY_ID)?;
     let mut rows = stmt.query_map(params![id], row_to_memory)?;
@@ -4832,7 +4838,6 @@ pub fn update_with_archive_on_supersede(
     consult_governance_pre_write(&new_mem)?;
 
     // Steps 1+2 (#1638): one transaction around archive + insert.
-    let write_txn = connection::WriteTxn::begin(conn)?;
     let tx_result = (|| -> Result<()> {
         // Step 1: archive the OLD row with reason='superseded'.
         let moved = archive_memory_no_tx(conn, &archived_id, Some("superseded"))?;
@@ -18674,6 +18679,16 @@ pub fn merge_inbound(
                     inbound,
                     receiver_verified,
                 );
+                // #4035: compare logical plaintext before sealing. Replays
+                // and losing inbound rows must retain the prior recovery copy,
+                // while non-content CRDT fields still converge below.
+                if merged.title != existing.title || merged.content != existing.content {
+                    archive_memory_insert_only(
+                        conn,
+                        &merged.id,
+                        crate::models::field_names::ARCHIVE_REASON_FEDERATION_MERGE,
+                    )?;
+                }
                 overwrite_full_row_by_id(conn, &merged)?;
                 Ok(Some(merged.id))
             }
@@ -18731,14 +18746,6 @@ pub fn merge_inbound(
 /// Bubbles up serde encode errors for the JSON-shaped columns and any
 /// rusqlite error from the UPDATE.
 fn overwrite_full_row_by_id(conn: &Connection, mem: &Memory) -> Result<()> {
-    // #1773 (MEDIUM) — snapshot the pre-merge row before this peer-driven
-    // LWW content overwrite, mirroring the #1725 in_place_edit snapshot, so a
-    // federation merge where the remote wins the tiebreak leaves a recoverable
-    // copy instead of permanently discarding prior local content. INSERT OR
-    // REPLACE so a repeated merge of the same id is idempotent; archives the
-    // CURRENT row (incl its encrypted_envelope) before the UPDATE below.
-    archive_memory_insert_only(conn, &mem.id, "federation_merge")?;
-
     let tags_json = serde_json::to_string(&mem.tags)?;
     let metadata_json = serde_json::to_string(&mem.metadata)?;
     let citations_json = serde_json::to_string(&mem.citations)?;
@@ -18855,9 +18862,9 @@ fn overwrite_full_row_by_id(conn: &Connection, mem: &Memory) -> Result<()> {
     )?;
     // APPEND-ONLY-SANCTIONED (#1823 G6) — COW SUPERSEDE: this peer-driven
     // LWW full-row overwrite rewrites content in place (same id); the
-    // pre-merge content is preserved in the `federation_merge` archive
-    // snapshot above, never in the leaf. Append ONE identity-only
-    // SUPERSEDE leaf in the caller's tx.
+    // caller snapshots the prior row when logical title/content changes.
+    // Append ONE identity-only SUPERSEDE leaf (never content) in the
+    // caller's tx.
     crate::revisions::emit_revision_leaf_if_enabled(
         conn,
         &mem.id,
@@ -22241,13 +22248,15 @@ pub fn memories_updated_since_counted(
 }
 
 /// v1.0.0 #2579 — the FTS5 external-content integrity-check command.
+/// #4036: rank=1 compares postings with external content; the default only
+/// checks the internal index and can certify stale postings as healthy.
 /// DELIBERATELY not on any per-request path: it re-tokenizes every row of
 /// `memories` and is prepared as a WRITER, so it holds the WAL write lock
 /// for its whole O(corpus) duration. Reached only from
 /// [`crate::background::fts_integrity`] (paced) and `ai-memory doctor`
 /// (explicit, operator-invoked).
 const SQL_FTS_INTEGRITY_CHECK: &str =
-    "INSERT INTO memories_fts(memories_fts) VALUES('integrity-check')";
+    "INSERT INTO memories_fts(memories_fts, rank) VALUES('integrity-check', 1)";
 
 /// A term deliberately absent from any real corpus, so the liveness probe
 /// below is a single miss in the FTS5 segment index rather than a doclist walk.
@@ -22272,8 +22281,8 @@ pub fn ping(conn: &Connection) -> Result<()> {
 /// A `MATCH` for a term that is not in the vocabulary resolves to one lookup
 /// in the segment b-tree: it proves the `fts5` module is registered and the
 /// shadow tables (`memories_fts_data` / `_idx` / `_config`) are readable,
-/// which is a real signal — a dropped sync trigger or a missing shadow table
-/// surfaces here. It is a `SELECT`, so it takes no write lock, and its cost
+/// which can expose missing shadow tables. It does not inspect sync triggers
+/// or detect stale postings. This `SELECT` takes no write lock; its cost
 /// is independent of corpus size (measured <0.1 ms warm at both 8k and 130k
 /// rows).
 ///

@@ -63,6 +63,8 @@ pub const ARCHIVE_REASON: &str = "archive_reason";
 /// content under the SAME memory_id, no fork). Shared SSOT so the
 /// sqlite + postgres backends and the parity test agree on the marker.
 pub const ARCHIVE_REASON_IN_PLACE_EDIT: &str = "in_place_edit";
+/// Prior logical content replaced by federation reconciliation (#4035/#3961).
+pub const ARCHIVE_REASON_FEDERATION_MERGE: &str = "federation_merge";
 /// Parity finding #1 (2026-08) — the DEFAULT `archive_reason` VALUE
 /// stamped when an archive is requested with no explicit reason.
 ///
