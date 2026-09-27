@@ -1383,11 +1383,15 @@ fn sal_outer_curator_report_carries_the_judge_counts() {
 // ================================= code-review F4: the remaining acceptance cells
 
 /// f1's acceptance table, the cells the reviewer found missing OVER THE
-/// WIRE: an unparseable logprob (`NaN` is not JSON), an infinite one
-/// (`1e999`) and an out-of-range one (a POSITIVE logprob, probability > 1)
-/// never permit — the client degrades them to ABSENT and the seam blocks;
-/// the judge WAS asked each time (PRESENCE), so the block is the seam
-/// refusing the number, not a silent endpoint.
+/// WIRE, each with its EXACT block reason (#3806 review F-3):
+/// * `NaN` and `1e999` are not valid JSON for serde_json, so the whole
+///   response fails to parse — an `unavailable` block, never a permit;
+/// * a POSITIVE logprob (probability > 1) parses, and the validated
+///   confidence constructor refuses it — degraded to ABSENT, a
+///   `LowConfidence { confidence: None }` block.
+/// The judge WAS asked each time (PRESENCE). The non-finite legs of the
+/// confidence constructor itself are pinned by the lib cell
+/// `merge_acceptance_cells_permit_only_a_confident_yes_at_the_floor`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_malformed_or_out_of_range_confidence_never_permits_over_the_wire() {
     let _serialized = serialize().await;
@@ -1439,9 +1443,25 @@ async fn a_malformed_or_out_of_range_confidence_never_permits_over_the_wire() {
             !judgement.permits(),
             "{label}: a confidence that is not a probability must never permit, got {judgement:?}"
         );
+        let expected_reason = match label {
+            "positive_logprob_p_gt_1" => matches!(
+                judgement,
+                MergeJudgement::Block {
+                    reason: MergeBlockReason::LowConfidence { confidence: None },
+                    ..
+                }
+            ),
+            _ => matches!(
+                judgement,
+                MergeJudgement::Block {
+                    reason: MergeBlockReason::Unavailable(_),
+                    ..
+                }
+            ),
+        };
         assert!(
-            matches!(judgement, MergeJudgement::Block { .. }),
-            "{label}: {judgement:?}"
+            expected_reason,
+            "{label}: wrong block reason, got {judgement:?}"
         );
         assert_eq!(
             hits(&decision).await,

@@ -80,7 +80,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   probe's result closes or re-opens it; a cancelled probe counts as failed and
   frees the slot. The socket-pin pin runs on every platform (f1 delta N3).
 - **The two DESTRUCTIVE seams share ONE contract (W3 + W4, GOD rulings).**
-  `destructive_judge(client, seam, prompt)` → `destructive_judgement_of`
+  `destructive_judge(client, seam, bodies, prompt)` → `destructive_judgement_of`
   (`src/decision_seams.rs`): PRIMARY-ONLY through the new REQUIRED
   `DecisionProvider::judge_primary` (the generative stand-in is never asked on
   a delete path — 5/5 vote); a configured-but-unbuilt provider is a permanent
@@ -93,7 +93,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`MERGE_JUDGE_MEMBER_CHARS`, 2000) BLOCKS before any prompt is built —
   `unusable` abstain, endpoint never dialled — so a confident `yes` over a
   truncated excerpt can never permit merging or deleting text the judge never
-  examined (code review F2). Under `--features sal` the outer curator report
+  examined (code review F2). The window is per MEMBER; a merge prompt carries
+  up to eight members, so the `[decision]` model's context must hold the whole
+  prompt — an endpoint that silently truncates to its context (instead of
+  erroring) could show the judge only part of a cluster (review F-4, a
+  documented deployment requirement). Under `--features sal` the outer curator report
   carries the SAL consolidator's `merge_judge` / `judge_preview` counts (code
   review F1; they were dropped in the fold). W3: the online synthesis
   pass's `delete` verdict becomes advice; at the sole enqueue point (after the

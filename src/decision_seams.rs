@@ -267,7 +267,7 @@ impl ProbeTicket<'_> {
     /// Fold the probe's result in and release the slot.
     fn complete(&mut self, reason: Option<AbstainReason>, now: Instant) {
         self.done = true;
-        self.breaker.observe(reason, now);
+        self.breaker.fold(reason, now, true);
     }
 }
 
@@ -313,11 +313,24 @@ impl SeamBreaker {
         })
     }
 
-    /// Fold one real call's result into the breaker (and release the probe
-    /// slot, if one was held).
+    /// Fold one `Proceed` call's result into the breaker. It does NOT touch
+    /// the probe slot: only the [`ProbeTicket`] that owns the slot may
+    /// release it (#3806 review F-2 — a stale `Proceed` admitted while the
+    /// breaker was closed and finishing during half-open used to clear
+    /// `probing` unconditionally, so a second probe was admitted while the
+    /// first was still in flight whenever `timeout_secs` exceeded the
+    /// cooldown).
     fn observe(&self, reason: Option<AbstainReason>, now: Instant) {
+        self.fold(reason, now, false);
+    }
+
+    /// The one result-fold. `release_probe` is true only on the path of the
+    /// ticket that holds the slot.
+    fn fold(&self, reason: Option<AbstainReason>, now: Instant, release_probe: bool) {
         let mut state = self.lock();
-        state.probing = false;
+        if release_probe {
+            state.probing = false;
+        }
         match reason {
             // An answer — a decision or a decline — closes the breaker.
             None | Some(AbstainReason::Unusable) => {
@@ -746,13 +759,15 @@ impl MergeJudgeReport {
             return;
         };
         let report = slot.get_or_insert_with(Self::default);
-        report.blocked += other.blocked;
-        report.permitted += other.permitted;
+        report.blocked = report.blocked.saturating_add(other.blocked);
+        report.permitted = report.permitted.saturating_add(other.permitted);
         for (k, v) in &other.sources {
-            *report.sources.entry(k.clone()).or_default() += v;
+            let e = report.sources.entry(k.clone()).or_default();
+            *e = e.saturating_add(*v);
         }
         for (k, v) in &other.block_reasons {
-            *report.block_reasons.entry(k.clone()).or_default() += v;
+            let e = report.block_reasons.entry(k.clone()).or_default();
+            *e = e.saturating_add(*v);
         }
     }
 
@@ -1670,5 +1685,250 @@ mod tests {
         assert_eq!(got.sources.get("decision_model").copied(), Some(4));
         assert_eq!(got.block_reasons.get("decided_no").copied(), Some(2));
         assert_eq!(got.block_reasons.get("unavailable").copied(), Some(1));
+    }
+}
+
+/// tmux-22 REVIEW CELLS (not for landing) — the N2 half-open protocol as
+/// wired on the SYNC destructive path (`destructive_judge`, d002936df).
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod review_sync_probe_cells {
+    use super::*;
+    use serde_json::json;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn members() -> Vec<(String, String)> {
+        let c = "the production deploy window is every tuesday at 02:00 utc".to_string();
+        vec![("a".to_string(), c.clone()), ("b".to_string(), c)]
+    }
+
+    fn yes_body() -> serde_json::Value {
+        let document = json!({ "verdict": "yes" }).to_string();
+        json!({"choices": [{
+            "message": {"role": "assistant", "content": document},
+            "logprobs": {"content": [{"token": "yes", "logprob": 0.95f64.ln()}]},
+        }]})
+    }
+
+    fn client_for(decision_url: &str, db: &Path) -> OllamaClient {
+        let mut cfg = AppConfig::default();
+        cfg.llm = Some(crate::config::LlmSection {
+            backend: Some("ollama".to_string()),
+            model: Some("vendor/chat-1".to_string()),
+            base_url: Some("http://127.0.0.1:9".to_string()),
+            ..crate::config::LlmSection::default()
+        });
+        cfg.decision = Some(crate::decision_config::DecisionSection {
+            provider: Some("openai-compatible".to_string()),
+            model: Some("vendor/decision-1".to_string()),
+            base_url: Some(decision_url.to_string()),
+            api_key_env: None,
+            api_key_file: None,
+            api_key: None,
+            timeout_secs: Some(2),
+            fallback: Some(DecisionFallback::Abstain),
+        });
+        let client =
+            OllamaClient::new_with_url_no_health_check("http://127.0.0.1:9", "vendor/chat-1")
+                .expect("client");
+        attach_decider(Some(client), &cfg, db).expect("attached")
+    }
+
+    /// Put the breaker HALF-OPEN: threshold reached, cooldown elapsed.
+    fn half_open(seams: &DecisionSeams) {
+        let mut st = seams.breaker.lock();
+        st.consecutive_unavailable = BREAKER_THRESHOLD;
+        st.opened_at = Instant::now().checked_sub(BREAKER_COOLDOWN + Duration::from_secs(1));
+        st.probing = false;
+    }
+
+    async fn hits(server: &MockServer) -> usize {
+        server.received_requests().await.unwrap_or_default().len()
+    }
+
+    /// CELL 1 — a SUCCESSFUL probe on the sync path CLOSES the breaker: the
+    /// ticket is completed with the answer, not dropped uncompleted (a drop
+    /// would re-open it for another cooldown after a good answer).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sync_destructive_probe_success_closes_the_breaker() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(yes_body()))
+            .mount(&server)
+            .await;
+        let db = tempfile::tempdir().unwrap();
+        let client = client_for(&server.uri(), db.path());
+        let seams = client.decider().expect("gated");
+        half_open(seams);
+        let judgement = tokio::task::block_in_place(|| {
+            std::thread::scope(|s| s.spawn(|| judge_merge(&client, &members())).join().unwrap())
+        })
+        .expect("abstain posture");
+        assert!(
+            matches!(judgement, MergeJudgement::Permit { .. }),
+            "the probe answered a confident yes: {judgement:?}"
+        );
+        assert_eq!(hits(&server).await, 1, "exactly one probe dialled");
+        let st = seams.breaker.lock();
+        assert!(!st.probing, "slot released");
+        assert_eq!(st.consecutive_unavailable, 0, "a good probe closes it");
+        assert!(st.opened_at.is_none(), "a good probe must not re-open it");
+        drop(st);
+        assert!(matches!(
+            seams.breaker.admit(Instant::now()),
+            Admission::Proceed
+        ));
+    }
+
+    /// CELL 2 — while the ONE probe is in flight on the sync path, a
+    /// concurrent destructive call SHORT-CIRCUITS (blocks `unavailable`
+    /// without a socket); the probe's answer then closes the breaker.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sync_destructive_concurrent_caller_short_circuits_during_the_probe() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(1200))
+                    .set_body_json(yes_body()),
+            )
+            .mount(&server)
+            .await;
+        let db = tempfile::tempdir().unwrap();
+        let client = client_for(&server.uri(), db.path());
+        let seams = client.decider().expect("gated");
+        half_open(seams);
+        let rt = tokio::runtime::Handle::current();
+        let (probe, second, second_took) = tokio::task::block_in_place(|| {
+            std::thread::scope(|s| {
+                let a = s.spawn(|| judge_merge(&client, &members()));
+                // Wait until the probe's request is ON THE WIRE.
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while rt.block_on(hits(&server)) == 0 {
+                    assert!(Instant::now() < deadline, "probe never dialled");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                let t = Instant::now();
+                let b = s.spawn(|| judge_merge(&client, &members())).join().unwrap();
+                let took = t.elapsed();
+                (a.join().unwrap(), b, took)
+            })
+        });
+        assert!(
+            matches!(
+                second.as_ref().expect("abstain"),
+                MergeJudgement::Block {
+                    reason: MergeBlockReason::Unavailable(AbstainReason::Unavailable),
+                    source: DecisionSource::Deterministic,
+                }
+            ),
+            "the concurrent caller short-circuits: {second:?}"
+        );
+        assert!(
+            second_took < Duration::from_millis(500),
+            "no socket: {second_took:?}"
+        );
+        assert!(matches!(
+            probe.expect("abstain"),
+            MergeJudgement::Permit { .. }
+        ));
+        assert_eq!(
+            hits(&server).await,
+            1,
+            "ONE probe, the concurrent caller never dialled"
+        );
+        assert!(matches!(
+            seams.breaker.admit(Instant::now()),
+            Admission::Proceed
+        ));
+    }
+
+    /// CELL 3 — a probe that TIMES OUT on the sync path is a FAILED probe:
+    /// the breaker re-opens for a fresh cooldown and the slot is released
+    /// (the next cooldown admits a new probe; nothing holds it forever).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sync_destructive_timed_out_probe_reopens_and_releases_the_slot() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_secs(30))
+                    .set_body_json(yes_body()),
+            )
+            .mount(&server)
+            .await;
+        let db = tempfile::tempdir().unwrap();
+        let client = client_for(&server.uri(), db.path());
+        let seams = client.decider().expect("gated");
+        half_open(seams);
+        let before = Instant::now();
+        let judgement = tokio::task::block_in_place(|| {
+            std::thread::scope(|s| s.spawn(|| judge_merge(&client, &members())).join().unwrap())
+        })
+        .expect("abstain posture");
+        assert!(
+            matches!(
+                judgement,
+                MergeJudgement::Block {
+                    reason: MergeBlockReason::Unavailable(_),
+                    ..
+                }
+            ),
+            "{judgement:?}"
+        );
+        {
+            let st = seams.breaker.lock();
+            assert!(!st.probing, "the timed-out probe released the slot");
+            assert!(
+                st.opened_at.is_some_and(|o| o >= before),
+                "re-opened for a fresh cooldown"
+            );
+        }
+        assert!(matches!(
+            seams.breaker.admit(Instant::now()),
+            Admission::ShortCircuit
+        ));
+        assert!(
+            matches!(
+                seams.breaker.admit(Instant::now() + BREAKER_COOLDOWN),
+                Admission::Probe(_)
+            ),
+            "the next cooldown admits a fresh probe"
+        );
+    }
+    /// CELL 4 (expected RED on d002936df — pre-existing N2 protocol, both
+    /// paths) — a STALE `Proceed` call, admitted while the breaker was
+    /// still closed and completing while a probe is in flight, clears
+    /// `probing` in `observe`; once its re-open cooldown elapses a SECOND
+    /// probe is admitted while the first ticket is still held. Reachable
+    /// only when `[decision].timeout_secs` (unbounded above) exceeds
+    /// `BREAKER_COOLDOWN` (30 s): the stale call must outlive a cooldown.
+    #[test]
+    fn a_stale_proceed_observe_must_not_free_a_held_probe_slot() {
+        let breaker = SeamBreaker::default();
+        let t0 = Instant::now();
+        let stale = breaker.admit(t0);
+        assert!(
+            matches!(stale, Admission::Proceed),
+            "closed: the slow call P proceeds"
+        );
+        for _ in 0..BREAKER_THRESHOLD {
+            breaker.observe(Some(AbstainReason::Unavailable), t0);
+        }
+        let q_at = t0 + BREAKER_COOLDOWN;
+        let q = breaker.admit(q_at);
+        assert!(matches!(q, Admission::Probe(_)), "probe Q in flight");
+        // P (timeout_secs > cooldown) finally times out while Q is held.
+        breaker.observe(Some(AbstainReason::Timeout), q_at + Duration::from_secs(5));
+        let r = breaker.admit(q_at + Duration::from_secs(5) + BREAKER_COOLDOWN);
+        assert!(
+            matches!(r, Admission::ShortCircuit),
+            "Q is still held: EXACTLY ONE probe may be in flight, got a second"
+        );
+        drop(q);
     }
 }
