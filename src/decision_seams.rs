@@ -330,6 +330,13 @@ impl SeamBreaker {
         let mut state = self.lock();
         if release_probe {
             state.probing = false;
+        } else if state.probing {
+            // #3806 Codex P2 — while a probe owns the half-open slot, a STALE
+            // Proceed result (admitted while closed, finishing now) decides
+            // nothing: a stale SUCCESS used to reset the failure counter and
+            // close the breaker under the probe, defeating half-open. The
+            // probe's own result is the only one that may move the state.
+            return;
         }
         match reason {
             // An answer — a decision or a decline — closes the breaker.
@@ -1707,7 +1714,12 @@ mod review_sync_probe_cells {
         let document = json!({ "verdict": "yes" }).to_string();
         json!({"choices": [{
             "message": {"role": "assistant", "content": document},
-            "logprobs": {"content": [{"token": "yes", "logprob": 0.95f64.ln()}]},
+            // A real stream: tokens concatenate to the document (#3806 P1).
+            "logprobs": {"content": [
+                {"token": "{\"verdict\":\"", "logprob": 0.0},
+                {"token": "yes", "logprob": 0.95f64.ln()},
+                {"token": "\"}", "logprob": 0.0},
+            ]},
         }]})
     }
 
@@ -1907,6 +1919,32 @@ mod review_sync_probe_cells {
     /// probe is admitted while the first ticket is still held. Reachable
     /// only when `[decision].timeout_secs` (unbounded above) exceeds
     /// `BREAKER_COOLDOWN` (30 s): the stale call must outlive a cooldown.
+    /// #3806 Codex P2 — a stale SUCCESSFUL Proceed finishing while a probe
+    /// holds the half-open slot must not close the breaker under it.
+    #[test]
+    fn a_stale_successful_proceed_does_not_close_the_breaker_under_a_probe() {
+        let breaker = SeamBreaker::default();
+        let t0 = Instant::now();
+        let stale = breaker.admit(t0);
+        assert!(
+            matches!(stale, Admission::Proceed),
+            "closed: the slow call P proceeds"
+        );
+        for _ in 0..BREAKER_THRESHOLD {
+            breaker.observe(Some(AbstainReason::Unavailable), t0);
+        }
+        let q_at = t0 + BREAKER_COOLDOWN;
+        let q = breaker.admit(q_at);
+        assert!(matches!(q, Admission::Probe(_)), "probe Q in flight");
+        // P finally SUCCEEDS while Q is held: it must not close the breaker.
+        breaker.observe(None, q_at);
+        assert!(
+            matches!(breaker.admit(q_at), Admission::ShortCircuit),
+            "a stale success must not reopen admission while the probe decides"
+        );
+        drop(q);
+    }
+
     #[test]
     fn a_stale_proceed_observe_must_not_free_a_held_probe_slot() {
         let breaker = SeamBreaker::default();

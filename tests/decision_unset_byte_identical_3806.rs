@@ -224,6 +224,11 @@ const DECIDER_ALLOWED: &[&str] = &[
     // W1a, before W1b tightened the scan, so the stacked integration
     // branch inherited a list that had never seen them (#3826).
     "src/decision_clients.rs",
+    // #3806 code-review F1 (Codex P2 census, f2r-confirmed): the curator
+    // FOLDS the SAL consolidator's `MergeJudgeReport` into the outer report
+    // (`MergeJudgeReport::fold_into`). It names the report type only; it
+    // obtains no decider.
+    "src/curator/mod.rs",
     "src/decision_clients/calibration.rs",
     "src/decision_clients/chat.rs",
     "src/decision_clients/fallback.rs",

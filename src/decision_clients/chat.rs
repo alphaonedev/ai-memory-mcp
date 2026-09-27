@@ -355,7 +355,7 @@ impl OpenAiCompatibleDecider {
 
     /// Confidence for `label`, or `None` when it cannot be attributed.
     fn confidence_for(answer: &StructuredAnswer, label: &str) -> Option<f64> {
-        label_probability(answer.logprobs.as_deref()?, label)
+        label_probability(answer.logprobs.as_deref()?, answer.field, label)
     }
 }
 
@@ -425,6 +425,9 @@ impl DecisionProvider for OpenAiCompatibleDecider {
 /// The two things a structured response carries: the schema field, and
 /// the token logprobs that may license a confidence for it.
 struct StructuredAnswer {
+    /// The schema field the answer was read from (`verdict` / `choice` /
+    /// `score`); confidence is attributed ONLY to that field's value.
+    field: &'static str,
     payload: Value,
     logprobs: Option<Vec<Value>>,
 }
@@ -448,7 +451,7 @@ struct StructuredAnswer {
 /// Absent logprobs are NOT a failure; they are an absent confidence.
 fn read_structured_answer(
     response: &Value,
-    field: &str,
+    field: &'static str,
 ) -> Result<StructuredAnswer, AbstainReason> {
     let choice = response.get("choices").and_then(|c| c.get(0));
     let message = choice.and_then(|c| c.get("message"));
@@ -481,22 +484,40 @@ fn read_structured_answer(
         .and_then(|block| block.get("content"))
         .and_then(Value::as_array)
         .cloned();
-    Ok(StructuredAnswer { payload, logprobs })
+    Ok(StructuredAnswer {
+        field,
+        payload,
+        logprobs,
+    })
 }
 
-/// The probability the endpoint assigned to `label`, or `None` when it
-/// cannot be attributed to exactly one token run.
+/// The probability the endpoint assigned to `label` AS THE VALUE OF
+/// `field`, or `None` when it cannot be attributed.
 ///
 /// `content` is the OpenAI `choices[0].logprobs.content` array of
-/// `{token, logprob}` entries. The rule, stated once here and pinned in
-/// the tests: find every contiguous run of tokens whose concatenation
-/// equals `label` exactly; accept only if there is EXACTLY ONE such run;
-/// the probability is `exp(Σ logprob)` over it.
-fn label_probability(content: &[Value], label: &str) -> Option<f64> {
-    if label.is_empty() || content.is_empty() {
+/// `{token, logprob}` entries; their concatenation is the answer document.
+/// The rule, stated once here and pinned in the tests:
+/// 1. ANCHOR — in the concatenated text, find the value of `field`: the
+///    `"<field>"` key, optional whitespace, `:`, optional whitespace, then
+///    the quoted `label`. Exactly ONE such occurrence must exist.
+/// 2. ALIGN — the label's byte span must start and end on token
+///    boundaries; the probability is `exp(Σ logprob)` over exactly the
+///    tokens covering it.
+///
+/// #3806 (Codex P1, confirmed by f2r): the previous rule accepted ANY
+/// single token run equal to the label anywhere in the stream. When the
+/// verdict token was fused with its quote (no aligned run) and an
+/// unrelated field emitted an exact `yes` at p=0.99, that stray run was
+/// attributed to the verdict and PERMITTED a destructive delete while the
+/// verdict itself carried p=0.01. Anchoring to the field closes that; a
+/// fused (unaligned) verdict now reports NO confidence, which blocks.
+fn label_probability(content: &[Value], field: &str, label: &str) -> Option<f64> {
+    if label.is_empty() || field.is_empty() || content.is_empty() {
         return None;
     }
-    let mut tokens: Vec<(&str, f64)> = Vec::with_capacity(content.len());
+    let mut text = String::new();
+    // (byte offset where the token starts, logprob)
+    let mut spans: Vec<(usize, f64)> = Vec::with_capacity(content.len());
     for entry in content {
         let token = entry.get("token")?.as_str()?;
         let logprob = entry.get("logprob")?.as_f64()?;
@@ -505,29 +526,55 @@ fn label_probability(content: &[Value], label: &str) -> Option<f64> {
         if !logprob.is_finite() || logprob > 0.0 {
             return None;
         }
-        tokens.push((token, logprob));
+        spans.push((text.len(), logprob));
+        text.push_str(token);
     }
 
-    let mut runs: Vec<f64> = Vec::new();
-    for start in 0..tokens.len() {
-        let mut accumulated = String::new();
-        let mut total = 0.0_f64;
-        for (token, logprob) in &tokens[start..] {
-            accumulated.push_str(token);
-            total += *logprob;
-            if accumulated.len() > label.len() {
-                break;
-            }
-            if accumulated == label {
-                runs.push(total);
-                break;
-            }
+    let key = format!("\"{field}\"");
+    let mut anchored: Vec<usize> = Vec::new();
+    let mut from = 0;
+    while let Some(pos) = text[from..].find(&key) {
+        let key_at = from + pos;
+        from = key_at + key.len();
+        let rest = &text[from..];
+        let after_ws = rest.trim_start();
+        let Some(after_colon) = after_ws.strip_prefix(':') else {
+            continue;
+        };
+        let value = after_colon.trim_start();
+        if let Some(tail) = value.strip_prefix('"')
+            && tail.strip_prefix(label).is_some_and(|t| t.starts_with('"'))
+        {
+            // byte offset of the label inside `text`
+            anchored.push(text.len() - tail.len());
         }
     }
-    if runs.len() != 1 {
+    if anchored.len() != 1 {
         return None;
     }
-    let probability = runs[0].exp();
+    let (start, end) = (anchored[0], anchored[0] + label.len());
+
+    let mut total = 0.0_f64;
+    let (mut starts_aligned, mut ends_aligned) = (false, false);
+    for (idx, (token_start, logprob)) in spans.iter().enumerate() {
+        let token_end = spans.get(idx + 1).map_or(text.len(), |next| next.0);
+        if *token_start == start {
+            starts_aligned = true;
+        }
+        if token_end == end {
+            ends_aligned = true;
+        }
+        if *token_start >= start && token_end <= end {
+            total += *logprob;
+        } else if *token_start < end && token_end > start {
+            // A token straddles the label's boundary: unaligned.
+            return None;
+        }
+    }
+    if !(starts_aligned && ends_aligned) {
+        return None;
+    }
+    let probability = total.exp();
     // `exp` of a non-positive sum is always <= 1.0, so this only rejects
     // a payload that lied about its logprobs; `Decision::decided` would
     // degrade such a value anyway, but refusing it here keeps the reason
@@ -567,8 +614,8 @@ mod tests {
             token("s", -0.3),
             token("\"}", -0.02),
         ];
-        let probability =
-            label_probability(&content, "yes").expect("a single aligned run must attribute");
+        let probability = label_probability(&content, "verdict", "yes")
+            .expect("a single aligned run must attribute");
         assert!(
             (probability - (-0.5_f64).exp()).abs() < 1e-12,
             "probability must be exp(sum of the run's logprobs): {probability}"
@@ -577,24 +624,94 @@ mod tests {
 
     #[test]
     fn an_ambiguous_or_unaligned_attribution_reports_no_confidence() {
-        // TWO runs reconstruct the label: which one decided is unknowable.
+        // TWO `verdict` keys: which one decided is unknowable.
         let ambiguous = [
-            token("no", -0.1),
             token("{\"verdict\":\"", -0.01),
             token("no", -0.4),
+            token("\",\"verdict\":\"", -0.01),
+            token("no", -0.3),
             token("\"}", -0.02),
         ];
-        assert_eq!(label_probability(&ambiguous, "no"), None, "ambiguous run");
+        assert_eq!(
+            label_probability(&ambiguous, "verdict", "no"),
+            None,
+            "ambiguous field"
+        );
         // The label is swallowed by a wider token: no aligned run exists.
         let unaligned = [token("{\"verdict\":\"yes\"}", -0.05)];
-        assert_eq!(label_probability(&unaligned, "yes"), None, "unaligned");
+        assert_eq!(
+            label_probability(&unaligned, "verdict", "yes"),
+            None,
+            "unaligned"
+        );
         // A positive logprob is not evidence.
         let broken = [token("yes", 0.5)];
-        assert_eq!(label_probability(&broken, "yes"), None, "positive logprob");
+        assert_eq!(
+            label_probability(&broken, "verdict", "yes"),
+            None,
+            "positive logprob"
+        );
         // An entry missing its logprob is not evidence either.
         let partial = [json!({"token": "yes"})];
-        assert_eq!(label_probability(&partial, "yes"), None, "missing logprob");
-        assert_eq!(label_probability(&[], "yes"), None, "empty content");
+        assert_eq!(
+            label_probability(&partial, "verdict", "yes"),
+            None,
+            "missing logprob"
+        );
+        assert_eq!(
+            label_probability(&[], "verdict", "yes"),
+            None,
+            "empty content"
+        );
+    }
+
+    /// #3806 Codex P1 — the confidence is the VERDICT's, never a stray
+    /// token's. The verdict value is fused with its quote (no aligned run)
+    /// and an unrelated field emits an exact `yes` at p=0.99: pre-fix that
+    /// stray run was the single match and PERMITTED a delete. Now there is
+    /// no attributable confidence. CONTROL: the same document with the
+    /// verdict aligned attributes the VERDICT's own p=0.01, not the note's.
+    #[test]
+    fn confidence_is_anchored_to_the_verdict_field_not_a_stray_token_3806_p1() {
+        let fused = [
+            token("{\"note\":\"", -0.01),
+            token("yes", 0.99_f64.ln()),
+            token("\",\"verdict\":", -0.01),
+            token("\"yes\"", 0.01_f64.ln()),
+            token("}", -0.01),
+        ];
+        assert_eq!(
+            label_probability(&fused, "verdict", "yes"),
+            None,
+            "a stray `yes` in another field must never be read as the verdict's confidence"
+        );
+        let aligned = [
+            token("{\"note\":\"", -0.01),
+            token("yes", 0.99_f64.ln()),
+            token("\",\"verdict\":\"", -0.01),
+            token("yes", 0.01_f64.ln()),
+            token("\"}", -0.01),
+        ];
+        let p = label_probability(&aligned, "verdict", "yes").expect("aligned verdict attributes");
+        assert!(
+            (p - 0.01).abs() < 1e-9,
+            "the VERDICT's probability, got {p}"
+        );
+    }
+
+    /// f2r's optional cell — a NESTED `verdict` key elsewhere in the
+    /// document makes the anchor ambiguous, so no confidence is attributed
+    /// (fail closed), even though the top-level verdict is aligned.
+    #[test]
+    fn a_nested_verdict_key_makes_the_anchor_ambiguous_3806_p1() {
+        let nested = [
+            token("{\"note\":{\"verdict\":\"", -0.01),
+            token("yes", 0.99_f64.ln()),
+            token("\"},\"verdict\":\"", -0.01),
+            token("yes", 0.01_f64.ln()),
+            token("\"}", -0.01),
+        ];
+        assert_eq!(label_probability(&nested, "verdict", "yes"), None);
     }
 
     #[test]

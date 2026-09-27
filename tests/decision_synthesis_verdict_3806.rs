@@ -174,9 +174,17 @@ fn decision_body(content: &str) -> Value {
 /// ln p`), so the client derives a confidence of exactly `p`.
 fn decision_body_with_confidence(verdict: &str, p: f64) -> Value {
     let document = json!({ FIELD_VERDICT: verdict }).to_string();
+    // A REAL logprobs stream: its tokens concatenate to the content
+    // document, so the verdict's confidence is anchored to the `verdict`
+    // field (#3806 P1). The wrapper tokens carry logprob 0 (p = 1) so
+    // the derived confidence is exactly `p`.
     json!({"choices": [{
         "message": {"role": "assistant", "content": document},
-        "logprobs": {"content": [{"token": verdict, "logprob": p.ln()}]},
+        "logprobs": {"content": [
+            {"token": format!("{{\"{FIELD_VERDICT}\":\""), "logprob": 0.0},
+            {"token": verdict, "logprob": p.ln()},
+            {"token": "\"}", "logprob": 0.0},
+        ]},
     }]})
 }
 
