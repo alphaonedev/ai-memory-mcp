@@ -182,3 +182,27 @@ fn release_notes_do_not_claim_the_cert_workflow_builds_the_image_4008() {
         ISSUE,
     );
 }
+
+/// #4009 — the abort-after-commit harness proves crash consistency across an
+/// unclean PROCESS exit; `PERFORMANCE.md` marks real power-cut durability NOT
+/// proven, so the release notes must not say the harness "proves" survival of
+/// a power cut.
+#[test]
+fn release_notes_do_not_claim_the_abort_harness_proves_power_cut_durability_4009() {
+    const ISSUE: &str = "#4009";
+    // Premise anchors: the harness aborts the process, and PERFORMANCE.md
+    // still marks power-cut durability unproven.
+    assert_present("src/recover/durability.rs", "std::process::abort();", ISSUE);
+    assert_present("PERFORMANCE.md", "**NOT proven", ISSUE);
+    assert_absent(
+        "docs/v1.0.0/release-notes.md",
+        "survives a power cut. A fault-injection harness (`AI_MEMORY_TEST_ABORT_AFTER_COMMIT`, row #129) proves it.",
+        ISSUE,
+    );
+    assert_present(
+        "docs/v1.0.0/release-notes.md",
+        "proves crash consistency across an unclean process exit; real power-cut fsync behavior is not yet evidenced",
+        ISSUE,
+    );
+    assert_absent("CLAUDE.md", "simulating a power cut / SIGKILL", ISSUE);
+}
