@@ -435,7 +435,7 @@ async fn cross_id_title_merge_keeps_other_row_quarantined(backend: &Backend) {
 ///
 /// #4017 — the quarantined copy is the SAME signed unit (same `created_at`),
 /// as a relayed-unattributed copy of one write is. Pre-#4017 this cell seeded
-/// `created_at = T_OLD`, so the merged row kept `T_OLD` (created_at is
+/// `created_at = T_OLD`, so the merged row kept `T_OLD` (`created_at` is
 /// min-merged) and was NOT the signed unit; releasing it was the #4017 defect,
 /// which this control must not depend on. The different-`created_at` shape is
 /// pinned as REFUSED in `tests/federation_dequarantine_same_id_4017.rs`.
