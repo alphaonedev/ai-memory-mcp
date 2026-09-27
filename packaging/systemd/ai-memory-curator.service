@@ -13,6 +13,8 @@ Wants=ai-memory.service
 Type=simple
 User=ai-memory
 Group=ai-memory
+Environment=AI_MEMORY_DB=/var/lib/ai-memory/ai-memory.db
+WorkingDirectory=/var/lib/ai-memory
 # Default sweep: every hour, at most 100 LLM-invoking operations per
 # cycle. Tune via EnvironmentFile=/etc/ai-memory/curator.env:
 #   AI_MEMORY_CURATOR_INTERVAL_SECS=3600

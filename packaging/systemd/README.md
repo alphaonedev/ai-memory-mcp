@@ -1,8 +1,11 @@
 # ai-memory systemd units
 
 Drop-in systemd units for operators running ai-memory as a hardened
-single-node deployment. Shipped by the Debian (.deb) and Fedora COPR
-packages; also usable standalone on any systemd distro.
+single-node deployment. The Debian (.deb), release RPM and Fedora COPR
+recipes are binary-only: install the users, state directories and units
+manually using the steps below before enabling services. The AUR package
+ships the units and sysusers fragment. These units also work standalone
+on any systemd distro.
 
 ## Units
 
@@ -20,10 +23,9 @@ packages; also usable standalone on any systemd distro.
 ## Install — manual
 
 ```sh
-# 1. System users + state dir. Distro packages install
-#    packaging/systemd/ai-memory.sysusers.conf as
-#    /usr/lib/sysusers.d/ai-memory.conf; systemd-sysusers creates both
-#    users on first boot (the AUR PKGBUILD ships this). Manual:
+# 1. System users + state dir. Required for binary-only deb/rpm installs.
+#    The AUR PKGBUILD installs /usr/lib/sysusers.d/ai-memory.conf; for
+#    manual installation, create both service users from the source fragment:
 sudo systemd-sysusers packaging/systemd/ai-memory.sysusers.conf
 # Fallback if systemd-sysusers is unavailable:
 # sudo useradd --system --home /var/lib/ai-memory --shell /usr/sbin/nologin ai-memory

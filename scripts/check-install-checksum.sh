@@ -250,7 +250,7 @@ run_static() {
 # Tools the installer legitimately needs, beyond the download client. The
 # scenario-D minimal PATH is built from exactly this list, so a SHA-256
 # tool can be withheld without withholding anything else.
-MIN_TOOLS=(sh env gzip uname mktemp rm mkdir cp chmod tar awk wc tr ls cat sed grep)
+MIN_TOOLS=(sh env gzip uname mktemp rm mkdir cp mv chmod tar awk wc tr ls cat sed grep)
 
 # Every fail-closed abort in install.sh prints this line.
 # Reject scenarios must see it, so that a harness-level failure (a missing
