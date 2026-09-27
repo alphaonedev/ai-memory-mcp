@@ -507,10 +507,15 @@ Implications:
    must tamper with **all three** without leaving evidence
    ([`signed-events-v4.md §"Three complementary verifiers"`](signed-events-v4.html)).
 
-### 4.6 Latency budget (T3)
+### 4.6 Latency budget (T3) — illustrative, unmeasured
 
-Reference numbers from the LAN-parity test fleet
-(`infra/lan-parity-test/`) on two-rack same-DC topology:
+> **Provenance: illustrative targets, not measurements.** No committed
+> receipt or script produces the table below. In particular it does
+> **not** come from `infra/lan-parity-test/`: that harness runs the
+> SAL-postgres cross-adapter parity tests serially against a local
+> PG+AGE container and samples no latency percentiles. Use the rows as
+> planning targets for a two-rack same-DC topology and measure your own
+> fleet before relying on them (#3999).
 
 | Operation | p50 | p95 | p99 |
 |---|---|---|---|
@@ -518,7 +523,7 @@ Reference numbers from the LAN-parity test fleet
 | `POST /api/v1/memories` (W=2 of N=3 quorum) | 14 ms | 38 ms | 75 ms |
 | `GET /api/v1/recall?q=…` (local; hot HNSW) | 8 ms | 22 ms | 50 ms |
 | `POST /api/v1/sync/push` (single payload, 5 memories) | 11 ms | 30 ms | 65 ms |
-| `POST /api/v1/kg/find_paths` (depth=3, AGE) | 12 ms | 35 ms | 80 ms |
+| `POST /api/v1/kg/find_paths` (depth=3; relational CTE on both backends) | 12 ms | 35 ms | 80 ms |
 
 LAN RTT-bound. Federation fanout adds one full RTT × peer count to
 the write path. The CRDT-lite merge cost on the receiving side scales
