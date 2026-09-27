@@ -169,12 +169,11 @@ pub(super) fn handle_consolidate(
 
     let auto_generated = params["summary"].as_str().is_none();
 
-    // Remove old entries from HNSW index before consolidation deletes them
-    if let Some(idx) = vector_index {
-        for id in &ids {
-            idx.remove(id);
-        }
-    }
+    // #4063 — the vector index is NOT touched here. It used to drop every
+    // source id BEFORE the quota check and `db::consolidate`, so a refused
+    // quota or a failed write returned an error while the source rows stayed
+    // live in the database but vanished from semantic recall for the rest of
+    // the process. Index publication is now strictly post-commit (below).
 
     // NHI: the caller (consolidator) owns the new memory's agent_id;
     // source authors are preserved as a forensic array by db::consolidate.
@@ -247,6 +246,16 @@ pub(super) fn handle_consolidate(
         }
     };
 
+    // #4063 — post-commit index publication. `db::consolidate` has durably
+    // replaced the sources, so retire their vectors now (unconditionally —
+    // not only when the new row embeds), then publish the new row's vector
+    // below. No error path above this line mutates the index.
+    if let Some(idx) = vector_index {
+        for id in &ids {
+            idx.remove(id);
+        }
+    }
+
     // Generate embedding for the consolidated memory (#52)
     if let Some(emb) = embedder {
         let text = format!("{title} {summary}");
@@ -262,10 +271,6 @@ pub(super) fn handle_consolidate(
                     );
                 }
                 if let Some(idx) = vector_index {
-                    // Remove old embeddings from HNSW index
-                    for id in &ids {
-                        idx.remove(id);
-                    }
                     idx.insert(new_id.clone(), embedding);
                 }
             }
@@ -1220,6 +1225,165 @@ mod tests {
             links_resp["links"].as_array().map(Vec::len),
             Some(0),
             "links array must be empty"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #4063 — a REFUSED or FAILED consolidation must not touch the vector
+    // index. Pre-fix every source id was removed from the index before the
+    // quota check and the storage write, so an error left live rows missing
+    // from semantic recall for the rest of the process.
+    // -----------------------------------------------------------------------
+
+    const QUOTA_AGENT_4063: &str = "ai:test";
+
+    /// Two indexed sources in `ns`, plus the warm index holding them.
+    fn warm_index_4063(
+        conn: &rusqlite::Connection,
+        ns: &str,
+        embedder: &MockEmbedder,
+    ) -> (Vec<String>, crate::hnsw::VectorIndex) {
+        let index = crate::hnsw::VectorIndex::empty();
+        let ids: Vec<String> = ["alpha source", "beta source"]
+            .iter()
+            .map(|t| seed_observation(conn, ns, t))
+            .collect();
+        for id in &ids {
+            let mem = db::get(conn, id).expect("get").expect("seeded");
+            let v = embedder.embed(&mem.title).expect("embed");
+            db::set_embedding(conn, id, &v, &embedder.space_fingerprint()).expect("set emb");
+            index.insert(id.clone(), v);
+        }
+        (ids, index)
+    }
+
+    /// Every source is still a semantic-recall hit for its own vector.
+    fn assert_sources_indexed_4063(
+        conn: &rusqlite::Connection,
+        index: &crate::hnsw::VectorIndex,
+        ids: &[String],
+        embedder: &MockEmbedder,
+        cell: &str,
+    ) {
+        assert_eq!(index.len(), ids.len(), "{cell}: index membership changed");
+        for id in ids {
+            let mem = db::get(conn, id)
+                .expect("get")
+                .unwrap_or_else(|| panic!("{cell}: source row {id} must stay live"));
+            let q = embedder.embed(&mem.title).expect("embed");
+            let hits = index.search(&q, 10);
+            assert!(
+                hits.iter().any(|h| &h.id == id),
+                "{cell}: live source {id} vanished from semantic recall: {hits:?}"
+            );
+        }
+    }
+
+    fn consolidate_args_4063(ids: &[String], ns: &str) -> Value {
+        json!({
+            "ids": ids,
+            "title": "merged 4063",
+            "summary": "explicit summary 4063",
+            "namespace": ns,
+            "agent_id": QUOTA_AGENT_4063,
+        })
+    }
+
+    #[test]
+    fn quota_refused_consolidation_leaves_the_vector_index_intact_4063() {
+        // Serialize against sibling tests that install AI_MEMORY_AGENT_ID (the
+        // consolidator / quota key must be the explicit `agent_id`).
+        let _agent_env = crate::identity::agent_id_env_test_lock();
+        let (conn, tmp) = fresh_db();
+        let ns = "cons-4063-quota";
+        let embedder = MockEmbedder::new_local().expect("mock embedder");
+        let (ids, index) = warm_index_4063(&conn, ns, &embedder);
+        // Exhaust the consolidator's daily write quota.
+        crate::quotas::get_status(&conn, QUOTA_AGENT_4063, ns).expect("quota row");
+        conn.execute(
+            "UPDATE agent_quotas SET max_memories_per_day = 0 WHERE agent_id = ?1 AND namespace = ?2",
+            rusqlite::params![QUOTA_AGENT_4063, ns],
+        )
+        .expect("exhaust quota");
+
+        let err = handle_consolidate(
+            &conn,
+            tmp.path(),
+            &consolidate_args_4063(&ids, ns),
+            None,
+            Some(&embedder as &dyn Embed),
+            Some(&index),
+            None,
+            None,
+        )
+        .expect_err("an exhausted quota must refuse the consolidation");
+        assert!(err.to_lowercase().contains("quota"), "quota refusal: {err}");
+        assert_sources_indexed_4063(&conn, &index, &ids, &embedder, "quota refusal");
+    }
+
+    #[test]
+    fn storage_failed_consolidation_leaves_the_vector_index_intact_4063() {
+        // Serialize against sibling tests that install AI_MEMORY_AGENT_ID (the
+        // consolidator / quota key must be the explicit `agent_id`).
+        let _agent_env = crate::identity::agent_id_env_test_lock();
+        let (conn, tmp) = fresh_db();
+        let ns = "cons-4063-storage";
+        let embedder = MockEmbedder::new_local().expect("mock embedder");
+        let (ids, index) = warm_index_4063(&conn, ns, &embedder);
+        // Inject a storage failure at the consolidated-row insert.
+        conn.execute_batch(
+            "CREATE TEMP TRIGGER fail_consolidate_4063 BEFORE INSERT ON memories \
+             WHEN NEW.title = 'merged 4063' \
+             BEGIN SELECT RAISE(ABORT, 'injected storage failure 4063'); END;",
+        )
+        .expect("failure trigger");
+
+        let err = handle_consolidate(
+            &conn,
+            tmp.path(),
+            &consolidate_args_4063(&ids, ns),
+            None,
+            Some(&embedder as &dyn Embed),
+            Some(&index),
+            None,
+            None,
+        )
+        .expect_err("the injected storage failure must surface");
+        assert!(!err.is_empty());
+        assert_sources_indexed_4063(&conn, &index, &ids, &embedder, "storage failure");
+    }
+
+    #[test]
+    fn successful_consolidation_swaps_source_vectors_for_the_new_row_4063() {
+        // Serialize against sibling tests that install AI_MEMORY_AGENT_ID (the
+        // consolidator / quota key must be the explicit `agent_id`).
+        let _agent_env = crate::identity::agent_id_env_test_lock();
+        let (conn, tmp) = fresh_db();
+        let ns = "cons-4063-ok";
+        let embedder = MockEmbedder::new_local().expect("mock embedder");
+        let (ids, index) = warm_index_4063(&conn, ns, &embedder);
+
+        let out = handle_consolidate(
+            &conn,
+            tmp.path(),
+            &consolidate_args_4063(&ids, ns),
+            None,
+            Some(&embedder as &dyn Embed),
+            Some(&index),
+            None,
+            None,
+        )
+        .expect("consolidation succeeds");
+        let new_id = out["id"].as_str().expect("new id").to_string();
+        assert_eq!(index.len(), 1, "sources retired, new row published");
+        let q = embedder
+            .embed("merged 4063 explicit summary 4063")
+            .expect("embed");
+        let hits = index.search(&q, 10);
+        assert!(hits.iter().any(|h| h.id == new_id), "{hits:?}");
+        assert!(
+            hits.iter().all(|h| !ids.contains(&h.id)),
+            "retired sources must not be hits: {hits:?}"
         );
     }
 }
