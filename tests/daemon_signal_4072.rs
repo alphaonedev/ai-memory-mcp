@@ -251,19 +251,26 @@ fn exercise_shutdown(signal: &str, postgres_url: Option<&str>, anchor_fault: boo
 async fn postgres_final_witness_binds_active_heads_and_failure_exits_75_4070() {
     use sha2::{Digest, Sha256};
     use sqlx::Row as _;
+    let _sandbox = ai_memory::identity::test_key_dir::install();
     let url = std::env::var("AI_MEMORY_TEST_POSTGRES_URL").expect("dedicated database");
     let pg = ai_memory::store::postgres::PostgresStore::connect(&url)
         .await
         .unwrap();
     for anchor_fault in [false, true] {
-        let sequence: i64 =
-            sqlx::query_scalar("SELECT COALESCE(MAX(sequence),0)+1 FROM signed_events")
+        let before: i64 =
+            sqlx::query_scalar("SELECT COALESCE(MAX(sequence), 0) FROM signed_events")
                 .fetch_one(pg.pool())
                 .await
                 .unwrap();
-        sqlx::query("INSERT INTO signed_events (id, agent_id, event_type, payload_hash, attest_level, timestamp, prev_hash, sequence) VALUES ($1, 'ai:shutdown4070', 'shutdown_probe', $2, 'unsigned', NOW(), $3, $4)")
-            .bind(uuid::Uuid::new_v4().to_string()).bind(ai_memory::signed_events::payload_hash(b"shutdown tail"))
-            .bind(ai_memory::signed_events::ZERO_HASH.to_vec()).bind(sequence).execute(pg.pool()).await.unwrap();
+        pg.emit_spawn_audit("shutdown-probe", "daemon4070").await;
+        let after: i64 = sqlx::query_scalar("SELECT MAX(sequence) FROM signed_events")
+            .fetch_one(pg.pool())
+            .await
+            .unwrap();
+        assert!(
+            after > before,
+            "the real PostgreSQL append must create a tail"
+        );
         let child_url = url.clone();
         tokio::task::spawn_blocking(move || {
             exercise_shutdown("INT", Some(&child_url), anchor_fault)

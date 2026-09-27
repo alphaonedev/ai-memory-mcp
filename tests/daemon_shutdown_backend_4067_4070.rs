@@ -134,16 +134,19 @@ async fn shutdown_certifies_active_postgres_head_4070() {
     let pg = ai_memory::store::postgres::PostgresStore::connect(&url)
         .await
         .unwrap();
-    let id = uuid::Uuid::new_v4().to_string();
-    let sequence: i64 =
-        sqlx::query_scalar("SELECT COALESCE(MAX(sequence), 0) + 1 FROM signed_events")
-            .fetch_one(pg.pool())
-            .await
-            .unwrap();
-    sqlx::query("INSERT INTO signed_events (id, agent_id, event_type, payload_hash, attest_level, timestamp, prev_hash, sequence) VALUES ($1, 'ai:4070', 'shutdown_probe', $2, 'unsigned', NOW(), $3, $4)")
-        .bind(&id).bind(ai_memory::signed_events::payload_hash(b"final tail"))
-        .bind(ai_memory::signed_events::ZERO_HASH.to_vec()).bind(sequence)
-        .execute(pg.pool()).await.unwrap();
+    let before: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(sequence), 0) FROM signed_events")
+        .fetch_one(pg.pool())
+        .await
+        .unwrap();
+    pg.emit_spawn_audit("shutdown-probe", "daemon4070").await;
+    let after: i64 = sqlx::query_scalar("SELECT MAX(sequence) FROM signed_events")
+        .fetch_one(pg.pool())
+        .await
+        .unwrap();
+    assert!(
+        after > before,
+        "the real PostgreSQL append must create a tail"
+    );
     let prior: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM checkpoints WHERE condition_type = 'audit_head_witness'",
     )
