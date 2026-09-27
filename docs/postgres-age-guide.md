@@ -1195,14 +1195,17 @@ adapter probes at connect time:
 
 | Op | AGE 1.8.0 (executed engine) | CTE / other | Speedup at depth=5 |
 |---|---|---|---|
-| `kg_query` | AGE Cypher `MATCH (a)-[*1..d]->(b) WHERE a.id = $1` | recursive `WITH` join (fallback) | ≥30% (S76 gate) |
-| `kg_timeline` | AGE Cypher `MATCH ... WHERE valid_from < $1 AND (valid_until IS NULL OR valid_until > $1)` | recursive temporal join (fallback) | ≥30% |
+| `kg_query` | AGE Cypher `MATCH (a)-[*1..d]->(b) WHERE a.id = $1` | recursive `WITH` join (fallback) | ≥30% threshold in the manual `benches/age_vs_cte.rs` bench (not run in CI) |
+| `kg_timeline` | AGE Cypher `MATCH ... WHERE valid_from < $1 AND (valid_until IS NULL OR valid_until > $1)` | recursive temporal join (fallback) | not benched |
 | `kg_invalidate` | AGE Cypher `MATCH ... SET valid_until = $1` | `UPDATE memory_links` (fallback) | parity |
 | `find_paths` | **relational recursive-CTE (bounded BFS) on both `KgBackend` values** — not AGE Cypher (#2582 / #3297) | (this **is** the production engine) | n/a (no AGE walk) |
 
-The S76 perf gate fires if AGE is reported as engaged but the AGE p95
-is **not** at least 30% faster than CTE p95 on the canonical 1k-entity
-/ 5k-edge corpus. That gate is honest about the AGE-vs-CTE comparison
+`benches/age_vs_cte.rs` exits non-zero when both halves ran and the AGE
+p95 is **not** at least 30% faster than the CTE p95 for `kg_query` at
+depth 5 on its 200-node / ~800-edge fixture (`FIXTURE_NODES = 200`, 4
+edges per node). It is run by hand: it skips itself without Postgres
+(or without AGE), and no CI job runs it (see `PERFORMANCE.md`
+§"AGE-vs-CTE speedup"). The comparison is AGE vs CTE
 on the **same** postgres host — comparing AGE-on-postgres to
 CTE-on-sqlite is a different question and not the speedup we claim.
 

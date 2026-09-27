@@ -633,9 +633,12 @@ some queries but the production guidance at v0.7.0 is:
 - The recursive-CTE fallback runs against the replica's `memory_links`
   table and produces correct results without AGE — useful for the
   read-only audit case.
-- The S76 perf gate guarantees AGE Cypher is ≥30% faster than CTE at
-  depth=5 on the canonical 1k-entity / 5k-edge corpus
-  ([`postgres-age-guide.md §"AGE Cypher vs CTE fallback"`](postgres-age-guide.html)).
+- `benches/age_vs_cte.rs` is a manually run bench (200-node / ~800-edge
+  fixture, `kg_query` at depth 5) that fails if AGE is not ≥30% faster
+  than CTE. It skips itself without Postgres+AGE and does not run in CI,
+  so no AGE speedup is guaranteed or gated
+  ([`postgres-age-guide.md §"AGE Cypher vs CTE fallback"`](postgres-age-guide.html),
+  `PERFORMANCE.md` §"AGE-vs-CTE speedup").
 
 ### 5.6 Connection pooling (PgBouncer enters at T4)
 
