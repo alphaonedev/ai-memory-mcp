@@ -273,7 +273,83 @@ fn rel_src(path: &Path, root: &Path) -> String {
         .replace('\\', "/")
 }
 
+/// #4052 — the ONE function-boundary routine every B7 slicer uses. Returns
+/// `(start, end, name)` for each function start `start_of` recognises, where
+/// a body runs from its own start line up to (not including) the NEXT
+/// recognised start, or to the end of the text. Before #4052 the parity
+/// helper [`fn_body_has_gate`] kept its own ad-hoc boundary (`\n    async fn `
+/// or `\npub fn ` only), so a following indented sync fn or a
+/// `pub(restricted)` fn did not end the body and the NEXT function's gate was
+/// credited to an ungated parity target.
+fn fn_spans(
+    lines: &[&str],
+    start_of: impl Fn(&str) -> Option<(usize, String)>,
+) -> Vec<(usize, usize, String)> {
+    let starts: Vec<(usize, String)> = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(i, l)| start_of(l).map(|(_, n)| (i, n)))
+        .collect();
+    starts
+        .iter()
+        .enumerate()
+        .map(|(k, (s, n))| {
+            let end = starts.get(k + 1).map_or(lines.len(), |(e, _)| *e);
+            (*s, end, n.clone())
+        })
+        .collect()
+}
+
+/// The span of the function enclosing line `idx` (the nearest recognised
+/// start at or before it), per [`fn_spans`].
+fn enclosing_span(spans: &[(usize, usize, String)], idx: usize) -> Option<&(usize, usize, String)> {
+    spans.iter().rev().find(|(s, _, _)| *s <= idx)
+}
+
+fn body_has_gate(body: &[&str]) -> bool {
+    body.iter()
+        .any(|l| GATE_MARKERS.iter().any(|g| l.contains(g)))
+}
+
+/// #4052 — gate verdict of EVERY production function named exactly `fn_name`
+/// in `src` (trailing `#[cfg(test)] mod tests` stripped, string
+/// continuations joined — the same preprocessing as the main scanner), sliced
+/// by the shared [`fn_spans`] boundary. Exact name match: `fn foo_v2` is not
+/// `fn foo` (the pre-#4052 `find("fn foo")` matched it).
+fn fn_gate_verdicts(
+    src: &str,
+    fn_name: &str,
+    start_of: impl Fn(&str) -> Option<(usize, String)>,
+) -> Vec<bool> {
+    let text = join_string_continuations(strip_test_mod(src));
+    let lines: Vec<&str> = text.lines().collect();
+    fn_spans(&lines, start_of)
+        .iter()
+        .filter(|(_, _, n)| n == fn_name)
+        .map(|(s, e, _)| body_has_gate(&lines[*s..*e]))
+        .collect()
+}
+
+/// Parity-side read: is `fn_name` gated in `src`? Fails CLOSED — every
+/// same-named definition must carry a gate, and an absent function is
+/// ungated.
 fn fn_body_has_gate(src: &str, fn_name: &str) -> bool {
+    let v = fn_gate_verdicts(src, fn_name, is_fn_start);
+    !v.is_empty() && v.iter().all(|g| *g)
+}
+
+/// Twin-side read: does ANY definition of `fn_name` gate? Used to decide
+/// whether the parity obligation applies — `any` so a gated twin can never
+/// be skipped because a same-named sibling is ungated.
+fn fn_any_body_has_gate(src: &str, fn_name: &str) -> bool {
+    fn_gate_verdicts(src, fn_name, is_fn_start)
+        .iter()
+        .any(|g| *g)
+}
+
+/// #4052 R-203 — the EXACT pre-#4052 parity slicer, frozen so the self-test
+/// proves the blind spot: it credits a FOLLOWING function's gate.
+fn fn_body_has_gate_frozen_4052(src: &str, fn_name: &str) -> bool {
     let needle = format!("fn {fn_name}");
     let Some(idx) = src.find(&needle) else {
         return false;
@@ -300,32 +376,20 @@ fn ungated_write_fns_for(
     classify: impl Fn(&str) -> bool,
 ) -> Vec<String> {
     let lines: Vec<&str> = text.lines().collect();
-    let starts: Vec<(usize, String)> = lines
-        .iter()
-        .enumerate()
-        .filter_map(|(i, l)| start_of(l).map(|(_, n)| (i, n)))
-        .collect();
+    let spans = fn_spans(&lines, start_of);
     let mut out = Vec::new();
     let mut seen = HashSet::new();
     for (idx, line) in lines.iter().enumerate() {
         if !classify(line) {
             continue;
         }
-        let Some(&(start, ref name)) = starts.iter().rev().find(|(s, _)| *s <= idx) else {
+        let Some((start, end, name)) = enclosing_span(&spans, idx) else {
             continue;
         };
         if !seen.insert(name.clone()) {
             continue;
         }
-        let end = starts
-            .iter()
-            .find(|(s, _)| *s > start)
-            .map_or(lines.len(), |(s, _)| *s);
-        let body = &lines[start..end];
-        let has_gate = body
-            .iter()
-            .any(|l| GATE_MARKERS.iter().any(|g| l.contains(g)));
-        if !has_gate {
+        if !body_has_gate(&lines[*start..*end]) {
             out.push(name.clone());
         }
     }
@@ -545,6 +609,75 @@ fn b7_scanner_sees_backslash_continued_write_sql_3942() {
     );
 }
 
+/// #4052 — sensitivity + R-203 specificity for the PARITY slicer. An
+/// ungated indented `async fn set_embeddings_batch` is followed by a gated
+/// private sync `pub(self) fn` (the exact plant from the issue), and a gated
+/// `fn set_embeddings_batch_v2` precedes it (a prefix-name trap). The shipped
+/// [`fn_body_has_gate`] must report the target UNGATED; the frozen pre-#4052
+/// slicer credits the neighbour's gate (the bug). Control: a GATED target
+/// followed by an ungated neighbour is credited by the shipped slicer.
+#[test]
+fn b7_parity_slicer_does_not_borrow_a_following_gate_4052() {
+    let plant = r#"
+impl SqliteStore {
+    async fn set_embeddings_batch_v2(&self) -> Result<()> {
+        gate_record_stop(&self.conn)?;
+        Ok(())
+    }
+
+    async fn set_embeddings_batch(&self) -> Result<()> {
+        self.conn.execute("UPDATE memories SET embedding = ?1", [])?;
+        Ok(())
+    }
+
+    pub(self) fn private_gated_helper(&self) -> Result<()> {
+        gate_record_stop(&self.conn)?;
+        Ok(())
+    }
+
+    fn sync_gated_helper(&self) -> Result<()> {
+        gate_record_stop(&self.conn)?;
+        Ok(())
+    }
+}
+"#;
+    assert!(
+        !fn_body_has_gate(plant, "set_embeddings_batch"),
+        "sensitivity: an ungated parity target followed by a gated pub(self)/sync fn must read UNGATED"
+    );
+    assert!(
+        !fn_any_body_has_gate(plant, "set_embeddings_batch"),
+        "sensitivity: the twin-side read must not borrow a neighbour's gate either"
+    );
+    assert!(
+        fn_body_has_gate_frozen_4052(plant, "set_embeddings_batch"),
+        "R-203: the frozen pre-#4052 slicer must credit the borrowed gate (that is the #4052 bug)"
+    );
+
+    let control = r#"
+impl PostgresStore {
+    async fn set_embeddings_batch(&self) -> Result<()> {
+        gate_record_stop(&self.pool)?;
+        sqlx::query("UPDATE memories SET embedding = $1");
+        Ok(())
+    }
+
+    pub(super) fn ungated_neighbour(&self) -> Result<()> {
+        sqlx::query("DELETE FROM memories");
+        Ok(())
+    }
+}
+"#;
+    assert!(
+        fn_body_has_gate(control, "set_embeddings_batch"),
+        "specificity: a GATED parity target must be credited"
+    );
+    assert!(
+        !fn_body_has_gate(control, "no_such_fn"),
+        "fail-closed: an absent parity target is not gated"
+    );
+}
+
 #[test]
 fn record_stop_write_sql_fns_are_gated_or_allowlisted_b7() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -584,18 +717,13 @@ fn record_stop_write_sql_fns_are_gated_or_allowlisted_b7() {
         // Pair every write-SQL line with the nearest preceding `fn`
         // (impl methods sit at indent 4; do not swallow them as nested
         // inside an earlier indent-0 helper).
-        let mut starts: Vec<(usize, String)> = Vec::new();
-        for (idx, line) in lines.iter().enumerate() {
-            if let Some((_, name)) = is_fn_start(line) {
-                starts.push((idx, name));
-            }
-        }
+        let spans = fn_spans(&lines, is_fn_start);
         let mut seen: HashSet<(String, String)> = HashSet::new();
         for (idx, line) in lines.iter().enumerate() {
             if !write_sql_line(line) {
                 continue;
             }
-            let Some(&(start, ref name)) = starts.iter().rev().find(|(s, _)| *s <= idx) else {
+            let Some(&(start, end, ref name)) = enclosing_span(&spans, idx) else {
                 continue;
             };
             // #3484 — write SQL held in a module/impl-level `const`/`static`
@@ -620,15 +748,7 @@ fn record_stop_write_sql_fns_are_gated_or_allowlisted_b7() {
             {
                 continue;
             }
-            let end = starts
-                .iter()
-                .find(|(s, _)| *s > start)
-                .map_or(lines.len(), |(s, _)| *s);
-            let body = &lines[start..end];
-            let has_gate = body
-                .iter()
-                .any(|l| GATE_MARKERS.iter().any(|g| l.contains(g)));
-            if has_gate {
+            if body_has_gate(&lines[start..end]) {
                 if let Some(flag) = gated_hits.get_mut(name) {
                     *flag = true;
                 }
@@ -671,7 +791,7 @@ fn record_stop_write_sql_fns_are_gated_or_allowlisted_b7() {
     let allow_txt = include_str!("record_stop_b7_allowlist.txt");
     let mut parity_fail = Vec::new();
     for (sqlite_fn, pg_fn) in SQLITE_PG_TWINS {
-        if !fn_body_has_gate(&sqlite_src, sqlite_fn) {
+        if !fn_any_body_has_gate(&sqlite_src, sqlite_fn) {
             continue;
         }
         if !fn_body_has_gate(&pg_src, pg_fn) {
