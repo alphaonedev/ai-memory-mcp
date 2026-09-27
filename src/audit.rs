@@ -868,7 +868,9 @@ pub struct VerifyReport {
     /// increments the sequence BEFORE it writes, so an event lost to a write
     /// failure (#3975) leaves a skipped value. A restart reseeds from the file
     /// tail and makes no gap, so in a single-writer trail a gap is evidence of
-    /// a lost event. A trail that starts above sequence 1 is not a gap (the
+    /// a lost event. The converse does NOT hold: events lost after the last
+    /// written line and before a restart have their numbers reused and leave
+    /// no gap (#4086). A trail that starts above sequence 1 is not a gap (the
     /// head of a file is not checked).
     pub gaps: Vec<SequenceGap>,
 }

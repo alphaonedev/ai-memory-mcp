@@ -404,8 +404,7 @@ If the loss is known and accepted, re-run with --acknowledge-gaps 812-812
 **Sequence gaps (#4021).** An event is numbered before it is written, so an
 event lost to a failed write (a full disk, a revoked permission; see
 §"Detecting a trail that stopped recording") leaves a missing `sequence`
-range while the hash chain stays intact. A restart continues from the last
-written number and never makes a gap. `verify` therefore fails on a gap, as
+range while the hash chain stays intact. `verify` therefore fails on a gap, as
 its own kind (`SequenceGap`, "events missing"), never with the tamper
 wording. Only interior gaps count: the first line of a file is not required
 to be sequence 1.
@@ -416,6 +415,15 @@ only if it EQUALS a listed range. A range that merely contains it does not
 count, so an acknowledgement can never become a blanket pass, and any later
 gap fails again. A listed range that matches no gap is reported on stderr, so
 a stale acknowledgement left in a cron line stays visible.
+
+**Limit: a loss at the tail before a restart leaves no gap.** A restart
+resumes numbering from the last event WRITTEN to the file. Events lost after
+that write and before the restart therefore have their numbers reused, and
+the trail shows no gap for them. The `ai_memory_audit_write_failures_total`
+counter (#3975) counted them, but only in the process that lost them, and it
+does not survive the restart. So "no gap" means no loss was detected BETWEEN
+two written events. It is not proof that nothing was lost at a tail. A
+persisted sequence high-water that closes this is tracked as #4086.
 
 **Honest limit.** The acknowledgement is a flag, not a signed record. On a
 hostile host, whoever can rewrite the trail (renumber the lines, recompute
