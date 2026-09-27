@@ -262,3 +262,56 @@ fn tls_verbs_are_not_deferred_to_v1_0_1_4006() {
     }
     assert_absent("src/daemon_runtime.rs", "flags = plain HTTP", ISSUE);
 }
+
+/// #4000 — the `signed_events` chain does not hold a row for every successful
+/// memory write: SQLite link creation keeps the link when its best-effort
+/// append fails, `store`/`update`/`delete`/`archive`/`consolidate` append no
+/// `signed_events` row, and recall-observation recording is best-effort.
+#[test]
+fn audit_coverage_does_not_claim_every_write_is_chain_logged_4000() {
+    const ISSUE: &str = "#4000";
+    // Premise anchor: the link append is still best-effort. If it becomes
+    // fail-closed this gate must be revisited, not silently kept.
+    assert_present(
+        "src/storage/mod.rs",
+        "Best-effort: a failure here logs a warn but does NOT roll back",
+        ISSUE,
+    );
+    assert_absent(
+        "docs/security/audit-trail-coverage.md",
+        "on every successful substrate write",
+        ISSUE,
+    );
+    assert_absent(
+        "docs/security/audit-trail-coverage.md",
+        "none for the success leg",
+        ISSUE,
+    );
+    assert_absent(
+        "docs/security/audit-trail-coverage.md",
+        "**All memory writes**",
+        ISSUE,
+    );
+    assert_present(
+        "docs/security/audit-trail-coverage.md",
+        "SQLite link creation can succeed without an audit row when its best-effort append fails",
+        ISSUE,
+    );
+    assert_absent(
+        "docs/compliance/honest-limitations.md",
+        "Every state-changing operation appends to `signed_events`",
+        ISSUE,
+    );
+    for rel in [
+        "docs/compliance/nsa-csi-mcp-security-mapping.md",
+        "docs/compliance/nsa-csi-mcp.html",
+    ] {
+        assert_absent(rel, "every recall writes a", ISSUE);
+        assert_present(rel, "recording is best-effort", ISSUE);
+    }
+    assert_absent(
+        "docs/index.html",
+        "Every state-changing operation lands in",
+        ISSUE,
+    );
+}

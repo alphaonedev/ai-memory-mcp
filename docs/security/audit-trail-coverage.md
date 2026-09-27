@@ -60,7 +60,7 @@ recovery-before-live path. See §4.
 | Event class | Current logging status | `signed_events` row shape | Known gaps | v0.8.0 issue |
 |---|---|---|---|---|
 | Cross-row chain integrity | **Chain-logged today** (v0.7.0 V-4 closeout, #698) — every row carries `prev_hash` + `sequence`; [`verify_chain`](../../src/signed_events.rs) walks every row and flags chain breaks | `prev_hash BLOB` = SHA-256 over [`canonical_chain_bytes`](../../src/signed_events.rs) of the preceding row (ZERO_HASH for first); `sequence INTEGER` monotonic from 1, pinned by UNIQUE index | DELETE row N is detected at row N+1's prev_hash check; raw row-pruning operators must accept the documented chain break | — |
-| Memory writes (`store` / `update` / `link` / `delete` / `archive` / `consolidate`) | **Chain-logged today** via `signed_events.append` (`src/signed_events.rs`) on every successful substrate write | `event_type = "memory.<verb>"`, `payload_hash` over canonical-JSON of the post-write row, `signature` (Ed25519 over `payload_hash`), `attest_level` ∈ {`unsigned`, `signed`} | none for the success leg | — |
+| Memory writes (`store` / `update` / `link` / `delete` / `archive` / `consolidate`) | **Partially chain-logged (#4000).** `signed_events` receives a row only for link creation (`memory_link.created`, from `create_link_signed_with_window` / `create_link_inbound`) and invalidation of a SIGNED link (`memory_link.invalidated`, from `invalidate_link`; an unsigned link's invalidation appends nothing). `store` / `update` / `delete` / `forget` / `archive` / `consolidate` append **no** `signed_events` row. They append a leaf to the `memory_revisions` hash chain only when the append-only spine is on (`AI_MEMORY_APPEND_ONLY` / `[storage].append_only`, default **off**; a plain insert appends no leaf, an upsert over an existing row appends a supersede leaf; `consolidate` also appends one when `consolidate_tombstone_sources` is on), and a line to the JSONL audit log (`src/audit.rs`) only when `[audit] enabled = true` (default **off**; emission never fails the write) | link events: `payload_hash` over the canonical CBOR of the link (`SignableLink`), `signature` = the link's H2 signature when one was made, `attest_level` of the row | SQLite link creation can succeed without an audit row when its best-effort append fails: the link is kept, success is reported, and a WARN is logged. A signed link's invalidation appends in the same transaction (a failed append fails the invalidation). Under the default configuration `store` / `update` / `delete` / `forget` / `archive` leave no row in any tamper-evident chain | — |
 | Reflection writes | **Chain-logged today** with `peer_origin` for cross-peer paths (L2-2 commit `2aef248`) | `event_type = "reflection.write"`, payload binds `(source_ids, depth, peer_origin)` | none | — |
 | Governance refusals on agent-EXTERNAL surface (Bash / Write / Network / ProcessSpawn / Custom) via `check_agent_action` (audited path) | **Chain-logged today** synchronously, every call | `event_type = "governance.check"`, `payload_hash` over canonical `{action, decision}` JSON, `agent_id` carrier set | none | — |
 | Governance refusals on substrate-INTERNAL pre-write hook (`check_agent_action_no_audit`) | **Chain-logged and crash-durable after successful admission** via PE-3 + PE-4 | `event_type = "governance.refusal"`; payload hash binds canonical `{action, decision, agent_id, timestamp, occurrence_id}`; admitted occurrences are spooled before queue delivery and acknowledged only after chain/DLQ residence | quota exhaustion stores bounded timestamp/occurrence/payload-hash evidence instead of the full event; other admission/recovery failures emit operational errors and keep the queue/action closed without promising a marker | **#697** V08-PE-4 shipped |
@@ -161,9 +161,14 @@ Comprehensive list for the current release branch:
   remains as the cross-host portable evidence format. Verify via
   `ai-memory verify-signed-events-chain` (chain GREEN exit 0; chain
   break exit 1). Schema bump: SQLite v33 → v34, Postgres v32 → v33.
-- **All memory writes** via `signed_events.append`
-  (`src/signed_events.rs`) on the success leg of every
-  `storage::insert*` and `create_link_signed` path.
+- **Link writes only** among memory writes (#4000): `memory_link.created`
+  on link creation (best-effort on SQLite — a failed append logs a WARN and
+  the link is kept and reported as created) and `memory_link.invalidated` on
+  invalidation of a signed link (same transaction; unsigned-link
+  invalidation appends nothing). `store` / `update` / `delete` /
+  `forget` / `archive` / `consolidate` append no `signed_events` row; see §2
+  for the opt-in `memory_revisions` spine and JSONL audit log that do record
+  them.
 - **All reflection writes** with `peer_origin` set when the source
   came from a federation peer (L2-2 commit `2aef248`).
 - **All governance refusals on the agent-EXTERNAL surface** via
@@ -261,6 +266,17 @@ per-row Ed25519 signatures remain as defense-in-depth.
 The current release does not claim complete visibility or guaranteed
 audit-row admission for every event:
 
+- **Memory-write audit coverage (#4000).** The `signed_events` chain
+  records successfully appended events, but does not guarantee a row for
+  every successful state change: SQLite link creation retains the link and
+  reports success if its best-effort audit append fails, and `store` /
+  `update` / `delete` / `forget` / `archive` / `consolidate` are recorded in
+  a tamper-evident chain only when the operator enables the append-only
+  spine or the JSONL audit log (both default off).
+- **Recall observations are best-effort.** The MCP and HTTP recall paths
+  attempt to record returned candidates and their ranks and scores in
+  `recall_observations`; a failed append logs a warning and does not fail
+  the recall.
 - **Read audit availability.** Read actions are governance-evaluable, but
   audit append is intentionally best-effort and the zero-rule fast path emits
   nothing. This is an audit-availability limitation, not a governance bypass:
