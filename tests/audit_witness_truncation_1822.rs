@@ -778,24 +778,28 @@ mod postgres_parity {
         // `emit_spawn_audit` stamps `Utc::now()` (nanoseconds) — the exact F2 skew
         // surface — and appends through `pg_append_signed_event_with_chain`.
         let mut anchored: Option<i64> = None;
+        let mut db_id = None;
         for i in 0..300 {
             pg.emit_spawn_audit(&format!("argv0-{i}"), "1822-f2-headhash")
                 .await;
-            if let Some((seq, _)) = witness::last_audit_watermark(None) {
+            if db_id.is_none() {
+                let (id, agent, payload): (String, String, Vec<u8>) =
+                    sqlx::query_as(ai_memory::signed_events::GENESIS_ROW_SQL)
+                        .fetch_one(pg.pool())
+                        .await
+                        .expect("real PostgreSQL append creates a genesis identity");
+                db_id = Some(ai_memory::signed_events::db_id_from_genesis_parts(
+                    &id, &agent, &payload,
+                ));
+            }
+            // PostgreSQL watermarks carry the corpus identity. An identity-less
+            // lookup deliberately excludes them, so it cannot prove parity.
+            if let Some((seq, _)) = witness::last_audit_watermark(db_id.as_deref()) {
                 anchored = Some(seq); // fired on the just-appended head → anchored == head
                 break;
             }
         }
-        let Some(anchored) = anchored else {
-            eprintln!("skip: no watermark fired within 300 pg appends (shared-DB throttle state)");
-            sqlx::query("DELETE FROM signed_events WHERE sequence > $1")
-                .bind(base_seq)
-                .execute(pg.pool())
-                .await
-                .ok();
-            witness::shutdown();
-            return;
-        };
+        let anchored = anchored.expect("real PostgreSQL appends must emit an observable watermark");
 
         // CLEAN chain: the anchored row survives intact → the micros-readback
         // recompute MATCHES the anchor (also micros, post-#2203) → NotDetected.
