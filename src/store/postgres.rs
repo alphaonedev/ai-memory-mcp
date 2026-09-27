@@ -12495,6 +12495,20 @@ impl PostgresStore {
             .await
             .map_err(|e| to_store_err(CTX_BEGIN_AGE_TX, e))?;
 
+        // #4039 / CONCURRENCY-04: projection and unlink acquire the
+        // canonical row before touching AGE. Invalidation must share that
+        // order; taking the graph edge first forms a wait cycle with them.
+        sqlx::query(
+            "SELECT 1 FROM memory_links \
+             WHERE source_id = $1 AND target_id = $2 AND relation = $3 FOR UPDATE",
+        )
+        .bind(source_id)
+        .bind(target_id)
+        .bind(relation)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("lock link before AGE invalidation", e))?;
+
         // #1640 — tolerated LOAD (see load_age_tolerated): a role-level
         // LOAD refusal must not fail the query on fleets where
         // shared_preload_libraries provides the library.

@@ -396,3 +396,47 @@ async fn node_unprojection_fences_recreation_4039() {
         "#4039: re-creation committed after absence check and before node detach"
     );
 }
+
+#[tokio::test]
+async fn invalidate_uses_relational_before_age_lock_order_4039() {
+    let (store, _, link) = fixture().await;
+    let ctx = CallerContext::for_agent("b4-regression");
+    store.link(&ctx, &link).await.expect("project edge");
+    let mut projection = store.pool().begin().await.expect("projection-side lock");
+    sqlx::query("SELECT 1 FROM memory_links WHERE source_id=$1 AND target_id=$2 FOR UPDATE")
+        .bind(&link.source_id)
+        .bind(&link.target_id)
+        .fetch_all(&mut *projection)
+        .await
+        .expect("canonical lock");
+    sqlx::query("SET LOCAL lock_timeout='1s'")
+        .execute(&mut *projection)
+        .await
+        .expect("bounded lock wait");
+    let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *projection)
+        .await
+        .expect("pid");
+    let other = Arc::clone(&store);
+    let task = tokio::spawn(async move {
+        other
+            .kg_invalidate_cypher(&link.source_id, &link.target_id, "related_to", None, None)
+            .await
+    });
+    wait_blocked(&store, pid).await;
+    // A SQL-first projection must be able to acquire its AGE lock while
+    // invalidation is queued on its relational row, without a wait cycle.
+    let graph_lock = sqlx::query("SELECT id FROM memory_graph.related_to FOR UPDATE")
+        .fetch_all(&mut *projection)
+        .await;
+    projection
+        .rollback()
+        .await
+        .expect("release projection locks");
+    let outcome = task.await.expect("invalidation join");
+    assert!(
+        graph_lock.is_ok() && outcome.is_ok(),
+        "#4039: invalidation took AGE before the canonical lock: graph={:?}, invalidate={outcome:?}",
+        graph_lock.err()
+    );
+}
