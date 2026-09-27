@@ -1218,13 +1218,13 @@ footer.site-foot a { color: var(--text-muted); }
     <span class="eyebrow p3">Pillar 3 · Performance</span>
     <h2>Every hot path has a published budget.</h2>
     <p class="lede">
-      Numbers below are real measurements, not aspirational. <code>ai-memory bench</code> runs the canonical 1,000-memory workload and reports p50/p95/p99. CI fails any PR that exceeds budget by more than 10%. Hardware baseline: Apple M4 / 32 GB / NVMe SSD.
+      Each gauge's marker is the published p95 (or p99) target from <code>PERFORMANCE.md</code>, calibrated on Apple M4 / 32 GB / NVMe SSD. The filled values are <strong>illustrative, not a committed measurement</strong>. <code>ai-memory bench</code> measures eight operations (store without embedding, FTS5 search, hot recall, the rerank stage, kg_query at depth 1/3/5, and kg_timeline) on its default ~500-row workload and reports p50/p95/p99. Gauges marked <em>advisory</em> have no bench: nothing measures or enforces them. The bench CI job is advisory too: a p95 more than 10% over budget turns it red but does not block a merge.
     </p>
 
     <div class="perf-grid">
       <div class="gauge">
         <div class="gauge-op">memory_session_start</div>
-        <div class="gauge-budget">target p95 &lt; 100 ms · Claude Code hook</div>
+        <div class="gauge-budget">target p95 &lt; 100 ms · Claude Code hook · advisory, no bench</div>
         <div class="gauge-bar-bg"><div class="gauge-bar-fill" style="width: 42%"></div><div class="gauge-bar-marker" style="left:100%"></div></div>
         <div class="gauge-numbers"><span class="gauge-measured">42 ms</span><span class="gauge-target">/ 100 ms</span></div>
       </div>
@@ -1242,7 +1242,7 @@ footer.site-foot a { color: var(--text-muted); }
       </div>
       <div class="gauge">
         <div class="gauge-op">memory_store (with embedding)</div>
-        <div class="gauge-budget">target p95 &lt; 200 ms · ONNX/Ollama call</div>
+        <div class="gauge-budget">target p95 &lt; 200 ms · ONNX/Ollama call · advisory, no bench</div>
         <div class="gauge-bar-bg"><div class="gauge-bar-fill" style="width: 43%"></div><div class="gauge-bar-marker" style="left:100%"></div></div>
         <div class="gauge-numbers"><span class="gauge-measured">86 ms</span><span class="gauge-target">/ 200 ms</span></div>
       </div>
@@ -1254,7 +1254,7 @@ footer.site-foot a { color: var(--text-muted); }
       </div>
       <div class="gauge">
         <div class="gauge-op">memory_check_duplicate</div>
-        <div class="gauge-budget">target p95 &lt; 50 ms · pre-write check</div>
+        <div class="gauge-budget">target p95 &lt; 50 ms · pre-write check · advisory, no bench</div>
         <div class="gauge-bar-bg"><div class="gauge-bar-fill" style="width: 44%"></div><div class="gauge-bar-marker" style="left:100%"></div></div>
         <div class="gauge-numbers"><span class="gauge-measured">22 ms</span><span class="gauge-target">/ 50 ms</span></div>
       </div>
@@ -1272,20 +1272,20 @@ footer.site-foot a { color: var(--text-muted); }
       </div>
       <div class="gauge">
         <div class="gauge-op">curator cycle (1k memories)</div>
-        <div class="gauge-budget">target p95 &lt; 60 s · background</div>
+        <div class="gauge-budget">target p95 &lt; 60 s · background · advisory, no bench</div>
         <div class="gauge-bar-bg"><div class="gauge-bar-fill" style="width: 20%"></div><div class="gauge-bar-marker" style="left:100%"></div></div>
         <div class="gauge-numbers"><span class="gauge-measured">12 s</span><span class="gauge-target">/ 60 s</span></div>
       </div>
       <div class="gauge">
         <div class="gauge-op">federation ack (W=2 quorum)</div>
-        <div class="gauge-budget">target p99 &lt; 2 s · multi-machine</div>
+        <div class="gauge-budget">target p99 &lt; 2 s · multi-machine · advisory, no bench</div>
         <div class="gauge-bar-bg"><div class="gauge-bar-fill" style="width: 42%"></div><div class="gauge-bar-marker" style="left:100%"></div></div>
         <div class="gauge-numbers"><span class="gauge-measured">850 ms</span><span class="gauge-target">/ 2 s</span></div>
       </div>
     </div>
 
     <div class="callout">
-      <strong>Every PR. Every push. Every release branch.</strong> The bench-CI workflow runs <code>ai-memory bench</code> on <code>ubuntu-latest</code> and posts a workflow summary with the table above. A regression of more than 10% on any p95 turns the bench job red — an advisory signal on every PR (bench is deliberately not in the required-status-checks, so it flags the regression loudly rather than hard-blocking the merge).
+      <strong>Every PR. Every push. Every release branch.</strong> The bench-CI workflow runs <code>ai-memory bench</code> on <code>ubuntu-latest</code> and posts its measured p50/p95/p99 table as a workflow summary. A p95 more than 10% over its budget turns the bench job red — an advisory signal on every PR (bench is deliberately not in the required-status-checks, so it flags the regression loudly rather than hard-blocking the merge).
     </div>
   </div>
 </section>
