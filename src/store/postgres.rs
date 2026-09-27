@@ -2638,6 +2638,12 @@ impl PostgresStore {
         statement_timeout_secs: u64,
         pool_config: PoolConfig,
     ) -> StoreResult<Self> {
+        if pool_config.max_connections < 2 {
+            return Err(StoreError::InvalidInput {
+                detail: "postgres max_connections must be at least 2 for schema bootstrap"
+                    .to_string(),
+            });
+        }
         if !SUPPORTED_EMBEDDING_DIMS.contains(&i32::try_from(dim).unwrap_or(-1)) {
             return Err(unsupported_embedding_dim(dim));
         }
@@ -10127,7 +10133,27 @@ impl PostgresStore {
             });
         }
 
-        let current = self.current_embedding_dim().await?;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v29 conversion tx", e))?;
+
+        // #4040 / CONCURRENCY-04: take the DDL-strength locks in the same
+        // live-then-archive order as the conversion, BEFORE probing state.
+        // Counts and refusal now cover every writer that committed first;
+        // later writers wait until the gate and conversion have committed.
+        sqlx::query("LOCK TABLE memories, archived_memories IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("lock embedding conversion tables", e))?;
+        let current: Option<i32> = sqlx::query_scalar(
+            "SELECT atttypmod FROM pg_attribute \
+             WHERE attrelid = 'public.memories'::regclass AND attname = 'embedding'",
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("read locked embedding dimension", e))?;
         if let Some(cur) = current
             && cur == target_i32
         {
@@ -10146,13 +10172,13 @@ impl PostgresStore {
         // opt in via `force`, refuse without mutating a single row.
         let embeddings_at_risk: i64 = {
             let live: i64 = sqlx::query_scalar(crate::SQL_COUNT_EMBEDDED_MEMORIES)
-                .fetch_one(&self.pool)
+                .fetch_one(&mut *tx)
                 .await
                 .map_err(|e| to_store_err("count memories.embedding non-null", e))?;
             let archived: i64 = sqlx::query_scalar(
                 "SELECT COUNT(*) FROM archived_memories WHERE embedding IS NOT NULL",
             )
-            .fetch_one(&self.pool)
+            .fetch_one(&mut *tx)
             .await
             .map_err(|e| to_store_err("count archived_memories.embedding non-null", e))?;
             live + archived
@@ -10173,12 +10199,6 @@ impl PostgresStore {
             embeddings_nulled = embeddings_at_risk,
             "{embeddings_at_risk} embeddings NULLed by vector({target_i32}) conversion — re-embed required (v29 embedding-dim migration: converting memories.embedding + archived_memories.embedding; operators MUST re-run embeddings after this conversion completes)"
         );
-
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| to_store_err("begin v29 conversion tx", e))?;
 
         // Drop the HNSW indexes that pin the column type. ALTER COLUMN
         // TYPE on a vector column fails while the HNSW index references
@@ -13452,9 +13472,6 @@ impl PostgresStore {
                     &link.source_id,
                     &link.target_id,
                     link.relation.as_str(),
-                    // #2377 (FIX #9) — the just-bound relational validity.
-                    Some(valid_from_str.as_str()),
-                    valid_until_str.as_deref(),
                 )
                 .await
                 {
@@ -13636,6 +13653,13 @@ impl PostgresStore {
                 // so DROP the marker instead of acting on it. Fail-safe by
                 // construction: the reconciler can only ever remove a node
                 // whose relational row is confirmed absent inside this tx.
+                // #4039: an absent row cannot carry a tuple lock. Fence
+                // memory writers before testing absence and hold the fence
+                // through detach, including id re-creation by remote apply.
+                sqlx::query("LOCK TABLE memories IN SHARE MODE")
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| to_store_err("fence kg unprojection liveness", e))?;
                 let live: Option<(String,)> = sqlx::query_as(SQL_SELECT_MEMORY_ID_BY_ID)
                     .bind(&source_id)
                     .fetch_optional(&mut *tx)
@@ -13675,7 +13699,7 @@ impl PostgresStore {
                     .fetch_optional(&mut *tx)
                     .await
                     .map_err(|e| to_store_err("kg_projection_outbox existence check", e))?;
-                let Some((valid_from, valid_until)) = existing else {
+                let Some(_) = existing else {
                     sqlx::query(SQL_MARK_KG_OUTBOX_PROJECTED)
                         .bind(id)
                         .execute(&mut *tx)
@@ -13688,17 +13712,7 @@ impl PostgresStore {
                         .map_err(|e| to_store_err("commit drop deleted-link outbox row", e))?;
                     continue;
                 };
-                let valid_from_str = valid_from.map(|t| t.to_rfc3339());
-                let valid_until_str = valid_until.map(|t| t.to_rfc3339());
-                project_link_into_age(
-                    &mut tx,
-                    &source_id,
-                    &target_id,
-                    &relation,
-                    valid_from_str.as_deref(),
-                    valid_until_str.as_deref(),
-                )
-                .await
+                project_link_into_age(&mut tx, &source_id, &target_id, &relation).await
             };
             match outcome {
                 Ok(()) => {
@@ -19970,14 +19984,6 @@ async fn project_link_into_age(
     source_id: &str,
     target_id: &str,
     relation: &str,
-    // #2377 (FIX #9) — the relational row's temporal-validity, already in
-    // `to_rfc3339()` form so the agtype STRING comparison in the current-view
-    // Cypher filter (`e.valid_until IS NULL OR e.valid_until > $now`,
-    // `build_kg_query_current_view_cypher`) matches the dual-written mirror
-    // BYTE-for-byte. `None` => the property is not set on the MERGEd edge (so
-    // `e.valid_until IS NULL` keeps a never-invalidated edge visible).
-    valid_from: Option<&str>,
-    valid_until: Option<&str>,
 ) -> StoreResult<()> {
     // Defence-in-depth: confirm the relation is in the
     // validator's accepted shape before interpolating it into the
@@ -19995,6 +20001,25 @@ async fn project_link_into_age(
             ),
         });
     }
+
+    // #4038/#4039: ignored replay payloads and stale outbox reads are
+    // never authoritative. Hold the canonical row through AGE commit;
+    // unlink either precedes this read or removes our committed projection.
+    let persisted: Option<(Option<DateTime<Utc>>, Option<DateTime<Utc>>)> = sqlx::query_as(
+        "SELECT valid_from, valid_until FROM memory_links \
+         WHERE source_id = $1 AND target_id = $2 AND relation = $3 FOR UPDATE",
+    )
+    .bind(source_id)
+    .bind(target_id)
+    .bind(relation)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|e| to_store_err("lock canonical AGE link", e))?;
+    let Some((valid_from, valid_until)) = persisted else {
+        return Ok(());
+    };
+    let valid_from = valid_from.map(|t| t.to_rfc3339());
+    let valid_until = valid_until.map(|t| t.to_rfc3339());
 
     // #1542/#1640 — shared tolerated-LOAD helper.
     load_age_tolerated(tx).await?;
@@ -20107,24 +20132,28 @@ async fn project_link_into_age(
     // the Rust-side readers (`age_last_edge_relation`) can pull it back
     // without a second lookup.
     //
+    // #4038: projection includes NULLs, which remove stale AGE properties.
     // #2377 (FIX #9) — thread the row's temporal-validity onto the edge.
     // Pre-fix the MERGE carried only `{relation}`, so a link BORN with
     // `valid_until` set (a federation relay of an already-invalidated edge,
     // or a caller temporal link) was served VALID by the current-view Cypher
-    // filter FOREVER while relational reads excluded it. We `SET` each of
-    // `valid_from`/`valid_until` only when non-NULL — leaving the property
-    // ABSENT (never `SET ... = null`, which AGE treats as REMOVE) so a
-    // never-invalidated edge keeps the `e.valid_until IS NULL` fast-path.
+    // filter FOREVER while relational reads excluded it. Set each persisted
+    // value, including NULL (AGE removes that property), so a repaired edge
+    // cannot retain validity from a rejected duplicate payload.
     let mut set_clauses: Vec<&str> = Vec::new();
     let mut edge_pairs: Vec<(&str, &str)> =
         vec![("src", source_id), ("dst", target_id), ("rel", relation)];
-    if let Some(vf) = valid_from {
+    if let Some(vf) = valid_from.as_deref() {
         set_clauses.push("r.valid_from = $valid_from");
         edge_pairs.push(("valid_from", vf));
+    } else {
+        set_clauses.push("r.valid_from = null");
     }
-    if let Some(vu) = valid_until {
+    if let Some(vu) = valid_until.as_deref() {
         set_clauses.push("r.valid_until = $valid_until");
         edge_pairs.push(("valid_until", vu));
+    } else {
+        set_clauses.push("r.valid_until = null");
     }
     let set_fragment = if set_clauses.is_empty() {
         String::new()
@@ -25980,15 +26009,11 @@ impl MemoryStore for PostgresStore {
             // edge carries `valid_until`; project it onto the AGE edge so the
             // receiver's current-view Cypher reads exclude it exactly as the
             // relational reads do (else the relayed retraction is lost graph-side).
-            let vf_str = valid_from.map(|t| t.to_rfc3339());
-            let vu_str = valid_until.map(|t| t.to_rfc3339());
             match project_link_into_age(
                 &mut tx,
                 &link.source_id,
                 &link.target_id,
                 link.relation.as_str(),
-                vf_str.as_deref(),
-                vu_str.as_deref(),
             )
             .await
             {
@@ -29094,16 +29119,13 @@ impl MemoryStore for PostgresStore {
                             .await
                             .map_err(|e| to_store_err("savepoint age_consolidate_projection", e))?;
                         // #2377 (FIX #9) — the consolidate lineage edge is
-                        // born at `now` with no `valid_until` (unbounded); pass
-                        // the same validity the relational INSERT bound above.
-                        let consolidate_vf = now.to_rfc3339();
+                        // born at `now` with no `valid_until` (unbounded);
+                        // projection re-reads the persisted relational validity.
                         match project_link_into_age(
                             &mut tx,
                             &new_id,
                             id,
                             crate::models::MemoryLinkRelation::DerivedFrom.as_str(),
-                            Some(consolidate_vf.as_str()),
-                            None,
                         )
                         .await
                         {
@@ -30768,6 +30790,19 @@ impl MemoryStore for PostgresStore {
                     .await
                     .map_err(|e| to_store_err("gc begin tx", e))?;
 
+                // #4037: one locked victim set for copy, edge snapshot and
+                // delete. READ COMMITTED late arrivals wait for the next sweep.
+                let victims: Vec<(String, String, Option<String>)> = sqlx::query_as(
+                    "SELECT id, namespace, metadata->>'agent_id' FROM memories \
+                     WHERE expires_at IS NOT NULL AND expires_at < $1 \
+                     ORDER BY id FOR UPDATE",
+                )
+                .bind(now)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("gc read evict victims", e))?;
+                let victim_ids: Vec<&str> = victims.iter().map(|(id, _, _)| id.as_str()).collect();
+
                 if archive {
                     sqlx::query(&format!(
                         "INSERT INTO archived_memories (
@@ -30792,11 +30827,12 @@ impl MemoryStore for PostgresStore {
                                confidence_source, confidence_signals, confidence_decayed_at,
                                mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until, cid, cid_genesis
                         FROM memories
-                        WHERE expires_at IS NOT NULL AND expires_at < $1
+                        WHERE id = ANY($2)
                         -- #2195 - LAST-WINS re-archive parity with sqlite INSERT OR REPLACE.
                         {SQL_ARCHIVE_ON_CONFLICT_LAST_WINS}"
                     ))
                     .bind(now)
+                    .bind(&victim_ids)
                     .execute(&mut *tx)
                     .await
                     .map_err(|e| to_store_err("gc archive copy", e))?;
@@ -30823,15 +30859,11 @@ impl MemoryStore for PostgresStore {
                                 ml.signature, ml.attest_level, $1::timestamptz,
                                 ml.source_cid, ml.target_cid
                          FROM memory_links ml
-                         WHERE ml.source_id IN (
-                                   SELECT id FROM memories
-                                   WHERE expires_at IS NOT NULL AND expires_at < $1)
-                            OR ml.target_id IN (
-                                   SELECT id FROM memories
-                                   WHERE expires_at IS NOT NULL AND expires_at < $1)
+                         WHERE ml.source_id = ANY($2) OR ml.target_id = ANY($2)
                          ON CONFLICT (source_id, target_id, relation) DO NOTHING",
                     )
                     .bind(now)
+                    .bind(&victim_ids)
                     .execute(&mut *tx)
                     .await
                     .map_err(|e| to_store_err("gc snapshot links", e))?;
@@ -30858,25 +30890,12 @@ impl MemoryStore for PostgresStore {
                 // there, exactly as the sqlite twin reasons; the archive reaper is the
                 // erasure point for archived rows.
                 //
-                // The victim set is read `FOR UPDATE` with the IDENTICAL predicate the
-                // DELETE below uses, inside this one transaction, so the erased +
-                // tombstoned set and the deleted set cannot diverge.
-                let tombstoned: Option<Vec<String>> = if archive {
-                    None
-                } else {
-                    let victims: Vec<(String, String, Option<String>)> = sqlx::query_as(
-                        "SELECT id, namespace, metadata->>'agent_id' FROM memories \
-                         WHERE expires_at IS NOT NULL AND expires_at < $1 \
-                         FOR UPDATE",
-                    )
-                    .bind(now)
-                    .fetch_all(&mut *tx)
-                    .await
-                    .map_err(|e| to_store_err("gc read evict victims", e))?;
+                // The victim set was locked before the archive branch. Erasure
+                // and deletion use exactly those identities in this transaction.
+                if !archive {
                     crate::store::postgres_parity::evict_tombstone_and_erase_in_tx(&mut tx, &victims, now)
                         .await?;
-                    Some(victims.into_iter().map(|(id, _, _)| id).collect())
-                };
+                }
 
                 // #1783 — RETURNING id so the TTL-evicted set is known for AGE
                 // unprojection in THIS tx. gc is the most common delete path; the
@@ -30886,26 +30905,12 @@ impl MemoryStore for PostgresStore {
                 // rationale is now retired outright: #3161 snapshots the edge graph
                 // on this funnel too, immediately above.)
                 //
-                // v1.0.0 #3177 — on the HARD-DELETE path the DELETE is PINNED to the
-                // exact id set that was just tombstoned + crypto-erased, rather than
-                // re-evaluating `expires_at < $1` a second time. Postgres runs this tx
-                // at READ COMMITTED, so a row committed by a concurrent writer between
-                // the `FOR UPDATE` victim read and this statement — a fresh row that is
-                // ALREADY expired, which `store` accepts — would otherwise satisfy the
-                // predicate and be deleted with NO tombstone and NO erase: precisely
-                // the #3177 defect, reintroduced through a race. The sqlite twin cannot
-                // hit this because `BEGIN IMMEDIATE` holds the single writer lock for
-                // the whole sweep; on postgres the id pin is the equivalent guarantee.
-                // Such a row is simply left for the next gc tick, which tombstones it
-                // properly. `archive = true` binds NULL and keeps the original
-                // predicate: that path is a recoverable MOVE with no erasure to pair.
+                // Both archive and hard-delete paths use exactly the locked
+                // identities; never re-evaluate expiry on a later snapshot.
                 let evicted: Vec<(String, String)> = sqlx::query_as(
-                    "DELETE FROM memories WHERE expires_at IS NOT NULL AND expires_at < $1 \
-                       AND ($2::text[] IS NULL OR id = ANY($2)) \
-                     RETURNING id, namespace",
+                    "DELETE FROM memories WHERE id = ANY($1) RETURNING id, namespace",
                 )
-                .bind(now)
-                .bind(tombstoned.as_deref())
+                .bind(&victim_ids)
                 .fetch_all(&mut *tx)
                 .await
                 .map_err(|e| to_store_err("gc delete", e))?;
@@ -31553,7 +31558,7 @@ impl MemoryStore for PostgresStore {
                 // restore (#700/#1542 posture — the graph is derived data; the
                 // restore of the durable rows must never be blocked by it).
                 if matches!(self.kg_backend, KgBackend::Age) {
-                    for (src, dst, rel, valid_from, valid_until) in &restored_edges {
+                    for (src, dst, rel, _, _) in &restored_edges {
                         if matches!(
                             crate::config::age_projection_mode(),
                             crate::config::AgeProjectionMode::Deferred
@@ -31578,18 +31583,7 @@ impl MemoryStore for PostgresStore {
                                 .await
                                 .map_err(|e| to_store_err("savepoint age_restore_projection", e))?;
                             // #2377 (FIX #9) — carry the restored edge's validity.
-                            let vf_str = valid_from.map(|t| t.to_rfc3339());
-                            let vu_str = valid_until.map(|t| t.to_rfc3339());
-                            match project_link_into_age(
-                                &mut tx,
-                                src,
-                                dst,
-                                rel,
-                                vf_str.as_deref(),
-                                vu_str.as_deref(),
-                            )
-                            .await
-                            {
+                            match project_link_into_age(&mut tx, src, dst, rel).await {
                                 Ok(()) => {
                                     sqlx::query("RELEASE SAVEPOINT age_restore_projection")
                                         .execute(&mut *tx)

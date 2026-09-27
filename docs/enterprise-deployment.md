@@ -735,7 +735,7 @@ and PgBouncer never overruns Postgres:
 
 | Layer | Knob | Sizing rule |
 |---|---|---|
-| Daemon `sqlx` pool | `AI_MEMORY_PG_POOL_MAX` (→ `postgres_pool_max_connections` → `DEFAULT_MAX_CONNECTIONS`) | Per-daemon ceiling. Keep at the compiled default unless one daemon is provably the bottleneck; raising it on every daemon just pushes contention down to PgBouncer. |
+| Daemon `sqlx` pool | `AI_MEMORY_PG_POOL_MAX` (→ `postgres_pool_max_connections` → `DEFAULT_MAX_CONNECTIONS`) | Per-daemon ceiling (minimum 2; smaller values are refused before connecting). Keep at the compiled default unless one daemon is provably the bottleneck; raising it on every daemon just pushes contention down to PgBouncer. |
 | Daemon `sqlx` pool | `AI_MEMORY_PG_POOL_MIN` (→ `postgres_pool_min_connections` → `DEFAULT_MIN_CONNECTIONS`) | Warm-connection floor per daemon. With PgBouncer fronting, a low floor is fine — PgBouncer keeps server conns warm. |
 | Daemon `sqlx` pool | `AI_MEMORY_PG_ACQUIRE_TIMEOUT_SECS` (→ `postgres_acquire_timeout_secs` → `DEFAULT_ACQUIRE_TIMEOUT_SECS`) | How long a daemon waits for a client slot before erroring. Keep ≥ PgBouncer's `query_wait_timeout` so the daemon doesn't give up before PgBouncer can hand it a server connection. |
 | PgBouncer | `default_pool_size` | Server conns per `(user, db)`. The sum across pools must stay below Postgres `max_connections` (§10.2) minus the superuser reserve. |

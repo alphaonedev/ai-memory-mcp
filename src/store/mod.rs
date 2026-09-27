@@ -125,6 +125,7 @@ const DEFAULT_ACQUIRE_TIMEOUT_SECS: u64 = 30;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PoolConfig {
     /// Hard ceiling on open connections (sqlx `max_connections`).
+    /// PostgreSQL bootstrap requires at least 2; smaller values are rejected.
     pub max_connections: u32,
     /// Floor of always-open warm connections (sqlx `min_connections`).
     pub min_connections: u32,

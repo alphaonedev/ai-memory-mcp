@@ -156,7 +156,7 @@ async fn nonforced_dim_conversion_fences_writers_4040() {
     let migration = tokio::spawn(async move { other.migrate_embedding_dim(768, false).await });
     wait_blocked(&store, pid).await;
     sqlx::query("UPDATE memories SET embedding = $1::vector WHERE id=$2")
-        .bind(format!("[{}]", vec!["0.1"; 384].join(",")))
+        .bind(format!("[{}]", ["0.1"; 384].join(",")))
         .bind(&link.source_id)
         .execute(&mut *writer)
         .await
