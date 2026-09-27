@@ -2140,6 +2140,14 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_warn_if_key_perms_loose_emits_warn_on_world_readable() {
+        // #4088: the `tracing` callsite-interest cache is process-global; a
+        // sibling test with no subscriber can pin a callsite to `never` and this
+        // capture then reads nothing (the #3426 mechanism). Run alone in a child.
+        if crate::config::run_env_isolated_child_or_spawn(
+            "tls::tests::test_warn_if_key_perms_loose_emits_warn_on_world_readable",
+        ) {
+            return;
+        }
         use std::os::unix::fs::PermissionsExt as _;
         use tracing::Level;
 
@@ -2173,6 +2181,14 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_warn_if_key_perms_loose_silent_on_0600() {
+        // #4088: the `tracing` callsite-interest cache is process-global; a
+        // sibling test with no subscriber can pin a callsite to `never` and this
+        // capture then reads nothing (the #3426 mechanism). Run alone in a child.
+        if crate::config::run_env_isolated_child_or_spawn(
+            "tls::tests::test_warn_if_key_perms_loose_silent_on_0600",
+        ) {
+            return;
+        }
         use std::os::unix::fs::PermissionsExt as _;
         use tracing::Level;
 

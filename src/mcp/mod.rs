@@ -217,6 +217,8 @@ fn mcp_wire_format(tool_name: &str, arguments: &Value) -> Result<Option<WireForm
 mod provider_echo_sinks_3648_tests;
 #[cfg(test)]
 mod provider_redaction_3648_tests;
+#[cfg(test)]
+mod span_capture_4088_tests;
 
 /// PR-5 (issue #487): emit an audit event for an MCP `tools/call`
 /// dispatch. Per-handler emissions inside `handle_store` /
@@ -6561,42 +6563,7 @@ mod tests {
         assert_eq!(err.message, "test error");
     }
 
-    /// Buffer-backed `MakeWriter` so `tracing` output can be asserted on
-    /// without polluting test stdout/stderr or installing a global
-    /// subscriber. Used by the Stream E span coverage tests below.
-    #[derive(Clone)]
-    struct VecWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-
-    impl std::io::Write for VecWriter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for VecWriter {
-        type Writer = VecWriter;
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
-    fn run_with_capture<F: FnOnce()>(f: F) -> String {
-        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
-        let writer = VecWriter(buf.clone());
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(writer)
-            .with_max_level(tracing::Level::INFO)
-            .with_ansi(false)
-            .finish();
-        tracing::subscriber::with_default(subscriber, f);
-        String::from_utf8(buf.lock().unwrap().clone()).unwrap_or_default()
-    }
-
-    fn make_tools_call(tool: &str, args: Value) -> RpcRequest {
+    pub(super) fn make_tools_call(tool: &str, args: Value) -> RpcRequest {
         RpcRequest {
             jsonrpc: "2.0".into(),
             id: Some(json!(1)),
@@ -6605,131 +6572,6 @@ mod tests {
         }
     }
 
-    /// Pillar 3 / Stream E coverage — every successful `tools/call` must
-    /// emit a `mcp_tool_call` span carrying the tool name plus an `ok`
-    /// event with `elapsed_ms`. This is the single point of latency
-    /// instrumentation production exporters key off.
-    #[test]
-    fn tools_call_emits_span_with_tool_name_and_elapsed_ms() {
-        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
-        let tier_config = FeatureTier::Keyword.config();
-        let resolved_ttl = crate::config::ResolvedTtl::default();
-        let resolved_scoring = crate::config::ResolvedScoring::default();
-        let req = make_tools_call("memory_list", json!({"limit": 1}));
-
-        let captured = run_with_capture(|| {
-            let resp = handle_request(
-                &conn,
-                std::path::Path::new(":memory:"),
-                &req,
-                None,
-                None,
-                None,
-                &tier_config,
-                &crate::config::ResolvedModels::from_tier_preset(&tier_config),
-                None,
-                &resolved_ttl,
-                &resolved_scoring,
-                true,
-                false,
-                None,
-                &crate::profile::Profile::full(),
-                None,
-                None,
-                None,
-                None,           // federation_forward_url (#318)
-                None,           // recall_scope (#518)
-                None,           // atomise_handler (WT-1-C)
-                None,           // atomise_queue (#2986)
-                None,           // ingest_multistep_handler (Form 3 / #756)
-                None,           // nag_watcher (#1389/#1398 L1)
-                "test-session", // nag_session_id (#1389/#1398 L1)
-            );
-            assert!(resp.error.is_none(), "expected ok rpc response");
-        });
-
-        assert!(
-            captured.contains("mcp_tool_call"),
-            "missing span name in: {captured}"
-        );
-        assert!(
-            captured.contains("memory_list"),
-            "missing tool field in: {captured}"
-        );
-        assert!(
-            captured.contains("elapsed_ms"),
-            "missing elapsed_ms field in: {captured}"
-        );
-        assert!(
-            captured.contains(" ok"),
-            "missing ok outcome event in: {captured}"
-        );
-    }
-
-    /// Failure path — when the underlying handler returns an `Err`, the
-    /// span emits a `warn` level event with the error message so on-call
-    /// dashboards can alert on per-tool error rate.
-    #[test]
-    fn tools_call_emits_warn_event_on_handler_error() {
-        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
-        let tier_config = FeatureTier::Keyword.config();
-        let resolved_ttl = crate::config::ResolvedTtl::default();
-        let resolved_scoring = crate::config::ResolvedScoring::default();
-        // memory_get with a missing/invalid id is a deterministic Err
-        // path: validate_id rejects empty strings.
-        let req = make_tools_call("memory_get", json!({"id": ""}));
-
-        let captured = run_with_capture(|| {
-            let resp = handle_request(
-                &conn,
-                std::path::Path::new(":memory:"),
-                &req,
-                None,
-                None,
-                None,
-                &tier_config,
-                &crate::config::ResolvedModels::from_tier_preset(&tier_config),
-                None,
-                &resolved_ttl,
-                &resolved_scoring,
-                true,
-                false,
-                None,
-                &crate::profile::Profile::full(),
-                None,
-                None,
-                None,
-                None,           // federation_forward_url (#318)
-                None,           // recall_scope (#518)
-                None,           // atomise_handler (WT-1-C)
-                None,           // atomise_queue (#2986)
-                None,           // ingest_multistep_handler (Form 3 / #756)
-                None,           // nag_watcher (#1389/#1398 L1)
-                "test-session", // nag_session_id (#1389/#1398 L1)
-            );
-            // Handler errs are returned as ok_response with isError=true,
-            // not RpcError, by design (the JSON-RPC layer is reserved for
-            // protocol-level failures).
-            assert!(resp.error.is_none());
-        });
-
-        assert!(
-            captured.contains("mcp_tool_call"),
-            "missing span in err path: {captured}"
-        );
-        assert!(
-            captured.contains("memory_get"),
-            "missing tool field in err path: {captured}"
-        );
-        assert!(
-            captured.contains("WARN"),
-            "missing WARN level on err path: {captured}"
-        );
-        assert!(
-            captured.contains("err"),
-            "missing err outcome in: {captured}"
-        );
-    }
     /// Parametrized smoke matrix over the MCP tool dispatch pathway
     /// (Justice of MCP). Each `ToolCase` exercises one tool end to end:
     /// Tier 1: happy path with canonical valid args.
