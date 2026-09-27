@@ -221,3 +221,47 @@ fn c2_tool_definitions_source_keeps_docs_on_overbudget_tools() {
          source of truth that verbose=true reads from); got {with_docs}"
     );
 }
+
+/// #4005 — the `memory_subscribe` tool contract must not advertise the two
+/// modes the server refuses: plaintext `http` to loopback (#3705 refuses
+/// `http` to every host) and unsigned delivery (R3-S1.HMAC refuses a
+/// registration with no per-subscription or server-wide secret). The prose
+/// reaches clients through the verbose `memory_capabilities` drilldown, so
+/// that is the surface pinned here.
+#[test]
+fn memory_subscribe_schema_text_matches_server_enforcement_4005() {
+    let profile = Profile::full();
+    let resp = handle_capabilities_family("governance", true, true, &profile, None, None, None)
+        .unwrap_or_else(|e| panic!("verbose governance drilldown failed: {e}"));
+    let tool = resp["tools"]
+        .as_array()
+        .expect("verbose response must carry tools[]")
+        .iter()
+        .find(|t| t["name"] == "memory_subscribe")
+        .expect("memory_subscribe must be in the governance family");
+    let text = tool.to_string();
+    for false_claim in ["http only for loopback", "Omit for unsigned"] {
+        assert!(
+            !text.contains(false_claim),
+            "memory_subscribe still advertises {false_claim:?}: {text}"
+        );
+    }
+    for true_claim in [
+        "including for loopback",
+        "registration is refused if neither",
+    ] {
+        assert!(
+            text.contains(true_claim),
+            "memory_subscribe must state {true_claim:?}: {text}"
+        );
+    }
+
+    // Behaviour anchor: the server really does refuse plaintext loopback,
+    // on the scheme (not merely because loopback is off by default).
+    let err = ai_memory::subscriptions::validate_url("http://127.0.0.1:9/hook")
+        .expect_err("plaintext http to loopback must be refused (#3705)");
+    assert!(
+        !err.to_string().contains("targets loopback address"),
+        "the refusal must be the plaintext one, not the loopback SSRF one: {err}"
+    );
+}

@@ -18,14 +18,18 @@ use serde_json::{Value, json};
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 #[allow(dead_code)]
 pub struct SubscribeRequest {
-    /// https URL (http only for loopback). SSRF guard rejects private IPs.
+    /// HTTPS URL, required including for loopback (http is refused, #3705).
+    /// Loopback also needs `[subscriptions] allow_loopback_webhooks = true`;
+    /// the SSRF guard refuses other private addresses.
     pub url: String,
 
     /// Comma-list or *. Events: memory_store, memory_delete, memory_promote.
     #[serde(default)]
     pub events: Option<String>,
 
-    /// HMAC secret. Omit for unsigned.
+    /// Per-subscription HMAC secret; if omitted, the server-wide
+    /// `[hooks.subscription] hmac_secret` is used, and registration is
+    /// refused if neither is set (deliveries are never unsigned).
     #[serde(default)]
     pub secret: Option<String>,
 
@@ -54,7 +58,7 @@ impl McpTool for SubscribeTool {
         "Register a webhook subscription for memory events."
     }
     fn docs() -> &'static str {
-        "Webhook subscription. HMAC-SHA256 signed via X-Ai-Memory-Signature when secret supplied. https required (http only for loopback). Secret stored hashed only."
+        "Webhook subscription. Every delivery is HMAC-SHA256 signed via X-Ai-Memory-Signature with the per-subscription secret, else the server-wide [hooks.subscription] hmac_secret; registration is refused if neither is set. https required, including for loopback (loopback also needs [subscriptions] allow_loopback_webhooks = true). Secret stored hashed only."
     }
     fn input_schema() -> Value {
         crate::mcp::registry::input_schema_for::<SubscribeRequest>()

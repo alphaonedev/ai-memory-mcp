@@ -1804,6 +1804,11 @@ mod d1_6_987_tests {
     //!   `get` re-listed forever. The docs now state the shipped contract:
     //!   the inbox is the pending set, handled = deleted by the recipient,
     //!   `unread_only` narrows nothing.
+    //! - 2026-09-27 (#4005): `memory_subscribe.docs` (and its `url` / `secret`
+    //!   property descriptions) advertised plaintext `http` for loopback and
+    //!   unsigned delivery; both are refused by the server. The text now says
+    //!   https is required including for loopback and a registration with no
+    //!   secret anywhere is refused.
     //! - 2026-09-10 (#3394): `memory_pending_approve` / `memory_pending_reject`
     //!   advertised `remember=forever` progressive trust. Forever cannot be
     //!   honoured durably (process-local `SYNTHETIC_RULES` only; #3580).
@@ -1966,6 +1971,11 @@ mod d1_6_987_tests {
         // #3551: source admission replaces missing-source stubs before promotion.
         "memory_skill_promote_from_reflection",
         "memory_stats",
+        // #4005 — advertised "http only for loopback" and "omit for
+        // unsigned"; the server refuses plaintext http to every host (#3705)
+        // and refuses a registration with no per-subscription or server-wide
+        // HMAC secret (R3-S1.HMAC). The docs now state what is enforced.
+        "memory_subscribe",
         // #3659 — `delivery_status` on replayed events: `pending` can mean
         // the terminal status write failed, not only in flight; the docs
         // now say so at the field a caller reads.
