@@ -376,7 +376,7 @@ scan_test_lines () {
             grep -En "$STDIN_PATTERN" "$f" 2>/dev/null || true
             grep -En "$STDIN_TOKEN_PATTERN" "$f" 2>/dev/null || true
             grep -En "$STDIN_ALIAS_PATTERN" "$f" 2>/dev/null || true
-        } | sort -t: -k1,1n -u
+        } | LC_ALL=C sort -t: -k1,1n -u
     )"
     [[ -z "$matches" ]] && return 0
     local cfg_ranges

@@ -171,8 +171,8 @@ load_fixture_live() {
 compare_files() {
     local a_file="$1" a_label="$2" b_file="$3" b_label="$4"
     local only_a only_b
-    only_a="$(comm -23 "$a_file" "$b_file" || true)"
-    only_b="$(comm -13 "$a_file" "$b_file" || true)"
+    only_a="$(LC_ALL=C comm -23 "$a_file" "$b_file" || true)"
+    only_b="$(LC_ALL=C comm -13 "$a_file" "$b_file" || true)"
     if [ -n "$only_a" ]; then
         fail "$a_label has contexts not in $b_label:"
         printf '%s\n' "$only_a" | sed 's/^/     - /' >&2
@@ -467,7 +467,54 @@ TXT
         exit 2
     fi
 
-    echo "required-contexts-live self-test: PASS (load-bearing — catches the #3554 38-vs-35 shape, extra live context, enforce_admins=false, strict=false, empty live, missing declaration, missing pin, stale pin; spares equal sets and an inline-# context name)"
+    # (11) #3984: compare_files MUST be locale-independent. sorted_unique
+    #      sorts under LC_ALL=C, so `comm` must compare under LC_ALL=C too;
+    #      under an ambient non-C collation (en_US.UTF-8) a bare `comm`
+    #      warns "not in sorted order" and mis-attributes the drift — a
+    #      context present on BOTH sides is named as drift, so the report no
+    #      longer says which declared context is really missing from live.
+    #      Punctuation-leading names are the trigger: C orders `(` and `-`
+    #      before letters, en_US ignores them at the first level.
+    #  (11a) Static: every comm/sort/join in this script is LC_ALL=C-prefixed
+    #        (holds even on a host with no non-C locale installed).
+    local bare
+    bare="$(grep -nE '(^|[|(]|\$\(|<\()[[:space:]]*(comm|sort|join)[[:space:]]' "$ROOT/scripts/check-required-contexts-live.sh" \
+        | grep -vE '^[0-9]+:[[:space:]]*#' | grep -vE 'LC_ALL=C (comm|sort|join)[[:space:]]' || true)"
+    if [ -n "$bare" ]; then
+        echo "self-test FAILED: comm/sort/join without LC_ALL=C (#3984):" >&2
+        printf '%s\n' "$bare" >&2
+        exit 2
+    fi
+    #  (11b) Behavioural, under a real non-C collation when one is installed.
+    printf '%s\n' '(paren) gate' '-hyphen gate' 'alpha gate' >"$scratch/punct.txt"
+    printf '%s\n' 'alpha gate' >"$scratch/alpha.txt"
+    local loc nonc=""
+    for loc in en_US.UTF-8 en_US.utf8 en_GB.UTF-8 de_DE.UTF-8; do
+        if [ "$(printf '%s\n' 'B' 'a' | LC_ALL="$loc" sort 2>/dev/null | head -n1)" = "a" ]; then
+            nonc="$loc"
+            break
+        fi
+    done
+    if [ -n "$nonc" ]; then
+        if LC_ALL="$nonc" RQC_MIRROR_FILE="$scratch/punct.txt" RQC_PIN_FILE="$scratch/punct.txt" \
+            RQC_LIVE_CONTEXTS_FILE="$scratch/alpha.txt" \
+            RQC_LIVE_ENFORCE_ADMINS=true RQC_LIVE_STRICT=true \
+            "$ROOT/scripts/check-required-contexts-live.sh" >/dev/null 2>"$scratch/errlocale"; then
+            echo "self-test FAILED: punctuation-leading drift under $nonc was NOT rejected (#3984)" >&2
+            exit 2
+        fi
+        local listed
+        listed="$(sed -n 's/^     - //p' "$scratch/errlocale" | LC_ALL=C sort -u | tr '\n' '|')"
+        if [ "$listed" != "(paren) gate|-hyphen gate|" ] || grep -q 'not in sorted order' "$scratch/errlocale"; then
+            echo "self-test FAILED: under $nonc the drift report is wrong (#3984) — want exactly '(paren) gate' and '-hyphen gate', got: ${listed}" >&2
+            cat "$scratch/errlocale" >&2
+            exit 2
+        fi
+    else
+        echo "required-contexts-live self-test: note — no non-C collation locale installed; #3984 behavioural leg (11b) skipped, static leg (11a) enforced" >&2
+    fi
+
+    echo "required-contexts-live self-test: PASS (load-bearing — catches the #3554 38-vs-35 shape, extra live context, enforce_admins=false, strict=false, empty live, missing declaration, missing pin, stale pin, locale-dependent comm (#3984); spares equal sets and an inline-# context name)"
 }
 
 case "${1:-}" in

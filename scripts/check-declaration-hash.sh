@@ -100,7 +100,7 @@ run_gate() {
       echo "::error::declaration-hash gate: standard §6 cites ${nid} but the declaration's §6 table has no '| ${nid} | #<issue> |' row (D4)" >&2
       missing=1
     fi
-  done < <(awk '/^## 6\. Execution list/{f=1} /^## 7\./{f=0} f' "$STD" | grep -oE '\bN[0-9]+\b' | sort -u)
+  done < <(awk '/^## 6\. Execution list/{f=1} /^## 7\./{f=0} f' "$STD" | grep -oE '\bN[0-9]+\b' | LC_ALL=C sort -u)
   [ "$missing" = 0 ] || exit 1
   echo "declaration-hash gate: PASS (sha ${actual_sha:0:12}, revision ${file_rev}, no placeholders, §6 ids indexed)"
 }

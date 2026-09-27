@@ -162,7 +162,7 @@ judge() { # $1 = allowlist path; reads "file:line  key" lines on stdin; sets LIV
     done < <(grep -E '^[^#].*=pending:#[0-9]+\s*$' "$ALLOW" | sed -E 's/=pending:#[0-9]+\s*$//')
   fi
   rm -f "$SEEN_PENDING"
-  [ "$PENDING" -gt 0 ] && echo "  LIVE unredacted sinks held by the ledger: $PENDING ($(printf '%s\n' $PER_ISSUE | sort | uniq -c | awk '{printf "%s=%s ", $2, $1}'| sed 's/ $//'))"
+  [ "$PENDING" -gt 0 ] && echo "  LIVE unredacted sinks held by the ledger: $PENDING ($(printf '%s\n' $PER_ISSUE | LC_ALL=C sort | uniq -c | awk '{printf "%s=%s ", $2, $1}'| sed 's/ $//'))"
 }
 
 if [ "$SELF_TEST" -eq 1 ]; then

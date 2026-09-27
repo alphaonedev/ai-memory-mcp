@@ -176,7 +176,7 @@ tokenise() {
         && $0 !~ /^(rs|src|lib|mod|tests|test|the|and|for|use|with|core|util|utils|main)$/ {
             print tolower($0)
         }
-    ' | sort -u
+    ' | LC_ALL=C sort -u
 }
 
 # --------------------------------------------------------------------
@@ -210,8 +210,8 @@ compute_impact() {
         esac
     done
     # Dedup token + direct lists
-    sort -u -o "$tmp_tokens" "$tmp_tokens"
-    sort -u -o "$tmp_direct" "$tmp_direct"
+    LC_ALL=C sort -u -o "$tmp_tokens" "$tmp_tokens"
+    LC_ALL=C sort -u -o "$tmp_direct" "$tmp_direct"
 
     # 2. Match each tests/*.rs basename against the token set
     local t name
@@ -226,7 +226,7 @@ compute_impact() {
         if tokenise "$name.rs" | grep -qxFf "$tmp_tokens" -; then
             printf '%s\n' "$name" >> "$tmp_impacted"
         fi
-    done < <(find "$repo_root/tests" -maxdepth 1 -type f -name '*.rs' 2>/dev/null | sort)
+    done < <(find "$repo_root/tests" -maxdepth 1 -type f -name '*.rs' 2>/dev/null | LC_ALL=C sort)
 
     # 3. ALWAYS include the parity invariants (existence-gated)
     for t in "${ALWAYS_RUN_PARITY_TESTS[@]}"; do
@@ -236,7 +236,7 @@ compute_impact() {
     done
 
     # 4. Emit sorted unique list
-    [[ -s "$tmp_impacted" ]] && sort -u "$tmp_impacted"
+    [[ -s "$tmp_impacted" ]] && LC_ALL=C sort -u "$tmp_impacted"
 }
 
 # --------------------------------------------------------------------

@@ -1057,6 +1057,19 @@ run_gate() {
     local -a notreq_lines=()
     mapfile -t notreq_lines < <(read_list "$NOTREQ_FILE")
     local nline nfile njob ndate nref
+    # #3985: the ledger is where a promotion is read from, so it must never
+    # instruct the inverted "mirror first" order. Since #3554 an ADDITION is
+    # live protection -> --pin-from-live -> move the name from this ledger
+    # into the mirror in the same commit; a declaration that lands first
+    # fails check-required-contexts-live.sh. Comments are scanned too — the
+    # wrong order was first taught in this file's header.
+    local order_inv
+    order_inv="$(grep -niE 'mirror[ -]+first' "$NOTREQ_FILE" 2>/dev/null || true)"
+    if [ -n "$order_inv" ]; then
+        fail "NOT-REQUIRED LEDGER ORDER INVERSION (#3985) — $NOTREQ_FILE instructs 'mirror first', the #3554 over-claim order that fails the live-drift gate."
+        printf '%s\n' "$order_inv" | cut -c1-200 | sed 's/^/     line /' >&2
+        echo "     FIX: state the #3554 lockstep instead — live protection first, then --pin-from-live, then move the reported name from this ledger into $MIRROR_FILE in the same commit as the pin." >&2
+    fi
     for nline in "${notreq_lines[@]}"; do
         # FORMAT: <workflow-file> <job-id> <YYYY-MM-DD> #<issue> [note…]
         read -r nfile njob ndate nref _ <<< "$nline"
@@ -1138,8 +1151,8 @@ run_gate() {
 
         fail "RULE (f) — $fwf job '$fjob' reports context(s) $missing, which are declared NEITHER in $MIRROR_FILE nor in $NOTREQ_FILE."
         echo "     A job in a gating workflow that appears in neither file is UNENFORCED BY DEFAULT — it runs on every PR, looks like a gate, and blocks nothing. That is #2636: four c8-precheck integrity gates were in exactly this state, including THIS gate, the only mechanical proof that the other required contexts are sound, so a PR that broke it could merge." >&2
-        echo "     FIX (almost always the right one): add the reported name(s) verbatim to $MIRROR_FILE, then make the branch-protection call — mirror FIRST, protection after (the ORDER doctrine in that file's header: prove, then enforce)." >&2
-        echo "     OR, if leaving it unrequired is a deliberate, dated, tracked decision: add '$fwf $fjob $(date -u +%Y-%m-%d) #<issue>' to $NOTREQ_FILE. That is a decision record, not an absolution." >&2
+        echo "     FIX (the usual path, #3554 ORDER in $MIRROR_FILE's header): a new job cannot report on the protected base until it merges, so FIRST add a dated, tracked entry '$fwf $fjob $(date -u +%Y-%m-%d) #<issue>' to $NOTREQ_FILE; then, once it has reported on the base, promote it in lockstep — live branch protection, then 'scripts/check-required-contexts-live.sh --pin-from-live', then move the name verbatim from $NOTREQ_FILE into $MIRROR_FILE in the same commit as the pin. Declaring it in the mirror ahead of live protection fails the live-drift gate (#3554 / #2712)." >&2
+        echo "     If the job ALREADY reports on the base and is already in live protection, declare the reported name(s) verbatim in $MIRROR_FILE together with the regenerated pin. A ledger entry is a decision record, not an absolution." >&2
         if [ "${JOB_MATRIX[$fjk]}" = "1" ]; then
             echo "     NOTE: this is a MATRIX job. PARTIAL coverage fails deliberately — an expansion that no one declared can fail and merge while its siblings look green." >&2
         fi
@@ -1892,6 +1905,16 @@ YAML
     # clean control: the wired fixture gate alone PASSES
     write_clean
     g_expect "clean control" 0 "" || return 2
+    # ---- #3985: the not-required ledger must not teach the inverted order ----
+    write_clean
+    : > "$nwd"
+    printf '# promote it later (mirror FIRST, protection after)\n' > "$nrq"
+    g_expect "#3985 ledger comment instructing mirror-first" nonzero "NOT-REQUIRED LEDGER ORDER INVERSION (#3985)" || return 2
+    printf '# promote via the #3554 lockstep: live protection, --pin-from-live, then move the name\n' > "$nrq"
+    g_expect "#3985 ledger with the lockstep wording" 0 "" || return 2
+    : > "$nrq"
+    echo "  [#3985] a not-required ledger that instructs 'mirror first': CAUGHT (the lockstep wording passes)"
+
     echo "  [g] a gate script no workflow references: CAUGHT BY RULE (g) (a commented-out reference does not count; a dated+tracked ledger entry passes; undated / non-#issue / stale / wired-but-ledgered entries and an empty script set all FAIL)"
 
     echo "required-contexts gate self-test: PASS (load-bearing — catches the #2494 (b1) wedge, the (a) unmatched-context class, the (c) path-filtered carrier, the (b3) unguarded step, the (b4) unallowlistable decider 'if:', both directions of the (b2) ratchet, the (d) #2508 cancelled-duplicate carrier in its verbatim historical form, and the (f) #2636 unenforced-by-default job with its ledger-rot and scope cross-checks, and the (g) #3967 gate script no workflow runs with its own ledger hygiene; spares a clean tree, all four (d) near-miss shapes, both legitimate (f) dispositions, and a dated (g) ledger entry)"

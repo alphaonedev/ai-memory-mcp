@@ -377,7 +377,7 @@ while IFS= read -r _hf; do
     _hf="${_hf#./}"
     html_is_frozen "$_hf" && continue
     HTML_DOC_FILES+=("$_hf")
-done < <(find docs -name '*.html' -type f 2>/dev/null | sort)
+done < <(find docs -name '*.html' -type f 2>/dev/null | LC_ALL=C sort)
 
 if [[ ${#HTML_DOC_FILES[@]} -eq 0 && -z "${AI_MEMORY_DOCS_GATE_ROOT:-}" ]]; then
     printf 'FAIL: check-docs-vs-ssot: resolved ZERO operator-facing docs/**/*.html pages — the html rules would be a silent no-op (#2444)\n' >&2
@@ -1015,7 +1015,7 @@ check_env_var_census_rule() {
     code_vars=$( { _census_production_lines | grep -oE 'env::var(_os)?\("AI_MEMORY_[A-Z0-9_]+"'; \
         _census_production_lines | grep -oE 'const [A-Z][A-Z0-9_]*: *&str *= *"AI_MEMORY_[A-Z0-9_]+"'; \
         _census_production_lines | grep -oE 'env *= *"AI_MEMORY_[A-Z0-9_]+"'; } \
-        | grep -oE 'AI_MEMORY_[A-Z0-9_]+' | sort -u) || true
+        | grep -oE 'AI_MEMORY_[A-Z0-9_]+' | LC_ALL=C sort -u) || true
     for var in $code_vars; do
         # Word-boundaried: a bare `grep -q` lets a LONGER var's mention
         # satisfy a shorter one (`AI_MEMORY_STORE_URL` would be answered
@@ -1388,7 +1388,7 @@ PY
                 printf 'NOTICE: doc-numeric-claims ledger entry is STALE (suppresses nothing) — delete it: %s\n' \
                     "$(tr '|' ' ' <<<"$k")" >&2
             fi
-        done < <(sort -u <<<"$ledger_keys")
+        done < <(LC_ALL=C sort -u <<<"$ledger_keys")
     fi
 }
 

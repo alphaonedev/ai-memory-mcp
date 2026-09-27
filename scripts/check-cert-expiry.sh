@@ -193,8 +193,8 @@ wire_drift() {
     local from_ids to_ids
     from_ids="$(extract_fed_ids "$repo" "$from")"
     to_ids="$(extract_fed_ids "$repo" "$to")"
-    comm -13 <(printf '%s\n' "$from_ids" | sed '/^$/d') <(printf '%s\n' "$to_ids" | sed '/^$/d') | sed 's/^/+/'
-    comm -23 <(printf '%s\n' "$from_ids" | sed '/^$/d') <(printf '%s\n' "$to_ids" | sed '/^$/d') | sed 's/^/-/'
+    LC_ALL=C comm -13 <(printf '%s\n' "$from_ids" | sed '/^$/d') <(printf '%s\n' "$to_ids" | sed '/^$/d') | sed 's/^/+/'
+    LC_ALL=C comm -23 <(printf '%s\n' "$from_ids" | sed '/^$/d') <(printf '%s\n' "$to_ids" | sed '/^$/d') | sed 's/^/-/'
 }
 
 # extract_fed_ids REPO TREE — unique AI_MEMORY_FED_* identifiers in src/
@@ -206,7 +206,7 @@ extract_fed_ids() {
     if [[ -z "$out" ]]; then
         return 0
     fi
-    printf '%s\n' "$out" | grep -oE "$FED_ID_PATTERN" | sort -u
+    printf '%s\n' "$out" | grep -oE "$FED_ID_PATTERN" | LC_ALL=C sort -u
 }
 
 # ---------------------------------------------------------------------------
@@ -355,8 +355,8 @@ check_change() {
     local base_ids head_ids added removed
     base_ids="$(extract_fed_ids "$repo" "$mb")"
     head_ids="$(extract_fed_ids "$repo" "$head")"
-    added="$(comm -13 <(printf '%s\n' "$base_ids" | sed '/^$/d') <(printf '%s\n' "$head_ids" | sed '/^$/d') || true)"
-    removed="$(comm -23 <(printf '%s\n' "$base_ids" | sed '/^$/d') <(printf '%s\n' "$head_ids" | sed '/^$/d') || true)"
+    added="$(LC_ALL=C comm -13 <(printf '%s\n' "$base_ids" | sed '/^$/d') <(printf '%s\n' "$head_ids" | sed '/^$/d') || true)"
+    removed="$(LC_ALL=C comm -23 <(printf '%s\n' "$base_ids" | sed '/^$/d') <(printf '%s\n' "$head_ids" | sed '/^$/d') || true)"
 
     local id_changed=0
     [[ -n "$added" || -n "$removed" ]] && id_changed=1

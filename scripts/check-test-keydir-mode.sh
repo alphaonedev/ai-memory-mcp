@@ -12,7 +12,7 @@
 # key dir (not on an unrelated dir while KEY_DIR points at a TempDir root).
 set -u
 fail=0
-for f in $(git grep -lE 'AI_MEMORY_KEY_DIR|_KEY_DIR"' -- 'tests/*.rs' 'tests/**/*.rs' | sort -u); do
+for f in $(git grep -lE 'AI_MEMORY_KEY_DIR|_KEY_DIR"' -- 'tests/*.rs' 'tests/**/*.rs' | LC_ALL=C sort -u); do
   grep -qE 'mkdir_0700|from_mode\(0o700\)' "$f" && continue
   if grep -qE 'std::fs::create_dir(_all)?\(&(keys|key_dir|kdir|dir)\b' "$f" \
      && grep -qE 'KEY_DIR"?,\s*&?(keys|key_dir|kdir|dir)\b|KEY_DIR",\s*[a-z_]+(\.path\(\))?\.join\("keys"\)|self\.keys' "$f"; then

@@ -199,7 +199,7 @@ if [[ "${1:-}" == "--update-baseline" ]]; then
         echo "# const-name-literals grandfathered baseline — burn-down to EMPTY"
         echo "# scheduled in the #1579 merge-train. Entries: relpath:identifier."
         echo "# Regenerate ONLY via --update-baseline (operator-gated)."
-        scan emit | sort -u
+        scan emit | LC_ALL=C sort -u
     } > "$BASELINE"
     echo "baseline regenerated: $(grep -cv '^#' "$BASELINE" || true) entries"
     exit 0

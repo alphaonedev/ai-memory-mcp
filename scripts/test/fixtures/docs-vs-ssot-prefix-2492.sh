@@ -323,7 +323,7 @@ check_env_var_census_rule() {
         --include='*.rs' 2>/dev/null; \
         grep -rhoE 'const ENV_[A-Z0-9_]+: *&str *= *"AI_MEMORY_[A-Z0-9_]+"' "$REPO_ROOT/src" \
         --include='*.rs' 2>/dev/null; } \
-        | grep -oE 'AI_MEMORY_[A-Z0-9_]+' | sort -u) || true
+        | grep -oE 'AI_MEMORY_[A-Z0-9_]+' | LC_ALL=C sort -u) || true
     for var in $code_vars; do
         if ! grep -q "$var" "$REPO_ROOT/CLAUDE.md"; then
             printf 'FAIL: %s: src reads %s but CLAUDE.md never mentions it (env-var table drift)\n' \

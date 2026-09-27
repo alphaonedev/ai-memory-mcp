@@ -44,7 +44,8 @@
 #   * The NEW (full) context must be ADDED to live protection AFTER the rename
 #     merges, because until the base carries the rename no PR reports that name
 #     and requiring it would wedge every open PR instead. (Addition ⇒ mirror
-#     first: the ADDITION half of the doctrine.)
+#     first under the pre-#3554 doctrine; the CURRENT addition order is the
+#     #3554 lockstep in ORDER below — #3985.)
 #
 # So the sequence is: (1) protection DROPS the truncated context — 23 required;
 # (2) this PR merges — mirror declares the full name, workflow reports it, and
@@ -231,10 +232,9 @@ Named-CI-job existence + enforcement-truthfulness gate (#2629)
 # whether a cited value/symbol is RIGHT; this one pins whether anything is
 # MISSING). Declared REQUIRED per gate 7 rule (f): a new c8-precheck
 # integrity gate must be declared here (or in the not-required ledger) or
-# rule (f) flags it as required-by-nothing — the #2636 class. Mirror-first:
-# this declaration lands before the companion branch-protection API call
-# (KNOWN GAP below), so the gate can prove the context sound before it is
-# enforced.
+# rule (f) flags it as required-by-nothing — the #2636 class. It was
+# declared under the pre-#3554 mirror-first order; it is now held equal to
+# live protection by check-required-contexts-live.sh (ORDER above, #3985).
 Doc surface completeness gate (#2839)
 #
 # #2869 — agent-count / scale-CAPACITY claim ceiling gate (CERT TRUTHFULNESS).
@@ -286,8 +286,8 @@ Enterprise-federation cert-expiry gate (cert §7 / F7)
 # `required_signatures` ruleset + `Commit-signing posture gate (#2486)`.
 # Carried by `c8-precheck.yml` (`external-pr-operator-approval-gate`); no
 # `needs:`, no job-level `if:`, no `paths:` filter — always reports. Declared
-# REQUIRED per gate 7 rule (f); mirror-first, the companion branch-protection
-# API call follows once this job has reported green on the base branch.
+# REQUIRED per gate 7 rule (f); declared under the pre-#3554 mirror-first
+# order, now held equal to live protection (ORDER above, #3985).
 External-PR operator-approval gate (author outside team => @alphaonedev review)
 #
 # ---------------------------------------------------------------------------
@@ -345,8 +345,8 @@ Postgres ignored tests (sal-postgres --ignored)
 #     All four are now DECLARED above, plus `Build-script custom-build ledger
 #     gate (#2635)`, taking this mirror from 24 to 29 declared contexts. Live
 #     `required_status_checks` remains at 24 until the operator makes the
-#     branch-protection call — the ADDITION half of the ORDER doctrine above
-#     (mirror first, protection after: prove, then enforce). The intermediate
+#     branch-protection call — the ADDITION half of the ORDER doctrine as it
+#     stood then (mirror first; superseded by the #3554 lockstep). The intermediate
 #     state over-claims enforcement for one visible, diffable window and blocks
 #     nothing, because GitHub never reads this file.
 #
