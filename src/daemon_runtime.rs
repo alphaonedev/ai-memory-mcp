@@ -1123,10 +1123,10 @@ pub struct ServeArgs {
     pub host: String,
     #[arg(long, default_value_t = DEFAULT_PORT)]
     pub port: u16,
-    /// Path to PEM-encoded TLS certificate (may include the full chain).
-    /// Passing both `--tls-cert` and `--tls-key` switches `serve` to
-    /// HTTPS. rustls under the hood — no OpenSSL dep. Absent both
-    /// flags = plain HTTP (same as every previous release).
+    /// PEM TLS certificate (may include the full chain), paired with `--tls-key`;
+    /// rustls, no OpenSSL. Without these flags `serve` uses material installed by
+    /// `ai-memory tls import` or generated locally for a singleton, and refuses
+    /// otherwise; it never serves plaintext HTTP (#3705, #4006).
     #[arg(long, requires = "tls_key")]
     pub tls_cert: Option<PathBuf>,
     /// Path to PEM-encoded TLS private key (PKCS#8 or RSA).

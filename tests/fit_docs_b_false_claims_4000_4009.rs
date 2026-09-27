@@ -227,3 +227,38 @@ fn tofu_recipe_pins_identity_not_signature_4002() {
         ISSUE,
     );
 }
+
+/// #4006 — `ai-memory tls init|import|status` ship in v1.0.0 (unconditionally
+/// registered, `src/cli/tls.rs`); the references must not defer them to
+/// v1.0.1, and must not tell operators rotation needs an unshipped verb.
+#[test]
+fn tls_verbs_are_not_deferred_to_v1_0_1_4006() {
+    const ISSUE: &str = "#4006";
+    // Premise anchor: the verbs exist.
+    for verb in ["    Init {", "    Import {", "    Status,"] {
+        assert_present("src/cli/tls.rs", verb.trim(), ISSUE);
+    }
+    assert_absent(
+        "docs/CLI_REFERENCE.md",
+        "init|import|renew` and `ai-memory db check-tls` verbs are v1.0.1",
+        ISSUE,
+    );
+    assert_absent(
+        "docs/SECURITY.md",
+        "init|import|renew` and `ai-memory db check-tls` verbs",
+        ISSUE,
+    );
+    assert_absent(
+        "docs/SECURITY.md",
+        "an `ai-memory tls import` verb is #3709 item 2, v1.0.1",
+        ISSUE,
+    );
+    for rel in ["docs/CLI_REFERENCE.md", "docs/SECURITY.md"] {
+        assert_present(
+            rel,
+            "v1.0.0 ships `ai-memory tls init`, `tls import`, and `tls status`",
+            ISSUE,
+        );
+    }
+    assert_absent("src/daemon_runtime.rs", "flags = plain HTTP", ISSUE);
+}

@@ -75,3 +75,29 @@ fn serve_rejects_tier_flag() {
         "serve --tier must be rejected at parse time; stderr was:\n{stderr}"
     );
 }
+
+/// #4006 — `serve --help` promised "Absent both flags = plain HTTP (same as
+/// every previous release)". Since #3705 the daemon never binds plaintext:
+/// with no flags it uses installed or generated TLS material, or refuses.
+/// The help must not advertise a plaintext listener and must say what the
+/// no-flags path actually does.
+#[test]
+fn serve_help_does_not_promise_plain_http_4006() {
+    let assert = Command::cargo_bin("ai-memory")
+        .unwrap()
+        .env("AI_MEMORY_NO_CONFIG", "1")
+        .args(["serve", "--help"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let flat = stdout.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        !flat.contains("plain HTTP"),
+        "serve --help must not promise a plaintext listener (#4006); got:\n{stdout}"
+    );
+    assert!(
+        flat.contains("never serves plaintext HTTP") && flat.contains("ai-memory tls import"),
+        "serve --help must say the no-flags path uses installed/generated TLS \
+         material or refuses (#4006); got:\n{stdout}"
+    );
+}
