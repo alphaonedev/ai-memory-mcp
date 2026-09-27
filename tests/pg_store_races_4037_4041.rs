@@ -137,6 +137,12 @@ async fn wait_blocked(store: &PostgresStore, blocker: i32) {
 #[tokio::test]
 async fn nonforced_dim_conversion_fences_writers_4040() {
     let (store, _, link) = fixture().await;
+    // The dimension-migration suite may have left this disposable database
+    // at 768. Establish this test's 384-dimensional baseline explicitly.
+    store
+        .migrate_embedding_dim(384, true)
+        .await
+        .expect("establish source dimension");
     sqlx::raw_sql(
         "UPDATE memories SET embedding=NULL; UPDATE archived_memories SET embedding=NULL",
     )
