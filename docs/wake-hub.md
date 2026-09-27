@@ -767,8 +767,13 @@ into the hub directory (CWE-59), and the hub could find no snapshot mid-copy.
   directory, hands that inode to the directory's owner at mode `0600`,
   `fsync`s it, `renameat`s it over the old snapshot and `fsync`s the directory.
 
-Any refusal publishes nothing: the previous snapshot stays in place and ages
-out, which refuses hellos — the fail-closed direction.
+Any refusal, and any failure before the rename, publishes nothing: the previous
+snapshot stays in place and ages out, which refuses hellos — the fail-closed
+direction. The one step after the rename is the directory `fsync`; if it
+fails, the step exits non-zero (the unit is marked failed) with an error that
+says the new, fully validated snapshot WAS published and only its durability
+across a crash is unconfirmed. (`/run` is a tmpfs, so on the shipped layout the
+snapshot does not survive a reboot anyway; the next refresh republishes it.)
 
 **Grant the database's DIRECTORY, not the database file.** The systemd
 refresher runs under `ProtectSystem=strict`, so every path it writes has to be

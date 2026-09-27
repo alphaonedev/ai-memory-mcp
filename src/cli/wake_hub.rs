@@ -94,7 +94,9 @@ pub struct WakeHubArgs {
     /// followed, the source must be a single-link 0600 file owned by its
     /// directory's owner, the snapshot is fully validated, and the new inode
     /// is handed to the destination directory's owner at 0600 and renamed
-    /// into place atomically. A refusal publishes nothing.
+    /// into place atomically. A refusal publishes nothing; a directory fsync
+    /// failure after the rename exits non-zero saying the snapshot WAS
+    /// published but its durability is unconfirmed.
     #[arg(
         long,
         value_name = "PATH",

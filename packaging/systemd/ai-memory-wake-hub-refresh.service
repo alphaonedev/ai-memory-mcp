@@ -43,7 +43,9 @@ Group=ai-memory
 # mid-copy. --publish-snapshot follows no symlink on either path, accepts
 # only a single-link 0600 source owned by its directory's owner, fully
 # validates the snapshot, and renames a 0600 inode owned by the hub
-# directory's owner into place atomically. A refusal publishes nothing.
+# directory's owner into place atomically. A refusal publishes nothing; a
+# failed directory fsync AFTER the rename fails the unit with an error saying
+# the validated snapshot WAS published but its durability is unconfirmed.
 # AI_MEMORY_NO_CONFIG=1 keeps the root step from reading (or seeding) root's
 # ai-memory config: it needs nothing but the two explicit paths.
 ExecStart=/usr/bin/ai-memory --db /var/lib/ai-memory/ai-memory.db \

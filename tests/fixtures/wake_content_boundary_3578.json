@@ -87,7 +87,7 @@
     "path": "src/wake_hub/snapshot_publish.rs",
     "role": "#3637 M4 root hand-off of the refreshed PUBLIC allowlist snapshot into the hub runtime dir: symlink-free descriptor walk, validated with the hub's own parser, O_EXCL temp + atomic renameat. Carries no wake metadata and no message content.",
     "mode": "rust-production-tokens",
-    "sha256": "9e01f45d6fc18bd0eddaed64382513802878cf6b31d5ec31c7a76fb6ee88fe6d"
+    "sha256": "fd18ac479ee4e7ba740e5b918ff39dd7c1190289571bd2414d37c5b9f3323cbf"
   },
   {
     "path": "src/wake_hub/startup.rs",

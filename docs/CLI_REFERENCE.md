@@ -2041,7 +2041,10 @@ is the root hand-off the packaged refresher runs as `ExecStartPost=+`. It
 follows no symlink on either (absolute) path, accepts only a single-link `0600`
 source owned by its directory's owner, fully validates the snapshot, and
 renames a `0600` inode owned by the destination directory's owner into place
-atomically. A refusal publishes nothing and exits non-zero. It replaces the
+atomically. A refusal publishes nothing and exits non-zero. A directory
+`fsync` failure after the rename also exits non-zero, and its error states
+that the validated snapshot WAS published and only its durability is
+unconfirmed. It replaces the
 earlier `install(1)` step, which followed a symlinked source as root (CWE-59)
 and was not atomic.
 
