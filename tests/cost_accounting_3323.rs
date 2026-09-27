@@ -242,6 +242,12 @@ fn recall_counters_are_exact_under_concurrent_recalls() {
             let b = b.clone();
             s.spawn(move || {
                 let conn = db::open(&path).expect("worker open");
+                // #4117 (f2r) — same 8-writer exposure as the write cell: each
+                // recall appends a metering row, and record_recall_sqlite swallows
+                // SQLITE_BUSY at debug, so a lock timeout here would surface as a
+                // COUNT MISMATCH (silent metering loss is #4124). Wait, do not refuse.
+                conn.pragma_update(None, "busy_timeout", 60_000)
+                    .expect("worker busy_timeout");
                 for _ in 0..PER_THREAD {
                     cost::record_recall_sqlite(&conn, &[(a.clone(), 0.9), (b.clone(), 0.8)]);
                 }
