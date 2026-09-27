@@ -772,24 +772,20 @@ pub async fn kg_timeline(
                     // #3982: read each target under the CALLER'S OWN context. The
                     // pg `get` already folds a target this caller cannot read
                     // (lifecycle-hidden, or another tenant's private row) into
-                    // NotFound, so for a tenant the verdict is identical to the
-                    // former unconditional `for_admin` read followed by the filter
-                    // below, without constructing a privacy bypass on a tenant
-                    // route. Only the daemon keeps the admin read: its filter
-                    // verdict below is trust-all (`None`), which a scoped read
-                    // would narrow. (Over HTTP `X-Agent-Id: daemon` is refused by
-                    // `validate_agent_id`, #977, so that arm is not reachable from
-                    // a request header.)
-                    let target_ctx = crate::store::CallerContext::for_admin_checked(
-                        caller.clone(),
-                        caller == sentinels::DAEMON_PRINCIPAL,
-                    );
+                    // NotFound, so the verdict equals the former `for_admin` read
+                    // followed by the filter below, without a privacy-bypass
+                    // construction on a tenant route. No admin arm: the HTTP caller
+                    // can never be the daemon principal here (`validate_agent_id`
+                    // refuses the reserved id, #977), and an admin arm keyed on a
+                    // self-asserted id would break the #1062 contract that
+                    // `is_admin` comes from the admin gate.
+                    let target_ctx = crate::store::CallerContext::for_agent(caller.clone());
                     let mut kept = Vec::with_capacity(events.len());
                     for e in events {
                         let visible = match app.store.get(&target_ctx, &e.target_id).await {
                             Ok(m) => crate::visibility::is_readable_on_query(
                                 &m,
-                                (caller != sentinels::DAEMON_PRINCIPAL).then_some(caller.as_str()),
+                                Some(caller.as_str()),
                                 None,
                             ),
                             Err(_) => false,
