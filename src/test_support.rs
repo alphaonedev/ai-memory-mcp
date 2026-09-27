@@ -646,12 +646,132 @@ mod tests {
         );
     }
 
-    /// #4015 class guard: no `.local-runs` fixture root under `src/` may be
-    /// built from `std::env::current_dir()`. A cwd-derived root resolves
-    /// against whatever directory a concurrent test moved the process to;
-    /// `local_runs_root` exists so none has to.
+    /// #4015/#4016: one source line with its `//` comment and the contents of
+    /// its string literals removed, and all whitespace dropped, so neither
+    /// spacing nor a mention in prose can hide or fake a cwd access.
+    fn cwd_scan_normalise(line: &str) -> String {
+        let mut out = String::new();
+        let mut in_str = false;
+        let mut chars = line.chars().peekable();
+        while let Some(c) = chars.next() {
+            if in_str {
+                match c {
+                    '\\' => {
+                        chars.next();
+                    }
+                    '"' => in_str = false,
+                    _ => {}
+                }
+                continue;
+            }
+            match c {
+                '"' => {
+                    in_str = true;
+                    out.push('"');
+                }
+                '/' if chars.peek() == Some(&'/') => break,
+                c if c.is_whitespace() => {}
+                c => out.push(c),
+            }
+        }
+        out
+    }
+
+    /// Whether `raw` opens a function item (`pub async fn name(..`).
+    fn is_fn_header(raw: &str) -> bool {
+        for token in raw.split_whitespace() {
+            match token {
+                "pub" | "async" | "unsafe" | "const" | "extern" => {}
+                t if t.starts_with("pub(") || t.starts_with('"') => {}
+                "fn" => return true,
+                _ => return false,
+            }
+        }
+        false
+    }
+
+    /// #4015/#4016 class rule, as a pure function so its own mutants can be
+    /// tested: the 0-based indices of TEST-code lines that read or move the
+    /// process cwd (`env::current_dir` / `env::set_current_dir`) outside a
+    /// function that holds the ONE cwd lock or runs in a re-exec'd child. A
+    /// `use` of either is always a violation (the alias route). The process
+    /// cwd is shared by every test in the lib binary, so an unlocked read
+    /// races any writer (tmux-22's R2b retest: 17/20 red) and a fixture root
+    /// built from it can resolve under `/` or a deleted tempdir (#4015).
+    fn unguarded_cwd_access(lines: &[&str], is_test: &[bool]) -> Vec<usize> {
+        // Built at run time so this file cannot match its own needles.
+        let read = ["env", "::", "current_dir"].concat();
+        let write = ["env", "::", "set_current_dir"].concat();
+        let guards = [
+            ["cwd", "_lock("].concat(),
+            ["run_env_isolated_child", "_or_spawn("].concat(),
+        ];
+        let mut out = Vec::new();
+        for (i, raw) in lines.iter().enumerate() {
+            if !is_test.get(i).copied().unwrap_or(false) {
+                continue;
+            }
+            let line = cwd_scan_normalise(raw);
+            if !(line.contains(&read) || line.contains(&write)) {
+                continue;
+            }
+            let guarded = !line.starts_with("use")
+                && (0..=i)
+                    .rev()
+                    .find(|&j| is_fn_header(lines[j]))
+                    .is_some_and(|start| {
+                        lines[start..i].iter().any(|l| {
+                            let l = cwd_scan_normalise(l);
+                            guards.iter().any(|g| l.contains(g.as_str()))
+                        })
+                    });
+            if !guarded {
+                out.push(i);
+            }
+        }
+        out
+    }
+
+    /// The test-line mask of one source file, from the repo's SSOT
+    /// `scripts/lib/production-lines.awk` (which blanks test lines and keeps
+    /// the numbering). A file named like `*_tests.rs` is test code throughout,
+    /// exactly as `scripts/lib/production-lines.sh` treats it.
+    fn test_line_mask(path: &std::path::Path, lines: &[&str]) -> Vec<bool> {
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        let whole_file_is_test = stem
+            .split('_')
+            .any(|part| part == "test" || part == "tests");
+        if whole_file_is_test {
+            return vec![true; lines.len()];
+        }
+        let awk = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("scripts/lib/production-lines.awk");
+        let output = crate::spawn_audit::audited_command("awk", "test_support::test_line_mask")
+            .arg("-f")
+            .arg(&awk)
+            .arg(path)
+            .output()
+            .expect("run production-lines.awk");
+        assert!(
+            output.status.success(),
+            "production-lines.awk failed on {}",
+            path.display()
+        );
+        let production = String::from_utf8_lossy(&output.stdout).into_owned();
+        let production: Vec<&str> = production.lines().collect();
+        lines
+            .iter()
+            .enumerate()
+            .map(|(i, l)| {
+                !l.trim().is_empty() && production.get(i).is_none_or(|p| p.trim().is_empty())
+            })
+            .collect()
+    }
+
+    /// #4015/#4016 class guard over `src/`: every test-code read or move of
+    /// the process cwd holds the ONE cwd lock or runs in an isolated child.
     #[test]
-    fn no_local_runs_root_is_built_from_the_process_cwd_4015() {
+    fn test_code_process_cwd_access_holds_the_cwd_lock_4015_4016() {
         fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
             for entry in std::fs::read_dir(dir).expect("read src dir") {
                 let path = entry.expect("dir entry").path();
@@ -666,25 +786,85 @@ mod tests {
         let mut files = Vec::new();
         walk(&src, &mut files);
         assert!(files.len() > 100, "the scan must see the source tree");
-        // Built at run time so this file does not match its own needle.
-        let needle = format!("{}(\"{}\")", ".join", ".local-runs");
         let mut offenders = Vec::new();
+        let mut test_lines_seen = 0usize;
         for file in &files {
             let text = std::fs::read_to_string(file).expect("read source file");
             let lines: Vec<&str> = text.lines().collect();
-            for (i, line) in lines.iter().enumerate() {
-                if !line.contains(&needle) {
-                    continue;
-                }
-                let from = i.saturating_sub(3);
-                if lines[from..=i].iter().any(|l| l.contains("current_dir()")) {
-                    offenders.push(format!("{}:{}", file.display(), i + 1));
-                }
+            let mask = test_line_mask(file, &lines);
+            test_lines_seen += mask.iter().filter(|t| **t).count();
+            for i in unguarded_cwd_access(&lines, &mask) {
+                offenders.push(format!("{}:{}", file.display(), i + 1));
             }
         }
+        assert!(test_lines_seen > 10_000, "the mask must find the test code");
         assert!(
             offenders.is_empty(),
-            "use test_support::local_runs_root (or CARGO_MANIFEST_DIR) instead of the process cwd: {offenders:?}"
+            "test code reads or moves the process cwd without crate::test_support::cwd_lock() \
+             or config::run_env_isolated_child_or_spawn (use test_support::local_runs_root for \
+             fixture roots): {offenders:?}"
+        );
+    }
+
+    /// The class rule catches every shape tmux-22's R2b retest used to slip
+    /// past the first guard, and nothing else.
+    #[test]
+    fn cwd_access_rule_catches_the_r2b_mutants_4015_4016() {
+        let flagged = |src: &str| {
+            let lines: Vec<&str> = src.lines().collect();
+            unguarded_cwd_access(&lines, &vec![true; lines.len()])
+        };
+        let read = ["std::env::", "current_dir"].concat();
+        // Mutants that MUST be flagged.
+        let direct = format!("fn root() -> P {{\n    {read}().unwrap().join(\".local-runs\")\n}}");
+        assert_eq!(flagged(&direct), vec![1], "direct");
+        let spaced = "fn root() -> P {\n    std :: env :: current_dir ( ).unwrap()\n}";
+        assert_eq!(flagged(spaced), vec![1], "spaced");
+        let split = format!(
+            "fn root() -> P {{\n    let cwd = {read}().unwrap();\n    // a\n    // b\n    // c\n    cwd.join(\".local-runs\")\n}}"
+        );
+        assert_eq!(flagged(&split), vec![1], "split across comment lines");
+        let alias = [
+            "use std::env::",
+            "current_dir as cwd;\nfn root() -> P {\n    cwd().unwrap()\n}",
+        ]
+        .concat();
+        assert_eq!(flagged(&alias), vec![0], "alias import");
+        let writer = [
+            "fn t() {\n    std::env::",
+            "set_current_dir(p).unwrap();\n}",
+        ]
+        .concat();
+        assert_eq!(flagged(&writer), vec![1], "unlocked writer");
+        let helper = format!(
+            "fn t() {{\n    let _l = cwd_lock();\n}}\nfn helper() -> P {{\n    {read}().unwrap()\n}}"
+        );
+        assert_eq!(
+            flagged(&helper),
+            vec![4],
+            "a lock in another fn does not cover a helper"
+        );
+        // Shapes that must stay CLEAN.
+        let locked = format!(
+            "fn t() {{\n    let _l = crate::test_support::cwd_lock();\n    let c = {read}().ok();\n}}"
+        );
+        assert!(flagged(&locked).is_empty(), "locked read");
+        let child = format!(
+            "fn t() {{\n    if run_env_isolated_child_or_spawn(\"x\") {{ return; }}\n    {read}().ok();\n}}"
+        );
+        assert!(flagged(&child).is_empty(), "child-isolated");
+        assert!(
+            flagged("fn t() {\n    cmd.current_dir(dir);\n}").is_empty(),
+            "Command::current_dir sets a CHILD's cwd"
+        );
+        let comment = format!("fn t() {{\n    // {read}() is not called here\n}}");
+        assert!(flagged(&comment).is_empty(), "prose in a comment");
+        let string = format!("fn t() {{\n    let s = \"{read}()\";\n}}");
+        assert!(flagged(&string).is_empty(), "text in a string literal");
+        let lines = [read.as_str()];
+        assert!(
+            unguarded_cwd_access(&lines, &[false]).is_empty(),
+            "production code is out of scope"
         );
     }
 }

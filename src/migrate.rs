@@ -1112,6 +1112,15 @@ mod tests {
     // test needs the lock while it waits.
     #[allow(clippy::await_holding_lock)]
     async fn open_store_sqlite_with_three_slashes() {
+        // #4016: this is the ONLY test in the lib binary that MOVES the
+        // process cwd. Run it alone in a re-exec'd child, so the move can
+        // never be observed by a concurrent reader, even one that does not
+        // take the cwd lock.
+        if crate::config::run_env_isolated_child_or_spawn(
+            "migrate::tests::open_store_sqlite_with_three_slashes",
+        ) {
+            return;
+        }
         // sqlite:///path → absolute path (already covered).
         // sqlite://./relative → relative; we cover the `else` branch in
         // open_store's path-strip closure (line 106).

@@ -1449,7 +1449,9 @@ mod jail_3357_tests {
             expected
         );
 
-        // It is NOT the process working directory.
+        // It is NOT the process working directory. (#4016: a cwd read holds
+        // the ONE cwd lock.)
+        let _cwd = crate::test_support::cwd_lock();
         let cwd = std::fs::canonicalize(std::env::current_dir().expect("cwd")).expect("canon cwd");
         assert_ne!(root, cwd);
         assert_ne!(root, cwd.join(DEFAULT_EXPORT_DIR_NAME));

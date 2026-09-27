@@ -315,6 +315,10 @@ mod tests {
 
     #[test]
     fn auto_namespace_in_uses_the_dirname_outside_a_git_repo_4016() {
+        // The before/after cwd comparison is a READ of the process cwd; hold
+        // the ONE cwd lock across it so no writer can move it in between
+        // (tmux-22's R2b retest: 17/20 red when paired with the migrate test).
+        let _cwd = crate::test_support::cwd_lock();
         let tmp = tempfile::tempdir().expect("tempdir");
         let inner = tmp.path().join("scratch-dir-4016");
         std::fs::create_dir_all(&inner).expect("mkdir inner");
