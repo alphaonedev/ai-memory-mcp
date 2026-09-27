@@ -646,35 +646,128 @@ mod tests {
         );
     }
 
-    /// #4015/#4016: one source line with its `//` comment and the contents of
-    /// its string literals removed, and all whitespace dropped, so neither
-    /// spacing nor a mention in prose can hide or fake a cwd access.
-    fn cwd_scan_normalise(line: &str) -> String {
-        let mut out = String::new();
-        let mut in_str = false;
-        let mut chars = line.chars().peekable();
-        while let Some(c) = chars.next() {
-            if in_str {
-                match c {
-                    '\\' => {
-                        chars.next();
+    fn is_ident_char(c: char) -> bool {
+        c.is_alphanumeric() || c == '_'
+    }
+
+    /// #4015/#4016: every source line with comments (`//`, nested `/* */`,
+    /// across lines) and the CONTENTS of string, raw-string and char literals
+    /// removed, and whitespace dropped except one space between two identifier
+    /// characters (so `env as e` survives and `std :: env` does not split).
+    /// Neither spacing, a comment nor a literal can hide or fake a cwd access.
+    fn cwd_scan_normalise(lines: &[&str]) -> Vec<String> {
+        // `None` = code; `Some(None)` = "..." string; `Some(Some(n))` = raw string with n hashes.
+        let mut in_str: Option<Option<usize>> = None;
+        let mut block_depth = 0usize;
+        let mut out_lines = Vec::with_capacity(lines.len());
+        for line in lines {
+            let cs: Vec<char> = line.chars().collect();
+            let at = |k: usize| cs.get(k).copied();
+            let mut out = String::new();
+            let mut pending_space = false;
+            let mut i = 0;
+            while i < cs.len() {
+                let c = cs[i];
+                if block_depth > 0 {
+                    if c == '*' && at(i + 1) == Some('/') {
+                        block_depth -= 1;
+                        i += 2;
+                    } else if c == '/' && at(i + 1) == Some('*') {
+                        block_depth += 1;
+                        i += 2;
+                    } else {
+                        i += 1;
                     }
-                    '"' => in_str = false,
-                    _ => {}
+                    continue;
                 }
-                continue;
-            }
-            match c {
-                '"' => {
-                    in_str = true;
+                match in_str {
+                    Some(None) => {
+                        if c == '\\' {
+                            i += 2;
+                            continue;
+                        }
+                        if c == '"' {
+                            in_str = None;
+                            out.push('"');
+                        }
+                        i += 1;
+                        continue;
+                    }
+                    Some(Some(hashes)) => {
+                        if c == '"' && (1..=hashes).all(|k| at(i + k) == Some('#')) {
+                            in_str = None;
+                            out.push('"');
+                            i += 1 + hashes;
+                        } else {
+                            i += 1;
+                        }
+                        continue;
+                    }
+                    None => {}
+                }
+                if c == '/' && at(i + 1) == Some('/') {
+                    break;
+                }
+                if c == '/' && at(i + 1) == Some('*') {
+                    block_depth += 1;
+                    i += 2;
+                    continue;
+                }
+                let prev_is_ident = i > 0 && is_ident_char(cs[i - 1]);
+                if !prev_is_ident && (c == 'r' || (c == 'b' && at(i + 1) == Some('r'))) {
+                    let mut j = if c == 'b' { i + 2 } else { i + 1 };
+                    let mut hashes = 0;
+                    while at(j) == Some('#') {
+                        hashes += 1;
+                        j += 1;
+                    }
+                    if at(j) == Some('"') {
+                        in_str = Some(Some(hashes));
+                        out.push('"');
+                        pending_space = false;
+                        i = j + 1;
+                        continue;
+                    }
+                }
+                if c == '"' {
+                    in_str = Some(None);
                     out.push('"');
+                    pending_space = false;
+                    i += 1;
+                    continue;
                 }
-                '/' if chars.peek() == Some(&'/') => break,
-                c if c.is_whitespace() => {}
-                c => out.push(c),
+                if c == '\'' {
+                    // A char literal (`'"'`, `'\''`) is skipped whole; a lifetime is kept.
+                    if at(i + 1) == Some('\\') {
+                        let close = (i + 3..cs.len()).find(|&k| cs[k] == '\'');
+                        out.push_str("''");
+                        i = close.map_or(cs.len(), |k| k + 1);
+                        continue;
+                    }
+                    if at(i + 2) == Some('\'') {
+                        out.push_str("''");
+                        i += 3;
+                        continue;
+                    }
+                }
+                if c.is_whitespace() {
+                    pending_space = true;
+                    i += 1;
+                    continue;
+                }
+                if pending_space
+                    && is_ident_char(c)
+                    && out.chars().last().is_some_and(is_ident_char)
+                {
+                    out.push(' ');
+                }
+                pending_space = false;
+                out.push(c);
+                i += 1;
             }
+            out_lines.push(out);
         }
-        out
+        out_lines
     }
 
     /// Whether `raw` opens a function item (`pub async fn name(..`).
@@ -690,41 +783,141 @@ mod tests {
         false
     }
 
-    /// #4015/#4016 class rule, as a pure function so its own mutants can be
-    /// tested: the 0-based indices of TEST-code lines that read or move the
-    /// process cwd (`env::current_dir` / `env::set_current_dir`) outside a
-    /// function that holds the ONE cwd lock or runs in a re-exec'd child. A
-    /// `use` of either is always a violation (the alias route). The process
-    /// cwd is shared by every test in the lib binary, so an unlocked read
-    /// races any writer (tmux-22's R2b retest: 17/20 red) and a fixture root
-    /// built from it can resolve under `/` or a deleted tempdir (#4015).
-    fn unguarded_cwd_access(lines: &[&str], is_test: &[bool]) -> Vec<usize> {
+    /// Whether a normalised line names a process-cwd primitive as an
+    /// IDENTIFIER, whatever its path prefix (`std::env::`, a module alias, a
+    /// glob import or none). A METHOD call (`.current_dir(` — the
+    /// `Command::current_dir` builder, which sets a CHILD's cwd), a struct
+    /// field (`current_dir:`) and a definition (`fn current_dir`) are not
+    /// process-cwd accesses.
+    fn names_a_cwd_primitive(line: &str) -> bool {
         // Built at run time so this file cannot match its own needles.
-        let read = ["env", "::", "current_dir"].concat();
-        let write = ["env", "::", "set_current_dir"].concat();
-        let guards = [
-            ["cwd", "_lock("].concat(),
-            ["run_env_isolated_child", "_or_spawn("].concat(),
+        let idents = [
+            ["current", "_dir"].concat(),
+            ["set_current", "_dir"].concat(),
+            ["ch", "dir"].concat(),
+            ["getc", "wd"].concat(),
         ];
+        idents.iter().any(|ident| {
+            line.match_indices(ident.as_str()).any(|(pos, _)| {
+                let before = line[..pos].chars().last();
+                let after = &line[pos + ident.len()..];
+                !before.is_some_and(|b| is_ident_char(b) || b == '.')
+                    && !after.chars().next().is_some_and(is_ident_char)
+                    && !(after.starts_with(':') && !after.starts_with("::"))
+                    && !line[..pos].ends_with("fn ")
+            })
+        })
+    }
+
+    /// Whether a normalised line is a `use` that can bring a cwd primitive
+    /// into scope under another name: a glob or alias of the `env` module,
+    /// or any `use` naming a cwd primitive.
+    fn is_cwd_reaching_use(line: &str) -> bool {
+        let rest = line.strip_prefix("pub ").unwrap_or(line);
+        let rest = if rest.starts_with("pub(") {
+            rest.find(')').map_or(rest, |k| &rest[k + 1..])
+        } else {
+            rest
+        };
+        let rest = rest.trim_start();
+        rest.starts_with("use ")
+            && (names_a_cwd_primitive(rest)
+                || rest.contains("env::*")
+                || rest.contains("env as ")
+                || rest.contains("env::{") && (rest.contains("self") || rest.contains('*')))
+    }
+
+    /// The name bound by `let <name>[: T] = …cwd_lock(…)`, if this normalised
+    /// line holds the ONE cwd lock in a named binding. `let _ = cwd_lock()`
+    /// drops the guard at once and binds nothing, so it is not a hold.
+    fn cwd_lock_binding(line: &str) -> Option<(usize, String)> {
+        let lock = ["cwd", "_lock("].concat();
+        let pos = line.find("let ")?;
+        let after_let = &line[pos + 4..];
+        let after_let = after_let.strip_prefix("mut ").unwrap_or(after_let);
+        let name: String = after_let
+            .chars()
+            .take_while(|c| is_ident_char(*c))
+            .collect();
+        let tail = &after_let[name.len()..];
+        let value = tail.find('=').map(|k| &tail[k + 1..])?;
+        let bound =
+            !name.is_empty() && name != "_" && (tail.starts_with('=') || tail.starts_with(':'));
+        let lock_at = value.find(lock.as_str())?;
+        let lock_called = !value[..lock_at].chars().last().is_some_and(is_ident_char);
+        (bound && lock_called).then_some((pos, name))
+    }
+
+    /// Apply `text`'s braces to the scope `depth`; a held lock whose block
+    /// closes is released.
+    fn track_braces(text: &str, depth: &mut i64, held: &mut Vec<(String, i64)>) {
+        for ch in text.chars() {
+            match ch {
+                '{' => *depth += 1,
+                '}' => {
+                    *depth -= 1;
+                    let d = *depth;
+                    held.retain(|(_, at)| *at <= d);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// #4015/#4016 class rule, as a pure function so its own mutants can be
+    /// tested: the 0-based indices of TEST-code lines that reach the process
+    /// cwd (`current_dir` / `set_current_dir` / `chdir` / `getcwd`, named as
+    /// an identifier under any path, alias or glob) while the enclosing fn
+    /// neither HOLDS the ONE cwd lock (a named `let` binding still in scope
+    /// and not `drop`ped at the access) nor returns early from
+    /// `if …run_env_isolated_child_or_spawn(…)`. A `use` that could bring a
+    /// primitive into scope under another name is always a violation. The
+    /// process cwd is shared by every test in the lib binary, so an unlocked
+    /// read races any writer (tmux-22's R2b retest: 17/20 red) and a fixture
+    /// root built from it can resolve under `/` or a deleted tempdir (#4015).
+    ///
+    /// Out of scope, by construction: IMPLICIT cwd resolution (opening a
+    /// RELATIVE path such as `Path::new(".")`) is not a named access and
+    /// cannot be told from an ordinary relative path by source text; and a
+    /// lock held by a CALLER cannot be seen from the callee, so a helper that
+    /// reaches the cwd must take the lock (or the isolation) itself.
+    fn unguarded_cwd_access(lines: &[&str], is_test: &[bool]) -> Vec<usize> {
+        let norm = cwd_scan_normalise(lines);
+        let isolate = ["run_env_isolated_child", "_or_spawn("].concat();
         let mut out = Vec::new();
-        for (i, raw) in lines.iter().enumerate() {
+        for (i, line) in norm.iter().enumerate() {
             if !is_test.get(i).copied().unwrap_or(false) {
                 continue;
             }
-            let line = cwd_scan_normalise(raw);
-            if !(line.contains(&read) || line.contains(&write)) {
+            if is_cwd_reaching_use(line) {
+                out.push(i);
                 continue;
             }
-            let guarded = !line.starts_with("use")
-                && (0..=i)
-                    .rev()
-                    .find(|&j| is_fn_header(lines[j]))
-                    .is_some_and(|start| {
-                        lines[start..i].iter().any(|l| {
-                            let l = cwd_scan_normalise(l);
-                            guards.iter().any(|g| l.contains(g.as_str()))
-                        })
-                    });
+            if !names_a_cwd_primitive(line) {
+                continue;
+            }
+            let start = (0..=i)
+                .rev()
+                .find(|&j| !norm[j].is_empty() && is_fn_header(lines[j]));
+            let guarded = start.is_some_and(|start| {
+                let mut depth: i64 = 0;
+                let mut held: Vec<(String, i64)> = Vec::new();
+                let mut isolated = false;
+                for l in &norm[start..i] {
+                    if l.starts_with("if ") && l.contains(isolate.as_str()) {
+                        isolated = true;
+                    }
+                    held.retain(|(name, _)| !l.contains(&format!("drop({name})")));
+                    if let Some((pos, name)) = cwd_lock_binding(l) {
+                        track_braces(&l[..pos], &mut depth, &mut held);
+                        held.push((name, depth));
+                        track_braces(&l[pos..], &mut depth, &mut held);
+                    } else {
+                        track_braces(l, &mut depth, &mut held);
+                    }
+                }
+                isolated || !held.is_empty()
+            });
             if !guarded {
                 out.push(i);
             }
@@ -806,64 +999,165 @@ mod tests {
         );
     }
 
-    /// The class rule catches every shape tmux-22's R2b retest used to slip
-    /// past the first guard, and nothing else.
+    /// The class rule catches every evasion the R2b retest (tmux-22) and the
+    /// 6ce9eccdf review (f2r) used to slip past earlier guards, and nothing else.
     #[test]
     fn cwd_access_rule_catches_the_r2b_mutants_4015_4016() {
         let flagged = |src: &str| {
             let lines: Vec<&str> = src.lines().collect();
             unguarded_cwd_access(&lines, &vec![true; lines.len()])
         };
-        let read = ["std::env::", "current_dir"].concat();
-        // Mutants that MUST be flagged.
-        let direct = format!("fn root() -> P {{\n    {read}().unwrap().join(\".local-runs\")\n}}");
-        assert_eq!(flagged(&direct), vec![1], "direct");
-        let spaced = "fn root() -> P {\n    std :: env :: current_dir ( ).unwrap()\n}";
-        assert_eq!(flagged(spaced), vec![1], "spaced");
-        let split = format!(
-            "fn root() -> P {{\n    let cwd = {read}().unwrap();\n    // a\n    // b\n    // c\n    cwd.join(\".local-runs\")\n}}"
-        );
-        assert_eq!(flagged(&split), vec![1], "split across comment lines");
-        let alias = [
-            "use std::env::",
-            "current_dir as cwd;\nfn root() -> P {\n    cwd().unwrap()\n}",
-        ]
-        .concat();
-        assert_eq!(flagged(&alias), vec![0], "alias import");
-        let writer = [
-            "fn t() {\n    std::env::",
-            "set_current_dir(p).unwrap();\n}",
-        ]
-        .concat();
-        assert_eq!(flagged(&writer), vec![1], "unlocked writer");
-        let helper = format!(
-            "fn t() {{\n    let _l = cwd_lock();\n}}\nfn helper() -> P {{\n    {read}().unwrap()\n}}"
-        );
-        assert_eq!(
-            flagged(&helper),
-            vec![4],
-            "a lock in another fn does not cover a helper"
-        );
-        // Shapes that must stay CLEAN.
-        let locked = format!(
-            "fn t() {{\n    let _l = crate::test_support::cwd_lock();\n    let c = {read}().ok();\n}}"
-        );
-        assert!(flagged(&locked).is_empty(), "locked read");
-        let child = format!(
-            "fn t() {{\n    if run_env_isolated_child_or_spawn(\"x\") {{ return; }}\n    {read}().ok();\n}}"
-        );
-        assert!(flagged(&child).is_empty(), "child-isolated");
+        let must_flag: &[(&str, &str, Vec<usize>)] = &[
+            (
+                "direct",
+                "fn r() -> P {\n    std::env::current_dir().unwrap()\n}",
+                vec![1],
+            ),
+            (
+                "spaced",
+                "fn r() -> P {\n    std :: env :: current_dir ( ).unwrap()\n}",
+                vec![1],
+            ),
+            (
+                "split over comments",
+                "fn r() -> P {\n    let c = std::env::current_dir().unwrap();\n    // a\n    // b\n    c.join(\"x\")\n}",
+                vec![1],
+            ),
+            (
+                "alias import",
+                "use std::env::current_dir as cwd;\nfn r() {\n    cwd().ok();\n}",
+                vec![0],
+            ),
+            (
+                "unlocked writer",
+                "fn t() {\n    std::env::set_current_dir(p).unwrap();\n}",
+                vec![1],
+            ),
+            (
+                "lock in another fn",
+                "fn t() {\n    let _l = cwd_lock();\n}\nfn helper() -> P {\n    std::env::current_dir().unwrap()\n}",
+                vec![4],
+            ),
+            // f2r @ 6ce9eccdf, row 1: glob import, then a bare call.
+            (
+                "glob import",
+                "use std::env::*;\nfn t() {\n    current_dir().ok();\n}",
+                vec![0, 2],
+            ),
+            // Row 2: module alias.
+            (
+                "module alias",
+                "use std::env as e;\nfn t() {\n    e::current_dir().ok();\n}",
+                vec![0, 2],
+            ),
+            (
+                "braced self alias",
+                "use std::env::{self as e};\nfn t() {}",
+                vec![0],
+            ),
+            // Row 3: a block comment is not a guard, on one line or across several.
+            (
+                "block-comment guard",
+                "fn t() {\n    /* cwd_lock() */\n    std::env::current_dir().ok();\n}",
+                vec![2],
+            ),
+            (
+                "multi-line block-comment guard",
+                "fn t() {\n    /*\n    let _l = cwd_lock();\n    */\n    std::env::current_dir().ok();\n}",
+                vec![4],
+            ),
+            // Row 4: a lock released before the access is not held.
+            (
+                "dropped temporary",
+                "fn t() {\n    drop(cwd_lock());\n    std::env::current_dir().ok();\n}",
+                vec![2],
+            ),
+            (
+                "let underscore",
+                "fn t() {\n    let _ = cwd_lock();\n    std::env::current_dir().ok();\n}",
+                vec![2],
+            ),
+            (
+                "dropped binding",
+                "fn t() {\n    let g = cwd_lock();\n    drop(g);\n    std::env::current_dir().ok();\n}",
+                vec![3],
+            ),
+            (
+                "lock in a closed block",
+                "fn t() {\n    {\n        let _l = cwd_lock();\n    }\n    std::env::current_dir().ok();\n}",
+                vec![4],
+            ),
+            // The lexer cannot be desynchronised by a quote in a literal.
+            (
+                "after a char quote",
+                "fn t() {\n    let q = '\"';\n    std::env::current_dir().ok();\n}",
+                vec![2],
+            ),
+            (
+                "after a raw string",
+                "fn t() {\n    let s = r#\"a\"b\"#;\n    std::env::current_dir().ok();\n}",
+                vec![2],
+            ),
+            (
+                "libc chdir",
+                "fn t() {\n    unsafe { libc::chdir(p) };\n}",
+                vec![1],
+            ),
+            (
+                "fn pointer",
+                "fn t() {\n    let f = std::env::current_dir;\n}",
+                vec![1],
+            ),
+        ];
+        for (name, src, want) in must_flag {
+            assert_eq!(&flagged(src), want, "must flag: {name}");
+        }
+        let must_pass: &[(&str, &str)] = &[
+            (
+                "locked",
+                "fn t() {\n    let _l = crate::test_support::cwd_lock();\n    std::env::current_dir().ok();\n}",
+            ),
+            (
+                "locked, typed",
+                "fn t() {\n    let _l: G = cwd_lock();\n    std::env::current_dir().ok();\n}",
+            ),
+            (
+                "child-isolated",
+                "fn t() {\n    if run_env_isolated_child_or_spawn(\"x\") {\n        return;\n    }\n    std::env::current_dir().ok();\n}",
+            ),
+            (
+                "lock in the enclosing block",
+                "fn t() {\n    let _l = cwd_lock();\n    {\n        std::env::current_dir().ok();\n    }\n}",
+            ),
+            (
+                "Command builder",
+                "fn t() {\n    cmd.current_dir(dir);\n    cmd\n        .current_dir(dir);\n}",
+            ),
+            ("struct field", "fn t() {\n    S { current_dir: p };\n}"),
+            (
+                "comment mention",
+                "fn t() {\n    // std::env::current_dir() is not called\n}",
+            ),
+            (
+                "string mention",
+                "fn t() {\n    let s = \"std::env::current_dir()\";\n}",
+            ),
+            (
+                "raw string mention",
+                "fn t() {\n    let s = r#\"std::env::current_dir() \"q\" \"#;\n}",
+            ),
+            ("plain env import", "use std::env;\nfn t() {}"),
+        ];
+        for (name, src) in must_pass {
+            assert!(
+                flagged(src).is_empty(),
+                "must pass: {name}: {:?}",
+                flagged(src)
+            );
+        }
+        let prod = ["std::env::current_dir()"];
         assert!(
-            flagged("fn t() {\n    cmd.current_dir(dir);\n}").is_empty(),
-            "Command::current_dir sets a CHILD's cwd"
-        );
-        let comment = format!("fn t() {{\n    // {read}() is not called here\n}}");
-        assert!(flagged(&comment).is_empty(), "prose in a comment");
-        let string = format!("fn t() {{\n    let s = \"{read}()\";\n}}");
-        assert!(flagged(&string).is_empty(), "text in a string literal");
-        let lines = [read.as_str()];
-        assert!(
-            unguarded_cwd_access(&lines, &[false]).is_empty(),
+            unguarded_cwd_access(&prod, &[false]).is_empty(),
             "production code is out of scope"
         );
     }
