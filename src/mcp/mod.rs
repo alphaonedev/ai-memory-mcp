@@ -1202,7 +1202,8 @@ pub fn skill_compositional_context_for_tests(
     conn: &rusqlite::Connection,
     params: &serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    handle_skill_compositional_context(conn, params)
+    // Local-operator posture (`None` read caller), as before #4059.
+    handle_skill_compositional_context(conn, params, None)
 }
 // handle_skill_export, handle_skill_promote_from_reflection,
 // handle_skill_register, handle_skill_get, handle_skill_list, and
@@ -2999,7 +3000,10 @@ fn dispatch_memory_skill_promote_from_reflection(
 }
 
 fn dispatch_memory_skill_compositional_context(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
-    handle_skill_compositional_context(ctx.conn, ctx.arguments)
+    // v1.0.0 #4059 — the composed reflections are memory rows: every one must
+    // be readable by the dispatch-resolved caller.
+    let caller = ctx.authority.read_caller();
+    handle_skill_compositional_context(ctx.conn, ctx.arguments, caller)
 }
 
 fn dispatch_memory_skill_retire(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
