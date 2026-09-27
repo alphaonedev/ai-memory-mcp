@@ -1979,8 +1979,8 @@ impl OllamaClient {
     /// Returns the response text.
     ///
     /// v0.7.0 F6 — the call is guarded by a circuit breaker. After
-    /// [`CIRCUIT_BREAKER_THRESHOLD`] consecutive failures the call
-    /// fast-fails for [`CIRCUIT_BREAKER_COOLDOWN`] instead of waiting
+    /// [`CIRCUIT_BREAKER_THRESHOLD`] consecutive provider failures (transport,
+    /// HTTP 5xx, or unusable response envelopes) the call fast-fails for [`CIRCUIT_BREAKER_COOLDOWN`] instead of waiting
     /// the full HTTP timeout each time. This is the key defence
     /// against the Round-2 F6 deadlock where a dead ollama caused
     /// every chat-backed MCP tool to hang the daemon for 30s+.
@@ -2092,6 +2092,7 @@ impl OllamaClient {
             LlmProvider::Ollama => body["message"]["content"]
                 .as_str()
                 .ok_or_else(|| {
+                    self.note_failure();
                     self.provider
                         .invalid_response("Missing 'message.content' field in chat output")
                 })?
@@ -2099,6 +2100,7 @@ impl OllamaClient {
             LlmProvider::OpenAiCompatible { .. } => body["choices"][0]["message"]["content"]
                 .as_str()
                 .ok_or_else(|| {
+                    self.note_failure();
                     self.provider.invalid_response(
                         "Missing 'choices[0].message.content' field in OpenAI-compatible \
                          chat response",
@@ -2258,6 +2260,7 @@ impl OllamaClient {
             LlmProvider::Ollama => message["content"]
                 .as_str()
                 .ok_or_else(|| {
+                    self.note_failure();
                     self.provider
                         .invalid_response("Missing 'message.content' field in chat output")
                 })?
@@ -2265,6 +2268,7 @@ impl OllamaClient {
             LlmProvider::OpenAiCompatible { .. } => message["content"]
                 .as_str()
                 .ok_or_else(|| {
+                    self.note_failure();
                     self.provider.invalid_response(
                         "Missing 'choices[0].message.content' field in OpenAI-compatible \
                          chat response",
@@ -2328,6 +2332,7 @@ impl OllamaClient {
         let prompt = SUMMARIZE_PROMPT.replace("{memories}", &formatted);
         let response = self.generate_async(&prompt, None).await?;
 
+        crate::validate::validate_content(&response)?;
         Ok(response.trim().to_string())
     }
 
@@ -2507,6 +2512,7 @@ impl OllamaClient {
             LlmProvider::Ollama => body["message"]["content"]
                 .as_str()
                 .ok_or_else(|| {
+                    self.note_failure();
                     self.provider
                         .invalid_response("Missing 'message.content' in chat response")
                 })?
@@ -2514,6 +2520,7 @@ impl OllamaClient {
             LlmProvider::OpenAiCompatible { .. } => body["choices"][0]["message"]["content"]
                 .as_str()
                 .ok_or_else(|| {
+                    self.note_failure();
                     self.provider.invalid_response(
                         "Missing 'choices[0].message.content' in OpenAI-compatible \
                          chat response",
@@ -2648,6 +2655,7 @@ impl OllamaClient {
         let response_text = parsed["response"]
             .as_str()
             .ok_or_else(|| {
+                self.note_failure();
                 self.provider
                     .invalid_response("Missing 'response' field in generate output")
             })?
@@ -2834,11 +2842,13 @@ impl OllamaClient {
                 .and_then(|arr| arr.first())
                 .and_then(|v| v.as_array())
                 .ok_or_else(|| {
+                    self.note_failure();
                     self.provider
                         .invalid_response("Missing 'embeddings[0]' in Ollama embed response")
                 })?,
             LlmProvider::OpenAiCompatible { .. } => {
                 body["data"][0]["embedding"].as_array().ok_or_else(|| {
+                    self.note_failure();
                     self.provider.invalid_response(
                         "Missing 'data[0].embedding' in OpenAI-compatible embed response",
                     )
@@ -2853,6 +2863,7 @@ impl OllamaClient {
             .collect();
 
         if floats.is_empty() {
+            self.note_failure();
             return Err(anyhow!("Empty embedding returned from LLM"));
         }
 
@@ -3031,8 +3042,10 @@ impl OllamaClient {
             }
         };
 
-        let parsed = parse_openai_embeddings_batch(&body, chunk.len())
-            .map_err(|_| self.provider.failure(ProviderFailure::InvalidResponse))?;
+        let parsed = parse_openai_embeddings_batch(&body, chunk.len()).map_err(|_| {
+            self.note_failure();
+            self.provider.failure(ProviderFailure::InvalidResponse)
+        })?;
         self.note_success();
         Ok(parsed)
     }
@@ -7130,17 +7143,29 @@ mod classify_kind_parse_tests {
 #[cfg(test)]
 mod issue_4047_regressions {
     use super::*;
-    use wiremock::{Mock, MockServer, ResponseTemplate};
     use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     async fn call(client: &OllamaClient, variant: u8) -> Result<()> {
         match variant {
             0 => client.generate_async("test", None).await.map(|_| ()),
-            1 => client.generate_with_tools_async("test", None, &[ToolDef::new("test", "test", json!({}))]).await.map(|_| ()),
-            2 => client.generate_with_model_override_async("test", None, Some("other")).await.map(|_| ()),
-            3 => client.generate_with_body_async(&json!({})).await.map(|_| ()),
+            1 => client
+                .generate_with_tools_async("test", None, &[ToolDef::new("test", "test", json!({}))])
+                .await
+                .map(|_| ()),
+            2 => client
+                .generate_with_model_override_async("test", None, Some("other"))
+                .await
+                .map(|_| ()),
+            3 => client
+                .generate_with_body_async(&json!({}))
+                .await
+                .map(|_| ()),
             4 => client.embed_text_async("test", "test").await.map(|_| ()),
-            _ => client.embed_texts_async(&["test"], "test").await.map(|_| ()),
+            _ => client
+                .embed_texts_async(&["test"], "test")
+                .await
+                .map(|_| ()),
         }
     }
 
@@ -7156,7 +7181,8 @@ mod issue_4047_regressions {
         server.reset().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(status).set_body_json(body))
-            .mount(server).await;
+            .mount(server)
+            .await;
     }
 
     #[tokio::test]
@@ -7164,8 +7190,13 @@ mod issue_4047_regressions {
         let mut failures = Vec::new();
         for openai in [false, true] {
             for variant in 0..6 {
-                if variant == 3 && openai { continue; }
-                for body in [json!({}), json!({"message": {"content": 42}, "choices": [{"message": {"content": 42}}], "response": 42, "embeddings": 42, "data": 42})] {
+                if variant == 3 && openai {
+                    continue;
+                }
+                for body in [
+                    json!({}),
+                    json!({"message": {"content": 42}, "choices": [{"message": {"content": 42}}], "response": 42, "embeddings": 42, "data": 42}),
+                ] {
                     let server = MockServer::start().await;
                     respond(&server, 200, body).await;
                     let client = client(&server, openai);
@@ -7176,7 +7207,11 @@ mod issue_4047_regressions {
                         }
                     }
                     let count = server.received_requests().await.unwrap().len();
-                    if count != 3 { failures.push(format!("openai={openai}, variant={variant}: requests={count}")); }
+                    if count != 3 {
+                        failures.push(format!(
+                            "openai={openai}, variant={variant}: requests={count}"
+                        ));
+                    }
                 }
             }
         }
@@ -7189,18 +7224,39 @@ mod issue_4047_regressions {
             let server = MockServer::start().await;
             let client = client(&server, openai);
             respond(&server, 200, json!({})).await;
-            for _ in 0..2 { assert!(client.generate_async("test", None).await.is_err()); }
+            for _ in 0..2 {
+                assert!(client.generate_async("test", None).await.is_err());
+            }
             let message = json!({"content": "valid response"});
-            let body = if openai { json!({"choices": [{"message": message}]}) } else { json!({"message": message}) };
+            let body = if openai {
+                json!({"choices": [{"message": message}]})
+            } else {
+                json!({"message": message})
+            };
             respond(&server, 200, body).await;
-            assert_eq!(client.generate_async("test", None).await.unwrap(), "valid response");
+            assert_eq!(
+                client.generate_async("test", None).await.unwrap(),
+                "valid response"
+            );
             respond(&server, 500, json!({})).await;
-            for _ in 0..3 { assert!(client.generate_async("test", None).await.is_err()); }
-            assert!(client.generate_async("test", None).await.unwrap_err().to_string().contains("circuit breaker open"));
+            for _ in 0..3 {
+                assert!(client.generate_async("test", None).await.is_err());
+            }
+            assert!(
+                client
+                    .generate_async("test", None)
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("circuit breaker open")
+            );
             assert_eq!(server.received_requests().await.unwrap().len(), 3);
-            let client = super::OllamaClient::new_with_url_no_health_check(&server.uri(), "test").unwrap();
+            let client =
+                super::OllamaClient::new_with_url_no_health_check(&server.uri(), "test").unwrap();
             respond(&server, 400, json!({})).await;
-            for _ in 0..4 { assert!(client.generate_async("test", None).await.is_err()); }
+            for _ in 0..4 {
+                assert!(client.generate_async("test", None).await.is_err());
+            }
             assert_eq!(server.received_requests().await.unwrap().len(), 4);
         }
     }
@@ -7210,11 +7266,26 @@ mod issue_4047_regressions {
         for openai in [false, true] {
             let server = MockServer::start().await;
             let client = client(&server, openai);
-            let message = json!({"tool_calls": [{"function": {"name": "test", "arguments": "{}"}}]});
-            let body = if openai { json!({"choices": [{"message": message}]}) } else { json!({"message": message}) };
+            let message =
+                json!({"tool_calls": [{"function": {"name": "test", "arguments": "{}"}}]});
+            let body = if openai {
+                json!({"choices": [{"message": message}]})
+            } else {
+                json!({"message": message})
+            };
             respond(&server, 200, body).await;
             for _ in 0..4 {
-                assert!(matches!(client.generate_with_tools_async("test", None, &[ToolDef::new("test", "test", json!({}))]).await.unwrap(), ChatOutcome::ToolCalls(_)));
+                assert!(matches!(
+                    client
+                        .generate_with_tools_async(
+                            "test",
+                            None,
+                            &[ToolDef::new("test", "test", json!({}))]
+                        )
+                        .await
+                        .unwrap(),
+                    ChatOutcome::ToolCalls(_)
+                ));
             }
             assert_eq!(server.received_requests().await.unwrap().len(), 4);
         }
@@ -7224,24 +7295,34 @@ mod issue_4047_regressions {
 #[cfg(test)]
 mod issue_4046_http_regressions {
     use super::*;
-    use wiremock::{Mock, MockServer, ResponseTemplate};
     use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[tokio::test]
     async fn issue_4046_whitespace_summary_is_refused() {
         for openai in [false, true] {
             let server = MockServer::start().await;
             let message = json!({"content": " \n\t"});
-            let body = if openai { json!({"choices": [{"message": message}]}) } else { json!({"message": message}) };
+            let body = if openai {
+                json!({"choices": [{"message": message}]})
+            } else {
+                json!({"message": message})
+            };
             Mock::given(method("POST"))
                 .respond_with(ResponseTemplate::new(200).set_body_json(body))
-                .mount(&server).await;
+                .mount(&server)
+                .await;
             let client = if openai {
                 OllamaClient::new_openai_compatible(&server.uri(), "test", "test-key").unwrap()
             } else {
                 OllamaClient::new_with_url_no_health_check(&server.uri(), "test").unwrap()
             };
-            assert!(client.summarize_memories_async(&[("title".into(), "body".into())]).await.is_err());
+            assert!(
+                client
+                    .summarize_memories_async(&[("title".into(), "body".into())])
+                    .await
+                    .is_err()
+            );
         }
     }
 }

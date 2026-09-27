@@ -352,6 +352,7 @@ impl<'a> ConsolidationPass<'a> {
             .map(|m| (m.title.clone(), m.content.clone()))
             .collect();
         let summary_text = self.llm.summarize_memories(&input)?;
+        crate::validate::validate_content(&summary_text)?;
 
         let base_title = cluster
             .iter()
@@ -424,13 +425,24 @@ impl<'a> ConsolidationPass<'a> {
     /// caller can hand it to [`Self::verify`] (the consolidate path mints
     /// its own id, distinct from `summary.id`). No-op returning an empty
     /// id when `self.dry_run = true` or `sources` is empty.
+    #[cfg(test)]
     async fn persist(&self, summary: &Memory, sources: &[MemoryId]) -> Result<String> {
+        self.persist_with_expected_versions(summary, sources, None)
+            .await
+    }
+
+    async fn persist_with_expected_versions(
+        &self,
+        summary: &Memory,
+        sources: &[MemoryId],
+        expected_versions: Option<&[i64]>,
+    ) -> Result<String> {
         if self.dry_run || sources.is_empty() {
             return Ok(String::new());
         }
         let new_id = self
             .store
-            .consolidate(
+            .consolidate_with_expected_versions(
                 &self.ctx,
                 sources,
                 &summary.title,
@@ -439,6 +451,7 @@ impl<'a> ConsolidationPass<'a> {
                 &summary.tier,
                 &summary.source,
                 CONSOLIDATOR_AGENT_ID,
+                expected_versions,
             )
             .await
             .map_err(|e| anyhow::anyhow!(e))?;
@@ -628,7 +641,11 @@ impl<'a> ConsolidationPass<'a> {
                     continue;
                 }
             };
-            let new_id = match self.persist(&summary, &cluster_ids).await {
+            let versions: Vec<i64> = members.iter().map(|memory| memory.version).collect();
+            let new_id = match self
+                .persist_with_expected_versions(&summary, &cluster_ids, Some(&versions))
+                .await
+            {
                 Ok(id) => id,
                 Err(e) => {
                     // The merge failed atomically: nothing was deleted, the
@@ -1490,15 +1507,28 @@ mod tests {
         }
 
         impl AutonomyLlm for SummaryEdit<'_> {
-            fn auto_tag(&self, _: &str, _: &str) -> Result<Vec<String>> { Ok(vec![]) }
-            fn detect_contradiction(&self, _: &str, _: &str) -> Result<bool> { Ok(false) }
+            fn auto_tag(&self, _: &str, _: &str) -> Result<Vec<String>> {
+                Ok(vec![])
+            }
+            fn detect_contradiction(&self, _: &str, _: &str) -> Result<bool> {
+                Ok(false)
+            }
             fn summarize_memories(&self, _: &[(String, String)]) -> Result<String> {
-                crate::llm::block_on_local_bounded(std::time::Duration::from_secs(15), || async {
-                    self.store.update(&CallerContext::for_admin(CONSOLIDATOR_AGENT_ID), &self.id, crate::store::UpdatePatch {
-                        content: Some("distinctive committed v2".to_string()),
-                        ..Default::default()
-                    }).await
-                })??;
+                crate::llm::block_on_local_bounded(
+                    std::time::Duration::from_secs(15),
+                    || async {
+                        self.store
+                            .update(
+                                &CallerContext::for_admin(CONSOLIDATOR_AGENT_ID),
+                                &self.id,
+                                crate::store::UpdatePatch {
+                                    content: Some("distinctive committed v2".to_string()),
+                                    ..Default::default()
+                                },
+                            )
+                            .await
+                    },
+                )??;
                 Ok("summary of v1 only".to_string())
             }
         }
@@ -1508,23 +1538,51 @@ mod tests {
             let namespace = uuid::Uuid::new_v4().to_string();
             let mut candidates = Vec::new();
             for title in ["first", "second"] {
-                let memory = make_memory_full(&uuid::Uuid::new_v4().to_string(), &namespace, title,
-                    "kubernetes rolling canary deploy strategy notes", Tier::Mid, 5);
+                let memory = make_memory_full(
+                    &uuid::Uuid::new_v4().to_string(),
+                    &namespace,
+                    title,
+                    "kubernetes rolling canary deploy strategy notes",
+                    Tier::Mid,
+                    5,
+                );
                 let vector = vec![1.0; 384];
-                store.store_with_embedding(&ctx, &memory, Some(&vector), Some(&crate::embeddings::embedding_space_fingerprint("test-space"))).await.unwrap();
+                store.store(&ctx, &memory).await.unwrap();
+                store
+                    .update_embedding(
+                        &ctx,
+                        &memory.id,
+                        Some(&vector),
+                        &crate::embeddings::embedding_space_fingerprint("test-space"),
+                    )
+                    .await
+                    .unwrap();
                 candidates.push(store.get(&ctx, &memory.id).await.unwrap());
             }
-            let editor = SummaryEdit { store, id: candidates[0].id.clone() };
+            let editor = SummaryEdit {
+                store,
+                id: candidates[0].id.clone(),
+            };
             let stub = StubLlm::new(summary);
             let llm: &dyn AutonomyLlm = if edit { &editor } else { &stub };
-            let report = ConsolidationPass::new(store, llm, false).run(&candidates).await.unwrap();
+            let report = ConsolidationPass::new(store, llm, false)
+                .run(&candidates)
+                .await
+                .unwrap();
             assert_eq!(report.eligible_clusters, 1);
             if edit || summary.trim().is_empty() {
-                assert_eq!(report.memories_consolidated, 0, "invalid or stale summary must be refused");
+                assert_eq!(
+                    report.memories_consolidated, 0,
+                    "invalid or stale summary must be refused"
+                );
                 assert!(!report.errors.is_empty());
                 for (index, source) in candidates.iter().enumerate() {
                     let row = store.get(&ctx, &source.id).await.unwrap();
-                    let expected = if edit && index == 0 { "distinctive committed v2" } else { &source.content };
+                    let expected = if edit && index == 0 {
+                        "distinctive committed v2"
+                    } else {
+                        &source.content
+                    };
                     assert_eq!(row.content, expected);
                     assert_eq!(row.lifecycle_state, source.lifecycle_state);
                 }
@@ -1540,7 +1598,12 @@ mod tests {
             for tombstone in [false, true] {
                 flags.set_lineage_dag(tombstone);
                 flags.set_consolidate_tombstone_sources(tombstone);
-                for (edit, summary) in [(true, "summary"), (false, ""), (false, " \n\t"), (false, "valid summary")] {
+                for (edit, summary) in [
+                    (true, "summary"),
+                    (false, ""),
+                    (false, " \n\t"),
+                    (false, "valid summary"),
+                ] {
                     let (store, _dir) = open_db();
                     issue_4045_4046_matrix(&store, edit, summary).await;
                 }
@@ -1550,13 +1613,22 @@ mod tests {
         #[cfg(feature = "sal-postgres")]
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn issue_4045_4046_postgres_disposition_matrix() {
-            let Ok(url) = std::env::var("AI_MEMORY_TEST_POSTGRES_URL") else { return; };
-            let store = crate::store::postgres::PostgresStore::connect(&url).await.unwrap();
+            let Ok(url) = std::env::var("AI_MEMORY_TEST_POSTGRES_URL") else {
+                return;
+            };
+            let store = crate::store::postgres::PostgresStore::connect(&url)
+                .await
+                .unwrap();
             let flags = crate::test_support::LineageDagIsolation::new();
             for tombstone in [false, true] {
                 flags.set_lineage_dag(tombstone);
                 flags.set_consolidate_tombstone_sources(tombstone);
-                for (edit, summary) in [(true, "summary"), (false, ""), (false, " \n\t"), (false, "valid summary")] {
+                for (edit, summary) in [
+                    (true, "summary"),
+                    (false, ""),
+                    (false, " \n\t"),
+                    (false, "valid summary"),
+                ] {
                     issue_4045_4046_matrix(&store, edit, summary).await;
                 }
             }
@@ -1569,7 +1641,10 @@ mod tests {
                 let conn = conn_of(&store);
                 let candidates = seed_two_dupes(&conn);
                 let llm = StubLlm::new(summary);
-                let report = ConsolidationPass::new(&store, &llm, false).run(&candidates).await.unwrap();
+                let report = ConsolidationPass::new(&store, &llm, false)
+                    .run(&candidates)
+                    .await
+                    .unwrap();
                 assert_eq!(report.memories_consolidated, 0);
                 assert_eq!(report.rollback_entries_written, 0);
                 assert!(!report.errors.is_empty());
@@ -1578,7 +1653,9 @@ mod tests {
                     assert_eq!(actual.content, source.content);
                     assert_eq!(actual.lifecycle_state, source.lifecycle_state);
                 }
-                let count: i64 = conn.query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0)).unwrap();
+                let count: i64 = conn
+                    .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))
+                    .unwrap();
                 assert_eq!(count, 2);
             }
         }
@@ -2372,6 +2449,32 @@ mod tests {
                         tier,
                         source,
                         consolidator_agent_id,
+                    )
+                    .await
+            }
+            async fn consolidate_with_expected_versions(
+                &self,
+                ctx: &CallerContext,
+                ids: &[String],
+                title: &str,
+                summary: &str,
+                namespace: &str,
+                tier: &Tier,
+                source: &str,
+                consolidator_agent_id: &str,
+                expected_versions: Option<&[i64]>,
+            ) -> crate::store::StoreResult<String> {
+                self.inner
+                    .consolidate_with_expected_versions(
+                        ctx,
+                        ids,
+                        title,
+                        summary,
+                        namespace,
+                        tier,
+                        source,
+                        consolidator_agent_id,
+                        expected_versions,
                     )
                     .await
             }

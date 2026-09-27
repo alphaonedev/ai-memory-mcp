@@ -2262,9 +2262,35 @@ impl MemoryStore for SqliteStore {
         source: &str,
         consolidator_agent_id: &str,
     ) -> StoreResult<String> {
+        self.consolidate_with_expected_versions(
+            ctx,
+            ids,
+            title,
+            summary,
+            namespace,
+            tier,
+            source,
+            consolidator_agent_id,
+            None,
+        )
+        .await
+    }
+
+    async fn consolidate_with_expected_versions(
+        &self,
+        ctx: &CallerContext,
+        ids: &[String],
+        title: &str,
+        summary: &str,
+        namespace: &str,
+        tier: &Tier,
+        source: &str,
+        consolidator_agent_id: &str,
+        expected_versions: Option<&[i64]>,
+    ) -> StoreResult<String> {
         self.gate_record_stop()?;
         let conn = self.state.lock().await;
-        db::consolidate(
+        db::consolidate_with_expected_versions(
             &conn,
             ids,
             title,
@@ -2274,6 +2300,7 @@ impl MemoryStore for SqliteStore {
             source,
             consolidator_agent_id,
             ctx.bypass_visibility,
+            expected_versions,
         )
         .map_err(box_err)
     }

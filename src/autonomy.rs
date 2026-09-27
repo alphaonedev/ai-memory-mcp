@@ -654,6 +654,7 @@ fn consolidate_cluster(
         .map(|m| (m.title.clone(), m.content.clone()))
         .collect();
     let summary = llm.summarize_memories(&input)?;
+    crate::validate::validate_content(&summary)?;
     // Prefix the consolidated title so it never collides with one of
     // the source memories' (title, namespace) UNIQUE key. Source
     // rows still exist at INSERT time — db::consolidate deletes them
@@ -696,7 +697,8 @@ fn consolidate_cluster(
     // exact copy of each hard-deleted source in this stack frame.
     let entry_id = persist_write_ahead(conn, cluster)
         .map_err(|e| anyhow::anyhow!("{ROLLBACK_WRITE_AHEAD_FAILED}: {e}"))?;
-    let result_id = match db::consolidate(
+    let expected_versions: Vec<i64> = cluster.iter().map(|memory| memory.version).collect();
+    let result_id = match db::consolidate_with_expected_versions(
         conn,
         &ids,
         &title,
@@ -706,6 +708,7 @@ fn consolidate_cluster(
         CURATOR_SOURCE_LABEL,
         crate::identity::sentinels::AI_CURATOR,
         true,
+        Some(&expected_versions),
     ) {
         Ok(id) => id,
         Err(e) => {
@@ -2080,9 +2083,17 @@ mod tests {
             db::insert(&conn, &b).unwrap();
             let result = consolidate_cluster(&conn, &StubLlm::new(summary), &[a, b], false);
             assert!(result.is_err(), "empty summary must be refused");
-            assert_eq!(db::get(&conn, "a").unwrap().unwrap().content, "original one");
-            assert_eq!(db::get(&conn, "b").unwrap().unwrap().content, "original two");
-            let count: i64 = conn.query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0)).unwrap();
+            assert_eq!(
+                db::get(&conn, "a").unwrap().unwrap().content,
+                "original one"
+            );
+            assert_eq!(
+                db::get(&conn, "b").unwrap().unwrap().content,
+                "original two"
+            );
+            let count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))
+                .unwrap();
             assert_eq!(count, 2, "no summary or rollback write for invalid content");
         }
     }
@@ -2092,10 +2103,26 @@ mod tests {
     }
 
     impl AutonomyLlm for ConcurrentEditLlm {
-        fn auto_tag(&self, _: &str, _: &str) -> Result<Vec<String>> { Ok(vec![]) }
-        fn detect_contradiction(&self, _: &str, _: &str) -> Result<bool> { Ok(false) }
+        fn auto_tag(&self, _: &str, _: &str) -> Result<Vec<String>> {
+            Ok(vec![])
+        }
+        fn detect_contradiction(&self, _: &str, _: &str) -> Result<bool> {
+            Ok(false)
+        }
         fn summarize_memories(&self, _: &[(String, String)]) -> Result<String> {
-            db::update(&self.conn, "a", None, Some("distinctive committed v2"), None, None, None, None, None, None, None)?;
+            db::update(
+                &self.conn,
+                "a",
+                None,
+                Some("distinctive committed v2"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )?;
             Ok("summary of v1 only".to_string())
         }
     }
@@ -2107,12 +2134,26 @@ mod tests {
         let b = sample_mem("b", "app", "second", "original two", Tier::Mid);
         db::insert(&conn, &a).unwrap();
         db::insert(&conn, &b).unwrap();
-        let llm = ConcurrentEditLlm { conn: db::open(tmp.path()).unwrap() };
+        let llm = ConcurrentEditLlm {
+            conn: db::open(tmp.path()).unwrap(),
+        };
         let result = consolidate_cluster(&conn, &llm, &[a, b], false);
         assert!(result.is_err(), "stale summary must be refused");
-        assert_eq!(db::get(&conn, "a").unwrap().unwrap().content, "distinctive committed v2");
-        assert_eq!(db::get(&conn, "b").unwrap().unwrap().content, "original two");
-        let count: i64 = conn.query_row("SELECT COUNT(*) FROM memories WHERE namespace = 'app'", [], |r| r.get(0)).unwrap();
+        assert_eq!(
+            db::get(&conn, "a").unwrap().unwrap().content,
+            "distinctive committed v2"
+        );
+        assert_eq!(
+            db::get(&conn, "b").unwrap().unwrap().content,
+            "original two"
+        );
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE namespace = 'app'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(count, 2, "no stale summary committed");
     }
 
@@ -2122,25 +2163,46 @@ mod tests {
         for tombstone in [false, true] {
             flags.set_lineage_dag(tombstone);
             flags.set_consolidate_tombstone_sources(tombstone);
-            for (edit, summary) in [(true, "summary"), (false, ""), (false, " \n\t"), (false, "valid summary")] {
+            for (edit, summary) in [
+                (true, "summary"),
+                (false, ""),
+                (false, " \n\t"),
+                (false, "valid summary"),
+            ] {
                 let (tmp, conn) = setup_conn();
                 let a = sample_mem("a", "app", "first", "original one", Tier::Mid);
                 let b = sample_mem("b", "app", "second", "original two", Tier::Mid);
                 db::insert(&conn, &a).unwrap();
                 db::insert(&conn, &b).unwrap();
-                let editor = ConcurrentEditLlm { conn: db::open(tmp.path()).unwrap() };
+                let editor = ConcurrentEditLlm {
+                    conn: db::open(tmp.path()).unwrap(),
+                };
                 let stub = StubLlm::new(summary);
                 let llm: &dyn AutonomyLlm = if edit { &editor } else { &stub };
                 let result = consolidate_cluster(&conn, llm, &[a, b], false);
                 if edit || summary.trim().is_empty() {
                     assert!(result.is_err(), "invalid or stale summary must be refused");
-                    assert_eq!(db::get(&conn, "a").unwrap().unwrap().content,
-                        if edit { "distinctive committed v2" } else { "original one" });
-                    assert_eq!(db::get(&conn, "b").unwrap().unwrap().content, "original two");
+                    assert_eq!(
+                        db::get(&conn, "a").unwrap().unwrap().content,
+                        if edit {
+                            "distinctive committed v2"
+                        } else {
+                            "original one"
+                        }
+                    );
+                    assert_eq!(
+                        db::get(&conn, "b").unwrap().unwrap().content,
+                        "original two"
+                    );
                 } else {
                     let entry = result.unwrap().unwrap().entry;
-                    let RollbackEntry::Consolidate { result_id, .. } = entry else { panic!("consolidate entry"); };
-                    assert_eq!(db::get(&conn, &result_id).unwrap().unwrap().content, summary);
+                    let RollbackEntry::Consolidate { result_id, .. } = entry else {
+                        panic!("consolidate entry");
+                    };
+                    assert_eq!(
+                        db::get(&conn, &result_id).unwrap().unwrap().content,
+                        summary
+                    );
                 }
             }
         }

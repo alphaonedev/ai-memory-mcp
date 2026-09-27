@@ -3479,6 +3479,40 @@ pub trait MemoryStore: Send + Sync {
         })
     }
 
+    /// Consolidate with source versions aligned one-for-one with `ids`.
+    /// Adapters compare them inside the write transaction before any mutation;
+    /// PostgreSQL locks all sources in stable id order until commit.
+    /// `None` retains the ordinary consolidation contract.
+    async fn consolidate_with_expected_versions(
+        &self,
+        ctx: &CallerContext,
+        ids: &[String],
+        title: &str,
+        summary: &str,
+        namespace: &str,
+        tier: &Tier,
+        source: &str,
+        consolidator_agent_id: &str,
+        expected_versions: Option<&[i64]>,
+    ) -> StoreResult<String> {
+        if expected_versions.is_some() {
+            return Err(StoreError::UnsupportedCapability {
+                capability: "version-checked consolidation".to_string(),
+            });
+        }
+        self.consolidate(
+            ctx,
+            ids,
+            title,
+            summary,
+            namespace,
+            tier,
+            source,
+            consolidator_agent_id,
+        )
+        .await
+    }
+
     /// #2860 (federation data-integrity, 5-agent vote `4d3ea1c5`) — replace a
     /// single row's `metadata` JSON in place. Used ONLY by the federated
     /// consolidate finalize on the postgres branch (the sqlite branch calls the
