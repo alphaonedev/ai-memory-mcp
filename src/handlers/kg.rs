@@ -769,10 +769,24 @@ pub async fn kg_timeline(
                 // twin in mcp/tools/kg_timeline.rs). #3498: the substrate
                 // gate also applies to daemon reads.
                 let events = {
-                    let raw_ctx = crate::store::CallerContext::for_admin(caller.clone());
+                    // #3982: read each target under the CALLER'S OWN context. The
+                    // pg `get` already folds a target this caller cannot read
+                    // (lifecycle-hidden, or another tenant's private row) into
+                    // NotFound, so for a tenant the verdict is identical to the
+                    // former unconditional `for_admin` read followed by the filter
+                    // below, without constructing a privacy bypass on a tenant
+                    // route. Only the daemon keeps the admin read: its filter
+                    // verdict below is trust-all (`None`), which a scoped read
+                    // would narrow. (Over HTTP `X-Agent-Id: daemon` is refused by
+                    // `validate_agent_id`, #977, so that arm is not reachable from
+                    // a request header.)
+                    let target_ctx = crate::store::CallerContext::for_admin_checked(
+                        caller.clone(),
+                        caller == sentinels::DAEMON_PRINCIPAL,
+                    );
                     let mut kept = Vec::with_capacity(events.len());
                     for e in events {
-                        let visible = match app.store.get(&raw_ctx, &e.target_id).await {
+                        let visible = match app.store.get(&target_ctx, &e.target_id).await {
                             Ok(m) => crate::visibility::is_readable_on_query(
                                 &m,
                                 (caller != sentinels::DAEMON_PRINCIPAL).then_some(caller.as_str()),

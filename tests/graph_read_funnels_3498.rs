@@ -477,3 +477,140 @@ async fn http_anchor_contract_matrix(
         );
     }
 }
+
+/// #3982: the pg `kg_timeline` per-TARGET filter now reads each target under
+/// the caller's own context, not an unconditional `for_admin`. A tenant keeps
+/// its own private target and another tenant's collective target, and never
+/// sees another tenant's private target. The same matrix runs on sqlite
+/// (`db::get_any` plus the explicit filter) so the two backends are held to one
+/// verdict.
+#[tokio::test]
+async fn timeline_target_tenancy_matrix_3982() {
+    timeline_target_tenancy(
+        #[cfg(feature = "sal")]
+        None,
+    )
+    .await;
+}
+
+#[cfg(feature = "sal-postgres")]
+#[tokio::test]
+async fn live_pg_timeline_target_tenancy_matrix_3982() {
+    let Ok(url) = std::env::var("AI_MEMORY_TEST_POSTGRES_URL") else {
+        eprintln!("skip: live_pg_timeline_target_tenancy_matrix_3982 requires PostgreSQL");
+        return;
+    };
+    let store = ai_memory::store::postgres::PostgresStore::connect(&url)
+        .await
+        .expect("live PostgreSQL");
+    timeline_target_tenancy(Some(std::sync::Arc::new(store))).await;
+}
+
+async fn timeline_target_tenancy(
+    #[cfg(feature = "sal")] live_store: Option<std::sync::Arc<dyn ai_memory::store::MemoryStore>>,
+) {
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+    };
+    use tower::ServiceExt as _;
+    let (router, db, _scratch) = build_router_with_db(
+        #[cfg(feature = "sal")]
+        live_store.clone(),
+    );
+    let row = |owner: &str, scope: &str, title: &str| {
+        let now = chrono::Utc::now().to_rfc3339();
+        Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            namespace: "ordinary-3982".to_string(),
+            title: format!("{title} {}", uuid::Uuid::new_v4()),
+            content: "timeline target tenancy 3982".to_string(),
+            created_at: now.clone(),
+            updated_at: now,
+            metadata: json!({"agent_id": owner, "scope": scope}),
+            ..Memory::default()
+        }
+    };
+    let (source, own_private, foreign_collective, foreign_private) = {
+        let lock = db.lock().await;
+        let ids: Vec<String> = [
+            row(CALLER, "collective", "source"),
+            row(CALLER, "private", "own private"),
+            row("ai:other", "collective", "foreign collective"),
+            row("ai:other", "private", "foreign private"),
+        ]
+        .iter()
+        .map(|m| ai_memory::db::insert(&lock.0, m).expect("seed"))
+        .collect();
+        for target in &ids[1..] {
+            ai_memory::db::create_link(&lock.0, &ids[0], target, "related_to").unwrap();
+        }
+        (
+            ids[0].clone(),
+            ids[1].clone(),
+            ids[2].clone(),
+            ids[3].clone(),
+        )
+    };
+    #[cfg(feature = "sal")]
+    if let Some(store) = live_store {
+        let (memories, links) = {
+            let lock = db.lock().await;
+            let memories = [&source, &own_private, &foreign_collective, &foreign_private]
+                .into_iter()
+                .map(|id| ai_memory::db::get(&lock.0, id).unwrap().unwrap())
+                .collect::<Vec<_>>();
+            (
+                memories,
+                ai_memory::db::get_links(&lock.0, &source).unwrap(),
+            )
+        };
+        let ctx = ai_memory::store::CallerContext::for_admin("fixture-3982");
+        for mem in memories {
+            store
+                .store(&ctx, &mem)
+                .await
+                .expect("seed PostgreSQL memory");
+        }
+        for link in links {
+            store.link(&ctx, &link).await.expect("seed PostgreSQL link");
+        }
+        // Prove the route reads PostgreSQL by emptying its SQLite fallback.
+        let mut lock = db.lock().await;
+        lock.0 = ai_memory::db::open(std::path::Path::new(":memory:")).unwrap();
+    }
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/kg/timeline?source_id={source}"))
+                .header(ai_memory::HEADER_AGENT_ID, CALLER)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    let targets: Vec<&str> = body["events"]
+        .as_array()
+        .expect("events")
+        .iter()
+        .filter_map(|e| e["target_id"].as_str())
+        .collect();
+    assert!(
+        targets.contains(&own_private.as_str()),
+        "own private target kept: {body}"
+    );
+    assert!(
+        targets.contains(&foreign_collective.as_str()),
+        "another tenant's collective target kept: {body}"
+    );
+    assert!(
+        !targets.contains(&foreign_private.as_str()),
+        "another tenant's PRIVATE target must never appear: {body}"
+    );
+    assert_eq!(targets.len(), 2, "exactly the two readable targets: {body}");
+}
