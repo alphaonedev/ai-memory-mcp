@@ -8223,12 +8223,14 @@ impl PostgresStore {
     /// scope predicate over the row that exists, so the gate is
     /// lifecycle-NEUTRAL — it never changes which lifecycle states the
     /// surface it guards discloses: it discloses whatever state the row
-    /// already carries. On Postgres no path WRITES `contaminated` at
-    /// v1.0.0 — the only #3324 stamper is the SQLite MCP `supersedes` path
-    /// (`mcp/tools/link.rs`, reflection-to-reflection only); PG `kg_invalidate`
-    /// and `link_signed` stamp nothing, so a PG row carries the state only
-    /// when it arrives already stamped (e.g. replicated from a SQLite node).
-    /// PG parity for the stamp is tracked on #3926 / #3266 (#3925).
+    /// already carries. Postgres WRITES `contaminated` on two paths at
+    /// v1.0.0 (#4050): `link_signed` (HTTP `POST /links`) runs the #3324
+    /// auto-stamp after a `supersedes` link between two reflections
+    /// (`stamp_on_reflection_supersedes_pg`), and the admin swarm rewind
+    /// (`swarm_rewind_pg`) stamps the cascade root and its `derives_from`
+    /// descendants. PG `kg_invalidate` stamps nothing. Because this read is
+    /// lifecycle-neutral, a row contaminated by either path is still found
+    /// here and judged by the gate's own scope predicate (#3925).
     ///
     /// This is an authz-precondition read ONLY — never a caller-facing
     /// content read (the #3270 rule); it is reached through the concrete
