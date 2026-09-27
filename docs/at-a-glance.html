@@ -1205,7 +1205,7 @@ footer.site-foot a { color: var(--text-muted); }
     </svg>
 
     <div class="callout">
-      <strong>Reversibility is the rule, not the exception.</strong> Every destructive operation has an undo path. Archive instead of delete. Supersede instead of overwrite. The only hard delete is <code>memory_archive_purge</code> (CLI: <code>ai-memory archive purge --older-than-days &lt;N&gt;</code>) — scoped by the <code>older_than_days</code> safety knob and audit-logged.
+      <strong>Most destructive operations are archive-first and restorable.</strong> Supersede instead of overwrite. CLI <code>ai-memory delete</code> and <code>ai-memory forget</code>, and deleting an inbox message on any surface, archive the row so <code>archive restore</code> can bring it back. <strong>Irreversible paths:</strong> <code>memory_archive_purge</code> (CLI: <code>ai-memory archive purge --older-than-days &lt;N&gt;</code>, scoped by the <code>older_than_days</code> safety knob and audit-logged), <code>ai-memory delete --hard</code>, and MCP <code>memory_delete</code> / HTTP <code>DELETE</code> on any non-inbox row, which erase the row with no content snapshot. Recovery after those is from a <code>backup</code> only.
     </div>
   </div>
 </section>
