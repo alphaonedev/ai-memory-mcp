@@ -96,6 +96,34 @@ pub fn authorize_remote_transition(
     }
 }
 
+/// #3986 — distinguishable refusal cause for an inbound action transition that
+/// was refused because the LOCAL lease on the action could not be READ.
+///
+/// [`authorize_remote_transition`] rejects a transition whose attested actor
+/// is not the local lease holder. Both `/sync/push` funnels used to read that
+/// lease with `lease_get(..).ok().flatten()`, so a storage error became "no
+/// lease holder" and the conflict check was silently skipped — fail OPEN, and
+/// under a permissive `require_sig` an unsigned transition then applied over a
+/// lease someone else holds. A read error now refuses the item (counted in the
+/// push envelope's `skipped`, like every other per-item refusal); this token
+/// is the `cause` on the refusal WARN so an operator can tell "this node cannot
+/// read its lease table" from a genuine lease conflict.
+pub const CAUSE_LEASE_UNRESOLVABLE: &str = "lease_unresolvable";
+
+/// #3986 — the ONE refusal signal both transition funnels emit when the local
+/// lease read fails. Names the action id and the storage error only.
+pub fn warn_transition_lease_unresolvable(action_id: &str, error: &dyn std::fmt::Display) {
+    tracing::warn!(
+        target: crate::federation::SIGNING_TRACE_TARGET,
+        action_id = %action_id,
+        cause = CAUSE_LEASE_UNRESOLVABLE,
+        error = %error,
+        "sync_push: refusing federated action transition — the local lease could not be \
+         read, so the lease-holder conflict check cannot decide (#3986 fail-closed). \
+         Investigate the storage error rather than the peer."
+    );
+}
+
 /// FED-RQ-01 (#1936) — verdict for an inbound federated checkpoint RESOLUTION.
 /// A resolved commit-checkpoint is an **authority-granting** write (the
 /// separation-of-duties attestation: who resolved this coordination gate, to

@@ -4213,10 +4213,20 @@ async fn sync_push_write(
             .claimed_by
             .as_deref()
             .and_then(crate::identity::verify::lookup_peer_public_key);
-        let lease_holder = crate::actions::lease_get(&lock.0, &op.action_id)
-            .ok()
-            .flatten()
-            .map(|l| l.holder);
+        // #3986 — a lease-read ERROR is not "no lease": mapping it to `None`
+        // skipped the lease-holder conflict check (fail open). Refuse the item.
+        let lease = match crate::actions::lease_get(&lock.0, &op.action_id) {
+            Ok(lease) => lease,
+            Err(e) => {
+                crate::federation::receive_auth::warn_transition_lease_unresolvable(
+                    &op.action_id,
+                    &e,
+                );
+                skipped += 1;
+                continue;
+            }
+        };
+        let lease_holder = lease.map(|l| l.holder);
         let signable = crate::identity::sign::SignableTransition {
             action_id: &op.action_id,
             namespace: &local.namespace,
