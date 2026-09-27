@@ -355,9 +355,16 @@ pub fn init_for_test(buf: std::sync::Arc<Mutex<Vec<u8>>>) {
             Ok(())
         }
     }
+    init_for_test_with_writer(Box::new(VecWriter(buf)));
+}
+
+/// Test-only: install an in-memory sink over an arbitrary writer (#3975
+/// drives a writer that fails like a full disk).
+#[cfg(test)]
+pub(crate) fn init_for_test_with_writer(writer: Box<dyn Write + Send>) {
     let sink = AuditSink {
         inner: Mutex::new(SinkInner {
-            writer: Box::new(VecWriter(buf)),
+            writer,
             last_hash: CHAIN_HEAD_PREV_HASH.to_string(),
             path: None,
         }),
@@ -577,9 +584,101 @@ pub fn emit(builder: EventBuilder) {
     }
 }
 
+/// #3975 — the metric an operator watches for a trail that stopped
+/// recording. Named by the stderr diagnostic so one leads to the other.
+pub const AUDIT_WRITE_FAILURES_TOTAL: &str = "ai_memory_audit_write_failures_total";
+
+/// #3975 — count one lost audit event and, at most once a minute (the #3651
+/// log-sink diagnostic interval), say so on stderr.
+/// `tracing` is not enough: it is a no-op unless the logging pipeline is
+/// enabled, and the audit trail is the record an operator relies on when it
+/// is not.
+fn note_emit_failure(err: &anyhow::Error) {
+    let delivery = &RuntimeContext::global().audit.delivery;
+    if let Some(suppressed) = delivery.record_failure(now_unix_ms()) {
+        // Nothing is left to report a failing stderr to.
+        let _ = writeln!(
+            std::io::stderr(),
+            "{}",
+            audit_failure_diagnostic(err, suppressed)
+        );
+    }
+}
+
+fn audit_failure_diagnostic(err: &anyhow::Error, suppressed: u64) -> String {
+    format!(
+        "ai-memory: the audit trail failed to record an event: {err} \
+         ({suppressed} further failures since the previous report); audit \
+         events are being lost, see {AUDIT_WRITE_FAILURES_TOTAL}"
+    )
+}
+
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
+/// #3975 — whether the flat audit trail is recording in this process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuditTrailState {
+    /// No sink is installed: `[audit].enabled` is off, or (only in `doctor`,
+    /// which boots past a refused trail) the trail failed to initialise.
+    NotActive,
+    /// A sink is installed and receives every emitted event.
+    Active,
+}
+
+/// #3975 — a snapshot of the flat audit trail. Counters are `None` unless the
+/// trail is [`AuditTrailState::Active`]: a number nothing measured is never
+/// reported as zero (the #3651 `LogPipelineStatus` rule).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditTrailStatus {
+    /// Whether a sink is installed.
+    pub state: AuditTrailState,
+    /// Events written and flushed without error.
+    pub records_written: Option<u64>,
+    /// Events lost to a failed write or flush (or a poisoned sink).
+    pub write_failures: Option<u64>,
+    /// Wall-clock time of the most recent successful write.
+    pub last_write_unix_ms: Option<u64>,
+}
+
+/// #3975 — the flat audit trail's state and delivery counters, read at call
+/// time (the `/metrics` collector and `doctor` both use it).
+#[must_use]
+pub fn audit_trail_status() -> AuditTrailStatus {
+    let audit = &RuntimeContext::global().audit;
+    let active = audit.sink.read().map(|g| g.is_some()).unwrap_or(false);
+    if !active {
+        return AuditTrailStatus {
+            state: AuditTrailState::NotActive,
+            records_written: None,
+            write_failures: None,
+            last_write_unix_ms: None,
+        };
+    }
+    AuditTrailStatus {
+        state: AuditTrailState::Active,
+        records_written: Some(audit.delivery.delivered()),
+        write_failures: Some(audit.delivery.write_failures()),
+        last_write_unix_ms: audit.delivery.last_success_unix_ms(),
+    }
+}
+
 /// Inner emission with proper `Result` so tests can assert directly on
-/// the writer. `emit` swallows errors so production never blocks.
+/// the writer. `emit` swallows errors so production never blocks. Every
+/// failure after a sink is found is counted and reported (#3975); no sink
+/// (auditing off) is not a failure.
 fn try_emit(builder: EventBuilder) -> Result<()> {
+    try_emit_inner(builder)
+        .map(|_written| ())
+        .inspect_err(note_emit_failure)
+}
+
+/// `Ok(true)` when the event was written, `Ok(false)` when no sink is
+/// installed (auditing is off, nothing to record).
+fn try_emit_inner(builder: EventBuilder) -> Result<bool> {
     let audit = &RuntimeContext::global().audit;
     let sink = {
         let guard = audit
@@ -588,7 +687,7 @@ fn try_emit(builder: EventBuilder) -> Result<()> {
             .map_err(|_| anyhow!("audit sink rwlock poisoned"))?;
         match guard.as_ref() {
             Some(s) => s.clone(),
-            None => return Ok(()),
+            None => return Ok(false),
         }
     };
 
@@ -626,9 +725,18 @@ fn try_emit(builder: EventBuilder) -> Result<()> {
 
     let line = serde_json::to_string(&ev).context("serializing audit event")?;
     writeln!(inner.writer, "{line}").context("appending audit line")?;
-    inner.writer.flush().ok();
+    // #3975: a failed flush was discarded (`.ok()`). The line may or may not
+    // be durable, so the chain head still advances exactly as before (the
+    // line WAS handed to the writer), but the failure is counted and
+    // reported like any other lost write.
+    let flushed = inner.writer.flush();
     inner.last_hash = self_hash;
-    Ok(())
+    flushed.context("flushing audit line")?;
+    RuntimeContext::global()
+        .audit
+        .delivery
+        .record_success(now_unix_ms());
+    Ok(true)
 }
 
 /// Sanitize a field for log emission: strip control chars + newlines
@@ -1423,6 +1531,110 @@ mod tests {
         assert_eq!(report.total_lines as usize, actions.len());
 
         super::shutdown_for_test();
+    }
+
+    /// #3975: a writer that behaves like a disk that fills after `budget`
+    /// bytes (`ENOSPC` on write), and optionally fails every flush.
+    struct FillingDisk {
+        budget: usize,
+        fail_flush: bool,
+    }
+
+    impl std::io::Write for FillingDisk {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            if data.len() > self.budget {
+                return Err(std::io::Error::from_raw_os_error(28)); // ENOSPC
+            }
+            self.budget -= data.len();
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            if self.fail_flush {
+                Err(std::io::Error::other("flush failed"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn emit_one() {
+        super::emit(EventBuilder::new(
+            AuditAction::Store,
+            actor("a", "explicit", None),
+            target_memory("m", "ns", None, None, None),
+        ));
+    }
+
+    /// #3975: a disk that fills AFTER boot. Pre-fix the failed writes were
+    /// reported only through `tracing` (a no-op without a subscriber), so the
+    /// trail stopped with no counter an operator could see.
+    #[test]
+    fn a_disk_that_fills_after_boot_is_counted_3975() {
+        let _g = sink_lock();
+        let delivery = &RuntimeContext::global().audit.delivery;
+        let (written0, failed0) = (delivery.delivered(), delivery.write_failures());
+        // Room for exactly one event line.
+        super::init_for_test_with_writer(Box::new(FillingDisk {
+            budget: 4096,
+            fail_flush: false,
+        }));
+        emit_one();
+        super::init_for_test_with_writer(Box::new(FillingDisk {
+            budget: 0,
+            fail_flush: false,
+        }));
+        emit_one();
+        emit_one();
+        let status = super::audit_trail_status();
+        super::shutdown_for_test();
+        assert_eq!(delivery.delivered() - written0, 1, "one event landed");
+        assert_eq!(
+            delivery.write_failures() - failed0,
+            2,
+            "two events were lost"
+        );
+        assert_eq!(status.state, super::AuditTrailState::Active);
+        assert!(status.last_write_unix_ms.is_some());
+    }
+
+    /// #3975: a failed FLUSH was discarded (`.ok()`); it is now a counted loss.
+    #[test]
+    fn a_failed_flush_is_counted_not_discarded_3975() {
+        let _g = sink_lock();
+        let delivery = &RuntimeContext::global().audit.delivery;
+        let (written0, failed0) = (delivery.delivered(), delivery.write_failures());
+        super::init_for_test_with_writer(Box::new(FillingDisk {
+            budget: usize::MAX,
+            fail_flush: true,
+        }));
+        emit_one();
+        super::shutdown_for_test();
+        assert_eq!(delivery.write_failures() - failed0, 1);
+        assert_eq!(delivery.delivered() - written0, 0);
+    }
+
+    /// #3975: auditing OFF is not a loss. No sink means nothing to record, so
+    /// the failure counter must not move (and no stderr line is printed).
+    #[test]
+    fn emit_with_auditing_off_is_not_a_failure_3975() {
+        let _g = sink_lock();
+        super::shutdown_for_test();
+        let delivery = &RuntimeContext::global().audit.delivery;
+        let failed0 = delivery.write_failures();
+        emit_one();
+        assert_eq!(delivery.write_failures(), failed0);
+        assert_eq!(
+            super::audit_trail_status().state,
+            super::AuditTrailState::NotActive
+        );
+    }
+
+    #[test]
+    fn the_failure_diagnostic_names_the_metric_3975() {
+        let line = super::audit_failure_diagnostic(&anyhow::anyhow!("No space left on device"), 4);
+        assert!(line.contains("No space left on device"));
+        assert!(line.contains("4 further failures"));
+        assert!(line.contains(super::AUDIT_WRITE_FAILURES_TOTAL));
     }
 
     #[test]

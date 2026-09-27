@@ -1604,6 +1604,12 @@ fn run_local(db_path: &Path, caller_agent_id: Option<&str>) -> Report {
     sections.push(section_logging_pipeline_3651(
         &crate::logging::log_pipeline_status(),
     ));
+    // #3975 — the flat audit trail of THIS process, right after the log
+    // sink: both are write-only records whose loss is otherwise silent.
+    sections.push(section_audit_trail_3975(
+        &crate::audit::audit_trail_status(),
+        audit_configured_enabled_3975(),
+    ));
     sections.push(section_peer_allowlist_3582(
         &crate::federation::peer_posture::observe(None),
     ));
@@ -2593,6 +2599,87 @@ fn section_logging_pipeline_3651(status: &crate::logging::LogPipelineStatus) -> 
                     .into(),
             ),
         },
+    }
+}
+
+/// #3975 — whether `[audit].enabled` is set in the configuration this
+/// process would boot with (`false` under `AI_MEMORY_NO_CONFIG`).
+fn audit_configured_enabled_3975() -> bool {
+    let app_config = if crate::config::skip_config() {
+        crate::config::AppConfig::default()
+    } else {
+        crate::config::AppConfig::load_for_boot().unwrap_or_default()
+    };
+    app_config.effective_audit().enabled.unwrap_or(false)
+}
+
+/// #3975 — the flat audit trail of THIS process. Critical when events were
+/// lost (a write or flush failed) or when auditing is configured on but no
+/// trail is recording; `doctor` is the one command that boots past a refused
+/// trail (#3651), so it is where that state is visible. A running daemon's
+/// live counters are the `ai_memory_audit_*` metrics on its `/metrics`.
+fn section_audit_trail_3975(
+    status: &crate::audit::AuditTrailStatus,
+    configured_enabled: bool,
+) -> ReportSection {
+    use crate::audit::AuditTrailState;
+    const NAME: &str = "Audit trail (#3975)";
+    const SCOPE: &str = "this doctor process; a daemon reports ai_memory_audit_* on /metrics";
+    match status.state {
+        AuditTrailState::NotActive if !configured_enabled => ReportSection {
+            name: NAME.into(),
+            severity: Severity::Info,
+            facts: vec![(
+                "state".into(),
+                "not configured ([audit].enabled is off)".into(),
+            )],
+            note: None,
+        },
+        AuditTrailState::NotActive => ReportSection {
+            name: NAME.into(),
+            severity: Severity::Critical,
+            facts: vec![
+                ("state".into(), "NOT RECORDING".into()),
+                ("configured".into(), "[audit].enabled = true".into()),
+            ],
+            note: Some(
+                "auditing is configured on but no trail is recording in this process; \
+                 every other ai-memory command refuses to start (exit 78) until the \
+                 cause printed on stderr is fixed or [audit].enabled = false"
+                    .into(),
+            ),
+        },
+        AuditTrailState::Active => {
+            let failures = status.write_failures.unwrap_or(0);
+            let last = status
+                .last_write_unix_ms
+                .and_then(|ms| i64::try_from(ms).ok())
+                .and_then(chrono::DateTime::from_timestamp_millis)
+                .map_or_else(|| "none yet".to_string(), |at| at.to_rfc3339());
+            ReportSection {
+                name: NAME.into(),
+                severity: if failures > 0 {
+                    Severity::Critical
+                } else {
+                    Severity::Info
+                },
+                facts: vec![
+                    ("state".into(), "active".into()),
+                    (
+                        "records_written".into(),
+                        status.records_written.unwrap_or(0).to_string(),
+                    ),
+                    ("write_failures".into(), failures.to_string()),
+                    ("last_write".into(), last),
+                    ("scope".into(), SCOPE.into()),
+                ],
+                note: (failures > 0).then(|| {
+                    "audit events were LOST in this process (the trail has a gap); \
+                     stderr carries the rate-limited reason"
+                        .into()
+                }),
+            }
+        }
     }
 }
 
@@ -5270,7 +5357,8 @@ mod tests {
         // total is now 21.
         // #3651 inserted "Logging pipeline (#3651)" after the transit section
         // (the log sink is initialised before any command runs) — total is
-        // now 23.
+        // now 23. #3975 inserted "Audit trail (#3975)" right after it — total
+        // is now 24.
         //
         // #3264 note: "Postgres extensions (#3264)" is an additional CONDITIONAL
         // section — emitted only when `store_url::resolve_store_url(None)`
@@ -5286,7 +5374,7 @@ mod tests {
         // #3471 note: "Wake hub (#3471)" is UNCONDITIONAL — it reads only the
         // filesystem and this process's own RLIMIT_NOFILE, so it costs nothing
         // on a host with no hub and reports `configured = no` there.
-        assert_eq!(report.sections.len(), 23);
+        assert_eq!(report.sections.len(), 24);
         let names: Vec<&str> = report.sections.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(
             names,
@@ -5295,6 +5383,7 @@ mod tests {
                 SECTION_DEPLOYMENT_SHAPE_DETECTOR,
                 SECTION_TRANSIT_ENCRYPTION,
                 "Logging pipeline (#3651)",
+                "Audit trail (#3975)",
                 "Federation peer authorization",
                 "Identity",
                 SECTION_KEY_POSTURE,
@@ -6627,9 +6716,10 @@ mod tests {
         // registry signal left `unobservable` because the store never opened;
         // #3705 the transit section renders third, with the webhook census
         // left `unobservable` for the same reason; #3651 the logging
-        // pipeline renders fourth (it is independent of the database too).
+        // pipeline renders fourth (it is independent of the database too);
+        // #3975 the audit trail renders fifth, for the same reason.
         // Storage is the Critical failure.
-        assert_eq!(report.sections.len(), 8);
+        assert_eq!(report.sections.len(), 9);
         assert_eq!(report.sections[0].name, "Configuration");
         assert_eq!(report.sections[1].name, SECTION_DEPLOYMENT_SHAPE_DETECTOR);
         assert_eq!(
@@ -6644,12 +6734,13 @@ mod tests {
             "#3705: an unopened store is unobservable, never zero plaintext targets"
         );
         assert_eq!(report.sections[3].name, "Logging pipeline (#3651)");
-        assert_eq!(report.sections[4].name, "Federation peer authorization");
-        assert_eq!(report.sections[5].name, SECTION_IDENTITY);
+        assert_eq!(report.sections[4].name, "Audit trail (#3975)");
+        assert_eq!(report.sections[5].name, "Federation peer authorization");
+        assert_eq!(report.sections[6].name, SECTION_IDENTITY);
         // #3717 — the key posture is filesystem-only and renders even when
         // the database will not open.
-        assert_eq!(report.sections[6].name, SECTION_KEY_POSTURE);
-        let storage = &report.sections[7];
+        assert_eq!(report.sections[7].name, SECTION_KEY_POSTURE);
+        let storage = &report.sections[8];
         assert_eq!(storage.name, "Storage");
         assert_eq!(storage.severity, Severity::Critical);
         // overall is computed from the sections; Storage is Critical.
@@ -6673,6 +6764,49 @@ mod tests {
             last_delivery_unix_ms: None,
             failure: None,
         }
+    }
+
+    #[test]
+    fn audit_section_severity_follows_the_trail_3975() {
+        use crate::audit::{AuditTrailState, AuditTrailStatus};
+        let off = AuditTrailStatus {
+            state: AuditTrailState::NotActive,
+            records_written: None,
+            write_failures: None,
+            last_write_unix_ms: None,
+        };
+        assert_eq!(
+            section_audit_trail_3975(&off, false).severity,
+            Severity::Info
+        );
+        let refused = section_audit_trail_3975(&off, true);
+        assert_eq!(
+            refused.severity,
+            Severity::Critical,
+            "enabled but not recording"
+        );
+        assert_eq!(fact(&refused, "state"), "NOT RECORDING");
+        let healthy = AuditTrailStatus {
+            state: AuditTrailState::Active,
+            records_written: Some(7),
+            write_failures: Some(0),
+            last_write_unix_ms: Some(1_757_000_000_000),
+        };
+        let s = section_audit_trail_3975(&healthy, true);
+        assert_eq!(s.severity, Severity::Info);
+        assert_eq!(fact(&s, "records_written"), "7");
+        let lossy = AuditTrailStatus {
+            write_failures: Some(2),
+            ..healthy
+        };
+        let s = section_audit_trail_3975(&lossy, true);
+        assert_eq!(
+            s.severity,
+            Severity::Critical,
+            "a lost event is a gap in the trail"
+        );
+        assert_eq!(fact(&s, "write_failures"), "2");
+        assert!(s.note.as_deref().unwrap_or("").contains("LOST"));
     }
 
     #[test]
