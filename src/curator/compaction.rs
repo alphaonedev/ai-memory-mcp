@@ -1484,6 +1484,105 @@ mod tests {
             assert_eq!(rows.len(), 2, "both source rows remain");
         }
 
+        struct SummaryEdit<'a> {
+            store: &'a dyn MemoryStore,
+            id: String,
+        }
+
+        impl AutonomyLlm for SummaryEdit<'_> {
+            fn auto_tag(&self, _: &str, _: &str) -> Result<Vec<String>> { Ok(vec![]) }
+            fn detect_contradiction(&self, _: &str, _: &str) -> Result<bool> { Ok(false) }
+            fn summarize_memories(&self, _: &[(String, String)]) -> Result<String> {
+                crate::llm::block_on_local_bounded(std::time::Duration::from_secs(15), || async {
+                    self.store.update(&CallerContext::for_admin(CONSOLIDATOR_AGENT_ID), &self.id, crate::store::UpdatePatch {
+                        content: Some("distinctive committed v2".to_string()),
+                        ..Default::default()
+                    }).await
+                })??;
+                Ok("summary of v1 only".to_string())
+            }
+        }
+
+        async fn issue_4045_4046_matrix(store: &dyn MemoryStore, edit: bool, summary: &str) {
+            let ctx = CallerContext::for_admin(CONSOLIDATOR_AGENT_ID);
+            let namespace = uuid::Uuid::new_v4().to_string();
+            let mut candidates = Vec::new();
+            for title in ["first", "second"] {
+                let memory = make_memory_full(&uuid::Uuid::new_v4().to_string(), &namespace, title,
+                    "kubernetes rolling canary deploy strategy notes", Tier::Mid, 5);
+                let vector = vec![1.0; 384];
+                store.store_with_embedding(&ctx, &memory, Some(&vector), Some(&crate::embeddings::embedding_space_fingerprint("test-space"))).await.unwrap();
+                candidates.push(store.get(&ctx, &memory.id).await.unwrap());
+            }
+            let editor = SummaryEdit { store, id: candidates[0].id.clone() };
+            let stub = StubLlm::new(summary);
+            let llm: &dyn AutonomyLlm = if edit { &editor } else { &stub };
+            let report = ConsolidationPass::new(store, llm, false).run(&candidates).await.unwrap();
+            assert_eq!(report.eligible_clusters, 1);
+            if edit || summary.trim().is_empty() {
+                assert_eq!(report.memories_consolidated, 0, "invalid or stale summary must be refused");
+                assert!(!report.errors.is_empty());
+                for (index, source) in candidates.iter().enumerate() {
+                    let row = store.get(&ctx, &source.id).await.unwrap();
+                    let expected = if edit && index == 0 { "distinctive committed v2" } else { &source.content };
+                    assert_eq!(row.content, expected);
+                    assert_eq!(row.lifecycle_state, source.lifecycle_state);
+                }
+            } else {
+                assert_eq!(report.memories_consolidated, 2);
+                assert!(report.errors.is_empty(), "{:?}", report.errors);
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn issue_4045_4046_sqlite_disposition_matrix() {
+            let flags = crate::test_support::LineageDagIsolation::new();
+            for tombstone in [false, true] {
+                flags.set_lineage_dag(tombstone);
+                flags.set_consolidate_tombstone_sources(tombstone);
+                for (edit, summary) in [(true, "summary"), (false, ""), (false, " \n\t"), (false, "valid summary")] {
+                    let (store, _dir) = open_db();
+                    issue_4045_4046_matrix(&store, edit, summary).await;
+                }
+            }
+        }
+
+        #[cfg(feature = "sal-postgres")]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn issue_4045_4046_postgres_disposition_matrix() {
+            let Ok(url) = std::env::var("AI_MEMORY_TEST_POSTGRES_URL") else { return; };
+            let store = crate::store::postgres::PostgresStore::connect(&url).await.unwrap();
+            let flags = crate::test_support::LineageDagIsolation::new();
+            for tombstone in [false, true] {
+                flags.set_lineage_dag(tombstone);
+                flags.set_consolidate_tombstone_sources(tombstone);
+                for (edit, summary) in [(true, "summary"), (false, ""), (false, " \n\t"), (false, "valid summary")] {
+                    issue_4045_4046_matrix(&store, edit, summary).await;
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn issue_4046_empty_summary_preserves_sources() {
+            for summary in ["", " \n\t"] {
+                let (store, _dir) = open_db();
+                let conn = conn_of(&store);
+                let candidates = seed_two_dupes(&conn);
+                let llm = StubLlm::new(summary);
+                let report = ConsolidationPass::new(&store, &llm, false).run(&candidates).await.unwrap();
+                assert_eq!(report.memories_consolidated, 0);
+                assert_eq!(report.rollback_entries_written, 0);
+                assert!(!report.errors.is_empty());
+                for source in candidates {
+                    let actual = crate::db::get(&conn, &source.id).unwrap().unwrap();
+                    assert_eq!(actual.content, source.content);
+                    assert_eq!(actual.lifecycle_state, source.lifecycle_state);
+                }
+                let count: i64 = conn.query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0)).unwrap();
+                assert_eq!(count, 2);
+            }
+        }
+
         #[tokio::test]
         async fn run_real_mode_consolidates_cluster() {
             // #3577 reader guard: this test consolidates under the DEFAULT
