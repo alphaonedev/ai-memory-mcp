@@ -315,9 +315,10 @@ async fn postgres_final_witness_binds_active_heads_and_failure_exits_75_4070() {
                 sequence: head,
                 cause_hash: row.get("cause_hash"),
             };
-            let expected_hash = ai_memory::signed_events::hex_lower(&Sha256::digest(
-                ai_memory::signed_events::canonical_chain_bytes(&event),
-            ));
+            let expected_hash = format!(
+                "{:x}",
+                Sha256::digest(ai_memory::signed_events::canonical_chain_bytes(&event))
+            );
             assert_eq!(resolution["signed_events"]["head_hash"], expected_hash);
             assert_eq!(resolution["signed_events"]["head_sequence"], head);
             assert_eq!(resolution["memory_revisions"]["head_sequence"], revisions);
