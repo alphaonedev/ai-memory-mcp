@@ -12,7 +12,9 @@
 //!
 //! Every leg drives the REAL router and reads the PERSISTED row. The Postgres
 //! leg runs when `AI_MEMORY_TEST_POSTGRES_URL` is set (the CI Postgres job
-//! sets it); the SQLite legs always run and pin the positive control.
+//! sets it); the SQLite legs run on every `sal` build and pin the positive
+//! control. The SAL (`ai_memory::store`) is itself `sal`-gated.
+#![cfg(feature = "sal")]
 
 use std::sync::Arc;
 
