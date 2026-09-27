@@ -638,6 +638,9 @@ mod tests {
         // bottoms out at whatever `auto_namespace()` yields.
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
+        // `auto_namespace` is read here AND again inside `run`; hold the ONE
+        // cwd lock (#4016) so no test moves the cwd between the two reads.
+        let _cwd = crate::test_support::cwd_lock();
         // Auto-namespace lookup — accept whatever it returns; the
         // seeded memories live in the same namespace.
         let ns = crate::cli::helpers::auto_namespace();

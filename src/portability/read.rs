@@ -430,14 +430,7 @@ mod tests {
     fn empty_db() -> Connection {
         let dir = tempfile::Builder::new()
             .prefix("issue-2006-read-")
-            .tempdir_in({
-                let root = std::env::current_dir()
-                    .unwrap_or_else(|_| std::path::PathBuf::from("."))
-                    .join(".local-runs")
-                    .join("issue-2006-read");
-                std::fs::create_dir_all(&root).ok();
-                root
-            })
+            .tempdir_in(crate::test_support::local_runs_root("issue-2006-read"))
             .expect("tempdir under .local-runs");
         let path = dir.path().join("read.db");
         drop(crate::db::open(&path).expect("init db"));

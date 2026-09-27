@@ -1999,11 +1999,7 @@ mod tests {
     }
 
     fn fresh_conn(tag: &str) -> Connection {
-        let root = std::env::current_dir()
-            .unwrap_or_else(|_| std::path::PathBuf::from("."))
-            .join(".local-runs")
-            .join("issue-2006-import");
-        std::fs::create_dir_all(&root).ok();
+        let root = crate::test_support::local_runs_root("issue-2006-import");
         let dir = tempfile::Builder::new()
             .prefix(tag)
             .tempdir_in(&root)

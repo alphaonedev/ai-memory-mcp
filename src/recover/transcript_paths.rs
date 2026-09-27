@@ -363,12 +363,7 @@ mod tests {
 
     /// In-tree scratch root honoring the project no-`/tmp` HARD RULE.
     fn local_runs_dir() -> std::path::PathBuf {
-        let root = std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join(".local-runs")
-            .join("transcript-paths-unit-test");
-        std::fs::create_dir_all(&root).ok();
-        root
+        crate::test_support::local_runs_root("transcript-paths-unit-test")
     }
 
     /// Serialize HOME mutations against every other `$HOME`-mutating test

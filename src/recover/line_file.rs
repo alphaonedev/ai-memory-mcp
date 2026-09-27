@@ -819,11 +819,7 @@ mod tests {
     use std::io::Write;
 
     fn fresh_dir() -> tempfile::TempDir {
-        let root = std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join(".local-runs")
-            .join("issue-3587-u2-line-file");
-        std::fs::create_dir_all(&root).ok();
+        let root = crate::test_support::local_runs_root("issue-3587-u2-line-file");
         tempfile::tempdir_in(&root).expect("tempdir under .local-runs")
     }
 

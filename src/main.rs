@@ -979,8 +979,8 @@ mod tests {
         let _ = ai_memory::identity::test_key_dir::install();
         // Scratch under the repo's gitignored .local-runs/ per the
         // project no-/tmp HARD RULE.
-        let root = std::env::current_dir()
-            .unwrap_or_else(|_| std::path::PathBuf::from("."))
+        // Anchored on CARGO_MANIFEST_DIR, never the mutable process cwd.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join(".local-runs")
             .join("main-init-forensic-audit");
         std::fs::create_dir_all(&root).ok();

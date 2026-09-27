@@ -1084,11 +1084,7 @@ mod tests {
 
     /// In-tree scratch root honoring the project no-`/tmp` HARD RULE.
     fn fresh_dir() -> tempfile::TempDir {
-        let root = std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join(".local-runs")
-            .join("issue-1978-poll-watcher-unit-test");
-        std::fs::create_dir_all(&root).ok();
+        let root = crate::test_support::local_runs_root("issue-1978-poll-watcher-unit-test");
         tempfile::tempdir_in(&root).expect("tempdir under .local-runs")
     }
 

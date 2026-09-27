@@ -48,9 +48,15 @@ pub fn id_short(id: &str) -> &str {
 /// consumed by NO CLI path; every command fell straight through to
 /// the git/cwd inference.
 pub fn resolve_namespace(explicit: Option<String>) -> String {
+    resolve_namespace_in(explicit, None)
+}
+
+/// [`resolve_namespace`] with the inference step run against `dir` instead
+/// of the process current directory (see [`auto_namespace_in`]).
+pub fn resolve_namespace_in(explicit: Option<String>, dir: Option<&std::path::Path>) -> String {
     explicit
         .or_else(crate::config::configured_default_namespace)
-        .unwrap_or_else(auto_namespace)
+        .unwrap_or_else(|| auto_namespace_in(dir))
 }
 
 /// Best-effort namespace resolver:
@@ -58,15 +64,26 @@ pub fn resolve_namespace(explicit: Option<String>) -> String {
 /// 2. `current_dir`'s file_name component
 /// 3. The literal "global" fallback
 pub fn auto_namespace() -> String {
+    auto_namespace_in(None)
+}
+
+/// [`auto_namespace`] inferred from `dir` (`None` = the process current
+/// directory). `git` runs with `dir` as ITS working directory and the
+/// basename fallback reads `dir`; the process cwd is never changed. Before
+/// this, `ai-memory boot --cwd <dir>` called `set_current_dir(dir)` on the
+/// whole process to reach the same answer, silently ignoring a failure.
+pub fn auto_namespace_in(dir: Option<&std::path::Path>) -> String {
     // #1937 V08-PE-3 — route the production `git` spawn through the audited
     // chokepoint so it emits a signed `process.spawn_audited` row (argv0 +
     // caller). Best-effort: the audit never blocks namespace resolution.
-    if let Ok(out) =
-        crate::spawn_audit::audited_command("git", crate::spawn_audit::CALLER_CLI_NAMESPACE_GIT)
-            .args(["remote", "get-url", "origin"])
-            .stderr(std::process::Stdio::null())
-            .output()
-    {
+    let mut git =
+        crate::spawn_audit::audited_command("git", crate::spawn_audit::CALLER_CLI_NAMESPACE_GIT);
+    git.args(["remote", "get-url", "origin"])
+        .stderr(std::process::Stdio::null());
+    if let Some(dir) = dir {
+        git.current_dir(dir);
+    }
+    if let Ok(out) = git.output() {
         let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
         if !url.is_empty()
             && let Some(name) = url.rsplit('/').next()
@@ -77,8 +94,8 @@ pub fn auto_namespace() -> String {
             }
         }
     }
-    std::env::current_dir()
-        .ok()
+    dir.map(std::path::Path::to_path_buf)
+        .or_else(|| std::env::current_dir().ok())
         .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
         .unwrap_or_else(|| crate::DEFAULT_NAMESPACE.to_string())
 }
@@ -265,143 +282,66 @@ mod tests {
     }
 
     // ---------- E1 coverage uplift -----------------------------------
-    // The git-fallback paths (lines 56-62) only fire when the cwd is
-    // not a git repo. We exercise them in a child process whose cwd is
-    // a fresh tempdir so the parent's cwd isn't disturbed.
+    // The git-fallback paths only fire outside a git repo. They are driven
+    // through `auto_namespace_in(Some(dir))`, which never changes the
+    // process cwd (#4016): changing it moved every concurrently running
+    // test in the lib binary, and #4015 is what that did to fixture roots.
 
-    #[test]
-    fn test_auto_namespace_outside_git_repo_uses_dirname() {
-        // Spawn the test binary as a child with cwd set to a temp dir
-        // that is NOT a git repo. The child runs the same `auto_namespace`
-        // logic and prints its result on stdout. We assert the parent's
-        // observation matches the temp dir's basename (the current_dir
-        // fallback) — which exercises lines 56-62.
-        //
-        // We avoid changing cwd in the parent process — that would race
-        // with sibling tests. Instead we shell out to a tiny rust program
-        // — but that's heavy. The pure-test path is the
-        // `std::env::set_current_dir` mutation guarded by a process-wide
-        // mutex. Tests in the helpers module use no cwd-dependent state,
-        // so this is safe.
-        let tmp = tempfile::tempdir().expect("tempdir");
-        // Process-wide cwd mutation; serialize against any other test
-        // that touches cwd in the same binary. Capture cwd AFTER the
-        // lock to avoid reading a transient state set by a sibling test.
-        let _g = cwd_lock();
-        let saved_cwd = match std::env::current_dir() {
-            Ok(p) => p,
-            // A sibling test under this lock may have set cwd to a now-
-            // deleted tempdir; fall back to the worktree root so the
-            // restore at the end of this test still lands on a real path.
-            Err(_) => std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")),
-        };
-        std::env::set_current_dir(tmp.path()).expect("set cwd");
-        let ns = auto_namespace();
-        // Restore BEFORE asserting so a panic doesn't pollute the
-        // process-wide cwd.
-        std::env::set_current_dir(&saved_cwd).expect("restore cwd");
-        // `tmp.path()` ends with the tempdir's basename — auto_namespace
-        // must surface either that basename (current_dir branch) or
-        // "global" (file_name None on a root). It must NEVER return
-        // empty.
-        assert!(!ns.is_empty());
-        // The git path can still succeed when invoked outside a repo:
-        // some CI environments configure a global git remote. We don't
-        // pin the exact value — only that the helper is total.
+    /// Run `f` with `GIT_CEILING_DIRECTORIES=ceiling`, so git stops its
+    /// parent walk there and cannot find an enclosing repo (a `TMPDIR` that
+    /// happens to sit inside a checkout would otherwise answer with that
+    /// checkout's name). The variable is process-wide, so it is set and
+    /// restored under the ONE env lock.
+    fn with_git_ceiling<T>(ceiling: &std::path::Path, f: impl FnOnce() -> T) -> T {
+        let _env = crate::test_support::env_lock();
+        let saved = std::env::var_os("GIT_CEILING_DIRECTORIES");
+        // SAFETY: process-wide env mutation, serialized by `env_lock`.
+        unsafe {
+            std::env::set_var("GIT_CEILING_DIRECTORIES", ceiling);
+        }
+        let out = f();
+        // SAFETY: serialized by `env_lock`; restored before any assertion.
+        unsafe {
+            match saved {
+                Some(v) => std::env::set_var("GIT_CEILING_DIRECTORIES", v),
+                None => std::env::remove_var("GIT_CEILING_DIRECTORIES"),
+            }
+        }
+        out
     }
 
-    /// Process-wide cwd guard. `auto_namespace` reads `current_dir`;
-    /// other tests in this module also read it. A `Mutex` serializes
-    /// concurrent set_current_dir calls within the test binary so
-    /// tests can swap cwd without racing.
-    fn cwd_lock() -> std::sync::MutexGuard<'static, ()> {
-        use std::sync::{Mutex, OnceLock};
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    // ----------------------------------------------------------------
-    // C-3 coverage uplift — drive the fallback path (lines 59-62) by
-    // pointing git at a path it cannot resolve as a repo. We force the
-    // `git remote get-url origin` invocation to fail by setting
-    // `GIT_CEILING_DIRECTORIES` to the system root so git's parent
-    // walk terminates immediately, and we pin the cwd at the tempdir.
-    // ----------------------------------------------------------------
-
     #[test]
-    fn test_auto_namespace_falls_back_to_dirname_when_git_fails() {
-        // Snapshot env vars and CWD; restore even on panic via the guard.
-        let _g = cwd_lock();
-        let saved_cwd = std::env::current_dir()
-            .unwrap_or_else(|_| std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")));
-        let saved_ceiling = std::env::var("GIT_CEILING_DIRECTORIES").ok();
-
+    fn auto_namespace_in_uses_the_dirname_outside_a_git_repo_4016() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let inner = tmp.path().join("scratch-dir-12345");
+        let inner = tmp.path().join("scratch-dir-4016");
         std::fs::create_dir_all(&inner).expect("mkdir inner");
+        let cwd_before = std::env::current_dir().ok();
 
-        // Force git to bail before it can walk up to a real repo.
-        // `GIT_CEILING_DIRECTORIES` makes git treat the listed paths
-        // as boundaries it MUST NOT cross when searching for a .git.
-        // Pointing it at the parent of the tempdir means the walk
-        // terminates with no repo found.
-        // SAFETY: process-wide env mutation is serialized by `cwd_lock`.
-        unsafe {
-            std::env::set_var("GIT_CEILING_DIRECTORIES", tmp.path());
-        }
-        std::env::set_current_dir(&inner).expect("set cwd");
+        let ns = with_git_ceiling(tmp.path(), || auto_namespace_in(Some(&inner)));
 
-        let ns = auto_namespace();
-
-        // Restore BEFORE asserting so a panic can't leak the env change.
-        std::env::set_current_dir(&saved_cwd).expect("restore cwd");
-        // SAFETY: serialized via `cwd_lock`.
-        unsafe {
-            match saved_ceiling {
-                Some(v) => std::env::set_var("GIT_CEILING_DIRECTORIES", v),
-                None => std::env::remove_var("GIT_CEILING_DIRECTORIES"),
-            }
-        }
-
-        // Either we hit the dirname branch (lines 59-62: "scratch-dir-12345")
-        // or git still succeeded somehow and produced a non-empty value.
-        // The contract `auto_namespace` enforces is non-empty; that's what
-        // we pin. In practice on a Linux/macOS box with no global git
-        // remote, the dirname is what we see.
-        assert!(!ns.is_empty(), "auto_namespace must be total");
+        assert_eq!(ns, "scratch-dir-4016", "the dirname fallback names the dir");
+        assert_eq!(
+            std::env::current_dir().ok(),
+            cwd_before,
+            "inferring a namespace for a dir must not move the process cwd"
+        );
     }
 
     #[test]
-    fn test_auto_namespace_dirname_branch_via_root_cwd() {
-        // Force-cd to "/" which has no file_name() component — exercises
-        // the `unwrap_or_else(|| "global".to_string())` arm of line 62.
-        // Combined with `GIT_CEILING_DIRECTORIES = /`, git also fails,
-        // so both branches in the fallback chain are observed.
-        let _g = cwd_lock();
-        let saved_cwd = std::env::current_dir()
-            .unwrap_or_else(|_| std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")));
-        let saved_ceiling = std::env::var("GIT_CEILING_DIRECTORIES").ok();
+    fn auto_namespace_in_falls_back_to_the_default_on_a_root_dir_4016() {
+        // `/` has no file_name(), and with the ceiling at `/` git finds no
+        // repo, so both fallbacks are exhausted.
+        let root = std::path::Path::new("/");
+        let ns = with_git_ceiling(root, || auto_namespace_in(Some(root)));
+        assert_eq!(ns, crate::DEFAULT_NAMESPACE);
+    }
 
-        // SAFETY: serialized via `cwd_lock`.
-        unsafe {
-            std::env::set_var("GIT_CEILING_DIRECTORIES", "/");
-        }
-        std::env::set_current_dir("/").expect("cd /");
-
-        let ns = auto_namespace();
-
-        std::env::set_current_dir(&saved_cwd).expect("restore cwd");
-        // SAFETY: serialized via `cwd_lock`.
-        unsafe {
-            match saved_ceiling {
-                Some(v) => std::env::set_var("GIT_CEILING_DIRECTORIES", v),
-                None => std::env::remove_var("GIT_CEILING_DIRECTORIES"),
-            }
-        }
-
-        // The helper is total — must return non-empty.
-        assert!(!ns.is_empty(), "auto_namespace must be total");
+    #[test]
+    fn resolve_namespace_in_prefers_the_explicit_value_4014() {
+        let root = std::path::Path::new("/");
+        assert_eq!(
+            resolve_namespace_in(Some("explicit-ns".to_string()), Some(root)),
+            "explicit-ns"
+        );
     }
 }

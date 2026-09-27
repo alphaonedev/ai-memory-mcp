@@ -1106,12 +1106,20 @@ mod tests {
     }
 
     #[tokio::test]
+    // The cwd lock is held across the await ON PURPOSE: the relative path is
+    // resolved inside `open_store`, so the cwd must stay put until it
+    // returns. The test runtime is current-thread, so nothing else in this
+    // test needs the lock while it waits.
+    #[allow(clippy::await_holding_lock)]
     async fn open_store_sqlite_with_three_slashes() {
         // sqlite:///path → absolute path (already covered).
         // sqlite://./relative → relative; we cover the `else` branch in
         // open_store's path-strip closure (line 106).
         // Use a relative path under a CWD-private tempdir so it cleans up.
         let tmp = tempfile::tempdir().unwrap();
+        // #4016: the process cwd is shared by every test in this binary;
+        // hold the ONE cwd lock for the whole relative-path window.
+        let _cwd = crate::test_support::cwd_lock();
         let cwd = std::env::current_dir().unwrap();
         std::env::set_current_dir(tmp.path()).unwrap();
         let result = open_store("sqlite://./relative.db").await;

@@ -480,11 +480,7 @@ mod tests {
     use crate::signed_events::{SignedEvent, append_signed_event, payload_hash};
 
     fn fresh_conn() -> Connection {
-        let root = std::env::current_dir()
-            .unwrap_or_else(|_| std::path::PathBuf::from("."))
-            .join(".local-runs")
-            .join("issue-2006-emit");
-        std::fs::create_dir_all(&root).ok();
+        let root = crate::test_support::local_runs_root("issue-2006-emit");
         let dir = tempfile::Builder::new()
             .prefix("emit-")
             .tempdir_in(&root)

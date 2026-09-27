@@ -7519,11 +7519,7 @@ enabled = true
     /// reports the reembed-pending / unverified counts.
     #[test]
     fn embedding_space_census_warns_on_heterogeneous_corpus_2167() {
-        let dir = std::env::current_dir()
-            .unwrap_or_else(|_| std::path::PathBuf::from("."))
-            .join(".local-runs")
-            .join("doctor-census-2167");
-        std::fs::create_dir_all(&dir).ok();
+        let dir = crate::test_support::local_runs_root("doctor-census-2167");
         let path = dir.join(format!("{}.db", uuid::Uuid::new_v4()));
         let conn = db::open(&path).expect("open db");
 

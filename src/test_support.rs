@@ -74,6 +74,43 @@ pub(crate) fn env_mutex() -> &'static Mutex<()> {
     crate::config::test_env_mutex()
 }
 
+/// The ONE process-wide lock for the process current directory.
+///
+/// `std::env::set_current_dir` changes a value every thread in the lib test
+/// binary reads. Any test that changes the cwd holds this lock for as long
+/// as the cwd differs from its saved value, and so does any test whose
+/// assertion depends on the cwd staying put between two reads. Before this
+/// lock existed, `cli::helpers` had a private one, while `cli::boot` and
+/// `migrate` changed the cwd with no lock at all, so the private lock
+/// excluded nobody else.
+///
+/// A poisoned lock is recovered: the panicking test's restore already ran,
+/// or the next holder saves whatever cwd it finds.
+pub(crate) fn cwd_lock() -> MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// `<repo>/.local-runs/<tag>`, created if absent. This is the in-tree
+/// scratch root the project's no-`/tmp` rule requires.
+///
+/// The path is anchored on `CARGO_MANIFEST_DIR`, fixed at compile time,
+/// and NEVER on `std::env::current_dir()`. A fixture root built from the
+/// cwd resolves against whatever directory a concurrent test has switched
+/// the process to. That may be `/`, or a tempdir that is deleted by the
+/// time the fixture opens its database: four `recover::tests` cells failed
+/// that way under a full parallel lib run with `DbOpen("failed to open
+/// database")` and zero writes, and each passed alone.
+pub(crate) fn local_runs_root(tag: &str) -> PathBuf {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join(".local-runs")
+        .join(tag);
+    std::fs::create_dir_all(&root).expect("create the .local-runs fixture root");
+    root
+}
+
 /// Snapshot+restore guard for a single process-wide environment variable, so a
 /// test never leaks its mutation into a sibling test in the same binary.
 ///

@@ -190,17 +190,15 @@ pub struct BootArgs {
 
 /// Resolve the boot namespace. Explicit `--namespace` wins; otherwise
 /// `auto_namespace` runs against the optional `--cwd` (or the current
-/// process's CWD if unset).
+/// process's CWD if unset). `--cwd` is passed to the resolver; the process
+/// cwd is never changed.
 fn resolve_namespace(args: &BootArgs) -> String {
     if let Some(ref ns) = args.namespace {
         return ns.clone();
     }
-    if let Some(ref cwd) = args.cwd {
-        let _ = std::env::set_current_dir(cwd);
-    }
     // #1590 — configured [storage].default_namespace beats the git/cwd
     // inference; unconfigured deployments keep the historical ladder.
-    crate::cli::helpers::resolve_namespace(None)
+    crate::cli::helpers::resolve_namespace_in(None, args.cwd.as_deref())
 }
 
 /// Pull the boot set from the DB. Two-stage:
@@ -2383,9 +2381,9 @@ mod tests {
 
     #[test]
     fn boot_resolve_namespace_with_cwd_override() {
-        // Hits resolve_namespace's `set_current_dir(cwd)` branch
-        // (line 178). The override doesn't have to land on a git repo —
-        // the resolver swallows the result.
+        // #4014: `--cwd` is handed to the resolver; the process cwd is never
+        // changed. Pre-fix this called `set_current_dir(--cwd)` on the whole
+        // process and ignored a failure.
         let _g = test_lock();
         unsafe {
             std::env::remove_var("AI_MEMORY_BOOT_ENABLED");
@@ -2396,12 +2394,18 @@ mod tests {
         let cfg = default_config();
         let mut args = default_args();
         args.cwd = Some(tmp.path().to_path_buf());
+        // Hold the ONE cwd lock so no other test moves the cwd between the
+        // two reads; a change observed here can only be this run's.
+        let _cwd = crate::test_support::cwd_lock();
+        let cwd_before = std::env::current_dir().ok();
         // namespace is None so resolve_namespace falls into the cwd branch.
-        let saved_cwd = std::env::current_dir().unwrap();
         let mut out = env.output();
         run(&db_path, &args, &cfg, &mut out).unwrap();
-        // Restore so subsequent tests aren't perturbed.
-        std::env::set_current_dir(&saved_cwd).unwrap();
+        assert_eq!(
+            std::env::current_dir().ok(),
+            cwd_before,
+            "boot --cwd must not change the process current directory (#4014)"
+        );
         let stdout = std::str::from_utf8(&env.stdout).unwrap();
         // The header surfaces *some* namespace; we don't pin which.
         assert!(stdout.contains("# ai-memory boot"));

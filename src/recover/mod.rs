@@ -861,11 +861,7 @@ mod tests {
     /// Tempdirs land under the repo's gitignored `.local-runs/`, never
     /// on a tmpfs path.
     fn fresh_dir() -> tempfile::TempDir {
-        let root = std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join(".local-runs")
-            .join("issue-1389-recover-unit-test");
-        std::fs::create_dir_all(&root).ok();
+        let root = crate::test_support::local_runs_root("issue-1389-recover-unit-test");
         tempfile::tempdir_in(&root).expect("tempdir under .local-runs")
     }
 

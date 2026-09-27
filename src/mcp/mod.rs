@@ -15084,6 +15084,9 @@ mod tests {
         // branch — that's an inherent property of the function under
         // test, not a test bug. We early-return-with-pass if cwd
         // doesn't satisfy the property so the test stays hermetic.
+        // The function under test reads the cwd again; hold the ONE cwd
+        // lock (#4016) so both reads see the same directory.
+        let _cwd = crate::test_support::cwd_lock();
         let cwd = match std::env::current_dir() {
             Ok(c) => c,
             Err(_) => return,
