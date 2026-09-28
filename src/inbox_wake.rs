@@ -79,10 +79,12 @@ static WAKE_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// One frame on the inbox wake bus.
 ///
-/// Serialised with an external `event` tag so the SSE wire shape
-/// matches [`crate::approvals::ApprovalEvent`] (`{"event":
-/// "agent_notified", …}`) and a client can demultiplex both streams
-/// with the same parser.
+/// Serialised with an `event` tag so it matches
+/// [`crate::approvals::ApprovalEvent`] (`{"event": "agent_notified", …}`)
+/// and a client can demultiplex both streams with the same parser. The
+/// SSE stream does NOT serialise this type directly: it sends a
+/// tenant-safe projection with the same `event` tag and without the
+/// process-wide `seq` (#4071, `handlers::inbox_stream`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum InboxEvent {
@@ -95,6 +97,12 @@ pub enum InboxEvent {
         /// [`seq_high_watermark`]) to size the gap exactly, then does one
         /// catch-up inbox read. Sequences are per-process and reset on
         /// restart; they order wakes, they do not identify them.
+        ///
+        /// INTERNAL ONLY (#4071): the counter is shared by every recipient,
+        /// so the gap between two of one tenant's values measures OTHER
+        /// tenants' notify volume. The inbox SSE stream projects the event
+        /// through a wire DTO that omits it; any new tenant-facing surface
+        /// must do the same.
         seq: u64,
         /// Inbox owner. The ONLY agent this frame may ever be shown to.
         recipient_agent_id: String,
