@@ -181,6 +181,13 @@ fn counters_are_exact_under_concurrent_writes() {
             let path = path.clone();
             s.spawn(move || {
                 let conn = db::open(&path).expect("worker open");
+                // #4117 — under heavy node load a writer can wait longer than
+                // `db::open`'s 5 s busy_timeout for the single SQLite write
+                // lock and get SQLITE_BUSY: a correct REFUSAL, not a lost
+                // update. This cell pins counter EXACTNESS under contention,
+                // so contention must WAIT here rather than refuse.
+                conn.pragma_update(None, "busy_timeout", 60_000)
+                    .expect("worker busy_timeout");
                 for i in 0..PER_THREAD {
                     // Distinct ids so every insert is a genuine new row (a
                     // (title,namespace) merge would still meter, but distinct
@@ -235,6 +242,12 @@ fn recall_counters_are_exact_under_concurrent_recalls() {
             let b = b.clone();
             s.spawn(move || {
                 let conn = db::open(&path).expect("worker open");
+                // #4117 (f2r) — same 8-writer exposure as the write cell: each
+                // recall appends a metering row, and record_recall_sqlite swallows
+                // SQLITE_BUSY at debug, so a lock timeout here would surface as a
+                // COUNT MISMATCH (silent metering loss is #4124). Wait, do not refuse.
+                conn.pragma_update(None, "busy_timeout", 60_000)
+                    .expect("worker busy_timeout");
                 for _ in 0..PER_THREAD {
                     cost::record_recall_sqlite(&conn, &[(a.clone(), 0.9), (b.clone(), 0.8)]);
                 }
