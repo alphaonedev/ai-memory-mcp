@@ -31,8 +31,10 @@
 //! SAFE direction (a revoke NARROWS it before anything else can fail, a bind
 //! WIDENS it only after the durable row exists), and a full authoritative
 //! re-read follows through
-//! [`crate::handlers::identity_binding::apply_agent_key_refresh`], whose
-//! keep-last-known degrade rule applies unchanged.
+//! [`crate::handlers::identity_binding::refresh_agent_keys`], whose
+//! keep-last-known degrade rule applies unchanged. Every registry change is an
+//! atomic transform that also supersedes any refresh whose store read began
+//! before it, so a stale read can never re-arm a revoked key (#4066).
 //!
 //! # The controls, and what each one is actually for
 //!
@@ -1041,35 +1043,74 @@ async fn store_approve(app: &AppState, id: &str, approver: &str) -> Result<Appro
 // Live-registry maintenance
 // ---------------------------------------------------------------------------
 
+/// How the LIVE registry moves after a durable credential write.
+#[derive(Debug, Clone, Copy)]
+enum RegistryChange<'a> {
+    /// A bind of `digest` to `agent`. `ticket` MUST have been taken BEFORE the
+    /// durable bind was written (#4066): the optimistic insert is only safe if
+    /// no revoke was published in between.
+    Bind {
+        ticket: crate::handlers::identity_binding::LoadTicket,
+        digest: &'a str,
+        agent: &'a str,
+    },
+    /// Every key bound to this agent was durably revoked.
+    RevokeAgent(&'a str),
+}
+
+/// Bounded re-reads when an authoritative load keeps being overtaken by other
+/// credential writes. Past it the background refresh converges; the map the
+/// mutations published is already correct for every write they reflect.
+const REFRESH_ATTEMPTS: usize = 3;
+
 /// Move the LIVE registry after a durable write, then re-read authoritatively.
 ///
-/// The two steps are ordered so the SAFE direction lands first and cannot be
-/// lost to a read failure:
+/// The steps are ordered so the SAFE direction lands first and cannot be lost
+/// to a read failure or a concurrent refresh:
 ///
-/// * `remove_agent` (a revoke) NARROWS the snapshot before anything else runs,
-///   so the revoked credential stops authenticating on the very next request
-///   even if the store is then unreachable;
-/// * `add` (a bind) WIDENS it only after the durable row exists, so the
-///   in-memory map can never claim a binding the store does not have.
+/// * a revoke NARROWS the published map with an atomic transform
+///   ([`crate::handlers::identity_binding::EnrolledAgentKeys::mutate`]) before
+///   anything else runs, so the revoked credential stops authenticating on
+///   the very next request even if the store is then unreachable. The
+///   transform bumps the registry's mutation epoch, so any refresh whose read
+///   began before it — the background loop's or another handler's — is
+///   discarded instead of re-publishing the revoked key (#4066);
+/// * a bind WIDENS it only after the durable row exists, and only if no other
+///   mutation was published since the bind's pre-write ticket — otherwise
+///   the insert could re-arm a key a racing revoke already removed, so it is
+///   skipped and the authoritative re-read below decides.
 ///
-/// The authoritative re-read follows through
-/// [`crate::handlers::identity_binding::apply_agent_key_refresh`], which keeps
-/// the last known snapshot on a failed read rather than installing an empty
-/// map — installing empty would silently disarm the identity gate ([#3418]).
-async fn refresh_registry(app: &AppState, add: Option<(&str, &str)>, remove_agent: Option<&str>) {
+/// The authoritative re-read goes through
+/// [`crate::handlers::identity_binding::refresh_agent_keys`], which keeps the
+/// last known snapshot on a failed read rather than installing an empty map —
+/// installing empty would silently disarm the identity gate ([#3418]).
+async fn refresh_registry(app: &AppState, change: RegistryChange<'_>) {
     let registry = &app.enrolled_agent_keys;
-    if add.is_some() || remove_agent.is_some() {
-        let mut map = (*registry.snapshot()).clone();
-        if let Some(agent) = remove_agent {
-            map.retain(|_, bound| bound != agent);
+    match change {
+        RegistryChange::RevokeAgent(agent) => {
+            registry.mutate(|map| map.retain(|_, bound| bound != agent));
         }
-        if let Some((digest, agent)) = add {
-            map.insert(digest.to_string(), agent.to_string());
+        RegistryChange::Bind {
+            ticket,
+            digest,
+            agent,
+        } => {
+            let _ = registry.mutate_if_current(ticket, |map| {
+                map.insert(digest.to_string(), agent.to_string());
+            });
         }
-        registry.install(map);
     }
-    let loaded = load_enrolled(app).await;
-    let _ = crate::handlers::identity_binding::apply_agent_key_refresh(registry, loaded);
+    for _ in 0..REFRESH_ATTEMPTS {
+        let outcome =
+            crate::handlers::identity_binding::refresh_agent_keys(registry, || load_enrolled(app))
+                .await;
+        if !matches!(
+            outcome,
+            crate::handlers::identity_binding::AgentKeyRefresh::Superseded(_)
+        ) {
+            break;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1282,6 +1323,8 @@ pub async fn mint_agent_api_key(
         };
     }
 
+    // #4066 — the ticket precedes the durable write; see `RegistryChange::Bind`.
+    let bind_ticket = app.enrolled_agent_keys.begin_load();
     match store_bind(&app, &caller, &agent_id, &digest).await {
         // v1.0.0 #3535 — a fresh bind and an idempotent re-assertion of the
         // SAME (agent, digest) pair are one answer on the wire; the second is
@@ -1305,7 +1348,15 @@ pub async fn mint_agent_api_key(
             return resp;
         }
     }
-    refresh_registry(&app, Some((&digest, &agent_id)), None).await;
+    refresh_registry(
+        &app,
+        RegistryChange::Bind {
+            ticket: bind_ticket,
+            digest: &digest,
+            agent: &agent_id,
+        },
+    )
+    .await;
     audit(
         &caller,
         "allow",
@@ -1386,7 +1437,7 @@ pub async fn revoke_agent_api_key(
 
     match store_revoke_unless_last(&app, &caller, &agent_id).await {
         Ok(crate::storage::RevokeUnlessLastOutcome::Revoked { bindings_removed }) => {
-            refresh_registry(&app, None, Some(&agent_id)).await;
+            refresh_registry(&app, RegistryChange::RevokeAgent(&agent_id)).await;
             audit(
                 &caller,
                 "allow",
@@ -1701,6 +1752,8 @@ async fn apply_approved(
             (Some(token), digest)
         }
     };
+    // #4066 — the ticket precedes the durable write; see `RegistryChange::Bind`.
+    let bind_ticket = app.enrolled_agent_keys.begin_load();
     match store_bind(app, caller, agent_id, &digest).await {
         Ok(
             crate::storage::BindApiKeyOutcome::Bound
@@ -1727,7 +1780,15 @@ async fn apply_approved(
             return resp;
         }
     }
-    refresh_registry(app, Some((&digest, agent_id)), None).await;
+    refresh_registry(
+        app,
+        RegistryChange::Bind {
+            ticket: bind_ticket,
+            digest: &digest,
+            agent: agent_id,
+        },
+    )
+    .await;
     audit(
         caller,
         "allow",
@@ -1821,7 +1882,7 @@ async fn apply_approved_revoke(
             Err(resp) => return resp,
         }
     };
-    refresh_registry(app, None, Some(agent_id)).await;
+    refresh_registry(app, RegistryChange::RevokeAgent(agent_id)).await;
     audit(
         caller,
         "allow",

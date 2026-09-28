@@ -80,7 +80,7 @@ async fn enroll_and_revoke_reach_the_live_registry(store: &Arc<dyn MemoryStore>,
          re-point cannot read as a successful enrolment"
     );
     let rows = store.list_agent_api_keys().await.map_err(|e| e.to_string());
-    let outcome = apply_agent_key_refresh(&registry, rows);
+    let outcome = apply_agent_key_refresh(&registry, registry.begin_load(), rows);
     assert!(
         matches!(outcome, AgentKeyRefresh::Installed(n) if n >= 1),
         "the refresh must install the freshly enrolled key, got {outcome:?}"
@@ -98,7 +98,7 @@ async fn enroll_and_revoke_reach_the_live_registry(store: &Arc<dyn MemoryStore>,
         .expect("revoke_agent_api_key");
     assert!(removed >= 1, "the binding we just wrote must be removed");
     let rows = store.list_agent_api_keys().await.map_err(|e| e.to_string());
-    let outcome = apply_agent_key_refresh(&registry, rows);
+    let outcome = apply_agent_key_refresh(&registry, registry.begin_load(), rows);
     assert!(
         matches!(outcome, AgentKeyRefresh::Installed(_)),
         "a revocation is a change the refresh must install, got {outcome:?}"

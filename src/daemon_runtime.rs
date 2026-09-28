@@ -7498,22 +7498,23 @@ pub async fn bootstrap_serve(
             ticker.tick().await;
             loop {
                 ticker.tick().await;
-                // Each backend reads with its own error type; both normalise to
-                // a display string so ONE funnel
-                // (`identity_binding::apply_agent_key_refresh`) owns the
-                // install-or-keep decision for every backend, and the
-                // degrade rule is stated once instead of per adapter.
+                // Both backends normalise errors to a string so ONE funnel
+                // (`identity_binding::refresh_agent_keys`) owns ticket → read
+                // → install-or-keep; a read a revoke overtook is discarded,
+                // never re-arming the revoked key (#4066).
                 #[cfg(feature = "sal")]
-                let loaded = refresh_store
-                    .list_agent_api_keys()
-                    .await
-                    .map_err(|e| e.to_string());
+                let load = || async {
+                    refresh_store
+                        .list_agent_api_keys()
+                        .await
+                        .map_err(|e| e.to_string())
+                };
                 #[cfg(not(feature = "sal"))]
-                let loaded = {
+                let load = || async {
                     let guard = refresh_db.lock().await;
                     crate::db::list_agent_api_keys(&guard.0).map_err(|e| e.to_string())
                 };
-                crate::handlers::identity_binding::apply_agent_key_refresh(&registry, loaded);
+                crate::handlers::identity_binding::refresh_agent_keys(&registry, load).await;
             }
         }));
     }
