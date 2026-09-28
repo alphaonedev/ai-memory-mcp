@@ -56,6 +56,7 @@
 
 use anyhow::Result;
 use rusqlite::Connection;
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 
 /// Env var selecting the inference-plane egress posture.
 pub const ENV_INFERENCE_EGRESS: &str = "AI_MEMORY_INFERENCE_EGRESS";
@@ -113,6 +114,13 @@ pub enum InferenceEgressMode {
     LoopbackOnly,
     /// Every inference-plane egress is refused (air-gapped posture).
     Deny,
+    /// #3822 (5-agent vote 4d3ea1c5, option A) — every resolved address of the
+    /// target must be an INTERNAL address (loopback / RFC1918 / RFC4193 ULA /
+    /// RFC6598 CGNAT), none link-local/multicast/broadcast/unspecified, and
+    /// none a known cloud-metadata literal — after `normalize_ip`. Requires
+    /// DNS resolution (resolve-then-pin); a DNS-rebind or any public address in
+    /// the set is refused. External-vendor egress is refused.
+    InternalOnly,
 }
 
 impl InferenceEgressMode {
@@ -123,6 +131,7 @@ impl InferenceEgressMode {
             Self::Allow => "allow",
             Self::LoopbackOnly => "loopback-only",
             Self::Deny => "deny",
+            Self::InternalOnly => "internal-only",
         }
     }
 
@@ -140,6 +149,7 @@ impl InferenceEgressMode {
                 Some(Self::LoopbackOnly)
             }
             "deny" | "refuse" | "none" => Some(Self::Deny),
+            "internal-only" | "internal_only" | "internal" => Some(Self::InternalOnly),
             _ => None,
         }
     }
@@ -244,16 +254,12 @@ fn host_of(base_url: &str) -> Option<String> {
     let after_scheme = base_url
         .split_once("://")
         .map_or(base_url, |(_, rest)| rest);
-    // Authority ends at the first `/`, `?`, or `#`.
-    let authority = after_scheme
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or(after_scheme);
-    if authority.is_empty() {
+    // #3744 (A4) — ONE userinfo-stripping helper shared with the subscriptions
+    // SSRF lane, so egress and the webhook guard read the identical host.
+    let host_port = crate::subscriptions::authority_without_userinfo(after_scheme);
+    if host_port.is_empty() {
         return None;
     }
-    // Strip userinfo (`user:pass@host`).
-    let host_port = authority.rsplit_once('@').map_or(authority, |(_, hp)| hp);
     // Strip the port. IPv6 literals are bracketed, so a `]` guards the
     // port split from eating a `:` inside the address.
     let host = if let Some(end) = host_port.find(']') {
@@ -348,6 +354,217 @@ pub fn evaluate_inference_egress(
                 }
             }
         }
+        // #3822 (A5) — TLS-first, then a NAME-based best-effort: an IP-literal
+        // host classifies without DNS; a hostname cannot, so the name-based
+        // path fails CLOSED and directs callers at `admit_inference_target`
+        // (the resolving entry point). The chokepoints use `admit_*`, so this
+        // arm is a defensive default, never the primary path.
+        InferenceEgressMode::InternalOnly => {
+            if let Some(refusal) = refuse_offhost_plaintext_inference_egress(class, base_url) {
+                return refusal;
+            }
+            match host_ip_literal(base_url) {
+                Some(ip) if addr_is_internal(ip) => EgressDecision::Allow,
+                Some(_) => EgressDecision::Refuse {
+                    class,
+                    target: base_url.to_string(),
+                    reason: format!(
+                        "inference-plane egress refused: {ENV_INFERENCE_EGRESS}=internal-only \
+                         but target IP literal is not an internal address ({class})",
+                        class = class.as_str()
+                    ),
+                },
+                None => EgressDecision::Refuse {
+                    class,
+                    target: base_url.to_string(),
+                    reason: format!(
+                        "inference-plane egress refused: {ENV_INFERENCE_EGRESS}=internal-only \
+                         requires DNS resolution of the target host to classify it; the \
+                         name-based gate fails closed ({class}) — use admit_inference_target",
+                        class = class.as_str()
+                    ),
+                },
+            }
+        }
+    }
+}
+
+/// #3822 — parse `base_url`'s host as an IP literal (bracket-stripped), or
+/// `None` for a DNS name. Used by the name-based [`evaluate_inference_egress`]
+/// `InternalOnly` arm (an IP-literal target classifies without DNS).
+fn host_ip_literal(base_url: &str) -> Option<IpAddr> {
+    let host = host_of(base_url)?;
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    bare.parse::<IpAddr>().ok()
+}
+
+/// #3822 — an address is INTERNAL iff, after `normalize_ip`, it is loopback /
+/// RFC1918 / RFC4193 ULA / RFC6598 CGNAT AND is not link-local/multicast/
+/// broadcast/unspecified AND is not a known cloud-metadata literal. The
+/// metadata check runs FIRST so `100.100.100.200` (inside the CGNAT /10) is
+/// refused — "metadata beats CGNAT". Reuses the subscriptions SSRF
+/// sub-predicates (#3822 A4) so egress and the webhook guard share one
+/// specificity leg.
+fn addr_is_internal(ip: IpAddr) -> bool {
+    use crate::subscriptions::{
+        is_cgnat, is_link_local_or_special, is_metadata_literal, is_rfc1918_or_ula, normalize_ip,
+    };
+    let ip = normalize_ip(ip);
+    if is_metadata_literal(ip) {
+        return false;
+    }
+    if is_link_local_or_special(ip) {
+        return false;
+    }
+    ip.is_loopback() || is_rfc1918_or_ula(ip) || is_cgnat(ip)
+}
+
+/// #3822 (A2) — the PURE resolved inference-egress gate: given the posture,
+/// class, target URL, and the addresses the target resolves to, decide. This
+/// is the pin surface — the tests inject `addrs`, so the decision is
+/// side-effect-free and DNS-free. `Allow` / `LoopbackOnly` / `Deny` ignore
+/// `addrs` and delegate to the name-based SSOT; `InternalOnly` requires EVERY
+/// address to be internal (empty set fails closed) after a TLS-first refusal.
+#[must_use]
+pub fn evaluate_inference_egress_resolved(
+    mode: InferenceEgressMode,
+    class: EgressClass,
+    url: &str,
+    addrs: &[SocketAddr],
+) -> EgressDecision {
+    match mode {
+        InferenceEgressMode::InternalOnly => {
+            // A5 — refuse off-host plaintext http FIRST (loopback http stays permitted).
+            if let Some(refusal) = refuse_offhost_plaintext_inference_egress(class, url) {
+                return refusal;
+            }
+            if addrs.is_empty() {
+                return EgressDecision::Refuse {
+                    class,
+                    target: url.to_string(),
+                    reason: format!(
+                        "inference-plane egress refused: {ENV_INFERENCE_EGRESS}=internal-only \
+                         and the target resolved to NO addresses — failing closed ({class})",
+                        class = class.as_str()
+                    ),
+                };
+            }
+            if addrs.iter().all(|sa| addr_is_internal(sa.ip())) {
+                EgressDecision::Allow
+            } else {
+                EgressDecision::Refuse {
+                    class,
+                    target: url.to_string(),
+                    reason: format!(
+                        "inference-plane egress refused: {ENV_INFERENCE_EGRESS}=internal-only \
+                         but the target resolves to a NON-internal address (public / DNS-rebind / \
+                         cloud-metadata literal) — every resolved address must be loopback / \
+                         RFC1918 / ULA / CGNAT ({class})",
+                        class = class.as_str()
+                    ),
+                }
+            }
+        }
+        // The name-based postures ignore the resolved addresses.
+        _ => evaluate_inference_egress(mode, class, url),
+    }
+}
+
+/// #3822 (A2) — a target admitted for pinning under [`InferenceEgressMode::InternalOnly`].
+/// `host` is the bracket/port-stripped host string reqwest's `.resolve(host, addr)`
+/// keys on; `addrs` are the boot-resolved addresses to pin.
+#[derive(Debug, Clone)]
+pub struct PinnedTarget {
+    /// The resolved host string (reqwest resolve key).
+    pub host: String,
+    /// The boot-resolved socket addresses to pin.
+    pub addrs: Vec<SocketAddr>,
+}
+
+/// #3822 (A2) — resolve the URL's authority to socket addresses. An IP literal
+/// resolves without DNS; a hostname uses the system resolver. Failure / empty
+/// set is an `Err` (fail CLOSED — `AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL` does
+/// NOT apply on this lane). Returns `(resolved_host, addrs)`.
+fn resolve_inference_authority(url: &str) -> Result<(String, Vec<SocketAddr>), String> {
+    let lower = url.to_ascii_lowercase();
+    let rest = lower.split_once("://").map_or(lower.as_str(), |(_, r)| r);
+    let host_port = crate::subscriptions::authority_without_userinfo(rest);
+    if host_port.is_empty() {
+        return Err("target URL has no authority to resolve".to_string());
+    }
+    // Bracket/port-stripped host (the reqwest resolve key), and a resolvable
+    // `host:port` (default 80 when the URL omits the port), mirroring the
+    // subscriptions SSRF lane's normalization.
+    let (resolved_host, resolv_target) =
+        if let Some(close) = host_port.strip_prefix('[').and(host_port.find(']')) {
+            let inner = host_port[1..close].to_string();
+            let after = &host_port[close + 1..];
+            let tgt = if after.starts_with(':') {
+                host_port.to_string()
+            } else {
+                crate::subscriptions::host_port_with_default_http_port(host_port)
+            };
+            (inner, tgt)
+        } else if let Some(idx) = host_port.rfind(':') {
+            (host_port[..idx].to_string(), host_port.to_string())
+        } else {
+            (
+                host_port.to_string(),
+                crate::subscriptions::host_port_with_default_http_port(host_port),
+            )
+        };
+    match resolv_target.to_socket_addrs() {
+        Ok(iter) => {
+            let addrs: Vec<SocketAddr> = iter.collect();
+            if addrs.is_empty() {
+                Err(format!(
+                    "target host {resolved_host} resolved to no addresses (internal-only fails closed)"
+                ))
+            } else {
+                Ok((resolved_host, addrs))
+            }
+        }
+        Err(e) => Err(format!(
+            "DNS resolution failed for {resolved_host}: {e} (internal-only fails CLOSED; AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL does not apply to the inference lane)"
+        )),
+    }
+}
+
+/// #3822 (A2) — the resolve-then-pin entry point the boot chokepoints call.
+/// Under [`InferenceEgressMode::InternalOnly`] it refuses off-host plaintext
+/// (A5), resolves the target (fail-closed), classifies every resolved address
+/// via [`evaluate_inference_egress_resolved`], and on `Allow` returns the
+/// [`PinnedTarget`] the caller pins into the reqwest client. Under the
+/// name-based postures it returns `Ok(None)` on allow (no pin) or `Err` on
+/// refuse, so callers thread one uniform path.
+///
+/// # Errors
+/// The refusal [`EgressDecision`] when the target is not admitted.
+pub fn admit_inference_target(
+    mode: InferenceEgressMode,
+    class: EgressClass,
+    url: &str,
+) -> std::result::Result<Option<PinnedTarget>, EgressDecision> {
+    match mode {
+        InferenceEgressMode::InternalOnly => {
+            if let Some(refusal) = refuse_offhost_plaintext_inference_egress(class, url) {
+                return Err(refusal);
+            }
+            let (host, addrs) =
+                resolve_inference_authority(url).map_err(|reason| EgressDecision::Refuse {
+                    class,
+                    target: url.to_string(),
+                    reason,
+                })?;
+            match evaluate_inference_egress_resolved(mode, class, url, &addrs) {
+                EgressDecision::Allow => Ok(Some(PinnedTarget { host, addrs })),
+                refusal => Err(refusal),
+            }
+        }
+        _ => match evaluate_inference_egress(mode, class, url) {
+            EgressDecision::Allow => Ok(None),
+            refusal => Err(refusal),
+        },
     }
 }
 
@@ -467,6 +684,129 @@ mod tests {
             Some(InferenceEgressMode::Deny)
         );
         assert_eq!(InferenceEgressMode::parse("garbage"), None);
+    }
+
+    #[test]
+    fn internal_only_parses_and_typo_still_denies_3822() {
+        // #3822 — the new token + its synonyms parse; the unrecognised-token
+        // arm is UNTOUCHED (still `None` → resolves to Deny, FBL-14).
+        assert_eq!(
+            InferenceEgressMode::parse("internal-only"),
+            Some(InferenceEgressMode::InternalOnly)
+        );
+        assert_eq!(
+            InferenceEgressMode::parse("internal_only"),
+            Some(InferenceEgressMode::InternalOnly)
+        );
+        assert_eq!(
+            InferenceEgressMode::parse("internal"),
+            Some(InferenceEgressMode::InternalOnly)
+        );
+        assert_eq!(InferenceEgressMode::InternalOnly.as_str(), "internal-only");
+        // presence controls: near-miss tokens still fail to a Deny disposition.
+        assert_eq!(InferenceEgressMode::parse("internal-only-ish"), None);
+        assert_eq!(InferenceEgressMode::parse("internalonly"), None);
+    }
+
+    #[test]
+    fn internal_only_resolved_classifies_every_address_3822() {
+        // #3822 (5-agent vote 4d3ea1c5) — the pure resolved gate with addresses
+        // INJECTED (no live DNS, no set_var). Each assertion is paired with a
+        // presence control so a green does not depend on an accident.
+        let c = EgressClass::InferenceLlm;
+        let ev = |url: &str, addrs: &[SocketAddr]| {
+            evaluate_inference_egress_resolved(InferenceEgressMode::InternalOnly, c, url, addrs)
+        };
+        let sa = |t: &str| -> SocketAddr { t.parse().expect("test SocketAddr") };
+
+        // DNS-rebind: an internal-LOOKING name that resolves to a PUBLIC addr → Refuse.
+        assert!(ev("https://internal.example", &[sa("8.8.8.8:443")]).is_refused());
+        // presence control: the SAME name resolving to RFC1918 → Allow.
+        assert_eq!(
+            ev("https://internal.example", &[sa("10.1.2.3:443")]),
+            EgressDecision::Allow
+        );
+        // CGNAT 100.64/10 → Allow.
+        assert_eq!(
+            ev("https://cg.example", &[sa("100.64.1.2:443")]),
+            EgressDecision::Allow
+        );
+        // metadata literals → Refuse. `100.100.100.200` is INSIDE the CGNAT /10,
+        // so this proves "metadata beats CGNAT" (the control above allowed CGNAT).
+        assert!(ev("https://md.example", &[sa("169.254.169.254:443")]).is_refused());
+        assert!(ev("https://md.example", &[sa("100.100.100.200:443")]).is_refused());
+        // ULA → Allow; link-local → Refuse.
+        assert_eq!(
+            ev("https://u.example", &[sa("[fd00::1]:443")]),
+            EgressDecision::Allow
+        );
+        assert!(ev("https://ll.example", &[sa("[fe80::1]:443")]).is_refused());
+        // v4-mapped IPv6 private (`::ffff:10.0.0.1`) → Allow (normalize_ip collapses).
+        assert_eq!(
+            ev("https://m.example", &[sa("[::ffff:10.0.0.1]:443")]),
+            EgressDecision::Allow
+        );
+        // mixed set: ANY address outside the internal set → Refuse.
+        assert!(
+            ev(
+                "https://mix.example",
+                &[sa("10.1.2.3:443"), sa("8.8.8.8:443")]
+            )
+            .is_refused()
+        );
+        // TLS-first (A5): plaintext http to a NON-loopback internal addr → Refuse
+        // NAMING the scheme (even though 10.0.0.5 is otherwise internal).
+        let http = ev("http://10.0.0.5", &[sa("10.0.0.5:80")]);
+        assert!(http.is_refused());
+        if let EgressDecision::Refuse { reason, .. } = http {
+            assert!(
+                reason.contains("http"),
+                "refusal must name the plaintext scheme: {reason}"
+            );
+        }
+        // http://127.0.0.1 → Allow (loopback http stays permitted; #3824 is v1.x).
+        assert_eq!(
+            ev("http://127.0.0.1", &[sa("127.0.0.1:80")]),
+            EgressDecision::Allow
+        );
+        // empty resolve set → Refuse (fail closed).
+        assert!(ev("https://empty.example", &[]).is_refused());
+    }
+
+    #[test]
+    fn non_internal_modes_ignore_resolved_addresses_3822() {
+        // #3822 — the resolved gate delegates Allow/LoopbackOnly/Deny to the
+        // name-based SSOT and ignores `addrs` (presence control that the split
+        // did not change the other postures).
+        let c = EgressClass::InferenceLlm;
+        let public = [SocketAddr::from(([8, 8, 8, 8], 443))];
+        assert_eq!(
+            evaluate_inference_egress_resolved(
+                InferenceEgressMode::Allow,
+                c,
+                "https://api.vendor.example",
+                &public
+            ),
+            EgressDecision::Allow
+        );
+        assert!(
+            evaluate_inference_egress_resolved(
+                InferenceEgressMode::Deny,
+                c,
+                "https://api.vendor.example",
+                &public
+            )
+            .is_refused()
+        );
+        assert!(
+            evaluate_inference_egress_resolved(
+                InferenceEgressMode::LoopbackOnly,
+                c,
+                "https://api.vendor.example",
+                &public
+            )
+            .is_refused()
+        );
     }
 
     // v1.0.0 FBL-14 (T3 security posture) regression: a SET-but-unrecognised

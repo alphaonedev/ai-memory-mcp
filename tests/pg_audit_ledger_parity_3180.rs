@@ -13,8 +13,8 @@
 //!    was unprovable once the (mutable) `pending_actions` row moved on.
 //! 2. **the recall access ledger** — `recall_hybrid` appended NOTHING on pg,
 //!    so every pg-backed fleet produced zero `recall_observations` and the
-//!    memory lifecycle (TTL extension, mid→long promotion, priority decay),
-//!    which folds from exactly those rows, was frozen.
+//!    memory lifecycle (access_count folding, TTL floor-extension,
+//!    confidence decay), which folds from exactly those rows, was frozen.
 //! 3. **`reclassify` `cause_hash`** — the pg twin bound `None`, so an auditor
 //!    could not tie a reclassification to the caller and inputs that caused
 //!    it. The test recomputes the hash with the SQLITE formula and requires

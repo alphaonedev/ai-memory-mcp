@@ -362,6 +362,7 @@ jobs:
             --test g4_postgres_link_projects_into_age_graph
             --test g5_find_paths_cte_served_on_age
             --test kg_age_fallback
+            --test kg_age_orphan_graph_3883
             --test age_cte_equivalence
             --test issue_1482_age_cypher_persistent
             --test pillar4_4c_deferred_age_cold_path_1735

@@ -242,6 +242,8 @@ pub fn postgres_endpoint_supported(method: &axum::http::Method, path: &str) -> b
         // SAL trait on the postgres path.
         ("GET", super::routes::TOOLS_LIST) => true,
         ("POST", super::routes::MEMORY_LOAD_FAMILY) => true,
+        // Boids item 3 (#3266) — rewind dispatches to `MemoryStore::swarm_rewind`.
+        ("POST", super::routes::MEMORY_SWARM_REWIND) => true,
         ("POST", super::routes::NOTIFY) => true,
         ("POST", super::routes::GC) => true,
         ("POST", super::routes::IMPORT) => true,
@@ -580,6 +582,8 @@ pub fn path_is_registered_route(method: &axum::http::Method, path: &str) -> bool
         // L9 / L10 — tools/list + load_family.
         ("GET", super::routes::TOOLS_LIST) => true,
         ("POST", super::routes::MEMORY_LOAD_FAMILY) => true,
+        // Boids item 3 (#3266) — cascade rewind.
+        ("POST", super::routes::MEMORY_SWARM_REWIND) => true,
         // Links.
         ("POST", super::routes::LINKS) => true,
         ("DELETE", super::routes::LINKS) => true,

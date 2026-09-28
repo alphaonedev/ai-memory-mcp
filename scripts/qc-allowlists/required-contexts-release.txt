@@ -389,3 +389,6 @@ Postgres ignored tests (sal-postgres --ignored)
 #   * `main` and `develop` require only `Check (ubuntu/macos-latest)`.
 #     That is the #2496 exposure: those two are the vacuous-success job, so
 #     the branch that ships is the least protected in fact. Out of scope here.
+URL-sink redaction gate (#3688 / #3967)
+Stale contract-assertion gate (#3688 / #3967)
+Claude plugin manifest gate (#3967)

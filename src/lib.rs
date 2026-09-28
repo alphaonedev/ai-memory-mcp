@@ -437,7 +437,12 @@ pub const META_KEY_FAMILY: &str = "family";
 // Re-derived from the ACTUAL count on the rebase base rather than carried
 // forward: the pre-rebase branch read 99/85 against a 97/83 base, and adding
 // its own delta to a moved base is exactly how a route-count SSOT drifts.
-pub const EXPECTED_PRODUCTION_ROUTES_COUNT: usize = 102;
+// 2026-09-24 (Boids item 3, #3266, vote `4d3ea1c5`) — bumped 102 → 103:
+// `POST /api/v1/memory_swarm_rewind` (`handlers::swarm_rewind_http::
+// handle_swarm_rewind_http`), the admin-gated #1111 mirror of
+// `memory_swarm_rewind` on both backends. A new PATH, so
+// EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT moves by 1 as well.
+pub const EXPECTED_PRODUCTION_ROUTES_COUNT: usize = 103;
 // 2026-06-22 (#1718 Commit C) — bumped 89 → 90: the coordination
 // action-transition write surface `POST /api/v1/actions/{id}/transition`
 // (`handlers::transition_action`) — local CAS write + W-of-N federation fanout.
@@ -478,7 +483,8 @@ pub const EXPECTED_TEST_ROUTES_COUNT: usize = 3;
 // `/api/v1/agents/{id}/api-key` (admin mint/bind) and
 // `/api/v1/agents/{id}/api-key/revoke` (admin revoke, approval-gated).
 // #3646 adds authenticated monitoring status and numeric exposition.
-pub const EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT: usize = 88;
+// 2026-09-24 (Boids item 3, #3266) — bumped 88 → 89: `/api/v1/memory_swarm_rewind`.
+pub const EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT: usize = 89;
 
 // ---------------------------------------------------------------------------
 // v0.7.0 multi-agent literal-sweep (scanner A, finding F-A3.1) —
@@ -1618,6 +1624,11 @@ pub fn build_router_with_timeout(
         .route(
             handlers::routes::MEMORY_CALIBRATE_CONFIDENCE,
             post(handlers::route_1111::handle_calibrate_confidence_http),
+        )
+        // Boids item 3 (#3266) — admin-gated cascade rewind, both backends.
+        .route(
+            handlers::routes::MEMORY_SWARM_REWIND,
+            post(handlers::swarm_rewind_http::handle_swarm_rewind_http),
         )
         .route(
             handlers::routes::MEMORY_VERIFY,

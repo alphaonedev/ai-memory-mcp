@@ -289,28 +289,25 @@ async fn k7_hmac_unset_refuses_dispatch_when_no_per_sub_secret() {
         );
     }
 
-    // Poll: the wiremock must NOT see any request, AND a DLQ row
-    // must materialise with the "dispatch refused" error.
-    let path_for_poll = db_path.clone();
-    let sub_for_poll = sub_id.clone();
-    let dlq_outcome = tokio::task::spawn_blocking(move || {
-        for _ in 0..40 {
-            let conn = Connection::open(&path_for_poll).unwrap();
-            let entries = subscriptions::list_dlq(&conn, Some(&sub_for_poll)).unwrap();
-            if !entries.is_empty() {
-                return Some(entries);
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        None
-    })
-    .await
-    .unwrap();
+    // #3908 — observe the refusal through the dispatcher's own idle signal,
+    // not a fixed wall-clock window. The refusal + `record_dlq` run INSIDE
+    // the fire-and-forget `work` closure (`subscriptions.rs`, the R3-S1.HMAC
+    // arm), and `dispatch_event` increments `DISPATCH_IN_FLIGHT` SYNCHRONOUSLY
+    // before spawning that worker, so `drain_dispatches` waits on the
+    // dispatcher's `DISPATCH_IDLE` notify until the worker has dropped its
+    // `DispatchInFlightGuard`. Once it returns, the DLQ row is materialised —
+    // or the refusal genuinely wrote none, which the assertions below catch.
+    // The old 40 x 100 ms poll could give up before a loaded runner's worker
+    // landed the row (#3908); the `SHUTDOWN_DRAIN_TIMEOUT` here is a hang
+    // detector (> the retry ladder), not an observation window — a worker
+    // still in flight fails loudly with exactly that meaning, and the six
+    // sibling webhook tests already observe dispatch this way.
+    let drained = subscriptions::drain_dispatches(subscriptions::shutdown_drain_timeout()).await;
 
-    // #1201 — filter by per-test path to be robust against any
-    // straggler from a sibling test landing on this server even if
-    // port reuse aligned (with the dedicated listener, this is now
-    // essentially impossible — the filter is defense in depth).
+    // The wiremock must NOT have seen the unsigned body (the refusal is
+    // correct). #1201 — filter by per-test path against any straggler from a
+    // sibling test landing on this server (with the dedicated listener this is
+    // essentially impossible; the filter is defense in depth).
     let received: Vec<_> = server
         .received_requests()
         .await
@@ -323,8 +320,16 @@ async fn k7_hmac_unset_refuses_dispatch_when_no_per_sub_secret() {
         "dispatcher must NOT post an unsigned body — got {} request(s)",
         received.len()
     );
-    let dlq = dlq_outcome.expect("DLQ row must materialise for refused dispatch");
-    assert_eq!(dlq.len(), 1, "exactly one DLQ row");
+    assert!(
+        drained,
+        "dispatch worker never drained within {:?} (subscriptions::wait_dispatch_idle) — the refusal + record_dlq run inside the worker, so a stuck worker means no DLQ row",
+        subscriptions::shutdown_drain_timeout(),
+    );
+    // The worker has drained: the DLQ row is now present (or the refusal wrote
+    // none, which the assertions below catch).
+    let conn = Connection::open(&db_path).unwrap();
+    let dlq = subscriptions::list_dlq(&conn, Some(&sub_id)).unwrap();
+    assert_eq!(dlq.len(), 1, "exactly one DLQ row for the refused dispatch");
     assert!(
         dlq[0].last_error.contains("dispatch refused")
             || dlq[0].last_error.contains("R3-S1.HMAC")
@@ -332,6 +337,122 @@ async fn k7_hmac_unset_refuses_dispatch_when_no_per_sub_secret() {
         "DLQ row must carry an explicit refusal message: {}",
         dlq[0].last_error
     );
+}
+
+/// #3941 — the dispatch worker must sign with the server-wide HMAC secret as
+/// it stood WHEN THE DISPATCH WAS DECIDED, not with whatever a sibling has set
+/// by the time the fire-and-forget worker happens to run. On a `current_thread`
+/// runtime the `rt.spawn`'d worker cannot execute until this cell first awaits,
+/// so the `set_active_hooks_hmac_secret(None)` below is provably in effect
+/// before the worker's read. Pre-fix (the worker reads `active_hooks_hmac_secret`
+/// lazily inside `work`) it sees `None` and REFUSES, so no request lands — RED.
+/// With the dispatch-time snapshot (#3941 fix A) it signs with the captured
+/// secret — GREEN. Deterministic red-first pin (author != reviewer; f2r's shape).
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn k7_hmac_worker_signs_with_dispatch_time_secret_snapshot_3941() {
+    let _guard = K7_HMAC_GLOBAL_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // #3941 — the red-first determinism REQUIRES current_thread: the spawned
+    // worker must not be runnable until this cell first awaits, so the
+    // `set_active_hooks_hmac_secret(None)` below is provably before the worker's
+    // read. Two `flavor = "multi_thread"` siblings live in this file; asserting
+    // the flavour makes a copy-pasted `flavor` a LOUD failure instead of
+    // silently turning the RED half into decoration (f2r).
+    assert_eq!(
+        tokio::runtime::Handle::current().runtime_flavor(),
+        tokio::runtime::RuntimeFlavor::CurrentThread,
+        "#3941: the red-first determinism requires the current_thread runtime",
+    );
+    let tls = common::tls_receiver::dispatch_tls(&std::env::temp_dir());
+    let server = TlsReceiver::start_with(tls, ack_echo()).await;
+    let unique = uuid::Uuid::new_v4().simple().to_string();
+    let path_str = format!("/k7-snapshot/{unique}");
+
+    let (_keep, db_path) = fresh_db();
+    let url = format!("{}{}", server.uri(), path_str);
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        subscriptions::insert(
+            &conn,
+            &NewSubscription {
+                url: &url,
+                events: "*",
+                // No per-sub secret: the server-wide override is the only key,
+                // which is exactly the arm that reads the process-global.
+                secret: None,
+                namespace_filter: None,
+                agent_filter: None,
+                created_by: Some("k7-snapshot-test"),
+                event_types: None,
+            },
+        )
+        .expect("insert subscription");
+    }
+
+    // The secret in effect WHEN the dispatch is decided.
+    set_active_hooks_hmac_secret(Some("k7-snapshot-secret".into()));
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        subscriptions::dispatch_event(
+            &conn,
+            "memory_store",
+            "memory-k7-snap",
+            "ns-k7",
+            None,
+            &db_path,
+        );
+    }
+    // A sibling flips it to None BEFORE the worker runs. On current_thread the
+    // spawned worker has not executed yet — this synchronous line precedes the
+    // first `.await`.
+    set_active_hooks_hmac_secret(None);
+
+    // Drive the worker to completion via the dispatcher's own idle signal.
+    let drained = subscriptions::drain_dispatches(subscriptions::shutdown_drain_timeout()).await;
+    assert!(drained, "dispatch worker never drained");
+
+    // It must have SIGNED with the dispatch-time snapshot and POSTed, not
+    // refused on the now-None global. drain guarantees the worker finished, so
+    // the receiver has already recorded the request.
+    let received: Vec<_> = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| r.url.path() == path_str)
+        .collect();
+    assert_eq!(
+        received.len(),
+        1,
+        "worker must SIGN and POST with the dispatch-time secret snapshot \
+         (#3941), not refuse on the sibling's None — got {} request(s)",
+        received.len()
+    );
+    let req = &received[0];
+    let sig_header = req
+        .headers
+        .get("x-ai-memory-signature")
+        .expect("signed request must carry x-ai-memory-signature")
+        .to_str()
+        .unwrap();
+    let hex_part = sig_header.trim_start_matches("sha256=");
+    let timestamp = req
+        .headers
+        .get("x-ai-memory-timestamp")
+        .expect("timestamp header")
+        .to_str()
+        .unwrap();
+    let body = std::str::from_utf8(&req.body).expect("request body utf8");
+    let canonical = format!("{timestamp}.{body}");
+    assert_eq!(
+        hex_part,
+        expected_k7_signature("k7-snapshot-secret", &canonical),
+        "signature must be keyed by the SNAPSHOTTED secret, not the sibling's None"
+    );
+
+    set_active_hooks_hmac_secret(None);
 }
 
 /// Poll the wiremock server for ~5s waiting for at least one request to

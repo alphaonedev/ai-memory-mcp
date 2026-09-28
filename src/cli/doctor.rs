@@ -2026,7 +2026,12 @@ fn section_postgres_extensions_3264() -> Option<ReportSection> {
     // ticket (#1893 / #1579 A3 discipline).
     let redacted = crate::url_display::store_url_display(&url);
 
-    type Probe = (PgvectorPreflightFacts, Option<String>, Option<String>);
+    type Probe = (
+        PgvectorPreflightFacts,
+        Option<String>,
+        Option<String>,
+        Option<bool>,
+    );
     let probed: Result<Probe> = run_pg_probe(|| async move {
         // #3264 review fix (B4) — the whole probe runs inside ONE
         // wall-clock envelope. `acquire_timeout` bounds only the pool
@@ -2042,8 +2047,18 @@ fn section_postgres_extensions_3264() -> Option<ReportSection> {
             let facts = probe_pgvector_preflight(&pool).await?;
             let vector_version = probe_extension_version(&pool, PGVECTOR_EXTENSION_NAME).await?;
             let age_version = probe_extension_version(&pool, AGE_EXTENSION_NAME).await?;
+            // #3883 A5 — is the `memory_graph` registered in ag_catalog.ag_graph?
+            // Only meaningful when AGE is installed; a probe error (e.g. the
+            // catalog absent) degrades to None ("n/a"), never a doctor failure.
+            let ag_graph_registered = if age_version.is_some() {
+                crate::store::postgres::age_graph_registry_present_pool(&pool)
+                    .await
+                    .ok()
+            } else {
+                None
+            };
             pool.close().await;
-            Ok::<Probe, sqlx::Error>((facts, vector_version, age_version))
+            Ok::<Probe, sqlx::Error>((facts, vector_version, age_version, ag_graph_registered))
         };
         tokio::time::timeout(PG_PROBE_TIMEOUT, probe)
             .await
@@ -2052,7 +2067,7 @@ fn section_postgres_extensions_3264() -> Option<ReportSection> {
     })
     .and_then(|inner| inner);
 
-    let (facts, vector_version, age_version) = match probed {
+    let (facts, vector_version, age_version, ag_graph_registered) = match probed {
         Ok(v) => v,
         Err(e) => {
             return Some(ReportSection {
@@ -2103,6 +2118,13 @@ fn section_postgres_extensions_3264() -> Option<ReportSection> {
         (
             "ag_catalog_usage".into(),
             facts.age_catalog_usage.to_string(),
+        ),
+        // #3883 A5 — the ag_catalog.ag_graph registry-row presence. "n/a" when
+        // AGE is not installed or the probe could not run; "false" is the
+        // ORPHAN signal (schema present, registry row absent).
+        (
+            "ag_graph_registered".into(),
+            ag_graph_registered.map_or_else(|| "n/a".to_string(), |b| b.to_string()),
         ),
         ("pgvector_verdict".into(), verdict.label().to_string()),
         // #3756 — the comparator's verdict on the installed version
@@ -4591,11 +4613,17 @@ fn section_atomisation_curator_2985(conn: &rusqlite::Connection) -> ReportSectio
     // A curator exists only when the resolved client would actually be
     // constructed: an LLM must be configured AND the #1963 inference-egress
     // gate must permit the resolved target.
-    let egress = crate::egress::evaluate_inference_egress(
+    // #3822 (A2) — under `internal-only` this RESOLVES the target (a doctor
+    // diagnostic probe) so the reported availability matches what the daemon
+    // would admit; the returned decision drives the fact below.
+    let egress = match crate::egress::admit_inference_target(
         crate::egress::resolve_inference_egress_mode(),
         crate::egress::EgressClass::InferenceLlm,
         &resolved.base_url,
-    );
+    ) {
+        Ok(_) => crate::egress::EgressDecision::Allow,
+        Err(decision) => decision,
+    };
     let curator_available = !curator_model.trim().is_empty() && !egress.is_refused();
 
     facts.push(("curator_impl".into(), "LlmCurator".into()));

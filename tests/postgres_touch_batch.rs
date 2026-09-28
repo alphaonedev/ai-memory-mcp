@@ -9,34 +9,32 @@
     clippy::cast_possible_wrap,
     clippy::cast_sign_loss
 )]
-//! Wave-2 Tier-A4 (#852) — postgres `touch_after_recall` must apply
-//! the three touch effects (`access_count` + sliding-window TTL extend,
-//! mid→long auto-promotion at `PROMOTION_THRESHOLD`, priority bump
-//! every 10 accesses) atomically in a SINGLE UPDATE statement.
+//! Wave-2 Tier-A4 (#852) — postgres `touch_after_recall` applies the
+//! access effects atomically in a SINGLE UPDATE statement.
 //!
-//! The pre-refactor implementation ran three separate
-//! `sqlx::query(...)` calls inside a transaction (3 parse+execute
-//! roundtrips per recall touch); this regression test pins the
-//! collapsed single-statement form by exercising each branch of the
-//! merged CASE expression and asserting the post-touch row state.
+//! v1.0.0 Boids item 1 (5-agent vote 4d3ea1c5) DE-ESCALATED this recall
+//! MAINTENANCE verb: it now applies only the `access_count` bump (cap
+//! 1M), `last_accessed_at`, and the per-tier TTL floor-extend. The
+//! mid→long auto-promotion, its `updated_at` rewrite and the priority
+//! decade ladder were REMOVED so recall popularity can no longer rewrite
+//! a row's tier, recency or priority (`memory_promote` is the sole
+//! tier-raising verb). This test now pins the ABSENCE of escalation.
 //!
 //! ## What this test asserts
 //!
 //! For a set of seeded `mid`-tier memories under a fresh namespace:
 //!
 //! 1. **First touch (`access_count` 0 → 1)** — `access_count` increments,
-//!    `last_accessed_at` lands, `expires_at` slides forward by 1d
-//!    (mid tier), tier stays `mid`, priority is unchanged.
-//! 2. **Fifth touch (`access_count` 4 → 5)** — promotion fires: tier
-//!    flips to `long`, `expires_at` clears to NULL, `updated_at`
-//!    advances.
-//! 3. **Tenth touch (`access_count` 9 → 10)** — priority bumps by 1
-//!    (the row stays `long` from step 2; the priority CASE fires
-//!    purely on the post-increment % 10 == 0 predicate).
+//!    `last_accessed_at` lands, `expires_at` floor-extends by 1d (mid
+//!    tier), tier stays `mid`, priority unchanged.
+//! 2. **Fifth touch (`access_count` 4 → 5)** — R2: NO promotion. Tier
+//!    stays `mid`, `expires_at` stays non-NULL (floor-extended, not
+//!    cleared), priority unchanged.
+//! 3. **Tenth / twentieth touch** — R2: NO priority bump. Priority stays
+//!    5 across every decade boundary; only `access_count` advances.
 //!
-//! A second test covers the `short`-tier branch — touch must slide
-//! the 1h TTL forward and NEVER auto-promote (promotion is mid→long
-//! only).
+//! A second test covers the `short`-tier branch — touch floor-extends
+//! the 1h TTL and (as always) never auto-promotes.
 //!
 //! ## Gating
 //!
@@ -181,7 +179,8 @@ async fn touch_after_recall_single_update_preserves_semantics() {
         );
     }
 
-    // ---- Phase 2: drive to the 5th touch, watch the mid→long flip. ----
+    // ---- Phase 2: drive to the 5th touch. v1.0.0 Boids item 1 (5-agent
+    // vote 4d3ea1c5): the recall MAINTENANCE verb no longer auto-promotes.
     // We've already done 1 touch; do 4 more to land at access_count=5.
     let rows = touch_n(&store, &ctx, &ids, 4).await;
     for r in &rows {
@@ -192,20 +191,18 @@ async fn touch_after_recall_single_update_preserves_semantics() {
         );
         assert_eq!(
             r.tier,
-            Tier::Long,
-            "mid→long auto-promote must fire at access_count=5 (PROMOTION_THRESHOLD)"
+            Tier::Mid,
+            "R2: no mid→long auto-promote at the historical PROMOTION_THRESHOLD"
         );
-        assert_eq!(
-            r.expires_at, None,
-            "expires_at must clear when promotion fires this round"
+        assert!(
+            r.expires_at.is_some(),
+            "R2: mid row keeps its expiry (no promotion to clear it); TTL floor-extends"
         );
-        assert_eq!(r.priority, 5, "priority unchanged before 10th touch");
+        assert_eq!(r.priority, 5, "priority unchanged");
     }
 
-    // ---- Phase 3: drive to the 10th touch, watch the priority bump. ----
-    // Currently at access_count=5; 5 more touches lands at 10. The row
-    // is already long-tier from Phase 2 so the promotion CASE arm is
-    // a no-op (long stays long); only the priority CASE fires.
+    // ---- Phase 3: drive to the 10th touch. R2: no priority decade bump. ----
+    // Currently at access_count=5; 5 more touches lands at 10.
     let rows = touch_n(&store, &ctx, &ids, 5).await;
     for r in &rows {
         assert_eq!(
@@ -213,29 +210,24 @@ async fn touch_after_recall_single_update_preserves_semantics() {
             "access_count must be 10 after the tenth touch (id={})",
             r.id
         );
+        assert_eq!(r.tier, Tier::Mid, "R2: still mid — no auto-promote");
         assert_eq!(
-            r.tier,
-            Tier::Long,
-            "long tier persists; CASE only flips from mid"
+            r.priority, 5,
+            "R2: no priority bump at the historical 10-access decade"
         );
-        assert_eq!(
-            r.priority, 6,
-            "priority must bump from 5 → 6 on the 10th touch \
-             (post-increment access_count % 10 == 0 branch)"
-        );
-        assert_eq!(
-            r.expires_at, None,
-            "long-tier rows keep their NULL expires_at across touch"
+        assert!(
+            r.expires_at.is_some(),
+            "R2: mid row keeps its (floor-extended) expiry across touch"
         );
     }
 
-    // ---- Phase 4: drive to the 20th touch — priority bumps again. ----
+    // ---- Phase 4: drive to the 20th touch — R2: priority still does not bump. ----
     let rows = touch_n(&store, &ctx, &ids, 10).await;
     for r in &rows {
         assert_eq!(r.access_count, 20, "access_count must be 20 (id={})", r.id);
         assert_eq!(
-            r.priority, 7,
-            "priority must bump twice (10th + 20th touch): 5 → 6 → 7"
+            r.priority, 5,
+            "R2: priority never bumps (no decade ladder) — stays 5 through 20 touches"
         );
     }
 

@@ -208,8 +208,8 @@ pub(crate) fn canonicalize_valid_until_stamp(valid_until: Option<&str>) -> Strin
 use crate::models::{
     AGENTS_NAMESPACE, AgentRegistration, Approval, ApproverType, ConfidenceSource, DuplicateCheck,
     DuplicateMatch, GovernanceDecision, GovernanceLevel, GovernancePolicy, GovernedAction,
-    MAX_NAMESPACE_DEPTH, Memory, MemoryKind, MemoryLink, NamespaceCount, PROMOTION_THRESHOLD,
-    PendingAction, SourceSpan, Stats, Taxonomy, TaxonomyNode, Tier, TierCount, namespace_ancestors,
+    MAX_NAMESPACE_DEPTH, Memory, MemoryKind, MemoryLink, NamespaceCount, PendingAction, SourceSpan,
+    Stats, Taxonomy, TaxonomyNode, Tier, TierCount, namespace_ancestors,
 };
 
 // #962 — typed substrate-layer error envelope. Substrate code emits
@@ -859,6 +859,10 @@ pub(crate) fn escape_like_pattern(s: &str) -> String {
 // `pub use storage as db;` shim in `src/lib.rs` preserves the
 // historical `crate::db::*` paths used elsewhere.
 pub(crate) mod connection;
+pub(crate) mod contamination_marker;
+pub(crate) use contamination_marker::StampAuthority;
+pub(crate) mod decontaminate;
+mod lifecycle_write;
 // `pub` (rather than `pub(crate)`) so the V-4 closeout
 // integration test suite (`tests/signed_events_chain_v34.rs`) can
 // invoke `migrate_v34_backfill_chain` directly to exercise the
@@ -3524,7 +3528,9 @@ pub fn resolve_id(conn: &Connection, id: &str) -> Result<Option<Memory>> {
     get_by_prefix(conn, id)
 }
 
-/// Bump access count, extend TTL, auto-promote — atomic via transaction.
+/// Bump access count and extend the per-tier TTL floor — atomic via
+/// transaction. v1.0.0 Boids item 1 (5-agent vote 4d3ea1c5): this recall
+/// MAINTENANCE verb no longer auto-promotes or bumps priority.
 pub fn touch(conn: &Connection, id: &str, short_extend: i64, mid_extend: i64) -> Result<()> {
     let now = Utc::now();
     let now_str = now.to_rfc3339();
@@ -3564,20 +3570,6 @@ pub fn touch(conn: &Connection, id: &str, short_extend: i64, mid_extend: i64) ->
             params![now_str, short_expires, mid_expires, id],
         )?;
 
-        conn.execute(
-            "UPDATE memories SET tier = 'long', expires_at = NULL, updated_at = ?1
-             WHERE id = ?2 AND tier = 'mid' AND access_count >= ?3",
-            params![now_str, id, PROMOTION_THRESHOLD],
-        )?;
-
-        // v1.0.0 #2339 (FBL-34) — access-driven bumps stop at the named
-        // ceiling; rows already above it (operator band 8-10) are untouched.
-        conn.execute(
-            "UPDATE memories SET priority = MIN(priority + 1, ?2)
-             WHERE id = ?1 AND access_count > 0 AND access_count % 10 = 0 AND priority < ?2",
-            params![id, crate::models::ACCESS_PRIORITY_CEILING],
-        )?;
-
         Ok(())
     })();
 
@@ -3599,10 +3591,11 @@ pub fn touch(conn: &Connection, id: &str, short_extend: i64, mid_extend: i64) ->
 /// collapses the per-row `BEGIN IMMEDIATE` … `COMMIT` cycle into a
 /// SINGLE outer transaction so a K-row batch pays the SQLite
 /// write-lock + commit cost ONCE instead of K times. The three
-/// per-row UPDATE statements still run (same semantics: access bump
-/// + TTL extend, mid→long promotion at `PROMOTION_THRESHOLD`,
-/// priority+1 every 10 accesses); only the transaction framing
-/// changes.
+/// per-row UPDATE now applies only the access bump + per-tier TTL
+/// floor-extend; v1.0.0 Boids item 1 (5-agent vote 4d3ea1c5) removed
+/// the mid→long promotion and the priority decade ladder from this
+/// recall MAINTENANCE verb (`memory_promote` is the sole tier-raising
+/// verb). Only the transaction framing differs from [`touch`].
 ///
 /// v0.9.0 P0-1 (#1869) — this is the EXPLICIT touch verb and stays
 /// ungated. v1.0.0 (#1953): the RECALL paths no longer call it at
@@ -3673,20 +3666,8 @@ pub fn touch_many(
                 END
              WHERE id = ?4",
         )?;
-        let mut promote_stmt = conn.prepare_cached(
-            "UPDATE memories SET tier = 'long', expires_at = NULL, updated_at = ?1
-             WHERE id = ?2 AND tier = 'mid' AND access_count >= ?3",
-        )?;
-        // v1.0.0 #2339 (FBL-34) — access-driven bumps stop at the named
-        // ceiling; rows already above it (operator band 8-10) are untouched.
-        let mut priority_stmt = conn.prepare_cached(
-            "UPDATE memories SET priority = MIN(priority + 1, ?2)
-             WHERE id = ?1 AND access_count > 0 AND access_count % 10 = 0 AND priority < ?2",
-        )?;
         for id in ids {
             bump_stmt.execute(params![now_str, short_expires, mid_expires, id])?;
-            promote_stmt.execute(params![now_str, id, PROMOTION_THRESHOLD])?;
-            priority_stmt.execute(params![id, crate::models::ACCESS_PRIORITY_CEILING])?;
         }
         Ok(())
     })();
@@ -3718,12 +3699,6 @@ pub fn touch_many(
 ///   extension anchored on the LAST observation, which is what the
 ///   legacy per-recall MAX chain converged to; `long` / NULL-expiry
 ///   rows untouched)
-/// * mid→long promotion at `access_count' >= PROMOTION_THRESHOLD`
-///   (`expires_at = NULL`, `updated_at = now`)
-/// * `priority = MIN(priority + (ac'/10 − ac/10), 10)` — decade
-///   boundaries crossed ≡ the legacy per-step `% 10 == 0` firing
-///   (the sole divergence is at the 1M access ceiling, where the
-///   legacy per-step form kept firing; accepted, documented)
 /// * when `AI_MEMORY_CONFIDENCE_DECAY=1`, the confidence-decay stamp
 ///   ([`crate::confidence::decay::apply_decay_touch`]) moves off the
 ///   recall path onto the fold
@@ -3801,23 +3776,22 @@ pub fn fold_recall_accesses(
             if agg.is_empty() {
                 return Ok(0);
             }
-            let now_str = Utc::now().to_rfc3339();
             // APPEND-ONLY-SANCTIONED (#1823 G6 / #1869 P0-1) —
             // forward-compat documentation for the append-only
             // discipline: these UPDATEs are the explicit FOLD
             // maintenance verb applying metadata-only access
             // bookkeeping (the same sanction class as the legacy
             // touch); they never rewrite memory content.
-            // v1.0.0 #2339 (FBL-34) — the fold's decade bump stops at the
-            // named ceiling; rows already above it (operator band 8-10)
-            // keep their priority byte-identical.
-            let mut bump_stmt = conn.prepare_cached(&format!(
+            // v1.0.0 Boids item 1 (5-agent vote 4d3ea1c5) — the fold no
+            // longer ESCALATES: the mid→long promotion, its updated_at
+            // rewrite and the priority decade ladder are removed, so recall
+            // popularity cannot rewrite a row's tier, recency or priority
+            // (memory_promote is the sole tier-raising verb). The fold still
+            // applies access_count (cap 1M), last_accessed_at and the
+            // per-tier TTL floor-extend (#1596).
+            let mut bump_stmt = conn.prepare_cached(
                 "UPDATE memories SET
                     access_count = MIN(access_count + ?1, 1000000),
-                    priority = CASE WHEN priority >= {ceiling} THEN priority
-                        ELSE MIN(priority
-                            + (MIN(access_count + ?1, 1000000) / 10 - access_count / 10),
-                            {ceiling}) END,
                     last_accessed_at = CASE
                         WHEN last_accessed_at IS NULL OR last_accessed_at < ?2 THEN ?2
                         ELSE last_accessed_at
@@ -3829,11 +3803,6 @@ pub fn fold_recall_accesses(
                         ELSE expires_at
                     END
                  WHERE id = ?5",
-                ceiling = crate::models::ACCESS_PRIORITY_CEILING,
-            ))?;
-            let mut promote_stmt = conn.prepare_cached(
-                "UPDATE memories SET tier = 'long', expires_at = NULL, updated_at = ?1
-                 WHERE id = ?2 AND tier = 'mid' AND access_count >= ?3",
             )?;
             let mut mark_stmt = conn.prepare_cached(
                 "UPDATE recall_observations SET folded = 1
@@ -3858,7 +3827,6 @@ pub fn fold_recall_accesses(
                     t_max + chrono::Duration::seconds(mid_extend),
                 );
                 bump_stmt.execute(params![n, t_max_str, short_exp, mid_exp, id])?;
-                promote_stmt.execute(params![now_str, id, PROMOTION_THRESHOLD])?;
                 if decay {
                     // #1572 parity — the decay stamp moves off the
                     // recall path onto the fold.
@@ -3966,64 +3934,7 @@ pub fn consolidate_source_hidden(id: &str) -> InvalidTransition {
     }
 }
 
-/// v0.8.0 Pillar 2 (#1709 / #1726) — persist a lifecycle-state transition
-/// on a single memory, ENFORCING the transition machine
-/// ([`crate::models::LifecycleState::can_transition_to`]). The current
-/// state is read and an illegal edge (`open → done`, a move out of a
-/// terminal state, a self-loop) is rejected with a typed
-/// [`InvalidTransition`] BEFORE any write — #1726 wired this gate, which
-/// the v64 column previously left inert. Bumps the Gap-1 `version` counter
-/// because a lifecycle advance IS a mutation observable to
-/// optimistic-concurrency callers.
-///
-/// Returns `true` when a row was updated, `false` when `id` did not match
-/// a live row (no transition to validate).
-///
-/// # Errors
-///
-/// * [`InvalidTransition`] — the `current → state` edge is not permitted.
-/// * Propagates rusqlite errors from the SELECT / UPDATE.
-pub fn set_lifecycle_state(
-    conn: &Connection,
-    id: &str,
-    state: crate::models::LifecycleState,
-) -> Result<bool> {
-    // #1726 — read the current state and validate the edge before writing.
-    use rusqlite::OptionalExtension;
-    let current: Option<String> = conn
-        .query_row(
-            "SELECT lifecycle_state FROM memories WHERE id = ?1",
-            params![id],
-            |r| r.get(0),
-        )
-        .optional()?;
-    let Some(current_str) = current else {
-        return Ok(false);
-    };
-    let from = crate::models::LifecycleState::from_str(&current_str).unwrap_or_default();
-    // A no-op (requested == current) is idempotent success, not a self-loop
-    // error — mirrors the `memory_update` handler contract ("a request equal
-    // to the stored state is a no-op, no error"). Lets the patch / HTTP
-    // callers pass the current state through without a pre-check.
-    if from == state {
-        return Ok(true);
-    }
-    if !from.can_transition_to(state) {
-        return Err(InvalidTransition {
-            id: id.to_string(),
-            from,
-            to: state,
-        }
-        .into());
-    }
-    let now = Utc::now().to_rfc3339();
-    let n = conn.execute(
-        "UPDATE memories SET lifecycle_state = ?1, updated_at = ?2, version = version + 1 \
-         WHERE id = ?3",
-        params![state.as_str(), now, id],
-    )?;
-    Ok(n > 0)
-}
+pub use lifecycle_write::set_lifecycle_state;
 
 /// v1.0.0 [#2402] — the operator INSPECTION half of the quarantine route-OUT
 /// contract: list the rows currently held in
@@ -4124,6 +4035,9 @@ pub fn list_quarantined(
 /// writes NO audit row, so a released row cannot be re-released and a
 /// tombstoned row cannot be revived.
 ///
+/// Boids item 3 R2.5 (#3266): a CONTAMINATED row is decontaminated by the
+/// same call (see [`decontaminate`]); the state read under the lock decides.
+///
 /// [#2402]: https://github.com/alphaonedev/ai-memory-mcp/issues/2402
 ///
 /// # Errors
@@ -4149,6 +4063,17 @@ pub fn operator_dequarantine(conn: &mut Connection, id: &str, agent_id: &str) ->
     // function non-load-bearing, so a later edit cannot silently reintroduce
     // the race by moving a read above the UPDATE.
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    // Boids item 3 R2.5 (#3266) — the path is chosen by the state observed
+    // under the write lock, never by the caller (`decontaminate`).
+    match decontaminate::observe_and_release_sqlite(&tx, id, agent_id)? {
+        decontaminate::Observed::Quarantined => {}
+        decontaminate::Observed::Decontaminated(target) => {
+            tx.commit()?;
+            decontaminate::warn_released(id, agent_id, target);
+            return Ok(true);
+        }
+        decontaminate::Observed::NotContained => return Ok(false),
+    }
     let changed = tx.execute(
         "UPDATE memories SET lifecycle_state = ?1, updated_at = ?2, version = version + 1 \
          WHERE id = ?3 AND lifecycle_state = ?4",
@@ -4183,7 +4108,7 @@ pub fn operator_dequarantine(conn: &mut Connection, id: &str, agent_id: &str) ->
     // BACKEND primitive rather than each caller so no surface (CLI, admin
     // HTTP, either backend) can be added later and silently skip them.
     tracing::warn!(
-        target: "ai_memory::quarantine",
+        target: decontaminate::QUARANTINE_TRACE_TARGET,
         memory_id = %id,
         operator = %agent_id,
         "quarantine.operator_release: an operator RELEASED a quarantined memory back to          lifecycle_state=open, overriding the #1948 federation containment decision; a          memory.dequarantined signed-chain row was appended in the same transaction (#2402)"
@@ -8158,8 +8083,8 @@ pub fn search_with_source_uri(
            {lifecycle_vis}
          ORDER BY ((fts.rank * -1)
            + (m.priority * 0.5)
-           + (MIN(m.access_count, 50) * 0.1)
-           + (m.confidence * 2.0)
+           + (MIN(m.access_count, {cap}) * 0.1)
+           + (CASE WHEN m.confidence_source = 'default' OR m.confidence_source IS NULL THEN 0.5 ELSE m.confidence END * 2.0)
            + (1.0 / (1.0 + (julianday('now') - julianday(m.updated_at)) * 0.1)))
            -- v1.0.0 #2338 (FBL-33) — G7 soft-loser down-weight (see recall).
            * (CASE WHEN json_extract(m.metadata, '$.contradiction_soft_loser') = 1
@@ -8175,6 +8100,7 @@ pub fn search_with_source_uri(
         soft_loser_factor = SOFT_LOSER_SCORE_FACTOR,
         // #3279 — instant-based `created_at` since/until window (?6/?7).
         created_at_window = created_at_instant_window("m.", 6, 7),
+        cap = crate::models::ACCESS_SCORE_CAP,
     );
     // #3279 — canonicalize the since/until bounds so the SQL `strftime`
     // comparison (which also normalizes the stored column) is exactly
@@ -8668,6 +8594,19 @@ pub fn recall_with_telemetry(
 /// itself: clearing the marker (the G7 rollback) restores full rank.
 pub const SOFT_LOSER_SCORE_FACTOR: f64 = 0.5;
 
+/// #3927 (Boids item 3 part 4) — the ONE hybrid-lane predicate: the fused
+/// recall score multiplier for a row carrying the G7 soft-loser marker
+/// (`SOFT_LOSER_SCORE_FACTOR`), else `1.0`. Applied to the FUSED score on BOTH
+/// backends so the keyword AND the semantic halves are down-weighted (#2338).
+#[must_use]
+pub fn soft_loser_penalty(metadata: &serde_json::Value) -> f64 {
+    let loser = metadata
+        .get(crate::models::field_names::CONTRADICTION_SOFT_LOSER)
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    if loser { SOFT_LOSER_SCORE_FACTOR } else { 1.0 }
+}
+
 pub fn recall(
     conn: &Connection,
     context: &str,
@@ -8754,8 +8693,8 @@ pub fn recall(
         "SELECT {cols},
                 ((fts.rank * -1)
                 + (m.priority * 0.5)
-                + (MIN(m.access_count, 50) * 0.1)
-                + (m.confidence * 2.0)
+                + (MIN(m.access_count, {cap}) * 0.1)
+                + (CASE WHEN m.confidence_source = 'default' OR m.confidence_source IS NULL THEN 0.5 ELSE m.confidence END * 2.0)
                 + (CASE m.tier WHEN 'long' THEN 3.0 WHEN 'mid' THEN 1.0 ELSE 0.0 END)
                 + (1.0 / (1.0 + (julianday('now') - julianday(m.updated_at)) * 0.1)))
                 -- v1.0.0 #2338 (FBL-33) — the promised G7 soft down-weight:
@@ -8796,6 +8735,7 @@ pub fn recall(
         soft_loser_factor = SOFT_LOSER_SCORE_FACTOR,
         // #3279 — instant-based `created_at` since/until window (?5/?6).
         created_at_window = created_at_instant_window("m.", 5, 6),
+        cap = crate::models::ACCESS_SCORE_CAP,
     );
     // #3279 — canonicalize the since/until bounds; the SQL `strftime`
     // normalizes both sides so byte order equals instant order.
@@ -13441,6 +13381,9 @@ pub struct ContaminationStampReport {
     /// non-destructive: a logical-delete / quarantine posture is never
     /// downgraded to a taint).
     pub skipped_system_only: usize,
+    /// Descendants outside a non-admin caller's authority — left untouched
+    /// (item 3 f1-review F1; counted for the WARN, never named).
+    pub skipped_unauthorized: usize,
 }
 
 /// Outcome of one [`contaminate_row`] stamp attempt on a single memory row.
@@ -13515,24 +13458,10 @@ fn contaminate_row(
         .filter(serde_json::Value::is_object)
         .unwrap_or_else(|| serde_json::json!({}));
     if let Some(map) = meta.as_object_mut() {
-        // Base marker keys in the historical (#3324) order; `extra_marker`
-        // appends provenance (e.g. `via`, `rewind`) without disturbing them.
-        let mut marker = serde_json::Map::new();
-        marker.insert(
-            "prior_lifecycle_state".to_string(),
-            serde_json::json!(cur.as_str()),
-        );
-        marker.insert(
-            "contaminated_from".to_string(),
-            serde_json::json!(contaminated_from),
-        );
-        marker.insert("stamped_at".to_string(), serde_json::json!(now));
-        for (k, v) in extra_marker {
-            marker.insert((*k).to_string(), v.clone());
-        }
+        // Shared builder (sqlite + postgres): base keys in the #3324 order.
         map.insert(
             CONTAMINATION_METADATA_KEY.to_string(),
-            serde_json::Value::Object(marker),
+            contamination_marker::build(cur, contaminated_from, now, extra_marker),
         );
     }
     let meta_ser = serde_json::to_string(&meta)?;
@@ -13594,6 +13523,25 @@ pub fn stamp_contaminated_descendants(
     root_id: &str,
     max_depth: usize,
 ) -> Result<ContaminationStampReport> {
+    stamp_contaminated_descendants_as(conn, root_id, max_depth, StampAuthority::Admin)
+}
+
+/// [`stamp_contaminated_descendants`] under an explicit caller `authority`
+/// (item 3 f1-review F1): a non-admin stamps ONLY the descendants it owns for
+/// mutation; every other row is left untouched and counted in
+/// `skipped_unauthorized` (one WARN, no ids). Pre-existing on sqlite since
+/// #3324: the MCP narrow trigger tainted the whole closure.
+///
+/// # Errors
+///
+/// As [`stamp_contaminated_descendants`].
+pub(crate) fn stamp_contaminated_descendants_as(
+    conn: &Connection,
+    root_id: &str,
+    max_depth: usize,
+    authority: StampAuthority<'_>,
+) -> Result<ContaminationStampReport> {
+    use rusqlite::OptionalExtension;
     // #1955 R45 write-funnel fence — this is a lifecycle-mutating write and is
     // reachable from the CLI-local and HTTP-sqlite lanes that bypass
     // `SqliteStore::gate_record_stop`; gate here, where every other sqlite
@@ -13624,6 +13572,21 @@ pub fn stamp_contaminated_descendants(
               WHERE id = ?4 AND lifecycle_state = ?5",
         )?;
         for node in &descendants {
+            if authority != StampAuthority::Admin {
+                let meta: Option<Option<String>> =
+                    read.query_row(params![node.id], |r| r.get(1)).optional()?;
+                let meta = meta
+                    .flatten()
+                    .and_then(|m| serde_json::from_str(&m).ok())
+                    .unwrap_or_else(|| serde_json::json!({}));
+                let site = crate::identity::owner_stamp::MutationSite::sqlite(
+                    crate::identity::owner_stamp::funnel::LINK,
+                );
+                if !authority.admits(&meta, &node.id, site) {
+                    report.skipped_unauthorized += 1;
+                    continue;
+                }
+            }
             // Empty `extra_marker` reproduces the historical #3324 contamination
             // marker byte-for-byte.
             match contaminate_row(&mut read, &mut upd, &node.id, root_id, &now, &[])? {
@@ -13635,6 +13598,7 @@ pub fn stamp_contaminated_descendants(
         }
     }
     tx.commit()?;
+    contamination_marker::warn_skipped_unauthorized(root_id, report.skipped_unauthorized);
     Ok(report)
 }
 
@@ -13663,7 +13627,7 @@ pub struct SwarmRewindCost {
 }
 
 impl SwarmRewindCost {
-    fn from_rollup(r: &crate::cost::CostRollup) -> Self {
+    pub(crate) fn from_rollup(r: &crate::cost::CostRollup) -> Self {
         Self {
             scope_key: r.scope_key.clone(),
             tokens_written: r.tokens_written,
@@ -13720,7 +13684,7 @@ pub struct SwarmRewindReport {
 /// marker to make a `swarm_rewind` IDEMPOTENT: a re-run detects an already-set
 /// `rewind: true` marker and short-circuits without re-stamping or appending a
 /// duplicate audit row.
-const SWARM_REWIND_MARKER_KEY: &str = "rewind";
+pub(crate) const SWARM_REWIND_MARKER_KEY: &str = "rewind";
 
 /// Shared SELECT of a memory's `(lifecycle_state, metadata)` by id — used by
 /// both the #3324 auto-stamp sweep and the #3322 swarm_rewind orchestration
@@ -13820,7 +13784,7 @@ pub fn swarm_rewind(
         .optional()?;
     let Some((root_state_str, root_meta_str)) = root_row else {
         return Err(anyhow::Error::new(StorageError::InvalidArgument {
-            reason: format!("swarm_rewind: root memory {root_id} not found"),
+            reason: contamination_marker::rewind_root_not_found(root_id),
         }));
     };
     let root_state = crate::models::LifecycleState::from_str(&root_state_str).unwrap_or_default();
@@ -13913,6 +13877,33 @@ pub fn swarm_rewind(
               WHERE id = ?4 AND lifecycle_state = ?5",
         )?;
 
+        // f1-review F2/F3 parity (pre-existing since #3322): the autocommit
+        // read above is a preview only. Re-read and re-decide UNDER the
+        // IMMEDIATE write lock, so a rewind or metadata writer on another
+        // connection can neither duplicate the signed event nor be overwritten
+        // by a stale marker copy. Any early return rolls `tx` back.
+        let locked: Option<(String, Option<String>)> = read
+            .query_row(params![root_id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?;
+        let Some((locked_state, locked_meta)) = locked else {
+            return Err(anyhow::Error::new(StorageError::InvalidArgument {
+                reason: contamination_marker::rewind_root_not_found(root_id),
+            }));
+        };
+        let root_state = crate::models::LifecycleState::from_str(&locked_state).unwrap_or_default();
+        let root_meta: serde_json::Value = locked_meta
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .filter(serde_json::Value::is_object)
+            .unwrap_or_else(|| serde_json::json!({}));
+        if root_state == crate::models::LifecycleState::Contaminated
+            && root_meta[CONTAMINATION_METADATA_KEY][SWARM_REWIND_MARKER_KEY].as_bool()
+                == Some(true)
+        {
+            report.already_rewound = true;
+            return Ok(report);
+        }
+
         // 1a. Contaminate the downstream cascade. `via` records the taint
         // provenance; the base marker (prior_lifecycle_state/...) is identical
         // to the auto-stamp so a future restore reads it uniformly.
@@ -13951,7 +13942,10 @@ pub fn swarm_rewind(
                     "via".to_string(),
                     serde_json::json!(crate::governance::action_labels::SWARM_REWIND),
                 );
-                cont.insert("rewound_at".to_string(), serde_json::json!(now));
+                cont.insert(
+                    contamination_marker::REWOUND_AT_KEY.to_string(),
+                    serde_json::json!(now),
+                );
                 obj.insert(
                     CONTAMINATION_METADATA_KEY.to_string(),
                     serde_json::Value::Object(cont),
@@ -14040,7 +14034,7 @@ pub fn swarm_rewind(
 /// v1.0.0 #3322 — canonical bytes committed by a `swarm.rewind` signed event.
 /// The event's `payload_hash` is `SHA-256` over this, binding the rewind's
 /// identity into the tamper-evident chain.
-fn swarm_rewind_audit_payload(
+pub(crate) fn swarm_rewind_audit_payload(
     root_id: &str,
     target_kind: &str,
     contaminated: usize,
@@ -18117,7 +18111,7 @@ static INSERT_IF_NEWER_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::n
                     THEN json_remove(json_patch(
                         CASE WHEN excluded.updated_at > memories.updated_at
                                   OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
-                             THEN excluded.metadata
+                             THEN {newer_metadata}
                              ELSE memories.metadata END,
                         COALESCE(
                             -- #2941 — same reserved set: a newer-wins federation
@@ -18131,7 +18125,7 @@ static INSERT_IF_NEWER_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::n
                     ELSE json_patch(
                         CASE WHEN excluded.updated_at > memories.updated_at
                                   OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
-                             THEN excluded.metadata
+                             THEN {newer_metadata}
                              ELSE memories.metadata END,
                         COALESCE(
                             (SELECT json_group_object(key, value)
@@ -18228,9 +18222,9 @@ static INSERT_IF_NEWER_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::n
                 -- UPDATE and never pass can_transition_to, so the replicated
                 -- lifecycle value is NOT uniformly transition-validated -- the
                 -- enforcement gap is deferred to v1.1 per #3750.
-                lifecycle_state = CASE WHEN excluded.updated_at > memories.updated_at
-                                            OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
-                                       THEN excluded.lifecycle_state ELSE memories.lifecycle_state END,
+                -- Boids item 3 R2.1: local system-only never replaced, remote
+                -- system-only never adopted, else newer-wins (one shared twin).
+                lifecycle_state = {lifecycle_case},
                 -- v1.0.0 #2333 (FBL-03) + v1.0.0 #2394 — the v79 denormalized
                 -- kind_provenance FOLLOWS THE KIND THAT ACTUALLY WON on the
                 -- federation lane too. `memory_kind` above is sticky (a local
@@ -18258,6 +18252,8 @@ static INSERT_IF_NEWER_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::n
                                    THEN excluded.valid_until ELSE memories.valid_until END
              RETURNING id",
         conflict_target = crate::models::TITLE_SLOT_CONFLICT_TARGET,
+        lifecycle_case = crate::models::crdt_merge::lifecycle_local_taint_wins_case("excluded", "memories"),
+        newer_metadata = crate::models::crdt_merge::sqlite_title_slot_newer_metadata(),
         unstamped_owner =
             crate::identity::owner_stamp::sqlite_unstamped_predicate(
                 crate::identity::owner_stamp::UPSERT_SURVIVING_METADATA_COL,
@@ -18578,7 +18574,7 @@ pub fn archived_namespace_by_id(conn: &Connection, id: &str) -> Result<Option<St
 /// taken up front so a concurrent peer push can't slip a write between the
 /// read and the merge, and a failure rolls the whole merge back.
 ///
-/// 1. Look up the existing row BY `inbound.id` ([`get`]).
+/// 1. Look up the existing row BY `inbound.id` ([`get_any`] — ANY lifecycle).
 /// 2. **Existing row found** → `merged = merge_memory(&existing, inbound)`
 ///    (the SAME pure #224 reconciler the postgres adapter calls in Rust,
 ///    so there is no per-backend merge drift) and persist the FULL merged
@@ -18620,7 +18616,12 @@ pub fn merge_inbound(
     // `consolidate` / `size_gc`).
     let write_txn = connection::WriteTxn::begin(conn)?;
     let tx_result = (|| -> Result<Option<String>> {
-        match get(conn, &inbound.id)? {
+        // Boids item 3 R2.2 (#3905) — `get_any`, not `get`: `get` hides
+        // system-only rows, so a contaminated local row fell through to the
+        // insert lane instead of reaching `merge_memory` (whose R2.1
+        // predicate keeps the local taint). The postgres twin already reads
+        // the raw row by id (`SQL_SELECT_MEMORY_ROW_BY_ID`).
+        match get_any(conn, &inbound.id)? {
             Some(existing) => {
                 // #2123 — backend parity with `PostgresStore::merge_inbound`:
                 // the same-`id` field-merge path persists via
@@ -20822,8 +20823,8 @@ fn fts_keyword_phase(
     let fts_limit = limit.saturating_mul(3).max(30);
     let fts_sql = format!(
         "SELECT {cols}, m.embedding, m.{emb_space_col},
-                (fts.rank * -1) + (m.priority * 0.5) + (MIN(m.access_count, 50) * 0.1)
-                + (m.confidence * 2.0)
+                (fts.rank * -1) + (m.priority * 0.5) + (MIN(m.access_count, {cap}) * 0.1)
+                + (CASE WHEN m.confidence_source = 'default' OR m.confidence_source IS NULL THEN 0.5 ELSE m.confidence END * 2.0)
                 + (CASE m.tier WHEN 'long' THEN 3.0 WHEN 'mid' THEN 1.0 ELSE 0.0 END)
                 + (1.0 / (1.0 + (julianday('now') - julianday(m.updated_at)) * 0.1))
                 AS fts_score
@@ -20861,6 +20862,7 @@ fn fts_keyword_phase(
         // v1.0.0 R19/A3 (#1948) — fail-closed lifecycle allow-list on the
         // hybrid-recall FTS branch.
         lifecycle_vis = crate::models::lifecycle_visible_clause("m"),
+        cap = crate::models::ACCESS_SCORE_CAP,
     );
     // #3279 — canonicalize the since/until bounds; the SQL `strftime`
     // normalizes the stored column and the bound identically, so byte
@@ -21467,16 +21469,7 @@ fn blend_and_rank(
             // fts_score penalty alone would leave the loser fully ranked
             // through the cosine half). Reversible: the G7 rollback clears
             // the marker and full rank returns.
-            let soft_loser = mem
-                .metadata
-                .get(crate::models::field_names::CONTRADICTION_SOFT_LOSER)
-                .and_then(serde_json::Value::as_bool)
-                == Some(true);
-            let penalty = if soft_loser {
-                SOFT_LOSER_SCORE_FACTOR
-            } else {
-                1.0
-            };
+            let penalty = soft_loser_penalty(&mem.metadata);
             (mem, blended * decay * penalty)
         })
         .collect();
@@ -30842,18 +30835,21 @@ mod tests {
         conn
     }
 
-    /// Test 1 — the access-count auto-promote (fold/touch MAINTENANCE verb) is
-    /// COURT-BLIND: a `mid` row in a `promote: Owner` namespace still flips to
-    /// `long` at `PROMOTION_THRESHOLD`, because the fold is callerless frecency
-    /// bookkeeping and never consults the promote court.
+    /// Test 1 — v1.0.0 Boids item 1 (5-agent vote 4d3ea1c5): the recall
+    /// MAINTENANCE verb no longer auto-promotes. `touch` on a `mid` row whose
+    /// access_count crosses the historical `PROMOTION_THRESHOLD` leaves the tier
+    /// `mid` — recall popularity can no longer rewrite a row's tier, so the
+    /// court-blindness question is moot (there is no callerless tier change to
+    /// gate). `memory_promote` remains the sole tier-raising verb (still court-
+    /// gated — Test 2).
     #[test]
-    fn g10_3_access_count_auto_promote_is_court_blind() {
+    fn g10_3_touch_no_longer_auto_promotes() {
         let ns = "g10-3/court";
         let conn = court_ns_conn(ns);
         let mut m = make_memory("hot", ns, Tier::Mid, 5);
-        m.access_count = PROMOTION_THRESHOLD - 1;
+        m.access_count = crate::models::PROMOTION_THRESHOLD - 1;
         let id = insert(&conn, &m).unwrap();
-        // Drive the maintenance auto-promote (one bump crosses the threshold).
+        // One bump crosses the historical threshold; post-R2 it must NOT promote.
         touch(
             &conn,
             &id,
@@ -30861,17 +30857,22 @@ mod tests {
             crate::models::MID_TTL_EXTEND_SECS,
         )
         .unwrap();
-        let tier: String = conn
+        let (tier, access_count): (String, i64) = conn
             .query_row(
-                "SELECT tier FROM memories WHERE id = ?1",
+                "SELECT tier, access_count FROM memories WHERE id = ?1",
                 params![id],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
         assert_eq!(
-            tier, "long",
-            "access-count auto-promote is maintenance-exempt / court-blind (G10.3 §13); \
-             a v1.x suppress-in-adjudicated-namespaces opt-in would keep it 'mid'"
+            tier, "mid",
+            "post-Boids-R2 touch does not auto-promote — recall popularity no \
+             longer rewrites tier (memory_promote is the sole tier-raising verb)"
+        );
+        assert_eq!(
+            access_count,
+            crate::models::PROMOTION_THRESHOLD,
+            "access_count still folds (the bump the fold/touch keeps)"
         );
     }
 

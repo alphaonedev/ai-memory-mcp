@@ -10,7 +10,7 @@ layout: doc
 > is the supported deployment shape.
 >
 > **It is not a parity backend, and this guide does not claim it is.** At
-> v1.0.0 postgres serves **75 of the 88** unique production HTTP paths;
+> v1.0.0 postgres serves **76 of the 89** unique production HTTP paths;
 > the other **13 return `501 NOT IMPLEMENTED`**, and the **stdio MCP path
 > is SQLite-only** (`ai-memory mcp` always opens a local rusqlite
 > connection, so a postgres deployment serves MCP clients through the
@@ -59,7 +59,7 @@ ladder ends at `migrate_v100()`).
 version-stamp no-ops rather than real DDL, so a matching version number
 does not mean a matching set of tables: postgres ships no `skills` table
 (`migrate_v82` is a no-op) and no `governance_rules` table. Concretely,
-**75 of the 88 unique production HTTP paths are served on postgres and
+**76 of the 89 unique production HTTP paths are served on postgres and
 13 return a uniform `501 NOT IMPLEMENTED`** (fail-closed — never a
 silent read/write against the wrong database), and the **stdio MCP path
 is SQLite-only**. See "The 13 fully-501 paths" below for the exact
@@ -681,10 +681,10 @@ The eight remaining sqlite-only surfaces land here.
 > on a postgres-backed daemon, with "no residual 501 envelope on
 > standard endpoints" — the 501 being merely a safety net for unknown
 > or future routes. That OVERSTATED the delivered surface and is
-> **RETRACTED**. The measured, gate-pinned inventory is **75
-> pg-supported unique paths, 13 fully-501 paths, 88 unique paths
-> total** (`EXPECTED_PG_SUPPORTED_UNIQUE_PATHS = 75` /
-> `EXPECTED_FULLY_501_PATHS = 13` / `EXPECTED_TOTAL_UNIQUE_PATHS = 88`,
+> **RETRACTED**. The measured, gate-pinned inventory is **76
+> pg-supported unique paths, 13 fully-501 paths, 89 unique paths
+> total** (`EXPECTED_PG_SUPPORTED_UNIQUE_PATHS = 76` /
+> `EXPECTED_FULLY_501_PATHS = 13` / `EXPECTED_TOTAL_UNIQUE_PATHS = 89`,
 > `tests/pg_supported_route_inventory_gate_2799.rs`), and the
 > same gate freezes the allow-list membership so a silent match-arm
 > add or remove fails until the SSOT is updated in a reviewed edit. The
@@ -799,8 +799,10 @@ in `create_memory` / `delete_memory` / `create_link` /
 
 The full hybrid recall pipeline mirrors `db::recall_hybrid` (sqlite
 path) over pgvector + tsvector + ts_rank: 6-factor FTS sub-score
-(priority \* 0.5 + min(access_count, 50) \* 0.1 + confidence \* 2.0
-+ tier_bonus + recency_factor), 0.2 cosine gate, adaptive blend
+(priority \* 0.5 + min(access_count, 10) \* 0.1 + provenance-aware
+confidence \* 2.0 + tier_bonus + recency_factor; v1.0.0 Boids item 1,
+vote 4d3ea1c5: popularity capped at ACCESS_SCORE_CAP=10, unassessed/NULL
+confidence scored neutral 0.5), 0.2 cosine gate, adaptive blend
 (`semantic_weight = 0.50` for ≤500 chars, lerp to `0.15` at ≥5000
 chars), atomic touch ops (++access_count + TTL extension +
 mid→long auto-promotion at 5 accesses + ++priority every 10

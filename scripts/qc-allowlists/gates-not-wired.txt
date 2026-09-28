@@ -1,0 +1,18 @@
+# gates-not-wired.txt — the DELIBERATELY-UNWIRED gate-script ledger, enforced
+# by rule (g) of `scripts/check-required-contexts.sh` (#3967).
+#
+# FORMAT (one per line): <check-*.sh basename> <YYYY-MM-DD> #<issue> [note…]
+#
+# A `scripts/check-*.sh` that no workflow references on a non-comment line
+# must be listed here, dated and tracked, or rule (g) fails. A listed script
+# that a workflow DOES reference is a CONTRADICTION (fatal — delete the line
+# when you wire it); a listed script that no longer exists is STALE (fatal).
+#
+# WHY THE RULE EXISTS (#3967). Five of forty gates were referenced by no
+# workflow at all — including `check-url-sink-redaction.sh`, the
+# credential-leak gate written AFTER its class recurred four times (#3648,
+# #3649, #3667, #3674). Rule (f) (#2636) audits jobs that EXIST; a script with
+# no job was invisible to it. Every gate here is a dated decision, not a gap.
+#
+check-count-assertion-declared.sh 2026-09-26 #3967 reds on the promotion range a1403c742..HEAD for two already-landed carrier commits (7bf6d358a #3946, d478016b7 #3941) that carry no Count: trailer and cannot be rewritten; wire it (PR range = merge-base..head) once promotion 4 resets the range
+check-shared-namespace-claims.sh 2026-09-26 #3967 needs an explicit --base and scans the origin candidate queue (not a PR-shaped input); reports FAIL on the #3806 dup-branch finding until that queue resolves — wire advisory-first or with a fixed --base once the queue is empty

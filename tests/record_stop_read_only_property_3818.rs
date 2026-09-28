@@ -521,3 +521,27 @@ fn skill_export_is_write_fenced_under_record_stop_3818() {
         "the -32603 must be the record-stop refusal, not another -32603: {msg}"
     );
 }
+
+/// Boids item 3 (#3266, vote `4d3ea1c5`) — `memory_swarm_rewind` (and its
+/// `POST /api/v1/memory_swarm_rewind` mirror) is a class-(a) WRITER: it
+/// contaminates a provenance subtree, freezes routines and appends a signed
+/// event. It must NEVER join the read-only inventory the record-stop fence lets
+/// through, so it appears in neither the measured set nor the classified set.
+/// Explicit rather than incidental: a future edit that lists it as read-only
+/// fails HERE, not silently.
+#[test]
+fn swarm_rewind_is_a_writer_never_on_the_read_only_inventory_3266() {
+    let tool = "memory_swarm_rewind";
+    assert!(
+        !ai_memory::mcp::dispatch_test_hook::mcp_tool_is_read_only_for_test(tool),
+        "{tool} is a class-(a) WRITER and must stay off the read-only inventory (#3266)"
+    );
+    assert!(
+        !read_only_inventory().contains(tool),
+        "{tool} must not be enumerated as read-only (#3266)"
+    );
+    assert!(
+        !classification_only().contains(tool),
+        "{tool} must not be classified read-only (#3266)"
+    );
+}

@@ -7,8 +7,8 @@
 //! against a record-plane table must call `gate_record_stop`, except a
 //! minimal bookkeeping allowlist (touch / confidence-decay /
 //! recall-observation / `refund_update_growth` / `mark_recall_consumed`).
-//! `fold_recall_accesses` GATES (mid→long promote is a record-plane
-//! mutation). In-tx free functions (no `&self`) are out of
+//! `fold_recall_accesses` GATES (the fold's access-count / TTL
+//! bookkeeping is a record-plane mutation). In-tx free functions (no `&self`) are out of
 //! scope here — they cannot call the SAL gate; the B7 allowlist names
 //! their gated callers. `append_signed_event` stays ungated so resume
 //! can persist the attestation (ERRORS-09).

@@ -60,7 +60,7 @@ FTS_OPERATORS = {"AND", "OR", "NOT", "NEAR"}
 
 RECALL_SQL = """
 SELECT m.id, m.tags,
-       (fts.rank * -1) + (m.priority * 0.5) + (MIN(m.access_count,50)*0.1)
+       (fts.rank * -1) + (m.priority * 0.5) + (MIN(m.access_count,10)*0.1)
        + (m.confidence * 2.0)
        + (CASE m.tier WHEN 'long' THEN 3.0 WHEN 'mid' THEN 1.0 ELSE 0.0 END)
        + (1.0 / (1.0 + (julianday('now') - julianday(m.updated_at)) * 0.1))

@@ -56,7 +56,12 @@ serde_json = "1"
 # additional features yet and the API churn isn't worth pulling forward
 # in a release-gate cycle.
 schemars = "0.8"
-tokio = { version = "1", features = ["full"] }
+# #3745 / #3940 — floor at 1.52.1. tokio 1.52.0's sharded blocking pool
+# (tokio#7757) could leave a `spawn_blocking` task queued behind a running
+# one while it believed an idle thread would take it (tokio#8056, reverted in
+# 1.52.1 by tokio#8057); every webhook delivery runs on that pool. Pinned by
+# tests/spawn_blocking_no_starvation_3745.rs.
+tokio = { version = "1.52.1", features = ["full"] }
 # v0.7 K10 — Approval API SSE endpoint adapts a `tokio::sync::broadcast`
 # Receiver into the `futures_core::Stream` axum's `Sse` requires.
 # `tokio-stream`'s `BroadcastStream` wrapper does that bridging, and
@@ -385,7 +390,8 @@ tower = { version = "0.5", features = ["util"] }
 # (used by the daemon_runtime gc/wal-checkpoint loop tests) compile. The
 # production tokio dep keeps just "full" to avoid leaking the test-util
 # surface into release binaries.
-tokio = { version = "1", features = ["full", "test-util"] }
+# #3745 — same 1.52.1 floor as the runtime dependency above.
+tokio = { version = "1.52.1", features = ["full", "test-util"] }
 # W7 (v0.6.3) / I7 — binary-spawn integration tests. `assert_cmd` and
 # `predicates` are the standard pair for CLI subprocess assertions; the
 # production `reqwest` dep already has the `blocking` feature on, which

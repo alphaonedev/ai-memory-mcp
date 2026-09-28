@@ -1327,7 +1327,34 @@ pub(crate) fn sanitize_and_attest_inbound_pull_memory(
 /// resolver when no cryptographic verification can occur.
 pub(crate) fn sanitize_inbound_pull_memory(mem: &mut Memory) {
     strip_federated_pubkey_binding_or_warn(mem);
+    normalise_inbound_node_local_overlay_or_warn(mem);
     crate::federation::receive_auth::redact_inbound_before_attestation(mem);
+}
+
+/// Boids item 3 R2.3 (#3266, ruling tmux-22) — the receive-gate normalisation
+/// of a node-local containment overlay, shared by EVERY inbound federation
+/// funnel: the `/sync/push` write lane on both backends (called before the
+/// #1948 route-IN verdict [`maybe_quarantine_unattributed`]) and the pull /
+/// catch-up lanes (via [`sanitize_inbound_pull_memory`]). A wire
+/// `contaminated` / `quarantined` lifecycle lands `open` and a wire
+/// `metadata.contamination` marker is dropped
+/// ([`crate::models::crdt_merge::normalise_inbound_node_local_overlay`]). The
+/// send lanes never ship a hidden row, so a wire overlay is abnormal: WARN with
+/// identifying fields only (never content).
+pub(crate) fn normalise_inbound_node_local_overlay_or_warn(mem: &mut Memory) {
+    let wire_state = mem.lifecycle_state;
+    if crate::models::crdt_merge::normalise_inbound_node_local_overlay(mem) {
+        tracing::warn!(
+            target: ATTESTATION_TRACE_TARGET,
+            memory_id = %mem.id,
+            namespace = %mem.namespace,
+            wire_lifecycle_state = %wire_state.as_str(),
+            "federation receive: normalised a node-local containment overlay on an \
+             inbound row (lifecycle -> open when contaminated/quarantined; \
+             metadata.contamination dropped) — containment is node-local and never \
+             adopted from the wire (#3266 item 3 R2.3)"
+        );
+    }
 }
 
 /// v1.0.0 R19/A3 (#1948, decision `560c8007`) — route-IN quarantine of a
@@ -1389,6 +1416,46 @@ pub(super) fn row_is_agent_attested(mem: &Memory) -> bool {
         .get(crate::models::field_names::ATTEST_LEVEL)
         .and_then(serde_json::Value::as_str)
         == Some(crate::identity::verify::AttestLevel::AgentAttested.as_str())
+}
+
+/// #3901 (SEC, containment) — the row the #1948 route-OUT dequarantine-on-attest
+/// may clear after `merge_inbound` returned `applied_id`, shared by the sqlite
+/// and postgres receive funnels so the gate cannot diverge between backends.
+///
+/// `Some(applied_id)` only when BOTH hold:
+/// * the inbound unit is `agent_attested` (THIS node's verified verdict, never
+///   a peer self-assertion — [`row_is_agent_attested`]); and
+/// * the row `merge_inbound` wrote IS the inbound row (`applied_id ==
+///   inbound.id`).
+///
+/// An inbound id absent locally resolves through the `(title, namespace)`
+/// title-slot upsert on both backends, which returns the id of a DIFFERENT
+/// local row. The attestation covered the inbound unit only — never that other
+/// row, nor this node's decision to quarantine it (containment is node-local,
+/// #3266 item 3 part 5) — so the cross-id case is `None` and the other row's
+/// quarantine is left untouched (fail closed: at worst a legitimately
+/// attestable row stays hidden until an operator release; never an un-hide the
+/// attestation did not cover).
+#[must_use]
+pub(super) fn attest_dequarantine_target<'a>(
+    inbound: &Memory,
+    applied_id: &'a str,
+) -> Option<&'a str> {
+    if !row_is_agent_attested(inbound) {
+        return None;
+    }
+    if applied_id != inbound.id {
+        tracing::info!(
+            target: ATTESTATION_TRACE_TARGET,
+            inbound_id = %inbound.id,
+            applied_id = %applied_id,
+            "federation receive: attested inbound merged into a different local row via \
+             the (title, namespace) slot — route-OUT dequarantine skipped; that row's \
+             node-local containment is preserved (#3901)"
+        );
+        return None;
+    }
+    Some(applied_id)
 }
 
 /// #1920 (CWE-862) — authorship gate for an inbound federated PENDING
@@ -2779,6 +2846,10 @@ async fn sync_push_write(
         // signature/honor decision. A post-verification strip would mutate
         // the signed bytes while leaving `agent_attested` on the row.
         strip_federated_pubkey_binding_or_warn(&mut to_insert);
+        // Boids item 3 R2.3 (#3266) — a wire contaminated / quarantined overlay
+        // lands `open` (and its marker is dropped) BEFORE the #1948 route-IN
+        // verdict below, so any `quarantined` the merge sees is this node's own.
+        normalise_inbound_node_local_overlay_or_warn(&mut to_insert);
         // #1464 — capture the originally-claimed author BEFORE attribution
         // may rewrite it, so the content-attestation step can skip rows that
         // get re-attributed to the sender (an unauthorized third-party claim).
@@ -2987,24 +3058,29 @@ async fn sync_push_write(
             Ok(actual_id) => {
                 applied += 1;
                 // v1.0.0 R19/A3 (#1948) — route-OUT dequarantine-on-attest.
-                // #3750 — on THIS (sqlite) funnel `merge_inbound` does NOT
-                // field-merge a quarantined row's lifecycle_state via crdt_merge.
-                // Its same-id branch opens with `db::get`, which returns
-                // `lifecycle_state.is_recall_visible().then_some(row)` (#2402), so
-                // a quarantined / contaminated row reads back None and the branch
-                // is UNREACHABLE for it. The write falls through to
-                // `insert_if_newer`, whose SQL `CASE WHEN excluded.updated_at >
-                // memories.updated_at` arm resolves lifecycle by LWW and whose
-                // metadata REBUILD keeps only {agent_id, derived_from,
-                // consolidated_from_agents, agent_pubkey, pubkey_bound_at} — the
-                // contamination record is NOT among them, so it is DESTROYED
-                // (postgres PRESERVES it: the #3905 cross-backend parity gap).
-                // crdt_merge/LWW is the mechanism only for RECALL-VISIBLE states,
-                // which `db::get` returns. So we clear any prior quarantine
-                // EXPLICITLY via a raw UPDATE, independent of the merge (no-op on
-                // a non-quarantined row).
-                if row_is_agent_attested(&to_insert) {
-                    let _ = db::dequarantine(&lock.0, &actual_id);
+                // Boids item 3 R2.2 (#3905 closed): `merge_inbound`'s same-id
+                // branch now reads via `db::get_any`, so a quarantined /
+                // contaminated local row reaches `merge_memory`, whose R2.1
+                // predicate keeps the LOCAL overlay and whose metadata merge keeps
+                // the local contamination marker (postgres parity). The merge
+                // therefore never clears a quarantine; the attest upgrade clears
+                // it EXPLICITLY via a raw UPDATE (no-op on a non-quarantined row,
+                // and never touches a contaminated one).
+                // #3901 — only when the row written IS the inbound row: a
+                // cross-id title-slot merge returns a DIFFERENT local row's id,
+                // whose quarantine the attestation never covered.
+                if let Some(target) = attest_dequarantine_target(&to_insert, &actual_id)
+                    && let Err(e) = db::dequarantine(&lock.0, target)
+                {
+                    // The merge is committed; the row simply stays
+                    // quarantined (fail closed) — surface it, never swallow.
+                    tracing::warn!(
+                        target: ATTESTATION_TRACE_TARGET,
+                        memory_id = %target,
+                        error = %e,
+                        "sync_push: route-OUT dequarantine-on-attest failed; \
+                         row stays quarantined (#1948/#3901)"
+                    );
                 }
                 // #3631 — the row is committed (no outer transaction on this
                 // funnel): wake the local recipient when this apply delivered
@@ -5899,6 +5975,33 @@ mod tests {
     fn extract_peer_id_absent_returns_none() {
         let h = HeaderMap::new();
         assert_eq!(extract_peer_id(&h), None);
+    }
+
+    /// Boids item 3 R2.3 (#3266) — the PULL / catch-up lanes reach the
+    /// receive-gate normalisation through `sanitize_inbound_pull_memory` (the
+    /// one pre-apply step every pull funnel calls on both backends).
+    #[test]
+    fn pull_sanitize_normalises_a_wire_overlay_3266() {
+        use crate::models::LifecycleState;
+        for st in [LifecycleState::Contaminated, LifecycleState::Quarantined] {
+            let mut m = wsig_mem("ai:curator");
+            m.lifecycle_state = st;
+            m.metadata.as_object_mut().unwrap().insert(
+                crate::storage::CONTAMINATION_METADATA_KEY.to_string(),
+                serde_json::json!({"prior_lifecycle_state": "done"}),
+            );
+            sanitize_inbound_pull_memory(&mut m);
+            assert_eq!(m.lifecycle_state, LifecycleState::Open, "{st:?}");
+            assert!(
+                m.metadata
+                    .get(crate::storage::CONTAMINATION_METADATA_KEY)
+                    .is_none()
+            );
+        }
+        let mut t = wsig_mem("ai:curator");
+        t.lifecycle_state = LifecycleState::Tombstoned;
+        sanitize_inbound_pull_memory(&mut t);
+        assert_eq!(t.lifecycle_state, LifecycleState::Tombstoned, "variant B");
     }
 
     // -- #1948 route-IN quarantine helper -------------------------------

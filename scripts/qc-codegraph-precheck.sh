@@ -58,7 +58,14 @@ fi
 # production file containing a sentinel-form for_admin call, expects
 # the main check to HARD-BLOCK, then cleans up.
 if [[ "${1:-}" == "--self-test" ]]; then
-    python3 "${ROOT}/scripts/tests/gate-production-3623.py" "$(basename "$0")"
+    # The load-bearing DETECTOR probes (#1651 for_admin, #3943
+    # for_admin_checked) run FIRST so a failure in the #3623 scenario harness
+    # below cannot stop them from running. The harness used to run here under
+    # `set -e`; on this base it fails cases 19/20/22 (a PRE-EXISTING
+    # GOVERNANCE_INTERNAL carve-out line-pin staleness after the carrier moved
+    # store/postgres.rs — unrelated to #3943, reported separately) and aborted
+    # the whole self-test before any probe ran. It now runs LAST, so its status
+    # is still the self-test's exit while the detector probes stay reachable.
     PROBE="${ROOT}/src/c8_probe_1651.rs"
     trap 'rm -f "${PROBE}"' EXIT
     cat > "${PROBE}" <<'PROBE_EOF'
@@ -72,7 +79,85 @@ PROBE_EOF
         exit 1
     fi
     echo "C8 SELF-TEST PASS: sentinel-form for_admin injection HARD-BLOCKed as expected"
-    exit 0
+    rm -f "${PROBE}"
+
+    # #3943 — prove the literal-second-argument detector is load-bearing. One
+    # known-POSITIVE (a production literal, the quarantine.rs:182 shape with
+    # inner parens in arg 1) must HARD-BLOCK; three known-NEGATIVES must PASS —
+    # they are the exact false-positive classes f2r measured in the pre-review:
+    # the gate's own threaded shape, a #[cfg(test)] literal, and a comment.
+    PROBE3943="${ROOT}/src/c8_probe_3943.rs"
+    trap 'rm -f "${PROBE}" "${PROBE3943}"' EXIT
+
+    # known-POSITIVE — must be DETECTED (bare "$0" must exit non-zero).
+    cat > "${PROBE3943}" <<'PROBE3943_EOF'
+// C8 #3943 self-test probe (transient; created + removed by --self-test)
+pub fn probe() {
+    let ctx = crate::store::CallerContext::for_admin_checked(caller.clone(), true);
+    let _ = ctx;
+}
+PROBE3943_EOF
+    if "$0" >/dev/null 2>&1; then
+        echo "C8 SELF-TEST FAIL (#3943): production for_admin_checked(.., true) was NOT detected" >&2
+        exit 1
+    fi
+
+    # known-NEGATIVE 1 — the blessed swarm_rewind shape: the second argument is
+    # the gate result, not a literal. Must PASS.
+    cat > "${PROBE3943}" <<'PROBE3943_EOF'
+// C8 #3943 self-test probe (transient)
+pub fn probe() {
+    let (caller, is_admin) = match require_admin() {
+        Ok(c) => (c, true),
+        Err(resp) => return resp,
+    };
+    let ctx = crate::store::CallerContext::for_admin_checked(caller, is_admin);
+    let _ = ctx;
+}
+PROBE3943_EOF
+    if ! "$0" >/dev/null 2>&1; then
+        echo "C8 SELF-TEST FAIL (#3943): threaded for_admin_checked(caller, is_admin) was flagged" >&2
+        exit 1
+    fi
+
+    # known-NEGATIVE 2 — a literal inside #[cfg(test)] (production_lines blanks
+    # it, mirroring store/mod.rs:7774, the #1062 constructor coverage test).
+    cat > "${PROBE3943}" <<'PROBE3943_EOF'
+// C8 #3943 self-test probe (transient)
+#[cfg(test)]
+mod tests {
+    fn cov() {
+        let _ = crate::store::CallerContext::for_admin_checked("ops:admin", true);
+    }
+}
+PROBE3943_EOF
+    if ! "$0" >/dev/null 2>&1; then
+        echo "C8 SELF-TEST FAIL (#3943): a #[cfg(test)] for_admin_checked(.., true) was flagged" >&2
+        exit 1
+    fi
+
+    # known-NEGATIVE 3 — a COMMENT that spells the pattern (store/mod.rs:7772).
+    cat > "${PROBE3943}" <<'PROBE3943_EOF'
+// C8 #3943 self-test probe (transient)
+// for_admin_checked(.., true) yields a bypass-visibility admin ctx; pins #1062.
+pub fn probe() {}
+PROBE3943_EOF
+    if ! "$0" >/dev/null 2>&1; then
+        echo "C8 SELF-TEST FAIL (#3943): a COMMENT spelling for_admin_checked(.., true) was flagged" >&2
+        exit 1
+    fi
+
+    rm -f "${PROBE3943}"
+    echo "C8 SELF-TEST PASS (#3943): production literal second-arg HARD-BLOCKed; threaded / #[cfg(test)] / comment forms accepted"
+
+    # #3623 production-boundary scenario harness runs LAST (see the note at the
+    # top of this block). Its exit status is the self-test's. On this base it
+    # fails cases 19/20/22 (pre-existing, unrelated to #3943).
+    set +e
+    python3 "${ROOT}/scripts/tests/gate-production-3623.py" "$(basename "$0")"
+    harness_rc=$?
+    set -e
+    exit "${harness_rc}"
 fi
 
 # Enumerate production sites through the shared #3623 item filter.
@@ -256,6 +341,31 @@ check_diff () {
 
 check_diff "CallerContext::for_agent" "$CURRENT_FOR_AGENT_NORM" "$ALLOW_FOR_AGENT_BODY"
 check_diff "CallerContext::for_admin" "$CURRENT_FOR_ADMIN_NORM" "$ALLOW_FOR_ADMIN_BODY"
+
+# #3943 — a LITERAL bool in the SECOND argument of `for_admin_checked(` severs
+# the type dependency on the admin gate: a free-standing `.., true` still
+# compiles after the gate is removed, silently yielding an admin-bypass
+# context. No allowlist — the second argument MUST be the gate's result
+# (threaded from a `require_admin` Ok arm). Paren-aware + multi-line +
+# comment/test-skipping; see scripts/tests/for-admin-checked-literal-3943.py.
+checked_literal_hits=""
+# Prefilter to the files that actually contain the call (a call always opens
+# `for_admin_checked(` on one line, even when the ARGS wrap) so the paren-aware
+# python parser runs on a handful of files, not one startup per src file.
+while IFS= read -r f; do
+    [[ -z "$f" ]] && continue
+    hits="$(production_lines "$f" \
+        | python3 "${ROOT}/scripts/tests/for-admin-checked-literal-3943.py" "${f#"${ROOT}/"}")"
+    [[ -n "${hits}" ]] && checked_literal_hits+="${hits}"$'\n'
+done < <(grep -rlF --include='*.rs' 'for_admin_checked(' "${ROOT}/src" 2>/dev/null || true)
+checked_literal_hits="$(printf '%s' "${checked_literal_hits}" | grep -v '^$' || true)"
+if [[ -n "${checked_literal_hits}" ]]; then
+    echo "C8 HARD-BLOCK (#3943): for_admin_checked(.., <literal bool>) in production." >&2
+    echo "  The second argument must be threaded from the admin gate (require_admin Ok" >&2
+    echo "  arm), never a literal — a literal still compiles after the gate is removed." >&2
+    printf '%s\n' "${checked_literal_hits}" | sed 's/^/    /' >&2
+    violations=$(( violations + 1 ))
+fi
 
 if (( violations > 0 )); then
     echo "" >&2

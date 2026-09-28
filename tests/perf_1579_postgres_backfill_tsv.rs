@@ -349,7 +349,7 @@ async fn b2_search_plan_reads_tsv_column_not_expression_recompute() {
     let explain_sql = "EXPLAIN ANALYZE SELECT *,
             ts_rank(tsv, to_tsquery('english', $1))
             + (priority * 0.5)
-            + (LEAST(access_count, 50) * 0.1)
+            + (LEAST(access_count, 10) * 0.1) -- mirrors models::ACCESS_SCORE_CAP
             + (confidence * 2.0)
             + CASE tier WHEN 'long' THEN 3.0 WHEN 'mid' THEN 1.0 ELSE 0.0 END
             + (1.0 / (1.0 + EXTRACT(EPOCH FROM (NOW() - updated_at)) / 86400.0 * 0.1))

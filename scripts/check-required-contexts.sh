@@ -236,6 +236,20 @@
 #
 # CLI:
 #   scripts/check-required-contexts.sh              — run the gate (exit 0/1)
+#   (g) HARD-FAIL (#3967): every gate SCRIPT `scripts/check-*.sh` must be
+#       referenced by name, on a NON-COMMENT line, in some workflow under
+#       `.github/workflows/`, OR carry a dated, tracked entry in
+#       `scripts/qc-allowlists/gates-not-wired.txt` (`<check-*.sh> <YYYY-MM-DD>
+#       #<issue>`). Rule (f) audits jobs that EXIST; a script with no job is
+#       invisible to it — there is nothing in any workflow to enumerate. That is
+#       #3967: five of forty gates ran NOWHERE, including the credential-leak
+#       gate (`check-url-sink-redaction.sh`) written AFTER its class recurred
+#       four times — coverage in appearance only, one layer below the control
+#       built for this family. Stale ledger entries are FATAL in both
+#       directions (a listed script that a workflow does reference; a listed
+#       script that no longer exists), a commented-out reference does NOT
+#       count as wiring, and an empty script set fails closed.
+#
 #   scripts/check-required-contexts.sh --self-test  — plant the historical
 #       shapes in a throwaway copy UNDER the repo (never system /tmp) and
 #       confirm the gate rejects EACH: the (b1) matrix+`if:` wedge, an (a)
@@ -279,6 +293,8 @@ MIRROR_FILE="${RQC_MIRROR_FILE:-$ROOT/scripts/qc-allowlists/required-contexts-re
 ALLOW_FILE="${RQC_ALLOW_FILE:-$ROOT/scripts/qc-allowlists/required-contexts-joblevel-if-allow.txt}"
 DUPTRIG_ALLOW_FILE="${RQC_DUPTRIG_ALLOW_FILE:-$ROOT/scripts/qc-allowlists/dual-trigger-cancel-allow.txt}"
 NOTREQ_FILE="${RQC_NOTREQ_FILE:-$ROOT/scripts/qc-allowlists/required-contexts-not-required.txt}"
+SCRIPTS_DIR="${RQC_SCRIPTS_DIR:-$ROOT/scripts}"
+NOTWIRED_FILE="${RQC_NOTWIRED_FILE:-$ROOT/scripts/qc-allowlists/gates-not-wired.txt}"
 PROTECTED_BRANCH="${RQC_PROTECTED_BRANCH:-release/v1.0.0}"
 CLASSIFY_JOB="${RQC_CLASSIFY_JOB:-classify}"
 
@@ -1136,12 +1152,81 @@ run_gate() {
         echo "     Unlike the rule (d) pending-fix ledger — where a stale line can only suppress a failure that no longer happens — a stale line HERE pre-absolves whatever job next takes that id, in the workflow where integrity gates live. It is therefore fatal, not advisory. FIX: delete the line." >&2
     done
 
+    # ---- rule (g): no gate SCRIPT may exist that no workflow runs (#3967) --
+    #
+    # Rule (f) audits jobs that EXIST. A `scripts/check-*.sh` with no job is
+    # invisible to it: there is nothing in any workflow to enumerate. That is
+    # #3967: five of forty gates — including the credential-leak gate written
+    # AFTER its class recurred four times — were referenced by no workflow at
+    # all, so each was coverage in appearance only. "Referenced" means the
+    # script's basename appears on a NON-COMMENT line of a workflow file: a
+    # commented-out `run:` is exactly the shape that would let a gate be
+    # switched off in place and still read as wired.
+    declare -A NOTWIRED=() NOTWIRED_REF=() NOTWIRED_USED=()
+    local -a notwired_lines=()
+    mapfile -t notwired_lines < <(read_list "$NOTWIRED_FILE")
+    local gline gscript gdate gref
+    for gline in "${notwired_lines[@]}"; do
+        # FORMAT: <check-*.sh basename> <YYYY-MM-DD> #<issue> [note…]
+        read -r gscript gdate gref _ <<< "$gline"
+        if [ -z "$gscript" ] || [[ ! "$gscript" =~ ^check-[A-Za-z0-9._-]+\.sh$ ]] \
+            || [[ ! "$gdate" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] \
+            || [[ ! "$gref" =~ ^#[0-9]+$ ]]; then
+            fail "GATES-NOT-WIRED LEDGER MALFORMED — '$gline' in $NOTWIRED_FILE."
+            echo "     Every entry MUST be '<check-*.sh basename> <YYYY-MM-DD> #<issue>'. The date records WHEN the decision to leave a gate unwired was taken and the issue is what closes it; without both, an entry rots into an unexplained suppression." >&2
+            continue
+        fi
+        NOTWIRED["$gscript"]=1
+        NOTWIRED_REF["$gscript"]="$gdate $gref"
+    done
+
+    local gpath gbase gwired gwf gate_count=0
+    for gpath in "$SCRIPTS_DIR"/check-*.sh; do
+        [ -e "$gpath" ] || continue
+        gate_count=$((gate_count + 1))
+        gbase="$(basename "$gpath")"
+        gwired=0
+        for gwf in "$WORKFLOW_DIR"/*.yml "$WORKFLOW_DIR"/*.yaml; do
+            [ -f "$gwf" ] || continue
+            # NOT `grep -q`: under `pipefail` an early grep exit sends sed
+            # SIGPIPE on any workflow longer than a pipe buffer, the pipeline
+            # reads as FAILED, and every real gate scores "unwired" while the
+            # small self-test fixture passes — measured on first run (#3967).
+            if sed 's/^[[:space:]]*#.*$//' "$gwf" | grep -F -- "$gbase" >/dev/null; then
+                gwired=1
+                break
+            fi
+        done
+        if [ -n "${NOTWIRED[$gbase]:-}" ]; then
+            NOTWIRED_USED["$gbase"]=1
+            if [ "$gwired" = "1" ]; then
+                fail "GATES-NOT-WIRED LEDGER CONTRADICTION — '$gbase' is listed in $NOTWIRED_FILE (${NOTWIRED_REF[$gbase]}) but a workflow in $WORKFLOW_DIR references it on a non-comment line."
+                echo "     A gate cannot be both wired and deliberately-unwired. The entry is STALE: it was presumably kept when the gate was wired. DELETE it — left in place it silently pre-absolves the next un-wiring of that script." >&2
+            fi
+            continue
+        fi
+        [ "$gwired" = "1" ] && continue
+        fail "RULE (g) — gate script '$gbase' is referenced by NO workflow in $WORKFLOW_DIR (non-comment lines) and carries no entry in $NOTWIRED_FILE."
+        echo "     A check-*.sh that nothing runs is coverage in appearance only: it cannot fail, so it cannot protect anything. That is #3967 — five of forty gates, including the credential-leak gate written after its class recurred four times." >&2
+        echo "     FIX (almost always the right one): add a job that runs 'bash scripts/$gbase' (plus its --self-test) to a gating workflow, then declare that job per rule (f)." >&2
+        echo "     OR, if leaving it unwired is a deliberate, dated, tracked decision: add '$gbase $(date -u +%Y-%m-%d) #<issue>' to $NOTWIRED_FILE. That is a decision record, not an absolution." >&2
+    done
+    if [ "$gate_count" -eq 0 ]; then
+        fail "RULE (g) SCOPE — no check-*.sh scripts found under $SCRIPTS_DIR."
+        echo "     Refusing to pass a scope that covers nothing (fail-closed): a mistyped RQC_SCRIPTS_DIR would otherwise make rule (g) vacuous." >&2
+    fi
+    for gbase in "${!NOTWIRED[@]}"; do
+        [ -z "${NOTWIRED_USED[$gbase]:-}" ] || continue
+        fail "GATES-NOT-WIRED LEDGER STALE — '$gbase' (${NOTWIRED_REF[$gbase]}) is listed in $NOTWIRED_FILE but no such script exists under $SCRIPTS_DIR."
+        echo "     A stale line here pre-absolves whatever gate is next created under that name. Fatal, not advisory. FIX: delete the line." >&2
+    done
+
     [ "$FAILURES" -eq 0 ]
 }
 
 # --- self-test --------------------------------------------------------------
 selftest() {
-    echo "required-contexts gate: self-test (clean control -> PASS; #2494 (b1) matrix+if wedge -> FAIL; (a) unmatched mirror context -> FAIL; #2473 (e) unquoted ' #' job name -> FAIL (and the parse is asserted truncated); (c) paths-filtered carrier -> FAIL; (b3) unguarded step -> FAIL; (b4) decider with job-level if -> FAIL even when allowlisted; #2508 (d) verbatim cancelled-duplicate carrier -> FAIL, its four near-miss shapes -> PASS; #2636 (f) a gating-workflow job declared in NEITHER the mirror nor the not-required ledger -> FAIL)"
+    echo "required-contexts gate: self-test (clean control -> PASS; #2494 (b1) matrix+if wedge -> FAIL; (a) unmatched mirror context -> FAIL; #2473 (e) unquoted ' #' job name -> FAIL (and the parse is asserted truncated); (c) paths-filtered carrier -> FAIL; (b3) unguarded step -> FAIL; (b4) decider with job-level if -> FAIL even when allowlisted; #2508 (d) verbatim cancelled-duplicate carrier -> FAIL, its four near-miss shapes -> PASS; #2636 (f) a gating-workflow job declared in NEITHER the mirror nor the not-required ledger -> FAIL; #3967 (g) a check-*.sh referenced by no workflow -> FAIL)"
 
     # Fixtures are staged under the repo's gitignored `.local-runs/` scratch
     # root — never system /tmp (project hard rule), and never `mktemp -d`,
@@ -1161,10 +1246,16 @@ selftest() {
 
     local wf="$scratch/wf" al="$scratch/allow.txt" mi="$scratch/mirror.txt"
     local dal="$scratch/duptrig-allow.txt" nrq="$scratch/not-required.txt"
-    mkdir -p "$wf"
+    local nwd="$scratch/gates-not-wired.txt" sd="$scratch/scripts"
+    mkdir -p "$wf" "$sd"
     : > "$al"
     : > "$dal"
     : > "$nrq"
+    : > "$nwd"
+    # Rule (g)'s fixture script set: ONE gate, wired by the clean workflow's
+    # classify body below (a non-comment `run:` line). Every leg that is not
+    # about rule (g) therefore sees a wired set and cannot fail on (g).
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$sd/check-alpha.sh"
 
     # Rule (f)'s scope is pointed at the fixture's ONE workflow. The real
     # default names three workflows that do not exist in this scratch tree, and
@@ -1198,6 +1289,7 @@ jobs:
           #       - name: not a real step
           #         if: bogus
           echo "docs_only=false" >> "$GITHUB_OUTPUT"
+          bash scripts/check-alpha.sh
   check:
     name: Check (${{ matrix.os }})
     needs: classify
@@ -1268,6 +1360,7 @@ TXT
             set +e
             RQC_WORKFLOW_DIR="$wf" RQC_MIRROR_FILE="$mi" RQC_ALLOW_FILE="$al" \
                 RQC_DUPTRIG_ALLOW_FILE="$dal" RQC_NOTREQ_FILE="$nrq" \
+                RQC_SCRIPTS_DIR="$sd" RQC_NOTWIRED_FILE="$nwd" \
                 RQC_COVERED_WORKFLOWS="$covered" \
                 RQC_PROTECTED_BRANCH="release/v1.0.0" \
                 bash "${BASH_SOURCE[0]}" >/dev/null 2>&1
@@ -1572,6 +1665,7 @@ YAML
     run_out() {
         RQC_WORKFLOW_DIR="$wf" RQC_MIRROR_FILE="$mi" RQC_ALLOW_FILE="$al" \
             RQC_DUPTRIG_ALLOW_FILE="$dal" RQC_NOTREQ_FILE="$nrq" \
+            RQC_SCRIPTS_DIR="$sd" RQC_NOTWIRED_FILE="$nwd" \
             RQC_COVERED_WORKFLOWS="$covered" \
             RQC_PROTECTED_BRANCH="release/v1.0.0" \
             bash "${BASH_SOURCE[0]}" 2>&1 || true
@@ -1745,7 +1839,62 @@ YAML
     fi
     echo "  [f] scope cross-check (uncovered carrier FAILS, vanished covered workflow FAILS): the scope cannot silently narrow"
 
-    echo "required-contexts gate self-test: PASS (load-bearing — catches the #2494 (b1) wedge, the (a) unmatched-context class, the (c) path-filtered carrier, the (b3) unguarded step, the (b4) unallowlistable decider 'if:', both directions of the (b2) ratchet, the (d) #2508 cancelled-duplicate carrier in its verbatim historical form, and the (f) #2636 unenforced-by-default job with its ledger-rot and scope cross-checks; spares a clean tree, all four (d) near-miss shapes, and both legitimate (f) dispositions)"
+    # ---- (g) a gate script that NO workflow references (#3967) ------------
+    #
+    # Rule (f) reasons workflow -> job; it cannot see a script with no job.
+    # This leg plants exactly that: a well-formed check-*.sh under the fixture
+    # scripts dir that nothing in the fixture workflow runs.
+    g_expect() { # $1 label  $2 expected-rc-class (0|nonzero)  $3 needle-in-output (or "")
+        local g_out g_rc
+        g_out="$(run_out)"
+        g_rc="$(run_fixture)"
+        if [ "$2" = "0" ] && [ "$g_rc" != "0" ]; then
+            echo "  [g] $1: expected PASS, got exit $g_rc. Output was:" >&2; printf '%s\n' "$g_out" >&2; return 2
+        fi
+        if [ "$2" != "0" ] && [ "$g_rc" = "0" ]; then
+            echo "  [g] $1: NOT CAUGHT (gate passed) — FAIL" >&2; return 2
+        fi
+        if [ -n "$3" ]; then
+            case "$g_out" in
+                *"$3"*) ;;
+                *) echo "  [g] $1: rejected, but NOT via the expected rule ('$3' absent) — the leg would pass for the wrong reason. Output was:" >&2; printf '%s\n' "$g_out" >&2; return 2 ;;
+            esac
+        fi
+        return 0
+    }
+    write_clean
+    : > "$nwd"
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$sd/check-omega.sh"
+    g_expect "unwired gate script" nonzero "RULE (g) — gate script 'check-omega.sh'" || return 2
+    # a COMMENTED-OUT reference must not count as wiring
+    printf '      # bash scripts/check-omega.sh (switched off in place)\n' >> "$wf/ci.yml"
+    grep -q 'check-omega.sh' "$wf/ci.yml" || { echo "  [g] fixture injection FAILED (self-test is broken, not the gate)" >&2; return 2; }
+    g_expect "commented-out reference" nonzero "RULE (g) — gate script 'check-omega.sh'" || return 2
+    # the legitimate disposition: a dated, tracked ledger entry PASSES
+    write_clean
+    printf 'check-omega.sh 2026-09-26 #3967 needs a --base the PR event cannot supply\n' > "$nwd"
+    g_expect "dated+tracked ledger entry" 0 "" || return 2
+    # ledger hygiene: malformed / stale / contradicting entries all FAIL
+    printf 'check-omega.sh #3967\n' > "$nwd"
+    g_expect "undated ledger entry" nonzero "GATES-NOT-WIRED LEDGER MALFORMED" || return 2
+    printf 'check-omega.sh 2026-09-26 3967\n' > "$nwd"
+    g_expect "issue reference not #<n>" nonzero "GATES-NOT-WIRED LEDGER MALFORMED" || return 2
+    rm -f "$sd/check-omega.sh"
+    printf 'check-omega.sh 2026-09-26 #3967\n' > "$nwd"
+    g_expect "stale ledger entry (no such script)" nonzero "GATES-NOT-WIRED LEDGER STALE" || return 2
+    printf 'check-alpha.sh 2026-09-26 #3967\n' > "$nwd"
+    g_expect "ledger entry for a WIRED script" nonzero "GATES-NOT-WIRED LEDGER CONTRADICTION" || return 2
+    : > "$nwd"
+    # an empty script set fails closed (a mistyped scripts dir is not a pass)
+    local sd_saved="$sd"; sd="$scratch/no-such-scripts"
+    g_expect "empty scripts dir" nonzero "RULE (g) SCOPE" || { sd="$sd_saved"; return 2; }
+    sd="$sd_saved"
+    # clean control: the wired fixture gate alone PASSES
+    write_clean
+    g_expect "clean control" 0 "" || return 2
+    echo "  [g] a gate script no workflow references: CAUGHT BY RULE (g) (a commented-out reference does not count; a dated+tracked ledger entry passes; undated / non-#issue / stale / wired-but-ledgered entries and an empty script set all FAIL)"
+
+    echo "required-contexts gate self-test: PASS (load-bearing — catches the #2494 (b1) wedge, the (a) unmatched-context class, the (c) path-filtered carrier, the (b3) unguarded step, the (b4) unallowlistable decider 'if:', both directions of the (b2) ratchet, the (d) #2508 cancelled-duplicate carrier in its verbatim historical form, and the (f) #2636 unenforced-by-default job with its ledger-rot and scope cross-checks, and the (g) #3967 gate script no workflow runs with its own ledger hygiene; spares a clean tree, all four (d) near-miss shapes, both legitimate (f) dispositions, and a dated (g) ledger entry)"
 }
 
 if [ "${1:-}" = "--self-test" ]; then

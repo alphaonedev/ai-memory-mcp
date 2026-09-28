@@ -351,7 +351,7 @@ struct FoldedRow {
 // awaits); each test runs on its own thread + runtime, so a blocked
 // std::Mutex merely parks that test thread.
 #[expect(clippy::await_holding_lock)]
-async fn postgres_sqlite_fold_parity_promotion_decade_and_decay() {
+async fn postgres_sqlite_fold_parity_no_escalation_and_decay() {
     let _g = env_lock();
     clear_flags();
     common::permissive_attestation_for_tests();
@@ -480,16 +480,27 @@ async fn postgres_sqlite_fold_parity_promotion_decade_and_decay() {
         .expect("sqlite read");
 
     assert_eq!(pg.access_count, sq.access_count, "access_count parity");
-    assert_eq!(pg.access_count, 11, "2 + 9 observations");
+    assert_eq!(
+        pg.access_count, 11,
+        "2 + 9 observations — access still folds"
+    );
     assert_eq!(pg.tier, sq.tier, "tier parity");
-    assert_eq!(pg.tier, "long", "promotion crossed in a single window");
+    // v1.0.0 Boids item 1 (5-agent vote 4d3ea1c5): the fold no longer
+    // escalates on either backend — the mid row does NOT promote despite
+    // crossing threshold 5, and priority does NOT bump despite crossing a
+    // decade. Both backends stay identical (the parity this test exists
+    // for) at the NEW no-escalation contract.
+    assert_eq!(pg.tier, "mid", "R2: fold no longer auto-promotes mid→long");
     assert_eq!(pg.priority, sq.priority, "priority parity");
-    assert_eq!(pg.priority, 6, "one decade crossed (2 → 11)");
+    assert_eq!(pg.priority, 5, "R2: fold no longer bumps priority");
     assert_eq!(
         pg.expires_is_null, sq.expires_is_null,
         "expires_at-window parity"
     );
-    assert!(pg.expires_is_null, "promotion clears expires_at");
+    assert!(
+        !pg.expires_is_null,
+        "R2: mid row keeps a non-NULL expiry (no promotion clear)"
+    );
     // Decay parity with timestamp normalization: both backends decay
     // 0.9 from the SAME created_at anchor at (approximately) the same
     // wall-clock instant — the residual difference is the sub-second

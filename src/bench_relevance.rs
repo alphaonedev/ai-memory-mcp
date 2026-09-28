@@ -60,7 +60,8 @@
 //!   contamination is attributable to the `priority * 0.5` frecency term.
 //! - [`Scenario::AdversarialAccessOnly`] — distractors crank ONLY
 //!   `access_count` (`priority` held equal to the relevant rows), so the
-//!   contamination is attributable to the `MIN(access_count, 50) * 0.1`
+//!   contamination is attributable to the `MIN(access_count, ACCESS_SCORE_CAP)`
+//!   `* 0.1` (ACCESS_SCORE_CAP = 10 at v1.0.0, Boids item 1)
 //!   term — this is the term the access-count cap governs, so the row is
 //!   the direct test of whether that cap is sufficient. Holding the
 //!   relevant-row baseline (COLD) constant across the three adversarial
@@ -138,7 +139,8 @@ pub const DISTRACTOR_CORPUS_FRACTION: f64 = 0.10;
 pub const HOT_PRIORITY: i32 = 10;
 
 /// `access_count` value for a HOT row. Far above the scorer's documented
-/// `MIN(access_count, 50)` cap, so the access-only scenario exercises the
+/// `MIN(access_count, crate::models::ACCESS_SCORE_CAP)` cap (10 at v1.0.0),
+/// so the access-only scenario exercises the
 /// cap: the harness reveals whether the cap is sufficient to stop
 /// popularity from dominating textual relevance.
 pub const HOT_ACCESS_COUNT: i64 = 50_000;

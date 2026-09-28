@@ -767,6 +767,14 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0  # #3872 requires complete ancestry, not the merge checkout alone.
+      # #3872: the original PR head must contain the pinned release base.
+      # The synthetic merge checkout would always hide BEHIND geometry.
+      - name: Promotion ancestry soundness (#3872)
+        run: bash scripts/check-promotion-geometry.sh --github-event "$GITHUB_EVENT_PATH"
+      - name: Self-test promotion ancestry (including BEHIND negative control)
+        run: bash scripts/check-promotion-geometry.sh --self-test
       - name: Run required-contexts gate
         run: bash scripts/check-required-contexts.sh
       - name: Declared-vs-live required-context drift (#3554 / #2712)
@@ -1195,3 +1203,74 @@ jobs:
           re-run this job. Any new push voids the approval.
           MSG
           exit 1
+
+  # ---------------------------------------------------------------------------
+  # #3967 — three gates that existed and ran NOWHERE. Rule (g) of
+  # check-required-contexts.sh now fails a check-*.sh that no workflow
+  # references, so these jobs are the burn-down half of that finding; the two
+  # gates still unwired (`check-count-assertion-declared.sh`,
+  # `check-shared-namespace-claims.sh`) carry dated entries in
+  # scripts/qc-allowlists/gates-not-wired.txt with the reason each cannot run
+  # on a PR event today. All three jobs are declared in
+  # required-contexts-not-required.txt (rule (f)) until the branch-protection
+  # call + live-pin update promote them together.
+  url-sink-redaction-gate:
+    # #3688 gate 2 — a URL-shaped value interpolated into a log / error sink
+    # (DSN password, basic-auth userinfo, API key in the query). Written after
+    # the class recurred FOUR times (#3648 #3649 #3667 #3674) and, until
+    # #3967, invoked by nothing.
+    name: "URL-sink redaction gate (#3688 / #3967)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Run URL-sink redaction gate
+        run: bash scripts/check-url-sink-redaction.sh
+      - name: Self-test the gate (regression evidence)
+        run: bash scripts/check-url-sink-redaction.sh --self-test
+
+  stale-contract-assertions-gate:
+    # #3688 gate 4 — a lane that changes a string literal in src/ that some
+    # test asserts on must repair the pin in the same change. Cargo-free; runs
+    # over the PR's merge-base..head range (a two-dot diff against the base
+    # SHA would attribute base-only changes to the PR — the #2488 lesson).
+    name: "Stale contract-assertion gate (#3688 / #3967)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - name: Run stale contract-assertion gate over the change range
+        env:
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          GITHUB_EVENT_BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            base="$(git merge-base "$PR_BASE_SHA" "$PR_HEAD_SHA")"
+            range="$base..$PR_HEAD_SHA"
+          elif [ -n "${GITHUB_EVENT_BEFORE:-}" ] && [ "$GITHUB_EVENT_BEFORE" != "0000000000000000000000000000000000000000" ] \
+               && git rev-parse --verify --quiet "$GITHUB_EVENT_BEFORE^{commit}" >/dev/null; then
+            range="$GITHUB_EVENT_BEFORE..$GITHUB_SHA"
+          else
+            range="HEAD~1..HEAD"
+          fi
+          echo "range=$range"
+          bash scripts/check-stale-contract-assertions.sh --range "$range"
+      - name: Self-test the gate (regression evidence)
+        run: bash scripts/check-stale-contract-assertions.sh --self-test
+
+  claude-plugin-gate:
+    # The `.claude-plugin/` manifest structural check; existed, ran nowhere.
+    name: Claude plugin manifest gate (#3967)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Run Claude plugin manifest gate
+        run: bash scripts/check-claude-plugin.sh
+      - name: Self-test the gate (regression evidence)
+        run: bash scripts/check-claude-plugin.sh --self-test

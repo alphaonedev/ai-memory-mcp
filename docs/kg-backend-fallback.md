@@ -154,6 +154,7 @@ fails with a clear error message when the extension is gone, when
 | Sustained on every request  | Extension dropped or graph projection lost                | `CREATE EXTENSION age` + `SELECT create_graph('memory_graph')` |
 | Sustained on a single op    | Per-op projection drift (e.g. `find_paths` walker)        | Rebuild the projection from `memory_links` |
 | Sustained at startup        | Role lacks permission on `ag_catalog`                     | Grant `USAGE` on `ag_catalog` + `pg_catalog` to the daemon role |
+| `age_graph_orphan` reason   | `memory_graph` SCHEMA present but its `ag_catalog.ag_graph` registry row is ABSENT (orphan — e.g. `DROP EXTENSION age CASCADE` left the schema behind). `create_graph` cannot succeed against it (42P06). | `DROP SCHEMA memory_graph CASCADE` + `SELECT create_graph('memory_graph')`. Link writes commit and enqueue their projection QUARANTINED; the cold drainer SELF-HEALS them once the registry row returns (#3883). |
 
 When the daemon is restarted with AGE still missing, the boot-time
 probe resolves `kg_backend` to `Cte` and the runtime fallback never

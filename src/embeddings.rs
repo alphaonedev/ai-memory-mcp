@@ -11,6 +11,10 @@ use tokenizers::Tokenizer;
 
 use crate::config::EmbeddingModel;
 
+/// The de-facto-standard HuggingFace offline knob, honoured alongside
+/// `AI_MEMORY_EMBED_OFFLINE` (one name for the reader and its test).
+const HF_HUB_OFFLINE_ENV: &str = "HF_HUB_OFFLINE";
+
 /// #1558 batch 5 wave 2 — the canonical embedding/rerank document
 /// template: `"{title} {content}"`.
 ///
@@ -1216,6 +1220,86 @@ impl Embedder {
         }
     }
 
+    /// #3822 (5-agent vote 4d3ea1c5, option A) — pinned sibling of
+    /// [`Self::from_resolved`] for the `internal-only` egress posture. The pin
+    /// applies to EGRESSING embed lanes ([`crate::config::embed_lane_egresses`]):
+    /// the API-embed lane via `new_openai_compatible_pinned`, and the
+    /// ollama+Nomic lane via `new_with_url_pinned` (#3933). `None` and the local
+    /// in-process candle embedder never egress and delegate to the
+    /// byte-identical-legacy [`Self::from_resolved`].
+    ///
+    /// # Errors
+    /// Same conditions as [`Self::from_resolved`], plus a pinned-client build
+    /// failure.
+    pub fn from_resolved_pinned(
+        resolved: &crate::config::ResolvedEmbeddings,
+        tier_model: Option<crate::config::EmbeddingModel>,
+        pin: Option<&crate::egress::PinnedTarget>,
+    ) -> Result<Option<Self>> {
+        let Some(pin) = pin else {
+            return Self::from_resolved(resolved, tier_model);
+        };
+        if !crate::config::embed_lane_egresses(&resolved.backend, tier_model) {
+            // #3933 — only an EGRESSING embed lane is gated/pinned; the local
+            // in-process candle embedder (MiniLmL6V2) never opens a socket, so
+            // it delegates unpinned to the byte-identical-legacy path.
+            return Self::from_resolved(resolved, tier_model);
+        }
+        if !crate::config::is_api_embed_backend(&resolved.backend) {
+            // #3933 — the ollama backend + Nomic model builds an OllamaClient to
+            // the resolved URL and EGRESSES, so it must be pinned to the
+            // boot-resolved addrs exactly as the API lane is, not left unpinned.
+            // `embed_lane_egresses` admits a NON-API lane here ONLY for
+            // `Some(NomicEmbedV15)`, so `tier_model` is Some — the else arm is
+            // UNREACHABLE, and failing loud beats silently disabling the embedder.
+            let Some(tier_model) = tier_model else {
+                unreachable!(
+                    "embed_lane_egresses admits a non-API embed lane only for Some(NomicEmbedV15) (#3933)"
+                )
+            };
+            let client = crate::llm::OllamaClient::new_with_url_pinned(
+                &resolved.url,
+                NOMIC_OLLAMA_MODEL,
+                &pin.host,
+                &pin.addrs,
+            )
+            .context("failed to build pinned Ollama embed client (#3933)")?;
+            return Self::for_model(tier_model, Some(Arc::new(client))).map(Some);
+        }
+        if tier_model.is_none() {
+            return Ok(None);
+        }
+        if !crate::config::is_recognized_llm_backend(&resolved.backend) {
+            return Err(
+                crate::config::unrecognized_llm_backend_error(&resolved.backend)
+                    .context("refusing to build an embedder for an unrecognized backend (#3627)"),
+            );
+        }
+        let Some(dim) = resolved.embedding_dim else {
+            anyhow::bail!(
+                "embedding model {:?} (backend {:?}) has no known vector dim — pin the width with {} (env) or `[embeddings].dim` (#1598, #2626)",
+                resolved.model,
+                resolved.backend,
+                crate::config::ENV_EMBED_DIM,
+            );
+        };
+        let api_key = resolved.api_key().unwrap_or_default();
+        let client = crate::llm::OllamaClient::new_openai_compatible_pinned(
+            &resolved.url,
+            &resolved.model,
+            api_key,
+            &pin.host,
+            &pin.addrs,
+        )
+        .context("failed to build pinned OpenAI-compatible embed client (#3822)")?
+        .with_embed_dimensions(resolved.requested_dim);
+        Ok(Some(Self::new_remote(
+            Arc::new(client),
+            resolved.model.clone(),
+            dim as usize,
+        )))
+    }
+
     /// Create an embedder for the specified model.
     ///
     /// - `MiniLmL6V2` → local candle embedder
@@ -1861,7 +1945,7 @@ impl Embedder {
                 .map(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "on"))
                 .unwrap_or(false)
         };
-        truthy("AI_MEMORY_EMBED_OFFLINE") || truthy("HF_HUB_OFFLINE")
+        truthy("AI_MEMORY_EMBED_OFFLINE") || truthy(HF_HUB_OFFLINE_ENV)
     }
 
     /// Resolve the pre-staged MiniLM model files from the offline HuggingFace
@@ -3336,29 +3420,48 @@ fn offline_env_skips_network_and_errors_fast_on_empty_cache() {
         uuid::Uuid::new_v4()
     ));
     std::fs::create_dir_all(&tmp).expect("mk empty home");
-    let prev_home = std::env::var("HOME").ok();
-    let prev_off = std::env::var("AI_MEMORY_EMBED_OFFLINE").ok();
+    // f1 goal4 — the test OWNS every variable the offline resolver reads, and
+    // restores them on Drop (also on a panic): `HOME`, `HF_HOME` (the hub root
+    // when set, #3788 — a harness's forwarded cache made the "empty cache"
+    // premise false), `AI_MEMORY_EMBED_OFFLINE` (the knob under test) and
+    // `HF_HUB_OFFLINE` (REMOVED, so only the knob under test can produce the
+    // offline posture — no vacuous green from an ambient OR arm).
+    struct EnvGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (k, v) in &self.0 {
+                // SAFETY: serialized via the crate env LOCK held by the test.
+                unsafe {
+                    match v {
+                        Some(v) => std::env::set_var(k, v),
+                        None => std::env::remove_var(k),
+                    }
+                }
+            }
+        }
+    }
+    let keys = [
+        "HOME",
+        "HF_HOME",
+        "AI_MEMORY_EMBED_OFFLINE",
+        HF_HUB_OFFLINE_ENV,
+    ];
+    let restore = EnvGuard(keys.iter().map(|k| (*k, std::env::var_os(k))).collect());
     // SAFETY: serialized via LOCK; no other thread mutates these here.
     unsafe {
         std::env::set_var("HOME", &tmp);
+        std::env::set_var("HF_HOME", tmp.join("hf-home"));
         std::env::set_var("AI_MEMORY_EMBED_OFFLINE", "1");
+        std::env::remove_var(HF_HUB_OFFLINE_ENV);
     }
     assert!(
         Embedder::remote_fetch_disabled(),
         "offline knob must be honored"
     );
     let result = Embedder::new_local();
-    // Restore env before any assertion that could panic.
-    unsafe {
-        match prev_home {
-            Some(p) => std::env::set_var("HOME", p),
-            None => std::env::remove_var("HOME"),
-        }
-        match prev_off {
-            Some(v) => std::env::set_var("AI_MEMORY_EMBED_OFFLINE", v),
-            None => std::env::remove_var("AI_MEMORY_EMBED_OFFLINE"),
-        }
-    }
+    // Restore env before any assertion that could panic (Drop covers a panic
+    // above).
+    drop(restore);
     let _ = std::fs::remove_dir_all(&tmp);
     let msg = match result {
         Ok(_) => panic!("empty cache + offline must error (degrades to keyword)"),

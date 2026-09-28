@@ -75,7 +75,15 @@ mod key_dir_sandbox;
 
 /// Overall budget for a spawned daemon's `/health` to come up. Generous: CI
 /// coverage instrumentation inflates cold-start 3-5x (see serve_integration).
-const SPAWN_TIMEOUT: Duration = Duration::from_secs(60);
+/// #3938: measured timing out at 60s on the SHARED macos-fed runner
+/// (f1-macos-fed-2) when two macos-fed jobs contend for one Mac — the daemon's
+/// TLS listener had not bound within 60s (`F2H-INSTRUMENT` line:
+/// `last_probe_err` = "error sending request"), while the same cell passed on
+/// the un-contended macos-fed job and every Linux job. Raised 60 -> 120, the
+/// house daemon-readiness bound (cf. `serve_store_url_explicit_3431.rs`). The
+/// `F2H-INSTRUMENT` diagnostics are KEPT, so a real readiness regression (vs
+/// host contention) still surfaces rather than being masked by the higher cap.
+const SPAWN_TIMEOUT: Duration = Duration::from_secs(120);
 /// Poll cadence while waiting on `/health` (and for an early-exit child).
 const READINESS_POLL: Duration = Duration::from_millis(100);
 /// Per-request ceiling for the readiness probe.

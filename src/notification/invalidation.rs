@@ -54,6 +54,11 @@
 //! tracks moving idempotency into the walker itself if the
 //! cross-peer federation case demands it.
 
+/// The `tracing` target for reflection-invalidation fan-out and the #3324
+/// contaminated auto-stamp (sqlite MCP link tool and the Postgres
+/// `link_signed` twin) — ONE spelling for every emitter.
+pub(crate) const TRACE_TARGET: &str = "notification.invalidation";
+
 use crate::models::ConfidenceSource;
 use crate::models::{Memory, MemoryKind, Tier};
 use anyhow::Result;

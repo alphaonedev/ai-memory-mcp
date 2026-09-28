@@ -227,34 +227,37 @@ pub fn resolve_and_build_mcp_llm(
 ) -> Option<Arc<OllamaClient>> {
     let resolved_llm = app_config.resolve_llm(None, None, None);
 
-    // v1.0.0 #1963 (R68/D14) — inference-plane egress gate. On refuse the
-    // outbound client is NOT constructed so no memory content can be
-    // POSTed to the vendor; a best-effort signed refusal is recorded.
-    let egress_refused = match crate::egress::evaluate_inference_egress(
+    // v1.0.0 #1963 (R68/D14) + #3822 (A2/A6) — inference-plane egress gate,
+    // resolve-then-pin. On refuse the outbound client is NOT constructed. Under
+    // `internal-only` the target is resolved and its addresses PINNED into the
+    // rebuilt client (`Some(pin)`); this function runs on every hot-swap (#2166),
+    // so a DNS change is re-admitted + RE-PINNED on the swap (A6).
+    let (egress_refused, egress_pin) = match crate::egress::admit_inference_target(
         crate::egress::InferenceEgressMode::resolve(),
         crate::egress::EgressClass::InferenceLlm,
         &resolved_llm.base_url,
     ) {
-        crate::egress::EgressDecision::Refuse {
+        Ok(pin) => (false, pin),
+        Err(crate::egress::EgressDecision::Refuse {
             class,
             target,
             reason,
-        } => {
+        }) => {
             if verbose_banner {
                 eprintln!(
                     "ai-memory: LLM DISABLED by inference-plane egress gate \
-                     (target={target}); {reason} (#1963)"
+                     (target={target}); {reason} (#1963/#3822)"
                 );
             } else {
                 tracing::warn!(
                     target = %target,
-                    "[llm] reload: client DISABLED by inference-plane egress gate; {reason} (#1963)"
+                    "[llm] reload: client DISABLED by inference-plane egress gate; {reason} (#1963/#3822)"
                 );
             }
             crate::egress::refuse_inference_egress_audited(db_path, class, &target, &reason);
-            true
+            (true, None)
         }
-        crate::egress::EgressDecision::Allow => false,
+        Err(crate::egress::EgressDecision::Allow) => (false, None),
     };
 
     if egress_refused
@@ -265,7 +268,7 @@ pub fn resolve_and_build_mcp_llm(
         return None;
     }
 
-    match OllamaClient::build_from_resolved(&resolved_llm) {
+    match OllamaClient::build_from_resolved_pinned(&resolved_llm, egress_pin.as_ref()) {
         Ok(Some(client)) => {
             if verbose_banner {
                 eprintln!(

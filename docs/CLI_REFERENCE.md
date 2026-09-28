@@ -1912,7 +1912,7 @@ external cognition. Routes through the backend-blind
 ai-memory quarantine list                          # what is currently held (identifying metadata only)
 ai-memory quarantine list --namespace team/eng     # narrow to one namespace
 ai-memory quarantine list --limit 500 --json       # bounded page, machine-readable
-ai-memory quarantine release <id>                  # release ONE row back to lifecycle_state=open
+ai-memory quarantine release <id>                  # release ONE quarantined row to open, or decontaminate ONE contaminated row (#3266 R2.5)
 ai-memory quarantine list --store-url postgres://… # same two verbs on the enterprise tier
 ```
 

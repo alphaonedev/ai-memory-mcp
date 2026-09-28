@@ -107,7 +107,7 @@ CLI subcommands):
 |---|---|
 | MCP tools (`--profile full`) | **103 advertised** (102 callable + the always-on `memory_capabilities` bootstrap) |
 | MCP tools (`--profile core`) | **7** (original 5 + `memory_load_family` + `memory_smart_load`) + the `memory_capabilities` bootstrap |
-| HTTP routes | **102 production `.route(...)` registrations** / 88 unique URL paths |
+| HTTP routes | **103 production `.route(...)` registrations** / 89 unique URL paths |
 | CLI subcommands | **90 default build** / **92 under `--features sal`** (the `capability init` sub-verb rides the existing `Capability` command, so the top-level count is unchanged) |
 | `MemoryKind` variants | **16** (adds v1.0.0 epistemic typing `Told` / `Instruction` / `Intervention`, [#1945](https://github.com/alphaonedev/ai-memory-mcp/issues/1945)) |
 | Schema | **v100** (`CURRENT_SCHEMA_VERSION`, both adapters). Not uniformly additive: v79–v85 are additive, **v86 and v87 rewrite stored rows**, v88 is index-only, v89 redefines the postgres FTS `tsv` generated column (derived data, no stored-row rewrite), and v90–v97 are additive; v98 adds legacy inbox namespace aliases; v99 (#3655) adds the per-peer contact stamp; v100 (#3690) makes the `(title, namespace)` unique index PARTIAL (`WHERE lifecycle_state <> 'tombstoned'`) so a consolidation tombstone gives its slot up — index-only, no stored-row rewrite. Per-rung detail + the true bound of the migration evidence: §"Schema ladder v78 → v100" |
@@ -468,10 +468,16 @@ tier via `cert-postgres-age.yml` and honestly labels the PG 16 alternate.
   Cleared via `dequarantine` (on-attest or operator).
 - **Inference-plane egress gate ([#1963](https://github.com/alphaonedev/ai-memory-mcp/issues/1963), R68/D14).**
   `AI_MEMORY_INFERENCE_EGRESS` (env-table row #131, default `allow`) is a
-  three-state egress class for LLM + API-embedder construction:
+  four-state egress class for LLM + API-embedder construction:
   `loopback-only` permits only localhost inference targets (local Ollama /
   self-hosted TEI) and refuses external-vendor egress; `deny` refuses ALL
-  inference egress (keyword-only posture). Enforced at the boot
+  inference egress (keyword-only posture);
+  `internal-only` ([#3822](https://github.com/alphaonedev/ai-memory-mcp/issues/3822),
+  5-agent vote) permits only targets whose EVERY resolved address is internal
+  (loopback / RFC1918 / ULA / CGNAT, none link-local/special, none a
+  cloud-metadata literal) — it resolves the target and PINS the resolved
+  addresses into the client (redirects disabled, `.no_proxy()`), failing closed
+  on a DNS failure or any public / DNS-rebind address. Enforced at the boot
   chokepoints — on refuse the outbound client is not constructed, so no
   memory content can be POSTed to the refused vendor. A best-effort signed
   `egress.inference_refused` row records the class + non-secret target.
@@ -708,6 +714,32 @@ real but scoped — this section states the residual bounds honestly
 rather than overclaiming, per the North Star (degrade, never corrupt
 or overclaim).
 
+- **Recall trust weighting is bounded (Boids items 1+2, #3922, 5-agent
+  vote `4d3ea1c5`).** At v1.0.0 recall popularity is capped (+1.0 max,
+  `models::ACCESS_SCORE_CAP` = 10) and no longer escalates priority or
+  tier (the fold/touch maintenance verbs stopped auto-promoting and
+  stopped the priority decade ladder on both backends); unassessed rows
+  (caller omitted confidence ⇒ `confidence_source='default'`, or a
+  genuinely-unattested NULL provenance) score as neutral confidence.
+  Per-reader trust weighting (distinct readers) is NOT in GA — it needs
+  bound reader identity in the recall ledger (v1.1, with items 4-6). The
+  residual, stated plainly: **priority, tier and an explicit confidence
+  remain caller-asserted and unattested and now dominate the score** — a
+  writer declaring priority 10 / tier long / confidence 1.0 earns ~+10.0
+  of self-asserted rank with zero reads; the controls for
+  declaration-gaming — corroboration and Sybil-correct independent
+  writers (plan items 5-6) — are behind the benchmark gate, not in GA.
+  A quantified residual on the confidence term: the schema-v39 SQLite
+  migration added `confidence_source` as `TEXT NOT NULL DEFAULT
+  'caller_provided'`, so every row predating v39 was backfilled to
+  `caller_provided` and keeps the full +2.0 — and those are the oldest,
+  most-recalled rows. The same holds on Postgres (its `memories`
+  `confidence_source` is also `NOT NULL DEFAULT 'caller_provided'`), so
+  legacy rows there are backfilled identically. Only a `'default'`
+  provenance is neutralised; a legacy `caller_provided` row is
+  indistinguishable from an explicit caller value. The CASE's
+  `OR ... IS NULL` arm is defensive-dead on `memories` (NOT NULL on both
+  backends).
 - **Tamper-evidence bounds (interior-rewrite residual).** The
   `signed_events` cross-row hash chain plus the #1850 forensic
   watermark and the #1873/#2202 head-hash anchor detect **tail
@@ -743,6 +775,19 @@ or overclaim).
   rollbacks until upgraded (one-release conservatism: old readers never
   mint a FALSE verdict, and the new reader still counts legacy id-less
   lines toward Evidence).
+- **Swarm-cascade containment on Postgres: rewind and auto-stamp,
+  node-local only (#3926, #3266 item 3).** `memory_swarm_rewind`
+  (#3322) runs on BOTH backends through the admin-only
+  `POST /api/v1/memory_swarm_rewind`; the MCP tool stays stdio/SQLite-only
+  and the `swarm-rewind` CLI refuses a Postgres store (#3924), so on
+  Postgres the route is the rewind. Its report carries the lineage's
+  #3323 token/cost rollup on both backends; no other surface reads the PG
+  rollup yet. The automatic `Contaminated` stamp (#3324) fires only on a
+  `supersedes` link between two reflections: sqlite stamps on the MCP
+  link tool; Postgres on HTTP `POST /links`, its only link surface.
+  Neither backend stamps on `kg_invalidate`. Containment is
+  node-local: a rewind does not propagate to federated peers. The cascade
+  sensor and corroboration gate are v1.1 scope (#3266).
 - **Claimed-vs-attested identity and diversity.** `metadata.agent_id`
   and the reflection-decorrelation probe's model-family signal are
   CLAIMED (self-asserted by the caller) unless independently attested

@@ -1588,6 +1588,211 @@ impl OllamaClient {
         })
     }
 
+    // ===================================================================
+    // #3822 (5-agent vote 4d3ea1c5, option A) — `internal-only` egress
+    // pinned client constructors. Under `AI_MEMORY_INFERENCE_EGRESS=internal-only`
+    // the boot chokepoint resolves the target (`crate::egress::admit_inference_target`)
+    // and pins the boot-resolved internal addresses into the reqwest client:
+    // `resolve_to_addrs` (close the DNS-rebind window), `redirect(Policy::none())`
+    // (a redirect could reach an un-pinned address), and `.no_proxy()` (A3 — a
+    // pinned address a proxy never connects to would defeat the pin; a proxied
+    // internal endpoint is v1.x). A DNS change after boot requires a swap (A6,
+    // `crate::reload::resolve_and_build_mcp_llm` re-runs admit + re-pins).
+    // ===================================================================
+
+    /// #3822 (A2/A3) — apply the internal-only pin to a reqwest builder.
+    fn apply_internal_egress_pin(
+        builder: reqwest::ClientBuilder,
+        host: &str,
+        addrs: &[std::net::SocketAddr],
+    ) -> reqwest::ClientBuilder {
+        builder
+            .resolve_to_addrs(host, addrs)
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+    }
+
+    /// #3822 — pinned variant of [`Self::new_openai_compatible`].
+    ///
+    /// # Errors
+    /// Returns an error if the HTTP client fails to build.
+    pub fn new_openai_compatible_pinned(
+        base_url: &str,
+        model: &str,
+        api_key: &str,
+        host: &str,
+        addrs: &[std::net::SocketAddr],
+    ) -> Result<Self> {
+        let client = Self::apply_internal_egress_pin(
+            reqwest::Client::builder()
+                .timeout(GENERATE_TIMEOUT)
+                .connect_timeout(CONNECT_TIMEOUT),
+            host,
+            addrs,
+        )
+        .build()
+        .context("Failed to build pinned HTTP client (internal-only egress)")?;
+        Ok(Self {
+            provider: LlmProvider::OpenAiCompatible {
+                api_key: api_key.to_string(),
+            },
+            base_url: base_url.trim_end_matches('/').to_string(),
+            model: model.to_string(),
+            client,
+            breaker: Mutex::new(BreakerState::new()),
+            embed_dimensions: None,
+        })
+    }
+
+    /// #3822 — pinned variant of [`Self::new_with_url_no_health_check`].
+    ///
+    /// # Errors
+    /// Returns an error if the HTTP client fails to build.
+    pub fn new_with_url_no_health_check_pinned(
+        base_url: &str,
+        model: &str,
+        host: &str,
+        addrs: &[std::net::SocketAddr],
+    ) -> Result<Self> {
+        let client = Self::apply_internal_egress_pin(
+            reqwest::Client::builder()
+                .timeout(GENERATE_TIMEOUT)
+                .connect_timeout(CONNECT_TIMEOUT),
+            host,
+            addrs,
+        )
+        .build()
+        .context("Failed to build pinned HTTP client (internal-only egress)")?;
+        Ok(Self {
+            provider: LlmProvider::Ollama,
+            base_url: base_url.trim_end_matches('/').to_string(),
+            model: model.to_string(),
+            client,
+            breaker: Mutex::new(BreakerState::new()),
+            embed_dimensions: None,
+        })
+    }
+
+    /// #3822 — pinned async Ollama constructor (mirrors
+    /// [`Self::new_with_url_async`]: pinned client + `/api/tags` health probe).
+    ///
+    /// # Errors
+    /// Client build failure, or Ollama not reachable at the pinned target.
+    pub async fn new_with_url_async_pinned(
+        base_url: &str,
+        model: &str,
+        host: &str,
+        addrs: &[std::net::SocketAddr],
+    ) -> Result<Self> {
+        let instance = Self::new_with_url_no_health_check_pinned(base_url, model, host, addrs)?;
+        if !instance.is_available_async().await {
+            return Err(anyhow!(
+                "Ollama is not running or not reachable at the pinned internal target {}. Start it with: ollama serve",
+                crate::url_display::url_origin(&instance.base_url)
+            ));
+        }
+        Ok(instance)
+    }
+
+    /// #3822 — pinned sync Ollama constructor (mirrors [`Self::new_with_url`]:
+    /// bridges to the async pinned constructor with the health probe).
+    ///
+    /// # Errors
+    /// Client build failure, or Ollama not reachable.
+    pub fn new_with_url_pinned(
+        base_url: &str,
+        model: &str,
+        host: &str,
+        addrs: &[std::net::SocketAddr],
+    ) -> Result<Self> {
+        block_on_local_bounded(BRIDGE_HEALTH_BUDGET, || {
+            Self::new_with_url_async_pinned(base_url, model, host, addrs)
+        })?
+    }
+
+    /// #3822 — pinned sibling of [`Self::build_from_resolved`]. `pin = Some`
+    /// (internal-only) builds a pinned client; `None` delegates to the
+    /// byte-identical-legacy [`Self::build_from_resolved`].
+    ///
+    /// # Errors
+    /// Same conditions as [`Self::build_from_resolved`].
+    pub fn build_from_resolved_pinned(
+        resolved: &crate::config::ResolvedLlm,
+        pin: Option<&crate::egress::PinnedTarget>,
+    ) -> Result<Option<Self>> {
+        let Some(pin) = pin else {
+            return Self::build_from_resolved(resolved);
+        };
+        if !is_recognized_llm_backend(&resolved.backend) {
+            return Err(unrecognized_llm_backend_error(&resolved.backend));
+        }
+        if resolved.backend == BACKEND_OLLAMA {
+            return Self::new_with_url_pinned(
+                &resolved.base_url,
+                &resolved.model,
+                &pin.host,
+                &pin.addrs,
+            )
+            .map(Some);
+        }
+        let Some(api_key) = resolved.api_key() else {
+            return Err(anyhow!(
+                "LLM backend `{}` requires an API key but the resolver produced none (KeySource = {}).",
+                resolved.backend,
+                resolved.api_key_source.as_str(),
+            ));
+        };
+        Self::new_openai_compatible_pinned(
+            &resolved.base_url,
+            &resolved.model,
+            api_key,
+            &pin.host,
+            &pin.addrs,
+        )
+        .map(Some)
+    }
+
+    /// #3822 — pinned async sibling of [`Self::build_from_resolved_async`].
+    ///
+    /// # Errors
+    /// Same conditions as [`Self::build_from_resolved_async`].
+    pub async fn build_from_resolved_async_pinned(
+        resolved: &crate::config::ResolvedLlm,
+        pin: Option<&crate::egress::PinnedTarget>,
+    ) -> Result<Option<Self>> {
+        let Some(pin) = pin else {
+            return Self::build_from_resolved_async(resolved).await;
+        };
+        if !is_recognized_llm_backend(&resolved.backend) {
+            return Err(unrecognized_llm_backend_error(&resolved.backend));
+        }
+        if resolved.backend == BACKEND_OLLAMA {
+            return Self::new_with_url_async_pinned(
+                &resolved.base_url,
+                &resolved.model,
+                &pin.host,
+                &pin.addrs,
+            )
+            .await
+            .map(Some);
+        }
+        let Some(api_key) = resolved.api_key() else {
+            return Err(anyhow!(
+                "LLM backend `{}` requires an API key but the resolver produced none (KeySource = {}).",
+                resolved.backend,
+                resolved.api_key_source.as_str(),
+            ));
+        };
+        Self::new_openai_compatible_pinned(
+            &resolved.base_url,
+            &resolved.model,
+            api_key,
+            &pin.host,
+            &pin.addrs,
+        )
+        .map(Some)
+    }
+
     /// v1.0.0 #3523 — TEST-ONLY probe-free constructor (#3509 load-flake
     /// class): `new_with_url`'s `GET /api/tags` probe crosses the sync->async
     /// bridge under a 10 s budget and times out under concurrent build load,

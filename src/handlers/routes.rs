@@ -86,6 +86,8 @@ pub const MEMORY_REFLECTION_ORIGIN: &str = "/api/v1/memory_reflection_origin";
 pub const MEMORY_REPLAY: &str = "/api/v1/memory_replay";
 pub const MEMORY_RULE_LIST: &str = "/api/v1/memory_rule_list";
 pub const MEMORY_SMART_LOAD: &str = "/api/v1/memory_smart_load";
+/// Boids item 3 (#3266, vote `4d3ea1c5`) — admin-gated cascade rewind, both backends.
+pub const MEMORY_SWARM_REWIND: &str = "/api/v1/memory_swarm_rewind";
 pub const MEMORY_SUBSCRIPTION_DLQ_LIST: &str = "/api/v1/memory_subscription_dlq_list";
 pub const MEMORY_SUBSCRIPTION_REPLAY: &str = "/api/v1/memory_subscription_replay";
 pub const MEMORY_VERIFY: &str = "/api/v1/memory_verify";

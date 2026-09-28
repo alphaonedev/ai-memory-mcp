@@ -217,6 +217,8 @@ fn mcp_wire_format(tool_name: &str, arguments: &Value) -> Result<Option<WireForm
 mod provider_echo_sinks_3648_tests;
 #[cfg(test)]
 mod provider_redaction_3648_tests;
+#[cfg(test)]
+mod span_capture_4088_tests;
 
 /// PR-5 (issue #487): emit an audit event for an MCP `tools/call`
 /// dispatch. Per-handler emissions inside `handle_store` /
@@ -808,6 +810,16 @@ pub use kg_invalidate::handle_kg_invalidate;
 pub use kg_timeline::handle_kg_timeline;
 pub use subscribe::{handle_list_subscriptions, handle_subscribe};
 pub use swarm_rewind::handle_swarm_rewind;
+/// Boids item 3 part 2 — shared with `handlers::swarm_rewind_http` so the HTTP
+/// route resolves targets and renders the envelope exactly as the MCP tool does.
+pub(crate) use swarm_rewind::{
+    TARGET_KIND_CHECKPOINT as REWIND_TARGET_KIND_CHECKPOINT,
+    TARGET_KIND_MEMORY as REWIND_TARGET_KIND_MEMORY,
+    checkpoint_has_no_root as rewind_checkpoint_has_no_root,
+    checkpoint_root_memory_id as checkpoint_rewind_root,
+    checkpoint_root_not_found as rewind_checkpoint_root_not_found,
+    render_report as render_swarm_rewind_report, target_not_found as rewind_target_not_found,
+};
 pub use verify::handle_verify;
 // v0.7.0 L1-5 / L2-6 — test-and-integration access to the skill
 // substrate handlers. These are public so the L2-6 regression suite
@@ -4753,39 +4765,49 @@ pub fn run_mcp_server(
     // breadcrumb — it NEVER routes embedding requests through the
     // chat LLM client (the pre-#1143 silent-wrong-wire-shape trap).
     let resolved_embeddings = app_config.resolve_embeddings();
-    // v1.0.0 #1963 (R68/D14) — inference-plane egress gate for API embed
-    // backends (the ones that POST memory content to an embedding vendor);
-    // the local in-process embedder never egresses and is NOT gated.
-    let embed_egress_refused = crate::config::is_api_embed_backend(&resolved_embeddings.backend)
-        && match crate::egress::evaluate_inference_egress(
+    // v1.0.0 #1963 (R68/D14) — inference-plane egress gate for EGRESSING embed
+    // lanes (every API backend, plus the ollama+Nomic lane — #3933, which opens
+    // a socket to the resolved URL); the local in-process candle embedder never
+    // egresses and is NOT gated.
+    // #3822 (A2) — resolve-then-pin for the egressing lane; #3933 gates on
+    // transport, not backend name.
+    let (embed_egress_refused, embed_egress_pin) = if crate::config::embed_lane_egresses(
+        &resolved_embeddings.backend,
+        tier_config.embedding_model,
+    ) {
+        match crate::egress::admit_inference_target(
             crate::egress::InferenceEgressMode::resolve(),
             crate::egress::EgressClass::InferenceEmbedding,
             &resolved_embeddings.url,
         ) {
-            crate::egress::EgressDecision::Refuse {
+            Ok(pin) => (false, pin),
+            Err(crate::egress::EgressDecision::Refuse {
                 class,
                 target,
                 reason,
-            } => {
+            }) => {
                 eprintln!(
                     "ai-memory: embedder DISABLED by inference-plane egress gate \
-                     (target={target}); {reason} — semantic recall degrades to keyword (#1963)"
+                         (target={target}); {reason} — semantic recall degrades to keyword (#1963/#3822)"
                 );
-                // #3429 (sibling of #1991) — audit the refusal into the store
-                // this MCP process actually opened (`db_path`, resolved once by
-                // the top-level parser), NOT a recomputed
-                // `effective_db(DEFAULT_DB)`, which discards a non-default
-                // `--db`/`AI_MEMORY_DB` and misfiles the signed row into CWD
-                // `ai-memory.db` / the config store.
+                // #3429 (sibling of #1991) — audit into the store this MCP
+                // process actually opened (`db_path`).
                 crate::egress::refuse_inference_egress_audited(db_path, class, &target, &reason);
-                true
+                (true, None)
             }
-            crate::egress::EgressDecision::Allow => false,
-        };
+            Err(crate::egress::EgressDecision::Allow) => (false, None),
+        }
+    } else {
+        (false, None)
+    };
     let embedder = if embed_egress_refused {
         None
     } else {
-        match Embedder::from_resolved(&resolved_embeddings, tier_config.embedding_model) {
+        match Embedder::from_resolved_pinned(
+            &resolved_embeddings,
+            tier_config.embedding_model,
+            embed_egress_pin.as_ref(),
+        ) {
             Ok(Some(emb)) => {
                 eprintln!("ai-memory: embedder loaded ({})", emb.model_description());
                 // v0.7.0 issue #1260 — batch size from the canonical #1146
@@ -6541,42 +6563,7 @@ mod tests {
         assert_eq!(err.message, "test error");
     }
 
-    /// Buffer-backed `MakeWriter` so `tracing` output can be asserted on
-    /// without polluting test stdout/stderr or installing a global
-    /// subscriber. Used by the Stream E span coverage tests below.
-    #[derive(Clone)]
-    struct VecWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-
-    impl std::io::Write for VecWriter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for VecWriter {
-        type Writer = VecWriter;
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
-    fn run_with_capture<F: FnOnce()>(f: F) -> String {
-        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
-        let writer = VecWriter(buf.clone());
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(writer)
-            .with_max_level(tracing::Level::INFO)
-            .with_ansi(false)
-            .finish();
-        tracing::subscriber::with_default(subscriber, f);
-        String::from_utf8(buf.lock().unwrap().clone()).unwrap_or_default()
-    }
-
-    fn make_tools_call(tool: &str, args: Value) -> RpcRequest {
+    pub(super) fn make_tools_call(tool: &str, args: Value) -> RpcRequest {
         RpcRequest {
             jsonrpc: "2.0".into(),
             id: Some(json!(1)),
@@ -6585,131 +6572,6 @@ mod tests {
         }
     }
 
-    /// Pillar 3 / Stream E coverage — every successful `tools/call` must
-    /// emit a `mcp_tool_call` span carrying the tool name plus an `ok`
-    /// event with `elapsed_ms`. This is the single point of latency
-    /// instrumentation production exporters key off.
-    #[test]
-    fn tools_call_emits_span_with_tool_name_and_elapsed_ms() {
-        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
-        let tier_config = FeatureTier::Keyword.config();
-        let resolved_ttl = crate::config::ResolvedTtl::default();
-        let resolved_scoring = crate::config::ResolvedScoring::default();
-        let req = make_tools_call("memory_list", json!({"limit": 1}));
-
-        let captured = run_with_capture(|| {
-            let resp = handle_request(
-                &conn,
-                std::path::Path::new(":memory:"),
-                &req,
-                None,
-                None,
-                None,
-                &tier_config,
-                &crate::config::ResolvedModels::from_tier_preset(&tier_config),
-                None,
-                &resolved_ttl,
-                &resolved_scoring,
-                true,
-                false,
-                None,
-                &crate::profile::Profile::full(),
-                None,
-                None,
-                None,
-                None,           // federation_forward_url (#318)
-                None,           // recall_scope (#518)
-                None,           // atomise_handler (WT-1-C)
-                None,           // atomise_queue (#2986)
-                None,           // ingest_multistep_handler (Form 3 / #756)
-                None,           // nag_watcher (#1389/#1398 L1)
-                "test-session", // nag_session_id (#1389/#1398 L1)
-            );
-            assert!(resp.error.is_none(), "expected ok rpc response");
-        });
-
-        assert!(
-            captured.contains("mcp_tool_call"),
-            "missing span name in: {captured}"
-        );
-        assert!(
-            captured.contains("memory_list"),
-            "missing tool field in: {captured}"
-        );
-        assert!(
-            captured.contains("elapsed_ms"),
-            "missing elapsed_ms field in: {captured}"
-        );
-        assert!(
-            captured.contains(" ok"),
-            "missing ok outcome event in: {captured}"
-        );
-    }
-
-    /// Failure path — when the underlying handler returns an `Err`, the
-    /// span emits a `warn` level event with the error message so on-call
-    /// dashboards can alert on per-tool error rate.
-    #[test]
-    fn tools_call_emits_warn_event_on_handler_error() {
-        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
-        let tier_config = FeatureTier::Keyword.config();
-        let resolved_ttl = crate::config::ResolvedTtl::default();
-        let resolved_scoring = crate::config::ResolvedScoring::default();
-        // memory_get with a missing/invalid id is a deterministic Err
-        // path: validate_id rejects empty strings.
-        let req = make_tools_call("memory_get", json!({"id": ""}));
-
-        let captured = run_with_capture(|| {
-            let resp = handle_request(
-                &conn,
-                std::path::Path::new(":memory:"),
-                &req,
-                None,
-                None,
-                None,
-                &tier_config,
-                &crate::config::ResolvedModels::from_tier_preset(&tier_config),
-                None,
-                &resolved_ttl,
-                &resolved_scoring,
-                true,
-                false,
-                None,
-                &crate::profile::Profile::full(),
-                None,
-                None,
-                None,
-                None,           // federation_forward_url (#318)
-                None,           // recall_scope (#518)
-                None,           // atomise_handler (WT-1-C)
-                None,           // atomise_queue (#2986)
-                None,           // ingest_multistep_handler (Form 3 / #756)
-                None,           // nag_watcher (#1389/#1398 L1)
-                "test-session", // nag_session_id (#1389/#1398 L1)
-            );
-            // Handler errs are returned as ok_response with isError=true,
-            // not RpcError, by design (the JSON-RPC layer is reserved for
-            // protocol-level failures).
-            assert!(resp.error.is_none());
-        });
-
-        assert!(
-            captured.contains("mcp_tool_call"),
-            "missing span in err path: {captured}"
-        );
-        assert!(
-            captured.contains("memory_get"),
-            "missing tool field in err path: {captured}"
-        );
-        assert!(
-            captured.contains("WARN"),
-            "missing WARN level on err path: {captured}"
-        );
-        assert!(
-            captured.contains("err"),
-            "missing err outcome in: {captured}"
-        );
-    }
     /// Parametrized smoke matrix over the MCP tool dispatch pathway
     /// (Justice of MCP). Each `ToolCase` exercises one tool end to end:
     /// Tier 1: happy path with canonical valid args.

@@ -43,9 +43,9 @@ use std::path::{Path, PathBuf};
 /// call sites in that file (the `fn refuse_pg_store` DEFINITION in
 /// `src/cli/backup.rs` is NOT a call — it lacks the `backup::` path prefix — so
 /// it is correctly excluded). Test-module sites are excluded by
-/// [`production_prefix`]. Total = 36 across 23 files (#2555: +1 doctor.rs
+/// [`production_prefix`]. Total = 37 across 24 files (#2555: +1 doctor.rs
 /// `--repair-schema-version`; #3730: +3 — `inbox`, `notify`, the wake
-/// listener's catch-up inbox read).
+/// listener's catch-up inbox read; #3924: +1 `swarm-rewind`).
 const GUARDED: &[(&str, usize, &str)] = &[
     ("src/cli/store.rs", 1, "`store` write."),
     (
@@ -168,6 +168,14 @@ const GUARDED: &[(&str, usize, &str)] = &[
         "#3730 — the wake listener's catch-up inbox read is the same read \
          `ai-memory inbox` makes, gated the same way.",
     ),
+    (
+        "src/cli/commands/swarm_rewind.rs",
+        1,
+        "#3924 — `swarm-rewind` WRITE: contaminates a provenance subtree, freezes \
+         routines and appends a signed `swarm.rewind` event; on a pg node the \
+         unguarded open rewound a throwaway sidecar while the operator believed \
+         the fleet was rewound.",
+    ),
 ];
 
 /// Files that open the local SQLite but are DELIBERATELY carved out of the
@@ -277,9 +285,9 @@ fn every_class_a_guard_call_is_enumerated_2572() {
 
     let total: usize = GUARDED.iter().map(|(_, n, _)| n).sum();
     assert_eq!(
-        total, 36,
-        "the pinned class-(a) guard total drifted from 36 (#2572; 31 + #3587 U2 watch + U4 \
-         capture-turn + #3730 inbox / notify / wake-listen catch-up read)"
+        total, 37,
+        "the pinned class-(a) guard total drifted from 37 (#2572; 31 + #3587 U2 watch + U4 \
+         capture-turn + #3730 inbox / notify / wake-listen catch-up read + #3924 swarm-rewind)"
     );
     assert!(
         problems.is_empty(),
@@ -449,6 +457,55 @@ fn store_write_refuses_on_a_postgres_store_url_without_phantom_writing_2572() {
     assert!(
         !wal.exists(),
         "must NOT create a WAL for a refused wrong-store write (#2572)"
+    );
+}
+
+/// v1.0.0 #3924 — `swarm-rewind` is a class-(a) WRITE (contaminates a
+/// provenance subtree, freezes routines, appends a signed `swarm.rewind`
+/// event). Before the guard it opened the local SQLite `--db` on a Postgres
+/// node and rewound a throwaway sidecar while the operator believed the fleet
+/// was rewound. It must refuse through the shared #2572 funnel with no disk
+/// write. Lives HERE, as a subprocess cell, rather than as an in-file unit test:
+/// the child gets the store URL on its own environment, so no test process
+/// mutates `AI_MEMORY_STORE_URL` (check-test-env-lock arm (d)).
+#[test]
+fn swarm_rewind_refuses_on_a_postgres_store_url_without_phantom_writing_3924() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db = tmp.path().join("must-not-be-created.db");
+    assert!(!db.exists());
+
+    let out = run_verb(
+        &db,
+        Some(PG_STORE_URL),
+        &["swarm-rewind", "--to", "cascade-root", "--json"],
+    );
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    assert!(
+        !out.status.success(),
+        "`swarm-rewind` must exit non-zero on a postgres:// store URL; status={:?} out={combined}",
+        out.status
+    );
+    assert!(
+        combined.contains("#2572") && combined.contains("HTTP daemon"),
+        "the refusal must cite #2572 and name the HTTP-daemon remedy: {combined}"
+    );
+    assert!(
+        !combined.contains(PG_PASSWORD),
+        "the refusal must redact the DSN password: {combined}"
+    );
+    assert!(
+        !db.exists(),
+        "swarm-rewind must NOT create the local sqlite db on a pg store (#3924)"
+    );
+    let wal = PathBuf::from(format!("{}-wal", db.display()));
+    assert!(
+        !wal.exists(),
+        "must NOT create a WAL for a refused rewind (#3924)"
     );
 }
 

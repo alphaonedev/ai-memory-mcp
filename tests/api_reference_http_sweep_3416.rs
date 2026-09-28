@@ -52,12 +52,14 @@ fn api_reference_cites_ssot_route_and_tool_counts_3416() {
     let paths = ai_memory::EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT;
     let tools = ai_memory::profile::Profile::full().expected_tool_count();
 
+    // 2026-09-24 (Boids item 3, #3266) — 102/88 -> 103/89:
+    // `POST /api/v1/memory_swarm_rewind`, documented in the same commit.
     assert_eq!(
-        routes, 102,
+        routes, 103,
         "SSOT moved; update this pin and the doc together"
     );
     assert_eq!(
-        paths, 88,
+        paths, 89,
         "SSOT moved; update this pin and the doc together"
     );
     assert_eq!(

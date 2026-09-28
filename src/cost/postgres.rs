@@ -293,8 +293,7 @@ pub async fn lineage_rollup_pg(
         .join(", ");
     let max_depth_i64 = i64::try_from(max_depth).unwrap_or(i64::MAX);
 
-    // The recursive node set (root + provenance descendants), shared by the
-    // stored-counter SUM and the ledger-derived recall query below.
+    // Capture the recursive node set once for both counters and recall.
     let cte = format!(
         "WITH RECURSIVE descendants(node_id, depth, path) AS ( \
             SELECT ml.source_id, 1, ARRAY[ml.target_id, ml.source_id] \
@@ -311,36 +310,44 @@ pub async fn lineage_rollup_pg(
         )"
     );
 
-    let sum_sql = format!(
-        "{cte} \
-        SELECT COALESCE(SUM(c.tokens_written), 0)::bigint, \
-               COALESCE(SUM(c.tokens_recalled), 0)::bigint, \
-               COALESCE(SUM(c.write_events), 0)::bigint, \
-               COALESCE(SUM(c.recall_events), 0)::bigint \
-        FROM nodes n \
-        LEFT JOIN token_cost_counters c \
-          ON c.scope_kind = '{SCOPE_LINEAGE}' AND c.scope_key = n.id"
-    );
-
-    let (w, r, we, re): (i64, i64, i64, i64) = sqlx::query_as(&sum_sql)
-        .bind(root_id)
-        .bind(max_depth_i64)
-        .fetch_one(pool)
-        .await?;
-
-    // #1953 recall-purity — derive recall from the ledger over the SAME node
-    // set (recall no longer writes the counter table). Best-effort.
-    let contents_sql = format!(
-        "{cte} \
-        SELECT m.content FROM nodes n \
-        JOIN recall_observations ro ON ro.memory_id = n.id \
-        JOIN memories m ON m.id = ro.memory_id"
-    );
-    let (dr_tokens, dr_events) = match sqlx::query_as::<_, (String,)>(&contents_sql)
+    let node_ids: Vec<String> = sqlx::query_scalar(&format!("{cte} SELECT id FROM nodes"))
         .bind(root_id)
         .bind(max_depth_i64)
         .fetch_all(pool)
-        .await
+        .await?;
+    let node_refs: Vec<&str> = node_ids.iter().map(String::as_str).collect();
+    lineage_nodes_rollup_pg(pool, root_id, &node_refs).await
+}
+
+/// #3946 — roll up an already selected closure. Containment supplies its exact
+/// relational node set so costs cannot follow a different projection, depth,
+/// or quarantine filter. `ANY` also prevents duplicate ids from double billing.
+pub(crate) async fn lineage_nodes_rollup_pg(
+    pool: &PgPool,
+    root_id: &str,
+    node_ids: &[&str],
+) -> Result<CostRollup, sqlx::Error> {
+    let (w, r, we, re): (i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT COALESCE(SUM(tokens_written), 0)::bigint, \
+                COALESCE(SUM(tokens_recalled), 0)::bigint, \
+                COALESCE(SUM(write_events), 0)::bigint, \
+                COALESCE(SUM(recall_events), 0)::bigint \
+         FROM token_cost_counters WHERE scope_kind = $1 AND scope_key = ANY($2)",
+    )
+    .bind(SCOPE_LINEAGE)
+    .bind(node_ids)
+    .fetch_one(pool)
+    .await?;
+
+    // #1953 recall-purity — derive recall from the ledger over the SAME node
+    // set (recall no longer writes the counter table). Best-effort.
+    let (dr_tokens, dr_events) = match sqlx::query_as::<_, (String,)>(
+        "SELECT m.content FROM recall_observations ro \
+         JOIN memories m ON m.id = ro.memory_id WHERE ro.memory_id = ANY($1)",
+    )
+    .bind(node_ids)
+    .fetch_all(pool)
+    .await
     {
         Ok(contents) => {
             let mut acc = (0_i64, 0_i64);

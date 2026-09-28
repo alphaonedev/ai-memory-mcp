@@ -137,6 +137,8 @@ fn all_registered_paths() -> Vec<&'static str> {
         routes::MEMORY_REPLAY,
         routes::MEMORY_RULE_LIST,
         routes::MEMORY_SMART_LOAD,
+        // Boids item 3 (#3266) — admin cascade rewind.
+        routes::MEMORY_SWARM_REWIND,
         routes::MEMORY_SUBSCRIPTION_DLQ_LIST,
         routes::MEMORY_SUBSCRIPTION_REPLAY,
         routes::MEMORY_VERIFY,
@@ -360,9 +362,18 @@ fn expected_fully_501_paths() -> BTreeSet<&'static str> {
 // and adding a delta to a moved base is how this inventory drifts.
 // #3646: +2 metadata-only health paths; live PostgreSQL dispatch is pinned by
 // monitoring_api_3646::issue_3646_postgres_routes_and_seeded_non_disclosure.
-const EXPECTED_PG_SUPPORTED_UNIQUE_PATHS: usize = 75;
+// 2026-09-24 (Boids item 3, #3266, vote `4d3ea1c5`) — +1 pg-supported / +1
+// total (501 count UNCHANGED): `POST /api/v1/memory_swarm_rewind`. Its
+// postgres arm dispatches to `MemoryStore::swarm_rewind` (implemented by
+// `PostgresStore`, `src/store/postgres/swarm_rewind.rs`) and resolves the
+// target through the unfiltered `PostgresStore::get_any` — no `app.db`
+// scratch read. A 501 here would be the #3921 false-parity shape: an
+// actuator implemented on PG with no way to call it. Proof:
+// `tests/swarm_rewind_pg_item3_3266.rs` (store) and
+// `tests/swarm_rewind_route_item3_3266.rs` (route, both backends).
+const EXPECTED_PG_SUPPORTED_UNIQUE_PATHS: usize = 76;
 const EXPECTED_FULLY_501_PATHS: usize = 13;
-const EXPECTED_TOTAL_UNIQUE_PATHS: usize = 88;
+const EXPECTED_TOTAL_UNIQUE_PATHS: usize = 89;
 
 /// Source-level membership freeze: the exact route-const + path-matcher
 /// names the allow-list body references. A silent match-arm add/remove
@@ -421,6 +432,8 @@ const EXPECTED_ALLOWLIST_CONSTS: &[&str] = &[
     // #3064 family F2 — smart_load wraps the already-frozen
     // `MEMORY_LOAD_FAMILY` read through the shared SAL helper.
     "MEMORY_SMART_LOAD",
+    // Boids item 3 (#3266) — admin cascade rewind; PG dispatch via the SAL.
+    "MEMORY_SWARM_REWIND",
     "MEMORY_VERIFY",
     "METRICS",
     "METRICS_BARE",
