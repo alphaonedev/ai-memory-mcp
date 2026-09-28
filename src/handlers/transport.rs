@@ -979,7 +979,7 @@ pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 /// forged header. `None` (a router driven without a TCP listener, as in
 /// tests) passes through to normal auth with no backoff.
 /// See `handlers::auth_backoff` for the policy.
-fn auth_backoff_source(req: &Request) -> Option<IpAddr> {
+pub(crate) fn auth_backoff_source(req: &Request) -> Option<IpAddr> {
     req.extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map(|peer| peer.0.ip())
@@ -1006,17 +1006,51 @@ fn backoff_refusal(retry_after_secs: u64) -> Response {
 /// A broken counter admits (fail-open inside the policy) and lands on the
 /// `401` arm — degrade, never deny.
 fn record_auth_failure(auth: &ApiKeyState, source: Option<IpAddr>, now: Instant) -> Response {
+    record_auth_failure_or(auth, source, now, || {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "missing or invalid API key"})),
+        )
+            .into_response()
+    })
+}
+
+/// #2502 / #4068 — the shared failure-recording funnel for EVERY transport
+/// credential decision, including the ones the outer monitoring gate makes
+/// (`monitoring::access`): record one failure for `source` in the SAME
+/// [`super::auth_backoff::AuthFailurePolicy`] and render the uniform `429`
+/// when that crosses (or extends) the backoff; otherwise render the caller's
+/// own `401` body. Keeping one funnel means a failure is counted identically
+/// whichever gate observed it.
+pub(crate) fn record_auth_failure_or(
+    auth: &ApiKeyState,
+    source: Option<IpAddr>,
+    now: Instant,
+    unauthorized: impl FnOnce() -> Response,
+) -> Response {
     if let Some(ip) = source
         && let super::auth_backoff::AuthDecision::Refuse { retry_after_secs } =
             auth.auth_backoff.on_failure(ip, now)
     {
         return backoff_refusal(retry_after_secs);
     }
-    (
-        StatusCode::UNAUTHORIZED,
-        Json(json!({"error": "missing or invalid API key"})),
-    )
-        .into_response()
+    unauthorized()
+}
+
+/// #2502 / #4068 — the shared pre-key backoff check: `true` when `source` is
+/// currently refused. Called BEFORE any presented credential is compared, by
+/// both transport gates, so a correct key during backoff is refused too.
+pub(crate) fn auth_backoff_refuses(
+    auth: &ApiKeyState,
+    source: Option<IpAddr>,
+    now: Instant,
+) -> bool {
+    source.is_some_and(|ip| {
+        matches!(
+            auth.auth_backoff.pre_check(ip, now),
+            super::auth_backoff::AuthDecision::Refuse { .. }
+        )
+    })
 }
 
 /// Middleware: reject requests with 401 if `api_key` is configured and the
@@ -1039,7 +1073,9 @@ pub async fn api_key_auth(
         return next.run(req).await.into_response();
     };
 
-    // Exempt health endpoint
+    // Exempt health endpoint. The monitoring routes are exempt HERE only
+    // because the outer `monitoring::access` gate already authenticated them
+    // against the SAME auth-failure policy (#4068) — never unmetered.
     if req.uri().path() == super::routes::HEALTH
         || super::monitoring::is_health_path(req.uri().path())
     {
@@ -1101,10 +1137,7 @@ pub async fn api_key_auth(
     // bypasses above return before this point and are never counted.
     let source = auth_backoff_source(&req);
     let now = Instant::now();
-    if let Some(ip) = source
-        && let super::auth_backoff::AuthDecision::Refuse { .. } =
-            auth.auth_backoff.pre_check(ip, now)
-    {
+    if auth_backoff_refuses(&auth, source, now) {
         return record_auth_failure(&auth, source, now);
     }
 

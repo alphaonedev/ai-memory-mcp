@@ -67,11 +67,53 @@ fn refusal(code: StatusCode, reason: &'static str) -> Response {
 }
 
 /// The outermost HTTP gate; checks both credentials before any bypass branch.
+///
+/// # Auth-failure backoff (v1.0.0 #4068)
+///
+/// Every credential decision this gate makes — authenticating the monitoring
+/// routes, and (once health-only scopes exist) requiring a resolved transport
+/// principal — goes through the SAME per-source
+/// [`super::auth_backoff::AuthFailurePolicy`] as `api_key_auth`, via the shared
+/// `transport` funnels:
+///
+/// * a source already in backoff is refused `429` + `Retry-After` BEFORE any
+///   presented key is compared, correct key included, so neither this gate's
+///   `401`s nor its scope `403` can serve as a key oracle during backoff;
+/// * each credential failure here is recorded, so failures on monitoring and
+///   on ordinary routes count against one budget;
+/// * a key-based success resets the source, exactly as on ordinary routes.
+///
+/// The public legacy `/api/v1/health` liveness probe is NOT gated by backoff:
+/// a backed-off source still reaches it, but its presented key is not
+/// consulted at all.
 pub(crate) async fn access(State(state): State<AccessState>, req: Request, next: Next) -> Response {
-    let token = req
-        .headers()
-        .get(crate::HEADER_API_KEY)
-        .and_then(|v| v.to_str().ok());
+    let path = req.uri().path();
+    let health = is_health_path(path);
+    let legacy_health = path == super::routes::HEALTH;
+    let scoped = !state.scopes.agent_ids.is_empty() || !state.scopes.peer_ids.is_empty();
+    // The requests on which THIS gate decides authentication (not merely scope).
+    let decides_auth = health || (scoped && !legacy_health);
+    let source = super::transport::auth_backoff_source(&req);
+    let now = std::time::Instant::now();
+    // Pre-key check: nothing below has looked at a credential yet.
+    let backed_off = super::transport::auth_backoff_refuses(&state.auth, source, now);
+    if backed_off && decides_auth {
+        return super::transport::record_auth_failure_or(&state.auth, source, now, || {
+            refusal(
+                StatusCode::UNAUTHORIZED,
+                "monitoring_requires_authentication",
+            )
+        });
+    }
+    // A backed-off source's key is never consulted (legacy /health included),
+    // so the scope refusal below cannot confirm a guessed key during backoff.
+    let token = if backed_off {
+        None
+    } else {
+        req.headers()
+            .get(crate::HEADER_API_KEY)
+            .and_then(|v| v.to_str().ok())
+    };
     let keys = state.auth.enrolled_agent_keys.snapshot();
     let agent = token.and_then(|v| keys.get(&super::identity_binding::api_key_sha256_hex(v)));
     let peer = if state.auth.mtls_enforced {
@@ -85,7 +127,6 @@ pub(crate) async fn access(State(state): State<AccessState>, req: Request, next:
     // elevate a health-only principal. Restriction wins over other authority.
     let restricted = agent.is_some_and(|id| state.scopes.agent_ids.contains(id))
         || peer.is_some_and(|id| state.scopes.peer_ids.contains(id));
-    let health = is_health_path(req.uri().path());
     let read = matches!(*req.method(), Method::GET | Method::HEAD);
     if restricted && (!health || !read) {
         return refusal(StatusCode::FORBIDDEN, "monitoring_scope_refused");
@@ -96,25 +137,32 @@ pub(crate) async fn access(State(state): State<AccessState>, req: Request, next:
     // Revoked/unresolved keys cannot fall through an auth-off deployment.
     // Once health-only scopes exist, all non-probe requests need a resolved
     // transport principal, even when the legacy shared key is unconfigured.
-    if (!state.scopes.agent_ids.is_empty() || !state.scopes.peer_ids.is_empty())
-        && !health
-        && req.uri().path() != super::routes::HEALTH
-        && agent.is_none()
-        && peer.is_none()
-        && !global
-    {
-        return refusal(StatusCode::UNAUTHORIZED, "unresolved_transport_principal");
+    if scoped && !health && !legacy_health && agent.is_none() && peer.is_none() && !global {
+        return super::transport::record_auth_failure_or(&state.auth, source, now, || {
+            refusal(StatusCode::UNAUTHORIZED, "unresolved_transport_principal")
+        });
     }
     if health {
         if !state.tls_enabled {
             return refusal(StatusCode::FORBIDDEN, "monitoring_requires_tls");
         }
         if agent.is_none() && peer.is_none() && !global {
-            return refusal(
-                StatusCode::UNAUTHORIZED,
-                "monitoring_requires_authentication",
-            );
+            return super::transport::record_auth_failure_or(&state.auth, source, now, || {
+                refusal(
+                    StatusCode::UNAUTHORIZED,
+                    "monitoring_requires_authentication",
+                )
+            });
         }
+    }
+    // A KEY-based success resets the source, as on ordinary routes. A
+    // certificate-only success neither records nor resets: the presented key
+    // (if any) was not what authenticated the request.
+    if decides_auth
+        && (agent.is_some() || global)
+        && let Some(ip) = source
+    {
+        state.auth.auth_backoff.on_success(ip);
     }
     next.run(req).await
 }

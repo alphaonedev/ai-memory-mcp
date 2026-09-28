@@ -16,6 +16,15 @@
 //! site (a success resets the source). No second copy of the decision
 //! exists anywhere.
 //!
+//! v1.0.0 #4068 — the outer monitoring gate (`monitoring::access`), which
+//! authenticates `/api/v1/monitoring/{status,metrics}` itself and requires a
+//! resolved principal once health-only scopes exist, consults the SAME
+//! policy instance through the same `transport` funnels
+//! (`auth_backoff_refuses` before any key is compared, `record_auth_failure_or`
+//! at each of its failure sites, `on_success` on a key-based success). Those
+//! routes are therefore metered against the same per-source budget, and a
+//! source backed off on any route is refused on them too.
+//!
 //! * Source identity is the TCP peer IP (`ConnectInfo<SocketAddr>`,
 //!   `transport.rs`), NEVER a client header: a header-derived source lets an
 //!   attacker lock someone else out with a forged header. The tree has no
