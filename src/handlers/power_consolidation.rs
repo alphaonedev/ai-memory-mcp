@@ -34,6 +34,12 @@ use super::StorageBackend;
 #[cfg(feature = "sal")]
 use super::store_err_to_response;
 
+/// v1.0.0 #4091 — the typed `code` of the `503` a consolidation answers when
+/// no REAL summary exists (no caller `summary`, and the model is absent,
+/// timed out, errored or returned nothing). Nothing is consolidated, and no
+/// source is tombstoned or deleted.
+pub const SUMMARY_UNAVAILABLE: &str = "summary_unavailable";
+
 /// L5 — cap on auto-tag output rows.
 const AUTO_TAG_MAX_TAGS: usize = 8;
 
@@ -47,8 +53,10 @@ pub struct ConsolidateBody {
     /// daemon to materialize the summary via the LLM (matching
     /// `handle_consolidate` at `crate::mcp::handle_consolidate` (LLM-wired branch)). Now optional;
     /// when absent the handler asks `app.llm.summarize_memories` to
-    /// produce a real summary, otherwise (no LLM wired) we synthesise
-    /// a deterministic concat fallback so the row still lands.
+    /// produce a real summary. v1.0.0 #4091 — when it cannot (no LLM
+    /// wired, timeout, error, empty completion) the request FAILS with
+    /// `503` [`SUMMARY_UNAVAILABLE`] and nothing is consolidated; a
+    /// placeholder is never substituted for the sources' meaning.
     #[serde(default)]
     pub summary: Option<String>,
     #[serde(default = "default_ns")]
@@ -73,51 +81,54 @@ fn default_ns() -> String {
     crate::DEFAULT_NAMESPACE.to_string()
 }
 
-/// v0.7.0 L7 — resolve the consolidation `summary` field when the
-/// caller omits it. Mirrors the MCP `handle_consolidate` auto-summary
-/// path at `crate::mcp::handle_consolidate` (LLM-wired branch): when an LLM is wired and the source
-/// memories can be fetched, run `summarize_memories` on `(title,
-/// content)` pairs. When no LLM is wired (keyword / semantic tiers, or
-/// Ollama unreachable at boot), fall back to a deterministic
-/// title-concat string so the consolidation still succeeds — S51 only
-/// gates on `summary_len >= 20`, and the fallback is comfortably above
-/// that for any 2-id call with non-trivial titles.
+/// The `503` [`SUMMARY_UNAVAILABLE`] refusal (#4091). `reason` is a closed
+/// vocabulary so the body never echoes a foreign model error.
+fn summary_unavailable(reason: &'static str) -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({
+            "error": "consolidation refused: no summary could be produced, so no memory was \
+                      consolidated, tombstoned or deleted",
+            "code": SUMMARY_UNAVAILABLE,
+            "reason": reason,
+            "hint": "supply `summary` explicitly, or retry when the model is available",
+        })),
+    )
+        .into_response()
+}
+
+/// v0.7.0 L7 — resolve the consolidation `summary` field when the caller omits
+/// it, mirroring the MCP `handle_consolidate` auto-summary path: when an LLM is
+/// wired, run `summarize_memories` on the `(title, content)` pairs.
 ///
-/// The blocking Ollama call is wrapped in `tokio::task::spawn_blocking`
-/// to keep the async runtime healthy under load — same pattern as
-/// `maybe_auto_tag`.
+/// # Fail closed (v1.0.0 #4091)
+///
+/// A consolidation REPLACES its sources: by default they are tombstoned, and
+/// with `AI_MEMORY_CONSOLIDATE_TOMBSTONE_SOURCES=0` they are hard-deleted. The
+/// consolidated row is therefore the only carrier of their meaning, and it
+/// may only ever hold a real summary. When there is none — no LLM wired, the
+/// call exceeds `llm_call_timeout`, the model errors, or it returns an empty /
+/// whitespace completion — this returns `Err(503 SUMMARY_UNAVAILABLE)` and
+/// the caller aborts BEFORE any write. Pre-#4091 each of those cases
+/// fabricated a titles-only or fixed-string "summary" and consolidated anyway,
+/// so a transient model failure silently replaced the memories' content.
+/// Degrade (the consolidation does not happen), never corrupt. MCP
+/// (`handle_consolidate`) already refuses the same cases.
 async fn resolve_consolidate_summary(
     app: &AppState,
     pairs: Vec<(String, String)>,
 ) -> Result<String, Response> {
     // v1.0.0 #3380 — the `(title, content)` pairs are supplied by the CALLER of
-    // this helper, which obtained them from [`gate_consolidate_sources`].
-    // Pre-#3380 this function re-fetched the sources itself through an
-    // ungated read, so the rows the model saw were not necessarily the rows any
-    // gate had admitted. Fetching once and threading the result makes
-    // "gated" and "summarised" the same set by construction.
-
-    // No LLM available — deterministic concat fallback. Titles only
-    // (not full content) so the result stays a "summary" rather than a
-    // verbatim concat that S51's `is_verbatim_concat` heuristic would
-    // flag.
+    // this helper, which obtained them from [`gate_consolidate_sources`], so the
+    // rows the model sees are exactly the rows the gate admitted.
     let llm_arc = app.llm.current();
     if llm_arc.is_none() || pairs.is_empty() {
-        let titles: Vec<String> = pairs.iter().map(|(t, _)| t.clone()).collect();
-        return Ok(format!(
-            "Consolidated summary of {} memories: {}",
-            titles.len(),
-            titles.join("; ")
-        ));
+        return Err(summary_unavailable("llm_unavailable"));
     }
 
     let llm_timeout = app.llm_call_timeout;
-    // H8 (v0.7.0 round-2) — bound the Ollama summarize call by the
-    // configured per-LLM-call timeout (default 30s). On timeout we
-    // degrade to the deterministic concat fallback below (already the
-    // L7 LLM-absent path).
-    // PERF-9 (v0.7.0 FX-C1) — direct async summarize. No spawn_blocking
-    // hop now that OllamaClient is async-`reqwest::Client`.
+    // H8 (v0.7.0 round-2) — bound the summarize call by the configured
+    // per-LLM-call timeout (default 30s).
     let join = tokio::time::timeout(llm_timeout, async move {
         let Some(llm) = llm_arc.as_ref() else {
             return Ok::<String, anyhow::Error>(String::new());
@@ -128,18 +139,20 @@ async fn resolve_consolidate_summary(
 
     match join {
         Ok(Ok(s)) if !s.trim().is_empty() => Ok(s),
+        Ok(Ok(_)) => {
+            tracing::warn!("#4091: LLM returned an empty summary — refusing the consolidation");
+            Err(summary_unavailable("llm_empty"))
+        }
+        Ok(Err(e)) => {
+            tracing::warn!("#4091: LLM summarize failed ({e}) — refusing the consolidation");
+            Err(summary_unavailable("llm_error"))
+        }
         Err(_) => {
             tracing::warn!(
-                "H8: LLM call (summarize_memories) exceeded {}s timeout — falling back to \
-                 deterministic concat",
+                "#4091: LLM summarize exceeded the {}s timeout — refusing the consolidation",
                 llm_timeout.as_secs()
             );
-            Ok("Consolidated summary (LLM timeout; deterministic fallback)".to_string())
-        }
-        Ok(_) => {
-            // LLM returned an empty body or errored — fall back to a
-            // deterministic concat-of-titles fallback.
-            Ok("Consolidated summary (LLM unavailable; deterministic fallback)".to_string())
+            Err(summary_unavailable("llm_timeout"))
         }
     }
 }

@@ -292,9 +292,22 @@ async fn source_matrix(f: &Fixture) {
         }
         let a = seed(f, &ns, json!({"agent_id": CALLER, "scope": "private"})).await;
         let b = seed(f, &ns, json!({"agent_id": CALLER, "scope": "private"})).await;
+        let before = snapshot(f).await;
         let (status, body) = call(f, &[a, b], Some(&ns), supplied).await;
-        assert_eq!(status, StatusCode::CREATED, "owner body={body}");
-        assert_eq!(body["consolidated"], 2);
+        if supplied {
+            assert_eq!(status, StatusCode::CREATED, "owner body={body}");
+            assert_eq!(body["consolidated"], 2);
+        } else {
+            // v1.0.0 #4091 — admitted, but no LLM and no supplied summary:
+            // fail closed, nothing consumed.
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "owner body={body}");
+            assert_eq!(body["code"], ai_memory::handlers::SUMMARY_UNAVAILABLE);
+            assert_eq!(
+                snapshot(f).await,
+                before,
+                "a refused consolidation changes nothing"
+            );
+        }
         let a = seed(
             f,
             "_agents",
@@ -310,7 +323,11 @@ async fn source_matrix(f: &Fixture) {
         let (status, body) = call(f, &[a, b], Some("_agents"), supplied).await;
         assert_eq!(
             status,
-            StatusCode::CREATED,
+            if supplied {
+                StatusCode::CREATED
+            } else {
+                StatusCode::SERVICE_UNAVAILABLE
+            },
             "explicit substrate owner body={body}"
         );
     }

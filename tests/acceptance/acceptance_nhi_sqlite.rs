@@ -840,14 +840,17 @@ fn config1_full_surface_attested_nhi_e2e() {
         "promote must lift the tier to long"
     );
 
-    // -- Consolidate two sources into a summary (degrades w/o an LLM). Runs
-    // LAST among the writes that touch long/mid — it supersedes its sources.
+    // -- Consolidate two sources into a caller-supplied summary. Runs LAST
+    // among the writes that touch long/mid — it supersedes its sources.
+    // v1.0.0 #4091: with no LLM the daemon refuses to invent one (503), so
+    // the e2e run supplies it.
     let consolidate = client
         .post(daemon.url("/api/v1/consolidate"))
         .header("X-Agent-Id", NHI_AGENT)
         .json(&json!({
             "ids": [long_id, mid_id],
             "title": "consolidated-summary",
+            "summary": "Consolidated summary of the long and mid NHI acceptance sources.",
             "namespace": ns,
             "tier": "long",
             "agent_id": NHI_AGENT

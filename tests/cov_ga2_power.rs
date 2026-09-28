@@ -586,17 +586,15 @@ async fn consolidate_no_llm_deterministic_summary_is_201() {
         json!({"ids": [id1, id2], "title": "Consolidated project facts"}),
     )
     .await;
-    assert_eq!(status, StatusCode::CREATED, "consolidate 201: {body}");
-    assert!(body["id"].is_string());
-    assert_eq!(body["consolidated"], 2);
-    let summary = body["summary"].as_str().unwrap_or_default();
-    assert!(
-        summary.contains("Consolidated summary of 2 memories"),
-        "deterministic fallback summary: {body}"
+    // v1.0.0 #4091 — no LLM and no caller summary: FAIL CLOSED. A titles-only
+    // placeholder must never replace the sources.
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "no summary must refuse: {body}"
     );
-    // L7-followup mirror fields.
-    assert_eq!(body["content"], body["summary"]);
-    assert_eq!(body["memory"]["title"], "Consolidated project facts");
+    assert_eq!(body["code"], ai_memory::handlers::SUMMARY_UNAVAILABLE);
+    assert!(body["id"].is_null(), "nothing consolidated: {body}");
 }
 
 #[tokio::test]

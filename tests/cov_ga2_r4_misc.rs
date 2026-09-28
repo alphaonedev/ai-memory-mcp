@@ -532,10 +532,8 @@ async fn sqlite_consolidate_no_summary_deterministic_fallback() {
     let ns = uniq_ns();
     let id1 = seed_memory(&r, &ns, "fallback src 1", "alpha source body here").await;
     let id2 = seed_memory(&r, &ns, "fallback src 2", "beta source body here").await;
-    // No summary + no LLM wired → resolve_consolidate_summary's
-    // deterministic title-concat fallback (lines 110-118) runs after
-    // fetch_consolidate_source_pairs walks the SQLite db::get arm
-    // (lines 203-225).
+    // No summary + no LLM wired → v1.0.0 #4091: resolve_consolidate_summary
+    // refuses (503) after the SQLite source gate walked `db::get`.
     let (status, body) = post_json(
         &r,
         "/api/v1/consolidate",
@@ -547,11 +545,8 @@ async fn sqlite_consolidate_no_summary_deterministic_fallback() {
         }),
     )
     .await;
-    assert_eq!(status, StatusCode::CREATED, "body={body}");
-    assert!(
-        body["summary"].as_str().is_some_and(|s| !s.is_empty()),
-        "deterministic fallback summary present; body={body}"
-    );
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "body={body}");
+    assert_eq!(body["code"], ai_memory::handlers::SUMMARY_UNAVAILABLE);
 }
 
 #[tokio::test]

@@ -436,7 +436,7 @@ async fn consolidate_body_agent_id_mismatch_returns_403() {
 
 #[tokio::test]
 async fn consolidate_no_llm_deterministic_summary_fallback() {
-    // No LLM wired + summary omitted → deterministic concat fallback.
+    // No LLM wired + summary omitted → v1.0.0 #4091 fail-closed 503.
     let (router, _f, _db) = build_llm_router(None);
     let id1 = seed_memory(&router, "cov-cons4", "Det one", "det").await;
     let id2 = seed_memory(&router, "cov-cons4", "Det two", "det").await;
@@ -451,13 +451,9 @@ async fn consolidate_no_llm_deterministic_summary_fallback() {
         "det",
     )
     .await;
-    assert_eq!(status, StatusCode::CREATED, "{v}");
-    assert!(
-        v["summary"]
-            .as_str()
-            .is_some_and(|s| s.contains("Consolidated summary of")),
-        "deterministic fallback: {v}",
-    );
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{v}");
+    assert_eq!(v["code"], ai_memory::handlers::SUMMARY_UNAVAILABLE, "{v}");
+    assert!(v["summary"].is_null(), "no placeholder summary: {v}");
 }
 
 // ===========================================================================

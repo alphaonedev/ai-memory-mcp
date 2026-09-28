@@ -6,7 +6,7 @@
 //! CONVERGE across a strict-write-sig mesh.
 //!
 //! **The gap.** `POST /api/v1/consolidate` mints a NEW substrate-derived memory
-//! (an LLM summary or a deterministic title-concat produced by the origin
+//! (an LLM or caller-supplied summary — never a placeholder, #4091 — produced by the origin
 //! DAEMON) and — pre-#2860 — stamped `metadata.agent_id = <tenant>` with NO
 //! `metadata.write_signature`. The origin daemon CANNOT produce the tenant's
 //! Ed25519 signature, so under the v1.0.0-default strict

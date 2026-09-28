@@ -745,9 +745,8 @@ pg_test!(
         let ns = uniq_ns();
         let id1 = seed_memory(&r, &ns, "no-summary src 1", "alpha body").await;
         let id2 = seed_memory(&r, &ns, "no-summary src 2", "beta body").await;
-        // No summary + no LLM wired → resolve_consolidate_summary takes the
-        // deterministic title-concat fallback (fetch_consolidate_source_pairs
-        // postgres arm runs to gather the source titles).
+        // No summary + no LLM wired → v1.0.0 #4091: resolve_consolidate_summary
+        // refuses (503) after the postgres source gate ran.
         let (status, body) = post_json(
             &r,
             "/api/v1/consolidate",
@@ -759,12 +758,8 @@ pg_test!(
             }),
         )
         .await;
-        assert_eq!(status, StatusCode::CREATED, "body={body}");
-        assert_eq!(body["storage_backend"], "postgres");
-        assert!(
-            body["summary"].as_str().is_some_and(|s| !s.is_empty()),
-            "deterministic fallback summary present; body={body}"
-        );
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "body={body}");
+        assert_eq!(body["code"], ai_memory::handlers::SUMMARY_UNAVAILABLE);
     }
 );
 
