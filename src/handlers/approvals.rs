@@ -7,19 +7,25 @@
 //! Body: `{"decision":"approve|deny","remember":"once|session"}`.
 //! `remember='forever'` is refused (#3394) before any backend work.
 //! Gated behind the K7 server-wide HMAC: caller MUST present
-//! `X-AI-Memory-Signature: sha256=<hex>` keyed on
-//! `SHA256([hooks.subscription].hmac_secret)` over the canonical
-//! `<timestamp>.<body>` string. Missing or invalid signature → 401.
+//! `X-AI-Memory-Signature: sha256=<hex>` and
+//! `X-AI-Memory-Timestamp: <unix_ts>`, where `<hex>` is
+//! `HMAC-SHA256(SHA256([hooks.subscription].hmac_secret), canonical)` over
+//! the canonical request `<unix_ts>.<METHOD>.<pending_id>.<body>` (method,
+//! row and body are all bound — see [`verify_approval_hmac`]). Missing or
+//! invalid signature → 401.
 //!
-//! `GET /api/v1/approvals/stream` — long-lived SSE stream that fans out
-//! every `approval_requested` and `approval_decided` event from the
-//! process-wide [`crate::approvals`] broadcast bus to every attached
-//! subscriber.
+//! `GET /api/v1/approvals/stream` — long-lived SSE stream of
+//! `approval_requested` and `approval_decided` events from the
+//! process-wide [`crate::approvals`] broadcast bus, FILTERED per
+//! subscriber by [`sse_event_visible_to`]: a subscriber sees only its own
+//! rows plus namespaces a K9 `Allow` rule grants it. An anonymous or
+//! `host:`-prefixed subscriber sees nothing.
 //!
-//! The SSE endpoint is intentionally unauthenticated beyond the
-//! existing `api_key_auth` middleware: SSE re-key handshakes are clunky
-//! and the K7 HMAC is a *write*-side gate. Read-side gating piggybacks
-//! on the api-key middleware that wraps every other route.
+//! The SSE endpoint carries no HMAC (SSE re-key handshakes are clunky and
+//! the K7 HMAC is a *write*-side gate). Read-side gating is the api-key
+//! middleware that wraps every other route, plus the per-agent-key
+//! identity gate at stream open (#2154) and the per-event visibility
+//! filter above.
 //!
 //! Extracted from `src/handlers/mod.rs` as part of the issue #650
 //! file-architecture cleanup.
@@ -88,9 +94,13 @@ pub(crate) const APPROVAL_HMAC_MAX_SKEW_SECS: i64 = 60;
 
 /// HMAC-verify an inbound approval request.
 ///
-/// Mirrors the K7 outbound construction: signature value is
-/// `sha256=<hex>` where `<hex>` = `HMAC-SHA256(SHA256(secret),
-/// "<timestamp>.<body>")`. Returns `Ok(())` on a valid signature;
+/// Signature value is `sha256=<hex>` where `<hex>` =
+/// `HMAC-SHA256(SHA256(secret), "<unix_ts>.<METHOD>.<pending_id>.<body>")`
+/// — the K7 keying, over the canonical request described below. On the
+/// generic approval routes `<pending_id>` is the row id from the URL; the
+/// credential-approval arm of the api-key revoke/mint route binds the
+/// approver into it ([`crate::handlers::agent_api_key::approval_subject`]).
+/// Returns `Ok(())` on a valid signature;
 /// `Err(StatusCode)` (always 401) on any failure mode (missing
 /// header, missing timestamp, stale timestamp, bad encoding,
 /// mismatch).
@@ -108,7 +118,8 @@ pub(crate) const APPROVAL_HMAC_MAX_SKEW_SECS: i64 = 60;
 /// to avoid timing oracles on the hex digest.
 ///
 /// **Canonical request (#628 P1, agent-4 finding)**: the signed
-/// payload binds **method + URL path + body**, not just `<ts>.<body>`.
+/// payload binds **method + pending row + body**, not just the timestamp
+/// and body.
 /// Without the path binding, a captured signature for pending row A
 /// could be replayed against pending row B by simply changing the URL
 /// — a row-substitution attack inside the 300s replay window. The
@@ -118,10 +129,9 @@ pub(crate) const APPROVAL_HMAC_MAX_SKEW_SECS: i64 = 60;
 /// canonical = "<unix_ts>.<METHOD>.<pending_id>.<body>"
 /// ```
 ///
-/// Both signer and verifier MUST use the exact same join. Callers
-/// that previously signed `<ts>.<body>` will now hard-fail (401), so
-/// any in-tree test fixture or external client must be updated in
-/// lockstep with this change.
+/// Both signer and verifier MUST use the exact same join. A signature
+/// over the older two-part preimage (timestamp and body only, without
+/// method and row) hard-fails (401).
 pub(crate) fn verify_approval_hmac(
     headers: &HeaderMap,
     body: &[u8],
@@ -767,10 +777,12 @@ fn publish_decision_event(
 ///      to share an `agent_id` with the requester.
 ///   3. The historical "anonymous" subscriber (agent_id empty) sees
 ///      nothing — opt-in is the safe default for a privileged feed.
-///   4. If the subscriber agent is a server-internal id starting with
-///      `host:` (the daemon's own boot id), they see everything —
-///      this preserves the operator-CLI affordance of attaching to
-///      the local socket and observing all activity for diagnostics.
+///   4. A subscriber agent starting with `host:` (the server-side
+///      fallback principal from `identity::resolve_agent_id`) sees
+///      NOTHING: `host:` is never a legitimate self-asserted identity,
+///      and the removed `host:` all-events bypass was the #628 P1
+///      cross-tenant leak. An operator who needs a see-all feed grants
+///      an explicit K9 `Allow` rule to a named administrative agent.
 #[must_use]
 pub fn sse_event_visible_to(
     subscriber_agent: &str,
