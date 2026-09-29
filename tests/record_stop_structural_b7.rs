@@ -18,6 +18,32 @@
 //! (and the same split of `INSERT` / `INTO` or `DELETE` / `FROM`) is
 //! classified. The predicate itself stays single-line; the pre-#3942
 //! scanner is the frozen leg of `b7_scanner_sees_backslash_continued_write_sql_3942`.
+//!
+//! #4149 — a file is skipped as test-only ONLY when a parent module
+//! DECLARES it `#[cfg(test)] mod NAME;` ([`cfg_test_declared_files`]),
+//! plus that module's descendants. A test-looking file NAME proves
+//! nothing (#4054); an undeclared file is scanned as production.
+//!
+//! # Known limits (#4182)
+//!
+//! This is a TEXTUAL scanner, so it proves less than a reader may assume:
+//!
+//! - **Reachability is not checked.** A gate call anywhere in the
+//!   function body counts, including one inside a closure that is never
+//!   invoked or a branch that never runs. A gate that is present but
+//!   unreachable reads as gated.
+//! - **Macro-generated code is invisible.** Write SQL or a gate call
+//!   produced by a macro expansion is never seen.
+//! - **Enclosing function is lexical.** Write SQL is attributed to the
+//!   nearest preceding `fn` in the text, not to the function that
+//!   executes it (a SQL const used from another function is attributed
+//!   to wherever it is declared).
+//! - **`#[path = ...]` is not resolved** by the #4149 declaration walk,
+//!   so such a cfg(test) module stays scanned (fail-closed direction).
+//!
+//! A green B7 therefore means "every write-SQL function NAMES a gate or is
+//! allowlisted", not "every write is gated at run time". The run-time
+//! proof is the record-stop behavioural cells.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
