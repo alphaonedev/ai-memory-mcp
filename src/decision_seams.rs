@@ -511,6 +511,12 @@ fn outcome_of<T>(decision: &Decision<T>) -> DecisionOutcome {
 /// Both series are created lazily by the first observation, so an
 /// unconfigured deployment's `/metrics` gains nothing — which is half of
 /// "unset is byte-identical".
+///
+/// #4175 — the series counts SEAM CALLS, and a dry-run preview's judge call
+/// is one: it is a real provider round trip with a real latency and a real
+/// outcome, so it is recorded like any other. The series is NOT a count of
+/// applied merges or deletes. Those live in the pass reports, where a dry
+/// run's answer is carried separately under `judge_preview`.
 fn record(seam: CalibrationSeam, outcome: DecisionOutcome, started: Instant) {
     crate::metrics::record_decision(seam, outcome, started.elapsed().as_secs_f64());
 }
@@ -684,7 +690,9 @@ pub enum MergeBlockReason {
     /// The provider decided **no**.
     DecidedNo,
     /// The provider decided **yes** but carried no confidence, or one
-    /// below [`CONSOLIDATION_MERGE_CONFIDENCE_FLOOR`]. Treated as an
+    /// below the SEAM'S OWN floor ([`CalibrationSeam::confidence_floor`]:
+    /// [`CONSOLIDATION_MERGE_CONFIDENCE_FLOOR`] for the merge judge,
+    /// [`SYNTHESIS_DELETE_CONFIDENCE_FLOOR`] for a synthesis delete). Treated as an
     /// abstain: on a delete-the-sources path an uncalibrated yes is not
     /// a yes.
     LowConfidence {
@@ -721,8 +729,11 @@ impl fmt::Display for MergeBlockReason {
             Self::LowConfidence {
                 confidence: Some(c),
             } => write!(
+                // #4175 — the variant is shared by every destructive seam,
+                // so it must not quote ONE seam's floor. The seam's floor is
+                // CalibrationSeam::confidence_floor.
                 f,
-                "{} ({c:.3} < {CONSOLIDATION_MERGE_CONFIDENCE_FLOOR})",
+                "{} ({c:.3} is below the seam's confidence floor)",
                 self.as_str()
             ),
             Self::LowConfidence { confidence: None } => {
@@ -825,8 +836,10 @@ impl MergeJudgeReport {
 pub enum MergeJudgement {
     /// No decider is attached: the merge proceeds as v1.0.0 did
     /// (byte-identical). This is NOT a permit — it is the absence of a
-    /// judge, and it is only reachable when `[decision]` is unset or the
-    /// boot chokepoint refused to build a provider.
+    /// judge, and it is only reachable when `[decision]` is unset. A
+    /// CONFIGURED decider whose provider the boot chokepoint refused to
+    /// build is NOT this arm: it blocks as unavailable (case 2) under every
+    /// fallback (#4175).
     NoDecider,
     /// A decided yes at or above the floor. The merge may proceed —
     /// which only ever confirms what the two fixed gates already
@@ -1716,11 +1729,31 @@ mod tests {
     }
 }
 
-/// tmux-22 REVIEW CELLS (not for landing) — the N2 half-open protocol as
-/// wired on the SYNC destructive path (`destructive_judge`, d002936df).
+/// #4175 — `LowConfidence` is shared by the merge judge and the synthesis
+/// delete, so its message must not quote the consolidation floor for both.
+/// RED on 65642b3cf, which printed `(0.500 < 0.8)` whatever the seam.
+#[cfg(test)]
+#[test]
+fn low_confidence_display_names_no_single_seams_floor_4175() {
+    let shown = MergeBlockReason::LowConfidence {
+        confidence: Some(0.5),
+    }
+    .to_string();
+    assert_eq!(
+        shown,
+        "low_confidence (0.500 is below the seam's confidence floor)"
+    );
+}
+
+/// The f1 delta N2 half-open circuit-breaker protocol as wired on the SYNC
+/// destructive path (`destructive_judge`). After the cooldown, exactly one
+/// caller probes. A result that is not the probe's never closes an open
+/// breaker. A cancelled probe frees the slot. These cells were written by
+/// tmux-22 during review and are kept deliberately (#4178): they are the
+/// only pin of that protocol on the sync path.
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
-mod review_sync_probe_cells {
+mod sync_half_open_probe_cells {
     use super::*;
     use serde_json::json;
     use wiremock::matchers::{method, path};
