@@ -90,6 +90,9 @@ const FACT_DURABILITY_CLASS: &str = "durability_class";
 /// v1.0.0 #3553 — what an acknowledged write may lose on a POWER LOSS (not a
 /// process crash) at the live level.
 const FACT_RPO_ON_POWER_LOSS: &str = "rpo_on_power_loss";
+/// #4199 — the forensic log's chain tail (a hash prefix, `empty`, or
+/// `UNAVAILABLE`).
+const FACT_CHAIN_TAIL: &str = "chain_tail";
 /// v1.0.0 #3385 — provenance of the reported `archive_on_gc` fact:
 /// `config` (`[storage].archive_on_gc`), `legacy` (the deprecated flat key),
 /// or `compiled-default`. The value alone cannot tell an operator whether a
@@ -1607,6 +1610,12 @@ fn run_local(db_path: &Path, caller_agent_id: Option<&str>) -> Report {
     sections.push(section_peer_allowlist_3582(
         &crate::federation::peer_posture::observe(None),
     ));
+    // #4199 / #4203 — the forensic governance log, inspected exactly as boot
+    // does: an unavailable chain tail (the sink is OFF) or a future-dated
+    // file is Critical. Filesystem only; no database needed.
+    sections.push(section_forensic_log_4199(
+        &crate::governance::audit::inspect_forensic_tail(&forensic_dir_for_doctor()),
+    ));
 
     // v1.0.0 (#3264) — Postgres extension health, BEFORE the SQLite open for
     // the same reason `section_config_health_3166` is: on a `postgres://`
@@ -2524,6 +2533,92 @@ fn section_key_posture_3717(caller_agent_id: Option<&str>) -> ReportSection {
         severity,
         facts,
         note,
+    }
+}
+
+/// #4199 — the doctor section name for the forensic governance log.
+pub const SECTION_FORENSIC_LOG: &str = "Forensic audit log (#4199)";
+
+/// The forensic directory boot uses: the parent of the resolved audit path.
+fn forensic_dir_for_doctor() -> PathBuf {
+    let audit_cfg = crate::config::AppConfig::load().effective_audit();
+    let log_path = crate::audit::resolve_audit_path(&audit_cfg);
+    log_path
+        .parent()
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
+}
+
+/// #4199 / #4203 — the forensic governance log. Critical when its chain tail
+/// cannot be established (every process then runs WITHOUT the forensic sink,
+/// or refuses under `AI_MEMORY_REQUIRE_FORENSIC_SINK`) or when a file is dated
+/// after today (never the tail, left in place as evidence).
+fn section_forensic_log_4199(
+    report: &crate::governance::audit::ForensicTailReport,
+) -> ReportSection {
+    use crate::governance::audit::{REQUIRE_FORENSIC_SINK_ENV, require_forensic_sink_enabled};
+    let require = require_forensic_sink_enabled();
+    let mut facts = vec![
+        ("directory".to_string(), report.dir.display().to_string()),
+        (
+            "require_mode".to_string(),
+            format!(
+                "{REQUIRE_FORENSIC_SINK_ENV}={}",
+                if require { "on" } else { "off" }
+            ),
+        ),
+    ];
+    let mut notes: Vec<String> = Vec::new();
+    match &report.tail {
+        Ok(None) => facts.push((
+            FACT_CHAIN_TAIL.into(),
+            "empty (the next row starts the chain)".into(),
+        )),
+        Ok(Some(hash)) => facts.push((
+            FACT_CHAIN_TAIL.into(),
+            hash.chars().take(16).collect::<String>(),
+        )),
+        Err(cause) => {
+            facts.push((FACT_CHAIN_TAIL.into(), "UNAVAILABLE".into()));
+            facts.push(("cause".into(), cause.clone()));
+            notes.push(if require {
+                "every command but `doctor` REFUSES to start (require-mode). Repair or move the \
+                 named file."
+                    .to_string()
+            } else {
+                format!(
+                    "every process runs WITHOUT the forensic sink (no forensic rows are written; \
+                     the chain is not forked). Repair or move the named file; set \
+                     {REQUIRE_FORENSIC_SINK_ENV}=1 to refuse boot instead."
+                )
+            });
+        }
+    }
+    if !report.future_dated.is_empty() {
+        facts.push((
+            "future_dated_files".into(),
+            report
+                .future_dated
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+        ));
+        notes.push(
+            "files dated after today are never the chain tail and are left in place as \
+             evidence (#4203): find out who wrote them."
+                .to_string(),
+        );
+    }
+    let critical = report.tail.is_err() || !report.future_dated.is_empty();
+    ReportSection {
+        name: SECTION_FORENSIC_LOG.into(),
+        severity: if critical {
+            Severity::Critical
+        } else {
+            Severity::Info
+        },
+        facts,
+        note: (!notes.is_empty()).then(|| notes.join(" ")),
     }
 }
 
@@ -5290,7 +5385,8 @@ mod tests {
         // #3471 note: "Wake hub (#3471)" is UNCONDITIONAL — it reads only the
         // filesystem and this process's own RLIMIT_NOFILE, so it costs nothing
         // on a host with no hub and reports `configured = no` there.
-        assert_eq!(report.sections.len(), 23);
+        // #4199 — "Forensic audit log (#4199)" renders before the database open.
+        assert_eq!(report.sections.len(), 24);
         let names: Vec<&str> = report.sections.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(
             names,
@@ -5300,6 +5396,7 @@ mod tests {
                 SECTION_TRANSIT_ENCRYPTION,
                 "Logging pipeline (#3651)",
                 "Federation peer authorization",
+                SECTION_FORENSIC_LOG,
                 "Identity",
                 SECTION_KEY_POSTURE,
                 "Storage",
@@ -6633,7 +6730,9 @@ mod tests {
         // left `unobservable` for the same reason; #3651 the logging
         // pipeline renders fourth (it is independent of the database too).
         // Storage is the Critical failure.
-        assert_eq!(report.sections.len(), 8);
+        // #4199 — the forensic log section is filesystem-only and renders
+        // before the database open too.
+        assert_eq!(report.sections.len(), 9);
         assert_eq!(report.sections[0].name, "Configuration");
         assert_eq!(report.sections[1].name, SECTION_DEPLOYMENT_SHAPE_DETECTOR);
         assert_eq!(
@@ -6649,16 +6748,59 @@ mod tests {
         );
         assert_eq!(report.sections[3].name, "Logging pipeline (#3651)");
         assert_eq!(report.sections[4].name, "Federation peer authorization");
-        assert_eq!(report.sections[5].name, SECTION_IDENTITY);
+        assert_eq!(report.sections[5].name, SECTION_FORENSIC_LOG);
+        assert_eq!(report.sections[6].name, SECTION_IDENTITY);
         // #3717 — the key posture is filesystem-only and renders even when
         // the database will not open.
-        assert_eq!(report.sections[6].name, SECTION_KEY_POSTURE);
-        let storage = &report.sections[7];
+        assert_eq!(report.sections[7].name, SECTION_KEY_POSTURE);
+        let storage = &report.sections[8];
         assert_eq!(storage.name, "Storage");
         assert_eq!(storage.severity, Severity::Critical);
         // overall is computed from the sections; Storage is Critical.
         assert_eq!(report.overall, Severity::Critical);
         assert!(storage.note.as_ref().unwrap().contains("could not open"));
+    }
+
+    // -------------------------------------------------------------------
+    // #4199 / #4203 — forensic log section
+    // -------------------------------------------------------------------
+
+    fn forensic_report(
+        tail: std::result::Result<Option<String>, String>,
+        future: &[&str],
+    ) -> crate::governance::audit::ForensicTailReport {
+        crate::governance::audit::ForensicTailReport {
+            dir: PathBuf::from("/var/lib/ai-memory/audit"),
+            tail,
+            future_dated: future.iter().map(PathBuf::from).collect(),
+        }
+    }
+
+    #[test]
+    fn forensic_section_is_info_for_a_healthy_or_empty_chain_4199() {
+        for tail in [Ok(None), Ok(Some("ab".repeat(32)))] {
+            let s = section_forensic_log_4199(&forensic_report(tail, &[]));
+            assert_eq!(s.name, SECTION_FORENSIC_LOG);
+            assert_eq!(s.severity, Severity::Info);
+        }
+    }
+
+    #[test]
+    fn forensic_section_is_critical_and_names_the_cause_when_unavailable_4199() {
+        let s = section_forensic_log_4199(&forensic_report(Err("disk read failed".into()), &[]));
+        assert_eq!(s.severity, Severity::Critical);
+        assert_eq!(fact(&s, FACT_CHAIN_TAIL), "UNAVAILABLE");
+        assert_eq!(fact(&s, "cause"), "disk read failed");
+    }
+
+    #[test]
+    fn forensic_section_is_critical_for_a_future_dated_file_4203() {
+        let s = section_forensic_log_4199(&forensic_report(
+            Ok(Some("cd".repeat(32))),
+            &["/var/lib/ai-memory/audit/forensic-2099-01-01.jsonl"],
+        ));
+        assert_eq!(s.severity, Severity::Critical);
+        assert!(fact(&s, "future_dated_files").contains("forensic-2099-01-01.jsonl"));
     }
 
     // -------------------------------------------------------------------

@@ -315,6 +315,11 @@ pub struct Metrics {
     /// quarantine used to emit nothing while `/sync/push` returned 200).
     pub federation_quarantined_unattributed: IntCounter,
 
+    /// v1.0.0 #4199 — monotonic count of process starts whose forensic
+    /// audit sink was unavailable (its chain tail could not be established),
+    /// so the process ran WITHOUT it instead of forking the chain at genesis.
+    pub forensic_sink_unavailable: IntCounter,
+
     /// v1.0.0 #3699 (5-agent vote 4d3ea1c5) — monotonic count of inbound
     /// federated memories folded into a LOCAL row of a DIFFERENT id by the
     /// newer-wins `(title, namespace)` merge (the inbound id was never
@@ -1100,6 +1105,18 @@ impl Metrics {
             &mut err,
         );
 
+        // v1.0.0 #4199 — the forensic sink was unavailable at boot (no fork).
+        let forensic_sink_unavailable = int_counter(
+            &registry,
+            "ai_memory_forensic_sink_unavailable_total",
+            "Monotonic count of process starts whose forensic audit sink was \
+             unavailable: the forensic log's chain tail could not be established \
+             (an I/O error, or no parseable row in any non-empty file), so the \
+             process ran WITHOUT the sink instead of forking the signed chain at \
+             genesis. Any non-zero value needs an operator. #4199.",
+            &mut err,
+        );
+
         // #2966 (L6 5-agent vote 4d3ea1c5) — route-IN quarantine
         // observability. The provenance gate used to flip a row to
         // lifecycle_state=quarantined and emit NOTHING while /sync/push
@@ -1521,6 +1538,7 @@ impl Metrics {
             federation_push_dlq_legacy_positional,
             federation_erasure_superseded,
             federation_quarantined_unattributed,
+            forensic_sink_unavailable,
             federation_cross_id_title_merge,
             operator_dequarantined,
             hnsw_evictions_total,
@@ -1680,6 +1698,19 @@ pub fn record_auto_export_spawn_failed() {
 /// quarantine knob (`AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED`) is off.
 pub fn inc_fed_quarantined_unattributed() {
     registry().federation_quarantined_unattributed.inc();
+}
+
+/// v1.0.0 #4199 — record that this process runs without the forensic audit
+/// sink (its chain tail could not be established). Pairs with the ERROR, the
+/// doctor Critical and the signed `audit.forensic_sink_unavailable` row.
+pub fn inc_forensic_sink_unavailable() {
+    registry().forensic_sink_unavailable.inc();
+}
+
+/// v1.0.0 #4199 — read [`inc_forensic_sink_unavailable`]'s counter.
+#[must_use]
+pub fn forensic_sink_unavailable_count() -> u64 {
+    registry().forensic_sink_unavailable.get()
 }
 
 /// v1.0.0 #3124 — record `rows` caller-scoped mutations admitted on
