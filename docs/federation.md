@@ -359,13 +359,15 @@ independently — these are layered on top.
   gates the `action_transitions` subcollection on `/sync/push`. A
   coordination-action transition is an *authority-granting* write
   (complete/abandon an action, claim/release a lease), so an inbound
-  transition is applied only when its Ed25519 signature verifies
-  against the attested actor's (`claimed_by`) locally-**enrolled** key
-  AND a best-effort local lease-holder check does not conflict.
-  Unsigned / non-enrolled transitions are refused; a **forged**
-  signature is rejected **unconditionally** regardless of this knob.
-  Set falsy (`0`/`false`/`no`/`off`) for a heterogeneous-rollout
-  window. Decision function:
+  transition under the default requires its Ed25519 signature to verify
+  against the actor's (`claimed_by`) locally-**enrolled** key and a
+  non-conflicting best-effort local lease-holder check. Setting a falsy
+  token (`0`/`false`/`no`/`off`, case-sensitive after whitespace trimming)
+  also accepts unsigned transitions and signed transitions without an
+  enrolled key, without verification. The lease check still runs first.
+  When an enrolled key and a signature are both present, a failed
+  verification is rejected even with the opt-out. `FALSE` keeps the gate
+  enabled. Decision function:
   [`src/federation/receive_auth.rs::authorize_remote_transition`](../src/federation/receive_auth.rs).
 
 - **Inbound checkpoint-resolution signature gate — FED-RQ-01
@@ -521,11 +523,14 @@ leaves all three at their secure defaults:
 - **`AI_MEMORY_FED_REQUIRE_POLICY_CURRENT`** (**default `1`**) —
   cross-node governance-policy freshness gate: refuses an inbound push
   whose advertised `sender_policy_seq` is STRICTLY behind the local
-  committed policy with `409 stale_policy_version`. Fail-closed only for
-  a *detected*-stale epoch; an absent / undeterminable epoch is accepted
-  (fail-open by design), so it never hard-refuses a peer that does not
-  advertise. See [`docs/enterprise-deployment.md`
-  §14.3](enterprise-deployment.html). The certified
+  committed policy with `409 stale_policy_version`. The local policy is
+  read first: a read failure after bounded retries returns **503** when
+  the gate is required, even if the sender omits its epoch. After a
+  successful read, an absent sender epoch is accepted. An explicit
+  opt-out accepts both read failures and stale epochs. See
+  `refuse_if_stale_policy` in
+  [`federation_receive.rs`](../src/handlers/federation_receive.rs) and
+  [`docs/enterprise-deployment.md` §14.3](enterprise-deployment.html). The certified
   `enterprise-federation.env` pins it explicitly (#2911) so an
   operator's `=0` cannot silently escape the certified set.
 - **`AI_MEMORY_FED_CERT_PEER_BINDING`** (default `warn`) +

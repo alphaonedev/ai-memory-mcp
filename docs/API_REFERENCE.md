@@ -1419,15 +1419,27 @@ Peer-to-peer push with timestamp-aware merge.
 }
 ```
 
-Response includes `applied`, `noop`, `skipped`, `receiver_agent_id`,
-`receiver_clock`, and `attestation_rejections`. The latter is an array of
-`{memory_id, cause}` for refused memory attestations on both backends (#3502),
+Response includes `applied`, `noop`, `skipped`, `receiver_agent_id`, and
+`attestation_rejections`; SQLite also returns `receiver_clock`. The rejection
+array contains `{memory_id, cause}` for refused memory attestations on both
+backends (#3502),
 where `cause` is one of `unenrolled_author_strict`,
 `no_eligible_key_at_created_at`, `missing_signature` or `forged_or_malformed`.
 HTTP 200 can represent a partially applied batch: inspect these refusals and
 `skipped` before acknowledging replication. Refused rows also emit receiver
 WARNs. The rejection array survives a later quota refusal (HTTP 429).
 See [historical key eligibility and rejection causes](attestation.md#historical-key-eligibility-on-federation-receive-3502).
+
+**Response identity limitation (#4028).** `receiver_agent_id` does not reliably
+identify the configured receiving node: PostgreSQL echoes the request body's
+`sender_agent_id`, while SQLite reports the validated caller-supplied
+`X-Agent-Id` or a fresh anonymous request identity if that header is absent or
+empty. Do not use this field as receiver identity evidence. These are the
+current response semantics; a consistent configured-node identity requires a
+separate behavior change. Sources: PostgreSQL response in
+[`federation_signing_check.rs`](../src/handlers/federation_signing_check.rs),
+SQLite response in [`federation_receive.rs`](../src/handlers/federation_receive.rs),
+and `resolve_http_agent_id` in [`identity/mod.rs`](../src/identity/mod.rs).
 
 **Federation headers (v0.7.0 secure defaults).** Under
 `AI_MEMORY_FED_REQUIRE_SIG=1` (default, #791) the request must carry an

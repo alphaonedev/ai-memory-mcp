@@ -2133,6 +2133,8 @@ pub(super) async fn sync_push_via_store(
             (crate::handlers::ATTESTATION_REJECTIONS_FIELD): crate::handlers::federation_receive::rejections_in_wire_order(&attestation_rejections),
             (crate::handlers::UNSUPPORTED_ON_POSTGRES_FIELD): unsupported_on_postgres,
             "dry_run": body.dry_run,
+            // Legacy response field: echoes the sender, not a configured
+            // receiver identity. See the API reference limitation (#4028).
             "receiver_agent_id": body.sender_agent_id,
             (field_names::STORAGE_BACKEND): "postgres",
             "note": "every /sync/push subcollection round-trips via the SAL trait on \
@@ -2388,11 +2390,13 @@ fn verify_credential_pubkey(
 /// | present    | yes          | verify; refuse on bad sig            |
 /// | present    | no           | refuse (cannot verify untrusted sig) |
 /// | absent     | yes          | refuse (enrolled peer must sign)     |
-/// | absent     | no           | allow + WARN (degraded permissive)   |
+/// | absent     | no           | refuse by default; opt-outs below   |
 ///
-/// The "neither side enrolled" allow-with-warn arm keeps an
-/// unenrolled federation pair operational while the strict-deny
-/// arms fire once an operator enrols a peer key.
+/// With neither a signature nor an enrolled key, the gate returns
+/// `401 peer_not_enrolled` by default. It allows with WARN only when
+/// peer-enrollment enforcement is disabled or the unenrolled-peer escape
+/// hatch is enabled (`require_peer_enrollment_enabled()` is false or
+/// `allow_unenrolled_peers_enabled()` is true).
 /// `AI_MEMORY_FED_REQUIRE_SIG=0` bypasses every branch.
 pub(super) fn verify_signature_or_reject(
     headers: &HeaderMap,
@@ -2734,11 +2738,13 @@ pub(super) fn canonical_get_bytes(method: &str, path: &str, query: &str) -> Vec<
 /// | present    | any   | yes          | verify; refuse on bad sig            |
 /// | present    | any   | no           | refuse (cannot verify untrusted sig) |
 /// | absent     | any   | yes          | refuse (enrolled peer must sign)     |
-/// | absent     | any   | no           | allow + WARN (degraded permissive)   |
+/// | absent     | any   | no           | refuse by default; opt-outs below   |
 ///
-/// The "neither side enrolled" allow-with-warn arm keeps an
-/// unenrolled federation pair operational while the strict-deny
-/// arms fire once an operator enrols a peer key.
+/// With neither a signature nor an enrolled key, the gate returns
+/// `401 peer_not_enrolled` by default. It allows with WARN only when
+/// peer-enrollment enforcement is disabled or the unenrolled-peer escape
+/// hatch is enabled (`require_peer_enrollment_enabled()` is false or
+/// `allow_unenrolled_peers_enabled()` is true).
 /// `AI_MEMORY_FED_REQUIRE_SIG=0` bypasses every branch (mirrors the
 /// `/sync/push` env-var posture).
 pub(super) fn verify_get_signature_or_reject(

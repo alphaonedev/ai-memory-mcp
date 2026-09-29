@@ -10,10 +10,11 @@
 //! — an unauthenticated transition is a privilege-escalation / lease-theft
 //! vector (the outer `/sync/push` envelope authenticates the *peer node*, not
 //! the *agent* the transition is attributed to). Per the #1718 5-agent vote
-//! (memory `4d3ea1c5`), inbound transitions are therefore **fail-closed**:
+//! (memory `4d3ea1c5`), inbound transitions are **fail-closed by default**:
 //! applied only when cryptographically attested to the enrolled key of the
-//! claimed actor. Signals and memories/links keep the accept-and-flag-unsigned
-//! posture (data, not authority).
+//! claimed actor. The explicit transition-signature opt-out also accepts
+//! unsigned or unenrolled transitions, subject to the local lease check.
+//! Memory and signal attestations use their own signature gates.
 //!
 //! [`authorize_remote_transition`] is the pure decision function shared by both
 //! receive backends (the sqlite inline `/sync/push` loop and the
@@ -57,11 +58,11 @@ pub enum TransitionAuthz {
 ///    is tracked separately.
 /// 2. **Unsigned →** fail-closed (`RejectUnsigned`) under `require_sig`, else
 ///    `Accept` (operator opt-out for rollout).
-/// 3. **Signed →** the actor MUST have an enrolled key and the signature MUST
-///    verify against *that* key (binds `from_agent → enrolled key`; verifying
-///    against the wire `signer_pubkey` would let a sender forge identity). A
-///    present-but-invalid signature is `RejectForged` **unconditionally** (even
-///    under permissive `require_sig == false`).
+/// 3. **Signed →** without an enrolled key, return `RejectNotEnrolled` when
+///    `require_sig` is true, otherwise `Accept` without verifying. With an
+///    enrolled key, the signature MUST verify against *that* key (binds
+///    `claimed_by → enrolled key`; never trust the wire `signer_pubkey`).
+///    Verification failure is `RejectForged` even when `require_sig` is false.
 #[must_use]
 pub fn authorize_remote_transition(
     signable: &SignableTransition<'_>,
@@ -336,8 +337,9 @@ pub const REQUIRE_TRANSITION_SIG_ENV: &str = "AI_MEMORY_FED_REQUIRE_TRANSITION_S
 /// one is refused unless the operator opts out for a rollout window by setting
 /// `AI_MEMORY_FED_REQUIRE_TRANSITION_SIG` to a falsy value (`0`/`false`/`no`/
 /// `off`). Mirrors the escape-hatch shape of `AI_MEMORY_FED_REQUIRE_SIG`
-/// (envelope signatures) — a *forged* signature is still rejected
-/// unconditionally regardless of this knob (see [`authorize_remote_transition`]).
+/// (envelope signatures). With an enrolled key, a failed verification is
+/// rejected regardless of this knob; without one, opting out accepts without
+/// verification (see [`authorize_remote_transition`]).
 #[must_use]
 pub fn require_transition_sig_enabled() -> bool {
     env_flag_default_on(REQUIRE_TRANSITION_SIG_ENV)
@@ -371,8 +373,8 @@ pub fn require_checkpoint_sig_enabled() -> bool {
 
 /// Shared grammar for federation security knobs that default **ON**
 /// (fail-closed): the flag is disabled only by an explicit falsy token
-/// (`0`/`false`/`no`/`off`, case- and whitespace-trimmed); every other value
-/// — including the empty string or an unknown word — keeps it enabled.
+/// (`0`/`false`/`no`/`off`, case-sensitive after trimming whitespace). Every
+/// other value, including the empty string or an unknown word, keeps it enabled.
 ///
 /// Centralising this parsing (#1914) stops sibling knobs from diverging, e.g.
 /// `require_sig()` historically disabled only on the literal `"0"`, so
@@ -387,7 +389,7 @@ pub fn env_flag_default_on(name: &str) -> bool {
 /// Value-level half of the [`env_flag_default_on`] grammar: given an
 /// already-resolved value, is a default-ON federation knob still ENABLED?
 /// A trimmed value is DISABLED only by an explicit falsy token
-/// (`0`/`false`/`no`/`off`, case- and whitespace-SENSITIVE per #1914); every
+/// (`0`/`false`/`no`/`off`, case-sensitive after trimming whitespace); every
 /// other value — empty string or unknown word — keeps it enabled.
 ///
 /// Split out of [`env_flag_default_on`] (#3033) as the ONE grammar SSOT both

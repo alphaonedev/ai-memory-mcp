@@ -20,7 +20,7 @@ re-issue at `b0483115`, the 2026-09-11 #3595 re-issue at `ad60bead` and the orig
 mint `e22bc93c` remain as historical records. Any change to the federation wire path or the `AI_MEMORY_FED_*` surface **voids this
 certification and triggers re-cert** (see §7).
 
-> ## STATUS — **LIVE as of 2026-09-26** (re-issued at the promotion-4 rehearsal tip `eba96b307` at 22 checks after 2 §7-watched federation-wire files changed by REAL CODE — #3266 item 3 part 5 and #3901; supersedes the 2026-09-23 bind at `eae99be43`)
+> ## STATUS — **EXPIRED as of 2026-09-29** (#4028 receive-contract comment corrections touch the §7-watched federation files; prior certification evidence is historical pending re-certification)
 >
 > Re-validated and re-bound against `f32c18dadf8a659567960747cc2802186bac9de9`
 > at the v1.0.0 promotion tip on 2026-09-21: §5.4(2) posture legs re-measured at 22 checks
@@ -1325,6 +1325,14 @@ following should **not** treat v1.0.0 as sufficient:
 ---
 
 ## 7. §5.4(7) — disconfirmation clause + expiry + signer + re-cert trigger
+
+**2026-09-29 — #4028 documentation expiry record.** Receive-contract comments
+changed in `src/federation/receive_auth.rs`,
+`src/handlers/federation_receive.rs`, and
+`src/handlers/federation_signing_check.rs`. The §7 path-based expiry gate
+includes comment-only edits. This change expires the prior certification;
+it does not re-run or re-issue certification. The binding and evidence above
+remain the historical record of the previous certification.
 
 **This certification is falsifiable. It is void the moment any of the following
 is observed:**

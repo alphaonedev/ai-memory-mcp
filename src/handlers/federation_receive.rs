@@ -2363,19 +2363,12 @@ async fn sync_push_write(
         return rejection;
     }
 
-    // v0.7.0 #1056 (Agent-2 #6) — TOFU spoofing guard. The
-    // (no sig, no enrolled key) arm of `verify_signature_or_reject`
-    // allows the request through with a WARN ("strict enforcement
-    // skipped") so an unenrolled federation pair stays operational.
-    // That permissive posture lets an attacker who knows a legitimate
-    // peer's id but has NOT yet been enrolled (heterogeneous rollout
-    // window — operator enrols half the mesh) impersonate the
-    // unenrolled half. Close the window by refusing any push whose
-    // claimed `x-peer-id` is NOT in the operator-configured peer
-    // allowlist (`AI_MEMORY_FED_PEER_ATTESTATION`). When NO allowlist
-    // is configured (the default zero-config state), this gate is a
-    // no-op and the legacy posture stands — so the security uplift
-    // only fires when the operator has explicitly enrolled peers.
+    // v0.7.0 #1056 (Agent-2 #6) — TOFU spoofing guard. Refuse a claimed
+    // `x-peer-id` outside the configured peer-attestation allowlist.
+    // With no allowlist this guard is a no-op; the signature/enrollment
+    // gate below still runs. Under required signatures, its (no sig, no
+    // enrolled key) arm refuses by default. Allow-with-WARN requires an
+    // explicit enrollment opt-out or the unenrolled-peer escape hatch.
     if let Some(peer_id) = peer_header_owned.as_deref() {
         let attest_cfg = peer_attestation::PeerAttestationConfig::from_env();
         if attest_cfg.has_allowlist() && attest_cfg.scope_for(peer_id).is_none() {
@@ -2457,22 +2450,20 @@ async fn sync_push_write(
     // branch (and before any apply loop) so a push governed by a stale
     // governance policy is refused reject-before-apply IDENTICALLY on sqlite
     // and postgres, never reaching a `MemoryStore` verbatim-apply path
-    // (postgres-clean, independent of #1990). Fail-OPEN on absent / opt-out /
-    // read-error; refuses only a DETECTED-stale sender epoch (see
-    // `receive_auth::evaluate_inbound_policy_freshness` for the rollout-safety
-    // ordering).
+    // (postgres-clean, independent of #1990). A local policy-read failure
+    // refuses 503 after bounded retries when required, even if the sender
+    // omits its epoch; an explicit opt-out accepts read failures. After a
+    // successful read, an absent sender epoch or opt-out accepts, while a
+    // detected stale epoch refuses (see `refuse_if_stale_policy`).
     if let Some(refusal) = refuse_if_stale_policy(&app, &body).await {
         return refusal;
     }
 
-    // v0.7.0 Wave-3 Continuation 2 — postgres-backed federation
-    // dispatches through the SAL trait for memories / deletions /
-    // links. Pendings / archives / restores / namespace_meta /
-    // pending_decisions remain sqlite-only (governance write paths
-    // and archive-state-machine state sit on tables not yet covered
-    // by the trait surface — those subcollections, when present in a
-    // push from a sqlite peer, surface in `skipped` with a structured
-    // note in the response envelope).
+    // Postgres-backed federation dispatches through the SAL trait.
+    // Since #3075 this also applies pendings / pending_decisions,
+    // archives / restores, namespace_meta / namespace_meta_clears, and
+    // checkpoint resolutions through their receive authorization gates.
+    // These lanes are not skipped merely because the backend is Postgres.
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
         return sync_push_via_store(app, headers, body).await;
@@ -2636,8 +2627,9 @@ async fn sync_push_write(
         )
             .into_response();
     }
-    // Receiver's local identity — default to the caller-supplied header,
-    // fall back to the anonymous placeholder. Recorded in sync_state rows.
+    // Request-scoped identity for sync_state rows and receiver_agent_id:
+    // caller-supplied X-Agent-Id, or a fresh anonymous request identity.
+    // This is not the receiver's configured node identity (#4028).
     let header_agent_id = headers
         .get(crate::HEADER_AGENT_ID)
         .and_then(|v| v.to_str().ok());
@@ -4321,9 +4313,10 @@ async fn sync_push_write(
         // while a resolution of a locally-pending anchor is confined to that
         // anchor's STORED namespace. The probe is elided when Layer 1 is not
         // armed for this peer (`ns_scope_needs_existing`), so zero-config
-        // deployments pay ZERO extra reads. Postgres still skips apply entirely
-        // (#2464/#1936) — confinement still runs so both backends refuse
-        // out-of-scope rows the same way.
+        // deployments pay ZERO extra reads. The Postgres receive twin applies
+        // checkpoint resolutions through
+        // MemoryStore::apply_remote_checkpoint_resolution after the same
+        // claimed-and-stored namespace confinement (#3075).
         let existing_cp_ns = if ns_scope_needs_existing {
             match crate::checkpoints::namespace_by_id(&lock.0, &cp.id) {
                 Ok(ns) => ns,
