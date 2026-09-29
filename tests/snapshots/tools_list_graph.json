@@ -130,21 +130,6 @@
     {
       "description": "Recall memories relevant to a",
       "inputSchema": {
-        "definitions": {
-          "KindsFilter": {
-            "anyOf": [
-              {
-                "items": {
-                  "type": "string"
-                },
-                "type": "array"
-              },
-              {
-                "type": "string"
-              }
-            ]
-          }
-        },
         "properties": {
           "as_agent": {
             "type": [
@@ -198,7 +183,17 @@
           "kinds": {
             "anyOf": [
               {
-                "$ref": "#/definitions/KindsFilter"
+                "anyOf": [
+                  {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  {
+                    "type": "string"
+                  }
+                ]
               },
               {
                 "type": "null"

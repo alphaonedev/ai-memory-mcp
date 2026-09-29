@@ -86,6 +86,51 @@ fn wire_form_drops_default_null_noise_1058() {
     );
 }
 
+/// v0.10.1 — regression pin: the trimmed wire form must be fully
+/// self-contained. Schemars derives `#[serde(untagged)]` enums (e.g.
+/// `KindsFilter` on `memory_recall`, `ToolCallSummary` on
+/// `memory_capture_turn`, `ApproverSignatureArg` on
+/// `memory_pending_approve`) as a `$ref` pointer into a sibling
+/// `definitions` map. OpenAI/Anthropic-style function-calling
+/// gateways reject `$ref`/`definitions` with
+/// `Invalid schema ... Pointer '/definitions/<Name>' does not exist`,
+/// so `strip_docs_from_tools` must inline every `$ref` and drop
+/// `definitions` before the payload leaves the process.
+fn count_ref_or_definition_nodes(value: &Value) -> usize {
+    match value {
+        Value::Object(map) => {
+            let here = usize::from(
+                map.contains_key("$ref") || map.contains_key("definitions"),
+            );
+            here + map.values().map(count_ref_or_definition_nodes).sum::<usize>()
+        }
+        Value::Array(items) => items.iter().map(count_ref_or_definition_nodes).sum(),
+        _ => 0,
+    }
+}
+
+#[test]
+fn wire_form_has_no_ref_or_definitions_nodes() {
+    for profile in [
+        Profile::core(),
+        Profile::graph(),
+        Profile::admin(),
+        Profile::power(),
+        Profile::full(),
+    ] {
+        let defs = tool_definitions_for_profile(&profile);
+        let tools = defs["tools"].as_array().expect("tools array");
+        let total: usize = tools.iter().map(count_ref_or_definition_nodes).sum();
+        assert_eq!(
+            total,
+            0,
+            "wire payload MUST carry zero `$ref`/`definitions` nodes (fully inlined schema); \
+             got {total} occurrences across {} tools",
+            tools.len()
+        );
+    }
+}
+
 /// Look up a single tool's `inputSchema.properties` map under the
 /// full profile's trimmed wire form.
 fn wire_properties(tool_name: &str) -> serde_json::Map<String, Value> {

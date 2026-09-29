@@ -130,21 +130,6 @@
     {
       "description": "Recall memories relevant to a",
       "inputSchema": {
-        "definitions": {
-          "KindsFilter": {
-            "anyOf": [
-              {
-                "items": {
-                  "type": "string"
-                },
-                "type": "array"
-              },
-              {
-                "type": "string"
-              }
-            ]
-          }
-        },
         "properties": {
           "as_agent": {
             "type": [
@@ -198,7 +183,17 @@
           "kinds": {
             "anyOf": [
               {
-                "$ref": "#/definitions/KindsFilter"
+                "anyOf": [
+                  {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  {
+                    "type": "string"
+                  }
+                ]
               },
               {
                 "type": "null"
@@ -672,23 +667,6 @@
     {
       "description": "L4 host-volunteered turn",
       "inputSchema": {
-        "definitions": {
-          "ToolCallSummary": {
-            "properties": {
-              "brief": {
-                "type": "string"
-              },
-              "tool": {
-                "type": "string"
-              }
-            },
-            "required": [
-              "brief",
-              "tool"
-            ],
-            "type": "object"
-          }
-        },
         "properties": {
           "capability": {
             "type": [
@@ -748,7 +726,19 @@
           },
           "tool_calls": {
             "items": {
-              "$ref": "#/definitions/ToolCallSummary"
+              "properties": {
+                "brief": {
+                  "type": "string"
+                },
+                "tool": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "brief",
+                "tool"
+              ],
+              "type": "object"
             },
             "type": "array"
           }
@@ -865,25 +855,20 @@
     {
       "description": "Approve a pending action",
       "inputSchema": {
-        "definitions": {
-          "ApproverSignatureArg": {
-            "properties": {
-              "pubkey": {
-                "default": "",
-                "type": "string"
-              },
-              "signature": {
-                "default": "",
-                "type": "string"
-              }
-            },
-            "type": "object"
-          }
-        },
         "properties": {
           "approvals": {
             "items": {
-              "$ref": "#/definitions/ApproverSignatureArg"
+              "properties": {
+                "pubkey": {
+                  "default": "",
+                  "type": "string"
+                },
+                "signature": {
+                  "default": "",
+                  "type": "string"
+                }
+              },
+              "type": "object"
             },
             "type": [
               "array",
