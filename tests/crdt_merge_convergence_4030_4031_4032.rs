@@ -37,7 +37,9 @@ use tower::ServiceExt as _;
 use ai_memory::config::{FeatureTier, ResolvedScoring, ResolvedTtl};
 use ai_memory::handlers::{ApiKeyState, AppState, Db, StorageBackend};
 use ai_memory::models::Memory;
-use ai_memory::store::{CallerContext, MemoryStore};
+#[cfg(feature = "sal-postgres")]
+use ai_memory::store::CallerContext;
+use ai_memory::store::MemoryStore;
 
 static FED_ENV_LOCK: Mutex<()> = Mutex::const_new(());
 const PEER_HEADER: &str = "x-peer-id";
@@ -106,6 +108,8 @@ enum Backend {
 /// One receiving node: a production router plus its read handles.
 struct Node {
     router: axum::Router,
+    // Read only by the postgres arm of `Node::read`.
+    #[cfg_attr(not(feature = "sal-postgres"), allow(dead_code))]
     store: Arc<dyn MemoryStore>,
     db: Db,
     backend: Backend,
@@ -342,7 +346,7 @@ fn pure_merge_takes_the_temporal_max_4030() {
 
 // ------------------------------------------------------------ #4031 ------
 
-/// A{k=old, source_uri=old}@t1, B{k=new, source_uri=new}@t2, C{}@t3 (C
+/// `A{k=old, source_uri=old}@t1`, `B{k=new, source_uri=new}@t2`, `C{}@t3` (C
 /// edits an unrelated field and omits both).
 fn abc(id: &str, ns: &str, peer: &str) -> [Value; 3] {
     let mut a = row(id, ns, peer, "2026-09-26T01:00:00Z", "same text");
@@ -449,6 +453,162 @@ fn pure_merge_is_associative_on_distinct_clocks_4031() {
     // Idempotent on its own output.
     let once = merge_memory(a, b);
     assert_eq!(projection(&merge_memory(&once, &once)), projection(&once));
+}
+
+// ------------------------------------------- #4031 (visibility: scope) ---
+
+/// `metadata.scope` is authorization-bearing (an absent / `private` scope is
+/// owner-only, `collective` is broad). `A{scope=collective}@t1`,
+/// `B{scope=private}@t2`, `C{no scope}@t3`: every delivery order must converge
+/// on B's NEWER `private` — pre-#4031 the order A, C, B kept `collective`.
+fn scope_rows(id: &str, ns: &str, peer: &str) -> [Value; 3] {
+    let mut a = row(id, ns, peer, "2026-09-26T01:00:00Z", "same text");
+    a["metadata"]["scope"] = json!("collective");
+    let mut b = row(id, ns, peer, "2026-09-26T02:00:00Z", "same text");
+    b["metadata"]["scope"] = json!("private");
+    let c = row(id, ns, peer, "2026-09-26T03:00:00Z", "same text");
+    [a, b, c]
+}
+
+async fn scope_never_widens_by_delivery_order(backend: &Backend) {
+    let peer = uniq("ai:peer-4031s");
+    let ns = uniq("fit-4031s");
+    let _posture = Posture::new(&peer, &ns);
+    for order in [
+        [0, 1, 2],
+        [0, 2, 1],
+        [1, 0, 2],
+        [1, 2, 0],
+        [2, 0, 1],
+        [2, 1, 0],
+    ] {
+        let n = node(backend).await;
+        let id = uniq("m4031s");
+        let rows = scope_rows(&id, &ns, &peer);
+        for i in order {
+            n.push(&peer, &rows[i]).await;
+        }
+        let got = n.read(&id).await;
+        assert_eq!(
+            got.metadata.get("scope"),
+            Some(&json!("private")),
+            "#4031: delivery order {order:?} let an older `collective` scope override the \
+             newer `private` one"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sqlite_scope_never_widens_by_delivery_order_4031() {
+    let _g = FED_ENV_LOCK.lock().await;
+    scope_never_widens_by_delivery_order(&Backend::Sqlite).await;
+}
+
+/// The per-field clock map is bound to the row clock it was minted at. A row
+/// whose retained `scope=private` carries a recorded (older) version, then is
+/// edited locally to `collective` (t4) and back to `private` (t5) by a
+/// read-modify-write client that round-trips the map verbatim, must keep
+/// `private` when the stale t4 `collective` row is replayed later. Without
+/// the binding the t5 `private` matched its old fingerprint and resurrected
+/// the t1 version, so the replay WIDENED the row's visibility.
+fn aba_rows() -> (Memory, Memory) {
+    use ai_memory::models::merge_memory;
+    let mut x: Memory =
+        serde_json::from_value(row("x", "n", "ai:p", "2026-09-26T01:00:00Z", "t")).expect("m");
+    x.metadata["scope"] = json!("private");
+    let y: Memory =
+        serde_json::from_value(row("x", "n", "ai:p", "2026-09-26T03:00:00Z", "t")).expect("m");
+    // M@t3 retains scope=private with its t1 version recorded in the map.
+    let merged = merge_memory(&x, &y);
+    assert!(
+        merged.metadata.get("crdt_field_clocks").is_some(),
+        "precondition: the merge recorded the retained scope's own version"
+    );
+    let mut edit_collective = merged.clone();
+    edit_collective.metadata["scope"] = json!("collective");
+    edit_collective.updated_at = "2026-09-26T04:00:00Z".to_string();
+    let mut edit_private = edit_collective.clone();
+    edit_private.metadata["scope"] = json!("private");
+    edit_private.updated_at = "2026-09-26T05:00:00Z".to_string();
+    (edit_private, edit_collective)
+}
+
+#[test]
+fn pure_edited_back_value_never_resurrects_an_old_version_4031() {
+    use ai_memory::models::merge_memory;
+    let (newest_private, stale_collective) = aba_rows();
+    for m in [
+        merge_memory(&newest_private, &stale_collective),
+        merge_memory(&stale_collective, &newest_private),
+    ] {
+        assert_eq!(
+            m.metadata.get("scope"),
+            Some(&json!("private")),
+            "a stale replay of the intermediate `collective` edit beat the owner's newest `private`"
+        );
+    }
+}
+
+async fn edited_back_scope_survives_a_stale_replay(backend: &Backend) {
+    let peer = uniq("ai:peer-4031a");
+    let ns = uniq("fit-4031a");
+    let _posture = Posture::new(&peer, &ns);
+    let n = node(backend).await;
+    let id = uniq("m4031a");
+    let (newest_private, stale_collective) = aba_rows();
+    let wire = |m: &Memory| -> Value {
+        let mut v = serde_json::to_value(m).expect("serialize");
+        v["id"] = json!(id);
+        v["namespace"] = json!(ns);
+        v["title"] = json!(format!("merge convergence probe {id}"));
+        v["metadata"]["agent_id"] = json!(peer);
+        v
+    };
+    n.push(&peer, &wire(&newest_private)).await;
+    n.push(&peer, &wire(&stale_collective)).await;
+    assert_eq!(
+        n.read(&id).await.metadata.get("scope"),
+        Some(&json!("private")),
+        "the replayed stale `collective` row widened a row the owner made private"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sqlite_edited_back_scope_survives_a_stale_replay_4031() {
+    let _g = FED_ENV_LOCK.lock().await;
+    edited_back_scope_survives_a_stale_replay(&Backend::Sqlite).await;
+}
+
+/// The #4032 bounded metadata fallback keeps only the row-LWW winner's
+/// ordinary keys; the visibility keys must still resolve by their own
+/// versions, so the fallback can never widen a row.
+#[test]
+fn pure_bounded_metadata_fallback_never_widens_scope_4032() {
+    use ai_memory::models::merge_memory;
+    let big = "x".repeat(300 * 1024);
+    let mut x: Memory =
+        serde_json::from_value(row("x", "n", "ai:p", "2026-09-26T01:00:00Z", "t")).expect("m");
+    x.metadata["scope"] = json!("collective");
+    x.metadata["big_a"] = json!(big);
+    let y: Memory =
+        serde_json::from_value(row("x", "n", "ai:p", "2026-09-26T03:00:00Z", "t")).expect("m");
+    // The winner W@t3 carries `collective` retained at its t1 version.
+    let winner = merge_memory(&x, &y);
+    let mut loser: Memory =
+        serde_json::from_value(row("x", "n", "ai:p", "2026-09-26T02:00:00Z", "t")).expect("m");
+    loser.metadata["scope"] = json!("private");
+    loser.metadata["big_b"] = json!(big);
+    for m in [merge_memory(&winner, &loser), merge_memory(&loser, &winner)] {
+        assert!(
+            m.metadata.get("big_b").is_none(),
+            "precondition: the join crossed the replicated cap and took the bounded fallback"
+        );
+        assert_eq!(
+            m.metadata.get("scope"),
+            Some(&json!("private")),
+            "the bounded fallback dropped the loser's NEWER `private` scope"
+        );
+    }
 }
 
 // ------------------------------------------------------------ #4032 ------
@@ -602,6 +762,22 @@ mod pg {
         let _g = FED_ENV_LOCK.lock().await;
         let Some(backend) = pg_backend() else { return };
         every_delivery_order_converges(&backend).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs AI_MEMORY_TEST_POSTGRES_URL"]
+    async fn pg_scope_never_widens_by_delivery_order_4031() {
+        let _g = FED_ENV_LOCK.lock().await;
+        let Some(backend) = pg_backend() else { return };
+        scope_never_widens_by_delivery_order(&backend).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs AI_MEMORY_TEST_POSTGRES_URL"]
+    async fn pg_edited_back_scope_survives_a_stale_replay_4031() {
+        let _g = FED_ENV_LOCK.lock().await;
+        let Some(backend) = pg_backend() else { return };
+        edited_back_scope_survives_a_stale_replay(&backend).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
