@@ -228,6 +228,77 @@ fn strip_test_mod(src: &str) -> &str {
     src
 }
 
+/// #4149 — the files that are compiled ONLY under `cfg(test)` because their
+/// MODULE DECLARATION says so: `#[cfg(test)]` immediately followed by an
+/// out-of-line `mod NAME;` (any visibility) in a parent file. Test-ness is
+/// decided by the DECLARATION, never by a test-looking file name (the #4054
+/// rule: a name proves nothing, and an undeclared file is production). A
+/// declared test-only module's own children are test-only too.
+///
+/// `files` are `(rel path under the crate root, source)` pairs; the result
+/// holds rel paths such as `src/store/sqlite/owner_gate_txn_3957.rs`.
+fn cfg_test_declared_files(files: &[(String, String)]) -> HashSet<String> {
+    let known: HashSet<&str> = files.iter().map(|(p, _)| p.as_str()).collect();
+    let mut out: HashSet<String> = HashSet::new();
+    for (rel, src) in files {
+        // The directory a child module of `rel` lives in.
+        let dir =
+            if rel.ends_with("/mod.rs") || rel.ends_with("/lib.rs") || rel.ends_with("/main.rs") {
+                rel.rsplit_once('/')
+                    .map_or_else(String::new, |(d, _)| d.to_string())
+            } else {
+                rel.trim_end_matches(".rs").to_string()
+            };
+        let lines: Vec<&str> = src.lines().collect();
+        for (i, line) in lines.iter().enumerate() {
+            if line.trim() != "#[cfg(test)]" {
+                continue;
+            }
+            let Some(next) = lines
+                .iter()
+                .skip(i + 1)
+                .map(|l| l.trim())
+                .find(|l| !l.is_empty())
+            else {
+                continue;
+            };
+            let decl = strip_visibility(next);
+            let Some(rest) = decl.strip_prefix("mod ") else {
+                continue;
+            };
+            let Some(name) = rest.strip_suffix(';') else {
+                continue;
+            };
+            let name = name.trim();
+            if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                continue;
+            }
+            for cand in [format!("{dir}/{name}.rs"), format!("{dir}/{name}/mod.rs")] {
+                if known.contains(cand.as_str()) {
+                    out.insert(cand);
+                }
+            }
+        }
+    }
+    // Children of a test-only module are test-only: a file under the
+    // module's directory (`src/a/x.rs` declared -> `src/a/x/**`).
+    let roots: Vec<String> = out
+        .iter()
+        .map(|p| {
+            p.trim_end_matches("/mod.rs")
+                .trim_end_matches(".rs")
+                .to_string()
+                + "/"
+        })
+        .collect();
+    for (rel, _) in files {
+        if roots.iter().any(|r| rel.starts_with(r.as_str())) {
+            out.insert(rel.clone());
+        }
+    }
+    out
+}
+
 fn skip_path(rel: &str) -> bool {
     // Trees whose writes are not record-plane content, or already sit
     // behind an entry gate (MCP dispatch / federation chokepoint /
@@ -551,6 +622,11 @@ fn record_stop_write_sql_fns_are_gated_or_allowlisted_b7() {
     let src_root = root.join("src");
     let mut files = Vec::new();
     walk_rs(&src_root, &mut files);
+    let sources: Vec<(String, String)> = files
+        .iter()
+        .filter_map(|p| Some((rel_src(p, root), fs::read_to_string(p).ok()?)))
+        .collect();
+    let test_only = cfg_test_declared_files(&sources);
 
     let allow: HashSet<(String, String)> = include_str!("record_stop_b7_allowlist.txt")
         .lines()
@@ -572,7 +648,7 @@ fn record_stop_write_sql_fns_are_gated_or_allowlisted_b7() {
 
     for path in files {
         let rel = rel_src(&path, root);
-        if skip_path(&rel) {
+        if skip_path(&rel) || test_only.contains(&rel) {
             continue;
         }
         let Ok(raw) = fs::read_to_string(&path) else {
@@ -691,4 +767,48 @@ fn record_stop_write_sql_fns_are_gated_or_allowlisted_b7() {
         "B7 pg/sqlite gate parity failures:\n  {}",
         parity_fail.join("\n  ")
     );
+}
+
+/// #4149 — test-ness comes from the module DECLARATION, never from the name.
+#[test]
+fn cfg_test_declared_modules_are_skipped_and_nothing_else_4149() {
+    let f = |p: &str, s: &str| (p.to_string(), s.to_string());
+    let files = vec![
+        // Declared test-only (the #3957 shape, incl. visibility + blank line).
+        f(
+            "src/store/sqlite.rs",
+            "fn a() {}\n#[cfg(test)]\n\npub(crate) mod owner_gate_txn_3957;\n#[cfg(test)]\nmod dir_mod;\n",
+        ),
+        f(
+            "src/store/sqlite/owner_gate_txn_3957.rs",
+            "fn arm() { \"UPDATE memories SET x\"; }",
+        ),
+        f("src/store/sqlite/dir_mod/mod.rs", "mod inner;"),
+        f("src/store/sqlite/dir_mod/inner.rs", "fn i() {}"),
+        // NOT declared test-only: a test-looking NAME must not be skipped.
+        f("src/store/sqlite.rs.bak", ""),
+        f("src/store/sqlite/looks_like_test_hook.rs", "fn prod() {}"),
+        // A `cfg(test)` attribute on something that is NOT an out-of-line mod.
+        f("src/lib.rs", "#[cfg(test)]\nfn helper() {}\nmod store;\n"),
+        f("src/store.rs", ""),
+    ];
+    let got = cfg_test_declared_files(&files);
+    assert!(
+        got.contains("src/store/sqlite/owner_gate_txn_3957.rs"),
+        "{got:?}"
+    );
+    assert!(got.contains("src/store/sqlite/dir_mod/mod.rs"), "{got:?}");
+    assert!(
+        got.contains("src/store/sqlite/dir_mod/inner.rs"),
+        "children of a test-only module: {got:?}"
+    );
+    assert!(
+        !got.contains("src/store/sqlite/looks_like_test_hook.rs"),
+        "a NAME proves nothing: {got:?}"
+    );
+    assert!(
+        !got.contains("src/store.rs"),
+        "an ungated `mod store;` is production: {got:?}"
+    );
+    assert_eq!(got.len(), 3, "exactly the declared set: {got:?}");
 }
