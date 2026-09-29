@@ -1073,6 +1073,47 @@ fn undecryptable_row_error(detail: String) -> rusqlite::Error {
     )
 }
 
+/// #4133 — what a `memories.encrypted_envelope` cell holds, WITHOUT the
+/// fail-open `Option<Vec<u8>>` + `.unwrap_or(None)` read that folded a
+/// column TYPE error into "no envelope".
+pub(crate) enum EnvelopeColumn {
+    /// SQL NULL, or the column is not in the result set (pre-v44 backup).
+    Absent,
+    /// A BLOB: the envelope bytes (possibly truncated / corrupt — the
+    /// decrypt step decides).
+    Blob(Vec<u8>),
+    /// A non-NULL, non-BLOB value (`"text"` / `"integer"` / `"real"`): never
+    /// a valid envelope, never "absent". Callers fail closed.
+    Malformed(&'static str),
+}
+
+/// #4133 — read an envelope cell by column name or index.
+///
+/// # Errors
+/// Any read failure other than the column being absent from the row.
+pub(crate) fn read_envelope_column<I: rusqlite::RowIndex>(
+    row: &rusqlite::Row<'_>,
+    idx: I,
+) -> rusqlite::Result<EnvelopeColumn> {
+    use rusqlite::types::ValueRef;
+    match row.get_ref(idx) {
+        Ok(ValueRef::Null) | Err(rusqlite::Error::InvalidColumnName(_)) => {
+            Ok(EnvelopeColumn::Absent)
+        }
+        Ok(ValueRef::Blob(bytes)) => Ok(EnvelopeColumn::Blob(bytes.to_vec())),
+        Ok(ValueRef::Text(_)) => Ok(EnvelopeColumn::Malformed("text")),
+        Ok(ValueRef::Integer(_)) => Ok(EnvelopeColumn::Malformed("integer")),
+        Ok(ValueRef::Real(_)) => Ok(EnvelopeColumn::Malformed("real")),
+        Err(e) => Err(e),
+    }
+}
+
+/// #4133 — the fail-closed detail for a non-BLOB envelope cell (no value
+/// bytes are echoed).
+pub(crate) fn malformed_envelope_detail(kind: &str) -> String {
+    format!("encrypted_envelope holds a non-BLOB {kind} value (corrupt or tampered row)")
+}
+
 /// #3404 — the ONE canonical `memories` row projection. Every
 /// `Memory`-materializing `SELECT` interpolates `memory_row_columns`
 /// instead of carrying a hand-written column list, so `version`,
@@ -1297,54 +1338,74 @@ fn row_to_memory_with_policy(
     // #228 Commit B — at-rest content decryption. The decrypt branch is
     // gated on envelope PRESENCE (a non-NULL `encrypted_envelope`), NOT on
     // `encryption_enabled`, so rows written while encryption was on remain
-    // readable after the flag is toggled off. When the column is NULL
+    // readable after the flag is toggled off. When the column is SQL NULL
     // (every legacy row + every row written under encryption-off) this is
     // a no-op — `memory.content` keeps the plaintext read above, so the
-    // default path stays byte-identical. `.unwrap_or(None)` tolerates the
-    // column being absent on a pre-v44 backup (the migrate ladder may not
-    // have reached this DB yet); an absent column reads as NULL.
-    let enc: Option<Vec<u8>> = row
-        .get::<_, Option<Vec<u8>>>(field_names::ENCRYPTED_ENVELOPE)
-        .unwrap_or(None);
-    if let Some(bytes) = enc {
-        let agent_id = memory
-            .metadata
-            .get("agent_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        match crate::encryption::open_content(&bytes, agent_id) {
-            Ok(plaintext) => memory.content = plaintext,
-            Err(e) => {
-                // NEVER return the empty placeholder as if it were the
-                // plaintext content — that would silently surface an empty
-                // memory and mask key loss / corruption. The only two legal
-                // dispositions are "error" and "omit"; see
-                // [`DecryptFailurePolicy`] for which read takes which.
-                //
-                // v1.0.0 #2383 (N1) — SkipRow keeps ONE poisoned row from
-                // denying an entire namespace's `list` / `recall`. The row is
-                // NOT modified or deleted: its ciphertext stays on disk and
-                // becomes readable again the moment the correct keypair is
-                // restored (or `AI_MEMORY_STRICT_DECRYPT_READS=1` is set to
-                // surface the failure loudly instead).
-                if policy == DecryptFailurePolicy::SkipRow && !strict_decrypt_reads_enabled() {
-                    tracing::warn!(
-                        target: UNDECRYPTABLE_ROW_TRACE_TARGET,
-                        row_id = %memory.id,
-                        namespace = %memory.namespace,
-                        agent_id = %agent_id,
-                        error = %e,
-                        "{UNDECRYPTABLE_ROW_SKIPPED_MSG}"
-                    );
-                    crate::metrics::record_corrupt_provenance(field_names::ENCRYPTED_ENVELOPE);
-                    return Ok(None);
-                }
-                // #3718 — an ABSENT key renders as its class, never as a
-                // wrong-recipient "decrypt failed", and never with a path.
-                return Err(undecryptable_row_error(
-                    crate::encryption::read_failure_detail(&e),
-                ));
+    // default path stays byte-identical. A column ABSENT from the result set
+    // (a pre-v44 backup the migrate ladder has not reached) also reads as no
+    // envelope.
+    //
+    // #4133 — a non-NULL value that is NOT a BLOB (TEXT / INTEGER / REAL:
+    // a column type error from corruption or tampering) is NOT "no
+    // envelope". The old `.unwrap_or(None)` read it as absent and returned
+    // the plaintext `content` column as if the row were unencrypted (fail
+    // OPEN). It now takes the SAME fail-closed disposition as an
+    // undecryptable envelope below: error on a targeted read, omit with a
+    // WARN + metric on a scan. A truncated BLOB reaches `open_content` and
+    // fails there.
+    let opened: Option<std::result::Result<String, String>> =
+        match read_envelope_column(row, field_names::ENCRYPTED_ENVELOPE)? {
+            EnvelopeColumn::Absent => None,
+            EnvelopeColumn::Blob(bytes) => {
+                let agent_id = memory
+                    .metadata
+                    .get("agent_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                Some(
+                    crate::encryption::open_content(&bytes, agent_id)
+                        // #3718 — an ABSENT key renders as its class, never
+                        // as a wrong-recipient "decrypt failed", never with a
+                        // path.
+                        .map_err(|e| crate::encryption::read_failure_detail(&e)),
+                )
             }
+            EnvelopeColumn::Malformed(kind) => Some(Err(malformed_envelope_detail(kind))),
+        };
+    match opened {
+        None => {}
+        Some(Ok(plaintext)) => memory.content = plaintext,
+        Some(Err(detail)) => {
+            // NEVER return the empty placeholder (or the raw plaintext
+            // column) as if it were the content — that would silently
+            // surface wrong data and mask key loss / corruption. The only
+            // two legal dispositions are "error" and "omit"; see
+            // [`DecryptFailurePolicy`] for which read takes which.
+            //
+            // v1.0.0 #2383 (N1) — SkipRow keeps ONE poisoned row from
+            // denying an entire namespace's `list` / `recall`. The row is
+            // NOT modified or deleted: its ciphertext stays on disk and
+            // becomes readable again the moment the correct keypair is
+            // restored (or `AI_MEMORY_STRICT_DECRYPT_READS=1` is set to
+            // surface the failure loudly instead).
+            if policy == DecryptFailurePolicy::SkipRow && !strict_decrypt_reads_enabled() {
+                let agent_id = memory
+                    .metadata
+                    .get("agent_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                tracing::warn!(
+                    target: UNDECRYPTABLE_ROW_TRACE_TARGET,
+                    row_id = %memory.id,
+                    namespace = %memory.namespace,
+                    agent_id = %agent_id,
+                    error = %detail,
+                    "{UNDECRYPTABLE_ROW_SKIPPED_MSG}"
+                );
+                crate::metrics::record_corrupt_provenance(field_names::ENCRYPTED_ENVELOPE);
+                return Ok(None);
+            }
+            return Err(undecryptable_row_error(detail));
         }
     }
 
@@ -5698,7 +5759,16 @@ pub fn undo_in_place_edit(
                 let metadata_json: String =
                     r.get::<_, String>(8).unwrap_or_else(|_| "{}".to_string());
                 let raw_content: String = r.get(1)?;
-                let envelope: Option<Vec<u8>> = r.get::<_, Option<Vec<u8>>>(10).unwrap_or(None);
+                // #4133 — a non-BLOB envelope cell is corrupt, never "absent":
+                // restoring its raw `content` would silently write the
+                // placeholder back as the memory's content.
+                let envelope: Option<Vec<u8>> = match read_envelope_column(r, 10)? {
+                    EnvelopeColumn::Absent => None,
+                    EnvelopeColumn::Blob(bytes) => Some(bytes),
+                    EnvelopeColumn::Malformed(kind) => {
+                        return Err(undecryptable_row_error(malformed_envelope_detail(kind)));
+                    }
+                };
                 let content =
                     match resolve_embeddable_content(id, raw_content, envelope, &metadata_json) {
                         Some(c) => c,
