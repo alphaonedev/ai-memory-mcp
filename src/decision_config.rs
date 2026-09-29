@@ -523,6 +523,44 @@ fn plan(cfg: &AppConfig, parent: &ResolvedLlm) -> anyhow::Result<Option<Decision
     }))
 }
 
+/// #4192 — the `[decision]` key when the endpoint is NOT the parent's.
+///
+/// The section's OWN `api_key_env` / `api_key_file` win: the operator named
+/// that credential for this endpoint. Only when neither is set does the
+/// per-vendor alias env (e.g. `OPENROUTER_API_KEY`) apply, and ONLY when
+/// `base_url` has that vendor's default origin (scheme, host, port). Before
+/// #4192, `provider = "openrouter"` with `base_url = https://other-host/v1`
+/// sent `OPENROUTER_API_KEY` as a Bearer token to other-host, ahead of the
+/// section's own key. A vendor credential travels only to that vendor.
+fn decision_api_key(
+    provider: &str,
+    base_url: &str,
+    api_key_env: Option<&str>,
+    api_key_file: Option<&str>,
+) -> (Option<String>, KeySource) {
+    if api_key_env.is_some() || api_key_file.is_some() {
+        // A backend with no alias list, so the ladder reads ONLY the
+        // section's own env var / file.
+        return crate::config::resolve_api_key_ladder(
+            None,
+            crate::llm::BACKEND_OPENAI_COMPATIBLE,
+            api_key_env,
+            api_key_file,
+            SECTION,
+        );
+    }
+    let same_origin = |a: &str, b: &str| match (reqwest::Url::parse(a), reqwest::Url::parse(b)) {
+        (Ok(a), Ok(b)) => a.origin() == b.origin(),
+        _ => false,
+    };
+    match default_base_url(provider) {
+        Some(vendor) if same_origin(vendor, base_url) => {
+            crate::config::resolve_api_key_ladder(None, provider, None, None, SECTION)
+        }
+        _ => (None, KeySource::None),
+    }
+}
+
 /// Resolve the `[decision]` provider configuration.
 ///
 /// Returns `None` — meaning NO decision provider, the byte-identical
@@ -542,8 +580,9 @@ fn plan(cfg: &AppConfig, parent: &ResolvedLlm) -> anyhow::Result<Option<Decision
 ///   refuse (always empty for `local-nli`).
 /// - `api_key`: the parent `[llm]` key **only when provider AND
 ///   base_url both match the parent endpoint** (it is then literally the
-///   same endpoint) > per-vendor alias env > `[decision].api_key_env` >
-///   `[decision].api_key_file` > none. There is deliberately no
+///   same endpoint) > `[decision].api_key_env` > `[decision].api_key_file`
+///   > the per-vendor alias env, ONLY when `base_url` has that vendor's
+///   default origin (#4192) > none. There is deliberately no
 ///   `AI_MEMORY_DECISION_API_KEY`-style catch-all: a generic env var
 ///   would ship the chat credential to a different vendor's host.
 #[must_use]
@@ -560,12 +599,11 @@ pub fn resolve_decision(cfg: &AppConfig) -> Option<ResolvedDecision> {
             parent.api_key_source.clone(),
         )
     } else {
-        crate::config::resolve_api_key_ladder(
-            None,
+        decision_api_key(
             &plan.provider,
+            &plan.base_url,
             non_empty(section.api_key_env.as_ref()),
             non_empty(section.api_key_file.as_ref()),
-            SECTION,
         )
     };
 
