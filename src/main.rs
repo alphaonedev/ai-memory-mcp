@@ -404,12 +404,31 @@ fn main() -> Result<()> {
     // and swallowed so a missing key never blocks daemon startup.
     // #3354 — the WRITE PATH: a ledger-writing command gets its signing key
     // ensured (generated when absent) before its first row, or does not start.
-    init_forensic_audit(
+    if let Err(e) = init_forensic_audit(
         &app_config,
         hosts_ledger_writers(&cli.command),
         ledger_writer(&cli.command),
         is_key_provisioning_verb(&cli.command),
-    )?;
+        &app_config.effective_db_explicit(cli.db.as_deref()),
+    ) {
+        // #4199 — only under AI_MEMORY_REQUIRE_FORENSIC_SINK (pinned by
+        // asi-hard) does an unavailable forensic sink reach here: refuse,
+        // like the flat trail (#3651/#4190); `doctor` still runs.
+        if e.downcast_ref::<ai_memory::governance::audit::ForensicTailUnreadable>()
+            .is_none()
+        {
+            return Err(e);
+        }
+        if is_doctor {
+            eprintln!(
+                "ai-memory: the forensic audit log failed to initialise; `doctor` \
+                 continues so the rest of its report is available: {e:#}"
+            );
+        } else {
+            eprintln!("{}", ai_memory::governance::audit::boot_refusal_message(&e));
+            std::process::exit(config::EX_CONFIG);
+        }
+    }
 
     // v1.0.0 L4 (PR-3) — resolve the out-of-band audit pin HERE, in the same
     // SYNCHRONOUS pre-runtime phase as the posture enforcement above (the #1889
@@ -631,6 +650,7 @@ fn init_forensic_audit(
     hosts_writers: bool,
     ledger_writer: bool,
     key_provisioning: bool,
+    db_path: &std::path::Path,
 ) -> Result<()> {
     let audit_cfg = app_config.effective_audit();
     // Resolve the daemon's agent_id with the standard precedence chain.
@@ -699,9 +719,47 @@ fn init_forensic_audit(
     };
     warn_if_plaintext_retention_requested(&audit_cfg);
     if let Err(e) = ai_memory::governance::audit::init(dir, signing_key) {
-        eprintln!("ai-memory: forensic audit init failed (continuing unsigned): {e}");
+        use ai_memory::governance::audit as forensic;
+        let Some(unavailable) = e.downcast_ref::<forensic::ForensicTailUnreadable>() else {
+            eprintln!("ai-memory: forensic audit init failed (continuing unsigned): {e}");
+            return Ok(());
+        };
+        // #4199 (vote 4d3ea1c5) — the chain tail cannot be established. The
+        // sink stays OFF (never a genesis fork). Refuse only in require-mode.
+        if forensic::require_forensic_sink_enabled() {
+            return Err(e);
+        }
+        eprintln!("{}", forensic::degraded_boot_message(&e));
+        tracing::error!(target: "ai_memory::audit", "forensic sink unavailable: {e:#}");
+        ai_memory::metrics::inc_forensic_sink_unavailable();
+        record_forensic_outage(db_path, unavailable);
     }
     Ok(())
+}
+
+/// #4199 — append the signed `audit.forensic_sink_unavailable` row to the
+/// EXISTING database (best-effort, the egress-refusal precedent). A missing
+/// database file is not created for this: that would plant an orphan store.
+fn record_forensic_outage(
+    db_path: &std::path::Path,
+    err: &ai_memory::governance::audit::ForensicTailUnreadable,
+) {
+    if !db_path.exists() {
+        eprintln!(
+            "ai-memory: the forensic-sink outage was NOT recorded in signed_events: \
+             no database exists at {} yet",
+            db_path.display()
+        );
+        return;
+    }
+    let outcome = ai_memory::db::open(db_path)
+        .and_then(|conn| ai_memory::governance::audit::emit_forensic_sink_unavailable(&conn, err));
+    if let Err(e) = outcome {
+        eprintln!(
+            "ai-memory: the forensic-sink outage was NOT recorded in signed_events ({}): {e:#}",
+            db_path.display()
+        );
+    }
 }
 
 /// #3647 — `audit.redact_content = false` asks for plaintext retention, which
@@ -836,7 +894,14 @@ mod tests {
         ai_memory::governance::audit::shutdown();
         // A non-writer, non-host boot (#3354 reconciliation): the key is
         // ENSURED in the installed test key dir, so the sink signs.
-        init_forensic_audit(&app_config, false, false, false).expect("forensic boot");
+        init_forensic_audit(
+            &app_config,
+            false,
+            false,
+            false,
+            std::path::Path::new("does-not-exist-4199.db"),
+        )
+        .expect("forensic boot");
         assert!(
             ai_memory::governance::audit::is_enabled(),
             "the sink comes up on every boot (#1850 watermark lane)"
@@ -1021,7 +1086,14 @@ mod tests {
 
         let app_config = config::AppConfig::default();
         // Must not panic and must leave the process bootable (unsigned).
-        init_forensic_audit(&app_config, false, false, false).expect("init");
+        init_forensic_audit(
+            &app_config,
+            false,
+            false,
+            false,
+            std::path::Path::new("does-not-exist-4199.db"),
+        )
+        .expect("init");
 
         match prev {
             Some(v) => unsafe { std::env::set_var("AI_MEMORY_AUDIT_DIR", v) },

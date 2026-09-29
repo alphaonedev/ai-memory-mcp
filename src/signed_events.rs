@@ -474,6 +474,18 @@ pub mod event_types {
     /// refused vendor — this row is the audit witness of that refusal.
     pub const EGRESS_INFERENCE_REFUSED: &str = "egress.inference_refused";
 
+    /// v1.0.0 #4199 (5-agent vote 4d3ea1c5, decision memory 4ae4ed7d) —
+    /// `signed_events.event_type` for the row that attests the FORENSIC
+    /// audit sink is unavailable for this process: its chain tail could not
+    /// be established (an I/O error, or no parseable row in any non-empty
+    /// file), so the process runs without it rather than forking the chain
+    /// at genesis. `payload_hash` = SHA-256 over the canonical pre-image of
+    /// the forensic path + the cause; substrate-emitted (`daemon_signed` when
+    /// a key is enrolled, else `unsigned`), the same posture as
+    /// [`EGRESS_INFERENCE_REFUSED`]. Best-effort: appended only to an
+    /// EXISTING database, never one created for the purpose.
+    pub const FORENSIC_SINK_UNAVAILABLE: &str = "audit.forensic_sink_unavailable";
+
     /// v1.0.0 V08-PE-3 (#1937, ratified spec — the `4d3ea1c5` minimal
     /// shape recorded in #1840's closing 2×5 vote) —
     /// `signed_events.event_type` for a MINIMAL signed spawn-audit row:
