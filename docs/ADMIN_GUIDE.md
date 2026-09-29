@@ -903,6 +903,15 @@ default 30-second HTTP request grace period plus the bounded background-writer,
 webhook-delivery, deferred-audit drain, and final witness/checkpoint phases,
 leaving time for the visible exit-75 failure path.
 
+If the webhook-delivery drain misses its 30-second budget, webhook
+deliveries that had not started yet are recorded to the subscription DLQ
+(`last_error = "shutdown_unstarted"`, listed by
+`memory_subscription_dlq_list`) rather than dropped. The shutdown log line
+counts the started, DLQ-recorded and unrecordable deliveries (#3979). A
+crash or `SIGKILL` skips this step: webhook deliveries that had not started
+are lost, and neither replay nor the DLQ shows them. Use the graceful stop
+path above.
+
 > **Note:** The HTTP daemon handles SIGINT (Ctrl+C) gracefully with WAL checkpoint. Systemd sends SIGTERM by default -- the service file sets `KillSignal=SIGINT` to ensure clean shutdown.
 
 The daemon exits with status **75 (`EX_TEMPFAIL`)** when it cannot certify a
