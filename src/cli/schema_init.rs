@@ -18,7 +18,8 @@
 //! `SELECT create_graph('memory_graph')`. The call is wrapped in a
 //! "graph already exists" guard so re-running is idempotent — AGE
 //! raises `invalid_graph_name` (or "graph ... already exists") on a
-//! second invocation; we treat that as success.
+//! second invocation; we treat that as success only after verifying the
+//! graph's registry row. An orphan schema is preserved and reported false.
 //!
 //! AGE is opt-in: missing-extension or probe-failure leaves
 //! `age_projection_created = false` in the JSON payload and is NOT a
@@ -204,9 +205,9 @@ pub struct SchemaInitReport {
     /// the table is empty (should not happen post-init).
     pub schema_version: i64,
     /// `true` when the AGE `memory_graph` projection was created (or
-    /// already existed) on this connect. `false` when AGE is not
-    /// installed (which is the common case) or the target is
-    /// SQLite. Never aborts the verb on its own.
+    /// was verified as registered) on this connect. `false` when AGE is not
+    /// installed, the graph is orphaned, bootstrap or verification fails,
+    /// or the target is SQLite. Never aborts the verb on its own.
     pub age_projection_created: bool,
     /// Embedding column dimension as it sits in the schema after the
     /// verb returns. For Postgres targets this is read from
@@ -648,8 +649,9 @@ async fn enumerate_postgres(url: &str) -> Result<SchemaInitReport> {
     // AGE bootstrap: only attempt when the extension is actually
     // installed (it appears in the extensions list above). The call
     // is `SELECT create_graph('memory_graph')`. AGE returns an
-    // error if the graph already exists; we tolerate that as a
-    // success signal so re-runs are idempotent.
+    // error if the graph already exists; verify the registry before
+    // treating that as success so re-runs are idempotent without
+    // misreporting an orphan schema as a usable graph (#4049).
     let age_projection_created = if extensions.iter().any(|e| e == "age") {
         bootstrap_memory_graph(&pool).await
     } else {
@@ -702,9 +704,9 @@ async fn enumerate_postgres(url: &str) -> Result<SchemaInitReport> {
 }
 
 /// Run `SELECT create_graph('memory_graph')` against an
-/// AGE-installed Postgres pool, swallowing the
-/// "graph-already-exists" error so the call is idempotent. Any
-/// other error is logged at WARN and reported as
+/// AGE-installed Postgres pool. An "already exists" error is successful
+/// only when the AGE registry confirms the graph is registered (#4049).
+/// An absent registry row or any error is logged at WARN and reported as
 /// `age_projection_created = false`; AGE is opt-in and a failure
 /// here MUST NOT fail the whole verb.
 #[cfg(feature = "sal-postgres")]
@@ -743,21 +745,40 @@ async fn bootstrap_memory_graph(pool: &sqlx::PgPool) -> bool {
     {
         Ok(_) => true,
         Err(e) => {
-            // AGE's "graph already exists" comes back as a generic
-            // SQLSTATE with a message containing "already exists".
-            // We treat that as success — re-running schema-init
-            // against a previously-bootstrapped DB MUST be
-            // idempotent.
+            // Both a registered graph and an orphan schema produce
+            // "already exists". The message alone cannot establish success.
             let msg = e.to_string();
-            if msg.contains(crate::store::postgres::PG_ERR_ALREADY_EXISTS) {
-                true
-            } else {
+            if !msg.contains(crate::store::postgres::PG_ERR_ALREADY_EXISTS) {
                 tracing::warn!(
                     target: TRACE_TARGET,
                     error = %e,
                     "create_graph('memory_graph') failed (continuing without AGE projection)"
                 );
-                false
+                return false;
+            }
+            // Release the dedicated connection before the shared pool probe
+            // so this also works with a single-connection pool.
+            drop(conn);
+            match crate::store::postgres::age_graph_registry_present_pool(pool).await {
+                Ok(true) => true,
+                Ok(false) => {
+                    tracing::warn!(
+                        target: TRACE_TARGET,
+                        error = %e,
+                        "AGE graph is unregistered after create_graph reported already exists \
+                         (orphan memory_graph schema). Leaving schema and data untouched; \
+                         operator repair required (docs/kg-backend-fallback.md)"
+                    );
+                    false
+                }
+                Err(probe_error) => {
+                    tracing::warn!(
+                        target: TRACE_TARGET,
+                        error = %probe_error,
+                        "cannot verify AGE graph registry (continuing without AGE projection)"
+                    );
+                    false
+                }
             }
         }
     }
