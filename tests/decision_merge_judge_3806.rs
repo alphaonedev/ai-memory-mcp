@@ -992,15 +992,9 @@ fn every_production_autonomy_llm_impl_overrides_judge_merge() {
     let mut missing = Vec::new();
     for file in &files {
         let text = std::fs::read_to_string(file).expect("read source");
-        // Everything at or below the first test module is stub territory.
-        let production = text
-            .lines()
-            .take_while(|l| !l.trim_start().starts_with("mod tests"))
-            .fold(String::new(), |mut acc, l| {
-                acc.push_str(l);
-                acc.push('\n');
-                acc
-            });
+        // #4179 — strip only the `#[cfg(test)]` inline modules' own bodies,
+        // never everything after the first `mod tests`.
+        let production = strip_cfg_test_inline_mods(&text);
         let mut rest = production.as_str();
         while let Some(at) = rest.find("impl AutonomyLlm for ") {
             let block = &rest[at..];
@@ -1033,6 +1027,187 @@ fn every_production_autonomy_llm_impl_overrides_judge_merge() {
         "production `impl AutonomyLlm` without a `judge_merge` override — the trait default is \
          the PERMISSIVE `NoDecider` arm, a fail-open on the delete-the-sources path: {missing:?} \
          (impls seen: {production_impls:?})"
+    );
+}
+
+/// #4179 — `text` with every INLINE `#[cfg(test)] mod NAME { … }` body
+/// removed, and everything else kept. The pre-#4179 census cut each file
+/// at the first line starting `mod tests`. So a file with an early test
+/// module, or a non-test helper module named `tests`, hid every later
+/// production caller from the census. Test-ness now comes from the
+/// `#[cfg(test)]` attribute on the declaration (the #4149 rule), and only
+/// that module's brace-matched body is dropped. The brace walk skips
+/// string literals, char literals and comments, so a `{` or `}` inside
+/// them cannot move the match. Known limit: raw strings (`r#"…"#`) are
+/// not lexed, so an unbalanced brace inside one in a cfg(test) module could
+/// end the strip early and put test code back in the census (it never hides
+/// production code).
+fn strip_cfg_test_inline_mods(text: &str) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let is_cfg_test = cfg_requires_test(lines[i].trim());
+        // Further attributes may sit between the cfg and the declaration.
+        let mut d_at = i + 1;
+        while lines.get(d_at).is_some_and(|l| l.trim().starts_with("#[")) {
+            d_at += 1;
+        }
+        let decl = lines.get(d_at).map(|l| l.trim());
+        let opens_inline_mod = decl.is_some_and(|d| {
+            let d = d
+                .strip_prefix("pub(crate) ")
+                .or_else(|| d.strip_prefix("pub "))
+                .unwrap_or(d);
+            d.starts_with("mod ") && d.ends_with('{')
+        });
+        if is_cfg_test && opens_inline_mod {
+            // Brace-match from the declaration line.
+            let mut depth: i64 = 0;
+            let mut j = d_at;
+            let mut in_block_comment = false;
+            'scan: while j < lines.len() {
+                let mut chars = lines[j].chars().peekable();
+                let mut in_str = false;
+                while let Some(c) = chars.next() {
+                    if in_block_comment {
+                        if c == '*' && chars.peek() == Some(&'/') {
+                            chars.next();
+                            in_block_comment = false;
+                        }
+                        continue;
+                    }
+                    if in_str {
+                        if c == '\\' {
+                            chars.next();
+                        } else if c == '"' {
+                            in_str = false;
+                        }
+                        continue;
+                    }
+                    match c {
+                        '/' if chars.peek() == Some(&'/') => break,
+                        '/' if chars.peek() == Some(&'*') => {
+                            chars.next();
+                            in_block_comment = true;
+                        }
+                        '"' => in_str = true,
+                        '\'' => {
+                            // A char literal or a lifetime. `'\x'` (escaped)
+                            // and `'c'` are consumed whole; a lifetime `'a`
+                            // has no closing quote at offset 1 and is left.
+                            if chars.peek() == Some(&'\\') {
+                                chars.next();
+                                chars.next();
+                                for q in chars.by_ref() {
+                                    if q == '\'' {
+                                        break;
+                                    }
+                                }
+                            } else if chars.clone().nth(1) == Some('\'') {
+                                chars.next();
+                                chars.next();
+                            }
+                        }
+                        '{' => depth += 1,
+                        '}' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break 'scan;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                j += 1;
+            }
+            i = j + 1;
+            continue;
+        }
+        out.push_str(lines[i]);
+        out.push('\n');
+        i += 1;
+    }
+    out
+}
+
+/// #4179 — whether a `#[cfg(...)]` attribute line makes its item TEST-ONLY.
+/// True for `cfg(test)` and for `cfg(all(...))` with `test` as a top-level
+/// member. `any(test, ...)` and `not(test)` are NOT test-only, so they are
+/// never stripped. Erring here strips less, which can only false-red the
+/// census, never hide production code.
+fn cfg_requires_test(attr: &str) -> bool {
+    let Some(pred) = attr
+        .strip_prefix("#[cfg(")
+        .and_then(|r| r.strip_suffix(")]"))
+    else {
+        return false;
+    };
+    let pred = pred.trim();
+    if pred == "test" {
+        return true;
+    }
+    let Some(inner) = pred.strip_prefix("all(").and_then(|r| r.strip_suffix(')')) else {
+        return false;
+    };
+    let mut depth = 0i32;
+    let mut member = String::new();
+    let mut members = Vec::new();
+    for c in inner.chars() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => {
+                members.push(std::mem::take(&mut member));
+                continue;
+            }
+            _ => {}
+        }
+        member.push(c);
+    }
+    members.push(member);
+    members.iter().any(|m| m.trim() == "test")
+}
+
+/// #4179 known-positive: a production caller placed AFTER an early
+/// `#[cfg(test)] mod tests` is kept, and so is a non-test helper module
+/// named `tests`. The test module's own body, including a brace inside a
+/// string, is dropped. RED against the pre-#4179 `take_while` cut, which
+/// drops both production lines below.
+#[test]
+fn census_strip_keeps_callers_after_an_early_test_module_4179() {
+    let src = "fn a() {}\n#[cfg(test)]\nmod tests {\n    fn stub() { let _ = \"}{\"; let _c = '}'; x.judge_merge(&[]); }\n}\nfn late() { llm.judge_merge(&input); }\nmod tests_helpers {\n    fn h() { y.judge_merge(&v); }\n}\n";
+    let kept = strip_cfg_test_inline_mods(src);
+    assert!(
+        kept.contains("fn late() { llm.judge_merge(&input); }"),
+        "{kept}"
+    );
+    assert!(
+        kept.contains("y.judge_merge(&v)"),
+        "a non-cfg(test) module is production: {kept}"
+    );
+    assert!(
+        !kept.contains("fn stub()"),
+        "the cfg(test) body is dropped: {kept}"
+    );
+    // cfg(all(test, ...)) with an attribute in between is test-only;
+    // cfg(any(test, ...)) is NOT, so its body stays in the census.
+    let src2 = "#[cfg(all(test, feature = \"sal\"))]\n#[allow(clippy::x)]\nmod pass_tests {\n    impl AutonomyLlm for Stub {}\n}\n#[cfg(any(test, feature = \"x\"))]\nmod maybe {\n    fn m() { z.judge_merge(&w); }\n}\n";
+    let kept2 = strip_cfg_test_inline_mods(src2);
+    assert!(!kept2.contains("impl AutonomyLlm for Stub"), "{kept2}");
+    assert!(
+        kept2.contains("z.judge_merge(&w)"),
+        "any(test, ..) is production: {kept2}"
+    );
+    // The pre-#4179 cut, for the red leg: it loses the late caller.
+    let old: String = src
+        .lines()
+        .take_while(|l| !l.trim_start().starts_with("mod tests"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !old.contains("fn late()"),
+        "the old cut really does lose it"
     );
 }
 
@@ -1160,9 +1335,8 @@ fn judge_merge_is_called_only_from_the_two_autonomous_funnels() {
     let mut callers: Vec<String> = Vec::new();
     for file in &files {
         let text = std::fs::read_to_string(file).expect("read source");
-        let production: String = text
+        let production: String = strip_cfg_test_inline_mods(&text)
             .lines()
-            .take_while(|l| !l.trim_start().starts_with("mod tests"))
             .filter(|l| !l.trim_start().starts_with("//"))
             .fold(String::new(), |mut acc, l| {
                 acc.push_str(l);
