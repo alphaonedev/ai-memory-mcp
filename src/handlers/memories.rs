@@ -277,28 +277,48 @@ fn parse_pg_conflict_stored_version(detail: &str) -> Option<i64> {
         .ok()
 }
 
-/// #4061 — parse the `If-Match` optimistic-concurrency header.
+/// #4061 — parse the `If-Match` optimistic-concurrency header STRICTLY.
 ///
-/// `Ok(None)`: header absent, or the RFC 9110 wildcard `*` (no version
-/// precondition — last-write-wins). `Ok(Some(v))`: a bare or quoted integer
-/// version (`42` / `"42"`). `Err`: a PRESENT header that names no version —
-/// refused (fail closed) rather than read as "no precondition", which would
-/// silently drop the caller's compare-and-swap fence.
+/// Accepted grammar (the whole received field, every field line):
+/// * absent → `Ok(None)` (no precondition, last-write-wins);
+/// * exactly one field line holding exactly `*` → `Ok(None)` (RFC 9110
+///   §13.1.1 "any current representation");
+/// * exactly one field line holding ONE version: a bare ASCII-digit integer
+///   (`42`) or the same wrapped in exactly one pair of double quotes
+///   (`"42"`, a strong entity-tag) → `Ok(Some(v))`.
+///
+/// Everything else is `Err` and refused before any write (fail closed): a
+/// repeated `If-Match` field line (RFC 9110 §5.2 combines them into a list,
+/// and `*` mixed with a tag is invalid), a comma list, a weak tag (`W/"1"`;
+/// If-Match uses strong comparison), unbalanced or stray quotes (`"1`,
+/// `1"`, `""1""`), signs, whitespace inside the tag, an empty value,
+/// non-ASCII, or an integer outside `i64`. Reading a malformed or combined
+/// field as "no precondition" would silently drop the caller's
+/// compare-and-swap fence.
 fn parse_if_match_version(headers: &HeaderMap) -> Result<Option<i64>, String> {
-    let Some(raw) = headers.get("if-match") else {
+    const MSG: &str = "If-Match must be a single integer memory version (42 or \"42\") or *";
+    let mut lines = headers.get_all("if-match").iter();
+    let Some(raw) = lines.next() else {
         return Ok(None);
     };
-    let text = raw
-        .to_str()
-        .map_err(|_| "If-Match must be an integer memory version".to_string())?
-        .trim();
+    if lines.next().is_some() {
+        return Err(format!(
+            "{MSG}; multiple If-Match header fields are not supported"
+        ));
+    }
+    let text = raw.to_str().map_err(|_| MSG.to_string())?.trim();
+    let malformed = || format!("{MSG}, got {text:?}");
     if text == "*" {
         return Ok(None);
     }
-    text.trim_matches('"')
-        .parse::<i64>()
-        .map(Some)
-        .map_err(|_| format!("If-Match must be an integer memory version, got {text:?}"))
+    let digits = match text.strip_prefix('"') {
+        Some(rest) => rest.strip_suffix('"').ok_or_else(malformed)?,
+        None => text,
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(malformed());
+    }
+    digits.parse::<i64>().map(Some).map_err(|_| malformed())
 }
 
 #[allow(clippy::too_many_lines)]
