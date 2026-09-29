@@ -71,6 +71,13 @@
 
 set -euo pipefail
 
+# #3984 / R4-G1 — the WHOLE script runs byte-exact. A context name is an
+# opaque byte string: collation (`comm`/`sort`) and character classes must
+# not depend on the caller's locale. Under en_US/de_DE/ja_JP a
+# `[[:space:]]` trim erased a leading/trailing U+2003 EM SPACE, so a
+# declared "\u2003Security gate" compared EQUAL to live "Security gate".
+export LC_ALL=C
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 MIRROR_FILE="${RQC_MIRROR_FILE:-$ROOT/scripts/qc-allowlists/required-contexts-release.txt}"
@@ -96,10 +103,15 @@ read_list() {
     [ -f "$file" ] || return 0
     while IFS= read -r line || [ -n "$line" ]; do
         line="${line%$'\r'}"
-        case "$(printf '%s' "$line" | sed -e 's/^[[:space:]]*//')" in
+        # R4-G1: trim ONLY ASCII space and tab (byte-exact under LC_ALL=C).
+        # Any other byte — including a UTF-8 U+2003/U+00A0 — is part of the
+        # name, so two different names can never be normalised equal.
+        line="${line#"${line%%[!$' \t']*}"}"
+        line="${line%"${line##*[!$' \t']}"}"
+        case "$line" in
             '' | '#'*) continue ;;
         esac
-        printf '%s\n' "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
+        printf '%s\n' "$line"
     done < "$file"
 }
 
@@ -171,8 +183,8 @@ load_fixture_live() {
 compare_files() {
     local a_file="$1" a_label="$2" b_file="$3" b_label="$4"
     local only_a only_b
-    only_a="$(comm -23 "$a_file" "$b_file" || true)"
-    only_b="$(comm -13 "$a_file" "$b_file" || true)"
+    only_a="$(LC_ALL=C comm -23 "$a_file" "$b_file" || true)"
+    only_b="$(LC_ALL=C comm -13 "$a_file" "$b_file" || true)"
     if [ -n "$only_a" ]; then
         fail "$a_label has contexts not in $b_label:"
         printf '%s\n' "$only_a" | sed 's/^/     - /' >&2
@@ -467,7 +479,88 @@ TXT
         exit 2
     fi
 
-    echo "required-contexts-live self-test: PASS (load-bearing — catches the #3554 38-vs-35 shape, extra live context, enforce_admins=false, strict=false, empty live, missing declaration, missing pin, stale pin; spares equal sets and an inline-# context name)"
+    # (11) #3984: compare_files MUST be locale-independent. sorted_unique
+    #      sorts under LC_ALL=C, so `comm` must compare under LC_ALL=C too;
+    #      under an ambient non-C collation (en_US.UTF-8) a bare `comm`
+    #      warns "not in sorted order" and mis-attributes the drift — a
+    #      context present on BOTH sides is named as drift, so the report no
+    #      longer says which declared context is really missing from live.
+    #      Punctuation-leading names are the trigger: C orders `(` and `-`
+    #      before letters, en_US ignores them at the first level.
+    #  (11a) Static: every comm/sort/join in this script is LC_ALL=C-prefixed
+    #        (holds even on a host with no non-C locale installed).
+    local bare
+    bare="$(grep -nE '(^|[|(]|\$\(|<\()[[:space:]]*(comm|sort|join)[[:space:]]' "$ROOT/scripts/check-required-contexts-live.sh" \
+        | grep -vE '^[0-9]+:[[:space:]]*#' | grep -vE 'LC_ALL=C (comm|sort|join)[[:space:]]' || true)"
+    if [ -n "$bare" ]; then
+        echo "self-test FAILED: comm/sort/join without LC_ALL=C (#3984):" >&2
+        printf '%s\n' "$bare" >&2
+        exit 2
+    fi
+    #  (11b) Behavioural, under a real non-C collation when one is installed.
+    printf '%s\n' '(paren) gate' '-hyphen gate' 'alpha gate' >"$scratch/punct.txt"
+    printf '%s\n' 'alpha gate' >"$scratch/alpha.txt"
+    local loc nonc=""
+    for loc in en_US.UTF-8 en_US.utf8 en_GB.UTF-8 de_DE.UTF-8; do
+        if [ "$(printf '%s\n' 'B' 'a' | LC_ALL="$loc" sort 2>/dev/null | head -n1)" = "a" ]; then
+            nonc="$loc"
+            break
+        fi
+    done
+    if [ -n "$nonc" ]; then
+        if LC_ALL="$nonc" RQC_MIRROR_FILE="$scratch/punct.txt" RQC_PIN_FILE="$scratch/punct.txt" \
+            RQC_LIVE_CONTEXTS_FILE="$scratch/alpha.txt" \
+            RQC_LIVE_ENFORCE_ADMINS=true RQC_LIVE_STRICT=true \
+            "$ROOT/scripts/check-required-contexts-live.sh" >/dev/null 2>"$scratch/errlocale"; then
+            echo "self-test FAILED: punctuation-leading drift under $nonc was NOT rejected (#3984)" >&2
+            exit 2
+        fi
+        local listed
+        listed="$(sed -n 's/^     - //p' "$scratch/errlocale" | LC_ALL=C sort -u | tr '\n' '|')"
+        if [ "$listed" != "(paren) gate|-hyphen gate|" ] || grep -q 'not in sorted order' "$scratch/errlocale"; then
+            echo "self-test FAILED: under $nonc the drift report is wrong (#3984) — want exactly '(paren) gate' and '-hyphen gate', got: ${listed}" >&2
+            cat "$scratch/errlocale" >&2
+            exit 2
+        fi
+    else
+        echo "required-contexts-live self-test: note — no non-C collation locale installed; #3984 behavioural leg (11b) skipped, static leg (11a) enforced" >&2
+    fi
+
+    # (12) R4-G1: a leading or trailing non-ASCII space is PART of the name.
+    #      Declaration + pin "<U+2003>Security gate" vs live "Security gate"
+    #      are DIFFERENT contexts and MUST FAIL — in C and in every non-C
+    #      locale present (the pre-fix `[[:space:]]` trim erased U+2003 under
+    #      UTF-8 locales and reported "declaration == live"). Controls: the
+    #      equal ASCII set passes; ASCII space/tab padding is still trimmed.
+    local em nbsp
+    em=$'\xe2\x80\x83'
+    nbsp=$'\xc2\xa0'
+    printf '%s\n' 'Security gate' >"$scratch/ascii.txt"
+    printf '%s\n' "${em}Security gate" >"$scratch/lead-em.txt"
+    printf '%s\n' "Security gate${em}" >"$scratch/trail-em.txt"
+    printf '%s\n' "${nbsp}Security gate" >"$scratch/lead-nbsp.txt"
+    printf ' \t%s\t \n' 'Security gate' >"$scratch/ascii-padded.txt"
+    local u_loc u_variant
+    for u_loc in C ${nonc:+"$nonc"} de_DE.UTF-8 ja_JP.UTF-8; do
+        for u_variant in lead-em trail-em lead-nbsp; do
+            if LC_ALL="$u_loc" RQC_MIRROR_FILE="$scratch/$u_variant.txt" RQC_PIN_FILE="$scratch/$u_variant.txt" \
+                RQC_LIVE_CONTEXTS_FILE="$scratch/ascii.txt" \
+                RQC_LIVE_ENFORCE_ADMINS=true RQC_LIVE_STRICT=true \
+                "$ROOT/scripts/check-required-contexts-live.sh" >/dev/null 2>"$scratch/errunicode"; then
+                echo "self-test FAILED: under LC_ALL=$u_loc a $u_variant U+2003/U+00A0 context compared EQUAL to its ASCII name (R4-G1)" >&2
+                exit 2
+            fi
+        done
+        if ! LC_ALL="$u_loc" RQC_MIRROR_FILE="$scratch/ascii-padded.txt" RQC_PIN_FILE="$scratch/ascii.txt" \
+            RQC_LIVE_CONTEXTS_FILE="$scratch/ascii.txt" \
+            RQC_LIVE_ENFORCE_ADMINS=true RQC_LIVE_STRICT=true \
+            "$ROOT/scripts/check-required-contexts-live.sh" >/dev/null 2>&1; then
+            echo "self-test FAILED: under LC_ALL=$u_loc ASCII space/tab padding was not trimmed (control)" >&2
+            exit 2
+        fi
+    done
+
+    echo "required-contexts-live self-test: PASS (load-bearing — catches the #3554 38-vs-35 shape, extra live context, enforce_admins=false, strict=false, empty live, missing declaration, missing pin, stale pin, locale-dependent comm (#3984), a U+2003/U+00A0-padded name compared equal to its ASCII twin (R4-G1); spares equal sets and an inline-# context name)"
 }
 
 case "${1:-}" in

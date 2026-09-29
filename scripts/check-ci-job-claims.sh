@@ -758,7 +758,7 @@ if [[ -n "$ledger_keys" ]]; then
             printf 'NOTICE: ci-job-claims ledger entry is STALE (suppresses nothing) — delete it: %s\n' \
                 "$(tr '|' ' ' <<<"$k")" >&2
         fi
-    done < <(sort -u <<<"$ledger_keys")
+    done < <(LC_ALL=C sort -u <<<"$ledger_keys")
 fi
 
 if [[ "$fail_count" -gt 0 ]]; then

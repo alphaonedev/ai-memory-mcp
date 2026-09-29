@@ -105,14 +105,14 @@ pub const FED_REQUIRE_SERVER_VERIFY_OFF: &str = "0";
 /// Uses the house default-ON federation-knob grammar: disabled only by an
 /// explicit falsy token (`0`/`false`/`no`/`off`, trimmed); every other value —
 /// including unset, the empty string, or an unknown word — keeps it enabled.
-/// Mirrors `federation::receive_auth::env_flag_default_on`, re-implemented
-/// here because that module is `--features sal`-gated while `tls` is in the
-/// default build.
+/// Delegates to [`crate::federation::receive_auth::env_flag_default_on`], the
+/// ONE grammar SSOT for default-ON federation knobs (#3033). `receive_auth`
+/// has been in the default build since it landed (#1718, no `cfg`); an
+/// earlier doc claimed it was `--features sal`-gated and justified a local
+/// copy of the grammar on that false premise (#3987).
 #[must_use]
 pub fn server_verify_required() -> bool {
-    std::env::var(FED_REQUIRE_SERVER_VERIFY_ENV)
-        .ok()
-        .is_none_or(|v| !matches!(v.trim(), "0" | "false" | "no" | "off"))
+    crate::federation::receive_auth::env_flag_default_on(FED_REQUIRE_SERVER_VERIFY_ENV)
 }
 
 /// #2477 — the staged-rollout escape hatch for the plaintext-peer refusal.

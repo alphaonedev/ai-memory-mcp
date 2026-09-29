@@ -302,7 +302,7 @@ done < <(
             \( -name '*.ts' -o -name '*.py' -o -name '*.js' -o -name 'README.md' \) \
             -not -path '*/node_modules/*' -not -path '*/__tests__/*' -not -path '*/tests/*' \
             2>/dev/null || true
-    } | sort
+    } | LC_ALL=C sort
 )
 
 if [[ ! -f "$ROUTES_RS" ]]; then
@@ -603,7 +603,7 @@ if [[ -n "$ledger_keys" ]]; then
             printf 'NOTICE: sdk-route-paths ledger entry is STALE (suppresses nothing) — delete it: %s\n' \
                 "$(tr '|' ' ' <<<"$k")" >&2
         fi
-    done < <(sort -u <<<"$ledger_keys")
+    done < <(LC_ALL=C sort -u <<<"$ledger_keys")
 fi
 
 if [[ "$fail_count" -gt 0 ]]; then

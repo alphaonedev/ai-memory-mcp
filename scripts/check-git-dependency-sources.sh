@@ -122,7 +122,7 @@ scan() {
     done < <(grep -nE "$MANIFEST_RE" "$f" || true)
   done < <(find "$dir" -type f -name Cargo.toml \
              -not -path '*/target/*' -not -path "${dir}/.local-runs/*" \
-             -not -path '*/.git/*' | sort)
+             -not -path '*/.git/*' | LC_ALL=C sort)
 
   while IFS= read -r f; do
     rel="${f#"${dir}"/}"
@@ -133,7 +133,7 @@ scan() {
     done < <(grep -nE "$LOCK_RE" "$f" || true)
   done < <(find "$dir" -type f -name Cargo.lock \
              -not -path '*/target/*' -not -path "${dir}/.local-runs/*" \
-             -not -path '*/.git/*' | sort)
+             -not -path '*/.git/*' | LC_ALL=C sort)
 
   return $found
 }

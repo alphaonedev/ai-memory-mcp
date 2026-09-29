@@ -447,7 +447,7 @@ guard_wrapper_names () {
             active = 0
         }
     }
-    ' "$1" 2>/dev/null | sort -u
+    ' "$1" 2>/dev/null | LC_ALL=C sort -u
 }
 
 # naked_home_mutations <file> <guard-tokens-COMMA-list> <mut-linenos-csv>
@@ -1286,7 +1286,7 @@ env_mutation_census () {
         [[ "${e:-0}" -eq 0 && "${a:-0}" -eq 0 ]] && continue
         rel="${f#"${ROOT}/"}"
         printf '%s %s %s\n' "${a:-0}" "$e" "$rel"
-    done < <(find "${ROOT}/src" -type f -name '*.rs' -print0 2>/dev/null) | sort -k3,3
+    done < <(find "${ROOT}/src" -type f -name '*.rs' -print0 2>/dev/null) | LC_ALL=C sort -k3,3
 }
 
 # ---------------------------------------------------------------------
@@ -1328,7 +1328,7 @@ helper_mutation_census () {
         [[ "$total" -eq 0 ]] && continue
         rel="${f#"${ROOT}/"}"
         printf '%s %s\n' "$total" "$rel"
-    done < <(find "${ROOT}/src" -type f -name '*.rs' -print0 2>/dev/null) | sort -k2,2
+    done < <(find "${ROOT}/src" -type f -name '*.rs' -print0 2>/dev/null) | LC_ALL=C sort -k2,2
 }
 
 # ---------------------------------------------------------------------
@@ -1587,7 +1587,7 @@ reader_census () {
         else
             printf '%s %s\n' "$(printf '%s\n' "$flagged" | grep -c . || true)" "$rel"
         fi
-    done < <(find "${ROOT}/src" -type f -name '*.rs' -print0 2>/dev/null) | sort -k2,2
+    done < <(find "${ROOT}/src" -type f -name '*.rs' -print0 2>/dev/null) | LC_ALL=C sort -k2,2
 }
 
 if [[ "${1:-}" == "--reader-census" ]]; then

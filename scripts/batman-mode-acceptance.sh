@@ -511,7 +511,7 @@ except: print('')")
 
     # B3 — memory_kind classified (parent or atom)
     if [[ -n "$probe_id" ]]; then
-        kinds=$(sql "SELECT DISTINCT memory_kind FROM memories WHERE id='$probe_id' OR atom_of='$probe_id';" | sort -u | tr '\n' ',' | sed 's/,$//')
+        kinds=$(sql "SELECT DISTINCT memory_kind FROM memories WHERE id='$probe_id' OR atom_of='$probe_id';" | LC_ALL=C sort -u | tr '\n' ',' | sed 's/,$//')
         non_default=$(echo "$kinds" | tr ',' '\n' | grep -vE '^observation$|^$' | head -1)
         if [[ -n "$non_default" ]]; then
             record "B3" pass "Form 6 fired: probe classified as '$non_default' (kinds=$kinds)" "non-default vocabulary applied"

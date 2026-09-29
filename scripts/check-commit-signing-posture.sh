@@ -76,7 +76,7 @@ SIGNERS_FILE_DEFAULT="$REPO_ROOT/scripts/qc-allowlists/enrolled-commit-signers.t
 # not the attack this gate defends against).
 enrolled_principals() {
   local signers_file="$1"
-  grep -vE '^[[:space:]]*(#|$)' "$signers_file" | awk '{print tolower($1)}' | sort -u
+  grep -vE '^[[:space:]]*(#|$)' "$signers_file" | awk '{print tolower($1)}' | LC_ALL=C sort -u
 }
 
 # assert_registry_usable SIGNERS_FILE — EXPLICIT fail-closed guard for a

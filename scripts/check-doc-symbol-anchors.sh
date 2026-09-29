@@ -505,7 +505,7 @@ if [[ -n "$allow_keys" ]]; then
                 "$(tr '|' ' ' <<<"$k")" >&2
             fail_count=$((fail_count + 1))
         fi
-    done < <(sort -u <<<"$allow_keys")
+    done < <(LC_ALL=C sort -u <<<"$allow_keys")
 fi
 
 if [[ "$fail_count" -gt 0 ]]; then

@@ -4,9 +4,12 @@
 # verbatim fragment of the flagged line.
 #
 # ============================================================================
-# *** THIS FILE IS CURRENTLY EMPTY, AND THAT IS THE PASSING STATE. ***
+# *** THE TARGET STATE IS AN EMPTY FILE; THE ENTRIES AT THE END ARE REAL. ***
 # ============================================================================
-# Empty means NO operator-facing doc needs a hand-authored exemption — every
+# (R4-G3 sibling: this header used to say the file was "CURRENTLY" empty while
+# it held entries; `check-capacity-claims.sh` now refuses that claim alongside
+# any entry.) An empty file would mean NO operator-facing doc needs a
+# hand-authored exemption — every
 # legitimate history/corpus-row/retirement use is already covered STRUCTURALLY
 # by the gate (row/corpus nouns never associate with an `agent` noun; the
 # ±1-line HISTORICAL-marker window exempts retirement notes; frozen doc trees

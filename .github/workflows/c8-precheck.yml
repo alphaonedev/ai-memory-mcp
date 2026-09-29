@@ -219,8 +219,8 @@ jobs:
   const-name-literal-gate:
     # #3122 follow-up: the companion name-literal gate was script-only
     # and unwired. Mirror hardcoded-literals (run + --self-test). NOT
-    # required at introduction (mirror-first; see
-    # required-contexts-not-required.txt).
+    # required at introduction (ledgered in
+    # required-contexts-not-required.txt; promotion is the #3554 lockstep).
     name: Const-name-literal identifier gate (#3121)
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -1110,8 +1110,9 @@ jobs:
     #
     # No `needs:`, no job-level `if:`, no `paths:` -- always runs. Declared in
     # required-contexts-not-required.txt at introduction (rule (f) of gate 7
-    # of the lint set); REQUIRE it mirror-first when the required set is next
-    # revised (#3554 ORDER rule).
+    # of the lint set); REQUIRE it via the #3554 lockstep (live protection,
+    # --pin-from-live, then the mirror line in the same commit) when the
+    # required set is next revised.
     name: "Foreign-text-to-caller gate (#3688 gate 7)"
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -1154,9 +1155,9 @@ jobs:
     #
     # Shape: no `needs:`, no job-level `if:`, no `paths:` filter — it ALWAYS
     # runs and always reports (rule (f) of scripts/check-required-contexts.sh).
-    # Declared in scripts/qc-allowlists/required-contexts-release.txt
-    # (mirror-first); the branch-protection API addition follows once this job
-    # has reported green on the base branch.
+    # Declared in scripts/qc-allowlists/required-contexts-release.txt and
+    # held equal to live protection by check-required-contexts-live.sh
+    # (#3554; it was first declared under the pre-#3554 mirror-first order).
     name: "External-PR operator-approval gate (author outside team => @alphaonedev review)"
     runs-on: ubuntu-latest
     timeout-minutes: 5
