@@ -872,12 +872,23 @@ curl -X POST https://127.0.0.1:9077/api/v1/subscriptions \
 (subscribe to it to feed a human-in-the-loop UI; the paired
 `approval_decided` event rides the K10 SSE stream), and the v1.0.0
 addition `agent_notified` (one per committed `memory_notify`; its
-details block carries the recipient, a correlation id and a `sha256:`
-digest of the body, never the body itself). `agent_notified` also fires
+details block carries the recipient, `notification_correlation_id` (the
+wake's digest of the inbox row id), and a `sha256:` digest of the body,
+never the body itself). `agent_notified` also fires
 on a separate in-process wake bus that backs
 `GET /api/v1/inbox/stream` — an agent that wants a low-latency push
 should hold that SSE stream rather than subscribe a webhook, which is
 operator egress and rides the shared dispatch semaphore.
+
+Every webhook has one `correlation_id`: the delivery UUID, also sent in
+`x-ai-memory-correlation-id` and persisted in the dispatch audit. Receivers
+parse the body and return `{"status":"ack","correlation_id":"<delivery UUID>"}`.
+The delivery id stays stable across retries. For `agent_notified`, use
+`notification_correlation_id` to correlate with the wake stream. For
+`approval_requested`, `memory_id` identifies the pending action;
+`target_memory_id`, when present, identifies the memory being deleted or
+promoted. These distinct detail names replace the duplicate JSON keys in
+earlier payloads.
 
 For the full event catalog, payload shapes, and the retry / backoff contract, see [DEVELOPER_GUIDE.md](DEVELOPER_GUIDE.html) and the relevant [V0.7-EPIC](v0.7/V0.7-EPIC.html) tracks once they merge.
 

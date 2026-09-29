@@ -274,6 +274,8 @@ pub fn agent_notified_wake(ev: &AgentNotified<'_>) {
 }
 
 /// Build the webhook-lane details block for an `agent_notified` event.
+/// Its digest is serialized as `notification_correlation_id` on BOTH
+/// backends, separate from the envelope's delivery UUID (`correlation_id`).
 fn agent_notified_details(ev: &AgentNotified<'_>) -> AgentNotifiedEventDetails {
     AgentNotifiedEventDetails {
         recipient_agent_id: ev.recipient_agent_id.to_string(),

@@ -809,7 +809,10 @@ pub struct AgentNotifiedEventDetails {
     /// Inbox owner the notification was delivered to.
     pub recipient_agent_id: String,
     /// Correlates this webhook delivery with the in-process wake frame
-    /// published for the same notify (see [`crate::inbox_wake`]).
+    /// published for the same notify (see [`crate::inbox_wake`]). On the
+    /// webhook wire this is `notification_correlation_id`; `correlation_id`
+    /// belongs exclusively to the envelope's delivery UUID and ACK contract.
+    #[serde(rename = "notification_correlation_id")]
     pub correlation_id: String,
     /// `sha256:<hex>` over the notification body — never the body.
     pub content_digest: String,
@@ -865,8 +868,14 @@ pub struct ApprovalRequestedEventDetails {
     /// the queue-time without a second round-trip.
     pub requested_at: String,
     /// `pending_actions.memory_id` — `Some` for delete / promote
-    /// (existing row), `None` for store (no row yet).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// (existing row), `None` for store (no row yet). Serialized as
+    /// `target_memory_id` so the envelope's `memory_id` remains the pending
+    /// action id used to approve or reject the request.
+    #[serde(
+        rename = "target_memory_id",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub memory_id: Option<String>,
     /// Always `"pending"` at insert time. Decided rows do NOT re-fire
     /// this event — the decision flows through the planned
@@ -2786,6 +2795,37 @@ fn record_dispatch_with_conn(conn: &Connection, sub_id: &str, correlation_id: &s
 mod tests {
     use super::*;
 
+    // #4076: serde flatten must not shadow the delivery id with a wake digest.
+    #[test]
+    fn agent_notified_payload_has_one_delivery_correlation_id_4076() -> anyhow::Result<()> {
+        let delivery_id = uuid::Uuid::now_v7().to_string();
+        let notification_id = crate::write_events::correlation_id_for("inbox-4076");
+        let details = AgentNotifiedEventDetails {
+            recipient_agent_id: "recipient-4076".into(),
+            correlation_id: notification_id.clone(),
+            content_digest: "sha256:body".into(),
+        };
+        let payload = DispatchPayload {
+            event: webhook_events::AGENT_NOTIFIED,
+            memory_id: "inbox-4076",
+            namespace: "_inbox/recipient-4076",
+            agent_id: Some("sender-4076"),
+            delivered_at: "2026-09-29T00:00:00Z".into(),
+            correlation_id: &delivery_id,
+            details: Some(serde_json::to_value(details)?),
+        };
+        let wire = serde_json::to_string(&payload)?;
+        assert_eq!(
+            wire.matches("\"correlation_id\":").count(),
+            1,
+            "duplicate delivery key: {wire}"
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&wire)?;
+        assert_eq!(parsed["correlation_id"], delivery_id);
+        assert_eq!(parsed["notification_correlation_id"], notification_id);
+        Ok(())
+    }
+
     /// Serializes the two #1053 tests that mutate the process-global
     /// `AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL` env var. Without it they
     /// race under the default parallel test runner: the fail-open
@@ -3501,6 +3541,8 @@ mod tests {
         /// header, so the legacy "2xx → success" tests satisfy K6's strict
         /// ACK contract without coupling to the exact UUID value.
         AckEcho,
+        /// Echo the parsed body as an ordinary JSON receiver does.
+        AckBody,
         /// A bare status (4xx / 5xx ladders).
         Status(u16),
         /// `302` to `location` — the SSRF-pin-bypass shape.
@@ -3567,6 +3609,14 @@ mod tests {
                 body: bytes.to_vec(),
             });
         match state.reply {
+            Reply::AckBody => {
+                let parsed: serde_json::Value =
+                    serde_json::from_slice(&bytes).expect("JSON payload");
+                axum::Json(serde_json::json!({
+                    "status": "ack", "correlation_id": parsed["correlation_id"]
+                }))
+                .into_response()
+            }
             Reply::AckEcho => {
                 let corr = parts
                     .headers
@@ -4825,6 +4875,92 @@ mod tests {
     //   4. `replay_subscription_events` returns audit rows ordered by
     //      delivered_at since a cursor timestamp
     // ----------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sqlite_agent_notified_body_ack_4076() -> anyhow::Result<()> {
+        let receiver = spawn_tls_receiver(Reply::AckBody).await;
+        let (_keep, db_path) = fresh_db();
+        let conn = crate::db::open(&db_path)?;
+        let url = receiver.hook_url();
+        let sub_id = insert(
+            &conn,
+            &NewSubscription {
+                url: &url,
+                events: webhook_events::AGENT_NOTIFIED,
+                secret: Some("test-sub-secret"),
+                namespace_filter: None,
+                agent_filter: None,
+                created_by: None,
+                event_types: None,
+            },
+        )?;
+        let ev = crate::write_events::AgentNotified {
+            recipient_agent_id: "recipient-4076",
+            sender_agent_id: "sender-4076",
+            inbox_row_id: "inbox-4076",
+            namespace: "_inbox/recipient-4076",
+            content: "notification body",
+        };
+        crate::write_events::agent_notified(&conn, &db_path, &ev);
+        tokio::time::timeout(std::time::Duration::from_secs(30), wait_dispatch_idle()).await?;
+        let (corr, payload, status): (String, String, String) = conn.query_row(
+            "SELECT correlation_id, payload, delivery_status FROM subscription_events WHERE subscription_id = ?1",
+            params![sub_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        assert_eq!(
+            status, "ack",
+            "body echo must ACK the persisted delivery: {payload}"
+        );
+        let received = receiver.received();
+        assert_eq!(received.len(), 1, "valid body ACK must not retry");
+        let request = &received[0];
+        assert_eq!(request.body, payload.as_bytes());
+        assert_eq!(
+            request.headers["x-ai-memory-correlation-id"].to_str()?,
+            corr
+        );
+        assert_eq!(uuid::Uuid::parse_str(&corr)?.get_version_num(), 7);
+        let parsed: serde_json::Value = serde_json::from_slice(&request.body)?;
+        assert_eq!(parsed["correlation_id"], corr);
+        assert_eq!(
+            parsed["notification_correlation_id"],
+            crate::write_events::correlation_id_for(ev.inbox_row_id)
+        );
+        assert!(list_dlq(&conn, Some(&sub_id))?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn approval_payload_has_one_envelope_memory_id_4076() -> anyhow::Result<()> {
+        for action in ["store", "delete", "promote"] {
+            let target = (action != "store").then(|| "target-4076".to_string());
+            let details = ApprovalRequestedEventDetails {
+                action_type: action.into(),
+                requested_at: "2026-09-29T00:00:00Z".into(),
+                memory_id: target.clone(),
+                status: "pending".into(),
+            };
+            let payload = DispatchPayload {
+                event: webhook_events::APPROVAL_REQUESTED,
+                memory_id: "pending-4076",
+                namespace: "approval-4076",
+                agent_id: Some("sender-4076"),
+                delivered_at: "2026-09-29T00:00:00Z".into(),
+                correlation_id: "delivery-4076",
+                details: Some(serde_json::to_value(details)?),
+            };
+            let wire = serde_json::to_string(&payload)?;
+            assert_eq!(
+                wire.matches("\"memory_id\":").count(),
+                1,
+                "duplicate envelope key: {wire}"
+            );
+            let parsed: serde_json::Value = serde_json::from_str(&wire)?;
+            assert_eq!(parsed["memory_id"], "pending-4076");
+            assert_eq!(parsed["target_memory_id"], serde_json::to_value(target)?);
+        }
+        Ok(())
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn k6_dispatch_persists_uuidv7_correlation_id() {

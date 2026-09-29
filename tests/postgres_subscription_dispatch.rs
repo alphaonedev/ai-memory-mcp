@@ -335,3 +335,76 @@ async fn dispatch_event_postgres_zero_subs_is_noop() {
     .await;
     // No assertion needed — the test passes iff the call returned.
 }
+
+/// #4076: a real Postgres subscription must accept an ACK echoing the JSON
+/// body's delivery id, while retaining the separate notification digest.
+#[cfg(feature = "sal-postgres")]
+#[tokio::test(flavor = "multi_thread")]
+async fn postgres_agent_notified_body_ack_4076() -> anyhow::Result<()> {
+    let Some(pg_url) = common::postgres_url() else {
+        return Ok(());
+    };
+    let pg = ai_memory::store::postgres::PostgresStore::connect(&pg_url).await?;
+    let (mut state, audit_path) = make_test_state();
+    state.store = Arc::new(pg);
+    ai_memory::config::set_allow_loopback_webhooks(true);
+    let tls = common::tls_receiver::dispatch_tls(&std::env::temp_dir());
+    let server = TlsReceiver::start_with(
+        tls,
+        Arc::new(|req| {
+            let body: serde_json::Value = serde_json::from_slice(&req.body).expect("JSON payload");
+            Respond::ok().json(serde_json::json!({
+                "status": "ack", "correlation_id": body["correlation_id"]
+            }))
+        }),
+    )
+    .await;
+    let id = uuid::Uuid::new_v4().to_string();
+    let namespace = format!("_inbox/{id}");
+    let url = format!("{}/notify", server.uri());
+    let sub = make_subscription_memory(
+        &id,
+        &id,
+        &url,
+        &namespace,
+        Some(&sha256_hex_local("secret-4076")),
+    );
+    let ctx = CallerContext::for_admin("test-setup");
+    state.store.store(&ctx, &sub).await?;
+    let event = ai_memory::write_events::AgentNotified {
+        recipient_agent_id: &id,
+        sender_agent_id: &id,
+        inbox_row_id: "pg-inbox-4076",
+        namespace: &namespace,
+        content: "notification body",
+    };
+    ai_memory::write_events::agent_notified_webhook_postgres(&state, &event).await;
+    tokio::time::timeout(Duration::from_secs(30), wait_dispatch_idle()).await?;
+    let conn = ai_memory::db::open(&audit_path)?;
+    let (corr, payload, status): (String, String, String) = conn.query_row(
+        "SELECT correlation_id, payload, delivery_status FROM subscription_events WHERE subscription_id = ?1",
+        [&id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )?;
+    assert_eq!(
+        status, "ack",
+        "body echo must ACK the persisted delivery: {payload}"
+    );
+    let received = server.received_requests().await.expect("recorded requests");
+    assert_eq!(received.len(), 1, "valid body ACK must not retry");
+    let request = &received[0];
+    assert_eq!(request.body, payload.as_bytes());
+    assert_eq!(payload.matches("\"correlation_id\":").count(), 1);
+    assert_eq!(
+        request.headers["x-ai-memory-correlation-id"].to_str()?,
+        corr
+    );
+    assert_eq!(uuid::Uuid::parse_str(&corr)?.get_version_num(), 7);
+    let parsed: serde_json::Value = serde_json::from_slice(&request.body)?;
+    assert_eq!(parsed["correlation_id"], corr);
+    assert_eq!(
+        parsed["notification_correlation_id"],
+        ai_memory::write_events::correlation_id_for(event.inbox_row_id)
+    );
+    assert!(ai_memory::subscriptions::list_dlq(&conn, Some(&id))?.is_empty());
+    Ok(())
+}
