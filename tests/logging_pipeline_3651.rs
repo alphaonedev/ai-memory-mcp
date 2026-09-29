@@ -27,11 +27,16 @@ fn sandbox() -> tempfile::TempDir {
 
 /// Write `[logging]` config into an isolated HOME and run the binary there.
 fn run_with_logging(home: &Path, logging_toml: &str, args: &[&str]) -> Output {
+    run_with_section(home, "logging", logging_toml, args)
+}
+
+/// Write one `[section]` of config into an isolated HOME and run the binary.
+fn run_with_section(home: &Path, section: &str, body: &str, args: &[&str]) -> Output {
     let config_root = home.join(".config").join("ai-memory");
     std::fs::create_dir_all(&config_root).expect("create config root");
     std::fs::write(
         config_root.join("config.toml"),
-        format!("schema_version = 2\ntier = \"keyword\"\n\n[logging]\n{logging_toml}"),
+        format!("schema_version = 2\ntier = \"keyword\"\n\n[{section}]\n{body}"),
     )
     .expect("write config");
     let db: PathBuf = home.join("pipeline.db");
@@ -167,4 +172,109 @@ fn a_second_subscriber_installation_is_an_error_3651() {
         "status: {status:?}"
     );
     assert_eq!(status.records_delivered, None, "nothing was measured");
+}
+
+// ---- #3651 audit half (5-agent vote 5/5 A, decision memory 25844fe7) --------
+// Before the fix `main` printed "audit init failed (continuing without)" and
+// ran with NO audit trail, although the docs promise `hash_chain = false`
+// "REFUSES boot" and `init_from_config` refuses. These drive the real binary,
+// because the lib test only ever proved the FUNCTION refuses.
+
+/// Assert an audit boot refusal: exit 78, the refusal names the cause and the
+/// escape hatch, and the old "continuing without" line is gone.
+fn assert_audit_refusal(out: &Output, cause: &str) {
+    let err = stderr(out);
+    assert_eq!(out.status.code(), Some(EX_CONFIG), "stderr: {err}");
+    assert!(err.contains("refusing to start"), "stderr: {err}");
+    assert!(err.contains(cause), "stderr: {err}");
+    assert!(err.contains("[audit].enabled = false"), "stderr: {err}");
+    assert!(!err.contains("continuing without"), "stderr: {err}");
+}
+
+#[test]
+fn audit_hash_chain_false_refuses_boot_3651() {
+    let home = sandbox();
+    let dir = home.path().join("audit");
+    let out = run_with_section(
+        home.path(),
+        "audit",
+        &format!(
+            "enabled = true\npath = \"{}\"\nhash_chain = false\n",
+            dir.display()
+        ),
+        &["stats"],
+    );
+    assert_audit_refusal(&out, "hash_chain = false");
+}
+
+#[test]
+fn audit_schema_version_mismatch_refuses_boot_3651() {
+    let home = sandbox();
+    let dir = home.path().join("audit");
+    let out = run_with_section(
+        home.path(),
+        "audit",
+        &format!(
+            "enabled = true\npath = \"{}\"\nschema_version = 999\n",
+            dir.display()
+        ),
+        &["stats"],
+    );
+    assert_audit_refusal(&out, "schema_version = 999");
+}
+
+#[cfg(unix)]
+#[test]
+fn unusable_audit_directory_refuses_boot_3651() {
+    let home = sandbox();
+    let blocker = home.path().join("blocker");
+    std::fs::write(&blocker, b"a file, not a directory").expect("write blocker");
+    let out = run_with_section(
+        home.path(),
+        "audit",
+        &format!(
+            "enabled = true\npath = \"{}\"\n",
+            blocker.join("sub").display()
+        ),
+        &["stats"],
+    );
+    assert_audit_refusal(&out, "audit log");
+}
+
+#[test]
+fn doctor_still_runs_with_a_refused_audit_trail_3651() {
+    let home = sandbox();
+    let dir = home.path().join("audit");
+    let out = run_with_section(
+        home.path(),
+        "audit",
+        &format!(
+            "enabled = true\npath = \"{}\"\nhash_chain = false\n",
+            dir.display()
+        ),
+        &["doctor", "--json"],
+    );
+    let err = stderr(&out);
+    assert_ne!(
+        out.status.code(),
+        Some(EX_CONFIG),
+        "doctor must not be refused: {err}"
+    );
+    assert!(err.contains("`doctor` continues"), "stderr: {err}");
+    let _: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("doctor --json prints a report");
+}
+
+#[test]
+fn a_working_audit_trail_still_boots_3651() {
+    let home = sandbox();
+    let dir = home.path().join("audit");
+    let out = run_with_section(
+        home.path(),
+        "audit",
+        &format!("enabled = true\npath = \"{}\"\n", dir.display()),
+        &["stats"],
+    );
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(!stderr(&out).contains("refusing to start"));
 }
