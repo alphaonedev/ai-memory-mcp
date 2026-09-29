@@ -1885,10 +1885,9 @@ impl MemoryStore for SqliteStore {
     async fn apply_remote_restore(&self, _ctx: &CallerContext, id: &str) -> StoreResult<bool> {
         self.gate_record_stop()?;
         let conn = self.state.lock().await;
-        if db::memory_is_tombstoned(&conn, id).map_err(box_err)? {
-            return Ok(false);
-        }
-        db::restore_archived(&conn, id).map_err(box_err)
+        // #4029 — the tombstone gate and the restore share ONE write
+        // transaction (a separate probe raced a forget on another connection).
+        db::restore_archived_unless_tombstoned(&conn, id).map_err(box_err)
     }
 
     async fn recall_hybrid(

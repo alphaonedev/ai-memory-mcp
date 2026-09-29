@@ -104,6 +104,9 @@ pub mod dsn;
 // qual_10 budget reason as `parity_3064` above.
 mod reown_3124;
 mod swarm_rewind;
+// v1.0.0 #4029 — the admission-vs-erasure advisory-lock protocol that keeps a
+// federation write from resurrecting an id a concurrent erasure tombstoned.
+pub(crate) mod tombstone_serial_4029;
 
 use crate::models::field_names;
 use std::time::Duration;
@@ -16588,6 +16591,11 @@ async fn pg_tombstone_and_erase_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     id: &str,
 ) -> Result<Option<(String, i64)>, sqlx::Error> {
+    // v1.0.0 #4029 — the erasure side of the admission protocol, taken
+    // BEFORE the row is read: an in-flight federation admission of this id
+    // commits first (and its row is then erased here), and a later one waits
+    // for this tombstone and drops itself.
+    tombstone_serial_4029::lock_erasure(tx, std::slice::from_ref(&id.to_owned())).await?;
     let row: Option<(String, i64, Option<String>)> =
         sqlx::query_as(SQL_SELECT_NS_VERSION_AGENT_BY_ID)
             .bind(id)
@@ -21171,6 +21179,481 @@ impl PostgresStore {
     }
 }
 
+impl PostgresStore {
+    /// `archive_restore` body; `federated` (#4029) adds the in-transaction
+    /// G30 forget-tombstone gate the federated `restores[]` apply needs (the
+    /// OPERATOR restore is an authorized un-forget and never gates).
+    pub(super) async fn archive_restore_gated(
+        &self,
+        ctx: &CallerContext,
+        id: &str,
+        federated: bool,
+    ) -> StoreResult<bool> {
+        self.gate_record_stop().await?;
+        // v1.0.0 #3520 — routed through the shared bounded-retry funnel. Restore
+        // is the archive family's inverse (archived-row read + live INSERT +
+        // preserved-edge re-insert + archive DELETE), so it holds the same
+        // multi-relation lock set that a concurrent bootstrap's
+        // `CREATE INDEX IF NOT EXISTS` deadlocks against. An early `return`
+        // inside the block exits THIS attempt with that verdict, which the loop
+        // then yields unchanged — a not-found restore is still `Ok(false)`.
+        let mut retry = tx_retry::TxRetry::new("archive_restore tx");
+        let restored: bool = loop {
+            let attempt: StoreResult<bool> = async {
+                let mut tx = self
+                    .pool
+                    .begin()
+                    .await
+                    .map_err(|e| to_store_err("begin archive_restore tx", e))?;
+                // v1.0.0 #4029 — the federated `restores[]` apply: the G30
+                // tombstone gate runs INSIDE this transaction, after the
+                // admission advisory locks (`tombstone_serial_4029`), so a
+                // forget committing between a separate probe and this restore
+                // can no longer leave a restored live row beside its tombstone.
+                if federated
+                    && tombstone_serial_4029::admit_or_tombstoned(&mut tx, id)
+                        .await
+                        .map_err(|e| to_store_err("archive_restore tombstone gate", e))?
+                {
+                    return Ok(false);
+                }
+
+                // v1.0.0 #3271 (SECURITY-high) — SAL-side caller-owns gate, the
+                // archive-RESTORE sibling of the #3193 `archive_by_ids` gate. Pre-fix
+                // this funnel discarded its `_ctx` and matched on `WHERE id = $1` with
+                // NO owner predicate, so on a postgres-backed daemon ANY authenticated
+                // tenant could `POST /api/v1/archive/{victim's id}/restore` and pull a
+                // DIFFERENT tenant's deliberately-archived row back into the live set —
+                // and the 200-vs-404 split was an enumeration oracle over other
+                // tenants' archived ids (the sqlite twin has refused via
+                // `db::restore_archived_for_caller` since #940; #3193 fixed only the
+                // archive side of this class). The existence probe now carries the
+                // three-way owner predicate (owner OR inbox-target), so a non-owner
+                // sees the SAME `Ok(false)` a truly-absent id gives → the handler's
+                // 404 `NOT_FOUND_IN_ARCHIVE`, no oracle. Admin/operator lanes
+                // (`ctx.bypass_visibility`) round-trip regardless of ownership, exactly
+                // as they do on update / delete / archive.
+                //
+                // #3124 — the ownership verdict is the ONE cross-backend predicate:
+                // the probe reads the row's owner stamp (typed by `jsonb_typeof`, so a
+                // malformed owner is never mistaken for a stamp OR for unstamped) and
+                // decides in Rust — owner, inbox recipient of a STAMPED row, or an
+                // UNSTAMPED row admitted by `AI_MEMORY_UNSTAMPED_MUTATION` (`warn`, the
+                // pre-#3124 outcome, WARNs + counts; `refuse` refuses). A refusal is
+                // the same `Ok(false)` an absent id gives — still no oracle.
+                // `admit_unstamped_row` feeds the INSERT's defense-in-depth arm so the
+                // write predicate and this verdict cannot disagree.
+                let mut admit_unstamped_row = false;
+                if ctx.bypass_visibility {
+                    let exists: Option<(String,)> =
+                        sqlx::query_as("SELECT id FROM archived_memories WHERE id = $1")
+                            .bind(id)
+                            .fetch_optional(&mut *tx)
+                            .await
+                            .map_err(|e| to_store_err("archive_restore lookup", e))?;
+                    if exists.is_none() {
+                        return Ok(false);
+                    }
+                } else {
+                    let probe: Option<(Option<String>, Option<String>, Option<String>)> =
+                        sqlx::query_as(
+                            "SELECT jsonb_typeof(metadata->'agent_id'), metadata->>'agent_id', \
+                             metadata->>'target_agent_id' \
+                             FROM archived_memories WHERE id = $1",
+                        )
+                        .bind(id)
+                        .fetch_optional(&mut *tx)
+                        .await
+                        .map_err(|e| to_store_err("archive_restore owner lookup", e))?;
+                    let Some((owner_type, owner, inbox)) = probe else {
+                        return Ok(false);
+                    };
+                    let caller = ctx.effective_principal();
+                    let stamp = crate::identity::owner_stamp::OwnerStamp::of_pg(
+                        owner_type.as_deref(),
+                        owner.as_deref(),
+                    );
+                    let admitted = if stamp.is_unstamped() {
+                        admit_unstamped_row = crate::identity::owner_stamp::admit_unstamped(
+                            crate::identity::owner_stamp::MutationSite::postgres(
+                                crate::identity::owner_stamp::funnel::RESTORE,
+                            ),
+                            id,
+                            caller,
+                        );
+                        admit_unstamped_row
+                    } else {
+                        stamp.is_owned_by(caller)
+                            || inbox
+                                .as_deref()
+                                .is_some_and(|t| !t.is_empty() && t == caller)
+                    };
+                    if !admitted {
+                        return Ok(false);
+                    }
+                }
+
+                // #1848 reconciled to #1771 (5-agent vote 4d3ea1c5, option B): this is
+                // the OPERATOR un-forget path, so NO tombstone gate here — an authorized
+                // restore round-trips per #1771.
+                //
+                // #3075 — the ORIGINAL justification for that omission was "federation
+                // /sync/push restores[] are sqlite-only per federation_signing_check.rs,
+                // never PostgresStore". That premise is RETIRED: the postgres receiver
+                // now applies `restores[]`. The omission stands anyway, on the #1771
+                // reasoning alone — but the G30 gate the federated lane needs is no
+                // longer absent, it MOVED: it lives on `apply_remote_restore`
+                // (`postgres/federation_3075.rs`), which runs it BEFORE composing this
+                // method. Do NOT "fix" the two by merging them: gating here would break
+                // the documented operator un-forget capability on both backends.
+
+                // Reject if the id is already in active memories.
+                let active: Option<(String,)> = sqlx::query_as(SQL_SELECT_MEMORY_ID_BY_ID)
+                    .bind(id)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(|e| to_store_err("archive_restore active lookup", e))?;
+                if active.is_some() {
+                    return Err(StoreError::Conflict { id: id.to_string() });
+                }
+
+                // FX-C5 — substrate governance pre-write hook parity. Restoring
+                // an archived row mints a fresh live row via a raw INSERT...SELECT
+                // that bypasses `PostgresStore::store(..)` (which is where ARCH-1
+                // wired in the `consult_governance_pre_write_pg` adapter at
+                // line 7001). Without this call, an operator's signed governance
+                // rule could be bypassed by restoring a row whose `(title,
+                // namespace)` would otherwise be refused on a direct write.
+                // Load the archived row shaped as a `Memory` and fire the hook
+                // BEFORE the INSERT lands.
+                let candidate = Self::load_archived_as_memory_pg(&mut *tx, id).await?;
+                // #3124 — an UNSTAMPED row the owner probe above already admitted
+                // (and reported) is not re-decided here: re-running the policy would
+                // WARN + count the same restore twice. Every other row is re-checked
+                // against the loaded candidate (same row, same single predicate).
+                if !ctx.bypass_visibility
+                    && !admit_unstamped_row
+                    && !crate::visibility::caller_owns_for_mutation(
+                        &candidate,
+                        ctx.effective_principal(),
+                        true,
+                        crate::identity::owner_stamp::MutationSite::postgres(
+                            crate::identity::owner_stamp::funnel::RESTORE,
+                        ),
+                    )
+                {
+                    return Ok(false);
+                }
+                consult_governance_pre_write_pg(&candidate)?;
+                // #2110/#2113 audit — TRACT covenant clause 1 on the archive-RESTORE
+                // funnel. Advisory-only (never refuses): a legacy archived row that
+                // predates the covenant must stay restorable even under
+                // AI_MEMORY_REQUIRE_WHY_TRACE=1 (postgres parity with the sqlite
+                // `restore_archived` inbound gate).
+                crate::storage::consult_why_trace_gate_inbound(&candidate);
+
+                // v0.9.0 G8 (#1825) — re-mint the row's genesis content-id from the
+                // archived row's ORIGINAL identity + PLAINTEXT content (decrypting the
+                // archived envelope when present, falling back to the stored content
+                // on any decrypt error) so the restored live row carries the same
+                // `b3:` address it held before archival. created_at / title /
+                // namespace / kind are the ORIGINAL archived values (via `candidate`),
+                // NOT NOW(). Mirrors the sqlite `restored_cid_stamp` path.
+                let restored_cid = {
+                    let agent_id = candidate
+                        .metadata
+                        .get("agent_id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    let (raw_content, envelope): (String, Option<Vec<u8>>) = sqlx::query_as(
+                        "SELECT content, encrypted_envelope FROM archived_memories WHERE id = $1",
+                    )
+                    .bind(id)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(|e| to_store_err("archive_restore load plaintext for cid", e))?;
+                    let plaintext = match envelope {
+                        Some(env) => {
+                            crate::encryption::open_content(&env, &agent_id).unwrap_or(raw_content)
+                        }
+                        None => raw_content,
+                    };
+                    crate::identity::cid::stamp_cid(
+                        &agent_id,
+                        &candidate.namespace,
+                        &candidate.title,
+                        candidate.memory_kind.as_str(),
+                        &candidate.created_at,
+                        &plaintext,
+                    )
+                };
+
+                let now = chrono::Utc::now();
+                // #1025 (CRITICAL, 2026-05-21) — full v0.7.0 column carry on
+                // archive→restore. Pre-#1025 the SELECT pulled only 17 columns
+                // from archived_memories, so the restored row landed in
+                // memories with reflection_depth=0, memory_kind='observation'
+                // (the live-table DEFAULT), citations=[], version=1, etc. —
+                // silent loss of provenance + persona + confidence calibration.
+                // Now copies all 26 v0.7.0 fields (with COALESCE defaults for
+                // pre-#1025 archived rows where the columns are NULL).
+                sqlx::query(
+                    "INSERT INTO memories (
+                        id, tier, namespace, title, content, tags, priority, confidence,
+                        source, access_count, created_at, updated_at, last_accessed_at,
+                        expires_at, metadata, embedding, embedding_dim, embedding_space,
+                        reflection_depth, atomised_into, atom_of, memory_kind,
+                        entity_id, persona_version, citations, source_uri, source_span,
+                        confidence_source, confidence_signals, confidence_decayed_at,
+                        mentioned_entity_id, version, lifecycle_state, encrypted_envelope,
+                        cid, cid_genesis, kind_provenance, valid_from, valid_until
+                    )
+                    SELECT id, COALESCE(original_tier, 'long'), namespace, title, content,
+                           tags, priority, confidence, source, access_count, created_at,
+                           $1::timestamptz, last_accessed_at, original_expires_at, metadata,
+                           -- v1.0.0 #2167 (S8) restore/migrate HEAL (postgres twin):
+                           -- keep the archived vector ONLY when its space matches the
+                           -- live active space ($5); a foreign- or NULL-space vector
+                           -- has its whole trio NULLed so the boot backfill re-embeds
+                           -- from the durable text under the LIVE space (self-heal).
+                           -- $5 NULL (no active embedder in this process) keeps any
+                           -- STAMPED vector but still drops an unverifiable NULL one.
+                           CASE WHEN embedding_space IS NOT NULL
+                                     AND ($5::text IS NULL OR embedding_space = $5)
+                                THEN embedding ELSE NULL END,
+                           CASE WHEN embedding_space IS NOT NULL
+                                     AND ($5::text IS NULL OR embedding_space = $5)
+                                THEN embedding_dim ELSE NULL END,
+                           CASE WHEN embedding_space IS NOT NULL
+                                     AND ($5::text IS NULL OR embedding_space = $5)
+                                THEN embedding_space ELSE NULL END,
+                           COALESCE(reflection_depth, 0),
+                           atomised_into,
+                           atom_of,
+                           COALESCE(memory_kind, 'observation'),
+                           entity_id, persona_version,
+                           COALESCE(citations, '[]'),
+                           source_uri, source_span,
+                           COALESCE(confidence_source, 'caller_provided'),
+                           confidence_signals, confidence_decayed_at,
+                           mentioned_entity_id,
+                           COALESCE(version, 1),
+                           COALESCE(lifecycle_state, 'open'),
+                           encrypted_envelope,
+                           -- v1.0.0 #2385 — the STORED genesis identity WINS. Pre-#2385
+                           -- `archived_memories` had no cid columns, so restore
+                           -- unconditionally bound the re-mint ($3/$4) recomputed from six
+                           -- reconstructed inputs (agent_id / namespace / title / kind /
+                           -- created_at / decrypted plaintext) — and a decrypt failure
+                           -- there falls back to the CIPHERTEXT placeholder. Any drift
+                           -- silently re-addressed the durable row and dangled every
+                           -- `memory_links.source_cid` / `target_cid` mirror. The v90
+                           -- columns make the identity a CARRIED fact; the re-mint is now
+                           -- the legacy fallback for pre-v90 archive rows only.
+                           -- The PAIR is selected atomically (the #2395 lesson applied
+                           -- here): `cid_genesis` is the canonical PRE-IMAGE of `cid`, so
+                           -- mixing a carried address with a re-derived pre-image would
+                           -- produce a row whose own verify disagrees with itself.
+                           CASE WHEN cid IS NOT NULL THEN cid ELSE $3::text END,
+                           CASE WHEN cid IS NOT NULL THEN cid_genesis ELSE $4::bytea END,
+                           -- v1.0.0 #2333 (FBL-03 pg mirror) — carry kind_provenance
+                           -- back on restore; legacy pre-v87 archive rows re-derive
+                           -- it from the metadata carrier, vocab-guarded (sqlite twin).
+                           COALESCE(kind_provenance,
+                                    CASE WHEN metadata->>'kind_provenance' IN
+                                              ('declared','channel_derived','regex','llm')
+                                         THEN metadata->>'kind_provenance' END),
+                           valid_from, valid_until
+                    FROM archived_memories WHERE id = $2
+                      -- v1.0.0 #3271 — owner-predicated write (defense-in-depth with
+                      -- the owner probe above; same predicate). $6 bypass
+                      -- short-circuits the owner/inbox/legacy arms so operator lanes
+                      -- still round-trip any row. #3124: owner equality is typed
+                      -- (a malformed non-string owner never matches), the inbox arm
+                      -- needs a STAMPED row, and the unstamped arm is live only when
+                      -- the probe's `AI_MEMORY_UNSTAMPED_MUTATION` verdict admitted
+                      -- it ($8) — the same ONE predicate as the sqlite
+                      -- `db::restore_archived_for_caller`.
+                      AND ($6::bool
+                           OR (jsonb_typeof(metadata->'agent_id') = 'string'
+                               AND metadata->>'agent_id' = $7)
+                           OR (metadata->>'target_agent_id' = $7
+                               AND metadata->>'agent_id' IS NOT NULL
+                               AND metadata->>'agent_id' <> '')
+                           OR ($8::bool
+                               AND (metadata->>'agent_id' IS NULL
+                                    OR metadata->>'agent_id' = '')))",
+                )
+                .bind(now)
+                .bind(id)
+                .bind(&restored_cid.cid)
+                .bind(&restored_cid.genesis)
+                // v1.0.0 #2167 (S8) — $5: the process-wide active-space fp (NULL when
+                // this process resolved no embedder) driving the restore heal above.
+                .bind(crate::embeddings::active_embedding_space())
+                .bind(ctx.bypass_visibility)
+                .bind(ctx.effective_principal())
+                // #3124 — $8: the probe's unstamped-row verdict.
+                .bind(admit_unstamped_row)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("archive_restore insert", e))?;
+
+                // #1771 (5-agent vote 4d3ea1c5) — re-insert this memory's preserved
+                // `archived_memory_links` edges back into `memory_links`, AFTER the
+                // memory row is restored above and within the same tx. Only edges
+                // whose BOTH endpoints currently exist in `memories` are restored —
+                // `memory_links` carries an `ON DELETE CASCADE` FK on both
+                // endpoints, so an edge whose OTHER endpoint is permanently gone
+                // would be rejected (and is correctly skipped here). Idempotent via
+                // the PK `ON CONFLICT`. Postgres twin of the SQLite
+                // `restore_links_for_memory` re-insert.
+                // #2315 — RETURNING the actually-restored edges so they can be
+                // re-projected into the AGE graph below (only edges this INSERT
+                // landed; ON CONFLICT skips report nothing, which is correct —
+                // an already-present edge is already projected or queued).
+                // #2377 (FIX #9) — RETURNING carries `valid_from`/`valid_until` too so a
+                // restored already-invalidated edge re-projects into AGE ALREADY-carrying
+                // its validity (else the current-view Cypher reads would serve it as VALID).
+                let restored_edges: Vec<(
+                    String,
+                    String,
+                    String,
+                    Option<DateTime<Utc>>,
+                    Option<DateTime<Utc>>,
+                )> = sqlx::query_as(
+                    "INSERT INTO memory_links (
+                         source_id, target_id, relation, created_at, valid_from,
+                         valid_until, observed_by, signature, attest_level,
+                         source_cid, target_cid
+                     )
+                     SELECT aml.source_id, aml.target_id, aml.relation, aml.created_at,
+                            aml.valid_from, aml.valid_until, aml.observed_by,
+                            aml.signature, aml.attest_level,
+                            aml.source_cid, aml.target_cid
+                     FROM archived_memory_links aml
+                     WHERE (aml.source_id = $1 OR aml.target_id = $1)
+                       AND EXISTS (SELECT 1 FROM memories m WHERE m.id = aml.source_id)
+                       AND EXISTS (SELECT 1 FROM memories m WHERE m.id = aml.target_id)
+                     ON CONFLICT (source_id, target_id, relation) DO NOTHING
+                     RETURNING source_id, target_id, relation, valid_from, valid_until",
+                )
+                .bind(id)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("archive_restore restore links", e))?;
+
+                // #2315 — re-PROJECT the restored edges into the AGE `memory_graph`.
+                // Every delete path unprojects (forget / delete / consolidate / gc /
+                // size_gc / archive_by_ids), but restore previously re-inserted the
+                // relational rows WITHOUT re-projecting, so an AGE-routed kg_query
+                // permanently missed restored edges (the CTE fallback fires only on
+                // AGE runtime failure, never on a valid-but-empty result) — a
+                // split-brain with no self-heal. Deferred mode enqueues the outbox
+                // rows in THIS tx (the drainer's existence re-check tolerates any
+                // later delete); sync mode MERGEs via a SAVEPOINT so an AGE runtime
+                // failure degrades to a WARN instead of failing the relational
+                // restore (#700/#1542 posture — the graph is derived data; the
+                // restore of the durable rows must never be blocked by it).
+                if matches!(self.kg_backend, KgBackend::Age) {
+                    for (src, dst, rel, valid_from, valid_until) in &restored_edges {
+                        if matches!(
+                            crate::config::age_projection_mode(),
+                            crate::config::AgeProjectionMode::Deferred
+                        ) {
+                            // Deferred: the drainer re-reads validity from memory_links
+                            // (#2377 FIX #9) at drain time, so no validity is threaded here.
+                            sqlx::query(
+                                "INSERT INTO kg_projection_outbox (source_id, target_id, relation) \
+                                 VALUES ($1, $2, $3)",
+                            )
+                            .bind(src)
+                            .bind(dst)
+                            .bind(rel)
+                            .execute(&mut *tx)
+                            .await
+                            .map_err(|e| {
+                                to_store_err("archive_restore enqueue kg_projection_outbox", e)
+                            })?;
+                        } else {
+                            sqlx::query("SAVEPOINT age_restore_projection")
+                                .execute(&mut *tx)
+                                .await
+                                .map_err(|e| to_store_err("savepoint age_restore_projection", e))?;
+                            // #2377 (FIX #9) — carry the restored edge's validity.
+                            let vf_str = valid_from.map(|t| t.to_rfc3339());
+                            let vu_str = valid_until.map(|t| t.to_rfc3339());
+                            match project_link_into_age(
+                                &mut tx,
+                                src,
+                                dst,
+                                rel,
+                                vf_str.as_deref(),
+                                vu_str.as_deref(),
+                            )
+                            .await
+                            {
+                                Ok(()) => {
+                                    sqlx::query("RELEASE SAVEPOINT age_restore_projection")
+                                        .execute(&mut *tx)
+                                        .await
+                                        .map_err(|e| {
+                                            to_store_err(
+                                                "release savepoint age_restore_projection",
+                                                e,
+                                            )
+                                        })?;
+                                }
+                                Err(e) if is_age_runtime_failure(&e) => {
+                                    sqlx::query("ROLLBACK TO SAVEPOINT age_restore_projection")
+                                        .execute(&mut *tx)
+                                        .await
+                                        .map_err(|e2| {
+                                            to_store_err(
+                                                "rollback savepoint age_restore_projection",
+                                                e2,
+                                            )
+                                        })?;
+                                    // #3883 (A1) — was WARN-only; now RECORD.
+                                    record_failed_age_projection(
+                                        &mut tx,
+                                        "archive_restore",
+                                        src,
+                                        dst,
+                                        rel,
+                                        &e,
+                                    )
+                                    .await?;
+                                }
+                                Err(e) => return Err(e),
+                            }
+                        }
+                    }
+                }
+
+                sqlx::query(SQL_DELETE_ARCHIVED_MEMORY_BY_ID)
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| to_store_err("archive_restore delete", e))?;
+
+                tx.commit()
+                    .await
+                    .map_err(|e| to_store_err("archive_restore commit", e))?;
+                Ok(true)
+            }
+            .await;
+            match attempt {
+                Ok(v) => break v,
+                Err(e) => retry.consider(e).await?,
+            }
+        };
+
+        Ok(restored)
+    }
+}
+
 #[async_trait]
 impl MemoryStore for PostgresStore {
     async fn write_durability(&self) -> StoreResult<crate::write_receipt::WriteDurability> {
@@ -25187,18 +25670,22 @@ impl MemoryStore for PostgresStore {
         // wholesale-preserved any string leaf under a `*_b64` key, so a
         // credential-shaped catchup-pull leaf egressed verbatim. Local
         // `store` / `store_batch` keep the TrustedByName storage screen.
-        let tombstoned: bool = sqlx::query_scalar(federation_3075::SQL_FORGET_TOMBSTONE_EXISTS)
-            .bind(&memory.id)
-            .fetch_one(&self.pool)
+        //
+        // v1.0.0 #4029 (SEC, erasure) — the G30 probe no longer reads the
+        // POOL before the write transaction (a forget / hard delete committing
+        // between that negative read and the INSERT left a live row beside its
+        // tombstone). The transaction is opened FIRST, the admission advisory
+        // locks every tombstone-writing erasure contends on are taken, and the
+        // probe runs inside it — see `tombstone_serial_4029`.
+        let mut tx = self
+            .pool
+            .begin()
             .await
-            .map_err(|e| to_store_err("apply_remote_memory tombstone check", e))?;
-        if tombstoned {
-            tracing::info!(
-                target: crate::storage::FORGET_TOMBSTONE_TRACE_TARGET,
-                memory_id = %memory.id,
-                "{}",
-                crate::storage::FORGET_TOMBSTONE_DROP_MSG
-            );
+            .map_err(|e| to_store_err("begin apply_remote_memory tx", e))?;
+        if tombstone_serial_4029::admit_or_tombstoned(&mut tx, &memory.id)
+            .await
+            .map_err(|e| to_store_err("apply_remote_memory tombstone gate", e))?
+        {
             return Ok(memory.id.clone());
         }
         let screened = crate::secret_screen::redact_memory_for_receive(memory);
@@ -25306,12 +25793,8 @@ impl MemoryStore for PostgresStore {
         // transaction so the seal pre-read, the newer-wins upsert, and the
         // envelope-owner reconcile are ONE atomic unit. Pre-#2383 this funnel
         // executed a bare `fetch_one(&self.pool)` with no tx, so a repair could
-        // not have been rolled back with the write it repairs.
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| to_store_err("begin apply_remote_memory tx", e))?;
+        // not have been rolled back with the write it repairs. (#4029: `tx` is
+        // opened above, before the tombstone probe.)
         // #2954 — armed-only pre-image of the `(title, namespace)` row this
         // upsert may overwrite, `SELECT … FOR UPDATE` inside this tx so the
         // probe and the newer-wins upsert are atomic under READ COMMITTED (the
@@ -25708,19 +26191,19 @@ impl MemoryStore for PostgresStore {
         // v0.8.1 W2.3 (#1821 / gap G30) — resurrection guard (postgres parity
         // with the sqlite insert_if_newer gate). DROP an inbound write for a
         // tombstoned id (tombstone-wins) so a peer cannot revive a forgotten
-        // row via LWW.
-        let tombstoned: bool = sqlx::query_scalar(federation_3075::SQL_FORGET_TOMBSTONE_EXISTS)
-            .bind(&inbound.id)
-            .fetch_one(&self.pool)
+        // row via LWW. #4029 — inside the merge transaction, after the
+        // admission advisory locks (see `tombstone_serial_4029`); the
+        // no-row fall-through re-runs the guard under `apply_remote_memory`'s
+        // own locks.
+        let mut tx = self
+            .pool
+            .begin()
             .await
-            .map_err(|e| to_store_err("merge_inbound tombstone check", e))?;
-        if tombstoned {
-            tracing::info!(
-                target: crate::storage::FORGET_TOMBSTONE_TRACE_TARGET,
-                memory_id = %inbound.id,
-                "{}",
-                crate::storage::FORGET_TOMBSTONE_DROP_MSG
-            );
+            .map_err(|e| to_store_err("merge_inbound begin tx", e))?;
+        if tombstone_serial_4029::admit_or_tombstoned(&mut tx, &inbound.id)
+            .await
+            .map_err(|e| to_store_err("merge_inbound tombstone gate", e))?
+        {
             return Ok(inbound.id.clone());
         }
 
@@ -25756,11 +26239,7 @@ impl MemoryStore for PostgresStore {
         // is computed from the row actually being overwritten — a local rewind
         // or release that commits while this peer write is in flight is either
         // seen here or waits for it; never undone from a stale snapshot.
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| to_store_err("merge_inbound begin tx", e))?;
+        // (#4029: `tx` is opened above, before the tombstone probe.)
         let existing_row = sqlx::query(&SQL_SELECT_MEMORY_ROW_BY_ID_FOR_UPDATE)
             .bind(&inbound.id)
             .fetch_optional(&mut *tx)
@@ -28284,6 +28763,15 @@ impl MemoryStore for PostgresStore {
                 // THIS tx. 5-agent vote 4d3ea1c5.
                 if !deleted.is_empty() {
                     let ids: Vec<String> = deleted.iter().map(|(id, _, _)| id.clone()).collect();
+                    // v1.0.0 #4029 — the erasure side of the admission protocol,
+                    // before the tombstones below commit. Taken after the DELETE
+                    // (the victim set is only known from its RETURNING): a genuine
+                    // same-id race with an in-flight admission resolves as a
+                    // `40P01` deadlock this funnel's `TxRetry` retries — never a
+                    // live row beside its tombstone.
+                    tombstone_serial_4029::lock_erasure(&mut tx, &ids)
+                        .await
+                        .map_err(|e| to_store_err("forget erasure lock", e))?;
                     // #3286 — route through the shared SSOT so this forget reap and the
                     // delete / evict primitives cannot drift on which remanence tables
                     // a crypto-erase purges.
@@ -31226,456 +31714,7 @@ impl MemoryStore for PostgresStore {
     }
 
     async fn archive_restore(&self, ctx: &CallerContext, id: &str) -> StoreResult<bool> {
-        self.gate_record_stop().await?;
-        // v1.0.0 #3520 — routed through the shared bounded-retry funnel. Restore
-        // is the archive family's inverse (archived-row read + live INSERT +
-        // preserved-edge re-insert + archive DELETE), so it holds the same
-        // multi-relation lock set that a concurrent bootstrap's
-        // `CREATE INDEX IF NOT EXISTS` deadlocks against. An early `return`
-        // inside the block exits THIS attempt with that verdict, which the loop
-        // then yields unchanged — a not-found restore is still `Ok(false)`.
-        let mut retry = tx_retry::TxRetry::new("archive_restore tx");
-        let restored: bool = loop {
-            let attempt: StoreResult<bool> = async {
-                let mut tx = self
-                    .pool
-                    .begin()
-                    .await
-                    .map_err(|e| to_store_err("begin archive_restore tx", e))?;
-
-                // v1.0.0 #3271 (SECURITY-high) — SAL-side caller-owns gate, the
-                // archive-RESTORE sibling of the #3193 `archive_by_ids` gate. Pre-fix
-                // this funnel discarded its `_ctx` and matched on `WHERE id = $1` with
-                // NO owner predicate, so on a postgres-backed daemon ANY authenticated
-                // tenant could `POST /api/v1/archive/{victim's id}/restore` and pull a
-                // DIFFERENT tenant's deliberately-archived row back into the live set —
-                // and the 200-vs-404 split was an enumeration oracle over other
-                // tenants' archived ids (the sqlite twin has refused via
-                // `db::restore_archived_for_caller` since #940; #3193 fixed only the
-                // archive side of this class). The existence probe now carries the
-                // three-way owner predicate (owner OR inbox-target), so a non-owner
-                // sees the SAME `Ok(false)` a truly-absent id gives → the handler's
-                // 404 `NOT_FOUND_IN_ARCHIVE`, no oracle. Admin/operator lanes
-                // (`ctx.bypass_visibility`) round-trip regardless of ownership, exactly
-                // as they do on update / delete / archive.
-                //
-                // #3124 — the ownership verdict is the ONE cross-backend predicate:
-                // the probe reads the row's owner stamp (typed by `jsonb_typeof`, so a
-                // malformed owner is never mistaken for a stamp OR for unstamped) and
-                // decides in Rust — owner, inbox recipient of a STAMPED row, or an
-                // UNSTAMPED row admitted by `AI_MEMORY_UNSTAMPED_MUTATION` (`warn`, the
-                // pre-#3124 outcome, WARNs + counts; `refuse` refuses). A refusal is
-                // the same `Ok(false)` an absent id gives — still no oracle.
-                // `admit_unstamped_row` feeds the INSERT's defense-in-depth arm so the
-                // write predicate and this verdict cannot disagree.
-                let mut admit_unstamped_row = false;
-                if ctx.bypass_visibility {
-                    let exists: Option<(String,)> =
-                        sqlx::query_as("SELECT id FROM archived_memories WHERE id = $1")
-                            .bind(id)
-                            .fetch_optional(&mut *tx)
-                            .await
-                            .map_err(|e| to_store_err("archive_restore lookup", e))?;
-                    if exists.is_none() {
-                        return Ok(false);
-                    }
-                } else {
-                    let probe: Option<(Option<String>, Option<String>, Option<String>)> =
-                        sqlx::query_as(
-                            "SELECT jsonb_typeof(metadata->'agent_id'), metadata->>'agent_id', \
-                             metadata->>'target_agent_id' \
-                             FROM archived_memories WHERE id = $1",
-                        )
-                        .bind(id)
-                        .fetch_optional(&mut *tx)
-                        .await
-                        .map_err(|e| to_store_err("archive_restore owner lookup", e))?;
-                    let Some((owner_type, owner, inbox)) = probe else {
-                        return Ok(false);
-                    };
-                    let caller = ctx.effective_principal();
-                    let stamp = crate::identity::owner_stamp::OwnerStamp::of_pg(
-                        owner_type.as_deref(),
-                        owner.as_deref(),
-                    );
-                    let admitted = if stamp.is_unstamped() {
-                        admit_unstamped_row = crate::identity::owner_stamp::admit_unstamped(
-                            crate::identity::owner_stamp::MutationSite::postgres(
-                                crate::identity::owner_stamp::funnel::RESTORE,
-                            ),
-                            id,
-                            caller,
-                        );
-                        admit_unstamped_row
-                    } else {
-                        stamp.is_owned_by(caller)
-                            || inbox
-                                .as_deref()
-                                .is_some_and(|t| !t.is_empty() && t == caller)
-                    };
-                    if !admitted {
-                        return Ok(false);
-                    }
-                }
-
-                // #1848 reconciled to #1771 (5-agent vote 4d3ea1c5, option B): this is
-                // the OPERATOR un-forget path, so NO tombstone gate here — an authorized
-                // restore round-trips per #1771.
-                //
-                // #3075 — the ORIGINAL justification for that omission was "federation
-                // /sync/push restores[] are sqlite-only per federation_signing_check.rs,
-                // never PostgresStore". That premise is RETIRED: the postgres receiver
-                // now applies `restores[]`. The omission stands anyway, on the #1771
-                // reasoning alone — but the G30 gate the federated lane needs is no
-                // longer absent, it MOVED: it lives on `apply_remote_restore`
-                // (`postgres/federation_3075.rs`), which runs it BEFORE composing this
-                // method. Do NOT "fix" the two by merging them: gating here would break
-                // the documented operator un-forget capability on both backends.
-
-                // Reject if the id is already in active memories.
-                let active: Option<(String,)> = sqlx::query_as(SQL_SELECT_MEMORY_ID_BY_ID)
-                    .bind(id)
-                    .fetch_optional(&mut *tx)
-                    .await
-                    .map_err(|e| to_store_err("archive_restore active lookup", e))?;
-                if active.is_some() {
-                    return Err(StoreError::Conflict { id: id.to_string() });
-                }
-
-                // FX-C5 — substrate governance pre-write hook parity. Restoring
-                // an archived row mints a fresh live row via a raw INSERT...SELECT
-                // that bypasses `PostgresStore::store(..)` (which is where ARCH-1
-                // wired in the `consult_governance_pre_write_pg` adapter at
-                // line 7001). Without this call, an operator's signed governance
-                // rule could be bypassed by restoring a row whose `(title,
-                // namespace)` would otherwise be refused on a direct write.
-                // Load the archived row shaped as a `Memory` and fire the hook
-                // BEFORE the INSERT lands.
-                let candidate = Self::load_archived_as_memory_pg(&mut *tx, id).await?;
-                // #3124 — an UNSTAMPED row the owner probe above already admitted
-                // (and reported) is not re-decided here: re-running the policy would
-                // WARN + count the same restore twice. Every other row is re-checked
-                // against the loaded candidate (same row, same single predicate).
-                if !ctx.bypass_visibility
-                    && !admit_unstamped_row
-                    && !crate::visibility::caller_owns_for_mutation(
-                        &candidate,
-                        ctx.effective_principal(),
-                        true,
-                        crate::identity::owner_stamp::MutationSite::postgres(
-                            crate::identity::owner_stamp::funnel::RESTORE,
-                        ),
-                    )
-                {
-                    return Ok(false);
-                }
-                consult_governance_pre_write_pg(&candidate)?;
-                // #2110/#2113 audit — TRACT covenant clause 1 on the archive-RESTORE
-                // funnel. Advisory-only (never refuses): a legacy archived row that
-                // predates the covenant must stay restorable even under
-                // AI_MEMORY_REQUIRE_WHY_TRACE=1 (postgres parity with the sqlite
-                // `restore_archived` inbound gate).
-                crate::storage::consult_why_trace_gate_inbound(&candidate);
-
-                // v0.9.0 G8 (#1825) — re-mint the row's genesis content-id from the
-                // archived row's ORIGINAL identity + PLAINTEXT content (decrypting the
-                // archived envelope when present, falling back to the stored content
-                // on any decrypt error) so the restored live row carries the same
-                // `b3:` address it held before archival. created_at / title /
-                // namespace / kind are the ORIGINAL archived values (via `candidate`),
-                // NOT NOW(). Mirrors the sqlite `restored_cid_stamp` path.
-                let restored_cid = {
-                    let agent_id = candidate
-                        .metadata
-                        .get("agent_id")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("")
-                        .to_string();
-                    let (raw_content, envelope): (String, Option<Vec<u8>>) = sqlx::query_as(
-                        "SELECT content, encrypted_envelope FROM archived_memories WHERE id = $1",
-                    )
-                    .bind(id)
-                    .fetch_one(&mut *tx)
-                    .await
-                    .map_err(|e| to_store_err("archive_restore load plaintext for cid", e))?;
-                    let plaintext = match envelope {
-                        Some(env) => {
-                            crate::encryption::open_content(&env, &agent_id).unwrap_or(raw_content)
-                        }
-                        None => raw_content,
-                    };
-                    crate::identity::cid::stamp_cid(
-                        &agent_id,
-                        &candidate.namespace,
-                        &candidate.title,
-                        candidate.memory_kind.as_str(),
-                        &candidate.created_at,
-                        &plaintext,
-                    )
-                };
-
-                let now = chrono::Utc::now();
-                // #1025 (CRITICAL, 2026-05-21) — full v0.7.0 column carry on
-                // archive→restore. Pre-#1025 the SELECT pulled only 17 columns
-                // from archived_memories, so the restored row landed in
-                // memories with reflection_depth=0, memory_kind='observation'
-                // (the live-table DEFAULT), citations=[], version=1, etc. —
-                // silent loss of provenance + persona + confidence calibration.
-                // Now copies all 26 v0.7.0 fields (with COALESCE defaults for
-                // pre-#1025 archived rows where the columns are NULL).
-                sqlx::query(
-                    "INSERT INTO memories (
-                        id, tier, namespace, title, content, tags, priority, confidence,
-                        source, access_count, created_at, updated_at, last_accessed_at,
-                        expires_at, metadata, embedding, embedding_dim, embedding_space,
-                        reflection_depth, atomised_into, atom_of, memory_kind,
-                        entity_id, persona_version, citations, source_uri, source_span,
-                        confidence_source, confidence_signals, confidence_decayed_at,
-                        mentioned_entity_id, version, lifecycle_state, encrypted_envelope,
-                        cid, cid_genesis, kind_provenance, valid_from, valid_until
-                    )
-                    SELECT id, COALESCE(original_tier, 'long'), namespace, title, content,
-                           tags, priority, confidence, source, access_count, created_at,
-                           $1::timestamptz, last_accessed_at, original_expires_at, metadata,
-                           -- v1.0.0 #2167 (S8) restore/migrate HEAL (postgres twin):
-                           -- keep the archived vector ONLY when its space matches the
-                           -- live active space ($5); a foreign- or NULL-space vector
-                           -- has its whole trio NULLed so the boot backfill re-embeds
-                           -- from the durable text under the LIVE space (self-heal).
-                           -- $5 NULL (no active embedder in this process) keeps any
-                           -- STAMPED vector but still drops an unverifiable NULL one.
-                           CASE WHEN embedding_space IS NOT NULL
-                                     AND ($5::text IS NULL OR embedding_space = $5)
-                                THEN embedding ELSE NULL END,
-                           CASE WHEN embedding_space IS NOT NULL
-                                     AND ($5::text IS NULL OR embedding_space = $5)
-                                THEN embedding_dim ELSE NULL END,
-                           CASE WHEN embedding_space IS NOT NULL
-                                     AND ($5::text IS NULL OR embedding_space = $5)
-                                THEN embedding_space ELSE NULL END,
-                           COALESCE(reflection_depth, 0),
-                           atomised_into,
-                           atom_of,
-                           COALESCE(memory_kind, 'observation'),
-                           entity_id, persona_version,
-                           COALESCE(citations, '[]'),
-                           source_uri, source_span,
-                           COALESCE(confidence_source, 'caller_provided'),
-                           confidence_signals, confidence_decayed_at,
-                           mentioned_entity_id,
-                           COALESCE(version, 1),
-                           COALESCE(lifecycle_state, 'open'),
-                           encrypted_envelope,
-                           -- v1.0.0 #2385 — the STORED genesis identity WINS. Pre-#2385
-                           -- `archived_memories` had no cid columns, so restore
-                           -- unconditionally bound the re-mint ($3/$4) recomputed from six
-                           -- reconstructed inputs (agent_id / namespace / title / kind /
-                           -- created_at / decrypted plaintext) — and a decrypt failure
-                           -- there falls back to the CIPHERTEXT placeholder. Any drift
-                           -- silently re-addressed the durable row and dangled every
-                           -- `memory_links.source_cid` / `target_cid` mirror. The v90
-                           -- columns make the identity a CARRIED fact; the re-mint is now
-                           -- the legacy fallback for pre-v90 archive rows only.
-                           -- The PAIR is selected atomically (the #2395 lesson applied
-                           -- here): `cid_genesis` is the canonical PRE-IMAGE of `cid`, so
-                           -- mixing a carried address with a re-derived pre-image would
-                           -- produce a row whose own verify disagrees with itself.
-                           CASE WHEN cid IS NOT NULL THEN cid ELSE $3::text END,
-                           CASE WHEN cid IS NOT NULL THEN cid_genesis ELSE $4::bytea END,
-                           -- v1.0.0 #2333 (FBL-03 pg mirror) — carry kind_provenance
-                           -- back on restore; legacy pre-v87 archive rows re-derive
-                           -- it from the metadata carrier, vocab-guarded (sqlite twin).
-                           COALESCE(kind_provenance,
-                                    CASE WHEN metadata->>'kind_provenance' IN
-                                              ('declared','channel_derived','regex','llm')
-                                         THEN metadata->>'kind_provenance' END),
-                           valid_from, valid_until
-                    FROM archived_memories WHERE id = $2
-                      -- v1.0.0 #3271 — owner-predicated write (defense-in-depth with
-                      -- the owner probe above; same predicate). $6 bypass
-                      -- short-circuits the owner/inbox/legacy arms so operator lanes
-                      -- still round-trip any row. #3124: owner equality is typed
-                      -- (a malformed non-string owner never matches), the inbox arm
-                      -- needs a STAMPED row, and the unstamped arm is live only when
-                      -- the probe's `AI_MEMORY_UNSTAMPED_MUTATION` verdict admitted
-                      -- it ($8) — the same ONE predicate as the sqlite
-                      -- `db::restore_archived_for_caller`.
-                      AND ($6::bool
-                           OR (jsonb_typeof(metadata->'agent_id') = 'string'
-                               AND metadata->>'agent_id' = $7)
-                           OR (metadata->>'target_agent_id' = $7
-                               AND metadata->>'agent_id' IS NOT NULL
-                               AND metadata->>'agent_id' <> '')
-                           OR ($8::bool
-                               AND (metadata->>'agent_id' IS NULL
-                                    OR metadata->>'agent_id' = '')))",
-                )
-                .bind(now)
-                .bind(id)
-                .bind(&restored_cid.cid)
-                .bind(&restored_cid.genesis)
-                // v1.0.0 #2167 (S8) — $5: the process-wide active-space fp (NULL when
-                // this process resolved no embedder) driving the restore heal above.
-                .bind(crate::embeddings::active_embedding_space())
-                .bind(ctx.bypass_visibility)
-                .bind(ctx.effective_principal())
-                // #3124 — $8: the probe's unstamped-row verdict.
-                .bind(admit_unstamped_row)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| to_store_err("archive_restore insert", e))?;
-
-                // #1771 (5-agent vote 4d3ea1c5) — re-insert this memory's preserved
-                // `archived_memory_links` edges back into `memory_links`, AFTER the
-                // memory row is restored above and within the same tx. Only edges
-                // whose BOTH endpoints currently exist in `memories` are restored —
-                // `memory_links` carries an `ON DELETE CASCADE` FK on both
-                // endpoints, so an edge whose OTHER endpoint is permanently gone
-                // would be rejected (and is correctly skipped here). Idempotent via
-                // the PK `ON CONFLICT`. Postgres twin of the SQLite
-                // `restore_links_for_memory` re-insert.
-                // #2315 — RETURNING the actually-restored edges so they can be
-                // re-projected into the AGE graph below (only edges this INSERT
-                // landed; ON CONFLICT skips report nothing, which is correct —
-                // an already-present edge is already projected or queued).
-                // #2377 (FIX #9) — RETURNING carries `valid_from`/`valid_until` too so a
-                // restored already-invalidated edge re-projects into AGE ALREADY-carrying
-                // its validity (else the current-view Cypher reads would serve it as VALID).
-                let restored_edges: Vec<(
-                    String,
-                    String,
-                    String,
-                    Option<DateTime<Utc>>,
-                    Option<DateTime<Utc>>,
-                )> = sqlx::query_as(
-                    "INSERT INTO memory_links (
-                         source_id, target_id, relation, created_at, valid_from,
-                         valid_until, observed_by, signature, attest_level,
-                         source_cid, target_cid
-                     )
-                     SELECT aml.source_id, aml.target_id, aml.relation, aml.created_at,
-                            aml.valid_from, aml.valid_until, aml.observed_by,
-                            aml.signature, aml.attest_level,
-                            aml.source_cid, aml.target_cid
-                     FROM archived_memory_links aml
-                     WHERE (aml.source_id = $1 OR aml.target_id = $1)
-                       AND EXISTS (SELECT 1 FROM memories m WHERE m.id = aml.source_id)
-                       AND EXISTS (SELECT 1 FROM memories m WHERE m.id = aml.target_id)
-                     ON CONFLICT (source_id, target_id, relation) DO NOTHING
-                     RETURNING source_id, target_id, relation, valid_from, valid_until",
-                )
-                .bind(id)
-                .fetch_all(&mut *tx)
-                .await
-                .map_err(|e| to_store_err("archive_restore restore links", e))?;
-
-                // #2315 — re-PROJECT the restored edges into the AGE `memory_graph`.
-                // Every delete path unprojects (forget / delete / consolidate / gc /
-                // size_gc / archive_by_ids), but restore previously re-inserted the
-                // relational rows WITHOUT re-projecting, so an AGE-routed kg_query
-                // permanently missed restored edges (the CTE fallback fires only on
-                // AGE runtime failure, never on a valid-but-empty result) — a
-                // split-brain with no self-heal. Deferred mode enqueues the outbox
-                // rows in THIS tx (the drainer's existence re-check tolerates any
-                // later delete); sync mode MERGEs via a SAVEPOINT so an AGE runtime
-                // failure degrades to a WARN instead of failing the relational
-                // restore (#700/#1542 posture — the graph is derived data; the
-                // restore of the durable rows must never be blocked by it).
-                if matches!(self.kg_backend, KgBackend::Age) {
-                    for (src, dst, rel, valid_from, valid_until) in &restored_edges {
-                        if matches!(
-                            crate::config::age_projection_mode(),
-                            crate::config::AgeProjectionMode::Deferred
-                        ) {
-                            // Deferred: the drainer re-reads validity from memory_links
-                            // (#2377 FIX #9) at drain time, so no validity is threaded here.
-                            sqlx::query(
-                                "INSERT INTO kg_projection_outbox (source_id, target_id, relation) \
-                                 VALUES ($1, $2, $3)",
-                            )
-                            .bind(src)
-                            .bind(dst)
-                            .bind(rel)
-                            .execute(&mut *tx)
-                            .await
-                            .map_err(|e| {
-                                to_store_err("archive_restore enqueue kg_projection_outbox", e)
-                            })?;
-                        } else {
-                            sqlx::query("SAVEPOINT age_restore_projection")
-                                .execute(&mut *tx)
-                                .await
-                                .map_err(|e| to_store_err("savepoint age_restore_projection", e))?;
-                            // #2377 (FIX #9) — carry the restored edge's validity.
-                            let vf_str = valid_from.map(|t| t.to_rfc3339());
-                            let vu_str = valid_until.map(|t| t.to_rfc3339());
-                            match project_link_into_age(
-                                &mut tx,
-                                src,
-                                dst,
-                                rel,
-                                vf_str.as_deref(),
-                                vu_str.as_deref(),
-                            )
-                            .await
-                            {
-                                Ok(()) => {
-                                    sqlx::query("RELEASE SAVEPOINT age_restore_projection")
-                                        .execute(&mut *tx)
-                                        .await
-                                        .map_err(|e| {
-                                            to_store_err(
-                                                "release savepoint age_restore_projection",
-                                                e,
-                                            )
-                                        })?;
-                                }
-                                Err(e) if is_age_runtime_failure(&e) => {
-                                    sqlx::query("ROLLBACK TO SAVEPOINT age_restore_projection")
-                                        .execute(&mut *tx)
-                                        .await
-                                        .map_err(|e2| {
-                                            to_store_err(
-                                                "rollback savepoint age_restore_projection",
-                                                e2,
-                                            )
-                                        })?;
-                                    // #3883 (A1) — was WARN-only; now RECORD.
-                                    record_failed_age_projection(
-                                        &mut tx,
-                                        "archive_restore",
-                                        src,
-                                        dst,
-                                        rel,
-                                        &e,
-                                    )
-                                    .await?;
-                                }
-                                Err(e) => return Err(e),
-                            }
-                        }
-                    }
-                }
-
-                sqlx::query(SQL_DELETE_ARCHIVED_MEMORY_BY_ID)
-                    .bind(id)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(|e| to_store_err("archive_restore delete", e))?;
-
-                tx.commit()
-                    .await
-                    .map_err(|e| to_store_err("archive_restore commit", e))?;
-                Ok(true)
-            }
-            .await;
-            match attempt {
-                Ok(v) => break v,
-                Err(e) => retry.consider(e).await?,
-            }
-        };
-
-        Ok(restored)
+        self.archive_restore_gated(ctx, id, false).await
     }
 
     async fn archive_purge(

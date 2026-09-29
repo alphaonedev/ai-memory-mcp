@@ -236,6 +236,13 @@ pub(crate) async fn evict_tombstone_and_erase_in_tx(
     }
     let ids: Vec<String> = victims.iter().map(|(id, _, _)| id.clone()).collect();
 
+    // (0) v1.0.0 #4029 — the erasure side of the admission-vs-erasure
+    // advisory-lock protocol, before this transaction's tombstones commit, so
+    // a concurrent federation admission can never land a live row beside one.
+    crate::store::postgres::tombstone_serial_4029::lock_erasure(tx, &ids)
+        .await
+        .map_err(|e| to_store_err("evict erasure lock", e))?;
+
     // (1) Crypto-erase the per-record envelope keys. `get_byte(...,0) = 3`
     // selects ONLY the per-record scheme (mirrors the `forget` twin).
     // RETURNING id so each victim's erasure KIND is known below.
