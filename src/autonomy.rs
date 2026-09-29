@@ -794,6 +794,21 @@ fn consolidate_cluster(
         }
         other => other,
     };
+    // #4174 — a dry run previews WHICH clusters would merge; it never
+    // generates the summary. It returns before the summariser, so a dry
+    // run pays no generative call (cost, latency, egress) and cannot fail
+    // on a summariser error. The merge judge above still runs, because its
+    // answer is part of what the preview reports.
+    if dry_run {
+        return Ok(ClusterStep::Done(ClusterOutcome {
+            entry: RollbackEntry::Consolidate {
+                originals: cluster.to_vec(),
+                result_id: "dry-run".to_string(),
+            },
+            persisted: false,
+            judge,
+        }));
+    }
     let summary = llm.summarize_memories(&input)?;
     // Prefix the consolidated title so it never collides with one of
     // the source memories' (title, namespace) UNIQUE key. Source
@@ -805,17 +820,6 @@ fn consolidate_cluster(
         .next()
         .unwrap_or("(consolidated)");
     let title = format!("[consolidated] {base_title}");
-
-    if dry_run {
-        return Ok(ClusterStep::Done(ClusterOutcome {
-            entry: RollbackEntry::Consolidate {
-                originals: cluster.to_vec(),
-                result_id: "dry-run".to_string(),
-            },
-            persisted: false,
-            judge,
-        }));
-    }
 
     let ids: Vec<String> = cluster.iter().map(|m| m.id.clone()).collect();
     let namespace = cluster[0].namespace.clone();
@@ -3526,6 +3530,27 @@ mod tests {
             .unwrap();
         }
         vec![a, b]
+    }
+
+    /// #4174 — a dry run never calls the generative summariser. RED on
+    /// 65642b3cf, where `summarize_memories` ran before the `dry_run`
+    /// return (one call per cluster). The control is a live run over the
+    /// same cluster, which DOES summarise, so the count is not trivially 0.
+    #[test]
+    fn dry_run_never_calls_the_summariser_4174() {
+        let (_tmp, conn) = setup_conn();
+        let cluster = seed_mergeable_pair(&conn, "dry-4174");
+        let llm = StubLlm::new("never generated");
+        let outcome = consolidate_cluster(&conn, &llm, &cluster, true)
+            .unwrap()
+            .into_outcome()
+            .expect("dry run returns an entry");
+        assert!(!outcome.persisted);
+        assert_eq!(summarize_calls(&llm), 0, "a dry run must not summarise");
+
+        let live = StubLlm::new("generated");
+        consolidate_cluster(&conn, &live, &cluster, false).unwrap();
+        assert_eq!(summarize_calls(&live), 1, "control: a live run summarises");
     }
 
     fn summarize_calls(llm: &StubLlm) -> usize {
