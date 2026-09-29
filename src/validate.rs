@@ -16,6 +16,14 @@ const MAX_NAMESPACE_LEN: usize = 512;
 const MAX_SOURCE_LEN: usize = 64;
 const MAX_TAG_LEN: usize = 128;
 const MAX_TAGS_COUNT: usize = 50;
+/// v1.0.0 #4032 — the REPLICATED-state tag cap: the bound on a FULL row
+/// (federation receive, sync pull, import), distinct from the authored-input
+/// cap [`MAX_TAGS_COUNT`] a create/update request is held to. The CRDT tag
+/// join (`models::crdt_merge`) is bounded by exactly this value, so a merged
+/// row is always valid at every receiver — the representation is closed
+/// under the join. 512 x 128-byte tags keeps a row far inside the 2 MiB
+/// `/sync/push` body limit.
+pub const MAX_REPLICATED_TAGS: usize = 512;
 const MAX_RELATION_LEN: usize = 64;
 const MAX_ID_LEN: usize = 128;
 const MAX_AGENT_ID_LEN: usize = 128;
@@ -25,6 +33,11 @@ const MAX_AGENT_ID_LEN: usize = 128;
 /// decode work a hostile caller can force (#626 Layer-3 attestation).
 const MAX_AGENT_PUBKEY_B64_LEN: usize = 128;
 const MAX_METADATA_SIZE: usize = 65_536;
+/// v1.0.0 #4032 — the REPLICATED-state metadata cap (serialized bytes) for a
+/// FULL row; the authored-input cap stays [`MAX_METADATA_SIZE`]. The CRDT
+/// metadata join degrades to the row-LWW winner's metadata before exceeding
+/// it, so a merged row is always relayable.
+pub const MAX_REPLICATED_METADATA_SIZE: usize = 512 * 1024;
 const MAX_METADATA_DEPTH: usize = 32;
 /// Maximum caller-controlled relative time window (approximately 100 years).
 /// Keeps `chrono` duration construction and timestamp subtraction bounded.
@@ -653,8 +666,14 @@ pub fn validate_capabilities(caps: &[String]) -> Result<()> {
 }
 
 pub fn validate_tags(tags: &[String]) -> Result<()> {
-    if tags.len() > MAX_TAGS_COUNT {
-        bail!("too many tags (max {MAX_TAGS_COUNT})");
+    validate_tags_bounded(tags, MAX_TAGS_COUNT)
+}
+
+/// [`validate_tags`] against an explicit count cap — the authored-input cap
+/// for requests, [`MAX_REPLICATED_TAGS`] for a full replicated row (#4032).
+fn validate_tags_bounded(tags: &[String], max_count: usize) -> Result<()> {
+    if tags.len() > max_count {
+        bail!("too many tags (max {max_count})");
     }
     for tag in tags {
         let trimmed = tag.trim();
@@ -776,14 +795,21 @@ pub fn checked_days_ago(
 }
 
 pub fn validate_metadata(metadata: &serde_json::Value) -> Result<()> {
+    validate_metadata_bounded(metadata, MAX_METADATA_SIZE)
+}
+
+/// [`validate_metadata`] against an explicit size cap — the authored-input
+/// cap for requests, [`MAX_REPLICATED_METADATA_SIZE`] for a full replicated
+/// row (#4032).
+fn validate_metadata_bounded(metadata: &serde_json::Value, max_size: usize) -> Result<()> {
     if !metadata.is_object() {
         bail!("metadata must be a JSON object");
     }
     let serialized = serde_json::to_string(metadata)
         .map_err(|e| anyhow::anyhow!("metadata is not valid JSON: {e}"))?;
-    if serialized.len() > MAX_METADATA_SIZE {
+    if serialized.len() > max_size {
         bail!(
-            "metadata exceeds max size of {MAX_METADATA_SIZE} bytes (got {})",
+            "metadata exceeds max size of {max_size} bytes (got {})",
             serialized.len()
         );
     }
@@ -1304,14 +1330,23 @@ pub fn validate_lifecycle_state(state: Option<&str>) -> Result<()> {
     }
 }
 
-/// Validate a full Memory (used for import).
+/// Validate a full Memory — RETAINED / replicated state (import, federation
+/// receive, sync pull), never an authored request.
+///
+/// v1.0.0 #4032 — a full row is held to the REPLICATED-state caps
+/// ([`MAX_REPLICATED_TAGS`], [`MAX_REPLICATED_METADATA_SIZE`]), not the
+/// authored-input caps: a CRDT merge of two individually valid rows unions
+/// their tags and metadata keys, and a receiver that validated the joined row
+/// against the authored caps refused to relay it, stranding the state. The
+/// merge is bounded by exactly these caps, so the representation is closed
+/// under the join. Every other rule is unchanged.
 pub fn validate_memory(mem: &Memory) -> Result<()> {
     validate_id(&mem.id)?;
     validate_title(&mem.title)?;
     validate_content(&mem.content)?;
     validate_namespace(&mem.namespace)?;
     validate_source(&mem.source)?;
-    validate_tags(&mem.tags)?;
+    validate_tags_bounded(&mem.tags, MAX_REPLICATED_TAGS)?;
     validate_priority(mem.priority)?;
     validate_confidence(mem.confidence)?;
     if mem.access_count < 0 {
@@ -1348,7 +1383,7 @@ pub fn validate_memory(mem: &Memory) -> Result<()> {
     {
         bail!("valid_until is not valid RFC3339");
     }
-    validate_metadata(&mem.metadata)?;
+    validate_metadata_bounded(&mem.metadata, MAX_REPLICATED_METADATA_SIZE)?;
     // v0.7.0 Form 4 — fact-provenance fields on a full Memory import.
     validate_citations(&mem.citations)?;
     if let Some(ref uri) = mem.source_uri {
