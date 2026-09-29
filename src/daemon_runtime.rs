@@ -9871,6 +9871,19 @@ mod tests {
             }
         }
 
+        // #4090: the `tracing` callsite-interest cache and max-level hint are
+        // process-global, so in the shared lib binary a sibling test can race
+        // this thread-local capture into reading NOTHING (the #3426 / #4088
+        // mechanism). Present-plus-absent below turns that into a false red,
+        // not a false green, but a redaction guard must not flake: run the
+        // body alone in a re-exec'd child. The helper asserts `1 passed`, so
+        // a wrong path fails loudly; tests/tracing_capture_isolation_4090.rs
+        // keeps every capture site in `src/` isolated.
+        if crate::config::run_env_isolated_child_or_spawn(
+            "daemon_runtime::tests::issue_1579_a3_boot_log_redacts_store_url_password",
+        ) {
+            return;
+        }
         let buf = SharedBuf::default();
         let writer_buf = buf.clone();
         let subscriber = tracing_subscriber::fmt()
