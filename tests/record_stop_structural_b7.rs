@@ -107,18 +107,138 @@ fn escapes_newline(line: &str) -> bool {
     n % 2 == 1
 }
 
+/// #4148 — the 0-based indices of the physical lines whose trailing
+/// backslash escapes the newline INSIDE a non-raw string literal, the only
+/// place Rust gives `\`+newline that meaning. One lexer pass over the whole
+/// source, so a string opened on an earlier line is still tracked. A
+/// backslash at the end of a `//` or `/* */` comment, in code, or inside a
+/// raw string is NOT a continuation. Before #4148 every odd trailing
+/// backslash run joined, so a doc comment ending in `\` (a shell example)
+/// swallowed the `fn` signature below it, and that fn's write SQL was
+/// credited to the gated function above.
+fn string_continuation_lines(src: &str) -> HashSet<usize> {
+    let c: Vec<char> = src.chars().collect();
+    let is_ident = |ch: char| ch.is_alphanumeric() || ch == '_';
+    let mut found = HashSet::new();
+    let mut line = 0usize;
+    let mut i = 0;
+    // Advance over c[i], counting a newline.
+    let step = |i: &mut usize, line: &mut usize| {
+        if c[*i] == '\n' {
+            *line += 1;
+        }
+        *i += 1;
+    };
+    while i < c.len() {
+        let ch = c[i];
+        let next = c.get(i + 1).copied();
+        if ch == '/' && next == Some('/') {
+            while i < c.len() && c[i] != '\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if ch == '/' && next == Some('*') {
+            let mut depth = 0usize;
+            while i < c.len() {
+                if c[i] == '/' && c.get(i + 1) == Some(&'*') {
+                    depth += 1;
+                    i += 2;
+                } else if c[i] == '*' && c.get(i + 1) == Some(&'/') {
+                    depth -= 1;
+                    i += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                } else {
+                    step(&mut i, &mut line);
+                }
+            }
+            continue;
+        }
+        let prev_ident = i > 0 && is_ident(c[i - 1]);
+        let raw_at = if ch == 'r' && !prev_ident {
+            Some(i + 1)
+        } else if ch == 'b' && next == Some('r') && !prev_ident {
+            Some(i + 2)
+        } else {
+            None
+        };
+        if let Some(mut j) = raw_at {
+            let mut hashes = 0usize;
+            while c.get(j) == Some(&'#') {
+                hashes += 1;
+                j += 1;
+            }
+            if c.get(j) == Some(&'"') {
+                i = j + 1;
+                while i < c.len() {
+                    if c[i] == '"' && (1..=hashes).all(|h| c.get(i + h) == Some(&'#')) {
+                        i += 1 + hashes;
+                        break;
+                    }
+                    step(&mut i, &mut line);
+                }
+                continue;
+            }
+        }
+        if ch == '"' {
+            i += 1;
+            while i < c.len() {
+                if c[i] == '\\' {
+                    if c.get(i + 1) == Some(&'\n') {
+                        found.insert(line);
+                    }
+                    i += 1;
+                    if i < c.len() {
+                        step(&mut i, &mut line);
+                    }
+                    continue;
+                }
+                if c[i] == '"' {
+                    i += 1;
+                    break;
+                }
+                step(&mut i, &mut line);
+            }
+            continue;
+        }
+        if ch == '\'' && (next == Some('\\') || c.get(i + 2) == Some(&'\'')) {
+            // A char literal ('x', '\n', '\u{..}'); a lifetime ('a) is left.
+            i += 1;
+            while i < c.len() {
+                if c[i] == '\\' {
+                    i += 2;
+                    continue;
+                }
+                if c[i] == '\'' {
+                    i += 1;
+                    break;
+                }
+                step(&mut i, &mut line);
+            }
+            continue;
+        }
+        step(&mut i, &mut line);
+    }
+    found
+}
+
 /// Collapse a `\`-escaped newline inside a string literal into one
 /// logical line, then drop the leading whitespace of the continued
 /// line (the string-literal rule). When that would glue two word
 /// characters (`UPDATE\` + `SET`), keep a single space so the keyword
-/// boundary the predicate looks for still exists.
+/// boundary the predicate looks for still exists. #4148: only a line whose
+/// backslash sits inside a string literal joins
+/// ([`string_continuation_lines`]).
 fn join_string_continuations(src: &str) -> String {
+    let continues = string_continuation_lines(src);
     let lines: Vec<&str> = src.lines().collect();
     let mut out: Vec<String> = Vec::with_capacity(lines.len());
     let mut i = 0;
     while i < lines.len() {
         let mut acc = lines[i].to_string();
-        while escapes_newline(&acc) {
+        while escapes_newline(&acc) && continues.contains(&i) {
             let Some(next) = lines.get(i + 1) else {
                 break;
             };
@@ -1193,4 +1313,76 @@ fn record_stop_write_sql_fns_are_gated_or_allowlisted_b7() {
         "B7 pg/sqlite gate parity failures:\n  {}",
         parity_fail.join("\n  ")
     );
+}
+
+/// #4148 — a comment ending in a backslash is not a string continuation.
+/// A doc comment carrying a shell example that ends in `\` sits directly
+/// above an UNGATED writer, which follows a GATED function. Before #4148
+/// the join swallowed the `fn` signature into the comment line, so the
+/// ungated writer's SQL was credited to the gated function above it. The
+/// same shape with a trailing `\` on a code-line comment is covered too.
+/// Control: a `\`-continued UPDATE/SET inside a string still joins and is
+/// still flagged when ungated (the #3942 guarantee).
+#[test]
+fn a_comment_ending_in_a_backslash_never_hides_a_writer_4148() {
+    let planted = r#"
+    pub fn plant_gated_before(conn: &Connection) -> Result<()> {
+        gate_record_stop(conn)?;
+        conn.execute("DELETE FROM memories WHERE id = 1", [])?;
+        Ok(())
+    }
+
+    /// Example:
+    ///     ai-memory store --title x \
+    pub fn plant_ungated_after_doc_backslash(conn: &Connection) -> Result<()> {
+        conn.execute("DELETE FROM memories WHERE id = 2", [])?;
+        Ok(())
+    }
+
+    pub fn plant_gated_before_two(conn: &Connection) -> Result<()> {
+        gate_record_stop(conn)?;
+        let _ = 1; // trailing code comment \
+        Ok(())
+    }
+    pub fn plant_ungated_after_code_comment(conn: &Connection) -> Result<()> {
+        conn.execute("DELETE FROM memories WHERE id = 3", [])?;
+        Ok(())
+    }
+
+    pub fn plant_split_update_ungated_control(conn: &Connection) -> Result<()> {
+        conn.execute(
+            "UPDATE x \
+             SET y = 2",
+            [],
+        )?;
+        Ok(())
+    }
+"#;
+    let flagged = ungated_write_fns_for(
+        &join_string_continuations(planted),
+        is_fn_start,
+        write_sql_line,
+    );
+    for name in [
+        "plant_ungated_after_doc_backslash",
+        "plant_ungated_after_code_comment",
+        "plant_split_update_ungated_control",
+    ] {
+        assert!(
+            flagged.iter().any(|n| n == name),
+            "sensitivity: `{name}` must be flagged as an ungated writer (got {flagged:?})"
+        );
+    }
+    for name in ["plant_gated_before", "plant_gated_before_two"] {
+        assert!(
+            !flagged.iter().any(|n| n == name),
+            "specificity: gated `{name}` must not be flagged (got {flagged:?})"
+        );
+    }
+    // Only the string-literal line is a continuation.
+    let lines = string_continuation_lines(planted);
+    let at = |needle: &str| planted.lines().position(|l| l.contains(needle)).unwrap();
+    assert!(lines.contains(&at("\"UPDATE x \\")));
+    assert!(!lines.contains(&at("--title x \\")));
+    assert!(!lines.contains(&at("trailing code comment \\")));
 }
