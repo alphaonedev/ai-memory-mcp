@@ -335,3 +335,91 @@ async fn dispatch_event_postgres_zero_subs_is_noop() {
     .await;
     // No assertion needed — the test passes iff the call returned.
 }
+
+/// #4081: a real Postgres registration never owns a `SQLite` counter row.
+/// Even after acknowledged and failed deliveries, its listing must explicitly
+/// report unavailable counters rather than claim the subscription was unused.
+#[cfg(feature = "sal-postgres")]
+#[tokio::test(flavor = "multi_thread")]
+async fn postgres_delivery_counters_are_explicitly_unavailable_4081() {
+    use ai_memory::handlers::{ListSubscriptionsQuery, list_subscriptions};
+    use axum::extract::{Query, State};
+    use axum::response::IntoResponse;
+
+    let Some(env) = common::postgres_env::PostgresTestEnv::new("counters_4081").await else {
+        eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+        return;
+    };
+    let (mut state, audit_path) = make_test_state();
+    state.store = Arc::new(
+        ai_memory::store::postgres::PostgresStore::connect(env.url())
+            .await
+            .expect("connect postgres"),
+    );
+    ai_memory::config::set_allow_loopback_webhooks(true);
+    let tls = common::tls_receiver::dispatch_tls(&std::env::temp_dir());
+    let server = TlsReceiver::start_with(
+        tls,
+        Arc::new(|request| {
+            let body: serde_json::Value =
+                serde_json::from_slice(&request.body).expect("delivery JSON");
+            if body["memory_id"] == "failed-4081" {
+                Respond::status(400)
+            } else {
+                ack_echo()(request)
+            }
+        }),
+    )
+    .await;
+    let sub = make_subscription_memory(
+        "sub-4081",
+        "probe",
+        &server.uri(),
+        "counter-test",
+        Some("test-hash"),
+    );
+    state
+        .store
+        .store(&CallerContext::for_agent("probe"), &sub)
+        .await
+        .expect("persist postgres subscription");
+    for memory_id in ["ack-4081", "failed-4081"] {
+        dispatch_event_postgres(
+            &state,
+            "memory_store",
+            memory_id,
+            "counter-test",
+            Some("probe"),
+            None,
+        )
+        .await;
+        wait_dispatch_idle().await;
+    }
+    let conn = rusqlite::Connection::open(audit_path).expect("audit DB");
+    let statuses: Vec<String> = conn.prepare(
+        "SELECT delivery_status FROM subscription_events WHERE subscription_id = 'sub-4081' ORDER BY delivery_status",
+    ).expect("statuses").query_map([], |row| row.get(0)).expect("query statuses")
+        .collect::<Result<_, _>>().expect("read statuses");
+    assert_eq!(statuses, ["ack", "failed"]);
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert("x-agent-id", "probe".parse().expect("header"));
+    let response = list_subscriptions(
+        State(state),
+        headers,
+        Query(ListSubscriptionsQuery {
+            agent_id: Some("probe".into()),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("body");
+    let body: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON");
+    assert_eq!(body["count"], 1);
+    let row = &body["subscriptions"][0];
+    assert_eq!(row["id"], "sub-4081");
+    assert_eq!(row.get("dispatch_count"), Some(&serde_json::Value::Null));
+    assert_eq!(row.get("failure_count"), Some(&serde_json::Value::Null));
+}

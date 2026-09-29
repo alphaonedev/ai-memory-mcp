@@ -630,7 +630,7 @@ footer a{color:var(--text-muted)}
           <tr><td class="col">secret_hash</td><td class="type">TEXT NULL</td><td class="note">SHA-256 of the plaintext shared secret. Plaintext returned once on subscribe.</td></tr>
           <tr><td class="col">created_by</td><td class="type">TEXT NULL</td><td class="note">agent_id of subscriber.</td></tr>
           <tr><td class="col">created_at</td><td class="type">TEXT NOT NULL</td><td class="note">RFC3339 UTC.</td></tr>
-          <tr><td class="col">dispatch_count</td><td class="type">INTEGER</td><td class="note">Successful dispatches.</td></tr>
+          <tr><td class="col">dispatch_count</td><td class="type">INTEGER</td><td class="note">Completed dispatches (acknowledged or failed).</td></tr>
           <tr><td class="col">failure_count</td><td class="type">INTEGER</td><td class="note">Failed dispatches (non-2xx OR connect timeout).</td></tr>
         </tbody>
       </table>

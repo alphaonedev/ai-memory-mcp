@@ -1561,6 +1561,15 @@ Returns `{"subscriptions":[…],"count":N}`. Each entry includes `url`,
 `events`, `created_at`, `dispatch_count`, `failure_count`. Equivalent
 MCP tool: `memory_list_subscriptions` (`src/mcp/tools/subscribe.rs`).
 
+On SQLite, `dispatch_count` counts completed deliveries (acknowledged or
+failed), and `failure_count` counts failed deliveries. On Postgres, both
+fields are `null` (unavailable): registrations live in SAL memory metadata,
+while the dispatch worker's SQLite scratch database has no matching
+subscription counter row. Zero-row counter updates are reported under
+`webhook_audit_delivery.value.failed_by_stage.dispatch_counter` and the
+corresponding audit-update failure metric; they are not persistence successes.
+`null` must not be interpreted as zero deliveries or zero failures.
+
 ## Federation (v0.7, opt-in via `--quorum-writes`)
 
 When `ai-memory serve --quorum-writes N --quorum-peers URL,URL,…` is

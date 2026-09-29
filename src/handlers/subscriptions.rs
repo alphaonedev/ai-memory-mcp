@@ -962,9 +962,9 @@ pub async fn list_subscriptions(
     // v0.7.0 Wave-3 Continuation 4 (Bucket B / S33) — postgres-backed
     // daemons read subscriptions back from the `_subscriptions/
     // <agent_id>` namespace via the SAL `list` projection. The
-    // dispatch loop itself is still sqlite-bound; the wire envelope
-    // here lets the cert oracle observe that the subscription
-    // round-trips through the persistent store.
+    // worker persists delivery audit rows in sqlite scratch storage, but
+    // that database has no matching subscription counter rows. The list
+    // must distinguish unavailable counters from an unused hook (#4081).
     //
     // #872 — always scope to the authenticated caller's namespace; the
     // pre-fix code walked every namespace under `_subscriptions/` when
@@ -1002,8 +1002,8 @@ pub async fn list_subscriptions(
                             "agent_id": meta.get("agent_id").cloned().unwrap_or(serde_json::Value::Null),
                             (field_names::CREATED_BY): meta.get(field_names::CREATED_BY).cloned().unwrap_or(serde_json::Value::Null),
                             (field_names::CREATED_AT): meta.get(field_names::CREATED_AT).cloned().unwrap_or(serde_json::Value::Null),
-                            "dispatch_count": 0,
-                            "failure_count": 0,
+                            "dispatch_count": null,
+                            "failure_count": null,
                         }));
                     }
                 }
@@ -1085,9 +1085,10 @@ pub async fn list_subscriptions(
 /// into a `Subscription` struct, resolves the secret_hash from the
 /// memory's metadata, and feeds the canonical
 /// `subscriptions::dispatch_event_to_subs` worker pool. Audit
-/// rows (`record_subscription_event` / `record_dispatch` / DLQ)
-/// still write to sqlite via `db_path` because postgres-backed
-/// daemons keep a sqlite scratch DB alongside the SAL store handle.
+/// rows (`record_subscription_event` / DLQ) still write to sqlite via
+/// `db_path` because postgres-backed daemons keep a sqlite scratch DB.
+/// Dispatch counters have no backing registration there: the zero-row
+/// update is observed as a bookkeeping failure and GET returns null (#4081).
 ///
 /// Fire-and-forget — never panics, errors logged at warn / debug.
 #[cfg(feature = "sal")]
@@ -1276,7 +1277,8 @@ pub async fn dispatch_event_postgres(
 
     // Resolve the audit sqlite path via the shared db_state. Postgres
     // daemons still keep a sqlite scratch DB for federation/governance
-    // state — audit rows + DLQ + dispatch counters still land there.
+    // state — audit rows and DLQ land there. Counter updates match no
+    // registration and are reported as persistence failures (#4081).
     let db_path = {
         let lock = app.db.lock().await;
         lock.1.clone()

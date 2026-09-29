@@ -45,7 +45,7 @@ pub enum AuditStage {
     /// failed earlier, or the row was pruned). Distinct from an error —
     /// the database is fine; the history has a hole.
     StatusNoRow,
-    /// The `subscriptions` dispatch/failure counter UPDATE errored.
+    /// The `subscriptions` dispatch/failure counter UPDATE errored or matched no row.
     DispatchCounter,
 }
 
@@ -206,6 +206,15 @@ impl AuditStatusCounters {
             "UPDATE subscriptions SET dispatch_count = dispatch_count + 1, failure_count = failure_count + 1, last_dispatched_at = ?1 WHERE id = ?2"
         };
         match conn.execute(sql, params![now, sub_id]) {
+            Ok(0) => {
+                self.note_failure(
+                    AuditStage::DispatchCounter,
+                    sub_id,
+                    correlation_id,
+                    "no subscription row matched the dispatch counter update",
+                );
+                false
+            }
             Ok(_) => true,
             Err(e) => {
                 self.note_failure(
@@ -486,6 +495,51 @@ mod tests {
         assert!(!c.persist_dispatch_counter(&conn, "sub-dc", "cid-dc", false));
         assert_eq!(c.failures(AuditStage::DispatchCounter), 1);
         assert_eq!(c.delivery_at(0).failed_total, 1);
+    }
+
+    #[test]
+    fn missing_dispatch_counter_row_is_failure_4081() {
+        let (_d, p) = fresh_db();
+        let conn = rusqlite::Connection::open(&p).expect("open");
+        let c = AuditStatusCounters::new();
+        for ok in [true, false] {
+            assert!(
+                !c.persist_dispatch_counter(&conn, "missing", "cid-missing", ok),
+                "a zero-row counter UPDATE must not report persistence success"
+            );
+        }
+        assert_eq!(c.failures(AuditStage::DispatchCounter), 2);
+        assert!(c.delivery_at(0).actionable);
+    }
+
+    #[test]
+    fn acknowledged_and_failed_dispatch_counters_are_listed_4081() {
+        let (_d, p) = fresh_db();
+        let conn = rusqlite::Connection::open(&p).expect("open");
+        seed_pending(&conn, "sub-counts", "cid-ack");
+        crate::subscriptions::record_subscription_event_with_conn(
+            &conn,
+            "sub-counts",
+            "cid-failed",
+            "memory_store",
+            "{}",
+        )
+        .expect("seed failed delivery");
+        let c = AuditStatusCounters::new();
+        for (cid, ok) in [("cid-ack", true), ("cid-failed", false)] {
+            assert!(c.persist_event_status(&conn, "sub-counts", cid, ok));
+            assert!(c.persist_dispatch_counter(&conn, "sub-counts", cid, ok));
+        }
+        conn.execute(
+            "UPDATE subscriptions SET created_by = 'probe' WHERE id = 'sub-counts'",
+            [],
+        )
+        .expect("owner");
+        let rows = crate::subscriptions::list(&conn, Some("probe")).expect("owner list");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].dispatch_count, 2);
+        assert_eq!(rows[0].failure_count, 1);
+        assert_eq!(c.delivery_at(0).failed_total, 0);
     }
 
     /// A success after a failure clears `failing_now` (the most recent
