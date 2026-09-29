@@ -315,6 +315,136 @@ pub fn transition_cas(
     Ok(CasOutcome::Applied(action))
 }
 
+/// #4024 — the signed operation identity (`ActionTransitionOp.nonce`) of a
+/// federated action transition, guaranteed NON-EMPTY by construction
+/// (ERRORS-09). An empty nonce is an unsigned op from a heterogeneous-rollout
+/// peer: it carries no identity, so it can never be recorded (recording `b""`
+/// would refuse every later unsigned op on the action as a "replay").
+#[derive(Debug, Clone, Copy)]
+pub struct OpNonce<'a>(&'a [u8]);
+
+impl<'a> OpNonce<'a> {
+    /// `None` for an empty nonce (an unsigned op — no identity to record).
+    #[must_use]
+    pub fn new(bytes: &'a [u8]) -> Option<Self> {
+        (!bytes.is_empty()).then_some(Self(bytes))
+    }
+
+    /// The raw nonce bytes (the durable key alongside the action id).
+    #[must_use]
+    pub fn as_bytes(&self) -> &'a [u8] {
+        self.0
+    }
+}
+
+/// #4024 — one inbound federated transition, applied under its operation
+/// identity by [`transition_cas_once`] (sqlite) or
+/// [`crate::store::MemoryStore::action_transition_cas_once`] (either backend).
+#[derive(Debug, Clone, Copy)]
+pub struct RemoteTransition<'a> {
+    /// Target action id.
+    pub action_id: &'a str,
+    /// Expected current state (the CAS guard).
+    pub from: crate::models::ActionState,
+    /// State to move to.
+    pub to: crate::models::ActionState,
+    /// Attested actor written to `claimed_by`.
+    pub claimed_by: Option<&'a str>,
+    /// The op's `updated_at` (epoch seconds) written to the action row.
+    pub now: i64,
+    /// The op's signed identity.
+    pub nonce: OpNonce<'a>,
+}
+
+/// #4024 — outcome of [`transition_cas_once`].
+#[derive(Debug, Clone)]
+pub enum RemoteCasOutcome {
+    /// The operation identity was NOT previously applied here; carries the CAS
+    /// verdict. The identity was recorded **iff** this is
+    /// [`CasOutcome::Applied`] — every other verdict wrote nothing, so the op
+    /// stays applicable on a retry.
+    Fresh(CasOutcome),
+    /// This `(action_id, nonce)` was already APPLIED on this node: a replay
+    /// (#1805 — e.g. a captured signed op re-wrapped in a fresh envelope after
+    /// a cyclic edge returned the action to its `from` state). Nothing written.
+    AlreadyApplied,
+}
+
+/// SQL: is `(action_id, nonce)` a durably recorded, applied operation?
+const SELECT_TRANSITION_NONCE_SQL: &str =
+    "SELECT 1 FROM action_transition_nonces WHERE action_id = ?1 AND nonce = ?2";
+
+/// SQL: record an applied operation identity (same transaction as the CAS).
+const INSERT_TRANSITION_NONCE_SQL: &str = "INSERT INTO action_transition_nonces \
+     (action_id, nonce, from_state, to_state, recorded_at) VALUES (?1, ?2, ?3, ?4, ?5)";
+
+/// #4024 — compare-and-swap a FEDERATED transition and record its operation
+/// identity **atomically**: one `BEGIN IMMEDIATE` transaction holds the
+/// identity probe, the `UPDATE … WHERE state = from` guard and the identity
+/// `INSERT`, so "applied" and "recorded" commit or roll back together.
+///
+/// - identity already recorded → [`RemoteCasOutcome::AlreadyApplied`], no write
+///   (the #1805 replay refusal, durable across restarts and exact — no cache
+///   eviction can reopen it);
+/// - CAS miss / not-found / illegal edge → `Fresh(<verdict>)`, NOTHING written:
+///   a transition that arrived ahead of its causal predecessor keeps its
+///   identity, so the sender's retry applies once the predecessor lands;
+/// - any substrate error (CAS or identity write) → `Err`, the transaction
+///   rolls back: neither the state change nor the identity survives.
+///
+/// Pre-#4024 the receivers recorded the nonce in the in-memory replay cache
+/// BEFORE the CAS, so a miss or an error burned the identity of an op that was
+/// never applied (and a miss was acked as a `noop`).
+///
+/// # Errors
+/// Propagates `rusqlite` errors (including the record-stop refusal and
+/// `SQLITE_BUSY`); the transaction is rolled back on every error path.
+pub fn transition_cas_once(
+    conn: &Connection,
+    t: &RemoteTransition<'_>,
+) -> rusqlite::Result<RemoteCasOutcome> {
+    gate_record_stop_actions(conn)?;
+    let RemoteTransition {
+        action_id: id,
+        from,
+        to,
+        claimed_by,
+        now,
+        nonce,
+    } = *t;
+    // IMMEDIATE: take the write lock up front so no other connection (another
+    // process on the same file) can interleave between the probe and the
+    // writes. A dropped `Transaction` rolls back.
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    let seen = tx
+        .query_row(
+            SELECT_TRANSITION_NONCE_SQL,
+            params![id, nonce.as_bytes()],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if seen {
+        return Ok(RemoteCasOutcome::AlreadyApplied);
+    }
+    let verdict = transition_cas(&tx, id, from, to, claimed_by, now)?;
+    if matches!(verdict, CasOutcome::Applied(_)) {
+        tx.execute(
+            INSERT_TRANSITION_NONCE_SQL,
+            params![
+                id,
+                nonce.as_bytes(),
+                from.as_str(),
+                to.as_str(),
+                chrono::Utc::now().timestamp()
+            ],
+        )?;
+        tx.commit()?;
+    }
+    // Every non-Applied verdict wrote nothing; the dropped tx releases the lock.
+    Ok(RemoteCasOutcome::Fresh(verdict))
+}
+
 /// List actions filtered by optional `namespace` / `state`, newest-first,
 /// capped at `limit`.
 ///

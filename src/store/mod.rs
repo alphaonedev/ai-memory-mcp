@@ -3672,6 +3672,27 @@ pub trait MemoryStore: Send + Sync {
         })
     }
 
+    /// #4024 — the federation receive path's CAS: apply `t` and durably
+    /// record its operation identity `(action_id, nonce)` in ONE transaction,
+    /// so the identity is recorded **iff** the transition applied. An identity
+    /// already recorded is [`crate::actions::RemoteCasOutcome::AlreadyApplied`]
+    /// (the #1805 replay refusal, durable and exact); a CAS miss, illegal edge
+    /// or not-found writes nothing (the op stays applicable on a retry); a
+    /// substrate error rolls both back.
+    ///
+    /// Default `UnsupportedCapability` — FAIL CLOSED: an adapter that cannot
+    /// make the identity atomic with the CAS must not apply remote transitions
+    /// at all, never fall back to a non-atomic record.
+    async fn action_transition_cas_once(
+        &self,
+        _ctx: &CallerContext,
+        _t: &crate::actions::RemoteTransition<'_>,
+    ) -> StoreResult<crate::actions::RemoteCasOutcome> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "ACTIONS".to_string(),
+        })
+    }
+
     /// #1709 Pillar 1 — list actions, optionally filtered by `namespace`
     /// and/or `state`, newest-`updated_at` first, capped at `limit`. Default
     /// `UnsupportedCapability`.

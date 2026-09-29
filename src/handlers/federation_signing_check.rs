@@ -1310,50 +1310,51 @@ pub(super) async fn sync_push_via_store(
             require_tx_sig,
         ) {
             crate::federation::receive_auth::TransitionAuthz::Accept => {
-                // #1805 — per-transition nonce anti-replay (postgres twin of the
-                // sqlite federation_receive path). The signed transition nonce
-                // was never recorded; record it in the per-peer nonce cache and
-                // refuse a replay (a captured signed op re-wrapped in a fresh
-                // envelope replays through CAS on a cyclic/ABA edge). Empty
-                // nonce = unsigned op → not gated. Rides #1718 / 4d3ea1c5.
-                if !op.nonce.is_empty() {
-                    use base64::Engine as _;
-                    let nstr = base64::engine::general_purpose::STANDARD.encode(&op.nonce);
-                    if matches!(
-                        app.federation_nonce_cache
-                            .record_and_check(peer_header_owned.as_deref().unwrap_or(""), &nstr),
-                        crate::identity::replay::ReplayDecision::Replay
-                    ) {
-                        tracing::warn!(
-                            target: crate::federation::SIGNING_TRACE_TARGET,
-                            action_id = %op.action_id,
-                            "sync_push(store): replayed action-transition nonce refused (#1805)"
-                        );
-                        skipped += 1;
-                        continue;
+                // #1805 + #4024 — per-transition anti-replay ATOMIC with the
+                // apply (postgres twin of the sqlite `federation_receive`
+                // path): the signed nonce is recorded durably in the CAS
+                // transaction (`action_transition_cas_once`), so it is
+                // consumed iff the op applied. Empty nonce = unsigned op → no
+                // identity to record (plain CAS).
+                let outcome = match crate::actions::OpNonce::new(&op.nonce) {
+                    Some(nonce) => {
+                        app.store
+                            .action_transition_cas_once(
+                                &ctx,
+                                &crate::actions::RemoteTransition {
+                                    action_id: &op.action_id,
+                                    from: op.from_state,
+                                    to: op.to_state,
+                                    claimed_by: op.claimed_by.as_deref(),
+                                    now: op.updated_at,
+                                    nonce,
+                                },
+                            )
+                            .await
                     }
-                }
-                match app
-                    .store
-                    .action_transition_cas(
-                        &ctx,
-                        &op.action_id,
-                        op.from_state,
-                        op.to_state,
-                        op.claimed_by.as_deref(),
-                        op.updated_at,
-                    )
-                    .await
-                {
-                    Ok(crate::actions::CasOutcome::Applied(_)) => action_transitions_applied += 1,
-                    Ok(_) => noop += 1,
-                    Err(e) => {
-                        tracing::warn!(
-                            "sync_push(store): action transition {} cas failed: {e}",
-                            op.action_id
-                        );
-                        skipped += 1;
+                    None => app
+                        .store
+                        .action_transition_cas(
+                            &ctx,
+                            &op.action_id,
+                            op.from_state,
+                            op.to_state,
+                            op.claimed_by.as_deref(),
+                            op.updated_at,
+                        )
+                        .await
+                        .map(crate::actions::RemoteCasOutcome::Fresh),
+                };
+                match crate::handlers::federation_receive::tally_remote_transition(
+                    op,
+                    outcome,
+                    "sync_push(store)",
+                ) {
+                    crate::handlers::federation_receive::TransitionTally::Applied => {
+                        action_transitions_applied += 1;
                     }
+                    crate::handlers::federation_receive::TransitionTally::Noop => noop += 1,
+                    crate::handlers::federation_receive::TransitionTally::Skipped => skipped += 1,
                 }
             }
             verdict => {
