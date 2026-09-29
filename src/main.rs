@@ -377,8 +377,23 @@ fn main() -> Result<()> {
             std::process::exit(config::EX_CONFIG);
         }
     };
+    // #3651 audit half (5-agent vote, 5/5 A, decision memory 25844fe7): the
+    // audit trail is off unless the operator enables it, so an enabled trail
+    // that cannot initialise (an explicit `hash_chain = false`, a mismatched
+    // `schema_version`, or an audit directory / file that cannot be created or
+    // opened) refuses boot exactly like the log sink above. Before this it
+    // printed "continuing without" and ran with NO audit trail, the opposite
+    // of every documented outcome. `doctor` stays runnable.
     if let Err(e) = audit::init_from_config(&app_config.effective_audit()) {
-        eprintln!("ai-memory: audit init failed (continuing without): {e}");
+        if is_doctor {
+            eprintln!(
+                "ai-memory: the audit trail failed to initialise; `doctor` \
+                 continues so the rest of its report is available: {e:#}"
+            );
+        } else {
+            eprintln!("{}", audit::boot_refusal_message(&e));
+            std::process::exit(config::EX_CONFIG);
+        }
     }
 
     // v0.7.0 #697 — bootstrap the Ed25519-signed forensic governance
