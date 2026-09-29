@@ -1062,65 +1062,9 @@ fn strip_cfg_test_inline_mods(text: &str) -> String {
             d.starts_with("mod ") && d.ends_with('{')
         });
         if is_cfg_test && opens_inline_mod {
-            // Brace-match from the declaration line.
-            let mut depth: i64 = 0;
-            let mut j = d_at;
-            let mut in_block_comment = false;
-            'scan: while j < lines.len() {
-                let mut chars = lines[j].chars().peekable();
-                let mut in_str = false;
-                while let Some(c) = chars.next() {
-                    if in_block_comment {
-                        if c == '*' && chars.peek() == Some(&'/') {
-                            chars.next();
-                            in_block_comment = false;
-                        }
-                        continue;
-                    }
-                    if in_str {
-                        if c == '\\' {
-                            chars.next();
-                        } else if c == '"' {
-                            in_str = false;
-                        }
-                        continue;
-                    }
-                    match c {
-                        '/' if chars.peek() == Some(&'/') => break,
-                        '/' if chars.peek() == Some(&'*') => {
-                            chars.next();
-                            in_block_comment = true;
-                        }
-                        '"' => in_str = true,
-                        '\'' => {
-                            // A char literal or a lifetime. `'\x'` (escaped)
-                            // and `'c'` are consumed whole; a lifetime `'a`
-                            // has no closing quote at offset 1 and is left.
-                            if chars.peek() == Some(&'\\') {
-                                chars.next();
-                                chars.next();
-                                for q in chars.by_ref() {
-                                    if q == '\'' {
-                                        break;
-                                    }
-                                }
-                            } else if chars.clone().nth(1) == Some('\'') {
-                                chars.next();
-                                chars.next();
-                            }
-                        }
-                        '{' => depth += 1,
-                        '}' => {
-                            depth -= 1;
-                            if depth == 0 {
-                                break 'scan;
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                j += 1;
-            }
+            // Brace-match from the declaration line; resume after the line
+            // that closes the module.
+            let j = d_at + cfg_test_mod_close_offset(&lines[d_at..], d_at);
             i = j + 1;
             continue;
         }
@@ -1129,6 +1073,142 @@ fn strip_cfg_test_inline_mods(text: &str) -> String {
         i += 1;
     }
     out
+}
+
+/// #4179 — the offset (in lines, from `lines[0]`, the `mod NAME {` line) of
+/// the line holding the brace that CLOSES that module. One lexer pass carries
+/// its state across lines: normal strings with escapes, raw strings
+/// (`r"…"`, `r#"…"#`, `br…`), nested block comments, line comments, and char
+/// literals vs lifetimes. A `{` or `}` inside any of them cannot move the
+/// match.
+///
+/// FAILS CLOSED (f2r, #4179 review). A module whose closing brace is never
+/// found panics instead of being stripped to end-of-file, because a strip to
+/// EOF would hide every production caller after it.
+fn cfg_test_mod_close_offset(lines: &[&str], decl_line: usize) -> usize {
+    let text = lines.join("\n");
+    let c: Vec<char> = text.chars().collect();
+    let is_ident = |ch: char| ch.is_alphanumeric() || ch == '_';
+    let (mut i, mut line, mut depth) = (0usize, 0usize, 0i64);
+    let mut opened = false;
+    while i < c.len() {
+        let ch = c[i];
+        let next = c.get(i + 1).copied();
+        if ch == '\n' {
+            line += 1;
+            i += 1;
+            continue;
+        }
+        if ch == '/' && next == Some('/') {
+            while i < c.len() && c[i] != '\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if ch == '/' && next == Some('*') {
+            let mut nest = 0usize;
+            while i < c.len() {
+                if c[i] == '/' && c.get(i + 1) == Some(&'*') {
+                    nest += 1;
+                    i += 2;
+                } else if c[i] == '*' && c.get(i + 1) == Some(&'/') {
+                    nest -= 1;
+                    i += 2;
+                    if nest == 0 {
+                        break;
+                    }
+                } else {
+                    if c[i] == '\n' {
+                        line += 1;
+                    }
+                    i += 1;
+                }
+            }
+            continue;
+        }
+        let prev_ident = i > 0 && is_ident(c[i - 1]);
+        let raw_at = if ch == 'r' && !prev_ident {
+            Some(i + 1)
+        } else if ch == 'b' && next == Some('r') && !prev_ident {
+            Some(i + 2)
+        } else {
+            None
+        };
+        if let Some(mut j) = raw_at {
+            let mut hashes = 0usize;
+            while c.get(j) == Some(&'#') {
+                hashes += 1;
+                j += 1;
+            }
+            if c.get(j) == Some(&'"') {
+                i = j + 1;
+                while i < c.len() {
+                    if c[i] == '"' && (1..=hashes).all(|h| c.get(i + h) == Some(&'#')) {
+                        i += 1 + hashes;
+                        break;
+                    }
+                    if c[i] == '\n' {
+                        line += 1;
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+        }
+        if ch == '"' {
+            i += 1;
+            while i < c.len() {
+                match c[i] {
+                    '\\' => {
+                        if c.get(i + 1) == Some(&'\n') {
+                            line += 1;
+                        }
+                        i += 2;
+                    }
+                    '"' => {
+                        i += 1;
+                        break;
+                    }
+                    '\n' => {
+                        line += 1;
+                        i += 1;
+                    }
+                    _ => i += 1,
+                }
+            }
+            continue;
+        }
+        if ch == '\'' && (next == Some('\\') || c.get(i + 2) == Some(&'\'')) {
+            i += 1;
+            while i < c.len() {
+                if c[i] == '\\' {
+                    i += 2;
+                    continue;
+                }
+                i += 1;
+                if c[i - 1] == '\'' {
+                    break;
+                }
+            }
+            continue;
+        }
+        if ch == '{' {
+            depth += 1;
+            opened = true;
+        } else if ch == '}' {
+            depth -= 1;
+            if opened && depth == 0 {
+                return line;
+            }
+        }
+        i += 1;
+    }
+    panic!(
+        "#4179 census strip: the cfg(test) module declared at src line {} never closes \
+         (depth {depth} at end of file); refusing to strip to EOF, which would hide \
+         every later production caller",
+        decl_line + 1
+    );
 }
 
 /// #4179 — whether a `#[cfg(...)]` attribute line makes its item TEST-ONLY.
@@ -1167,6 +1247,31 @@ fn cfg_requires_test(attr: &str) -> bool {
     }
     members.push(member);
     members.iter().any(|m| m.trim() == "test")
+}
+
+/// #4179 f2r review — raw and multi-line strings inside a cfg(test) module
+/// do not move the brace match, and a module that never closes FAILS
+/// CLOSED (panics) instead of stripping to EOF.
+#[test]
+fn census_strip_handles_raw_and_multiline_strings_4179() {
+    // `r#" " { "#`: a quote inside a raw string, then a brace; and a normal
+    // string whose `{` is on its SECOND physical line. The pre-review walk
+    // (per-line string state, no raw strings) counted both braces and
+    // stripped to EOF, hiding `late`.
+    let src = "#[cfg(test)]\nmod tests {\n    const R: &str = r#\" \" { \"#;\n    const M: &str = \"line one\n { line two\";\n}\nfn late() { llm.judge_merge(&input); }\n";
+    let kept = strip_cfg_test_inline_mods(src);
+    assert!(
+        kept.contains("fn late() { llm.judge_merge(&input); }"),
+        "{kept}"
+    );
+    assert!(!kept.contains("const R"), "{kept}");
+}
+
+#[test]
+#[should_panic(expected = "never closes")]
+fn census_strip_fails_closed_on_an_unclosed_test_module_4179() {
+    let src = "#[cfg(test)]\nmod tests {\n    fn x() {}\nfn late() { llm.judge_merge(&input); }\n";
+    let _ = strip_cfg_test_inline_mods(src);
 }
 
 /// #4179 known-positive: a production caller placed AFTER an early
