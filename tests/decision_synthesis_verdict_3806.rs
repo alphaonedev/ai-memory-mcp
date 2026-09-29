@@ -1029,3 +1029,72 @@ fn verdict_field_confidence_still_licenses_a_delete_3806_p1_control() {
     );
     assert_eq!(ids.len(), 1, "delete + insert = one row");
 }
+
+// ---------------------------------------------------------------------------
+// #4173 — a withheld Delete is reported, never silently skipped.
+// ---------------------------------------------------------------------------
+
+/// #4173: a Delete the decision seam withheld is named on the store
+/// response under `synthesis_deletes_withheld` with its reason code, and
+/// the candidate survives. There are three shapes:
+/// - `refuse` + an unavailable judge reports `refused_unavailable`.
+/// - `abstain` + a low-confidence yes reports `low_confidence`.
+/// - A permitted delete (the control) reports NOTHING and the delete
+///   applies, so the field is not unconditional.
+///
+/// RED on 65642b3cf: the response carries no such field, so a caller cannot
+/// tell "applied" from "skipped".
+#[test]
+fn a_withheld_synthesis_delete_is_reported_on_the_response_4173() {
+    let _g = synthesis_lock().lock().unwrap_or_else(|p| p.into_inner());
+
+    let withheld = |resp: &Value| resp.get("synthesis_deletes_withheld").cloned();
+
+    // refuse + unavailable
+    let (conn, db_path) = open_db();
+    let cand = seed_existing(&conn, "obsolete deploy note", "old", "ns-4173-refuse");
+    let server = mock_server_silent_judge(delete_verdict(&cand));
+    let llm = llm_with_decider(&server.uri(), &db_path, DecisionFallback::Refuse);
+    let resp = run_store(&conn, &db_path, &llm, store_req("ns-4173-refuse")).expect("ok");
+    assert_eq!(
+        withheld(&resp),
+        Some(json!([{"id": cand, "reason": "refused_unavailable"}])),
+        "refuse posture must report the withheld delete: {resp}"
+    );
+    assert!(surviving_ids(&conn, "ns-4173-refuse").contains(&cand));
+
+    // abstain + low confidence
+    let (conn, db_path) = open_db();
+    let cand = seed_existing(&conn, "obsolete deploy note", "old", "ns-4173-low");
+    let server = mock_server(
+        delete_verdict(&cand),
+        Some(decision_body_with_confidence("yes", 0.50)),
+    );
+    let llm = llm_with_decider(&server.uri(), &db_path, DecisionFallback::Abstain);
+    let resp = run_store(&conn, &db_path, &llm, store_req("ns-4173-low")).expect("ok");
+    assert_eq!(
+        withheld(&resp),
+        Some(json!([{"id": cand, "reason": "low_confidence"}])),
+        "a low-confidence Block must report the withheld delete: {resp}"
+    );
+    assert!(surviving_ids(&conn, "ns-4173-low").contains(&cand));
+
+    // control: a permitted delete applies and reports nothing withheld
+    let (conn, db_path) = open_db();
+    let cand = seed_existing(&conn, "obsolete deploy note", "old", "ns-4173-permit");
+    let server = mock_server(
+        delete_verdict(&cand),
+        Some(decision_body_with_confidence("yes", 0.99)),
+    );
+    let llm = llm_with_decider(&server.uri(), &db_path, DecisionFallback::Abstain);
+    let resp = run_store(&conn, &db_path, &llm, store_req("ns-4173-permit")).expect("ok");
+    assert_eq!(
+        withheld(&resp),
+        None,
+        "an applied delete is not withheld: {resp}"
+    );
+    assert!(
+        !surviving_ids(&conn, "ns-4173-permit").contains(&cand),
+        "the control delete must actually apply"
+    );
+}

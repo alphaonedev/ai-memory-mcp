@@ -164,7 +164,18 @@ pub(super) struct SynthesisOutcome {
     /// handler surfaces this on the response envelope as
     /// `synthesis_failed: true` + `synthesis_failed_reason`.
     pub failed_reason: Option<String>,
+    /// #4173 — Delete verdicts the decision seam WITHHELD (collapsed to
+    /// NoOp), as `(candidate_id, reason_code)`. Surfaced on the store
+    /// response as `synthesis_deletes_withheld` so a caller can tell
+    /// "applied" from "skipped". The durable write itself still succeeds
+    /// (the same honest-envelope shape as `synthesis_failed`).
+    pub withheld_deletes: Vec<(String, &'static str)>,
 }
+
+/// #4173 — reason code for a Delete withheld because the decider was
+/// configured but unavailable under `fallback = "refuse"`. The `Block`
+/// verdicts reuse `MergeBlockReason::as_str`.
+pub(super) const WITHHELD_REFUSED_UNAVAILABLE: &str = "refused_unavailable";
 
 impl SynthesisOutcome {
     pub(super) fn empty() -> Self {
@@ -173,6 +184,7 @@ impl SynthesisOutcome {
             updates: Vec::new(),
             deletes: Vec::new(),
             failed_reason: None,
+            withheld_deletes: Vec::new(),
         }
     }
 }
@@ -262,6 +274,7 @@ pub(super) fn run_synthesis_pass(
             }
             let mut updates: Vec<(String, String)> = Vec::new();
             let mut deletes: Vec<String> = Vec::new();
+            let mut withheld_deletes: Vec<(String, &'static str)> = Vec::new();
             for v in &resp.verdicts {
                 match v.verb {
                     crate::synthesis::SynthesisVerb::Update => {
@@ -321,6 +334,8 @@ pub(super) fn run_synthesis_pass(
                                             source = ?source,
                                             "synthesis.delete_judged_noop; Block verdict collapses to NoOp",
                                         );
+                                        withheld_deletes
+                                            .push((v.candidate_id.clone(), reason.as_str()));
                                     }
                                 }
                                 // `judge_synthesis_delete` returns Err ONLY under
@@ -332,12 +347,18 @@ pub(super) fn run_synthesis_pass(
                                 // store proceeds; the delete is skipped) rather
                                 // than failing the store — the fail-safe
                                 // direction. WARN so the refuse posture is seen.
-                                Err(e) => tracing::warn!(
-                                    target: "synthesis",
-                                    namespace = %mem.namespace,
-                                    error = %e,
-                                    "synthesis.delete_judge_refused; fail-closed NoOp",
-                                ),
+                                Err(e) => {
+                                    tracing::warn!(
+                                        target: "synthesis",
+                                        namespace = %mem.namespace,
+                                        error = %e,
+                                        "synthesis.delete_judge_refused; fail-closed NoOp",
+                                    );
+                                    withheld_deletes.push((
+                                        v.candidate_id.clone(),
+                                        WITHHELD_REFUSED_UNAVAILABLE,
+                                    ));
+                                }
                             }
                         }
                     }
@@ -350,6 +371,7 @@ pub(super) fn run_synthesis_pass(
                 updates,
                 deletes,
                 failed_reason: None,
+                withheld_deletes,
             })
         }
         Err(e) => {
@@ -373,6 +395,7 @@ pub(super) fn run_synthesis_pass(
                     updates: Vec::new(),
                     deletes: Vec::new(),
                     failed_reason: Some(reason),
+                    withheld_deletes: Vec::new(),
                 }),
             }
         }
