@@ -285,7 +285,7 @@ async fn sqlite_sal_notify_publishes_a_wake_3465() {
 #[test]
 fn only_the_recipient_may_see_a_wake_3465() {
     let ev = InboxEvent::AgentNotified {
-        seq: 1,
+        seq: 900_001,
         recipient_agent_id: "bob".into(),
         correlation_id: "sha256:c".into(),
         inbox_row_id: "row".into(),
@@ -293,6 +293,7 @@ fn only_the_recipient_may_see_a_wake_3465() {
         sender_agent_id: "alice".into(),
         content_digest: "sha256:d".into(),
         notified_at: "2026-09-02T00:00:00Z".into(),
+        recipient_seq: 1,
     };
     // ALLOWED
     assert!(inbox_wake_visible_to("bob", &ev));

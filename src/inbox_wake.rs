@@ -54,9 +54,9 @@
 //! monotonic [`seq`](InboxEvent::seq) so a consumer can size the gap
 //! exactly rather than guess.
 
-use std::sync::Arc;
-use std::sync::OnceLock;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
@@ -76,6 +76,75 @@ pub const INBOX_WAKE_BROADCAST_CAPACITY: usize = 1024;
 /// Starts at 1 so `0` is unambiguously "no wake seen yet" for a
 /// consumer's high-watermark bookkeeping.
 static WAKE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Most distinct recipients whose per-recipient wake counter is kept before
+/// the table is reset (#4125). Bounds the table at roughly this many
+/// `(agent id, u64)` entries however many agents a host serves.
+pub const RECIPIENT_SEQ_TABLE_CAPACITY: usize = 262_144;
+
+/// #4125 — per-recipient wake counters, assigned at PUBLISH time.
+///
+/// A recipient's [`InboxEvent::AgentNotified::recipient_seq`] moves ONLY when
+/// a wake is published to that recipient, so the gap between two of its values
+/// counts the recipient's own missed wakes and never measures another tenant's
+/// notify volume (the host-wide [`WAKE_SEQ`] does, which is why #4071 keeps it
+/// off tenant-facing surfaces). Because the number is assigned HERE, before
+/// the broadcast send, a consumer whose receiver lags still sees the dropped
+/// numbers as a gap; a counter kept in the consumer would renumber across it.
+struct RecipientSeqs {
+    next: HashMap<String, u64>,
+}
+
+impl RecipientSeqs {
+    /// The recipient's next wake number.
+    ///
+    /// A recipient seen for the first time — including one whose counter was
+    /// dropped by a table reset — starts from a wall-clock base
+    /// ([`recipient_seq_base`]), never from 1. So a reset (or a producer
+    /// restart) moves every counter FORWARD: the consumer sees at worst one
+    /// spurious gap, which costs nothing because every wake already triggers
+    /// exactly one catch-up read, and can never see a counter go backwards and
+    /// hide a real gap behind its old high-watermark. The base depends only on
+    /// the clock, so a reset reveals nothing about other recipients.
+    fn assign(&mut self, recipient: &str) -> u64 {
+        if let Some(slot) = self.next.get_mut(recipient) {
+            *slot = slot.saturating_add(1);
+            return *slot;
+        }
+        if self.next.len() >= RECIPIENT_SEQ_TABLE_CAPACITY {
+            self.next.clear();
+        }
+        let first = recipient_seq_base();
+        self.next.insert(recipient.to_string(), first);
+        first
+    }
+}
+
+/// Starting number for a recipient counter: microseconds since the Unix epoch
+/// (clamped to at least 1 so `0` keeps meaning "no wake seen yet").
+///
+/// Monotonic across table resets and producer restarts as long as one
+/// recipient receives fewer than one wake per microsecond, which the bounded
+/// broadcast bus makes physically unreachable. A clock step backwards
+/// degrades to the pre-#4125 restart behaviour (the consumer keeps its higher
+/// watermark and reports no gap for the overlap) — never to a wrong read,
+/// because the durable inbox row, not the hint, is what the reader returns.
+fn recipient_seq_base() -> u64 {
+    let micros = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_micros()).unwrap_or(u64::MAX));
+    micros.max(1)
+}
+
+static RECIPIENT_SEQS: OnceLock<Mutex<RecipientSeqs>> = OnceLock::new();
+
+fn recipient_seqs() -> &'static Mutex<RecipientSeqs> {
+    RECIPIENT_SEQS.get_or_init(|| {
+        Mutex::new(RecipientSeqs {
+            next: HashMap::new(),
+        })
+    })
+}
 
 /// One frame on the inbox wake bus.
 ///
@@ -115,6 +184,19 @@ pub enum InboxEvent {
         content_digest: String,
         /// RFC-3339 instant the wake was published.
         notified_at: String,
+        /// #4125 — this RECIPIENT's own wake number, assigned at publish time.
+        ///
+        /// Strictly increasing per recipient and moved by nothing but wakes to
+        /// this recipient, so it is safe to show to the recipient: a gap
+        /// between two values counts the recipient's OWN missed wakes (one
+        /// catch-up inbox read) and carries no other tenant's activity volume.
+        /// This, not [`Self::AgentNotified::seq`], is what the wake-hub
+        /// forwards as `seq_high_watermark`. Values are large (they start
+        /// from a wall-clock base, see `recipient_seq_base`) and only their
+        /// ORDER and DIFFERENCES are meaningful. `0` on a frame decoded from
+        /// a producer that predates the field.
+        #[serde(default)]
+        recipient_seq: u64,
     },
 }
 
@@ -137,6 +219,15 @@ impl InboxEvent {
     pub fn seq(&self) -> u64 {
         match self {
             InboxEvent::AgentNotified { seq, .. } => *seq,
+        }
+    }
+
+    /// This recipient's own wake number (#4125); see
+    /// [`Self::AgentNotified::recipient_seq`].
+    #[must_use]
+    pub fn recipient_seq(&self) -> u64 {
+        match self {
+            InboxEvent::AgentNotified { recipient_seq, .. } => *recipient_seq,
         }
     }
 
@@ -200,6 +291,16 @@ pub(crate) fn publish_agent_notified(
     sender_agent_id: &str,
     content_digest: &str,
 ) -> InboxEvent {
+    // #4125 — both numbers are assigned and the frame is sent under ONE short
+    // lock (CONCURRENCY-03: no await, no I/O; `broadcast::Sender::send` never
+    // blocks), so every consumer receives a recipient's wakes in
+    // `recipient_seq` order and a gap it sees is a real one. A poisoned lock
+    // only means another publisher panicked between two map operations; the
+    // counters are still valid numbers, so recover rather than drop the wake
+    // (CONCURRENCY-18).
+    let mut seqs = recipient_seqs()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
     let event = InboxEvent::AgentNotified {
         seq: next_seq(),
         recipient_agent_id: recipient_agent_id.to_string(),
@@ -209,11 +310,13 @@ pub(crate) fn publish_agent_notified(
         sender_agent_id: sender_agent_id.to_string(),
         content_digest: content_digest.to_string(),
         notified_at: chrono::Utc::now().to_rfc3339(),
+        recipient_seq: seqs.assign(recipient_agent_id),
     };
     // No receivers is the documented, expected steady state on a daemon
     // with no attached streams — never an error (ERRORS-19: deliberate,
     // commented discard).
     let _ = bus().send(event.clone());
+    drop(seqs);
     event
 }
 
@@ -344,7 +447,44 @@ mod tests {
             sender_agent_id: "alice".into(),
             content_digest: "sha256:deadbeef".into(),
             notified_at: "2026-09-02T00:00:00Z".into(),
+            recipient_seq: 3,
         }
+    }
+
+    /// #4125 — a recipient counter is strictly increasing, independent of
+    /// other recipients, and a table reset moves it FORWARD (never back to a
+    /// small number that would hide a real gap behind the consumer's old
+    /// high-watermark).
+    #[test]
+    fn recipient_seq_is_isolated_and_survives_a_table_reset_forward_4125() {
+        let mut t = RecipientSeqs {
+            next: HashMap::new(),
+        };
+        let a1 = t.assign("a");
+        let b1 = t.assign("b");
+        let a2 = t.assign("a");
+        let a3 = t.assign("a");
+        assert_eq!((a2 - a1, a3 - a2), (1, 1), "own wakes are contiguous");
+        assert_eq!(t.assign("b"), b1 + 1, "A's wakes never move B");
+        // Fill the table to capacity with other recipients; the next NEW
+        // recipient resets it, dropping A's counter.
+        for i in 0..RECIPIENT_SEQ_TABLE_CAPACITY {
+            t.assign(&format!("r{i}"));
+        }
+        assert!(t.next.len() <= RECIPIENT_SEQ_TABLE_CAPACITY, "bounded");
+        let a_after = t.assign("a");
+        assert!(
+            a_after > a3,
+            "after a reset A's counter must move forward: {a3} -> {a_after}"
+        );
+    }
+
+    #[test]
+    fn a_frame_without_recipient_seq_still_decodes_4125() {
+        let mut v = serde_json::to_value(sample()).expect("serialise");
+        v.as_object_mut().expect("object").remove("recipient_seq");
+        let back: InboxEvent = serde_json::from_value(v).expect("deserialise");
+        assert_eq!(back.recipient_seq(), 0);
     }
 
     #[test]

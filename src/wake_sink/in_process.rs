@@ -210,7 +210,7 @@ mod tests {
 
     fn event(recipient: &str) -> InboxEvent {
         InboxEvent::AgentNotified {
-            seq: 9,
+            seq: 900_009,
             recipient_agent_id: recipient.into(),
             correlation_id: "sha256:corr".into(),
             inbox_row_id: "row-9".into(),
@@ -218,6 +218,7 @@ mod tests {
             sender_agent_id: "ai:alice".into(),
             content_digest: format!("sha256:{}", "11".repeat(32)),
             notified_at: "2026-09-05T00:00:00Z".into(),
+            recipient_seq: 9,
         }
     }
 

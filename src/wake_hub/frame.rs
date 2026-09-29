@@ -807,14 +807,16 @@ pub struct WakeMeta {
     /// The producer's wake sequence at the moment this hint was minted, so a
     /// client that missed wakes knows it missed them.
     ///
-    /// For a SUBSTRATE wake (#3469) this is the producer's HOST-WIDE monotonic
-    /// wake counter ([`crate::inbox_wake::seq_high_watermark`]), NOT a
-    /// per-recipient inbox depth: the bus has no per-recipient counter and a
-    /// truthful one would put a database read on the wake path this EPIC
-    /// exists to remove. Read it as "wakes happened that you did not see" — a
-    /// gap means do ONE catch-up inbox read. That is fail-safe by
-    /// construction: a client may read once more than it had to, and can never
-    /// conclude nothing was missed when something was.
+    /// For a SUBSTRATE wake (#3469) this is the RECIPIENT's own wake number
+    /// ([`crate::inbox_wake::InboxEvent::recipient_seq`], #4125), assigned at
+    /// publish time and forwarded verbatim — never the host-wide wake
+    /// sequence, whose gaps would measure other tenants' notify volume. It is
+    /// a count of wakes, not an inbox depth (a truthful depth would put a
+    /// database read on the wake path this EPIC exists to remove). Read it as
+    /// "wakes happened that you did not see" — a gap means do ONE catch-up
+    /// inbox read. That is fail-safe by construction: a client may read once
+    /// more than it had to, and can never conclude nothing was missed when
+    /// something was.
     pub seq_high_watermark: u64,
 }
 

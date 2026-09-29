@@ -49,11 +49,23 @@ Sixty seconds is a CEILING, not a target. A client that observes a
 
 ## Self-healing after a lost wake
 
-Every wake carries `seq_high_watermark`: the producer's host-wide monotonic wake
-counter at the instant the hint was minted. It is deliberately NOT a
-per-recipient inbox depth — the bus has no per-recipient counter, and a truthful
-one would put a database read on the very latency path this plane exists to
-remove.
+Every wake carries `seq_high_watermark`: the RECIPIENT's own wake number,
+assigned by the producer at publish time (#4125). It moves only when a wake is
+published to that recipient, so a gap between two of your values counts wakes
+YOU missed and never measures another tenant's notify volume (the host-wide
+wake sequence did, which is the cross-tenant side channel #4071 also removes
+from the inbox SSE stream). It is a count of wakes, not an inbox depth — a
+truthful depth would put a database read on the very latency path this plane
+exists to remove.
+
+The number is assigned BEFORE the frame enters the bounded broadcast bus and is
+forwarded verbatim by every sink, never renumbered: a counter kept in a sink
+would only advance for frames the sink actually received, so a lagging sink
+would hand you contiguous numbers across a real drop. Values start from a
+wall-clock base (only their order and differences are meaningful), so a
+producer restart or a reset of the producer's bounded per-recipient table
+moves your number FORWARD — at worst one wake is labelled `gap`, which costs
+nothing extra because every wake already triggers exactly one catch-up read.
 
 Read it as *"wakes happened that you did not see"*. The correct response to a
 gap is ONE catch-up inbox read. That is fail-safe by construction: a client may
