@@ -200,7 +200,7 @@
         "tests/http_if_match_concurrency.rs:149 (HTTP PUT with stale If-Match returns 409)",
         "tests/http_if_match_concurrency.rs:184 (PUT without If-Match preserves legacy last-write-wins)",
         "tests/http_if_match_concurrency.rs:197 (quoted ETag-style If-Match parses)",
-        "tests/http_if_match_concurrency.rs:219 (unparseable If-Match falls through to legacy)"
+        "tests/http_if_match_concurrency.rs (#4061: unparseable If-Match refused with 400; `*` is last-write-wins)"
       ],
       "schema_anchor": "v45 (memories.version BIGINT NOT NULL DEFAULT 1 column added)",
       "issue_references": ["#884"],

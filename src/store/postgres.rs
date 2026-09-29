@@ -14231,52 +14231,68 @@ impl PostgresStore {
         // unrecoverable silent content loss with no error anywhere in the
         // pipe. Do not remove. Pinned by
         // `tests/store_parity_gaps.rs::pg_list_memories_updated_since_decrypts_for_send_2303`.
-        let enc: Option<Vec<u8>> = row
-            .try_get::<Option<Vec<u8>>, _>(field_names::ENCRYPTED_ENVELOPE)
-            .unwrap_or(None);
-        if let Some(bytes) = enc {
-            let agent_id = memory
-                .metadata
-                .get("agent_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            match crate::encryption::open_content(&bytes, agent_id) {
-                Ok(plaintext) => memory.content = plaintext,
-                Err(e) => {
-                    // NEVER surface the empty placeholder as if it were the
-                    // plaintext content (that would mask key loss /
-                    // corruption). The only two legal dispositions are "error"
-                    // and "omit"; `crate::storage::DecryptFailurePolicy`
-                    // documents which read takes which.
-                    //
-                    // v1.0.0 #2383 (N1) — SkipRow keeps ONE poisoned row from
-                    // denying an entire namespace's list/search/recall. The row
-                    // is NOT modified or deleted; it becomes readable again the
-                    // moment the correct keypair is restored.
-                    if policy == crate::storage::DecryptFailurePolicy::SkipRow
-                        && !crate::storage::strict_decrypt_reads_enabled()
-                    {
-                        tracing::warn!(
-                            target: crate::storage::UNDECRYPTABLE_ROW_TRACE_TARGET,
-                            row_id = %memory.id,
-                            namespace = %memory.namespace,
-                            agent_id = %agent_id,
-                            error = %e,
-                            "{}", crate::storage::UNDECRYPTABLE_ROW_SKIPPED_MSG
-                        );
-                        crate::metrics::record_corrupt_provenance(field_names::ENCRYPTED_ENVELOPE);
-                        return Ok(None);
-                    }
+        //
+        // #4133 — only a column ABSENT from the result set (a pre-v68 backup)
+        // reads as "no envelope". Any other decode error on a PRESENT column
+        // is NOT folded into `None` (the old `.unwrap_or(None)` would then
+        // have surfaced the plaintext `content` column — fail OPEN); it takes
+        // the same fail-closed disposition as an undecryptable envelope.
+        let opened: Option<std::result::Result<String, String>> =
+            match row.try_get::<Option<Vec<u8>>, _>(field_names::ENCRYPTED_ENVELOPE) {
+                Ok(None) | Err(sqlx::Error::ColumnNotFound(_)) => None,
+                Ok(Some(bytes)) => {
+                    let agent_id = memory
+                        .metadata
+                        .get("agent_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
                     // #3718 — an ABSENT key renders as its class, never as a
-                    // wrong-recipient "decrypt failed", and never with a path.
-                    return Err(StoreError::IntegrityFailed {
-                        detail: format!(
-                            "{} for memory {}",
-                            crate::encryption::read_failure_detail(&e),
-                            memory.id
-                        ),
-                    });
+                    // wrong-recipient "decrypt failed", never with a path.
+                    Some(
+                        crate::encryption::open_content(&bytes, agent_id)
+                            .map_err(|e| crate::encryption::read_failure_detail(&e)),
+                    )
                 }
+                Err(_) => Some(Err(crate::storage::malformed_envelope_detail(
+                    "undecodable",
+                ))),
+            };
+        match opened {
+            None => {}
+            Some(Ok(plaintext)) => memory.content = plaintext,
+            Some(Err(detail)) => {
+                // NEVER surface the empty placeholder (or the raw plaintext
+                // column) as if it were the content. The only two legal
+                // dispositions are "error" and "omit";
+                // `crate::storage::DecryptFailurePolicy` documents which read
+                // takes which.
+                //
+                // v1.0.0 #2383 (N1) — SkipRow keeps ONE poisoned row from
+                // denying an entire namespace's list/search/recall. The row
+                // is NOT modified or deleted; it becomes readable again the
+                // moment the correct keypair is restored.
+                if policy == crate::storage::DecryptFailurePolicy::SkipRow
+                    && !crate::storage::strict_decrypt_reads_enabled()
+                {
+                    let agent_id = memory
+                        .metadata
+                        .get("agent_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    tracing::warn!(
+                        target: crate::storage::UNDECRYPTABLE_ROW_TRACE_TARGET,
+                        row_id = %memory.id,
+                        namespace = %memory.namespace,
+                        agent_id = %agent_id,
+                        error = %detail,
+                        "{}", crate::storage::UNDECRYPTABLE_ROW_SKIPPED_MSG
+                    );
+                    crate::metrics::record_corrupt_provenance(field_names::ENCRYPTED_ENVELOPE);
+                    return Ok(None);
+                }
+                return Err(StoreError::IntegrityFailed {
+                    detail: format!("{detail} for memory {}", memory.id),
+                });
             }
         }
 

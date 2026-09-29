@@ -277,6 +277,50 @@ fn parse_pg_conflict_stored_version(detail: &str) -> Option<i64> {
         .ok()
 }
 
+/// #4061 — parse the `If-Match` optimistic-concurrency header STRICTLY.
+///
+/// Accepted grammar (the whole received field, every field line):
+/// * absent → `Ok(None)` (no precondition, last-write-wins);
+/// * exactly one field line holding exactly `*` → `Ok(None)` (RFC 9110
+///   §13.1.1 "any current representation");
+/// * exactly one field line holding ONE version: a bare ASCII-digit integer
+///   (`42`) or the same wrapped in exactly one pair of double quotes
+///   (`"42"`, a strong entity-tag) → `Ok(Some(v))`.
+///
+/// Everything else is `Err` and refused before any write (fail closed): a
+/// repeated `If-Match` field line (RFC 9110 §5.2 combines them into a list,
+/// and `*` mixed with a tag is invalid), a comma list, a weak tag (`W/"1"`;
+/// If-Match uses strong comparison), unbalanced or stray quotes (`"1`,
+/// `1"`, `""1""`), signs, whitespace inside the tag, an empty value,
+/// non-ASCII, or an integer outside `i64`. Reading a malformed or combined
+/// field as "no precondition" would silently drop the caller's
+/// compare-and-swap fence.
+fn parse_if_match_version(headers: &HeaderMap) -> Result<Option<i64>, String> {
+    const MSG: &str = "If-Match must be a single integer memory version (42 or \"42\") or *";
+    let mut lines = headers.get_all("if-match").iter();
+    let Some(raw) = lines.next() else {
+        return Ok(None);
+    };
+    if lines.next().is_some() {
+        return Err(format!(
+            "{MSG}; multiple If-Match header fields are not supported"
+        ));
+    }
+    let text = raw.to_str().map_err(|_| MSG.to_string())?.trim();
+    let malformed = || format!("{MSG}, got {text:?}");
+    if text == "*" {
+        return Ok(None);
+    }
+    let digits = match text.strip_prefix('"') {
+        Some(rest) => rest.strip_suffix('"').ok_or_else(malformed)?,
+        None => text,
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(malformed());
+    }
+    digits.parse::<i64>().map(Some).map_err(|_| malformed())
+}
+
 #[allow(clippy::too_many_lines)]
 pub async fn update_memory(
     State(app): State<AppState>,
@@ -331,17 +375,21 @@ async fn update_memory_write(
     // a parseable integer, the storage::update_with_expected_version
     // path refuses the mutation with a 409 CONFLICT envelope carrying
     // both expected + current versions when the stored row has
-    // drifted. When the header is absent or unparseable, the legacy
-    // last-write-wins behaviour is preserved.
-    let if_match_version: Option<i64> = headers
-        .get("if-match")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| {
-            // Allow both bare integers and quoted ETag-style values
-            // ("42" or 42).
-            let trimmed = s.trim().trim_matches('"');
-            trimmed.parse::<i64>().ok()
-        });
+    // drifted. When the header is absent (or the RFC 9110 wildcard `*`,
+    // "any current representation"), the legacy last-write-wins
+    // behaviour is preserved.
+    //
+    // #4061 (sibling of the MCP `expected_version` defect) — a PRESENT
+    // header that is not a version (`If-Match: not-an-integer`, a weak
+    // `W/"3"` tag, a non-ASCII value) used to be read as "no precondition",
+    // silently dropping the caller's compare-and-swap fence so a stale write
+    // overwrote newer content. It is now REFUSED with 400 before any write.
+    let if_match_version: Option<i64> = match parse_if_match_version(&headers) {
+        Ok(v) => v,
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response();
+        }
+    };
 
     // v0.7.0 Wave-3 — Postgres-backed daemons take the SAL trait
     // dispatch path. The trait's `update` accepts an `UpdatePatch`

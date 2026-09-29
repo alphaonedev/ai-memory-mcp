@@ -607,7 +607,11 @@ fn run_compose(
     if let Some(b) = args.budget_tokens {
         params[field_names::BUDGET_TOKENS] = json!(b);
     }
-    match crate::mcp::handle_skill_compositional_context(conn, &params) {
+    // #4059 — the composed reflections are memory rows: scope them to the
+    // CLI read-visibility caller exactly like `ai-memory recall` (`None`,
+    // the single-operator posture, when no identity is configured).
+    let vis_caller = crate::identity::resolve_read_visibility_caller();
+    match crate::mcp::handle_skill_compositional_context(conn, &params, vis_caller.as_deref()) {
         Ok(v) => {
             emit_json(out, &v)?;
             Ok(0)

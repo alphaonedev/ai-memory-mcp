@@ -70,12 +70,23 @@ const RECALL_SATURATION: i64 = 50;
 /// CLI `ai-memory skill compose` and HTTP routes can dispatch into
 /// the same implementation.
 ///
+/// # Read authority (#4059)
+///
+/// The composed reflections ARE memory rows (`memories`, kind
+/// `reflection`), so every candidate passes the canonical read funnel
+/// [`crate::visibility::is_readable_on_query`] for `caller` before it is
+/// scored, budgeted, or rendered. The declared namespace counts as named
+/// explicitly. `caller` is the dispatch-resolved read caller
+/// (`Authority::read_caller`); `None` is the documented single-tenant
+/// trust-all posture (local operator / admin-gated HTTP route).
+///
 /// # Errors
 /// Returns a substrate error string when `skill_id` is missing/invalid,
 /// the skill is not found, or zstd body decompression fails.
 pub fn handle_skill_compositional_context(
     conn: &Connection,
     params: &Value,
+    caller: Option<&str>,
 ) -> Result<Value, String> {
     let skill_id = params["skill_id"]
         .as_str()
@@ -151,10 +162,15 @@ pub fn handle_skill_compositional_context(
             continue;
         }
 
+        // #4059 — select candidate IDS only, then read the rows (below) and
+        // pass each through lifecycle visibility and the canonical
+        // caller-visibility funnel BEFORE it can be scored or rendered. Pre-#4059 this read `title`/`content`
+        // straight from `memories` with no owner / scope predicate, so another
+        // agent's `scope=private` reflection in a declared namespace was
+        // returned verbatim.
         let mut stmt = conn
             .prepare(
-                "SELECT id, namespace, title, content, created_at, access_count, \
-                        reflection_depth, memory_kind \
+                "SELECT id \
                  FROM memories \
                  WHERE namespace = ?1 \
                    AND memory_kind = 'reflection' \
@@ -168,7 +184,7 @@ pub fn handle_skill_compositional_context(
             })?;
 
         let now_iso = chrono::Utc::now().to_rfc3339();
-        let rows = stmt
+        let ids = stmt
             .query_map(
                 rusqlite::params![
                     &entry.namespace,
@@ -176,36 +192,46 @@ pub fn handle_skill_compositional_context(
                     i64::from(ceiling),
                     now_iso,
                 ],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, i64>(5)?,
-                        row.get::<_, i32>(6)?,
-                        row.get::<_, String>(7)?,
-                    ))
-                },
+                |row| row.get::<_, String>(0),
             )
-            .map_err(|e| crate::mcp::error_text::mcp_foreign_err("reflections SELECT exec", e))?;
+            .map_err(|e| crate::mcp::error_text::mcp_foreign_err("reflections SELECT exec", e))?
+            .collect::<Result<Vec<String>, _>>()
+            .map_err(|e| crate::mcp::error_text::mcp_foreign_err("reflections row", e))?;
 
-        for row in rows {
-            let (id, ns, title, content, created_at, access_count, depth, kind) =
-                row.map_err(|e| crate::mcp::error_text::mcp_foreign_err("reflections row", e))?;
-            let recency = recency_score(&created_at, now_epoch);
-            let recall = recall_score(access_count);
+        // #4059 (R10b) — batch-read through the SCAN decode policy
+        // (`db::get_many` → `row_to_memory_scan`): a candidate whose at-rest
+        // envelope cannot be decrypted is OMITTED (WARN +
+        // `undecryptable` metric emitted by the mapper) instead of failing
+        // the whole composition for every caller. The omitted row stays fail
+        // closed — its content is never returned. A genuine read failure
+        // (schema / corrupt column) still propagates. Candidate order (newest
+        // first) is preserved from `ids`; lifecycle visibility (the rule
+        // `db::get` applies) and the caller read funnel are applied
+        // explicitly to every fetched row.
+        let mut fetched = crate::db::get_many(conn, &ids)
+            .map_err(|e| crate::mcp::error_text::mcp_foreign_err("reflections get_many", e))?;
+        for id in ids {
+            let Some(mem) = fetched.remove(&id) else {
+                continue;
+            };
+            if !mem.lifecycle_state.is_recall_visible() {
+                continue;
+            }
+            if !crate::visibility::is_readable_on_query(&mem, caller, Some(&entry.namespace)) {
+                continue;
+            }
+            let recency = recency_score(&mem.created_at, now_epoch);
+            let recall = recall_score(mem.access_count);
             let score = recency + recall;
             scored.push(ScoredReflection {
-                id,
-                namespace: ns,
-                title,
-                content,
-                created_at,
-                access_count,
-                reflection_depth: depth,
-                memory_kind: kind,
+                id: mem.id,
+                namespace: mem.namespace,
+                title: mem.title,
+                content: mem.content,
+                created_at: mem.created_at,
+                access_count: mem.access_count,
+                reflection_depth: mem.reflection_depth,
+                memory_kind: mem.memory_kind.as_str().to_string(),
                 score,
             });
         }
@@ -214,11 +240,8 @@ pub fn handle_skill_compositional_context(
     // -----------------------------------------------------------------------
     // 4) Sort by score (descending) and apply the token budget.
     // -----------------------------------------------------------------------
-    scored.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    // PERF-25 — total, NaN-safe order.
+    scored.sort_by(|a, b| b.score.total_cmp(&a.score));
 
     let mut tokens_used: usize = 0;
     let mut dropped: usize = 0;
