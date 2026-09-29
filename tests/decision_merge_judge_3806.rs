@@ -1596,8 +1596,11 @@ async fn a_malformed_or_out_of_range_confidence_never_permits_over_the_wire() {
         (
             "positive_logprob_p_gt_1",
             format!(
-                r#"{{"choices":[{{"message":{{"role":"assistant","content":{}}},"logprobs":{{"content":[{{"token":"yes","logprob":0.5}}]}}}}]}}"#,
-                serde_json::to_string(&document).unwrap()
+                // #4011 — the stream spells the content, so this cell blocks on
+                // the out-of-range logprob and not on a stream/content mismatch.
+                r#"{{"choices":[{{"message":{{"role":"assistant","content":{}}},"logprobs":{{"content":[{{"token":{},"logprob":0.0}},{{"token":"yes","logprob":0.5}},{{"token":"\"}}","logprob":0.0}}]}}}}]}}"#,
+                serde_json::to_string(&document).unwrap(),
+                serde_json::to_string(&format!("{{\"{FIELD_VERDICT}\":\"")).unwrap()
             ),
         ),
     ];

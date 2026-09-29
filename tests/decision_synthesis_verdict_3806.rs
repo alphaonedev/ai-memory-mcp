@@ -908,10 +908,21 @@ fn refuse_posture_on_an_unavailable_judge_fails_closed_to_noop() {
 // this W3 pin a LANDING CONDITION for #3806.
 // ---------------------------------------------------------------------------
 
-/// A decision body whose `content` is `document` and whose logprob stream
-/// is exactly `tokens` (text, probability), so a cell controls which token
-/// carries which confidence.
-fn decision_body_with_stream(document: &str, tokens: &[(&str, f64)]) -> Value {
+/// A REALISTIC decision body: its logprob stream is exactly `tokens` (text,
+/// probability), and its `content` is what those tokens spell, as it is for
+/// every real provider. A cell controls which token carries which
+/// confidence without the content drifting from the stream. (#4011: a
+/// `json!` document sorts its keys, so a hand-built document silently
+/// disagreed with a verdict-first stream.)
+fn decision_body_with_stream(tokens: &[(&str, f64)]) -> Value {
+    let document: String = tokens.iter().map(|(token, _)| *token).collect();
+    decision_body_with_stream_and_content(&document, tokens)
+}
+
+/// A decision body whose `content` is `document` and whose logprob stream is
+/// `tokens`, even when the two DISAGREE. Only the #4011 cell uses this, to
+/// model an endpoint whose logprobs cover more than the content.
+fn decision_body_with_stream_and_content(document: &str, tokens: &[(&str, f64)]) -> Value {
     let content: Vec<Value> = tokens
         .iter()
         .map(|(token, p)| json!({"token": token, "logprob": p.ln()}))
@@ -939,23 +950,19 @@ fn unrelated_field_confidence_never_licenses_a_delete_3806_p1() {
     let _g = synthesis_lock().lock().unwrap_or_else(|p| p.into_inner());
     let (conn, db_path) = open_db();
     let cand = seed_existing(&conn, "obsolete deploy note", "old", "ns-p1-misattr");
-    let document = json!({ FIELD_VERDICT: "yes", "note": "yes" }).to_string();
     let server = mock_server(
         delete_verdict(&cand),
-        Some(decision_body_with_stream(
-            &document,
-            &[
-                ("{\"", 0.99),
-                (FIELD_VERDICT, 0.99),
-                ("\":", 0.99),
-                ("\"yes", 0.01),
-                ("\",\"", 0.99),
-                ("note", 0.99),
-                ("\":\"", 0.99),
-                ("yes", 0.99),
-                ("\"}", 0.99),
-            ],
-        )),
+        Some(decision_body_with_stream(&[
+            ("{\"", 0.99),
+            (FIELD_VERDICT, 0.99),
+            ("\":", 0.99),
+            ("\"yes", 0.01),
+            ("\",\"", 0.99),
+            ("note", 0.99),
+            ("\":\"", 0.99),
+            ("yes", 0.99),
+            ("\"}", 0.99),
+        ])),
     );
     let llm = llm_with_decider(&server.uri(), &db_path, DecisionFallback::Abstain);
 
@@ -989,23 +996,19 @@ fn verdict_field_confidence_still_licenses_a_delete_3806_p1_control() {
     let _g = synthesis_lock().lock().unwrap_or_else(|p| p.into_inner());
     let (conn, db_path) = open_db();
     let cand = seed_existing(&conn, "obsolete deploy note", "old", "ns-p1-control");
-    let document = json!({ FIELD_VERDICT: "yes", "note": "stale" }).to_string();
     let server = mock_server(
         delete_verdict(&cand),
-        Some(decision_body_with_stream(
-            &document,
-            &[
-                ("{\"", 0.99),
-                (FIELD_VERDICT, 0.99),
-                ("\":\"", 0.99),
-                ("yes", 0.99),
-                ("\",\"", 0.99),
-                ("note", 0.99),
-                ("\":\"", 0.99),
-                ("stale", 0.99),
-                ("\"}", 0.99),
-            ],
-        )),
+        Some(decision_body_with_stream(&[
+            ("{\"", 0.99),
+            (FIELD_VERDICT, 0.99),
+            ("\":\"", 0.99),
+            ("yes", 0.99),
+            ("\",\"", 0.99),
+            ("note", 0.99),
+            ("\":\"", 0.99),
+            ("stale", 0.99),
+            ("\"}", 0.99),
+        ])),
     );
     let llm = llm_with_decider(&server.uri(), &db_path, DecisionFallback::Abstain);
 
@@ -1097,4 +1100,63 @@ fn a_withheld_synthesis_delete_is_reported_on_the_response_4173() {
         !surviving_ids(&conn, "ns-4173-permit").contains(&cand),
         "the control delete must actually apply"
     );
+}
+
+// ---------------------------------------------------------------------------
+// #4011 residual (SECPROG L1) — the confidence must come from the SAME text
+// the verdict was decoded from.
+// ---------------------------------------------------------------------------
+
+/// #4011 residual. The verdict is decoded from `message.content`
+/// (`{"verdict":"yes"}`), but the logprob stream carries MORE than that
+/// document: a draft `{"verdict":"yes"}` at 0.99, then a stray `{` that
+/// pushes the real answer to depth 2, where it sits at 0.01. The depth-1
+/// scanner finds exactly one top-level verdict in the stream (the draft's)
+/// and would attribute 0.99, so a destructive Permit follows. With the fix,
+/// the stream does not spell the content, so there is no confidence, the
+/// delete blocks, and the candidate survives.
+///
+/// RED on 65642b3cf: the candidate is deleted. The control is the same
+/// answer with a stream that spells exactly the content at 0.99, which
+/// still permits and deletes, so the check does not block honest streams.
+#[test]
+fn a_stream_that_is_not_the_content_never_licenses_a_delete_4011() {
+    let _g = synthesis_lock().lock().unwrap_or_else(|p| p.into_inner());
+    let document = json!({ FIELD_VERDICT: "yes" }).to_string();
+    let open = format!("{{\"{FIELD_VERDICT}\":\"");
+    for (ns, tokens, deleted) in [
+        (
+            "ns-4011-spliced",
+            vec![
+                (open.as_str(), 1.0),
+                ("yes", 0.99),
+                ("\"}", 1.0),
+                ("{", 1.0),
+                (open.as_str(), 1.0),
+                ("yes", 0.01),
+                ("\"}", 1.0),
+                ("}", 1.0),
+            ],
+            false,
+        ),
+        (
+            "ns-4011-honest",
+            vec![(open.as_str(), 1.0), ("yes", 0.99), ("\"}", 1.0)],
+            true,
+        ),
+    ] {
+        let (conn, db_path) = open_db();
+        let cand = seed_existing(&conn, "obsolete deploy note", "old", ns);
+        let server = mock_server(
+            delete_verdict(&cand),
+            Some(decision_body_with_stream_and_content(&document, &tokens)),
+        );
+        let llm = llm_with_decider(&server.uri(), &db_path, DecisionFallback::Abstain);
+        run_store(&conn, &db_path, &llm, store_req(ns)).expect("ok");
+        let survived = surviving_ids(&conn, ns).contains(&cand);
+        assert_eq!(
+            survived, !deleted,
+            "{ns}: deleted must be {deleted} (a stream that is not the content carries no confidence)"
+        );
+    }
 }

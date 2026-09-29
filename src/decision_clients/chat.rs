@@ -355,7 +355,12 @@ impl OpenAiCompatibleDecider {
 
     /// Confidence for `label`, or `None` when it cannot be attributed.
     fn confidence_for(answer: &StructuredAnswer, label: &str) -> Option<f64> {
-        label_probability(answer.logprobs.as_deref()?, answer.field, label)
+        attributed_confidence(
+            answer.logprobs.as_deref()?,
+            &answer.document,
+            answer.field,
+            label,
+        )
     }
 }
 
@@ -430,6 +435,10 @@ struct StructuredAnswer {
     field: &'static str,
     payload: Value,
     logprobs: Option<Vec<Value>>,
+    /// #4011 — the `message.content` document the payload was decoded
+    /// from. Confidence is attributed only when the logprob tokens spell
+    /// exactly this document.
+    document: String,
 }
 
 /// Pull `field` out of `choices[0].message.content` (a JSON document
@@ -488,6 +497,7 @@ fn read_structured_answer(
         field,
         payload,
         logprobs,
+        document: content.to_string(),
     })
 }
 
@@ -614,6 +624,32 @@ fn top_level_string_value_offset(text: &str, field: &str, label: &str) -> Option
 /// attributed to the verdict and PERMITTED a destructive delete while the
 /// verdict itself carried p=0.01. Anchoring to the field closes that; a
 /// fused (unaligned) verdict now reports NO confidence, which blocks.
+/// #4011 — confidence for `label`, attributed ONLY when the logprob tokens
+/// are the content document the verdict was decoded from. The verdict is
+/// read from `message.content`, and the confidence from the concatenated
+/// `logprobs.content` tokens. An endpoint whose logprobs cover MORE than the
+/// content (reasoning or think tokens, a proxy that splices a draft) can
+/// carry a confident `yes` that is not the answer. So the two must agree
+/// byte-for-byte; only surrounding JSON whitespace (space, tab, CR, LF) is
+/// forgiven. On any disagreement the confidence is `None`, which blocks a
+/// destructive seam.
+fn attributed_confidence(
+    logprobs: &[Value],
+    document: &str,
+    field: &str,
+    label: &str,
+) -> Option<f64> {
+    let mut spelled = String::new();
+    for entry in logprobs {
+        spelled.push_str(entry.get("token")?.as_str()?);
+    }
+    let json_ws = |c: char| matches!(c, ' ' | '\t' | '\n' | '\r');
+    if spelled.trim_matches(json_ws) != document.trim_matches(json_ws) {
+        return None;
+    }
+    label_probability(logprobs, field, label)
+}
+
 fn label_probability(content: &[Value], field: &str, label: &str) -> Option<f64> {
     if label.is_empty() || field.is_empty() || content.is_empty() {
         return None;
@@ -896,6 +932,34 @@ mod tests {
         assert!(
             read_structured_answer(&body, FIELD_CHOICE).is_ok(),
             "an empty refusal must not block a valid answer: {body}"
+        );
+    }
+
+    /// #4011 — confidence is attributed only when the tokens spell the
+    /// content document; surrounding JSON whitespace is forgiven, and
+    /// nothing else is.
+    #[test]
+    fn confidence_requires_the_tokens_to_be_the_content_4011() {
+        let tok = |t: &str, p: f64| json!({"token": t, "logprob": p.ln()});
+        let stream = vec![
+            tok("{\"verdict\":\"", 1.0),
+            tok("yes", 0.9),
+            tok("\"}", 1.0),
+        ];
+        let doc = "{\"verdict\":\"yes\"}";
+        assert!(attributed_confidence(&stream, doc, "verdict", "yes").is_some());
+        // Surrounding JSON whitespace on either side is tolerated.
+        assert!(
+            attributed_confidence(&stream, &format!(" \n{doc}\r\n"), "verdict", "yes").is_some()
+        );
+        // A stream carrying anything more than the document is not attributable.
+        let mut more = stream.clone();
+        more.push(tok("{", 1.0));
+        assert_eq!(attributed_confidence(&more, doc, "verdict", "yes"), None);
+        // A different document with the same scanned verdict is not either.
+        assert_eq!(
+            attributed_confidence(&stream, "{\"verdict\":\"yes\",\"x\":1}", "verdict", "yes"),
+            None
         );
     }
 
