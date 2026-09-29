@@ -448,8 +448,18 @@ fn decision_http_client(
     pin: Option<&crate::egress::PinnedTarget>,
 ) -> Result<reqwest::Client> {
     let builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
+    // #4193 — under any posture other than `allow`, an environment proxy
+    // (HTTP_PROXY / HTTPS_PROXY / ALL_PROXY) would carry an ADMITTED call
+    // (Bearer key plus memory content) to a host the egress gate never
+    // approved. So the client ignores proxies there. Under `allow` every
+    // destination is permitted anyway, and a corporate proxy keeps working.
+    let restricted = !matches!(
+        crate::egress::resolve_inference_egress_mode(),
+        crate::egress::InferenceEgressMode::Allow
+    );
     let builder = match pin {
         Some(pin) => builder.resolve_to_addrs(&pin.host, &pin.addrs).no_proxy(),
+        None if restricted => builder.no_proxy(),
         None => builder,
     };
     builder
