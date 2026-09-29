@@ -67,8 +67,8 @@ pub enum HealthStatus {
     /// Something exists at the path but it is not a socket. Reported
     /// separately because the remedy is "fix the path", not "start the hub".
     NotASocket,
-    /// The socket exists but nothing is listening: a hub that died without
-    /// unlinking, or one that has not finished binding.
+    /// The socket refused the connection: no listener, an unfinished bind,
+    /// or a full accept queue on macOS/BSD.
     ConnectionRefused,
     /// The kernel refused the connection. On a 0600 socket this is the
     /// peer-credential / ownership answer: from here, the hub is unreachable.
@@ -118,8 +118,9 @@ impl HealthStatus {
                  path — the hub will REFUSE to unlink it, and so does this probe"
             }
             Self::ConnectionRefused => {
-                "the socket file is stale: no process is listening on it. The next \
-                 `ai-memory wake-hub` start clears it after probing"
+                "the socket refused a connection: no listener, or a full accept queue on \
+                 macOS/BSD. Check the hub process and logs; startup clears a stale \
+                 socket only after acquiring its ownership lock and probing"
             }
             Self::PermissionDenied => {
                 "the socket is 0600 inside a 0700 directory and admits only its owner: \

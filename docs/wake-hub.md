@@ -849,9 +849,24 @@ Cost to the hub is one short-lived connection bounded by a 2 s budget, against
 a pre-auth budget of 4 frames/s that the probe never spends (it sends zero
 frames). Every outcome that is not "a well-formed challenge arrived" is
 `unreachable` with a named cause and remedy — `socket_missing`,
-`not_a_socket`, `connection_refused` (a stale socket with no listener),
+`not_a_socket`, `connection_refused` (no listener, or a full queue on macOS/BSD),
 `permission_denied`, `timeout`, `unexpected_frame` — because a supervisor that
 reads "healthy" from an inconclusive probe is worse than no probe.
+
+### Socket ownership at startup
+
+The hub takes a nonblocking exclusive lock on `<socket>.lock` before probing or
+binding the socket and holds it until shutdown finishes. The lock file stays in
+the same private directory after exit; leave it in place. Removing it while a
+hub is running would allow a second starter to lock a different file.
+
+A refused connection alone does not prove that the hub is dead: macOS/BSD can
+return `ECONNREFUSED` for a live listener with a full accept queue. A held lock
+therefore refuses startup before the probe can remove that socket. After a crash,
+the OS releases the lock, allowing the next starter to clear a stale socket.
+When upgrading from a version without this lock, stop the old hub first; the
+connection probe remains an additional check, but cannot distinguish that old
+hub's full queue from a stale socket on macOS/BSD.
 
 ### What it reports — the metrics
 

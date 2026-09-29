@@ -24,7 +24,7 @@
 
 use std::fs;
 use std::io;
-use std::os::unix::fs::{DirBuilderExt, FileTypeExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::Path;
 
@@ -310,22 +310,34 @@ pub fn configure_fd_limit(configured_max_connections: usize) -> Result<FdBudget>
     Ok(budget)
 }
 
-/// Verify (or create) the socket's parent directory and clear the path.
+/// Exclusive ownership of a wake-hub socket path (#4120).
+///
+/// Keep this guard until the listener is closed and shutdown has finished.
+/// The lock file deliberately survives release: unlinking it would let another
+/// starter lock a different inode while an existing owner still holds this one.
+#[derive(Debug)]
+#[must_use = "keep the socket ownership guard alive for the listener's lifetime"]
+pub struct SocketPathGuard {
+    _lock: fs::File,
+}
+
+/// Verify the parent directory, reserve the socket path, and clear a stale socket.
+///
+/// The returned guard must remain held through bind, serving, and shutdown.
+/// A connection refusal alone is not proof of a dead hub: macOS/BSD also return
+/// `ECONNREFUSED` when a live listener's accept queue is full. Acquire the
+/// lifetime lock BEFORE inspecting or probing the socket, even if it is absent.
 ///
 /// # Errors
 ///
-/// Refuses when the parent directory is missing-and-uncreatable, is not a
-/// directory, is not owned by this process, or is group/other-accessible; and
-/// when the socket path itself is occupied by something that is NOT a stale
-/// socket.
+/// Refuses an unsuitable directory or lock file, a held/unavailable lock, a
+/// non-socket path, a live listener, or any ambiguous probe failure.
 ///
 /// # Data integrity
 ///
-/// The ONLY thing this function will ever unlink is a path that `stat`s as a
-/// socket AND refuses a connection. A regular file, a directory, a symlink to
-/// either, or a socket a live hub is still listening on all produce a refusal.
-/// Blind `remove_file` on a configured path is how a typo becomes data loss.
-pub fn prepare_socket_path(path: &Path) -> Result<()> {
+/// Only an exclusively owned path that is a socket AND refuses a connection
+/// may be unlinked. Regular files, directories and symlinks are preserved.
+pub fn prepare_socket_path(path: &Path) -> Result<SocketPathGuard> {
     let parent = path.parent().ok_or_else(|| {
         anyhow::anyhow!(
             "wake-hub: socket path {} has no parent directory",
@@ -334,6 +346,42 @@ pub fn prepare_socket_path(path: &Path) -> Result<()> {
     })?;
     prepare_socket_dir(parent)?;
 
+    let mut lock_path = path.as_os_str().to_os_string();
+    lock_path.push(".lock");
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(SOCKET_MODE)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&lock_path)
+        .with_context(|| {
+            format!(
+                "wake-hub: could not open ownership lock for {}",
+                path.display()
+            )
+        })?;
+    if !lock.metadata()?.is_file() {
+        bail!(
+            "wake-hub: ownership lock for {} is not a regular file",
+            path.display()
+        );
+    }
+    lock.try_lock().with_context(|| {
+        format!(
+            "wake-hub: could not acquire ownership lock for {}; another wake-hub may own it",
+            path.display()
+        )
+    })?;
+    let guard = SocketPathGuard { _lock: lock };
+    clear_unowned_socket(path)?;
+    Ok(guard)
+}
+
+/// Called only while the lifetime lock is held. Keep the connect probe as an
+/// additional refusal for listeners started by older binaries without a lock.
+fn clear_unowned_socket(path: &Path) -> Result<()> {
     let meta = match fs::symlink_metadata(path) {
         Ok(m) => m,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -350,10 +398,9 @@ pub fn prepare_socket_path(path: &Path) -> Result<()> {
             path.display()
         );
     }
-    // A BLOCKING connect, deliberately: this runs once at start-up, before the
-    // listener exists, and the alternative — unlinking whatever is at the path —
-    // is how a mistyped socket path becomes data loss. The probe targets a local
-    // AF_UNIX socket, so it resolves immediately in both outcomes.
+    // The lifetime lock protects cooperating hubs. Retain the existing probe
+    // to refuse a responsive legacy listener, which has no lock. Old hubs must
+    // be stopped before upgrading: their queue can make this probe ambiguous.
     match std::os::unix::net::UnixStream::connect(path) {
         Ok(_) => bail!(
             "wake-hub: another wake-hub is already listening on {}. Refusing to \
@@ -534,7 +581,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tmp");
         let dir = tmp.path().join("nested").join("run");
         let sock = dir.join("wake-hub.sock");
-        prepare_socket_path(&sock).expect("prepare");
+        let _guard = prepare_socket_path(&sock).expect("prepare");
         let mode = fs::metadata(&dir).expect("stat").permissions().mode() & 0o777;
         assert_eq!(mode, SOCKET_DIR_MODE);
     }
@@ -588,6 +635,131 @@ mod tests {
         assert!(path.exists(), "the live socket must survive the refusal");
     }
 
+    /// A refused connection does not prove that the owner is dead (#4120).
+    /// Model the macOS/BSD full-backlog errno on every host with a closed
+    /// listener, while the owner still holds the socket's lifetime lock.
+    #[test]
+    fn refused_connection_does_not_override_a_live_owner_4120() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let dir = tmp.path().join("run");
+        prepare_socket_dir(&dir)?;
+        let path = dir.join("owned.sock");
+        let owner = fs::File::create(dir.join("owned.sock.lock"))?;
+        owner.try_lock()?;
+        drop(StdUnixListener::bind(&path)?);
+        let err = std::os::unix::net::UnixStream::connect(&path).expect_err("refused");
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionRefused);
+        let result = prepare_socket_path(&path);
+        assert!(result.is_err(), "a live owner must prevent socket takeover");
+        assert!(path.exists(), "the owned socket must not be unlinked");
+        drop(owner);
+        let _guard = prepare_socket_path(&path)?;
+        assert!(!path.exists(), "a dead owner's stale socket is recoverable");
+        Ok(())
+    }
+
+    #[test]
+    fn a_live_owner_reserves_even_an_absent_socket_path_4120() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let dir = tmp.path().join("run");
+        prepare_socket_dir(&dir)?;
+        let owner = fs::File::create(dir.join("starting.sock.lock"))?;
+        owner.try_lock()?;
+        let result = prepare_socket_path(&dir.join("starting.sock"));
+        assert!(
+            result.is_err(),
+            "concurrent starters must be serialized before bind"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_full_accept_queue_cannot_lose_its_owned_socket_4120() -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        use std::time::Duration;
+
+        let tmp = tempfile::tempdir()?;
+        let path = tmp.path().join("run/full.sock");
+        let _guard = prepare_socket_path(&path)?;
+        let listener = StdUnixListener::bind(&path)?;
+        // SAFETY: the listener owns this live socket descriptor; listen takes
+        // no pointers and only lowers its accept backlog for this test.
+        if unsafe { libc::listen(listener.as_raw_fd(), 1) } != 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        let before = fs::symlink_metadata(&path)?;
+        let mut clients = Vec::new();
+        let mut saturated = false;
+        for _ in 0..16 {
+            match tokio::time::timeout(
+                Duration::from_millis(50),
+                tokio::net::UnixStream::connect(&path),
+            )
+            .await
+            {
+                Ok(Ok(client)) => clients.push(client),
+                Ok(Err(err))
+                    if matches!(
+                        err.kind(),
+                        io::ErrorKind::ConnectionRefused | io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    // macOS/BSD refuse; Linux may report EAGAIN directly.
+                    saturated = true;
+                    break;
+                }
+                Err(_) => {
+                    // Linux's full queue stays pending until somebody accepts.
+                    saturated = true;
+                    break;
+                }
+                Ok(Err(err)) => return Err(err.into()),
+            }
+        }
+        assert!(saturated, "the accept queue must actually be full");
+        let result = prepare_socket_path(&path);
+        assert!(result.is_err(), "a saturated owner must keep its socket");
+        let after = fs::symlink_metadata(&path)?;
+        assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
+        drop(clients);
+        drop(listener);
+        Ok(())
+    }
+
+    #[test]
+    fn lock_file_survives_release_and_failure_releases_ownership_4120() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let path = tmp.path().join("run/hub.sock");
+        let first = prepare_socket_path(&path)?;
+        let lock_path = tmp.path().join("run/hub.sock.lock");
+        assert!(lock_path.is_file());
+        assert_eq!(
+            fs::metadata(&lock_path)?.permissions().mode() & 0o777,
+            SOCKET_MODE
+        );
+        drop(first);
+        assert!(lock_path.is_file(), "never unlink the coordination inode");
+        fs::write(&path, b"keep me")?;
+        assert!(prepare_socket_path(&path).is_err());
+        assert_eq!(fs::read(&path)?, b"keep me");
+        fs::remove_file(&path)?;
+        let _next = prepare_socket_path(&path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_symlink_at_the_lock_path_is_refused_4120() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let path = tmp.path().join("run/hub.sock");
+        prepare_socket_dir(path.parent().expect("parent"))?;
+        let target = tmp.path().join("precious");
+        fs::write(&target, b"keep me")?;
+        std::os::unix::fs::symlink(&target, tmp.path().join("run/hub.sock.lock"))?;
+        assert!(prepare_socket_path(&path).is_err());
+        assert_eq!(fs::read(&target)?, b"keep me");
+        Ok(())
+    }
+
     #[test]
     fn a_stale_socket_is_cleared() {
         let tmp = tempfile::tempdir().expect("tmp");
@@ -599,7 +771,7 @@ mod tests {
             let _listener = StdUnixListener::bind(&path).expect("bind");
         }
         assert!(path.exists(), "the socket file outlives the listener");
-        prepare_socket_path(&path).expect("stale socket is clearable");
+        let _guard = prepare_socket_path(&path).expect("stale socket is clearable");
         assert!(!path.exists());
     }
 

@@ -26,8 +26,8 @@ use super::frame::{ErrorCode, Frame, Kind, encode_error};
 use super::limits::{DRAIN_DEADLINE_MS, DRAIN_POLL_MS, EgressBudget};
 use super::metrics::{HubMetrics, MetricsSnapshot};
 use super::startup::{
-    FdBudget, assert_peer_credentials_available, configure_fd_limit, enforce_socket_mode,
-    prepare_socket_path, read_peer_cred,
+    FdBudget, SocketPathGuard, assert_peer_credentials_available, configure_fd_limit,
+    enforce_socket_mode, prepare_socket_path, read_peer_cred,
 };
 use super::{HubConfig, HubDeps, HubState, conn};
 
@@ -82,6 +82,7 @@ type SocketIdent = (u64, u64);
 #[derive(Debug)]
 pub struct WakeHub {
     listener: UnixListener,
+    _socket_guard: SocketPathGuard,
     state: Arc<HubState>,
     socket_path: PathBuf,
     socket_ident: Option<SocketIdent>,
@@ -124,7 +125,7 @@ impl WakeHub {
 
         let socket_path = cfg.socket_path.clone();
         check_socket_path_length(&socket_path)?;
-        prepare_socket_path(&socket_path)?;
+        let socket_guard = prepare_socket_path(&socket_path)?;
         let listener = UnixListener::bind(&socket_path)
             .with_context(|| format!("wake-hub: could not bind {}", socket_path.display()))?;
         enforce_socket_mode(&socket_path)?;
@@ -149,6 +150,7 @@ impl WakeHub {
         );
         Ok(Self {
             listener,
+            _socket_guard: socket_guard,
             state,
             socket_path,
             socket_ident,
@@ -207,6 +209,8 @@ impl WakeHub {
     /// Only for a listener failure that is not recoverable by backing off.
     pub async fn serve(self, shutdown: impl Future<Output = ()> + Send) -> Result<()> {
         let Self {
+            // Bind the guard first so cancellation drops the listener before it.
+            _socket_guard: socket_guard,
             listener,
             state,
             socket_path,
@@ -235,9 +239,10 @@ impl WakeHub {
         //   [`SocketIdent`].
         remove_own_socket(&socket_path, socket_ident);
         drain(&state, &socket_path, &shutdown_tx).await;
-        // The listener is dropped LAST: it is what pins our inode, and it is
-        // what the still-draining sessions were accepted on.
+        // Keep ownership through the drain and listener close. The listener
+        // pins our inode until all cleanup has finished.
         drop(listener);
+        drop(socket_guard);
         Ok(())
     }
 }
@@ -487,6 +492,50 @@ mod tests {
             "unexpected: {err}"
         );
         assert!(check_socket_path_length(Path::new("/tmp/a/s.sock")).is_ok());
+    }
+
+    #[tokio::test]
+    async fn ownership_is_held_while_bound_and_serving_then_released_4120() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let path = tmp.path().join("run/hub.sock");
+        let cfg = HubConfig::with_socket_path(path.clone());
+        let hub = WakeHub::bind(cfg.clone(), HubDeps::default())?;
+        // Remove the endpoint to ensure only the lifetime lock can refuse a
+        // second starter; a successful-connect probe cannot protect this case.
+        std::fs::remove_file(&path)?;
+        assert!(WakeHub::bind(cfg.clone(), HubDeps::default()).is_err());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(hub.serve(async move {
+            started_tx.send(()).expect("test observes serving");
+            stop_rx.await.expect("test requests stop");
+        }));
+        started_rx.await?;
+        assert!(WakeHub::bind(cfg.clone(), HubDeps::default()).is_err());
+        stop_tx.send(()).expect("serving task receives stop");
+        task.await??;
+        let replacement = WakeHub::bind(cfg.clone(), HubDeps::default())?;
+        drop(replacement);
+        let _after_drop = WakeHub::bind(cfg, HubDeps::default())?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancellation_releases_socket_ownership_4120() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let path = tmp.path().join("run/hub.sock");
+        let cfg = HubConfig::with_socket_path(path);
+        let hub = WakeHub::bind(cfg.clone(), HubDeps::default())?;
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(hub.serve(async move {
+            started_tx.send(()).expect("test observes serving");
+            std::future::pending::<()>().await;
+        }));
+        started_rx.await?;
+        task.abort();
+        assert!(task.await.expect_err("cancelled").is_cancelled());
+        let _replacement = WakeHub::bind(cfg, HubDeps::default())?;
+        Ok(())
     }
 
     /// #3471 — the drain unlinks the socket IT created, in the order the hub
