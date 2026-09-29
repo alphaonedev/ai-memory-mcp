@@ -193,27 +193,18 @@ async fn the_internal_only_pin_overrides_resolution_portable() {
 }
 
 /// SECOND-LOOPBACK half: the pin reaches an address the resolver NEVER
-/// yields for `localhost` (`127.0.0.2`). Needs `127.0.0.2` to be bindable —
-/// true on Linux, where this assertion is always alive. Where the platform
-/// genuinely cannot express the case (macOS without an alias), it says so
-/// with a `skip:` line and the portable half above still carries the
-/// pin-overrides-resolution assertion; any OTHER bind failure is a FAIL.
+/// yields for `localhost` (`127.0.0.2`). The cell is compiled for Linux ONLY,
+/// where every `127.0.0.0/8` address is bindable. #4177: it used to print
+/// `skip:` and `return` on other platforms, so it reported ok on macOS
+/// without testing anything. The portable half,
+/// `the_internal_only_pin_overrides_resolution_portable`, still asserts the
+/// pin on every platform.
+#[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread")]
 async fn the_internal_only_pin_is_what_the_client_connects_to() {
-    let (server, port) = match server_on([127, 0, 0, 2]).await {
-        Ok(bound) => bound,
-        Err(e)
-            if e.kind() == std::io::ErrorKind::AddrNotAvailable && !cfg!(target_os = "linux") =>
-        {
-            println!(
-                "skip: 127.0.0.2 is not a configured loopback address on this host ({e}); \
-                 the portable pin test the_internal_only_pin_overrides_resolution_portable \
-                 still asserts the pin (f1 delta N3)"
-            );
-            return;
-        }
-        Err(e) => panic!("bind 127.0.0.2: {e}"),
-    };
+    let (server, port) = server_on([127, 0, 0, 2])
+        .await
+        .unwrap_or_else(|e| panic!("bind 127.0.0.2: {e}"));
     let resolved = resolve_for("openai-compatible", &format!("http://localhost:{port}"));
 
     // PRESENCE — pinned to 127.0.0.2, the client reaches the server and

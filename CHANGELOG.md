@@ -78,7 +78,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   TRUE half-open (f1 delta N2): after the cooldown exactly one caller probes
   the endpoint while every concurrent caller keeps short-circuiting until that
   probe's result closes or re-opens it; a cancelled probe counts as failed and
-  frees the slot. The socket-pin pin runs on every platform (f1 delta N3).
+  frees the slot. The portable socket-pin cell runs on every platform (f1 delta
+  N3); the second-loopback (127.0.0.2) cell is Linux-only, because macOS has
+  no such address without an alias (#4177).
 - **The two DESTRUCTIVE seams share ONE contract (W3 + W4, GOD rulings).**
   `destructive_judge(client, seam, bodies, prompt)` → `destructive_judgement_of`
   (`src/decision_seams.rs`): PRIMARY-ONLY through the new REQUIRED
