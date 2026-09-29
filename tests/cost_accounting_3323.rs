@@ -137,8 +137,8 @@ fn recall_metering_aggregates_and_accrues() {
     let a = mem("a", "team/a", "alpha recalled content");
     let b = mem("b", "team/a", "bravo recalled content longer");
     let want = tokens_of(&a) + tokens_of(&b);
-    // Drive the recall meter directly (the SAL recall funnels call exactly
-    // this on their writable connection).
+    // Exercise the direct-accrual API. Production recall uses the observation
+    // ledger; its retained rows contribute at rollup time (#1953).
     cost::record_recall_sqlite(&conn, &[(a, 0.9), (b, 0.8)]);
 
     let ns = cost::namespace_rollup(&conn, "team/a")
@@ -152,12 +152,12 @@ fn recall_metering_aggregates_and_accrues() {
     );
 }
 
-/// Counters must stay EXACT under concurrent writers. SQLite serializes
+/// Successful metering upserts must accumulate under concurrent writers. SQLite serializes
 /// writers, and each write's counter upsert rides the same connection's
 /// autocommit tx as the insert, so N concurrent inserts of the same memory
 /// yield a counter of exactly N — never a lost update.
 #[test]
-fn counters_are_exact_under_concurrent_writes() {
+fn counters_accumulate_when_concurrent_writes_succeed() {
     const THREADS: usize = 8;
     const PER_THREAD: usize = 50;
 
@@ -216,12 +216,11 @@ fn counters_are_exact_under_concurrent_writes() {
     );
 }
 
-/// Recall counters must also stay EXACT under concurrent recallers. Each
-/// worker records the same served set repeatedly on its own connection to
-/// the shared file; the aggregate `recall_events` must equal exactly the
-/// total number of served rows (no lost update).
+/// Successful concurrent upserts must accumulate without a lost-update race.
+/// This cell gives writers time to succeed; it does not promise completeness
+/// after a timeout. Forced BUSY and loss visibility are covered by #4124.
 #[test]
-fn recall_counters_are_exact_under_concurrent_recalls() {
+fn recall_counters_accumulate_when_concurrent_updates_succeed() {
     const THREADS: usize = 8;
     const PER_THREAD: usize = 40;
 
@@ -243,9 +242,9 @@ fn recall_counters_are_exact_under_concurrent_recalls() {
             s.spawn(move || {
                 let conn = db::open(&path).expect("worker open");
                 // #4117 (f2r) — same 8-writer exposure as the write cell: each
-                // recall appends a metering row, and record_recall_sqlite swallows
-                // SQLITE_BUSY at debug, so a lock timeout here would surface as a
-                // COUNT MISMATCH (silent metering loss is #4124). Wait, do not refuse.
+                // direct-accrual call upserts metering rows. A timeout is an
+                // observable dropped attempt (#4124); this cell exercises the
+                // successful-update case. Give these writers time to finish.
                 conn.pragma_update(None, "busy_timeout", 60_000)
                     .expect("worker busy_timeout");
                 for _ in 0..PER_THREAD {
@@ -262,13 +261,13 @@ fn recall_counters_are_exact_under_concurrent_recalls() {
     let served_rows = i64::try_from(THREADS * PER_THREAD * 2).unwrap();
     assert_eq!(
         ns.recall_events, served_rows,
-        "no lost recall counter updates"
+        "successful concurrent recall updates must all accumulate"
     );
     let recalls = i64::try_from(THREADS * PER_THREAD).unwrap();
     assert_eq!(
         ns.tokens_recalled,
         per_recall_tokens.saturating_mul(recalls),
-        "aggregated recalled-token count is exact under contention"
+        "aggregated recalled-token count matches successful updates"
     );
 }
 

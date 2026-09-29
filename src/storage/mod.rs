@@ -13674,15 +13674,16 @@ pub(crate) fn stamp_contaminated_descendants_as(
 
 /// v1.0.0 #3322 (#3266 MVG) — the lineage token/cost summary reported by a
 /// [`swarm_rewind`], derived from the #3323 [`crate::cost::lineage_rollup`]
-/// over the rewound root's provenance subtree. Integer-exact token counts;
-/// cost is the on-demand micro-USD derivation.
+/// over the rewound root's provenance subtree. Best-effort integer token
+/// counts (a lower bound under contention); cost is an advisory micro-USD
+/// estimate, and recall reflects the retained ledger and current content.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SwarmRewindCost {
     /// The lineage root the rollup is scoped to (the rewound root id).
     pub scope_key: String,
     /// Cumulative tokens authored under the subtree.
     pub tokens_written: i64,
-    /// Cumulative tokens served (recalled) under the subtree.
+    /// Direct-accrual recalled tokens plus tokens derived from the retained ledger.
     pub tokens_recalled: i64,
     /// `tokens_written + tokens_recalled` (saturating).
     pub tokens_total: i64,

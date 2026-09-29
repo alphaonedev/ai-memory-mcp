@@ -142,5 +142,10 @@ pub fn cmd_swarm_rewind(
              lineage-cost={usd}"
         )?;
     }
+    writeln!(
+        out.stdout,
+        "  Accounting: {}; recall reflects the retained ledger.",
+        crate::cost::ACCOUNTING_ACCURACY
+    )?;
     Ok(())
 }

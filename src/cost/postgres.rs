@@ -4,12 +4,14 @@
 //! v1.0.0 #3323 — Postgres twin of the token/cost accounting increment
 //! funnels and rollups. Same model, same `token_cost_counters` relation,
 //! same best-effort posture as the SQLite path in the parent module: a
-//! metering failure is logged and swallowed, never surfaced to the caller
+//! metering failure increments the dropped metric and emits a rate-limited
+//! WARN, never an error to the caller
 //! (advisory, disposable — North Star: degrade, never corrupt).
 
 use sqlx::PgPool;
 
-use super::{CostRollup, SCOPE_LINEAGE, SCOPE_NAMESPACE};
+use super::observability::{MeteringKind, note_failure};
+use super::{ACCOUNTING_ACCURACY, CostRollup, SCOPE_LINEAGE, SCOPE_NAMESPACE};
 use crate::models::Memory;
 
 /// Embedded Postgres DDL doc twin, sourced by `migrate_v93`.
@@ -42,7 +44,7 @@ const RECALL_UPSERT_SQL: &str = "INSERT INTO token_cost_counters \
 pub async fn record_write_pg(pool: &PgPool, mem: &Memory, memory_id: &str) {
     let tokens = clamp_tokens(crate::storage::count_memory_tokens(mem));
     if let Err(e) = try_record_write(pool, &mem.namespace, memory_id, tokens).await {
-        tracing::debug!(target: "cost", "token/cost write metering skipped (non-fatal, pg): {e}");
+        note_failure(MeteringKind::Write, "postgres", &e);
     }
 }
 
@@ -77,7 +79,7 @@ pub async fn record_recall_pg(pool: &PgPool, results: &[(Memory, f64)]) {
         return;
     }
     if let Err(e) = try_record_recall(pool, results).await {
-        tracing::debug!(target: "cost", "token/cost recall metering skipped (non-fatal, pg): {e}");
+        note_failure(MeteringKind::Recall, "postgres", &e);
     }
 }
 
@@ -141,7 +143,7 @@ async fn derive_namespace_recall_pg(pool: &PgPool, namespace: &str) -> (i64, i64
         Ok(acc)
     }
     inner(pool, namespace).await.unwrap_or_else(|e| {
-        tracing::debug!(target: "cost", "recall-ledger derive (namespace, pg) skipped (non-fatal): {e}");
+        note_failure(MeteringKind::Rollup, "postgres", &e);
         (0, 0)
     })
 }
@@ -171,7 +173,7 @@ async fn derive_all_namespace_recall_pg(
         Ok(map)
     }
     inner(pool).await.unwrap_or_else(|e| {
-        tracing::debug!(target: "cost", "recall-ledger derive (all-namespace, pg) skipped (non-fatal): {e}");
+        note_failure(MeteringKind::Rollup, "postgres", &e);
         std::collections::BTreeMap::new()
     })
 }
@@ -198,6 +200,7 @@ pub async fn namespace_rollup_pg(
     let (dr_tokens, dr_events) = derive_namespace_recall_pg(pool, namespace).await;
     match row {
         Some((w, r, we, re)) => Ok(Some(CostRollup {
+            accuracy: ACCOUNTING_ACCURACY,
             scope_kind: SCOPE_NAMESPACE.to_string(),
             scope_key: namespace.to_string(),
             tokens_written: w,
@@ -207,6 +210,7 @@ pub async fn namespace_rollup_pg(
         })),
         None if dr_events == 0 => Ok(None),
         None => Ok(Some(CostRollup {
+            accuracy: ACCOUNTING_ACCURACY,
             scope_kind: SCOPE_NAMESPACE.to_string(),
             scope_key: namespace.to_string(),
             tokens_written: 0,
@@ -238,6 +242,7 @@ pub async fn all_namespace_rollups_pg(pool: &PgPool) -> Result<Vec<CostRollup>, 
             (
                 key.clone(),
                 CostRollup {
+                    accuracy: ACCOUNTING_ACCURACY,
                     scope_kind: SCOPE_NAMESPACE.to_string(),
                     scope_key: key,
                     tokens_written: w,
@@ -250,6 +255,7 @@ pub async fn all_namespace_rollups_pg(pool: &PgPool) -> Result<Vec<CostRollup>, 
         .collect();
     for (ns, (dr_tokens, dr_events)) in derive_all_namespace_recall_pg(pool).await {
         let entry = by_ns.entry(ns.clone()).or_insert_with(|| CostRollup {
+            accuracy: ACCOUNTING_ACCURACY,
             scope_kind: SCOPE_NAMESPACE.to_string(),
             scope_key: ns,
             tokens_written: 0,
@@ -360,12 +366,13 @@ pub(crate) async fn lineage_nodes_rollup_pg(
             acc
         }
         Err(e) => {
-            tracing::debug!(target: "cost", "recall-ledger derive (lineage, pg) skipped (non-fatal): {e}");
+            note_failure(MeteringKind::Rollup, "postgres", &e);
             (0, 0)
         }
     };
 
     Ok(CostRollup {
+        accuracy: ACCOUNTING_ACCURACY,
         scope_kind: SCOPE_LINEAGE.to_string(),
         scope_key: root_id.to_string(),
         tokens_written: w,

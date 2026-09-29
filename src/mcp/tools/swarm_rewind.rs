@@ -328,6 +328,7 @@ pub(crate) fn render_report(r: &crate::storage::SwarmRewindReport) -> Value {
         (crate::storage::SWARM_REWIND_ROUTINES_FROZEN_KEY): r.routines_frozen,
         "signed_event_id": r.signed_event_id,
         "cost": {
+            "accuracy": crate::cost::ACCOUNTING_ACCURACY,
             "scope_key": r.cost.scope_key,
             "tokens_written": r.cost.tokens_written,
             "tokens_recalled": r.cost.tokens_recalled,
@@ -352,6 +353,13 @@ mod tests {
         let derived = derived_props_for::<SwarmRewindRequest>();
         assert_property_set_parity("memory_swarm_rewind", &derived);
         assert_descriptions_match("memory_swarm_rewind", &derived);
+    }
+
+    #[test]
+    fn cost_report_discloses_accounting_completeness() {
+        let report = crate::storage::SwarmRewindReport::default();
+        let envelope = render_report(&report);
+        assert_eq!(envelope["cost"]["accuracy"], "lower bound under contention");
     }
 
     #[test]

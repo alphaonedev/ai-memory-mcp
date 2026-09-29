@@ -112,6 +112,9 @@ pub struct Metrics {
     pub registry: Registry,
     pub store_total: IntCounterVec,
     pub recall_total: IntCounterVec,
+    /// Failed advisory cost operations (write, recall, rollup); not a count of
+    /// lost tokens. Process-local; zero does not establish complete accounting.
+    pub cost_metering_dropped_total: IntCounterVec,
     pub recall_latency_seconds: HistogramVec,
     pub autonomy_hook_total: IntCounterVec,
     pub contradiction_detected_total: IntCounter,
@@ -731,6 +734,17 @@ impl Metrics {
             &["mode"],
             &mut err,
         );
+
+        let cost_metering_dropped_total = int_counter_vec(
+            &registry,
+            "ai_memory_cost_metering_dropped_total",
+            "Failed advisory cost operations, including partial updates and omitted ledger reads; not lost tokens. Process-local.",
+            &["kind"],
+            &mut err,
+        );
+        for kind in ["write", "recall", "rollup"] {
+            cost_metering_dropped_total.with_label_values(&[kind]);
+        }
 
         let recall_latency_seconds = histogram_vec(
             &registry,
@@ -1479,6 +1493,7 @@ impl Metrics {
             registry,
             store_total,
             recall_total,
+            cost_metering_dropped_total,
             recall_latency_seconds,
             autonomy_hook_total,
             contradiction_detected_total,

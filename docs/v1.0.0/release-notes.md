@@ -782,7 +782,9 @@ or overclaim).
   and the `swarm-rewind` CLI refuses a Postgres store (#3924), so on
   Postgres the route is the rewind. Its report carries the lineage's
   #3323 token/cost rollup on both backends; no other surface reads the PG
-  rollup yet. The automatic `Contaminated` stamp (#3324) fires only on a
+  rollup yet. These advisory counters are a **lower bound under contention**,
+  with process-local dropped-operation metrics and rate-limited warnings
+  on both backends (#4124); see [accounting coverage](../cost-accounting.md). The automatic `Contaminated` stamp (#3324) fires only on a
   `supersedes` link between two reflections: sqlite stamps on the MCP
   link tool; Postgres on HTTP `POST /links`, its only link surface.
   Neither backend stamps on `kg_invalidate`. Containment is

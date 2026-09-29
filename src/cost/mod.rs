@@ -25,7 +25,7 @@
 //!   (`storage::lineage_descendants`).
 //!
 //! The tokens->cost conversion ([`micro_usd_for_tokens`]) is applied ONLY
-//! at rollup time, so the durable rows hold exact integer token counts
+//! at rollup time, so the durable rows hold integer token counts
 //! (never a float — a float aggregate/key would corrupt ordering,
 //! PERF-25) and re-pricing the fleet needs no row rewrite.
 //!
@@ -35,7 +35,14 @@
 //! `storage::insert_inner`, the single LOCAL-authorship write chokepoint
 //! (federation/import admission is excluded — those tokens were spent on
 //! the authoring node), plus `PostgresStore::store`. The write counters in
-//! [`TABLE`] are cumulative and exact.
+//! [`TABLE`] are cumulative but best-effort: a lower bound under contention
+//! or other metering failures. Integer representation does not guarantee
+//! complete accounting. Failed attempts increment the process-local
+//! `ai_memory_cost_metering_dropped_total{kind="write"|"recall"|"rollup"}`
+//! metric and emit a WARN at most once per kind per minute. The metric counts
+//! failed operations, not missing tokens or scope rows; an operation can
+//! partially update its scopes. Rollup failures count omitted ledger reads,
+//! which can recover on the next report.
 //!
 //! RECALL metering is DIFFERENT: a recall is PURE (#1953) — it may append
 //! only to the `recall_observations` ledger, never mutate a durable table
@@ -48,7 +55,8 @@
 //! ledger is pruned to `AI_MEMORY_OBSERVATIONS_TTL_DAYS`, so the derived
 //! recalled figure reflects the ledger-retention WINDOW, not all-time — an
 //! intentional trade for recall purity, consistent with this module being
-//! advisory and disposable (a report of fewer numbers, never wrong ones).
+//! advisory and disposable. Deleted memories and ledger-read failures can
+//! further reduce coverage; current content is re-tokenized at report time.
 //! The [`record_recall_sqlite`] / `postgres::record_recall_pg` UPSERT
 //! funnels remain as a direct-accrual API (exercised by the cost tests) and
 //! their stored deltas, when present, are ADDED to the derived figure.
@@ -56,6 +64,14 @@
 use rusqlite::{Connection, params, params_from_iter};
 
 use crate::models::Memory;
+
+mod observability;
+use observability::{MeteringKind, note_failure};
+
+/// Accounting completeness qualification for both backends and report surfaces.
+/// Best-effort updates can be lost; a zero process-local loss metric does not
+/// prove historical completeness (including across process restarts).
+pub const ACCOUNTING_ACCURACY: &str = "lower bound under contention";
 
 /// The counter relation name (SSOT for the table, shared by the DDL doc
 /// twins and every statement in this module).
@@ -123,21 +139,24 @@ pub const DEFAULT_ROLLUP_DEPTH: usize = 5;
 /// `INTEGER + INTEGER` to a float — a corruption this table must not risk).
 const I64_CEILING: i64 = i64::MAX;
 
-/// A rolled-up counter row plus its derived cost. Exact integer token
-/// counts; cost is computed on demand from [`micro_usd_for_tokens`].
+/// A best-effort counter row plus its derived cost. Integer token counts
+/// are a lower bound under contention; recall also reflects ledger retention
+/// and current memory content. Cost uses [`micro_usd_for_tokens`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CostRollup {
+    /// Completeness qualification; never inferred from a process-local metric.
+    pub accuracy: &'static str,
     /// [`SCOPE_NAMESPACE`] or [`SCOPE_LINEAGE`].
     pub scope_kind: String,
     /// The namespace, or the lineage root memory id.
     pub scope_key: String,
     /// Cumulative cl100k_base tokens authored under this scope.
     pub tokens_written: i64,
-    /// Cumulative cl100k_base tokens served (recalled) under this scope.
+    /// Direct-accrual recalled tokens plus tokens derived from the retained ledger.
     pub tokens_recalled: i64,
     /// Number of write events attributed to this scope.
     pub write_events: i64,
-    /// Number of recall hits attributed to this scope.
+    /// Direct-accrual recall hits plus hits derived from the retained ledger.
     pub recall_events: i64,
 }
 
@@ -186,12 +205,13 @@ const RECALL_UPSERT_SQL: &str = "INSERT INTO token_cost_counters \
 
 /// Best-effort: attribute a single LOCAL-authorship write to its namespace
 /// and its own lineage node. A failure (e.g. a partial-schema fixture with
-/// no counter table) is logged at debug and swallowed — advisory metering
+/// no counter table) increments the dropped metric and emits a rate-limited
+/// WARN — advisory metering
 /// must never fail a durable write (North Star). Runs on the caller's
 /// write connection, so it commits atomically with the insert's tx.
 pub fn record_write_sqlite(conn: &Connection, mem: &Memory, memory_id: &str) {
     if let Err(e) = try_record_write(conn, mem, memory_id) {
-        tracing::debug!(target: "cost", "token/cost write metering skipped (non-fatal): {e}");
+        note_failure(MeteringKind::Write, "sqlite", &e);
     }
 }
 
@@ -207,13 +227,15 @@ fn try_record_write(conn: &Connection, mem: &Memory, memory_id: &str) -> rusqlit
 /// Best-effort: attribute a served recall set to each result's namespace
 /// and lineage node. Deltas are AGGREGATED per scope in-process so a
 /// 50-result recall spanning one namespace pays one namespace upsert, not
-/// fifty. A failure is logged at debug and swallowed.
+/// fifty. A failure increments the dropped metric and emits a rate-limited
+/// WARN, without failing the recall. Scopes can be partially updated; no retry
+/// is attempted on the recall path.
 pub fn record_recall_sqlite(conn: &Connection, results: &[(Memory, f64)]) {
     if results.is_empty() {
         return;
     }
     if let Err(e) = try_record_recall(conn, results) {
-        tracing::debug!(target: "cost", "token/cost recall metering skipped (non-fatal): {e}");
+        note_failure(MeteringKind::Recall, "sqlite", &e);
     }
 }
 
@@ -277,7 +299,7 @@ fn derive_namespace_recall(conn: &Connection, namespace: &str) -> (i64, i64) {
         Ok(acc)
     })()
     .unwrap_or_else(|e| {
-        tracing::debug!(target: "cost", "recall-ledger derive (namespace) skipped (non-fatal): {e}");
+        note_failure(MeteringKind::Rollup, "sqlite", &e);
         (0, 0)
     })
 }
@@ -308,7 +330,7 @@ fn derive_ids_recall(conn: &Connection, ids: &std::collections::BTreeSet<String>
         Ok(acc)
     })()
     .unwrap_or_else(|e| {
-        tracing::debug!(target: "cost", "recall-ledger derive (lineage) skipped (non-fatal): {e}");
+        note_failure(MeteringKind::Rollup, "sqlite", &e);
         (0, 0)
     })
 }
@@ -337,7 +359,7 @@ fn derive_all_namespace_recall(
         Ok(map)
     })()
     .unwrap_or_else(|e| {
-        tracing::debug!(target: "cost", "recall-ledger derive (all-namespace) skipped (non-fatal): {e}");
+        note_failure(MeteringKind::Rollup, "sqlite", &e);
         std::collections::BTreeMap::new()
     })
 }
@@ -359,6 +381,7 @@ pub fn namespace_rollup(
             params![SCOPE_NAMESPACE, namespace],
             |row| {
                 Ok(CostRollup {
+                    accuracy: ACCOUNTING_ACCURACY,
                     scope_kind: SCOPE_NAMESPACE.to_string(),
                     scope_key: row.get(0)?,
                     tokens_written: row.get(1)?,
@@ -384,6 +407,7 @@ pub fn namespace_rollup(
         }
         None if dr_events == 0 => Ok(None),
         None => Ok(Some(CostRollup {
+            accuracy: ACCOUNTING_ACCURACY,
             scope_kind: SCOPE_NAMESPACE.to_string(),
             scope_key: namespace.to_string(),
             tokens_written: 0,
@@ -408,6 +432,7 @@ pub fn all_namespace_rollups(conn: &Connection) -> rusqlite::Result<Vec<CostRoll
     let stored: Vec<CostRollup> = stmt
         .query_map(params![SCOPE_NAMESPACE], |row| {
             Ok(CostRollup {
+                accuracy: ACCOUNTING_ACCURACY,
                 scope_kind: SCOPE_NAMESPACE.to_string(),
                 scope_key: row.get(0)?,
                 tokens_written: row.get(1)?,
@@ -427,6 +452,7 @@ pub fn all_namespace_rollups(conn: &Connection) -> rusqlite::Result<Vec<CostRoll
         .collect();
     for (ns, (dr_tokens, dr_events)) in derive_all_namespace_recall(conn) {
         let entry = by_ns.entry(ns.clone()).or_insert_with(|| CostRollup {
+            accuracy: ACCOUNTING_ACCURACY,
             scope_kind: SCOPE_NAMESPACE.to_string(),
             scope_key: ns,
             tokens_written: 0,
@@ -476,6 +502,7 @@ pub fn lineage_rollup(
     }
 
     let mut rollup = CostRollup {
+        accuracy: ACCOUNTING_ACCURACY,
         scope_kind: SCOPE_LINEAGE.to_string(),
         scope_key: root_id.to_string(),
         tokens_written: 0,
@@ -673,7 +700,7 @@ mod tests {
 
     #[test]
     fn best_effort_never_panics_without_table() {
-        // A connection with NO counter table must silently no-op, never
+        // A connection with NO counter table must report the loss, never
         // panic — advisory metering can never break a write.
         let conn = Connection::open_in_memory().unwrap();
         let m = mem("id-1", "team-a", "content");
