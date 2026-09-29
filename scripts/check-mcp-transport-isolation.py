@@ -29,8 +29,9 @@ Two checks over production Rust under ``src/mcp/``:
      bridge. Pins "MCP's own transport constructs no network client" while
      permitting the documented federation forward.
 
-Production-vs-test heuristic mirrors ``scripts/check-vendor-literals.sh``: skip
-``*test*.rs`` / ``tests.rs`` files, skip lines at/below the first ``mod tests {``
+Production-vs-test heuristic: skip a ``*test*.rs`` file ONLY when its module
+declaration is ``cfg(test)``-gated (#4145, shared #4054 resolver; a test-looking
+name alone proves nothing and an undeclared file is production), skip lines at/below the first ``mod tests {``
 in a file, and skip comment lines (so the wiremock ``MockServer`` in a test mod
 and every doc comment are out of scope). Bare ``.bind(`` is deliberately NOT a
 pattern — rusqlite SQL parameter binds use it all over the MCP tools; only the
@@ -44,7 +45,9 @@ Usage:
 """
 from __future__ import annotations
 
+import os
 import re
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -125,9 +128,35 @@ def _production_lines(text: str) -> list[tuple[int, str]]:
     return out
 
 
-def _is_test_file(rel: str) -> bool:
-    name = Path(rel).name
-    return "test" in name or name == "tests.rs"
+def _is_test_file(path: Path) -> bool:
+    """#4145: a test-looking NAME only triggers a declaration check.
+
+    The compiler decides test-ness from the module DECLARATION, never the file
+    name (``src/mcp/dispatch_test_hook.rs`` is a production module). The file
+    is out of scope only when the shared #4054 resolver
+    (``scripts/lib/production-lines.sh::_pl_declared_test_only``) proves every
+    declaration of it is ``cfg(test)``-gated. Undeclared, ambiguous, or any
+    resolver error => production (fail closed).
+    """
+    if "test" not in path.name:
+        return False
+    try:
+        run = subprocess.run(
+            [
+                "bash",
+                "-c",
+                'source "$ROOT/scripts/lib/production-lines.sh" && _pl_declared_test_only "$1"',
+                "check-mcp-transport-isolation",
+                str(path),
+            ],
+            env={**os.environ, "ROOT": str(ROOT)},
+            capture_output=True,
+            timeout=120,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return run.returncode == 0
 
 
 def scan(root: Path) -> list[str]:
@@ -137,7 +166,7 @@ def scan(root: Path) -> list[str]:
         return [f"{MCP_DIR}/ not found under {root} — cannot verify MCP transport isolation"]
     for path in sorted(mcp.rglob("*.rs")):
         rel = path.relative_to(root).as_posix()
-        if _is_test_file(rel):
+        if _is_test_file(path):
             continue
         try:
             text = path.read_text(encoding="utf-8")
@@ -211,6 +240,19 @@ def self_test() -> int:
             "binds/serves a SOCKET",
         ),
         (
+            # #4145: a production module whose NAME contains "test" (declared
+            # with no cfg in src/mcp/mod.rs) is compiled into release builds.
+            "planted TcpListener::bind in the production dispatch_test_hook.rs must RED",
+            {"dispatch_test_hook.rs": "fn boom() {\n    let _l = TcpListener::bind(\"0.0.0.0:9077\").unwrap();\n}\n"},
+            "binds/serves a SOCKET",
+        ),
+        (
+            # #4145: an UNDECLARED test-named file is production (fail closed).
+            "planted TcpListener::bind in an undeclared *_tests.rs must RED",
+            {"planted_4145_tests.rs": "fn boom() {\n    let _l = TcpListener::bind(\"0.0.0.0:9077\").unwrap();\n}\n"},
+            "binds/serves a SOCKET",
+        ),
+        (
             "planted reqwest client OUTSIDE the allowlist must RED",
             {"planted_client.rs": "fn boom() {\n    let _c = reqwest::blocking::Client::new();\n}\n"},
             "NETWORK CLIENT outside the allowlist",
@@ -234,6 +276,17 @@ def self_test() -> int:
         failed += 1
     else:
         print("  [ok] a reqwest client in the allowlisted transport.rs is permitted")
+
+    # Negative control (#4145): a cfg(test)-DECLARED test module stays out of
+    # scope (src/mcp/mod.rs declares it `#[cfg(test)] mod ..;`).
+    ok_test = _run_in_copy(
+        {"param_shapes_3365_tests.rs": "fn ok() {\n    let _s = MockServer::start();\n    let _l = TcpListener::bind(\"127.0.0.1:0\");\n}\n"}
+    )
+    if ok_test:
+        print(f"  [FAIL] a cfg(test)-declared test module must NOT red; got {ok_test}", file=sys.stderr)
+        failed += 1
+    else:
+        print("  [ok] a cfg(test)-declared test module is out of scope")
 
     # Negative control: a bare `.bind(` (SQL param) must NOT red.
     ok_sql = _run_in_copy(
