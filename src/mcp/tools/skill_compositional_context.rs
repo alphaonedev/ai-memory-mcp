@@ -162,10 +162,9 @@ pub fn handle_skill_compositional_context(
             continue;
         }
 
-        // #4059 — select candidate IDS only, then read each row through the
-        // ordinary read lane (`db::get`, which also hides quarantined /
-        // tombstoned rows) and the canonical caller-visibility funnel BEFORE
-        // it can be scored or rendered. Pre-#4059 this read `title`/`content`
+        // #4059 — select candidate IDS only, then read the rows (below) and
+        // pass each through lifecycle visibility and the canonical
+        // caller-visibility funnel BEFORE it can be scored or rendered. Pre-#4059 this read `title`/`content`
         // straight from `memories` with no owner / scope predicate, so another
         // agent's `scope=private` reflection in a declared namespace was
         // returned verbatim.
@@ -199,12 +198,25 @@ pub fn handle_skill_compositional_context(
             .collect::<Result<Vec<String>, _>>()
             .map_err(|e| crate::mcp::error_text::mcp_foreign_err("reflections row", e))?;
 
+        // #4059 (R10b) — batch-read through the SCAN decode policy
+        // (`db::get_many` → `row_to_memory_scan`): a candidate whose at-rest
+        // envelope cannot be decrypted is OMITTED (WARN +
+        // `undecryptable` metric emitted by the mapper) instead of failing
+        // the whole composition for every caller. The omitted row stays fail
+        // closed — its content is never returned. A genuine read failure
+        // (schema / corrupt column) still propagates. Candidate order (newest
+        // first) is preserved from `ids`; lifecycle visibility (the rule
+        // `db::get` applies) and the caller read funnel are applied
+        // explicitly to every fetched row.
+        let mut fetched = crate::db::get_many(conn, &ids)
+            .map_err(|e| crate::mcp::error_text::mcp_foreign_err("reflections get_many", e))?;
         for id in ids {
-            let Some(mem) = crate::db::get(conn, &id)
-                .map_err(|e| crate::mcp::error_text::mcp_foreign_err("reflections get", e))?
-            else {
+            let Some(mem) = fetched.remove(&id) else {
                 continue;
             };
+            if !mem.lifecycle_state.is_recall_visible() {
+                continue;
+            }
             if !crate::visibility::is_readable_on_query(&mem, caller, Some(&entry.namespace)) {
                 continue;
             }

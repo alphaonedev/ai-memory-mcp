@@ -198,3 +198,51 @@ fn compositional_context_is_funnelled_not_allowlisted_4059() {
         "the dispatch arm must pass the resolved read caller: {arm}"
     );
 }
+
+/// #4059 (R10b retest gap) — ONE candidate reflection whose at-rest envelope
+/// cannot be decrypted must not deny the composition to every caller. Pre-fix
+/// the per-candidate fail-closed `db::get` propagated the decode error and
+/// the whole tool answered "internal storage error". Now the poisoned
+/// candidate is OMITTED (its content never returned) and the healthy sibling
+/// is still composed.
+#[test]
+fn poisoned_candidate_is_omitted_not_fatal_4059() {
+    const HEALTHY: &str = "HEALTHY-4059";
+    const POISON: &str = "POISON-4059";
+    let fixture = Fixture::new();
+    author_reflection(&fixture, ALICE, HEALTHY, "collective");
+    author_reflection(&fixture, ALICE, POISON, "collective");
+    let skill_id = register_composing_skill(&fixture);
+    {
+        // Every MCP child above has exited (dropped); poison one row.
+        let conn = rusqlite::Connection::open(&fixture.db).expect("open");
+        let poisoned = conn
+            .execute(
+                "UPDATE memories SET encrypted_envelope = zeroblob(96) \
+                 WHERE namespace = ?1 AND memory_kind = 'reflection' AND content = ?2",
+                rusqlite::params![NS, POISON],
+            )
+            .expect("poison envelope");
+        assert_eq!(poisoned, 1, "fixture: exactly one reflection poisoned");
+    }
+    for caller in [Some(BOB), Some(ALICE), None] {
+        let mut mcp = Mcp::start(&fixture, caller);
+        let result = mcp.call(
+            "memory_skill_compositional_context",
+            &json!({"skill_id": skill_id}),
+        );
+        assert_ne!(
+            result["isError"], true,
+            "{caller:?}: one undecryptable candidate must not fail the composition: {result}"
+        );
+        let text = Mcp::text(&result);
+        assert!(
+            text.contains(HEALTHY),
+            "{caller:?}: healthy sibling composed: {text}"
+        );
+        assert!(
+            !text.contains(POISON),
+            "{caller:?}: the poisoned candidate is omitted, never rendered: {text}"
+        );
+    }
+}
