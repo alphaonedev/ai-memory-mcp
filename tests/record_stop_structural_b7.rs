@@ -232,13 +232,13 @@ fn string_continuation_lines(src: &str) -> HashSet<usize> {
 /// backslash sits inside a string literal joins
 /// ([`string_continuation_lines`]).
 fn join_string_continuations(src: &str) -> String {
-    let continues = string_continuation_lines(src);
+    let string_lines = string_continuation_lines(src);
     let lines: Vec<&str> = src.lines().collect();
     let mut out: Vec<String> = Vec::with_capacity(lines.len());
     let mut i = 0;
     while i < lines.len() {
         let mut acc = lines[i].to_string();
-        while escapes_newline(&acc) && continues.contains(&i) {
+        while escapes_newline(&acc) && string_lines.contains(&i) {
             let Some(next) = lines.get(i + 1) else {
                 break;
             };
