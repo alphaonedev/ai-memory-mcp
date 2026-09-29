@@ -264,48 +264,32 @@ fn sign_catchup_get(
 /// reqwest's `.json()` buffers the ENTIRE body into RAM before parsing with no
 /// length bound, so a hostile-but-enrolled peer answering `/sync/since` with a
 /// multi-gigabyte body could drive the daemon to OOM (the federation client
-/// sets only a wall-clock timeout, NOT a byte bound). We cap here exactly as
-/// the LLM client does at `src/llm.rs`: a `Content-Length` pre-check rejects an
-/// honest oversize body before a byte is read, and a streaming accumulator
-/// aborts a lying peer mid-transfer.
-const MAX_SYNC_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+/// sets only a wall-clock timeout, NOT a byte bound). #4033 — the value and the
+/// accumulator now live in [`super::capped_body`], the ONE capped reader every
+/// federation response body (pull AND push) goes through.
+#[cfg(test)]
+const MAX_SYNC_RESPONSE_BYTES: usize = super::capped_body::MAX_SYNC_RESPONSE_BYTES;
 
 /// #1928 — buffer a federation catchup response, aborting as soon as the
-/// accumulated body would exceed [`MAX_SYNC_RESPONSE_BYTES`], then parse JSON.
+/// accumulated body would exceed the `/sync/since` cap, then parse JSON.
 /// Replaces the unbounded `resp.json().await` at every `/sync/since` pull.
 async fn read_capped_sync_json(resp: reqwest::Response) -> anyhow::Result<serde_json::Value> {
-    read_capped_sync_json_inner(resp, MAX_SYNC_RESPONSE_BYTES).await
+    read_capped_sync_json_inner(resp, super::capped_body::sync_response_cap()).await
 }
 
 /// Cap-parameterised core of [`read_capped_sync_json`], split out so a unit
 /// test can exercise the rejection against a tiny `cap` without streaming a
-/// real 64 MiB body.
-async fn read_capped_sync_json_inner(
-    mut resp: reqwest::Response,
+/// real 64 MiB body. #4033 — delegates the byte accounting to the shared
+/// [`super::capped_body::read_body_capped`].
+pub(crate) async fn read_capped_sync_json_inner(
+    resp: reqwest::Response,
     cap: usize,
 ) -> anyhow::Result<serde_json::Value> {
-    use anyhow::anyhow;
-    if let Some(len) = resp.content_length() {
-        if len > cap as u64 {
-            return Err(anyhow!(
-                "federation sync response too large: Content-Length {len} exceeds cap of {cap} bytes"
-            ));
-        }
-    }
-    let mut buf: Vec<u8> = Vec::new();
-    while let Some(chunk) = resp
-        .chunk()
+    let buf = super::capped_body::read_body_capped(resp, cap)
         .await
-        .map_err(|e| anyhow!("reading federation sync response chunk: {e}"))?
-    {
-        if buf.len().saturating_add(chunk.len()) > cap {
-            return Err(anyhow!(
-                "federation sync response exceeded cap of {cap} bytes while streaming"
-            ));
-        }
-        buf.extend_from_slice(&chunk);
-    }
-    serde_json::from_slice(&buf).map_err(|e| anyhow!("parsing federation sync response: {e}"))
+        .map_err(|e| anyhow::anyhow!("federation sync response: {e}"))?;
+    serde_json::from_slice(&buf)
+        .map_err(|e| anyhow::anyhow!("parsing federation sync response: {e}"))
 }
 
 /// #1687 — advance the per-peer catchup watermark for a row that just applied

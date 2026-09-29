@@ -281,7 +281,27 @@ async fn post_once_unobserved(
     }
     match req.send().await {
         Ok(resp) if resp.status().is_success() => {
-            match resp.json::<serde_json::Value>().await {
+            // #4033 (SEC, CWE-770) — the receiver's report is read through the
+            // ONE capped reader, never `resp.json()` (which buffers an
+            // unbounded body). An OVERSIZE body is a typed non-ack: it must
+            // NOT fall through the legacy "unparseable 2xx = ack" arm below,
+            // or a hostile peer's oversize reply would meet quorum and retire
+            // push-DLQ rows on a report this node never read.
+            let body = match super::capped_body::read_body_capped(
+                resp,
+                super::capped_body::push_response_cap(),
+            )
+            .await
+            {
+                Ok(bytes) => Ok(bytes),
+                Err(e @ super::capped_body::BodyReadError::TooLarge { .. }) => {
+                    return AckOutcome::Fail(push_response_too_large_reason(&e));
+                }
+                Err(super::capped_body::BodyReadError::Transport(_)) => Err(()),
+            };
+            match body.and_then(|bytes| {
+                serde_json::from_slice::<serde_json::Value>(&bytes).map_err(|_| ())
+            }) {
                 Ok(v) => {
                     // sync_push responses don't echo per-memory ids; any
                     // success on a 1-memory push is treated as an ack
@@ -320,10 +340,13 @@ async fn post_once_unobserved(
             // same peer pays a fresh mTLS handshake (~4.3×RTT measured
             // on do-1461 — the mechanism behind the 0.3s/row serial
             // DLQ-replay floor during error regimes like the #1578
-            // 429 era). The body is small (a JSON error envelope) and
-            // already in flight; reading it is microseconds.
+            // 429 era). #4033 — the drain is BOUNDED: an honest error
+            // envelope is small and drains in microseconds, but a hostile
+            // peer's endless error body stops at the push-response cap (the
+            // connection is then dropped rather than pooled — the correct
+            // trade against unbounded allocation).
             let status = resp.status();
-            let _ = resp.bytes().await;
+            drain_push_response_capped(resp).await;
             // #1544 — classify a 429 as a retryable THROTTLE (status-precise,
             // not a string-match on the reason) so the push-DLQ replayer can
             // avoid burning a quarantine attempt on a quota window that resets
@@ -348,6 +371,23 @@ async fn post_once_unobserved(
                 .stamp(&crate::url_display::network_failure(&e)),
         ),
     }
+}
+
+/// #4033 — the typed non-ack reason for a push response that exceeded the
+/// capped reader's bound. Stamped `Other` (a retryable-then-quarantined
+/// class): the peer answered, but with a body this node refuses to hold.
+fn push_response_too_large_reason(e: &super::capped_body::BodyReadError) -> String {
+    super::dlq_class::DlqErrorClass::Other.stamp(&e.to_string())
+}
+
+/// #4033 — drain a non-2xx push response for keep-alive reuse, holding at
+/// most the push-response cap. The body is discarded either way; a
+/// transport or oversize error simply ends the drain.
+async fn drain_push_response_capped(resp: reqwest::Response) {
+    // DISCARD (ERRORS-19): the body is diagnostic-only; the verdict is the
+    // status line the caller already took.
+    let _ =
+        super::capped_body::read_body_capped(resp, super::capped_body::push_response_cap()).await;
 }
 
 /// #2341 (W1A2-01/02) — inspect a 2xx receiver report and return the
@@ -2568,24 +2608,40 @@ pub async fn bulk_catchup_push(
                     // so: the peer's push freshness counts a batch as a
                     // success only when the peer applied it (#2341). An
                     // unreadable 2xx body stays an ack, as in `post_once`.
-                    let applied = resp.bytes().await.ok().is_none_or(|bytes| {
-                        serde_json::from_slice::<serde_json::Value>(&bytes)
-                            .ok()
-                            .and_then(|v| success_report_non_ack_reason(&v))
-                            .is_none()
-                    });
-                    let observation = if applied {
-                        Observation::Success
-                    } else {
-                        Observation::Failure(FailureClass::NotApplied)
-                    };
-                    (Ok(()), observation)
+                    // #4033 — through the ONE capped reader. An OVERSIZE
+                    // report is a failed push to this peer (never the legacy
+                    // unreadable-2xx ack below).
+                    match super::capped_body::read_body_capped(
+                        resp,
+                        super::capped_body::push_response_cap(),
+                    )
+                    .await
+                    {
+                        Err(e @ super::capped_body::BodyReadError::TooLarge { .. }) => (
+                            Err(push_response_too_large_reason(&e)),
+                            Observation::Failure(FailureClass::NotApplied),
+                        ),
+                        read => {
+                            let applied = read.ok().is_none_or(|bytes| {
+                                serde_json::from_slice::<serde_json::Value>(&bytes)
+                                    .ok()
+                                    .and_then(|v| success_report_non_ack_reason(&v))
+                                    .is_none()
+                            });
+                            let observation = if applied {
+                                Observation::Success
+                            } else {
+                                Observation::Failure(FailureClass::NotApplied)
+                            };
+                            (Ok(()), observation)
+                        }
+                    }
                 }
                 Ok(resp) => {
                     // #1579 B5 — same drain on the error arm; see
                     // `post_once` for the fresh-handshake rationale.
                     let status = resp.status();
-                    let _ = resp.bytes().await;
+                    drain_push_response_capped(resp).await;
                     // #3148 — reuse the canonical `http {status}` shape helper
                     // rather than re-inlining the literal (pm-v3.1).
                     (

@@ -9030,12 +9030,17 @@ pub async fn sync_cycle_once(
     if !resp.status().is_success() {
         anyhow::bail!("sync-daemon: pull status {}", resp.status());
     }
-    let pulled: SyncSinceResponse = resp.json().await.map_err(|e| {
-        anyhow::anyhow!(
-            "sync-daemon: pull body {}",
-            crate::url_display::network_failure(&e)
-        )
-    })?;
+    // #4033 (SEC, CWE-770) — the pull body goes through the ONE capped reader
+    // (the #1928 `/sync/since` bound the `serve` puller already honours), never
+    // `resp.json()`, which buffers an unbounded peer body.
+    let pulled_bytes = crate::federation::capped_body::read_body_capped(
+        resp,
+        crate::federation::capped_body::sync_response_cap(),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("sync-daemon: pull body {e}"))?;
+    let pulled: SyncSinceResponse = serde_json::from_slice(&pulled_bytes)
+        .map_err(|e| anyhow::anyhow!("sync-daemon: pull body is not a sync/since page: {e}"))?;
     // #3655 — CONTACT is recorded the moment the peer answered, before and
     // apart from the data watermark below: an empty window is a successful
     // exchange with a reachable peer, and `sync_state_observe` (which moves
