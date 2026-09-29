@@ -34,7 +34,9 @@
 //!    serialized within one process. The file is opened with `O_APPEND`, but
 //!    separate processes are not chain-serialized and a crash or short write
 //!    can leave a torn final line. Run one writer per audit file and use
-//!    `audit verify` to detect malformed or broken chains. Failures inside
+//!    `audit verify` to detect malformed or broken chains. An enabled
+//!    trail whose tail cannot be read or ends in a torn record refuses to
+//!    start rather than restarting the chain at genesis (#4190). Failures inside
 //!    emit are swallowed and logged via `tracing`; a broken audit pipeline
 //!    never blocks a memory operation.
 
@@ -297,9 +299,24 @@ pub fn init(path: &Path, redact_content: bool, append_only_hint: bool) -> Result
     // which made `audit verify` flag "sequence not monotonic:
     // prior=N, this=1" on the first event after every restart —
     // the hash chain was intact but the sequence integer reset.
-    let (last_hash, last_sequence) = match read_chain_tail(path) {
-        Ok(Some((hash, seq))) => (hash, seq),
-        _ => (CHAIN_HEAD_PREV_HASH.to_string(), 0),
+    //
+    // #4190 — `Ok(None)` (no trail yet, or only blank lines) is the ONLY case
+    // that starts at genesis. A trail that exists but whose tail cannot be
+    // read (an I/O or permission error, bytes that are not UTF-8, a torn or
+    // corrupt last record) is an `Err` that refuses boot through
+    // `init_from_config` (#3651, exit 78). Pre-#4190 every one of those was
+    // treated as "no chain" and a NEW chain was appended at genesis into the
+    // same file, forking it silently.
+    let (last_hash, last_sequence) = match read_chain_tail(path).with_context(|| {
+        format!(
+            "reading the audit trail tail {} to continue its hash chain; a trail \
+             that exists but cannot be read is never restarted at genesis (that \
+             would fork the chain), so repair or move the trail",
+            path.display()
+        )
+    })? {
+        Some((hash, seq)) => (hash, seq),
+        None => (CHAIN_HEAD_PREV_HASH.to_string(), 0),
     };
 
     let file = OpenOptions::new()
@@ -395,11 +412,17 @@ pub fn shutdown_for_test() {
 }
 
 /// Read the last `(self_hash, sequence)` pair from an existing audit
-/// log. Returns `Ok(None)` when the file is empty or doesn't exist;
-/// returns the `self_hash` and `sequence` of the last well-formed line
-/// otherwise. A malformed trailing line counts as "empty" — emission
-/// seeds a fresh chain head, and `audit verify` will surface the
-/// corruption.
+/// log. Returns `Ok(None)` only when the file doesn't exist or holds no
+/// non-blank line (a genuinely empty chain); otherwise the `self_hash`
+/// and `sequence` of the last record.
+///
+/// **#4190:** the LAST non-blank line must be a complete audit event. A
+/// torn or corrupt final record is an `Err`, as is any read error (the
+/// file cannot be opened or read, or holds bytes that are not UTF-8).
+/// Pre-#4190 a malformed trailing line counted as "empty" and [`init`]
+/// seeded a fresh chain head, forking the chain. A malformed line that a
+/// later valid record follows is still skipped here; `audit verify`
+/// reports it.
 ///
 /// **F2 (v0.7.0 round-2-fixes):** the return tuple is consumed by
 /// [`init`] to seed both `last_hash` (chain continuity) AND the
@@ -423,12 +446,16 @@ fn read_chain_tail(path: &Path) -> Result<Option<(String, u64)>> {
     let reader = BufReader::new(file);
     let mut last: Option<(String, u64)> = None;
     let mut prior_seq: Option<u64> = None;
+    // #4190 — whether the last non-blank line parsed as an event.
+    let mut last_line_parsed = true;
     for line in reader.lines() {
         let line = line?;
         if line.trim().is_empty() {
             continue;
         }
-        if let Ok(ev) = serde_json::from_str::<AuditEvent>(&line) {
+        let parsed = serde_json::from_str::<AuditEvent>(&line);
+        last_line_parsed = parsed.is_ok();
+        if let Ok(ev) = parsed {
             // M14: surface out-of-order seqnums. A higher prior_seq
             // followed by a lower this_seq is the corruption signal —
             // equal seqnums are *also* a violation (duplicate emit),
@@ -452,6 +479,13 @@ fn read_chain_tail(path: &Path) -> Result<Option<(String, u64)>> {
             prior_seq = Some(ev.sequence);
             last = Some((ev.self_hash, ev.sequence));
         }
+    }
+    if !last_line_parsed {
+        return Err(anyhow!(
+            "the last record in {} is not a complete audit event (a torn or \
+             corrupt write)",
+            path.display()
+        ));
     }
     Ok(last)
 }
@@ -1600,15 +1634,39 @@ mod tests {
     }
 
     #[test]
-    fn audit_init_skips_chain_tail_when_log_corrupted() {
+    fn audit_init_refuses_a_corrupt_chain_tail_4190() {
+        // #4190 — pre-fix, a malformed trailing line counted as "no chain"
+        // and init re-seeded CHAIN_HEAD_PREV_HASH, forking the chain inside
+        // the same file. Now it is an error, and the file is left alone.
         let _g = sink_lock();
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("audit.log");
-        // File has a malformed trailing line; init must fall back to
-        // CHAIN_HEAD_PREV_HASH because no well-formed lines exist.
         std::fs::write(&path, "{not valid json\n").unwrap();
+        let err = super::init(&path, true, false).expect_err("a corrupt tail must refuse");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("audit trail tail"), "{msg}");
+        assert!(msg.contains("torn or corrupt"), "{msg}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{not valid json\n");
+    }
+
+    #[test]
+    fn audit_init_continues_past_a_corrupt_interior_line_4190() {
+        // Control for the rule's boundary: a malformed line that a later
+        // valid record follows is not the tail, so init continues from that
+        // later record (and `audit verify` reports the bad line).
+        let _g = sink_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("audit.log");
+        let e1 = sample_event(1, CHAIN_HEAD_PREV_HASH);
+        std::fs::write(
+            &path,
+            format!(
+                "{{not valid json\n{}\n",
+                serde_json::to_string(&e1).unwrap()
+            ),
+        )
+        .unwrap();
         super::init(&path, true, false).unwrap();
-        // Emitting a fresh event must seed prev_hash with the chain head.
         super::emit(EventBuilder::new(
             AuditAction::Store,
             actor("a", "explicit", None),
@@ -1617,7 +1675,7 @@ mod tests {
         let body = std::fs::read_to_string(&path).unwrap();
         let last = body.lines().filter(|l| !l.is_empty()).last().unwrap();
         let parsed: AuditEvent = serde_json::from_str(last).unwrap();
-        assert_eq!(parsed.prev_hash, CHAIN_HEAD_PREV_HASH);
+        assert_eq!(parsed.prev_hash, e1.self_hash);
         super::shutdown_for_test();
     }
 
@@ -2255,16 +2313,24 @@ mod tests {
 
     #[test]
     fn init_with_directory_in_place_of_file_returns_open_error() {
-        // Line 266: `OpenOptions::new().open(path)` fails when the
-        // path resolves to an existing *directory*. `init` wraps the
-        // error with `with_context("opening audit log {path}")`.
+        // A path that resolves to an existing *directory* is an error that
+        // names the path. Since #4190 the chain-tail read reaches it first
+        // (reading a directory fails, e.g. EISDIR, and is no longer
+        // discarded); on a platform where that read cannot even open the
+        // directory the error comes from the same stage, and if it ever got
+        // past the read the append-open (`opening audit log {path}`) refuses.
         let _g = sink_lock();
         let tmp = tempfile::tempdir().unwrap();
-        // Use the tempdir itself as the target — opening a dir for
-        // write/append fails with EISDIR on macOS/Linux.
         let err = super::init(tmp.path(), true, false).unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("opening audit log"), "got: {msg}");
+        assert!(
+            msg.contains("audit trail tail") || msg.contains("opening audit log"),
+            "got: {msg}"
+        );
+        assert!(
+            msg.contains(&tmp.path().display().to_string()),
+            "got: {msg}"
+        );
         super::shutdown_for_test();
     }
 

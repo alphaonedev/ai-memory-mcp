@@ -278,3 +278,173 @@ fn a_working_audit_trail_still_boots_3651() {
     assert!(out.status.success(), "stderr: {}", stderr(&out));
     assert!(!stderr(&out).contains("refusing to start"));
 }
+
+// #4190 — `audit::init` must keep "no chain yet" (`Ok(None)`: start at
+// genesis) apart from "a chain whose tail cannot be read" (`Err`: refuse boot,
+// exit 78). Before #4190 every read error, and a torn or corrupt last record,
+// was treated as "no chain": the process booted and appended a NEW chain at
+// genesis into the same file, forking it silently.
+
+fn audit_toml(dir: &Path) -> String {
+    format!("enabled = true\npath = \"{}\"\n", dir.display())
+}
+
+/// The trail file inside the configured audit directory.
+fn trail_file(dir: &Path) -> PathBuf {
+    dir.join("audit.log")
+}
+
+/// One `store` through the real binary, which emits one audit record.
+fn store_once(home: &Path, dir: &Path, title: &str) -> Output {
+    store_once_with(home, dir, title, "")
+}
+
+/// [`store_once`] with extra `[audit]` keys appended.
+fn store_once_with(home: &Path, dir: &Path, title: &str, extra: &str) -> Output {
+    run_with_section(
+        home,
+        "audit",
+        &format!("{}{extra}", audit_toml(dir)),
+        &["store", "--title", title, "--content", "audit chain 4190"],
+    )
+}
+
+/// Every parsed record in the trail, in file order.
+fn records(dir: &Path) -> Vec<serde_json::Value> {
+    std::fs::read_to_string(trail_file(dir))
+        .expect("read the audit trail")
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).expect("every record is valid JSON"))
+        .collect()
+}
+
+/// A trail holding one genuine record, written by the binary itself.
+fn trail_with_one_record(home: &Path) -> PathBuf {
+    let dir = home.join("audit");
+    let out = store_once(home, &dir, "first");
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert_eq!(records(&dir).len(), 1, "the seed run wrote one record");
+    dir
+}
+
+/// Boot against a damaged trail must refuse (exit 78, naming the trail) and
+/// must leave every byte of it untouched.
+fn assert_damaged_trail_refused(home: &Path, dir: &Path) {
+    let before = std::fs::read(trail_file(dir)).expect("read trail before");
+    let out = store_once(home, dir, "second");
+    assert_audit_refusal(&out, "audit trail tail");
+    let after = std::fs::read(trail_file(dir)).expect("read trail after");
+    assert_eq!(before, after, "a refused boot must not write to the trail");
+}
+
+#[test]
+fn a_torn_last_audit_record_refuses_boot_4190() {
+    let home = sandbox();
+    let dir = trail_with_one_record(home.path());
+    // A write torn mid-record: the last line is not a complete event.
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(trail_file(&dir))
+        .expect("open trail");
+    std::io::Write::write_all(&mut f, b"{\"sequence\":2,\"prev_hash\":\"").expect("tear");
+    drop(f);
+    assert_damaged_trail_refused(home.path(), &dir);
+}
+
+#[test]
+fn a_trail_of_only_garbage_refuses_boot_4190() {
+    // No line parses, so the pre-#4190 scan returned "no chain" and the
+    // process re-started the chain at genesis inside a non-empty file.
+    let home = sandbox();
+    let dir = home.path().join("audit");
+    std::fs::create_dir_all(&dir).expect("create audit dir");
+    std::fs::write(trail_file(&dir), b"not an audit event\n").expect("write garbage");
+    assert_damaged_trail_refused(home.path(), &dir);
+}
+
+#[test]
+fn a_non_utf8_audit_tail_refuses_boot_4190() {
+    let home = sandbox();
+    let dir = trail_with_one_record(home.path());
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(trail_file(&dir))
+        .expect("open trail");
+    std::io::Write::write_all(&mut f, b"\xff\xfe\xfd\n").expect("write invalid UTF-8");
+    drop(f);
+    assert_damaged_trail_refused(home.path(), &dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn an_unreadable_audit_trail_refuses_boot_4190() {
+    use std::os::unix::fs::PermissionsExt;
+    // The OS append-only flag (`[audit].append_only`, on by default) forbids
+    // the chmod this cell needs on macOS, so this cell runs without it; the
+    // refusal under test does not depend on that flag.
+    const NO_OS_FLAG: &str = "append_only = false\n";
+    let home = sandbox();
+    let dir = home.path().join("audit");
+    let seed = store_once_with(home.path(), &dir, "first", NO_OS_FLAG);
+    assert!(seed.status.success(), "stderr: {}", stderr(&seed));
+    assert_eq!(records(&dir).len(), 1, "the seed run wrote one record");
+    let trail = trail_file(&dir);
+    let before = std::fs::read(&trail).expect("read trail before");
+    // Append-only for us, like a trail the process may write but not read.
+    std::fs::set_permissions(&trail, std::fs::Permissions::from_mode(0o200)).expect("chmod");
+    if std::fs::read(&trail).is_ok() {
+        // Running as root: permission bits do not deny reads, so this cell
+        // cannot build its precondition. The other variants still cover the
+        // refusal; say so rather than passing silently.
+        std::fs::set_permissions(&trail, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+        eprintln!(
+            "SKIP an_unreadable_audit_trail_refuses_boot_4190: permission bits do not deny reads here"
+        );
+        return;
+    }
+    let out = store_once_with(home.path(), &dir, "second", NO_OS_FLAG);
+    std::fs::set_permissions(&trail, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+    assert_audit_refusal(&out, "audit trail tail");
+    assert_eq!(
+        before,
+        std::fs::read(&trail).expect("read trail after"),
+        "a refused boot must not write to the trail"
+    );
+}
+
+#[test]
+fn a_fresh_audit_trail_boots_and_writes_genesis_4190() {
+    let home = sandbox();
+    let dir = home.path().join("audit");
+    assert!(!trail_file(&dir).exists(), "precondition: no trail yet");
+    let out = store_once(home.path(), &dir, "first");
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let recs = records(&dir);
+    assert_eq!(recs.len(), 1, "one record");
+    assert_eq!(recs[0]["sequence"], 1, "a fresh chain starts at sequence 1");
+    assert_eq!(
+        recs[0]["prev_hash"],
+        ai_memory::audit::CHAIN_HEAD_PREV_HASH,
+        "a fresh chain starts at genesis"
+    );
+}
+
+#[test]
+fn an_intact_audit_trail_boots_and_appends_to_its_tail_4190() {
+    let home = sandbox();
+    let dir = trail_with_one_record(home.path());
+    let out = store_once(home.path(), &dir, "second");
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let recs = records(&dir);
+    assert_eq!(recs.len(), 2, "the second boot appended one record");
+    assert_eq!(
+        recs[1]["prev_hash"], recs[0]["self_hash"],
+        "the new record continues the existing chain, not genesis"
+    );
+    assert_eq!(
+        recs[1]["sequence"].as_u64(),
+        recs[0]["sequence"].as_u64().map(|s| s + 1),
+        "the sequence continues across the restart"
+    );
+}
