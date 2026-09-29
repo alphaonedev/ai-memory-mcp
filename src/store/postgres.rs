@@ -8322,10 +8322,10 @@ impl PostgresStore {
         // semantics while guaranteeing the gate evaluated the row
         // that was actually replaced. Explicit If-Match callers keep
         // exactly-one-winner semantics (no retry).
-        // #1726 — capture the optional lifecycle target before the loop
-        // (LifecycleState is Copy); applied once after the value-gated UPDATE
-        // succeeds so the If-Match HTTP path enforces the transition machine.
-        let lifecycle_target = patch.lifecycle_state;
+        // #1726 / #4053 — an optional `patch.lifecycle_state` is applied by
+        // `update_with_expected_version_once` INSIDE its owner-locked write
+        // transaction (never a second, owner-unaware transaction after
+        // commit), so the version returned here reflects the complete update.
         const MAX_GATE_RETRIES: usize = 3;
         let mut attempt = 0;
         loop {
@@ -8334,10 +8334,7 @@ impl PostgresStore {
                 .update_with_expected_version_once(ctx, id, patch.clone(), expected_version)
                 .await?
             {
-                Some(new_version) => {
-                    self.apply_lifecycle_patch(id, lifecycle_target).await?;
-                    return Ok(new_version);
-                }
+                Some(new_version) => return Ok(new_version),
                 None => {
                     // 0 rows: row vanished or version drifted.
                     let observed: Option<(i64,)> =
@@ -8372,7 +8369,7 @@ impl PostgresStore {
     /// #1726 (Pillar-2 typed cognition) — apply an optional lifecycle
     /// transition on the postgres backend, ENFORCING the transition machine
     /// ([`crate::models::LifecycleState::can_transition_to`]). Postgres twin
-    /// of the sqlite primitive [`crate::storage::set_lifecycle_state`]: SELECT
+    /// of the sqlite primitive [`crate::storage::set_lifecycle_state`]: read
     /// the current state, reject an illegal edge (`open → done`, a move out
     /// of a terminal, etc.) with a typed [`StoreError::InvalidTransition`]
     /// (→ HTTP 409 — byte-parity error detail with the sqlite Display), and
@@ -8380,38 +8377,43 @@ impl PostgresStore {
     /// to the stored state is an idempotent no-op; `None` leaves the column
     /// untouched.
     ///
+    /// #4053 — runs on the CALLER's write transaction, which has already
+    /// passed the caller-owns gate and holds the row `FOR UPDATE`. Pre-fix
+    /// this opened its own transaction after the owner-locked update had
+    /// committed, so an ownership transfer committing in between let the
+    /// former owner's request change the new owner's row, and an illegal
+    /// edge refused the call AFTER its content write had committed (#3152).
+    /// Now the gate, the content write and the transition commit or roll back
+    /// together. The `FOR UPDATE` below re-asserts the lock (a no-op under
+    /// the gate's; the admin `bypass_visibility` path has no gate probe).
+    ///
+    /// Returns the row's new `version` when a transition was written, `None`
+    /// for an absent target or a no-op.
+    ///
     /// # Errors
     ///
     /// * [`StoreError::InvalidTransition`] — the `current → target` edge is
-    ///   not permitted.
+    ///   not permitted (the caller's transaction must roll back).
     /// * [`StoreError::NotFound`] — no live memory matches `id`.
     /// * [`StoreError::BackendUnavailable`] — on SQL failure.
-    async fn apply_lifecycle_patch(
-        &self,
+    async fn apply_lifecycle_patch_in_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         id: &str,
         target: Option<crate::models::LifecycleState>,
-    ) -> StoreResult<()> {
+    ) -> StoreResult<Option<i64>> {
         use crate::models::LifecycleState;
 
-        self.gate_record_stop().await?;
         let Some(target) = target else {
-            return Ok(());
+            return Ok(None);
         };
-        // f1 goal4 FC (#3266, GOD ruling): read, validate and write in ONE
-        // transaction — the row is read `FOR UPDATE` on the transaction's own
-        // connection (never the pool), and the UPDATE carries the validated
-        // `from` as a compare-and-set. A route-IN quarantine or a contamination
-        // stamp that commits before this read is SEEN (and refused by the
-        // transition machine); one that commits after it waits for this commit.
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| to_store_err("lifecycle transition begin tx", e))?;
+        // f1 goal4 FC (#3266, GOD ruling): read, validate and write under the
+        // row lock — a route-IN quarantine or a contamination stamp that
+        // commits before the gate's read is SEEN (and refused by the
+        // transition machine); one that commits after waits for this commit.
         let current: Option<(String,)> =
             sqlx::query_as("SELECT lifecycle_state FROM memories WHERE id = $1 FOR UPDATE")
                 .bind(id)
-                .fetch_optional(&mut *tx)
+                .fetch_optional(&mut **tx)
                 .await
                 .map_err(|e| to_store_err("read lifecycle_state for transition gate", e))?;
         let Some((current_str,)) = current else {
@@ -8421,7 +8423,7 @@ impl PostgresStore {
         // No-op (requested == current) is idempotent success, not a self-loop
         // error — mirrors the sqlite primitive + the memory_update contract.
         if from == target {
-            return Ok(());
+            return Ok(None);
         }
         let illegal = |from: &str| StoreError::InvalidTransition {
             detail: format!(
@@ -8431,26 +8433,22 @@ impl PostgresStore {
         if !from.can_transition_to(target) {
             return Err(illegal(from.as_str()));
         }
-        let n = sqlx::query(
+        let written: Option<(i64,)> = sqlx::query_as(
             "UPDATE memories SET lifecycle_state = $1, updated_at = NOW(), version = version + 1 \
-             WHERE id = $2 AND lifecycle_state = $3",
+             WHERE id = $2 AND lifecycle_state = $3 RETURNING version",
         )
         .bind(target.as_str())
         .bind(id)
         .bind(&current_str)
-        .execute(&mut *tx)
+        .fetch_optional(&mut **tx)
         .await
-        .map_err(|e| to_store_err("update lifecycle_state", e))?
-        .rows_affected();
+        .map_err(|e| to_store_err("update lifecycle_state", e))?;
         // Unreachable under the held row lock; the CAS is the structural guard,
         // and a miss is a typed conflict, never a silent no-op.
-        if n == 0 {
+        let Some((version,)) = written else {
             return Err(illegal(from.as_str()));
-        }
-        tx.commit()
-            .await
-            .map_err(|e| to_store_err("lifecycle transition commit", e))?;
-        Ok(())
+        };
+        Ok(Some(version))
     }
 
     /// v1.0.0 R19/A3 (#1948, decision `560c8007`) — system-only RAW
@@ -8494,6 +8492,9 @@ impl PostgresStore {
     ) -> StoreResult<Option<i64>> {
         // Wave-2 B8 — inner CAS attempt of If-Match update (ERRORS-09).
         self.gate_record_stop().await?;
+        // #4053 — captured before the binds below move `patch`
+        // (LifecycleState is Copy); applied in THIS owner-locked tx.
+        let lifecycle_target = patch.lifecycle_state;
         // Pre-read the current version so a CONFLICT carries the
         // observed-current value in the typed error; the UPDATE re-asserts
         // that VERSION (the $11 bind) — it carries no ownership predicate.
@@ -8868,10 +8869,17 @@ impl PostgresStore {
         )
         .await
         .map_err(|e| to_store_err(CTX_APPEND_SUPERSEDE_LEAF, e))?;
+        // #1726 / #4053 — the optional lifecycle transition, under the SAME
+        // owner gate row lock and version CAS as the content write above: an
+        // illegal edge rolls the whole update back, and a transfer of
+        // ownership cannot land between the two writes.
+        let final_version = Self::apply_lifecycle_patch_in_tx(&mut tx, id, lifecycle_target)
+            .await?
+            .unwrap_or(new_version);
         tx.commit()
             .await
             .map_err(|e| to_store_err("commit update tx", e))?;
-        Ok(Some(new_version))
+        Ok(Some(final_version))
     }
 
     /// v0.7.0 Provenance Gap 5 (issue #888) — append-and-archive write
@@ -23844,7 +23852,8 @@ impl MemoryStore for PostgresStore {
 
         // #1726 — capture the optional lifecycle target before the binds
         // below move the rest of `patch` (LifecycleState is Copy); applied
-        // through the self-validating helper after the COALESCE UPDATE lands.
+        // through the self-validating helper after the COALESCE UPDATE lands,
+        // in the same owner-locked transaction (#4053).
         let lifecycle_target = patch.lifecycle_state;
 
         // #1799 — snapshot the prior content under
@@ -24248,18 +24257,17 @@ impl MemoryStore for PostgresStore {
             .map_err(|e| to_store_err(CTX_APPEND_SUPERSEDE_LEAF, e))?;
         }
 
-        // #1799 — commit the atomic snapshot + UPDATE before any
-        // pool-direct follow-up. `apply_lifecycle_patch` below uses
-        // `self.pool` separately (its own statement), so it MUST run after
-        // the tx commits, preserving the pre-#1799 post-update ordering.
+        // #1726 / #4053 — apply an optional lifecycle transition through the
+        // self-validating helper (the non-If-Match HTTP PUT path routes here)
+        // INSIDE this owner-locked tx, so the gate, the content write and the
+        // transition commit or roll back together. `lifecycle_target` was
+        // captured before the binds moved `patch`.
+        Self::apply_lifecycle_patch_in_tx(&mut tx, id, lifecycle_target).await?;
+
+        // #1799 — commit the atomic snapshot + UPDATE + transition.
         tx.commit()
             .await
             .map_err(|e| to_store_err("update commit tx", e))?;
-
-        // #1726 — apply an optional lifecycle transition through the
-        // self-validating helper (the non-If-Match HTTP PUT path routes here).
-        // `lifecycle_target` was captured before the binds moved `patch`.
-        self.apply_lifecycle_patch(id, lifecycle_target).await?;
         Ok(())
     }
 
