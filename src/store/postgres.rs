@@ -97,6 +97,9 @@ mod lineage;
 // canonical pins mirroring the SSOT) shared by `ai-memory doctor` and the
 // `serve` boot WARN. Own module: pure, no sqlx, unit-tested without a cluster.
 pub mod age_version;
+// v1.0.0 #3674 — the ONE funnel a store DSN crosses on its way into sqlx:
+// query parameters sqlx would log instead of honour are removed first.
+pub mod dsn;
 // v1.0.0 #3124 R4 — the audited `reown` sweep. Own module for the same
 // qual_10 budget reason as `parity_3064` above.
 mod reown_3124;
@@ -169,6 +172,31 @@ const SQL_DELETE_MEMORY_BY_ID: &str = "DELETE FROM memories WHERE id = $1";
 /// snapshot before re-INSERTing the prior content) and by `restore_archived`
 /// (removes the archive row after a successful restore).
 const SQL_DELETE_ARCHIVED_MEMORY_BY_ID: &str = "DELETE FROM archived_memories WHERE id = $1";
+/// #1725 / #3961 — snapshot a STILL-LIVE row's full column set into
+/// `archived_memories` under a caller-bound `archive_reason` ($2), keeping the
+/// live row. Paired with [`SQL_DELETE_ARCHIVED_MEMORY_BY_ID`] on the same tx
+/// (DELETE + INSERT = sqlite's `INSERT OR REPLACE`, the most-recent snapshot
+/// wins). One definition for the in-place-edit snapshots and the federation
+/// merge snapshot, so the archive-parity column set (v49 / #1025) cannot drift
+/// between them.
+const SQL_ARCHIVE_SNAPSHOT_LIVE_ROW: &str = "INSERT INTO archived_memories
+                    (id, tier, namespace, title, content, tags, priority, confidence,
+                     source, access_count, created_at, updated_at, last_accessed_at,
+                     expires_at, archived_at, archive_reason, metadata,
+                     embedding, embedding_dim, embedding_space, original_tier, original_expires_at,
+                     reflection_depth, atomised_into, atom_of, memory_kind,
+                     entity_id, persona_version, citations, source_uri, source_span,
+                     confidence_source, confidence_signals, confidence_decayed_at,
+                     mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until, cid, cid_genesis)
+                 SELECT id, tier, namespace, title, content, tags, priority, confidence,
+                        source, access_count, created_at, updated_at, last_accessed_at,
+                        expires_at, NOW(), $2, metadata,
+                        embedding, embedding_dim, embedding_space, tier, expires_at,
+                        reflection_depth, atomised_into, atom_of, memory_kind,
+                        entity_id, persona_version, citations, source_uri, source_span,
+                        confidence_source, confidence_signals, confidence_decayed_at,
+                        mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until, cid, cid_genesis
+                 FROM memories WHERE id = $1";
 /// #2195 (data-integrity archive-parity) — LAST-WINS `ON CONFLICT` clause for
 /// the eviction / manual archive-INSERT paths (`forget`, `run_gc`, `size_gc`,
 /// `archive_by_ids`). SQLite archives via `INSERT OR REPLACE` (last-wins: a
@@ -2668,17 +2696,18 @@ impl PostgresStore {
             }
         }
 
+        // #3674 — through the DSN screen, never `url.parse()`: sqlx logs every
+        // query parameter it does not recognise with its VALUE at WARN.
         let options: PgConnectOptions =
-            url.parse()
-                .map_err(|e: sqlx::Error| StoreError::BackendUnavailable {
-                    backend: "postgres".to_string(),
-                    sqlstate: None,
-                    // #1579 A3 (SECURITY) — sqlx parse errors can
-                    // interpolate the raw URL (credential included)
-                    // into their Display; scrub any embedded URL's
-                    // password before the detail leaves the adapter.
-                    detail: format!("parse url: {e}"),
-                })?;
+            dsn::connect_options(url).map_err(|e: sqlx::Error| StoreError::BackendUnavailable {
+                backend: "postgres".to_string(),
+                sqlstate: None,
+                // #1579 A3 (SECURITY) — sqlx parse errors can
+                // interpolate the raw URL (credential included)
+                // into their Display; scrub any embedded URL's
+                // password before the detail leaves the adapter.
+                detail: format!("parse url: {e}"),
+            })?;
         // v0.7.0 M4/M7 — `after_connect` hook fires the moment a new
         // connection is acquired. We use it to apply per-session
         // `statement_timeout` + `lock_timeout` so a runaway query
@@ -8678,31 +8707,12 @@ impl PostgresStore {
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| to_store_err("clear prior in_place_edit snapshot", e))?;
-            sqlx::query(
-                "INSERT INTO archived_memories
-                    (id, tier, namespace, title, content, tags, priority, confidence,
-                     source, access_count, created_at, updated_at, last_accessed_at,
-                     expires_at, archived_at, archive_reason, metadata,
-                     embedding, embedding_dim, embedding_space, original_tier, original_expires_at,
-                     reflection_depth, atomised_into, atom_of, memory_kind,
-                     entity_id, persona_version, citations, source_uri, source_span,
-                     confidence_source, confidence_signals, confidence_decayed_at,
-                     mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until, cid, cid_genesis)
-                 SELECT id, tier, namespace, title, content, tags, priority, confidence,
-                        source, access_count, created_at, updated_at, last_accessed_at,
-                        expires_at, NOW(), $2, metadata,
-                        embedding, embedding_dim, embedding_space, tier, expires_at,
-                        reflection_depth, atomised_into, atom_of, memory_kind,
-                        entity_id, persona_version, citations, source_uri, source_span,
-                        confidence_source, confidence_signals, confidence_decayed_at,
-                        mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until, cid, cid_genesis
-                 FROM memories WHERE id = $1",
-            )
-            .bind(id)
-            .bind(crate::models::field_names::ARCHIVE_REASON_IN_PLACE_EDIT)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| to_store_err("archive prior content in_place_edit", e))?;
+            sqlx::query(SQL_ARCHIVE_SNAPSHOT_LIVE_ROW)
+                .bind(id)
+                .bind(crate::models::field_names::ARCHIVE_REASON_IN_PLACE_EDIT)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("archive prior content in_place_edit", e))?;
         }
 
         let new_version = current + 1;
@@ -24016,31 +24026,12 @@ impl MemoryStore for PostgresStore {
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| to_store_err("clear prior in_place_edit snapshot", e))?;
-            sqlx::query(
-                "INSERT INTO archived_memories
-                    (id, tier, namespace, title, content, tags, priority, confidence,
-                     source, access_count, created_at, updated_at, last_accessed_at,
-                     expires_at, archived_at, archive_reason, metadata,
-                     embedding, embedding_dim, embedding_space, original_tier, original_expires_at,
-                     reflection_depth, atomised_into, atom_of, memory_kind,
-                     entity_id, persona_version, citations, source_uri, source_span,
-                     confidence_source, confidence_signals, confidence_decayed_at,
-                     mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until, cid, cid_genesis)
-                 SELECT id, tier, namespace, title, content, tags, priority, confidence,
-                        source, access_count, created_at, updated_at, last_accessed_at,
-                        expires_at, NOW(), $2, metadata,
-                        embedding, embedding_dim, embedding_space, tier, expires_at,
-                        reflection_depth, atomised_into, atom_of, memory_kind,
-                        entity_id, persona_version, citations, source_uri, source_span,
-                        confidence_source, confidence_signals, confidence_decayed_at,
-                        mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until, cid, cid_genesis
-                 FROM memories WHERE id = $1",
-            )
-            .bind(id)
-            .bind(crate::models::field_names::ARCHIVE_REASON_IN_PLACE_EDIT)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| to_store_err("archive prior content in_place_edit", e))?;
+            sqlx::query(SQL_ARCHIVE_SNAPSHOT_LIVE_ROW)
+                .bind(id)
+                .bind(crate::models::field_names::ARCHIVE_REASON_IN_PLACE_EDIT)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("archive prior content in_place_edit", e))?;
         }
 
         // One-shot COALESCE update — each patch field overrides only if
@@ -25861,6 +25852,27 @@ impl MemoryStore for PostgresStore {
         // transaction that holds the row lock (f1 goal4 FA). The node-local
         // metadata keys are overlaid from the locked row by an atomic jsonb
         // merge (`pg_node_local_overlay`), never from a copy.
+        // #3961 (the postgres half of #1773) — snapshot the PRE-MERGE row
+        // before this peer-driven LWW full-row overwrite, in the SAME
+        // transaction that holds the row lock, under
+        // `archive_reason = 'federation_merge'`. Unconditional whenever a row
+        // exists by id — exactly the sqlite `overwrite_full_row_by_id`
+        // contract — so a merge where the remote wins the tiebreak leaves a
+        // recoverable copy of the prior local content on BOTH backends
+        // (`archive restore` / `undo-edit` have something to restore from).
+        // DELETE + INSERT keeps the most-recent snapshot, the sqlite
+        // `INSERT OR REPLACE` semantics, so a repeated merge is idempotent.
+        sqlx::query(SQL_DELETE_ARCHIVED_MEMORY_BY_ID)
+            .bind(&merged.id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("merge_inbound clear prior snapshot", e))?;
+        sqlx::query(SQL_ARCHIVE_SNAPSHOT_LIVE_ROW)
+            .bind(&merged.id)
+            .bind(crate::models::field_names::ARCHIVE_REASON_FEDERATION_MERGE)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("merge_inbound pre-merge snapshot", e))?;
         let (merge_content, merge_envelope) = seal_content_for_insert(&mut *tx, &merged).await?;
         sqlx::query(&SQL_MERGE_INBOUND_FULL_ROW_UPDATE)
             .bind(&merged.id)
@@ -25913,7 +25925,8 @@ impl MemoryStore for PostgresStore {
             .map_err(|e| to_store_err("merge_inbound full-row update", e))?;
         // APPEND-ONLY-SANCTIONED (#1823 G6) — COW SUPERSEDE: the federation
         // LWW full-row overwrite rewrites content in place (same id); the
-        // pre-merge content lives in the merge snapshot, never in the leaf.
+        // pre-merge content lives in the `federation_merge` archive snapshot
+        // taken above in this tx (#3961), never in the leaf.
         // Append ONE identity-only SUPERSEDE leaf in this tx.
         pg_emit_revision_leaf_if_enabled(
             &mut tx,

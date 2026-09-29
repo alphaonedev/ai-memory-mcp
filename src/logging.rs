@@ -59,6 +59,27 @@ const DEFAULT_PREFIX: &str = "ai-memory.log";
 /// `RUST_LOG`, which the builder layers last.
 pub const DEFAULT_LOG_DIRECTIVE: &str = "info";
 
+/// v1.0.0 #3685 / #3674 — sqlx event targets that can render a CREDENTIAL,
+/// capped at `error` in every filter this module builds. Applied AFTER
+/// `RUST_LOG`, so an operator's `RUST_LOG=debug` (or an explicit entry for the
+/// same target) cannot re-open them: for a secret-bearing sink, fail-closed
+/// beats verbosity (T3).
+///
+/// - `sqlx_postgres::options::pgpass` — `warn!(line = whole_line, "Malformed
+///   line in pgpass file")` renders a whole `~/.pgpass` / `$PGPASSFILE` line,
+///   password included, whenever the store URL carries no password. sqlx
+///   reads that file itself, so the DSN screen cannot reach it; a filter is
+///   the only control available for a log line and a file that are both
+///   outside our code.
+/// - `sqlx_postgres::options::parse` — the unrecognised-parameter `warn!` that
+///   renders key AND value. [`crate::store::postgres::dsn`] removes those
+///   parameters before sqlx parses a DSN; this floor is the defence in depth
+///   for any future path that bypasses the screen.
+pub const SQLX_SECRET_BEARING_TARGET_FLOOR: &[&str] = &[
+    "sqlx_postgres::options::pgpass=error",
+    "sqlx_postgres::options::parse=error",
+];
+
 /// A filter ready to install, plus every directive that could not be used.
 ///
 /// The rejects are returned rather than logged: no subscriber exists yet
@@ -104,6 +125,15 @@ pub(crate) fn build_log_filter(
             Ok(directive) => filter = filter.add_directive(directive),
             Err(err) => rejected.push(format!("{directive:?} ({err})")),
         }
+    }
+    // #3685 — LAST, so no operator directive for the same target can
+    // override it (a later same-target directive replaces an earlier one).
+    for floor in SQLX_SECRET_BEARING_TARGET_FLOOR {
+        filter = filter.add_directive(
+            floor
+                .parse()
+                .expect("SQLX_SECRET_BEARING_TARGET_FLOOR entries are valid directives"),
+        );
     }
     BuiltLogFilter { filter, rejected }
 }
@@ -2271,6 +2301,51 @@ mod tests {
             garbage.filter.to_string(),
             build_log_filter("info", &[], None).filter.to_string(),
             "a garbage base must degrade to the `info` filter"
+        );
+    }
+    /// #3685 / #3674 — the sqlx targets that can render a credential (a whole
+    /// malformed `.pgpass` line; an unrecognised DSN parameter's value) are
+    /// capped at `error` by EVERY filter the production builder returns, and
+    /// no `RUST_LOG` — global, or naming the exact target — re-opens them.
+    /// R-203 control: the bare `info` filter that shipped with #3650 (what
+    /// the builder produced before the floor) DOES admit the pgpass WARN, so
+    /// the absence below is the floor's doing, not a blind admission check.
+    #[test]
+    fn sqlx_secret_bearing_targets_are_floored_in_every_built_filter_3685() {
+        const PGPASS: &str = "sqlx_postgres::options::pgpass";
+        const PARSE: &str = "sqlx_postgres::options::parse";
+        assert!(
+            filter_admits_3650(
+                tracing_subscriber::EnvFilter::try_new(super::DEFAULT_LOG_DIRECTIVE)
+                    .expect("default parses"),
+                PGPASS,
+                tracing::Level::WARN
+            ),
+            "control: the pre-floor #3650 default admits the pgpass WARN (the leak)"
+        );
+        for rust_log in [
+            None,
+            Some("debug"),
+            Some("trace"),
+            Some("sqlx_postgres=trace"),
+            Some("sqlx_postgres::options::pgpass=trace"),
+            Some("sqlx_postgres::options::parse=trace,sqlx_postgres::options::pgpass=warn"),
+        ] {
+            for target in [PGPASS, PARSE] {
+                let built = build_log_filter(super::DEFAULT_LOG_DIRECTIVE, &[], rust_log);
+                assert!(
+                    !filter_admits_3650(built.filter, target, tracing::Level::WARN),
+                    "#3685: {target} WARN admitted under RUST_LOG={rust_log:?} — a \
+                     credential-bearing sqlx line would reach the sink"
+                );
+            }
+        }
+        // Scope: the floor names two targets and nothing else — sqlx's other
+        // events (e.g. the slow-statement WARN) keep the operator's level.
+        let built = build_log_filter(super::DEFAULT_LOG_DIRECTIVE, &[], None);
+        assert!(
+            filter_admits_3650(built.filter, "sqlx::query", tracing::Level::WARN),
+            "the floor must not silence unrelated sqlx targets"
         );
     }
 }

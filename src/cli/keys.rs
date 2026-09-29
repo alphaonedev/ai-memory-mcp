@@ -550,7 +550,9 @@ fn postgres(
     super::doctor::run_pg_probe(|| async {
         use sqlx::Connection as _;
         let operation = async {
-            let mut conn = sqlx::PgConnection::connect(url).await?;
+            // #3674 — the DSN screen, never a raw `connect(url)`.
+            let options = crate::store::postgres::dsn::connect_options(url)?;
+            let mut conn = sqlx::PgConnection::connect_with(&options).await?;
             let mut tx = conn.begin().await?;
             if delete {
                 // Protect the entire _agents population against insertion,

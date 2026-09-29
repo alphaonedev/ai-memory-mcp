@@ -399,6 +399,37 @@ fn assert_caller_owns_for_mutation(
     })
 }
 
+/// #3957 — test-only interleave point between the ownership gate and the
+/// write it authorises. A cell arms it for ONE row id; any other id (a
+/// concurrent test on another row) passes through untouched. Compiled out
+/// of every non-test build.
+#[cfg(test)]
+type OwnerGateHook = Box<dyn FnOnce() + Send>;
+/// Keyed by row id so concurrently running cells never replace each
+/// other's armed hook.
+#[cfg(test)]
+pub(crate) static OWNER_GATE_TEST_HOOK: std::sync::Mutex<
+    Option<std::collections::HashMap<String, OwnerGateHook>>,
+> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn owner_gate_test_hook(id: &str) {
+    let hook = OWNER_GATE_TEST_HOOK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_mut()
+        .and_then(|armed| armed.remove(id));
+    if let Some(f) = hook {
+        f();
+    }
+}
+
+#[cfg(not(test))]
+fn owner_gate_test_hook(_id: &str) {}
+
+#[cfg(test)]
+mod owner_gate_txn_3957;
+
 // #1709 Pillar 1 — the actions SELECT column list + row mapping live in
 // `crate::actions` (shared with the MCP `memory_action_*` handlers, which hold
 // a bare Connection). Referenced below as `crate::actions::{ACTION_SELECT_SQL,
@@ -821,6 +852,15 @@ impl MemoryStore for SqliteStore {
     async fn update(&self, ctx: &CallerContext, id: &str, patch: UpdatePatch) -> StoreResult<()> {
         self.gate_record_stop()?;
         let conn = self.state.lock().await;
+        // #3957 — the ownership gate, the content write and the lifecycle
+        // transition run in ONE `BEGIN IMMEDIATE`. The mutex above only
+        // serialises THIS process; other OS processes write the same file
+        // (MCP stdio, `curator`, every CLI invocation), and without the
+        // write lock held from check to write one of them could commit an
+        // ownership change between the gate's read and our UPDATE — a
+        // mutation authorised against a stale owner (the sqlite twin of
+        // #3953). Every early `?` below drops the guard, which rolls back.
+        let txn = crate::storage::connection::WriteTxn::begin(&conn).map_err(box_err)?;
         // Parity finding #4 — SAL-level caller-owns gate (postgres parity).
         // Inbox carve-out DISABLED for update, mirroring the HTTP
         // `update_memory` / MCP `memory_update` convention.
@@ -832,6 +872,7 @@ impl MemoryStore for SqliteStore {
             false,
             crate::identity::owner_stamp::funnel::UPDATE,
         )?;
+        owner_gate_test_hook(id);
         // v0.7.0 Provenance Gap 2 (#906) — thread the patch's
         // `source_uri` slot into `update_with_expected_version` so the
         // sqlite SAL adapter honors source_uri rewrites end-to-end.
@@ -879,6 +920,7 @@ impl MemoryStore for SqliteStore {
                     )
             })?;
         }
+        txn.commit().map_err(box_err)?;
         Ok(())
     }
 
@@ -916,6 +958,9 @@ impl MemoryStore for SqliteStore {
     async fn delete(&self, ctx: &CallerContext, id: &str) -> StoreResult<()> {
         self.gate_record_stop()?;
         let conn = self.state.lock().await;
+        // #3957 — gate and delete in ONE `BEGIN IMMEDIATE`, for the reason
+        // spelled out on `update` above (cross-PROCESS interleaving).
+        let txn = crate::storage::connection::WriteTxn::begin(&conn).map_err(box_err)?;
         // #3730 — retention policy by namespace: an inbox message is archived
         // (`archive_reason = "delete"`), every other row is erased. Looked up
         // FIRST, through the scalar probe (never the full-row `get`, whose
@@ -945,11 +990,13 @@ impl MemoryStore for SqliteStore {
             retains,
             crate::identity::owner_stamp::funnel::DELETE,
         )?;
+        owner_gate_test_hook(id);
         let removed = if retains {
             db::delete_archive_first(&conn, id).map_err(box_err)?
         } else {
             db::delete(&conn, id).map_err(box_err)?
         };
+        txn.commit().map_err(box_err)?;
         if removed {
             Ok(())
         } else {
