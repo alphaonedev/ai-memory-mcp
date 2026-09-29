@@ -163,7 +163,7 @@ tr.tot td{border-top:2px solid var(--line-strong);background:var(--raise)}
   <div class="eyebrow">ai-memory + AgenticMem · one engineering &amp; development scheme · v1.0.0 GA · epic #3969 · AlphaOne LLC</div>
   <h1>ai-memory Engineering &amp; Development Scheme</h1>
   <p class="toplinks"><a href="https://www.agenticmem.co/">AgenticMem</a> · <a href="https://alphaonedev.github.io/ai-memory-mcp/">ai-memory on GitHub Pages</a> · <a href="https://github.com/alphaonedev/ai-memory-mcp">Source</a> · <a href="https://test.agenticmem.co/">Live acceptance campaign</a> · <a href="https://checklist.agenticmem.co/">GA burn-down</a></p>
-  <p>The open-source ai-memory project and AgenticMem, its commercial support vehicle, are built by one team under one engineering scheme. This page is that scheme. It covers the full spectrum of how ai-memory is engineered: planning, development, testing, code and security review, documentation and decision-making. The release is built, tested and landed across two nodes. f1 is a Mac mini and f2 is a Linux workstation. Each runs a native enterprise-federation data tier (PostgreSQL 18.6 with Apache AGE and pgvector) for CI and acceptance testing. Agents coordinate over ai-memory's own wake plane, and TypeSafe Jev triages the deputy's inbox. Decisions are made by waves of independent AI agents that assess, attack and vote, and a script, not a model, counts the votes. The goal of all of it is to make the best engineering decisions. Every line below is data moving: hover over or tab to a box to trace its links.</p>
+  <p>The open-source ai-memory project and AgenticMem, its commercial support vehicle, are built by one team under one engineering scheme. This page is that scheme. It covers the full spectrum of how ai-memory is engineered: planning, development, testing, code and security review, documentation and decision-making. The release is built, tested and landed across two nodes. f1 runs macOS and f2 runs Linux. Each runs a native enterprise-federation data tier (PostgreSQL 18.6 with Apache AGE and pgvector) for CI and acceptance testing. Agents coordinate over ai-memory's own wake plane, and TypeSafe Jev triages the deputy's inbox. Decisions are made by waves of independent AI agents that assess, attack and vote, and a script, not a model, counts the votes. The goal of all of it is to make the best engineering decisions. Every line below is data moving: hover over or tab to a box to trace its links.</p>
   <div class="kpis">
     <div class="kpi"><b>2 nodes</b><span>f1 macOS · f2 Linux</span></div>
     <div class="kpi"><b>7 runners</b><span>self-hosted CI: 4 on f2, 3 on f1</span></div>
@@ -245,13 +245,13 @@ tr.tot td{border-top:2px solid var(--line-strong);background:var(--raise)}
   <ul class="notes">
     <li><b>Wake-driven:</b> deliverers block on <code>inbox --wait</code>. Nothing polls on a timer.</li>
     <li><b>Since-loops</b> skip old backlog and deduplicate, so a restart never re-floods a pane.</li>
-    <li><b>Loop-proof bridge:</b> it relays only originals from <code>ai:codex-f1*</code>, after a sync echo once produced 976 junk messages.</li>
+    <li><b>Loop-proof bridge:</b> it relays only originals from the f1 Codex workers, after a sync echo once produced 976 junk messages.</li>
   </ul>
 </section>
 
 <section class="dia" id="jev">
   <div class="dhead"><span class="num">05</span><h2>TypeSafe Jev inbox triage</h2><p>Jev classifies each batch of new messages as action, status or noise in one call. Claude spends tokens only on what needs a decision. Jev only routes messages. It never decides correctness, security or merges, and it never sees secrets.</p></div>
-  <div class="canvas"><svg id="d5" role="img" aria-label="Jev triage pipeline from inbox to pane 22"></svg></div>
+  <div class="canvas"><svg id="d5" role="img" aria-label="Jev triage pipeline from inbox to the deputy"></svg></div>
   <ul class="notes">
     <li><b>Deterministic first:</b> known false alarms are dropped by a rule before any model call.</li>
     <li><b>Fail-safe:</b> if Jev errors or times out, every message is delivered. Nothing is lost.</li>
@@ -490,24 +490,24 @@ function render(id,spec){
 /* 1 · Fleet map */
 render("d1",{w:1200,h:720,
  groups:[
-  {x:20,y:50,w:340,h:630,label:"f1",sub:"Mac mini · Apple M4 · 10 cores · 32 GB · macOS"},
-  {x:390,y:50,w:460,h:630,label:"f2",sub:"Core Ultra 5 225H · 14 cores · 93 GB · Pop!_OS · NVMe + 1.8 TB T9"},
+  {x:20,y:50,w:340,h:630,label:"f1",sub:"macOS · Apple silicon"},
+  {x:390,y:50,w:460,h:630,label:"f2",sub:"Linux · NVMe + external SSD"},
   {x:880,y:50,w:300,h:630,label:"External services",sub:"every leg TLS, mTLS or HTTPS"}],
  nodes:[
-  {id:"codex1",x:40,y:106,w:300,h:62,t:"Codex pool · ai:codex-f1",s:"GPT-6 Astra @ high · 4 workers\nqueue → running → done → out"},
+  {id:"codex1",x:40,y:106,w:300,h:62,t:"Codex pool · f1",s:"GPT-6 Astra @ high · 4 workers\nqueue → running → done → out"},
   {id:"store1",x:40,y:188,w:300,h:62,t:"Wake-plane store",tone:"teal",s:"ai-memory serve · mTLS\nf1 agents post here"},
   {id:"ci1",x:40,y:270,w:300,h:62,t:"CI runners ×3",badge:"macos-fed",s:"self-hosted · legs: sqlite + enterprise-fed\nnice'd below CI priority"},
-  {id:"pg1",x:40,y:352,w:300,h:78,t:"Enterprise-fed tier",badge:":5445",tone:"data",s:"PostgreSQL 18.6 · Apache AGE · pgvector\nHomebrew pg-age-stack · loopback only\nper-job ephemeral DB per CI run"},
+  {id:"pg1",x:40,y:352,w:300,h:78,t:"Enterprise-fed tier",tone:"data",s:"PostgreSQL 18.6 · Apache AGE · pgvector\nHomebrew build · loopback only\nper-job ephemeral DB per CI run"},
   {id:"sq1",x:40,y:450,w:300,h:62,t:"SQLite tier",tone:"data",s:"embedded · per-test file DBs\nmacos-fed,sqlite leg"},
   {id:"disk1",x:40,y:532,w:300,h:62,t:"Disks",s:"internal SSD + external volume\nfree-space floor checked before builds"},
-  {id:"panes",x:410,y:106,w:420,h:80,t:"Claude panes (tmux)",tone:"gold",s:"GOD god-zsg · Fable 5.1 · sole merger\nthe deputy · Opus 5.5 · f2r reviewer · f2h builder\nMuse · pane 35 · graded trial #4089"},
-  {id:"codex2",x:410,y:204,w:420,h:62,t:"Codex pool · ai:codex-f2",s:"GPT-6 Astra @ high · 6 workers · MCP-free CODEX_HOME\n3x7 / 3x3 audits, retests, builders"},
+  {id:"panes",x:410,y:106,w:420,h:80,t:"Claude panes (tmux)",tone:"gold",s:"GOD · Fable 5.1 · sole merger\nthe deputy · Opus 5.5 · f2r reviewer · f2h builder\nMuse · graded trial #4089"},
+  {id:"codex2",x:410,y:204,w:420,h:62,t:"Codex pool · f2",s:"GPT-6 Astra @ high · 6 workers · MCP-free CODEX_HOME\n3x7 / 3x3 audits, retests, builders"},
   {id:"store2",x:410,y:284,w:420,h:62,t:"Team store",tone:"teal",s:"ai-memory serve · mTLS + API key\n5 per-pane deliverer loops"},
-  {id:"cargo",x:410,y:364,w:200,h:62,t:"Cargo semaphore",s:"shared cargo semaphore · 1 slot\nearlyoom · disk floors"},
-  {id:"jevd",x:630,y:364,w:200,h:62,t:"Jev triage",tone:"jev",s:"Jev triage deliverer\n→ pane 22"},
+  {id:"cargo",x:410,y:364,w:200,h:62,t:"Cargo semaphore",s:"shared cargo semaphore\nearlyoom · disk floors"},
+  {id:"jevd",x:630,y:364,w:200,h:62,t:"Jev triage",tone:"jev",s:"Jev triage deliverer\n→ deputy"},
   {id:"ci2",x:410,y:444,w:420,h:62,t:"CI runners ×4",badge:"linux-fed",s:"self-hosted · leg: enterprise-fed\n160-min cap · 8,100 s named watchdog"},
-  {id:"pg2",x:410,y:524,w:420,h:78,t:"Enterprise-fed tier · cluster aimemfed",badge:":5445",tone:"data",s:"PostgreSQL 18.6 · Apache AGE 1.8.0 · pgvector 0.8.6\nalways up · no CI services: block\nper-job ephemeral DB per CI run"},
-  {id:"lab",x:410,y:614,w:420,h:58,t:"Test daemons + harness",s:":9077 pg-backed capture · wakelab :19178/:19179"},
+  {id:"pg2",x:410,y:524,w:420,h:78,t:"Enterprise-fed tier",tone:"data",s:"PostgreSQL 18.6 · Apache AGE 1.8.0 · pgvector 0.8.6\nalways up · no CI services: block\nper-job ephemeral DB per CI run"},
+  {id:"lab",x:410,y:614,w:420,h:58,t:"Test daemons + harness",s:"pg-backed capture daemons"},
   {id:"gh",x:895,y:106,w:270,h:78,t:"GitHub · ai-memory-mcp",tone:"gold",s:"release/v1.0.0 · carrier rehearsal/audit-wip\n43 required checks · branch protection\nsigned commits only"},
   {id:"hosted",x:895,y:202,w:270,h:62,t:"GitHub-hosted runner",s:"ubuntu-latest · sqlite leg\n95-min job cap"},
   {id:"jev",x:895,y:282,w:270,h:78,t:"TypeSafe Jev",tone:"jev",badge:"API",s:"api.typesafe.ai/v1/systemone\njev-latest · batched questions\n~200 ms per call"},
@@ -543,9 +543,9 @@ render("d2",{w:1200,h:500,
   {id:"l3",x:340,y:282,w:310,h:62,t:"macos-fed · sqlite",badge:"f1",s:"self-hosted · 3 runner slots\n80-min cap · 40-min per-invocation cap"},
   {id:"l4",x:340,y:392,w:310,h:62,t:"macos-fed · enterprise-fed",badge:"f1",s:"self-hosted · 160-min cap\n8,100 s watchdog · compile outside it"},
   {id:"t1",x:740,y:40,w:430,h:62,t:"SQLite · embedded",tone:"data",s:"ephemeral file DB per test\ndiscarded with the hosted VM"},
-  {id:"t2",x:740,y:140,w:430,h:106,t:"Native enterprise-fed tier · f2",tone:"data",badge:":5445",s:"PostgreSQL 18.6 · cluster aimemfed\nApache AGE 1.8.0 (graph) · pgvector 0.8.6 (vectors)\nper-job DB ai_memory_test_ci_<run>_…_enterprise_fed\nalways up · created per job · dropped at cleanup"},
+  {id:"t2",x:740,y:140,w:430,h:106,t:"Native enterprise-fed tier · f2",tone:"data",s:"PostgreSQL 18.6 · federation cluster\nApache AGE 1.8.0 (graph) · pgvector 0.8.6 (vectors)\nper-job DB ai_memory_test_ci_<run>_…_enterprise_fed\nalways up · created per job · dropped at cleanup"},
   {id:"t3",x:740,y:282,w:430,h:62,t:"SQLite · embedded (f1)",tone:"data",s:"ephemeral file DB per test\nAPFS on the runner host"},
-  {id:"t4",x:740,y:374,w:430,h:92,t:"Native enterprise-fed tier · f1",tone:"data",badge:":5445",s:"PostgreSQL 18.6 · AGE · pgvector (Homebrew)\npg-age-stack data dir · loopback only\nsame per-job ephemeral DB pattern"}],
+  {id:"t4",x:740,y:374,w:430,h:92,t:"Native enterprise-fed tier · f1",tone:"data",s:"PostgreSQL 18.6 · AGE · pgvector (Homebrew)\nloopback only\nsame per-job ephemeral DB pattern"}],
  edges:[
   {a:"gh",b:"l1",c:"ci",n:[2,1],as:"r:0.2",bs:"l"},
   {a:"gh",b:"l2",c:"ci",n:[2,1],as:"r:0.4",bs:"l"},
@@ -566,8 +566,8 @@ render("d3",{w:1200,h:540,
   {id:"d2",x:70,y:280,w:290,h:78,t:"ai-memory daemon",tone:"gold",badge:"f2",s:"serve · mTLS listener\nEd25519-signed stores\nnon-blocking boot (#3329)"},
   {id:"d1",x:840,y:280,w:290,h:78,t:"ai-memory daemon",tone:"gold",badge:"f1",s:"serve · mTLS listener\nEd25519-signed stores\nnon-blocking boot (#3329)"},
   {id:"fed",x:440,y:262,w:320,h:106,t:"Federation contract",tone:"teal",s:"L1 · mTLS fingerprint allowlist (transport)\nL2 · X-API-Key (application)\nL3 · peer attestation · PeerScope (identity)\nquorum writes · refuse boot on bad allowlist"},
-  {id:"p2",x:70,y:430,w:290,h:78,t:"PostgreSQL 18.6",tone:"data",badge:"f2",s:"Apache AGE 1.8.0 · pgvector 0.8.6\ncluster aimemfed :5445\nTLS verify-full"},
-  {id:"p1",x:840,y:430,w:290,h:78,t:"PostgreSQL 18.6",tone:"data",badge:"f1",s:"Apache AGE · pgvector\npg-age-stack :5445\nTLS verify-full"},
+  {id:"p2",x:70,y:430,w:290,h:78,t:"PostgreSQL 18.6",tone:"data",badge:"f2",s:"Apache AGE 1.8.0 · pgvector 0.8.6\nfederation cluster\nTLS verify-full"},
+  {id:"p1",x:840,y:430,w:290,h:78,t:"PostgreSQL 18.6",tone:"data",badge:"f1",s:"Apache AGE · pgvector\nfederation cluster\nTLS verify-full"},
   {id:"do",x:440,y:430,w:320,h:78,t:"DigitalOcean · Phase B",tone:"pend",s:"same tier at cloud scale · 4 droplets\noperator-authorized · $5 cap · TTL 4 h\nruns after Promotion 4 · not yet run"}],
  edges:[
   {a:"or",b:"a2",c:"api",n:[2,2],as:"l",bs:"t"},
@@ -584,22 +584,22 @@ render("d3",{w:1200,h:540,
 /* 4 · Agent comms */
 render("d4",{w:1200,h:520,
  nodes:[
-  {id:"s_god",x:30,y:30,w:250,h:54,t:"GOD · god-zsg",tone:"gold",s:"Fable 5.1 · ai:god-zsg / ai:fable"},
+  {id:"s_god",x:30,y:30,w:250,h:54,t:"GOD",tone:"gold",s:"Fable 5.1 · sole merger"},
   {id:"s_f2r",x:30,y:96,w:250,h:54,t:"reviewer-f2r",s:"Opus 5 · landing reviews"},
   {id:"s_f2h",x:30,y:162,w:250,h:54,t:"rehearsal-f2h",s:"Opus 5 · builder"},
-  {id:"s_muse",x:30,y:228,w:250,h:54,t:"Muse · pane 35",s:"ai:muse-f2 · graded trial"},
-  {id:"s_cx2",x:30,y:294,w:250,h:54,t:"Codex pool · f2",s:"ai:codex-f2 · 6 workers"},
-  {id:"s_22",x:30,y:360,w:250,h:54,t:"the deputy",tone:"jev",s:"ai:deputy-f2a · Opus 5.5"},
-  {id:"s_cx1",x:30,y:440,w:250,h:54,t:"Codex pool · f1",badge:"f1",s:"ai:codex-f1 · 4 workers"},
+  {id:"s_muse",x:30,y:228,w:250,h:54,t:"Muse",s:"graded trial"},
+  {id:"s_cx2",x:30,y:294,w:250,h:54,t:"Codex pool · f2",s:"6 workers"},
+  {id:"s_22",x:30,y:360,w:250,h:54,t:"the deputy",tone:"jev",s:"Opus 5.5 · capacity pool"},
+  {id:"s_cx1",x:30,y:440,w:250,h:54,t:"Codex pool · f1",badge:"f1",s:"4 workers"},
   {id:"send",x:340,y:150,w:200,h:62,t:"send CLI",s:"POST · mTLS + API key\n201 = stored"},
   {id:"st1",x:340,y:436,w:200,h:62,t:"f1 store",tone:"teal",s:"mTLS"},
   {id:"bridge",x:600,y:436,w:240,h:62,t:"f1 → f2 bridge",s:"relays f1 originals only\nseen-ids · 1,228 relayed"},
   {id:"st2",x:600,y:140,w:240,h:84,t:"Team store",tone:"teal",s:"mTLS\ninbox per agent id\ninbox --wait · wake-driven"},
-  {id:"dv_god",x:910,y:24,w:270,h:62,t:"since-loop → god-zsg",s:"ai:god-zsg + ai:fable\nbusy check · skips old backlog"},
+  {id:"dv_god",x:910,y:24,w:270,h:62,t:"since-loop → GOD",s:"GOD\nbusy check · skips old backlog"},
   {id:"dv_f2r",x:910,y:100,w:270,h:54,t:"v2 loop → reviewer-f2r",s:"idle-checked delivery"},
   {id:"dv_f2h",x:910,y:168,w:270,h:54,t:"v2 loop → rehearsal-f2h",s:"idle-checked delivery"},
-  {id:"dv_muse",x:910,y:236,w:270,h:62,t:"since-v2 → pane 35",s:"Muse · false-alarm filter\nnew messages only"},
-  {id:"dv_jev",x:910,y:312,w:270,h:78,t:"Jev deliverer → pane 22",tone:"jev",s:"the deputy · action delivered now\nstatus → digest\nnoise dropped and logged"}],
+  {id:"dv_muse",x:910,y:236,w:270,h:62,t:"since-v2 → Muse",s:"Muse · false-alarm filter\nnew messages only"},
+  {id:"dv_jev",x:910,y:312,w:270,h:78,t:"Jev deliverer → deputy",tone:"jev",s:"the deputy · action delivered now\nstatus → digest\nnoise dropped and logged"}],
  edges:[
   {a:"s_god",b:"send",c:"teal",n:[1,1],as:"r",bs:"l:0.2",k:40},
   {a:"s_f2r",b:"send",c:"teal",n:[1,1],as:"r",bs:"l:0.35",k:40},
@@ -621,7 +621,7 @@ render("d4",{w:1200,h:520,
 /* 5 · Jev triage */
 render("d5",{w:1250,h:560,
  nodes:[
-  {id:"inbox",x:20,y:230,w:150,h:62,t:"Inbox",s:"ai:deputy-f2a\ninbox --wait 60"},
+  {id:"inbox",x:20,y:230,w:150,h:62,t:"Inbox",s:"deputy inbox\ninbox --wait 60"},
   {id:"dedup",x:195,y:230,w:150,h:62,t:"New only",s:"after start time\nseen-ids dedup"},
   {id:"filt",x:370,y:230,w:165,h:62,t:"False-alarm filter",s:"deterministic rule\nno model call"},
   {id:"batch",x:560,y:230,w:165,h:62,t:"One batched call",tone:"jev",s:"m0 … mn · title\n+ 600 chars each"},
@@ -631,7 +631,7 @@ render("d5",{w:1250,h:560,
   {id:"status",x:910,y:230,w:160,h:62,t:"STATUS",tone:"teal",s:"digest every 30 min\nor at 8 items"},
   {id:"noise",x:910,y:350,w:160,h:62,t:"NOISE",tone:"pend",s:"only if P ≥ 0.85\ndropped, still logged"},
   {id:"log",x:910,y:450,w:160,h:54,t:"Audit log",s:"deliverer log + ledger"},
-  {id:"pane",x:1100,y:196,w:130,h:112,t:"Pane 22",tone:"gold",s:"the deputy\nClaude Opus 5.5\nidle check\nverified send"}],
+  {id:"pane",x:1100,y:196,w:130,h:112,t:"Deputy pane",tone:"gold",s:"the deputy\nClaude Opus 5.5\nidle check\nverified send"}],
  edges:[
   {a:"inbox",b:"dedup",c:"teal",n:[2,0]},
   {a:"dedup",b:"filt",c:"teal",n:[2,0]},
@@ -657,7 +657,7 @@ render("d6",{w:1200,h:470,
   {id:"n3",x:630,y:40,w:250,h:78,t:"Signed branch",s:"SSH-signed commits\nBase: + Co-Authored-By trailers\nfull-range count gate"},
   {id:"n4",x:920,y:40,w:250,h:92,t:"Review gate",tone:"teal",s:"f2r landing review\nthe deputy code + security review (Muse)\nCodex red → green retest\n3x7 / 3x3 votes where contested"},
   {id:"gr",x:330,y:176,w:540,h:106,t:"Guardrails",tone:"pend",s:"Only GOD merges · the deputy approves Muse work before GOD merges it\nAdmin lift only with operator approval: back up, lift, restore, diff\nJev never decides correctness, security or merges\nEvery found-in-testing issue is fixed, retested and documented 1:1"},
-  {id:"n5",x:920,y:330,w:250,h:78,t:"GOD merges",tone:"gold",s:"god-zsg · Fable 5.1 · sole merger\ninto rehearsal/audit-wip\n(the carrier)"},
+  {id:"n5",x:920,y:330,w:250,h:78,t:"GOD merges",tone:"gold",s:"Fable 5.1 · sole merger\ninto rehearsal/audit-wip\n(the carrier)"},
   {id:"n6",x:630,y:330,w:250,h:78,t:"Promotion PR",tone:"gold",s:"43 required checks\nCI 2×2 on the native tiers\nPromotion 4 (#3931) merged"},
   {id:"n7",x:330,y:330,w:250,h:78,t:"release/v1.0.0",tone:"gold",s:"4fff967ce\nGA tag is operator-gated"},
   {id:"n8",x:30,y:330,w:250,h:78,t:"Redeploy + retest",tone:"data",s:"swarm + gates on f1/f2 tiers\ndashboards updated\nnew defects → new issues"}],
@@ -767,8 +767,8 @@ render("d10",{w:1400,h:710,
   {id:"cls",x:205,y:262,w:170,h:92,t:"Classify changes",s:"docs-only short-circuit\nconcurrency groups\ncoalesce duplicates"},
   {id:"gha",x:400,y:232,w:180,h:132,t:"GitHub Actions",tone:"gold",s:"19 workflows\n62 jobs on Promotion 4\nper-leg runner\nplacement from\nthe matrix"},
   {id:"sq",x:400,y:92,w:180,h:76,t:"SQLite",tone:"data",s:"ephemeral per test\non hosted VMs"},
-  {id:"pg2",x:400,y:420,w:180,h:86,t:"PG 18.6 · f2",tone:"data",s:"aimemfed :5445\nAGE 1.8.0 · pgvector 0.8.6\nper-job database"},
-  {id:"pg1",x:400,y:596,w:180,h:86,t:"PG 18.6 · f1",tone:"data",s:"pg-age-stack :5445\nAGE · pgvector\nper-job database"},
+  {id:"pg2",x:400,y:420,w:180,h:86,t:"PG 18.6 · f2",tone:"data",s:"federation cluster\nAGE 1.8.0 · pgvector 0.8.6\nper-job database"},
+  {id:"pg1",x:400,y:596,w:180,h:86,t:"PG 18.6 · f1",tone:"data",s:"federation cluster\nAGE · pgvector\nper-job database"},
   {id:"g1",x:625,y:92,w:340,h:50,t:"33 static gates · c8-precheck",s:"docs truth · supply chain · architecture · 1.2 min"},
   {id:"g2",x:625,y:152,w:340,h:50,t:"Lint + feature gates",s:"fmt · clippy pedantic · pg · SAL · vectorlite · MSRV"},
   {id:"g3",x:625,y:212,w:340,h:50,t:"Cross-compile · Docker · CodeQL",s:"aarch64 iOS · aarch64 Android · image · 4 CodeQL jobs"},
