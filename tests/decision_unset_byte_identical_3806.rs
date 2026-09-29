@@ -186,6 +186,16 @@ const DECIDER_TOKENS: &[&str] = &[
     // `decision_seams` without naming anything this scan looks for.
     "decision_seams",
     "attach_decider",
+    // #4195 (SECPROG L1) — the provider CONSTRUCTORS. Each takes an
+    // arbitrary OutboundCheck, so a production call outside the chokepoint
+    // could build a decider the egress gate never approved. Grouped imports
+    // (`decision_clients::{construct, ..}`) are caught by the `::{` token.
+    "decision_clients::construct",
+    "decision_clients::{",
+    "construct_pinned",
+    "OpenAiCompatibleDecider",
+    "SystemOneDecider",
+    "GenerativeFallbackDecider",
 ];
 
 /// The files ALLOWED to name the decider surface. A change in this list
