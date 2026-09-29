@@ -8579,7 +8579,10 @@ pub fn apply_token_budget(
     )
 }
 
-/// Recall — fuzzy OR search + touch + auto-promote + TTL extension.
+/// Recall — pure, keyword-only fuzzy OR search; no memory-row mutations.
+/// Entry layers append the access signal to `recall_observations`;
+/// [`fold_recall_accesses`] applies access counts and TTL floor-extension.
+/// Neither recall nor the fold promotes tiers (Boids item 1).
 /// Task 1.11: after ranking, applies optional `budget_tokens` cap.
 /// Phase P6: returns the full `BudgetOutcome` (tokens_used,
 /// tokens_remaining, memories_dropped, budget_overflow) instead of just
