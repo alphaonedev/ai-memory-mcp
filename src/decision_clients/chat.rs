@@ -859,6 +859,11 @@ mod tests {
             json!({"choices": []}),
             json!({"choices": [{"message": {}}]}),
             json!({"choices": [{"message": {"content": null}}]}),
+            // #4176 — an EMPTY (or blank) refusal is no refusal: with no
+            // content either, there is no model answer at all, so this is
+            // the outage arm, never a parse of empty content or a Proceed.
+            json!({"choices": [{"message": {"content": null, "refusal": ""}}]}),
+            json!({"choices": [{"message": {"content": null, "refusal": "   "}}]}),
             json!({"error": {"message": "upstream overloaded"}}),
         ] {
             assert_eq!(
@@ -884,6 +889,14 @@ mod tests {
                 "{body}"
             );
         }
+        // #4176 — an empty refusal beside a valid document does not decline:
+        // the answer is read (the control for the two outage cells above).
+        let body = json!({"choices": [{"message": {
+            "content": format!("{{\"{FIELD_CHOICE}\":\"Fact\"}}"), "refusal": ""}}]});
+        assert!(
+            read_structured_answer(&body, FIELD_CHOICE).is_ok(),
+            "an empty refusal must not block a valid answer: {body}"
+        );
     }
 
     #[test]
