@@ -7,23 +7,46 @@
 //! filters. When a matching event fires (e.g. `memory_store`), a
 //! fire-and-forget thread POSTs an HMAC-SHA256-signed JSON payload.
 //!
-//! SSRF hardening:
-//! - `http://` only to `127.0.0.0/8` or `localhost` hosts;
-//!   everywhere else requires `https://`
-//! - RFC1918 / RFC4193 / link-local hosts are rejected unless
-//!   `allow_private_networks = true` in the daemon config
+//! SSRF hardening (#4083 — this is the policy the code enforces; there is
+//! no private-network override):
+//! - Only `https://` targets are accepted. Plaintext `http://` is refused
+//!   to every host, loopback included (#3705).
+//! - Loopback targets (`localhost`, `127.0.0.0/8`, `::1`, and hostnames
+//!   that RESOLVE to loopback) are refused unless the operator opts in with
+//!   `[subscriptions] allow_loopback_webhooks = true` (testing / dev only).
+//! - RFC1918 / RFC4193 / CGNAT / link-local and other special-purpose
+//!   targets are refused UNCONDITIONALLY — as an IP literal at
+//!   registration and as a resolved address at dispatch (the dispatch-time
+//!   guard resolves once, checks every address, and pins the connection to
+//!   exactly those addresses). To reach an internal receiver, front it with
+//!   a public-address reverse proxy. The legacy
+//!   `AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL=1` hatch only changes what happens
+//!   when resolution FAILS (an unpinned connect, logged as UNSAFE); it never
+//!   admits an address the guard resolved as private.
+//! - Redirects are never followed.
 //!
-//! Signature:
-//! - Header `X-Ai-Memory-Signature: sha256=<hex>` over the raw
-//!   JSON body
-//! - The secret stored in the DB is a SHA-256 of the plaintext
-//!   shared secret; the plaintext is returned **once** at
-//!   subscription time and never leaves the DB after.
+//! Signature (#4083 — the exact signed bytes; the SDK verifiers and
+//! `sdk/fixtures/webhook_hmac_vector.json` pin the same recipe):
+//! - Header `X-Ai-Memory-Timestamp: <unix-seconds>` and header
+//!   `X-Ai-Memory-Signature: sha256=<lowercase hex>`.
+//! - `<hex> = HMAC-SHA256(key, "<timestamp>.<body>")`: the timestamp
+//!   header value, a literal `.`, then the raw request body bytes — NOT
+//!   the body alone.
+//! - `key` = the 32-byte SHA-256 digest of the plaintext shared secret
+//!   (the per-subscription secret, or the server-wide
+//!   `[hooks.subscription] hmac_secret` when the subscription has none).
+//! - Receivers should compare in constant time and reject a timestamp
+//!   outside their replay window (5 minutes is the recommended bound).
+//! - Only the SHA-256 of the plaintext secret is persisted; the plaintext
+//!   is never stored and never returned by any read surface.
 
 use crate::models::field_names;
 
 // #3659 — delivery-audit bookkeeping evidence (counters, /metrics, /health).
 pub mod audit_status;
+
+#[cfg(test)]
+mod tests_4083;
 use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2248,10 +2271,11 @@ fn validate_url_with(url: &str, allow_loopback: bool) -> Result<()> {
         ));
     }
     // Reject private-range IPs regardless of scheme (RFC1918 / RFC4193 /
-    // link-local). Hostnames that resolve to private ranges are not
-    // caught here — the dispatch thread will still be able to reach
-    // them; operators who want to reach internal services should set
-    // up reverse proxies or allow explicitly in config.
+    // link-local). Hostnames that RESOLVE to private ranges are not
+    // caught here (no DNS at registration); the dispatch-time guard
+    // (`validate_url_dns_with`) refuses them before any connection and
+    // pins the connect to the addresses it cleared. There is no
+    // private-network override (#4083).
     if let Some(ip) = parsed_ip
         && is_private(ip)
         && !is_loopback_normalized(ip)

@@ -335,3 +335,84 @@ async fn dispatch_event_postgres_zero_subs_is_noop() {
     .await;
     // No assertion needed — the test passes iff the call returned.
 }
+
+/// #4083 — pins the documented behaviour of a Postgres NAMESPACE-ONLY
+/// subscription (the `{agent_id, namespace}` S33 shape with no `url`). The
+/// handler stores a synthetic `https://localhost/_ns/<agent>/<ns>` row with
+/// no marker, and the pre-#4083 comment claimed it was "never dispatched".
+/// It IS dispatched: the per-delivery `subscription_events` audit row (the
+/// record `memory_subscription_replay` reads) is written, and the delivery
+/// itself does not succeed (loopback SSRF refusal, unsigned refusal, or an
+/// unreachable loopback listener) and lands in the subscription DLQ.
+#[tokio::test(flavor = "multi_thread")]
+async fn postgres_namespace_only_subscription_is_dispatched_4083() {
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt as _;
+
+    let (state, audit_path) = make_test_state();
+    let owner = format!("ai:ns-only-{}", uuid::Uuid::new_v4().simple());
+    let ns = format!("ns-only-4083/{}", uuid::Uuid::new_v4().simple());
+    let app = axum::Router::new()
+        .route(
+            "/api/v1/subscriptions",
+            axum::routing::post(ai_memory::handlers::subscribe),
+        )
+        .with_state(state.clone());
+    let resp = app
+        .oneshot(
+            Request::post("/api/v1/subscriptions")
+                .header("content-type", "application/json")
+                .header("x-agent-id", owner.as_str())
+                .body(Body::from(
+                    serde_json::json!({
+                        "agent_id": owner,
+                        "namespace": ns,
+                        "secret": "ns-only-4083-secret",
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("subscribe");
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .expect("body");
+    let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+    assert_eq!(status, axum::http::StatusCode::CREATED, "{body}");
+    let sub_id = body["id"].as_str().expect("id").to_string();
+    assert_eq!(
+        body["url"].as_str(),
+        Some(format!("https://localhost/_ns/{owner}/{ns}").as_str()),
+        "namespace-only registration stores the synthetic loopback URL"
+    );
+
+    dispatch_event_postgres(&state, "memory_store", "mem-4083", &ns, Some(&owner), None).await;
+    wait_dispatch_idle().await;
+
+    let conn = rusqlite::Connection::open(&audit_path).expect("open audit db");
+    let events: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM subscription_events WHERE subscription_id = ?1",
+            [&sub_id],
+            |r| r.get(0),
+        )
+        .expect("count subscription_events");
+    assert_eq!(
+        events, 1,
+        "#4083: the namespace-only row IS dispatched — its replay audit row is written"
+    );
+    let dlq: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM subscription_dlq WHERE subscription_id = ?1",
+            [&sub_id],
+            |r| r.get(0),
+        )
+        .expect("count subscription_dlq");
+    assert_eq!(
+        dlq, 1,
+        "#4083: delivery to the synthetic loopback URL does not succeed and is DLQ'd"
+    );
+}

@@ -432,12 +432,19 @@ pub async fn subscribe(
             )
                 .into_response();
         };
-        // Synthetic loopback URL — never dispatched (the postgres
-        // persistence path doesn't run the webhook loop), serves only
-        // to round-trip the (agent_id, namespace) pair through the
-        // wire shape. We mark it so the SSRF guard can skip the
-        // loopback rejection — H11's allow_loopback_webhooks knob
-        // gates real callers, not internally-synthesized stubs.
+        // Synthetic loopback URL — round-trips the (agent_id, namespace)
+        // pair through the wire shape. #4083: it is NOT "never dispatched".
+        // The row is an ordinary subscription row on BOTH backends, so
+        // every matching event is dispatched to it like any other: the
+        // per-delivery `subscription_events` audit row is written first
+        // (that record is what `memory_subscription_replay` reads, so a
+        // namespace-only subscriber can replay history), then delivery to
+        // the loopback URL is attempted — refused by the dispatch-time
+        // SSRF guard and recorded in the subscription DLQ by default, or
+        // an actual POST to `https://localhost/_ns/...` when the operator
+        // set `[subscriptions] allow_loopback_webhooks = true`. On the
+        // postgres branch registration skips the H11 loopback check for
+        // this synthesized stub only; caller-supplied URLs are checked.
         // The assignment is unused under default features (the reader
         // is `#[cfg(feature = "sal")]`-gated); allow the unused-assignment
         // warning specifically.
@@ -469,9 +476,10 @@ pub async fn subscribe(
     // peer originated the subscription.
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
-        // Skip SSRF validation for synthetic loopback stubs — they are
-        // never dispatched on the postgres path. Real caller-supplied
-        // URLs still go through the H11 SSRF guard.
+        // Skip REGISTRATION-time SSRF validation for the synthetic
+        // loopback stub only (see the #4083 note above: it IS dispatched,
+        // and the dispatch-time guard still refuses it unless loopback is
+        // opted in). Real caller-supplied URLs go through the H11 guard.
         if !url_was_synthesized && let Err(e) = crate::subscriptions::validate_url(&url) {
             return (
                 StatusCode::BAD_REQUEST,
