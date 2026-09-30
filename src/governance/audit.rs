@@ -1311,9 +1311,13 @@ pub enum OutageRecord {
     Skipped(String),
 }
 
-fn outage_payload_hash(err: &ForensicTailUnreadable) -> Vec<u8> {
+/// The UTC day is part of the key (f2r review of 36253cab6): the dedupe must
+/// not outlive the outage it suppresses. A repaired tail that fails again the
+/// same way on a later day is a NEW outage and is attested; within one day a
+/// stuck tail still costs one row, not one per invocation.
+fn outage_payload_hash(err: &ForensicTailUnreadable, day: &str) -> Vec<u8> {
     let preimage = format!(
-        "forensic-sink-unavailable|path={}|cause={}",
+        "forensic-sink-unavailable|day={day}|path={}|cause={}",
         err.path.display(),
         err.cause
     );
@@ -1322,7 +1326,8 @@ fn outage_payload_hash(err: &ForensicTailUnreadable) -> Vec<u8> {
 
 /// #4199 — append the SIGNED `signed_events` row that attests the forensic
 /// sink is unavailable, and why, unless the newest outage row already
-/// records the same `(path, cause)`. Returns whether a row was appended.
+/// records the same `(path, cause)` on the same UTC day. Returns whether a
+/// row was appended.
 ///
 /// # Errors
 /// Propagates the read or `append_signed_event` error; callers treat this
@@ -1331,11 +1336,21 @@ pub fn emit_forensic_sink_unavailable(
     conn: &rusqlite::Connection,
     err: &ForensicTailUnreadable,
 ) -> Result<bool> {
+    emit_forensic_sink_unavailable_on(conn, err, &Utc::now().format("%Y-%m-%d").to_string())
+}
+
+/// [`emit_forensic_sink_unavailable`] for an explicit UTC `day`
+/// (`YYYY-MM-DD`), the dedupe-window key.
+fn emit_forensic_sink_unavailable_on(
+    conn: &rusqlite::Connection,
+    err: &ForensicTailUnreadable,
+    day: &str,
+) -> Result<bool> {
     use crate::signed_events::{
         SignedEvent, append_signed_event, event_types::FORENSIC_SINK_UNAVAILABLE,
     };
     use rusqlite::OptionalExtension;
-    let hash = outage_payload_hash(err);
+    let hash = outage_payload_hash(err, day);
     let newest: Option<Vec<u8>> = conn
         .query_row(
             "SELECT payload_hash FROM signed_events WHERE event_type = ?1 \
@@ -5561,6 +5576,20 @@ mod tests {
             OutageRecord::Recorded
         );
         let conn = crate::storage::open_unmigrated(&db).unwrap();
+        assert_eq!(outage_rows(&conn), 2);
+    }
+
+    /// f2r review of 36253cab6 — the dedupe window is one UTC day: a recurrence
+    /// of the same `(path, cause)` on a later day is attested again.
+    #[test]
+    fn outage_dedupe_does_not_outlive_its_day_4199() {
+        let tmp = TempDir::new().unwrap();
+        let db = tmp.path().join("m.db");
+        let conn = crate::storage::open(&db).unwrap();
+        let a = outage("/x/forensic-2026-07-31.jsonl", "no parseable row");
+        assert!(emit_forensic_sink_unavailable_on(&conn, &a, "2026-07-31").unwrap());
+        assert!(!emit_forensic_sink_unavailable_on(&conn, &a, "2026-07-31").unwrap());
+        assert!(emit_forensic_sink_unavailable_on(&conn, &a, "2026-08-01").unwrap());
         assert_eq!(outage_rows(&conn), 2);
     }
 
