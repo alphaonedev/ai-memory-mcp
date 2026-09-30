@@ -360,7 +360,11 @@ async fn post_once_unobserved(
 ///   a 2xx carrying that count is a structural non-apply for this peer.
 /// - `skipped > 0` — the receiver refused items (validation failure,
 ///   per-write attestation refusal, #1934 namespace-scope refusal, or a
-///   substrate error). Idempotent replays land `noop`, never `skipped`.
+///   substrate error). Idempotent replays land `noop`, never `skipped` —
+///   except an action TRANSITION, whose durably recorded identity makes a
+///   re-delivery a refused replay (#1805, `skipped`), and whose CAS miss is
+///   `skipped` too (#4024: a miss does not prove the op was applied, so it
+///   must stay un-acked and be retried, never counted as a clean `noop`).
 ///
 /// Everything else stays an ack: absent counters (legacy peers / plain
 /// 2xx bodies) keep the backward-compatible posture, and

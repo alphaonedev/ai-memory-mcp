@@ -130,7 +130,8 @@ async fn pg_schema_v100_carries_the_partial_title_slot_index_3690() {
         .fetch_one(store.pool())
         .await
         .expect("schema_version");
-    assert_eq!(version, 100);
+    // Tip moved to v101 (#4024, additive table); the v100 index is unchanged.
+    assert_eq!(version, 101);
     let indexdef: String = sqlx::query_scalar(
         "SELECT indexdef FROM pg_indexes WHERE indexname = 'memories_title_ns_uidx'",
     )
