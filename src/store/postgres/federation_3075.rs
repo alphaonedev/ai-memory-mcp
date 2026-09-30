@@ -120,23 +120,12 @@ impl PostgresStore {
         ctx: &CallerContext,
         id: &str,
     ) -> StoreResult<bool> {
-        let tombstoned: bool = sqlx::query_scalar(SQL_FORGET_TOMBSTONE_EXISTS)
-            .bind(id)
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|e| to_store_err("apply_remote_restore tombstone check", e))?;
-        if tombstoned {
-            tracing::info!(
-                target: crate::storage::FORGET_TOMBSTONE_TRACE_TARGET,
-                memory_id = %id,
-                "{}",
-                crate::storage::FORGET_TOMBSTONE_DROP_MSG
-            );
-            return Ok(false);
-        }
+        // #4029 — the probe runs INSIDE the restore transaction, after the
+        // admission advisory locks (`archive_restore_gated(.., true)`): a
+        // separate pool probe raced a forget committing in between.
         let mut op_ctx = ctx.clone();
         op_ctx.bypass_visibility = true;
-        self.archive_restore(&op_ctx, id).await
+        self.archive_restore_gated(&op_ctx, id, true).await
     }
 }
 

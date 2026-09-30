@@ -3461,19 +3461,11 @@ async fn sync_push_write(
                 }
             }
         }
-        match db::memory_is_tombstoned(&lock.0, res_id) {
-            Ok(true) => {
-                noop += 1;
-                continue;
-            }
-            Ok(false) => {}
-            Err(e) => {
-                tracing::warn!("sync_push: tombstone check failed for {res_id}: {e}");
-                skipped += 1;
-                continue;
-            }
-        }
-        match db::restore_archived(&lock.0, res_id) {
+        // #4029 — the G30 forget-tombstone gate runs INSIDE the restore's
+        // write transaction (`restore_archived_unless_tombstoned`): a separate
+        // probe raced a forget committing on another connection. A tombstoned
+        // id is the lane's no-op (`Ok(false)`).
+        match db::restore_archived_unless_tombstoned(&lock.0, res_id) {
             Ok(true) => restored += 1,
             Ok(false) => noop += 1,
             Err(e) => {
