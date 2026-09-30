@@ -921,6 +921,42 @@ pub mod signed {
         rule_id: &str,
         reason: &str,
     ) -> anyhow::Result<String> {
+        let pending_id = uuid::Uuid::new_v4().to_string();
+        route_escalation_to_approval_gate_with_id(
+            conn,
+            &pending_id,
+            action,
+            namespace,
+            memory_id,
+            requested_by,
+            payload,
+            rule_id,
+            reason,
+        )?;
+        Ok(pending_id)
+    }
+
+    /// #4116 — [`route_escalation_to_approval_gate`] under a caller-minted
+    /// `pending_id`: the governance pre-write hook reports the id in its
+    /// refusal and DEFERS the queue write to the end of the caller's write
+    /// transaction (see `storage::queue_deferred_escalation`). The stored
+    /// payload is byte-identical to the immediate route.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the storage error from queueing the pending action.
+    #[allow(clippy::too_many_arguments)]
+    pub fn route_escalation_to_approval_gate_with_id(
+        conn: &rusqlite::Connection,
+        pending_id: &str,
+        action: crate::models::GovernedAction,
+        namespace: &str,
+        memory_id: Option<&str>,
+        requested_by: &str,
+        payload: &serde_json::Value,
+        rule_id: &str,
+        reason: &str,
+    ) -> anyhow::Result<()> {
         // Fold the escalation provenance + the signed-approval requirement into
         // the pending payload. A non-object payload is wrapped so the metadata
         // keys always have an object to live on.
@@ -943,8 +979,9 @@ pub mod signed {
                 serde_json::Value::String(reason.to_string()),
             );
         }
-        crate::storage::queue_pending_action(
+        crate::storage::queue_pending_action_with_id(
             conn,
+            pending_id,
             action,
             namespace,
             memory_id,

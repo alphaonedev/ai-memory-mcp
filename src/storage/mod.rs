@@ -319,6 +319,68 @@ pub(crate) fn consult_governance_pre_write(mem: &Memory) -> Result<()> {
     Ok(())
 }
 
+/// #4116 — an escalated write's signed-approval routing, deferred by the
+/// governance pre-write hook to the write transaction the calling funnel
+/// holds (see [`connection::defer_escalation_to_open_txn`]) and queued on that
+/// transaction's own connection as soon as it ends
+/// ([`queue_deferred_escalation`]).
+#[derive(Debug, Clone)]
+pub struct DeferredEscalation {
+    /// The pending id already reported to the caller in the refusal.
+    pub pending_id: String,
+    /// The escalated write's author (`metadata.agent_id`, hook fallback tag).
+    pub requested_by: String,
+    /// The escalating rule.
+    pub rule_id: String,
+    /// The operator-authored escalation reason.
+    pub reason: String,
+    /// The escalated write's namespace.
+    pub namespace: String,
+    /// The escalated write, byte-shape-identical to the hook's routing
+    /// payload (`serde_json::to_value(mem)`), so the approved replay is the
+    /// very write the gate evaluated.
+    pub payload: serde_json::Value,
+}
+
+/// #4116 — queue one [`DeferredEscalation`] as a signed-approval `store`
+/// pending on `conn`, whose write transaction has just ENDED (the writer
+/// lock is released, so nothing waits on this thread's own lock).
+///
+/// Infallible by design (it runs from `WriteTxn`'s terminator, which may be
+/// `Drop`): the escalated write was already refused to its caller, so a
+/// failure here loses only the pending (logged at ERROR) and never admits
+/// the write — fail closed.
+pub(crate) fn queue_deferred_escalation(conn: &Connection, intent: &DeferredEscalation) {
+    match crate::approvals::signed::route_escalation_to_approval_gate_with_id(
+        conn,
+        &intent.pending_id,
+        GovernedAction::Store,
+        &intent.namespace,
+        None,
+        &intent.requested_by,
+        &intent.payload,
+        &intent.rule_id,
+        &intent.reason,
+    ) {
+        Ok(()) => tracing::info!(
+            "L1-6 governance pre-write escalated namespace={:?} rule_id={} — queued \
+             signed-approval pending_id={} on the funnel connection after its write \
+             transaction ended (#4116; blocked until m-of-n quorum met)",
+            intent.namespace,
+            intent.rule_id,
+            intent.pending_id
+        ),
+        Err(e) => tracing::error!(
+            "L1-6 governance pre-write: deferred escalation routing FAILED \
+             namespace={:?} rule_id={} pending_id={} err={e:#}; the escalated write \
+             stays REFUSED (fail-closed) but no pending was queued",
+            intent.namespace,
+            intent.rule_id,
+            intent.pending_id
+        ),
+    }
+}
+
 /// #2059 — TRACT covenant clause 1 (`docs/spec/TRACT-L1-CLAIM-CONTRACT.md`
 /// §8.1): env knob gating the WRITE path, mirroring the shape of the
 /// existing VERIFY-time `AI_MEMORY_REQUIRE_CAUSE_BINDING`
@@ -23626,9 +23688,37 @@ pub fn queue_pending_action(
     requested_by: &str,
     payload: &serde_json::Value,
 ) -> Result<String> {
+    let id = uuid::Uuid::new_v4().to_string();
+    queue_pending_action_with_id(
+        conn,
+        &id,
+        action,
+        namespace,
+        memory_id,
+        requested_by,
+        payload,
+    )?;
+    Ok(id)
+}
+
+/// #4116 — [`queue_pending_action`] under a caller-minted `id` (a deferred
+/// escalation reports its pending id in the refusal before the row lands).
+///
+/// # Errors
+///
+/// Propagates the record-stop gate and SQLite errors (a duplicate `id` is a
+/// primary-key violation, never an overwrite).
+pub fn queue_pending_action_with_id(
+    conn: &Connection,
+    id: &str,
+    action: GovernedAction,
+    namespace: &str,
+    memory_id: Option<&str>,
+    requested_by: &str,
+    payload: &serde_json::Value,
+) -> Result<()> {
     // Wave-2 B7 — sibling of gated `upsert_pending_action` (ERRORS-09).
     crate::storage::record_stop::gate_storage_conn(conn)?;
-    let id = uuid::Uuid::new_v4().to_string();
     let now = Utc::now().to_rfc3339();
     let payload_json = serde_json::to_string(payload)?;
     conn.execute(
@@ -23644,7 +23734,7 @@ pub fn queue_pending_action(
             now,
         ],
     )?;
-    Ok(id)
+    Ok(())
 }
 
 /// v0.6.2 (S34): upsert a `pending_actions` row from a canonical `PendingAction`

@@ -5418,6 +5418,40 @@ pub(crate) fn route_or_block_escalated_write(
     }
     // (3) route to the signed-approval gate.
     let escalated_payload = serde_json::to_value(mem).unwrap_or(serde_json::Value::Null);
+    // #4116 — this hook fires synchronously from inside a write funnel. When
+    // that funnel holds a write transaction on the database `conn` consults,
+    // queueing on `conn` waited out `busy_timeout` behind THIS thread's own
+    // writer lock and failed SQLITE_BUSY (refused, never queued). Defer the
+    // queue write to that transaction instead: it lands on the funnel's own
+    // connection the moment the transaction ends. Evaluation already ran
+    // under the funnel's lock; the current write is refused either way.
+    let pending_id = uuid::Uuid::new_v4().to_string();
+    let deferred = crate::storage::DeferredEscalation {
+        pending_id: pending_id.clone(),
+        requested_by: agent_id.to_string(),
+        rule_id: rule_id.to_string(),
+        reason: reason.to_string(),
+        namespace: mem.namespace.clone(),
+        payload: escalated_payload,
+    };
+    let escalated_payload =
+        match crate::storage::connection::defer_escalation_to_open_txn(conn.path(), deferred) {
+            Ok(()) => {
+                tracing::info!(
+                    "L1-6 governance pre-write escalated namespace={:?} rule_id={} reason={} — \
+                     signed-approval pending_id={} deferred to the caller's write transaction \
+                     (#4116; queued on its connection when it ends)",
+                    mem.namespace,
+                    rule_id,
+                    reason,
+                    pending_id
+                );
+                return Err(format!(
+                    "action escalated for signed approval (pending_id={pending_id}): {reason}"
+                ));
+            }
+            Err(not_deferred) => not_deferred.payload,
+        };
     match crate::approvals::signed::route_escalation_to_approval_gate(
         conn,
         crate::models::GovernedAction::Store,
@@ -14994,6 +15028,314 @@ mod cov_cli_dispatch_arms_3521 {
             memory_count(&env.db_path),
             before,
             "a dry-run rewind must leave the corpus byte-identical"
+        );
+    }
+}
+
+#[cfg(test)]
+mod escalate_under_write_lock_4116_tests {
+    //! #4116 — an `Escalate` verdict from the INSTALLED L1-6 pre-write hook,
+    //! reached from a write funnel that holds `BEGIN IMMEDIATE` on the same
+    //! database, must QUEUE exactly one signed-approval pending and return the
+    //! governance-escalated refusal — not wait out `busy_timeout` and fail
+    //! `SQLITE_BUSY` without queueing. Controls: a Refuse rule still refuses
+    //! (nothing queued), and with no rule the write lands.
+    //!
+    //! Each cell installs the process-global hook, so each runs in an
+    //! env-isolated child process (`run_env_isolated_child_or_spawn`).
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use crate::models::{Memory, Tier};
+
+    /// Well under the connection `busy_timeout` (5 s): a funnel that waited
+    /// on its own writer lock cannot finish inside it.
+    const UNDER_BUSY_TIMEOUT: Duration = Duration::from_millis(2_500);
+
+    fn approver_pubkey_b64(seed: u8) -> String {
+        use base64::Engine as _;
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+        base64::engine::general_purpose::STANDARD.encode(sk.verifying_key().to_bytes())
+    }
+
+    fn memory(title: &str, ns: &str) -> Memory {
+        Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            namespace: ns.to_string(),
+            title: title.to_string(),
+            content: format!("body of {title} — long enough to be a real memory"),
+            tier: Tier::Long,
+            metadata: serde_json::json!({ "agent_id": "ai:worker-4116" }),
+            ..Memory::default()
+        }
+    }
+
+    fn seed_rule(path: &Path, severity: &str) {
+        let conn = crate::db::open(path).expect("open seed");
+        conn.execute(
+            "INSERT INTO governance_rules \
+             (id, kind, matcher, severity, reason, namespace, created_by, \
+              created_at, enabled, signature, attest_level) \
+             VALUES (?1, 'custom', ?2, ?3, ?4, '_global', 'test', ?5, 1, NULL, 'unsigned')",
+            rusqlite::params![
+                format!("R-4116-{severity}"),
+                r#"{"kind":"memory_write"}"#,
+                severity,
+                format!("#4116 {severity} rule"),
+                chrono::Utc::now().timestamp(),
+            ],
+        )
+        .expect("seed rule");
+    }
+
+    /// Install the REAL hook (the daemon/MCP installer) on its own
+    /// consultation connection to `path`. The returned receiver keeps the
+    /// deferred-audit queue admitting.
+    fn install_hook(
+        path: &Path,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<crate::governance::deferred_audit::DeferredAuditEvent>
+    {
+        let (queue, rx) = crate::governance::deferred_audit::DeferredAuditQueue::new();
+        let cache = Arc::new(crate::governance::rule_cache::RuleCache::new());
+        let hook_conn = crate::db::open(path).expect("open hook consultation connection");
+        super::install_governance_pre_write_hook(
+            path,
+            &queue,
+            &cache,
+            Some(Arc::new(std::sync::Mutex::new(hook_conn))),
+        );
+        rx
+    }
+
+    fn setup(label: &str) -> (tempfile::TempDir, PathBuf) {
+        unsafe {
+            std::env::remove_var("AI_MEMORY_OPERATOR_PUBKEY");
+            std::env::set_var(
+                crate::approvals::signed::APPROVER_PUBKEYS_ENV,
+                approver_pubkey_b64(41),
+            );
+            std::env::remove_var(super::ENV_GOVERNANCE_FAIL_OPEN);
+        }
+        let dir = tempfile::Builder::new()
+            .prefix(&format!("issue-4116-{label}-"))
+            .tempdir()
+            .expect("tempdir");
+        let path = dir.path().join("ai-memory.db");
+        drop(crate::db::open(&path).expect("init db"));
+        (dir, path)
+    }
+
+    /// `(pending rows, rows escalated from the #4116 rule, rows flagged
+    /// requires_signed_approval)`.
+    fn pending_counts(conn: &rusqlite::Connection) -> (i64, i64, i64) {
+        let mut stmt = conn
+            .prepare("SELECT payload FROM pending_actions WHERE status = 'pending'")
+            .expect("prepare");
+        let payloads: Vec<String> = stmt
+            .query_map([], |r| r.get(0))
+            .expect("query")
+            .collect::<rusqlite::Result<_>>()
+            .expect("rows");
+        let mut from_rule = 0;
+        let mut signed = 0;
+        for p in &payloads {
+            let v: serde_json::Value = serde_json::from_str(p).expect("payload json");
+            if v[crate::approvals::signed::ESCALATED_FROM_RULE_KEY] == "R-4116-escalate" {
+                from_rule += 1;
+            }
+            if v[crate::approvals::signed::REQUIRES_SIGNED_APPROVAL_KEY] == true {
+                signed += 1;
+            }
+        }
+        let total = i64::try_from(payloads.len()).expect("count fits");
+        (total, from_rule, signed)
+    }
+
+    /// Run one funnel and assert: escalated refusal (not BUSY), fast, exactly
+    /// one new signed-approval pending from the escalate rule.
+    fn assert_escalation_queued<T: std::fmt::Debug>(
+        conn: &rusqlite::Connection,
+        funnel: &str,
+        run: impl FnOnce() -> anyhow::Result<T>,
+    ) {
+        let before = pending_counts(conn);
+        let started = Instant::now();
+        let result = run();
+        let elapsed = started.elapsed();
+        let err = result.expect_err(&format!("{funnel}: an escalated write must be refused"));
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("escalated for signed approval"),
+            "{funnel}: expected the governance-escalated refusal, got: {msg}"
+        );
+        assert!(
+            !msg.to_ascii_lowercase().contains("busy") && !msg.contains("locked"),
+            "{funnel}: must not fail on its own writer lock, got: {msg}"
+        );
+        assert!(
+            elapsed < UNDER_BUSY_TIMEOUT,
+            "{funnel}: took {elapsed:?} — it waited on its own writer lock"
+        );
+        let after = pending_counts(conn);
+        assert_eq!(
+            (after.0 - before.0, after.1 - before.1, after.2 - before.2),
+            (1, 1, 1),
+            "{funnel}: exactly one signed-approval pending from the escalate rule \
+             (before={before:?} after={after:?})"
+        );
+        assert!(
+            conn.is_autocommit(),
+            "{funnel}: the connection must be back in autocommit"
+        );
+    }
+
+    #[test]
+    fn escalate_under_held_write_lock_queues_on_every_funnel() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "daemon_runtime::escalate_under_write_lock_4116_tests::escalate_under_held_write_lock_queues_on_every_funnel",
+        ) {
+            return;
+        }
+        let _no_pk = crate::governance::rules_store::force_no_operator_pubkey_for_test();
+        let (_dir, path) = setup("funnels");
+        let conn = crate::db::open(&path).expect("open main");
+        let ns = "gov4116/funnels";
+
+        // Seed the rows every funnel needs BEFORE the rule/hook exist.
+        let to_restore = memory("restore-me", ns);
+        crate::storage::insert(&conn, &to_restore).expect("insert restore row");
+        assert!(
+            crate::storage::archive_memory(&conn, &to_restore.id, Some("test")).expect("archive")
+        );
+        let to_restore_owned = memory("restore-owned", ns);
+        crate::storage::insert(&conn, &to_restore_owned).expect("insert owned row");
+        assert!(
+            crate::storage::archive_memory(&conn, &to_restore_owned.id, Some("test"))
+                .expect("archive owned")
+        );
+        let a = memory("consolidate-a", ns);
+        let b = memory("consolidate-b", ns);
+        crate::storage::insert(&conn, &a).expect("insert a");
+        crate::storage::insert(&conn, &b).expect("insert b");
+        let merge_target = memory("merge-target", ns);
+        crate::storage::insert(&conn, &merge_target).expect("insert merge target");
+        let update_target = memory("update-target", ns);
+        crate::storage::insert(&conn, &update_target).expect("insert update target");
+
+        seed_rule(&path, "escalate");
+        let _rx = install_hook(&path);
+
+        assert_escalation_queued(&conn, "restore_archived", || {
+            crate::storage::restore_archived(&conn, &to_restore.id)
+        });
+        assert_escalation_queued(&conn, "restore_archived_for_caller", || {
+            crate::storage::restore_archived_for_caller(
+                &conn,
+                &to_restore_owned.id,
+                "ai:worker-4116",
+            )
+        });
+        assert_escalation_queued(&conn, "consolidate", || {
+            crate::storage::consolidate(
+                &conn,
+                &[a.id.clone(), b.id.clone()],
+                "consolidated",
+                "merged summary of a and b",
+                ns,
+                &Tier::Long,
+                "test",
+                "ai:worker-4116",
+                true,
+            )
+        });
+        assert_escalation_queued(&conn, "merge_inbound", || {
+            let mut inbound = merge_target.clone();
+            inbound.content = "peer-updated body for the merge funnel".to_string();
+            inbound.updated_at = chrono::Utc::now().to_rfc3339();
+            crate::storage::merge_inbound(&conn, &inbound, false)
+        });
+        // A caller-owned write transaction around an inner funnel (the
+        // `SqliteStore::update` shape): the same class, one level up.
+        assert_escalation_queued(&conn, "update inside a caller WriteTxn", || {
+            let txn = crate::storage::connection::WriteTxn::begin(&conn)?;
+            let out = crate::storage::update_with_expected_version(
+                &conn,
+                &update_target.id,
+                Some("update-target retitled"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+            drop(txn);
+            out
+        });
+
+        // Nothing the gate escalated was written.
+        let restored: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE id IN (?1, ?2)",
+                rusqlite::params![to_restore.id, to_restore_owned.id],
+                |r| r.get(0),
+            )
+            .expect("count restored");
+        assert_eq!(restored, 0, "escalated restores must not land");
+    }
+
+    #[test]
+    fn control_refuse_rule_still_refuses_and_queues_nothing() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "daemon_runtime::escalate_under_write_lock_4116_tests::control_refuse_rule_still_refuses_and_queues_nothing",
+        ) {
+            return;
+        }
+        let _no_pk = crate::governance::rules_store::force_no_operator_pubkey_for_test();
+        let (_dir, path) = setup("refuse");
+        let conn = crate::db::open(&path).expect("open main");
+        let m = memory("refuse-restore", "gov4116/refuse");
+        crate::storage::insert(&conn, &m).expect("insert");
+        assert!(crate::storage::archive_memory(&conn, &m.id, Some("test")).expect("archive"));
+        seed_rule(&path, "refuse");
+        let _rx = install_hook(&path);
+        let err = crate::storage::restore_archived(&conn, &m.id).expect_err("refused");
+        assert!(
+            format!("{err:#}").contains("governance-refused"),
+            "got {err:#}"
+        );
+        assert_eq!(
+            pending_counts(&conn).0,
+            0,
+            "a Refuse verdict queues nothing"
+        );
+    }
+
+    #[test]
+    fn control_no_rule_restores() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "daemon_runtime::escalate_under_write_lock_4116_tests::control_no_rule_restores",
+        ) {
+            return;
+        }
+        let _no_pk = crate::governance::rules_store::force_no_operator_pubkey_for_test();
+        let (_dir, path) = setup("allow");
+        let conn = crate::db::open(&path).expect("open main");
+        let m = memory("allow-restore", "gov4116/allow");
+        crate::storage::insert(&conn, &m).expect("insert");
+        assert!(crate::storage::archive_memory(&conn, &m.id, Some("test")).expect("archive"));
+        let _rx = install_hook(&path);
+        assert!(crate::storage::restore_archived(&conn, &m.id).expect("allowed restore"));
+        assert_eq!(
+            pending_counts(&conn).0,
+            0,
+            "an Allow verdict queues nothing"
         );
     }
 }

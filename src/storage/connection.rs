@@ -186,6 +186,74 @@ pub struct WriteTxn<'c> {
     /// `true` once the transaction has been terminated (committed or
     /// rolled back), which makes [`Drop`] a no-op.
     finished: bool,
+    /// #4116 — this transaction's frame on the thread's
+    /// [`TXN_FRAMES`] stack (see [`defer_escalation_to_open_txn`]).
+    frame_id: u64,
+}
+
+/// #4116 — one open [`WriteTxn`] on this thread: the database it holds the
+/// writer lock on, and the signed-approval escalations the governance
+/// pre-write hook deferred while it was open.
+struct TxnFrame {
+    id: u64,
+    /// `Connection::path()` of the transaction's connection (`None` for an
+    /// in-memory / temp database, which no other connection can share).
+    db_path: Option<String>,
+    deferred: Vec<super::DeferredEscalation>,
+}
+
+thread_local! {
+    /// #4116 — the [`WriteTxn`]s open on this thread, innermost last.
+    /// `WriteTxn` borrows a `!Sync` `Connection`, so it is `!Send`: a frame
+    /// is pushed and popped on the same thread.
+    static TXN_FRAMES: std::cell::RefCell<Vec<TxnFrame>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Monotonic frame ids (process-wide; only uniqueness per thread matters).
+static NEXT_TXN_FRAME_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// #4116 — hand an escalated write's signed-approval routing to the
+/// innermost [`WriteTxn`] open on THIS thread against `db_path`, instead of
+/// writing the pending row now.
+///
+/// The governance pre-write hook consults (and used to queue) on its OWN
+/// connection, but it fires synchronously from inside a write funnel. When
+/// that funnel holds a write transaction on the same database, the hook's
+/// pending INSERT waited out the whole `busy_timeout` behind this thread's
+/// own writer lock and failed `SQLITE_BUSY`, so the escalated write was
+/// refused WITHOUT being queued. The deferred routing is written on the
+/// transaction's own connection the moment the transaction ends (commit or
+/// rollback), see [`WriteTxn::settle_deferred_escalations`]. The governance
+/// EVALUATION still ran inside the held lock.
+///
+/// Returns the escalation back (`Err`) when no write transaction on
+/// `db_path` is open on this thread — the caller then routes it itself.
+///
+/// # Errors
+///
+/// Returns `intent` unchanged when there is nothing to defer to.
+pub(crate) fn defer_escalation_to_open_txn(
+    db_path: Option<&str>,
+    intent: super::DeferredEscalation,
+) -> std::result::Result<(), super::DeferredEscalation> {
+    let Some(db_path) = db_path.filter(|p| !p.is_empty()) else {
+        return Err(intent);
+    };
+    TXN_FRAMES.with(|frames| {
+        let mut frames = frames.borrow_mut();
+        match frames
+            .iter_mut()
+            .rev()
+            .find(|f| f.db_path.as_deref() == Some(db_path))
+        {
+            Some(frame) => {
+                frame.deferred.push(intent);
+                Ok(())
+            }
+            None => Err(intent),
+        }
+    })
 }
 
 impl<'c> WriteTxn<'c> {
@@ -200,10 +268,7 @@ impl<'c> WriteTxn<'c> {
     /// is left to roll back.
     pub fn begin(conn: &'c Connection) -> rusqlite::Result<Self> {
         conn.execute_batch(SQL_BEGIN_IMMEDIATE)?;
-        Ok(Self {
-            conn,
-            finished: false,
-        })
+        Ok(Self::opened(conn))
     }
 
     /// Open a DEFERRED transaction on `conn` — the chunked-import boundary,
@@ -215,10 +280,7 @@ impl<'c> WriteTxn<'c> {
     /// [`WriteTxn::begin`], no guard is constructed on failure.
     pub fn begin_deferred(conn: &'c Connection) -> rusqlite::Result<Self> {
         conn.execute_batch(SQL_BEGIN_DEFERRED)?;
-        Ok(Self {
-            conn,
-            finished: false,
-        })
+        Ok(Self::opened(conn))
     }
 
     /// Open an EXCLUSIVE write transaction on `conn` — the schema-migration
@@ -230,10 +292,7 @@ impl<'c> WriteTxn<'c> {
     /// [`WriteTxn::begin`], no guard is constructed on failure.
     pub fn begin_exclusive(conn: &'c Connection) -> rusqlite::Result<Self> {
         conn.execute_batch(SQL_BEGIN_EXCLUSIVE)?;
-        Ok(Self {
-            conn,
-            finished: false,
-        })
+        Ok(Self::opened(conn))
     }
 
     /// Commit the transaction, consuming the guard.
@@ -248,7 +307,65 @@ impl<'c> WriteTxn<'c> {
         // Only a SUCCESSFUL commit disarms the guard. On the error path we
         // fall through with `finished == false` so `Drop` rolls back.
         self.finished = true;
+        self.settle_deferred_escalations();
         Ok(())
+    }
+
+    /// Register a freshly-opened transaction's frame (#4116).
+    fn opened(conn: &'c Connection) -> Self {
+        let frame_id = NEXT_TXN_FRAME_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let db_path = conn.path().filter(|p| !p.is_empty()).map(str::to_string);
+        TXN_FRAMES.with(|frames| {
+            frames.borrow_mut().push(TxnFrame {
+                id: frame_id,
+                db_path,
+                deferred: Vec::new(),
+            });
+        });
+        Self {
+            conn,
+            finished: false,
+            frame_id,
+        }
+    }
+
+    /// #4116 — pop this transaction's frame and queue every escalation the
+    /// governance hook deferred to it, on THIS connection, now that the
+    /// transaction has ended and the writer lock is released. Runs once, on
+    /// the commit or the rollback that terminates the transaction.
+    ///
+    /// Fail-closed and infallible (it runs from `Drop`): every deferred
+    /// write was already REFUSED to its caller, so a queue failure loses
+    /// only the pending (logged at ERROR), never admits the write. Nothing
+    /// is queued during a panic unwind or while the connection is still
+    /// inside a transaction (a failed ROLLBACK) — never write into a
+    /// foreign transaction.
+    fn settle_deferred_escalations(&mut self) {
+        let frame_id = self.frame_id;
+        let deferred = TXN_FRAMES.with(|frames| {
+            let mut frames = frames.borrow_mut();
+            frames
+                .iter()
+                .rposition(|f| f.id == frame_id)
+                .map(|at| frames.remove(at).deferred)
+                .unwrap_or_default()
+        });
+        if deferred.is_empty() {
+            return;
+        }
+        if std::thread::panicking() || !self.conn.is_autocommit() {
+            tracing::error!(
+                target: TXN_GUARD_TRACE_TARGET,
+                count = deferred.len(),
+                "#4116 WriteTxn: dropping deferred escalation(s) — the transaction \
+                 ended by panic or its connection is still inside a transaction; the \
+                 escalated write(s) stay REFUSED but are NOT queued for approval"
+            );
+            return;
+        }
+        for intent in deferred {
+            super::queue_deferred_escalation(self.conn, &intent);
+        }
     }
 
     /// Roll the transaction back explicitly, consuming the guard.
@@ -273,9 +390,14 @@ impl<'c> WriteTxn<'c> {
         // a fatal statement error. Issuing ROLLBACK there would only log a
         // spurious "cannot rollback - no transaction is active".
         if self.conn.is_autocommit() {
+            self.settle_deferred_escalations();
             return;
         }
-        if let Err(e) = self.conn.execute_batch(SQL_ROLLBACK) {
+        let rolled_back = self.conn.execute_batch(SQL_ROLLBACK);
+        // #4116 — queue what the governance hook deferred to this
+        // transaction (a no-op unless the ROLLBACK released the lock).
+        self.settle_deferred_escalations();
+        if let Err(e) = rolled_back {
             tracing::error!(
                 target: TXN_GUARD_TRACE_TARGET,
                 error = %e,
