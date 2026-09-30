@@ -579,6 +579,11 @@ if [[ "${1:-}" == "--self-test" ]]; then
         fi
     done
 
+    # #4292: every probe is removed on ANY exit, including an interrupted
+    # one, and INT/TERM re-raise. See scripts/lib/selftest-probes.sh.
+    source "${ROOT}/scripts/lib/selftest-probes.sh"
+    selftest_probes_arm "$probe_violation" "$probe_compliant" "$probe_handrolled" "$probe_comment_only" "$probe_arm_b" "$probe_naked" "$probe_delegate" "$probe_arm_d" "$probe_arm_e" "$probe_arm_e_exempt" "$probe_arm_f" "$probe_arm_f_compliant" "$probe_arm_g" "$probe_arm_h" "$probe_arm_h_compliant" "$probe_arm_h_param"
+
     # Case 1: a plain $HOME mutation with NO test_env_lock reference
     # anywhere in the file -- the "nobody serialized it at all" shape
     # (#1998's original defect).
@@ -966,11 +971,10 @@ fn contrived_param_caller_test() {
 EOF
 
     set +e
-    gate_output="$("$0" 2>&1)"
-    gate_exit=$?
+    selftest_run gate_output gate_exit "$0"
     set -e
 
-    rm -f "$probe_violation" "$probe_compliant" "$probe_handrolled" "$probe_comment_only" "$probe_arm_b" "$probe_naked" "$probe_delegate" "$probe_arm_d" "$probe_arm_e" "$probe_arm_e_exempt" "$probe_arm_f" "$probe_arm_f_compliant" "$probe_arm_g" "$probe_arm_h" "$probe_arm_h_compliant" "$probe_arm_h_param"
+    selftest_probes_disarm
     printf '%s\n' "$gate_output"
 
     # PASS requires: non-zero exit, ALL EIGHT violators reported (no-lock,

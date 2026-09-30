@@ -210,7 +210,11 @@ if [[ "${1:-}" == "--self-test" ]]; then
     # a line the scanner must read. Each case is probed on its own so one
     # shape can never mask another.
     probe="${ROOT}/src/__name_literal_gate_selftest.rs"
-    trap 'rm -f "$probe"' EXIT
+    # #4292: the probe is removed on ANY exit, including an interrupted one,
+    # and INT/TERM re-raise (an EXIT-only trap let an interrupted run finish
+    # and exit 0). See scripts/lib/selftest-probes.sh.
+    source "${ROOT}/scripts/lib/selftest-probes.sh"
+    selftest_probes_arm "$probe"
     st_rc=0
 
     # (a) TRUE POSITIVES — the gate must still HARD-BLOCK every one.
@@ -245,8 +249,7 @@ SELFTEST_POSITIVE
     let key256 = [0u8; 256];
 SELFTEST_NEGATIVE
 
-    rm -f "$probe"
-    trap - EXIT
+    selftest_probes_disarm
     if [[ "$st_rc" -ne 0 ]]; then
         exit 1
     fi
