@@ -23,16 +23,60 @@
 # the self-test refuse (exit 2) and survive byte-identical: a probe-planting
 # self-test must never overwrite or delete a file it did not create.
 #
-# Anything a failing gate strands is removed afterwards (only paths that
-# appeared during that run), so a red run leaves the tree as it found it.
+# Anything a failing gate strands is removed afterwards, but ONLY paths that
+# appeared during that run AND are declared probe paths of that gate. Any
+# other new path is reported and left in place: it may be someone else's
+# work in the same tree (r9 F1 on #4292).
+#
+# The harness applies the same rule to itself (r9 F2): if IT is interrupted
+# (^C, a CI cancel, timeout), it stops the self-test it started and removes
+# the sentinel file it planted, then dies of the signal, so an interrupted
+# harness never strands a file at a real probe path.
 #
 # Usage: scripts/test/test-gate-selftest-interrupt-cleanup.sh [gate.sh ...]
+#        scripts/test/test-gate-selftest-interrupt-cleanup.sh --harness-self-test
 # LINUX (setsid).
 
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
+
+# What this harness has running or planted right now, so an interrupt can
+# undo exactly that and nothing else.
+CHILD_SESSION=""   # a setsid'd self-test: its pid is its process group id
+CHILD_PID=""       # a sentinel-phase self-test (not setsid'd)
+CUR_SENTINEL=""    # a sentinel file this harness planted
+
+harness_cleanup() {
+  if [[ -n "$CHILD_SESSION" ]]; then
+    kill -TERM -- "-$CHILD_SESSION" 2>/dev/null
+    local i
+    for i in $(seq 1 100); do kill -0 "$CHILD_SESSION" 2>/dev/null || break; sleep 0.05; done
+    kill -KILL -- "-$CHILD_SESSION" 2>/dev/null
+    wait "$CHILD_SESSION" 2>/dev/null
+    CHILD_SESSION=""
+  fi
+  if [[ -n "$CHILD_PID" ]]; then
+    kill -TERM "$CHILD_PID" 2>/dev/null
+    wait "$CHILD_PID" 2>/dev/null
+    CHILD_PID=""
+  fi
+  if [[ -n "$CUR_SENTINEL" ]]; then
+    rm -f -- "$CUR_SENTINEL"
+    CUR_SENTINEL=""
+  fi
+}
+trap harness_cleanup EXIT
+trap 'harness_cleanup; trap - INT; kill -INT $$' INT
+trap 'harness_cleanup; trap - TERM; kill -TERM $$' TERM
+
+if [[ "${1:-}" == --harness-self-test ]]; then
+  HARNESS_SELF_TEST=1
+  shift
+else
+  HARNESS_SELF_TEST=0
+fi
 
 GATES=("$@")
 if ((${#GATES[@]} == 0)); then
@@ -84,6 +128,7 @@ signal.signal(signal.SIGINT, signal.SIG_DFL)
 signal.signal(signal.SIGQUIT, signal.SIG_DFL)
 os.execvp("bash", ["bash", sys.argv[1], "--self-test"])' "scripts/${gate}" >"$log" 2>&1 &
   pid=$!
+  CHILD_SESSION=$pid
   deadline=$((SECONDS + PROBE_WAIT_SECS))
   while kill -0 "$pid" 2>/dev/null && ((SECONDS < deadline)); do
     now=$(porcelain)
@@ -102,6 +147,7 @@ os.execvp("bash", ["bash", sys.argv[1], "--self-test"])' "scripts/${gate}" >"$lo
   if [[ -z "$appeared" ]]; then
     kill -KILL -- "-$pid" 2>/dev/null
     wait "$pid" 2>/dev/null
+    CHILD_SESSION=""
     echo "not ok ${n} - ${gate} ${sig}: no probe ever appeared, nothing was interrupted (log: ${log})"
     failures=$((failures + 1))
     return
@@ -116,6 +162,7 @@ os.execvp("bash", ["bash", sys.argv[1], "--self-test"])' "scripts/${gate}" >"$lo
   kill -KILL -- "-$pid" 2>/dev/null
   wait "$pid" 2>/dev/null
   local rc=$?
+  CHILD_SESSION=""
   local after stranded
   after=$(porcelain)
   stranded=$(new_paths "$before" "$after")
@@ -132,10 +179,23 @@ os.execvp("bash", ["bash", sys.argv[1], "--self-test"])' "scripts/${gate}" >"$lo
   printf '%s\n' "$stranded" | sed 's/^/    /'
   [[ "$after" == "$before" ]] || [[ -n "$stranded" ]] || echo "    (tracked files changed)"
   failures=$((failures + 1))
-  # Leave the tree as it was found: remove only what this run created.
+  # Remove only what the GATE stranded: a new path that is also one of its
+  # declared probe paths. Any other new path is not provably the run's (it
+  # may be someone's work in this tree), so it is reported and left (r9 F1).
+  local declared kept
+  declared=$(probe_paths "$gate")
   while IFS= read -r p; do
-    [[ -n "$p" ]] && rm -f -- "$p"
+    [[ -z "$p" ]] && continue
+    if grep -qxF -- "$p" <<<"$declared"; then
+      rm -f -- "$p"
+    else
+      kept="${kept:-}    ${p}"$'\n'
+    fi
   done <<<"$stranded"
+  if [[ -n "${kept:-}" ]]; then
+    echo "    left in place (not a declared probe path of ${gate}, so not provably this run's):"
+    printf '%s' "$kept"
+  fi
 }
 
 # A file ALREADY at a probe path is not the run's to touch: the self-test
@@ -150,12 +210,20 @@ sentinel_one() {
     return
   fi
   mkdir -p "$(dirname "$path")"
+  # Registered BEFORE it exists, so an interrupt at any point removes it.
+  CUR_SENTINEL=$path
   printf 'SENTINEL #4292 %s %s\n' "$gate" "$$" >"$path"
   local want got rc=0 log="${LOGDIR}/${gate%.sh}-sentinel-$(basename "$path").log"
   want=$(sha256sum "$path")
-  timeout 120 bash "scripts/${gate}" --self-test >"$log" 2>&1 || rc=$?
+  # In the background and waited for: bash defers a trap until a FOREGROUND
+  # command returns, which would hold an interrupt for up to 120 s.
+  timeout 120 bash "scripts/${gate}" --self-test >"$log" 2>&1 &
+  CHILD_PID=$!
+  wait "$CHILD_PID" || rc=$?
+  CHILD_PID=""
   got=$(sha256sum "$path" 2>/dev/null || echo MISSING)
   rm -f -- "$path"
+  CUR_SENTINEL=""
   if ((rc == 2)) && [[ "$got" == "$want" ]]; then
     echo "ok ${n} - ${gate}: refuses a pre-existing ${path} (exit 2) and leaves it byte-identical"
   else
@@ -163,6 +231,97 @@ sentinel_one() {
     failures=$((failures + 1))
   fi
 }
+
+# --harness-self-test: the harness's OWN two properties (r9 on #4292), run
+# against HARNESS_UNDER_TEST (default: this file) on one real gate.
+#   F1: a file someone creates in the tree mid-run is reported, never deleted.
+#   F2: a harness killed by SIGTERM in its sentinel phase leaves no sentinel.
+if ((HARNESS_SELF_TEST)); then
+  H="${HARNESS_UNDER_TEST:-scripts/test/test-gate-selftest-interrupt-cleanup.sh}"
+  G=check-vendor-literals.sh
+  mapfile -t gdecl < <(probe_paths "$G")
+  st_fail=0
+  st_n=0
+  st_log="${LOGDIR}/harness-self-test.log"
+
+  # F1. The user file must appear AFTER the harness's baseline snapshot, so
+  # the cell retries with a longer delay until the harness's output shows it
+  # saw the file; a run where it did not is not counted either way.
+  st_n=$((st_n + 1))
+  user="src/.harness-4292-user-file-$$.rs"
+  exercised=0 survived=0
+  for delay in 0.3 0.6 1.0 1.5; do
+    [[ -e "$user" ]] && { echo "not ok ${st_n} - F1: ${user} already exists"; st_fail=$((st_fail + 1)); break; }
+    bash "$H" "$G" >"$st_log" 2>&1 &
+    hp=$!
+    sleep "$delay"
+    printf 'user work, not the harness %s\n' "$$" >"$user"
+    wait "$hp"
+    if grep -qF -- "$user" "$st_log"; then
+      exercised=1
+      [[ -f "$user" ]] && grep -q 'user work, not the harness' "$user" && survived=1
+      rm -f -- "$user"
+      break
+    fi
+    rm -f -- "$user"
+  done
+  if ((exercised && survived)); then
+    echo "ok ${st_n} - F1: a file created mid-run by someone else was reported and left in place"
+  elif ((exercised)); then
+    echo "not ok ${st_n} - F1: the harness DELETED a file it did not create (${user})"
+    st_fail=$((st_fail + 1))
+  else
+    echo "not ok ${st_n} - F1: never exercised (the harness never saw the file; log: ${st_log})"
+    st_fail=$((st_fail + 1))
+  fi
+
+  # F2. Wait until a sentinel is planted, then SIGTERM the harness.
+  st_n=$((st_n + 1))
+  st_before=$(porcelain)
+  bash "$H" "$G" >"$st_log" 2>&1 &
+  hp=$!
+  planted=""
+  deadline=$((SECONDS + 300))
+  while kill -0 "$hp" 2>/dev/null && ((SECONDS < deadline)) && [[ -z "$planted" ]]; do
+    for q in "${gdecl[@]}"; do
+      if [[ -f "$q" ]] && grep -q '^SENTINEL #4292' "$q" 2>/dev/null; then planted=$q; break; fi
+    done
+    sleep 0.01
+  done
+  if [[ -z "$planted" ]]; then
+    kill -TERM "$hp" 2>/dev/null
+    wait "$hp" 2>/dev/null
+    echo "not ok ${st_n} - F2: no sentinel was ever planted, nothing was interrupted (log: ${st_log})"
+    st_fail=$((st_fail + 1))
+  else
+    kill -TERM "$hp" 2>/dev/null
+    deadline=$((SECONDS + 30))
+    while kill -0 "$hp" 2>/dev/null && ((SECONDS < deadline)); do sleep 0.05; done
+    wait "$hp" 2>/dev/null
+    hrc=$?
+    left=""
+    for q in "${gdecl[@]}"; do [[ -e "$q" ]] && left="${left} ${q}"; done
+    if [[ -z "$left" && "$(porcelain)" == "$st_before" ]] && ((hrc != 0)); then
+      echo "ok ${st_n} - F2: SIGTERM during the sentinel phase (${planted}) left the tree unchanged (rc=${hrc})"
+    else
+      echo "not ok ${st_n} - F2: SIGTERM during the sentinel phase stranded:${left:- (tree changed)} (rc=${hrc})"
+      st_fail=$((st_fail + 1))
+      # Leave the tree as found: only files carrying the harness's sentinel mark.
+      for q in "${gdecl[@]}"; do
+        [[ -f "$q" ]] && grep -q '^SENTINEL #4292' "$q" 2>/dev/null && rm -f -- "$q"
+      done
+    fi
+  fi
+
+  echo "1..${st_n}"
+  if ((st_fail > 0)); then
+    echo "FAIL: ${st_fail} of ${st_n} harness self-test(s) failed (#4292 r9); logs: ${LOGDIR}" >&2
+    exit 1
+  fi
+  rm -rf "$LOGDIR"
+  echo "PASS: the harness never deletes a file it did not create, and never strands its own sentinel (#4292 r9)"
+  exit 0
+fi
 
 for g in "${GATES[@]}"; do
   [[ -f "scripts/${g}" ]] || { echo "not ok - scripts/${g} does not exist"; failures=$((failures + 1)); continue; }

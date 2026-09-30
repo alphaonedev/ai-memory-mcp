@@ -24,6 +24,11 @@
 # The gate child runs in the background and is waited for, because bash
 # defers a trap until a FOREGROUND command returns: under `$("$0")` a SIGTERM
 # would wait out the whole gate run, long past a CI cancel's SIGKILL.
+#
+# Residual: SIGKILL cannot be trapped, so a SIGKILLed self-test (an OOM kill,
+# or a CI runner that escalates past SIGTERM) still strands its probes. The
+# refusal above then makes the NEXT self-test exit 2 instead of silently
+# overwriting them; remove the named probe file by hand.
 
 _selftest_probes=()
 _selftest_child=""

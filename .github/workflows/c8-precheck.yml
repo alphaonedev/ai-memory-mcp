@@ -741,6 +741,12 @@ jobs:
         # A file already at any declared probe path must make the self-test
         # refuse (exit 2) and survive byte-identical.
         run: bash scripts/test/test-gate-selftest-interrupt-cleanup.sh
+      - name: The interrupt harness itself never deletes or strands (#4292 r9)
+        # The harness must hold itself to the same rule: a file someone
+        # else creates in the tree mid-run is reported, never deleted, and
+        # a harness killed by SIGTERM in its sentinel phase removes the
+        # sentinel it planted instead of stranding it at a real probe path.
+        run: bash scripts/test/test-gate-selftest-interrupt-cleanup.sh --harness-self-test
 
   required-contexts-gate:
     # Issues #2494 / #2496 — required-status-check SOUNDNESS. The required set
