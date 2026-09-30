@@ -14652,6 +14652,17 @@ mod escalate_producer_2991_tests {
         base64::engine::general_purpose::STANDARD.encode(sk.verifying_key().to_bytes())
     }
 
+    mod escalate_under_write_lock_4116_tests;
+    fn set_approver_env(key: Option<&str>) {
+        let env = crate::approvals::signed::APPROVER_PUBKEYS_ENV;
+        // SAFETY: only called in an env-isolated single-test child (#2991/#4116 cells).
+        unsafe { std::env::remove_var("AI_MEMORY_OPERATOR_PUBKEY") };
+        key.map_or_else(
+            || unsafe { std::env::remove_var(env) },
+            |k| unsafe { std::env::set_var(env, k) },
+        );
+    }
+
     #[test]
     fn keyless_escalation_blocks_without_queuing_a_pending() {
         // Env-isolated: asserts the KEYLESS state, so no concurrent test's
@@ -14661,10 +14672,7 @@ mod escalate_producer_2991_tests {
         ) {
             return;
         }
-        unsafe {
-            std::env::remove_var("AI_MEMORY_OPERATOR_PUBKEY");
-            std::env::remove_var(crate::approvals::signed::APPROVER_PUBKEYS_ENV);
-        }
+        set_approver_env(None);
         // Also neutralise any on-disk operator key so the fleet is TRULY keyless
         // (a dev host may have staged an operator.key.pub).
         let _no_pk = crate::governance::rules_store::force_no_operator_pubkey_for_test();
@@ -14686,13 +14694,7 @@ mod escalate_producer_2991_tests {
         ) {
             return;
         }
-        unsafe {
-            std::env::remove_var("AI_MEMORY_OPERATOR_PUBKEY");
-            std::env::set_var(
-                crate::approvals::signed::APPROVER_PUBKEYS_ENV,
-                approver_pubkey_b64(9),
-            );
-        }
+        set_approver_env(Some(&approver_pubkey_b64(9)));
         let conn = crate::db::open(std::path::Path::new(":memory:")).expect("open");
         let m = mem("gov-ns", "body-keyed");
         let r =
@@ -14714,9 +14716,7 @@ mod escalate_producer_2991_tests {
             serde_json::from_value(pend[0].payload.clone()).expect("payload is a Memory");
         assert_eq!(back.content, "body-keyed");
         assert_eq!(back.namespace, "gov-ns");
-        unsafe {
-            std::env::remove_var(crate::approvals::signed::APPROVER_PUBKEYS_ENV);
-        }
+        set_approver_env(None);
     }
 
     #[test]

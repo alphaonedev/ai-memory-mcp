@@ -186,6 +186,8 @@ pub struct WriteTxn<'c> {
     /// `true` once the transaction has been terminated (committed or
     /// rolled back), which makes [`Drop`] a no-op.
     finished: bool,
+    /// #4116 — this transaction's frame (see `storage::escalation_deferral`).
+    frame_id: u64,
 }
 
 impl<'c> WriteTxn<'c> {
@@ -200,10 +202,7 @@ impl<'c> WriteTxn<'c> {
     /// is left to roll back.
     pub fn begin(conn: &'c Connection) -> rusqlite::Result<Self> {
         conn.execute_batch(SQL_BEGIN_IMMEDIATE)?;
-        Ok(Self {
-            conn,
-            finished: false,
-        })
+        Ok(Self::opened(conn))
     }
 
     /// Open a DEFERRED transaction on `conn` — the chunked-import boundary,
@@ -215,10 +214,7 @@ impl<'c> WriteTxn<'c> {
     /// [`WriteTxn::begin`], no guard is constructed on failure.
     pub fn begin_deferred(conn: &'c Connection) -> rusqlite::Result<Self> {
         conn.execute_batch(SQL_BEGIN_DEFERRED)?;
-        Ok(Self {
-            conn,
-            finished: false,
-        })
+        Ok(Self::opened(conn))
     }
 
     /// Open an EXCLUSIVE write transaction on `conn` — the schema-migration
@@ -230,10 +226,7 @@ impl<'c> WriteTxn<'c> {
     /// [`WriteTxn::begin`], no guard is constructed on failure.
     pub fn begin_exclusive(conn: &'c Connection) -> rusqlite::Result<Self> {
         conn.execute_batch(SQL_BEGIN_EXCLUSIVE)?;
-        Ok(Self {
-            conn,
-            finished: false,
-        })
+        Ok(Self::opened(conn))
     }
 
     /// Commit the transaction, consuming the guard.
@@ -248,7 +241,17 @@ impl<'c> WriteTxn<'c> {
         // Only a SUCCESSFUL commit disarms the guard. On the error path we
         // fall through with `finished == false` so `Drop` rolls back.
         self.finished = true;
+        super::escalation_deferral::settle_frame(self.conn, self.frame_id);
         Ok(())
+    }
+
+    /// Register a freshly-opened transaction's #4116 escalation frame.
+    fn opened(conn: &'c Connection) -> Self {
+        Self {
+            conn,
+            finished: false,
+            frame_id: super::escalation_deferral::open_frame(conn),
+        }
     }
 
     /// Roll the transaction back explicitly, consuming the guard.
@@ -273,9 +276,13 @@ impl<'c> WriteTxn<'c> {
         // a fatal statement error. Issuing ROLLBACK there would only log a
         // spurious "cannot rollback - no transaction is active".
         if self.conn.is_autocommit() {
+            super::escalation_deferral::settle_frame(self.conn, self.frame_id);
             return;
         }
-        if let Err(e) = self.conn.execute_batch(SQL_ROLLBACK) {
+        let rolled_back = self.conn.execute_batch(SQL_ROLLBACK);
+        // #4116 — queue deferred escalations (a no-op unless the lock is released).
+        super::escalation_deferral::settle_frame(self.conn, self.frame_id);
+        if let Err(e) = rolled_back {
             tracing::error!(
                 target: TXN_GUARD_TRACE_TARGET,
                 error = %e,
