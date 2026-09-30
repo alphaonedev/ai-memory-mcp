@@ -198,6 +198,29 @@ fn outage_rows(home: &Path) -> i64 {
     .expect("count outage rows")
 }
 
+/// The two tables the recorder could touch, dumped row by row: the schema
+/// stamp and the signed-event chain.
+fn store_dump(home: &Path) -> (Vec<i64>, Vec<(i64, String, String)>) {
+    let conn = rusqlite::Connection::open(db_path(home)).expect("open the test database");
+    let stamps = conn
+        .prepare("SELECT version FROM schema_version ORDER BY version")
+        .expect("prepare")
+        .query_map([], |r| r.get(0))
+        .expect("query")
+        .map(Result::unwrap)
+        .collect();
+    let events = conn
+        .prepare(
+            "SELECT sequence, event_type, hex(payload_hash) FROM signed_events ORDER BY sequence",
+        )
+        .expect("prepare")
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .expect("query")
+        .map(Result::unwrap)
+        .collect();
+    (stamps, events)
+}
+
 /// The doctor severity of the forensic section. `doctor` is never refused.
 fn doctor_forensic_severity(home: &Path, env: &[(&str, &str)]) -> String {
     let out = run_with_env(home, env, &["doctor", "--json"]);
@@ -394,9 +417,18 @@ fn a_future_dated_junk_file_does_not_change_the_tail_4203() {
     log_with_rows(home.path());
     let junk = forensic_dir(home.path()).join(FUTURE_DAY);
     std::fs::write(&junk, b"planted junk\n").expect("plant a future-dated file");
+    let outages = outage_rows(home.path());
     let out = purge_once(home.path());
     assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("dated after today"),
+        "stderr: {}",
+        stderr(&out)
+    );
     assert_one_unbroken_chain(&rows(home.path()));
+    // f2r review of 15fde1499: the skip can fork the chain after a backward
+    // clock step, so it is attested by a signed row, not only logged.
+    assert_eq!(outage_rows(home.path()), outages + 1);
     assert_eq!(
         std::fs::read(&junk).expect("the planted file is still there"),
         b"planted junk\n",
@@ -453,4 +485,115 @@ fn a_torn_last_line_is_still_skipped_4199() {
     assert!(out.status.success(), "stderr: {}", stderr(&out));
     assert!(!stderr(&out).contains(DEGRADED), "stderr: {}", stderr(&out));
     assert_one_unbroken_chain(&rows(home.path()));
+}
+
+/// f2r review of 15fde1499 — `doctor` is the pre-upgrade DETECTOR: with a
+/// broken tail it reports Critical and leaves the store untouched (no
+/// migration, no outage row).
+#[test]
+fn doctor_never_writes_the_store_with_a_broken_tail_4199() {
+    let home = sandbox();
+    garbage_only_log(home.path());
+    let before = store_dump(home.path());
+    assert_eq!(doctor_forensic_severity(home.path(), &[]), "critical");
+    assert_eq!(store_dump(home.path()), before, "doctor wrote the store");
+}
+
+/// f2r review of 15fde1499 — an egress verb takes the copy without the
+/// recorder opening, migrating or appending to the primary first.
+#[test]
+fn backup_never_writes_the_store_with_a_broken_tail_4199() {
+    let home = sandbox();
+    garbage_only_log(home.path());
+    let before = store_dump(home.path());
+    let to = home.path().join("backups");
+    let out = run_with_env(
+        home.path(),
+        &[],
+        &["backup", "--to", to.to_str().expect("utf-8 path")],
+    );
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert_eq!(store_dump(home.path()), before, "backup wrote the store");
+}
+
+/// f2r review of 15fde1499 — a stuck tail costs ONE outage row, not one per
+/// invocation (the `PreToolUse` hook runs on every agent tool call).
+#[test]
+fn a_stuck_tail_appends_one_outage_row_across_runs_4199() {
+    let home = sandbox();
+    garbage_only_log(home.path());
+    let before = outage_rows(home.path());
+    for _ in 0..2 {
+        let out = purge_once(home.path());
+        assert!(out.status.success(), "stderr: {}", stderr(&out));
+        assert!(stderr(&out).contains(DEGRADED), "stderr: {}", stderr(&out));
+    }
+    assert_eq!(outage_rows(home.path()), before + 1);
+}
+
+/// f2r review of 15fde1499 — the gate from the other side: a read-only verb
+/// with a broken tail reports the outage but never writes the store.
+#[test]
+fn a_read_only_verb_never_writes_the_store_with_a_broken_tail_4199() {
+    let home = sandbox();
+    garbage_only_log(home.path());
+    let before = store_dump(home.path());
+    let out = run_with_env(home.path(), &[], &["list"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(stderr(&out).contains(DEGRADED), "stderr: {}", stderr(&out));
+    assert_eq!(store_dump(home.path()), before, "list wrote the store");
+}
+
+/// #4205 — a torn last line WITHOUT a trailing newline: the next row must not
+/// be glued onto it. Pre-fix the glued row is unparseable and the row after it
+/// links past it, so the chain still reads unbroken; only the row COUNT shows
+/// the loss.
+#[test]
+fn a_row_after_an_unterminated_fragment_is_not_glued_to_it_4205() {
+    let home = sandbox();
+    let file = log_with_rows(home.path());
+    let seeded = rows(home.path()).len();
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&file)
+        .expect("open forensic file");
+    std::io::Write::write_all(&mut f, b"{\"ts\":\"2026-09-29T00:00:0").expect("tear");
+    drop(f);
+    for _ in 0..2 {
+        let out = purge_once(home.path());
+        assert!(out.status.success(), "stderr: {}", stderr(&out));
+        assert!(!stderr(&out).contains(DEGRADED), "stderr: {}", stderr(&out));
+    }
+    let recs = rows(home.path());
+    assert_eq!(recs.len(), seeded + 2, "both new rows parse (none glued)");
+    assert_one_unbroken_chain(&recs);
+    let text = std::fs::read_to_string(&file).expect("read forensic file");
+    assert!(
+        text.lines().any(|l| l == "{\"ts\":\"2026-09-29T00:00:0"),
+        "the fragment stays its own line"
+    );
+}
+
+/// f2r review of 15fde1499 — a postgres-backed process never writes its
+/// outage into a stray local sqlite store; it says the row was not written.
+#[test]
+fn a_postgres_backed_process_writes_no_sqlite_outage_row_4199() {
+    let home = sandbox();
+    garbage_only_log(home.path());
+    let before = store_dump(home.path());
+    let out = purge_with_env(
+        home.path(),
+        &[(
+            "AI_MEMORY_STORE_URL",
+            "postgres://ai_memory@127.0.0.1:1/none",
+        )],
+    );
+    let err = stderr(&out);
+    assert!(err.contains(DEGRADED), "stderr: {err}");
+    assert!(err.contains("uses a postgres store"), "stderr: {err}");
+    assert_eq!(
+        store_dump(home.path()),
+        before,
+        "wrote the local sqlite store"
+    );
 }

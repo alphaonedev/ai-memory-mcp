@@ -198,6 +198,31 @@ fn writer() -> anyhow::Result<&'static Sender<WriteOp>> {
     Ok(WRITER.get_or_init(|| tx))
 }
 
+/// #4205 — open `path` for appending WHOLE LINES. A crash mid-write can
+/// leave a file ending in a torn fragment with no trailing newline; a row
+/// appended straight after it would share its physical line, fail to parse,
+/// and silently drop out of the chain. So when the file is non-empty and its
+/// last byte is not `\n`, one `\n` is written first: the fragment stays its
+/// own (skipped) line and the new row stays parseable. Every append-only log
+/// here opens through this one helper, so no appender can skip the rule.
+fn open_for_append_line_aligned(path: &Path) -> std::io::Result<File> {
+    let mut f = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .append(true)
+        .open(path)?;
+    let len = f.metadata()?.len();
+    if len > 0 {
+        let mut last = [0u8; 1];
+        f.seek(SeekFrom::Start(len - 1))?;
+        f.read_exact(&mut last)?;
+        if last[0] != b'\n' {
+            f.write_all(b"\n")?;
+        }
+    }
+    Ok(f)
+}
+
 /// Drain loop for the background writer. Keeps the destination file open
 /// across appends (one `open()` per rotated file, not one per row) and
 /// coalesces a burst into a single flush.
@@ -217,7 +242,7 @@ fn run_writer(rx: Receiver<WriteOp>) {
                 WriteOp::Append { path, line } => {
                     let reopen = open_file.as_ref().map_or(true, |(p, _)| p != &path);
                     if reopen {
-                        match OpenOptions::new().create(true).append(true).open(&path) {
+                        match open_for_append_line_aligned(&path) {
                             Ok(file) => open_file = Some((path, file)),
                             Err(e) => {
                                 tracing::error!(
@@ -1272,33 +1297,108 @@ pub fn degraded_boot_message(err: &anyhow::Error) -> String {
     )
 }
 
-/// #4199 — append the SIGNED `signed_events` row that attests the forensic
-/// sink is unavailable, and why. The outage itself is then on the existing
-/// tamper-evident chain rather than only in a log line.
-///
-/// # Errors
-/// Propagates the `append_signed_event` error; callers treat this as
-/// best-effort (the degraded boot already happened).
-pub fn emit_forensic_sink_unavailable(
-    conn: &rusqlite::Connection,
-    err: &ForensicTailUnreadable,
-) -> Result<()> {
-    use crate::signed_events::{
-        SignedEvent, append_signed_event, event_types::FORENSIC_SINK_UNAVAILABLE, payload_hash,
-    };
+/// #4199 — what [`record_forensic_sink_unavailable`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OutageRecord {
+    /// A new signed `audit.forensic_sink_unavailable` row was appended.
+    Recorded,
+    /// The newest outage row already records this `(path, cause)`: nothing
+    /// was appended, so a stuck tail costs one row, not one per invocation.
+    Duplicate,
+    /// Nothing was written; the reason is operator-facing. The database is
+    /// absent, not bootstrapped, or not at this binary's schema version:
+    /// the recorder never creates, bootstraps or migrates a store.
+    Skipped(String),
+}
+
+fn outage_payload_hash(err: &ForensicTailUnreadable) -> Vec<u8> {
     let preimage = format!(
         "forensic-sink-unavailable|path={}|cause={}",
         err.path.display(),
         err.cause
     );
+    crate::signed_events::payload_hash(preimage.as_bytes())
+}
+
+/// #4199 — append the SIGNED `signed_events` row that attests the forensic
+/// sink is unavailable, and why, unless the newest outage row already
+/// records the same `(path, cause)`. Returns whether a row was appended.
+///
+/// # Errors
+/// Propagates the read or `append_signed_event` error; callers treat this
+/// as best-effort (the degraded boot already happened).
+pub fn emit_forensic_sink_unavailable(
+    conn: &rusqlite::Connection,
+    err: &ForensicTailUnreadable,
+) -> Result<bool> {
+    use crate::signed_events::{
+        SignedEvent, append_signed_event, event_types::FORENSIC_SINK_UNAVAILABLE,
+    };
+    use rusqlite::OptionalExtension;
+    let hash = outage_payload_hash(err);
+    let newest: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT payload_hash FROM signed_events WHERE event_type = ?1 \
+             ORDER BY sequence DESC LIMIT 1",
+            [FORENSIC_SINK_UNAVAILABLE],
+            |r| r.get(0),
+        )
+        .optional()
+        .context("read the newest forensic-sink outage row")?;
+    if newest.as_deref() == Some(hash.as_slice()) {
+        return Ok(false);
+    }
     let event = SignedEvent::with_daemon_signature(
-        payload_hash(preimage.as_bytes()),
+        hash,
         crate::identity::sentinels::DAEMON_PRINCIPAL.to_string(),
         FORENSIC_SINK_UNAVAILABLE.to_string(),
         Utc::now().to_rfc3339(),
         None,
     );
-    append_signed_event(conn, &event)
+    append_signed_event(conn, &event)?;
+    Ok(true)
+}
+
+/// #4199 — record the forensic-sink outage in the database at `db_path`.
+///
+/// The store is opened with the NON-migrating funnel
+/// ([`crate::storage::open_unmigrated`]) and written only when it already
+/// carries this binary's schema version: the recorder runs before the verb,
+/// so it must never be the thing that creates, bootstraps or upgrades a
+/// store. Callers restrict it to the ledger-writing verbs; `doctor` and the
+/// egress / remediation verbs never reach it.
+///
+/// # Errors
+/// An open, probe, read or append failure; best-effort for the caller.
+pub fn record_forensic_sink_unavailable(
+    db_path: &Path,
+    err: &ForensicTailUnreadable,
+) -> Result<OutageRecord> {
+    use crate::storage::schema_guard::SchemaStamp;
+    if !db_path.exists() {
+        return Ok(OutageRecord::Skipped(format!(
+            "no database exists at {} yet",
+            db_path.display()
+        )));
+    }
+    let conn = crate::storage::open_unmigrated(db_path)?;
+    let current = crate::storage::migrations::current_schema_version();
+    match crate::storage::probe_schema_stamp(&conn)? {
+        SchemaStamp::Known(v) if v == current => {}
+        other => {
+            return Ok(OutageRecord::Skipped(format!(
+                "the database at {} is not at this binary's schema version {current} \
+                 ({other:?}); the recorder never migrates a store, so this boot's outage \
+                 is reported only on stderr, by the metric and by `ai-memory doctor`",
+                db_path.display()
+            )));
+        }
+    }
+    Ok(if emit_forensic_sink_unavailable(&conn, err)? {
+        OutageRecord::Recorded
+    } else {
+        OutageRecord::Duplicate
+    })
 }
 
 /// #4199 — what `ai-memory doctor` reports about the forensic log.
@@ -1321,14 +1421,39 @@ pub fn inspect_forensic_tail(dir: &Path) -> ForensicTailReport {
     ForensicTailReport {
         dir: dir.to_path_buf(),
         tail: read_chain_tail_as_of(dir, today).map_err(|e| format!("{e:#}")),
-        future_dated: list_forensic_files(dir)
-            .map(|files| {
-                files
-                    .into_iter()
-                    .filter(|f| is_future_dated(f, today))
-                    .collect()
-            })
-            .unwrap_or_default(),
+        future_dated: future_dated_as_of(dir, today),
+    }
+}
+
+/// #4203 — the forensic files dated after the current UTC day. They are never
+/// the chain tail and are never deleted; a backward clock step across midnight
+/// can make TODAY's file one of them, and the next row then forks from an
+/// earlier day's tail, so the boot path attests them (f2r review of 15fde1499).
+#[must_use]
+pub fn future_dated_forensic_files(dir: &Path) -> Vec<PathBuf> {
+    future_dated_as_of(dir, today_code())
+}
+
+fn future_dated_as_of(dir: &Path, today: i64) -> Vec<PathBuf> {
+    list_forensic_files(dir)
+        .map(|files| {
+            files
+                .into_iter()
+                .filter(|f| is_future_dated(f, today))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// #4203 — the cause string the signed outage row carries for a
+/// future-dated file, distinct from an unreadable tail.
+#[must_use]
+pub fn future_dated_outage(path: &Path) -> ForensicTailUnreadable {
+    ForensicTailUnreadable {
+        path: path.to_path_buf(),
+        cause: "future-dated file skipped: the chain continues from an earlier day, \
+                so rows written while the clock is behind this date may fork"
+            .to_string(),
     }
 }
 
@@ -3654,10 +3779,7 @@ fn try_append_head_anchor(cp: &crate::models::Checkpoint, durable: bool) -> Resu
     let path = dir.join(HEAD_ANCHOR_LOG_FILENAME);
     let created = !path.exists();
     let line = serde_json::to_string(cp).context("serialise head-anchor checkpoint")?;
-    let mut f = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
+    let mut f = open_for_append_line_aligned(&path)
         .with_context(|| format!("open head-anchor log at {}", path.display()))?;
     writeln!(f, "{line}").context("append head-anchor line")?;
     if durable {
@@ -3890,10 +4012,7 @@ pub fn append_restore_sanction(line: &str) -> Result<()> {
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("create witness mount dir {}", dir.display()))?;
     let path = dir.join(RESTORE_SANCTION_LOG_FILENAME);
-    let mut f = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
+    let mut f = open_for_append_line_aligned(&path)
         .with_context(|| format!("open restore-sanction log at {}", path.display()))?;
     writeln!(f, "{line}").context("append restore-sanction line")?;
     Ok(())
@@ -5402,6 +5521,73 @@ mod tests {
         );
         assert_eq!(std::fs::read(&p).unwrap(), b"not a forensic row\n");
         assert!(!is_enabled(), "no sink is installed");
+    }
+
+    fn outage(path: &str, cause: &str) -> ForensicTailUnreadable {
+        ForensicTailUnreadable {
+            path: PathBuf::from(path),
+            cause: cause.to_string(),
+        }
+    }
+
+    fn outage_rows(conn: &rusqlite::Connection) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM signed_events WHERE event_type = ?1",
+            [crate::signed_events::event_types::FORENSIC_SINK_UNAVAILABLE],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// #4199 (f2r review of 15fde1499) — a stuck tail appends ONE row, not
+    /// one per invocation; a different `(path, cause)` is a new outage.
+    #[test]
+    fn outage_row_is_deduplicated_per_path_and_cause_4199() {
+        let tmp = TempDir::new().unwrap();
+        let db = tmp.path().join("m.db");
+        drop(crate::storage::open(&db).unwrap());
+        let a = outage("/x/forensic-2026-07-31.jsonl", "no parseable row");
+        assert_eq!(
+            record_forensic_sink_unavailable(&db, &a).unwrap(),
+            OutageRecord::Recorded
+        );
+        assert_eq!(
+            record_forensic_sink_unavailable(&db, &a).unwrap(),
+            OutageRecord::Duplicate
+        );
+        let b = outage("/x/forensic-2026-07-31.jsonl", "permission denied");
+        assert_eq!(
+            record_forensic_sink_unavailable(&db, &b).unwrap(),
+            OutageRecord::Recorded
+        );
+        let conn = crate::storage::open_unmigrated(&db).unwrap();
+        assert_eq!(outage_rows(&conn), 2);
+    }
+
+    /// #4199 (f2r review of 15fde1499) — the recorder never creates,
+    /// bootstraps or migrates a store: an absent file stays absent and an
+    /// un-bootstrapped one gains no table.
+    #[test]
+    fn outage_recorder_never_creates_or_migrates_a_store_4199() {
+        let tmp = TempDir::new().unwrap();
+        let err = outage("/x/f.jsonl", "unreadable");
+        let absent = tmp.path().join("absent.db");
+        assert!(matches!(
+            record_forensic_sink_unavailable(&absent, &err).unwrap(),
+            OutageRecord::Skipped(_)
+        ));
+        assert!(!absent.exists(), "an absent store is not created");
+        let empty = tmp.path().join("empty.db");
+        std::fs::write(&empty, b"").unwrap();
+        assert!(matches!(
+            record_forensic_sink_unavailable(&empty, &err).unwrap(),
+            OutageRecord::Skipped(_)
+        ));
+        let conn = crate::storage::open_unmigrated(&empty).unwrap();
+        let tables: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sqlite_master", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(tables, 0, "an un-bootstrapped store is not bootstrapped");
     }
 
     #[test]

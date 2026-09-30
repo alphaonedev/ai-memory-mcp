@@ -718,7 +718,9 @@ fn init_forensic_audit(
         return Ok(());
     };
     warn_if_plaintext_retention_requested(&audit_cfg);
-    if let Err(e) = ai_memory::governance::audit::init(dir, signing_key) {
+    let init_result = ai_memory::governance::audit::init(dir, signing_key);
+    report_future_dated_forensic_files(dir, hosts_writers || ledger_writer, db_path);
+    if let Err(e) = init_result {
         use ai_memory::governance::audit as forensic;
         let Some(unavailable) = e.downcast_ref::<forensic::ForensicTailUnreadable>() else {
             eprintln!("ai-memory: forensic audit init failed (continuing unsigned): {e}");
@@ -732,34 +734,100 @@ fn init_forensic_audit(
         eprintln!("{}", forensic::degraded_boot_message(&e));
         tracing::error!(target: "ai_memory::audit", "forensic sink unavailable: {e:#}");
         ai_memory::metrics::inc_forensic_sink_unavailable();
-        record_forensic_outage(db_path, unavailable);
+        // The signed outage row is written only by the verbs that write the
+        // ledger (f2r review of 15fde1499): `doctor`, the egress and
+        // remediation verbs and the read-only verbs must never open, let
+        // alone migrate, the store from here.
+        if hosts_writers || ledger_writer {
+            record_forensic_outage(db_path, unavailable);
+        }
     }
     Ok(())
 }
 
+/// #4203 (f2r review of 15fde1499) — a future-dated forensic file is never
+/// the tail. Reported on every verb (ERROR + metric; `doctor` reports it as
+/// Critical) and, from the ledger-writing verbs only, attested by the same
+/// deduplicated signed outage row, because a backward clock step can make it
+/// the cause of a fork.
+fn report_future_dated_forensic_files(
+    dir: &std::path::Path,
+    record: bool,
+    db_path: &std::path::Path,
+) {
+    use ai_memory::governance::audit as forensic;
+    for file in forensic::future_dated_forensic_files(dir) {
+        eprintln!(
+            "ai-memory: ERROR: forensic file {} is dated after today (UTC); it is never used \
+             as the chain tail and is left in place. Check the system clock.",
+            file.display()
+        );
+        ai_memory::metrics::inc_forensic_sink_unavailable();
+        if record {
+            record_forensic_outage(db_path, &forensic::future_dated_outage(&file));
+        }
+    }
+}
+
 /// #4199 — append the signed `audit.forensic_sink_unavailable` row to the
-/// EXISTING database (best-effort, the egress-refusal precedent). A missing
-/// database file is not created for this: that would plant an orphan store.
+/// EXISTING database (best-effort). The library call opens without migrating,
+/// writes only on a store already at this binary's schema, and appends nothing
+/// when the newest outage row records the same `(path, cause)`.
 fn record_forensic_outage(
     db_path: &std::path::Path,
     err: &ai_memory::governance::audit::ForensicTailUnreadable,
 ) {
-    if !db_path.exists() {
+    use ai_memory::governance::audit::{OutageRecord, record_forensic_sink_unavailable};
+    if process_store_is_postgres() {
         eprintln!(
-            "ai-memory: the forensic-sink outage was NOT recorded in signed_events: \
-             no database exists at {} yet",
-            db_path.display()
+            "ai-memory: the forensic-sink outage was NOT recorded in signed_events: this \
+             process uses a postgres store, whose signed chain this boot-time recorder does \
+             not write; the outage is reported only on stderr, by the metric and by \
+             `ai-memory doctor`"
         );
         return;
     }
-    let outcome = ai_memory::db::open(db_path)
-        .and_then(|conn| ai_memory::governance::audit::emit_forensic_sink_unavailable(&conn, err));
-    if let Err(e) = outcome {
-        eprintln!(
+    match record_forensic_sink_unavailable(db_path, err) {
+        Ok(OutageRecord::Recorded | OutageRecord::Duplicate) => {}
+        Ok(OutageRecord::Skipped(why)) => {
+            eprintln!(
+                "ai-memory: the forensic-sink outage was NOT recorded in signed_events: {why}"
+            );
+        }
+        Err(e) => eprintln!(
             "ai-memory: the forensic-sink outage was NOT recorded in signed_events ({}): {e:#}",
             db_path.display()
-        );
+        ),
     }
+}
+
+/// #4199 (f2r review of 15fde1499) — is this process's store postgres? Checks
+/// the two env channels and any `--store-url` on the command line, whichever
+/// verb carries it: a postgres-backed process must never have its outage
+/// written into a stray local sqlite file instead.
+fn process_store_is_postgres() -> bool {
+    use ai_memory::store_url::{is_postgres_url, resolve_store_url};
+    if resolve_store_url(None)
+        .ok()
+        .flatten()
+        .is_some_and(|u| is_postgres_url(&u))
+    {
+        return true;
+    }
+    let mut args = std::env::args();
+    while let Some(arg) = args.next() {
+        let url = if let Some(value) = arg.strip_prefix("--store-url=") {
+            Some(value.to_string())
+        } else if arg == "--store-url" {
+            args.next()
+        } else {
+            None
+        };
+        if url.is_some_and(|u| is_postgres_url(&u)) {
+            return true;
+        }
+    }
+    false
 }
 
 /// #3647 — `audit.redact_content = false` asks for plaintext retention, which

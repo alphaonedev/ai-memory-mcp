@@ -1109,11 +1109,12 @@ impl Metrics {
         let forensic_sink_unavailable = int_counter(
             &registry,
             "ai_memory_forensic_sink_unavailable_total",
-            "Monotonic count of process starts whose forensic audit sink was \
-             unavailable: the forensic log's chain tail could not be established \
-             (an I/O error, or no parseable row in any non-empty file), so the \
-             process ran WITHOUT the sink instead of forking the signed chain at \
-             genesis. Any non-zero value needs an operator. #4199.",
+            "Monotonic count of forensic-log integrity events at process start: \
+             the chain tail could not be established (an I/O error, or no parseable \
+             row in any non-empty file), so the process ran WITHOUT the sink instead \
+             of forking the signed chain at genesis (#4199); or a forensic file dated \
+             after today was found and skipped (#4203). Any non-zero value needs an \
+             operator.",
             &mut err,
         );
 
