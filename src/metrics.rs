@@ -2022,8 +2022,9 @@ impl AuditTrailCollector {
             )?,
             write_failures: IntCounter::new(
                 crate::audit::AUDIT_WRITE_FAILURES_TOTAL,
-                "Audit events lost to a failed write or flush; any increase means \
-                 the trail has a gap (#3975).",
+                "Audit writes or flushes that failed; each may be a lost event. A \
+                 failed flush whose line reached the file leaves no gap, so run \
+                 `ai-memory audit verify` for the actual gaps (#3975).",
             )?,
             last_write: IntGauge::new(
                 "ai_memory_audit_last_write_seconds",

@@ -2773,8 +2773,9 @@ fn section_audit_trail_3975(
                     ("scope".into(), SCOPE.into()),
                 ],
                 note: (failures > 0).then(|| {
-                    "audit events were LOST in this process (the trail has a gap); \
-                     stderr carries the rate-limited reason"
+                    "audit events may have been LOST in this process (a write or \
+                     flush failed); run `ai-memory audit verify` for the actual \
+                     gaps; stderr carries the rate-limited reason"
                         .into()
                 }),
             }

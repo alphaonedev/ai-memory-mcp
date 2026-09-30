@@ -1323,13 +1323,13 @@ pub fn target_sweep(namespace: impl Into<String>) -> AuditTarget {
 pub struct VerifyReport {
     pub total_lines: u64,
     pub first_failure: Option<VerifyFailure>,
-    /// #4021 — every interior sequence gap, in file order. `try_emit`
-    /// increments the sequence BEFORE it writes, so an event lost to a write
-    /// failure (#3975) leaves a skipped value. A restart reseeds from the file
-    /// tail and makes no gap, so in a single-writer trail a gap is evidence of
-    /// a lost event. The converse does NOT hold: events lost after the last
-    /// written line and before a restart have their numbers reused and leave
-    /// no gap (#4086). The HEAD is checked too (#4191): verify always starts
+    /// #4021 — every sequence gap, in file order. `try_emit` numbers an event
+    /// BEFORE it writes, so an event lost to a write failure (#3975) leaves a
+    /// skipped value; in a single-writer trail a gap is evidence of a lost
+    /// event. A loss at the TAIL just before a restart is a gap too: the #4086
+    /// high-water mark keeps those numbers from being reused, and
+    /// [`verify_chain`] reports the numbers the mark holds past the last
+    /// written line (on an empty trail as well). The HEAD is checked too (#4191): verify always starts
     /// from the genesis anchor, whose sequence is 0, so a genesis-anchored
     /// first line above sequence 1 reports `1..=first-1`, the events lost
     /// before the first successful write.
