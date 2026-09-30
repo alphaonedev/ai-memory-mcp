@@ -34,7 +34,9 @@
 #   outside the charset or shorter than 32 is refused (64) without touching
 #   the file; 9 (#4213) a changed AI_MEMORY_API_KEY rotates the stored key
 #   and, after the restart compose performs (depends_on restart: true), the old
-#   key is refused and the new one accepted.
+#   key is refused and the new one accepted; 10 (#4291) with only a
+#   table-scoped api_key present, init keeps it, restores the top-level key
+#   and reports no rotation.
 #
 # Every service must declare its entrypoint EXPLICITLY (#3838, Codex review):
 # the root Dockerfile sets ENTRYPOINT ["ai-memory"] and Dockerfile.batman-active
@@ -266,4 +268,20 @@ done
 [[ "$(status_with "${API_KEY}")" == 401 ]] || fail "the OLD key still works after rotation (#4213)"
 [[ "$(status_with "${NEW_KEY}")" == 200 ]] || fail "the rotated key is not accepted"
 echo "ok 9 - a changed AI_MEMORY_API_KEY rotates the key: old 401, new 200 (#4213)"
+
+# ---- 10. only the TOP-LEVEL key is the init's to rewrite (#4291) --------------
+# An api_key inside a table is operator config. The #4213 rewrite took the FIRST
+# `^api_key =` line anywhere as "the stored key" and dropped every such line, so
+# with only a table-scoped key present it deleted that key and reported a
+# rotation that did not happen. Leave only a table-scoped key and re-run init:
+# the table key must survive, the top-level key must come back, nothing rotated.
+{ grep -v '^api_key[[:space:]]*=' "${CFG}"; printf '\n[llm]\napi_key = "table-scoped-keep-me"\n'; } > "${T}/cfg.edit"
+cat "${T}/cfg.edit" > "${CFG}"
+env -i "${BASE_ENV[@]}" "${INIT_ENV[@]}" AI_MEMORY_API_KEY="${NEW_KEY}" "${INIT_ARGV[@]}" > "${T}/init-table.log" 2>&1 \
+    || fail "init failed with a table-scoped api_key present: $(tail -10 "${T}/init-table.log")"
+grep -q 'API key rotated' "${T}/init-table.log" && fail "init reported a rotation that did not happen (#4291)"
+grep -q '^api_key = "table-scoped-keep-me"$' "${CFG}" || fail "init dropped the table-scoped api_key (#4291)"
+[[ "$(head -1 "${CFG}")" == "api_key = \"${NEW_KEY}\"" ]] || fail "init did not restore the top-level api_key first (#4291)"
+[[ "$(grep -c '^api_key' "${CFG}")" == 2 ]] || fail "expected one top-level and one table-scoped api_key (#4291)"
+echo "ok 10 - a table-scoped api_key survives init, the top-level key is restored, nothing is reported rotated (#4291)"
 echo "PASS (#3838 compose smoke): the batman-active stack's services run as the container runtime runs them"
