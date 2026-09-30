@@ -393,60 +393,71 @@ pub enum RuleDecision {
 /// Tiny glob: `**` matches across `/`, `*` matches a single
 /// `/`-delimited segment. Exact strings match literally. Empty
 /// pattern matches the empty string only.
+///
+/// A run of two or more `*` is a `**`; a lone `*` matches any run of
+/// non-`/` bytes (possibly empty).
+///
+/// #4042: this is an authorization decision (`Permissions::evaluate`
+/// selects Deny rules with it), so it must be EXACT for patterns that
+/// mix `**` and `*`. The earlier single-checkpoint backtracker dropped
+/// the `**` alternative once a later `*` was reached, so
+/// `**/secret/*` failed to match `a/secret/b/secret/c` and a
+/// configured Deny silently did not apply (fail-open). The matcher is
+/// now a bounded dynamic program over (pattern token, value offset):
+/// `O(|pattern| * |value|)` time, `O(|value|)` space, no recursion,
+/// and it keeps every wildcard alternative alive.
 #[must_use]
 pub fn glob_matches(pattern: &str, value: &str) -> bool {
     glob_inner(pattern.as_bytes(), value.as_bytes())
 }
 
+/// One lexed glob token.
+#[derive(Clone, Copy)]
+enum GlobToken {
+    Literal(u8),
+    /// `*` — any run of non-`/` bytes.
+    Star,
+    /// `**` — any run of bytes, `/` included.
+    DoubleStar,
+}
+
 fn glob_inner(pat: &[u8], val: &[u8]) -> bool {
-    // Iterative backtracker — avoids unbounded recursion on a
-    // pathological pattern but keeps the implementation < 30 LOC.
-    let (mut p, mut v) = (0usize, 0usize);
-    let (mut star_p, mut star_v): (Option<usize>, usize) = (None, 0);
-    let mut star_double = false;
-    while v < val.len() {
-        if p < pat.len() {
-            // `**` greedy across '/'. `*` greedy within a segment.
-            if pat[p] == b'*' {
-                let double = p + 1 < pat.len() && pat[p + 1] == b'*';
-                star_p = Some(p);
-                star_double = double;
-                p += if double { 2 } else { 1 };
-                star_v = v;
-                continue;
+    // `reach[j]` == "the pattern prefix consumed so far matches val[..j]".
+    let mut reach = vec![false; val.len() + 1];
+    reach[0] = true;
+    let mut next = vec![false; val.len() + 1];
+    let mut p = 0usize;
+    while p < pat.len() {
+        let token = if pat[p] == b'*' {
+            let run = pat[p..].iter().take_while(|b| **b == b'*').count();
+            p += run;
+            if run >= 2 {
+                GlobToken::DoubleStar
+            } else {
+                GlobToken::Star
             }
-            if pat[p] == val[v] {
-                p += 1;
-                v += 1;
-                continue;
-            }
+        } else {
+            p += 1;
+            GlobToken::Literal(pat[p - 1])
+        };
+        next[0] = match token {
+            GlobToken::Literal(_) => false,
+            GlobToken::Star | GlobToken::DoubleStar => reach[0],
+        };
+        for j in 1..=val.len() {
+            let byte = val[j - 1];
+            next[j] = match token {
+                GlobToken::Literal(c) => reach[j - 1] && byte == c,
+                GlobToken::Star => reach[j] || (next[j - 1] && byte != b'/'),
+                GlobToken::DoubleStar => reach[j] || next[j - 1],
+            };
         }
-        // Mismatch: reset to last star and advance value cursor.
-        if let Some(sp) = star_p {
-            // `*` may not consume a '/' — '**' may.
-            if !star_double && val[star_v] == b'/' {
-                return false;
-            }
-            star_v += 1;
-            // Walking past '/' under single-star also fails.
-            if !star_double && star_v <= val.len() && {
-                // Check: if a '/' lies between star_v-1 and star_v we
-                // already failed above; here we just reset cursors.
-                false
-            } {
-                return false;
-            }
-            p = sp + if star_double { 2 } else { 1 };
-            v = star_v;
-            continue;
+        std::mem::swap(&mut reach, &mut next);
+        if !reach.iter().any(|r| *r) {
+            return false;
         }
-        return false;
     }
-    // Trailing pattern must be all '*' / '**'.
-    while p < pat.len() && pat[p] == b'*' {
-        p += 1;
-    }
-    p == pat.len()
+    reach[val.len()]
 }
 
 /// Specificity score for a glob. Higher = more specific. Used as
@@ -1073,6 +1084,77 @@ mod tests {
         assert!(glob_matches("ai:*", "ai:claude-1"));
         // single-star may not eat '/' — namespace segments preserved.
         assert!(!glob_matches("foo/*", "foo/bar/baz"));
+    }
+
+    /// #4042 red-first: patterns that mix `**` and `*` must keep the
+    /// earlier `**` alternative alive. Each row is (pattern, value, expected).
+    #[test]
+    fn glob_4042_mixed_wildcard_table() {
+        let table: &[(&str, &str, bool)] = &[
+            // The reported defect: `**` must absorb `a/secret/b`.
+            ("**/secret/*", "a/secret/b/secret/c", true),
+            ("**/secret/*", "a/secret/c", true),
+            ("**/secret/*", "secret/c", false),
+            ("**/secret/*", "x/secret/c/d", false),
+            ("**/secret/*", "a/public/c", false),
+            ("a/**/b/*", "a/x/b/y/b/z", true),
+            ("a/**/b/*", "a/b/z", false),
+            ("a/**/b/*", "a//b/z", true),
+            ("a/**/b/*", "a/x/b/y/z", false),
+            ("**/x/*/y/**", "p/x/q/x/r/y/s", true),
+            ("**/x/*/y/**", "p/x/q/r/y/s", false),
+            // Byte-literal semantics: `**` does not absorb its neighbouring
+            // `/`s, so `*/**/*` needs two separators (unchanged behaviour).
+            ("*/**/*", "a/b", false),
+            ("*/**/*", "a//b", true),
+            ("*/**/*", "a/b/c/d", true),
+            ("*/**/*", "ab", false),
+            ("**x*", "a/bxc", true),
+            ("**x*", "a/bxc/d", false),
+            ("**x*/d", "a/xb/xc/d", true),
+            ("*x*", "a/x", false),
+            ("***", "a/b", true),
+            ("a*", "a/b", false),
+            ("a**", "a/b", true),
+            ("", "", true),
+            ("*", "", true),
+            ("**", "", true),
+            ("a/*", "a/", true),
+        ];
+        for (pat, val, want) in table {
+            assert_eq!(
+                glob_matches(pat, val),
+                *want,
+                "glob_matches({pat:?}, {val:?}) must be {want}"
+            );
+        }
+    }
+
+    /// #4042 red-first: a configured Enforce Deny with a mixed-wildcard
+    /// namespace pattern must apply to a namespace it covers.
+    #[test]
+    fn glob_4042_mixed_pattern_deny_rule_applies() {
+        let r = rule("**/secret/*", "memory_store", "*", RuleDecision::Deny);
+        let covered = Permissions::evaluate_with(
+            &ctx(Op::MemoryStore, "a/secret/b/secret/c", "ai:claude"),
+            &[],
+            std::slice::from_ref(&r),
+            PermissionsMode::Enforce,
+        );
+        assert!(
+            matches!(covered, Decision::Deny(_)),
+            "Deny rule must apply to a covered namespace, got {covered:?}"
+        );
+        let control = Permissions::evaluate_with(
+            &ctx(Op::MemoryStore, "a/public/b", "ai:claude"),
+            &[],
+            &[r],
+            PermissionsMode::Enforce,
+        );
+        assert!(
+            matches!(control, Decision::Allow),
+            "non-covered namespace must stay Allow, got {control:?}"
+        );
     }
 
     #[test]
