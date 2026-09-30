@@ -301,10 +301,10 @@ if ((HARNESS_SELF_TEST)); then
     hrc=$?
     left=""
     for q in "${gdecl[@]}"; do [[ -e "$q" ]] && left="${left} ${q}"; done
-    if [[ -z "$left" && "$(porcelain)" == "$st_before" ]] && ((hrc != 0)); then
+    if [[ -z "$left" && "$(porcelain)" == "$st_before" ]] && ((hrc == 143)); then
       echo "ok ${st_n} - F2: SIGTERM during the sentinel phase (${planted}) left the tree unchanged (rc=${hrc})"
     else
-      echo "not ok ${st_n} - F2: SIGTERM during the sentinel phase stranded:${left:- (tree changed)} (rc=${hrc})"
+      echo "not ok ${st_n} - F2: SIGTERM during the sentinel phase stranded:${left:- (nothing)} or did not die of the signal (rc=${hrc}, want 143)"
       st_fail=$((st_fail + 1))
       # Leave the tree as found: only files carrying the harness's sentinel mark.
       for q in "${gdecl[@]}"; do
