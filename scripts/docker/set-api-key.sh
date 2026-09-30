@@ -32,11 +32,47 @@ set -euo pipefail
 
 cfg=${1:?usage: set-api-key.sh <config.toml>}
 : "${AI_MEMORY_API_KEY:?AI_MEMORY_API_KEY must be set}"
+
+# The key rules are enforced HERE, not only by the compose init, so the script
+# is safe on its own: the charset keeps the key a plain TOML basic string (no
+# quote, backslash or whitespace can break out of it), checked in the C locale
+# (#3838 L8), and at least 32 characters. Refused before the file is read.
+export LC_ALL=C
+case "$AI_MEMORY_API_KEY" in
+  '' | *[!A-Za-z0-9._~+/=-]*)
+    echo "set-api-key: AI_MEMORY_API_KEY must be non-empty and use only [A-Za-z0-9._~+/=-]; ${1} not changed" >&2
+    exit 64
+    ;;
+esac
+if ((${#AI_MEMORY_API_KEY} < 32)); then
+  echo "set-api-key: AI_MEMORY_API_KEY must be at least 32 characters (e.g. openssl rand -hex 32); ${1} not changed" >&2
+  exit 64
+fi
 want="api_key = \"${AI_MEMORY_API_KEY}\""
 
 refuse() {
   echo "set-api-key: ${cfg}: $1; not rewriting it (#4291). Put the top-level api_key on one line, before any table." >&2
   exit 64
+}
+
+# The VALUE of a one-line top-level `api_key = ...` line: a basic ("...") or
+# literal ('...') string, followed only by whitespace or a comment. Prints
+# nothing when the line is not that shape (it is then never "the same key").
+key_value() {
+  local rest=${1#*=}
+  rest=${rest#"${rest%%[![:space:]]*}"}
+  local quote=${rest:0:1} body tail
+  case "$quote" in
+    \" | \') ;;
+    *) return 0 ;;
+  esac
+  body=${rest:1}
+  [[ $body == *"$quote"* ]] || return 0
+  tail=${body#*"$quote"}
+  body=${body%%"$quote"*}
+  tail=${tail#"${tail%%[![:space:]]*}"}
+  [[ -z $tail || $tail == \#* ]] || return 0
+  printf '%s' "$body"
 }
 
 # Occurrences of $2 in $1.
@@ -101,8 +137,12 @@ if ((top == 1)); then
   ((depth == 0)) || refuse "a multi-line array is never closed"
 fi
 
-# Already right: exactly one top-level key, and it is the wanted one.
-if [ "$have" = "$want" ] && ((${#drop[@]} == 1)); then
+# Already right: exactly one top-level key, holding the wanted VALUE in any
+# valid spelling (spacing, quote style, trailing comment). The file is left
+# exactly as it is and nothing is reported (f2r, #4291).
+have_value=""
+[ -z "$have" ] || have_value=$(key_value "$have")
+if [ -n "$have" ] && [ "$have_value" = "$AI_MEMORY_API_KEY" ] && ((${#drop[@]} == 1)); then
   exit 0
 fi
 
@@ -118,6 +158,6 @@ fi
   } >"$cfg.new"
 )
 mv "$cfg.new" "$cfg"
-if [ -n "$have" ] && [ "$have" != "$want" ]; then
+if [ -n "$have" ] && [ "$have_value" != "$AI_MEMORY_API_KEY" ]; then
   echo "init-batman: API key rotated (the services restart with it: depends_on restart: true)"
 fi

@@ -96,6 +96,48 @@ run_case "unterminated multi-line string: refused (64), file untouched" \
   "${old_line}"$'\nnote = """\nnever closed\n' \
   "${old_line}"$'\nnote = """\nnever closed\n' 64 no
 
+# 9-13. (f2r, #4291 CR) The SAME key in any valid TOML spelling is not a
+# rotation: nothing reported, the file left exactly as it was.
+same_key_cases=(
+  "no spaces|api_key=\"${NEW_KEY}\""
+  "single quotes|api_key = '${NEW_KEY}'"
+  "trailing comment|api_key = \"${NEW_KEY}\"  # rotated by ops, keep"
+  "wide spacing|api_key    =    \"${NEW_KEY}\""
+  "indented|  api_key = \"${NEW_KEY}\""
+)
+for c in "${same_key_cases[@]}"; do
+  run_case "same key, ${c%%|*}: no rotation, file untouched" \
+    "${c#*|}"$'\ntier = "autonomous"\n' \
+    "${c#*|}"$'\ntier = "autonomous"\n' 0 no
+done
+
+# 14-16. (f2r, #4291 CR) The script enforces the key rules itself, not only
+# the compose init: outside the charset, or shorter than 32, refuses (64) and
+# leaves the file untouched.
+refuse_case() {
+  local name=$1 key=$2
+  case_no=$((case_no + 1))
+  local cfg="$T/case${case_no}.toml" out rc got
+  printf '%s' "${old_line}"$'\n' >"$cfg"
+  out=$(AI_MEMORY_API_KEY="$key" bash "$SCRIPT" "$cfg" 2>&1)
+  rc=$?
+  got=$(cat "$cfg")
+  if [[ $rc == 64 && "$got" == "${old_line}" ]]; then
+    echo "ok ${case_no} - ${name}"
+  else
+    echo "not ok ${case_no} - ${name}: exit=${rc} (want 64), file ${got}"
+    failures=$((failures + 1))
+  fi
+}
+refuse_case "key shorter than 32 is refused (64), file untouched" "short-key-0123456789"
+refuse_case "key with a double quote is refused (64), file untouched" "has\"quote-0123456789abcdef0123456789abcdef"
+refuse_case "key with a space is refused (64), file untouched" "has space-0123456789abcdef0123456789abcdef"
+
+# 17. Control: a real change in one of those spellings IS a rotation.
+run_case "different key written with single quotes: rotated" \
+  "api_key = '${OLD_KEY}'"$'\ntier = "autonomous"\n' \
+  "${want_line}"$'\ntier = "autonomous"\n' 0 yes
+
 echo "1..${case_no}"
 if ((failures > 0)); then
   echo "FAIL: ${failures} of ${case_no} case(s) failed (#4291)" >&2
