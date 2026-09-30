@@ -33,8 +33,11 @@ name: ai-memory-plan-c
 #
 # Operator recreate (after binary rebuild or schema migration):
 #
-#   docker compose -f infra/plan-c/docker-compose.yml down -v
-#   docker compose -f infra/plan-c/docker-compose.yml up -d --build
+#   docker compose -f infra/plan-c/docker-compose.yml up -d --build --force-recreate
+#
+# This preserves the named signing-key, audit and TLS volumes. Back them up
+# before upgrading. Volume deletion (down --volumes) is a destructive full
+# teardown only: it permanently discards identities, audit history and TLS.
 #
 # Healthcheck: each container probes its own `/api/v1/capabilities`
 # every 10s; once all three are healthy the mesh is ready for write

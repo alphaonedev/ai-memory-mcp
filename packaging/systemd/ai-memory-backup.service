@@ -8,10 +8,10 @@ After=ai-memory.service
 Type=oneshot
 User=ai-memory
 Group=ai-memory
+Environment=AI_MEMORY_DB=/var/lib/ai-memory/ai-memory.db
+WorkingDirectory=/var/lib/ai-memory
 # The backup CLI takes a snapshot via SQLite's `VACUUM INTO` (hot-backup-safe)
 # and writes a manifest.json alongside it. --keep rotates oldest snapshots.
-# Landing PR: backup CLI lands separately in v0.6.0.0; this unit is wired
-# up ready for it and is a no-op if the CLI subcommand is absent.
 ExecStart=/usr/bin/ai-memory backup --to /var/lib/ai-memory/backups --keep 48
 # Optional off-box push via AWS SDK — uncomment and set env if desired.
 # ExecStartPost=/usr/bin/ai-memory backup push --remote s3://my-bucket/ai-memory/
@@ -38,7 +38,7 @@ SystemCallFilter=@system-service
 SystemCallFilter=~@mount @swap @reboot @obsolete
 CapabilityBoundingSet=
 AmbientCapabilities=
-ReadWritePaths=/var/lib/ai-memory/backups
-ReadOnlyPaths=/var/lib/ai-memory/ai-memory.db
+# The backup opener also writes WAL/SHM and migration/watermark state.
+ReadWritePaths=/var/lib/ai-memory
 
 TimeoutStartSec=15min
