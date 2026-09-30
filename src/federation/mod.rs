@@ -56,6 +56,10 @@
 /// message?" decision, which wakes the local inbox bus so a cross-host
 /// recipient does not wait for its backstop poll.
 pub(crate) mod applied_wake;
+/// v1.0.0 #4033 — the ONE byte-capped reader for every peer response body
+/// (the `/sync/since` pulls and the `/sync/push` fanout / DLQ replay / bulk
+/// catch-up lanes).
+pub mod capped_body;
 /// v1.0.0 #2672 — typed, peer-unforgeable push-DLQ error class (replaces the
 /// steerable `last_error LIKE '%429%'` substring classifier that a peer could
 /// steer with a count containing `429`).
