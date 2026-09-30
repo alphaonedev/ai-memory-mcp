@@ -457,10 +457,17 @@ fn pure_merge_is_associative_on_distinct_clocks_4031() {
 
 // ------------------------------------------- #4031 (visibility: scope) ---
 
+/// An absent or explicit `private` scope: owner-only visibility.
+fn owner_private(metadata: &Value) -> bool {
+    metadata.get("scope").is_none_or(|s| s == "private")
+}
+
 /// `metadata.scope` is authorization-bearing (an absent / `private` scope is
 /// owner-only, `collective` is broad). `A{scope=collective}@t1`,
 /// `B{scope=private}@t2`, `C{no scope}@t3`: every delivery order must converge
-/// on B's NEWER `private` — pre-#4031 the order A, C, B kept `collective`.
+/// on an OWNER-PRIVATE row — pre-#4031 the order A, C, B kept `collective`.
+/// (Since the f2r review the newest row's ABSENCE of `scope` is itself a
+/// versioned value, so the converged row carries no scope: owner-private.)
 fn scope_rows(id: &str, ns: &str, peer: &str) -> [Value; 3] {
     let mut a = row(id, ns, peer, "2026-09-26T01:00:00Z", "same text");
     a["metadata"]["scope"] = json!("collective");
@@ -489,11 +496,11 @@ async fn scope_never_widens_by_delivery_order(backend: &Backend) {
             n.push(&peer, &rows[i]).await;
         }
         let got = n.read(&id).await;
-        assert_eq!(
-            got.metadata.get("scope"),
-            Some(&json!("private")),
+        assert!(
+            owner_private(&got.metadata),
             "#4031: delivery order {order:?} let an older `collective` scope override the \
-             newer `private` one"
+             newer owner-private state: {}",
+            got.metadata
         );
     }
 }
@@ -505,57 +512,56 @@ async fn sqlite_scope_never_widens_by_delivery_order_4031() {
 }
 
 /// The per-field clock map is bound to the row clock it was minted at. A row
-/// whose retained `scope=private` carries a recorded (older) version, then is
-/// edited locally to `collective` (t4) and back to `private` (t5) by a
-/// read-modify-write client that round-trips the map verbatim, must keep
-/// `private` when the stale t4 `collective` row is replayed later. Without
-/// the binding the t5 `private` matched its old fingerprint and resurrected
-/// the t1 version, so the replay WIDENED the row's visibility.
+/// whose retained `k=v1` carries a recorded (older) version, then is edited
+/// locally to `v2` (t4) and back to `v1` (t5) by a read-modify-write client
+/// that round-trips the map verbatim, must keep `v1` when the stale t4 `v2`
+/// row is replayed later. Without the binding the t5 `v1` matched its old
+/// fingerprint and resurrected the t1 version, so the replay won. (First
+/// found on `scope`; since the f2r review the visibility keys are
+/// absence-versioned, so the retained-old-version precondition is exercised
+/// on an ordinary key.)
 fn aba_rows() -> (Memory, Memory) {
     use ai_memory::models::merge_memory;
     let mut x: Memory =
         serde_json::from_value(row("x", "n", "ai:p", "2026-09-26T01:00:00Z", "t")).expect("m");
-    x.metadata["scope"] = json!("private");
+    x.metadata["k"] = json!("v1");
     let y: Memory =
         serde_json::from_value(row("x", "n", "ai:p", "2026-09-26T03:00:00Z", "t")).expect("m");
-    // M@t3 retains scope=private with its t1 version recorded in the map.
+    // M@t3 retains k=v1 with its t1 version recorded in the map.
     let merged = merge_memory(&x, &y);
     assert!(
         merged.metadata.get("crdt_field_clocks").is_some(),
-        "precondition: the merge recorded the retained scope's own version"
+        "precondition: the merge recorded the retained value's own version"
     );
-    let mut edit_collective = merged.clone();
-    edit_collective.metadata["scope"] = json!("collective");
-    edit_collective.updated_at = "2026-09-26T04:00:00Z".to_string();
-    let mut edit_private = edit_collective.clone();
-    edit_private.metadata["scope"] = json!("private");
-    edit_private.updated_at = "2026-09-26T05:00:00Z".to_string();
-    (edit_private, edit_collective)
+    let mut edit_v2 = merged.clone();
+    edit_v2.metadata["k"] = json!("v2");
+    edit_v2.updated_at = "2026-09-26T04:00:00Z".to_string();
+    let mut edit_back = edit_v2.clone();
+    edit_back.metadata["k"] = json!("v1");
+    edit_back.updated_at = "2026-09-26T05:00:00Z".to_string();
+    (edit_back, edit_v2)
 }
 
 #[test]
 fn pure_edited_back_value_never_resurrects_an_old_version_4031() {
     use ai_memory::models::merge_memory;
-    let (newest_private, stale_collective) = aba_rows();
-    for m in [
-        merge_memory(&newest_private, &stale_collective),
-        merge_memory(&stale_collective, &newest_private),
-    ] {
+    let (newest, stale) = aba_rows();
+    for m in [merge_memory(&newest, &stale), merge_memory(&stale, &newest)] {
         assert_eq!(
-            m.metadata.get("scope"),
-            Some(&json!("private")),
-            "a stale replay of the intermediate `collective` edit beat the owner's newest `private`"
+            m.metadata.get("k"),
+            Some(&json!("v1")),
+            "a stale replay of the intermediate edit beat the owner's newest value"
         );
     }
 }
 
-async fn edited_back_scope_survives_a_stale_replay(backend: &Backend) {
+async fn edited_back_value_survives_a_stale_replay(backend: &Backend) {
     let peer = uniq("ai:peer-4031a");
     let ns = uniq("fit-4031a");
     let _posture = Posture::new(&peer, &ns);
     let n = node(backend).await;
     let id = uniq("m4031a");
-    let (newest_private, stale_collective) = aba_rows();
+    let (newest, stale) = aba_rows();
     let wire = |m: &Memory| -> Value {
         let mut v = serde_json::to_value(m).expect("serialize");
         v["id"] = json!(id);
@@ -564,19 +570,19 @@ async fn edited_back_scope_survives_a_stale_replay(backend: &Backend) {
         v["metadata"]["agent_id"] = json!(peer);
         v
     };
-    n.push(&peer, &wire(&newest_private)).await;
-    n.push(&peer, &wire(&stale_collective)).await;
+    n.push(&peer, &wire(&newest)).await;
+    n.push(&peer, &wire(&stale)).await;
     assert_eq!(
-        n.read(&id).await.metadata.get("scope"),
-        Some(&json!("private")),
-        "the replayed stale `collective` row widened a row the owner made private"
+        n.read(&id).await.metadata.get("k"),
+        Some(&json!("v1")),
+        "the replayed stale row beat the owner's newest edit"
     );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn sqlite_edited_back_scope_survives_a_stale_replay_4031() {
+async fn sqlite_edited_back_value_survives_a_stale_replay_4031() {
     let _g = FED_ENV_LOCK.lock().await;
-    edited_back_scope_survives_a_stale_replay(&Backend::Sqlite).await;
+    edited_back_value_survives_a_stale_replay(&Backend::Sqlite).await;
 }
 
 /// The #4032 bounded metadata fallback keeps only the row-LWW winner's
@@ -586,14 +592,17 @@ async fn sqlite_edited_back_scope_survives_a_stale_replay_4031() {
 fn pure_bounded_metadata_fallback_never_widens_scope_4032() {
     use ai_memory::models::merge_memory;
     let big = "x".repeat(300 * 1024);
-    let mut x: Memory =
-        serde_json::from_value(row("x", "n", "ai:p", "2026-09-26T01:00:00Z", "t")).expect("m");
-    x.metadata["scope"] = json!("collective");
-    x.metadata["big_a"] = json!(big);
-    let y: Memory =
-        serde_json::from_value(row("x", "n", "ai:p", "2026-09-26T03:00:00Z", "t")).expect("m");
-    // The winner W@t3 carries `collective` retained at its t1 version.
-    let winner = merge_memory(&x, &y);
+    // The winner W@t3 carries `collective` whose OWN version (per its clock
+    // map) is t1: the row-LWW winner holding an older visibility value.
+    let collective_fp = blake3::hash(b"\"collective\"").to_hex().as_str()[..16].to_string();
+    let winner = mem_at(
+        "2026-09-26T03:00:00Z",
+        json!({"scope": "collective", "big_a": big, "crdt_field_clocks": {
+            "v": 1,
+            "row": "2026-09-26T03:00:00.000000Z",
+            "leaf": {"/scope": ["2026-09-26T01:00:00.000000Z", collective_fp]}
+        }}),
+    );
     let mut loser: Memory =
         serde_json::from_value(row("x", "n", "ai:p", "2026-09-26T02:00:00Z", "t")).expect("m");
     loser.metadata["scope"] = json!("private");
@@ -732,6 +741,208 @@ fn pure_repeated_joins_stay_bounded_and_convergent_4032() {
     assert_eq!(f.len(), ai_memory::validate::MAX_REPLICATED_TAGS);
 }
 
+// ------------------------- f2r review: visibility absence + forged floors ---
+
+/// A pure `Memory` from [`row`] with the given metadata.
+fn mem_at(updated_at: &str, metadata: Value) -> Memory {
+    let mut m: Memory =
+        serde_json::from_value(row("x", "n", "ai:alice", updated_at, "t")).expect("memory");
+    m.metadata = metadata;
+    m
+}
+
+/// The two visibility-absence cases: `(newer, stale, dropped key)`. The owner
+/// made the row private by DROPPING `scope` (absent = owner-private), and
+/// revoked a share by dropping `target_agent_id`; a stale peer row still
+/// carries the broad value.
+fn absence_cases() -> [(Value, Value, &'static str); 2] {
+    [
+        (
+            json!({"agent_id": "ai:alice"}),
+            json!({"agent_id": "ai:alice", "scope": "collective"}),
+            "scope",
+        ),
+        (
+            json!({"agent_id": "ai:alice", "scope": "private"}),
+            json!({"agent_id": "ai:alice", "scope": "private", "target_agent_id": "ai:bob"}),
+            "target_agent_id",
+        ),
+    ]
+}
+
+#[test]
+fn pure_newer_absence_of_a_visibility_key_beats_a_stale_presence() {
+    use ai_memory::models::merge_memory;
+    for (newer, stale, key) in absence_cases() {
+        let newer = mem_at("2026-09-26T02:00:00Z", newer);
+        let stale = mem_at("2026-09-26T01:00:00Z", stale);
+        for m in [merge_memory(&newer, &stale), merge_memory(&stale, &newer)] {
+            assert!(
+                m.metadata.get(key).is_none(),
+                "a stale `{key}` resurrected over the owner's newer removal: {}",
+                m.metadata
+            );
+        }
+        // A genuinely NEWER presence still wins over an older absence.
+        let mut later = stale.clone();
+        later.updated_at = "2026-09-26T03:00:00Z".to_string();
+        assert!(merge_memory(&newer, &later).metadata.get(key).is_some());
+    }
+}
+
+#[test]
+fn pure_visibility_absence_joins_associatively() {
+    use ai_memory::models::merge_memory;
+    // A{scope=collective}@t1, B{}@t2 (owner dropped scope), C{scope=team}@t3
+    // omitted from half the groupings: every grouping ends with B's absence
+    // until C's newer value arrives.
+    let a = mem_at("2026-09-26T01:00:00Z", json!({"scope": "collective"}));
+    let b = mem_at("2026-09-26T02:00:00Z", json!({}));
+    let c = mem_at("2026-09-26T03:00:00Z", json!({"note": "unrelated"}));
+    let groupings = [
+        merge_memory(&merge_memory(&a, &b), &c),
+        merge_memory(&merge_memory(&a, &c), &b),
+        merge_memory(&a, &merge_memory(&c, &b)),
+        merge_memory(&merge_memory(&c, &a), &b),
+    ];
+    for m in &groupings {
+        assert!(
+            m.metadata.get("scope").is_none(),
+            "grouping kept the stale collective scope: {}",
+            m.metadata
+        );
+        assert_eq!(m.metadata.get("note"), Some(&json!("unrelated")));
+    }
+}
+
+/// A forged floor: H@t3 carries no `prefs` at all, only a clock map claiming a
+/// scalar superseded `/prefs` at t3. It must not erase L's nested object.
+fn forged_floor_rows() -> (Memory, Memory) {
+    let local = mem_at("2026-09-26T02:00:00Z", json!({"prefs": {"x": 1, "y": 2}}));
+    let forged = mem_at(
+        "2026-09-26T03:00:00Z",
+        json!({"crdt_field_clocks": {
+            "v": 1,
+            "row": "2026-09-26T03:00:00.000000Z",
+            "floor": {"/prefs": "2026-09-26T03:00:00.000000Z"}
+        }}),
+    );
+    (local, forged)
+}
+
+#[test]
+fn pure_forged_floor_cannot_erase_a_nested_object() {
+    use ai_memory::models::merge_memory;
+    let (local, forged) = forged_floor_rows();
+    for m in [merge_memory(&local, &forged), merge_memory(&forged, &local)] {
+        assert_eq!(
+            m.metadata.get("prefs"),
+            Some(&json!({"x": 1, "y": 2})),
+            "a peer-forged floor erased a nested object the peer never held"
+        );
+    }
+}
+
+#[test]
+fn pure_inconsistent_clock_map_keeps_the_join_idempotent() {
+    use ai_memory::models::merge_memory;
+    // H@9 {a:{b:"x"}} with floor /a=9 and leaf /a/b=3: the floor contradicts a
+    // descendant H itself carries (an honest merge would have pruned it).
+    // The leaf carries the value's real fingerprint (16 hex of blake3 over
+    // the canonical JSON), so it is honoured.
+    let x_fp = blake3::hash(b"\"x\"").to_hex().as_str()[..16].to_string();
+    let h = mem_at(
+        "2026-09-26T09:00:00Z",
+        json!({"a": {"b": "x"}, "crdt_field_clocks": {
+            "v": 1,
+            "row": "2026-09-26T09:00:00.000000Z",
+            "floor": {"/a": "2026-09-26T09:00:00.000000Z"},
+            "leaf": {"/a/b": ["2026-09-26T03:00:00.000000Z", x_fp]}
+        }}),
+    );
+    let hh = merge_memory(&h, &h);
+    assert_eq!(hh.metadata.get("a"), Some(&json!({"b": "x"})), "H v H != H");
+    // Honest outputs are byte-idempotent, clock map included.
+    let honest = merge_memory(
+        &mem_at("2026-09-26T01:00:00Z", json!({"o": {"x": 1}, "k": "old"})),
+        &mem_at("2026-09-26T02:00:00Z", json!({"o": 5})),
+    );
+    let honest = merge_memory(
+        &honest,
+        &mem_at("2026-09-26T03:00:00Z", json!({"o": {"y": 2}})),
+    );
+    assert_eq!(merge_memory(&honest, &honest).metadata, honest.metadata);
+}
+
+async fn visibility_absence_survives_a_stale_replay(backend: &Backend) {
+    let peer = uniq("ai:peer-f2r");
+    let ns = uniq("fit-f2r");
+    let _posture = Posture::new(&peer, &ns);
+    for (newer, stale, key) in absence_cases() {
+        for stale_first in [false, true] {
+            let n = node(backend).await;
+            let id = uniq("mvis");
+            let wire = |meta: &Value, ts: &str| -> Value {
+                let mut v = row(&id, &ns, &peer, ts, "same text");
+                let mut meta = meta.clone();
+                meta["agent_id"] = json!(peer);
+                v["metadata"] = meta;
+                v
+            };
+            let newer_row = wire(&newer, "2026-09-26T02:00:00Z");
+            let stale_row = wire(&stale, "2026-09-26T01:00:00Z");
+            let order = if stale_first {
+                [&stale_row, &newer_row]
+            } else {
+                [&newer_row, &stale_row]
+            };
+            for r in order {
+                n.push(&peer, r).await;
+            }
+            let got = n.read(&id).await;
+            assert!(
+                got.metadata.get(key).is_none(),
+                "stale `{key}` widened the row (stale_first={stale_first}): {}",
+                got.metadata
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sqlite_visibility_absence_survives_a_stale_replay_f2r() {
+    let _g = FED_ENV_LOCK.lock().await;
+    visibility_absence_survives_a_stale_replay(&Backend::Sqlite).await;
+}
+
+async fn forged_floor_is_refused(backend: &Backend) {
+    let peer = uniq("ai:peer-f2rf");
+    let ns = uniq("fit-f2rf");
+    let _posture = Posture::new(&peer, &ns);
+    let n = node(backend).await;
+    let id = uniq("mfloor");
+    let (local, forged) = forged_floor_rows();
+    for m in [&local, &forged] {
+        let mut v = serde_json::to_value(m).expect("serialize");
+        v["id"] = json!(id);
+        v["namespace"] = json!(ns);
+        v["title"] = json!(format!("merge convergence probe {id}"));
+        v["metadata"]["agent_id"] = json!(peer);
+        n.push(&peer, &v).await;
+    }
+    assert_eq!(
+        n.read(&id).await.metadata.get("prefs"),
+        Some(&json!({"x": 1, "y": 2})),
+        "a forged clock-map floor erased the stored nested object"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sqlite_forged_floor_is_refused_f2r() {
+    let _g = FED_ENV_LOCK.lock().await;
+    forged_floor_is_refused(&Backend::Sqlite).await;
+}
+
 // ---------------------------------------------------------- postgres -----
 
 #[cfg(feature = "sal-postgres")]
@@ -774,10 +985,26 @@ mod pg {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "needs AI_MEMORY_TEST_POSTGRES_URL"]
-    async fn pg_edited_back_scope_survives_a_stale_replay_4031() {
+    async fn pg_edited_back_value_survives_a_stale_replay_4031() {
         let _g = FED_ENV_LOCK.lock().await;
         let Some(backend) = pg_backend() else { return };
-        edited_back_scope_survives_a_stale_replay(&backend).await;
+        edited_back_value_survives_a_stale_replay(&backend).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs AI_MEMORY_TEST_POSTGRES_URL"]
+    async fn pg_visibility_absence_survives_a_stale_replay_f2r() {
+        let _g = FED_ENV_LOCK.lock().await;
+        let Some(backend) = pg_backend() else { return };
+        visibility_absence_survives_a_stale_replay(&backend).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs AI_MEMORY_TEST_POSTGRES_URL"]
+    async fn pg_forged_floor_is_refused_f2r() {
+        let _g = FED_ENV_LOCK.lock().await;
+        let Some(backend) = pg_backend() else { return };
+        forged_floor_is_refused(&backend).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

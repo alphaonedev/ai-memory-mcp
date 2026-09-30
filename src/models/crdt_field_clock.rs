@@ -3,7 +3,22 @@
 
 //! v1.0.0 #4030 / #4031 — the temporal order and the PER-FIELD clocks the
 //! CRDT-lite merge ([`super::crdt_merge::merge_memory`]) needs to be a real
-//! join (commutative, associative, idempotent on distinct clocks).
+//! join (commutative, associative, idempotent on distinct clocks — on the
+//! merged VALUES; see `crdt_merge`'s module docs for the equal-clock
+//! residuals and why the clock-map BYTES are not convergent).
+//!
+//! **The clock map is untrusted input (f2r review).** A peer ships its map
+//! inside `metadata`. Leaves are honoured only while the value still has the
+//! recorded fingerprint and are capped at the carrying row's clock (a forged
+//! leaf can only make the forger's own value lose); floors are honoured only
+//! where they are consistent with the values the same side carries (see
+//! `Side::retain_consistent_floors`), so a forged floor cannot prune the
+//! other side's nested objects, and `H v H == H` holds for any `H`.
+//!
+//! **Persisted representation.** The map is stored inside the row's
+//! `metadata` JSON (sqlite `metadata` TEXT, postgres `metadata` JSONB): no
+//! new column or schema version. It replicates with the row on every
+//! federation lane and is visible to readers of `metadata`.
 //!
 //! # #4030 — one instant order for every timestamp the merge compares
 //!
@@ -80,6 +95,9 @@ const CLOCKS_V: &str = "v";
 /// whose `row` differs from the carrying row's clock is stale (a local write
 /// happened since the merge that minted it) and is ignored whole.
 const CLOCKS_ROW: &str = "row";
+/// Fingerprint recorded for a versioned ABSENCE of a visibility key (never a
+/// 16-hex-digit value fingerprint, so it cannot collide with one).
+const ABSENT_FP: &str = "absent";
 /// Path prefix of an optional TOP-LEVEL field (never collides with a
 /// metadata JSON-pointer path, which always starts with `/`).
 const FIELD_PATH_PREFIX: char = '#';
@@ -263,10 +281,74 @@ struct Side {
 impl Side {
     fn of(metadata: &Value, updated_at: &str, rank: u8) -> Self {
         let row = row_ver(updated_at);
-        Self {
+        let mut side = Self {
             clocks: Clocks::parse(metadata, row),
             row,
             rank,
+        };
+        side.retain_consistent_floors(metadata);
+        side
+    }
+
+    /// f2r review — a peer-supplied clock map is UNTRUSTED structure. A floor
+    /// records that a scalar superseded the subtree at `path`; it is honoured
+    /// only where it is consistent with the values this same side carries:
+    ///
+    /// * the path must exist in this side's metadata (a floor at a path the
+    ///   sender does not hold would prune the OTHER side's subtree — a forged
+    ///   erasure of a nested object the sender never wrote);
+    /// * at an object, every descendant must be at least as new as the floor
+    ///   (an honest merge pruned anything older, so an older descendant
+    ///   proves the floor forged — and honouring it broke `H v H == H`);
+    /// * at a scalar, the floor cannot exceed the scalar's own version.
+    ///
+    /// An inconsistent floor is dropped (the value keeps the version the
+    /// leaves / row clock give it), never an error.
+    fn retain_consistent_floors(&mut self, metadata: &Value) {
+        let floors = std::mem::take(&mut self.clocks.floor);
+        for (path, at) in floors {
+            let at_capped = at.min(self.row);
+            let Some(v) = path
+                .starts_with('/')
+                .then(|| metadata.pointer(&path))
+                .flatten()
+            else {
+                continue;
+            };
+            let consistent = match v {
+                Value::Object(map) => map.iter().all(|(k, child)| {
+                    self.subtree_at_least(&child_path(&path, k), child, at_capped)
+                }),
+                scalar => at_capped <= self.own_ver(&path, scalar),
+            };
+            if consistent {
+                self.clocks.floor.insert(path, at);
+            }
+        }
+    }
+
+    /// No node of the subtree rooted at `path` would be pruned by a floor of
+    /// `min` (the exact survival rule of `merge_object_or_flip`): a scalar
+    /// survives when its own version is at least `min`; an object when every
+    /// child survives and it is not an EMPTY object older than `min`.
+    fn subtree_at_least(&self, path: &str, v: &Value, min: Ver) -> bool {
+        match v {
+            Value::Object(m) => {
+                (!m.is_empty() || self.own_ver(path, v) >= min)
+                    && m.iter()
+                        .all(|(k, c)| self.subtree_at_least(&child_path(path, k), c, min))
+            }
+            scalar => self.own_ver(path, scalar) >= min,
+        }
+    }
+
+    /// The version of the ABSENCE of a visibility key at `path`: its recorded
+    /// version when the clock map carries an absence entry there (capped at
+    /// the row clock), else the row clock — the row was written without it.
+    fn absent_ver(&self, path: &str) -> Ver {
+        match self.clocks.leaf.get(path) {
+            Some((at, fp)) if fp == ABSENT_FP => (*at).min(self.row),
+            _ => self.row,
         }
     }
 
@@ -496,26 +578,89 @@ impl FieldClockMerge {
 
     /// #4031 — merge the generic (non-special) top-level metadata keys of
     /// both sides. `skip` names the keys the caller resolves itself.
+    ///
+    /// f2r review — the `absence_versioned` keys (the visibility keys) treat
+    /// ABSENCE as a value with its own version: a key missing from a side was
+    /// removed (or never set) as of that side's clock, so a NEWER absence
+    /// beats an OLDER presence. For `scope` absence means owner-private and
+    /// for `target_agent_id` / `recipient_agent_id` it means "not shared", so
+    /// the preservation rule ("absence is never a deletion") would let a
+    /// stale peer row re-widen a row its owner narrowed. Every other key
+    /// keeps the #224 preservation rule.
     pub(super) fn merge_metadata_keys(
         &mut self,
         local: &Map<String, Value>,
         remote: &Map<String, Value>,
         skip: &[&str],
+        absence_versioned: &[&str],
     ) -> Map<String, Value> {
-        let mut keys: Vec<&String> = local.keys().chain(remote.keys()).collect();
-        keys.sort();
+        let mut keys: Vec<&str> = local
+            .keys()
+            .chain(remote.keys())
+            .map(String::as_str)
+            .chain(absence_versioned.iter().copied())
+            .collect();
+        keys.sort_unstable();
         keys.dedup();
         let mut out = Map::new();
         for key in keys {
-            if skip.contains(&key.as_str()) {
+            if skip.contains(&key) {
                 continue;
             }
             let path = child_path("", key);
-            if let Some(m) = self.merge_node(&path, local.get(key), remote.get(key), None) {
-                out.insert(key.clone(), m.value);
+            let (l, r) = (local.get(key), remote.get(key));
+            let merged = if absence_versioned.contains(&key) && (l.is_none() || r.is_none()) {
+                self.merge_register_with_absence(&path, l, r)
+            } else {
+                self.merge_node(&path, l, r, None)
+            };
+            if let Some(m) = merged {
+                out.insert(key.to_string(), m.value);
             }
         }
         out
+    }
+
+    /// A top-level key as an LWW register whose values include ABSENCE (at
+    /// least one side lacks it). Order: `(version, attestation rank,
+    /// absent-first, fingerprint)` — at an exactly equal version and rank the
+    /// ABSENCE wins, so an equal-clock collision fails CLOSED (narrower).
+    fn merge_register_with_absence(
+        &mut self,
+        path: &str,
+        l: Option<&Value>,
+        r: Option<&Value>,
+    ) -> Option<Merged> {
+        let cand = |side: &Side, v: Option<&Value>| match v {
+            Some(v) => (side.node_ver(path, v), side.rank, 0_u8, fingerprint(v)),
+            None => (
+                side.absent_ver(path),
+                side.rank,
+                1_u8,
+                ABSENT_FP.to_string(),
+            ),
+        };
+        let lc = cand(&self.local, l);
+        let rc = cand(&self.remote, r);
+        let floor = max_opt(self.local.floor(path), self.remote.floor(path));
+        self.record_floor(path, floor);
+        let (winner, value) = if rc > lc { (rc, r) } else { (lc, l) };
+        let ver = winner.0;
+        match value {
+            Some(v) => {
+                let value = v.clone();
+                self.record(path, &value, ver);
+                Some(Merged { value, ver })
+            }
+            None => {
+                if ver < self.row_out {
+                    self.out
+                        .leaf
+                        .insert(path.to_string(), (ver, ABSENT_FP.to_string()));
+                }
+                None
+            }
+        }
     }
 
     /// #4031 — "present beats absent, else the newer value" for an optional

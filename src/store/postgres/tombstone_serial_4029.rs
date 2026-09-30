@@ -26,8 +26,9 @@
 //!   admissions never block each other.
 //! * **erasure** (`pg_tombstone_and_erase_in_tx` for delete /
 //!   `apply_remote_deletion`, the `forget` reap, TTL/byte-cap eviction):
-//!   SHARED global + EXCLUSIVE stripe locks for its ids (ascending, so two
-//!   erasures cannot cycle), or — for a bulk erasure spanning more than
+//!   SHARED global + EXCLUSIVE stripe locks for its ids (taken in ascending
+//!   stripe order, so two erasures that take ONLY these locks cannot cycle on
+//!   them), or — for a bulk erasure spanning more than
 //!   [`BULK_STRIPE_THRESHOLD`] stripes — ONE EXCLUSIVE global lock, keeping
 //!   the lock-table footprint of any transaction bounded.
 //!
@@ -37,9 +38,29 @@
 //! and then SEES the tombstone (READ COMMITTED: a statement issued after the
 //! lock is granted reads everything committed before it). The rare genuine
 //! same-id race where an erasure locks AFTER its `DELETE` resolves as a
-//! PostgreSQL deadlock (`40P01`): one side aborts whole, nothing half-applies,
-//! and the erasure funnels retry through `tx_retry`. Fail closed, never a
-//! live row beside its tombstone.
+//! PostgreSQL deadlock (`40P01`): one side aborts whole, nothing half-applies.
+//! Fail closed, never a live row beside its tombstone.
+//!
+//! # Residuals (stated precisely)
+//!
+//! * **Erasure vs erasure of one id can also end in `40P01`.** `forget` and
+//!   the GC / eviction reaps take ROW locks (their `DELETE`) BEFORE the
+//!   advisory lock, while `apply_remote_deletion` (via
+//!   `pg_tombstone_and_erase_in_tx`) takes the stripe lock first; the
+//!   ascending-stripe order does not cover that row-lock-then-stripe
+//!   interleaving. The outcome is benign — one erasure aborts whole and the
+//!   other completes the erasure — but only the funnels wrapped in `tx_retry`
+//!   (`forget`, `run_gc`, `size_gc`, `delete`) retry by themselves: `apply_remote_deletion`
+//!   is NOT in `tx_retry`, so its aborted attempt surfaces as a failed apply
+//!   and is re-driven by the federation redelivery (push DLQ / catch-up), by
+//!   which time the id is already tombstoned (an idempotent no-op).
+//! * **Key spaces.** These locks use the TWO-key form
+//!   (`pg_advisory_xact_lock(int4, int4)`); the adapter's other advisory locks
+//!   use the one-key `bigint` form. PostgreSQL keeps the two forms in one lock
+//!   table, so a one-key `hashtext(..)` value can coincide with a
+//!   `(TOMBSTONE_LOCK_CLASS, stripe)` pair. The only possible effect is a
+//!   spurious WAIT between unrelated transactions (never a missed exclusion,
+//!   never a wrong result).
 //!
 //! The stripe function is FIXED (FNV-1a, 32-bit): every daemon sharing one
 //! database must derive the same key for the same id.
@@ -49,8 +70,8 @@ use std::collections::BTreeSet;
 type PgTx<'a> = sqlx::Transaction<'a, sqlx::Postgres>;
 
 /// First key of the two-key advisory lock space ("AMTB" — ai-memory
-/// tombstone). The two-key space never overlaps the one-key `hashtext(..)`
-/// locks the rest of the adapter takes.
+/// tombstone). See the module residuals: a one-key `hashtext(..)` lock can
+/// coincide with a key here, costing at most a spurious wait.
 const TOMBSTONE_LOCK_CLASS: i32 = 0x414D_5442;
 /// Number of per-id lock stripes.
 const STRIPES: u32 = 1024;

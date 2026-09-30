@@ -87,6 +87,30 @@
 //! resolve through the full per-path join, so the residual never changes who
 //! can read a row.
 //!
+//! **Equal-clock residuals (extend #344; stated precisely).** Every claim
+//! above is for operands with DISTINCT `(updated_at, attest_rank)`. The `id`
+//! tie-break is inert inside `merge_memory` (both operands share the id), so
+//! at an exactly equal `(updated_at, attest_rank)`:
+//! * the metadata bounded fallback is NOT commutative — neither side "wins"
+//!   the row-LWW order, so the LOCAL operand's ordinary keys are kept in
+//!   both argument orders (`L@5{k1}` vs `R@5{k2}` keeps `k1` on L's node and
+//!   `k2` on R's);
+//! * an object/scalar flip at the same microsecond is not associative (the
+//!   flip is decided by `(version, rank, fingerprint)`, and which floor is
+//!   recorded depends on grouping);
+//! * the visibility keys fail CLOSED at a tie: an absence beats a presence
+//!   at equal `(version, rank)`; two different PRESENT values tie-break on
+//!   their fingerprint (deterministic, not "most restrictive").
+//!
+//! **Clock-map bytes are not convergent.** The merged VALUES converge; the
+//! reserved `metadata.crdt_field_clocks` object can differ in BYTES between
+//! replicas that joined the same rows in different groupings:
+//! a leaf is recorded only when a retained value is older than that join's
+//! row clock, and floors are recorded per join. Anything that compares whole
+//! metadata objects to detect a USER edit (for example the #4216 merge
+//! version bump) MUST exclude `crdt_field_clocks` and `version_vector`, or it
+//! will report a change no user made.
+//!
 //! ## Metadata sub-rules (#224 + Task 1.8 #196)
 //!
 //! `metadata` is a deep JSON merge (objects merge key-wise recursively;
@@ -95,8 +119,14 @@
 //!
 //! * `metadata.agent_id` — **immutable, original (`local`) wins**
 //!   (NHI provenance is write-once; a peer must not rewrite it).
-//! * `metadata.scope` — ordinary per-key LWW (#4031: by the key's own
-//!   version; a conscious visibility change, like `title`).
+//! * `metadata.scope`, `metadata.target_agent_id`,
+//!   `metadata.recipient_agent_id` (the visibility keys) — per-key LWW by the
+//!   key's own version (#4031), where ABSENCE is a versioned value too (f2r
+//!   review): an owner makes a row private by dropping `scope` and revokes a
+//!   share by dropping `target_agent_id`, so a NEWER absence beats an OLDER
+//!   presence. This is the one deliberate exception to "absence is never a
+//!   deletion": preserving a stale visibility value would re-widen a row its
+//!   owner narrowed.
 //! * `metadata.governance` — **keep `local`'s** (owner-only override; a
 //!   merge must never let a peer rewrite governance).
 //! * `metadata.version_vector` — **pointwise-max [`VectorClock`] merge**
@@ -512,7 +542,7 @@ fn merge_metadata(
             (lmap, &r_bounded)
         }
     };
-    let mut map = clocks.merge_metadata_keys(lgen, rgen, &skip);
+    let mut map = clocks.merge_metadata_keys(lgen, rgen, &skip, &VISIBILITY_METADATA_KEYS);
 
     // agent_id — immutable, original (local) wins. Write-once NHI
     // provenance (Task 1.8 #196): a peer must never rewrite it. Local never
@@ -667,8 +697,8 @@ fn resolve_clocked_fields(local: &Memory, remote: &Memory, bounded: bool) -> Clo
 ///
 /// Pure: no I/O, no clock reads. Commutative + associative (up to the
 /// `(updated_at, id)` LWW total order) + idempotent — except past the #4032
-/// metadata byte cap, where the bounded fallback is commutative but not
-/// associative (see the module docs).
+/// metadata byte cap, where the bounded fallback is commutative (for distinct
+/// `(updated_at, attest_rank)`) but not associative (see the module docs).
 #[must_use]
 pub fn merge_memory(local: &Memory, remote: &Memory) -> Memory {
     debug_assert_eq!(
@@ -680,7 +710,8 @@ pub fn merge_memory(local: &Memory, remote: &Memory) -> Memory {
     // field keeps the version it was written at, never the merged row's.
     // #4032 — the joined metadata is bounded by the REPLICATED-state cap the
     // receivers validate against; past it the join degrades deterministically
-    // to the row-LWW winner's metadata (commutative, never unrelayable).
+    // to the row-LWW winner's metadata (commutative for distinct clocks, never
+    // unrelayable; see the module docs for the equal-clock residual).
     let mut clocked = resolve_clocked_fields(local, remote, false);
     if metadata_exceeds_replicated_cap(&clocked.metadata) {
         tracing::warn!(
