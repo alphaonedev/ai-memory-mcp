@@ -420,6 +420,26 @@ count, so an acknowledgement can never become a blanket pass, and any later
 gap fails again. A listed range that matches no gap is reported on stderr, so
 a stale acknowledgement left in a cron line stays visible.
 
+**A write that fails part-way leaves no glued line (#4211).** A record and its
+newline go out as one buffer through one write. When the write fails
+part-way (a disk that fills mid-record writes some bytes, then reports
+ENOSPC), the bytes it left are removed: every ai-memory writer holds an
+exclusive lock on the trail around each append, and the leftover is
+truncated only when it is provably that write's own (a prefix of the record
+it was writing). The trail is then exactly as it was, and the lost event is
+an ordinary gap. If only the newline was missing, the line is finished and
+the event was not lost at all.
+
+When the leftover cannot be removed (the append-only OS flag set by
+`append_only_hint` refuses truncation; on macOS that is the default), the next
+record starts its own line instead of being glued onto it, and `verify`
+reports the leftover as `TornRecord`: never clean and not acknowledgeable,
+but the chain is checked ACROSS it (the next record must chain to the one
+before the torn line), so every later record is still verified and the lost
+event is still reported as a gap. An unparseable line that the chain does NOT
+pass around (a record replaced by garbage, or garbage at the end of the file)
+is still the `Parse` failure it always was.
+
 **A loss at the tail before a restart is a gap too (#4086).** A restart used
 to resume numbering from the last event WRITTEN, so the numbers of events lost
 after that write were reused and no gap ever appeared. The trail now keeps a
