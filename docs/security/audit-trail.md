@@ -792,7 +792,7 @@ while the daemon keeps serving. Every such loss is now counted and reported:
 
 | Signal | Meaning |
 |---|---|
-| `ai_memory_audit_write_failures_total` | Events lost to a failed write or flush. **Any increase is a gap in the trail.** |
+| `ai_memory_audit_write_failures_total` | Writes or flushes that failed. **Each may be a lost event**: a failed flush whose line did reach the file leaves no gap, and neither does a record whose newline was finished after a failed write (#4211). Run `ai-memory audit verify` for the actual gaps. |
 | `ai_memory_audit_records_written_total` | Events written and flushed without error. |
 | `ai_memory_audit_last_write_seconds` | UNIX time of the last successful write. Absent until the first write. |
 | `ai_memory_audit_trail_active` | `1` when a trail is recording in the process, `0` when auditing is off. |
