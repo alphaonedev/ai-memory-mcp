@@ -319,7 +319,10 @@ fn writer_failure(what: &str, path: &Path, e: &std::io::Error) {
 }
 
 /// [`writer_failure`] against given accounting and clock: counts the row and
-/// returns the stderr line when one is due.
+/// returns the stderr line when one is due. The per-row event is DEBUG only:
+/// `serve` and `mcp` route tracing to stderr, so a per-row ERROR was the very
+/// flood the rate limit exists to stop (f2r on #4310). The ERROR goes out with
+/// the rate-limited line.
 fn writer_failure_with(
     stats: &crate::logging::DeliveryStats,
     now_unix_ms: u64,
@@ -327,19 +330,21 @@ fn writer_failure_with(
     path: &Path,
     e: &std::io::Error,
 ) -> Option<String> {
-    tracing::error!(
+    tracing::debug!(
         target: AUDIT_TRACE_TARGET,
         "forensic: {what} {} failed: {e}",
         path.display()
     );
     crate::metrics::inc_forensic_sink_unavailable();
     stats.record_failure(now_unix_ms).map(|suppressed| {
-        format!(
+        let line = format!(
             "ai-memory: the forensic audit log dropped a row: {what} {} failed: {e} \
              ({suppressed} further rows dropped since the previous report; every one is \
              counted in ai_memory_forensic_sink_unavailable_total) (#4302)",
             path.display()
-        )
+        );
+        tracing::error!(target: AUDIT_TRACE_TARGET, "{line}");
+        line
     })
 }
 
@@ -5927,6 +5932,65 @@ mod tests {
             writer_failure_with(&stats, t0 + 60_001, "appending to", path, &err).is_none(),
             "and the limit holds again"
         );
+    }
+
+    /// Captures formatted tracing output (no ANSI, no timestamps).
+    #[derive(Clone, Default)]
+    struct CapturedLines(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for CapturedLines {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLines {
+        type Writer = CapturedLines;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+    /// Run `f` under a DEBUG-level capturing subscriber; returns the
+    /// (ERROR, DEBUG) line counts it produced.
+    fn count_error_and_debug_lines(f: impl FnOnce()) -> (usize, usize) {
+        let sink = CapturedLines::default();
+        let buf = sink.0.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(sink)
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        let text = String::from_utf8_lossy(
+            &buf.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+        .into_owned();
+        let count = |level: &str| text.lines().filter(|l| l.contains(level)).count();
+        (count("ERROR"), count("DEBUG"))
+    }
+
+    /// #4310 (f2r B1) — the tracing ERROR is rate-limited too. `serve` and
+    /// `mcp` route tracing to stderr, so a per-row ERROR was the flood itself.
+    /// Red on ed111a9eb: 10 ERROR lines for 10 dropped rows.
+    #[test]
+    fn dropped_rows_log_one_error_per_interval_not_per_row_4310() {
+        let stats = crate::logging::DeliveryStats::default();
+        let path = Path::new("/nonexistent/forensic-2026-07-31.jsonl");
+        let err = std::io::Error::from_raw_os_error(30);
+        let (errors, debugs) = count_error_and_debug_lines(|| {
+            for i in 0..10 {
+                let _ = writer_failure_with(&stats, 1_000_000 + i, "appending to", path, &err);
+            }
+        });
+        assert_eq!(errors, 1, "one ERROR per interval, not one per row");
+        assert_eq!(debugs, 10, "every dropped row is still traced, at DEBUG");
     }
 
     /// #4304 — a row and its newline go out in ONE write call.
