@@ -206,10 +206,20 @@ fn writer() -> anyhow::Result<&'static Sender<WriteOp>> {
 /// own (skipped) line and the new row stays parseable. Every append-only log
 /// here opens through this one helper, so no appender can skip the rule.
 fn open_for_append_line_aligned(path: &Path) -> std::io::Result<File> {
-    let mut f = open_forensic_file(
+    let f = open_forensic_file(
         OpenOptions::new().create(true).read(true).append(true),
         path,
     )?;
+    align_to_line_end(&f)?;
+    Ok(f)
+}
+
+/// #4205 — the line-alignment rule itself, shared by every append-only log
+/// (the forensic appenders above and the flat audit trail's torn-write
+/// fallback, #4211): when `f` is non-empty and its last byte is not `\n`,
+/// write one `\n` so the next record starts its own line. `f` must be open
+/// for reading and appending.
+pub(crate) fn align_to_line_end(mut f: &File) -> std::io::Result<()> {
     let len = f.metadata()?.len();
     if len > 0 {
         let mut last = [0u8; 1];
@@ -219,7 +229,7 @@ fn open_for_append_line_aligned(path: &Path) -> std::io::Result<File> {
             f.write_all(b"\n")?;
         }
     }
-    Ok(f)
+    Ok(())
 }
 
 /// #4273 — open a forensic log file WITHOUT following a symbolic link and
