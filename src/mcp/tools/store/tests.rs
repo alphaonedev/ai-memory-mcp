@@ -768,6 +768,48 @@ fn k9_deny_rule_short_circuits_store() {
     assert!(err.contains("denied"), "got: {err}");
 }
 
+/// #4042 red-first: a Deny rule whose namespace pattern mixes `**` and
+/// `*` must refuse an MCP store into a namespace it covers, and no row
+/// may be inserted. Control: a sibling namespace the pattern does NOT
+/// cover still stores.
+#[test]
+fn k9_4042_mixed_wildcard_deny_rule_refuses_store_and_inserts_nothing() {
+    use crate::permissions::{PermissionRule, RuleDecision, set_active_permission_rules};
+    let _g = rules_scope();
+    set_active_permission_rules(vec![PermissionRule {
+        namespace_pattern: "k9mix/**/secret/*".to_string(),
+        op: "memory_store".to_string(),
+        agent_pattern: "*".to_string(),
+        decision: RuleDecision::Deny,
+        reason: Some("blocked".to_string()),
+    }]);
+    let conn = fresh_conn();
+    let db_path = db_path();
+    let ttl = ResolvedTtl::default();
+    let mut params = base_params("mixed-deny");
+    params["namespace"] = json!("k9mix/a/secret/b/secret/c");
+    let err = handle_store(
+        &conn, &db_path, &params, None, None, None, &ttl, false, None, None, None,
+    )
+    .expect_err("a covered namespace must be denied");
+    assert!(err.contains("denied"), "got: {err}");
+    let rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM memories WHERE namespace = 'k9mix/a/secret/b/secret/c'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("count");
+    assert_eq!(rows, 0, "a denied store must insert no row");
+
+    let mut control = base_params("mixed-allow");
+    control["namespace"] = json!("k9mix/a/public/b");
+    handle_store(
+        &conn, &db_path, &control, None, None, None, &ttl, false, None, None, None,
+    )
+    .expect("a namespace the pattern does not cover must store");
+}
+
 #[test]
 fn k9_ask_rule_returns_ask_envelope_for_store() {
     use crate::permissions::{PermissionRule, RuleDecision, set_active_permission_rules};
