@@ -249,11 +249,30 @@ fn open_forensic_file(options: &mut OpenOptions, path: &Path) -> std::io::Result
         }
         Err(e) => return Err(e),
     };
-    if !file.metadata()?.is_file() {
+    let meta = file.metadata()?;
+    if !meta.is_file() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!("forensic log file {} is not a regular file", path.display()),
         ));
+    }
+    // #4305 — a HARD link is a regular file, so the checks above accept it,
+    // and every append then also lands under a second name that can sit
+    // outside the audit directory. Nothing in ai-memory hard-links these
+    // files, so a link count above one is refused like a symlink.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if meta.nlink() > 1 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "forensic log file {} has {} hard links; it is never used through a second name",
+                    path.display(),
+                    meta.nlink()
+                ),
+            ));
+        }
     }
     Ok(file)
 }
@@ -261,6 +280,34 @@ fn open_forensic_file(options: &mut OpenOptions, path: &Path) -> std::io::Result
 /// #4273 — [`open_forensic_file`] for reading.
 fn open_forensic_file_for_read(path: &Path) -> std::io::Result<File> {
     open_forensic_file(OpenOptions::new().read(true), path)
+}
+
+/// #4302 — a row the background writer could not persist. It was a trace
+/// line only, so a sink that stopped writing after start-up (a remount, a full
+/// disk) looked healthy. Now it is counted in
+/// `ai_memory_forensic_sink_unavailable_total` and said on stderr too.
+fn writer_failure(what: &str, path: &Path, e: &std::io::Error) {
+    tracing::error!(
+        target: AUDIT_TRACE_TARGET,
+        "forensic: {what} {} failed: {e}",
+        path.display()
+    );
+    crate::metrics::inc_forensic_sink_unavailable();
+    let _ = writeln!(
+        std::io::stderr(),
+        "ai-memory: the forensic audit log dropped a row: {what} {} failed: {e} (#4302)",
+        path.display()
+    );
+}
+
+/// #4304 — append one row and its newline in ONE write. `writeln!` issued
+/// them as two syscalls, and a concurrent appender to the same daily file
+/// could land between them and glue two rows onto one line.
+fn append_record<W: Write>(w: &mut W, line: &str) -> std::io::Result<()> {
+    let mut record = String::with_capacity(line.len() + 1);
+    record.push_str(line);
+    record.push('\n');
+    w.write_all(record.as_bytes())
 }
 
 /// Drain loop for the background writer. Keeps the destination file open
@@ -285,23 +332,15 @@ fn run_writer(rx: Receiver<WriteOp>) {
                         match open_for_append_line_aligned(&path) {
                             Ok(file) => open_file = Some((path, file)),
                             Err(e) => {
-                                tracing::error!(
-                                    target: AUDIT_TRACE_TARGET,
-                                    "forensic: opening {} failed: {e}",
-                                    path.display()
-                                );
+                                writer_failure("opening", &path, &e);
                                 open_file = None;
                                 continue;
                             }
                         }
                     }
                     if let Some((path, file)) = open_file.as_mut() {
-                        if let Err(e) = writeln!(file, "{line}") {
-                            tracing::error!(
-                                target: AUDIT_TRACE_TARGET,
-                                "forensic: appending to {} failed: {e}",
-                                path.display()
-                            );
+                        if let Err(e) = append_record(file, &line) {
+                            writer_failure("appending to", &path, &e);
                         } else {
                             needs_flush = true;
                         }
@@ -1088,6 +1127,13 @@ pub fn init_audit_signers(signing_key: Option<&SigningKey>) {
 pub fn init(dir: &Path, signing_key: Option<SigningKey>) -> Result<()> {
     std::fs::create_dir_all(dir)
         .with_context(|| format!("creating forensic audit dir {}", dir.display()))?;
+    // #4302 (r1 B2 on #4272) — prove the sink can WRITE before it is up. A
+    // read-only directory or daily file (chmod, a read-only mount) used to boot
+    // "with the sink" while the background writer dropped every row with only
+    // a trace line: no metric, no doctor signal, no refusal under
+    // AI_MEMORY_REQUIRE_FORENSIC_SINK. Now it is an init error, which the boot
+    // path turns into the outage signals, or exit 78 under require-mode.
+    probe_forensic_writable(dir, &Utc::now())?;
     // #4199 — only a genuinely empty chain starts at genesis; an unavailable
     // tail is an error: no sink, never a fork (see `read_chain_tail`).
     let last_hash = read_chain_tail(dir)?.unwrap_or_else(|| CHAIN_HEAD_PREV_HASH.to_string());
@@ -1116,6 +1162,25 @@ pub fn init(dir: &Path, signing_key: Option<SigningKey>) -> Result<()> {
     let _ = writer()?.send(WriteOp::Reset);
     *guard = Some(new_sink);
     Ok(())
+}
+
+/// #4302 — prove the forensic sink can append: the directory accepts a new
+/// file (a probe file, removed again; never a `forensic-*` name, so the tail
+/// walk never sees it) and today's daily file, when it already exists, opens
+/// for append. Nothing is written to a forensic file.
+fn probe_forensic_writable(dir: &Path, now: &DateTime<Utc>) -> Result<()> {
+    crate::log_paths::probe_dir_writable(dir).map_err(|e| {
+        tail_unreadable(dir, format!("the forensic directory is not writable: {e}"))
+    })?;
+    let today = daily_path(dir, now);
+    match open_forensic_file(OpenOptions::new().append(true), &today) {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(tail_unreadable(
+            &today,
+            format!("today's forensic file is not writable: {e}"),
+        )),
+    }
 }
 
 /// Tear down the sink (test-only convenience).
@@ -1511,16 +1576,29 @@ pub struct ForensicTailReport {
     /// Files dated after the current UTC day (#4203): never the tail, never
     /// deleted, always reported.
     pub future_dated: Vec<PathBuf>,
+    /// #4302 — why the sink could NOT append, `None` when it can: the
+    /// directory accepts a new file and today's file, if present, opens for
+    /// append. A directory that does not exist yet is `None`: boot creates
+    /// it, and a failure to create it is its own error.
+    pub not_writable: Option<String>,
 }
 
 /// #4199 / #4203 — inspect the forensic directory the way [`init`] would.
 #[must_use]
 pub fn inspect_forensic_tail(dir: &Path) -> ForensicTailReport {
     let today = today_code();
+    let not_writable = if dir.exists() {
+        probe_forensic_writable(dir, &Utc::now())
+            .err()
+            .map(|e| format!("{e:#}"))
+    } else {
+        None
+    };
     ForensicTailReport {
         dir: dir.to_path_buf(),
         tail: read_chain_tail_as_of(dir, today).map_err(|e| format!("{e:#}")),
         future_dated: future_dated_as_of(dir, today),
+        not_writable,
     }
 }
 
@@ -1593,7 +1671,10 @@ fn is_future_dated(path: &Path, today: i64) -> bool {
 /// - the walk goes newest to oldest and takes the last parseable row of the
 ///   first file that has one (#4202). A torn or unparseable last LINE is
 ///   skipped, as it always was;
-/// - `Ok(None)` (genesis) only when no file holds a non-blank line;
+/// - `Ok(None)` (genesis) only when no file holds a non-blank line, future-dated
+///   files INCLUDED: when only future-dated files hold rows the chain exists
+///   but cannot be continued, which is a [`ForensicTailUnreadable`] error, not
+///   a second genesis (r1 B1 on #4203);
 /// - an I/O error, or non-empty files with no parseable row anywhere, is a
 ///   [`ForensicTailUnreadable`] error.
 ///
@@ -1615,6 +1696,11 @@ fn read_chain_tail(dir: &Path) -> Result<Option<String>> {
 fn read_chain_tail_as_of(dir: &Path, today: i64) -> Result<Option<String>> {
     let files = list_forensic_files(dir).map_err(|e| tail_unreadable(dir, format!("{e:#}")))?;
     let mut unparseable: Option<&PathBuf> = None;
+    // #4203 (r1 B1): future-dated files are never the tail, but one that holds
+    // rows proves a chain exists, so it must never let the walk fall through
+    // to "no chain" (genesis), which would fork it. Read only when no
+    // present-dated file holds the tail.
+    let mut future: Vec<&PathBuf> = Vec::new();
     for file in files.iter().rev() {
         if is_future_dated(file, today) {
             tracing::error!(
@@ -1623,6 +1709,7 @@ fn read_chain_tail_as_of(dir: &Path, today: i64) -> Result<Option<String>> {
                 "forensic: a file dated after today is never the chain tail; it is left in \
                  place as evidence (#4203)"
             );
+            future.push(file);
             continue;
         }
         match read_file_tail(file)? {
@@ -1639,13 +1726,22 @@ fn read_chain_tail_as_of(dir: &Path, today: i64) -> Result<Option<String>> {
             }
         }
     }
-    match unparseable {
-        Some(path) => Err(tail_unreadable(
+    if let Some(path) = unparseable {
+        return Err(tail_unreadable(
             path,
             "non-empty forensic files exist but none holds a parseable row",
-        )),
-        None => Ok(None),
+        ));
     }
+    for path in future {
+        if read_file_tail(path)? != FileTail::Empty {
+            return Err(tail_unreadable(
+                path,
+                "only files dated after today hold forensic rows; starting a chain at genesis \
+                 would fork it (#4203)",
+            ));
+        }
+    }
+    Ok(None)
 }
 
 /// The tail of one file: the bounded suffix read, else the exact scan.
@@ -3939,8 +4035,15 @@ fn off_table_head_anchor_present() -> bool {
     let Ok(dir) = witness_key_dir() else {
         return false;
     };
-    let path = dir.join(HEAD_ANCHOR_LOG_FILENAME);
-    match File::open(&path) {
+    anchor_log_has_a_line(&dir.join(HEAD_ANCHOR_LOG_FILENAME))
+}
+
+/// [`off_table_head_anchor_present`] on one path. #4303 — opened never
+/// through a link and never blocking on a FIFO (a FIFO here hung every db
+/// open). A refused or unreadable file is an error other than `NotFound`, so
+/// it reads as a surviving anchor (fail closed).
+fn anchor_log_has_a_line(path: &Path) -> bool {
+    match open_forensic_file_for_read(path) {
         Ok(f) => BufReader::new(f)
             .lines()
             .any(|l| l.is_ok_and(|s| !s.trim().is_empty())),
@@ -4003,7 +4106,8 @@ fn scan_head_anchor_log(db_id: Option<&str>) -> AnchorScan {
         return AnchorScan::Unpinnable;
     };
     let enrolled_bytes = enrolled.to_bytes();
-    let Ok(f) = File::open(&path) else {
+    // #4303 — never through a link, never blocking on a FIFO.
+    let Ok(f) = open_forensic_file_for_read(&path) else {
         return AnchorScan::NoPinnedLines;
     };
     let mut high: Option<i64> = None;
@@ -4160,7 +4264,9 @@ fn restore_sanction_clears(anchored_head: i64, db_head: i64, db_id: Option<&str>
         return false;
     };
     let path = dir.join(RESTORE_SANCTION_LOG_FILENAME);
-    let Ok(f) = File::open(&path) else {
+    // #4303 — never through a link, never blocking on a FIFO. A refused file
+    // grants no sanction.
+    let Ok(f) = open_forensic_file_for_read(&path) else {
         return false;
     };
     for line in BufReader::new(f).lines() {
@@ -5592,6 +5698,214 @@ mod tests {
         assert!(future.exists(), "evidence is never deleted");
         let report = inspect_forensic_tail(tmp.path());
         assert_eq!(report.future_dated, vec![future]);
+    }
+
+    /// r1 B1 on #4203 — when ONLY future-dated files hold rows, a chain
+    /// exists and cannot be continued: an error, never genesis (a genesis
+    /// row today would fork it). Red on 823cc4c13: `Ok(None)`.
+    #[test]
+    fn only_future_dated_rows_are_an_error_never_genesis_4203() {
+        let tmp = TempDir::new().unwrap();
+        let future = tmp.path().join("forensic-2099-01-01.jsonl");
+        let b = serde_json::to_string(&tail_row("b")).unwrap();
+        std::fs::write(&future, format!("{b}\n")).unwrap();
+        let err = read_chain_tail_as_of(tmp.path(), 2026_07_31)
+            .expect_err("rows exist only in a future-dated file: not genesis");
+        let typed = err
+            .downcast_ref::<ForensicTailUnreadable>()
+            .unwrap_or_else(|| panic!("typed outage error: {err:#}"));
+        assert_eq!(typed.path, future, "the error names the file holding rows");
+        assert!(future.exists(), "evidence is never deleted");
+
+        // Control: a future-dated file with no non-blank line holds no chain.
+        let blank = TempDir::new().unwrap();
+        std::fs::write(blank.path().join("forensic-2099-01-01.jsonl"), b" \n").unwrap();
+        assert_eq!(
+            read_chain_tail_as_of(blank.path(), 2026_07_31).unwrap(),
+            None
+        );
+    }
+
+    /// #4302 (r1 B2 on #4272) — a forensic directory the process cannot
+    /// write to is an init error: no sink is installed, so the boot path
+    /// degrades with its signals or refuses under require-mode. Red on
+    /// 823cc4c13: init succeeded and the writer dropped every row.
+    #[cfg(unix)]
+    #[test]
+    fn init_refuses_a_read_only_forensic_directory_4302() {
+        use std::os::unix::fs::PermissionsExt;
+        let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        shutdown();
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("audit");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        if std::fs::File::create(dir.join("probe")).is_ok() {
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+            eprintln!("SKIP: permission bits do not deny writes here (running as root?)");
+            return;
+        }
+        let r = init(&dir, None);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let err = r.expect_err("a read-only forensic directory is no sink");
+        assert!(
+            err.downcast_ref::<ForensicTailUnreadable>().is_some(),
+            "{err:#}"
+        );
+        assert!(!is_enabled(), "no sink is installed");
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            0,
+            "the probe leaves nothing behind"
+        );
+    }
+
+    /// #4302 — today's daily file present but read-only is an init error too,
+    /// although its tail reads fine. Red on 823cc4c13: init succeeded.
+    #[cfg(unix)]
+    #[test]
+    fn init_refuses_a_read_only_daily_file_4302() {
+        use std::os::unix::fs::PermissionsExt;
+        let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        shutdown();
+        let tmp = TempDir::new().unwrap();
+        let today = daily_path(tmp.path(), &Utc::now());
+        let a = serde_json::to_string(&tail_row("a")).unwrap();
+        std::fs::write(&today, format!("{a}\n")).unwrap();
+        std::fs::set_permissions(&today, std::fs::Permissions::from_mode(0o400)).unwrap();
+        if OpenOptions::new().append(true).open(&today).is_ok() {
+            std::fs::set_permissions(&today, std::fs::Permissions::from_mode(0o600)).unwrap();
+            eprintln!("SKIP: permission bits do not deny writes here (running as root?)");
+            return;
+        }
+        let r = init(tmp.path(), None);
+        std::fs::set_permissions(&today, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let err = r.expect_err("a read-only daily file is no sink");
+        let typed = err
+            .downcast_ref::<ForensicTailUnreadable>()
+            .unwrap_or_else(|| panic!("typed outage error: {err:#}"));
+        assert_eq!(typed.path, today);
+        assert!(!is_enabled(), "no sink is installed");
+        assert_eq!(std::fs::read(&today).unwrap(), format!("{a}\n").as_bytes());
+    }
+
+    /// #4302 — a row the writer cannot persist is counted, not only traced.
+    #[test]
+    fn a_dropped_row_is_counted_4302() {
+        let before = crate::metrics::forensic_sink_unavailable_count();
+        writer_failure(
+            "appending to",
+            Path::new("/nonexistent/forensic-2026-07-31.jsonl"),
+            &std::io::Error::from_raw_os_error(28),
+        );
+        assert!(crate::metrics::forensic_sink_unavailable_count() > before);
+    }
+
+    /// #4302 — doctor reports a read-only directory as not writable, and a
+    /// healthy or missing one as writable (a missing one is created at boot).
+    #[cfg(unix)]
+    #[test]
+    fn inspect_reports_writability_4302() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        assert_eq!(inspect_forensic_tail(tmp.path()).not_writable, None);
+        assert_eq!(
+            inspect_forensic_tail(&tmp.path().join("not-yet")).not_writable,
+            None
+        );
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        let denied = std::fs::File::create(tmp.path().join("probe")).is_err();
+        let report = inspect_forensic_tail(tmp.path());
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        if !denied {
+            eprintln!("SKIP: permission bits do not deny writes here (running as root?)");
+            return;
+        }
+        let cause = report.not_writable.expect("read-only is not writable");
+        assert!(cause.contains("not writable"), "{cause}");
+    }
+
+    /// #4305 — a daily file with a second hard link is refused: appends
+    /// would also land under a name outside the audit directory. Red on
+    /// 823cc4c13: the open succeeded.
+    #[cfg(unix)]
+    #[test]
+    fn a_hard_linked_forensic_file_is_refused_4305() {
+        let tmp = TempDir::new().unwrap();
+        let today = tmp.path().join("forensic-2026-07-31.jsonl");
+        std::fs::write(&today, b"").unwrap();
+        let outside = tmp.path().join("outside.jsonl");
+        std::fs::hard_link(&today, &outside).unwrap();
+        for opened in [
+            open_forensic_file_for_read(&today),
+            open_forensic_file(OpenOptions::new().append(true), &today),
+            open_for_append_line_aligned(&today),
+        ] {
+            let err = opened.expect_err("a hard-linked forensic file is refused");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(err.to_string().contains("hard links"), "{err}");
+        }
+        std::fs::remove_file(&outside).unwrap();
+        assert!(
+            open_forensic_file_for_read(&today).is_ok(),
+            "one link again: accepted"
+        );
+    }
+
+    /// #4304 — a row and its newline go out in ONE write call.
+    #[test]
+    fn a_row_and_its_newline_are_one_write_4304() {
+        struct Calls(Vec<Vec<u8>>);
+        impl Write for Calls {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.push(buf.to_vec());
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut w = Calls(Vec::new());
+        append_record(&mut w, r#"{"row":1}"#).unwrap();
+        assert_eq!(w.0, vec![b"{\"row\":1}\n".to_vec()]);
+    }
+
+    /// #4303 — the head-anchor reader never blocks on a FIFO (one hung every
+    /// db open) and never reads through a symlink or a hard link; each is
+    /// refused, which reads as a surviving anchor (fail closed).
+    #[cfg(unix)]
+    #[test]
+    fn head_anchor_reader_refuses_a_fifo_and_links_promptly_4303() {
+        let tmp = TempDir::new().unwrap();
+        let fifo = tmp.path().join("fifo.log");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("run mkfifo");
+        assert!(status.success());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let p = fifo.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(anchor_log_has_a_line(&p));
+        });
+        let fifo_verdict = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the head-anchor reader HUNG on a FIFO (#4303)");
+        assert!(fifo_verdict, "a refused FIFO fails closed");
+
+        let empty = tmp.path().join("empty.log");
+        std::fs::write(&empty, b"").unwrap();
+        let link = tmp.path().join("link.log");
+        std::os::unix::fs::symlink(&empty, &link).unwrap();
+        assert!(
+            anchor_log_has_a_line(&link),
+            "a symlink is refused (fails closed), never read through"
+        );
+        assert!(!anchor_log_has_a_line(&empty), "control: empty, no anchor");
+        let hard = tmp.path().join("hard.log");
+        std::fs::hard_link(&empty, &hard).unwrap();
+        assert!(anchor_log_has_a_line(&hard), "a hard link is refused");
+        assert!(!anchor_log_has_a_line(&tmp.path().join("absent.log")));
     }
 
     /// #4199 — an I/O error (here: a file that cannot be opened) is an error.

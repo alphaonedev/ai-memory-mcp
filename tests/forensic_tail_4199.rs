@@ -765,3 +765,201 @@ fn a_symlinked_daily_file_is_refused_and_its_target_untouched_4273() {
     assert!(out.status.success(), "stderr: {err}");
     assert!(err.contains(DEGRADED), "stderr: {err}");
 }
+
+/// r1 B1 on #4203 — when the only forensic rows sit in a future-dated file,
+/// boot must not start a second chain at genesis today: it degrades (or
+/// refuses under require-mode). Red on 823cc4c13: a genesis row was written
+/// into today's file, forking the chain.
+fn future_only_case(require: bool) {
+    let home = sandbox();
+    let today = log_with_rows(home.path());
+    let future = forensic_dir(home.path()).join(FUTURE_DAY);
+    std::fs::rename(&today, &future).expect("move the rows to a future-dated name");
+    let before = snapshot(home.path());
+    let outages = outage_rows(home.path());
+    let env: &[(&str, &str)] = if require {
+        &[(REQUIRE_FORENSIC_SINK_ENV, "1")]
+    } else {
+        &[]
+    };
+    let out = purge_with_env(home.path(), env);
+    if require {
+        assert_refused(&out, home.path(), &before);
+    } else {
+        let err = stderr(&out);
+        assert!(out.status.success(), "the standard posture degrades: {err}");
+        assert!(err.contains(DEGRADED), "stderr: {err}");
+        assert!(err.contains("dated after today"), "stderr: {err}");
+        assert_eq!(
+            snapshot(home.path()),
+            before,
+            "no genesis row is written today (the chain is not forked)"
+        );
+        // Two distinct causes, each attested once: the future-dated file
+        // (#4203) and the tail it leaves unavailable (r1 B1).
+        assert_eq!(outage_rows(home.path()), outages + 2);
+    }
+    assert!(future.exists(), "evidence is never deleted");
+    assert_eq!(doctor_forensic_severity(home.path(), env), "critical");
+}
+
+#[test]
+fn only_future_dated_rows_degrade_instead_of_forking_at_genesis_4203() {
+    future_only_case(false);
+}
+
+#[test]
+fn require_mode_refuses_boot_when_only_future_dated_rows_exist_4203() {
+    future_only_case(true);
+}
+
+/// Deny writes on `path`. `false` (and restored) when the bits do not deny
+/// writes here, e.g. when running as root.
+#[cfg(unix)]
+fn deny_writes(path: &Path, dir: bool) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = if dir { 0o500 } else { 0o400 };
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("chmod");
+    let writable = if dir {
+        std::fs::File::create(path.join("write-probe")).is_ok()
+    } else {
+        std::fs::OpenOptions::new().append(true).open(path).is_ok()
+    };
+    if writable {
+        restore_reads(path, dir);
+        eprintln!("SKIP: permission bits do not deny writes here (running as root?)");
+    }
+    !writable
+}
+
+/// #4302 (r1 B2 on #4272) — a read-only forensic directory or daily file.
+/// The tail still reads, so boot used to install the sink and the writer
+/// dropped every row with only a trace line. Now: degrade with every signal
+/// by default, refuse under require-mode, doctor Critical in both.
+#[cfg(unix)]
+fn read_only_case(dir: bool, require: bool) {
+    let home = sandbox();
+    let file = log_with_rows(home.path());
+    let target = if dir { forensic_dir(home.path()) } else { file };
+    let before = snapshot(home.path());
+    let outages = outage_rows(home.path());
+    let env: &[(&str, &str)] = if require {
+        &[(REQUIRE_FORENSIC_SINK_ENV, "1")]
+    } else {
+        &[]
+    };
+    if !deny_writes(&target, dir) {
+        return;
+    }
+    let out = purge_with_env(home.path(), env);
+    let after_outages = outage_rows(home.path());
+    let doctor = doctor_forensic_severity(home.path(), env);
+    restore_reads(&target, dir);
+    if require {
+        assert_refused(&out, home.path(), &before);
+    } else {
+        let err = stderr(&out);
+        assert!(out.status.success(), "the standard posture degrades: {err}");
+        assert!(err.contains(DEGRADED), "stderr: {err}");
+        assert!(err.contains("not writable"), "stderr: {err}");
+        assert_eq!(snapshot(home.path()), before, "no forensic row is written");
+        assert_eq!(after_outages, outages + 1, "one signed outage row");
+    }
+    assert_eq!(doctor, "critical");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_read_only_forensic_directory_degrades_with_the_outage_signals_4302() {
+    read_only_case(true, false);
+}
+
+#[cfg(unix)]
+#[test]
+fn require_mode_refuses_boot_on_a_read_only_forensic_directory_4302() {
+    read_only_case(true, true);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_read_only_daily_file_degrades_with_the_outage_signals_4302() {
+    read_only_case(false, false);
+}
+
+#[cfg(unix)]
+#[test]
+fn require_mode_refuses_boot_on_a_read_only_daily_file_4302() {
+    read_only_case(false, true);
+}
+
+/// #4303 — a FIFO as the witness head-anchor log must not hang a db open:
+/// its reader runs at every open. Red on 823cc4c13 (the retester's cell
+/// `r1_fifo_head_anchor_log_no_hang_at_db_open`): `archive purge` hung.
+#[cfg(unix)]
+#[test]
+fn a_fifo_head_anchor_log_does_not_hang_a_db_open_4303() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = sandbox();
+    let witness = home.path().join("witness");
+    std::fs::create_dir(&witness).expect("create the witness dir");
+    std::fs::set_permissions(&witness, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    mkfifo(&witness.join(ai_memory::governance::audit::HEAD_ANCHOR_LOG_FILENAME));
+    let witness_dir = witness.display().to_string();
+    let out = purge_with_deadline(
+        home.path(),
+        &[(
+            ai_memory::governance::audit::WITNESS_KEY_DIR_ENV,
+            &witness_dir,
+        )],
+        Duration::from_secs(30),
+    )
+    .expect("the db open HUNG on a FIFO head-anchor log (#4303)");
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+}
+
+/// #4302 — a FRESH forensic directory (no file yet) that cannot be written:
+/// it used to boot with the sink under require-mode, exit 0, empty stderr
+/// (the retester's cells `r1_unwritable_dir_fresh_degrade` and
+/// `r1_unwritable_dir_fresh_require`).
+#[cfg(unix)]
+fn read_only_fresh_dir_case(require: bool) {
+    let home = sandbox();
+    let dir = forensic_dir(home.path());
+    std::fs::create_dir_all(&dir).expect("create the forensic dir");
+    let env: &[(&str, &str)] = if require {
+        &[(REQUIRE_FORENSIC_SINK_ENV, "1")]
+    } else {
+        &[]
+    };
+    if !deny_writes(&dir, true) {
+        return;
+    }
+    let out = purge_with_env(home.path(), env);
+    let doctor = doctor_forensic_severity(home.path(), env);
+    restore_reads(&dir, true);
+    let err = stderr(&out);
+    if require {
+        assert_eq!(out.status.code(), Some(EX_CONFIG), "stderr: {err}");
+        assert!(err.contains("refusing to start"), "stderr: {err}");
+    } else {
+        assert!(out.status.success(), "the standard posture degrades: {err}");
+        assert!(err.contains(DEGRADED), "stderr: {err}");
+    }
+    assert!(
+        forensic_files(home.path()).is_empty(),
+        "nothing was written"
+    );
+    assert_eq!(doctor, "critical");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_read_only_fresh_forensic_directory_degrades_4302() {
+    read_only_fresh_dir_case(false);
+}
+
+#[cfg(unix)]
+#[test]
+fn require_mode_refuses_boot_on_a_read_only_fresh_forensic_directory_4302() {
+    read_only_fresh_dir_case(true);
+}

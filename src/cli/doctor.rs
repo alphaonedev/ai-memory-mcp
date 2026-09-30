@@ -2593,6 +2593,24 @@ fn section_forensic_log_4199(
             });
         }
     }
+    // #4302 — a sink that cannot append drops every row. That used to show
+    // up only as a trace line from the background writer.
+    match &report.not_writable {
+        None => facts.push(("writable".into(), "yes".into())),
+        Some(cause) => {
+            facts.push(("writable".into(), "NO".into()));
+            facts.push(("write_cause".into(), cause.clone()));
+            notes.push(if require {
+                "the forensic log cannot be appended to: every command but `doctor` REFUSES to \
+                 start (require-mode). Make the directory and today's file writable."
+                    .to_string()
+            } else {
+                "the forensic log cannot be appended to: every process runs WITHOUT the \
+                 forensic sink. Make the directory and today's file writable."
+                    .to_string()
+            });
+        }
+    }
     if !report.future_dated.is_empty() {
         facts.push((
             "future_dated_files".into(),
@@ -2609,7 +2627,8 @@ fn section_forensic_log_4199(
                 .to_string(),
         );
     }
-    let critical = report.tail.is_err() || !report.future_dated.is_empty();
+    let critical =
+        report.tail.is_err() || report.not_writable.is_some() || !report.future_dated.is_empty();
     ReportSection {
         name: SECTION_FORENSIC_LOG.into(),
         severity: if critical {
@@ -6773,7 +6792,19 @@ mod tests {
             dir: PathBuf::from("/var/lib/ai-memory/audit"),
             tail,
             future_dated: future.iter().map(PathBuf::from).collect(),
+            not_writable: None,
         }
+    }
+
+    /// #4302 — a sink that cannot append is Critical, with the cause named.
+    #[test]
+    fn forensic_section_is_critical_when_the_log_is_not_writable_4302() {
+        let mut report = forensic_report(Ok(Some("ef".repeat(32))), &[]);
+        report.not_writable = Some("the forensic directory is not writable: EACCES".into());
+        let s = section_forensic_log_4199(&report);
+        assert_eq!(s.severity, Severity::Critical);
+        assert_eq!(fact(&s, "writable"), "NO");
+        assert!(fact(&s, "write_cause").contains("EACCES"));
     }
 
     #[test]

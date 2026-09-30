@@ -1113,7 +1113,9 @@ impl Metrics {
              the chain tail could not be established (an I/O error, or no parseable \
              row in any non-empty file), so the process ran WITHOUT the sink instead \
              of forking the signed chain at genesis (#4199); or a forensic file dated \
-             after today was found and skipped (#4203). Any non-zero value needs an \
+             after today was found and skipped (#4203); or the sink cannot append (a \
+             read-only directory or daily file at start-up, or a failed open or append \
+             that dropped a row at run time, #4302). Any non-zero value needs an \
              operator.",
             &mut err,
         );

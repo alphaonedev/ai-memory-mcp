@@ -252,18 +252,22 @@ fn is_writable_dir(p: &Path) -> bool {
     if !p.exists() || !p.is_dir() {
         return false;
     }
-    // Probe: try to create a unique temp file in the directory; if it
-    // fails, treat the dir as not-writable. We keep this best-effort —
-    // the kernel is the source of truth and this is a hint for the
-    // resolution decision.
+    probe_dir_writable(p).is_ok()
+}
+
+/// Prove a directory accepts new files: create a unique probe file in it and
+/// remove it again. The kernel is the source of truth (a 0555 directory, a
+/// read-only mount, a full quota), so this asks it rather than reading mode
+/// bits. The error is the kernel's. Shared with the forensic sink's start-up
+/// check (#4302), which must not boot a sink that cannot write.
+///
+/// # Errors
+/// The directory refuses the probe file (the OS error).
+pub(crate) fn probe_dir_writable(p: &Path) -> std::io::Result<()> {
     let probe = p.join(format!(".ai-memory-write-probe-{}", std::process::id()));
-    match std::fs::File::create(&probe) {
-        Ok(_) => {
-            let _ = std::fs::remove_file(&probe);
-            true
-        }
-        Err(_) => false,
-    }
+    std::fs::File::create(&probe)?;
+    let _ = std::fs::remove_file(&probe);
+    Ok(())
 }
 
 /// Reject world-writable directories. Returns `Ok(())` if the path
