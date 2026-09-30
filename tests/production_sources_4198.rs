@@ -90,3 +90,74 @@ fn strip_keeps_callers_after_test_modules_and_handles_strings_4198() {
 fn strip_fails_closed_on_an_unclosed_test_module_4198() {
     let _ = strip_cfg_test_inline_mods("#[cfg(test)]\nmod tests {\n    fn x() {}\nfn late() {}\n");
 }
+
+/// #4198 f2r review — the real tree's parent-declared test-only files are
+/// test-only, including the two shapes the first resolver missed:
+/// `#[cfg(test)] #[path = ".."] mod x;` and a `mod x;` declared INSIDE an
+/// inline `#[cfg(test)] mod tests { .. }`. Every one of them was returned as
+/// production by the 1e19ce2d0 resolver.
+#[test]
+fn every_parent_declared_test_module_in_src_is_test_only_4198() {
+    let view = production_sources(&root());
+    let prod: std::collections::HashSet<&str> = view.iter().map(|(r, _)| r.as_str()).collect();
+    for rel in [
+        // #[cfg(test)] + #[path]
+        "src/handlers/tests.rs",
+        "src/mcp/tools/store/tests.rs",
+        "src/daemon_runtime_shutdown_tests.rs",
+        "src/mcp/tools/d1_4_985_helpers.rs",
+        "src/mcp/tools/routine/freeze_3616.rs",
+        // declared inside an inline #[cfg(test)] mod tests
+        "src/cli/backup/tests/publish_3550.rs",
+        "src/cli/backup/tests/signed_manifest_3199.rs",
+        // the #4149 / #4200 shape
+        "src/store/sqlite/owner_gate_txn_3957.rs",
+    ] {
+        assert!(
+            std::path::Path::new(&root().join(rel)).exists(),
+            "fixture drift: {rel} no longer exists; update this cell"
+        );
+        assert!(
+            !prod.contains(rel),
+            "{rel} is test-only and must not be production"
+        );
+    }
+    // A production #[path] module is still production (src/mcp/mod.rs loads
+    // the tool modules through #[path]).
+    assert!(prod.contains("src/mcp/tools/action.rs"));
+}
+
+/// The module graph on synthetic trees: #[path] under cfg(test), children
+/// inside an inline test module, an intervening attribute, and a production
+/// #[path]; strict mode reports an orphan.
+#[test]
+fn module_graph_follows_path_attrs_and_inline_children_4198() {
+    let f = |p: &str, s: &str| (p.to_string(), s.to_string());
+    let files = vec![
+        f(
+            "src/lib.rs",
+            "mod a;\n#[cfg(test)]\n#[path = \"a_tests.rs\"]\nmod a_tests;\n#[path = \"tools/b.rs\"]\nmod b;\n",
+        ),
+        f(
+            "src/a.rs",
+            "#[cfg(test)]\n#[allow(dead_code)]\nmod tests {\n    mod child;\n}\n",
+        ),
+        f("src/a/tests/child.rs", "fn c() {}\n"),
+        f("src/a_tests.rs", "fn t() {}\n"),
+        f("src/tools/b.rs", "fn prod() {}\n"),
+        f("src/orphan.rs", "fn o() {}\n"),
+    ];
+    let g = cfg_test_modules::module_graph(&files, true);
+    assert!(g.test_only.contains("src/a_tests.rs"), "{g:?}");
+    assert!(g.test_only.contains("src/a/tests/child.rs"), "{g:?}");
+    assert!(g.production.contains("src/tools/b.rs"), "{g:?}");
+    assert!(g.production.contains("src/a.rs"), "{g:?}");
+    assert_eq!(g.orphans, vec!["src/orphan.rs".to_string()], "{g:?}");
+}
+
+#[test]
+#[should_panic(expected = "which is not a src file")]
+fn an_unresolved_production_declaration_panics_4198() {
+    let files = vec![("src/lib.rs".to_string(), "mod missing;\n".to_string())];
+    let _ = cfg_test_modules::module_graph(&files, true);
+}
