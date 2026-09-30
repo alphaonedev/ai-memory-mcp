@@ -236,6 +236,7 @@ sentinel_one() {
 # against HARNESS_UNDER_TEST (default: this file) on one real gate.
 #   F1: a file someone creates in the tree mid-run is reported, never deleted.
 #   F2: a harness killed by SIGTERM in its sentinel phase leaves no sentinel.
+#   F3: a gate SIGTERMed during its full-tree run leaves no process running.
 if ((HARNESS_SELF_TEST)); then
   H="${HARNESS_UNDER_TEST:-scripts/test/test-gate-selftest-interrupt-cleanup.sh}"
   G=check-vendor-literals.sh
@@ -312,6 +313,43 @@ if ((HARNESS_SELF_TEST)); then
       done
     fi
   fi
+
+  # F3 (r9 INFO): a SIGTERM to a gate while its full-tree run is in progress
+  # must stop that run's pipelines too, not only its top shell. The run is
+  # in progress once the helper's output file exists; the cell then waits
+  # until one of the run's scan pipelines (awk / sort) is actually running,
+  # which is the moment an interrupt used to leave them behind.
+  st_n=$((st_n + 1))
+  G3=check-test-env-lock.sh
+  st_before=$(porcelain)
+  outs_before=$(ls .local-runs/selftest-out.* 2>/dev/null | sort)
+  setsid bash "scripts/${G3}" --self-test >"$st_log" 2>&1 &
+  gp=$!
+  running=0
+  deadline=$((SECONDS + 120))
+  while kill -0 "$gp" 2>/dev/null && ((SECONDS < deadline)); do
+    if [[ "$(ls .local-runs/selftest-out.* 2>/dev/null | sort)" != "$outs_before" ]] &&
+      ps -e -o sid=,comm= | awk -v s="$gp" '$1 == s && ($2 == "awk" || $2 == "sort") {f = 1} END {exit !f}'; then
+      running=1
+      break
+    fi
+    sleep 0.02
+  done
+  kill -TERM "$gp" 2>/dev/null
+  wait "$gp" 2>/dev/null
+  grc=$?
+  sleep 1
+  left_procs=$(ps -e -o sid=,pid=,comm= | awk -v s="$gp" '$1 == s {print $2 "(" $3 ")"}' | tr '\n' ' ')
+  if ((running == 0)); then
+    echo "not ok ${st_n} - F3: the gate run was never seen in progress, nothing was interrupted (log: ${st_log})"
+    st_fail=$((st_fail + 1))
+  elif [[ -z "$left_procs" && "$(porcelain)" == "$st_before" ]] && ((grc == 143)); then
+    echo "ok ${st_n} - F3: SIGTERM during ${G3}'s gate run left no process running and the tree unchanged (rc=${grc})"
+  else
+    echo "not ok ${st_n} - F3: SIGTERM during ${G3}'s gate run left running: ${left_procs:-none} (rc=${grc}; tree $([[ "$(porcelain)" == "$st_before" ]] && echo unchanged || echo CHANGED))"
+    st_fail=$((st_fail + 1))
+  fi
+  kill -KILL -- "-$gp" 2>/dev/null
 
   echo "1..${st_n}"
   if ((st_fail > 0)); then

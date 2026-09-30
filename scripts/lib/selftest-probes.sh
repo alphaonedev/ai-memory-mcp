@@ -19,7 +19,8 @@
 #   selftest_probes_disarm                     # normal-path cleanup
 #
 # On EXIT, INT or TERM every registered probe is removed and a running gate
-# child is stopped. INT and TERM are then RE-RAISED, so an interrupted
+# child is stopped, with its whole process group (its own awk/sort pipelines
+# included). INT and TERM are then RE-RAISED, so an interrupted
 # self-test dies of the signal (130 / 143) and never reads as a pass.
 # The gate child runs in the background and is waited for, because bash
 # defers a trap until a FOREGROUND command returns: under `$("$0")` a SIGTERM
@@ -36,7 +37,9 @@ _selftest_out=""
 
 selftest_cleanup () {
     if [[ -n "$_selftest_child" ]]; then
-        kill -TERM "$_selftest_child" 2>/dev/null
+        # The whole process group: the gate run's own pipelines (awk, sort)
+        # would otherwise keep scanning the tree after the self-test is gone.
+        kill -TERM -- "-$_selftest_child" 2>/dev/null || kill -TERM "$_selftest_child" 2>/dev/null
         wait "$_selftest_child" 2>/dev/null
         _selftest_child=""
     fi
@@ -67,7 +70,9 @@ selftest_run () {
     _dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/.local-runs"
     mkdir -p "$_dir"
     _selftest_out="$(mktemp "${_dir}/selftest-out.XXXXXX")"
-    "$@" >"$_selftest_out" 2>&1 &
+    # In its own process group (perl's setpgrp: portable, unlike setsid), so
+    # an interrupt stops the gate run AND every pipeline it started.
+    perl -e 'setpgrp(0, 0); exec @ARGV or die "exec $ARGV[0]: $!\n"' "$@" >"$_selftest_out" 2>&1 &
     _selftest_child=$!
     local _rc=0
     wait "$_selftest_child" || _rc=$?
