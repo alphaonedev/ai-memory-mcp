@@ -246,9 +246,19 @@ impl EgressDecision {
 /// refused rather than assumed local).
 #[must_use]
 pub fn target_is_loopback(base_url: &str) -> bool {
-    let Some(host) = host_of(base_url) else {
-        return false;
-    };
+    host_of(base_url).is_some_and(|host| host_is_loopback(&host))
+}
+
+/// THE loopback classifier for an inference target's HOST (#4193 f2r CR):
+/// the egress gate ([`target_is_loopback`]) and the decision client's proxy
+/// rule (`decision_clients::proxy_may_carry`) both call this, so they cannot
+/// disagree. `localhost`, `localhost.localdomain`, a loopback or unspecified
+/// IP (`127.0.0.0/8`, `0.0.0.0`, `::1`, `::`), and an IPv4-mapped loopback
+/// (`::ffff:127.0.0.1`) are loopback. A bracketed IPv6 literal is accepted.
+/// `*.localhost` names are NOT loopback here: the gate never admitted them
+/// under `loopback-only`, so they stay external on both sides.
+#[must_use]
+pub(crate) fn host_is_loopback(host: &str) -> bool {
     let host = host.to_ascii_lowercase();
     if matches!(host.as_str(), "localhost" | "localhost.localdomain") {
         return true;
@@ -257,7 +267,13 @@ pub fn target_is_loopback(base_url: &str) -> bool {
     let bare = host.trim_start_matches('[').trim_end_matches(']');
     match bare.parse::<std::net::IpAddr>() {
         Ok(std::net::IpAddr::V4(v4)) => v4.is_loopback() || v4.is_unspecified(),
-        Ok(std::net::IpAddr::V6(v6)) => v6.is_loopback() || v6.is_unspecified(),
+        Ok(std::net::IpAddr::V6(v6)) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6
+                    .to_ipv4_mapped()
+                    .is_some_and(|v4| v4.is_loopback() || v4.is_unspecified())
+        }
         Err(_) => false,
     }
 }

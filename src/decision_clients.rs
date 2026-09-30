@@ -489,19 +489,12 @@ fn decision_http_client(
 /// only https to a host that is not loopback. Plaintext never crosses a
 /// proxy, and nothing needs a proxy to reach loopback.
 fn proxy_may_carry(endpoint: &Url) -> bool {
-    if endpoint.scheme() != "https" {
-        return false;
-    }
-    let Some(host) = endpoint.host_str() else {
-        return false;
-    };
-    // `host_str` renders an IPv6 literal in brackets.
-    let bare = host.trim_start_matches('[').trim_end_matches(']');
-    if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
-        return !ip.is_loopback();
-    }
-    let lower = host.to_ascii_lowercase();
-    lower != "localhost" && !lower.ends_with(".localhost")
+    // ONE loopback classifier with the egress gate (f2r CR on 6cdfbeb17): a
+    // host the gate calls loopback is never proxied, and vice versa.
+    endpoint.scheme() == "https"
+        && endpoint
+            .host_str()
+            .is_some_and(|host| !crate::egress::host_is_loopback(host))
 }
 
 /// Join a configured `base_url` and a route into a request URL.
@@ -756,6 +749,37 @@ pub(crate) const NETWORK_SOURCE: DecisionSource = DecisionSource::DecisionModel;
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// f2r CR on 6cdfbeb17 — the proxy rule and the egress gate share ONE
+    /// loopback classifier, so for every https target they agree: proxy-able
+    /// iff the gate does not call it loopback. The corpus covers every shape
+    /// where the two used to disagree.
+    #[test]
+    fn proxy_rule_and_egress_gate_agree_on_loopback_4193() {
+        for url in [
+            "https://127.0.0.1:9/v1",
+            "https://127.9.9.9:9/v1",
+            "https://0.0.0.0:9/v1",
+            "https://[::1]:9/v1",
+            "https://[::]:9/v1",
+            "https://[::ffff:127.0.0.1]:9/v1",
+            "https://localhost:9/v1",
+            "https://LOCALHOST:9/v1",
+            "https://localhost.localdomain:9/v1",
+            "https://api.localhost/v1",
+            "https://api.vendor.example/v1",
+            "https://10.0.0.5/v1",
+        ] {
+            let proxied = proxy_may_carry(&Url::parse(url).expect("url"));
+            let loopback = crate::egress::target_is_loopback(url);
+            assert_eq!(
+                proxied, !loopback,
+                "{url}: proxy rule and egress gate disagree"
+            );
+        }
+    }
+
     /// #4193 amendment — an environment proxy may carry only https to a
     /// non-loopback host; plaintext and loopback never cross it.
     #[test]
@@ -769,11 +793,12 @@ mod tests {
         assert!(!may("https://127.0.0.1:9/v1"));
         assert!(!may("https://[::1]:9/v1"));
         assert!(!may("https://localhost:9/v1"));
-        assert!(!may("https://api.localhost/v1"));
+        assert!(!may("https://0.0.0.0:9/v1"));
+        assert!(!may("https://[::]:9/v1"));
+        assert!(!may("https://localhost.localdomain:9/v1"));
+        assert!(!may("https://[::ffff:127.0.0.1]:9/v1"));
         assert!(!may("http://127.0.0.1:11434/v1"));
     }
-
-    use super::*;
 
     /// A provider that can judge and score but never choose.
     #[derive(Debug)]
