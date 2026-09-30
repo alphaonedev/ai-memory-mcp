@@ -79,7 +79,7 @@ fn forget_governance_gate_one_ns(
             // #4043 — an unreadable policy refuses the bulk forget.
             .map_err(|e| {
                 crate::mcp::error_text::mcp_foreign_err(
-                    "governance policy unreadable (#4043 fail-CLOSED)",
+                    crate::storage::GOVERNANCE_POLICY_UNREADABLE,
                     e,
                 )
             })?

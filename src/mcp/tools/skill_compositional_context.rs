@@ -339,10 +339,7 @@ fn max_reflection_depth_for(conn: &Connection, namespace: &str) -> Result<u32, S
     crate::db::resolve_governance_policy(conn, namespace)
         .map(|p| p.map_or(3, |p| p.effective_max_reflection_depth()))
         .map_err(|e| {
-            crate::mcp::error_text::mcp_foreign_err(
-                "governance policy unreadable (#4043 fail-CLOSED)",
-                e,
-            )
+            crate::mcp::error_text::mcp_foreign_err(crate::storage::GOVERNANCE_POLICY_UNREADABLE, e)
         })
 }
 

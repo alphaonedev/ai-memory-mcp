@@ -22507,14 +22507,23 @@ fn auto_detect_parent(conn: &Connection, namespace: &str) -> Result<Option<Strin
 #[allow(clippy::unnecessary_wraps)]
 pub fn get_namespace_standard(conn: &Connection, namespace: &str) -> Result<Option<String>> {
     let result = conn
-        .query_row(
-            "SELECT standard_id FROM namespace_meta WHERE namespace = ?1",
-            params![namespace],
-            |r| r.get(0),
-        )
+        .query_row(SQL_SELECT_NAMESPACE_STANDARD_ID, params![namespace], |r| {
+            r.get(0)
+        })
         .ok();
     Ok(result)
 }
+
+/// #4043 — the one `namespace_meta.standard_id` probe the storage layer issues.
+pub(crate) const SQL_SELECT_NAMESPACE_STANDARD_ID: &str =
+    "SELECT standard_id FROM namespace_meta WHERE namespace = ?1";
+/// Tracing target for governance-policy read drift / faults (#1384, #4043).
+pub(crate) const TRACE_TARGET_GOVERNANCE_POLICY_READ: &str = "ai_memory::governance::policy_read";
+/// #4043 — context attached when a governance policy / threshold cannot be
+/// read and the governed action is refused.
+pub const GOVERNANCE_POLICY_UNREADABLE: &str = "governance policy unreadable (#4043 fail-CLOSED)";
+/// #4043 — context for a failed read of a bound namespace standard.
+const CTX_READ_NAMESPACE_STANDARD: &str = "governance: read namespace standard";
 
 /// #4043 — FALLIBLE twin of [`get_namespace_standard`] for the GOVERNANCE
 /// walkers. `Ok(None)` means "no row, or a row whose `standard_id` is NULL";
@@ -22525,11 +22534,9 @@ pub fn get_namespace_standard(conn: &Connection, namespace: &str) -> Result<Opti
 fn try_get_namespace_standard(conn: &Connection, namespace: &str) -> Result<Option<String>> {
     use rusqlite::OptionalExtension;
     let row: Option<Option<String>> = conn
-        .query_row(
-            "SELECT standard_id FROM namespace_meta WHERE namespace = ?1",
-            params![namespace],
-            |r| r.get::<_, Option<String>>(0),
-        )
+        .query_row(SQL_SELECT_NAMESPACE_STANDARD_ID, params![namespace], |r| {
+            r.get::<_, Option<String>>(0)
+        })
         .optional()
         .context("governance: read namespace_meta.standard_id")?;
     Ok(row.flatten())
@@ -22664,7 +22671,7 @@ pub fn build_namespace_chain(conn: &Connection, namespace: &str) -> Vec<String> 
     // defensive only.
     build_namespace_chain_view(conn, namespace, ChainView::Lookup).unwrap_or_else(|e| {
         tracing::warn!(
-            target: "ai_memory::governance::policy_read",
+            target: TRACE_TARGET_GOVERNANCE_POLICY_READ,
             namespace = %namespace,
             error = %e,
             "lookup namespace chain read failed; returning the structural chain"
@@ -22953,11 +22960,9 @@ fn read_namespace_level(conn: &Connection, namespace: &str) -> Result<NamespaceL
     use rusqlite::OptionalExtension;
     // `Option<Option<String>>`: outer = row present?, inner = standard bound?
     let row: Option<Option<String>> = conn
-        .query_row(
-            "SELECT standard_id FROM namespace_meta WHERE namespace = ?1",
-            params![namespace],
-            |r| r.get::<_, Option<String>>(0),
-        )
+        .query_row(SQL_SELECT_NAMESPACE_STANDARD_ID, params![namespace], |r| {
+            r.get::<_, Option<String>>(0)
+        })
         .optional()
         .context("governance: read namespace_meta level")?;
     let Some(bound) = row else {
@@ -22966,7 +22971,7 @@ fn read_namespace_level(conn: &Connection, namespace: &str) -> Result<NamespaceL
     let Some(standard_id) = bound else {
         return Ok(NamespaceLevel::Severed); // row survives, pointer severed
     };
-    match get(conn, &standard_id).context("governance: read namespace standard")? {
+    match get(conn, &standard_id).context(CTX_READ_NAMESPACE_STANDARD)? {
         Some(mem) => Ok(
             match read_policy_from_standard(namespace, &standard_id, &mem) {
                 Some(p) => NamespaceLevel::Policy(Box::new(p)),
@@ -23009,7 +23014,7 @@ fn read_policy_from_standard(
         // operators now have a structured signal to investigate.
         Some(Err(parse_err)) => {
             tracing::warn!(
-                target: "ai_memory::governance::policy_read",
+                target: TRACE_TARGET_GOVERNANCE_POLICY_READ,
                 namespace = %namespace,
                 standard_id = %standard_id,
                 error = %parse_err,
@@ -23177,7 +23182,7 @@ pub fn resolve_governance_policy_for_optional_feature(
         Ok(policy) => policy.unwrap_or_default(),
         Err(e) => {
             tracing::warn!(
-                target: "ai_memory::governance::policy_read",
+                target: TRACE_TARGET_GOVERNANCE_POLICY_READ,
                 namespace = %namespace,
                 error = %e,
                 "governance policy unreadable; optional policy-driven feature stays OFF (#4043)"
@@ -23238,8 +23243,7 @@ pub fn resolve_require_approval_above_depth(
         let Some(standard_id) = try_get_namespace_standard(conn, &level)? else {
             continue;
         };
-        let Some(mem) = get(conn, &standard_id).context("governance: read namespace standard")?
-        else {
+        let Some(mem) = get(conn, &standard_id).context(CTX_READ_NAMESPACE_STANDARD)? else {
             continue;
         };
         // Governance blob must exist and not be null.
@@ -23316,8 +23320,7 @@ pub fn resolve_skill_promotion_min_depth(
         let Some(standard_id) = try_get_namespace_standard(conn, &level)? else {
             continue;
         };
-        let Some(mem) = get(conn, &standard_id).context("governance: read namespace standard")?
-        else {
+        let Some(mem) = get(conn, &standard_id).context(CTX_READ_NAMESPACE_STANDARD)? else {
             continue;
         };
         let gov = match mem.metadata.get(crate::META_KEY_GOVERNANCE) {

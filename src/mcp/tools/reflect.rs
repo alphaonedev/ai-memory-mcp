@@ -668,7 +668,7 @@ pub fn handle_reflect_caller(
             if let Some(threshold) =
                 db::resolve_require_approval_above_depth(conn, ns).map_err(|e| {
                     crate::mcp::error_text::mcp_foreign_err(
-                        "governance policy unreadable (#4043 fail-CLOSED)",
+                        crate::storage::GOVERNANCE_POLICY_UNREADABLE,
                         e,
                     )
                 })?

@@ -200,7 +200,7 @@ pub(super) fn handle_link(
         let policy = db::resolve_governance_policy(conn, &source_ns)
             .map_err(|e| {
                 crate::mcp::error_text::mcp_foreign_err(
-                    "governance policy unreadable (#4043 fail-CLOSED)",
+                    crate::storage::GOVERNANCE_POLICY_UNREADABLE,
                     e,
                 )
             })?
