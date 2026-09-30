@@ -763,11 +763,33 @@ pub async fn unsubscribe(
         };
         return match target_id {
             Some(id) => match app.store.delete(&ctx, &id).await {
-                Ok(()) => (
-                    StatusCode::OK,
-                    Json(json!({"id": id, "removed": true, (field_names::STORAGE_BACKEND): "postgres"})),
-                )
-                    .into_response(),
+                Ok(()) => {
+                    // #4079 — withdraw the peer replicas `subscribe` fanned
+                    // out. Pre-fix only the local row was deleted: every peer
+                    // holding the replicated `_subscriptions/<aid>` row kept
+                    // matching its dispatch scan and kept POSTing signed
+                    // events to the withdrawn endpoint, indefinitely. The
+                    // delete lane is quorum-tracked and DLQ-backed, so a peer
+                    // that is down now converges when it returns. Runs only
+                    // after the SAL owner gate accepted the local delete.
+                    match crate::handlers::parity::fanout_delete_or_pending(&app, &id).await {
+                        None => (
+                            StatusCode::OK,
+                            Json(json!({"id": id, "removed": true, (field_names::STORAGE_BACKEND): "postgres"})),
+                        )
+                            .into_response(),
+                        // W3/G12 — the local withdrawal is durable and the
+                        // peer withdrawal is queued: 202 carrying the
+                        // replication state, never a bare success body.
+                        Some(pending) => {
+                            let mut done = serde_json::Map::new();
+                            done.insert("id".to_string(), json!(id));
+                            done.insert("removed".to_string(), json!(true));
+                            done.insert(field_names::STORAGE_BACKEND.to_string(), json!("postgres"));
+                            crate::handlers::parity::under_replicated_response_with(done, &pending)
+                        }
+                    }
+                }
                 Err(crate::store::StoreError::NotFound { .. }) => (
                     StatusCode::OK,
                     Json(json!({"id": id, "removed": false, (field_names::STORAGE_BACKEND): "postgres"})),

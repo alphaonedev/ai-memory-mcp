@@ -69,14 +69,24 @@ use crate::validate;
 /// must never infer cluster-confirmed exclusivity from a 2xx alone
 /// (split-brain guard — W3 coordination-semantics finding).
 pub(crate) fn under_replicated_response(payload: &QuorumNotMetPayload) -> axum::response::Response {
-    let body = json!({
-        "quorum_met": false,
-        "acks": payload.got,
-        "needed": payload.needed,
-        "reason": payload.reason,
-        "durability": "local",
-    });
-    (StatusCode::ACCEPTED, Json(body)).into_response()
+    under_replicated_response_with(serde_json::Map::new(), payload)
+}
+
+/// #4079 — [`under_replicated_response`] that ALSO carries the caller's own
+/// success fields (e.g. `{id, removed}`), so a durable-but-under-replicated
+/// delete still tells the caller what it removed. The replication-state
+/// fields are the SAME ones, from the same place.
+pub(crate) fn under_replicated_response_with(
+    extra: serde_json::Map<String, serde_json::Value>,
+    payload: &QuorumNotMetPayload,
+) -> axum::response::Response {
+    let mut body = extra;
+    body.insert("quorum_met".to_string(), json!(false));
+    body.insert("acks".to_string(), json!(payload.got));
+    body.insert("needed".to_string(), json!(payload.needed));
+    body.insert("reason".to_string(), json!(payload.reason));
+    body.insert("durability".to_string(), json!("local"));
+    (StatusCode::ACCEPTED, Json(serde_json::Value::Object(body))).into_response()
 }
 
 /// #2856 (federation data-integrity) — the consolidate-specific
@@ -132,6 +142,42 @@ pub(crate) fn under_replicated_consolidate_response(
         "durability": "local",
     });
     (StatusCode::ACCEPTED, Json(body)).into_response()
+}
+
+/// #4079 — fan a locally-committed, OWNER-AUTHORIZED hard delete out to
+/// peers through the quorum delete lane (`sync_push.deletions`). Returns
+/// `None` when no federation is configured or the quorum was met, and
+/// `Some(payload)` describing the replication shortfall otherwise.
+///
+/// Durability of the withdrawal does not depend on the verdict: every
+/// dispatched peer that did not ack inside the deadline gets a
+/// `federation_push_dlq` row from `broadcast_delete_quorum`'s landing pass,
+/// and the push-DLQ replay worker re-POSTs the deletion when the peer
+/// returns. The `Err` arm (the tracker could not be finalised, so the landing
+/// pass never ran) is reported as a shortfall rather than swallowed: the
+/// caller must not be told the withdrawal reached the mesh when nothing
+/// recorded that it still has to.
+///
+/// Callers MUST only invoke this AFTER a local delete that the SAL owner gate
+/// accepted — the receiving peer applies `deletions[]` by id, so fanning out
+/// an id the caller was not proven to own would be a cross-tenant delete.
+#[cfg(feature = "sal")]
+pub(crate) async fn fanout_delete_or_pending(
+    app: &AppState,
+    id: &str,
+) -> Option<crate::federation::QuorumNotMetPayload> {
+    let fed = app.federation.as_ref().as_ref()?;
+    match crate::federation::broadcast_delete_quorum(fed, id).await {
+        Ok(tracker) => crate::federation::finalise_quorum(&tracker)
+            .err()
+            .map(|err| crate::federation::QuorumNotMetPayload::from_err(&err)),
+        Err(err) => {
+            tracing::warn!(
+                "delete fanout could not be finalised for {id} (local delete committed): {err:?}"
+            );
+            Some(crate::federation::QuorumNotMetPayload::from_err(&err))
+        }
+    }
 }
 
 /// Fan out a locally-committed memory to peers via quorum store. On full

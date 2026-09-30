@@ -1156,6 +1156,19 @@ pub async fn delete_memory(
                 let archived = target
                     .as_ref()
                     .is_some_and(|m| crate::visibility::inbox_delete_retains(&m.namespace));
+                // #4153 — propagate the deletion to peers, as the sqlite arm
+                // below does. Pre-fix the postgres arm deleted locally and
+                // answered success with nothing on the delete lane, so every
+                // independently-stored peer kept the row (and, for a
+                // `_subscriptions/` row, kept dispatching to it — #4079).
+                // Reached only after the SAL owner gate accepted the delete.
+                if let Some(pending) = super::parity::fanout_delete_or_pending(&app, &id).await {
+                    let mut done = serde_json::Map::new();
+                    done.insert("deleted".to_string(), json!(true));
+                    done.insert("id".to_string(), json!(id));
+                    done.insert("archived".to_string(), json!(archived));
+                    return super::parity::under_replicated_response_with(done, &pending);
+                }
                 (
                     StatusCode::OK,
                     Json(json!({"deleted": true, "id": id, "archived": archived})),
