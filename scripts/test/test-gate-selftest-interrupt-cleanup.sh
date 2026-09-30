@@ -16,7 +16,12 @@
 # (SIGINT to the whole process group, like ^C; SIGTERM to the script alone,
 # like timeout(1)), and asserts `git status` is exactly what it was before.
 # A run in which no probe was ever seen FAILS: it interrupted nothing, so it
-# proved nothing.
+# proved nothing. Every in-tree path a run writes must be one the gate
+# DECLARES as a probe (its "${ROOT}/...probe..." literals).
+#
+# Then, for every declared probe path, a file planted there first must make
+# the self-test refuse (exit 2) and survive byte-identical: a probe-planting
+# self-test must never overwrite or delete a file it did not create.
 #
 # Anything a failing gate strands is removed afterwards (only paths that
 # appeared during that run), so a red run leaves the tree as it found it.
@@ -56,6 +61,14 @@ new_paths() {
     sed -n 's/^?? //p'
 }
 
+# The in-tree probe paths a gate's self-test declares, from its source:
+# every "${ROOT}/...probe..." / "...selftest..." literal, minus the shared
+# helper it sources.
+probe_paths() {
+  grep -oE '"\$\{ROOT\}/[^"]*(probe|selftest)[^"]*"' "scripts/$1" |
+    tr -d '"' | sed 's#^\${ROOT}/##' | grep -v '^scripts/lib/' | sort -u
+}
+
 run_one() {
   local gate=$1 sig=$2
   n=$((n + 1))
@@ -80,6 +93,12 @@ os.execvp("bash", ["bash", sys.argv[1], "--self-test"])' "scripts/${gate}" >"$lo
     fi
     sleep 0.02
   done
+  local undeclared
+  undeclared=$(comm -23 <(new_paths "$before" "$(porcelain)" | sort -u) <(probe_paths "$gate"))
+  if [[ -n "$undeclared" ]]; then
+    echo "not ok ${n} - ${gate} ${sig}: wrote in-tree path(s) its probe list does not declare, so its guard cannot cover them: $(echo $undeclared)"
+    failures=$((failures + 1))
+  fi
   if [[ -z "$appeared" ]]; then
     kill -KILL -- "-$pid" 2>/dev/null
     wait "$pid" 2>/dev/null
@@ -119,16 +138,51 @@ os.execvp("bash", ["bash", sys.argv[1], "--self-test"])' "scripts/${gate}" >"$lo
   done <<<"$stranded"
 }
 
+# A file ALREADY at a probe path is not the run's to touch: the self-test
+# must refuse (exit 2) before planting anything and leave it byte-identical.
+# One run per declared probe path, so no path's guard can be missing.
+sentinel_one() {
+  local gate=$1 path=$2
+  n=$((n + 1))
+  if [[ -e "$path" ]]; then
+    echo "not ok ${n} - ${gate}: ${path} exists before the sentinel run; refusing to touch it"
+    failures=$((failures + 1))
+    return
+  fi
+  mkdir -p "$(dirname "$path")"
+  printf 'SENTINEL #4292 %s %s\n' "$gate" "$$" >"$path"
+  local want got rc=0 log="${LOGDIR}/${gate%.sh}-sentinel-$(basename "$path").log"
+  want=$(sha256sum "$path")
+  timeout 120 bash "scripts/${gate}" --self-test >"$log" 2>&1 || rc=$?
+  got=$(sha256sum "$path" 2>/dev/null || echo MISSING)
+  rm -f -- "$path"
+  if ((rc == 2)) && [[ "$got" == "$want" ]]; then
+    echo "ok ${n} - ${gate}: refuses a pre-existing ${path} (exit 2) and leaves it byte-identical"
+  else
+    echo "not ok ${n} - ${gate}: pre-existing ${path}: exit ${rc} (want 2), file ${got%% *} (want ${want%% *}) (log: ${log})"
+    failures=$((failures + 1))
+  fi
+}
+
 for g in "${GATES[@]}"; do
   [[ -f "scripts/${g}" ]] || { echo "not ok - scripts/${g} does not exist"; failures=$((failures + 1)); continue; }
+  mapfile -t declared < <(probe_paths "$g")
+  if ((${#declared[@]} == 0)); then
+    echo "not ok - scripts/${g}: no declared probe paths found"
+    failures=$((failures + 1))
+    continue
+  fi
   run_one "$g" INT
   run_one "$g" TERM
+  for path in "${declared[@]}"; do
+    sentinel_one "$g" "$path"
+  done
 done
 
 echo "1..${n}"
 if ((failures > 0)); then
-  echo "FAIL: ${failures} of ${n} interrupted self-test run(s) left the tree changed (#4292); logs: ${LOGDIR}" >&2
+  echo "FAIL: ${failures} of ${n} check(s) failed: an interrupted self-test left the tree changed or exited 0, or a self-test touched a file it did not create (#4292); logs: ${LOGDIR}" >&2
   exit 1
 fi
 rm -rf "$LOGDIR"
-echo "PASS: ${n} interrupted self-test run(s) left the tree unchanged (#4292)"
+echo "PASS: ${n} check(s): every interrupted self-test left the tree unchanged and exited non-zero, and every pre-existing probe-path file was refused and left intact (#4292)"

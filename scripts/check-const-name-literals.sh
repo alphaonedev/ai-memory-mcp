@@ -210,6 +210,13 @@ if [[ "${1:-}" == "--self-test" ]]; then
     # a line the scanner must read. Each case is probed on its own so one
     # shape can never mask another.
     probe="${ROOT}/src/__name_literal_gate_selftest.rs"
+    # Refuse rather than overwrite (and later delete) a file this run did not
+    # create, exactly like the other probe-planting self-tests (#4292, f2r).
+    if [[ -e "$probe" ]]; then
+        echo "ERROR: self-test scratch file already exists: $probe" >&2
+        echo "(cleanup may have failed in a prior run — remove manually)" >&2
+        exit 2
+    fi
     # #4292: the probe is removed on ANY exit, including an interrupted one,
     # and INT/TERM re-raise (an EXIT-only trap let an interrupted run finish
     # and exit 0). See scripts/lib/selftest-probes.sh.

@@ -738,6 +738,8 @@ jobs:
         # clean change. Each self-test is interrupted with SIGINT (process
         # group, like ^C) and SIGTERM (like timeout/CI cancel) once a probe
         # appears; git status must be unchanged and the run must not exit 0.
+        # A file already at any declared probe path must make the self-test
+        # refuse (exit 2) and survive byte-identical.
         run: bash scripts/test/test-gate-selftest-interrupt-cleanup.sh
 
   required-contexts-gate:
