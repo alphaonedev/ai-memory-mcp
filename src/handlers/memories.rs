@@ -651,7 +651,9 @@ async fn update_memory_write(
         }
     };
 
-    let lock = state.lock().await;
+    // #4089 — an OWNED guard, so the post-write embedding regeneration below
+    // can move it into its blocking-pool task (see `regenerate_embedding`).
+    let lock = state.lock_owned().await;
     // Resolve prefix if exact ID not found
     let resolved_id = match db::resolve_id(&lock.0, &id) {
         Ok(Some(mem)) => mem.id,
@@ -823,34 +825,20 @@ async fn update_memory_write(
             // linger even after the row is updated.
             let content_changed = body.title.is_some() || body.content.is_some();
             let mut lock_opt = Some(lock);
-            if content_changed && let Some(ref m) = mem {
+            if content_changed
+                && let Some(ref m) = mem
+                && let Some(emb) = app.embedder.as_ref().as_ref()
+                && let Some(guard) = lock_opt.take()
+            {
                 let text = crate::embeddings::embedding_document(&m.title, &m.content);
-                if let Some(emb) = app.embedder.as_ref().as_ref() {
-                    match emb.embed(&text) {
-                        Ok(vec) => {
-                            if let Some(ref l) = lock_opt
-                                && let Err(e) = db::set_embedding(
-                                    &l.0,
-                                    &resolved_id,
-                                    &vec,
-                                    &emb.space_fingerprint(),
-                                )
-                            {
-                                tracing::warn!(
-                                    "failed to refresh embedding for {resolved_id}: {e}"
-                                );
-                            }
-                            // Drop DB lock before touching vector index.
-                            lock_opt.take();
-                            let mut idx_lock = app.vector_index.lock().await;
-                            if let Some(idx) = idx_lock.as_mut() {
-                                idx.remove(&resolved_id);
-                                idx.insert(resolved_id.clone(), vec);
-                            }
-                        }
-                        Err(e) => tracing::warn!("embedding regeneration failed: {e}"),
-                    }
-                }
+                regenerate_embedding(
+                    guard,
+                    emb.clone(),
+                    text,
+                    resolved_id.clone(),
+                    std::sync::Arc::clone(&app.vector_index),
+                )
+                .await;
             }
             // Drop the DB lock before fanning out — peers POST back to
             // our sync_push so we'd deadlock if we held it.
@@ -940,6 +928,66 @@ async fn update_memory_write(
             crate::handlers::errors::handler_error_500(&e)
         }
     }
+}
+
+/// Issue #219 + #4089 — regenerate the embedding of a row whose searchable
+/// text (title/content) an update just changed, OFF the runtime worker and
+/// CANCELLATION-SAFE.
+///
+/// The embed is a CPU-bound forward pass (rust-1.98 CONCURRENCY-22), so it
+/// runs on the blocking pool. The row's new text is ALREADY committed when
+/// this runs, and the old vector is still stored against it, so the embed
+/// and its `set_embedding` must not be separable by an `.await`: if the
+/// request future were dropped there (client disconnect), the row would keep
+/// the OLD vector for its NEW text and semantic recall would rank it WRONG.
+/// The whole unit (embed, `set_embedding`, release the DB guard, vector
+/// index refresh) therefore runs inside ONE blocking task, which tokio runs
+/// to completion even when the awaiting handler is dropped (CONCURRENCY-23).
+/// The DB guard moves in with it, so no concurrent update can interleave a
+/// stale vector between the text write and the vector write — the same
+/// serialisation the pre-#4089 inline path had, without pinning a worker.
+///
+/// An embed failure keeps the pre-#4089 behaviour (WARN, row keeps its prior
+/// vector). A task that did not complete is WARNed + counted by
+/// `embed_offload` (surface `update`).
+async fn regenerate_embedding(
+    guard: tokio::sync::OwnedMutexGuard<(
+        rusqlite::Connection,
+        std::path::PathBuf,
+        crate::config::ResolvedTtl,
+        bool,
+    )>,
+    emb: crate::embeddings::Embedder,
+    text: String,
+    id: String,
+    vector_index: std::sync::Arc<
+        tokio::sync::Mutex<Option<Box<dyn crate::hnsw::VectorSearchIndex>>>,
+    >,
+) {
+    let _ =
+        super::embed_offload::on_blocking_pool(crate::metrics::EMBED_SURFACE_UPDATE, move || {
+            let vector = match emb.embed(&text) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!("embedding regeneration failed: {e}");
+                    return;
+                }
+            };
+            if let Err(e) = db::set_embedding(&guard.0, &id, &vector, &emb.space_fingerprint()) {
+                tracing::warn!("failed to refresh embedding for {id}: {e}");
+            }
+            // Drop the DB guard before touching the vector index (lock order:
+            // never hold both).
+            drop(guard);
+            // A blocking-pool thread is not an async context, so the
+            // synchronous acquire is the correct form here.
+            let mut idx_lock = vector_index.blocking_lock();
+            if let Some(idx) = idx_lock.as_mut() {
+                idx.remove(&id);
+                idx.insert(id, vector);
+            }
+        })
+        .await;
 }
 
 #[allow(clippy::too_many_lines)]
