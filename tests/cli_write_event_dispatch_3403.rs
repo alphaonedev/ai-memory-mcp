@@ -498,7 +498,7 @@ fn the_one_shot_epilogue_drains_the_webhook_fan_out_3403() {
     // events that reliably die with the process.
     let src = production_prefix(&read("src/daemon_runtime.rs"));
     assert!(
-        src.contains("subscriptions::drain_dispatches("),
+        src.contains("subscriptions::drain_dispatches_with_report("),
         "#3403: `daemon_runtime::run` must drain the webhook fan-out before a one-shot \
          `ai-memory <verb>` exits, or every CLI-dispatched event is lost at process exit."
     );

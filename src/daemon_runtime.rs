@@ -3143,19 +3143,17 @@ pub async fn run(
     // `std::process::exit` — not-found, governance Deny — do so BEFORE any
     // dispatch, so no admitted delivery can be stranded by that route.)
     //
-    // Severity is a WARN, never an error: the durable write already
-    // happened, and the per-delivery audit row is persisted BEFORE the
-    // network send, so a K7 replay-from-cursor can re-deliver whatever the
-    // deadline truncated. Turning a delivery deadline into a non-zero exit
-    // would misreport a committed write as a failure.
-    if !crate::subscriptions::drain_dispatches(crate::subscriptions::shutdown_drain_timeout()).await
-    {
-        tracing::warn!(
-            "webhook fan-out did not drain within the shutdown budget; the write(s) are \
-             durable and every admitted delivery has a persisted audit row — replay from \
-             the subscription cursor to re-deliver"
-        );
-    }
+    // Severity is a WARN, never an error: the durable write already happened,
+    // and a non-zero exit would misreport a committed write as a failure. On
+    // a miss, deliveries already started have their audit row (replay from
+    // the cursor); ones not yet started were DLQ-recorded by the drain and the
+    // WARN counts both (#3979). A crash never reaches this line, and loses
+    // every not-yet-started delivery: only its in-memory registration exists.
+    crate::subscriptions::drain_dispatches_with_report(
+        crate::subscriptions::shutdown_drain_timeout(),
+    )
+    .await
+    .log_miss("one-shot CLI");
 
     result
 }
@@ -8493,12 +8491,15 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    // #3403 — the SHARED drain (`subscriptions::drain_dispatches`), also
-    // used by the one-shot CLI epilogue in `run`. The daemon's severity is
-    // FATAL: a late delivery worker could write after the final audit
-    // checkpoint.
-    if !crate::subscriptions::drain_dispatches(crate::subscriptions::shutdown_drain_timeout()).await
-    {
+    // #3403 — the SHARED drain, also run by the one-shot CLI epilogue. FATAL
+    // here: a late worker could write after the final audit checkpoint. #3979:
+    // a miss first DLQ-records every delivery not yet started, and logs counts.
+    let drain = crate::subscriptions::drain_dispatches_with_report(
+        crate::subscriptions::shutdown_drain_timeout(),
+    )
+    .await;
+    drain.log_miss("daemon");
+    if !drain.drained {
         return Err(fatal_shutdown(
             "subscription dispatch shutdown deadline exceeded",
         ));
