@@ -394,6 +394,57 @@ pub(crate) fn init_for_test_with_writer(writer: Box<dyn Write + Send>) {
     }
 }
 
+/// #4021 test helper: produce a flat audit trail with ONE real lost event.
+/// Events 1 and 2 are written, event 3 hits a failing write (its sequence is
+/// consumed, the chain head does not move), and event 4 is written. The trail
+/// therefore verifies its hash chain cleanly and carries exactly the gap 3-3,
+/// through the same mechanism a full disk produces. Takes the sink lock.
+#[cfg(test)]
+pub(crate) fn gapped_trail_for_test() -> Vec<u8> {
+    use std::sync::atomic::AtomicBool;
+    struct Toggle {
+        buf: std::sync::Arc<Mutex<Vec<u8>>>,
+        fail: std::sync::Arc<AtomicBool>,
+    }
+    impl Write for Toggle {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            if self.fail.load(Ordering::SeqCst) {
+                return Err(std::io::Error::from_raw_os_error(28)); // ENOSPC
+            }
+            self.buf
+                .lock()
+                .expect("test buffer")
+                .extend_from_slice(data);
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let _g = sink_test_lock();
+    let buf = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let fail = std::sync::Arc::new(AtomicBool::new(false));
+    init_for_test_with_writer(Box::new(Toggle {
+        buf: std::sync::Arc::clone(&buf),
+        fail: std::sync::Arc::clone(&fail),
+    }));
+    let one = || {
+        emit(EventBuilder::new(
+            AuditAction::Store,
+            actor("ai:gap-4021", "explicit", None),
+            target_memory("m", "ns", None, None, None),
+        ));
+    };
+    one();
+    one();
+    fail.store(true, Ordering::SeqCst);
+    one();
+    fail.store(false, Ordering::SeqCst);
+    one();
+    shutdown_for_test();
+    buf.lock().expect("test buffer").clone()
+}
+
 /// Process-wide lock serialising any test that installs or removes the
 /// global audit sink. The sink lives on the shared [`RuntimeContext`],
 /// so tests across modules (audit's own + the `mcp` dispatch tests that
@@ -847,6 +898,66 @@ pub fn target_sweep(namespace: impl Into<String>) -> AuditTarget {
 pub struct VerifyReport {
     pub total_lines: u64,
     pub first_failure: Option<VerifyFailure>,
+    /// #4021 — every interior sequence gap, in file order. `try_emit`
+    /// increments the sequence BEFORE it writes, so an event lost to a write
+    /// failure (#3975) leaves a skipped value. A restart reseeds from the file
+    /// tail and makes no gap, so in a single-writer trail a gap is evidence of
+    /// a lost event. A trail that starts above sequence 1 is not a gap (the
+    /// head of a file is not checked).
+    pub gaps: Vec<SequenceGap>,
+}
+
+/// #4021 — a run of sequence numbers that no line carries: `from..=to`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SequenceGap {
+    /// First missing sequence number.
+    pub from: u64,
+    /// Last missing sequence number (inclusive).
+    pub to: u64,
+}
+
+impl SequenceGap {
+    /// How many events the gap stands for.
+    #[must_use]
+    pub fn len(&self) -> u64 {
+        self.to - self.from + 1
+    }
+
+    /// Always false: a gap covers at least one sequence number.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        false
+    }
+}
+
+impl std::fmt::Display for SequenceGap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}-{}", self.from, self.to)
+    }
+}
+
+impl std::str::FromStr for SequenceGap {
+    type Err = String;
+
+    /// Parses `FROM-TO` (inclusive, `FROM <= TO`), the form verify prints.
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        let (a, b) = s
+            .trim()
+            .split_once('-')
+            .ok_or_else(|| format!("gap range `{s}` must be FROM-TO"))?;
+        let from: u64 = a
+            .trim()
+            .parse()
+            .map_err(|_| format!("gap range `{s}`: FROM is not a number"))?;
+        let to: u64 = b
+            .trim()
+            .parse()
+            .map_err(|_| format!("gap range `{s}`: TO is not a number"))?;
+        if from == 0 || from > to {
+            return Err(format!("gap range `{s}` must satisfy 1 <= FROM <= TO"));
+        }
+        Ok(Self { from, to })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -895,7 +1006,9 @@ pub enum VerifyFailureKind {
 }
 
 impl VerifyReport {
-    /// Convenience — `Ok(())` when chain is intact, `Err` when not.
+    /// Convenience — `Ok(())` when chain is intact AND no event is missing,
+    /// `Err` when not. A sequence gap fails here too (#4021): there is no
+    /// acknowledgement on this path.
     pub fn into_result(self) -> Result<u64> {
         if let Some(failure) = self.first_failure {
             Err(anyhow!(
@@ -904,10 +1017,42 @@ impl VerifyReport {
                 failure.kind,
                 failure.detail
             ))
+        } else if !self.gaps.is_empty() {
+            Err(anyhow!("{}", lost_events_message(&self.gaps)))
         } else {
             Ok(self.total_lines)
         }
     }
+
+    /// #4021 — the gaps NOT named by `acknowledged`. An acknowledgement
+    /// matches a gap only EXACTLY (same `from` and `to`), so a broad range
+    /// can never act as a blanket pass for gaps that appear later.
+    #[must_use]
+    pub fn unacknowledged_gaps(&self, acknowledged: &[SequenceGap]) -> Vec<SequenceGap> {
+        self.gaps
+            .iter()
+            .copied()
+            .filter(|g| !acknowledged.contains(g))
+            .collect()
+    }
+}
+
+/// #4021 — why a gap fails verify. Deliberately NOT the tamper wording: a
+/// gap is most likely an event lost to a failed write, which #3975 counts.
+#[must_use]
+pub fn lost_events_message(gaps: &[SequenceGap]) -> String {
+    let events: u64 = gaps.iter().map(SequenceGap::len).sum();
+    let ranges = gaps
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "{events} audit event(s) missing: sequence gap(s) {ranges}. These events were \
+         sequenced but never written, most likely a failed write (see \
+         {AUDIT_WRITE_FAILURES_TOTAL}). If the loss is known and accepted, re-run with \
+         --acknowledge-gaps {ranges}"
+    )
 }
 
 /// Walk an audit log file and verify the chain. Returns a structured
@@ -928,6 +1073,7 @@ pub fn verify_chain_from_reader<R: Read>(reader: R) -> Result<VerifyReport> {
     let mut total: u64 = 0;
     let mut prev_hash = CHAIN_HEAD_PREV_HASH.to_string();
     let mut prev_seq: u64 = 0;
+    let mut gaps: Vec<SequenceGap> = Vec::new();
 
     for (idx, line) in buf.lines().enumerate() {
         let line_no = (idx as u64) + 1;
@@ -942,6 +1088,7 @@ pub fn verify_chain_from_reader<R: Read>(reader: R) -> Result<VerifyReport> {
             Err(e) => {
                 return Ok(VerifyReport {
                     total_lines: total,
+                    gaps: std::mem::take(&mut gaps),
                     first_failure: Some(VerifyFailure {
                         line_number: line_no,
                         kind: VerifyFailureKind::Parse,
@@ -954,6 +1101,7 @@ pub fn verify_chain_from_reader<R: Read>(reader: R) -> Result<VerifyReport> {
         if ev.prev_hash != prev_hash {
             return Ok(VerifyReport {
                 total_lines: total,
+                gaps: std::mem::take(&mut gaps),
                 first_failure: Some(VerifyFailure {
                     line_number: line_no,
                     kind: VerifyFailureKind::ChainBreak,
@@ -968,6 +1116,7 @@ pub fn verify_chain_from_reader<R: Read>(reader: R) -> Result<VerifyReport> {
         if ev.sequence <= prev_seq && prev_seq != 0 {
             return Ok(VerifyReport {
                 total_lines: total,
+                gaps: std::mem::take(&mut gaps),
                 first_failure: Some(VerifyFailure {
                     line_number: line_no,
                     kind: VerifyFailureKind::Sequence,
@@ -979,10 +1128,19 @@ pub fn verify_chain_from_reader<R: Read>(reader: R) -> Result<VerifyReport> {
             });
         }
 
+        // #4021: an interior skip is a lost event (the head is not checked).
+        if prev_seq != 0 && ev.sequence > prev_seq + 1 {
+            gaps.push(SequenceGap {
+                from: prev_seq + 1,
+                to: ev.sequence - 1,
+            });
+        }
+
         let recomputed = compute_self_hash(&ev);
         if recomputed != ev.self_hash {
             return Ok(VerifyReport {
                 total_lines: total,
+                gaps: std::mem::take(&mut gaps),
                 first_failure: Some(VerifyFailure {
                     line_number: line_no,
                     kind: VerifyFailureKind::SelfHash,
@@ -1001,6 +1159,7 @@ pub fn verify_chain_from_reader<R: Read>(reader: R) -> Result<VerifyReport> {
     Ok(VerifyReport {
         total_lines: total,
         first_failure: None,
+        gaps,
     })
 }
 
@@ -2189,6 +2348,93 @@ mod tests {
         assert_eq!(n, 1);
     }
 
+    /// #4021: a real lost write (the #3975 mechanism) leaves an intact hash
+    /// chain and a sequence gap. Pre-#4021 this trail verified clean.
+    #[test]
+    fn a_lost_write_leaves_a_detected_gap_4021() {
+        let trail = super::gapped_trail_for_test();
+        let report = verify_chain_from_reader(trail.as_slice()).unwrap();
+        assert_eq!(
+            report.first_failure, None,
+            "the hash chain itself is intact"
+        );
+        assert_eq!(report.total_lines, 3, "events 1, 2 and 4 were written");
+        assert_eq!(report.gaps, vec![super::SequenceGap { from: 3, to: 3 }]);
+        let err = report.clone().into_result().unwrap_err().to_string();
+        assert!(err.contains("1 audit event(s) missing"), "got: {err}");
+        assert!(err.contains("--acknowledge-gaps 3-3"), "got: {err}");
+        assert!(
+            !err.contains("somebody touched"),
+            "a gap is a lost event, never the tamper wording"
+        );
+    }
+
+    /// #4021: an acknowledgement passes a gap only when it names it EXACTLY.
+    #[test]
+    fn an_acknowledgement_matches_a_gap_only_exactly_4021() {
+        let report = VerifyReport {
+            total_lines: 4,
+            first_failure: None,
+            gaps: vec![
+                super::SequenceGap { from: 3, to: 3 },
+                super::SequenceGap { from: 7, to: 9 },
+            ],
+        };
+        let exact = [
+            super::SequenceGap { from: 3, to: 3 },
+            super::SequenceGap { from: 7, to: 9 },
+        ];
+        assert!(report.unacknowledged_gaps(&exact).is_empty());
+        // A broad range is NOT a blanket pass.
+        let broad = [super::SequenceGap { from: 1, to: 100 }];
+        assert_eq!(report.unacknowledged_gaps(&broad), report.gaps);
+        // Acknowledging one leaves the other failing.
+        assert_eq!(
+            report.unacknowledged_gaps(&exact[..1]),
+            vec![super::SequenceGap { from: 7, to: 9 }]
+        );
+    }
+
+    #[test]
+    fn gap_ranges_parse_strictly_4021() {
+        use std::str::FromStr;
+        assert_eq!(
+            super::SequenceGap::from_str("3-3").unwrap(),
+            super::SequenceGap { from: 3, to: 3 }
+        );
+        assert_eq!(
+            super::SequenceGap::from_str(" 7 - 9 ").unwrap(),
+            super::SequenceGap { from: 7, to: 9 }
+        );
+        for bad in ["", "3", "0-1", "5-3", "a-b", "3-", "-3"] {
+            assert!(
+                super::SequenceGap::from_str(bad).is_err(),
+                "`{bad}` must be refused"
+            );
+        }
+    }
+
+    /// #4021: a trail with no gap reports none (a restart reseeds from the
+    /// tail, so contiguous emission is the normal shape).
+    #[test]
+    fn a_contiguous_trail_has_no_gap_4021() {
+        let _g = sink_lock();
+        let buf = std::sync::Arc::new(Mutex::new(Vec::new()));
+        super::init_for_test(std::sync::Arc::clone(&buf));
+        for _ in 0..3 {
+            super::emit(EventBuilder::new(
+                AuditAction::Store,
+                actor("a", "explicit", None),
+                target_memory("m", "ns", None, None, None),
+            ));
+        }
+        super::shutdown_for_test();
+        let trail = buf.lock().unwrap().clone();
+        let report = verify_chain_from_reader(trail.as_slice()).unwrap();
+        assert!(report.gaps.is_empty());
+        assert_eq!(report.into_result().unwrap(), 3);
+    }
+
     #[test]
     fn audit_verify_report_into_result_err() {
         let report = VerifyReport {
@@ -2198,6 +2444,7 @@ mod tests {
                 kind: VerifyFailureKind::ChainBreak,
                 detail: "x".to_string(),
             }),
+            gaps: Vec::new(),
         };
         let err = report.into_result().unwrap_err();
         let msg = format!("{err}");
