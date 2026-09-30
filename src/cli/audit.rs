@@ -1137,6 +1137,8 @@ fn run_verify(
                     },
                     "gaps": gaps_json,
                     "gap_count": report.gaps.len(),
+                    // #4211: additive; the lines of a TornRecord verdict.
+                    "torn_lines": report.torn_lines,
                     "path": path.display().to_string(),
                 })
             )?;
