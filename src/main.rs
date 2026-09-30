@@ -713,34 +713,66 @@ fn init_forensic_audit(
     // (#3354), never a plain load that could predate generation.
     ai_memory::governance::audit::init_audit_signers(signing_key.as_ref());
     let log_path = ai_memory::audit::resolve_audit_path(&audit_cfg);
+    let record = hosts_writers || ledger_writer;
     let Some(dir) = log_path.parent() else {
-        eprintln!("ai-memory: forensic init skipped (could not resolve audit dir)");
-        return Ok(());
+        // #4272 — no forensic directory means no sink: the same outcome as any
+        // other failure to start it, never a silent skip.
+        return forensic_sink_unavailable(
+            ai_memory::governance::audit::ForensicTailUnreadable {
+                path: log_path.clone(),
+                cause: "the forensic audit directory could not be resolved".to_string(),
+            },
+            record,
+            db_path,
+        );
     };
     warn_if_plaintext_retention_requested(&audit_cfg);
     let init_result = ai_memory::governance::audit::init(dir, signing_key);
-    report_future_dated_forensic_files(dir, hosts_writers || ledger_writer, db_path);
+    report_future_dated_forensic_files(dir, record, db_path);
     if let Err(e) = init_result {
-        use ai_memory::governance::audit as forensic;
-        let Some(unavailable) = e.downcast_ref::<forensic::ForensicTailUnreadable>() else {
-            eprintln!("ai-memory: forensic audit init failed (continuing unsigned): {e}");
-            return Ok(());
+        // #4272 — EVERY failure to start the sink is "forensic sink
+        // unavailable", not only an unreadable tail: an uncreatable directory,
+        // a writer that cannot be spawned, a poisoned lock. It used to print
+        // "continuing unsigned" and exit 0 with NO sink, even under
+        // AI_MEMORY_REQUIRE_FORENSIC_SINK.
+        let unavailable = match e.downcast::<ai_memory::governance::audit::ForensicTailUnreadable>()
+        {
+            Ok(typed) => typed,
+            Err(other) => ai_memory::governance::audit::ForensicTailUnreadable {
+                path: dir.to_path_buf(),
+                cause: format!("{other:#}"),
+            },
         };
-        // #4199 (vote 4d3ea1c5) — the chain tail cannot be established. The
-        // sink stays OFF (never a genesis fork). Refuse only in require-mode.
-        if forensic::require_forensic_sink_enabled() {
-            return Err(e);
-        }
-        eprintln!("{}", forensic::degraded_boot_message(&e));
-        tracing::error!(target: "ai_memory::audit", "forensic sink unavailable: {e:#}");
-        ai_memory::metrics::inc_forensic_sink_unavailable();
-        // The signed outage row is written only by the verbs that write the
-        // ledger (f2r review of 15fde1499): `doctor`, the egress and
-        // remediation verbs and the read-only verbs must never open, let
-        // alone migrate, the store from here.
-        if hosts_writers || ledger_writer {
-            record_forensic_outage(db_path, unavailable);
-        }
+        return forensic_sink_unavailable(unavailable, record, db_path);
+    }
+    Ok(())
+}
+
+/// #4199 / #4272 — the forensic sink could not be started. Under
+/// `AI_MEMORY_REQUIRE_FORENSIC_SINK` (pinned by `asi-hard`) this is the typed
+/// refusal the caller turns into exit 78 (`doctor` exempt). Otherwise the
+/// process runs WITHOUT the sink (never a genesis fork) and says so four ways:
+/// an ERROR, the metric, the doctor Critical, and (from the ledger-writing
+/// verbs only) the signed outage row.
+fn forensic_sink_unavailable(
+    unavailable: ai_memory::governance::audit::ForensicTailUnreadable,
+    record: bool,
+    db_path: &std::path::Path,
+) -> Result<()> {
+    use ai_memory::governance::audit as forensic;
+    if forensic::require_forensic_sink_enabled() {
+        return Err(anyhow::Error::new(unavailable));
+    }
+    let e = anyhow::Error::new(unavailable.clone());
+    eprintln!("{}", forensic::degraded_boot_message(&e));
+    tracing::error!(target: "ai_memory::audit", "forensic sink unavailable: {e:#}");
+    ai_memory::metrics::inc_forensic_sink_unavailable();
+    // The signed outage row is written only by the verbs that write the
+    // ledger (f2r review of 15fde1499): `doctor`, the egress and remediation
+    // verbs and the read-only verbs must never open, let alone migrate, the
+    // store from here.
+    if record {
+        record_forensic_outage(db_path, &unavailable);
     }
     Ok(())
 }
