@@ -487,14 +487,23 @@ pub struct PinnedTarget {
 /// NOT apply on this lane). Returns `(resolved_host, addrs)`.
 fn resolve_inference_authority(url: &str) -> Result<(String, Vec<SocketAddr>), String> {
     let lower = url.to_ascii_lowercase();
-    let rest = lower.split_once("://").map_or(lower.as_str(), |(_, r)| r);
+    // #4075 — the implicit port is the SCHEME's default (443 for https): the
+    // resolved addresses are pinned into the reqwest client, whose connector
+    // keeps a pin's non-zero port when the URL omits one. A scheme with no
+    // known default (or no scheme at all) cannot be pinned correctly, so it
+    // fails CLOSED rather than guessing a port.
+    let (scheme, rest) = lower
+        .split_once("://")
+        .ok_or_else(|| "target URL has no scheme to derive a port from".to_string())?;
+    let default_port = crate::subscriptions::default_port_for_scheme(scheme)
+        .ok_or_else(|| format!("target URL scheme `{scheme}` is not http(s)"))?;
     let host_port = crate::subscriptions::authority_without_userinfo(rest);
     if host_port.is_empty() {
         return Err("target URL has no authority to resolve".to_string());
     }
     // Bracket/port-stripped host (the reqwest resolve key), and a resolvable
-    // `host:port` (default 80 when the URL omits the port), mirroring the
-    // subscriptions SSRF lane's normalization.
+    // `host:port` (the scheme default when the URL omits the port), mirroring
+    // the subscriptions SSRF lane's normalization.
     let (resolved_host, resolv_target) =
         if let Some(close) = host_port.strip_prefix('[').and(host_port.find(']')) {
             let inner = host_port[1..close].to_string();
@@ -502,7 +511,7 @@ fn resolve_inference_authority(url: &str) -> Result<(String, Vec<SocketAddr>), S
             let tgt = if after.starts_with(':') {
                 host_port.to_string()
             } else {
-                crate::subscriptions::host_port_with_default_http_port(host_port)
+                crate::subscriptions::host_port_with_default_port(host_port, default_port)
             };
             (inner, tgt)
         } else if let Some(idx) = host_port.rfind(':') {
@@ -510,7 +519,7 @@ fn resolve_inference_authority(url: &str) -> Result<(String, Vec<SocketAddr>), S
         } else {
             (
                 host_port.to_string(),
-                crate::subscriptions::host_port_with_default_http_port(host_port),
+                crate::subscriptions::host_port_with_default_port(host_port, default_port),
             )
         };
     match resolv_target.to_socket_addrs() {
@@ -641,6 +650,39 @@ pub fn refuse_inference_egress_audited(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #4075 sibling — the internal-only inference lane pins the addresses
+    /// `resolve_inference_authority` returns into the reqwest client, whose
+    /// connector keeps a pin's port when the URL omits one. An implicit-port
+    /// `https://` endpoint must therefore pin :443, not the pre-fix :80.
+    #[test]
+    fn inference_pins_use_scheme_default_port_4075() {
+        let ports = |url: &str| -> Vec<u16> {
+            let (_, addrs) = resolve_inference_authority(url)
+                .unwrap_or_else(|e| panic!("{url} must resolve: {e}"));
+            addrs.iter().map(SocketAddr::port).collect()
+        };
+        for url in [
+            "https://localhost/v1",
+            "https://127.0.0.1",
+            "https://[::1]/",
+        ] {
+            assert!(
+                ports(url).iter().all(|p| *p == 443),
+                "#4075: implicit-port {url} must pin :443, got {:?}",
+                ports(url)
+            );
+        }
+        assert!(ports("http://127.0.0.1/").iter().all(|p| *p == 80));
+        assert!(
+            ports("https://127.0.0.1:11434/")
+                .iter()
+                .all(|p| *p == 11434)
+        );
+        // No scheme / an unknown scheme cannot be pinned correctly: refuse.
+        assert!(resolve_inference_authority("127.0.0.1").is_err());
+        assert!(resolve_inference_authority("ftp://127.0.0.1/").is_err());
+    }
 
     #[test]
     fn class_tokens_are_stable_and_inference_flagged() {
