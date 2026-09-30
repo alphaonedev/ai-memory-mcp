@@ -6527,6 +6527,17 @@ pub const FORGET_TOMBSTONE_TRACE_TARGET: &str = "forget.tombstone";
 pub const FORGET_TOMBSTONE_DROP_MSG: &str =
     "rejected inbound federation write for a forgotten id (resurrection guard)";
 
+/// v1.0.0 #4029 — the ONE audit line every resurrection-guard drop site
+/// emits (sqlite admission funnels + the postgres `tombstone_serial_4029`
+/// gate), so the target and message cannot drift between sites.
+pub(crate) fn log_forget_tombstone_drop(memory_id: &str) {
+    tracing::info!(
+        target: FORGET_TOMBSTONE_TRACE_TARGET,
+        memory_id = %memory_id,
+        "{FORGET_TOMBSTONE_DROP_MSG}"
+    );
+}
+
 /// `forget_tombstones` row exists)? The federation RECEIVE funnel consults
 /// this BEFORE accepting an inbound write so a peer that still holds a
 /// forgotten row cannot resurrect it via LWW. Tombstone-WINS: once an id is
@@ -17171,11 +17182,7 @@ fn restore_archived_gated(conn: &Connection, id: &str, gate: RestoreTombstoneGat
     let result = (|| -> Result<bool> {
         if gate == RestoreTombstoneGate::Federated {
             if memory_is_tombstoned(conn, id)? {
-                tracing::info!(
-                    target: FORGET_TOMBSTONE_TRACE_TARGET,
-                    memory_id = %id,
-                    "{FORGET_TOMBSTONE_DROP_MSG}"
-                );
+                log_forget_tombstone_drop(id);
                 return Ok(false);
             }
             crate::storage::admission_hook::checkpoint(id);
@@ -18523,11 +18530,7 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
         // holds. Idempotent no-op return (the row stays forgotten); logged for
         // audit. #4029 — under the write lock (see `owns_tx`).
         if memory_is_tombstoned(conn, &mem.id)? {
-            tracing::info!(
-                target: FORGET_TOMBSTONE_TRACE_TARGET,
-                memory_id = %mem.id,
-                "{FORGET_TOMBSTONE_DROP_MSG}"
-            );
+            log_forget_tombstone_drop(&mem.id);
             return Ok(mem.id.clone());
         }
         crate::storage::admission_hook::checkpoint(&mem.id);
@@ -18755,11 +18758,7 @@ pub fn merge_inbound(
         // (postgres `merge_inbound` parity: the guard runs before any merge).
         // A forgotten id is dropped whole — never merged, never re-inserted.
         if memory_is_tombstoned(conn, &inbound.id)? {
-            tracing::info!(
-                target: FORGET_TOMBSTONE_TRACE_TARGET,
-                memory_id = %inbound.id,
-                "{FORGET_TOMBSTONE_DROP_MSG}"
-            );
+            log_forget_tombstone_drop(&inbound.id);
             return Ok(Some(inbound.id.clone()));
         }
         crate::storage::admission_hook::checkpoint(&inbound.id);
