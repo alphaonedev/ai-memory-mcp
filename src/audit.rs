@@ -1137,8 +1137,10 @@ pub struct VerifyReport {
     /// tail and makes no gap, so in a single-writer trail a gap is evidence of
     /// a lost event. The converse does NOT hold: events lost after the last
     /// written line and before a restart have their numbers reused and leave
-    /// no gap (#4086). A trail that starts above sequence 1 is not a gap (the
-    /// head of a file is not checked).
+    /// no gap (#4086). The HEAD is checked too (#4191): verify always starts
+    /// from the genesis anchor, whose sequence is 0, so a genesis-anchored
+    /// first line above sequence 1 reports `1..=first-1`, the events lost
+    /// before the first successful write.
     pub gaps: Vec<SequenceGap>,
 }
 
@@ -1307,8 +1309,7 @@ pub fn verify_chain(path: &Path) -> Result<VerifyReport> {
     // gap like any interior one, INCLUDING on an empty trail: a mark above 0
     // is evidence that events were numbered, so a trail whose every event was
     // lost (a disk full from the first write) is the gap 1..=mark, never
-    // clean. The "head is not checked" rule covers only an empty trail with
-    // no such evidence.
+    // clean. An empty trail with no mark is clean: nothing was numbered.
     let high_water = read_seq_mark(&seq_mark_path(path))?.unwrap_or(0);
     if report.first_failure.is_none() && high_water > last_sequence {
         report.gaps.push(SequenceGap {
@@ -1374,7 +1375,11 @@ fn walk_chain<R: Read>(reader: R, last_sequence: &mut u64) -> Result<VerifyRepor
             });
         }
 
-        if ev.sequence <= prev_seq && prev_seq != 0 {
+        // #4191: the genesis anchor IS sequence 0 (every verifiable trail
+        // starts there; a first line not chained to it fails ChainBreak
+        // above), so the head is held to the same rules as every later line:
+        // sequence 0 is refused, and a first line above 1 is a gap.
+        if ev.sequence <= prev_seq {
             return Ok(VerifyReport {
                 total_lines: total,
                 gaps: std::mem::take(&mut gaps),
@@ -1389,8 +1394,8 @@ fn walk_chain<R: Read>(reader: R, last_sequence: &mut u64) -> Result<VerifyRepor
             });
         }
 
-        // #4021: an interior skip is a lost event (the head is not checked).
-        if prev_seq != 0 && ev.sequence > prev_seq + 1 {
+        // #4021: a skip is a lost event, at the head (#4191) as anywhere.
+        if ev.sequence > prev_seq + 1 {
             gaps.push(SequenceGap {
                 from: prev_seq + 1,
                 to: ev.sequence - 1,
@@ -1688,6 +1693,9 @@ fn mark_append_only(_path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tail_loss_4086_tests;
+
+#[cfg(test)]
+mod verify_head_4191_tests;
 
 #[cfg(test)]
 mod tests {
