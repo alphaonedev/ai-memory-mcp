@@ -460,6 +460,20 @@ interior gap. That includes an EMPTY trail: if every event was lost (a disk
 full from the first write), the file has no lines and the mark holds N, and
 `verify` reports the gap 1..=N instead of reading clean.
 
+**The mark is written AHEAD of every append (#4299).** Each event's number is
+written to the mark (in place, no fsync) before the event is appended, under
+the trail's exclusive lock, and made durable (fdatasync) only if the write
+fails. So a process that dies after numbering an event and before writing it
+(a kill, an OOM, a panic, even with the disk full on the first byte) leaves
+that number on disk, and `verify` reports it as a gap; after an ordinary
+write the mark simply equals the last line. The write-ahead is not fsynced
+because the trail lines are not fsynced either: the mark is exactly as
+durable as the lines it guards, and a per-event fsync would stall every audited
+operation. `verify` takes a shared lock on the trail, so a write in progress
+(mark already ahead, line not yet written) is waited out, never reported as a
+gap. If the write-ahead itself fails, the event is still written (the event
+matters more than its index) and stderr says so.
+
 The mark adds no boot refusal on a full disk. An existing mark is updated in
 place at start-up, and only when its value changes; only a missing mark is
 created through a temp file and a rename. Start-up needs no new file once the
@@ -474,14 +488,17 @@ recreates it from the trail. A missing mark (a new trail, or one written before
 
 Remaining limits:
 
-- An event lost to a crash between being numbered and its write failing (the
-  process dies mid-write) is not recorded in the mark. If some of its bytes
-  reached the file, the torn line fails `verify` with `Parse` and a restart
-  refuses the torn tail. If none did, nothing on disk records the lost number
-  and `verify` reads clean: the one residual the mark cannot close, because
-  the mark is written only once the write has failed. (A crash AFTER a failed
-  write is covered: the mark is made durable before any bytes are removed,
-  #4298.)
+- **Power loss.** Neither the trail lines nor the write-ahead mark are
+  fsynced per event (the mark is fsynced only when a write fails). A power
+  loss or kernel crash can therefore drop the newest lines AND the mark's
+  record of them together, and `verify` then reads clean for those events.
+  Every PROCESS crash is covered: the write-ahead (#4299) is in the kernel
+  before the append, and a failed write's loss is made durable before any
+  bytes are removed (#4298).
+- If the write-ahead itself fails (the mark cannot be written, which stderr
+  reports) AND that event's append then fails on its first byte AND the
+  process dies before the failure path records the loss, nothing records
+  the lost number.
 - **Custody of the mark.** `audit.log.seq` is NOT signed and not chained; it
   has exactly the custody of the trail (the same directory, the same
   permissions). Deleting it, or rolling it back together with the trail's
