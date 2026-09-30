@@ -426,8 +426,13 @@ part-way (a disk that fills mid-record writes some bytes, then reports
 ENOSPC), the bytes it left are removed: every ai-memory writer holds an
 exclusive lock on the trail around each append, and the leftover is
 truncated only when it is provably that write's own (a prefix of the record
-it was writing). The trail is then exactly as it was, and the lost event is
-an ordinary gap. If only the newline was missing, the line is finished and
+it was writing), and only AFTER the lost event's number is durable in the
+high-water mark (#4298). The trail is then exactly as it was, and the lost
+event is an ordinary gap. A crash at any point of this path cannot hide the
+loss: before the mark is written the partial record is still on disk (verify
+fails and a restart refuses the torn tail); after it, the mark names the
+lost number. If the mark cannot be written, the bytes are not removed at all
+(they stay as a `TornRecord`, below). If only the newline was missing, the line is finished and
 the event was not lost at all.
 
 When the leftover cannot be removed (the append-only OS flag set by
@@ -470,8 +475,13 @@ recreates it from the trail. A missing mark (a new trail, or one written before
 Remaining limits:
 
 - An event lost to a crash between being numbered and its write failing (the
-  process dies mid-write) is not recorded; a torn line fails `verify` with
-  `Parse` instead.
+  process dies mid-write) is not recorded in the mark. If some of its bytes
+  reached the file, the torn line fails `verify` with `Parse` and a restart
+  refuses the torn tail. If none did, nothing on disk records the lost number
+  and `verify` reads clean: the one residual the mark cannot close, because
+  the mark is written only once the write has failed. (A crash AFTER a failed
+  write is covered: the mark is made durable before any bytes are removed,
+  #4298.)
 - **Custody of the mark.** `audit.log.seq` is NOT signed and not chained; it
   has exactly the custody of the trail (the same directory, the same
   permissions). Deleting it, or rolling it back together with the trail's

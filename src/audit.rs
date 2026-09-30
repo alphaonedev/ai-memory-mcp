@@ -335,6 +335,55 @@ const fn truncation_refused_for_test() -> bool {
     false
 }
 
+/// #4298 — test seam: fail every high-water write, to prove a failed append
+/// is never truncated when its loss could not be made durable.
+#[cfg(test)]
+static REFUSE_MARK_WRITE_FOR_TEST: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+fn mark_write_refused_for_test() -> bool {
+    REFUSE_MARK_WRITE_FOR_TEST.load(Ordering::SeqCst)
+}
+
+#[cfg(not(test))]
+const fn mark_write_refused_for_test() -> bool {
+    false
+}
+
+/// #4298 — crash points on the failed-append path, in the order they occur.
+/// The last instant before the lost number reaches the mark: right after the
+/// failed append, nothing yet removed.
+const CRASH_BEFORE_MARK: &str = "before-mark";
+const CRASH_AFTER_MARK: &str = "after-mark";
+const CRASH_AFTER_TRUNCATE: &str = "after-truncate";
+
+/// #4298 — test seam: when set, each crash point copies the trail and its
+/// high-water mark into `<dir>/<point>/`, i.e. exactly what a process killed
+/// at that point leaves on disk, so a cell can verify every such state.
+#[cfg(test)]
+static CRASH_SNAPSHOT_DIR: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+#[cfg(test)]
+fn crash_snapshot(point: &str, trail: Option<&Path>) {
+    let dir = CRASH_SNAPSHOT_DIR.lock().ok().and_then(|g| g.clone());
+    let (Some(dir), Some(trail)) = (dir, trail) else {
+        return;
+    };
+    let out = dir.join(point);
+    let _ = std::fs::create_dir_all(&out);
+    let name = trail.file_name().unwrap_or_default();
+    let _ = std::fs::copy(trail, out.join(name));
+    let mark = seq_mark_path(trail);
+    if mark.exists() {
+        let _ = std::fs::copy(&mark, seq_mark_path(&out.join(name)));
+    }
+}
+
+#[cfg(not(test))]
+#[inline]
+fn crash_snapshot(_: &str, _: Option<&Path>) {}
+
 /// #4211 — what became of a failed append's bytes.
 #[derive(Debug)]
 enum Undo {
@@ -348,8 +397,10 @@ enum Undo {
 
 /// #4211 — after `write_all(record)` failed, restore the trail to its
 /// pre-write length when the bytes past it are provably this append's own
-/// (a prefix of `record`) and the lock is held. Otherwise report what is
-/// left so the next record can be line-aligned.
+/// (a prefix of `record`) and `locked` allows it. The caller passes `locked`
+/// only when the lock is held AND the loss is already durable in the #4086
+/// high-water (#4298). Otherwise report what is left so the next record can
+/// be line-aligned.
 fn undo_failed_append(
     trail: Option<&File>,
     pre_len: Option<u64>,
@@ -440,6 +491,12 @@ impl SeqMark {
     fn record(&mut self, sequence: u64) -> Result<()> {
         if sequence <= self.recorded {
             return Ok(());
+        }
+        if mark_write_refused_for_test() {
+            return Err(anyhow!(
+                "recording lost audit sequence {sequence} in {}: refused by the test seam",
+                self.path.display()
+            ));
         }
         self.overwrite(sequence)
     }
@@ -1162,9 +1219,9 @@ fn write_event(inner: &mut SinkInner, builder: EventBuilder, sequence: u64) -> R
         writer,
         last_hash,
         path,
+        seq_mark,
         trail,
         torn,
-        ..
     } = inner;
     let lock = TrailLock::acquire(trail.as_ref());
     // #4211: a previous failed append left bytes that could not be removed.
@@ -1219,8 +1276,22 @@ fn write_event(inner: &mut SinkInner, builder: EventBuilder, sequence: u64) -> R
         .and_then(|f| f.metadata().ok())
         .map(|m| m.len());
     if let Err(write_err) = writer.write_all(&record) {
-        match undo_failed_append(trail.as_ref(), pre_len, lock.held(), &record, &self_hash) {
-            Undo::Clean => {}
+        crash_snapshot(CRASH_BEFORE_MARK, path.as_deref());
+        // #4298: make the loss DURABLE before any of its evidence is removed.
+        // The #4086 high-water records this sequence (fdatasync'd) FIRST; only
+        // then may the partial record be truncated. The reverse order left a
+        // window where a crash showed a clean trail and a mark that did not
+        // cover the lost number: a false "no gap" (the partial line, before
+        // #4211, at least failed verify). If the mark cannot be written, the
+        // bytes are never truncated: they stay as the evidence (the Torn path).
+        let loss_durable = match seq_mark.as_mut() {
+            Some(mark) => mark.record(sequence).is_ok(),
+            None => trail.is_none(),
+        };
+        crash_snapshot(CRASH_AFTER_MARK, path.as_deref());
+        let may_truncate = lock.held() && loss_durable;
+        match undo_failed_append(trail.as_ref(), pre_len, may_truncate, &record, &self_hash) {
+            Undo::Clean => crash_snapshot(CRASH_AFTER_TRUNCATE, path.as_deref()),
             Undo::Completed => {
                 *last_hash = self_hash;
                 return Ok(());
@@ -1959,6 +2030,9 @@ mod verify_head_4191_tests;
 
 #[cfg(test)]
 mod torn_write_4211_tests;
+
+#[cfg(test)]
+mod crash_window_4298_tests;
 
 #[cfg(test)]
 mod tests {
