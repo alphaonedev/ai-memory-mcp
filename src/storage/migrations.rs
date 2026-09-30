@@ -1922,7 +1922,7 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             // ERRORS-02: propagate DDL/commit failures; the guard rolls back
             // both definitions together if repair cannot complete.
             let repair_txn = super::connection::WriteTxn::begin_exclusive(conn)?;
-            crate::storage::embed_skip::apply_sqlite_v96(conn)?;
+            crate::storage::embed_skip::repair_sqlite_after_trigger_gap(conn)?;
             repair_txn.commit()?;
         }
         return Ok(());
@@ -4628,8 +4628,10 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
 
         // #4078: entry dropped these before any ALTER. The v96 arm is
         // skipped by v96-v99 stores, so restore the final definitions here
-        // inside the SAME transaction, before publishing the new version.
-        crate::storage::embed_skip::apply_sqlite_v96(conn)?;
+        // inside the SAME transaction, before publishing the new version. The
+        // skip cache is cleared with them: rows edited while the triggers were
+        // absent would otherwise keep a stale marker (L8 finding on #4078).
+        crate::storage::embed_skip::repair_sqlite_after_trigger_gap(conn)?;
 
         conn.execute(SQL_CLEAR_SCHEMA_VERSION, [])?;
         conn.execute(

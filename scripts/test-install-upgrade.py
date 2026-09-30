@@ -25,6 +25,26 @@ class PackagingContract(unittest.TestCase):
         self.assertNotIn('--volumes', recipe)
         self.assertIn('up -d --build', recipe)
 
+    def test_plan_c_runbook_never_recommends_volume_deletion(self):
+        text = (ROOT / 'docs/plan-c-deployment.md').read_text()
+        section = text.split('## Routine recreate', 1)[1].split('\n## ', 1)[0]
+        fences = []
+        inside = False
+        for line in section.splitlines():
+            if line.startswith('```'):
+                inside = not inside
+            elif inside:
+                fences.append(line)
+        recipe = '\n'.join(fences)
+        self.assertNotIn('down -v', recipe)
+        self.assertNotIn('--volumes', recipe)
+        self.assertIn('up -d --build --force-recreate', recipe)
+        self.assertIn('NEW random keypair', section, 'the runbook must say why')
+
+    def test_backup_unit_comment_does_not_claim_migration(self):
+        unit = (ROOT / 'packaging/systemd/ai-memory-backup.service').read_text()
+        self.assertIn('never migrates', unit)
+
     def test_companions_use_main_database(self):
         main = (ROOT / 'packaging/systemd/ai-memory.service').read_text().splitlines()
         database = next(line for line in main if line.startswith('Environment=AI_MEMORY_DB='))
@@ -86,6 +106,9 @@ class InstallerUpgrade(unittest.TestCase):
                 'case "$1" in -o) shift; output=$1;; https:*) url=$1;; esac\nshift\ndone\n'
                 f'case "$url" in *.sha256) /bin/cp {shlex.quote(str(checksum))} "$output";;\n'
                 f'*) /bin/cp {shlex.quote(str(asset))} "$output";; esac\n')
+            if mode == 'dir-target':
+                installed.unlink()
+                installed.mkdir()
             if mode == 'copy-failure':
                 (stubs / 'cp').write_text(
                     '#!/bin/sh\nfor arg do dest=$arg; done\n'
@@ -105,6 +128,12 @@ class InstallerUpgrade(unittest.TestCase):
                 remaining, _ = running.communicate('old-still-running\n', timeout=5)
                 self.assertEqual(running.returncode, 0)
                 self.assertIn('old-still-running', remaining)
+            if mode == 'dir-target':
+                self.assertNotEqual(result.returncode, 0, output)
+                self.assertTrue(installed.is_dir())
+                self.assertEqual(list(installed.iterdir()), [], 'candidate moved into the directory')
+                self.assertEqual(sorted(p.name for p in dest.iterdir()), ['ai-memory'], 'staging leak')
+                return
             if mode in ('copy-failure', 'bad-loader'):
                 self.assertNotEqual(result.returncode, 0, output)
                 self.assertEqual(installed.read_bytes(), old, 'failed upgrade destroyed old executable\n' + output)
@@ -119,6 +148,9 @@ class InstallerUpgrade(unittest.TestCase):
 
     def test_loader_failure_preserves_old_binary(self):
         self.run_upgrade('bad-loader')
+
+    def test_directory_at_target_is_refused(self):
+        self.run_upgrade('dir-target')
 
     def test_running_old_process_survives_upgrade(self):
         self.run_upgrade('running')

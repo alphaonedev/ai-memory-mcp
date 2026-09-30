@@ -38,7 +38,10 @@ SystemCallFilter=@system-service
 SystemCallFilter=~@mount @swap @reboot @obsolete
 CapabilityBoundingSet=
 AmbientCapabilities=
-# The backup opener also writes WAL/SHM and migration/watermark state.
+# `backup` opens the database through the unmigrated egress funnel (#4207): it
+# never migrates, so a newer binary on disk cannot upgrade the live primary
+# under a still-running older daemon. The grant covers the WAL/SHM sidecars SQLite
+# keeps beside the database file and the backups directory, nothing else.
 ReadWritePaths=/var/lib/ai-memory
 
 TimeoutStartSec=15min

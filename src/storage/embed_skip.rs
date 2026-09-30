@@ -148,6 +148,29 @@ pub fn apply_sqlite_v96(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// #4078 — re-install the clear triggers after a window in which they were
+/// ABSENT (a v96-v99 store upgraded by a binary whose ladder skipped the v96
+/// arm, or a current-schema store that lost them), and discard the skip cache.
+///
+/// While the triggers were missing, a content edit or a fresh embedding could
+/// not clear a row's marker, so a surviving `oversize` / `undecryptable`
+/// marker may describe content that no longer exists and would exclude the row
+/// from embedding backfill permanently. `embed_skip` is a REGENERABLE cache
+/// (the next scan re-records whatever is still unembeddable; the durable text
+/// is never touched), so the honest repair is to clear it in the SAME
+/// transaction that restores the triggers.
+///
+/// # Errors
+///
+/// Propagates a rusqlite failure; the caller's transaction rolls both the
+/// trigger DDL and the cache clear back together (ERRORS-02).
+pub fn repair_sqlite_after_trigger_gap(conn: &Connection) -> Result<()> {
+    apply_sqlite_v96(conn)?;
+    conn.execute("DELETE FROM embed_skip", [])
+        .context("clear embed_skip cache after the trigger gap")?;
+    Ok(())
+}
+
 /// Why a row was remembered as unembeddable. A descriptive enum, not a
 /// bare bool (API-09).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

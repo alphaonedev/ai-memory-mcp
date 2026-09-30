@@ -367,6 +367,13 @@ fi
 # ---------------------------------------------------------------------------
 # Install binary
 # ---------------------------------------------------------------------------
+# A directory at the target would make `mv` move the candidate INSIDE it and
+# report success with the old "binary" untouched; refuse before staging anything.
+if [ -d "$INSTALL_DIR/$BINARY" ]; then
+    echo "Error: $INSTALL_DIR/$BINARY is a directory, not an executable; refusing to install over it." >&2
+    exit 1
+fi
+
 # Stage on the destination filesystem so publication is an atomic rename.
 # A failed copy, chmod or loader check must leave the old executable intact.
 STAGED_BINARY="$(mktemp "$INSTALL_DIR/.${BINARY}.upgrade.XXXXXX")"
@@ -381,6 +388,9 @@ if ! "$STAGED_BINARY" --version >/dev/null 2>&1; then
     echo "Error: Downloaded binary cannot execute; installed binary unchanged." >&2
     exit 1
 fi
+# Best-effort flush of the staged bytes so a power cut between the rename and
+# writeback cannot leave a zero-length executable under the final name.
+sync 2>/dev/null || true
 mv -f "$STAGED_BINARY" "$INSTALL_DIR/$BINARY"
 STAGED_BINARY=""
 

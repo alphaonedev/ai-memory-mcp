@@ -150,6 +150,55 @@ fn sqlite_current_schema_repairs_missing_embed_skip_triggers_4078() {
     assert_heals(&db::open(temp.path()).expect("repair current schema on open"));
 }
 
+/// L8 finding on #4078: the repair reinstalls the triggers but must also drop
+/// markers orphaned while they were absent. Seed an oversize marker, drop both
+/// triggers, shorten the row with a RAW update (no trigger fires), reopen.
+#[test]
+fn sqlite_repair_clears_markers_stranded_in_the_trigger_gap_4078() {
+    let temp = tempfile::NamedTempFile::new().unwrap();
+    let conn = db::open(temp.path()).unwrap();
+    seed(&conn);
+    conn.execute_batch(
+        "DROP TRIGGER memories_embed_skip_clear_on_content;
+        DROP TRIGGER memories_embed_skip_clear_on_embed;
+        UPDATE memories SET content='short, embeddable' WHERE id='upgrade-4078';",
+    )
+    .unwrap();
+    drop(conn);
+    let conn = db::open(temp.path()).expect("repair current schema on open");
+    let stale: i64 = conn
+        .query_row("SELECT count(*) FROM embed_skip", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(stale, 0, "repair left a marker for content that changed");
+    let rows = db::get_unembedded_ids_batch(&conn, 10).expect("backfill scan");
+    assert!(
+        rows.iter().any(|(id, _, _)| id == "upgrade-4078"),
+        "the edited row must be eligible for embedding again"
+    );
+}
+
+/// Same gap on the ladder path: a v99 store whose triggers were dropped and
+/// whose oversize row was edited before this binary upgraded it.
+#[test]
+fn sqlite_ladder_upgrade_clears_markers_stranded_in_the_trigger_gap_4078() {
+    let temp = tempfile::NamedTempFile::new().unwrap();
+    let conn = db::open(temp.path()).unwrap();
+    seed(&conn);
+    conn.execute_batch(
+        "DROP TRIGGER memories_embed_skip_clear_on_content;
+        DROP TRIGGER memories_embed_skip_clear_on_embed;
+        UPDATE memories SET content='short, embeddable' WHERE id='upgrade-4078';
+        UPDATE schema_version SET version = 99;",
+    )
+    .unwrap();
+    drop(conn);
+    let conn = db::open(temp.path()).expect("ladder upgrade");
+    let stale: i64 = conn
+        .query_row("SELECT count(*) FROM embed_skip", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(stale, 0, "ladder upgrade left a stranded marker");
+}
+
 #[cfg(feature = "sal-postgres")]
 mod postgres {
     use ai_memory::store::postgres::PostgresStore;
