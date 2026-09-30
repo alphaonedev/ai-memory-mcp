@@ -729,6 +729,16 @@ jobs:
         # the shared one (the #1998/#2115/#2127 recurrent shape); the
         # gate must reject both and spare a compliant control fixture.
         run: bash scripts/check-test-env-lock.sh --self-test
+      - name: Interrupted gate self-tests leave no probe behind (#4292)
+        # This gate's self-test, like five others, must plant probe files
+        # INSIDE the tree (the gate scans src/ and tests/). One interrupted
+        # run (a full disk, ^C, a CI cancel) used to strand them, and a
+        # stranded src/ probe then failed OTHER gates: it turned the #3838
+        # landing gate's check-cert-removal-proof.sh --self-test red on a
+        # clean change. Each self-test is interrupted with SIGINT (process
+        # group, like ^C) and SIGTERM (like timeout/CI cancel) once a probe
+        # appears; git status must be unchanged and the run must not exit 0.
+        run: bash scripts/test/test-gate-selftest-interrupt-cleanup.sh
 
   required-contexts-gate:
     # Issues #2494 / #2496 — required-status-check SOUNDNESS. The required set
