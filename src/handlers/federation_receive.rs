@@ -717,6 +717,23 @@ pub(super) fn resolve_inbound_decider(
     sender_agent_id.to_string()
 }
 
+/// #1718 / #4027 — the ONE forged-signature predicate for a federated signal,
+/// evaluated on the ORIGINAL wire bytes on BOTH receive funnels, BEFORE the
+/// #3049 secret screen.
+///
+/// A present-but-invalid signature (including one whose `sender_pubkey` is
+/// empty, which can never verify) is forged and refused unconditionally —
+/// regardless of the `AI_MEMORY_FED_REQUIRE_SIGNAL_SIG` staged-rollout knob,
+/// which only governs whether a genuinely UNSIGNED signal is accepted. The
+/// ordering is load-bearing: the screen CLEARS `signature`/`sender_pubkey`
+/// when it redacts a signed field, and the store-side check in
+/// `MemoryStore::apply_remote_signal` only fires on a non-empty signature, so
+/// a check left until after the screen let a forged signal through as an
+/// accepted unsigned one (#4027, postgres funnel).
+pub(super) fn signal_wire_signature_forged(sig: &crate::models::Signal) -> bool {
+    !sig.signature.is_empty() && !crate::signals::verify(sig)
+}
+
 /// #1843 (v0.8.1, security-high) — author-binding authorization for an inbound
 /// relayed signal, shared verbatim by the sqlite (`sync_push`) and postgres
 /// (`sync_push_via_store`) receive loops so both backends behave identically.
@@ -4054,7 +4071,7 @@ async fn sync_push_write(
             skipped += 1;
             continue;
         }
-        if !sig.signature.is_empty() && !crate::signals::verify(sig) {
+        if signal_wire_signature_forged(sig) {
             tracing::warn!(
                 "sync_push: signal {} has an invalid signature — skipping (forged)",
                 sig.id
