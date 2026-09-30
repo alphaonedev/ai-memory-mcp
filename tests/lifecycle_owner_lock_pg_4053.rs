@@ -191,17 +191,36 @@ async fn drop_park_trigger(pg: &PostgresStore) {
     .expect("remove barrier trigger");
 }
 
-/// Park Alice's content write, queue an ownership transfer behind her row
-/// lock, release, and report `(lifecycle the transfer observed, Alice's
-/// result, final (owner, lifecycle))`.
-async fn race(
-    pg: &Arc<PostgresStore>,
-    explicit: bool,
-) -> (
+/// What [`race`] reports: `(lifecycle the transfer observed, Alice's result,
+/// final (owner, lifecycle))`.
+type RaceOutcome = (
     String,
     Result<Option<i64>, StoreError>,
     (Option<String>, String),
-) {
+);
+
+/// Park Alice's content write, queue an ownership transfer behind her row
+/// lock, release, and report what the transfer saw.
+///
+/// The barrier trigger sits on the SHARED `memories` table, so it must never
+/// outlive this call (f2r review of 9b101e875): a leaked trigger would make
+/// every later content UPDATE in every test binary take advisory key 4053.
+/// So it is dropped before install (healing a leak from an earlier crashed
+/// run) and dropped again unconditionally after the body, which runs in its
+/// own task so a failing assertion inside it cannot skip the cleanup.
+async fn race(pg: &Arc<PostgresStore>, explicit: bool) -> RaceOutcome {
+    drop_park_trigger(pg).await;
+    let body = tokio::spawn(race_body(Arc::clone(pg), explicit)).await;
+    drop_park_trigger(pg).await;
+    match body {
+        Ok(outcome) => outcome,
+        Err(join) if join.is_panic() => std::panic::resume_unwind(join.into_panic()),
+        Err(join) => panic!("race body did not complete: {join}"),
+    }
+}
+
+async fn race_body(pg: Arc<PostgresStore>, explicit: bool) -> RaceOutcome {
+    let pg = &pg;
     let m = seed(pg).await;
     install_park_trigger(pg).await;
 
@@ -249,7 +268,6 @@ async fn race(
         .await
         .expect("writer completed")
         .expect("join writer");
-    drop_park_trigger(pg).await;
     let after: (Option<String>, String) =
         sqlx::query_as("SELECT metadata->>'agent_id', lifecycle_state FROM memories WHERE id = $1")
             .bind(&m.id)
