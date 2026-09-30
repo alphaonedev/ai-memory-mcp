@@ -351,6 +351,25 @@ const fn mark_write_refused_for_test() -> bool {
     false
 }
 
+/// #4299 — test seam: refuse the WRITE-AHEAD mark only, to prove a failed
+/// write-ahead never costs the event itself.
+#[cfg(test)]
+static REFUSE_WRITE_AHEAD_FOR_TEST: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+fn write_ahead_refused_for_test() -> bool {
+    REFUSE_WRITE_AHEAD_FOR_TEST.load(Ordering::SeqCst)
+}
+
+#[cfg(not(test))]
+const fn write_ahead_refused_for_test() -> bool {
+    false
+}
+
+/// #4299 — the crash point between the write-ahead mark and the append.
+const CRASH_BEFORE_APPEND: &str = "before-append";
+
 /// #4298 — crash points on the failed-append path, in the order they occur.
 /// The last instant before the lost number reaches the mark: right after the
 /// failed append, nothing yet removed.
@@ -481,15 +500,44 @@ pub fn seq_mark_path(trail: &Path) -> PathBuf {
 struct SeqMark {
     file: File,
     path: PathBuf,
-    /// The value currently on disk.
+    /// The value last written to the file (possibly not yet synced).
     recorded: u64,
+    /// The value known to be durable (fdatasync'd).
+    synced: u64,
 }
 
 impl SeqMark {
-    /// Raise the mark to `sequence` (no-op when it is not higher) with an
-    /// in-place, fixed-width overwrite, then `fdatasync`.
-    fn record(&mut self, sequence: u64) -> Result<()> {
+    /// #4299 — WRITE-AHEAD: raise the mark to `sequence` BEFORE its event is
+    /// appended, with an in-place, fixed-width overwrite and NO fsync (the
+    /// trail lines are not fsynced either, so the mark is exactly as durable
+    /// as the lines it guards: it survives any process crash, and a power
+    /// loss can drop both). A process that dies after numbering an event and
+    /// before writing it, even on the first byte, therefore still leaves the
+    /// number on disk, and verify reports it as a gap. No-op when not higher.
+    fn advance(&mut self, sequence: u64) -> Result<()> {
         if sequence <= self.recorded {
+            return Ok(());
+        }
+        if write_ahead_refused_for_test() {
+            return Err(anyhow!(
+                "writing audit sequence {sequence} ahead in {}: refused by the test seam",
+                self.path.display()
+            ));
+        }
+        self.write_in_place(sequence).with_context(|| {
+            format!(
+                "writing audit sequence {sequence} ahead in {}",
+                self.path.display()
+            )
+        })
+    }
+
+    /// Make `sequence` DURABLE in the mark (fdatasync), writing it first when
+    /// it is not there yet. Used when a write failed: the loss must be on disk
+    /// before any of its evidence is removed (#4298). A number the write-ahead
+    /// already put there is synced, not skipped. No-op when already durable.
+    fn record(&mut self, sequence: u64) -> Result<()> {
+        if sequence <= self.synced {
             return Ok(());
         }
         if mark_write_refused_for_test() {
@@ -498,22 +546,35 @@ impl SeqMark {
                 self.path.display()
             ));
         }
-        self.overwrite(sequence)
+        let path = self.path.display().to_string();
+        let ctx = || format!("recording lost audit sequence {sequence} in {path}");
+        if sequence > self.recorded {
+            self.write_in_place(sequence).with_context(ctx)?;
+        }
+        self.file.sync_data().with_context(ctx)?;
+        self.synced = self.recorded;
+        Ok(())
     }
 
     /// Write `sequence` over the fixed-width record in place, then
-    /// `fdatasync`.
+    /// `fdatasync` (the start-up path: `open_seq_mark`).
     fn overwrite(&mut self, sequence: u64) -> Result<()> {
-        self.file
-            .seek(SeekFrom::Start(0))
-            .and_then(|_| self.file.write_all(seq_mark_record(sequence).as_bytes()))
+        self.write_in_place(sequence)
             .and_then(|()| self.file.sync_data())
             .with_context(|| {
                 format!(
-                    "recording lost audit sequence {sequence} in {}",
+                    "recording audit sequence {sequence} in {}",
                     self.path.display()
                 )
             })?;
+        self.synced = self.recorded;
+        Ok(())
+    }
+
+    /// The in-place, fixed-width write itself (no sync).
+    fn write_in_place(&mut self, sequence: u64) -> std::io::Result<()> {
+        self.file.seek(SeekFrom::Start(0))?;
+        self.file.write_all(seq_mark_record(sequence).as_bytes())?;
         self.recorded = sequence;
         Ok(())
     }
@@ -584,6 +645,7 @@ fn open_seq_mark(mark: &Path, existing: Option<u64>, value: u64) -> Result<SeqMa
                 file,
                 path: mark.to_path_buf(),
                 recorded: on_disk,
+                synced: on_disk,
             };
             if on_disk != value {
                 seq_mark.overwrite(value)?;
@@ -629,6 +691,7 @@ fn create_seq_mark(mark: &Path, value: u64) -> Result<SeqMark> {
         file,
         path: mark.to_path_buf(),
         recorded: value,
+        synced: value,
     })
 }
 
@@ -1275,6 +1338,25 @@ fn write_event(inner: &mut SinkInner, builder: EventBuilder, sequence: u64) -> R
         .as_ref()
         .and_then(|f| f.metadata().ok())
         .map(|m| m.len());
+    // #4299: WRITE-AHEAD. The number goes into the mark (in place, no fsync)
+    // BEFORE the append, under the trail lock, so a process that dies after
+    // numbering the event and before writing it, even on the first byte,
+    // leaves that number on disk and verify reports it as a gap. A failed
+    // write-ahead never costs the event: the event is still appended (the
+    // durable record matters more than its index), and the failure is said.
+    if let Some(mark) = seq_mark.as_mut()
+        && let Err(e) = mark.advance(sequence)
+    {
+        let _ = writeln!(
+            std::io::stderr(),
+            "ai-memory: audit trail {}: {e:#}; the event is still written, but if this \
+             write also fails and the process dies before the loss is recorded, the \
+             loss leaves no trace (#4299)",
+            path.as_deref()
+                .map_or_else(|| "?".into(), |p| p.display().to_string())
+        );
+    }
+    crash_snapshot(CRASH_BEFORE_APPEND, path.as_deref());
     if let Err(write_err) = writer.write_all(&record) {
         crash_snapshot(CRASH_BEFORE_MARK, path.as_deref());
         // #4298: make the loss DURABLE before any of its evidence is removed.
@@ -1577,6 +1659,14 @@ pub fn lost_events_message(gaps: &[SequenceGap]) -> String {
 /// - The sequence high-water mark next to the trail (#4086) exists but is
 ///   unreadable or corrupt: whether events were lost cannot be determined.
 pub fn verify_chain(path: &Path) -> Result<VerifyReport> {
+    // #4299: every writer holds the EXCLUSIVE trail lock across its
+    // write-ahead mark and its append, so for that moment the mark names a
+    // number whose line is not written yet. A SHARED lock here makes verify
+    // wait that moment out instead of reporting it as a gap; it is held
+    // across the walk AND the mark read. Best effort: a filesystem without
+    // locks still verifies.
+    let lock = File::open(path).with_context(|| crate::errors::msg::opening(path.display()))?;
+    let _ = lock.lock_shared();
     let file = File::open(path).with_context(|| crate::errors::msg::opening(path.display()))?;
     let mut last_sequence = 0;
     let mut report = walk_chain(file, &mut last_sequence)?;
@@ -2036,6 +2126,9 @@ mod torn_write_4211_tests;
 
 #[cfg(test)]
 mod crash_window_4298_tests;
+
+#[cfg(test)]
+mod write_ahead_4299_tests;
 
 #[cfg(test)]
 mod tests {
