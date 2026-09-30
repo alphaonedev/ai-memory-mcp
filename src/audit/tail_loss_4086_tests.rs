@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use super::*;
 
 /// A writer that fails like a full disk.
-struct Enospc;
+pub(super) struct Enospc;
 
 impl Write for Enospc {
     fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
@@ -29,14 +29,14 @@ impl Write for Enospc {
 }
 
 /// Swap the live sink's writer (the file stays the sink's configured path).
-fn swap_writer(w: Box<dyn Write + Send>) {
+pub(super) fn swap_writer(w: Box<dyn Write + Send>) {
     let audit = &RuntimeContext::global().audit;
     let guard = audit.sink.read().expect("sink lock");
     let sink = guard.as_ref().expect("an installed sink");
     sink.inner.lock().expect("sink inner").writer = w;
 }
 
-fn reopen_real_file(path: &Path) {
+pub(super) fn reopen_real_file(path: &Path) {
     let f = OpenOptions::new()
         .append(true)
         .open(path)
@@ -44,7 +44,7 @@ fn reopen_real_file(path: &Path) {
     swap_writer(Box::new(f));
 }
 
-fn one() {
+pub(super) fn one() {
     emit(EventBuilder::new(
         AuditAction::Store,
         actor("ai:tail-4086", "explicit", None),
@@ -52,7 +52,7 @@ fn one() {
     ));
 }
 
-fn sequences(path: &Path) -> Vec<u64> {
+pub(super) fn sequences(path: &Path) -> Vec<u64> {
     std::fs::read_to_string(path)
         .expect("read trail")
         .lines()
@@ -65,7 +65,7 @@ fn sequences(path: &Path) -> Vec<u64> {
         .collect()
 }
 
-fn mark_file(path: &Path) -> PathBuf {
+pub(super) fn mark_file(path: &Path) -> PathBuf {
     let mut name = path.file_name().expect("file name").to_os_string();
     name.push(".seq");
     path.with_file_name(name)
