@@ -10,7 +10,10 @@
 # expose it). Form 7 operator key is generated on first launch by the
 # init container.
 #
-# Usage (both variables are REQUIRED; compose refuses to render without them):
+# Usage (both variables are REQUIRED; compose refuses to render without them).
+# AI_MEMORY_API_KEY: at least 32 characters from [A-Za-z0-9._~+/=-]. To ROTATE
+# it, change the variable and `up -d` again: init rewrites the key and the
+# services restart with it (#4213).
 #   AI_MEMORY_IMAGE=ai-memory:local AI_MEMORY_API_KEY="$(openssl rand -hex 32)" \
 #   docker compose -f scripts/docker/docker-compose.batman-active.yml up -d
 #   docker compose -f scripts/docker/docker-compose.batman-active.yml logs -f curator
@@ -67,23 +70,45 @@ services:
         #
         # The same file carries `api_key` (#3838), so it is a secret: 0700
         # directory, 0600 file, written under umask 077, and every service runs
-        # as the same AI_MEMORY_UID. The key is added (at the top, where a TOML
-        # top-level key must go) only when the file has none, so an
-        # operator-set key is never replaced.
+        # as the same AI_MEMORY_UID.
+        # The key is checked in the C locale: under a UTF-8 locale the bracket
+        # ranges admit ~2000 non-ASCII letters (#3838 L8). At least 32
+        # characters (`openssl rand -hex 32` gives 64).
+        export LC_ALL=C
         case "$$AI_MEMORY_API_KEY" in
           ''|*[!A-Za-z0-9._~+/=-]*)
             echo "init-batman: AI_MEMORY_API_KEY must be non-empty and use only [A-Za-z0-9._~+/=-]" >&2
             exit 64 ;;
         esac
+        if [ "$${#AI_MEMORY_API_KEY}" -lt 32 ]; then
+          echo "init-batman: AI_MEMORY_API_KEY must be at least 32 characters (e.g. openssl rand -hex 32)" >&2
+          exit 64
+        fi
         mkdir -p /data/xdg/ai-memory
         chmod 700 /data/xdg /data/xdg/ai-memory
         cfg=/data/xdg/ai-memory/config.toml
         if [ ! -f "$$cfg" ]; then
           (umask 077; printf 'schema_version = 2\ntier = "autonomous"\n' > "$$cfg")
         fi
-        if ! grep -q '^api_key[[:space:]]*=' "$$cfg"; then
-          (umask 077; { printf 'api_key = "%s"\n' "$$AI_MEMORY_API_KEY"; cat "$$cfg"; } > "$$cfg.new")
+        # #4213 — AI_MEMORY_API_KEY is the source of truth: a changed key
+        # REPLACES the stored one (it used to be kept, so rotation silently did
+        # nothing). The rewrite uses shell builtins only, so the key never
+        # reaches argv; it goes first, where a TOML top-level key must go.
+        want="api_key = \"$$AI_MEMORY_API_KEY\""
+        have=""
+        while IFS= read -r line || [ -n "$$line" ]; do
+          if [[ $$line =~ ^api_key[[:space:]]*= ]]; then have=$$line; break; fi
+        done < "$$cfg"
+        if [ "$$have" != "$$want" ]; then
+          (umask 077
+           { printf '%s\n' "$$want"
+             while IFS= read -r line || [ -n "$$line" ]; do
+               [[ $$line =~ ^api_key[[:space:]]*= ]] || printf '%s\n' "$$line"
+             done < "$$cfg"; } > "$$cfg.new")
           mv "$$cfg.new" "$$cfg"
+          if [ -n "$$have" ]; then
+            echo "init-batman: API key rotated (the services restart with it: depends_on restart: true)"
+          fi
         fi
         chmod 600 "$$cfg"
         echo "init-batman complete"
@@ -99,6 +124,9 @@ services:
     depends_on:
       init-batman:
         condition: service_completed_successfully
+        # #4213 — a re-run init (e.g. a rotated AI_MEMORY_API_KEY) restarts
+        # this service, so the old key stops working.
+        restart: true
     environment:
       AI_MEMORY_DB: /data/ai-memory.db
       AI_MEMORY_KEY_DIR: /keys
@@ -156,6 +184,9 @@ services:
     depends_on:
       init-batman:
         condition: service_completed_successfully
+        # #4213 — a re-run init (e.g. a rotated AI_MEMORY_API_KEY) restarts
+        # this service, so the old key stops working.
+        restart: true
     environment:
       AI_MEMORY_DB: /data/ai-memory.db
       AI_MEMORY_KEY_DIR: /keys
@@ -192,6 +223,9 @@ services:
     depends_on:
       init-batman:
         condition: service_completed_successfully
+        # #4213 — a re-run init (e.g. a rotated AI_MEMORY_API_KEY) restarts
+        # this service, so the old key stops working.
+        restart: true
     environment:
       AI_MEMORY_DB: /data/ai-memory.db
       AI_MEMORY_KEY_DIR: /keys

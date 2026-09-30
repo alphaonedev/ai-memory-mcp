@@ -29,6 +29,12 @@
 #      few seconds (an argv the CLI rejects exits 2 at once).
 #   7. Run the sync service's effective argv with no SYNC_PEERS: it must reach
 #      its documented idle exit 0 (the shell script parses and runs).
+#   Plus the #3838 L8 secret-handling legs: 5b the key is enforced (none and a
+#   wrong key 401, the right key 200); the key directories are 0700; 8 a key
+#   outside the charset or shorter than 32 is refused (64) without touching
+#   the file; 9 (#4213) a changed AI_MEMORY_API_KEY rotates the stored key
+#   and, after the restart compose performs (depends_on restart: true), the old
+#   key is refused and the new one accepted.
 #
 # Every service must declare its entrypoint EXPLICITLY (#3838, Codex review):
 # the root Dockerfile sets ENTRYPOINT ["ai-memory"] and Dockerfile.batman-active
@@ -91,7 +97,7 @@ grep -q AI_MEMORY_API_KEY "${T}/no-key.err" || fail "missing-key refusal does no
 echo "ok 1 - compose refuses to render without AI_MEMORY_IMAGE / AI_MEMORY_API_KEY"
 
 # ---- 2. render ---------------------------------------------------------------
-API_KEY="smoke3838$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
+API_KEY="smoke3838$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
 AI_MEMORY_IMAGE=smoke:local AI_MEMORY_API_KEY="${API_KEY}" SYNC_PEERS= \
     docker compose -f "${COMPOSE}" --profile sync config --format json > "${T}/rendered.json"
 PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
@@ -133,6 +139,10 @@ cur = effective("curator")
 assert cur[0] == "ai-memory" and cur[1] != "ai-memory", cur[:2]
 syn = effective("sync")
 assert syn[:2] == ["sh", "-c"], syn[:2]
+for name in ("mcp", "curator", "sync"):
+    dep = (svc[name].get("depends_on") or {}).get("init-batman") or {}
+    # #4213: a re-run init (a rotated key) must restart the services.
+    assert dep.get("restart") is True, f"{name}: depends_on init-batman lacks restart: true (#4213)"
 hc = [rw(a) for a in svc["mcp"]["healthcheck"]["test"]]
 assert hc[0] == "CMD", hc
 for name, var in (("init-batman", "INIT_ENV"), ("mcp", "MCP_ENV"), ("curator", "CURATOR_ENV"), ("sync", "SYNC_ENV")):
@@ -147,7 +157,7 @@ PYEOF
 source "${T}/plan.sh"
 [[ " ${MCP_ARGV[*]} " == *" --host 0.0.0.0 "* ]] \
     || fail "the rendered mcp service no longer binds 0.0.0.0 (the published port needs it): ${MCP_ARGV[*]}"
-echo "ok 2 - rendered; every service declares its entrypoint; mcp runs: ${MCP_ARGV[*]}"
+echo "ok 2 - rendered; every service declares its entrypoint and restarts on a re-run init; mcp runs: ${MCP_ARGV[*]}"
 
 # A container starts with ONLY its image env + the rendered environment block.
 # `env -i` reproduces that, so no host AI_MEMORY_* (e.g. AI_MEMORY_NO_CONFIG,
@@ -167,7 +177,11 @@ MODE="$(stat -c '%a' "${CFG}" 2>/dev/null || stat -f '%Lp' "${CFG}")"
 [[ "${MODE}" == 600 ]] || fail "config.toml holds the API key but is mode ${MODE}, not 600"
 grep -q "^api_key = \"${API_KEY}\"$" "${CFG}" || fail "config.toml does not carry the AI_MEMORY_API_KEY"
 grep -q '^tier = "autonomous"$' "${CFG}" || fail "config.toml lost the autonomous tier"
-echo "ok 4 - config.toml is mode 600 and carries api_key + tier"
+for d in "${T}/data/xdg" "${T}/data/xdg/ai-memory"; do
+    DMODE="$(stat -c '%a' "${d}" 2>/dev/null || stat -f '%Lp' "${d}")"
+    [[ "${DMODE}" == 700 ]] || fail "${d} holds the key file but is mode ${DMODE}, not 700"
+done
+echo "ok 4 - config.toml is mode 600 in 0700 directories and carries api_key + tier"
 
 # ---- 5. the rendered serve argv boots and the rendered healthcheck answers --
 env -i "${BASE_ENV[@]}" "${MCP_ENV[@]}" "${MCP_ARGV[@]}" > "${T}/serve.log" 2>&1 &
@@ -186,6 +200,19 @@ done
 (( healthy )) || fail "no healthy answer within ${BOOT_TIMEOUT_SECS}s from: ${HEALTH_ARGV[*]}"$'\n'"$(tail -20 "${T}/serve.log")"
 echo "ok 5 - the mcp service's effective argv is up and the rendered TLS healthcheck answers"
 
+# ---- 5b. the API key is enforced ---------------------------------------------
+CA="${T}/keys/tls/local-ca.pem"
+status_with() {  # status_with <key or empty>: HTTP status of an authenticated read
+    local hdr=()
+    [[ -n "$1" ]] && hdr=(-H "x-api-key: $1")
+    curl -s -o /dev/null -w '%{http_code}' --cacert "${CA}" "${hdr[@]}" \
+        "https://localhost:${PORT}/api/v1/memories?limit=1"
+}
+[[ "$(status_with '')" == 401 ]] || fail "no key was not refused with 401"
+[[ "$(status_with "wrong${API_KEY}")" == 401 ]] || fail "a wrong key was not refused with 401"
+[[ "$(status_with "${API_KEY}")" == 200 ]] || fail "the configured key was not accepted"
+echo "ok 5b - the API key is enforced (none 401, wrong 401, right 200)"
+
 # ---- 6. the curator's effective argv parses and keeps running ---------------
 env -i "${BASE_ENV[@]}" "${CURATOR_ENV[@]}" "${CURATOR_ARGV[@]}" > "${T}/curator.log" 2>&1 &
 CURATOR_PID=$!
@@ -202,4 +229,41 @@ env -i "${BASE_ENV[@]}" "${SYNC_ENV[@]}" "${SYNC_ARGV[@]}" > "${T}/sync.log" 2>&
     || fail "the sync service's effective argv failed with no SYNC_PEERS:"$'\n'"$(tail -10 "${T}/sync.log")"
 grep -q 'sync daemon idle' "${T}/sync.log" || fail "the sync service did not reach its idle exit: $(tail -5 "${T}/sync.log")"
 echo "ok 7 - the sync service's effective argv idles cleanly without peers"
+# ---- 8. the key whitelist and minimum length refuse, without touching the file --
+BEFORE="$(sha256sum "${CFG}")"
+for bad in "bad\"quote$(printf 'x%.0s' {1..40})" 'short-key'; do
+    if env -i "${BASE_ENV[@]}" "${INIT_ENV[@]}" AI_MEMORY_API_KEY="${bad}" "${INIT_ARGV[@]}" > "${T}/init-bad.log" 2>&1; then
+        fail "init accepted an invalid AI_MEMORY_API_KEY (${#bad} chars)"
+    else
+        rc=$?
+    fi
+    [[ "${rc}" == 64 ]] || fail "init refused an invalid key with rc=${rc}, not 64: $(tail -3 "${T}/init-bad.log")"
+done
+[[ "$(sha256sum "${CFG}")" == "${BEFORE}" ]] || fail "a refused key changed config.toml"
+echo "ok 8 - a key outside the charset, or shorter than 32, is refused (64) and config.toml is untouched"
+
+# ---- 9. rotation (#4213): a new AI_MEMORY_API_KEY replaces the old one --------
+NEW_KEY="rotated3838$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+env -i "${BASE_ENV[@]}" "${INIT_ENV[@]}" AI_MEMORY_API_KEY="${NEW_KEY}" "${INIT_ARGV[@]}" > "${T}/init-rot.log" 2>&1 \
+    || fail "init failed on a rotated key: $(tail -10 "${T}/init-rot.log")"
+grep -q 'API key rotated' "${T}/init-rot.log" || fail "init did not report the rotation: $(tail -5 "${T}/init-rot.log")"
+[[ "$(grep -c '^api_key' "${CFG}")" == 1 ]] || fail "config.toml does not carry exactly one api_key after rotation"
+grep -q "^api_key = \"${NEW_KEY}\"$" "${CFG}" || fail "config.toml does not carry the rotated key"
+grep -q '^tier = "autonomous"$' "${CFG}" || fail "rotation lost the autonomous tier"
+MODE="$(stat -c '%a' "${CFG}" 2>/dev/null || stat -f '%Lp' "${CFG}")"
+[[ "${MODE}" == 600 ]] || fail "rotation left config.toml mode ${MODE}, not 600"
+# Compose restarts the services after the re-run init (depends_on restart: true, asserted in ok 2).
+kill "${DAEMON_PID}" 2>/dev/null || true
+wait "${DAEMON_PID}" 2>/dev/null || true
+env -i "${BASE_ENV[@]}" "${MCP_ENV[@]}" "${MCP_ARGV[@]}" > "${T}/serve2.log" 2>&1 &
+DAEMON_PID=$!
+deadline=$(( SECONDS + BOOT_TIMEOUT_SECS ))
+until "${HEALTH_ARGV[@]}" >/dev/null 2>&1; do
+    kill -0 "${DAEMON_PID}" 2>/dev/null || fail "serve exited after the rotation: $(tail -10 "${T}/serve2.log")"
+    (( SECONDS < deadline )) || fail "serve not healthy after the rotation"
+    sleep 1
+done
+[[ "$(status_with "${API_KEY}")" == 401 ]] || fail "the OLD key still works after rotation (#4213)"
+[[ "$(status_with "${NEW_KEY}")" == 200 ]] || fail "the rotated key is not accepted"
+echo "ok 9 - a changed AI_MEMORY_API_KEY rotates the key: old 401, new 200 (#4213)"
 echo "PASS (#3838 compose smoke): the batman-active stack's services run as the container runtime runs them"
