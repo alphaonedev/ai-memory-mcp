@@ -22,16 +22,31 @@
 #
 # Exit 0: done. "API key rotated" is printed only when a top-level key
 #         existed and changed.
-# Exit 64: the file's top-level scope cannot be established (an unterminated
-#          multi-line string or array, or a top-level key whose value spans
-#          lines). Guessing could leave two top-level keys, which the daemon
-#          refuses to boot on, or drop a line the operator wrote, so the file
-#          is left untouched and the reason is printed.
+# Exit 64: the key is empty or malformed, or the file's top-level scope cannot
+#          be established: an unterminated multi-line string, array or inline
+#          table, a top-level key whose value spans lines, or TWO OR MORE
+#          top-level api_key lines (ambiguous: which one the operator meant is
+#          unknowable, and the daemon refuses to boot on a duplicate key).
+#          Guessing could leave two top-level keys or drop a line the operator
+#          wrote, so the file is left untouched and the reason is printed.
+#
+# Recognised spellings of the top-level key: api_key, "api_key" and 'api_key'
+# (TOML allows a quoted bare key). It is replaced by the bare form, in place
+# of the old line, never duplicated. `{`/`}` depth is tracked like `[`/`]`, so
+# an api_key inside a multi-line inline table is not top-level.
+#
+# Known conservative refusals (valid TOML that is refused with 64, file left
+# untouched, by design): a comment containing a lone """ or ''', a one-line
+# array mixing 'a"b' with "c]", and an escaped \""" inside a multi-line
+# basic string. The scanner is line-based, not a full TOML parser.
 
 set -euo pipefail
 
 cfg=${1:?usage: set-api-key.sh <config.toml>}
-: "${AI_MEMORY_API_KEY:?AI_MEMORY_API_KEY must be set}"
+if [ -z "${AI_MEMORY_API_KEY:-}" ] || [ -z "${AI_MEMORY_API_KEY//[[:space:]]/}" ]; then
+  echo "set-api-key: AI_MEMORY_API_KEY must be set and not empty or whitespace; ${cfg} not changed" >&2
+  exit 64
+fi
 
 # The key rules are enforced HERE, not only by the compose init, so the script
 # is safe on its own: the charset keeps the key a plain TOML basic string (no
@@ -51,7 +66,7 @@ fi
 want="api_key = \"${AI_MEMORY_API_KEY}\""
 
 refuse() {
-  echo "set-api-key: ${cfg}: $1; not rewriting it (#4291). Put the top-level api_key on one line, before any table." >&2
+  echo "set-api-key: ${cfg}: $1; not rewriting it (#4291). ${2:-Put the top-level api_key on one line, before any table.}" >&2
   exit 64
 }
 
@@ -81,19 +96,19 @@ count_of() {
   echo $(((${#1} - ${#stripped}) / ${#2}))
 }
 
-# Net `[` minus `]` of a line, outside simple quoted strings and comments.
-bracket_delta() {
+# Net `[`/`{` minus `]`/`}` of a line, outside simple quoted strings and comments.
+nest_delta() {
   local s=$1
   while [[ $s =~ (\"([^\"\\]|\\.)*\") ]]; do s=${s/"${BASH_REMATCH[1]}"/}; done
   while [[ $s =~ (\'[^\']*\') ]]; do s=${s/"${BASH_REMATCH[1]}"/}; done
   s=${s%%#*}
-  local opens=${s//[^\[]/} closes=${s//[^\]]/}
+  local opens=${s//[^\[\{]/} closes=${s//[^\]\}]/}
   echo $((${#opens} - ${#closes}))
 }
 
 top=1      # still before the first table header
 ml=""      # the delimiter of the multi-line string we are inside, if any
-depth=0    # open brackets of a multi-line array value
+depth=0    # open [ / { of a multi-line array or inline-table value
 n=0
 have=""
 declare -A drop=()
@@ -109,11 +124,11 @@ while IFS= read -r line || [ -n "$line" ]; do
       top=0
       continue
     fi
-    if [[ $line =~ ^[[:space:]]*api_key[[:space:]]*= ]]; then
+    if [[ $line =~ ^[[:space:]]*(api_key|\"api_key\"|\'api_key\')[[:space:]]*= ]]; then
       # A key whose value opens a multi-line string or array cannot be
       # replaced line by line.
       if (($(count_of "$line" '"""') % 2 == 1 || $(count_of "$line" "'''") % 2 == 1)) ||
-        (($(bracket_delta "$line") != 0)); then
+        (($(nest_delta "$line") != 0)); then
         refuse "the top-level api_key at line ${n} spans lines"
       fi
       [ -n "$have" ] || have=$line
@@ -127,14 +142,19 @@ while IFS= read -r line || [ -n "$line" ]; do
     elif (($(count_of "$line" "'''") % 2 == 1)); then
       ml="'''"
     else
-      depth=$((depth + $(bracket_delta "$line")))
-      ((depth >= 0)) || refuse "line ${n} closes an array that was never opened"
+      depth=$((depth + $(nest_delta "$line")))
+      ((depth >= 0)) || refuse "line ${n} closes an array or inline table that was never opened"
     fi
   fi
 done <"$cfg"
 if ((top == 1)); then
   [ -z "$ml" ] || refuse "a multi-line string is never closed"
-  ((depth == 0)) || refuse "a multi-line array is never closed"
+  ((depth == 0)) || refuse "a multi-line array or inline table is never closed"
+fi
+
+if ((${#drop[@]} > 1)); then
+  refuse "${#drop[@]} top-level api_key lines (ambiguous, duplicate key)" \
+    "Remove the duplicates so exactly one top-level api_key remains."
 fi
 
 # Already right: exactly one top-level key, holding the wanted VALUE in any

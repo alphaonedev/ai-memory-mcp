@@ -138,6 +138,56 @@ run_case "different key written with single quotes: rotated" \
   "api_key = '${OLD_KEY}'"$'\ntier = "autonomous"\n' \
   "${want_line}"$'\ntier = "autonomous"\n' 0 yes
 
+# 18-23. (#4307, r8 F1-F4 folded into #4291)
+# F1. Two top-level api_key lines are ambiguous: refuse (64), file untouched,
+#     message names the ambiguity. The first line equals the wanted key, which
+#     is the case that used to drop the operator's second line silently.
+dup_in="${want_line}"$'\n'"${old_line}"$'\ntier = "autonomous"\n'
+run_case "F1: two top-level api_key lines refused (64), file untouched" \
+  "$dup_in" "$dup_in" 64 no
+out=$(AI_MEMORY_API_KEY="$NEW_KEY" bash "$SCRIPT" "$T/case${case_no}.toml" 2>&1)
+case_no=$((case_no + 1))
+if [[ $out == *ambiguous* ]]; then
+  echo "ok ${case_no} - F1: the refusal message names the ambiguity"
+else
+  echo "not ok ${case_no} - F1: message does not name the ambiguity: ${out}"
+  failures=$((failures + 1))
+fi
+
+# F2. A quoted top-level key is the top-level key: replaced in place, never
+#     duplicated (a duplicate makes the daemon refuse to boot).
+run_case "F2: \"api_key\" = ... is the top-level key: replaced, not duplicated" \
+  "\"api_key\" = \"${OLD_KEY}\""$'\ntier = "autonomous"\n' \
+  "${want_line}"$'\ntier = "autonomous"\n' 0 yes
+run_case "F2: 'api_key' = ... is the top-level key: replaced, not duplicated" \
+  "'api_key' = '${OLD_KEY}'"$'\ntier = "autonomous"\n' \
+  "${want_line}"$'\ntier = "autonomous"\n' 0 yes
+
+# F3. An api_key inside a multi-line inline table is not top-level: kept, and
+#     no false rotation message.
+run_case "F3: api_key inside a multi-line inline table kept, no false rotation" \
+  $'llm = {\n  api_key = "keep-me",\n  model = "x"\n}\n' \
+  "${want_line}"$'\nllm = {\n  api_key = "keep-me",\n  model = "x"\n}\n' 0 no
+
+# F4. An empty or whitespace-only key exits 64 (documented), file untouched.
+empty_case() {
+  local name=$1 key=$2
+  case_no=$((case_no + 1))
+  local cfg="$T/case${case_no}.toml" rc got
+  printf '%s' "${old_line}"$'\n' >"$cfg"
+  AI_MEMORY_API_KEY="$key" bash "$SCRIPT" "$cfg" >/dev/null 2>&1
+  rc=$?
+  got=$(cat "$cfg")
+  if [[ $rc == 64 && "$got" == "${old_line}" ]]; then
+    echo "ok ${case_no} - ${name}"
+  else
+    echo "not ok ${case_no} - ${name}: exit=${rc} (want 64), file ${got}"
+    failures=$((failures + 1))
+  fi
+}
+empty_case "F4: empty key exits 64, file untouched" ""
+empty_case "F4: whitespace-only key exits 64, file untouched" "   "
+
 echo "1..${case_no}"
 if ((failures > 0)); then
   echo "FAIL: ${failures} of ${case_no} case(s) failed (#4291)" >&2
