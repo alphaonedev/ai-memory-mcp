@@ -41,7 +41,7 @@
 //!    never blocks a memory operation.
 
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::Ordering;
@@ -271,6 +271,182 @@ struct SinkInner {
     /// in-memory test sinks.
     #[allow(dead_code)]
     path: Option<PathBuf>,
+    /// #4086 — the persisted sequence high-water mark next to a real file
+    /// (`None` for in-memory test sinks).
+    seq_mark: Option<SeqMark>,
+}
+
+/// #4086 — largest sequence value a persisted high-water mark may hold.
+///
+/// Anything larger is treated as corruption (it would overflow the counter
+/// long before a real trail could reach it), never as a value to resume from.
+pub const MAX_AUDIT_SEQUENCE: u64 = i64::MAX.unsigned_abs();
+
+/// #4086 — path of the sequence high-water mark for the trail at `trail`:
+/// the trail's own file name plus `.seq`, in the same directory.
+#[must_use]
+pub fn seq_mark_path(trail: &Path) -> PathBuf {
+    let mut name = trail
+        .file_name()
+        .map_or_else(|| std::ffi::OsString::from("audit.log"), ToOwned::to_owned);
+    name.push(".seq");
+    trail.with_file_name(name)
+}
+
+/// #4086 — the persisted sequence high-water mark.
+///
+/// An event is numbered BEFORE it is written. When a write fails, the number
+/// is recorded here (durably, before the error is reported), so a restart
+/// resumes numbering from `max(trail tail, high-water)` instead of reusing the
+/// lost numbers. The loss then stays a gap `audit verify` reports (#4021),
+/// even when it happened at the tail just before a restart and even before
+/// the next event is written.
+struct SeqMark {
+    file: File,
+    path: PathBuf,
+    /// The value currently on disk.
+    recorded: u64,
+}
+
+impl SeqMark {
+    /// Raise the mark to `sequence` (no-op when it is not higher) with an
+    /// in-place, fixed-width overwrite, then `fdatasync`.
+    fn record(&mut self, sequence: u64) -> Result<()> {
+        if sequence <= self.recorded {
+            return Ok(());
+        }
+        self.overwrite(sequence)
+    }
+
+    /// Write `sequence` over the fixed-width record in place, then
+    /// `fdatasync`.
+    fn overwrite(&mut self, sequence: u64) -> Result<()> {
+        self.file
+            .seek(SeekFrom::Start(0))
+            .and_then(|_| self.file.write_all(seq_mark_record(sequence).as_bytes()))
+            .and_then(|()| self.file.sync_data())
+            .with_context(|| {
+                format!(
+                    "recording lost audit sequence {sequence} in {}",
+                    self.path.display()
+                )
+            })?;
+        self.recorded = sequence;
+        Ok(())
+    }
+}
+
+/// The fixed-width (20 digits + newline) high-water record. Fixed so an update
+/// is an in-place overwrite of bytes the file already owns: recording a lost
+/// sequence number must still work on the full disk that lost the event.
+fn seq_mark_record(sequence: u64) -> String {
+    format!("{sequence:020}\n")
+}
+
+/// #4086 — read the high-water mark. `Ok(None)` when it does not exist (a
+/// fresh trail, or one written before #4086). Anything present but not a
+/// single in-range number is an ERROR: the trail can no longer tell whether
+/// events were lost, and that is refused, never guessed around.
+fn read_seq_mark(mark: &Path) -> Result<Option<u64>> {
+    let file = match File::open(mark) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(e)
+                .with_context(|| format!("reading audit sequence high-water {}", mark.display()));
+        }
+    };
+    // Bounded read: the record is 21 bytes; never slurp an arbitrary file.
+    let mut raw = String::new();
+    file.take(64)
+        .read_to_string(&mut raw)
+        .with_context(|| format!("reading audit sequence high-water {}", mark.display()))?;
+    let value: u64 = raw.trim().parse().map_err(|_| {
+        anyhow!(
+            "audit sequence high-water {} is corrupt (expected one number); the trail \
+             cannot tell whether events were lost before the last shutdown",
+            mark.display()
+        )
+    })?;
+    if value > MAX_AUDIT_SEQUENCE {
+        return Err(anyhow!(
+            "audit sequence high-water {} holds {value}, beyond the maximum sequence \
+             {MAX_AUDIT_SEQUENCE}; refusing to resume from it",
+            mark.display()
+        ));
+    }
+    Ok(Some(value))
+}
+
+/// #4086 — open the high-water mark for in-place updates, holding `value`.
+///
+/// An existing fixed-width mark is opened IN PLACE and overwritten in place
+/// only when its value changes (`existing` is what [`read_seq_mark`] read).
+/// That write reuses bytes the file already owns, so boot still works on a
+/// full disk, exactly as it did before the mark existed: the trail itself is
+/// only opened for append. Only a missing mark, or one not in the fixed-width
+/// form, is (re)created through a temp file and a rename.
+fn open_seq_mark(mark: &Path, existing: Option<u64>, value: u64) -> Result<SeqMark> {
+    if let Some(on_disk) = existing {
+        let ctx = || format!("updating audit sequence high-water {}", mark.display());
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(mark)
+            .with_context(ctx)?;
+        let fixed_width = u64::try_from(seq_mark_record(value).len())
+            .is_ok_and(|want| file.metadata().is_ok_and(|m| m.len() == want));
+        if fixed_width {
+            let mut seq_mark = SeqMark {
+                file,
+                path: mark.to_path_buf(),
+                recorded: on_disk,
+            };
+            if on_disk != value {
+                seq_mark.overwrite(value)?;
+            }
+            return Ok(seq_mark);
+        }
+    }
+    create_seq_mark(mark, value)
+}
+
+/// #4086 — (re)write the high-water mark atomically (temp file, fsync,
+/// rename, directory fsync) and open it for in-place updates.
+fn create_seq_mark(mark: &Path, value: u64) -> Result<SeqMark> {
+    let mut tmp_name = mark.file_name().unwrap_or_default().to_os_string();
+    tmp_name.push(".tmp");
+    let tmp = mark.with_file_name(tmp_name);
+    let ctx = || format!("writing audit sequence high-water {}", mark.display());
+    {
+        let mut f = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp)
+            .with_context(ctx)?;
+        f.write_all(seq_mark_record(value).as_bytes())
+            .and_then(|()| f.sync_all())
+            .with_context(ctx)?;
+    }
+    std::fs::rename(&tmp, mark).with_context(ctx)?;
+    if let Some(dir) = mark.parent().filter(|d| !d.as_os_str().is_empty()) {
+        // Best-effort directory fsync so the rename itself is durable; not
+        // every platform can open a directory for sync.
+        if let Ok(d) = File::open(dir) {
+            let _ = d.sync_all();
+        }
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(mark)
+        .with_context(ctx)?;
+    Ok(SeqMark {
+        file,
+        path: mark.to_path_buf(),
+        recorded: value,
+    })
 }
 
 /// Initialise the audit sink. Called at most once per process from
@@ -307,7 +483,7 @@ pub fn init(path: &Path, redact_content: bool, append_only_hint: bool) -> Result
     // `init_from_config` (#3651, exit 78). Pre-#4190 every one of those was
     // treated as "no chain" and a NEW chain was appended at genesis into the
     // same file, forking it silently.
-    let (last_hash, last_sequence) = match read_chain_tail(path).with_context(|| {
+    let (last_hash, tail_sequence) = match read_chain_tail(path).with_context(|| {
         format!(
             "reading the audit trail tail {} to continue its hash chain; a trail \
              that exists but cannot be read is never restarted at genesis (that \
@@ -318,6 +494,37 @@ pub fn init(path: &Path, redact_content: bool, append_only_hint: bool) -> Result
         Some((hash, seq)) => (hash, seq),
         None => (CHAIN_HEAD_PREV_HASH.to_string(), 0),
     };
+
+    // #4086: resume from the persisted high-water, not only from the last
+    // WRITTEN line, so numbers consumed by events lost before the restart are
+    // never reused. A corrupt mark refuses init (and so boot, #3651).
+    if tail_sequence > MAX_AUDIT_SEQUENCE {
+        return Err(anyhow!(
+            "audit log {} ends at sequence {tail_sequence}, beyond the maximum sequence \
+             {MAX_AUDIT_SEQUENCE}; refusing to continue it",
+            path.display()
+        ));
+    }
+    let mark_path = seq_mark_path(path);
+    let existing_mark = read_seq_mark(&mark_path)?;
+    let high_water = existing_mark.unwrap_or(0);
+    let last_sequence = tail_sequence.max(high_water);
+    if last_sequence > tail_sequence {
+        let lost = SequenceGap {
+            from: tail_sequence + 1,
+            to: last_sequence,
+        };
+        // Nothing else will say this before `audit verify` runs: the process
+        // that lost them is gone, and `tracing` may be off.
+        let _ = writeln!(
+            std::io::stderr(),
+            "ai-memory: audit trail {}: {} event(s) (sequence {lost}) were numbered \
+             but never written before the last shutdown; numbering resumes after them \
+             and `ai-memory audit verify` reports them as a gap (#4086)",
+            path.display(),
+            lost.len()
+        );
+    }
 
     let file = OpenOptions::new()
         .create(true)
@@ -337,11 +544,14 @@ pub fn init(path: &Path, redact_content: bool, append_only_hint: bool) -> Result
         }
     }
 
+    let seq_mark = open_seq_mark(&mark_path, existing_mark, last_sequence)?;
+
     let sink = AuditSink {
         inner: Mutex::new(SinkInner {
             writer: Box::new(file),
             last_hash,
             path: Some(path.to_path_buf()),
+            seq_mark: Some(seq_mark),
         }),
         redact_content,
     };
@@ -384,6 +594,7 @@ pub(crate) fn init_for_test_with_writer(writer: Box<dyn Write + Send>) {
             writer,
             last_hash: CHAIN_HEAD_PREV_HASH.to_string(),
             path: None,
+            seq_mark: None,
         }),
         redact_content: true,
     };
@@ -781,8 +992,35 @@ fn try_emit_inner(builder: EventBuilder) -> Result<bool> {
         .lock()
         .map_err(|_| anyhow!("audit sink mutex poisoned"))?;
 
-    let sequence = audit.sequence.fetch_add(1, Ordering::SeqCst) + 1;
+    let sequence = audit
+        .sequence
+        .fetch_add(1, Ordering::SeqCst)
+        .checked_add(1)
+        .filter(|s| *s <= MAX_AUDIT_SEQUENCE)
+        .ok_or_else(|| anyhow!("audit sequence exhausted"))?;
 
+    // #4086: the number is consumed. If the event does not reach the trail,
+    // persist the number as the high-water BEFORE reporting the failure, so a
+    // restart cannot reuse it and hide the loss.
+    let written = write_event(&mut inner, builder, sequence);
+    if let Err(err) = written {
+        return Err(match inner.seq_mark.as_mut().map(|m| m.record(sequence)) {
+            Some(Err(mark_err)) => err.context(format!(
+                "{mark_err:#}; a restart may reuse this sequence number (#4086)"
+            )),
+            _ => err,
+        });
+    }
+    RuntimeContext::global()
+        .audit
+        .delivery
+        .record_success(now_unix_ms());
+    Ok(true)
+}
+
+/// Build, hash and append one event as `sequence`. Advances the chain head
+/// once the line has been handed to the writer.
+fn write_event(inner: &mut SinkInner, builder: EventBuilder, sequence: u64) -> Result<()> {
     let mut ev = AuditEvent {
         schema_version: SCHEMA_VERSION,
         timestamp: Utc::now().to_rfc3339(),
@@ -816,12 +1054,7 @@ fn try_emit_inner(builder: EventBuilder) -> Result<bool> {
     // reported like any other lost write.
     let flushed = inner.writer.flush();
     inner.last_hash = self_hash;
-    flushed.context("flushing audit line")?;
-    RuntimeContext::global()
-        .audit
-        .delivery
-        .record_success(now_unix_ms());
-    Ok(true)
+    flushed.context("flushing audit line")
 }
 
 /// Sanitize a field for log emission: strip control chars + newlines
@@ -1063,14 +1296,40 @@ pub fn lost_events_message(gaps: &[SequenceGap]) -> String {
 ///
 /// # Errors
 /// - The file cannot be opened or read.
+/// - The sequence high-water mark next to the trail (#4086) exists but is
+///   unreadable or corrupt: whether events were lost cannot be determined.
 pub fn verify_chain(path: &Path) -> Result<VerifyReport> {
     let file = File::open(path).with_context(|| crate::errors::msg::opening(path.display()))?;
-    verify_chain_from_reader(file)
+    let mut last_sequence = 0;
+    let mut report = walk_chain(file, &mut last_sequence)?;
+    // #4086: numbers recorded as consumed past the last written line are
+    // events lost at the tail (possibly just before a restart). Reported as a
+    // gap like any interior one, INCLUDING on an empty trail: a mark above 0
+    // is evidence that events were numbered, so a trail whose every event was
+    // lost (a disk full from the first write) is the gap 1..=mark, never
+    // clean. The "head is not checked" rule covers only an empty trail with
+    // no such evidence.
+    let high_water = read_seq_mark(&seq_mark_path(path))?.unwrap_or(0);
+    if report.first_failure.is_none() && high_water > last_sequence {
+        report.gaps.push(SequenceGap {
+            from: last_sequence + 1,
+            to: high_water,
+        });
+    }
+    Ok(report)
 }
 
 /// Verify a chain from any [`Read`] source. Lets tests run against
-/// in-memory buffers without touching the filesystem.
+/// in-memory buffers without touching the filesystem. A bare reader has no
+/// high-water mark, so a tail loss (#4086) is only visible through
+/// [`verify_chain`].
 pub fn verify_chain_from_reader<R: Read>(reader: R) -> Result<VerifyReport> {
+    walk_chain(reader, &mut 0)
+}
+
+/// The chain walk behind both verify entry points. `last_sequence` receives
+/// the last sequence number of a verified line (0 for an empty trail).
+fn walk_chain<R: Read>(reader: R, last_sequence: &mut u64) -> Result<VerifyReport> {
     let buf = BufReader::new(reader);
     let mut total: u64 = 0;
     let mut prev_hash = CHAIN_HEAD_PREV_HASH.to_string();
@@ -1156,6 +1415,7 @@ pub fn verify_chain_from_reader<R: Read>(reader: R) -> Result<VerifyReport> {
 
         prev_hash = ev.self_hash.clone();
         prev_seq = ev.sequence;
+        *last_sequence = prev_seq;
     }
 
     Ok(VerifyReport {
@@ -1425,6 +1685,9 @@ fn mark_append_only(_path: &Path) -> Result<()> {
 // ---------------------------------------------------------------------------
 // Tests.
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tail_loss_4086_tests;
 
 #[cfg(test)]
 mod tests {
