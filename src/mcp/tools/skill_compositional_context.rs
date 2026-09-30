@@ -145,7 +145,7 @@ pub fn handle_skill_compositional_context(
     let now_epoch = chrono::Utc::now().timestamp();
 
     for entry in &composes {
-        let ceiling = max_reflection_depth_for(conn, &entry.namespace);
+        let ceiling = max_reflection_depth_for(conn, &entry.namespace)?;
         bounded_namespaces.push(json!({
             "namespace": entry.namespace,
             "min_depth": entry.min_depth,
@@ -333,9 +333,17 @@ fn parse_composes_from_metadata(metadata_json: &str) -> Vec<ComposesWithReflecti
 /// Falls back to the compiled default (3) when no operator override is
 /// present — matching the `GovernancePolicy::effective_max_reflection_depth`
 /// contract documented in `src/models/namespace.rs`.
-fn max_reflection_depth_for(conn: &Connection, namespace: &str) -> u32 {
+///
+/// #4043 — an unreadable policy is an error, never the compiled default.
+fn max_reflection_depth_for(conn: &Connection, namespace: &str) -> Result<u32, String> {
     crate::db::resolve_governance_policy(conn, namespace)
-        .map_or(3, |p| p.effective_max_reflection_depth())
+        .map(|p| p.map_or(3, |p| p.effective_max_reflection_depth()))
+        .map_err(|e| {
+            crate::mcp::error_text::mcp_foreign_err(
+                "governance policy unreadable (#4043 fail-CLOSED)",
+                e,
+            )
+        })
 }
 
 /// Recency score in `[0, 1]`. The substrate stamps `created_at` as RFC

@@ -76,6 +76,13 @@ fn forget_governance_gate_one_ns(
     // which queues a single reviewable action.
     if crate::config::active_permissions_mode() == crate::config::PermissionsMode::Enforce
         && db::resolve_governance_policy(conn, ns)
+            // #4043 — an unreadable policy refuses the bulk forget.
+            .map_err(|e| {
+                crate::mcp::error_text::mcp_foreign_err(
+                    "governance policy unreadable (#4043 fail-CLOSED)",
+                    e,
+                )
+            })?
             .is_some_and(|p| matches!(p.core.delete, GovernanceLevel::Approve))
     {
         return Err(crate::governance::deny_message(

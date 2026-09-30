@@ -9718,7 +9718,9 @@ pub fn validate_link_pre_create(
             Ok(Some(m)) => m.namespace,
             _ => crate::DEFAULT_NAMESPACE.to_string(),
         };
-        let max_depth = resolve_governance_policy(conn, &link_ns)
+        // #4043 — an unreadable policy refuses the link; it never falls back to
+        // the default depth cap (which would lift an operator kill-switch of 0).
+        let max_depth = resolve_governance_policy(conn, &link_ns)?
             .unwrap_or_default()
             .effective_max_reflection_depth();
         if crate::kg::cycle_check::would_create_reflection_cycle(
@@ -22514,6 +22516,39 @@ pub fn get_namespace_standard(conn: &Connection, namespace: &str) -> Result<Opti
     Ok(result)
 }
 
+/// #4043 — FALLIBLE twin of [`get_namespace_standard`] for the GOVERNANCE
+/// walkers. `Ok(None)` means "no row, or a row whose `standard_id` is NULL";
+/// every other rusqlite failure is an `Err`, never an absence. The lenient
+/// [`get_namespace_standard`] collapses a read fault into "no standard bound",
+/// which is correct for display but FAILS OPEN when a governance walker reads
+/// it (an unreadable policy looks unconfigured).
+fn try_get_namespace_standard(conn: &Connection, namespace: &str) -> Result<Option<String>> {
+    use rusqlite::OptionalExtension;
+    let row: Option<Option<String>> = conn
+        .query_row(
+            "SELECT standard_id FROM namespace_meta WHERE namespace = ?1",
+            params![namespace],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .context("governance: read namespace_meta.standard_id")?;
+    Ok(row.flatten())
+}
+
+/// #4043 — FALLIBLE twin of [`get_namespace_parent`] for the GOVERNANCE chain:
+/// a read fault is an `Err`, never "no parent" (dropping an entitled parent
+/// drops its policy layer — fail-open).
+fn try_get_namespace_parent(conn: &Connection, namespace: &str) -> Result<Option<String>> {
+    use rusqlite::OptionalExtension;
+    conn.query_row(
+        "SELECT parent_namespace FROM namespace_meta WHERE namespace = ?1 AND parent_namespace IS NOT NULL",
+        params![namespace],
+        |r| r.get(0),
+    )
+    .optional()
+    .context("governance: read namespace_meta.parent_namespace")
+}
+
 /// Get the parent namespace for a given namespace.
 pub fn get_namespace_parent(conn: &Connection, namespace: &str) -> Option<String> {
     conn.query_row(
@@ -22624,7 +22659,26 @@ pub fn clear_namespace_standard(conn: &Connection, namespace: &str) -> Result<bo
 /// leaf-first walk (most-specific wins).
 #[must_use]
 pub fn build_namespace_chain(conn: &Connection, namespace: &str) -> Vec<String> {
-    build_namespace_chain_view(conn, namespace, ChainView::Lookup)
+    // The LOOKUP view reads parent links leniently (a display convenience) and
+    // never consults an owner, so it has no fallible read; the fallback arm is
+    // defensive only.
+    build_namespace_chain_view(conn, namespace, ChainView::Lookup).unwrap_or_else(|e| {
+        tracing::warn!(
+            target: "ai_memory::governance::policy_read",
+            namespace = %namespace,
+            error = %e,
+            "lookup namespace chain read failed; returning the structural chain"
+        );
+        let mut chain = vec!["*".to_string()];
+        if namespace != "*" {
+            chain.extend(
+                crate::models::namespace_ancestors(namespace)
+                    .into_iter()
+                    .rev(),
+            );
+        }
+        chain
+    })
 }
 
 /// #2542 — which VIEW of the namespace chain to build.
@@ -22682,24 +22736,32 @@ enum ChainView {
 /// severed / dangling, or the standard is UNOWNED (empty / exact `system` /
 /// [`crate::identity::sentinels::SYSTEM_PRINCIPAL`]). The unowned-set mirrors the
 /// bind gate [`crate::mcp::authorize_namespace_standard_bind`] exactly.
-fn namespace_standard_owner(conn: &Connection, namespace: &str) -> Option<String> {
-    let owner = get_namespace_standard(conn, namespace)
-        .ok()
-        .flatten()
-        .and_then(|sid| get(conn, &sid).ok().flatten())
-        .and_then(|mem| {
-            mem.metadata
-                .get("agent_id")
-                .and_then(|v| v.as_str())
-                .map(str::to_string)
-        })?;
+///
+/// #4043 — a read fault (namespace_meta or the standard row, including a
+/// fail-closed decrypt) is an `Err`, never "unowned": "unowned" makes a parent
+/// link entitled-or-not on evidence nobody read.
+fn namespace_standard_owner(conn: &Connection, namespace: &str) -> Result<Option<String>> {
+    let Some(sid) = try_get_namespace_standard(conn, namespace)? else {
+        return Ok(None);
+    };
+    let Some(mem) = get(conn, &sid).context("governance: read namespace standard (owner)")? else {
+        return Ok(None);
+    };
+    let Some(owner) = mem
+        .metadata
+        .get("agent_id")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+    else {
+        return Ok(None);
+    };
     if owner.is_empty()
         || owner == "system"
         || owner == crate::identity::sentinels::SYSTEM_PRINCIPAL
     {
-        None
+        Ok(None)
     } else {
-        Some(owner)
+        Ok(Some(owner))
     }
 }
 
@@ -22722,11 +22784,11 @@ fn parent_link_governance_entitled(
     conn: &Connection,
     declarer_owner: Option<&str>,
     parent: &str,
-) -> bool {
-    match namespace_standard_owner(conn, parent) {
+) -> Result<bool> {
+    Ok(match namespace_standard_owner(conn, parent)? {
         None => true, // unowned parent — no cross-tenant authority to graft
         Some(parent_owner) => declarer_owner == Some(parent_owner.as_str()),
-    }
+    })
 }
 
 /// #2542 — one structured WARN per governance resolution that dropped a
@@ -22747,13 +22809,21 @@ fn warn_governance_graft_excluded(resolving_for: &str, child: &str, parent: &str
     );
 }
 
-fn build_namespace_chain_view(conn: &Connection, namespace: &str, view: ChainView) -> Vec<String> {
+/// #4043 — FALLIBLE in the GOVERNANCE view: a `namespace_meta` / standard read
+/// fault while following a parent link is an `Err`, never a silently shorter
+/// chain (a dropped entitled ancestor is a dropped policy layer — fail-open).
+/// The LOOKUP view keeps its lenient reads and cannot return `Err`.
+fn build_namespace_chain_view(
+    conn: &Connection,
+    namespace: &str,
+    view: ChainView,
+) -> Result<Vec<String>> {
     const MAX_EXPLICIT_DEPTH: usize = 8;
     let mut chain: Vec<String> = Vec::new();
 
     if namespace == "*" {
         chain.push("*".to_string());
-        return chain;
+        return Ok(chain);
     }
 
     // Always start with the global standard — most general.
@@ -22783,15 +22853,19 @@ fn build_namespace_chain_view(conn: &Connection, namespace: &str, view: ChainVie
         let mut explicit_above: Vec<String> = Vec::new();
         let mut current = root;
         for _ in 0..MAX_EXPLICIT_DEPTH {
-            let Some(p) = get_namespace_parent(conn, &current) else {
+            let parent = match view {
+                ChainView::Lookup => get_namespace_parent(conn, &current),
+                ChainView::Governance => try_get_namespace_parent(conn, &current)?,
+            };
+            let Some(p) = parent else {
                 break;
             };
             if p == "*" || explicit_above.contains(&p) || hierarchy_chain.contains(&p) {
                 break;
             }
             if view == ChainView::Governance {
-                let declarer_owner = namespace_standard_owner(conn, &current);
-                if !parent_link_governance_entitled(conn, declarer_owner.as_deref(), &p) {
+                let declarer_owner = namespace_standard_owner(conn, &current)?;
+                if !parent_link_governance_entitled(conn, declarer_owner.as_deref(), &p)? {
                     warn_governance_graft_excluded(namespace, &current, &p);
                     break;
                 }
@@ -22813,7 +22887,7 @@ fn build_namespace_chain_view(conn: &Connection, namespace: &str, view: ChainVie
         }
     }
 
-    chain
+    Ok(chain)
 }
 
 /// #2542 — the GOVERNANCE view of [`build_namespace_chain`]: identical, except a
@@ -22825,7 +22899,11 @@ fn build_namespace_chain_view(conn: &Connection, namespace: &str, view: ChainVie
 /// [`resolve_require_approval_above_depth`], [`resolve_skill_promotion_min_depth`],
 /// [`namespace_owner`]) walks THIS chain; LOOKUP / display paths keep using
 /// [`build_namespace_chain`].
-fn build_namespace_governance_chain(conn: &Connection, namespace: &str) -> Vec<String> {
+///
+/// # Errors
+///
+/// #4043 — any `namespace_meta` / standard read fault on the walk.
+fn build_namespace_governance_chain(conn: &Connection, namespace: &str) -> Result<Vec<String>> {
     build_namespace_chain_view(conn, namespace, ChainView::Governance)
 }
 
@@ -22861,7 +22939,17 @@ enum NamespaceLevel {
 /// [`get_namespace_standard`], whose contract collapses a NULL `standard_id`
 /// into `None` ("no standard bound") — correct for its own callers and for the
 /// #1642 observable, but exactly the distinction this function exists to make.
-fn read_namespace_level(conn: &Connection, namespace: &str) -> NamespaceLevel {
+///
+/// # Errors
+///
+/// #4043 — a read fault on `namespace_meta` or on the bound standard
+/// (including a fail-closed decrypt of an encrypted standard) is an `Err`.
+/// Pre-#4043 both faults collapsed into [`NamespaceLevel::NoPolicy`] — the
+/// "never configured" value — so an operator's Owner/Approve policy that
+/// could not be READ was treated as absent and the write fell through to
+/// allow-on-silence (fail-OPEN). A fault is evidence of neither absence nor
+/// severance; the only safe answer is to refuse the governed action.
+fn read_namespace_level(conn: &Connection, namespace: &str) -> Result<NamespaceLevel> {
     use rusqlite::OptionalExtension;
     // `Option<Option<String>>`: outer = row present?, inner = standard bound?
     let row: Option<Option<String>> = conn
@@ -22871,26 +22959,23 @@ fn read_namespace_level(conn: &Connection, namespace: &str) -> NamespaceLevel {
             |r| r.get::<_, Option<String>>(0),
         )
         .optional()
-        .unwrap_or(None);
+        .context("governance: read namespace_meta level")?;
     let Some(bound) = row else {
-        return NamespaceLevel::NoPolicy; // no row — never configured
+        return Ok(NamespaceLevel::NoPolicy); // no row — never configured
     };
     let Some(standard_id) = bound else {
-        return NamespaceLevel::Severed; // row survives, pointer severed
+        return Ok(NamespaceLevel::Severed); // row survives, pointer severed
     };
-    match get(conn, &standard_id) {
-        Ok(Some(mem)) => match read_policy_from_standard(namespace, &standard_id, &mem) {
-            Some(p) => NamespaceLevel::Policy(Box::new(p)),
-            None => NamespaceLevel::NoPolicy,
-        },
+    match get(conn, &standard_id).context("governance: read namespace standard")? {
+        Some(mem) => Ok(
+            match read_policy_from_standard(namespace, &standard_id, &mem) {
+                Some(p) => NamespaceLevel::Policy(Box::new(p)),
+                None => NamespaceLevel::NoPolicy,
+            },
+        ),
         // The row names a memory that is not there: a dangling pointer. Same
         // meaning as an explicit severance — governed, policy gone.
-        Ok(None) => NamespaceLevel::Severed,
-        // A read fault is NOT evidence that the standard is gone, so it must
-        // not be reported as `Severed` (that would fail closed on a transient
-        // I/O error). Falling through as `NoPolicy` preserves the pre-#2503
-        // behaviour of this arm exactly.
-        Err(_) => NamespaceLevel::NoPolicy,
+        None => Ok(NamespaceLevel::Severed),
     }
 }
 
@@ -23009,7 +23094,17 @@ fn read_policy_from_standard(
 ///    own policy, an ancestor severance is irrelevant because that ancestor
 ///    would never have been consulted. Tracking severance only until the first
 ///    policy is found is therefore precise, not an approximation.
-pub fn resolve_governance_policy(conn: &Connection, namespace: &str) -> Option<GovernancePolicy> {
+///
+/// # Errors
+///
+/// #4043 — any read fault on the chain walk (a `namespace_meta` row, a parent
+/// link, a standard's owner, or the standard itself). Callers MUST treat the
+/// `Err` as "policy unknown" and refuse the governed action; mapping it to
+/// `None` / the default policy is exactly the fail-open this fixes.
+pub fn resolve_governance_policy(
+    conn: &Connection,
+    namespace: &str,
+) -> Result<Option<GovernancePolicy>> {
     // build_namespace_chain returns top-down (`["*", root, ..., leaf]`).
     // Governance resolution wants leaf-first (most specific first), so
     // we reverse before walking.
@@ -23017,10 +23112,10 @@ pub fn resolve_governance_policy(conn: &Connection, namespace: &str) -> Option<G
     // #2542 — the GOVERNANCE chain excludes `-`-inferred parent links so an
     // inferred ancestor (a naming coincidence, possibly a different tenant's
     // namespace) cannot layer its governance/approver policy onto this write.
-    let chain = build_namespace_governance_chain(conn, namespace);
+    let chain = build_namespace_governance_chain(conn, namespace)?;
     let mut severed_level: Option<String> = None;
     for level in chain.into_iter().rev() {
-        match read_namespace_level(conn, &level) {
+        match read_namespace_level(conn, &level)? {
             // Most-specific match wins. Returning here means an explicit
             // policy at the leaf (or any descendant level with a policy)
             // authoritatively overrides anything above — precisely the
@@ -23029,13 +23124,13 @@ pub fn resolve_governance_policy(conn: &Connection, namespace: &str) -> Option<G
             // pending_action approver resolver) don't re-walk to a parent.
             NamespaceLevel::Policy(policy) => {
                 let policy = *policy;
-                return Some(match severed_level {
+                return Ok(Some(match severed_level {
                     None => policy,
                     Some(ns) => {
                         warn_severed_floor_applied(&ns, namespace);
                         policy.with_severed_standard_floor()
                     }
-                });
+                }));
             }
             // #2503 — governed, but the policy is gone. Remember it and keep
             // walking so an intact ancestor policy is still found and honoured.
@@ -23055,11 +23150,39 @@ pub fn resolve_governance_policy(conn: &Connection, namespace: &str) -> Option<G
     // level WAS severed, returning `None` is what handed the attacker
     // allow-on-silence over a namespace an operator had deliberately governed;
     // the floor is returned instead.
-    match severed_level {
+    Ok(match severed_level {
         None => None,
         Some(ns) => {
             warn_severed_floor_applied(&ns, namespace);
             Some(GovernancePolicy::default().with_severed_standard_floor())
+        }
+    })
+}
+
+/// #4043 — resolve the namespace policy for a NON-AUTHORIZATION convenience
+/// knob (auto-classify, auto-atomise mode, the atomise-candidate report): a
+/// read fault logs a WARN and yields [`GovernancePolicy::default`], whose
+/// knobs are all OFF, so the degradation is "the optional feature does not
+/// run", never a wider permission.
+///
+/// NEVER use this for an authorization decision, a depth cap, an approver
+/// type or any gate: those call [`resolve_governance_policy`] and refuse on
+/// `Err`.
+#[must_use]
+pub fn resolve_governance_policy_for_optional_feature(
+    conn: &Connection,
+    namespace: &str,
+) -> GovernancePolicy {
+    match resolve_governance_policy(conn, namespace) {
+        Ok(policy) => policy.unwrap_or_default(),
+        Err(e) => {
+            tracing::warn!(
+                target: "ai_memory::governance::policy_read",
+                namespace = %namespace,
+                error = %e,
+                "governance policy unreadable; optional policy-driven feature stays OFF (#4043)"
+            );
+            GovernancePolicy::default()
         }
     }
 }
@@ -23099,18 +23222,25 @@ fn warn_severed_floor_applied(severed_namespace: &str, resolving_for: &str) {
 /// Returns `Some(threshold)` when the key is a non-null unsigned integer.
 /// Callers in `memory_reflect` compare `proposed_depth > threshold` and
 /// queue a `pending_actions` row when the condition is true.
-pub fn resolve_require_approval_above_depth(conn: &Connection, namespace: &str) -> Option<u32> {
+///
+/// # Errors
+///
+/// #4043 — any read fault on the governance chain walk; an unreadable level is
+/// never skipped as if it carried no threshold.
+pub fn resolve_require_approval_above_depth(
+    conn: &Connection,
+    namespace: &str,
+) -> Result<Option<u32>> {
     // #2542 — governance/approver LAYERING follows only explicitly-declared
     // parents; a `-`-inferred ancestor must not inject an approval threshold.
-    let chain = build_namespace_governance_chain(conn, namespace);
+    let chain = build_namespace_governance_chain(conn, namespace)?;
     for level in chain.into_iter().rev() {
-        let standard_id = match get_namespace_standard(conn, &level) {
-            Ok(Some(id)) => id,
-            _ => continue,
+        let Some(standard_id) = try_get_namespace_standard(conn, &level)? else {
+            continue;
         };
-        let mem = match get(conn, &standard_id) {
-            Ok(Some(m)) => m,
-            _ => continue,
+        let Some(mem) = get(conn, &standard_id).context("governance: read namespace standard")?
+        else {
+            continue;
         };
         // Governance blob must exist and not be null.
         let gov = match mem.metadata.get(crate::META_KEY_GOVERNANCE) {
@@ -23135,7 +23265,7 @@ pub fn resolve_require_approval_above_depth(conn: &Connection, namespace: &str) 
                 // discipline. The companion regression test at
                 // `tests/governance_metadata_no_silent_truncation.rs`
                 // pins this behaviour.
-                return Some(u32::try_from(n).unwrap_or(0));
+                return Ok(Some(u32::try_from(n).unwrap_or(0)));
             }
             // Key present but null → no gate at this level; keep walking.
         }
@@ -23144,10 +23274,10 @@ pub fn resolve_require_approval_above_depth(conn: &Connection, namespace: &str) 
         // the main resolve_governance_policy walker: a leaf policy that
         // doesn't set the field takes precedence over a parent that does).
         if GovernancePolicy::from_metadata(&mem.metadata).is_some() {
-            return None;
+            return Ok(None);
         }
     }
-    None
+    Ok(None)
 }
 
 /// v0.7.0 L2-6 — read `governance.skill_promotion_min_depth` from the
@@ -23170,18 +23300,25 @@ pub fn resolve_require_approval_above_depth(conn: &Connection, namespace: &str) 
 /// compiled-in default of `1` when this returns `None` — a reflection
 /// must have at least one level of synthesised insight (depth ≥ 1)
 /// before it can be promoted to a reusable skill.
-pub fn resolve_skill_promotion_min_depth(conn: &Connection, namespace: &str) -> Option<u32> {
+///
+/// # Errors
+///
+/// #4043 — any read fault on the governance chain walk; an unreadable level is
+/// never skipped as if it carried no threshold.
+pub fn resolve_skill_promotion_min_depth(
+    conn: &Connection,
+    namespace: &str,
+) -> Result<Option<u32>> {
     // #2542 — governance LAYERING follows only explicitly-declared parents; a
     // `-`-inferred ancestor must not inject a promotion threshold.
-    let chain = build_namespace_governance_chain(conn, namespace);
+    let chain = build_namespace_governance_chain(conn, namespace)?;
     for level in chain.into_iter().rev() {
-        let standard_id = match get_namespace_standard(conn, &level) {
-            Ok(Some(id)) => id,
-            _ => continue,
+        let Some(standard_id) = try_get_namespace_standard(conn, &level)? else {
+            continue;
         };
-        let mem = match get(conn, &standard_id) {
-            Ok(Some(m)) => m,
-            _ => continue,
+        let Some(mem) = get(conn, &standard_id).context("governance: read namespace standard")?
+        else {
+            continue;
         };
         let gov = match mem.metadata.get(crate::META_KEY_GOVERNANCE) {
             Some(g) if !g.is_null() => g,
@@ -23202,17 +23339,17 @@ pub fn resolve_skill_promotion_min_depth(conn: &Connection, namespace: &str) -> 
                 // permanently true). The companion regression test at
                 // `tests/governance_metadata_no_silent_truncation.rs`
                 // pins this behaviour.
-                return Some(u32::try_from(n).unwrap_or(u32::MAX));
+                return Ok(Some(u32::try_from(n).unwrap_or(u32::MAX)));
             }
             // Key present but null → no override at this level; keep walking.
         }
         // Policy found at this level but no skill_promotion_min_depth
         // key → no override; stop walking (leaf-first-wins semantics).
         if GovernancePolicy::from_metadata(&mem.metadata).is_some() {
-            return None;
+            return Ok(None);
         }
     }
-    None
+    Ok(None)
 }
 
 /// Return true if `agent_id` matches a registered agent in `_agents`.
@@ -23375,7 +23512,10 @@ fn evaluate_level(
 /// Without this walk, deep children with no standard of their own
 /// triggered `governance: owner-level action has no resolvable owner`
 /// despite the parent's policy being correctly inherited.
-fn namespace_owner(conn: &Connection, namespace: &str) -> Option<String> {
+///
+/// #4043 — a read fault is an `Err`, never "no owner" (an Owner gate evaluated
+/// against a missing owner must not be reached on evidence nobody read).
+fn namespace_owner(conn: &Connection, namespace: &str) -> Result<Option<String>> {
     // build_namespace_chain returns top-down (`["*", root, ..., leaf]`).
     // We want leaf-first so the most-specific owner wins, matching how
     // resolve_governance_policy picks up the most-specific policy.
@@ -23383,12 +23523,12 @@ fn namespace_owner(conn: &Connection, namespace: &str) -> Option<String> {
     // #2542 — resolve the Owner authority over the GOVERNANCE chain so a
     // `-`-inferred ancestor cannot become the effective owner (an Owner-level
     // policy check would otherwise resolve to a foreign tenant's standard owner).
-    let chain = build_namespace_governance_chain(conn, namespace);
+    let chain = build_namespace_governance_chain(conn, namespace)?;
     for level in chain.into_iter().rev() {
-        let Some(standard_id) = get_namespace_standard(conn, &level).ok().flatten() else {
+        let Some(standard_id) = try_get_namespace_standard(conn, &level)? else {
             continue;
         };
-        let Some(mem) = get(conn, &standard_id).ok().flatten() else {
+        let Some(mem) = get(conn, &standard_id).context("governance: read namespace owner")? else {
             continue;
         };
         if let Some(owner) = mem
@@ -23397,10 +23537,10 @@ fn namespace_owner(conn: &Connection, namespace: &str) -> Option<String> {
             .and_then(|v| v.as_str())
             .map(str::to_string)
         {
-            return Some(owner);
+            return Ok(Some(owner));
         }
     }
-    None
+    Ok(None)
 }
 
 /// Decide a `Store`/`Delete`/`Promote` whose namespace chain resolves NO
@@ -23516,7 +23656,32 @@ pub fn enforce_governance(
     //   `governance::ENV_REQUIRE_GOVERNED_NAMESPACE` for the full rationale.
     // The refusal returns EARLY, so it never reaches the capability-grant
     // joiner below — see `governance::ungoverned_namespace_refusal` for why.
-    let Some(policy) = resolve_governance_policy(conn, namespace) else {
+    //
+    // #4043 — an UNREADABLE policy is not an ungoverned one. Under `Enforce`
+    // the read fault propagates as an `Err` (every caller refuses the write on
+    // it); pre-#4043 it collapsed into `None` and reached the allow-on-silence
+    // arm above. `Advisory` never blocks by contract, so it logs and allows —
+    // exactly what it would have done with the policy in hand.
+    let resolved = match resolve_governance_policy(conn, namespace) {
+        Ok(resolved) => resolved,
+        Err(e) if mode == PermissionsMode::Advisory => {
+            tracing::warn!(
+                target: crate::governance::GOVERNANCE_GATE_TRACE_TARGET,
+                namespace = %namespace,
+                agent_id = %agent_id,
+                action = ?action,
+                error = %e,
+                "permissions.mode=advisory: governance policy UNREADABLE — would refuse under enforce"
+            );
+            return Ok(GovernanceDecision::Allow);
+        }
+        Err(e) => {
+            return Err(e.context(format!(
+                "governance policy for namespace '{namespace}' could not be read; refusing (#4043)"
+            )));
+        }
+    };
+    let Some(policy) = resolved else {
         return Ok(ungoverned_namespace_decision(
             mode, action, namespace, agent_id,
         ));
@@ -23536,7 +23701,7 @@ pub fn enforce_governance(
     };
     // Always resolve the namespace-standard owner: Owner-level Store
     // uses it, and Approve uses it for every action (B15).
-    let ns_owner = namespace_owner(conn, namespace);
+    let ns_owner = namespace_owner(conn, namespace)?;
 
     let mut decision = evaluate_level(
         conn,
@@ -24180,7 +24345,9 @@ pub fn reject_with_approver_type(
     if pa.status != "pending" {
         return Ok(RejectOutcome::NotFound);
     }
-    let approver = resolve_governance_policy(conn, &pa.namespace)
+    // #4043 — an unreadable policy refuses the decision; it never falls back to
+    // the `Human` default (which would let one human decide a consensus row).
+    let approver = resolve_governance_policy(conn, &pa.namespace)?
         .map_or(ApproverType::Human, |p| p.core.approver);
     if let ApproverEligibility::Refused(reason) = evaluate_approver_eligibility(
         conn,
@@ -24231,7 +24398,9 @@ pub fn approve_with_approver_type(
     // which accepts any approval (back-compat with 1.9 callers).
     // #880 — `approver` lives on `policy.core` after the governance
     // decomposition.
-    let approver = resolve_governance_policy(conn, &pa.namespace)
+    // #4043 — an unreadable policy refuses the decision; it never falls back to
+    // the `Human` default (which would let one human decide a consensus row).
+    let approver = resolve_governance_policy(conn, &pa.namespace)?
         .map_or(ApproverType::Human, |p| p.core.approver);
 
     // v1.0.0 #3388 — the eligibility half of this gate is now ONE predicate
@@ -24411,9 +24580,9 @@ fn refuse_unapproved_destination_store(
     if mode == PermissionsMode::Off {
         return Ok(());
     }
-    let decision = match resolve_governance_policy(conn, to_ns) {
+    let decision = match resolve_governance_policy(conn, to_ns)? {
         Some(policy) => {
-            let ns_owner = namespace_owner(conn, to_ns);
+            let ns_owner = namespace_owner(conn, to_ns)?;
             evaluate_level(
                 conn,
                 GovernedAction::Store,
@@ -30875,6 +31044,7 @@ mod tests {
         set_namespace_standard(&conn, "ns/locked", &standard_id, None).unwrap();
 
         let resolved = resolve_governance_policy(&conn, "ns/locked")
+            .expect("policy read must succeed")
             .expect("policy must resolve when explicitly set");
         assert_eq!(resolved.core.write, crate::models::GovernanceLevel::Owner);
     }
@@ -30913,6 +31083,217 @@ mod tests {
         let sid = insert(&conn, &standard).unwrap();
         set_namespace_standard(&conn, ns, &sid, None).unwrap();
         conn
+    }
+
+    // ---- #4043 — an UNREADABLE namespace policy must refuse, never allow ----
+
+    /// An Owner-gated namespace whose standard belongs to `ai:owner-4043`.
+    fn owner_gated_conn_4043(ns: &str) -> Connection {
+        use crate::models::{ApproverType, CorePolicy, GovernanceLevel, GovernancePolicy};
+        let conn = test_db();
+        let policy = GovernancePolicy {
+            core: CorePolicy {
+                write: GovernanceLevel::Owner,
+                promote: GovernanceLevel::Owner,
+                delete: GovernanceLevel::Owner,
+                approver: ApproverType::Human,
+                inherit: true,
+                max_reflection_depth: None,
+                required_scope: None,
+            },
+            ..Default::default()
+        };
+        let mut standard = make_memory("std-4043", &format!("_standards-{ns}"), Tier::Long, 9);
+        standard.metadata = serde_json::json!({"governance": policy, "agent_id": "ai:owner-4043"});
+        let sid = insert(&conn, &standard).unwrap();
+        set_namespace_standard(&conn, ns, &sid, None).unwrap();
+        conn
+    }
+
+    /// Make every read of `table` on THIS connection fail, the way a
+    /// storage/decrypt fault would: a TEMP view shadows the table and calls a
+    /// scalar function that always errors.
+    fn inject_read_fault_4043(conn: &Connection, table: &str) {
+        conn.create_scalar_function(
+            "fault_4043",
+            0,
+            rusqlite::functions::FunctionFlags::SQLITE_UTF8,
+            |_| -> rusqlite::Result<i64> {
+                Err(rusqlite::Error::UserFunctionError(
+                    "injected #4043 read fault".into(),
+                ))
+            },
+        )
+        .unwrap();
+        conn.execute_batch(&format!(
+            "CREATE TEMP VIEW {table} AS SELECT * FROM main.{table} WHERE fault_4043() = 1"
+        ))
+        .unwrap();
+    }
+
+    fn enforce_store_4043(
+        conn: &Connection,
+        ns: &str,
+    ) -> Result<crate::models::GovernanceDecision> {
+        enforce_governance(
+            conn,
+            crate::models::GovernedAction::Store,
+            ns,
+            "ai:intruder-4043",
+            None,
+            None,
+            &serde_json::json!({"title": "x"}),
+            None,
+        )
+    }
+
+    /// #4043 red-first — control: the policy is readable and a non-owner is
+    /// refused; then a `namespace_meta` read fault must REFUSE (error), not
+    /// fall through to allow-on-silence.
+    #[test]
+    fn issue_4043_namespace_meta_read_fault_refuses_under_enforce() {
+        use crate::config::{
+            PermissionsMode, lock_permissions_mode_for_test,
+            override_active_permissions_mode_for_test,
+        };
+        use crate::models::GovernanceDecision;
+        let _gate = lock_permissions_mode_for_test();
+        override_active_permissions_mode_for_test(PermissionsMode::Enforce);
+        let ns = "gov4043/meta";
+        let conn = owner_gated_conn_4043(ns);
+
+        let control = enforce_store_4043(&conn, ns).expect("readable policy decides");
+        assert!(
+            matches!(control, GovernanceDecision::Deny(_)),
+            "control: an Owner policy refuses a non-owner, got {control:?}"
+        );
+
+        inject_read_fault_4043(&conn, "namespace_meta");
+        match enforce_store_4043(&conn, ns) {
+            Err(_) | Ok(GovernanceDecision::Deny(_)) => {}
+            Ok(other) => {
+                panic!("#4043: an unreadable namespace policy must refuse the write, got {other:?}")
+            }
+        }
+        override_active_permissions_mode_for_test(PermissionsMode::Advisory);
+    }
+
+    /// #4043 red-first — the bound standard itself is unreadable (the
+    /// selective-key-loss / decrypt-fault shape): refuse, never allow.
+    #[test]
+    fn issue_4043_standard_read_fault_refuses_under_enforce() {
+        use crate::config::{
+            PermissionsMode, lock_permissions_mode_for_test,
+            override_active_permissions_mode_for_test,
+        };
+        use crate::models::GovernanceDecision;
+        let _gate = lock_permissions_mode_for_test();
+        override_active_permissions_mode_for_test(PermissionsMode::Enforce);
+        let ns = "gov4043/standard";
+        let conn = owner_gated_conn_4043(ns);
+
+        inject_read_fault_4043(&conn, "memories");
+        match enforce_store_4043(&conn, ns) {
+            Err(_) | Ok(GovernanceDecision::Deny(_)) => {}
+            Ok(other) => panic!(
+                "#4043: an unreadable namespace standard must refuse the write, got {other:?}"
+            ),
+        }
+        override_active_permissions_mode_for_test(PermissionsMode::Advisory);
+    }
+
+    /// #4043 red-first — the realistic fault: the standard's at-rest envelope
+    /// cannot be opened (selective key loss / corrupted ciphertext). Refuse.
+    #[test]
+    fn issue_4043_undecryptable_standard_refuses_under_enforce() {
+        use crate::config::{
+            PermissionsMode, lock_permissions_mode_for_test,
+            override_active_permissions_mode_for_test,
+        };
+        use crate::models::GovernanceDecision;
+        let _gate = lock_permissions_mode_for_test();
+        override_active_permissions_mode_for_test(PermissionsMode::Enforce);
+        let ns = "gov4043/envelope";
+        let conn = owner_gated_conn_4043(ns);
+        let sid: String = conn
+            .query_row(
+                "SELECT standard_id FROM namespace_meta WHERE namespace = ?1",
+                params![ns],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let changed = conn
+            .execute(
+                "UPDATE memories SET encrypted_envelope = x'00ff00ff' WHERE id = ?1",
+                params![sid],
+            )
+            .unwrap();
+        assert_eq!(changed, 1);
+        match enforce_store_4043(&conn, ns) {
+            Err(_) | Ok(GovernanceDecision::Deny(_)) => {}
+            Ok(other) => panic!(
+                "#4043: an undecryptable namespace standard must refuse the write, got {other:?}"
+            ),
+        }
+        override_active_permissions_mode_for_test(PermissionsMode::Advisory);
+    }
+
+    /// #4043 — a read fault on a PARENT link of the governance chain must
+    /// refuse: the leaf has no policy, the governed parent is reachable only
+    /// through `namespace_meta.parent_namespace`, and that read fails.
+    #[test]
+    fn issue_4043_parent_link_read_fault_refuses_under_enforce() {
+        use crate::config::{
+            PermissionsMode, lock_permissions_mode_for_test,
+            override_active_permissions_mode_for_test,
+        };
+        use crate::models::GovernanceDecision;
+        let _gate = lock_permissions_mode_for_test();
+        override_active_permissions_mode_for_test(PermissionsMode::Enforce);
+        let parent = "gov4043parent";
+        let conn = owner_gated_conn_4043(parent);
+        let leaf = "gov4043leaf";
+        // The leaf's own standard carries NO governance (contributes nothing),
+        // owned by the same principal so the parent link is entitled (#2542).
+        let mut plain = make_memory("leaf-std-4043", "_standards-gov4043leaf", Tier::Long, 5);
+        plain.metadata = serde_json::json!({"agent_id": "ai:owner-4043"});
+        let plain_id = insert(&conn, &plain).unwrap();
+        set_namespace_standard(&conn, leaf, &plain_id, Some(parent)).unwrap();
+        // Control: the leaf inherits the parent's Owner gate (severed-floor
+        // aside, a non-owner is refused).
+        let control = enforce_store_4043(&conn, leaf).expect("readable chain decides");
+        assert!(
+            matches!(control, GovernanceDecision::Deny(_)),
+            "control: the inherited Owner policy refuses a non-owner, got {control:?}"
+        );
+        inject_read_fault_4043(&conn, "namespace_meta");
+        match enforce_store_4043(&conn, leaf) {
+            Err(_) | Ok(GovernanceDecision::Deny(_)) => {}
+            Ok(other) => {
+                panic!("#4043: an unreadable parent link must refuse the write, got {other:?}")
+            }
+        }
+        override_active_permissions_mode_for_test(PermissionsMode::Advisory);
+    }
+
+    /// #4043 — Advisory never blocks by contract, including on a read fault.
+    #[test]
+    fn issue_4043_read_fault_under_advisory_allows() {
+        use crate::config::{
+            PermissionsMode, lock_permissions_mode_for_test,
+            override_active_permissions_mode_for_test,
+        };
+        use crate::models::GovernanceDecision;
+        let _gate = lock_permissions_mode_for_test();
+        override_active_permissions_mode_for_test(PermissionsMode::Advisory);
+        let ns = "gov4043/advisory";
+        let conn = owner_gated_conn_4043(ns);
+        inject_read_fault_4043(&conn, "namespace_meta");
+        let d = enforce_store_4043(&conn, ns).expect("advisory never errors");
+        assert!(
+            matches!(d, GovernanceDecision::Allow),
+            "advisory allows, got {d:?}"
+        );
     }
 
     /// Test 1 — v1.0.0 Boids item 1 (5-agent vote 4d3ea1c5): the recall

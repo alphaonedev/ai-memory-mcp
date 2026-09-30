@@ -195,7 +195,15 @@ pub(super) fn handle_link(
             Ok(Some(m)) => m.namespace,
             _ => crate::DEFAULT_NAMESPACE.to_string(),
         };
+        // #4043 — an unreadable policy refuses the link; it never falls back to
+        // the default depth cap (which would lift an operator cap of 0).
         let policy = db::resolve_governance_policy(conn, &source_ns)
+            .map_err(|e| {
+                crate::mcp::error_text::mcp_foreign_err(
+                    "governance policy unreadable (#4043 fail-CLOSED)",
+                    e,
+                )
+            })?
             .unwrap_or_else(GovernancePolicy::default);
         let max_depth = policy.effective_max_reflection_depth();
 
