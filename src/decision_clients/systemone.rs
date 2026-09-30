@@ -251,12 +251,13 @@ impl SystemOneDecider {
         pin: Option<&crate::egress::PinnedTarget>,
     ) -> Result<Self> {
         let timeout = resolved.timeout();
+        let endpoint = endpoint_url(&resolved.base_url, wire.path())?;
         Ok(Self {
             provider_id: resolved.provider.clone(),
             model: resolved.model.clone(),
-            endpoint: endpoint_url(&resolved.base_url, wire.path())?,
+            http: decision_http_client(timeout, pin, &endpoint)?,
+            endpoint,
             api_key: SecretKey::new(resolved.api_key()),
-            http: decision_http_client(timeout, pin)?,
             timeout,
             outbound,
             wire,

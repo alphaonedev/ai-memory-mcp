@@ -446,20 +446,25 @@ pub(crate) async fn post_json(call: HttpCall<'_>) -> Result<Value, CallFailure> 
 fn decision_http_client(
     timeout: Duration,
     pin: Option<&crate::egress::PinnedTarget>,
+    endpoint: &Url,
 ) -> Result<reqwest::Client> {
     let builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
-    // #4193 — under any posture other than `allow`, an environment proxy
-    // (HTTP_PROXY / HTTPS_PROXY / ALL_PROXY) would carry an ADMITTED call
-    // (Bearer key plus memory content) to a host the egress gate never
-    // approved. So the client ignores proxies there. Under `allow` every
-    // destination is permitted anyway, and a corporate proxy keeps working.
-    let restricted = !matches!(
+    // #4193 (5-agent vote 4d3ea1c5, memory 753506d9: X amended). An
+    // environment proxy (HTTP_PROXY / HTTPS_PROXY / ALL_PROXY) is honoured
+    // ONLY under `allow` AND only for https to a non-loopback host, where
+    // CONNECT keeps TLS end to end. In every other case the client ignores
+    // it: outside `allow` a proxy would carry an ADMITTED call (Bearer key
+    // plus memory content) to a host the gate never approved, and under
+    // `allow` a loopback or plaintext target would otherwise go OFF-HOST in
+    // cleartext through the proxy. The decision reads the SAME parsed Url the
+    // client dials, never a second host parser (the #4018 class).
+    let allow = matches!(
         crate::egress::resolve_inference_egress_mode(),
         crate::egress::InferenceEgressMode::Allow
     );
     let builder = match pin {
         Some(pin) => builder.resolve_to_addrs(&pin.host, &pin.addrs).no_proxy(),
-        None if restricted => builder.no_proxy(),
+        None if !(allow && proxy_may_carry(endpoint)) => builder.no_proxy(),
         None => builder,
     };
     builder
@@ -478,6 +483,25 @@ fn decision_http_client(
         .timeout(timeout.saturating_mul(2))
         .build()
         .map_err(|_| anyhow!("could not build the [decision] HTTP client"))
+}
+
+/// #4193 — whether an environment proxy may carry a call to `endpoint`:
+/// only https to a host that is not loopback. Plaintext never crosses a
+/// proxy, and nothing needs a proxy to reach loopback.
+fn proxy_may_carry(endpoint: &Url) -> bool {
+    if endpoint.scheme() != "https" {
+        return false;
+    }
+    let Some(host) = endpoint.host_str() else {
+        return false;
+    };
+    // `host_str` renders an IPv6 literal in brackets.
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
+        return !ip.is_loopback();
+    }
+    let lower = host.to_ascii_lowercase();
+    lower != "localhost" && !lower.ends_with(".localhost")
 }
 
 /// Join a configured `base_url` and a route into a request URL.
@@ -732,6 +756,23 @@ pub(crate) const NETWORK_SOURCE: DecisionSource = DecisionSource::DecisionModel;
 
 #[cfg(test)]
 mod tests {
+    /// #4193 amendment — an environment proxy may carry only https to a
+    /// non-loopback host; plaintext and loopback never cross it.
+    #[test]
+    fn proxy_may_carry_only_https_to_a_non_loopback_host_4193() {
+        let may = |u: &str| proxy_may_carry(&Url::parse(u).expect("url"));
+        assert!(may("https://api.vendor.example/v1"));
+        assert!(
+            !may("http://api.vendor.example/v1"),
+            "plaintext never crosses a proxy"
+        );
+        assert!(!may("https://127.0.0.1:9/v1"));
+        assert!(!may("https://[::1]:9/v1"));
+        assert!(!may("https://localhost:9/v1"));
+        assert!(!may("https://api.localhost/v1"));
+        assert!(!may("http://127.0.0.1:11434/v1"));
+    }
+
     use super::*;
 
     /// A provider that can judge and score but never choose.

@@ -168,12 +168,13 @@ impl OpenAiCompatibleDecider {
             CHAT_ROUTE
         };
         let timeout = resolved.timeout();
+        let endpoint = endpoint_url(&resolved.base_url, route)?;
         Ok(Self {
             provider_id: resolved.provider.clone(),
             model: resolved.model.clone(),
-            endpoint: endpoint_url(&resolved.base_url, route)?,
+            http: decision_http_client(timeout, pin, &endpoint)?,
+            endpoint,
             api_key: SecretKey::new(resolved.api_key()),
-            http: decision_http_client(timeout, pin)?,
             timeout,
             outbound,
             logprobs: AtomicBool::new(true),
@@ -716,9 +717,14 @@ mod tests {
         OpenAiCompatibleDecider {
             provider_id: "openai-compatible".to_string(),
             model: "vendor/decision-1".to_string(),
+            http: decision_http_client(
+                Duration::from_secs(2),
+                None,
+                &endpoint_url(base_url, CHAT_ROUTE).expect("test base_url parses"),
+            )
+            .expect("test client builds"),
             endpoint: endpoint_url(base_url, CHAT_ROUTE).expect("test base_url parses"),
             api_key: SecretKey::new(key),
-            http: decision_http_client(Duration::from_secs(2), None).expect("test client builds"),
             timeout: Duration::from_secs(2),
             outbound: Arc::new(|_: &Url| Ok(())),
             logprobs: AtomicBool::new(true),

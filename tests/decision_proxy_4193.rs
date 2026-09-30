@@ -87,3 +87,52 @@ async fn a_restricted_posture_never_routes_the_decision_call_through_a_proxy_419
     );
     assert_eq!(judgement.verdict(), Some(true));
 }
+
+/// #4193 amendment (vote 753506d9), lifted from SECPROG L1's
+/// `l1_system_proxy_never_carries_a_loopback_decision_call`: under the
+/// DEFAULT `allow` posture a loopback plaintext decision endpoint must never
+/// go through an environment proxy (it would leave the host in cleartext).
+/// RED on e8532dc16, which honoured the proxy under `allow` (proxy 1, target 0).
+#[tokio::test(flavor = "multi_thread")]
+async fn under_allow_a_loopback_decision_call_never_uses_a_proxy_4193() {
+    let approved = answering_server().await;
+    let proxy = answering_server().await;
+    let proxy_url = proxy.uri();
+    let _env = common::MultiEnvVarGuard::apply(&[
+        ("AI_MEMORY_INFERENCE_EGRESS", None),
+        ("HTTP_PROXY", Some(proxy_url.as_str())),
+        ("http_proxy", Some(proxy_url.as_str())),
+        ("ALL_PROXY", Some(proxy_url.as_str())),
+        ("all_proxy", Some(proxy_url.as_str())),
+        ("NO_PROXY", None),
+        ("no_proxy", None),
+    ]);
+    let cfg = AppConfig {
+        decision: Some(DecisionSection {
+            provider: Some("openai-compatible".to_string()),
+            model: Some("vendor/decision-1".to_string()),
+            base_url: Some(approved.uri()),
+            api_key_env: None,
+            api_key_file: None,
+            api_key: None,
+            timeout_secs: Some(2),
+            fallback: Some(DecisionFallback::Abstain),
+        }),
+        ..AppConfig::default()
+    };
+    let resolved = resolve_decision(&cfg).expect("resolves");
+    let permit: OutboundCheck = Arc::new(|_| Ok(()));
+    let decider = construct_pinned(&resolved, permit, None, None).expect("constructs");
+    let judgement = decider.judge("do these two records conflict?").await;
+    assert_eq!(
+        hits(&proxy).await,
+        0,
+        "loopback under allow must not use the proxy"
+    );
+    assert_eq!(
+        hits(&approved).await,
+        1,
+        "the approved endpoint answers directly"
+    );
+    assert_eq!(judgement.verdict(), Some(true));
+}
