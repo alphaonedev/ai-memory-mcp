@@ -25,6 +25,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::time::Duration;
 
 use ai_memory::governance::audit::{
     CHAIN_HEAD_PREV_HASH, ForensicDecision, REQUIRE_FORENSIC_SINK_ENV,
@@ -599,4 +600,168 @@ fn a_postgres_backed_process_writes_no_sqlite_outage_row_4199() {
         before,
         "wrote the local sqlite store"
     );
+}
+
+/// Run `archive purge` but give up after `limit`: a hang is a failure, never a
+/// hung test harness (#4273 — a FIFO daily file used to block start-up).
+fn purge_with_deadline(home: &Path, env: &[(&str, &str)], limit: Duration) -> Option<Output> {
+    let config_root = home.join(".config").join("ai-memory");
+    std::fs::create_dir_all(&config_root).expect("create config root");
+    std::fs::write(
+        config_root.join("config.toml"),
+        format!(
+            "schema_version = 2\ntier = \"keyword\"\n\n[audit]\nenabled = false\npath = \"{}\"\n",
+            forensic_dir(home).display()
+        ),
+    )
+    .expect("write config");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_ai-memory"));
+    cmd.env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("HOME", home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env(
+            "AI_MEMORY_KEY_DIR",
+            ai_memory::identity::test_key_dir::install(),
+        );
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let mut child = cmd
+        .current_dir(home)
+        .arg("--db")
+        .arg(db_path(home))
+        .args(["archive", "purge", "--namespace", PROBE_NAMESPACE])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn purge");
+    let deadline = std::time::Instant::now() + limit;
+    loop {
+        if child.try_wait().expect("poll purge").is_some() {
+            return Some(child.wait_with_output().expect("collect purge"));
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Replace the forensic directory with a regular FILE: `create_dir_all` fails.
+fn make_forensic_dir_uncreatable(home: &Path) {
+    let dir = forensic_dir(home);
+    std::fs::remove_dir_all(&dir).expect("remove the forensic dir");
+    std::fs::write(&dir, b"a file where the forensic directory should be\n")
+        .expect("plant a file at the forensic dir path");
+}
+
+/// #4272 — under require-mode, EVERY failure to start the sink refuses boot,
+/// not only an unreadable tail: here the forensic directory cannot be created.
+#[test]
+fn require_mode_refuses_boot_when_the_forensic_dir_cannot_be_created_4272() {
+    let home = sandbox();
+    log_with_rows(home.path());
+    make_forensic_dir_uncreatable(home.path());
+    let out = purge_with_env(home.path(), &[(REQUIRE_FORENSIC_SINK_ENV, "1")]);
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(EX_CONFIG), "stderr: {err}");
+    assert!(err.contains("refusing to start"), "stderr: {err}");
+}
+
+/// #4272 — without the knob the same failure degrades with EVERY #4199
+/// signal (it used to print "continuing unsigned" and record nothing).
+#[test]
+fn an_uncreatable_forensic_dir_degrades_with_the_outage_signals_4272() {
+    let home = sandbox();
+    log_with_rows(home.path());
+    make_forensic_dir_uncreatable(home.path());
+    let outages = outage_rows(home.path());
+    let out = purge_once(home.path());
+    let err = stderr(&out);
+    assert!(out.status.success(), "stderr: {err}");
+    assert!(err.contains(DEGRADED), "stderr: {err}");
+    assert!(!err.contains("continuing unsigned"), "stderr: {err}");
+    assert_eq!(
+        outage_rows(home.path()),
+        outages + 1,
+        "one signed outage row"
+    );
+    assert_eq!(doctor_forensic_severity(home.path(), &[]), "critical");
+}
+
+#[cfg(unix)]
+fn mkfifo(path: &Path) {
+    let status = Command::new("mkfifo")
+        .arg(path)
+        .status()
+        .expect("run mkfifo");
+    assert!(status.success(), "mkfifo {}", path.display());
+}
+
+/// #4273 — a FIFO under a daily-file name must not hang the process: the
+/// listing refuses it, so the boot degrades promptly (it used to block forever
+/// in the tail read).
+#[cfg(unix)]
+#[test]
+fn a_fifo_daily_file_degrades_promptly_instead_of_hanging_4273() {
+    let home = sandbox();
+    // The FIFO must be the file the tail reader opens: the only daily file.
+    let today = log_with_rows(home.path());
+    std::fs::remove_file(&today).expect("remove the only healthy daily file");
+    mkfifo(&forensic_dir(home.path()).join(OLDER_DAY));
+    let out = purge_with_deadline(home.path(), &[], Duration::from_secs(30))
+        .expect("the process HUNG on a FIFO daily file (#4273)");
+    let err = stderr(&out);
+    assert!(out.status.success(), "stderr: {err}");
+    assert!(err.contains(DEGRADED), "stderr: {err}");
+    assert!(err.contains("not a regular file"), "stderr: {err}");
+}
+
+/// #4273 — the same FIFO under require-mode refuses boot (78), promptly.
+#[cfg(unix)]
+#[test]
+fn require_mode_refuses_boot_on_a_fifo_daily_file_4273() {
+    let home = sandbox();
+    // The FIFO must be the file the tail reader opens: the only daily file.
+    let today = log_with_rows(home.path());
+    std::fs::remove_file(&today).expect("remove the only healthy daily file");
+    mkfifo(&forensic_dir(home.path()).join(OLDER_DAY));
+    let out = purge_with_deadline(
+        home.path(),
+        &[(REQUIRE_FORENSIC_SINK_ENV, "1")],
+        Duration::from_secs(30),
+    )
+    .expect("the process HUNG on a FIFO daily file (#4273)");
+    assert_eq!(
+        out.status.code(),
+        Some(EX_CONFIG),
+        "stderr: {}",
+        stderr(&out)
+    );
+}
+
+/// #4273 — a daily file that is a symlink to a file OUTSIDE the audit
+/// directory is refused: nothing is read through it and nothing is appended
+/// to its target (the writer used to append through the link).
+#[cfg(unix)]
+#[test]
+fn a_symlinked_daily_file_is_refused_and_its_target_untouched_4273() {
+    let home = sandbox();
+    let today = log_with_rows(home.path());
+    let outside = home.path().join("outside-the-audit-dir.jsonl");
+    std::fs::rename(&today, &outside).expect("move the rows outside");
+    std::os::unix::fs::symlink(&outside, &today).expect("symlink the daily file");
+    let before = std::fs::read(&outside).expect("read the link target");
+    let out = purge_once(home.path());
+    let err = stderr(&out);
+    assert_eq!(
+        std::fs::read(&outside).expect("read the link target"),
+        before,
+        "nothing may be written through a symlinked daily file; stderr: {err}"
+    );
+    assert!(out.status.success(), "stderr: {err}");
+    assert!(err.contains(DEGRADED), "stderr: {err}");
 }

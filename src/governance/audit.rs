@@ -206,11 +206,10 @@ fn writer() -> anyhow::Result<&'static Sender<WriteOp>> {
 /// own (skipped) line and the new row stays parseable. Every append-only log
 /// here opens through this one helper, so no appender can skip the rule.
 fn open_for_append_line_aligned(path: &Path) -> std::io::Result<File> {
-    let mut f = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .append(true)
-        .open(path)?;
+    let mut f = open_forensic_file(
+        OpenOptions::new().create(true).read(true).append(true),
+        path,
+    )?;
     let len = f.metadata()?.len();
     if len > 0 {
         let mut last = [0u8; 1];
@@ -221,6 +220,47 @@ fn open_for_append_line_aligned(path: &Path) -> std::io::Result<File> {
         }
     }
     Ok(f)
+}
+
+/// #4273 — open a forensic log file WITHOUT following a symbolic link and
+/// without blocking on a FIFO, then refuse anything the opened handle does
+/// not show to be a regular file. The type check is on the OPENED descriptor,
+/// so there is no window between checking a path and opening it. A FIFO named
+/// as a daily file used to hang every process start (the tail read blocks on
+/// a FIFO with no writer), and a symlinked daily file sent reads and appends
+/// outside the audit directory.
+fn open_forensic_file(options: &mut OpenOptions, path: &Path) -> std::io::Result<File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+    }
+    let file = match options.open(path) {
+        Ok(file) => file,
+        #[cfg(unix)]
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "{} is a symbolic link; forensic log files are never opened through a link",
+                    path.display()
+                ),
+            ));
+        }
+        Err(e) => return Err(e),
+    };
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("forensic log file {} is not a regular file", path.display()),
+        ));
+    }
+    Ok(file)
+}
+
+/// #4273 — [`open_forensic_file`] for reading.
+fn open_forensic_file_for_read(path: &Path) -> std::io::Result<File> {
+    open_forensic_file(OpenOptions::new().read(true), path)
 }
 
 /// Drain loop for the background writer. Keeps the destination file open
@@ -1069,9 +1109,10 @@ pub fn init(dir: &Path, signing_key: Option<SigningKey>) -> Result<()> {
     // before any row for the freshly-initialised sink is enqueued —
     // without this, a re-init over a removed/rotated same-named file
     // would keep writing to the unlinked inode.
-    // #3164 — a spawn failure surfaces as an `init` error (the boot path
-    // already downgrades to "continuing unsigned" rather than aborting);
-    // it no longer kills the process from the main thread.
+    // #3164 — a spawn failure surfaces as an `init` error; it no longer kills
+    // the process from the main thread. #4272: the boot path treats it as
+    // "forensic sink unavailable" (degrade with the outage signals, or refuse
+    // under AI_MEMORY_REQUIRE_FORENSIC_SINK), like every other init failure.
     let _ = writer()?.send(WriteOp::Reset);
     *guard = Some(new_sink);
     Ok(())
@@ -1244,7 +1285,7 @@ impl std::fmt::Display for ForensicTailUnreadable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "the forensic audit log at {} cannot continue its hash chain ({}); it is never \
+            "the forensic audit log at {} is unavailable ({}); its hash chain is never \
              restarted at genesis, which would fork the signed chain",
             self.path.display(),
             self.cause
@@ -1634,7 +1675,7 @@ fn is_blank_line(line: &[u8]) -> bool {
 /// parseable row, so only the exact scan can answer.
 fn read_chain_tail_from_suffix(path: &Path) -> Result<Option<FileTail>> {
     let io = |e: std::io::Error| tail_unreadable(path, e.to_string());
-    let mut f = File::open(path).map_err(io)?;
+    let mut f = open_forensic_file_for_read(path).map_err(io)?;
     let len = f.metadata().map_err(io)?.len();
     let start = len.saturating_sub(CHAIN_TAIL_WINDOW_BYTES);
     f.seek(SeekFrom::Start(start)).map_err(io)?;
@@ -1679,7 +1720,7 @@ fn read_chain_tail_from_suffix(path: &Path) -> Result<Option<FileTail>> {
 /// held any non-blank line.
 fn read_chain_tail_full_scan(path: &Path) -> Result<FileTail> {
     let io = |e: std::io::Error| tail_unreadable(path, e.to_string());
-    let f = File::open(path).map_err(io)?;
+    let f = open_forensic_file_for_read(path).map_err(io)?;
     let mut last: Option<String> = None;
     let mut saw_non_blank = false;
     for raw in BufReader::new(f).split(b'\n') {
@@ -1727,6 +1768,21 @@ fn list_forensic_files(dir: &Path) -> Result<Vec<PathBuf>> {
                 .and_then(|s| s.strip_suffix(FORENSIC_FILE_SUFFIX))
                 .is_some_and(|stem| parse_iso_date(stem).is_ok());
             if stem_is_date {
+                // #4273 — only a REGULAR file can be a daily forensic file.
+                // `file_type` does not follow a symlink, so a link, FIFO,
+                // socket, device or directory under a daily-file name is
+                // refused here (the chain tail is then unavailable: degrade,
+                // or refuse under require-mode) and never silently skipped.
+                let file_type = entry
+                    .file_type()
+                    .with_context(|| format!("reading the type of {}", entry.path().display()))?;
+                if !file_type.is_file() {
+                    anyhow::bail!(
+                        "{} is not a regular file (a symbolic link, FIFO, socket, device or \
+                         directory under a daily forensic file name)",
+                        entry.path().display()
+                    );
+                }
                 out.push(entry.path());
             } else {
                 tracing::warn!(
@@ -1813,7 +1869,8 @@ pub fn verify_since(
         if date >= cutoff {
             break;
         }
-        let f = File::open(file).with_context(|| crate::errors::msg::opening(file.display()))?;
+        let f = open_forensic_file_for_read(file)
+            .with_context(|| crate::errors::msg::opening(file.display()))?;
         for line in BufReader::new(f).lines() {
             let Ok(line) = line else { continue };
             if line.trim().is_empty() {
@@ -1830,7 +1887,8 @@ pub fn verify_since(
         if date < cutoff {
             continue;
         }
-        let f = File::open(file).with_context(|| crate::errors::msg::opening(file.display()))?;
+        let f = open_forensic_file_for_read(file)
+            .with_context(|| crate::errors::msg::opening(file.display()))?;
         for (idx, line) in BufReader::new(f).lines().enumerate() {
             let line_no = (idx as u64) + 1;
             let line = line.with_context(|| format!("reading {}:{line_no}", file.display()))?;
@@ -2286,7 +2344,7 @@ enum WatermarkScan {
 /// signed. [`last_audit_watermark`] ignores the bit (the CONVICTING lanes read
 /// the raw unauthenticated anchor).
 fn scan_file_last_watermark(path: &Path, db_id: Option<&str>) -> WatermarkScan {
-    let Ok(f) = File::open(path) else {
+    let Ok(f) = open_forensic_file_for_read(path) else {
         return WatermarkScan::NoEligibleRow;
     };
     let mut found: Option<(i64, String, bool)> = None;
@@ -4403,8 +4461,8 @@ mod writer_spawn_tests_3164 {
     /// `main::init_forensic_audit`, so a `clone(2)` refusal (`EAGAIN` from a
     /// pids-cgroup cap or `RLIMIT_NPROC` on a dense host) aborted the whole
     /// process with exit 101 before it served a request. A resource condition
-    /// must be a `Result` (ERRORS-01), and the boot path's existing
-    /// "continuing unsigned" policy then decides.
+    /// must be a `Result` (ERRORS-01), and the boot path then decides (#4272:
+    /// "forensic sink unavailable", which degrades, or refuses in require-mode).
     ///
     /// LIMITATION, stated honestly: forcing a real `clone(2)` EAGAIN inside a
     /// test process is not portable, so this pins the CONTRACT — the fallible
