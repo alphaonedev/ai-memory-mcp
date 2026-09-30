@@ -32,6 +32,12 @@ const SQL_SELECT_LIFECYCLE_STATE_BY_ID: &str = "SELECT lifecycle_state FROM memo
 /// write lock, kept as the structural guard) is a typed [`InvalidTransition`]
 /// naming the state the row moved to — NEVER the `Ok(false)` of an absent row.
 ///
+/// #3152 — the transaction is [`super::in_write_txn`]: standalone it opens and
+/// commits its own `BEGIN IMMEDIATE`; inside a caller's transaction (the
+/// `memory_update` / SAL update funnels) it JOINS it instead of nesting, so the
+/// transition commits or rolls back WITH the content patch. There is no
+/// intermediate COMMIT between the patch and the transition.
+///
 /// Returns `true` when a row was updated, `false` when `id` did not match
 /// a row (no transition to validate).
 ///
@@ -47,15 +53,12 @@ pub fn set_lifecycle_state(
     use crate::models::LifecycleState;
     use rusqlite::OptionalExtension;
     super::record_stop::gate_storage_conn(conn)?;
-    // #3957 — transaction-aware (the `update_with_expected_version` precedent):
-    // the SAL `update` funnel runs its ownership gate, the content write and
-    // this transition in ONE caller-owned `BEGIN IMMEDIATE`, so join the
-    // caller's transaction when one is open instead of failing on a nested BEGIN.
-    let txn = conn
-        .is_autocommit()
-        .then(|| super::connection::WriteTxn::begin(conn))
-        .transpose()?;
-    let outcome = (|| -> Result<bool> {
+    // #3957 / #3152 — transaction-aware: the SAL `update` funnel runs its
+    // ownership gate, the content write and this transition in ONE
+    // caller-owned `BEGIN IMMEDIATE`, so `in_write_txn` JOINS the caller's
+    // transaction when one is open instead of failing on a nested BEGIN, and
+    // opens (and commits or rolls back) its own otherwise.
+    super::in_write_txn(conn, || -> Result<bool> {
         // #1726 — read the current state (under the write lock) and validate.
         let current: Option<String> = conn
             .query_row(SQL_SELECT_LIFECYCLE_STATE_BY_ID, params![id], |r| r.get(0))
@@ -97,17 +100,5 @@ pub fn set_lifecycle_state(
             .into());
         }
         Ok(true)
-    })();
-    match (outcome, txn) {
-        (Ok(v), Some(txn)) => {
-            txn.commit()?;
-            Ok(v)
-        }
-        (Err(e), Some(txn)) => {
-            txn.rollback();
-            Err(e)
-        }
-        // Joined a caller-owned transaction: its commit/rollback governs.
-        (outcome, None) => outcome,
-    }
+    })
 }
