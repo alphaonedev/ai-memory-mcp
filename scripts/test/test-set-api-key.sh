@@ -154,7 +154,7 @@ else
   failures=$((failures + 1))
 fi
 
-# F2. A quoted top-level key is the top-level key: replaced in place, never
+# F2. A quoted top-level key is the top-level key: replaced by the bare key on line 1, never
 #     duplicated (a duplicate makes the daemon refuse to boot).
 run_case "F2: \"api_key\" = ... is the top-level key: replaced, not duplicated" \
   "\"api_key\" = \"${OLD_KEY}\""$'\ntier = "autonomous"\n' \

@@ -31,8 +31,11 @@
 #          wrote, so the file is left untouched and the reason is printed.
 #
 # Recognised spellings of the top-level key: api_key, "api_key" and 'api_key'
-# (TOML allows a quoted bare key). It is replaced by the bare form, in place
-# of the old line, never duplicated. `{`/`}` depth is tracked like `[`/`]`, so
+# (TOML allows a quoted bare key). When its value changes, the old line (and
+# any trailing comment on it) is removed and the bare form `api_key = "..."`
+# is written as line 1, never a duplicate; quoting is preserved only when the
+# value is unchanged (the file is then left untouched). `{`/`}` depth is
+# tracked like `[`/`]`, so
 # an api_key inside a multi-line inline table is not top-level.
 #
 # Known conservative refusals (valid TOML that is refused with 64, file left
