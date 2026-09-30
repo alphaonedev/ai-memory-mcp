@@ -18685,6 +18685,49 @@ pub fn merge_inbound(
     inbound: &Memory,
     receiver_verified: bool,
 ) -> Result<String> {
+    merge_inbound_authorized(conn, inbound, receiver_verified, None)
+}
+
+/// #4023 — a federation peer-scope verdict re-evaluated against the STORED
+/// namespace of the row a same-`id` merge is about to overwrite, read INSIDE
+/// the merge's write transaction. `true` authorizes the merge.
+pub type StoredNamespaceAuthorizer<'a> = &'a (dyn Fn(&str) -> bool + Send + Sync);
+
+/// #4023 — the refusal detail when [`merge_inbound_authorized`]'s in-transaction
+/// re-check finds the colliding row in a namespace the peer is not scoped for.
+/// One builder shared by both backends so the log line cannot drift.
+#[must_use]
+pub fn inbound_stored_namespace_refused(id: &str, stored_namespace: &str) -> String {
+    format!(
+        "federation merge refused for {id}: the stored row is in namespace \
+         {stored_namespace:?}, outside the pushing peer's scope (#4023 in-transaction re-check)"
+    )
+}
+
+/// [`merge_inbound`] with the #4023 in-transaction peer-scope re-check.
+///
+/// The receive funnel authorizes a colliding row's STORED namespace on a
+/// pre-read, but `merge_memory` LWWs `namespace`, so a concurrent writer that
+/// moved the row between that pre-read and this write would otherwise have the
+/// narrow peer's merge land on a row it was never authorized for. When
+/// `authorize_stored` is `Some`, the namespace of the row read under this
+/// function's `BEGIN IMMEDIATE` lock is re-authorized and a refusal rolls the
+/// merge back (nothing written). The no-row fall-through needs no re-check:
+/// its `(title, namespace)` upsert targets the CLAIMED namespace (already
+/// authorized), and a same-`id` row appearing concurrently fails the insert
+/// on the primary key rather than being overwritten.
+///
+/// # Errors
+///
+/// Everything [`merge_inbound`] returns, plus a refusal (built by
+/// [`inbound_stored_namespace_refused`]) when the locked row's namespace is
+/// not authorized.
+pub fn merge_inbound_authorized(
+    conn: &Connection,
+    inbound: &Memory,
+    receiver_verified: bool,
+    authorize_stored: Option<StoredNamespaceAuthorizer<'_>>,
+) -> Result<String> {
     // Wave-2 B2 — record-stop fence on the same-id overwrite path.
     // `insert_if_newer` (no-row fall-through) already gated; the existing-row
     // branch used to bypass via `overwrite_full_row_by_id`. Federation-receive
@@ -18703,6 +18746,16 @@ pub fn merge_inbound(
         // the raw row by id (`SQL_SELECT_MEMORY_ROW_BY_ID`).
         match get_any(conn, &inbound.id)? {
             Some(existing) => {
+                // #4023 — re-authorize the row actually being overwritten,
+                // under the write lock (the caller's pre-read may be stale).
+                if let Some(authorize) = authorize_stored
+                    && !authorize(&existing.namespace)
+                {
+                    anyhow::bail!(inbound_stored_namespace_refused(
+                        &inbound.id,
+                        &existing.namespace
+                    ));
+                }
                 // #2123 — backend parity with `PostgresStore::merge_inbound`:
                 // the same-`id` field-merge path persists via
                 // `overwrite_full_row_by_id`, which (deliberately) bypasses

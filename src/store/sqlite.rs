@@ -1786,6 +1786,20 @@ impl MemoryStore for SqliteStore {
         db::merge_inbound(&conn, inbound, receiver_verified).map_err(box_err)
     }
 
+    async fn merge_inbound_authorized(
+        &self,
+        _ctx: &CallerContext,
+        inbound: &Memory,
+        receiver_verified: bool,
+        authorize_stored: crate::storage::StoredNamespaceAuthorizer<'_>,
+    ) -> StoreResult<String> {
+        self.gate_record_stop()?;
+        // #4023 — the re-check runs inside the free-fn's BEGIN IMMEDIATE.
+        let conn = self.state.lock().await;
+        db::merge_inbound_authorized(&conn, inbound, receiver_verified, Some(authorize_stored))
+            .map_err(box_err)
+    }
+
     async fn apply_remote_link(
         &self,
         _ctx: &CallerContext,
