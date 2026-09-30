@@ -108,6 +108,8 @@ mod swarm_rewind;
 // transaction (one commit per logical update). Own module for the same
 // qual_10 budget reason as `parity_3064` above.
 mod lifecycle_tx_3152;
+// #4199 A1 — the postgres forensic-sink outage recorder (qual_10 budget).
+mod forensic_outage_4199;
 
 use crate::models::field_names;
 use std::time::Duration;
@@ -3330,6 +3332,8 @@ impl PostgresStore {
             // #1955 R45 — derive the persisted record-stop state from the
             // audit chain so a stop set before this connect is honored.
             store.seed_record_stop().await;
+            // #4199 A1 — attest any forensic-sink outage the boot path deferred.
+            store.attest_deferred_forensic_outages().await;
 
             Ok(store)
         }

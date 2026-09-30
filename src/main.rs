@@ -779,12 +779,15 @@ fn record_forensic_outage(
 ) {
     use ai_memory::governance::audit::{OutageRecord, record_forensic_sink_unavailable};
     if process_store_is_postgres() {
+        // #4199 A1 (GOD ruling) — deferred to the postgres store this process
+        // opens: `PostgresStore` attests it right after it connects. A verb
+        // that never opens its store records nothing, and the note says so.
         eprintln!(
-            "ai-memory: the forensic-sink outage was NOT recorded in signed_events: this \
-             process uses a postgres store, whose signed chain this boot-time recorder does \
-             not write; the outage is reported only on stderr, by the metric and by \
-             `ai-memory doctor`"
+            "ai-memory: the forensic-sink outage is recorded in the postgres signed_events \
+             chain when this process opens its store; a command that does not open the store \
+             does not record it (reported on stderr, by the metric and by `ai-memory doctor`)"
         );
+        ai_memory::governance::audit::defer_forensic_outage(err.clone());
         return;
     }
     match record_forensic_sink_unavailable(db_path, err) {

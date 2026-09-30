@@ -590,7 +590,10 @@ fn a_postgres_backed_process_writes_no_sqlite_outage_row_4199() {
     );
     let err = stderr(&out);
     assert!(err.contains(DEGRADED), "stderr: {err}");
-    assert!(err.contains("uses a postgres store"), "stderr: {err}");
+    assert!(
+        err.contains("recorded in the postgres signed_events"),
+        "stderr: {err}"
+    );
     assert_eq!(
         store_dump(home.path()),
         before,

@@ -1232,7 +1232,7 @@ const CHAIN_TAIL_WINDOW_BYTES: u64 = 256 * 1024;
 /// sink (it never forks the chain at genesis) and records the outage loudly
 /// (ERROR, metric, doctor Critical, a signed `signed_events` row), or, under
 /// [`REQUIRE_FORENSIC_SINK_ENV`] (pinned by `asi-hard`), refuses to start.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ForensicTailUnreadable {
     /// The forensic file or directory whose tail could not be established.
     pub path: PathBuf,
@@ -1311,17 +1311,60 @@ pub enum OutageRecord {
     Skipped(String),
 }
 
+/// #4199 — the signed payload hash of one forensic-sink outage, and the key
+/// both backends dedupe on: `(day, path, cause)`.
+///
 /// The UTC day is part of the key (f2r review of 36253cab6): the dedupe must
 /// not outlive the outage it suppresses. A repaired tail that fails again the
 /// same way on a later day is a NEW outage and is attested; within one day a
 /// stuck tail still costs one row, not one per invocation.
-fn outage_payload_hash(err: &ForensicTailUnreadable, day: &str) -> Vec<u8> {
+#[must_use]
+pub fn forensic_outage_key(err: &ForensicTailUnreadable, day: &str) -> Vec<u8> {
     let preimage = format!(
         "forensic-sink-unavailable|day={day}|path={}|cause={}",
         err.path.display(),
         err.cause
     );
     crate::signed_events::payload_hash(preimage.as_bytes())
+}
+
+/// #4199 — today's UTC day (`YYYY-MM-DD`), the dedupe window of
+/// [`forensic_outage_key`]. Both backends take it from here.
+#[must_use]
+pub fn forensic_outage_day() -> String {
+    Utc::now().format("%Y-%m-%d").to_string()
+}
+
+/// #4199 — the ONE dedupe comparison, shared by the sqlite and postgres
+/// recorders (f2r, landing condition for A1): an outage is a duplicate when
+/// the NEWEST `audit.forensic_sink_unavailable` row carries the same
+/// [`forensic_outage_key`].
+#[must_use]
+pub fn is_duplicate_forensic_outage(newest: Option<&[u8]>, key: &[u8]) -> bool {
+    newest == Some(key)
+}
+
+/// #4199 A1 (GOD ruling) — outages the boot path could not attest because
+/// this process's store is postgres. `serve` drains them into its postgres
+/// store once the store is built ([`take_deferred_forensic_outages`]).
+static DEFERRED_FORENSIC_OUTAGES: Mutex<Vec<ForensicTailUnreadable>> = Mutex::new(Vec::new());
+
+/// #4199 A1 — hold an outage for the postgres store to attest.
+pub fn defer_forensic_outage(err: ForensicTailUnreadable) {
+    DEFERRED_FORENSIC_OUTAGES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(err);
+}
+
+/// #4199 A1 — take every deferred outage (the queue is left empty).
+#[must_use]
+pub fn take_deferred_forensic_outages() -> Vec<ForensicTailUnreadable> {
+    std::mem::take(
+        &mut *DEFERRED_FORENSIC_OUTAGES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    )
 }
 
 /// #4199 — append the SIGNED `signed_events` row that attests the forensic
@@ -1336,7 +1379,7 @@ pub fn emit_forensic_sink_unavailable(
     conn: &rusqlite::Connection,
     err: &ForensicTailUnreadable,
 ) -> Result<bool> {
-    emit_forensic_sink_unavailable_on(conn, err, &Utc::now().format("%Y-%m-%d").to_string())
+    emit_forensic_sink_unavailable_on(conn, err, &forensic_outage_day())
 }
 
 /// [`emit_forensic_sink_unavailable`] for an explicit UTC `day`
@@ -1350,7 +1393,7 @@ fn emit_forensic_sink_unavailable_on(
         SignedEvent, append_signed_event, event_types::FORENSIC_SINK_UNAVAILABLE,
     };
     use rusqlite::OptionalExtension;
-    let hash = outage_payload_hash(err, day);
+    let hash = forensic_outage_key(err, day);
     let newest: Option<Vec<u8>> = conn
         .query_row(
             "SELECT payload_hash FROM signed_events WHERE event_type = ?1 \
@@ -1360,7 +1403,7 @@ fn emit_forensic_sink_unavailable_on(
         )
         .optional()
         .context("read the newest forensic-sink outage row")?;
-    if newest.as_deref() == Some(hash.as_slice()) {
+    if is_duplicate_forensic_outage(newest.as_deref(), &hash) {
         return Ok(false);
     }
     let event = SignedEvent::with_daemon_signature(
