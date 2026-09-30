@@ -92,24 +92,12 @@ services:
         fi
         # #4213 — AI_MEMORY_API_KEY is the source of truth: a changed key
         # REPLACES the stored one (it used to be kept, so rotation silently did
-        # nothing). The rewrite uses shell builtins only, so the key never
-        # reaches argv; it goes first, where a TOML top-level key must go.
-        want="api_key = \"$$AI_MEMORY_API_KEY\""
-        have=""
-        while IFS= read -r line || [ -n "$$line" ]; do
-          if [[ $$line =~ ^api_key[[:space:]]*= ]]; then have=$$line; break; fi
-        done < "$$cfg"
-        if [ "$$have" != "$$want" ]; then
-          (umask 077
-           { printf '%s\n' "$$want"
-             while IFS= read -r line || [ -n "$$line" ]; do
-               [[ $$line =~ ^api_key[[:space:]]*= ]] || printf '%s\n' "$$line"
-             done < "$$cfg"; } > "$$cfg.new")
-          mv "$$cfg.new" "$$cfg"
-          if [ -n "$$have" ]; then
-            echo "init-batman: API key rotated (the services restart with it: depends_on restart: true)"
-          fi
-        fi
+        # nothing). #4291 — only the TOP-LEVEL key is replaced: an api_key
+        # inside a table or a multi-line string is operator config and is left
+        # alone, and a file whose top-level scope cannot be established is
+        # refused (64) rather than guessed at. Shell builtins only; the key is
+        # read from the environment, never from argv.
+        bash /opt/scripts/docker/set-api-key.sh "$$cfg"
         chmod 600 "$$cfg"
         echo "init-batman complete"
     restart: "no"

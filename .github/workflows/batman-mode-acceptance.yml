@@ -56,6 +56,7 @@ on:
       - 'scripts/batman-bench.sh'
       - 'scripts/test/test-batman-mode-suite.sh'
       - 'scripts/test/test-compose-batman-active.sh'
+      - 'scripts/test/test-set-api-key.sh'
       - 'scripts/templates/**'
       - 'scripts/docker/**'
       - 'tests/issue_800_batman_mode.rs'
@@ -136,6 +137,11 @@ jobs:
         env:
           AI_MEMORY_BIN: target/release/ai-memory
         run: bash scripts/test/test-compose-batman-active.sh
+      - name: init-batman api_key rewrite fixtures (#4291)
+        # No Docker: drives scripts/docker/set-api-key.sh over fixture
+        # config.toml files (top-level vs table-scoped vs multi-line-string
+        # api_key lines, the no-false-rotation rule, the scope refusal).
+        run: bash scripts/test/test-set-api-key.sh
       - name: Run Batman Mode regression tests
         env:
           AI_MEMORY_NO_CONFIG: '1'
