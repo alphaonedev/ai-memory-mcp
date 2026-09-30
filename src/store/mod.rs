@@ -3123,8 +3123,33 @@ pub trait MemoryStore: Send + Sync {
         ctx: &CallerContext,
         signal: &crate::models::Signal,
     ) -> StoreResult<&'static str> {
+        Ok(match self.apply_remote_signal_outcome(ctx, signal).await? {
+            RemoteSignalApply::Inserted(label) => label,
+            RemoteSignalApply::AlreadyPresent => crate::models::AttestLevel::Unsigned.as_str(),
+        })
+    }
+
+    /// #4026 — [`apply_remote_signal`](MemoryStore::apply_remote_signal) that
+    /// REPORTS whether the signal was newly persisted or was already present
+    /// (the idempotent replay no-op). The federation receive funnel charges
+    /// the author's cumulative storage-bytes quota before this write (the
+    /// quota lives on a different substrate on postgres-backed daemons), so it
+    /// needs the outcome to refund a charge that bought no storage. A
+    /// concurrent duplicate that loses the insert race surfaces as `Err`
+    /// (primary-key conflict), which the caller also refunds.
+    ///
+    /// # Errors
+    ///
+    /// As [`apply_remote_signal`](MemoryStore::apply_remote_signal):
+    /// `InvalidInput` for a present-but-invalid (forged) signature, `Backend`
+    /// on a storage error.
+    async fn apply_remote_signal_outcome(
+        &self,
+        ctx: &CallerContext,
+        signal: &crate::models::Signal,
+    ) -> StoreResult<RemoteSignalApply> {
         if self.signal_get(ctx, &signal.id).await?.is_some() {
-            return Ok(crate::models::AttestLevel::Unsigned.as_str());
+            return Ok(RemoteSignalApply::AlreadyPresent);
         }
         let signed_ok = !signal.signature.is_empty() && crate::signals::verify(signal);
         if !signal.signature.is_empty() && !signed_ok {
@@ -3133,11 +3158,11 @@ pub trait MemoryStore: Send + Sync {
             });
         }
         self.signal_send(ctx, signal, None).await?;
-        Ok(if signed_ok {
+        Ok(RemoteSignalApply::Inserted(if signed_ok {
             crate::models::AttestLevel::SelfSigned.as_str()
         } else {
             crate::models::AttestLevel::Unsigned.as_str()
-        })
+        }))
     }
 
     // ==================================================================
@@ -5513,6 +5538,17 @@ pub const UNDO_IN_PLACE_EDIT_ACTION: &str = "undo_in_place_edit";
 /// envelope names when [`MemoryStore::execute_pending_action`] refuses an
 /// approver-on-behalf laundering attempt (S5-H4).
 pub const EXECUTE_PENDING_ACTION: &str = "execute_pending_action";
+
+/// #4026 — outcome of [`MemoryStore::apply_remote_signal_outcome`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteSignalApply {
+    /// The signal was newly persisted; carries its attestation label
+    /// (`self_signed` when its embedded signature verifies, else `unsigned`).
+    Inserted(&'static str),
+    /// A signal with this UUID already existed: nothing was written (the
+    /// idempotent replay no-op), so no storage was consumed.
+    AlreadyPresent,
+}
 
 /// #1727 (v0.8.0) — outcome of an [`MemoryStore::undo_in_place_edit`]
 /// call: enough before/after detail to render a dry-run diff and to
