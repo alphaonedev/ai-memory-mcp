@@ -566,7 +566,7 @@ fn classify_persisted(outcomes: &[(usize, String, String)], ledger: &mut BulkLed
 /// round trips rather than N. A failure DEGRADES (rows are still written — the
 /// durable memory TEXT is the source of truth and vectors are regenerable
 /// derived data) and is reported truthfully via `embed_status`.
-fn embed_bulk_rows(
+async fn embed_bulk_rows(
     app: &AppState,
     rows: &mut [PreparedRow],
     ledger: &mut BulkLedger,
@@ -578,6 +578,10 @@ fn embed_bulk_rows(
         return None;
     }
     let space = emb.space_fingerprint();
+    // #4089 (rust-1.98 CONCURRENCY-22) — `embed_batch` is a CPU-bound model
+    // forward pass over up to 1000 rows. Each chunk runs on the blocking
+    // pool (`embed_offload`), never inline on this worker; a clone of the
+    // all-`Arc` `Embedder` shares the model.
     let mut degraded: Option<String> = None;
     for chunk_start in (0..rows.len()).step_by(BULK_EMBED_CHUNK) {
         let chunk_end = (chunk_start + BULK_EMBED_CHUNK).min(rows.len());
@@ -585,30 +589,42 @@ fn embed_bulk_rows(
             .iter()
             .map(|r| crate::embeddings::embedding_document(&r.mem.title, &r.mem.content))
             .collect();
-        let refs: Vec<&str> = docs.iter().map(String::as_str).collect();
-        match emb.embed_batch(&refs) {
-            Ok(vectors) if vectors.len() == refs.len() => {
+        let input_len = docs.len();
+        let chunk_emb = emb.clone();
+        let embedded =
+            super::embed_offload::on_blocking_pool(crate::metrics::EMBED_SURFACE_BULK, move || {
+                let refs: Vec<&str> = docs.iter().map(String::as_str).collect();
+                chunk_emb.embed_batch(&refs)
+            })
+            .await;
+        match embedded {
+            Some(Ok(vectors)) if vectors.len() == input_len => {
                 for (row, vector) in rows[chunk_start..chunk_end].iter_mut().zip(vectors) {
                     row.embedding = Some(vector);
                 }
             }
-            Ok(vectors) => {
+            Some(Ok(vectors)) => {
                 // Arity mismatch: refuse to guess which row each vector
                 // belongs to. Mis-attributing a vector would make recall
                 // return WRONG results, which the North Star ranks strictly
                 // worse than returning fewer.
                 let reason = format!(
-                    "embedder returned {} vectors for {} inputs",
+                    "embedder returned {} vectors for {input_len} inputs",
                     vectors.len(),
-                    refs.len()
                 );
                 tracing::warn!(target: BULK_TRACE_TARGET, "bulk_create: {reason}");
                 degraded = Some(reason);
             }
-            Err(e) => {
+            Some(Err(e)) => {
                 let reason = e.to_string();
                 tracing::warn!(target: BULK_TRACE_TARGET, "bulk_create: embed_batch failed: {reason}");
                 degraded = Some(reason);
+            }
+            // A panicked or cancelled embed produced nothing: degrade like an
+            // embed failure (rows are still written vectorless and stay
+            // keyword-recallable); `embed_offload` already warned + counted.
+            None => {
+                degraded = Some("embed task did not complete".to_string());
             }
         }
     }
@@ -1052,7 +1068,8 @@ async fn bulk_create_write(
     }
 
     // ---- Stage 2 (NO DB LOCK) — embed (#2594, #219 embed-before-lock). -----
-    let embedding_space = embed_bulk_rows(&app, &mut prepared, &mut ledger);
+    // #4089: each chunk embeds on the blocking pool (see `embed_bulk_rows`).
+    let embedding_space = embed_bulk_rows(&app, &mut prepared, &mut ledger).await;
 
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {

@@ -477,16 +477,31 @@ pub(crate) fn build_create_memory(
 /// Keyword-only deployments (embedder=None) report `Indexed` so the
 /// response shape is unchanged on nodes where the semantic layer is
 /// intentionally absent.
-fn embed_create_before_lock(
+async fn embed_create_before_lock(
     app: &AppState,
     title: &str,
     content: &str,
 ) -> (Option<Vec<f32>>, EmbedStatus) {
     let embedding_text = crate::embeddings::embedding_document(title, content);
-    match app.embedder.as_ref().as_ref() {
-        None => (None, EmbedStatus::Indexed),
-        Some(emb) => emb.embed_with_status(&embedding_text),
-    }
+    let Some(emb) = app.embedder.as_ref().as_ref() else {
+        return (None, EmbedStatus::Indexed);
+    };
+    // #4089 (rust-1.98 CONCURRENCY-22) — `embed_with_status` is a CPU-bound
+    // model forward pass (or a blocking remote call): run it on the blocking
+    // pool, never inline on this worker. A task that did not complete
+    // degrades like an embed failure (no vector, `Failed` status);
+    // `embed_offload` warns + counts it.
+    let emb = emb.clone();
+    super::embed_offload::on_blocking_pool(crate::metrics::EMBED_SURFACE_CREATE, move || {
+        emb.embed_with_status(&embedding_text)
+    })
+    .await
+    .unwrap_or_else(|| {
+        (
+            None,
+            EmbedStatus::Failed("embed task did not complete".to_string()),
+        )
+    })
 }
 
 /// #866 stage 2 — resolve the `on_conflict` policy:
@@ -1307,10 +1322,31 @@ async fn create_memory_postgres(
     let (embedding, embedding_space): (Option<Vec<f32>>, Option<String>) =
         match app.embedder.as_ref().as_ref() {
             None => (None, None),
-            Some(emb) => match emb.embed(&embedding_text) {
-                Ok(v) => (Some(v), Some(emb.space_fingerprint())),
-                Err(_) => (None, None),
-            },
+            Some(emb) => {
+                // #4089 (rust-1.98 CONCURRENCY-22) — `embed` is CPU-bound;
+                // run it on the blocking pool, never inline on this worker.
+                // Every failure degrades to (no vector, no stamp) exactly as
+                // before, and every failure is now observable: an embed
+                // error WARNs here, a task that did not complete WARNs +
+                // counts (`embed.task.failed`,
+                // `ai_memory_embed_task_failed_total{surface="create"}`) in
+                // `embed_offload`.
+                let space = emb.space_fingerprint();
+                match super::embed_offload::embed_document(
+                    crate::metrics::EMBED_SURFACE_CREATE,
+                    emb,
+                    embedding_text,
+                )
+                .await
+                {
+                    Some(Ok(v)) => (Some(v), Some(space)),
+                    Some(Err(e)) => {
+                        tracing::warn!("create (postgres): embed failed: {e} (#4089)");
+                        (None, None)
+                    }
+                    None => (None, None),
+                }
+            }
         };
 
     // v0.7.0 Wave-3 Continuation 3 (Phase 20) — governance walk on
@@ -1678,7 +1714,9 @@ async fn create_memory_write(
     // Stage 3 — embed-before-lock (issue #219). Computed BEFORE
     // acquiring the DB lock so the 10-200 ms embedder run doesn't
     // hold the single shared `Mutex<Connection>`.
-    let (embedding, embed_status) = embed_create_before_lock(&app, &body.title, &body.content);
+    // #4089: the embed itself runs on the blocking pool.
+    let (embedding, embed_status) =
+        embed_create_before_lock(&app, &body.title, &body.content).await;
 
     // #1579 A5 — ANN candidate pool for the proactive conflict check
     // (#519). The HNSW search runs BEFORE the DB lock (vector-index
