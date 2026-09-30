@@ -328,10 +328,10 @@ fn migration_v82_applies_and_is_idempotent() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("mig.db");
 
-    // Fresh open reaches the ladder tip (v100, #3690 title-slot partial index) with the
+    // Fresh open reaches the ladder tip (v101, #4024 transition identity) with the
     // v82 retire columns present.
     let conn = db::open(&path).unwrap();
-    assert_eq!(db::migrations::current_schema_version_for_tests(), 100);
+    assert_eq!(db::migrations::current_schema_version_for_tests(), 101);
     assert!(
         conn.prepare("SELECT retired_at, retired_by, retire_reason FROM skills LIMIT 0")
             .is_ok(),

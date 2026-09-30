@@ -342,6 +342,9 @@ pub(super) fn postgres_stats_envelope(stats: &crate::models::Stats) -> serde_jso
         "expiring_soon": stats.expiring_soon,
         "links_count": stats.links_count,
         "db_size_bytes": stats.db_size_bytes,
+        // v1.0.0 #4024 — durable transition-identity row count, SHAPE PARITY
+        // with the sqlite handler (which serializes `Stats` directly).
+        "action_transition_nonces": stats.action_transition_nonces,
         (field_names::STORAGE_BACKEND): "postgres",
     })
 }
@@ -371,6 +374,7 @@ mod stats_envelope_parity_tests {
             db_size_bytes: 4096,
             dim_violations: 0,
             index_evictions_total: 0,
+            action_transition_nonces: 3,
         };
 
         // The SQLite handler serializes this shared `Stats` value directly.

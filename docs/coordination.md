@@ -185,7 +185,10 @@ daemon so Postgres-backed / MCP-over-HTTP deployments can drive them
   (`0`/`false`/`no`/`off`) for a heterogeneous-rollout window. A *forged*
   signature is rejected unconditionally regardless of the knob. Source:
   [`src/federation/receive_auth.rs`](../src/federation/receive_auth.rs)
-  (`require_transition_sig_enabled`).
+  (`require_transition_sig_enabled`). **Rollout-hatch contract (#4024):**
+  an unsigned transition admitted under `=0` carries no nonce and records
+  NO operation identity, so replay protection (#1805) covers SIGNED ops
+  only; the strict default refuses unsigned ops outright.
 - **Transition-replay nonce** (#1805) — each signed transition delivery
   binds 16 random CSPRNG bytes as a per-delivery anti-replay nonce into
   the signed surface (`src/handlers/coordination.rs`).

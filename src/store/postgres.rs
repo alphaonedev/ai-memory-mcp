@@ -49,6 +49,9 @@ mod hub;
 
 use crate::models::ConfidenceSource;
 mod coordination_create;
+// #4024 — federated transition identity recorded atomically with the CAS (own
+// module: postgres.rs is at its qual_10 budget).
+mod transition_identity_4024;
 // #3064 lane L-PGP — postgres SAL for the tools whose HTTP mirrors were
 // fail-closed 501 on this backend. Its own module because postgres.rs is at
 // its qual_10 module-size budget (the lane brief mandates a submodule over a
@@ -1724,6 +1727,12 @@ const MIGRATION_V99_SYNC_PEER_CONTACT: &str =
 const MIGRATION_V100_TITLE_SLOT_LIVE_ROWS: &str =
     include_str!("../../migrations/postgres/0057_v100_title_slot_live_rows.sql");
 
+/// v101 (#4024): durable operation identity for federated action transitions,
+/// recorded in the same transaction as the CAS. The sqlite twin is
+/// `MIGRATION_V101_SQLITE` (`migrations/sqlite/0085_v101_action_transition_nonces.sql`).
+const MIGRATION_V101_ACTION_TRANSITION_NONCES: &str =
+    include_str!("../../migrations/postgres/0058_v101_action_transition_nonces.sql");
+
 /// v0.7.0 Cluster G — shadow-mode retention + denormalised `source`
 /// column + compound `(namespace, source, observed_at)` index
 /// supporting the calibration scan (issue #767, PERF-4 + PERF-12).
@@ -2114,7 +2123,10 @@ const MIGRATION_V48_FEDERATION_PUSH_DLQ: &str =
 //       has carried these since v56, so its v88 is a no-op; doc twins
 //       migrations/{postgres/0045,sqlite/0072}_v88_list_composite_indexes.sql.
 //       CURRENT_SCHEMA_VERSION stays pinned in lockstep with sqlite.
-const CURRENT_SCHEMA_VERSION: i32 = 100;
+// v101 — #4024: `action_transition_nonces` (additive), the durable operation
+//       identity of a federated action transition, written in the CAS
+//       transaction. CURRENT_SCHEMA_VERSION stays pinned in lockstep with sqlite.
+const CURRENT_SCHEMA_VERSION: i32 = 101;
 
 /// PostgreSQL session-scoped advisory lock key used to serialize
 /// concurrent `migrate()` invocations across processes and across
@@ -4297,8 +4309,11 @@ impl PostgresStore {
         if current_version < 99 {
             self.migrate_v99().await?;
         }
-        if current_version < CURRENT_SCHEMA_VERSION {
+        if current_version < 100 {
             self.migrate_v100().await?;
+        }
+        if current_version < CURRENT_SCHEMA_VERSION {
+            self.migrate_v101().await?;
         }
 
         Ok(())
@@ -7471,6 +7486,36 @@ impl PostgresStore {
             target: TRACE_TARGET,
             "schema migration v100 applied (#3690: the (title, namespace) unique index \
              is partial — tombstoned rows no longer hold a title slot)"
+        );
+        Ok(())
+    }
+
+    /// v101 (#4024): additive `action_transition_nonces` — the durable
+    /// operation identity of a federated action transition, written by
+    /// `action_transition_cas_once` in the CAS transaction. Stamps literal 101.
+    async fn migrate_v101(&self) -> StoreResult<()> {
+        debug_assert!(
+            MIGRATION_V101_ACTION_TRANSITION_NONCES
+                .contains("CREATE TABLE IF NOT EXISTS action_transition_nonces"),
+            "#4024: the v101 DDL doc twin must create the identity table"
+        );
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v101 action-transition-nonces migration tx", e))?;
+        sqlx::raw_sql(MIGRATION_V101_ACTION_TRANSITION_NONCES)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("apply v101 action-transition-nonces migration", e))?;
+        record_schema_version(&mut tx, 101).await?;
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v101 migration", e))?;
+        tracing::info!(
+            target: TRACE_TARGET,
+            "schema migration v101 applied (#4024: federated transition identity is \
+             recorded atomically with the CAS)"
         );
         Ok(())
     }
@@ -17620,6 +17665,11 @@ pub(crate) fn to_store_err(what: &str, e: sqlx::Error) -> StoreError {
 
 /// #1709 Pillar 1 — `actions` by-id SELECT (canonical column order matching
 /// [`pg_row_to_action`]). One definition shared by the by-id reads.
+/// Row-locking read of an action's current state: the compare-and-swap window
+/// opener shared by `action_transition`, `action_transition_cas` and the
+/// #4024 `action_transition_cas_once` (one spelling, one lock discipline).
+const PG_ACTION_STATE_FOR_UPDATE: &str = "SELECT state FROM actions WHERE id = $1 FOR UPDATE";
+
 const PG_ACTION_SELECT_BY_ID: &str = "SELECT id, namespace, kind, state, title, payload, \
      priority, agent_id, claimed_by, vector_clock, metadata, created_at, updated_at \
      FROM actions WHERE id = $1";
@@ -29547,12 +29597,11 @@ impl MemoryStore for PostgresStore {
             .begin()
             .await
             .map_err(|e| to_store_err("begin action_transition tx", e))?;
-        let current: Option<String> =
-            sqlx::query_scalar("SELECT state FROM actions WHERE id = $1 FOR UPDATE")
-                .bind(id)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(|e| to_store_err("action_transition select", e))?;
+        let current: Option<String> = sqlx::query_scalar(PG_ACTION_STATE_FOR_UPDATE)
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("action_transition select", e))?;
         let Some(cs) = current else {
             return Err(StoreError::NotFound { id: id.to_string() });
         };
@@ -29625,12 +29674,11 @@ impl MemoryStore for PostgresStore {
             .map_err(|e| to_store_err("begin action_transition_cas tx", e))?;
         // `FOR UPDATE` locks the row for the compare-and-swap window so a
         // concurrent transition cannot slip between the read and the write.
-        let current: Option<String> =
-            sqlx::query_scalar("SELECT state FROM actions WHERE id = $1 FOR UPDATE")
-                .bind(id)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(|e| to_store_err("action_transition_cas select", e))?;
+        let current: Option<String> = sqlx::query_scalar(PG_ACTION_STATE_FOR_UPDATE)
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("action_transition_cas select", e))?;
         let Some(cs) = current else {
             // tx rolls back on drop — nothing was written.
             return Ok(CasOutcome::NotFound);
@@ -29660,6 +29708,15 @@ impl MemoryStore for PostgresStore {
             .await
             .map_err(|e| to_store_err("commit action_transition_cas", e))?;
         Ok(CasOutcome::Applied(action))
+    }
+
+    async fn action_transition_cas_once(
+        &self,
+        _ctx: &CallerContext,
+        t: &crate::actions::RemoteTransition<'_>,
+    ) -> StoreResult<crate::actions::RemoteCasOutcome> {
+        // #4024 — one transaction: row lock, identity probe, CAS, identity insert.
+        self.transition_cas_once_tx(t).await
     }
 
     async fn action_list(
@@ -34341,6 +34398,7 @@ impl MemoryStore for PostgresStore {
             // postgres uses pgvector indexes which don't expose either.
             dim_violations: 0,
             index_evictions_total: 0,
+            action_transition_nonces: self.count_transition_nonces().await?,
         })
     }
 

@@ -2653,6 +2653,13 @@ pub struct Stats {
     /// (not persisted) because the index itself is process-local.
     #[serde(default)]
     pub index_evictions_total: u64,
+    /// v1.0.0 #4024 (5-agent vote 4d3ea1c5, decision f41cf98b) — row count of
+    /// `action_transition_nonces`, the durable federated-transition operation
+    /// identities. The table is never pruned below the replay window (pruning
+    /// would reopen #1805), so its growth is reported here and in
+    /// `ai-memory doctor`. Additive wire field, both backends.
+    #[serde(default)]
+    pub action_transition_nonces: usize,
 }
 
 #[derive(Debug, Serialize)]

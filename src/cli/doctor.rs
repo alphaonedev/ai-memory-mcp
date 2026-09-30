@@ -73,6 +73,8 @@ const FACT_DB_SCHEMA: &str = "db_schema";
 const FACT_BINARY_SUPPORTS_SCHEMA: &str = "binary_supports_schema";
 const FACT_SCHEMA_STAMP: &str = "schema_stamp";
 const FACT_DIM_VIOLATIONS: &str = "dim_violations";
+/// #4024 — `action_transition_nonces` row count (Storage fact / pg section).
+const FACT_ACTION_TRANSITION_NONCES: &str = "action_transition_nonces";
 
 /// v1.0.0 (#3113) — `doctor` fact naming the core-relation integrity state
 /// (see [`crate::storage::schema_integrity`]).
@@ -178,6 +180,9 @@ const NOT_OBSERVED_PRE_P3: &str = "not_observed (pre-P3 rolling counter)";
 const SECTION_POSTGRES_EXTENSIONS: &str = "Postgres extensions (#3264)";
 /// v1.0.0 #3124 — the unstamped-owner census row (both backends).
 const SECTION_UNSTAMPED_OWNERS: &str = "Unstamped owners (#3124)";
+/// #4024 — the postgres-only transition-identity count section.
+#[cfg(feature = "sal-postgres")]
+const SECTION_TRANSITION_IDENTITIES: &str = "Action transition identities (#4024)";
 
 /// #3264 — anyhow context when the ephemeral probe runtime cannot be built.
 #[cfg(feature = "sal-postgres")]
@@ -1618,6 +1623,10 @@ fn run_local(db_path: &Path, caller_agent_id: Option<&str>) -> Report {
     if let Some(pg) = section_postgres_unstamped_owners_3124() {
         sections.push(pg);
     }
+    #[cfg(feature = "sal-postgres")]
+    if let Some(pg) = section_postgres_transition_identities_4024() {
+        sections.push(pg);
+    }
 
     // Open the connection once, READ-ONLY. A missing path is a refusal,
     // never a create-and-migrate (#3434 — clap advertises "never mutates").
@@ -1979,6 +1988,61 @@ fn section_postgres_unstamped_owners_3124() -> Option<ReportSection> {
         census,
         crate::identity::owner_stamp::BACKEND_LABEL_POSTGRES,
     ))
+}
+
+/// v1.0.0 #4024 — the postgres twin of the Storage section's
+/// `action_transition_nonces` fact: the durable federated-transition identity
+/// row count (never pruned below the replay window). `None` on a SQLite
+/// deployment (the sqlite count is a fact in the Storage section). A count that
+/// could not be read is `Critical`, never reported as 0.
+#[cfg(feature = "sal-postgres")]
+fn section_postgres_transition_identities_4024() -> Option<ReportSection> {
+    let url = match crate::store_url::resolve_store_url(None) {
+        Ok(Some(url)) if crate::store_url::is_postgres_url(&url) => url,
+        _ => return None,
+    };
+    let count: Result<i64> = run_pg_probe(|| async move {
+        let probe = async {
+            // #3674 — the DSN screen, never a raw `.connect(url)`.
+            let options = crate::store::postgres::dsn::connect_options(&url)?;
+            let pool = sqlx::postgres::PgPoolOptions::new()
+                .max_connections(1)
+                .acquire_timeout(PG_PROBE_TIMEOUT)
+                .connect_with(options)
+                .await?;
+            let n: i64 =
+                sqlx::query_scalar("SELECT COUNT(*)::BIGINT FROM action_transition_nonces")
+                    .fetch_one(&pool)
+                    .await?;
+            pool.close().await;
+            Ok::<_, sqlx::Error>(n)
+        };
+        tokio::time::timeout(PG_PROBE_TIMEOUT, probe)
+            .await
+            .map_err(|_elapsed| anyhow::anyhow!(MSG_PG_PROBE_TIMEOUT))?
+            .map_err(anyhow::Error::from)
+    })
+    .and_then(|inner| inner);
+    let mut facts = vec![("backend".into(), "postgres".to_string())];
+    let (severity, note) = match count {
+        Ok(n) => {
+            facts.push((FACT_ACTION_TRANSITION_NONCES.into(), n.to_string()));
+            (Severity::Info, None)
+        }
+        Err(e) => {
+            facts.push(("error".into(), format!("{e:#}")));
+            (
+                Severity::Critical,
+                Some("the action_transition_nonces row count could not be read".to_string()),
+            )
+        }
+    };
+    Some(ReportSection {
+        name: SECTION_TRANSITION_IDENTITIES.into(),
+        severity,
+        facts,
+        note,
+    })
 }
 
 /// v1.0.0 (#3264) — "Postgres extensions" report row(s).
@@ -2872,6 +2936,12 @@ fn section_storage(conn: &rusqlite::Connection, db_path: &Path) -> ReportSection
             facts.push(("expiring_within_1h".into(), stats.expiring_soon.to_string()));
             facts.push(("links".into(), stats.links_count.to_string()));
             facts.push(("db_size_bytes".into(), stats.db_size_bytes.to_string()));
+            // #4024 — durable federated-transition identities; never pruned
+            // below the replay window, so the count is the growth signal.
+            facts.push((
+                FACT_ACTION_TRANSITION_NONCES.into(),
+                stats.action_transition_nonces.to_string(),
+            ));
             for tc in &stats.by_tier {
                 facts.push((format!("tier::{}", tc.tier), tc.count.to_string()));
             }
@@ -4908,6 +4978,9 @@ fn section_storage_remote(stats_url: &str, auth: &RemoteAuth) -> ReportSection {
             }
             if let Some(links) = v.get("links_count").and_then(Value::as_u64) {
                 facts.push(("links".into(), links.to_string()));
+            }
+            if let Some(n) = v.get(FACT_ACTION_TRANSITION_NONCES).and_then(Value::as_u64) {
+                facts.push((FACT_ACTION_TRANSITION_NONCES.into(), n.to_string()));
             }
             facts.push((
                 FACT_DIM_VIOLATIONS.into(),
@@ -7370,6 +7443,39 @@ enabled = true
         let s = String::from_utf8(stdout).unwrap();
         assert!(s.contains("Hooks loaded: 1"), "got: {s}");
         assert!(s.contains("notify-hook.sh"), "got: {s}");
+    }
+
+    /// #4024 (vote 4d3ea1c5 item 3) — the Storage section reports the
+    /// `action_transition_nonces` row count: 0 on a fresh v101 database and the
+    /// real count once an identity is recorded.
+    #[test]
+    fn storage_section_reports_action_transition_nonce_count_4024() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("doctor-4024.db");
+        let conn = crate::db::open(&path).expect("open");
+        let fact_of = |c: &rusqlite::Connection| {
+            section_storage(c, &path)
+                .facts
+                .into_iter()
+                .find(|(k, _)| k == FACT_ACTION_TRANSITION_NONCES)
+                .map(|(_, v)| v)
+        };
+        assert_eq!(fact_of(&conn).as_deref(), Some("0"), "fresh db: 0 rows");
+        conn.execute(
+            "INSERT INTO actions (id, namespace, kind, state, title, payload, priority, \
+             vector_clock, metadata, created_at, updated_at) \
+             VALUES ('a-4024', 'ns', 'k', 'pending', 't', '{}', 5, '{}', '{}', 1, 1)",
+            [],
+        )
+        .expect("seed action");
+        conn.execute(
+            "INSERT INTO action_transition_nonces \
+             (action_id, nonce, from_state, to_state, recorded_at) \
+             VALUES ('a-4024', x'01', 'pending', 'claimed', 1)",
+            [],
+        )
+        .expect("seed identity");
+        assert_eq!(fact_of(&conn).as_deref(), Some("1"), "one identity row");
     }
 
     /// #3113 — a healthy, fully-migrated database reports its core relations

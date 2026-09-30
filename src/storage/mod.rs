@@ -16300,6 +16300,9 @@ pub fn stats(conn: &Connection, db_path: &Path) -> Result<Stats> {
     // `stats` lets `memory_stats` callers and `ai-memory doctor` (P7) flag
     // operators who are sustaining at the index cap.
     let index_evictions_total = crate::hnsw::index_evictions_total();
+    // #4024 — durable federated-transition identities (never pruned below the
+    // replay window); a pre-v101 database reports an honest 0.
+    let action_transition_nonces = crate::actions::count_transition_nonces(conn)?;
 
     Ok(Stats {
         total,
@@ -16313,6 +16316,7 @@ pub fn stats(conn: &Connection, db_path: &Path) -> Result<Stats> {
         db_size_bytes,
         dim_violations,
         index_evictions_total,
+        action_transition_nonces,
     })
 }
 

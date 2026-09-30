@@ -60,11 +60,11 @@ fn v74_columns_and_version_both_backends() {
         db::migrations::current_schema_version_for_tests(),
         "fresh open reaches the current schema tip"
     );
-    // Tip pin: the ladder head advanced to v100 (#3690 title-slot partial
-    // index; previously v99, #3655 durable per-peer contact).
+    // Tip pin: the ladder head advanced to v101 (#4024 federated transition
+    // identity; previously v100, #3690 title-slot partial index).
     // The v74 cid columns asserted below still exist; only the tip moved
     // (was v97 = #3464 append-only agent key ledger).
-    assert_eq!(db::migrations::current_schema_version_for_tests(), 100);
+    assert_eq!(db::migrations::current_schema_version_for_tests(), 101);
     // The additive columns exist and are queryable.
     assert!(
         conn.prepare("SELECT cid, cid_genesis FROM memories LIMIT 0")
