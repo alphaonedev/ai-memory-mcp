@@ -2203,14 +2203,25 @@ mod tests {
         let key = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(key.path(), b"dummy keymat").unwrap();
         std::fs::set_permissions(key.path(), std::fs::Permissions::from_mode(0o600)).unwrap();
+        // #4088 L8 — a positive canary through the SAME callsite and the SAME
+        // subscriber: a 0644 key must be warned about. Without it, "nothing
+        // captured" would also pass when the capture itself is broken.
+        let canary = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(canary.path(), b"dummy keymat").unwrap();
+        std::fs::set_permissions(canary.path(), std::fs::Permissions::from_mode(0o644)).unwrap();
 
         tracing::subscriber::with_default(subscriber, || {
             warn_if_key_perms_loose(key.path());
+            warn_if_key_perms_loose(canary.path());
         });
 
         let captured = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
         assert!(
-            !captured.contains("group- or world-accessible"),
+            captured.contains(&canary.path().display().to_string()),
+            "the 0644 canary must be warned about (capture is live); got: {captured:?}"
+        );
+        assert!(
+            !captured.contains(&key.path().display().to_string()),
             "0600 perms must NOT trigger the WARN; got: {captured:?}"
         );
     }
