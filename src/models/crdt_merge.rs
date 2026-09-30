@@ -74,6 +74,18 @@
 //! metadata join are capped at the replicated-state limits every receiver
 //! validates against; past a cap the join degrades deterministically (see
 //! `merge_tags` / `merge_memory`), WARNed on [`CRDT_BOUND_TRACE_TARGET`].
+//! The tag bound ("the k smallest of the union") is itself a join, so it
+//! stays associative. The METADATA bound is NOT: its fallback (the row-LWW
+//! winner's ordinary keys) depends on which intermediate join first crossed
+//! the byte cap, so replicas that join over-cap rows in different orders can
+//! keep different subsets of the LOSING operands' disjoint keys. That is the
+//! documented residual of a byte-bounded map (sizes differ per key, so no
+//! byte-bounded selection is a join); it is reachable only past the 512 KiB
+//! replicated cap, every drop is WARNed and the pre-merge row survives in the
+//! `federation_merge` archive snapshot. The visibility keys
+//! (`VISIBILITY_METADATA_KEYS`) are exempt from the fallback and always
+//! resolve through the full per-path join, so the residual never changes who
+//! can read a row.
 //!
 //! ## Metadata sub-rules (#224 + Task 1.8 #196)
 //!
@@ -438,6 +450,16 @@ const SPECIAL_METADATA_KEYS: [&str; 4] = [
     field_names::CRDT_FIELD_CLOCKS,
 ];
 
+/// The metadata keys the visibility gate reads (`crate::visibility`): the
+/// scope arm and the private arm's inbox-target / legacy-recipient grants.
+/// The #4032 bounded fallback still resolves them through the full per-path
+/// join, so a bounded merge never widens who can read a row.
+const VISIBILITY_METADATA_KEYS: [&str; 3] = [
+    crate::META_KEY_SCOPE,
+    crate::META_KEY_TARGET_AGENT_ID,
+    "recipient_agent_id",
+];
+
 /// Resolve `metadata` (#224 + #4031).
 ///
 /// Every ordinary key — at any depth — is an LWW-element-map entry resolved
@@ -466,12 +488,29 @@ fn merge_metadata(
         .copied()
         .chain(NODE_LOCAL_METADATA_KEYS)
         .collect();
-    // #4032 bounded fallback: the row-LWW loser contributes no ordinary key.
-    let empty = Map::new();
+    // #4032 bounded fallback: the row-LWW loser contributes no ordinary key —
+    // EXCEPT the authorization-bearing visibility keys, which always resolve
+    // through the full per-path join so the bounded fallback can never make a
+    // row visible to anyone the unbounded join would not (a retained older
+    // `scope=collective` on the winner must still lose to the loser's newer
+    // `scope=private`).
+    let loser_visibility = |m: &Map<String, Value>| -> Map<String, Value> {
+        VISIBILITY_METADATA_KEYS
+            .iter()
+            .filter_map(|k| m.get(*k).map(|v| ((*k).to_string(), v.clone())))
+            .collect()
+    };
+    let (l_bounded, r_bounded);
     let (lgen, rgen) = match (bounded, remote_wins_lww(local, remote)) {
         (false, _) => (lmap, rmap),
-        (true, true) => (&empty, rmap),
-        (true, false) => (lmap, &empty),
+        (true, true) => {
+            l_bounded = loser_visibility(lmap);
+            (&l_bounded, rmap)
+        }
+        (true, false) => {
+            r_bounded = loser_visibility(rmap);
+            (lmap, &r_bounded)
+        }
     };
     let mut map = clocks.merge_metadata_keys(lgen, rgen, &skip);
 
@@ -627,7 +666,9 @@ fn resolve_clocked_fields(local: &Memory, remote: &Memory, bounded: bool) -> Clo
 /// merge rule is chosen for it.
 ///
 /// Pure: no I/O, no clock reads. Commutative + associative (up to the
-/// `(updated_at, id)` LWW total order) + idempotent.
+/// `(updated_at, id)` LWW total order) + idempotent — except past the #4032
+/// metadata byte cap, where the bounded fallback is commutative but not
+/// associative (see the module docs).
 #[must_use]
 pub fn merge_memory(local: &Memory, remote: &Memory) -> Memory {
     debug_assert_eq!(

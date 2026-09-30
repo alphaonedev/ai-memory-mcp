@@ -40,6 +40,18 @@
 //! merge has to know the map exists. A recorded version is also capped at the
 //! row clock, so a forged entry can only make a value LOSE.
 //!
+//! The whole map is additionally BOUND to the row clock it was minted at
+//! (sub-key `row`): it is honoured only while the carrying row's `updated_at`
+//! still denotes that instant. Any later local write stamps a new
+//! `updated_at`, so the map it carries along (a read-modify-write client
+//! round-trips the key verbatim) is ignored and every value in that row takes
+//! the write's clock — the write re-asserted the whole row. Without the
+//! binding a value edited away and then back (`private` -> `collective` ->
+//! `private`) matched its recorded fingerprint again and resurrected the OLD
+//! version, so a stale replay of the intermediate `collective` row beat the
+//! owner's newest `private` edit (a visibility widening on the
+//! authorization-bearing `metadata.scope`).
+//!
 //! Collisions pick the greater `(version, fingerprint)`. An object that beats
 //! a scalar at the same path records the scalar's version as that path's
 //! FLOOR, and every descendant older than a floor is pruned — the scalar had
@@ -64,6 +76,10 @@ const CLOCKS_LEAF: &str = "leaf";
 const CLOCKS_FLOOR: &str = "floor";
 /// Sub-key: format version.
 const CLOCKS_V: &str = "v";
+/// Sub-key: the row clock (`updated_at` instant) the map was minted at. A map
+/// whose `row` differs from the carrying row's clock is stale (a local write
+/// happened since the merge that minted it) and is ignored whole.
+const CLOCKS_ROW: &str = "row";
 /// Path prefix of an optional TOP-LEVEL field (never collides with a
 /// metadata JSON-pointer path, which always starts with `/`).
 const FIELD_PATH_PREFIX: char = '#';
@@ -164,8 +180,10 @@ struct Clocks {
 impl Clocks {
     /// Tolerant parse of `metadata[CRDT_FIELD_CLOCKS]`: anything malformed is
     /// ignored (the value then simply carries the row clock — the pre-#4031
-    /// behaviour, never an error).
-    fn parse(metadata: &Value) -> Self {
+    /// behaviour, never an error). A map not bound to `row` — the carrying
+    /// row's own clock — is STALE (minted before a later local write) or
+    /// unbound, and is ignored whole: every value then carries the row clock.
+    fn parse(metadata: &Value, row: Ver) -> Self {
         let mut clocks = Self::default();
         let Some(obj) = metadata
             .get(field_names::CRDT_FIELD_CLOCKS)
@@ -173,6 +191,13 @@ impl Clocks {
         else {
             return clocks;
         };
+        let minted_at = obj
+            .get(CLOCKS_ROW)
+            .and_then(Value::as_str)
+            .and_then(instant_of);
+        if minted_at != Some(row) {
+            return clocks;
+        }
         if let Some(leaf) = obj.get(CLOCKS_LEAF).and_then(Value::as_object) {
             for (path, entry) in leaf {
                 if let Some([at, fp]) = entry.as_array().map(Vec::as_slice)
@@ -196,7 +221,7 @@ impl Clocks {
         self.leaf.is_empty() && self.floor.is_empty()
     }
 
-    fn encode(&self) -> Value {
+    fn encode(&self, row: Ver) -> Value {
         let render = |v: &Ver| crate::validate::render_canonical_utc(*v);
         let leaf: Map<String, Value> = self
             .leaf
@@ -215,6 +240,7 @@ impl Clocks {
             .collect();
         let mut obj = Map::new();
         obj.insert(CLOCKS_V.to_string(), Value::from(CLOCKS_FORMAT));
+        obj.insert(CLOCKS_ROW.to_string(), Value::String(render(&row)));
         if !leaf.is_empty() {
             obj.insert(CLOCKS_LEAF.to_string(), Value::Object(leaf));
         }
@@ -236,9 +262,10 @@ struct Side {
 
 impl Side {
     fn of(metadata: &Value, updated_at: &str, rank: u8) -> Self {
+        let row = row_ver(updated_at);
         Self {
-            clocks: Clocks::parse(metadata),
-            row: row_ver(updated_at),
+            clocks: Clocks::parse(metadata, row),
+            row,
             rank,
         }
     }
@@ -525,7 +552,7 @@ impl FieldClockMerge {
     /// The merged row's clock map, or `None` when every value is at the row
     /// clock (the map is then omitted — byte-identical to a pre-#4031 row).
     pub(super) fn finish(self) -> Option<Value> {
-        (!self.out.is_empty()).then(|| self.out.encode())
+        (!self.out.is_empty()).then(|| self.out.encode(self.row_out))
     }
 }
 
@@ -569,12 +596,38 @@ mod tests {
         let t = instant_of("2026-01-01T00:00:00Z").expect("parse");
         c.leaf.insert("/k".to_string(), (t, "abcd".to_string()));
         c.floor.insert("/o".to_string(), t);
-        let meta = json!({ field_names::CRDT_FIELD_CLOCKS: c.encode() });
-        let back = Clocks::parse(&meta);
+        let meta = json!({ field_names::CRDT_FIELD_CLOCKS: c.encode(t) });
+        let back = Clocks::parse(&meta, t);
         assert_eq!(back.leaf.get("/k"), Some(&(t, "abcd".to_string())));
         assert_eq!(back.floor.get("/o"), Some(&t));
         let junk = json!({ field_names::CRDT_FIELD_CLOCKS: {"leaf": {"/k": 3}, "floor": 7} });
-        assert!(Clocks::parse(&junk).is_empty());
+        assert!(Clocks::parse(&junk, t).is_empty());
+    }
+
+    #[test]
+    fn a_map_minted_at_another_row_clock_is_ignored() {
+        // The map is bound to the row clock it was minted at: once a local
+        // write re-stamps `updated_at`, the carried map is stale and every
+        // value takes the write's clock (no A-B-A fingerprint resurrection).
+        let minted = instant_of("2026-01-01T00:00:00Z").expect("parse");
+        let later_write = instant_of("2026-01-05T00:00:00Z").expect("parse");
+        let mut c = Clocks::default();
+        c.leaf
+            .insert("/scope".to_string(), (minted, "abcd".to_string()));
+        let meta = json!({ field_names::CRDT_FIELD_CLOCKS: c.encode(minted) });
+        assert!(
+            !Clocks::parse(&meta, minted).is_empty(),
+            "bound map honoured"
+        );
+        assert!(
+            Clocks::parse(&meta, later_write).is_empty(),
+            "a map minted before the row's current clock is stale"
+        );
+        // An unbound map (no `row` sub-key, e.g. hand-authored) is ignored.
+        let unbound = json!({ field_names::CRDT_FIELD_CLOCKS: {
+            "v": 1, "leaf": {"/scope": ["2026-01-01T00:00:00.000000Z", "abcd"]}
+        }});
+        assert!(Clocks::parse(&unbound, minted).is_empty());
     }
 
     #[test]
