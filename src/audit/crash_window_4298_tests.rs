@@ -259,10 +259,12 @@ fn crash_after_a_partial_append_before_the_mark_is_not_a_false_no_gap_r2_4298() 
     let disk = snaps.trail(CRASH_BEFORE_MARK);
     drop(snaps);
 
+    // Since #4299 the write-ahead has already put 3 in the mark (unsynced)
+    // by this point; the question is unchanged: the disk must not read clean.
     assert_eq!(
         read_seq_mark(&seq_mark_path(&disk)).expect("mark readable"),
-        Some(0),
-        "at this crash point the mark has not recorded sequence 3 yet"
+        Some(3),
+        "the #4299 write-ahead names sequence 3 before the append"
     );
     assert!(
         !reads_clean(&disk),
