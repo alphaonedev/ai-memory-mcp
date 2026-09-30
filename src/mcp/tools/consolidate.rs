@@ -99,7 +99,10 @@ pub(super) fn handle_consolidate(
     // gate admitted are exactly the rows the model sees.
     let sources = resolve_consolidate_sources(conn, &ids, caller, params["namespace"].as_str())?;
 
-    // Auto-generate summary via LLM if not provided
+    // Auto-generate summary via LLM if not provided. #4091 (fail-closed):
+    // a missing, failed or empty model summary is a typed
+    // `SUMMARY_UNAVAILABLE` refusal — never a fabricated placeholder — so
+    // the sources below are left untouched and no row is created.
     let summary: String = if let Some(s) = params["summary"].as_str() {
         s.to_string()
     } else if let Some(llm_client) = llm {
@@ -107,19 +110,25 @@ pub(super) fn handle_consolidate(
             .iter()
             .map(|mem| (mem.title.clone(), mem.content.clone()))
             .collect();
-        llm_client.summarize_memories(&memory_pairs).map_err(|e| {
-            format!(
+        let generated = llm_client.summarize_memories(&memory_pairs).map_err(|e| {
+            crate::errors::msg::summary_unavailable(&format!(
                 "LLM summarization failed: {}",
                 crate::mcp::error_text::mcp_foreign_err(
                     "LLM summarization failed",
                     crate::mcp::error_text::llm(e),
                 )
-            )
-        })?
+            ))
+        })?;
+        if generated.trim().is_empty() {
+            return Err(crate::errors::msg::summary_unavailable(
+                crate::errors::msg::SUMMARY_UNAVAILABLE_LLM,
+            ));
+        }
+        generated
     } else {
-        return Err(
-            "summary is required (or use smart/autonomous tier for auto-summarization)".into(),
-        );
+        return Err(crate::errors::msg::summary_unavailable(
+            crate::errors::msg::SUMMARY_UNAVAILABLE_NO_LLM,
+        ));
     };
 
     validate::RequestValidator::validate_consolidate(&ids, title, &summary, namespace)
@@ -379,7 +388,8 @@ impl McpTool for ConsolidateTool {
         "Merge 2-100 sources into one long-tier memory; consumes sources; provenance in \
          metadata.derived_from + metadata.consolidated_from_agents (plus derived_from link rows \
          only when sources are tombstoned, not deleted). LLM auto-generates summary if omitted \
-         (smart/autonomous tier)."
+         (smart/autonomous tier); when no LLM is wired, the LLM call fails, or the LLM returns \
+         empty, the call is refused with SUMMARY_UNAVAILABLE and no source is touched."
     }
     fn input_schema() -> Value {
         crate::mcp::registry::input_schema_for::<ConsolidateRequest>()
@@ -565,7 +575,12 @@ mod tests {
             None,
         )
         .unwrap_err();
-        assert!(err.contains("summary is required"), "got: {err}");
+        // #4091 — the refusal carries the typed slug (was the untyped
+        // "summary is required" message).
+        assert!(
+            err.contains(crate::errors::error_codes::SUMMARY_UNAVAILABLE),
+            "got: {err}"
+        );
     }
 
     // Happy path — two observations consolidated, returns new id + count.

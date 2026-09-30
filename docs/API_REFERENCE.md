@@ -939,6 +939,14 @@ At least one filter required. **Admin-gated**. Returns `{"deleted": N}`.
 
 201 with `{"id":"consolidated-uuid","consolidated":3}`.
 
+`summary` is optional: when omitted the daemon materialises it via the
+configured LLM. The call never fabricates a summary — when no LLM is wired,
+the LLM call exceeds `llm_call_timeout`, or the LLM returns empty or errors,
+the handler fails closed with `503` and a stable `SUMMARY_UNAVAILABLE` code
+(`{"code":"SUMMARY_UNAVAILABLE","error":"..."}`), leaves every source row
+untouched (not tombstoned, not deleted), and creates no consolidated row.
+Supply `summary` explicitly to consolidate without an LLM.
+
 ### `POST /api/v1/gc`
 
 Immediate garbage collection. Empty body. **Admin-gated**. Returns

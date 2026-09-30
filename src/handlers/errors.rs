@@ -273,6 +273,21 @@ pub(crate) fn record_stopped_response(e: &dyn std::fmt::Display) -> axum::respon
         .into_response()
 }
 
+/// #4091 — ONE spelling for the consolidate fail-closed 503. No LLM wired,
+/// the LLM call timed out, or the LLM returned empty/errored: the handler
+/// refuses with the stable `SUMMARY_UNAVAILABLE` code instead of writing a
+/// content-free placeholder over tombstoned or hard-deleted sources.
+pub(crate) fn summary_unavailable_response(detail: &str) -> axum::response::Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({
+            "code": crate::errors::error_codes::SUMMARY_UNAVAILABLE,
+            "error": detail,
+        })),
+    )
+        .into_response()
+}
+
 pub(crate) fn handler_error_500(e: &dyn std::fmt::Display) -> axum::response::Response {
     tracing::error!("handler error: {e}");
     (

@@ -15731,14 +15731,17 @@ async fn http_expand_query_route_returns_503_when_no_llm_l6() {
 }
 
 // ------------------------------------------------------------------
-// v0.7.0 L7 — consolidate no longer 422's on absent `summary`
+// v0.7.0 L7 / v1.0.0 #4091 — consolidate no longer 422's on absent `summary`
 // ------------------------------------------------------------------
 //
 // Before L7, `ConsolidateBody.summary` was `String` (required), so
 // axum's `Json<T>` extractor rejected S51's `{use_llm: true}` body
-// with 422 UNPROCESSABLE ENTITY. The fix made `summary` optional
-// and synthesises a deterministic fallback when the LLM is absent.
-// The 2xx assertion guards against the regression returning.
+// with 422 UNPROCESSABLE ENTITY. L7 made `summary` optional and
+// synthesised a deterministic fallback when the LLM was absent.
+// #4091 removes the fallback: without an LLM the handler fails closed
+// with `503 SUMMARY_UNAVAILABLE` and touches nothing. The not-422
+// assertion below guards the L7 wire-shape fix; the 503 + intact-source
+// assertions pin the #4091 fail-closed contract.
 
 #[tokio::test]
 async fn http_consolidate_accepts_use_llm_without_summary_l7() {
@@ -15806,25 +15809,56 @@ async fn http_consolidate_accepts_use_llm_without_summary_l7() {
         )
         .await
         .unwrap();
-    // The regression manifests as 422; the fix produces 201.
+    // The L7 regression manifests as 422; #4091 turns the former 201
+    // placeholder into a typed 503 that touches nothing.
     assert_ne!(
         resp.status(),
         StatusCode::UNPROCESSABLE_ENTITY,
         "L7 regression: consolidate 422'd on absent summary"
     );
-    assert_eq!(resp.status(), StatusCode::CREATED);
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     let bytes = axum::body::to_bytes(resp.into_body(), crate::TEST_BODY_READ_CAP)
         .await
         .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    // S51 reads `summary_len >= 20`; assert the body carries a
-    // summary string (the LLM-absent fallback is well above 20
-    // chars for any 2-id input).
-    let summary = v["summary"].as_str().expect("summary in response");
-    assert!(
-        summary.len() >= 20,
-        "L7 fallback summary too short: {summary:?}"
+    assert_eq!(
+        v["code"].as_str(),
+        Some(crate::errors::error_codes::SUMMARY_UNAVAILABLE),
+        "typed refusal code, got {v}"
     );
+    // #4091 — no source may change and no consolidated row may exist.
+    {
+        let lock = state.lock().await;
+        for (id, title, content) in [
+            (id_a.as_str(), "aom101-0", "first"),
+            (id_b.as_str(), "aom101-1", "second"),
+        ] {
+            let mem = db::get(&lock.0, id)
+                .unwrap()
+                .unwrap_or_else(|| panic!("source {id} missing"));
+            assert_eq!(mem.title, title);
+            assert_eq!(mem.content, content);
+        }
+        assert_eq!(
+            db::list(
+                &lock.0,
+                Some("l7-no-summary"),
+                None,
+                100,
+                0,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None
+            )
+            .unwrap()
+            .len(),
+            2,
+            "no consolidated row may be created"
+        );
+    }
 }
 
 // ------------------------------------------------------------------
@@ -15914,15 +15948,18 @@ async fn http_consolidate_response_carries_summary_on_every_key_s51_reads() {
         .route("/api/v1/consolidate", axum_post(consolidate_memories))
         .with_state(test_app_state(state.clone()));
 
-    // S51's exact request shape — `use_llm: true` and no `summary`
-    // field. test_state() does not wire an LLM, so the resolver
-    // falls through to the deterministic concat-of-titles
-    // fallback, exactly as the postgres branch will on a daemon
-    // whose Ollama endpoint is down.
+    // S51's request shape with an explicit `summary`: the 201 wire shape
+    // (`summary` / `content` / nested `memory.content`) is a success-path
+    // contract and stays pinned here. #4091: the same shape WITHOUT a
+    // summary and with no LLM wired is now a `503 SUMMARY_UNAVAILABLE`
+    // (see `http_consolidate_accepts_use_llm_without_summary_l7` and the
+    // `consolidate_no_placeholder_4091` integration tests) — the resolver
+    // never fabricates a fallback.
     let body = serde_json::json!({
         "ids": [id_a, id_b],
         "title": "AOM-101 lifecycle",
         "namespace": "l7-followup",
+        "summary": "AOM-101 hardened the sync_push retry path with exponential backoff and jitter.",
         "use_llm": true,
     });
     let resp = app

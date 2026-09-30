@@ -75,6 +75,13 @@ pub mod error_codes {
     /// in its text (`ATTESTATION_FAILED: …`, a governance deny message, an
     /// offload integrity verdict). Passes through every surface verbatim.
     pub const REFUSED: &str = "REFUSED";
+    /// #4091 — a consolidation was refused because no trustworthy summary
+    /// could be produced: no LLM wired, the LLM call timed out, or the LLM
+    /// returned empty or errored. Fail-closed (HTTP 503) so a transient
+    /// model failure can never tombstone or hard-delete real sources behind
+    /// a content-free placeholder. Un-prefixed like `RECORD_STOPPED`: a
+    /// deliberate refusal state shared across surfaces, not a backend fault.
+    pub const SUMMARY_UNAVAILABLE: &str = "SUMMARY_UNAVAILABLE";
 
     // ---- StorageError-side (substrate-facing) -------------------------------
     pub const PENDING_ACTION_NOT_FOUND: &str = "PENDING_ACTION_NOT_FOUND";
@@ -412,6 +419,28 @@ pub mod msg {
     pub const QUERY_REQUIRED: &str = "query is required";
     pub const CONTEXT_REQUIRED: &str = "context is required";
 
+    // ---- #4091 consolidate fail-closed family ----------------------------------
+    // The `error` half of the `503 SUMMARY_UNAVAILABLE` envelope (the `code`
+    // half is `super::error_codes::SUMMARY_UNAVAILABLE`). Lowercase prose per
+    // ERRORS-14; the MCP/CLI twins carry the same slug first via
+    // [`summary_unavailable`].
+    pub const SUMMARY_UNAVAILABLE_NO_LLM: &str =
+        "consolidation summary unavailable: no LLM is wired; supply summary explicitly or configure an LLM";
+    pub const SUMMARY_UNAVAILABLE_TIMEOUT: &str =
+        "consolidation summary unavailable: LLM call timed out; retry later or supply summary explicitly";
+    pub const SUMMARY_UNAVAILABLE_LLM: &str =
+        "consolidation summary unavailable: LLM returned empty or errored; retry later or supply summary explicitly";
+
+    /// `"SUMMARY_UNAVAILABLE: {detail}"` — the MCP/CLI spelling of the #4091
+    /// refusal: the typed slug first so callers can match it, then the detail.
+    #[must_use]
+    pub fn summary_unavailable(detail: &str) -> String {
+        format!(
+            "{}: {detail}",
+            super::error_codes::SUMMARY_UNAVAILABLE
+        )
+    }
+
     // ---- shared sqlx/rusqlite context label (postgres adapter + schema-init) -----
     pub const READ_SCHEMA_VERSION: &str = "read schema_version";
 
@@ -587,6 +616,9 @@ mod arch_9_slug_tests {
         // #3196 — un-prefixed like RECORD_STOPPED: a deliberate, caller-
         // triggerable refusal shared across both backends, not a fault.
         assert_eq!(TRAVERSAL_BUDGET_EXCEEDED, "TRAVERSAL_BUDGET_EXCEEDED");
+        // #4091 — un-prefixed like RECORD_STOPPED: the fail-closed
+        // consolidate refusal shared across HTTP/MCP/CLI on both backends.
+        assert_eq!(SUMMARY_UNAVAILABLE, "SUMMARY_UNAVAILABLE");
     }
 
     // FX-E1 (2026-05-27) — `crate::store` is gated behind

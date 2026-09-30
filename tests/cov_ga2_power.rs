@@ -560,12 +560,13 @@ async fn consolidate_missing_source_id_is_404() {
 }
 
 #[tokio::test]
-async fn consolidate_no_llm_deterministic_summary_is_201() {
+async fn consolidate_no_llm_refuses_with_summary_unavailable_4091() {
     let (r, _t) = sqlite_router();
-    // Two real rows, NO summary supplied, NO LLM wired → the
-    // deterministic concat-of-titles fallback in
-    // resolve_consolidate_summary materializes the summary and the row
-    // lands. Also exercises default_ns (namespace omitted).
+    // #4091 — two real rows, NO summary supplied, NO LLM wired → the
+    // handler fails closed with `503 SUMMARY_UNAVAILABLE` instead of the
+    // former deterministic concat-of-titles fallback (which tombstoned
+    // the sources behind content-free text). Also exercises default_ns
+    // (namespace omitted).
     let id1 = create_memory(
         &r,
         "fact one about the project",
@@ -586,17 +587,8 @@ async fn consolidate_no_llm_deterministic_summary_is_201() {
         json!({"ids": [id1, id2], "title": "Consolidated project facts"}),
     )
     .await;
-    assert_eq!(status, StatusCode::CREATED, "consolidate 201: {body}");
-    assert!(body["id"].is_string());
-    assert_eq!(body["consolidated"], 2);
-    let summary = body["summary"].as_str().unwrap_or_default();
-    assert!(
-        summary.contains("Consolidated summary of 2 memories"),
-        "deterministic fallback summary: {body}"
-    );
-    // L7-followup mirror fields.
-    assert_eq!(body["content"], body["summary"]);
-    assert_eq!(body["memory"]["title"], "Consolidated project facts");
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "body={body}");
+    assert_eq!(body["code"].as_str(), Some("SUMMARY_UNAVAILABLE"), "body={body}");
 }
 
 #[tokio::test]
