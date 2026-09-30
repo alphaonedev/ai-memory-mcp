@@ -406,8 +406,12 @@ event lost to a failed write (a full disk, a revoked permission; see
 §"Detecting a trail that stopped recording") leaves a missing `sequence`
 range while the hash chain stays intact. `verify` therefore fails on a gap, as
 its own kind (`SequenceGap`, "events missing"), never with the tamper
-wording. Only interior gaps count: the first line of a file is not required
-to be sequence 1.
+wording. The HEAD of the trail is checked too (#4191): every trail `verify`
+accepts starts at the genesis anchor, which is sequence 0, so a first line
+above sequence 1 means the events before it were numbered and lost (the disk
+was already full, or the permission already gone, when the trail started).
+Those are reported as the gap `1..=first-1`, and a first line with sequence 0
+fails as `Sequence`.
 
 Once the loss is understood, acknowledge the exact ranges verify printed:
 `ai-memory audit verify --acknowledge-gaps 812-812,1040-1043`. A gap passes
