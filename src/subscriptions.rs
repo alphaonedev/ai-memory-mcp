@@ -1855,14 +1855,23 @@ pub(crate) fn hmac_sha256_hex(key_hex: &str, body: &str) -> String {
 }
 
 fn hex_decode(s: &str) -> Option<Vec<u8>> {
-    if !s.len().is_multiple_of(2) {
+    // #4074 — decode over BYTES: a `&str` byte-range slice panicked inside a
+    // multi-byte code point, and `from_str_radix` also accepted a leading `+`.
+    let bytes = s.as_bytes();
+    if !bytes.len().is_multiple_of(2) {
         return None;
     }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+    bytes
+        .chunks_exact(2)
+        .map(|pair| {
+            let (hi, lo) = (char::from(pair[0]), char::from(pair[1]));
+            u8::try_from((hi.to_digit(16)? << 4) | lo.to_digit(16)?).ok()
+        })
         .collect()
 }
+
+#[cfg(test)]
+mod tests_4074;
 
 /// v0.7.0 #1048 (Agent-5 #8) — boot-time hex validator for the
 /// operator-supplied `hmac_secret`. Returns `Ok(())` when the value

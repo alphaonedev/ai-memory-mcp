@@ -262,12 +262,51 @@ pub fn run(
 
 /// Decode a lowercase-hex string to bytes. Small local helper so the
 /// consumer has no hex-crate dependency in this path.
+/// #4074 — the one refusal text for a non-hex manifest signature byte.
+const INVALID_HEX_BYTE: &str = "invalid hex byte";
+
 fn hex_decode(s: &str) -> Result<Vec<u8>> {
-    if s.len() % 2 != 0 {
+    // #4074 — decode over BYTES: a `&str` byte-range slice panics when it
+    // cuts a multi-byte code point, and the manifest signature is file
+    // input. Only ASCII hex digits are accepted (`from_str_radix` alone
+    // would also take a leading `+`).
+    let bytes = s.as_bytes();
+    if !bytes.len().is_multiple_of(2) {
         bail!("odd-length hex string");
     }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).context("invalid hex byte"))
+    if !bytes.iter().all(u8::is_ascii_hexdigit) {
+        bail!(INVALID_HEX_BYTE);
+    }
+    bytes
+        .chunks_exact(2)
+        .map(|pair| {
+            let digits = std::str::from_utf8(pair).context(INVALID_HEX_BYTE)?;
+            u8::from_str_radix(digits, 16).context(INVALID_HEX_BYTE)
+        })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::hex_decode;
+
+    /// #4074 sibling — `doc.signature` comes from an operator-supplied
+    /// manifest file; a non-ASCII value whose byte length is even must be an
+    /// `Err`, never a panic from slicing inside a UTF-8 code point.
+    #[test]
+    fn hex_decode_rejects_non_ascii_without_panic_4074() {
+        for bad in [
+            "\u{1F600}",
+            "a\u{20AC}",
+            "\u{e9}\u{e9}",
+            "abc",
+            "+f+f",
+            "zz",
+        ] {
+            let got = std::panic::catch_unwind(|| hex_decode(bad))
+                .unwrap_or_else(|_| panic!("#4074: hex_decode panicked on {bad:?}"));
+            assert!(got.is_err(), "#4074: {bad:?} must be refused");
+        }
+        assert_eq!(hex_decode("00ff").expect("valid hex"), vec![0x00, 0xff]);
+    }
 }
