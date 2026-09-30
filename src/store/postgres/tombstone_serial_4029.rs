@@ -138,12 +138,7 @@ async fn tombstoned_in_tx(tx: &mut PgTx<'_>, id: &str) -> Result<bool, sqlx::Err
 pub(crate) async fn admit_or_tombstoned(tx: &mut PgTx<'_>, id: &str) -> Result<bool, sqlx::Error> {
     lock_admission(tx, id).await?;
     if tombstoned_in_tx(tx, id).await? {
-        tracing::info!(
-            target: crate::storage::FORGET_TOMBSTONE_TRACE_TARGET,
-            memory_id = %id,
-            "{}",
-            crate::storage::FORGET_TOMBSTONE_DROP_MSG
-        );
+        crate::storage::log_forget_tombstone_drop(id);
         return Ok(true);
     }
     crate::storage::admission_hook::checkpoint(id);

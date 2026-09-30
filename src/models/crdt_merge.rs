@@ -457,7 +457,7 @@ const SPECIAL_METADATA_KEYS: [&str; 4] = [
 const VISIBILITY_METADATA_KEYS: [&str; 3] = [
     crate::META_KEY_SCOPE,
     crate::META_KEY_TARGET_AGENT_ID,
-    "recipient_agent_id",
+    crate::META_KEY_RECIPIENT_AGENT_ID,
 ];
 
 /// Resolve `metadata` (#224 + #4031).

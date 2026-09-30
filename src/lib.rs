@@ -375,6 +375,11 @@ pub const META_KEY_MINED_FROM: &str = "mined_from";
 /// the named target to see otherwise-private rows alongside the owner.
 pub const META_KEY_TARGET_AGENT_ID: &str = "target_agent_id";
 
+/// `metadata.recipient_agent_id` — the legacy inbox recipient key. Read by
+/// the visibility predicate's legacy-inbox arm (a row in the recipient's
+/// `_inbox/` namespace with no `target_agent_id`) and by `memory_notify`.
+pub const META_KEY_RECIPIENT_AGENT_ID: &str = "recipient_agent_id";
+
 /// `metadata.family` — the MCP TOOL-family tag (`core` / `lifecycle` /
 /// `graph` / `governance` / `power` / `meta` / `archive` / `other`, per
 /// `crate::profile::Family`; issue #864 — NOT the `memory_kind`
