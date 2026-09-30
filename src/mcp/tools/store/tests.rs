@@ -774,6 +774,7 @@ fn k9_deny_rule_short_circuits_store() {
 /// cover still stores.
 #[test]
 fn k9_4042_mixed_wildcard_deny_rule_refuses_store_and_inserts_nothing() {
+    let _agent_id_env_guard = crate::identity::agent_id_env_test_lock();
     use crate::permissions::{PermissionRule, RuleDecision, set_active_permission_rules};
     let _g = rules_scope();
     set_active_permission_rules(vec![PermissionRule {
