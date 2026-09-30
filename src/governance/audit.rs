@@ -292,22 +292,55 @@ fn open_forensic_file_for_read(path: &Path) -> std::io::Result<File> {
     open_forensic_file(OpenOptions::new().read(true), path)
 }
 
+/// #4310 — the stderr rate limit for [`writer_failure`]: its own
+/// accounting, on the #3651 log-sink diagnostic interval the flat audit
+/// trail's #3975 diagnostic also uses.
+static WRITER_FAILURE_DIAGNOSTICS: std::sync::LazyLock<crate::logging::DeliveryStats> =
+    std::sync::LazyLock::new(crate::logging::DeliveryStats::default);
+
 /// #4302 — a row the background writer could not persist. It was a trace
 /// line only, so a sink that stopped writing after start-up (a remount, a full
-/// disk) looked healthy. Now it is counted in
-/// `ai_memory_forensic_sink_unavailable_total` and said on stderr too.
+/// disk) looked healthy. Now EVERY dropped row is counted in
+/// `ai_memory_forensic_sink_unavailable_total`, and stderr says so. #4310 —
+/// stderr only at most once a minute, naming how many rows were dropped
+/// since the previous line, so a log that turns read-only mid-run does not
+/// flood stderr in proportion to governed traffic.
 fn writer_failure(what: &str, path: &Path, e: &std::io::Error) {
+    if let Some(line) = writer_failure_with(
+        &WRITER_FAILURE_DIAGNOSTICS,
+        crate::logging::now_unix_ms(),
+        what,
+        path,
+        e,
+    ) {
+        // Nothing is left to report a failing stderr to.
+        let _ = writeln!(std::io::stderr(), "{line}");
+    }
+}
+
+/// [`writer_failure`] against given accounting and clock: counts the row and
+/// returns the stderr line when one is due.
+fn writer_failure_with(
+    stats: &crate::logging::DeliveryStats,
+    now_unix_ms: u64,
+    what: &str,
+    path: &Path,
+    e: &std::io::Error,
+) -> Option<String> {
     tracing::error!(
         target: AUDIT_TRACE_TARGET,
         "forensic: {what} {} failed: {e}",
         path.display()
     );
     crate::metrics::inc_forensic_sink_unavailable();
-    let _ = writeln!(
-        std::io::stderr(),
-        "ai-memory: the forensic audit log dropped a row: {what} {} failed: {e} (#4302)",
-        path.display()
-    );
+    stats.record_failure(now_unix_ms).map(|suppressed| {
+        format!(
+            "ai-memory: the forensic audit log dropped a row: {what} {} failed: {e} \
+             ({suppressed} further rows dropped since the previous report; every one is \
+             counted in ai_memory_forensic_sink_unavailable_total) (#4302)",
+            path.display()
+        )
+    })
 }
 
 /// #4304 — append one row and its newline in ONE write. `writeln!` issued
@@ -5859,6 +5892,40 @@ mod tests {
         assert!(
             open_forensic_file_for_read(&today).is_ok(),
             "one link again: accepted"
+        );
+    }
+
+    /// #4310 — every dropped row is counted, but stderr gets at most one
+    /// line per interval, naming the rows folded into it. Red on 4434125ca:
+    /// one stderr line per dropped row.
+    #[test]
+    fn dropped_rows_are_all_counted_but_stderr_is_rate_limited_4310() {
+        let stats = crate::logging::DeliveryStats::default();
+        let path = Path::new("/nonexistent/forensic-2026-07-31.jsonl");
+        let err = std::io::Error::from_raw_os_error(30);
+        let t0 = 1_000_000_u64;
+        let before = crate::metrics::forensic_sink_unavailable_count();
+        let lines: Vec<String> = (0..10)
+            .filter_map(|i| writer_failure_with(&stats, t0 + i, "appending to", path, &err))
+            .collect();
+        assert!(
+            crate::metrics::forensic_sink_unavailable_count() >= before + 10,
+            "every dropped row is counted"
+        );
+        assert_eq!(
+            lines.len(),
+            1,
+            "one stderr line inside the interval: {lines:?}"
+        );
+        assert!(lines[0].contains("0 further rows"), "{}", lines[0]);
+
+        // A minute later: one more line, naming the 9 rows folded since.
+        let later = writer_failure_with(&stats, t0 + 60_000, "appending to", path, &err)
+            .expect("a line is due after the interval");
+        assert!(later.contains("9 further rows"), "{later}");
+        assert!(
+            writer_failure_with(&stats, t0 + 60_001, "appending to", path, &err).is_none(),
+            "and the limit holds again"
         );
     }
 
