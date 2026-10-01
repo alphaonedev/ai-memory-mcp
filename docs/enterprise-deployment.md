@@ -300,7 +300,8 @@ Graduate directly to T3 (skip T2) when **any** of these are true:
 ### 3.2 Storage
 
 Same as T1 — SQLite-WAL — but **shared by all N agents** via the
-HTTP daemon process. Each agent connects over HTTP:
+HTTP daemon process. Every agent that shares this store reaches it over
+HTTP:
 
 ```bash
 # Daemon
@@ -311,9 +312,23 @@ curl -H "X-Agent-Id: alice@team-finance" \
      -H "X-API-Key: $(cat /etc/ai-memory/api.key)" \
      https://127.0.0.1:9077/api/v1/recall?q=quarterly+forecast
 
-# Agent 2 (using ai-memory CLI as a thin client)
-AI_MEMORY_AGENT_ID="bob@team-finance" ai-memory recall "quarterly forecast"
+# Agent 2 — same shape, a different caller identity
+curl -H "X-Agent-Id: bob@team-finance" \
+     -H "X-API-Key: $(cat /etc/ai-memory/api.key)" \
+     https://127.0.0.1:9077/api/v1/recall?q=quarterly+forecast
 ```
+
+> **`ai-memory recall` is not a thin client for this daemon.** The CLI
+> read/write verbs open a **local SQLite file** at the resolved `--db` /
+> `AI_MEMORY_DB` path — `Command::Recall` dispatches to
+> `cli::recall::run(&db_path, …)`, never an HTTP request — so
+> `AI_MEMORY_AGENT_ID="bob@…" ai-memory recall "…"` on an agent host
+> reads that host's own database, not the shared T2 store. It is a
+> different store with the same command name, which at T2 silently looks
+> like an empty or stale corpus. Use HTTP (or an MCP client pointed at
+> the daemon) for shared access; the CLI reaches the shared store only on
+> the daemon host with `--db` set to the daemon's own path, where WAL lets
+> that reader coexist with the daemon's writer (see the note below).
 
 WAL mode is critical at T2 — it permits a single writer to coexist
 with N readers without blocking. The substrate also serializes
