@@ -18286,8 +18286,11 @@ static INSERT_IF_NEWER_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::n
                 -- UPDATE and never pass can_transition_to, so the replicated
                 -- lifecycle value is NOT uniformly transition-validated -- the
                 -- enforcement gap is deferred to v1.1 per #3750.
-                -- Boids item 3 R2.1: local system-only never replaced, remote
-                -- system-only never adopted, else newer-wins (one shared twin).
+                -- Boids item 3 R2.1 (crdt_merge::merge_lifecycle_local_taint_wins,
+                -- one shared twin): a LOCAL contaminated / quarantined is never
+                -- replaced; a REMOTE contaminated is never adopted; every other
+                -- case, including a remote quarantined or tombstoned, is
+                -- newer-wins.
                 lifecycle_state = {lifecycle_case},
                 -- v1.0.0 #2333 (FBL-03) + v1.0.0 #2394 — the v79 denormalized
                 -- kind_provenance FOLLOWS THE KIND THAT ACTUALLY WON on the
