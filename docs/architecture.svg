@@ -185,9 +185,9 @@
     <text x="530" y="557" text-anchor="middle" class="label-bold" style="color:#58a6ff">long</text>
     <text x="530" y="575" text-anchor="middle" class="subtitle">permanent</text>
 
-    <!-- Auto-promote arrow -->
+    <!-- Promotion arrow (explicit only, Boids item 1) -->
     <path d="M 400 590 Q 465 615 530 590" class="line-green flow-anim-green" marker-end="none"/>
-    <text x="465" y="615" text-anchor="middle" class="subtitle" style="fill:#3fb950">mid → long auto-promote @ 5 accesses</text>
+    <text x="465" y="615" text-anchor="middle" class="subtitle" style="fill:#3fb950">mid → long via memory_promote only</text>
   </g>
 
   <!-- Pulsing dots on flow lines -->

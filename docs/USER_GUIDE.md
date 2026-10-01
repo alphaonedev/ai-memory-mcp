@@ -1548,10 +1548,11 @@ This performs a fuzzy OR search across all your memories and returns the most re
 5. **Tier boost** -- long-term gets +3.0, mid gets +1.0, short gets +0.0
 6. **Recency decay** -- `1/(1 + days_old * 0.1)` so recent memories rank higher
 
-Recall also automatically:
+Recall also records the access; the periodic fold job then:
 - Bumps the access count
 - Extends the TTL (1 hour for short, 1 day for mid)
-- Auto-promotes mid-tier memories to long-term after 5 accesses
+
+Recall never changes a memory's tier or priority. Use `memory_promote` to make a memory long-term.
 
 ### Search for Exact Matches
 
@@ -1923,8 +1924,7 @@ Show archive statistics (count, size, oldest/newest).
 Recall itself is a **pure read** — it writes zero rows to `memories` and records each access in the append-only `recall_observations` ledger instead (#1953). The behaviors below are applied out of band by the periodic **fold job** (`db::fold_recall_accesses`) from that ledger, not inline on the recall path:
 
 - **TTL extension**: A recalled memory's expiry is floor-extended (1 hour for short, 1 day for mid; an access never moves an expiry earlier)
-- **Auto-promotion**: A mid-tier memory recalled 5+ times automatically becomes long-term (expiry cleared)
-- **Priority reinforcement**: Every 10 accesses, a memory's priority increases by 1 (max 10)
+- **No access-driven promotion**: recall never changes a memory's tier or priority (v1.0.0 Boids item 1). Promote with `memory_promote`; change priority with `memory_update`
 - **Garbage collection**: Expired memories are cleaned up every 30 minutes (optionally archived instead of deleted when `archive_on_gc = true` in `config.toml`)
 - **Deduplication**: Storing a memory with the same title+namespace updates the existing one (tier never downgrades, priority takes the higher value)
 

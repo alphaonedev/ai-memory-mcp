@@ -636,7 +636,7 @@ These are set in the source code and require recompilation to change:
 | `DEFAULT_PORT` | 9077 | `src/daemon_runtime.rs:97` |
 | `GC_INTERVAL_SECS` | 1800 (30 min) | `src/daemon_runtime.rs:98` |
 | `MAX_CONTENT_SIZE` | 65536 (64 KB) | `models.rs` |
-| `PROMOTION_THRESHOLD` | 5 accesses | `models.rs` |
+| `PROMOTION_THRESHOLD` | 5 (historical; no production reader since v1.0.0 Boids item 1 — access never promotes, only `memory_promote` raises a tier; kept for a regression test) | `models.rs` |
 | `SHORT_TTL_EXTEND_SECS` | 3600 (1 hour) | `models.rs` |
 | `MID_TTL_EXTEND_SECS` | 86400 (1 day) | `models.rs` |
 | `DEFAULT_MAX_MEMORIES_PER_DAY` | 1000 | `quotas.rs` (compiled fallback for `[limits].max_memories_per_day` / `AI_MEMORY_MAX_MEMORIES_PER_DAY`) |
@@ -1280,10 +1280,10 @@ These are written by the server; treat as read-only in queries:
 ### Transaction Safety
 
 Critical operations use `BEGIN IMMEDIATE` / `COMMIT` transactions to prevent data corruption under concurrent access:
-- **`touch()`** -- the read-modify-write cycle for access count, TTL extension, auto-promotion, and priority reinforcement is fully atomic
+- **`touch()`** -- the read-modify-write cycle for access count, `last_accessed_at` and the TTL floor extension is fully atomic (since v1.0.0 Boids item 1 it never changes tier or priority)
 - **`consolidate()`** -- the multi-step merge (create new memory, delete originals, aggregate tags) is fully atomic
 
-This prevents race conditions where two concurrent recalls could cause incorrect access counts or missed auto-promotions.
+This prevents race conditions where two concurrent recalls could cause incorrect access counts or a lost TTL extension.
 
 ### FTS Query Injection Protection
 
@@ -1840,7 +1840,7 @@ Note: `last_accessed_at` and `expires_at` are omitted from the JSON when null.
 
 #### GET /recall?context=... (Recall)
 
-Fuzzy OR search with ranked results. Automatically bumps access count, extends TTL, and auto-promotes frequently accessed mid-tier memories to long-term.
+Fuzzy OR search with ranked results. A pure read (#1953): it writes nothing to `memories` and appends one `recall_observations` ledger row; the periodic fold job later bumps the access count and extends the TTL floor. Recall never promotes a memory — `memory_promote` is the only verb that raises a tier.
 
 ```bash
 curl "https://127.0.0.1:9077/api/v1/recall?context=database+migration+postgres&namespace=infra&limit=5"

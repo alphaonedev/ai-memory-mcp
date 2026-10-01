@@ -234,8 +234,9 @@ context. Semantics: semantic + keyword + priority/confidence/recency
 blend. **Pure read** (#1953): writes zero rows to `memories` on the
 recall path — no `access_count` bump, no TTL extension, no promotion.
 It appends one row to the append-only `recall_observations` ledger; the
-access ladders (increment `access_count`, extend TTL, promote mid→long
-at 5 accesses, nudge priority every 10) are applied out of band by the
+access bookkeeping (increment `access_count`, update `last_accessed_at`,
+extend the TTL floor; never tier or priority, v1.0.0 Boids item 1) is
+applied out of band by the
 periodic fold job (`db::fold_recall_accesses`) from that ledger.
 
 ## SAL — Storage Abstraction Layer (v0.7)

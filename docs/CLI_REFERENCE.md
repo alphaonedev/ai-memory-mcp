@@ -107,7 +107,8 @@ from that ledger: increment `access_count`, raise `expires_at` to
 an access can never move an expiry earlier; issue
 [#1596](https://github.com/alphaonedev/ai-memory-mcp/issues/1596),
 superseding the [#830](https://github.com/alphaonedev/ai-memory-mcp/issues/830)
-replacement contract), auto-promote mid→long at 5 accesses.
+replacement contract). The fold never changes tier or priority (v1.0.0
+Boids item 1); `ai-memory promote` is the only way to raise a tier.
 
 | Flag | Type | Default | Notes |
 |------|------|---------|-------|
@@ -2339,8 +2340,8 @@ results (#1468 / #1469); leave it unset for single-tenant trust-all reads.
 | `mid` | 7 days | Normal memories (default). |
 | `long` | permanent | Important records. |
 
-Accessing a memory extends TTL (short +1 h, mid +1 d). At 5 accesses,
-mid auto-promotes to long.
+Accessing a memory extends TTL (short +1 h, mid +1 d). Access never
+changes the tier: use `ai-memory promote` to move a memory to long.
 
 ## See also
 
