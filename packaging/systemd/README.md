@@ -1,8 +1,17 @@
 # ai-memory systemd units
 
 Drop-in systemd units for operators running ai-memory as a hardened
-single-node deployment. Shipped by the Debian (.deb) and Fedora COPR
-packages; also usable standalone on any systemd distro.
+single-node deployment, usable on any systemd distro.
+
+**What the packages ship.** The Debian (.deb) and RPM / Fedora COPR
+packages are **binary-only**: they install `/usr/bin/ai-memory` and
+nothing else — no unit, no timer, no sysusers fragment and no
+maintainer scripts (`nfpm.yaml` `contents:`, `ai-memory.spec` `%files`,
+`debian/rules`). On a deb/rpm install, follow every step of
+[Install — manual](#install--manual) below; the service users and the
+units do not exist until you create them. The AUR `PKGBUILD` is the
+one recipe that installs a unit: it ships `ai-memory.service` and this
+sysusers fragment, not the other units or timers.
 
 ## Units
 
@@ -10,6 +19,7 @@ packages; also usable standalone on any systemd distro.
 |------|---------|------|
 | `ai-memory.service` | Main daemon (HTTP + MCP) | `simple` |
 | `ai-memory-sync.service` | Peer-mesh sync daemon (optional) | `simple` |
+| `ai-memory-curator.service` | Autonomous curator daemon (optional) | `simple` |
 | `ai-memory-backup.service` | One-shot snapshot via `VACUUM INTO` | `oneshot` |
 | `ai-memory-backup.timer` | Hourly backup trigger | `timer` |
 | `ai-memory-wake-hub.service` | Content-free wake plane (`User=ai-memory-hub`) | `simple` |
@@ -20,10 +30,10 @@ packages; also usable standalone on any systemd distro.
 ## Install — manual
 
 ```sh
-# 1. System users + state dir. Distro packages install
-#    packaging/systemd/ai-memory.sysusers.conf as
-#    /usr/lib/sysusers.d/ai-memory.conf; systemd-sysusers creates both
-#    users on first boot (the AUR PKGBUILD ships this). Manual:
+# 1. System users + state dir. The .deb and .rpm packages do NOT ship
+#    the sysusers fragment, so run this on a deb/rpm install. (Only the
+#    AUR PKGBUILD installs it, as /usr/lib/sysusers.d/ai-memory.conf,
+#    where systemd-sysusers creates both users on first boot.) Manual:
 sudo systemd-sysusers packaging/systemd/ai-memory.sysusers.conf
 # Fallback if systemd-sysusers is unavailable:
 # sudo useradd --system --home /var/lib/ai-memory --shell /usr/sbin/nologin ai-memory
@@ -31,7 +41,7 @@ sudo systemd-sysusers packaging/systemd/ai-memory.sysusers.conf
 sudo install -d -o ai-memory -g ai-memory -m 0750 /var/lib/ai-memory
 sudo install -d -o ai-memory -g ai-memory -m 0750 /var/lib/ai-memory/backups
 
-# 2. Units into /etc/systemd/system (or /usr/lib/systemd/system for distro packages)
+# 2. Units into /etc/systemd/system. The .deb and .rpm packages ship no units.
 sudo install -m 0644 packaging/systemd/*.service /etc/systemd/system/
 sudo install -m 0644 packaging/systemd/*.timer   /etc/systemd/system/
 
