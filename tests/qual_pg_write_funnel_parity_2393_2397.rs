@@ -95,7 +95,12 @@ const AGE_UNPROJECT_FUNNELS: &[&str] = &[
     "delete",
     "apply_remote_deletion",
     "forget",
-    "consolidate",
+    // #4045/#4046/#4047 — `consolidate` was refactored into a thin delegator to
+    // `consolidate_with_expected_versions`, which now holds the hard-DELETE of
+    // the source rows and their AGE unprojection. The guard follows the DELETE
+    // to the function that owns it (same move as `store_with_embedding_inner`
+    // above for #2771); the wrapper deletes nothing itself.
+    "consolidate_with_expected_versions",
     "run_gc",
     "size_gc",
     "archive_by_ids",
