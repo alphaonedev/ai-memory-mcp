@@ -116,21 +116,28 @@ owner, so an owner write is not locked out; a non-owner write is refused.
   deserialise, **or** (sqlite) a whole `metadata` cell that is not a JSON object
   (invalid JSON, an array, a string, ...). A corrupt level contributes nothing
   to ANY governance reader: the sibling walkers
-  (`require_approval_above_depth`, `skill_promotion_min_depth`) continue to the
-  ancestor and never honour a raw key of an unparseable policy.
+  (`require_approval_above_depth`, `skill_promotion_min_depth`) keep walking to
+  the ancestor and never honour a raw key of an unparseable policy.
   `memory_namespace_get_standard` and the capabilities `rule_summary` report
   the effective severed (Owner-floored) policy with `corrupt: true`, not the
   permissive default. Whole-`metadata` corruption also loses the stored owner
   id: the corrupt level has no owner, so the nearest ancestor standard's owner (if any) is the namespace owner, otherwise nobody is until the binding is repaired (fail closed).
-- **Documented limit (depth knobs).** A corrupt level also cannot state
-  `require_approval_above_depth` / `skill_promotion_min_depth`: those walks
-  continue to the ancestor (an ancestor's explicit value governs; with none,
-  the documented default applies, i.e. no approval gate), while the Owner floor
+- **Documented limit (depth knobs).** The depth walks are leaf-first-wins
+  (#2542): an explicit integer at the nearest level decides; an explicit `null`
+  or a missing standard keeps walking; a well-formed policy that **omits** the
+  key means no gate at that level and the walk **stops** (it is not
+  inherited from the ancestor). A corrupt level keeps walking and never
+  contributes a raw key. A walk that passed a corrupt level and ends without an
+  explicit value fails closed instead of reading as "no gate": the approval
+  threshold resolves to `0` (every reflection needs approval) and the
+  skill-promotion floor to `u32::MAX` (no promotion), until the standard is
+  repaired. This includes a corrupt leaf under a well-formed parent that omits
+  the key. Only a chain with no corrupt level and no explicit value keeps the
+  documented default (no approval gate; promotion floor 1). The Owner floor
   still gates WRITE at the corrupt level. A corrupt level that meant a stricter
-  depth gate degrades to the inherited one until repaired. For the skill
-  promotion floor only, a walk that passes a corrupt level and finds no explicit
-  value fails closed to `u32::MAX` (no promotion) until the standard is
-  repaired; an unconfigured chain keeps the default of 1.
+  depth gate than the inherited one degrades to the inherited value until
+  repaired. Caveat: because an omitting child escapes the parent's gate, that
+  is safe only once #4356 (the ancestor-owner bind gate) lands.
 - **Repair.** Re-run `memory_namespace_set_standard` for the namespace with a
   valid policy; the row is then read normally and no floor is applied.
 - **Documented limit.** A corrupt policy that *meant* something stricter than
