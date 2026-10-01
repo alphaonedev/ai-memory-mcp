@@ -436,3 +436,113 @@ async fn pg_link_replay_locks_endpoints_in_id_order_4210() {
         "no lock cycle: replay={replay_out:?}, writer={writer:?}"
     );
 }
+
+/// #4459 — consolidate locks its sources in ascending BYTEWISE id order, not the
+/// database default collation. `B-…` sorts before `a-…` bytewise but after it in
+/// a locale collation (en_US), so a default-collation `ORDER BY id FOR UPDATE`
+/// takes `a` first. The ascending (`COLLATE "C"`) writer holds `B` and waits for
+/// nothing yet; consolidate (default order) takes `a` and parks on `B`; the
+/// writer's next lock, `a`, closes the cycle (40P01 on the writer, which checks
+/// first). Bytewise: consolidate parks on `B` holding nothing, the writer takes
+/// `a`, commits, and both finish. A bytewise-default database cannot invert, so
+/// the cell has nothing to prove there and returns.
+#[tokio::test]
+async fn pg_consolidate_locks_bytewise_not_default_collation_4459() {
+    let _serial = SERIAL.lock().await;
+    let Some(store) = connect().await else {
+        return;
+    };
+    let ns = format!("lock4459-{}", uuid::Uuid::new_v4().simple());
+    let (lo, hi) = (format!("B-{ns}"), format!("a-{ns}"));
+    let locale_inverts: bool = sqlx::query_scalar("SELECT $2::text < $1::text")
+        .bind(&lo)
+        .bind(&hi)
+        .fetch_one(store.pool())
+        .await
+        .expect("compare default collation");
+    if !locale_inverts {
+        eprintln!(
+            "database default collation is bytewise: no inversion possible, nothing to prove"
+        );
+        return;
+    }
+    let ctx = CallerContext::for_agent("ai:tester");
+    for id in [&lo, &hi] {
+        store
+            .store(&ctx, &mem(&ns, id.clone(), "ai:tester"))
+            .await
+            .expect("seed row");
+    }
+    // Ascending writer, first half: `B` (the bytewise-lower id).
+    let mut writer = store.pool().begin().await.expect("writer tx");
+    let writer_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *writer)
+        .await
+        .expect("writer pid");
+    // The writer asks for its second row while consolidate is already waiting
+    // on `B`; a short check delay on the writer makes the writer, not the
+    // consolidate retry-free path, surface a cycle as 40P01.
+    sqlx::query("SET LOCAL deadlock_timeout = '100ms'")
+        .execute(&mut *writer)
+        .await
+        .expect("writer deadlock check delay");
+    sqlx::query("SELECT id FROM memories WHERE id = $1 FOR UPDATE")
+        .bind(&lo)
+        .fetch_one(&mut *writer)
+        .await
+        .expect("writer locks the bytewise-lower row");
+
+    let s = Arc::clone(&store);
+    let (ids, ns2) = (vec![hi.clone(), lo.clone()], ns.clone());
+    let consolidate = tokio::spawn(async move {
+        s.consolidate(
+            &CallerContext::for_agent("ai:tester"),
+            &ids,
+            &format!("consolidated-{ns2}"),
+            "summary",
+            &ns2,
+            &Tier::Mid,
+            "test",
+            "ai:tester",
+        )
+        .await
+        .map_err(|e| e.to_string())
+    });
+    let parked = blocked_backend(&store, writer_pid).await;
+    assert_ne!(parked, writer_pid, "independent transactions");
+    // Ascending writer, second half: the bytewise-higher row, then commit.
+    let writer_result: Result<(), String> = async {
+        sqlx::query("SELECT id FROM memories WHERE id = $1 FOR UPDATE")
+            .bind(&hi)
+            .fetch_optional(&mut *writer)
+            .await
+            .map_err(|e| e.to_string())?;
+        sqlx::query("UPDATE memories SET priority = priority WHERE id = ANY($1)")
+            .bind([lo.clone(), hi.clone()].as_slice())
+            .execute(&mut *writer)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+    .await;
+    let writer_result = match writer_result {
+        Ok(()) => writer.commit().await.map_err(|e| e.to_string()),
+        Err(e) => {
+            drop(writer);
+            Err(e)
+        }
+    };
+    let consolidated = tokio::time::timeout(Duration::from_secs(60), consolidate)
+        .await
+        .expect("consolidate finishes")
+        .expect("join consolidate");
+    assert!(
+        writer_result.is_ok() && consolidated.is_ok(),
+        "no lock cycle: writer={writer_result:?}, consolidate={consolidated:?}"
+    );
+    sqlx::query("DELETE FROM memories WHERE namespace = $1")
+        .bind(&ns)
+        .execute(store.pool())
+        .await
+        .expect("cleanup rows");
+}
