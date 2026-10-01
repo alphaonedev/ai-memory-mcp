@@ -485,7 +485,7 @@ Series an operator should wire alerts to (canonical registration:
 | `ai_memory_log_last_delivery_seconds` | gauge | UNIX time of the most recent successful log delivery. Absent until the first delivery; never `0` (#3651). |
 | `ai_memory_audit_trail_active` | gauge | 1 when the flat audit trail (`[audit].enabled`) is recording in this process; 0 when auditing is off (#3975). |
 | `ai_memory_audit_records_written_total` | counter | Audit events written and flushed without error. Present only while the trail is active (#3975). |
-| `ai_memory_audit_write_failures_total` | counter | Audit events lost to a failed write or flush; any increase is a gap in the trail (#3975). |
+| `ai_memory_audit_write_failures_total` | counter | Audit writes or flushes that failed; each may be a lost event (a failed flush whose line reached the file leaves no gap). Run `ai-memory audit verify` for the actual gaps (#3975). |
 | `ai_memory_audit_last_write_seconds` | gauge | UNIX time of the most recent successful audit write. Absent until the first write; never `0` (#3975). |
 | `ai_memory_recall_embed_degraded_total` | counter | Recalls that exceeded `AI_MEMORY_RECALL_EMBED_BUDGET_MS` and degraded to keyword (#2577). |
 | `ai_memory_rerank_budget_degraded_total` | counter | Recalls whose cross-encoder stage was skipped pre-flight under `AI_MEMORY_RERANK_BUDGET_MS`, shipping the hybrid ordering (#2608). |
