@@ -163,7 +163,7 @@ pub(crate) fn observe_and_release_sqlite(
         "UPDATE memories SET lifecycle_state = ?1, \
          metadata = CASE WHEN json_valid(metadata) THEN CASE WHEN json_type(metadata) = 'object' \
          THEN json_remove(metadata, '$.' || ?2) ELSE '{}' END ELSE '{}' END, \
-         updated_at = ?3, version = version + 1 WHERE id = ?4 AND lifecycle_state = ?5",
+         updated_at = ?3, version = MIN(version, 9223372036854775806) + 1 WHERE id = ?4 AND lifecycle_state = ?5",
         rusqlite::params![
             plan.target.as_str(),
             super::CONTAMINATION_METADATA_KEY,

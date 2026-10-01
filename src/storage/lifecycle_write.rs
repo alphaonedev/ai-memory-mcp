@@ -81,7 +81,7 @@ pub fn set_lifecycle_state(
             .into());
         }
         let n = conn.execute(
-            "UPDATE memories SET lifecycle_state = ?1, updated_at = ?2, version = version + 1 \
+            "UPDATE memories SET lifecycle_state = ?1, updated_at = ?2, version = MIN(version, 9223372036854775806) + 1 \
              WHERE id = ?3 AND lifecycle_state = ?4",
             params![state.as_str(), Utc::now().to_rfc3339(), id, current_str],
         )?;

@@ -110,6 +110,8 @@ mod swarm_rewind;
 mod lifecycle_tx_3152;
 // #4199 A1 — the postgres forensic-sink outage recorder (qual_10 budget).
 mod forensic_outage_4199;
+mod merge_version_4216;
+mod version_repair_4371;
 
 use crate::models::field_names;
 use std::time::Duration;
@@ -2116,7 +2118,7 @@ const MIGRATION_V48_FEDERATION_PUSH_DLQ: &str =
 //       has carried these since v56, so its v88 is a no-op; doc twins
 //       migrations/{postgres/0045,sqlite/0072}_v88_list_composite_indexes.sql.
 //       CURRENT_SCHEMA_VERSION stays pinned in lockstep with sqlite.
-const CURRENT_SCHEMA_VERSION: i32 = 100;
+const CURRENT_SCHEMA_VERSION: i32 = 101;
 
 /// PostgreSQL session-scoped advisory lock key used to serialize
 /// concurrent `migrate()` invocations across processes and across
@@ -4301,8 +4303,11 @@ impl PostgresStore {
         if current_version < 99 {
             self.migrate_v99().await?;
         }
-        if current_version < CURRENT_SCHEMA_VERSION {
+        if current_version < 100 {
             self.migrate_v100().await?;
+        }
+        if current_version < CURRENT_SCHEMA_VERSION {
+            self.migrate_v101().await?;
         }
 
         Ok(())
@@ -7479,6 +7484,29 @@ impl PostgresStore {
         Ok(())
     }
 
+    /// v101 (#4371) — clamp `version` counters a peer pinned above the
+    /// replicated ceiling before the #4218 bound, in one transaction with the
+    /// stamp. Data-only, idempotent; twin of the sqlite `migrate_v101`.
+    async fn migrate_v101(&self) -> StoreResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v101 version-repair migration tx", e))?;
+        let (memories, archived) = version_repair_4371::repair_poisoned_versions(&mut tx).await?;
+        record_schema_version(&mut tx, 101).await?;
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v101 migration", e))?;
+        tracing::info!(
+            target: TRACE_TARGET,
+            memories,
+            archived,
+            "schema migration v101 applied (#4371: version counters above the replicated ceiling clamped)"
+        );
+        Ok(())
+    }
+
     async fn migrate_v98(&self) -> StoreResult<()> {
         debug_assert!(
             MIGRATION_V98_CANONICAL_INBOX_NAMESPACE.contains("archived_memories"),
@@ -8637,7 +8665,14 @@ impl PostgresStore {
                 .map_err(|e| to_store_err("archive prior content in_place_edit", e))?;
         }
 
-        let new_version = current + 1;
+        // #4218 — checked: a counter at the i64 edge fails the update cleanly
+        // (the tx rolls back on drop) instead of panicking in debug / wrapping
+        // to a negative version in release.
+        let new_version = current
+            .checked_add(1)
+            .ok_or_else(|| StoreError::IntegrityFailed {
+                detail: format!("version counter exhausted for memory {id} (#4218)"),
+            })?;
         // v0.7.0 Provenance Gap 2 (#906) — source_uri ($10) follows
         // COALESCE semantics so a patch that omits source_uri leaves
         // the stored value alone. The expected_version gate is shifted
@@ -25240,6 +25275,15 @@ impl MemoryStore for PostgresStore {
             .begin()
             .await
             .map_err(|e| to_store_err("begin apply_remote_memory tx", e))?;
+        // #4216 / #4218 — the slot row's user data + version (locked), and the
+        // inbound version bounded against it.
+        let slot_pre =
+            merge_version_4216::read_slot_preimage(&mut tx, &memory.title, &memory.namespace)
+                .await?;
+        let bounded_version = crate::models::replicated_version::bounded_inbound_version(
+            memory.version,
+            slot_pre.as_ref().map(|p| p.version),
+        );
         // #2954 — armed-only pre-image of the `(title, namespace)` row this
         // upsert may overwrite, `SELECT … FOR UPDATE` inside this tx so the
         // probe and the newer-wins upsert are atomic under READ COMMITTED (the
@@ -25525,7 +25569,7 @@ impl MemoryStore for PostgresStore {
         .bind(confidence_decayed_at)
         .bind(memory.entity_id.as_ref())
         .bind(memory.persona_version)
-        .bind(memory.version)
+        .bind(bounded_version)
         .bind(mentioned_entity_id.as_deref())
         .bind(memory.lifecycle_state.as_str())
         .bind(&remote_cid.cid)
@@ -25579,6 +25623,8 @@ impl MemoryStore for PostgresStore {
         // `encrypted_envelope` MUST open under the row's persisted
         // `metadata.agent_id`.
         reconcile_envelope_owner(&mut *tx, &applied_id, &memory.content, &remote_seal).await?;
+        merge_version_4216::bump_if_user_data_changed(&mut tx, slot_pre.as_ref(), &applied_id)
+            .await?;
         // APPEND-ONLY-SANCTIONED (#1823 G6 / #2954) — COW SUPERSEDE: the
         // federation newer-wins upsert above rewrote an existing `(title,
         // namespace)` row's durable `content` in place ONLY when the inbound
@@ -25713,11 +25759,13 @@ impl MemoryStore for PostgresStore {
         // primary LWW key) to a freshness ceiling (identical to the sqlite
         // `db::merge_inbound` boundary, no per-backend drift) so an enrolled
         // relay cannot win the merge by stamping a far-future timestamp.
-        let prepared = crate::models::clamp_inbound_updated_at(
+        let mut prepared = crate::models::clamp_inbound_updated_at(
             sanitized,
             &chrono::Utc::now().to_rfc3339(),
             crate::identity::attest::ATTEST_CREATED_AT_SKEW_SECS,
         );
+        // #4218 — bound the peer's version against the local row.
+        crate::models::replicated_version::bound_inbound_row(&mut prepared, &existing);
         let merged = crate::models::merge_memory(&existing, &prepared);
         // #2863 — atomic `agent_attested` re-assert (postgres twin of the sqlite
         // `db::merge_inbound` path): `sanitize` above demoted the inbound level
@@ -25728,8 +25776,11 @@ impl MemoryStore for PostgresStore {
         // restored level flows into the `metadata` column encoded below, so it is
         // written in the SAME UPDATE (atomic, no crash window). No-op when
         // `receiver_verified` is false.
-        let merged =
+        let mut merged =
             crate::models::reassert_verified_attestation(merged, inbound, receiver_verified);
+        // #4216 — a merge that changed user data moves the version (the shared
+        // predicate, evaluated in this tx against the `FOR UPDATE` row).
+        crate::models::replicated_version::apply_version_rule(&existing, &mut merged);
 
         // Encode the JSON-shaped columns the same way the
         // `apply_remote_memory` insert path does.
@@ -26790,7 +26841,7 @@ impl MemoryStore for PostgresStore {
         // mirrors what the original ordered sequence saw.
         sqlx::query(
             "UPDATE memories SET
-                access_count = LEAST(access_count + 1, 1000000),
+                access_count = LEAST(LEAST(access_count, 1000000) + 1, 1000000),
                 last_accessed_at = NOW(),
                 expires_at = CASE
                     WHEN tier = 'long' THEN expires_at
@@ -29423,7 +29474,7 @@ impl MemoryStore for PostgresStore {
                      GROUP BY memory_id
                 )
                 UPDATE memories m SET
-                    access_count = LEAST(m.access_count + a.n, 1000000),
+                    access_count = LEAST(LEAST(m.access_count, 1000000) + a.n, 1000000),
                     last_accessed_at = GREATEST(
                         COALESCE(m.last_accessed_at, a.t_max), a.t_max),
                     expires_at = CASE

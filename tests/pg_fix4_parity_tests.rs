@@ -267,8 +267,10 @@ fn sqlite_insert_if_newer_persists_remote_version_1631() {
             r.get(0)
         })
         .expect("read merged version");
+    // #4216: GREATEST(9, 2) = 9 (no rollback, #1631) and the merge replaced the
+    // content (a user-data change), so the version moves one past it.
     assert_eq!(
-        v2, 9,
-        "#1631: version merges via MAX(local, remote) — no rollback"
+        v2, 10,
+        "#1631/#4216: version merges via GREATEST(local, remote) + 1 for a data change — no rollback"
     );
 }

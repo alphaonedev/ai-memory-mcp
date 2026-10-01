@@ -150,6 +150,11 @@ pub const PRINCIPAL: &str = "principal";
 pub const SUITE_TAG: &str = "suite_tag";
 /// `session_id` — optional presence-encoded session id key.
 pub const SESSION_ID: &str = "session_id";
+/// `crdt_field_clocks` — v1.0.0 #4031 reserved metadata key carrying the
+/// per-field versions of values a CRDT merge RETAINED from an operand older
+/// than the merged row (see `models::crdt_field_clock`). Written only by
+/// `merge_memory`; replicated with the row so every peer joins identically.
+pub const CRDT_FIELD_CLOCKS: &str = "crdt_field_clocks";
 /// `version_vector` — per-memory CRDT vector-clock metadata key (#1756 /
 /// #1719 item 2). Lives inside `metadata`; merged by pointwise-max.
 pub const VERSION_VECTOR: &str = "version_vector";
