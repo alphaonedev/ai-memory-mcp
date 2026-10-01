@@ -32610,27 +32610,15 @@ impl MemoryStore for PostgresStore {
         }
         // #4416/F3 — a marked row's effect already landed (the marker is only
         // written server-side, after an effect): never run it a second time.
-        if crate::storage::payload_has_effect_marker(&pa.payload) {
-            if let Err(e) = self
-                .pg_emit_pending_action_event(
-                    &pa,
-                    crate::storage::PENDING_ACTION_APPROVED_EVENT,
-                    pa.decided_by.as_deref(),
-                )
-                .await
-            {
-                tracing::warn!(
-                    target: crate::signed_events::SIGNED_EVENTS_TRACE_TARGET,
-                    pending_id = %pending_id,
-                    "failed to append pending_action.approved audit row: {e}"
-                );
-            }
-            return Ok(None);
-        }
-        let memory_id = self.pg_execute_pending_effect(ctx, &pa).await?;
-        // #4345 — stamp the execution marker (best-effort: the effect already
-        // committed; see `postgres/pending_approve_execute_4025.rs`).
-        self.pg_mark_effect_applied(pending_id).await;
+        let memory_id = if crate::storage::payload_has_effect_marker(&pa.payload) {
+            None
+        } else {
+            let id = self.pg_execute_pending_effect(ctx, &pa).await?;
+            // #4345 — stamp the execution marker (best-effort: the effect
+            // already committed; see `postgres/pending_approve_execute_4025.rs`).
+            self.pg_mark_effect_applied(pending_id).await;
+            id
+        };
         // v1.0.0 #3180 (v0.7.0 S5-M1) — append the `pending_action.approved`
         // audit row AFTER the side-effecting write succeeded, so the chain
         // reflects the post-execute state (byte-identical placement to the
