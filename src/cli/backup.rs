@@ -1435,13 +1435,17 @@ fn run_backup_with(
             |r| r.get(0),
         )
         .context("counting memories in the source DB")?;
-    let schema_version: i64 = conn
-        .query_row(
-            crate::storage::migrations::SELECT_SCHEMA_VERSION_SQL,
-            [],
-            |r| r.get(0),
-        )
-        .context("reading the source DB schema version")?;
+    // v1.0.0 #4323 — read the stamp through the tri-state probe, never a bare
+    // `SELECT … FROM schema_version`. A populated store whose relation was
+    // DROPPED (not merely emptied) is exactly the #2564 incident whose refusal
+    // tells the operator to back up first; the bare query failed with
+    // `no such table` there and produced no snapshot. The manifest records the
+    // DIAGNOSTIC reading (`version()`): an absent or destroyed stamp lands as
+    // an explicit 0 (or its raw negative value), the same value the
+    // `DELETE FROM schema_version` shape always recorded.
+    let schema_version: i64 = crate::storage::probe_schema_stamp(&conn)
+        .context("reading the source DB schema version")?
+        .version();
     let ts = chrono::Utc::now().format(BACKUP_TS_FMT).to_string();
     let snapshot_name = format!("ai-memory-{ts}.db");
     let snapshot_path = args.to.join(&snapshot_name);
