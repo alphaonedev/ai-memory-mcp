@@ -40,8 +40,10 @@ CapabilityBoundingSet=
 AmbientCapabilities=
 # `backup` opens the database through the unmigrated egress funnel (#4207): it
 # never migrates, so a newer binary on disk cannot upgrade the live primary
-# under a still-running older daemon. The grant covers the WAL/SHM sidecars SQLite
-# keeps beside the database file and the backups directory, nothing else.
+# under a still-running older daemon. The grant is the whole state directory
+# (/var/lib/ai-memory): SQLite needs to create the WAL/SHM sidecars beside the
+# database file, and the backups directory lives under it. This is wider than
+# the pre-#4080 read-only database path and is a deliberate loosening.
 ReadWritePaths=/var/lib/ai-memory
 
 TimeoutStartSec=15min
