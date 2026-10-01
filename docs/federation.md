@@ -272,7 +272,15 @@ the `x-peer-id` HTTP header) to a `PeerScope`
 > `restores[]`, `action_transitions[]`, `checkpoints[]`,
 > `namespace_meta`, and the catchup pull-accept path
 > (`src/federation/receive.rs::catchup_memory_namespace_authorized`,
-> [#2480](https://github.com/alphaonedev/ai-memory-mcp/issues/2480)).
+> [#2480](https://github.com/alphaonedev/ai-memory-mcp/issues/2480);
+> the stored-namespace probe on that pull path landed with
+> [#3195](https://github.com/alphaonedev/ai-memory-mcp/issues/3195) —
+> before it the helper passed `existing_namespace: None`, so the pull
+> lane checked only the CLAIMED namespace). On the pull path the probe
+> (`MemoryStore::namespace_by_id`, the scalar projection) runs whenever
+> Layer 1 is armed for that peer; a probe error skips the row AND halts
+> the catch-up watermark so the row is re-pulled, and a scope refusal
+> skips the row and also halts the watermark (#3233).
 > An endpoint whose namespace cannot be resolved is REFUSED, not
 > admitted under a scoped posture. With no allowlist, the default namespace
 > requirement refuses writes; only the explicit Standard `=0` opt-out
