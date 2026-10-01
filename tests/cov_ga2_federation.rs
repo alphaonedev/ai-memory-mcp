@@ -577,7 +577,7 @@ async fn sync_push_replayed_action_transition_refused_1805() {
         };
         ai_memory::actions::create(&conn, &action).expect("seed action");
     }
-    let nonce = b"cov-ga2-replay-nonce".to_vec();
+    let nonce = b"cov-ga2-replay-1".to_vec();
     let signable = ai_memory::identity::sign::SignableTransition {
         action_id: "cov-ga2-act-replay",
         namespace: ns,
@@ -619,7 +619,8 @@ async fn sync_push_replayed_action_transition_refused_1805() {
         "first signed tx applies; body={b1}"
     );
     // Second delivery: byte-identical signed op, fresh outer envelope →
-    // the (peer, base64(nonce)) is already recorded → refused PRE-CAS.
+    // the durable (action_id, nonce) identity is already recorded → an
+    // idempotent noop (#4204), nothing re-applied.
     let (s2, b2) = decode(&r, push_req(&make_body(), &[(PEER_HEADER, actor)])).await;
     unsafe {
         std::env::remove_var(ai_memory::federation::signing::REQUIRE_SIG_ENV);
@@ -635,14 +636,14 @@ async fn sync_push_replayed_action_transition_refused_1805() {
         0,
         "replayed tx must NOT re-apply; body={b2}"
     );
-    assert!(
-        b2["skipped"].as_i64().unwrap_or(0) >= 1,
-        "#1805: replayed nonce is refused (skipped), not a CAS noop; body={b2}"
-    );
     assert_eq!(
-        b2["noop"].as_i64().unwrap_or(-1),
+        b2["skipped"].as_i64().unwrap_or(-1),
         0,
-        "#1805: replay never reaches the CAS, so noop stays 0; body={b2}"
+        "#4204: a re-delivery of an applied op is never skipped; body={b2}"
+    );
+    assert!(
+        b2["noop"].as_i64().unwrap_or(0) >= 1,
+        "#1805/#4204: the replay is an idempotent noop and never re-applies; body={b2}"
     );
     // The action is claimed exactly once.
     let conn = ai_memory::db::open(t.path()).expect("verify conn");

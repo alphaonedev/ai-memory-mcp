@@ -611,7 +611,7 @@ async fn pg_sync_push_via_store_applies_action_transition() {
         .expect("seed unsigned action");
 
     let r = pg_router(&url).await;
-    let nonce = b"cov-ga2-pg-tx-nonce".to_vec();
+    let nonce = b"cov-ga2-pg-nonce".to_vec();
     let signable = ai_memory::identity::sign::SignableTransition {
         action_id: &aid_signed,
         namespace: &ns,
