@@ -11,6 +11,13 @@
 //! The assembled body must instead take #4029's in-transaction
 //! `admit_or_tombstoned` + stripe advisory lock, with lock order: stripe
 //! advisory lock -> row `FOR UPDATE` -> authorizer.
+//!
+//! NOTE for #4216/#4218 (PR #4348): it edits the pg `merge_inbound` body in
+//! `postgres.rs`. That body MOVED here, so git will show a conflict on deleted
+//! lines; its hunks must be PORTED into this file, not re-applied to
+//! `postgres.rs`. Its `read_slot_preimage` `FOR UPDATE` goes AFTER #4029's
+//! `admit_or_tombstoned` stripe lock (stripe -> row `FOR UPDATE` ->
+//! authorizer, CONCURRENCY-04).
 
 use super::*;
 
