@@ -943,6 +943,118 @@ async fn sqlite_forged_floor_is_refused_f2r() {
     forged_floor_is_refused(&Backend::Sqlite).await;
 }
 
+// ------------------- f2r round 2: rank laundering on the visibility register ---
+
+/// `2026-09-26T00:00:<sec>.000000Z`.
+fn t(sec: u32) -> String {
+    format!("2026-09-26T00:00:{sec:02}.000000Z")
+}
+
+/// A clock map binding `row` with `leaf` entries `(path, at, fingerprint)`.
+fn clock_map(row: u32, leaves: &[(&str, u32, &str)]) -> Value {
+    let leaf: serde_json::Map<String, Value> = leaves
+        .iter()
+        .map(|(p, at, fp)| ((*p).to_string(), json!([t(*at), fp])))
+        .collect();
+    json!({"v": 1, "row": t(row), "leaf": leaf})
+}
+
+/// f2r's counterexample: a={u:20, scope:collective}; b={u:22, ATTESTED, leaf
+/// /scope ABSENT@19}; c={u:21, leaf /scope ABSENT@20}. The merged row's
+/// attest_level used to supply the register rank, so a value that landed in an
+/// attested row inherited rank 1 and the verdict depended on the grouping:
+/// (a|b)|c stayed collective while a|(b|c) was private.
+fn laundering_rows() -> [Memory; 3] {
+    let a = mem_at(&t(20), json!({"scope": "collective"}));
+    let b = mem_at(
+        &t(22),
+        json!({
+            "attest_level": "agent_attested",
+            "crdt_field_clocks": clock_map(22, &[("/scope", 19, "absent")]),
+        }),
+    );
+    let c = mem_at(
+        &t(21),
+        json!({"crdt_field_clocks": clock_map(21, &[("/scope", 20, "absent")])}),
+    );
+    [a, b, c]
+}
+
+#[test]
+fn pure_visibility_register_never_fails_open_by_grouping_rank_laundering() {
+    use ai_memory::models::merge_memory as j;
+    let [a, b, c] = laundering_rows();
+    let groupings = [
+        ("(a|b)|c", j(&j(&a, &b), &c)),
+        ("c|(a|b)", j(&c, &j(&a, &b))),
+        ("a|(b|c)", j(&a, &j(&b, &c))),
+        ("(a|c)|b", j(&j(&a, &c), &b)),
+        ("b|(a|c)", j(&b, &j(&a, &c))),
+        ("(b|c)|a", j(&j(&b, &c), &a)),
+    ];
+    for (name, m) in &groupings {
+        assert!(
+            m.metadata.get("scope").is_none(),
+            "{name} kept `scope` (fails OPEN): {}",
+            m.metadata
+        );
+    }
+}
+
+#[test]
+fn pure_equal_version_present_vs_absent_absence_wins_regardless_of_rank() {
+    use ai_memory::models::merge_memory as j;
+    // Equal version, and the PRESENT side carries the higher attestation rank.
+    let present = mem_at(
+        &t(20),
+        json!({"attest_level": "agent_attested", "scope": "collective"}),
+    );
+    let absent = mem_at(&t(20), json!({}));
+    for m in [j(&present, &absent), j(&absent, &present)] {
+        assert!(m.metadata.get("scope").is_none(), "{}", m.metadata);
+    }
+}
+
+async fn rank_laundering_converges_private_in_every_order(backend: &Backend) {
+    let peer = uniq("ai:peer-f2r2");
+    let ns = uniq("fit-f2r2");
+    let _posture = Posture::new(&peer, &ns);
+    let [a, b, c] = laundering_rows();
+    let rows = [a, b, c];
+    let orders: [[usize; 3]; 6] = [
+        [0, 1, 2],
+        [0, 2, 1],
+        [1, 0, 2],
+        [1, 2, 0],
+        [2, 0, 1],
+        [2, 1, 0],
+    ];
+    for order in orders {
+        let n = node(backend).await;
+        let id = uniq("mrank");
+        for i in order {
+            let mut v = serde_json::to_value(&rows[i]).expect("serialize");
+            v["id"] = json!(id);
+            v["namespace"] = json!(ns);
+            v["title"] = json!(format!("merge convergence probe {id}"));
+            v["metadata"]["agent_id"] = json!(peer);
+            n.push(&peer, &v).await;
+        }
+        let got = n.read(&id).await;
+        assert!(
+            got.metadata.get("scope").is_none(),
+            "order {order:?} left `scope` set (fails OPEN): {}",
+            got.metadata
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sqlite_rank_laundering_converges_private_in_every_order_f2r() {
+    let _g = FED_ENV_LOCK.lock().await;
+    rank_laundering_converges_private_in_every_order(&Backend::Sqlite).await;
+}
+
 // ---------------------------------------------------------- postgres -----
 
 #[cfg(feature = "sal-postgres")]
@@ -997,6 +1109,14 @@ mod pg {
         let _g = FED_ENV_LOCK.lock().await;
         let Some(backend) = pg_backend() else { return };
         visibility_absence_survives_a_stale_replay(&backend).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs AI_MEMORY_TEST_POSTGRES_URL"]
+    async fn pg_rank_laundering_converges_private_in_every_order_f2r() {
+        let _g = FED_ENV_LOCK.lock().await;
+        let Some(backend) = pg_backend() else { return };
+        rank_laundering_converges_private_in_every_order(&backend).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

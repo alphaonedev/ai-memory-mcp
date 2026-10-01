@@ -609,7 +609,12 @@ impl FieldClockMerge {
             }
             let path = child_path("", key);
             let (l, r) = (local.get(key), remote.get(key));
-            let merged = if absence_versioned.contains(&key) && (l.is_none() || r.is_none()) {
+            // A visibility key is a version-only register unless an operand
+            // carries an object there (a forged shape: the generic join handles it).
+            let register = absence_versioned.contains(&key)
+                && !l.is_some_and(Value::is_object)
+                && !r.is_some_and(Value::is_object);
+            let merged = if register {
                 self.merge_register_with_absence(&path, l, r)
             } else {
                 self.merge_node(&path, l, r, None)
@@ -621,10 +626,14 @@ impl FieldClockMerge {
         out
     }
 
-    /// A top-level key as an LWW register whose values include ABSENCE (at
-    /// least one side lacks it). Order: `(version, attestation rank,
-    /// absent-first, fingerprint)` — at an exactly equal version and rank the
-    /// ABSENCE wins, so an equal-clock collision fails CLOSED (narrower).
+    /// A top-level key as an LWW register whose values include ABSENCE.
+    /// Order: `(version, absent-first, fingerprint)` — the attestation rank is
+    /// deliberately NOT part of it (f2r, rank laundering): a rank read from
+    /// the merged row would let a value that landed in an attested row carry
+    /// rank 1 into the next merge, making the verdict depend on the merge
+    /// grouping and failing OPEN. At an exactly equal version the ABSENCE
+    /// wins, so an equal-clock collision fails CLOSED (narrower) in every
+    /// grouping.
     fn merge_register_with_absence(
         &mut self,
         path: &str,
@@ -632,13 +641,8 @@ impl FieldClockMerge {
         r: Option<&Value>,
     ) -> Option<Merged> {
         let cand = |side: &Side, v: Option<&Value>| match v {
-            Some(v) => (side.node_ver(path, v), side.rank, 0_u8, fingerprint(v)),
-            None => (
-                side.absent_ver(path),
-                side.rank,
-                1_u8,
-                ABSENT_FP.to_string(),
-            ),
+            Some(v) => (side.node_ver(path, v), 0_u8, fingerprint(v)),
+            None => (side.absent_ver(path), 1_u8, ABSENT_FP.to_string()),
         };
         let lc = cand(&self.local, l);
         let rc = cand(&self.remote, r);

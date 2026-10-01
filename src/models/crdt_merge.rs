@@ -99,8 +99,31 @@
 //!   flip is decided by `(version, rank, fingerprint)`, and which floor is
 //!   recorded depends on grouping);
 //! * the visibility keys fail CLOSED at a tie: an absence beats a presence
-//!   at equal `(version, rank)`; two different PRESENT values tie-break on
-//!   their fingerprint (deterministic, not "most restrictive").
+//!   at an equal VERSION, whatever the attestation rank of either row; two
+//!   different PRESENT values tie-break on their fingerprint (deterministic,
+//!   not "most restrictive"). The visibility register compares version only
+//!   because the rank is read from the MERGED row's `attest_level`: a value
+//!   that landed in an attested row would carry rank 1 into the next merge
+//!   and the verdict would then depend on the merge grouping (f2r, rank
+//!   laundering; cell
+//!   `pure_visibility_register_never_fails_open_by_grouping_rank_laundering`);
+//! * the same rank laundering leaves an associativity residual for the
+//!   NON-visibility keys at an equal clock: with `a = {u:20, k:"x"}`,
+//!   `b = {u:20, attested}` and `c = {u:21, k:"y", leaf /k@20}`, `(a|b)|c`
+//!   keeps `"x"` while the other groupings keep `"y"`. Ordinary data only, it
+//!   never changes who can read a row.
+//!
+//! **Share revocation by an unrelated newer row (availability, fail closed).**
+//! A MISSING visibility key is dated at its row's clock, so any peer row newer
+//! than a share's own version revokes that share even when the peer never
+//! received it: local `{u:34, target_agent_id:"bob"@22, scope:"collective"@22}`
+//! merged with `{u:31, note:"y"}` loses both keys in both orders (plain
+//! row-LWW would have kept them). This is the design: an absence is a
+//! statement "as of this clock", so the merge can only narrow, never widen.
+//! It is operator-visible: a share made on one node can be revoked by an
+//! unrelated concurrent edit on a node that never saw it. To recover, the
+//! owner re-shares (a new write of `scope` / `target_agent_id` carries a fresh
+//! version that beats every older absence).
 //!
 //! **Clock-map bytes are not convergent.** The merged VALUES converge; the
 //! reserved `metadata.crdt_field_clocks` object can differ in BYTES between
