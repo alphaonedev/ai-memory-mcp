@@ -2556,7 +2556,7 @@ impl OllamaClient {
         let url = reqwest::Url::parse(&self.base_url).ok();
         let host = url
             .as_ref()
-            .and_then(|u| u.host_str().map(str::to_string))
+            .and_then(crate::governance::host::egress_host)
             .unwrap_or_else(|| crate::url_display::url_origin(&self.base_url));
         let scheme = url
             .as_ref()
