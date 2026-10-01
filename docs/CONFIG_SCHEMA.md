@@ -319,7 +319,12 @@ path                        = "~/.local/state/ai-memory/audit/"   # dir or file
 schema_version              = 1       # reserved; must equal the binary's emitted version
 redact_content              = true    # v1 only supports true (no content field on the wire)
 hash_chain                  = true    # per-line hash chain (load-bearing tamper evidence)
-attestation_cadence_minutes = 60      # periodic CHECKPOINT.sig marker; 0 disables
+attestation_cadence_minutes = 60      # reserved: v1.0.0 emits no periodic CHECKPOINT.sig marker;
+                                      # a nonzero effective cadence warns when audit is enabled,
+                                      # and an effective 0 suppresses that warning. Compliance
+                                      # cadence overrides only change the reserved value.
+                                      # Anti-truncation evidence uses the separate signed_events
+                                      # witness/watermark mechanism.
 append_only                 = true    # best-effort platform append-only file flag
 retention_days              = 90      # purge/verify horizon; compliance presets override
 
@@ -340,7 +345,7 @@ retention_days              = 90      # purge/verify horizon; compliance presets
   # pseudonymize_actors       = true
   [audit.compliance.fedramp]
   applied                     = false
-  attestation_cadence_minutes = 15
+  attestation_cadence_minutes = 15   # reserved: changes only the warned value; no marker is emitted
 ```
 
 Each `[audit.compliance.<preset>]` table is a `CompliancePreset`:
@@ -376,7 +381,10 @@ claimed compliance control. This is the operator cutline ruling
 (2026-08-01, §1-condition-2: a compliance defaults-lie is a hard boot
 ERROR); a compliance surface must fail closed, not serve while lying.
 Only `retention_days` and `attestation_cadence_minutes` are actually
-consumed by the preset resolver today.
+consumed by the preset resolver today — and the resolved cadence is
+consumed only by the one-shot reserved-feature WARN (`src/audit.rs`
+`warn_attestation_reserved_once`); no `CHECKPOINT.sig` marker is
+emitted at v1.0.0.
 
 ### `[transcripts]` — transcript lifecycle sweeper (I3)
 
