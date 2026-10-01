@@ -380,7 +380,7 @@ records the original claim.
 ### `mcp`
 
 Run as an MCP tool server over stdio (JSON-RPC 2.0).
-`--profile full` advertises 103 entries (102 callable memory tools + the
+`--profile full` advertises 104 entries (103 callable memory tools + the
 always-on `memory_capabilities` bootstrap; see issue
 [#862](https://github.com/alphaonedev/ai-memory-mcp/issues/862) for the
 disambiguation). Default `--profile core` ships 7 tools + the bootstrap.

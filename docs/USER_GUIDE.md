@@ -49,7 +49,7 @@ Below is an example for **Claude Code** (user scope: merge `mcpServers` into `~/
 
 ### How It Works
 
-With MCP configured, your AI client gains 103 memory tools at `--profile full` (102 callable tools + the always-on `memory_capabilities` bootstrap) (highlights below; see [API_REFERENCE.md](API_REFERENCE.html) for the full reference):
+With MCP configured, your AI client gains 104 memory tools at `--profile full` (103 callable tools + the always-on `memory_capabilities` bootstrap) (highlights below; see [API_REFERENCE.md](API_REFERENCE.html) for the full reference):
 
 - **memory_store** -- Store new knowledge (auto-deduplicates by title+namespace, reports contradictions)
 - **memory_recall** -- Recall relevant memories for the current context (supports `until` date filter)
@@ -77,7 +77,7 @@ Your AI assistant uses these tools automatically during conversations. You can a
 
 ## MCP Tool Reference
 
-This section documents the MCP tools with their exact parameter schemas, example requests, and response formats. **The surface advertises 103 entries at `--profile full`** (102 callable "memory tools" + the always-on `memory_capabilities` bootstrap — both numbers are intentional; see issue [#862](https://github.com/alphaonedev/ai-memory-mcp/issues/862) for the disambiguation). Default `--profile core` exposes 7 (the original 5 + `memory_load_family` + `memory_smart_load`) plus the always-on `memory_capabilities`. Canonical counts on the [evidence page](https://alphaonedev.github.io/ai-memory-mcp/evidence.html) and asserted by `Profile::full().expected_tool_count()` in `src/profile.rs`. All tools are invoked via JSON-RPC 2.0 using method `tools/call` with the tool name in `params.name` and tool parameters in `params.arguments`.
+This section documents the MCP tools with their exact parameter schemas, example requests, and response formats. **The surface advertises 104 entries at `--profile full`** (103 callable "memory tools" + the always-on `memory_capabilities` bootstrap — both numbers are intentional; see issue [#862](https://github.com/alphaonedev/ai-memory-mcp/issues/862) for the disambiguation). Default `--profile core` exposes 7 (the original 5 + `memory_load_family` + `memory_smart_load`) plus the always-on `memory_capabilities`. Canonical counts on the [evidence page](https://alphaonedev.github.io/ai-memory-mcp/evidence.html) and asserted by `Profile::full().expected_tool_count()` in `src/profile.rs`. All tools are invoked via JSON-RPC 2.0 using method `tools/call` with the tool name in `params.name` and tool parameters in `params.arguments`.
 
 `tools/list` descriptions are a compacted gist (32-byte preferred cut, extend to 80 on a dangling last token). Verbose per-tool docs and full schemas live in `memory_capabilities { verbose: true }` — optionally with `family` and `include_schema` to drill one family. The compact `memory_capabilities` label on the wire is `Discover runtime capabilities; full per-tool docs: verbose=true`.
 
