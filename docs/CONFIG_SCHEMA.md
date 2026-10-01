@@ -268,7 +268,9 @@ the SSOT struct declares them.
 ### Top-level operational fields
 
 ```toml
-schema_version = 2          # None/1 = legacy flat parse; >=2 = sectioned parse
+schema_version = 2          # shape MARKER, not a parser selector: omitted/1 =
+                            # legacy shape, >=2 = sectioned shape + enables the
+                            # mixed-legacy-field warning (see below)
 
 # Postgres connection-pool + query bounds (resolved by AppConfig::resolve_pg_pool).
 postgres_pool_max_connections   = 16    # env: AI_MEMORY_PG_POOL_MAX
@@ -286,7 +288,7 @@ mcp_federation_forward_url = "https://localhost:9077"
 
 | Field | Type | Default | Purpose |
 |---|---|---|---|
-| `schema_version` | `u32?` | `1` (legacy) | `>= 2` selects the sectioned parse path; warns if legacy flat fields coexist. |
+| `schema_version` | `u32?` | `1` (legacy) | Advisory shape marker; `>= 2` enables the mixed-legacy-field warning. Does NOT select a parser — see the note below this table. |
 | `postgres_pool_max_connections` | `u32?` | `DEFAULT_MAX_CONNECTIONS` | sqlx `max_connections`; non-positive falls through to default. |
 | `postgres_pool_min_connections` | `u32?` | `DEFAULT_MIN_CONNECTIONS` | sqlx `min_connections` (warm floor). |
 | `postgres_acquire_timeout_secs` | `u64?` | derived from `DEFAULT_ACQUIRE_TIMEOUT` | sqlx `acquire_timeout`, whole seconds. |
@@ -294,6 +296,27 @@ mcp_federation_forward_url = "https://localhost:9077"
 | `request_timeout_secs` | `u64?` | `60` | per-HTTP-request wall-clock cap (H7). |
 | `llm_call_timeout_secs` | `u64?` | `30` | per-LLM-call timeout; on timeout falls back to the LLM-absent path (H8). |
 | `mcp_federation_forward_url` | `String?` | unset (direct SQLite) | when set, MCP-stdio write tools POST to this daemon so federation fanout runs (#318). |
+
+**`schema_version` is an advisory marker, not a parser selector (#4241).**
+
+```text
+schema_version is an optional configuration-shape marker. Omitted/1 denotes
+the legacy shape; values >=2 denote the sectioned shape and enable the
+mixed-legacy-field warning. The loader accepts known flat and sectioned
+fields through the same AppConfig parser, and the resolver precedence
+applies regardless of this marker. It does not by itself select a separate
+parser or prove a future schema is supported.
+```
+
+There is exactly one deserialization on this path: `AppConfig::from_toml_contents`
+runs the deprecation and unknown-key validation
+(`src/config.rs::refuse_unknown_keys`) and then a single
+`toml::from_str` (`src/config.rs:8605`) for every marker value. The
+inspected version predicate (`src/config.rs:8664`) selects only the drift
+WARN, and `AppConfig::resolve_llm` (`src/config.rs:9450`) resolves sectioned
+`[llm]` values without consulting the marker at all. The field is
+`Option<u32>` (`src/config.rs:3533`), so omitting it is not the same as
+storing the integer `1`.
 
 ### `[identity]` — identity-resolution fallback (#198)
 
