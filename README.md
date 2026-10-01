@@ -11,7 +11,7 @@
 [![Rust](https://img.shields.io/badge/rust-1.98%2B-orange?logo=rust)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![SQLite](https://img.shields.io/badge/sqlite-FTS5-003B57?logo=sqlite)](https://www.sqlite.org/)
-[![Tests](https://img.shields.io/badge/tests-12%2C549_%E2%80%A2_%E2%89%A590%25_cov-brightgreen)](https://alphaonedev.github.io/ai-memory-mcp/evidence.html)
+[![Tests](https://img.shields.io/badge/test_attributes-15%2C885_%E2%80%A2_%E2%89%A590%25_cov-brightgreen)](https://alphaonedev.github.io/ai-memory-mcp/evidence.html)
 [![Evidence Hub](https://img.shields.io/badge/evidence--hub-campaigns-6ee7ff?logo=githubpages)](https://alphaonedev.github.io/ai-memory-mcp/evidence/)
 [![v0.6.4 Cert](https://img.shields.io/badge/v0.6.4_cert-CERT_GREEN-2ea043?logo=github)](https://github.com/alphaonedev/ai-memory-test-hub/blob/main/campaigns/v0.6.4.md)
 [![MCP](https://img.shields.io/badge/MCP-7_default_%2B_1_bootstrap_%E2%80%A2_104_full-blueviolet)]()
@@ -821,13 +821,13 @@ Beyond MCP, ai-memory also exposes a full HTTP REST API (103 route registrations
 - **Color CLI output** -- ANSI tier labels (red/yellow/green), priority bars, bold titles, cyan namespaces
 
 ### Quality
-- **12,549 test attributes across the workspace** — **7,882** under `src/` (6,660 `#[test]` + 1,222 `#[tokio::test]`) and **4,667** under `tests/` (2,793 `#[test]` + 1,874 `#[tokio::test]`), grown from the v0.6.4-era ~2,400-test baseline. Measured at this commit, re-derivable in four commands:
+- **15,885 test attributes under `src/` and `tests/`** at commit `626f52a482ebf42afe029917442250d225e8e352` — **9,429** under `src/` (8,130 `#[test]` + 1,299 `#[tokio::test...]`) and **6,456** under `tests/` (3,806 `#[test]` + 2,650 `#[tokio::test...]`), grown from the v0.6.4-era ~2,400-test baseline. This is a source-attribute count, not executed-test evidence. Re-derivable in four commands:
 
   ```bash
-  rg -c --no-filename '^\s*#\[test\]'      src/   | awk '{s+=$1} END {print s}'   # 6660
-  rg -c --no-filename '^\s*#\[tokio::test' src/   | awk '{s+=$1} END {print s}'   # 1222
-  rg -c --no-filename '^\s*#\[test\]'      tests/ | awk '{s+=$1} END {print s}'   # 2793
-  rg -c --no-filename '^\s*#\[tokio::test' tests/ | awk '{s+=$1} END {print s}'   # 1874
+  rg -c --no-filename '^\s*#\[test\]'      src/   | awk '{s+=$1} END {print s}'   # 8130
+  rg -c --no-filename '^\s*#\[tokio::test' src/   | awk '{s+=$1} END {print s}'   # 1299
+  rg -c --no-filename '^\s*#\[test\]'      tests/ | awk '{s+=$1} END {print s}'   # 3806
+  rg -c --no-filename '^\s*#\[tokio::test' tests/ | awk '{s+=$1} END {print s}'   # 2650
   ```
 
   The `#[tokio::test` prefix (no closing bracket) is deliberate — it also counts `#[tokio::test(flavor = "multi_thread")]`, which is a test. This is a count of test *attributes*, not of test cases executed by any one `cargo test` invocation. Re-derive before citing; the numbers move every release.
