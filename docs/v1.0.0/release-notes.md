@@ -151,6 +151,43 @@ back too (`config migrate` leaves `<config.toml>.bak.<timestamp>`) — the
 config analogue of the schema-ahead guard, and the reason a version-bound
 rollback runbook must name both artifacts.
 
+## Before upgrading — legacy agent keys must be well-formed (schema v97, #3464 / #3500)
+
+Schema v97 copies every canonical agent registration's flat
+`metadata.agent_pubkey` (rows in `_agents` titled `agent:<agent_id>`)
+into the new append-only `agent_pubkey_history` ledger as version 1.
+The ledger accepts only an Ed25519 public key in one of two spellings:
+the canonical 43-character URL-safe base64 form, or the 44-character
+padded standard base64 form (which the migration normalises). Any other
+value is copied verbatim and the ledger's `pubkey_b64` CHECK refuses it,
+so the whole v97 step fails and the upgraded binary refuses to open the
+database (both backends: `migrations/sqlite/0081_v97_agent_pubkey_history.sql`,
+`migrations/postgres/0054_v97_agent_pubkey_history.sql`). That refusal is
+deliberate — a malformed trust anchor is never silently dropped — and
+the database is left unchanged at its old version.
+
+A malformed key can only exist in a database written before #3362
+closed the generic `_agents` write path. In this release the refusal
+surfaces as a bare `CHECK constraint failed` that does not name the
+agent; a pre-flight that names every offending agent is tracked in
+[#3500](https://github.com/alphaonedev/ai-memory-mcp/issues/3500). Until
+then, check before upgrading. On SQLite, with the OLD binary stopped:
+
+```bash
+sqlite3 ai-memory.db "SELECT json_extract(metadata,'$.agent_id'),
+  length(trim(json_extract(metadata,'$.agent_pubkey')))
+  FROM memories WHERE namespace='_agents'
+  AND title = 'agent:' || json_extract(metadata,'$.agent_id')
+  AND json_extract(metadata,'$.agent_pubkey') IS NOT NULL;"
+```
+
+Every listed key must be 43 or 44 characters and decode to 32 bytes.
+For any agent whose key does not, run on the **pre-v1.0.0 binary**
+`ai-memory agents revoke-key --agent-id <id>` (removes the flat binding;
+re-enroll afterwards with `ai-memory agents bind-key`, which since #3464
+requires proof of possession), or remove that registration row. Then
+upgrade. See also [`docs/attestation.md`](../attestation.md).
+
 ## Secure-default flips (breaking)
 
 v1.0.0 flips the Gate-1′ "defaults stop lying" knobs to their secure
@@ -704,7 +741,6 @@ durable-row probe, so a populated database can never migrate unsnapshotted
 | v89 | postgres FTS `tags` fold — cross-backend determinism fix ([#2392](https://github.com/alphaonedev/ai-memory-mcp/issues/2392); 5-agent vote `4d3ea1c5`). SQLite's `memories_fts` FTS5 table has always indexed `(title, content, tags)`, but the postgres stored generated `tsv` tsvector (v57) folded only `title + content`, so a tag-only-hit search / recall / contradiction returned the row on SQLite but ZERO rows on the enterprise (postgres) tier. `migrate_v89` redefines the generated column to fold `coalesce(tags::text, '')` — the generated-column-LEGAL fold (a GENERATED column bars `jsonb_array_elements_text`; the immutable `jsonb -> text` cast's JSON punctuation tokenizes away, leaving the array elements as lexemes under the same `'english'` config already applied to title + content) — and every `tsv`-reading path (search / recall / contradiction / list) is fixed uniformly. PG16 has no `ALTER COLUMN ... SET EXPRESSION`, so the arm is `DROP COLUMN IF EXISTS tsv` (cascades away `memories_tsv_gin`) + `ADD COLUMN tsv ... GENERATED ... STORED` + recreate the GIN, one transaction on the pooled connection retaining `lock_timeout` (the ACCESS EXCLUSIVE STORED-generated rewrite cannot be `CONCURRENTLY`, so it fails CLOSED under contention — DEGRADE to fewer tag results, never a wrong result). The SQLite v89 arm is a version-stamp no-op (FTS5 already indexes tags), so both adapters keep ONE logical schema number. `tsv` is derived data regenerated from the durable text |
 | v90 | archive genesis-cid parity — **purely additive on both backends**, no full-table rebuild and therefore no trigger recreation (the v63/v65 lesson) ([#2385](https://github.com/alphaonedev/ai-memory-mcp/issues/2385)). `archived_memories` never gained the v74/#1825 genesis content-id pair, so every archive `INSERT…SELECT` DROPPED the row's BLAKE3 address on the way into cold storage and both `restore_archived*` paths RE-MINTED it on the way back out, recomputing `stamp_cid(agent_id, namespace, title, memory_kind, created_at, plaintext)` from six reconstructed inputs. A re-mint reproduces the original address only if all six are byte-identical at restore time; a rewritten `metadata.agent_id`, or a decrypt failure whose `unwrap_or` hashes the CIPHERTEXT placeholder instead of the plaintext, silently re-addressed the durable row and dangled every `memory_links.source_cid` / `target_cid` mirror resolving to it — the v74 genesis-identity contract violated with no write intent and no error. v90 adds `cid` (TEXT) + `cid_genesis` (BLOB / BYTEA) to `archived_memories`, carries them through all seven archive funnels on each backend, and makes both restore paths bind the CARRIED pair atomically (`CASE WHEN cid IS NOT NULL THEN cid ELSE <re-mint> END`, and the same predicate for `cid_genesis` — mixing a carried address with a re-derived pre-image would produce a row whose own verify disagrees with itself). It **backfills nothing**: a pre-v90 archived row's genesis address cannot be proven from the archive alone, so those rows keep NULL and keep the legacy re-mint fallback — degrade, never corrupt; inventing an address we cannot prove would be the corruption the rung exists to stop. SQLite applies it as a probe-guarded `ALTER` (no `ADD COLUMN IF NOT EXISTS`); postgres uses `ADD COLUMN IF NOT EXISTS`. Idempotent on both |
 | v97 | proof-of-possession enrollment history — additive `agent_pubkey_history` and single-use `agent_pubkey_bind_challenges` tables on both backends ([#3464](https://github.com/alphaonedev/ai-memory-mcp/issues/3464)). Candidate-key proof can bootstrap only an identity with no prior trust history, or reassert the same live key. Once anchored, a distinct replacement must traverse the predecessor-signed succession or guardian-recovery lineage path; admin role plus possession of an unrelated candidate key cannot replace another identity's trust anchor. Closed or revoked history cannot be reopened by direct bind. |
-
 | v98 | Canonical `_inbox/<agent>` namespace on both backends (#3401). An additive view aliases live and archived legacy rows without rewriting any signed or stored bytes. Idempotent; rollback drops the view. |
 
 ## Honest limits

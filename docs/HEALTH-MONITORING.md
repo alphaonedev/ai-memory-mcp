@@ -165,6 +165,9 @@ events since process start:
 | `autotag_enqueued_total`, `autotag_dropped_total`, `autotag_applied_total`, `autotag_degraded_total` | Auto-tag queue acceptance, drops, applied jobs and degraded jobs |
 | `atomise_enqueued_total`, `atomise_dropped_total`, `atomise_applied_total`, `atomise_degraded_total` | Atomisation queue acceptance, drops, applied jobs and degraded jobs |
 | `federation_partial_quorum_total` | Quorum succeeded while at least one peer did not acknowledge in time; not all quorum failures |
+| `auth_failures_total`, `auth_backoff_episodes_total` | HTTP transport-auth failures (missing or unknown API key), and episodes where one source crossed into 429 backoff |
+| `record_stop_gate_indeterminate_total` | Mutating writes refused fail-closed because the record-stop gate could not read the audit chain; a sustained rate means every gated write is refused |
+| `governance_check_audit_suppressed_total`, `capability_expansion_audit_suppressed_total` | `governance.check` and capability-expansion audit appends skipped under an engaged record-stop (the check or expansion itself still answers) |
 
 No memory/inbox/transcript bodies, titles, namespace-private policy values, raw
 errors, DSNs, endpoints, credential hashes or key material are serialized. Seeded
@@ -177,5 +180,6 @@ still apply under overload.
 
 The legacy `/api/v1/health`, `/metrics`, and `/api/v1/metrics` retain their existing
 contracts and are not part of this metadata-only scope. Monitor-only credentials
-cannot use them. Broader operator observability and incident guidance is tracked
-in #3666.
+cannot use them. Broader operator observability — every series and label, which process
+emits it, unknown/stale semantics, alert examples and an incident trace walk —
+is in [`operations/observability.md`](operations/observability.md) (#3666).

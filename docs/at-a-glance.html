@@ -1218,13 +1218,13 @@ footer.site-foot a { color: var(--text-muted); }
     <span class="eyebrow p3">Pillar 3 · Performance</span>
     <h2>Every hot path has a published budget.</h2>
     <p class="lede">
-      Numbers below are real measurements, not aspirational. <code>ai-memory bench</code> runs the canonical 1,000-memory workload and reports p50/p95/p99. CI fails any PR that exceeds budget by more than 10%. Hardware baseline: Apple M4 / 32 GB / NVMe SSD.
+      The <code>memory_recall</code>, <code>memory_store</code> (no embedding), <code>memory_search</code>, <code>memory_kg_query</code> and <code>memory_kg_timeline</code> gauges are operations <code>ai-memory bench</code> runs, on its default workload of ~500 rows (a larger corpus with <code>--scale</code>), reporting p50/p95/p99. The five gauges marked <em>advisory</em> have <strong>no bench in the repository</strong>: their targets are published budgets and their figures are historical observations, not reproducible measurements (see <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/PERFORMANCE.md">PERFORMANCE.md</a>). The bench workflow is advisory and does not block a merge. Hardware baseline: Apple M4 / 32 GB / NVMe SSD.
     </p>
 
     <div class="perf-grid">
       <div class="gauge">
         <div class="gauge-op">memory_session_start</div>
-        <div class="gauge-budget">target p95 &lt; 100 ms · Claude Code hook</div>
+        <div class="gauge-budget">target p95 &lt; 100 ms · Claude Code hook · <em>advisory, no bench</em></div>
         <div class="gauge-bar-bg"><div class="gauge-bar-fill" style="width: 42%"></div><div class="gauge-bar-marker" style="left:100%"></div></div>
         <div class="gauge-numbers"><span class="gauge-measured">42 ms</span><span class="gauge-target">/ 100 ms</span></div>
       </div>
@@ -1242,7 +1242,7 @@ footer.site-foot a { color: var(--text-muted); }
       </div>
       <div class="gauge">
         <div class="gauge-op">memory_store (with embedding)</div>
-        <div class="gauge-budget">target p95 &lt; 200 ms · ONNX/Ollama call</div>
+        <div class="gauge-budget">target p95 &lt; 200 ms · ONNX/Ollama call · <em>advisory, no bench</em></div>
         <div class="gauge-bar-bg"><div class="gauge-bar-fill" style="width: 43%"></div><div class="gauge-bar-marker" style="left:100%"></div></div>
         <div class="gauge-numbers"><span class="gauge-measured">86 ms</span><span class="gauge-target">/ 200 ms</span></div>
       </div>
@@ -1254,7 +1254,7 @@ footer.site-foot a { color: var(--text-muted); }
       </div>
       <div class="gauge">
         <div class="gauge-op">memory_check_duplicate</div>
-        <div class="gauge-budget">target p95 &lt; 50 ms · pre-write check</div>
+        <div class="gauge-budget">target p95 &lt; 50 ms · pre-write check · <em>advisory, no bench</em></div>
         <div class="gauge-bar-bg"><div class="gauge-bar-fill" style="width: 44%"></div><div class="gauge-bar-marker" style="left:100%"></div></div>
         <div class="gauge-numbers"><span class="gauge-measured">22 ms</span><span class="gauge-target">/ 50 ms</span></div>
       </div>
@@ -1272,13 +1272,13 @@ footer.site-foot a { color: var(--text-muted); }
       </div>
       <div class="gauge">
         <div class="gauge-op">curator cycle (1k memories)</div>
-        <div class="gauge-budget">target p95 &lt; 60 s · background</div>
+        <div class="gauge-budget">target p95 &lt; 60 s · background · <em>advisory, no bench</em></div>
         <div class="gauge-bar-bg"><div class="gauge-bar-fill" style="width: 20%"></div><div class="gauge-bar-marker" style="left:100%"></div></div>
         <div class="gauge-numbers"><span class="gauge-measured">12 s</span><span class="gauge-target">/ 60 s</span></div>
       </div>
       <div class="gauge">
         <div class="gauge-op">federation ack (W=2 quorum)</div>
-        <div class="gauge-budget">target p99 &lt; 2 s · multi-machine</div>
+        <div class="gauge-budget">target p99 &lt; 2 s · multi-machine · <em>advisory, no bench</em></div>
         <div class="gauge-bar-bg"><div class="gauge-bar-fill" style="width: 42%"></div><div class="gauge-bar-marker" style="left:100%"></div></div>
         <div class="gauge-numbers"><span class="gauge-measured">850 ms</span><span class="gauge-target">/ 2 s</span></div>
       </div>
@@ -1957,7 +1957,7 @@ footer.site-foot a { color: var(--text-muted); }
         <div class="card p1" style="height:100%;display:flex;flex-direction:column;border:2px solid rgba(110,231,255,0.4)">
           <div class="card-eyebrow" style="color:var(--pillar-1)">▸ PROCUREMENT-GRADE · COMPLIANCE</div>
           <div class="card-title">NSA CSI MCP Security Compliance</div>
-          <p class="card-body">v0.7.x substrate-level coverage of the National Security Agency Cybersecurity Information document on MCP security (U/OO/6030316-26, May 2026). <strong>10 of 10 NSA concerns structurally addressed + 7 of 7 NSA recommendations implemented.</strong> Every claim codegraph-verified, file-anchored, independently reproducible by federal procurement reviewers. 47 dedicated tests pin the #1154 daemon-serverInfo signing contract.</p>
+          <p class="card-body">v0.7.x substrate-level coverage of the National Security Agency Cybersecurity Information document on MCP security (U/OO/6030316-26, May 2026). <strong>9 of 10 NSA concerns structurally addressed as shipped; concern (a) access control is structurally addressed under the <code>enforce</code> identity-binding posture with per-agent keys enrolled (the shipped default is finding H1). 7 of 7 NSA recommendations implemented.</strong> Every claim codegraph-verified, file-anchored, independently reproducible by federal procurement reviewers. 47 dedicated tests pin the #1154 daemon-serverInfo signing contract.</p>
           <div style="margin-top:.85rem;font-family:var(--font-mono);font-size:.78rem;color:var(--pillar-1)">compliance/nsa-csi-mcp.html →</div>
         </div>
       </a>

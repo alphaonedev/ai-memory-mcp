@@ -168,8 +168,8 @@ embeddings lose information on long text.
 ## MCP (Model Context Protocol)
 
 Anthropic's JSON-RPC protocol for AI-tool integration. ai-memory ships
-an MCP server via `ai-memory mcp` exposing **103 advertised entries at
-`--profile full`** (102 callable "memory tools" + the always-on
+an MCP server via `ai-memory mcp` exposing **104 advertised entries at
+`--profile full`** (103 callable "memory tools" + the always-on
 `memory_capabilities` bootstrap — both numbers are intentional; see
 issue [#862](https://github.com/alphaonedev/ai-memory-mcp/issues/862))
 plus 2 prompts over stdio. Default `--profile core` exposes 7 tools (the

@@ -864,7 +864,7 @@ ai-memory serve --host 127.0.0.1 --port 9077
 
 ### `mcp`
 
-Run as an MCP tool server over stdio. This is the primary integration path for any MCP-compatible AI client. The `--profile full` surface advertises 103 entries (102 callable memory tools + the always-on `memory_capabilities` bootstrap); the default `--profile core` ships 7 + the bootstrap (8 advertised).
+Run as an MCP tool server over stdio. This is the primary integration path for any MCP-compatible AI client. The `--profile full` surface advertises 104 entries (103 callable memory tools + the always-on `memory_capabilities` bootstrap); the default `--profile core` ships 7 + the bootstrap (8 advertised).
 
 ```bash
 ai-memory mcp
