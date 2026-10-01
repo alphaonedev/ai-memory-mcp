@@ -268,6 +268,11 @@ able to hang against a wedged hub.
 
 ## Remote (fleet) mode
 
+`doctor` is one signal among several. For the full operator contract —
+metric catalog, which process emits what, unknown/stale semantics, alert
+examples and an incident trace walk — see
+[`observability.md`](observability.md).
+
 `--remote <url>` queries the daemon's existing HTTP surfaces:
 
 - `GET /api/v1/capabilities` — the full Capabilities v2 (P1) JSON.
