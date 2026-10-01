@@ -509,8 +509,13 @@ Implications:
 
 ### 4.6 Latency budget (T3)
 
-Reference numbers from the LAN-parity test fleet
-(`infra/lan-parity-test/`) on two-rack same-DC topology:
+**Illustrative planning targets, not measurements.** The numbers below
+are planning targets for a two-rack same-DC topology. They do not come
+from `infra/lan-parity-test/` (that harness runs cross-adapter parity
+tests against a local PG+AGE container and samples no latency
+percentiles), and no committed receipt or script produced them. Measure
+your own deployment before treating any row as a budget; the measured,
+receipted numbers this project publishes live in `PERFORMANCE.md`.
 
 | Operation | p50 | p95 | p99 |
 |---|---|---|---|
@@ -518,7 +523,7 @@ Reference numbers from the LAN-parity test fleet
 | `POST /api/v1/memories` (W=2 of N=3 quorum) | 14 ms | 38 ms | 75 ms |
 | `GET /api/v1/recall?q=…` (local; hot HNSW) | 8 ms | 22 ms | 50 ms |
 | `POST /api/v1/sync/push` (single payload, 5 memories) | 11 ms | 30 ms | 65 ms |
-| `POST /api/v1/kg/find_paths` (depth=3, AGE) | 12 ms | 35 ms | 80 ms |
+| `POST /api/v1/kg/find_paths` (depth=3; recursive CTE on both backends) | 12 ms | 35 ms | 80 ms |
 
 LAN RTT-bound. Federation fanout adds one full RTT × peer count to
 the write path. The CRDT-lite merge cost on the receiving side scales
