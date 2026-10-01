@@ -974,6 +974,12 @@ pub fn store_err_to_response(e: crate::store::StoreError) -> Response {
         // reads are unaffected. The message is caller-safe (no adapter
         // internals) so no sanitisation is needed.
         StoreError::Stopped { .. } => (StatusCode::SERVICE_UNAVAILABLE, e.to_string()),
+        // #4400 — this process's audit trail is not recording and the operator
+        // required one: 503 (it clears itself once the trail records again).
+        // The message names only the knob, so it is emitted unsanitised.
+        StoreError::AuditTrailUnavailable { .. } => {
+            (StatusCode::SERVICE_UNAVAILABLE, e.to_string())
+        }
         // v1.0.0 #3196 — a find_paths traversal-budget refusal. 400, not 503:
         // the caller asked for a traversal too broad to serve within the
         // materialised-prefix budget, and the actionable fix is on the

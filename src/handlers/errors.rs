@@ -132,6 +132,16 @@ pub fn classify_bulk_row_error(raw: &str) -> BulkRowErrorClass {
             retryable: true,
         };
     }
+    // #4400 — the audit-trail latch: the refusal names its knob. Retryable
+    // 503: the gate clears itself once the trail records again.
+    if lower.contains(&crate::audit::REQUIRE_AUDIT_TRAIL_ENV.to_ascii_lowercase()) {
+        return BulkRowErrorClass {
+            code: crate::errors::error_codes::AUDIT_TRAIL_UNAVAILABLE,
+            label: "audit trail unavailable",
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            retryable: true,
+        };
+    }
     // #2588 — quota FIRST: retryable, typed, and already caller-visible on
     // the single-row surface.
     if lower.contains("quota_exceeded") {
@@ -259,14 +269,20 @@ pub(crate) fn quota_exceeded_response(qe: &crate::quotas::QuotaError) -> axum::r
         .into_response()
 }
 
-/// #3707 (f2r F2, option b) — ONE spelling for the record-stop 503. The
-/// record-stop error is our own typed refusal (closed vocabulary), rendered
-/// here once instead of at two handler sites each spelling `e.to_string()`.
-pub(crate) fn record_stopped_response(e: &dyn std::fmt::Display) -> axum::response::Response {
+/// #3707 (f2r F2, option b) — ONE spelling for the record-stop gate's 503.
+/// The gate's errors are our own typed refusals (closed vocabulary), rendered
+/// here once instead of at each handler site spelling `e.to_string()`.
+/// #4400 — the code is the error's OWN slug, not a fixed `RECORD_STOPPED`:
+/// the gate also refuses with `RECORD_STOP_INDETERMINATE` (#3877) and
+/// `AUDIT_TRAIL_UNAVAILABLE` (#4400), and a client must be able to tell an
+/// operator's stop from a retryable condition.
+pub(crate) fn record_stopped_response(
+    e: &crate::storage::StorageError,
+) -> axum::response::Response {
     (
         StatusCode::SERVICE_UNAVAILABLE,
         Json(json!({
-            "code": crate::errors::error_codes::RECORD_STOPPED,
+            "code": e.code(),
             "error": e.to_string(),
         })),
     )
@@ -539,6 +555,8 @@ pub fn classify_store_err(e: &crate::store::StoreError) -> BulkRowErrorClass {
         (VALIDATION_FAILED_LABEL, StatusCode::BAD_REQUEST, false)
     } else if code == codes::STORE_BACKEND_UNAVAILABLE
         || code == codes::RECORD_STOPPED
+        // #4400 — clears itself once the audit trail records again.
+        || code == codes::AUDIT_TRAIL_UNAVAILABLE
         || code == codes::SCHEMA_AHEAD_OF_BINARY
         // #2564 — the low-end schema refusal is the same operational shape:
         // the node is temporarily un-writable until the operator fixes the

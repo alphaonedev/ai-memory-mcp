@@ -226,6 +226,9 @@ fn memory_guard_err(e: crate::errors::MemoryError) -> StoreError {
         crate::errors::MemoryError::ValidationFailed(detail) => {
             StoreError::IntegrityFailed { detail }
         }
+        crate::errors::MemoryError::AuditTrailUnavailable(reason) => {
+            StoreError::AuditTrailUnavailable { reason }
+        }
         other => box_err(other.message()),
     }
 }
