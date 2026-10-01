@@ -2223,7 +2223,7 @@ shell word-splitting.
 | `AI_MEMORY_WAKE_SENDER` | agent that wrote the row |
 | `AI_MEMORY_WAKE_DIGEST` | lowercase hex SHA-256 **of the body** — never the body |
 | `AI_MEMORY_WAKE_SEQ` | the producer's wake watermark at mint time |
-| `AI_MEMORY_WAKE_MISSED` | wakes this listener demonstrably did not see |
+| `AI_MEMORY_WAKE_MISSED` | wakes this listener did not see, clamped to 65,536; across a producer restart or eviction the watermark rebases and this is NOT a count, so rely only on `> 0` (reason `gap`), never as a loop or batch bound |
 | `AI_MEMORY_WAKE_PENDING` | wakes the hub coalesced while this agent was offline |
 | `AI_MEMORY_WAKE_INBOX_COUNT` | messages the catch-up read returned |
 

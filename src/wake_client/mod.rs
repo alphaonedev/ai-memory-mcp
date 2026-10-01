@@ -150,6 +150,9 @@ pub struct WakeSignal {
     /// Wakes the hub coalesced while this agent was offline, from the welcome.
     pub pending_count: u64,
     /// Wakes this listener demonstrably did not see, from a watermark gap.
+    /// Clamped to [`MAX_REPORTED_MISSED`]: across a producer restart or a
+    /// counter-table eviction the watermark rebases and this is NOT a count,
+    /// so only `missed > 0` (reason `gap`) is reliable (#4125).
     pub missed: u64,
 }
 
@@ -166,6 +169,17 @@ impl WakeSignal {
     }
 }
 
+/// Ceiling on [`SeqTracker::observe`]'s `missed` (#4125).
+///
+/// `seq_high_watermark` is the recipient's own wake number, which restarts from
+/// a wall-clock base after a producer restart or an eviction from the
+/// producer's recipient table. Across such a rebase the raw difference is a
+/// clock delta (elapsed microseconds, unbounded), NOT a count of wakes. `missed` is therefore
+/// clamped to this value: it means "AT LEAST this many, or the counter
+/// rebased", and only `missed > 0` (reason `gap`, one catch-up read) is
+/// reliable. A hook must never use it as a loop or batch bound.
+pub const MAX_REPORTED_MISSED: u64 = 65_536;
+
 /// Tracks `seq_high_watermark` so a gap becomes exactly one extra read.
 ///
 /// Deliberately fail-safe in one direction only: it may report a gap that was
@@ -178,13 +192,19 @@ pub struct SeqTracker {
 
 impl SeqTracker {
     /// Fold one observed watermark in and report how many wakes were missed.
+    ///
+    /// The result is a count only between values with no rebase in between,
+    /// and is clamped to [`MAX_REPORTED_MISSED`] (saturating, never wrapping).
     pub fn observe(&mut self, seq: u64) -> u64 {
         let missed = match self.last {
             // The first wake of a session establishes the baseline. The
             // session's own welcome already forced a catch-up read, so there
             // is nothing to recover here.
             None => 0,
-            Some(prev) => seq.saturating_sub(prev).saturating_sub(1),
+            Some(prev) => seq
+                .saturating_sub(prev)
+                .saturating_sub(1)
+                .min(MAX_REPORTED_MISSED),
         };
         self.last = Some(self.last.map_or(seq, |prev| prev.max(seq)));
         missed
@@ -605,6 +625,27 @@ mod tests {
         assert_eq!(t.observe(103), 0);
         assert_eq!(t.last(), Some(105));
         assert_eq!(t.observe(106), 0);
+    }
+
+    /// #4125 — a rebased watermark (restart / eviction jumps to a wall-clock
+    /// base, a ~10^12 difference) is reported as a clamped gap, never as a
+    /// huge or wrapped count; contiguity is still never claimed.
+    #[test]
+    fn a_rebased_watermark_clamps_missed_and_never_wraps_4125() {
+        let mut t = SeqTracker::default();
+        assert_eq!(t.observe(100), 0);
+        assert_eq!(t.observe(1_000_000_000_000), MAX_REPORTED_MISSED);
+        assert_eq!(t.observe(u64::MAX), MAX_REPORTED_MISSED);
+        assert_eq!(t.last(), Some(u64::MAX));
+        assert_eq!(t.observe(0), 0, "a backwards value is never a gap");
+        // A genuine small gap is exact.
+        let mut g = SeqTracker::default();
+        g.observe(10);
+        assert_eq!(g.observe(14), 3);
+        // At the ceiling the value is still > 0, so the gap signal survives.
+        let mut c = SeqTracker::default();
+        c.observe(1);
+        assert!(c.observe(MAX_REPORTED_MISSED + 3) > 0);
     }
 
     /// The normative ceiling is REFUSED, not clamped: a client that silently

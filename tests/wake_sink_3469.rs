@@ -187,10 +187,9 @@ async fn notify_reaches_a_cohosted_hub_through_the_installed_sink_3469() {
         meta.seq_high_watermark > 0,
         "the self-heal watermark must be populated"
     );
-    assert!(
-        meta.seq_high_watermark <= ai_memory::inbox_wake::seq_high_watermark(),
-        "the watermark is the producer's own monotonic wake sequence"
-    );
+    // #4125: the watermark is the RECIPIENT's own publish-time counter, not
+    // the host-wide wake sequence; its isolation and lag-gap properties are
+    // pinned in tests/wake_seq_per_recipient_4125.rs.
 
     // NEITHER the body NOR the title may appear anywhere on the wire.
     let wire = String::from_utf8_lossy(&frame.encode().expect("re-encode")).into_owned();
@@ -215,7 +214,7 @@ async fn a_wake_for_another_agent_never_lands_on_this_queue_3469() {
     let sink = InProcessWakeSink::for_router(Arc::clone(&probe.router));
 
     sink.on_wake(&InboxEvent::AgentNotified {
-        seq: 1,
+        seq: 900_001,
         recipient_agent_id: theirs.clone(),
         correlation_id: "sha256:c".into(),
         inbox_row_id: "row-theirs".into(),
@@ -223,6 +222,7 @@ async fn a_wake_for_another_agent_never_lands_on_this_queue_3469() {
         sender_agent_id: "ai:alice".into(),
         content_digest: format!("sha256:{}", "33".repeat(32)),
         notified_at: "2026-09-05T00:00:00Z".into(),
+        recipient_seq: 1,
     });
 
     assert!(
@@ -258,7 +258,7 @@ async fn the_router_accessor_survives_the_serve_move_3469() {
 
     let sink = InProcessWakeSink::for_router(router);
     sink.on_wake(&InboxEvent::AgentNotified {
-        seq: 77,
+        seq: 900_077,
         recipient_agent_id: recipient.clone(),
         correlation_id: "sha256:c".into(),
         inbox_row_id: "row-live".into(),
@@ -266,6 +266,7 @@ async fn the_router_accessor_survives_the_serve_move_3469() {
         sender_agent_id: "ai:alice".into(),
         content_digest: format!("sha256:{}", "44".repeat(32)),
         notified_at: "2026-09-05T00:00:00Z".into(),
+        recipient_seq: 77,
     });
 
     let frame = client.expect_frame().await;
@@ -325,7 +326,7 @@ async fn the_uds_forwarder_delivers_a_wake_across_a_real_socket_3469() {
         .expect("the forwarder must start for an enrolled producer credential");
 
     sink.on_wake(&InboxEvent::AgentNotified {
-        seq: 5150,
+        seq: 905_150,
         recipient_agent_id: recipient.clone(),
         correlation_id: "sha256:c".into(),
         inbox_row_id: "row-uds".into(),
@@ -333,6 +334,7 @@ async fn the_uds_forwarder_delivers_a_wake_across_a_real_socket_3469() {
         sender_agent_id: "ai:alice".into(),
         content_digest: format!("sha256:{}", "55".repeat(32)),
         notified_at: "2026-09-05T00:00:00Z".into(),
+        recipient_seq: 5150,
     });
 
     let frame = client.expect_frame().await;
@@ -382,7 +384,7 @@ async fn a_hub_404_is_per_frame_and_the_forwarder_keeps_pumping_3641() {
     // (1) A wake to an agent the hub has NEVER seen -> hub answers 404 on the
     // producer session. The forwarder must COUNT it per-frame and KEEP pumping.
     sink.on_wake(&InboxEvent::AgentNotified {
-        seq: 1,
+        seq: 900_001,
         recipient_agent_id: "ai:never-seen-3641".into(),
         correlation_id: "sha256:x".into(),
         inbox_row_id: "row-404".into(),
@@ -390,6 +392,7 @@ async fn a_hub_404_is_per_frame_and_the_forwarder_keeps_pumping_3641() {
         sender_agent_id: "ai:alice".into(),
         content_digest: format!("sha256:{}", "11".repeat(32)),
         notified_at: "2026-09-05T00:00:00Z".into(),
+        recipient_seq: 1,
     });
     let mut counted = false;
     for _ in 0..300 {
@@ -407,7 +410,7 @@ async fn a_hub_404_is_per_frame_and_the_forwarder_keeps_pumping_3641() {
     // (2) A wake to the KNOWN recipient IS delivered across the SAME session,
     // proving the forwarder did not tear the connection down on the 404.
     sink.on_wake(&InboxEvent::AgentNotified {
-        seq: 2,
+        seq: 900_002,
         recipient_agent_id: recipient.clone(),
         correlation_id: "sha256:y".into(),
         inbox_row_id: "row-after-404".into(),
@@ -415,6 +418,7 @@ async fn a_hub_404_is_per_frame_and_the_forwarder_keeps_pumping_3641() {
         sender_agent_id: "ai:alice".into(),
         content_digest: format!("sha256:{}", "22".repeat(32)),
         notified_at: "2026-09-05T00:00:01Z".into(),
+        recipient_seq: 2,
     });
     let frame = client.expect_frame().await;
     assert_eq!(frame.kind, Kind::Wake);
@@ -486,6 +490,7 @@ async fn a_forwarder_the_hub_refuses_delivers_nothing_3469() {
             sender_agent_id: "ai:alice".into(),
             content_digest: format!("sha256:{}", "66".repeat(32)),
             notified_at: "2026-09-05T00:00:00Z".into(),
+            recipient_seq: i + 1,
         });
     }
 
@@ -742,7 +747,7 @@ async fn the_boot_wired_forwarder_joins_a_real_hub_and_delivers_3469() {
         .expect("`sink_socket` is configured, so this is not the unconfigured posture");
 
     sink.on_wake(&InboxEvent::AgentNotified {
-        seq: 3469,
+        seq: 903_469,
         recipient_agent_id: recipient.clone(),
         correlation_id: "sha256:c".into(),
         inbox_row_id: "row-boot".into(),
@@ -750,6 +755,7 @@ async fn the_boot_wired_forwarder_joins_a_real_hub_and_delivers_3469() {
         sender_agent_id: "ai:alice".into(),
         content_digest: format!("sha256:{}", "77".repeat(32)),
         notified_at: "2026-09-05T00:00:00Z".into(),
+        recipient_seq: 3469,
     });
 
     let frame = client.expect_frame().await;
@@ -817,7 +823,7 @@ async fn without_the_producer_row_the_forwarder_is_refused_3469() {
         .expect("configured");
 
     sink.on_wake(&InboxEvent::AgentNotified {
-        seq: 7,
+        seq: 900_007,
         recipient_agent_id: recipient.clone(),
         correlation_id: "sha256:c".into(),
         inbox_row_id: "row-denied".into(),
@@ -825,6 +831,7 @@ async fn without_the_producer_row_the_forwarder_is_refused_3469() {
         sender_agent_id: "ai:alice".into(),
         content_digest: format!("sha256:{}", "88".repeat(32)),
         notified_at: "2026-09-05T00:00:00Z".into(),
+        recipient_seq: 7,
     });
 
     // The hub refuses the hello, so nothing is ever delivered.
