@@ -866,13 +866,30 @@ pub(crate) fn parse_classified_kind(text: &str) -> Option<crate::models::MemoryK
         .find_map(|tok| crate::models::MemoryKind::from_str(&tok.to_ascii_lowercase()))
 }
 
+/// #4341 — convert one embedding array to `f32`, refusing the WHOLE vector
+/// when any element is not a JSON number or does not fit a finite `f32` (an
+/// `as` cast saturates an out-of-range value to +/-inf). Dropping a bad
+/// element instead would return a vector shorter than the model's dimension
+/// as a success. `None` means the envelope is malformed.
+fn embedding_floats(values: &[Value]) -> Option<Vec<f32>> {
+    values
+        .iter()
+        .map(|v| {
+            #[allow(clippy::cast_possible_truncation)]
+            let f = v.as_f64()? as f32;
+            f.is_finite().then_some(f)
+        })
+        .collect()
+}
+
 /// #1603 — parse a batched OpenAI-compatible `/embeddings` response
 /// (`{"data": [{"index": i, "embedding": [...]}, ...]}`) into one
 /// vector per input, in INPUT order. The spec allows providers to
 /// reorder `data`, so each element's `index` field places its vector;
 /// elements without an `index` fall back to positional order. Errors on
 /// a missing/short `data` array, a missing `embedding`, an
-/// out-of-range/duplicate `index`, an empty vector, or a final count
+/// out-of-range/duplicate `index`, an empty vector, a non-numeric or
+/// non-finite element (#4341), or a final count
 /// that does not match `expected_len` — a misaligned batch must fail
 /// loudly rather than pair texts with the wrong vectors.
 fn parse_openai_embeddings_batch(body: &Value, expected_len: usize) -> Result<Vec<Vec<f32>>> {
@@ -903,11 +920,9 @@ fn parse_openai_embeddings_batch(body: &Value, expected_len: usize) -> Result<Ve
         let arr = item["embedding"].as_array().ok_or_else(|| {
             anyhow!("Missing 'data[{pos}].embedding' in OpenAI-compatible embed response")
         })?;
-        #[allow(clippy::cast_possible_truncation)]
-        let floats: Vec<f32> = arr
-            .iter()
-            .filter_map(|v| v.as_f64().map(|f| f as f32))
-            .collect();
+        let floats = embedding_floats(arr).ok_or_else(|| {
+            anyhow!("Non-numeric or non-finite element at index {idx} in embed response")
+        })?;
         if floats.is_empty() {
             return Err(anyhow!("Empty embedding at index {idx} in embed response"));
         }
@@ -2846,13 +2861,16 @@ impl OllamaClient {
             }
         };
 
-        #[allow(clippy::cast_possible_truncation)]
-        let floats: Vec<f32> = embedding_array
-            .iter()
-            .filter_map(|v| v.as_f64().map(|f| f as f32))
-            .collect();
-
+        // #4341 — a malformed vector is an invalid envelope: error and count
+        // it toward the breaker, never return a short / non-finite success.
+        let Some(floats) = embedding_floats(embedding_array) else {
+            self.note_failure();
+            return Err(self
+                .provider
+                .invalid_response("Non-numeric or non-finite element in embed response"));
+        };
         if floats.is_empty() {
+            self.note_failure();
             return Err(anyhow!("Empty embedding returned from LLM"));
         }
 
@@ -3031,8 +3049,14 @@ impl OllamaClient {
             }
         };
 
-        let parsed = parse_openai_embeddings_batch(&body, chunk.len())
-            .map_err(|_| self.provider.failure(ProviderFailure::InvalidResponse))?;
+        // #4341 — a malformed batch envelope counts toward the breaker.
+        let Ok(parsed) = parse_openai_embeddings_batch(&body, chunk.len()) else {
+            self.note_failure();
+            return Err(self
+                .provider
+                .failure(ProviderFailure::InvalidResponse)
+                .into());
+        };
         self.note_success();
         Ok(parsed)
     }
@@ -7082,6 +7106,9 @@ mod bridge_budget_tests_3140 {
     // the type (the function returns `anyhow::Result<T>` and contains no
     // `expect` on the builder).
 }
+
+#[cfg(test)]
+mod embed_envelope_4341_tests;
 
 #[cfg(test)]
 mod classify_kind_parse_tests {
