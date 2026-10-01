@@ -28,17 +28,21 @@ auto-checkpoint) and documents the rest here.
 
 ### 1. Single writer per database file — **Structural**
 
-SQLite allows one writer at a time by design. WAL mode lets readers pass
-the writer, but writers never run concurrently. Our `Arc<Mutex<Connection>>`
-daemon compounds this by serializing readers too. A connection pool fixes
-the daemon-side serialization within SQLite, but the file-level single-writer
-ceiling (~500-2000 writes/sec on NVMe) remains.
+SQLite still permits one writer per database file. WAL mode lets readers
+pass the writer, but writers never run concurrently. File-backed HTTP
+get/list/search and recall read phases use the WAL read pool
+(`src/handlers/read_pool.rs`, #1580), whose default size is eight read-only
+connections (`DEFAULT_READ_POOL_SIZE`). These reads need not hold the shared
+writer connection. An unavailable read pool falls back to the writer
+connection; in-memory databases do not use the file-backed pool. Writes still
+serialize on the daemon's single writer connection, and the file-level
+single-writer ceiling (~500-2000 writes/sec on NVMe) remains.
 
 **Impact ceiling:** ~1000-2000 writes/sec regardless of hardware.
 **Workaround:** switch to Postgres via the v0.7 SAL when you need higher
 write throughput; Postgres MVCC gives concurrent writers.
-**v0.6.0 GA polish:** none. The connection pool was deferred to v0.7 SAL
-because it becomes moot when the user can just pick a different backend.
+**v0.6.0 GA polish:** none at the time; the read pool landed later
+(#1580) and covers reads only — it does not lift the single-writer limit.
 
 ### 2. Single-node only — **Structural**
 
@@ -78,8 +82,10 @@ proposal and is not a shipped v1.0.0 adapter).
 
 ### 5. No native client-server protocol — **Structural**
 
-SQLite is embedded. Remote access goes through our HTTP daemon, which
-reintroduces the `Mutex<Connection>` bottleneck. Postgres, MySQL, Qdrant,
+SQLite is embedded. Remote access goes through our HTTP daemon. File-backed
+pooled reads do not hold the writer mutex, but every write (and any read that
+falls back from the pool) still serializes on the single writer
+`Mutex<Connection>`. Postgres, MySQL, Qdrant,
 pgvector all have real wire protocols.
 
 **Impact:** the HTTP daemon is the bottleneck at fleet scale, not SQLite's
