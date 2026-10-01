@@ -251,10 +251,13 @@ fn init_with_an_existing_mark_needs_no_new_file_4086() {
     shutdown_for_test();
 
     assert_eq!(sequences(&path), vec![1, 2, 3]);
+    // init raised the mark to the tail (2) in place; since #4299 event 3's
+    // write-ahead then raised it to 3, also in place: neither step needs a new
+    // file in the 0500 directory.
     assert_eq!(
         read_seq_mark(&mark_file(&path)).expect("mark readable"),
-        Some(2),
-        "the in-place update raised the mark to the trail tail"
+        Some(3),
+        "the in-place updates (init, then the #4299 write-ahead) raised the mark to 3"
     );
     assert!(
         !dir.join("audit.log.seq.tmp").exists(),
