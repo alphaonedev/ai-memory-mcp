@@ -1012,6 +1012,13 @@ strategy.
 Fall-through is `--system`. Same binary on macOS / Linux /
 Docker / Kubernetes. Exit code is propagated.
 
+> **Codex CLI ≥ 0.153 rejects `--system`** (`error: unexpected argument
+> '--system' found`, exit 2), so `ai-memory wrap codex` with the default
+> strategy is known broken on current Codex; there is no version probe
+> or tested-range table yet ([#3545](https://github.com/alphaonedev/ai-memory-mcp/issues/3545)).
+> Override with `--system-flag` / `--system-env`, or use Codex's native
+> MCP server configuration instead (see `docs/integrations/codex-cli.md`).
+
 ```bash
 ai-memory wrap codex -- "draft a release note"
 ai-memory wrap aider -- src/main.rs
