@@ -75,7 +75,8 @@ substrates, not for shared or federated deployments. Child
 namespaces inherit the parent's policy by default (`inherit: true`),
 so one standard at `org/` governs the subtree until a child opts out.
 Opting a child out is itself an authorized act (#4356): binding the
-**first** standard (or repairing a severed binding) at a namespace
+**first** standard (or repairing a severed binding, the #3758 SET repair
+path) at a namespace
 under a governed ancestor requires the caller to own the **nearest
 governing ancestor's** standard — the nearest ancestor on the
 governance chain whose standard carries a `metadata.governance`
@@ -83,7 +84,11 @@ policy (a bound standard with no policy does not shadow a governed
 grandparent). A non-owner is refused with the usual 403 `NOT_OWNER`
 (the owner is never named). An ungoverned root, an unowned (`system`)
 ancestor standard and the daemon / operator CLI are unaffected, and a
-severed or dangling governing ancestor fails closed. The global `*`
+severed or dangling governing ancestor fails closed, and so does one whose
+stored metadata is corrupt (not a JSON object, or a `governance` blob that
+does not deserialize). The check runs inside the bind's write transaction
+on both backends, so it cannot pass on a chain a concurrent bind is
+changing. The global `*`
 default is not a governing ancestor for this gate, and the federated
 `namespace_meta` lanes keep their own peer-scope gate (#2479).
 

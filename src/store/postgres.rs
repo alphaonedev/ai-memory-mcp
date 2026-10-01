@@ -87,9 +87,7 @@ mod tx_retry;
 // take NO relation-level DDL lock on connect. Own module for the same
 // qual_10 budget reason as `parity_3064` above.
 mod bootstrap_ddl;
-// #4356 — the ancestor-owner bind gate's postgres reader (own module for the
-// same qual_10 budget reason as `parity_3064` above).
-mod ns_standard_ancestor_4356;
+mod ns_standard_ancestor_4356; // #4356 bind gate (own module: qual_10 budget)
 // v1.0.0 #3614 — the lineage walk (recursive CTE + AGE Cypher + the backend
 // dispatcher + the #3041 cycle check) and its two helpers. Own module for the
 // same qual_10 budget reason as `parity_3064` above: a pure MOVE (rule l),
@@ -26636,34 +26634,15 @@ impl MemoryStore for PostgresStore {
             Some(p) => Some(p.to_string()),
             None => pg_auto_detect_parent(&self.pool, namespace).await?,
         };
-        // #3758 — the REBIND gate: the standard CURRENTLY bound decides,
-        // through the same predicate CLEAR uses. Pre-fix this adapter
-        // discarded `ctx` and any caller could replace another tenant's
-        // governance standard. Owner read + upsert in ONE transaction (the
-        // #3237 item 5 TOCTOU discipline of the CLEAR twin).
+        // #3758 rebind gate + #4356 bind lock and ancestor-owner gate, read in
+        // THIS transaction with the upsert (#3237 item 5 TOCTOU discipline;
+        // see `ns_standard_ancestor_4356::set_gate_in_tx`).
         let mut tx = self
             .pool
             .begin()
             .await
             .map_err(|e| to_store_err("set_namespace_standard begin", e))?;
-        if !ctx.bypass_visibility {
-            let binding = pg_namespace_standard_binding(&mut tx, namespace).await?;
-            // #4356 — the ancestor-owner gate on a first bind, read in THIS tx
-            // (fail-closed floor); one shared verdict with the sqlite twin.
-            let ancestor = if crate::ns_standard_ancestor::needs_ancestor(&binding) {
-                ns_standard_ancestor_4356::governing_ancestor_in_tx(&mut tx, namespace).await?
-            } else {
-                crate::ns_standard_ancestor::GoverningAncestor::None
-            };
-            crate::ns_standard_ancestor::set_admission(
-                ctx.effective_principal(),
-                false,
-                namespace,
-                &binding,
-                &ancestor,
-            )
-            .map_err(|r| crate::store::set_refusal_to_store_err(r, namespace))?;
-        }
+        ns_standard_ancestor_4356::set_gate_in_tx(&mut tx, ctx, namespace).await?;
         sqlx::query(
             "INSERT INTO namespace_meta (namespace, standard_id, updated_at, parent_namespace)
              VALUES ($1, $2, NOW(), $3)
@@ -26688,12 +26667,7 @@ impl MemoryStore for PostgresStore {
         &self,
         namespace: &str,
     ) -> StoreResult<crate::ns_standard_ancestor::GoverningAncestor> {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| to_store_err("namespace_governing_ancestor begin", e))?;
-        ns_standard_ancestor_4356::governing_ancestor_in_tx(&mut tx, namespace).await
+        ns_standard_ancestor_4356::governing_ancestor_pool(&self.pool, namespace).await
     }
 
     async fn clear_namespace_standard(
