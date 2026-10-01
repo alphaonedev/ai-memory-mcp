@@ -14,8 +14,11 @@
 //! can persist the attestation (ERRORS-09).
 
 use std::collections::{HashMap, HashSet};
-use std::fs;
-use std::path::Path;
+
+// #4023: ONE shared loader reads `postgres.rs` AND every child module under
+// `src/store/postgres/` (fail closed on an empty / short file set).
+#[path = "common/pg_sources.rs"]
+mod pg_sources;
 
 const GATE_MARKERS: &[&str] = &["gate_record_stop", "refuse_if_record_stopped"];
 
@@ -195,18 +198,7 @@ fn signature_has_self(lines: &[&str], start: usize) -> bool {
 
 #[test]
 fn record_stop_pg_write_methods_gate_or_bookkeeping_b9() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let path = root.join("src/store/postgres.rs");
-    let raw = fs::read_to_string(&path).expect("postgres.rs");
-    let text = strip_test_mod(&raw);
-    let lines: Vec<&str> = text.lines().collect();
-
-    let mut starts: Vec<(usize, String)> = Vec::new();
-    for (idx, line) in lines.iter().enumerate() {
-        if let Some((_, name)) = is_fn_start(line) {
-            starts.push((idx, name));
-        }
-    }
+    let sources = pg_sources::pg_adapter_sources();
 
     let bookkeeping: HashSet<&str> = BOOKKEEPING.iter().copied().collect();
     let record_plane: HashSet<&str> = RECORD_PLANE.iter().copied().collect();
@@ -217,34 +209,62 @@ fn record_stop_pg_write_methods_gate_or_bookkeeping_b9() {
     let mut ungated: Vec<(String, usize, String)> = Vec::new();
     let mut surfaced: HashSet<String> = HashSet::new();
 
-    for (i, (start, name)) in starts.iter().enumerate() {
-        if !signature_has_self(&lines, *start) {
-            continue;
-        }
-        if name.starts_with("migrate_v") || name.starts_with("test_") {
-            continue;
-        }
-        let end = starts.get(i + 1).map_or(lines.len(), |(s, _)| *s);
-        let body = lines[*start..end].join("\n");
-        let tables: Vec<String> = tables_written(&body)
-            .into_iter()
-            .filter(|t| record_plane.contains(t.as_str()))
-            .collect();
-        if tables.is_empty() {
-            continue;
-        }
-        surfaced.insert(name.clone());
-        let has_gate = GATE_MARKERS.iter().any(|g| body.contains(g));
-        if has_gate {
-            if let Some(flag) = gated_hits.get_mut(name) {
-                *flag = true;
+    for source in &sources {
+        let text = strip_test_mod(&source.text);
+        let lines: Vec<&str> = text.lines().collect();
+        let file = source
+            .rel
+            .rsplit('/')
+            .next()
+            .unwrap_or(source.rel.as_str())
+            .to_string();
+
+        let mut starts: Vec<(usize, String)> = Vec::new();
+        for (idx, line) in lines.iter().enumerate() {
+            if let Some((_, name)) = is_fn_start(line) {
+                starts.push((idx, name));
             }
-            continue;
         }
-        if bookkeeping.contains(name.as_str()) {
-            continue;
+
+        for (i, (start, name)) in starts.iter().enumerate() {
+            if !signature_has_self(&lines, *start) {
+                continue;
+            }
+            if name.starts_with("migrate_v") || name.starts_with("test_") {
+                continue;
+            }
+            let next_fn = starts.get(i + 1).map_or(lines.len(), |(s, _)| *s);
+            // A method body ends at its `impl` block's closing `}` (column 0)
+            // when that comes before the next fn: in a child module the text
+            // between an `impl` block and the next one (a `const SQL_...`
+            // string) is NOT part of this method, and must not be attributed
+            // to it as a phantom write (#4023). Only ever shortens a span past
+            // the end of its own impl block.
+            let end = lines[*start..next_fn]
+                .iter()
+                .position(|l| l.starts_with('}'))
+                .map_or(next_fn, |off| start + off);
+            let body = lines[*start..end].join("\n");
+            let tables: Vec<String> = tables_written(&body)
+                .into_iter()
+                .filter(|t| record_plane.contains(t.as_str()))
+                .collect();
+            if tables.is_empty() {
+                continue;
+            }
+            surfaced.insert(name.clone());
+            let has_gate = GATE_MARKERS.iter().any(|g| body.contains(g));
+            if has_gate {
+                if let Some(flag) = gated_hits.get_mut(name) {
+                    *flag = true;
+                }
+                continue;
+            }
+            if bookkeeping.contains(name.as_str()) {
+                continue;
+            }
+            ungated.push((format!("{file}:{name}"), start + 1, tables.join(",")));
         }
-        ungated.push((name.clone(), start + 1, tables.join(",")));
     }
 
     let mut missing_required: Vec<String> = gated_hits
@@ -264,7 +284,7 @@ fn record_stop_pg_write_methods_gate_or_bookkeeping_b9() {
         "B9 pg-write structural: PostgresStore methods write record-plane tables without gate_record_stop:\n  {}\n(add a gate, or justify as bookkeeping in BOOKKEEPING)",
         ungated
             .iter()
-            .map(|(n, line, table)| format!("postgres.rs:{line} {n} writes {table}"))
+            .map(|(n, line, table)| format!("{n}:{line} writes {table}"))
             .collect::<Vec<_>>()
             .join("\n  ")
     );
