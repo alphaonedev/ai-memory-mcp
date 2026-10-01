@@ -3219,7 +3219,7 @@ impl MemoryStore for SqliteStore {
         namespace: &str,
     ) -> StoreResult<Option<u32>> {
         let conn = self.state.lock().await;
-        Ok(db::resolve_require_approval_above_depth(&conn, namespace))
+        db::resolve_require_approval_above_depth(&conn, namespace).map_err(box_err)
     }
 
     async fn governance_approve_with_consensus(
