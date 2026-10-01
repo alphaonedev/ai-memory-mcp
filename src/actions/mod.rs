@@ -352,11 +352,21 @@ impl<'a> OpNonce<'a> {
     }
 }
 
+/// #4024 v3d - the signer component of the identity key: the attested actor
+/// (`claimed_by`, whose enrolled key verified the op). Nonces are PER-SIGNER, so
+/// a node cannot front-run another node\'s nonce; the only collision left is a
+/// signer reusing its OWN nonce for different content. An op with no
+/// `claimed_by` keys under the empty signer.
+#[must_use]
+pub fn identity_signer(claimed_by: Option<&str>) -> &str {
+    claimed_by.unwrap_or("")
+}
+
 /// #4024 / F1 - SHA-256 of the canonical signed transition bytes (the exact
 /// bytes the op's Ed25519 signature covers: action, namespace, edge, actor,
 /// nonce, timestamp). It is stored with the identity row and compared on a
 /// probe hit: the SAME digest is an idempotent re-delivery (`noop`), a
-/// DIFFERENT digest under the same `(action_id, nonce)` is an identity
+/// DIFFERENT digest under the same `(action_id, signer, nonce)` is an identity
 /// collision ([`RemoteCasOutcome::IdentityConflict`], never a `noop`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OpDigest([u8; 32]);
@@ -419,7 +429,7 @@ pub enum RemoteCasOutcome {
     /// `skipped` (#4204): `skipped > 0` is the sender's #2341 non-ack, which
     /// would retry an APPLIED op to DLQ quarantine.
     AlreadyApplied,
-    /// `(action_id, nonce)` is already recorded but for a DIFFERENT op (the
+    /// `(action_id, signer, nonce)` is already recorded but for a DIFFERENT op (the
     /// stored digest differs from this op's): an identity collision - another
     /// signer, or the same signer reusing a nonce for different content. The
     /// op is NOT applied and is NOT acknowledged as a `noop` (that would be an
@@ -429,13 +439,13 @@ pub enum RemoteCasOutcome {
 }
 
 /// SQL: is `(action_id, nonce)` a durably recorded, applied operation?
-const SELECT_TRANSITION_NONCE_SQL: &str =
-    "SELECT op_digest FROM action_transition_nonces WHERE action_id = ?1 AND nonce = ?2";
+const SELECT_TRANSITION_NONCE_SQL: &str = "SELECT op_digest FROM action_transition_nonces \
+     WHERE action_id = ?1 AND nonce = ?2 AND claimed_by = ?3";
 
 /// SQL: record an applied operation identity (same transaction as the CAS).
 const INSERT_TRANSITION_NONCE_SQL: &str = "INSERT INTO action_transition_nonces \
-     (action_id, nonce, from_state, to_state, recorded_at, op_digest) \
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6)";
+     (action_id, nonce, from_state, to_state, recorded_at, op_digest, claimed_by) \
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)";
 
 /// #4024 — compare-and-swap a FEDERATED transition and record its operation
 /// identity **atomically**: one `BEGIN IMMEDIATE` transaction holds the
@@ -479,10 +489,13 @@ pub fn transition_cas_once(
     // process on the same file) can interleave between the probe and the
     // writes. A dropped `Transaction` rolls back.
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    // Per-signer nonce namespace (v3d): the identity is `(action_id, signer,
+    // nonce)`, so another node can never occupy this signer's nonce.
+    let signer = identity_signer(claimed_by);
     let stored: Option<Vec<u8>> = tx
         .query_row(
             SELECT_TRANSITION_NONCE_SQL,
-            params![id, nonce.as_bytes()],
+            params![id, nonce.as_bytes(), signer],
             |r| r.get(0),
         )
         .optional()?;
@@ -505,7 +518,8 @@ pub fn transition_cas_once(
                 from.as_str(),
                 to.as_str(),
                 chrono::Utc::now().timestamp(),
-                digest.as_bytes().as_slice()
+                digest.as_bytes().as_slice(),
+                signer
             ],
         )?;
         tx.commit()?;

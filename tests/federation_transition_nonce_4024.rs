@@ -27,6 +27,7 @@
 
 #![cfg(feature = "sal")]
 #![allow(clippy::too_many_lines)]
+#![allow(clippy::many_single_char_names)]
 #![allow(clippy::doc_markdown)]
 
 use std::sync::Arc;
@@ -652,15 +653,15 @@ fn sqlite_identity_rows(path: &std::path::Path, action_id: &str) -> i64 {
     .expect("count identity rows")
 }
 
-/// #4024 F1 (sqlite), the reviewer's attack: enrolled node B applies its OWN
-/// signed transition under node A's nonce first; A's real op then arrives. It
-/// must be `skipped` with a collision WARN - never an acknowledged `noop` of an
-/// op that never applied.
+/// #4024 v3d (sqlite): nonces are PER-SIGNER. Enrolled node B applies its OWN
+/// signed transition under A\'s nonce FIRST (a normal B op); A\'s real op under
+/// that nonce must then APPLY - not skipped (no front-run DoS), not noop - and
+/// both identity rows exist under their own signer.
 #[tokio::test]
-async fn sqlite_identity_collision_other_signer_is_skipped_not_noop_4024_f1() {
+async fn sqlite_other_signers_nonce_use_does_not_block_the_real_op_4024_v3d() {
     let _g = FED_ENV_LOCK.lock().await;
-    let ns = uniq("ns4024f1a");
-    let (a, b) = enroll_pair("ai:fed4024f1-sq-a", "ai:fed4024f1-sq-b", &ns);
+    let ns = uniq("ns4024v3da");
+    let (a, b) = enroll_pair("ai:fed4024v3d-sq-a", "ai:fed4024v3d-sq-b", &ns);
     let f = sqlite_fixture(&a.id, &ns);
     let nonce = b"stolen-nonce-016";
     let op_b = signed_op(
@@ -672,6 +673,15 @@ async fn sqlite_identity_collision_other_signer_is_skipped_not_noop_4024_f1() {
         nonce,
         1_700_009_100,
     );
+    let release = signed_op(
+        &b,
+        &f.action_id,
+        &f.ns,
+        ActionState::Claimed,
+        ActionState::Pending,
+        b"b-release-nonce1",
+        1_700_009_150,
+    );
     let op_a = signed_op(
         &a,
         &f.action_id,
@@ -679,23 +689,39 @@ async fn sqlite_identity_collision_other_signer_is_skipped_not_noop_4024_f1() {
         ActionState::Pending,
         ActionState::Claimed,
         nonce,
-        1_700_009_101,
+        1_700_009_200,
     );
     assert_applied(
         &push(&f.router, &b.id, &op_b).await,
         "B applies its own op under A\'s nonce",
     );
+    assert_applied(&push(&f.router, &b.id, &release).await, "B releases");
     let (r, logs) = push_logged(&f.router, &a.id, &op_a).await;
-    assert_not_acked(
+    assert_applied(
         &r,
-        "F1: A\'s real op under a colliding nonce is skipped, never a noop",
+        "v3d: A\'s real op applies (per-signer nonce), never skipped or noop\'d",
     );
     assert!(
-        logs.contains("identity collision"),
-        "F1: a distinct collision WARN is required; logs={logs}"
+        !logs.contains("identity collision"),
+        "no collision for another signer; logs={logs}"
     );
     assert_eq!(sqlite_state(&f.path, &f.action_id), ActionState::Claimed);
-    assert_eq!(sqlite_identity_rows(&f.path, &f.action_id), 1);
+    assert_eq!(
+        sqlite_identity_rows(&f.path, &f.action_id),
+        3,
+        "B(nonce), B(release), A(nonce)"
+    );
+    let conn = ai_memory::db::open(&f.path).expect("conn");
+    for (who, want) in [(&a.id, 1i64), (&b.id, 2)] {
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM action_transition_nonces WHERE action_id = ?1 AND claimed_by = ?2",
+                [&f.action_id, who],
+                |r| r.get(0),
+            )
+            .expect("count");
+        assert_eq!(n, want, "rows under {who}");
+    }
 }
 
 /// #4024 F1 (sqlite) honest-reuse variant: one signer reuses a nonce for a
@@ -1188,18 +1214,22 @@ mod pg {
             .expect("count identity rows")
     }
 
-    /// #4024 F1 (pg): the reviewer\'s attack, see the sqlite twin.
+    /// #4024 v3d (pg): per-signer nonces, see the sqlite twin.
     #[tokio::test]
-    async fn pg_identity_collision_other_signer_is_skipped_not_noop_4024_f1() {
+    async fn pg_other_signers_nonce_use_does_not_block_the_real_op_4024_v3d() {
         let _g = FED_ENV_LOCK.lock().await;
         let Some(url) = pg_url() else {
             eprintln!(
-                "SKIP pg_identity_collision_other_signer_is_skipped_not_noop_4024_f1: env unset"
+                "SKIP pg_other_signers_nonce_use_does_not_block_the_real_op_4024_v3d: env unset"
             );
             return;
         };
-        let ns = uniq("pgns4024f1a");
-        let (a, b) = enroll_pair(&uniq("ai:fed4024f1-pg-a"), &uniq("ai:fed4024f1-pg-b"), &ns);
+        let ns = uniq("pgns4024v3da");
+        let (a, b) = enroll_pair(
+            &uniq("ai:fed4024v3d-pg-a"),
+            &uniq("ai:fed4024v3d-pg-b"),
+            &ns,
+        );
         let f = pg_fixture(&url, &a.id, &ns).await;
         let nonce = b"stolen-nonce-016";
         let op_b = signed_op(
@@ -1211,6 +1241,15 @@ mod pg {
             nonce,
             1_700_009_100,
         );
+        let release = signed_op(
+            &b,
+            &f.action_id,
+            &f.ns,
+            ActionState::Claimed,
+            ActionState::Pending,
+            b"b-release-nonce1",
+            1_700_009_150,
+        );
         let op_a = signed_op(
             &a,
             &f.action_id,
@@ -1218,20 +1257,32 @@ mod pg {
             ActionState::Pending,
             ActionState::Claimed,
             nonce,
-            1_700_009_101,
+            1_700_009_200,
         );
         assert_applied(
             &push(&f.router, &b.id, &op_b).await,
             "B applies its own op (pg)",
         );
+        assert_applied(&push(&f.router, &b.id, &release).await, "B releases (pg)");
         let (r, logs) = push_logged(&f.router, &a.id, &op_a).await;
-        assert_not_acked(
+        assert_applied(
             &r,
-            "F1 (pg): A\'s real op under a colliding nonce is skipped, never a noop",
+            "v3d (pg): A\'s real op applies, never skipped or noop\'d",
         );
-        assert!(logs.contains("identity collision"), "logs={logs}");
+        assert!(!logs.contains("identity collision"), "logs={logs}");
         assert_eq!(f.state().await, ActionState::Claimed);
-        assert_eq!(pg_identity_rows(&f).await, 1);
+        assert_eq!(pg_identity_rows(&f).await, 3);
+        for (who, want) in [(&a.id, 1i64), (&b.id, 2)] {
+            let n: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM action_transition_nonces WHERE action_id = $1 AND claimed_by = $2",
+            )
+            .bind(&f.action_id)
+            .bind(who)
+            .fetch_one(f.store.pool())
+            .await
+            .expect("count");
+            assert_eq!(n, want, "rows under {who} (pg)");
+        }
     }
 
     /// #4024 F1 (pg) honest-reuse variant.

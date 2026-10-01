@@ -30,6 +30,11 @@
 -- #4024 security review. Rows are written ONLY for ops whose signature was
 -- VERIFIED against the actor's enrolled key (F2) and whose nonce is exactly 16
 -- bytes (F3).
+-- `claimed_by` is the attested SIGNER: the key is `(action_id, claimed_by,
+-- nonce)`, so nonces are PER-SIGNER and an authorized node cannot front-run
+-- another node's nonce to push its legitimate op into skipped/DLQ/quarantine.
+-- The only collision left is a signer reusing its own nonce for different
+-- content (same signer + nonce + different digest => skipped + WARN).
 -- `ON DELETE RESTRICT` (5-agent vote 4d3ea1c5, decision f41cf98b): no production
 -- action-delete path exists today, so RESTRICT costs nothing, and it forces any
 -- FUTURE delete / purge / re-create path to handle transition identities
@@ -43,8 +48,9 @@ CREATE TABLE IF NOT EXISTS action_transition_nonces (
     action_id  TEXT    NOT NULL REFERENCES actions(id) ON DELETE RESTRICT,
     nonce      BLOB    NOT NULL,
     op_digest  BLOB    NOT NULL,
+    claimed_by TEXT    NOT NULL,
     from_state TEXT    NOT NULL,
     to_state   TEXT    NOT NULL,
     recorded_at INTEGER NOT NULL,
-    PRIMARY KEY (action_id, nonce)
+    PRIMARY KEY (action_id, claimed_by, nonce)
 ) WITHOUT ROWID;

@@ -1798,7 +1798,7 @@ pub(super) fn tally_remote_transition<E: std::fmt::Display>(
         }
         Ok(RemoteCasOutcome::IdentityConflict) => {
             // F1 (#4024 security review): the nonce is already recorded for a
-            // DIFFERENT op (another signer, or a signer reusing a nonce for
+            // DIFFERENT op (the SAME signer reusing its own nonce for
             // different content). Never a noop: that would acknowledge an op
             // that was not applied. Skipped = the sender's visible non-ack.
             tracing::warn!(

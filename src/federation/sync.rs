@@ -366,7 +366,7 @@ async fn post_once_unobserved(
 ///   bytes, makes it an acked noop that re-applies nothing). An action
 ///   TRANSITION whose CAS misses is `skipped` (#4024: a miss does not prove
 ///   the op was applied, so it must stay un-acked and be retried), and so is
-///   one whose `(action_id, nonce)` identity is recorded for a DIFFERENT op
+///   one whose `(action_id, signer, nonce)` identity is recorded for a DIFFERENT op
 ///   (an identity collision, never a noop) or whose nonce is not 16 bytes.
 ///
 /// Everything else stays an ack: absent counters (legacy peers / plain

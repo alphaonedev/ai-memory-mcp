@@ -7508,8 +7508,8 @@ enabled = true
         .expect("seed action");
         conn.execute(
             "INSERT INTO action_transition_nonces \
-             (action_id, nonce, from_state, to_state, recorded_at, op_digest) \
-             VALUES ('a-4024', x'01', 'pending', 'claimed', 1, x'02')",
+             (action_id, nonce, from_state, to_state, recorded_at, op_digest, claimed_by) \
+             VALUES ('a-4024', x'01', 'pending', 'claimed', 1, x'02', 'ai:doctor')",
             [],
         )
         .expect("seed identity");

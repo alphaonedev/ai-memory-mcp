@@ -192,8 +192,10 @@ daemon so Postgres-backed / MCP-over-HTTP deployments can drive them
   records NO identity, so replay protection (#1805) covers VERIFIED ops only
   and an unauthenticated nonce can never pre-empt the real actor's signed
   op. The identity row binds a SHA-256 of the canonical signed bytes: a
-  re-delivery of the same op is an idempotent `noop`; a different op under
-  the same `(action_id, nonce)` is `skipped` (collision WARN), never a
+  re-delivery of the same op is an idempotent `noop`; nonces are PER-SIGNER (the key is
+  `(action_id, claimed_by, nonce)`), so another node cannot occupy a
+  signer\'s nonce; the only collision is a signer reusing its OWN nonce for a
+  different op, which is `skipped` (collision WARN), never a
   `noop`; a nonce that is not exactly 16 bytes is refused. Under the hatch an unsigned op's
   re-delivery is NOT a noop (no identity): its CAS misses, so it is `skipped`,
   lands in the push-DLQ and is quarantined after about 100 retries. On a shared

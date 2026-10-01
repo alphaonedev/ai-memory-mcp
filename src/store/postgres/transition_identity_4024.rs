@@ -6,7 +6,7 @@
 //! half of `crate::actions::transition_cas_once`).
 //!
 //! A row in `action_transition_nonces` (schema v101) means exactly one thing:
-//! the transition `(action_id, nonce)` WAS applied on this node. The identity
+//! the transition `(action_id, claimed_by, nonce)` WAS applied on this node. The identity
 //! is inserted iff the CAS applied, inside the transaction that performs it,
 //! so a CAS miss, an illegal edge or a not-found writes nothing (the op stays
 //! applicable on a retry) and any error rolls back BOTH the state change and
@@ -62,10 +62,11 @@ impl PostgresStore {
         };
         let stored: Option<Vec<u8>> = sqlx::query_scalar(
             "SELECT op_digest FROM action_transition_nonces \
-             WHERE action_id = $1 AND nonce = $2",
+             WHERE action_id = $1 AND nonce = $2 AND claimed_by = $3",
         )
         .bind(t.action_id)
         .bind(t.nonce.as_bytes())
+        .bind(crate::actions::identity_signer(t.claimed_by))
         .fetch_optional(&mut *tx)
         .await
         .map_err(|e| to_store_err("action_transition_cas_once identity probe", e))?;
@@ -96,8 +97,8 @@ impl PostgresStore {
         .map_err(|e| to_store_err("action_transition_cas_once update", e))?;
         sqlx::query(
             "INSERT INTO action_transition_nonces \
-             (action_id, nonce, from_state, to_state, recorded_at, op_digest) \
-             VALUES ($1, $2, $3, $4, $5, $6)",
+             (action_id, nonce, from_state, to_state, recorded_at, op_digest, claimed_by) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
         )
         .bind(t.action_id)
         .bind(t.nonce.as_bytes())
@@ -105,6 +106,7 @@ impl PostgresStore {
         .bind(to.as_str())
         .bind(chrono::Utc::now().timestamp())
         .bind(t.digest.as_bytes().as_slice())
+        .bind(crate::actions::identity_signer(t.claimed_by))
         .execute(&mut *tx)
         .await
         .map_err(|e| to_store_err("action_transition_cas_once identity insert", e))?;
