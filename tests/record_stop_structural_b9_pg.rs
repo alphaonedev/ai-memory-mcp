@@ -310,7 +310,10 @@ fn scan(sources: &[(String, String)]) -> Scan {
     let texts: Vec<(String, String, String)> = sources
         .iter()
         .map(|(rel, text)| {
-            let masked = pg_sources::mask_rust(text);
+            // Fail closed: an unterminated literal/comment would fold every
+            // later fn header into the opening method (K3).
+            let masked =
+                pg_sources::try_mask_rust(text).unwrap_or_else(|e| panic!("B9: {rel}: {e}"));
             // The test-module cut is found on the MASKED text so a string that
             // mimics the `mod tests` header cannot truncate the scan.
             let cut = strip_test_mod(&masked).len();
@@ -377,6 +380,19 @@ fn scan(sources: &[(String, String)]) -> Scan {
                 .map(|(_, l)| *l)
                 .collect::<Vec<_>>()
                 .join("\n");
+            // The gate marker is looked for in CODE only: a marker that shows
+            // up only in a comment or string of an ungated writer is not a
+            // gate (G1).
+            let masked_body = masked[*start..end]
+                .iter()
+                .enumerate()
+                .filter(|(off, _)| {
+                    let idx = start + off;
+                    !items.iter().any(|it| it.start <= idx && idx <= it.end)
+                })
+                .map(|(_, l)| *l)
+                .collect::<Vec<_>>()
+                .join("\n");
             let mut tables: HashSet<String> = tables_written(&body)
                 .into_iter()
                 .filter(|t| record_plane.contains(t.as_str()))
@@ -390,9 +406,7 @@ fn scan(sources: &[(String, String)]) -> Scan {
                 continue;
             }
             out.surfaced.insert(name.clone());
-            // The gate marker is looked for in the method's own span, consts
-            // lifted out as for the tables.
-            if GATE_MARKERS.iter().any(|g| body.contains(g)) {
+            if GATE_MARKERS.iter().any(|g| masked_body.contains(g)) {
                 out.gated.insert(name.clone());
                 continue;
             }
@@ -637,4 +651,110 @@ fn mask_rust_blanks_literals_and_comments_and_keeps_layout_4023() {
     assert!(m.contains("fn f<'a>(x: &'a str) -> char {"), "{m}");
     assert!(m.contains("let keep = 1;"), "{m}");
     assert!(m.contains("let c ="), "{m}");
+}
+
+// --- #4023 K3 / G1: fail closed on an unterminated literal; a gate marker in a
+// comment or string is not a gate.
+
+fn assert_unterminated(src: &str, what: &str, offset: usize) {
+    let err = pg_sources::try_mask_rust(src).expect_err("must fail closed");
+    assert_eq!(err.what, what, "{err}");
+    assert_eq!(err.offset, offset, "{err}");
+}
+
+#[test]
+fn unterminated_raw_string_fails_closed_4023_k3() {
+    assert_unterminated(
+        "fn a() {}\nlet q = r#\"never closed\nfn b() {}\n",
+        "raw string",
+        18,
+    );
+    // A raw string whose closer has too few hashes is still open.
+    assert_unterminated("let q = r##\"x\"# y\n", "raw string", 8);
+}
+
+#[test]
+fn unterminated_string_fails_closed_4023_k3() {
+    assert_unterminated(
+        "fn a() {}\nlet q = \"never closed\nfn b() {}\n",
+        "string literal",
+        18,
+    );
+}
+
+#[test]
+fn unterminated_nested_block_comment_fails_closed_4023_k3() {
+    // Depth 2 opened, only one closer: still open.
+    assert_unterminated(
+        "fn a() {}\n/* outer /* inner */ tail\nfn b() {}\n",
+        "block comment",
+        10,
+    );
+}
+
+#[test]
+fn terminated_literals_at_the_same_positions_still_mask_4023_k3() {
+    for src in [
+        "fn a() {}\nlet q = r#\"closed\"#;\nfn b() {}\n",
+        "fn a() {}\nlet q = \"closed\";\nfn b() {}\n",
+        "fn a() {}\n/* outer /* inner */ tail */\nfn b() {}\n",
+    ] {
+        let m = pg_sources::try_mask_rust(src).expect("terminated input masks");
+        assert!(m.contains("fn b() {}"), "later fn header must survive: {m}");
+        assert_eq!(m.len(), src.len());
+    }
+}
+
+#[test]
+#[should_panic(
+    expected = "src/store/postgres/synth.rs: unterminated raw string starting at byte offset"
+)]
+fn the_scan_panics_naming_the_file_on_an_unterminated_literal_4023_k3() {
+    let src = "impl PostgresStore {\n    async fn a(&self) {\n        self.gate_record_stop().await?;\n        \
+               let _q = r#\"oops\n    }\n    async fn w(&self) {\n        \
+               sqlx::query(\"UPDATE memories SET t = 1\");\n    }\n}\n";
+    let _ = scan(&[("src/store/postgres/synth.rs".to_string(), src.to_string())]);
+}
+
+#[test]
+fn gate_marker_only_in_a_comment_or_string_is_not_a_gate_4023_g1() {
+    let c = synth(
+        "    async fn writer(&self) {\n        // self.gate_record_stop().await?;\n        \
+         sqlx::query(\"UPDATE memories SET t = 1\");\n    }\n",
+        "",
+    );
+    assert!(names_ungated(&c, "writer"), "comment: {:?}", c.ungated);
+    let t = synth(
+        "    async fn writer(&self) {\n        let _n = \"gate_record_stop\";\n        \
+         sqlx::query(\"UPDATE memories SET t = 1\");\n    }\n",
+        "",
+    );
+    assert!(names_ungated(&t, "writer"), "string: {:?}", t.ungated);
+    let real = synth(
+        "    async fn writer(&self) {\n        self.gate_record_stop().await?;\n        \
+         sqlx::query(\"UPDATE memories SET t = 1\");\n    }\n",
+        "",
+    );
+    assert!(
+        real.ungated.is_empty(),
+        "a real gate call is green: {:?}",
+        real.ungated
+    );
+}
+
+#[test]
+fn a_desync_that_resyncs_through_a_comment_fails_closed_4023_k3() {
+    // An unterminated `"` flips string state; a later comment line holding an
+    // odd quote would flip it back, so the end-of-input check alone stays
+    // silent. A plain string running onto a `//` line is reported instead.
+    let src = "fn a() {\n    let q = \"oops\n}\n    // a \"quoted word\nfn b() {}\n";
+    let err = pg_sources::try_mask_rust(src).expect_err("must fail closed");
+    assert!(err.what.contains("lexer desync"), "{err}");
+}
+
+#[test]
+fn a_top_level_item_at_nonzero_brace_depth_fails_closed_4023_k3() {
+    let src = "impl A {\n    fn a(&self) {\n}\nimpl B {}\n";
+    let err = pg_sources::try_mask_rust(src).expect_err("must fail closed");
+    assert!(err.what.contains("lexer desync"), "{err}");
 }
