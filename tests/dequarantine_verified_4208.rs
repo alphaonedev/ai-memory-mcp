@@ -143,3 +143,62 @@ async fn sqlite_absent_or_open_row_releases_nothing_4208() {
             .expect("already open")
     );
 }
+
+/// #4314 — the primitive must JOIN a caller-held transaction instead of
+/// nesting its own `BEGIN IMMEDIATE`. Pre-fix the nested BEGIN errored
+/// ("cannot start a transaction within a transaction"), so an attested row
+/// that should be released stayed quarantined. Commit of the outer
+/// transaction must land the release.
+#[tokio::test]
+async fn sqlite_releases_inside_caller_transaction_4314() {
+    let fx = seeded_quarantined("signed text").await;
+    let v = mem("signed text", Some("agent_attested"));
+    let c = rusqlite::Connection::open(&fx.path).expect("raw");
+    c.execute_batch("BEGIN IMMEDIATE").expect("outer begin");
+    let released = ai_memory::storage::dequarantine_if_verified_unit(&c, ID, &v)
+        .expect("must join the caller's transaction, not nest a BEGIN");
+    assert!(
+        released,
+        "attested unit must be released inside the outer txn"
+    );
+    assert!(
+        !c.is_autocommit(),
+        "the caller's transaction must stay open"
+    );
+    c.execute_batch("COMMIT").expect("outer commit");
+    assert_eq!(state(&fx), "open");
+}
+
+/// #4314 — joining means the CALLER decides: an outer ROLLBACK undoes the
+/// release (it was not committed on its own), so the row stays quarantined.
+#[tokio::test]
+async fn sqlite_outer_rollback_undoes_joined_release_4314() {
+    let fx = seeded_quarantined("signed text").await;
+    let v = mem("signed text", Some("agent_attested"));
+    let c = rusqlite::Connection::open(&fx.path).expect("raw");
+    c.execute_batch("BEGIN IMMEDIATE").expect("outer begin");
+    let released = ai_memory::storage::dequarantine_if_verified_unit(&c, ID, &v)
+        .expect("must join the caller's transaction, not nest a BEGIN");
+    assert!(released);
+    c.execute_batch("ROLLBACK").expect("outer rollback");
+    assert_eq!(state(&fx), "quarantined");
+}
+
+/// #4314 — a mismatch inside a caller transaction releases nothing and
+/// leaves the caller's transaction open and usable.
+#[tokio::test]
+async fn sqlite_mismatch_inside_caller_transaction_keeps_quarantine_4314() {
+    let fx = seeded_quarantined("local never-attested text").await;
+    let v = mem("signed text", Some("agent_attested"));
+    let c = rusqlite::Connection::open(&fx.path).expect("raw");
+    c.execute_batch("BEGIN IMMEDIATE").expect("outer begin");
+    let released = ai_memory::storage::dequarantine_if_verified_unit(&c, ID, &v)
+        .expect("must join the caller's transaction, not nest a BEGIN");
+    assert!(!released);
+    assert!(
+        !c.is_autocommit(),
+        "the caller's transaction must stay open"
+    );
+    c.execute_batch("COMMIT").expect("outer commit");
+    assert_eq!(state(&fx), "quarantined");
+}
