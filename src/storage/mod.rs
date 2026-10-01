@@ -896,6 +896,9 @@ pub mod lockout;
 pub mod migration_meta;
 pub mod migrations;
 pub mod model_attest;
+// #4025 — federated approval committed only after its effect landed.
+mod pending_approve_execute_4025;
+pub use pending_approve_execute_4025::{FederatedApproveOutcome, approve_execute_pending_action};
 /// #1955 [P1][R45] — substrate record-stop actuator (storage layer): the
 /// non-feature-gated flag registry + attestation logic + the
 /// `StorageError::RecordStopped` `db::`-funnel gate. Lives here (not under
@@ -23830,6 +23833,10 @@ pub fn decide_pending_action(
 /// caller's primary mutation MUST NOT roll back on audit failure.
 /// Mirrors the same posture as `memory_link.invalidated` emit (the
 /// audit chain is allowed to gap, the underlying write is not).
+/// #4025 — the audit event type appended once an approved pending action's
+/// effect has landed. One name for every emit site on both backends.
+pub(crate) const PENDING_ACTION_APPROVED_EVENT: &str = "pending_action.approved";
+
 fn emit_pending_action_event(
     conn: &Connection,
     pa: &PendingAction,
@@ -24203,10 +24210,9 @@ pub fn approve_with_approver_type(
         return Ok(ApproveOutcome::NotFound);
     };
     if pa.status != "pending" {
-        return Ok(ApproveOutcome::Rejected(format!(
-            "already decided: status={}",
-            pa.status
-        )));
+        return Ok(ApproveOutcome::Rejected(
+            crate::errors::msg::pending_already_decided(&pa.status),
+        ));
     }
     // Resolve the namespace's approver type. If no policy, default to Human —
     // which accepts any approval (back-compat with 1.9 callers).
@@ -24446,12 +24452,31 @@ pub fn execute_pending_action(conn: &Connection, pending_id: &str) -> Result<Opt
             },
         ));
     }
+    let memory_id = execute_pending_effect(conn, &pa)?;
+    // S5-M1: emit the approve audit row after the side-effecting write
+    // succeeded so the audit chain reflects the post-execute state. The
+    // emit is best-effort (warn-only) so an audit-side failure does not
+    // roll back the governance decision.
+    emit_pending_action_event(
+        conn,
+        &pa,
+        PENDING_ACTION_APPROVED_EVENT,
+        pa.decided_by.as_deref(),
+    );
+    Ok(memory_id)
+}
+
+/// #4025 — the side-effecting half of [`execute_pending_action`], split out so
+/// the federated approve funnel can run the effect BEFORE it commits the
+/// approval (see `pending_approve_execute_4025`). `pa` is the row to execute
+/// as-if approved; the caller owns the status contract.
+fn execute_pending_effect(conn: &Connection, pa: &PendingAction) -> Result<Option<String>> {
     // S5-H4: refuse approver-on-behalf laundering BEFORE the side-effecting
     // write. Emit an audit row on refusal so the laundering attempt is
     // captured by the signed_events chain even when the substrate
     // bails the execute.
-    if let Err(e) = verify_payload_agent_id(&pa) {
-        emit_pending_action_event(conn, &pa, "pending_action.refused_agent_id_mismatch", None);
+    if let Err(e) = verify_payload_agent_id(pa) {
+        emit_pending_action_event(conn, pa, "pending_action.refused_agent_id_mismatch", None);
         return Err(e);
     }
     let memory_id = match pa.action_type.as_str() {
@@ -24531,7 +24556,7 @@ pub fn execute_pending_action(conn: &Connection, pending_id: &str) -> Result<Opt
                     // execute must re-evaluate dest write (no queue: an
                     // Approve here would insert a second pending). Deny or
                     // still-Pending ⇒ refuse; do not clone into a forbidden ns.
-                    refuse_unapproved_destination_store(conn, &pa, to_ns)?;
+                    refuse_unapproved_destination_store(conn, pa, to_ns)?;
                     let clone_id =
                         promote_to_namespace(conn, &mid, to_ns, Some(pa.requested_by.as_str()))?;
                     Some(clone_id)
@@ -24556,7 +24581,7 @@ pub fn execute_pending_action(conn: &Connection, pending_id: &str) -> Result<Opt
                 None
             }
         }
-        "reflect" => execute_reflect_from_payload(conn, &pa)?,
+        "reflect" => execute_reflect_from_payload(conn, pa)?,
         other => {
             // #962 typed envelope.
             return Err(anyhow::Error::new(StorageError::InvalidArgument {
@@ -24564,16 +24589,6 @@ pub fn execute_pending_action(conn: &Connection, pending_id: &str) -> Result<Opt
             }));
         }
     };
-    // S5-M1: emit the approve audit row after the side-effecting write
-    // succeeded so the audit chain reflects the post-execute state. The
-    // emit is best-effort (warn-only) so an audit-side failure does not
-    // roll back the governance decision.
-    emit_pending_action_event(
-        conn,
-        &pa,
-        "pending_action.approved",
-        pa.decided_by.as_deref(),
-    );
     Ok(memory_id)
 }
 

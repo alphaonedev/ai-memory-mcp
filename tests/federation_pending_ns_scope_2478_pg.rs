@@ -904,10 +904,25 @@ async fn federated_approve_rebinds_forged_decider_on_postgres_3628() {
             action_type: "store".to_string(),
             memory_id: None,
             namespace: namespace.clone(),
+            // #4025 — a WELL-FORMED store payload: the approval now becomes
+            // durable only once its effect lands, so a fixture whose payload
+            // cannot execute would (correctly) stay pending.
             payload: json!({
+                "id": uuid::Uuid::new_v4().to_string(),
+                "tier": "long",
+                "namespace": namespace,
                 "title": uniq(&format!("3628-{tag}")),
                 "content": format!("3628 {tag} content"),
-                "namespace": namespace
+                "tags": [],
+                "priority": 5,
+                "confidence": 1.0,
+                "source": "api",
+                "access_count": 0,
+                "created_at": chrono::Utc::now().to_rfc3339(),
+                "updated_at": chrono::Utc::now().to_rfc3339(),
+                "metadata": {"agent_id": requester},
+                "reflection_depth": 0,
+                "memory_kind": "observation",
             }),
             requested_by: requester.clone(),
             requested_at: chrono::Utc::now().to_rfc3339(),

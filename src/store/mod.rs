@@ -1814,6 +1814,37 @@ pub trait MemoryStore: Send + Sync {
         })
     }
 
+    /// #4025 — the FEDERATED approval of a pending action, as ONE
+    /// approve-then-effect unit whose approval becomes durable only after the
+    /// effect landed (see `crate::storage::approve_execute_pending_action`).
+    ///
+    /// The separate [`approve_with_approver_type`](MemoryStore::approve_with_approver_type)
+    /// + [`execute_pending_action`](MemoryStore::execute_pending_action) pair
+    /// commits `approved` first, so a failed or interrupted execution left an
+    /// approved row with no effect that every redelivery then refused as
+    /// "already decided". Here a failed effect commits nothing (a redelivery
+    /// retries), and an `approved` row reports
+    /// [`AlreadyApproved`](crate::storage::FederatedApproveOutcome::AlreadyApproved)
+    /// so a lost-response redelivery acknowledges as a converged no-op. The
+    /// approver-eligibility gate is the same one the approve surface runs.
+    ///
+    /// Default: `UnsupportedCapability` (fail closed — never approve without
+    /// the completion guarantee).
+    ///
+    /// # Errors
+    ///
+    /// A storage failure, or the effect's own error (nothing committed).
+    async fn approve_execute_pending_action(
+        &self,
+        _ctx: &CallerContext,
+        _pending_id: &str,
+        _approver_agent_id: &str,
+    ) -> StoreResult<crate::storage::FederatedApproveOutcome> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "FEDERATED_APPROVE_EXECUTE".to_string(),
+        })
+    }
+
     /// Execute an approved pending governance action — mirrors
     /// `db::execute_pending_action` on the SQLite path. The pending
     /// row's `action_type` selects the operation (`store` / `delete`

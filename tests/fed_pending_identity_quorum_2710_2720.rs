@@ -494,10 +494,25 @@ async fn federated_approve_rebinds_forged_decider_3628() {
                 action_type: "store".into(),
                 memory_id: None,
                 namespace: "public/ok".into(),
+                // #4025 — a WELL-FORMED store payload: the approval now
+                // becomes durable only once its effect lands, so a fixture
+                // whose payload cannot execute would (correctly) stay pending.
                 payload: json!({
+                    "id": uuid::Uuid::new_v4().to_string(),
+                    "tier": "long",
+                    "namespace": "public/ok",
                     "title": format!("{id} title"),
                     "content": format!("{id} content"),
-                    "namespace": "public/ok"
+                    "tags": [],
+                    "priority": 5,
+                    "confidence": 1.0,
+                    "source": "api",
+                    "access_count": 0,
+                    "created_at": chrono::Utc::now().to_rfc3339(),
+                    "updated_at": chrono::Utc::now().to_rfc3339(),
+                    "metadata": {"agent_id": REQUESTER},
+                    "reflection_depth": 0,
+                    "memory_kind": "observation",
                 }),
                 requested_by: REQUESTER.into(),
                 requested_at: chrono::Utc::now().to_rfc3339(),

@@ -440,6 +440,15 @@ pub mod msg {
         format!("{SKILL_NOT_FOUND}: {skill_id}")
     }
 
+    /// `"already decided: status={status}"` — the refusal an approve surface
+    /// returns for a pending action that is no longer `pending`. #4025: one
+    /// builder for the approve surface and the federated approve-then-effect
+    /// unit on both backends.
+    #[must_use]
+    pub fn pending_already_decided(status: impl std::fmt::Display) -> String {
+        format!("already decided: status={status}")
+    }
+
     /// `"pending action not found: {pending_id}"`.
     #[must_use]
     pub fn pending_action_not_found(pending_id: impl std::fmt::Display) -> String {

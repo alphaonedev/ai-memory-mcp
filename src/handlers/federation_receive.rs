@@ -3906,61 +3906,57 @@ async fn sync_push_write(
                     && pa.memory_id.as_deref().is_some_and(|mid| {
                         matches!(db::namespace_by_id(&lock.0, mid), Ok(Some(_)))
                     });
-            match db::approve_with_approver_type(
+            // #4025 — ONE approve-then-effect unit: the approval becomes
+            // durable only after the effect landed. Pre-fix the approval
+            // committed first, so a failed (or interrupted) execution left an
+            // `approved` row with no effect and every redelivery was refused as
+            // "already decided" — the effect could never be completed.
+            match db::approve_execute_pending_action(
                 &lock.0,
                 &dec.id,
                 &bound_decider,
                 db::ApproveSurface::Http,
             ) {
-                Ok(db::ApproveOutcome::Approved) => {
+                Ok(db::FederatedApproveOutcome::Executed(_)) => {
                     pending_decisions_applied += 1;
-                    // Replay the pending payload so the target write lands
-                    // on this peer — matches the originator's post-approve
-                    // state.
-                    match db::execute_pending_action(&lock.0, &dec.id) {
-                        Ok(_) => {
-                            // #2478 — a pending-executed hard DELETE was
-                            // previously invisible in the 200: it incremented no
-                            // destructive counter at all, so an operator reading
-                            // the envelope could not tell that rows had been
-                            // erased by this push.
-                            if delete_target_existed {
-                                deleted += 1;
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "sync_push: execute_pending_action failed for {}: {e}",
-                                dec.id
-                            );
-                            // #2478 — without this the decision counted APPLIED
-                            // while its side effect never landed and `skipped`
-                            // stayed 0, so `success_report_non_ack_reason` saw a
-                            // clean report and the sender ACKed a write that does
-                            // not exist here.
-                            skipped += 1;
-                        }
+                    // #2478 — a pending-executed hard DELETE was previously
+                    // invisible in the 200: report rows actually destroyed.
+                    if delete_target_existed {
+                        deleted += 1;
                     }
                 }
                 // Consensus-gated: the relayed vote was recorded but quorum
                 // is not yet met on this peer — nothing to execute.
-                Ok(db::ApproveOutcome::Pending { .. }) => pending_decisions_applied += 1,
-                // Already decided / unknown pending — converged / no-op.
-                Ok(db::ApproveOutcome::NotFound) => noop += 1,
-                Ok(db::ApproveOutcome::Rejected(reason)) => {
+                Ok(db::FederatedApproveOutcome::VotePending { .. }) => {
+                    pending_decisions_applied += 1;
+                }
+                // #4025 — `approved` here means its effect landed (this unit
+                // commits the approval only after the effect): a redelivery,
+                // e.g. after a lost response, is the converged no-op, not a
+                // refusal that would keep the sender from ever acknowledging.
+                // An unknown pending is the same converged no-op.
+                Ok(
+                    db::FederatedApproveOutcome::AlreadyApproved
+                    | db::FederatedApproveOutcome::NotFound,
+                ) => noop += 1,
+                Ok(db::FederatedApproveOutcome::Refused(reason)) => {
                     tracing::warn!(
                         target: ATTESTATION_TRACE_TARGET,
                         pending_id = %dec.id,
                         decider = %dec.decider,
                         bound_decider = %bound_decider,
-                        "sync_push: refusing forged / unauthorized federated approval (#1920): \
-                         {reason}"
+                        "sync_push: refusing forged / unauthorized / conflicting federated \
+                         approval (#1920): {reason}"
                     );
                     skipped += 1;
                 }
                 Err(e) => {
+                    // #4025 — nothing about the decision was committed (the row
+                    // stays `pending`), so the sender's retry re-runs the unit.
+                    // #2478 — counted `skipped` so the sender never ACKs a write
+                    // that does not exist here.
                     tracing::warn!(
-                        "sync_push: approve_with_approver_type failed for {}: {e}",
+                        "sync_push: approve_execute_pending_action failed for {}: {e}",
                         dec.id
                     );
                     skipped += 1;
