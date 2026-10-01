@@ -12496,13 +12496,6 @@ mod tests {
         governance: Value,
     ) {
         let now = chrono::Utc::now().to_rfc3339();
-        // #4285 / #4357 — a standard whose governance blob does not satisfy the
-        // typed shape is a CORRUPT level that contributes no raw knobs, so the
-        // fixture must be a valid policy: the typed shape requires `write`.
-        let mut governance = governance;
-        if let Some(obj) = governance.as_object_mut() {
-            obj.entry("write").or_insert_with(|| json!("any"));
-        }
         let metadata = json!({
             "agent_id": "test-agent-reflect",
             "governance": governance,
@@ -12892,7 +12885,10 @@ mod tests {
         reflect_test_seed_governance(
             &conn,
             "team/r-under",
-            json!({"require_approval_above_depth": 5}),
+            // #4357 — this cell needs a VALID policy (`write` is required by the
+            // typed shape): a threshold-only blob is a corrupt level that fails
+            // closed to approval-required, so it could not "proceed".
+            json!({"write": "any", "require_approval_above_depth": 5}),
         );
         let s1 = reflect_test_seed_source(&conn, "team/r-under", "src-1", 0);
         let req = make_tools_call(
