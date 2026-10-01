@@ -25,7 +25,8 @@
 //! 3. the site is listed as IMMUNE with a written reason (it never reads a
 //!    capture through the callsite cache).
 //!
-//! Stale allowlist entries fail too, so the lists cannot rot.
+//! Stale allowlist entries fail too, so the lists cannot rot — including a
+//! PENDING entry whose test has since been guarded (#4327).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -54,9 +55,10 @@ const HELPERS: &[(&str, &str)] = &[
 ];
 
 /// (file, enclosing fn, tracking): known-unguarded sites whose guard is
-/// already written but rides another landing unit. Accepted guarded or not,
-/// so the other unit landing cannot turn this census red; remove the entry
-/// once it has landed.
+/// already written but rides another landing unit. Accepted ONLY while the
+/// site is still unguarded: once the guard lands the entry is stale and the
+/// census fails (#4327), so the landing unit must remove it in the same
+/// change.
 const PENDING: &[(&str, &str, &str)] = &[(
     "src/federation/mod.rs",
     "broadcast_emits_entry_line_log_for_track_d_grep",
@@ -217,6 +219,53 @@ fn check_helper(
     guarded_calls
 }
 
+/// Classify one install site at line `i`: returns the enclosing fn name (for
+/// the stale-allowlist sweep) and how many guarded tests it accounts for.
+/// `pending` is a parameter so the self-test can drive it with synthetic
+/// entries.
+fn check_install(
+    rel: &str,
+    lines: &[&str],
+    i: usize,
+    pending: &[(&str, &str, &str)],
+    failures: &mut Vec<String>,
+) -> (Option<String>, usize) {
+    let Some((fn_line, name)) = enclosing_fn(lines, i) else {
+        failures.push(format!("{rel}:{}: install outside any fn", i + 1));
+        return (None, 0);
+    };
+    if IMMUNE.iter().any(|(f, n, _)| *f == rel && *n == name) {
+        return (Some(name), 0);
+    }
+    if pending.iter().any(|(f, n, _)| *f == rel && *n == name) {
+        // #4327: PENDING means "guard not landed yet". A guarded test makes
+        // the entry stale; fail so it is removed rather than left to excuse a
+        // later regression that drops the guard again.
+        if guarded(lines, fn_line, i, &name).is_ok() {
+            failures.push(format!(
+                "{rel}:{}: stale PENDING entry: `{name}` is now guarded; \
+                 remove it from PENDING",
+                i + 1
+            ));
+        }
+        return (Some(name), 0);
+    }
+    if HELPERS.iter().any(|(f, n)| *f == rel && *n == name) {
+        let g = check_helper(rel, lines, &name, 0, failures);
+        return (Some(name), g);
+    }
+    match guarded(lines, fn_line, i, &name) {
+        Ok(()) => (Some(name), 1),
+        Err(e) => {
+            failures.push(format!(
+                "{rel}:{}: `{name}` captures tracing in the shared lib binary: {e}",
+                i + 1
+            ));
+            (Some(name), 0)
+        }
+    }
+}
+
 #[test]
 fn every_lib_tracing_capture_runs_in_an_isolated_child_4090() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -244,26 +293,10 @@ fn every_lib_tracing_capture_runs_in_an_isolated_child_4090() {
                 continue;
             }
             sites += 1;
-            let Some((fn_line, name)) = enclosing_fn(&lines, i) else {
-                failures.push(format!("{rel}:{}: install outside any fn", i + 1));
-                continue;
-            };
-            seen.push((rel.clone(), name.clone()));
-            if IMMUNE.iter().any(|(f, n, _)| *f == rel && *n == name)
-                || PENDING.iter().any(|(f, n, _)| *f == rel && *n == name)
-            {
-                continue;
-            }
-            if HELPERS.iter().any(|(f, n)| *f == rel && *n == name) {
-                guarded_sites += check_helper(&rel, &lines, &name, 0, &mut failures);
-                continue;
-            }
-            match guarded(&lines, fn_line, i, &name) {
-                Ok(()) => guarded_sites += 1,
-                Err(e) => failures.push(format!(
-                    "{rel}:{}: `{name}` captures tracing in the shared lib binary: {e}",
-                    i + 1
-                )),
+            let (name, g) = check_install(&rel, &lines, i, PENDING, &mut failures);
+            guarded_sites += g;
+            if let Some(name) = name {
+                seen.push((rel.clone(), name));
             }
         }
     }
@@ -318,4 +351,50 @@ fn install_patterns_match_every_install_shape_4090() {
             "INSTALL_PATTERNS misses the install shape: {shape}"
         );
     }
+}
+
+/// #4327 self-test: a PENDING entry is a promise that the guard has NOT
+/// landed yet. Once the test IS guarded the entry is stale and must fail the
+/// census (otherwise it rots silently and would keep excusing a later
+/// regression that removes the guard again). An unguarded pending test stays
+/// accepted.
+#[test]
+fn pending_entry_fails_once_its_test_is_guarded_4327() {
+    const FILE: &str = "src/synthetic_4327.rs";
+    let guarded_src = [
+        "#[test]",
+        "fn cap_test() {",
+        "    if crate::config::run_env_isolated_child_or_spawn(\"m::tests::cap_test\") {",
+        "        return;",
+        "    }",
+        "    let _g = tracing::subscriber::set_default(sub);",
+        "}",
+    ];
+    let unguarded_src = [
+        "#[test]",
+        "fn cap_test() {",
+        "    let _g = tracing::subscriber::set_default(sub);",
+        "}",
+    ];
+    let pending: &[(&str, &str, &str)] = &[(FILE, "cap_test", "synthetic")];
+
+    let mut failures = Vec::new();
+    let (name, _) = check_install(FILE, &guarded_src, 5, pending, &mut failures);
+    assert_eq!(name.as_deref(), Some("cap_test"));
+    assert!(
+        failures
+            .iter()
+            .any(|f| f.contains("stale PENDING") && f.contains("cap_test")),
+        "a PENDING entry whose test is already guarded must fail the census as \
+         stale; got failures: {failures:?}"
+    );
+
+    let mut failures = Vec::new();
+    let (name, g) = check_install(FILE, &unguarded_src, 2, pending, &mut failures);
+    assert_eq!(name.as_deref(), Some("cap_test"));
+    assert_eq!(g, 0);
+    assert!(
+        failures.is_empty(),
+        "an unguarded PENDING test must stay accepted; got: {failures:?}"
+    );
 }
