@@ -8256,12 +8256,14 @@ impl PostgresStore {
     /// scope predicate over the row that exists, so the gate is
     /// lifecycle-NEUTRAL — it never changes which lifecycle states the
     /// surface it guards discloses: it discloses whatever state the row
-    /// already carries. On Postgres no path WRITES `contaminated` at
-    /// v1.0.0 — the only #3324 stamper is the SQLite MCP `supersedes` path
-    /// (`mcp/tools/link.rs`, reflection-to-reflection only); PG `kg_invalidate`
-    /// and `link_signed` stamp nothing, so a PG row carries the state only
-    /// when it arrives already stamped (e.g. replicated from a SQLite node).
-    /// PG parity for the stamp is tracked on #3926 / #3266 (#3925).
+    /// already carries. That neutrality does not depend on which paths write
+    /// `contaminated`. On Postgres the writers are the #3324 auto-stamp twin
+    /// in `link_signed` (`swarm_rewind.rs::stamp_on_reflection_supersedes_pg`,
+    /// reflection-to-reflection `supersedes` only, the same narrow trigger as
+    /// the SQLite `mcp/tools/link.rs` path), the admin
+    /// `stamp_contaminated_descendants_pg` sweep and `swarm_rewind_pg`; PG
+    /// `kg_invalidate` stamps nothing. A row can also arrive already stamped
+    /// by federation from another node (#3925).
     ///
     /// This is an authz-precondition read ONLY — never a caller-facing
     /// content read (the #3270 rule); it is reached through the concrete
