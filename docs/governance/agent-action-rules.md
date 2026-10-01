@@ -117,10 +117,26 @@ is exactly as inert as a misspelled key.
 |--------------------|------------------------------------------------------|-----------------------------------------|-----------------------------------------------------------------------|
 | `bash`             | `command_substring`:string (or the legacy alias `command_regex`:string) | —                     | LITERAL substring match on the command line — never a regex.          |
 | `filesystem_write` | `glob`:string                                        | —                                       | Reuses the substrate glob vocabulary (`*` per-segment, `**` cross-`/`). |
-| `network_request`  | `host`:string                                        | —                                       | Glob host match (a plain host with no `*` matches exactly).           |
+| `network_request`  | `host`:string                                        | —                                       | Glob host match on the CANONICAL host (see below).                    |
 | `process_spawn`    | `binary`:string                                      | `args_contain`:string, `disk_free_min_gib`:uint | Binary name match plus optional argv-substring / disk-threshold refusal. |
 | `custom`           | `kind`:string                                        | `namespace_glob`:string, `tier`:string, `title_contains`:string | Extension point for caller-specific actions.  |
 | `read_action`      | `surface`:string, `namespace`:string, `query_substring`:string, or `all`:bool | —                       | PE-2 read gating; `{"all": true}` is the explicit blanket opt-in.     |
+
+### `network_request` host canonicalisation (#4300)
+
+The rule `host` and the evaluated host are both canonicalised by one shared
+function before the glob runs: ASCII-lowercase, exactly one trailing root dot
+removed, Unicode labels converted to the A-label (punycode) form, IPv4 as a
+dotted quad (`127.1` and `127.000.000.001` become `127.0.0.1`), IPv6 bracketed
+and compressed, an optional `:port` kept. Empty labels, labels over 63 bytes,
+hosts over 253 bytes and whitespace/control/NUL characters are rejected.
+`EVIL.example.com`, `evil.example.com.` and a Unicode spelling therefore match
+a rule written for `evil.example.com`. `*` spans any run of characters
+including dots: `*.example.com` matches a subdomain at any depth, never the
+bare apex `example.com`. A host that cannot be canonicalised is never allowed
+by default: it matches every `refuse`/`escalate` `network_request` rule and no
+`warn`/`log` rule. `rules add` refuses a host pattern that cannot be
+canonicalised; one already stored is inert and fails closed (below).
 
 ### Write-time validation and inert rules (#3031)
 

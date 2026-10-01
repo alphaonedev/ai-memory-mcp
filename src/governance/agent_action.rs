@@ -432,6 +432,18 @@ pub fn matcher_status(rule: &Rule, action: &AgentAction) -> MatcherStatus {
     if matcher_is_inert_for_kind(&rule.kind, &matcher) {
         return MatcherStatus::Inert;
     }
+    if let AgentAction::NetworkRequest { host, .. } = action
+        && crate::governance::host::canonicalize_host(host).is_err()
+    {
+        // #4300 — the evaluated host cannot be canonicalised (empty label,
+        // whitespace/control/NUL, over-long, bad IDNA...). Never allow by
+        // default: it matches every BLOCKING network_request rule (so a deny
+        // is never skipped by a malformed spelling) and no warn/log rule.
+        return match Severity::from_str(&rule.severity) {
+            Some(Severity::Refuse | Severity::Escalate) => MatcherStatus::Applies,
+            _ => MatcherStatus::DoesNotApply,
+        };
+    }
     if matcher_applies_inner(&matcher, action) {
         MatcherStatus::Applies
     } else {
@@ -562,6 +574,14 @@ fn matcher_is_inert_for_kind(kind: &str, matcher: &serde_json::Value) -> bool {
     let Some(obj) = matcher.as_object() else {
         return true;
     };
+    if kind == action_kinds::NETWORK_REQUEST
+        && let Some(host) = obj.get("host").and_then(|v| v.as_str())
+        && crate::governance::host::canonicalize_host_pattern(host).is_err()
+    {
+        // #4300 — a host pattern that cannot be canonicalised can never match
+        // a canonical host: INERT, so a blocking rule fails closed (#3031).
+        return true;
+    }
     !required
         .iter()
         .any(|(name, kind)| obj.get(*name).is_some_and(|v| kind.accepts(v)))
@@ -643,6 +663,16 @@ pub fn validate_matcher_for_kind(kind: &str, matcher: &serde_json::Value) -> Res
             "matcher for kind {kind:?} carries none of the required key(s) [{}], \
              so the rule could never fire (silently INERT). Add one of them",
             render_key_set(required)
+        ));
+    }
+    if kind == action_kinds::NETWORK_REQUEST
+        && let Some(host) = obj.get("host").and_then(|v| v.as_str())
+        && let Err(e) = crate::governance::host::canonicalize_host_pattern(host)
+    {
+        return Err(format!(
+            "matcher for kind {kind:?} key \"host\" is not a valid host pattern ({e}); \
+             the engine canonicalises hosts (lowercase, one trailing dot, A-label) and \
+             could never match it (silently INERT)"
         ));
     }
     Ok(())
@@ -830,16 +860,27 @@ fn match_network_request(matcher: &serde_json::Value, host: &str) -> bool {
     let Some(target_host) = matcher.get("host").and_then(|v| v.as_str()) else {
         return false;
     };
-    // Glob match on host (same engine as the filesystem `glob` matcher).
-    // A plain host with no `*` matches exactly — so pre-existing exact-host
-    // rules are unchanged — while `*.example.com`-style patterns now fire
-    // as the operator intended. Pre-fix this was a literal `==`, so a glob
-    // host pattern silently never matched: a DENY rule written as
-    // `{"host":"*.evil.example.com"}` would fail-OPEN, letting every
-    // subdomain through the gate. Hostnames contain no `/`, so the
-    // single-`*` (segment-bounded) and `**` (cross-segment) forms behave
-    // identically here.
-    crate::governance::glob_matches(target_host, host)
+    // #4300 — canonicalise BOTH sides through the one shared function before
+    // the glob engine runs (ASCII-lowercase, one trailing root dot, A-label,
+    // canonical IPs; see `governance::host`). Pre-fix the comparison was
+    // byte-literal, so `EVIL.example.com` / `evil.example.com.` slipped past a
+    // `refuse` rule for `evil.example.com` (fail-open).
+    //
+    // Fail closed: an un-canonicalisable pattern or host NEVER matches here.
+    // The engine routes both cases to a blocking outcome in
+    // [`matcher_status`] (inert pattern, #3031; invalid host, #4300) before
+    // this function is reached, so `false` is only the defense-in-depth arm.
+    //
+    // Glob semantics are unchanged: a plain host matches exactly, `*` spans
+    // any run of bytes (dots included), so `*.example.com` matches a
+    // subdomain at any depth but not the bare apex.
+    let (Ok(pattern), Ok(canonical)) = (
+        crate::governance::host::canonicalize_host_pattern(target_host),
+        crate::governance::host::canonicalize_host(host),
+    ) else {
+        return false;
+    };
+    crate::governance::glob_matches(&pattern, &canonical)
 }
 
 fn match_process_spawn(matcher: &serde_json::Value, binary: &str, args: &[String]) -> bool {

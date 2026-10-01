@@ -72,6 +72,8 @@ pub(crate) const GOVERNANCE_RULES_TRACE_TARGET: &str = "governance.rules";
 // `ai-memory governance install-defaults` (one-shot bulk enable)
 // or `ai-memory rules enable <id> --sign` (per-rule).
 pub mod agent_action;
+// #4300 — the single canonical form for a `network_request` host (rule and request side).
+pub mod host;
 // v0.7.0 #697 — Ed25519-signed forensic audit log. Independent of the
 // file-based `audit.rs` chain (which logs memory-substrate ops);
 // `governance::audit` captures every governance DECISION (allow /
