@@ -496,11 +496,13 @@ In addition, `asi-hard` forces the config-backed governance knob
 check. A loosening override (e.g. `AI_MEMORY_SECRET_SCREEN_MODE=off`
 under `asi-hard`) aborts boot with a clear error naming the knob.
 
-With federation peers configured, `asi-hard` also requires a valid,
-nonempty `AI_MEMORY_FED_PEER_ATTESTATION` map (#3582). This conditional
-read-only boot check adds no entry to `KNOBS`. Standard warns about a
-missing/empty/invalid map, while the default namespace requirement refuses
-inbound writes without authorization. Ordinary doctor remains runnable;
+With configured federation, `asi-hard` refuses an absent
+`AI_MEMORY_FED_PEER_ATTESTATION` authorization map; invalid maps also
+refuse hardened boot (#3582). A valid empty `{}` map permits boot and
+authorizes no peers. This conditional read-only boot check adds no entry
+to `KNOBS`. Standard warns for absent required configuration or invalid
+maps. The default namespace gate refuses inbound writes without
+authorization. Ordinary doctor remains runnable;
 see [federation posture and capabilities](docs/federation.md#current-defaults-and-boot-posture-3582)
 for inbound/outbound observation and the explicit Standard opt-out.
 
