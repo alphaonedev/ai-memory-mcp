@@ -812,7 +812,7 @@ cargo test --lib profile::tests::profile_power_loads_core_plus_power</pre>
 
     <h3>5b. Verify the wire-surface counts this page cites</h3>
 <pre class="codeblock">grep -nE 'EXPECTED_PRODUCTION_ROUTES_COUNT|EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT' src/lib.rs
-<span class="com"># Expected: 100 production route registrations over 86 unique paths</span>
+<span class="com"># Expected: 103 production route registrations over 89 unique paths</span>
 
 grep -nE 'EXPECTED_CLI_SUBCOMMANDS_(DEFAULT|SAL)' src/lib.rs
 <span class="com"># Expected: 91 CLI subcommands in the default build / 93 under `sal`</span>
