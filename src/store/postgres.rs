@@ -111,6 +111,7 @@ mod lifecycle_tx_3152;
 // #4199 A1 — the postgres forensic-sink outage recorder (qual_10 budget).
 mod forensic_outage_4199;
 mod merge_version_4216;
+mod version_repair_4371;
 
 use crate::models::field_names;
 use std::time::Duration;
@@ -2117,7 +2118,7 @@ const MIGRATION_V48_FEDERATION_PUSH_DLQ: &str =
 //       has carried these since v56, so its v88 is a no-op; doc twins
 //       migrations/{postgres/0045,sqlite/0072}_v88_list_composite_indexes.sql.
 //       CURRENT_SCHEMA_VERSION stays pinned in lockstep with sqlite.
-const CURRENT_SCHEMA_VERSION: i32 = 100;
+const CURRENT_SCHEMA_VERSION: i32 = 101;
 
 /// PostgreSQL session-scoped advisory lock key used to serialize
 /// concurrent `migrate()` invocations across processes and across
@@ -4302,8 +4303,11 @@ impl PostgresStore {
         if current_version < 99 {
             self.migrate_v99().await?;
         }
-        if current_version < CURRENT_SCHEMA_VERSION {
+        if current_version < 100 {
             self.migrate_v100().await?;
+        }
+        if current_version < CURRENT_SCHEMA_VERSION {
+            self.migrate_v101().await?;
         }
 
         Ok(())
@@ -7476,6 +7480,29 @@ impl PostgresStore {
             target: TRACE_TARGET,
             "schema migration v100 applied (#3690: the (title, namespace) unique index \
              is partial — tombstoned rows no longer hold a title slot)"
+        );
+        Ok(())
+    }
+
+    /// v101 (#4371) — clamp `version` counters a peer pinned above the
+    /// replicated ceiling before the #4218 bound, in one transaction with the
+    /// stamp. Data-only, idempotent; twin of the sqlite `migrate_v101`.
+    async fn migrate_v101(&self) -> StoreResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v101 version-repair migration tx", e))?;
+        let (memories, archived) = version_repair_4371::repair_poisoned_versions(&mut tx).await?;
+        record_schema_version(&mut tx, 101).await?;
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v101 migration", e))?;
+        tracing::info!(
+            target: TRACE_TARGET,
+            memories,
+            archived,
+            "schema migration v101 applied (#4371: version counters above the replicated ceiling clamped)"
         );
         Ok(())
     }
@@ -26814,7 +26841,7 @@ impl MemoryStore for PostgresStore {
         // mirrors what the original ordered sequence saw.
         sqlx::query(
             "UPDATE memories SET
-                access_count = LEAST(access_count + 1, 1000000),
+                access_count = LEAST(LEAST(access_count, 1000000) + 1, 1000000),
                 last_accessed_at = NOW(),
                 expires_at = CASE
                     WHEN tier = 'long' THEN expires_at
@@ -29447,7 +29474,7 @@ impl MemoryStore for PostgresStore {
                      GROUP BY memory_id
                 )
                 UPDATE memories m SET
-                    access_count = LEAST(m.access_count + a.n, 1000000),
+                    access_count = LEAST(LEAST(m.access_count, 1000000) + a.n, 1000000),
                     last_accessed_at = GREATEST(
                         COALESCE(m.last_accessed_at, a.t_max), a.t_max),
                     expires_at = CASE

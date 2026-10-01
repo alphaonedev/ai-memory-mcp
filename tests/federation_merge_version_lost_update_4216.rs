@@ -338,7 +338,7 @@ mod sqlite {
     }
 
     #[test]
-    fn sqlite_a_local_update_at_the_version_ceiling_saturates_4218() {
+    fn sqlite_a_local_update_at_the_version_ceiling_is_refused_never_overflows_4218_4371() {
         let (_dir, conn) = open();
         let id = node_a_at_v3(&conn);
         // A row poisoned before the bound existed.
@@ -347,7 +347,19 @@ mod sqlite {
             rusqlite::params![i64::MAX, id],
         )
         .expect("poison");
-        edit(&conn, &id, "local edit", i64::MAX).expect("edit at the ceiling");
+        // #4371: the edit is REFUSED (postgres parity) rather than succeeding with a
+        // frozen `If-Match` token; the row is untouched and never becomes a REAL.
+        let err = edit(&conn, &id, "local edit", i64::MAX)
+            .expect_err("#4371: an edit at the i64::MAX ceiling must be refused");
+        assert!(
+            err.to_string().contains("version counter exhausted"),
+            "{err}"
+        );
+        let after = db::get_any(&conn, &id).expect("read").expect("row");
+        assert_eq!(
+            after.content, "A's concurrent edit",
+            "#4371: refused edit changed the row"
+        );
         let (v, ty): (i64, String) = conn
             .query_row(
                 "SELECT version, typeof(version) FROM memories WHERE id = ?1",

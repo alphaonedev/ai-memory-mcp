@@ -864,6 +864,7 @@ pub(crate) use contamination_marker::StampAuthority;
 pub(crate) mod decontaminate;
 mod lifecycle_write;
 mod merge_version_4216;
+mod version_repair_4371;
 // `pub` (rather than `pub(crate)`) so the V-4 closeout
 // integration test suite (`tests/signed_events_chain_v34.rs`) can
 // invoke `migrate_v34_backfill_chain` directly to exercise the
@@ -4544,11 +4545,19 @@ pub fn update_with_expected_version(
                     )
                 ),
                 source_uri = COALESCE(?11, source_uri), encrypted_envelope=?14, valid_until = COALESCE(?15, valid_until), version = MIN(version, 9223372036854775806) + 1
-             WHERE id=?12 AND (?13 IS NULL OR version = ?13)",
-            params![effective_tier.as_str(), namespace, new_title, update_content_to_store, tags_json, priority, confidence, now, expires_at, metadata_json, source_uri, id, expected_version, update_encrypted_envelope, valid_until],
+             WHERE id=?12 AND (?13 IS NULL OR version = ?13) AND version < ?16",
+            params![effective_tier.as_str(), namespace, new_title, update_content_to_store, tags_json, priority, confidence, now, expires_at, metadata_json, source_uri, id, expected_version, update_encrypted_envelope, valid_until, i64::MAX],
         );
         match update_res {
             Ok(0) => {
+                // #4371 — parity with the postgres checked add: a counter at
+                // `i64::MAX` cannot move, so the edit is REFUSED (the tx rolls
+                // back, the row is unchanged) instead of succeeding while the
+                // `If-Match` token stays frozen and stops fencing a lost update.
+                if let Some(e) = version_repair_4371::exhausted_counter(conn, id, expected_version)?
+                {
+                    return Err(e.into());
+                }
                 // Either the row vanished between SELECT and UPDATE, or
                 // the version drifted (racing writer slipped in). When
                 // expected_version was supplied, re-read so the CONFLICT
