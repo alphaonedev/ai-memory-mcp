@@ -12,29 +12,26 @@
 <title>ai-memory · Enterprise Reference Architecture — CPU + Memory + GPU Federated Nodes</title>
 <meta name="description" content="Local Ollama embeddings on GPU-equipped nodes for enterprise federated ai-memory deployments — with the when-to-choose-which guidance vs. the CPU-only API-embeddings shape.">
 <link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/reference-architecture/enterprise-cpu-memory-gpu.html">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700;800;900&amp;family=IBM+Plex+Sans:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@500;600&amp;display=swap">
+<link rel="stylesheet" href="../assets/site-theme.css">
+<meta name="theme-color" content="#0c0b08">
 <style>
-:root{--bg:#000;--bg-raised:#0a0a0a;--bg-card:#111;--bg-elev:#161616;--bg-code:#1a1a1a;--border:#262626;--border-hl:#3d3d3d;--text:#fff;--text-muted:#999;--text-dim:#666;--p1:#6ee7ff;--p2:#ffb86b;--p3:#c8a2ff;--good:#6ee7ff;--bad:#ff6b9d;--warn:#ffd700;--gold:#ffd700;
+:root{--gpu:var(--good);--p2:var(--slate);--p3:var(--teal);--warn:var(--accent-ink);--gold:var(--accent);
 /* three-leg accents (centerpiece) */
---leg1:#6ee7ff;--leg2:#c8a2ff;--leg3:#ffb86b;
-/* GPU local-embed accent (the differentiator vs the CPU-only sibling) */
---gpu:#3fb950;
+--leg1:var(--accent);--leg2:var(--teal);--leg3:var(--slate);
 /* three regions */
---rg-nyc:#6ee7ff;--rg-fra:#c8a2ff;--rg-sgp:#ffb86b;
---font-mono:'SF Mono','Cascadia Code','Fira Code',Consolas,monospace;--font-sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;--max-w:1280px}
+--rg-nyc:var(--accent);--rg-fra:var(--teal);--rg-sgp:var(--slate);--max-w:1120px}
 *,*::before,*::after{margin:0;padding:0;box-sizing:border-box}
 html{scroll-behavior:smooth;scroll-padding-top:5rem}
 body{font-family:var(--font-sans);background:var(--bg);color:var(--text);line-height:1.6;-webkit-font-smoothing:antialiased;overflow-x:hidden}
-a{color:var(--text);text-decoration:none}a:hover{color:var(--p1)}
+a{color:var(--accent-ink);text-decoration:none}a:hover{color:var(--accent)}
 code{font-family:var(--font-mono);font-size:.85rem;background:var(--bg-code);padding:.1em .35em;border-radius:4px}
 .container{max-width:var(--max-w);margin:0 auto;padding:0 1.5rem}
-h1,h2,h3{font-weight:700;letter-spacing:-0.02em}h2{font-size:1.6rem;margin-bottom:.5rem;font-family:var(--font-mono)}h3{font-size:1.05rem}
+h1,h2,h3{font-family:var(--disp);font-weight:800;letter-spacing:-0.02em;color:var(--ink)}h2{font-size:1.6rem;margin-bottom:.5rem;font-family:var(--disp)}h3{font-size:1.05rem}
 p{color:var(--text-muted)}
-.topnav{position:sticky;top:0;z-index:50;background:rgba(0,0,0,0.85);backdrop-filter:blur(12px);border-bottom:1px solid var(--border)}
-.topnav .inner{display:flex;justify-content:space-between;max-width:var(--max-w);margin:0 auto;padding:.9rem 1.5rem;font-size:.875rem}
-.topnav a{color:var(--text-muted);margin-right:1.25rem}.topnav a:hover{color:var(--text)}
-.topnav .home-link{color:var(--text);font-weight:600}
-.topnav .right{display:flex;gap:1.25rem}@media(max-width:800px){.topnav .right{display:none}}
-.hero{padding:4rem 1.5rem 2.5rem;text-align:center;background:radial-gradient(ellipse at center,rgba(255,215,0,0.08),transparent 60%);border-bottom:1px solid var(--border)}
+.hero{padding:4rem 1.5rem 2.5rem;text-align:center;background:radial-gradient(ellipse at center,color-mix(in srgb,var(--accent) 8%,transparent),transparent 60%);border-bottom:1px solid var(--border)}
 .hero h1{font-size:clamp(2rem,4.5vw,3.25rem);line-height:1.1;letter-spacing:-0.03em;margin-bottom:1rem}
 .hero .tagline{color:var(--text-muted);font-size:1.05rem;max-width:860px;margin:0 auto 1rem}
 .hero .pills{display:flex;justify-content:center;gap:.5rem;flex-wrap:wrap;margin-top:1.25rem}
@@ -56,7 +53,9 @@ section h2.sans{font-family:var(--font-sans);font-size:1.75rem}
 .matrix td{padding:.7rem 1rem;border-bottom:1px solid var(--border);vertical-align:top}
 .matrix tr:last-child td{border-bottom:none}
 .matrix .id{font-family:var(--font-mono);font-weight:700;color:var(--p3)}
-.matrix .res{font-family:var(--font-mono);font-size:.82rem;color:var(--warn);white-space:nowrap}
+.matrix .res{font-family:var(--font-mono);font-size:.82rem;color:var(--good);white-space:normal;min-width:16rem}
+.matrix .res.partial{color:var(--accent-ink)}
+.matrix{min-width:760px}
 .matrix code{font-size:.78rem}
 .scroll-x{overflow-x:auto;border-radius:12px}
 
@@ -80,7 +79,7 @@ section h2.sans{font-family:var(--font-sans);font-size:1.75rem}
 .testpair .t .tag{font-weight:700;letter-spacing:.04em;margin-right:.4rem}
 .testpair .t.pos .tag{color:var(--good)}
 .testpair .t.neg .tag{color:var(--bad)}
-.testpair .t .res{color:var(--warn);float:right}
+.testpair .t .res{color:var(--good);float:right}
 
 .snip{font-family:var(--font-mono);font-size:.78rem;color:var(--text-muted);margin-top:.85rem;padding:.85rem 1rem;background:var(--bg-code);border:1px solid var(--border);border-radius:8px;line-height:1.55;white-space:pre;overflow-x:auto}
 .snip .ok{color:var(--good)}.snip .err{color:var(--bad)}.snip .warn{color:var(--warn)}.snip .cm{color:var(--text-dim)}.snip .key{color:var(--p3)}.snip .val{color:var(--p2)}
@@ -91,30 +90,20 @@ section h2.sans{font-family:var(--font-sans);font-size:1.75rem}
 .step h3{font-family:var(--font-mono);font-size:1.1rem;margin-bottom:.5rem;color:var(--text)}
 .step p{color:var(--text-muted);font-size:.92rem;margin-bottom:.6rem}
 
-.warn-box{background:rgba(255,215,0,0.05);border:1px solid var(--warn);border-radius:10px;padding:1rem 1.25rem;margin:1.5rem 0;color:var(--text-muted);font-size:.9rem}
+.warn-box{background:color-mix(in srgb,var(--accent) 5%,transparent);border:1px solid var(--warn);border-radius:10px;padding:1rem 1.25rem;margin:1.5rem 0;color:var(--text-muted);font-size:.9rem}
 .warn-box strong{color:var(--warn);font-family:var(--font-mono);font-size:.82rem;letter-spacing:.04em;display:block;margin-bottom:.35rem}
-.honest-box{background:rgba(255,107,157,0.05);border:1px solid var(--bad);border-radius:10px;padding:1.1rem 1.25rem;margin:1.25rem 0;color:var(--text-muted);font-size:.9rem}
+.honest-box{background:color-mix(in srgb,var(--bad) 5%,transparent);border:1px solid var(--bad);border-radius:10px;padding:1.1rem 1.25rem;margin:1.25rem 0;color:var(--text-muted);font-size:.9rem}
 .honest-box strong{color:var(--bad);font-family:var(--font-mono);font-size:.82rem;letter-spacing:.04em;display:block;margin-bottom:.35rem}
 
-footer{padding:3rem 1.5rem 2.5rem;text-align:center;color:var(--text-dim);font-size:.85rem;border-top:1px solid var(--border)}
-footer .footer-links{display:flex;justify-content:center;gap:1.5rem;flex-wrap:wrap;margin-bottom:1rem}
-footer a{color:var(--text-dim)}footer a:hover{color:var(--p1)}
-footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
+footer.ra-legal{padding:2.5rem 1.5rem 1rem;text-align:center;color:var(--text-dim);font-size:.85rem;border-top:1px solid var(--border)}
+footer.ra-legal .footer-links{display:flex;justify-content:center;gap:1.5rem;flex-wrap:wrap;margin-bottom:1rem}
+footer.ra-legal a{color:var(--text-dim)}footer a:hover{color:var(--p1)}
+footer.ra-legal .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
 
-.topnav .menu{position:relative;display:inline-block}
-.topnav .menu-btn{background:none;border:none;color:var(--text-muted);font-family:inherit;font-size:inherit;cursor:pointer;padding:.2rem 0;line-height:1;letter-spacing:0}
-.topnav .menu-btn:hover,.topnav .menu:focus-within .menu-btn{color:var(--text)}
-.topnav .menu-btn.active{color:var(--text)}
-.topnav .menu-btn .caret{opacity:.5;font-size:.7em;margin-left:.2em}
-.topnav .menu-pane{position:absolute;top:calc(100% + .55rem);right:0;background:var(--bg-card);border:1px solid var(--border-hl);border-radius:8px;padding:.4rem 0;min-width:240px;box-shadow:0 10px 28px rgba(0,0,0,0.5);z-index:60;visibility:hidden;opacity:0;transition:opacity .12s ease,visibility 0s .12s}
-.topnav .menu:focus-within .menu-pane,.topnav .menu:hover .menu-pane{visibility:visible;opacity:1;transition:opacity .12s ease}
-.topnav .menu-pane a{display:block;padding:.5rem 1rem;color:var(--text-muted);font-size:.85rem;margin-right:0;white-space:nowrap;text-decoration:none}
-.topnav .menu-pane a:hover{background:var(--bg-elev);color:var(--text)}
-.topnav .menu-pane a.current{color:var(--p1);background:var(--bg-elev)}
 
 /* ============ animated diagram ============ */
-.diagram-wrap{background:var(--bg-raised);border:1px solid var(--border);border-radius:16px;padding:1rem;margin:1.5rem 0;overflow:hidden}
-.diagram-wrap svg{display:block;width:100%;height:auto}
+.diagram-wrap{background:var(--panel);border:1px solid var(--border);border-radius:16px;padding:1rem;margin:1.5rem 0;overflow-x:auto;min-width:0;-webkit-overflow-scrolling:touch}
+.diagram-wrap svg{display:block;width:100%;height:auto;min-width:var(--fig-min,820px)}
 .legend{display:flex;flex-wrap:wrap;gap:1rem 1.5rem;justify-content:center;margin-top:1rem;font-size:.8rem;color:var(--text-muted)}
 .legend .item{display:flex;align-items:center;gap:.45rem;font-family:var(--font-mono)}
 .legend .sw{width:26px;height:0;border-top:3px dashed currentColor;border-radius:2px}
@@ -125,7 +114,7 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
 @keyframes march{to{stroke-dashoffset:-32}}
 @keyframes pulse-glow{0%,100%{opacity:.55}50%{opacity:1}}
 @keyframes shimmer{0%,100%{stroke-opacity:.35}50%{stroke-opacity:.9}}
-@keyframes node-breathe{0%,100%{filter:drop-shadow(0 0 2px rgba(110,231,255,0.25))}50%{filter:drop-shadow(0 0 7px rgba(110,231,255,0.55))}}
+@keyframes node-breathe{0%,100%{filter:drop-shadow(0 0 2px color-mix(in srgb,var(--accent) 25%,transparent))}50%{filter:drop-shadow(0 0 7px color-mix(in srgb,var(--accent) 55%,transparent))}}
 @keyframes shield-flicker{0%,100%{opacity:.85}50%{opacity:1}}
 
 .flow{stroke-width:2.4;fill:none;stroke-linecap:round;stroke-dasharray:9 7}
@@ -151,7 +140,7 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
 </style>
 <style>
 .article{max-width:62rem;margin:0 auto;padding:2.5rem 1.5rem 4rem}
-.article h2{font-family:var(--font-mono);font-size:1.45rem;margin:2.4rem 0 .9rem;padding-bottom:.4rem;border-bottom:1px solid var(--border);color:var(--text)}
+.article h2{font-family:var(--disp);font-size:1.45rem;margin:2.4rem 0 .9rem;padding-bottom:.4rem;border-bottom:1px solid var(--border);color:var(--text)}
 .article h3{font-size:1.1rem;margin:1.6rem 0 .6rem;color:var(--text)}
 .article p{color:var(--text-muted);margin:.7rem 0}
 .article ul,.article ol{color:var(--text-muted);margin:.7rem 0 .7rem 1.4rem}
@@ -173,52 +162,70 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
 .hero.doc .tagline{margin:0;text-align:left;max-width:62rem}
 </style>
 </head>
-<body>
+<body class="am-page">
 
-<nav class="topnav">
-  <div class="inner">
-    <a class="home-link" href="../">ai-memory <span style="opacity:.5">▸ Reference Architecture</span></a>
-    <div class="right">
-      <a href="../at-a-glance.html" style="color:#6ee7ff">Atlas</a>
-      <a href="../whats-new-v09.html" style="color:#6ee7ff">v0.9.0</a>
-      <div class="menu">
-        <button class="menu-btn active">Architectures<span class="caret">▾</span></button>
-        <div class="menu-pane">
-          <a href="../architectures.html">Overview</a>
-          <a href="../architectures-t1.html">T1 — Single Agent</a>
-          <a href="../architectures-t2.html">T2 — Many Agents</a>
-          <a href="../architectures-t3.html">T3 — Multi-Node Cluster</a>
-          <a href="../architectures-t4.html">T4 — Data-Center Swarm</a>
-          <a href="../architectures-t5.html">T5 — Global Hive</a>
-          <a href="./">Grand Slam — 3-Region Hive</a>
-          <a href="enterprise-cpu-memory.html">Enterprise — CPU+Memory Nodes</a>
-          <a href="enterprise-cpu-memory-gpu.html" class="current">Enterprise — CPU+Memory+GPU Nodes</a>
-        </div>
+<a class="am-skip" href="#main">Skip to content</a>
+<header class="am-nav"><div class="am-nav-in">
+  <a class="am-brand" href="../index.html" aria-label="ai-memory home">
+    <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 2l9 5.2v9.6L12 22 3 16.8V7.2z" stroke="var(--accent)" stroke-width="1.5"/><circle cx="12" cy="12" r="2.4" fill="var(--accent)"/><path d="M12 9.6V4.5M12 14.4v5.1M14.4 12h5M4.9 12h5" stroke="var(--accent)" stroke-width="1.1"/></svg>
+    ai-memory <span class="am-crumb">/ reference / CPU + memory + GPU</span>
+  </a>
+  <nav class="am-links" aria-label="Primary">
+    <a href="../architectures.html">Architectures</a>
+    <div class="am-dd">
+      <button aria-haspopup="true">Tiers ▾</button>
+      <div class="am-dd-menu">
+        <a href="../architectures-t1.html">T1 · Single node<span>one agent, one store</span></a>
+        <a href="../architectures-t2.html">T2 · Shared daemon<span>many agents, one host</span></a>
+        <a href="../architectures-t3.html">T3 · Federated cluster<span>W-of-N quorum, signed sync</span></a>
+        <a href="../architectures-t4.html">T4 · Data-center swarm<span>PostgreSQL tier</span></a>
+        <a href="../architectures-t5.html">T5 · Federated hive<span>multi-DC / multi-region</span></a>
       </div>
-      <div class="menu">
-        <button class="menu-btn">Internals<span class="caret">▾</span></button>
-        <div class="menu-pane">
-          <a href="../schema.html">Schema</a>
-          <a href="../types.html">Types</a>
-          <a href="../validators.html">Validators</a>
-          <a href="../governance.html">Governance</a>
-          <a href="../batman-active-mode.html">Batman Mode</a>
-          <a href="../encryption.html">Encryption</a>
-          <a href="../tracing.html">Tracing</a>
-        </div>
-      </div>
-      <div class="menu">
-        <button class="menu-btn">Compliance<span class="caret">▾</span></button>
-        <div class="menu-pane">
-          <a href="../compliance/">Overview</a>
-          <a href="../compliance/nsa-csi-mcp.html">NSA CSI MCP</a>
-        </div>
-      </div>
-      <a href="../credits.html">Credits</a>
-      <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub →</a>
     </div>
-  </div>
-</nav>
+    <div class="am-dd">
+      <button aria-haspopup="true">Reference ▾</button>
+      <div class="am-dd-menu">
+        <a href="../reference-architecture/">3-region hive<span>the do-1461 run record</span></a>
+        <a href="../reference-architecture/enterprise-cpu-memory.html">Enterprise · CPU + memory<span>API embeddings, no GPU</span></a>
+        <a href="../reference-architecture/enterprise-cpu-memory-gpu.html">Enterprise · CPU + memory + GPU<span>local embeddings</span></a>
+        <a href="../enterprise-deployment.html">Enterprise deployment guide<span>sizing, replication, backups</span></a>
+        <a href="../ARCHITECTURAL_LIMITS.html">Architectural limits<span>what does not scale, and why</span></a>
+      </div>
+    </div>
+    <div class="am-dd">
+      <button aria-haspopup="true">Planes ▾</button>
+      <div class="am-dd-menu">
+        <a href="../federation.html">Federation<span>signed sync, quorum, catch-up</span></a>
+        <a href="../wake-hub.html">Wake plane<span>wake-hub, wake-listen</span></a>
+        <a href="../a2a-integration.html">Integrate any agent<span>inbox, notify, wake</span></a>
+        <a href="../governance.html">Governance<span>policies, approvals</span></a>
+        <a href="../encryption.html">Encryption<span>at rest and in transit</span></a>
+        <a href="../SECURITY.html">Security model<span>threat model, posture</span></a>
+      </div>
+    </div>
+  </nav>
+  <details class="am-mnav"><summary>Menu</summary><div class="am-mnav-pane">
+    <a href="../index.html">Home</a>
+    <a href="../architectures.html">Architectures overview</a>
+    <div class="am-g">Tiers</div>
+    <a href="../architectures-t1.html">T1 · Single node</a>
+    <a href="../architectures-t2.html">T2 · Shared daemon</a>
+    <a href="../architectures-t3.html">T3 · Federated cluster</a>
+    <a href="../architectures-t4.html">T4 · Data-center swarm</a>
+    <a href="../architectures-t5.html">T5 · Federated hive</a>
+    <div class="am-g">Reference</div>
+    <a href="../reference-architecture/">3-region hive</a>
+    <a href="../reference-architecture/enterprise-cpu-memory.html">Enterprise · CPU + memory</a>
+    <a href="../reference-architecture/enterprise-cpu-memory-gpu.html">Enterprise · CPU + memory + GPU</a>
+    <a href="../ARCHITECTURAL_LIMITS.html">Architectural limits</a>
+    <div class="am-g">Planes</div>
+    <a href="../federation.html">Federation</a>
+    <a href="../wake-hub.html">Wake plane</a>
+    <a href="../governance.html">Governance</a>
+    <a href="../SECURITY.html">Security model</a>
+  </div></details>
+  <a class="am-cta" href="https://github.com/alphaonedev/ai-memory-mcp">GitHub</a>
+</div></header>
 
 <section class="hero doc">
   <div class="container">
@@ -230,12 +237,12 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
       <span class="pill">local GPU embeddings</span>
       <span class="pill">nomic-embed-text · 768d</span>
       <span class="pill">W-of-N quorum · mTLS</span>
-      <span class="pill">schema v90</span>
+      <span class="pill">schema v100</span>
     </div>
   </div>
 </section>
 
-<main class="article">
+<main class="article" id="main">
 <p><strong>Local Ollama embeddings on GPU-equipped nodes — zero per-token
 cost, no embedding egress.</strong> This is the #1598 reference shape for
 enterprise federated deployments where every memory-bearing node has
@@ -255,24 +262,24 @@ capacity / cost / SLA planning is
 <div class="diagram-wrap">
   <svg viewBox="0 0 1240 600" role="img" aria-labelledby="gpu-topo-title gpu-topo-desc" preserveAspectRatio="xMidYMid meet">
     <title id="gpu-topo-title">CPU + Memory + GPU federated node topology</title>
-    <desc id="gpu-topo-desc">A federated mesh of N identical CPU+RAM+GPU nodes under a W-of-N write quorum. Two representative peers (node-a, node-b) are shown; the remainder are abstracted as "+N peers". Each node runs one ai-memory serve daemon (Axum on :9077) that computes every embedding on a node-local GPU Ollama instance over a localhost loopback /api/embed call (the green GPU embed leg — ~5 to 30 ms, zero per-token cost, no egress), reads and writes its own SQLite or PostgreSQL + Apache AGE store (the amber store leg), and federates to every peer over a cross-node W-of-N synchronous quorum secured by mTLS plus per-message Ed25519 signatures and nonces (the violet quorum leg). An NHI agent connects to a node as an mTLS client on :9077 (the cyan client leg). Every node carries a Batman maximum-secure shield-lock glyph.</desc>
+    <desc id="gpu-topo-desc">A federated mesh of N identical CPU+RAM+GPU nodes under a W-of-N write quorum. Two representative peers (node-a, node-b) are shown; the remainder are abstracted as "+N peers". Each node runs one ai-memory serve daemon (Axum on :9077) that computes every embedding on a node-local GPU Ollama instance over a localhost loopback /api/embed call (the green GPU embed leg — ~5 to 30 ms, zero per-token cost, no egress), reads and writes its own SQLite or PostgreSQL + Apache AGE store (the slate-blue store leg), and federates to every peer over a cross-node W-of-N synchronous quorum secured by mTLS plus per-message Ed25519 signatures and nonces (the teal quorum leg). An NHI agent connects to a node as an mTLS client on :9077 (the gold client leg). Every node carries a Batman maximum-secure shield-lock glyph.</desc>
 
     <defs>
       <radialGradient id="rgGlow" cx="50%" cy="50%" r="50%">
-        <stop offset="0%" stop-color="#6ee7ff" stop-opacity="0.10"/>
-        <stop offset="100%" stop-color="#6ee7ff" stop-opacity="0"/>
+        <stop offset="0%" stop-opacity="0.10" style="stop-color:var(--accent)"/>
+        <stop offset="100%" stop-opacity="0" style="stop-color:var(--accent)"/>
       </radialGradient>
       <linearGradient id="pgGrad" x1="0" y1="0" x2="0" y2="1">
-        <stop offset="0%" stop-color="#1c160c"/><stop offset="100%" stop-color="#120d06"/>
+        <stop offset="0%" style="stop-color:var(--raise)"/><stop offset="100%" style="stop-color:var(--panel)"/>
       </linearGradient>
       <linearGradient id="gpuGrad" x1="0" y1="0" x2="0" y2="1">
-        <stop offset="0%" stop-color="#0a1a10"/><stop offset="100%" stop-color="#06130b"/>
+        <stop offset="0%" style="stop-color:var(--panel)"/><stop offset="100%" style="stop-color:var(--raise)"/>
       </linearGradient>
       <symbol id="shieldlock" viewBox="0 0 32 36">
-        <path d="M16 1 L30 6 V18 C30 27 24 33 16 35 C8 33 2 27 2 18 V6 Z" fill="rgba(255,215,0,0.08)" stroke="#ffd700" stroke-width="1.6"/>
-        <rect x="10" y="16" width="12" height="10" rx="1.6" fill="rgba(255,215,0,0.12)" stroke="#ffd700" stroke-width="1.3"/>
-        <path d="M12 16 V13 a4 4 0 0 1 8 0 V16" fill="none" stroke="#ffd700" stroke-width="1.3"/>
-        <circle cx="16" cy="20.5" r="1.6" fill="#ffd700"/>
+        <path d="M16 1 L30 6 V18 C30 27 24 33 16 35 C8 33 2 27 2 18 V6 Z" stroke-width="1.6" style="stroke:var(--accent);fill:color-mix(in srgb,var(--accent) 8%,transparent)"/>
+        <rect x="10" y="16" width="12" height="10" rx="1.6" stroke-width="1.3" style="stroke:var(--accent);fill:color-mix(in srgb,var(--accent) 12%,transparent)"/>
+        <path d="M12 16 V13 a4 4 0 0 1 8 0 V16" fill="none" stroke-width="1.3" style="stroke:var(--accent)"/>
+        <circle cx="16" cy="20.5" r="1.6" style="fill:var(--accent)"/>
       </symbol>
     </defs>
 
@@ -285,105 +292,105 @@ capacity / cost / SLA planning is
     <!-- quorum hub marker -->
     <g transform="translate(575,66)">
       <circle r="34" fill="url(#rgGlow)"/>
-      <circle r="23" fill="#120a1c" stroke="#c8a2ff" stroke-width="1.6" class="glowpath"/>
-      <text x="0" y="-1" text-anchor="middle" class="svg-label" font-size="11" fill="#c8a2ff" font-weight="700">W-of-N</text>
-      <text x="0" y="12" text-anchor="middle" class="svg-label" font-size="8.5" fill="#c8a2ff">quorum</text>
+      <circle r="23" stroke-width="1.6" class="glowpath" style="fill:var(--teal-soft);stroke:var(--teal)"/>
+      <text x="0" y="-1" text-anchor="middle" class="svg-label" font-size="11" font-weight="700" style="fill:var(--teal)">W-of-N</text>
+      <text x="0" y="12" text-anchor="middle" class="svg-label" font-size="8.5" style="fill:var(--teal)">quorum</text>
       <text x="0" y="46" text-anchor="middle" class="svg-label" font-size="9.5">mTLS · Ed25519 X-Memory-Sig + X-Memory-Nonce · vector-clock merge</text>
     </g>
 
     <!-- ===== node-a (cyan) ===== -->
     <g>
-      <rect x="60" y="120" width="470" height="380" rx="16" fill="#060d0f" stroke="#13343d" stroke-width="1.4"/>
-      <text x="84" y="152" class="svg-title" font-size="15" font-weight="700" fill="#6ee7ff">node-a</text>
+      <rect x="60" y="120" width="470" height="380" rx="16" stroke-width="1.4" style="fill:var(--panel);stroke:var(--line-strong)"/>
+      <text x="84" y="152" class="svg-title" font-size="15" font-weight="700" style="fill:var(--accent)">node-a</text>
       <text x="84" y="170" class="svg-label" font-size="10">CPU + RAM + GPU · ai-memory serve :9077 · autonomous tier</text>
       <use href="#shieldlock" x="486" y="132" width="22" height="25" class="shield"/>
 
       <!-- node-local GPU Ollama embedder -->
       <g class="peernode">
-        <rect x="300" y="196" width="210" height="96" rx="10" fill="url(#gpuGrad)" stroke="#3fb950" stroke-width="1.5"/>
-        <text x="405" y="222" text-anchor="middle" class="svg-title" font-size="11.5" fill="#3fb950" font-weight="700">Ollama · GPU</text>
+        <rect x="300" y="196" width="210" height="96" rx="10" fill="url(#gpuGrad)" stroke-width="1.5" style="stroke:var(--good)"/>
+        <text x="405" y="222" text-anchor="middle" class="svg-title" font-size="11.5" font-weight="700" style="fill:var(--good)">Ollama · GPU</text>
         <text x="405" y="240" text-anchor="middle" class="svg-label" font-size="9">nomic-embed-text · 768d</text>
         <text x="405" y="256" text-anchor="middle" class="svg-label" font-size="9">/api/embed · loopback</text>
-        <text x="405" y="274" text-anchor="middle" class="svg-label" font-size="8.5" fill="#3fb950">~5–30 ms · $0 · no egress</text>
+        <text x="405" y="274" text-anchor="middle" class="svg-label" font-size="8.5" style="fill:var(--good)">~5–30 ms · $0 · no egress</text>
       </g>
 
       <!-- ai-memory serve daemon -->
       <g class="peernode">
-        <rect x="84" y="232" width="178" height="150" rx="10" fill="#08161a" stroke="#6ee7ff" stroke-width="1.4"/>
-        <text x="173" y="262" text-anchor="middle" class="svg-title" font-size="11.5" fill="#6ee7ff" font-weight="700">ai-memory serve</text>
+        <rect x="84" y="232" width="178" height="150" rx="10" stroke-width="1.4" style="fill:var(--accent-soft);stroke:var(--accent)"/>
+        <text x="173" y="262" text-anchor="middle" class="svg-title" font-size="11.5" font-weight="700" style="fill:var(--accent)">ai-memory serve</text>
         <text x="173" y="280" text-anchor="middle" class="svg-label" font-size="9">Axum HTTP · :9077</text>
         <text x="173" y="300" text-anchor="middle" class="svg-label" font-size="9">recall · embed · federate</text>
         <text x="173" y="320" text-anchor="middle" class="svg-label" font-size="9">HNSW · FTS5 · reranker</text>
-        <text x="173" y="346" text-anchor="middle" class="svg-label" font-size="8.5" fill="#6ee7ff">permissions = enforce</text>
-        <text x="173" y="362" text-anchor="middle" class="svg-label" font-size="8.5" fill="#6ee7ff">attestation · fail-closed</text>
+        <text x="173" y="346" text-anchor="middle" class="svg-label" font-size="8.5" style="fill:var(--accent)">permissions = enforce</text>
+        <text x="173" y="362" text-anchor="middle" class="svg-label" font-size="8.5" style="fill:var(--accent)">attestation · fail-closed</text>
       </g>
 
       <!-- store -->
       <g class="peernode">
-        <rect x="300" y="336" width="210" height="104" rx="10" fill="url(#pgGrad)" stroke="#ffb86b" stroke-width="1.5"/>
-        <text x="405" y="362" text-anchor="middle" class="svg-title" font-size="11" fill="#ffb86b" font-weight="700">SQLite (WAL + FTS5)</text>
+        <rect x="300" y="336" width="210" height="104" rx="10" fill="url(#pgGrad)" stroke-width="1.5" style="stroke:var(--slate)"/>
+        <text x="405" y="362" text-anchor="middle" class="svg-title" font-size="11" font-weight="700" style="fill:var(--slate)">SQLite (WAL + FTS5)</text>
         <text x="405" y="380" text-anchor="middle" class="svg-label" font-size="8.5">— or —</text>
-        <text x="405" y="398" text-anchor="middle" class="svg-label" font-size="10" fill="#ffb86b">PostgreSQL + Apache AGE</text>
-        <text x="405" y="416" text-anchor="middle" class="svg-label" font-size="9">+ pgvector · schema v90</text>
+        <text x="405" y="398" text-anchor="middle" class="svg-label" font-size="10" style="fill:var(--slate)">PostgreSQL + Apache AGE</text>
+        <text x="405" y="416" text-anchor="middle" class="svg-label" font-size="9">+ pgvector · schema v100</text>
       </g>
 
       <!-- GPU embed loopback leg (green) -->
       <path class="flow gpu" d="M262 252 C284 240 286 216 300 210" aria-hidden="true"/>
-      <text x="244" y="216" class="svg-label" font-size="8" fill="#3fb950">embed</text>
+      <text x="244" y="216" class="svg-label" font-size="8" style="fill:var(--good)">embed</text>
       <!-- store leg (amber) -->
       <path class="flow leg3 shim" d="M262 348 C284 360 288 376 300 386" aria-hidden="true"/>
     </g>
 
     <!-- ===== node-b (violet) ===== -->
     <g>
-      <rect x="620" y="120" width="470" height="380" rx="16" fill="#0b070d" stroke="#2a1a3a" stroke-width="1.4"/>
-      <text x="644" y="152" class="svg-title" font-size="15" font-weight="700" fill="#c8a2ff">node-b</text>
+      <rect x="620" y="120" width="470" height="380" rx="16" stroke-width="1.4" style="fill:var(--panel);stroke:var(--line-strong)"/>
+      <text x="644" y="152" class="svg-title" font-size="15" font-weight="700" style="fill:var(--teal)">node-b</text>
       <text x="644" y="170" class="svg-label" font-size="10">CPU + RAM + GPU · ai-memory serve :9077 · autonomous tier</text>
       <use href="#shieldlock" x="1046" y="132" width="22" height="25" class="shield"/>
 
       <g class="peernode">
-        <rect x="860" y="196" width="210" height="96" rx="10" fill="url(#gpuGrad)" stroke="#3fb950" stroke-width="1.5"/>
-        <text x="965" y="222" text-anchor="middle" class="svg-title" font-size="11.5" fill="#3fb950" font-weight="700">Ollama · GPU</text>
+        <rect x="860" y="196" width="210" height="96" rx="10" fill="url(#gpuGrad)" stroke-width="1.5" style="stroke:var(--good)"/>
+        <text x="965" y="222" text-anchor="middle" class="svg-title" font-size="11.5" font-weight="700" style="fill:var(--good)">Ollama · GPU</text>
         <text x="965" y="240" text-anchor="middle" class="svg-label" font-size="9">nomic-embed-text · 768d</text>
         <text x="965" y="256" text-anchor="middle" class="svg-label" font-size="9">/api/embed · loopback</text>
-        <text x="965" y="274" text-anchor="middle" class="svg-label" font-size="8.5" fill="#3fb950">~5–30 ms · $0 · no egress</text>
+        <text x="965" y="274" text-anchor="middle" class="svg-label" font-size="8.5" style="fill:var(--good)">~5–30 ms · $0 · no egress</text>
       </g>
 
       <g class="peernode">
-        <rect x="644" y="232" width="178" height="150" rx="10" fill="#120a1c" stroke="#c8a2ff" stroke-width="1.4"/>
-        <text x="733" y="262" text-anchor="middle" class="svg-title" font-size="11.5" fill="#c8a2ff" font-weight="700">ai-memory serve</text>
+        <rect x="644" y="232" width="178" height="150" rx="10" stroke-width="1.4" style="fill:var(--teal-soft);stroke:var(--teal)"/>
+        <text x="733" y="262" text-anchor="middle" class="svg-title" font-size="11.5" font-weight="700" style="fill:var(--teal)">ai-memory serve</text>
         <text x="733" y="280" text-anchor="middle" class="svg-label" font-size="9">Axum HTTP · :9077</text>
         <text x="733" y="300" text-anchor="middle" class="svg-label" font-size="9">recall · embed · federate</text>
         <text x="733" y="320" text-anchor="middle" class="svg-label" font-size="9">HNSW · FTS5 · reranker</text>
-        <text x="733" y="346" text-anchor="middle" class="svg-label" font-size="8.5" fill="#c8a2ff">permissions = enforce</text>
-        <text x="733" y="362" text-anchor="middle" class="svg-label" font-size="8.5" fill="#c8a2ff">attestation · fail-closed</text>
+        <text x="733" y="346" text-anchor="middle" class="svg-label" font-size="8.5" style="fill:var(--teal)">permissions = enforce</text>
+        <text x="733" y="362" text-anchor="middle" class="svg-label" font-size="8.5" style="fill:var(--teal)">attestation · fail-closed</text>
       </g>
 
       <g class="peernode">
-        <rect x="860" y="336" width="210" height="104" rx="10" fill="url(#pgGrad)" stroke="#ffb86b" stroke-width="1.5"/>
-        <text x="965" y="362" text-anchor="middle" class="svg-title" font-size="11" fill="#ffb86b" font-weight="700">SQLite (WAL + FTS5)</text>
+        <rect x="860" y="336" width="210" height="104" rx="10" fill="url(#pgGrad)" stroke-width="1.5" style="stroke:var(--slate)"/>
+        <text x="965" y="362" text-anchor="middle" class="svg-title" font-size="11" font-weight="700" style="fill:var(--slate)">SQLite (WAL + FTS5)</text>
         <text x="965" y="380" text-anchor="middle" class="svg-label" font-size="8.5">— or —</text>
-        <text x="965" y="398" text-anchor="middle" class="svg-label" font-size="10" fill="#ffb86b">PostgreSQL + Apache AGE</text>
-        <text x="965" y="416" text-anchor="middle" class="svg-label" font-size="9">+ pgvector · schema v90</text>
+        <text x="965" y="398" text-anchor="middle" class="svg-label" font-size="10" style="fill:var(--slate)">PostgreSQL + Apache AGE</text>
+        <text x="965" y="416" text-anchor="middle" class="svg-label" font-size="9">+ pgvector · schema v100</text>
       </g>
 
       <path class="flow gpu" d="M822 252 C844 240 846 216 860 210" aria-hidden="true"/>
-      <text x="804" y="216" class="svg-label" font-size="8" fill="#3fb950">embed</text>
+      <text x="804" y="216" class="svg-label" font-size="8" style="fill:var(--good)">embed</text>
       <path class="flow leg3 shim" d="M822 348 C844 360 848 376 860 386" aria-hidden="true"/>
     </g>
 
     <!-- +N peers (abstracted remainder of the quorum) -->
     <g class="peernode" aria-hidden="true">
-      <rect x="1110" y="240" width="100" height="180" rx="12" fill="#0b070d" stroke="#2a1a3a" stroke-width="1.3" stroke-dasharray="5 4"/>
-      <text x="1160" y="318" text-anchor="middle" class="svg-title" font-size="13" fill="#c8a2ff" font-weight="700">+ N peers</text>
+      <rect x="1110" y="240" width="100" height="180" rx="12" stroke-width="1.3" stroke-dasharray="5 4" style="fill:var(--panel);stroke:var(--line-strong)"/>
+      <text x="1160" y="318" text-anchor="middle" class="svg-title" font-size="13" font-weight="700" style="fill:var(--teal)">+ N peers</text>
       <text x="1160" y="338" text-anchor="middle" class="svg-label" font-size="8.5">identical shape</text>
       <text x="1160" y="353" text-anchor="middle" class="svg-label" font-size="8.5">in the quorum</text>
     </g>
 
     <!-- NHI agent over leg1 (cyan mTLS client) -->
     <g>
-      <rect x="120" y="522" width="220" height="56" rx="10" fill="#08161a" stroke="#6ee7ff" stroke-width="1.3" stroke-dasharray="4 3"/>
-      <text x="230" y="546" text-anchor="middle" class="svg-title" font-size="11" fill="#6ee7ff" font-weight="700">NHI agent · grok-4.3</text>
+      <rect x="120" y="522" width="220" height="56" rx="10" stroke-width="1.3" stroke-dasharray="4 3" style="fill:var(--accent-soft);stroke:var(--accent)"/>
+      <text x="230" y="546" text-anchor="middle" class="svg-title" font-size="11" font-weight="700" style="fill:var(--accent)">NHI agent · grok-4.3</text>
       <text x="230" y="564" text-anchor="middle" class="svg-label" font-size="9">mTLS client-cert + x-api-key → :9077</text>
     </g>
     <path class="flow agentlink" d="M230 522 C230 470 180 420 173 384" aria-hidden="true"/>
@@ -394,13 +401,12 @@ capacity / cost / SLA planning is
   <span class="item gpuc"><span class="sw"></span>GPU embed — localhost /api/embed (loopback)</span>
   <span class="item leg3c"><span class="sw"></span>Store — SQLite / Postgres + AGE</span>
   <span class="item leg2c"><span class="sw"></span>Federation — W-of-N quorum · mTLS + Ed25519</span>
-  <span class="item"><span class="dot" style="background:#ffd700"></span>Batman maximum-secure</span>
+  <span class="item"><span class="dot" style="background:var(--accent)"></span>Batman maximum-secure</span>
 </div>
 <div class="stats" style="margin-top:1.5rem">
-  <div class="stat"><div class="n">v90</div><div class="l">DB schema</div></div>
-  <div class="stat"><div class="n">103 / 7</div><div class="l">MCP tools (full / core)</div></div>
-  <div class="stat"><div class="n">90 / 92</div><div class="l">CLI subcommands (default / sal)</div></div>
-  <div class="stat"><div class="n">96 / 82</div><div class="l">HTTP routes / paths</div></div>
+  <div class="stat"><div class="n">v100</div><div class="l">DB schema</div></div>
+  <div class="stat"><div class="n">core / full</div><div class="l">MCP profiles</div></div>
+  <div class="stat"><div class="n">76 / 89</div><div class="l">unique HTTP paths served on PostgreSQL (rest fail closed 501)</div></div>
   <div class="stat"><div class="n">9</div><div class="l">Link relations</div></div>
   <div class="stat"><div class="n">30</div><div class="l">Memory fields</div></div>
 </div>
@@ -451,7 +457,7 @@ verified <code>AI_MEMORY_*</code> override battery follow.</p>
     <h3>SQLite or Postgres + AGE</h3>
     <p>Single-node: SQLite WAL + FTS5. Shared fleet: PostgreSQL + Apache AGE +
     pgvector via <code>ai-memory serve --store-url postgres://…</code> (the SAL trait path).
-    <strong>Schema v90</strong> in lockstep across all peers.</p>
+    <strong>Schema v100</strong> in lockstep across all peers.</p>
   </div>
   <div class="card leg2">
     <span class="leg-tag">Federation &amp; security</span>
@@ -616,7 +622,7 @@ the serving tier.</p>
   cloud + airgapped API-embedding shapes, sizing and security posture.</li>
 <li><a href="../whats-new-v08.html">What's New in v0.8.0</a> — distributed-coordination
   GA (the Pillar-1 action / signal / attested-checkpoint substrate). The
-  current v1.0.0 substrate counts (schema v90, 103/7 MCP tools, 9 link
+  current v1.0.0 substrate counts (schema v100, MCP core/full profiles, 9 link
   relations, 30 memory fields) are in the stat strip at the top of this page.</li>
 <li><a href="../v0.8.0/release-notes.html"><code>docs/v0.8.0/release-notes.md</code></a>
   — the v0.8.0 GA change inventory.</li>
@@ -627,7 +633,7 @@ the serving tier.</p>
 </ul>
 </main>
 
-<footer>
+<footer class="ra-legal">
   <div class="footer-links">
     <a href="https://github.com/alphaonedev/ai-memory-mcp">Source</a>
     <a href="https://github.com/alphaonedev/ai-memory-mcp/issues">Issues</a>
@@ -642,6 +648,15 @@ the serving tier.</p>
     <strong>NSA non-endorsement.</strong> References to the National Security Agency Cybersecurity Information document on MCP security (U/OO/6030316-26 | PP-26-1834, May 2026 v1.0) describe ai-memory's substrate-level posture relative to NSA-issued guidance. The NSA, the Department of Defense, and the United States Government do not endorse, certify, or recommend ai-memory, AgenticMem, AlphaOne LLC, or any commercial product. Full mapping + citation: <a href="../compliance/nsa-csi-mcp.html">compliance/nsa-csi-mcp.html</a>.
   </div>
 </footer>
+<footer class="am-foot"><div class="am-wrap">
+  <span>© 2026 AlphaOne LLC · Apache-2.0 · ai-memory v1.0.0</span>
+  <span><a href="https://github.com/alphaonedev/ai-memory-mcp">source</a> · <a href="../index.html">home</a> · <a href="../architectures.html">architectures</a> · <a href="../ARCHITECTURAL_LIMITS.html">limits</a></span>
+</div></footer>
+<button class="am-themetog" id="am-themetog" type="button" aria-label="Toggle light or dark theme">theme</button>
+<script>
+(function(){var d=document.documentElement;try{var s=localStorage.getItem('aim-site-theme');if(s)d.setAttribute('data-theme',s);}catch(e){}
+var b=document.getElementById('am-themetog');if(!b)return;b.addEventListener('click',function(){var c=d.getAttribute('data-theme');var n=c==='dark'?'light':c==='light'?'dark':(matchMedia('(prefers-color-scheme:dark)').matches?'light':'dark');d.setAttribute('data-theme',n);try{localStorage.setItem('aim-site-theme',n);}catch(e){}});})();
+</script>
 
 </body>
 </html>
