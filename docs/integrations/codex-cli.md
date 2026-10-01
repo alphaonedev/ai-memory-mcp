@@ -3,7 +3,27 @@ layout: doc
 ---
 # OpenAI Codex CLI — programmatic system-message prepend
 
-**Category 3 (programmatic).** 100% reliable when implemented.
+**Category 3 (programmatic).**
+
+> ⚠️ **`ai-memory wrap codex` is known broken on Codex CLI ≥ 0.153
+> ([#3545](https://github.com/alphaonedev/ai-memory-mcp/issues/3545)).**
+> The default strategy passes `--system`, and Codex CLI 0.153 has no such
+> flag: `codex exec --system x hello` exits 2 with
+> `error: unexpected argument '--system' found`. The wrapper does NOT probe
+> `codex --version`, ships no tested-range table, and has no boot sentinel,
+> so it cannot tell you the injection failed. The mission-critical
+> standard lists `wrap codex` on Codex ≥ 0.153 as NOT CERTIFIED
+> ([`MISSION-CRITICAL-CERTIFICATION-STANDARD-v1.md`](../compliance/MISSION-CRITICAL-CERTIFICATION-STANDARD-v1.md)).
+>
+> | Codex CLI version | `wrap codex` default (`--system`) |
+> |---|---|
+> | ≥ 0.153 | **Known broken** — Codex rejects the flag |
+> | < 0.153 | **Untested** — no acceptance run is recorded in this repository |
+>
+> On current Codex, use the native MCP server path below
+> (`mcp_servers.memory` in `~/.codex/config.toml`) instead of the wrapper,
+> or pass `--system-flag` / `--system-env` naming a mechanism your
+> installed Codex actually accepts (check `codex --help`).
 
 OpenAI's Codex CLI does not have an MCP host or a session-start hook
 mechanism. The integration is at the application boundary: prepend
@@ -12,7 +32,7 @@ conversation.
 
 > **Codex DOES launch ai-memory as an MCP server when configured in `~/.codex/config.toml` (`mcp_servers.memory`).** If you're using that path AND running `--tier smart` or `--tier autonomous` with a non-default LLM backend, the **recommended** path post-[#1146](https://github.com/alphaonedev/ai-memory-mcp/issues/1146) is a `[llm]` section in `~/.config/ai-memory/config.toml` (single source of truth — no `mcp_servers.memory.env` block needed; export the API-key env var named by `api_key_env` in your shell rc). The **override** path is a TOML env-block in `mcp_servers.memory.env`; see [`llm-backends.md` § Codex CLI TOML shape](llm-backends.html#codex-cli-toml-shape) for the recipe. Shell exports do NOT reach the MCP-spawned subprocess ([#1144](https://github.com/alphaonedev/ai-memory-mcp/issues/1144) → [#1146](https://github.com/alphaonedev/ai-memory-mcp/issues/1146)). Full schema: [`../CONFIG_SCHEMA.md`](../CONFIG_SCHEMA.html).
 
-## Use `ai-memory wrap` (recommended — pure Rust, cross-platform)
+## `ai-memory wrap` (pure Rust, cross-platform — see the warning above)
 
 PR-6 of issue #487 ships a built-in subcommand that does the wrapping
 in Rust with no shell. Same code path on macOS / Linux /
@@ -60,9 +80,11 @@ ai-memory wrap codex --message-file-flag --message-file -- chat
 
 ## Caveats
 
-- The exact flag name depends on which Codex CLI variant is installed.
-  Check `codex --help` and override with `--system-flag` or
-  `--system-env` if needed.
+- The default `--system` flag is rejected by Codex CLI ≥ 0.153 (#3545).
+  The exact mechanism depends on which Codex CLI variant is installed:
+  check `codex --help` and override with `--system-flag` or
+  `--system-env`. `--no-boot` only skips the boot call; it does not fix
+  the flag.
 - `ai-memory wrap` loads memory **once per CLI invocation**. Multi-turn
   conversations within one invocation share the boot context.
 - For richer memory access (mid-session), the developer would need to
