@@ -48,7 +48,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Mutex, OnceLock};
 
@@ -148,19 +148,20 @@ fn sink() -> &'static Mutex<Option<ForensicSink>> {
 /// behind the sink lock.
 const WRITER_THREAD_NAME: &str = "ai-memory-audit-writer";
 
-/// A unit of work for the background writer: either a formed line bound
-/// for a destination file, or a barrier whose acknowledgement channel is
-/// signalled once every line enqueued before it has been written.
+/// A unit of work for the background writer: a row's fields, which the
+/// writer chains, signs and appends under the forensic lock (#4304), or a
+/// barrier whose acknowledgement channel is signalled once every row
+/// enqueued before it has been handled.
 enum WriteOp {
+    /// #4304 — the UNSIGNED fields: `prev_hash` is only known under the lock.
+    Row(Box<PendingRow>),
+    /// Test-only: a raw formed line for a given path (bypasses the chain).
+    #[cfg(test)]
     Append {
         path: PathBuf,
         line: String,
     },
     Barrier(Sender<()>),
-    /// Flush and drop any cached destination handle. Sent by `init` so a
-    /// re-init never keeps writing to a handle whose file was rotated or
-    /// removed out from under it (same path, new inode).
-    Reset,
 }
 
 static WRITER: OnceLock<Sender<WriteOp>> = OnceLock::new();
@@ -358,10 +359,14 @@ fn append_record<W: Write>(w: &mut W, line: &str) -> std::io::Result<()> {
     w.write_all(record.as_bytes())
 }
 
-/// Drain loop for the background writer. Keeps the destination file open
-/// across appends (one `open()` per rotated file, not one per row) and
-/// coalesces a burst into a single flush.
+/// Drain loop for the background writer (`serve` / `mcp`). Each queued row is
+/// chained, signed and appended by [`append_to_chain`] under the forensic
+/// lock (#4304); barriers are acknowledged once every row before them is
+/// written.
 fn run_writer(rx: Receiver<WriteOp>) {
+    // Test-only raw appends keep their own cached handle; real rows go
+    // through the chain writer, which owns its handle.
+    #[cfg(test)]
     let mut open_file: Option<(PathBuf, File)> = None;
     let mut pending_barriers: Vec<Sender<()>> = Vec::new();
 
@@ -371,51 +376,54 @@ fn run_writer(rx: Receiver<WriteOp>) {
             batch.push(next);
         }
 
-        let mut needs_flush = false;
         for op in batch {
+            #[cfg(any(test, debug_assertions))]
+            if !matches!(op, WriteOp::Barrier(_)) {
+                if let Some(delay) = test_writer_delay() {
+                    std::thread::sleep(delay);
+                }
+            }
             match op {
-                WriteOp::Append { path, line } => {
-                    #[cfg(any(test, debug_assertions))]
-                    if let Some(delay) = test_writer_delay() {
-                        std::thread::sleep(delay);
-                    }
-                    let reopen = open_file.as_ref().map_or(true, |(p, _)| p != &path);
-                    if reopen {
-                        match open_for_append_line_aligned(&path) {
-                            Ok(file) => open_file = Some((path, file)),
-                            Err(e) => {
-                                writer_failure("opening", &path, &e);
-                                open_file = None;
-                                continue;
-                            }
-                        }
-                    }
-                    if let Some((path, file)) = open_file.as_mut() {
-                        if let Err(e) = append_record(file, &line) {
-                            writer_failure("appending to", &path, &e);
-                        } else {
-                            needs_flush = true;
-                        }
+                WriteOp::Row(row) => {
+                    if let Err(e) = append_to_chain(*row) {
+                        // The row was not written: say so, count it.
+                        crate::metrics::inc_forensic_sink_unavailable();
+                        tracing::error!(
+                            target: AUDIT_TRACE_TARGET,
+                            "forensic: a queued row was not written: {e:#}"
+                        );
                     }
                 }
+                #[cfg(test)]
+                WriteOp::Append { path, line } => append_raw_for_test(&mut open_file, path, &line),
                 WriteOp::Barrier(ack) => pending_barriers.push(ack),
-                WriteOp::Reset => {
-                    if let Some((_, file)) = open_file.as_mut() {
-                        let _ = file.flush();
-                    }
-                    open_file = None;
-                    needs_flush = false;
-                }
             }
         }
 
-        if needs_flush {
-            if let Some((_, file)) = open_file.as_mut() {
-                let _ = file.flush();
-            }
-        }
+        // Every write above went straight to its file (no user-space
+        // buffer), so a barrier can be acknowledged now.
         for ack in pending_barriers.drain(..) {
             let _ = ack.send(());
+        }
+    }
+}
+
+/// Test-only: the raw-append arm of [`run_writer`], with its own handle.
+#[cfg(test)]
+fn append_raw_for_test(open_file: &mut Option<(PathBuf, File)>, path: PathBuf, line: &str) {
+    if open_file.as_ref().is_none_or(|(p, _)| p != &path) {
+        match open_for_append_line_aligned(&path) {
+            Ok(file) => *open_file = Some((path, file)),
+            Err(e) => {
+                writer_failure("opening", &path, &e);
+                *open_file = None;
+                return;
+            }
+        }
+    }
+    if let Some((path, file)) = open_file.as_mut() {
+        if let Err(e) = append_record(file, line) {
+            writer_failure("appending to", path, &e);
         }
     }
 }
@@ -766,14 +774,13 @@ pub fn ledger_signing_status() -> LedgerSigningStatus {
     }
 }
 
+/// The per-process part of the sink: what is needed to RENDER a row's
+/// fields. The chain head, the signing key and the file live in
+/// [`ChainWriter`] (#4304), behind the cross-process forensic lock.
 struct ForensicSink {
+    /// The forensic directory (read by the watermark and outage helpers).
     dir: PathBuf,
-    last_hash: String,
-    /// #4319 — the daily file the INLINE path appends to (cached; reopened
-    /// when the day changes). Unused in background mode.
-    inline_file: Option<(PathBuf, File)>,
-    signing_key: Option<SigningKey>,
-    /// #3647 — commitment key derived once from `signing_key`; `None` when
+    /// #3647 — commitment key derived once from the signing key; `None` when
     /// the sink is unsigned (commitments are then withheld).
     commitment_key: Option<zeroize::Zeroizing<[u8; 32]>>,
 }
@@ -1311,31 +1318,39 @@ pub fn init(dir: &Path, signing_key: Option<SigningKey>) -> Result<()> {
     let last_hash = read_chain_tail(dir)?.unwrap_or_else(|| CHAIN_HEAD_PREV_HASH.to_string());
     init_audit_signers(signing_key.as_ref());
     let commitment_key = signing_key.as_ref().map(forensic_commitment_key);
-    let new_sink = ForensicSink {
-        dir: dir.to_path_buf(),
-        last_hash,
-        inline_file: None,
-        signing_key,
-        commitment_key,
-    };
     let mut guard = sink()
         .lock()
         .map_err(|_| anyhow!("forensic sink mutex poisoned"))?;
-    // Invalidate any cached destination handle the background writer is
-    // holding from a prior epoch. New appends can only be enqueued under
-    // this same guard (see `try_record_decision`), so sending `Reset`
-    // while holding it guarantees the writer drops the stale handle
-    // before any row for the freshly-initialised sink is enqueued —
-    // without this, a re-init over a removed/rotated same-named file
-    // would keep writing to the unlinked inode.
+    // New appends can only be produced under this same guard, so draining the
+    // background writer here (it never takes the sink lock) guarantees no row
+    // of a prior epoch is still queued when the chain writer is replaced.
     // #3164 — a spawn failure surfaces as an `init` error; it no longer kills
     // the process from the main thread. #4272: the boot path treats it as
     // "forensic sink unavailable" (degrade with the outage signals, or refuse
     // under AI_MEMORY_REQUIRE_FORENSIC_SINK), like every other init failure.
     if background_writer_enabled() {
-        let _ = writer()?.send(WriteOp::Reset);
+        writer()?;
+        flush_blocking();
     }
-    *guard = Some(new_sink);
+    // A fresh chain writer drops any handle cached by a prior epoch, so a
+    // re-init over a removed or rotated same-named file never keeps writing
+    // to the unlinked inode. `at: None` makes its first append re-read the
+    // tail under the lock (#4304).
+    *chain_writer()
+        .lock()
+        .map_err(|_| anyhow!("forensic chain mutex poisoned"))? = Some(ChainWriter {
+        dir: dir.to_path_buf(),
+        signing_key,
+        cursor: ChainCursor {
+            last_hash,
+            at: None,
+        },
+        file: None,
+    });
+    *guard = Some(ForensicSink {
+        dir: dir.to_path_buf(),
+        commitment_key,
+    });
     Ok(())
 }
 
@@ -1367,6 +1382,9 @@ pub fn shutdown() {
     flush_blocking();
     if let Ok(mut guard) = sink().lock() {
         *guard = None;
+    }
+    if let Ok(mut chain) = chain_writer().lock() {
+        *chain = None;
     }
 }
 
@@ -1424,84 +1442,331 @@ fn append_row(
     rule_id: &str,
     payload: &ForensicPayload,
 ) -> Result<()> {
-    let mut guard = sink()
+    let guard = sink()
         .lock()
         .map_err(|_| anyhow!("forensic sink mutex poisoned"))?;
-    let Some(s) = guard.as_mut() else {
+    let Some(s) = guard.as_ref() else {
         return Ok(());
     };
-
-    let now = Utc::now();
-    let ts = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-    let prev_hash = s.last_hash.clone();
     let mac_key = s.commitment_key.as_deref();
-
-    let mut row = ForensicDecision {
-        ts,
+    let row = PendingRow {
+        now: Utc::now(),
         actor: sanitize_row_field(actor, mac_key),
         decision: sanitize_row_field(decision, mac_key),
-        kind: kind.to_string(),
+        kind,
         rule_id: sanitize_row_field(rule_id, mac_key),
         payload: payload.render(mac_key),
-        prev_hash,
-        sig: String::new(),
     };
-
-    if let Some(key) = &s.signing_key {
-        let canonical = row.canonical_bytes();
-        let sig: Signature = key.sign(&canonical);
-        row.sig = B64.encode(sig.to_bytes());
-    }
-
-    let self_hash = row.self_hash();
-    let line = serde_json::to_string(&row).context("serialising forensic row")?;
-    let file_path = daily_path(&s.dir, &now);
-
-    // Advance the in-memory chain head and write (or enqueue) the row while
-    // still holding the sink lock, so the on-disk order equals the
-    // `prev_hash` chain order. A write that fails is counted by
-    // `writer_failure` and the head still advances, so the lost row shows
-    // as a chain break at the next verify instead of vanishing.
-    s.last_hash = self_hash;
+    // The row is chained, signed and written by `append_to_chain`, under the
+    // cross-process forensic lock (#4304). The sink lock is held until the
+    // row is written (inline) or queued (background), so a re-init can never
+    // interleave with it.
     if background_writer_enabled() {
-        // #1472 — `serve` / `mcp` only: the blocking open()/write() runs off
-        // the request thread; the #4319 exit drain covers what is queued.
+        // #1472 — `serve` / `mcp` only: the blocking lock, read and write run
+        // off the request thread; the #4319 exit drain covers what is queued.
         writer()?
-            .send(WriteOp::Append {
-                path: file_path,
-                line,
-            })
+            .send(WriteOp::Row(Box::new(row)))
             .map_err(|_| anyhow!("forensic audit writer thread has stopped"))?;
+        Ok(())
     } else {
         // #4319 — every other process writes the row before `append_row`
-        // returns, so nothing is queued when it exits (a short-lived
-        // command used to exit with its row still in the writer's queue).
-        write_inline(s, file_path, &line);
+        // returns, so nothing is queued when it exits.
+        append_to_chain(row)
     }
-    Ok(())
 }
 
-/// #4319 — append one formed row on the calling thread, through the same
-/// line-aligned open and single-write helpers the background writer uses.
-fn write_inline(s: &mut ForensicSink, path: PathBuf, line: &str) {
-    if s.inline_file.as_ref().map_or(true, |(p, _)| p != &path) {
-        match open_for_append_line_aligned(&path) {
-            Ok(file) => s.inline_file = Some((path, file)),
+// ---------------------------------------------------------------------------
+// #4304 — one chain across processes
+// ---------------------------------------------------------------------------
+//
+// Several processes append to the same daily file: `serve`, `mcp`, and every
+// CLI command. Each used to read the tail ONCE at start and chain from its own
+// in-memory head ever after, so a row written by any other process in
+// between was skipped: the chain forked and `verify` reported a break with
+// no tampering. Vote acba9602: every append takes an exclusive lock on
+// `<forensic dir>/forensic.lock`, compares the daily file with what this
+// process last left there, re-reads the tail only when it changed, and forms,
+// signs and writes the row while still holding the lock.
+
+/// #4304 — the cross-process lock file inside the forensic directory. Its
+/// name does not match the daily-file pattern, so no reader treats it as a
+/// log file.
+pub const FORENSIC_LOCK_FILE: &str = "forensic.lock";
+
+/// A row's fields, rendered on the recording thread. `prev_hash` and `sig`
+/// are added under the forensic lock by [`append_to_chain`].
+struct PendingRow {
+    now: DateTime<Utc>,
+    actor: String,
+    decision: String,
+    kind: &'static str,
+    rule_id: String,
+    payload: serde_json::Value,
+}
+
+/// What a daily file looked like right after this process last wrote it.
+/// Any other appender (or a rewrite) changes at least one field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileMark {
+    path: PathBuf,
+    dev: u64,
+    ino: u64,
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+impl FileMark {
+    fn of(path: &Path, meta: &std::fs::Metadata) -> Self {
+        #[cfg(unix)]
+        let (dev, ino) = {
+            use std::os::unix::fs::MetadataExt as _;
+            (meta.dev(), meta.ino())
+        };
+        #[cfg(not(unix))]
+        let (dev, ino) = (0, 0);
+        Self {
+            path: path.to_path_buf(),
+            dev,
+            ino,
+            len: meta.len(),
+            modified: meta.modified().ok(),
+        }
+    }
+
+    /// The same file (path, device, inode), now shorter than this mark.
+    fn shrank_to(&self, now: Option<&Self>) -> bool {
+        now.is_some_and(|n| {
+            n.path == self.path && n.dev == self.dev && n.ino == self.ino && n.len < self.len
+        })
+    }
+
+    /// The daily file as it is now, without following a link; `None` when it
+    /// does not exist or cannot be examined (the tail is then re-read).
+    fn current(path: &Path) -> Option<Self> {
+        std::fs::symlink_metadata(path)
+            .ok()
+            .map(|meta| Self::of(path, &meta))
+    }
+}
+
+/// The chain head this process last wrote, and where.
+struct ChainCursor {
+    last_hash: String,
+    /// `None` = unknown: the next append re-reads the tail.
+    at: Option<FileMark>,
+}
+
+/// The process's appender: owns the chain head, the signing key and the
+/// cached daily-file handle. One per process, behind [`chain_writer`].
+struct ChainWriter {
+    dir: PathBuf,
+    signing_key: Option<SigningKey>,
+    cursor: ChainCursor,
+    file: Option<(PathBuf, File)>,
+}
+
+static CHAIN: OnceLock<Mutex<Option<ChainWriter>>> = OnceLock::new();
+
+fn chain_writer() -> &'static Mutex<Option<ChainWriter>> {
+    CHAIN.get_or_init(|| Mutex::new(None))
+}
+
+/// The exclusive lock on [`FORENSIC_LOCK_FILE`], released on drop.
+struct DirLock(File);
+
+/// #4304 (f2r) — how long one append waits for [`FORENSIC_LOCK_FILE`]. A
+/// legitimate holder keeps it for one tail check and one write (milliseconds),
+/// but `flock` needs only read access, so a process that can open the file
+/// could hold it forever and stall every audited write (the #4332 class). At
+/// the bound the append goes ahead unlocked, counted.
+pub const FORENSIC_LOCK_BUDGET: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The first and the largest pause between two `try_lock` attempts.
+const LOCK_RETRY_FIRST: std::time::Duration = std::time::Duration::from_millis(1);
+const LOCK_RETRY_MAX: std::time::Duration = std::time::Duration::from_millis(50);
+
+impl DirLock {
+    /// `None` when the lock cannot be taken within [`FORENSIC_LOCK_BUDGET`].
+    /// The caller then re-reads the tail on every append: still correct for
+    /// this process, but two unlocked appenders can interleave, so it is
+    /// WARNed (once) and counted.
+    fn acquire(dir: &Path) -> Option<Self> {
+        Self::acquire_within(dir, FORENSIC_LOCK_BUDGET)
+    }
+
+    fn acquire_within(dir: &Path, budget: std::time::Duration) -> Option<Self> {
+        let path = dir.join(FORENSIC_LOCK_FILE);
+        let mut options = OpenOptions::new();
+        options.create(true).read(true).write(true);
+        // Owner-only, so another user cannot open it to hold the lock.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let locked = open_forensic_file(&mut options, &path).and_then(|f| {
+            lock_within(&f, budget)?;
+            Ok(f)
+        });
+        match locked {
+            Ok(f) => Some(Self(f)),
             Err(e) => {
-                writer_failure("opening", &path, &e);
-                s.inline_file = None;
-                return;
+                crate::metrics::inc_forensic_lock_unavailable();
+                if !LOCK_UNAVAILABLE_WARNED.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(
+                        target: AUDIT_TRACE_TARGET,
+                        "forensic: cannot lock {}: {e}; appending without the cross-process \
+                         lock (the tail is re-read for every row) (#4304)",
+                        path.display()
+                    );
+                }
+                None
             }
         }
     }
-    let failed = match s.inline_file.as_mut() {
-        Some((path, file)) => append_record(file, line).err().map(|e| (path.clone(), e)),
-        None => None,
-    };
-    if let Some((path, e)) = failed {
-        writer_failure("appending to", &path, &e);
-        // Reopen next time: the handle may be past a failed partial write.
-        s.inline_file = None;
+}
+
+/// Take `f`'s exclusive lock, retrying a held lock with backoff until
+/// `budget` is spent; then `TimedOut`.
+fn lock_within(f: &File, budget: std::time::Duration) -> std::io::Result<()> {
+    let deadline = std::time::Instant::now() + budget;
+    let mut pause = LOCK_RETRY_FIRST;
+    loop {
+        match f.try_lock() {
+            Ok(()) => return Ok(()),
+            Err(std::fs::TryLockError::Error(e)) => return Err(e),
+            Err(std::fs::TryLockError::WouldBlock) => {}
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("held by another process for more than {budget:?}"),
+            ));
+        }
+        std::thread::sleep(pause.min(deadline - now));
+        pause = (pause * 2).min(LOCK_RETRY_MAX);
+    }
+}
+
+impl Drop for DirLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
+static LOCK_UNAVAILABLE_WARNED: AtomicBool = AtomicBool::new(false);
+
+/// #4304 — chain, sign and write one row under the forensic lock. A no-op when
+/// the sink is down.
+///
+/// # Errors
+/// The chain tail could not be read (the row is not written: chaining it
+/// from a guessed head would fork the chain), or the chain mutex is poisoned.
+/// A failed WRITE is counted and reported by [`writer_failure`], as before,
+/// and is not an error here.
+fn append_to_chain(row: PendingRow) -> Result<()> {
+    let mut guard = chain_writer()
+        .lock()
+        .map_err(|_| anyhow!("forensic chain mutex poisoned"))?;
+    match guard.as_mut() {
+        Some(w) => w.append(row),
+        None => Ok(()),
+    }
+}
+
+impl ChainWriter {
+    fn append(&mut self, row: PendingRow) -> Result<()> {
+        let lock = DirLock::acquire(&self.dir);
+        let path = daily_path(&self.dir, &row.now);
+        // Fast path only when locked and the file is exactly as this process
+        // left it: nobody else has written since, so the cached head is the
+        // tail. Anything else (another appender, a rotation, a new day, a
+        // rewrite, an unknown cursor) re-reads it.
+        let current = FileMark::current(&path);
+        let unchanged = lock.is_some() && self.cursor.at.is_some() && self.cursor.at == current;
+        if !unchanged
+            && self
+                .cursor
+                .at
+                .as_ref()
+                .is_some_and(|m| m.shrank_to(current.as_ref()))
+        {
+            // Appenders only ever grow the file. The same file SHORTER than
+            // this process left it was truncated: chaining from its new tail
+            // would hide that, so the row continues this process's head and
+            // the break stays visible to `verify` (the pre-#4304 property).
+            self.file = None;
+            tracing::error!(
+                target: AUDIT_TRACE_TARGET,
+                path = %path.display(),
+                "forensic: the daily file is shorter than this process left it (truncated); \
+                 the next row continues the chain head this process wrote, so `verify` \
+                 reports the break (#4304)"
+            );
+        } else if !unchanged {
+            self.file = None;
+            let today = date_code(&row.now);
+            match read_chain_tail_as_of(&self.dir, today) {
+                Ok(tail) => {
+                    self.cursor.last_hash =
+                        tail.unwrap_or_else(|| CHAIN_HEAD_PREV_HASH.to_string());
+                }
+                Err(e) => {
+                    crate::metrics::inc_forensic_sink_unavailable();
+                    return Err(e.context("forensic: the chain tail could not be re-read"));
+                }
+            }
+        }
+
+        let mut record = ForensicDecision {
+            ts: row.now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            actor: row.actor,
+            decision: row.decision,
+            kind: row.kind.to_string(),
+            rule_id: row.rule_id,
+            payload: row.payload,
+            prev_hash: self.cursor.last_hash.clone(),
+            sig: String::new(),
+        };
+        if let Some(key) = &self.signing_key {
+            let sig: Signature = key.sign(&record.canonical_bytes());
+            record.sig = B64.encode(sig.to_bytes());
+        }
+        let self_hash = record.self_hash();
+        let line = serde_json::to_string(&record).context("serialising forensic row")?;
+
+        if self.file.as_ref().is_none_or(|(p, _)| p != &path) {
+            // Opened (and line-aligned, #4205) under the lock.
+            match open_for_append_line_aligned(&path) {
+                Ok(file) => self.file = Some((path.clone(), file)),
+                Err(e) => {
+                    writer_failure("opening", &path, &e);
+                    self.cursor.at = None;
+                    return Ok(());
+                }
+            }
+        }
+        let written = match self.file.as_mut() {
+            Some((_, file)) => append_record(file, &line).and_then(|()| file.metadata()),
+            None => return Ok(()),
+        };
+        match written {
+            Ok(meta) => {
+                // The head moves only once the row is on disk.
+                self.cursor.last_hash = self_hash;
+                self.cursor.at = Some(FileMark::of(&path, &meta));
+            }
+            Err(e) => {
+                writer_failure("appending to", &path, &e);
+                // Resync from the file next time: the handle may be past a
+                // partial write, and the row is not in the chain.
+                self.file = None;
+                self.cursor.at = None;
+            }
+        }
+        drop(lock);
+        Ok(())
     }
 }
 
@@ -1854,7 +2119,12 @@ enum FileTail {
 
 /// Today's UTC date as the `YYYYMMDD` code [`file_date`] returns.
 fn today_code() -> i64 {
-    let d = Utc::now().date_naive();
+    date_code(&Utc::now())
+}
+
+/// `when`'s UTC date as the `YYYYMMDD` code [`file_date`] returns.
+fn date_code(when: &DateTime<Utc>) -> i64 {
+    let d = when.date_naive();
     i64::from(d.year()) * 10_000 + i64::from(d.month()) * 100 + i64::from(d.day())
 }
 
@@ -4764,6 +5034,9 @@ pub(crate) fn forensic_sink_test_lock() -> &'static std::sync::Mutex<()> {
 }
 
 #[cfg(test)]
+mod chain_4304_tests;
+
+#[cfg(test)]
 mod writer_spawn_tests_3164 {
     use super::*;
 
@@ -6714,7 +6987,7 @@ mod tests {
         // Same dir + same date file name across two init epochs. The
         // first epoch leaves the writer holding an open handle to the
         // file's inode. Removing the file and re-initing must make the
-        // writer drop that handle (WriteOp::Reset) so the second epoch's
+        // writer drop that handle (a fresh `ChainWriter`) so the second epoch's
         // row lands on the freshly created file, not the unlinked inode.
         let tmp = TempDir::new().unwrap();
         let date = Utc::now().format("%Y-%m-%d").to_string();
