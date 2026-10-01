@@ -375,6 +375,10 @@ fn run_writer(rx: Receiver<WriteOp>) {
         for op in batch {
             match op {
                 WriteOp::Append { path, line } => {
+                    #[cfg(any(test, debug_assertions))]
+                    if let Some(delay) = test_writer_delay() {
+                        std::thread::sleep(delay);
+                    }
                     let reopen = open_file.as_ref().map_or(true, |(p, _)| p != &path);
                     if reopen {
                         match open_for_append_line_aligned(&path) {
@@ -435,6 +439,123 @@ pub fn flush_blocking() {
             "forensic: flush skipped, writer unavailable: {e:#}"
         ),
     }
+}
+
+/// #4319 — whether forensic rows go through the background writer (#1472).
+/// Off by default: rows are written inline, before `append_row` returns. Only
+/// the long-running request servers (`serve`, `mcp`) switch it on, from
+/// `main` before [`init`], so per-request file I/O stays off their request
+/// path; their queued rows are drained at exit by [`drain_bounded`].
+static BACKGROUND_WRITER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn background_writer_enabled() -> bool {
+    BACKGROUND_WRITER.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// #4319 — route forensic rows through the background writer for the rest
+/// of this process, and drain it at process exit (bounded). Call before
+/// [`init`]; idempotent.
+pub fn use_background_writer() {
+    BACKGROUND_WRITER.store(true, std::sync::atomic::Ordering::SeqCst);
+    register_exit_drain();
+}
+
+/// How long the exit drain waits for the background writer to persist what
+/// is queued. Rows are formed in memory already; this only bounds the file
+/// writes, so a healthy writer needs milliseconds. A writer stuck on I/O is
+/// abandoned at the bound rather than holding the process.
+pub const EXIT_DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// #4319 — what a bounded drain of the background writer found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrainOutcome {
+    /// Every row queued before the drain is on disk.
+    Drained,
+    /// No background writer exists in this process: nothing to drain.
+    NoWriter,
+    /// The writer did not finish within the budget. The rows still queued
+    /// are lost; counted in `ai_memory_forensic_sink_unavailable_total`.
+    TimedOut,
+}
+
+/// #4319 — wait at most `budget` for the background writer to persist every
+/// row queued so far. Never takes the sink lock (it may run at process exit
+/// while another thread holds it) and never spawns the writer. A timeout is
+/// counted and reported on stderr: rows that never reach disk must not be
+/// silent.
+pub fn drain_bounded(budget: std::time::Duration) -> DrainOutcome {
+    match WRITER.get() {
+        Some(tx) => drain_writer(tx, budget),
+        None => DrainOutcome::NoWriter,
+    }
+}
+
+/// [`drain_bounded`] against a given writer channel.
+fn drain_writer(tx: &Sender<WriteOp>, budget: std::time::Duration) -> DrainOutcome {
+    let (ack, done) = std::sync::mpsc::channel();
+    if tx.send(WriteOp::Barrier(ack)).is_err() {
+        return DrainOutcome::NoWriter;
+    }
+    match done.recv_timeout(budget) {
+        Ok(()) => DrainOutcome::Drained,
+        Err(_) => {
+            crate::metrics::inc_forensic_sink_unavailable();
+            // Raw stderr: tracing may already be torn down at exit.
+            let _ = writeln!(
+                std::io::stderr(),
+                "ai-memory: the forensic audit writer did not finish within {budget:?} at \
+                 exit; rows still queued were not written (counted in \
+                 ai_memory_forensic_sink_unavailable_total) (#4319)"
+            );
+            DrainOutcome::TimedOut
+        }
+    }
+}
+
+/// #4319 — register [`drain_bounded`] to run at process exit, once. libc's
+/// `exit` runs it for a return from `main` and for every
+/// `std::process::exit`, so no exit path needs its own call.
+fn register_exit_drain() {
+    static REGISTERED: std::sync::Once = std::sync::Once::new();
+    REGISTERED.call_once(|| {
+        #[cfg(unix)]
+        {
+            // SAFETY: `atexit` only records a function pointer. The handler
+            // is an `extern "C" fn()` with no arguments, never unwinds
+            // (`catch_unwind` inside), and touches only process-global state
+            // that outlives `main` (a `OnceLock` sender and a metric).
+            let rc = unsafe { libc::atexit(drain_forensic_writer_at_exit) };
+            if rc != 0 {
+                tracing::error!(
+                    target: AUDIT_TRACE_TARGET,
+                    "forensic: could not register the exit drain (atexit returned {rc}); \
+                     rows queued at exit may be lost (#4319)"
+                );
+            }
+        }
+    });
+}
+
+#[cfg(unix)]
+extern "C" fn drain_forensic_writer_at_exit() {
+    let _ = std::panic::catch_unwind(|| drain_bounded(EXIT_DRAIN_BUDGET));
+}
+
+/// #4319 — test seam: sleep this many ms in the background writer before
+/// each append, so a test can make "the process exits while its row is
+/// still queued" deterministic. Read in debug and test builds only.
+pub const TEST_FORENSIC_WRITER_DELAY_ENV: &str = "AI_MEMORY_TEST_FORENSIC_WRITER_DELAY_MS";
+
+#[cfg(any(test, debug_assertions))]
+fn test_writer_delay() -> Option<std::time::Duration> {
+    static DELAY: OnceLock<Option<std::time::Duration>> = OnceLock::new();
+    *DELAY.get_or_init(|| {
+        std::env::var(TEST_FORENSIC_WRITER_DELAY_ENV)
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|ms| *ms > 0)
+            .map(std::time::Duration::from_millis)
+    })
 }
 
 /// Test-only: enqueue a raw append directly to the background writer,
@@ -648,6 +769,9 @@ pub fn ledger_signing_status() -> LedgerSigningStatus {
 struct ForensicSink {
     dir: PathBuf,
     last_hash: String,
+    /// #4319 — the daily file the INLINE path appends to (cached; reopened
+    /// when the day changes). Unused in background mode.
+    inline_file: Option<(PathBuf, File)>,
     signing_key: Option<SigningKey>,
     /// #3647 — commitment key derived once from `signing_key`; `None` when
     /// the sink is unsigned (commitments are then withheld).
@@ -1190,6 +1314,7 @@ pub fn init(dir: &Path, signing_key: Option<SigningKey>) -> Result<()> {
     let new_sink = ForensicSink {
         dir: dir.to_path_buf(),
         last_hash,
+        inline_file: None,
         signing_key,
         commitment_key,
     };
@@ -1207,7 +1332,9 @@ pub fn init(dir: &Path, signing_key: Option<SigningKey>) -> Result<()> {
     // the process from the main thread. #4272: the boot path treats it as
     // "forensic sink unavailable" (degrade with the outage signals, or refuse
     // under AI_MEMORY_REQUIRE_FORENSIC_SINK), like every other init failure.
-    let _ = writer()?.send(WriteOp::Reset);
+    if background_writer_enabled() {
+        let _ = writer()?.send(WriteOp::Reset);
+    }
     *guard = Some(new_sink);
     Ok(())
 }
@@ -1330,20 +1457,52 @@ fn append_row(
     let line = serde_json::to_string(&row).context("serialising forensic row")?;
     let file_path = daily_path(&s.dir, &now);
 
-    // Advance the in-memory chain head and enqueue the durable append —
-    // both while still holding the sink lock, so the order rows reach the
-    // background writer equals their `prev_hash` chain order (and hence
-    // their on-disk order). The blocking open()/write() now runs off the
-    // request thread, removing per-write file I/O from this serialized
-    // critical section (#1472).
+    // Advance the in-memory chain head and write (or enqueue) the row while
+    // still holding the sink lock, so the on-disk order equals the
+    // `prev_hash` chain order. A write that fails is counted by
+    // `writer_failure` and the head still advances, so the lost row shows
+    // as a chain break at the next verify instead of vanishing.
     s.last_hash = self_hash;
-    writer()?
-        .send(WriteOp::Append {
-            path: file_path,
-            line,
-        })
-        .map_err(|_| anyhow!("forensic audit writer thread has stopped"))?;
+    if background_writer_enabled() {
+        // #1472 — `serve` / `mcp` only: the blocking open()/write() runs off
+        // the request thread; the #4319 exit drain covers what is queued.
+        writer()?
+            .send(WriteOp::Append {
+                path: file_path,
+                line,
+            })
+            .map_err(|_| anyhow!("forensic audit writer thread has stopped"))?;
+    } else {
+        // #4319 — every other process writes the row before `append_row`
+        // returns, so nothing is queued when it exits (a short-lived
+        // command used to exit with its row still in the writer's queue).
+        write_inline(s, file_path, &line);
+    }
     Ok(())
+}
+
+/// #4319 — append one formed row on the calling thread, through the same
+/// line-aligned open and single-write helpers the background writer uses.
+fn write_inline(s: &mut ForensicSink, path: PathBuf, line: &str) {
+    if s.inline_file.as_ref().map_or(true, |(p, _)| p != &path) {
+        match open_for_append_line_aligned(&path) {
+            Ok(file) => s.inline_file = Some((path, file)),
+            Err(e) => {
+                writer_failure("opening", &path, &e);
+                s.inline_file = None;
+                return;
+            }
+        }
+    }
+    let failed = match s.inline_file.as_mut() {
+        Some((path, file)) => append_record(file, line).err().map(|e| (path.clone(), e)),
+        None => None,
+    };
+    if let Some((path, e)) = failed {
+        writer_failure("appending to", &path, &e);
+        // Reopen next time: the handle may be past a failed partial write.
+        s.inline_file = None;
+    }
 }
 
 /// Fire-and-forget [`try_record_decision`]. Errors logged + swallowed.
@@ -5985,6 +6144,61 @@ mod tests {
         let (errors, debugs) = crate::test_support::count_error_and_debug_lines(&sink);
         assert_eq!(errors, 1, "one ERROR per interval, not one per row");
         assert_eq!(debugs, 10, "every dropped row is still traced, at DEBUG");
+    }
+
+    /// #4319 — the exit drain is bounded: a writer that never answers is
+    /// abandoned at the budget, and the loss is counted, not silent.
+    #[test]
+    fn a_drain_that_times_out_is_counted_4319() {
+        let (tx, _rx_never_serviced) = std::sync::mpsc::channel::<WriteOp>();
+        let before = crate::metrics::forensic_sink_unavailable_count();
+        let started = std::time::Instant::now();
+        let outcome = drain_writer(&tx, std::time::Duration::from_millis(50));
+        assert_eq!(outcome, DrainOutcome::TimedOut);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the drain must not wait past its budget"
+        );
+        assert!(crate::metrics::forensic_sink_unavailable_count() > before);
+    }
+
+    /// #4319 — a writer whose thread is gone has nothing to drain.
+    #[test]
+    fn a_drain_with_no_writer_thread_is_a_no_op_4319() {
+        let (tx, rx) = std::sync::mpsc::channel::<WriteOp>();
+        drop(rx);
+        assert_eq!(
+            drain_writer(&tx, std::time::Duration::from_millis(50)),
+            DrainOutcome::NoWriter
+        );
+    }
+
+    /// #4319 — a drain against a live writer returns once everything queued
+    /// before it is on disk.
+    #[test]
+    fn a_drain_returns_after_the_queued_rows_are_written_4319() {
+        let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("forensic-2026-07-31.jsonl");
+        enqueue_append_for_test(path.clone(), "{\"row\":1}".to_string());
+        assert_eq!(drain_bounded(EXIT_DRAIN_BUDGET), DrainOutcome::Drained);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"row\":1}\n");
+    }
+
+    /// #4319 — with the default (inline) mode, a row is on disk when
+    /// recording it returns: nothing is queued for exit to lose.
+    #[test]
+    fn an_inline_row_is_on_disk_when_recording_returns_4319() {
+        let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        shutdown();
+        assert!(!background_writer_enabled(), "inline is the default");
+        let tmp = TempDir::new().unwrap();
+        init(tmp.path(), None).unwrap();
+        record_decision("agent:4319", "allow", "probe", "", ForensicPayload::new());
+        let today = daily_path(tmp.path(), &Utc::now());
+        let body = std::fs::read_to_string(&today).expect("written inline, no flush");
+        assert_eq!(body.lines().count(), 1, "{body}");
+        shutdown();
     }
 
     /// #4304 — a row and its newline go out in ONE write call.
