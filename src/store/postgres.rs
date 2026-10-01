@@ -110,6 +110,8 @@ mod swarm_rewind;
 mod lifecycle_tx_3152;
 // #4199 A1 — the postgres forensic-sink outage recorder (qual_10 budget).
 mod forensic_outage_4199;
+// #4370 — the apply_remote_signal override + the shared signal INSERT.
+mod signal_apply_4370;
 
 use crate::models::field_names;
 use std::time::Duration;
@@ -30107,34 +30109,20 @@ impl MemoryStore for PostgresStore {
                 crate::models::AttestLevel::Unsigned.as_str(),
             ),
         };
-        sqlx::query(
-            "INSERT INTO signals \
-                (id, namespace, from_agent, to_agent, subject, body, signal_type, \
-                 in_reply_to, correlation_id, reference_ids, created_at, expires_at, \
-                 delivered_at, read_at, acknowledged_at, signature, sender_pubkey) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)",
-        )
-        .bind(&to_store.id)
-        .bind(&to_store.namespace)
-        .bind(&to_store.from_agent)
-        .bind(&to_store.to_agent)
-        .bind(&to_store.subject)
-        .bind(to_store.body.to_string())
-        .bind(to_store.signal_type.as_str())
-        .bind(&to_store.in_reply_to)
-        .bind(&to_store.correlation_id)
-        .bind(to_store.reference_ids.to_string())
-        .bind(to_store.created_at)
-        .bind(to_store.expires_at)
-        .bind(to_store.delivered_at)
-        .bind(to_store.read_at)
-        .bind(to_store.acknowledged_at)
-        .bind(&to_store.signature)
-        .bind(&to_store.sender_pubkey)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| to_store_err("signal_send", e))?;
+        self.insert_signal_row_pg(&to_store)
+            .await
+            .map_err(|e| to_store_err("signal_send", e))?;
         Ok(attest)
+    }
+
+    /// #4370 — a primary-key race loser is `AlreadyPresent`; see
+    /// `postgres/signal_apply_4370.rs`.
+    async fn apply_remote_signal(
+        &self,
+        ctx: &CallerContext,
+        signal: &crate::models::Signal,
+    ) -> StoreResult<crate::store::RemoteSignalApply> {
+        self.apply_remote_signal_pg(ctx, signal).await
     }
 
     async fn signal_get(
