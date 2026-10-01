@@ -898,12 +898,20 @@ schemas and enforced-caller visibility remain unchanged.
 ### `GET /api/v1/search`
 
 Read-only FTS5 keyword search. Same filter params as list, plus `q`
-(required) and `format` (`json` default | `toon` | `toon_compact` —
-v0.7.0 #1579 B4, same semantics as recall above).
+and `format` (`json` default | `toon` | `toon_compact` —
+v0.7.0 #1579 B4, same semantics as recall above). `q` is required only
+when `source_uri` is absent or blank; a nonempty `source_uri` supports
+source-only lookup (#891). A request with both empty is `400
+{"error": "query or source_uri is required"}`.
+
+Text-query responses contain `results`, `count`, and `query`:
 
 ```json
 { "results": [ … ], "count": 3, "query": "urgent deadline" }
 ```
+
+The SQLite source-only response contains `results`, `count`, and
+`source_uri` instead of `query`.
 
 > **Note (HTTP ↔ MCP parity):** The MCP `memory_recall`,
 > `memory_search`, and `memory_list` tools accept the same optional
