@@ -712,7 +712,7 @@ async fn exercise_sal_surface(store: &dyn MemoryStore) {
             .apply_remote_signal(&ctx, &signed_remote)
             .await
             .expect("apply_remote_signal signed ok"),
-        "self_signed"
+        ai_memory::store::RemoteSignalApply::Inserted(ai_memory::models::AttestLevel::SelfSigned)
     );
     assert!(
         ai_memory::signals::verify(
@@ -724,11 +724,14 @@ async fn exercise_sal_surface(store: &dyn MemoryStore) {
         ),
         "applied remote signal verifies"
     );
-    // Replay → idempotent no-op (still present, no error).
-    store
-        .apply_remote_signal(&ctx, &signed_remote)
-        .await
-        .expect("apply_remote_signal replay ok");
+    // Replay → idempotent no-op (still present, no error, nothing written).
+    assert_eq!(
+        store
+            .apply_remote_signal(&ctx, &signed_remote)
+            .await
+            .expect("apply_remote_signal replay ok"),
+        ai_memory::store::RemoteSignalApply::AlreadyPresent
+    );
     // Forged → refused (signature present but does not verify).
     let forged_id = format!("sal-cov-forged-{}", uuid_like());
     let mut forged = make_signal(&forged_id);
@@ -754,7 +757,7 @@ async fn exercise_sal_surface(store: &dyn MemoryStore) {
             .apply_remote_signal(&ctx, &unsigned)
             .await
             .expect("apply_remote_signal unsigned ok"),
-        "unsigned"
+        ai_memory::store::RemoteSignalApply::Inserted(ai_memory::models::AttestLevel::Unsigned)
     );
 
     // #1709 Pillar 1 — checkpoint_create / checkpoint_get / checkpoint_list /

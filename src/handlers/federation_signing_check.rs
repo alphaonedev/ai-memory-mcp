@@ -1217,8 +1217,25 @@ pub(super) async fn sync_push_via_store(
                 continue;
             }
         }
-        match app.store.apply_remote_signal(&ctx, sig).await {
-            Ok(_) => signals_applied += 1,
+        // #4370 — the charge above is committed on the SQLite metadata DB before
+        // this write on the postgres store, so it is compensated EXACTLY when
+        // this call stored nothing: `AlreadyPresent` (a duplicate, including the
+        // primary-key loser of a concurrent delivery of the same id) and any
+        // `Err`, which by the trait's documented invariant means nothing was
+        // persisted. A loser therefore leaves no quota drift and, like the
+        // sqlite twin's replay arm, is acknowledged as the converged no-op.
+        let outcome = app.store.apply_remote_signal(&ctx, sig).await;
+        if !matches!(&outcome, Ok(o) if o.stored_now()) {
+            let lock = app.db.lock().await;
+            if let Err(e) =
+                crate::quotas::refund_storage_only(&lock.0, &sig.from_agent, &sig.namespace, bytes)
+            {
+                crate::quotas::log_refund_op_failed(&sig.from_agent, &e);
+            }
+        }
+        match outcome {
+            Ok(crate::store::RemoteSignalApply::Inserted(_)) => signals_applied += 1,
+            Ok(crate::store::RemoteSignalApply::AlreadyPresent) => noop += 1,
             Err(crate::store::StoreError::InvalidInput { .. }) => {
                 tracing::warn!(
                     "sync_push(store): signal {} refused (invalid signature)",
