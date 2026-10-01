@@ -115,7 +115,7 @@ macOS / Linux / Docker / Kubernetes — no shell required.
 
    | Agent | Strategy | Argv shape |
    |---|---|---|
-   | `codex` / `codex-cli` | `SystemFlag` | `codex --system "<msg>" <args>` |
+   | `codex` / `codex-cli` | `SystemFlag` | `codex --system "<msg>" <args>` — **known broken on Codex CLI ≥ 0.153**, which rejects `--system` ([#3545](https://github.com/alphaonedev/ai-memory-mcp/issues/3545)); override with `--system-flag` / `--system-env` or use the MCP server path |
    | `gemini` | `SystemFlag` | `gemini --system "<msg>" <args>` |
    | `aider` | `MessageFile` | `aider --message-file <tempfile> <args>` |
    | `ollama` | `SystemEnv` | `OLLAMA_SYSTEM=<msg> ollama <args>` |

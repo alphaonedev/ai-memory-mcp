@@ -295,11 +295,13 @@ command: ai-memory
 args:    ["mcp"]
 # optionally:
 #   ["--db", "/path/to/ai-memory.db", "mcp", "--tier", "semantic"]
-#   ["mcp", "--profile", "full"]  # advertise all 103 tools
+#   ["mcp", "--profile", "full"]  # advertise all 104 entries (103 tools + bootstrap)
 ```
 
-That's it. ai-memory speaks MCP 2024-11-05 protocol, advertises 7
-tools by default and up to 103 with `--profile full`. Per-harness
+That's it. ai-memory speaks MCP 2024-11-05 protocol, advertises 8
+entries by default (7 tools + the always-on `memory_capabilities`
+bootstrap) and 104 with `--profile full` (103 callable tools + the
+bootstrap). Per-harness
 copy-paste recipes live in [`docs/integrations/`](integrations/):
 **aider**, **claude-agent-sdk**, **cline**, **codex-cli**, **cody**,
 **gemini**, **goose**, **grok-and-xai**, **openclaw**, **roo-code**,

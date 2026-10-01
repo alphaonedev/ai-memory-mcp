@@ -791,6 +791,12 @@ ai-memory store -T "Installation test" -c "It works." --tier short
 ai-memory recall "installation"
 ```
 
+Before running in production, read the
+[observability and incident-tracing contract](operations/observability.md):
+which process exposes which metrics (only `ai-memory serve` serves
+`/metrics`), what an absent or stale signal means, alert examples, and how
+to trace an incident end to end.
+
 ## Post-install: migrate from v0.6.x (if upgrading)
 
 **If you're upgrading from v0.6.x**, run the one-shot config

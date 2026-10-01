@@ -309,7 +309,7 @@ flowchart TB
 | `AI_MEMORY_REQUIRE_AGENT_ATTESTATION` (required by default on the HTTP direct-write surface only since v1.0.0, #1985 correcting #1751) | Unsigned `POST /api/v1/memories`(+`/bulk`) writes are blocked (`403 ATTESTATION_FAILED`) by default; MCP `memory_store` / CLI `store` stay permissive and land `claimed`. `=1` forces strict everywhere, `=0` permissive everywhere | Already on by default; run `ai-memory identity generate` + agent registration so signed writes succeed instead of being rejected |
 | `AI_MEMORY_REQUIRE_OWNED_ROWS=1` | MCP boot refusal on owner lockout | Strict multi-agent hosts with `AI_MEMORY_AGENT_ID` set |
 | `[memory] enabled = true` in Grok | Second memory system | Only if you want Grok native memory **in addition** to ai-memory |
-| `--profile core` | Drops 95 of the 103 advertised entries | Low-token or read-mostly workflows |
+| `--profile core` | Drops 96 of the 104 advertised entries | Low-token or read-mostly workflows |
 
 ---
 

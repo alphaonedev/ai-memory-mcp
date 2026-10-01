@@ -37,9 +37,16 @@ happens on a `memory_store` / recall call site. The `[logging].path`,
 file-sink-only and are ignored under `stdout` — rotation/retention is now the
 init system's job (below).
 
-`enabled = false` (the default) silences operational logging entirely
-regardless of `sink`. An unrecognized `sink` value falls back to `file` with a
-one-shot WARN.
+`enabled = false` (the default) installs no `[logging]` sink at all,
+regardless of `sink`. It does **not** silence every log line: the long-lived
+console verbs (`serve`, `curator`, `watch`, `wake-hub`, `wake-listen`) still
+install a console subscriber that writes to **stderr**, filtered by
+`RUST_LOG` (`src/daemon_runtime.rs::command_installs_console_subscriber`).
+Under systemd that stderr is captured by the journal like stdout. Other verbs,
+including `ai-memory mcp`, emit no operational log lines when logging is
+disabled. An unrecognized `sink` value falls back to `file` with a one-shot
+WARN. See [`observability.md`](observability.md) for which process emits
+which signal.
 
 ## Why this satisfies "use the pre-existing OS facilities"
 

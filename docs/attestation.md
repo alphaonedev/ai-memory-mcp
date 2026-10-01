@@ -177,6 +177,17 @@ binding is appended to the `agent_pubkey_history` ledger (schema v97) with a
 dense 1-based version and a `[bound_at, superseded_at)` window, so writes an
 older key already attested stay verifiable against the key that signed them.
 
+**Upgrade precondition (v97, [#3500](https://github.com/alphaonedev/ai-memory-mcp/issues/3500)).**
+The v97 upgrade copies each canonical registration's existing key into the
+ledger as version 1 (`bind_authority = 'legacy_unproven'`). A stored key that
+is neither the 43-character URL-safe nor the 44-character padded base64 form
+of a 32-byte Ed25519 key fails the ledger's CHECK, and the upgraded binary
+refuses to open the database rather than drop the anchor. The error does not
+yet name the agent. Before upgrading, list and repair such keys with the
+pre-v1.0.0 binary (`ai-memory agents revoke-key --agent-id <id>`, then
+re-enroll) — the query and steps are in the
+[v1.0.0 release notes](v1.0.0/release-notes.md#before-upgrading--legacy-agent-keys-must-be-well-formed-schema-v97-3464--3500).
+
 ### Proof of possession (#3464)
 
 A bind now has to PROVE the caller holds the private half of the key being
