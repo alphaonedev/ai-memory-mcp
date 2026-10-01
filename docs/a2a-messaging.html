@@ -291,13 +291,17 @@ footer a{color:var(--text-muted)}
       <div class="snip"><span class="cm">// MCP — memory_inbox</span>
 {
   <span class="key">"agent_id"</span>:        <span class="val">"alphaone/eng/platform/team-a/bob"</span>,    <span class="cm">// optional · defaults to caller</span>
-  <span class="key">"unread_only"</span>:     <span class="ok">true</span>,
-  <span class="key">"limit"</span>:           <span class="num">50</span>
+  <span class="key">"unread_only"</span>:     <span class="ok">true</span>,                           <span class="cm">// accepted + echoed for compatibility · narrows nothing (#3730)</span>
+  <span class="key">"limit"</span>:           <span class="num">50</span>                             <span class="cm">// default 50 · capped at 500</span>
 }
 
 <span class="ok">→ {"messages": [{"id": "…", "from": "…", "title": "OKR review — your input needed",
                   "payload": "…", "priority": 7, "tier": "short", "created_at": "…",
-                  "read": false, "access_count": 0}, …], "count": 3, "unread_only": true}</span></div>
+                  "access_count": 0}, …], "count": 3, "unread_only": true}</span>
+<span class="cm">// No `read` field is returned: nothing marks an inbox message read. `access_count`
+// counts TOUCHES (a namespaced recall landed by the fold), never handling — do not
+// key a redelivery loop on it. A message leaves the inbox when its recipient
+// deletes it; every message still listed is one nobody has declared handled.</span></div>
     </div>
   </div>
 </section>
