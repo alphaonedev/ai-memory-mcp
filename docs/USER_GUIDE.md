@@ -99,7 +99,7 @@ On error, the envelope includes `"isError": true` and the text contains the erro
 
 ### memory_store
 
-Store a new memory. Deduplicates by title+namespace -- if a memory with the same title and namespace already exists, it updates the existing memory instead of creating a duplicate.
+Store a new memory. A title-and-namespace collision follows `on_conflict`: `error` refuses the write, `merge` follows the existing-row merge path subject to write admission, and `version` chooses a suffixed title. If omitted, clients whose normalized name begins `ai:claude-code` or `ai:ai-memory-cli/v2` default to `error`; other clients default to `merge`.
 
 **Parameters:**
 
