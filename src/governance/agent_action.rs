@@ -713,7 +713,9 @@ fn matcher_applies_inner(matcher: &serde_json::Value, action: &AgentAction) -> b
     match action {
         AgentAction::Bash { command, .. } => match_bash(matcher, command),
         AgentAction::FilesystemWrite { path, .. } => match_filesystem_write(matcher, path),
-        AgentAction::NetworkRequest { host, .. } => match_network_request(matcher, host),
+        AgentAction::NetworkRequest { host, scheme } => {
+            match_network_request(matcher, host, scheme)
+        }
         AgentAction::ProcessSpawn { binary, args } => match_process_spawn(matcher, binary, args),
         AgentAction::Custom {
             custom_kind,
@@ -856,7 +858,7 @@ fn match_filesystem_write(matcher: &serde_json::Value, path: &std::path::Path) -
     crate::governance::glob_matches(glob, &path_str)
 }
 
-fn match_network_request(matcher: &serde_json::Value, host: &str) -> bool {
+fn match_network_request(matcher: &serde_json::Value, host: &str, scheme: &str) -> bool {
     let Some(target_host) = matcher.get("host").and_then(|v| v.as_str()) else {
         return false;
     };
@@ -874,13 +876,23 @@ fn match_network_request(matcher: &serde_json::Value, host: &str) -> bool {
     // Glob semantics are unchanged: a plain host matches exactly, `*` spans
     // any run of bytes (dots included), so `*.example.com` matches a
     // subdomain at any depth but not the bare apex.
-    let (Ok(pattern), Ok(canonical)) = (
+    let (Ok(pattern), Ok(request)) = (
         crate::governance::host::canonicalize_host_pattern(target_host),
         crate::governance::host::canonicalize_host(host),
     ) else {
         return false;
     };
-    crate::governance::glob_matches(&pattern, &canonical)
+    // #4414 — a portless rule matches any port; a port rule needs the same
+    // effective port (explicit, else the scheme default).
+    if !crate::governance::host::port_matches(pattern.port, request.port, scheme) {
+        return false;
+    }
+    // #4300 — match the A-label form AND (when it differs) the Unicode form,
+    // so an in-label ASCII wildcard (`evil*.com`) still catches `evilü.com`.
+    crate::governance::glob_matches(&pattern.host, &request.host)
+        || request
+            .unicode_form()
+            .is_some_and(|u| crate::governance::glob_matches(&pattern.host, &u))
 }
 
 fn match_process_spawn(matcher: &serde_json::Value, binary: &str, args: &[String]) -> bool {

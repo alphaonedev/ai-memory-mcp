@@ -331,3 +331,160 @@ fn issue_4300_write_time_validation_refuses_a_bad_host_pattern() {
         .is_ok()
     );
 }
+
+// ---- security review of 6ec8c1831 (F1 regression, #4414 ports, #4415 mapped) --
+
+fn refused_scheme(conn: &rusqlite::Connection, host: &str, scheme: &str) -> bool {
+    let action = AgentAction::NetworkRequest {
+        host: host.into(),
+        scheme: scheme.into(),
+    };
+    matches!(
+        check_agent_action(conn, "agent:t", &action).unwrap(),
+        Decision::Refuse { .. }
+    )
+}
+
+#[test]
+fn issue_4300_idn_wildcard_in_label_is_refused_not_allowed() {
+    use ai_memory::governance::agent_action::validate_matcher_for_kind;
+    let (signing, _g) = install_test_operator_key();
+    // Non-ASCII text sharing a label with `*` cannot be matched after
+    // punycode: rejected at write time and inert (blocking => refuses) when
+    // already stored. Refused on the carrier, ALLOWED on 6ec8c1831.
+    for (rule, req) in [
+        ("b\u{fc}*.example", "b\u{fc}cher.example"),
+        ("b\u{fc}*.example", "xn--bcher-kva.example"),
+        ("*b\u{fc}cher.example", "f\u{fc}b\u{fc}cher.example"),
+    ] {
+        assert!(
+            validate_matcher_for_kind("network_request", &serde_json::json!({"host": rule}))
+                .is_err(),
+            "{rule:?} must be rejected at write time"
+        );
+        let conn = deny_with(&signing, rule);
+        assert!(refused(&conn, req), "{rule:?} vs {req:?} must be refused");
+    }
+    // Whole-label wildcard next to an IDN label is fine and matches.
+    let conn = deny_with(&signing, "*.b\u{fc}cher.example");
+    assert!(refused(&conn, "a.B\u{dc}CHER.example"));
+    assert!(refused(&conn, "a.xn--bcher-kva.example"));
+}
+
+#[test]
+fn issue_4300_ascii_inlabel_wildcard_catches_unicode_and_a_label_hosts() {
+    let (signing, _g) = install_test_operator_key();
+    let conn = deny_with(&signing, "evil*.com");
+    for h in [
+        "evil\u{fc}.com",
+        "xn--evil-3ra.com",
+        "evilcorp.com",
+        "EVIL.com.",
+    ] {
+        assert!(refused(&conn, h), "{h:?} must be refused");
+    }
+    assert!(!refused(&conn, "good.com"));
+    assert!(!refused(&conn, "notevil.com"));
+}
+
+#[test]
+fn issue_4300_noncanonical_numeric_wildcard_pattern_is_rejected_and_inert() {
+    use ai_memory::governance::agent_action::validate_matcher_for_kind;
+    let (signing, _g) = install_test_operator_key();
+    assert!(
+        validate_matcher_for_kind("network_request", &serde_json::json!({"host":"0177.0.0.*"}))
+            .is_err()
+    );
+    let conn = deny_with(&signing, "0177.0.0.*");
+    assert!(
+        refused(&conn, "127.0.0.1"),
+        "inert blocking rule fails closed"
+    );
+    let conn = deny_with(&signing, "127.0.0.*");
+    assert!(refused(&conn, "0x7f.0.0.9"));
+    assert!(!refused(&conn, "128.0.0.1"));
+}
+
+#[test]
+fn issue_4414_portless_rule_matches_any_port() {
+    let (signing, _g) = install_test_operator_key();
+    for (rule, req) in [
+        ("example.com", "example.com:443"),
+        ("example.com", "EXAMPLE.com.:0443"),
+        ("*.example.com", "a.example.com:8443"),
+        ("127.0.0.1", "127.0.0.1:80"),
+        ("[::1]", "[::1]:80"),
+    ] {
+        let conn = deny_with(&signing, rule);
+        assert!(refused(&conn, req), "{rule:?} must refuse {req:?}");
+    }
+    let conn = deny_with(&signing, "example.com");
+    assert!(!refused(&conn, "other.com:443"));
+}
+
+#[test]
+fn issue_4414_port_rule_needs_the_same_effective_port() {
+    let (signing, _g) = install_test_operator_key();
+    let conn = deny_with(&signing, "example.com:443");
+    assert!(refused(&conn, "EXAMPLE.COM.:443"));
+    assert!(refused(&conn, "example.com:0443"));
+    // Portless egress request: scheme default applies.
+    assert!(refused_scheme(&conn, "example.com", "https"));
+    assert!(!refused_scheme(&conn, "example.com", "http"));
+    assert!(!refused(&conn, "example.com:8443"));
+    assert!(!refused(&conn, "other.com:443"));
+    let conn = deny_with(&signing, "example.com:8443");
+    assert!(refused(&conn, "example.com:8443"));
+    assert!(!refused_scheme(&conn, "example.com", "https"));
+    // Unknown effective port: over-block rather than allow.
+    assert!(refused_scheme(&conn, "example.com", "gopher"));
+}
+
+#[test]
+fn issue_4414_malformed_rule_port_is_inert_and_refused_at_write_time() {
+    use ai_memory::governance::agent_action::validate_matcher_for_kind;
+    let (signing, _g) = install_test_operator_key();
+    assert!(
+        validate_matcher_for_kind("network_request", &serde_json::json!({"host":"evil.com:*"}))
+            .is_err()
+    );
+    // Documented over-block: a stored inert blocking rule refuses everything.
+    let conn = deny_with(&signing, "evil.com:*");
+    assert!(refused(&conn, "good.com"));
+}
+
+#[test]
+fn issue_4300_malformed_host_is_refused_by_an_unrelated_blocking_rule() {
+    // Documented over-blocking: no allow-by-default for a host we cannot parse.
+    let (signing, _g) = install_test_operator_key();
+    let conn = deny_with(&signing, "unrelated.example");
+    assert!(refused(&conn, "bad host"));
+    assert!(!refused(&conn, "fine.example"));
+}
+
+#[test]
+fn issue_4415_ipv4_mapped_ipv6_matches_ipv4_both_directions() {
+    let (signing, _g) = install_test_operator_key();
+    let conn = deny_with(&signing, "127.0.0.1");
+    for h in [
+        "::ffff:127.0.0.1",
+        "[::ffff:127.0.0.1]",
+        "[::ffff:7f00:1]",
+        "[::FFFF:7F00:1]:80",
+    ] {
+        assert!(refused(&conn, h), "{h:?} must be refused by an IPv4 rule");
+    }
+    assert!(
+        !refused(&conn, "[::ffff:7f00:2]"),
+        "other address stays allowed"
+    );
+    for rule in ["[::ffff:127.0.0.1]", "::ffff:7f00:1", "[::ffff:7f00:1]"] {
+        let conn = deny_with(&signing, rule);
+        assert!(
+            refused(&conn, "127.0.0.1"),
+            "{rule:?} must refuse 127.0.0.1"
+        );
+        assert!(refused(&conn, "[::ffff:127.0.0.1]"));
+        assert!(!refused(&conn, "127.0.0.2"));
+    }
+}

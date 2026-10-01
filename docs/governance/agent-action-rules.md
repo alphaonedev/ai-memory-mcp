@@ -122,21 +122,47 @@ is exactly as inert as a misspelled key.
 | `custom`           | `kind`:string                                        | `namespace_glob`:string, `tier`:string, `title_contains`:string | Extension point for caller-specific actions.  |
 | `read_action`      | `surface`:string, `namespace`:string, `query_substring`:string, or `all`:bool | —                       | PE-2 read gating; `{"all": true}` is the explicit blanket opt-in.     |
 
-### `network_request` host canonicalisation (#4300)
+### `network_request` host canonicalisation (#4300, #4414, #4415)
 
 The rule `host` and the evaluated host are both canonicalised by one shared
 function before the glob runs: ASCII-lowercase, exactly one trailing root dot
 removed, Unicode labels converted to the A-label (punycode) form, IPv4 as a
 dotted quad (`127.1` and `127.000.000.001` become `127.0.0.1`), IPv6 bracketed
-and compressed, an optional `:port` kept. Empty labels, labels over 63 bytes,
-hosts over 253 bytes and whitespace/control/NUL characters are rejected.
-`EVIL.example.com`, `evil.example.com.` and a Unicode spelling therefore match
-a rule written for `evil.example.com`. `*` spans any run of characters
-including dots: `*.example.com` matches a subdomain at any depth, never the
-bare apex `example.com`. A host that cannot be canonicalised is never allowed
-by default: it matches every `refuse`/`escalate` `network_request` rule and no
-`warn`/`log` rule. `rules add` refuses a host pattern that cannot be
-canonicalised; one already stored is inert and fails closed (below).
+and compressed. An IPv4-mapped IPv6 literal (`::ffff:127.0.0.1`,
+`[::ffff:7f00:1]`) becomes the IPv4 dotted quad on both sides, so each
+spelling matches the other. Empty labels, labels over 63 bytes, hosts over 253
+bytes and whitespace/control/NUL characters are rejected. `EVIL.example.com`,
+`evil.example.com.` and a Unicode spelling therefore match a rule written for
+`evil.example.com`.
+
+**Wildcards.** `*` spans any run of characters including dots:
+`*.example.com` matches a subdomain at any depth, never the bare apex
+`example.com`. Punycode does not preserve substrings, so a `*` that shares a
+label with non-ASCII text (`bü*.example`) is REJECTED by `rules add` and, if
+already stored, is inert (a blocking inert rule refuses, #3031); write a
+whole-label wildcard (`*.bücher.example`) instead. An ASCII in-label wildcard
+(`evil*.com`) is matched against both the request's A-label and Unicode forms,
+so `evilü.com` is caught. A wildcard pattern whose all-digit or `0x` labels are
+not canonical decimal octets (`0177.0.0.*`) is rejected the same way; write
+`127.0.0.*`.
+
+**Ports.** A rule WITHOUT a port compares the host only and matches any port
+or none (`example.com` matches `example.com:8443`). A rule WITH a port
+(`example.com:443`) matches only the same effective port: the request's
+explicit port, else the scheme default (`https`/`wss` 443, `http`/`ws` 80,
+`ftp` 21). When the effective port cannot be established (unknown scheme, no
+port) the port rule matches (over-block). The LLM client and federation peer
+POST pass the URL's explicit port to the gate, so port-scoped rules enforce
+there. A malformed rule port, including `evil.com:*`, is an inert pattern;
+there is no "any port" spelling beyond omitting the port.
+
+**Failure is never allow-by-default.** A host that cannot be canonicalised
+matches every `refuse`/`escalate` `network_request` rule and no `warn`/`log`
+rule. This deliberately over-blocks: a malformed host is refused by an
+UNRELATED blocking rule, and the audit reason is that rule's reason. Likewise an
+inert stored host pattern (such as `evil.com:*`) makes its blocking rule refuse
+every `network_request`. With zero blocking network rules configured there is
+nothing to deny and the action is allowed.
 
 ### Write-time validation and inert rules (#3031)
 
