@@ -94,8 +94,11 @@ write lock.
 connect directly to Postgres. Every request still terminates at the axum
 daemon: `serve --store-url postgres://…` routes through
 `postgres_route_gate` (`src/lib.rs` → `src/handlers/postgres_gate.rs`), which
-serves 59 of the 80 unique production HTTP paths from Postgres and returns a
-uniform `501 NOT IMPLEMENTED` on the other 21; the daemon additionally opens a
+supports at least one method on 76 of the 89 unique production HTTP paths
+from Postgres and returns a uniform `501 NOT IMPLEMENTED` on the 13 paths that
+are wholly unsupported there (path support does not imply every method on that
+path is supported — consult the method-level gate in
+`tests/pg_supported_route_inventory_gate_2799.rs`); the daemon additionally opens a
 scratch SQLite beside Postgres. So the daemon remains the fleet-scale
 bottleneck on both backends — the SAL work moved the *storage* off SQLite, not
 the *access path* off the daemon. A direct-to-Postgres agent wire protocol is
