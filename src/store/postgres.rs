@@ -32233,10 +32233,10 @@ impl MemoryStore for PostgresStore {
         namespace: &str,
     ) -> StoreResult<Option<u32>> {
         use crate::storage::{
-            ApprovalDepthLevel, ApprovalDepthLevelState, approval_depth_level_decision,
-            approval_depth_level_state,
+            ApprovalDepthLevelState, ApprovalDepthWalk, approval_depth_level_state,
         };
         let chain = pg_namespace_chain(&self.pool, namespace, true).await?;
+        let mut walk = ApprovalDepthWalk::default();
         for ns in chain.into_iter().rev() {
             let row: Option<(Option<String>,)> = sqlx::query_as(SQL_SELECT_STANDARD_ID_BY_NS)
                 .bind(&ns)
@@ -32260,12 +32260,11 @@ impl MemoryStore for PostgresStore {
                 }
                 _ => ApprovalDepthLevelState::Missing,
             };
-            match approval_depth_level_decision(state) {
-                ApprovalDepthLevel::Threshold(n) => return Ok(Some(n)),
-                ApprovalDepthLevel::Continue => {}
+            if let Some(n) = walk.step(state) {
+                return Ok(Some(n));
             }
         }
-        Ok(None)
+        Ok(walk.finish())
     }
 
     /// v1.0.0 #3448 — approver-gated REJECT (veto), the postgres twin of
