@@ -638,3 +638,55 @@ mod tests {
         );
     }
 }
+
+/// Captures formatted tracing output (no ANSI, no timestamps).
+#[derive(Clone, Default)]
+pub(crate) struct CapturedLines(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+impl std::io::Write for CapturedLines {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend_from_slice(b);
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLines {
+    type Writer = CapturedLines;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+/// A DEBUG-level capturing subscriber plus the sink it writes to. Shared by
+/// the #4310 (forensic writer) and #4318 (flat audit trail) rate-limit cells.
+///
+/// #4090: the CALLER installs it (`tracing::subscriber::with_default`) inside
+/// a test guarded by `run_env_isolated_child_or_spawn`, so the install is
+/// visible to the isolation census; the install is deliberately not hidden in
+/// this shared helper where no guard can precede it.
+pub(crate) fn error_debug_capture() -> (impl tracing::Subscriber + Send + Sync, CapturedLines) {
+    let sink = CapturedLines::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_writer(sink.clone())
+        .with_ansi(false)
+        .without_time()
+        .finish();
+    (subscriber, sink)
+}
+
+/// The (ERROR, DEBUG) line counts a [`error_debug_capture`] sink received.
+pub(crate) fn count_error_and_debug_lines(sink: &CapturedLines) -> (usize, usize) {
+    let text = String::from_utf8_lossy(
+        &sink
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    )
+    .into_owned();
+    let count = |level: &str| text.lines().filter(|l| l.contains(level)).count();
+    (count("ERROR"), count("DEBUG"))
+}

@@ -198,6 +198,166 @@ fn writer() -> anyhow::Result<&'static Sender<WriteOp>> {
     Ok(WRITER.get_or_init(|| tx))
 }
 
+/// #4205 — open `path` for appending WHOLE LINES. A crash mid-write can
+/// leave a file ending in a torn fragment with no trailing newline; a row
+/// appended straight after it would share its physical line, fail to parse,
+/// and silently drop out of the chain. So when the file is non-empty and its
+/// last byte is not `\n`, one `\n` is written first: the fragment stays its
+/// own (skipped) line and the new row stays parseable. Every append-only log
+/// here opens through this one helper, so no appender can skip the rule.
+fn open_for_append_line_aligned(path: &Path) -> std::io::Result<File> {
+    let f = open_forensic_file(
+        OpenOptions::new().create(true).read(true).append(true),
+        path,
+    )?;
+    align_to_line_end(&f)?;
+    Ok(f)
+}
+
+/// #4205 — the line-alignment rule itself, shared by every append-only log
+/// (the forensic appenders above and the flat audit trail's torn-write
+/// fallback, #4211): when `f` is non-empty and its last byte is not `\n`,
+/// write one `\n` so the next record starts its own line. `f` must be open
+/// for reading and appending.
+pub(crate) fn align_to_line_end(mut f: &File) -> std::io::Result<()> {
+    let len = f.metadata()?.len();
+    if len > 0 {
+        let mut last = [0u8; 1];
+        f.seek(SeekFrom::Start(len - 1))?;
+        f.read_exact(&mut last)?;
+        if last[0] != b'\n' {
+            f.write_all(b"\n")?;
+        }
+    }
+    Ok(())
+}
+
+/// #4273 — open a forensic log file WITHOUT following a symbolic link and
+/// without blocking on a FIFO, then refuse anything the opened handle does
+/// not show to be a regular file. The type check is on the OPENED descriptor,
+/// so there is no window between checking a path and opening it. A FIFO named
+/// as a daily file used to hang every process start (the tail read blocks on
+/// a FIFO with no writer), and a symlinked daily file sent reads and appends
+/// outside the audit directory.
+fn open_forensic_file(options: &mut OpenOptions, path: &Path) -> std::io::Result<File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+    }
+    let file = match options.open(path) {
+        Ok(file) => file,
+        #[cfg(unix)]
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "{} is a symbolic link; forensic log files are never opened through a link",
+                    path.display()
+                ),
+            ));
+        }
+        Err(e) => return Err(e),
+    };
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("forensic log file {} is not a regular file", path.display()),
+        ));
+    }
+    // #4305 — a HARD link is a regular file, so the checks above accept it,
+    // and every append then also lands under a second name that can sit
+    // outside the audit directory. Nothing in ai-memory hard-links these
+    // files, so a link count above one is refused like a symlink.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if meta.nlink() > 1 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "forensic log file {} has {} hard links; it is never used through a second name",
+                    path.display(),
+                    meta.nlink()
+                ),
+            ));
+        }
+    }
+    Ok(file)
+}
+
+/// #4273 — [`open_forensic_file`] for reading.
+fn open_forensic_file_for_read(path: &Path) -> std::io::Result<File> {
+    open_forensic_file(OpenOptions::new().read(true), path)
+}
+
+/// #4310 — the stderr rate limit for [`writer_failure`]: its own
+/// accounting, on the #3651 log-sink diagnostic interval the flat audit
+/// trail's #3975 diagnostic also uses.
+static WRITER_FAILURE_DIAGNOSTICS: std::sync::LazyLock<crate::logging::DeliveryStats> =
+    std::sync::LazyLock::new(crate::logging::DeliveryStats::default);
+
+/// #4302 — a row the background writer could not persist. It was a trace
+/// line only, so a sink that stopped writing after start-up (a remount, a full
+/// disk) looked healthy. Now EVERY dropped row is counted in
+/// `ai_memory_forensic_sink_unavailable_total`, and stderr says so. #4310 —
+/// stderr only at most once a minute, naming how many rows were dropped
+/// since the previous line, so a log that turns read-only mid-run does not
+/// flood stderr in proportion to governed traffic.
+fn writer_failure(what: &str, path: &Path, e: &std::io::Error) {
+    if let Some(line) = writer_failure_with(
+        &WRITER_FAILURE_DIAGNOSTICS,
+        crate::logging::now_unix_ms(),
+        what,
+        path,
+        e,
+    ) {
+        // Nothing is left to report a failing stderr to.
+        let _ = writeln!(std::io::stderr(), "{line}");
+    }
+}
+
+/// [`writer_failure`] against given accounting and clock: counts the row and
+/// returns the stderr line when one is due. The per-row event is DEBUG only:
+/// `serve` and `mcp` route tracing to stderr, so a per-row ERROR was the very
+/// flood the rate limit exists to stop (f2r on #4310). The ERROR goes out with
+/// the rate-limited line.
+fn writer_failure_with(
+    stats: &crate::logging::DeliveryStats,
+    now_unix_ms: u64,
+    what: &str,
+    path: &Path,
+    e: &std::io::Error,
+) -> Option<String> {
+    tracing::debug!(
+        target: AUDIT_TRACE_TARGET,
+        "forensic: {what} {} failed: {e}",
+        path.display()
+    );
+    crate::metrics::inc_forensic_sink_unavailable();
+    stats.record_failure(now_unix_ms).map(|suppressed| {
+        let line = format!(
+            "ai-memory: the forensic audit log dropped a row: {what} {} failed: {e} \
+             ({suppressed} further rows dropped since the previous report; every one is \
+             counted in ai_memory_forensic_sink_unavailable_total) (#4302)",
+            path.display()
+        );
+        tracing::error!(target: AUDIT_TRACE_TARGET, "{line}");
+        line
+    })
+}
+
+/// #4304 — append one row and its newline in ONE write. `writeln!` issued
+/// them as two syscalls, and a concurrent appender to the same daily file
+/// could land between them and glue two rows onto one line.
+fn append_record<W: Write>(w: &mut W, line: &str) -> std::io::Result<()> {
+    let mut record = String::with_capacity(line.len() + 1);
+    record.push_str(line);
+    record.push('\n');
+    w.write_all(record.as_bytes())
+}
+
 /// Drain loop for the background writer. Keeps the destination file open
 /// across appends (one `open()` per rotated file, not one per row) and
 /// coalesces a burst into a single flush.
@@ -217,26 +377,18 @@ fn run_writer(rx: Receiver<WriteOp>) {
                 WriteOp::Append { path, line } => {
                     let reopen = open_file.as_ref().map_or(true, |(p, _)| p != &path);
                     if reopen {
-                        match OpenOptions::new().create(true).append(true).open(&path) {
+                        match open_for_append_line_aligned(&path) {
                             Ok(file) => open_file = Some((path, file)),
                             Err(e) => {
-                                tracing::error!(
-                                    target: AUDIT_TRACE_TARGET,
-                                    "forensic: opening {} failed: {e}",
-                                    path.display()
-                                );
+                                writer_failure("opening", &path, &e);
                                 open_file = None;
                                 continue;
                             }
                         }
                     }
                     if let Some((path, file)) = open_file.as_mut() {
-                        if let Err(e) = writeln!(file, "{line}") {
-                            tracing::error!(
-                                target: AUDIT_TRACE_TARGET,
-                                "forensic: appending to {} failed: {e}",
-                                path.display()
-                            );
+                        if let Err(e) = append_record(file, &line) {
+                            writer_failure("appending to", &path, &e);
                         } else {
                             needs_flush = true;
                         }
@@ -1017,10 +1169,22 @@ pub fn init_audit_signers(signing_key: Option<&SigningKey>) {
 ///
 /// # Errors
 /// - The directory cannot be created.
+/// - #4199: the chain tail cannot be established (a [`ForensicTailUnreadable`]
+///   inside the `anyhow::Error`): the binary runs without the sink, or refuses
+///   under [`REQUIRE_FORENSIC_SINK_ENV`].
 pub fn init(dir: &Path, signing_key: Option<SigningKey>) -> Result<()> {
     std::fs::create_dir_all(dir)
         .with_context(|| format!("creating forensic audit dir {}", dir.display()))?;
-    let last_hash = read_chain_tail(dir).unwrap_or_else(|| CHAIN_HEAD_PREV_HASH.to_string());
+    // #4302 (r1 B2 on #4272) — prove the sink can WRITE before it is up. A
+    // read-only directory or daily file (chmod, a read-only mount) used to boot
+    // "with the sink" while the background writer dropped every row with only
+    // a trace line: no metric, no doctor signal, no refusal under
+    // AI_MEMORY_REQUIRE_FORENSIC_SINK. Now it is an init error, which the boot
+    // path turns into the outage signals, or exit 78 under require-mode.
+    probe_forensic_writable(dir, &Utc::now())?;
+    // #4199 — only a genuinely empty chain starts at genesis; an unavailable
+    // tail is an error: no sink, never a fork (see `read_chain_tail`).
+    let last_hash = read_chain_tail(dir)?.unwrap_or_else(|| CHAIN_HEAD_PREV_HASH.to_string());
     init_audit_signers(signing_key.as_ref());
     let commitment_key = signing_key.as_ref().map(forensic_commitment_key);
     let new_sink = ForensicSink {
@@ -1039,12 +1203,32 @@ pub fn init(dir: &Path, signing_key: Option<SigningKey>) -> Result<()> {
     // before any row for the freshly-initialised sink is enqueued —
     // without this, a re-init over a removed/rotated same-named file
     // would keep writing to the unlinked inode.
-    // #3164 — a spawn failure surfaces as an `init` error (the boot path
-    // already downgrades to "continuing unsigned" rather than aborting);
-    // it no longer kills the process from the main thread.
+    // #3164 — a spawn failure surfaces as an `init` error; it no longer kills
+    // the process from the main thread. #4272: the boot path treats it as
+    // "forensic sink unavailable" (degrade with the outage signals, or refuse
+    // under AI_MEMORY_REQUIRE_FORENSIC_SINK), like every other init failure.
     let _ = writer()?.send(WriteOp::Reset);
     *guard = Some(new_sink);
     Ok(())
+}
+
+/// #4302 — prove the forensic sink can append: the directory accepts a new
+/// file (a probe file, removed again; never a `forensic-*` name, so the tail
+/// walk never sees it) and today's daily file, when it already exists, opens
+/// for append. Nothing is written to a forensic file.
+fn probe_forensic_writable(dir: &Path, now: &DateTime<Utc>) -> Result<()> {
+    crate::log_paths::probe_dir_writable(dir).map_err(|e| {
+        tail_unreadable(dir, format!("the forensic directory is not writable: {e}"))
+    })?;
+    let today = daily_path(dir, now);
+    match open_forensic_file(OpenOptions::new().append(true), &today) {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(tail_unreadable(
+            &today,
+            format!("today's forensic file is not writable: {e}"),
+        )),
+    }
 }
 
 /// Tear down the sink (test-only convenience).
@@ -1196,106 +1380,509 @@ fn daily_path(dir: &Path, when: &DateTime<Utc>) -> PathBuf {
 /// microsecond operation on any corpus.
 const CHAIN_TAIL_WINDOW_BYTES: u64 = 256 * 1024;
 
-/// Resolve the hash of the LAST parseable row in the newest forensic
-/// file — the `prev_hash` the next appended row must carry.
-///
-/// # v1.0.0 #2584 — bounded tail read, exact-fallback
-///
-/// This runs on EVERY process start (`main.rs::init_forensic_audit` →
-/// [`init`]) — every CLI invocation, every MCP stdio boot, every daemon
-/// boot, and every firing of the `governance check-action` PreToolUse
-/// hook. Pre-#2584 it streamed the WHOLE newest file and ran
-/// `serde_json::from_str::<ForensicDecision>` on EVERY line just to keep
-/// the last one.
-///
-/// Measured on this node with a 16.5 MB same-day forensic log: 2 021 of
-/// the process's 2 052 `read` syscalls and **163 ms of a 174 ms**
-/// `ai-memory list` were this function (10.8 ms with an empty audit
-/// dir; 4.4 ms `--version` floor). The cost is O(TODAY'S LOG SIZE) and
-/// therefore GROWS ALL DAY and resets at UTC midnight — it was mistaken
-/// for a fixed ~130 ms constant in the original report, and the
-/// `futex`-dominated `strace -c` profile that accompanied it was an
-/// artefact of counting the tokio worker threads' PARKED time as syscall
-/// time.
-///
-/// ## Why this is exactly equivalent to the old forward scan
-///
-/// The old scan returned `self_hash()` of the last line that PARSED.
-/// Every line after that one is, by definition, unparseable. Walking
-/// backwards from EOF therefore encounters those same unparseable lines
-/// first and returns the very same row — PROVIDED the window reaches it.
-/// When the window is exhausted without a parse, we fall back to the
-/// original full forward scan, so the returned value is identical for
-/// EVERY input, including a file whose entire 256 KiB tail is corrupt.
-/// Skipping / trimming rules (blank-line skip, `\r\n` handling,
-/// invalid-UTF-8 tolerance) mirror `BufReader::lines()` line for line.
-///
-/// Data-integrity posture: this only ever selects WHICH stored row seeds
-/// `prev_hash`; it writes nothing, and a wrong answer would break the
-/// chain link loudly at `verify_since` rather than silently. The exact
-/// fallback means it cannot give a wrong answer at all.
-fn read_chain_tail(dir: &Path) -> Option<String> {
-    let files = list_forensic_files(dir).ok()?;
-    let last_file = files.last()?;
-    read_chain_tail_from_suffix(last_file).or_else(|| read_chain_tail_full_scan(last_file))
+/// #4199 (5-agent vote 4d3ea1c5, decision memory 4ae4ed7d) — the forensic
+/// log exists but the tail of its hash chain cannot be established. Returned
+/// (inside `anyhow`) by [`init`]. The binary then runs WITHOUT the forensic
+/// sink (it never forks the chain at genesis) and records the outage loudly
+/// (ERROR, metric, doctor Critical, a signed `signed_events` row), or, under
+/// [`REQUIRE_FORENSIC_SINK_ENV`] (pinned by `asi-hard`), refuses to start.
+#[derive(Debug, Clone)]
+pub struct ForensicTailUnreadable {
+    /// The forensic file or directory whose tail could not be established.
+    pub path: PathBuf,
+    /// What went wrong (an I/O error, or no parseable row in any non-empty file).
+    pub cause: String,
 }
 
-/// Bounded backward hunt over the final [`CHAIN_TAIL_WINDOW_BYTES`] of
-/// `path`. `None` means "no parseable row found in the window" — NOT
-/// "no parseable row exists"; the caller must fall back.
-fn read_chain_tail_from_suffix(path: &Path) -> Option<String> {
-    let mut f = File::open(path).ok()?;
-    let len = f.metadata().ok()?.len();
+impl std::fmt::Display for ForensicTailUnreadable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the forensic audit log at {} is unavailable ({}); its hash chain is never \
+             restarted at genesis, which would fork the signed chain",
+            self.path.display(),
+            self.cause
+        )
+    }
+}
+
+impl std::error::Error for ForensicTailUnreadable {}
+
+fn tail_unreadable(path: &Path, cause: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(ForensicTailUnreadable {
+        path: path.to_path_buf(),
+        cause: cause.into(),
+    })
+}
+
+/// #4199 — require-mode for the forensic sink. When truthy (the shared
+/// [`crate::security_profile::is_truthy`] grammar), a forensic log whose chain
+/// tail cannot be established REFUSES boot (exit 78, `doctor` exempt) instead of
+/// running degraded. Unset (the `standard` default) degrades. PINNED to `1` by
+/// the `asi-hard` profile.
+pub const REQUIRE_FORENSIC_SINK_ENV: &str = "AI_MEMORY_REQUIRE_FORENSIC_SINK";
+
+/// Whether [`REQUIRE_FORENSIC_SINK_ENV`] is set truthy.
+#[must_use]
+pub fn require_forensic_sink_enabled() -> bool {
+    std::env::var(REQUIRE_FORENSIC_SINK_ENV).is_ok_and(|v| crate::security_profile::is_truthy(&v))
+}
+
+/// #4199 — the message printed when the binary REFUSES to start because the
+/// forensic sink is unavailable and [`REQUIRE_FORENSIC_SINK_ENV`] is set.
+#[must_use]
+pub fn boot_refusal_message(err: &anyhow::Error) -> String {
+    format!(
+        "ai-memory: refusing to start: {err:#}\n  {REQUIRE_FORENSIC_SINK_ENV} is set (the asi-hard \
+         profile pins it), so an unavailable forensic sink refuses boot. Repair the named file, \
+         or move it out of the audit directory (the chain then continues from the newest \
+         readable file and `ai-memory audit verify` reports the gap). `ai-memory doctor` still runs."
+    )
+}
+
+/// #4199 — the ERROR printed when the forensic sink is unavailable and the
+/// process continues WITHOUT it (the `standard` default).
+#[must_use]
+pub fn degraded_boot_message(err: &anyhow::Error) -> String {
+    format!(
+        "ai-memory: ERROR: {err:#}\n  Continuing WITHOUT the forensic audit sink: this process \
+         writes no forensic rows, and the chain is not forked. Repair or move the named file; set \
+         {REQUIRE_FORENSIC_SINK_ENV}=1 to refuse boot instead. `ai-memory doctor` reports this."
+    )
+}
+
+/// #4199 — what [`record_forensic_sink_unavailable`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OutageRecord {
+    /// A new signed `audit.forensic_sink_unavailable` row was appended.
+    Recorded,
+    /// The newest outage row already records this `(path, cause)`: nothing
+    /// was appended, so a stuck tail costs one row, not one per invocation.
+    Duplicate,
+    /// Nothing was written; the reason is operator-facing. The database is
+    /// absent, not bootstrapped, or not at this binary's schema version:
+    /// the recorder never creates, bootstraps or migrates a store.
+    Skipped(String),
+}
+
+/// #4199 — the signed payload hash of one forensic-sink outage, and the key
+/// both backends dedupe on: `(day, path, cause)`.
+///
+/// The UTC day is part of the key (f2r review of 36253cab6): the dedupe must
+/// not outlive the outage it suppresses. A repaired tail that fails again the
+/// same way on a later day is a NEW outage and is attested; within one day a
+/// stuck tail still costs one row, not one per invocation.
+#[must_use]
+pub fn forensic_outage_key(err: &ForensicTailUnreadable, day: &str) -> Vec<u8> {
+    let preimage = format!(
+        "forensic-sink-unavailable|day={day}|path={}|cause={}",
+        err.path.display(),
+        err.cause
+    );
+    crate::signed_events::payload_hash(preimage.as_bytes())
+}
+
+/// #4199 — today's UTC day (`YYYY-MM-DD`), the dedupe window of
+/// [`forensic_outage_key`]. Both backends take it from here.
+#[must_use]
+pub fn forensic_outage_day() -> String {
+    Utc::now().format("%Y-%m-%d").to_string()
+}
+
+/// #4199 — the ONE dedupe comparison, shared by the sqlite and postgres
+/// recorders (f2r, landing condition for A1): an outage is a duplicate when
+/// the NEWEST `audit.forensic_sink_unavailable` row carries the same
+/// [`forensic_outage_key`].
+#[must_use]
+pub fn is_duplicate_forensic_outage(newest: Option<&[u8]>, key: &[u8]) -> bool {
+    newest == Some(key)
+}
+
+/// #4199 A1 (GOD ruling) — outages the boot path could not attest because
+/// this process's store is postgres. `serve` drains them into its postgres
+/// store once the store is built ([`take_deferred_forensic_outages`]).
+static DEFERRED_FORENSIC_OUTAGES: Mutex<Vec<ForensicTailUnreadable>> = Mutex::new(Vec::new());
+
+/// #4199 A1 — hold an outage for the postgres store to attest.
+pub fn defer_forensic_outage(err: ForensicTailUnreadable) {
+    DEFERRED_FORENSIC_OUTAGES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(err);
+}
+
+/// #4199 A1 — take every deferred outage (the queue is left empty).
+#[must_use]
+pub fn take_deferred_forensic_outages() -> Vec<ForensicTailUnreadable> {
+    std::mem::take(
+        &mut *DEFERRED_FORENSIC_OUTAGES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    )
+}
+
+/// #4199 — append the SIGNED `signed_events` row that attests the forensic
+/// sink is unavailable, and why, unless the newest outage row already
+/// records the same `(path, cause)` on the same UTC day. Returns whether a
+/// row was appended.
+///
+/// # Errors
+/// Propagates the read or `append_signed_event` error; callers treat this
+/// as best-effort (the degraded boot already happened).
+pub fn emit_forensic_sink_unavailable(
+    conn: &rusqlite::Connection,
+    err: &ForensicTailUnreadable,
+) -> Result<bool> {
+    emit_forensic_sink_unavailable_on(conn, err, &forensic_outage_day())
+}
+
+/// [`emit_forensic_sink_unavailable`] for an explicit UTC `day`
+/// (`YYYY-MM-DD`), the dedupe-window key.
+fn emit_forensic_sink_unavailable_on(
+    conn: &rusqlite::Connection,
+    err: &ForensicTailUnreadable,
+    day: &str,
+) -> Result<bool> {
+    use crate::signed_events::{
+        SignedEvent, append_signed_event, event_types::FORENSIC_SINK_UNAVAILABLE,
+    };
+    use rusqlite::OptionalExtension;
+    let hash = forensic_outage_key(err, day);
+    let newest: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT payload_hash FROM signed_events WHERE event_type = ?1 \
+             ORDER BY sequence DESC LIMIT 1",
+            [FORENSIC_SINK_UNAVAILABLE],
+            |r| r.get(0),
+        )
+        .optional()
+        .context("read the newest forensic-sink outage row")?;
+    if is_duplicate_forensic_outage(newest.as_deref(), &hash) {
+        return Ok(false);
+    }
+    let event = SignedEvent::with_daemon_signature(
+        hash,
+        crate::identity::sentinels::DAEMON_PRINCIPAL.to_string(),
+        FORENSIC_SINK_UNAVAILABLE.to_string(),
+        Utc::now().to_rfc3339(),
+        None,
+    );
+    append_signed_event(conn, &event)?;
+    Ok(true)
+}
+
+/// #4199 — record the forensic-sink outage in the database at `db_path`.
+///
+/// The store is opened with the NON-migrating funnel
+/// ([`crate::storage::open_unmigrated`]) and written only when it already
+/// carries this binary's schema version: the recorder runs before the verb,
+/// so it must never be the thing that creates, bootstraps or upgrades a
+/// store. Callers restrict it to the ledger-writing verbs; `doctor` and the
+/// egress / remediation verbs never reach it.
+///
+/// # Errors
+/// An open, probe, read or append failure; best-effort for the caller.
+pub fn record_forensic_sink_unavailable(
+    db_path: &Path,
+    err: &ForensicTailUnreadable,
+) -> Result<OutageRecord> {
+    use crate::storage::schema_guard::SchemaStamp;
+    if !db_path.exists() {
+        return Ok(OutageRecord::Skipped(format!(
+            "no database exists at {} yet",
+            db_path.display()
+        )));
+    }
+    let conn = crate::storage::open_unmigrated(db_path)?;
+    let current = crate::storage::migrations::current_schema_version();
+    match crate::storage::probe_schema_stamp(&conn)? {
+        SchemaStamp::Known(v) if v == current => {}
+        other => {
+            return Ok(OutageRecord::Skipped(format!(
+                "the database at {} is not at this binary's schema version {current} \
+                 ({other:?}); the recorder never migrates a store, so this boot's outage \
+                 is reported only on stderr, by the metric and by `ai-memory doctor`",
+                db_path.display()
+            )));
+        }
+    }
+    Ok(if emit_forensic_sink_unavailable(&conn, err)? {
+        OutageRecord::Recorded
+    } else {
+        OutageRecord::Duplicate
+    })
+}
+
+/// #4199 — what `ai-memory doctor` reports about the forensic log.
+#[derive(Debug)]
+pub struct ForensicTailReport {
+    /// The forensic directory inspected.
+    pub dir: PathBuf,
+    /// The chain tail: `Ok(None)` an empty chain, `Ok(Some(hash))` the tail,
+    /// `Err(message)` unavailable (the sink would be off).
+    pub tail: std::result::Result<Option<String>, String>,
+    /// Files dated after the current UTC day (#4203): never the tail, never
+    /// deleted, always reported.
+    pub future_dated: Vec<PathBuf>,
+    /// #4302 — why the sink could NOT append, `None` when it can: the
+    /// directory accepts a new file and today's file, if present, opens for
+    /// append. A directory that does not exist yet is `None`: boot creates
+    /// it, and a failure to create it is its own error.
+    pub not_writable: Option<String>,
+}
+
+/// #4199 / #4203 — inspect the forensic directory the way [`init`] would.
+#[must_use]
+pub fn inspect_forensic_tail(dir: &Path) -> ForensicTailReport {
+    let today = today_code();
+    let not_writable = if dir.exists() {
+        probe_forensic_writable(dir, &Utc::now())
+            .err()
+            .map(|e| format!("{e:#}"))
+    } else {
+        None
+    };
+    ForensicTailReport {
+        dir: dir.to_path_buf(),
+        tail: read_chain_tail_as_of(dir, today).map_err(|e| format!("{e:#}")),
+        future_dated: future_dated_as_of(dir, today),
+        not_writable,
+    }
+}
+
+/// #4203 — the forensic files dated after the current UTC day. They are never
+/// the chain tail and are never deleted; a backward clock step across midnight
+/// can make TODAY's file one of them, and the next row then forks from an
+/// earlier day's tail, so the boot path attests them (f2r review of 15fde1499).
+#[must_use]
+pub fn future_dated_forensic_files(dir: &Path) -> Vec<PathBuf> {
+    future_dated_as_of(dir, today_code())
+}
+
+fn future_dated_as_of(dir: &Path, today: i64) -> Vec<PathBuf> {
+    list_forensic_files(dir)
+        .map(|files| {
+            files
+                .into_iter()
+                .filter(|f| is_future_dated(f, today))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// #4203 — the cause string the signed outage row carries for a
+/// future-dated file, distinct from an unreadable tail.
+#[must_use]
+pub fn future_dated_outage(path: &Path) -> ForensicTailUnreadable {
+    ForensicTailUnreadable {
+        path: path.to_path_buf(),
+        cause: "future-dated file skipped: the chain continues from an earlier day, \
+                so rows written while the clock is behind this date may fork"
+            .to_string(),
+    }
+}
+
+/// The tail of ONE daily forensic file.
+#[derive(Debug, PartialEq, Eq)]
+enum FileTail {
+    /// No non-blank line.
+    Empty,
+    /// Non-blank lines, none of them a complete forensic row.
+    NoParseableRow,
+    /// The `self_hash` of its last PARSEABLE row.
+    Row(String),
+}
+
+/// Today's UTC date as the `YYYYMMDD` code [`file_date`] returns.
+fn today_code() -> i64 {
+    let d = Utc::now().date_naive();
+    i64::from(d.year()) * 10_000 + i64::from(d.month()) * 100 + i64::from(d.day())
+}
+
+/// #4203 — a file dated after the current UTC day.
+fn is_future_dated(path: &Path, today: i64) -> bool {
+    file_date(path).is_ok_and(|d| d > today)
+}
+
+/// Resolve the hash of the LAST row of the forensic chain — the `prev_hash`
+/// the next appended row must carry.
+///
+/// # #4199 / #4202 / #4203 — never fork the chain (vote 4d3ea1c5)
+///
+/// Pre-#4199 this returned `Option` over the NEWEST file only, so every
+/// failure (a directory it could not list, a file it could not open or read),
+/// an empty newest file (a crash after the lazy create, #4202), and a planted
+/// future-dated file (#4203) all collapsed to "no chain": [`init`] seeded
+/// genesis and the next signed row forked the chain. Now:
+/// - files dated after the current UTC day are NEVER the tail (#4203); they
+///   are reported (ERROR here, doctor Critical) and never deleted;
+/// - the walk goes newest to oldest and takes the last parseable row of the
+///   first file that has one (#4202). A torn or unparseable last LINE is
+///   skipped, as it always was;
+/// - `Ok(None)` (genesis) only when no file holds a non-blank line, future-dated
+///   files INCLUDED: when only future-dated files hold rows the chain exists
+///   but cannot be continued, which is a [`ForensicTailUnreadable`] error, not
+///   a second genesis (r1 B1 on #4203);
+/// - an I/O error, or non-empty files with no parseable row anywhere, is a
+///   [`ForensicTailUnreadable`] error.
+///
+/// # v1.0.0 #2584 — bounded tail read, exact fallback
+///
+/// This runs on EVERY process start (`main.rs::init_forensic_audit` →
+/// [`init`]). Pre-#2584 it streamed the WHOLE newest file and parsed EVERY
+/// line (measured: 163 ms of a 174 ms `ai-memory list` against a 16.5 MB
+/// same-day log, growing all day). The bounded suffix read answers from the
+/// final [`CHAIN_TAIL_WINDOW_BYTES`] and falls back to the exact forward scan
+/// only when that window starts mid-file and holds no parseable row, so its
+/// verdict is identical to the scan for every input. Line splitting mirrors
+/// `BufReader::lines()` (LF, a trailing CR stripped, whitespace-only lines
+/// blank).
+fn read_chain_tail(dir: &Path) -> Result<Option<String>> {
+    read_chain_tail_as_of(dir, today_code())
+}
+
+fn read_chain_tail_as_of(dir: &Path, today: i64) -> Result<Option<String>> {
+    let files = list_forensic_files(dir).map_err(|e| tail_unreadable(dir, format!("{e:#}")))?;
+    let mut unparseable: Option<&PathBuf> = None;
+    // #4203 (r1 B1): future-dated files are never the tail, but one that holds
+    // rows proves a chain exists, so it must never let the walk fall through
+    // to "no chain" (genesis), which would fork it. Read only when no
+    // present-dated file holds the tail.
+    let mut future: Vec<&PathBuf> = Vec::new();
+    for file in files.iter().rev() {
+        if is_future_dated(file, today) {
+            tracing::error!(
+                target: AUDIT_TRACE_TARGET,
+                path = %file.display(),
+                "forensic: a file dated after today is never the chain tail; it is left in \
+                 place as evidence (#4203)"
+            );
+            future.push(file);
+            continue;
+        }
+        match read_file_tail(file)? {
+            FileTail::Row(hash) => return Ok(Some(hash)),
+            FileTail::Empty => {}
+            FileTail::NoParseableRow => {
+                tracing::warn!(
+                    target: AUDIT_TRACE_TARGET,
+                    path = %file.display(),
+                    "forensic: a file with no parseable row is skipped for the chain tail; \
+                     the chain continues from an earlier file (#4202)"
+                );
+                unparseable.get_or_insert(file);
+            }
+        }
+    }
+    if let Some(path) = unparseable {
+        return Err(tail_unreadable(
+            path,
+            "non-empty forensic files exist but none holds a parseable row",
+        ));
+    }
+    for path in future {
+        if read_file_tail(path)? != FileTail::Empty {
+            return Err(tail_unreadable(
+                path,
+                "only files dated after today hold forensic rows; starting a chain at genesis \
+                 would fork it (#4203)",
+            ));
+        }
+    }
+    Ok(None)
+}
+
+/// The tail of one file: the bounded suffix read, else the exact scan.
+fn read_file_tail(path: &Path) -> Result<FileTail> {
+    match read_chain_tail_from_suffix(path)? {
+        Some(tail) => Ok(tail),
+        None => read_chain_tail_full_scan(path),
+    }
+}
+
+/// The parsed row hash of one raw line, if it is a complete forensic row.
+fn parse_row(line: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(line).ok()?;
+    serde_json::from_str::<ForensicDecision>(text)
+        .ok()
+        .map(|row| row.self_hash())
+}
+
+/// Whether a raw line (LF already removed) is blank, as `BufReader::lines()`
+/// + `trim()` would see it. Bytes that are not UTF-8 are never blank.
+fn is_blank_line(line: &[u8]) -> bool {
+    std::str::from_utf8(line).is_ok_and(|t| t.trim().is_empty())
+}
+
+/// Bounded backward read over the final [`CHAIN_TAIL_WINDOW_BYTES`] of
+/// `path`. `Ok(None)` means the window starts mid-file and holds no
+/// parseable row, so only the exact scan can answer.
+fn read_chain_tail_from_suffix(path: &Path) -> Result<Option<FileTail>> {
+    let io = |e: std::io::Error| tail_unreadable(path, e.to_string());
+    let mut f = open_forensic_file_for_read(path).map_err(io)?;
+    let len = f.metadata().map_err(io)?.len();
     let start = len.saturating_sub(CHAIN_TAIL_WINDOW_BYTES);
-    f.seek(SeekFrom::Start(start)).ok()?;
+    f.seek(SeekFrom::Start(start)).map_err(io)?;
     let mut buf = Vec::with_capacity(usize::try_from(len - start).unwrap_or(0));
-    f.read_to_end(&mut buf).ok()?;
+    f.read_to_end(&mut buf).map_err(io)?;
 
     // When the window starts mid-file the first fragment is a partial
     // line; drop it so a truncated prefix can never be mis-parsed.
     let body: &[u8] = if start > 0 {
         match buf.iter().position(|b| *b == b'\n') {
             Some(nl) => &buf[nl + 1..],
-            // A 256 KiB run with no newline at all: nothing usable here.
-            None => return None,
+            // A window with no newline at all: only the exact scan knows.
+            None => return Ok(None),
         }
     } else {
         &buf[..]
     };
 
+    let mut saw_non_blank = false;
     for raw in body.split(|b| *b == b'\n').rev() {
         // `BufReader::lines()` strips a trailing CR as well as the LF.
         let line = raw.strip_suffix(b"\r").unwrap_or(raw);
-        // ... and the old scan skipped whitespace-only lines outright.
-        let Ok(text) = std::str::from_utf8(line) else {
-            // Invalid UTF-8 — the old scan's `Err(_) => continue` arm.
-            continue;
-        };
-        if text.trim().is_empty() {
+        if is_blank_line(line) {
             continue;
         }
-        if let Ok(row) = serde_json::from_str::<ForensicDecision>(text) {
-            return Some(row.self_hash());
+        saw_non_blank = true;
+        if let Some(hash) = parse_row(line) {
+            return Ok(Some(FileTail::Row(hash)));
         }
     }
-    None
+    if start > 0 {
+        return Ok(None);
+    }
+    Ok(Some(if saw_non_blank {
+        FileTail::NoParseableRow
+    } else {
+        FileTail::Empty
+    }))
 }
 
-/// The pre-#2584 exact forward scan, retained VERBATIM as the fallback
-/// so the bounded hunt above can never change an answer — only skip work.
-fn read_chain_tail_full_scan(path: &Path) -> Option<String> {
-    let f = File::open(path).ok()?;
-    let mut last_hash: Option<String> = None;
-    for line in BufReader::new(f).lines() {
-        let Ok(line) = line else { continue };
-        if line.trim().is_empty() {
+/// The exact forward scan: the last parseable row, else whether the file
+/// held any non-blank line.
+fn read_chain_tail_full_scan(path: &Path) -> Result<FileTail> {
+    let io = |e: std::io::Error| tail_unreadable(path, e.to_string());
+    let f = open_forensic_file_for_read(path).map_err(io)?;
+    let mut last: Option<String> = None;
+    let mut saw_non_blank = false;
+    for raw in BufReader::new(f).split(b'\n') {
+        let raw = raw.map_err(io)?;
+        let line = raw.strip_suffix(b"\r").unwrap_or(raw.as_slice());
+        if is_blank_line(line) {
             continue;
         }
-        if let Ok(row) = serde_json::from_str::<ForensicDecision>(&line) {
-            last_hash = Some(row.self_hash());
+        saw_non_blank = true;
+        if let Some(hash) = parse_row(line) {
+            last = Some(hash);
         }
     }
-    last_hash
+    Ok(match (last, saw_non_blank) {
+        (Some(hash), _) => FileTail::Row(hash),
+        (None, true) => FileTail::NoParseableRow,
+        (None, false) => FileTail::Empty,
+    })
 }
 
 fn list_forensic_files(dir: &Path) -> Result<Vec<PathBuf>> {
@@ -1325,6 +1912,21 @@ fn list_forensic_files(dir: &Path) -> Result<Vec<PathBuf>> {
                 .and_then(|s| s.strip_suffix(FORENSIC_FILE_SUFFIX))
                 .is_some_and(|stem| parse_iso_date(stem).is_ok());
             if stem_is_date {
+                // #4273 — only a REGULAR file can be a daily forensic file.
+                // `file_type` does not follow a symlink, so a link, FIFO,
+                // socket, device or directory under a daily-file name is
+                // refused here (the chain tail is then unavailable: degrade,
+                // or refuse under require-mode) and never silently skipped.
+                let file_type = entry
+                    .file_type()
+                    .with_context(|| format!("reading the type of {}", entry.path().display()))?;
+                if !file_type.is_file() {
+                    anyhow::bail!(
+                        "{} is not a regular file (a symbolic link, FIFO, socket, device or \
+                         directory under a daily forensic file name)",
+                        entry.path().display()
+                    );
+                }
                 out.push(entry.path());
             } else {
                 tracing::warn!(
@@ -1411,7 +2013,8 @@ pub fn verify_since(
         if date >= cutoff {
             break;
         }
-        let f = File::open(file).with_context(|| crate::errors::msg::opening(file.display()))?;
+        let f = open_forensic_file_for_read(file)
+            .with_context(|| crate::errors::msg::opening(file.display()))?;
         for line in BufReader::new(f).lines() {
             let Ok(line) = line else { continue };
             if line.trim().is_empty() {
@@ -1428,7 +2031,8 @@ pub fn verify_since(
         if date < cutoff {
             continue;
         }
-        let f = File::open(file).with_context(|| crate::errors::msg::opening(file.display()))?;
+        let f = open_forensic_file_for_read(file)
+            .with_context(|| crate::errors::msg::opening(file.display()))?;
         for (idx, line) in BufReader::new(f).lines().enumerate() {
             let line_no = (idx as u64) + 1;
             let line = line.with_context(|| format!("reading {}:{line_no}", file.display()))?;
@@ -1884,7 +2488,7 @@ enum WatermarkScan {
 /// signed. [`last_audit_watermark`] ignores the bit (the CONVICTING lanes read
 /// the raw unauthenticated anchor).
 fn scan_file_last_watermark(path: &Path, db_id: Option<&str>) -> WatermarkScan {
-    let Ok(f) = File::open(path) else {
+    let Ok(f) = open_forensic_file_for_read(path) else {
         return WatermarkScan::NoEligibleRow;
     };
     let mut found: Option<(i64, String, bool)> = None;
@@ -3435,10 +4039,7 @@ fn try_append_head_anchor(cp: &crate::models::Checkpoint, durable: bool) -> Resu
     let path = dir.join(HEAD_ANCHOR_LOG_FILENAME);
     let created = !path.exists();
     let line = serde_json::to_string(cp).context("serialise head-anchor checkpoint")?;
-    let mut f = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
+    let mut f = open_for_append_line_aligned(&path)
         .with_context(|| format!("open head-anchor log at {}", path.display()))?;
     writeln!(f, "{line}").context("append head-anchor line")?;
     if durable {
@@ -3482,8 +4083,15 @@ fn off_table_head_anchor_present() -> bool {
     let Ok(dir) = witness_key_dir() else {
         return false;
     };
-    let path = dir.join(HEAD_ANCHOR_LOG_FILENAME);
-    match File::open(&path) {
+    anchor_log_has_a_line(&dir.join(HEAD_ANCHOR_LOG_FILENAME))
+}
+
+/// [`off_table_head_anchor_present`] on one path. #4303 — opened never
+/// through a link and never blocking on a FIFO (a FIFO here hung every db
+/// open). A refused or unreadable file is an error other than `NotFound`, so
+/// it reads as a surviving anchor (fail closed).
+fn anchor_log_has_a_line(path: &Path) -> bool {
+    match open_forensic_file_for_read(path) {
         Ok(f) => BufReader::new(f)
             .lines()
             .any(|l| l.is_ok_and(|s| !s.trim().is_empty())),
@@ -3546,7 +4154,8 @@ fn scan_head_anchor_log(db_id: Option<&str>) -> AnchorScan {
         return AnchorScan::Unpinnable;
     };
     let enrolled_bytes = enrolled.to_bytes();
-    let Ok(f) = File::open(&path) else {
+    // #4303 — never through a link, never blocking on a FIFO.
+    let Ok(f) = open_forensic_file_for_read(&path) else {
         return AnchorScan::NoPinnedLines;
     };
     let mut high: Option<i64> = None;
@@ -3671,10 +4280,7 @@ pub fn append_restore_sanction(line: &str) -> Result<()> {
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("create witness mount dir {}", dir.display()))?;
     let path = dir.join(RESTORE_SANCTION_LOG_FILENAME);
-    let mut f = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
+    let mut f = open_for_append_line_aligned(&path)
         .with_context(|| format!("open restore-sanction log at {}", path.display()))?;
     writeln!(f, "{line}").context("append restore-sanction line")?;
     Ok(())
@@ -3706,7 +4312,9 @@ fn restore_sanction_clears(anchored_head: i64, db_head: i64, db_id: Option<&str>
         return false;
     };
     let path = dir.join(RESTORE_SANCTION_LOG_FILENAME);
-    let Ok(f) = File::open(&path) else {
+    // #4303 — never through a link, never blocking on a FIFO. A refused file
+    // grants no sanction.
+    let Ok(f) = open_forensic_file_for_read(&path) else {
         return false;
     };
     for line in BufReader::new(f).lines() {
@@ -4007,8 +4615,8 @@ mod writer_spawn_tests_3164 {
     /// `main::init_forensic_audit`, so a `clone(2)` refusal (`EAGAIN` from a
     /// pids-cgroup cap or `RLIMIT_NPROC` on a dense host) aborted the whole
     /// process with exit 101 before it served a request. A resource condition
-    /// must be a `Result` (ERRORS-01), and the boot path's existing
-    /// "continuing unsigned" policy then decides.
+    /// must be a `Result` (ERRORS-01), and the boot path then decides (#4272:
+    /// "forensic sink unavailable", which degrades, or refuses in require-mode).
     ///
     /// LIMITATION, stated honestly: forcing a real `clone(2)` EAGAIN inside a
     /// test process is not portable, so this pins the CONTRACT — the fallible
@@ -4863,7 +5471,7 @@ mod tests {
     fn read_chain_tail_returns_none_for_empty_dir() {
         let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
         let tmp = TempDir::new().unwrap();
-        assert!(read_chain_tail(tmp.path()).is_none());
+        assert!(read_chain_tail(tmp.path()).unwrap().is_none());
     }
 
     #[test]
@@ -4873,24 +5481,26 @@ mod tests {
         fresh_init(tmp.path(), None);
         record_decision("ai:t", "allow", "bash", "R001", ForensicPayload::new());
         shutdown();
-        let tail = read_chain_tail(tmp.path()).expect("tail present after record");
+        let tail = read_chain_tail(tmp.path())
+            .unwrap()
+            .expect("tail present after record");
         assert!(!tail.is_empty());
         assert_ne!(tail, CHAIN_HEAD_PREV_HASH);
     }
 
     // -----------------------------------------------------------------
-    // v1.0.0 #2584 — bounded chain-tail read.
+    // v1.0.0 #2584 — bounded chain-tail read, and #4199 — never fork.
     //
     // `read_chain_tail` runs on EVERY process start (main.rs
     // `init_forensic_audit`). Pre-#2584 it JSON-parsed every line of the
     // newest forensic file to keep only the last: measured 163 ms of a
-    // 174 ms `ai-memory list` against a 16.5 MB same-day log (2 021 of
-    // the process's 2 052 `read` syscalls), growing all day.
+    // 174 ms `ai-memory list` against a 16.5 MB same-day log.
     //
-    // These pin BOTH halves of the contract: the bounded suffix hunt
-    // must ANSWER without a full scan (the perf property), and it must
-    // never CHANGE an answer (the correctness property) — including on
-    // the damaged tails a SIGKILL mid-append can leave behind.
+    // These pin: the bounded suffix read must ANSWER without a full scan
+    // (the perf property) and never CHANGE the exact scan's answer (the
+    // correctness property). Since #4199 a torn, corrupt or non-UTF-8 LAST
+    // row is an error on both paths (pre-#4199 both skipped back to an
+    // earlier row, or to genesis, and the next row forked the chain).
     // -----------------------------------------------------------------
 
     /// Build a syntactically valid forensic row whose payload carries
@@ -4908,79 +5518,102 @@ mod tests {
         }
     }
 
+    /// The expected verdict for one file.
+    #[derive(Debug, Clone, Copy)]
+    enum Expect {
+        Empty,
+        NoParseableRow,
+        Row(&'static str),
+    }
+
+    fn expected(x: Expect) -> FileTail {
+        match x {
+            Expect::Empty => FileTail::Empty,
+            Expect::NoParseableRow => FileTail::NoParseableRow,
+            Expect::Row(m) => FileTail::Row(tail_row(m).self_hash()),
+        }
+    }
+
     /// Every tail shape a crash / rotation / editor can leave behind.
-    /// `(label, file bytes, expected marker of the last PARSEABLE row)`.
-    fn tail_corpus() -> Vec<(&'static str, Vec<u8>, Option<&'static str>)> {
+    /// A torn or unparseable LAST line is skipped (it always was; the #4199
+    /// vote keeps that): the tail is the last PARSEABLE row.
+    fn tail_corpus() -> Vec<(&'static str, Vec<u8>, Expect)> {
         let a = serde_json::to_string(&tail_row("a")).unwrap();
         let b = serde_json::to_string(&tail_row("b")).unwrap();
-        let mut out: Vec<(&'static str, Vec<u8>, Option<&'static str>)> = Vec::new();
-        out.push(("empty-file", Vec::new(), None));
-        out.push(("single-row", format!("{a}\n").into_bytes(), Some("a")));
-        out.push(("two-rows", format!("{a}\n{b}\n").into_bytes(), Some("b")));
+        let mut out: Vec<(&'static str, Vec<u8>, Expect)> = Vec::new();
+        out.push(("empty-file", Vec::new(), Expect::Empty));
+        out.push(("only-blank-lines", b"\n   \n\r\n".to_vec(), Expect::Empty));
+        out.push((
+            "single-row",
+            format!("{a}\n").into_bytes(),
+            Expect::Row("a"),
+        ));
+        out.push((
+            "two-rows",
+            format!("{a}\n{b}\n").into_bytes(),
+            Expect::Row("b"),
+        ));
         out.push((
             "no-trailing-newline",
             format!("{a}\n{b}").into_bytes(),
-            Some("b"),
+            Expect::Row("b"),
         ));
         out.push((
             "blank-lines-after",
             format!("{a}\n{b}\n\n   \n\n").into_bytes(),
-            Some("b"),
+            Expect::Row("b"),
         ));
         out.push((
             "crlf-line-endings",
             format!("{a}\r\n{b}\r\n").into_bytes(),
-            Some("b"),
+            Expect::Row("b"),
         ));
         out.push((
             "truncated-last-row",
             format!("{a}\n{b}\n{{\"ts\":\"2026-07-3").into_bytes(),
-            Some("b"),
+            Expect::Row("b"),
         ));
         out.push((
             "garbage-after",
             format!("{a}\n{b}\nnot json at all\n!!!\n").into_bytes(),
-            Some("b"),
+            Expect::Row("b"),
         ));
-        out.push(("only-garbage", b"not json\nstill not json\n".to_vec(), None));
-        // Invalid UTF-8 trailing fragment — the old scan's
-        // `Err(_) => continue` arm.
         let mut bad_utf8 = format!("{a}\n{b}\n").into_bytes();
         bad_utf8.extend_from_slice(&[0xff, 0xfe, 0x0a]);
-        out.push(("invalid-utf8-tail", bad_utf8, Some("b")));
+        out.push(("invalid-utf8-tail", bad_utf8, Expect::Row("b")));
+        // #4199 — distinct from EMPTY: non-empty, but nothing parses. Pre-#4199
+        // both were `None`, and the next row started a new chain at genesis.
+        out.push((
+            "only-garbage",
+            b"not json\nstill not json\n".to_vec(),
+            Expect::NoParseableRow,
+        ));
         out
     }
 
-    /// CORRECTNESS: the bounded hunt (with its exact fallback) must
-    /// return byte-for-byte what the pre-#2584 full forward scan
-    /// returns, for EVERY tail shape.
+    /// CORRECTNESS: the bounded read (with its exact fallback) and the
+    /// exact scan give the SAME verdict for every tail shape, and it is the
+    /// expected one.
     #[test]
     fn chain_tail_bounded_read_matches_full_scan_on_every_tail_shape_2584() {
         let tmp = TempDir::new().unwrap();
-        for (label, bytes, expected_marker) in tail_corpus() {
-            let p = tmp.path().join(format!("forensic-2026-07-31.jsonl"));
+        for (label, bytes, want) in tail_corpus() {
+            let p = tmp.path().join("forensic-2026-07-31.jsonl");
             std::fs::write(&p, &bytes).unwrap();
 
-            let full = read_chain_tail_full_scan(&p);
-            let bounded = read_chain_tail_from_suffix(&p).or_else(|| read_chain_tail_full_scan(&p));
+            let full = read_chain_tail_full_scan(&p).unwrap();
+            let bounded = read_file_tail(&p).unwrap();
             assert_eq!(
                 bounded, full,
-                "#2584 [{label}]: the bounded tail read must never CHANGE the answer the \
-                 pre-fix full forward scan gave — only skip work"
+                "#2584 [{label}]: the bounded tail read must never CHANGE the exact scan's verdict"
             );
-
-            let expected = expected_marker.map(|m| tail_row(m).self_hash());
-            assert_eq!(
-                bounded, expected,
-                "#2584 [{label}]: expected the hash of the LAST PARSEABLE row"
-            );
+            assert_eq!(bounded, expected(want), "[{label}]: unexpected verdict");
         }
     }
 
     /// PERF (R-203): on a file far larger than the window, the BOUNDED
     /// path alone must produce the answer. If someone reverts to a full
-    /// scan (or zeroes the window) this fails, because the suffix hunt
-    /// would no longer be the thing that answers.
+    /// scan (or zeroes the window) this fails.
     #[test]
     fn chain_tail_suffix_answers_large_file_without_full_scan_2584() {
         let tmp = TempDir::new().unwrap();
@@ -4997,48 +5630,543 @@ mod tests {
         body.push('\n');
         std::fs::write(&p, body.as_bytes()).unwrap();
 
-        let bounded = read_chain_tail_from_suffix(&p);
+        let bounded = read_chain_tail_from_suffix(&p).unwrap();
         assert_eq!(
             bounded,
-            Some(tail_row("last").self_hash()),
+            Some(FileTail::Row(tail_row("last").self_hash())),
             "#2584 REGRESSED: the bounded suffix read must resolve the chain tail of a \
-             multi-window file on its own — reading the whole file on every process \
-             start is the defect (163 ms of a 174 ms `ai-memory list` on a 16.5 MB log)"
+             multi-window file on its own"
         );
-        // ...and it must agree with the exact scan it replaces.
-        assert_eq!(bounded, read_chain_tail_full_scan(&p));
+        assert_eq!(bounded, Some(read_chain_tail_full_scan(&p).unwrap()));
     }
 
-    /// FAIL-SAFE: when the ENTIRE window is unparseable the bounded hunt
-    /// declines (`None`) and the exact full scan still finds the real
-    /// tail. Worst case is today's behaviour, never a wrong answer.
+    /// FAIL-SAFE: when the ENTIRE window (starting mid-file) holds no
+    /// parseable row the bounded read declines (`None`) and the exact scan
+    /// still finds the real tail. Worst case is the old behaviour, never a
+    /// wrong answer.
     #[test]
     fn chain_tail_falls_back_to_full_scan_when_window_is_all_garbage_2584() {
         let tmp = TempDir::new().unwrap();
         let p = tmp.path().join("forensic-2026-07-31.jsonl");
         let good = serde_json::to_string(&tail_row("good")).unwrap();
-
-        let mut body = String::new();
-        body.push_str(&good);
-        body.push('\n');
-        let mut garbage_len: u64 = 0;
-        while garbage_len <= CHAIN_TAIL_WINDOW_BYTES * 2 {
+        let mut body = format!("{good}\n");
+        while body.len() as u64 <= CHAIN_TAIL_WINDOW_BYTES * 2 {
             body.push_str("this line is not a forensic row\n");
-            garbage_len += 32;
         }
         std::fs::write(&p, body.as_bytes()).unwrap();
 
         assert_eq!(
-            read_chain_tail_from_suffix(&p),
+            read_chain_tail_from_suffix(&p).unwrap(),
             None,
             "a window containing no parseable row must DECLINE, not guess"
         );
         assert_eq!(
-            read_chain_tail(tmp.path()),
+            read_chain_tail(tmp.path()).unwrap(),
             Some(tail_row("good").self_hash()),
-            "#2584: the exact full-scan fallback must still recover the true chain tail, \
-             so the optimisation cannot lose the chain link"
+            "#2584: the exact full-scan fallback must still recover the true chain tail"
         );
+    }
+
+    /// #4202 — an empty NEWEST daily file does not hide the chain held by an
+    /// older file (pre-#4202 only the newest file was read: genesis).
+    #[test]
+    fn chain_tail_walks_back_past_an_empty_newest_file_4202() {
+        let tmp = TempDir::new().unwrap();
+        let a = serde_json::to_string(&tail_row("a")).unwrap();
+        std::fs::write(
+            tmp.path().join("forensic-2026-07-30.jsonl"),
+            format!("{a}\n"),
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join("forensic-2026-07-31.jsonl"), b"").unwrap();
+        assert_eq!(
+            read_chain_tail(tmp.path()).unwrap(),
+            Some(tail_row("a").self_hash())
+        );
+    }
+
+    /// #4202 — a newest file with no parseable row is skipped too.
+    #[test]
+    fn chain_tail_walks_back_past_an_unparseable_newest_file_4202() {
+        let tmp = TempDir::new().unwrap();
+        let a = serde_json::to_string(&tail_row("a")).unwrap();
+        std::fs::write(
+            tmp.path().join("forensic-2026-07-30.jsonl"),
+            format!("{a}\n"),
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join("forensic-2026-07-31.jsonl"), b"garbage\n").unwrap();
+        assert_eq!(
+            read_chain_tail(tmp.path()).unwrap(),
+            Some(tail_row("a").self_hash())
+        );
+    }
+
+    /// #4199 — non-empty files but no parseable row ANYWHERE is an error,
+    /// never genesis. Only a directory with no non-blank line is `Ok(None)`.
+    #[test]
+    fn chain_tail_errors_when_no_file_has_a_parseable_row_4199() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("forensic-2026-07-30.jsonl"), b"\n").unwrap();
+        std::fs::write(tmp.path().join("forensic-2026-07-31.jsonl"), b"garbage\n").unwrap();
+        let err = read_chain_tail(tmp.path()).expect_err("nothing parses: not genesis");
+        assert!(
+            err.downcast_ref::<ForensicTailUnreadable>().is_some(),
+            "{err:#}"
+        );
+
+        let empty = TempDir::new().unwrap();
+        std::fs::write(empty.path().join("forensic-2026-07-31.jsonl"), b"  \n").unwrap();
+        assert_eq!(
+            read_chain_tail(empty.path()).unwrap(),
+            None,
+            "blank-only is empty"
+        );
+    }
+
+    /// #4203 — a future-dated file is never the tail and is left in place.
+    #[test]
+    fn a_future_dated_file_is_never_the_chain_tail_4203() {
+        let tmp = TempDir::new().unwrap();
+        let a = serde_json::to_string(&tail_row("a")).unwrap();
+        let b = serde_json::to_string(&tail_row("b")).unwrap();
+        std::fs::write(
+            tmp.path().join("forensic-2026-07-30.jsonl"),
+            format!("{a}\n"),
+        )
+        .unwrap();
+        let future = tmp.path().join("forensic-2099-01-01.jsonl");
+        std::fs::write(&future, format!("{b}\n")).unwrap();
+        let today = 2026_07_31;
+        assert_eq!(
+            read_chain_tail_as_of(tmp.path(), today).unwrap(),
+            Some(tail_row("a").self_hash()),
+            "even a PARSEABLE future-dated row is not the tail"
+        );
+        assert!(future.exists(), "evidence is never deleted");
+        let report = inspect_forensic_tail(tmp.path());
+        assert_eq!(report.future_dated, vec![future]);
+    }
+
+    /// r1 B1 on #4203 — when ONLY future-dated files hold rows, a chain
+    /// exists and cannot be continued: an error, never genesis (a genesis
+    /// row today would fork it). Red on 823cc4c13: `Ok(None)`.
+    #[test]
+    fn only_future_dated_rows_are_an_error_never_genesis_4203() {
+        let tmp = TempDir::new().unwrap();
+        let future = tmp.path().join("forensic-2099-01-01.jsonl");
+        let b = serde_json::to_string(&tail_row("b")).unwrap();
+        std::fs::write(&future, format!("{b}\n")).unwrap();
+        let err = read_chain_tail_as_of(tmp.path(), 2026_07_31)
+            .expect_err("rows exist only in a future-dated file: not genesis");
+        let typed = err
+            .downcast_ref::<ForensicTailUnreadable>()
+            .unwrap_or_else(|| panic!("typed outage error: {err:#}"));
+        assert_eq!(typed.path, future, "the error names the file holding rows");
+        assert!(future.exists(), "evidence is never deleted");
+
+        // Control: a future-dated file with no non-blank line holds no chain.
+        let blank = TempDir::new().unwrap();
+        std::fs::write(blank.path().join("forensic-2099-01-01.jsonl"), b" \n").unwrap();
+        assert_eq!(
+            read_chain_tail_as_of(blank.path(), 2026_07_31).unwrap(),
+            None
+        );
+    }
+
+    /// #4302 (r1 B2 on #4272) — a forensic directory the process cannot
+    /// write to is an init error: no sink is installed, so the boot path
+    /// degrades with its signals or refuses under require-mode. Red on
+    /// 823cc4c13: init succeeded and the writer dropped every row.
+    #[cfg(unix)]
+    #[test]
+    fn init_refuses_a_read_only_forensic_directory_4302() {
+        use std::os::unix::fs::PermissionsExt;
+        let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        shutdown();
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("audit");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        if std::fs::File::create(dir.join("probe")).is_ok() {
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+            eprintln!("SKIP: permission bits do not deny writes here (running as root?)");
+            return;
+        }
+        let r = init(&dir, None);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let err = r.expect_err("a read-only forensic directory is no sink");
+        assert!(
+            err.downcast_ref::<ForensicTailUnreadable>().is_some(),
+            "{err:#}"
+        );
+        assert!(!is_enabled(), "no sink is installed");
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            0,
+            "the probe leaves nothing behind"
+        );
+    }
+
+    /// #4302 — today's daily file present but read-only is an init error too,
+    /// although its tail reads fine. Red on 823cc4c13: init succeeded.
+    #[cfg(unix)]
+    #[test]
+    fn init_refuses_a_read_only_daily_file_4302() {
+        use std::os::unix::fs::PermissionsExt;
+        let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        shutdown();
+        let tmp = TempDir::new().unwrap();
+        let today = daily_path(tmp.path(), &Utc::now());
+        let a = serde_json::to_string(&tail_row("a")).unwrap();
+        std::fs::write(&today, format!("{a}\n")).unwrap();
+        std::fs::set_permissions(&today, std::fs::Permissions::from_mode(0o400)).unwrap();
+        if OpenOptions::new().append(true).open(&today).is_ok() {
+            std::fs::set_permissions(&today, std::fs::Permissions::from_mode(0o600)).unwrap();
+            eprintln!("SKIP: permission bits do not deny writes here (running as root?)");
+            return;
+        }
+        let r = init(tmp.path(), None);
+        std::fs::set_permissions(&today, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let err = r.expect_err("a read-only daily file is no sink");
+        let typed = err
+            .downcast_ref::<ForensicTailUnreadable>()
+            .unwrap_or_else(|| panic!("typed outage error: {err:#}"));
+        assert_eq!(typed.path, today);
+        assert!(!is_enabled(), "no sink is installed");
+        assert_eq!(std::fs::read(&today).unwrap(), format!("{a}\n").as_bytes());
+    }
+
+    /// #4322 — the forensic start-up probe (every process start, and doctor)
+    /// never truncates through a link planted at the OLD predictable probe
+    /// name. Red on 4434125ca: `init` truncated the victim to 0 bytes.
+    #[cfg(unix)]
+    #[test]
+    fn init_does_not_truncate_through_a_planted_probe_link_4322() {
+        let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        shutdown();
+        let tmp = TempDir::new().unwrap();
+        let victim = tmp.path().join("victim.db");
+        std::fs::write(&victim, b"precious bytes").unwrap();
+        let dir = tmp.path().join("audit");
+        std::fs::create_dir(&dir).unwrap();
+        std::os::unix::fs::symlink(
+            &victim,
+            dir.join(format!(".ai-memory-write-probe-{}", std::process::id())),
+        )
+        .unwrap();
+        let _ = init(&dir, None);
+        shutdown();
+        let _ = inspect_forensic_tail(&dir);
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            b"precious bytes",
+            "the start-up probe truncated a file through a planted link"
+        );
+    }
+
+    /// #4302 — a row the writer cannot persist is counted, not only traced.
+    #[test]
+    fn a_dropped_row_is_counted_4302() {
+        let before = crate::metrics::forensic_sink_unavailable_count();
+        writer_failure(
+            "appending to",
+            Path::new("/nonexistent/forensic-2026-07-31.jsonl"),
+            &std::io::Error::from_raw_os_error(28),
+        );
+        assert!(crate::metrics::forensic_sink_unavailable_count() > before);
+    }
+
+    /// #4302 — doctor reports a read-only directory as not writable, and a
+    /// healthy or missing one as writable (a missing one is created at boot).
+    #[cfg(unix)]
+    #[test]
+    fn inspect_reports_writability_4302() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        assert_eq!(inspect_forensic_tail(tmp.path()).not_writable, None);
+        assert_eq!(
+            inspect_forensic_tail(&tmp.path().join("not-yet")).not_writable,
+            None
+        );
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        let denied = std::fs::File::create(tmp.path().join("probe")).is_err();
+        let report = inspect_forensic_tail(tmp.path());
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        if !denied {
+            eprintln!("SKIP: permission bits do not deny writes here (running as root?)");
+            return;
+        }
+        let cause = report.not_writable.expect("read-only is not writable");
+        assert!(cause.contains("not writable"), "{cause}");
+    }
+
+    /// #4305 — a daily file with a second hard link is refused: appends
+    /// would also land under a name outside the audit directory. Red on
+    /// 823cc4c13: the open succeeded.
+    #[cfg(unix)]
+    #[test]
+    fn a_hard_linked_forensic_file_is_refused_4305() {
+        let tmp = TempDir::new().unwrap();
+        let today = tmp.path().join("forensic-2026-07-31.jsonl");
+        std::fs::write(&today, b"").unwrap();
+        let outside = tmp.path().join("outside.jsonl");
+        std::fs::hard_link(&today, &outside).unwrap();
+        for opened in [
+            open_forensic_file_for_read(&today),
+            open_forensic_file(OpenOptions::new().append(true), &today),
+            open_for_append_line_aligned(&today),
+        ] {
+            let err = opened.expect_err("a hard-linked forensic file is refused");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(err.to_string().contains("hard links"), "{err}");
+        }
+        std::fs::remove_file(&outside).unwrap();
+        assert!(
+            open_forensic_file_for_read(&today).is_ok(),
+            "one link again: accepted"
+        );
+    }
+
+    /// #4310 — every dropped row is counted, but stderr gets at most one
+    /// line per interval, naming the rows folded into it. Red on 4434125ca:
+    /// one stderr line per dropped row.
+    #[test]
+    fn dropped_rows_are_all_counted_but_stderr_is_rate_limited_4310() {
+        let stats = crate::logging::DeliveryStats::default();
+        let path = Path::new("/nonexistent/forensic-2026-07-31.jsonl");
+        let err = std::io::Error::from_raw_os_error(30);
+        let t0 = 1_000_000_u64;
+        let before = crate::metrics::forensic_sink_unavailable_count();
+        let lines: Vec<String> = (0..10)
+            .filter_map(|i| writer_failure_with(&stats, t0 + i, "appending to", path, &err))
+            .collect();
+        assert!(
+            crate::metrics::forensic_sink_unavailable_count() >= before + 10,
+            "every dropped row is counted"
+        );
+        assert_eq!(
+            lines.len(),
+            1,
+            "one stderr line inside the interval: {lines:?}"
+        );
+        assert!(lines[0].contains("0 further rows"), "{}", lines[0]);
+
+        // A minute later: one more line, naming the 9 rows folded since.
+        let later = writer_failure_with(&stats, t0 + 60_000, "appending to", path, &err)
+            .expect("a line is due after the interval");
+        assert!(later.contains("9 further rows"), "{later}");
+        assert!(
+            writer_failure_with(&stats, t0 + 60_001, "appending to", path, &err).is_none(),
+            "and the limit holds again"
+        );
+    }
+
+    /// #4310 (f2r B1) — the tracing ERROR is rate-limited too. `serve` and
+    /// `mcp` route tracing to stderr, so a per-row ERROR was the flood itself.
+    /// Red on ed111a9eb: 10 ERROR lines for 10 dropped rows.
+    #[test]
+    fn dropped_rows_log_one_error_per_interval_not_per_row_4310() {
+        // #4090: tracing capture; run alone in a child (callsite-interest cache).
+        if crate::config::run_env_isolated_child_or_spawn(
+            "governance::audit::tests::dropped_rows_log_one_error_per_interval_not_per_row_4310",
+        ) {
+            return;
+        }
+        let stats = crate::logging::DeliveryStats::default();
+        let path = Path::new("/nonexistent/forensic-2026-07-31.jsonl");
+        let err = std::io::Error::from_raw_os_error(30);
+        let (subscriber, sink) = crate::test_support::error_debug_capture();
+        tracing::subscriber::with_default(subscriber, || {
+            for i in 0..10 {
+                let _ = writer_failure_with(&stats, 1_000_000 + i, "appending to", path, &err);
+            }
+        });
+        let (errors, debugs) = crate::test_support::count_error_and_debug_lines(&sink);
+        assert_eq!(errors, 1, "one ERROR per interval, not one per row");
+        assert_eq!(debugs, 10, "every dropped row is still traced, at DEBUG");
+    }
+
+    /// #4304 — a row and its newline go out in ONE write call.
+    #[test]
+    fn a_row_and_its_newline_are_one_write_4304() {
+        struct Calls(Vec<Vec<u8>>);
+        impl Write for Calls {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.push(buf.to_vec());
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut w = Calls(Vec::new());
+        append_record(&mut w, r#"{"row":1}"#).unwrap();
+        assert_eq!(w.0, vec![b"{\"row\":1}\n".to_vec()]);
+    }
+
+    /// #4303 — the head-anchor reader never blocks on a FIFO (one hung every
+    /// db open) and never reads through a symlink or a hard link; each is
+    /// refused, which reads as a surviving anchor (fail closed).
+    #[cfg(unix)]
+    #[test]
+    fn head_anchor_reader_refuses_a_fifo_and_links_promptly_4303() {
+        let tmp = TempDir::new().unwrap();
+        let fifo = tmp.path().join("fifo.log");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("run mkfifo");
+        assert!(status.success());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let p = fifo.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(anchor_log_has_a_line(&p));
+        });
+        let fifo_verdict = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the head-anchor reader HUNG on a FIFO (#4303)");
+        assert!(fifo_verdict, "a refused FIFO fails closed");
+
+        let empty = tmp.path().join("empty.log");
+        std::fs::write(&empty, b"").unwrap();
+        let link = tmp.path().join("link.log");
+        std::os::unix::fs::symlink(&empty, &link).unwrap();
+        assert!(
+            anchor_log_has_a_line(&link),
+            "a symlink is refused (fails closed), never read through"
+        );
+        assert!(!anchor_log_has_a_line(&empty), "control: empty, no anchor");
+        let hard = tmp.path().join("hard.log");
+        std::fs::hard_link(&empty, &hard).unwrap();
+        assert!(anchor_log_has_a_line(&hard), "a hard link is refused");
+        assert!(!anchor_log_has_a_line(&tmp.path().join("absent.log")));
+    }
+
+    /// #4199 — an I/O error (here: a file that cannot be opened) is an error.
+    #[cfg(unix)]
+    #[test]
+    fn chain_tail_errors_on_an_unreadable_file_4199() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().join("forensic-2026-07-31.jsonl");
+        std::fs::write(
+            &p,
+            format!("{}\n", serde_json::to_string(&tail_row("a")).unwrap()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o200)).unwrap();
+        if std::fs::read(&p).is_ok() {
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
+            eprintln!("SKIP: permission bits do not deny reads here");
+            return;
+        }
+        let r = read_chain_tail(tmp.path());
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let err = r.expect_err("an unreadable file is an error, not genesis");
+        assert!(
+            err.downcast_ref::<ForensicTailUnreadable>().is_some(),
+            "{err:#}"
+        );
+    }
+
+    /// #4199 — `init` surfaces the typed error, writes nothing, installs no
+    /// sink (the degraded / require-mode choice is the boot path's).
+    #[test]
+    fn init_returns_the_typed_error_and_installs_no_sink_4199() {
+        let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        shutdown();
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().join("forensic-2026-07-31.jsonl");
+        std::fs::write(&p, b"not a forensic row\n").unwrap();
+        let err = init(tmp.path(), None).expect_err("nothing parses: no sink");
+        assert!(
+            err.downcast_ref::<ForensicTailUnreadable>().is_some(),
+            "{err:#}"
+        );
+        assert_eq!(std::fs::read(&p).unwrap(), b"not a forensic row\n");
+        assert!(!is_enabled(), "no sink is installed");
+    }
+
+    fn outage(path: &str, cause: &str) -> ForensicTailUnreadable {
+        ForensicTailUnreadable {
+            path: PathBuf::from(path),
+            cause: cause.to_string(),
+        }
+    }
+
+    fn outage_rows(conn: &rusqlite::Connection) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM signed_events WHERE event_type = ?1",
+            [crate::signed_events::event_types::FORENSIC_SINK_UNAVAILABLE],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// #4199 (f2r review of 15fde1499) — a stuck tail appends ONE row, not
+    /// one per invocation; a different `(path, cause)` is a new outage.
+    #[test]
+    fn outage_row_is_deduplicated_per_path_and_cause_4199() {
+        let tmp = TempDir::new().unwrap();
+        let db = tmp.path().join("m.db");
+        drop(crate::storage::open(&db).unwrap());
+        let a = outage("/x/forensic-2026-07-31.jsonl", "no parseable row");
+        assert_eq!(
+            record_forensic_sink_unavailable(&db, &a).unwrap(),
+            OutageRecord::Recorded
+        );
+        assert_eq!(
+            record_forensic_sink_unavailable(&db, &a).unwrap(),
+            OutageRecord::Duplicate
+        );
+        let b = outage("/x/forensic-2026-07-31.jsonl", "permission denied");
+        assert_eq!(
+            record_forensic_sink_unavailable(&db, &b).unwrap(),
+            OutageRecord::Recorded
+        );
+        let conn = crate::storage::open_unmigrated(&db).unwrap();
+        assert_eq!(outage_rows(&conn), 2);
+    }
+
+    /// f2r review of 36253cab6 — the dedupe window is one UTC day: a recurrence
+    /// of the same `(path, cause)` on a later day is attested again.
+    #[test]
+    fn outage_dedupe_does_not_outlive_its_day_4199() {
+        let tmp = TempDir::new().unwrap();
+        let db = tmp.path().join("m.db");
+        let conn = crate::storage::open(&db).unwrap();
+        let a = outage("/x/forensic-2026-07-31.jsonl", "no parseable row");
+        assert!(emit_forensic_sink_unavailable_on(&conn, &a, "2026-07-31").unwrap());
+        assert!(!emit_forensic_sink_unavailable_on(&conn, &a, "2026-07-31").unwrap());
+        assert!(emit_forensic_sink_unavailable_on(&conn, &a, "2026-08-01").unwrap());
+        assert_eq!(outage_rows(&conn), 2);
+    }
+
+    /// #4199 (f2r review of 15fde1499) — the recorder never creates,
+    /// bootstraps or migrates a store: an absent file stays absent and an
+    /// un-bootstrapped one gains no table.
+    #[test]
+    fn outage_recorder_never_creates_or_migrates_a_store_4199() {
+        let tmp = TempDir::new().unwrap();
+        let err = outage("/x/f.jsonl", "unreadable");
+        let absent = tmp.path().join("absent.db");
+        assert!(matches!(
+            record_forensic_sink_unavailable(&absent, &err).unwrap(),
+            OutageRecord::Skipped(_)
+        ));
+        assert!(!absent.exists(), "an absent store is not created");
+        let empty = tmp.path().join("empty.db");
+        std::fs::write(&empty, b"").unwrap();
+        assert!(matches!(
+            record_forensic_sink_unavailable(&empty, &err).unwrap(),
+            OutageRecord::Skipped(_)
+        ));
+        let conn = crate::storage::open_unmigrated(&empty).unwrap();
+        let tables: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sqlite_master", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(tables, 0, "an un-bootstrapped store is not bootstrapped");
     }
 
     #[test]

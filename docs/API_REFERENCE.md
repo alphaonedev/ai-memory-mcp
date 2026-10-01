@@ -478,9 +478,19 @@ Series an operator should wire alerts to (canonical registration:
 | `ai_memory_memories` | gauge | Corpus size. Refreshed on a paced loop (`AI_MEMORY_METRICS_GAUGE_REFRESH_SECS`, default `60`; `0` disables the loop), not per scrape. |
 | `ai_memory_memories_refreshed_at_seconds` | gauge | UNIX seconds at which the gauge above was last recomputed; `0` = never. **Not optional — alert on `time() - ai_memory_memories_refreshed_at_seconds`.** Without it a dead refresher would freeze a plausible-looking count forever, including through a mass deletion, while Prometheus `up` stayed `1`. |
 | `ai_memory_admission_shed_total` | counter | Requests shed by admission control with a typed `503`. |
+| `ai_memory_log_pipeline_active` | gauge | 1 when the configured operational log sink is installed and receiving events; 0 when logging is disabled (#3651). |
+| `ai_memory_log_records_delivered_total` | counter | Log records written to the configured sink without error. Present only while a log pipeline is active (#3651). |
+| `ai_memory_log_write_failures_total` | counter | Failed writes and flushes of the configured log sink; each lost at least one record (#3651). |
+| `ai_memory_log_queue_dropped_total` | counter | Log records dropped because the sink's worker queue was full (#3651). |
+| `ai_memory_log_last_delivery_seconds` | gauge | UNIX time of the most recent successful log delivery. Absent until the first delivery; never `0` (#3651). |
+| `ai_memory_audit_trail_active` | gauge | 1 when the flat audit trail (`[audit].enabled`) is recording in this process; 0 when auditing is off (#3975). |
+| `ai_memory_audit_records_written_total` | counter | Audit events written and flushed without error. Present only while the trail is active (#3975). |
+| `ai_memory_audit_write_failures_total` | counter | Audit writes or flushes that failed; each may be a lost event (a failed flush whose line reached the file leaves no gap). Run `ai-memory audit verify` for the actual gaps (#3975). |
+| `ai_memory_audit_last_write_seconds` | gauge | UNIX time of the most recent successful audit write. Absent until the first write; never `0` (#3975). |
 | `ai_memory_recall_embed_degraded_total` | counter | Recalls that exceeded `AI_MEMORY_RECALL_EMBED_BUDGET_MS` and degraded to keyword (#2577). |
 | `ai_memory_rerank_budget_degraded_total` | counter | Recalls whose cross-encoder stage was skipped pre-flight under `AI_MEMORY_RERANK_BUDGET_MS`, shipping the hybrid ordering (#2608). |
 | `ai_memory_query_embed_cache_hits_total` | counter | Query-embedding cache hits (#2577). |
+| `ai_memory_embed_task_failed_total{surface}` | counter | HTTP-path embed/rerank tasks run on the blocking pool that did not complete (a panic or runtime shutdown), by surface (`bulk`, `create`, `update`, `check_duplicate`, `recall`, `rerank`, `smart_load`, `reflect`). Each request degraded as on an embed failure or failed closed; any increment is a bug to investigate (#4089). |
 | `ai_memory_corrupt_provenance_rows_total{column}` | counter | Rows skipped by a discovery scan because a provenance column would not open (e.g. `encrypted_envelope`, #2383). |
 | `ai_memory_fed_quarantined_unattributed_total` | counter | Inbound relayed memories quarantined by the route-IN provenance gate (`AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED`, #2966). Always zero when the quarantine knob is off (the default); a non-zero rate means a peer is relaying provenance-less content this node is black-holing until dequarantine. Pairs with the `federation.quarantine.unattributed` WARN. |
 | `ai_memory_operator_dequarantined_total` | counter | The route-OUT twin (#2402): quarantined memories released by an OPERATOR through `ai-memory quarantine release` or `POST /api/v1/admin/quarantine/{id}/release`. Each increment also appends a `memory.dequarantined` signed-chain row naming the authenticated caller, in the same transaction as the state change; a no-op release does not increment. Pairs with the `quarantine.operator_release` WARN. |
@@ -1530,9 +1540,27 @@ through one shared funnel (`src/write_events.rs`), so the event stream is
 a complete record of writes regardless of which surface made them. Before
 #3403 no CLI verb dispatched anything, and subscribers were silently
 blind to CLI-originated writes. Delivery is fire-and-forget, so a one-shot
-CLI invocation drains the fan-out before exiting; if that drain hits its
-budget the write is still durable and each admitted delivery has a
-persisted audit row for replay-from-cursor.
+CLI invocation drains the fan-out before exiting (the daemon drains at
+shutdown too). If that drain hits its 30 s budget the write is still
+durable, and what happens to each delivery depends on whether its worker
+had started (#3979):
+
+- **Started** (holding a dispatch slot): it has a `subscription_events`
+  audit row, written before the first send, so
+  `memory_subscription_replay` re-delivers it.
+- **Not started** (queued behind `AI_MEMORY_WEBHOOK_DISPATCH_CONCURRENCY`,
+  default 32, or behind the blocking pool): it has no audit row. The drain
+  records it to `subscription_dlq` with `last_error = "shutdown_unstarted"`
+  (visible in `memory_subscription_dlq_list`) and it is never sent late.
+  If that DLQ write fails (for example the per-subscription DLQ cap), the
+  delivery is logged at ERROR and lost.
+
+The shutdown WARN reports all three counts. **A crash is not covered.**
+SIGKILL, an OOM kill or an abort before the drain loses every delivery
+that had not started, because until its worker runs a delivery exists only
+in memory (admission-time persistence is tracked in #3980). The event
+stream therefore records every write that
+*dispatched*, not every delivery a subscriber will receive.
 
 ### `POST /api/v1/subscriptions` — register webhook
 

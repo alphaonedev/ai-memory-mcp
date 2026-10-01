@@ -960,3 +960,76 @@ mod postgres_emission {
         clear_env();
     }
 }
+
+// ── #4205 — no glue after an unterminated fragment on the witness mount ────
+
+const TORN: &str = "{\"torn";
+
+fn plant(path: &std::path::Path, bytes: &str) {
+    std::fs::write(path, bytes).expect("plant a pre-existing fragment");
+}
+
+/// #4205 — a head-anchor appended after a torn, unterminated last line gets
+/// its own line and still parses as a checkpoint.
+#[test]
+fn head_anchor_is_not_glued_to_an_unterminated_fragment_4205() {
+    let _g = lock();
+    let kdir = fresh_dir("glue-anchor-keys");
+    let ddir = fresh_dir("glue-anchor-db");
+    let _kp = enrol_witness(kdir.path());
+    let log = kdir.path().join(witness::HEAD_ANCHOR_LOG_FILENAME);
+    plant(&log, TORN);
+    let (_path, conn) = open_db(ddir.path());
+    append_rows(&conn, 5);
+    force_emit_audit_head_witness(&conn);
+    let text = std::fs::read_to_string(&log).expect("read anchor log");
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(
+        lines.first(),
+        Some(&TORN),
+        "the fragment stays its own line"
+    );
+    let cp: ai_memory::models::Checkpoint =
+        serde_json::from_str(lines.last().expect("anchor line")).expect("anchor parses");
+    assert!(ai_memory::checkpoints::verify(&cp), "the anchor verifies");
+    clear_env();
+}
+
+/// #4205 control — a newline-terminated fragment gains no blank line.
+#[test]
+fn head_anchor_after_a_terminated_line_adds_no_blank_line_4205() {
+    let _g = lock();
+    let kdir = fresh_dir("glue-anchor-ctl-keys");
+    let ddir = fresh_dir("glue-anchor-ctl-db");
+    let _kp = enrol_witness(kdir.path());
+    let log = kdir.path().join(witness::HEAD_ANCHOR_LOG_FILENAME);
+    plant(&log, &format!("{TORN}\n"));
+    let (_path, conn) = open_db(ddir.path());
+    append_rows(&conn, 5);
+    force_emit_audit_head_witness(&conn);
+    let text = std::fs::read_to_string(&log).expect("read anchor log");
+    assert!(!text.contains("\n\n"), "no blank line: {text:?}");
+    clear_env();
+}
+
+/// #4205 — the operator's restore sanction, same rule.
+#[test]
+fn restore_sanction_is_not_glued_to_an_unterminated_fragment_4205() {
+    let _g = lock();
+    let kdir = fresh_dir("glue-sanction-keys");
+    let _kp = enrol_witness(kdir.path());
+    let log = kdir.path().join(witness::RESTORE_SANCTION_LOG_FILENAME);
+    plant(&log, TORN);
+    witness::append_restore_sanction("sanction-line").expect("append sanction");
+    let text = std::fs::read_to_string(&log).expect("read sanction log");
+    assert_eq!(text, format!("{TORN}\nsanction-line\n"));
+    plant(&log, &format!("{TORN}\n"));
+    witness::append_restore_sanction("sanction-line").expect("append sanction");
+    let text = std::fs::read_to_string(&log).expect("read sanction log");
+    assert_eq!(
+        text,
+        format!("{TORN}\nsanction-line\n"),
+        "control: no blank line"
+    );
+    clear_env();
+}

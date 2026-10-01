@@ -51,9 +51,13 @@
 //! Every function here is infallible and best-effort. The row is already
 //! durable when it is called; a subscriber outage, a full DLQ or a missed
 //! drain deadline must never turn a committed write into a reported
-//! failure. Delivery is additionally recoverable: the per-delivery audit
-//! row is persisted BEFORE the network send, so a K7 replay-from-cursor
-//! can re-deliver what a process exit truncated.
+//! failure. Recovery after a drain miss depends on how far the delivery
+//! got. A delivery whose worker had started has its audit row (persisted
+//! BEFORE the network send), so a K7 replay-from-cursor re-delivers it. A
+//! delivery still queued for a worker has no audit row; the drain records
+//! it to `subscription_dlq` instead (#3979). A crash skips the drain, so a
+//! delivery that had not started when the process died leaves no row at
+//! all and is lost.
 
 use std::path::Path;
 

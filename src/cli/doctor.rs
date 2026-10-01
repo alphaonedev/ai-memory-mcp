@@ -90,6 +90,9 @@ const FACT_DURABILITY_CLASS: &str = "durability_class";
 /// v1.0.0 #3553 — what an acknowledged write may lose on a POWER LOSS (not a
 /// process crash) at the live level.
 const FACT_RPO_ON_POWER_LOSS: &str = "rpo_on_power_loss";
+/// #4199 — the forensic log's chain tail (a hash prefix, `empty`, or
+/// `UNAVAILABLE`).
+const FACT_CHAIN_TAIL: &str = "chain_tail";
 /// v1.0.0 #3385 — provenance of the reported `archive_on_gc` fact:
 /// `config` (`[storage].archive_on_gc`), `legacy` (the deprecated flat key),
 /// or `compiled-default`. The value alone cannot tell an operator whether a
@@ -1599,8 +1602,25 @@ fn run_local(db_path: &Path, caller_agent_id: Option<&str>) -> Report {
     // census is folded in once the connection is open (below); until then
     // it is reported as unobservable, never as zero.
     sections.push(section_transit_encryption_3705(None));
+    // #3651 — the log sink is initialised before any command runs; a sink
+    // that cannot be built refuses every command but this one.
+    sections.push(section_logging_pipeline_3651(
+        &crate::logging::log_pipeline_status(),
+    ));
+    // #3975 — the flat audit trail of THIS process, right after the log
+    // sink: both are write-only records whose loss is otherwise silent.
+    sections.push(section_audit_trail_3975(
+        &crate::audit::audit_trail_status(),
+        audit_configured_enabled_3975(),
+    ));
     sections.push(section_peer_allowlist_3582(
         &crate::federation::peer_posture::observe(None),
+    ));
+    // #4199 / #4203 — the forensic governance log, inspected exactly as boot
+    // does: an unavailable chain tail (the sink is OFF) or a future-dated
+    // file is Critical. Filesystem only; no database needed.
+    sections.push(section_forensic_log_4199(
+        &crate::governance::audit::inspect_forensic_tail(&forensic_dir_for_doctor()),
     ));
 
     // v1.0.0 (#3264) — Postgres extension health, BEFORE the SQLite open for
@@ -2523,6 +2543,266 @@ fn section_key_posture_3717(caller_agent_id: Option<&str>) -> ReportSection {
         severity,
         facts,
         note,
+    }
+}
+
+/// #4199 — the doctor section name for the forensic governance log.
+pub const SECTION_FORENSIC_LOG: &str = "Forensic audit log (#4199)";
+
+/// The forensic directory boot uses: the parent of the resolved audit path.
+fn forensic_dir_for_doctor() -> PathBuf {
+    let audit_cfg = crate::config::AppConfig::load().effective_audit();
+    let log_path = crate::audit::resolve_audit_path(&audit_cfg);
+    log_path
+        .parent()
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
+}
+
+/// #4199 / #4203 — the forensic governance log. Critical when its chain tail
+/// cannot be established (every process then runs WITHOUT the forensic sink,
+/// or refuses under `AI_MEMORY_REQUIRE_FORENSIC_SINK`) or when a file is dated
+/// after today (never the tail, left in place as evidence).
+fn section_forensic_log_4199(
+    report: &crate::governance::audit::ForensicTailReport,
+) -> ReportSection {
+    use crate::governance::audit::{REQUIRE_FORENSIC_SINK_ENV, require_forensic_sink_enabled};
+    let require = require_forensic_sink_enabled();
+    let mut facts = vec![
+        ("directory".to_string(), report.dir.display().to_string()),
+        (
+            "require_mode".to_string(),
+            format!(
+                "{REQUIRE_FORENSIC_SINK_ENV}={}",
+                if require { "on" } else { "off" }
+            ),
+        ),
+    ];
+    let mut notes: Vec<String> = Vec::new();
+    match &report.tail {
+        Ok(None) => facts.push((
+            FACT_CHAIN_TAIL.into(),
+            "empty (the next row starts the chain)".into(),
+        )),
+        Ok(Some(hash)) => facts.push((
+            FACT_CHAIN_TAIL.into(),
+            hash.chars().take(16).collect::<String>(),
+        )),
+        Err(cause) => {
+            facts.push((FACT_CHAIN_TAIL.into(), "UNAVAILABLE".into()));
+            facts.push(("cause".into(), cause.clone()));
+            notes.push(if require {
+                "every command but `doctor` REFUSES to start (require-mode). Repair or move the \
+                 named file."
+                    .to_string()
+            } else {
+                format!(
+                    "every process runs WITHOUT the forensic sink (no forensic rows are written; \
+                     the chain is not forked). Repair or move the named file; set \
+                     {REQUIRE_FORENSIC_SINK_ENV}=1 to refuse boot instead."
+                )
+            });
+        }
+    }
+    // #4302 — a sink that cannot append drops every row. That used to show
+    // up only as a trace line from the background writer.
+    match &report.not_writable {
+        None => facts.push(("writable".into(), "yes".into())),
+        Some(cause) => {
+            facts.push(("writable".into(), "NO".into()));
+            facts.push(("write_cause".into(), cause.clone()));
+            notes.push(if require {
+                "the forensic log cannot be appended to: every command but `doctor` REFUSES to \
+                 start (require-mode). Make the directory and today's file writable."
+                    .to_string()
+            } else {
+                "the forensic log cannot be appended to: every process runs WITHOUT the \
+                 forensic sink. Make the directory and today's file writable."
+                    .to_string()
+            });
+        }
+    }
+    if !report.future_dated.is_empty() {
+        facts.push((
+            "future_dated_files".into(),
+            report
+                .future_dated
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+        ));
+        notes.push(
+            "files dated after today are never the chain tail and are left in place as \
+             evidence (#4203): find out who wrote them."
+                .to_string(),
+        );
+    }
+    let critical =
+        report.tail.is_err() || report.not_writable.is_some() || !report.future_dated.is_empty();
+    ReportSection {
+        name: SECTION_FORENSIC_LOG.into(),
+        severity: if critical {
+            Severity::Critical
+        } else {
+            Severity::Info
+        },
+        facts,
+        note: (!notes.is_empty()).then(|| notes.join(" ")),
+    }
+}
+
+/// #3651 — the operational log pipeline of THIS process. It answers whether
+/// the configured sink can be initialised, which is what decides whether
+/// every other command starts; a running daemon's live delivery counters are
+/// the `ai_memory_log_*` metrics on its `/metrics` endpoint.
+fn section_logging_pipeline_3651(status: &crate::logging::LogPipelineStatus) -> ReportSection {
+    use crate::logging::LogPipelineState;
+    const NAME: &str = "Logging pipeline (#3651)";
+    let sink = status.sink.map_or("none", crate::config::LogSink::as_str);
+    match status.state {
+        LogPipelineState::NotConfigured => ReportSection {
+            name: NAME.into(),
+            severity: Severity::Info,
+            facts: vec![(
+                "state".into(),
+                "not configured ([logging].enabled is off)".into(),
+            )],
+            note: None,
+        },
+        LogPipelineState::Active => {
+            let failures = status.write_failures.unwrap_or(0);
+            let dropped = status.queue_dropped.unwrap_or(0);
+            let last = status
+                .last_delivery_unix_ms
+                .and_then(|ms| i64::try_from(ms).ok())
+                .and_then(chrono::DateTime::from_timestamp_millis)
+                .map_or_else(|| "none yet".to_string(), |at| at.to_rfc3339());
+            let lossy = failures > 0 || dropped > 0;
+            ReportSection {
+                name: NAME.into(),
+                severity: if lossy {
+                    Severity::Warning
+                } else {
+                    Severity::Info
+                },
+                facts: vec![
+                    ("state".into(), "active".into()),
+                    ("sink".into(), sink.into()),
+                    (
+                        "records_delivered".into(),
+                        status.records_delivered.unwrap_or(0).to_string(),
+                    ),
+                    ("write_failures".into(), failures.to_string()),
+                    ("queue_dropped".into(), dropped.to_string()),
+                    ("last_delivery".into(), last),
+                    (
+                        "scope".into(),
+                        "this doctor process; a daemon reports ai_memory_log_* on /metrics".into(),
+                    ),
+                ],
+                note: lossy.then(|| {
+                    "the sink lost records in this process; stderr carries the \
+                     rate-limited reason"
+                        .into()
+                }),
+            }
+        }
+        LogPipelineState::Failed => ReportSection {
+            name: NAME.into(),
+            severity: Severity::Critical,
+            facts: vec![
+                ("state".into(), "FAILED".into()),
+                ("sink".into(), sink.into()),
+                ("error".into(), status.failure.clone().unwrap_or_default()),
+            ],
+            note: Some(
+                "every other ai-memory command refuses to start (exit 78) until the sink \
+                 is fixed, another sink is selected, or [logging].enabled = false"
+                    .into(),
+            ),
+        },
+    }
+}
+
+/// #3975 — whether `[audit].enabled` is set in the configuration this
+/// process would boot with (`false` under `AI_MEMORY_NO_CONFIG`).
+fn audit_configured_enabled_3975() -> bool {
+    let app_config = if crate::config::skip_config() {
+        crate::config::AppConfig::default()
+    } else {
+        crate::config::AppConfig::load_for_boot().unwrap_or_default()
+    };
+    app_config.effective_audit().enabled.unwrap_or(false)
+}
+
+/// #3975 — the flat audit trail of THIS process. Critical when events were
+/// lost (a write or flush failed) or when auditing is configured on but no
+/// trail is recording; `doctor` is the one command that boots past a refused
+/// trail (#3651), so it is where that state is visible. A running daemon's
+/// live counters are the `ai_memory_audit_*` metrics on its `/metrics`.
+fn section_audit_trail_3975(
+    status: &crate::audit::AuditTrailStatus,
+    configured_enabled: bool,
+) -> ReportSection {
+    use crate::audit::AuditTrailState;
+    const NAME: &str = "Audit trail (#3975)";
+    const SCOPE: &str = "this doctor process; a daemon reports ai_memory_audit_* on /metrics";
+    match status.state {
+        AuditTrailState::NotActive if !configured_enabled => ReportSection {
+            name: NAME.into(),
+            severity: Severity::Info,
+            facts: vec![(
+                "state".into(),
+                "not configured ([audit].enabled is off)".into(),
+            )],
+            note: None,
+        },
+        AuditTrailState::NotActive => ReportSection {
+            name: NAME.into(),
+            severity: Severity::Critical,
+            facts: vec![
+                ("state".into(), "NOT RECORDING".into()),
+                ("configured".into(), "[audit].enabled = true".into()),
+            ],
+            note: Some(
+                "auditing is configured on but no trail is recording in this process; \
+                 every other ai-memory command refuses to start (exit 78) until the \
+                 cause printed on stderr is fixed or [audit].enabled = false"
+                    .into(),
+            ),
+        },
+        AuditTrailState::Active => {
+            let failures = status.write_failures.unwrap_or(0);
+            let last = status
+                .last_write_unix_ms
+                .and_then(|ms| i64::try_from(ms).ok())
+                .and_then(chrono::DateTime::from_timestamp_millis)
+                .map_or_else(|| "none yet".to_string(), |at| at.to_rfc3339());
+            ReportSection {
+                name: NAME.into(),
+                severity: if failures > 0 {
+                    Severity::Critical
+                } else {
+                    Severity::Info
+                },
+                facts: vec![
+                    ("state".into(), "active".into()),
+                    (
+                        "records_written".into(),
+                        status.records_written.unwrap_or(0).to_string(),
+                    ),
+                    ("write_failures".into(), failures.to_string()),
+                    ("last_write".into(), last),
+                    ("scope".into(), SCOPE.into()),
+                ],
+                note: (failures > 0).then(|| {
+                    "audit events may have been LOST in this process (a write or \
+                     flush failed); run `ai-memory audit verify` for the actual \
+                     gaps; stderr carries the rate-limited reason"
+                        .into()
+                }),
+            }
+        }
     }
 }
 
@@ -5213,6 +5493,10 @@ mod tests {
         // inserted "Transit encryption (#3705)" after the detector (every
         // transit surface versus the mandate, the pre-upgrade detector) —
         // total is now 21.
+        // #3651 inserted "Logging pipeline (#3651)" after the transit section
+        // (the log sink is initialised before any command runs) — total is
+        // now 23. #3975 inserted "Audit trail (#3975)" right after it — total
+        // is now 24.
         //
         // #3264 note: "Postgres extensions (#3264)" is an additional CONDITIONAL
         // section — emitted only when `store_url::resolve_store_url(None)`
@@ -5222,13 +5506,14 @@ mod tests {
         // URL in the process env" here. It is NOT true that every test
         // setting one is subprocess-isolated — `src/store_url.rs`'s own
         // in-process tests set `AI_MEMORY_STORE_URL` to a `postgres://`
-        // DSN under that same lock. The count stays 21 on a SQLite
-        // deployment, which is the invariant this test pins.
+        // DSN under that same lock. The count stays at the pinned total on a
+        // SQLite deployment, which is the invariant this test pins.
         //
         // #3471 note: "Wake hub (#3471)" is UNCONDITIONAL — it reads only the
         // filesystem and this process's own RLIMIT_NOFILE, so it costs nothing
         // on a host with no hub and reports `configured = no` there.
-        assert_eq!(report.sections.len(), 22);
+        // #4199 — "Forensic audit log (#4199)" renders before the database open.
+        assert_eq!(report.sections.len(), 25);
         let names: Vec<&str> = report.sections.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(
             names,
@@ -5236,7 +5521,10 @@ mod tests {
                 "Configuration",
                 SECTION_DEPLOYMENT_SHAPE_DETECTOR,
                 SECTION_TRANSIT_ENCRYPTION,
+                "Logging pipeline (#3651)",
+                "Audit trail (#3975)",
                 "Federation peer authorization",
+                SECTION_FORENSIC_LOG,
                 "Identity",
                 SECTION_KEY_POSTURE,
                 "Storage",
@@ -6587,9 +6875,13 @@ mod tests {
         // declared-shape section is absent under skip_config), with the
         // registry signal left `unobservable` because the store never opened;
         // #3705 the transit section renders third, with the webhook census
-        // left `unobservable` for the same reason. Storage is the Critical
-        // failure.
-        assert_eq!(report.sections.len(), 7);
+        // left `unobservable` for the same reason; #3651 the logging
+        // pipeline renders fourth (it is independent of the database too);
+        // #3975 the audit trail renders fifth, for the same reason.
+        // Storage is the Critical failure.
+        // #4199 — the forensic log section is filesystem-only and renders
+        // before the database open too.
+        assert_eq!(report.sections.len(), 10);
         assert_eq!(report.sections[0].name, "Configuration");
         assert_eq!(report.sections[1].name, SECTION_DEPLOYMENT_SHAPE_DETECTOR);
         assert_eq!(
@@ -6603,17 +6895,182 @@ mod tests {
             "unobservable",
             "#3705: an unopened store is unobservable, never zero plaintext targets"
         );
-        assert_eq!(report.sections[3].name, "Federation peer authorization");
-        assert_eq!(report.sections[4].name, SECTION_IDENTITY);
+        assert_eq!(report.sections[3].name, "Logging pipeline (#3651)");
+        assert_eq!(report.sections[4].name, "Audit trail (#3975)");
+        assert_eq!(report.sections[5].name, "Federation peer authorization");
+        assert_eq!(report.sections[6].name, SECTION_FORENSIC_LOG);
+        assert_eq!(report.sections[7].name, SECTION_IDENTITY);
         // #3717 — the key posture is filesystem-only and renders even when
         // the database will not open.
-        assert_eq!(report.sections[5].name, SECTION_KEY_POSTURE);
-        let storage = &report.sections[6];
+        assert_eq!(report.sections[8].name, SECTION_KEY_POSTURE);
+        let storage = &report.sections[9];
         assert_eq!(storage.name, "Storage");
         assert_eq!(storage.severity, Severity::Critical);
         // overall is computed from the sections; Storage is Critical.
         assert_eq!(report.overall, Severity::Critical);
         assert!(storage.note.as_ref().unwrap().contains("could not open"));
+    }
+
+    // -------------------------------------------------------------------
+    // #4199 / #4203 — forensic log section
+    // -------------------------------------------------------------------
+
+    fn forensic_report(
+        tail: std::result::Result<Option<String>, String>,
+        future: &[&str],
+    ) -> crate::governance::audit::ForensicTailReport {
+        crate::governance::audit::ForensicTailReport {
+            dir: PathBuf::from("/var/lib/ai-memory/audit"),
+            tail,
+            future_dated: future.iter().map(PathBuf::from).collect(),
+            not_writable: None,
+        }
+    }
+
+    /// #4302 — a sink that cannot append is Critical, with the cause named.
+    #[test]
+    fn forensic_section_is_critical_when_the_log_is_not_writable_4302() {
+        let mut report = forensic_report(Ok(Some("ef".repeat(32))), &[]);
+        report.not_writable = Some("the forensic directory is not writable: EACCES".into());
+        let s = section_forensic_log_4199(&report);
+        assert_eq!(s.severity, Severity::Critical);
+        assert_eq!(fact(&s, "writable"), "NO");
+        assert!(fact(&s, "write_cause").contains("EACCES"));
+    }
+
+    #[test]
+    fn forensic_section_is_info_for_a_healthy_or_empty_chain_4199() {
+        for tail in [Ok(None), Ok(Some("ab".repeat(32)))] {
+            let s = section_forensic_log_4199(&forensic_report(tail, &[]));
+            assert_eq!(s.name, SECTION_FORENSIC_LOG);
+            assert_eq!(s.severity, Severity::Info);
+        }
+    }
+
+    #[test]
+    fn forensic_section_is_critical_and_names_the_cause_when_unavailable_4199() {
+        let s = section_forensic_log_4199(&forensic_report(Err("disk read failed".into()), &[]));
+        assert_eq!(s.severity, Severity::Critical);
+        assert_eq!(fact(&s, FACT_CHAIN_TAIL), "UNAVAILABLE");
+        assert_eq!(fact(&s, "cause"), "disk read failed");
+    }
+
+    #[test]
+    fn forensic_section_is_critical_for_a_future_dated_file_4203() {
+        let s = section_forensic_log_4199(&forensic_report(
+            Ok(Some("cd".repeat(32))),
+            &["/var/lib/ai-memory/audit/forensic-2099-01-01.jsonl"],
+        ));
+        assert_eq!(s.severity, Severity::Critical);
+        assert!(fact(&s, "future_dated_files").contains("forensic-2099-01-01.jsonl"));
+    }
+
+    // -------------------------------------------------------------------
+    // #3651 — logging pipeline section
+    // -------------------------------------------------------------------
+
+    fn pipeline_status(
+        state: crate::logging::LogPipelineState,
+    ) -> crate::logging::LogPipelineStatus {
+        crate::logging::LogPipelineStatus {
+            state,
+            sink: None,
+            records_delivered: None,
+            write_failures: None,
+            queue_dropped: None,
+            last_delivery_unix_ms: None,
+            failure: None,
+        }
+    }
+
+    #[test]
+    fn audit_section_severity_follows_the_trail_3975() {
+        use crate::audit::{AuditTrailState, AuditTrailStatus};
+        let off = AuditTrailStatus {
+            state: AuditTrailState::NotActive,
+            records_written: None,
+            write_failures: None,
+            last_write_unix_ms: None,
+        };
+        assert_eq!(
+            section_audit_trail_3975(&off, false).severity,
+            Severity::Info
+        );
+        let refused = section_audit_trail_3975(&off, true);
+        assert_eq!(
+            refused.severity,
+            Severity::Critical,
+            "enabled but not recording"
+        );
+        assert_eq!(fact(&refused, "state"), "NOT RECORDING");
+        let healthy = AuditTrailStatus {
+            state: AuditTrailState::Active,
+            records_written: Some(7),
+            write_failures: Some(0),
+            last_write_unix_ms: Some(1_757_000_000_000),
+        };
+        let s = section_audit_trail_3975(&healthy, true);
+        assert_eq!(s.severity, Severity::Info);
+        assert_eq!(fact(&s, "records_written"), "7");
+        let lossy = AuditTrailStatus {
+            write_failures: Some(2),
+            ..healthy
+        };
+        let s = section_audit_trail_3975(&lossy, true);
+        assert_eq!(
+            s.severity,
+            Severity::Critical,
+            "a lost event is a gap in the trail"
+        );
+        assert_eq!(fact(&s, "write_failures"), "2");
+        assert!(s.note.as_deref().unwrap_or("").contains("LOST"));
+    }
+
+    #[test]
+    fn logging_section_is_info_when_not_configured_3651() {
+        let s = section_logging_pipeline_3651(&pipeline_status(
+            crate::logging::LogPipelineState::NotConfigured,
+        ));
+        assert_eq!(s.severity, Severity::Info);
+        assert!(s.note.is_none());
+    }
+
+    #[test]
+    fn logging_section_is_critical_and_names_the_error_when_failed_3651() {
+        let mut status = pipeline_status(crate::logging::LogPipelineState::Failed);
+        status.sink = Some(crate::config::LogSink::Syslog);
+        status.failure = Some("requires a build with `--features syslog`".into());
+        let s = section_logging_pipeline_3651(&status);
+        assert_eq!(s.severity, Severity::Critical);
+        assert!(s.facts.contains(&("sink".into(), "syslog".into())));
+        assert!(
+            s.facts
+                .iter()
+                .any(|(k, v)| k == "error" && v.contains("--features syslog"))
+        );
+        assert!(s.note.as_deref().is_some_and(|n| n.contains("exit 78")));
+    }
+
+    #[test]
+    fn logging_section_warns_when_an_active_sink_lost_records_3651() {
+        let mut status = pipeline_status(crate::logging::LogPipelineState::Active);
+        status.sink = Some(crate::config::LogSink::File);
+        status.records_delivered = Some(10);
+        status.write_failures = Some(0);
+        status.queue_dropped = Some(0);
+        status.last_delivery_unix_ms = Some(1_700_000_000_000);
+        let clean = section_logging_pipeline_3651(&status);
+        assert_eq!(clean.severity, Severity::Info);
+        assert!(
+            clean
+                .facts
+                .contains(&("records_delivered".into(), "10".into()))
+        );
+
+        status.queue_dropped = Some(3);
+        let lossy = section_logging_pipeline_3651(&status);
+        assert_eq!(lossy.severity, Severity::Warning);
+        assert!(lossy.facts.contains(&("queue_dropped".into(), "3".into())));
     }
 
     // -------------------------------------------------------------------

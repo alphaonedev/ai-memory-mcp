@@ -116,6 +116,7 @@ pub mod capture_turn;
 pub mod consolidate_federation;
 pub mod coordination;
 pub mod create;
+pub mod embed_offload;
 pub mod errors;
 pub mod federation_receive;
 pub mod federation_signing_check;

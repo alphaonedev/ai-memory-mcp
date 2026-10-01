@@ -1465,3 +1465,76 @@ fn a_comment_ending_in_a_backslash_never_hides_a_writer_4148() {
     assert!(!lines.contains(&at("--title x \\")));
     assert!(!lines.contains(&at("trailing code comment \\")));
 }
+
+/// #4324 — an allowlisted migrate-only repair must not be `pub`: the B7
+/// exemption holds only because the sole callers are the open-time/ladder
+/// repair sites inside `crate::storage`, so a crate-visible-or-wider fn lets
+/// a future outside caller inherit the record-stop exemption unreviewed.
+#[test]
+fn migrate_only_repair_is_not_public_4324() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let src = fs::read_to_string(root.join("src/storage/embed_skip.rs")).expect("embed_skip.rs");
+    let decl = src
+        .lines()
+        .find(|l| l.contains("fn repair_sqlite_after_trigger_gap"))
+        .expect("repair_sqlite_after_trigger_gap must exist");
+    assert!(
+        decl.trim_start().starts_with("pub(super) fn "),
+        "#4324: allowlisted migrate-only repair must be `pub(super)`, found `{decl}`"
+    );
+}
+
+/// #4324 — does `line` mention `name` as a whole identifier (the chars on both
+/// sides are not `[A-Za-z0-9_]`)? Matches calls, fn-pointer takes, `use .. as`
+/// aliases and `name (` with a space, not just `name(`.
+fn mentions_bare_ident(line: &str, name: &str) -> bool {
+    let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    line.match_indices(name).any(|(i, m)| {
+        let before = line[..i].chars().next_back();
+        let after = line[i + m.len()..].chars().next();
+        !before.is_some_and(is_ident) && !after.is_some_and(is_ident)
+    })
+}
+
+/// #4324 — `pub(super)` alone does not pin "migrate callers only": any
+/// wrapper inside `crate::storage` could re-expose the record-stop-exempt
+/// repair, and B7 cannot see it (no write SQL in the wrapper). So pin the
+/// call sites: every non-declaration, non-comment mention must be in
+/// `src/storage/migrations.rs`, and there are exactly two today (open-time
+/// repair + ladder tail); a new site must be reviewed here.
+#[test]
+fn repair_call_sites_are_migrate_only_4324() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+    walk_rs(&root.join("src"), &mut files);
+    let mut sites: Vec<String> = Vec::new();
+    for f in &files {
+        let Ok(text) = fs::read_to_string(f) else {
+            continue;
+        };
+        let rel = rel_src(f, root);
+        for (i, line) in text.lines().enumerate() {
+            let t = line.trim_start();
+            if t.starts_with("//")
+                || !mentions_bare_ident(line, "repair_sqlite_after_trigger_gap")
+                || line.contains("fn repair_sqlite_after_trigger_gap")
+            {
+                continue;
+            }
+            sites.push(format!("{rel}:{}", i + 1));
+        }
+    }
+    let outside: Vec<&String> = sites
+        .iter()
+        .filter(|s| !s.starts_with("src/storage/migrations.rs:"))
+        .collect();
+    assert!(
+        outside.is_empty(),
+        "#4324: repair call sites outside src/storage/migrations.rs: {outside:?}"
+    );
+    assert_eq!(
+        sites.len(),
+        2,
+        "#4324: expected exactly 2 migrate call sites (open-time repair + ladder tail), got {sites:?}"
+    );
+}

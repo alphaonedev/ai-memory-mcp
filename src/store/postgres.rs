@@ -111,6 +111,8 @@ mod lifecycle_tx_3152;
 // #4025 — federated approval committed only after its effect landed. Own
 // module for the same qual_10 budget reason as `reown_3124` above.
 mod pending_approve_execute_4025;
+// #4199 A1 — the postgres forensic-sink outage recorder (qual_10 budget).
+mod forensic_outage_4199;
 
 use crate::models::field_names;
 use std::time::Duration;
@@ -3333,6 +3335,8 @@ impl PostgresStore {
             // #1955 R45 — derive the persisted record-stop state from the
             // audit chain so a stop set before this connect is honored.
             store.seed_record_stop().await;
+            // #4199 A1 — attest any forensic-sink outage the boot path deferred.
+            store.attest_deferred_forensic_outages().await;
 
             Ok(store)
         }
@@ -39303,13 +39307,11 @@ mod tests {
         );
     }
 
-    // ============================================================
-    // FX-C2-batch3 — Postgres live parity for read-only trait
+    // =====================================================    // FX-C2-batch3 — Postgres live parity for read-only trait
     // additions (list_namespaces, get_taxonomy, list_agents,
     // list_pending_actions, entity_get_by_alias, health_check,
     // stats). Gated on AI_MEMORY_TEST_POSTGRES_URL.
-    // ============================================================
-
+    // =====================================================
     #[tokio::test]
     async fn live_list_namespaces_groups_by_count() {
         let Some(url) = postgres_url() else {
@@ -42256,8 +42258,7 @@ mod tests {
         );
     }
 
-    // ===================================================================
-    // v0.9.0 coverage uplift — live-PG exercise of large `MemoryStore`
+    // ============================================================    // v0.9.0 coverage uplift — live-PG exercise of large `MemoryStore`
     // methods that had no direct in-module coverage: batch write + hybrid
     // recall, consolidate, forget (guard + archive), link listing +
     // verification, the audit-trail verifier, the AGE find-paths /
@@ -42271,8 +42272,7 @@ mod tests {
     // M-MOCKABLE-SYSCALLS / M-TAUTOLOGICAL-TESTS (assert observable
     // round-trip behaviour against the real backend, not restated
     // constants).
-    // ===================================================================
-
+    // ============================================================
     #[tokio::test]
     async fn live_cov1859_store_batch_then_recall_hybrid() {
         let Some(url) = postgres_url() else {

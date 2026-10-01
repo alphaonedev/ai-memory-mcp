@@ -143,8 +143,18 @@ mkdir -p "$INSTALL_DIR"
 # ---------------------------------------------------------------------------
 # Temp directory with cleanup
 # ---------------------------------------------------------------------------
-TMPDIR="$(mktemp -d)"
-trap 'rm -rf "$TMPDIR"' EXIT
+DOWNLOAD_DIR="$(mktemp -d)"
+STAGED_BINARY=""
+cleanup() {
+    rm -rf "$DOWNLOAD_DIR"
+    if [ -n "$STAGED_BINARY" ]; then
+        rm -f "$STAGED_BINARY"
+    fi
+}
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # ---------------------------------------------------------------------------
 # Download helper with exit-code checking
@@ -182,12 +192,12 @@ download() {
 # Download binary archive
 # ---------------------------------------------------------------------------
 echo "Downloading ${ASSET}..."
-if ! download "$RELEASE_URL" "$TMPDIR/$ASSET" "$ASSET"; then
+if ! download "$RELEASE_URL" "$DOWNLOAD_DIR/$ASSET" "$ASSET"; then
     exit 1
 fi
 
 # Print binary archive size
-FILESIZE=$(wc -c < "$TMPDIR/$ASSET" | tr -d ' ')
+FILESIZE=$(wc -c < "$DOWNLOAD_DIR/$ASSET" | tr -d ' ')
 if [ "$FILESIZE" -gt 1048576 ] 2>/dev/null; then
     SIZE_MB=$(echo "scale=1; $FILESIZE / 1048576" | bc 2>/dev/null || echo "$FILESIZE bytes")
     echo "Downloaded: ${SIZE_MB} MB"
@@ -257,7 +267,7 @@ if [ "$SKIP_CHECKSUM" = "1" ]; then
 else
     echo "Verifying checksum..."
 
-    if ! download "$CHECKSUM_URL" "$TMPDIR/${ASSET}.sha256" "checksum"; then
+    if ! download "$CHECKSUM_URL" "$DOWNLOAD_DIR/${ASSET}.sha256" "checksum"; then
         echo "Error: could not download the SHA-256 checksum for ${ASSET}:" >&2
         echo "  ${CHECKSUM_URL}" >&2
         echo "" >&2
@@ -270,7 +280,7 @@ else
         abort_unverified
     fi
 
-    EXPECTED_HASH=$(awk 'NR == 1 { print $1 }' "$TMPDIR/${ASSET}.sha256" | tr -d '\r' | tr 'A-F' 'a-f')
+    EXPECTED_HASH=$(awk 'NR == 1 { print $1 }' "$DOWNLOAD_DIR/${ASSET}.sha256" | tr -d '\r' | tr 'A-F' 'a-f')
 
     # A 200-response carrying a garbage body (captive portal, proxy error
     # page, truncated transfer) must never be mistaken for a checksum.
@@ -296,11 +306,11 @@ else
     # deliberately NOT a rung: an interpreter whose own presence and
     # version are unverified is not a supply-chain integrity tool.
     if command -v sha256sum >/dev/null 2>&1; then
-        ACTUAL_HASH=$(sha256sum "$TMPDIR/$ASSET" | awk '{ print $1 }')
+        ACTUAL_HASH=$(sha256sum "$DOWNLOAD_DIR/$ASSET" | awk '{ print $1 }')
     elif command -v shasum >/dev/null 2>&1; then
-        ACTUAL_HASH=$(shasum -a 256 "$TMPDIR/$ASSET" | awk '{ print $1 }')
+        ACTUAL_HASH=$(shasum -a 256 "$DOWNLOAD_DIR/$ASSET" | awk '{ print $1 }')
     elif command -v openssl >/dev/null 2>&1; then
-        ACTUAL_HASH=$(openssl dgst -sha256 "$TMPDIR/$ASSET" | awk '{ print $NF }')
+        ACTUAL_HASH=$(openssl dgst -sha256 "$DOWNLOAD_DIR/$ASSET" | awk '{ print $NF }')
     else
         echo "Error: no SHA-256 tool found on this host." >&2
         echo "Looked for: sha256sum, shasum, openssl." >&2
@@ -340,15 +350,15 @@ fi
 # Extract
 # ---------------------------------------------------------------------------
 echo "Extracting..."
-tar xzf "$TMPDIR/$ASSET" -C "$TMPDIR"
+tar xzf "$DOWNLOAD_DIR/$ASSET" -C "$DOWNLOAD_DIR"
 
 # ---------------------------------------------------------------------------
 # Validate extracted binary
 # ---------------------------------------------------------------------------
-if [ ! -f "$TMPDIR/$BINARY" ]; then
+if [ ! -f "$DOWNLOAD_DIR/$BINARY" ]; then
     echo "Error: Expected binary '$BINARY' not found after extraction." >&2
     echo "Archive contents:" >&2
-    ls -la "$TMPDIR/" >&2
+    ls -la "$DOWNLOAD_DIR/" >&2
     echo "" >&2
     echo "Fallback: cargo install ai-memory" >&2
     exit 1
@@ -357,33 +367,36 @@ fi
 # ---------------------------------------------------------------------------
 # Install binary
 # ---------------------------------------------------------------------------
-cp "$TMPDIR/$BINARY" "$INSTALL_DIR/$BINARY"
-chmod +x "$INSTALL_DIR/$BINARY"
-
-if [ ! -x "$INSTALL_DIR/$BINARY" ]; then
-    echo "Error: Installed binary is not executable at $INSTALL_DIR/$BINARY" >&2
+# A directory at the target would make `mv` move the candidate INSIDE it and
+# report success with the old "binary" untouched; refuse before staging anything.
+if [ -d "$INSTALL_DIR/$BINARY" ]; then
+    echo "Error: $INSTALL_DIR/$BINARY is a directory, not an executable; refusing to install over it." >&2
     exit 1
 fi
 
-# ---------------------------------------------------------------------------
-# macOS: remove Gatekeeper quarantine attribute
-# ---------------------------------------------------------------------------
-if [ "$OS" = "Darwin" ]; then
-    xattr -d com.apple.quarantine "$INSTALL_DIR/$BINARY" 2>/dev/null || true
-fi
+# Stage on the destination filesystem so publication is an atomic rename.
+# A failed copy, chmod or loader check must leave the old executable intact.
+STAGED_BINARY="$(mktemp "$INSTALL_DIR/.${BINARY}.upgrade.XXXXXX")"
+cp "$DOWNLOAD_DIR/$BINARY" "$STAGED_BINARY"
+chmod 755 "$STAGED_BINARY"
 
-# ---------------------------------------------------------------------------
-# Done
-# ---------------------------------------------------------------------------
+# Remove quarantine before testing the candidate, never after publication.
+if [ "$OS" = "Darwin" ]; then
+    xattr -d com.apple.quarantine "$STAGED_BINARY" 2>/dev/null || true
+fi
+if ! "$STAGED_BINARY" --version >/dev/null 2>&1; then
+    echo "Error: Downloaded binary cannot execute; installed binary unchanged." >&2
+    exit 1
+fi
+# Best-effort flush of the staged bytes so a power cut between the rename and
+# writeback cannot leave a zero-length executable under the final name.
+sync -- "$STAGED_BINARY" 2>/dev/null || sync 2>/dev/null || true
+mv -f "$STAGED_BINARY" "$INSTALL_DIR/$BINARY"
+STAGED_BINARY=""
+
 echo ""
 echo "Installed ${BINARY} to ${INSTALL_DIR}/${BINARY}"
-
-# Verify installation by running the binary
-if "$INSTALL_DIR/$BINARY" stats >/dev/null 2>&1; then
-    echo "Verification: binary runs successfully."
-else
-    echo "Installed successfully (could not run 'ai-memory stats' -- database may not be configured yet)."
-fi
+echo "Verification: binary runs successfully."
 
 # Check if install dir is in PATH
 case ":$PATH:" in

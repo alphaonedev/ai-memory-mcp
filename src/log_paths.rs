@@ -252,17 +252,76 @@ fn is_writable_dir(p: &Path) -> bool {
     if !p.exists() || !p.is_dir() {
         return false;
     }
-    // Probe: try to create a unique temp file in the directory; if it
-    // fails, treat the dir as not-writable. We keep this best-effort —
-    // the kernel is the source of truth and this is a hint for the
-    // resolution decision.
-    let probe = p.join(format!(".ai-memory-write-probe-{}", std::process::id()));
-    match std::fs::File::create(&probe) {
-        Ok(_) => {
-            let _ = std::fs::remove_file(&probe);
-            true
-        }
-        Err(_) => false,
+    probe_dir_writable(p).is_ok()
+}
+
+/// Prove a directory accepts new files: create a unique probe file in it and
+/// remove it again (exclusively, never through a link: #4322). The kernel is the source of truth (a 0555 directory, a
+/// read-only mount, a full quota), so this asks it rather than reading mode
+/// bits. The error is the kernel's. Shared with the forensic sink's start-up
+/// check (#4302), which must not boot a sink that cannot write.
+///
+/// # Errors
+/// The directory refuses the probe file (the OS error).
+pub(crate) fn probe_dir_writable(p: &Path) -> std::io::Result<()> {
+    // #4322 — the name is unpredictable (a v4 uuid, not the pid), so nobody
+    // can plant something at it ahead of time.
+    let name = format!(
+        ".ai-memory-write-probe-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    );
+    probe_dir_writable_at(&p.join(name))
+}
+
+/// [`probe_dir_writable`] at a given probe path. #4322 — the probe is created
+/// EXCLUSIVELY (`create_new` = O_CREAT|O_EXCL, which fails on ANY existing
+/// path, a symlink included) and never through a link (O_NOFOLLOW). The old
+/// `File::create` was O_CREAT|O_TRUNC and followed a planted symlink, so a
+/// link at the predictable name truncated whatever it pointed at (the
+/// database, a key). Only the file this call created is removed: its
+/// identity (device + inode, from the open handle) must still be what the
+/// name points at, so a name swapped in between is left alone.
+fn probe_dir_writable_at(probe: &Path) -> std::io::Result<()> {
+    probe_dir_writable_at_with(probe, |_| {})
+}
+
+/// [`probe_dir_writable_at`] with a hook run between the create and the
+/// removal (a test seam for the swapped-name case; production passes a no-op).
+fn probe_dir_writable_at_with(probe: &Path, between: impl FnOnce(&Path)) -> std::io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let created = options.open(probe)?;
+    let ours = created.metadata()?;
+    between(probe);
+    // `symlink_metadata` never follows a link; `remove_file` unlinks the NAME.
+    // `created` stays OPEN until after both: an open descriptor pins our inode,
+    // so its number cannot be handed to a file swapped in at the name. Closed
+    // first, ext4 reuses the freed number at once, the identity check matches
+    // the newcomer, and it would be deleted (r1 on de4a3bd82, OWNERSHIP-24).
+    if std::fs::symlink_metadata(probe).is_ok_and(|now| same_file(&ours, &now)) {
+        let _ = std::fs::remove_file(probe);
+    }
+    drop(created);
+    Ok(())
+}
+
+/// The same file: device and inode on unix. Elsewhere there is no inode to
+/// compare, so a regular file of the same length is taken as ours.
+fn same_file(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        a.dev() == b.dev() && a.ino() == b.ino()
+    }
+    #[cfg(not(unix))]
+    {
+        b.is_file() && a.len() == b.len()
     }
 }
 
@@ -357,6 +416,73 @@ pub fn expand_tilde(raw: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// #4322 — the write probe never follows a link planted at its name: the
+    /// exclusive create refuses an existing path, and the target is untouched.
+    #[cfg(unix)]
+    #[test]
+    fn the_write_probe_never_follows_a_planted_symlink_4322() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let victim = tmp.path().join("victim.db");
+        std::fs::write(&victim, b"precious bytes").unwrap();
+        let dir = tmp.path().join("logs");
+        std::fs::create_dir(&dir).unwrap();
+        let planted = dir.join("probe-name");
+        std::os::unix::fs::symlink(&victim, &planted).unwrap();
+        assert!(
+            probe_dir_writable_at(&planted).is_err(),
+            "an existing path at the probe name is refused, never opened"
+        );
+        assert_eq!(std::fs::read(&victim).unwrap(), b"precious bytes");
+        assert!(
+            std::fs::symlink_metadata(&planted).is_ok(),
+            "a probe this call did not create is never removed"
+        );
+    }
+
+    /// #4322 — the log-dir caller: links planted at the OLD predictable name
+    /// (`.ai-memory-write-probe-<pid>`) are never followed. Red on 4434125ca,
+    /// whose probe name was exactly that: the victim was truncated to 0.
+    #[cfg(unix)]
+    #[test]
+    fn is_writable_dir_does_not_truncate_through_a_pid_named_link_4322() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let victim = tmp.path().join("victim.db");
+        std::fs::write(&victim, b"precious bytes").unwrap();
+        let dir = tmp.path().join("logs");
+        std::fs::create_dir(&dir).unwrap();
+        std::os::unix::fs::symlink(
+            &victim,
+            dir.join(format!(".ai-memory-write-probe-{}", std::process::id())),
+        )
+        .unwrap();
+        assert!(is_writable_dir(&dir));
+        assert_eq!(std::fs::read(&victim).unwrap(), b"precious bytes");
+    }
+
+    /// #4322 — a name swapped between the probe's create and its removal (a
+    /// file someone else now owns) is NOT removed: only our own inode is.
+    #[cfg(unix)]
+    #[test]
+    fn the_probe_never_removes_a_file_it_did_not_create_4322() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let probe = tmp.path().join("probe-name");
+        probe_dir_writable_at_with(&probe, |p| {
+            std::fs::remove_file(p).unwrap();
+            std::fs::write(p, b"someone else's file").unwrap();
+        })
+        .unwrap();
+        assert_eq!(std::fs::read(&probe).unwrap(), b"someone else's file");
+    }
+
+    /// #4322 — two probes never share a name (the suffix is random).
+    #[test]
+    fn the_probe_leaves_nothing_behind_and_succeeds_twice_4322() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        probe_dir_writable(tmp.path()).unwrap();
+        probe_dir_writable(tmp.path()).unwrap();
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+    }
+
     use super::*;
 
     // Process-wide env lock + snapshot/restore `EnvGuard` are shared across all

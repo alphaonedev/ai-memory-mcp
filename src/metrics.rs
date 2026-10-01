@@ -12,6 +12,8 @@
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use prometheus::core::{Collector, Desc};
+use prometheus::proto::MetricFamily;
 use prometheus::{
     Encoder, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec,
     Registry, TextEncoder,
@@ -313,6 +315,11 @@ pub struct Metrics {
     /// quarantine used to emit nothing while `/sync/push` returned 200).
     pub federation_quarantined_unattributed: IntCounter,
 
+    /// v1.0.0 #4199 — monotonic count of process starts whose forensic
+    /// audit sink was unavailable (its chain tail could not be established),
+    /// so the process ran WITHOUT it instead of forking the chain at genesis.
+    pub forensic_sink_unavailable: IntCounter,
+
     /// v1.0.0 #3699 (5-agent vote 4d3ea1c5) — monotonic count of inbound
     /// federated memories folded into a LOCAL row of a DIFFERENT id by the
     /// newer-wins `(title, namespace)` merge (the inbound id was never
@@ -466,6 +473,15 @@ pub struct Metrics {
     /// serves no `/metrics`, so on that surface the `rerank.budget.degraded`
     /// WARN is the only channel.
     pub rerank_budget_degraded_total: IntCounter,
+
+    /// #4089 — monotonic count of HTTP-path embed / rerank tasks that ran on
+    /// the blocking pool and did not complete (the closure panicked or the
+    /// runtime was shutting down), labeled by the closed `surface` set
+    /// ([`EMBED_TASK_SURFACES`]). Every such request DEGRADES exactly as an
+    /// embed failure does (vectorless write, keyword recall, pre-rerank
+    /// ordering, keyword routing) or fails closed (`check_duplicate` 503);
+    /// the counter plus the `embed.task.failed` WARN make it observable.
+    pub embed_task_failed_total: IntCounterVec,
 
     /// #2577 — monotonic count of recall query embeddings served from the
     /// process-local cache instead of a remote round trip. Rising with
@@ -1098,6 +1114,21 @@ impl Metrics {
             &mut err,
         );
 
+        // v1.0.0 #4199 — the forensic sink was unavailable at boot (no fork).
+        let forensic_sink_unavailable = int_counter(
+            &registry,
+            "ai_memory_forensic_sink_unavailable_total",
+            "Monotonic count of forensic-log integrity events at process start: \
+             the chain tail could not be established (an I/O error, or no parseable \
+             row in any non-empty file), so the process ran WITHOUT the sink instead \
+             of forking the signed chain at genesis (#4199); or a forensic file dated \
+             after today was found and skipped (#4203); or the sink cannot append (a \
+             read-only directory or daily file at start-up, or a failed open or append \
+             that dropped a row at run time, #4302). Any non-zero value needs an \
+             operator.",
+            &mut err,
+        );
+
         // #2966 (L6 5-agent vote 4d3ea1c5) — route-IN quarantine
         // observability. The provenance gate used to flip a row to
         // lifecycle_state=quarantined and emit NOTHING while /sync/push
@@ -1310,6 +1341,20 @@ impl Metrics {
             &mut err,
         );
 
+        let embed_task_failed_total = int_counter_vec(
+            &registry,
+            "ai_memory_embed_task_failed_total",
+            "HTTP-path embed/rerank tasks run on the blocking pool that did \
+             not complete (panicked, or the runtime was shutting down), \
+             labeled by surface (#4089). Each such request degraded exactly as \
+             an embed failure does (vectorless write, keyword recall, \
+             pre-rerank ordering, keyword family routing) or failed closed \
+             (check_duplicate 503); never a wrong result. Any increment is a \
+             bug to investigate: the embedder or reranker panicked.",
+            &["surface"],
+            &mut err,
+        );
+
         let query_embed_cache_hits_total = int_counter(
             &registry,
             "ai_memory_query_embed_cache_hits_total",
@@ -1475,6 +1520,11 @@ impl Metrics {
             return Err(e);
         }
 
+        // #3651 — the operational log pipeline, read at scrape time.
+        registry.register(Box::new(LogPipelineCollector::new()?))?;
+        // #3975 — the flat audit trail's delivery, read at scrape time.
+        registry.register(Box::new(AuditTrailCollector::new()?))?;
+
         Ok(Self {
             registry,
             store_total,
@@ -1516,6 +1566,7 @@ impl Metrics {
             federation_push_dlq_legacy_positional,
             federation_erasure_superseded,
             federation_quarantined_unattributed,
+            forensic_sink_unavailable,
             federation_cross_id_title_merge,
             operator_dequarantined,
             hnsw_evictions_total,
@@ -1531,6 +1582,7 @@ impl Metrics {
             auth_backoff_episodes_total,
             recall_embed_degraded_total,
             rerank_budget_degraded_total,
+            embed_task_failed_total,
             query_embed_cache_hits_total,
             autotag_enqueued_total,
             autotag_dropped_total,
@@ -1677,6 +1729,19 @@ pub fn inc_fed_quarantined_unattributed() {
     registry().federation_quarantined_unattributed.inc();
 }
 
+/// v1.0.0 #4199 — record that this process runs without the forensic audit
+/// sink (its chain tail could not be established). Pairs with the ERROR, the
+/// doctor Critical and the signed `audit.forensic_sink_unavailable` row.
+pub fn inc_forensic_sink_unavailable() {
+    registry().forensic_sink_unavailable.inc();
+}
+
+/// v1.0.0 #4199 — read [`inc_forensic_sink_unavailable`]'s counter.
+#[must_use]
+pub fn forensic_sink_unavailable_count() -> u64 {
+    registry().forensic_sink_unavailable.get()
+}
+
 /// v1.0.0 #3124 — record `rows` caller-scoped mutations admitted on
 /// UNSTAMPED rows (`AI_MEMORY_UNSTAMPED_MUTATION=warn`). Pairs with the
 /// `authz.unstamped` WARN at the call site
@@ -1750,6 +1815,57 @@ pub fn inc_recall_embed_degraded() {
 /// channel on MCP stdio (no `/metrics` endpoint there).
 pub fn inc_rerank_budget_degraded() {
     registry().rerank_budget_degraded_total.inc();
+}
+
+/// #4089 — the closed label set of `ai_memory_embed_task_failed_total`.
+/// Bounded by construction: callers pass one of these constants, never a
+/// caller-supplied string.
+pub const EMBED_TASK_SURFACES: &[&str] = &[
+    EMBED_SURFACE_BULK,
+    EMBED_SURFACE_CREATE,
+    EMBED_SURFACE_UPDATE,
+    EMBED_SURFACE_CHECK_DUPLICATE,
+    EMBED_SURFACE_RECALL,
+    EMBED_SURFACE_RERANK,
+    EMBED_SURFACE_SMART_LOAD,
+    EMBED_SURFACE_REFLECT,
+];
+/// `POST /api/v1/memories/bulk` (both backends).
+pub const EMBED_SURFACE_BULK: &str = "bulk";
+/// `POST /api/v1/memories` (both backends).
+pub const EMBED_SURFACE_CREATE: &str = "create";
+/// `PUT /api/v1/memories/{id}` embedding regeneration (sqlite).
+pub const EMBED_SURFACE_UPDATE: &str = "update";
+/// `check_duplicate` (both backends).
+pub const EMBED_SURFACE_CHECK_DUPLICATE: &str = "check_duplicate";
+/// Recall query embedding (both backends).
+pub const EMBED_SURFACE_RECALL: &str = "recall";
+/// Recall cross-encoder rerank (both backends).
+pub const EMBED_SURFACE_RERANK: &str = "rerank";
+/// `memory_smart_load` family pick (both backends).
+pub const EMBED_SURFACE_SMART_LOAD: &str = "smart_load";
+/// `memory_reflect` reflection embedding (sqlite).
+pub const EMBED_SURFACE_REFLECT: &str = "reflect";
+
+/// #4089 — record one blocking-pool embed/rerank task that did not
+/// complete on `surface` (one of [`EMBED_TASK_SURFACES`]). Pairs with the
+/// `embed.task.failed` WARN emitted by
+/// [`crate::embeddings::report_embed_task_failure`].
+pub fn inc_embed_task_failed(surface: &'static str) {
+    registry()
+        .embed_task_failed_total
+        .with_label_values(&[surface])
+        .inc();
+}
+
+/// #4089 — read the counter for one surface. Test-only accessor pinning
+/// the observability wiring.
+#[must_use]
+pub fn embed_task_failed_count(surface: &'static str) -> u64 {
+    registry()
+        .embed_task_failed_total
+        .with_label_values(&[surface])
+        .get()
 }
 
 /// v1.0.0 #2577 — record one recall query embedding served from the
@@ -1845,6 +1961,206 @@ pub fn auto_export_spawn_failed_count() -> u64 {
     registry().auto_export_spawn_failed_total.get()
 }
 
+/// #3651 — failed writes and flushes of the operational log sink. Named by
+/// the sink's stderr diagnostic so an operator can go from one to the other.
+pub const LOG_WRITE_FAILURES_TOTAL: &str = "ai_memory_log_write_failures_total";
+
+/// #3651 — the operational log pipeline's state and delivery counters. They
+/// are owned by the worker-side writer in [`crate::logging`], so this
+/// collector reads a snapshot at scrape time rather than mirroring them into
+/// separately-updated metrics that could drift. The counters are emitted only
+/// while a pipeline is active: a number nothing measured is never exposed as
+/// zero.
+struct LogPipelineCollector {
+    active: IntGauge,
+    delivered: IntCounter,
+    write_failures: IntCounter,
+    queue_dropped: IntCounter,
+    last_delivery: IntGauge,
+    // Serialises scrapes: a counter is reset and re-set per collect.
+    scrape: std::sync::Mutex<()>,
+}
+
+impl LogPipelineCollector {
+    fn new() -> prometheus::Result<Self> {
+        Ok(Self {
+            active: IntGauge::new(
+                "ai_memory_log_pipeline_active",
+                "1 when the configured operational log sink is installed and \
+                 receiving events; 0 when logging is disabled. A sink that fails at \
+                 boot refuses the boot, so a running daemon never reports a failed \
+                 sink here; `ai-memory doctor` does (#3651).",
+            )?,
+            delivered: IntCounter::new(
+                "ai_memory_log_records_delivered_total",
+                "Log records written to the configured sink without error (#3651).",
+            )?,
+            write_failures: IntCounter::new(
+                LOG_WRITE_FAILURES_TOTAL,
+                "Failed writes and flushes of the configured log sink; each lost at \
+                 least one record (#3651).",
+            )?,
+            queue_dropped: IntCounter::new(
+                "ai_memory_log_queue_dropped_total",
+                "Log records dropped because the sink's worker queue was full (#3651).",
+            )?,
+            last_delivery: IntGauge::new(
+                "ai_memory_log_last_delivery_seconds",
+                "UNIX time of the most recent successful log delivery. Absent until \
+                 the first delivery: there is no time to report yet (#3651).",
+            )?,
+            scrape: std::sync::Mutex::new(()),
+        })
+    }
+}
+
+impl Collector for LogPipelineCollector {
+    fn desc(&self) -> Vec<&Desc> {
+        [
+            self.active.desc(),
+            self.delivered.desc(),
+            self.write_failures.desc(),
+            self.queue_dropped.desc(),
+            self.last_delivery.desc(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+
+    fn collect(&self) -> Vec<MetricFamily> {
+        self.families_for(&crate::logging::log_pipeline_status())
+    }
+}
+
+impl LogPipelineCollector {
+    /// Render `status` as metric families. A value nothing measured is
+    /// omitted, never rendered as `0`: absence is how a series says
+    /// "unknown", and a consumer does arithmetic on any number it sees.
+    fn families_for(&self, status: &crate::logging::LogPipelineStatus) -> Vec<MetricFamily> {
+        let _serialised = self
+            .scrape
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let is_active = status.state == crate::logging::LogPipelineState::Active;
+        self.active.set(i64::from(is_active));
+        let mut families = self.active.collect();
+        if !is_active {
+            return families;
+        }
+        for (counter, value) in [
+            (&self.delivered, status.records_delivered),
+            (&self.write_failures, status.write_failures),
+            (&self.queue_dropped, status.queue_dropped),
+        ] {
+            let Some(value) = value else { continue };
+            counter.reset();
+            counter.inc_by(value);
+            families.extend(counter.collect());
+        }
+        // No series until the first successful delivery. A `0` here would be
+        // 1970-01-01, so `time() - ai_memory_log_last_delivery_seconds > 300`
+        // would fire on every fresh node and then be muted.
+        if let Some(ms) = status.last_delivery_unix_ms {
+            self.last_delivery
+                .set(i64::try_from(ms / 1000).unwrap_or(i64::MAX));
+            families.extend(self.last_delivery.collect());
+        }
+        families
+    }
+}
+
+/// #3975 — the flat audit trail's state and delivery counters. Like the #3651
+/// log collector, it reads a snapshot at scrape time from the counters the
+/// writer owns (`RuntimeContext::audit.delivery`), so nothing can drift, and a
+/// value nothing measured is omitted rather than rendered as `0`.
+struct AuditTrailCollector {
+    active: IntGauge,
+    written: IntCounter,
+    write_failures: IntCounter,
+    last_write: IntGauge,
+    // Serialises scrapes: a counter is reset and re-set per collect.
+    scrape: std::sync::Mutex<()>,
+}
+
+impl AuditTrailCollector {
+    fn new() -> prometheus::Result<Self> {
+        Ok(Self {
+            active: IntGauge::new(
+                "ai_memory_audit_trail_active",
+                "1 when the flat audit trail ([audit].enabled) is recording in this \
+                 process; 0 when auditing is off. An enabled trail that cannot \
+                 initialise refuses the boot (#3651), so a running daemon reports \
+                 0 only when auditing is off (#3975).",
+            )?,
+            written: IntCounter::new(
+                "ai_memory_audit_records_written_total",
+                "Audit events written and flushed without error (#3975).",
+            )?,
+            write_failures: IntCounter::new(
+                crate::audit::AUDIT_WRITE_FAILURES_TOTAL,
+                "Audit writes or flushes that failed; each may be a lost event. A \
+                 failed flush whose line reached the file leaves no gap, so run \
+                 `ai-memory audit verify` for the actual gaps (#3975).",
+            )?,
+            last_write: IntGauge::new(
+                "ai_memory_audit_last_write_seconds",
+                "UNIX time of the most recent successful audit write. Absent until \
+                 the first write: there is no time to report yet (#3975).",
+            )?,
+            scrape: std::sync::Mutex::new(()),
+        })
+    }
+
+    /// Render `status` as metric families; a value nothing measured is
+    /// omitted, never rendered as `0`.
+    fn families_for(&self, status: &crate::audit::AuditTrailStatus) -> Vec<MetricFamily> {
+        let _serialised = self
+            .scrape
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let is_active = status.state == crate::audit::AuditTrailState::Active;
+        self.active.set(i64::from(is_active));
+        let mut families = self.active.collect();
+        if !is_active {
+            return families;
+        }
+        for (counter, value) in [
+            (&self.written, status.records_written),
+            (&self.write_failures, status.write_failures),
+        ] {
+            let Some(value) = value else { continue };
+            counter.reset();
+            counter.inc_by(value);
+            families.extend(counter.collect());
+        }
+        if let Some(ms) = status.last_write_unix_ms {
+            self.last_write
+                .set(i64::try_from(ms / 1000).unwrap_or(i64::MAX));
+            families.extend(self.last_write.collect());
+        }
+        families
+    }
+}
+
+impl Collector for AuditTrailCollector {
+    fn desc(&self) -> Vec<&Desc> {
+        [
+            self.active.desc(),
+            self.written.desc(),
+            self.write_failures.desc(),
+            self.last_write.desc(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+
+    fn collect(&self) -> Vec<MetricFamily> {
+        self.families_for(&crate::audit::audit_trail_status())
+    }
+}
+
 /// Render the current registry state to the Prometheus text exposition
 /// format. Ignores errors from the encoder (unreachable in practice) and
 /// returns an empty string — the scrape returns 200 with a possibly-empty
@@ -1925,6 +2241,109 @@ pub fn curator_cycle_completed(
 mod tests {
     use super::*;
     use crate::models::Tier;
+
+    /// #3651: an active pipeline that has not delivered yet exports NO
+    /// last-delivery series (a `0` would read as 1970-01-01), and a counter
+    /// nothing measured is omitted rather than rendered as `0`.
+    #[test]
+    fn log_pipeline_omits_values_nothing_measured_3651() {
+        use crate::logging::{LogPipelineState, LogPipelineStatus};
+        const LAST: &str = "ai_memory_log_last_delivery_seconds";
+        let names = |families: &[MetricFamily]| -> Vec<String> {
+            families.iter().map(|f| f.get_name().to_string()).collect()
+        };
+        let collector = LogPipelineCollector::new().expect("collector");
+        let mut status = LogPipelineStatus {
+            state: LogPipelineState::Active,
+            sink: None,
+            records_delivered: Some(0),
+            write_failures: Some(0),
+            queue_dropped: None,
+            last_delivery_unix_ms: None,
+            failure: None,
+        };
+
+        let before = names(&collector.families_for(&status));
+        assert!(
+            !before.iter().any(|n| n == LAST),
+            "no delivery yet: {before:?}"
+        );
+        assert!(
+            !before
+                .iter()
+                .any(|n| n == "ai_memory_log_queue_dropped_total"),
+            "an unmeasured counter is omitted: {before:?}"
+        );
+        assert!(
+            before
+                .iter()
+                .any(|n| n == "ai_memory_log_records_delivered_total")
+        );
+
+        status.last_delivery_unix_ms = Some(1_757_000_000_123);
+        let after = collector.families_for(&status);
+        let family = after
+            .iter()
+            .find(|f| f.get_name() == LAST)
+            .expect("the series appears after the first delivery");
+        let secs = family.get_metric()[0].get_gauge().get_value();
+        assert!(
+            (secs - 1_757_000_000.0).abs() < 0.5,
+            "whole seconds, got {secs}"
+        );
+
+        status.state = LogPipelineState::NotConfigured;
+        assert_eq!(
+            names(&collector.families_for(&status)),
+            vec!["ai_memory_log_pipeline_active".to_string()],
+            "a disabled pipeline reports only that it is not active"
+        );
+    }
+
+    /// #3975: an active trail that has not written yet exports NO last-write
+    /// series (a `0` would read as 1970-01-01); a disabled trail reports only
+    /// that it is not active; a failure count is exported as measured.
+    #[test]
+    fn audit_trail_omits_values_nothing_measured_3975() {
+        use crate::audit::{AuditTrailState, AuditTrailStatus};
+        const LAST: &str = "ai_memory_audit_last_write_seconds";
+        let names = |families: &[MetricFamily]| -> Vec<String> {
+            families.iter().map(|f| f.get_name().to_string()).collect()
+        };
+        let collector = AuditTrailCollector::new().expect("collector");
+        let mut status = AuditTrailStatus {
+            state: AuditTrailState::Active,
+            records_written: Some(0),
+            write_failures: Some(3),
+            last_write_unix_ms: None,
+        };
+        let before = collector.families_for(&status);
+        assert!(!names(&before).iter().any(|n| n == LAST), "no write yet");
+        let failures = before
+            .iter()
+            .find(|f| f.get_name() == crate::audit::AUDIT_WRITE_FAILURES_TOTAL)
+            .expect("the failure counter is exported while active");
+        assert!((failures.get_metric()[0].get_counter().get_value() - 3.0).abs() < f64::EPSILON);
+
+        status.last_write_unix_ms = Some(1_757_000_000_123);
+        let after = collector.families_for(&status);
+        let family = after
+            .iter()
+            .find(|f| f.get_name() == LAST)
+            .expect("the series appears after the first write");
+        let secs = family.get_metric()[0].get_gauge().get_value();
+        assert!(
+            (secs - 1_757_000_000.0).abs() < 0.5,
+            "whole seconds, got {secs}"
+        );
+
+        status.state = AuditTrailState::NotActive;
+        assert_eq!(
+            names(&collector.families_for(&status)),
+            vec!["ai_memory_audit_trail_active".to_string()],
+            "a disabled trail reports only that it is not active"
+        );
+    }
 
     #[test]
     fn registry_is_singleton() {
