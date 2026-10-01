@@ -2758,6 +2758,13 @@ impl MemoryStore for SqliteStore {
         keypair: Option<&crate::identity::keypair::AgentKeypair>,
     ) -> StoreResult<&'static str> {
         self.gate_record_stop()?;
+        // #4408 — refuse an invalid recipient before any sign or write; the
+        // shared validator never echoes the value.
+        crate::validate::validate_signal_recipient(signal.to_agent.as_deref()).map_err(|e| {
+            StoreError::InvalidInput {
+                detail: e.to_string(),
+            }
+        })?;
         // #1709 Pillar 1 — mirror `link_signed`: sign a clone when a signing
         // keypair is present, else persist the signal verbatim (unsigned).
         let conn = self.state.lock().await;
