@@ -10,33 +10,43 @@
 //! and the census the doctor Critical and the boot WARN read.
 
 use super::{PostgresStore, StoreResult, to_store_err};
-use crate::storage::{CorruptStandard, classify_standard_metadata};
+use crate::storage::{
+    CorruptStandard, StandardMetadata, classify_standard_metadata, classify_standard_metadata_value,
+};
 
 /// Backend label carried on the WARN / doctor section.
 pub(crate) const BACKEND: &str = "postgres";
 
-/// One chain level whose bound standard failed the typed deserialise: WARN
-/// (parity with the sqlite read) — the caller then marks the level severed and
-/// continues the walk.
-pub(super) fn warn_corrupt(namespace: &str, standard_id: &str, error: &serde_json::Error) {
-    // #4285 F3 — report the error CATEGORY + position only, never serde's
-    // text (it echoes the offending stored value).
-    crate::storage::warn_corrupt_standard(
-        BACKEND,
-        namespace,
-        standard_id,
-        &crate::storage::CorruptReason::from_governance_error(error),
-    );
-}
-
-/// Same WARN from an already-classified reason (the sibling walkers classify
-/// through the shared #4285 classifier).
-pub(super) fn warn_corrupt_reason(
+/// #4285 — classify one chain level for the POLICY walk: `(Some(policy), false)`
+/// intact, `(None, true)` corrupt (WARN, SEVERED: the caller floors and keeps
+/// walking), `(None, false)` no governance here.
+pub(super) fn parse_level(
     namespace: &str,
     standard_id: &str,
-    reason: &crate::storage::CorruptReason,
-) {
-    crate::storage::warn_corrupt_standard(BACKEND, namespace, standard_id, reason);
+    metadata: &serde_json::Value,
+) -> (Option<crate::models::GovernancePolicy>, bool) {
+    match classify_standard_metadata_value(metadata) {
+        StandardMetadata::Policy(p, _) => (Some(*p), false),
+        StandardMetadata::NoGovernance => (None, false),
+        StandardMetadata::Corrupt(reason) => {
+            crate::storage::warn_corrupt_standard(BACKEND, namespace, standard_id, &reason);
+            (None, true)
+        }
+    }
+}
+
+/// #4285 — classify one chain level for the approval-depth walk (shared
+/// classifier; WARN on a corrupt level, parity with the sqlite walk).
+pub(super) fn level_state(
+    namespace: &str,
+    standard_id: &str,
+    metadata: &serde_json::Value,
+) -> crate::storage::ApprovalDepthLevelState {
+    let class = classify_standard_metadata_value(metadata);
+    if let StandardMetadata::Corrupt(reason) = &class {
+        crate::storage::warn_corrupt_standard(BACKEND, namespace, standard_id, reason);
+    }
+    crate::storage::approval_depth_level_state(&class)
 }
 
 /// The census SQL: every bound standard that carries a non-null
