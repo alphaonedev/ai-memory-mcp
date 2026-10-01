@@ -102,7 +102,9 @@ pub mod age_version;
 pub mod dsn;
 // v1.0.0 #3124 R4 — the audited `reown` sweep. Own module for the same
 // qual_10 budget reason as `parity_3064` above.
+mod governance_corrupt_4285;
 mod reown_3124;
+pub use governance_corrupt_4285::list_corrupt_governance_standards_pg;
 mod swarm_rewind;
 
 use crate::models::field_names;
@@ -3310,6 +3312,7 @@ impl PostgresStore {
                 // regression refuses the connect (fail closed) unless the
                 // operator override acknowledges it.
                 store.enforce_lineage_watermarks().await?;
+                store.warn_corrupt_governance_standards_at_boot().await; // #4285
                 // v1.0.0 #2578 — self-heal the v88 composite ordering
                 // indexes on EVERY connect, not only inside the v88 arm.
                 // The arm is FAIL-OPEN (an index is derived, disposable
@@ -32229,12 +32232,22 @@ impl MemoryStore for PostgresStore {
                 }
                 Err(e) => return Err(e),
             };
-            if let Some(Ok(p)) = crate::models::GovernancePolicy::from_metadata(&mem.metadata) {
-                return Ok(Some(if severed {
-                    p.with_severed_standard_floor()
-                } else {
-                    p
-                }));
+            match crate::models::GovernancePolicy::from_metadata(&mem.metadata) {
+                Some(Ok(p)) => {
+                    return Ok(Some(if severed {
+                        p.with_severed_standard_floor()
+                    } else {
+                        p
+                    }));
+                }
+                // #4285 — a corrupt `metadata.governance` is a SEVERED level
+                // (#2503): WARN, floor the result, keep walking to an intact
+                // ancestor. Never NoPolicy, never a hard refusal.
+                Some(Err(e)) => {
+                    governance_corrupt_4285::warn_corrupt(&ns, &standard_id, &e);
+                    severed = true;
+                }
+                None => {}
             }
         }
         if severed {
@@ -32763,9 +32776,17 @@ impl MemoryStore for PostgresStore {
                 severed = true;
                 continue;
             };
-            if let Some(Ok(p)) = crate::models::GovernancePolicy::from_metadata(&m) {
-                resolved_policy = Some(p);
-                break;
+            match crate::models::GovernancePolicy::from_metadata(&m) {
+                Some(Ok(p)) => {
+                    resolved_policy = Some(p);
+                    break;
+                }
+                // #4285 — corrupt standard = SEVERED level (see the pool twin).
+                Some(Err(e)) => {
+                    governance_corrupt_4285::warn_corrupt(ns, &standard_id, &e);
+                    severed = true;
+                }
+                None => {}
             }
         }
         let resolved_policy = match (resolved_policy, severed) {

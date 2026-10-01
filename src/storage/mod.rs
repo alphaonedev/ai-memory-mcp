@@ -860,12 +860,17 @@ pub(crate) fn escape_like_pattern(s: &str) -> String {
 // historical `crate::db::*` paths used elsewhere.
 pub(crate) mod connection;
 mod governance_read;
-use governance_read::{
-    CTX_READ_NAMESPACE_STANDARD, SQL_SELECT_NAMESPACE_STANDARD_ID,
-    TRACE_TARGET_GOVERNANCE_POLICY_READ, try_get_namespace_parent, try_get_namespace_standard,
-};
+#[cfg(feature = "sal-postgres")]
+pub(crate) use governance_read::warn_corrupt_standard;
 pub use governance_read::{
-    GOVERNANCE_POLICY_UNREADABLE, resolve_governance_policy_for_optional_feature,
+    CORRUPT_STANDARD_BACKEND_POSTGRES, CORRUPT_STANDARD_BACKEND_SQLITE, CorruptStandard,
+    GOVERNANCE_POLICY_UNREADABLE, boot_warn_corrupt_governance_standards,
+    classify_standard_metadata, list_corrupt_governance_standards,
+    resolve_governance_policy_for_optional_feature, warn_corrupt_governance_standards,
+};
+use governance_read::{
+    CTX_READ_NAMESPACE_STANDARD, SQL_SELECT_NAMESPACE_STANDARD_ID, try_get_namespace_parent,
+    try_get_namespace_standard,
 };
 pub(crate) mod contamination_marker;
 pub(crate) use contamination_marker::StampAuthority;
@@ -22875,8 +22880,10 @@ enum NamespaceLevel {
     /// `standard_id IS NULL` (severed by a reap, see
     /// [`sever_namespace_standards`]) or non-NULL but naming a memory that no
     /// longer exists (a legacy dangle predating #2503, or one produced by a
-    /// raw out-of-band `DELETE`). Both mean the same thing: an operator
-    /// deliberately governed this namespace and the policy is gone.
+    /// raw out-of-band `DELETE`) — OR (#4285, reverses #1384) resolves to a
+    /// standard whose `metadata.governance` fails the typed deserialise. All
+    /// mean the same thing: an operator deliberately governed this namespace
+    /// and the policy is gone.
     Severed,
     /// A resolved, parsed policy. Most-specific wins; the walk stops here.
     Policy(Box<GovernancePolicy>),
@@ -22909,62 +22916,15 @@ fn read_namespace_level(conn: &Connection, namespace: &str) -> Result<NamespaceL
         return Ok(NamespaceLevel::Severed); // row survives, pointer severed
     };
     match get(conn, &standard_id).context(CTX_READ_NAMESPACE_STANDARD)? {
-        Some(mem) => Ok(
-            match read_policy_from_standard(namespace, &standard_id, &mem) {
-                Some(p) => NamespaceLevel::Policy(Box::new(p)),
-                None => NamespaceLevel::NoPolicy,
-            },
-        ),
+        // #4285 — a corrupt `metadata.governance` is `Severed`, not `NoPolicy`.
+        Some(mem) => Ok(governance_read::level_from_standard(
+            namespace,
+            &standard_id,
+            &mem,
+        )),
         // The row names a memory that is not there: a dangling pointer. Same
         // meaning as an explicit severance — governed, policy gone.
         None => Ok(NamespaceLevel::Severed),
-    }
-}
-
-/// Parse the policy out of an already-resolved standard memory.
-///
-/// #2503 — extracted verbatim from the former `read_namespace_policy` so the
-/// severed-aware [`read_namespace_level`] reuses the SAME #1384 parse-drift
-/// observability instead of forking a second copy of it. The parse semantics
-/// (including the WARN and the `None` fall-through) are byte-identical.
-fn read_policy_from_standard(
-    namespace: &str,
-    standard_id: &str,
-    mem: &crate::models::Memory,
-) -> Option<GovernancePolicy> {
-    match GovernancePolicy::from_metadata(&mem.metadata) {
-        Some(Ok(p)) => Some(p),
-        // #1384 — observability for stored-corruption. The write path
-        // (`memory_namespace_set_standard` → typed `GovernancePolicy`
-        // deserialise) rejects unknown enum variants and malformed
-        // structures (verified live against alice: `write: "approval"`
-        // returns a typed 400 error). A parse error here therefore
-        // means the stored JSON drifted out-of-band: direct SQL update,
-        // migration corruption, older binary writing newer schema,
-        // etc. Pre-#1384 this arm silently returned `None` and the
-        // inheritance walk continued to the parent — which may be
-        // totally permissive, silently downgrading the operator's
-        // intent. Surface the drift via tracing WARN so operators
-        // can grep `ai_memory::governance::policy_read` for the lag.
-        // We still return `None` (don't fail-CLOSED at the read site
-        // — that could lock callers out of unrelated namespaces) but
-        // operators now have a structured signal to investigate.
-        Some(Err(parse_err)) => {
-            tracing::warn!(
-                target: TRACE_TARGET_GOVERNANCE_POLICY_READ,
-                namespace = %namespace,
-                standard_id = %standard_id,
-                error = %parse_err,
-                "stored metadata.governance failed typed deserialise — \
-                 inheritance walk will continue past this namespace as \
-                 if no policy were set. Likely cause: direct SQL update, \
-                 older binary, or corrupted migration. Operator should \
-                 re-run `memory_namespace_set_standard` to restore the \
-                 typed shape."
-            );
-            None
-        }
-        None => None,
     }
 }
 

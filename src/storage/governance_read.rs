@@ -137,3 +137,159 @@ pub(super) fn unreadable_policy_decision(
         "governance policy for namespace '{namespace}' could not be read; refusing (#4043)"
     )))
 }
+
+// ---------------------------------------------------------------------------
+// #4285 (5-agent vote 4d3ea1c5, memory 1c3e2889; reverses #1384) — a governance
+// standard whose `metadata.governance` does not deserialize is a SEVERED level
+// (#2503), never `NoPolicy` and never a hard refusal.
+// ---------------------------------------------------------------------------
+
+/// Backend label for the sqlite corrupt-standard WARN / doctor section.
+pub const CORRUPT_STANDARD_BACKEND_SQLITE: &str = "sqlite";
+/// Backend label for the postgres corrupt-standard WARN / doctor section.
+pub const CORRUPT_STANDARD_BACKEND_POSTGRES: &str = "postgres";
+
+/// #4285 — one namespace whose bound standard carries a `metadata.governance`
+/// blob that fails the typed deserialise.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CorruptStandard {
+    /// The namespace the standard is bound to.
+    pub namespace: String,
+    /// The standard memory id.
+    pub standard_id: String,
+    /// The typed-deserialise error.
+    pub error: String,
+}
+
+/// #4285 — the ONE classifier of a standard's metadata: `Some` iff
+/// `metadata.governance` is present and does not deserialize. Shared by the
+/// sqlite and postgres census so the two cannot disagree on "corrupt".
+#[must_use]
+pub fn classify_standard_metadata(
+    namespace: &str,
+    standard_id: &str,
+    metadata: &serde_json::Value,
+) -> Option<CorruptStandard> {
+    match GovernancePolicy::from_metadata(metadata) {
+        Some(Err(e)) => Some(CorruptStandard {
+            namespace: namespace.to_string(),
+            standard_id: standard_id.to_string(),
+            error: e.to_string(),
+        }),
+        Some(Ok(_)) | None => None,
+    }
+}
+
+/// #4285 — structured WARN for one corrupt standard met while resolving. The
+/// walk continues as a SEVERED level (Owner floor). Shared by both backends.
+pub(crate) fn warn_corrupt_standard(
+    backend: &str,
+    namespace: &str,
+    standard_id: &str,
+    error: &dyn std::fmt::Display,
+) {
+    tracing::warn!(
+        target: TRACE_TARGET_GOVERNANCE_POLICY_READ,
+        backend = %backend,
+        namespace = %namespace,
+        standard_id = %standard_id,
+        error = %error,
+        "stored metadata.governance failed typed deserialise — treated as a SEVERED \
+         standard (#2503): the walk continues and write/promote/delete resolve to at \
+         least the Owner floor (#4285). A policy that meant stricter than Owner \
+         (approve/consensus) is degraded to Owner until repaired. Re-run \
+         `memory_namespace_set_standard` for this namespace to restore the typed shape."
+    );
+}
+
+/// #4285 — a resolved standard memory's contribution to the chain walk.
+pub(super) fn level_from_standard(
+    namespace: &str,
+    standard_id: &str,
+    mem: &super::Memory,
+) -> super::NamespaceLevel {
+    match GovernancePolicy::from_metadata(&mem.metadata) {
+        Some(Ok(p)) => super::NamespaceLevel::Policy(Box::new(p)),
+        Some(Err(e)) => {
+            warn_corrupt_standard(CORRUPT_STANDARD_BACKEND_SQLITE, namespace, standard_id, &e);
+            super::NamespaceLevel::Severed
+        }
+        None => super::NamespaceLevel::NoPolicy,
+    }
+}
+
+/// #4285 — every namespace (sorted) whose bound standard is corrupt: the
+/// doctor Critical and the boot WARN read this.
+///
+/// # Errors
+///
+/// A read fault (never reported as "none corrupt").
+pub fn list_corrupt_governance_standards(conn: &Connection) -> Result<Vec<CorruptStandard>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT nm.namespace, m.id, m.metadata FROM namespace_meta nm \
+             INNER JOIN memories m ON m.id = nm.standard_id \
+             WHERE json_extract(m.metadata, '$.governance') IS NOT NULL \
+             ORDER BY nm.namespace ASC",
+        )
+        .context("governance: prepare corrupt-standard census")?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })
+        .context("governance: corrupt-standard census")?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("governance: read corrupt-standard census")?;
+    let mut out = Vec::new();
+    for (ns, id, meta) in rows {
+        match serde_json::from_str::<serde_json::Value>(&meta) {
+            Ok(v) => out.extend(classify_standard_metadata(&ns, &id, &v)),
+            Err(e) => out.push(CorruptStandard {
+                namespace: ns,
+                standard_id: id,
+                error: format!("metadata is not valid JSON: {e}"),
+            }),
+        }
+    }
+    Ok(out)
+}
+
+/// #4285 — boot WARN naming EVERY corrupt standard (one summary line; silent
+/// when none). Best-effort by contract: the census never gates boot.
+pub fn warn_corrupt_governance_standards(backend: &str, corrupt: &[CorruptStandard]) {
+    if corrupt.is_empty() {
+        return;
+    }
+    let listing = corrupt
+        .iter()
+        .map(|c| format!("{} (standard {}: {})", c.namespace, c.standard_id, c.error))
+        .collect::<Vec<_>>()
+        .join("; ");
+    tracing::warn!(
+        target: TRACE_TARGET_GOVERNANCE_POLICY_READ,
+        backend = %backend,
+        count = corrupt.len(),
+        namespaces = %listing,
+        "{} namespace governance standard(s) are CORRUPT (metadata.governance does not \
+         deserialize) and resolve as SEVERED (Owner floor, #4285) — repair each with \
+         `memory_namespace_set_standard`; `ai-memory doctor` reports this as Critical",
+        corrupt.len()
+    );
+}
+
+/// #4285 — the sqlite boot hook (serve + MCP stdio): census then WARN.
+/// Best-effort — a census fault is itself a WARN, never a boot failure.
+pub fn boot_warn_corrupt_governance_standards(conn: &Connection) {
+    match list_corrupt_governance_standards(conn) {
+        Ok(c) => warn_corrupt_governance_standards(CORRUPT_STANDARD_BACKEND_SQLITE, &c),
+        Err(e) => tracing::warn!(
+            target: TRACE_TARGET_GOVERNANCE_POLICY_READ,
+            error = %e,
+            "corrupt governance standard census could not be read at boot (#4285)"
+        ),
+    }
+}
