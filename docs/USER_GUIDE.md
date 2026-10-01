@@ -77,7 +77,7 @@ Your AI assistant uses these tools automatically during conversations. You can a
 
 ## MCP Tool Reference
 
-This section documents the MCP tools with their exact parameter schemas, example requests, and response formats. **The surface advertises 103 entries at `--profile full`** (102 callable "memory tools" + the always-on `memory_capabilities` bootstrap — both numbers are intentional; see issue [#862](https://github.com/alphaonedev/ai-memory-mcp/issues/862) for the disambiguation). Default `--profile core` exposes 7 (the original 5 + `memory_load_family` + `memory_smart_load`) plus the always-on `memory_capabilities`. Canonical counts on the [evidence page](https://alphaonedev.github.io/ai-memory-mcp/evidence.html) and asserted by `Profile::full().expected_tool_count()` in `src/profile.rs`. All tools are invoked via JSON-RPC 2.0 using method `tools/call` with the tool name in `params.name` and tool parameters in `params.arguments`.
+This section presents selected MCP tools, selected parameters, and example response formats. For complete declared input schemas, call `memory_capabilities` with `{"family":"core","include_schema":true,"verbose":true}`; select the relevant family for other tools. Declared schemas do not by themselves enumerate undocumented dynamic handler behavior. **The surface advertises 103 entries at `--profile full`** (102 callable "memory tools" + the always-on `memory_capabilities` bootstrap — both numbers are intentional; see issue [#862](https://github.com/alphaonedev/ai-memory-mcp/issues/862) for the disambiguation). Default `--profile core` exposes 7 (the original 5 + `memory_load_family` + `memory_smart_load`) plus the always-on `memory_capabilities`. Canonical counts on the [evidence page](https://alphaonedev.github.io/ai-memory-mcp/evidence.html) and asserted by `Profile::full().expected_tool_count()` in `src/profile.rs`. All tools are invoked via JSON-RPC 2.0 using method `tools/call` with the tool name in `params.name` and tool parameters in `params.arguments`.
 
 `tools/list` descriptions are a compacted gist (32-byte preferred cut, extend to 80 on a dangling last token). Verbose per-tool docs and full schemas live in `memory_capabilities { verbose: true }` — optionally with `family` and `include_schema` to drill one family. The compact `memory_capabilities` label on the wire is `Discover runtime capabilities; full per-tool docs: verbose=true`.
 
@@ -101,7 +101,7 @@ On error, the envelope includes `"isError": true` and the text contains the erro
 
 Store a new memory. Deduplicates by title+namespace -- if a memory with the same title and namespace already exists, it updates the existing memory instead of creating a duplicate.
 
-**Parameters:**
+**Parameters (selected — 9 of the 23 fields `StoreRequest` declares):**
 
 | Name | Type | Required | Default | Description |
 |------|------|----------|---------|-------------|
@@ -168,7 +168,7 @@ Store a new memory. Deduplicates by title+namespace -- if a memory with the same
 
 Recall memories relevant to a context. Uses fuzzy OR matching, ranked by a composite score of relevance + priority + access frequency + confidence + tier boost + recency decay. At semantic tier and above, uses hybrid scoring (semantic + keyword blending).
 
-**Parameters:**
+**Parameters (selected — 7 of the 20 fields `RecallRequest` declares):**
 
 | Name | Type | Required | Default | Description |
 |------|------|----------|---------|-------------|
@@ -237,7 +237,7 @@ a1b2c3d4-...|Project uses PostgreSQL 15|long|my-app|8|0.763|database
 
 Search memories by exact keyword match with AND semantics (all terms must match).
 
-**Parameters:**
+**Parameters (selected — 7 of the 9 fields `SearchRequest` declares):**
 
 | Name | Type | Required | Default | Description |
 |------|------|----------|---------|-------------|
@@ -281,7 +281,7 @@ Search memories by exact keyword match with AND semantics (all terms must match)
 
 List memories, optionally filtered by namespace or tier.
 
-**Parameters:**
+**Parameters (selected — 4 of the 6 fields `ListRequest` declares):**
 
 | Name | Type | Required | Default | Description |
 |------|------|----------|---------|-------------|
