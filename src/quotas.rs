@@ -1198,11 +1198,11 @@ pub fn get_aggregate_status(conn: &Connection, agent_id: &str) -> Result<QuotaSt
                 COALESCE(MIN(day_started_at), ''),
                 COALESCE(MIN(created_at), ''),
                 COALESCE(MAX(updated_at), '')
-             FROM agent_quotas WHERE agent_id = ?1 AND namespace <> '_notify'",
+             FROM agent_quotas WHERE agent_id = ?1 AND namespace <> ?2",
         )
         .context("failed to prepare aggregate quota query")?;
     let row: Option<(i64, i64, i64, i64, i64, i64, String, String, String)> = stmt
-        .query_row(params![agent_id], |r| {
+        .query_row(params![agent_id, NOTIFY_AGGREGATE_NAMESPACE], |r| {
             Ok((
                 r.get(0)?,
                 r.get(1)?,
