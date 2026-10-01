@@ -174,6 +174,34 @@ fn canonical_json(v: &Value, out: &mut String) {
     }
 }
 
+/// Narrowness of ABSENCE: the narrowest visibility setting there is.
+const NARROWNESS_ABSENT: u8 = u8::MAX;
+/// An unrecognised token or a non-string value reads as owner-private.
+const NARROWNESS_UNKNOWN: u8 = NARROWNESS_ABSENT - 1;
+
+/// How narrow a PRESENT visibility value is (larger = narrower), the tie-break
+/// of the visibility register at an equal version. Only `scope` has an order;
+/// every other visibility key (the agent-id grants) returns `0` and falls to
+/// the fingerprint. Mirrors `visibility::classify_scope`.
+fn visibility_narrowness(path: &str, v: &Value) -> u8 {
+    use super::namespace::MemoryScope;
+    if path != child_path("", crate::META_KEY_SCOPE) {
+        return 0;
+    }
+    let Some(raw) = v.as_str() else {
+        return NARROWNESS_UNKNOWN;
+    };
+    match MemoryScope::from_str(raw) {
+        Some(MemoryScope::Private) => NARROWNESS_UNKNOWN - 1,
+        Some(MemoryScope::Team) => NARROWNESS_UNKNOWN - 2,
+        Some(MemoryScope::Unit) => NARROWNESS_UNKNOWN - 3,
+        Some(MemoryScope::Org) => NARROWNESS_UNKNOWN - 4,
+        Some(MemoryScope::Collective) => NARROWNESS_UNKNOWN - 5,
+        None if crate::visibility::is_legacy_broad_scope(raw) => NARROWNESS_UNKNOWN - 5,
+        None => NARROWNESS_UNKNOWN,
+    }
+}
+
 /// 64-bit fingerprint (hex) of a JSON value's canonical rendering.
 fn fingerprint(v: &Value) -> String {
     let mut s = String::new();
@@ -609,11 +637,11 @@ impl FieldClockMerge {
             }
             let path = child_path("", key);
             let (l, r) = (local.get(key), remote.get(key));
-            // A visibility key is a version-only register unless an operand
-            // carries an object there (a forged shape: the generic join handles it).
-            let register = absence_versioned.contains(&key)
-                && !l.is_some_and(Value::is_object)
-                && !r.is_some_and(Value::is_object);
+            // A visibility key is ALWAYS a register, whatever the value shape:
+            // an object (a forged non-string `scope`) is an opaque register
+            // value, never routed to the generic join, where a one-sided
+            // presence survives and a later scalar beats the object (r11 F1).
+            let register = absence_versioned.contains(&key);
             let merged = if register {
                 self.merge_register_with_absence(&path, l, r)
             } else {
@@ -627,13 +655,18 @@ impl FieldClockMerge {
     }
 
     /// A top-level key as an LWW register whose values include ABSENCE.
-    /// Order: `(version, absent-first, fingerprint)` — the attestation rank is
-    /// deliberately NOT part of it (f2r, rank laundering): a rank read from
-    /// the merged row would let a value that landed in an attested row carry
-    /// rank 1 into the next merge, making the verdict depend on the merge
-    /// grouping and failing OPEN. At an exactly equal version the ABSENCE
-    /// wins, so an equal-clock collision fails CLOSED (narrower) in every
-    /// grouping.
+    /// Order: `(version, narrowness, fingerprint)`, a total order over the
+    /// candidates, so the join stays commutative, associative and idempotent.
+    /// The attestation rank is deliberately NOT part of it (f2r, rank
+    /// laundering): a rank read from the merged row would let a value that
+    /// landed in an attested row carry rank 1 into the next merge, making the
+    /// verdict depend on the merge grouping and failing OPEN. At an equal
+    /// version the NARROWER setting wins (r11 F2): an absence first, then an
+    /// unrecognised or non-string value (both read as owner-private), then
+    /// `private`, `team`, `unit`, `org`, and `collective` / the legacy broad
+    /// set last; the fingerprint is only the final tie-break (the agent-id
+    /// keys, which have no narrowness order). An equal-clock collision
+    /// therefore fails CLOSED in every grouping.
     fn merge_register_with_absence(
         &mut self,
         path: &str,
@@ -641,8 +674,16 @@ impl FieldClockMerge {
         r: Option<&Value>,
     ) -> Option<Merged> {
         let cand = |side: &Side, v: Option<&Value>| match v {
-            Some(v) => (side.node_ver(path, v), 0_u8, fingerprint(v)),
-            None => (side.absent_ver(path), 1_u8, ABSENT_FP.to_string()),
+            Some(v) => (
+                side.node_ver(path, v),
+                visibility_narrowness(path, v),
+                fingerprint(v),
+            ),
+            None => (
+                side.absent_ver(path),
+                NARROWNESS_ABSENT,
+                ABSENT_FP.to_string(),
+            ),
         };
         let lc = cand(&self.local, l);
         let rc = cand(&self.remote, r);

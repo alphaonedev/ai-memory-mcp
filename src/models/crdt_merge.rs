@@ -98,15 +98,23 @@
 //! * an object/scalar flip at the same microsecond is not associative (the
 //!   flip is decided by `(version, rank, fingerprint)`, and which floor is
 //!   recorded depends on grouping);
-//! * the visibility keys fail CLOSED at a tie: an absence beats a presence
-//!   at an equal VERSION, whatever the attestation rank of either row; two
-//!   different PRESENT values tie-break on their fingerprint (deterministic,
-//!   not "most restrictive"). The visibility register compares version only
+//! * the visibility keys fail CLOSED at a tie: at an equal VERSION an absence
+//!   beats any presence, whatever the attestation rank of either row, and two
+//!   different PRESENT `scope` values resolve to the NARROWER one (an
+//!   unrecognised or non-string value, then `private`, `team`, `unit`, `org`,
+//!   and `collective` / the legacy broad set last), so an equal-microsecond
+//!   `private` vs `collective` ends private in every grouping; only the
+//!   agent-id keys, which have no narrowness order, fall to the value
+//!   fingerprint (deterministic, not "most restrictive"). The visibility
+//!   register compares `(version, narrowness, fingerprint)` and never the rank
 //!   because the rank is read from the MERGED row's `attest_level`: a value
-//!   that landed in an attested row would carry rank 1 into the next merge
-//!   and the verdict would then depend on the merge grouping (f2r, rank
+//!   that landed in an attested row would carry rank 1 into the next merge and
+//!   the verdict would then depend on the merge grouping (f2r, rank
 //!   laundering; cell
-//!   `pure_visibility_register_never_fails_open_by_grouping_rank_laundering`);
+//!   `pure_visibility_register_never_fails_open_by_grouping_rank_laundering`).
+//!   The register applies to EVERY value shape: an object at a visibility key
+//!   is an opaque register value, never routed to the generic join (r11 F1:
+//!   there a one-sided presence survives and a later scalar beats the object);
 //! * the same rank laundering leaves an associativity residual for the
 //!   NON-visibility keys at an equal clock: with `a = {u:20, k:"x"}`,
 //!   `b = {u:20, attested}` and `c = {u:21, k:"y", leaf /k@20}`, `(a|b)|c`

@@ -1054,6 +1054,240 @@ async fn sqlite_rank_laundering_converges_private_in_every_order_f2r() {
     rank_laundering_converges_private_in_every_order(&Backend::Sqlite).await;
 }
 
+// -------------------- r11 retest: object-shaped keys and equal-version scope ---
+
+/// Every join of three operands: all six permutations, left and right fold.
+fn all_groupings(first: &Memory, second: &Memory, third: &Memory) -> Vec<(String, Memory)> {
+    use ai_memory::models::merge_memory as join;
+    let ops = [("1st", first), ("2nd", second), ("3rd", third)];
+    let perms: [[usize; 3]; 6] = [
+        [0, 1, 2],
+        [0, 2, 1],
+        [1, 0, 2],
+        [1, 2, 0],
+        [2, 0, 1],
+        [2, 1, 0],
+    ];
+    let mut out = Vec::new();
+    for perm in perms {
+        let (lhs, mid, rhs) = (ops[perm[0]], ops[perm[1]], ops[perm[2]]);
+        out.push((
+            format!("({}|{})|{}", lhs.0, mid.0, rhs.0),
+            join(&join(lhs.1, mid.1), rhs.1),
+        ));
+        out.push((
+            format!("{}|({}|{})", lhs.0, mid.0, rhs.0),
+            join(lhs.1, &join(mid.1, rhs.1)),
+        ));
+    }
+    out
+}
+
+/// The row reads as owner-private: no `scope`, `private`, or a value the
+/// visibility classifier reads as private (non-string).
+fn scope_reads_private(m: &Memory) -> bool {
+    match m.metadata.get("scope") {
+        Some(Value::String(s)) => s == "private",
+        // Absent, or a non-string the classifier reads as owner-private.
+        _ => true,
+    }
+}
+
+/// r11 F2: an equal-microsecond EXPLICIT `private` vs `collective` must end
+/// private in every grouping (it used to end collective: the fingerprint of
+/// "collective" sorts above "private").
+#[test]
+fn r11_equal_usec_explicit_private_vs_collective_every_grouping() {
+    use ai_memory::models::merge_memory as join;
+    let collective = mem_at(&t(20), json!({"scope": "collective"}));
+    let private = mem_at(&t(20), json!({"scope": "private"}));
+    let attested = mem_at(
+        &t(20),
+        json!({"scope": "collective", "attest_level": "agent_attested"}),
+    );
+    let absent = mem_at(&t(20), json!({}));
+    let mut bad = Vec::new();
+    for (name, m) in [
+        ("c|p", join(&collective, &private)),
+        ("p|c", join(&private, &collective)),
+        ("ca|p", join(&attested, &private)),
+        ("p|ca", join(&private, &attested)),
+    ] {
+        if !scope_reads_private(&m) {
+            bad.push(format!("{name}: {}", m.metadata));
+        }
+    }
+    for (name, m) in all_groupings(&collective, &private, &absent)
+        .into_iter()
+        .chain(all_groupings(&attested, &private, &collective))
+    {
+        if !scope_reads_private(&m) {
+            bad.push(format!("3-operand {name}: {}", m.metadata));
+        }
+    }
+    assert!(
+        bad.is_empty(),
+        "equal-microsecond tie failed OPEN: {bad:#?}"
+    );
+}
+
+/// The narrowness order at an equal version, narrowest first.
+#[test]
+fn r11_equal_version_scope_resolves_to_the_narrower_one() {
+    use ai_memory::models::merge_memory as join;
+    let ladder = ["private", "team", "unit", "org", "collective"];
+    for (narrow_idx, narrow) in ladder.iter().enumerate() {
+        for wide in &ladder[narrow_idx + 1..] {
+            let low = mem_at(&t(20), json!({"scope": narrow}));
+            let high = mem_at(&t(20), json!({"scope": wide}));
+            for m in [join(&low, &high), join(&high, &low)] {
+                assert_eq!(
+                    m.metadata.get("scope"),
+                    Some(&json!(narrow)),
+                    "{narrow} vs {wide} at an equal version must end {narrow}"
+                );
+            }
+        }
+    }
+    // A legacy broad token is as wide as `collective`.
+    let legacy = mem_at(&t(20), json!({"scope": "shared"}));
+    let org = mem_at(&t(20), json!({"scope": "org"}));
+    for m in [join(&legacy, &org), join(&org, &legacy)] {
+        assert_eq!(m.metadata.get("scope"), Some(&json!("org")));
+    }
+}
+
+/// An equal-microsecond absence vs `collective`, attested or not, in every grouping.
+#[test]
+fn r11_equal_usec_absent_vs_collective_every_grouping() {
+    let collective = mem_at(&t(20), json!({"scope": "collective"}));
+    let attested = mem_at(
+        &t(20),
+        json!({"scope": "collective", "attest_level": "agent_attested"}),
+    );
+    let absent = mem_at(&t(20), json!({}));
+    let absent_attested = mem_at(&t(20), json!({"attest_level": "agent_attested"}));
+    let mut bad = Vec::new();
+    for (name, m) in all_groupings(&collective, &absent, &attested)
+        .into_iter()
+        .chain(all_groupings(&collective, &absent_attested, &attested))
+        .chain(all_groupings(&attested, &absent, &absent_attested))
+    {
+        if m.metadata.get("scope").is_some() {
+            bad.push(format!("{name}: {}", m.metadata));
+        }
+    }
+    assert!(bad.is_empty(), "absence lost at an equal version: {bad:#?}");
+}
+
+/// r11 F1: an OBJECT at a visibility key used to bypass the absence register
+/// (the generic join keeps a one-sided presence), wiping the newer absence's
+/// version; a later stale honest presence then beat the object.
+#[test]
+fn r11_object_shape_detour_scope_every_grouping() {
+    let owner_private = mem_at(&t(30), json!({}));
+    let forged_object = mem_at(&t(10), json!({"scope": {"x": 1}}));
+    let stale_collective = mem_at(&t(20), json!({"scope": "collective"}));
+    let mut bad = Vec::new();
+    for (name, m) in all_groupings(&owner_private, &forged_object, &stale_collective) {
+        if !scope_reads_private(&m) {
+            bad.push(format!("{name}: {}", m.metadata));
+        }
+    }
+    assert!(bad.is_empty(), "object-shape detour failed OPEN: {bad:#?}");
+}
+
+#[test]
+fn r11_object_shape_detour_target_every_grouping() {
+    let revoked = mem_at(&t(30), json!({"scope": "private"}));
+    let forged_object = mem_at(
+        &t(10),
+        json!({"scope": "private", "target_agent_id": {"x": 1}}),
+    );
+    let stale_share = mem_at(
+        &t(20),
+        json!({"scope": "private", "target_agent_id": "ai:bob"}),
+    );
+    let mut bad = Vec::new();
+    for (name, m) in all_groupings(&revoked, &forged_object, &stale_share) {
+        if m.metadata.get("target_agent_id").and_then(Value::as_str) == Some("ai:bob") {
+            bad.push(format!("{name}: {}", m.metadata));
+        }
+    }
+    assert!(bad.is_empty(), "revoked share resurrected: {bad:#?}");
+}
+
+/// A forged clock map cannot raise a version above its row, and a forged
+/// absence leaf can only make the forger's own absence lose.
+#[test]
+fn r11_forged_leaf_cannot_beat_newer_absence() {
+    use ai_memory::models::merge_memory as join;
+    let collective_fp = blake3::hash(b"\"collective\"").to_hex().as_str()[..16].to_string();
+    let owner_private = mem_at(&t(30), json!({}));
+    let forged = mem_at(
+        &t(20),
+        json!({"scope": "collective",
+               "crdt_field_clocks": clock_map(20, &[("/scope", 59, collective_fp.as_str())])}),
+    );
+    let forged_row = mem_at(
+        &t(20),
+        json!({"scope": "collective",
+               "crdt_field_clocks": clock_map(59, &[("/scope", 59, collective_fp.as_str())])}),
+    );
+    for stale in [&forged, &forged_row] {
+        for m in [join(&owner_private, stale), join(stale, &owner_private)] {
+            assert!(
+                m.metadata.get("scope").is_none(),
+                "forged leaf won: {}",
+                m.metadata
+            );
+        }
+    }
+}
+
+async fn object_shape_detour_converges_private(backend: &Backend) {
+    let peer = uniq("ai:peer-r11");
+    let ns = uniq("fit-r11");
+    let _posture = Posture::new(&peer, &ns);
+    let rows = [
+        mem_at(&t(30), json!({})),
+        mem_at(&t(10), json!({"scope": {"x": 1}})),
+        mem_at(&t(20), json!({"scope": "collective"})),
+    ];
+    let orders: [[usize; 3]; 6] = [
+        [0, 1, 2],
+        [0, 2, 1],
+        [1, 0, 2],
+        [1, 2, 0],
+        [2, 0, 1],
+        [2, 1, 0],
+    ];
+    let mut bad = Vec::new();
+    for order in orders {
+        let node_under_test = node(backend).await;
+        let id = uniq("mr11");
+        for idx in order {
+            let mut wire = serde_json::to_value(&rows[idx]).expect("serialize");
+            wire["id"] = json!(id);
+            wire["namespace"] = json!(ns);
+            wire["title"] = json!(format!("merge convergence probe {id}"));
+            wire["metadata"]["agent_id"] = json!(peer);
+            node_under_test.push(&peer, &wire).await;
+        }
+        let got = node_under_test.read(&id).await;
+        if !scope_reads_private(&got) {
+            bad.push(format!("{order:?}: {}", got.metadata));
+        }
+    }
+    assert!(bad.is_empty(), "backend detour failed OPEN: {bad:#?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r11_sqlite_object_shape_detour() {
+    let _g = FED_ENV_LOCK.lock().await;
+    object_shape_detour_converges_private(&Backend::Sqlite).await;
+}
+
 // ---------------------------------------------------------- postgres -----
 
 #[cfg(feature = "sal-postgres")]
@@ -1116,6 +1350,14 @@ mod pg {
         let _g = FED_ENV_LOCK.lock().await;
         let Some(backend) = pg_backend() else { return };
         rank_laundering_converges_private_in_every_order(&backend).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs AI_MEMORY_TEST_POSTGRES_URL"]
+    async fn r11_pg_object_shape_detour() {
+        let _g = FED_ENV_LOCK.lock().await;
+        let Some(backend) = pg_backend() else { return };
+        object_shape_detour_converges_private(&backend).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
