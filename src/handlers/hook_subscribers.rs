@@ -480,6 +480,34 @@ async fn set_namespace_standard_inner(
             );
         }
 
+        // #4356 — the ancestor-owner gate on a FIRST bind, BEFORE any write this
+        // arm performs (the placeholder store would otherwise land first). Same
+        // shared verdict as every other funnel; the adapter re-runs it in-tx as
+        // the fail-closed floor. A read fault refuses.
+        if !ctx.bypass_visibility {
+            let ancestor = if crate::ns_standard_ancestor::needs_ancestor(&current_binding) {
+                match app.store.namespace_governing_ancestor(ns).await {
+                    Ok(a) => a,
+                    Err(e) => return store_err_to_response(e),
+                }
+            } else {
+                crate::ns_standard_ancestor::GoverningAncestor::None
+            };
+            if let Err(refusal) = crate::ns_standard_ancestor::set_admission(
+                caller_principal,
+                false,
+                ns,
+                &current_binding,
+                &ancestor,
+            ) {
+                return crate::handlers::parity::owner_gate_refusal(
+                    crate::ns_standard_ancestor::refusal_reason(refusal),
+                    Some(caller_principal),
+                    crate::handlers::parity::RefusedResource::Namespace(ns),
+                );
+            }
+        }
+
         // #2542 — resolve the DECLARED parent's currently-bound standard memory
         // so the bind gate can refuse a graft onto a parent chain the caller
         // does not own (a tenant-isolation + approval-bypass hazard). Fetch it
@@ -662,37 +690,26 @@ async fn set_namespace_standard_inner(
     // in the victim's namespace for a caller the bind then refuses. Same
     // predicate as CLEAR and as the MCP funnel this arm delegates to (which
     // re-runs it as the fail-closed floor); a read fault refuses.
-    {
-        let binding = match db::namespace_standard_binding(&lock.0, ns) {
-            Ok(b) => b,
-            Err(e) => {
-                drop(lock);
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(json!({"error": format!(
-                        "cannot verify the current namespace-standard owner (error={e}); \
-                         refusing the bind rather than treating the standard as unowned"
-                    )})),
-                )
-                    .into_response();
-            }
-        };
-        if crate::visibility::namespace_standard_mutation_admission(
-            &caller,
-            caller == sentinels::DAEMON_PRINCIPAL,
-            ns,
-            &binding,
-            crate::visibility::NamespaceStandardOp::Set,
-        )
-        .is_err()
-        {
-            drop(lock);
-            return crate::handlers::parity::owner_gate_refusal(
-                crate::errors::msg::CALLER_DOES_NOT_OWN_NAMESPACE_STANDARD,
+    // #4356 — plus the ancestor-owner gate on a first bind (shared verdict).
+    if let Err(refusal) = crate::storage::ns_standard_ancestor::set_admission_conn(
+        &lock.0,
+        &caller,
+        caller == sentinels::DAEMON_PRINCIPAL,
+        ns,
+    ) {
+        drop(lock);
+        return match refusal {
+            crate::ns_standard_ancestor::SetRefusal::Unverifiable => (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": crate::ns_standard_ancestor::refusal_reason(refusal)})),
+            )
+                .into_response(),
+            _ => crate::handlers::parity::owner_gate_refusal(
+                crate::ns_standard_ancestor::refusal_reason(refusal),
                 Some(caller.as_str()),
                 crate::handlers::parity::RefusedResource::Namespace(ns),
-            );
-        }
+            ),
+        };
     }
     let resolved_id = if let Some(id) = body.id.clone() {
         id
