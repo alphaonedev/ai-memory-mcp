@@ -390,7 +390,7 @@ if ! "$STAGED_BINARY" --version >/dev/null 2>&1; then
 fi
 # Best-effort flush of the staged bytes so a power cut between the rename and
 # writeback cannot leave a zero-length executable under the final name.
-sync 2>/dev/null || true
+sync -- "$STAGED_BINARY" 2>/dev/null || sync 2>/dev/null || true
 mv -f "$STAGED_BINARY" "$INSTALL_DIR/$BINARY"
 STAGED_BINARY=""
 

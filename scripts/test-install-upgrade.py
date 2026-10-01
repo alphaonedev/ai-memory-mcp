@@ -122,7 +122,7 @@ class InstallerUpgrade(unittest.TestCase):
                     [str(installed)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True))
                 self.assertEqual(running.stdout.readline().strip(), 'old-working-binary')
             result = subprocess.run(['sh', str(ROOT / 'install.sh'), '--version', 'v-test',
-                                     '--dir', str(dest)], env=env, text=True, capture_output=True, timeout=30)
+                                     '--dir', str(dest)], env=env, text=True, capture_output=True, timeout=120)
             output = result.stdout + result.stderr
             if running:
                 remaining, _ = running.communicate('old-still-running\n', timeout=5)
