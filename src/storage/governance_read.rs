@@ -16,6 +16,9 @@ pub(crate) const SQL_SELECT_NAMESPACE_STANDARD_ID: &str =
     "SELECT standard_id FROM namespace_meta WHERE namespace = ?1";
 /// Tracing target for governance-policy read drift / faults (#1384, #4043).
 pub(crate) const TRACE_TARGET_GOVERNANCE_POLICY_READ: &str = "ai_memory::governance::policy_read";
+/// #4285 — the RAW `metadata` column of a standard memory (classified
+/// Rust-side; the lenient row mapper defaults an unparseable cell to `{}`).
+const SQL_SELECT_STANDARD_RAW_METADATA: &str = "SELECT m.metadata FROM memories m WHERE m.id = ?1";
 /// #4043 — context attached when a governance policy / threshold cannot be
 /// read and the governed action is refused.
 pub const GOVERNANCE_POLICY_UNREADABLE: &str = "governance policy unreadable (#4043 fail-CLOSED)";
@@ -161,23 +164,210 @@ pub struct CorruptStandard {
     pub error: String,
 }
 
-/// #4285 — the ONE classifier of a standard's metadata: `Some` iff
-/// `metadata.governance` is present and does not deserialize. Shared by the
-/// sqlite and postgres census so the two cannot disagree on "corrupt".
+/// #4285 — why a bound standard's metadata is corrupt. The `Display` text is a
+/// FIXED category (+ line/column when serde reports one): it NEVER carries the
+/// stored value, because serde's own error text echoes the offending token
+/// (`invalid type: string "..."`) and this text flows to WARN logs, the doctor
+/// report and `doctor --json`. The stored `metadata.governance` is out-of-band,
+/// caller-influenced data (#4285 F3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CorruptReason {
+    /// The whole `metadata` cell is not parseable JSON.
+    MetadataNotJson {
+        /// serde error category (`io`/`syntax`/`data`/`eof`).
+        category: &'static str,
+        /// 1-based line, 0 when unknown.
+        line: usize,
+        /// 1-based column, 0 when unknown.
+        column: usize,
+    },
+    /// The whole `metadata` cell is valid JSON but not an object (array,
+    /// string, number, bool, null).
+    MetadataNotObject,
+    /// `metadata.governance` is present but fails the typed deserialise.
+    GovernanceShape {
+        /// serde error category.
+        category: &'static str,
+        /// 1-based line, 0 when unknown.
+        line: usize,
+        /// 1-based column, 0 when unknown.
+        column: usize,
+    },
+}
+
+fn serde_category(e: &serde_json::Error) -> &'static str {
+    use serde_json::error::Category;
+    match e.classify() {
+        Category::Io => "io",
+        Category::Syntax => "syntax",
+        Category::Data => "data",
+        Category::Eof => "eof",
+    }
+}
+
+impl CorruptReason {
+    /// Value-free reason for a `metadata.governance` typed-deserialise failure.
+    #[must_use]
+    pub fn from_governance_error(e: &serde_json::Error) -> Self {
+        Self::GovernanceShape {
+            category: serde_category(e),
+            line: e.line(),
+            column: e.column(),
+        }
+    }
+
+    fn from_metadata_error(e: &serde_json::Error) -> Self {
+        Self::MetadataNotJson {
+            category: serde_category(e),
+            line: e.line(),
+            column: e.column(),
+        }
+    }
+}
+
+impl std::fmt::Display for CorruptReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MetadataNotJson {
+                category,
+                line,
+                column,
+            } => write!(
+                f,
+                "metadata is not valid JSON ({category} error, line {line}, column {column})"
+            ),
+            Self::MetadataNotObject => f.write_str("metadata is not a JSON object"),
+            Self::GovernanceShape {
+                category,
+                line,
+                column,
+            } => write!(
+                f,
+                "metadata.governance does not deserialize ({category} error, line {line}, \
+                 column {column})"
+            ),
+        }
+    }
+}
+
+/// #4285 — what a bound standard's metadata contributes to governance. The
+/// ONE classification every walker and census shares (sqlite AND postgres), so
+/// they cannot disagree on "corrupt".
+#[derive(Debug, Clone, PartialEq)]
+pub enum StandardMetadata {
+    /// Intact metadata with no (or a null) `governance` key: no policy here.
+    NoGovernance,
+    /// An intact, typed policy together with its raw `governance` blob (the
+    /// off-struct knobs such as `require_approval_above_depth` live only there).
+    Policy(Box<GovernancePolicy>, serde_json::Value),
+    /// Corrupt: a SEVERED level (#2503). It contributes NOTHING — no typed
+    /// policy and no raw key — and the walk continues.
+    Corrupt(CorruptReason),
+}
+
+/// #4285 — classify a parsed `metadata` value. Anything that is not a JSON
+/// object, or whose `governance` blob fails the typed deserialise, is
+/// `Corrupt`.
+#[must_use]
+pub fn classify_standard_metadata_value(metadata: &serde_json::Value) -> StandardMetadata {
+    if !metadata.is_object() {
+        return StandardMetadata::Corrupt(CorruptReason::MetadataNotObject);
+    }
+    match GovernancePolicy::from_metadata(metadata) {
+        None => StandardMetadata::NoGovernance,
+        Some(Ok(p)) => {
+            let raw = metadata
+                .get(crate::META_KEY_GOVERNANCE)
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            StandardMetadata::Policy(Box::new(p), raw)
+        }
+        Some(Err(e)) => StandardMetadata::Corrupt(CorruptReason::from_governance_error(&e)),
+    }
+}
+
+/// #4285 — classify the RAW stored `metadata` text of a bound standard. This is
+/// the reusable fail-closed classifier (#4356 reuses it): the lenient row mapper
+/// defaults unparseable metadata to `{}`, which reads as "no policy" — fail
+/// OPEN — so a governance read must classify the raw column, not the mapped
+/// `Memory.metadata`.
+#[must_use]
+pub fn classify_standard_metadata_text(raw: &str) -> StandardMetadata {
+    match serde_json::from_str::<serde_json::Value>(raw) {
+        Ok(v) => classify_standard_metadata_value(&v),
+        Err(e) => StandardMetadata::Corrupt(CorruptReason::from_metadata_error(&e)),
+    }
+}
+
+/// #4285 — census projection of [`classify_standard_metadata_value`]: `Some`
+/// iff the standard is corrupt.
 #[must_use]
 pub fn classify_standard_metadata(
     namespace: &str,
     standard_id: &str,
     metadata: &serde_json::Value,
 ) -> Option<CorruptStandard> {
-    match GovernancePolicy::from_metadata(metadata) {
-        Some(Err(e)) => Some(CorruptStandard {
+    corrupt_standard_of(
+        namespace,
+        standard_id,
+        classify_standard_metadata_value(metadata),
+    )
+}
+
+fn corrupt_standard_of(
+    namespace: &str,
+    standard_id: &str,
+    class: StandardMetadata,
+) -> Option<CorruptStandard> {
+    match class {
+        StandardMetadata::Corrupt(reason) => Some(CorruptStandard {
             namespace: namespace.to_string(),
             standard_id: standard_id.to_string(),
-            error: e.to_string(),
+            error: reason.to_string(),
         }),
-        Some(Ok(_)) | None => None,
+        StandardMetadata::NoGovernance | StandardMetadata::Policy(..) => None,
     }
+}
+
+/// #4285 — read the RAW `metadata` text of a standard memory (`Ok(None)` when
+/// the row is gone). A read fault is an `Err` (refuse), never an absence.
+pub(super) fn read_raw_standard_metadata(
+    conn: &Connection,
+    standard_id: &str,
+) -> Result<Option<String>> {
+    use rusqlite::OptionalExtension;
+    let raw: Option<Option<String>> = conn
+        .query_row(
+            SQL_SELECT_STANDARD_RAW_METADATA,
+            params![standard_id],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .context("governance: read standard metadata")?;
+    // A NULL metadata cell is "not an object": hand the classifier a non-object.
+    Ok(raw.map(|m| m.unwrap_or_else(|| "null".to_string())))
+}
+
+/// #4285 — classify the bound standard `standard_id` of `namespace`, WARN-ing on
+/// corruption. `Ok(None)` when the memory is gone.
+pub(super) fn classify_bound_standard(
+    conn: &Connection,
+    namespace: &str,
+    standard_id: &str,
+) -> Result<Option<StandardMetadata>> {
+    let Some(raw) = read_raw_standard_metadata(conn, standard_id)? else {
+        return Ok(None);
+    };
+    let class = classify_standard_metadata_text(&raw);
+    if let StandardMetadata::Corrupt(reason) = &class {
+        warn_corrupt_standard(
+            CORRUPT_STANDARD_BACKEND_SQLITE,
+            namespace,
+            standard_id,
+            reason,
+        );
+    }
+    Ok(Some(class))
 }
 
 /// #4285 — structured WARN for one corrupt standard met while resolving. The
@@ -186,15 +376,15 @@ pub(crate) fn warn_corrupt_standard(
     backend: &str,
     namespace: &str,
     standard_id: &str,
-    error: &dyn std::fmt::Display,
+    reason: &CorruptReason,
 ) {
     tracing::warn!(
         target: TRACE_TARGET_GOVERNANCE_POLICY_READ,
         backend = %backend,
         namespace = %namespace,
         standard_id = %standard_id,
-        error = %error,
-        "stored metadata.governance failed typed deserialise — treated as a SEVERED \
+        reason = %reason,
+        "stored governance standard is corrupt — treated as a SEVERED \
          standard (#2503): the walk continues and write/promote/delete resolve to at \
          least the Owner floor (#4285). A policy that meant stricter than Owner \
          (approve/consensus) is degraded to Owner until repaired. Re-run \
@@ -202,20 +392,43 @@ pub(crate) fn warn_corrupt_standard(
     );
 }
 
-/// #4285 — a resolved standard memory's contribution to the chain walk.
-pub(super) fn level_from_standard(
+/// #4285 — `Some(reason)` iff the standard memory's RAW metadata is corrupt
+/// (read surface twin of the enforcement classification). A read fault is an
+/// `Err`.
+///
+/// # Errors
+///
+/// The metadata read fault.
+pub fn standard_metadata_corruption(
+    conn: &Connection,
+    standard_id: &str,
+) -> Result<Option<CorruptReason>> {
+    Ok(match read_raw_standard_metadata(conn, standard_id)? {
+        Some(raw) => match classify_standard_metadata_text(&raw) {
+            StandardMetadata::Corrupt(reason) => Some(reason),
+            StandardMetadata::NoGovernance | StandardMetadata::Policy(..) => None,
+        },
+        None => None,
+    })
+}
+
+/// #4285 — the raw `governance` blob of a bound standard for the SIBLING
+/// walkers (approval-depth gate, skill-promotion floor), `Some` ONLY when the
+/// standard is intact. A corrupt standard is a SEVERED level: it neither stops
+/// the walk nor contributes a raw key (an unparseable policy's fields are not
+/// honoured), so the walker continues to the ancestor. `None` also covers "no
+/// governance here" and a vanished row — the walker continues in both cases.
+pub(super) fn intact_governance_blob(
+    conn: &Connection,
     namespace: &str,
     standard_id: &str,
-    mem: &super::Memory,
-) -> super::NamespaceLevel {
-    match GovernancePolicy::from_metadata(&mem.metadata) {
-        Some(Ok(p)) => super::NamespaceLevel::Policy(Box::new(p)),
-        Some(Err(e)) => {
-            warn_corrupt_standard(CORRUPT_STANDARD_BACKEND_SQLITE, namespace, standard_id, &e);
-            super::NamespaceLevel::Severed
-        }
-        None => super::NamespaceLevel::NoPolicy,
-    }
+) -> Result<Option<serde_json::Value>> {
+    Ok(
+        match classify_bound_standard(conn, namespace, standard_id)? {
+            Some(StandardMetadata::Policy(_, raw)) => Some(raw),
+            Some(StandardMetadata::NoGovernance | StandardMetadata::Corrupt(_)) | None => None,
+        },
+    )
 }
 
 /// #4285 — every namespace (sorted) whose bound standard is corrupt: the
@@ -225,37 +438,46 @@ pub(super) fn level_from_standard(
 ///
 /// A read fault (never reported as "none corrupt").
 pub fn list_corrupt_governance_standards(conn: &Connection) -> Result<Vec<CorruptStandard>> {
+    // No SQL-side `json_extract` filter: it ERRORS on a metadata cell that is
+    // not valid JSON, which is exactly the corruption this census must name.
+    // Classification happens Rust-side on the raw text.
+    Ok(bound_standard_classes(conn)?
+        .into_iter()
+        .filter_map(|(ns, id, class)| corrupt_standard_of(&ns, &id, class))
+        .collect())
+}
+
+/// #4285 — every bound standard (sorted by namespace) with its metadata
+/// classification, read from the RAW column. Shared by the census and the
+/// capabilities rule summary.
+pub(super) fn bound_standard_classes(
+    conn: &Connection,
+) -> Result<Vec<(String, String, StandardMetadata)>> {
     let mut stmt = conn
         .prepare(
             "SELECT nm.namespace, m.id, m.metadata FROM namespace_meta nm \
              INNER JOIN memories m ON m.id = nm.standard_id \
-             WHERE json_extract(m.metadata, '$.governance') IS NOT NULL \
              ORDER BY nm.namespace ASC",
         )
-        .context("governance: prepare corrupt-standard census")?;
+        .context("governance: prepare bound-standard census")?;
     let rows = stmt
         .query_map([], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
+                r.get::<_, Option<String>>(2)?,
             ))
         })
-        .context("governance: corrupt-standard census")?
+        .context("governance: bound-standard census")?
         .collect::<rusqlite::Result<Vec<_>>>()
-        .context("governance: read corrupt-standard census")?;
-    let mut out = Vec::new();
-    for (ns, id, meta) in rows {
-        match serde_json::from_str::<serde_json::Value>(&meta) {
-            Ok(v) => out.extend(classify_standard_metadata(&ns, &id, &v)),
-            Err(e) => out.push(CorruptStandard {
-                namespace: ns,
-                standard_id: id,
-                error: format!("metadata is not valid JSON: {e}"),
-            }),
-        }
-    }
-    Ok(out)
+        .context("governance: read bound-standard census")?;
+    Ok(rows
+        .into_iter()
+        .map(|(ns, id, meta)| {
+            let class = classify_standard_metadata_text(meta.as_deref().unwrap_or("null"));
+            (ns, id, class)
+        })
+        .collect())
 }
 
 /// #4285 — boot WARN naming EVERY corrupt standard (one summary line; silent

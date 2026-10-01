@@ -19,7 +19,14 @@ pub(crate) const BACKEND: &str = "postgres";
 /// (parity with the sqlite read) — the caller then marks the level severed and
 /// continues the walk.
 pub(super) fn warn_corrupt(namespace: &str, standard_id: &str, error: &serde_json::Error) {
-    crate::storage::warn_corrupt_standard(BACKEND, namespace, standard_id, error);
+    // #4285 F3 — report the error CATEGORY + position only, never serde's
+    // text (it echoes the offending stored value).
+    crate::storage::warn_corrupt_standard(
+        BACKEND,
+        namespace,
+        standard_id,
+        &crate::storage::CorruptReason::from_governance_error(error),
+    );
 }
 
 /// The census SQL: every bound standard that carries a non-null

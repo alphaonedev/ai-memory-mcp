@@ -863,10 +863,12 @@ mod governance_read;
 #[cfg(feature = "sal-postgres")]
 pub(crate) use governance_read::warn_corrupt_standard;
 pub use governance_read::{
-    CORRUPT_STANDARD_BACKEND_POSTGRES, CORRUPT_STANDARD_BACKEND_SQLITE, CorruptStandard,
-    GOVERNANCE_POLICY_UNREADABLE, boot_warn_corrupt_governance_standards,
-    classify_standard_metadata, list_corrupt_governance_standards,
-    resolve_governance_policy_for_optional_feature, warn_corrupt_governance_standards,
+    CORRUPT_STANDARD_BACKEND_POSTGRES, CORRUPT_STANDARD_BACKEND_SQLITE, CorruptReason,
+    CorruptStandard, GOVERNANCE_POLICY_UNREADABLE, StandardMetadata,
+    boot_warn_corrupt_governance_standards, classify_standard_metadata,
+    classify_standard_metadata_text, classify_standard_metadata_value,
+    list_corrupt_governance_standards, resolve_governance_policy_for_optional_feature,
+    standard_metadata_corruption, warn_corrupt_governance_standards,
 };
 use governance_read::{
     CTX_READ_NAMESPACE_STANDARD, SQL_SELECT_NAMESPACE_STANDARD_ID, try_get_namespace_parent,
@@ -22896,17 +22898,26 @@ fn read_namespace_level(conn: &Connection, namespace: &str) -> Result<NamespaceL
     let Some(standard_id) = bound else {
         return Ok(NamespaceLevel::Severed); // row survives, pointer severed
     };
-    match get(conn, &standard_id).context(CTX_READ_NAMESPACE_STANDARD)? {
-        // #4285 — a corrupt `metadata.governance` is `Severed`, not `NoPolicy`.
-        Some(mem) => Ok(governance_read::level_from_standard(
-            namespace,
-            &standard_id,
-            &mem,
-        )),
+    // `get` keeps the #4043 fail-closed decrypt / read-fault contract and detects
+    // a dangling pointer; the metadata is then classified from the RAW column
+    // (#4285) because the lenient row mapper defaults an unparseable cell to
+    // `{}`, which would read as NoPolicy — fail OPEN.
+    if get(conn, &standard_id)
+        .context(CTX_READ_NAMESPACE_STANDARD)?
+        .is_none()
+    {
         // The row names a memory that is not there: a dangling pointer. Same
         // meaning as an explicit severance — governed, policy gone.
-        None => Ok(NamespaceLevel::Severed),
+        return Ok(NamespaceLevel::Severed);
     }
+    Ok(
+        match governance_read::classify_bound_standard(conn, namespace, &standard_id)? {
+            Some(StandardMetadata::Policy(p, _)) => NamespaceLevel::Policy(p),
+            Some(StandardMetadata::NoGovernance) => NamespaceLevel::NoPolicy,
+            // #4285 — corrupt metadata (incl. non-object) is `Severed`.
+            Some(StandardMetadata::Corrupt(_)) | None => NamespaceLevel::Severed,
+        },
+    )
 }
 
 /// Resolve the governance policy that gates actions in `namespace`.
@@ -23090,13 +23101,17 @@ pub fn resolve_require_approval_above_depth(
         let Some(standard_id) = try_get_namespace_standard(conn, &level)? else {
             continue;
         };
-        let Some(mem) = get(conn, &standard_id).context(CTX_READ_NAMESPACE_STANDARD)? else {
+        if get(conn, &standard_id)
+            .context(CTX_READ_NAMESPACE_STANDARD)?
+            .is_none()
+        {
             continue;
-        };
-        // Governance blob must exist and not be null.
-        let gov = match mem.metadata.get(crate::META_KEY_GOVERNANCE) {
-            Some(g) if !g.is_null() => g,
-            _ => continue,
+        }
+        // #4285 — only an INTACT standard speaks. A corrupt level is SEVERED:
+        // it neither stops the walk nor contributes a raw key; continue to the
+        // ancestor (whose gate must not be silently dropped).
+        let Some(gov) = governance_read::intact_governance_blob(conn, &level, &standard_id)? else {
+            continue;
         };
         // The field is optional inside the blob — `None` means skip this
         // level and keep walking (inherit semantics: an ancestor that sets
@@ -23124,9 +23139,7 @@ pub fn resolve_require_approval_above_depth(
         // key → no gate; stop walking (same leaf-first-wins semantics as
         // the main resolve_governance_policy walker: a leaf policy that
         // doesn't set the field takes precedence over a parent that does).
-        if GovernancePolicy::from_metadata(&mem.metadata).is_some() {
-            return Ok(None);
-        }
+        return Ok(None);
     }
     Ok(None)
 }
@@ -23166,12 +23179,17 @@ pub fn resolve_skill_promotion_min_depth(
         let Some(standard_id) = try_get_namespace_standard(conn, &level)? else {
             continue;
         };
-        let Some(mem) = get(conn, &standard_id).context(CTX_READ_NAMESPACE_STANDARD)? else {
+        if get(conn, &standard_id)
+            .context(CTX_READ_NAMESPACE_STANDARD)?
+            .is_none()
+        {
             continue;
-        };
-        let gov = match mem.metadata.get(crate::META_KEY_GOVERNANCE) {
-            Some(g) if !g.is_null() => g,
-            _ => continue,
+        }
+        // #4285 — only an INTACT standard speaks. A corrupt level is SEVERED:
+        // it neither stops the walk nor contributes a raw key; continue to the
+        // ancestor (whose gate must not be silently dropped).
+        let Some(gov) = governance_read::intact_governance_blob(conn, &level, &standard_id)? else {
+            continue;
         };
         if let Some(threshold) = gov.get("skill_promotion_min_depth") {
             if let Some(n) = threshold.as_u64() {
@@ -23194,9 +23212,7 @@ pub fn resolve_skill_promotion_min_depth(
         }
         // Policy found at this level but no skill_promotion_min_depth
         // key → no override; stop walking (leaf-first-wins semantics).
-        if GovernancePolicy::from_metadata(&mem.metadata).is_some() {
-            return Ok(None);
-        }
+        return Ok(None);
     }
     Ok(None)
 }

@@ -243,11 +243,13 @@ mod pg {
 
     async fn live() -> Option<PostgresStore> {
         let url = pg_url()?;
+        // #4285 F5 — a URL that IS set must connect: a stale tunnel or wrong
+        // server may never turn a pg cell into a vacuous green skip. Only an
+        // UNSET URL skips (reported on stderr, per the repo convention).
         match PostgresStore::connect(&url).await {
             Ok(s) => Some(s),
             Err(e) => {
-                eprintln!("skip: PostgresStore::connect failed: {e}");
-                None
+                panic!("AI_MEMORY_TEST_POSTGRES_URL is set but PostgresStore::connect failed: {e}")
             }
         }
     }
