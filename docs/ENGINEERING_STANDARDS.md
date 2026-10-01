@@ -215,8 +215,7 @@ Run against the compiled binary via CLI. Covers all 26 CLI commands with edge ca
 | Custom overrides | `--ttl-secs`, `--expires-at` |
 | GC behavior | Removes expired, preserves non-expired, archives before deletion |
 | TTL refresh on recall | Short: rolling +1h window. Mid: +1d extension |
-| Auto-promotion | Mid-to-long at 5+ accesses, expires_at cleared |
-| Priority reinforcement | +1 every 10 accesses (max 10) |
+| No access-driven promotion | Access past the historical `PROMOTION_THRESHOLD` leaves tier and priority unchanged (Boids item 1) |
 | Tier protection | Downgrade silently blocked, upgrades allowed |
 | Upsert semantics | Duplicate title preserves higher tier |
 

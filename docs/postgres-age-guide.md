@@ -804,9 +804,9 @@ confidence \* 2.0 + tier_bonus + recency_factor; v1.0.0 Boids item 1,
 vote 4d3ea1c5: popularity capped at ACCESS_SCORE_CAP=10, unassessed/NULL
 confidence scored neutral 0.5), 0.2 cosine gate, adaptive blend
 (`semantic_weight = 0.50` for ≤500 chars, lerp to `0.15` at ≥5000
-chars), atomic touch ops (++access_count + TTL extension +
-mid→long auto-promotion at 5 accesses + ++priority every 10
-accesses).
+chars), atomic touch ops (++access_count + TTL floor extension;
+v1.0.0 Boids item 1 removed the mid→long auto-promotion and the
+priority ladder, so tier changes only through `memory_promote`).
 
 ### Postgres route gate
 
