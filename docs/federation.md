@@ -399,12 +399,12 @@ independently — these are layered on top.
   `EpochAdvance` epoch-freeze checkpoint rides this transport (ROADMAP
   §25.2). Decision function:
   [`src/federation/receive_auth.rs::authorize_remote_checkpoint_resolution`](../src/federation/receive_auth.rs);
-  apply: `src/checkpoints/mod.rs::apply_inbound_resolution`. On a
-  postgres-backed receiver the checkpoints table is not yet
-  MemoryStore-trait-covered for a federated verbatim-resolution write, so
-  the postgres funnel reports inbound checkpoints as
-  `unsupported_on_postgres` (honest count, never a silent drop) — the
-  sqlite / MCP-native path applies them fully.
+  apply: `src/checkpoints/mod.rs::apply_inbound_resolution`. A
+  postgres-backed receiver applies inbound resolutions through the SAL
+  method `MemoryStore::apply_remote_checkpoint_resolution`
+  ([#3075](https://github.com/alphaonedev/ai-memory-mcp/issues/3075)),
+  under the same authorization, signature and first-resolution-wins checks;
+  the lane is no longer reported as `unsupported_on_postgres`.
 
 - **Per-transition replay nonce
   ([#1805](https://github.com/alphaonedev/ai-memory-mcp/issues/1805)).**
