@@ -29,6 +29,8 @@
   </a>
   <nav class="am-links" aria-label="Primary">
     <a href="architectures.html">Architectures</a>
+    <a href="https://test.agenticmem.co" target="_blank" rel="noopener">Live Testing</a>
+    <a href="testing/">Test Results</a>
     <div class="am-dd">
       <button aria-haspopup="true">Tiers ▾</button>
       <div class="am-dd-menu">
@@ -64,6 +66,8 @@
   <details class="am-mnav"><summary>Menu</summary><div class="am-mnav-pane">
     <a href="index.html">Home</a>
     <a href="architectures.html">Architectures overview</a>
+    <a href="https://test.agenticmem.co" target="_blank" rel="noopener">Live Testing</a>
+    <a href="testing/">Test Results</a>
     <div class="am-g">Tiers</div>
     <a href="architectures-t1.html">T1 · Single node</a>
     <a href="architectures-t2.html">T2 · Shared daemon</a>
@@ -90,7 +94,7 @@
   <h1 class="am-h1">Many agents, one host, <span class="a">one shared memory</span>.</h1>
   <p class="am-sub">A planner, a coder and a reviewer share one store through <b>ai-memory serve</b>. Each agent writes into its own namespace, recalls through <b>scope visibility</b>, and passes a <b>per-namespace governance</b> gate with a pending-approval queue. The host's <b>wake hub</b> tells an agent the moment a message for it lands.</p>
   <div class="am-proof">
-    <span><b>HTTP</b> 127.0.0.1:9077</span>
+    <span><b>HTTPS</b> 127.0.0.1:9077 · TLS on every bind</span>
     <span><b>X-Agent-Id</b> + per-agent API keys</span>
     <span><b>scopes</b> private · team · unit · org · collective</span>
     <span><b>Allow · Deny · Pending</b></span>
@@ -102,15 +106,15 @@
   <div class="am-sec-h">
     <span class="am-eyebrow">Architecture</span>
     <h2>One daemon, <span class="a">one file</span>, every writer takes its turn.</h2>
-    <p>HTTP agents talk to the daemon. An MCP agent's <code>ai-memory mcp</code> child and the operator's CLI verbs are <b>not</b> clients of that daemon: they open the same SQLite file in-process. That is why a CLI <code>recall</code> sees the same memories as the daemon, and also why every one of these processes queues on the same file lock for writes.</p>
+    <p>HTTPS agents talk to the daemon. An MCP agent's <code>ai-memory mcp</code> child and the operator's CLI verbs are <b>not</b> clients of that daemon: they open the same SQLite file in-process. That is why a CLI <code>recall</code> sees the same memories as the daemon, and also why every one of these processes queues on the same file lock for writes.</p>
   </div>
   <div class="am-legend"><span><i></i>memory read/write</span><span><i class="teal"></i>wake hint</span></div>
   <figure class="am-fig" style="--fig-min:920px">
 <svg class="dg" viewBox="0 0 1100 520" role="img" aria-labelledby="t2a-title" aria-describedby="t2a-desc" xmlns="http://www.w3.org/2000/svg">
-<title id="t2a-title">Tier 2: many agents share one daemon on one host</title><desc id="t2a-desc">Planner and coder agents call ai-memory serve over HTTP with their own agent id and API key. A reviewer agent spawns an MCP child and an operator runs CLI verbs; both open the same SQLite file in-process. All writers take turns on that one file. The daemon publishes committed messages to the same-host wake hub, which wakes the recipients' wake-listen sessions.</desc>
+<title id="t2a-title">Tier 2: many agents share one daemon on one host</title><desc id="t2a-desc">Planner and coder agents call ai-memory serve over HTTPS with their own agent id and API key. A reviewer agent spawns an MCP child and an operator runs CLI verbs; both open the same SQLite file in-process. All writers take turns on that one file. The daemon publishes committed messages to the same-host wake hub, which wakes the recipients' wake-listen sessions.</desc>
 <defs><marker id="t2a-ah" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow"/></marker><marker id="t2a-aa" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow acc"/></marker><marker id="t2a-at" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow teal"/></marker><marker id="t2a-ab" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow bad"/></marker><marker id="t2a-as" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow slate"/></marker></defs>
-<rect class="zone solid" x="20" y="20" width="1060" height="480" rx="18"/><text class="t-k" x="40" y="44">ONE HOST  ·  MANY AGENTS</text><text class="t-teal" x="1060" y="44" text-anchor="end">wake → wake-listen sessions</text><g class="rise"><rect class="box" x="60" y="66" width="150" height="40" rx="10"/><text class="t-s" x="135" y="91" text-anchor="middle">planner · HTTP</text><circle class="pulse good" cx="72" cy="77" r="2.6"/></g>
-<g class="rise" style="--d:0.08s"><rect class="box" x="270" y="66" width="150" height="40" rx="10"/><text class="t-s" x="345" y="91" text-anchor="middle">coder · HTTP</text><circle class="pulse good" cx="282" cy="77" r="2.6" style="--d:0.3s"/></g>
+<rect class="zone solid" x="20" y="20" width="1060" height="480" rx="18"/><text class="t-k" x="40" y="44">ONE HOST  ·  MANY AGENTS</text><text class="t-teal" x="1060" y="44" text-anchor="end">wake → wake-listen sessions</text><g class="rise"><rect class="box" x="60" y="66" width="150" height="40" rx="10"/><text class="t-s" x="135" y="91" text-anchor="middle">planner · HTTPS</text><circle class="pulse good" cx="72" cy="77" r="2.6"/></g>
+<g class="rise" style="--d:0.08s"><rect class="box" x="270" y="66" width="150" height="40" rx="10"/><text class="t-s" x="345" y="91" text-anchor="middle">coder · HTTPS</text><circle class="pulse good" cx="282" cy="77" r="2.6" style="--d:0.3s"/></g>
 <g class="rise" style="--d:0.16s"><rect class="box" x="665" y="66" width="150" height="40" rx="10"/><text class="t-s" x="740" y="91" text-anchor="middle">reviewer · MCP</text><circle class="pulse good" cx="677" cy="77" r="2.6" style="--d:0.6s"/></g>
 <g class="rise" style="--d:0.24s"><rect class="box" x="845" y="66" width="150" height="40" rx="10"/><text class="t-s" x="920" y="91" text-anchor="middle">operator · CLI</text><circle class="pulse good" cx="857" cy="77" r="2.6" style="--d:0.8999999999999999s"/></g>
 <g class="rise" style="--d:0.2s"><rect class="box acc" x="40" y="150" width="430" height="140" rx="14"/><text class="t-h" x="56" y="176">ai-memory serve · 127.0.0.1:9077</text><rect class="box" x="56" y="188" width="398" height="20" rx="6"/><text class="t-s" x="68" y="202">identity: X-Agent-Id + per-agent API key</text><rect class="box" x="56" y="212" width="398" height="20" rx="6"/><text class="t-s" x="68" y="226">namespaces + scope visibility (as_agent)</text><rect class="box" x="56" y="236" width="398" height="20" rx="6"/><text class="t-s" x="68" y="250">governance gate: Allow · Deny · Pending</text><rect class="box" x="56" y="260" width="398" height="20" rx="6"/><text class="t-s" x="68" y="274">memory engine · pending_actions queue</text></g>
@@ -121,7 +125,7 @@
 <path class="wire" d="M255 290 V336" marker-end="url(#t2a-aa)"/><path class="flow" d="M255 290 V336"/><path class="dot" pathLength="100" d="M255 290 V336" style="--d:1.4s"/><path class="wire" d="M740 290 V336" marker-end="url(#t2a-aa)"/><path class="flow" d="M740 290 V336"/><path class="dot" pathLength="100" d="M740 290 V336" style="--d:1.8s"/><path class="wire" d="M920 290 V336" marker-end="url(#t2a-aa)"/><path class="flow" d="M920 290 V336"/><path class="dot" pathLength="100" d="M920 290 V336" style="--d:2.2s"/><text class="t-s" x="40" y="452">Every surface resolves an agent identity and passes the same per-namespace governance gate.</text><text class="t-s" x="40" y="472">The hub carries hints only: the inbox row in SQLite is the message, and recipients keep a backstop poll.</text></svg>
 
   </figure>
-  <p class="am-figcap"><b>Correction (#4254).</b> Earlier guides described the CLI at this tier as a thin client of the daemon. It is not: CLI verbs such as <code>store</code> and <code>recall</code> open the database in-process (<code>src/daemon_runtime.rs</code> dispatches them to <code>src/cli/store.rs</code> and <code>src/cli/recall.rs</code> with the local path). Only <code>sync</code> and <code>doctor --remote</code> speak HTTP. Sources: <code>src/handlers/routes.rs</code>, <code>src/identity/authority.rs</code>, <code>src/wake_hub/routing.rs</code>, <code>src/wake_sink/in_process.rs</code>.</p>
+  <p class="am-figcap"><b>Correction (#4254).</b> Earlier guides described the CLI at this tier as a thin client of the daemon. It is not: CLI verbs such as <code>store</code> and <code>recall</code> open the database in-process (<code>src/daemon_runtime.rs</code> dispatches them to <code>src/cli/store.rs</code> and <code>src/cli/recall.rs</code> with the local path). Only <code>sync</code> and <code>doctor --remote</code> speak HTTPS to a daemon or peer. Sources: <code>src/handlers/routes.rs</code>, <code>src/identity/authority.rs</code>, <code>src/wake_hub/routing.rs</code>, <code>src/wake_sink/in_process.rs</code>.</p>
 </div></section>
 
 <section class="am-sec alt" id="isolation"><div class="am-wrap">
@@ -172,11 +176,18 @@
     <span class="am-eyebrow">Deployment recipe</span>
     <h2>A shared workstation or <span class="a">a single VM</span>.</h2>
   </div>
-<pre><code># One daemon per host (loopback by default; a non-loopback bind refuses to start without api_key in config.toml)
+<pre><code># TLS is mandatory on every listener, loopback included (#3705).
+# A team host brings its own certificate: verify it and install it once
+# (or pass --tls-cert / --tls-key to serve). Only the single-operator
+# singleton shape mints a local CA certificate for you.
+ai-memory tls import --cert /etc/ai-memory/tls/fullchain.pem --key /etc/ai-memory/tls/key.pem \
+  --ca /etc/ai-memory/tls/ca.pem --host 127.0.0.1
+
+# One daemon per host (loopback by default; a non-loopback bind refuses to start without api_key in config.toml)
 ai-memory --db /var/lib/ai-memory/ai-memory.db serve --host 127.0.0.1 --port 9077
 
-# HTTP agents identify themselves on every call
-curl -s -X POST http://127.0.0.1:9077/api/v1/recall \
+# HTTPS agents identify themselves on every call and trust the daemon's CA
+curl -s --cacert /etc/ai-memory/tls/ca.pem -X POST https://127.0.0.1:9077/api/v1/recall \
   -H "X-Agent-Id: org/team-a/planner" -H "X-API-Key: $PLANNER_KEY" \
   -H "Content-Type: application/json" \
   -d '{"context":"release blockers","as_agent":"org/team-a/planner"}'
@@ -214,10 +225,11 @@ ai-memory wake-listen --agent-id org/team-a/reviewer --socket /run/ai-memory-hub
     <thead><tr><th>Dimension</th><th>Tier 2 behaviour</th><th>Move up when</th></tr></thead>
     <tbody>
       <tr><td><b>Writers</b></td><td>The daemon, MCP children and CLI processes share one SQLite file; writes serialize on its lock.</td><td>Write contention shows up in latency: <a href="architectures-t4.html">PostgreSQL tier</a>.</td></tr>
-      <tr><td><b>Throughput</b></td><td>Every HTTP request terminates at the one daemon.</td><td>One daemon is the bottleneck: add peers at <a href="architectures-t3.html">Tier 3</a>.</td></tr>
+      <tr><td><b>Throughput</b></td><td>Every HTTPS request terminates at the one daemon.</td><td>One daemon is the bottleneck: add peers at <a href="architectures-t3.html">Tier 3</a>.</td></tr>
       <tr><td><b>Availability</b></td><td>One host, one disk; snapshots with <code>backup</code>, no live replica.</td><td>You need a current second copy: <a href="architectures-t3.html">Tier 3</a>.</td></tr>
       <tr><td><b>Wake reach</b></td><td>The hub reaches agents on this host only.</td><td>Agents on other hosts: federation at <a href="architectures-t3.html">Tier 3</a>.</td></tr>
-      <tr><td><b>Transport</b></td><td>Loopback by default; TLS and an mTLS allowlist are available on <code>serve</code>.</td><td>Configure both, plus <code>api_key</code>, before binding beyond loopback.</td></tr>
+      <tr><td><b>Transport</b></td><td>TLS on every bind, loopback included; the daemon refuses to start in cleartext. Loopback by default; an mTLS allowlist is available on <code>serve</code>.</td><td>Add the allowlist and <code>api_key</code> before binding beyond loopback.</td></tr>
+      <tr><td><b>Shared filesystems</b></td><td>The SQLite file must sit on a local disk: NFS, SMB, FUSE or EFS locking is unsafe (architectural limit 4), so the daemon cannot be scaled out over a shared volume.</td><td>You need more than one host: <a href="architectures-t3.html">Tier 3</a> or the <a href="architectures-t4.html">PostgreSQL tier</a>.</td></tr>
     </tbody>
   </table></div>
   <p class="am-figcap" style="margin-top:12px">Reasoning for each: <a href="ARCHITECTURAL_LIMITS.html">architectural limits</a>.</p>

@@ -29,6 +29,8 @@
   </a>
   <nav class="am-links" aria-label="Primary">
     <a href="architectures.html">Architectures</a>
+    <a href="https://test.agenticmem.co" target="_blank" rel="noopener">Live Testing</a>
+    <a href="testing/">Test Results</a>
     <div class="am-dd">
       <button aria-haspopup="true">Tiers ▾</button>
       <div class="am-dd-menu">
@@ -64,6 +66,8 @@
   <details class="am-mnav"><summary>Menu</summary><div class="am-mnav-pane">
     <a href="index.html">Home</a>
     <a href="architectures.html">Architectures overview</a>
+    <a href="https://test.agenticmem.co" target="_blank" rel="noopener">Live Testing</a>
+    <a href="testing/">Test Results</a>
     <div class="am-g">Tiers</div>
     <a href="architectures-t1.html">T1 · Single node</a>
     <a href="architectures-t2.html">T2 · Shared daemon</a>
@@ -102,12 +106,12 @@
   <div class="am-sec-h">
     <span class="am-eyebrow">Architecture</span>
     <h2>Two ways in, <span class="a">one file</span>.</h2>
-    <p>The MCP child and the CLI are separate processes that link the same engine; neither is a client of a daemon. An HTTP daemon on loopback and a same-host wake hub are optional extras, drawn dashed.</p>
+    <p>The MCP child and the CLI are separate processes that link the same engine; neither is a client of a daemon. An HTTPS daemon on loopback (TLS even there; this single-operator shape mints and renews a local CA certificate) and a same-host wake hub are optional extras, drawn dashed.</p>
   </div>
   <div class="am-legend"><span><i></i>memory read/write</span><span><i class="teal"></i>operations</span><span><i class="dash"></i>optional</span></div>
   <figure class="am-fig" style="--fig-min:900px">
 <svg class="dg" viewBox="0 0 1100 460" role="img" aria-labelledby="t1a-title" aria-describedby="t1a-desc" xmlns="http://www.w3.org/2000/svg">
-<title id="t1a-title">Tier 1: one agent, one store, one host</title><desc id="t1a-desc">An MCP client spawns ai-memory mcp over stdio, or an operator runs a CLI verb; both open the same SQLite file in-process through the same engine. A SQLCipher build encrypts the file at rest. An HTTP daemon and a wake hub are optional. Backups are VACUUM INTO snapshots with a signed manifest.</desc>
+<title id="t1a-title">Tier 1: one agent, one store, one host</title><desc id="t1a-desc">An MCP client spawns ai-memory mcp over stdio, or an operator runs a CLI verb; both open the same SQLite file in-process through the same engine. A SQLCipher build encrypts the file at rest. An HTTPS daemon (TLS even on loopback) and a wake hub are optional. Backups are VACUUM INTO snapshots with a signed manifest.</desc>
 <defs><marker id="t1a-ah" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow"/></marker><marker id="t1a-aa" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow acc"/></marker><marker id="t1a-at" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow teal"/></marker><marker id="t1a-ab" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow bad"/></marker><marker id="t1a-as" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow slate"/></marker></defs>
 <rect class="zone solid" x="20" y="20" width="1060" height="420" rx="18"/><text class="t-k" x="40" y="46">ONE HOST  ·  NO NETWORK REQUIRED</text><g class="rise"><rect class="box" x="50" y="70" width="190" height="70" rx="12"/><text class="t-m" x="66" y="98">agent</text><text class="t-s" x="66" y="116">any MCP client</text></g>
 <g class="rise" style="--d:0.1s"><rect class="box" x="50" y="230" width="190" height="70" rx="12"/><text class="t-m" x="66" y="258">operator shell</text><text class="t-s" x="66" y="276">ai-memory &lt;verb&gt;</text></g>
@@ -115,7 +119,7 @@
 <g class="rise" style="--d:0.3s"><rect class="box" x="300" y="230" width="230" height="70" rx="12"/><text class="t-m" x="316" y="254">CLI process</text><text class="t-s" x="316" y="271">opens the store in-process</text><text class="t-s" x="316" y="288">not a thin HTTP client</text></g>
 <g class="rise" style="--d:0.4s"><rect class="box" x="590" y="70" width="220" height="230" rx="12"/><text class="t-m" x="606" y="98">one engine, linked in</text><text class="t-s" x="606" y="124">agent id resolved</text><text class="t-s" x="606" y="150">governance gate</text><text class="t-s" x="606" y="176">tiers short · mid · long</text><text class="t-s" x="606" y="202">keyword + vector recall</text><text class="t-s" x="606" y="228">temporal knowledge graph</text><text class="t-s" x="606" y="254">hooks pipeline</text></g>
 <g class="rise" style="--d:0.5s"><rect class="box acc" x="870" y="100" width="190" height="170" rx="12"/><ellipse class="box acc" cx="965" cy="106" rx="85" ry="6"/><text class="t-m" x="886" y="134">SQLite · WAL</text><text class="t-s" x="886" y="156">one file,</text><text class="t-s" x="886" y="178">one writer at a time</text><text class="t-a" x="886" y="200">SQLCipher build:</text><text class="t-s" x="886" y="222">encrypted at rest</text></g>
-<path class="wire" d="M240 105 H296" marker-end="url(#t1a-aa)"/><path class="flow" d="M240 105 H296"/><path class="dot" pathLength="100" d="M240 105 H296"/><path class="wire" d="M240 265 H296" marker-end="url(#t1a-aa)"/><path class="flow" d="M240 265 H296"/><path class="dot" pathLength="100" d="M240 265 H296" style="--d:0.6s"/><path class="wire" d="M530 105 H586" marker-end="url(#t1a-aa)"/><path class="flow" d="M530 105 H586"/><path class="dot" pathLength="100" d="M530 105 H586" style="--d:0.9s"/><path class="wire" d="M530 265 H586" marker-end="url(#t1a-aa)"/><path class="flow" d="M530 265 H586"/><path class="dot" pathLength="100" d="M530 265 H586" style="--d:1.3s"/><path class="wire" d="M810 185 H866" marker-end="url(#t1a-aa)"/><path class="flow" d="M810 185 H866"/><path class="dot" pathLength="100" d="M810 185 H866" style="--d:1.7s"/><g class="rise" style="--d:0.6s"><rect class="box ghost" x="50" y="340" width="230" height="76" rx="12"/><text class="t-k" x="66" y="364">optional</text><text class="t-m" x="66" y="381">ai-memory serve</text><text class="t-s" x="66" y="398">loopback HTTP 127.0.0.1:9077</text></g>
+<path class="wire" d="M240 105 H296" marker-end="url(#t1a-aa)"/><path class="flow" d="M240 105 H296"/><path class="dot" pathLength="100" d="M240 105 H296"/><path class="wire" d="M240 265 H296" marker-end="url(#t1a-aa)"/><path class="flow" d="M240 265 H296"/><path class="dot" pathLength="100" d="M240 265 H296" style="--d:0.6s"/><path class="wire" d="M530 105 H586" marker-end="url(#t1a-aa)"/><path class="flow" d="M530 105 H586"/><path class="dot" pathLength="100" d="M530 105 H586" style="--d:0.9s"/><path class="wire" d="M530 265 H586" marker-end="url(#t1a-aa)"/><path class="flow" d="M530 265 H586"/><path class="dot" pathLength="100" d="M530 265 H586" style="--d:1.3s"/><path class="wire" d="M810 185 H866" marker-end="url(#t1a-aa)"/><path class="flow" d="M810 185 H866"/><path class="dot" pathLength="100" d="M810 185 H866" style="--d:1.7s"/><g class="rise" style="--d:0.6s"><rect class="box ghost" x="50" y="340" width="230" height="76" rx="12"/><text class="t-k" x="66" y="364">optional</text><text class="t-m" x="66" y="381">ai-memory serve</text><text class="t-s" x="66" y="398">TLS · 127.0.0.1:9077</text></g>
 <g class="rise" style="--d:0.7s"><rect class="box ghost" x="300" y="340" width="230" height="76" rx="12"/><text class="t-k" x="316" y="364">optional</text><text class="t-m" x="316" y="381">wake-hub</text><text class="t-s" x="316" y="398">unix socket, same host</text></g>
 <g class="rise" style="--d:0.8s"><rect class="box teal" x="590" y="340" width="470" height="76" rx="12"/><text class="t-k" x="606" y="364">operations</text><text class="t-s" x="606" y="382">ai-memory backup: VACUUM INTO snapshot + signed manifest</text><text class="t-s" x="606" y="400">ai-memory restore · ai-memory doctor</text></g>
 <path class="wire" d="M965 270 V336" marker-end="url(#t1a-at)"/><path class="flow teal" d="M965 270 V336"/><path class="dot teal" pathLength="100" d="M965 270 V336" style="--d:2.2s"/></svg>
@@ -200,7 +204,7 @@ ai-memory --db ~/.local/share/ai-memory/ai-memory.db doctor</code></pre>
     <tbody>
       <tr><td><b>Writers</b></td><td>One writer at a time on the SQLite file; WAL lets readers pass it.</td><td>Several agents write at once: <a href="architectures-t2.html">Tier 2</a>.</td></tr>
       <tr><td><b>Vectors</b></td><td>HNSW index held in RAM and rebuilt at start-up.</td><td>The corpus makes start-up or memory painful: <a href="architectures-t4.html">PostgreSQL tier</a>.</td></tr>
-      <tr><td><b>Remote access</b></td><td>None unless you run <code>serve</code>; loopback by default, and non-loopback binds require an API key.</td><td>Agents on other machines need the memory: <a href="architectures-t3.html">Tier 3</a>.</td></tr>
+      <tr><td><b>Remote access</b></td><td>None unless you run <code>serve</code>; it listens with TLS only, loopback by default, and non-loopback binds require an API key.</td><td>Agents on other machines need the memory: <a href="architectures-t3.html">Tier 3</a>.</td></tr>
       <tr><td><b>Durability</b></td><td>One disk. Snapshots with <code>backup</code>; no replication.</td><td>You need a second copy that is current: <a href="architectures-t3.html">Tier 3</a>.</td></tr>
       <tr><td><b>Filesystem</b></td><td>Local disk only; network filesystems are unsafe for SQLite locking.</td><td>Always: keep the file on local storage.</td></tr>
     </tbody>

@@ -29,6 +29,8 @@
   </a>
   <nav class="am-links" aria-label="Primary">
     <a href="architectures.html">Architectures</a>
+    <a href="https://test.agenticmem.co" target="_blank" rel="noopener">Live Testing</a>
+    <a href="testing/">Test Results</a>
     <div class="am-dd">
       <button aria-haspopup="true">Tiers ▾</button>
       <div class="am-dd-menu">
@@ -64,6 +66,8 @@
   <details class="am-mnav"><summary>Menu</summary><div class="am-mnav-pane">
     <a href="index.html">Home</a>
     <a href="architectures.html">Architectures overview</a>
+    <a href="https://test.agenticmem.co" target="_blank" rel="noopener">Live Testing</a>
+    <a href="testing/">Test Results</a>
     <div class="am-g">Tiers</div>
     <a href="architectures-t1.html">T1 · Single node</a>
     <a href="architectures-t2.html">T2 · Shared daemon</a>
@@ -119,7 +123,7 @@
 <text class="t-k" x="550" y="22" text-anchor="middle">CROSS-SITE FEDERATION  ·  mTLS  ·  signed + nonce-bound pushes  ·  enrolled peers only  ·  W-of-N, WAN-sized timeout</text><path class="wire" d="M158 40 H966"/><path class="flow slow" d="M158 40 H966"/><path class="flow slow rev" d="M158 40 H966"/><path class="dot" pathLength="100" d="M158 40 H966" style="--d:0.2s"/><path class="dot" pathLength="100" d="M966 40 H158" style="--d:1.8s"/><path class="wire" d="M158 104 V40"/><path class="flow slow" d="M158 104 V40"/><circle class="ring" cx="158" cy="40" r="7"/><circle class="pulse" cx="158" cy="40" r="3.5"/><path class="wire" d="M310 104 V40"/><path class="flow slow" d="M310 104 V40"/><circle class="ring" cx="310" cy="40" r="7" style="--d:0.4s"/><circle class="pulse" cx="310" cy="40" r="3.5" style="--d:0.4s"/><path class="wire" d="M518 104 V40"/><path class="flow slow" d="M518 104 V40"/><circle class="ring" cx="518" cy="40" r="7" style="--d:0.8s"/><circle class="pulse" cx="518" cy="40" r="3.5" style="--d:0.8s"/><path class="wire" d="M670 104 V40"/><path class="flow slow" d="M670 104 V40"/><circle class="ring" cx="670" cy="40" r="7" style="--d:1.2000000000000002s"/><circle class="pulse" cx="670" cy="40" r="3.5" style="--d:1.2000000000000002s"/><path class="wire" d="M966 104 V40"/><path class="flow slow" d="M966 104 V40"/><circle class="ring" cx="966" cy="40" r="7" style="--d:1.6s"/><circle class="pulse" cx="966" cy="40" r="3.5" style="--d:1.6s"/><path class="wire" d="M90 174 V184" marker-end="url(#t5h-at)"/><path class="flow teal" d="M90 174 V184"/><path class="wire" d="M242 174 V184" marker-end="url(#t5h-at)"/><path class="flow teal" d="M242 174 V184"/><path class="wire" d="M160 234 V250" marker-end="url(#t5h-aa)"/><path class="flow" d="M160 234 V250"/><path class="wire" d="M450 174 V184" marker-end="url(#t5h-at)"/><path class="flow teal" d="M450 174 V184"/><path class="wire" d="M602 174 V184" marker-end="url(#t5h-at)"/><path class="flow teal" d="M602 174 V184"/><path class="wire" d="M520 234 V250" marker-end="url(#t5h-aa)"/><path class="flow" d="M520 234 V250"/><path class="wire" d="M810 174 V184" marker-end="url(#t5h-at)"/><path class="flow teal" d="M810 174 V184"/><path class="wire" d="M950 174 V250" marker-end="url(#t5h-aa)"/><path class="flow" d="M950 174 V250"/><g class="rise" style="--d:0.6s"><rect class="box teal" x="30" y="360" width="330" height="92" rx="12"/><text class="t-m" x="46" y="384">security posture</text><text class="t-s" x="46" y="401">asi-hard profile pins hardened knobs and</text><text class="t-s" x="46" y="418">refuses to boot if one is loosened;</text><text class="t-teal" x="46" y="435">doctor --posture enterprise-federation</text></g>
 <g class="rise" style="--d:0.7s"><rect class="box" x="380" y="360" width="340" height="92" rx="12"/><text class="t-m" x="396" y="384">certified scope</text><text class="t-s" x="396" y="401">500–1000-agent clusters of ≤ 50-peer</text><text class="t-s" x="396" y="418">blocks, certified as a trust boundary;</text><text class="t-s" x="396" y="435">scale out by adding independent clusters</text></g>
 <g class="rise" style="--d:0.8s"><rect class="box bad" x="740" y="360" width="330" height="92" rx="12"/><text class="t-bad" x="756" y="384">not in the box</text><text class="t-s" x="756" y="401">no Raft / Paxos, no gossip discovery</text><text class="t-s" x="756" y="418">wake hubs never cross hosts</text><text class="t-s" x="756" y="435">graph invalidations converge eventually</text></g>
-<text class="t-s" x="30" y="488">Agents in every site reach their local peer over HTTP; a message for an agent in another site travels as an inbox row by federation,</text><text class="t-s" x="30" y="506">and the receiving peer wakes its local hub only when the apply moved the row forward (replays wake nobody).</text></svg>
+<text class="t-s" x="30" y="488">Agents in every site reach their local peer over HTTPS; a message for an agent in another site travels as an inbox row by federation,</text><text class="t-s" x="30" y="506">and the receiving peer wakes its local hub only when the apply moved the row forward (replays wake nobody).</text></svg>
 
   </figure>
   <p class="am-figcap"><b>Certified as a trust boundary.</b> The enterprise federation certification covers 500–1000-agent clusters built from blocks of at most 50 peers: namespace confinement, peer attestation, per-write authority, at-rest confidentiality and the tamper-evident audit spine. It certifies no throughput or latency figure; scale beyond one cluster by adding independent clusters. Sources: <code>src/federation/signing.rs</code>, <code>src/federation/peer_attestation.rs</code>, <code>src/replication.rs</code>, <code>src/security_profile.rs</code>, <code>docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md</code>.</p>
@@ -157,7 +161,7 @@
   <div class="am-grid two">
     <div class="am-card gold"><span class="am-k">Write</span><h3>Across sites</h3>
       <ol class="am-steps" style="margin-top:12px">
-        <li>An agent in site 1 writes to its local peer over HTTP; identity and the namespace governance gate run first.</li>
+        <li>An agent in site 1 writes to its local peer over HTTPS; identity and the namespace governance gate run first.</li>
         <li>The row commits in site 1's store.</li>
         <li>The peer signs the body with its enrolled Ed25519 key, binds it to a fresh nonce and pushes it to the other sites over mutual TLS.</li>
         <li>Each receiver verifies the signature and nonce, checks that the sender is enrolled and may write that namespace, and applies the row with a newer-wins merge.</li>

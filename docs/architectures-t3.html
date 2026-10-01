@@ -29,6 +29,8 @@
   </a>
   <nav class="am-links" aria-label="Primary">
     <a href="architectures.html">Architectures</a>
+    <a href="https://test.agenticmem.co" target="_blank" rel="noopener">Live Testing</a>
+    <a href="testing/">Test Results</a>
     <div class="am-dd">
       <button aria-haspopup="true">Tiers ▾</button>
       <div class="am-dd-menu">
@@ -64,6 +66,8 @@
   <details class="am-mnav"><summary>Menu</summary><div class="am-mnav-pane">
     <a href="index.html">Home</a>
     <a href="architectures.html">Architectures overview</a>
+    <a href="https://test.agenticmem.co" target="_blank" rel="noopener">Live Testing</a>
+    <a href="testing/">Test Results</a>
     <div class="am-g">Tiers</div>
     <a href="architectures-t1.html">T1 · Single node</a>
     <a href="architectures-t2.html">T2 · Shared daemon</a>
@@ -88,7 +92,7 @@
   <nav class="am-rail" aria-label="Tiers"><a href="architectures-t1.html">T1 · Single node</a><a href="architectures-t2.html">T2 · Shared daemon</a><a href="architectures-t3.html" aria-current="page">T3 · Federated cluster</a><a href="architectures-t4.html">T4 · Data-center swarm</a><a href="architectures-t5.html">T5 · Federated hive</a><a href="architectures.html">Overview</a></nav>
   <span class="am-pill" style="margin-top:18px"><i></i>Tier 3 · ships in v1.0.0</span>
   <h1 class="am-h1">A cluster that <span class="a">agrees enough</span>, and never loses a write.</h1>
-  <p class="am-sub">Several ai-memory daemons in one rack or data center replicate every HTTP write over <b>mutual TLS</b> with <b>Ed25519-signed</b> pushes. A write commits locally first, then waits for a <b>W-of-N quorum</b>; a miss is answered with <b>202</b> and the row stays safe. Peers that were away catch up by pulling, erasures travel through a durable outbox, and a replicated message wakes its recipient on the receiving host.</p>
+  <p class="am-sub">Several ai-memory daemons in one rack or data center replicate every HTTPS write over <b>mutual TLS</b> with <b>Ed25519-signed</b> pushes. A write commits locally first, then waits for a <b>W-of-N quorum</b>; a miss is answered with <b>202</b> and the row stays safe. Peers that were away catch up by pulling, erasures travel through a durable outbox, and a replicated message wakes its recipient on the receiving host.</p>
   <div class="am-proof">
     <span><b>W-of-N</b> quorum writes</span>
     <span><b>mTLS</b> fingerprint allowlist</span>
@@ -102,12 +106,12 @@
   <div class="am-sec-h">
     <span class="am-eyebrow">Architecture</span>
     <h2>Three peers, <span class="a">one signed mesh</span>.</h2>
-    <p>Each peer is a full <code>ai-memory serve</code> with its own store and its own wake hub. With <code>--quorum-writes W</code> and a <code>--quorum-peers</code> list, every HTTP write fans out to every peer and is acknowledged once the local commit plus W−1 peer acknowledgements land inside <code>--quorum-timeout-ms</code>.</p>
+    <p>Each peer is a full <code>ai-memory serve</code> with its own store and its own wake hub. With <code>--quorum-writes W</code> and a <code>--quorum-peers</code> list, every HTTPS write fans out to every peer and is acknowledged once the local commit plus W−1 peer acknowledgements land inside <code>--quorum-timeout-ms</code>.</p>
   </div>
   <div class="am-legend"><span><i></i>signed push</span><span><i class="teal"></i>acknowledgement · wake</span></div>
   <figure class="am-fig" style="--fig-min:920px">
 <svg class="dg" viewBox="0 0 1100 540" role="img" aria-labelledby="t3a-title" aria-describedby="t3a-desc" xmlns="http://www.w3.org/2000/svg">
-<title id="t3a-title">Tier 3: a federated cluster of three daemons</title><desc id="t3a-desc">Three ai-memory daemons in one rack or data center replicate every HTTP write over mutual TLS with Ed25519-signed pushes. A write commits locally and is acknowledged once the local commit plus W minus one peer acknowledgements land within the quorum timeout; otherwise the answer is 202 with quorum_met false and durability local. Each host keeps its own wake hub.</desc>
+<title id="t3a-title">Tier 3: a federated cluster of three daemons</title><desc id="t3a-desc">Three ai-memory daemons in one rack or data center replicate every HTTPS write over mutual TLS with Ed25519-signed pushes. A write commits locally and is acknowledged once the local commit plus W minus one peer acknowledgements land within the quorum timeout; otherwise the answer is 202 with quorum_met false and durability local. Each host keeps its own wake hub.</desc>
 <defs><marker id="t3a-ah" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow"/></marker><marker id="t3a-aa" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow acc"/></marker><marker id="t3a-at" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow teal"/></marker><marker id="t3a-ab" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow bad"/></marker><marker id="t3a-as" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow slate"/></marker></defs>
 <rect class="zone solid" x="20" y="20" width="1060" height="470" rx="18"/><text class="t-k" x="40" y="44">ONE RACK  ·  ONE DATA CENTER</text><text class="t-a" x="1060" y="44" text-anchor="end">mTLS allowlist · X-Memory-Sig · nonce · enrolled peer keys</text><g class="rise"><rect class="box" x="130" y="62" width="160" height="36" rx="10"/><text class="t-s" x="210" y="85" text-anchor="middle">agent → peer A</text><circle class="pulse good" cx="142" cy="72" r="2.6"/></g>
 <g class="rise" style="--d:0.1s"><rect class="box" x="810" y="62" width="160" height="36" rx="10"/><text class="t-s" x="890" y="85" text-anchor="middle">agent → peer B</text><circle class="pulse good" cx="822" cy="72" r="2.6" style="--d:0.5s"/></g>
@@ -140,7 +144,7 @@
 <path class="wire" d="M428 193 H454" marker-end="url(#t3b-at)"/><path class="flow teal" d="M428 193 H454"/><path class="dot teal" pathLength="100" d="M428 193 H454" style="--d:0.85s"/><g class="rise" style="--d:0.7s"><rect class="box" x="458" y="160" width="184" height="66" rx="12"/><text class="t-a" x="472" y="184">03</text><text class="t-m" x="498" y="184">apply on C</text><text class="t-s" x="472" y="206">newer-wins merge</text></g>
 <path class="wire" d="M642 193 H668" marker-end="url(#t3b-at)"/><path class="flow teal" d="M642 193 H668"/><path class="dot teal" pathLength="100" d="M642 193 H668" style="--d:1.2s"/><g class="rise" style="--d:0.8s"><rect class="box teal" x="672" y="160" width="184" height="66" rx="12"/><text class="t-a" x="686" y="184">04</text><text class="t-m" x="712" y="184">applied_wake</text><text class="t-s" x="686" y="206">fresh apply only</text></g>
 <path class="wire" d="M856 193 H882" marker-end="url(#t3b-at)"/><path class="flow teal" d="M856 193 H882"/><path class="dot teal" pathLength="100" d="M856 193 H882" style="--d:1.5499999999999998s"/><g class="rise" style="--d:0.9s"><rect class="box" x="886" y="160" width="184" height="66" rx="12"/><text class="t-a" x="900" y="184">05</text><text class="t-m" x="926" y="184">wake on C</text><text class="t-s" x="900" y="206">C's hub, same host</text></g>
-<text class="t-k" x="30" y="270">ERASURE FROM MCP OR CLI  (HTTP DELETE broadcasts through the quorum directly)</text><g class="rise" style="--d:1.0s"><rect class="box acc" x="30" y="280" width="184" height="66" rx="12"/><text class="t-a" x="44" y="304">01</text><text class="t-m" x="70" y="304">forget on A</text><text class="t-s" x="44" y="326">via MCP or the CLI</text></g>
+<text class="t-k" x="30" y="270">ERASURE FROM MCP OR CLI  (an HTTPS DELETE broadcasts through the quorum directly)</text><g class="rise" style="--d:1.0s"><rect class="box acc" x="30" y="280" width="184" height="66" rx="12"/><text class="t-a" x="44" y="304">01</text><text class="t-m" x="70" y="304">forget on A</text><text class="t-s" x="44" y="326">via MCP or the CLI</text></g>
 <path class="wire" d="M214 313 H240" marker-end="url(#t3b-aa)"/><path class="flow" d="M214 313 H240"/><path class="dot" pathLength="100" d="M214 313 H240" style="--d:1.0s"/><g class="rise" style="--d:1.1s"><rect class="box" x="244" y="280" width="184" height="66" rx="12"/><text class="t-a" x="258" y="304">02</text><text class="t-m" x="284" y="304">local erase</text><text class="t-s" x="258" y="326">always succeeds</text></g>
 <path class="wire" d="M428 313 H454" marker-end="url(#t3b-aa)"/><path class="flow" d="M428 313 H454"/><path class="dot" pathLength="100" d="M428 313 H454" style="--d:1.35s"/><g class="rise" style="--d:1.2s"><rect class="box" x="458" y="280" width="184" height="66" rx="12"/><text class="t-a" x="472" y="304">03</text><text class="t-m" x="498" y="304">erasure outbox</text><text class="t-s" x="472" y="326">durable, network-free</text></g>
 <path class="wire" d="M642 313 H668" marker-end="url(#t3b-aa)"/><path class="flow" d="M642 313 H668"/><path class="dot" pathLength="100" d="M642 313 H668" style="--d:1.7s"/><g class="rise" style="--d:1.3s"><rect class="box acc" x="672" y="280" width="184" height="66" rx="12"/><text class="t-a" x="686" y="304">04</text><text class="t-m" x="712" y="304">daemon drains</text><text class="t-s" x="686" y="326">federation worker</text></g>
@@ -212,7 +216,7 @@ ai-memory --db /var/lib/ai-memory/ai-memory.db serve \
     <tbody>
       <tr><td><b>Consistency</b></td><td>Quorum writes plus catch-up; no Raft or Paxos, no gossip discovery. Peers are listed explicitly.</td><td>Always true; size quorum for the failures you must survive.</td></tr>
       <tr><td><b>Graph invalidation</b></td><td>Knowledge-graph invalidations reach other peers asynchronously.</td><td>Read from the writing peer when you need the result immediately.</td></tr>
-      <tr><td><b>Surfaces</b></td><td>Only HTTP writes fan out; MCP and CLI erasures reach peers through the erasure outbox drained by the daemon.</td><td>Route agents that need replication through HTTP.</td></tr>
+      <tr><td><b>Surfaces</b></td><td>HTTPS writes fan out. MCP-over-stdio writes join the quorum only when <code>mcp_federation_forward_url</code> points the MCP server at the local daemon; CLI writes stay local. MCP and CLI erasures reach peers through the erasure outbox drained by the daemon.</td><td>Set the forward URL, or route agents that need replication through HTTPS.</td></tr>
       <tr><td><b>Per-peer store</b></td><td>SQLite peers each keep one writer at a time and an in-process vector index.</td><td>Write load or corpus size grows: <a href="architectures-t4.html">PostgreSQL tier</a>.</td></tr>
       <tr><td><b>Wake reach</b></td><td>Wakes are per host; the cross-host leg is federation, and the poll remains the guarantee.</td><td>No change needed at larger tiers.</td></tr>
     </tbody>
