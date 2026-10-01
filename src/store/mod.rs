@@ -588,6 +588,50 @@ pub fn reject_unattributed_space(op: &str, space: &str) -> StoreResult<()> {
     })
 }
 
+/// #4045 — shared input guard for
+/// [`MemoryStore::consolidate_with_expected_versions`], so BOTH adapters
+/// refuse an empty/whitespace summary (#4046) and a version list that is not
+/// aligned one-for-one with `ids` as the SAME typed
+/// [`StoreError::InvalidInput`], before any lock or write.
+///
+/// # Errors
+///
+/// [`StoreError::InvalidInput`] when the summary fails
+/// [`crate::validate::validate_content`] or the version count differs from
+/// the id count.
+pub(crate) fn validate_consolidation_input(
+    ids: &[String],
+    summary: &str,
+    expected_versions: Option<&[i64]>,
+) -> StoreResult<()> {
+    crate::validate::validate_content(summary).map_err(|e| StoreError::InvalidInput {
+        detail: e.to_string(),
+    })?;
+    if expected_versions.is_some_and(|versions| versions.len() != ids.len()) {
+        return Err(StoreError::InvalidInput {
+            detail: "source version count must match source ids".to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// #4045 (5-agent vote 4d3ea1c5, memory 656eb5ff, item 2) — the ONE mapping
+/// of a stale consolidation source onto the SAL error, shared by both
+/// adapters so a caller matching on the variant sees [`StoreError::Conflict`]
+/// on sqlite AND postgres. `Conflict` carries only the id (a structured
+/// field, never decorated text), so the expected/stored versions are kept
+/// for the operator in a structured WARN emitted here, at the one point both
+/// values are known.
+pub(crate) fn consolidation_version_conflict(id: &str, expected: i64, stored: i64) -> StoreError {
+    tracing::warn!(
+        memory_id = %id,
+        expected_version = expected,
+        stored_version = stored,
+        "consolidation refused: source changed after it was summarized"
+    );
+    StoreError::Conflict { id: id.to_string() }
+}
+
 /// #1709 Pillar 1 — capability tag returned by the default (unsupported)
 /// `checkpoint_*` trait methods. One named const referenced at every default
 /// arm (the sibling `"SIGNALS"` / `"ACTIONS"` / `"LEASES"` tags stay bare
@@ -3483,6 +3527,40 @@ pub trait MemoryStore: Send + Sync {
                 .as_str()
                 .to_string(),
         })
+    }
+
+    /// Consolidate with source versions aligned one-for-one with `ids`.
+    /// Adapters compare them inside the write transaction before any mutation;
+    /// PostgreSQL locks all sources in stable id order until commit.
+    /// `None` retains the ordinary consolidation contract.
+    async fn consolidate_with_expected_versions(
+        &self,
+        ctx: &CallerContext,
+        ids: &[String],
+        title: &str,
+        summary: &str,
+        namespace: &str,
+        tier: &Tier,
+        source: &str,
+        consolidator_agent_id: &str,
+        expected_versions: Option<&[i64]>,
+    ) -> StoreResult<String> {
+        if expected_versions.is_some() {
+            return Err(StoreError::UnsupportedCapability {
+                capability: "version-checked consolidation".to_string(),
+            });
+        }
+        self.consolidate(
+            ctx,
+            ids,
+            title,
+            summary,
+            namespace,
+            tier,
+            source,
+            consolidator_agent_id,
+        )
+        .await
     }
 
     /// #2860 (federation data-integrity, 5-agent vote `4d3ea1c5`) — replace a
