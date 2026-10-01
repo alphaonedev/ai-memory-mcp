@@ -2023,6 +2023,13 @@ fn section_postgres_transition_identities_4024() -> Option<ReportSection> {
             .map_err(anyhow::Error::from)
     })
     .and_then(|inner| inner);
+    Some(transition_identities_section_4024(count))
+}
+
+/// #4024 - render the postgres transition-identity count (pure, unit-tested):
+/// `Info` with the count, or `Critical` when it could not be read - never 0.
+#[cfg(feature = "sal-postgres")]
+fn transition_identities_section_4024(count: Result<i64>) -> ReportSection {
     let mut facts = vec![("backend".into(), "postgres".to_string())];
     let (severity, note) = match count {
         Ok(n) => {
@@ -2037,12 +2044,12 @@ fn section_postgres_transition_identities_4024() -> Option<ReportSection> {
             )
         }
     };
-    Some(ReportSection {
+    ReportSection {
         name: SECTION_TRANSITION_IDENTITIES.into(),
         severity,
         facts,
         note,
-    })
+    }
 }
 
 /// v1.0.0 (#3264) — "Postgres extensions" report row(s).
@@ -7443,6 +7450,37 @@ enabled = true
         let s = String::from_utf8(stdout).unwrap();
         assert!(s.contains("Hooks loaded: 1"), "got: {s}");
         assert!(s.contains("notify-hook.sh"), "got: {s}");
+    }
+
+    /// #4024 S3 - the postgres transition-identity section renders the count
+    /// (Info) and never reports an unreadable count as 0 (Critical).
+    #[cfg(feature = "sal-postgres")]
+    #[test]
+    fn postgres_transition_identities_section_renders_count_and_error_4024() {
+        let ok = transition_identities_section_4024(Ok(42));
+        assert_eq!(ok.name, SECTION_TRANSITION_IDENTITIES);
+        assert_eq!(ok.severity, Severity::Info);
+        assert!(
+            ok.facts
+                .iter()
+                .any(|(k, v)| k == FACT_ACTION_TRANSITION_NONCES && v == "42"),
+            "facts: {:?}",
+            ok.facts
+        );
+        let bad = transition_identities_section_4024(Err(anyhow::anyhow!("pg down")));
+        assert_eq!(bad.severity, Severity::Critical);
+        assert!(
+            !bad.facts
+                .iter()
+                .any(|(k, _)| k == FACT_ACTION_TRANSITION_NONCES),
+            "an unreadable count must not be rendered as a number: {:?}",
+            bad.facts
+        );
+        assert!(
+            bad.facts
+                .iter()
+                .any(|(k, v)| k == "error" && v.contains("pg down"))
+        );
     }
 
     /// #4024 (vote 4d3ea1c5 item 3) — the Storage section reports the

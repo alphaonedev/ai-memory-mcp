@@ -194,7 +194,9 @@ daemon so Postgres-backed / MCP-over-HTTP deployments can drive them
   op. The identity row binds a SHA-256 of the canonical signed bytes: a
   re-delivery of the same op is an idempotent `noop`; a different op under
   the same `(action_id, nonce)` is `skipped` (collision WARN), never a
-  `noop`; a nonce that is not exactly 16 bytes is refused. On a shared
+  `noop`; a nonce that is not exactly 16 bytes is refused. Under the hatch an unsigned op's
+  re-delivery is NOT a noop (no identity): its CAS misses, so it is `skipped`,
+  lands in the push-DLQ and is quarantined after about 100 retries. On a shared
   postgres DSN upgrade every binary together (an already-connected older
   daemon applies without recording until it reconnects).
 - **Transition-replay nonce** (#1805) — each signed transition delivery

@@ -17663,13 +17663,13 @@ pub(crate) fn to_store_err(what: &str, e: sqlx::Error) -> StoreError {
     }
 }
 
-/// #1709 Pillar 1 — `actions` by-id SELECT (canonical column order matching
-/// [`pg_row_to_action`]). One definition shared by the by-id reads.
 /// Row-locking read of an action's current state: the compare-and-swap window
 /// opener shared by `action_transition`, `action_transition_cas` and the
 /// #4024 `action_transition_cas_once` (one spelling, one lock discipline).
 const PG_ACTION_STATE_FOR_UPDATE: &str = "SELECT state FROM actions WHERE id = $1 FOR UPDATE";
 
+/// #1709 Pillar 1 — `actions` by-id SELECT (canonical column order matching
+/// [`pg_row_to_action`]). One definition shared by the by-id reads.
 const PG_ACTION_SELECT_BY_ID: &str = "SELECT id, namespace, kind, state, title, payload, \
      priority, agent_id, claimed_by, vector_clock, metadata, created_at, updated_at \
      FROM actions WHERE id = $1";
@@ -29715,6 +29715,9 @@ impl MemoryStore for PostgresStore {
         _ctx: &CallerContext,
         t: &crate::actions::RemoteTransition<'_>,
     ) -> StoreResult<crate::actions::RemoteCasOutcome> {
+        // Gate here as well as in the child module: the record-stop parity
+        // scanner (`qual_pg_record_stop_gate_parity_3175`) reads only this file.
+        self.gate_record_stop().await?;
         // #4024 — one transaction: row lock, identity probe, CAS, identity insert.
         self.transition_cas_once_tx(t).await
     }
