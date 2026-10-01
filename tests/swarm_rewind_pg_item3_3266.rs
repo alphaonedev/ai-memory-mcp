@@ -340,3 +340,137 @@ async fn pg_swarm_rewind_cost_is_lineage_rollup_pg_3323() {
         "the rewind report reads the PG rollup"
     );
 }
+
+/// A database lock barrier, not a timing assumption: return the backend
+/// currently waiting directly on `holder`. Bounded so a broken fixture fails.
+async fn blocked_backend(store: &PostgresStore, holder: i32) -> i32 {
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        loop {
+            let pid: Option<i32> = sqlx::query_scalar(
+                "SELECT pid FROM pg_stat_activity WHERE datname = current_database() \
+                 AND $1 = ANY(pg_blocking_pids(pid)) LIMIT 1",
+            )
+            .bind(holder)
+            .fetch_optional(store.pool())
+            .await
+            .expect("probe lock barrier");
+            if let Some(pid) = pid {
+                return pid;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("lock barrier must be reached")
+}
+
+/// #4010: upstream <- z-root <- a-child. Auto-stamping holds a-child;
+/// rewind then waits on a-child. On the carrier it also holds z-root, so
+/// resuming auto-stamping makes the two real transactions deadlock.
+#[tokio::test]
+#[ignore = "live postgres: AI_MEMORY_TEST_POSTGRES_URL (postgres-ignored tier)"]
+async fn pg_rewind_and_auto_stamp_share_lock_order_4010() {
+    let store = std::sync::Arc::new(connect().await.expect("live postgres URL required"));
+    let namespace = format!("lock-order-{}", uuid::Uuid::new_v4().simple());
+    let issuer = cell_issuer();
+    let mut upstream = mem(&namespace, "upstream");
+    let mut root = mem(&namespace, "root");
+    let mut child = mem(&namespace, "child");
+    upstream.id = format!("u-{namespace}");
+    root.id = format!("z-{namespace}");
+    child.id = format!("a-{namespace}");
+    let ctx = CallerContext::for_agent("ai:tester");
+    for row in [&upstream, &root, &child] {
+        store.store(&ctx, row).await.expect("seed overlap");
+    }
+    for (c, p) in [(&root, &upstream), (&child, &root)] {
+        let link = MemoryLink {
+            source_id: c.id.clone(),
+            target_id: p.id.clone(),
+            relation: MemoryLinkRelation::DerivesFrom,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            signature: None,
+            observed_by: None,
+            valid_from: None,
+            valid_until: None,
+            attest_level: None,
+            source_cid: None,
+            target_cid: None,
+        };
+        store.link(&ctx, &link).await.expect("overlapping lineage");
+    }
+
+    // Test-only AFTER UPDATE trigger pauses the production auto-stamp while
+    // it owns the first row. All interpolated SQL is generated UUID/id text.
+    let trigger = format!("barrier_4010_{}", uuid::Uuid::new_v4().simple());
+    let mut barrier = store.pool().begin().await.expect("barrier connection");
+    let holder: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *barrier)
+        .await
+        .expect("barrier pid");
+    sqlx::query("SELECT pg_advisory_xact_lock(4010, $1)")
+        .bind(holder)
+        .execute(&mut *barrier)
+        .await
+        .expect("hold barrier");
+    sqlx::raw_sql(&format!(
+        "CREATE FUNCTION {trigger}() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN PERFORM pg_advisory_xact_lock(4010, {holder}); RETURN NEW; END $$; \
+         CREATE TRIGGER {trigger} AFTER UPDATE ON memories FOR EACH ROW \
+         WHEN (NEW.id = '{}') EXECUTE FUNCTION {trigger}()",
+        child.id,
+    ))
+    .execute(store.pool())
+    .await
+    .expect("install test barrier");
+
+    let stamp_store = std::sync::Arc::clone(&store);
+    let stamp_root = upstream.id.clone();
+    let stamp = tokio::spawn(async move {
+        stamp_store
+            .stamp_contaminated_descendants_pg(&stamp_root, DEPTH)
+            .await
+    });
+    let stamper = blocked_backend(&store, holder).await;
+    let rewind_store = std::sync::Arc::clone(&store);
+    let rewind_root = root.id.clone();
+    let rewind_issuer = issuer.clone();
+    let rewind = tokio::spawn(async move {
+        rewind_store
+            .swarm_rewind(
+                &admin(&rewind_issuer),
+                &rewind_root,
+                DEPTH,
+                "memory",
+                &[],
+                false,
+            )
+            .await
+    });
+    let rewinder = blocked_backend(&store, stamper).await;
+    assert_ne!(stamper, rewinder, "independent transaction connections");
+    barrier.commit().await.expect("release auto-stamp barrier");
+    let (stamp, rewind) = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        tokio::join!(stamp, rewind)
+    })
+    .await
+    .expect("both containment writes finish without timeout");
+    sqlx::raw_sql(&format!(
+        "DROP TRIGGER {trigger} ON memories; DROP FUNCTION {trigger}()"
+    ))
+    .execute(store.pool())
+    .await
+    .expect("remove test barrier");
+    let stamp = stamp.expect("join auto-stamp");
+    let rewind = rewind.expect("join rewind");
+    assert!(
+        stamp.is_ok() && rewind.is_ok(),
+        "both containment writes must succeed: stamp={stamp:?}, rewind={rewind:?}"
+    );
+    for row in [&root, &child] {
+        assert_eq!(state(&store, &row.id).await, "contaminated");
+    }
+    assert_eq!(state(&store, &upstream.id).await, "open");
+    assert_eq!(rewind_events(&store, &issuer).await, 1);
+    assert!(rewind.expect("successful rewind").signed_event_id.is_some());
+}
