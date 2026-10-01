@@ -210,7 +210,14 @@ fn ssot_gated_inherent_pg_twins_must_gate_3175() {
     // sqlite SSOT twin gates (update_with_expected_version — the
     // If-Match path) were invisible. Pair storage/mod.rs gated free-fns
     // with same-named PostgresStore methods.
-    let ssot = ssot_free_fns(&read("src/storage/mod.rs"));
+    // #4023 (L1): `merge_inbound_authorized` and its `gate_storage_conn`
+    // moved to a storage child module; read it with the root so the SSOT side
+    // does not go blind to the moved free fn.
+    let ssot = ssot_free_fns(&format!(
+        "{}\n{}",
+        read("src/storage/mod.rs"),
+        read("src/storage/merge_inbound_authorized_4023.rs")
+    ));
     let postgres = pg_methods();
     let pg_directly_gated: BTreeSet<&String> = postgres
         .iter()
