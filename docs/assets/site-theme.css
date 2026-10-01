@@ -36,9 +36,10 @@
   --sans:'IBM Plex Sans',system-ui,-apple-system,sans-serif;
   --mono:'IBM Plex Mono',ui-monospace,"SF Mono",monospace;
   /* compatibility aliases for legacy pages that link this file last */
-  --bg-raised:var(--raise); --bg-card:var(--panel); --bg-elev:var(--panel); --bg-code:var(--bg2); --code-bg:var(--bg2);
-  --text:var(--ink); --text-muted:var(--ink-mid); --muted:var(--ink-mid); --text-dim:var(--ink-soft); --dim:var(--ink-soft);
-  --border:var(--line); --border-hi:var(--line-strong); --border-hl:var(--line-strong);
+  /* (values that no landing token defines keep main's site-theme.css values, #4420 CR-5) */
+  --bg-raised:#efe9dc; --bg-card:var(--panel); --bg-elev:var(--panel); --bg-code:#efe9dc; --code-bg:#efe9dc;
+  --text:var(--ink); --text-muted:#6f6656; --muted:#6f6656; --text-dim:#8a8272; --dim:#8a8272;
+  --border:var(--line); --border-hi:#c9bfa8; --border-hl:#c9bfa8;
   --cyan:var(--accent); --accent-cyan:var(--accent); --p1:var(--accent);
   --font-sans:var(--sans); --font-mono:var(--mono);
 }
@@ -51,6 +52,8 @@
   --teal:#3d7565; --teal-soft:#12251f; --good:#4cba86;
   --bad:#e0805f; --bad-soft:#2a140d;
   --slate:#86a7c2; --slate-soft:#121a21;
+  --bg-raised:#15130e; --bg-elev:#191610; --bg-code:#1e1b13; --code-bg:#1e1b13;
+  --text-muted:#988f7f; --muted:#988f7f; --text-dim:#8a8272; --dim:#8a8272; --border-hi:#3a3524; --border-hl:#3a3524;
 }}
 :root[data-theme="dark"]{
   color-scheme:dark;
@@ -61,6 +64,8 @@
   --teal:#3d7565; --teal-soft:#12251f; --good:#4cba86;
   --bad:#e0805f; --bad-soft:#2a140d;
   --slate:#86a7c2; --slate-soft:#121a21;
+  --bg-raised:#15130e; --bg-elev:#191610; --bg-code:#1e1b13; --code-bg:#1e1b13;
+  --text-muted:#988f7f; --muted:#988f7f; --text-dim:#8a8272; --dim:#8a8272; --border-hi:#3a3524; --border-hl:#3a3524;
 }
 
 /* ---------------------------------------------------- base element rules */
