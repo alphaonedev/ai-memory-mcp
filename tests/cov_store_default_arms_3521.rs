@@ -391,6 +391,15 @@ async fn benign_default_arms_degrade_without_refusing() {
             .await
             .expect("dequarantine default")
     );
+    // #4208 — the evidence-bound release default is FAIL-CLOSED: an adapter that
+    // cannot prove the stored surface never releases a quarantine.
+    let mut verified = probe_memory();
+    verified.metadata = serde_json::json!({"agent_id": "a", "attest_level": "agent_attested"});
+    assert!(
+        !s.dequarantine_verified("m-3521", &verified)
+            .await
+            .expect("dequarantine_verified default")
+    );
     // No watermark → the federation catch-up never short-circuits.
     assert!(
         s.agent_max_created_at("agent-a")
