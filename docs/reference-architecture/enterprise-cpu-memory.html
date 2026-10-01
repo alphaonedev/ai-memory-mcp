@@ -12,27 +12,26 @@
 <title>ai-memory · Enterprise Reference Architecture — CPU + Memory Federated Nodes</title>
 <meta name="description" content="API embeddings on commodity CPU + memory nodes — no GPU, no Ollama, full semantic/autonomous tier. The #1598 reference shape for enterprise federated ai-memory deployments.">
 <link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/reference-architecture/enterprise-cpu-memory.html">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700;800;900&amp;family=IBM+Plex+Sans:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@500;600&amp;display=swap">
+<link rel="stylesheet" href="../assets/site-theme.css">
+<meta name="theme-color" content="#0c0b08">
 <style>
-:root{--bg:#000;--bg-raised:#0a0a0a;--bg-card:#111;--bg-elev:#161616;--bg-code:#1a1a1a;--border:#262626;--border-hl:#3d3d3d;--text:#fff;--text-muted:#999;--text-dim:#666;--p1:#b07d10;--p2:#ffb86b;--p3:#c8a2ff;--good:#b07d10;--bad:#ff6b9d;--warn:#ffd700;--gold:#ffd700;
+:root{--p2:var(--slate);--p3:var(--teal);--warn:var(--accent-ink);--gold:var(--accent);
 /* three-leg accents (centerpiece) */
---leg1:#b07d10;--leg2:#c8a2ff;--leg3:#ffb86b;
+--leg1:var(--accent);--leg2:var(--teal);--leg3:var(--slate);
 /* three regions */
---rg-nyc:#b07d10;--rg-fra:#c8a2ff;--rg-sgp:#ffb86b;
---font-mono:'SF Mono','Cascadia Code','Fira Code',Consolas,monospace;--font-sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;--max-w:1280px}
+--rg-nyc:var(--accent);--rg-fra:var(--teal);--rg-sgp:var(--slate);--max-w:1120px}
 *,*::before,*::after{margin:0;padding:0;box-sizing:border-box}
 html{scroll-behavior:smooth;scroll-padding-top:5rem}
 body{font-family:var(--font-sans);background:var(--bg);color:var(--text);line-height:1.6;-webkit-font-smoothing:antialiased;overflow-x:hidden}
-a{color:var(--text);text-decoration:none}a:hover{color:var(--p1)}
+a{color:var(--accent-ink);text-decoration:none}a:hover{color:var(--accent)}
 code{font-family:var(--font-mono);font-size:.85rem;background:var(--bg-code);padding:.1em .35em;border-radius:4px}
 .container{max-width:var(--max-w);margin:0 auto;padding:0 1.5rem}
-h1,h2,h3{font-weight:700;letter-spacing:-0.02em}h2{font-size:1.6rem;margin-bottom:.5rem;font-family:var(--font-mono)}h3{font-size:1.05rem}
+h1,h2,h3{font-family:var(--disp);font-weight:800;letter-spacing:-0.02em;color:var(--ink)}h2{font-size:1.6rem;margin-bottom:.5rem;font-family:var(--disp)}h3{font-size:1.05rem}
 p{color:var(--text-muted)}
-.topnav{position:sticky;top:0;z-index:50;background:var(--bg);backdrop-filter:blur(12px);border-bottom:1px solid var(--border)}
-.topnav .inner{display:flex;justify-content:space-between;max-width:var(--max-w);margin:0 auto;padding:.9rem 1.5rem;font-size:.875rem}
-.topnav a{color:var(--text-muted);margin-right:1.25rem}.topnav a:hover{color:var(--text)}
-.topnav .home-link{color:var(--text);font-weight:600}
-.topnav .right{display:flex;gap:1.25rem}@media(max-width:800px){.topnav .right{display:none}}
-.hero{padding:4rem 1.5rem 2.5rem;text-align:center;background:radial-gradient(ellipse at center,rgba(255,215,0,0.08),transparent 60%);border-bottom:1px solid var(--border)}
+.hero{padding:4rem 1.5rem 2.5rem;text-align:center;background:radial-gradient(ellipse at center,color-mix(in srgb,var(--accent) 8%,transparent),transparent 60%);border-bottom:1px solid var(--border)}
 .hero h1{font-size:clamp(2rem,4.5vw,3.25rem);line-height:1.1;letter-spacing:-0.03em;margin-bottom:1rem}
 .hero .tagline{color:var(--text-muted);font-size:1.05rem;max-width:860px;margin:0 auto 1rem}
 .hero .pills{display:flex;justify-content:center;gap:.5rem;flex-wrap:wrap;margin-top:1.25rem}
@@ -54,7 +53,9 @@ section h2.sans{font-family:var(--font-sans);font-size:1.75rem}
 .matrix td{padding:.7rem 1rem;border-bottom:1px solid var(--border);vertical-align:top}
 .matrix tr:last-child td{border-bottom:none}
 .matrix .id{font-family:var(--font-mono);font-weight:700;color:var(--p3)}
-.matrix .res{font-family:var(--font-mono);font-size:.82rem;color:var(--warn);white-space:nowrap}
+.matrix .res{font-family:var(--font-mono);font-size:.82rem;color:var(--good);white-space:normal;min-width:16rem}
+.matrix .res.partial{color:var(--accent-ink)}
+.matrix{min-width:760px}
 .matrix code{font-size:.78rem}
 .scroll-x{overflow-x:auto;border-radius:12px}
 
@@ -78,7 +79,7 @@ section h2.sans{font-family:var(--font-sans);font-size:1.75rem}
 .testpair .t .tag{font-weight:700;letter-spacing:.04em;margin-right:.4rem}
 .testpair .t.pos .tag{color:var(--good)}
 .testpair .t.neg .tag{color:var(--bad)}
-.testpair .t .res{color:var(--warn);float:right}
+.testpair .t .res{color:var(--good);float:right}
 
 .snip{font-family:var(--font-mono);font-size:.78rem;color:var(--text-muted);margin-top:.85rem;padding:.85rem 1rem;background:var(--bg-code);border:1px solid var(--border);border-radius:8px;line-height:1.55;white-space:pre;overflow-x:auto}
 .snip .ok{color:var(--good)}.snip .err{color:var(--bad)}.snip .warn{color:var(--warn)}.snip .cm{color:var(--text-dim)}.snip .key{color:var(--p3)}.snip .val{color:var(--p2)}
@@ -89,30 +90,20 @@ section h2.sans{font-family:var(--font-sans);font-size:1.75rem}
 .step h3{font-family:var(--font-mono);font-size:1.1rem;margin-bottom:.5rem;color:var(--text)}
 .step p{color:var(--text-muted);font-size:.92rem;margin-bottom:.6rem}
 
-.warn-box{background:rgba(255,215,0,0.05);border:1px solid var(--warn);border-radius:10px;padding:1rem 1.25rem;margin:1.5rem 0;color:var(--text-muted);font-size:.9rem}
+.warn-box{background:color-mix(in srgb,var(--accent) 5%,transparent);border:1px solid var(--warn);border-radius:10px;padding:1rem 1.25rem;margin:1.5rem 0;color:var(--text-muted);font-size:.9rem}
 .warn-box strong{color:var(--warn);font-family:var(--font-mono);font-size:.82rem;letter-spacing:.04em;display:block;margin-bottom:.35rem}
-.honest-box{background:rgba(255,107,157,0.05);border:1px solid var(--bad);border-radius:10px;padding:1.1rem 1.25rem;margin:1.25rem 0;color:var(--text-muted);font-size:.9rem}
+.honest-box{background:color-mix(in srgb,var(--bad) 5%,transparent);border:1px solid var(--bad);border-radius:10px;padding:1.1rem 1.25rem;margin:1.25rem 0;color:var(--text-muted);font-size:.9rem}
 .honest-box strong{color:var(--bad);font-family:var(--font-mono);font-size:.82rem;letter-spacing:.04em;display:block;margin-bottom:.35rem}
 
-footer{padding:3rem 1.5rem 2.5rem;text-align:center;color:var(--text-dim);font-size:.85rem;border-top:1px solid var(--border)}
-footer .footer-links{display:flex;justify-content:center;gap:1.5rem;flex-wrap:wrap;margin-bottom:1rem}
-footer a{color:var(--text-dim)}footer a:hover{color:var(--p1)}
-footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
+footer.ra-legal{padding:2.5rem 1.5rem 1rem;text-align:center;color:var(--text-dim);font-size:.85rem;border-top:1px solid var(--border)}
+footer.ra-legal .footer-links{display:flex;justify-content:center;gap:1.5rem;flex-wrap:wrap;margin-bottom:1rem}
+footer.ra-legal a{color:var(--text-dim)}footer a:hover{color:var(--p1)}
+footer.ra-legal .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
 
-.topnav .menu{position:relative;display:inline-block}
-.topnav .menu-btn{background:none;border:none;color:var(--text-muted);font-family:inherit;font-size:inherit;cursor:pointer;padding:.2rem 0;line-height:1;letter-spacing:0}
-.topnav .menu-btn:hover,.topnav .menu:focus-within .menu-btn{color:var(--text)}
-.topnav .menu-btn.active{color:var(--text)}
-.topnav .menu-btn .caret{opacity:.5;font-size:.7em;margin-left:.2em}
-.topnav .menu-pane{position:absolute;top:calc(100% + .55rem);right:0;background:var(--bg-card);border:1px solid var(--border-hl);border-radius:8px;padding:.4rem 0;min-width:240px;box-shadow:0 10px 28px rgba(0,0,0,0.5);z-index:60;visibility:hidden;opacity:0;transition:opacity .12s ease,visibility 0s .12s}
-.topnav .menu:focus-within .menu-pane,.topnav .menu:hover .menu-pane{visibility:visible;opacity:1;transition:opacity .12s ease}
-.topnav .menu-pane a{display:block;padding:.5rem 1rem;color:var(--text-muted);font-size:.85rem;margin-right:0;white-space:nowrap;text-decoration:none}
-.topnav .menu-pane a:hover{background:var(--bg-elev);color:var(--text)}
-.topnav .menu-pane a.current{color:var(--p1);background:var(--bg-elev)}
 
 /* ============ animated diagram ============ */
-.diagram-wrap{background:var(--bg-raised);border:1px solid var(--border);border-radius:16px;padding:1rem;margin:1.5rem 0;overflow:hidden}
-.diagram-wrap svg{display:block;width:100%;height:auto}
+.diagram-wrap{background:var(--panel);border:1px solid var(--border);border-radius:16px;padding:1rem;margin:1.5rem 0;overflow-x:auto;min-width:0;-webkit-overflow-scrolling:touch}
+.diagram-wrap svg{display:block;width:100%;height:auto;min-width:var(--fig-min,820px)}
 .legend{display:flex;flex-wrap:wrap;gap:1rem 1.5rem;justify-content:center;margin-top:1rem;font-size:.8rem;color:var(--text-muted)}
 .legend .item{display:flex;align-items:center;gap:.45rem;font-family:var(--font-mono)}
 .legend .sw{width:26px;height:0;border-top:3px dashed currentColor;border-radius:2px}
@@ -123,7 +114,7 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
 @keyframes march{to{stroke-dashoffset:-32}}
 @keyframes pulse-glow{0%,100%{opacity:.55}50%{opacity:1}}
 @keyframes shimmer{0%,100%{stroke-opacity:.35}50%{stroke-opacity:.9}}
-@keyframes node-breathe{0%,100%{filter:drop-shadow(0 0 2px rgba(176,125,16,0.25))}50%{filter:drop-shadow(0 0 7px rgba(176,125,16,0.55))}}
+@keyframes node-breathe{0%,100%{filter:drop-shadow(0 0 2px color-mix(in srgb,var(--accent) 25%,transparent))}50%{filter:drop-shadow(0 0 7px color-mix(in srgb,var(--accent) 55%,transparent))}}
 @keyframes shield-flicker{0%,100%{opacity:.85}50%{opacity:1}}
 
 .flow{stroke-width:2.4;fill:none;stroke-linecap:round;stroke-dasharray:9 7}
@@ -147,7 +138,7 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
 </style>
 <style>
 .article{max-width:62rem;margin:0 auto;padding:2.5rem 1.5rem 4rem}
-.article h2{font-family:var(--font-mono);font-size:1.45rem;margin:2.4rem 0 .9rem;padding-bottom:.4rem;border-bottom:1px solid var(--border);color:var(--text)}
+.article h2{font-family:var(--disp);font-size:1.45rem;margin:2.4rem 0 .9rem;padding-bottom:.4rem;border-bottom:1px solid var(--border);color:var(--text)}
 .article h3{font-size:1.1rem;margin:1.6rem 0 .6rem;color:var(--text)}
 .article p{color:var(--text-muted);margin:.7rem 0}
 .article ul,.article ol{color:var(--text-muted);margin:.7rem 0 .7rem 1.4rem}
@@ -168,54 +159,71 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
 .hero.doc h1{font-size:clamp(1.7rem,3.6vw,2.6rem);text-align:left;margin-bottom:.5rem}
 .hero.doc .tagline{margin:0;text-align:left;max-width:62rem}
 </style>
-  <link rel="stylesheet" href="/ai-memory-mcp/assets/site-theme.css">
 </head>
-<body>
+<body class="am-page">
 
-<nav class="topnav">
-  <div class="inner">
-    <a class="home-link" href="../">ai-memory <span style="opacity:.5">▸ Reference Architecture</span></a>
-    <div class="right">
-      <a href="../at-a-glance.html" style="color:var(--accent-ink)">Atlas</a>
-      <a href="../whats-new-v09.html" style="color:var(--accent-ink)">v0.9.0</a>
-      <div class="menu">
-        <button class="menu-btn active">Architectures<span class="caret">▾</span></button>
-        <div class="menu-pane">
-          <a href="../architectures.html">Overview</a>
-          <a href="../architectures-t1.html">T1 — Single Agent</a>
-          <a href="../architectures-t2.html">T2 — Many Agents</a>
-          <a href="../architectures-t3.html">T3 — Multi-Node Cluster</a>
-          <a href="../architectures-t4.html">T4 — Data-Center Swarm</a>
-          <a href="../architectures-t5.html">T5 — Global Hive</a>
-          <a href="./">Grand Slam — 3-Region Hive</a>
-          <a href="enterprise-cpu-memory.html" class="current">Enterprise — CPU+Memory Nodes</a>
-          <a href="enterprise-cpu-memory-gpu.html">Enterprise — CPU+Memory+GPU Nodes</a>
-        </div>
+<a class="am-skip" href="#main">Skip to content</a>
+<header class="am-nav"><div class="am-nav-in">
+  <a class="am-brand" href="../index.html" aria-label="ai-memory home">
+    <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 2l9 5.2v9.6L12 22 3 16.8V7.2z" stroke="var(--accent)" stroke-width="1.5"/><circle cx="12" cy="12" r="2.4" fill="var(--accent)"/><path d="M12 9.6V4.5M12 14.4v5.1M14.4 12h5M4.9 12h5" stroke="var(--accent)" stroke-width="1.1"/></svg>
+    ai-memory <span class="am-crumb">/ reference / CPU + memory</span>
+  </a>
+  <nav class="am-links" aria-label="Primary">
+    <a href="../architectures.html">Architectures</a>
+    <div class="am-dd">
+      <button aria-haspopup="true">Tiers ▾</button>
+      <div class="am-dd-menu">
+        <a href="../architectures-t1.html">T1 · Single node<span>one agent, one store</span></a>
+        <a href="../architectures-t2.html">T2 · Shared daemon<span>many agents, one host</span></a>
+        <a href="../architectures-t3.html">T3 · Federated cluster<span>W-of-N quorum, signed sync</span></a>
+        <a href="../architectures-t4.html">T4 · Data-center swarm<span>PostgreSQL tier</span></a>
+        <a href="../architectures-t5.html">T5 · Federated hive<span>multi-DC / multi-region</span></a>
       </div>
-      <div class="menu">
-        <button class="menu-btn">Internals<span class="caret">▾</span></button>
-        <div class="menu-pane">
-          <a href="../schema.html">Schema</a>
-          <a href="../types.html">Types</a>
-          <a href="../validators.html">Validators</a>
-          <a href="../governance.html">Governance</a>
-          <a href="../batman-active-mode.html">Batman Mode</a>
-          <a href="../encryption.html">Encryption</a>
-          <a href="../tracing.html">Tracing</a>
-        </div>
-      </div>
-      <div class="menu">
-        <button class="menu-btn">Compliance<span class="caret">▾</span></button>
-        <div class="menu-pane">
-          <a href="../compliance/">Overview</a>
-          <a href="../compliance/nsa-csi-mcp.html">NSA CSI MCP</a>
-        </div>
-      </div>
-      <a href="../credits.html">Credits</a>
-      <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub →</a>
     </div>
-  </div>
-</nav>
+    <div class="am-dd">
+      <button aria-haspopup="true">Reference ▾</button>
+      <div class="am-dd-menu">
+        <a href="../reference-architecture/">3-region hive<span>the do-1461 run record</span></a>
+        <a href="../reference-architecture/enterprise-cpu-memory.html">Enterprise · CPU + memory<span>API embeddings, no GPU</span></a>
+        <a href="../reference-architecture/enterprise-cpu-memory-gpu.html">Enterprise · CPU + memory + GPU<span>local embeddings</span></a>
+        <a href="../enterprise-deployment.html">Enterprise deployment guide<span>sizing, replication, backups</span></a>
+        <a href="../ARCHITECTURAL_LIMITS.html">Architectural limits<span>what does not scale, and why</span></a>
+      </div>
+    </div>
+    <div class="am-dd">
+      <button aria-haspopup="true">Planes ▾</button>
+      <div class="am-dd-menu">
+        <a href="../federation.html">Federation<span>signed sync, quorum, catch-up</span></a>
+        <a href="../wake-hub.html">Wake plane<span>wake-hub, wake-listen</span></a>
+        <a href="../a2a-integration.html">Integrate any agent<span>inbox, notify, wake</span></a>
+        <a href="../governance.html">Governance<span>policies, approvals</span></a>
+        <a href="../encryption.html">Encryption<span>at rest and in transit</span></a>
+        <a href="../SECURITY.html">Security model<span>threat model, posture</span></a>
+      </div>
+    </div>
+  </nav>
+  <details class="am-mnav"><summary>Menu</summary><div class="am-mnav-pane">
+    <a href="../index.html">Home</a>
+    <a href="../architectures.html">Architectures overview</a>
+    <div class="am-g">Tiers</div>
+    <a href="../architectures-t1.html">T1 · Single node</a>
+    <a href="../architectures-t2.html">T2 · Shared daemon</a>
+    <a href="../architectures-t3.html">T3 · Federated cluster</a>
+    <a href="../architectures-t4.html">T4 · Data-center swarm</a>
+    <a href="../architectures-t5.html">T5 · Federated hive</a>
+    <div class="am-g">Reference</div>
+    <a href="../reference-architecture/">3-region hive</a>
+    <a href="../reference-architecture/enterprise-cpu-memory.html">Enterprise · CPU + memory</a>
+    <a href="../reference-architecture/enterprise-cpu-memory-gpu.html">Enterprise · CPU + memory + GPU</a>
+    <a href="../ARCHITECTURAL_LIMITS.html">Architectural limits</a>
+    <div class="am-g">Planes</div>
+    <a href="../federation.html">Federation</a>
+    <a href="../wake-hub.html">Wake plane</a>
+    <a href="../governance.html">Governance</a>
+    <a href="../SECURITY.html">Security model</a>
+  </div></details>
+  <a class="am-cta" href="https://github.com/alphaonedev/ai-memory-mcp">GitHub</a>
+</div></header>
 
 <section class="hero doc">
   <div class="container">
@@ -225,7 +233,7 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
   </div>
 </section>
 
-<main class="article">
+<main class="article" id="main">
 <p><strong>API embeddings on commodity CPU nodes — no GPU, no Ollama, full
 semantic/autonomous tier.</strong> This is the #1598 reference shape for
 enterprise federated deployments where the fleet is CPU + memory only
@@ -441,7 +449,7 @@ models do not compare. Roll out a model change fleet-wide:
 </ul>
 </main>
 
-<footer>
+<footer class="ra-legal">
   <div class="footer-links">
     <a href="https://github.com/alphaonedev/ai-memory-mcp">Source</a>
     <a href="https://github.com/alphaonedev/ai-memory-mcp/issues">Issues</a>
@@ -451,11 +459,20 @@ models do not compare. Roll out a model change fleet-wide:
     <a href="../whats-new-v09.html">v0.9.0</a>
   </div>
   <div>ai-memory &middot; Apache-2.0 &middot; &copy; 2026 <a href="https://alphaonedev.com">AlphaOne LLC</a></div>
-  <div class="legal">Secure Enterprise Federated Reference Architecture (do-1461) — a 3-region Batman-mode AI Agent Hive. A v0.9.0 GA deliverable.</div>
+  <div class="legal">Secure Enterprise Federated Reference Architecture (do-1461) — a 3-region Batman-mode AI Agent Hive. A v1.0.0 GA deliverable.</div>
   <div class="legal" style="margin-top:.55rem; font-size:.72rem; opacity:.85; max-width:64rem; margin-left:auto; margin-right:auto">
     <strong>NSA non-endorsement.</strong> References to the National Security Agency Cybersecurity Information document on MCP security (U/OO/6030316-26 | PP-26-1834, May 2026 v1.0) describe ai-memory's substrate-level posture relative to NSA-issued guidance. The NSA, the Department of Defense, and the United States Government do not endorse, certify, or recommend ai-memory, AgenticMem, AlphaOne LLC, or any commercial product. Full mapping + citation: <a href="../compliance/nsa-csi-mcp.html">compliance/nsa-csi-mcp.html</a>.
   </div>
 </footer>
+<footer class="am-foot"><div class="am-wrap">
+  <span>© 2026 AlphaOne LLC · Apache-2.0 · ai-memory v1.0.0</span>
+  <span><a href="https://github.com/alphaonedev/ai-memory-mcp">source</a> · <a href="../index.html">home</a> · <a href="../architectures.html">architectures</a> · <a href="../ARCHITECTURAL_LIMITS.html">limits</a></span>
+</div></footer>
+<button class="am-themetog" id="am-themetog" type="button" aria-label="Toggle light or dark theme">theme</button>
+<script>
+(function(){var d=document.documentElement;try{var s=localStorage.getItem('aim-site-theme');if(s)d.setAttribute('data-theme',s);}catch(e){}
+var b=document.getElementById('am-themetog');if(!b)return;b.addEventListener('click',function(){var c=d.getAttribute('data-theme');var n=c==='dark'?'light':c==='light'?'dark':(matchMedia('(prefers-color-scheme:dark)').matches?'light':'dark');d.setAttribute('data-theme',n);try{localStorage.setItem('aim-site-theme',n);}catch(e){}});})();
+</script>
 
 </body>
 </html>

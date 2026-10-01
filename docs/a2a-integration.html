@@ -1,0 +1,805 @@
+<!--
+  Copyright 2026 AlphaOne LLC
+  SPDX-License-Identifier: Apache-2.0
+  A2A Integration atlas — notify/inbox + subscribe/webhooks + federation propagation.
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ai-memory · A2A Integration — agent-to-agent</title>
+<meta name="description" content="Integrate any AI agent with the shipped ai-memory v1.0.0 wake plane: enrolment, receiving, sending, shell loops, SDKs and troubleshooting.">
+<link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/a2a-integration.html">
+<style>
+:root{--bg:#000;--bg-raised:#0a0a0a;--bg-card:#111;--bg-elev:#161616;--bg-code:#1a1a1a;--border:#262626;--border-hl:#3d3d3d;--text:#fff;--text-muted:#999;--text-dim:#666;--p1:#6ee7ff;--p2:#ffb86b;--p3:#c8a2ff;--good:#6ee7ff;--bad:#ff6b9d;--gold:#ffd700;--font-mono:'SF Mono','Cascadia Code','Fira Code',Consolas,monospace;--font-sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;--max-w:1280px}
+*,*::before,*::after{margin:0;padding:0;box-sizing:border-box}
+html{scroll-behavior:smooth;scroll-padding-top:5rem}
+body{font-family:var(--font-sans);background:var(--bg);color:var(--text);line-height:1.6;-webkit-font-smoothing:antialiased;overflow-x:hidden}
+a{color:var(--text);text-decoration:none}a:hover{color:var(--p1)}
+code{font-family:var(--font-mono);font-size:.85rem;background:var(--bg-code);padding:.1em .35em;border-radius:4px}
+.container{max-width:var(--max-w);margin:0 auto;padding:0 1.5rem}
+h1,h2,h3{font-weight:700;letter-spacing:-0.02em}h2{font-size:1.6rem;margin-bottom:.5rem;font-family:var(--font-mono)}h3{font-size:1.05rem}
+p{color:var(--text-muted)}
+.topnav{position:sticky;top:0;z-index:50;background:rgba(0,0,0,0.85);backdrop-filter:blur(12px);border-bottom:1px solid var(--border)}
+.topnav .inner{display:flex;justify-content:space-between;max-width:var(--max-w);margin:0 auto;padding:.9rem 1.5rem;font-size:.875rem}
+.topnav a{color:var(--text-muted);margin-right:1.25rem}.topnav a:hover{color:var(--text)}
+.topnav .home-link{color:var(--text);font-weight:600}
+.topnav .right{display:flex;gap:1.25rem;flex-wrap:wrap}@media(max-width:800px){.topnav .right{display:none}}
+.hero{padding:4rem 1.5rem 2.5rem;text-align:center;background:radial-gradient(ellipse at center,rgba(110,231,255,0.08),transparent 60%);border-bottom:1px solid var(--border)}
+.hero h1{font-size:clamp(2rem,4.5vw,3.25rem);line-height:1.1;letter-spacing:-0.03em;margin-bottom:1rem}
+.hero .tagline{color:var(--text-muted);font-size:1.05rem;max-width:780px;margin:0 auto 1rem}
+.hero .pills{display:flex;justify-content:center;gap:.5rem;flex-wrap:wrap;margin-top:1.25rem}
+.hero .pill{padding:.4rem 1rem;border:1px solid var(--border-hl);border-radius:999px;font-family:var(--font-mono);font-size:.78rem;color:var(--text-muted)}
+
+section{padding:3.5rem 0;border-bottom:1px solid var(--border)}
+.eyebrow{display:inline-block;font-size:.72rem;font-weight:600;letter-spacing:.12em;text-transform:uppercase;color:var(--text-muted);margin-bottom:.5rem;padding:.2rem .6rem;border:1px solid var(--border-hl);border-radius:999px}
+.lede{color:var(--text-muted);font-size:.95rem;max-width:820px;margin-bottom:2rem}
+
+.flow-svg{width:100%;background:var(--bg-card);border:1px solid var(--border);border-radius:14px;padding:1.5rem;margin-bottom:1.5rem}
+
+.tool{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:1.5rem;margin-bottom:1.25rem;position:relative;overflow:hidden}
+.tool::before{content:"";position:absolute;top:0;left:0;right:0;height:3px;background:var(--p1)}
+.tool.notify::before{background:var(--p2)}
+.tool.subscribe::before{background:var(--p3)}
+.tool.fed::before{background:var(--good)}
+.tool-head{display:flex;align-items:baseline;gap:1rem;flex-wrap:wrap;margin-bottom:.5rem}
+.tool-name{font-family:var(--font-mono);font-size:1.15rem;font-weight:700;color:var(--text)}
+.tool-tag{font-family:var(--font-mono);font-size:.7rem;letter-spacing:.1em;text-transform:uppercase;color:var(--text-muted);padding:.15em .55em;border:1px solid var(--border-hl);border-radius:4px}
+.tool-desc{color:var(--text-muted);font-size:.92rem;margin-bottom:1rem}
+
+.snip{font-family:var(--font-mono);font-size:.78rem;color:var(--text-muted);margin-top:.85rem;padding:.7rem .85rem;background:var(--bg-code);border-radius:6px;line-height:1.55;white-space:pre;overflow-x:auto}
+.snip .ok{color:var(--good)}
+.snip .err{color:var(--bad)}
+.snip .warn{color:var(--gold)}
+.snip .cm{color:var(--text-dim)}
+.snip .key{color:var(--p3)}
+.snip .val{color:var(--p2)}
+.snip .num{color:var(--p1)}
+
+.compare{display:grid;grid-template-columns:1fr 1fr;gap:1rem;margin:1.5rem 0}
+@media(max-width:760px){.compare{grid-template-columns:1fr}}
+.compare-col{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:1.25rem 1.5rem}
+.compare-col h3{font-family:var(--font-mono);margin-bottom:.85rem}
+.compare-col h3.in{color:var(--p2)}
+.compare-col h3.out{color:var(--p3)}
+.compare-col p{color:var(--text-muted);font-size:.88rem;line-height:1.5}
+
+footer{padding:3rem 1.5rem;text-align:center;font-size:.85rem;color:var(--text-dim);border-top:1px solid var(--border)}
+footer a{color:var(--text-muted)}
+
+/* Grouped dropdown menu (atlas v2) */
+.topnav .menu{position:relative;display:inline-block}
+.topnav .menu-btn{background:none;border:none;color:var(--text-muted);font-family:inherit;font-size:inherit;cursor:pointer;padding:.2rem 0;line-height:1;letter-spacing:0}
+.topnav .menu-btn:hover,.topnav .menu:focus-within .menu-btn{color:var(--text)}
+.topnav .menu-btn.active{color:var(--text)}
+.topnav .menu-btn .caret{opacity:.5;font-size:.7em;margin-left:.2em}
+.topnav .menu-pane{position:absolute;top:calc(100% + .55rem);right:0;background:var(--bg-card);border:1px solid var(--border-hl);border-radius:8px;padding:.4rem 0;min-width:240px;box-shadow:0 10px 28px rgba(0,0,0,0.5);z-index:60;visibility:hidden;opacity:0;transition:opacity .12s ease,visibility 0s .12s}
+.topnav .menu:focus-within .menu-pane,.topnav .menu:hover .menu-pane{visibility:visible;opacity:1;transition:opacity .12s ease}
+.topnav .menu-pane a{display:block;padding:.5rem 1rem;color:var(--text-muted);font-size:.85rem;margin-right:0;white-space:nowrap;text-decoration:none}
+.topnav .menu-pane a:hover{background:var(--bg-elev);color:var(--text)}
+.topnav .menu-pane a.current{color:var(--p1);background:var(--bg-elev)}
+
+/* Zero-JS mobile nav fallback — visible only when .right collapses */
+.topnav .mnav{display:none;position:relative}
+.topnav .mnav summary{list-style:none;cursor:pointer;color:var(--text-muted);border:1px solid var(--border-hl);border-radius:6px;padding:.3rem .8rem;font-size:.85rem;user-select:none}
+.topnav .mnav summary::-webkit-details-marker{display:none}
+.topnav .mnav[open] summary{color:var(--text);border-color:var(--text-muted)}
+.topnav .mnav-pane{position:absolute;top:calc(100% + .55rem);right:0;background:var(--bg-card);border:1px solid var(--border-hl);border-radius:8px;padding:.4rem 0;min-width:250px;max-height:72vh;overflow-y:auto;box-shadow:0 10px 28px rgba(0,0,0,0.5);z-index:60}
+.topnav .mnav-pane a{display:block;padding:.45rem 1rem;color:var(--text-muted);font-size:.85rem;margin:0;white-space:nowrap}
+.topnav .mnav-pane a:hover{background:var(--bg-elev);color:var(--text)}
+.topnav .mnav-group{padding:.6rem 1rem .25rem;font-family:var(--font-mono);font-size:.66rem;letter-spacing:.12em;text-transform:uppercase;color:var(--text-dim)}
+@media(max-width:800px){.topnav .mnav{display:block}}
+main{max-width:850px;margin:0 auto;padding:3.2rem 1.5rem 6rem}
+main>h1:first-child{margin-top:0}
+main h1{font-size:2.15rem;line-height:1.18;letter-spacing:-.025em;margin:1.4em 0 .55em;color:#fff;font-weight:750}
+main h2{font-size:1.5rem;margin:2.3em 0 .75em;padding-bottom:.32em;border-bottom:1px solid var(--border);color:#fff;letter-spacing:-.015em;font-weight:680}
+main h3{font-size:1.22rem;margin:1.9em 0 .55em;color:#fff;font-weight:640}
+main h4{font-size:1.02rem;margin:1.6em 0 .45em;color:var(--text)}
+main h5,main h6{font-size:.92rem;margin:1.4em 0 .4em;color:var(--text-muted);text-transform:uppercase;letter-spacing:.04em}
+main p{margin:.95em 0}
+main ul,main ol{padding-left:1.45em;margin:.95em 0}
+main li{margin:.38em 0}
+main li>ul,main li>ol{margin:.38em 0}
+main strong{color:#fff;font-weight:640}
+main code{font-family:var(--font-mono);font-size:.85em;background:var(--bg-code);border:1px solid var(--border);border-radius:5px;padding:.12em .42em;color:#e9e9e9}
+main pre{background:var(--bg-code);border:1px solid var(--border);border-radius:11px;padding:1.05rem 1.2rem;overflow:auto;margin:1.25em 0;line-height:1.55}
+main pre code{background:none;border:none;padding:0;font-size:.835rem;color:#e9e9e9}
+main blockquote{margin:1.3em 0;padding:.7em 1.15em;border-left:3px solid var(--p3);background:var(--bg-raised);border-radius:0 9px 9px 0;color:var(--text-muted)}
+main blockquote p{margin:.35em 0}
+main blockquote strong{color:var(--p3)}
+main table{border-collapse:collapse;width:100%;margin:1.4em 0;font-size:.91rem;display:block;overflow-x:auto}
+main th,main td{border:1px solid var(--border);padding:.56em .85em;text-align:left;vertical-align:top}
+main th{background:var(--bg-card);color:#fff;font-weight:620;white-space:nowrap}
+main tbody tr:nth-child(2n) td{background:var(--bg-raised)}
+main td code{white-space:nowrap}
+main hr{border:none;border-top:1px solid var(--border);margin:2.4em 0}
+main img{max-width:100%;border-radius:8px}
+main h1,main h2,main h3,main h4{scroll-margin-top:5rem}
+main kbd{font-family:var(--font-mono);font-size:.8em;background:var(--bg-elev,#161616);border:1px solid var(--border-hl);border-radius:5px;padding:.1em .4em;box-shadow:0 1px 0 var(--border-hl)}
+</style>
+</head>
+<body>
+
+<nav class="topnav">
+  <div class="inner">
+    <a class="home-link" href="./">ai-memory <span style="opacity:.5">▸ A2A Integration</span></a>
+    <div class="right">
+      <a href="at-a-glance.html" style="color:#6ee7ff">Atlas</a>
+      <a href="whats-new-v09.html" style="color:#ffb86b">v0.9.0</a>
+      <div class="menu">
+        <button class="menu-btn">Audiences<span class="caret">▾</span></button>
+        <div class="menu-pane">
+          <a href="for-everyone.html">For Everyone</a>
+          <a href="audience/decision-maker.html">Decision Maker</a>
+          <a href="audience/developer.html">Developer</a>
+          <a href="audience/operator.html">Operator</a>
+          <a href="feature-matrix.html">Feature Matrix</a>
+          <a href="data-flow.html">Data Flow</a>
+          <a href="integrations.html">Integrations</a>
+          <a href="import-history.html">Import History</a>
+          <a href="release-pipeline.html">Release Pipeline</a>
+        </div>
+      </div>
+      <div class="menu">
+        <button class="menu-btn active">Features<span class="caret">▾</span></button>
+        <div class="menu-pane">
+          <a href="memory-tiers.html">Memory Tiers</a>
+          <a href="memory-rules.html">Memory Rules</a>
+          <a href="ttl-controls.html">TTL Controls</a>
+          <a href="archival.html">Archival</a>
+          <a href="encryption.html">Encryption</a>
+          <a href="hierarchies.html">Hierarchies</a>
+          <a href="knowledge-graph.html">Knowledge Graph</a>
+          <a href="autonomous.html">Autonomous</a>
+          <a href="a2a-messaging.html" class="current">A2A Integration</a>
+          <a class="current" href="a2a-integration.html">Integrate an Agent</a>
+          <a href="lifecycle.html">Lifecycle</a>
+          <a href="performance.html">Performance</a>
+          <a href="agent-identity.html">Agent Identity (NHI)</a>
+          <a href="zero-touch-trust.html">Zero-Touch Trust</a>
+        </div>
+      </div>
+      <div class="menu">
+        <button class="menu-btn">Architectures<span class="caret">▾</span></button>
+        <div class="menu-pane">
+          <a href="architectures.html">Overview</a>
+          <a href="architectures-t1.html">T1 — Single Agent</a>
+          <a href="architectures-t2.html">T2 — Many Agents</a>
+          <a href="architectures-t3.html">T3 — Multi-Node Cluster</a>
+          <a href="architectures-t4.html">T4 — Data-Center Swarm</a>
+          <a href="architectures-t5.html">T5 — Global Hive</a>
+          <a href="reference-architecture/">Grand Slam — 3-Region Hive</a>
+          <a href="reference-architecture/enterprise-cpu-memory.html">Enterprise — CPU+Memory Nodes</a>
+          <a href="reference-architecture/enterprise-cpu-memory-gpu.html">Enterprise — CPU+Memory+GPU Nodes</a>
+        </div>
+      </div>
+      <div class="menu">
+        <button class="menu-btn">Internals<span class="caret">▾</span></button>
+        <div class="menu-pane">
+          <a href="schema.html">Schema</a>
+          <a href="types.html">Types</a>
+          <a href="validators.html">Validators</a>
+          <a href="governance.html">Governance</a>
+          <a href="batman-active-mode.html">Batman Mode</a>
+          <a href="tracing.html">Tracing</a>
+          <a href="spec/v1.html">Portability Spec v1</a>
+        </div>
+      </div>
+      <div class="menu">
+        <button class="menu-btn">Evidence<span class="caret">▾</span></button>
+        <div class="menu-pane">
+          <a href="evidence.html">Frozen Claims</a>
+          <a href="evidence/">Evidence Hub (campaigns)</a>
+          <a href="performance.html">Performance budgets</a>
+          <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/benchmarks/longmemeval/results.md">LongMemEval variants</a>
+        </div>
+      </div>
+      <a href="credits.html">Credits</a>
+      <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub →</a>
+    </div>
+    <details class="mnav">
+      <summary>Menu</summary>
+      <div class="mnav-pane">
+        <a href="./">Home</a>
+        <a href="at-a-glance.html">Atlas</a>
+        <a href="whats-new-v09.html">v0.9.0</a>
+        <div class="mnav-group">Audiences</div>
+        <a href="for-everyone.html">For Everyone</a>
+        <a href="audience/decision-maker.html">Decision Maker</a>
+        <a href="audience/developer.html">Developer</a>
+        <a href="audience/operator.html">Operator</a>
+        <a href="feature-matrix.html">Feature Matrix</a>
+        <a href="data-flow.html">Data Flow</a>
+        <a href="integrations.html">Integrations</a>
+        <a href="import-history.html">Import History</a>
+        <a href="release-pipeline.html">Release Pipeline</a>
+        <div class="mnav-group">Features</div>
+        <a href="memory-tiers.html">Memory Tiers</a>
+        <a href="memory-rules.html">Memory Rules</a>
+        <a href="ttl-controls.html">TTL Controls</a>
+        <a href="archival.html">Archival</a>
+        <a href="encryption.html">Encryption</a>
+        <a href="hierarchies.html">Hierarchies</a>
+        <a href="knowledge-graph.html">Knowledge Graph</a>
+        <a href="autonomous.html">Autonomous</a>
+        <a href="a2a-messaging.html">A2A Integration</a>
+          <a class="current" href="a2a-integration.html">Integrate an Agent</a>
+        <a href="lifecycle.html">Lifecycle</a>
+        <a href="performance.html">Performance</a>
+        <a href="agent-identity.html">Agent Identity (NHI)</a>
+        <a href="zero-touch-trust.html">Zero-Touch Trust</a>
+        <div class="mnav-group">Architectures</div>
+        <a href="architectures.html">Overview</a>
+        <a href="architectures-t1.html">T1 — Single Agent</a>
+        <a href="architectures-t2.html">T2 — Many Agents</a>
+        <a href="architectures-t3.html">T3 — Multi-Node Cluster</a>
+        <a href="architectures-t4.html">T4 — Data-Center Swarm</a>
+        <a href="architectures-t5.html">T5 — Global Hive</a>
+        <a href="reference-architecture/">Grand Slam — 3-Region Hive</a>
+        <a href="reference-architecture/enterprise-cpu-memory.html">Enterprise — CPU+Memory Nodes</a>
+        <a href="reference-architecture/enterprise-cpu-memory-gpu.html">Enterprise — CPU+Memory+GPU Nodes</a>
+        <div class="mnav-group">Internals</div>
+        <a href="schema.html">Schema</a>
+        <a href="types.html">Types</a>
+        <a href="validators.html">Validators</a>
+        <a href="governance.html">Governance</a>
+        <a href="batman-active-mode.html">Batman Mode</a>
+        <a href="tracing.html">Tracing</a>
+        <a href="spec/v1.html">Portability Spec v1</a>
+        <div class="mnav-group">Evidence</div>
+        <a href="evidence.html">Frozen Claims</a>
+        <a href="evidence/">Evidence Hub (campaigns)</a>
+        <a href="performance.html">Performance budgets</a>
+        <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/benchmarks/longmemeval/results.md">LongMemEval variants</a>
+        <div class="mnav-group">More</div>
+        <a href="credits.html">Credits</a>
+        <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub →</a>
+      </div>
+    </details>
+  </div>
+</nav>
+<header class="hero"><h1>Integrate any agent with the A2A wake plane</h1></header>
+<main>
+
+<p>The wake plane shipped in ai-memory v1.0.0. This path takes a shell-driven
+Claude Code, Codex or Grok agent, a daemon, an SDK program, or a one-shot script
+from enrolment to receiving hints and exchanging durable messages. You do not
+need to implement the wire protocol. Use the CLI or SDK client on the same host
+as the hub, with access to the intended ai-memory store.</p>
+<h2 id="1-the-model-in-one-page">1. The model in one page</h2>
+<p><code>memory_notify</code> writes a durable inbox row. The daemon's wake sink forwards a
+content-free hint to the local wake-hub. The recipient reads <code>memory_inbox</code> to
+obtain the message. <strong>The hint is advisory, the row is the record, the bounded
+poll is the guarantee.</strong> Every receiver must read at least once every 60 seconds
+while running, even if the hub is unavailable. A gap or lag signal means one
+catch-up read, not one read for every missing hint.</p>
+<pre><code class="language-text">sender -&gt; notify -&gt; durable inbox row
+                       |
+                 local wake sink -&gt; local hub -&gt; recipient
+                       ^                         |
+                       +------ inbox read -------+
+</code></pre>
+<p>The plane carries no message bodies or titles, has no cross-host hop of its
+own, and introduces no second identity root. The hub has no database access.
+A hint identifies a row and normally includes its body digest; read the row
+through the normal authorization boundary before acting. Never execute text
+from a hint or treat a notification as authorization for privileged work.</p>
+<p>Millisecond wakes, including a sub-millisecond hub hop, are <strong>design targets</strong>,
+not published measurements. Acceptance-latency measurement
+<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/3473">#3473</a> remains open.
+The implementation and certification stance have shipped; measurement has not.</p>
+<h2 id="2-choose-your-receive-pattern">2. Choose your receive pattern</h2>
+<p>Complete section 3 before running the hub-backed examples.</p>
+<table>
+<thead>
+<tr>
+<th>Your agent</th>
+<th>Receive pattern</th>
+<th>Cost and responsibility</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Long-lived daemon or loop-driven agent</td>
+<td><code>ai-memory wake-listen --json</code> or <code>--exec</code></td>
+<td>One session; one catch-up inbox read per event, plus bounded backstop reads. The JSON lines and hook environment contain metadata, not bodies.</td>
+</tr>
+<tr>
+<td>Shell loop or one-shot script</td>
+<td><code>ai-memory inbox --wait --timeout N</code></td>
+<td>One process spawn and session attempt per wait/read. Drop-in replacement for <code>sleep N; ai-memory inbox</code>; may return early on a wake.</td>
+</tr>
+<tr>
+<td>Agent cannot hold a session</td>
+<td>Plain <code>memory_inbox</code> polling</td>
+<td>One read per interval, with no wake latency benefit; one process spawn per poll if using the CLI. Keep the interval at most 60 seconds.</td>
+</tr>
+<tr>
+<td>Python or TypeScript service</td>
+<td>SDK <code>WakeListener</code></td>
+<td>One session; your callback performs the catch-up read. Keep model work outside the callback.</td>
+</tr>
+</tbody>
+</table>
+<p>A daemon can consume one JSON line per event:</p>
+<pre><code class="language-bash">ai-memory --agent-id &quot;$AGENT&quot; wake-listen --json --poll-secs 30
+</code></pre>
+<p>For a small notification hook, this complete example records metadata for a
+separate worker. Provision <code>WAKE_EVENTS</code> as an owner-only file first. It does
+not run a model once per hint:</p>
+<pre><code class="language-bash">export WAKE_EVENTS=&quot;$PWD/a2a-demo/wake-events.log&quot;
+(umask 077; touch &quot;$WAKE_EVENTS&quot;)
+ai-memory --agent-id &quot;$AGENT&quot; wake-listen --poll-secs 30 \
+  --exec 'printf &quot;%s\n&quot; &quot;$AI_MEMORY_WAKE_REASON&quot; &gt;&gt; &quot;$WAKE_EVENTS&quot;'
+</code></pre>
+<p>This hook writes reason lines; use <code>--json</code> redirected to a separate file if
+you want full JSON metadata. The hook is bounded at 30 seconds;
+use it to signal a worker, not to run a potentially long model pass. The CLI
+already reads the inbox before emitting; your worker still needs to read the
+bodies. Welcome, gap, lagged and backstop events can have no row ID.</p>
+<p>For a one-shot shell read:</p>
+<pre><code class="language-bash">ai-memory --agent-id &quot;$AGENT&quot; inbox --wait --timeout 30 --json
+</code></pre>
+<p>Timeout is not an error: it still reads and prints the inbox, possibly empty.
+An empty welcome does not end the wait. Even with no explicit timeout, the
+bounded backstop returns within its interval. Missing or expired credentials
+cause this command to warn and wait on the fallback; <code>wake-listen</code> instead
+refuses startup so you can repair its bundle.</p>
+<p>For an MCP agent without a session, call <code>memory_inbox</code> with these arguments
+on a scheduler that runs at most 30 seconds apart; <code>agent_id</code> must match the
+MCP caller identity:</p>
+<pre><code class="language-json">{&quot;agent_id&quot;:&quot;ai:worker&quot;,&quot;unread_only&quot;:true,&quot;limit&quot;:500}
+</code></pre>
+<p>Process the returned <code>messages</code>, deduplicate their <code>id</code> values, and retain an
+application checkpoint. An inbox listing does not acknowledge successful work.
+A shell equivalent is <code>ai-memory --agent-id "$AGENT" inbox --json</code> on that
+scheduler. Do not sleep only when the previous read was empty.</p>
+<p>Python can use the shipped SDK and its existing HTTP authentication settings:</p>
+<pre><code class="language-python">import os
+from ai_memory import AiMemoryClient
+from ai_memory.wake import DelegationBundle, WakeListener
+
+agent = os.environ[&quot;AGENT&quot;]
+bundle = DelegationBundle.load(
+    os.environ[&quot;BUNDLE&quot;], hub_id=os.environ[&quot;HUB&quot;]
+)
+client = AiMemoryClient(
+    base_url=os.environ[&quot;API_BASE&quot;],
+    api_key=os.environ[&quot;API_KEY&quot;], agent_id=agent,
+)
+def catch_up(signal):
+    if signal.reason == &quot;subscribed&quot;:
+        return
+    # Replace printing with a durable local queue; model work runs separately.
+    print(client.inbox(agent_id=agent, limit=500), flush=True)
+
+WakeListener(os.environ[&quot;SOCKET&quot;], bundle, catch_up).run()
+</code></pre>
+<p>For a Node.js TypeScript service using the shipped package:</p>
+<pre><code class="language-typescript">import { AiMemoryClient } from &quot;@alphaone/ai-memory&quot;;
+import { DelegationBundle, WakeListener } from &quot;@alphaone/ai-memory/wake&quot;;
+
+function setting(name: string): string {
+  const value = process.env[name];
+  if (!value) throw new Error(`Set ${name}`);
+  return value;
+}
+const bundle = DelegationBundle.load(setting(&quot;BUNDLE&quot;), { hubId: setting(&quot;HUB&quot;) });
+const client = new AiMemoryClient({
+  baseUrl: setting(&quot;API_BASE&quot;), apiKey: setting(&quot;API_KEY&quot;), agentId: setting(&quot;AGENT&quot;),
+});
+let reading = false;
+let pending = false;
+async function catchUp(): Promise&lt;void&gt; {
+  pending = true;
+  if (reading) return;
+  reading = true;
+  try {
+    do {
+      pending = false;
+      const { messages } = await client.inbox({ limit: 500 });
+      // Replace printing with a durable local queue; run the model separately.
+      console.log(messages);
+    } while (pending);
+  } finally {
+    reading = false;
+  }
+}
+await new WakeListener(setting(&quot;SOCKET&quot;), bundle, (signal) =&gt; {
+  if (signal.reason !== &quot;subscribed&quot;) {
+    void catchUp().catch((error: unknown) =&gt; console.error(&quot;Inbox read failed&quot;, error));
+  }
+}).run();
+</code></pre>
+<p>These callbacks demonstrate reception; use the journal and idempotency rules
+in section 5 before attaching business side effects. Keep HTTP requests bounded
+so a stalled read does not defeat the fallback. The Python and TypeScript SDKs do not read the inbox for you. Both retain the
+bounded fallback and reconnect with backoff. Configure client TLS credentials
+as described in the <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/sdk/python/README.md">Python SDK guide</a> and
+<a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/sdk/typescript/README.md">TypeScript SDK guide</a> when mTLS is enabled.</p>
+<h2 id="3-enrolment-end-to-end">3. Enrolment, end to end</h2>
+<p>Use an installed v1.0.0 binary. Choose one stable agent ID per participant and
+one stable hub ID per host. The following is a <strong>fresh local SQLite example</strong>,
+run from the same directory in each terminal under the same OS user. Replace
+the example agent/type identifiers with your choices. For an existing service,
+use its actual store and key directory; do not generate replacement daemon keys.
+For PostgreSQL, provision registration and proof-of-possession binding through
+the daemon's admin HTTP/SDK surfaces (see the <a href="API_REFERENCE.md">API reference</a>).
+The local <code>agents register</code> and <code>agents bind-key</code> commands below operate on
+SQLite. <code>identity hub-cache</code> and <code>identity delegate</code> support the configured
+PostgreSQL store URL channels in a <code>sal-postgres</code> build; never enrol in a
+substitute SQLite database.</p>
+<pre><code class="language-bash">umask 077
+mkdir -p a2a-demo/store a2a-demo/keys a2a-demo/run a2a-demo/config/ai-memory
+chmod 700 a2a-demo a2a-demo/store a2a-demo/keys a2a-demo/run
+export AI_MEMORY_DB=&quot;$PWD/a2a-demo/store/memory.db&quot;
+export AI_MEMORY_KEY_DIR=&quot;$PWD/a2a-demo/keys&quot;
+export XDG_CONFIG_HOME=&quot;$PWD/a2a-demo/config&quot;
+export AGENT='ai:worker'
+export COORDINATOR='ai:coordinator'
+export HUB='example-hub'
+export SOCKET=&quot;$PWD/a2a-demo/run/wake.sock&quot;
+export ALLOWLIST=&quot;$PWD/a2a-demo/run/allow.json&quot;
+export BUNDLE=&quot;$AI_MEMORY_KEY_DIR/$AGENT.a2a-hub.json&quot;
+
+# Fresh installation only: producer uses this host's daemon key.
+ai-memory identity generate --agent-id daemon
+for participant in &quot;$AGENT&quot; &quot;$COORDINATOR&quot;; do
+  ai-memory identity generate --agent-id &quot;$participant&quot;
+  ai-memory agents register --agent-id &quot;$participant&quot; --agent-type ai:custom
+  public_key=$(ai-memory identity export-pub --agent-id &quot;$participant&quot;)
+  ai-memory agents bind-key --agent-id &quot;$participant&quot; --pubkey=&quot;$public_key&quot;
+done
+
+ai-memory identity hub-cache --daemon-producer \
+  --include-agent &quot;$AGENT&quot; --include-agent &quot;$COORDINATOR&quot; --out &quot;$ALLOWLIST&quot;
+
+cat &gt; &quot;$XDG_CONFIG_HOME/ai-memory/config.toml&quot; &lt;&lt;CONFIG
+[wake_hub]
+socket = &quot;$SOCKET&quot;
+sink_socket = &quot;$SOCKET&quot;
+hub_id = &quot;$HUB&quot;
+allowlist = &quot;$ALLOWLIST&quot;
+CONFIG
+
+# Separate terminal/supervisor, with the same environment; stays running.
+ai-memory wake-hub --socket &quot;$SOCKET&quot; --hub-id &quot;$HUB&quot; --allowlist &quot;$ALLOWLIST&quot;
+</code></pre>
+<p>Before the snapshot becomes 60 seconds old, start its refresher in another
+terminal or supervisor. Each export is the <strong>complete</strong> retained set. Repeat
+<code>--include-agent</code> for every participant, not just the newest one:</p>
+<pre><code class="language-bash">while true; do
+  ai-memory identity hub-cache --daemon-producer \
+    --include-agent &quot;$AGENT&quot; --include-agent &quot;$COORDINATOR&quot; --out &quot;$ALLOWLIST&quot; || exit 1
+  sleep 30
+done
+</code></pre>
+<p>Now mint the listener bundle, then run the daemon with this configuration in
+its own terminal. A production deployment uses the existing service supervisor
+and its configured bind/TLS settings; the fresh example uses <code>serve</code> defaults.</p>
+<pre><code class="language-bash">ai-memory identity delegate --scope a2a-hub --agent-id &quot;$AGENT&quot; --hub-id &quot;$HUB&quot;
+ai-memory identity delegate --scope a2a-hub --agent-id &quot;$COORDINATOR&quot; --hub-id &quot;$HUB&quot;
+ai-memory serve
+</code></pre>
+<p><code>generate</code> creates local key material only. <code>register --agent-type &lt;type&gt;</code>
+creates the durable agent record; <code>ai:&lt;name&gt;</code> accepts arbitrary agent types.
+<code>bind-key</code> proves possession and anchors its public key in the identity ledger.
+<code>hub-cache</code> derives public admission authority from that ledger. The
+<code>--daemon-producer</code> entry lets this daemon forward hints; it is not a new root.
+<code>socket</code> configures receivers and the hub, while <code>sink_socket</code> enables the
+<strong>daemon's</strong> forwarder. Setting only <code>socket</code> does not enable sending wakes.
+<code>delegate</code> grants a time-bounded join for this agent and this hub.</p>
+<p>The bundle carries a <strong>DELEGATED</strong> private key, never the enrolled one. Protect
+it as mode 0600 in an owner-only directory. Rust listeners also need the
+matching enrolled public material in their key directory, not its private half.
+Bundles expire (default TTL is one hour). Re-mint before expiry using a fresh
+path and restart the listener with that path:</p>
+<pre><code class="language-bash">ai-memory identity delegate --scope a2a-hub --agent-id &quot;$AGENT&quot; \
+  --hub-id &quot;$HUB&quot; --out &quot;$AI_MEMORY_KEY_DIR/$AGENT.renewed.a2a-hub.json&quot;
+ai-memory --agent-id &quot;$AGENT&quot; wake-listen \
+  --bundle &quot;$AI_MEMORY_KEY_DIR/$AGENT.renewed.a2a-hub.json&quot; --json
+</code></pre>
+<p>Use another new path on the next renewal. <code>inbox --wait</code> uses the default
+bundle path: stop that receiver, move its old bundle aside, mint to the now-free
+default path, then restart. Existing paths and symlinks are refused; overwriting
+a bundle is not renewal. A running listener does not automatically adopt a
+newly minted file.</p>
+<p>To revoke hub participation, omit the agent from the next complete cache
+export. Omit <code>--daemon-producer</code> to revoke forwarding. Sessions revalidate
+against the current snapshot once per second. Revoking an enrolled key with
+<code>agents revoke-key</code> also removes its eligibility on refresh; use
+<code>identity succeed</code> for key succession, not forced generation. Expiry alone
+ends a delegation without revoking the enrolled identity or its history.</p>
+<h2 id="4-sending">4. Sending</h2>
+<p>An agent-to-agent message addresses the peer; an agent-to-coordinator message
+addresses the coordinator's enrolled ID. The coordinator is an ordinary inbox
+participant, not a privileged route. To reply, target the sender from the
+<strong>durable row</strong>. Always set the sender explicitly.</p>
+<pre><code class="language-bash">ai-memory --agent-id &quot;$AGENT&quot; notify --target-agent-id &quot;$COORDINATOR&quot; \
+  --title 'Pass complete' --payload 'Review is ready.' --json
+</code></pre>
+<p>The CLI example and shell gate use SQLite. PostgreSQL receivers should use
+the HTTP SDK inbox against their configured daemon; do not point these local
+CLI commands at a substitute SQLite store. The CLI writes to its selected local store. Its process-local event bus is not
+the running daemon's bus: use the daemon HTTP or MCP surface when you want its
+configured wake sink and federation fanout. The same durable row remains
+readable when a local CLI write is discovered by the timed fallback.</p>
+<p>For immediate daemon-driven hints, set <code>API_BASE</code> to your daemon's HTTPS base
+URL and supply your approved API key and TLS files through these placeholders:</p>
+<pre><code class="language-bash">curl --fail-with-body --silent --show-error \
+  --cacert &quot;$CA_CERT&quot; --cert &quot;$CLIENT_CERT&quot; --key &quot;$CLIENT_KEY&quot; \
+  -H &quot;X-API-Key: $API_KEY&quot; -H &quot;X-Agent-Id: $COORDINATOR&quot; \
+  -H 'Content-Type: application/json' \
+  &quot;$API_BASE/api/v1/notify&quot; \
+  --data '{&quot;target_agent_id&quot;:&quot;ai:worker&quot;,&quot;title&quot;:&quot;Next batch&quot;,&quot;content&quot;:&quot;Please process the queued work.&quot;}'
+</code></pre>
+<p>For the fresh loopback-only demo, set <code>API_BASE</code> to the HTTP address reported
+by <code>serve</code> and omit the TLS options and X-API-Key header when no API key
+is configured. The HTTPS example is for a provisioned service.</p>
+<p><code>POST /api/v1/notify</code> requires <code>target_agent_id</code>, <code>title</code>, and a string body
+(<code>content</code> or <code>payload</code>; send exactly one). <code>X-Agent-Id</code> determines the sender.
+An optional body <code>agent_id</code> must match that header or the request is refused;
+it cannot impersonate a different sender. API authentication and mTLS still
+apply. The receipt's row ID confirms storage, not that an agent has processed
+it. Read with <code>GET /api/v1/inbox</code> using the recipient's <code>X-Agent-Id</code>, or use
+<code>memory_inbox</code> through that recipient's MCP session.</p>
+<h2 id="5-drive-an-agent-loop-from-wakes">5. Drive an agent loop from wakes</h2>
+<p>Run one pass per <strong>batch</strong>, not per wake: one pass per hint will thrash under a
+burst. Also, an agent with <strong>no timed fallback</strong> runs only when someone wakes
+it; if its coordinator goes quiet it stops. Keep timed inbox reads even when
+idle. To continue unfinished work without external input, use
+<strong>self-continuation</strong>: after a successful pass, send a notify to your own ID
+while work remains. When finished or blocked, stay silent. Prefer the HTTP
+shape above for a prompt self-wake; a local CLI self-notify is found by the
+fallback. Do not self-notify merely because the inbox was empty.</p>
+<p>Save the following as <code>wake-gate.sh</code>. It requires Bash, jq and the enrolled
+CLI environment from section 3. Supply an executable adapter as <code>AGENT_PASS</code>;
+its sole argument is a JSON array of rows, and exit zero means the whole batch
+has been durably handled. The adapter may launch any CLI agent. It must treat
+row IDs as idempotency keys because a crash after a side effect but before the
+checkpoint can replay that batch. <code>GATE_STATE</code> is a private directory used by
+exactly one gate instance. Never delete it just to clear a retry.</p>
+<pre><code class="language-bash">#!/usr/bin/env bash
+set -euo pipefail
+: &quot;${AGENT:?set AGENT}&quot; &quot;${AGENT_PASS:?set an executable adapter}&quot;
+: &quot;${GATE_STATE:?set a private state directory}&quot;
+umask 077
+mkdir -p &quot;$GATE_STATE&quot;
+chmod 700 &quot;$GATE_STATE&quot;
+state=&quot;$GATE_STATE/state.json&quot;
+batch=&quot;$GATE_STATE/batch.json&quot;
+if [[ ! -f &quot;$state&quot; ]]; then
+  printf '%s\n' '{&quot;done&quot;:[],&quot;pending&quot;:[]}' &gt; &quot;$state&quot;
+fi
+worker=''
+cleanup() {
+  if [[ -n &quot;$worker&quot; ]]; then
+    kill &quot;$worker&quot; 2&gt;/dev/null || true
+    wait &quot;$worker&quot; 2&gt;/dev/null || true
+  fi
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+collect() {
+  ai-memory --agent-id &quot;$AGENT&quot; inbox &quot;$@&quot; --limit 500 --json &gt; &quot;$GATE_STATE/inbox.json&quot;
+  jq -e '.messages | type == &quot;array&quot;' &quot;$GATE_STATE/inbox.json&quot; &gt; /dev/null
+  # This API has no inbox cursor. A full page cannot prove complete coverage.
+  if [[ $(jq '.messages | length' &quot;$GATE_STATE/inbox.json&quot;) -ge 500 ]]; then
+    printf '%s\n' 'Inbox page full: reconcile older rows before resuming.' &gt;&amp;2
+    exit 1
+  fi
+  jq --slurpfile incoming &quot;$GATE_STATE/inbox.json&quot; '
+    .done as $done |
+    .pending = ([.pending[], $incoming[0].messages[]] | unique_by(.id) |
+      map(select(.id as $id | $done | index($id) | not)))
+  ' &quot;$state&quot; &gt; &quot;$state.next&quot;
+  mv &quot;$state.next&quot; &quot;$state&quot;
+}
+
+collect  # startup reconciliation, including a batch interrupted by a crash
+while true; do
+  if [[ -n &quot;$worker&quot; ]] &amp;&amp; ! kill -0 &quot;$worker&quot; 2&gt;/dev/null; then
+    if wait &quot;$worker&quot;; then
+      jq --slurpfile batch &quot;$batch&quot; '
+        .done = ((.done + ($batch[0] | map(.id))) | unique) |
+        .done as $done |
+        .pending |= map(select(.id as $id | $done | index($id) | not))
+      ' &quot;$state&quot; &gt; &quot;$state.next&quot;
+      mv &quot;$state.next&quot; &quot;$state&quot;
+    else
+      printf '%s\n' 'Agent pass failed; pending batch retained for retry.' &gt;&amp;2
+    fi
+    worker=''
+  fi
+  if [[ -z &quot;$worker&quot; ]] &amp;&amp; jq -e '.pending | length &gt; 0' &quot;$state&quot; &gt; /dev/null; then
+    sleep 1  # debounce: coalesce the burst before launching a pass
+    collect
+    jq '.pending' &quot;$state&quot; &gt; &quot;$batch&quot;
+    &quot;$AGENT_PASS&quot; &quot;$batch&quot; &amp;
+    worker=$!
+  fi
+  # Reads continue while the model works; empty timeouts do not launch a pass.
+  collect --wait --timeout 30
+done
+</code></pre>
+<p>The first read reconciles startup state. Later reads block on wakes with a
+bounded timeout; a debounce read gathers the rest of a burst. New rows received
+while a pass runs stay pending for the next batch. Failed passes retain pending
+rows and retry after the next bounded wait. Launch with:</p>
+<pre><code class="language-bash">export GATE_STATE=&quot;$PWD/a2a-demo/gate&quot;
+export AGENT_PASS='./your-agent-pass'
+bash wake-gate.sh
+</code></pre>
+<p><code>your-agent-pass</code> is your adapter, not an ai-memory command. Keep its processing
+bounded and supervise it: a hung adapter does not stop this gate's inbox reads,
+but it prevents the next pass. A worker with child processes must propagate
+termination to them. The journal grows with handled IDs; archive it only after
+reconciling inbox retention and replay requirements. The 500-row guard is
+intentional: the inbox API has no cursor and a full newest-page result cannot
+prove there are no older rows. Reconcile with the store's authorized listing
+and retention workflow before restarting; never silently discard that backlog.</p>
+<h2 id="6-multi-host">6. Multi-host</h2>
+<p>Run one hub per host. Rows cross hosts through ai-memory federation, with
+mutual TLS, signed pushes, peer signing-key enrolment and namespace-scoped
+attestation. The receiving host's local plane completes the intended hop.
+The hub itself cannot bridge hosts; mounting a socket remotely does not create
+a supported cross-host transport.</p>
+<p><strong>Current limitation:</strong> federation receive/apply does not currently publish a
+receiving-host inbox wake. The remaining federation-to-local-wake integration is
+tracked in <a href="https://github.com/alphaonedev/ai-memory-mcp/issues/3631">#3631</a>.
+Until that path is complete, the receiving agent's bounded inbox poll discovers
+the replicated row. Cross-host delivery is not a measured millisecond promise.
+See the <a href="federation.md">federation guide</a> for peer configuration.</p>
+<p>Enrol both the transport certificate pin and the peer's Ed25519 signing key.
+A public-only import uses the peer ID configured by the receiving daemon:</p>
+<pre><code class="language-bash">ai-memory identity import --agent-id &quot;$PEER_ID&quot; --pub &quot;$PEER_PUBLIC_KEY_FILE&quot;
+</code></pre>
+<p>Permit the intended original senders in the receiving peer's
+<code>allowed_sender_agent_ids</code>. Without that rule their sender identities do not
+survive the hop. Namespace attestation policy still applies independently of
+transport authentication and sender preservation.</p>
+<h2 id="7-security-model">7. Security model</h2>
+<p>There are two admission gates. First, kernel peer credentials bind a local
+socket client to an OS user; Linux uses <code>SO_PEERCRED</code>, macOS uses peer PID and
+UID credentials. The socket is 0600 inside a 0700 directory. Second, scoped
+delegation proves that the enrolled agent authorized this delegated key for
+this hub and this validity window. A same-user process is not admitted merely
+because it can open the socket.</p>
+<p>A stolen bundle can impersonate that principal on the specified hub until
+expiry or revocation, receive its hint metadata and exercise its permitted
+wake/topic operations. It cannot sign durable history as the enrolled key,
+read bodies without separate store/API authority, join another hub, or grant
+itself broader namespaces. Treat row IDs, sender IDs and body digests as
+sensitive metadata despite the absence of message content.</p>
+<p>There is no flag that disables verification: a missing or stale authority
+source denies admission. The wake carries a SHA-256 <strong>body digest, never a
+body</strong>. Under the metadata size ceiling, optional sender, namespace and digest
+fields may be shed; row ID and sequence watermark are retained or the hint is
+refused. The hub's certification stance is transport-only / NOT-COVERED;
+removal must affect latency only, never durable correctness. Read the
+<a href="wake-hub.md">wake-plane reference</a> for the detailed boundary and removal proof.</p>
+<h2 id="8-degraded-modes">8. Degraded modes</h2>
+<p>Correctness here means a committed row remains available through normal
+storage and retention rules. Delivery still requires an authorized receiver
+that resumes reading; a wake is not an acknowledgement or an indefinite
+retention promise.</p>
+<table>
+<thead>
+<tr>
+<th>Condition</th>
+<th>What the operator sees</th>
+<th>Recovery and durable correctness</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Hub down</td>
+<td>Connection failures, reconnect backoff, <code>backstop</code> reads</td>
+<td>Restore hub; the bounded poll reads committed rows meanwhile.</td>
+</tr>
+<tr>
+<td>Snapshot stale past its 60-second ceiling</td>
+<td>Unauthorized joins, disconnected sessions; posture reports stale snapshot</td>
+<td>Restore the refresher with the full retained set. Admission fails closed; inbox reads still work.</td>
+</tr>
+<tr>
+<td>Slow consumer</td>
+<td>Queue/drop/lag counters, disconnects or coalesced pending hints</td>
+<td>Catch up once on lag, sequence gap or reconnect, then resume bounded reads. Dropped hints do not delete rows.</td>
+</tr>
+<tr>
+<td>Hung exec hook</td>
+<td>Listener logs timeout and kills the hook after 30 seconds</td>
+<td>Repair the hook and use a separate worker; the listener resumes. A hook failure does not acknowledge business work.</td>
+</tr>
+<tr>
+<td>Unreachable recipient</td>
+<td>Pending hints are coalesced and bounded; sender has a storage receipt, no processing receipt</td>
+<td>Recipient reconciles on reconnect or polling. Alert on prolonged absence and retention expiry.</td>
+</tr>
+</tbody>
+</table>
+<p>Use read-only checks in the same configured environment:</p>
+<pre><code class="language-bash">ai-memory wake-hub --posture --json
+ai-memory wake-hub --health --json
+ai-memory doctor
+</code></pre>
+<p>A health probe proves socket reachability, not successful delegation, a working
+forwarder, or message processing. Verify end to end by sending an HTTP notify
+and matching its receipt ID to the recipient's inbox row.</p>
+<h2 id="9-troubleshooting">9. Troubleshooting</h2>
+<p>These failures were observed during production deployment. Values below are
+placeholders; never copy an operator's keys or deployment coordinates.</p>
+<table>
+<thead>
+<tr>
+<th>Symptom</th>
+<th>Cause and fix</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>deferred-audit spool ancestor permits untrusted rename</code></td>
+<td>Store parent directory is not owner-only. Make its dedicated directory 0700 and owned by the service user; inspect the ancestor chain. Do not widen the guard or change shared system directories.</td>
+</tr>
+<tr>
+<td><code>failed to parse private key as RSA, ECDSA, or EdDSA</code></td>
+<td>macOS LibreSSL <code>req -newkey ec</code> can emit explicit EC parameters. Generate with OpenSSL 3 using <code>-pkeyopt ec_param_enc:named_curve</code> and PKCS#8, or use RSA/Ed25519. <code>pkcs8 -topk8</code> alone does not remove explicit parameters.</td>
+</tr>
+<tr>
+<td>Non-loopback <code>serve</code> refuses despite mTLS</td>
+<td><code>api_key</code> in the daemon configuration is independently required. Configure both layers.</td>
+</tr>
+<tr>
+<td>Local HTTP helper rejected by mTLS</td>
+<td>Loopback does not bypass the certificate allowlist. Present a client certificate whose fingerprint is allowed; the daemon's own certificate is a natural local choice when provisioned for that use.</td>
+</tr>
+<tr>
+<td>Federation <code>401 peer_not_enrolled</code></td>
+<td>Certificate pin alone is insufficient. Import the peer's Ed25519 signing public key under its configured peer identity as well.</td>
+</tr>
+<tr>
+<td>Sender changes after federation</td>
+<td>Add the sender to the receiving peer's <code>allowed_sender_agent_ids</code>; retain namespace-scoped attestation checks.</td>
+</tr>
+<tr>
+<td>Local hub returns <code>404 no such agent</code> for a remote recipient</td>
+<td>Notify fires the local sink even when the agent lives elsewhere. The sink logs a connection failure and reconnects. Durable delivery is unaffected; tracked in <a href="https://github.com/alphaonedev/ai-memory-mcp/issues/3635">#3635</a>. Do not chase it as data loss.</td>
+</tr>
+<tr>
+<td>Transient federation push failure immediately after daemon restart</td>
+<td>Observed delivery recovers through DLQ replay on its next sweep: degrade-never-lose for queued committed delivery. Check replay success and receipt IDs instead of resending blindly.</td>
+</tr>
+<tr>
+<td>Hub reachable, listener unauthorized</td>
+<td>Check matching hub ID, enrolled key, bundle ownership/mode/expiry and fresh allowlist; renew as in section 3. Never disable verification.</td>
+</tr>
+<tr>
+<td>Inbox rows arrive but no hints</td>
+<td>Check <code>sink_socket</code>, producer enrolment, snapshot refresh, use of the daemon send surface, and the cross-host limitation in #3631. Polling remains required.</td>
+</tr>
+<tr>
+<td>Shell agent reruns the same task</td>
+<td>Inbox listings are not acknowledgements; persist row-ID deduplication and commit it only after successful processing.</td>
+</tr>
+</tbody>
+</table>
+<p>For example, generate a fresh named-curve key with the OpenSSL 3 executable
+selected as <code>OPENSSL3</code> (then issue the certificate through your normal CA):</p>
+<pre><code class="language-bash">&quot;$OPENSSL3&quot; genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 \
+  -pkeyopt ec_param_enc:named_curve -out &quot;$NEW_TLS_KEY&quot;
+</code></pre>
+<p>Continue with the <a href="CLI_REFERENCE.md">CLI reference</a>,
+<a href="a2a-messaging.html">messaging atlas</a>, and
+<a href="https://alphaonedev.github.io/rust-a2a/">protocol home</a>.</p>
+</main>
+<footer>
+  <p>ai-memory v1.0.0 · Apache 2.0 · A2A flows in <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/src/handlers/">src/handlers/</a> (notify/inbox) + <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/src/subscriptions.rs">subscriptions.rs</a> (webhooks)</p>
+  <p style="margin-top:.5rem"><a href="./">← Back to ai-memory</a> · <a href="at-a-glance.html">Atlas</a> · <a href="data-flow.html">Data flow</a> · <a href="encryption.html">Encryption</a></p>
+</footer>
+
+</body>
+</html>

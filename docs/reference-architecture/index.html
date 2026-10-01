@@ -13,27 +13,26 @@
 <title>ai-memory · Grand Slam Reference Architecture — 3-region Batman-mode AI Agent Hive</title>
 <meta name="description" content="ai-memory v0.9.0 Secure Enterprise Federated Reference Architecture (do-1461): a 3-region (nyc3 / fra1 / sgp1) Batman-active AI Agent Hive. 15 nodes (9 peers + 3 regional PG + 3 NHI agents), 9 federated peers in one W=2-synchronous-quorum mesh with eventual cross-region convergence, three distinct encryption legs (API mTLS, federation/quorum mTLS, daemon→Postgres verify-full TLS), each proven with a positive and a negative test. PostgreSQL 18.4 + Apache AGE 1.7.0 + pgvector 0.8.2.">
 <link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/reference-architecture/">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700;800;900&amp;family=IBM+Plex+Sans:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@500;600&amp;display=swap">
+<link rel="stylesheet" href="../assets/site-theme.css">
+<meta name="theme-color" content="#0c0b08">
 <style>
-:root{--bg:#000;--bg-raised:#0a0a0a;--bg-card:#111;--bg-elev:#161616;--bg-code:#1a1a1a;--border:#262626;--border-hl:#3d3d3d;--text:#fff;--text-muted:#999;--text-dim:#666;--p1:#b07d10;--p2:#ffb86b;--p3:#c8a2ff;--good:#b07d10;--bad:#ff6b9d;--warn:#ffd700;--gold:#ffd700;
+:root{--p2:var(--slate);--p3:var(--teal);--warn:var(--accent-ink);--gold:var(--accent);
 /* three-leg accents (centerpiece) */
---leg1:#b07d10;--leg2:#c8a2ff;--leg3:#ffb86b;
+--leg1:var(--accent);--leg2:var(--teal);--leg3:var(--slate);
 /* three regions */
---rg-nyc:#b07d10;--rg-fra:#c8a2ff;--rg-sgp:#ffb86b;
---font-mono:'SF Mono','Cascadia Code','Fira Code',Consolas,monospace;--font-sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;--max-w:1280px}
+--rg-nyc:var(--accent);--rg-fra:var(--teal);--rg-sgp:var(--slate);--max-w:1120px}
 *,*::before,*::after{margin:0;padding:0;box-sizing:border-box}
 html{scroll-behavior:smooth;scroll-padding-top:5rem}
 body{font-family:var(--font-sans);background:var(--bg);color:var(--text);line-height:1.6;-webkit-font-smoothing:antialiased;overflow-x:hidden}
-a{color:var(--text);text-decoration:none}a:hover{color:var(--p1)}
+a{color:var(--accent-ink);text-decoration:none}a:hover{color:var(--accent)}
 code{font-family:var(--font-mono);font-size:.85rem;background:var(--bg-code);padding:.1em .35em;border-radius:4px}
 .container{max-width:var(--max-w);margin:0 auto;padding:0 1.5rem}
-h1,h2,h3{font-weight:700;letter-spacing:-0.02em}h2{font-size:1.6rem;margin-bottom:.5rem;font-family:var(--font-mono)}h3{font-size:1.05rem}
+h1,h2,h3{font-family:var(--disp);font-weight:800;letter-spacing:-0.02em;color:var(--ink)}h2{font-size:1.6rem;margin-bottom:.5rem;font-family:var(--disp)}h3{font-size:1.05rem}
 p{color:var(--text-muted)}
-.topnav{position:sticky;top:0;z-index:50;background:var(--bg);backdrop-filter:blur(12px);border-bottom:1px solid var(--border)}
-.topnav .inner{display:flex;justify-content:space-between;max-width:var(--max-w);margin:0 auto;padding:.9rem 1.5rem;font-size:.875rem}
-.topnav a{color:var(--text-muted);margin-right:1.25rem}.topnav a:hover{color:var(--text)}
-.topnav .home-link{color:var(--text);font-weight:600}
-.topnav .right{display:flex;gap:1.25rem}@media(max-width:800px){.topnav .right{display:none}}
-.hero{padding:4rem 1.5rem 2.5rem;text-align:center;background:radial-gradient(ellipse at center,rgba(255,215,0,0.08),transparent 60%);border-bottom:1px solid var(--border)}
+.hero{padding:4rem 1.5rem 2.5rem;text-align:center;background:radial-gradient(ellipse at center,color-mix(in srgb,var(--accent) 8%,transparent),transparent 60%);border-bottom:1px solid var(--border)}
 .hero h1{font-size:clamp(2rem,4.5vw,3.25rem);line-height:1.1;letter-spacing:-0.03em;margin-bottom:1rem}
 .hero .tagline{color:var(--text-muted);font-size:1.05rem;max-width:860px;margin:0 auto 1rem}
 .hero .pills{display:flex;justify-content:center;gap:.5rem;flex-wrap:wrap;margin-top:1.25rem}
@@ -55,7 +54,9 @@ section h2.sans{font-family:var(--font-sans);font-size:1.75rem}
 .matrix td{padding:.7rem 1rem;border-bottom:1px solid var(--border);vertical-align:top}
 .matrix tr:last-child td{border-bottom:none}
 .matrix .id{font-family:var(--font-mono);font-weight:700;color:var(--p3)}
-.matrix .res{font-family:var(--font-mono);font-size:.82rem;color:var(--warn);white-space:nowrap}
+.matrix .res{font-family:var(--font-mono);font-size:.82rem;color:var(--good);white-space:normal;min-width:16rem}
+.matrix .res.partial{color:var(--accent-ink)}
+.matrix{min-width:760px}
 .matrix code{font-size:.78rem}
 .scroll-x{overflow-x:auto;border-radius:12px}
 
@@ -79,7 +80,7 @@ section h2.sans{font-family:var(--font-sans);font-size:1.75rem}
 .testpair .t .tag{font-weight:700;letter-spacing:.04em;margin-right:.4rem}
 .testpair .t.pos .tag{color:var(--good)}
 .testpair .t.neg .tag{color:var(--bad)}
-.testpair .t .res{color:var(--warn);float:right}
+.testpair .t .res{color:var(--good);float:right}
 
 .snip{font-family:var(--font-mono);font-size:.78rem;color:var(--text-muted);margin-top:.85rem;padding:.85rem 1rem;background:var(--bg-code);border:1px solid var(--border);border-radius:8px;line-height:1.55;white-space:pre;overflow-x:auto}
 .snip .ok{color:var(--good)}.snip .err{color:var(--bad)}.snip .warn{color:var(--warn)}.snip .cm{color:var(--text-dim)}.snip .key{color:var(--p3)}.snip .val{color:var(--p2)}
@@ -90,30 +91,20 @@ section h2.sans{font-family:var(--font-sans);font-size:1.75rem}
 .step h3{font-family:var(--font-mono);font-size:1.1rem;margin-bottom:.5rem;color:var(--text)}
 .step p{color:var(--text-muted);font-size:.92rem;margin-bottom:.6rem}
 
-.warn-box{background:rgba(255,215,0,0.05);border:1px solid var(--warn);border-radius:10px;padding:1rem 1.25rem;margin:1.5rem 0;color:var(--text-muted);font-size:.9rem}
+.warn-box{background:color-mix(in srgb,var(--accent) 5%,transparent);border:1px solid var(--warn);border-radius:10px;padding:1rem 1.25rem;margin:1.5rem 0;color:var(--text-muted);font-size:.9rem}
 .warn-box strong{color:var(--warn);font-family:var(--font-mono);font-size:.82rem;letter-spacing:.04em;display:block;margin-bottom:.35rem}
-.honest-box{background:rgba(255,107,157,0.05);border:1px solid var(--bad);border-radius:10px;padding:1.1rem 1.25rem;margin:1.25rem 0;color:var(--text-muted);font-size:.9rem}
+.honest-box{background:color-mix(in srgb,var(--bad) 5%,transparent);border:1px solid var(--bad);border-radius:10px;padding:1.1rem 1.25rem;margin:1.25rem 0;color:var(--text-muted);font-size:.9rem}
 .honest-box strong{color:var(--bad);font-family:var(--font-mono);font-size:.82rem;letter-spacing:.04em;display:block;margin-bottom:.35rem}
 
-footer{padding:3rem 1.5rem 2.5rem;text-align:center;color:var(--text-dim);font-size:.85rem;border-top:1px solid var(--border)}
-footer .footer-links{display:flex;justify-content:center;gap:1.5rem;flex-wrap:wrap;margin-bottom:1rem}
-footer a{color:var(--text-dim)}footer a:hover{color:var(--p1)}
-footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
+footer.ra-legal{padding:2.5rem 1.5rem 1rem;text-align:center;color:var(--text-dim);font-size:.85rem;border-top:1px solid var(--border)}
+footer.ra-legal .footer-links{display:flex;justify-content:center;gap:1.5rem;flex-wrap:wrap;margin-bottom:1rem}
+footer.ra-legal a{color:var(--text-dim)}footer a:hover{color:var(--p1)}
+footer.ra-legal .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
 
-.topnav .menu{position:relative;display:inline-block}
-.topnav .menu-btn{background:none;border:none;color:var(--text-muted);font-family:inherit;font-size:inherit;cursor:pointer;padding:.2rem 0;line-height:1;letter-spacing:0}
-.topnav .menu-btn:hover,.topnav .menu:focus-within .menu-btn{color:var(--text)}
-.topnav .menu-btn.active{color:var(--text)}
-.topnav .menu-btn .caret{opacity:.5;font-size:.7em;margin-left:.2em}
-.topnav .menu-pane{position:absolute;top:calc(100% + .55rem);right:0;background:var(--bg-card);border:1px solid var(--border-hl);border-radius:8px;padding:.4rem 0;min-width:240px;box-shadow:0 10px 28px rgba(0,0,0,0.5);z-index:60;visibility:hidden;opacity:0;transition:opacity .12s ease,visibility 0s .12s}
-.topnav .menu:focus-within .menu-pane,.topnav .menu:hover .menu-pane{visibility:visible;opacity:1;transition:opacity .12s ease}
-.topnav .menu-pane a{display:block;padding:.5rem 1rem;color:var(--text-muted);font-size:.85rem;margin-right:0;white-space:nowrap;text-decoration:none}
-.topnav .menu-pane a:hover{background:var(--bg-elev);color:var(--text)}
-.topnav .menu-pane a.current{color:var(--p1);background:var(--bg-elev)}
 
 /* ============ animated diagram ============ */
-.diagram-wrap{background:var(--bg-raised);border:1px solid var(--border);border-radius:16px;padding:1rem;margin:1.5rem 0;overflow:hidden}
-.diagram-wrap svg{display:block;width:100%;height:auto}
+.diagram-wrap{background:var(--panel);border:1px solid var(--border);border-radius:16px;padding:1rem;margin:1.5rem 0;overflow-x:auto;min-width:0;-webkit-overflow-scrolling:touch}
+.diagram-wrap svg{display:block;width:100%;height:auto;min-width:var(--fig-min,820px)}
 .legend{display:flex;flex-wrap:wrap;gap:1rem 1.5rem;justify-content:center;margin-top:1rem;font-size:.8rem;color:var(--text-muted)}
 .legend .item{display:flex;align-items:center;gap:.45rem;font-family:var(--font-mono)}
 .legend .sw{width:26px;height:0;border-top:3px dashed currentColor;border-radius:2px}
@@ -124,7 +115,7 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
 @keyframes march{to{stroke-dashoffset:-32}}
 @keyframes pulse-glow{0%,100%{opacity:.55}50%{opacity:1}}
 @keyframes shimmer{0%,100%{stroke-opacity:.35}50%{stroke-opacity:.9}}
-@keyframes node-breathe{0%,100%{filter:drop-shadow(0 0 2px rgba(176,125,16,0.25))}50%{filter:drop-shadow(0 0 7px rgba(176,125,16,0.55))}}
+@keyframes node-breathe{0%,100%{filter:drop-shadow(0 0 2px color-mix(in srgb,var(--accent) 25%,transparent))}50%{filter:drop-shadow(0 0 7px color-mix(in srgb,var(--accent) 55%,transparent))}}
 @keyframes shield-flicker{0%,100%{opacity:.85}50%{opacity:1}}
 
 .flow{stroke-width:2.4;fill:none;stroke-linecap:round;stroke-dasharray:9 7}
@@ -146,56 +137,73 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
 }
 @media(max-width:560px){.diagram-wrap{padding:.4rem}}
 </style>
-  <link rel="stylesheet" href="/ai-memory-mcp/assets/site-theme.css">
 </head>
-<body>
+<body class="am-page">
 
-<nav class="topnav">
-  <div class="inner">
-    <a class="home-link" href="../">ai-memory <span style="opacity:.5">▸ Reference Architecture</span></a>
-    <div class="right">
-      <a href="../at-a-glance.html" style="color:var(--accent-ink)">Atlas</a>
-      <a href="../whats-new-v09.html" style="color:var(--accent-ink)">v0.9.0</a>
-      <div class="menu">
-        <button class="menu-btn active">Architectures<span class="caret">▾</span></button>
-        <div class="menu-pane">
-          <a href="../architectures.html">Overview</a>
-          <a href="../architectures-t1.html">T1 — Single Agent</a>
-          <a href="../architectures-t2.html">T2 — Many Agents</a>
-          <a href="../architectures-t3.html">T3 — Multi-Node Cluster</a>
-          <a href="../architectures-t4.html">T4 — Data-Center Swarm</a>
-          <a href="../architectures-t5.html">T5 — Global Hive</a>
-          <a href="./" class="current">Grand Slam — 3-Region Hive</a>
-          <a href="enterprise-cpu-memory.html">Enterprise — CPU+Memory Nodes</a>
-          <a href="enterprise-cpu-memory-gpu.html">Enterprise — CPU+Memory+GPU Nodes</a>
-        </div>
+<a class="am-skip" href="#main">Skip to content</a>
+<header class="am-nav"><div class="am-nav-in">
+  <a class="am-brand" href="../index.html" aria-label="ai-memory home">
+    <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 2l9 5.2v9.6L12 22 3 16.8V7.2z" stroke="var(--accent)" stroke-width="1.5"/><circle cx="12" cy="12" r="2.4" fill="var(--accent)"/><path d="M12 9.6V4.5M12 14.4v5.1M14.4 12h5M4.9 12h5" stroke="var(--accent)" stroke-width="1.1"/></svg>
+    ai-memory <span class="am-crumb">/ reference / 3-region hive</span>
+  </a>
+  <nav class="am-links" aria-label="Primary">
+    <a href="../architectures.html">Architectures</a>
+    <div class="am-dd">
+      <button aria-haspopup="true">Tiers ▾</button>
+      <div class="am-dd-menu">
+        <a href="../architectures-t1.html">T1 · Single node<span>one agent, one store</span></a>
+        <a href="../architectures-t2.html">T2 · Shared daemon<span>many agents, one host</span></a>
+        <a href="../architectures-t3.html">T3 · Federated cluster<span>W-of-N quorum, signed sync</span></a>
+        <a href="../architectures-t4.html">T4 · Data-center swarm<span>PostgreSQL tier</span></a>
+        <a href="../architectures-t5.html">T5 · Federated hive<span>multi-DC / multi-region</span></a>
       </div>
-      <div class="menu">
-        <button class="menu-btn">Internals<span class="caret">▾</span></button>
-        <div class="menu-pane">
-          <a href="../schema.html">Schema</a>
-          <a href="../types.html">Types</a>
-          <a href="../validators.html">Validators</a>
-          <a href="../governance.html">Governance</a>
-          <a href="../batman-active-mode.html">Batman Mode</a>
-          <a href="../encryption.html">Encryption</a>
-          <a href="../tracing.html">Tracing</a>
-        </div>
-      </div>
-      <div class="menu">
-        <button class="menu-btn">Compliance<span class="caret">▾</span></button>
-        <div class="menu-pane">
-          <a href="../compliance/">Overview</a>
-          <a href="../compliance/nsa-csi-mcp.html">NSA CSI MCP</a>
-        </div>
-      </div>
-      <a href="../credits.html">Credits</a>
-      <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub →</a>
     </div>
-  </div>
-</nav>
+    <div class="am-dd">
+      <button aria-haspopup="true">Reference ▾</button>
+      <div class="am-dd-menu">
+        <a href="../reference-architecture/">3-region hive<span>the do-1461 run record</span></a>
+        <a href="../reference-architecture/enterprise-cpu-memory.html">Enterprise · CPU + memory<span>API embeddings, no GPU</span></a>
+        <a href="../reference-architecture/enterprise-cpu-memory-gpu.html">Enterprise · CPU + memory + GPU<span>local embeddings</span></a>
+        <a href="../enterprise-deployment.html">Enterprise deployment guide<span>sizing, replication, backups</span></a>
+        <a href="../ARCHITECTURAL_LIMITS.html">Architectural limits<span>what does not scale, and why</span></a>
+      </div>
+    </div>
+    <div class="am-dd">
+      <button aria-haspopup="true">Planes ▾</button>
+      <div class="am-dd-menu">
+        <a href="../federation.html">Federation<span>signed sync, quorum, catch-up</span></a>
+        <a href="../wake-hub.html">Wake plane<span>wake-hub, wake-listen</span></a>
+        <a href="../a2a-integration.html">Integrate any agent<span>inbox, notify, wake</span></a>
+        <a href="../governance.html">Governance<span>policies, approvals</span></a>
+        <a href="../encryption.html">Encryption<span>at rest and in transit</span></a>
+        <a href="../SECURITY.html">Security model<span>threat model, posture</span></a>
+      </div>
+    </div>
+  </nav>
+  <details class="am-mnav"><summary>Menu</summary><div class="am-mnav-pane">
+    <a href="../index.html">Home</a>
+    <a href="../architectures.html">Architectures overview</a>
+    <div class="am-g">Tiers</div>
+    <a href="../architectures-t1.html">T1 · Single node</a>
+    <a href="../architectures-t2.html">T2 · Shared daemon</a>
+    <a href="../architectures-t3.html">T3 · Federated cluster</a>
+    <a href="../architectures-t4.html">T4 · Data-center swarm</a>
+    <a href="../architectures-t5.html">T5 · Federated hive</a>
+    <div class="am-g">Reference</div>
+    <a href="../reference-architecture/">3-region hive</a>
+    <a href="../reference-architecture/enterprise-cpu-memory.html">Enterprise · CPU + memory</a>
+    <a href="../reference-architecture/enterprise-cpu-memory-gpu.html">Enterprise · CPU + memory + GPU</a>
+    <a href="../ARCHITECTURAL_LIMITS.html">Architectural limits</a>
+    <div class="am-g">Planes</div>
+    <a href="../federation.html">Federation</a>
+    <a href="../wake-hub.html">Wake plane</a>
+    <a href="../governance.html">Governance</a>
+    <a href="../SECURITY.html">Security model</a>
+  </div></details>
+  <a class="am-cta" href="https://github.com/alphaonedev/ai-memory-mcp">GitHub</a>
+</div></header>
 
-<section class="hero">
+<section class="hero" id="main">
   <h1>The Grand Slam.</h1>
   <p class="tagline">The <strong style="color:var(--gold)">Secure Enterprise Federated Reference Architecture</strong> — a 3-region, Batman-active AI Agent Hive. Three geographic regions (<strong style="color:var(--rg-nyc)">nyc3</strong> · <strong style="color:var(--rg-fra)">fra1</strong> · <strong style="color:var(--rg-sgp)">sgp1</strong>), 15 nodes (9 peers + 3 regional PG + 3 NHI agents), 9 federated peers in one <strong style="color:var(--good)">W=2 synchronous quorum + eventual cross-region convergence</strong> mesh, three distinct encryption legs — each proven with a positive <em>and</em> a negative test. PostgreSQL 18.4 + Apache AGE 1.7.0 + pgvector 0.8.2.</p>
   <div class="pills">
@@ -205,6 +213,18 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
     <span class="pill">3 encryption legs</span>
     <span class="pill">Batman MAXIMUM-SECURE</span>
     <span class="pill">do-1461</span>
+  </div>
+</section>
+
+<!-- ============ VERSION CURRENCY (do not falsify the measured run) ============ -->
+<section style="padding:2.25rem 0">
+  <div class="container">
+    <div style="border:1px solid var(--gold);border-left:4px solid var(--gold);border-radius:12px;background:linear-gradient(180deg,color-mix(in srgb,var(--accent) 6%,transparent),color-mix(in srgb,var(--accent) 2%,transparent));padding:1.25rem 1.4rem">
+      <p style="color:var(--gold);font-family:var(--font-mono);font-size:.78rem;letter-spacing:.08em;text-transform:uppercase;margin-bottom:.5rem">Version currency</p>
+      <p style="color:var(--text-muted);margin-bottom:.7rem">Every result cell on this page is preserved verbatim from the <strong style="color:var(--text)">v0.9.0 <code>do-1461</code> reference run</strong> — a measured 0&rarr;60 clean-room fleet (<strong>PostgreSQL 18.4 · Apache AGE 1.7.0 · pgvector 0.8.2 · schema v78 · ai-memory 0.9.0</strong>). Those cells are the run record and are <em>not</em> rewritten; changing a measured version would falsify the run.</p>
+      <p style="color:var(--text-muted);margin-bottom:.7rem"><strong style="color:var(--text)">Build a fresh hive against the current pins.</strong> The <code>do-1461</code> provisioning SSOT on <code>release/v1.0.0</code> (<code>deploy/docker-1461/provision/lib.sh</code>) now targets <strong style="color:var(--gold)">PostgreSQL 18.6 + Apache AGE 1.8.0 (extversion) + pgvector 0.8.6</strong>; the current binary migrates to <strong style="color:var(--gold)">schema v100</strong> (<code>src/storage/migrations.rs</code>). AGE 1.8.0 is overlaid via pinned pgdg apt on the <code>apache/age:release_PG18_1.7.0</code> base image.</p>
+      <p style="color:var(--text-muted);margin-bottom:0">Several v1.0.0 fail-closed defaults have <strong style="color:var(--text)">hardened past what the v0.9.0 run measured</strong>: per-write and per-signal federation-receive attestation now default <strong style="color:var(--good)">ON</strong> (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1464">#1464</a> / #1801&rarr;#1954), closing the &ldquo;claimed-by-default&rdquo; limitation noted in the <em>Honest limitations</em> section below, and the certified enterprise-federation posture (asi-hard + 22 checks) is machine-verified by <code>ai-memory doctor --posture enterprise-federation</code> and its boot gate <code>AI_MEMORY_REQUIRE_ENTERPRISE_FEDERATION_POSTURE=1</code> (its PostgreSQL at-rest storage check records an operator attestation; it does not itself probe disk encryption, <a href="https://github.com/alphaonedev/ai-memory-mcp/issues/4250">#4250</a>). The certified envelope is a <strong>500&ndash;1000-agent cluster composed of &le; 50-peer federation blocks</strong> (certification doc line 538&ndash;539) (a derived topology ceiling, not a measured million-agent capacity). Canonical: <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/release/v1.0.0/docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md">compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md</a>.</p>
+    </div>
   </div>
 </section>
 
@@ -235,23 +255,23 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
     <div class="diagram-wrap">
       <svg viewBox="0 0 1200 720" role="img" aria-labelledby="hive-title hive-desc" preserveAspectRatio="xMidYMid meet">
         <title id="hive-title">3-region federated AI Agent Hive topology diagram</title>
-        <desc id="hive-desc">Three region clusters — nyc3 (US-East), fra1 (EU-Central), and sgp1 (Asia-SE) — arranged in a triangle. Each cluster is a 5-node unit containing one regional PostgreSQL 18.4 / Apache AGE / pgvector node, three ai-memory peer daemons, and one NHI agent (an xAI grok-4.3 client), for 15 nodes total (9 peers + 3 PG + 3 agents). Within each region, the three peers connect to their regional Postgres over private-VPC TLS verify-full (leg 3, amber). All nine peers across the three regions are interconnected by a cross-region quorum mesh using a W=2 synchronous write quorum (local commit plus one cross-region remote ack) with eventual async convergence to every peer in every region (leg 2, violet). The NHI agent in each region is a pure mTLS client that connects to its regional peer over API mutual-TLS on port 9077 (leg 1, cyan) — a client link, not a member of the quorum mesh. Every peer node displays a Batman shield-lock glyph indicating the MAXIMUM-SECURE posture.</desc>
+        <desc id="hive-desc">Three region clusters — nyc3 (US-East), fra1 (EU-Central), and sgp1 (Asia-SE) — arranged in a triangle. Each cluster is a 5-node unit containing one regional PostgreSQL 18.4 / Apache AGE / pgvector node, three ai-memory peer daemons, and one NHI agent (an xAI grok-4.3 client), for 15 nodes total (9 peers + 3 PG + 3 agents). Within each region, the three peers connect to their regional Postgres over private-VPC TLS verify-full (leg 3, slate blue). All nine peers across the three regions are interconnected by a cross-region quorum mesh using a W=2 synchronous write quorum (local commit plus one cross-region remote ack) with eventual async convergence to every peer in every region (leg 2, teal). The NHI agent in each region is a pure mTLS client that connects to its regional peer over API mutual-TLS on port 9077 (leg 1, gold) — a client link, not a member of the quorum mesh. Every peer node displays a Batman shield-lock glyph indicating the MAXIMUM-SECURE posture.</desc>
 
         <defs>
           <radialGradient id="rgGlow" cx="50%" cy="50%" r="50%">
-            <stop offset="0%" stop-color="#b07d10" stop-opacity="0.10"/>
-            <stop offset="100%" stop-color="#b07d10" stop-opacity="0"/>
+            <stop offset="0%" stop-opacity="0.10" style="stop-color:var(--accent)"/>
+            <stop offset="100%" stop-opacity="0" style="stop-color:var(--accent)"/>
           </radialGradient>
           <linearGradient id="pgGrad" x1="0" y1="0" x2="0" y2="1">
-            <stop offset="0%" stop-color="#1c160c"/><stop offset="100%" stop-color="#120d06"/>
+            <stop offset="0%" style="stop-color:var(--raise)"/><stop offset="100%" style="stop-color:var(--panel)"/>
           </linearGradient>
           <!-- batman shield-lock glyph: reusable -->
           <symbol id="shieldlock" viewBox="0 0 32 36">
             <path d="M16 1 L30 6 V18 C30 27 24 33 16 35 C8 33 2 27 2 18 V6 Z"
-                  fill="rgba(255,215,0,0.08)" stroke="#ffd700" stroke-width="1.6"/>
-            <rect x="10" y="16" width="12" height="10" rx="1.6" fill="rgba(255,215,0,0.12)" stroke="#ffd700" stroke-width="1.3"/>
-            <path d="M12 16 V13 a4 4 0 0 1 8 0 V16" fill="none" stroke="#ffd700" stroke-width="1.3"/>
-            <circle cx="16" cy="20.5" r="1.6" fill="#ffd700"/>
+                  stroke-width="1.6" style="stroke:var(--accent);fill:color-mix(in srgb,var(--accent) 8%,transparent)"/>
+            <rect x="10" y="16" width="12" height="10" rx="1.6" stroke-width="1.3" style="stroke:var(--accent);fill:color-mix(in srgb,var(--accent) 12%,transparent)"/>
+            <path d="M12 16 V13 a4 4 0 0 1 8 0 V16" fill="none" stroke-width="1.3" style="stroke:var(--accent)"/>
+            <circle cx="16" cy="20.5" r="1.6" style="fill:var(--accent)"/>
           </symbol>
         </defs>
 
@@ -267,38 +287,38 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
         <!-- quorum hub marker -->
         <g transform="translate(600,326)">
           <circle r="34" fill="url(#rgGlow)"/>
-          <circle r="22" fill="#120a1c" stroke="#c8a2ff" stroke-width="1.6" class="glowpath"/>
-          <text x="0" y="-1" text-anchor="middle" class="svg-label" font-size="11" fill="#c8a2ff" font-weight="700">W=2</text>
-          <text x="0" y="12" text-anchor="middle" class="svg-label" font-size="8.5" fill="#c8a2ff">sync</text>
+          <circle r="22" stroke-width="1.6" class="glowpath" style="fill:var(--teal-soft);stroke:var(--teal)"/>
+          <text x="0" y="-1" text-anchor="middle" class="svg-label" font-size="11" font-weight="700" style="fill:var(--teal)">W=2</text>
+          <text x="0" y="12" text-anchor="middle" class="svg-label" font-size="8.5" style="fill:var(--teal)">sync</text>
           <text x="0" y="44" text-anchor="middle" class="svg-label" font-size="10">W=2 sync quorum + eventual cross-region convergence · mTLS + Ed25519 + nonce</text>
         </g>
 
         <!-- ====== REGION CLUSTER: macro to draw one region ====== -->
         <!-- nyc3 cluster (top-left) -->
         <g>
-          <rect x="40" y="60" width="420" height="300" rx="16" fill="#070b0d" stroke="#13343d" stroke-width="1.4"/>
-          <text x="60" y="92" class="svg-title" font-size="15" font-weight="700" fill="#b07d10">nyc3 · US-East</text>
+          <rect x="40" y="60" width="420" height="300" rx="16" stroke-width="1.4" style="fill:var(--accent-soft);stroke:var(--line-strong)"/>
+          <text x="60" y="92" class="svg-title" font-size="15" font-weight="700" style="fill:var(--accent)">nyc3 · US-East</text>
           <text x="60" y="110" class="svg-label" font-size="10">private VPC · regional substrate</text>
 
           <!-- regional postgres -->
           <g transform="translate(60,140)">
-            <rect x="0" y="0" width="150" height="86" rx="10" fill="url(#pgGrad)" stroke="#ffb86b" stroke-width="1.5"/>
-            <text x="75" y="26" text-anchor="middle" class="svg-title" font-size="11.5" fill="#ffb86b" font-weight="700">PostgreSQL 18.4</text>
+            <rect x="0" y="0" width="150" height="86" rx="10" fill="url(#pgGrad)" stroke-width="1.5" style="stroke:var(--slate)"/>
+            <text x="75" y="26" text-anchor="middle" class="svg-title" font-size="11.5" font-weight="700" style="fill:var(--slate)">PostgreSQL 18.4</text>
             <text x="75" y="44" text-anchor="middle" class="svg-label" font-size="9">+ Apache AGE 1.7.0</text>
             <text x="75" y="58" text-anchor="middle" class="svg-label" font-size="9">+ pgvector 0.8.2</text>
-            <text x="75" y="75" text-anchor="middle" class="svg-label" font-size="8.5" fill="#ffb86b">:5432 hostssl verify-full</text>
+            <text x="75" y="75" text-anchor="middle" class="svg-label" font-size="8.5" style="fill:var(--slate)">:5432 hostssl verify-full</text>
           </g>
 
           <!-- 3 peers -->
           <g transform="translate(245,132)">
-            <g class="peernode"><rect x="0" y="0" width="170" height="32" rx="8" fill="#08161a" stroke="#b07d10" stroke-width="1.3"/>
-              <text x="12" y="21" class="svg-label" font-size="10.5" fill="#b07d10">peer-nyc3-01</text>
+            <g class="peernode"><rect x="0" y="0" width="170" height="32" rx="8" stroke-width="1.3" style="fill:var(--accent-soft);stroke:var(--accent)"/>
+              <text x="12" y="21" class="svg-label" font-size="10.5" style="fill:var(--accent)">peer-nyc3-01</text>
               <use href="#shieldlock" x="142" y="6" width="20" height="22" class="shield"/></g>
-            <g class="peernode" transform="translate(0,44)"><rect x="0" y="0" width="170" height="32" rx="8" fill="#08161a" stroke="#b07d10" stroke-width="1.3"/>
-              <text x="12" y="21" class="svg-label" font-size="10.5" fill="#b07d10">peer-nyc3-02</text>
+            <g class="peernode" transform="translate(0,44)"><rect x="0" y="0" width="170" height="32" rx="8" stroke-width="1.3" style="fill:var(--accent-soft);stroke:var(--accent)"/>
+              <text x="12" y="21" class="svg-label" font-size="10.5" style="fill:var(--accent)">peer-nyc3-02</text>
               <use href="#shieldlock" x="142" y="6" width="20" height="22" class="shield"/></g>
-            <g class="peernode" transform="translate(0,88)"><rect x="0" y="0" width="170" height="32" rx="8" fill="#08161a" stroke="#b07d10" stroke-width="1.3"/>
-              <text x="12" y="21" class="svg-label" font-size="10.5" fill="#b07d10">peer-nyc3-03</text>
+            <g class="peernode" transform="translate(0,88)"><rect x="0" y="0" width="170" height="32" rx="8" stroke-width="1.3" style="fill:var(--accent-soft);stroke:var(--accent)"/>
+              <text x="12" y="21" class="svg-label" font-size="10.5" style="fill:var(--accent)">peer-nyc3-03</text>
               <use href="#shieldlock" x="142" y="6" width="20" height="22" class="shield"/></g>
           </g>
           <!-- leg 3: peers -> regional pg (private VPC, verify-full) -->
@@ -309,9 +329,9 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
           </g>
           <!-- NHI agent (xAI grok-4.3 mTLS client) -->
           <g transform="translate(60,300)">
-            <rect x="0" y="0" width="150" height="42" rx="8" fill="#08161a" stroke="#b07d10" stroke-width="1.2" stroke-dasharray="4 3"/>
-            <text x="75" y="18" text-anchor="middle" class="svg-label" font-size="9.5" fill="#b07d10" font-weight="700">agent-nyc3-01</text>
-            <text x="75" y="32" text-anchor="middle" class="svg-label" font-size="8" fill="#b07d10">NHI · grok-4.3 mTLS client</text>
+            <rect x="0" y="0" width="150" height="42" rx="8" stroke-width="1.2" stroke-dasharray="4 3" style="fill:var(--accent-soft);stroke:var(--accent)"/>
+            <text x="75" y="18" text-anchor="middle" class="svg-label" font-size="9.5" font-weight="700" style="fill:var(--accent)">agent-nyc3-01</text>
+            <text x="75" y="32" text-anchor="middle" class="svg-label" font-size="8" style="fill:var(--accent)">NHI · grok-4.3 mTLS client</text>
           </g>
           <!-- leg 1 client link: agent -> regional peer (thinner, not the quorum mesh) -->
           <path class="flow agentlink" d="M210 321 C235 321 245 280 245 252" aria-hidden="true"/>
@@ -319,25 +339,25 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
 
         <!-- fra1 cluster (top-right) -->
         <g>
-          <rect x="740" y="60" width="420" height="300" rx="16" fill="#0b070d" stroke="#2a1a3a" stroke-width="1.4"/>
-          <text x="760" y="92" class="svg-title" font-size="15" font-weight="700" fill="#c8a2ff">fra1 · EU-Central</text>
+          <rect x="740" y="60" width="420" height="300" rx="16" stroke-width="1.4" style="fill:var(--panel);stroke:var(--line-strong)"/>
+          <text x="760" y="92" class="svg-title" font-size="15" font-weight="700" style="fill:var(--teal)">fra1 · EU-Central</text>
           <text x="760" y="110" class="svg-label" font-size="10">private VPC · regional substrate</text>
           <g transform="translate(990,140)">
-            <rect x="0" y="0" width="150" height="86" rx="10" fill="url(#pgGrad)" stroke="#ffb86b" stroke-width="1.5"/>
-            <text x="75" y="26" text-anchor="middle" class="svg-title" font-size="11.5" fill="#ffb86b" font-weight="700">PostgreSQL 18.4</text>
+            <rect x="0" y="0" width="150" height="86" rx="10" fill="url(#pgGrad)" stroke-width="1.5" style="stroke:var(--slate)"/>
+            <text x="75" y="26" text-anchor="middle" class="svg-title" font-size="11.5" font-weight="700" style="fill:var(--slate)">PostgreSQL 18.4</text>
             <text x="75" y="44" text-anchor="middle" class="svg-label" font-size="9">+ Apache AGE 1.7.0</text>
             <text x="75" y="58" text-anchor="middle" class="svg-label" font-size="9">+ pgvector 0.8.2</text>
-            <text x="75" y="75" text-anchor="middle" class="svg-label" font-size="8.5" fill="#ffb86b">:5432 hostssl verify-full</text>
+            <text x="75" y="75" text-anchor="middle" class="svg-label" font-size="8.5" style="fill:var(--slate)">:5432 hostssl verify-full</text>
           </g>
           <g transform="translate(760,132)">
-            <g class="peernode"><rect x="0" y="0" width="170" height="32" rx="8" fill="#120a1c" stroke="#c8a2ff" stroke-width="1.3"/>
-              <text x="12" y="21" class="svg-label" font-size="10.5" fill="#c8a2ff">peer-fra1-01</text>
+            <g class="peernode"><rect x="0" y="0" width="170" height="32" rx="8" stroke-width="1.3" style="fill:var(--teal-soft);stroke:var(--teal)"/>
+              <text x="12" y="21" class="svg-label" font-size="10.5" style="fill:var(--teal)">peer-fra1-01</text>
               <use href="#shieldlock" x="142" y="6" width="20" height="22" class="shield"/></g>
-            <g class="peernode" transform="translate(0,44)"><rect x="0" y="0" width="170" height="32" rx="8" fill="#120a1c" stroke="#c8a2ff" stroke-width="1.3"/>
-              <text x="12" y="21" class="svg-label" font-size="10.5" fill="#c8a2ff">peer-fra1-02</text>
+            <g class="peernode" transform="translate(0,44)"><rect x="0" y="0" width="170" height="32" rx="8" stroke-width="1.3" style="fill:var(--teal-soft);stroke:var(--teal)"/>
+              <text x="12" y="21" class="svg-label" font-size="10.5" style="fill:var(--teal)">peer-fra1-02</text>
               <use href="#shieldlock" x="142" y="6" width="20" height="22" class="shield"/></g>
-            <g class="peernode" transform="translate(0,88)"><rect x="0" y="0" width="170" height="32" rx="8" fill="#120a1c" stroke="#c8a2ff" stroke-width="1.3"/>
-              <text x="12" y="21" class="svg-label" font-size="10.5" fill="#c8a2ff">peer-fra1-03</text>
+            <g class="peernode" transform="translate(0,88)"><rect x="0" y="0" width="170" height="32" rx="8" stroke-width="1.3" style="fill:var(--teal-soft);stroke:var(--teal)"/>
+              <text x="12" y="21" class="svg-label" font-size="10.5" style="fill:var(--teal)">peer-fra1-03</text>
               <use href="#shieldlock" x="142" y="6" width="20" height="22" class="shield"/></g>
           </g>
           <g aria-hidden="true">
@@ -347,9 +367,9 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
           </g>
           <!-- NHI agent (xAI grok-4.3 mTLS client) -->
           <g transform="translate(990,300)">
-            <rect x="0" y="0" width="150" height="42" rx="8" fill="#120a1c" stroke="#c8a2ff" stroke-width="1.2" stroke-dasharray="4 3"/>
-            <text x="75" y="18" text-anchor="middle" class="svg-label" font-size="9.5" fill="#c8a2ff" font-weight="700">agent-fra1-01</text>
-            <text x="75" y="32" text-anchor="middle" class="svg-label" font-size="8" fill="#c8a2ff">NHI · grok-4.3 mTLS client</text>
+            <rect x="0" y="0" width="150" height="42" rx="8" stroke-width="1.2" stroke-dasharray="4 3" style="fill:var(--teal-soft);stroke:var(--teal)"/>
+            <text x="75" y="18" text-anchor="middle" class="svg-label" font-size="9.5" font-weight="700" style="fill:var(--teal)">agent-fra1-01</text>
+            <text x="75" y="32" text-anchor="middle" class="svg-label" font-size="8" style="fill:var(--teal)">NHI · grok-4.3 mTLS client</text>
           </g>
           <!-- leg 1 client link: agent -> regional peer (thinner, not the quorum mesh) -->
           <path class="flow agentlink" d="M990 321 C950 321 930 280 930 252" aria-hidden="true"/>
@@ -357,25 +377,25 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
 
         <!-- sgp1 cluster (bottom-center) -->
         <g>
-          <rect x="390" y="410" width="420" height="300" rx="16" fill="#0d0a06" stroke="#3a2a14" stroke-width="1.4"/>
-          <text x="410" y="442" class="svg-title" font-size="15" font-weight="700" fill="#ffb86b">sgp1 · Asia-SE</text>
+          <rect x="390" y="410" width="420" height="300" rx="16" stroke-width="1.4" style="fill:var(--slate-soft);stroke:var(--line-strong)"/>
+          <text x="410" y="442" class="svg-title" font-size="15" font-weight="700" style="fill:var(--slate)">sgp1 · Asia-SE</text>
           <text x="410" y="460" class="svg-label" font-size="10">private VPC · regional substrate</text>
           <g transform="translate(410,492)">
-            <rect x="0" y="0" width="150" height="86" rx="10" fill="url(#pgGrad)" stroke="#ffb86b" stroke-width="1.5"/>
-            <text x="75" y="26" text-anchor="middle" class="svg-title" font-size="11.5" fill="#ffb86b" font-weight="700">PostgreSQL 18.4</text>
+            <rect x="0" y="0" width="150" height="86" rx="10" fill="url(#pgGrad)" stroke-width="1.5" style="stroke:var(--slate)"/>
+            <text x="75" y="26" text-anchor="middle" class="svg-title" font-size="11.5" font-weight="700" style="fill:var(--slate)">PostgreSQL 18.4</text>
             <text x="75" y="44" text-anchor="middle" class="svg-label" font-size="9">+ Apache AGE 1.7.0</text>
             <text x="75" y="58" text-anchor="middle" class="svg-label" font-size="9">+ pgvector 0.8.2</text>
-            <text x="75" y="75" text-anchor="middle" class="svg-label" font-size="8.5" fill="#ffb86b">:5432 hostssl verify-full</text>
+            <text x="75" y="75" text-anchor="middle" class="svg-label" font-size="8.5" style="fill:var(--slate)">:5432 hostssl verify-full</text>
           </g>
           <g transform="translate(595,484)">
-            <g class="peernode"><rect x="0" y="0" width="170" height="32" rx="8" fill="#1a1206" stroke="#ffb86b" stroke-width="1.3"/>
-              <text x="12" y="21" class="svg-label" font-size="10.5" fill="#ffb86b">peer-sgp1-01</text>
+            <g class="peernode"><rect x="0" y="0" width="170" height="32" rx="8" stroke-width="1.3" style="fill:var(--slate-soft);stroke:var(--slate)"/>
+              <text x="12" y="21" class="svg-label" font-size="10.5" style="fill:var(--slate)">peer-sgp1-01</text>
               <use href="#shieldlock" x="142" y="6" width="20" height="22" class="shield"/></g>
-            <g class="peernode" transform="translate(0,44)"><rect x="0" y="0" width="170" height="32" rx="8" fill="#1a1206" stroke="#ffb86b" stroke-width="1.3"/>
-              <text x="12" y="21" class="svg-label" font-size="10.5" fill="#ffb86b">peer-sgp1-02</text>
+            <g class="peernode" transform="translate(0,44)"><rect x="0" y="0" width="170" height="32" rx="8" stroke-width="1.3" style="fill:var(--slate-soft);stroke:var(--slate)"/>
+              <text x="12" y="21" class="svg-label" font-size="10.5" style="fill:var(--slate)">peer-sgp1-02</text>
               <use href="#shieldlock" x="142" y="6" width="20" height="22" class="shield"/></g>
-            <g class="peernode" transform="translate(0,88)"><rect x="0" y="0" width="170" height="32" rx="8" fill="#1a1206" stroke="#ffb86b" stroke-width="1.3"/>
-              <text x="12" y="21" class="svg-label" font-size="10.5" fill="#ffb86b">peer-sgp1-03</text>
+            <g class="peernode" transform="translate(0,88)"><rect x="0" y="0" width="170" height="32" rx="8" stroke-width="1.3" style="fill:var(--slate-soft);stroke:var(--slate)"/>
+              <text x="12" y="21" class="svg-label" font-size="10.5" style="fill:var(--slate)">peer-sgp1-03</text>
               <use href="#shieldlock" x="142" y="6" width="20" height="22" class="shield"/></g>
           </g>
           <g aria-hidden="true">
@@ -385,9 +405,9 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
           </g>
           <!-- NHI agent (xAI grok-4.3 mTLS client) -->
           <g transform="translate(595,652)">
-            <rect x="0" y="0" width="150" height="42" rx="8" fill="#1a1206" stroke="#ffb86b" stroke-width="1.2" stroke-dasharray="4 3"/>
-            <text x="75" y="18" text-anchor="middle" class="svg-label" font-size="9.5" fill="#ffb86b" font-weight="700">agent-sgp1-01</text>
-            <text x="75" y="32" text-anchor="middle" class="svg-label" font-size="8" fill="#ffb86b">NHI · grok-4.3 mTLS client</text>
+            <rect x="0" y="0" width="150" height="42" rx="8" stroke-width="1.2" stroke-dasharray="4 3" style="fill:var(--slate-soft);stroke:var(--slate)"/>
+            <text x="75" y="18" text-anchor="middle" class="svg-label" font-size="9.5" font-weight="700" style="fill:var(--slate)">agent-sgp1-01</text>
+            <text x="75" y="32" text-anchor="middle" class="svg-label" font-size="8" style="fill:var(--slate)">NHI · grok-4.3 mTLS client</text>
           </g>
           <!-- leg 1 client link: agent -> regional peer (thinner, not the quorum mesh) -->
           <path class="flow agentlink" d="M670 652 C670 630 680 620 680 604" aria-hidden="true"/>
@@ -395,13 +415,13 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
 
         <!-- ====== external client over leg 1 (API mTLS) ====== -->
         <g transform="translate(40,610)">
-          <rect x="0" y="0" width="190" height="62" rx="10" fill="#08161a" stroke="#b07d10" stroke-width="1.4" stroke-dasharray="4 3"/>
-          <text x="95" y="26" text-anchor="middle" class="svg-title" font-size="11.5" fill="#b07d10" font-weight="700">External client</text>
+          <rect x="0" y="0" width="190" height="62" rx="10" stroke-width="1.4" stroke-dasharray="4 3" style="fill:var(--accent-soft);stroke:var(--accent)"/>
+          <text x="95" y="26" text-anchor="middle" class="svg-title" font-size="11.5" font-weight="700" style="fill:var(--accent)">External client</text>
           <text x="95" y="44" text-anchor="middle" class="svg-label" font-size="9">mTLS client-cert + x-api-key</text>
         </g>
         <!-- leg 1: client -> nyc3 peer -->
         <path class="flow leg1 shim" d="M150 610 C160 480 200 360 245 230" aria-hidden="true"/>
-        <text x="120" y="540" class="svg-label" font-size="9" fill="#b07d10" transform="rotate(-62 120 540)">leg 1 · API mTLS :9077</text>
+        <text x="120" y="540" class="svg-label" font-size="9" transform="rotate(-62 120 540)" style="fill:var(--accent)">leg 1 · API mTLS :9077</text>
       </svg>
     </div>
 
@@ -426,60 +446,60 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
     <div class="diagram-wrap">
       <svg viewBox="0 0 1200 280" role="img" aria-labelledby="legs-title legs-desc" preserveAspectRatio="xMidYMid meet">
         <title id="legs-title">The three encryption legs, in sequence</title>
-        <desc id="legs-desc">Left to right: an external client connects to a peer over leg 1 (API mutual-TLS on port 9077, cyan); the peer connects to other peers over leg 2 (federation quorum mutual-TLS with Ed25519 message signing and nonce anti-replay, violet); the peer connects to its regional PostgreSQL over leg 3 (TLS verify-full on port 5432, amber). Each connection is an animated encrypted flow.</desc>
+        <desc id="legs-desc">Left to right: an external client connects to a peer over leg 1 (API mutual-TLS on port 9077, gold); the peer connects to other peers over leg 2 (federation quorum mutual-TLS with Ed25519 message signing and nonce anti-replay, teal); the peer connects to its regional PostgreSQL over leg 3 (TLS verify-full on port 5432, slate blue). Each connection is an animated encrypted flow.</desc>
 
         <!-- self-contained defs so this diagram renders standalone -->
         <defs>
           <linearGradient id="pgGrad2" x1="0" y1="0" x2="0" y2="1">
-            <stop offset="0%" stop-color="#1c160c"/><stop offset="100%" stop-color="#120d06"/>
+            <stop offset="0%" style="stop-color:var(--raise)"/><stop offset="100%" style="stop-color:var(--panel)"/>
           </linearGradient>
           <symbol id="shieldlock2" viewBox="0 0 32 36">
             <path d="M16 1 L30 6 V18 C30 27 24 33 16 35 C8 33 2 27 2 18 V6 Z"
-                  fill="rgba(255,215,0,0.08)" stroke="#ffd700" stroke-width="1.6"/>
-            <rect x="10" y="16" width="12" height="10" rx="1.6" fill="rgba(255,215,0,0.12)" stroke="#ffd700" stroke-width="1.3"/>
-            <path d="M12 16 V13 a4 4 0 0 1 8 0 V16" fill="none" stroke="#ffd700" stroke-width="1.3"/>
-            <circle cx="16" cy="20.5" r="1.6" fill="#ffd700"/>
+                  stroke-width="1.6" style="stroke:var(--accent);fill:color-mix(in srgb,var(--accent) 8%,transparent)"/>
+            <rect x="10" y="16" width="12" height="10" rx="1.6" stroke-width="1.3" style="stroke:var(--accent);fill:color-mix(in srgb,var(--accent) 12%,transparent)"/>
+            <path d="M12 16 V13 a4 4 0 0 1 8 0 V16" fill="none" stroke-width="1.3" style="stroke:var(--accent)"/>
+            <circle cx="16" cy="20.5" r="1.6" style="fill:var(--accent)"/>
           </symbol>
         </defs>
 
         <!-- client -->
         <g transform="translate(30,108)">
-          <rect width="150" height="64" rx="10" fill="#08161a" stroke="#b07d10" stroke-width="1.4"/>
-          <text x="75" y="28" text-anchor="middle" class="svg-title" font-size="11.5" fill="#b07d10" font-weight="700">Client</text>
+          <rect width="150" height="64" rx="10" stroke-width="1.4" style="fill:var(--accent-soft);stroke:var(--accent)"/>
+          <text x="75" y="28" text-anchor="middle" class="svg-title" font-size="11.5" font-weight="700" style="fill:var(--accent)">Client</text>
           <text x="75" y="46" text-anchor="middle" class="svg-label" font-size="9">cert + api-key</text>
         </g>
         <!-- peer A -->
         <g transform="translate(360,98)">
-          <rect width="170" height="84" rx="10" fill="#120a1c" stroke="#c8a2ff" stroke-width="1.4"/>
+          <rect width="170" height="84" rx="10" stroke-width="1.4" style="fill:var(--teal-soft);stroke:var(--teal)"/>
           <use href="#shieldlock2" x="142" y="8" width="20" height="22" class="shield"/>
-          <text x="80" y="34" text-anchor="middle" class="svg-title" font-size="11.5" fill="#c8a2ff" font-weight="700">ai-memory peer</text>
+          <text x="80" y="34" text-anchor="middle" class="svg-title" font-size="11.5" font-weight="700" style="fill:var(--teal)">ai-memory peer</text>
           <text x="80" y="52" text-anchor="middle" class="svg-label" font-size="9">Batman MAXIMUM</text>
           <text x="80" y="67" text-anchor="middle" class="svg-label" font-size="8.5">:9077 rustls client-auth</text>
         </g>
         <!-- peer B (cross region) -->
         <g transform="translate(720,40)">
-          <rect width="150" height="62" rx="10" fill="#120a1c" stroke="#c8a2ff" stroke-width="1.4" stroke-dasharray="4 3"/>
+          <rect width="150" height="62" rx="10" stroke-width="1.4" stroke-dasharray="4 3" style="fill:var(--teal-soft);stroke:var(--teal)"/>
           <use href="#shieldlock2" x="124" y="6" width="18" height="20" class="shield"/>
-          <text x="75" y="28" text-anchor="middle" class="svg-title" font-size="10.5" fill="#c8a2ff" font-weight="700">peer (other region)</text>
+          <text x="75" y="28" text-anchor="middle" class="svg-title" font-size="10.5" font-weight="700" style="fill:var(--teal)">peer (other region)</text>
           <text x="75" y="45" text-anchor="middle" class="svg-label" font-size="8.5">W=2 sync quorum</text>
         </g>
         <!-- regional pg -->
         <g transform="translate(1000,98)">
-          <rect width="170" height="84" rx="10" fill="url(#pgGrad2)" stroke="#ffb86b" stroke-width="1.5"/>
-          <text x="85" y="30" text-anchor="middle" class="svg-title" font-size="11" fill="#ffb86b" font-weight="700">Regional PG 18.4</text>
+          <rect width="170" height="84" rx="10" fill="url(#pgGrad2)" stroke-width="1.5" style="stroke:var(--slate)"/>
+          <text x="85" y="30" text-anchor="middle" class="svg-title" font-size="11" font-weight="700" style="fill:var(--slate)">Regional PG 18.4</text>
           <text x="85" y="47" text-anchor="middle" class="svg-label" font-size="8.5">AGE 1.7.0 · pgvector 0.8.2</text>
-          <text x="85" y="64" text-anchor="middle" class="svg-label" font-size="8.5" fill="#ffb86b">:5432 scram-sha-256</text>
+          <text x="85" y="64" text-anchor="middle" class="svg-label" font-size="8.5" style="fill:var(--slate)">:5432 scram-sha-256</text>
         </g>
 
         <!-- leg 1 flow -->
         <path class="flow leg1 shim" d="M180 140 L360 140" aria-hidden="true"/>
-        <text x="270" y="128" text-anchor="middle" class="svg-label" font-size="9.5" fill="#b07d10">leg 1 · API mTLS</text>
+        <text x="270" y="128" text-anchor="middle" class="svg-label" font-size="9.5" style="fill:var(--accent)">leg 1 · API mTLS</text>
         <!-- leg 2 flow (peer A up to peer B) -->
         <path class="flow leg2 shim" d="M530 120 C620 120 660 72 720 72" aria-hidden="true"/>
-        <text x="625" y="86" text-anchor="middle" class="svg-label" font-size="9.5" fill="#c8a2ff">leg 2 · quorum mTLS + Ed25519</text>
+        <text x="625" y="86" text-anchor="middle" class="svg-label" font-size="9.5" style="fill:var(--teal)">leg 2 · quorum mTLS + Ed25519</text>
         <!-- leg 3 flow (peer A to pg) -->
         <path class="flow leg3 shim" d="M530 150 C660 150 880 140 1000 140" aria-hidden="true"/>
-        <text x="765" y="172" text-anchor="middle" class="svg-label" font-size="9.5" fill="#ffb86b">leg 3 · daemon → PG verify-full</text>
+        <text x="765" y="172" text-anchor="middle" class="svg-label" font-size="9.5" style="fill:var(--slate)">leg 3 · daemon → PG verify-full</text>
       </svg>
     </div>
 
@@ -539,8 +559,8 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
       </thead>
       <tbody>
         <tr>
-          <td class="id">AI_MEMORY_REQUIRE_AGENT_ATTESTATION (required by default; =0 opts out)</td>
-          <td>Every store write must be agent-attested; an unsigned write is refused. Required by default since v0.9.0 (#1751) — set <code>=0</code> to restore the permissive <code>claimed</code> posture.</td>
+          <td class="id">AI_MEMORY_REQUIRE_AGENT_ATTESTATION (required by default on HTTP direct-write only; =0 opts out everywhere)</td>
+          <td>Surface-scoped since v1.0.0 (#1985, correcting #1751): an unsigned <strong>HTTP direct write</strong> (<code>POST /api/v1/memories</code>(+<code>/bulk</code>)) is refused <code>403 ATTESTATION_FAILED</code>; MCP <code>memory_store</code> and CLI <code>store</code> are operator-as-actor and stay permissive, landing <code>claimed</code>. <code>=1</code> forces strict on every surface; <code>=0</code> restores the permissive posture everywhere.</td>
           <td>unsigned write → <code>403 ATTESTATION_FAILED</code></td>
           <td class="res">PASS — unsigned write → 403 ATTESTATION_FAILED</td>
         </tr>
@@ -590,7 +610,7 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
           <td class="id">Form 7 — signed rules R001–R004</td>
           <td>Operator-signed governance seed rules (sqlite-substrate-scoped). On the postgres peers of this hive the live governance is the env battery above.</td>
           <td><code>rules list</code> → 4 enabled, attest_level=operator_signed (sqlite substrate)</td>
-          <td class="res">PARTIAL — Form-7 signed-rules (R001–R004) are sqlite-substrate-scoped; on postgres peers the env-battery controls above are the live governance (tracked #1536, out-of-NSA-scope)</td>
+          <td class="res partial">PARTIAL — Form-7 signed-rules (R001–R004) are sqlite-substrate-scoped; on postgres peers the env-battery controls above are the live governance (tracked #1536, out-of-NSA-scope)</td>
         </tr>
         <tr>
           <td class="id">V-4 signed-events hash chain</td>
@@ -792,6 +812,7 @@ make down                              <span class="cm"># tear it all down</span
       <li>• <a href="../batman-active-mode.html" style="color:var(--text)">Batman Mode atlas</a> — single-node activation recipe + the 7 forms</li>
       <li>• <a href="../compliance/nsa-csi-mcp.html" style="color:var(--text)">NSA CSI MCP mapping</a> — full concern/recommendation matrix with provenance</li>
       <li>• <a href="../compliance/honest-limitations.html" style="color:var(--text)">honest-limitations.md</a> — what the substrate does not defend against</li>
+      <li>• <a href="../compliance/enterprise-federation-repro.html" style="color:var(--text)">Enterprise-federation reproduction</a> — reproduce the audit env (PG 18.6 / AGE 1.8.0 / pgvector 0.8.6, TLS+mTLS) + the 3&times;7 scheme</li>
       <li>• <a href="../encryption.html" style="color:var(--text)">Encryption atlas</a> — SQLCipher / mTLS / HMAC-mandatory webhooks</li>
       <li>• <a href="../zero-touch-trust.html" style="color:var(--text)">Zero-touch trust</a> — CA-rooted O(1) peer enrollment</li>
       <li>• <a href="../architectures-t5.html" style="color:var(--text)">T5 — Global Hive</a> — the architecture tier this fleet realises</li>
@@ -801,7 +822,7 @@ make down                              <span class="cm"># tear it all down</span
   </div>
 </section>
 
-<footer>
+<footer class="ra-legal">
   <div class="footer-links">
     <a href="https://github.com/alphaonedev/ai-memory-mcp">Source</a>
     <a href="https://github.com/alphaonedev/ai-memory-mcp/issues">Issues</a>
@@ -816,6 +837,15 @@ make down                              <span class="cm"># tear it all down</span
     <strong>NSA non-endorsement.</strong> References to the National Security Agency Cybersecurity Information document on MCP security (U/OO/6030316-26 | PP-26-1834, May 2026 v1.0) describe ai-memory's substrate-level posture relative to NSA-issued guidance. The NSA, the Department of Defense, and the United States Government do not endorse, certify, or recommend ai-memory, AgenticMem, AlphaOne LLC, or any commercial product. Full mapping + citation: <a href="../compliance/nsa-csi-mcp.html">compliance/nsa-csi-mcp.html</a>.
   </div>
 </footer>
+<footer class="am-foot"><div class="am-wrap">
+  <span>© 2026 AlphaOne LLC · Apache-2.0 · ai-memory v1.0.0</span>
+  <span><a href="https://github.com/alphaonedev/ai-memory-mcp">source</a> · <a href="../index.html">home</a> · <a href="../architectures.html">architectures</a> · <a href="../ARCHITECTURAL_LIMITS.html">limits</a></span>
+</div></footer>
+<button class="am-themetog" id="am-themetog" type="button" aria-label="Toggle light or dark theme">theme</button>
+<script>
+(function(){var d=document.documentElement;try{var s=localStorage.getItem('aim-site-theme');if(s)d.setAttribute('data-theme',s);}catch(e){}
+var b=document.getElementById('am-themetog');if(!b)return;b.addEventListener('click',function(){var c=d.getAttribute('data-theme');var n=c==='dark'?'light':c==='light'?'dark':(matchMedia('(prefers-color-scheme:dark)').matches?'light':'dark');d.setAttribute('data-theme',n);try{localStorage.setItem('aim-site-theme',n);}catch(e){}});})();
+</script>
 
 </body>
 </html>

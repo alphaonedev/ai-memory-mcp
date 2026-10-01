@@ -1,0 +1,1083 @@
+# The wake plane: `ai-memory wake-hub` and the wake sink
+
+> Issues [#3466](https://github.com/alphaonedev/ai-memory-mcp/issues/3466)
+> (EPIC), [#3465](https://github.com/alphaonedev/ai-memory-mcp/issues/3465)
+> (the bus), [#3467](https://github.com/alphaonedev/ai-memory-mcp/issues/3467)
+> (the hub), [#3468](https://github.com/alphaonedev/ai-memory-mcp/issues/3468)
+> (identity), [#3469](https://github.com/alphaonedev/ai-memory-mcp/issues/3469)
+> (this page: the bus sink), [#3470](https://github.com/alphaonedev/ai-memory-mcp/issues/3470)
+> (this page: the client),
+> [#3504](https://github.com/alphaonedev/ai-memory-mcp/issues/3504) (this page:
+> snapshot reuse + the refresher),
+> [#3472](https://github.com/alphaonedev/ai-memory-mcp/issues/3472) (this page:
+> the certification stance and the removal proof).
+
+Start with [Integrate any agent](a2a-integration.md) for the end-to-end setup.
+
+## What the wake plane is for
+
+Before it existed, `memory_notify` wrote a durable inbox row and dispatched
+nothing. A recipient learned it had mail only by polling `memory_inbox`. The
+wake plane closes that gap: a committed notify pushes a bounded, content-free
+HINT to the recipient with a millisecond design target (measurement #3473
+remains open), so the poll becomes a safety net
+instead of the delivery mechanism.
+
+Three pieces:
+
+| Piece | Owns |
+|---|---|
+| `crate::inbox_wake` | the in-process `agent_notified` broadcast bus, one frame per committed notify |
+| `crate::wake_sink` | the bridge from that bus to the hub — in-process, or over the hub's socket |
+| `crate::wake_hub` | the same-host Unix-domain-socket switch that pushes the hint to connected agents |
+| `crate::wake_client` | the CLIENT: one long-lived session, one catch-up inbox read per hint, and the bounded poll that makes losing the hub cost latency only |
+
+## NORMATIVE: keep polling
+
+**A client of the wake plane MUST continue to poll its inbox at least once every
+60 seconds** (`wake_sink::BACKSTOP_POLL_MAX`).
+
+This is the rule that makes everything else here safe. The hub holds no durable
+truth: the ai-memory inbox row is the record and the wake is only a prompt to go
+read it. Every bound in the plane — a full recipient queue, a full hub-wide
+egress budget, a full hand-off channel, a lagging bus subscriber, an absent hub
+process — may drop a hint. Bounding the backstop poll is what turns each of
+those into a bounded LATENCY cost rather than an unbounded correctness one.
+
+Sixty seconds is a CEILING, not a target. A client that observes a
+`seq_high_watermark` gap should read immediately rather than wait it out.
+
+## Self-healing after a lost wake
+
+Every wake carries `seq_high_watermark`: the producer's host-wide monotonic wake
+counter at the instant the hint was minted. It is deliberately NOT a
+per-recipient inbox depth — the bus has no per-recipient counter, and a truthful
+one would put a database read on the very latency path this plane exists to
+remove.
+
+Read it as *"wakes happened that you did not see"*. The correct response to a
+gap is ONE catch-up inbox read. That is fail-safe by construction: a client may
+read once more than it strictly had to, and can never conclude that nothing was
+missed when something was.
+
+A sink-side per-recipient counter would be strictly worse. When a broadcast
+subscriber lags, it never sees the frames that were dropped, so it would hand
+clients contiguous numbers across a real gap. Lag is therefore signalled
+explicitly, through `InboxWakeSink::on_lagged` and its own metric.
+
+## What a wake carries — and what it cannot
+
+A wake payload is exactly:
+
+```text
+{ inbox_row_id, namespace, sender, digest, seq_high_watermark }
+```
+
+* `digest` is the SHA-256 of the notification body, so a recipient can
+  de-duplicate and verify what it later reads back without the hub ever seeing
+  the body.
+* There is no body field and no title field, on the bus frame or on the wire.
+  The body reaches only the emitter, which digests it.
+* The whole encoding is capped. When a long namespace and a long agent id will
+  not fit together, fields are shed in a fixed order — `sender`, then
+  `namespace`, then `digest` — and `inbox_row_id` and `seq_high_watermark` are
+  never shed. A hint that will not fit even then is REFUSED rather than
+  truncated: a truncated row id points at the wrong row, and this plane may only
+  ever produce fewer results, never wrong ones.
+
+## Who may receive which wake
+
+A substrate wake is addressed DIRECTLY to the recipient agent id and never to a
+`#topic`. The hub's route table is keyed by the identity a hello authenticated,
+so a wake for `X` can only ever land on a session that authenticated AS `X`.
+A topic-shaped, reserved, empty or over-long recipient is refused and counted;
+it is never coerced into something routable.
+
+### Which topics a session may subscribe to (#3505)
+
+The verifier admits exactly two topic shapes and nothing else:
+
+1. `#_inbox/<agent-id>` for the principal that authenticated — the
+   unconditional own-inbox proof #3468 shipped.
+2. `#<namespace>` for a namespace the CURRENT snapshot PROVES that principal
+   reads.
+
+The proof is derived out of band, by `ai-memory identity hub-cache`, from the
+SAME predicate the store applies for namespace read scope: the #1921 team /
+unit / org ancestors of the agent's own id. There is no second copy of that
+predicate — `crate::visibility::namespace_read_scope_prefixes` is the one
+definition, and both the sqlite and the postgres exporter call it.
+
+What the snapshot carries is those PREFIXES (at most three), not an expanded
+list of namespaces. The hub then admits `#<namespace>` when
+`crate::visibility::namespace_subtree_contains` — the store's own containment
+test, the same one `crate::storage::matches_subtree` and
+`scope_subtree_visible` route through — places the namespace inside one carried
+prefix, AND the namespace is not a #3348 substrate namespace (`_inbox/`,
+`_messages/`, `_agents`, …).
+
+Four properties follow, and each is load-bearing:
+
+* **The hub still opens no database.** Verify time is the shared containment
+  test applied to material the hub already holds.
+* **The hub applies the store's own subtree containment against
+  exporter-proven prefixes.** It is not a bare `starts_with`: `acme/eng` admits
+  `acme/eng/x` and never `acme/engineering`, because the shared predicate is
+  segment-wise. Reusing it is what stops the hub from re-widening a scope the
+  store would narrow — the hub is the component with the least information
+  about what the store would allow, so it must not carry its own rule.
+* **The export cannot grow with the corpus.** The set is a property of the
+  agent's ID, so it is fixed-size forever and derived with no query. An
+  expanded namespace list would instead grow as namespaces are created: an
+  org-level agent in a corpus of a few hundred namespaces would exceed any
+  fixed per-agent ceiling, the refresher would then publish NOTHING, and once
+  the snapshot aged out the hub would refuse EVERY hello — a fleet-wide
+  availability failure caused by ordinary corpus growth.
+* **Narrowing takes effect within one second.** Every session's live
+  subscription set — the hello topics AND anything a later `subscribe` frame
+  added — is re-verified on the one-second revalidation. Drop a prefix from the
+  next snapshot and the already-open subscription is dropped, with no reconnect
+  and no cooperation from the client. The session itself survives: losing a
+  scope costs subscriptions, not the agent's own inbox, because a fleet that
+  reconnects on every scope change is an outage where fewer subscriptions is a
+  degrade.
+
+The prefix set is bounded per agent by `MAX_READABLE_PREFIXES`, which IS
+`crate::visibility::NAMESPACE_READ_SCOPE_DEPTH` — one number, so the hub's
+ceiling can never disagree with the derivation. The exporter cannot produce an
+oversize set, so a file that carries one is evidence it is not what it claims
+to be and the hub REFUSES to load it — never a truncation, because which of an
+agent's prefixes survived would then depend on ordering.
+
+### Sending to a topic (#3505)
+
+**A topic has two doors, and both take the same proof.** `Frame.to =
+#<namespace>` on a `wake` is gated by the SAME `verify_topics` check a
+`subscribe` takes, so a session may address exactly the topics it could itself
+subscribe to. An out-of-scope topic send is refused with `403 forbidden` and
+fans out to nobody.
+
+Without that gate the widening would have been one-sided: before #3505 nobody
+could subscribe to `#<namespace>`, so an ungated topic send reached nobody and
+cost nothing — but the moment a proven namespace became subscribable, any
+authenticated peer, in any tenant, could have published fabricated hints (row
+id, sender, digest) to every subscriber of a team namespace and forced
+catch-up reads fleet-wide while paying only its own token bucket.
+
+`403 forbidden`, not `401 unauthorized`: this refuses ONE frame on an otherwise
+valid session (the hub closes the connection on `unauthorized` and keeps it on
+`forbidden`), so a mis-addressed wake never becomes a fleet-wide reconnect
+storm.
+
+**This is the boundary the producer follow-up must cross deliberately.** The
+reserved `wake-hub-producer` (#3469) is a flat id with no team / unit / org
+ancestor, so it carries an EMPTY prefix set by design and therefore cannot
+publish to a namespace topic at all. Its DIRECT, own-inbox wakes are unchanged
+— that is the whole authority the sink was ever granted. Making the substrate
+emit a TOPIC wake therefore cannot be done by wiring alone: it requires an
+explicit, reviewed decision to grant that principal a namespace scope, which is
+exactly the deliberation a broadcast authority deserves.
+
+**Snapshot format.** `readable_prefixes` is an ADDITIVE field and
+`ALLOWLIST_FILE_VERSION` deliberately stayed at `2`. Both mismatch directions
+already fail in the right direction: a NEWER hub reading an OLDER snapshot sees
+no field, defaults the set to EMPTY and admits own-inbox only (never
+"everything") — which a version bump would have turned into an outright refusal
+of every older file, so upgrading the hub before the exporter would take the
+fleet down; an OLDER hub reading a NEWER snapshot refuses the file whole through
+`deny_unknown_fields`, so it can never part-honour a grant it does not
+understand. The version stays reserved for a change to the meaning of an
+EXISTING field.
+
+**Not in this lane — the producer half.** Nothing in the substrate publishes a
+TOPIC-addressed wake yet. The #3469 sink emits DIRECT wakes only
+(`Frame.to = <agent-id>`), so today a namespace topic is subscribable and is
+fed only by another authenticated session that PROVES the namespace sending
+`wake` to `#<namespace>`. Making the substrate emit a topic wake when a
+shared-namespace row lands is a separate, deliberate change to
+`src/wake_sink/` and its `agent_notified` producer — it needs its own decision
+about which namespaces are worth broadcasting, how the fan-out is charged, and
+(per the send gate above) whether the reserved producer principal should be
+granted a namespace scope at all. It is tracked as a follow-up rather than
+smuggled in behind a verifier widening.
+
+Wakes are never sourced from the webhook lane. That lane is operator egress,
+with a global dispatch semaphore and a subscription-scan ceiling; sourcing an
+agent's latency-critical wake from it would make one slow operator webhook the
+recipient's wake latency. The `agent_notified` event still fires there for
+operator subscribers — the two lanes are fed from the same emitter and are
+independent of one another.
+
+### Knowing when a subscription is live (#3532)
+
+**An applied `subscribe` is acknowledged, and the acknowledgement is a
+promise about the router, not about the frame.** The hub adds the topics to
+its routing table FIRST and mints the ack only after that returned. Because
+one connection's frames are read, handled and written in order, a client that
+has OBSERVED the ack knows the route already existed when the ack was
+minted — so any topic wake a peer addresses after that point is routed against
+a table containing this session. `unsubscribe` is acknowledged the same way,
+with the dual guarantee: once the ack is observed, no further wake for those
+topics will be routed there.
+
+Before this, an accepted `subscribe` was answered with nothing at all. A client
+could not know when its subscription went live, and a peer's hint sent inside
+that window fanned out to nobody. The inbox row is the durable truth and the
+`<=60 s` backstop still finds it, so the cost was LATENCY and never loss — but
+it was UNOBSERVABLE latency, and a fleet cannot manage what it cannot observe.
+It was also why every wake-hub test had to round-trip a `ping` after
+subscribing before any peer addressed the topic; the ack replaces that
+workaround with the property itself.
+
+**The hello already had this.** Topics asserted in the `hello` are registered
+before the `welcome` is sent, so the welcome has always been their
+acknowledgement. #3532 extends the same guarantee to a subscription taken
+later in the session.
+
+**The ack is an echo, and that is deliberate.** It is the SAME kind as the
+request (`subscribe` -> `subscribe`, `unsubscribe` -> `unsubscribe`), stamped
+`from` the hub, carrying the request's own topic-list bytes. It does not
+consume a new wire number, for a reason that is about other people's clients
+rather than about elegance: the frame parser REFUSES an unknown kind byte (so
+does the Python SDK reader), so a hub that unilaterally started emitting a new
+`subscribed` kind would have ENDED the session of every client written before
+it, instead of being ignored by one. Kinds 5 and 6 are already in every
+reader's table, and every client in this tree ignores a frame kind it has no
+opinion about — so the ack is inert for an old client and meaningful to a new
+one, which is what "additive" has to mean on a wire other people have already
+implemented. `hello` is already bidirectional with a different payload per
+direction, so a direction-disambiguated kind is the protocol's existing idiom.
+
+Three properties follow, and each is pinned by
+`tests/wake_hub_subscribe_ack_3532.rs`:
+
+* **Acknowledged means applied.** A REFUSED subscribe — out of scope, or past
+  `MAX_TOPICS_PER_SESSION` — is answered with its `error` and never with an
+  ack. There is no frame that says "listening" for a topic the hub did not
+  take.
+* **The ack carries nothing new.** Its payload is the request's own bytes, so
+  it cannot smuggle a body, an identity claim or an authority the client did
+  not itself send. The wake-only posture is unchanged.
+* **A wake may still precede the ack.** If the session already held the topic,
+  a wake for it can legitimately arrive between the request and its
+  acknowledgement. A client waits for the ack while dispatching whatever
+  arrives first; it must not assume the ack is the next frame.
+
+## The two deployment shapes
+
+### Co-hosted with the daemon
+
+`wake_sink::in_process::install_in_process(router)` attaches a fire-and-forget
+sink to the bus. The encoded frame goes straight to the hub's own
+`Router::deliver` — the same injection point a hub connection's own `route_wake`
+uses — so a substrate wake and a peer-relayed one are indistinguishable
+downstream and obey the same per-recipient queue depth, per-recipient byte cap,
+hub-wide egress budget and coalesced offline set. There is one set of bounds to
+reason about, not two.
+
+### Hub as a separate process
+
+`wake_sink::uds::install_uds(cfg, credential)` starts a forwarder that is an
+ORDINARY hub client over the hub's Unix domain socket: the hub opens with a
+challenge, the forwarder answers with a signed hello, and from then on it writes
+`wake` frames through the same length-delimited codec and the same frame ceiling
+every peer uses. There is no privileged side channel and no second admission
+path — the hub applies its peer-credential gate, its identity verifier, its
+token buckets and its queue bounds to the daemon exactly as it does to an agent.
+
+## Identity, and why it fails closed
+
+A substrate wake is stamped with the reserved `wake-hub-producer` identity, NOT
+with the notifying agent's id. No hub session ever authenticated that agent for
+that frame, so putting its id on the frame's `from` would be a claim the hub
+never checked. The real sender rides in the wake metadata, where it is plainly
+metadata.
+
+`wake-hub-producer` is a reserved agent id, so no wire caller can register it or
+claim it through `X-Agent-Id`, an MCP tool argument, or an HTTP body. "May wake
+any agent on this host" is therefore an operator grant to one unclaimable name
+rather than an authority an agent can talk its way into. The forwarder REFUSES
+to start for a credential that authenticates as anything else.
+
+The shipped join credential (`NoJoinCredential`) refuses to sign, so a daemon
+with no enrolled producer identity refuses to start a forwarder rather than
+opening a socket it could not authenticate on. This mirrors the hub's own
+shipped `DenyAllVerifier`. There is deliberately no flag that relaxes either
+one: a switch that disables identity verification is a switch that eventually
+gets set in production.
+
+## Degrade, never corrupt
+
+The durable inbox row is already committed before a wake fires. A slow, full or
+absent hub therefore costs a HINT and a counter — never a committed notify, and
+never backpressure applied to the notify path. Concretely:
+
+* Everything on the bus pump is an encode plus a non-blocking enqueue. No
+  `.await`, no lock held across one, no I/O.
+* The hand-off channel to a separate-process hub is bounded. When it is full
+  the new HINT is dropped and counted; the durable write it referred to has
+  already committed, so the recipient still finds the row on its next poll.
+* Reconnects use jittered exponential backoff capped at the backstop interval,
+  so a hub restart cannot produce a synchronised reconnect blast across a fleet.
+  The ladder resets only after a connection that actually lasted, so a hub that
+  accepts and instantly drops cannot turn the forwarder into a hot loop, and a
+  daemon that survived one long outage does not stay stuck at the cap forever.
+
+Every drop cause has its own counter on `wake_sink::SinkMetricsSnapshot` —
+unaddressable recipient, unencodable frame, hub queue or egress overflow,
+offline-coalesced, offline-unknown, hand-off channel full, hub down, and bus
+lag. A hub that silently stopped waking anyone must not look like a quiet fleet.
+
+## Certification: transport-only, and provably removable
+
+The enterprise-federation certification
+(`docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md`) covers the
+federation trust boundary. **The wake plane is explicitly NOT covered by it**
+(§6), and that entry is a limit, not an omission. Three properties are what
+let the certification's claims stay true while this plane ships beside them:
+
+* **Transport-only.** The hub federates nothing. It is reachable only over a
+  mode-`0600` Unix-domain socket on ONE host, never between peers, and no
+  `/sync/push` verdict, no `receive_auth` control and no envelope or signature
+  gate the certification cites consults it. Nothing in the certified
+  federation path gets weaker, or stronger, because a hub is running.
+* **Content-free.** A wake frame is exactly
+  `{inbox_row_id, namespace, sender, digest, seq_high_watermark}` — no body
+  and no title, on the bus frame or on the wire. A hub process therefore
+  observes no memory content, and the plaintext-to-peer exposure the
+  certification already discloses is unchanged by it.
+* **Loss degrades LATENCY only.** The inbox row is committed before any hint
+  is minted and stays the durable truth; the `<= 60 s` backstop poll is armed
+  hub or no hub. A hub that is slow, full, absent — or deleted from the
+  deployment entirely — costs wake latency and a counter, never a committed
+  notify and never a row.
+
+What is therefore **not** covered: any wake-latency SLO, any delivery,
+ordering or at-least-once guarantee for a hint, any MEASURED hub scale
+envelope (the bounds here are architected, like the agent dimension of the
+certification's scale envelope), and any authority derived from a hint —
+what a woken recipient may read is decided by the ordinary inbox read it then
+performs, not by the wake.
+
+### The removal proof
+
+"Removable" is mechanised rather than asserted. `scripts/check-cert-removal-proof.sh`
+carries the row `wake_backstop_always_armed_3472`, the only row in that
+harness that runs in the opposite direction to the others: every other row
+proves a control the certification COVERS is load-bearing, this one proves the
+subsystem the certification does NOT cover is the removable half.
+
+The control it mutates is the unconditional spawn of the backstop loop in
+`wake_client::WakeStream::start` — the one that happens before, and
+independently of, the `if let Some(hub)` arm. Disarming it, and only it, is
+exactly the world where the hub is the sole delivery mechanism. The guard test
+is `tests/wake_client_3470.rs::inbox_wait_returns_on_the_bounded_backstop_with_no_hub_3470`,
+which drives `ai-memory inbox --wait` on a host with **no** hub and asserts the
+backstop fires inside its own bound. Broken it goes RED; restored it goes
+GREEN. That is the executable form of the sentence at the top of this page:
+the POLL is the guarantee, the wake is a prompt.
+
+Read the harness before running it: it rewrites tracked source in place for
+the length of a run (`#3118` / `#3119`), so `git add -A` after one is banned
+and `--force-restore` is the recovery path.
+
+## Turning it on: the operator ceremony
+
+Nothing pushes wakes until an operator asks for it. The default posture is no
+forwarder, no socket and no identity load.
+
+**1. Run the hub.** `ai-memory wake-hub --allowlist <allow.json>` in its own
+process (see `docs/CLI_REFERENCE.md`; `--posture` prints the resolved socket,
+directory mode and fd budget without binding anything).
+
+**2. Grant the producer name.** The daemon issues its wake sessions under the
+reserved principal `wake-hub-producer`, signed by the daemon's OWN enrolled
+`daemon` key — the same key it already signs links with. Publish an allowlist
+row binding that name to that public key:
+
+```bash
+ai-memory identity hub-cache --daemon-producer \
+    --include-agent <each agent that may listen> --out <allow.json>
+```
+
+`--daemon-producer` is the switch that publishes it. It reads only
+`daemon.pub` from this host's owner-only key directory and writes the row with
+`bind_authority: "daemon_key_dir"`.
+
+That row is the single, revocable grant that says "this host's daemon may wake
+agents on this hub". Drop the switch on the next refresh and the row disappears,
+which revokes the daemon's wake authority within a second — the hub revalidates
+every established session once per second against the current snapshot. Both the
+grant and the revocation are recorded on the `signed_events` audit spine as
+`identity.hub_allow` / `identity.hub_revoke`, exactly like an agent's.
+
+There is deliberately no way to publish this row by naming the principal:
+`--include-agent wake-hub-producer` is REFUSED, because a reserved principal has no
+key history and the store loop would silently omit it, publishing a snapshot
+that looked successful and granted nothing.
+
+The row's `bound_at` is the daemon key's own bind instant — read from
+`daemon.pub` on this host — not the instant the snapshot was published, so it is
+IDENTICAL on every refresh (#3540). That matters because the hub refuses a
+delegation issued BEFORE the binding it rides on: a `bound_at` that moved
+forward on every 30 s republish would refuse the daemon's own established
+session on the very next re-validation, and the forwarder would reconnect once
+per refresh, dropping every wake minted in the gap. Revocation is still the
+same single lever — drop the switch and the row disappears.
+
+Operationally that means the stamp is the daemon key FILE's timestamp: anything
+that rewrites `daemon.pub` — re-staging the key, a restore that does not
+preserve modification times, a `touch` — moves the binding forward, and the
+daemon's hub session is re-established ONCE on the next refresh (one reconnect,
+then stable again). Copy key directories with `cp -p` / `rsync -a` if you would
+rather not pay even that one reconnect. Nothing else about the grant changes,
+and the daemon re-joins on its own.
+
+The same ordering check compares the two stamps at the precision the delegation
+carries, WHOLE SECONDS: a bundle minted in the same second as the binding is
+admitted (the ceremony above mints exactly that), and one minted in an earlier
+second is still refused.
+
+### What `daemon_key_dir` does and does not attest
+
+It says: the operator of this host, with read access to its 0700 key directory,
+asserted that this host's daemon key may wake agents on this hub. It does NOT
+claim a possession challenge was answered or that a v97 ledger row backs it —
+neither is true, and stamping `possession_proof` would be a lie about the
+durable identity root. The hub therefore treats it as delegating authority for
+the reserved `wake-hub-producer` name and for NO other principal: that name is
+unclaimable on the wire, owns no memories and no namespace, and the only thing
+it can do is deliver a content-free wake hint addressed to an agent's own inbox.
+A hub build that has never heard of the value maps it to "unrecognised", which
+cannot delegate at all — so an older hub reading a newer snapshot fails closed.
+
+**3. Point the daemon at the hub.** In `config.toml`:
+
+```toml
+[wake_hub]
+sink_socket = "/run/user/1000/ai-memory/wake-hub.sock"
+```
+
+Restart `serve`. The startup log names the enrolled public key it will issue
+under, so you can check it against the row you published.
+
+If the sink is configured but the daemon has no enrolled key — or a
+public-only one — it REFUSES to start the forwarder, logs the exact
+remediation at ERROR, and keeps serving. It does not open a socket it could not
+authenticate on, and it does not take the durable substrate down over a hint it
+cannot push.
+
+### Why the daemon's own key, and not a key of its own
+
+`wake-hub-producer` is a reserved agent id: no wire caller can register or
+claim it. It deliberately has NO enrolled root of its own. Minting one would
+mean a second private key on the host, with its own enrolment ceremony, its own
+rotation and its own revocation story — a second identity root, which is
+exactly what "one identity root" forbids. Instead the daemon's already-enrolled,
+already-proven root is the sole authority, `wake-hub-producer` is a scoped NAME
+that root may speak under on the wake plane, and the allowlist row is the
+operator's explicit, revocable grant that says so. The per-connection session
+key is generated in memory and never written anywhere, so there is no
+credential file to steal and nothing to rotate.
+
+### The co-hosted shape
+
+`wake_sink::in_process::install_in_process(router)` is available as a library
+call and is exercised by the test suite, but nothing in `serve` hosts a hub in
+this build — `ai-memory wake-hub` runs the hub as its own process. When a
+`serve`-hosted hub lands, wiring it is one line at the same boot site.
+
+## The client: `ai-memory wake-listen`
+
+The plane is only useful if something listens on it. `ai-memory wake-listen`
+(#3470) is that something, and it is what replaces the fleet's three-minute
+`ai-memory inbox` cron: one process, one session, one inbox read per event
+instead of one process boot per poll.
+
+```bash
+# once, per agent, on the host that will listen
+ai-memory identity delegate --scope a2a-hub --agent-id ai:alice --hub-id ai-memory-wake-hub
+
+# then, long-lived
+ai-memory wake-listen --agent-id ai:alice --json
+ai-memory wake-listen --agent-id ai:alice --exec 'my-notifier'
+
+# or, for a one-shot "block until there is mail, then print it"
+ai-memory inbox --wait --timeout 300 --agent-id ai:alice
+```
+
+### What it reads, and how often
+
+Exactly ONE catch-up inbox read per event, through the same `memory_inbox`
+funnel every other surface uses — never a read per queued hint:
+
+| Event | Why it reads |
+|---|---|
+| welcome | mail may have arrived while this agent was offline |
+| welcome with `lagged` | the hub's offline id set overflowed, so its id list cannot be trusted |
+| `wake` | a hint arrived naming a row |
+| `wake` with a `seq_high_watermark` gap | wakes happened that this listener did not see |
+| backstop tick | the bounded poll, always armed |
+
+The backstop's clock is reset by every catch-up read, hub-driven or not, so the
+guarantee is "at most `BACKSTOP_POLL_MAX` since the LAST read" rather than a
+fixed schedule that fires right after a wake. A healthy hub therefore costs at
+most one idle read per minute per agent, not one per wake plus one per minute.
+
+`--poll-secs` is REFUSED above 60 rather than clamped: a listener that silently
+polled less often than the plane's own contract would be reporting a guarantee
+it does not provide.
+
+### Subscribing, and waiting for the acknowledgement (#3532)
+
+`wake-listen` itself asserts NO topics: a substrate wake is addressed directly
+to the recipient, so its own-inbox scope needs no subscription and its
+`welcome` is already the acknowledgement of everything it asked for. A client
+that DOES want a namespace topic (#3505) asks for it after the welcome, and the
+rule is the same in all three client libraries:
+
+**Send the `subscribe`, then treat the subscription as live only when the
+acknowledgement arrives — never when the write returns.** A client that reports
+liveness on the write reintroduces exactly the race #3532 closed.
+
+* **Rust** — `Session::send_subscribe` / `send_unsubscribe` only WRITE;
+  liveness is `Session::next_event` yielding `SessionEvent::Subscribed`.
+  Keeping the ack in the one ordered event stream is what lets a wake that
+  arrives before it be delivered rather than swallowed.
+* **Python** — pass `topics=` to `WakeListener`; the pump sends the
+  `subscribe` after the welcome and emits a `WakeReason.SUBSCRIBED` signal
+  when the hub acknowledges. `listener.subscribed` holds the acknowledged
+  topics and is empty until then.
+* **TypeScript** — pass `topics` to `WakeStateMachine` / `WakeListener`; the
+  machine emits a `subscribed` signal on the ack and exposes
+  `subscribedTopics`.
+
+All three IGNORE an acknowledgement they cannot parse rather than dropping the
+session over it: the subscription simply stays unacknowledged, so a caller
+waiting on liveness keeps waiting instead of being told a lie, and the durable
+inbox row is untouched either way.
+
+### One identity root, and every check fails closed
+
+The listener loads the bundle `ai-memory identity delegate --scope a2a-hub`
+wrote — `<key-dir>/<agent-id>.a2a-hub.json`, mode 0600 — which holds a
+DELEGATED private key and never the enrolled one. There is no second identity
+root and no second enrolment ceremony; the agent's enrolled key is still the
+sole authority, and the delegation is a short-lived certificate it minted.
+
+Before a byte reaches the wire the listener refuses a bundle that is:
+
+* not mode 0600, not owned by the caller, or reached through a symlink;
+* a version this build does not understand;
+* minted for a different hub, or for a different agent than the one being
+  watched;
+* holding a private key that is not the one its certificate authorises;
+* carrying a certificate that does not verify under the agent's ENROLLED public
+  key in the same key directory;
+* outside its validity window (refused locally, with the re-mint command in the
+  message, rather than as an opaque `401` after a reconnect ladder).
+
+It also checks the socket the way the hub hardened it: an owner-only (`0700`)
+directory holding an owner-only (`0600`) socket, both owned by the caller.
+Dialling a socket another local user could have created would be handing the
+handshake to whoever won that race.
+
+There is deliberately no flag that skips any of this — the same reasoning that
+keeps `--insecure` off `ai-memory wake-hub`.
+
+### Degrade, never corrupt
+
+Every failure mode here costs LATENCY:
+
+* **No hub configured, hub down, hub refusing.** The bounded poll IS the
+  delivery mechanism. That is the documented degraded mode, not an error.
+* **Reconnects.** Jittered exponential backoff capped at the backstop, with the
+  ladder resetting only after a session that actually lasted — so a hub that
+  accepts and instantly drops cannot become a hot loop, and a fleet restart
+  cannot produce a synchronised reconnect blast.
+* **A slow consumer.** Signals cross to the consumer through a bounded channel
+  using `try_send`. A full channel means a catch-up read is already queued and
+  will see every row a dropped signal referred to, so the drop coalesces reads
+  rather than losing them — and it is counted, because a listener that silently
+  stopped reading must not look like a quiet inbox.
+* **A failed catch-up read.** Logged; the row is already committed and the next
+  signal — at worst the backstop — reads it again.
+* **A hung `--exec` hook.** Bounded at 30 s and killed, so one slow notifier
+  cannot become a listener that stops reading.
+
+### The exec hook carries metadata, never a body
+
+`--exec` runs `sh -c <cmd>` with the wake hint in the ENVIRONMENT (never on the
+command line, so wire-sourced values reach neither `ps` output nor shell
+word-splitting):
+
+`AI_MEMORY_WAKE_REASON`, `_AGENT_ID`, `_HUB_ID`, `_INBOX_ROW_ID`, `_NAMESPACE`,
+`_SENDER`, `_DIGEST` (lowercase hex SHA-256 **of the body**), `_SEQ`,
+`_MISSED`, `_PENDING`, `_INBOX_COUNT`.
+
+`_DIGEST` is what lets a hook verify what it later reads without the hub ever
+having seen it. There is no body variable because there is no body on the wire.
+These variables are EMITTED by the listener, not read by the substrate, so they
+carry no precedence ladder and appear in no `AI_MEMORY_*` resolution table.
+
+### Replacing a polling fleet
+
+A fleet that coordinates through `memory_notify` + `ai-memory inbox` on a timer
+converts to the wake plane one agent at a time, and never all at once:
+
+```bash
+# 1. once per agent, on the host that will listen
+ai-memory identity delegate --scope a2a-hub --agent-id <agent> --hub-id ai-memory-wake-hub
+
+# 2. replace `sleep 180; ai-memory inbox --agent-id <agent> --json`
+ai-memory inbox --wait --timeout 180 --agent-id <agent> --json
+
+# 3. or, for a long-lived worker, replace the loop entirely
+ai-memory wake-listen --agent-id <agent> --exec 'my-handler'
+```
+
+Nothing about the durable side changes: the same rows, the same read, the same
+output. What changes is that the read happens when there is mail rather than
+every three minutes — and, because the `<=60 s` backstop is always armed, an
+agent whose hub is unreachable is strictly no worse off than the poller it
+replaced.
+
+The `sdk/python/swarm` acceptance harness converts the same way: set
+`SWARM_WAKE_HUB_SOCKET` + `SWARM_WAKE_HUB_BUNDLE_DIR` and its consumer lanes
+wait for the wake instead of racing the write. Leaving them unset keeps the
+harness byte-identical to its pre-#3470 behaviour, which is what makes the
+switch safe to roll out per fleet rather than per release.
+
+### `ai-memory inbox --wait`
+
+The one-shot form: block on the wake plane, then perform and print the read
+exactly as `ai-memory inbox` does. `--timeout` bounds the wait, and on expiry
+the read STILL happens — a timeout means "nothing arrived in that window",
+never "skip the durable truth". **Omitting `--timeout` does not mean waiting
+forever:** the backstop tick is itself a return, so a wait without it lasts at
+most one poll interval (`<= 60 s`, `wake_sink::BACKSTOP_POLL_MAX`).
+
+A hub that is merely DOWN is already covered by the always-armed backstop: the
+credential loads, the session loop backs off, and the poll returns on schedule.
+When the CREDENTIAL itself will not load — no `ai-memory identity delegate` was
+ever run on this host, the bundle expired, or it was minted for another hub —
+`--wait` logs that refusal once at `WARN` with its cause chain and then waits
+on the bounded poll anyway. That is deliberate: `--wait` is the drop-in for
+`sleep 180; ai-memory inbox`, and a version that returned immediately on a
+credential error would replace a paced poll with a hot loop. `ai-memory
+wake-listen` keeps the hard refusal, because an operator who started the
+listener explicitly asked for a hub session and needs to see why it will not
+open.
+
+## Keeping the snapshot fresh: the refresher is not optional
+
+The hub REFUSES every hello once the snapshot it reads is older than 60 seconds
+(`identity::hub_cache::MAX_CACHE_AGE_SECS`). That is deliberate — a snapshot is
+the only thing standing between a revoked agent and a live session, so an
+un-refreshed one must expire into refusal rather than linger into authority —
+but it means a hub with no refresher admits nobody one minute after the last
+manual export.
+
+Ship the refresh as a job, not as a habit:
+
+| Platform | Unit |
+|---|---|
+| Linux | `packaging/systemd/ai-memory-wake-hub-refresh.service` + `.timer` |
+| macOS | `scripts/templates/dev.alphaone.ai-memory.wake-hub-refresh.plist` |
+
+Both run the same command every 30 seconds — half the refusal threshold, so a
+missed tick costs nothing, writing to the SAME path the hub reads:
+
+```bash
+# Linux (the $ALLOWLIST that ai-memory-wake-hub.service passes to --allowlist)
+ai-memory identity hub-cache \
+    --include-agent <each agent that may listen> \
+    --out /var/lib/ai-memory/hub-allow.json
+# The shipped refresher then install(1)s that file 0600 owned by
+# ai-memory-hub into /run/ai-memory-hub/hub-allow.json — the hub uid
+# must own the snapshot at exact mode 0600.
+
+# macOS (the path dev.alphaone.ai-memory.wake-hub.plist reads)
+ai-memory identity hub-cache \
+    --include-agent <each agent that may listen> \
+    --out ~/.ai-memory/hub-allow.json
+```
+
+**Write it where the hub reads it.** `/run/ai-memory-hub/hub-allow.json` on
+Linux and `~/.ai-memory/hub-allow.json` on macOS are the paths the hub units
+name; a refresher pointed anywhere else leaves a hub reading a file nobody
+writes, which looks like a working install right up to the moment every hello
+is refused. On Linux the hub runtime directory is created `0700` by the hub
+unit (`RuntimeDirectory=ai-memory-hub`, `User=ai-memory-hub`,
+`RuntimeDirectoryPreserve=yes`). The refresher is a DISTINCT user
+(`User=ai-memory`) because it opens the store; it cannot write the 0700 hub
+directory, so `ExecStartPost=+/usr/bin/install -o ai-memory-hub …` is the
+hand-off that satisfies the hub's owner-only 0600 allowlist gate (#3578).
+
+**Grant the database's DIRECTORY, not the database file.** The systemd
+refresher runs under `ProtectSystem=strict`, so every path it writes has to be
+named in a `ReadWritePaths=`. SQLite runs the store in WAL mode, and WAL mode
+creates and locks `ai-memory.db-wal` and `ai-memory.db-shm` BESIDE the
+database — a reader opens them too, and `identity hub-cache` is not even a
+pure reader, since it audits its allow/revoke decisions onto the signed_events
+spine. Naming only `/var/lib/ai-memory/ai-memory.db` would leave those side
+files on a read-only parent: the run fails, nothing is published, and the
+previous snapshot ages past the 60 s ceiling into refusal — fail-closed, but a
+hub that admits nobody. The shipped unit therefore grants
+`ReadWritePaths=/var/lib/ai-memory`, the same directory grant
+`ai-memory.service` uses ("Only touch `AI_MEMORY_DB`'s parent"); if you keep
+the database somewhere else, name THAT directory here instead. The macOS
+launchd job carries no path allowlist, so it needs no equivalent.
+
+**After a reboot the snapshot is gone.** `/run` is a tmpfs, so the hub starts
+admitting nobody and stays that way until the refresher has run once — which is
+exactly what `OnBootSec=15s` (systemd) and `RunAtLoad` (launchd) are for. The
+first post-boot refresh is what lets the hub admit anyone at all.
+
+Three properties make that safe to run on a timer. It publishes ATOMICALLY: the
+snapshot goes to a temp file created in the SAME directory, set to mode 0600
+before a byte is written, then written, `fsync`ed and renamed into place over
+the old inode, so a hub reading concurrently
+sees the whole old snapshot or the whole new one and never a truncated file. It
+publishes NOTHING on failure: a store error, a record-stop or a failed audit
+leaves the previous snapshot alone, which then ages out and refuses — the
+fail-closed direction. And it can only ever NARROW: the snapshot is complete, so
+an agent omitted from the next refresh loses admission within the hub's
+one-second session revalidation, which is exactly how revocation works.
+
+The units are deliberately SEPARATE from `ai-memory-wake-hub.service`. The
+refresher opens the store; the hub must never. Keeping them in one unit would
+put a database handle inside the process whose whole security story is that it
+holds only public material.
+
+**Watch it with `--posture`.** `ai-memory wake-hub --posture` prints the
+snapshot's age and whether the hub still accepts it:
+
+```text
+  allowlist snapshot:    12 s old (ceiling 60 s)
+```
+
+`--posture --json` carries the same facts under `allowlist_snapshot`
+(`age_secs`, `max_age_secs`, `within_max_age`). Alert on `within_max_age`
+turning false, or on `age_secs` climbing: that is the refresher having stopped,
+and it is visible before the agents notice they can no longer join. An
+unreadable snapshot reports no age and `within_max_age: false` — a snapshot the
+hub cannot read is not a fresh one.
+
+### Why there is no in-process refresh loop
+
+`wake-hub` deliberately grew no `--refresh-from <store-url>` flag. The
+derivation reads the durable v97 identity root and writes to the
+`signed_events` audit spine, so an in-process loop would put a live store
+handle — and its credentials — inside the hub process. The hub's entire
+security posture is that it holds ONLY public material and opens NO database on
+either backend, which is what bounds a hub compromise to "wake hints stop
+flowing" instead of "the identity root is reachable". A timer that runs the
+existing, already-audited exporter buys the same automation without spending
+that property.
+
+## Reusing the parsed snapshot
+
+The hub re-checks identity on every hello AND once per second for every
+established session, so at the 256-connection ceiling it was parsing the
+snapshot JSON hundreds of times a second. It now reuses the PARSED snapshot
+while the file's identity (device, inode, mtime, size) is unchanged and the
+parse is younger than `wake_hub::limits::ALLOWLIST_CACHE_TTL` (2 seconds, 30x
+under the 60-second refusal threshold).
+
+Reuse changed the COST and nothing about the DECISION. Three properties hold on
+every single identity check, warm parse or not:
+
+* **The permission gate runs every time.** Each check opens the snapshot with
+  `O_NOFOLLOW` and re-proves through that descriptor that it is a regular file
+  owned by this uid at exactly mode 0600. A snapshot whose mode is widened,
+  whose owner changes, which is replaced by a symlink, or which is removed is
+  refused immediately.
+* **The age gate runs every time.** The snapshot's own `refreshed_at` is
+  re-tested against the clock on every check, so reuse can never extend a
+  snapshot's life past the 60-second ceiling. A stale file stays refused exactly
+  as it was before reuse landed.
+* **A replaced snapshot takes effect immediately.** A new inode, mtime or size
+  misses the reuse key and forces a re-read on the very next check, so a refresh
+  or a revocation still lands within the same one-second revalidation window it
+  always did.
+
+The permissions that are checked, the identity that reuse is keyed on, and the
+bytes that are parsed all come from ONE descriptor — there is no `stat`-then-open
+window for a swap to slip through.
+
+## Operating the hub
+
+> Issue [#3471](https://github.com/alphaonedev/ai-memory-mcp/issues/3471) — the
+> ops surface: metrics, the health probe, the SIGTERM drain, the supervisor
+> units, and the `doctor` posture check.
+
+`ai-memory wake-hub --posture` resolves and prints the socket, directory mode,
+fd budget, drain deadline, identity verifier and allowlist snapshot age
+**without binding anything**, so it is safe to run against a host already
+serving a hub. `--allowlist` names
+the derived public snapshot of enrolled agent keys the delegation verifier
+reads; the hub itself never opens the store. Full flag reference:
+`docs/CLI_REFERENCE.md`.
+
+### Is it up? — `wake-hub --health`
+
+```bash
+ai-memory wake-hub --health          # human report; exit 0 reachable, 2 not
+ai-memory wake-hub --health --json   # machine-readable, same exit codes
+```
+
+The probe is an **ordinary hub client**. It connects to the configured socket,
+waits for the hub's opening challenge frame, and closes. That is the whole
+probe, and the three things it deliberately is NOT are what make it safe:
+
+* **Not a privileged side channel.** There is no admin socket and no status
+  endpoint. A health surface that bypassed the hub's own admission path would
+  be an unauthenticated way to learn its state — and, worse, would stop
+  testing the path that actually matters.
+* **Not a bypass of the peer-credential gate.** The probe is subject to
+  `SO_PEERCRED` / `getpeereid` like any peer. Run as the wrong user it is
+  denied and reports `unreachable`, which is the correct answer: from that
+  user, the hub *is* unreachable.
+* **Not an authenticated session.** It presents no `hello`, holds no key
+  material, and is refused everything past the challenge — so it cannot
+  enumerate agents, join topics or inject a wake, and it needs no credential,
+  which is what makes it runnable from a supervisor where no agent identity
+  exists.
+
+Cost to the hub is one short-lived connection bounded by a 2 s budget, against
+a pre-auth budget of 4 frames/s that the probe never spends (it sends zero
+frames). Every outcome that is not "a well-formed challenge arrived" is
+`unreachable` with a named cause and remedy — `socket_missing`,
+`not_a_socket`, `connection_refused` (a stale socket with no listener),
+`permission_denied`, `timeout`, `unexpected_frame` — because a supervisor that
+reads "healthy" from an inconclusive probe is worse than no probe.
+
+### What it reports — the metrics
+
+The hub's counters, gauges and histograms are read through one stable JSON
+shape (`wake_hub::metrics::MetricsSnapshot::to_json`), published at rest by
+`wake-hub --posture --json` under `metrics_schema` so an exporter can be
+written against a documented contract:
+
+| Family | Answers |
+|---|---|
+| `connections_current`, `recipients_current` | how many agents are attached, and how many hold a route |
+| `queue.queued_bytes_current` / `queued_frames_current` | how much is waiting, under BOTH per-recipient bounds — bytes and frames are different faults with different remedies |
+| `queue.slow_consumers_current` / `slow_consumer_events_total` | who is falling behind, counted BEFORE anything is dropped |
+| `drops.*` | WHY a delivery was refused: `recipient_queue_full` (one slow reader), `global_egress_full` (the hub is saturated), `channel_full` (a burst deeper than the queue), `write_failed` (accepted then unwritable), `offline_unknown` |
+| `denied.*` | peer credential, connection ceiling, hello, malformed, forged `from`, rate limit |
+| `fanout_latency_us`, `wake_latency_us` | `count` / `mean` / `max` / `p50` / `p99` — fan-out is the hub-internal hand-off span, wake latency is mint-to-delivery |
+
+Two properties are load-bearing. The histograms are **fixed-bucket and
+allocation-free** — an observability surface the hub can be made to allocate
+would be a denial-of-service surface, not observability — so a bucketed
+quantile is reported as the containing bucket's UPPER bound, a conservative
+over-estimate that can make the hub look slower than it is and never faster.
+And a quantile with no observations behind it is `null`, never `0`: "no
+traffic yet" and "instantaneous" are different facts and an alert rule must be
+able to tell them apart. Mint-to-delivery crosses a wall-clock boundary, so it
+is advisory: a wake with no stamp records nothing, and a peer whose clock runs
+ahead records `0` rather than an underflowed enormous value.
+
+### Shutting it down — the bounded drain
+
+On `SIGTERM` or `SIGINT`, in this order and no other:
+
+1. **Stop accepting.** The listener closes first, so a peer arriving
+   mid-shutdown is refused by the kernel rather than accepted into a hub that
+   is about to stop reading it.
+2. **Ask every session to go.** Each reader is woken and each writer gets its
+   close sentinel. **Nothing content-bearing is emitted** — no goodbye frame,
+   no last wake. The hub holds no durable truth, so there is nothing it could
+   owe a peer at shutdown; the committed inbox row and the `<=60 s` backstop
+   poll are the guarantee, exactly as at every other moment.
+3. **Wait, bounded.** At most 5 s (`wake_hub::limits::DRAIN_DEADLINE_MS`) for
+   the connection gauge to reach zero, then exit anyway with a WARN naming the
+   residual. An unbounded drain is a hung `systemctl stop` that ends in
+   `SIGKILL` — strictly worse, because the socket then survives the process.
+4. **Unlink our own socket, and only ours.** The path must still be a socket
+   AND carry the `(device, inode)` this process created. Without the inode
+   check, a hub slow to drain while its replacement had already bound a fresh
+   socket at the same path would delete the REPLACEMENT's socket, and every
+   agent on the host would be talking to a live process through a path that no
+   longer exists. When ownership cannot be established the file is left for
+   the next start-up probe, which connects to it before unlinking anything.
+
+The process exits `0` after a completed drain, so `systemctl stop` and
+`launchctl bootout` do not record a failure for the thing they asked for.
+
+### Supervisor units
+
+| Platform | Template |
+|---|---|
+| systemd | `packaging/systemd/ai-memory-wake-hub.service` |
+| launchd | `scripts/templates/dev.alphaone.ai-memory.wake-hub.plist` |
+
+Both pin the file-descriptor budget to `wake_hub::limits::DESIRED_NOFILE`
+(4096) — `LimitNOFILE=` on systemd, `SoftResourceLimits`/`HardResourceLimits`
+`NumberOfFiles` on launchd. **This is the point of the templates:** macOS
+ships a default soft `RLIMIT_NOFILE` of 256, which lands `EMFILE` at exactly
+the 256-agent scale the hub is designed for. At start-up the hub raises its own
+soft limit toward that value where the hard limit allows, sizes its connection
+ceiling from what it actually got (WARNing when that is below the target), and
+REFUSES to bind at all when the budget cannot cover `MIN_CONNECTION_CEILING`
+connections plus `FD_HEADROOM` descriptors — a smaller hub is honest, a hub
+that lies about its capacity is not.
+
+**Wire identity domain (#3578).** `a2a-hub` and every `a2a-hub/...` scoped
+form are reserved by `validate::RESERVED_AGENT_IDS` and its scoped-form
+check. HTTP header/body claims and MCP explicit caller claims are refused
+through the shared identity validator, even when the claimed value agrees
+with the resolved caller. Ordinary principal names such as `ai:alice` and
+`a2a-hub-agent` retain their existing grammar. The allowed/refused resolver
+matrix is pinned by `tests/wake_hub_identity_domain_3578.rs`. This wire
+reservation does not change the internal-bootstrap shape-only validator.
+
+**Credential and write-authority pins (#3578, #3579).**
+`tests/wake_hub_write_authority_3578.rs` first admits the exact delegation
+through the production hub hello verifier using a backend-derived possession
+binding. That delegation's wire envelope, root signature, and delegated public
+key cannot replace an enrolled HTTP API key. A hub-domain signature or a memory
+write signed by its delegated key cannot replace the enrolled root's memory-write
+signature. Denied requests leave the complete memory-row snapshot unchanged;
+allowed controls persist the independently resolved caller. Forged wake
+principal/sender/from and namespace fields do not select notification authority
+or its destination namespace. PostgreSQL tests require a live database and
+also check that the SQLite shadow receives no write.
+
+HTTP tests use the real router in per-agent API-key Enforce mode. MCP tests
+use the existing production-handler test entry and its host caller context;
+MCP has no API-key login. The PostgreSQL MCP path forwards over a real loopback
+HTTP listener requiring an enrolled-root write signature. That listener has
+no API-key gate because the existing forwarder sends only `X-Agent-Id`; the
+separate HTTP credential cases cover that gate. These pins do not claim stdio
+framing, a sandbox, or authentication of arbitrary operator code.
+`tests/http_notify_caller_binding_3579.rs` additionally pins the exact HTTP
+sender in both ambient-identity postures on SQLite and live PostgreSQL, and
+preserves MCP's host identity ladder and validation order.
+
+**Binary hint codec pins (#3578).** `tests/qual_wake_meta_codec_3578.rs`,
+`sdk/python/tests/test_wake_meta_3578.py`, and
+`sdk/typescript/__tests__/wake_meta_3578.test.ts` consume the same
+`sdk/fixtures/wake_meta_3578.json` vectors. They pin the five metadata fields,
+empty and UTF-8 hints, a valid 256-byte encoding, 257-byte refusal, appended
+`content`/`title` refusal, every truncation of each valid vector, and reserved
+body kinds 11/12/13 with an allowed wake control. Rust also checks exact
+re-encoding and refuses an oversized hint at encode time. These tests cover
+the binary hint; handshake/control frames have their own bounds. They do not
+assert a 256-byte limit on the CLI reporting JSON or a JSON-input decoder.
+
+**JSON output pins (#3578).** `tests/qual_wake_json_3578.rs` pins the exact
+closed output key set: `inbox_row_id`, `namespace`, `sender`, `digest`,
+`seq_high_watermark`, `reason`, `hub_driven`, `agent_id`, `hub_id`, `missed`,
+`pending_count`, and `inbox_count`. No `content`, `title`, `body`, or `payload`
+key is admitted. Hint values and all reporting values are checked, including
+bare signals and metadata text that resembles JSON keys. The serialized
+reporting envelope may exceed 256 bytes; the ceiling applies to encoded binary
+`WakeMeta`. The #3578 tests in `wake_client::session` deliver the shared denied
+binary vectors and reserved kinds through a socket pair into the production
+`Session::next_event`: refusal produces no renderable event, while valid hints
+produce exactly the expected metadata. This tests the boundary after admission,
+not credentials, database authority, JSON input validation, or process isolation.
+
+**Dependency gate (#3578).** `tests/qual_wake_hub_zero_authority_3578.rs`
+walks every Rust source under `src/wake_hub`, scanning all feature branches
+and resuming after complete inline test modules. Its reviewed crate-edge
+allowlist admits the public delegation verification vocabulary, snapshot-age
+constant, binding-authority type, producer sentinel, and shared visibility
+predicates. `identity::keypair::decode_public_base64` is the sole keypair
+exception; its public decoder body and imported dependencies are pinned.
+Module/glob imports cannot widen that exception. Mutation fixtures cover
+aliased/grouped imports, fully qualified paths, the production tail after
+tests, database/configuration literals, signing material, and source inclusion.
+This lexical qualification gate does not prove filesystem isolation or replace
+the OS permissions below; runtime credential refusal and content-plane checks
+are separate controls.
+
+**Forward-binding content-plane allowance (#3578).**
+`tests/qual_wake_content_boundary_3578.rs` runs in the qualification family.
+Its reviewed source manifest covers the hub, both producer sinks, Rust client,
+CLI consumer, wake bus, spawn-audit wrapper, and Python/TypeScript listeners
+(including the Python swarm adapter). It admits the existing flow:
+
+- A committed notify emits metadata to the bus; the in-process and UDS sinks
+  encode a `WakeMeta` hint. The producer's inbound hub frames handle liveness
+  and refusals; they do not dispatch memory writes.
+- The Rust client decodes a hint into a signal. `wake-listen` calls
+  `catch_up_read` with the operator-resolved listener identity, through the
+  existing `handle_inbox` funnel. The hint never selects that identity.
+  Rendering receives metadata and the resulting count, not inbox content.
+- An operator-supplied `--exec` command goes through
+  `spawn_audit::audited_tokio_command`. This explicitly admitted edge can open
+  the seeded audit database and append a content-free signed spawn-audit row.
+  The eleven `AI_MEMORY_WAKE_*` fields attached by the listener are pinned by
+  exact key **and value expression**: reason, listener identity, hub identity,
+  row ID, namespace, sender, digest, sequence, missed/pending counts, and inbox
+  count. No hint content/title becomes an environment value or shell program.
+
+The hook and SDK `on_signal` / `onSignal` callbacks are **external operator
+trust boundaries**, not SDK-screened content paths. They may independently
+read or write using their own credentials. The hook also inherits its operator
+environment; the pin covers the fields the listener attaches, not a sanitized
+process environment. GA has no automatic A2A decoder-to-notify/store content
+write in these reviewed paths. A future payload decoder requires a reviewed
+SDK-edge screen and an explicit allowlist change; an operator callback is not
+that screen.
+
+The manifest is a conservative source-change gate: Rust production tokens
+(including imports, all feature branches and code after inline test modules)
+and SDK source bytes must match, and the three Rust directory inventories must
+remain exact. Rust formatting/comments and complete inline `cfg(test)` modules
+may change without updating the pin. Mutation tests refuse added writes and
+aliases, caller substitution, content/title environment fields, command
+substitution, SDK callback-to-write changes, and production appended after
+tests. Updating a digest requires boundary review, even for a harmless code
+change; do not regenerate the manifest merely to make a gate green. This is
+not a compiler call-graph proof, macro-expansion analysis, proof of unchanged
+external dependency implementations, or a sandbox for arbitrary application
+callbacks. Runtime codec/credential tests and the OS isolation contract remain
+separate evidence.
+
+**Process isolation (#3578).** The systemd unit runs as `User=ai-memory-hub`
+(not the daemon's `ai-memory`), jails `/var/lib/ai-memory` with
+`InaccessiblePaths=`, and restricts the address family to `AF_UNIX`: the wake
+plane is same-host by construction, so the kernel enforces that as well as the
+code. A TCP listener is **not shipped**; an operator drop-in that added one
+would have to add both a listen flag and `AF_INET`, and
+`tests/wake_hub_process_isolation_3578.rs` refuses a unit that names either
+today. The launchd template names `UserName`/`GroupName` `ai-memory-hub`,
+which launchd honours only for a LaunchDaemon under `/Library/LaunchDaemons`;
+the `~/Library/LaunchAgents` copy is a dev convenience that does not satisfy
+the contract. Create the system user before enabling the unit:
+
+```sh
+sudo useradd --system --home /run/ai-memory-hub --shell /usr/sbin/nologin ai-memory-hub
+```
+
+Its `ExecStartPost` runs `--health`, so a unit that reports "started" has
+actually been reached — a claim that holds **only because that probe retries**.
+`Type=simple` lets systemd run `ExecStartPost` as soon as it has forked the
+main process, before the hub has bound, and the hub sends no `sd_notify`; the
+unit therefore retries the probe for about five seconds across the bind race
+and fails the unit only if the hub is still unreachable after that. A
+single-shot probe would fail every start and, with `Restart=on-failure`,
+convert a healthy host into a restart loop. The unit also sets
+`RuntimeDirectoryPreserve=yes`, so the allowlist snapshot the refresher
+install(1)s at `/run/ai-memory-hub/hub-allow.json` survives a stop or restart
+instead of being deleted with the runtime directory — which would leave the
+restarted hub admitting nobody. `/run` is a tmpfs, so that path still does not
+survive a **reboot**; republish it after boot.
+
+### `ai-memory doctor`
+
+`doctor` carries a **Wake hub (#3471)** section — filesystem and `getrlimit`
+only, no bind, no connect, no database. A live socket whose mode or ownership
+is wrong is **Critical** (that is an exposure on this host right now); a
+file-descriptor budget below the desired value on a host that runs a hub is a
+**Warning**, escalating to Critical only below the floor at which the hub would
+refuse to start; an installed supervisor unit is **informational** and its
+absence is never a finding, because running the hub in the foreground or under
+another supervisor is a legitimate deployment. On a host with no `[wake_hub]`
+configuration and no socket on disk the section reports `configured = no` and
+nothing else.

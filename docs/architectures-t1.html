@@ -1,515 +1,226 @@
+<!DOCTYPE html>
 <!--
   Copyright 2026 AlphaOne LLC
   SPDX-License-Identifier: Apache-2.0
-  T1 — Single node, single agent. The bedrock primitive.
+  Tier 1 · Single node (v1.0.0 GA).
+  Theme: the shared landing-page tokens in assets/site-theme.css (#4420).
+  Every capability drawn here is backed by code on the v1.0.0 tree; the
+  commit that introduced this page cites file:line for each one.
 -->
-<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>ai-memory · T1 — Single node, single agent</title>
-<meta name="description" content="One ai-memory process, one consumer, SQLite-backed. The bedrock primitive of the entire stack.">
-<meta property="og:title" content="ai-memory · T1 — Single node, single agent">
-<meta property="og:description" content="One process. One consumer. Zero network. The bedrock primitive.">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ai-memory · Tier 1: single node</title>
+<meta name="description" content="Tier 1 of ai-memory v1.0.0: one agent and one SQLite store on one host, reached through an MCP stdio child or the in-process CLI, optionally encrypted at rest with a SQLCipher build.">
+<meta name="theme-color" content="#0c0b08">
 <link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/architectures-t1.html">
-<style>
-:root{--bg:#000;--bg-raised:#0a0a0a;--bg-card:#111;--bg-elev:#161616;--bg-code:#1a1a1a;--border:#262626;--border-hl:#3d3d3d;--text:#fff;--text-muted:#999;--text-dim:#666;--p1:#b07d10;--p2:#ffb86b;--p3:#c8a2ff;--good:#b07d10;--bad:#ff6b9d;--gold:#ffd700;--font-mono:'SF Mono','Cascadia Code','Fira Code',Consolas,monospace;--font-sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;--max-w:1280px}
-*,*::before,*::after{margin:0;padding:0;box-sizing:border-box}
-html{scroll-behavior:smooth;scroll-padding-top:5rem}
-body{font-family:var(--font-sans);background:var(--bg);color:var(--text);line-height:1.6;-webkit-font-smoothing:antialiased;overflow-x:hidden}
-a{color:var(--text);text-decoration:none}a:hover{color:var(--p1)}
-code{font-family:var(--font-mono);font-size:.85rem;background:var(--bg-code);padding:.1em .35em;border-radius:4px}
-pre{font-family:var(--font-mono);font-size:.85rem;background:var(--bg-code);padding:1rem 1.1rem;border-radius:8px;border:1px solid var(--border);overflow-x:auto;line-height:1.55;color:var(--text-muted);margin:1rem 0}
-pre code{padding:0;background:none}
-.container{max-width:var(--max-w);margin:0 auto;padding:0 1.5rem}
-h1,h2,h3{font-weight:700;letter-spacing:-0.02em}h2{font-size:1.6rem;margin-bottom:.5rem;font-family:var(--font-mono)}h3{font-size:1.05rem;margin:1rem 0 .35rem}
-p{color:var(--text-muted);margin-bottom:.85rem}
-.topnav{position:sticky;top:0;z-index:50;background:var(--bg);backdrop-filter:blur(12px);border-bottom:1px solid var(--border)}
-.topnav .inner{display:flex;justify-content:space-between;max-width:var(--max-w);margin:0 auto;padding:.9rem 1.5rem;font-size:.875rem}
-.topnav a{color:var(--text-muted);margin-right:1.25rem}.topnav a:hover{color:var(--text)}
-.topnav .home-link{color:var(--text);font-weight:600}
-.topnav .right{display:flex;gap:1.25rem;flex-wrap:wrap}@media(max-width:800px){.topnav .right{display:none}}
-.hero{padding:4rem 1.5rem 2.5rem;text-align:center;background:radial-gradient(ellipse at center,rgba(176,125,16,0.08),transparent 60%);border-bottom:1px solid var(--border)}
-.hero h1{font-size:clamp(1.8rem,4vw,2.75rem);line-height:1.1;letter-spacing:-0.03em;margin-bottom:1rem}
-.hero .tagline{color:var(--text-muted);font-size:1.05rem;max-width:780px;margin:0 auto 1rem}
-.hero .pills{display:flex;justify-content:center;gap:.5rem;flex-wrap:wrap;margin-top:1.25rem}
-.hero .pill{padding:.4rem 1rem;border:1px solid var(--border-hl);border-radius:999px;font-family:var(--font-mono);font-size:.78rem;color:var(--text-muted)}
-
-section{padding:3rem 0;border-bottom:1px solid var(--border)}
-.eyebrow{display:inline-block;font-size:.72rem;font-weight:600;letter-spacing:.12em;text-transform:uppercase;color:var(--text-muted);margin-bottom:.5rem;padding:.2rem .6rem;border:1px solid var(--border-hl);border-radius:999px}
-.lede{color:var(--text-muted);font-size:.95rem;max-width:820px;margin-bottom:2rem}
-section h2{font-family:var(--font-sans);font-size:1.6rem;margin-bottom:.6rem}
-
-footer{padding:3rem 1.5rem;text-align:center;font-size:.85rem;color:var(--text-dim);border-top:1px solid var(--border)}
-footer a{color:var(--text-muted)}
-
-/* Grouped dropdown menu */
-.topnav .menu{position:relative;display:inline-block}
-.topnav .menu-btn{background:none;border:none;color:var(--text-muted);font-family:inherit;font-size:inherit;cursor:pointer;padding:.2rem 0;line-height:1;letter-spacing:0}
-.topnav .menu-btn:hover,.topnav .menu:focus-within .menu-btn{color:var(--text)}
-.topnav .menu-btn.active{color:var(--text)}
-.topnav .menu-btn .caret{opacity:.5;font-size:.7em;margin-left:.2em}
-.topnav .menu-pane{position:absolute;top:calc(100% + .55rem);right:0;background:var(--bg-card);border:1px solid var(--border-hl);border-radius:8px;padding:.4rem 0;min-width:240px;box-shadow:0 10px 28px rgba(0,0,0,0.5);z-index:60;visibility:hidden;opacity:0;transition:opacity .12s ease,visibility 0s .12s}
-.topnav .menu:focus-within .menu-pane,.topnav .menu:hover .menu-pane{visibility:visible;opacity:1;transition:opacity .12s ease}
-.topnav .menu-pane a{display:block;padding:.5rem 1rem;color:var(--text-muted);font-size:.85rem;margin-right:0;white-space:nowrap;text-decoration:none}
-.topnav .menu-pane a:hover{background:var(--bg-elev);color:var(--text)}
-.topnav .menu-pane a.current{color:var(--p1);background:var(--bg-elev)}
-
-/* capability badges */
-.cap-badge{display:inline-block;padding:.15em .55em;font-family:var(--font-mono);font-size:.7rem;font-weight:600;border-radius:4px;border:1px solid;letter-spacing:.04em;margin:.1em .15em}
-.cap-today{color:#b07d10;border-color:#2a6571;background:rgba(176,125,16,.08)}
-.cap-roadmap{color:#c8a2ff;border-color:#5a4280;background:rgba(200,162,255,.08)}
-.cap-partial{color:#ffb86b;border-color:#7a5328;background:rgba(255,184,107,.08)}
-.cap-future{color:#ff6b9d;border-color:#7a3251;background:rgba(255,107,157,.08)}
-
-/* arch-diagram block */
-.arch-diagram{background:var(--bg-card);border:1px solid var(--border);border-radius:14px;padding:1.5rem;margin:1.5rem 0}
-.arch-diagram-title{font-family:var(--font-mono);font-size:.85rem;color:var(--p2);letter-spacing:.04em;margin-bottom:1rem;text-transform:uppercase}
-.arch-svg{width:100%;height:auto;display:block;background:#0a0a0a;border-radius:8px}
-.arch-svg .node{fill:#161616;stroke:#3d3d3d;stroke-width:1.2}
-.arch-svg .node-label{fill:#fff;font-family:'SF Mono',monospace;font-size:12px;font-weight:600}
-.arch-svg .sub-label{fill:#999;font-family:'SF Mono',monospace;font-size:10px}
-.arch-svg .edge{fill:none}
-.arch-svg .edge-dashed{fill:none;stroke:#666;stroke-width:1.2;stroke-dasharray:4 3}
-.arch-svg .edge-roadmap{fill:none;stroke:#a78bfa;stroke-width:1.4;stroke-dasharray:5 4;opacity:.7}
-.arch-svg .flow{filter:drop-shadow(0 0 4px currentColor)}
-.arch-svg .flow-write{fill:#f97316;color:#f97316}
-.arch-svg .flow-recall{fill:#2dd4bf;color:#2dd4bf}
-.arch-svg .flow-sync{fill:#a78bfa;color:#a78bfa}
-.arch-svg .flow-policy{fill:#facc15;color:#facc15}
-.arch-svg .flow-attest{fill:#f472b6;color:#f472b6}
-.arch-svg .ring{fill:none;stroke:#b07d10;stroke-width:2;opacity:.7}
-.arch-svg .ring{animation:pulse 2.4s ease-out infinite}
-@keyframes pulse{0%{r:6;opacity:.85}100%{r:18;opacity:0}}
-.arch-legend{display:flex;flex-wrap:wrap;gap:1rem;margin-top:1rem;font-family:var(--font-mono);font-size:.75rem;color:var(--text-muted)}
-.arch-legend-item{display:inline-flex;align-items:center;gap:.4rem}
-.arch-legend-dot{display:inline-block;width:10px;height:10px;border-radius:50%}
-.arch-diagram-caption{font-size:.85rem;color:var(--text-dim);margin-top:1rem;line-height:1.5}
-
-ul,ol{padding-left:1.5rem;color:var(--text-muted);font-size:.92rem;margin:.5rem 0 1rem}
-ul li,ol li{margin-bottom:.4rem}
-
-table{width:100%;border-collapse:collapse;margin:1rem 0 1.5rem;font-size:.85rem;background:var(--bg-card);border:1px solid var(--border);border-radius:10px;overflow:hidden}
-table th,table td{padding:.65rem .85rem;text-align:left;border-bottom:1px solid var(--border)}
-table th{background:var(--bg-elev);font-family:var(--font-mono);font-size:.78rem;font-weight:600;color:var(--text);letter-spacing:.04em}
-table td{color:var(--text-muted)}
-table tr:last-child td{border-bottom:none}
-@media (prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important;scroll-behavior:auto!important}}
-
-/* Zero-JS mobile nav fallback — visible only when .right collapses */
-.topnav .mnav{display:none;position:relative}
-.topnav .mnav summary{list-style:none;cursor:pointer;color:var(--text-muted);border:1px solid var(--border-hl);border-radius:6px;padding:.3rem .8rem;font-size:.85rem;user-select:none}
-.topnav .mnav summary::-webkit-details-marker{display:none}
-.topnav .mnav[open] summary{color:var(--text);border-color:var(--text-muted)}
-.topnav .mnav-pane{position:absolute;top:calc(100% + .55rem);right:0;background:var(--bg-card);border:1px solid var(--border-hl);border-radius:8px;padding:.4rem 0;min-width:250px;max-height:72vh;overflow-y:auto;box-shadow:0 10px 28px rgba(0,0,0,0.5);z-index:60}
-.topnav .mnav-pane a{display:block;padding:.45rem 1rem;color:var(--text-muted);font-size:.85rem;margin:0;white-space:nowrap}
-.topnav .mnav-pane a:hover{background:var(--bg-elev);color:var(--text)}
-.topnav .mnav-group{padding:.6rem 1rem .25rem;font-family:var(--font-mono);font-size:.66rem;letter-spacing:.12em;text-transform:uppercase;color:var(--text-dim)}
-@media(max-width:800px){.topnav .mnav{display:block}}
-</style>
-  <link rel="stylesheet" href="/ai-memory-mcp/assets/site-theme.css">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700;800;900&amp;family=IBM+Plex+Sans:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@500;600&amp;display=swap">
+<link rel="stylesheet" href="assets/site-theme.css">
 </head>
-<body>
-
-<nav class="topnav">
-  <div class="inner">
-    <a class="home-link" href="./">ai-memory <span style="opacity:.5">▸ Architectures · T1</span></a>
-    <div class="right">
-      <a href="at-a-glance.html" style="color:var(--accent-ink)">Atlas</a>
-      <a href="whats-new-v09.html" style="color:var(--accent-ink)">v0.9.0</a>
-      <div class="menu">
-        <button class="menu-btn">Audiences<span class="caret">▾</span></button>
-        <div class="menu-pane">
-          <a href="for-everyone.html">For Everyone</a>
-          <a href="audience/decision-maker.html">Decision Maker</a>
-          <a href="audience/developer.html">Developer</a>
-          <a href="audience/operator.html">Operator</a>
-          <a href="feature-matrix.html">Feature Matrix</a>
-          <a href="data-flow.html">Data Flow</a>
-          <a href="integrations.html">Integrations</a>
-          <a href="import-history.html">Import History</a>
-          <a href="release-pipeline.html">Release Pipeline</a>
-        </div>
-      </div>
-      <div class="menu">
-        <button class="menu-btn">Features<span class="caret">▾</span></button>
-        <div class="menu-pane">
-          <a href="memory-tiers.html">Memory Tiers</a>
-          <a href="memory-rules.html">Memory Rules</a>
-          <a href="ttl-controls.html">TTL Controls</a>
-          <a href="archival.html">Archival</a>
-          <a href="encryption.html">Encryption</a>
-          <a href="hierarchies.html">Hierarchies</a>
-          <a href="knowledge-graph.html">Knowledge Graph</a>
-          <a href="autonomous.html">Autonomous</a>
-          <a href="a2a-messaging.html">A2A Messaging</a>
-          <a href="lifecycle.html">Lifecycle</a>
-          <a href="performance.html">Performance</a>
-          <a href="agent-identity.html">Agent Identity (NHI)</a>
-          <a href="zero-touch-trust.html">Zero-Touch Trust</a>
-        </div>
-      </div>
-      <div class="menu">
-        <button class="menu-btn active">Architectures<span class="caret">▾</span></button>
-        <div class="menu-pane">
-          <a href="architectures.html">Overview</a>
-          <a href="architectures-t1.html" class="current">T1 — Single Agent</a>
-          <a href="architectures-t2.html">T2 — Many Agents</a>
-          <a href="architectures-t3.html">T3 — Multi-Node Cluster</a>
-          <a href="architectures-t4.html">T4 — Data-Center Swarm</a>
-          <a href="architectures-t5.html">T5 — Global Hive</a>
-          <a href="reference-architecture/">Grand Slam — 3-Region Hive</a>
-          <a href="reference-architecture/enterprise-cpu-memory.html">Enterprise — CPU+Memory Nodes</a>
-          <a href="reference-architecture/enterprise-cpu-memory-gpu.html">Enterprise — CPU+Memory+GPU Nodes</a>
-        </div>
-      </div>
-      <div class="menu">
-        <button class="menu-btn">Internals<span class="caret">▾</span></button>
-        <div class="menu-pane">
-          <a href="schema.html">Schema</a>
-          <a href="types.html">Types</a>
-          <a href="validators.html">Validators</a>
-          <a href="governance.html">Governance</a>
-          <a href="batman-active-mode.html">Batman Mode</a>
-          <a href="tracing.html">Tracing</a>
-          <a href="spec/v1.html">Portability Spec v1</a>
-        </div>
-      </div>
-      <div class="menu">
-        <button class="menu-btn">Evidence<span class="caret">▾</span></button>
-        <div class="menu-pane">
-          <a href="evidence.html">Frozen Claims</a>
-          <a href="evidence/">Evidence Hub (campaigns)</a>
-          <a href="https://alphaonedev.github.io/ai-memory-test-hub/">Test Hub</a>
-          <a href="https://alphaonedev.github.io/ai-memory-a2a-v0.6.3.1/">v0.6.3.1 A2A (live)</a>
-          <a href="https://alphaonedev.github.io/ai-memory-test-hub/releases/v0.6.3/">v0.6.3 evidence (historical)</a>
-          <a href="https://alphaonedev.github.io/ai-memory-ship-gate/">Ship Gate</a>
-          <a href="https://alphaonedev.github.io/ai-memory-ai2ai-gate/">A2A Gate</a>
-          <a href="performance.html">Performance budgets</a>
-          <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/benchmarks/longmemeval/results.md">LongMemEval variants</a>
-        </div>
-      </div>
-      <a href="credits.html">Credits</a>
-      <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub →</a>
-    </div>
-    <details class="mnav">
-      <summary>Menu</summary>
-      <div class="mnav-pane">
-        <a href="./">Home</a>
-        <a href="at-a-glance.html">Atlas</a>
-        <a href="whats-new-v09.html">v0.9.0</a>
-        <div class="mnav-group">Audiences</div>
-        <a href="for-everyone.html">For Everyone</a>
-        <a href="audience/decision-maker.html">Decision Maker</a>
-        <a href="audience/developer.html">Developer</a>
-        <a href="audience/operator.html">Operator</a>
-        <a href="feature-matrix.html">Feature Matrix</a>
-        <a href="data-flow.html">Data Flow</a>
-        <a href="integrations.html">Integrations</a>
-        <a href="import-history.html">Import History</a>
-        <a href="release-pipeline.html">Release Pipeline</a>
-        <div class="mnav-group">Features</div>
-        <a href="memory-tiers.html">Memory Tiers</a>
-        <a href="memory-rules.html">Memory Rules</a>
-        <a href="ttl-controls.html">TTL Controls</a>
-        <a href="archival.html">Archival</a>
-        <a href="encryption.html">Encryption</a>
-        <a href="hierarchies.html">Hierarchies</a>
-        <a href="knowledge-graph.html">Knowledge Graph</a>
-        <a href="autonomous.html">Autonomous</a>
-        <a href="a2a-messaging.html">A2A Messaging</a>
-        <a href="lifecycle.html">Lifecycle</a>
-        <a href="performance.html">Performance</a>
-        <a href="agent-identity.html">Agent Identity (NHI)</a>
-        <a href="zero-touch-trust.html">Zero-Touch Trust</a>
-        <div class="mnav-group">Architectures</div>
-        <a href="architectures.html">Overview</a>
-        <a href="architectures-t1.html">T1 — Single Agent</a>
-        <a href="architectures-t2.html">T2 — Many Agents</a>
-        <a href="architectures-t3.html">T3 — Multi-Node Cluster</a>
-        <a href="architectures-t4.html">T4 — Data-Center Swarm</a>
-        <a href="architectures-t5.html">T5 — Global Hive</a>
-        <a href="reference-architecture/">Grand Slam — 3-Region Hive</a>
-        <a href="reference-architecture/enterprise-cpu-memory.html">Enterprise — CPU+Memory Nodes</a>
-        <a href="reference-architecture/enterprise-cpu-memory-gpu.html">Enterprise — CPU+Memory+GPU Nodes</a>
-        <div class="mnav-group">Internals</div>
-        <a href="schema.html">Schema</a>
-        <a href="types.html">Types</a>
-        <a href="validators.html">Validators</a>
-        <a href="governance.html">Governance</a>
-        <a href="batman-active-mode.html">Batman Mode</a>
-        <a href="tracing.html">Tracing</a>
-        <a href="spec/v1.html">Portability Spec v1</a>
-        <div class="mnav-group">Evidence</div>
-        <a href="evidence.html">Frozen Claims</a>
-        <a href="evidence/">Evidence Hub (campaigns)</a>
-        <a href="https://alphaonedev.github.io/ai-memory-test-hub/">Test Hub</a>
-        <a href="https://alphaonedev.github.io/ai-memory-a2a-v0.6.3.1/">v0.6.3.1 A2A (live)</a>
-        <a href="https://alphaonedev.github.io/ai-memory-test-hub/releases/v0.6.3/">v0.6.3 evidence (historical)</a>
-        <a href="https://alphaonedev.github.io/ai-memory-ship-gate/">Ship Gate</a>
-        <a href="https://alphaonedev.github.io/ai-memory-ai2ai-gate/">A2A Gate</a>
-        <a href="performance.html">Performance budgets</a>
-        <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/benchmarks/longmemeval/results.md">LongMemEval variants</a>
-        <div class="mnav-group">More</div>
-        <a href="credits.html">Credits</a>
-        <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub →</a>
-      </div>
-    </details>
-  </div>
-</nav>
-
-<section class="hero">
-  <span class="cap-badge cap-today">SHIPS TODAY · v0.9.0</span>
-  <h1>Tier 1 — Single node, single agent</h1>
-  <p class="tagline">The bedrock primitive. <strong>One process. One consumer. Zero network.</strong> SQLite + WAL, FTS5 keyword recall, in-process HNSW vector index, no replication, no peers.</p>
-  <div class="pills">
-    <span class="pill">SQLite WAL</span>
-    <span class="pill">FTS5 + HNSW</span>
-    <span class="pill">~10⁶ memories</span>
-    <span class="pill">sub-ms recall</span>
-  </div>
-</section>
-
-<section>
-  <div class="container">
-    <p>This is what runs on every developer's laptop, every Claude Code session, every solo agent that needs to remember things between turns. SQLite under the hood, WAL-mode for atomic writes, FTS5 for keyword recall, an in-process HNSW vector index for semantic recall. No replication, no peers, no governance to coordinate.</p>
-  </div>
-</section>
-
-<section>
-  <div class="container">
-    <span class="eyebrow">Architecture diagram</span>
-    <h2>Memory data flow — single agent.</h2>
-
-    <div class="arch-diagram">
-      <div class="arch-diagram-title">T1 · Memory data flow — single agent</div>
-
-      <svg class="arch-svg" viewBox="0 0 760 440" role="img" aria-label="Single agent talking to a single ai-memory instance backed by SQLite">
-
-        <defs>
-          <marker id="t1-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
-            <path d="M0,0 L10,5 L0,10 z" fill="currentColor" />
-          </marker>
-
-          <linearGradient id="t1-mem-gradient" x1="0" x2="0" y1="0" y2="1">
-            <stop offset="0%" stop-color="#2dd4bf" stop-opacity="0.18"/>
-            <stop offset="100%" stop-color="#0d9488" stop-opacity="0.06"/>
-          </linearGradient>
-
-          <path id="t1-path-write"  d="M 130 145 C 250 145, 280 200, 380 200" />
-          <path id="t1-path-recall" d="M 380 240 C 280 240, 250 295, 130 295" />
-          <path id="t1-path-store"  d="M 470 240 C 540 240, 580 290, 615 320" />
-          <path id="t1-path-fetch"  d="M 615 360 C 580 380, 540 360, 470 320" />
-        </defs>
-
-        <!-- AGENT -->
-        <g>
-          <rect x="40" y="170" width="180" height="100" rx="14" class="node" />
-          <text x="130" y="200" text-anchor="middle" class="node-label">AI agent</text>
-          <text x="130" y="220" text-anchor="middle" class="sub-label">Claude · GPT · local LLM</text>
-          <text x="130" y="240" text-anchor="middle" class="sub-label">MCP / HTTP / CLI client</text>
-          <text x="130" y="258" text-anchor="middle" class="sub-label">single namespace</text>
-        </g>
-
-        <!-- AI-MEMORY PROCESS -->
-        <g>
-          <rect x="290" y="80" width="280" height="280" rx="16"
-                fill="url(#t1-mem-gradient)" stroke="#2dd4bf" stroke-width="1.6" />
-          <text x="430" y="105" text-anchor="middle" class="node-label" style="font-size: 13px">ai-memory process</text>
-          <text x="430" y="122" text-anchor="middle" class="sub-label">one SQLite DB (WAL)</text>
-
-          <!-- Three interfaces -->
-          <rect x="306" y="138" width="78" height="40" rx="6" class="node" />
-          <text x="345" y="156" text-anchor="middle" class="sub-label" style="font-size: 10px">MCP</text>
-          <text x="345" y="170" text-anchor="middle" class="sub-label">stdio JSON-RPC</text>
-
-          <rect x="392" y="138" width="78" height="40" rx="6" class="node" />
-          <text x="431" y="156" text-anchor="middle" class="sub-label" style="font-size: 10px">HTTP :9077</text>
-          <text x="431" y="170" text-anchor="middle" class="sub-label">/api/v1/* (Axum)</text>
-
-          <rect x="478" y="138" width="78" height="40" rx="6" class="node" />
-          <text x="517" y="156" text-anchor="middle" class="sub-label" style="font-size: 10px">CLI</text>
-          <text x="517" y="170" text-anchor="middle" class="sub-label">clap subcommands</text>
-
-          <!-- Recall pipeline -->
-          <rect x="306" y="195" width="248" height="64" rx="8" class="node" />
-          <text x="430" y="214" text-anchor="middle" class="node-label" style="font-size: 11px">Recall pipeline</text>
-          <text x="430" y="230" text-anchor="middle" class="sub-label">FTS5 keyword + HNSW semantic</text>
-          <text x="430" y="245" text-anchor="middle" class="sub-label">adaptive blend · touch + auto-promote</text>
-
-          <!-- Governance + KG -->
-          <rect x="306" y="275" width="120" height="68" rx="8" class="node" />
-          <text x="366" y="294" text-anchor="middle" class="sub-label" style="font-size: 10px">Governance</text>
-          <text x="366" y="308" text-anchor="middle" class="sub-label">policy / pending</text>
-          <text x="366" y="322" text-anchor="middle" class="sub-label">scope filter</text>
-          <text x="366" y="336" text-anchor="middle" class="sub-label">v0.6.2+</text>
-
-          <rect x="434" y="275" width="120" height="68" rx="8" class="node" />
-          <text x="494" y="294" text-anchor="middle" class="sub-label" style="font-size: 10px">Knowledge graph</text>
-          <text x="494" y="308" text-anchor="middle" class="sub-label">links · taxonomy</text>
-          <text x="494" y="322" text-anchor="middle" class="sub-label">temporal validity</text>
-          <text x="494" y="336" text-anchor="middle" class="sub-label">v0.6.3</text>
-        </g>
-
-        <!-- SQLITE -->
-        <g>
-          <rect x="595" y="290" width="135" height="110" rx="12" class="node" />
-          <text x="662" y="312" text-anchor="middle" class="node-label">SQLite (WAL)</text>
-          <text x="662" y="330" text-anchor="middle" class="sub-label">memories</text>
-          <text x="662" y="344" text-anchor="middle" class="sub-label">memory_links</text>
-          <text x="662" y="358" text-anchor="middle" class="sub-label">FTS5 virtual table</text>
-          <text x="662" y="372" text-anchor="middle" class="sub-label">HNSW (in-memory)</text>
-          <text x="662" y="388" text-anchor="middle" class="sub-label">archive</text>
-        </g>
-
-        <!-- PATHS -->
-        <use href="#t1-path-write" class="edge" stroke="#f97316" stroke-width="1.8" marker-end="url(#t1-arrow)" style="color: #f97316" />
-        <use href="#t1-path-recall" class="edge" stroke="#2dd4bf" stroke-width="1.8" marker-end="url(#t1-arrow)" style="color: #2dd4bf" />
-        <use href="#t1-path-store"  class="edge-dashed" />
-        <use href="#t1-path-fetch"  class="edge-dashed" />
-
-        <!-- Path labels -->
-        <text x="240" y="135" class="sub-label" fill="#f97316" font-weight="600">store / link</text>
-        <text x="240" y="318" class="sub-label" fill="#2dd4bf" font-weight="600">recall / kg_query</text>
-
-        <!-- FLOW PARTICLES — write (orange) -->
-        <circle r="4" class="flow flow-write"><animateMotion dur="3.6s" repeatCount="indefinite" begin="0s"><mpath href="#t1-path-write"/></animateMotion></circle>
-        <circle r="4" class="flow flow-write"><animateMotion dur="3.6s" repeatCount="indefinite" begin="1.2s"><mpath href="#t1-path-write"/></animateMotion></circle>
-        <circle r="4" class="flow flow-write"><animateMotion dur="3.6s" repeatCount="indefinite" begin="2.4s"><mpath href="#t1-path-write"/></animateMotion></circle>
-
-        <!-- FLOW PARTICLES — recall (teal) -->
-        <circle r="4" class="flow flow-recall"><animateMotion dur="3.6s" repeatCount="indefinite" begin="0.6s"><mpath href="#t1-path-recall"/></animateMotion></circle>
-        <circle r="4" class="flow flow-recall"><animateMotion dur="3.6s" repeatCount="indefinite" begin="1.8s"><mpath href="#t1-path-recall"/></animateMotion></circle>
-        <circle r="4" class="flow flow-recall"><animateMotion dur="3.6s" repeatCount="indefinite" begin="3.0s"><mpath href="#t1-path-recall"/></animateMotion></circle>
-
-        <!-- FLOW PARTICLES — store to disk -->
-        <circle r="3" class="flow flow-write"><animateMotion dur="2.8s" repeatCount="indefinite" begin="0.4s"><mpath href="#t1-path-store"/></animateMotion></circle>
-        <circle r="3" class="flow flow-write"><animateMotion dur="2.8s" repeatCount="indefinite" begin="1.6s"><mpath href="#t1-path-store"/></animateMotion></circle>
-        <circle r="3" class="flow flow-write"><animateMotion dur="2.8s" repeatCount="indefinite" begin="2.8s"><mpath href="#t1-path-store"/></animateMotion></circle>
-
-        <!-- FLOW PARTICLES — fetch from disk -->
-        <circle r="3" class="flow flow-recall"><animateMotion dur="2.8s" repeatCount="indefinite" begin="0s"><mpath href="#t1-path-fetch"/></animateMotion></circle>
-        <circle r="3" class="flow flow-recall"><animateMotion dur="2.8s" repeatCount="indefinite" begin="1.2s"><mpath href="#t1-path-fetch"/></animateMotion></circle>
-        <circle r="3" class="flow flow-recall"><animateMotion dur="2.8s" repeatCount="indefinite" begin="2.4s"><mpath href="#t1-path-fetch"/></animateMotion></circle>
-
-        <!-- Touch ring on agent (showing recall is alive) -->
-        <circle cx="130" cy="220" r="6" class="ring" />
-      </svg>
-
-      <div class="arch-legend">
-        <span class="arch-legend-item"><span class="arch-legend-dot" style="background: #f97316"></span>write / store</span>
-        <span class="arch-legend-item"><span class="arch-legend-dot" style="background: #2dd4bf"></span>recall / fetch</span>
-        <span class="arch-legend-item"><span class="arch-legend-dot" style="background: #666"></span>persistent I/O</span>
-      </div>
-
-      <div class="arch-diagram-caption">
-        Agent talks to ai-memory over MCP, HTTP, or CLI. The HTTP daemon guards a single SQLite connection behind a mutex; MCP stdio is single-threaded by protocol; each CLI invocation opens its own connection (#965 audit).
-        Every recall is a hot loop — FTS5 + HNSW + scoring + access-count touch — all in-process.
+<body class="am-page">
+<a class="am-skip" href="#main">Skip to content</a>
+<header class="am-nav"><div class="am-nav-in">
+  <a class="am-brand" href="index.html" aria-label="ai-memory home">
+    <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 2l9 5.2v9.6L12 22 3 16.8V7.2z" stroke="var(--accent)" stroke-width="1.5"/><circle cx="12" cy="12" r="2.4" fill="var(--accent)"/><path d="M12 9.6V4.5M12 14.4v5.1M14.4 12h5M4.9 12h5" stroke="var(--accent)" stroke-width="1.1"/></svg>
+    ai-memory <span class="am-crumb">/ architectures / T1</span>
+  </a>
+  <nav class="am-links" aria-label="Primary">
+    <a href="architectures.html">Architectures</a>
+    <a href="https://test.agenticmem.co" target="_blank" rel="noopener">Live Testing</a>
+    <a href="testing/">Test Results</a>
+    <div class="am-dd">
+      <button aria-haspopup="true">Tiers ▾</button>
+      <div class="am-dd-menu">
+        <a href="architectures-t1.html">T1 · Single node<span>one agent, one store</span></a>
+        <a href="architectures-t2.html">T2 · Shared daemon<span>many agents, one host</span></a>
+        <a href="architectures-t3.html">T3 · Federated cluster<span>W-of-N quorum, signed sync</span></a>
+        <a href="architectures-t4.html">T4 · Data-center swarm<span>PostgreSQL tier</span></a>
+        <a href="architectures-t5.html">T5 · Federated hive<span>multi-DC / multi-region</span></a>
       </div>
     </div>
+    <div class="am-dd">
+      <button aria-haspopup="true">Reference ▾</button>
+      <div class="am-dd-menu">
+        <a href="reference-architecture/">3-region hive<span>the do-1461 run record</span></a>
+        <a href="reference-architecture/enterprise-cpu-memory.html">Enterprise · CPU + memory<span>API embeddings, no GPU</span></a>
+        <a href="reference-architecture/enterprise-cpu-memory-gpu.html">Enterprise · CPU + memory + GPU<span>local embeddings</span></a>
+        <a href="enterprise-deployment.html">Enterprise deployment guide<span>sizing, replication, backups</span></a>
+        <a href="ARCHITECTURAL_LIMITS.html">Architectural limits<span>what does not scale, and why</span></a>
+      </div>
+    </div>
+    <div class="am-dd">
+      <button aria-haspopup="true">Planes ▾</button>
+      <div class="am-dd-menu">
+        <a href="federation.html">Federation<span>signed sync, quorum, catch-up</span></a>
+        <a href="wake-hub.html">Wake plane<span>wake-hub, wake-listen</span></a>
+        <a href="a2a-integration.html">Integrate any agent<span>inbox, notify, wake</span></a>
+        <a href="governance.html">Governance<span>policies, approvals</span></a>
+        <a href="encryption.html">Encryption<span>at rest and in transit</span></a>
+        <a href="SECURITY.html">Security model<span>threat model, posture</span></a>
+      </div>
+    </div>
+  </nav>
+  <details class="am-mnav"><summary>Menu</summary><div class="am-mnav-pane">
+    <a href="index.html">Home</a>
+    <a href="architectures.html">Architectures overview</a>
+    <a href="https://test.agenticmem.co" target="_blank" rel="noopener">Live Testing</a>
+    <a href="testing/">Test Results</a>
+    <div class="am-g">Tiers</div>
+    <a href="architectures-t1.html">T1 · Single node</a>
+    <a href="architectures-t2.html">T2 · Shared daemon</a>
+    <a href="architectures-t3.html">T3 · Federated cluster</a>
+    <a href="architectures-t4.html">T4 · Data-center swarm</a>
+    <a href="architectures-t5.html">T5 · Federated hive</a>
+    <div class="am-g">Reference</div>
+    <a href="reference-architecture/">3-region hive</a>
+    <a href="reference-architecture/enterprise-cpu-memory.html">Enterprise · CPU + memory</a>
+    <a href="reference-architecture/enterprise-cpu-memory-gpu.html">Enterprise · CPU + memory + GPU</a>
+    <a href="ARCHITECTURAL_LIMITS.html">Architectural limits</a>
+    <div class="am-g">Planes</div>
+    <a href="federation.html">Federation</a>
+    <a href="wake-hub.html">Wake plane</a>
+    <a href="governance.html">Governance</a>
+    <a href="SECURITY.html">Security model</a>
+  </div></details>
+  <a class="am-cta" href="https://github.com/alphaonedev/ai-memory-mcp">GitHub</a>
+</div></header>
+<main id="main">
+<section class="am-hero"><div class="am-wrap">
+  <nav class="am-rail" aria-label="Tiers"><a href="architectures-t1.html" aria-current="page">T1 · Single node</a><a href="architectures-t2.html">T2 · Shared daemon</a><a href="architectures-t3.html">T3 · Federated cluster</a><a href="architectures-t4.html">T4 · Data-center swarm</a><a href="architectures-t5.html">T5 · Federated hive</a><a href="architectures.html">Overview</a></nav>
+  <span class="am-pill" style="margin-top:18px"><i></i>Tier 1 · ships in v1.0.0</span>
+  <h1 class="am-h1">One agent, one store, <span class="a">zero network</span>.</h1>
+  <p class="am-sub">The bedrock shape. An MCP client spawns <b>ai-memory mcp</b> over stdio, or you run a CLI verb; either way the process opens a <b>SQLite</b> file in-process and the same engine that powers every other tier does the work. Build with <b>SQLCipher</b> and the file is encrypted at rest. Nothing listens on a port unless you ask it to.</p>
+  <div class="am-proof">
+    <span><b>SQLite</b> · WAL</span>
+    <span><b>MCP</b> core | full</span>
+    <span><b>CLI</b> in-process</span>
+    <span><b>SQLCipher</b> build option</span>
+    <span><b>backup</b> · restore · doctor</span>
   </div>
-</section>
+</div></section>
 
-<section>
-  <div class="container">
-    <span class="eyebrow">Walkthrough</span>
-    <h2>What's actually happening.</h2>
-
-    <h3>A write — <code>memory_store</code></h3>
-    <ol>
-      <li>The agent calls <code>memory_store</code> over MCP (or <code>POST /api/v1/memories</code> over HTTP, or <code>ai-memory store ...</code> from the CLI).</li>
-      <li>The handler validates the input (<code>src/validate.rs</code>), then acquires the connection mutex.</li>
-      <li>Governance gate runs (<code>src/governance/</code> → <code>check_agent_action()</code>). For T1 with a single agent, the default policy returns <code>Allow</code> immediately. With a stricter policy, the write may be queued as a <code>PendingAction</code> (see <a href="architectures-t2.html" style="color:var(--p1)">Tier 2</a> for that flow).</li>
-      <li>Memory row is <code>INSERT</code>ed (or <code>UPDATE</code>d on <code>(title, namespace)</code> collision). FTS5 is kept in sync via triggers. The <code>scope_idx</code> generated column gets recomputed automatically.</li>
-      <li>If the feature tier is <code>semantic</code> or above, the embedding is generated and added to the in-memory HNSW index.</li>
-      <li>WAL is fsynced; the call returns.</li>
-    </ol>
-
-    <h3>A recall — <code>memory_recall</code></h3>
-    <ol>
-      <li>Agent calls <code>memory_recall</code> with a context string.</li>
-      <li><strong>FTS5 keyword pass</strong> — fuzzy OR query, scored by <code>(fts.rank * -1) + priority*0.5 + MIN(access_count, 50)*0.1 + confidence*2.0 + tier_bonus + recency_factor</code>.</li>
-      <li><strong>Semantic pass</strong> — cosine similarity via HNSW (or linear scan fallback); skipped entirely in the keyword tier.</li>
-      <li><strong>Adaptive blend</strong> — semantic weight varies 0.50 (short content) → 0.15 (long content) because embeddings lose information on long text. Final score is <code>semantic_weight * cosine + (1 - semantic_weight) * norm_fts</code>.</li>
-      <li><strong>Touch</strong> — every returned memory has <code>access_count</code> incremented, TTL extended, and (for mid-tier memories) auto-promoted to long-tier on the 5th access. Priority bumps every 10 accesses.</li>
-      <li>Result formatted as <code>toon_compact</code> (40-60% smaller than JSON), <code>toon</code>, or <code>json</code>.</li>
-    </ol>
-
-    <p>That's it. No network, no peers, no consensus.</p>
+<section class="am-sec" id="diagram"><div class="am-wrap">
+  <div class="am-sec-h">
+    <span class="am-eyebrow">Architecture</span>
+    <h2>Two ways in, <span class="a">one file</span>.</h2>
+    <p>The MCP child and the CLI are separate processes that link the same engine; neither is a client of a daemon. An HTTPS daemon on loopback (TLS even there; this single-operator shape mints and renews a local CA certificate) and a same-host wake hub are optional extras, drawn dashed.</p>
   </div>
-</section>
+  <div class="am-legend"><span><i></i>memory read/write</span><span><i class="teal"></i>operations</span><span><i class="dash"></i>optional</span></div>
+  <figure class="am-fig" style="--fig-min:900px">
+<svg class="dg" viewBox="0 0 1100 460" role="img" aria-labelledby="t1a-title" aria-describedby="t1a-desc" xmlns="http://www.w3.org/2000/svg">
+<title id="t1a-title">Tier 1: one agent, one store, one host</title><desc id="t1a-desc">An MCP client spawns ai-memory mcp over stdio, or an operator runs a CLI verb; both open the same SQLite file in-process through the same engine. A SQLCipher build encrypts the file at rest. An HTTPS daemon (TLS even on loopback) and a wake hub are optional. Backups are VACUUM INTO snapshots with a signed manifest.</desc>
+<defs><marker id="t1a-ah" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow"/></marker><marker id="t1a-aa" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow acc"/></marker><marker id="t1a-at" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow teal"/></marker><marker id="t1a-ab" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow bad"/></marker><marker id="t1a-as" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow slate"/></marker></defs>
+<rect class="zone solid" x="20" y="20" width="1060" height="420" rx="18"/><text class="t-k" x="40" y="46">ONE HOST  ·  NO NETWORK REQUIRED</text><g class="rise"><rect class="box" x="50" y="70" width="190" height="70" rx="12"/><text class="t-m" x="66" y="98">agent</text><text class="t-s" x="66" y="116">any MCP client</text></g>
+<g class="rise" style="--d:0.1s"><rect class="box" x="50" y="230" width="190" height="70" rx="12"/><text class="t-m" x="66" y="258">operator shell</text><text class="t-s" x="66" y="276">ai-memory &lt;verb&gt;</text></g>
+<g class="rise" style="--d:0.2s"><rect class="box acc" x="300" y="70" width="230" height="70" rx="12"/><text class="t-m" x="316" y="94">ai-memory mcp</text><text class="t-s" x="316" y="111">--profile core | full</text><text class="t-s" x="316" y="128">stdio JSON-RPC child</text></g>
+<g class="rise" style="--d:0.3s"><rect class="box" x="300" y="230" width="230" height="70" rx="12"/><text class="t-m" x="316" y="254">CLI process</text><text class="t-s" x="316" y="271">opens the store in-process</text><text class="t-s" x="316" y="288">not a thin HTTP client</text></g>
+<g class="rise" style="--d:0.4s"><rect class="box" x="590" y="70" width="220" height="230" rx="12"/><text class="t-m" x="606" y="98">one engine, linked in</text><text class="t-s" x="606" y="124">agent id resolved</text><text class="t-s" x="606" y="150">governance gate</text><text class="t-s" x="606" y="176">tiers short · mid · long</text><text class="t-s" x="606" y="202">keyword + vector recall</text><text class="t-s" x="606" y="228">temporal knowledge graph</text><text class="t-s" x="606" y="254">hooks pipeline</text></g>
+<g class="rise" style="--d:0.5s"><rect class="box acc" x="870" y="100" width="190" height="170" rx="12"/><ellipse class="box acc" cx="965" cy="106" rx="85" ry="6"/><text class="t-m" x="886" y="134">SQLite · WAL</text><text class="t-s" x="886" y="156">one file,</text><text class="t-s" x="886" y="178">one writer at a time</text><text class="t-a" x="886" y="200">SQLCipher build:</text><text class="t-s" x="886" y="222">encrypted at rest</text></g>
+<path class="wire" d="M240 105 H296" marker-end="url(#t1a-aa)"/><path class="flow" d="M240 105 H296"/><path class="dot" pathLength="100" d="M240 105 H296"/><path class="wire" d="M240 265 H296" marker-end="url(#t1a-aa)"/><path class="flow" d="M240 265 H296"/><path class="dot" pathLength="100" d="M240 265 H296" style="--d:0.6s"/><path class="wire" d="M530 105 H586" marker-end="url(#t1a-aa)"/><path class="flow" d="M530 105 H586"/><path class="dot" pathLength="100" d="M530 105 H586" style="--d:0.9s"/><path class="wire" d="M530 265 H586" marker-end="url(#t1a-aa)"/><path class="flow" d="M530 265 H586"/><path class="dot" pathLength="100" d="M530 265 H586" style="--d:1.3s"/><path class="wire" d="M810 185 H866" marker-end="url(#t1a-aa)"/><path class="flow" d="M810 185 H866"/><path class="dot" pathLength="100" d="M810 185 H866" style="--d:1.7s"/><g class="rise" style="--d:0.6s"><rect class="box ghost" x="50" y="340" width="230" height="76" rx="12"/><text class="t-k" x="66" y="364">optional</text><text class="t-m" x="66" y="381">ai-memory serve</text><text class="t-s" x="66" y="398">TLS · 127.0.0.1:9077</text></g>
+<g class="rise" style="--d:0.7s"><rect class="box ghost" x="300" y="340" width="230" height="76" rx="12"/><text class="t-k" x="316" y="364">optional</text><text class="t-m" x="316" y="381">wake-hub</text><text class="t-s" x="316" y="398">unix socket, same host</text></g>
+<g class="rise" style="--d:0.8s"><rect class="box teal" x="590" y="340" width="470" height="76" rx="12"/><text class="t-k" x="606" y="364">operations</text><text class="t-s" x="606" y="382">ai-memory backup: VACUUM INTO snapshot + signed manifest</text><text class="t-s" x="606" y="400">ai-memory restore · ai-memory doctor</text></g>
+<path class="wire" d="M965 270 V336" marker-end="url(#t1a-at)"/><path class="flow teal" d="M965 270 V336"/><path class="dot teal" pathLength="100" d="M965 270 V336" style="--d:2.2s"/></svg>
 
-<section>
-  <div class="container">
-    <span class="eyebrow">Deployment recipe</span>
-    <h2>Install, run, verify.</h2>
-<pre><code># install
-cargo install ai-memory --version 0.8.0
+  </figure>
+  <p class="am-figcap"><b>Sources.</b> <code>src/mcp/mod.rs</code> (the stdio server takes a SQLite path), <code>src/profile.rs</code> (core and full profiles), <code>src/cli/store.rs</code> and <code>src/cli/recall.rs</code> (CLI verbs open the store in-process), <code>src/cli/backup.rs</code>, <code>src/cli/doctor.rs</code>; the <code>sqlcipher</code> feature is in <code>Cargo.toml</code>.</p>
+</div></section>
 
-# run as MCP server (for Claude Code, etc.)
-ai-memory --db ~/.claude/ai-memory.db mcp --tier semantic
-
-# OR run as HTTP daemon
-ai-memory --db ~/.claude/ai-memory.db serve --host 127.0.0.1 --port 9077
-
-# verify
-ai-memory --db ~/.claude/ai-memory.db stats</code></pre>
-    <p>A single config file at <code>~/.config/ai-memory/config.toml</code> covers tier selection, embedding model, Ollama URL (for the smart/autonomous tiers), and DB path.</p>
+<section class="am-sec alt" id="walkthrough"><div class="am-wrap">
+  <div class="am-sec-h">
+    <span class="am-eyebrow">Walkthrough</span>
+    <h2>One write, <span class="a">one recall</span>.</h2>
   </div>
-</section>
+  <figure class="am-fig" style="--fig-min:900px">
+<svg class="dg" viewBox="0 0 1100 250" role="img" aria-labelledby="t1b-title" aria-describedby="t1b-desc" xmlns="http://www.w3.org/2000/svg">
+<title id="t1b-title">Tier 1 walkthrough: one write and one recall</title><desc id="t1b-desc">Write: memory_store, identity resolved, governance gate, row inserted with its tier TTL, keyword index and embedding. Recall: memory_recall, keyword search, vector search, blend and scope filter, ranked memories back to the agent.</desc>
+<defs><marker id="t1b-ah" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow"/></marker><marker id="t1b-aa" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow acc"/></marker><marker id="t1b-at" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow teal"/></marker><marker id="t1b-ab" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow bad"/></marker><marker id="t1b-as" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow slate"/></marker></defs>
+<text class="t-k" x="30" y="30">WRITE</text><g class="rise"><rect class="box acc" x="30" y="40" width="184" height="66" rx="12"/><text class="t-a" x="44" y="64">01</text><text class="t-m" x="70" y="64">memory_store</text><text class="t-s" x="44" y="86">title · content · tier</text></g>
+<path class="wire" d="M214 73 H240" marker-end="url(#t1b-aa)"/><path class="flow" d="M214 73 H240"/><path class="dot" pathLength="100" d="M214 73 H240"/><g class="rise" style="--d:0.1s"><rect class="box" x="244" y="40" width="184" height="66" rx="12"/><text class="t-a" x="258" y="64">02</text><text class="t-m" x="284" y="64">identity</text><text class="t-s" x="258" y="86">agent id resolved</text></g>
+<path class="wire" d="M428 73 H454" marker-end="url(#t1b-aa)"/><path class="flow" d="M428 73 H454"/><path class="dot" pathLength="100" d="M428 73 H454" style="--d:0.35s"/><g class="rise" style="--d:0.2s"><rect class="box" x="458" y="40" width="184" height="66" rx="12"/><text class="t-a" x="472" y="64">03</text><text class="t-m" x="498" y="64">governance</text><text class="t-s" x="472" y="86">namespace standard</text></g>
+<path class="wire" d="M642 73 H668" marker-end="url(#t1b-aa)"/><path class="flow" d="M642 73 H668"/><path class="dot" pathLength="100" d="M642 73 H668" style="--d:0.7s"/><g class="rise" style="--d:0.30000000000000004s"><rect class="box acc" x="672" y="40" width="184" height="66" rx="12"/><text class="t-a" x="686" y="64">04</text><text class="t-m" x="712" y="64">insert row</text><text class="t-s" x="686" y="86">tier TTL applied</text></g>
+<path class="wire" d="M856 73 H882" marker-end="url(#t1b-aa)"/><path class="flow" d="M856 73 H882"/><path class="dot" pathLength="100" d="M856 73 H882" style="--d:1.0499999999999998s"/><g class="rise" style="--d:0.4s"><rect class="box" x="886" y="40" width="184" height="66" rx="12"/><text class="t-a" x="900" y="64">05</text><text class="t-m" x="926" y="64">index</text><text class="t-s" x="900" y="86">keyword + embedding</text></g>
+<text class="t-k" x="30" y="150">RECALL</text><g class="rise" style="--d:0.6s"><rect class="box teal" x="30" y="160" width="184" height="66" rx="12"/><text class="t-a" x="44" y="184">01</text><text class="t-m" x="70" y="184">memory_recall</text><text class="t-s" x="44" y="206">context · as_agent</text></g>
+<path class="wire" d="M214 193 H240" marker-end="url(#t1b-at)"/><path class="flow teal" d="M214 193 H240"/><path class="dot teal" pathLength="100" d="M214 193 H240" style="--d:0.6s"/><g class="rise" style="--d:0.7s"><rect class="box" x="244" y="160" width="184" height="66" rx="12"/><text class="t-a" x="258" y="184">02</text><text class="t-m" x="284" y="184">keyword</text><text class="t-s" x="258" y="206">FTS on SQLite</text></g>
+<path class="wire" d="M428 193 H454" marker-end="url(#t1b-at)"/><path class="flow teal" d="M428 193 H454"/><path class="dot teal" pathLength="100" d="M428 193 H454" style="--d:0.95s"/><g class="rise" style="--d:0.8s"><rect class="box" x="458" y="160" width="184" height="66" rx="12"/><text class="t-a" x="472" y="184">03</text><text class="t-m" x="498" y="184">vector</text><text class="t-s" x="472" y="206">in-process HNSW</text></g>
+<path class="wire" d="M642 193 H668" marker-end="url(#t1b-at)"/><path class="flow teal" d="M642 193 H668"/><path class="dot teal" pathLength="100" d="M642 193 H668" style="--d:1.2999999999999998s"/><g class="rise" style="--d:0.9s"><rect class="box teal" x="672" y="160" width="184" height="66" rx="12"/><text class="t-a" x="686" y="184">04</text><text class="t-m" x="712" y="184">blend</text><text class="t-s" x="686" y="206">scope filter in SQL</text></g>
+<path class="wire" d="M856 193 H882" marker-end="url(#t1b-at)"/><path class="flow teal" d="M856 193 H882"/><path class="dot teal" pathLength="100" d="M856 193 H882" style="--d:1.65s"/><g class="rise" style="--d:1.0s"><rect class="box" x="886" y="160" width="184" height="66" rx="12"/><text class="t-a" x="900" y="184">05</text><text class="t-m" x="926" y="184">results</text><text class="t-s" x="900" y="206">ranked memories</text></g>
+</svg>
 
-<section>
-  <div class="container">
-    <span class="eyebrow">Wiring</span>
-    <h2>Governance, skills, and attestations at T1.</h2>
-    <ul>
-      <li><strong>Governance</strong> — Default policy is <code>write: any, promote: any, delete: owner</code>. Override per-namespace via <code>memory_namespace_set_standard</code> if you want pending-approval behavior for sensitive memories. The same governance machinery as T2+ is present; you just rarely use it with one agent.</li>
-      <li><strong>Skills</strong> — Auto-tagging (<code>memory_auto_tag</code>) and contradiction detection (<code>memory_detect_contradiction</code>) require the <code>smart</code> or <code>autonomous</code> feature tier (LLM-bound). Post-#1067 + #1146 (v0.7.0), tier no longer dictates vendor — any tier can route to Ollama OR any of 15+ cloud vendors (xAI, OpenAI, Anthropic, Gemini, DeepSeek, Kimi, Qwen, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks, LMStudio) via a <code>[llm]</code> section in <code>~/.config/ai-memory/config.toml</code> (canonical schema: <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/docs/CONFIG_SCHEMA.md">CONFIG_SCHEMA.md</a>) or via <code>AI_MEMORY_LLM_BACKEND</code> env vars (override). Capabilities introspection v2 (v0.6.3) lets the agent ask the server which skills are available before invoking them.</li>
-      <li><strong>Attestations</strong> — Not enforced at T1; the <code>signature</code> column on <code>memory_links</code> (added schema v15 / v0.6.3) is populated with Ed25519 attestation.</li>
-    </ul>
+  </figure>
+  <div class="am-grid two">
+    <div class="am-card gold"><span class="am-k">Write</span><h3>memory_store</h3><p>The tool call carries a title, content, tier and namespace. The engine resolves the agent id (from <code>AI_MEMORY_AGENT_ID</code> or <code>--agent-id</code>), consults the namespace standard's governance policy, inserts the row with its tier's TTL (<b>short</b> expires after hours, <b>mid</b> after days, <b>long</b> never) and indexes it for keyword search and, at the semantic tier, an embedding.</p></div>
+    <div class="am-card teal"><span class="am-k">Recall</span><h3>memory_recall</h3><p>The context runs through keyword search on SQLite and the in-process HNSW vector index, the scores are blended, and the scope filter in SQL drops anything the caller may not see. Embeddings come from a local MiniLM model or an OpenAI-compatible endpoint (<code>src/embeddings.rs</code>).</p></div>
   </div>
-</section>
+</div></section>
 
-<section>
-  <div class="container">
-    <span class="eyebrow">Limits</span>
-    <h2>Honest ceilings.</h2>
-    <table>
-      <thead>
-        <tr><th>Dimension</th><th>T1 ceiling</th><th>When it bites</th></tr>
-      </thead>
-      <tbody>
-        <tr><td>Concurrent writers</td><td>1 (mutex-serialized)</td><td>If a second writer joins, you've graduated to T2</td></tr>
-        <tr><td>Total memories</td><td>~10⁶ before HNSW RAM pinches (~1.5 GB at 384-dim)</td><td>Vector index lives in-process</td></tr>
-        <tr><td>FTS5 query latency</td><td>sub-millisecond at 10⁵ rows</td><td>Stays fast through 10⁶</td></tr>
-        <tr><td>Crash recovery</td><td>WAL replay on next open</td><td>Atomic — never lose committed writes</td></tr>
-        <tr><td>Network exposure</td><td>none unless you bind HTTP to non-loopback</td><td>Default is <code>127.0.0.1</code></td></tr>
-      </tbody>
-    </table>
-    <p>When you hit any of these, walk to <a href="architectures-t2.html" style="color:var(--p1)">Tier 2</a> (more agents on this same node) or <a href="architectures-t3.html" style="color:var(--p1)">Tier 3</a> (more nodes).</p>
+<section class="am-sec" id="recipe"><div class="am-wrap">
+  <div class="am-sec-h">
+    <span class="am-eyebrow">Deployment recipe</span>
+    <h2>Laptop or single VM, <span class="a">no daemon</span>.</h2>
   </div>
-</section>
+<pre><code># MCP client config (.mcp.json): spawn the stdio server; it opens SQLite in-process
+{ "mcpServers": { "memory": {
+    "command": "ai-memory",
+    "args": ["--db", "/home/me/.local/share/ai-memory/ai-memory.db", "mcp", "--profile", "core"]
+} } }
 
-<section>
-  <div class="container">
-    <span class="eyebrow">Source</span>
-    <h2>Source-of-truth references.</h2>
-    <ul>
-      <li><code>src/main.rs</code> + <code>src/daemon_runtime.rs</code> — CLI parsing + daemon setup (87 subcommands in the default build (89 under <code>--features sal</code> or <code>--features sal-postgres</code>; #1598 added <code>reembed</code>))</li>
-      <li><code>src/mcp/</code> — MCP server (101 advertised entries at <code>--profile full</code>; 7 at <code>--profile core</code>)</li>
-      <li><code>src/handlers/</code> — HTTP route handlers (router registers 92 <code>/api/v1/*</code> route bindings / 78 unique URL paths)</li>
-      <li><code>src/storage/</code> — schema, recall scoring, GC, migrations (current schema v78 per <code>CURRENT_SCHEMA_VERSION</code>; v57 = postgres stored generated tsvector + memories_tsv_gin #1579 B2; v56 = composite list/archive ordering indexes + sargable list #1579 A2; v55 = sargable list_memories_updated_since federation-catchup rewrite + idx_memories_updated_at #1476; v54 = tier-default expiry backfill #1466; v53 = memories_au FTS5 trigger scoping #1418; v52 = transcript_line_dedup #1389; v51 = federation_nonces persistence #1255 / PR #1296; v50 = per-namespace K8 quota dimension #1156)</li>
-      <li><code>src/reranker.rs</code> — adaptive blend semantic + keyword</li>
-      <li><code>src/hnsw.rs</code> — in-memory ANN</li>
-      <li><code>CLAUDE.md</code> §Architecture / Key Modules — full module map</li>
-    </ul>
+# The CLI opens the same file in-process (it is not an HTTP client)
+ai-memory --db ~/.local/share/ai-memory/ai-memory.db store -T "build cache" -c "CI uses sccache" -n proj/build
+ai-memory --db ~/.local/share/ai-memory/ai-memory.db recall "how do we cache builds" -n proj/build
+
+# Encryption at rest: a SQLCipher build plus a passphrase file
+cargo build --release --no-default-features --features sqlcipher
+ai-memory --db ~/.local/share/ai-memory/ai-memory.db --db-passphrase-file ~/.config/ai-memory/db.pass mcp --profile core
+
+# Signed snapshots (SQLite only), health
+ai-memory --db ~/.local/share/ai-memory/ai-memory.db backup --to ~/ai-memory-backups --keep 48
+ai-memory --db ~/.local/share/ai-memory/ai-memory.db restore --from ~/ai-memory-backups --latest
+ai-memory --db ~/.local/share/ai-memory/ai-memory.db doctor</code></pre>
+  <p class="am-figcap">Every flag above is a clap argument in <code>src/daemon_runtime.rs</code>, <code>src/cli/store.rs</code>, <code>src/cli/recall.rs</code> or <code>src/cli/backup.rs</code>. Use <code>--profile full</code> when the agent needs the whole tool surface.</p>
+</div></section>
+
+<section class="am-sec alt" id="wiring"><div class="am-wrap">
+  <div class="am-sec-h">
+    <span class="am-eyebrow">Wiring</span>
+    <h2>What still applies <span class="a">with one agent</span>.</h2>
   </div>
-</section>
+  <div class="am-grid">
+    <div class="am-card"><span class="am-k">Governance</span><h3>Namespace standards</h3><p>A namespace standard can already require approval or ownership for writes, promotes and deletes, so a single agent can be fenced out of a namespace it should only read.</p></div>
+    <div class="am-card"><span class="am-k">Forensics</span><h3>signed_events · audit log</h3><p>The <code>signed_events</code> chain is verifiable with <code>verify-signed-events-chain</code>; the hash-chained audit log is opt-in and checked by <code>audit verify</code> (<code>src/signed_events.rs</code>, <code>src/audit.rs</code>).</p></div>
+    <div class="am-card"><span class="am-k">Wake plane</span><h3>Optional, same host</h3><p>With one agent there is nobody to wake. Add a <a href="wake-hub.html">wake hub</a> when a second agent or an operator tool starts sending messages.</p></div>
+  </div>
+</div></section>
 
-<footer>
-  <p>© 2026 AlphaOne LLC. Licensed Apache-2.0. ai-memory v0.9.0 — <a href="https://github.com/alphaonedev/ai-memory-mcp">source on GitHub</a> · <a href="./">home</a></p>
-</footer>
-
+<section class="am-sec" id="limits"><div class="am-wrap">
+  <div class="am-sec-h">
+    <span class="am-eyebrow">Honest limits</span>
+    <h2>When Tier 1 <span class="a">stops fitting</span>.</h2>
+  </div>
+  <div class="am-tablewrap"><table class="am-table">
+    <thead><tr><th>Dimension</th><th>Tier 1 behaviour</th><th>Move up when</th></tr></thead>
+    <tbody>
+      <tr><td><b>Writers</b></td><td>One writer at a time on the SQLite file; WAL lets readers pass it.</td><td>Several agents write at once: <a href="architectures-t2.html">Tier 2</a>.</td></tr>
+      <tr><td><b>Vectors</b></td><td>HNSW index held in RAM and rebuilt at start-up.</td><td>The corpus makes start-up or memory painful: <a href="architectures-t4.html">PostgreSQL tier</a>.</td></tr>
+      <tr><td><b>Remote access</b></td><td>None unless you run <code>serve</code>; it listens with TLS only, loopback by default, and non-loopback binds require an API key.</td><td>Agents on other machines need the memory: <a href="architectures-t3.html">Tier 3</a>.</td></tr>
+      <tr><td><b>Durability</b></td><td>One disk. Snapshots with <code>backup</code>; no replication.</td><td>You need a second copy that is current: <a href="architectures-t3.html">Tier 3</a>.</td></tr>
+      <tr><td><b>Filesystem</b></td><td>Local disk only; network filesystems are unsafe for SQLite locking.</td><td>Always: keep the file on local storage.</td></tr>
+    </tbody>
+  </table></div>
+  <p class="am-figcap" style="margin-top:12px">Reasoning for each: <a href="ARCHITECTURAL_LIMITS.html">architectural limits</a>.</p>
+  <div class="am-btns"><a class="am-btn" href="architectures.html">← Overview</a><a class="am-btn primary" href="architectures-t2.html">Tier 2 · Shared daemon →</a></div>
+</div></section>
+</main>
+<footer class="am-foot"><div class="am-wrap">
+  <span>© 2026 AlphaOne LLC · Apache-2.0 · ai-memory v1.0.0</span>
+  <span><a href="https://github.com/alphaonedev/ai-memory-mcp">source</a> · <a href="index.html">home</a> · <a href="architectures.html">architectures</a> · <a href="ARCHITECTURAL_LIMITS.html">limits</a></span>
+</div></footer>
+<button class="am-themetog" id="am-themetog" type="button" aria-label="Toggle light or dark theme">theme</button>
+<script>
+(function(){var d=document.documentElement;try{var s=localStorage.getItem('aim-site-theme');if(s)d.setAttribute('data-theme',s);}catch(e){}
+var b=document.getElementById('am-themetog');if(!b)return;b.addEventListener('click',function(){var c=d.getAttribute('data-theme');var n=c==='dark'?'light':c==='light'?'dark':(matchMedia('(prefers-color-scheme:dark)').matches?'light':'dark');d.setAttribute('data-theme',n);try{localStorage.setItem('aim-site-theme',n);}catch(e){}});})();
+</script>
 </body>
 </html>
