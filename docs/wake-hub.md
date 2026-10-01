@@ -49,11 +49,47 @@ Sixty seconds is a CEILING, not a target. A client that observes a
 
 ## Self-healing after a lost wake
 
-Every wake carries `seq_high_watermark`: the producer's host-wide monotonic wake
-counter at the instant the hint was minted. It is deliberately NOT a
-per-recipient inbox depth — the bus has no per-recipient counter, and a truthful
-one would put a database read on the very latency path this plane exists to
-remove.
+Every wake carries `seq_high_watermark`: the RECIPIENT's own wake number,
+assigned by the producer at publish time (#4125). It moves only when a wake is
+published to that recipient, so a gap between two of your values counts wakes
+YOU missed and never measures another tenant's notify volume (the host-wide
+wake sequence did, which is the cross-tenant side channel #4071 also removes
+from the inbox SSE stream). It is a count of wakes, not an inbox depth — a
+truthful depth would put a database read on the very latency path this plane
+exists to remove.
+
+The number is assigned BEFORE the frame enters the bounded broadcast bus and is
+forwarded verbatim by every sink, never renumbered: a counter kept in a sink
+would only advance for frames the sink actually received, so a lagging sink
+would hand you contiguous numbers across a real drop. Values start from a
+wall-clock base (only their order and differences are meaningful), so a
+producer restart or an eviction from the producer's per-recipient table moves
+your number FORWARD — at worst one wake is labelled `gap`, which costs nothing
+extra because every wake already triggers exactly one catch-up read.
+
+**Memory bound.** The producer's per-recipient table is bounded in BYTES, not
+entries (`wake_hub::limits::RECIPIENT_SEQ_BUDGET_BYTES` = 8 MiB): each entry is
+accounted as its recipient-id bytes plus
+`RECIPIENT_SEQ_ENTRY_OVERHEAD_BYTES` (192), a generous upper bound on resident
+cost. Recipient ids are caller-supplied up to 128 bytes, so an entry-count cap
+would not bound memory. At the 128-byte ceiling the table holds about 26,000
+recipients; shorter ids fit proportionally more.
+
+**Eviction and what it reveals.** At the budget the producer evicts the
+LEAST-RECENTLY-WOKEN recipient, one entry at a time. A recipient that stays
+resident always sees its number advance by exactly 1; only an evicted
+recipient sees a jump, on its next wake, and pays one extra catch-up read. That
+jump is a residual one-bit signal and it is NOT nothing: it tells the evicted
+recipient that, since it was last woken, enough other distinct recipient ids
+were woken to fill the table, and a party that can notify arbitrary ids can
+force that eviction for a recipient that has been idle. It is a bounded COUNT
+oracle, not merely one bit: an attacker can wake its own id, notify k fresh ids,
+and from whether its own number jumped bound how many distinct other recipients
+were woken in that window. Each probe costs roughly 26,000 notifies (up to
+about 43,000 with short ids) to fill the table, so the per-agent daily
+write quota (`AI_MEMORY_MAX_MEMORIES_PER_DAY`) makes it impractical today. It
+carries no recipient identity and no content, and it is far weaker than the
+host-wide-sequence volume signal this change removes.
 
 Read it as *"wakes happened that you did not see"*. The correct response to a
 gap is ONE catch-up inbox read. That is fail-safe by construction: a client may

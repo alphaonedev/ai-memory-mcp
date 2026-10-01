@@ -296,6 +296,27 @@ pub const DEFAULT_RECONNECT_BASE_MS: u32 = 250;
 pub const DEFAULT_RECONNECT_JITTER_MS: u32 = 750;
 
 // ---------------------------------------------------------------------------
+// Producer-side per-recipient wake counters (#4125)
+// ---------------------------------------------------------------------------
+
+/// Byte budget of the PRODUCER's per-recipient wake-counter table
+/// (`inbox_wake::RecipientSeqs`, #4125). Recipient ids are caller-supplied up
+/// to [`MAX_ID_BYTES`], so an entry-COUNT bound is not a memory bound (262k
+/// distinct 128-byte ids is tens of MiB); the table is bounded in BYTES, per
+/// this file's discipline: the summed key length plus
+/// [`RECIPIENT_SEQ_ENTRY_OVERHEAD_BYTES`] per entry never exceeds this. At
+/// the 128-byte id ceiling that is ~26k tracked recipients; past it the
+/// least-recently-woken recipient is evicted (see `docs/wake-hub.md`).
+pub const RECIPIENT_SEQ_BUDGET_BYTES: usize = 8 * 1_024 * 1_024;
+
+/// Accounted per-entry cost on top of the key bytes: the shared `Arc<str>`
+/// header, the hash-map slot (key pointer, counter, recency tick, control
+/// byte, load-factor slack) and the recency-index node. A deliberately
+/// generous constant so the accounted bytes are an UPPER bound on resident
+/// memory, never an underestimate.
+pub const RECIPIENT_SEQ_ENTRY_OVERHEAD_BYTES: usize = 192;
+
+// ---------------------------------------------------------------------------
 // Token bucket
 // ---------------------------------------------------------------------------
 

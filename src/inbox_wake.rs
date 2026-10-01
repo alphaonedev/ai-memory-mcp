@@ -54,11 +54,13 @@
 //! monotonic [`seq`](InboxEvent::seq) so a consumer can size the gap
 //! exactly rather than guess.
 
-use std::sync::Arc;
-use std::sync::OnceLock;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use serde::{Deserialize, Serialize};
+
+use crate::wake_hub::limits::{RECIPIENT_SEQ_BUDGET_BYTES, RECIPIENT_SEQ_ENTRY_OVERHEAD_BYTES};
 use tokio::sync::broadcast;
 
 /// Capacity of the process-wide inbox wake channel.
@@ -76,6 +78,119 @@ pub const INBOX_WAKE_BROADCAST_CAPACITY: usize = 1024;
 /// Starts at 1 so `0` is unambiguously "no wake seen yet" for a
 /// consumer's high-watermark bookkeeping.
 static WAKE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// #4125 — per-recipient wake counters, assigned at PUBLISH time.
+///
+/// A recipient's [`InboxEvent::AgentNotified::recipient_seq`] moves ONLY when
+/// a wake is published to that recipient, so the gap between two of its values
+/// counts the recipient's own missed wakes and never measures another tenant's
+/// notify volume (the host-wide [`WAKE_SEQ`] does, which is why #4071 keeps it
+/// off tenant-facing surfaces). Because the number is assigned HERE, before
+/// the broadcast send, a consumer whose receiver lags still sees the dropped
+/// numbers as a gap; a counter kept in the consumer would renumber across it.
+///
+/// The table is bounded in BYTES ([`RECIPIENT_SEQ_BUDGET_BYTES`], the
+/// `wake_hub::limits` discipline): recipient ids are caller-supplied up to 128
+/// bytes, so a count bound would not bound memory. At the budget the
+/// LEAST-RECENTLY-WOKEN recipient is evicted, one entry at a time, so a
+/// recipient that is not evicted is never disturbed.
+struct RecipientSeqs {
+    slots: HashMap<Arc<str>, Slot>,
+    /// Recency index: tick -> recipient, oldest first. Ticks are unique, so
+    /// the first entry is always the least-recently-woken recipient.
+    recency: BTreeMap<u64, Arc<str>>,
+    tick: u64,
+    /// Accounted bytes: sum over entries of `key.len() + ENTRY_OVERHEAD`.
+    bytes: usize,
+    budget: usize,
+}
+
+struct Slot {
+    seq: u64,
+    tick: u64,
+}
+
+fn entry_cost(key: &str) -> usize {
+    key.len().saturating_add(RECIPIENT_SEQ_ENTRY_OVERHEAD_BYTES)
+}
+
+impl RecipientSeqs {
+    fn new(budget: usize) -> Self {
+        Self {
+            slots: HashMap::new(),
+            recency: BTreeMap::new(),
+            tick: 0,
+            bytes: 0,
+            budget,
+        }
+    }
+
+    fn next_tick(&mut self) -> u64 {
+        // A u64 tick cannot wrap at any reachable publish rate (2^64 wakes).
+        self.tick = self.tick.saturating_add(1);
+        self.tick
+    }
+
+    /// The recipient's next wake number.
+    ///
+    /// A recipient seen for the first time — including one evicted to stay
+    /// inside the byte budget — starts from a wall-clock base
+    /// ([`recipient_seq_base`]), never from 1. So an eviction (or a producer
+    /// restart) moves that recipient's counter FORWARD: it sees at worst one
+    /// spurious gap, which costs nothing because every wake already triggers
+    /// exactly one catch-up read, and can never see its counter go backwards
+    /// and hide a real gap behind its old high-watermark. Every OTHER
+    /// recipient still sees +1.
+    fn assign(&mut self, recipient: &str) -> u64 {
+        let tick = self.next_tick();
+        if let Some(slot) = self.slots.get_mut(recipient) {
+            slot.seq = slot.seq.saturating_add(1);
+            let old = std::mem::replace(&mut slot.tick, tick);
+            let seq = slot.seq;
+            if let Some(key) = self.recency.remove(&old) {
+                self.recency.insert(tick, key);
+            }
+            return seq;
+        }
+        let cost = entry_cost(recipient);
+        while self.bytes.saturating_add(cost) > self.budget {
+            let Some((_, victim)) = self.recency.pop_first() else {
+                break;
+            };
+            if self.slots.remove(&victim).is_some() {
+                self.bytes = self.bytes.saturating_sub(entry_cost(&victim));
+            }
+        }
+        let first = recipient_seq_base();
+        let key: Arc<str> = Arc::from(recipient);
+        self.recency.insert(tick, Arc::clone(&key));
+        self.slots.insert(key, Slot { seq: first, tick });
+        self.bytes = self.bytes.saturating_add(cost);
+        first
+    }
+}
+
+/// Starting number for a recipient counter: microseconds since the Unix epoch
+/// (clamped to at least 1 so `0` keeps meaning "no wake seen yet").
+///
+/// Monotonic across evictions and producer restarts as long as one
+/// recipient receives fewer than one wake per microsecond, which the bounded
+/// broadcast bus makes physically unreachable. A clock step backwards
+/// degrades to the pre-#4125 restart behaviour (the consumer keeps its higher
+/// watermark and reports no gap for the overlap) — never to a wrong read,
+/// because the durable inbox row, not the hint, is what the reader returns.
+fn recipient_seq_base() -> u64 {
+    let micros = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_micros()).unwrap_or(u64::MAX));
+    micros.max(1)
+}
+
+static RECIPIENT_SEQS: OnceLock<Mutex<RecipientSeqs>> = OnceLock::new();
+
+fn recipient_seqs() -> &'static Mutex<RecipientSeqs> {
+    RECIPIENT_SEQS.get_or_init(|| Mutex::new(RecipientSeqs::new(RECIPIENT_SEQ_BUDGET_BYTES)))
+}
 
 /// One frame on the inbox wake bus.
 ///
@@ -115,6 +230,19 @@ pub enum InboxEvent {
         content_digest: String,
         /// RFC-3339 instant the wake was published.
         notified_at: String,
+        /// #4125 — this RECIPIENT's own wake number, assigned at publish time.
+        ///
+        /// Strictly increasing per recipient and moved by nothing but wakes to
+        /// this recipient, so it is safe to show to the recipient: a gap
+        /// between two values counts the recipient's OWN missed wakes (one
+        /// catch-up inbox read) and carries no other tenant's activity volume.
+        /// This, not [`Self::AgentNotified::seq`], is what the wake-hub
+        /// forwards as `seq_high_watermark`. Values are large (they start
+        /// from a wall-clock base, see `recipient_seq_base`) and only their
+        /// ORDER and DIFFERENCES are meaningful. `0` on a frame decoded from
+        /// a producer that predates the field.
+        #[serde(default)]
+        recipient_seq: u64,
     },
 }
 
@@ -137,6 +265,15 @@ impl InboxEvent {
     pub fn seq(&self) -> u64 {
         match self {
             InboxEvent::AgentNotified { seq, .. } => *seq,
+        }
+    }
+
+    /// This recipient's own wake number (#4125); see
+    /// [`Self::AgentNotified::recipient_seq`].
+    #[must_use]
+    pub fn recipient_seq(&self) -> u64 {
+        match self {
+            InboxEvent::AgentNotified { recipient_seq, .. } => *recipient_seq,
         }
     }
 
@@ -200,6 +337,16 @@ pub(crate) fn publish_agent_notified(
     sender_agent_id: &str,
     content_digest: &str,
 ) -> InboxEvent {
+    // #4125 — both numbers are assigned and the frame is sent under ONE short
+    // lock (CONCURRENCY-03: no await, no I/O; `broadcast::Sender::send` never
+    // blocks), so every consumer receives a recipient's wakes in
+    // `recipient_seq` order and a gap it sees is a real one. A poisoned lock
+    // only means another publisher panicked between two map operations; the
+    // counters are still valid numbers, so recover rather than drop the wake
+    // (CONCURRENCY-18).
+    let mut seqs = recipient_seqs()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
     let event = InboxEvent::AgentNotified {
         seq: next_seq(),
         recipient_agent_id: recipient_agent_id.to_string(),
@@ -209,11 +356,13 @@ pub(crate) fn publish_agent_notified(
         sender_agent_id: sender_agent_id.to_string(),
         content_digest: content_digest.to_string(),
         notified_at: chrono::Utc::now().to_rfc3339(),
+        recipient_seq: seqs.assign(recipient_agent_id),
     };
     // No receivers is the documented, expected steady state on a daemon
     // with no attached streams — never an error (ERRORS-19: deliberate,
     // commented discard).
     let _ = bus().send(event.clone());
+    drop(seqs);
     event
 }
 
@@ -344,7 +493,78 @@ mod tests {
             sender_agent_id: "alice".into(),
             content_digest: "sha256:deadbeef".into(),
             notified_at: "2026-09-02T00:00:00Z".into(),
+            recipient_seq: 3,
         }
+    }
+
+    /// #4125 — a recipient counter is strictly increasing and independent of
+    /// other recipients.
+    #[test]
+    fn recipient_seq_is_isolated_per_recipient_4125() {
+        let mut t = RecipientSeqs::new(RECIPIENT_SEQ_BUDGET_BYTES);
+        let a1 = t.assign("a");
+        let b1 = t.assign("b");
+        let a2 = t.assign("a");
+        let a3 = t.assign("a");
+        assert_eq!((a2 - a1, a3 - a2), (1, 1), "own wakes are contiguous");
+        assert_eq!(t.assign("b"), b1 + 1, "A's wakes never move B");
+    }
+
+    /// #4125 — the table is bounded in BYTES: 262k distinct 128-byte ids
+    /// (the DoS shape an entry-count bound leaves at tens of MiB) never push
+    /// the accounted bytes past the budget, and the recency index stays in
+    /// lock-step with the map.
+    #[test]
+    fn recipient_table_holds_its_byte_budget_under_262k_max_length_ids_4125() {
+        let mut t = RecipientSeqs::new(RECIPIENT_SEQ_BUDGET_BYTES);
+        for i in 0..262_144_usize {
+            let id = format!("{i:0>128}");
+            assert_eq!(id.len(), 128);
+            t.assign(&id);
+            assert!(
+                t.bytes <= RECIPIENT_SEQ_BUDGET_BYTES,
+                "budget breached at {i}"
+            );
+        }
+        assert_eq!(t.slots.len(), t.recency.len(), "index in lock-step");
+        let summed: usize = t.slots.keys().map(|k| entry_cost(k)).sum();
+        assert_eq!(summed, t.bytes, "accounting matches the keys held");
+        assert!(summed <= RECIPIENT_SEQ_BUDGET_BYTES);
+        assert!(
+            t.slots.len() < 262_144,
+            "older recipients were evicted, not all retained"
+        );
+    }
+
+    /// #4125 — eviction is PER ENTRY and least-recently-woken first: only the
+    /// evicted recipient sees its number jump; every recipient that stays
+    /// resident (including a re-woken old one) sees +1.
+    #[test]
+    fn eviction_is_per_entry_lru_and_only_the_evicted_sees_a_jump_4125() {
+        // Room for exactly three one-byte ids.
+        let mut t = RecipientSeqs::new(3 * entry_cost("x"));
+        let a1 = t.assign("a");
+        let b1 = t.assign("b");
+        let c1 = t.assign("c");
+        // Re-wake A so B is now the least recently woken.
+        assert_eq!(t.assign("a"), a1 + 1);
+        // A new recipient forces exactly one eviction: B.
+        let d1 = t.assign("d");
+        assert_eq!(t.slots.len(), 3);
+        assert_eq!(t.assign("a"), a1 + 2, "resident A sees +1");
+        assert_eq!(t.assign("c"), c1 + 1, "resident C sees +1");
+        assert_eq!(t.assign("d"), d1 + 1, "resident D sees +1");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let b2 = t.assign("b");
+        assert!(b2 > b1 + 1, "evicted B sees a forward jump: {b1} -> {b2}");
+    }
+
+    #[test]
+    fn a_frame_without_recipient_seq_still_decodes_4125() {
+        let mut v = serde_json::to_value(sample()).expect("serialise");
+        v.as_object_mut().expect("object").remove("recipient_seq");
+        let back: InboxEvent = serde_json::from_value(v).expect("deserialise");
+        assert_eq!(back.recipient_seq(), 0);
     }
 
     #[test]
