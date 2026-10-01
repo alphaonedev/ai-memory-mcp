@@ -203,6 +203,47 @@ pub fn reassert_verified_attestation(
     merged
 }
 
+/// #4208 — did the VERIFIED inbound's signed content actually WIN the merge,
+/// i.e. is every text field it signed over now what the stored row shows?
+///
+/// The route-OUT dequarantine-on-attest (#1948) may only release a quarantined
+/// row whose visible content IS the verified unit's. A validly signed inbound
+/// that LOSES the newer-wins merge leaves the local (never-attested)
+/// title/content on the row; a signature over different bytes proves nothing
+/// about it. Compared: `content`, `title`, `namespace`, `memory_kind` and the
+/// `metadata.agent_id` author (non-empty). NOT compared, by design: `created_at`
+/// (the merge keeps the LOCAL genesis instant, immutable) and the
+/// `write_signature` metadata key (the CRDT metadata merge may keep either
+/// side's) — neither changes the text a release would make visible. Fail
+/// closed on a missing author.
+///
+/// Defence in depth (#4208, ERRORS-09): the inbound must itself be
+/// `agent_attested` (this node's verified verdict). The receive callers already
+/// gate on it, but a release primitive must never rely on its caller, so an
+/// unattested inbound never matches here.
+#[must_use]
+pub fn persisted_is_verified_unit(persisted: &Memory, verified_inbound: &Memory) -> bool {
+    let author = |m: &Memory| {
+        m.metadata
+            .get(param_names::AGENT_ID)
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    };
+    let signer = author(verified_inbound);
+    let attested = verified_inbound
+        .metadata
+        .get(field_names::ATTEST_LEVEL)
+        .and_then(Value::as_str)
+        == Some(crate::identity::verify::AttestLevel::AgentAttested.as_str());
+    attested
+        && persisted.content == verified_inbound.content
+        && persisted.title == verified_inbound.title
+        && persisted.namespace == verified_inbound.namespace
+        && persisted.memory_kind == verified_inbound.memory_kind
+        && signer.as_deref().is_some_and(|s| !s.is_empty())
+        && author(persisted) == signer
+}
+
 /// #2863 — do two rows carry a byte-identical 6-field `SignableWrite` surface
 /// (`agent_id` + `namespace` + `title` + `memory_kind` + `created_at` +
 /// `content`) AND the same non-empty `write_signature`? The signature commits to
@@ -1947,5 +1988,90 @@ mod tests {
         rt.sort();
         assert_eq!(lt, rt);
         assert_eq!(lt, vec!["a", "b", "c"]);
+    }
+
+    /// #4208 F1 — a verified, attested inbound and a persisted row that
+    /// differs from it in exactly ONE compared field. Each cell fails if that
+    /// field's comparison is dropped from `persisted_is_verified_unit`.
+    fn attested_unit() -> Memory {
+        let mut m = base("u", "2026-06-16T00:00:00+00:00");
+        m.metadata = json!({"agent_id": "ai:a", "attest_level": "agent_attested"});
+        m
+    }
+
+    #[test]
+    fn verified_unit_matches_identical_row_4208() {
+        let v = attested_unit();
+        assert!(persisted_is_verified_unit(&v.clone(), &v));
+    }
+
+    #[test]
+    fn verified_unit_rejects_content_mismatch_4208() {
+        let v = attested_unit();
+        let mut p = v.clone();
+        p.content = "other".into();
+        assert!(!persisted_is_verified_unit(&p, &v));
+    }
+
+    #[test]
+    fn verified_unit_rejects_title_mismatch_4208() {
+        let v = attested_unit();
+        let mut p = v.clone();
+        p.title = "other".into();
+        assert!(!persisted_is_verified_unit(&p, &v));
+    }
+
+    #[test]
+    fn verified_unit_rejects_namespace_mismatch_4208() {
+        let v = attested_unit();
+        let mut p = v.clone();
+        p.namespace = "other".into();
+        assert!(!persisted_is_verified_unit(&p, &v));
+    }
+
+    #[test]
+    fn verified_unit_rejects_memory_kind_mismatch_4208() {
+        let v = attested_unit();
+        let mut p = v.clone();
+        p.memory_kind = MemoryKind::Reflection;
+        assert!(!persisted_is_verified_unit(&p, &v));
+    }
+
+    #[test]
+    fn verified_unit_rejects_author_mismatch_4208() {
+        let v = attested_unit();
+        let mut p = v.clone();
+        p.metadata = json!({"agent_id": "ai:b", "attest_level": "agent_attested"});
+        assert!(!persisted_is_verified_unit(&p, &v));
+    }
+
+    #[test]
+    fn verified_unit_rejects_missing_or_empty_author_4208() {
+        let mut v = attested_unit();
+        v.metadata = json!({"attest_level": "agent_attested"});
+        assert!(!persisted_is_verified_unit(&v.clone(), &v));
+        v.metadata = json!({"agent_id": "", "attest_level": "agent_attested"});
+        assert!(!persisted_is_verified_unit(&v.clone(), &v));
+    }
+
+    /// #4208 F3 — an inbound that is not `agent_attested` never matches, even
+    /// when the stored row is byte-identical (defence in depth).
+    #[test]
+    fn verified_unit_requires_inbound_attested_4208() {
+        let mut v = attested_unit();
+        v.metadata = json!({"agent_id": "ai:a", "attest_level": "claimed"});
+        assert!(!persisted_is_verified_unit(&v.clone(), &v));
+        v.metadata = json!({"agent_id": "ai:a"});
+        assert!(!persisted_is_verified_unit(&v.clone(), &v));
+    }
+
+    /// #4208 — created_at and the signature key are deliberately NOT compared.
+    #[test]
+    fn verified_unit_ignores_created_at_and_signature_4208() {
+        let v = attested_unit();
+        let mut p = v.clone();
+        p.created_at = "2020-01-01T00:00:00+00:00".into();
+        p.metadata = json!({"agent_id": "ai:a", "write_signature": "zzz"});
+        assert!(persisted_is_verified_unit(&p, &v));
     }
 }

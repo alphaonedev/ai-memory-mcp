@@ -28,8 +28,8 @@ pub use capture_turn::*;
 #[allow(unused_imports)]
 pub use checkpoint::*;
 pub use crdt_merge::{
-    clamp_inbound_updated_at, merge_memory, reassert_verified_attestation,
-    sanitize_inbound_attestation, stamp_version_vector,
+    clamp_inbound_updated_at, merge_memory, persisted_is_verified_unit,
+    reassert_verified_attestation, sanitize_inbound_attestation, stamp_version_vector,
 };
 #[allow(unused_imports)]
 pub use crdt_primitives::{OrSet, PnCounter};

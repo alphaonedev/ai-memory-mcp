@@ -863,6 +863,9 @@ pub(crate) mod contamination_marker;
 pub(crate) use contamination_marker::StampAuthority;
 pub(crate) mod decontaminate;
 mod lifecycle_write;
+// #4208 — the evidence-bound route-OUT dequarantine (child module: QUAL-10).
+mod dequarantine_verified;
+pub use dequarantine_verified::dequarantine_if_verified_unit;
 // `pub` (rather than `pub(crate)`) so the V-4 closeout
 // integration test suite (`tests/signed_events_chain_v34.rs`) can
 // invoke `migrate_v34_backfill_chain` directly to exercise the
