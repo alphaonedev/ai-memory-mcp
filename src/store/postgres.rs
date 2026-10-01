@@ -26756,9 +26756,9 @@ impl MemoryStore for PostgresStore {
         if ids.is_empty() {
             return Ok(());
         }
-        // Touch ops (atomic): increment access_count, extend TTL
-        // (1h short / 1d mid), auto-promote mid→long at 5 accesses,
-        // increment priority every 10 accesses.
+        // Touch ops (atomic): increment access_count and extend the TTL
+        // floor (1h short / 1d mid). No tier promotion and no priority
+        // ladder since v1.0.0 Boids item 1 (see the SQL notes below).
         //
         // Wave-2 Tier-A4 (#852) — collapsed three sequential UPDATEs
         // into a single statement with CASE expressions. The previous
