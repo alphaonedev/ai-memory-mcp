@@ -377,6 +377,23 @@ const CRASH_BEFORE_MARK: &str = "before-mark";
 const CRASH_AFTER_MARK: &str = "after-mark";
 const CRASH_AFTER_TRUNCATE: &str = "after-truncate";
 
+/// #4332 — test seam: run between `verify_chain`'s snapshot and its walk,
+/// i.e. while a real verify is in progress, to prove the trail lock is free.
+#[cfg(test)]
+#[allow(clippy::type_complexity)]
+static VERIFY_AFTER_SNAPSHOT_FOR_TEST: Mutex<Option<Box<dyn FnMut() + Send>>> = Mutex::new(None);
+
+#[cfg(test)]
+fn verify_after_snapshot() {
+    let hook = VERIFY_AFTER_SNAPSHOT_FOR_TEST
+        .lock()
+        .ok()
+        .and_then(|mut g| g.take());
+    if let Some(mut hook) = hook {
+        hook();
+    }
+}
+
 /// #4298 — test seam: when set, each crash point copies the trail and its
 /// high-water mark into `<dir>/<point>/`, i.e. exactly what a process killed
 /// at that point leaves on disk, so a cell can verify every such state.
@@ -1662,21 +1679,43 @@ pub fn verify_chain(path: &Path) -> Result<VerifyReport> {
     // #4299: every writer holds the EXCLUSIVE trail lock across its
     // write-ahead mark and its append, so for that moment the mark names a
     // number whose line is not written yet. A SHARED lock here makes verify
-    // wait that moment out instead of reporting it as a gap; it is held
-    // across the walk AND the mark read. Best effort: a filesystem without
-    // locks still verifies.
+    // wait that moment out instead of reporting it as a gap. Best effort: a
+    // filesystem without locks still verifies.
+    //
+    // #4332: the lock is held only for a consistent SNAPSHOT, the trail's
+    // length and the mark, never for the walk. While it is held no writer is
+    // between its write-ahead and its append, so the two agree. The walk then
+    // reads exactly that prefix with the lock released: holding it for the
+    // whole walk stalled every audited operation (and back-to-back verifies
+    // starved the writer, since a shared lock is not fair to an exclusive
+    // waiter). Lines appended after the snapshot are simply not in this
+    // verify; the mark it compares with is the one from the same snapshot.
     let lock = File::open(path).with_context(|| crate::errors::msg::opening(path.display()))?;
-    let _ = lock.lock_shared();
     let file = File::open(path).with_context(|| crate::errors::msg::opening(path.display()))?;
+    let _ = lock.lock_shared();
+    let snapshot = file
+        .metadata()
+        .with_context(|| crate::errors::msg::opening(path.display()))
+        .and_then(|meta| {
+            // #4086: numbers recorded as consumed past the last written line
+            // are events lost at the tail (possibly just before a restart).
+            // Reported as a gap like any interior one, INCLUDING on an empty
+            // trail: a mark above 0 is evidence that events were numbered,
+            // so a trail whose every event was lost (a disk full from the
+            // first write) is the gap 1..=mark, never clean. An empty trail
+            // with no mark is clean: nothing was numbered.
+            Ok((
+                meta.len(),
+                read_seq_mark(&seq_mark_path(path))?.unwrap_or(0),
+            ))
+        });
+    let _ = lock.unlock();
+    drop(lock);
+    let (len, high_water) = snapshot?;
+    #[cfg(test)]
+    verify_after_snapshot();
     let mut last_sequence = 0;
-    let mut report = walk_chain(file, &mut last_sequence)?;
-    // #4086: numbers recorded as consumed past the last written line are
-    // events lost at the tail (possibly just before a restart). Reported as a
-    // gap like any interior one, INCLUDING on an empty trail: a mark above 0
-    // is evidence that events were numbered, so a trail whose every event was
-    // lost (a disk full from the first write) is the gap 1..=mark, never
-    // clean. An empty trail with no mark is clean: nothing was numbered.
-    let high_water = read_seq_mark(&seq_mark_path(path))?.unwrap_or(0);
+    let mut report = walk_chain(file.take(len), &mut last_sequence)?;
     let chain_intact = report
         .first_failure
         .as_ref()
@@ -2129,6 +2168,9 @@ mod crash_window_4298_tests;
 
 #[cfg(test)]
 mod write_ahead_4299_tests;
+
+#[cfg(test)]
+mod verify_snapshot_4332_tests;
 
 #[cfg(test)]
 mod tests {
