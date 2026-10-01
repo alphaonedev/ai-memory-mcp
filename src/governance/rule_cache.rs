@@ -40,7 +40,8 @@
 //!
 //! ## Cache shape
 //!
-//! - `by_kind: RwLock<HashMap<String, Arc<Vec<Rule>>>>` keyed on the
+//! - `by_kind: RwLock<HashMap<String, CachedKind>>` (rules + the #4044
+//!   policy version they were read under, one snapshot) keyed on the
 //!   canonical kind strings emitted by `AgentAction::kind()`
 //!   (`"bash"`, `"filesystem_write"`, `"network_request"`,
 //!   `"process_spawn"`, `"custom:<discriminator>"`).
@@ -96,7 +97,18 @@ use std::sync::{Arc, RwLock};
 
 use rusqlite::Connection;
 
+use crate::governance::policy_version::PolicyVersion;
 use crate::governance::rules_store::Rule;
+
+/// #4044 — one cached kind: the enabled rules AND the policy version they
+/// were read under, loaded in ONE read snapshot
+/// ([`crate::governance::policy_version::load_rules_with_policy_version`]).
+/// A verdict evaluated by `rules` names `policy`, never a version read later.
+#[derive(Debug, Clone)]
+struct CachedKind {
+    rules: Arc<Vec<Rule>>,
+    policy: PolicyVersion,
+}
 
 /// v0.7.0 #1020 (Agent-1 #6) — typed error for the substrate-public
 /// [`RuleCache::get_or_load`] surface. Per CLAUDE.md #964
@@ -182,7 +194,7 @@ impl RuleCacheError {
 /// `Arc<Vec<Rule>>` clone — no row data is cloned on the fast path.
 #[derive(Debug, Default)]
 pub struct RuleCache {
-    by_kind: RwLock<HashMap<String, Arc<Vec<Rule>>>>,
+    by_kind: RwLock<HashMap<String, CachedKind>>,
 }
 
 impl RuleCache {
@@ -220,39 +232,53 @@ impl RuleCache {
         conn: &Connection,
         kind: &str,
     ) -> std::result::Result<Arc<Vec<Rule>>, RuleCacheError> {
+        self.get_or_load_attributed(conn, kind)
+            .map(|(rules, _)| rules)
+    }
+
+    /// #4044 — [`Self::get_or_load`] plus the [`PolicyVersion`] the returned
+    /// rules were read under. The pair is loaded in ONE read snapshot on a
+    /// miss and cached together, so it can never mix two policy versions.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::get_or_load`].
+    pub fn get_or_load_attributed(
+        &self,
+        conn: &Connection,
+        kind: &str,
+    ) -> std::result::Result<(Arc<Vec<Rule>>, PolicyVersion), RuleCacheError> {
         // Fast path: hold the read lock for the lookup + clone of
         // the Arc; drop the guard before any further work.
-        if let Some(rules) = self
+        if let Some(hit) = self
             .by_kind
             .read()
             .ok()
             .and_then(|guard| guard.get(kind).cloned())
         {
-            return Ok(rules);
+            return Ok((hit.rules, hit.policy));
         }
         // Slow path: load + insert under the write lock. The Arc<Vec>
         // we return is cloned from the inserted entry so a concurrent
         // invalidate after this insert doesn't strand our caller with
         // a dropped snapshot.
-        let rules = crate::governance::rules_store::list_enabled_by_kind(conn, kind)
-            .map_err(RuleCacheError::Load)?;
-        let arc = Arc::new(rules);
+        let (rules, policy) =
+            crate::governance::policy_version::load_rules_with_policy_version(conn, kind)
+                .map_err(RuleCacheError::Load)?;
+        let loaded = CachedKind {
+            rules: Arc::new(rules),
+            policy,
+        };
         if let Ok(mut guard) = self.by_kind.write() {
             // #1019 — check for an existing entry first (e.g., the
             // loser of a race) BEFORE allocating a fresh String via
-            // `kind.to_string()`. Pre-#1019 the `entry(kind.to_string())`
-            // call allocated on every slow-path invocation, including
-            // the race-loser case where the allocated String was
-            // immediately dropped. The contains_key probe avoids the
-            // allocation entirely on the common race-loser path.
+            // `kind.to_string()`.
             if let Some(existing) = guard.get(kind) {
-                return Ok(Arc::clone(existing));
+                return Ok((Arc::clone(&existing.rules), existing.policy));
             }
             // No race — we're the first to insert.
-            let entry = guard
-                .entry(kind.to_string())
-                .or_insert_with(|| Arc::clone(&arc));
-            return Ok(Arc::clone(entry));
+            let entry = guard.entry(kind.to_string()).or_insert(loaded);
+            return Ok((Arc::clone(&entry.rules), entry.policy));
         }
         // v0.7.0 #1020 — RwLock poison surfaces as a typed
         // `RuleCacheError::Poisoned`. The legacy fallback returned
@@ -338,6 +364,16 @@ mod tests {
     use super::*;
     use crate::governance::rules_store::Rule;
 
+    fn cached(rules: Arc<Vec<Rule>>) -> CachedKind {
+        CachedKind {
+            rules,
+            policy: PolicyVersion {
+                seq: 0,
+                digest: [0; 32],
+            },
+        }
+    }
+
     fn sample_rule(id: &str, kind: &str) -> Rule {
         Rule {
             id: id.to_string(),
@@ -361,11 +397,11 @@ mod tests {
             let mut g = cache.by_kind.write().unwrap();
             g.insert(
                 "bash".to_string(),
-                Arc::new(vec![sample_rule("r1", "bash")]),
+                cached(Arc::new(vec![sample_rule("r1", "bash")])),
             );
             g.insert(
                 "filesystem_write".to_string(),
-                Arc::new(vec![sample_rule("r2", "filesystem_write")]),
+                cached(Arc::new(vec![sample_rule("r2", "filesystem_write")])),
             );
         }
         assert_eq!(cache.len(), 2);
@@ -381,11 +417,11 @@ mod tests {
             let mut g = cache.by_kind.write().unwrap();
             g.insert(
                 "bash".to_string(),
-                Arc::new(vec![sample_rule("r1", "bash")]),
+                cached(Arc::new(vec![sample_rule("r1", "bash")])),
             );
             g.insert(
                 "filesystem_write".to_string(),
-                Arc::new(vec![sample_rule("r2", "filesystem_write")]),
+                cached(Arc::new(vec![sample_rule("r2", "filesystem_write")])),
             );
         }
         cache.invalidate("bash");
@@ -408,7 +444,7 @@ mod tests {
             let mut g = cache_a.by_kind.write().unwrap();
             g.insert(
                 "filesystem_write".to_string(),
-                Arc::new(vec![sample_rule("peer-a-r", "filesystem_write")]),
+                cached(Arc::new(vec![sample_rule("peer-a-r", "filesystem_write")])),
             );
         }
         assert_eq!(cache_a.len(), 1);
@@ -458,7 +494,7 @@ mod tests {
                 .by_kind
                 .write()
                 .unwrap()
-                .insert("bash".to_string(), entry);
+                .insert("bash".to_string(), cached(entry));
             assert!(weak.upgrade().is_some(), "entry alive while cache alive");
         }
         // `cache` dropped → its `HashMap` dropped → the inner

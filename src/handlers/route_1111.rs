@@ -244,13 +244,28 @@ pub async fn handle_smart_load_http(
     if matches!(app.storage_backend, StorageBackend::Postgres) {
         return smart_load_http_via_store(&app, &headers, &body).await;
     }
+    // #4089 (rust-1.98 CONCURRENCY-22) — route the intent BEFORE taking the
+    // DB lock and OFF this worker: with an embedder the pick embeds the
+    // intent AND every family descriptor (CPU-bound forward passes), which
+    // pre-#4089 ran inline on this worker while holding the single shared
+    // `Mutex<Connection>`. Only the read runs under the lock. Same parse,
+    // same `intent is required` refusal and same trim as `handle_smart_load`.
+    let Some(intent_raw) = body["intent"].as_str() else {
+        return err_response(crate::mcp::load_family::INTENT_REQUIRED.to_string());
+    };
+    let intent = intent_raw.trim();
+    let (family, score, source) =
+        super::embed_offload::pick_family_for_intent(app.embedder.as_ref().as_ref(), intent).await;
     let lock = app.db.lock().await;
-    let embedder = app
-        .embedder
-        .as_ref()
-        .as_ref()
-        .map(|e| e as &dyn crate::embeddings::Embed);
-    let result = crate::mcp::handle_smart_load(&lock.0, &body, embedder, Some(caller.as_str()));
+    let result = crate::mcp::load_family::forward_to_load_family(
+        &lock.0,
+        family,
+        score,
+        source,
+        intent,
+        &body,
+        Some(caller.as_str()),
+    );
     drop(lock);
     match result {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
@@ -285,7 +300,7 @@ async fn smart_load_http_via_store(
     body: &Value,
 ) -> axum::response::Response {
     let Some(intent_raw) = body["intent"].as_str() else {
-        return err_response("intent is required".to_string());
+        return err_response(crate::mcp::load_family::INTENT_REQUIRED.to_string());
     };
     let intent = intent_raw.trim();
     let namespace = body
@@ -302,12 +317,11 @@ async fn smart_load_http_via_store(
         .unwrap_or(20);
     let k = usize::try_from(k_raw).unwrap_or(usize::MAX).clamp(1, 100);
 
-    let embedder = app
-        .embedder
-        .as_ref()
-        .as_ref()
-        .map(|e| e as &dyn crate::embeddings::Embed);
-    let (family, score, source) = crate::mcp::pick_family_for_intent(intent, embedder);
+    // #4089 (rust-1.98 CONCURRENCY-22) — the embedder vote inside
+    // `pick_family_for_intent` is CPU-bound; it runs on the blocking pool,
+    // never inline on this worker (`embed_offload`).
+    let (family, score, source) =
+        super::embed_offload::pick_family_for_intent(app.embedder.as_ref().as_ref(), intent).await;
     let family_name = family.name();
     tracing::info!(
         target: crate::mcp::load_family::SMART_LOAD_LOG_TARGET,
@@ -546,13 +560,53 @@ pub async fn handle_reflect_http(
         )
             .into_response();
     }
+    // #4089 (rust-1.98 CONCURRENCY-22) — precompute the reflection embedding
+    // BEFORE taking the DB + vector-index locks: title and content are both
+    // required params so the document text is known pre-write, and the
+    // forward pass must not hold either lock (or this worker). When the
+    // precompute is attempted the callee gets `embedder: None`, so a failed
+    // precompute commits vectorless instead of being retried inline under
+    // the locks; when there is nothing to precompute (missing text or no
+    // embedder) the arguments pass through exactly as before.
+    let reflect_text: Option<String> = match (
+        body.get("title").and_then(Value::as_str),
+        body.get("content").and_then(Value::as_str),
+    ) {
+        (Some(title), Some(content)) => Some(crate::embeddings::embedding_document(title, content)),
+        _ => None,
+    };
+    let (embedder, precomputed_embedding): (
+        Option<&dyn crate::embeddings::Embed>,
+        Option<(Vec<f32>, String)>,
+    ) = match (reflect_text, app.embedder.as_ref().as_ref()) {
+        (Some(text), Some(emb)) => {
+            let space = emb.space_fingerprint();
+            match super::embed_offload::embed_document(
+                crate::metrics::EMBED_SURFACE_REFLECT,
+                emb,
+                text,
+            )
+            .await
+            {
+                Some(Ok(vector)) => (None, Some((vector, space))),
+                Some(Err(e)) => {
+                    tracing::warn!("failed to generate embedding for reflection: {e} (#4089)");
+                    (None, None)
+                }
+                // `embed_offload` already warned + counted (surface `reflect`).
+                None => (None, None),
+            }
+        }
+        _ => (
+            app.embedder
+                .as_ref()
+                .as_ref()
+                .map(|e| e as &dyn crate::embeddings::Embed),
+            None,
+        ),
+    };
     let lock = app.db.lock().await;
     let db_path = lock.1.clone();
-    let embedder = app
-        .embedder
-        .as_ref()
-        .as_ref()
-        .map(|e| e as &dyn crate::embeddings::Embed);
     let vec_lock = app.vector_index.lock().await;
     // v0.9 #1005 — deref through the boxed seam to the trait object.
     let vector_index = vec_lock.as_deref();
@@ -570,6 +624,7 @@ pub async fn handle_reflect_http(
         // #3423 — the authenticated principal owns the reflection, exactly as
         // on the postgres branch above.
         authenticated_caller.as_deref(),
+        precomputed_embedding,
     );
     drop(vec_lock);
     // #3638 — the sqlite path runs the write-admission gate inside the shared

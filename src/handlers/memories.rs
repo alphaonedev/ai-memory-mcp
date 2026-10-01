@@ -651,7 +651,9 @@ async fn update_memory_write(
         }
     };
 
-    let lock = state.lock().await;
+    // #4089 — an OWNED guard, so the post-write embedding regeneration below
+    // can move it into its blocking-pool task (see `regenerate_embedding`).
+    let lock = state.lock_owned().await;
     // Resolve prefix if exact ID not found
     let resolved_id = match db::resolve_id(&lock.0, &id) {
         Ok(Some(mem)) => mem.id,
@@ -777,50 +779,45 @@ async fn update_memory_write(
         }
         None => None,
     };
-    match db::update_with_expected_version(
-        &lock.0,
-        &resolved_id,
-        body.title.as_deref(),
-        body.content.as_deref(),
-        body.tier.as_ref(),
-        body.namespace.as_deref(),
-        body.tags.as_ref(),
-        body.priority,
-        body.confidence,
-        body.expires_at.as_deref(),
-        preserved_metadata.as_ref(),
-        body.source_uri.as_deref(),
-        if_match_version,
-        // v1.0.0 #1834 — opt-in valid_until patch (valid_from immutable).
-        body.valid_until.as_deref(),
-    ) {
-        Ok((true, _)) => {
-            // v0.8.0 Pillar 2 (#1726) — apply an optional lifecycle
-            // transition through the self-validating storage primitive. An
-            // illegal edge surfaces as a typed `InvalidTransition` → 409
-            // CONFLICT (byte-parity error detail with the postgres branch's
-            // `StoreError::InvalidTransition`); a request equal to the stored
-            // state is an idempotent no-op. `body.lifecycle_state` was already
-            // shape-validated by `validate_update` above.
-            if let Some(target) = body
+    // #3152 — the patch and the optional lifecycle transition are ONE write
+    // transaction (both storage primitives join it), so an illegal edge or a
+    // crash between them leaves the row exactly as it was.
+    let unit = db::in_write_txn(&lock.0, || {
+        let res = db::update_with_expected_version(
+            &lock.0,
+            &resolved_id,
+            body.title.as_deref(),
+            body.content.as_deref(),
+            body.tier.as_ref(),
+            body.namespace.as_deref(),
+            body.tags.as_ref(),
+            body.priority,
+            body.confidence,
+            body.expires_at.as_deref(),
+            preserved_metadata.as_ref(),
+            body.source_uri.as_deref(),
+            if_match_version,
+            // v1.0.0 #1834 — opt-in valid_until patch (valid_from immutable).
+            body.valid_until.as_deref(),
+        )?;
+        // v0.8.0 Pillar 2 (#1726) — apply an optional lifecycle transition
+        // through the self-validating storage primitive. An illegal edge
+        // surfaces as a typed `InvalidTransition` (→ 409 below); a request
+        // equal to the stored state is an idempotent no-op.
+        // `body.lifecycle_state` was already shape-validated by
+        // `validate_update` above.
+        if res.0
+            && let Some(target) = body
                 .lifecycle_state
                 .as_deref()
                 .and_then(crate::models::LifecycleState::from_str)
-                && let Err(e) = db::set_lifecycle_state(&lock.0, &resolved_id, target)
-            {
-                if let Some(it) = e.downcast_ref::<crate::storage::InvalidTransition>() {
-                    return (
-                        StatusCode::CONFLICT,
-                        Json(json!({
-                            "status": "conflict",
-                            "id": resolved_id,
-                            "error": it.to_string(),
-                        })),
-                    )
-                        .into_response();
-                }
-                return crate::handlers::errors::handler_error_500(&e);
-            }
+        {
+            db::set_lifecycle_state(&lock.0, &resolved_id, target)?;
+        }
+        Ok(res)
+    });
+    match unit {
+        Ok((true, _)) => {
             let mem = db::get(&lock.0, &resolved_id).ok().flatten();
             // Issue #219: regenerate the embedding when the searchable text
             // (title/content) changed. Without this, the semantic index keeps
@@ -828,34 +825,20 @@ async fn update_memory_write(
             // linger even after the row is updated.
             let content_changed = body.title.is_some() || body.content.is_some();
             let mut lock_opt = Some(lock);
-            if content_changed && let Some(ref m) = mem {
+            if content_changed
+                && let Some(ref m) = mem
+                && let Some(emb) = app.embedder.as_ref().as_ref()
+                && let Some(guard) = lock_opt.take()
+            {
                 let text = crate::embeddings::embedding_document(&m.title, &m.content);
-                if let Some(emb) = app.embedder.as_ref().as_ref() {
-                    match emb.embed(&text) {
-                        Ok(vec) => {
-                            if let Some(ref l) = lock_opt
-                                && let Err(e) = db::set_embedding(
-                                    &l.0,
-                                    &resolved_id,
-                                    &vec,
-                                    &emb.space_fingerprint(),
-                                )
-                            {
-                                tracing::warn!(
-                                    "failed to refresh embedding for {resolved_id}: {e}"
-                                );
-                            }
-                            // Drop DB lock before touching vector index.
-                            lock_opt.take();
-                            let mut idx_lock = app.vector_index.lock().await;
-                            if let Some(idx) = idx_lock.as_mut() {
-                                idx.remove(&resolved_id);
-                                idx.insert(resolved_id.clone(), vec);
-                            }
-                        }
-                        Err(e) => tracing::warn!("embedding regeneration failed: {e}"),
-                    }
-                }
+                regenerate_embedding(
+                    guard,
+                    emb.clone(),
+                    text,
+                    resolved_id.clone(),
+                    std::sync::Arc::clone(&app.vector_index),
+                )
+                .await;
             }
             // Drop the DB lock before fanning out — peers POST back to
             // our sync_push so we'd deadlock if we held it.
@@ -896,6 +879,21 @@ async fn update_memory_write(
             if let Some((ref owner, ref ns, delta)) = quota_charge {
                 let _ = crate::quotas::refund_storage_only(&lock.0, owner, ns, delta);
             }
+            // #1726 — an illegal lifecycle edge is a 409 CONFLICT (byte-parity
+            // error detail with the postgres branch's
+            // `StoreError::InvalidTransition`). #3152 — the patch rolled back
+            // with it, so the refund above is for bytes that never landed.
+            if let Some(it) = e.downcast_ref::<crate::storage::InvalidTransition>() {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(json!({
+                        "status": "conflict",
+                        "id": resolved_id,
+                        "error": it.to_string(),
+                    })),
+                )
+                    .into_response();
+            }
             // v0.7.0 Provenance Gap 1 (#884) — typed VersionConflict
             // surfaces as 409 with a structured envelope naming both
             // expected + current versions so callers can re-read and
@@ -930,6 +928,66 @@ async fn update_memory_write(
             crate::handlers::errors::handler_error_500(&e)
         }
     }
+}
+
+/// Issue #219 + #4089 — regenerate the embedding of a row whose searchable
+/// text (title/content) an update just changed, OFF the runtime worker and
+/// CANCELLATION-SAFE.
+///
+/// The embed is a CPU-bound forward pass (rust-1.98 CONCURRENCY-22), so it
+/// runs on the blocking pool. The row's new text is ALREADY committed when
+/// this runs, and the old vector is still stored against it, so the embed
+/// and its `set_embedding` must not be separable by an `.await`: if the
+/// request future were dropped there (client disconnect), the row would keep
+/// the OLD vector for its NEW text and semantic recall would rank it WRONG.
+/// The whole unit (embed, `set_embedding`, release the DB guard, vector
+/// index refresh) therefore runs inside ONE blocking task, which tokio runs
+/// to completion even when the awaiting handler is dropped (CONCURRENCY-23).
+/// The DB guard moves in with it, so no concurrent update can interleave a
+/// stale vector between the text write and the vector write — the same
+/// serialisation the pre-#4089 inline path had, without pinning a worker.
+///
+/// An embed failure keeps the pre-#4089 behaviour (WARN, row keeps its prior
+/// vector). A task that did not complete is WARNed + counted by
+/// `embed_offload` (surface `update`).
+async fn regenerate_embedding(
+    guard: tokio::sync::OwnedMutexGuard<(
+        rusqlite::Connection,
+        std::path::PathBuf,
+        crate::config::ResolvedTtl,
+        bool,
+    )>,
+    emb: crate::embeddings::Embedder,
+    text: String,
+    id: String,
+    vector_index: std::sync::Arc<
+        tokio::sync::Mutex<Option<Box<dyn crate::hnsw::VectorSearchIndex>>>,
+    >,
+) {
+    let _ =
+        super::embed_offload::on_blocking_pool(crate::metrics::EMBED_SURFACE_UPDATE, move || {
+            let vector = match emb.embed(&text) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!("embedding regeneration failed: {e}");
+                    return;
+                }
+            };
+            if let Err(e) = db::set_embedding(&guard.0, &id, &vector, &emb.space_fingerprint()) {
+                tracing::warn!("failed to refresh embedding for {id}: {e}");
+            }
+            // Drop the DB guard before touching the vector index (lock order:
+            // never hold both).
+            drop(guard);
+            // A blocking-pool thread is not an async context, so the
+            // synchronous acquire is the correct form here.
+            let mut idx_lock = vector_index.blocking_lock();
+            if let Some(idx) = idx_lock.as_mut() {
+                idx.remove(&id);
+                idx.insert(id, vector);
+            }
+        })
+        .await;
 }
 
 #[allow(clippy::too_many_lines)]

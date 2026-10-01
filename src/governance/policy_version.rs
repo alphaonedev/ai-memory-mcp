@@ -120,16 +120,78 @@ fn policy_advance_count(conn: &Connection) -> Result<i64> {
     Ok(count)
 }
 
+/// #4044 — run `read` against ONE consistent read snapshot of `conn`.
+///
+/// When `conn` is in autocommit mode, every statement is its own implicit
+/// transaction, so two reads can straddle another connection's (or another
+/// PROCESS's) committed signed rule change: a rule set from policy P0 paired
+/// with the sequence/digest of P1, or a P0 sequence paired with a P1 digest.
+/// Here the reads run inside one `BEGIN DEFERRED` transaction: SQLite pins
+/// the read snapshot at the first read (WAL) or holds the SHARED lock
+/// (rollback journal) until the end, so every read inside `read` observes the
+/// same committed state. The transaction is read-only and ends with a
+/// `COMMIT` (a `ROLLBACK` on error, via `Drop`).
+///
+/// When the caller already holds a transaction on `conn`, its reads are
+/// already one snapshot, so `read` runs directly on it.
+///
+/// # Errors
+///
+/// Propagates the error from `read` and any BEGIN/COMMIT failure.
+pub fn with_read_snapshot<T>(
+    conn: &Connection,
+    read: impl FnOnce(&Connection) -> Result<T>,
+) -> Result<T> {
+    if !conn.is_autocommit() {
+        return read(conn);
+    }
+    let tx = conn
+        .unchecked_transaction()
+        .context("policy_version::with_read_snapshot: BEGIN")?;
+    let out = read(&tx)?;
+    tx.commit()
+        .context("policy_version::with_read_snapshot: COMMIT")?;
+    Ok(out)
+}
+
+/// The sequence and digest read on `conn` as-is: the caller guarantees the
+/// two reads share one snapshot (see [`with_read_snapshot`]).
+fn policy_version_in_snapshot(conn: &Connection) -> Result<PolicyVersion> {
+    Ok(PolicyVersion {
+        seq: policy_advance_count(conn)?,
+        digest: compute_policy_digest(conn)?,
+    })
+}
+
 /// The current policy version: `seq` = live count of advance events,
 /// `digest` = live whole-ruleset digest.
+///
+/// #4044 — both are read in ONE snapshot ([`with_read_snapshot`]), so the
+/// pair always names a single committed policy, never a sequence from one
+/// version and a digest from the next.
 ///
 /// # Errors
 ///
 /// Propagates SQLite / canonicalisation errors.
 pub fn current_policy_version(conn: &Connection) -> Result<PolicyVersion> {
-    Ok(PolicyVersion {
-        seq: policy_advance_count(conn)?,
-        digest: compute_policy_digest(conn)?,
+    with_read_snapshot(conn, policy_version_in_snapshot)
+}
+
+/// #4044 — load the enabled rules of `kind` AND the policy version they
+/// belong to in ONE read snapshot, so a verdict evaluated by these rules can
+/// truthfully name the policy that evaluated it.
+///
+/// # Errors
+///
+/// Propagates SQLite / signature-verify / canonicalisation errors.
+pub fn load_rules_with_policy_version(
+    conn: &Connection,
+    kind: &str,
+) -> Result<(Vec<crate::governance::rules_store::Rule>, PolicyVersion)> {
+    with_read_snapshot(conn, |c| {
+        let rules = crate::governance::rules_store::list_enabled_by_kind(c, kind)?;
+        let pv = policy_version_in_snapshot(c)?;
+        Ok((rules, pv))
     })
 }
 

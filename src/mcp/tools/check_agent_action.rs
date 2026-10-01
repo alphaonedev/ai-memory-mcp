@@ -22,7 +22,7 @@
 
 use serde_json::{Value, json};
 
-use crate::governance::agent_action::{AgentAction, action_kinds as ak, check_agent_action};
+use crate::governance::agent_action::{AgentAction, action_kinds as ak};
 use crate::mcp::param_names;
 
 /// Default `agent_id` echoed back when the caller (MCP or CLI) does
@@ -102,6 +102,23 @@ pub fn run_check(
     kind: &str,
     action: &AgentAction,
 ) -> Result<Value, String> {
+    run_check_attributed(conn, agent_id, kind, action).map(|(envelope, _)| envelope)
+}
+
+/// #4044 — [`run_check`] that also returns the governance policy version
+/// that EVALUATED the verdict (read in the same snapshot as the rules). A
+/// caller that signs a further artefact about the verdict (the CLI stopper
+/// enforcement anchor) binds THIS version instead of re-reading it.
+///
+/// # Errors
+///
+/// Same as [`run_check`].
+pub fn run_check_attributed(
+    conn: &rusqlite::Connection,
+    agent_id: &str,
+    kind: &str,
+    action: &AgentAction,
+) -> Result<(Value, crate::governance::policy_version::PolicyVersion), String> {
     // v0.7.0 #1023 (Agent-1 #9) — MCP-side `memory_check_agent_action`
     // intentionally uses the un-cached entry point. The MCP server
     // runs as a SEPARATE process from the HTTP daemon (stdio
@@ -131,13 +148,18 @@ pub fn run_check(
     // the CLI `governance check-action` reuse of this funnel — the CLI
     // process never installs the gate).
     crate::mcp::consult_pre_governance_decision_gate("", kind, agent_id, None)?;
-    let decision = check_agent_action(conn, agent_id, action)
-        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("check_agent_action", e))?;
-    Ok(json!({
-        "decision": decision,
-        "kind": kind,
-        "agent_id": agent_id,
-    }))
+    let (decision, policy) = crate::governance::agent_action::check_agent_action_attributed(
+        conn, None, agent_id, action,
+    )
+    .map_err(|e| crate::mcp::error_text::mcp_foreign_err("check_agent_action", e))?;
+    Ok((
+        json!({
+            "decision": decision,
+            "kind": kind,
+            "agent_id": agent_id,
+        }),
+        policy,
+    ))
 }
 
 /// Build an [`AgentAction`] from the MCP/CLI JSON arg-bag for the

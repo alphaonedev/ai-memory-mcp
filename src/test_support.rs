@@ -467,6 +467,35 @@ pub(crate) fn tls_test_client(timeout: std::time::Duration) -> reqwest::Client {
         .expect("TLS test client")
 }
 
+/// v1.0.0 #3152 — run THIS test binary again as a child that executes
+/// exactly `test` (its full path inside the lib test binary) with `env` set.
+/// The child starts from a CLEAN environment (the #3550 `publish_3550`
+/// shape), so no parallel test's environment leaks into it, and it never
+/// reads the operator config file. The crate's own `cfg(test)` harness arms
+/// the #3355 key-directory guard by itself, so no key-dir variable is
+/// needed. The spawn goes through the #1937 audited chokepoint (the
+/// `spawn_audit_gate_1937` guard bans a raw process constructor outside
+/// `src/spawn_audit.rs`); its best-effort audit emit is a no-op in a unit
+/// test process, which seeds no spawn-audit database.
+#[cfg(unix)]
+pub(crate) fn spawn_test_child(test: &str, env: &[(&str, &str)]) -> std::process::Output {
+    let mut cmd = crate::spawn_audit::audited_command(
+        std::env::current_exe().expect("lib test binary"),
+        "test_support::spawn_test_child",
+    );
+    cmd.args(["--exact", test, "--test-threads=1", "--nocapture"])
+        .env_clear()
+        // Keep the coverage profiler's sink (cargo llvm-cov sets `LLVM_PROFILE_FILE`
+        // with a %p pid template) so the child's execution is measured, not lost.
+        .envs(std::env::var_os("LLVM_PROFILE_FILE").map(|v| ("LLVM_PROFILE_FILE", v)))
+        .env("TMPDIR", std::env::temp_dir())
+        .env("AI_MEMORY_NO_CONFIG", "1");
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
+    cmd.output().expect("spawn the test child")
+}
+
 #[cfg(test)]
 mod tests {
     use super::{

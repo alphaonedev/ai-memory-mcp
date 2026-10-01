@@ -467,6 +467,15 @@ pub struct Metrics {
     /// WARN is the only channel.
     pub rerank_budget_degraded_total: IntCounter,
 
+    /// #4089 — monotonic count of HTTP-path embed / rerank tasks that ran on
+    /// the blocking pool and did not complete (the closure panicked or the
+    /// runtime was shutting down), labeled by the closed `surface` set
+    /// ([`EMBED_TASK_SURFACES`]). Every such request DEGRADES exactly as an
+    /// embed failure does (vectorless write, keyword recall, pre-rerank
+    /// ordering, keyword routing) or fails closed (`check_duplicate` 503);
+    /// the counter plus the `embed.task.failed` WARN make it observable.
+    pub embed_task_failed_total: IntCounterVec,
+
     /// #2577 — monotonic count of recall query embeddings served from the
     /// process-local cache instead of a remote round trip. Rising with
     /// traffic is the healthy shape (agent fleets repeat queries heavily);
@@ -1310,6 +1319,20 @@ impl Metrics {
             &mut err,
         );
 
+        let embed_task_failed_total = int_counter_vec(
+            &registry,
+            "ai_memory_embed_task_failed_total",
+            "HTTP-path embed/rerank tasks run on the blocking pool that did \
+             not complete (panicked, or the runtime was shutting down), \
+             labeled by surface (#4089). Each such request degraded exactly as \
+             an embed failure does (vectorless write, keyword recall, \
+             pre-rerank ordering, keyword family routing) or failed closed \
+             (check_duplicate 503); never a wrong result. Any increment is a \
+             bug to investigate: the embedder or reranker panicked.",
+            &["surface"],
+            &mut err,
+        );
+
         let query_embed_cache_hits_total = int_counter(
             &registry,
             "ai_memory_query_embed_cache_hits_total",
@@ -1531,6 +1554,7 @@ impl Metrics {
             auth_backoff_episodes_total,
             recall_embed_degraded_total,
             rerank_budget_degraded_total,
+            embed_task_failed_total,
             query_embed_cache_hits_total,
             autotag_enqueued_total,
             autotag_dropped_total,
@@ -1750,6 +1774,57 @@ pub fn inc_recall_embed_degraded() {
 /// channel on MCP stdio (no `/metrics` endpoint there).
 pub fn inc_rerank_budget_degraded() {
     registry().rerank_budget_degraded_total.inc();
+}
+
+/// #4089 — the closed label set of `ai_memory_embed_task_failed_total`.
+/// Bounded by construction: callers pass one of these constants, never a
+/// caller-supplied string.
+pub const EMBED_TASK_SURFACES: &[&str] = &[
+    EMBED_SURFACE_BULK,
+    EMBED_SURFACE_CREATE,
+    EMBED_SURFACE_UPDATE,
+    EMBED_SURFACE_CHECK_DUPLICATE,
+    EMBED_SURFACE_RECALL,
+    EMBED_SURFACE_RERANK,
+    EMBED_SURFACE_SMART_LOAD,
+    EMBED_SURFACE_REFLECT,
+];
+/// `POST /api/v1/memories/bulk` (both backends).
+pub const EMBED_SURFACE_BULK: &str = "bulk";
+/// `POST /api/v1/memories` (both backends).
+pub const EMBED_SURFACE_CREATE: &str = "create";
+/// `PUT /api/v1/memories/{id}` embedding regeneration (sqlite).
+pub const EMBED_SURFACE_UPDATE: &str = "update";
+/// `check_duplicate` (both backends).
+pub const EMBED_SURFACE_CHECK_DUPLICATE: &str = "check_duplicate";
+/// Recall query embedding (both backends).
+pub const EMBED_SURFACE_RECALL: &str = "recall";
+/// Recall cross-encoder rerank (both backends).
+pub const EMBED_SURFACE_RERANK: &str = "rerank";
+/// `memory_smart_load` family pick (both backends).
+pub const EMBED_SURFACE_SMART_LOAD: &str = "smart_load";
+/// `memory_reflect` reflection embedding (sqlite).
+pub const EMBED_SURFACE_REFLECT: &str = "reflect";
+
+/// #4089 — record one blocking-pool embed/rerank task that did not
+/// complete on `surface` (one of [`EMBED_TASK_SURFACES`]). Pairs with the
+/// `embed.task.failed` WARN emitted by
+/// [`crate::embeddings::report_embed_task_failure`].
+pub fn inc_embed_task_failed(surface: &'static str) {
+    registry()
+        .embed_task_failed_total
+        .with_label_values(&[surface])
+        .inc();
+}
+
+/// #4089 — read the counter for one surface. Test-only accessor pinning
+/// the observability wiring.
+#[must_use]
+pub fn embed_task_failed_count(surface: &'static str) -> u64 {
+    registry()
+        .embed_task_failed_total
+        .with_label_values(&[surface])
+        .get()
 }
 
 /// v1.0.0 #2577 — record one recall query embedding served from the

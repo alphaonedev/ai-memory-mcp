@@ -1006,6 +1006,7 @@ pub mod tools {
     pub mod check_agent_action {
         pub use super::super::check_agent_action::{
             DEFAULT_AGENT_ID, build_action, handle_check_agent_action, run_check,
+            run_check_attributed,
         };
     }
 

@@ -1434,6 +1434,10 @@ impl Embedder {
         text: &str,
         budget: Option<std::time::Duration>,
     ) -> Result<Vec<f32>> {
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(out) = self.test_hold_intercept_one(text) {
+            return out;
+        }
         match self {
             Self::Local { .. } => self.embed_with_role(text, EmbedRole::Query),
             Self::Ollama {
@@ -1462,6 +1466,10 @@ impl Embedder {
     /// role-specific task-instruction prefix required by
     /// nomic-embed-text-v1.5 (#1520).
     pub fn embed_with_role(&self, text: &str, role: EmbedRole) -> Result<Vec<f32>> {
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(out) = self.test_hold_intercept_one(text) {
+            return out;
+        }
         match self {
             Self::Local {
                 model,
@@ -1495,6 +1503,30 @@ impl Embedder {
                 result
             }
         }
+    }
+
+    /// #4089 — route an embed through [`test_hold_hook`] when this is an
+    /// armed test embedder; `None` for every other embedder.
+    #[cfg(any(test, feature = "test-support"))]
+    fn test_hold_intercept(&self, texts: &[&str]) -> Option<Result<Vec<Vec<f32>>>> {
+        match self {
+            Self::Ollama {
+                model_name, dim, ..
+            } => test_hold_hook::intercept(model_name, *dim, texts),
+            Self::Local { .. } => None,
+        }
+    }
+
+    /// Single-input form of [`Self::test_hold_intercept`].
+    #[cfg(any(test, feature = "test-support"))]
+    fn test_hold_intercept_one(&self, text: &str) -> Option<Result<Vec<f32>>> {
+        self.test_hold_intercept(&[text]).map(|out| {
+            out.and_then(|v| {
+                v.into_iter()
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("test hold hook returned no vector"))
+            })
+        })
     }
 
     /// Whether the configured remote embed model uses nomic-style
@@ -1615,6 +1647,10 @@ impl Embedder {
     pub fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
         if texts.is_empty() {
             return Ok(Vec::new());
+        }
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(out) = self.test_hold_intercept(texts) {
+            return out;
         }
         match self {
             Self::Local {
@@ -2979,6 +3015,11 @@ mod tests {
         );
     }
 }
+
+/// #4089 — test-only stand-in for a CPU-bound model forward pass; see the
+/// module docs.
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_hold_hook;
 
 #[cfg(test)]
 #[allow(

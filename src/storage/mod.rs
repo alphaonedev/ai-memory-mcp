@@ -961,6 +961,8 @@ pub use connection::open_read_only;
 pub use connection::{MISSING_DATABASE_REFUSAL, open_existing_read_only};
 // v1.0.0 #2445 — the EGRESS + guard surface (see `schema_guard` module docs).
 pub use connection::{assert_schema_not_ahead, open_unmigrated, probe_schema_stamp};
+// v1.0.0 #3152 — one write transaction for a multi-statement logical write.
+pub use connection::in_write_txn;
 // #1579 B7 — mmap_size knob. `set_db_mmap_size` is the boot-time
 // seeding hook (`daemon_runtime::run`); the DEFAULT const is the
 // compiled fallback the `AppConfig::resolve_storage()` ladder bottoms
@@ -4516,14 +4518,9 @@ pub fn update_with_expected_version(
     // transaction", so we open our own tx ONLY when none is active
     // (`is_autocommit()` is true only outside a transaction); when the
     // caller owns the tx, the archive + UPDATE run inside it and the
-    // caller's commit/rollback covers atomicity.
-    let owns_tx = conn.is_autocommit();
-    let write_txn = if owns_tx {
-        Some(connection::WriteTxn::begin(conn)?)
-    } else {
-        None
-    };
-    let txn_result = (|| -> Result<(bool, bool)> {
+    // caller's commit/rollback covers atomicity. #3152 — that join is what
+    // lets a caller fold a lifecycle transition into the SAME transaction.
+    connection::in_write_txn(conn, || -> Result<(bool, bool)> {
         if content_changed {
             archive_memory_insert_only(
                 conn,
@@ -4629,23 +4626,7 @@ pub fn update_with_expected_version(
             }
             Err(e) => Err(e.into()),
         }
-    })();
-    match txn_result {
-        Ok(r) => {
-            if let Some(write_txn) = write_txn {
-                write_txn.commit()?;
-            }
-            Ok(r)
-        }
-        Err(e) => {
-            // Only roll back a tx we opened. When the caller owns the tx,
-            // propagating the Err lets THEIR rollback revert the archive.
-            if let Some(write_txn) = write_txn {
-                write_txn.rollback();
-            }
-            Err(e)
-        }
-    }
+    })
 }
 
 /// v0.7.0 Provenance Gap 5 (issue #888) — append-and-archive result

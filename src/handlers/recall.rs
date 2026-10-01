@@ -376,18 +376,42 @@ pub async fn recall_memories_post(
 /// advertises the stage exactly as the MCP recall path does.
 ///
 /// [`RECALL_MODE_HYBRID_RERANK`]: crate::models::RECALL_MODE_HYBRID_RERANK
-fn maybe_apply_rerank<'m>(
-    reranker: Option<&crate::reranker::BatchedReranker>,
+///
+/// #4089 — the rerank runs on the blocking pool (rust-1.98 CONCURRENCY-22).
+/// The neural forward (`rerank` → `score_pairs`) is CPU-bound candle work;
+/// the coalesced path additionally block-waits on the worker-thread reply
+/// channel. Either way, calling it inline would hold this worker for the
+/// whole rerank, so the call moves onto the blocking pool via a shared
+/// `Arc<BatchedReranker>` (cheap clone; the model weights are already
+/// shared). A panicked or cancelled rerank degrades to the pre-rerank
+/// hybrid ordering with the mode UNCHANGED (never wrong, never a 500) —
+/// the same degrade posture as an embed failure. No `unwrap()` on the join
+/// handle (ERRORS-06).
+async fn maybe_apply_rerank_on_blocking_pool<'m>(
+    reranker: Option<std::sync::Arc<crate::reranker::BatchedReranker>>,
     mode: &'m str,
-    context: &str,
+    context: String,
     pairs: Vec<(crate::models::Memory, f64)>,
 ) -> (Vec<(crate::models::Memory, f64)>, &'m str) {
-    match reranker {
-        Some(ce) if mode == "hybrid" => (
-            ce.rerank(context, pairs),
-            crate::models::RECALL_MODE_HYBRID_RERANK,
-        ),
-        _ => (pairs, mode),
+    let Some(rr) = reranker else {
+        return (pairs, mode);
+    };
+    if mode != "hybrid" {
+        return (pairs, mode);
+    }
+    // Bounded fallback copy: recall caps the candidate set at
+    // `limit.min(50)` rows, so this is small next to the BERT forward it
+    // insures. Returned only when the blocking task never completes.
+    let fallback = pairs.clone();
+    match super::embed_offload::on_blocking_pool(crate::metrics::EMBED_SURFACE_RERANK, move || {
+        rr.rerank(&context, pairs)
+    })
+    .await
+    {
+        Some(scored) => (scored, crate::models::RECALL_MODE_HYBRID_RERANK),
+        // `embed_offload` already emitted the `embed.task.failed` WARN
+        // (surface `rerank`) and counted it.
+        None => (fallback, mode),
     }
 }
 
@@ -478,11 +502,12 @@ async fn recall_response(
         // WARN + the `ai_memory_recall_embed_degraded_total` counter, so a
         // slow provider bounds the read instead of hanging it (and, on the
         // HTTP daemon, instead of holding an admission permit for 30 s).
-        let query_emb: Option<Vec<f32>> = app
-            .embedder
-            .as_ref()
-            .as_ref()
-            .and_then(|emb| crate::embeddings::recall_query_embedding(emb, context));
+        // #4089 (rust-1.98 CONCURRENCY-22) — the funnel is synchronous
+        // (CPU-bound forward / blocking HTTP), so run it on the blocking
+        // pool, never inline on this worker.
+        let query_emb: Option<Vec<f32>> =
+            super::embed_offload::recall_query_embedding(app.embedder.as_ref().as_ref(), context)
+                .await;
         let mode = if query_emb.is_some() {
             crate::models::RECALL_MODE_HYBRID
         } else {
@@ -583,13 +608,16 @@ async fn recall_response(
                 );
                 // #1691 — cross-encoder rerank on the hybrid path
                 // (postgres SAL), mirroring the MCP recall pipeline
-                // (crate::mcp::tools::recall). See [`maybe_apply_rerank`].
-                let (scored_pairs, mode) = maybe_apply_rerank(
-                    app.runtime.reranker().map(std::convert::AsRef::as_ref),
+                // (crate::mcp::tools::recall). See [`maybe_apply_rerank_on_blocking_pool`].
+                // #4089 (rust-1.98 CONCURRENCY-22) — the rerank is
+                // CPU-bound, so it runs on the blocking pool.
+                let (scored_pairs, mode) = maybe_apply_rerank_on_blocking_pool(
+                    app.runtime.reranker().cloned(),
                     mode,
-                    context,
+                    context.to_string(),
                     scored_pairs,
-                );
+                )
+                .await;
                 // v0.7.x Form 6 — apply post-fetch kinds filter on the
                 // postgres SAL branch. OR-of-kinds within the param.
                 let scored_pairs: Vec<_> = match kinds_filter {
@@ -762,11 +790,10 @@ async fn recall_response(
     // and holding the SQLite mutex across it serialises unrelated writes.
     // v1.0.0 #2577 — bounded funnel (cache -> budget -> degrade-to-keyword).
     // See the postgres branch above; the funnel owns the WARN + counter.
-    let query_emb: Option<Vec<f32>> = app
-        .embedder
-        .as_ref()
-        .as_ref()
-        .and_then(|emb| crate::embeddings::recall_query_embedding(emb, context));
+    // #4089 (rust-1.98 CONCURRENCY-22) — the funnel is synchronous, so run
+    // it on the blocking pool, never inline on this worker.
+    let query_emb: Option<Vec<f32>> =
+        super::embed_offload::recall_query_embedding(app.embedder.as_ref().as_ref(), context).await;
 
     // FX-4 / PERF-2 (2026-05-26) — release the DB mutex across the
     // HNSW search + post-recall decoration. Pre-fix the handler held
@@ -1072,14 +1099,17 @@ async fn recall_response(
                 crate::cli::recall::apply_form4_recall_filters(r, has_citations, source_uri_prefix);
             // #1691 — cross-encoder rerank on the hybrid path (sqlite),
             // mirroring the MCP recall pipeline (crate::mcp::tools::recall).
-            // See [`maybe_apply_rerank`]; closes the prior n23
+            // See [`maybe_apply_rerank_on_blocking_pool`]; closes the prior n23
             // "HTTP does NOT run the reranker" gap.
-            let (r, mode) = maybe_apply_rerank(
-                app.runtime.reranker().map(std::convert::AsRef::as_ref),
+            // #4089 (rust-1.98 CONCURRENCY-22) — the rerank is
+            // CPU-bound, so it runs on the blocking pool.
+            let (r, mode) = maybe_apply_rerank_on_blocking_pool(
+                app.runtime.reranker().cloned(),
                 mode,
-                context,
+                context.to_string(),
                 r,
-            );
+            )
+            .await;
             // v0.7.x Form 6 — apply post-fetch kinds filter on the
             // sqlite branch. Cheap because recall already capped
             // r.len() at limit.min(50).
@@ -1197,7 +1227,10 @@ mod issue_1691_rerank_tests {
     //! with the MCP recall pipeline. These pin the gating + mode-flip
     //! logic; the rerank reordering itself is covered by the
     //! `BatchedReranker::rerank` tests in `src/reranker.rs`.
-    use super::maybe_apply_rerank;
+    //!
+    //! #4089 — the wrapper runs the rerank on the blocking pool, so these
+    //! are `tokio::test`s awaiting it.
+    use super::maybe_apply_rerank_on_blocking_pool;
     use crate::models::{Memory, RECALL_MODE_HYBRID_RERANK};
     use crate::reranker::{BatchedReranker, CrossEncoder};
 
@@ -1205,30 +1238,35 @@ mod issue_1691_rerank_tests {
         Vec::new()
     }
 
-    #[test]
-    fn no_reranker_is_noop_even_on_hybrid() {
+    #[tokio::test]
+    async fn no_reranker_is_noop_even_on_hybrid() {
         // Non-autonomous tiers / test scaffolds install no reranker; the
         // mode must NOT flip and the candidate set is returned untouched.
-        let (pairs, mode) = maybe_apply_rerank(None, "hybrid", "ctx", empty());
+        let (pairs, mode) =
+            maybe_apply_rerank_on_blocking_pool(None, "hybrid", "ctx".to_string(), empty()).await;
         assert!(pairs.is_empty());
         assert_eq!(mode, "hybrid", "mode must not flip without a reranker");
     }
 
-    #[test]
-    fn reranker_skipped_on_keyword_mode() {
+    #[tokio::test]
+    async fn reranker_skipped_on_keyword_mode() {
         // Keyword-only recall (no semantic component) is never reranked,
         // even when a reranker is installed.
-        let r = BatchedReranker::new(CrossEncoder::new());
-        let (_, mode) = maybe_apply_rerank(Some(&r), "keyword", "ctx", empty());
+        let r = std::sync::Arc::new(BatchedReranker::new(CrossEncoder::new()));
+        let (_, mode) =
+            maybe_apply_rerank_on_blocking_pool(Some(r), "keyword", "ctx".to_string(), empty())
+                .await;
         assert_eq!(mode, "keyword", "keyword-only recall must not be reranked");
     }
 
-    #[test]
-    fn reranker_flips_mode_on_hybrid() {
+    #[tokio::test]
+    async fn reranker_flips_mode_on_hybrid() {
         // Hybrid path + installed reranker → the envelope advertises the
         // rerank stage via the canonical mode label, matching MCP.
-        let r = BatchedReranker::new(CrossEncoder::new());
-        let (_, mode) = maybe_apply_rerank(Some(&r), "hybrid", "ctx", empty());
+        let r = std::sync::Arc::new(BatchedReranker::new(CrossEncoder::new()));
+        let (_, mode) =
+            maybe_apply_rerank_on_blocking_pool(Some(r), "hybrid", "ctx".to_string(), empty())
+                .await;
         assert_eq!(mode, RECALL_MODE_HYBRID_RERANK);
     }
 }
