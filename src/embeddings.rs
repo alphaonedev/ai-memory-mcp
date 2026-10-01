@@ -1048,7 +1048,12 @@ impl Embedder {
             match Self::download_within(HF_DOWNLOAD_TIMEOUT, Self::download_via_hf_hub) {
                 Ok(paths) => paths,
                 Err(e) => {
-                    eprintln!("ai-memory: hf-hub download failed ({e}), trying fallback dir");
+                    // #4284 — `tracing`, never `eprintln!`: this loader runs on a
+                    // worker thread while CLI verbs (`recall`) hold the
+                    // process-wide stderr lock for their whole run, so a stderr
+                    // write here blocks forever and the verb hangs instead of
+                    // degrading to keyword recall.
+                    tracing::warn!(error = %e, "hf-hub download failed, trying fallback dir");
                     Self::load_from_fallback()?
                 }
             }
@@ -1316,7 +1321,9 @@ impl Embedder {
                 })?;
                 // Ensure the embedding model is pulled
                 if let Err(e) = client.ensure_embed_model(NOMIC_OLLAMA_MODEL) {
-                    eprintln!("ai-memory: warning: failed to pull nomic model: {e}");
+                    // #4284 — `tracing`, not `eprintln!` (see `new_local`): a CLI
+                    // verb holding the stderr lock would deadlock on this write.
+                    tracing::warn!(error = %e, "failed to pull nomic embed model");
                 }
                 Ok(Self::new_ollama(client))
             }
