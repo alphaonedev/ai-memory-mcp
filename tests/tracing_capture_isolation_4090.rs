@@ -69,6 +69,15 @@ const PENDING: &[(&str, &str, &str)] = &[(
 const IMMUNE: &[(&str, &str, &str)] = &[
     (
         "src/logging.rs",
+        "build_log_pipeline",
+        "production fn, not a test: the scoped dispatcher only EMITS the one-shot \
+         unrecognised-sink warning into the pipeline's own sink and reads no \
+         capture back through the callsite-interest cache; a test cannot be \
+         guarded inside production code, and every lib test that reads the \
+         pipeline's output carries its own #4090 guard (#3651, #4090)",
+    ),
+    (
+        "src/logging.rs",
         "filter_admits_3650",
         "writer is io::sink; asserts dispatch.enabled() on synthetic metadata, \
          which never consults the callsite-interest cache (f2r, #4088 review)",

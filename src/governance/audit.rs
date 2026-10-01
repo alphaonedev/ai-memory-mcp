@@ -5967,14 +5967,22 @@ mod tests {
     /// Red on ed111a9eb: 10 ERROR lines for 10 dropped rows.
     #[test]
     fn dropped_rows_log_one_error_per_interval_not_per_row_4310() {
+        // #4090: tracing capture; run alone in a child (callsite-interest cache).
+        if crate::config::run_env_isolated_child_or_spawn(
+            "governance::audit::tests::dropped_rows_log_one_error_per_interval_not_per_row_4310",
+        ) {
+            return;
+        }
         let stats = crate::logging::DeliveryStats::default();
         let path = Path::new("/nonexistent/forensic-2026-07-31.jsonl");
         let err = std::io::Error::from_raw_os_error(30);
-        let (errors, debugs) = crate::test_support::count_error_and_debug_lines(|| {
+        let (subscriber, sink) = crate::test_support::error_debug_capture();
+        tracing::subscriber::with_default(subscriber, || {
             for i in 0..10 {
                 let _ = writer_failure_with(&stats, 1_000_000 + i, "appending to", path, &err);
             }
         });
+        let (errors, debugs) = crate::test_support::count_error_and_debug_lines(&sink);
         assert_eq!(errors, 1, "one ERROR per interval, not one per row");
         assert_eq!(debugs, 10, "every dropped row is still traced, at DEBUG");
     }
