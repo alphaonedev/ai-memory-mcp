@@ -407,12 +407,12 @@ independently — these are layered on top.
   `EpochAdvance` epoch-freeze checkpoint rides this transport (ROADMAP
   §25.2). Decision function:
   [`src/federation/receive_auth.rs::authorize_remote_checkpoint_resolution`](../src/federation/receive_auth.rs);
-  apply: `src/checkpoints/mod.rs::apply_inbound_resolution`. On a
-  postgres-backed receiver the checkpoints table is not yet
-  MemoryStore-trait-covered for a federated verbatim-resolution write, so
-  the postgres funnel reports inbound checkpoints as
-  `unsupported_on_postgres` (honest count, never a silent drop) — the
-  sqlite / MCP-native path applies them fully.
+  apply: `src/checkpoints/mod.rs::apply_inbound_resolution`. A
+  postgres-backed receiver applies inbound resolutions through the SAL
+  method `MemoryStore::apply_remote_checkpoint_resolution`
+  ([#3075](https://github.com/alphaonedev/ai-memory-mcp/issues/3075)),
+  under the same authorization, signature and first-resolution-wins checks;
+  the lane is no longer reported as `unsupported_on_postgres`.
 
 - **Per-transition replay nonce
   ([#1805](https://github.com/alphaonedev/ai-memory-mcp/issues/1805)).**
@@ -718,10 +718,12 @@ drives the periodic pull from peers; cadence is operator-set via
 For small meshes (2-5 peers, modest write volume), 30s is fine. For
 large meshes, increase to 60-300s to spread the pull traffic.
 
-**Quorum width.** v0.6.x defaults to majority (`W = ceil((N+1)/2)` —
-the `QuorumPolicy::majority` convenience constructor,
-[`src/replication.rs`](../src/replication.rs))
-which is the correct default for partition-tolerance. For a regulated
+**Quorum width.** There is no compiled majority default: bare
+`ai-memory serve` defaults to `--quorum-writes 0` (federation off), and a
+quorum-enabled deployment selects W explicitly. Majority
+(`W = ceil((N+1)/2)` — the `QuorumPolicy::majority` convenience
+constructor, [`src/replication.rs`](../src/replication.rs)) is the
+recommended topology choice for partition-tolerance. For a regulated
 deployment where every write must be witnessed by every peer (W = N),
 configure explicitly — but be aware that any single-peer outage
 becomes a write outage.
@@ -757,12 +759,16 @@ the remaining peers regardless.
 **Push DLQ + replay worker (Track D
 [#933](https://github.com/alphaonedev/ai-memory-mcp/issues/933)).**
 Per-peer fanout failures inside `broadcast_store_quorum` (peer
-unreachable, or no Ack before the deadline) are recorded as
-`federation_push_dlq` rows
+unreachable, or no Ack before the deadline) are submitted to the durable
+retry queue as `federation_push_dlq` rows
 ([`src/federation/push_dlq.rs`](../src/federation/push_dlq.rs);
-schema v48). A replay worker
+schema v48). If that enqueue itself fails, the failure is logged
+(`land_push_failures`, `src/federation/sync.rs`) and durable retry is not
+guaranteed for that peer. A replay worker
 (`spawn_replay_federation_push_dlq`) is spawned alongside the catchup
-loop at the same cadence (`--catchup-interval-secs`, default 30s); it
+loop at the same cadence (`--catchup-interval-secs`, default 30s; `0`
+disables both the catch-up loop and this replay worker, so persisted rows
+are retried only while replay is enabled); it
 re-POSTs the originally captured payload via `post_once` and stamps
 `replayed_at` on Ack. The per-tick batch is adaptive (#1579 B5):
 `min(backlog, cap)` with a floor of 64, where the cap defaults to

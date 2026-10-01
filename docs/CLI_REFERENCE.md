@@ -416,7 +416,7 @@ API key comes from the `api_key` field in `config.toml`).
 | `--quorum-timeout-ms` | u64 | `2000` | Quorum-ack deadline; after it the locally-committed write returns **202 Accepted** with `quorum_met:false` in the body (`{quorum_met, acks, needed, reason, durability:"local"}`) — NOT a 503 (v0.8.1 W3 / gap G12); a durable write is never reported as a 5xx. Default assumes same-DC peers; cross-region (WAN) meshes need 5000-10000 (the do-1461 reference deployment uses 8000 — see `docs/federation.md`, [#1565](https://github.com/alphaonedev/ai-memory-mcp/issues/1565)). |
 | `--quorum-client-cert`/`--quorum-client-key` | path | — | mTLS client pair for outbound quorum fanout. |
 | `--quorum-ca-cert` | path | — | CA for verifying quorum peers. |
-| `--catchup-interval-secs` | u64 | `30` | Federation catch-up loop cadence. |
+| `--catchup-interval-secs` | u64 | `30` | Cadence for federation catch-up and push-DLQ replay. `0` disables both workers in this release; queued failed pushes and erasure-outbox rows will not be replayed by them until replay is enabled. |
 | `--federation-identity` | string | — | Identity this node presents to peers (also `AI_MEMORY_FED_IDENTITY`). |
 | `--store-url` | URL | — | SAL backend selector (`postgres://…` under `--features sal-postgres`). **Mutually exclusive with `--db`** — passing both is rejected at startup with a clear error. A userinfo password should be supplied via `AI_MEMORY_STORE_URL` (owner-only environment) or `AI_MEMORY_STORE_URL_FILE` (a `0600` file) rather than on argv, which is exposed via `/proc/<pid>/cmdline` and `ps auxww` to any local UID (#1927). |
 

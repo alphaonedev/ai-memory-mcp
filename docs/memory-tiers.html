@@ -275,7 +275,7 @@ footer a{color:var(--text-muted)}
         <div class="desc">Working memory. Notes from <em>right now</em>. Things you'd lose if you slept on them. Auto-expires unless explicitly extended. Use for: call logs, transient observations, "remind me at 3pm," intermediate reasoning steps.</div>
         <div class="meta">
           <div class="row"><span class="lbl">TTL</span><span class="val">6 × 3600s</span></div>
-          <div class="row"><span class="lbl">Extend</span><span class="val">floor: MAX(expiry, now+1h) — #1596</span></div>
+          <div class="row"><span class="lbl">Extend</span><span class="val">floor: MAX(expiry, now+1h), applied by access maintenance — #1596</span></div>
           <div class="row"><span class="lbl">Expires?</span><span class="val">yes</span></div>
           <div class="row"><span class="lbl">Tier rank</span><span class="val">0</span></div>
         </div>
@@ -286,7 +286,7 @@ footer a{color:var(--text-muted)}
         <div class="desc">Episodic memory. Project context. The default tier. A week is enough for a sprint, a deal cycle, or a research thread. Auto-expires unless promoted to Long. Use for: sprint goals, customer notes, debugging sessions, draft decisions.</div>
         <div class="meta">
           <div class="row"><span class="lbl">TTL</span><span class="val">7 × 86400s</span></div>
-          <div class="row"><span class="lbl">Extend</span><span class="val">floor: MAX(expiry, now+1d) — #1596</span></div>
+          <div class="row"><span class="lbl">Extend</span><span class="val">floor: MAX(expiry, now+1d), applied by access maintenance — #1596</span></div>
           <div class="row"><span class="lbl">Expires?</span><span class="val">yes</span></div>
           <div class="row"><span class="lbl">Tier rank</span><span class="val">1</span></div>
         </div>
@@ -433,8 +433,8 @@ footer a{color:var(--text-muted)}
 short_ttl_secs = <span class="num">3600</span>     <span class="cm"># 1h instead of 6h</span>
 mid_ttl_secs   = <span class="num">2592000</span>  <span class="cm"># 30d instead of 7d</span>
 long_ttl_secs  = <span class="val">0</span>        <span class="cm"># 0 = no TTL (default for Long)</span>
-short_extend_secs = <span class="num">1800</span>  <span class="cm"># access resets expiry to now+30min</span>
-mid_extend_secs   = <span class="num">86400</span> <span class="cm"># access resets expiry to now+1d</span></div>
+short_extend_secs = <span class="num">1800</span>  <span class="cm"># access maintenance extends to MAX(expiry, now+30min)</span>
+mid_extend_secs   = <span class="num">86400</span> <span class="cm"># access maintenance extends to MAX(expiry, now+1d)</span></div>
     <h3 style="margin-top:1.5rem">Per-namespace governance — gate the promotion</h3>
     <div class="snip"><span class="cm">// namespace standard's metadata.governance</span>
 {

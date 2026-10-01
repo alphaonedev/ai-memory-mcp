@@ -273,7 +273,7 @@ W-of-N quorum-write layer for the peer-mesh sync (v0.7 track C). Scaffolds the c
 
 ### `src/federation/`
 
-Federation autonomy (split from the former `src/federation.rs` into `mod.rs` + `quorum.rs`, `peer.rs`, `peer_attestation.rs`, `receive.rs`, `sync.rs`, `signing.rs`, `push_dlq.rs`, `reflection_bookkeeping.rs`, `identity/`) — wires the quorum primitives from `replication` into the HTTP write path (v0.7 track C, PR 2 of N). When `ai-memory serve` is started with `--quorum-writes N --quorum-peers <urls>`, every successful HTTP write fans out a 1-memory `/api/v1/sync/push` POST to each peer; the write returns OK only once `W-1` peer acks land within `--quorum-timeout-ms`. Fewer acks → `503 quorum_not_met`. Public API: `FederationConfig`, `broadcast_store_quorum()`.
+Federation autonomy (split from the former `src/federation.rs` into `mod.rs` + `quorum.rs`, `peer.rs`, `peer_attestation.rs`, `receive.rs`, `sync.rs`, `signing.rs`, `push_dlq.rs`, `reflection_bookkeeping.rs`, `identity/`) — wires the quorum primitives from `replication` into the HTTP write path (v0.7 track C, PR 2 of N). When `ai-memory serve` is started with `--quorum-writes N --quorum-peers <urls>`, every successful HTTP write fans out a 1-memory `/api/v1/sync/push` POST to each peer; the write returns OK only once `W-1` peer acks land within `--quorum-timeout-ms`. Fewer acks after the local commit → `202 Accepted` with `quorum_met:false`, `acks`, `needed`, `reason` and `durability:"local"` (locally committed, under-replicated). Public API: `FederationConfig`, `broadcast_store_quorum()`.
 
 ### `src/subscriptions.rs`
 

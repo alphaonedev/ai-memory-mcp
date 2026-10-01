@@ -33,7 +33,7 @@ a{color:var(--acc);text-decoration:none}a:hover{text-decoration:underline}
 <div class="wrap">
 
 <h1>ai-memory v1.0.0 — Test Results &amp; Reproducibility</h1>
-<p class="sub">Certification &amp; acceptance evidence for the AI-agent endpoint-memory substrate. Every result below is reproducible from the commands given; this page is the living record and reaches all-green before the v1.0.0 tag is cut.</p>
+<p class="sub">Certification &amp; acceptance evidence for the AI-agent endpoint-memory substrate. Reproduction instructions and available receipts are listed per result. Locally stored campaign artifacts (for example the Big-10 regression and capacity outputs) are not linked publicly here; where no public receipt is linked, the row reports a result without a public raw receipt. These limitations do not determine whether a reported historical run passed. This page is the living record and reaches all-green before the v1.0.0 tag is cut.</p>
 <div class="pillars">
 <span class="pill">◆ Data integrity</span><span class="pill">● Security</span><span class="pill">▲ Performance</span><span class="pill">■ Reliability</span>
 </div>
@@ -95,7 +95,7 @@ max_memory_mb     = 4096</pre></div>
 <table>
 <tr><th>Gate</th><th>Status</th><th>Evidence / reproduce</th></tr>
 <tr><td>CI on release tip <code>9b84c2a8</code></td><td><span class="s s-good">GREEN</span></td><td>51 checks pass, 0 fail (incl. Certified Postgres+AGE+pgvector, macos-fed, SAL-only, coverage). <code>gh api repos/alphaonedev/ai-memory-mcp/commits/9b84c2a8/check-runs</code></td></tr>
-<tr><td>Enterprise-federation cert posture (20 checks)</td><td><span class="s s-good">GREEN</span></td><td>20-check recapture on the 18.6/1.8.0/0.8.6 triple → <code>docs/compliance/evidence/cert-55/</code>; green <code>cert-postgres-age.yml</code> run cited in the cert doc.</td></tr>
+<tr><td>Enterprise-federation cert posture (20 checks)</td><td><span class="s s-good">GREEN</span></td><td>20-check recapture on the 18.6/1.8.0/0.8.6 triple → historical receipt in the release repository at commit <code>ba1f14ed</code>, <a href="https://github.com/alphaonedev/ai-memory-mcp/tree/ba1f14edc3df2cafe4555aba3caac2b9b51ba885/docs/compliance/evidence/cert-55"><code>docs/compliance/evidence/cert-55/</code></a>; green <code>cert-postgres-age.yml</code> run cited in the cert doc.</td></tr>
 <tr><td>#3329 — non-blocking MCP boot backfill + macOS config-path</td><td><span class="s s-good">GREEN</span></td><td>Merged; both <code>macos-fed</code> legs green. Coder→review→merge pipeline, 13 new tests.</td></tr>
 <tr><td>#3132 — pg/sqlite SYSTEM_PRINCIPAL parity + cert recapture</td><td><span class="s s-good">GREEN</span></td><td>Verified non-divergent at tip (SYSTEM_PRINCIPAL=="system", one shared authz predicate); parity guard test lands to lock it.</td></tr>
 <tr><td>f1⇄f2 cross-host mTLS federation + A2A acceptance</td><td><span class="s s-good">GREEN</span></td><td>9/9 (T1–T5 + A2A) over live mTLS. <code>infra/do-hive/crypto/test-federation-mtls.sh</code>, <code>test-fed-write-sig-attestation.sh</code>.</td></tr>
@@ -104,7 +104,7 @@ max_memory_mb     = 4096</pre></div>
 <h3>Acceptance campaign — full features · regression · A2A · capacity (encrypted, GLM-5.3-Flash)</h3>
 <table>
 <tr><th>Dimension</th><th>Status</th><th>What it proves</th></tr>
-<tr><td>Feature coverage matrix (100% of drivable tool surface)</td><td><span class="s s-pend">PENDING</span></td><td>Every ai-memory capability exercised end-to-end by the swarm over mTLS; coverage matrix as evidence.</td></tr>
+<tr><td>Swarm-driver tool-subset coverage</td><td><span class="s s-pend">PENDING</span></td><td>Exercises, over mTLS, the tools in the swarm driver&rsquo;s supported subset (the 22 <code>ToolSpec</code> entries in <code>sdk/python/swarm/toolset.py</code>); coverage matrix as evidence. A separate MCP validator is measured against its own 104-entry full-profile inventory. These are different surfaces, so their counts are not one coverage percentage, and neither result establishes complete product-capability coverage.</td></tr>
 <tr><td>Regression suite (fixed-bug / Big-10 invariants)</td><td><span class="s s-pend">PENDING</span></td><td>The shipped guarantees stay held; a regression is caught, not silently passed.</td></tr>
 <tr><td>A2A choreographies (signals · exactly-one-winner claims · leases · quorum · governance · replay-guard)</td><td><span class="s s-pend">PENDING</span></td><td>Multi-NHI coordination invariants hold under concurrency, cross-node.</td></tr>
 <tr><td><b>Security / red-team — can a bad memory infect the swarm/hive?</b></td><td><span class="s s-pend">PENDING</span></td><td>Adversarial memory poisoning: inject malicious / prompt-injection / false-fact memories as a hostile NHI and prove the swarm/hive does <b>not</b> get infected — cross-agent isolation holds (namespace-confined, fail-closed), unsigned/forged writes are convicted, an operator Deny stays Deny, and a wrong idea does not cascade into groupthink (corroboration independence + poison quarantine). Also: tenant-scope leak attempts, capability-token attenuation abuse, at-rest/in-transit boundary probes. The #3266 contamination concern, tested directly.</td></tr>
@@ -128,7 +128,7 @@ export SWARM_BASE_URL=https://&lt;daemon&gt;:&lt;port&gt;   # mTLS client cert
 export OPENROUTER_API_KEY=&lt;key&gt;                # GLM-5.3-Flash NHIs
 python3 -m swarm --agents N --scenario coverage   # Fable-authored suite -> coverage matrix
 infra/pillar4-envelope/measure-capacity-ramp.sh   # concurrency ramp -> USL fit -> knee</pre>
-<p class="note">Results, raw JSON, and the coverage matrix are committed under <code>docs/compliance/evidence/</code> and linked here as each phase completes.</p>
+<p class="note">Where a phase publishes results, raw JSON or a coverage matrix, they are committed under <code>docs/compliance/evidence/</code> in the release repository and linked from the row by immutable commit. A row with no such link has no public raw receipt.</p>
 </div>
 
 <p class="soft" style="margin-top:30px;font-size:13px">Generated by Fable 5 (conductor). Honest-by-construction: PENDING rows become GREEN only when measured. Last updated as the campaign runs.</p>

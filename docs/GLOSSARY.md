@@ -132,8 +132,10 @@ OpenAI, Anthropic, Gemini, etc.). Set per-invocation (`--tier` on
 
 Opt-in multi-agent replication layer (v0.7, PR #282). Configured via
 `ai-memory serve --quorum-writes N --quorum-peers URL,URL`. Every HTTP
-write fans out to peers; returns 201 only on `W-1` peer acks within
-`--quorum-timeout-ms`. Otherwise returns 503 `quorum_not_met`.
+write fans out to peers; returns success once `W-1` peer acks land within
+`--quorum-timeout-ms`. After a local commit, a shortfall returns
+`202 Accepted` with `quorum_met:false`, `acks`, `needed`, `reason` and
+`durability:"local"` (locally committed, under-replicated, not rejected).
 
 ## FTS5
 

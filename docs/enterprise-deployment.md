@@ -525,8 +525,12 @@ receipted numbers this project publishes live in `PERFORMANCE.md`.
 | `POST /api/v1/sync/push` (single payload, 5 memories) | 11 ms | 30 ms | 65 ms |
 | `POST /api/v1/kg/find_paths` (depth=3; recursive CTE on both backends) | 12 ms | 35 ms | 80 ms |
 
-LAN RTT-bound. Federation fanout adds one full RTT × peer count to
-the write path. The CRDT-lite merge cost on the receiving side scales
+LAN RTT-bound. Federation sends to peers concurrently and can complete
+the foreground wait once the configured quorum is met, subject to its
+shared acknowledgement deadline. Remaining fanouts continue in the
+background. Latency depends on the acknowledgements needed, peer/network
+behavior and local work; it is not defined as one RTT multiplied by peer
+count. The CRDT-lite merge cost on the receiving side scales
 with **row count**, not peer count (`federation.md §"Multi-peer
 scaling guidance"`).
 
@@ -1290,8 +1294,10 @@ api-key layer by design ([#702](https://github.com/alphaonedev/ai-memory-mcp/iss
 
 ### 8.7 Quorum cost in a 5-peer swarm
 
-Default W = ceil(5/2 + 1) = 3 (out of 5). Three peers must ack a
-write before it's canonical. Any single-peer outage is tolerated.
+There is no compiled majority default: bare `ai-memory serve` defaults to
+`--quorum-writes 0` (federation off), so W is set explicitly per
+deployment. A majority quorum for 5 nodes is W = 3 (out of 5): three
+nodes, counting the local commit, must ack a write before it's canonical. Any single-peer outage is tolerated.
 Two-peer simultaneous outage stalls writes.
 
 For deployments where the operator wants writes to land even with
