@@ -1483,3 +1483,46 @@ fn migrate_only_repair_is_not_public_4324() {
         "#4324: allowlisted migrate-only repair must be `pub(super)`, found `{decl}`"
     );
 }
+
+/// #4324 — `pub(super)` alone does not pin "migrate callers only": any
+/// wrapper inside `crate::storage` could re-expose the record-stop-exempt
+/// repair, and B7 cannot see it (no write SQL in the wrapper). So pin the
+/// call sites: every non-declaration, non-comment mention must be in
+/// `src/storage/migrations.rs`, and there are exactly two today (open-time
+/// repair + ladder tail); a new site must be reviewed here.
+#[test]
+fn repair_call_sites_are_migrate_only_4324() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+    walk_rs(&root.join("src"), &mut files);
+    let mut sites: Vec<String> = Vec::new();
+    for f in &files {
+        let Ok(text) = fs::read_to_string(f) else {
+            continue;
+        };
+        let rel = rel_src(f, root);
+        for (i, line) in text.lines().enumerate() {
+            let t = line.trim_start();
+            if t.starts_with("//")
+                || !line.contains("repair_sqlite_after_trigger_gap(")
+                || line.contains("fn repair_sqlite_after_trigger_gap")
+            {
+                continue;
+            }
+            sites.push(format!("{rel}:{}", i + 1));
+        }
+    }
+    let outside: Vec<&String> = sites
+        .iter()
+        .filter(|s| !s.starts_with("src/storage/migrations.rs:"))
+        .collect();
+    assert!(
+        outside.is_empty(),
+        "#4324: repair call sites outside src/storage/migrations.rs: {outside:?}"
+    );
+    assert_eq!(
+        sites.len(),
+        2,
+        "#4324: expected exactly 2 migrate call sites (open-time repair + ladder tail), got {sites:?}"
+    );
+}
