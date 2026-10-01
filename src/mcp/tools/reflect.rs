@@ -697,7 +697,13 @@ pub fn handle_reflect_caller(
             // namespace's governance metadata blob — avoids adding a
             // new field to the GovernancePolicy struct (which would
             // require updating every GovernancePolicy { … } literal).
-            if let Some(threshold) = db::resolve_require_approval_above_depth(conn, ns) {
+            // #4357 — a resolver fault REFUSES the reflect (fail closed); it
+            // never skips a configured approval gate.
+            if let Some(threshold) =
+                db::resolve_require_approval_above_depth(conn, ns).map_err(|e| {
+                    map_reflect_error_to_wire_string(db::ReflectError::Database(e.to_string()))
+                })?
+            {
                 if new_depth_u32 > threshold {
                     let pending_id = db::queue_pending_action(
                         conn,

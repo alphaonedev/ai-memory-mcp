@@ -120,6 +120,7 @@ fn issue_1326_require_approval_above_depth_round_trips() {
 
     // Sanity: the substrate's resolver also sees the value.
     let resolved = db::resolve_require_approval_above_depth(&conn, "ns-1326-leaf")
+        .expect("#4043: governance policy read")
         .expect("resolver returns Some");
     assert_eq!(resolved, 2, "substrate resolver must agree with get-side");
 }
