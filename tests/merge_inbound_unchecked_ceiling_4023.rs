@@ -219,8 +219,10 @@ fn ident_offsets(masked: &str, ident: &str) -> Vec<usize> {
         .collect()
 }
 
-/// The last top-level argument of the call whose `(` follows `ident` at
-/// `at`, trimmed. `None` when the ident is not directly called.
+/// The last NON-EMPTY top-level argument of the call whose `(` follows `ident`
+/// at `at`, trimmed (rustfmt's vertical form leaves an empty segment after the
+/// trailing comma; that must not be mistaken for "no argument"). `None` when
+/// the ident is not directly called.
 fn last_call_arg(masked: &str, at: usize, ident: &str) -> Option<String> {
     let rest = &masked[at + ident.len()..];
     let rest_trim = rest.trim_start();
@@ -238,11 +240,20 @@ fn last_call_arg(masked: &str, at: usize, ident: &str) -> Option<String> {
             ')' | ']' | '}' => {
                 depth -= 1;
                 if depth == 0 {
-                    last = masked[arg_start..pos].trim().to_string();
+                    let tail = masked[arg_start..pos].trim();
+                    if !tail.is_empty() {
+                        last = tail.to_string();
+                    }
                     break;
                 }
             }
-            ',' if depth == 1 => arg_start = pos + 1,
+            ',' if depth == 1 => {
+                let seg = masked[arg_start..pos].trim();
+                if !seg.is_empty() {
+                    last = seg.to_string();
+                }
+                arg_start = pos + 1;
+            }
             _ => {}
         }
     }
@@ -353,6 +364,28 @@ fn the_scanner_is_load_bearing_4023() {
         "fn f() { db::merge_inbound_authorized(&c, &m, true, Some(&auth)); }",
     ));
     assert!(none_auth.is_empty());
+    // rustfmt's vertical call form: a trailing comma after the last argument
+    // must not hide a literal `None` (the last NON-EMPTY argument counts).
+    let (_, none_auth, _) = scan(&planted(
+        "fn f() {\n    db::merge_inbound_authorized(\n        &c,\n        &m,\n        true,\n        None,\n    );\n}",
+    ));
+    assert_eq!(
+        none_auth.len(),
+        1,
+        "multi-line trailing-comma None must be seen"
+    );
+    let (_, none_auth, _) = scan(&planted(
+        "fn f() {\n    db::merge_inbound_authorized(\n        &c,\n        &m,\n        true,\n        Some(&auth),\n    );\n}",
+    ));
+    assert!(none_auth.is_empty(), "multi-line Some(..) is not a None");
+    let (_, _, none_pg) = scan(&planted(
+        "fn f() {\n    self.pg_merge_inbound(\n        ctx,\n        m,\n        false,\n        None,\n    )\n}",
+    ));
+    assert_eq!(
+        none_pg.len(),
+        1,
+        "multi-line pg_merge_inbound None must be seen"
+    );
     // The authorized name is NOT the unchecked token; comments, doc lines and
     // string literals are not code.
     let (token, _, _) = scan(&planted(

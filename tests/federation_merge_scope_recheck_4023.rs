@@ -254,6 +254,20 @@ async fn stale_scope_verdict_refused_after_concurrent_move_sqlite_4023() {
     ));
     // The daemon's scope pre-read is a WAL read and passes; its first write
     // then waits on `busy_timeout` (5 s) for this connection's lock.
+    //
+    // Why a sleep and why it is safe: sqlite exposes no "a writer is blocked
+    // on the lock" observable (the postgres twin polls `pg_stat_activity`), so
+    // this waits for the push task to finish its pre-read and reach the
+    // blocked `BEGIN IMMEDIATE`. 1500 ms is far below the 5000 ms
+    // `busy_timeout`, so the move below always lands while the merge is still
+    // waiting and never after it timed out. If a loaded host were slower than
+    // 1500 ms the pre-read would see the MOVED row and refuse at the funnel's
+    // own pre-check instead: the cell then still passes but no longer reaches
+    // the in-transaction re-check. That failure direction is a vacuous pass,
+    // not a corruption, and it is bounded by the mutation evidence: with the
+    // in-transaction re-check disabled this cell goes red (#4023 review M2/M3).
+    // Replacing the sleep with a deterministic sqlite barrier is tracked as
+    // the review's N3 follow-up.
     tokio::time::sleep(Duration::from_millis(1500)).await;
     other
         .execute(
