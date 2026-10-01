@@ -1522,6 +1522,8 @@ impl Metrics {
 
         // #3651 — the operational log pipeline, read at scrape time.
         registry.register(Box::new(LogPipelineCollector::new()?))?;
+        // #3975 — the flat audit trail's delivery, read at scrape time.
+        registry.register(Box::new(AuditTrailCollector::new()?))?;
 
         Ok(Self {
             registry,
@@ -2068,6 +2070,96 @@ impl LogPipelineCollector {
     }
 }
 
+/// #3975 — the flat audit trail's state and delivery counters. Like the #3651
+/// log collector, it reads a snapshot at scrape time from the counters the
+/// writer owns (`RuntimeContext::audit.delivery`), so nothing can drift, and a
+/// value nothing measured is omitted rather than rendered as `0`.
+struct AuditTrailCollector {
+    active: IntGauge,
+    written: IntCounter,
+    write_failures: IntCounter,
+    last_write: IntGauge,
+    // Serialises scrapes: a counter is reset and re-set per collect.
+    scrape: std::sync::Mutex<()>,
+}
+
+impl AuditTrailCollector {
+    fn new() -> prometheus::Result<Self> {
+        Ok(Self {
+            active: IntGauge::new(
+                "ai_memory_audit_trail_active",
+                "1 when the flat audit trail ([audit].enabled) is recording in this \
+                 process; 0 when auditing is off. An enabled trail that cannot \
+                 initialise refuses the boot (#3651), so a running daemon reports \
+                 0 only when auditing is off (#3975).",
+            )?,
+            written: IntCounter::new(
+                "ai_memory_audit_records_written_total",
+                "Audit events written and flushed without error (#3975).",
+            )?,
+            write_failures: IntCounter::new(
+                crate::audit::AUDIT_WRITE_FAILURES_TOTAL,
+                "Audit events lost to a failed write or flush; any increase means \
+                 the trail has a gap (#3975).",
+            )?,
+            last_write: IntGauge::new(
+                "ai_memory_audit_last_write_seconds",
+                "UNIX time of the most recent successful audit write. Absent until \
+                 the first write: there is no time to report yet (#3975).",
+            )?,
+            scrape: std::sync::Mutex::new(()),
+        })
+    }
+
+    /// Render `status` as metric families; a value nothing measured is
+    /// omitted, never rendered as `0`.
+    fn families_for(&self, status: &crate::audit::AuditTrailStatus) -> Vec<MetricFamily> {
+        let _serialised = self
+            .scrape
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let is_active = status.state == crate::audit::AuditTrailState::Active;
+        self.active.set(i64::from(is_active));
+        let mut families = self.active.collect();
+        if !is_active {
+            return families;
+        }
+        for (counter, value) in [
+            (&self.written, status.records_written),
+            (&self.write_failures, status.write_failures),
+        ] {
+            let Some(value) = value else { continue };
+            counter.reset();
+            counter.inc_by(value);
+            families.extend(counter.collect());
+        }
+        if let Some(ms) = status.last_write_unix_ms {
+            self.last_write
+                .set(i64::try_from(ms / 1000).unwrap_or(i64::MAX));
+            families.extend(self.last_write.collect());
+        }
+        families
+    }
+}
+
+impl Collector for AuditTrailCollector {
+    fn desc(&self) -> Vec<&Desc> {
+        [
+            self.active.desc(),
+            self.written.desc(),
+            self.write_failures.desc(),
+            self.last_write.desc(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+
+    fn collect(&self) -> Vec<MetricFamily> {
+        self.families_for(&crate::audit::audit_trail_status())
+    }
+}
+
 /// Render the current registry state to the Prometheus text exposition
 /// format. Ignores errors from the encoder (unreachable in practice) and
 /// returns an empty string — the scrape returns 200 with a possibly-empty
@@ -2204,6 +2296,51 @@ mod tests {
             names(&collector.families_for(&status)),
             vec!["ai_memory_log_pipeline_active".to_string()],
             "a disabled pipeline reports only that it is not active"
+        );
+    }
+
+    /// #3975: an active trail that has not written yet exports NO last-write
+    /// series (a `0` would read as 1970-01-01); a disabled trail reports only
+    /// that it is not active; a failure count is exported as measured.
+    #[test]
+    fn audit_trail_omits_values_nothing_measured_3975() {
+        use crate::audit::{AuditTrailState, AuditTrailStatus};
+        const LAST: &str = "ai_memory_audit_last_write_seconds";
+        let names = |families: &[MetricFamily]| -> Vec<String> {
+            families.iter().map(|f| f.get_name().to_string()).collect()
+        };
+        let collector = AuditTrailCollector::new().expect("collector");
+        let mut status = AuditTrailStatus {
+            state: AuditTrailState::Active,
+            records_written: Some(0),
+            write_failures: Some(3),
+            last_write_unix_ms: None,
+        };
+        let before = collector.families_for(&status);
+        assert!(!names(&before).iter().any(|n| n == LAST), "no write yet");
+        let failures = before
+            .iter()
+            .find(|f| f.get_name() == crate::audit::AUDIT_WRITE_FAILURES_TOTAL)
+            .expect("the failure counter is exported while active");
+        assert!((failures.get_metric()[0].get_counter().get_value() - 3.0).abs() < f64::EPSILON);
+
+        status.last_write_unix_ms = Some(1_757_000_000_123);
+        let after = collector.families_for(&status);
+        let family = after
+            .iter()
+            .find(|f| f.get_name() == LAST)
+            .expect("the series appears after the first write");
+        let secs = family.get_metric()[0].get_gauge().get_value();
+        assert!(
+            (secs - 1_757_000_000.0).abs() < 0.5,
+            "whole seconds, got {secs}"
+        );
+
+        status.state = AuditTrailState::NotActive;
+        assert_eq!(
+            names(&collector.families_for(&status)),
+            vec!["ai_memory_audit_trail_active".to_string()],
+            "a disabled trail reports only that it is not active"
         );
     }
 

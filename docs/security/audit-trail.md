@@ -688,6 +688,28 @@ OnCalendar=hourly
 WantedBy=timers.target
 ```
 
+### Detecting a trail that stopped recording (#3975)
+
+`audit verify` proves the lines on disk are intact. It cannot prove that
+events which never reached the disk were written. A disk filled after
+boot, an unmounted volume, or a revoked permission makes `emit` lose events
+while the daemon keeps serving. Every such loss is now counted and reported:
+
+| Signal | Meaning |
+|---|---|
+| `ai_memory_audit_write_failures_total` | Events lost to a failed write or flush. **Any increase is a gap in the trail.** |
+| `ai_memory_audit_records_written_total` | Events written and flushed without error. |
+| `ai_memory_audit_last_write_seconds` | UNIX time of the last successful write. Absent until the first write. |
+| `ai_memory_audit_trail_active` | `1` when a trail is recording in the process, `0` when auditing is off. |
+| stderr | `the audit trail failed to record an event: …`, at most once a minute, with the count of failures folded in since the previous line. |
+| `ai-memory doctor` | "Audit trail (#3975)": Critical on any lost event, or when `[audit].enabled = true` but no trail is recording. |
+
+Alert on `increase(ai_memory_audit_write_failures_total[5m]) > 0`. A lost
+event also leaves a skipped value in the `sequence` column (the counter
+advances before the write). `audit verify` does **not** report that gap
+today: it rejects only a sequence that fails to increase (#4021). The
+failure counter is therefore the signal to watch.
+
 ### Off-host attestation
 
 Ship every line to an immutable off-host store (SIEM, S3 Object Lock,
