@@ -60,17 +60,23 @@ impl PostgresStore {
         let Some(cs) = current else {
             return Ok(RemoteCasOutcome::Fresh(CasOutcome::NotFound));
         };
-        let seen: bool = sqlx::query_scalar(
-            "SELECT EXISTS (SELECT 1 FROM action_transition_nonces \
-             WHERE action_id = $1 AND nonce = $2)",
+        let stored: Option<Vec<u8>> = sqlx::query_scalar(
+            "SELECT op_digest FROM action_transition_nonces \
+             WHERE action_id = $1 AND nonce = $2",
         )
         .bind(t.action_id)
         .bind(t.nonce.as_bytes())
-        .fetch_one(&mut *tx)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|e| to_store_err("action_transition_cas_once identity probe", e))?;
-        if seen {
-            return Ok(RemoteCasOutcome::AlreadyApplied);
+        if let Some(stored) = stored {
+            // Same op = idempotent re-delivery; a different op under this
+            // identity = collision, never a noop (F1).
+            return Ok(if stored.as_slice() == t.digest.as_bytes().as_slice() {
+                RemoteCasOutcome::AlreadyApplied
+            } else {
+                RemoteCasOutcome::IdentityConflict
+            });
         }
         let cur = crate::models::ActionState::from_str(&cs).unwrap_or_default();
         if cur != from {
@@ -90,13 +96,15 @@ impl PostgresStore {
         .map_err(|e| to_store_err("action_transition_cas_once update", e))?;
         sqlx::query(
             "INSERT INTO action_transition_nonces \
-             (action_id, nonce, from_state, to_state, recorded_at) VALUES ($1, $2, $3, $4, $5)",
+             (action_id, nonce, from_state, to_state, recorded_at, op_digest) \
+             VALUES ($1, $2, $3, $4, $5, $6)",
         )
         .bind(t.action_id)
         .bind(t.nonce.as_bytes())
         .bind(from.as_str())
         .bind(to.as_str())
         .bind(chrono::Utc::now().timestamp())
+        .bind(t.digest.as_bytes().as_slice())
         .execute(&mut *tx)
         .await
         .map_err(|e| to_store_err("action_transition_cas_once identity insert", e))?;

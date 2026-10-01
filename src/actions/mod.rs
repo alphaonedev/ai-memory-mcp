@@ -315,33 +315,67 @@ pub fn transition_cas(
     Ok(CasOutcome::Applied(action))
 }
 
+/// #4024 / F3 — the exact length of a federated transition's operation nonce.
+/// The producer (`handlers::coordination`) always mints 16 CSPRNG bytes; the
+/// receiver refuses any other length, so a recorded identity row has a bounded
+/// size (the table is never pruned).
+pub const OP_NONCE_LEN: usize = 16;
+
 /// #4024 — the signed operation identity (`ActionTransitionOp.nonce`) of a
-/// federated action transition, guaranteed NON-EMPTY by construction
-/// (ERRORS-09). An empty nonce is an unsigned op from a heterogeneous-rollout
-/// peer: it carries no identity, so it can never be recorded (recording `b""`
-/// would refuse every later unsigned op on the action as a "replay").
+/// federated action transition, guaranteed EXACTLY [`OP_NONCE_LEN`] bytes by
+/// construction (ERRORS-09). Anything else (empty, short, oversized) cannot be
+/// built, so it can never be recorded.
 ///
-/// **Rollout-hatch contract (#4024 item 5, 5-agent vote 4d3ea1c5 / decision
-/// f41cf98b):** under `AI_MEMORY_FED_REQUIRE_TRANSITION_SIG=0` (CLAUDE.md env
-/// row #87) an UNSIGNED transition is admitted, and by construction it records
-/// NO operation identity. Replay protection (#1805) therefore covers SIGNED ops
-/// only; an unsigned op is applied by the plain CAS and is replayable. That is
-/// the hatch's documented contract, not a gap: the strict default (`=1`)
-/// refuses unsigned ops outright, so every admitted op is identified.
+/// **Verified-only contract (F2, 5-agent vote 4d3ea1c5 / decision f41cf98b):**
+/// an `OpNonce` is constructed ONLY on the receive path's VERIFIED arm
+/// (`TransitionAuthz::Accept`: the signature verified against the actor's
+/// enrolled key). An op admitted without verification (an unsigned op, or one
+/// from an unenrolled actor, under the rollout hatch
+/// `AI_MEMORY_FED_REQUIRE_TRANSITION_SIG=0`) takes the plain CAS and records NO
+/// identity - so an unauthenticated, sender-chosen nonce can never pre-empt the
+/// real actor's later signed op. Replay protection (#1805) therefore covers
+/// VERIFIED ops only.
 #[derive(Debug, Clone, Copy)]
 pub struct OpNonce<'a>(&'a [u8]);
 
 impl<'a> OpNonce<'a> {
-    /// `None` for an empty nonce (an unsigned op — no identity to record).
+    /// `None` unless `bytes` is exactly [`OP_NONCE_LEN`] bytes.
     #[must_use]
     pub fn new(bytes: &'a [u8]) -> Option<Self> {
-        (!bytes.is_empty()).then_some(Self(bytes))
+        (bytes.len() == OP_NONCE_LEN).then_some(Self(bytes))
     }
 
     /// The raw nonce bytes (the durable key alongside the action id).
     #[must_use]
     pub fn as_bytes(&self) -> &'a [u8] {
         self.0
+    }
+}
+
+/// #4024 / F1 - SHA-256 of the canonical signed transition bytes (the exact
+/// bytes the op's Ed25519 signature covers: action, namespace, edge, actor,
+/// nonce, timestamp). It is stored with the identity row and compared on a
+/// probe hit: the SAME digest is an idempotent re-delivery (`noop`), a
+/// DIFFERENT digest under the same `(action_id, nonce)` is an identity
+/// collision ([`RemoteCasOutcome::IdentityConflict`], never a `noop`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpDigest([u8; 32]);
+
+impl OpDigest {
+    /// Digest of `t`'s canonical signed bytes.
+    ///
+    /// # Errors
+    /// The CBOR encode error (pathological input only).
+    pub fn of(t: &crate::identity::sign::SignableTransition<'_>) -> anyhow::Result<Self> {
+        use sha2::{Digest, Sha256};
+        let bytes = crate::identity::sign::canonical_cbor_transition(t)?;
+        Ok(Self(Sha256::digest(&bytes).into()))
+    }
+
+    /// The raw digest bytes (the stored `op_digest` column).
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
     }
 }
 
@@ -362,6 +396,9 @@ pub struct RemoteTransition<'a> {
     pub now: i64,
     /// The op's signed identity.
     pub nonce: OpNonce<'a>,
+    /// Digest of the op's canonical signed bytes (binds the identity row to
+    /// the op that consumed it).
+    pub digest: OpDigest,
 }
 
 /// #4024 — outcome of [`transition_cas_once`].
@@ -382,24 +419,35 @@ pub enum RemoteCasOutcome {
     /// `skipped` (#4204): `skipped > 0` is the sender's #2341 non-ack, which
     /// would retry an APPLIED op to DLQ quarantine.
     AlreadyApplied,
+    /// `(action_id, nonce)` is already recorded but for a DIFFERENT op (the
+    /// stored digest differs from this op's): an identity collision - another
+    /// signer, or the same signer reusing a nonce for different content. The
+    /// op is NOT applied and is NOT acknowledged as a `noop` (that would be an
+    /// acked, never-applied transition); the receivers report it `skipped`
+    /// with a distinct WARN. Nothing written.
+    IdentityConflict,
 }
 
 /// SQL: is `(action_id, nonce)` a durably recorded, applied operation?
 const SELECT_TRANSITION_NONCE_SQL: &str =
-    "SELECT 1 FROM action_transition_nonces WHERE action_id = ?1 AND nonce = ?2";
+    "SELECT op_digest FROM action_transition_nonces WHERE action_id = ?1 AND nonce = ?2";
 
 /// SQL: record an applied operation identity (same transaction as the CAS).
 const INSERT_TRANSITION_NONCE_SQL: &str = "INSERT INTO action_transition_nonces \
-     (action_id, nonce, from_state, to_state, recorded_at) VALUES (?1, ?2, ?3, ?4, ?5)";
+     (action_id, nonce, from_state, to_state, recorded_at, op_digest) \
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6)";
 
 /// #4024 — compare-and-swap a FEDERATED transition and record its operation
 /// identity **atomically**: one `BEGIN IMMEDIATE` transaction holds the
 /// identity probe, the `UPDATE … WHERE state = from` guard and the identity
 /// `INSERT`, so "applied" and "recorded" commit or roll back together.
 ///
-/// - identity already recorded → [`RemoteCasOutcome::AlreadyApplied`], no write
-///   (the #1805 replay refusal, durable across restarts and exact — no cache
-///   eviction can reopen it);
+/// - identity already recorded with the SAME op digest →
+///   [`RemoteCasOutcome::AlreadyApplied`], no write (the #1805 replay refusal,
+///   durable across restarts and exact - no cache eviction can reopen it);
+/// - identity recorded with a DIFFERENT digest →
+///   [`RemoteCasOutcome::IdentityConflict`], no write (F1: a nonce collision
+///   must never read as an acknowledged replay of an op that never applied);
 /// - CAS miss / not-found / illegal edge → `Fresh(<verdict>)`, NOTHING written:
 ///   a transition that arrived ahead of its causal predecessor keeps its
 ///   identity, so the sender's retry applies once the predecessor lands;
@@ -425,21 +473,27 @@ pub fn transition_cas_once(
         claimed_by,
         now,
         nonce,
+        digest,
     } = *t;
     // IMMEDIATE: take the write lock up front so no other connection (another
     // process on the same file) can interleave between the probe and the
     // writes. A dropped `Transaction` rolls back.
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
-    let seen = tx
+    let stored: Option<Vec<u8>> = tx
         .query_row(
             SELECT_TRANSITION_NONCE_SQL,
             params![id, nonce.as_bytes()],
-            |_| Ok(()),
+            |r| r.get(0),
         )
-        .optional()?
-        .is_some();
-    if seen {
-        return Ok(RemoteCasOutcome::AlreadyApplied);
+        .optional()?;
+    if let Some(stored) = stored {
+        // Same op (digest equal) = idempotent re-delivery; a different op under
+        // this identity = collision, never a noop (F1).
+        return Ok(if stored.as_slice() == digest.as_bytes().as_slice() {
+            RemoteCasOutcome::AlreadyApplied
+        } else {
+            RemoteCasOutcome::IdentityConflict
+        });
     }
     let verdict = transition_cas(&tx, id, from, to, claimed_by, now)?;
     if matches!(verdict, CasOutcome::Applied(_)) {
@@ -450,7 +504,8 @@ pub fn transition_cas_once(
                 nonce.as_bytes(),
                 from.as_str(),
                 to.as_str(),
-                chrono::Utc::now().timestamp()
+                chrono::Utc::now().timestamp(),
+                digest.as_bytes().as_slice()
             ],
         )?;
         tx.commit()?;

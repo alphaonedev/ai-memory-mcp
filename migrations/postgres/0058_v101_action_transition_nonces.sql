@@ -10,6 +10,7 @@
 CREATE TABLE IF NOT EXISTS action_transition_nonces (
     action_id  TEXT   NOT NULL REFERENCES actions(id) ON DELETE RESTRICT,
     nonce      BYTEA  NOT NULL,
+    op_digest  BYTEA  NOT NULL,
     from_state TEXT   NOT NULL,
     to_state   TEXT   NOT NULL,
     recorded_at BIGINT NOT NULL,

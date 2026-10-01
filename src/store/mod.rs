@@ -3681,8 +3681,11 @@ pub trait MemoryStore: Send + Sync {
     /// #4024 — the federation receive path's CAS: apply `t` and durably
     /// record its operation identity `(action_id, nonce)` in ONE transaction,
     /// so the identity is recorded **iff** the transition applied. An identity
-    /// already recorded is [`crate::actions::RemoteCasOutcome::AlreadyApplied`]
-    /// (the #1805 replay refusal, durable and exact); a CAS miss, illegal edge
+    /// already recorded with the SAME op digest is
+    /// [`crate::actions::RemoteCasOutcome::AlreadyApplied`] (the #1805 replay
+    /// refusal, durable and exact); a DIFFERENT digest under the same identity
+    /// is [`crate::actions::RemoteCasOutcome::IdentityConflict`] (F1, never a
+    /// noop). Callers pass this ONLY for a signature-VERIFIED op (F2); a CAS miss, illegal edge
     /// or not-found writes nothing (the op stays applicable on a retry); a
     /// substrate error rolls both back.
     ///

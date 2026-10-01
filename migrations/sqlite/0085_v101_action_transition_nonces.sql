@@ -23,6 +23,13 @@
 -- restarts). The key is `(action_id, nonce)` — both are bound by the op's
 -- signature, so the identity holds regardless of which peer relays it.
 --
+-- `op_digest` is the SHA-256 of the canonical signed transition bytes (what the
+-- signature covers). It binds the identity row to the op that consumed it: a
+-- probe hit with the SAME digest is an idempotent re-delivery (noop), a
+-- DIFFERENT digest is an identity collision (skipped, never a noop) - F1 of the
+-- #4024 security review. Rows are written ONLY for ops whose signature was
+-- VERIFIED against the actor's enrolled key (F2) and whose nonce is exactly 16
+-- bytes (F3).
 -- `ON DELETE RESTRICT` (5-agent vote 4d3ea1c5, decision f41cf98b): no production
 -- action-delete path exists today, so RESTRICT costs nothing, and it forces any
 -- FUTURE delete / purge / re-create path to handle transition identities
@@ -35,6 +42,7 @@
 CREATE TABLE IF NOT EXISTS action_transition_nonces (
     action_id  TEXT    NOT NULL REFERENCES actions(id) ON DELETE RESTRICT,
     nonce      BLOB    NOT NULL,
+    op_digest  BLOB    NOT NULL,
     from_state TEXT    NOT NULL,
     to_state   TEXT    NOT NULL,
     recorded_at INTEGER NOT NULL,

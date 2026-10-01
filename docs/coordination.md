@@ -185,10 +185,18 @@ daemon so Postgres-backed / MCP-over-HTTP deployments can drive them
   (`0`/`false`/`no`/`off`) for a heterogeneous-rollout window. A *forged*
   signature is rejected unconditionally regardless of the knob. Source:
   [`src/federation/receive_auth.rs`](../src/federation/receive_auth.rs)
-  (`require_transition_sig_enabled`). **Rollout-hatch contract (#4024):**
-  an unsigned transition admitted under `=0` carries no nonce and records
-  NO operation identity, so replay protection (#1805) covers SIGNED ops
-  only; the strict default refuses unsigned ops outright.
+  (`require_transition_sig_enabled`). **Verified-only identity contract (#4024):**
+  a transition's durable operation identity is recorded ONLY when its
+  signature verified against the actor's enrolled key. An unsigned op (or
+  one from an unenrolled actor) admitted under `=0` takes the plain CAS and
+  records NO identity, so replay protection (#1805) covers VERIFIED ops only
+  and an unauthenticated nonce can never pre-empt the real actor's signed
+  op. The identity row binds a SHA-256 of the canonical signed bytes: a
+  re-delivery of the same op is an idempotent `noop`; a different op under
+  the same `(action_id, nonce)` is `skipped` (collision WARN), never a
+  `noop`; a nonce that is not exactly 16 bytes is refused. On a shared
+  postgres DSN upgrade every binary together (an already-connected older
+  daemon applies without recording until it reconnects).
 - **Transition-replay nonce** (#1805) — each signed transition delivery
   binds 16 random CSPRNG bytes as a per-delivery anti-replay nonce into
   the signed surface (`src/handlers/coordination.rs`).

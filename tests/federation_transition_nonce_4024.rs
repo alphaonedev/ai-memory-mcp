@@ -59,11 +59,13 @@ struct FedEnv {
 }
 
 impl FedEnv {
-    fn new(actor: &str, namespace: &str, key_dir: &std::path::Path) -> Self {
+    fn new(actors: &[&str], namespace: &str, key_dir: &std::path::Path) -> Self {
         use ai_memory::federation::peer_attestation::{
             PEER_ATTESTATION_ENV, TRUST_BODY_AGENT_ID_ENV,
         };
-        use ai_memory::federation::receive_auth::REQUIRE_PUSH_NAMESPACE_SCOPE_ENV;
+        use ai_memory::federation::receive_auth::{
+            REQUIRE_PUSH_NAMESPACE_SCOPE_ENV, REQUIRE_TRANSITION_SIG_ENV,
+        };
         use ai_memory::federation::signing::REQUIRE_SIG_ENV;
         use ai_memory::identity::keypair::KEY_DIR_ENV;
         let keys = [
@@ -72,12 +74,20 @@ impl FedEnv {
             KEY_DIR_ENV,
             PEER_ATTESTATION_ENV,
             REQUIRE_PUSH_NAMESPACE_SCOPE_ENV,
+            REQUIRE_TRANSITION_SIG_ENV,
         ];
         let saved = keys.iter().map(|k| (*k, std::env::var_os(k))).collect();
-        let allowlist = json!({actor: {
-            "allowed_sender_agent_ids": [actor],
-            "allowed_namespaces": [namespace],
-        }});
+        let mut allowlist = serde_json::Map::new();
+        for actor in actors {
+            allowlist.insert(
+                (*actor).to_string(),
+                json!({
+                    "allowed_sender_agent_ids": [actor],
+                    "allowed_namespaces": [namespace],
+                }),
+            );
+        }
+        let allowlist = Value::Object(allowlist);
         // SAFETY: every caller holds FED_ENV_LOCK; Drop restores the variables
         // before that guard is released.
         unsafe {
@@ -86,6 +96,7 @@ impl FedEnv {
             std::env::set_var(KEY_DIR_ENV, key_dir);
             std::env::set_var(PEER_ATTESTATION_ENV, allowlist.to_string());
             std::env::remove_var(REQUIRE_PUSH_NAMESPACE_SCOPE_ENV);
+            std::env::remove_var(REQUIRE_TRANSITION_SIG_ENV);
         }
         Self { saved }
     }
@@ -127,13 +138,77 @@ fn enroll(id: &str, namespace: &str) -> Actor {
     }
     let kp = ai_memory::identity::keypair::generate(id).expect("keypair");
     ai_memory::identity::keypair::save(&kp, key_dir.path()).expect("save keypair");
-    let env = FedEnv::new(id, namespace, key_dir.path());
+    let env = FedEnv::new(&[id], namespace, key_dir.path());
     Actor {
         id: id.to_string(),
         kp,
         _key_dir: key_dir,
         _env: env,
     }
+}
+
+/// Two enrolled actors sharing ONE key dir and ONE allowlist (the #4024 F1
+/// attack needs two nodes that are each authorized on the namespace). The first
+/// actor owns the env guard and key dir; bind as `let (a, b) = ...` so `b`
+/// drops first.
+fn enroll_pair(a: &str, b: &str, namespace: &str) -> (Actor, Actor) {
+    let key_dir = tempfile::tempdir().expect("keydir");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(key_dir.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("chmod 0700 keydir");
+    }
+    let kp_a = ai_memory::identity::keypair::generate(a).expect("keypair a");
+    let kp_b = ai_memory::identity::keypair::generate(b).expect("keypair b");
+    ai_memory::identity::keypair::save(&kp_a, key_dir.path()).expect("save a");
+    ai_memory::identity::keypair::save(&kp_b, key_dir.path()).expect("save b");
+    let env = FedEnv::new(&[a, b], namespace, key_dir.path());
+    let actor_a = Actor {
+        id: a.to_string(),
+        kp: kp_a,
+        _key_dir: key_dir,
+        _env: env,
+    };
+    let actor_b = Actor {
+        id: b.to_string(),
+        kp: kp_b,
+        _key_dir: tempfile::tempdir().expect("unused dir"),
+        _env: FedEnv { saved: Vec::new() },
+    };
+    (actor_a, actor_b)
+}
+
+/// Open the rollout hatch for the calling test (restored by `FedEnv::drop`).
+fn open_transition_sig_hatch() {
+    // SAFETY: every caller holds FED_ENV_LOCK; FedEnv::drop restores the var.
+    unsafe {
+        std::env::set_var(
+            ai_memory::federation::receive_auth::REQUIRE_TRANSITION_SIG_ENV,
+            "0",
+        );
+    }
+}
+
+/// A 16-byte nonce literal helper is not needed; this one is for F3: a signed
+/// op whose nonce has the wrong length.
+fn op_with_nonce_len(actor: &Actor, action_id: &str, ns: &str, len: usize) -> ActionTransitionOp {
+    signed_op(
+        actor,
+        action_id,
+        ns,
+        ActionState::Pending,
+        ActionState::Claimed,
+        &vec![7u8; len],
+        1_700_009_100,
+    )
+}
+
+/// Strip the signature: an UNSIGNED op (no keypair) as the rollout hatch admits.
+fn unsigned(mut op: ActionTransitionOp) -> ActionTransitionOp {
+    op.signature = Vec::new();
+    op.signer_pubkey = Vec::new();
+    op
 }
 
 fn uniq(prefix: &str) -> String {
@@ -243,6 +318,40 @@ fn assert_not_acked(v: &Value, why: &str) {
     assert_eq!(count(v, "action_transitions_applied"), 0, "{why}; body={v}");
     assert!(count(v, "skipped") >= 1, "{why}: must be skipped; body={v}");
     assert_eq!(count(v, "noop"), 0, "{why}: must not be a noop; body={v}");
+}
+
+/// A `MakeWriter` target collecting WARN output for one push.
+#[derive(Clone, Default)]
+struct CapturedLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for CapturedLog {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("log lock").extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// `push`, capturing the receiver's WARN-level tracing output for the call.
+async fn push_logged(
+    router: &axum::Router,
+    actor: &str,
+    op: &ActionTransitionOp,
+) -> (Value, String) {
+    use tracing::instrument::WithSubscriber as _;
+    let logs = CapturedLog::default();
+    let writer = logs.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(move || writer.clone())
+        .finish();
+    let v = push(router, actor, op).with_subscriber(subscriber).await;
+    let text = String::from_utf8_lossy(&logs.0.lock().expect("log lock")).to_string();
+    (v, text)
 }
 
 fn app_state(
@@ -439,7 +548,7 @@ async fn sqlite_premature_transition_is_not_acked_and_retry_applies_4024() {
         &f.ns,
         ActionState::Pending,
         ActionState::Claimed,
-        b"4024-sq-a-t1",
+        b"4024-sq-a-t1____",
         1_700_009_100,
     );
     let t2 = signed_op(
@@ -448,7 +557,7 @@ async fn sqlite_premature_transition_is_not_acked_and_retry_applies_4024() {
         &f.ns,
         ActionState::Claimed,
         ActionState::InProgress,
-        b"4024-sq-a-t2",
+        b"4024-sq-a-t2____",
         1_700_009_200,
     );
 
@@ -500,7 +609,7 @@ async fn sqlite_lost_ack_redelivery_is_acked_noop_not_quarantined_4204() {
         &f.ns,
         ActionState::Pending,
         ActionState::Claimed,
-        b"4204-sq-a-t1",
+        b"4204-sq-a-t1____",
         1_700_009_100,
     );
 
@@ -533,6 +642,171 @@ async fn sqlite_lost_ack_redelivery_is_acked_noop_not_quarantined_4204() {
     assert_eq!(recorded, 1, "the re-delivery records nothing new");
 }
 
+fn sqlite_identity_rows(path: &std::path::Path, action_id: &str) -> i64 {
+    let conn = ai_memory::db::open(path).expect("rows conn");
+    conn.query_row(
+        "SELECT COUNT(*) FROM action_transition_nonces WHERE action_id = ?1",
+        [action_id],
+        |r| r.get(0),
+    )
+    .expect("count identity rows")
+}
+
+/// #4024 F1 (sqlite), the reviewer's attack: enrolled node B applies its OWN
+/// signed transition under node A's nonce first; A's real op then arrives. It
+/// must be `skipped` with a collision WARN - never an acknowledged `noop` of an
+/// op that never applied.
+#[tokio::test]
+async fn sqlite_identity_collision_other_signer_is_skipped_not_noop_4024_f1() {
+    let _g = FED_ENV_LOCK.lock().await;
+    let ns = uniq("ns4024f1a");
+    let (a, b) = enroll_pair("ai:fed4024f1-sq-a", "ai:fed4024f1-sq-b", &ns);
+    let f = sqlite_fixture(&a.id, &ns);
+    let nonce = b"stolen-nonce-016";
+    let op_b = signed_op(
+        &b,
+        &f.action_id,
+        &f.ns,
+        ActionState::Pending,
+        ActionState::Claimed,
+        nonce,
+        1_700_009_100,
+    );
+    let op_a = signed_op(
+        &a,
+        &f.action_id,
+        &f.ns,
+        ActionState::Pending,
+        ActionState::Claimed,
+        nonce,
+        1_700_009_101,
+    );
+    assert_applied(
+        &push(&f.router, &b.id, &op_b).await,
+        "B applies its own op under A\'s nonce",
+    );
+    let (r, logs) = push_logged(&f.router, &a.id, &op_a).await;
+    assert_not_acked(
+        &r,
+        "F1: A\'s real op under a colliding nonce is skipped, never a noop",
+    );
+    assert!(
+        logs.contains("identity collision"),
+        "F1: a distinct collision WARN is required; logs={logs}"
+    );
+    assert_eq!(sqlite_state(&f.path, &f.action_id), ActionState::Claimed);
+    assert_eq!(sqlite_identity_rows(&f.path, &f.action_id), 1);
+}
+
+/// #4024 F1 (sqlite) honest-reuse variant: one signer reuses a nonce for a
+/// DIFFERENT edge. Skipped, never an acked noop of a never-applied op.
+#[tokio::test]
+async fn sqlite_identity_reuse_same_signer_different_content_is_skipped_4024_f1() {
+    let _g = FED_ENV_LOCK.lock().await;
+    let ns = uniq("ns4024f1b");
+    let actor = enroll("ai:fed4024f1-sq-c", &ns);
+    let f = sqlite_fixture(&actor.id, &ns);
+    let nonce = b"reused-nonce-016";
+    let t1 = signed_op(
+        &actor,
+        &f.action_id,
+        &f.ns,
+        ActionState::Pending,
+        ActionState::Claimed,
+        nonce,
+        1_700_009_100,
+    );
+    let t2 = signed_op(
+        &actor,
+        &f.action_id,
+        &f.ns,
+        ActionState::Claimed,
+        ActionState::InProgress,
+        nonce,
+        1_700_009_200,
+    );
+    assert_applied(&push(&f.router, &actor.id, &t1).await, "T1 applies");
+    let (r, logs) = push_logged(&f.router, &actor.id, &t2).await;
+    assert_not_acked(
+        &r,
+        "F1: same signer, nonce reused for different content: skipped",
+    );
+    assert!(logs.contains("identity collision"), "logs={logs}");
+    assert_eq!(sqlite_state(&f.path, &f.action_id), ActionState::Claimed);
+    // The honest re-delivery of T1 is still an idempotent noop.
+    assert_idempotent_noop(&push(&f.router, &actor.id, &t1).await, "T1 re-delivery");
+}
+
+/// #4024 F2 (sqlite): an op admitted WITHOUT a verified signature (rollout
+/// hatch) records NO identity, so the real actor's later SIGNED op under the
+/// same nonce is applied, not acked as a noop.
+#[tokio::test]
+async fn sqlite_unverified_op_records_no_identity_and_real_signed_op_applies_4024_f2() {
+    let _g = FED_ENV_LOCK.lock().await;
+    let ns = uniq("ns4024f2");
+    let actor = enroll("ai:fed4024f2-sq", &ns);
+    open_transition_sig_hatch();
+    let f = sqlite_fixture(&actor.id, &ns);
+    let nonce = b"preseeded-nonce1";
+    let t_signed = signed_op(
+        &actor,
+        &f.action_id,
+        &f.ns,
+        ActionState::Pending,
+        ActionState::Claimed,
+        nonce,
+        1_700_009_100,
+    );
+    let release = signed_op(
+        &actor,
+        &f.action_id,
+        &f.ns,
+        ActionState::Claimed,
+        ActionState::Pending,
+        b"release-nonce-16",
+        1_700_009_200,
+    );
+    // An UNSIGNED op under the real actor's future nonce is admitted (hatch).
+    assert_applied(
+        &push(&f.router, &actor.id, &unsigned(t_signed.clone())).await,
+        "the hatch admits an unsigned op",
+    );
+    assert_eq!(
+        sqlite_identity_rows(&f.path, &f.action_id),
+        0,
+        "F2: an unverified op records NO identity"
+    );
+    assert_applied(
+        &push(&f.router, &actor.id, &release).await,
+        "release applies",
+    );
+    assert_applied(
+        &push(&f.router, &actor.id, &t_signed).await,
+        "F2: the real actor\'s signed op is applied, never noop\'d by a pre-seeded identity",
+    );
+    assert_eq!(sqlite_state(&f.path, &f.action_id), ActionState::Claimed);
+    assert_eq!(sqlite_identity_rows(&f.path, &f.action_id), 2);
+}
+
+/// #4024 F3 (sqlite): a signed op whose nonce is not exactly 16 bytes is refused
+/// (`skipped`) before the CAS - nothing applied, nothing recorded.
+#[tokio::test]
+async fn sqlite_nonce_not_16_bytes_is_refused_4024_f3() {
+    let _g = FED_ENV_LOCK.lock().await;
+    let ns = uniq("ns4024f3");
+    let actor = enroll("ai:fed4024f3-sq", &ns);
+    let f = sqlite_fixture(&actor.id, &ns);
+    for len in [0usize, 8, 17, 1024] {
+        let op = op_with_nonce_len(&actor, &f.action_id, &f.ns, len);
+        assert_not_acked(
+            &push(&f.router, &actor.id, &op).await,
+            &format!("F3: a {len}-byte nonce is refused"),
+        );
+    }
+    assert_eq!(sqlite_state(&f.path, &f.action_id), ActionState::Pending);
+    assert_eq!(sqlite_identity_rows(&f.path, &f.action_id), 0);
+}
+
 /// 5-agent vote (4d3ea1c5) items 2+3 (sqlite): the identity FK is `ON DELETE
 /// RESTRICT` — deleting an action that has recorded identities is REFUSED (so a
 /// future delete/purge path must handle them instead of silently reopening
@@ -554,7 +828,7 @@ async fn sqlite_identity_fk_restricts_action_delete_and_stats_counts_rows_4024()
         &f.ns,
         ActionState::Pending,
         ActionState::Claimed,
-        b"4024-sq-r-t1",
+        b"4024-sq-r-t1____",
         1_700_009_100,
     );
     assert_applied(&push(&f.router, &actor.id, &t1).await, "T1 applies");
@@ -600,7 +874,7 @@ async fn sqlite_transient_cas_error_does_not_burn_nonce_4024() {
         &f.ns,
         ActionState::Pending,
         ActionState::Claimed,
-        b"4024-sq-b-t1",
+        b"4024-sq-b-t1____",
         1_700_009_100,
     );
 
@@ -644,7 +918,7 @@ async fn sqlite_replay_across_cyclic_edge_and_restart_is_refused_4024() {
         &f.ns,
         ActionState::Pending,
         ActionState::Claimed,
-        b"4024-sq-c-t1",
+        b"4024-sq-c-t1____",
         1_700_009_100,
     );
     let release = signed_op(
@@ -653,7 +927,7 @@ async fn sqlite_replay_across_cyclic_edge_and_restart_is_refused_4024() {
         &f.ns,
         ActionState::Claimed,
         ActionState::Pending,
-        b"4024-sq-c-rel",
+        b"4024-sq-c-rel___",
         1_700_009_200,
     );
 
@@ -697,7 +971,7 @@ async fn sqlite_identity_record_failure_rolls_back_the_transition_4024() {
         &f.ns,
         ActionState::Pending,
         ActionState::Claimed,
-        b"4024-sq-d-t1",
+        b"4024-sq-d-t1____",
         1_700_009_100,
     );
 
@@ -821,7 +1095,7 @@ mod pg {
             &f.ns,
             ActionState::Pending,
             ActionState::Claimed,
-            b"4024-pg-a-t1",
+            b"4024-pg-a-t1____",
             1_700_009_100,
         );
         let t2 = signed_op(
@@ -830,7 +1104,7 @@ mod pg {
             &f.ns,
             ActionState::Claimed,
             ActionState::InProgress,
-            b"4024-pg-a-t2",
+            b"4024-pg-a-t2____",
             1_700_009_200,
         );
 
@@ -878,7 +1152,7 @@ mod pg {
             &f.ns,
             ActionState::Pending,
             ActionState::Claimed,
-            b"4204-pg-a-t1",
+            b"4204-pg-a-t1____",
             1_700_009_100,
         );
 
@@ -904,6 +1178,179 @@ mod pg {
         .await
         .expect("count identity rows");
         assert_eq!(recorded, 1, "the re-delivery records nothing new (pg)");
+    }
+
+    async fn pg_identity_rows(f: &PgFixture) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM action_transition_nonces WHERE action_id = $1")
+            .bind(&f.action_id)
+            .fetch_one(f.store.pool())
+            .await
+            .expect("count identity rows")
+    }
+
+    /// #4024 F1 (pg): the reviewer\'s attack, see the sqlite twin.
+    #[tokio::test]
+    async fn pg_identity_collision_other_signer_is_skipped_not_noop_4024_f1() {
+        let _g = FED_ENV_LOCK.lock().await;
+        let Some(url) = pg_url() else {
+            eprintln!(
+                "SKIP pg_identity_collision_other_signer_is_skipped_not_noop_4024_f1: env unset"
+            );
+            return;
+        };
+        let ns = uniq("pgns4024f1a");
+        let (a, b) = enroll_pair(&uniq("ai:fed4024f1-pg-a"), &uniq("ai:fed4024f1-pg-b"), &ns);
+        let f = pg_fixture(&url, &a.id, &ns).await;
+        let nonce = b"stolen-nonce-016";
+        let op_b = signed_op(
+            &b,
+            &f.action_id,
+            &f.ns,
+            ActionState::Pending,
+            ActionState::Claimed,
+            nonce,
+            1_700_009_100,
+        );
+        let op_a = signed_op(
+            &a,
+            &f.action_id,
+            &f.ns,
+            ActionState::Pending,
+            ActionState::Claimed,
+            nonce,
+            1_700_009_101,
+        );
+        assert_applied(
+            &push(&f.router, &b.id, &op_b).await,
+            "B applies its own op (pg)",
+        );
+        let (r, logs) = push_logged(&f.router, &a.id, &op_a).await;
+        assert_not_acked(
+            &r,
+            "F1 (pg): A\'s real op under a colliding nonce is skipped, never a noop",
+        );
+        assert!(logs.contains("identity collision"), "logs={logs}");
+        assert_eq!(f.state().await, ActionState::Claimed);
+        assert_eq!(pg_identity_rows(&f).await, 1);
+    }
+
+    /// #4024 F1 (pg) honest-reuse variant.
+    #[tokio::test]
+    async fn pg_identity_reuse_same_signer_different_content_is_skipped_4024_f1() {
+        let _g = FED_ENV_LOCK.lock().await;
+        let Some(url) = pg_url() else {
+            eprintln!(
+                "SKIP pg_identity_reuse_same_signer_different_content_is_skipped_4024_f1: env unset"
+            );
+            return;
+        };
+        let ns = uniq("pgns4024f1b");
+        let actor = enroll(&uniq("ai:fed4024f1-pg-c"), &ns);
+        let f = pg_fixture(&url, &actor.id, &ns).await;
+        let nonce = b"reused-nonce-016";
+        let t1 = signed_op(
+            &actor,
+            &f.action_id,
+            &f.ns,
+            ActionState::Pending,
+            ActionState::Claimed,
+            nonce,
+            1_700_009_100,
+        );
+        let t2 = signed_op(
+            &actor,
+            &f.action_id,
+            &f.ns,
+            ActionState::Claimed,
+            ActionState::InProgress,
+            nonce,
+            1_700_009_200,
+        );
+        assert_applied(&push(&f.router, &actor.id, &t1).await, "T1 applies (pg)");
+        let (r, logs) = push_logged(&f.router, &actor.id, &t2).await;
+        assert_not_acked(&r, "F1 (pg): nonce reused for different content: skipped");
+        assert!(logs.contains("identity collision"), "logs={logs}");
+        assert_eq!(f.state().await, ActionState::Claimed);
+        assert_idempotent_noop(
+            &push(&f.router, &actor.id, &t1).await,
+            "T1 re-delivery (pg)",
+        );
+    }
+
+    /// #4024 F2 (pg): unverified ops record no identity.
+    #[tokio::test]
+    async fn pg_unverified_op_records_no_identity_and_real_signed_op_applies_4024_f2() {
+        let _g = FED_ENV_LOCK.lock().await;
+        let Some(url) = pg_url() else {
+            eprintln!(
+                "SKIP pg_unverified_op_records_no_identity_and_real_signed_op_applies_4024_f2: env unset"
+            );
+            return;
+        };
+        let ns = uniq("pgns4024f2");
+        let actor = enroll(&uniq("ai:fed4024f2-pg"), &ns);
+        open_transition_sig_hatch();
+        let f = pg_fixture(&url, &actor.id, &ns).await;
+        let nonce = b"preseeded-nonce1";
+        let t_signed = signed_op(
+            &actor,
+            &f.action_id,
+            &f.ns,
+            ActionState::Pending,
+            ActionState::Claimed,
+            nonce,
+            1_700_009_100,
+        );
+        let release = signed_op(
+            &actor,
+            &f.action_id,
+            &f.ns,
+            ActionState::Claimed,
+            ActionState::Pending,
+            b"release-nonce-16",
+            1_700_009_200,
+        );
+        assert_applied(
+            &push(&f.router, &actor.id, &unsigned(t_signed.clone())).await,
+            "the hatch admits an unsigned op (pg)",
+        );
+        assert_eq!(
+            pg_identity_rows(&f).await,
+            0,
+            "F2 (pg): unverified op records NO identity"
+        );
+        assert_applied(
+            &push(&f.router, &actor.id, &release).await,
+            "release applies (pg)",
+        );
+        assert_applied(
+            &push(&f.router, &actor.id, &t_signed).await,
+            "F2 (pg): the real actor\'s signed op is applied, never noop\'d",
+        );
+        assert_eq!(f.state().await, ActionState::Claimed);
+        assert_eq!(pg_identity_rows(&f).await, 2);
+    }
+
+    /// #4024 F3 (pg): wrong-length nonce refused before the CAS.
+    #[tokio::test]
+    async fn pg_nonce_not_16_bytes_is_refused_4024_f3() {
+        let _g = FED_ENV_LOCK.lock().await;
+        let Some(url) = pg_url() else {
+            eprintln!("SKIP pg_nonce_not_16_bytes_is_refused_4024_f3: env unset");
+            return;
+        };
+        let ns = uniq("pgns4024f3");
+        let actor = enroll(&uniq("ai:fed4024f3-pg"), &ns);
+        let f = pg_fixture(&url, &actor.id, &ns).await;
+        for len in [0usize, 8, 17, 1024] {
+            let op = op_with_nonce_len(&actor, &f.action_id, &f.ns, len);
+            assert_not_acked(
+                &push(&f.router, &actor.id, &op).await,
+                &format!("F3 (pg): a {len}-byte nonce is refused"),
+            );
+        }
+        assert_eq!(f.state().await, ActionState::Pending);
+        assert_eq!(pg_identity_rows(&f).await, 0);
     }
 
     /// 5-agent vote (4d3ea1c5) items 2+3 (pg): ON DELETE RESTRICT + the row
@@ -933,7 +1380,7 @@ mod pg {
             &f.ns,
             ActionState::Pending,
             ActionState::Claimed,
-            b"4024-pg-r-t1",
+            b"4024-pg-r-t1____",
             1_700_009_100,
         );
         assert_applied(&push(&f.router, &actor.id, &t1).await, "T1 applies (pg)");
@@ -978,7 +1425,7 @@ mod pg {
             &f.ns,
             ActionState::Pending,
             ActionState::Claimed,
-            b"4024-pg-b-t1",
+            b"4024-pg-b-t1____",
             1_700_009_100,
         );
 
@@ -1029,7 +1476,7 @@ mod pg {
             &f.ns,
             ActionState::Pending,
             ActionState::Claimed,
-            b"4024-pg-c-t1",
+            b"4024-pg-c-t1____",
             1_700_009_100,
         );
         let release = signed_op(
@@ -1038,7 +1485,7 @@ mod pg {
             &f.ns,
             ActionState::Claimed,
             ActionState::Pending,
-            b"4024-pg-c-rel",
+            b"4024-pg-c-rel___",
             1_700_009_200,
         );
 
@@ -1085,7 +1532,7 @@ mod pg {
             &f.ns,
             ActionState::Pending,
             ActionState::Claimed,
-            b"4024-pg-e-t1",
+            b"4024-pg-e-t1____",
             1_700_009_100,
         );
         let release = signed_op(
@@ -1094,7 +1541,7 @@ mod pg {
             &f.ns,
             ActionState::Claimed,
             ActionState::Pending,
-            b"4024-pg-e-rel",
+            b"4024-pg-e-rel___",
             1_700_009_200,
         );
         assert_applied(&push(&f.router, &actor.id, &t1).await, "T1 applies (pg)");
@@ -1149,7 +1596,7 @@ mod pg {
             &f.ns,
             ActionState::Pending,
             ActionState::Claimed,
-            b"4024-pg-d-t1",
+            b"4024-pg-d-t1____",
             1_700_009_100,
         );
 

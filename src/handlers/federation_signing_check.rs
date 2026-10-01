@@ -1310,41 +1310,66 @@ pub(super) async fn sync_push_via_store(
             require_tx_sig,
         ) {
             crate::federation::receive_auth::TransitionAuthz::Accept => {
-                // #1805 + #4024 — per-transition anti-replay ATOMIC with the
+                // #1805 + #4024 - per-transition anti-replay ATOMIC with the
                 // apply (postgres twin of the sqlite `federation_receive`
-                // path): the signed nonce is recorded durably in the CAS
-                // transaction (`action_transition_cas_once`), so it is
-                // consumed iff the op applied. Empty nonce = unsigned op → no
-                // identity to record (plain CAS).
-                let outcome = match crate::actions::OpNonce::new(&op.nonce) {
-                    Some(nonce) => {
-                        app.store
-                            .action_transition_cas_once(
-                                &ctx,
-                                &crate::actions::RemoteTransition {
-                                    action_id: &op.action_id,
-                                    from: op.from_state,
-                                    to: op.to_state,
-                                    claimed_by: op.claimed_by.as_deref(),
-                                    now: op.updated_at,
-                                    nonce,
-                                },
-                            )
-                            .await
-                    }
-                    None => app
-                        .store
-                        .action_transition_cas(
-                            &ctx,
-                            &op.action_id,
-                            op.from_state,
-                            op.to_state,
-                            op.claimed_by.as_deref(),
-                            op.updated_at,
-                        )
-                        .await
-                        .map(crate::actions::RemoteCasOutcome::Fresh),
+                // path), VERIFIED arm only: the signed identity, bound to the
+                // op by a digest of its canonical signed bytes (F1), is
+                // recorded durably in the CAS transaction
+                // (`action_transition_cas_once`). A nonce that is not exactly
+                // 16 bytes is refused before the CAS (F3).
+                let Some((nonce, digest)) =
+                    crate::handlers::federation_receive::verified_op_identity(
+                        op,
+                        &signable,
+                        "sync_push(store)",
+                    )
+                else {
+                    skipped += 1;
+                    continue;
                 };
+                let outcome = app
+                    .store
+                    .action_transition_cas_once(
+                        &ctx,
+                        &crate::actions::RemoteTransition {
+                            action_id: &op.action_id,
+                            from: op.from_state,
+                            to: op.to_state,
+                            claimed_by: op.claimed_by.as_deref(),
+                            now: op.updated_at,
+                            nonce,
+                            digest,
+                        },
+                    )
+                    .await;
+                match crate::handlers::federation_receive::tally_remote_transition(
+                    op,
+                    outcome,
+                    "sync_push(store)",
+                ) {
+                    crate::handlers::federation_receive::TransitionTally::Applied => {
+                        action_transitions_applied += 1;
+                    }
+                    crate::handlers::federation_receive::TransitionTally::Noop => noop += 1,
+                    crate::handlers::federation_receive::TransitionTally::Skipped => skipped += 1,
+                }
+            }
+            crate::federation::receive_auth::TransitionAuthz::AcceptUnverified => {
+                // F2: admitted WITHOUT a verified signature (rollout hatch
+                // `AI_MEMORY_FED_REQUIRE_TRANSITION_SIG=0`): plain CAS, NO
+                // identity recorded.
+                let outcome = app
+                    .store
+                    .action_transition_cas(
+                        &ctx,
+                        &op.action_id,
+                        op.from_state,
+                        op.to_state,
+                        op.claimed_by.as_deref(),
+                        op.updated_at,
+                    )
+                    .await
+                    .map(crate::actions::RemoteCasOutcome::Fresh);
                 match crate::handlers::federation_receive::tally_remote_transition(
                     op,
                     outcome,

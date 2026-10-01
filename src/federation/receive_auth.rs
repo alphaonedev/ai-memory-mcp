@@ -30,8 +30,15 @@ use ed25519_dalek::VerifyingKey;
 /// logged) — never a hard error that aborts the rest of the push.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransitionAuthz {
-    /// Authenticated (or permissively accepted) — apply the CAS transition.
+    /// **Authenticated** - the signature verified against the actor's
+    /// locally-enrolled key. The ONLY arm that may record a durable operation
+    /// identity (#4024 F2, the #3164 `CheckpointResolutionAuthz` precedent).
     Accept,
+    /// **Permissively accepted with NO verified signature** - `require_sig` is
+    /// off (rollout hatch) and the op was unsigned or its actor has no enrolled
+    /// key. Apply via the plain CAS; record NOTHING (an unauthenticated,
+    /// sender-chosen nonce must never pre-empt the real actor's signed op).
+    AcceptUnverified,
     /// Unsigned op while signatures are required (fail-closed default).
     RejectUnsigned,
     /// Signed, but the attested actor has no enrolled public key locally.
@@ -79,14 +86,14 @@ pub fn authorize_remote_transition(
         return if require_sig {
             TransitionAuthz::RejectUnsigned
         } else {
-            TransitionAuthz::Accept
+            TransitionAuthz::AcceptUnverified
         };
     }
     let Some(key) = enrolled_key else {
         return if require_sig {
             TransitionAuthz::RejectNotEnrolled
         } else {
-            TransitionAuthz::Accept
+            TransitionAuthz::AcceptUnverified
         };
     };
     if verify_transition(signable, signature, key.as_bytes()) {
@@ -1654,7 +1661,7 @@ mod tests {
         );
         assert_eq!(
             authorize_remote_transition(&s, &[], None, None, false),
-            TransitionAuthz::Accept
+            TransitionAuthz::AcceptUnverified
         );
     }
 
@@ -1670,7 +1677,7 @@ mod tests {
         );
         assert_eq!(
             authorize_remote_transition(&s, &sig, None, None, false),
-            TransitionAuthz::Accept
+            TransitionAuthz::AcceptUnverified
         );
     }
 
