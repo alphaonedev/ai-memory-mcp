@@ -846,9 +846,9 @@ tool names is unaffected. On sqlite nothing changes.
 
 ### What still returns 501 on postgres
 
-Of the **86 unique production URL paths** (over **100 `.route(...)`
+Of the **89 unique production URL paths** (over **103 `.route(...)`
 registrations in `src/lib.rs`**, surfaced through
-`/api/v1/capabilities`), **73 are served on a postgres-backed daemon
+`/api/v1/capabilities`), **76 are served on a postgres-backed daemon
 and 13 are fully fail-closed** — every HTTP method on those 13 paths
 returns a uniform `501 NOT IMPLEMENTED`. The gate FAILS CLOSED by
 design: an un-migrated handler can never fall through to the empty
