@@ -450,7 +450,10 @@ pub fn reflect_with_hooks_for_caller(
     // Treat that as "use the compiled default" — i.e. fall back to
     // `GovernancePolicy::default()` which has `max_reflection_depth =
     // None` and therefore yields the compiled-in cap of 3.
+    // #4043 — an unreadable policy refuses the reflection (`?`); it never
+    // falls back to the compiled cap, which would lift an operator cap of 0.
     let policy = resolve_governance_policy(conn, &target_namespace)
+        .map_err(|e| ReflectError::Database(format!("{e:#}")))?
         .unwrap_or_else(GovernancePolicy::default);
     let cap = policy.effective_max_reflection_depth();
 

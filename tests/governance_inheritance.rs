@@ -111,6 +111,7 @@ fn inherit_default_governance_chain_5_deep_requires_approval_at_leaf() {
     // Five-deep leaf with no intermediate policies.
     let leaf = "alphaone/secure/team-a/svc/agent-1";
     let resolved = db::resolve_governance_policy(&conn, leaf)
+        .expect("#4043: governance policy read")
         .expect("ancestor policy must inherit to leaf (G1)");
     assert_eq!(
         resolved.core.write,
@@ -131,6 +132,7 @@ fn inherit_false_at_child_blocks_parent_policy() {
     seed_policy(&conn, "alphaone/secure/team-a", &child, "alice");
 
     let resolved = db::resolve_governance_policy(&conn, "alphaone/secure/team-a")
+        .expect("#4043: governance policy read")
         .expect("child has its own policy, must be returned");
     // Most-specific wins — child's `Any` overrides parent's `Approve`.
     assert_eq!(resolved.core.write, GovernanceLevel::Any);
@@ -150,6 +152,7 @@ fn most_specific_policy_wins_when_both_set() {
     seed_policy(&conn, "alphaone/secure/team-a", &any_policy(), "alice");
 
     let resolved = db::resolve_governance_policy(&conn, "alphaone/secure/team-a")
+        .expect("#4043: governance policy read")
         .expect("child has its own policy");
     assert_eq!(
         resolved.core.write,
@@ -166,6 +169,7 @@ fn child_with_no_policy_inherits_parent_policy() {
     seed_policy(&conn, "alphaone/secure", &approve_policy(), "alice");
     // NB: NO policy on "alphaone/secure/team-a".
     let resolved = db::resolve_governance_policy(&conn, "alphaone/secure/team-a")
+        .expect("#4043: governance policy read")
         .expect("parent policy must inherit");
     assert_eq!(resolved.core.write, GovernanceLevel::Approve);
     assert!(
@@ -185,7 +189,8 @@ fn audit_no_silent_bypass_in_v063_compatibility_path() {
     seed_policy(&conn, "betatwo/secure", &approve_policy(), "alice");
 
     // alphaone/* has no policy in any ancestor.
-    let resolved = db::resolve_governance_policy(&conn, "alphaone/secure/team-a");
+    let resolved = db::resolve_governance_policy(&conn, "alphaone/secure/team-a")
+        .expect("#4043: governance policy read");
     assert!(
         resolved.is_none(),
         "no policy anywhere in the chain → None (opt-in preserved)"
@@ -202,7 +207,7 @@ fn resolver_is_cycle_safe() {
     // No cycle here, but exercise a deep chain that forces the
     // explicit-parent fallback to no-op (no namespace_meta cycle).
     let leaf = "alphaone/a/b/c/d/e/f/g";
-    let _ = db::resolve_governance_policy(&conn, leaf);
+    let _ = db::resolve_governance_policy(&conn, leaf).expect("#4043: governance policy read");
 }
 
 /// Sanity check on `build_namespace_chain` shape — top-down with `*`

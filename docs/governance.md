@@ -92,6 +92,58 @@ changing. The global `*`
 default is not a governing ancestor for this gate, and the federated
 `namespace_meta` lanes keep their own peer-scope gate (#2479).
 
+### Corrupt standards resolve as SEVERED ([#4285](https://github.com/alphaonedev/ai-memory-mcp/issues/4285))
+
+A namespace standard whose `metadata.governance` does not deserialize (a
+typo'd enum variant, an out-of-band edit, an older binary) is handled exactly
+like a severed standard ([#2503](https://github.com/alphaonedev/ai-memory-mcp/issues/2503))
+**at every level of the chain, on both backends**: the walk continues (an
+intact ancestor policy is still honoured) and the resolved `write` / `promote`
+/ `delete` are raised to **at least Owner**. It is never a hard refusal (a
+corrupt `*` would otherwise be a substrate-wide write outage) and never
+"no policy" (the pre-#4285 behaviour silently fell through to
+allow-on-silence). The owner of the corrupt standard is still the namespace
+owner, so an owner write is not locked out; a non-owner write is refused.
+
+- **Signal.** `ai-memory doctor` reports every corrupt standard as
+  **Critical** ("Corrupt governance standards (#4285)", both backends) and the
+  daemon / MCP server / postgres connect emit one boot `WARN` listing each
+  namespace, standard id and a value-free reason (the error category and
+  position; a stored value is never echoed into a log, the census or a
+  response). Every resolve of a corrupt level also
+  logs a `WARN` on target `ai_memory::governance::policy_read`.
+- **What counts as corrupt.** A `metadata.governance` that fails the typed
+  deserialise, **or** (sqlite) a whole `metadata` cell that is not a JSON object
+  (invalid JSON, an array, a string, ...). A corrupt level contributes nothing
+  to ANY governance reader: the sibling walkers
+  (`require_approval_above_depth`, `skill_promotion_min_depth`) continue to the
+  ancestor and never honour a raw key of an unparseable policy.
+  `memory_namespace_get_standard` and the capabilities `rule_summary` report
+  the effective severed (Owner-floored) policy with `corrupt: true`, not the
+  permissive default. Whole-`metadata` corruption also loses the stored owner
+  id: the corrupt level has no owner, so the nearest ancestor standard's owner (if any) is the namespace owner, otherwise nobody is until the binding is repaired (fail closed).
+- **Documented limit (depth knobs).** A corrupt level also cannot state
+  `require_approval_above_depth` / `skill_promotion_min_depth`: those walks
+  continue to the ancestor (an ancestor's explicit value governs; with none,
+  the documented default applies, i.e. no approval gate), while the Owner floor
+  still gates WRITE at the corrupt level. A corrupt level that meant a stricter
+  depth gate degrades to the inherited one until repaired. For the skill
+  promotion floor only, a walk that passes a corrupt level and finds no explicit
+  value fails closed to `u32::MAX` (no promotion) until the standard is
+  repaired; an unconfigured chain keeps the default of 1.
+- **Repair.** Re-run `memory_namespace_set_standard` for the namespace with a
+  valid policy; the row is then read normally and no floor is applied.
+- **Documented limit.** A corrupt policy that *meant* something stricter than
+  Owner (`approve` / consensus) degrades to the Owner floor until repaired. The
+  doctor Critical is the operator's signal; the floor only ever tightens.
+- **Federation receive.** Measured by
+  `tests/fed_owner_floor_4285.rs`: the Owner floor does **not** refuse a
+  non-owner peer's relayed write on `/sync/push` (receive authorizes by peer
+  attestation and namespace scope, not by the namespace write level — see
+  *Enforcement scope* below). A corrupt standard therefore never turns
+  federation receive into an outage, and receive behaviour is identical to an
+  intact explicit Owner policy.
+
 ### Enforcement scope ([#1617](https://github.com/alphaonedev/ai-memory-mcp/issues/1617))
 
 The namespace-standard `CorePolicy` gates the **direct write
