@@ -235,7 +235,8 @@ sentinel_one() {
 # --harness-self-test: the harness's OWN two properties (r9 on #4292), run
 # against HARNESS_UNDER_TEST (default: this file) on one real gate.
 #   F1: a file someone creates in the tree mid-run is reported, never deleted.
-#   F2: a harness killed by SIGTERM in its sentinel phase leaves no sentinel.
+#   F2: a harness killed by SIGTERM / SIGINT in its sentinel phase leaves no
+#       sentinel and dies of the signal (rc 143 / 130, #4317).
 #   F3: a gate SIGTERMed during its full-tree run leaves no process running.
 if ((HARNESS_SELF_TEST)); then
   H="${HARNESS_UNDER_TEST:-scripts/test/test-gate-selftest-interrupt-cleanup.sh}"
@@ -276,43 +277,56 @@ if ((HARNESS_SELF_TEST)); then
     st_fail=$((st_fail + 1))
   fi
 
-  # F2. Wait until a sentinel is planted, then SIGTERM the harness.
-  st_n=$((st_n + 1))
-  st_before=$(porcelain)
-  bash "$H" "$G" >"$st_log" 2>&1 &
-  hp=$!
-  planted=""
-  deadline=$((SECONDS + 300))
-  while kill -0 "$hp" 2>/dev/null && ((SECONDS < deadline)) && [[ -z "$planted" ]]; do
-    for q in "${gdecl[@]}"; do
-      if [[ -f "$q" ]] && grep -q '^SENTINEL #4292' "$q" 2>/dev/null; then planted=$q; break; fi
+  # F2. Wait until a sentinel is planted, then interrupt the harness. The
+  # harness must clean up and then DIE OF THE SIGNAL: 143 for TERM, 130 for
+  # INT. A bare "rc != 0" would pass a regression that swallows the signal
+  # into an ordinary exit 1, which is the #4292 class itself (#4317).
+  # INT is delivered from a harness started with SIGINT at its default
+  # disposition: a `&` job starts with SIGINT ignored, bash cannot trap a
+  # signal ignored at start, and the INT cell would otherwise test nothing.
+  f2_cell() {
+    local sig=$1 want=$2 hp planted="" deadline q hrc left=""
+    st_n=$((st_n + 1))
+    st_before=$(porcelain)
+    python3 -c 'import os, signal, sys
+signal.signal(signal.SIGINT, signal.SIG_DFL)
+signal.signal(signal.SIGQUIT, signal.SIG_DFL)
+os.execvp("bash", ["bash"] + sys.argv[1:])' "$H" "$G" >"$st_log" 2>&1 &
+    hp=$!
+    deadline=$((SECONDS + 300))
+    while kill -0 "$hp" 2>/dev/null && ((SECONDS < deadline)) && [[ -z "$planted" ]]; do
+      for q in "${gdecl[@]}"; do
+        if [[ -f "$q" ]] && grep -q '^SENTINEL #4292' "$q" 2>/dev/null; then planted=$q; break; fi
+      done
+      sleep 0.01
     done
-    sleep 0.01
-  done
-  if [[ -z "$planted" ]]; then
-    kill -TERM "$hp" 2>/dev/null
-    wait "$hp" 2>/dev/null
-    echo "not ok ${st_n} - F2: no sentinel was ever planted, nothing was interrupted (log: ${st_log})"
-    st_fail=$((st_fail + 1))
-  else
-    kill -TERM "$hp" 2>/dev/null
+    if [[ -z "$planted" ]]; then
+      kill -TERM "$hp" 2>/dev/null
+      wait "$hp" 2>/dev/null
+      echo "not ok ${st_n} - F2 ${sig}: no sentinel was ever planted, nothing was interrupted (log: ${st_log})"
+      st_fail=$((st_fail + 1))
+      return
+    fi
+    kill "-${sig}" "$hp" 2>/dev/null
     deadline=$((SECONDS + 30))
     while kill -0 "$hp" 2>/dev/null && ((SECONDS < deadline)); do sleep 0.05; done
+    kill -KILL "$hp" 2>/dev/null
     wait "$hp" 2>/dev/null
     hrc=$?
-    left=""
     for q in "${gdecl[@]}"; do [[ -e "$q" ]] && left="${left} ${q}"; done
-    if [[ -z "$left" && "$(porcelain)" == "$st_before" ]] && ((hrc == 143)); then
-      echo "ok ${st_n} - F2: SIGTERM during the sentinel phase (${planted}) left the tree unchanged (rc=${hrc})"
+    if [[ -z "$left" && "$(porcelain)" == "$st_before" ]] && ((hrc == want)); then
+      echo "ok ${st_n} - F2 ${sig}: SIG${sig} during the sentinel phase (${planted}) left the tree unchanged and the harness died of it (rc=${hrc})"
     else
-      echo "not ok ${st_n} - F2: SIGTERM during the sentinel phase stranded:${left:- (nothing)} or did not die of the signal (rc=${hrc}, want 143)"
+      echo "not ok ${st_n} - F2 ${sig}: SIG${sig} during the sentinel phase stranded:${left:- (nothing)} or did not die of the signal (rc=${hrc}, want ${want})"
       st_fail=$((st_fail + 1))
       # Leave the tree as found: only files carrying the harness's sentinel mark.
       for q in "${gdecl[@]}"; do
         [[ -f "$q" ]] && grep -q '^SENTINEL #4292' "$q" 2>/dev/null && rm -f -- "$q"
       done
     fi
-  fi
+  }
+  f2_cell TERM 143
+  f2_cell INT 130
 
   # F3 (r9 INFO): a SIGTERM to a gate while its full-tree run is in progress
   # must stop that run's pipelines too, not only its top shell. The run is
