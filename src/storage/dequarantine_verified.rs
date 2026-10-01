@@ -27,7 +27,8 @@ use crate::models::{LifecycleState, Memory};
 /// does not carry the verified surface.
 ///
 /// # Errors
-/// Propagates a record-stop refusal, a read/decrypt failure (fail closed: the
+/// Propagates a record-stop refusal, a `BEGIN IMMEDIATE`/`COMMIT` failure when
+/// this call owns the transaction, a read/decrypt failure (fail closed: the
 /// row stays quarantined) or the UPDATE error.
 pub fn dequarantine_if_verified_unit(
     conn: &Connection,
@@ -37,17 +38,21 @@ pub fn dequarantine_if_verified_unit(
     crate::storage::record_stop::gate_storage_conn(conn)?;
     // One write lock from the read to the UPDATE: a concurrent writer (another
     // process on this file) cannot swap the content between check and release.
-    let txn = crate::storage::connection::WriteTxn::begin(conn)?;
-    let Some(persisted) = super::get_any(conn, id)? else {
-        return Ok(false);
-    };
-    if persisted.lifecycle_state != LifecycleState::Quarantined {
-        return Ok(false);
-    }
-    if !crate::models::persisted_is_verified_unit(&persisted, verified_inbound) {
-        return Ok(false);
-    }
-    let released = super::dequarantine(conn, id)?;
-    txn.commit()?;
-    Ok(released)
+    // #4314 — `in_write_txn` (#3152) opens `BEGIN IMMEDIATE` when the
+    // connection is in autocommit and JOINS a caller-held transaction
+    // otherwise. A nested `BEGIN` would error, leaving an attested row
+    // quarantined with only a WARN. When joined, the caller's COMMIT/ROLLBACK
+    // decides whether the release lands.
+    crate::storage::connection::in_write_txn(conn, || {
+        let Some(persisted) = super::get_any(conn, id)? else {
+            return Ok(false);
+        };
+        if persisted.lifecycle_state != LifecycleState::Quarantined {
+            return Ok(false);
+        }
+        if !crate::models::persisted_is_verified_unit(&persisted, verified_inbound) {
+            return Ok(false);
+        }
+        super::dequarantine(conn, id)
+    })
 }
