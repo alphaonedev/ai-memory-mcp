@@ -243,6 +243,9 @@ trait Fixture {
     async fn force_approved(&self, pid: &str);
     /// #4345 — number of `approved` rows with no execution marker.
     async fn count_unmarked_approved(&self) -> i64;
+    /// #4416 — overwrite the row's stored payload with raw JSON text (the
+    /// shapes the presence predicate must classify).
+    async fn set_payload_raw(&self, pid: &str, json: &str);
 }
 
 async fn run_cell(
@@ -380,6 +383,14 @@ impl Fixture for SqliteFixture {
         )
         .expect("force approved");
     }
+    async fn set_payload_raw(&self, pid: &str, json: &str) {
+        let conn = rusqlite::Connection::open(&self.path).expect("fixture connection");
+        conn.execute(
+            "UPDATE pending_actions SET payload = ?1 WHERE id = ?2",
+            rusqlite::params![json, pid],
+        )
+        .expect("set payload");
+    }
     async fn count_unmarked_approved(&self) -> i64 {
         let conn = rusqlite::Connection::open(&self.path).expect("fixture connection");
         conn.query_row(
@@ -491,6 +502,14 @@ impl Fixture for PgFixture {
         .execute(&self.pool)
         .await
         .expect("force approved");
+    }
+    async fn set_payload_raw(&self, pid: &str, json: &str) {
+        sqlx::query("UPDATE pending_actions SET payload = $1::jsonb WHERE id = $2")
+            .bind(json)
+            .bind(pid)
+            .execute(&self.pool)
+            .await
+            .expect("set payload");
     }
     async fn count_unmarked_approved(&self) -> i64 {
         sqlx::query_scalar(
@@ -811,4 +830,305 @@ async fn unmarked_approved_counted_and_local_execute_stamps_pg_4345() {
     let _g = FED_ENV_LOCK.lock().await;
     let (router, store, fx) = pg_env(&url).await;
     marker_cell_unmarked("postgres", &router, &store, &fx).await;
+}
+
+// ---------------------------------------------------------------------
+// #4416 F4 — ONE presence predicate: a marker is a JSON OBJECT key holding a
+// STRING. A null, a number, or a string element of an array is NOT a marker, so
+// reject must still land on such a row (on both backends alike).
+// ---------------------------------------------------------------------
+
+async fn predicate_edge_cases_cell(
+    backend: &str,
+    router: &axum::Router,
+    store: &Arc<dyn MemoryStore>,
+    fixture: &impl Fixture,
+) {
+    let (root, _approver) = governed(store, "p").await;
+    for (label, raw) in [
+        ("null value", r#"{"__effect_applied_at": null}"#),
+        ("number value", r#"{"__effect_applied_at": 5}"#),
+        ("array string element", r#"["__effect_applied_at"]"#),
+        (
+            "nested object value",
+            r#"{"__effect_applied_at": {"a": 1}}"#,
+        ),
+    ] {
+        let (pid, ..) = queue_pending(router, &root).await;
+        fixture.set_payload_raw(&pid, raw).await;
+        let rejected = store
+            .pending_decide(&admin_ctx(), &pid, false, "ai:rejecter-4416")
+            .await
+            .expect("pending_decide");
+        assert!(
+            rejected,
+            "#4416 ({backend}): `{label}` is NOT an execution marker, so reject must land"
+        );
+    }
+    clear_posture();
+}
+
+#[tokio::test]
+async fn presence_predicate_edge_cases_sqlite_4416() {
+    let _g = FED_ENV_LOCK.lock().await;
+    let (router, store, fx) = sqlite_env();
+    predicate_edge_cases_cell("sqlite", &router, &store, &fx).await;
+}
+
+#[cfg(feature = "sal-postgres")]
+#[tokio::test]
+async fn presence_predicate_edge_cases_pg_4416() {
+    let Some(url) = pg_url_or_skip("presence_predicate_edge_cases_pg_4416") else {
+        return;
+    };
+    let _g = FED_ENV_LOCK.lock().await;
+    let (router, store, fx) = pg_env(&url).await;
+    predicate_edge_cases_cell("postgres", &router, &store, &fx).await;
+}
+
+// =====================================================================
+// s4025b adversarial cells (#4416 forged marker, #4417 re-push, #4346 F3 local
+// execute, concurrency), adopted as red-first cells
+// =====================================================================
+
+/// A wire `pendings[]` entry whose payload ALREADY carries the reserved
+/// execution-marker key (peer-supplied; no effect ever ran on this node).
+fn forged_entry(pid: &str, namespace: &str, title: &str) -> Value {
+    let mut e = pending_entry(pid, namespace, title);
+    e["payload"]["__effect_applied_at"] = json!("2026-01-01T00:00:00Z");
+    e
+}
+
+/// SECURE EXPECTATION: a marker that arrived over the wire must not be
+/// honoured: (1) a legitimate local reject must succeed; (2) on a second row
+/// a valid approval must RUN the effect.
+async fn forged_marker_stripped_4416(
+    backend: &str,
+    router: &axum::Router,
+    store: &Arc<dyn MemoryStore>,
+    fixture: &impl Fixture,
+) {
+    let (root, approver) = governed(store, "f").await;
+    let ns = format!("{root}/ok");
+    let rej_pid = uuid::Uuid::new_v4().to_string();
+    let app_pid = uuid::Uuid::new_v4().to_string();
+    let rej_title = uniq("forged-rej");
+    let app_title = uniq("forged-app");
+    let report = push(
+        router,
+        vec![
+            forged_entry(&rej_pid, &ns, &rej_title),
+            forged_entry(&app_pid, &ns, &app_title),
+        ],
+        vec![],
+    )
+    .await;
+    eprintln!("{backend} ingest report: {report}");
+    let rej_marked = fixture.has_marker(&rej_pid).await;
+    eprintln!("{backend} wire marker persisted on ingest: {rej_marked}");
+
+    let rejected = store
+        .pending_decide(&admin_ctx(), &rej_pid, false, "ai:rejecter-adv")
+        .await
+        .expect("pending_decide");
+    let rej_status = pending_status(store, &rej_pid).await;
+    eprintln!("{backend} reject over forged marker -> {rejected}, status={rej_status}");
+
+    let decision = json!({"id": app_pid, "approved": true, "decider": approver});
+    let report = push(router, vec![], vec![decision]).await;
+    let app_status = pending_status(store, &app_pid).await;
+    let effects = fixture.count_title(&ns, &app_title).await;
+    eprintln!(
+        "{backend} approve over forged marker -> status={app_status} effects={effects} report={report}"
+    );
+    clear_posture();
+    assert!(
+        rejected && rej_status == "rejected",
+        "CELL ({backend}): a peer-forged marker made a legitimate reject refuse (status={rej_status})"
+    );
+    assert_eq!(
+        effects, 1,
+        "CELL ({backend}): a peer-forged marker made an approval skip its effect (status={app_status})"
+    );
+}
+
+/// The originator's re-push of its own (still pending) row overwrites the
+/// payload and erases a LEGITIMATE marker -> reject is then allowed over an
+/// applied effect.
+async fn repush_keeps_marker_4417(
+    backend: &str,
+    router: &axum::Router,
+    store: &Arc<dyn MemoryStore>,
+    fixture: &impl Fixture,
+) {
+    let (root, _approver) = governed(store, "s").await;
+    let ns = format!("{root}/ok");
+    let pid = uuid::Uuid::new_v4().to_string();
+    let title = uniq("strip");
+    let entry = pending_entry(&pid, &ns, &title);
+    push(router, vec![entry.clone()], vec![]).await;
+    fixture.stamp_marker(&pid).await; // effect applied, crash before approval
+    assert!(fixture.has_marker(&pid).await);
+    push(router, vec![entry], vec![]).await; // originator re-push (same requested_by)
+    let still = fixture.has_marker(&pid).await;
+    let rejected = store
+        .pending_decide(&admin_ctx(), &pid, false, "ai:rejecter-adv")
+        .await
+        .expect("pending_decide");
+    eprintln!("{backend} after re-push marker={still}, reject -> {rejected}");
+    clear_posture();
+    assert!(
+        still && !rejected,
+        "CELL ({backend}): a wire re-push erased the execution marker; reject landed over an applied effect"
+    );
+}
+
+/// N concurrent approvals of one row: exactly one effect, row approved.
+async fn concurrent_approvals_one_effect_4025(
+    backend: &str,
+    router: &axum::Router,
+    store: &Arc<dyn MemoryStore>,
+    fixture: &impl Fixture,
+    marked_first: bool,
+) {
+    let (root, approver) = governed(store, "c").await;
+    let (pid, ns, title) = queue_pending(router, &root).await;
+    if marked_first {
+        fixture.stamp_marker(&pid).await;
+    }
+    let mut hs = Vec::new();
+    for _ in 0..6 {
+        let s = store.clone();
+        let p = pid.clone();
+        let a = approver.clone();
+        hs.push(tokio::spawn(async move {
+            s.approve_execute_pending_action(&admin_ctx(), &p, &a).await
+        }));
+    }
+    let mut outs = Vec::new();
+    for h in hs {
+        outs.push(format!("{:?}", h.await.expect("join")));
+    }
+    let status = pending_status(store, &pid).await;
+    let effects = fixture.count_title(&ns, &title).await;
+    let marked = fixture.has_marker(&pid).await;
+    eprintln!(
+        "{backend} concurrent(marked_first={marked_first}) status={status} effects={effects} marker={marked} outs={outs:?}"
+    );
+    clear_posture();
+    assert_eq!(status, "approved", "{backend}");
+    assert_eq!(
+        effects,
+        if marked_first { 0 } else { 1 },
+        "{backend}: {outs:?}"
+    );
+    assert!(marked, "{backend}");
+}
+
+#[tokio::test]
+async fn forged_marker_stripped_4416_sqlite() {
+    let _g = FED_ENV_LOCK.lock().await;
+    let (router, store, fx) = sqlite_env();
+    forged_marker_stripped_4416("sqlite", &router, &store, &fx).await;
+}
+
+#[tokio::test]
+async fn repush_keeps_marker_4417_sqlite() {
+    let _g = FED_ENV_LOCK.lock().await;
+    let (router, store, fx) = sqlite_env();
+    repush_keeps_marker_4417("sqlite", &router, &store, &fx).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_approvals_one_effect_4025_sqlite() {
+    let _g = FED_ENV_LOCK.lock().await;
+    let (router, store, fx) = sqlite_env();
+    concurrent_approvals_one_effect_4025("sqlite", &router, &store, &fx, false).await;
+}
+
+#[cfg(feature = "sal-postgres")]
+#[tokio::test]
+async fn forged_marker_stripped_4416_pg() {
+    let Some(url) = pg_url_or_skip("forged_marker_stripped_4416_pg") else {
+        return;
+    };
+    let _g = FED_ENV_LOCK.lock().await;
+    let (router, store, fx) = pg_env(&url).await;
+    forged_marker_stripped_4416("postgres", &router, &store, &fx).await;
+}
+
+#[cfg(feature = "sal-postgres")]
+#[tokio::test]
+async fn repush_keeps_marker_4417_pg() {
+    let Some(url) = pg_url_or_skip("repush_keeps_marker_4417_pg") else {
+        return;
+    };
+    let _g = FED_ENV_LOCK.lock().await;
+    let (router, store, fx) = pg_env(&url).await;
+    repush_keeps_marker_4417("postgres", &router, &store, &fx).await;
+}
+
+#[cfg(feature = "sal-postgres")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn concurrent_approvals_one_effect_4025_pg() {
+    let Some(url) = pg_url_or_skip("concurrent_approvals_one_effect_4025_pg") else {
+        return;
+    };
+    let _g = FED_ENV_LOCK.lock().await;
+    let (router, store, fx) = pg_env(&url).await;
+    concurrent_approvals_one_effect_4025("postgres", &router, &store, &fx, false).await;
+}
+
+#[cfg(feature = "sal-postgres")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn concurrent_approvals_one_effect_4025_marked_pg() {
+    let Some(url) = pg_url_or_skip("concurrent_approvals_one_effect_4025_marked_pg") else {
+        return;
+    };
+    let _g = FED_ENV_LOCK.lock().await;
+    let (router, store, fx) = pg_env(&url).await;
+    concurrent_approvals_one_effect_4025("postgres", &router, &store, &fx, true).await;
+}
+
+/// A pending row WITH the marker (effect applied; approval not yet committed)
+/// approved through the LOCAL surface: does the local execute re-run the effect?
+async fn local_execute_honours_marker_4346(
+    backend: &str,
+    router: &axum::Router,
+    store: &Arc<dyn MemoryStore>,
+    fixture: &impl Fixture,
+) {
+    let (root, approver) = governed(store, "l").await;
+    let (pid, ns, title) = queue_pending(router, &root).await;
+    fixture.stamp_marker(&pid).await;
+    store
+        .approve_with_approver_type(&admin_ctx(), &pid, &approver)
+        .await
+        .expect("local approve");
+    let r = store.execute_pending_action(&admin_ctx(), &pid).await;
+    let effects = fixture.count_title(&ns, &title).await;
+    eprintln!("{backend} local approve+execute over marker -> exec={r:?} effects={effects}");
+    clear_posture();
+    assert_eq!(
+        effects, 0,
+        "CELL ({backend}): local execute re-ran an effect the marker says already landed"
+    );
+}
+
+#[tokio::test]
+async fn local_execute_honours_marker_4346_sqlite() {
+    let _g = FED_ENV_LOCK.lock().await;
+    let (router, store, fx) = sqlite_env();
+    local_execute_honours_marker_4346("sqlite", &router, &store, &fx).await;
+}
+
+#[cfg(feature = "sal-postgres")]
+#[tokio::test]
+async fn local_execute_honours_marker_4346_pg() {
+    let Some(url) = pg_url_or_skip("local_execute_honours_marker_4346_pg") else {
+        return;
+    };
+    let _g = FED_ENV_LOCK.lock().await;
+    let (router, store, fx) = pg_env(&url).await;
+    local_execute_honours_marker_4346("postgres", &router, &store, &fx).await;
 }

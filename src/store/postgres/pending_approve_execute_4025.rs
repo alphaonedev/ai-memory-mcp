@@ -12,18 +12,17 @@
 //!
 //! # Shape
 //!
-//! Two phases (#4345, GOD ruling on #4025). Phase 1: one transaction takes the
-//! pending row `FOR UPDATE`, evaluates the eligibility gate (the SAME
+//! One transaction (#4345 / #4416): it takes the pending row `FOR UPDATE`,
+//! evaluates the eligibility gate (the SAME
 //! [`PostgresStore::approver_refusal_reason`] the approve surface runs), runs
-//! the effect through the standard SAL arms, then stamps the durable EXECUTION
-//! MARKER and COMMITS it, the row still `pending`. An effect error rolls the
-//! transaction back, so nothing about the decision is durable and a redelivery
-//! retries the unit. Phase 2: a compare-and-set that requires the marker writes
-//! the approval, and for a consensus threshold the final vote. Between the
-//! phases the row is `pending` WITH an applied effect, which reject and the
-//! timeout sweep refuse to overwrite and which a redelivered approval completes
-//! without re-running the effect. The row lock keeps every other decision path
-//! from deciding the row while its effect is in flight.
+//! the effect through the standard SAL arms, stamps the durable EXECUTION
+//! MARKER and writes the approval (and, for a consensus threshold, the final
+//! vote) in that same transaction, committing marker and approval together. An
+//! effect error rolls the transaction back, so nothing about the decision is
+//! durable and a redelivery retries the unit. A `pending` row that already
+//! carries the marker (server-written only; the wire is stripped of it) has its
+//! effect applied, so only the approval is committed. The row lock keeps every
+//! other decision path from deciding the row while its effect is in flight.
 //!
 //! The effect arms commit on their OWN pool connections (they are the shared
 //! SAL surfaces), so this needs a pool of at least two connections; with one,
@@ -47,15 +46,22 @@ const STATUS_PENDING: &str = "pending";
 /// Status string of an approved pending action.
 const STATUS_APPROVED: &str = "approved";
 
-/// The approval commit (phase 2, after the marker committed).
-const SQL_COMMIT_APPROVAL: &str = "UPDATE pending_actions \
+/// The approval commit, inside the transaction that holds the row lock. It
+/// requires the marker: stamped just before it (or already present).
+const SQL_COMMIT_APPROVAL: &str = concat!(
+    "UPDATE pending_actions \
      SET status = 'approved', decided_by = $1, decided_at = NOW(), approvals = $2 \
-     WHERE id = $3 AND status = 'pending' AND payload ? '__effect_applied_at'";
+     WHERE id = $3 AND status = 'pending' AND ",
+    crate::storage::marker_present_pg!("payload")
+);
 
 /// #4345 — stamp the execution marker (idempotent: an existing one is kept).
-const SQL_STAMP_MARKER: &str = "UPDATE pending_actions \
+const SQL_STAMP_MARKER: &str = concat!(
+    "UPDATE pending_actions \
      SET payload = jsonb_set(payload, '{__effect_applied_at}', to_jsonb($1::text)) \
-     WHERE id = $2 AND NOT (payload ? '__effect_applied_at')";
+     WHERE id = $2 AND jsonb_typeof(payload) = 'object' AND ",
+    crate::storage::marker_absent_pg!("payload")
+);
 
 impl PostgresStore {
     /// Body of [`crate::store::MemoryStore::approve_execute_pending_action`]
@@ -160,15 +166,16 @@ impl PostgresStore {
         as_approved.decided_at = Some(chrono::Utc::now().to_rfc3339());
         as_approved.approvals = approvals;
         // #4345 — a pending row WITH the marker has its effect applied: only
-        // the approval is left to commit, never a second effect.
+        // the approval is left to commit, never a second effect. (#4416: the
+        // marker is server-written only, so it can be trusted.)
         let memory_id = if effect_already_applied {
             None
         } else {
             // An effect error returns here; dropping `tx` rolls the lock back.
             let id = self.pg_execute_pending_effect(ctx, &as_approved).await?;
-            // Stamp the marker IN the locked transaction and COMMIT it before
-            // the approval: from this commit on the row is `pending` WITH an
-            // applied effect, which reject / sweep refuse to overwrite.
+            // The marker and the approval commit TOGETHER, in the transaction
+            // that holds the row lock (#4416 F3: no gap in which another
+            // decision path could land between the two).
             sqlx::query(SQL_STAMP_MARKER)
                 .bind(chrono::Utc::now().to_rfc3339())
                 .bind(pending_id)
@@ -177,26 +184,26 @@ impl PostgresStore {
                 .map_err(|e| to_store_err("approve_execute_pending stamp marker", e))?;
             id
         };
-        tx.commit()
-            .await
-            .map_err(|e| to_store_err("approve_execute_pending commit marker", e))?;
-
-        // Phase 2 — the approval compare-and-set, requiring the marker. A
-        // single statement is atomic on its own; a concurrent approver that
-        // won between the two phases leaves this one matching nothing.
         let committed = sqlx::query(SQL_COMMIT_APPROVAL)
             .bind(&decider)
             .bind(approvals_json(&as_approved.approvals)?)
             .bind(pending_id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(|e| to_store_err("approve_execute_pending commit approval", e))?
             .rows_affected();
         if committed == 0 {
-            // Another approver completed the unit between the phases (the
-            // marker is durable, so the effect is accounted for).
-            return Ok(FederatedApproveOutcome::AlreadyApproved);
+            // Unreachable while the row lock is held; refuse loudly if not.
+            return Err(StoreError::IntegrityFailed {
+                detail: format!(
+                    "pending action {pending_id}: approval compare-and-set matched no \
+                     pending row under its own lock (#4025)"
+                ),
+            });
         }
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("approve_execute_pending commit", e))?;
         // S5-M1 parity: the approve audit row captures the post-execute state.
         // Best-effort, exactly like `execute_pending_action`.
         if let Err(e) = self

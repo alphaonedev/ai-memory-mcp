@@ -93,33 +93,111 @@ pub enum FederatedApproveOutcome {
 /// an approved action's effect landed (module docs).
 pub const EFFECT_MARKER_KEY: &str = "__effect_applied_at";
 
-/// #4345 — `WHERE`-clause fragment (sqlite) that is true when the row's payload
-/// carries NO execution marker. Every path that would record a refusal over a
-/// `pending` row (reject, timeout sweep) ANDs this in, so a refused decision is
-/// never recorded over an applied effect. A malformed payload counts as
-/// unmarked (the `CASE` keeps `json_extract` from erroring the whole statement).
-pub const EFFECT_MARKER_ABSENT_SQL: &str = "CASE WHEN json_valid(payload) THEN \
-     json_extract(payload, '$.__effect_applied_at') END IS NULL";
+/// #4416 — every payload key that only the SERVER may write. The wire never
+/// carries one: [`strip_reserved_payload_keys`] removes them from every inbound
+/// payload before it is stored.
+pub const RESERVED_PAYLOAD_KEYS: &[&str] = &[EFFECT_MARKER_KEY];
 
-/// #4345 — the postgres twin of [`EFFECT_MARKER_ABSENT_SQL`].
-pub const PG_EFFECT_MARKER_ABSENT_SQL: &str = "NOT (payload ? '__effect_applied_at')";
+/// #4416 — remove every [`RESERVED_PAYLOAD_KEYS`] entry from `payload`, so a
+/// peer (or any remote-to-local funnel) can never plant the execution marker:
+/// it can only be written server-side, after an effect landed. A non-object
+/// payload has nothing to strip. Returns `true` when a key was removed.
+pub fn strip_reserved_payload_keys(payload: &mut serde_json::Value) -> bool {
+    let Some(obj) = payload.as_object_mut() else {
+        return false;
+    };
+    let mut removed = false;
+    for key in RESERVED_PAYLOAD_KEYS {
+        removed |= obj.remove(*key).is_some();
+    }
+    removed
+}
 
-/// #4345 — count of `approved` rows with no execution marker (sqlite).
-const SQL_COUNT_APPROVED_UNMARKED: &str = "SELECT COUNT(*) FROM pending_actions \
-     WHERE status = 'approved' AND CASE WHEN json_valid(payload) THEN \
-     json_extract(payload, '$.__effect_applied_at') END IS NULL";
-
-/// #4345 — count of `approved` rows with no execution marker (postgres).
-pub const PG_COUNT_APPROVED_UNMARKED_SQL: &str = "SELECT COUNT(*) FROM pending_actions \
-     WHERE status = 'approved' AND NOT (payload ? '__effect_applied_at')";
-
-/// #4345 — `true` when `payload` carries the execution marker.
+/// #4416 / F4 — the ONE definition of "this payload carries a marker": a JSON
+/// OBJECT whose marker key holds a STRING. A `null`, a number, or a string
+/// element inside an array is NOT a marker. The SQL macros below spell the
+/// same predicate; every reader (approve, reject, sweep, doctor, local execute)
+/// uses one of the two.
 #[must_use]
 pub fn payload_has_effect_marker(payload: &serde_json::Value) -> bool {
     payload
         .as_object()
-        .is_some_and(|o| o.contains_key(EFFECT_MARKER_KEY))
+        .and_then(|o| o.get(EFFECT_MARKER_KEY))
+        .is_some_and(serde_json::Value::is_string)
 }
+
+/// SQLite: boolean SQL expression, true when column `$col` holds the marker
+/// (mirror of [`payload_has_effect_marker`]); never errors on malformed JSON.
+macro_rules! marker_present_sqlite {
+    ($col:literal) => {
+        concat!(
+            "COALESCE(CASE WHEN json_valid(",
+            $col,
+            ") THEN json_type(",
+            $col,
+            ", '$.__effect_applied_at') = 'text' END, 0)"
+        )
+    };
+}
+/// SQLite: true when column `$col` carries NO marker.
+macro_rules! marker_absent_sqlite {
+    ($col:literal) => {
+        concat!(
+            "(NOT COALESCE(CASE WHEN json_valid(",
+            $col,
+            ") THEN json_type(",
+            $col,
+            ", '$.__effect_applied_at') = 'text' END, 0))"
+        )
+    };
+}
+/// PostgreSQL (jsonb): boolean SQL expression, true when column `$col` holds
+/// the marker (mirror of [`payload_has_effect_marker`]).
+macro_rules! marker_present_pg {
+    ($col:literal) => {
+        concat!(
+            "COALESCE(jsonb_typeof(",
+            $col,
+            ") = 'object' AND jsonb_typeof(",
+            $col,
+            " -> '__effect_applied_at') = 'string', false)"
+        )
+    };
+}
+/// PostgreSQL: true when column `$col` carries NO marker.
+macro_rules! marker_absent_pg {
+    ($col:literal) => {
+        concat!(
+            "(NOT COALESCE(jsonb_typeof(",
+            $col,
+            ") = 'object' AND jsonb_typeof(",
+            $col,
+            " -> '__effect_applied_at') = 'string', false))"
+        )
+    };
+}
+pub(crate) use {marker_absent_pg, marker_absent_sqlite, marker_present_pg, marker_present_sqlite};
+
+/// #4345 — `WHERE`-clause fragment (sqlite) that is true when the row's payload
+/// carries NO execution marker. Every path that would record a refusal over a
+/// `pending` row (reject, timeout sweep) ANDs this in, so a refused decision is
+/// never recorded over an applied effect.
+pub const EFFECT_MARKER_ABSENT_SQL: &str = marker_absent_sqlite!("payload");
+
+/// #4345 — the postgres twin of [`EFFECT_MARKER_ABSENT_SQL`].
+pub const PG_EFFECT_MARKER_ABSENT_SQL: &str = marker_absent_pg!("payload");
+
+/// #4345 — count of `approved` rows with no execution marker (sqlite).
+const SQL_COUNT_APPROVED_UNMARKED: &str = concat!(
+    "SELECT COUNT(*) FROM pending_actions WHERE status = 'approved' AND ",
+    marker_absent_sqlite!("payload")
+);
+
+/// #4345 — count of `approved` rows with no execution marker (postgres).
+pub const PG_COUNT_APPROVED_UNMARKED_SQL: &str = concat!(
+    "SELECT COUNT(*) FROM pending_actions WHERE status = 'approved' AND ",
+    marker_absent_pg!("payload")
+);
 
 /// #4345 — stamp the execution marker on `pending_id` (sqlite). Called right
 /// after the effect landed, before the approval commits. Idempotent: an
@@ -132,8 +210,8 @@ pub fn mark_effect_applied(conn: &Connection, pending_id: &str) -> Result<()> {
     conn.execute(
         "UPDATE pending_actions \
          SET payload = json_set(payload, '$.__effect_applied_at', ?1) \
-         WHERE id = ?2 AND json_valid(payload) \
-           AND json_extract(payload, '$.__effect_applied_at') IS NULL",
+         WHERE id = ?2 AND json_valid(payload) AND \
+           (NOT COALESCE(json_type(payload, '$.__effect_applied_at') = 'text', 0))",
         params![chrono::Utc::now().to_rfc3339(), pending_id],
     )?;
     Ok(())

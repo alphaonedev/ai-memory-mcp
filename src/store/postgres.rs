@@ -26688,13 +26688,15 @@ impl MemoryStore for PostgresStore {
             .begin()
             .await
             .map_err(|e| to_store_err("pending_decide begin tx", e))?;
-        let rows_affected = sqlx::query(
+        let rows_affected = sqlx::query(concat!(
             // #4345 — a REFUSAL never lands over an applied effect: a pending
             // row carrying the execution marker only moves forward.
             "UPDATE pending_actions SET status = $1, decided_by = $2, decided_at = NOW()
              WHERE id = $3 AND status = 'pending'
-               AND ($1 = 'approved' OR NOT (payload ? '__effect_applied_at'))",
-        )
+               AND ($1 = 'approved' OR ",
+            crate::storage::marker_absent_pg!("payload"),
+            ")"
+        ))
         .bind(new_status)
         .bind(decided_by)
         .bind(id)
@@ -26759,6 +26761,10 @@ impl MemoryStore for PostgresStore {
     ) -> StoreResult<String> {
         self.gate_record_stop().await?;
         let pending_id = uuid::Uuid::new_v4().to_string();
+        // #4416 — the server-only execution marker is never caller-writable.
+        let mut payload = payload.clone();
+        crate::storage::strip_reserved_payload_keys(&mut payload);
+        let payload = &payload;
         sqlx::query(
             "INSERT INTO pending_actions \
              (id, action_type, memory_id, namespace, payload, requested_by, requested_at, status) \
@@ -30242,16 +30248,18 @@ impl MemoryStore for PostgresStore {
         if default_secs <= 0 {
             return Ok(Vec::new());
         }
-        let rows = sqlx::query(
+        let rows = sqlx::query(concat!(
             "UPDATE pending_actions
                 SET status = 'expired', expired_at = NOW()
               WHERE status = 'pending'
-                AND NOT (payload ? '__effect_applied_at')
+                AND ",
+            crate::storage::marker_absent_pg!("payload"),
+            "
                 AND requested_at
                     + make_interval(secs => COALESCE(default_timeout_seconds, $1)::double precision)
                     < NOW()
-            RETURNING id, namespace",
-        )
+            RETURNING id, namespace"
+        ))
         .bind(default_secs)
         .fetch_all(&self.pool)
         .await
@@ -32599,6 +32607,25 @@ impl MemoryStore for PostgresStore {
             return Err(StoreError::InvalidInput {
                 detail: format!("cannot execute non-approved action (status={})", pa.status),
             });
+        }
+        // #4416/F3 — a marked row's effect already landed (the marker is only
+        // written server-side, after an effect): never run it a second time.
+        if crate::storage::payload_has_effect_marker(&pa.payload) {
+            if let Err(e) = self
+                .pg_emit_pending_action_event(
+                    &pa,
+                    crate::storage::PENDING_ACTION_APPROVED_EVENT,
+                    pa.decided_by.as_deref(),
+                )
+                .await
+            {
+                tracing::warn!(
+                    target: crate::signed_events::SIGNED_EVENTS_TRACE_TARGET,
+                    pending_id = %pending_id,
+                    "failed to append pending_action.approved audit row: {e}"
+                );
+            }
+            return Ok(None);
         }
         let memory_id = self.pg_execute_pending_effect(ctx, &pa).await?;
         // #4345 — stamp the execution marker (best-effort: the effect already

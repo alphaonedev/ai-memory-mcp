@@ -336,7 +336,8 @@ const PG_UNIQUE_VIOLATION_SQLSTATE: &str = "23505";
 ///   so a peer replay cannot clobber a decision this node already made;
 /// * and only when `requested_by` matches, so one peer cannot rewrite another
 ///   requester's queued action by id.
-const SQL_UPSERT_REMOTE_PENDING_ACTION: &str = "INSERT INTO pending_actions \
+const SQL_UPSERT_REMOTE_PENDING_ACTION: &str = concat!(
+    "INSERT INTO pending_actions \
         (id, action_type, memory_id, namespace, payload, requested_by, \
          requested_at, status, decided_by, decided_at, approvals) \
      VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', NULL, NULL, '[]'::jsonb) \
@@ -344,11 +345,17 @@ const SQL_UPSERT_REMOTE_PENDING_ACTION: &str = "INSERT INTO pending_actions \
         action_type  = EXCLUDED.action_type, \
         memory_id    = EXCLUDED.memory_id, \
         namespace    = EXCLUDED.namespace, \
-        payload      = EXCLUDED.payload, \
+        payload      = CASE WHEN ",
+    crate::storage::marker_present_pg!("pending_actions.payload"),
+    " \
+            THEN jsonb_set(EXCLUDED.payload, '{__effect_applied_at}', \
+                           pending_actions.payload -> '__effect_applied_at') \
+            ELSE EXCLUDED.payload END, \
         requested_by = EXCLUDED.requested_by, \
         requested_at = EXCLUDED.requested_at \
      WHERE pending_actions.status = 'pending' \
-       AND pending_actions.requested_by = EXCLUDED.requested_by";
+       AND pending_actions.requested_by = EXCLUDED.requested_by"
+);
 
 impl PostgresStore {
     /// #3075 — see [`crate::store::MemoryStore::apply_remote_pending_action`].
@@ -373,12 +380,15 @@ impl PostgresStore {
                     pa.id, pa.requested_at
                 ),
             })?;
+        // #4416 — the wire never carries the server-only execution marker.
+        let mut payload = pa.payload.clone();
+        crate::storage::strip_reserved_payload_keys(&mut payload);
         sqlx::query(SQL_UPSERT_REMOTE_PENDING_ACTION)
             .bind(&pa.id)
             .bind(&pa.action_type)
             .bind(&pa.memory_id)
             .bind(&pa.namespace)
-            .bind(&pa.payload)
+            .bind(&payload)
             .bind(&pa.requested_by)
             .bind(requested_at)
             .execute(&self.pool)

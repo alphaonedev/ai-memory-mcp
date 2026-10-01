@@ -900,8 +900,12 @@ pub mod model_attest;
 mod pending_approve_execute_4025;
 pub use pending_approve_execute_4025::{
     EFFECT_MARKER_ABSENT_SQL, EFFECT_MARKER_KEY, FederatedApproveOutcome,
-    PG_COUNT_APPROVED_UNMARKED_SQL, PG_EFFECT_MARKER_ABSENT_SQL, approve_execute_pending_action,
-    count_approved_without_effect_marker, mark_effect_applied, payload_has_effect_marker,
+    PG_COUNT_APPROVED_UNMARKED_SQL, PG_EFFECT_MARKER_ABSENT_SQL, RESERVED_PAYLOAD_KEYS,
+    approve_execute_pending_action, count_approved_without_effect_marker, mark_effect_applied,
+    payload_has_effect_marker, strip_reserved_payload_keys,
+};
+pub(crate) use pending_approve_execute_4025::{
+    marker_absent_pg, marker_absent_sqlite, marker_present_pg, marker_present_sqlite,
 };
 /// #1955 [P1][R45] — substrate record-stop actuator (storage layer): the
 /// non-feature-gated flag registry + attestation logic + the
@@ -23618,7 +23622,10 @@ pub fn queue_pending_action(
     crate::storage::record_stop::gate_storage_conn(conn)?;
     let id = uuid::Uuid::new_v4().to_string();
     let now = Utc::now().to_rfc3339();
-    let payload_json = serde_json::to_string(payload)?;
+    // #4416 — the server-only execution marker is never caller-writable.
+    let mut payload = payload.clone();
+    strip_reserved_payload_keys(&mut payload);
+    let payload_json = serde_json::to_string(&payload)?;
     conn.execute(
         "INSERT INTO pending_actions (id, action_type, memory_id, namespace, payload, requested_by, requested_at, status)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending')",
@@ -23680,9 +23687,13 @@ pub fn queue_pending_action(
 /// (identical `requested_by`) still converges.
 pub fn upsert_pending_action(conn: &Connection, pa: &PendingAction) -> Result<()> {
     crate::storage::record_stop::gate_storage_conn(conn)?;
-    let payload_json = serde_json::to_string(&pa.payload)?;
+    // #4416 — the wire never carries the server-only execution marker.
+    let mut payload = pa.payload.clone();
+    strip_reserved_payload_keys(&mut payload);
+    let payload_json = serde_json::to_string(&payload)?;
     conn.execute(
-        "INSERT INTO pending_actions
+        concat!(
+            "INSERT INTO pending_actions
          (id, action_type, memory_id, namespace, payload, requested_by,
           requested_at, status, decided_by, decided_at, approvals)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', NULL, NULL, '[]')
@@ -23690,11 +23701,17 @@ pub fn upsert_pending_action(conn: &Connection, pa: &PendingAction) -> Result<()
             action_type  = excluded.action_type,
             memory_id    = excluded.memory_id,
             namespace    = excluded.namespace,
-            payload      = excluded.payload,
+            payload      = CASE WHEN ",
+            marker_present_sqlite!("pending_actions.payload"),
+            "
+                THEN json_set(excluded.payload, '$.__effect_applied_at',
+                              json_extract(pending_actions.payload, '$.__effect_applied_at'))
+                ELSE excluded.payload END,
             requested_by = excluded.requested_by,
             requested_at = excluded.requested_at
          WHERE pending_actions.status = 'pending'
-           AND pending_actions.requested_by = excluded.requested_by",
+           AND pending_actions.requested_by = excluded.requested_by"
+        ),
         params![
             pa.id,
             pa.action_type,
@@ -24464,6 +24481,18 @@ pub fn execute_pending_action(conn: &Connection, pending_id: &str) -> Result<Opt
                 status: pa.status.clone(),
             },
         ));
+    }
+    // #4416/F3 — a row whose execution marker is set (the marker is only ever
+    // written server-side, after an effect) has its effect applied: the local
+    // approve-then-execute path must not run it a second time.
+    if payload_has_effect_marker(&pa.payload) {
+        emit_pending_action_event(
+            conn,
+            &pa,
+            PENDING_ACTION_APPROVED_EVENT,
+            pa.decided_by.as_deref(),
+        );
+        return Ok(None);
     }
     let memory_id = execute_pending_effect(conn, &pa)?;
     // #4345 — stamp the execution marker so a later federated redelivery (and
