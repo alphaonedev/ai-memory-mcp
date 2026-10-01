@@ -151,5 +151,5 @@ src/store/postgres.rs	pg_apply_entitled_attestation_in_tx
 # pool connection while holding the tx one): callers PostgresStore::update and
 # update_with_expected_version_once, both gate_record_stop at entry (section (b))
 src/store/postgres/lifecycle_tx_3152.rs	apply_lifecycle_patch_in_tx
-# #4078 repair (reviewed): runs only inside the migrate/open repair transaction; clears a regenerable cache (embed_skip), no durable text. Deliberately NOT routed through the record-stop gate: a repair inside the ladder must not consult it.
+# #4078 repair (reviewed): runs only inside the migrate/open repair transaction; visibility pub(super) (#4324) so only crate::storage migrate callers can reach it; clears a regenerable cache (embed_skip), no durable text. Deliberately NOT routed through the record-stop gate: a repair inside the ladder must not consult it.
 src/storage/embed_skip.rs	repair_sqlite_after_trigger_gap
