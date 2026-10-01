@@ -905,6 +905,8 @@ pub mod record_stop;
 // v1.0.0 #2445 — the schema DOWNGRADE guard (an OLDER binary must not
 // silently open and WRITE a NEWER database). Its own module so the pure
 // verdict is shared verbatim by the sqlite and postgres funnels.
+/// #4356 — sqlite reader for the ancestor-owner bind gate.
+pub mod ns_standard_ancestor;
 pub(crate) mod reflect;
 pub mod schema_guard;
 /// v1.0.0 (#3113) — core-relation integrity for the migration ladder.

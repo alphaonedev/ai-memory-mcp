@@ -87,6 +87,9 @@ mod tx_retry;
 // take NO relation-level DDL lock on connect. Own module for the same
 // qual_10 budget reason as `parity_3064` above.
 mod bootstrap_ddl;
+// #4356 — the ancestor-owner bind gate's postgres reader (own module for the
+// same qual_10 budget reason as `parity_3064` above).
+mod ns_standard_ancestor_4356;
 // v1.0.0 #3614 — the lineage walk (recursive CTE + AGE Cypher + the backend
 // dispatcher + the #3041 cycle check) and its two helpers. Own module for the
 // same qual_10 budget reason as `parity_3064` above: a pure MOVE (rule l),
@@ -26643,12 +26646,21 @@ impl MemoryStore for PostgresStore {
             .map_err(|e| to_store_err("set_namespace_standard begin", e))?;
         if !ctx.bypass_visibility {
             let binding = pg_namespace_standard_binding(&mut tx, namespace).await?;
-            crate::store::authorize_namespace_standard_mutation(
-                ctx,
+            // #4356 — the ancestor-owner gate on a first bind, read in THIS tx
+            // (fail-closed floor); one shared verdict with the sqlite twin.
+            let ancestor = if crate::ns_standard_ancestor::needs_ancestor(&binding) {
+                ns_standard_ancestor_4356::governing_ancestor_in_tx(&mut tx, namespace).await?
+            } else {
+                crate::ns_standard_ancestor::GoverningAncestor::None
+            };
+            crate::ns_standard_ancestor::set_admission(
+                ctx.effective_principal(),
+                false,
                 namespace,
                 &binding,
-                crate::store::NamespaceStandardOp::Set,
-            )?;
+                &ancestor,
+            )
+            .map_err(|r| crate::store::set_refusal_to_store_err(r, namespace))?;
         }
         sqlx::query(
             "INSERT INTO namespace_meta (namespace, standard_id, updated_at, parent_namespace)
@@ -26668,6 +26680,18 @@ impl MemoryStore for PostgresStore {
             .await
             .map_err(|e| to_store_err("set_namespace_standard commit", e))?;
         Ok(())
+    }
+
+    async fn namespace_governing_ancestor(
+        &self,
+        namespace: &str,
+    ) -> StoreResult<crate::ns_standard_ancestor::GoverningAncestor> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("namespace_governing_ancestor begin", e))?;
+        ns_standard_ancestor_4356::governing_ancestor_in_tx(&mut tx, namespace).await
     }
 
     async fn clear_namespace_standard(

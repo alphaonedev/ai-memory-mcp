@@ -74,6 +74,18 @@ allow-on-silence default is appropriate for single-operator local
 substrates, not for shared or federated deployments. Child
 namespaces inherit the parent's policy by default (`inherit: true`),
 so one standard at `org/` governs the subtree until a child opts out.
+Opting a child out is itself an authorized act (#4356): binding the
+**first** standard (or repairing a severed binding) at a namespace
+under a governed ancestor requires the caller to own the **nearest
+governing ancestor's** standard — the nearest ancestor on the
+governance chain whose standard carries a `metadata.governance`
+policy (a bound standard with no policy does not shadow a governed
+grandparent). A non-owner is refused with the usual 403 `NOT_OWNER`
+(the owner is never named). An ungoverned root, an unowned (`system`)
+ancestor standard and the daemon / operator CLI are unaffected, and a
+severed or dangling governing ancestor fails closed. The global `*`
+default is not a governing ancestor for this gate, and the federated
+`namespace_meta` lanes keep their own peer-scope gate (#2479).
 
 ### Enforcement scope ([#1617](https://github.com/alphaonedev/ai-memory-mcp/issues/1617))
 
