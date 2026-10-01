@@ -1205,7 +1205,7 @@ footer.site-foot a { color: var(--text-muted); }
     </svg>
 
     <div class="callout">
-      <strong>Reversibility is the rule, not the exception.</strong> Every destructive operation has an undo path. Archive instead of delete. Supersede instead of overwrite. The only hard delete is <code>memory_archive_purge</code> (CLI: <code>ai-memory archive purge --older-than-days &lt;N&gt;</code>) — scoped by the <code>older_than_days</code> safety knob and audit-logged.
+      <strong>Reversibility is the default, not a universal guarantee.</strong> Most destructive operations are archive-first and restorable: archive instead of delete, supersede instead of overwrite, and plain CLI <code>ai-memory delete</code> archives before it removes. Irreversible paths exist and are named here so nobody assumes an undo that is not there: <code>memory_archive_purge</code> (CLI: <code>ai-memory archive purge --older-than-days &lt;N&gt;</code>, scoped by the <code>older_than_days</code> safety knob and audit-logged); <code>ai-memory delete --hard</code>; and MCP <code>memory_delete</code> (and HTTP <code>DELETE /api/v1/memories/{id}</code>) on any row outside the caller's inbox, which erases the row and keeps only a content-free tombstone. Only an inbox message (<code>_inbox/&lt;agent&gt;</code>) is archived by those two surfaces. Recovery after an irreversible path is a <code>backup</code> restore.
     </div>
   </div>
 </section>
