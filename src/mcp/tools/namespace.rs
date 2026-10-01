@@ -348,11 +348,31 @@ pub fn handle_namespace_set_standard_trusted(
     handle_namespace_set_standard_inner(conn, params, Some(trusted_caller))
 }
 
+/// Error context for the #4356 set-standard write transaction (begin / commit).
+const SET_STANDARD_TXN_CONTEXT: &str = "set-standard write transaction";
+
 fn handle_namespace_set_standard_inner(
     conn: &rusqlite::Connection,
     params: &Value,
     trusted_caller: Option<&str>,
 ) -> Result<Value, String> {
+    // #4356 — the owner gates (#3758 rebind, #4356 ancestor) and every write
+    // of a SET run inside ONE `BEGIN IMMEDIATE` transaction (joined when the
+    // caller already holds one), so the gate reads the chain under the single
+    // sqlite write lock: a concurrent ancestor bind from another connection or
+    // process is either committed before this read or ordered after this bind,
+    // never interleaved between check and write (#4023/#4447 TOCTOU class).
+    // Every early return (a refusal or an error) drops `txn`, which rolls back,
+    // so nothing partial lands; only the success path below commits.
+    let txn = if conn.is_autocommit() {
+        Some(
+            crate::storage::connection::WriteTxn::begin(conn).map_err(|e| {
+                crate::mcp::error_text::mcp_foreign_err(SET_STANDARD_TXN_CONTEXT, e)
+            })?,
+        )
+    } else {
+        None
+    };
     let namespace = params["namespace"]
         .as_str()
         .ok_or(crate::errors::msg::NAMESPACE_REQUIRED)?;
@@ -559,6 +579,10 @@ fn handle_namespace_set_standard_inner(
     }
     if let Some(g) = governance_val {
         resp[field_names::GOVERNANCE] = g.clone();
+    }
+    if let Some(txn) = txn {
+        txn.commit()
+            .map_err(|e| crate::mcp::error_text::mcp_foreign_err(SET_STANDARD_TXN_CONTEXT, e))?;
     }
     Ok(resp)
 }

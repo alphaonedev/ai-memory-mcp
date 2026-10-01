@@ -14,12 +14,28 @@
 //! (CWE-284 / CWE-863, both backends).
 //!
 //! 5-agent vote (4d3ea1c5), unanimous option A: binding the first standard (or
-//! repairing a severed binding) under a governed ancestor requires the
-//! caller to be the owner of the NEAREST governing ancestor's standard. This
+//! repairing a severed binding: #3758 admits a SET on an unresolvable pointer
+//! as the repair path, and this gate then decides it) under a governed
+//! ancestor requires the caller to be the owner of the NEAREST governing
+//! ancestor's standard. This
 //! module is the ONE backend-blind verdict; each backend contributes only a
 //! reader that yields [`AncestorLevel`]s and the shared selector
 //! [`select_governing_ancestor`] picks the deciding one, so the two adapters
 //! cannot classify the same chain differently (the #2488 lesson).
+//!
+//! Corrupt ancestor metadata (#4356 CR1): the deciding level is classified
+//! from the RAW stored metadata by [`classify_standard_metadata`], the local
+//! equivalent of the #4285 classifier (same three outcomes, same rule: not
+//! JSON, not an object, or a `governance` blob that fails the typed
+//! deserialise is corrupt). A corrupt level is [`AncestorLevel::Severed`] and
+//! refuses every non-bypass first bind below it, on both backends.
+//!
+//! Race safety (#4023/#4447 TOCTOU class): every funnel re-reads the chain
+//! inside the bind's own write transaction. On sqlite that transaction is
+//! `BEGIN IMMEDIATE` (one writer); on postgres the bind first takes the
+//! transaction-scoped advisory lock [`PG_STANDARD_BIND_LOCK_KEY`], so a
+//! concurrent ancestor bind is either committed before the child's chain read
+//! or ordered after the child's bind, never interleaved.
 //!
 //! Deliberately NOT gated (vote rulings): the global `*` standard (a
 //! substrate default, not a subtree — and gating it would make every first
@@ -84,6 +100,48 @@ pub const REASON_ANCESTOR_STANDARD_UNRESOLVABLE: &str = "cannot bind a namespace
 /// Wire-pinned refusal text for [`SetRefusal::Unverifiable`].
 pub const REASON_STANDARD_UNVERIFIABLE: &str = "cannot verify the namespace-standard owner chain; refusing the bind rather than \
      treating the standard as unowned";
+
+/// #4356 — the postgres transaction-scoped advisory-lock key every
+/// namespace-standard SET takes before it reads the binding and the ancestor
+/// chain (single key, so trivially deadlock-free, CONCURRENCY-04). Public so
+/// the race cell can stand in for an in-flight bind with the same lock.
+pub const PG_STANDARD_BIND_LOCK_KEY: &str = "ai_memory:namespace_meta:standard_bind";
+
+/// #4356 CR1 — what a bound standard's stored metadata contributes to the
+/// gate. The local equivalent of the #4285 classifier
+/// (`classify_standard_metadata_value`): metadata that is not a JSON object,
+/// or whose `governance` blob fails the typed deserialise, is corrupt and the
+/// level is [`AncestorLevel::Severed`] (fail closed: a corrupt ancestor never
+/// lets a non-owner bind). A `governance` key that is absent or JSON `null`
+/// carries no policy ([`AncestorLevel::NoPolicy`]). A governing standard's
+/// owner is `metadata.agent_id`: absent / `null` / empty / `system` is
+/// unowned; a non-string `agent_id` is corrupt (Severed), never "unowned".
+#[must_use]
+pub fn classify_standard_metadata(metadata: &serde_json::Value) -> AncestorLevel {
+    if !metadata.is_object() {
+        return AncestorLevel::Severed;
+    }
+    match crate::models::GovernancePolicy::from_metadata(metadata) {
+        None => AncestorLevel::NoPolicy,
+        Some(Err(_)) => AncestorLevel::Severed,
+        Some(Ok(_)) => match metadata.get(crate::mcp::param_names::AGENT_ID) {
+            None | Some(serde_json::Value::Null) => AncestorLevel::Governing { owner: None },
+            Some(serde_json::Value::String(o)) => AncestorLevel::Governing {
+                owner: normalise_owner(Some(o.clone())),
+            },
+            Some(_) => AncestorLevel::Severed,
+        },
+    }
+}
+
+/// [`classify_standard_metadata`] over the RAW stored text (the sqlite
+/// column). Unparseable text is corrupt ([`AncestorLevel::Severed`]); the
+/// lenient row mapper would read it as `{}` ("no policy") and fail open.
+#[must_use]
+pub fn classify_standard_metadata_text(raw: &str) -> AncestorLevel {
+    serde_json::from_str::<serde_json::Value>(raw)
+        .map_or(AncestorLevel::Severed, |v| classify_standard_metadata(&v))
+}
 
 /// Normalise a standard's owner: empty / `system` / absent = unowned.
 #[must_use]
@@ -243,6 +301,79 @@ mod tests {
         assert_eq!(select_governing_ancestor(lv), Ok(GoverningAncestor::None));
         let lv: Vec<Result<AncestorLevel, &str>> = vec![Err("fault")];
         assert_eq!(select_governing_ancestor(lv), Err("fault"));
+    }
+
+    /// #4356 N1: #3758 admits a SET on an unresolvable pointer (the repair
+    /// path); the ancestor gate then decides it, so the governing ancestor's
+    /// owner may repair and nobody else may.
+    #[test]
+    fn severed_target_repair_is_decided_by_the_ancestor_owner_4356() {
+        let un = NamespaceStandardBinding::Unresolvable;
+        assert!(set_admission("a", false, "gov/leaf", &un, &gov(Some("a"))).is_ok());
+        assert_eq!(
+            set_admission("s", false, "gov/leaf", &un, &gov(Some("a"))),
+            Err(SetRefusal::NotOwner)
+        );
+    }
+
+    /// #4356: owner match is EXACT (no case folding, no pid-suffix prefix match).
+    #[test]
+    fn owner_match_is_exact_4356() {
+        let nm = NamespaceStandardBinding::NoMetaRow;
+        for near in ["A", "a:pid-1", "a ", " a"] {
+            assert_eq!(
+                set_admission(near, false, "gov/leaf", &nm, &gov(Some("a"))),
+                Err(SetRefusal::NotOwner),
+                "{near:?}"
+            );
+        }
+    }
+
+    /// #4356 CR1: the corrupt shapes classify Severed, never `NoPolicy`.
+    #[test]
+    fn corrupt_metadata_classifies_severed_4356() {
+        for raw in [
+            "[]",
+            r#""x""#,
+            "7",
+            "null",
+            "{not json",
+            r#"{"governance":{"write":42}}"#,
+            r#"{"governance":"owner"}"#,
+            r#"{"governance":{"write":"owner"},"agent_id":7}"#,
+        ] {
+            assert_eq!(
+                classify_standard_metadata_text(raw),
+                AncestorLevel::Severed,
+                "{raw}"
+            );
+        }
+        assert_eq!(
+            classify_standard_metadata_text(r#"{"agent_id":"a"}"#),
+            AncestorLevel::NoPolicy
+        );
+        assert_eq!(
+            classify_standard_metadata_text(r#"{"agent_id":"a","governance":null}"#),
+            AncestorLevel::NoPolicy
+        );
+        assert_eq!(
+            classify_standard_metadata_text(r#"{"agent_id":"a","governance":{"write":"any"}}"#),
+            AncestorLevel::Governing {
+                owner: Some("a".into())
+            }
+        );
+        for unowned in [
+            r#"{"governance":{"write":"any"}}"#,
+            r#"{"agent_id":null,"governance":{"write":"any"}}"#,
+            r#"{"agent_id":"system","governance":{"write":"any"}}"#,
+            r#"{"agent_id":"","governance":{"write":"any"}}"#,
+        ] {
+            assert_eq!(
+                classify_standard_metadata_text(unowned),
+                AncestorLevel::Governing { owner: None },
+                "{unowned}"
+            );
+        }
     }
 
     #[test]
