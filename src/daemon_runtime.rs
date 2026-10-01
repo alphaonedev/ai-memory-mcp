@@ -6486,6 +6486,7 @@ pub async fn bootstrap_serve(
     let resolved_ttl = app_config.effective_ttl();
     let archive_on_gc = app_config.effective_archive_on_gc();
     let conn = db::open(db_path)?;
+    db::boot_warn_corrupt_governance_standards(&conn); // #4285
     // v1.0.0 #3700 — read the sqlite agent registry while the connection is
     // still ours (it moves into the shared `Db` state below); the shape gate
     // consumes it after the SAL handle is built. A registry that cannot be

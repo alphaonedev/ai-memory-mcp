@@ -7,9 +7,11 @@
 //! (`db::resolve_require_approval_above_depth`, `storage::ApprovalDepthWalk`,
 //! ...) is unchanged.
 
+use anyhow::Context as _;
+
 use super::{
-    Connection, GovernancePolicy, Result, build_namespace_governance_chain, get,
-    get_namespace_standard,
+    CTX_READ_NAMESPACE_STANDARD, Connection, Result, StandardMetadata,
+    build_namespace_governance_chain, get, governance_read, try_get_namespace_standard,
 };
 
 /// v0.7.0 L1-8 — read `governance.require_approval_above_depth` from the
@@ -34,27 +36,37 @@ use super::{
 ///
 /// # Errors
 ///
-/// Reserved for a governance-chain read fault (#4043 / #4285 populate it);
-/// today every level that cannot be read classifies as
-/// [`ApprovalDepthLevelState::Missing`] and the walk continues.
+/// #4043 — any read fault on the governance chain walk (a fail-closed decrypt
+/// included): the reflect is refused, never "no approval required".
 pub fn resolve_require_approval_above_depth(
     conn: &Connection,
     namespace: &str,
 ) -> Result<Option<u32>> {
     // #2542 — governance/approver LAYERING follows only explicitly-declared
     // parents; a `-`-inferred ancestor must not inject an approval threshold.
-    let chain = build_namespace_governance_chain(conn, namespace);
+    let chain = build_namespace_governance_chain(conn, namespace)?;
     let mut walk = ApprovalDepthWalk::default();
     for level in chain.into_iter().rev() {
-        // #4357 — classify the level, then let the ONE shared decision fn act
-        // on the state. An unresolvable standard is `Missing` today; #4285
-        // adds the `Severed` handling here without touching the walk shape.
-        let state = match get_namespace_standard(conn, &level) {
-            Ok(Some(standard_id)) => match get(conn, &standard_id) {
-                Ok(Some(mem)) => approval_depth_level_state(&mem.metadata),
-                _ => ApprovalDepthLevelState::Missing,
-            },
-            _ => ApprovalDepthLevelState::Missing,
+        // #4357 — classify the level, then let the ONE shared walk act on the
+        // state. #4043 — a read fault is an `Err` (refuse), never a skipped
+        // level; only an unbound/vanished standard is Missing. #4285 — the RAW
+        // metadata column is classified (the row mapper would default an
+        // unparseable cell to `{}`): a corrupt or non-object level is SEVERED
+        // (continue to the ancestor, no raw key); the walk accumulator then
+        // fails closed to Threshold(0) if nothing explicit is found.
+        let state = match try_get_namespace_standard(conn, &level)? {
+            Some(standard_id) => {
+                match get(conn, &standard_id).context(CTX_READ_NAMESPACE_STANDARD)? {
+                    Some(_) => {
+                        governance_read::classify_bound_standard(conn, &level, &standard_id)?
+                            .map_or(ApprovalDepthLevelState::Missing, |c| {
+                                approval_depth_level_state(&c)
+                            })
+                    }
+                    None => ApprovalDepthLevelState::Missing,
+                }
+            }
+            None => ApprovalDepthLevelState::Missing,
         };
         if let Some(n) = walk.step(state) {
             return Ok(Some(n));
@@ -132,33 +144,26 @@ impl ApprovalDepthWalk {
     }
 }
 
-/// #4357 — classify one level's standard metadata. See
-/// [`ApprovalDepthLevelState`].
+/// #4357 / #4285 — classify one level's standard from the shared #4285
+/// classifier ([`StandardMetadata`]). A corrupt or non-object level is
+/// `Corrupt` (SEVERED: continue to the ancestor) and NEVER contributes a raw
+/// knob value.
 #[must_use]
-pub fn approval_depth_level_state(metadata: &serde_json::Value) -> ApprovalDepthLevelState {
-    let gov = match metadata.get(crate::META_KEY_GOVERNANCE) {
-        None => return ApprovalDepthLevelState::Missing,
-        Some(g) if g.is_null() => return ApprovalDepthLevelState::Missing,
-        Some(g) => g,
-    };
-    // Corruption is decided BEFORE any key is read: a level whose governance
-    // blob does not parse as a policy never contributes a raw knob value.
-    if matches!(GovernancePolicy::from_metadata(metadata), Some(Err(_))) {
-        return ApprovalDepthLevelState::Corrupt;
-    }
-    let Some(obj) = gov.as_object() else {
-        return ApprovalDepthLevelState::Corrupt;
-    };
-    match obj.get("require_approval_above_depth") {
-        None | Some(serde_json::Value::Null) => ApprovalDepthLevelState::OmitsField,
-        Some(v) => match v.as_u64() {
-            // QUAL-3 (FX-5): operator-controlled metadata. Reject the silent
-            // `n as u32` truncation that would let `2^32` land as 0 and
-            // DISABLE the gate. Fail-CLOSED on overflow: saturate to 0 so
-            // EVERY depth triggers approval (CLAUDE.md K3/K9). Pinned by
-            // `tests/governance_metadata_no_silent_truncation.rs`.
-            Some(n) => ApprovalDepthLevelState::Explicit(u32::try_from(n).unwrap_or(0)),
-            None => ApprovalDepthLevelState::Corrupt,
+pub fn approval_depth_level_state(class: &StandardMetadata) -> ApprovalDepthLevelState {
+    match class {
+        StandardMetadata::Corrupt(_) => ApprovalDepthLevelState::Corrupt,
+        StandardMetadata::NoGovernance => ApprovalDepthLevelState::Missing,
+        StandardMetadata::Policy(_, raw) => match raw.get("require_approval_above_depth") {
+            None | Some(serde_json::Value::Null) => ApprovalDepthLevelState::OmitsField,
+            Some(v) => match v.as_u64() {
+                // QUAL-3 (FX-5): operator-controlled metadata. Reject the silent
+                // `n as u32` truncation that would let `2^32` land as 0 and
+                // DISABLE the gate. Fail-CLOSED on overflow: saturate to 0 so
+                // EVERY depth triggers approval (CLAUDE.md K3/K9). Pinned by
+                // `tests/governance_metadata_no_silent_truncation.rs`.
+                Some(n) => ApprovalDepthLevelState::Explicit(u32::try_from(n).unwrap_or(0)),
+                None => ApprovalDepthLevelState::Corrupt,
+            },
         },
     }
 }

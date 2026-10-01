@@ -697,11 +697,14 @@ pub fn handle_reflect_caller(
             // namespace's governance metadata blob — avoids adding a
             // new field to the GovernancePolicy struct (which would
             // require updating every GovernancePolicy { … } literal).
-            // #4357 — a resolver fault REFUSES the reflect (fail closed); it
-            // never skips a configured approval gate.
+            // #4043 — an unreadable threshold refuses the reflection; it is never
+            // "no approval required".
             if let Some(threshold) =
                 db::resolve_require_approval_above_depth(conn, ns).map_err(|e| {
-                    map_reflect_error_to_wire_string(db::ReflectError::Database(e.to_string()))
+                    crate::mcp::error_text::mcp_foreign_err(
+                        crate::storage::GOVERNANCE_POLICY_UNREADABLE,
+                        e,
+                    )
                 })?
             {
                 if new_depth_u32 > threshold {
@@ -758,7 +761,8 @@ pub fn handle_reflect_caller(
         });
         let auto_export = target_ns
             .as_deref()
-            .and_then(|ns| db::resolve_governance_policy(conn, ns))
+            // #4043 — optional feature knob: an unreadable policy leaves it OFF.
+            .map(|ns| db::resolve_governance_policy_for_optional_feature(conn, ns))
             .map(|p| p.effective_auto_export_reflections_to_filesystem())
             .unwrap_or(false);
         let mut h = if auto_export {
