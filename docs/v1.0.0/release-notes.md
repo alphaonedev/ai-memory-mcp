@@ -88,11 +88,13 @@ The "defaults stop lying" lane (Gate 1′) is the centerpiece: six knobs
 that shipped OFF (or non-functional) through v0.10.0 now resolve to their
 secure posture by default, each riding the one-cycle deprecation-WARN
 discipline the v0.10.0 `warn-carrier` release delivered. The release also
-advances the schema **v78 → v90** — additive `ADD COLUMN` through v85,
-then **two DATA-MUTATING rungs (v86, v87) that rewrite stored rows**, one
-index-only rung (v88), one derived-column-rebuild rung (v89, the
-postgres FTS `tags` fold) and one additive rung (v90, the archive
-genesis-cid parity); see §"Schema ladder v78 → v90" — adds an M-of-N
+advances the schema **v78 → v100**. The ladder is not uniformly additive:
+v86/v87 normalize stored timestamp renderings, v89 rebuilds the derived
+PostgreSQL FTS column, v92 rebuilds SQLite's `schema_version` table to add
+its bound, and v100 replaces the title-slot unique index with a partial
+index. Other additions and backfills are described per rung in
+§"Schema ladder v78 → v100"; historical migration trials attest only their
+stated version range. The release also adds an M-of-N
 threshold key-recovery lane, human-key-signed m-of-n approvals, an
 open-time rollback-evidence check, an inference-plane egress gate, and a
 named `asi-hard` no-disable security posture.
@@ -111,7 +113,7 @@ CLI subcommands):
 | HTTP routes | **103 production `.route(...)` registrations** / 89 unique URL paths |
 | CLI subcommands | **90 default build** / **92 under `--features sal`** (the `capability init` sub-verb rides the existing `Capability` command, so the top-level count is unchanged) |
 | `MemoryKind` variants | **16** (adds v1.0.0 epistemic typing `Told` / `Instruction` / `Intervention`, [#1945](https://github.com/alphaonedev/ai-memory-mcp/issues/1945)) |
-| Schema | **v100** (`CURRENT_SCHEMA_VERSION`, both adapters). Not uniformly additive: v79–v85 are additive, **v86 and v87 rewrite stored rows**, v88 is index-only, v89 redefines the postgres FTS `tsv` generated column (derived data, no stored-row rewrite), and v90–v97 are additive; v98 adds legacy inbox namespace aliases; v99 (#3655) adds the per-peer contact stamp; v100 (#3690) makes the `(title, namespace)` unique index PARTIAL (`WHERE lifecycle_state <> 'tombstoned'`) so a consolidation tombstone gives its slot up — index-only, no stored-row rewrite. Per-rung detail + the true bound of the migration evidence: §"Schema ladder v78 → v100" |
+| Schema | **v100** (`CURRENT_SCHEMA_VERSION`, both adapters). Not uniformly additive: v79–v85 are additive, **v86 and v87 rewrite stored rows**, v88 is index-only, v89 redefines the postgres FTS `tsv` generated column (derived data, no stored-row rewrite), v90–v97 add tables/columns, except that v92 rebuilds SQLite's `schema_version` table (create + copy + drop + rename) to add its `version <= 100000` bound (postgres: `ADD CONSTRAINT`) — a version-table rebuild, not a `memories` rewrite; v98 adds legacy inbox namespace aliases; v99 (#3655) adds the per-peer contact stamp; v100 (#3690) makes the `(title, namespace)` unique index PARTIAL (`WHERE lifecycle_state <> 'tombstoned'`) so a consolidation tombstone gives its slot up — index-only, no stored-row rewrite. Per-rung detail + the true bound of the migration evidence: §"Schema ladder v78 → v100" |
 
 ## Before upgrading — run `ai-memory config check` (#3715)
 
@@ -584,9 +586,9 @@ program:
    live data), functional green, and a sound `verify-audit-trail` (the
    witness / cause-binding / role-separation / identity-lineage /
    rollback-evidence readouts resolve cleanly on both backends). **That
-   dogfood covers v78 → v86 and nothing above it** — v87, v88, v89 and v90
+   dogfood covers v78 → v86 and nothing above it** — v87 through v100
    landed afterwards on `release/v1.0.0` and are NOT covered by it. See
-   §"Schema ladder v78 → v90".
+   §"Schema ladder v78 → v100".
 
 ### Scope of this attestation
 
@@ -667,20 +669,26 @@ column (a `DROP COLUMN` + `ADD COLUMN` on a derived, regenerated column;
 the durable `title`/`content`/`tags` TEXT is never touched). v90 is
 additive again — two nullable `archived_memories` columns on both
 backends, no full-table rebuild and therefore no trigger recreation
-(the v63/v65 lesson), and it deliberately backfills nothing. Both
-mutating rungs are
+(the v63/v65 lesson), and it deliberately backfills nothing. **v92
+rebuilds SQLite's `schema_version` table** (create
+`schema_version_new` + copy + drop + rename,
+`migrations/sqlite/0076_v92_schema_version_bound.sql`) to add its upper
+bound; postgres adds the bound with `ADD CONSTRAINT`. The rebuild touches
+only the version stamp, never `memories`. **v100 replaces the
+`(title, namespace)` unique index with a partial index** (index-only).
+Both row-mutating rungs (v86, v87) are
 instant/value-preserving, idempotent, and fail-safe on an unparseable
 value (left byte-untouched rather than destroyed), but they are row
 rewrites and are labelled as such below.
 
 **Migration evidence, at its true bound.** The Gate-3 dogfood
 (§"Gate-3 evidence" step 5) attested a lossless **v78 → v86**
-round-trip on a real corpus. **v87, v88, v89 and v90 are outside that
+round-trip on a real corpus. **v87 through v100 are outside that
 attestation** — all landed on `release/v1.0.0` after the dogfood ran.
 They are covered by their own regression tests, not by a
 real-corpus dogfood. Per the North Star, data-integrity evidence is
 under-claimed rather than stretched: if you are upgrading a populated
-database across v86 → v90, take a backup first (`ai-memory backup`).
+database across v86 → v100, take a backup first (`ai-memory backup`).
 The sqlite ladder additionally writes its own pre-migration
 `VACUUM INTO` snapshot beside the database file before any schema
 mutation. v1.0.0 [#2564](https://github.com/alphaonedev/ai-memory-mcp/issues/2564)
