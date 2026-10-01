@@ -119,7 +119,8 @@ fn require_approval_above_depth_overflow_saturates_fail_closed() {
             "require_approval_above_depth": overflow_value,
         }),
     );
-    let resolved = db::resolve_require_approval_above_depth(&conn, "qual-3-approval-overflow");
+    let resolved = db::resolve_require_approval_above_depth(&conn, "qual-3-approval-overflow")
+        .expect("#4043: governance policy read");
     assert_eq!(
         resolved,
         Some(0),
@@ -141,7 +142,8 @@ fn require_approval_above_depth_u64_max_saturates_fail_closed() {
             "require_approval_above_depth": u64::MAX,
         }),
     );
-    let resolved = db::resolve_require_approval_above_depth(&conn, "qual-3-approval-u64max");
+    let resolved = db::resolve_require_approval_above_depth(&conn, "qual-3-approval-u64max")
+        .expect("#4043: governance policy read");
     assert_eq!(
         resolved,
         Some(0),
@@ -164,7 +166,8 @@ fn require_approval_above_depth_just_over_u32_max_saturates_fail_closed() {
             "require_approval_above_depth": overflow_value,
         }),
     );
-    let resolved = db::resolve_require_approval_above_depth(&conn, "qual-3-approval-edge");
+    let resolved = db::resolve_require_approval_above_depth(&conn, "qual-3-approval-edge")
+        .expect("#4043: governance policy read");
     assert_eq!(
         resolved,
         Some(0),
@@ -185,7 +188,8 @@ fn require_approval_above_depth_in_range_value_round_trips() {
             "require_approval_above_depth": 7_u32,
         }),
     );
-    let resolved = db::resolve_require_approval_above_depth(&conn, "qual-3-approval-inrange");
+    let resolved = db::resolve_require_approval_above_depth(&conn, "qual-3-approval-inrange")
+        .expect("#4043: governance policy read");
     assert_eq!(
         resolved,
         Some(7),

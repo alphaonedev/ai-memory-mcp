@@ -32232,7 +32232,10 @@ impl MemoryStore for PostgresStore {
         &self,
         namespace: &str,
     ) -> StoreResult<Option<u32>> {
-        use crate::storage::ApprovalDepthLevel;
+        use crate::storage::{
+            ApprovalDepthLevel, ApprovalDepthLevelState, approval_depth_level_decision,
+            approval_depth_level_state,
+        };
         let chain = pg_namespace_chain(&self.pool, namespace, true).await?;
         for ns in chain.into_iter().rev() {
             let row: Option<(Option<String>,)> = sqlx::query_as(SQL_SELECT_STANDARD_ID_BY_NS)
@@ -32240,21 +32243,25 @@ impl MemoryStore for PostgresStore {
                 .fetch_optional(&self.pool)
                 .await
                 .map_err(|e| to_store_err("resolve_require_approval_above_depth lookup", e))?;
-            let Some((Some(standard_id),)) = row else {
-                continue;
+            // An unresolvable standard is `Missing` (the shared decision's
+            // `Continue`); #4285 adds the Severed handling in this one place.
+            let state = match row {
+                Some((Some(standard_id),)) => {
+                    // Substrate-internal policy read: admin context, exactly as
+                    // `resolve_governance_policy` (#955) — a private standard
+                    // must still gate.
+                    let ctx =
+                        CallerContext::for_admin(crate::identity::sentinels::GOVERNANCE_INTERNAL);
+                    match self.get(&ctx, &standard_id).await {
+                        Ok(m) => approval_depth_level_state(&m.metadata),
+                        Err(StoreError::NotFound { .. }) => ApprovalDepthLevelState::Missing,
+                        Err(e) => return Err(e),
+                    }
+                }
+                _ => ApprovalDepthLevelState::Missing,
             };
-            // Substrate-internal policy read: admin context, exactly as
-            // `resolve_governance_policy` (#955) — a private standard must
-            // still gate.
-            let ctx = CallerContext::for_admin(crate::identity::sentinels::GOVERNANCE_INTERNAL);
-            let mem = match self.get(&ctx, &standard_id).await {
-                Ok(m) => m,
-                Err(StoreError::NotFound { .. }) => continue,
-                Err(e) => return Err(e),
-            };
-            match crate::storage::approval_depth_level_decision(&mem.metadata) {
+            match approval_depth_level_decision(state) {
                 ApprovalDepthLevel::Threshold(n) => return Ok(Some(n)),
-                ApprovalDepthLevel::Stop => return Ok(None),
                 ApprovalDepthLevel::Continue => {}
             }
         }
@@ -32674,10 +32681,16 @@ impl MemoryStore for PostgresStore {
                         detail: e.to_string(),
                     }
                 })?;
-                let admin =
-                    CallerContext::for_admin(crate::identity::sentinels::GOVERNANCE_INTERNAL);
-                let outcome = self
-                    .reflect_with_hooks(&admin, &input, &crate::db::ReflectHooks::empty())
+                // #4357 — replay as the REQUESTER's tenant through the trait
+                // `reflect`, never admin: source visibility, the #3696
+                // title-slot admission (a hidden private row of another
+                // principal is refused, not merged into), the why_trace gate,
+                // the attestation posture and the provenance stamp all
+                // re-apply at execute time exactly as on the direct path. The
+                // payload agent is already bound to `requested_by` by
+                // `verify_payload_agent_id` above.
+                let requester = CallerContext::for_agent(&pa.requested_by);
+                let outcome = MemoryStore::reflect(self, &requester, &input, None)
                     .await
                     .map_err(|e| StoreError::InvalidInput {
                         detail: format!("reflect execute failed: {e}"),
