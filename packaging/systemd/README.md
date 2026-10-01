@@ -4,7 +4,8 @@ Drop-in systemd units for operators running ai-memory as a hardened
 single-node deployment. The Debian (.deb), release RPM and Fedora COPR
 recipes are binary-only: install the users, state directories and units
 manually using the steps below before enabling services. The AUR package
-ships the units and sysusers fragment. These units also work standalone
+ships `ai-memory.service` and the sysusers fragment only (PKGBUILD:58-70); the
+other units are installed manually from this directory. These units also work standalone
 on any systemd distro.
 
 ## Units
