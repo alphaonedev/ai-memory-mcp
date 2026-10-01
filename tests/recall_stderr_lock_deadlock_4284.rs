@@ -19,10 +19,16 @@
 //! inside the budget — not a log line.
 //!
 //! **Hermetic.** No network egress and no model weights: `HOME` / `HF_HOME`
-//! point at empty directories under `CARGO_TARGET_TMPDIR`, `HF_ENDPOINT`
-//! points at a closed loopback port so the Hub fetch fails at connect, and
-//! every proxy variable is removed from the CHILD's environment. Env changes
-//! are applied to the spawned `Command` only, never to this process.
+//! point at empty directories under `CARGO_TARGET_TMPDIR`, and every proxy
+//! variable in the CHILD's environment (`ALL_PROXY` / `HTTPS_PROXY` /
+//! `HTTP_PROXY`, both cases) points at a closed loopback port, with
+//! `NO_PROXY` removed. hf-hub's `Api::new()` does not honour `HF_ENDPOINT` or
+//! `HF_HOME`, so the dead proxy is what makes the Hub download fail fast on a
+//! host WITH internet too; without it the child downloads the real weights,
+//! the error path never runs, and the cell passes on the unfixed base.
+//! `HF_ENDPOINT` is still pointed at the same dead port as a second guard.
+//! Env changes are applied to the spawned `Command` only, never to this
+//! process.
 
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -31,16 +37,18 @@ use std::time::{Duration, Instant};
 /// `HF_DOWNLOAD_TIMEOUT` and infinitely below a deadlock.
 const EXIT_BUDGET: Duration = Duration::from_secs(90);
 
-const PROXY_VARS: [&str; 8] = [
+/// Proxy variables pointed at the closed loopback port in the child.
+const PROXY_VARS: [&str; 6] = [
     "HTTPS_PROXY",
     "https_proxy",
     "HTTP_PROXY",
     "http_proxy",
     "ALL_PROXY",
     "all_proxy",
-    "NO_PROXY",
-    "no_proxy",
 ];
+
+/// Proxy bypass lists removed from the child so the dead proxy is never skipped.
+const NO_PROXY_VARS: [&str; 2] = ["NO_PROXY", "no_proxy"];
 
 /// A loopback port with nothing listening: bind, read the port, drop.
 fn closed_loopback_port() -> u16 {
@@ -58,9 +66,13 @@ fn recall_semantic_cold_cache_hub_down_terminates_4284() {
     std::fs::create_dir_all(&hf_home).expect("mk hf_home");
     let db = base.join("ai-memory.db");
 
+    let dead = format!("http://127.0.0.1:{}", closed_loopback_port());
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_ai-memory"));
-    for v in PROXY_VARS {
+    for v in NO_PROXY_VARS {
         cmd.env_remove(v);
+    }
+    for v in PROXY_VARS {
+        cmd.env(v, &dead);
     }
     cmd.env_remove("AI_MEMORY_EMBED_OFFLINE")
         .env_remove("HF_HUB_OFFLINE")
@@ -69,10 +81,7 @@ fn recall_semantic_cold_cache_hub_down_terminates_4284() {
         .env("AI_MEMORY_NO_CONFIG", "1")
         .env("HOME", &home)
         .env("HF_HOME", &hf_home)
-        .env(
-            "HF_ENDPOINT",
-            format!("http://127.0.0.1:{}", closed_loopback_port()),
-        )
+        .env("HF_ENDPOINT", &dead)
         .arg("--db")
         .arg(&db)
         .args(["recall", "anything", "--tier", "semantic"])
