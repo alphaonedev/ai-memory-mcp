@@ -472,6 +472,23 @@ pub fn pg_sslmode_refusal() -> String {
     )
 }
 
+/// The single decision "may a PostgreSQL socket be opened for this DSN at
+/// all" (#3705 / #3866 / #4333): `None` when the DSN pins
+/// `sslmode=verify-full` on a TCP transport, otherwise the refusal text
+/// (never echoing the DSN). Every production PostgreSQL connect - the store
+/// funnel AND every doctor / CLI probe - asks this one function through
+/// `store::postgres::dsn::floored_connect_options`, so no path can open a
+/// session below the floor.
+#[must_use]
+pub fn pg_dsn_floor_refusal(dsn: &str) -> Option<String> {
+    match dsn_sslmode_floor(dsn) {
+        SslmodeFloor::Pinned { .. } => None,
+        SslmodeFloor::UnixSocket { dir } => Some(pg_unix_socket_refusal(&dir)),
+        SslmodeFloor::Unparseable => Some(pg_dsn_unparseable_refusal()),
+        SslmodeFloor::NotPinned { .. } => Some(pg_sslmode_refusal()),
+    }
+}
+
 /// The refusal for a deployment whose DECLARED shape is not `singleton` and
 /// that has no operator-supplied certificate: the zero-config local CA is
 /// for the singleton shape only (a product that mints an unmanaged CA into

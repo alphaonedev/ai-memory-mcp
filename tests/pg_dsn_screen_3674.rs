@@ -314,7 +314,9 @@ const RAW_DSN_TOKENS: &[&str] = &[
 ];
 
 /// The funnel call as it appears at a call site.
-const FUNNEL_CALL: &str = "dsn::connect_options(";
+/// #4333: the call sites use the FLOORED variant, which runs the #3705 sslmode
+/// floor before the #3674 screen; the bare `connect_options` is not accepted.
+const FUNNEL_CALL: &str = "dsn::floored_connect_options(";
 
 fn strip_vis(t: &str) -> &str {
     let t = t.trim_start();

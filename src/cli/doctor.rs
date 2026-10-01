@@ -1968,33 +1968,36 @@ fn section_postgres_unstamped_owners_3124() -> Option<ReportSection> {
         // section already reports that as Critical).
         _ => return None,
     };
+    // #4333 — the SAME #3705 sslmode floor as the store funnel: a DSN below
+    // it is refused here and reported as the section's fact; no socket opens.
     let census: Result<crate::identity::owner_stamp::UnstampedCensus> =
-        run_pg_probe(|| async move {
-            let probe = async {
-                // #3674 — the DSN screen, never a raw `.connect(url)`.
-                let options = crate::store::postgres::dsn::connect_options(&url)?;
-                let pool = sqlx::postgres::PgPoolOptions::new()
-                    .max_connections(1)
-                    .acquire_timeout(PG_PROBE_TIMEOUT)
-                    .connect_with(options)
-                    .await?;
-                let (unstamped, malformed, archived): (i64, i64, i64) =
-                    sqlx::query_as(crate::identity::owner_stamp::PG_CENSUS_SQL)
-                        .fetch_one(&pool)
+        match crate::store::postgres::dsn::floored_connect_options(&url) {
+            Err(refused) => Err(anyhow::anyhow!("{refused}")),
+            Ok(options) => run_pg_probe(move || async move {
+                let probe = async {
+                    let pool = sqlx::postgres::PgPoolOptions::new()
+                        .max_connections(1)
+                        .acquire_timeout(PG_PROBE_TIMEOUT)
+                        .connect_with(options)
                         .await?;
-                pool.close().await;
-                Ok::<_, sqlx::Error>(crate::identity::owner_stamp::UnstampedCensus {
-                    unstamped: u64::try_from(unstamped).unwrap_or(0),
-                    malformed: u64::try_from(malformed).unwrap_or(0),
-                    archived_unstamped: u64::try_from(archived).unwrap_or(0),
-                })
-            };
-            tokio::time::timeout(PG_PROBE_TIMEOUT, probe)
-                .await
-                .map_err(|_elapsed| anyhow::anyhow!(MSG_PG_PROBE_TIMEOUT))?
-                .map_err(anyhow::Error::from)
-        })
-        .and_then(|inner| inner);
+                    let (unstamped, malformed, archived): (i64, i64, i64) =
+                        sqlx::query_as(crate::identity::owner_stamp::PG_CENSUS_SQL)
+                            .fetch_one(&pool)
+                            .await?;
+                    pool.close().await;
+                    Ok::<_, sqlx::Error>(crate::identity::owner_stamp::UnstampedCensus {
+                        unstamped: u64::try_from(unstamped).unwrap_or(0),
+                        malformed: u64::try_from(malformed).unwrap_or(0),
+                        archived_unstamped: u64::try_from(archived).unwrap_or(0),
+                    })
+                };
+                tokio::time::timeout(PG_PROBE_TIMEOUT, probe)
+                    .await
+                    .map_err(|_elapsed| anyhow::anyhow!(MSG_PG_PROBE_TIMEOUT))?
+                    .map_err(anyhow::Error::from)
+            })
+            .and_then(|inner| inner),
+        };
     Some(section_unstamped_owners_3124(
         census,
         crate::identity::owner_stamp::BACKEND_LABEL_POSTGRES,
@@ -2054,15 +2057,33 @@ fn section_postgres_extensions_3264() -> Option<ReportSection> {
         Option<String>,
         Option<bool>,
     );
-    let probed: Result<Probe> = run_pg_probe(|| async move {
+    // #4333 — the SAME #3705 sslmode floor as the store funnel, applied
+    // before any socket opens; a refusal is the section's fact.
+    let options = match crate::store::postgres::dsn::floored_connect_options(&url) {
+        Ok(o) => o,
+        Err(refused) => {
+            return Some(ReportSection {
+                name: SECTION_POSTGRES_EXTENSIONS.into(),
+                severity: Severity::Critical,
+                facts: vec![
+                    ("store".into(), redacted),
+                    ("error".into(), refused.to_string()),
+                ],
+                note: Some(
+                    "the configured postgres store is below the transit-encryption floor \
+                     (#3705): doctor REFUSED to connect — the daemon refuses the same DSN"
+                        .into(),
+                ),
+            });
+        }
+    };
+    let probed: Result<Probe> = run_pg_probe(move || async move {
         // #3264 review fix (B4) — the whole probe runs inside ONE
         // wall-clock envelope. `acquire_timeout` bounds only the pool
         // checkout; the connect and the three catalog reads were
         // unbounded, so a server that accepts a connection and then never
         // answers hung `ai-memory doctor` indefinitely.
         let probe = async {
-            // #3674 — the DSN screen, never a raw `.connect(url)`.
-            let options = crate::store::postgres::dsn::connect_options(&url)?;
             let pool = sqlx::postgres::PgPoolOptions::new()
                 .max_connections(1)
                 .acquire_timeout(PG_PROBE_TIMEOUT)
