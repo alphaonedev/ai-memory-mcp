@@ -1,553 +1,328 @@
+<!DOCTYPE html>
 <!--
   Copyright 2026 AlphaOne LLC
   SPDX-License-Identifier: Apache-2.0
-  ai-memory architectures — five-tier capability matrix.
+  Architectures overview (v1.0.0 GA).
+  Theme: the shared landing-page tokens in assets/site-theme.css (#4420).
+  Every capability drawn here is backed by code on the v1.0.0 tree; the
+  commit that introduced this page cites file:line for each one.
 -->
-<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>ai-memory · Architectures — five tiers from laptop to global hive</title>
-<meta name="description" content="Five reference architectures for ai-memory — from a single agent on a laptop to a federated hive of clusters. Federation is certified for 500–1000-agent clusters of ≤50 peers, with honest 'today vs roadmap' markers per v1.0.0.">
-<meta property="og:title" content="ai-memory · Architectures">
-<meta property="og:description" content="Five reference architectures for ai-memory — from one agent to a global hive.">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ai-memory · Architectures: from one agent to a federated hive</title>
+<meta name="description" content="How ai-memory v1.0.0 runs from a single agent to a federated hive: MCP, HTTP and CLI surfaces, SQLite and PostgreSQL tiers, signed quorum federation, governance and the new wake plane, with honest limits.">
+<meta name="theme-color" content="#0c0b08">
 <link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/architectures.html">
-<style>
-:root{--bg:#000;--bg-raised:#0a0a0a;--bg-card:#111;--bg-elev:#161616;--bg-code:#1a1a1a;--border:#262626;--border-hl:#3d3d3d;--text:#fff;--text-muted:#999;--text-dim:#666;--p1:#6ee7ff;--p2:#ffb86b;--p3:#c8a2ff;--good:#6ee7ff;--bad:#ff6b9d;--gold:#ffd700;--font-mono:'SF Mono','Cascadia Code','Fira Code',Consolas,monospace;--font-sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;--max-w:1280px}
-*,*::before,*::after{margin:0;padding:0;box-sizing:border-box}
-html{scroll-behavior:smooth;scroll-padding-top:5rem}
-body{font-family:var(--font-sans);background:var(--bg);color:var(--text);line-height:1.6;-webkit-font-smoothing:antialiased;overflow-x:hidden}
-a{color:var(--text);text-decoration:none}a:hover{color:var(--p1)}
-code{font-family:var(--font-mono);font-size:.85rem;background:var(--bg-code);padding:.1em .35em;border-radius:4px}
-.container{max-width:var(--max-w);margin:0 auto;padding:0 1.5rem}
-h1,h2,h3{font-weight:700;letter-spacing:-0.02em}h2{font-size:1.6rem;margin-bottom:.5rem;font-family:var(--font-mono)}h3{font-size:1.05rem}
-p{color:var(--text-muted)}
-.topnav{position:sticky;top:0;z-index:50;background:rgba(0,0,0,0.85);backdrop-filter:blur(12px);border-bottom:1px solid var(--border)}
-.topnav .inner{display:flex;justify-content:space-between;max-width:var(--max-w);margin:0 auto;padding:.9rem 1.5rem;font-size:.875rem}
-.topnav a{color:var(--text-muted);margin-right:1.25rem}.topnav a:hover{color:var(--text)}
-.topnav .home-link{color:var(--text);font-weight:600}
-.topnav .right{display:flex;gap:1.25rem;flex-wrap:wrap}@media(max-width:800px){.topnav .right{display:none}}
-.hero{padding:4rem 1.5rem 2.5rem;text-align:center;background:radial-gradient(ellipse at center,rgba(110,231,255,0.08),transparent 60%);border-bottom:1px solid var(--border)}
-.hero h1{font-size:clamp(2rem,4.5vw,3.25rem);line-height:1.1;letter-spacing:-0.03em;margin-bottom:1rem}
-.hero .tagline{color:var(--text-muted);font-size:1.05rem;max-width:780px;margin:0 auto 1rem}
-.hero .pills{display:flex;justify-content:center;gap:.5rem;flex-wrap:wrap;margin-top:1.25rem}
-.hero .pill{padding:.4rem 1rem;border:1px solid var(--border-hl);border-radius:999px;font-family:var(--font-mono);font-size:.78rem;color:var(--text-muted)}
-
-section{padding:3.5rem 0;border-bottom:1px solid var(--border)}
-.eyebrow{display:inline-block;font-size:.72rem;font-weight:600;letter-spacing:.12em;text-transform:uppercase;color:var(--text-muted);margin-bottom:.5rem;padding:.2rem .6rem;border:1px solid var(--border-hl);border-radius:999px}
-.lede{color:var(--text-muted);font-size:.95rem;max-width:820px;margin-bottom:2rem}
-
-footer{padding:3rem 1.5rem;text-align:center;font-size:.85rem;color:var(--text-dim);border-top:1px solid var(--border)}
-footer a{color:var(--text-muted)}
-
-/* Grouped dropdown menu */
-.topnav .menu{position:relative;display:inline-block}
-.topnav .menu-btn{background:none;border:none;color:var(--text-muted);font-family:inherit;font-size:inherit;cursor:pointer;padding:.2rem 0;line-height:1;letter-spacing:0}
-.topnav .menu-btn:hover,.topnav .menu:focus-within .menu-btn{color:var(--text)}
-.topnav .menu-btn.active{color:var(--text)}
-.topnav .menu-btn .caret{opacity:.5;font-size:.7em;margin-left:.2em}
-.topnav .menu-pane{position:absolute;top:calc(100% + .55rem);right:0;background:var(--bg-card);border:1px solid var(--border-hl);border-radius:8px;padding:.4rem 0;min-width:240px;box-shadow:0 10px 28px rgba(0,0,0,0.5);z-index:60;visibility:hidden;opacity:0;transition:opacity .12s ease,visibility 0s .12s}
-.topnav .menu:focus-within .menu-pane,.topnav .menu:hover .menu-pane{visibility:visible;opacity:1;transition:opacity .12s ease}
-.topnav .menu-pane a{display:block;padding:.5rem 1rem;color:var(--text-muted);font-size:.85rem;margin-right:0;white-space:nowrap;text-decoration:none}
-.topnav .menu-pane a:hover{background:var(--bg-elev);color:var(--text)}
-.topnav .menu-pane a.current{color:var(--p1);background:var(--bg-elev)}
-
-/* capability badges */
-.cap-badge{display:inline-block;padding:.15em .55em;font-family:var(--font-mono);font-size:.7rem;font-weight:600;border-radius:4px;border:1px solid;letter-spacing:.04em;margin:.1em .15em}
-.cap-today{color:#6ee7ff;border-color:#2a6571;background:rgba(110,231,255,.08)}
-.cap-roadmap{color:#c8a2ff;border-color:#5a4280;background:rgba(200,162,255,.08)}
-.cap-partial{color:#ffb86b;border-color:#7a5328;background:rgba(255,184,107,.08)}
-.cap-future{color:#ff6b9d;border-color:#7a3251;background:rgba(255,107,157,.08)}
-
-/* arch tier grid */
-.arch-tier-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:1rem;margin:1.5rem 0 2.5rem}
-.arch-tier-card{display:block;background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:1.4rem;text-decoration:none;color:var(--text);transition:border-color .15s ease,transform .15s ease;position:relative}
-.arch-tier-card:hover{border-color:var(--p1);transform:translateY(-2px)}
-.arch-tier-card .tier-id{display:inline-block;font-family:var(--font-mono);font-size:.7rem;font-weight:700;letter-spacing:.12em;color:var(--p2);background:rgba(255,184,107,.08);border:1px solid #7a5328;padding:.2em .55em;border-radius:4px;margin-bottom:.65rem}
-.arch-tier-card h3{font-family:var(--font-sans);font-size:1.15rem;font-weight:700;color:var(--text);margin-bottom:.45rem;letter-spacing:-0.01em}
-.arch-tier-card p{font-size:.88rem;color:var(--text-muted);margin-bottom:.75rem;line-height:1.5}
-.arch-tier-card .tier-scale{display:block;font-family:var(--font-mono);font-size:.68rem;color:var(--text-dim);letter-spacing:.04em;margin-bottom:.6rem}
-
-/* tier matrix table */
-.tier-matrix{width:100%;border-collapse:collapse;margin:1rem 0 2rem;font-size:.85rem;background:var(--bg-card);border:1px solid var(--border);border-radius:10px;overflow:hidden}
-.tier-matrix th,.tier-matrix td{padding:.65rem .85rem;text-align:left;border-bottom:1px solid var(--border)}
-.tier-matrix th{background:var(--bg-elev);font-family:var(--font-mono);font-size:.78rem;font-weight:600;color:var(--text);letter-spacing:.04em}
-.tier-matrix th:not(:first-child),.tier-matrix td:not(:first-child){text-align:center;width:11%}
-.tier-matrix td{color:var(--text-muted)}
-.tier-matrix tr:last-child td{border-bottom:none}
-.tier-matrix tr:hover td{background:var(--bg-elev)}
-
-/* honesty notice */
-.honesty-notice{background:rgba(110,231,255,.05);border:1px solid #2a6571;border-left:4px solid var(--p1);border-radius:8px;padding:1.1rem 1.25rem;margin:2rem 0;color:var(--text-muted);font-size:.9rem;line-height:1.6}
-.honesty-notice strong{color:var(--p1);font-family:var(--font-mono);font-size:.82rem;letter-spacing:.05em}
-
-ul,ol{padding-left:1.5rem;color:var(--text-muted);font-size:.92rem;margin:.5rem 0 1rem}
-ul li,ol li{margin-bottom:.35rem}
-section h2{font-family:var(--font-sans);font-size:1.75rem;margin-bottom:.6rem}
-section p{margin-bottom:.85rem}
-
-/* Zero-JS mobile nav fallback — visible only when .right collapses */
-.topnav .mnav{display:none;position:relative}
-.topnav .mnav summary{list-style:none;cursor:pointer;color:var(--text-muted);border:1px solid var(--border-hl);border-radius:6px;padding:.3rem .8rem;font-size:.85rem;user-select:none}
-.topnav .mnav summary::-webkit-details-marker{display:none}
-.topnav .mnav[open] summary{color:var(--text);border-color:var(--text-muted)}
-.topnav .mnav-pane{position:absolute;top:calc(100% + .55rem);right:0;background:var(--bg-card);border:1px solid var(--border-hl);border-radius:8px;padding:.4rem 0;min-width:250px;max-height:72vh;overflow-y:auto;box-shadow:0 10px 28px rgba(0,0,0,0.5);z-index:60}
-.topnav .mnav-pane a{display:block;padding:.45rem 1rem;color:var(--text-muted);font-size:.85rem;margin:0;white-space:nowrap}
-.topnav .mnav-pane a:hover{background:var(--bg-elev);color:var(--text)}
-.topnav .mnav-group{padding:.6rem 1rem .25rem;font-family:var(--font-mono);font-size:.66rem;letter-spacing:.12em;text-transform:uppercase;color:var(--text-dim)}
-@media(max-width:800px){.topnav .mnav{display:block}}
-</style>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700;800;900&amp;family=IBM+Plex+Sans:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@500;600&amp;display=swap">
+<link rel="stylesheet" href="assets/site-theme.css">
 </head>
-<body>
-
-<nav class="topnav">
-  <div class="inner">
-    <a class="home-link" href="./">ai-memory <span style="opacity:.5">▸ Architectures</span></a>
-    <div class="right">
-      <a href="at-a-glance.html" style="color:#6ee7ff">Atlas</a>
-      <a href="whats-new-v09.html" style="color:#ffb86b">What's new</a>
-      <div class="menu">
-        <button class="menu-btn">Audiences<span class="caret">▾</span></button>
-        <div class="menu-pane">
-          <a href="for-everyone.html">For Everyone</a>
-          <a href="audience/decision-maker.html">Decision Maker</a>
-          <a href="audience/developer.html">Developer</a>
-          <a href="audience/operator.html">Operator</a>
-          <a href="feature-matrix.html">Feature Matrix</a>
-          <a href="data-flow.html">Data Flow</a>
-          <a href="integrations.html">Integrations</a>
-          <a href="import-history.html">Import History</a>
-          <a href="release-pipeline.html">Release Pipeline</a>
-        </div>
+<body class="am-page">
+<a class="am-skip" href="#main">Skip to content</a>
+<div class="am-banner"><span><i></i><b>LIVE</b> v1.0.0 acceptance testing &rarr; <a href="https://test.agenticmem.co" target="_blank" rel="noopener">test.agenticmem.co</a></span><span class="am-banner-sep">|</span><span>Reproducible results for peer review &rarr; <a href="testing/">testing methodology &amp; outcomes</a></span></div>
+<header class="am-nav"><div class="am-nav-in">
+  <a class="am-brand" href="index.html" aria-label="ai-memory home">
+    <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 2l9 5.2v9.6L12 22 3 16.8V7.2z" stroke="var(--accent)" stroke-width="1.5"/><circle cx="12" cy="12" r="2.4" fill="var(--accent)"/><path d="M12 9.6V4.5M12 14.4v5.1M14.4 12h5M4.9 12h5" stroke="var(--accent)" stroke-width="1.1"/></svg>
+    ai-memory <span class="am-crumb">/ architectures</span>
+  </a>
+  <nav class="am-links" aria-label="Primary">
+    <a href="architectures.html" aria-current="page">Architectures</a>
+    <a href="https://test.agenticmem.co" target="_blank" rel="noopener">Live Testing</a>
+    <a href="testing/">Test Results</a>
+    <div class="am-dd">
+      <button aria-haspopup="true">Tiers ▾</button>
+      <div class="am-dd-menu">
+        <a href="architectures-t1.html">T1 · Single node<span>one agent, one store</span></a>
+        <a href="architectures-t2.html">T2 · Shared daemon<span>many agents, one host</span></a>
+        <a href="architectures-t3.html">T3 · Federated cluster<span>W-of-N quorum, signed sync</span></a>
+        <a href="architectures-t4.html">T4 · Data-center swarm<span>PostgreSQL tier</span></a>
+        <a href="architectures-t5.html">T5 · Federated hive<span>multi-DC / multi-region</span></a>
       </div>
-      <div class="menu">
-        <button class="menu-btn">Features<span class="caret">▾</span></button>
-        <div class="menu-pane">
-          <a href="memory-tiers.html">Memory Tiers</a>
-          <a href="memory-rules.html">Memory Rules</a>
-          <a href="ttl-controls.html">TTL Controls</a>
-          <a href="archival.html">Archival</a>
-          <a href="encryption.html">Encryption</a>
-          <a href="hierarchies.html">Hierarchies</a>
-          <a href="knowledge-graph.html">Knowledge Graph</a>
-          <a href="autonomous.html">Autonomous</a>
-          <a href="a2a-messaging.html">A2A Messaging</a>
-          <a href="a2a-integration.html">Integrate an Agent</a>
-          <a href="lifecycle.html">Lifecycle</a>
-          <a href="performance.html">Performance</a>
-          <a href="agent-identity.html">Agent Identity (NHI)</a>
-          <a href="zero-touch-trust.html">Zero-Touch Trust</a>
-        </div>
-      </div>
-      <div class="menu">
-        <button class="menu-btn active">Architectures<span class="caret">▾</span></button>
-        <div class="menu-pane">
-          <a href="architectures.html" class="current">Overview</a>
-          <a href="architectures-t1.html">T1 — Single Agent</a>
-          <a href="architectures-t2.html">T2 — Many Agents</a>
-          <a href="architectures-t3.html">T3 — Multi-Node Cluster</a>
-          <a href="architectures-t4.html">T4 — Data-Center Swarm</a>
-          <a href="architectures-t5.html">T5 — Global Hive</a>
-          <a href="reference-architecture/">Grand Slam — 3-Region Hive</a>
-          <a href="reference-architecture/enterprise-cpu-memory.html">Enterprise — CPU+Memory Nodes</a>
-          <a href="reference-architecture/enterprise-cpu-memory-gpu.html">Enterprise — CPU+Memory+GPU Nodes</a>
-        </div>
-      </div>
-      <div class="menu">
-        <button class="menu-btn">Internals<span class="caret">▾</span></button>
-        <div class="menu-pane">
-          <a href="schema.html">Schema</a>
-          <a href="types.html">Types</a>
-          <a href="validators.html">Validators</a>
-          <a href="governance.html">Governance</a>
-          <a href="batman-active-mode.html">Batman Mode</a>
-          <a href="tracing.html">Tracing</a>
-          <a href="spec/v1.html">Portability Spec v1</a>
-        </div>
-      </div>
-      <div class="menu">
-        <button class="menu-btn">Evidence<span class="caret">▾</span></button>
-        <div class="menu-pane">
-          <a href="evidence.html">Frozen Claims</a>
-          <a href="evidence/">Evidence Hub (campaigns)</a>
-          <a href="performance.html">Performance budgets</a>
-          <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/benchmarks/longmemeval/results.md">LongMemEval variants</a>
-        </div>
-      </div>
-      <a href="credits.html">Credits</a>
-      <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub →</a>
     </div>
-    <details class="mnav">
-      <summary>Menu</summary>
-      <div class="mnav-pane">
-        <a href="./">Home</a>
-        <a href="at-a-glance.html">Atlas</a>
-        <a href="whats-new-v09.html">What's new</a>
-        <div class="mnav-group">Audiences</div>
-        <a href="for-everyone.html">For Everyone</a>
-        <a href="audience/decision-maker.html">Decision Maker</a>
-        <a href="audience/developer.html">Developer</a>
-        <a href="audience/operator.html">Operator</a>
-        <a href="feature-matrix.html">Feature Matrix</a>
-        <a href="data-flow.html">Data Flow</a>
-        <a href="integrations.html">Integrations</a>
-        <a href="import-history.html">Import History</a>
-        <a href="release-pipeline.html">Release Pipeline</a>
-        <div class="mnav-group">Features</div>
-        <a href="memory-tiers.html">Memory Tiers</a>
-        <a href="memory-rules.html">Memory Rules</a>
-        <a href="ttl-controls.html">TTL Controls</a>
-        <a href="archival.html">Archival</a>
-        <a href="encryption.html">Encryption</a>
-        <a href="hierarchies.html">Hierarchies</a>
-        <a href="knowledge-graph.html">Knowledge Graph</a>
-        <a href="autonomous.html">Autonomous</a>
-        <a href="a2a-messaging.html">A2A Messaging</a>
-          <a href="a2a-integration.html">Integrate an Agent</a>
-        <a href="lifecycle.html">Lifecycle</a>
-        <a href="performance.html">Performance</a>
-        <a href="agent-identity.html">Agent Identity (NHI)</a>
-        <a href="zero-touch-trust.html">Zero-Touch Trust</a>
-        <div class="mnav-group">Architectures</div>
-        <a href="architectures.html">Overview</a>
-        <a href="architectures-t1.html">T1 — Single Agent</a>
-        <a href="architectures-t2.html">T2 — Many Agents</a>
-        <a href="architectures-t3.html">T3 — Multi-Node Cluster</a>
-        <a href="architectures-t4.html">T4 — Data-Center Swarm</a>
-        <a href="architectures-t5.html">T5 — Global Hive</a>
-        <a href="reference-architecture/">Grand Slam — 3-Region Hive</a>
-        <a href="reference-architecture/enterprise-cpu-memory.html">Enterprise — CPU+Memory Nodes</a>
-        <a href="reference-architecture/enterprise-cpu-memory-gpu.html">Enterprise — CPU+Memory+GPU Nodes</a>
-        <div class="mnav-group">Internals</div>
-        <a href="schema.html">Schema</a>
-        <a href="types.html">Types</a>
-        <a href="validators.html">Validators</a>
-        <a href="governance.html">Governance</a>
-        <a href="batman-active-mode.html">Batman Mode</a>
-        <a href="tracing.html">Tracing</a>
-        <a href="spec/v1.html">Portability Spec v1</a>
-        <div class="mnav-group">Evidence</div>
-        <a href="evidence.html">Frozen Claims</a>
-        <a href="evidence/">Evidence Hub (campaigns)</a>
-        <a href="performance.html">Performance budgets</a>
-        <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/benchmarks/longmemeval/results.md">LongMemEval variants</a>
-        <div class="mnav-group">More</div>
-        <a href="credits.html">Credits</a>
-        <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub →</a>
+    <div class="am-dd">
+      <button aria-haspopup="true">Reference ▾</button>
+      <div class="am-dd-menu">
+        <a href="reference-architecture/">3-region hive<span>the do-1461 run record</span></a>
+        <a href="reference-architecture/enterprise-cpu-memory.html">Enterprise · CPU + memory<span>API embeddings, no GPU</span></a>
+        <a href="reference-architecture/enterprise-cpu-memory-gpu.html">Enterprise · CPU + memory + GPU<span>local embeddings</span></a>
+        <a href="enterprise-deployment.html">Enterprise deployment guide<span>sizing, replication, backups</span></a>
+        <a href="ARCHITECTURAL_LIMITS.html">Architectural limits<span>what does not scale, and why</span></a>
       </div>
-    </details>
-  </div>
-</nav>
-
-<section class="hero">
-  <h1>ai-memory architectures</h1>
-  <p class="tagline">A primitive that scales from <strong>one agent</strong> on a laptop to a <strong>federated hive of clusters</strong>. Every tier ships either today, or sits behind a documented gap with a known roadmap. The federation trust boundary is <strong>certified for 500–1000-agent clusters composed of ≤50-peer blocks</strong>; the global-hive tier (T5) is the vision beyond it. Nothing on this page is marketing fiction — every "today" claim cites code in the v1.0.0 source tree.</p>
-  <div class="pills">
-    <span class="pill">5 tiers</span>
-    <span class="pill">T1–T3 ship today</span>
-    <span class="pill">T4 · PG GA v0.8.0</span>
-    <span class="pill">certified: ≤50 peers · 500–1000 agents</span>
-    <span class="pill">T5 vision · v1.0+</span>
-  </div>
-</section>
-
-<section>
-  <div class="container">
-    <span class="eyebrow">The five tiers</span>
-    <h2>From single agent to global collective.</h2>
-    <p class="lede">Each tier is a deployment pattern. Each inherits everything below it. Click a card for the full diagram, narrative, and deployment recipe.</p>
-
-    <div class="arch-tier-grid">
-
-      <a href="architectures-t1.html" class="arch-tier-card">
-        <span class="tier-id">TIER 1</span>
-        <h3>Single node, single agent</h3>
-        <p>One ai-memory instance, one consumer. SQLite, no network, zero ops. The bedrock primitive.</p>
-        <span class="tier-scale">SCALE: 1 node · 1 agent · ~10⁶ memories</span>
-        <span class="cap-badge cap-today">SHIPS TODAY</span>
-      </a>
-
-      <a href="architectures-t2.html" class="arch-tier-card">
-        <span class="tier-id">TIER 2</span>
-        <h3>Single node, many agents</h3>
-        <p>One instance fanned across ~10 concurrent agents, each isolated by namespace + scope visibility, gated by per-namespace governance.</p>
-        <span class="tier-scale">SCALE: 1 node · 10 agents · namespace-isolated</span>
-        <span class="cap-badge cap-today">SHIPS TODAY</span>
-      </a>
-
-      <a href="architectures-t3.html" class="arch-tier-card">
-        <span class="tier-id">TIER 3</span>
-        <h3>Multi-node cluster</h3>
-        <p>4 nodes × 5 agents with <strong>W-of-N quorum writes</strong>, mTLS fingerprint allowlist, federated governance, vector-clock catch-up — all shipping today.</p>
-        <span class="tier-scale">SCALE: 4 nodes · 20 agents · quorum-bounded</span>
-        <span class="cap-badge cap-today">SHIPS TODAY</span>
-      </a>
-
-      <a href="architectures-t4.html" class="arch-tier-card">
-        <span class="tier-id">TIER 4</span>
-        <h3>Data-center swarm</h3>
-        <p>Multi-rack deployment with quorum writes shipping today; <strong>Postgres+pgvector backbone</strong> behind the <code>sal-postgres</code> feature flag, GA at v0.8.0.</p>
-        <span class="tier-scale">SCALE: ≤50-peer blocks · ~500–1000 agents/block · racked &amp; zoned</span>
-        <span class="cap-badge cap-today">CORE TODAY</span>
-        <span class="cap-badge cap-today">PG GA · v0.8.0</span>
-      </a>
-
-      <a href="architectures-t5.html" class="arch-tier-card">
-        <span class="tier-id">TIER 5</span>
-        <h3>Global hive</h3>
-        <p>Multi-region cloud, attested agent identity, federated governance, many ≤50-peer clusters composed into a unified collective. The north-star scale is aspirational — a collective far larger than any single certified cluster, neither certified nor measured; the certified unit remains the 500–1000-agent cluster.</p>
-        <span class="tier-scale">SCALE: multi-region · many certified clusters · attested (vision)</span>
-        <span class="cap-badge cap-future">VISION v1.0+</span>
-      </a>
-
-      <a href="reference-architecture/" class="arch-tier-card">
-        <span class="tier-id">GRAND SLAM</span>
-        <h3>3-region federated hive — proven live</h3>
-        <p>The reference proof behind the T3–T5 claims: 15 nodes, 9 federated peers, W=2 quorum, three encryption legs each proven positive + negative, Batman MAXIMUM-SECURE posture (do-1461).</p>
-        <span class="tier-scale">SCALE: 3 regions · 15 nodes · 119/119 verify ×2 clean-room rounds</span>
-        <span class="cap-badge cap-today">PROVEN LIVE</span>
-      </a>
-
-      <a href="reference-architecture/enterprise-cpu-memory.html" class="arch-tier-card">
-        <span class="tier-id">ENTERPRISE</span>
-        <h3>CPU + Memory federated nodes</h3>
-        <p>API embeddings (#1598) on commodity CPU nodes — OpenRouter gemini-embedding-2 cloud shape or self-hosted TEI/vLLM airgapped shape. No Ollama anywhere; full semantic/autonomous tier on GPU-free fleets.</p>
-        <span class="tier-scale">SHAPE: federated mesh · API embeddings 80–300 ms · no GPU</span>
-        <span class="cap-badge cap-today">CORE TODAY · #1598</span>
-      </a>
-
-      <a href="reference-architecture/enterprise-cpu-memory-gpu.html" class="arch-tier-card">
-        <span class="tier-id">ENTERPRISE</span>
-        <h3>CPU + Memory + GPU federated nodes</h3>
-        <p>Local Ollama embeddings on GPU-equipped nodes (operator GPU policy), same hardened federation skeleton. Lowest embed latency, zero per-token cost, no embedding egress — includes the when-to-choose-which table.</p>
-        <span class="tier-scale">SHAPE: federated mesh · localhost GPU embed 5–30 ms</span>
-        <span class="cap-badge cap-today">CORE TODAY · #1598</span>
-      </a>
-
     </div>
-  </div>
-</section>
-
-<section>
-  <div class="container">
-    <span class="eyebrow">Capability matrix</span>
-    <h2>What ships today vs. what's on the road.</h2>
-    <p class="lede">The honest matrix. Cell colors match the badges above. Version tags are the release a capability reached GA — the Postgres+pgvector backbone is GA at <strong>v0.8.0</strong>.</p>
-
-    <table class="tier-matrix">
-      <thead>
-        <tr>
-          <th>Capability</th>
-          <th>T1</th>
-          <th>T2</th>
-          <th>T3</th>
-          <th>T4</th>
-          <th>T5</th>
-        </tr>
-      </thead>
-      <tbody>
-        <tr>
-          <td>SQLite-backed store, FTS5 keyword recall</td>
-          <td><span class="cap-badge cap-today">YES</span></td>
-          <td><span class="cap-badge cap-today">YES</span></td>
-          <td><span class="cap-badge cap-today">YES</span></td>
-          <td><span class="cap-badge cap-roadmap">→ pgvector</span></td>
-          <td><span class="cap-badge cap-roadmap">→ pgvector</span></td>
-        </tr>
-        <tr>
-          <td>Semantic recall (HNSW, MiniLM 384-dim)</td>
-          <td><span class="cap-badge cap-today">YES</span></td>
-          <td><span class="cap-badge cap-today">YES</span></td>
-          <td><span class="cap-badge cap-today">per-node</span></td>
-          <td><span class="cap-badge cap-roadmap">shared idx</span></td>
-          <td><span class="cap-badge cap-roadmap">shared idx</span></td>
-        </tr>
-        <tr>
-          <td>Namespace isolation + scope visibility (<code>as_agent</code>)</td>
-          <td>n/a</td>
-          <td><span class="cap-badge cap-today">YES</span></td>
-          <td><span class="cap-badge cap-today">YES</span></td>
-          <td><span class="cap-badge cap-today">YES</span></td>
-          <td><span class="cap-badge cap-today">YES</span></td>
-        </tr>
-        <tr>
-          <td>Per-namespace governance policy</td>
-          <td>n/a</td>
-          <td><span class="cap-badge cap-today">YES</span></td>
-          <td><span class="cap-badge cap-today">YES</span></td>
-          <td><span class="cap-badge cap-today">YES</span></td>
-          <td><span class="cap-badge cap-today">YES</span></td>
-        </tr>
-        <tr>
-          <td>Pending-approval gates (write/promote/delete)</td>
-          <td>n/a</td>
-          <td><span class="cap-badge cap-today">YES</span></td>
-          <td><span class="cap-badge cap-today">YES</span></td>
-          <td><span class="cap-badge cap-today">YES</span></td>
-          <td><span class="cap-badge cap-today">YES</span></td>
-        </tr>
-        <tr>
-          <td>Knowledge-graph w/ temporal validity (v0.6.3)</td>
-          <td><span class="cap-badge cap-today">YES</span></td>
-          <td><span class="cap-badge cap-today">YES</span></td>
-          <td><span class="cap-badge cap-today">YES</span></td>
-          <td><span class="cap-badge cap-today">YES</span></td>
-          <td><span class="cap-badge cap-today">YES</span></td>
-        </tr>
-        <tr>
-          <td>Hierarchical taxonomy (<code>memory_get_taxonomy</code>)</td>
-          <td><span class="cap-badge cap-today">YES</span></td>
-          <td><span class="cap-badge cap-today">YES</span></td>
-          <td><span class="cap-badge cap-today">YES</span></td>
-          <td><span class="cap-badge cap-today">YES</span></td>
-          <td><span class="cap-badge cap-today">YES</span></td>
-        </tr>
-        <tr>
-          <td>Capabilities introspection v2 (v0.6.3)</td>
-          <td><span class="cap-badge cap-today">YES</span></td>
-          <td><span class="cap-badge cap-today">YES</span></td>
-          <td><span class="cap-badge cap-today">YES</span></td>
-          <td><span class="cap-badge cap-today">YES</span></td>
-          <td><span class="cap-badge cap-today">YES</span></td>
-        </tr>
-        <tr>
-          <td>One-way <code>sync_push</code> fanout (memories, links, governance, pending)</td>
-          <td>n/a</td>
-          <td>n/a</td>
-          <td><span class="cap-badge cap-today">YES</span></td>
-          <td><span class="cap-badge cap-today">YES</span></td>
-          <td><span class="cap-badge cap-today">YES</span></td>
-        </tr>
-        <tr>
-          <td>Vector-clock causality (<code>sync/since</code>)</td>
-          <td>n/a</td>
-          <td>n/a</td>
-          <td><span class="cap-badge cap-today">YES</span></td>
-          <td><span class="cap-badge cap-today">YES</span></td>
-          <td><span class="cap-badge cap-today">YES</span></td>
-        </tr>
-        <tr>
-          <td>Quorum-write contract (W-of-N peer ack)</td>
-          <td>n/a</td>
-          <td>n/a</td>
-          <td><span class="cap-badge cap-today">YES</span></td>
-          <td><span class="cap-badge cap-today">YES</span></td>
-          <td><span class="cap-badge cap-today">YES</span></td>
-        </tr>
-        <tr>
-          <td>mTLS peer mesh + fingerprint allowlist</td>
-          <td>n/a</td>
-          <td>n/a</td>
-          <td><span class="cap-badge cap-today">YES</span></td>
-          <td><span class="cap-badge cap-today">YES</span></td>
-          <td><span class="cap-badge cap-today">YES</span></td>
-        </tr>
-        <tr>
-          <td>Postgres + pgvector backend</td>
-          <td><span class="cap-badge cap-partial">feature flag</span></td>
-          <td><span class="cap-badge cap-partial">feature flag</span></td>
-          <td><span class="cap-badge cap-partial">feature flag</span></td>
-          <td><span class="cap-badge cap-today">GA · v0.8.0</span></td>
-          <td><span class="cap-badge cap-today">GA · v0.8.0</span></td>
-        </tr>
-        <tr>
-          <td>Cryptographic agent attestation (Ed25519 <code>signature</code>, #626 Layer-3)</td>
-          <td><span class="cap-badge cap-today">YES</span></td>
-          <td><span class="cap-badge cap-today">YES</span></td>
-          <td><span class="cap-badge cap-today">YES</span></td>
-          <td><span class="cap-badge cap-today">YES</span></td>
-          <td><span class="cap-badge cap-future">hive scale · v1.0+</span></td>
-        </tr>
-        <tr>
-          <td>Distributed consensus (Raft / Paxos)</td>
-          <td>—</td>
-          <td>—</td>
-          <td>—</td>
-          <td>—</td>
-          <td><span class="cap-badge cap-future">v1.0+</span></td>
-        </tr>
-        <tr>
-          <td>Gossip / DHT for many-node discovery</td>
-          <td>—</td>
-          <td>—</td>
-          <td>—</td>
-          <td><span class="cap-badge cap-roadmap">scoped</span></td>
-          <td><span class="cap-badge cap-future">required</span></td>
-        </tr>
-      </tbody>
-    </table>
-
-    <div class="honesty-notice">
-      <strong>Certified scope — read this before you size a fleet.</strong> The federation <em>trust boundary</em> is certified for <strong>500–1000-agent clusters composed of ≤50-peer federation blocks</strong> — the substrate's own T6 = 1000+ / 50-peer ceiling, <strong>NOT</strong> a single 1M-agent fabric (issue #2438 retired that claim). The <strong>peer</strong> dimension is MEASURED — a real enrolled full mesh at N = 2…50 peers on a single host (#2921 capacity bench); the largest CROSS-HOST federation actually run is <strong>2 nodes</strong>. The <strong>agent</strong> figure is an ARCHITECTED (derived topology) ceiling, <strong>not</strong> a validated capacity — no agent population of that size has been run. Scale past one cluster by <strong>adding independent clusters</strong>, never by growing one mesh past ~50 peers. What is certified is the trust boundary (namespace confinement, peer attestation, per-write authority attestation, at-rest confidentiality, tamper-evident audit spine) — <strong>NOT</strong> throughput or latency (no ops/s figure is certified). Full scope + §6 limits: <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md" style="color:var(--p1)">the enterprise-federation certification</a>.
+    <div class="am-dd">
+      <button aria-haspopup="true">Planes ▾</button>
+      <div class="am-dd-menu">
+        <a href="federation.html">Federation<span>signed sync, quorum, catch-up</span></a>
+        <a href="wake-hub.html">Wake plane<span>wake-hub, wake-listen</span></a>
+        <a href="a2a-integration.html">Integrate any agent<span>inbox, notify, wake</span></a>
+        <a href="governance.html">Governance<span>policies, approvals</span></a>
+        <a href="encryption.html">Encryption<span>at rest and in transit</span></a>
+        <a href="SECURITY.html">Security model<span>threat model, posture</span></a>
+      </div>
     </div>
+  </nav>
+  <details class="am-mnav"><summary>Menu</summary><div class="am-mnav-pane">
+    <a href="index.html">Home</a>
+    <a href="architectures.html">Architectures overview</a>
+    <a href="https://test.agenticmem.co" target="_blank" rel="noopener">Live Testing</a>
+    <a href="testing/">Test Results</a>
+    <div class="am-g">Tiers</div>
+    <a href="architectures-t1.html">T1 · Single node</a>
+    <a href="architectures-t2.html">T2 · Shared daemon</a>
+    <a href="architectures-t3.html">T3 · Federated cluster</a>
+    <a href="architectures-t4.html">T4 · Data-center swarm</a>
+    <a href="architectures-t5.html">T5 · Federated hive</a>
+    <div class="am-g">Reference</div>
+    <a href="reference-architecture/">3-region hive</a>
+    <a href="reference-architecture/enterprise-cpu-memory.html">Enterprise · CPU + memory</a>
+    <a href="reference-architecture/enterprise-cpu-memory-gpu.html">Enterprise · CPU + memory + GPU</a>
+    <a href="ARCHITECTURAL_LIMITS.html">Architectural limits</a>
+    <div class="am-g">Planes</div>
+    <a href="federation.html">Federation</a>
+    <a href="wake-hub.html">Wake plane</a>
+    <a href="governance.html">Governance</a>
+    <a href="SECURITY.html">Security model</a>
+  </div></details>
+  <a class="am-cta" href="https://github.com/alphaonedev/ai-memory-mcp">GitHub</a>
+</div></header>
+<main id="main">
+<section class="am-hero"><div class="am-wrap">
+  <span class="am-pill"><i></i>ai-memory v1.0.0 · architectures</span>
+  <h1 class="am-h1">One memory substrate, from a single agent to a federated <span class="a">hive</span>.</h1>
+  <p class="am-sub">The same Rust binary, the same schema and the same three surfaces (<b>MCP</b>, <b>HTTP</b>, <b>CLI</b>) run on a laptop, behind a shared daemon, across a quorum-replicated cluster and on a PostgreSQL tier. What changes from tier to tier is topology, the consistency model and the trust boundary. <b>New in v1.0.0: the wake plane</b>, which pushes a content-free hint the moment a message lands, so agents stop sleeping between inbox polls.</p>
+  <div class="am-btns">
+    <a class="am-btn primary" href="#hive">See the hive</a>
+    <a class="am-btn" href="#tiers">Pick a tier</a>
+    <a class="am-btn" href="#limits">Honest limits</a>
   </div>
-</section>
-
-<section>
-  <div class="container">
-    <span class="eyebrow">Composition</span>
-    <h2>Why a layered architecture story.</h2>
-    <p>ai-memory is a <strong>primitive, not a platform</strong>. The same Rust binary, the same data model, the same MCP protocol surface scales from a developer's <code>~/.claude/ai-memory.db</code> to a fleet running across racks. What changes between tiers:</p>
-    <ul>
-      <li><strong>Topology</strong> — one process, then many, then many on many machines.</li>
-      <li><strong>Consistency model</strong> — single-writer atomic → eventually consistent peer mesh → quorum → consensus.</li>
-      <li><strong>Trust boundary</strong> — local trust → namespace + scope → governance policy → attested identity.</li>
-    </ul>
-    <p>What stays the same:</p>
-    <ul>
-      <li>The MCP tools (103 advertised at <code>--profile full</code>, 7 at <code>--profile core</code>) and 103 HTTP routes (89 unique paths) at <code>/api/v1/</code>.</li>
-      <li>The recall pipeline (FTS5 + HNSW + adaptive blending).</li>
-      <li>The tier model (<code>short</code> / <code>mid</code> / <code>long</code>).</li>
-      <li>The namespace hierarchy and scope visibility filter.</li>
-      <li>The governance contract (<code>Allow</code> / <code>Deny</code> / <code>Pending</code>).</li>
-    </ul>
-    <p>Every tier inherits everything below it.</p>
+  <div class="am-proof">
+    <span><b>SQLite</b> + SQLCipher at rest</span>
+    <span><b>PostgreSQL 18</b> + Apache AGE + pgvector</span>
+    <span><b>Ed25519</b>-signed federation</span>
+    <span><b>W-of-N</b> quorum writes</span>
+    <span><b>wake-hub</b> · wake-listen</span>
   </div>
-</section>
+</div></section>
 
-<section>
-  <div class="container">
-    <span class="eyebrow">Federation primitives</span>
-    <h2>What lives in the codebase today.</h2>
-    <p class="lede">These are the building blocks every multi-node tier composes. All shipped, all in v0.8.0:</p>
-    <ul>
-      <li><code>src/daemon_runtime.rs</code> (<code>ServeArgs</code>) — quorum-write CLI surface: <code>--quorum-writes N</code>, <code>--quorum-peers &lt;comma-list&gt;</code>, <code>--quorum-timeout-ms</code>, <code>--quorum-client-cert/-key/-ca-cert</code>, <code>--catchup-interval-secs</code>.</li>
-      <li><code>src/daemon_runtime.rs</code> (<code>ServeArgs</code>) — TLS / mTLS allowlist: <code>--tls-cert</code>, <code>--tls-key</code>, <code>--mtls-allowlist &lt;SHA-256 fingerprint file&gt;</code>. Allowlist presence enforces mTLS.</li>
-      <li><code>src/federation/{sync,quorum}.rs</code> — <code>broadcast_store_quorum</code> + <code>finalise_quorum</code> wired into the handler write path; returns <code>200 OK</code> with <code>quorum_acks</code> on success, and, after a local commit, a quorum shortfall after the local commit returns <code>202 Accepted</code> with <code>quorum_met:false</code>, <code>acks</code>, <code>needed</code>, <code>reason</code> and <code>durability:"local"</code> (the write is locally committed but under-replicated, not rejected).</li>
-      <li><code>src/federation/sync.rs</code> — <strong>10 broadcast functions</strong>: <code>broadcast_store_quorum</code>, <code>broadcast_delete_quorum</code>, <code>broadcast_archive_quorum</code>, <code>broadcast_restore_quorum</code>, <code>broadcast_link_quorum</code>, <code>broadcast_consolidate_quorum</code>, <code>broadcast_pending_quorum</code>, <code>broadcast_pending_decision_quorum</code>, <code>broadcast_namespace_meta_quorum</code>, <code>broadcast_namespace_meta_clear_quorum</code>.</li>
-      <li><code>src/handlers/</code> — <code>POST /api/v1/sync/push</code> accepts memories, deletions, archives, links, pending actions, pending decisions, namespace metadata, and (v0.6.3) entity registrations. <code>GET /api/v1/sync/since?peer=&lt;id&gt;&amp;since=&lt;ts&gt;</code> returns the rows updated after the peer's last-seen point for a rejoining peer.</li>
-      <li><code>src/storage/</code> — <code>compute_visibility_prefixes()</code> + <code>visibility_clause()</code> enforce scope-based recall filtering at the SQL level using the indexed <code>scope_idx</code> generated column.</li>
-      <li><code>src/models/</code> — <code>GovernancePolicy</code> per-namespace, <code>PendingAction</code> queue, <code>namespace_ancestors()</code> for visibility hierarchy.</li>
-      <li><code>src/replication.rs</code> — <code>QuorumPolicy</code> + <code>AckTracker</code>, <strong>functional</strong>, wired into the write path.</li>
-      <li><code>Cargo.toml</code> — <code>sal-postgres</code> feature flag for the v0.8.0 GA Postgres+pgvector backbone (<code>sqlx</code> + <code>pgvector</code> deps, schema parity fixes shipped #294-#297).</li>
-    </ul>
+<section class="am-sec" id="hive"><div class="am-wrap">
+  <div class="am-sec-h">
+    <span class="am-eyebrow">The hive</span>
+    <h2>ai-memory inside an <span class="a">agent hive</span>.</h2>
+    <p>Each host runs its agents, one ai-memory daemon, one same-host wake hub and one store. Hosts meet only through <b>federation</b>: a mutually-authenticated, Ed25519-signed push mesh with W-of-N quorum writes and a catch-up pull for peers that were away. Host A runs an MCP agent whose <code>ai-memory mcp</code> child opens SQLite in-process; host B runs the CLI, which also opens the store in-process (it is not a thin HTTP client); host C keeps its data in PostgreSQL, which agent traffic reaches only through its daemon. Every daemon listener is TLS, loopback included.</p>
   </div>
-</section>
-
-<section>
-  <div class="container">
-    <span class="eyebrow">How to read</span>
-    <h2>Each tier page contains.</h2>
-    <ol>
-      <li>An <strong>animated SVG diagram</strong> showing memory data flow — writes, recalls, peer sync, governance gates, and (where relevant) attestations.</li>
-      <li>A <strong>"what's actually happening"</strong> narrative walking the reader through a recall and a write.</li>
-      <li><strong>Capability badges</strong> on every primitive — cyan ships today, orange partial, purple roadmap, pink future vision.</li>
-      <li>A <strong>deployment recipe</strong> with real commands.</li>
-      <li><strong>Governance, skills, and attestations</strong> wiring for the tier — what enforces the rules at this scale.</li>
-      <li><strong>Honest limits</strong> — what would break, and at what scale.</li>
-    </ol>
-    <p>Start at <a href="architectures-t1.html" style="color:var(--p1)">Tier 1</a> and walk forward, or jump straight to the tier that matches your fleet.</p>
-
-    <div class="honesty-notice">
-      <strong>Engineering honesty.</strong> Every "ships today" claim cites a file path and behavior in the v1.0.0 source tree. Roadmap items reference ADRs and tracked work. The vision tier (T5) is the north star — we'll get there, but it's not shipping in v1.0.0. If a diagram shows something the code doesn't do, that's a documentation bug — please file an issue.
-    </div>
+  <div class="am-legend">
+    <span><i></i>memory read/write</span>
+    <span><i class="teal"></i>wake hint</span>
+    <span><i class="dash"></i>operator side / backstop</span>
+    <span><i class="bad"></i>limit</span>
   </div>
-</section>
+  <figure class="am-fig" style="--fig-min:920px">
+<svg class="dg" viewBox="0 0 1100 560" role="img" aria-labelledby="hv-title" aria-describedby="hv-desc" xmlns="http://www.w3.org/2000/svg">
+<title id="hv-title">ai-memory inside a three-host agent hive</title><desc id="hv-desc">Three hosts, each running agents, an ai-memory daemon, a same-host wake hub and a store. Hosts A and B use SQLite; host C uses PostgreSQL through its daemon. The daemons federate over a mutually-authenticated, Ed25519-signed mesh with W-of-N quorum writes and catch-up pulls. An operator-side triage consumer subscribes to wake hints like any agent and is not part of ai-memory.</desc>
+<defs><marker id="hv-ah" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow"/></marker><marker id="hv-aa" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow acc"/></marker><marker id="hv-at" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow teal"/></marker><marker id="hv-ab" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow bad"/></marker><marker id="hv-as" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow slate"/></marker></defs>
+<g class="rise"><text class="t-k" x="550.0" y="26" text-anchor="middle">FEDERATION MESH  ·  mTLS  ·  Ed25519-signed /sync/push  ·  W-of-N quorum  ·  /sync/since catch-up</text></g>
+<path class="wire" d="M139 44 H859"/><path class="flow slow" d="M139 44 H859"/><path class="flow slow rev" d="M139 44 H859"/><path class="dot" pathLength="100" d="M139 44 H859" style="--d:0.4s"/><path class="dot" pathLength="100" d="M859 44 H139" style="--d:2.1s"/><g class="rise"><rect class="zone solid" x="30" y="70" width="320" height="340" rx="18"/><text class="t-k" x="48" y="94">HOST A</text><text class="t-s" x="332" y="94" text-anchor="end">SQLite · MCP agent</text><rect class="box" x="46" y="120" width="84" height="38" rx="9"/><text class="t-s" x="88" y="143" text-anchor="middle">HTTPS agent</text><circle class="pulse good" cx="56" cy="130" r="2.6"/><rect class="box" x="148" y="120" width="84" height="38" rx="9"/><text class="t-s" x="190" y="143" text-anchor="middle">HTTPS agent</text><circle class="pulse good" cx="158" cy="130" r="2.6" style="--d:0.3s"/><rect class="box" x="250" y="120" width="84" height="38" rx="9"/><text class="t-s" x="292" y="143" text-anchor="middle">MCP agent</text><circle class="pulse good" cx="260" cy="130" r="2.6" style="--d:0.6s"/><rect class="box acc" x="46" y="190" width="188" height="110" rx="12"/><text class="t-h" x="60" y="213">ai-memory serve</text><rect class="box" x="60" y="222" width="160" height="20" rx="6"/><text class="t-s" x="70" y="236">identity · auth</text><rect class="box" x="60" y="247" width="160" height="20" rx="6"/><text class="t-s" x="70" y="261">governance gate</text><rect class="box" x="60" y="272" width="160" height="20" rx="6"/><text class="t-s" x="70" y="286">memory engine</text><rect class="box" x="244" y="190" width="90" height="110" rx="12"/><text class="t-m" x="289" y="212" text-anchor="middle">ai-memory</text><text class="t-a" x="289" y="228" text-anchor="middle">mcp</text><text class="t-s" x="289" y="244" text-anchor="middle">stdio child</text><text class="t-s" x="289" y="260" text-anchor="middle">in-process</text><text class="t-s" x="289" y="276" text-anchor="middle">SQLite only</text><rect class="box teal" x="46" y="330" width="84" height="66" rx="10"/><text class="t-m" x="88" y="354" text-anchor="middle">wake-hub</text><text class="t-s" x="88" y="369" text-anchor="middle">unix socket</text><text class="t-s" x="88" y="384" text-anchor="middle">same host</text><rect class="box" x="140" y="330" width="194" height="66" rx="10"/><ellipse class="box" cx="237" cy="336" rx="88" ry="5"/><text class="t-m" x="237" y="358" text-anchor="middle">SQLite · WAL</text><text class="t-s" x="237" y="372" text-anchor="middle">SQLCipher build:</text><text class="t-s" x="237" y="386" text-anchor="middle">encrypted at rest</text></g>
+<path class="wire" d="M88 158 V188" marker-end="url(#hv-aa)"/><path class="flow" d="M88 158 V188"/><path class="dot" pathLength="100" d="M88 158 V188"/><path class="wire" d="M190 158 V188" marker-end="url(#hv-aa)"/><path class="flow" d="M190 158 V188"/><path class="dot" pathLength="100" d="M190 158 V188" style="--d:0.5s"/><path class="wire" d="M292 158 V188" marker-end="url(#hv-aa)"/><path class="flow" d="M292 158 V188"/><path class="dot" pathLength="100" d="M292 158 V188" style="--d:1.0s"/><path class="wire" d="M180 300 V328" marker-end="url(#hv-aa)"/><path class="flow" d="M180 300 V328"/><path class="dot" pathLength="100" d="M180 300 V328" style="--d:1.4s"/><path class="wire" d="M292 300 V328" marker-end="url(#hv-aa)"/><path class="flow" d="M292 300 V328"/><path class="dot" pathLength="100" d="M292 300 V328" style="--d:1.8s"/><path class="wire" d="M88 300 V328" marker-end="url(#hv-at)"/><path class="flow teal" d="M88 300 V328"/><path class="dot teal" pathLength="100" d="M88 300 V328" style="--d:2.0s"/><path class="wire" d="M46 372 H38 V139 H44" marker-end="url(#hv-at)"/><path class="flow teal" d="M46 372 H38 V139 H44"/><path class="dot teal" pathLength="100" d="M46 372 H38 V139 H44" style="--d:2.4s"/><path class="wire" d="M139 190 V44"/><path class="flow slow" d="M139 190 V44"/><circle class="ring" cx="139" cy="44" r="7"/><circle class="pulse" cx="139" cy="44" r="4"/><g class="rise" style="--d:0.15s"><rect class="zone solid" x="390" y="70" width="320" height="340" rx="18"/><text class="t-k" x="408" y="94">HOST B</text><text class="t-s" x="692" y="94" text-anchor="end">SQLite · CLI operator</text><rect class="box" x="406" y="120" width="84" height="38" rx="9"/><text class="t-s" x="448" y="143" text-anchor="middle">HTTPS agent</text><circle class="pulse good" cx="416" cy="130" r="2.6" style="--d:0.2s"/><rect class="box" x="508" y="120" width="84" height="38" rx="9"/><text class="t-s" x="550" y="143" text-anchor="middle">HTTPS agent</text><circle class="pulse good" cx="518" cy="130" r="2.6" style="--d:0.5s"/><rect class="box" x="610" y="120" width="84" height="38" rx="9"/><text class="t-s" x="652" y="143" text-anchor="middle">CLI shell</text><circle class="pulse good" cx="620" cy="130" r="2.6" style="--d:0.8s"/><rect class="box acc" x="406" y="190" width="188" height="110" rx="12"/><text class="t-h" x="420" y="213">ai-memory serve</text><rect class="box" x="420" y="222" width="160" height="20" rx="6"/><text class="t-s" x="430" y="236">identity · auth</text><rect class="box" x="420" y="247" width="160" height="20" rx="6"/><text class="t-s" x="430" y="261">governance gate</text><rect class="box" x="420" y="272" width="160" height="20" rx="6"/><text class="t-s" x="430" y="286">memory engine</text><rect class="box" x="604" y="190" width="90" height="110" rx="12"/><text class="t-m" x="649" y="212" text-anchor="middle">ai-memory</text><text class="t-a" x="649" y="228" text-anchor="middle">&lt;verb&gt;</text><text class="t-s" x="649" y="244" text-anchor="middle">CLI process</text><text class="t-s" x="649" y="260" text-anchor="middle">in-process,</text><text class="t-s" x="649" y="276" text-anchor="middle">not a client</text><rect class="box teal" x="406" y="330" width="84" height="66" rx="10"/><text class="t-m" x="448" y="354" text-anchor="middle">wake-hub</text><text class="t-s" x="448" y="369" text-anchor="middle">unix socket</text><text class="t-s" x="448" y="384" text-anchor="middle">same host</text><rect class="box" x="500" y="330" width="194" height="66" rx="10"/><ellipse class="box" cx="597" cy="336" rx="88" ry="5"/><text class="t-m" x="597" y="358" text-anchor="middle">SQLite · WAL</text><text class="t-s" x="597" y="372" text-anchor="middle">SQLCipher build:</text><text class="t-s" x="597" y="386" text-anchor="middle">encrypted at rest</text></g>
+<path class="wire" d="M448 158 V188" marker-end="url(#hv-aa)"/><path class="flow" d="M448 158 V188"/><path class="dot" pathLength="100" d="M448 158 V188" style="--d:0.25s"/><path class="wire" d="M550 158 V188" marker-end="url(#hv-aa)"/><path class="flow" d="M550 158 V188"/><path class="dot" pathLength="100" d="M550 158 V188" style="--d:0.75s"/><path class="wire" d="M652 158 V188" marker-end="url(#hv-aa)"/><path class="flow" d="M652 158 V188"/><path class="dot" pathLength="100" d="M652 158 V188" style="--d:1.25s"/><path class="wire" d="M540 300 V328" marker-end="url(#hv-aa)"/><path class="flow" d="M540 300 V328"/><path class="dot" pathLength="100" d="M540 300 V328" style="--d:1.65s"/><path class="wire" d="M652 300 V328" marker-end="url(#hv-aa)"/><path class="flow" d="M652 300 V328"/><path class="dot" pathLength="100" d="M652 300 V328" style="--d:2.05s"/><path class="wire" d="M448 300 V328" marker-end="url(#hv-at)"/><path class="flow teal" d="M448 300 V328"/><path class="dot teal" pathLength="100" d="M448 300 V328" style="--d:2.25s"/><path class="wire" d="M406 372 H398 V139 H404" marker-end="url(#hv-at)"/><path class="flow teal" d="M406 372 H398 V139 H404"/><path class="dot teal" pathLength="100" d="M406 372 H398 V139 H404" style="--d:2.65s"/><path class="wire" d="M499 190 V44"/><path class="flow slow" d="M499 190 V44"/><circle class="ring" cx="499" cy="44" r="7" style="--d:0.6s"/><circle class="pulse" cx="499" cy="44" r="4" style="--d:0.6s"/><g class="rise" style="--d:0.3s"><rect class="zone solid" x="750" y="70" width="320" height="340" rx="18"/><text class="t-k" x="768" y="94">HOST C</text><text class="t-s" x="1052" y="94" text-anchor="end">PostgreSQL tier</text><rect class="box" x="766" y="120" width="84" height="38" rx="9"/><text class="t-s" x="808" y="143" text-anchor="middle">HTTPS agent</text><circle class="pulse good" cx="776" cy="130" r="2.6" style="--d:0.4s"/><rect class="box" x="868" y="120" width="84" height="38" rx="9"/><text class="t-s" x="910" y="143" text-anchor="middle">HTTPS agent</text><circle class="pulse good" cx="878" cy="130" r="2.6" style="--d:0.7s"/><rect class="box" x="970" y="120" width="84" height="38" rx="9"/><text class="t-s" x="1012" y="143" text-anchor="middle">HTTPS agent</text><circle class="pulse good" cx="980" cy="130" r="2.6" style="--d:1.0s"/><rect class="box acc" x="766" y="190" width="288" height="110" rx="12"/><text class="t-h" x="780" y="213">ai-memory serve</text><rect class="box" x="780" y="222" width="160" height="20" rx="6"/><text class="t-s" x="790" y="236">identity · auth</text><rect class="box" x="780" y="247" width="160" height="20" rx="6"/><text class="t-s" x="790" y="261">governance gate</text><rect class="box" x="780" y="272" width="160" height="20" rx="6"/><text class="t-s" x="790" y="286">memory engine</text><text class="t-s" x="956" y="238">HTTPS only:</text><text class="t-s" x="956" y="253">MCP stdio is</text><text class="t-s" x="956" y="268">SQLite-only</text><rect class="box teal" x="766" y="330" width="84" height="66" rx="10"/><text class="t-m" x="808" y="354" text-anchor="middle">wake-hub</text><text class="t-s" x="808" y="369" text-anchor="middle">unix socket</text><text class="t-s" x="808" y="384" text-anchor="middle">same host</text><rect class="box" x="860" y="330" width="194" height="66" rx="10"/><ellipse class="box" cx="957" cy="336" rx="88" ry="5"/><text class="t-m" x="957" y="358" text-anchor="middle">PostgreSQL 18 · pgvector</text><text class="t-s" x="957" y="372" text-anchor="middle">AGE when installed</text><text class="t-s" x="957" y="386" text-anchor="middle">agents via daemon only</text></g>
+<path class="wire" d="M808 158 V188" marker-end="url(#hv-aa)"/><path class="flow" d="M808 158 V188"/><path class="dot" pathLength="100" d="M808 158 V188" style="--d:0.5s"/><path class="wire" d="M910 158 V188" marker-end="url(#hv-aa)"/><path class="flow" d="M910 158 V188"/><path class="dot" pathLength="100" d="M910 158 V188" style="--d:1.0s"/><path class="wire" d="M1012 158 V188" marker-end="url(#hv-aa)"/><path class="flow" d="M1012 158 V188"/><path class="dot" pathLength="100" d="M1012 158 V188" style="--d:1.5s"/><path class="wire" d="M900 300 V328" marker-end="url(#hv-aa)"/><path class="flow" d="M900 300 V328"/><path class="dot" pathLength="100" d="M900 300 V328" style="--d:1.9s"/><path class="wire" d="M808 300 V328" marker-end="url(#hv-at)"/><path class="flow teal" d="M808 300 V328"/><path class="dot teal" pathLength="100" d="M808 300 V328" style="--d:2.5s"/><path class="wire" d="M766 372 H758 V139 H764" marker-end="url(#hv-at)"/><path class="flow teal" d="M766 372 H758 V139 H764"/><path class="dot teal" pathLength="100" d="M766 372 H758 V139 H764" style="--d:2.9s"/><path class="wire" d="M859 190 V44"/><path class="flow slow" d="M859 190 V44"/><circle class="ring" cx="859" cy="44" r="7" style="--d:1.2s"/><circle class="pulse" cx="859" cy="44" r="4" style="--d:1.2s"/><g class="rise" style="--d:0.6s"><rect class="box ghost" x="30" y="440" width="470" height="100" rx="14"/><text class="t-k" x="50" y="466">OPERATOR SIDE  ·  NOT PART OF ai-memory</text><text class="t-s" x="50" y="483">Jev triage: subscribes to wake hints with wake-listen like any</text><text class="t-s" x="50" y="500">agent, reads the inbox, routes and pre-scores. It never decides</text><text class="t-s" x="50" y="517">correctness, security or a merge.</text></g>
+<path class="wire ghost" d="M88 396 V420 H120 V438" marker-end="url(#hv-ah)"/><g class="rise" style="--d:0.75s"><rect class="box bad" x="530" y="440" width="540" height="100" rx="14"/><text class="t-k" x="550" y="466">HONEST LIMITS</text><text class="t-s" x="550" y="483">· a wake hub never bridges hosts; hosts meet only through federation</text><text class="t-s" x="550" y="500">· no agent talks to PostgreSQL directly; no CDC stream is offered</text><text class="t-s" x="550" y="517">· quorum miss → 202 quorum_met:false; the row is already durable locally</text></g>
+</svg>
 
-<footer>
-  <p>© 2026 AlphaOne LLC. Licensed Apache-2.0. ai-memory v1.0.0 — <a href="https://github.com/alphaonedev/ai-memory-mcp">source on GitHub</a> · <a href="./">home</a></p>
-</footer>
+  </figure>
+  <p class="am-figcap"><b>Read it top-down.</b> Agents reach the daemon over HTTPS or spawn a local process; the daemon resolves identity, applies governance and writes the store; a committed message publishes a wake to the local hub; the federation riser replicates the write to the other hosts. Sources: <code>src/daemon_runtime.rs</code>, <code>src/mcp/mod.rs</code>, <code>src/federation/sync.rs</code>, <code>src/wake_hub/server.rs</code>.</p>
+</div></section>
 
+<section class="am-sec alt" id="node"><div class="am-wrap">
+  <div class="am-sec-h">
+    <span class="am-eyebrow">One node</span>
+    <h2>Three surfaces, one engine, <span class="a">two backends</span>.</h2>
+    <p>MCP serves a named profile: <b>core</b> (the store, recall, list, get, search, load-family and smart-load tools, plus the always-on <code>memory_capabilities</code> bootstrap), <b>graph</b>, <b>admin</b>, <b>power</b> or <b>full</b>, or a comma-separated mix of profiles and tool families. HTTPS serves every route under <code>/api/v1/</code>: the daemon refuses to listen without TLS on any bind, loopback included; a single-operator install mints and renews a local CA certificate, and every fleet shape brings its own. The CLI exposes the same operations as verbs. All three resolve an agent identity and pass the same per-namespace governance gate before the engine touches storage.</p>
+  </div>
+  <figure class="am-fig" style="--fig-min:900px">
+<svg class="dg" viewBox="0 0 1100 460" role="img" aria-labelledby="nd-title" aria-describedby="nd-desc" xmlns="http://www.w3.org/2000/svg">
+<title id="nd-title">Inside one ai-memory node</title><desc id="nd-desc">Three surfaces (MCP over stdio with named profiles from core to full, HTTPS under /api/v1 with TLS on every bind, and the CLI) resolve an agent identity, pass the per-namespace governance gate, reach one memory engine and land in SQLite or SQLCipher, or in PostgreSQL with agent traffic through the HTTPS daemon only. Audit, signed events, curator and operations tooling sit underneath.</desc>
+<defs><marker id="nd-ah" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow"/></marker><marker id="nd-aa" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow acc"/></marker><marker id="nd-at" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow teal"/></marker><marker id="nd-ab" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow bad"/></marker><marker id="nd-as" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow slate"/></marker></defs>
+<g class="rise"><rect class="box" x="30" y="60" width="210" height="70" rx="12"/><text class="t-m" x="46" y="85">MCP · stdio JSON-RPC</text><text class="t-s" x="46" y="102">profiles: core · graph ·</text><text class="t-s" x="46" y="119">admin · power · full</text></g>
+<path class="wire" d="M240 95 H262" marker-end="url(#nd-aa)"/><path class="flow" d="M240 95 H262"/><path class="dot" pathLength="100" d="M240 95 H262"/><g class="rise" style="--d:0.1s"><rect class="box acc" x="30" y="150" width="210" height="70" rx="12"/><text class="t-m" x="46" y="175">HTTPS · /api/v1/*</text><text class="t-s" x="46" y="192">TLS on every bind (#3705)</text><text class="t-s" x="46" y="209">API key required off loopback</text></g>
+<path class="wire" d="M240 185 H262" marker-end="url(#nd-aa)"/><path class="flow" d="M240 185 H262"/><path class="dot" pathLength="100" d="M240 185 H262" style="--d:0.4s"/><g class="rise" style="--d:0.2s"><rect class="box" x="30" y="240" width="210" height="70" rx="12"/><text class="t-m" x="46" y="265">CLI · ai-memory &lt;verb&gt;</text><text class="t-s" x="46" y="282">in-process, not a client;</text><text class="t-s" x="46" y="299">admin verbs: --store-url</text></g>
+<path class="wire" d="M240 275 H262" marker-end="url(#nd-aa)"/><path class="flow" d="M240 275 H262"/><path class="dot" pathLength="100" d="M240 275 H262" style="--d:0.8s"/><text class="t-k" x="30" y="40">SURFACES</text><text class="t-k" x="266" y="40">IDENTITY</text><g class="rise" style="--d:0.2s"><rect class="box" x="266" y="60" width="160" height="250" rx="12"/><text class="t-s" x="280" y="88">X-Agent-Id header</text><text class="t-s" x="280" y="110">per-agent API keys</text><text class="t-s" x="280" y="132">mTLS fingerprint</text><text class="t-s" x="280" y="154">allowlist</text><text class="t-s" x="280" y="176">Ed25519 agent keys</text></g>
+<path class="wire" d="M426 185 H444" marker-end="url(#nd-aa)"/><path class="flow" d="M426 185 H444"/><path class="dot" pathLength="100" d="M426 185 H444" style="--d:0.6s"/><text class="t-k" x="448" y="40">GOVERNANCE</text><g class="rise" style="--d:0.35s"><rect class="box" x="448" y="60" width="190" height="250" rx="12"/><text class="t-s" x="462" y="88">namespace standards</text><text class="t-s" x="462" y="110">write · promote · delete</text><text class="t-s" x="462" y="132">any | registered |</text><text class="t-s" x="462" y="154">owner | approve</text><text class="t-s" x="462" y="176">Allow · Deny · Pending</text><text class="t-s" x="462" y="198">capability tokens</text></g>
+<path class="wire" d="M638 185 H656" marker-end="url(#nd-aa)"/><path class="flow" d="M638 185 H656"/><path class="dot" pathLength="100" d="M638 185 H656" style="--d:0.8999999999999999s"/><text class="t-k" x="660" y="40">MEMORY ENGINE</text><g class="rise" style="--d:0.5s"><rect class="box" x="660" y="60" width="190" height="250" rx="12"/><text class="t-s" x="674" y="88">tiers short · mid · long</text><text class="t-s" x="674" y="110">keyword + vector recall</text><text class="t-s" x="674" y="132">temporal knowledge graph</text><text class="t-s" x="674" y="154">hooks · subscriptions</text><text class="t-s" x="674" y="176">leases · checkpoints</text><text class="t-s" x="674" y="198">curator · autonomy</text></g>
+<text class="t-k" x="876" y="40">STORAGE</text><path class="wire" d="M850 125 H866" marker-end="url(#nd-aa)"/><path class="flow" d="M850 125 H866"/><path class="dot" pathLength="100" d="M850 125 H866" style="--d:1.4s"/><path class="wire" d="M850 250 H866" marker-end="url(#nd-as)"/><path class="flow slate" d="M850 250 H866"/><path class="dot slate" pathLength="100" d="M850 250 H866" style="--d:1.7s"/><g class="rise" style="--d:0.7s"><rect class="box acc" x="870" y="60" width="206" height="120" rx="12"/><ellipse class="box acc" cx="973" cy="66" rx="88" ry="6"/><text class="t-m" x="884" y="94">SQLite · WAL</text><text class="t-s" x="884" y="110">every surface</text><text class="t-s" x="884" y="126">SQLCipher build feature:</text><text class="t-s" x="884" y="142">encrypted at rest</text><text class="t-s" x="884" y="158">one writer at a time</text></g>
+<g class="rise" style="--d:0.85s"><rect class="box slate" x="870" y="196" width="206" height="114" rx="12"/><ellipse class="box slate" cx="973" cy="202" rx="88" ry="6"/><text class="t-m" x="884" y="228">PostgreSQL 18</text><text class="t-s" x="884" y="244">pgvector · AGE if installed</text><text class="t-s" x="884" y="260">agents via the daemon:</text><text class="t-slate" x="884" y="276">76 of the 89 unique paths</text><text class="t-bad" x="884" y="292">the rest fail closed: 501</text></g>
+<text class="t-k" x="30" y="352">UNDERNEATH EVERY NODE</text><g class="rise" style="--d:1.0s"><rect class="box teal" x="30" y="366" width="246" height="76" rx="12"/><text class="t-m" x="46" y="392">audit log</text><text class="t-s" x="46" y="409">hash-chained JSON lines</text><text class="t-s" x="46" y="426">opt-in · audit verify</text></g>
+<g class="rise" style="--d:1.12s"><rect class="box teal" x="292" y="366" width="246" height="76" rx="12"/><text class="t-m" x="308" y="392">signed_events</text><text class="t-s" x="308" y="409">append-only SHA-256 chain</text><text class="t-s" x="308" y="426">verify-signed-events-chain</text></g>
+<g class="rise" style="--d:1.24s"><rect class="box" x="554" y="366" width="246" height="76" rx="12"/><text class="t-m" x="570" y="392">curator · autonomy</text><text class="t-s" x="570" y="409">LLM sweeps, opt-in passes</text><text class="t-s" x="570" y="426">tagging · contradictions</text></g>
+<g class="rise" style="--d:1.3599999999999999s"><rect class="box" x="816" y="366" width="246" height="76" rx="12"/><text class="t-m" x="832" y="392">operations</text><text class="t-s" x="832" y="409">backup · restore (SQLite)</text><text class="t-s" x="832" y="426">doctor · export · import</text></g>
+</svg>
+
+  </figure>
+  <p class="am-figcap"><b>Backend parity, stated exactly.</b> On PostgreSQL every request still terminates at the daemon: <code>postgres_route_gate</code> serves 76 of the 89 unique paths and answers the rest with a uniform <code>501 NOT IMPLEMENTED</code> rather than ever touching the wrong database. <code>serve</code> and <code>curator</code> run against PostgreSQL; the tenant-facing CLI read/write verbs and MCP over stdio are SQLite-only; the admin verbs <code>schema-init</code>, <code>keys</code>, <code>reown</code>, <code>verify-audit-trail</code>, <code>agents bind-api-key</code>, <code>identity hub-cache</code> and <code>doctor</code> take a per-run <code>--store-url</code> target. Sources: <code>src/handlers/postgres_gate.rs</code>, <code>src/profile.rs</code>, <code>src/transit_encryption.rs</code>, <code>src/daemon_runtime.rs</code>.</p>
+  <div class="am-grid">
+    <div class="am-card gold"><span class="am-k">Data tiers</span><h3>short · mid · long</h3><p>Every memory carries a tier. <b>Short</b> expires after hours, <b>mid</b> after days, <b>long</b> never; recall boosts and promotion move memories up. TTLs come from the retention model in <code>src/models/memory.rs</code>.</p></div>
+    <div class="am-card gold"><span class="am-k">At rest</span><h3>SQLCipher or deployment-specific</h3><p>Build with the <code>sqlcipher</code> feature to encrypt the SQLite file. For PostgreSQL volumes, the enterprise posture check records an <b>operator attestation</b> that storage encryption is on; it does not probe the disk itself.</p></div>
+    <div class="am-card teal"><span class="am-k">Forensics</span><h3>Two tamper-evident chains</h3><p>The <code>signed_events</code> table is an append-only SHA-256 chain checked by <code>verify-signed-events-chain</code>. The opt-in audit log is a hash-chained JSON stream checked by <code>audit verify</code>. Content is never written to the audit log.</p></div>
+    <div class="am-card"><span class="am-k">Operations</span><h3>backup · restore · doctor</h3><p><code>ai-memory backup</code> snapshots SQLite with an operator-signed manifest and refuses other stores; PostgreSQL uses your own base backups and WAL archive. <code>doctor</code> reports health locally or across a fleet with <code>--remote</code>.</p></div>
+    <div class="am-card"><span class="am-k">Curator · autonomy</span><h3>LLM sweeps, opt-in</h3><p>The curator periodically auto-tags and checks for contradictions through a configured LLM; autonomy adds consolidation, forgetting of superseded memories and priority feedback. Neither runs without an LLM configured.</p></div>
+    <div class="am-card"><span class="am-k">Recall</span><h3>Keyword + vector, plus a graph</h3><p>Keyword search, embeddings from a local MiniLM model or an OpenAI-compatible endpoint, an in-process HNSW index on SQLite or pgvector on PostgreSQL, and temporal links with <code>valid_from</code> / <code>valid_until</code>. Apache AGE accelerates graph walks when installed.</p></div>
+  </div>
+</div></section>
+
+<section class="am-sec" id="wake"><div class="am-wrap">
+  <div class="am-sec-h">
+    <span class="am-eyebrow">New in v1.0.0 · rust-a2a wake plane</span>
+    <h2>Messages that <span class="a">wake</span> their recipient.</h2>
+    <p><code>memory_notify</code> commits a durable inbox row, then publishes a bounded hint through an in-process bus, a wake sink and the host's <b>wake-hub</b> (a Unix-domain-socket switch with per-recipient queues, an allowlist and a delegation verifier) to the recipient's <b>wake-listen</b> session. The hint carries a digest, never the body. Across hosts the row travels by federation, and the receiving node publishes its own local wake only when the apply actually moved the row forward.</p>
+  </div>
+  <figure class="am-fig" style="--fig-min:920px">
+<svg class="dg" viewBox="0 0 1100 500" role="img" aria-labelledby="wk-title" aria-describedby="wk-desc" xmlns="http://www.w3.org/2000/svg">
+<title id="wk-title">The rust-a2a wake plane</title><desc id="wk-desc">On host A a notify commits a durable inbox row first, then publishes a content-free wake through the in-process bus, a wake sink and the same-host wake hub to the recipient, who does one catch-up inbox read. A bounded backstop poll makes a lost wake cost latency only. The row reaches host B through signed federation; applying a fresh row there publishes a local wake, while replayed or superseded rows wake nobody. An operator-side triage consumer subscribes like any agent.</desc>
+<defs><marker id="wk-ah" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow"/></marker><marker id="wk-aa" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow acc"/></marker><marker id="wk-at" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow teal"/></marker><marker id="wk-ab" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow bad"/></marker><marker id="wk-as" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow slate"/></marker></defs>
+<rect class="zone solid" x="20" y="14" width="1060" height="236" rx="18"/><text class="t-k" x="40" y="40">HOST A</text><g class="rise"><rect class="box" x="40" y="60" width="150" height="78" rx="12"/><text class="t-a" x="54" y="84">01</text><text class="t-m" x="80" y="84">sender agent</text><text class="t-s" x="54" y="106">memory_notify</text><text class="t-s" x="54" y="122">MCP · HTTPS</text></g>
+<path class="wire" d="M190 99 H210" marker-end="url(#wk-aa)"/><path class="flow" d="M190 99 H210"/><path class="dot" pathLength="100" d="M190 99 H210"/><g class="rise" style="--d:0.12s"><rect class="box acc" x="212" y="60" width="150" height="78" rx="12"/><text class="t-a" x="226" y="84">02</text><text class="t-m" x="252" y="84">inbox row</text><text class="t-s" x="226" y="106">_inbox/&lt;recipient&gt;</text><text class="t-s" x="226" y="122">committed first</text></g>
+<path class="wire" d="M362 99 H382" marker-end="url(#wk-at)"/><path class="flow teal" d="M362 99 H382"/><path class="dot teal" pathLength="100" d="M362 99 H382" style="--d:0.35s"/><g class="rise" style="--d:0.24s"><rect class="box teal" x="384" y="60" width="150" height="78" rx="12"/><text class="t-a" x="398" y="84">03</text><text class="t-m" x="424" y="84">inbox_wake bus</text><text class="t-s" x="398" y="106">agent_notified</text><text class="t-s" x="398" y="122">in-process</text></g>
+<path class="wire" d="M534 99 H554" marker-end="url(#wk-at)"/><path class="flow teal" d="M534 99 H554"/><path class="dot teal" pathLength="100" d="M534 99 H554" style="--d:0.7s"/><g class="rise" style="--d:0.36s"><rect class="box teal" x="556" y="60" width="150" height="78" rx="12"/><text class="t-a" x="570" y="84">04</text><text class="t-m" x="596" y="84">wake_sink</text><text class="t-s" x="570" y="106">co-hosted, or</text><text class="t-s" x="570" y="122">UDS forwarder</text></g>
+<path class="wire" d="M706 99 H726" marker-end="url(#wk-at)"/><path class="flow teal" d="M706 99 H726"/><path class="dot teal" pathLength="100" d="M706 99 H726" style="--d:1.0499999999999998s"/><g class="rise" style="--d:0.48s"><rect class="box teal" x="728" y="60" width="150" height="78" rx="12"/><text class="t-a" x="742" y="84">05</text><text class="t-m" x="768" y="84">wake-hub</text><text class="t-s" x="742" y="106">unix socket</text><text class="t-s" x="742" y="122">per-recipient queue</text></g>
+<path class="wire" d="M878 99 H898" marker-end="url(#wk-at)"/><path class="flow teal" d="M878 99 H898"/><path class="dot teal" pathLength="100" d="M878 99 H898" style="--d:1.4s"/><g class="rise" style="--d:0.6s"><rect class="box teal" x="900" y="60" width="150" height="78" rx="12"/><text class="t-a" x="914" y="84">06</text><text class="t-m" x="940" y="84">wake-listen</text><text class="t-s" x="914" y="106">recipient agent</text><text class="t-s" x="914" y="122">1 catch-up read</text></g>
+<g class="rise" style="--d:0.8s"><rect class="box" x="326" y="154" width="610" height="34" rx="8"/><text class="t-s" x="631" y="176" text-anchor="middle">wake = { inbox_row_id, namespace, sender, digest, seq_high_watermark }  ·  no body</text></g>
+<path class="wire ghost" d="M975 138 V214 H287 V140" marker-end="url(#wk-ah)"/><path class="flow slow rev" d="M975 138 V214 H287 V140"/><text class="t-s" x="631" y="234" text-anchor="middle">backstop poll at least every 60 s: the inbox row is the record, a lost wake costs latency only</text><rect class="zone solid" x="20" y="286" width="1060" height="200" rx="18"/><text class="t-k" x="40" y="312">HOST B</text><path class="wire" d="M232 138 V268 H140 V353 H208" marker-end="url(#wk-aa)"/><path class="flow" d="M232 138 V268 H140 V353 H208"/><path class="dot" pathLength="100" d="M232 138 V268 H140 V353 H208" style="--d:1.2s"/><text class="t-a" x="244" y="272">quorum fan-out · mTLS · Ed25519 X-Memory-Sig</text><g class="rise" style="--d:0.9s"><rect class="box acc" x="212" y="314" width="150" height="78" rx="12"/><text class="t-m" x="226" y="338">/sync/push</text><text class="t-s" x="226" y="360">verify signature</text><text class="t-s" x="226" y="376">attest the sender</text></g>
+<path class="wire" d="M362 353 H382" marker-end="url(#wk-aa)"/><path class="flow" d="M362 353 H382"/><path class="dot" pathLength="100" d="M362 353 H382" style="--d:1.4s"/><g class="rise" style="--d:1.02s"><rect class="box acc" x="384" y="314" width="150" height="78" rx="12"/><text class="t-m" x="398" y="338">apply row</text><text class="t-s" x="398" y="360">newer-wins merge</text><text class="t-s" x="398" y="376">on the local store</text></g>
+<path class="wire" d="M534 353 H554" marker-end="url(#wk-at)"/><path class="flow teal" d="M534 353 H554"/><path class="dot teal" pathLength="100" d="M534 353 H554" style="--d:1.75s"/><g class="rise" style="--d:1.1400000000000001s"><rect class="box teal" x="556" y="314" width="150" height="78" rx="12"/><text class="t-m" x="570" y="338">applied_wake</text><text class="t-s" x="570" y="360">fresh apply only</text><text class="t-s" x="570" y="376">local wake publish</text></g>
+<path class="wire" d="M706 353 H726" marker-end="url(#wk-at)"/><path class="flow teal" d="M706 353 H726"/><path class="dot teal" pathLength="100" d="M706 353 H726" style="--d:2.0999999999999996s"/><g class="rise" style="--d:1.26s"><rect class="box teal" x="728" y="314" width="150" height="78" rx="12"/><text class="t-m" x="742" y="338">wake-hub</text><text class="t-s" x="742" y="360">host B socket</text><text class="t-s" x="742" y="376">per-recipient queue</text></g>
+<path class="wire" d="M878 353 H898" marker-end="url(#wk-at)"/><path class="flow teal" d="M878 353 H898"/><path class="dot teal" pathLength="100" d="M878 353 H898" style="--d:2.4499999999999997s"/><g class="rise" style="--d:1.38s"><rect class="box teal" x="900" y="314" width="150" height="78" rx="12"/><text class="t-m" x="914" y="338">wake-listen</text><text class="t-s" x="914" y="360">recipient on B</text><text class="t-s" x="914" y="376">1 catch-up read</text></g>
+<text class="t-teal" x="1062" y="312" text-anchor="end">replayed, superseded, tombstoned or quarantined rows wake nobody: the bridge cannot loop</text><g class="rise" style="--d:1.5s"><rect class="box ghost" x="40" y="400" width="150" height="70" rx="12"/><text class="t-k" x="52" y="422">operator side</text><text class="t-m" x="52" y="438">Jev triage</text><text class="t-s" x="52" y="454">like any agent</text></g>
+<path class="wire ghost" d="M803 392 V456 H194" marker-end="url(#wk-ah)"/><text class="t-s" x="500" y="450" text-anchor="middle">wake hint to an operator-side subscriber (not part of ai-memory)</text></svg>
+
+  </figure>
+  <p class="am-figcap"><b>Degrade, never corrupt.</b> The inbox row commits before any wake fires, so a slow, full or absent hub costs a hint and a counter, never a message. Clients must keep polling at least once a minute (<code>BACKSTOP_POLL_MAX</code>). The hub has no TCP or TLS listener: it is same-host by construction, and the cross-host leg is federation's mutual TLS. Jev is drawn as what it is: an operator-side subscriber that routes and pre-scores, not an ai-memory component. Sources: <code>src/inbox_wake.rs</code>, <code>src/wake_sink/mod.rs</code>, <code>src/wake_hub/routing.rs</code>, <code>src/federation/applied_wake.rs</code>; guide: <a href="wake-hub.html">wake plane</a>, <a href="a2a-integration.html">integrate any agent</a>.</p>
+</div></section>
+
+<section class="am-sec alt" id="federation"><div class="am-wrap">
+  <div class="am-sec-h">
+    <span class="am-eyebrow">Federation</span>
+    <h2>Durable first, <span class="a">replicated</span> second.</h2>
+    <p>A federated write commits locally before it fans out, so replication can be slow or partial without losing data. Every push is Ed25519-signed and carried over mutual TLS with pinned certificate fingerprints; receivers verify the signature, refuse replays and unenrolled peers, and check that the sender may write the namespace it claims.</p>
+  </div>
+  <figure class="am-fig" style="--fig-min:900px">
+<svg class="dg" viewBox="0 0 1100 470" role="img" aria-labelledby="fd-title" aria-describedby="fd-desc" xmlns="http://www.w3.org/2000/svg">
+<title id="fd-title">Federated quorum write</title><desc id="fd-desc">An agent writes to node A. Node A commits locally first, signs the body with Ed25519, fans out to peers over mTLS and waits for W of N acknowledgements. In time, the write is acknowledged; on a miss the answer is 202 Accepted with quorum_met false and durability local, and the push dead-letter queue retries. Rejoining peers catch up with sync/since. Erasures travel through a durable outbox.</desc>
+<defs><marker id="fd-ah" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow"/></marker><marker id="fd-aa" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow acc"/></marker><marker id="fd-at" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow teal"/></marker><marker id="fd-ab" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow bad"/></marker><marker id="fd-as" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow slate"/></marker></defs>
+<text class="t-k" x="210" y="40">WRITE PATH</text><text class="t-k" x="600" y="40">PEERS</text><text class="t-k" x="870" y="66">RECOVERY</text><g class="rise"><rect class="box" x="30" y="150" width="140" height="64" rx="12"/><text class="t-m" x="46" y="176">agent</text><text class="t-s" x="46" y="194">write via HTTPS</text></g>
+<path class="wire" d="M170 182 H206" marker-end="url(#fd-aa)"/><path class="flow" d="M170 182 H206"/><path class="dot" pathLength="100" d="M170 182 H206"/><g class="rise" style="--d:0.1s"><rect class="box acc" x="210" y="60" width="270" height="230" rx="14"/><text class="t-h" x="228" y="88">node A · ai-memory serve</text><rect class="box" x="226" y="106" width="238" height="38" rx="8"/><text class="t-a" x="238" y="122">01</text><text class="t-m" x="262" y="122">local commit</text><text class="t-s" x="262" y="137">durable, never rolled back</text><rect class="box" x="226" y="150" width="238" height="38" rx="8"/><text class="t-a" x="238" y="166">02</text><text class="t-m" x="262" y="166">sign the body</text><text class="t-s" x="262" y="181">Ed25519 X-Memory-Sig + nonce</text><rect class="box" x="226" y="194" width="238" height="38" rx="8"/><text class="t-a" x="238" y="210">03</text><text class="t-m" x="262" y="210">fan out to N peers</text><text class="t-s" x="262" y="225">mutual TLS, pinned certs</text><rect class="box" x="226" y="238" width="238" height="38" rx="8"/><text class="t-a" x="238" y="254">04</text><text class="t-m" x="262" y="254">collect W acks</text><text class="t-s" x="262" y="269">until --quorum-timeout-ms</text></g>
+<g class="rise" style="--d:0.3s"><rect class="box" x="600" y="60" width="210" height="62" rx="12"/><text class="t-m" x="616" y="84">peer B</text><text class="t-s" x="616" y="104">verify sig · attest · apply</text></g>
+<path class="wire" d="M480 175 C540 175 540 84 596 84" marker-end="url(#fd-aa)"/><path class="flow" d="M480 175 C540 175 540 84 596 84"/><path class="dot" pathLength="100" d="M480 175 C540 175 540 84 596 84" style="--d:0.5s"/><path class="wire" d="M600 104 C540 104 540 200 484 200" marker-end="url(#fd-at)"/><path class="flow teal" d="M600 104 C540 104 540 200 484 200"/><path class="dot teal" pathLength="100" d="M600 104 C540 104 540 200 484 200" style="--d:1.6s"/><g class="rise" style="--d:0.4s"><rect class="box" x="600" y="150" width="210" height="62" rx="12"/><text class="t-m" x="616" y="174">peer C</text><text class="t-s" x="616" y="194">verify sig · attest · apply</text></g>
+<path class="wire" d="M480 175 C540 175 540 174 596 174" marker-end="url(#fd-aa)"/><path class="flow" d="M480 175 C540 175 540 174 596 174"/><path class="dot" pathLength="100" d="M480 175 C540 175 540 174 596 174" style="--d:0.9s"/><path class="wire" d="M600 194 C540 194 540 200 484 200" marker-end="url(#fd-at)"/><path class="flow teal" d="M600 194 C540 194 540 200 484 200"/><path class="dot teal" pathLength="100" d="M600 194 C540 194 540 200 484 200" style="--d:2.0s"/><g class="rise" style="--d:0.5s"><rect class="box" x="600" y="240" width="210" height="62" rx="12"/><text class="t-m" x="616" y="264">peer D</text><text class="t-s" x="616" y="284">verify sig · attest · apply</text></g>
+<path class="wire" d="M480 175 C540 175 540 264 596 264" marker-end="url(#fd-aa)"/><path class="flow" d="M480 175 C540 175 540 264 596 264"/><path class="dot" pathLength="100" d="M480 175 C540 175 540 264 596 264" style="--d:1.3s"/><path class="wire" d="M600 284 C540 284 540 200 484 200" marker-end="url(#fd-at)"/><path class="flow teal" d="M600 284 C540 284 540 200 484 200"/><path class="dot teal" pathLength="100" d="M600 284 C540 284 540 200 484 200" style="--d:2.4000000000000004s"/><g class="rise" style="--d:0.6s"><rect class="box teal" x="870" y="80" width="200" height="150" rx="14"/><text class="t-m" x="886" y="106">catch-up</text><text class="t-s" x="886" y="126">rejoining peers pull</text><text class="t-teal" x="886" y="146">GET /api/v1/sync/since</text><text class="t-s" x="886" y="166">push DLQ replays</text><text class="t-s" x="886" y="186">missed deliveries</text></g>
+<path class="wire ghost" d="M810 152 H866" marker-end="url(#fd-ah)"/><g class="rise" style="--d:0.8s"><rect class="box" x="210" y="330" width="270" height="80" rx="12"/><text class="t-m" x="226" y="356">W of N acks in time</text><text class="t-s" x="226" y="373">write acknowledged</text><text class="t-s" x="226" y="390">replicated to the quorum</text></g>
+<g class="rise" style="--d:0.9s"><rect class="box bad" x="500" y="330" width="330" height="80" rx="12"/><text class="t-bad" x="516" y="356">quorum miss → 202 Accepted</text><text class="t-s" x="516" y="373">{quorum_met:false, acks, needed, reason,</text><text class="t-s" x="516" y="390"> durability:"local"} · never a 5xx</text></g>
+<path class="wire" d="M300 290 V326" marker-end="url(#fd-aa)"/><path class="flow" d="M300 290 V326"/><path class="dot" pathLength="100" d="M300 290 V326" style="--d:2.2s"/><path class="wire" d="M440 290 C440 310 600 300 600 326" marker-end="url(#fd-ab)"/><path class="flow bad" d="M440 290 C440 310 600 300 600 326"/><path class="dot bad" pathLength="100" d="M440 290 C440 310 600 300 600 326" style="--d:2.5s"/><g class="rise" style="--d:1s"><rect class="box" x="850" y="330" width="220" height="80" rx="12"/><text class="t-m" x="866" y="356">erasure</text><text class="t-s" x="866" y="373">forget / delete → durable</text><text class="t-s" x="866" y="390">outbox → pushed to peers</text></g>
+<text class="t-s" x="30" y="446">Receivers refuse unsigned, replayed or unenrolled pushes (401). Peer attestation checks the claimed sender and its namespace scope.</text></svg>
+
+  </figure>
+  <p class="am-figcap"><b>The 202 contract.</b> When fewer than W peers acknowledge before <code>--quorum-timeout-ms</code>, the daemon answers <code>202 Accepted</code> with <code>quorum_met:false</code> and <code>durability:"local"</code>: the write is safe on this node and queued for redelivery, which is why it is never reported as a server error. Writes made over MCP stdio join the quorum only when <code>mcp_federation_forward_url</code> points the MCP server at the local daemon; otherwise they skip the quorum and reach peers through the catch-up pull (a peer receives only rows in namespaces its attestation allowlist grants (deny by default) that are visible to its identity; <code>scope=private</code> rows stay on the node unless marked <code>federation_share:true</code> or the operator sets <code>AI_MEMORY_FED_SYNC_TRUST_PEER=1</code>), and their erasures travel through the outbox. Sources: <code>src/handlers/parity.rs</code>, <code>src/replication.rs</code>, <code>src/federation/signing.rs</code>, <code>src/federation/peer_attestation.rs</code>, <code>src/federation/erasure_outbox.rs</code>, <code>src/config.rs</code>; guide: <a href="federation.html">federation</a>.</p>
+</div></section>
+
+<section class="am-sec" id="governance"><div class="am-wrap">
+  <div class="am-sec-h">
+    <span class="am-eyebrow">Governance</span>
+    <h2>Policy per namespace, <span class="a">approval</span> where it matters.</h2>
+    <p>A namespace standard binds a governance policy: for each of write, promote and delete, who may act (<code>any</code>, <code>registered</code>, <code>owner</code> or <code>approve</code>). The gate answers Allow, Deny or Pending; pending actions wait in a queue for <code>memory_pending_approve</code> or <code>memory_pending_reject</code>. Capability tokens are on by default and strictly additive.</p>
+  </div>
+  <figure class="am-fig" style="--fig-min:900px">
+<svg class="dg" viewBox="0 0 1100 300" role="img" aria-labelledby="gv-title" aria-describedby="gv-desc" xmlns="http://www.w3.org/2000/svg">
+<title id="gv-title">Governance decision path</title><desc id="gv-desc">A request resolves its agent identity, walks the namespace standard chain and reads the policy level for write, promote or delete. The decision is Allow, Deny or Pending. Pending actions queue for approval or rejection. A capability token can only lift Pending to Allow and never lifts Deny. A namespace standard can require approval above a reflection depth.</desc>
+<defs><marker id="gv-ah" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow"/></marker><marker id="gv-aa" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow acc"/></marker><marker id="gv-at" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow teal"/></marker><marker id="gv-ab" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow bad"/></marker><marker id="gv-as" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow slate"/></marker></defs>
+<g class="rise"><rect class="box" x="30" y="60" width="130" height="70" rx="12"/><text class="t-m" x="44" y="88">request</text><text class="t-s" x="44" y="106">agent id resolved</text></g>
+<path class="wire" d="M160 95 H186" marker-end="url(#gv-aa)"/><path class="flow" d="M160 95 H186"/><path class="dot" pathLength="100" d="M160 95 H186"/><g class="rise" style="--d:0.1s"><rect class="box" x="190" y="60" width="180" height="70" rx="12"/><text class="t-m" x="204" y="84">namespace standard</text><text class="t-s" x="204" y="100">global → parent →</text><text class="t-s" x="204" y="116">namespace</text></g>
+<path class="wire" d="M370 95 H396" marker-end="url(#gv-aa)"/><path class="flow" d="M370 95 H396"/><path class="dot" pathLength="100" d="M370 95 H396" style="--d:0.3s"/><g class="rise" style="--d:0.2s"><rect class="box" x="400" y="60" width="200" height="70" rx="12"/><text class="t-m" x="414" y="82">policy level</text><text class="t-s" x="414" y="96">write · promote · delete:</text><text class="t-s" x="414" y="110">any · registered ·</text><text class="t-s" x="414" y="124">owner · approve</text></g>
+<path class="wire" d="M600 95 H618" marker-end="url(#gv-aa)"/><path class="flow" d="M600 95 H618"/><path class="dot" pathLength="100" d="M600 95 H618" style="--d:0.6s"/><g class="rise" style="--d:0.3s"><path class="box acc" d="M672 55 L722 95 L672 135 L622 95z"/><text class="t-a" x="672" y="99" text-anchor="middle">decide</text></g>
+<path class="wire" d="M705 82 C730 50 740 46 768 46" marker-end="url(#gv-aa)"/><path class="flow" d="M705 82 C730 50 740 46 768 46"/><path class="dot" pathLength="100" d="M705 82 C730 50 740 46 768 46" style="--d:1s"/><path class="wire" d="M722 95 H768" marker-end="url(#gv-aa)"/><path class="flow" d="M722 95 H768"/><path class="dot" pathLength="100" d="M722 95 H768" style="--d:1.2s"/><path class="wire" d="M705 108 C730 150 740 214 768 214" marker-end="url(#gv-ab)"/><path class="flow bad" d="M705 108 C730 150 740 214 768 214"/><path class="dot bad" pathLength="100" d="M705 108 C730 150 740 214 768 214" style="--d:1.4s"/><g class="rise" style="--d:0.4s"><rect class="box" x="770" y="20" width="170" height="52" rx="10"/><text class="t-a" x="784" y="42">Allow</text><text class="t-s" x="784" y="58">committed</text></g>
+<g class="rise" style="--d:0.5s"><rect class="box acc" x="770" y="74" width="170" height="52" rx="10"/><text class="t-a" x="784" y="96">Pending</text><text class="t-s" x="784" y="112">pending_actions queue</text></g>
+<g class="rise" style="--d:0.6s"><rect class="box bad" x="770" y="188" width="170" height="52" rx="10"/><text class="t-bad" x="784" y="210">Deny</text><text class="t-s" x="784" y="226">refused, terminal</text></g>
+<path class="wire" d="M940 100 H956" marker-end="url(#gv-aa)"/><path class="flow" d="M940 100 H956"/><path class="dot" pathLength="100" d="M940 100 H956" style="--d:1.6s"/><g class="rise" style="--d:0.7s"><rect class="box" x="960" y="74" width="110" height="52" rx="10"/><text class="t-m" x="972" y="96">approve</text><text class="t-s" x="972" y="112">or reject</text></g>
+<path class="wire" d="M1015 74 V46 H944" marker-end="url(#gv-aa)"/><path class="flow" d="M1015 74 V46 H944"/><path class="dot" pathLength="100" d="M1015 74 V46 H944" style="--d:2s"/><g class="rise" style="--d:0.8s"><rect class="box teal" x="400" y="170" width="300" height="92" rx="12"/><text class="t-m" x="414" y="194">capability token (macaroon)</text><text class="t-s" x="414" y="211">on by default, additive only: no token,</text><text class="t-s" x="414" y="228">no change · may lift Pending to Allow ·</text><text class="t-s" x="414" y="245">never lifts Deny · invalid token refused</text></g>
+<path class="wire" d="M700 190 C730 190 740 130 768 112" marker-end="url(#gv-at)"/><path class="flow teal" d="M700 190 C730 190 740 130 768 112"/><path class="dot teal" pathLength="100" d="M700 190 C730 190 740 130 768 112" style="--d:2.2s"/><g class="rise" style="--d:0.9s"><rect class="box" x="170" y="170" width="214" height="92" rx="12"/><text class="t-m" x="184" y="194">approval depth</text><text class="t-s" x="184" y="211">require_approval_above_depth</text><text class="t-s" x="184" y="228">in the namespace standard:</text><text class="t-s" x="184" y="245">deeper reflect → pending</text></g>
+</svg>
+
+  </figure>
+  <p class="am-figcap">Sources: <code>src/models/namespace.rs</code>, <code>src/governance/capability.rs</code>, <code>src/governance/agent_action.rs</code>; guide: <a href="governance.html">governance</a>.</p>
+</div></section>
+
+<section class="am-sec alt" id="tiers"><div class="am-wrap">
+  <div class="am-sec-h">
+    <span class="am-eyebrow">Topologies</span>
+    <h2>Five tiers. Each one <span class="a">inherits</span> the last.</h2>
+    <p>Each tier page has its own animated diagram, a walkthrough of one write and one recall, a deployment recipe and the limits that tell you when to move up.</p>
+  </div>
+  <div class="am-grid">
+    <a class="am-card gold" href="architectures-t1.html"><span class="am-k">Tier 1</span><h3>Single node</h3><p>One agent, one store, no network. MCP over stdio or the CLI opens SQLite in-process; encrypt it with a SQLCipher build.</p><div class="am-meta">SQLite · zero ops</div></a>
+    <a class="am-card gold" href="architectures-t2.html"><span class="am-k">Tier 2</span><h3>Shared daemon</h3><p>Many agents on one host share one store through <code>ai-memory serve</code>, isolated by namespace and scope, gated by governance, woken by the local hub.</p><div class="am-meta">one host · one SQLite file</div></a>
+    <a class="am-card gold" href="architectures-t3.html"><span class="am-k">Tier 3</span><h3>Federated cluster</h3><p>Several daemons replicate over the signed mTLS mesh with W-of-N quorum writes, catch-up pulls and erasure propagation.</p><div class="am-meta">quorum · signed sync</div></a>
+    <a class="am-card gold" href="architectures-t4.html"><span class="am-k">Tier 4</span><h3>Data-center swarm</h3><p>The PostgreSQL tier: daemons on PostgreSQL 18 with pgvector and, when installed, Apache AGE, spread across racks with rack-aware quorum.</p><div class="am-meta">PostgreSQL · pgvector · AGE</div></a>
+    <a class="am-card gold" href="architectures-t5.html"><span class="am-k">Tier 5</span><h3>Federated hive</h3><p>Independent certified clusters across data centers or regions, joined by federation with quorum tuned for partitions. No global consensus, by design.</p><div class="am-meta">multi-DC · multi-region</div></a>
+  </div>
+  <div class="am-grid" style="margin-top:14px">
+    <a class="am-card teal" href="reference-architecture/"><span class="am-k">Reference run</span><h3>3-region hive</h3><p>The do-1461 run record: three regions, a federated quorum mesh and three encrypted legs, each proven both ways.</p></a>
+    <a class="am-card teal" href="reference-architecture/enterprise-cpu-memory.html"><span class="am-k">Enterprise</span><h3>CPU + memory nodes</h3><p>Federated nodes with API embeddings and no GPU.</p></a>
+    <a class="am-card teal" href="reference-architecture/enterprise-cpu-memory-gpu.html"><span class="am-k">Enterprise</span><h3>CPU + memory + GPU nodes</h3><p>The same federation with local embeddings on GPU nodes.</p></a>
+  </div>
+</div></section>
+
+<section class="am-sec" id="matrix"><div class="am-wrap">
+  <div class="am-sec-h">
+    <span class="am-eyebrow">Capability matrix</span>
+    <h2>What each tier <span class="a">uses</span>.</h2>
+    <p>Every capability below is in the v1.0.0 build; the matrix shows where it does work. “opt” means available and off unless you turn it on.</p>
+  </div>
+  <div class="am-tablewrap">
+  <table class="am-table">
+    <thead><tr><th>Capability</th><th>T1</th><th>T2</th><th>T3</th><th>T4</th><th>T5</th></tr></thead>
+    <tbody>
+      <tr><td><b>Store</b></td><td>SQLite</td><td>SQLite, shared</td><td>SQLite per peer, or PostgreSQL</td><td>PostgreSQL</td><td>PostgreSQL or SQLite per site</td></tr>
+      <tr><td><b>Encryption at rest</b></td><td class="o">SQLCipher build</td><td class="o">SQLCipher build</td><td class="o">SQLCipher, or attested volume</td><td class="o">attested volume</td><td class="o">attested volume</td></tr>
+      <tr><td><b>MCP (core / full)</b> · stdio, SQLite only</td><td class="y">yes</td><td class="y">yes</td><td class="o">SQLite peers</td><td class="n">no</td><td class="o">SQLite sites</td></tr>
+      <tr><td><b>HTTPS</b> <code>/api/v1/</code> daemon (TLS on every bind)</td><td class="o">opt</td><td class="y">yes</td><td class="y">yes</td><td class="y">yes</td><td class="y">yes</td></tr>
+      <tr><td><b>CLI</b> (in-process)</td><td class="y">yes</td><td class="y">yes</td><td class="y">yes</td><td class="o">admin verbs via <code>--store-url</code></td><td class="o">admin verbs via <code>--store-url</code></td></tr>
+      <tr><td><b>Namespaces, scope visibility, governance</b></td><td class="y">yes</td><td class="y">yes</td><td class="y">yes</td><td class="y">yes</td><td class="y">yes</td></tr>
+      <tr><td><b>Wake plane</b> (one hub per host)</td><td class="o">opt</td><td class="y">yes</td><td class="y">per host</td><td class="y">per host</td><td class="y">per host</td></tr>
+      <tr><td><b>Signed federation, W-of-N quorum</b></td><td class="o">—</td><td class="o">—</td><td class="y">yes</td><td class="y">rack-aware</td><td class="y">cross-site</td></tr>
+      <tr><td><b>mTLS between peers</b></td><td class="o">—</td><td class="o">opt</td><td class="y">required</td><td class="y">required</td><td class="y">required</td></tr>
+      <tr><td><b>signed_events chain · audit log</b></td><td class="y">chain · audit opt</td><td class="y">chain · audit opt</td><td class="y">per peer</td><td class="o">audit opt · chain verifier reads SQLite</td><td class="o">per SQLite peer · audit opt</td></tr>
+      <tr><td><b>Backups</b></td><td><code>ai-memory backup</code></td><td><code>ai-memory backup</code></td><td>backup, or PostgreSQL base backups</td><td>base backups + WAL archive</td><td>WAL shipping off-site</td></tr>
+      <tr><td><b>Distributed consensus (Raft / Paxos)</b></td><td class="n">no</td><td class="n">no</td><td class="n">no</td><td class="n">no</td><td class="n">no</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p class="am-figcap" style="margin-top:12px">Tier guidance and sizing: <a href="enterprise-deployment.html">enterprise deployment</a>. Certified scope: the enterprise federation certification covers 500–1000-agent clusters built from blocks of at most 50 peers, as a trust boundary, not as a throughput figure (<code>docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md</code>).</p>
+</div></section>
+
+<section class="am-sec alt" id="limits"><div class="am-wrap">
+  <div class="am-sec-h">
+    <span class="am-eyebrow">Honest limits</span>
+    <h2>What this architecture <span class="a">does not</span> do.</h2>
+    <p>Read these before you size a fleet. Each is documented with its reasoning in <a href="ARCHITECTURAL_LIMITS.html">architectural limits</a>.</p>
+  </div>
+  <div class="am-grid two">
+    <div class="am-card limit"><span class="am-k">Access path</span><h3>No direct-to-PostgreSQL client</h3><p>Agent traffic never connects to PostgreSQL: every request terminates at the ai-memory daemon, which stays the throughput bottleneck on both backends. Only operator admin verbs open a per-run <code>--store-url</code> connection.</p></div>
+    <div class="am-card limit"><span class="am-k">Writers</span><h3>One writer at a time per SQLite file</h3><p>WAL lets readers pass the writer, but writes serialize. A shared daemon, MCP children and CLI processes on one host all queue on the same file lock. PostgreSQL removes this ceiling.</p></div>
+    <div class="am-card limit"><span class="am-k">Change feed</span><h3>No CDC</h3><p>There is no logical-replication or change-stream interface on either backend. The supported observation surface is hooks and webhook subscriptions.</p></div>
+    <div class="am-card limit"><span class="am-k">Consistency</span><h3>Eventual, not consensus</h3><p>Federation is quorum writes plus catch-up, with no Raft or Paxos and no gossip discovery. Knowledge-graph invalidations reach peers asynchronously.</p></div>
+    <div class="am-card limit"><span class="am-k">Wake plane</span><h3>Same host only</h3><p>The hub listens on a Unix socket; mounting it remotely is not a supported transport. Cross-host messages ride federation, and the poll stays the delivery guarantee.</p></div>
+    <div class="am-card limit"><span class="am-k">Vectors</span><h3>HNSW lives in process</h3><p>On SQLite the vector index is held in RAM and rebuilt at start-up. pgvector keeps a durable index on PostgreSQL.</p></div>
+  </div>
+</div></section>
+</main>
+<footer class="am-foot"><div class="am-wrap">
+  <span>© 2026 AlphaOne LLC · Apache-2.0 · ai-memory v1.0.0</span>
+  <span><a href="https://github.com/alphaonedev/ai-memory-mcp">source</a> · <a href="index.html">home</a> · <a href="architectures.html">architectures</a> · <a href="ARCHITECTURAL_LIMITS.html">limits</a></span>
+</div></footer>
+<button class="am-themetog" id="am-themetog" type="button" aria-label="Toggle light or dark theme">theme</button>
+<script>
+(function(){var d=document.documentElement;try{var s=localStorage.getItem('aim-site-theme');if(s)d.setAttribute('data-theme',s);}catch(e){}
+var b=document.getElementById('am-themetog');if(!b)return;b.addEventListener('click',function(){var c=d.getAttribute('data-theme');var n=c==='dark'?'light':c==='light'?'dark':(matchMedia('(prefers-color-scheme:dark)').matches?'light':'dark');d.setAttribute('data-theme',n);try{localStorage.setItem('aim-site-theme',n);}catch(e){}});})();
+</script>
 </body>
 </html>
