@@ -22,13 +22,16 @@ use super::{
 /// the resolved enforcement policy; this field is a pre-write interception
 /// threshold that lives beside it, not inside it.
 ///
-/// Returns `None` when:
-/// - no namespace standard is configured at any level of the chain, OR
-/// - the standard's `metadata.governance` blob is absent or null, OR
-/// - the blob does not contain a `require_approval_above_depth` key, OR
-/// - the key is present but `null`.
+/// Leaf-first, per level (GOD final ruling; #2542 leaf-first-wins): an explicit
+/// integer decides; a missing standard, an absent `governance` blob or an
+/// explicit `null` key keeps walking; a well-formed policy that OMITS the key
+/// means no gate and the walk stops. A corrupt level keeps walking and, if
+/// nothing explicit follows, resolves to `Some(0)`.
 ///
-/// Returns `Some(threshold)` when the key is a non-null unsigned integer.
+/// Returns `None` when no level states a threshold (no standard anywhere, or a
+/// well-formed policy that omits the key ended the walk).
+///
+/// Returns `Some(threshold)` when a level's key is an unsigned integer.
 /// Callers in `memory_reflect` compare `proposed_depth > threshold` and
 /// queue a `pending_actions` row when the condition is true.
 ///
@@ -59,6 +62,9 @@ pub fn resolve_require_approval_above_depth(
         if let Some(n) = walk.step(state) {
             return Ok(Some(n));
         }
+        if walk.is_done() {
+            break;
+        }
     }
     Ok(walk.finish())
 }
@@ -72,19 +78,21 @@ pub fn resolve_require_approval_above_depth(
 pub enum ApprovalDepthLevelState {
     /// No standard resolves at this level (never bound, or its memory is gone).
     Missing,
-    /// A well-formed standard that does NOT state the field (absent or null):
-    /// not a policy statement about this threshold, so an ancestor's explicit
-    /// value still governs (docs/governance.md: a child inherits until it
-    /// opts out).
+    /// A well-formed policy that OMITS the key: no gate at this level, and the
+    /// walk STOPS (leaf-first-wins, #2542; GOD final ruling). The result is
+    /// then [`ApprovalDepthWalk::finish`]: `None`, or `Some(0)` if a `Corrupt`
+    /// level was already passed.
     OmitsField,
+    /// The key is present with an explicit `null`: no decision at this level,
+    /// keep walking (the explicit opt-in to inherit).
+    NullKey,
     /// The level states a threshold explicitly. It decides and ends the walk.
     /// An out-of-range value is already saturated to 0 (fail closed).
     Explicit(u32),
     /// The level's governance blob is present but malformed (non-object, a
-    /// non-integer threshold, an unparseable policy). #4285 owns the final
-    /// rule (Severed: continue to the ancestor, Owner floor applies); until
-    /// then it is never LESS strict than the pre-#4357 walk: it continues to
-    /// the ancestor instead of ending the walk with no gate.
+    /// non-integer threshold, an unparseable policy). Severed: keep walking
+    /// (the Owner floor applies via the policy walk); if nothing explicit
+    /// follows, the walk resolves to `Some(0)` (gate on).
     Corrupt,
 }
 
@@ -96,6 +104,9 @@ pub enum ApprovalDepthLevel {
     /// Nothing decided here: keep walking toward the root. Falling off the end
     /// of the chain is the documented default (no gate).
     Continue,
+    /// A well-formed policy that omits the key: no gate here and the walk
+    /// STOPS; the result is [`ApprovalDepthWalk::finish`].
+    Stop,
 }
 
 /// #4357 — the shared walk accumulator both backends drive, so the
@@ -103,26 +114,42 @@ pub enum ApprovalDepthLevel {
 /// level's [`ApprovalDepthLevelState`] leaf-first via [`Self::step`]; call
 /// [`Self::finish`] when the chain is exhausted.
 ///
-/// Fail closed (conductor ruling): a chain that passed at least one
-/// `Corrupt` level and found NO explicit value anywhere resolves to
-/// `Some(0)` (approval required) rather than "no gate". A corrupt level still
-/// continues to the ancestor and an explicit ancestor value still decides;
-/// #4285 layers the Owner floor on top.
+/// Rule (GOD final ruling): an explicit value decides; an explicit `null` or a
+/// missing standard keeps walking; a well-formed policy that omits the key
+/// STOPS the walk (leaf-first-wins); a `Corrupt` level keeps walking, and a
+/// chain that passed one and ends without an explicit value resolves to
+/// `Some(0)` (approval required) rather than "no gate". After a stop the walk
+/// ignores every further level, so a backend that cannot break out of its own
+/// loop (postgres) still gets the same result.
 #[derive(Debug, Default)]
 pub struct ApprovalDepthWalk {
     saw_corrupt: bool,
+    stopped: bool,
 }
 
 impl ApprovalDepthWalk {
     /// Consume one level; `Some(n)` ends the walk with threshold `n`.
     pub fn step(&mut self, state: ApprovalDepthLevelState) -> Option<u32> {
+        if self.stopped {
+            return None;
+        }
         if state == ApprovalDepthLevelState::Corrupt {
             self.saw_corrupt = true;
         }
         match approval_depth_level_decision(state) {
             ApprovalDepthLevel::Threshold(n) => Some(n),
             ApprovalDepthLevel::Continue => None,
+            ApprovalDepthLevel::Stop => {
+                self.stopped = true;
+                None
+            }
         }
+    }
+
+    /// True once a well-formed policy that omits the key ended the walk.
+    #[must_use]
+    pub fn is_done(&self) -> bool {
+        self.stopped
     }
 
     /// The result when the chain ended without an explicit value.
@@ -150,7 +177,8 @@ pub fn approval_depth_level_state(metadata: &serde_json::Value) -> ApprovalDepth
         return ApprovalDepthLevelState::Corrupt;
     };
     match obj.get("require_approval_above_depth") {
-        None | Some(serde_json::Value::Null) => ApprovalDepthLevelState::OmitsField,
+        None => ApprovalDepthLevelState::OmitsField,
+        Some(serde_json::Value::Null) => ApprovalDepthLevelState::NullKey,
         Some(v) => match v.as_u64() {
             // QUAL-3 (FX-5): operator-controlled metadata. Reject the silent
             // `n as u32` truncation that would let `2^32` land as 0 and
@@ -169,8 +197,9 @@ pub fn approval_depth_level_state(metadata: &serde_json::Value) -> ApprovalDepth
 pub fn approval_depth_level_decision(state: ApprovalDepthLevelState) -> ApprovalDepthLevel {
     match state {
         ApprovalDepthLevelState::Explicit(n) => ApprovalDepthLevel::Threshold(n),
+        ApprovalDepthLevelState::OmitsField => ApprovalDepthLevel::Stop,
         ApprovalDepthLevelState::Missing
-        | ApprovalDepthLevelState::OmitsField
+        | ApprovalDepthLevelState::NullKey
         | ApprovalDepthLevelState::Corrupt => ApprovalDepthLevel::Continue,
     }
 }

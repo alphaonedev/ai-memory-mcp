@@ -369,9 +369,14 @@ async fn exercise_resolver(store: Arc<dyn MemoryStore>) {
             json!({"write": "any", "require_approval_above_depth": 3}),
             Some(3),
         ),
-        // A well-formed standard that OMITS the field is not a policy
-        // statement: the parent's explicit value still governs (GOD rule 2).
-        (json!({"write": "any"}), Some(1)),
+        // A well-formed policy that OMITS the field means no gate and the walk
+        // STOPS (leaf-first-wins, #2542; GOD final ruling).
+        (json!({"write": "any"}), None),
+        // An explicit `null` key keeps walking: the parent's value governs.
+        (
+            json!({"write": "any", "require_approval_above_depth": null}),
+            Some(1),
+        ),
         // A corrupt level (unparseable policy) never contributes its raw knob.
         (
             json!({"write": "not-a-level", "require_approval_above_depth": 99}),
@@ -589,10 +594,12 @@ async fn reflect_as(router: &axum::Router, agent: &str, body: &Value) -> (Status
 }
 
 /// Parent standard states threshold 0; the child standard is well-formed but
-/// OMITS the field. A depth-1 reflect into the child must be parked, never
-/// applied: the omitted field is not a policy statement, so the ancestor's
-/// explicit value governs. `declared` binds the parent explicitly, otherwise
-/// the chain is the `/` hierarchy.
+/// OMITS the field. GOD final ruling (leaf-first-wins, #2542): a well-formed
+/// policy that omits the key means NO gate and the walk STOPS, so the resolver
+/// answers `None` and a depth-1 reflect into the child is applied (the parent's
+/// threshold does not govern it). `declared` binds the parent explicitly,
+/// otherwise the chain is the `/` hierarchy. (Inverted from the superseded
+/// "omitted continues" rule; safe only once #4356 lands.)
 async fn exercise_child_omits_field(
     store: Arc<dyn MemoryStore>,
     backend: StorageBackend,
@@ -625,14 +632,59 @@ async fn exercise_child_omits_field(
             .resolve_require_approval_above_depth(&child)
             .await
             .expect("resolve"),
+        None,
+        "#4357: a well-formed child that omits the field stops the walk (no gate)"
+    );
+    let (router, _f) = build_router(backend, Arc::clone(&store), sqlite_path);
+    let (status, body) = reflect_http(&router, &gate_body(&src.id, &child)).await;
+    assert!(
+        body.get("id").is_some() && body["status"] != "pending",
+        "leaf-first-wins: the omitting child is ungated: {status} {body}"
+    );
+    assert_eq!(reflection_count(&store, &child).await, 1);
+}
+
+/// Rule 5 then rule 3: a CORRUPT leaf under a well-formed parent that OMITS the
+/// key. The corrupt level is passed (Severed), the parent stops the walk with no
+/// gate, and the passed-corrupt flag turns the result into `Some(0)`.
+async fn exercise_corrupt_leaf_under_omitting_parent(
+    store: Arc<dyn MemoryStore>,
+    backend: StorageBackend,
+    sqlite_path: Option<&std::path::Path>,
+) {
+    enforce_mode();
+    let ctx = CallerContext::for_agent(OWNER);
+    let parent = format!("p4357c/{}", uuid::Uuid::new_v4().simple());
+    let mut pstd = memory(&format!("{parent}/standards"), "parent standard");
+    pstd.metadata["governance"] = json!({"write": "any"});
+    store.store(&ctx, &pstd).await.expect("pstd");
+    store
+        .set_namespace_standard(&ctx, &parent, &pstd.id, None)
+        .await
+        .expect("bind parent");
+    let child = format!("{parent}/child");
+    let mut cstd = memory(&format!("{child}/standards"), "child standard");
+    cstd.metadata["governance"] = json!({"write": "not-a-level"});
+    store.store(&ctx, &cstd).await.expect("cstd");
+    store
+        .set_namespace_standard(&ctx, &child, &cstd.id, Some(&parent))
+        .await
+        .expect("bind child");
+    let src = memory(&child, "child source");
+    store.store(&ctx, &src).await.expect("src");
+    assert_eq!(
+        store
+            .resolve_require_approval_above_depth(&child)
+            .await
+            .expect("resolve"),
         Some(0),
-        "#4357: the child inherits the ancestor's explicit threshold"
+        "corrupt leaf under an omitting parent fails closed to 0"
     );
     let (router, _f) = build_router(backend, Arc::clone(&store), sqlite_path);
     let (status, body) = reflect_http(&router, &gate_body(&src.id, &child)).await;
     assert!(
         body.get("id").is_none() && body["status"] == "pending",
-        "#4357: a child omitting the field escaped the ancestor threshold: {status} {body}"
+        "{status} {body}"
     );
     assert_eq!(reflection_count(&store, &child).await, 0);
 }
@@ -956,6 +1008,7 @@ round2_cells! {
     issue_4357_child_omits_field_hierarchy => exercise_child_omits_field, false;
     issue_4357_child_omits_field_declared_parent => exercise_child_omits_field, true;
     issue_4357_child_without_standard_inherits => exercise_child_without_standard;
+    issue_4357_corrupt_leaf_under_omitting_parent => exercise_corrupt_leaf_under_omitting_parent;
     issue_4357_replay_no_overwrite_hidden_row => exercise_replay_no_overwrite;
     issue_4357_replay_provenance => exercise_replay_provenance;
     issue_4357_why_trace_replay_refused => exercise_why_trace_replay;
