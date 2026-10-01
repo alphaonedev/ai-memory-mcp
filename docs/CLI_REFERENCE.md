@@ -49,8 +49,13 @@ supplements `--help` with examples and context.
 | `AI_MEMORY_STORE_URL_FILE` | #1927 — **secret.** Path to a `0600`-enforced file holding the `--store-url` connection URL; takes precedence over `AI_MEMORY_STORE_URL`, which in turn takes precedence over the CLI arg. |
 | `RUST_LOG` | Tracing filter, e.g. `RUST_LOG=ai_memory=debug`. (Standard Rust ecosystem env, not product-specific.) |
 
-Resolution precedence for any setting: **CLI flag > `AI_MEMORY_*` env
-var > config file > compiled default**.
+Most scalar settings use **CLI flag > `AI_MEMORY_*` env var > config
+file > compiled default**; check the setting's resolver contract. Store
+URL uses `AI_MEMORY_STORE_URL_FILE` > `AI_MEMORY_STORE_URL` > `--store-url`.
+Application content encryption is enabled by a true config/seed OR a
+truthy `AI_MEMORY_ENCRYPT_AT_REST` value; a falsy env value does not
+override an enabled config. Removed downgrade controls and explicit
+refusal rules are not precedence fallbacks.
 
 ## Core memory operations
 

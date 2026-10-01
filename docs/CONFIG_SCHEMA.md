@@ -536,7 +536,7 @@ methods:
 CLI flag  >  AI_MEMORY_LLM_* env  >  [llm] section  >  legacy flat fields  >  compiled default
 ```
 
-**The ONE documented inversion — the store-URL channel (#1927 / CWE-214).**
+**Precedence exception 1 — the store-URL inversion (#1927 / CWE-214).**
 `AppConfig::resolve_store_url` (`src/store_url.rs`) deliberately
 INVERTS the ladder above: `AI_MEMORY_STORE_URL_FILE` (env #158) >
 `AI_MEMORY_STORE_URL` (env #157) > the `--store-url` CLI flag. Here
@@ -549,6 +549,13 @@ Postgres DSN password) must NOT be able to override the safer ones
 slot; passing a password-bearing `--store-url` while an env channel is
 set logs a WARN naming both. Source:
 `src/store_url.rs::{STORE_URL_FILE_ENV, STORE_URL_ENV, resolve_store_url}`.
+
+**Precedence exception 2 — additive encryption enabling.** Application
+content encryption is enabled by a true `[encryption].at_rest` config/seed
+OR a truthy `AI_MEMORY_ENCRYPT_AT_REST` value
+(`src/encryption/mod.rs::encryption_enabled`); a falsy env value does not
+override an enabled config. This is an OR, not an env-over-config
+override.
 
 Resolvers are pure (no network I/O). File reads for `api_key_file`
 happen at resolve time; permission-bit enforcement is non-fatal and
