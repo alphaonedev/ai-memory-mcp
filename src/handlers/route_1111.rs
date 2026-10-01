@@ -119,7 +119,17 @@ async fn reflect_write_admission_pg(
         )
         .await
     {
-        Ok(GovernanceDecision::Allow) => None,
+        Ok(GovernanceDecision::Allow) => {
+            reflect_depth_approval_gate_pg(
+                app,
+                caller,
+                input,
+                &target_namespace,
+                proposed_depth,
+                &payload,
+            )
+            .await
+        }
         Ok(GovernanceDecision::Deny(refusal)) => {
             tracing::warn!(
                 target: crate::storage::reflect::REFLECT_TRACE_TARGET,
@@ -156,6 +166,79 @@ async fn reflect_write_admission_pg(
         ),
         Err(e) => Some(crate::handlers::postgres_gate::store_err_to_response(e)),
     }
+}
+
+/// #4357 — the L1-8 `require_approval_above_depth` gate on the postgres
+/// reflect path (CWE-862). The sqlite twin lives in
+/// `mcp::tools::reflect::handle_reflect_caller`; pre-#4357 this backend never
+/// consulted the threshold, so a reflection above an operator-configured
+/// depth was WRITTEN instead of parked for approval. Runs AFTER the #3638
+/// write admission (a caller the standard does not admit never reaches the
+/// threshold read) and BEFORE the substrate write.
+///
+/// Returns `Some(response)` — the queued approval (202, same body fields as
+/// the sqlite wire shape; the threshold itself is never echoed, #3638) or a
+/// store-error response — when the reflect must NOT proceed, `None` when it is
+/// at or below the threshold / no threshold is configured. A resolver or
+/// queue failure REFUSES the reflect (fail closed), never skips the gate.
+#[cfg(feature = "sal")]
+async fn reflect_depth_approval_gate_pg(
+    app: &AppState,
+    caller: &crate::store::CallerContext,
+    input: &crate::storage::reflect::ReflectInput,
+    target_namespace: &str,
+    proposed_depth: u32,
+    payload: &Value,
+) -> Option<axum::response::Response> {
+    let threshold = match app
+        .store
+        .resolve_require_approval_above_depth(target_namespace)
+        .await
+    {
+        Ok(Some(t)) => t,
+        Ok(None) => return None,
+        Err(e) => return Some(crate::handlers::postgres_gate::store_err_to_response(e)),
+    };
+    if proposed_depth <= threshold {
+        return None;
+    }
+    let pending_id = match app
+        .store
+        .queue_pending_action(
+            caller,
+            crate::store::GovernedAction::Reflect,
+            target_namespace,
+            None,
+            &input.agent_id,
+            payload,
+        )
+        .await
+    {
+        Ok(id) => id,
+        Err(e) => return Some(crate::handlers::postgres_gate::store_err_to_response(e)),
+    };
+    tracing::info!(
+        target: crate::storage::reflect::REFLECT_TRACE_TARGET,
+        namespace = %target_namespace,
+        proposed_depth,
+        require_approval_above_depth = threshold,
+        "reflection requires approval"
+    );
+    Some(
+        (
+            StatusCode::ACCEPTED,
+            Json(json!({
+                "status": "pending",
+                (field_names::PENDING_ID): pending_id,
+                "reason": "governance requires approval for reflections above depth threshold",
+                "action": crate::models::GovernedAction::Reflect.as_str(),
+                "namespace": target_namespace,
+                (field_names::PROPOSED_DEPTH): proposed_depth,
+                (field_names::STORAGE_BACKEND): "postgres",
+            })),
+        )
+            .into_response(),
+    )
 }
 
 /// #1552 — shared federation fanout for the reflect write path, called by both

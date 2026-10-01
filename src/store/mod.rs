@@ -4503,6 +4503,25 @@ pub trait MemoryStore: Send + Sync {
         Ok(None)
     }
 
+    /// v0.7.0 L1-8 / #4357 — resolve the namespace's
+    /// `governance.require_approval_above_depth` threshold, leaf-first, with
+    /// the SAME walk semantics on every backend (the per-level decision is the
+    /// shared [`crate::storage::approval_depth_level_decision`]). `Ok(None)`
+    /// means no gate is configured; `Ok(Some(t))` means a reflection whose
+    /// proposed depth exceeds `t` must be parked for approval, never written.
+    ///
+    /// Default returns `UnsupportedCapability` — NOT `Ok(None)`: an adapter
+    /// that has not wired the walk must fail the reflect loudly rather than
+    /// silently skip an approval gate the operator configured (fail closed).
+    async fn resolve_require_approval_above_depth(
+        &self,
+        _namespace: &str,
+    ) -> StoreResult<Option<u32>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "REFLECT_APPROVAL_GATE".to_string(),
+        })
+    }
+
     /// Apply an approval vote against a pending action with full
     /// approver_type semantics:
     /// - `Human`: any caller approves; transitions to `approved`.
