@@ -172,8 +172,10 @@ Three (or more) ai-memory servers in a rack, full-mesh federated
 via the `federation/` module's quorum protocol. Each peer holds an
 independent copy of the substrate; a write commits locally first,
 then fans out to peers — the success response is gated on W−1 peer
-acks within the quorum deadline (W defaults to majority, counting
-the local commit). The Ed25519 `X-Memory-Sig` header
+acks within the quorum deadline (W includes the local commit). Bare
+`ai-memory serve` defaults to `--quorum-writes 0`; a quorum-enabled
+deployment must explicitly select W and peers. The DigitalOcean hive
+recipe defaults W to 2, while a majority quorum is a topology choice. The Ed25519 `X-Memory-Sig` header
 (`AI_MEMORY_FED_REQUIRE_SIG=1`) + per-message nonce
 (`AI_MEMORY_FED_REQUIRE_NONCE=1`) gate replay and forgery.
 

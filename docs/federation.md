@@ -688,10 +688,12 @@ drives the periodic pull from peers; cadence is operator-set via
 For small meshes (2-5 peers, modest write volume), 30s is fine. For
 large meshes, increase to 60-300s to spread the pull traffic.
 
-**Quorum width.** v0.6.x defaults to majority (`W = ceil((N+1)/2)` —
-the `QuorumPolicy::majority` convenience constructor,
-[`src/replication.rs`](../src/replication.rs))
-which is the correct default for partition-tolerance. For a regulated
+**Quorum width.** There is no compiled majority default: bare
+`ai-memory serve` defaults to `--quorum-writes 0` (federation off), and a
+quorum-enabled deployment selects W explicitly. Majority
+(`W = ceil((N+1)/2)` — the `QuorumPolicy::majority` convenience
+constructor, [`src/replication.rs`](../src/replication.rs)) is the
+recommended topology choice for partition-tolerance. For a regulated
 deployment where every write must be witnessed by every peer (W = N),
 configure explicitly — but be aware that any single-peer outage
 becomes a write outage.
