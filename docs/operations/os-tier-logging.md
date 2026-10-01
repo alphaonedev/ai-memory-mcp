@@ -37,9 +37,16 @@ happens on a `memory_store` / recall call site. The `[logging].path`,
 file-sink-only and are ignored under `stdout` — rotation/retention is now the
 init system's job (below).
 
-`enabled = false` (the default) silences operational logging entirely
-regardless of `sink`. An unrecognized `sink` value falls back to `file` with a
-one-shot WARN.
+`enabled = false` (the default) installs no `[logging]` sink at all,
+regardless of `sink`. It does **not** silence every log line: the long-lived
+console verbs (`serve`, `curator`, `watch`, `wake-hub`, `wake-listen`) still
+install a console subscriber that writes to **stderr**, filtered by
+`RUST_LOG` (`src/daemon_runtime.rs::command_installs_console_subscriber`).
+Under systemd that stderr is captured by the journal like stdout. Other verbs,
+including `ai-memory mcp`, emit no operational log lines when logging is
+disabled. An unrecognized `sink` value falls back to `file` with a one-shot
+WARN. See [`observability.md`](observability.md) for which process emits
+which signal.
 
 ## Why this satisfies "use the pre-existing OS facilities"
 
@@ -176,12 +183,17 @@ path to a remote host, because `tls` requires the CA file.
 
 **Failure posture.**
 
-- *Configured but not compiled:* selecting `sink = "syslog"` in a binary built
-  **without** `--features syslog` **fails closed at boot** (a clear "requires
-  `--features syslog`" error) — unlike Tier 1's warn-and-fallback for an
-  unrecognized value, because the operator explicitly opted into off-host
-  shipping and a silent fallback to a local file would be a confidentiality
-  surprise.
+- *Configured but not compiled (or misconfigured):* selecting
+  `sink = "syslog"` in a binary built **without** `--features syslog` makes
+  the logging initialiser return an error ("requires `--features syslog`"),
+  as does a missing `syslog_address` or, under `tls`, a missing CA. It never
+  falls back to a local file — the operator opted into off-host shipping and
+  a silent local copy would be a confidentiality surprise. The process does
+  **not** refuse to start: `main` prints
+  `ai-memory: file logging init failed (continuing without): …` to stderr
+  and runs with **no** operational-log sink (`src/main.rs`, the
+  `init_file_logging` call). The console verbs still log to stderr (above);
+  every other verb logs nothing. Check stderr after any sink change.
 - *Collector unreachable at runtime:* **lossy, never blocking** — the sink shares
   the file/stdout non-blocking worker, connects with a bounded timeout, and on
   failure drops the record and reconnects on the next event. A down / slow /
