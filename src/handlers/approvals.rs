@@ -9,7 +9,10 @@
 //! Gated behind the K7 server-wide HMAC: caller MUST present
 //! `X-AI-Memory-Signature: sha256=<hex>` keyed on
 //! `SHA256([hooks.subscription].hmac_secret)` over the canonical
-//! `<timestamp>.<body>` string. Missing or invalid signature → 401.
+//! `<timestamp>.<METHOD>.<pending_id>.<body>` string (the method and the
+//! pending-row id are bound so a signature cannot be replayed against a
+//! different row; see `verify_approval_hmac`). Missing or invalid
+//! signature → 401.
 //!
 //! `GET /api/v1/approvals/stream` — long-lived SSE stream that fans out
 //! every `approval_requested` and `approval_decided` event from the
@@ -88,9 +91,10 @@ pub(crate) const APPROVAL_HMAC_MAX_SKEW_SECS: i64 = 60;
 
 /// HMAC-verify an inbound approval request.
 ///
-/// Mirrors the K7 outbound construction: signature value is
+/// Keyed like the K7 outbound construction: signature value is
 /// `sha256=<hex>` where `<hex>` = `HMAC-SHA256(SHA256(secret),
-/// "<timestamp>.<body>")`. Returns `Ok(())` on a valid signature;
+/// "<timestamp>.<METHOD>.<pending_id>.<body>")` (the canonical string is
+/// defined below). Returns `Ok(())` on a valid signature;
 /// `Err(StatusCode)` (always 401) on any failure mode (missing
 /// header, missing timestamp, stale timestamp, bad encoding,
 /// mismatch).
@@ -767,10 +771,13 @@ fn publish_decision_event(
 ///      to share an `agent_id` with the requester.
 ///   3. The historical "anonymous" subscriber (agent_id empty) sees
 ///      nothing — opt-in is the safe default for a privileged feed.
-///   4. If the subscriber agent is a server-internal id starting with
-///      `host:` (the daemon's own boot id), they see everything —
-///      this preserves the operator-CLI affordance of attaching to
-///      the local socket and observing all activity for diagnostics.
+///   4. A subscriber agent id starting with `host:` sees NOTHING. `host:`
+///      is the server-side fallback id from `identity::resolve_agent_id`
+///      and is never a legitimate self-asserted subscriber; the SSE
+///      handshake already treats such a value as anonymous, and this
+///      predicate refuses it as defence in depth (#628). An operator who
+///      needs a "see all events" feed adds an explicit K9 `Allow` rule
+///      for an administrative agent id (rule 2).
 #[must_use]
 pub fn sse_event_visible_to(
     subscriber_agent: &str,

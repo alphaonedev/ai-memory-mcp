@@ -25,7 +25,7 @@ The remaining sections are mechanical: keypairs, allowlist, backups, migrations,
 
 ## 2. Keypair provisioning
 
-Every agent in a deployment needs its own Ed25519 keypair. The CLI never auto-generates one for you — generation is explicit so a typo cannot silently rotate a long-lived peer.
+Every agent in a deployment needs its own Ed25519 keypair. `serve` and ordinary writer verbs create a keypair for the resolved agent id on first use if none exists (the provisioning verbs `identity generate` / `identity import` and `keys init` / `keys status` / `keys recover` are the exception: they see the key directory as you left it). An existing keypair is never replaced without an explicit `identity generate --force`, so a typo cannot rotate a long-lived peer. Provision keys explicitly before first use when you want to control which ids exist:
 
 ```bash
 ai-memory identity generate --agent-id alice@team-finance

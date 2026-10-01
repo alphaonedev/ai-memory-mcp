@@ -8570,7 +8570,10 @@ pub fn apply_token_budget(
     )
 }
 
-/// Recall — fuzzy OR search + touch + auto-promote + TTL extension.
+/// Recall — fuzzy OR search + optional semantic blend. Pure since #1953:
+/// it appends `recall_observations` rows only; the periodic fold job applies
+/// the access count and the per-tier TTL floor-extend, and no recall path
+/// promotes a tier (removed by v1.0.0 Boids item 1, vote 4d3ea1c5).
 /// Task 1.11: after ranking, applies optional `budget_tokens` cap.
 /// Phase P6: returns the full `BudgetOutcome` (tokens_used,
 /// tokens_remaining, memories_dropped, budget_overflow) instead of just
@@ -18333,8 +18336,11 @@ static INSERT_IF_NEWER_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::n
                 -- UPDATE and never pass can_transition_to, so the replicated
                 -- lifecycle value is NOT uniformly transition-validated -- the
                 -- enforcement gap is deferred to v1.1 per #3750.
-                -- Boids item 3 R2.1: local system-only never replaced, remote
-                -- system-only never adopted, else newer-wins (one shared twin).
+                -- Boids item 3 R2.1 (crdt_merge::merge_lifecycle_local_taint_wins,
+                -- one shared twin): a LOCAL contaminated / quarantined is never
+                -- replaced; a REMOTE contaminated is never adopted; every other
+                -- case, including a remote quarantined or tombstoned, is
+                -- newer-wins.
                 lifecycle_state = {lifecycle_case},
                 -- v1.0.0 #2333 (FBL-03) + v1.0.0 #2394 — the v79 denormalized
                 -- kind_provenance FOLLOWS THE KIND THAT ACTUALLY WON on the

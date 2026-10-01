@@ -3199,9 +3199,10 @@ pub trait MemoryStore: Send + Sync {
     // (semantic weight varies by content length: 0.50 for short
     // content ≤500 chars, 0.15 for long content ≥5000 chars, lerp in
     // between). Each candidate gets a 6-factor blended score, then
-    // the survivors are touched (access_count++, TTL extended,
-    // mid→long auto-promotion at 5 accesses, priority++ every 10
-    // accesses).
+    // recall is pure (#1953): the survivors are recorded in the
+    // `recall_observations` ledger and the fold job later applies
+    // access_count++ and the TTL floor-extend (no tier promotion or
+    // priority ladder since v1.0.0 Boids item 1).
     //
     // Both adapters implement; sqlite delegates to db::recall_hybrid,
     // postgres synthesises the same 6-factor blend over pgvector +
@@ -3247,8 +3248,8 @@ pub trait MemoryStore: Send + Sync {
 
     /// Touch the supplied memory ids: increment `access_count`,
     /// extend TTL (1h short / 1d mid by default — adapters honor the
-    /// resolved TTL config), auto-promote mid→long at 5 accesses,
-    /// increment priority every 10 accesses (capped at 10).
+    /// resolved TTL config) as a floor. Since v1.0.0 Boids item 1
+    /// (vote 4d3ea1c5) touch neither promotes a tier nor bumps priority.
     ///
     /// Idempotent on a per-id basis; missing ids are silently skipped.
     /// Default returns `Ok(())` — adapters that wire touch ops override.

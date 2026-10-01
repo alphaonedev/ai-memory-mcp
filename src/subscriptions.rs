@@ -8,17 +8,26 @@
 //! fire-and-forget thread POSTs an HMAC-SHA256-signed JSON payload.
 //!
 //! SSRF hardening:
-//! - `http://` only to `127.0.0.0/8` or `localhost` hosts;
-//!   everywhere else requires `https://`
-//! - RFC1918 / RFC4193 / link-local hosts are rejected unless
-//!   `allow_private_networks = true` in the daemon config
+//! - `https://` only: plaintext `http://` is refused for every host,
+//!   loopback included (#3705, `validate_url_with`)
+//! - RFC1918 / RFC4193 / link-local targets are refused
+//!   unconditionally, both as literal IPs at registration and as
+//!   resolved addresses at dispatch; there is no private-network
+//!   override
+//! - loopback targets are refused unless the operator opts in with
+//!   `[subscriptions] allow_loopback_webhooks = true` (or
+//!   `AI_MEMORY_ALLOW_LOOPBACK_WEBHOOKS`)
 //!
 //! Signature:
-//! - Header `X-Ai-Memory-Signature: sha256=<hex>` over the raw
-//!   JSON body
-//! - The secret stored in the DB is a SHA-256 of the plaintext
-//!   shared secret; the plaintext is returned **once** at
-//!   subscription time and never leaves the DB after.
+//! - Header `X-Ai-Memory-Signature: sha256=<hex>` where
+//!   `<hex>` = `HMAC-SHA256(key, "<timestamp>.<body>")`, `<timestamp>`
+//!   is the value sent in `X-Ai-Memory-Timestamp`, and `<body>` is the
+//!   raw JSON body
+//! - `key` is `SHA256(plaintext shared secret)`: the DB stores that
+//!   hash, and the plaintext is returned **once** at subscription time
+//!   and never leaves the DB after. With no per-subscription secret the
+//!   key is `SHA256` of the server-wide `[hooks.subscription]
+//!   hmac_secret`
 
 use crate::models::field_names;
 

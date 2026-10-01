@@ -1129,13 +1129,15 @@ whose THIRTY-THREE jobs are `c8-precheck`, `vendor-literal-gate`,
 `doc-symbol-anchor-gate`, `sdk-route-path-gate`, `ci-job-claims-gate`,
 `doc-surface-completeness-gate`, `capacity-claim-gate`,
 `benchmark-claim-gate`, `cloud-init-ascii-gate`,
-`migration-ladder-gate`, `install-checksum-gate`,
+`test-keydir-mode-gate` (#3733), `migration-ladder-gate`, `install-checksum-gate`,
 `conformance-readers-gate`, `required-contexts-gate`,
 `git-dependency-source-gate`, `create-extension-allowlist-gate`,
 `commit-signing-posture-gate`, `cert-expiry-gate` (the
 enterprise-federation cert §7 expiry trigger, #2915 — an integrity
 gate, not one of the twelve numbered lint gates below),
-`url-sink-redaction-gate`, `stale-contract-assertions-gate` and
+`foreign-text-to-caller-gate` (#3688),
+`external-pr-operator-approval-gate` (an outside-team PR author needs
+an `@alphaonedev` review), `url-sink-redaction-gate`, `stale-contract-assertions-gate` and
 `claude-plugin-gate` (#3967 — three of the FIVE `check-*.sh` gates
 that existed and were referenced by NO workflow; the other two,
 `check-count-assertion-declared.sh` and `check-shared-namespace-claims.sh`,
