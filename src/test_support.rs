@@ -638,3 +638,46 @@ mod tests {
         );
     }
 }
+
+/// Captures formatted tracing output (no ANSI, no timestamps).
+#[derive(Clone, Default)]
+pub(crate) struct CapturedLines(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+impl std::io::Write for CapturedLines {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend_from_slice(b);
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLines {
+    type Writer = CapturedLines;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+/// Run `f` under a DEBUG-level capturing subscriber; returns the
+/// (ERROR, DEBUG) line counts it produced. Shared by the #4310 (forensic
+/// writer) and #4318 (flat audit trail) rate-limit cells.
+pub(crate) fn count_error_and_debug_lines(f: impl FnOnce()) -> (usize, usize) {
+    let sink = CapturedLines::default();
+    let buf = sink.0.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_writer(sink)
+        .with_ansi(false)
+        .without_time()
+        .finish();
+    tracing::subscriber::with_default(subscriber, f);
+    let text = String::from_utf8_lossy(
+        &buf.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    )
+    .into_owned();
+    let count = |level: &str| text.lines().filter(|l| l.contains(level)).count();
+    (count("ERROR"), count("DEBUG"))
+}

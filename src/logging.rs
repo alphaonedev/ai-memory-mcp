@@ -300,6 +300,15 @@ impl DeliveryStats {
         }
     }
 
+    /// Test-only: restart the diagnostic rate limit, so a cell can require
+    /// that the NEXT failure reports (#4318: the flat trail's accounting is
+    /// process-global, so an earlier cell may already hold the interval).
+    #[cfg(test)]
+    pub(crate) fn reset_diagnostic_clock_for_test(&self) {
+        self.last_diagnostic_unix_ms.store(0, Ordering::Relaxed);
+        self.suppressed_diagnostics.store(0, Ordering::Relaxed);
+    }
+
     /// Records delivered to the destination since the pipeline was built.
     pub fn delivered(&self) -> u64 {
         self.delivered.load(Ordering::Relaxed)
@@ -318,7 +327,7 @@ impl DeliveryStats {
     }
 }
 
-fn now_unix_ms() -> u64 {
+pub(crate) fn now_unix_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))

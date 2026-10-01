@@ -1150,7 +1150,10 @@ impl EventBuilder {
 /// **never** allowed to fail a memory operation.
 pub fn emit(builder: EventBuilder) {
     if let Err(e) = try_emit(builder) {
-        tracing::error!("audit: emission failed: {e}");
+        // #4318 — DEBUG per event: `serve` and `mcp` route tracing to stderr,
+        // so a per-event ERROR defeated the #3975 rate limit. The ERROR goes
+        // out with the rate-limited diagnostic in `note_emit_failure`.
+        tracing::debug!("audit: emission failed: {e}");
     }
 }
 
@@ -1166,12 +1169,11 @@ pub const AUDIT_WRITE_FAILURES_TOTAL: &str = "ai_memory_audit_write_failures_tot
 fn note_emit_failure(err: &anyhow::Error) {
     let delivery = &RuntimeContext::global().audit.delivery;
     if let Some(suppressed) = delivery.record_failure(now_unix_ms()) {
+        let line = audit_failure_diagnostic(err, suppressed);
+        // #4318 — the ERROR is rate-limited with the stderr line.
+        tracing::error!("{line}");
         // Nothing is left to report a failing stderr to.
-        let _ = writeln!(
-            std::io::stderr(),
-            "{}",
-            audit_failure_diagnostic(err, suppressed)
-        );
+        let _ = writeln!(std::io::stderr(), "{line}");
     }
 }
 
@@ -2536,6 +2538,36 @@ mod tests {
         );
         assert_eq!(status.state, super::AuditTrailState::Active);
         assert!(status.last_write_unix_ms.is_some());
+    }
+
+    /// #4318 — a lost audit event is traced at DEBUG; the ERROR goes out only
+    /// with the rate-limited diagnostic: exactly one for 10 losses inside one
+    /// interval (the shared clock is reset under the sink lock first, so a
+    /// fix that dropped the ERROR entirely fails here too, f2r's nit).
+    /// Red on ed111a9eb: 10 ERROR lines for 10 lost events.
+    #[test]
+    fn lost_events_log_at_most_one_error_per_interval_4318() {
+        let _g = sink_lock();
+        let delivery = &RuntimeContext::global().audit.delivery;
+        let failed0 = delivery.write_failures();
+        delivery.reset_diagnostic_clock_for_test();
+        super::init_for_test_with_writer(Box::new(FillingDisk {
+            budget: 0,
+            fail_flush: false,
+        }));
+        let (errors, debugs) = crate::test_support::count_error_and_debug_lines(|| {
+            for _ in 0..10 {
+                emit_one();
+            }
+        });
+        super::shutdown_for_test();
+        assert_eq!(
+            delivery.write_failures() - failed0,
+            10,
+            "every loss counted"
+        );
+        assert_eq!(errors, 1, "{errors} ERROR lines for 10 lost events");
+        assert_eq!(debugs, 10, "every lost event is still traced, at DEBUG");
     }
 
     /// #3975: a failed FLUSH was discarded (`.ok()`); it is now a counted loss.
