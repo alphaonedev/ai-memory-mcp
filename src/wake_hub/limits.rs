@@ -310,7 +310,7 @@ pub const DEFAULT_RECONNECT_JITTER_MS: u32 = 750;
 /// over [`MAX_ID_BYTES`] is never tracked at all (the hub cannot carry it). The
 /// hash table itself is a FIXED reservation on top of this budget: twice the
 /// most entries the budget can hold (`2 * budget /
-/// RECIPIENT_SEQ_ENTRY_OVERHEAD_BYTES` slots, ~4.3 MiB at the default). Twice,
+/// RECIPIENT_SEQ_ENTRY_OVERHEAD_BYTES` slots, 4.12 MiB (4,325,384 bytes) at the default). Twice,
 /// because remove-then-insert churn leaves tombstones and a table that is more
 /// than half full GROWS (doubles) to reclaim them, while one at most half full
 /// rehashes in place; so it never grows and has no transient peak.

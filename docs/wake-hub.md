@@ -66,7 +66,7 @@ would hand you contiguous numbers across a real drop. Values start from a
 wall-clock base, so only their ORDER is meaningful, and a difference is a wake
 count only between two values with no rebase in between. A producer restart or
 an eviction from the producer's per-recipient table is a rebase: it moves your
-number FORWARD by a clock delta (~10^7 to ~10^12), which is not a count. The
+number FORWARD by a clock delta (microseconds of elapsed wall-clock time, unbounded: it passes 10^12 after about 11.6 days), which is not a count. The
 client therefore clamps `AI_MEMORY_WAKE_MISSED` to
 `wake_client::MAX_REPORTED_MISSED` (65,536, saturating): treat `missed > 0`
 (reason `gap`) as the only reliable signal, never as a loop or batch bound.
@@ -82,12 +82,14 @@ would not bound memory. At the 128-byte ceiling the table holds about 26,000
 recipients; shorter ids fit proportionally more. An id over 128 bytes
 (`MAX_ID_BYTES`) is never tracked: the hub cannot carry it, and tracking one
 would only evict real recipients. The hash table is a fixed reservation ON TOP of that
-budget, allocated once at twice the most entries the budget can hold (about
-4.3 MiB at the default): churn leaves tombstones, and a table more than half
+budget, allocated once at twice the most entries the budget can hold (4.12 MiB,
+4,325,384 bytes, measured, at the default): churn leaves tombstones, and a table more than half
 full doubles to reclaim them (measured: 120k-id churn doubled a table sized to
 exactly the ceiling), whereas one at most half full rehashes in place, so this
-table never grows and has no transient peak. In-place rehashes happen under the
-producer's short lock, about once per 70,000 evictions. The per-entry
+table never grows and has no transient peak. An in-place rehash, when one
+happens, runs under the producer's short lock; at the shipped size none was
+observed in about 258,000 evictions (worst single assign 76 microseconds), so
+treat any rehash frequency as at most that, not as a measured rate. The per-entry
 accounting is an argued upper bound, not a measured RSS figure.
 
 **Eviction and what it reveals.** At the budget the producer evicts the
@@ -109,14 +111,26 @@ jump is a residual signal and it is NOT nothing. Stated exactly:
   digest or inbox row, or how many wakes any one recipient received: once a
   victim is in the table, repeat wakes to it change nothing. It sees only its
   own number.
-- **Cost.** Each probe needs about one full table turnover: roughly 43,000
-  notifies with the shortest ids, about 26,000 with 128-byte ids. Every notify
-  is charged to the sender's per-agent daily write quota
-  (`AI_MEMORY_MAX_MEMORIES_PER_DAY`, default 1,000), so one identity cannot
-  afford a probe in a day. The quota is per agent: an attacker holding N
-  identities divides that cost by N, so this is a quota-bounded residual and
-  not a closed channel. It is far weaker than the host-wide-sequence volume
-  signal this change removes.
+- **Cost.** Each probe needs about one full table turnover: at least about
+  26,000 notifies (the cheapest case, 128-byte ids), up to about 43,000 with the
+  shortest ids, each to a DISTINCT recipient id and each leaving a durable inbox
+  row (loud forensically, but not a quota). The per-agent daily write quota
+  (`AI_MEMORY_MAX_MEMORIES_PER_DAY`, default 1,000) does NOT bound the probe,
+  locally or over federation. Locally the quota is counted per sender per
+  recipient inbox namespace and the flood targets distinct recipients, so every
+  notify lands on a fresh quota row (measured: 1,500 notifies to 1,500 distinct
+  ids all succeed, while 1,001 to one id is refused); that general defect is #4359. On the
+  federation lane a wake is published for every applied inbox row
+  (`federation/applied_wake.rs`, #3631), the receive path charges storage bytes
+  only and not the daily count (#1544), and storage is keyed per (agent,
+  namespace) (#1156), so an enrolled peer whose push scope covers inbox
+  namespaces is bounded only by its push rate (about 26 pushes of 1,000 rows);
+  #4354 is its narrower federation instance. One identity can therefore run a probe, bounded only by
+  admission control and request latency. An observer holding k hub identities
+  can lay k canaries at the least-recently-woken end and read a count (or k time
+  slices) from one flood instead of one threshold bit. This is a residual, not a
+  closed channel, and it is strictly weaker than the host-wide sequence still
+  emitted on the inbox SSE stream (#4071, open).
 
 Read it as *"wakes happened that you did not see"*. The correct response to a
 gap is ONE catch-up inbox read. That is fail-safe by construction: a client may

@@ -174,7 +174,7 @@ impl WakeSignal {
 /// `seq_high_watermark` is the recipient's own wake number, which restarts from
 /// a wall-clock base after a producer restart or an eviction from the
 /// producer's recipient table. Across such a rebase the raw difference is a
-/// clock delta (up to ~10^12), NOT a count of wakes. `missed` is therefore
+/// clock delta (elapsed microseconds, unbounded), NOT a count of wakes. `missed` is therefore
 /// clamped to this value: it means "AT LEAST this many, or the counter
 /// rebased", and only `missed > 0` (reason `gap`, one catch-up read) is
 /// reliable. A hook must never use it as a loop or batch bound.
