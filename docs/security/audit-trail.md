@@ -375,11 +375,14 @@ sufficient.
 
 ### `ai-memory audit verify`
 
-Walks the audit log, recomputes every line's `self_hash`, and asserts
-each `prev_hash` matches the prior line's `self_hash`. Exits:
+Walks the audit log, recomputes every line's `self_hash`, asserts each
+`prev_hash` matches the prior line's `self_hash`, and (#4021) checks that no
+`sequence` number is missing between two lines. Exits:
 
-- `0` — chain intact
-- `2` — chain broken (precise line + failure kind printed)
+- `0` — chain intact and no event missing (`"status":"ok"`), or every
+  missing range acknowledged (`"status":"ok_acknowledged_gaps"`)
+- `2` — chain broken (precise line + failure kind printed), or an
+  unacknowledged sequence gap (`"kind":"SequenceGap"`)
 - non-zero with anyhow context — I/O error
 
 ```bash
@@ -387,11 +390,46 @@ $ ai-memory audit verify
 audit verify OK: 1428 line(s) verified at /home/op/.local/state/ai-memory/audit/audit.log
 
 $ ai-memory audit verify --json
-{"status":"ok","total_lines":1428,"path":"…/audit.log"}
+{"status":"ok","total_lines":1428,"gaps":[],"gap_count":0,"unmatched_acknowledgements":[],"path":"…/audit.log"}
 
 $ ai-memory audit verify   # after a tamper
 audit verify FAIL at line 203: SelfHash — self_hash mismatch: stored=ab…, recomputed=cd…
+
+$ ai-memory audit verify   # after a write failure lost one event
+audit verify FAIL: 1 audit event(s) missing: sequence gap(s) 812-812. These events were
+sequenced but never written, most likely a failed write (see ai_memory_audit_write_failures_total).
+If the loss is known and accepted, re-run with --acknowledge-gaps 812-812
 ```
+
+**Sequence gaps (#4021).** An event is numbered before it is written, so an
+event lost to a failed write (a full disk, a revoked permission; see
+§"Detecting a trail that stopped recording") leaves a missing `sequence`
+range while the hash chain stays intact. `verify` therefore fails on a gap, as
+its own kind (`SequenceGap`, "events missing"), never with the tamper
+wording. Only interior gaps count: the first line of a file is not required
+to be sequence 1.
+
+Once the loss is understood, acknowledge the exact ranges verify printed:
+`ai-memory audit verify --acknowledge-gaps 812-812,1040-1043`. A gap passes
+only if it EQUALS a listed range. A range that merely contains it does not
+count, so an acknowledgement can never become a blanket pass, and any later
+gap fails again. A listed range that matches no gap is reported on stderr, so
+a stale acknowledgement left in a cron line stays visible.
+
+**Limit: a loss at the tail before a restart leaves no gap.** A restart
+resumes numbering from the last event WRITTEN to the file. Events lost after
+that write and before the restart therefore have their numbers reused, and
+the trail shows no gap for them. The `ai_memory_audit_write_failures_total`
+counter (#3975) counted them, but only in the process that lost them, and it
+does not survive the restart. So "no gap" means no loss was detected BETWEEN
+two written events. It is not proof that nothing was lost at a tail. A
+persisted sequence high-water that closes this is tracked as #4086.
+
+**Honest limit.** The acknowledgement is a flag, not a signed record. On a
+hostile host, whoever can rewrite the trail (renumber the lines, recompute
+the chain) can also edit the cron line. Gap detection protects the trail
+against OPERATIONAL loss, not against an attacker with write access; that is
+the job of the signed `signed_events` chain and the off-host tiers below.
 
 ### `ai-memory audit tail`
 
@@ -706,9 +744,9 @@ while the daemon keeps serving. Every such loss is now counted and reported:
 
 Alert on `increase(ai_memory_audit_write_failures_total[5m]) > 0`. A lost
 event also leaves a skipped value in the `sequence` column (the counter
-advances before the write). `audit verify` does **not** report that gap
-today: it rejects only a sequence that fails to increase (#4021). The
-failure counter is therefore the signal to watch.
+advances before the write), and `audit verify` fails on it (#4021; see
+§"`ai-memory audit verify`"). The counter covers only the process that lost
+the event and only since it started; the gap stays in the file.
 
 ### Off-host attestation
 
