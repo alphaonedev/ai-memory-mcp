@@ -285,7 +285,7 @@ ai-memory recall "what database did we decide on for the analytics service"</cod
       <tbody>
         <tr><td><code>title</code></td><td>First user message, truncated</td></tr>
         <tr><td><code>content</code></td><td>Full conversation text — alternating user/assistant turns</td></tr>
-        <tr><td><code>tier</code></td><td><code>mid</code> by default (7-day TTL, auto-promotes to <code>long</code> after 5 recalls)</td></tr>
+        <tr><td><code>tier</code></td><td><code>mid</code> by default (7-day TTL; promote to <code>long</code> with <code>memory_promote</code>, recall never changes the tier)</td></tr>
         <tr><td><code>namespace</code></td><td>Auto-set per format: <code>claude-export</code>, <code>chatgpt-export</code>, <code>slack-export</code></td></tr>
         <tr><td><code>source</code></td><td><code>mine-claude</code> / <code>mine-chatgpt</code> / <code>mine-slack</code></td></tr>
         <tr><td><code>metadata.mined_from</code></td><td>Source format tag</td></tr>

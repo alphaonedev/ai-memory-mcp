@@ -396,7 +396,7 @@ table tr:last-child td{border-bottom:none}
 
       <div class="arch-diagram-caption">
         Agent talks to ai-memory over MCP, HTTP, or CLI. The HTTP daemon guards a single SQLite connection behind a mutex; MCP stdio is single-threaded by protocol; each CLI invocation opens its own connection (#965 audit).
-        Every recall is a hot loop — FTS5 + HNSW + scoring — all in-process. At v1.0.0 recall is <strong>pure</strong> (#1869/#1953): it writes zero rows to <code>memories</code>; the access signal (access-count, TTL floor-extend, mid→long promotion, priority) lands in the append-only <code>recall_observations</code> ledger and is applied by an async fold job, not during the read.
+        Every recall is a hot loop — FTS5 + HNSW + scoring — all in-process. At v1.0.0 recall is <strong>pure</strong> (#1869/#1953): it writes zero rows to <code>memories</code>; the access signal (access-count, TTL floor-extend) lands in the append-only <code>recall_observations</code> ledger and is applied by an async fold job, not during the read.
       </div>
     </div>
   </div>
@@ -423,7 +423,7 @@ table tr:last-child td{border-bottom:none}
       <li><strong>FTS5 keyword pass</strong> — fuzzy OR query, scored by <code>(fts.rank * -1) + priority*0.5 + MIN(access_count, 50)*0.1 + confidence*2.0 + tier_bonus + recency_factor</code>.</li>
       <li><strong>Semantic pass</strong> — cosine similarity via HNSW (or linear scan fallback); skipped entirely in the keyword tier.</li>
       <li><strong>Adaptive blend</strong> — semantic weight varies 0.50 (short content) → 0.15 (long content) because embeddings lose information on long text. Final score is <code>semantic_weight * cosine + (1 - semantic_weight) * norm_fts</code>.</li>
-      <li><strong>Ledger, not touch (v1.0.0 pure recall, #1869/#1953)</strong> — recall writes <strong>zero</strong> rows to <code>memories</code>. Each returned memory appends an entry to the append-only <code>recall_observations</code> ledger instead. An async fold job (<code>db::fold_recall_accesses</code>, default every 60&nbsp;s, and fold-before-gc on every eviction) later applies the exact access ladders from unfolded ledger rows: <code>access_count</code> increment, TTL floor-extend, mid→long auto-promotion on the 5th access, priority bump every 10 accesses. The pre-v1.0.0 synchronous-touch path is gone (the <code>AI_MEMORY_RECALL_TOUCH_SYNC</code> escape hatch was removed at v1.0.0).</li>
+      <li><strong>Ledger, not touch (v1.0.0 pure recall, #1869/#1953)</strong> — recall writes <strong>zero</strong> rows to <code>memories</code>. Each returned memory appends an entry to the append-only <code>recall_observations</code> ledger instead. An async fold job (<code>db::fold_recall_accesses</code>, default every 60&nbsp;s, and fold-before-gc on every eviction) later applies the exact access ladders from unfolded ledger rows: <code>access_count</code> increment and TTL floor-extend. v1.0.0 Boids item 1 removed the mid→long auto-promotion and the priority bump; tier changes only through <code>memory_promote</code>. The pre-v1.0.0 synchronous-touch path is gone (the <code>AI_MEMORY_RECALL_TOUCH_SYNC</code> escape hatch was removed at v1.0.0).</li>
       <li>Result formatted as <code>toon_compact</code> (40-60% smaller than JSON), <code>toon</code>, or <code>json</code>.</li>
     </ol>
 

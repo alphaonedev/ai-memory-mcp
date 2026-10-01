@@ -7,7 +7,7 @@ layout: doc
 
 `ai-memory` is an AI-agnostic memory management system. It works with **any MCP-compatible AI client** -- including Claude AI, OpenAI ChatGPT, xAI Grok, META Llama, and others. The HTTP API and CLI are completely platform-independent.
 
-**Key features for admins:** Zero token cost until recall (replaces built-in auto-memory), TOON compact default response format (79% smaller than JSON), MCP prompts for proactive AI behavior (`recall-first`, `memory-workflow`), 4 feature tiers (keyword → autonomous, with any LLM backend post-#1067 — local Ollama, xAI Grok, OpenAI, Anthropic, Gemini, etc.), and the v0.7.0 `attested-cortex` substrates (Ed25519 link attestation, 25-event hook pipeline, sidechain transcripts, optional AGE acceleration, capabilities v3, permissions + A2A approvals). v0.7.0 ships ~2,400 tests across the full surface with line coverage held above the ≥92% project bar; v0.6.3.1 baseline numbers (1,886 lib / 93.84%) and v0.6.3 baselines (1,600 lib / 93.08%) are frozen on the [evidence page](https://alphaonedev.github.io/ai-memory-mcp/evidence.html); v0.7.0 deltas live in `CHANGELOG.md` and the per-release notes.
+**Key features for admins:** no memory content in context until recall (replaces built-in auto-memory; the MCP tool schemas still cost a fixed per-request budget), TOON compact default response format (79% smaller than JSON), MCP prompts for proactive AI behavior (`recall-first`, `memory-workflow`), 4 feature tiers (keyword → autonomous, with any LLM backend post-#1067 — local Ollama, xAI Grok, OpenAI, Anthropic, Gemini, etc.), and the v0.7.0 `attested-cortex` substrates (Ed25519 link attestation, 25-event hook pipeline, sidechain transcripts, optional AGE acceleration, capabilities v3, permissions + A2A approvals). v0.7.0 ships ~2,400 tests across the full surface with line coverage held above the ≥92% project bar; v0.6.3.1 baseline numbers (1,886 lib / 93.84%) and v0.6.3 baselines (1,600 lib / 93.08%) are frozen on the [evidence page](https://alphaonedev.github.io/ai-memory-mcp/evidence.html); v0.7.0 deltas live in `CHANGELOG.md` and the per-release notes.
 
 > **Maturity framing (v0.7).** The single-machine primitive (T1/T2 in the [architectures matrix](https://alphaonedev.github.io/ai-memory-mcp/architectures.html)) is **production-ready**. Federation (T3 multi-node quorum cluster) is **beta** — the code is shipped and tested but not recommended for unattended production fleets. The Postgres+pgvector backend reaches **GA in v0.7** (with optional **Apache AGE acceleration** for KG ops behind a bench gate). Ed25519 attestation, the hook pipeline, sidechain transcripts, and the permissions/A2A surfaces are all **opt-in** — a v0.7.0 install with no `hooks.toml`, no keypair, and no `[transcripts]` config behaves identically to v0.6.4 at the lifecycle layer. Multi-region distributed consensus (T5 "global hive") is **vision** at v1.0+. See the [evidence page](https://alphaonedev.github.io/ai-memory-mcp/evidence.html) for the canonical maturity labels — use those labels in all customer-facing materials.
 
@@ -48,7 +48,7 @@ Run the HTTP daemon directly in the foreground:
 ai-memory --db /path/to/ai-memory.db serve
 ```
 
-The daemon listens on `127.0.0.1:9077` by default and exposes 100 HTTP route registrations (86 unique URL paths) (canonical count on the [evidence page](https://alphaonedev.github.io/ai-memory-mcp/evidence.html)).
+The daemon listens on `127.0.0.1:9077` by default and exposes 103 HTTP route registrations (89 unique URL paths) (canonical count on the [evidence page](https://alphaonedev.github.io/ai-memory-mcp/evidence.html)).
 
 ### Systemd (Production HTTP Daemon)
 
@@ -636,7 +636,7 @@ These are set in the source code and require recompilation to change:
 | `DEFAULT_PORT` | 9077 | `src/daemon_runtime.rs:97` |
 | `GC_INTERVAL_SECS` | 1800 (30 min) | `src/daemon_runtime.rs:98` |
 | `MAX_CONTENT_SIZE` | 65536 (64 KB) | `models.rs` |
-| `PROMOTION_THRESHOLD` | 5 accesses | `models.rs` |
+| `PROMOTION_THRESHOLD` | 5 (historical; no production reader since v1.0.0 Boids item 1 — access never promotes, only `memory_promote` raises a tier; kept for a regression test) | `models.rs` |
 | `SHORT_TTL_EXTEND_SECS` | 3600 (1 hour) | `models.rs` |
 | `MID_TTL_EXTEND_SECS` | 86400 (1 day) | `models.rs` |
 | `DEFAULT_MAX_MEMORIES_PER_DAY` | 1000 | `quotas.rs` (compiled fallback for `[limits].max_memories_per_day` / `AI_MEMORY_MAX_MEMORIES_PER_DAY`) |
@@ -1280,10 +1280,10 @@ These are written by the server; treat as read-only in queries:
 ### Transaction Safety
 
 Critical operations use `BEGIN IMMEDIATE` / `COMMIT` transactions to prevent data corruption under concurrent access:
-- **`touch()`** -- the read-modify-write cycle for access count, TTL extension, auto-promotion, and priority reinforcement is fully atomic
+- **`touch()`** -- the read-modify-write cycle for access count, `last_accessed_at` and the TTL floor extension is fully atomic (since v1.0.0 Boids item 1 it never changes tier or priority)
 - **`consolidate()`** -- the multi-step merge (create new memory, delete originals, aggregate tags) is fully atomic
 
-This prevents race conditions where two concurrent recalls could cause incorrect access counts or missed auto-promotions.
+This prevents race conditions where two concurrent recalls could cause incorrect access counts or a lost TTL extension.
 
 ### FTS Query Injection Protection
 
@@ -1685,7 +1685,7 @@ Both are cleaned up on graceful shutdown (the daemon runs `PRAGMA wal_checkpoint
 
 Maximum request body size: **2 MiB** (`HTTP_BODY_LIMIT_BYTES` in `src/lib.rs`).
 
-The HTTP daemon exposes **100 production `.route(...)` registrations / 86 unique URL paths** (canonical count via codegraph `codegraph_search kind=route limit=100` filtered to `src/lib.rs` excluding the `#[cfg(test)]`-gated test-only routes; multi-line-aware path extraction via `awk '/\.route\(/{in=1}in&&/"\/[^"]*"/{match($0,/"\/[^"]*"/);print substr($0,RSTART,RLENGTH);in=0}' src/lib.rs | sort -u`. The table below lists the high-traffic surfaces — see [`docs/API_REFERENCE.md`](API_REFERENCE.html) for the complete enumeration):
+The HTTP daemon exposes **103 production `.route(...)` registrations / 89 unique URL paths** (canonical count via codegraph `codegraph_search kind=route limit=103` filtered to `src/lib.rs` excluding the `#[cfg(test)]`-gated test-only routes; multi-line-aware path extraction via `awk '/\.route\(/{in=1}in&&/"\/[^"]*"/{match($0,/"\/[^"]*"/);print substr($0,RSTART,RLENGTH);in=0}' src/lib.rs | sort -u`. The table below lists the high-traffic surfaces — see [`docs/API_REFERENCE.md`](API_REFERENCE.html) for the complete enumeration):
 
 | Method | Path | Description |
 |--------|------|-------------|
@@ -1840,7 +1840,7 @@ Note: `last_accessed_at` and `expires_at` are omitted from the JSON when null.
 
 #### GET /recall?context=... (Recall)
 
-Fuzzy OR search with ranked results. Automatically bumps access count, extends TTL, and auto-promotes frequently accessed mid-tier memories to long-term.
+Fuzzy OR search with ranked results. A pure read (#1953): it writes nothing to `memories` and appends one `recall_observations` ledger row; the periodic fold job later bumps the access count and extends the TTL floor. Recall never promotes a memory — `memory_promote` is the only verb that raises a tier.
 
 ```bash
 curl "https://127.0.0.1:9077/api/v1/recall?context=database+migration+postgres&namespace=infra&limit=5"

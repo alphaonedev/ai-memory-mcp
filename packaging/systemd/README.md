@@ -13,6 +13,7 @@ on any systemd distro.
 |------|---------|------|
 | `ai-memory.service` | Main daemon (HTTP + MCP) | `simple` |
 | `ai-memory-sync.service` | Peer-mesh sync daemon (optional) | `simple` |
+| `ai-memory-curator.service` | Autonomous curator daemon (optional) | `simple` |
 | `ai-memory-backup.service` | One-shot snapshot via `VACUUM INTO` | `oneshot` |
 | `ai-memory-backup.timer` | Hourly backup trigger | `timer` |
 | `ai-memory-wake-hub.service` | Content-free wake plane (`User=ai-memory-hub`) | `simple` |
@@ -33,7 +34,7 @@ sudo systemd-sysusers packaging/systemd/ai-memory.sysusers.conf
 sudo install -d -o ai-memory -g ai-memory -m 0750 /var/lib/ai-memory
 sudo install -d -o ai-memory -g ai-memory -m 0750 /var/lib/ai-memory/backups
 
-# 2. Units into /etc/systemd/system (or /usr/lib/systemd/system for distro packages)
+# 2. Units into /etc/systemd/system. The .deb and .rpm packages ship no units.
 sudo install -m 0644 packaging/systemd/*.service /etc/systemd/system/
 sudo install -m 0644 packaging/systemd/*.timer   /etc/systemd/system/
 

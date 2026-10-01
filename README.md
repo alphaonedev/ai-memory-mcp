@@ -36,7 +36,7 @@
 > the United States Government do not endorse, certify, or recommend
 > ai-memory, AgenticMem, AlphaOne LLC, or any commercial product.
 
-**ai-memory is a persistent memory system for AI assistants.** It works with **any AI that supports MCP** -- Claude, ChatGPT, Grok, Llama, and more. It stores what your AI learns in a local SQLite database, ranks memories by relevance when recalling, and auto-promotes important knowledge to permanent storage. Install it once, and every AI assistant you use remembers your architecture, your preferences, your corrections -- forever.
+**ai-memory is a persistent memory system for AI assistants.** It works with **any AI that supports MCP** -- Claude, ChatGPT, Grok, Llama, and more. It stores what your AI learns in a local SQLite database, ranks memories by relevance when recalling, and lets your AI promote important knowledge to permanent storage with `memory_promote`. Install it once, and every AI assistant you use remembers your architecture, your preferences, your corrections -- forever.
 
 ---
 
@@ -219,7 +219,7 @@ The MCP, HTTP, and CLI surfaces are reactive. The curator is the part that makes
 
 **Substrate for multi-agent AI.** ai-memory is not an agent runtime and not "autonomous AI" on its own. It is the memory layer that *multi-agent* autonomous deployments need underneath them. Federation (`broadcast_store_quorum` + `spawn_catchup_loop`) handles W-of-N consistency across peers when many agents write in parallel; the curator daemon keeps the shared corpus from degrading into noise as a swarm scribbles into it; webhook subscriptions (HMAC-signed, namespace/agent-filtered, SSRF-hardened) turn the store into a message bus that triggers downstream agents on memory events; namespace hierarchy with N-level inheritance and per-namespace governance policies (write/promote/delete authority, approver type, optional N-of-M consensus) bound the swarm. Stack this under a 24/7 multi-machine agent runner with auto-generated skills, and the combined system clears the *behavioral* bar for autonomous AI. The remaining gaps (no weight-level learning, stateless reasoning kernel, human-seeded root goals) are real and not what ai-memory addresses; ai-memory provides the multi-agent memory substrate that any serious attempt at closing those gaps will need.
 
-**Zero token cost until recall.** Unlike built-in memory systems (Claude Code auto-memory, ChatGPT memory) that load your entire memory into every conversation -- burning tokens and money on every message -- ai-memory uses zero context tokens until the AI explicitly calls `memory_recall`. Only relevant memories come back, ranked by a 6-factor scoring algorithm. **TOON format** (Token-Oriented Object Notation) eliminates repeated field names; on the pinned 5-memory fixture in `src/toon.rs` the compact form is mechanically held **below 65% of JSON bytes** (`test_toon_size_invariant_5_memories_under_threshold`). The 1,600/626/336-byte figures are a single illustrative 3-memory example, not a guaranteed ratio. For Claude Code users: **disable auto-memory** (`"autoMemoryEnabled": false` in settings.json) and replace it with ai-memory to stop paying for 200+ lines of memory context on every single message.
+**No memory content in context until recall.** Unlike built-in memory systems (Claude Code auto-memory, ChatGPT memory) that load your entire memory into every conversation -- burning tokens and money on every message -- ai-memory puts no memory content into the context until the AI explicitly calls `memory_recall`. The tool schemas themselves are not free: an MCP client loads them through `tools/list` on every request, a fixed per-request cost that depends on the profile (see [Token-Budget Check](#token-budget-check-advisory-ci-check-v07-c5); `ai-memory doctor --tokens` prints the per-tool cost). Only relevant memories come back, ranked by a 6-factor scoring algorithm. **TOON format** (Token-Oriented Object Notation) eliminates repeated field names; on the pinned 5-memory fixture in `src/toon.rs` the compact form is mechanically held **below 65% of JSON bytes** (`test_toon_size_invariant_5_memories_under_threshold`). The 1,600/626/336-byte figures are a single illustrative 3-memory example, not a guaranteed ratio. For Claude Code users: **disable auto-memory** (`"autoMemoryEnabled": false` in settings.json) and replace it with ai-memory to stop paying for 200+ lines of memory context on every single message.
 
 ---
 
@@ -649,7 +649,7 @@ For HTTP-only clients, start the REST API:
 
 ```bash
 ai-memory serve   # TLS only (#3705): first boot generates <key_dir>/tls/ and renews it (#3709)
-# 100 REST route registrations (86 unique URL paths) at https://127.0.0.1:9077/api/v1/
+# 103 REST route registrations (89 unique URL paths) at https://127.0.0.1:9077/api/v1/
 ```
 
 </details>
@@ -782,9 +782,8 @@ Beyond MCP, ai-memory also exposes a full HTTP REST API (103 route registrations
 - **Hybrid recall** -- FTS5 keyword + cosine similarity with adaptive blending: the semantic weight varies 0.50 (short content) → 0.15 (long content) because embeddings lose information on long text
 - **6-factor recall scoring** -- FTS relevance + priority + access frequency + confidence + tier boost + recency decay
 - **Pure recall** -- a recall writes nothing to `memories`; it appends one `recall_observations` ledger row ([#1953](https://github.com/alphaonedev/ai-memory-mcp/issues/1953)). Safe on a read replica, idempotent under retry.
-- **Auto-promotion** -- memories accessed 5+ times promote from mid to long, applied by the fold job
 - **TTL extension** -- a recorded access raises expiry (short +1h, mid +1d; floor-only, never earlier), applied by the fold job
-- **Priority reinforcement** -- +1 every 10 accesses (max 10), applied by the fold job
+- **Explicit promotion only** -- recall never changes a memory's tier or priority; `memory_promote` is the only verb that raises a tier and `update` changes priority (Boids item 1, vote `4d3ea1c5`)
 - **Contradiction detection** -- warns when storing memories that conflict with existing ones
 - **Deduplication** -- upsert on title+namespace, tier never downgrades
 - **Confidence scoring** -- 0.0-1.0 certainty factored into ranking
@@ -966,7 +965,7 @@ Start the HTTP server for REST API access. Any AI, script, or automation that ca
 
 ```bash
 ai-memory serve   # TLS only (#3705): first boot generates <key_dir>/tls/ and renews it (#3709)
-# 100 REST route registrations (86 unique URL paths) at https://127.0.0.1:9077/api/v1/
+# 103 REST route registrations (89 unique URL paths) at https://127.0.0.1:9077/api/v1/
 ```
 
 ### CLI (Universal -- for scripting and direct use)
@@ -1285,11 +1284,10 @@ score = (fts_relevance * -1)
 
 ### Automatic Behaviors
 
-Recall records the access in the append-only `recall_observations` ledger and returns without touching `memories`. The three ladders below are applied by the periodic **fold job** (`db::fold_recall_accesses`, `AI_MEMORY_ACCESS_FOLD_INTERVAL_SECS`, default 60 s, plus a fold at the top of every GC tick) — so on an MCP-stdio-only deployment with no `ai-memory serve` daemon they do not fire until a gc chokepoint.
+Recall records the access in the append-only `recall_observations` ledger and returns without touching `memories`. The access bookkeeping below is applied by the periodic **fold job** (`db::fold_recall_accesses`, `AI_MEMORY_ACCESS_FOLD_INTERVAL_SECS`, default 60 s, plus a fold at the top of every GC tick) — so on an MCP-stdio-only deployment with no `ai-memory serve` daemon it does not run until a gc chokepoint. The fold bumps `access_count` (capped at 1,000,000), `last_accessed_at` and the TTL floor only.
 
 - **TTL extension on a recorded access**: short memories get +1 hour, mid memories get +1 day (floor-only — an access can extend a memory's life, never shorten it)
-- **Auto-promotion**: mid-tier memories accessed 5+ times promote to long (expiry cleared)
-- **Priority reinforcement**: every 10 accesses, priority increases by 1 (capped at 10)
+- **No access-driven promotion**: recall access extends TTL only; tier promotion and priority changes are explicit operations (`memory_promote`, `update`). v1.0.0 Boids item 1 (vote `4d3ea1c5`) removed the former mid→long auto-promotion and the priority ladder on both backends
 - **Contradiction detection**: warns when a new memory conflicts with an existing one in the same namespace
 - **Deduplication**: upsert on title+namespace; tier never downgrades on update
 
