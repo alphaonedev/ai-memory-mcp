@@ -394,7 +394,7 @@ table tr:last-child td{border-bottom:none}
           <rect x="0" y="0" width="350" height="60" rx="8" fill="rgba(34,197,94,0.10)" stroke="#22c55e" stroke-width="1.4" />
           <text x="12" y="22" class="sub-label" font-weight="700" fill="#16a34a">Quorum-write contract — SHIPS TODAY</text>
           <text x="12" y="38" class="sub-label">--quorum-writes N --quorum-peers a,b,c</text>
-          <text x="12" y="52" class="sub-label">503 quorum_not_met on timeout · ADR-0001 realised</text>
+          <text x="12" y="52" class="sub-label">202 quorum_met:false on shortfall · ADR-0001 realised</text>
         </g>
 
         <!-- mTLS annotation -->
@@ -429,7 +429,7 @@ table tr:last-child td{border-bottom:none}
     <p>The big T4-relevant capability that's already wired:</p>
     <ul>
       <li><code>src/daemon_runtime.rs</code> (<code>ServeArgs</code>) — <code>--quorum-writes N</code> enables W-of-N replication; <code>--quorum-peers a,b,c</code> lists targets.</li>
-      <li><code>src/handlers/</code> — write path calls <code>broadcast_store_quorum</code> then <code>finalise_quorum</code>. Local commit + (W-1) peer acks within <code>--quorum-timeout-ms</code> (default 2000) → <code>200 OK</code> with the achieved ack count returned in the response. Falling short → <code>503 quorum_not_met</code>.</li>
+      <li><code>src/handlers/</code> — write path calls <code>broadcast_store_quorum</code> then <code>finalise_quorum</code>. Local commit + (W-1) peer acks within <code>--quorum-timeout-ms</code> (default 2000) → <code>200 OK</code> with the achieved ack count returned in the response. Falling short after the local commit → <code>202 Accepted</code> with <code>quorum_met:false</code>, <code>acks</code>, <code>needed</code>, <code>reason</code> and <code>durability:"local"</code> (locally committed, under-replicated, not rejected).</li>
       <li>Same wiring on <code>link</code>, <code>consolidate</code>, <code>pending_decision</code>, <code>namespace_meta</code>, and the <code>clear_namespace_meta</code> path.</li>
       <li>mTLS for the outbound side via <code>--quorum-client-cert</code> / <code>--quorum-client-key</code> / <code>--quorum-ca-cert</code>.</li>
     </ul>
@@ -480,7 +480,7 @@ table tr:last-child td{border-bottom:none}
       <tbody>
         <tr><td>Total memories per cluster</td><td>bounded by per-node HNSW RAM</td><td>pgvector → 10⁸+</td></tr>
         <tr><td>Write durability across racks</td><td><strong>W-of-N quorum</strong> (<code>--quorum-writes N</code>)</td><td>unchanged</td></tr>
-        <tr><td>Partition tolerance</td><td>quorum-bounded divergence; <code>503 quorum_not_met</code> on shortfall</td><td>unchanged</td></tr>
+        <tr><td>Partition tolerance</td><td>quorum-bounded divergence; <code>202 Accepted</code>, <code>quorum_met:false</code>, <code>durability:"local"</code> on shortfall</td><td>unchanged</td></tr>
         <tr><td>Operational primitives</td><td>per-node SQLite, replicated; backups per node</td><td>Postgres ecosystem (PITR, replicas, central monitoring)</td></tr>
         <tr><td>Vector index drift</td><td>each node embeds &amp; indexes independently</td><td>shared pgvector</td></tr>
         <tr><td>mTLS</td><td>enforced via fingerprint allowlist</td><td>unchanged</td></tr>
