@@ -528,7 +528,11 @@ impl<'a> ConsolidationPass<'a> {
     /// (persist failed atomically) or was fully reversed (Stage-6 rollback
     /// restored every original). Best-effort by design: a leftover pending
     /// row is an honest over-retention an operator can see, never a loss.
-    async fn discard_pending_rollback_entry(&self, entry_id: &str) {
+    ///
+    /// Returns `true` only when the row was actually removed, so a caller can
+    /// keep `rollback_entries_written` equal to the entries that still exist.
+    #[must_use = "the caller must keep rollback_entries_written equal to the rows that still exist"]
+    async fn discard_pending_rollback_entry(&self, entry_id: &str) -> bool {
         if let Err(e) = self.store.delete(&self.ctx, entry_id).await {
             tracing::warn!(
                 target: COMPACTION_TRACE_TARGET,
@@ -537,7 +541,9 @@ impl<'a> ConsolidationPass<'a> {
                 error = %e,
                 "#3692: pending rollback row could not be removed (harmless over-retention)"
             );
+            return false;
         }
+        true
     }
 
     /// Verify the consolidated summary is readable from the store.
@@ -674,7 +680,12 @@ impl<'a> ConsolidationPass<'a> {
                 Err(e) => {
                     // The merge failed atomically: nothing was deleted, the
                     // pending row has nothing to reverse.
-                    self.discard_pending_rollback_entry(&entry_id).await;
+                    // #4350 — the entry is no longer written once discarded;
+                    // a failed discard leaves it, so the counter stays honest.
+                    if self.discard_pending_rollback_entry(&entry_id).await {
+                        report.rollback_entries_written =
+                            report.rollback_entries_written.saturating_sub(1);
+                    }
                     report
                         .errors
                         .push(format!("{}: persist failed: {e}", self.name()));
@@ -694,9 +705,13 @@ impl<'a> ConsolidationPass<'a> {
                     Ok(restored) => {
                         // Every original is back and reachable: the pending
                         // write-ahead row has nothing left to reverse.
-                        self.discard_pending_rollback_entry(&entry_id).await;
-                        report.rollback_entries_written =
-                            report.rollback_entries_written.saturating_sub(1);
+                        // #4350 — the counter follows the row: decrement only
+                        // when the discard really removed it (a failed delete
+                        // leaves the row, so it is still "written").
+                        if self.discard_pending_rollback_entry(&entry_id).await {
+                            report.rollback_entries_written =
+                                report.rollback_entries_written.saturating_sub(1);
+                        }
                         if restored > 0 {
                             report.rolled_back += 1;
                         }
@@ -1609,9 +1624,9 @@ mod tests {
                     2,
                     "refused consolidation must not commit a summary"
                 );
-                if !edit {
-                    assert_eq!(report.rollback_entries_written, 0);
-                }
+                // #4350 — a refused consolidation (empty summary OR a stale
+                // source) leaves no rollback entry, so none may be reported.
+                assert_eq!(report.rollback_entries_written, 0);
                 for (index, source) in candidates.iter().enumerate() {
                     let row = store.get(&ctx, &source.id).await.unwrap();
                     let expected = if edit && index == 0 {
@@ -1694,6 +1709,280 @@ mod tests {
                     .unwrap();
                 assert_eq!(count, 2);
             }
+        }
+
+        // ---- #4350 failed-discard branch, both arms, both backends ----
+
+        /// Store wrapper that injects the three faults the counter depends on:
+        /// the version-checked persist, the summary read-back (`verify`), and
+        /// the delete of the pending write-ahead row (every row stored
+        /// through the wrapper while the pass runs IS a write-ahead row).
+        struct FaultStore<'a> {
+            inner: &'a dyn MemoryStore,
+            fail_persist: bool,
+            fail_verify: bool,
+            fail_discard: bool,
+            summary_id: Mutex<Option<String>>,
+            stored: Mutex<Vec<String>>,
+        }
+
+        fn injected(what: &str) -> StoreError {
+            StoreError::Backend(crate::store::BoxBackendError::new(format!(
+                "injected {what} failure (#4350)"
+            )))
+        }
+
+        #[async_trait::async_trait]
+        impl MemoryStore for FaultStore<'_> {
+            fn capabilities(&self) -> crate::store::Capabilities {
+                self.inner.capabilities()
+            }
+            async fn store(
+                &self,
+                ctx: &CallerContext,
+                memory: &Memory,
+            ) -> crate::store::StoreResult<String> {
+                let id = self.inner.store(ctx, memory).await?;
+                self.stored.lock().unwrap().push(id.clone());
+                Ok(id)
+            }
+            async fn get(
+                &self,
+                ctx: &CallerContext,
+                id: &str,
+            ) -> crate::store::StoreResult<Memory> {
+                if self.fail_verify && self.summary_id.lock().unwrap().as_deref() == Some(id) {
+                    return Err(StoreError::NotFound { id: id.to_string() });
+                }
+                self.inner.get(ctx, id).await
+            }
+            async fn update(
+                &self,
+                ctx: &CallerContext,
+                id: &str,
+                patch: crate::store::UpdatePatch,
+            ) -> crate::store::StoreResult<()> {
+                self.inner.update(ctx, id, patch).await
+            }
+            async fn delete(&self, ctx: &CallerContext, id: &str) -> crate::store::StoreResult<()> {
+                if self.fail_discard && self.stored.lock().unwrap().iter().any(|s| s == id) {
+                    return Err(injected("discard"));
+                }
+                self.inner.delete(ctx, id).await
+            }
+            async fn list(
+                &self,
+                ctx: &CallerContext,
+                filter: &crate::store::Filter,
+            ) -> crate::store::StoreResult<Vec<Memory>> {
+                self.inner.list(ctx, filter).await
+            }
+            async fn search(
+                &self,
+                ctx: &CallerContext,
+                query: &str,
+                filter: &crate::store::Filter,
+            ) -> crate::store::StoreResult<Vec<Memory>> {
+                self.inner.search(ctx, query, filter).await
+            }
+            async fn verify(
+                &self,
+                ctx: &CallerContext,
+                id: &str,
+            ) -> crate::store::StoreResult<crate::store::VerifyReport> {
+                self.inner.verify(ctx, id).await
+            }
+            async fn link(
+                &self,
+                ctx: &CallerContext,
+                link: &crate::models::MemoryLink,
+            ) -> crate::store::StoreResult<()> {
+                self.inner.link(ctx, link).await
+            }
+            async fn list_links(
+                &self,
+                namespace: Option<&str>,
+            ) -> crate::store::StoreResult<Vec<crate::models::MemoryLink>> {
+                self.inner.list_links(namespace).await
+            }
+            async fn register_agent(
+                &self,
+                ctx: &CallerContext,
+                agent: &crate::models::AgentRegistration,
+            ) -> crate::store::StoreResult<()> {
+                self.inner.register_agent(ctx, agent).await
+            }
+            async fn get_embedding_with_space(
+                &self,
+                ctx: &CallerContext,
+                id: &str,
+            ) -> crate::store::StoreResult<Option<(Vec<f32>, Option<String>)>> {
+                self.inner.get_embedding_with_space(ctx, id).await
+            }
+            async fn consolidate(
+                &self,
+                ctx: &CallerContext,
+                ids: &[String],
+                title: &str,
+                summary: &str,
+                namespace: &str,
+                tier: &Tier,
+                source: &str,
+                consolidator_agent_id: &str,
+            ) -> crate::store::StoreResult<String> {
+                self.inner
+                    .consolidate(
+                        ctx,
+                        ids,
+                        title,
+                        summary,
+                        namespace,
+                        tier,
+                        source,
+                        consolidator_agent_id,
+                    )
+                    .await
+            }
+            async fn consolidate_with_expected_versions(
+                &self,
+                ctx: &CallerContext,
+                ids: &[String],
+                title: &str,
+                summary: &str,
+                namespace: &str,
+                tier: &Tier,
+                source: &str,
+                consolidator_agent_id: &str,
+                expected_versions: Option<&[i64]>,
+            ) -> crate::store::StoreResult<String> {
+                if self.fail_persist {
+                    return Err(injected("persist"));
+                }
+                let id = self
+                    .inner
+                    .consolidate_with_expected_versions(
+                        ctx,
+                        ids,
+                        title,
+                        summary,
+                        namespace,
+                        tier,
+                        source,
+                        consolidator_agent_id,
+                        expected_versions,
+                    )
+                    .await?;
+                *self.summary_id.lock().unwrap() = Some(id.clone());
+                Ok(id)
+            }
+            async fn restore_or_conflict(
+                &self,
+                ctx: &CallerContext,
+                memory: &Memory,
+            ) -> crate::store::StoreResult<String> {
+                self.inner.restore_or_conflict(ctx, memory).await
+            }
+        }
+
+        /// Run one pass over a fresh pair under the given faults. Returns
+        /// `(rollback_entries_written, write-ahead rows still present, errors)`.
+        async fn fault_run(
+            store: &dyn MemoryStore,
+            fail_persist: bool,
+            fail_verify: bool,
+            fail_discard: bool,
+        ) -> (usize, usize, Vec<String>) {
+            let ctx = CallerContext::for_admin(CONSOLIDATOR_AGENT_ID);
+            let namespace = uuid::Uuid::new_v4().to_string();
+            let mut candidates = Vec::new();
+            for title in ["first", "second"] {
+                let memory = make_memory_full(
+                    &uuid::Uuid::new_v4().to_string(),
+                    &namespace,
+                    title,
+                    "kubernetes rolling canary deploy strategy notes",
+                    Tier::Mid,
+                    5,
+                );
+                store.store(&ctx, &memory).await.unwrap();
+                store
+                    .update_embedding(
+                        &ctx,
+                        &memory.id,
+                        Some(&vec![1.0; 384]),
+                        &crate::embeddings::embedding_space_fingerprint("test-space"),
+                    )
+                    .await
+                    .unwrap();
+                candidates.push(store.get(&ctx, &memory.id).await.unwrap());
+            }
+            let fault = FaultStore {
+                inner: store,
+                fail_persist,
+                fail_verify,
+                fail_discard,
+                summary_id: Mutex::new(None),
+                stored: Mutex::new(Vec::new()),
+            };
+            let llm = StubLlm::new("synthesized summary");
+            let report = ConsolidationPass::new(&fault, &llm, false)
+                .run(&candidates)
+                .await
+                .unwrap();
+            let stored = fault.stored.lock().unwrap().clone();
+            let mut present = 0;
+            for id in &stored {
+                if store.get(&ctx, id).await.is_ok() {
+                    present += 1;
+                }
+            }
+            (report.rollback_entries_written, present, report.errors)
+        }
+
+        async fn issue_4350_discard_matrix(store: &dyn MemoryStore) {
+            let _dag = crate::test_support::no_lineage_dag_guard();
+            // (persist fails, verify fails, discard fails, expected err text)
+            let cases = [
+                (true, false, false, "persist failed"), // A
+                (true, false, true, "persist failed"),  // B
+                (false, true, false, "verify failed"),  // C
+                (false, true, true, "verify failed"),   // D
+            ];
+            for (persist, verify, discard, needle) in cases {
+                let (counter, rows, errors) = fault_run(store, persist, verify, discard).await;
+                let label = format!("persist={persist} verify={verify} discard={discard}");
+                assert!(
+                    errors.iter().any(|e| e.contains(needle)),
+                    "{label}: {errors:?}"
+                );
+                // The counter must equal the write-ahead rows that still exist.
+                assert_eq!(counter, rows, "{label}: counter vs surviving rows");
+                assert_eq!(
+                    rows,
+                    usize::from(discard),
+                    "{label}: a failed discard leaves the row"
+                );
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn issue_4350_sqlite_failed_discard_keeps_counter_honest() {
+            let (store, _dir) = open_db();
+            issue_4350_discard_matrix(&store).await;
+        }
+
+        /// Skips only when the URL is unset; a SET but unreachable URL FAILS
+        /// (the connect `unwrap`), never silently passes.
+        #[cfg(feature = "sal-postgres")]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn issue_4350_postgres_failed_discard_keeps_counter_honest() {
+            let Ok(url) = std::env::var("AI_MEMORY_TEST_POSTGRES_URL") else {
+                return;
+            };
+            let store = crate::store::postgres::PostgresStore::connect(&url)
+                .await
+                .unwrap();
+            issue_4350_discard_matrix(&store).await;
         }
 
         #[tokio::test]

@@ -7333,6 +7333,51 @@ mod tests {
         }
     }
 
+    /// #4351 (#4045 vote item 1) — the trait default of
+    /// `consolidate_with_expected_versions` FAILS CLOSED: a store that does
+    /// not override it must refuse a version-checked merge rather than drop
+    /// the versions and forward to the unchecked `consolidate`. `None`
+    /// keeps the ordinary contract (it reaches `consolidate`, whose own
+    /// default refuses with the Consolidate capability, proving the forward).
+    #[test]
+    fn issue_4351_default_version_checked_consolidate_fails_closed() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let store = DefaultImplProbeStore;
+        let ctx = CallerContext::for_agent("test-agent");
+        let ids = vec!["a".to_string(), "b".to_string()];
+        let call = |versions: Option<&[i64]>| {
+            rt.block_on(store.consolidate_with_expected_versions(
+                &ctx,
+                &ids,
+                "t",
+                "s",
+                "ns",
+                &Tier::Mid,
+                "src",
+                "agent",
+                versions,
+            ))
+        };
+        match call(Some(&[1, 1])) {
+            Err(StoreError::UnsupportedCapability { capability }) => {
+                assert_eq!(capability, "version-checked consolidation");
+            }
+            other => panic!("Some(versions) must fail closed, got: {other:?}"),
+        }
+        match call(None) {
+            Err(StoreError::UnsupportedCapability { capability }) => {
+                assert_eq!(
+                    capability,
+                    crate::revisions::RecordKind::Consolidate.as_str(),
+                    "None must forward to the unchecked consolidate"
+                );
+            }
+            other => panic!("None must reach consolidate, got: {other:?}"),
+        }
+    }
+
     /// #2044 (v1.0.0, #2032-A) — pins the trait-default contract for the
     /// per-agent api-key accessors so an adapter that does NOT override them
     /// behaves as "no per-agent keys enrolled + provisioning unsupported":
