@@ -253,7 +253,7 @@ cargo install --path .
 
 ## Pre-built Binaries
 
-Pre-built binaries are available on the [Releases](https://github.com/alphaonedev/ai-memory-mcp/releases) page for four targets: Linux (`x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`) and macOS (`x86_64-apple-darwin`, `aarch64-apple-darwin`). Releases are created on git tags. Note the pre-built binaries are default-feature builds — the `migrate` / `schema-init` subcommands and the postgres `--store-url` daemon path require a `--features sal,sal-postgres` source build.
+Pre-built binaries are available on the [Releases](https://github.com/alphaonedev/ai-memory-mcp/releases) page for four targets: Linux (`x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`) and macOS (`x86_64-apple-darwin`, `aarch64-apple-darwin`). Releases are created on git tags. The pre-built binaries are built with `--features sal` (`.github/workflows/release.yml:330`), so the `migrate` / `schema-init` subcommands — gated on `sal` alone (`src/daemon_runtime.rs::Command::{Migrate,SchemaInit}`, declared at `src/daemon_runtime.rs:538` and `src/daemon_runtime.rs:549`) — are present in the shipped binary. The postgres `--store-url` daemon path is NOT: it requires a `--features sal,sal-postgres` source build.
 
 The easiest way to install is via the install scripts:
 
