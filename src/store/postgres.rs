@@ -32002,6 +32002,13 @@ impl MemoryStore for PostgresStore {
         tier: Option<&Tier>,
         why_trace: Option<&str>,
     ) -> StoreResult<String> {
+        // #4338 — refuse an invalid recipient before any quota charge, write
+        // or wake; the shared validator never echoes the value.
+        crate::validate::validate_notify_target(target_agent).map_err(|e| {
+            StoreError::InvalidInput {
+                detail: e.to_string(),
+            }
+        })?;
         let now = chrono::Utc::now().to_rfc3339();
         let resolved_tier = tier.cloned().unwrap_or(Tier::Short);
         let priority = priority.unwrap_or(5);
