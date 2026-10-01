@@ -157,7 +157,13 @@ archive_on_gc     = true         # archive expired memories into
                                  # `ai-memory doctor` reports the effective
                                  # value and its source.
 archive_max_days  = 90
-max_memory_mb     = 4096
+max_memory_mb     = 4096        # PARSED BUT NOT ENFORCED (FBL-13): caps
+                                # neither memory nor storage, and is not
+                                # an auto-tier-selection input on any live
+                                # path. Setting it emits a one-shot WARN.
+                                # Use [limits].max_storage_bytes for a
+                                # real per-agent storage ceiling; nothing
+                                # caps process RAM.
 db_mmap_size_bytes = 268435456  # sqlite PRAGMA mmap_size (#1579 B7).
                                 # 256 MiB compiled default; 0 disables
                                 # memory-mapped I/O. Env override:
@@ -602,7 +608,8 @@ resolver's `Legacy` arm. Loading a legacy config emits a one-shot
 stderr WARN pointing operators at the migration tool. **These fields
 remain parseable at v1.0.0.**
 
-A legacy field is the lowest-precedence **fallback**, not inert: the
+**Most** legacy flat fields remain lower-precedence **fallbacks** to
+their sectioned replacements, not inert: the
 sectioned value wins where it is set, and the flat field still decides
 any key the sections leave unset. For `archive_on_gc` that difference
 governs whether TTL expiry is reversible, so [#3385](https://github.com/alphaonedev/ai-memory-mcp/issues/3385)
@@ -614,6 +621,17 @@ the effective `archive_on_gc` value alongside its `archive_on_gc_source`
 attribute in `src/config.rs` still says so), but that hard removal
 has not yet shipped — migrate off them with `ai-memory config
 migrate` rather than relying on the stale target.
+
+`max_memory_mb` is the **exception** to that fallback rule. Both its
+flat and its `[storage]` form are parsed and carried for compatibility
+but enforce **no memory or storage limit** and emit a warning: the
+resolver carries the value and fires a one-shot WARN on `target:
+config.max_memory_mb` whenever it is set (`src/config.rs:213`, fired
+from `src/config.rs:10109`), and the deprecated-key ledger records the
+same exception (`src/config/deprecated_keys.rs:103`). Use
+`[limits].max_storage_bytes` / `AI_MEMORY_MAX_STORAGE_BYTES` for a
+per-agent storage quota; it is **not** a process RAM limit. Nothing
+caps process RAM at v1.0.0.
 
 To migrate in place:
 
