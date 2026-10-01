@@ -230,6 +230,25 @@ namespace without starving the same agent's writes elsewhere.
 Pre-v50-style aggregate accounting lives on the `_global` sentinel
 row.
 
+### Per-sender notify aggregate (`_notify`, #4359)
+
+A notify is charged to the sender in the RECIPIENT's inbox namespace
+(`_inbox/<target>`, #3358), so that row alone bounds notifies per
+`(sender, recipient)`: a sender addressing N distinct recipients opens N
+rows with N daily allotments. Every notify (`memory_notify`,
+`POST /api/v1/notify`, `MemoryStore::notify`, both backends) is therefore
+ALSO counted against one per-sender aggregate row,
+`(agent_id, "_notify")`, in the same `agent_quotas` table (no
+migration). It is count-only (storage bytes stay on the inbox row),
+carries the same `AI_MEMORY_MAX_MEMORIES_PER_DAY` ceiling (no new
+knob; raise it for a legitimate high-fan-out sender), and refuses with the
+usual `QUOTA_EXCEEDED` naming `namespace _notify`. It is excluded from the
+namespace-omitted aggregate rollup (so a notify is not reported twice) and
+is visible through the per-namespace form
+(`memory_quota_status {agent_id, namespace: "_notify"}`) and the
+unfiltered list. Federation receive (#4354) and CLI one-shot writes (#1621)
+are not charged by this row.
+
 ## Anti-pattern examples
 
 - **Anti-pattern A: "Quota as the only fence."** The K8 substrate is
