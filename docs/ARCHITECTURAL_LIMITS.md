@@ -105,17 +105,17 @@ the *access path* off the daemon. A direct-to-Postgres agent wire protocol is
 not implemented and is not planned for v1.0.0. See
 [Backend parity](../README.md#backend-parity).
 
-### 6. FTS5 does not port — **Structural**
+### 6. FTS5 does not port — **Structural** (resolved per backend at v1.0.0)
 
-Every keyword-search query is SQLite-specific. Moving to Postgres means
-rewriting against `tsvector`; Qdrant uses its own full-text filter model;
-Chroma has no FTS at all.
+FTS5 itself is SQLite-only, so the keyword SQL differs per backend.
 
-**Impact:** the keyword recall path is not portable today.
-**v0.7 SAL:** `MemoryStore::keyword_search` is trait-level; each backend
-implements it natively. Chroma's missing FTS is handled by the
-`Capabilities::FULLTEXT` bit and a Rust-side fallback in the core
-layer.
+**v1.0.0 status:** SQLite implements keyword retrieval with FTS5. PostgreSQL
+implements it with its own full-text search over the stored `tsv` column
+(schema v57) through `MemoryStore::search` (`src/store/mod.rs`; the PostgreSQL
+override in `src/store/postgres.rs` delegates to `search_with_source_uri`). The
+storage-specific SQL differs, but keyword retrieval is implemented on both
+shipped backends. Chroma is not a shipped adapter, so this release makes no
+Chroma fallback guarantee.
 
 ### 7. No CDC / audit stream — **Structural**
 
