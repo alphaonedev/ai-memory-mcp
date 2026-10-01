@@ -613,6 +613,22 @@ local namespace cap, even if the sending peer's local cap is higher.
 1. **Generate peer certs.** Use your CA of choice; export the
    SHA-256 fingerprint via
    `openssl x509 -in peer.crt -noout -fingerprint -sha256`.
+   **Key format ([#3635](https://github.com/alphaonedev/ai-memory-mcp/issues/3635)).**
+   The loader (`src/tls.rs::rustls_pki_pem_parse_private_key`) accepts a
+   PKCS#8, PKCS#1 (RSA) or SEC1 PEM, but rustls signs only with an EC key on a
+   NAMED curve. macOS's stock `openssl` is LibreSSL; its
+   `openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1` writes
+   the curve with explicit parameters, and the daemon refuses that key at
+   boot (`failed to build pinning rustls ClientConfig with client cert: …
+   failed to parse private key as RSA, ECDSA, or EdDSA`). Re-encoding with
+   `openssl pkcs8 -topk8` does not help — the explicit parameters survive.
+   Generate with OpenSSL 3 and force the named-curve encoding:
+   ```bash
+   openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+       -pkeyopt ec_param_enc:named_curve -nodes \
+       -keyout peer.key -out peer.crt -days 365 -subj "/CN=peer-node-1"
+   ```
+   (a P-256 PKCS#8 key is about 241 bytes), or use an RSA or Ed25519 key.
 2. **Populate `peer-fingerprints.allow`.** One fingerprint per line.
    Inline comments (`# label`) and `:` separators tolerated.
 3. **Enroll each peer's Ed25519 signing key — REQUIRED under the
@@ -648,6 +664,12 @@ local namespace cap, even if the sending peer's local cap is higher.
    the key-exchange window the rollout escape hatch
    `AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS=1` temporarily accepts
    unenrolled peers — flip it back to unset once every peer is enrolled.
+   **Store directory must be owner-only (`0700`).** The deferred-audit
+   spool beside the database refuses to open — and audit delivery fails
+   CLOSED — when any ancestor directory is group- or world-writable without
+   the sticky bit, or owned by another user
+   (`deferred-audit spool ancestor permits untrusted rename: <dir>`). Run
+   `chmod 0700` on the store directory before first boot.
 4. **Author the peer attestation JSON and set
    `AI_MEMORY_FED_PEER_ATTESTATION`** on the receiving daemon's
    environment. Treat the file like a config blob, not a credential —
