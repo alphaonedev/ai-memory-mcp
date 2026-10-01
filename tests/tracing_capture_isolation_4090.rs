@@ -55,10 +55,10 @@ const HELPERS: &[(&str, &str)] = &[
 ];
 
 /// (file, enclosing fn, tracking): known-unguarded sites whose guard is
-/// already written but rides another landing unit. Accepted ONLY while the
-/// site is still unguarded: once the guard lands the entry is stale and the
-/// census fails (#4327), so the landing unit must remove it in the same
-/// change.
+/// already written but rides another landing unit. Accepted ONLY while no
+/// isolation guard (exact path or not) precedes the site: once any guard
+/// lands the entry is stale and the census fails (#4327), so the landing unit
+/// must remove it in the same change.
 const PENDING: &[(&str, &str, &str)] = &[(
     "src/federation/mod.rs",
     "broadcast_emits_entry_line_log_for_track_d_grep",
@@ -157,6 +157,15 @@ fn guarded(lines: &[&str], fn_line: usize, site: usize, name: &str) -> Result<()
     }
 }
 
+/// Does ANY isolation guard (whatever its path) appear between the fn
+/// declaration and the site? Used only for the stale-PENDING check; the
+/// guarded-site check itself still requires the exact path ([`guarded`]).
+fn has_any_guard(lines: &[&str], fn_line: usize, site: usize) -> bool {
+    lines[fn_line..site]
+        .iter()
+        .any(|l| !l.trim_start().starts_with("//") && l.contains(GUARD))
+}
+
 /// Check one call site of a capture helper: the enclosing fn must be
 /// guarded, or itself be a helper whose callers are (followed recursively).
 fn check_caller(
@@ -238,13 +247,14 @@ fn check_install(
         return (Some(name), 0);
     }
     if pending.iter().any(|(f, n, _)| *f == rel && *n == name) {
-        // #4327: PENDING means "guard not landed yet". A guarded test makes
-        // the entry stale; fail so it is removed rather than left to excuse a
-        // later regression that drops the guard again.
-        if guarded(lines, fn_line, i, &name).is_ok() {
+        // #4327: PENDING means "guard not landed yet". ANY guard before the
+        // site makes the entry stale, exact path or not: a wrong-path guard
+        // must not hide behind the entry, and once the entry is removed the
+        // exact-path check below reports the wrong path.
+        if has_any_guard(lines, fn_line, i) {
             failures.push(format!(
-                "{rel}:{}: stale PENDING entry: `{name}` is now guarded; \
-                 remove it from PENDING",
+                "{rel}:{}: stale PENDING entry: `{name}` now has an isolation \
+                 guard; remove it from PENDING",
                 i + 1
             ));
         }
@@ -396,5 +406,50 @@ fn pending_entry_fails_once_its_test_is_guarded_4327() {
     assert!(
         failures.is_empty(),
         "an unguarded PENDING test must stay accepted; got: {failures:?}"
+    );
+}
+
+/// #4327 review follow-up: a PENDING site that gains a guard with the WRONG
+/// exact path (copy-pasted from another test) is still no longer "guard not
+/// landed yet". The entry is stale either way and must fail the census; the
+/// wrong path itself is then reported by the ordinary guarded-site check once
+/// the entry is removed.
+#[test]
+fn pending_entry_fails_once_any_guard_precedes_its_site_4327() {
+    const FILE: &str = "src/synthetic_4327.rs";
+    let wrong_path_src = [
+        "#[test]",
+        "fn cap_test() {",
+        "    if crate::config::run_env_isolated_child_or_spawn(\"m::tests::other_test\") {",
+        "        return;",
+        "    }",
+        "    let _g = tracing::subscriber::set_default(sub);",
+        "}",
+    ];
+    let pending: &[(&str, &str, &str)] = &[(FILE, "cap_test", "synthetic")];
+
+    let mut failures = Vec::new();
+    let (name, g) = check_install(FILE, &wrong_path_src, 5, pending, &mut failures);
+    assert_eq!(name.as_deref(), Some("cap_test"));
+    assert_eq!(g, 0);
+    assert!(
+        failures
+            .iter()
+            .any(|f| f.contains("stale PENDING") && f.contains("cap_test")),
+        "a PENDING entry whose site has ANY guard (even a wrong-path one) must \
+         fail the census as stale; got failures: {failures:?}"
+    );
+
+    // Off the PENDING list the same site fails the exact-path check, so the
+    // wrong path is still caught after the stale entry is removed.
+    let mut failures = Vec::new();
+    let (_, g) = check_install(FILE, &wrong_path_src, 5, &[], &mut failures);
+    assert_eq!(g, 0);
+    assert!(
+        failures
+            .iter()
+            .any(|f| f.contains("does not end in `::cap_test`")),
+        "a wrong-path guard on a non-PENDING site must still fail the exact-path \
+         check; got failures: {failures:?}"
     );
 }
