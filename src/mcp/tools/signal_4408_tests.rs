@@ -131,8 +131,7 @@ fn sqlite_mcp_recipient_is_counted_in_quota_bytes_4408() {
         .expect("status")
         .current_storage_bytes;
     let (conn2, kp2) = mcp_fixture();
-    let mut p = mcp_params(&json!(null));
-    p["to_agent"] = Value::Null;
+    let p = mcp_params(&json!(null));
     crate::mcp::handle_signal_send(&conn2, &p, Some(&kp2)).expect("broadcast");
     let without = crate::quotas::get_status(&conn2, &kp2.agent_id, NS)
         .expect("status")

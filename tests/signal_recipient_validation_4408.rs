@@ -12,9 +12,6 @@
 //! unreachable.
 
 #![cfg(feature = "sal")]
-// The federation cells hold a test-only std lock that serialises process-wide env
-// mutation across awaits (same precedent as `federation_receive_coord_screen_3049`).
-#![allow(clippy::await_holding_lock)]
 
 use ai_memory::config::{FeatureTier, ResolvedScoring, ResolvedTtl};
 use ai_memory::handlers::{ApiKeyState, AppState, Db, StorageBackend};
@@ -277,6 +274,7 @@ async fn http_refusal(app: &AppState, label: &str, target: &str) -> (StatusCode,
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sqlite_store_signal_send_refuses_invalid_recipient_4408() {
+    let _env = FedEnv::plain().await;
     let dir = tempfile::tempdir().expect("dir");
     let (store, _path) = sqlite_store(&dir);
     for (label, target) in invalid_targets() {
@@ -286,6 +284,7 @@ async fn sqlite_store_signal_send_refuses_invalid_recipient_4408() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sqlite_http_signal_send_refuses_invalid_recipient_4408() {
+    let _env = FedEnv::plain().await;
     let dir = tempfile::tempdir().expect("dir");
     let (store, path) = sqlite_store(&dir);
     let app = sqlite_app(store, &path);
@@ -320,6 +319,7 @@ fn validate_signal_recipient_follows_the_agent_id_contract_4408() {
 /// The recipient is counted in the #1807 storage-only quota bytes (HTTP).
 #[tokio::test(flavor = "multi_thread")]
 async fn sqlite_http_recipient_is_counted_in_quota_bytes_4408() {
+    let _env = FedEnv::plain().await;
     let dir = tempfile::tempdir().expect("dir");
     let (store, path) = sqlite_store(&dir);
     let app = sqlite_app(store, &path);
@@ -353,6 +353,7 @@ async fn sqlite_http_recipient_is_counted_in_quota_bytes_4408() {
 /// Absent / null recipient is still a broadcast on the HTTP funnel.
 #[tokio::test(flavor = "multi_thread")]
 async fn sqlite_http_absent_recipient_is_still_a_broadcast_4408() {
+    let _env = FedEnv::plain().await;
     let dir = tempfile::tempdir().expect("dir");
     let (store, path) = sqlite_store(&dir);
     let app = sqlite_app(store, &path);
@@ -371,6 +372,7 @@ async fn sqlite_http_absent_recipient_is_still_a_broadcast_4408() {
 #[cfg(feature = "sal-postgres")]
 #[tokio::test(flavor = "multi_thread")]
 async fn pg_store_signal_send_refuses_invalid_recipient_4408() {
+    let _env = FedEnv::plain().await;
     let Some(store) = pg_store().await else {
         return;
     };
@@ -382,6 +384,7 @@ async fn pg_store_signal_send_refuses_invalid_recipient_4408() {
 #[cfg(feature = "sal-postgres")]
 #[tokio::test(flavor = "multi_thread")]
 async fn pg_http_signal_send_refuses_invalid_recipient_4408() {
+    let _env = FedEnv::plain().await;
     let Some(store) = pg_store().await else {
         return;
     };
@@ -396,6 +399,7 @@ async fn pg_http_signal_send_refuses_invalid_recipient_4408() {
 #[cfg(feature = "sal-postgres")]
 #[tokio::test(flavor = "multi_thread")]
 async fn sqlite_and_pg_refuse_identically_4408() {
+    let _env = FedEnv::plain().await;
     let Some(pg) = pg_store().await else { return };
     let dir = tempfile::tempdir().expect("dir");
     let (sq, path) = sqlite_store(&dir);
@@ -416,6 +420,7 @@ async fn sqlite_and_pg_refuse_identically_4408() {
 #[cfg(feature = "sal-postgres")]
 #[tokio::test(flavor = "multi_thread")]
 async fn valid_recipient_still_delivers_on_both_backends_4408() {
+    let _env = FedEnv::plain().await;
     let Some(pg) = pg_store().await else { return };
     let dir = tempfile::tempdir().expect("dir");
     let (sq, _path) = sqlite_store(&dir);
@@ -441,31 +446,80 @@ async fn valid_recipient_still_delivers_on_both_backends_4408() {
 
 const SKIP_LOG: &str = "federation signal skipped: invalid recipient";
 
-fn fed_env_lock() -> std::sync::MutexGuard<'static, ()> {
-    use std::sync::{Mutex as StdMutex, OnceLock};
-    static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| StdMutex::new(()))
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+/// Serialises every cell that can read or write the process environment. A
+/// `tokio` mutex so the guard may be held across `.await` (CONCURRENCY-20).
+static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// The env vars the relaxed federation posture changes.
+fn fed_env_keys() -> [&'static str; 5] {
+    [
+        ai_memory::federation::receive_auth::REQUIRE_PUSH_NAMESPACE_SCOPE_ENV,
+        ai_memory::federation::signing::REQUIRE_SIG_ENV,
+        "AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT",
+        ai_memory::federation::receive_auth::REQUIRE_SIGNAL_SIG_ENV,
+        ai_memory::federation::peer_attestation::PEER_ATTESTATION_ENV,
+    ]
 }
 
-/// Relax the orthogonal federation gates so an unsigned inbound signal reaches
-/// the recipient check (same posture as `federation_receive_coord_screen_3049`).
-fn relax_fed_gates() {
-    // SAFETY: serialised by `fed_env_lock`; no other thread reads these vars
-    // while a federation cell holds the lock.
-    unsafe {
-        std::env::set_var(
-            ai_memory::federation::receive_auth::REQUIRE_PUSH_NAMESPACE_SCOPE_ENV,
-            "0",
-        );
-        std::env::set_var(ai_memory::federation::signing::REQUIRE_SIG_ENV, "0");
-        std::env::set_var("AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT", "0");
-        std::env::set_var(
-            ai_memory::federation::receive_auth::REQUIRE_SIGNAL_SIG_ENV,
-            "0",
-        );
-        std::env::remove_var(ai_memory::federation::peer_attestation::PEER_ATTESTATION_ENV);
+/// Holds [`ENV_LOCK`] for the whole cell and, on drop (including a panic
+/// unwind), restores every var it changed to its previous value, or removes
+/// it if it was unset. The restore runs before the lock is released.
+struct FedEnv {
+    saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    _lock: tokio::sync::MutexGuard<'static, ()>,
+}
+
+impl FedEnv {
+    /// Lock only; the environment is left as found.
+    async fn plain() -> Self {
+        Self {
+            saved: Vec::new(),
+            _lock: ENV_LOCK.lock().await,
+        }
+    }
+
+    /// Lock, then relax the orthogonal federation gates so an unsigned inbound
+    /// signal reaches the recipient check (posture of
+    /// `federation_receive_coord_screen_3049`).
+    async fn relaxed() -> Self {
+        let lock = ENV_LOCK.lock().await;
+        let saved = fed_env_keys()
+            .into_iter()
+            .map(|k| (k, std::env::var_os(k)))
+            .collect();
+        let me = Self { saved, _lock: lock };
+        // SAFETY: every cell in this binary that reads or writes the process
+        // environment holds `ENV_LOCK` for its whole body (all async cells take
+        // `FedEnv::plain()` or `relaxed()`), so no other test thread touches the
+        // environment while these writes run; `Drop` restores the prior values.
+        unsafe {
+            std::env::set_var(
+                ai_memory::federation::receive_auth::REQUIRE_PUSH_NAMESPACE_SCOPE_ENV,
+                "0",
+            );
+            std::env::set_var(ai_memory::federation::signing::REQUIRE_SIG_ENV, "0");
+            std::env::set_var("AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT", "0");
+            std::env::set_var(
+                ai_memory::federation::receive_auth::REQUIRE_SIGNAL_SIG_ENV,
+                "0",
+            );
+            std::env::remove_var(ai_memory::federation::peer_attestation::PEER_ATTESTATION_ENV);
+        }
+        me
+    }
+}
+
+impl Drop for FedEnv {
+    fn drop(&mut self) {
+        for (k, v) in self.saved.drain(..) {
+            // SAFETY: still holding `ENV_LOCK` (field drops after this body).
+            unsafe {
+                match v {
+                    Some(val) => std::env::set_var(k, val),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
     }
 }
 
@@ -575,8 +629,7 @@ fn assert_fed_skip(label: &str, o: &FedOutcome) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sqlite_federated_invalid_recipient_is_skipped_per_signal_4408() {
-    let _g = fed_env_lock();
-    relax_fed_gates();
+    let _env = FedEnv::relaxed().await;
     let dir = tempfile::tempdir().expect("dir");
     let (store, path) = sqlite_store(&dir);
     let app = sqlite_app(store, &path);
@@ -588,11 +641,10 @@ async fn sqlite_federated_invalid_recipient_is_skipped_per_signal_4408() {
 #[cfg(feature = "sal-postgres")]
 #[tokio::test(flavor = "multi_thread")]
 async fn pg_federated_invalid_recipient_is_skipped_per_signal_4408() {
-    let _g = fed_env_lock();
+    let _env = FedEnv::relaxed().await;
     let Some(store) = pg_store().await else {
         return;
     };
-    relax_fed_gates();
     let app = pg_app(store);
     for (label, bad) in fed_invalid_targets() {
         assert_fed_skip(label, &fed_outcome(&app, label, &bad).await);
@@ -602,9 +654,8 @@ async fn pg_federated_invalid_recipient_is_skipped_per_signal_4408() {
 #[cfg(feature = "sal-postgres")]
 #[tokio::test(flavor = "multi_thread")]
 async fn sqlite_and_pg_federated_receive_agree_4408() {
-    let _g = fed_env_lock();
+    let _env = FedEnv::relaxed().await;
     let Some(pg) = pg_store().await else { return };
-    relax_fed_gates();
     let dir = tempfile::tempdir().expect("dir");
     let (sq, path) = sqlite_store(&dir);
     let sq_app = sqlite_app(sq, &path);
@@ -675,8 +726,7 @@ async fn assert_skip_log_is_value_free(app: &AppState, backend: &str) {
 
 #[tokio::test(flavor = "current_thread")]
 async fn sqlite_federated_skip_log_is_value_free_4408() {
-    let _g = fed_env_lock();
-    relax_fed_gates();
+    let _env = FedEnv::relaxed().await;
     let dir = tempfile::tempdir().expect("dir");
     let (store, path) = sqlite_store(&dir);
     let app = sqlite_app(store, &path);
@@ -686,11 +736,10 @@ async fn sqlite_federated_skip_log_is_value_free_4408() {
 #[cfg(feature = "sal-postgres")]
 #[tokio::test(flavor = "current_thread")]
 async fn pg_federated_skip_log_is_value_free_4408() {
-    let _g = fed_env_lock();
+    let _env = FedEnv::relaxed().await;
     let Some(store) = pg_store().await else {
         return;
     };
-    relax_fed_gates();
     let app = pg_app(store);
     assert_skip_log_is_value_free(&app, "pg").await;
 }
