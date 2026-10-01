@@ -152,6 +152,7 @@ fn existing_require_approval_above_depth_survives_set_standard() {
     // The free-function lookup that the live reflection-gate uses must
     // also resolve to the same value.
     let resolved = db::resolve_require_approval_above_depth(&conn, "phase-e-2")
+        .expect("#4043: governance policy read")
         .expect("resolver returns Some after merge");
     assert_eq!(
         resolved, 1,
@@ -185,6 +186,7 @@ fn incoming_require_approval_above_depth_lands_on_standard() {
         "incoming require_approval_above_depth must land; got governance={gov}"
     );
     let resolved = db::resolve_require_approval_above_depth(&conn, "phase-e-2-incoming")
+        .expect("#4043: governance policy read")
         .expect("resolver returns Some after incoming set");
     assert_eq!(resolved, 2);
 }
