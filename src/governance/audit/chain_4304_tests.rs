@@ -269,3 +269,112 @@ fn a_truncated_file_keeps_the_break_visible_4304() {
         "row c names the removed row b, so the gap stays visible"
     );
 }
+
+/// f2r: a lock held by someone else (here: another handle with LOCK_EX that
+/// is never released) costs an append at most the budget; the append still
+/// goes ahead, chains correctly, and the lock outage is counted.
+#[test]
+fn a_held_lock_costs_at_most_the_budget_and_is_counted_4304() {
+    let _g = lock();
+    let tmp = TempDir::new().unwrap();
+    let holder = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(tmp.path().join(FORENSIC_LOCK_FILE))
+        .unwrap();
+    holder.lock().unwrap();
+    let before = crate::metrics::forensic_lock_unavailable_count();
+    let mut w = writer_for(tmp.path());
+    let t0 = std::time::Instant::now();
+    w.append(pending("ai:row-a")).expect("append");
+    let took = t0.elapsed();
+    assert!(
+        took >= FORENSIC_LOCK_BUDGET,
+        "it waited for the holder first ({took:?})"
+    );
+    assert!(
+        took < FORENSIC_LOCK_BUDGET * 3,
+        "the wait is bounded by the budget ({took:?})"
+    );
+    assert!(crate::metrics::forensic_lock_unavailable_count() > before);
+    assert_eq!(rows(tmp.path()).len(), 1);
+    holder.unlock().unwrap();
+}
+
+/// A lock released within the budget is taken: no outage is counted.
+#[test]
+fn a_briefly_held_lock_is_waited_for_4304() {
+    let _g = lock();
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join(FORENSIC_LOCK_FILE);
+    let holder = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    holder.lock().unwrap();
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        holder.unlock().unwrap();
+    });
+    let got = DirLock::acquire_within(tmp.path(), std::time::Duration::from_secs(5));
+    release.join().unwrap();
+    assert!(got.is_some(), "the lock was free again within the budget");
+}
+
+/// The lock file is created owner-only.
+#[cfg(unix)]
+#[test]
+fn the_lock_file_is_created_owner_only_4304() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let _g = lock();
+    let tmp = TempDir::new().unwrap();
+    let mut w = writer_for(tmp.path());
+    w.append(pending("ai:row-a")).expect("append");
+    let mode = std::fs::metadata(tmp.path().join(FORENSIC_LOCK_FILE))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o600, "mode {mode:o}");
+}
+
+/// A symlink planted as the lock file is never followed: the lock is
+/// unavailable (counted), the link target is untouched, the row still lands.
+#[cfg(unix)]
+#[test]
+fn a_planted_symlink_lock_file_is_not_followed_4304() {
+    let _g = lock();
+    let tmp = TempDir::new().unwrap();
+    let target = tmp.path().join("elsewhere");
+    std::os::unix::fs::symlink(&target, tmp.path().join(FORENSIC_LOCK_FILE)).unwrap();
+    let before = crate::metrics::forensic_lock_unavailable_count();
+    let mut w = writer_for(tmp.path());
+    w.append(pending("ai:row-a")).expect("append");
+    assert!(!target.exists(), "the link target was not created");
+    assert!(crate::metrics::forensic_lock_unavailable_count() > before);
+    assert_eq!(rows(tmp.path()).len(), 1);
+}
+
+/// A FIFO planted as the lock file neither hangs the append nor is used.
+#[cfg(unix)]
+#[test]
+fn a_planted_fifo_lock_file_does_not_hang_4304() {
+    let _g = lock();
+    let tmp = TempDir::new().unwrap();
+    let fifo = std::ffi::CString::new(
+        tmp.path()
+            .join(FORENSIC_LOCK_FILE)
+            .to_str()
+            .expect("utf-8 path"),
+    )
+    .unwrap();
+    // SAFETY: a valid NUL-terminated path; mkfifo only creates a node.
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+    let before = crate::metrics::forensic_lock_unavailable_count();
+    let mut w = writer_for(tmp.path());
+    w.append(pending("ai:row-a")).expect("append");
+    assert!(crate::metrics::forensic_lock_unavailable_count() > before);
+    assert_eq!(rows(tmp.path()).len(), 1);
+}

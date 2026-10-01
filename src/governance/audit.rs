@@ -1574,17 +1574,40 @@ fn chain_writer() -> &'static Mutex<Option<ChainWriter>> {
 /// The exclusive lock on [`FORENSIC_LOCK_FILE`], released on drop.
 struct DirLock(File);
 
+/// #4304 (f2r) — how long one append waits for [`FORENSIC_LOCK_FILE`]. A
+/// legitimate holder keeps it for one tail check and one write (milliseconds),
+/// but `flock` needs only read access, so a process that can open the file
+/// could hold it forever and stall every audited write (the #4332 class). At
+/// the bound the append goes ahead unlocked, counted.
+pub const FORENSIC_LOCK_BUDGET: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The first and the largest pause between two `try_lock` attempts.
+const LOCK_RETRY_FIRST: std::time::Duration = std::time::Duration::from_millis(1);
+const LOCK_RETRY_MAX: std::time::Duration = std::time::Duration::from_millis(50);
+
 impl DirLock {
-    /// `None` when the lock cannot be taken. The caller then re-reads the
-    /// tail on every append: still correct for this process, but two
-    /// unlocked appenders can interleave, so it is WARNed (once) and counted.
+    /// `None` when the lock cannot be taken within [`FORENSIC_LOCK_BUDGET`].
+    /// The caller then re-reads the tail on every append: still correct for
+    /// this process, but two unlocked appenders can interleave, so it is
+    /// WARNed (once) and counted.
     fn acquire(dir: &Path) -> Option<Self> {
+        Self::acquire_within(dir, FORENSIC_LOCK_BUDGET)
+    }
+
+    fn acquire_within(dir: &Path, budget: std::time::Duration) -> Option<Self> {
         let path = dir.join(FORENSIC_LOCK_FILE);
-        let locked = open_forensic_file(
-            OpenOptions::new().create(true).read(true).write(true),
-            &path,
-        )
-        .and_then(|f| f.lock().map(|()| f));
+        let mut options = OpenOptions::new();
+        options.create(true).read(true).write(true);
+        // Owner-only, so another user cannot open it to hold the lock.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let locked = open_forensic_file(&mut options, &path).and_then(|f| {
+            lock_within(&f, budget)?;
+            Ok(f)
+        });
         match locked {
             Ok(f) => Some(Self(f)),
             Err(e) => {
@@ -1600,6 +1623,29 @@ impl DirLock {
                 None
             }
         }
+    }
+}
+
+/// Take `f`'s exclusive lock, retrying a held lock with backoff until
+/// `budget` is spent; then `TimedOut`.
+fn lock_within(f: &File, budget: std::time::Duration) -> std::io::Result<()> {
+    let deadline = std::time::Instant::now() + budget;
+    let mut pause = LOCK_RETRY_FIRST;
+    loop {
+        match f.try_lock() {
+            Ok(()) => return Ok(()),
+            Err(std::fs::TryLockError::Error(e)) => return Err(e),
+            Err(std::fs::TryLockError::WouldBlock) => {}
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("held by another process for more than {budget:?}"),
+            ));
+        }
+        std::thread::sleep(pause.min(deadline - now));
+        pause = (pause * 2).min(LOCK_RETRY_MAX);
     }
 }
 
