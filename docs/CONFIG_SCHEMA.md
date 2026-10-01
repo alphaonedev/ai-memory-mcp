@@ -288,7 +288,7 @@ mcp_federation_forward_url = "https://localhost:9077"
 
 | Field | Type | Default | Purpose |
 |---|---|---|---|
-| `schema_version` | `u32?` | `1` (legacy) | Advisory shape marker; `>= 2` enables the mixed-legacy-field warning. Does NOT select a parser — see the note below this table. |
+| `schema_version` | `u32?` | `None` (omitted — DENOTES the legacy shape; not stored as `1`) | Advisory shape marker; `>= 2` enables the mixed-legacy-field warning. Does NOT select a parser — see the note below this table. |
 | `postgres_pool_max_connections` | `u32?` | `DEFAULT_MAX_CONNECTIONS` | sqlx `max_connections`; non-positive falls through to default. |
 | `postgres_pool_min_connections` | `u32?` | `DEFAULT_MIN_CONNECTIONS` | sqlx `min_connections` (warm floor). |
 | `postgres_acquire_timeout_secs` | `u64?` | derived from `DEFAULT_ACQUIRE_TIMEOUT` | sqlx `acquire_timeout`, whole seconds. |
