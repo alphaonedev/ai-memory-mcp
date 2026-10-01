@@ -1,0 +1,254 @@
+// Copyright 2026 AlphaOne LLC
+// SPDX-License-Identifier: Apache-2.0
+
+//! #4356 — the ancestor-owner gate on the FIRST bind of a namespace standard.
+//!
+//! An ancestor's standard governs its `/`-subtree by inheritance; the only
+//! written way out is a child binding its own standard (most-specific wins).
+//! Before #4356 nothing authorized THAT act: the bind gates (#929 / #2541 /
+//! #2542 / #3758) judged the bound memory, the declared parent and the
+//! standard CURRENTLY bound to the target, and a target with no binding of its
+//! own (`NoMetaRow`) was admitted unconditionally — so any caller could open a
+//! permissive child standard under a governed ancestor and strip the
+//! ancestor's write / promote / delete / approval gates from that subtree
+//! (CWE-284 / CWE-863, both backends).
+//!
+//! 5-agent vote (4d3ea1c5), unanimous option A: binding the first standard (or
+//! repairing a severed binding) under a governed ancestor requires the
+//! caller to be the owner of the NEAREST governing ancestor's standard. This
+//! module is the ONE backend-blind verdict; each backend contributes only a
+//! reader that yields [`AncestorLevel`]s and the shared selector
+//! [`select_governing_ancestor`] picks the deciding one, so the two adapters
+//! cannot classify the same chain differently (the #2488 lesson).
+//!
+//! Deliberately NOT gated (vote rulings): the global `*` standard (a
+//! substrate default, not a subtree — and gating it would make every first
+//! bind anywhere depend on the `*` owner, breaking the allow-on-silence
+//! cutline); the federated `namespace_meta` lanes (own #2479 peer-scope gate);
+//! pending-queue delegation (no precedent; a follow-up).
+
+use crate::visibility::{
+    NamespaceStandardBinding, NamespaceStandardOp, NamespaceStandardRefusal,
+    namespace_standard_mutation_admission,
+};
+
+/// What ONE ancestor level contributes to the gate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AncestorLevel {
+    /// No `namespace_meta` row — keep walking.
+    Absent,
+    /// A bound standard that carries no `metadata.governance` — it does not
+    /// shadow a governed grandparent (bypass-voter amendment a).
+    NoPolicy,
+    /// A row whose standard is severed (NULL pointer) or dangling —
+    /// somebody governed this and the policy is gone (#2503): fail closed.
+    Severed,
+    /// A bound standard carrying `metadata.governance`. `owner` is the
+    /// standard's `metadata.agent_id`, normalised (`None` = unowned).
+    Governing {
+        /// The concrete owner, or `None` when empty / `system` / absent.
+        owner: Option<String>,
+    },
+}
+
+/// The nearest ancestor that decides the gate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GoverningAncestor {
+    /// No governing ancestor — the target is an ungoverned root (allow-on-silence).
+    None,
+    /// A governed ancestor; `owner` `None` = unowned (documented unowned-PASS).
+    Standard {
+        /// The concrete owner, or `None` when unowned.
+        owner: Option<String>,
+    },
+    /// The nearest governed level is severed / dangling.
+    Severed,
+}
+
+/// Why [`set_admission`] refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetRefusal {
+    /// The caller does not own the standard currently bound, or does not own
+    /// the governing ancestor's standard.
+    NotOwner,
+    /// The governing ancestor's standard is severed / dangling.
+    AncestorUnresolvable,
+    /// A read fault while resolving the binding or the ancestor (fail-closed).
+    Unverifiable,
+}
+
+/// Wire-pinned refusal text for [`SetRefusal::AncestorUnresolvable`].
+pub const REASON_ANCESTOR_STANDARD_UNRESOLVABLE: &str = "cannot bind a namespace standard under a governed ancestor whose standard is \
+     unresolvable (severed or dangling). Ask the ancestor's owner or an operator.";
+
+/// Wire-pinned refusal text for [`SetRefusal::Unverifiable`].
+pub const REASON_STANDARD_UNVERIFIABLE: &str = "cannot verify the namespace-standard owner chain; refusing the bind rather than \
+     treating the standard as unowned";
+
+/// Normalise a standard's owner: empty / `system` / absent = unowned.
+#[must_use]
+pub fn normalise_owner(owner: Option<String>) -> Option<String> {
+    owner.filter(|o| !o.is_empty() && o != crate::identity::sentinels::SYSTEM_PRINCIPAL)
+}
+
+/// Pick the deciding ancestor from levels ordered NEAREST-FIRST (the target
+/// itself and `*` already excluded by the caller). A fault on a level before
+/// the decision propagates (fail-closed).
+///
+/// # Errors
+///
+/// The first reader error encountered before a deciding level.
+pub fn select_governing_ancestor<E>(
+    levels: impl IntoIterator<Item = Result<AncestorLevel, E>>,
+) -> Result<GoverningAncestor, E> {
+    for level in levels {
+        match level? {
+            AncestorLevel::Absent | AncestorLevel::NoPolicy => {}
+            AncestorLevel::Severed => return Ok(GoverningAncestor::Severed),
+            AncestorLevel::Governing { owner } => {
+                return Ok(GoverningAncestor::Standard { owner });
+            }
+        }
+    }
+    Ok(GoverningAncestor::None)
+}
+
+/// Whether the ancestor must be consulted at all: only a bind that creates (or
+/// repairs) the target's OWN binding can opt out of an ancestor. A REBIND of a
+/// resolved standard is decided by its current owner (#3758) and never needs
+/// the chain read.
+#[must_use]
+pub const fn needs_ancestor(binding: &NamespaceStandardBinding) -> bool {
+    matches!(
+        binding,
+        NamespaceStandardBinding::NoMetaRow | NamespaceStandardBinding::Unresolvable
+    )
+}
+
+/// The ONE verdict for binding a namespace standard (SET): the #3758 rebind
+/// gate first, then — for a first bind / repair — the #4356 ancestor gate.
+///
+/// # Errors
+///
+/// [`SetRefusal`].
+pub fn set_admission(
+    caller: &str,
+    bypass: bool,
+    namespace: &str,
+    binding: &NamespaceStandardBinding,
+    ancestor: &GoverningAncestor,
+) -> Result<(), SetRefusal> {
+    if bypass {
+        return Ok(());
+    }
+    namespace_standard_mutation_admission(
+        caller,
+        false,
+        namespace,
+        binding,
+        NamespaceStandardOp::Set,
+    )
+    .map_err(|r| match r {
+        NamespaceStandardRefusal::NotOwner | NamespaceStandardRefusal::Unresolvable => {
+            SetRefusal::NotOwner
+        }
+    })?;
+    if !needs_ancestor(binding) {
+        return Ok(());
+    }
+    match ancestor {
+        GoverningAncestor::None | GoverningAncestor::Standard { owner: None } => Ok(()),
+        GoverningAncestor::Standard { owner: Some(o) } if o == caller => Ok(()),
+        GoverningAncestor::Standard { owner: Some(_) } => {
+            tracing::warn!(
+                target: crate::handlers::AUTHZ_TRACE_TARGET,
+                "namespace-standard ancestor-owner refusal: first bind on {namespace}: caller {caller} does not own the governing ancestor standard"
+            );
+            Err(SetRefusal::NotOwner)
+        }
+        GoverningAncestor::Severed => Err(SetRefusal::AncestorUnresolvable),
+    }
+}
+
+/// The caller-facing reason for a refusal (never names the owner, #3407).
+#[must_use]
+pub fn refusal_reason(refusal: SetRefusal) -> &'static str {
+    match refusal {
+        SetRefusal::NotOwner => crate::errors::msg::CALLER_DOES_NOT_OWN_NAMESPACE_STANDARD,
+        SetRefusal::AncestorUnresolvable => REASON_ANCESTOR_STANDARD_UNRESOLVABLE,
+        SetRefusal::Unverifiable => REASON_STANDARD_UNVERIFIABLE,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn gov(o: Option<&str>) -> GoverningAncestor {
+        GoverningAncestor::Standard {
+            owner: o.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn stranger_first_bind_under_owned_ancestor_refused_4356() {
+        let r = set_admission(
+            "s",
+            false,
+            "gov/leaf",
+            &NamespaceStandardBinding::NoMetaRow,
+            &gov(Some("a")),
+        );
+        assert_eq!(r, Err(SetRefusal::NotOwner));
+    }
+
+    #[test]
+    fn owner_unowned_root_bypass_and_rebind_pass_4356() {
+        let nm = NamespaceStandardBinding::NoMetaRow;
+        assert!(set_admission("a", false, "gov/leaf", &nm, &gov(Some("a"))).is_ok());
+        assert!(set_admission("s", false, "gov/leaf", &nm, &gov(None)).is_ok());
+        assert!(set_admission("s", false, "root", &nm, &GoverningAncestor::None).is_ok());
+        assert!(set_admission("s", true, "gov/leaf", &nm, &gov(Some("a"))).is_ok());
+        // rebind of a standard the caller owns never consults the ancestor
+        let own = NamespaceStandardBinding::Resolved(Some("s".into()));
+        assert!(set_admission("s", false, "gov/leaf", &own, &gov(Some("a"))).is_ok());
+    }
+
+    #[test]
+    fn severed_ancestor_and_unresolvable_repair_fail_closed_4356() {
+        let nm = NamespaceStandardBinding::NoMetaRow;
+        assert_eq!(
+            set_admission("s", false, "gov/leaf", &nm, &GoverningAncestor::Severed),
+            Err(SetRefusal::AncestorUnresolvable)
+        );
+        let un = NamespaceStandardBinding::Unresolvable;
+        assert_eq!(
+            set_admission("s", false, "gov/leaf", &un, &gov(Some("a"))),
+            Err(SetRefusal::NotOwner)
+        );
+    }
+
+    #[test]
+    fn selector_skips_nopolicy_and_picks_nearest_decider_4356() {
+        let lv: Vec<Result<AncestorLevel, ()>> = vec![
+            Ok(AncestorLevel::Absent),
+            Ok(AncestorLevel::NoPolicy),
+            Ok(AncestorLevel::Governing {
+                owner: Some("a".into()),
+            }),
+            Ok(AncestorLevel::Severed),
+        ];
+        assert_eq!(select_governing_ancestor(lv), Ok(gov(Some("a"))));
+        let lv: Vec<Result<AncestorLevel, ()>> = vec![Ok(AncestorLevel::Absent)];
+        assert_eq!(select_governing_ancestor(lv), Ok(GoverningAncestor::None));
+        let lv: Vec<Result<AncestorLevel, &str>> = vec![Err("fault")];
+        assert_eq!(select_governing_ancestor(lv), Err("fault"));
+    }
+
+    #[test]
+    fn normalise_owner_treats_empty_and_system_as_unowned_4356() {
+        assert_eq!(normalise_owner(Some(String::new())), None);
+        assert_eq!(normalise_owner(Some("system".into())), None);
+        assert_eq!(normalise_owner(Some("a".into())), Some("a".into()));
+    }
+}

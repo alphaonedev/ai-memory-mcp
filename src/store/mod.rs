@@ -940,6 +940,18 @@ pub(crate) fn authorize_namespace_standard_mutation(
     )
 }
 
+/// #4356 — map the shared SET verdict's refusal to the SAL error type.
+pub(crate) fn set_refusal_to_store_err(
+    refusal: crate::ns_standard_ancestor::SetRefusal,
+    namespace: &str,
+) -> StoreError {
+    StoreError::PermissionDenied {
+        action: NamespaceStandardOp::Set.label().to_string(),
+        target: namespace.to_string(),
+        reason: crate::ns_standard_ancestor::refusal_reason(refusal).to_string(),
+    }
+}
+
 /// #3176 — the CLEAR arm of [`authorize_namespace_standard_mutation`].
 ///
 /// # Errors
@@ -3369,6 +3381,20 @@ pub trait MemoryStore: Send + Sync {
     ) -> StoreResult<()> {
         Err(StoreError::UnsupportedCapability {
             capability: "GOVERNANCE_SET_STANDARD".to_string(),
+        })
+    }
+
+    /// #4356 — the nearest governing ancestor of `namespace` for the
+    /// ancestor-owner bind gate (the HTTP funnel's pre-write probe; the
+    /// adapters' own `set_namespace_standard` re-runs the gate in-transaction
+    /// as the fail-closed floor). Default returns `UnsupportedCapability`
+    /// (fail-closed: an adapter that cannot answer cannot admit the bind).
+    async fn namespace_governing_ancestor(
+        &self,
+        _namespace: &str,
+    ) -> StoreResult<crate::ns_standard_ancestor::GoverningAncestor> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "GOVERNANCE_GOVERNING_ANCESTOR".to_string(),
         })
     }
 

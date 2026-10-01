@@ -421,29 +421,18 @@ fn handle_namespace_set_standard_inner(
     // could REPLACE another tenant's governance standard with a memory of
     // their own. A read FAULT refuses (fail-closed): an unverifiable current
     // owner must never be treated as unowned.
-    let rebind_refusal: Option<String> = match db::namespace_standard_binding(conn, namespace) {
-        Err(err) => {
-            tracing::error!(
-                target: crate::mcp::error_text::TRACE_TARGET,
-                error = %err,
-                "namespace_set_standard: cannot verify the current standard owner; refusing the bind",
-            );
-            Some(
-                "cannot verify the current namespace-standard owner; refusing the bind \
-                 rather than treating the standard as unowned"
-                    .to_string(),
-            )
-        }
-        Ok(binding) => crate::visibility::namespace_standard_mutation_admission(
-            &caller,
-            caller == sentinels::DAEMON_PRINCIPAL,
-            namespace,
-            &binding,
-            crate::visibility::NamespaceStandardOp::Set,
-        )
-        .err()
-        .map(|_| crate::errors::msg::CALLER_DOES_NOT_OWN_NAMESPACE_STANDARD.to_string()),
-    };
+    // #4356 — the SAME shared verdict also gates the FIRST bind (and the
+    // severed-pointer repair) under a governed ancestor: only the nearest
+    // governing ancestor's owner may open a child standard that opts the
+    // subtree out of the ancestor's policy.
+    let rebind_refusal: Option<String> = crate::storage::ns_standard_ancestor::set_admission_conn(
+        conn,
+        &caller,
+        caller == sentinels::DAEMON_PRINCIPAL,
+        namespace,
+    )
+    .err()
+    .map(|r| crate::ns_standard_ancestor::refusal_reason(r).to_string());
     let bind_refusal: Option<String> = match (rebind_refusal, parent_standard) {
         (Some(refusal), _) => Some(refusal),
         (None, Err(err)) => {
