@@ -329,7 +329,8 @@ footer a{color:var(--text-muted)}
 //   version(1) || ephemeral_pub(32) || nonce(12) || ciphertext+tag</span>
 
 <span class="cm">// Opt-in (default OFF → byte-identical plaintext storage):</span>
-<span class="ok">$</span> AI_MEMORY_ENCRYPT_AT_REST=1 ai-memory serve   <span class="cm"># or [storage] encrypt_at_rest = true</span>
+<span class="ok">$</span> AI_MEMORY_ENCRYPT_AT_REST=1 ai-memory serve   <span class="cm"># or in config.toml: [encryption] / at_rest = true
+// (NOT [storage] — that section has no encrypt_at_rest field)</span>
 
 <span class="cm">// Fail-closed: with encryption ON, a memory that carries no agent_id is
 // rejected ("no agent_id to key encryption to") rather than stored in clear.</span></div>
