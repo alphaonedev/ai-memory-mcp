@@ -486,8 +486,11 @@ tier via `cert-postgres-age.yml` and honestly labels the PG 16 alternate.
 - **Power-loss durability knob + named `asi-hard` posture ([#1961](https://github.com/alphaonedev/ai-memory-mcp/issues/1961), R23/R7).**
   `AI_MEMORY_DB_SYNCHRONOUS` (env-table row #128, default `NORMAL`)
   exposes `PRAGMA synchronous` — `FULL`/`EXTRA` fsync the WAL at every
-  commit so an acknowledged write survives a power cut. A fault-injection
-  harness (`AI_MEMORY_TEST_ABORT_AFTER_COMMIT`, row #129) proves it.
+  commit so an acknowledged write is durable on hardware that honours
+  fsync. A fault-injection harness (`AI_MEMORY_TEST_ABORT_AFTER_COMMIT`,
+  row #129) proves crash consistency across an unclean process exit; real
+  power-cut fsync behavior is not yet evidenced (see PERFORMANCE.md,
+  [#3561](https://github.com/alphaonedev/ai-memory-mcp/issues/3561)).
   `AI_MEMORY_SECURITY_PROFILE=asi-hard` (env-table row #130) engages the
   hardened NO-DISABLE posture: at boot it PINS the fail-closed security
   knobs ON (including `DB_SYNCHRONOUS=FULL`) and REFUSES to boot if an
