@@ -64,11 +64,12 @@ kinds, claim-bitemporal columns), and certifies the postgres + Apache
 AGE + pgvector storage backend.
 
 > **Certified-backend scope — read this before choosing Postgres.** The
-> two backends are **not one identical API**: **61 of the 82 unique
-> production HTTP paths are served on Postgres; the remaining 21 fail
-> closed with a uniform `501 NOT IMPLEMENTED`** (the Agent Skills surface,
-> `/api/v1/share`, the legacy `/api/v1/find_paths` alias, and the
-> `memory_*` MCP-parity routes with no pg SAL trait method yet — pinned by
+> two backends are **not one identical API**: **76 of the 89 unique
+> production HTTP paths support at least one method on Postgres; the
+> remaining 13 fail closed with a uniform `501 NOT IMPLEMENTED`** (the Agent
+> Skills surface, `/api/v1/share`, and the `memory_*` MCP-parity routes with
+> no pg SAL trait method yet; the legacy `/api/v1/find_paths` alias is
+> supported; path support does not imply every method is supported — pinned by
 > `tests/pg_supported_route_inventory_gate_2799.rs`), and **MCP-stdio is
 > structurally SQLite-only** ([#1675](https://github.com/alphaonedev/ai-memory-mcp/issues/1675)):
 > a Postgres-backed deployment serves MCP clients through the HTTP daemon,
