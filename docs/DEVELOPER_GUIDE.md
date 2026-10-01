@@ -8,7 +8,7 @@
 2. **CLI tool** -- direct SQLite operations for store, recall, search, list, etc. (completely AI-agnostic)
 3. **HTTP daemon** -- an Axum web server exposing the same operations as a REST API with 103 route registrations / 89 unique URL paths (completely AI-agnostic)
 
-**Key architectural features:** Zero token cost (no context loaded until recall), TOON compact default response format (79% smaller than JSON), MCP prompts capability (`recall-first` behavioral rules + `memory-workflow` reference card), 4 feature tiers with optional local LLMs via Ollama, true dedup on title+namespace, 6-factor recall scoring with score field in responses.
+**Key architectural features:** No memory content in context until recall (the MCP tool schemas still cost a fixed per-request `tools/list` budget), TOON compact default response format (79% smaller than JSON), MCP prompts capability (`recall-first` behavioral rules + `memory-workflow` reference card), 4 feature tiers with optional local LLMs via Ollama, true dedup on title+namespace, 6-factor recall scoring with score field in responses.
 
 All three interfaces share the same storage layer (`src/storage/`, exposed as the `db` alias) and validation layer (`validate.rs`). The daemon adds automatic garbage collection (every 30 minutes) and graceful shutdown with WAL checkpointing.
 
@@ -85,7 +85,7 @@ When running at the `semantic` tier or higher, ai-memory loads a HuggingFace emb
 - Response types: `Stats`, `TierCount`, `NamespaceCount`
 - `TtlConfig` struct -- per-tier TTL overrides loaded from `config.toml` (`short_ttl_secs`, `mid_ttl_secs`, `long_ttl_secs`, `short_extend_secs`, `mid_extend_secs`)
 - `ResolvedTtl` struct -- resolved TTL values after merging config defaults with per-tier overrides
-- Constants: `MAX_CONTENT_SIZE` (65536), `PROMOTION_THRESHOLD` (5), `SHORT_TTL_EXTEND_SECS` (3600), `MID_TTL_EXTEND_SECS` (86400)
+- Constants: `MAX_CONTENT_SIZE` (65536), `PROMOTION_THRESHOLD` (5; historical, no production reader since Boids item 1), `SHORT_TTL_EXTEND_SECS` (3600), `MID_TTL_EXTEND_SECS` (86400)
 
 ### `src/mcp/`
 
@@ -191,13 +191,13 @@ The sqlite storage layer. The pre-#961 monolithic `src/db.rs` is GONE — split 
 | `open()` | Opens DB, sets WAL mode, creates schema, runs migrations |
 | `insert()` | Upsert on `(title, namespace)` -- never downgrades tier, keeps max priority |
 | `get()` | Fetch by ID |
-| `touch()` | Bump access count, extend TTL, auto-promote mid->long at 5 accesses, reinforce priority every 10 accesses. **Uses BEGIN IMMEDIATE/COMMIT transaction** for atomicity. |
+| `touch()` | Bump access count and `last_accessed_at`, extend the TTL floor. Never changes tier or priority (v1.0.0 Boids item 1). **Uses BEGIN IMMEDIATE/COMMIT transaction** for atomicity. |
 | `update()` | Partial update of any fields |
 | `delete()` | Delete by ID (links cascade) |
 | `forget()` | Bulk delete by namespace + FTS pattern + tier |
 | `list()` | List with filters: namespace, tier, priority, date range, tags, offset |
 | `search()` | FTS5 AND search with 6-factor composite scoring |
-| `recall()` | FTS5 OR search — PURE read; access ladders (touch/auto-promote/TTL extension) folded from the `recall_observations` ledger out of band |
+| `recall()` | FTS5 OR search — PURE read; access bookkeeping (access count / TTL floor extension) folded from the `recall_observations` ledger out of band |
 | `find_contradictions()` | Find memories in same namespace with similar titles |
 | `consolidate()` | Merge multiple memories, delete originals, aggregate tags and max priority. **Uses BEGIN IMMEDIATE/COMMIT transaction** for atomicity. |
 | `sanitize_fts_query()` | Strips special characters and quotes tokens to prevent FTS injection |

@@ -828,8 +828,9 @@ serve from a read replica.
 
 The access ladders still exist — they are applied out of band by the
 periodic **fold job** from unfolded ledger rows: access-count bump,
-per-tier TTL floor extension, mid→long promotion at 5 accesses, the
-priority decade ladder. **The fold job only runs inside `ai-memory
+per-tier TTL floor extension and `last_accessed_at`. v1.0.0 Boids item 1
+(vote `4d3ea1c5`) removed the mid→long promotion and the priority decade
+ladder from the fold: tier changes only through `memory_promote`. **The fold job only runs inside `ai-memory
 serve`** (its own 60 s loop, `AI_MEMORY_ACCESS_FOLD_INTERVAL_SECS`, plus a
 fold at the top of every GC tick). On an MCP-stdio or CLI-only topology
 with no daemon, nothing folds until a GC chokepoint runs — so

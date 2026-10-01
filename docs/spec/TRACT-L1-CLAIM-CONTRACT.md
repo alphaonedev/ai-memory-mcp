@@ -358,10 +358,10 @@ eviction; they are unbundled and serve different purposes:
 
 | # | Surface | What it is | Symbol |
 |---|---|---|---|
-| 1 | **Recall ranking** | recency + capped access-count + tier bonus tilt *ordering* toward fresh/hot rows | the FTS score `+ MIN(access_count,50)*0.1 + … + recency_factor + tier_bonus` (`storage::mod`) |
+| 1 | **Recall ranking** | recency + capped access-count + tier bonus tilt *ordering* toward fresh/hot rows | the FTS score `+ MIN(access_count,ACCESS_SCORE_CAP)*0.1 + … + recency_factor + tier_bonus` (`storage::mod`; `ACCESS_SCORE_CAP = 10` since v1.0.0 Boids item 1, `models::mod`) |
 | 2 | **TTL floor-extend on access** | an access raises `expires_at` by a per-tier floor — frequently-recalled rows live longer; recall is pure (#1953), so this is applied by the fold job from the ledger, not inline | `SHORT_TTL_EXTEND_SECS` / `MID_TTL_EXTEND_SECS` (`models::mod`), #1596 |
 | 3 | **Confidence decay on access** | a memory's `confidence` decays with age when the fold job applies the recall-access ladders (recall itself writes nothing) | `crate::confidence::decay`, `ConfidenceSource::Decayed` |
-| 4 | **Access-count promotion** | mid→long auto-promotion at 5 accesses; priority increments every 10 — folded from the `recall_observations` ledger, not on the recall path | fold-job ladders (`fold_recall_accesses`) |
+| 4 | **Access-count promotion** | **removed at v1.0.0** (Boids item 1, vote `4d3ea1c5`): the fold no longer promotes mid→long or raises priority; it applies only `access_count`, `last_accessed_at` and the TTL floor | `fold_recall_accesses`; pinned by `storage::tests::g10_3_touch_no_longer_auto_promotes` |
 
 ### 10.2 The true gap (localized)
 
@@ -515,6 +515,15 @@ three-lane coverage, private owner-scoping, opt-in default-OFF, dedup/rate-limit
 best-effort non-fatal, secret-screen, both backends) as acceptance criteria.
 
 ## 13. Promotion is not fully court-gated — access-count auto-promote is maintenance (G10.3, #1863)
+
+> **v1.0.0 status.** Boids item 1 (5-agent vote `4d3ea1c5`) REMOVED the
+> access-count auto-promote lane described below: `fold_recall_accesses`,
+> `touch` and `touch_many` no longer change tier or priority on either backend
+> (`src/storage/mod.rs` fold UPDATE; `src/store/postgres.rs` touch), and
+> `storage::tests::g10_3_touch_no_longer_auto_promotes` pins it. At v1.0.0 the
+> lanes to `long` are therefore the caller promote (court-gated) and the direct
+> write (gated by `write`). §13.1–§13.4 are kept as the design record; the
+> residual in §13.3 and part (a) of §13.4 no longer apply.
 
 TRACT L1 wants promotion above a configured tier to require an explicit, audited
 approval flow — "a memory reaches `long` by being adjudicated, not by being
