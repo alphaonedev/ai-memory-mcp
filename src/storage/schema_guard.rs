@@ -34,8 +34,8 @@
 //!
 //! * every path that can MUTATE the database refuses with
 //!   [`SchemaAheadOfBinary`], BEFORE any bootstrap DDL is replayed;
-//! * `backup` falls back to [`crate::db::open_unmigrated`] and still
-//!   produces a snapshot;
+//! * `backup` always opens through [`crate::db::open_unmigrated`] (it never
+//!   migrates, #4207) and so still produces a snapshot;
 //! * `boot` and `doctor` catch the typed error and report the schema drift
 //!   instead of dying with an opaque open failure.
 //!
