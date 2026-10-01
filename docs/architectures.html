@@ -285,7 +285,7 @@
       <tr><td><b>Wake plane</b> (one hub per host)</td><td class="o">opt</td><td class="y">yes</td><td class="y">per host</td><td class="y">per host</td><td class="y">per host</td></tr>
       <tr><td><b>Signed federation, W-of-N quorum</b></td><td class="o">—</td><td class="o">—</td><td class="y">yes</td><td class="y">rack-aware</td><td class="y">cross-site</td></tr>
       <tr><td><b>mTLS between peers</b></td><td class="o">—</td><td class="o">opt</td><td class="y">required</td><td class="y">required</td><td class="y">required</td></tr>
-      <tr><td><b>signed_events chain · audit log</b></td><td class="y">chain · audit opt</td><td class="y">chain · audit opt</td><td class="y">per peer</td><td class="y">per peer</td><td class="y">per peer</td></tr>
+      <tr><td><b>signed_events chain · audit log</b></td><td class="y">chain · audit opt</td><td class="y">chain · audit opt</td><td class="y">per peer</td><td class="o">audit opt · chain verifier reads SQLite</td><td class="o">per SQLite peer · audit opt</td></tr>
       <tr><td><b>Backups</b></td><td><code>ai-memory backup</code></td><td><code>ai-memory backup</code></td><td>backup, or PostgreSQL base backups</td><td>base backups + WAL archive</td><td>WAL shipping off-site</td></tr>
       <tr><td><b>Distributed consensus (Raft / Paxos)</b></td><td class="n">no</td><td class="n">no</td><td class="n">no</td><td class="n">no</td><td class="n">no</td></tr>
     </tbody>
