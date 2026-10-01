@@ -203,6 +203,36 @@ pub fn reassert_verified_attestation(
     merged
 }
 
+/// #4208 — did the VERIFIED inbound's signed content actually WIN the merge,
+/// i.e. is every text field it signed over now what the stored row shows?
+///
+/// The route-OUT dequarantine-on-attest (#1948) may only release a quarantined
+/// row whose visible content IS the verified unit's. A validly signed inbound
+/// that LOSES the newer-wins merge leaves the local (never-attested)
+/// title/content on the row; a signature over different bytes proves nothing
+/// about it. Compared: `content`, `title`, `namespace`, `memory_kind` and the
+/// `metadata.agent_id` author (non-empty). NOT compared, by design: `created_at`
+/// (the merge keeps the LOCAL genesis instant, immutable) and the
+/// `write_signature` metadata key (the CRDT metadata merge may keep either
+/// side's) — neither changes the text a release would make visible. Fail
+/// closed on a missing author.
+#[must_use]
+pub fn persisted_is_verified_unit(persisted: &Memory, verified_inbound: &Memory) -> bool {
+    let author = |m: &Memory| {
+        m.metadata
+            .get(param_names::AGENT_ID)
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    };
+    let signer = author(verified_inbound);
+    persisted.content == verified_inbound.content
+        && persisted.title == verified_inbound.title
+        && persisted.namespace == verified_inbound.namespace
+        && persisted.memory_kind == verified_inbound.memory_kind
+        && signer.as_deref().is_some_and(|s| !s.is_empty())
+        && author(persisted) == signer
+}
+
 /// #2863 — do two rows carry a byte-identical 6-field `SignableWrite` surface
 /// (`agent_id` + `namespace` + `title` + `memory_kind` + `created_at` +
 /// `content`) AND the same non-empty `write_signature`? The signature commits to

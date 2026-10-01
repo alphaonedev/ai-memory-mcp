@@ -17,7 +17,10 @@
 //! * cross-id title merge — `Y` stays `quarantined` AND the push still counts
 //!   as applied (the pin distinguishes "quarantine preserved" from "the whole
 //!   push was refused");
-//! * control — the legitimate same-id attested push still dequarantines.
+//! * control — the legitimate same-id attested push still dequarantines;
+//! * #4208 — a verified same-id push that LOSES the merge (the local row is
+//!   newer) releases nothing: the row keeps its local, never-attested content,
+//!   so it stays quarantined.
 
 #![cfg(feature = "sal")]
 #![allow(clippy::too_many_lines)]
@@ -454,11 +457,127 @@ async fn sqlite_same_id_attested_push_still_dequarantines_3901() {
     same_id_attested_push_still_dequarantines(&Backend::Sqlite).await;
 }
 
+/// #4208 (SEC, containment) — a validly signed unit for the quarantined row's
+/// OWN id that is OLDER than the local row LOSES the newer-wins merge, so the
+/// row keeps its local, never-attested content. The route-OUT release must key
+/// on what was PERSISTED, not on "a valid signature arrived for this id": the
+/// row stays quarantined with its local content. Pre-fix both backends
+/// released it (`open` + the unattested text).
+async fn stale_same_id_attested_push_keeps_row_quarantined(backend: &Backend) {
+    let _posture = Posture::zero_config();
+    let author = uniq("ai:author-4208");
+    let ns = uniq("team/q4208");
+    let (y, title) = (uniq("y"), uniq("t"));
+    let (router, store, db) = router(backend).await;
+    let kp = enroll(backend, &db, &store, &author).await;
+    // Local row NEWER than any attestable inbound: it wins the LWW merge.
+    let t_new = (chrono::Utc::now() + chrono::Duration::hours(1))
+        .format("%Y-%m-%dT%H:%M:%S%.6fZ")
+        .to_string();
+    let local: ai_memory::models::Memory = serde_json::from_value(memory_json(
+        &y,
+        &ns,
+        &title,
+        LOCAL_UNATTESTED,
+        &author,
+        &t_new,
+    ))
+    .expect("memory");
+    match backend {
+        Backend::Sqlite => {
+            let lock = db.lock().await;
+            ai_memory::db::insert(&lock.0, &local).expect("seed");
+            let n = lock
+                .0
+                .execute(
+                    "UPDATE memories SET lifecycle_state = 'quarantined', updated_at = ?1 \
+                     WHERE id = ?2",
+                    rusqlite::params![t_new, y],
+                )
+                .expect("quarantine");
+            assert_eq!(n, 1);
+        }
+        #[cfg(feature = "sal-postgres")]
+        Backend::Postgres(_) => {
+            store
+                .store(&CallerContext::for_agent(&author), &local)
+                .await
+                .expect("seed");
+            let n = sqlx::query(
+                "UPDATE memories SET lifecycle_state = 'quarantined', \
+                 updated_at = $1::timestamptz WHERE id = $2",
+            )
+            .bind(&t_new)
+            .bind(&y)
+            .execute(pg_store(&store).pool())
+            .await
+            .expect("quarantine")
+            .rows_affected();
+            assert_eq!(n, 1);
+        }
+    }
+
+    let (status, report) = push(&router, &author, signed_wire(&kp, &y, &ns, &title, &author)).await;
+    assert_eq!(status, StatusCode::OK, "{report}");
+    assert_eq!(
+        report["applied"], 1,
+        "the merge itself still applies: {report}"
+    );
+    assert_eq!(
+        content(backend, &db, &store, &y).await.as_deref(),
+        Some(LOCAL_UNATTESTED),
+        "precondition: the older attested inbound LOST the merge (local content kept)"
+    );
+    assert_eq!(
+        state(backend, &db, &store, &y).await.as_deref(),
+        Some("quarantined"),
+        "#4208: an attestation over DIFFERENT bytes must never release the row \
+         that still carries never-attested content"
+    );
+}
+
+/// `content` of a row by id (`None` when absent).
+async fn content(
+    backend: &Backend,
+    db: &Db,
+    store: &Arc<dyn MemoryStore>,
+    id: &str,
+) -> Option<String> {
+    let _ = store; // read by the pg arm only
+    match backend {
+        Backend::Sqlite => {
+            let lock = db.lock().await;
+            lock.0
+                .query_row("SELECT content FROM memories WHERE id = ?1", [id], |r| {
+                    r.get(0)
+                })
+                .ok()
+        }
+        #[cfg(feature = "sal-postgres")]
+        Backend::Postgres(_) => {
+            sqlx::query_scalar::<_, String>("SELECT content FROM memories WHERE id = $1")
+                .bind(id)
+                .fetch_optional(pg_store(store).pool())
+                .await
+                .expect("query")
+        }
+    }
+}
+
+const LOCAL_UNATTESTED: &str = "local never-attested text";
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sqlite_stale_same_id_attested_push_keeps_row_quarantined_4208() {
+    let _g = FED_ENV_LOCK.lock().await;
+    stale_same_id_attested_push_keeps_row_quarantined(&Backend::Sqlite).await;
+}
+
 #[cfg(feature = "sal-postgres")]
 mod pg {
     use super::{
         Backend, FED_ENV_LOCK, cross_id_title_merge_keeps_other_row_quarantined,
         same_id_attested_push_still_dequarantines,
+        stale_same_id_attested_push_keeps_row_quarantined,
     };
 
     fn pg_backend() -> Backend {
@@ -479,5 +598,12 @@ mod pg {
     async fn pg_same_id_attested_push_still_dequarantines_3901() {
         let _g = FED_ENV_LOCK.lock().await;
         same_id_attested_push_still_dequarantines(&pg_backend()).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "live postgres: AI_MEMORY_TEST_POSTGRES_URL (postgres-ignored tier)"]
+    async fn pg_stale_same_id_attested_push_keeps_row_quarantined_4208() {
+        let _g = FED_ENV_LOCK.lock().await;
+        stale_same_id_attested_push_keeps_row_quarantined(&pg_backend()).await;
     }
 }

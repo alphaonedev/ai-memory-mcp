@@ -945,6 +945,17 @@ impl MemoryStore for SqliteStore {
         db::dequarantine(&conn, id).map_err(box_err)
     }
 
+    /// #4208 — evidence-bound route-OUT (see the trait doc).
+    async fn dequarantine_verified(
+        &self,
+        id: &str,
+        verified_inbound: &crate::models::Memory,
+    ) -> StoreResult<bool> {
+        self.gate_record_stop()?;
+        let conn = self.state.lock().await;
+        db::dequarantine_if_verified_unit(&conn, id, verified_inbound).map_err(box_err)
+    }
+
     /// v1.0.0 #2402 — the AUDITED operator release. Delegates to the sqlite
     /// reference free fn [`db::operator_dequarantine`], which carries the
     /// guarded `UPDATE` out of `quarantined` and the `memory.dequarantined`
