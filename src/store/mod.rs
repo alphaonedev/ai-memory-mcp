@@ -2787,6 +2787,14 @@ pub trait MemoryStore: Send + Sync {
     /// byte-identical to `inbound` — so the CRDT `sanitize` (which neutralizes an
     /// UNTRUSTED level for the LWW tiebreak) cannot demote a level this node
     /// independently verified. Non-receive callers pass `false` (legacy merge).
+    ///
+    /// **UNCHECKED (#4023).** This method does NOT re-authorize the pushing
+    /// peer's namespace scope against the row it locks. It exists for tests
+    /// and for the adapters' own delegation ONLY; every production federation
+    /// caller must use [`merge_inbound_authorized`](MemoryStore::merge_inbound_authorized).
+    /// Pinned by `tests/merge_inbound_unchecked_ceiling_4023.rs` (5-agent vote
+    /// (4d3ea1c5), memory 179cf088).
+    #[doc(hidden)]
     async fn merge_inbound(
         &self,
         _ctx: &CallerContext,
@@ -2795,6 +2803,40 @@ pub trait MemoryStore: Send + Sync {
     ) -> StoreResult<String> {
         Err(StoreError::UnsupportedCapability {
             capability: "FEDERATION_MERGE_INBOUND".to_string(),
+        })
+    }
+
+    /// #4023 — [`merge_inbound`](MemoryStore::merge_inbound) with the
+    /// federation peer-scope verdict re-evaluated against the STORED namespace
+    /// of the colliding row, read under the SAME lock the merge writes under.
+    ///
+    /// The receive funnel's scope gate reads a colliding row's namespace on a
+    /// pre-read; `merge_memory` LWWs `namespace`, so a row moved by a broader
+    /// writer between that read and the merge would otherwise take the narrow
+    /// peer's write. `authorize_stored` is called with the locked row's
+    /// namespace; `false` refuses the merge with `PermissionDenied` and writes
+    /// nothing. The no-row fall-through is not re-checked (its upsert targets
+    /// the already-authorized claimed namespace; a concurrently inserted
+    /// same-`id` row fails it on the primary key instead of being clobbered).
+    ///
+    /// Default: `UnsupportedCapability` — an adapter that cannot re-check
+    /// FAILS CLOSED rather than silently merging unchecked.
+    ///
+    /// # Errors
+    ///
+    /// Everything [`merge_inbound`](MemoryStore::merge_inbound) returns, plus a
+    /// refusal when the locked row's namespace is not authorized
+    /// (`PermissionDenied { action: FEDERATION_MERGE_INBOUND }` on BOTH
+    /// backends, detail built by [`crate::storage::inbound_stored_namespace_refused`]).
+    async fn merge_inbound_authorized(
+        &self,
+        _ctx: &CallerContext,
+        _inbound: &Memory,
+        _receiver_verified: bool,
+        _authorize_stored: crate::storage::StoredNamespaceAuthorizer<'_>,
+    ) -> StoreResult<String> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "FEDERATION_MERGE_INBOUND_AUTHORIZED".to_string(),
         })
     }
 
@@ -5597,6 +5639,11 @@ pub const UNDO_IN_PLACE_EDIT_ACTION: &str = "undo_in_place_edit";
 /// envelope names when [`MemoryStore::execute_pending_action`] refuses an
 /// approver-on-behalf laundering attempt (S5-H4).
 pub const EXECUTE_PENDING_ACTION: &str = "execute_pending_action";
+
+/// #4023 — the `action` an [`StoreError::PermissionDenied`] envelope names when
+/// [`MemoryStore::merge_inbound_authorized`] refuses a federation merge whose
+/// locked row sits outside the pushing peer's namespace scope.
+pub const FEDERATION_MERGE_INBOUND: &str = "federation_merge_inbound";
 
 /// #1727 (v0.8.0) — outcome of an [`MemoryStore::undo_in_place_edit`]
 /// call: enough before/after detail to render a dry-run diff and to
