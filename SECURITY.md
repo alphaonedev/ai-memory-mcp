@@ -323,19 +323,23 @@ and why a relay's transport is the relay's responsibility.
 code claim.** "MCP binds no server socket" is unqualified. "MCP makes no
 outbound connection" is NOT, and was previously stated as a single exception —
 which was false by omission (#4169). The `ai-memory mcp` process can construct
-three kinds of outbound client; none of them is MCP's *serving* transport, so
+four kinds of outbound connection; none of them is MCP's *serving* transport, so
 the stdio-only claim above is unaffected, but an operator sizing the process's
-egress needs all three:
+egress needs all four — and note the last is NOT governed by the inference-egress
+knob that governs the two before it:
 
 | Outbound client | Built at | Gate |
 |---|---|---|
 | **Federation forward** — an MCP-stdio `memory_store` joining the HTTP daemon's federation fanout (#881/#318) | `src/mcp/tools/store/transport.rs` (a blocking `reqwest` client, 15 s timeout) | A client **to the HTTP daemon**, whose own TLS, mTLS and plaintext-peer refusals (#2448/#2477) cover that hop. The one file on the static gate's client allowlist. |
 | **Chat / completion LLM** — query expansion, auto-tagging, contradiction detection | `crate::reload::resolve_and_build_mcp_llm`, called at MCP init (`src/mcp/mod.rs:4755`) and again on a live `config.toml` `[llm]` hot-swap (`:5355`) | `AI_MEMORY_INFERENCE_EGRESS` (`src/egress.rs`): `loopback-only` / `internal-only` / `deny` refuse the target, and **on refusal the client is not constructed** — enforcement is the absence of the egress path. `internal-only` additionally pins the boot-resolved addresses. |
-| **API embedder** — semantic-tier recall vectors | `Embedder::from_resolved_pinned` at MCP init (`src/mcp/mod.rs:4812`), only when the resolved embed lane egresses (`:4780`) | Same `AI_MEMORY_INFERENCE_EGRESS` gate. The local in-process candle embedder never egresses and is not gated; a refused or failed build degrades recall to keyword (#1593), it does not silently route through the chat client. |
+| **API embedder** — semantic-tier recall vectors | `Embedder::from_resolved_pinned` at MCP init (`src/mcp/mod.rs:4812`), only when the resolved embed lane egresses (`:4780`) | Same `AI_MEMORY_INFERENCE_EGRESS` gate. A refused or failed build degrades recall to keyword (#1593); it does not silently route through the chat client. The LOCAL in-process candle embedder sends no *inference* request and is not gated by this knob — but it is not network-free either: see the model-weight row below. |
+| **Model-weight fetch** — HuggingFace Hub HTTPS download of the local MiniLM embedder's and the neural cross-encoder's weights, on a COLD cache | MiniLM: `src/embeddings.rs:1048` → `download_via_hf_hub` (`:1949-1962`, three `repo.get` calls for `config.json` / `tokenizer.json` / `model.safetensors` from `sentence-transformers/all-MiniLM-L6-v2`, `:379`). Cross-encoder: `CrossEncoder::new_neural()` at MCP init (`src/mcp/mod.rs:5020`) → `resolve_cross_encoder_files` (`src/reranker.rs:1077-1095`, the same three files from `cross-encoder/ms-marco-MiniLM-L-6-v2`, `:366`) | **NOT `AI_MEMORY_INFERENCE_EGRESS`** — this lane is governed by `AI_MEMORY_EMBED_OFFLINE` / `HF_HUB_OFFLINE` (either truthy; `Embedder::remote_fetch_disabled`, `src/embeddings.rs:1978-1985`, shared by both loaders since #2086). Truthy ⇒ no network: both resolve only from the pre-staged HF cache and fail to the keyword / lexical path. Otherwise a cold cache fetches ~80-90 MB per model, bounded by `HF_DOWNLOAD_TIMEOUT`. A WARM cache makes the lane silent; it is not disabled. Indirect: the cross-encoder is built only when an embedder exists (`should_build_cross_encoder`, `src/reranker.rs:757-762`), so an egress-refused API-embedder deployment skips its download as a side effect — not because this knob was consulted. |
 
-Both inference clients are built **outside** `src/mcp/**`, so the static gate
-does not and cannot see them — see "Pinned so it cannot decay" below for that
-scope boundary. The wake-hub UDS client (`src/wake_client/`) is **not** one of
+Every row but the first is built **outside** `src/mcp/**` — the two inference
+clients in `src/reload.rs` / `src/embeddings.rs`, the weight fetches in
+`src/embeddings.rs` / `src/reranker.rs` — so the static gate does not and cannot
+see them; see "Pinned, with its scope stated" below for that scope boundary. The
+wake-hub UDS client (`src/wake_client/`) is **not** one of
 these: it is reached only from `src/cli/wake_listen.rs`, i.e. the
 `ai-memory wake-listen` subcommand and `ai-memory inbox --wait`
 (`src/cli/commands/inbox.rs:151-177`) — separate processes from `ai-memory mcp`
