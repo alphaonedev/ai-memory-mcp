@@ -228,6 +228,27 @@ pub fn pg_adapter_concat() -> String {
     s
 }
 
+/// An unterminated literal or comment found by [`try_mask_rust`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaskError {
+    /// Byte offset where the still-open token started.
+    pub offset: usize,
+    /// What was left open.
+    pub what: &'static str,
+}
+
+impl std::fmt::Display for MaskError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "unterminated {} starting at byte offset {}",
+            self.what, self.offset
+        )
+    }
+}
+
+impl std::error::Error for MaskError {}
+
 /// A copy of `src` with the CONTENT of every comment, string literal and
 /// char/byte literal replaced by spaces (#4023). Newlines are kept and every
 /// replaced byte becomes exactly one space, so byte offsets and line numbers
@@ -242,11 +263,20 @@ pub fn pg_adapter_concat() -> String {
 /// `'a` is NOT a char literal); `//` line comments; nested `/* */` comments.
 ///
 /// Delimiters (the quotes, `#`s and the `r`/`b`/`c` prefix) are kept; only
-/// the content between them is blanked. An unterminated literal or comment
-/// blanks to end of input (fail closed: nothing after it is mistaken for
-/// structure).
-#[must_use]
-pub fn mask_rust(src: &str) -> String {
+/// the content between them is blanked.
+///
+/// FAIL CLOSED (#4023, K3): a string, raw string (any `#` count), byte/C
+/// string or block comment (at any nesting depth) still open at end of input
+/// is an `Err` naming the byte offset where the open token started. It is
+/// never blanked "best effort" to the end of the file, which would fold every
+/// later fn header into the opening method. (A lone `'` that does not close
+/// as a char literal is a lifetime or label by construction, so a char
+/// literal cannot be left open.)
+///
+/// # Errors
+///
+/// [`MaskError`] when a literal or comment is unterminated.
+pub fn try_mask_rust(src: &str) -> Result<String, MaskError> {
     let b = src.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(b.len());
     let is_ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
@@ -265,6 +295,7 @@ pub fn mask_rust(src: &str) -> String {
         }
         // Block comment (nested).
         if c == b'/' && next == Some(b'*') {
+            let started = i;
             let mut depth = 0usize;
             while i < b.len() {
                 if b[i] == b'/' && b.get(i + 1) == Some(&b'*') {
@@ -282,6 +313,12 @@ pub fn mask_rust(src: &str) -> String {
                     blank(&mut out, b[i]);
                     i += 1;
                 }
+            }
+            if depth != 0 {
+                return Err(MaskError {
+                    offset: started,
+                    what: "block comment",
+                });
             }
             continue;
         }
@@ -302,8 +339,10 @@ pub fn mask_rust(src: &str) -> String {
                     j += 1;
                 }
                 if b.get(j) == Some(&b'"') {
+                    let started = i;
                     out.extend_from_slice(&b[i..=j]);
                     j += 1;
+                    let mut closed = false;
                     loop {
                         if j >= b.len() {
                             break;
@@ -314,10 +353,17 @@ pub fn mask_rust(src: &str) -> String {
                         {
                             out.extend_from_slice(&b[j..=j + hashes]);
                             j += hashes + 1;
+                            closed = true;
                             break;
                         }
                         blank(&mut out, b[j]);
                         j += 1;
+                    }
+                    if !closed {
+                        return Err(MaskError {
+                            offset: started,
+                            what: "raw string",
+                        });
                     }
                     i = j;
                     continue;
@@ -326,6 +372,8 @@ pub fn mask_rust(src: &str) -> String {
         }
         // Ordinary string (the b/c prefix, if any, was already copied).
         if c == b'"' {
+            let started = i;
+            let mut closed = false;
             out.push(b'"');
             i += 1;
             while i < b.len() {
@@ -341,10 +389,35 @@ pub fn mask_rust(src: &str) -> String {
                 if b[i] == b'"' {
                     out.push(b'"');
                     i += 1;
+                    closed = true;
                     break;
+                }
+                // A plain (non-raw) string that runs onto a line starting with
+                // `//` is, in rustfmt-formatted source, a lexer desync (an odd
+                // quote earlier flipped string state) far more often than a
+                // real literal: fail closed rather than mask a comment as a
+                // string and re-segment everything after it.
+                if b[i] == b'\n' {
+                    let rest = &b[i + 1..];
+                    let ws = rest
+                        .iter()
+                        .take_while(|&&x| x == b' ' || x == b'\t')
+                        .count();
+                    if rest[ws..].starts_with(b"//") {
+                        return Err(MaskError {
+                            offset: started,
+                            what: "plain string running onto a `//` comment line (lexer desync)",
+                        });
+                    }
                 }
                 blank(&mut out, b[i]);
                 i += 1;
+            }
+            if !closed {
+                return Err(MaskError {
+                    offset: started,
+                    what: "string literal",
+                });
             }
             continue;
         }
@@ -390,5 +463,89 @@ pub fn mask_rust(src: &str) -> String {
     }
     // Only whole literal / comment contents were blanked byte-for-byte with
     // ASCII spaces; everything else was copied verbatim, so this is valid UTF-8.
-    String::from_utf8(out).unwrap_or_else(|e| panic!("mask_rust produced invalid UTF-8: {e}"))
+    let masked = String::from_utf8(out).map_err(|_| MaskError {
+        offset: 0,
+        what: "masked output (invalid UTF-8)",
+    })?;
+    check_item_depth(&masked)?;
+    Ok(masked)
+}
+
+/// Column-0 tokens that start a top-level item in rustfmt-formatted source.
+const ITEM_STARTS: &[&str] = &[
+    "impl",
+    "pub",
+    "fn",
+    "async",
+    "const",
+    "static",
+    "mod",
+    "use",
+    "struct",
+    "enum",
+    "trait",
+    "type",
+    "macro_rules",
+    "extern",
+    "unsafe",
+    "#[",
+    "#![",
+];
+
+/// Second, independent fail-closed check on the MASKED text (#4023, K3): a
+/// lexer desync that happens to re-balance before end of input (an odd quote
+/// that a later stray quote closes) is invisible to the end-of-input check,
+/// but it flips which braces count as code, so a top-level item no longer
+/// starts at brace depth 0. In rustfmt-formatted source every column-0 line
+/// starting with an item keyword begins at depth 0, a column-0 `}` returns to
+/// depth 0, and the file ends at depth 0; a violation is reported as an
+/// error naming the offending byte offset.
+fn check_item_depth(masked: &str) -> Result<(), MaskError> {
+    let mut depth: i64 = 0;
+    let mut offset = 0usize;
+    for line in masked.split_inclusive('\n') {
+        let t = line.trim_end_matches('\n');
+        let starts_item = ITEM_STARTS.iter().any(|k| {
+            t.strip_prefix(k)
+                .is_some_and(|rest| !rest.starts_with(|c: char| c.is_alphanumeric() || c == '_'))
+        });
+        if starts_item && depth != 0 {
+            return Err(MaskError {
+                offset,
+                what: "item start at nonzero brace depth (lexer desync)",
+            });
+        }
+        for c in t.chars() {
+            match c {
+                '{' => depth += 1,
+                '}' => depth -= 1,
+                _ => {}
+            }
+        }
+        if depth < 0 || (t.starts_with('}') && depth != 0) {
+            return Err(MaskError {
+                offset,
+                what: "unbalanced closing brace (lexer desync)",
+            });
+        }
+        offset += line.len();
+    }
+    if depth != 0 {
+        return Err(MaskError {
+            offset: masked.len(),
+            what: "unbalanced braces at end of input (lexer desync)",
+        });
+    }
+    Ok(())
+}
+
+/// [`try_mask_rust`] for callers with no file name to report: panics (a test
+/// failure) on an unterminated literal or comment.
+///
+/// # Panics
+///
+/// On an unterminated literal or comment.
+#[must_use]
+pub fn mask_rust(src: &str) -> String {
+    try_mask_rust(src).unwrap_or_else(|e| panic!("mask_rust: {e}"))
 }
