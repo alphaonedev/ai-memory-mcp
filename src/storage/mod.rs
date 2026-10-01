@@ -5967,8 +5967,8 @@ pub(crate) fn caller_may_mutate_live_row(
 /// in the live `memories` table whose `metadata->'agent_id'` JSON
 /// field matches `caller` (with the inbox-target carve-out:
 /// `metadata->'target_agent_id' == caller` is also archivable by
-/// the inbox owner, matching
-/// [`crate::store::is_visible_to_caller`]).
+/// the inbox owner, matching the owner/inbox arm of
+/// [`crate::visibility::is_visible_by_fields`]).
 ///
 /// Pre-#940 the HTTP handler at
 /// `src/handlers/archive.rs::archive_by_ids` (sqlite branch) called
@@ -17340,8 +17340,8 @@ pub fn restore_archived(conn: &Connection, id: &str) -> Result<bool> {
 /// rows whose `metadata->'agent_id'` JSON field matches `caller`
 /// (with the inbox-target carve-out: rows whose
 /// `metadata->'target_agent_id'` matches `caller` are also
-/// restorable by the inbox owner, matching the SAL
-/// [`crate::store::is_visible_to_caller`] visibility predicate).
+/// restorable by the inbox owner, matching the owner/inbox arm of the
+/// [`crate::visibility::is_visible_by_fields`] visibility predicate).
 ///
 /// Pre-#940 the only restore variant was owner-blind; any
 /// authenticated HTTP caller could restore any other owner's
@@ -17835,8 +17835,8 @@ pub fn purge_archive(conn: &Connection, older_than_days: Option<i64>) -> Result<
 /// `metadata->'agent_id'` JSON field matches `caller` (with the
 /// inbox-target carve-out: rows whose `metadata->'target_agent_id'`
 /// matches `caller` are also purgeable by the inbox owner, matching
-/// the SAL [`crate::store::is_visible_to_caller`] visibility
-/// predicate).
+/// the owner/inbox arm of the [`crate::visibility::is_visible_by_fields`]
+/// visibility predicate).
 ///
 /// Pre-#936 the only purge variant was owner-blind; any authenticated
 /// HTTP caller could destroy every owner's archive corpus via
