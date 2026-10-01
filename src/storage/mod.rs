@@ -904,9 +904,9 @@ pub use pending_approve_execute_4025::{
     approve_execute_pending_action, count_approved_without_effect_marker, mark_effect_applied,
     payload_has_effect_marker, strip_reserved_payload_keys,
 };
-pub(crate) use pending_approve_execute_4025::{
-    marker_absent_pg, marker_absent_sqlite, marker_present_pg, marker_present_sqlite,
-};
+#[cfg(feature = "sal-postgres")]
+pub(crate) use pending_approve_execute_4025::{marker_absent_pg, marker_present_pg};
+pub(crate) use pending_approve_execute_4025::{marker_absent_sqlite, marker_present_sqlite};
 /// #1955 [P1][R45] — substrate record-stop actuator (storage layer): the
 /// non-feature-gated flag registry + attestation logic + the
 /// `StorageError::RecordStopped` `db::`-funnel gate. Lives here (not under

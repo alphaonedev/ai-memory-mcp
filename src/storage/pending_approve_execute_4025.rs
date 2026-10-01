@@ -153,6 +153,7 @@ macro_rules! marker_absent_sqlite {
 }
 /// PostgreSQL (jsonb): boolean SQL expression, true when column `$col` holds
 /// the marker (mirror of [`payload_has_effect_marker`]).
+#[cfg_attr(not(feature = "sal-postgres"), allow(unused_macros))]
 macro_rules! marker_present_pg {
     ($col:literal) => {
         concat!(
