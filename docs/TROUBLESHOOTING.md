@@ -279,14 +279,16 @@ responses to avoid leaking internals.
 full error. If running in foreground, look at stderr. Raise verbosity
 with `RUST_LOG=ai_memory=debug`.
 
-### "503 quorum_not_met" on every write
+### `202` with `"quorum_met": false` on every write
 
 **Cause**: Federation is configured (`--quorum-writes N --quorum-peers …`)
 but peers are unreachable or slow.
 
 **Diagnosis**:
 
-1. Body carries `{"got":X,"needed":Y,"reason":"…"}`. `reason`:
+1. The write is committed locally but under-replicated. The body carries
+   `{"quorum_met":false,"acks":X,"needed":Y,"reason":"…","durability":"local"}`;
+   it does not enumerate individual peer outcomes. `reason`:
    - `unreachable` — no peers responded at all (network / DNS).
    - `timeout` — some peers acked but not enough before
      `--quorum-timeout-ms`.
