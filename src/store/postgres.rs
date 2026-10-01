@@ -2683,37 +2683,18 @@ impl PostgresStore {
         // #3866 — the TRANSPORT decides first: a Unix-domain socket cannot
         // carry TLS, so it is refused BY NAME here rather than surfacing the
         // driver's "server does not support TLS" on the first connect.
-        match crate::transit_encryption::dsn_sslmode_floor(url) {
-            crate::transit_encryption::SslmodeFloor::Pinned { .. } => {}
-            crate::transit_encryption::SslmodeFloor::UnixSocket { dir } => {
-                return Err(StoreError::InvalidInput {
-                    detail: crate::transit_encryption::pg_unix_socket_refusal(&dir),
-                });
-            }
-            crate::transit_encryption::SslmodeFloor::Unparseable => {
-                return Err(StoreError::InvalidInput {
-                    detail: crate::transit_encryption::pg_dsn_unparseable_refusal(),
-                });
-            }
-            crate::transit_encryption::SslmodeFloor::NotPinned { .. } => {
-                return Err(StoreError::InvalidInput {
-                    detail: crate::transit_encryption::pg_sslmode_refusal(),
-                });
-            }
-        }
-
-        // #3674 — through the DSN screen, never `url.parse()`: sqlx logs every
-        // query parameter it does not recognise with its VALUE at WARN.
-        let options: PgConnectOptions =
-            dsn::connect_options(url).map_err(|e: sqlx::Error| StoreError::BackendUnavailable {
+        // #4333 — the floor and the DSN screen are ONE function shared with
+        // every doctor / CLI probe (`dsn::floored_connect_options`).
+        let options: PgConnectOptions = dsn::floored_connect_options(url).map_err(|e| match e {
+            dsn::FlooredConnectError::Refused(detail) => StoreError::InvalidInput { detail },
+            // #1579 A3 (SECURITY) — the parse text is URL-redacted
+            // before it leaves the adapter.
+            dsn::FlooredConnectError::Parse(detail) => StoreError::BackendUnavailable {
                 backend: "postgres".to_string(),
                 sqlstate: None,
-                // #1579 A3 (SECURITY) — sqlx parse errors can
-                // interpolate the raw URL (credential included)
-                // into their Display; scrub any embedded URL's
-                // password before the detail leaves the adapter.
-                detail: format!("parse url: {e}"),
-            })?;
+                detail: format!("parse url: {detail}"),
+            },
+        })?;
         // v0.7.0 M4/M7 — `after_connect` hook fires the moment a new
         // connection is acquired. We use it to apply per-session
         // `statement_timeout` + `lock_timeout` so a runaway query

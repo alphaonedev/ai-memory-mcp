@@ -171,6 +171,47 @@ pub fn connect_options(dsn: &str) -> Result<PgConnectOptions, sqlx::Error> {
     PgConnectOptions::from_str(&screened.dsn)
 }
 
+/// Why [`floored_connect_options`] produced no options.
+#[derive(Debug)]
+pub enum FlooredConnectError {
+    /// The DSN is below the #3705 transit-encryption floor. Carries the
+    /// operator-facing refusal (never the DSN). No socket was opened.
+    Refused(String),
+    /// sqlx could not parse the DSN. The text is already URL-redacted.
+    Parse(String),
+}
+
+impl std::fmt::Display for FlooredConnectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused(detail) => f.write_str(detail),
+            Self::Parse(detail) => write!(f, "parse url: {detail}"),
+        }
+    }
+}
+
+impl std::error::Error for FlooredConnectError {}
+
+/// [`connect_options`] behind the #3705 transit-encryption floor (#4333):
+/// the ONE function production code uses to turn a store DSN into connect
+/// options. A DSN that does not pin `sslmode=verify-full` on a TCP transport
+/// (absent, weaker, a Unix socket, unparseable) is refused HERE, before any
+/// socket exists, so a caller cannot reach the database over an unverified
+/// channel. Fails closed (ERRORS-01).
+///
+/// # Errors
+///
+/// [`FlooredConnectError::Refused`] below the floor;
+/// [`FlooredConnectError::Parse`] when sqlx cannot parse the DSN.
+pub fn floored_connect_options(dsn: &str) -> Result<PgConnectOptions, FlooredConnectError> {
+    if let Some(refusal) = crate::transit_encryption::pg_dsn_floor_refusal(dsn) {
+        return Err(FlooredConnectError::Refused(refusal));
+    }
+    connect_options(dsn).map_err(|e| {
+        FlooredConnectError::Parse(crate::logging::redact_urls_in_message(&e.to_string()))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
