@@ -323,6 +323,14 @@ async fn check(app: AppState) -> Value {
                 &json!({"namespace": mcp_ns, "id": a_leaf_std, "agent_id": ALICE}),
             )
             .expect("the ancestor owner binds on the MCP surface");
+            // The operator CLI surface (`ai-memory namespace set-standard`,
+            // the trusted daemon principal) is the admin path: unaffected.
+            ai_memory::mcp::handle_namespace_set_standard_trusted(
+                &guard.0,
+                &json!({"namespace": format!("{gov}/cliadm"), "id": b_std}),
+                ai_memory::identity::sentinels::DAEMON_PRINCIPAL,
+            )
+            .expect("the operator / daemon bind is unaffected");
         }
     }
 
@@ -360,6 +368,85 @@ async fn check(app: AppState) -> Value {
             .expect("an admin/bypass context is unaffected");
     }
 
+    // EXPLICIT PARENT: a flat root that DECLARES the governed `gov` as its
+    // (entitled) parent puts its `/`-subtree under `gov`'s owner even though
+    // the root's own standard carries no policy (it does not shadow `gov`).
+    let ex = format!("expl4356{uniq}");
+    let a_ex_std = create_memory(&router, ALICE, &ex, "alice-explicit-root").await;
+    let (status, got) = call(
+        &router,
+        "POST",
+        "/api/v1/namespaces",
+        ALICE,
+        Some(json!({"namespace": ex, "id": a_ex_std, "parent": gov})),
+    )
+    .await;
+    assert!(
+        status.is_success(),
+        "alice declares gov as ex's parent: {status} {got}"
+    );
+    let ex_leaf = format!("{ex}/leaf");
+    let (status, refused_ex) = bind(
+        &router,
+        BOB,
+        &ex_leaf,
+        &b_std,
+        Some(json!({"write": "any"})),
+    )
+    .await;
+    assert_refusal(status, &refused_ex, BOB, &ex_leaf);
+    let (status, ok) = bind(&router, ALICE, &ex_leaf, &a_leaf_std, None).await;
+    assert!(
+        status.is_success(),
+        "explicit parent: owner binds {status} {ok}"
+    );
+
+    // SEVERED ancestor (its standard memory deleted, #2503 sever): nobody but
+    // an operator may open a child; same closed shape on both backends.
+    let sev = format!("sev4356{uniq}");
+    let a_sev_std = create_memory(&router, ALICE, &sev, "alice-severed-standard").await;
+    let (status, got) = bind(
+        &router,
+        ALICE,
+        &sev,
+        &a_sev_std,
+        Some(json!({"write": "owner"})),
+    )
+    .await;
+    assert!(status.is_success(), "{status} {got}");
+    let (status, got) = call(
+        &router,
+        "DELETE",
+        &format!("/api/v1/memories/{a_sev_std}"),
+        ALICE,
+        None,
+    )
+    .await;
+    assert!(
+        status.is_success(),
+        "delete severs the ancestor: {status} {got}"
+    );
+    let sev_leaf = format!("{sev}/leaf");
+    let (status, refused_sev) = bind(
+        &router,
+        BOB,
+        &sev_leaf,
+        &b_std,
+        Some(json!({"write": "any"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{refused_sev}");
+    assert_eq!(
+        refused_sev["error"],
+        ai_memory::ns_standard_ancestor::REASON_ANCESTOR_STANDARD_UNRESOLVABLE,
+        "{refused_sev}"
+    );
+    assert_eq!(
+        refused_sev["code"],
+        ai_memory::errors::error_codes::NOT_OWNER
+    );
+    assert!(!refused_sev.to_string().contains(ALICE), "{refused_sev}");
+
     // PRESENCE: alice (the ancestor's owner) binds the child through HTTP.
     let (status, ok) = bind(
         &router,
@@ -382,7 +469,7 @@ async fn check(app: AppState) -> Value {
         status.is_success(),
         "an ungoverned subtree stays opt-in for anyone: {status} {free_r}"
     );
-    refused
+    json!({"not_owner": refused, "severed": refused_sev})
 }
 
 #[tokio::test]
@@ -406,7 +493,9 @@ async fn postgres_first_child_bind_requires_the_governing_ancestors_owner_4356()
     std::fs::create_dir_all(".local-runs").unwrap();
     let dir = tempfile::tempdir_in(".local-runs").unwrap();
     let mut sq = check(sqlite_app_state(&dir.path().join("memories.db"))).await;
-    sq["namespace"] = pg["namespace"].clone();
+    for k in ["not_owner", "severed"] {
+        sq[k]["namespace"] = pg[k]["namespace"].clone();
+    }
     assert_eq!(
         serde_json::to_string(&pg).unwrap(),
         serde_json::to_string(&sq).unwrap(),
