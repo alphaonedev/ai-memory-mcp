@@ -404,6 +404,14 @@ fn main() -> Result<()> {
     // and swallowed so a missing key never blocks daemon startup.
     // #3354 — the WRITE PATH: a ledger-writing command gets its signing key
     // ensured (generated when absent) before its first row, or does not start.
+    // #4319 (vote 5c424459) — only the long-running request servers queue
+    // forensic rows on a background writer (#1472: no per-request file I/O on
+    // their request path), drained at exit. Every other process writes each
+    // row before recording it returns, so a short-lived command can never
+    // exit with its row still queued.
+    if uses_background_forensic_writer(&cli.command) {
+        ai_memory::governance::audit::use_background_writer();
+    }
     if let Err(e) = init_forensic_audit(
         &app_config,
         hosts_ledger_writers(&cli.command),
@@ -454,6 +462,12 @@ fn main() -> Result<()> {
         .enable_all()
         .build()?;
     let result = runtime.block_on(daemon_runtime::run(cli, &app_config, audit_pubkey.as_ref()));
+    // #4319 — on unix the exit drain is an `atexit` hook (it also covers every
+    // `std::process::exit` inside the commands); elsewhere drain here, bounded.
+    #[cfg(not(unix))]
+    let _ = ai_memory::governance::audit::drain_bounded(
+        ai_memory::governance::audit::EXIT_DRAIN_BUDGET,
+    );
     if result.as_ref().err().is_some_and(|error| {
         error
             .downcast_ref::<daemon_runtime::FatalShutdownError>()
@@ -510,6 +524,17 @@ fn config_tolerant_command(cmd: &daemon_runtime::Command) -> bool {
 /// stderr; the diagnostics report the state instead): the caller-visible
 /// surfaces are `memory_session_start.signing`, capabilities
 /// `signing_key_installed`, `/health.signed_events_signing` and `doctor`.
+/// #4319 — the commands whose forensic rows go through the background writer:
+/// the long-running request servers only, where per-request file I/O on the
+/// request path is what #1472 removed. Anything else writes inline, which is
+/// the safe side of a misclassification.
+fn uses_background_forensic_writer(cmd: &daemon_runtime::Command) -> bool {
+    matches!(
+        cmd,
+        daemon_runtime::Command::Serve(_) | daemon_runtime::Command::Mcp { .. }
+    )
+}
+
 fn hosts_ledger_writers(cmd: &daemon_runtime::Command) -> bool {
     matches!(
         cmd,
@@ -885,6 +910,25 @@ fn warn_if_plaintext_retention_requested(audit_cfg: &config::AuditConfig) -> boo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #4319 — only the long-running request servers queue forensic rows on
+    /// the background writer; every other command writes inline, so a
+    /// short-lived process cannot exit with a row still queued.
+    #[test]
+    fn only_serve_and_mcp_use_the_background_forensic_writer_4319() {
+        let parse = |argv: &[&str]| Cli::try_parse_from(argv).expect("argv parses").command;
+        for argv in [&["ai-memory", "serve"][..], &["ai-memory", "mcp"][..]] {
+            assert!(uses_background_forensic_writer(&parse(argv)), "{argv:?}");
+        }
+        for argv in [
+            &["ai-memory", "archive", "purge", "--namespace", "n"][..],
+            &["ai-memory", "store", "--title", "t", "--content", "c"][..],
+            &["ai-memory", "sync-daemon", "--peers", "https://p"][..],
+            &["ai-memory", "export"][..],
+        ] {
+            assert!(!uses_background_forensic_writer(&parse(argv)), "{argv:?}");
+        }
+    }
 
     /// #3354 review — the egress verbs are ONE definition, and the unsigned-
     /// ledger refusal reads it: an operator whose key dir is unwritable can
