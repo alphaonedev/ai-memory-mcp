@@ -60,7 +60,9 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use serde::{Deserialize, Serialize};
 
-use crate::wake_hub::limits::{RECIPIENT_SEQ_BUDGET_BYTES, RECIPIENT_SEQ_ENTRY_OVERHEAD_BYTES};
+use crate::wake_hub::limits::{
+    MAX_ID_BYTES, RECIPIENT_SEQ_BUDGET_BYTES, RECIPIENT_SEQ_ENTRY_OVERHEAD_BYTES,
+};
 use tokio::sync::broadcast;
 
 /// Capacity of the process-wide inbox wake channel.
@@ -84,8 +86,8 @@ static WAKE_SEQ: AtomicU64 = AtomicU64::new(0);
 /// A recipient's [`InboxEvent::AgentNotified::recipient_seq`] moves ONLY when
 /// a wake is published to that recipient, so the gap between two of its values
 /// counts the recipient's own missed wakes and never measures another tenant's
-/// notify volume (the host-wide [`WAKE_SEQ`] does, which is why #4071 keeps it
-/// off tenant-facing surfaces). Because the number is assigned HERE, before
+/// notify volume (the host-wide [`WAKE_SEQ`] does, which is why #4071 — open —
+/// tracks keeping it off tenant-facing surfaces). Because the number is assigned HERE, before
 /// the broadcast send, a consumer whose receiver lags still sees the dropped
 /// numbers as a gap; a counter kept in the consumer would renumber across it.
 ///
@@ -93,7 +95,18 @@ static WAKE_SEQ: AtomicU64 = AtomicU64::new(0);
 /// `wake_hub::limits` discipline): recipient ids are caller-supplied up to 128
 /// bytes, so a count bound would not bound memory. At the budget the
 /// LEAST-RECENTLY-WOKEN recipient is evicted, one entry at a time, so a
-/// recipient that is not evicted is never disturbed.
+/// recipient that is not evicted is never disturbed. The evicted recipient
+/// may be an OBSERVER'S OWN idle id (a canary), not an idle victim: see
+/// `docs/wake-hub.md` ("Eviction and what it reveals") for exactly what a
+/// party that floods the table to full learns from it, and what it cannot.
+///
+/// A recipient id longer than [`MAX_ID_BYTES`] is NEVER tracked: the hub cannot
+/// carry such an id (the codec refuses it), so tracking one buys nothing and
+/// would only evict real recipients (a single oversized id displaces hundreds
+/// of valid ones). The map is allocated at TWICE its entry ceiling up front:
+/// evict-then-insert churn leaves tombstones, a table more than half full
+/// answers that by doubling, and one at most half full rehashes in place
+/// instead, so the map never grows and has no transient peak.
 struct RecipientSeqs {
     slots: HashMap<Arc<str>, Slot>,
     /// Recency index: tick -> recipient, oldest first. Ticks are unique, so
@@ -117,7 +130,16 @@ fn entry_cost(key: &str) -> usize {
 impl RecipientSeqs {
     fn new(budget: usize) -> Self {
         Self {
-            slots: HashMap::new(),
+            // The most entries the budget can ever hold is `budget /
+            // OVERHEAD` (an empty key still costs the overhead). Sizing to
+            // exactly that is NOT enough: measured, 120k-id churn doubled the
+            // table, because tombstones left by evict-then-insert at >50%
+            // load force a grow instead of an in-place rehash. At 2x the live
+            // count never exceeds half the capacity, so hashbrown always
+            // rehashes in place: no old+new bucket arrays coexisting.
+            slots: HashMap::with_capacity(
+                (budget / RECIPIENT_SEQ_ENTRY_OVERHEAD_BYTES).saturating_mul(2),
+            ),
             recency: BTreeMap::new(),
             tick: 0,
             bytes: 0,
@@ -142,6 +164,13 @@ impl RecipientSeqs {
     /// and hide a real gap behind its old high-watermark. Every OTHER
     /// recipient still sees +1.
     fn assign(&mut self, recipient: &str) -> u64 {
+        // The length guard runs FIRST — before the recency tick, any eviction
+        // or any map insert — so an id the hub cannot carry costs nothing and
+        // evicts nobody. It still gets a (forward, wall-clock) number so the
+        // frame is well formed; it is undeliverable anyway.
+        if recipient.len() > MAX_ID_BYTES {
+            return recipient_seq_base();
+        }
         let tick = self.next_tick();
         if let Some(slot) = self.slots.get_mut(recipient) {
             slot.seq = slot.seq.saturating_add(1);
@@ -238,9 +267,11 @@ pub enum InboxEvent {
         /// catch-up inbox read) and carries no other tenant's activity volume.
         /// This, not [`Self::AgentNotified::seq`], is what the wake-hub
         /// forwards as `seq_high_watermark`. Values are large (they start
-        /// from a wall-clock base, see `recipient_seq_base`) and only their
-        /// ORDER and DIFFERENCES are meaningful. `0` on a frame decoded from
-        /// a producer that predates the field.
+        /// from a wall-clock base, see `recipient_seq_base`); their ORDER is
+        /// meaningful, and a DIFFERENCE is a wake count only between two
+        /// values with no rebase (producer restart or eviction) in between —
+        /// across a rebase the difference is a clock delta, not a count.
+        /// `0` on a frame decoded from a producer that predates the field.
         #[serde(default)]
         recipient_seq: u64,
     },
@@ -557,6 +588,60 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(2));
         let b2 = t.assign("b");
         assert!(b2 > b1 + 1, "evicted B sees a forward jump: {b1} -> {b2}");
+    }
+
+    /// #4125 (sec F1) — an id over the wire bound is not tracked and evicts
+    /// nobody, however many are published; a bounded id still is tracked.
+    #[test]
+    fn oversized_recipient_ids_are_untracked_and_evict_nobody_4125() {
+        let mut t = RecipientSeqs::new(3 * entry_cost("x"));
+        let a1 = t.assign("a");
+        let b1 = t.assign("b");
+        let c1 = t.assign("c");
+        let (bytes, len) = (t.bytes, t.slots.len());
+        for i in 0..64_usize {
+            let big = format!("{i:0>width$}", width = MAX_ID_BYTES + 1 + i);
+            assert!(big.len() > MAX_ID_BYTES);
+            assert!(t.assign(&big) > 0, "still gets a well-formed number");
+        }
+        assert_eq!(
+            (t.bytes, t.slots.len(), t.recency.len()),
+            (bytes, len, len),
+            "no oversized id was inserted or accounted"
+        );
+        assert_eq!(t.assign("a"), a1 + 1, "A was not evicted");
+        assert_eq!(t.assign("b"), b1 + 1, "B was not evicted");
+        assert_eq!(t.assign("c"), c1 + 1, "C was not evicted");
+        let mut roomy = RecipientSeqs::new(RECIPIENT_SEQ_BUDGET_BYTES);
+        let at = "d".repeat(MAX_ID_BYTES);
+        roomy.assign(&at);
+        assert!(
+            roomy.slots.contains_key(at.as_str()),
+            "an id AT the bound is tracked"
+        );
+    }
+
+    /// #4125 (sec F4) — the map is sized to its ceiling at construction and
+    /// never grows, so there is no rehash peak above the byte budget.
+    #[test]
+    fn recipient_map_is_presized_and_never_grows_4125() {
+        let mut t = RecipientSeqs::new(RECIPIENT_SEQ_BUDGET_BYTES);
+        let cap = t.slots.capacity();
+        assert!(
+            cap >= 2 * (RECIPIENT_SEQ_BUDGET_BYTES / RECIPIENT_SEQ_ENTRY_OVERHEAD_BYTES),
+            "pre-sized for twice the most entries the budget can hold: {cap}"
+        );
+        for i in 0..120_000_usize {
+            t.assign(&format!("r{i}"));
+        }
+        // `capacity()` dips while tombstones are outstanding (items + growth
+        // left), so "never grew" is "never above the pre-sized figure"; a grow
+        // would double it.
+        assert!(
+            t.slots.capacity() <= cap,
+            "never grew: {} > {cap}",
+            t.slots.capacity()
+        );
     }
 
     #[test]

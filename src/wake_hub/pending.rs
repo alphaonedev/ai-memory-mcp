@@ -126,6 +126,11 @@ impl PendingStore {
     /// gets no offline coalescing — degrade, never refuse the session and never
     /// grow past the bound.
     pub fn note_known(&mut self, agent_id: &str) -> bool {
+        // An id the codec cannot carry is never a hello-verified agent; refuse
+        // it BEFORE any table insert so it cannot occupy a known-agent slot.
+        if agent_id.len() > MAX_ID_BYTES {
+            return false;
+        }
         if self.known.contains(agent_id) {
             return true;
         }
@@ -140,7 +145,9 @@ impl PendingStore {
     /// Coalesce one wake for an offline agent. Returns `true` when it was
     /// retained, `false` when the agent is unknown and the hint was dropped.
     pub fn record(&mut self, agent_id: &str, inbox_row_id: &str) -> bool {
-        if !self.known.contains(agent_id) {
+        // Over-long ids are rejected before the known-set lookup and before
+        // any per-agent set is created (the same guard as `note_known`).
+        if agent_id.len() > MAX_ID_BYTES || !self.known.contains(agent_id) {
             self.dropped_unknown = self.dropped_unknown.saturating_add(1);
             return false;
         }
@@ -256,6 +263,23 @@ mod tests {
         assert!(s.note_known("a"), "an already-known agent is idempotent");
         assert_eq!(s.refused_known_slots(), 1);
         assert!(!s.is_known("c"));
+    }
+
+    /// #4125 — an agent id over the wire bound never reaches the known set or
+    /// the pending-set map (the offline/coalesced path), and an in-bound id
+    /// still does.
+    #[test]
+    fn an_over_long_agent_id_never_enters_the_offline_tables_4125() {
+        let mut s = PendingStore::new(8, 3);
+        let long = "a".repeat(MAX_ID_BYTES + 1);
+        assert!(!s.note_known(&long), "over-long id takes no known slot");
+        assert!(!s.is_known(&long));
+        assert!(!s.record(&long, "row-1"), "and records nothing");
+        assert_eq!(s.tracked_agents(), 0);
+        let at = "a".repeat(MAX_ID_BYTES);
+        assert!(s.note_known(&at));
+        assert!(s.record(&at, "row-1"));
+        assert_eq!(s.tracked_agents(), 1);
     }
 
     #[test]

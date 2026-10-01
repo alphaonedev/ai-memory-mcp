@@ -53,8 +53,9 @@ Every wake carries `seq_high_watermark`: the RECIPIENT's own wake number,
 assigned by the producer at publish time (#4125). It moves only when a wake is
 published to that recipient, so a gap between two of your values counts wakes
 YOU missed and never measures another tenant's notify volume (the host-wide
-wake sequence did, which is the cross-tenant side channel #4071 also removes
-from the inbox SSE stream). It is a count of wakes, not an inbox depth — a
+wake sequence did). That same host-wide sequence is the cross-tenant channel
+tracked by #4071, which is OPEN and NOT fixed by this change: the inbox SSE
+stream still emits the host-wide `seq` until #4071 lands. It is a count of wakes, not an inbox depth — a
 truthful depth would put a database read on the very latency path this plane
 exists to remove.
 
@@ -62,34 +63,60 @@ The number is assigned BEFORE the frame enters the bounded broadcast bus and is
 forwarded verbatim by every sink, never renumbered: a counter kept in a sink
 would only advance for frames the sink actually received, so a lagging sink
 would hand you contiguous numbers across a real drop. Values start from a
-wall-clock base (only their order and differences are meaningful), so a
-producer restart or an eviction from the producer's per-recipient table moves
-your number FORWARD — at worst one wake is labelled `gap`, which costs nothing
+wall-clock base, so only their ORDER is meaningful, and a difference is a wake
+count only between two values with no rebase in between. A producer restart or
+an eviction from the producer's per-recipient table is a rebase: it moves your
+number FORWARD by a clock delta (~10^7 to ~10^12), which is not a count. The
+client therefore clamps `AI_MEMORY_WAKE_MISSED` to
+`wake_client::MAX_REPORTED_MISSED` (65,536, saturating): treat `missed > 0`
+(reason `gap`) as the only reliable signal, never as a loop or batch bound.
+A rebase moves your number FORWARD — at worst one wake is labelled `gap`, which costs nothing
 extra because every wake already triggers exactly one catch-up read.
 
 **Memory bound.** The producer's per-recipient table is bounded in BYTES, not
 entries (`wake_hub::limits::RECIPIENT_SEQ_BUDGET_BYTES` = 8 MiB): each entry is
 accounted as its recipient-id bytes plus
-`RECIPIENT_SEQ_ENTRY_OVERHEAD_BYTES` (192), a generous upper bound on resident
-cost. Recipient ids are caller-supplied up to 128 bytes, so an entry-count cap
+`RECIPIENT_SEQ_ENTRY_OVERHEAD_BYTES` (192), a generous upper bound on the
+per-entry cost. Recipient ids are caller-supplied up to 128 bytes, so an entry-count cap
 would not bound memory. At the 128-byte ceiling the table holds about 26,000
-recipients; shorter ids fit proportionally more.
+recipients; shorter ids fit proportionally more. An id over 128 bytes
+(`MAX_ID_BYTES`) is never tracked: the hub cannot carry it, and tracking one
+would only evict real recipients. The hash table is a fixed reservation ON TOP of that
+budget, allocated once at twice the most entries the budget can hold (about
+4.3 MiB at the default): churn leaves tombstones, and a table more than half
+full doubles to reclaim them (measured: 120k-id churn doubled a table sized to
+exactly the ceiling), whereas one at most half full rehashes in place, so this
+table never grows and has no transient peak. In-place rehashes happen under the
+producer's short lock, about once per 70,000 evictions. The per-entry
+accounting is an argued upper bound, not a measured RSS figure.
 
 **Eviction and what it reveals.** At the budget the producer evicts the
 LEAST-RECENTLY-WOKEN recipient, one entry at a time. A recipient that stays
 resident always sees its number advance by exactly 1; only an evicted
 recipient sees a jump, on its next wake, and pays one extra catch-up read. That
-jump is a residual one-bit signal and it is NOT nothing: it tells the evicted
-recipient that, since it was last woken, enough other distinct recipient ids
-were woken to fill the table, and a party that can notify arbitrary ids can
-force that eviction for a recipient that has been idle. It is a bounded COUNT
-oracle, not merely one bit: an attacker can wake its own id, notify k fresh ids,
-and from whether its own number jumped bound how many distinct other recipients
-were woken in that window. Each probe costs roughly 26,000 notifies (up to
-about 43,000 with short ids) to fill the table, so the per-agent daily
-write quota (`AI_MEMORY_MAX_MEMORIES_PER_DAY`) makes it impractical today. It
-carries no recipient identity and no content, and it is far weaker than the
-host-wide-sequence volume signal this change removes.
+jump is a residual signal and it is NOT nothing. Stated exactly:
+
+- **What a full table lets an observer learn.** A party that controls ONE
+  recipient id A (its own inbox, so it sees A's numbers) and can notify arbitrary
+  ids can flood fresh ids until the table is full of its own ids, with A the
+  least-recently-woken entry. From then on ANY wake to ANY recipient not in
+  the table evicts A, so A's next number jumps. The observer learns whether at
+  least one other recipient was woken inside a window it chooses (a presence
+  oracle), and by varying how many fresh ids it floods it can bound how many
+  DISTINCT other recipients were woken (a threshold test on a distinct-recipient
+  count). It is the observer's own idle id that is evicted, not an idle victim.
+- **What it cannot learn.** Which recipient, which sender, any content,
+  digest or inbox row, or how many wakes any one recipient received: once a
+  victim is in the table, repeat wakes to it change nothing. It sees only its
+  own number.
+- **Cost.** Each probe needs about one full table turnover: roughly 43,000
+  notifies with the shortest ids, about 26,000 with 128-byte ids. Every notify
+  is charged to the sender's per-agent daily write quota
+  (`AI_MEMORY_MAX_MEMORIES_PER_DAY`, default 1,000), so one identity cannot
+  afford a probe in a day. The quota is per agent: an attacker holding N
+  identities divides that cost by N, so this is a quota-bounded residual and
+  not a closed channel. It is far weaker than the host-wide-sequence volume
+  signal this change removes.
 
 Read it as *"wakes happened that you did not see"*. The correct response to a
 gap is ONE catch-up inbox read. That is fail-safe by construction: a client may

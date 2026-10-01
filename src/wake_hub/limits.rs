@@ -306,14 +306,22 @@ pub const DEFAULT_RECONNECT_JITTER_MS: u32 = 750;
 /// this file's discipline: the summed key length plus
 /// [`RECIPIENT_SEQ_ENTRY_OVERHEAD_BYTES`] per entry never exceeds this. At
 /// the 128-byte id ceiling that is ~26k tracked recipients; past it the
-/// least-recently-woken recipient is evicted (see `docs/wake-hub.md`).
+/// least-recently-woken recipient is evicted (see `docs/wake-hub.md`). An id
+/// over [`MAX_ID_BYTES`] is never tracked at all (the hub cannot carry it). The
+/// hash table itself is a FIXED reservation on top of this budget: twice the
+/// most entries the budget can hold (`2 * budget /
+/// RECIPIENT_SEQ_ENTRY_OVERHEAD_BYTES` slots, ~4.3 MiB at the default). Twice,
+/// because remove-then-insert churn leaves tombstones and a table that is more
+/// than half full GROWS (doubles) to reclaim them, while one at most half full
+/// rehashes in place; so it never grows and has no transient peak.
 pub const RECIPIENT_SEQ_BUDGET_BYTES: usize = 8 * 1_024 * 1_024;
 
 /// Accounted per-entry cost on top of the key bytes: the shared `Arc<str>`
 /// header, the hash-map slot (key pointer, counter, recency tick, control
-/// byte, load-factor slack) and the recency-index node. A deliberately
-/// generous constant so the accounted bytes are an UPPER bound on resident
-/// memory, never an underestimate.
+/// byte) and the recency-index node. A deliberately generous constant so the
+/// accounted per-entry bytes are an argued upper bound on the per-entry heap
+/// cost (not a measured RSS figure). The pre-sized hash table is a separate
+/// fixed reservation, see [`RECIPIENT_SEQ_BUDGET_BYTES`].
 pub const RECIPIENT_SEQ_ENTRY_OVERHEAD_BYTES: usize = 192;
 
 // ---------------------------------------------------------------------------

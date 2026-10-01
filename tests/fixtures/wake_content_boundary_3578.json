@@ -69,7 +69,7 @@
     "path": "src/wake_hub/pending.rs",
     "role": "Hub routing and bounded codecs; only public verification/visibility dependencies admitted by the separate zero-authority gate.",
     "mode": "rust-production-tokens",
-    "sha256": "535baad90ef00428392f691a761071b6c60ef974cd3597b83b6c603773c5bc0a"
+    "sha256": "d67386992cfe202578cb5e39f9c612f926b1e883d3f18002c5e4bc6eac16fc50"
   },
   {
     "path": "src/wake_hub/routing.rs",
@@ -99,7 +99,7 @@
     "path": "src/wake_client/mod.rs",
     "role": "Client bundle/session/signal boundary; decode hints and request a read, never write memory.",
     "mode": "rust-production-tokens",
-    "sha256": "7b85c545a8d265773aca45e4f0de989c59ec63b5e6185f451fb4a3f33b1f0c3b"
+    "sha256": "7cad4fc0e315b4f7f326fcfda799dce8d131f707138bf38e63bb8e72017d0e38"
   },
   {
     "path": "src/wake_client/session.rs",
@@ -147,7 +147,7 @@
     "path": "src/inbox_wake.rs",
     "role": "Already-committed notify -> content-free bus event -> installed sink; no reverse content-write edge.",
     "mode": "rust-production-tokens",
-    "sha256": "3fad61f844288c315b27c54d60c2bf0bf79da03ba378867f79391075a6b665be"
+    "sha256": "c02eecfb5a3d4c504f2091dc88f72db3b40680c4cdece75bda83a35979e193f2"
   },
   {
     "path": "src/spawn_audit.rs",
