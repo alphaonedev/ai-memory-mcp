@@ -1979,8 +1979,8 @@ impl OllamaClient {
     /// Returns the response text.
     ///
     /// v0.7.0 F6 — the call is guarded by a circuit breaker. After
-    /// [`CIRCUIT_BREAKER_THRESHOLD`] consecutive failures the call
-    /// fast-fails for [`CIRCUIT_BREAKER_COOLDOWN`] instead of waiting
+    /// [`CIRCUIT_BREAKER_THRESHOLD`] consecutive provider failures (transport,
+    /// HTTP 5xx, or unusable response envelopes) the call fast-fails for [`CIRCUIT_BREAKER_COOLDOWN`] instead of waiting
     /// the full HTTP timeout each time. This is the key defence
     /// against the Round-2 F6 deadlock where a dead ollama caused
     /// every chat-backed MCP tool to hang the daemon for 30s+.
@@ -2092,6 +2092,7 @@ impl OllamaClient {
             LlmProvider::Ollama => body["message"]["content"]
                 .as_str()
                 .ok_or_else(|| {
+                    self.note_failure();
                     self.provider
                         .invalid_response("Missing 'message.content' field in chat output")
                 })?
@@ -2099,6 +2100,7 @@ impl OllamaClient {
             LlmProvider::OpenAiCompatible { .. } => body["choices"][0]["message"]["content"]
                 .as_str()
                 .ok_or_else(|| {
+                    self.note_failure();
                     self.provider.invalid_response(
                         "Missing 'choices[0].message.content' field in OpenAI-compatible \
                          chat response",
@@ -2258,6 +2260,7 @@ impl OllamaClient {
             LlmProvider::Ollama => message["content"]
                 .as_str()
                 .ok_or_else(|| {
+                    self.note_failure();
                     self.provider
                         .invalid_response("Missing 'message.content' field in chat output")
                 })?
@@ -2265,6 +2268,7 @@ impl OllamaClient {
             LlmProvider::OpenAiCompatible { .. } => message["content"]
                 .as_str()
                 .ok_or_else(|| {
+                    self.note_failure();
                     self.provider.invalid_response(
                         "Missing 'choices[0].message.content' field in OpenAI-compatible \
                          chat response",
@@ -2328,6 +2332,7 @@ impl OllamaClient {
         let prompt = SUMMARIZE_PROMPT.replace("{memories}", &formatted);
         let response = self.generate_async(&prompt, None).await?;
 
+        crate::validate::validate_content(&response)?;
         Ok(response.trim().to_string())
     }
 
@@ -2507,6 +2512,7 @@ impl OllamaClient {
             LlmProvider::Ollama => body["message"]["content"]
                 .as_str()
                 .ok_or_else(|| {
+                    self.note_failure();
                     self.provider
                         .invalid_response("Missing 'message.content' in chat response")
                 })?
@@ -2514,6 +2520,7 @@ impl OllamaClient {
             LlmProvider::OpenAiCompatible { .. } => body["choices"][0]["message"]["content"]
                 .as_str()
                 .ok_or_else(|| {
+                    self.note_failure();
                     self.provider.invalid_response(
                         "Missing 'choices[0].message.content' in OpenAI-compatible \
                          chat response",
@@ -2648,6 +2655,7 @@ impl OllamaClient {
         let response_text = parsed["response"]
             .as_str()
             .ok_or_else(|| {
+                self.note_failure();
                 self.provider
                     .invalid_response("Missing 'response' field in generate output")
             })?
@@ -2834,11 +2842,13 @@ impl OllamaClient {
                 .and_then(|arr| arr.first())
                 .and_then(|v| v.as_array())
                 .ok_or_else(|| {
+                    self.note_failure();
                     self.provider
                         .invalid_response("Missing 'embeddings[0]' in Ollama embed response")
                 })?,
             LlmProvider::OpenAiCompatible { .. } => {
                 body["data"][0]["embedding"].as_array().ok_or_else(|| {
+                    self.note_failure();
                     self.provider.invalid_response(
                         "Missing 'data[0].embedding' in OpenAI-compatible embed response",
                     )
@@ -2853,6 +2863,7 @@ impl OllamaClient {
             .collect();
 
         if floats.is_empty() {
+            self.note_failure();
             return Err(anyhow!("Empty embedding returned from LLM"));
         }
 
@@ -3031,8 +3042,10 @@ impl OllamaClient {
             }
         };
 
-        let parsed = parse_openai_embeddings_batch(&body, chunk.len())
-            .map_err(|_| self.provider.failure(ProviderFailure::InvalidResponse))?;
+        let parsed = parse_openai_embeddings_batch(&body, chunk.len()).map_err(|_| {
+            self.note_failure();
+            self.provider.failure(ProviderFailure::InvalidResponse)
+        })?;
         self.note_success();
         Ok(parsed)
     }
@@ -7126,3 +7139,9 @@ mod classify_kind_parse_tests {
         assert_eq!(parse_classified_kind("42!!"), None);
     }
 }
+
+#[cfg(test)]
+mod issue_4047_regression_tests;
+
+#[cfg(test)]
+mod issue_4046_http_regression_tests;

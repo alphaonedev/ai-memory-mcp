@@ -10650,6 +10650,46 @@ pub fn consolidate(
     consolidator_agent_id: &str,
     substrate_authored: bool,
 ) -> Result<String> {
+    consolidate_with_expected_versions(
+        conn,
+        ids,
+        title,
+        summary,
+        namespace,
+        tier,
+        source,
+        consolidator_agent_id,
+        substrate_authored,
+        None,
+    )
+}
+
+/// Consolidate only if every source still has the version used to summarize it.
+/// `expected_versions`, when present, must be aligned one-for-one with `ids`.
+/// The comparison and all mutations share the immediate write transaction.
+///
+/// # Errors
+/// Returns a version conflict for stale inputs and propagates storage errors.
+#[allow(clippy::too_many_arguments)]
+pub fn consolidate_with_expected_versions(
+    conn: &Connection,
+    ids: &[String],
+    title: &str,
+    summary: &str,
+    namespace: &str,
+    tier: &Tier,
+    source: &str,
+    consolidator_agent_id: &str,
+    substrate_authored: bool,
+    expected_versions: Option<&[i64]>,
+) -> Result<String> {
+    crate::validate::validate_content(summary)?;
+    if let Some(versions) = expected_versions {
+        anyhow::ensure!(
+            versions.len() == ids.len(),
+            "source version count must match source ids"
+        );
+    }
     // #1955 R45 — record-stop fence for the consolidate funnel.
     crate::storage::record_stop::gate_storage_conn(conn)?;
     // #3014 — a TENANT consolidate is a memory-creating write (it mints a
@@ -10706,9 +10746,19 @@ pub fn consolidate(
         // confidence (which `get` already coalesces to that default) never
         // silently inflates the result.
         let mut min_confidence = crate::models::DEFAULT_CONFIDENCE;
-        for id in ids {
+        for (index, id) in ids.iter().enumerate() {
             match get(conn, id)? {
                 Some(mem) => {
+                    if let Some(versions) = expected_versions
+                        && versions[index] != mem.version
+                    {
+                        return Err(VersionConflict {
+                            id: id.clone(),
+                            expected: versions[index],
+                            current: mem.version,
+                        }
+                        .into());
+                    }
                     source_rows.push((
                         id.clone(),
                         mem.cid.clone(),

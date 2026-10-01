@@ -28496,6 +28496,33 @@ impl MemoryStore for PostgresStore {
         source: &str,
         consolidator_agent_id: &str,
     ) -> StoreResult<String> {
+        self.consolidate_with_expected_versions(
+            ctx,
+            ids,
+            title,
+            summary,
+            namespace,
+            tier,
+            source,
+            consolidator_agent_id,
+            None,
+        )
+        .await
+    }
+
+    async fn consolidate_with_expected_versions(
+        &self,
+        ctx: &CallerContext,
+        ids: &[String],
+        title: &str,
+        summary: &str,
+        namespace: &str,
+        tier: &Tier,
+        source: &str,
+        consolidator_agent_id: &str,
+        expected_versions: Option<&[i64]>,
+    ) -> StoreResult<String> {
+        super::validate_consolidation_input(ids, summary, expected_versions)?;
         self.gate_record_stop().await?;
         if ids.is_empty() {
             return Err(StoreError::InvalidInput {
@@ -28519,6 +28546,14 @@ impl MemoryStore for PostgresStore {
             .await
             .map_err(|e| to_store_err("begin consolidate tx", e))?;
 
+        // CONCURRENCY-04: lock in stable order, then preserve caller order for
+        // metadata merging and expected-version alignment. Locks last to commit.
+        sqlx::query("SELECT id FROM memories WHERE id = ANY($1) ORDER BY id FOR UPDATE")
+            .bind(ids)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("lock consolidation sources", e))?;
+
         // Fetch source rows in one query, ordered by the input.
         let mut max_priority: i32 = 5;
         let mut all_tags: Vec<String> = Vec::new();
@@ -28539,10 +28574,10 @@ impl MemoryStore for PostgresStore {
         // NULL / unavailable source confidence never silently inflates.
         let mut min_confidence = crate::models::DEFAULT_CONFIDENCE;
 
-        for id in ids {
+        for (index, id) in ids.iter().enumerate() {
             use sqlx::Row;
             let row = sqlx::query(
-                "SELECT tags, priority, confidence, access_count, metadata, cid FROM memories WHERE id = $1",
+                "SELECT tags, priority, confidence, access_count, metadata, cid, version FROM memories WHERE id = $1",
             )
             .bind(id)
             .fetch_optional(&mut *tx)
@@ -28551,6 +28586,18 @@ impl MemoryStore for PostgresStore {
             let Some(row) = row else {
                 return Err(StoreError::NotFound { id: id.clone() });
             };
+            if let Some(versions) = expected_versions {
+                let current: i64 = row
+                    .try_get("version")
+                    .map_err(|e| to_store_err("read source version", e))?;
+                if versions[index] != current {
+                    return Err(super::consolidation_version_conflict(
+                        id,
+                        versions[index],
+                        current,
+                    ));
+                }
+            }
             source_cids.push(row.try_get::<Option<String>, _>("cid").unwrap_or(None));
             let priority: i32 = row.try_get("priority").unwrap_or(5);
             max_priority = max_priority.max(priority);

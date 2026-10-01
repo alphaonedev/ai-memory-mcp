@@ -2321,9 +2321,36 @@ impl MemoryStore for SqliteStore {
         source: &str,
         consolidator_agent_id: &str,
     ) -> StoreResult<String> {
+        self.consolidate_with_expected_versions(
+            ctx,
+            ids,
+            title,
+            summary,
+            namespace,
+            tier,
+            source,
+            consolidator_agent_id,
+            None,
+        )
+        .await
+    }
+
+    async fn consolidate_with_expected_versions(
+        &self,
+        ctx: &CallerContext,
+        ids: &[String],
+        title: &str,
+        summary: &str,
+        namespace: &str,
+        tier: &Tier,
+        source: &str,
+        consolidator_agent_id: &str,
+        expected_versions: Option<&[i64]>,
+    ) -> StoreResult<String> {
+        super::validate_consolidation_input(ids, summary, expected_versions)?;
         self.gate_record_stop()?;
         let conn = self.state.lock().await;
-        db::consolidate(
+        db::consolidate_with_expected_versions(
             &conn,
             ids,
             title,
@@ -2333,8 +2360,14 @@ impl MemoryStore for SqliteStore {
             source,
             consolidator_agent_id,
             ctx.bypass_visibility,
+            expected_versions,
         )
-        .map_err(box_err)
+        .map_err(
+            |e| match e.downcast_ref::<crate::storage::VersionConflict>() {
+                Some(vc) => super::consolidation_version_conflict(&vc.id, vc.expected, vc.current),
+                None => box_err(e),
+            },
+        )
     }
 
     async fn set_row_metadata(
