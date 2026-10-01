@@ -447,14 +447,22 @@ pub(super) async fn sync_push_via_store(
         // #1464 (v0.8.0, P0) — build the row first, then gate its quota +
         // ownership attribution (sqlite-twin parity). `resolve_governance_policy`
         // is async on the store, so resolve it before taking the quota lock.
-        let local_cap = app
-            .store
-            .resolve_governance_policy(&mem.namespace)
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or_else(crate::models::GovernancePolicy::default)
-            .effective_max_reflection_depth();
+        // #4043 — an unreadable policy refuses this row (sqlite twin); `.ok()`
+        // stamped the compiled default cap on evidence nobody read.
+        let local_cap = match app.store.resolve_governance_policy(&mem.namespace).await {
+            Ok(policy) => policy.unwrap_or_default().effective_max_reflection_depth(),
+            Err(e) => {
+                tracing::warn!(
+                    target: ATTESTATION_TRACE_TARGET,
+                    memory_id = %mem.id,
+                    "sync_push: governance policy unreadable for {}: {e}; \
+                     refusing the write (#4043 fail-closed)",
+                    mem.namespace
+                );
+                skipped += 1;
+                continue;
+            }
+        };
         let mut to_insert = crate::federation::reflection_bookkeeping::stamp_reflection_origin(
             mem,
             &body.sender_agent_id,

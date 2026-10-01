@@ -3203,7 +3203,8 @@ impl MemoryStore for SqliteStore {
         namespace: &str,
     ) -> StoreResult<Option<crate::models::GovernancePolicy>> {
         let conn = self.state.lock().await;
-        Ok(db::resolve_governance_policy(&conn, namespace))
+        // #4043 — a read fault propagates (postgres parity); it is never `None`.
+        db::resolve_governance_policy(&conn, namespace).map_err(box_err)
     }
 
     async fn resolve_require_approval_above_depth(

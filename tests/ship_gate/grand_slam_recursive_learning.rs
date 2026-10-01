@@ -474,6 +474,7 @@ fn sg_rl_3_federation_reflection_replication_with_cross_peer_refusal() {
         .expect("get r2 on A")
         .expect("r2 present on A");
     let cap_b = db::resolve_governance_policy(&conn_b, ns)
+        .expect("#4043: governance policy read")
         .unwrap_or_default()
         .effective_max_reflection_depth();
     assert_eq!(cap_b, 2, "peer B tightened cap = 2");
