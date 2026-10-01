@@ -1484,6 +1484,18 @@ fn migrate_only_repair_is_not_public_4324() {
     );
 }
 
+/// #4324 — does `line` mention `name` as a whole identifier (the chars on both
+/// sides are not `[A-Za-z0-9_]`)? Matches calls, fn-pointer takes, `use .. as`
+/// aliases and `name (` with a space, not just `name(`.
+fn mentions_bare_ident(line: &str, name: &str) -> bool {
+    let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    line.match_indices(name).any(|(i, m)| {
+        let before = line[..i].chars().next_back();
+        let after = line[i + m.len()..].chars().next();
+        !before.is_some_and(is_ident) && !after.is_some_and(is_ident)
+    })
+}
+
 /// #4324 — `pub(super)` alone does not pin "migrate callers only": any
 /// wrapper inside `crate::storage` could re-expose the record-stop-exempt
 /// repair, and B7 cannot see it (no write SQL in the wrapper). So pin the
@@ -1504,7 +1516,7 @@ fn repair_call_sites_are_migrate_only_4324() {
         for (i, line) in text.lines().enumerate() {
             let t = line.trim_start();
             if t.starts_with("//")
-                || !line.contains("repair_sqlite_after_trigger_gap(")
+                || !mentions_bare_ident(line, "repair_sqlite_after_trigger_gap")
                 || line.contains("fn repair_sqlite_after_trigger_gap")
             {
                 continue;
