@@ -32207,22 +32207,15 @@ impl MemoryStore for PostgresStore {
                 }
                 Err(e) => return Err(e),
             };
-            match crate::models::GovernancePolicy::from_metadata(&mem.metadata) {
-                Some(Ok(p)) => {
-                    return Ok(Some(if severed {
-                        p.with_severed_standard_floor()
-                    } else {
-                        p
-                    }));
-                }
-                // #4285 — a corrupt `metadata.governance` is a SEVERED level
-                // (#2503): WARN, floor the result, keep walking to an intact
-                // ancestor. Never NoPolicy, never a hard refusal.
-                Some(Err(e)) => {
-                    governance_corrupt_4285::warn_corrupt(&ns, &standard_id, &e);
-                    severed = true;
-                }
-                None => {}
+            let (policy, corrupt) =
+                governance_corrupt_4285::parse_level(&ns, &standard_id, &mem.metadata);
+            severed |= corrupt;
+            if let Some(p) = policy {
+                return Ok(Some(if severed {
+                    p.with_severed_standard_floor()
+                } else {
+                    p
+                }));
             }
         }
         if severed {
@@ -32245,10 +32238,7 @@ impl MemoryStore for PostgresStore {
         &self,
         namespace: &str,
     ) -> StoreResult<Option<u32>> {
-        use crate::storage::{
-            ApprovalDepthLevelState, ApprovalDepthWalk, StandardMetadata,
-            approval_depth_level_state, classify_standard_metadata_value,
-        };
+        use crate::storage::{ApprovalDepthLevelState, ApprovalDepthWalk};
         let chain = pg_namespace_chain(&self.pool, namespace, true).await?;
         let mut walk = ApprovalDepthWalk::default();
         for ns in chain.into_iter().rev() {
@@ -32257,8 +32247,7 @@ impl MemoryStore for PostgresStore {
                 .fetch_optional(&self.pool)
                 .await
                 .map_err(|e| to_store_err("resolve_require_approval_above_depth lookup", e))?;
-            // An unresolvable standard is `Missing` (the shared decision's
-            // `Continue`); #4285 adds the Severed handling in this one place.
+            // An unresolvable standard is `Missing`; a corrupt one is Severed.
             let state = match row {
                 Some((Some(standard_id),)) => {
                     // Substrate-internal policy read: admin context, exactly as
@@ -32268,19 +32257,7 @@ impl MemoryStore for PostgresStore {
                         CallerContext::for_admin(crate::identity::sentinels::GOVERNANCE_INTERNAL);
                     match self.get(&ctx, &standard_id).await {
                         Ok(m) => {
-                            // #4285 — the shared classifier: a corrupt or
-                            // non-object level is SEVERED (WARN, continue to the
-                            // ancestor, never a raw key), parity with the sqlite
-                            // walk and the policy walk.
-                            let class = classify_standard_metadata_value(&m.metadata);
-                            if let StandardMetadata::Corrupt(reason) = &class {
-                                governance_corrupt_4285::warn_corrupt_reason(
-                                    &ns,
-                                    &standard_id,
-                                    reason,
-                                );
-                            }
-                            approval_depth_level_state(&class)
+                            governance_corrupt_4285::level_state(&ns, &standard_id, &m.metadata)
                         }
                         Err(StoreError::NotFound { .. }) => ApprovalDepthLevelState::Missing,
                         Err(e) => return Err(e),
@@ -32290,6 +32267,9 @@ impl MemoryStore for PostgresStore {
             };
             if let Some(n) = walk.step(state) {
                 return Ok(Some(n));
+            }
+            if walk.is_done() {
+                break;
             }
         }
         Ok(walk.finish())
@@ -32842,17 +32822,11 @@ impl MemoryStore for PostgresStore {
                 severed = true;
                 continue;
             };
-            match crate::models::GovernancePolicy::from_metadata(&m) {
-                Some(Ok(p)) => {
-                    resolved_policy = Some(p);
-                    break;
-                }
-                // #4285 — corrupt standard = SEVERED level (see the pool twin).
-                Some(Err(e)) => {
-                    governance_corrupt_4285::warn_corrupt(ns, &standard_id, &e);
-                    severed = true;
-                }
-                None => {}
+            let (policy, corrupt) = governance_corrupt_4285::parse_level(ns, &standard_id, &m);
+            severed |= corrupt;
+            if let Some(p) = policy {
+                resolved_policy = Some(p);
+                break;
             }
         }
         let resolved_policy = match (resolved_policy, severed) {
