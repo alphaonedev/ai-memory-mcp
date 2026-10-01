@@ -604,9 +604,10 @@ or expect `"storage_backend": "sqlite"` — that key is absent on sqlite.
 }
 ```
 
-`ttl_secs` is HTTP-only — the MCP `memory_store` tool exposes
-`expires_at` instead (also accepted on this HTTP endpoint). See the
-HTTP ↔ MCP parameter coverage table at the bottom of this document.
+`ttl_secs` and create-time `expires_at` are HTTP-only. MCP `memory_store`
+applies the tier TTL; set an explicit expiry afterwards with `memory_update`
+(`expires_at`). See the HTTP ↔ MCP parameter coverage table at the bottom of
+this document.
 
 An optional `kind` field is also accepted. Omitting it keeps the
 `observation` default; a supplied value MUST be one of the **16**
