@@ -186,6 +186,64 @@ exercising it.
 - The signing-keypair auto-gen path in `ensure_and_load_daemon_keypair`
   is exercised by the F12 cold-boot cell.
 
+### `src/metrics.rs` — fallible-constructor Err arms (PARTIAL EXCEPTION)
+
+`coverage/thresholds.toml` holds `"metrics.rs" = 90` (measured 94.77)
+and names **this** section as the rationale for not carrying the tier-A
+98 aspiration. This is that rationale; it was missing until #4161.
+
+**What is uncovered.** Post-#3917 every Prometheus collector in the
+file is constructed AND registered through one of five module-level
+helpers — `int_counter`, `int_gauge`, `int_counter_vec`,
+`int_gauge_vec`, `histogram_vec` (`src/metrics.rs:604`-`696`). Each
+helper carries exactly one construction `Err` arm
+(`src/metrics.rs:622`, `:639`, `:657`, `:675`, `:694`) plus one
+`registry.register` failure branch. Those arms are the whole residue —
+the `Ok` path of every helper is covered by the unit suite, which
+builds the registry on every run.
+
+**Why the arms are structurally unreachable in production.** Stated at
+the call site in the `COVERAGE:` note at `src/metrics.rs:707`-`726`:
+
+1. `Metrics::try_new` builds a fresh `Registry::new()` per call
+   (`src/metrics.rs:729`), so there is no shared registry state.
+   Registration can only fail on a duplicate metric name, and every
+   name registered here is unique.
+2. Every metric and label name is a compile-time string literal that
+   already matches the Prometheus name regex
+   `[a-zA-Z_:][a-zA-Z0-9_:]*`, so construction cannot fail name
+   validation.
+
+The arms exist only because the `prometheus` crate's constructors
+return `Result`. They are written as `unreachable!()` rather than a
+silent fallback so that a future rename breaking either premise fails
+LOUDLY instead of shipping a missing metric.
+
+The `thresholds.toml` comment's shorthand "`?` Err arms" names these
+fallible-constructor error paths. Post-#3917 no per-metric call site
+carries a `?` at all: the helpers thread a single `err` slot that
+`try_new` surfaces once.
+
+**Ship-gate compensation**:
+
+- `Metrics::try_new` is exercised on every unit-test run through the
+  process-wide `OnceLock` handle (`src/metrics.rs:594`), so a real
+  duplicate-name or invalid-name regression trips the suite
+  immediately. The uncovered lines are the *failure* arms, not the
+  registration path they guard.
+- `new_or_panic` (`src/metrics.rs:699`) converts any such failure into
+  a startup panic, so the condition can never be reached silently in a
+  running daemon.
+- The `/metrics` scrape surface is exercised end-to-end by the
+  ship-gate HTTP cells, which fail if a collector is absent.
+
+**What retires this exception**: either (a) a toolchain with
+`coverage_nightly` / `#[coverage(off)]` support, which lets the arms
+leave the denominator under the residual policy above and the threshold
+return to the tier-A target, or (b) an upstream `prometheus` API that
+constructs a statically-named collector infallibly, which deletes the
+arms outright.
+
 ### L0.7-4 structural ceilings (Tier C — PARTIAL EXCEPTIONS)
 
 Five Tier C modules carry **structural ceilings** that prevent the tier-C
