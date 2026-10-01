@@ -15,6 +15,7 @@ pub mod memory;
 pub mod namespace;
 pub mod recall_request;
 pub mod reflection;
+pub mod replicated_version;
 pub mod routine;
 pub mod signal;
 pub mod skill;

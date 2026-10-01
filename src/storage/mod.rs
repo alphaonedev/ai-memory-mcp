@@ -863,6 +863,7 @@ pub(crate) mod contamination_marker;
 pub(crate) use contamination_marker::StampAuthority;
 pub(crate) mod decontaminate;
 mod lifecycle_write;
+mod merge_version_4216;
 // `pub` (rather than `pub(crate)`) so the V-4 closeout
 // integration test suite (`tests/signed_events_chain_v34.rs`) can
 // invoke `migrate_v34_backfill_chain` directly to exercise the
@@ -2281,7 +2282,7 @@ static INSERT_UPSERT_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new
                 -- If-Match could overwrite the merge invisibly. The decay
                 -- sweep remains the only documented non-bumping mutator
                 -- (tests/non_version_bumping_sites_1036.rs).
-                version = memories.version + 1,
+                version = MIN(memories.version, 9223372036854775806) + 1,
                 -- v1.0.0 (#1945) + v1.0.0 #2394 — the epistemic-typing
                 -- provenance FOLLOWS THE KIND THAT ACTUALLY WON. `memory_kind`
                 -- above is STICKY (a stored `reflection` / `persona` is never
@@ -4138,7 +4139,7 @@ pub fn operator_dequarantine(conn: &mut Connection, id: &str, agent_id: &str) ->
         decontaminate::Observed::NotContained => return Ok(false),
     }
     let changed = tx.execute(
-        "UPDATE memories SET lifecycle_state = ?1, updated_at = ?2, version = version + 1 \
+        "UPDATE memories SET lifecycle_state = ?1, updated_at = ?2, version = MIN(version, 9223372036854775806) + 1 \
          WHERE id = ?3 AND lifecycle_state = ?4",
         params![
             crate::models::LifecycleState::Open.as_str(),
@@ -4200,7 +4201,7 @@ pub fn dequarantine(conn: &Connection, id: &str) -> Result<bool> {
     crate::storage::record_stop::gate_storage_conn(conn)?;
     let now = Utc::now().to_rfc3339();
     let n = conn.execute(
-        "UPDATE memories SET lifecycle_state = ?1, updated_at = ?2, version = version + 1 \
+        "UPDATE memories SET lifecycle_state = ?1, updated_at = ?2, version = MIN(version, 9223372036854775806) + 1 \
          WHERE id = ?3 AND lifecycle_state = ?4",
         params![
             crate::models::LifecycleState::Open.as_str(),
@@ -4542,7 +4543,7 @@ pub fn update_with_expected_version(
                         '{}'
                     )
                 ),
-                source_uri = COALESCE(?11, source_uri), encrypted_envelope=?14, valid_until = COALESCE(?15, valid_until), version = version + 1
+                source_uri = COALESCE(?11, source_uri), encrypted_envelope=?14, valid_until = COALESCE(?15, valid_until), version = MIN(version, 9223372036854775806) + 1
              WHERE id=?12 AND (?13 IS NULL OR version = ?13)",
             params![effective_tier.as_str(), namespace, new_title, update_content_to_store, tags_json, priority, confidence, now, expires_at, metadata_json, source_uri, id, expected_version, update_encrypted_envelope, valid_until],
         );
@@ -5888,7 +5889,7 @@ pub fn undo_in_place_edit(
     // with_daemon_signature + append idiom. `update_with_expected_version`
     // opens + commits its own tx, so we are back in autocommit here; use
     // the public `append_signed_event` which opens its own tx.
-    let after_version = live.version + 1;
+    let after_version = live.version.saturating_add(1);
     let ph = crate::signed_events::payload_hash(
         format!(
             "memory.undo_in_place_edit|{id}|{}|{after_version}",
@@ -13629,7 +13630,7 @@ pub(crate) fn stamp_contaminated_descendants_as(
         let mut read = tx.prepare(SELECT_LIFECYCLE_META_BY_ID_SQL)?;
         let mut upd = tx.prepare(
             "UPDATE memories \
-                SET lifecycle_state = ?1, metadata = ?2, updated_at = ?3, version = version + 1 \
+                SET lifecycle_state = ?1, metadata = ?2, updated_at = ?3, version = MIN(version, 9223372036854775806) + 1 \
               WHERE id = ?4 AND lifecycle_state = ?5",
         )?;
         for node in &descendants {
@@ -13934,7 +13935,7 @@ pub fn swarm_rewind(
         let mut read = tx.prepare(SELECT_LIFECYCLE_META_BY_ID_SQL)?;
         let mut upd = tx.prepare(
             "UPDATE memories \
-                SET lifecycle_state = ?1, metadata = ?2, updated_at = ?3, version = version + 1 \
+                SET lifecycle_state = ?1, metadata = ?2, updated_at = ?3, version = MIN(version, 9223372036854775806) + 1 \
               WHERE id = ?4 AND lifecycle_state = ?5",
         )?;
 
@@ -18448,9 +18449,9 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
     // two concerns is live (the federation receive loop wraps batches in its own
     // tx, whose lock already covers both). Neither concern live ⇒ byte-identical
     // legacy path.
-    let owns_tx = (crate::encryption::encryption_enabled(None)
-        || crate::config::append_only_enabled())
-        && conn.is_autocommit();
+    // #4216 — ALWAYS own the tx when the caller has none: the version rule
+    // reads the slot pre-image and writes the bump around the upsert.
+    let owns_tx = conn.is_autocommit();
     let write_txn = if owns_tx {
         Some(connection::WriteTxn::begin(conn)?)
     } else {
@@ -18462,6 +18463,13 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
         // no prior row exists. Read under the `BEGIN IMMEDIATE` write lock above
         // so it cannot race the upsert whose newer-wins verdict it mirrors.
         let merge_preimage = probe_federation_merge_preimage(conn, &mem.title, &mem.namespace)?;
+        // #4216 / #4218 — the slot row's user data + version before the upsert,
+        // and the inbound version bounded against it.
+        let slot_pre = merge_version_4216::read_slot_preimage(conn, &mem.title, &mem.namespace)?;
+        let bounded_version = crate::models::replicated_version::bounded_inbound_version(
+            mem.version,
+            slot_pre.as_ref().map(|p| p.version),
+        );
         let seal = seal_content_for_upsert(conn, mem)?;
         let content_to_store = seal.content_to_store.as_str();
         let encrypted_envelope: Option<&[u8]> = seal.envelope_bytes();
@@ -18515,7 +18523,7 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
                 confidence_signals_json,
                 mem.confidence_decayed_at,
                 mentioned_entity_id,
-                mem.version,
+                bounded_version,
                 mem.lifecycle_state.as_str(),
                 encrypted_envelope,
                 cid_stamp.cid,
@@ -18534,6 +18542,7 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
         // #2383 (N1) — invariant backstop; a no-op when the inbound row lost
         // the newer-wins tiebreak (our envelope is not the one on the row).
         reconcile_envelope_owner(conn, &actual_id, &mem.content, &seal)?;
+        merge_version_4216::bump_if_user_data_changed(conn, slot_pre.as_ref(), &actual_id)?;
         // APPEND-ONLY-SANCTIONED (#1823 G6 / #2954) — COW SUPERSEDE: the
         // federation newer-wins upsert above rewrote an existing `(title,
         // namespace)` row's durable `content` in place ONLY when the inbound
@@ -18712,11 +18721,13 @@ pub fn merge_inbound(
                 // `updated_at` (the primary LWW key) to a freshness ceiling
                 // so an enrolled relay cannot win the merge by stamping a
                 // far-future timestamp. now + the attestation skew window.
-                let prepared = crate::models::clamp_inbound_updated_at(
+                let mut prepared = crate::models::clamp_inbound_updated_at(
                     sanitized,
                     &chrono::Utc::now().to_rfc3339(),
                     crate::identity::attest::ATTEST_CREATED_AT_SKEW_SECS,
                 );
+                // #4218 — bound the peer's version against the local row.
+                crate::models::replicated_version::bound_inbound_row(&mut prepared, &existing);
                 // #224 field-wise merge — the SAME pure reconciler the
                 // postgres adapter calls in Rust (no per-backend drift).
                 let merged = crate::models::merge_memory(&existing, &prepared);
@@ -18735,6 +18746,9 @@ pub fn merge_inbound(
                     inbound,
                     receiver_verified,
                 );
+                // #4216 — a merge that changed user data moves the version.
+                let mut merged = merged;
+                crate::models::replicated_version::apply_version_rule(&existing, &mut merged);
                 overwrite_full_row_by_id(conn, &merged)?;
                 Ok(Some(merged.id))
             }
@@ -20132,7 +20146,7 @@ pub fn reown(
         let update_sql = format!(
             "UPDATE memories \
              SET metadata = json_set(metadata, '$.agent_id', ?1), \
-                 version = version + 1, updated_at = ?2 \
+                 version = MIN(version, 9223372036854775806) + 1, updated_at = ?2 \
              WHERE {update_ns}{owner_filter}"
         );
         let rewritten = match namespace {
@@ -28692,7 +28706,9 @@ mod tests {
         assert_eq!(got.priority, 9);
         assert!((got.confidence - 0.8).abs() < f64::EPSILON);
         assert_eq!(got.access_count, 40, "access_count is max(40, 7)");
-        assert_eq!(got.version, 7, "version is max(7, 3) — never rolls back");
+        // #4216: GREATEST(7, 3) = 7 (never rolls back) and the merge changed user
+        // data (content / tags / priority), so the version moves one past it.
+        assert_eq!(got.version, 8, "version is max(7, 3) + 1 for a data change");
         // metadata deep-merge keeps disjoint keys on both sides.
         assert_eq!(got.metadata["k_local"], serde_json::json!(1));
         assert_eq!(got.metadata["k_remote"], serde_json::json!(2));

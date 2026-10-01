@@ -191,6 +191,15 @@ Status codes you'll commonly encounter:
 | 500 | Internal server error |
 | 503 | Service unavailable — admission-control shed, or `/health` reporting unhealthy |
 
+**`If-Match` / `ETag` is a NODE-LOCAL token (#4216).** The version behind it
+moves on every local edit AND on a federation merge that changes the row's
+user data (`GREATEST(local, remote) + 1`), so a client that read a row before a
+merge gets `409` instead of silently overwriting the merged edit. Two nodes
+that merge and bump independently can hold different versions for the same
+converged content: the token guards a client against a concurrent write on the
+node it talks to, not across replicas. An inbound replicated `version` above
+2^40, or more than 2^32 above the local row, is refused or clamped (#4218).
+
 ### 429 — per-agent write quotas
 
 **429 is a real response code on the primary write surfaces.** It is
