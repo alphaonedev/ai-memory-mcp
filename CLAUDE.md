@@ -1122,7 +1122,7 @@ cannot see, because a mutation routed through
 `crate::test_support::EnvGuard` spells neither verb and leaves the
 calling file's arm (d) count at zero). All are
 HARD-BLOCK. Eleven are wired into `.github/workflows/c8-precheck.yml`,
-whose TWENTY-SIX jobs are `c8-precheck`, `vendor-literal-gate`,
+whose THIRTY-THREE jobs are `c8-precheck`, `vendor-literal-gate`,
 `l3-boundary-gate`, `hardcoded-literal-gate`, `docs-vs-ssot-drift`,
 `doc-symbol-anchor-gate`, `sdk-route-path-gate`, `ci-job-claims-gate`,
 `doc-surface-completeness-gate`, `capacity-claim-gate`,
@@ -1141,10 +1141,18 @@ carry dated entries in `scripts/qc-allowlists/gates-not-wired.txt`
 naming why each cannot run on a PR event yet),
 `declaration-hash-gate` (#3557 — the pre-registered §0.2 SLO/RPO/RTO
 declaration's SHA-256 pin, `scripts/check-declaration-hash.sh`; an
-integrity gate in the same sense), plus the two test-guard jobs above. (This job list re-synced at #2915: it had
-silently rotted from sixteen to twenty-one jobs since #2636 — the
-same prose-rot class rule (f) of gate 7 blocks mechanically, one
-layer down.) The twelfth, gate **8** below, lives in
+integrity gate in the same sense), `truthy-grammar-gate` (#3200),
+`const-name-literal-gate` (#3121), `sdk-tls-scheme-gate` (#3782),
+`mcp-transport-isolation-gate` (#3829), `test-keydir-mode-gate`
+(#3733), `foreign-text-to-caller-gate` (#3688 gate 7),
+`external-pr-operator-approval-gate`, plus the two test-guard jobs
+above. (This job list re-synced at #2915 — sixteen had rotted to
+twenty-one since #2636 — and again at #3719, when it said TWENTY-SIX
+while the workflow declared thirty-three: the same prose-rot class
+rule (f) of gate 7 blocks mechanically, one layer down. Re-measure
+with `scripts/check-required-contexts.sh --dump`, gate 7's own
+parser, before trusting the count; a mechanical pin for this
+paragraph is tracked in #3719.) The twelfth, gate **8** below, lives in
 `.github/workflows/ci.yml` because it needs a Rust toolchain that
 `c8-precheck.yml`'s deliberately toolchain-free jobs do not carry.
 
