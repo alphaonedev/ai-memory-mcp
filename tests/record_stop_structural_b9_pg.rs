@@ -232,17 +232,18 @@ fn const_item_name(line: &str) -> Option<String> {
 
 /// Every top-level const/static item in `lines`, with the record-plane tables
 /// its own text writes. An item runs from its first line to the first line
-/// that ends in `;`.
-fn const_items(lines: &[&str], record_plane: &HashSet<&str>) -> Vec<ConstItem> {
+/// that ends in `;`. Detection (`masked`) never sees string or comment
+/// contents; the tables are read from the `orig` text of the same lines.
+fn const_items(masked: &[&str], orig: &[&str], record_plane: &HashSet<&str>) -> Vec<ConstItem> {
     let mut out = Vec::new();
     let mut i = 0;
-    while i < lines.len() {
-        if let Some(name) = const_item_name(lines[i]) {
+    while i < masked.len() {
+        if let Some(name) = const_item_name(masked[i]) {
             let mut end = i;
-            while end + 1 < lines.len() && !lines[end].trim_end().ends_with(';') {
+            while end + 1 < masked.len() && !masked[end].trim_end().ends_with(';') {
                 end += 1;
             }
-            let tables = tables_written(&lines[i..=end].join("\n"))
+            let tables = tables_written(&orig[i..=end].join("\n"))
                 .into_iter()
                 .filter(|t| record_plane.contains(t.as_str()))
                 .collect();
@@ -301,20 +302,39 @@ fn scan(sources: &[(String, String)]) -> Scan {
     let bookkeeping: HashSet<&str> = BOOKKEEPING.iter().copied().collect();
     let record_plane: HashSet<&str> = RECORD_PLANE.iter().copied().collect();
 
-    let prepared: Vec<(String, Vec<&str>)> = sources
+    // Structure (fn starts, signatures, const/static items) is detected on a
+    // MASKED copy of each file (comment / string / char contents blanked,
+    // offsets and newlines kept), so text inside a literal can never
+    // re-segment the scan. SQL and the gate marker are searched in the
+    // ORIGINAL text over the spans found on the masked copy (#4023, K2).
+    let texts: Vec<(String, String, String)> = sources
         .iter()
         .map(|(rel, text)| {
+            let masked = pg_sources::mask_rust(text);
+            // The test-module cut is found on the MASKED text so a string that
+            // mimics the `mod tests` header cannot truncate the scan.
+            let cut = strip_test_mod(&masked).len();
             (
                 rel.rsplit('/').next().unwrap_or(rel.as_str()).to_string(),
-                strip_test_mod(text).lines().collect(),
+                text[..cut].to_string(),
+                masked[..cut].to_string(),
             )
+        })
+        .collect();
+    let prepared: Vec<(&str, Vec<&str>, Vec<&str>)> = texts
+        .iter()
+        .map(|(file, orig, masked)| {
+            let o: Vec<&str> = orig.lines().collect();
+            let m: Vec<&str> = masked.lines().collect();
+            assert_eq!(o.len(), m.len(), "mask_rust must preserve line count");
+            (file.as_str(), o, m)
         })
         .collect();
 
     let mut const_tables: HashMap<String, HashSet<String>> = HashMap::new();
     let per_file_consts: Vec<Vec<ConstItem>> = prepared
         .iter()
-        .map(|(_, lines)| const_items(lines, &record_plane))
+        .map(|(_, orig, masked)| const_items(masked, orig, &record_plane))
         .collect();
     for items in &per_file_consts {
         for item in items {
@@ -332,15 +352,15 @@ fn scan(sources: &[(String, String)]) -> Scan {
         surfaced: HashSet::new(),
         gated: HashSet::new(),
     };
-    for ((file, lines), items) in prepared.iter().zip(&per_file_consts) {
+    for ((file, lines, masked), items) in prepared.iter().zip(&per_file_consts) {
         let mut starts: Vec<(usize, String)> = Vec::new();
-        for (idx, line) in lines.iter().enumerate() {
-            if let Some((_, name)) = is_fn_start(line) {
+        for (idx, mline) in masked.iter().enumerate() {
+            if let Some((_, name)) = is_fn_start(mline) {
                 starts.push((idx, name));
             }
         }
         for (i, (start, name)) in starts.iter().enumerate() {
-            if !signature_has_self(lines, *start) {
+            if !signature_has_self(masked, *start) {
                 continue;
             }
             if name.starts_with("migrate_v") || name.starts_with("test_") {
@@ -534,4 +554,87 @@ fn removing_the_gate_from_a_const_sql_method_is_red_4023() {
         "ungated form must be red: {:?}",
         u.ungated
     );
+}
+
+// --- #4023 K2: text inside a literal or comment must never re-segment the scan.
+
+#[test]
+fn const_shaped_line_inside_a_raw_string_does_not_swallow_a_write_4023_a7() {
+    let s = synth(
+        "    async fn writer(&self, id: &str) {\n        let q = format!(\n            r#\"\n\
+         const NOTE_A7: {}\nUPDATE memories SET content = '' WHERE id = $1\"#,\n            \"x\"\n        );\n    }\n",
+        "",
+    );
+    assert!(names_ungated(&s, "writer"), "A7: {:?}", s.ungated);
+}
+
+#[test]
+fn const_shaped_line_inside_a_block_comment_is_not_an_item_4023() {
+    let s = synth(
+        "    async fn writer(&self) {\n/*\nconst NOTE_BC: &str = 1\n*/\n        \
+         sqlx::query(\"UPDATE memories SET title = 'x'\");\n    }\n",
+        "",
+    );
+    assert!(
+        names_ungated(&s, "writer"),
+        "block comment: {:?}",
+        s.ungated
+    );
+    // A nested block comment whose inner close must not end the outer one.
+    let n = synth(
+        "    async fn writer(&self) {\n/* outer /* inner */\nconst NOTE_NB: &str = 1\n*/\n        \
+         sqlx::query(\"UPDATE memories SET title = 'x'\");\n    }\n",
+        "",
+    );
+    assert!(
+        names_ungated(&n, "writer"),
+        "nested comment: {:?}",
+        n.ungated
+    );
+}
+
+#[test]
+fn const_shaped_line_inside_a_hash_raw_string_is_not_an_item_4023() {
+    // r##".."## whose body contains a `"#` that must NOT close it.
+    let s = synth(
+        "    async fn writer(&self) {\n        let _q = r##\"\nfake close \"# still inside\n\
+         const NOTE_R2: &str = 1\nUPDATE memories SET title = 'x'\n\"##;\n    }\n",
+        "",
+    );
+    assert!(names_ungated(&s, "writer"), "r##: {:?}", s.ungated);
+}
+
+#[test]
+fn a_fn_header_inside_a_string_does_not_split_the_method_4023() {
+    // A line shaped like a method start inside a string must not end the
+    // enclosing span (the write after it would be charged to a phantom fn).
+    let s = synth(
+        "    async fn writer(&self) {\n        let _t = r#\"\n    async fn decoy(&self) {\n\"#;\n        \
+         sqlx::query(\"UPDATE memories SET title = 'x'\");\n    }\n",
+        "",
+    );
+    assert!(names_ungated(&s, "writer"), "decoy: {:?}", s.ungated);
+}
+
+#[test]
+fn mask_rust_blanks_literals_and_comments_and_keeps_layout_4023() {
+    let src = concat!(
+        "let a = \"LEAK1\\\"LEAK2\"; // LEAK3\n",
+        "let b = r##\"LEAK4\"#LEAK5\"##; /* LEAK6 /* LEAK7 */ LEAK8 */ let c = '\"';\n",
+        "fn f<'a>(x: &'a str) -> char { b'Z'; br#\"LEAK9\"#; c\"LEAKA\"; '\\'' }\n",
+        "let keep = 1;\n",
+    );
+    let m = pg_sources::mask_rust(src);
+    assert_eq!(m.len(), src.len(), "byte offsets preserved");
+    assert_eq!(m.matches('\n').count(), src.matches('\n').count());
+    for n in 1..=9 {
+        assert!(!m.contains(&format!("LEAK{n}")), "LEAK{n} survived: {m}");
+    }
+    assert!(!m.contains("LEAKA"), "LEAKA survived: {m}");
+    assert!(!m.contains('Z'), "byte literal survived: {m}");
+    // Code outside literals survives, including the lifetime and what follows
+    // the char literals (a mis-lexed `'a` would blank the rest of the line).
+    assert!(m.contains("fn f<'a>(x: &'a str) -> char {"), "{m}");
+    assert!(m.contains("let keep = 1;"), "{m}");
+    assert!(m.contains("let c ="), "{m}");
 }
