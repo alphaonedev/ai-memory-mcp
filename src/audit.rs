@@ -269,11 +269,188 @@ struct SinkInner {
     last_hash: String,
     /// Source path, when the sink wraps a real file. `None` for
     /// in-memory test sinks.
-    #[allow(dead_code)]
     path: Option<PathBuf>,
     /// #4086 — the persisted sequence high-water mark next to a real file
     /// (`None` for in-memory test sinks).
     seq_mark: Option<SeqMark>,
+    /// #4211 — a read+append handle on the trail file (`None` for in-memory
+    /// test sinks). It carries the exclusive lock around each append and is
+    /// how a failed append's own bytes are measured and removed.
+    trail: Option<File>,
+    /// #4211 — the trail ends in bytes of a failed append that could not be
+    /// removed. The next record is line-aligned first.
+    torn: Option<Torn>,
+}
+
+/// #4211 — what a failed append left at the end of the trail when its bytes
+/// could not be removed (the append-only OS flag refuses truncation).
+#[derive(Debug)]
+enum Torn {
+    /// Part of a record: once line-aligned it is an unparseable line, which
+    /// `verify` reports as a [`VerifyFailureKind::TornRecord`].
+    Fragment,
+    /// The whole record except its newline. Once line-aligned it is a valid
+    /// line in chain order, so it becomes the chain head.
+    CompleteRecord { self_hash: String },
+}
+
+/// #4211 — the exclusive lock on the trail file for one append, released on
+/// drop. Every ai-memory writer takes it, so the bytes past the pre-write
+/// length can only be this append's own while it is held. `None` when the
+/// sink has no file or the platform refused the lock (truncation is then
+/// never attempted).
+struct TrailLock<'a>(Option<&'a File>);
+
+impl<'a> TrailLock<'a> {
+    fn acquire(trail: Option<&'a File>) -> Self {
+        Self(trail.filter(|f| f.lock().is_ok()))
+    }
+
+    fn held(&self) -> bool {
+        self.0.is_some()
+    }
+}
+
+impl Drop for TrailLock<'_> {
+    fn drop(&mut self) {
+        if let Some(f) = self.0 {
+            let _ = f.unlock();
+        }
+    }
+}
+
+/// #4211 — test seam: behave as if the trail refused truncation (the
+/// append-only OS flag), which a non-root Linux test cannot set for real.
+#[cfg(test)]
+static REFUSE_TRUNCATION_FOR_TEST: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+fn truncation_refused_for_test() -> bool {
+    REFUSE_TRUNCATION_FOR_TEST.load(Ordering::SeqCst)
+}
+
+#[cfg(not(test))]
+const fn truncation_refused_for_test() -> bool {
+    false
+}
+
+/// #4298 — test seam: fail every high-water write, to prove a failed append
+/// is never truncated when its loss could not be made durable.
+#[cfg(test)]
+static REFUSE_MARK_WRITE_FOR_TEST: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+fn mark_write_refused_for_test() -> bool {
+    REFUSE_MARK_WRITE_FOR_TEST.load(Ordering::SeqCst)
+}
+
+#[cfg(not(test))]
+const fn mark_write_refused_for_test() -> bool {
+    false
+}
+
+/// #4298 — crash points on the failed-append path, in the order they occur.
+/// The last instant before the lost number reaches the mark: right after the
+/// failed append, nothing yet removed.
+const CRASH_BEFORE_MARK: &str = "before-mark";
+const CRASH_AFTER_MARK: &str = "after-mark";
+const CRASH_AFTER_TRUNCATE: &str = "after-truncate";
+
+/// #4298 — test seam: when set, each crash point copies the trail and its
+/// high-water mark into `<dir>/<point>/`, i.e. exactly what a process killed
+/// at that point leaves on disk, so a cell can verify every such state.
+#[cfg(test)]
+static CRASH_SNAPSHOT_DIR: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+#[cfg(test)]
+fn crash_snapshot(point: &str, trail: Option<&Path>) {
+    let dir = CRASH_SNAPSHOT_DIR.lock().ok().and_then(|g| g.clone());
+    let (Some(dir), Some(trail)) = (dir, trail) else {
+        return;
+    };
+    let out = dir.join(point);
+    let _ = std::fs::create_dir_all(&out);
+    let name = trail.file_name().unwrap_or_default();
+    let _ = std::fs::copy(trail, out.join(name));
+    let mark = seq_mark_path(trail);
+    if mark.exists() {
+        let _ = std::fs::copy(&mark, seq_mark_path(&out.join(name)));
+    }
+}
+
+#[cfg(not(test))]
+#[inline]
+fn crash_snapshot(_: &str, _: Option<&Path>) {}
+
+/// #4211 — what became of a failed append's bytes.
+#[derive(Debug)]
+enum Undo {
+    /// Nothing of the record remains: the trail is as it was before.
+    Clean,
+    /// The record and its newline are fully on disk after all.
+    Completed,
+    /// Bytes remain that could not be removed.
+    Torn(Torn),
+}
+
+/// #4211 — after `write_all(record)` failed, restore the trail to its
+/// pre-write length when the bytes past it are provably this append's own
+/// (a prefix of `record`) and `locked` allows it. The caller passes `locked`
+/// only when the lock is held AND the loss is already durable in the #4086
+/// high-water (#4298). Otherwise report what is left so the next record can
+/// be line-aligned.
+fn undo_failed_append(
+    trail: Option<&File>,
+    pre_len: Option<u64>,
+    locked: bool,
+    record: &[u8],
+    self_hash: &str,
+) -> Undo {
+    let Some(mut f) = trail else {
+        // In-memory sink: no file to leave a fragment in.
+        return Undo::Clean;
+    };
+    let (Some(pre), Ok(meta)) = (pre_len, f.metadata()) else {
+        return Undo::Torn(Torn::Fragment);
+    };
+    let now = meta.len();
+    if now == pre {
+        return Undo::Clean;
+    }
+    let landed = now
+        .checked_sub(pre)
+        .and_then(|n| usize::try_from(n).ok())
+        .filter(|n| *n <= record.len());
+    let Some(landed) = landed else {
+        // Shrunk, or grew by more than this record: not only our bytes.
+        return Undo::Torn(Torn::Fragment);
+    };
+    let mut ours = vec![0u8; landed];
+    let read = f
+        .seek(SeekFrom::Start(pre))
+        .and_then(|_| f.read_exact(&mut ours));
+    if read.is_err() || ours != record[..landed] {
+        return Undo::Torn(Torn::Fragment);
+    }
+    if landed == record.len() {
+        return Undo::Completed;
+    }
+    if locked && !truncation_refused_for_test() && f.set_len(pre).is_ok() {
+        let _ = f.sync_data();
+        return Undo::Clean;
+    }
+    if landed + 1 == record.len() {
+        // Only the newline is missing: finishing the line may still work.
+        if f.write_all(b"\n").is_ok() {
+            return Undo::Completed;
+        }
+        return Undo::Torn(Torn::CompleteRecord {
+            self_hash: self_hash.to_string(),
+        });
+    }
+    Undo::Torn(Torn::Fragment)
 }
 
 /// #4086 — largest sequence value a persisted high-water mark may hold.
@@ -314,6 +491,12 @@ impl SeqMark {
     fn record(&mut self, sequence: u64) -> Result<()> {
         if sequence <= self.recorded {
             return Ok(());
+        }
+        if mark_write_refused_for_test() {
+            return Err(anyhow!(
+                "recording lost audit sequence {sequence} in {}: refused by the test seam",
+                self.path.display()
+            ));
         }
         self.overwrite(sequence)
     }
@@ -545,6 +728,13 @@ pub fn init(path: &Path, redact_content: bool, append_only_hint: bool) -> Result
     }
 
     let seq_mark = open_seq_mark(&mark_path, existing_mark, last_sequence)?;
+    // #4211: a second handle, for the per-append lock and the undo of a
+    // failed append (reading and truncating what it left).
+    let trail = OpenOptions::new()
+        .read(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("opening audit log {}", path.display()))?;
 
     let sink = AuditSink {
         inner: Mutex::new(SinkInner {
@@ -552,6 +742,8 @@ pub fn init(path: &Path, redact_content: bool, append_only_hint: bool) -> Result
             last_hash,
             path: Some(path.to_path_buf()),
             seq_mark: Some(seq_mark),
+            trail: Some(trail),
+            torn: None,
         }),
         redact_content,
     };
@@ -595,6 +787,8 @@ pub(crate) fn init_for_test_with_writer(writer: Box<dyn Write + Send>) {
             last_hash: CHAIN_HEAD_PREV_HASH.to_string(),
             path: None,
             seq_mark: None,
+            trail: None,
+            torn: None,
         }),
         redact_content: true,
     };
@@ -1021,6 +1215,31 @@ fn try_emit_inner(builder: EventBuilder) -> Result<bool> {
 /// Build, hash and append one event as `sequence`. Advances the chain head
 /// once the line has been handed to the writer.
 fn write_event(inner: &mut SinkInner, builder: EventBuilder, sequence: u64) -> Result<()> {
+    let SinkInner {
+        writer,
+        last_hash,
+        path,
+        seq_mark,
+        trail,
+        torn,
+    } = inner;
+    let lock = TrailLock::acquire(trail.as_ref());
+    // #4211: a previous failed append left bytes that could not be removed.
+    // Start this record on its own line (the #4205 rule), so it is never
+    // glued onto them.
+    if let Some(left) = torn.take() {
+        let aligned = match trail.as_ref() {
+            Some(f) => crate::governance::audit::align_to_line_end(f),
+            None => Ok(()),
+        };
+        if let Err(e) = aligned {
+            *torn = Some(left);
+            return Err(e).context("line-aligning the audit trail after a torn write (#4211)");
+        }
+        if let Torn::CompleteRecord { self_hash } = left {
+            *last_hash = self_hash;
+        }
+    }
     let mut ev = AuditEvent {
         schema_version: SCHEMA_VERSION,
         timestamp: Utc::now().to_rfc3339(),
@@ -1039,21 +1258,65 @@ fn write_event(inner: &mut SinkInner, builder: EventBuilder, sequence: u64) -> R
         session_id: builder.session_id,
         request_id: builder.request_id,
         error: builder.error,
-        prev_hash: inner.last_hash.clone(),
+        prev_hash: last_hash.clone(),
         self_hash: String::new(),
     };
 
     let self_hash = compute_self_hash(&ev);
     ev.self_hash = self_hash.clone();
 
-    let line = serde_json::to_string(&ev).context("serializing audit event")?;
-    writeln!(inner.writer, "{line}").context("appending audit line")?;
+    // #4211: the record and its newline go out as ONE buffer through ONE
+    // `write_all` (never `writeln!`, which writes them separately). A failed
+    // append's bytes are removed when they are provably ours; otherwise the
+    // next record is line-aligned and verify reports the torn line.
+    let mut record = serde_json::to_vec(&ev).context("serializing audit event")?;
+    record.push(b'\n');
+    let pre_len = trail
+        .as_ref()
+        .and_then(|f| f.metadata().ok())
+        .map(|m| m.len());
+    if let Err(write_err) = writer.write_all(&record) {
+        crash_snapshot(CRASH_BEFORE_MARK, path.as_deref());
+        // #4298: make the loss DURABLE before any of its evidence is removed.
+        // The #4086 high-water records this sequence (fdatasync'd) FIRST; only
+        // then may the partial record be truncated. The reverse order left a
+        // window where a crash showed a clean trail and a mark that did not
+        // cover the lost number: a false "no gap" (the partial line, before
+        // #4211, at least failed verify). If the mark cannot be written, the
+        // bytes are never truncated: they stay as the evidence (the Torn path).
+        let loss_durable = match seq_mark.as_mut() {
+            Some(mark) => mark.record(sequence).is_ok(),
+            None => trail.is_none(),
+        };
+        crash_snapshot(CRASH_AFTER_MARK, path.as_deref());
+        let may_truncate = lock.held() && loss_durable;
+        match undo_failed_append(trail.as_ref(), pre_len, may_truncate, &record, &self_hash) {
+            Undo::Clean => crash_snapshot(CRASH_AFTER_TRUNCATE, path.as_deref()),
+            Undo::Completed => {
+                *last_hash = self_hash;
+                return Ok(());
+            }
+            Undo::Torn(left) => {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "ai-memory: audit trail {}: a failed write left bytes that could not be \
+                     removed (the append-only flag, or bytes that are not this write's); the next \
+                     record starts a new line and `ai-memory audit verify` reports a TornRecord \
+                     (#4211)",
+                    path.as_deref()
+                        .map_or_else(|| "?".into(), |p| p.display().to_string())
+                );
+                *torn = Some(left);
+            }
+        }
+        return Err(write_err).context("appending audit line");
+    }
     // #3975: a failed flush was discarded (`.ok()`). The line may or may not
     // be durable, so the chain head still advances exactly as before (the
     // line WAS handed to the writer), but the failure is counted and
     // reported like any other lost write.
-    let flushed = inner.writer.flush();
-    inner.last_hash = self_hash;
+    let flushed = writer.flush();
+    *last_hash = self_hash;
     flushed.context("flushing audit line")
 }
 
@@ -1137,9 +1400,14 @@ pub struct VerifyReport {
     /// tail and makes no gap, so in a single-writer trail a gap is evidence of
     /// a lost event. The converse does NOT hold: events lost after the last
     /// written line and before a restart have their numbers reused and leave
-    /// no gap (#4086). A trail that starts above sequence 1 is not a gap (the
-    /// head of a file is not checked).
+    /// no gap (#4086). The HEAD is checked too (#4191): verify always starts
+    /// from the genesis anchor, whose sequence is 0, so a genesis-anchored
+    /// first line above sequence 1 reports `1..=first-1`, the events lost
+    /// before the first successful write.
     pub gaps: Vec<SequenceGap>,
+    /// #4211 — line numbers of torn records (see
+    /// [`VerifyFailureKind::TornRecord`]), in file order.
+    pub torn_lines: Vec<u64>,
 }
 
 /// #4021 — a run of sequence numbers that no line carries: `from..=to`.
@@ -1238,6 +1506,13 @@ pub enum VerifyFailureKind {
     ChainBreak,
     /// `sequence` did not increase monotonically.
     Sequence,
+    /// #4211 — an unparseable line that the chain passes AROUND: the next
+    /// record chains to the record before it. It is what a failed write
+    /// leaves when its bytes cannot be removed (the append-only flag refuses
+    /// truncation). Never clean and never acknowledgeable, but verify keeps
+    /// checking the chain after it, so the records that follow stay verified
+    /// and the lost event still surfaces as a gap.
+    TornRecord,
 }
 
 impl VerifyReport {
@@ -1307,10 +1582,13 @@ pub fn verify_chain(path: &Path) -> Result<VerifyReport> {
     // gap like any interior one, INCLUDING on an empty trail: a mark above 0
     // is evidence that events were numbered, so a trail whose every event was
     // lost (a disk full from the first write) is the gap 1..=mark, never
-    // clean. The "head is not checked" rule covers only an empty trail with
-    // no such evidence.
+    // clean. An empty trail with no mark is clean: nothing was numbered.
     let high_water = read_seq_mark(&seq_mark_path(path))?.unwrap_or(0);
-    if report.first_failure.is_none() && high_water > last_sequence {
+    let chain_intact = report
+        .first_failure
+        .as_ref()
+        .is_none_or(|f| f.kind == VerifyFailureKind::TornRecord);
+    if chain_intact && high_water > last_sequence {
         report.gaps.push(SequenceGap {
             from: last_sequence + 1,
             to: high_water,
@@ -1335,6 +1613,11 @@ fn walk_chain<R: Read>(reader: R, last_sequence: &mut u64) -> Result<VerifyRepor
     let mut prev_hash = CHAIN_HEAD_PREV_HASH.to_string();
     let mut prev_seq: u64 = 0;
     let mut gaps: Vec<SequenceGap> = Vec::new();
+    let mut torn_lines: Vec<u64> = Vec::new();
+    // Unparseable lines not yet passed around by a chained record, with the
+    // first one's parse error.
+    let mut pending: Vec<u64> = Vec::new();
+    let mut pending_error = String::new();
 
     for (idx, line) in buf.lines().enumerate() {
         let line_no = (idx as u64) + 1;
@@ -1344,25 +1627,41 @@ fn walk_chain<R: Read>(reader: R, last_sequence: &mut u64) -> Result<VerifyRepor
         }
         total += 1;
 
-        let ev: AuditEvent = match serde_json::from_str(&line) {
-            Ok(e) => e,
+        // #4211: an unparseable line is set aside and the walk continues. It
+        // is never clean. If a later record chains past it (its prev_hash is
+        // the last ACCEPTED record's hash) it is a torn record; if nothing
+        // does, it is the Parse failure it always was; and a record that does
+        // not chain fails ChainBreak exactly as before.
+        let ev = match serde_json::from_str::<AuditEvent>(&line) {
+            Ok(ev) => ev,
             Err(e) => {
-                return Ok(VerifyReport {
-                    total_lines: total,
-                    gaps: std::mem::take(&mut gaps),
-                    first_failure: Some(VerifyFailure {
-                        line_number: line_no,
-                        kind: VerifyFailureKind::Parse,
-                        detail: format!("malformed JSON: {e}"),
-                    }),
-                });
+                if pending.is_empty() {
+                    pending_error = format!("malformed JSON: {e}");
+                }
+                pending.push(line_no);
+                continue;
             }
         };
 
         if ev.prev_hash != prev_hash {
+            // A set-aside line the chain does NOT pass around keeps the
+            // earliest failure it always was: Parse at that line.
+            if let Some(&line_number) = pending.first() {
+                return Ok(VerifyReport {
+                    total_lines: total,
+                    gaps: std::mem::take(&mut gaps),
+                    torn_lines: std::mem::take(&mut torn_lines),
+                    first_failure: Some(VerifyFailure {
+                        line_number,
+                        kind: VerifyFailureKind::Parse,
+                        detail: std::mem::take(&mut pending_error),
+                    }),
+                });
+            }
             return Ok(VerifyReport {
                 total_lines: total,
                 gaps: std::mem::take(&mut gaps),
+                torn_lines: std::mem::take(&mut torn_lines),
                 first_failure: Some(VerifyFailure {
                     line_number: line_no,
                     kind: VerifyFailureKind::ChainBreak,
@@ -1374,10 +1673,18 @@ fn walk_chain<R: Read>(reader: R, last_sequence: &mut u64) -> Result<VerifyRepor
             });
         }
 
-        if ev.sequence <= prev_seq && prev_seq != 0 {
+        // The chain passed around the set-aside lines: they are torn records.
+        torn_lines.append(&mut pending);
+
+        // #4191: the genesis anchor IS sequence 0 (every verifiable trail
+        // starts there; a first line not chained to it fails ChainBreak
+        // above), so the head is held to the same rules as every later line:
+        // sequence 0 is refused, and a first line above 1 is a gap.
+        if ev.sequence <= prev_seq {
             return Ok(VerifyReport {
                 total_lines: total,
                 gaps: std::mem::take(&mut gaps),
+                torn_lines: std::mem::take(&mut torn_lines),
                 first_failure: Some(VerifyFailure {
                     line_number: line_no,
                     kind: VerifyFailureKind::Sequence,
@@ -1389,8 +1696,8 @@ fn walk_chain<R: Read>(reader: R, last_sequence: &mut u64) -> Result<VerifyRepor
             });
         }
 
-        // #4021: an interior skip is a lost event (the head is not checked).
-        if prev_seq != 0 && ev.sequence > prev_seq + 1 {
+        // #4021: a skip is a lost event, at the head (#4191) as anywhere.
+        if ev.sequence > prev_seq + 1 {
             gaps.push(SequenceGap {
                 from: prev_seq + 1,
                 to: ev.sequence - 1,
@@ -1402,6 +1709,7 @@ fn walk_chain<R: Read>(reader: R, last_sequence: &mut u64) -> Result<VerifyRepor
             return Ok(VerifyReport {
                 total_lines: total,
                 gaps: std::mem::take(&mut gaps),
+                torn_lines: std::mem::take(&mut torn_lines),
                 first_failure: Some(VerifyFailure {
                     line_number: line_no,
                     kind: VerifyFailureKind::SelfHash,
@@ -1418,10 +1726,38 @@ fn walk_chain<R: Read>(reader: R, last_sequence: &mut u64) -> Result<VerifyRepor
         *last_sequence = prev_seq;
     }
 
+    if let Some(&line_number) = pending.first() {
+        return Ok(VerifyReport {
+            total_lines: total,
+            gaps,
+            torn_lines,
+            first_failure: Some(VerifyFailure {
+                line_number,
+                kind: VerifyFailureKind::Parse,
+                detail: pending_error,
+            }),
+        });
+    }
+    let first_failure = torn_lines.first().map(|&line_number| VerifyFailure {
+        line_number,
+        kind: VerifyFailureKind::TornRecord,
+        detail: format!(
+            "{} torn record(s) at line(s) {}: bytes of a failed write that could not be \
+             removed (#4211). The chain was verified across them; the events they held are \
+             reported as sequence gaps",
+            torn_lines.len(),
+            torn_lines
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+    });
     Ok(VerifyReport {
         total_lines: total,
-        first_failure: None,
+        first_failure,
         gaps,
+        torn_lines,
     })
 }
 
@@ -1688,6 +2024,15 @@ fn mark_append_only(_path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tail_loss_4086_tests;
+
+#[cfg(test)]
+mod verify_head_4191_tests;
+
+#[cfg(test)]
+mod torn_write_4211_tests;
+
+#[cfg(test)]
+mod crash_window_4298_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2644,6 +2989,7 @@ mod tests {
                 super::SequenceGap { from: 3, to: 3 },
                 super::SequenceGap { from: 7, to: 9 },
             ],
+            torn_lines: Vec::new(),
         };
         let exact = [
             super::SequenceGap { from: 3, to: 3 },
@@ -2710,6 +3056,7 @@ mod tests {
                 detail: "x".to_string(),
             }),
             gaps: Vec::new(),
+            torn_lines: Vec::new(),
         };
         let err = report.into_result().unwrap_err();
         let msg = format!("{err}");

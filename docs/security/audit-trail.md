@@ -406,8 +406,12 @@ event lost to a failed write (a full disk, a revoked permission; see
 §"Detecting a trail that stopped recording") leaves a missing `sequence`
 range while the hash chain stays intact. `verify` therefore fails on a gap, as
 its own kind (`SequenceGap`, "events missing"), never with the tamper
-wording. Only interior gaps count: the first line of a file is not required
-to be sequence 1.
+wording. The HEAD of the trail is checked too (#4191): every trail `verify`
+accepts starts at the genesis anchor, which is sequence 0, so a first line
+above sequence 1 means the events before it were numbered and lost (the disk
+was already full, or the permission already gone, when the trail started).
+Those are reported as the gap `1..=first-1`, and a first line with sequence 0
+fails as `Sequence`.
 
 Once the loss is understood, acknowledge the exact ranges verify printed:
 `ai-memory audit verify --acknowledge-gaps 812-812,1040-1043`. A gap passes
@@ -415,6 +419,31 @@ only if it EQUALS a listed range. A range that merely contains it does not
 count, so an acknowledgement can never become a blanket pass, and any later
 gap fails again. A listed range that matches no gap is reported on stderr, so
 a stale acknowledgement left in a cron line stays visible.
+
+**A write that fails part-way leaves no glued line (#4211).** A record and its
+newline go out as one buffer through one write. When the write fails
+part-way (a disk that fills mid-record writes some bytes, then reports
+ENOSPC), the bytes it left are removed: every ai-memory writer holds an
+exclusive lock on the trail around each append, and the leftover is
+truncated only when it is provably that write's own (a prefix of the record
+it was writing), and only AFTER the lost event's number is durable in the
+high-water mark (#4298). The trail is then exactly as it was, and the lost
+event is an ordinary gap. A crash at any point of this path cannot hide the
+loss: before the mark is written the partial record is still on disk (verify
+fails and a restart refuses the torn tail); after it, the mark names the
+lost number. If the mark cannot be written, the bytes are not removed at all
+(they stay as a `TornRecord`, below). If only the newline was missing, the line is finished and
+the event was not lost at all.
+
+When the leftover cannot be removed (the append-only OS flag set by
+`append_only_hint` refuses truncation; on macOS that is the default), the next
+record starts its own line instead of being glued onto it, and `verify`
+reports the leftover as `TornRecord`: never clean and not acknowledgeable,
+but the chain is checked ACROSS it (the next record must chain to the one
+before the torn line), so every later record is still verified and the lost
+event is still reported as a gap. An unparseable line that the chain does NOT
+pass around (a record replaced by garbage, or garbage at the end of the file)
+is still the `Parse` failure it always was.
 
 **A loss at the tail before a restart is a gap too (#4086).** A restart used
 to resume numbering from the last event WRITTEN, so the numbers of events lost
@@ -446,8 +475,13 @@ recreates it from the trail. A missing mark (a new trail, or one written before
 Remaining limits:
 
 - An event lost to a crash between being numbered and its write failing (the
-  process dies mid-write) is not recorded; a torn line fails `verify` with
-  `Parse` instead.
+  process dies mid-write) is not recorded in the mark. If some of its bytes
+  reached the file, the torn line fails `verify` with `Parse` and a restart
+  refuses the torn tail. If none did, nothing on disk records the lost number
+  and `verify` reads clean: the one residual the mark cannot close, because
+  the mark is written only once the write has failed. (A crash AFTER a failed
+  write is covered: the mark is made durable before any bytes are removed,
+  #4298.)
 - **Custody of the mark.** `audit.log.seq` is NOT signed and not chained; it
   has exactly the custody of the trail (the same directory, the same
   permissions). Deleting it, or rolling it back together with the trail's
