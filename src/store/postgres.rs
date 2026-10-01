@@ -33011,7 +33011,7 @@ impl MemoryStore for PostgresStore {
                 COALESCE(MIN(day_started_at), $2) AS day_started_at,
                 COALESCE(MIN(created_at), $2) AS created_at,
                 COALESCE(MAX(updated_at), $2) AS updated_at
-             FROM agent_quotas WHERE agent_id = $1",
+             FROM agent_quotas WHERE agent_id = $1 AND namespace <> '_notify'",
         )
         .bind(agent_id)
         .bind(now)
@@ -35703,6 +35703,23 @@ impl PostgresStore {
             !ctx.bypass_visibility,
         )
         .await?;
+
+        // #4359 — a tenant write into a system inbox namespace is a notify
+        // (#3362 refuses every other tenant write there): also charge the
+        // per-SENDER aggregate row, count-only, in the SAME tx so a refusal
+        // rolls the insert and the per-namespace charge back together.
+        // Federation receive (`merge_inbound`, #4354) and admin contexts
+        // (enforce=false) never take this branch.
+        if !ctx.bypass_visibility && crate::visibility::inbox_delete_retains(&memory.namespace) {
+            record_memory_quota_in_tx(
+                &mut tx,
+                &quota_agent_id,
+                crate::quotas::NOTIFY_AGGREGATE_NAMESPACE,
+                0,
+                true,
+            )
+            .await?;
+        }
 
         tx.commit()
             .await

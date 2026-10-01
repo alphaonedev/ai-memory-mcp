@@ -4097,10 +4097,8 @@ impl MemoryStore for SqliteStore {
         // inbox namespace, but the authenticated sender pays for the write.
         let payload_bytes =
             quotas::coordination_payload_bytes(&[&mem.title, &mem.content], &[&mem.metadata]);
-        let quota_op = quotas::QuotaOp::Memory {
-            bytes: payload_bytes,
-        };
-        match quotas::check_and_record(&conn, &ctx.agent_id, &mem.namespace, quota_op) {
+        // #4359 — also charges the per-sender aggregate row.
+        match quotas::check_and_record_notify(&conn, &ctx.agent_id, &mem.namespace, payload_bytes) {
             Ok(()) => {}
             Err(quotas::QuotaCheckError::Quota(q)) => {
                 return Err(StoreError::QuotaExceeded {
@@ -4137,7 +4135,7 @@ impl MemoryStore for SqliteStore {
             }
             Err(e) => {
                 if let Err(refund_err) =
-                    quotas::refund_op(&conn, &ctx.agent_id, &mem.namespace, quota_op)
+                    quotas::refund_notify(&conn, &ctx.agent_id, &mem.namespace, payload_bytes)
                 {
                     quotas::log_refund_op_failed(&ctx.agent_id, &refund_err);
                 }
@@ -6163,6 +6161,50 @@ mod tests {
             )
             .expect("count inbox rows");
         assert_eq!(inbox_rows, 0, "an over-quota notify must not materialise");
+    }
+
+    #[tokio::test]
+    async fn notify_distinct_recipient_flood_is_bound_per_sender_4359() {
+        let store = fresh_store();
+        let ctx = CallerContext::for_agent("flooder-4359");
+        {
+            let conn = store.state.lock().await;
+            quotas::get_status(&conn, &ctx.agent_id, quotas::NOTIFY_AGGREGATE_NAMESPACE)
+                .expect("seed aggregate row");
+            conn.execute(
+                "UPDATE agent_quotas SET max_memories_per_day = 3
+                 WHERE agent_id = ?1 AND namespace = ?2",
+                rusqlite::params![ctx.agent_id, quotas::NOTIFY_AGGREGATE_NAMESPACE],
+            )
+            .expect("tighten aggregate");
+        }
+        for index in 0..3 {
+            store
+                .notify(&ctx, &format!("ai:d-{index}"), "t", "p", None, None, None)
+                .await
+                .expect("under the sender ceiling");
+        }
+        let err = store
+            .notify(&ctx, "ai:d-3", "t", "p", None, None, None)
+            .await
+            .expect_err("4th distinct recipient refused");
+        assert!(matches!(
+            err,
+            StoreError::QuotaExceeded { ref namespace, .. }
+                if namespace == quotas::NOTIFY_AGGREGATE_NAMESPACE
+        ));
+        let conn = store.state.lock().await;
+        let rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE namespace = '_inbox/ai:d-3'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count");
+        assert_eq!(rows, 0, "refused notify must not materialise");
+        let agg = quotas::peek_status(&conn, &ctx.agent_id, quotas::NOTIFY_AGGREGATE_NAMESPACE)
+            .expect("aggregate status");
+        assert_eq!(agg.current_memories_today, 3);
     }
 
     #[tokio::test]
