@@ -64,12 +64,16 @@ kinds, claim-bitemporal columns), and certifies the postgres + Apache
 AGE + pgvector storage backend.
 
 > **Certified-backend scope — read this before choosing Postgres.** The
-> two backends are **not one identical API**: **61 of the 82 unique
-> production HTTP paths are served on Postgres; the remaining 21 fail
-> closed with a uniform `501 NOT IMPLEMENTED`** (the Agent Skills surface,
-> `/api/v1/share`, the legacy `/api/v1/find_paths` alias, and the
-> `memory_*` MCP-parity routes with no pg SAL trait method yet — pinned by
-> `tests/pg_supported_route_inventory_gate_2799.rs`), and **MCP-stdio is
+> two backends are **not one identical API**: **Postgres supports at least
+> one registered method on 76 of the 89 unique production HTTP paths; 13
+> paths are wholly unsupported on Postgres and fail closed with a uniform
+> `501 NOT IMPLEMENTED`** (the eight Agent Skills paths, `/api/v1/share`,
+> and four `memory_*` MCP-parity routes with no pg SAL trait method yet).
+> The legacy `POST /api/v1/find_paths` alias is supported. See the
+> method-level PostgreSQL gate (`src/handlers/postgres_gate.rs`) and
+> `tests/pg_supported_route_inventory_gate_2799.rs` for the supported and
+> unsupported inventories; path support does not imply all methods are
+> supported. **MCP-stdio is
 > structurally SQLite-only** ([#1675](https://github.com/alphaonedev/ai-memory-mcp/issues/1675)):
 > a Postgres-backed deployment serves MCP clients through the HTTP daemon,
 > not `ai-memory mcp`. The certified **PG 18.6 / AGE 1.8.0 / pgvector
