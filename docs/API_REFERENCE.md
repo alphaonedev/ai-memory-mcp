@@ -33,7 +33,13 @@ x-api-key: <key>
 
 The header is the **only** credential channel.
 
-Failure → **401** `{"error": "missing or invalid API key"}`.
+Failure → **401** `{"error": "missing or invalid API key"}`. After repeated
+authentication failures from the same TCP source (5 free failures, then a
+backoff starting at 1 s and doubling to a 300 s ceiling — #2502), that
+source receives **429** `{"error": "auth_backoff"}` with `Retry-After`
+on every authenticated route, read or write, even when it presents a
+correct key during the backoff window. `/health`, keyless daemons and the
+mTLS-enforced `/sync` lane are not counted.
 
 > **BREAKING CHANGE at v1.0.0 — `?api_key=` query credential REMOVED**
 > ([#2032](https://github.com/alphaonedev/ai-memory-mcp/issues/2032) L1;
@@ -225,8 +231,11 @@ application; `429` (dominant cause) when **nothing** persisted and quota
 was the worst rejection. A wholly quota-rejected batch is therefore
 `429`, not `200`.
 
-Read paths (`GET /recall`, `/search`, `/memories`, …) are not quota-charged
-and never return 429.
+Read operations (`GET /recall`, `/search`, `/memories`, …) are not charged
+against write quotas. Authenticated read and write routes may nevertheless
+return 429 with `{"error":"auth_backoff"}` and `Retry-After` when their TCP
+source is in authentication-failure backoff. Ordinary missing or invalid
+credentials return 401 before backoff begins.
 
 ## Limits
 
