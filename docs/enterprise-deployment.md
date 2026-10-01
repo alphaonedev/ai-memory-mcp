@@ -478,7 +478,7 @@ auth layers ([`federation.md`](federation.html)):
 | Layer | Mechanism | Effect |
 |---|---|---|
 | 1 (transport) | mTLS with SHA-256 fingerprint allowlist (`--mtls-allowlist`) | Peer without listed cert cannot open TCP |
-| 2 (application) | `x-api-key` header (the `?api_key=` query form is deprecated at v0.7.0, #1574 — WARNs once per process; slated for rejection in v0.8) | Every endpoint except `/api/v1/health` requires it |
+| 2 (application) | `x-api-key` header — the only accepted credential channel (the `?api_key=` query form was **REMOVED at v1.0.0**, #2032 L1, after deprecation at v0.7.0, #1574; it does not authenticate, and a once-per-process WARN names the header) | Every endpoint except `/api/v1/health` requires it; a missing or invalid credential ordinarily returns 401, and source-IP auth backoff can return 429 (#2502) |
 | 3 (identity) | Per-peer `PeerScope` JSON via `AI_MEMORY_FED_PEER_ATTESTATION` | `allowed_sender_agent_ids` gates the authorship a peer may claim on `/sync/push`; the `allowed_namespaces` glob gates WHICH namespaces it may touch on ALL THREE lanes — the `/sync/since` pull projection, the `deletions[]` lane (#1934), and the `memories[]` write lane + `archives[]` / `restores[]` (#2447); default-deny |
 
 Cert generation, fingerprint allowlist format, and the cert-revocation
