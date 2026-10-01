@@ -29,6 +29,26 @@ use tower::ServiceExt as _;
 /// Cells mutate process env (attestation / `why_trace` postures); one at a time.
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// RAII env override: restored on drop, so a panicking cell cannot leak the
+/// posture into later cells. Only used while `SERIAL` is held.
+struct EnvGuard(&'static str);
+
+impl EnvGuard {
+    fn set(key: &'static str, value: &str) -> Self {
+        // SAFETY: every cell holds `SERIAL`, so no other cell reads or writes
+        // the process env concurrently.
+        unsafe { std::env::set_var(key, value) };
+        Self(key)
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        // SAFETY: as in `set`; the guard is dropped while `SERIAL` is held.
+        unsafe { std::env::remove_var(self.0) };
+    }
+}
+
 const SHARED_KEY: &str = "issue-4357-transport-key";
 const OWNER: &str = "ai:owner-4357";
 const APPROVER: &str = "ai:approver-4357";
@@ -776,10 +796,10 @@ async fn exercise_why_trace_replay(
             .await
             .expect("approve")
     );
-    // SAFETY: serialised by SERIAL; removed before the guard drops.
-    unsafe { std::env::set_var("AI_MEMORY_REQUIRE_WHY_TRACE", "1") };
-    let exec = store.execute_pending_action(&approver, &pid).await;
-    unsafe { std::env::remove_var("AI_MEMORY_REQUIRE_WHY_TRACE") };
+    let exec = {
+        let _env = EnvGuard::set("AI_MEMORY_REQUIRE_WHY_TRACE", "1");
+        store.execute_pending_action(&approver, &pid).await
+    };
     assert!(
         !matches!(exec, Ok(Some(_))),
         "#4357: the approved replay bypassed the why_trace gate: {exec:?}"
@@ -801,10 +821,10 @@ async fn exercise_strict_attest_before_queue(
     )
     .await;
     let (router, _f) = build_router(backend, Arc::clone(&store), sqlite_path);
-    // SAFETY: serialised by SERIAL; removed before the guard drops.
-    unsafe { std::env::set_var("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "1") };
-    let (status, resp) = reflect_http(&router, &gate_body(&sid, &ns)).await;
-    unsafe { std::env::remove_var("AI_MEMORY_REQUIRE_AGENT_ATTESTATION") };
+    let (status, resp) = {
+        let _env = EnvGuard::set("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "1");
+        reflect_http(&router, &gate_body(&sid, &ns)).await
+    };
     assert!(
         status.is_client_error() && resp["status"] != "pending",
         "#4357: strict attestation must refuse before queueing: {status} {resp}"
@@ -850,7 +870,89 @@ macro_rules! paste_cell {
     };
 }
 
+/// A standard whose governance carries the threshold but NO `write` key fails
+/// the typed policy parse (`write` is required): a CORRUPT level. It must not
+/// turn the gate off. Own namespace, owner caller: pending.
+async fn exercise_threshold_only_own_namespace(
+    store: Arc<dyn MemoryStore>,
+    backend: StorageBackend,
+    sqlite_path: Option<&std::path::Path>,
+) {
+    enforce_mode();
+    let (ns, sid) = seed_namespace(&store, json!({"require_approval_above_depth": 0})).await;
+    let (router, _f) = build_router(backend, Arc::clone(&store), sqlite_path);
+    let (status, body) = reflect_http(&router, &gate_body(&sid, &ns)).await;
+    assert!(
+        body.get("id").is_none() && body["status"] == "pending",
+        "#4357: a threshold-only standard must still gate: {status} {body}"
+    );
+    assert_eq!(reflection_count(&store, &ns).await, 0);
+}
+
+/// Same standard, a NON-OWNER tenant reflecting into another owner's
+/// namespace: pending, never applied.
+async fn exercise_threshold_only_non_owner(
+    store: Arc<dyn MemoryStore>,
+    backend: StorageBackend,
+    sqlite_path: Option<&std::path::Path>,
+) {
+    enforce_mode();
+    let (ns, _owner_source) =
+        seed_namespace(&store, json!({"require_approval_above_depth": 0})).await;
+    // The tenant's own readable source, stored in the owner's namespace.
+    let stranger = CallerContext::for_agent(VICTIM);
+    let mut src = memory(&ns, "tenant source");
+    src.metadata = json!({"agent_id": VICTIM});
+    let sid = store.store(&stranger, &src).await.expect("tenant source");
+    let (router, _f) = build_router(backend, Arc::clone(&store), sqlite_path);
+    let mut body = gate_body(&sid, &ns);
+    body["agent_id"] = json!(VICTIM);
+    let (status, resp) = reflect_as(&router, VICTIM, &body).await;
+    assert!(
+        resp.get("id").is_none(),
+        "#4357: a non-owner reflect into another owner's namespace was APPLIED: {status} {resp}"
+    );
+    assert_eq!(reflection_count(&store, &ns).await, 0);
+}
+
+/// A corrupt child under an explicit parent 5: the parent decides (the
+/// resolver returns 5, never the corrupt level's raw knob, never "no gate").
+async fn exercise_corrupt_child_parent_decides(
+    store: Arc<dyn MemoryStore>,
+    _backend: StorageBackend,
+    _sqlite_path: Option<&std::path::Path>,
+) {
+    let ctx = CallerContext::for_agent(OWNER);
+    let parent = format!("p4357c/{}", uuid::Uuid::new_v4().simple());
+    let mut pstd = memory(&format!("{parent}/standards"), "parent standard");
+    pstd.metadata["governance"] = json!({"write": "any", "require_approval_above_depth": 5});
+    store.store(&ctx, &pstd).await.expect("pstd");
+    store
+        .set_namespace_standard(&ctx, &parent, &pstd.id, None)
+        .await
+        .expect("bind parent");
+    let child = format!("{parent}/child");
+    let mut cstd = memory(&format!("{child}/standards"), "child standard");
+    cstd.metadata["governance"] = json!({"require_approval_above_depth": 99});
+    store.store(&ctx, &cstd).await.expect("cstd");
+    store
+        .set_namespace_standard(&ctx, &child, &cstd.id, None)
+        .await
+        .expect("bind child");
+    assert_eq!(
+        store
+            .resolve_require_approval_above_depth(&child)
+            .await
+            .expect("resolve"),
+        Some(5),
+        "#4357: the explicit ancestor decides over a corrupt level"
+    );
+}
+
 round2_cells! {
+    issue_4357_threshold_only_own_namespace => exercise_threshold_only_own_namespace;
+    issue_4357_threshold_only_non_owner_tenant => exercise_threshold_only_non_owner;
+    issue_4357_corrupt_child_parent_decides => exercise_corrupt_child_parent_decides;
     issue_4357_child_omits_field_hierarchy => exercise_child_omits_field, false;
     issue_4357_child_omits_field_declared_parent => exercise_child_omits_field, true;
     issue_4357_child_without_standard_inherits => exercise_child_without_standard;
