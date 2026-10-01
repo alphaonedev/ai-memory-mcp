@@ -8570,7 +8570,10 @@ pub fn apply_token_budget(
     )
 }
 
-/// Recall — fuzzy OR search + touch + auto-promote + TTL extension.
+/// Recall — fuzzy OR search + optional semantic blend. Pure since #1953:
+/// it appends `recall_observations` rows only; the periodic fold job applies
+/// the access count and the per-tier TTL floor-extend, and no recall path
+/// promotes a tier (removed by v1.0.0 Boids item 1, vote 4d3ea1c5).
 /// Task 1.11: after ranking, applies optional `budget_tokens` cap.
 /// Phase P6: returns the full `BudgetOutcome` (tokens_used,
 /// tokens_remaining, memories_dropped, budget_overflow) instead of just
