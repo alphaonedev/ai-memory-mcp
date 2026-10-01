@@ -216,7 +216,8 @@ fn skill_promotion_min_depth_overflow_saturates_fail_closed() {
             "skill_promotion_min_depth": overflow_value,
         }),
     );
-    let resolved = db::resolve_skill_promotion_min_depth(&conn, "qual-3-promote-overflow");
+    let resolved = db::resolve_skill_promotion_min_depth(&conn, "qual-3-promote-overflow")
+        .expect("#4043: governance policy read");
     assert_eq!(
         resolved,
         Some(u32::MAX),
@@ -238,7 +239,8 @@ fn skill_promotion_min_depth_u64_max_saturates_fail_closed() {
             "skill_promotion_min_depth": u64::MAX,
         }),
     );
-    let resolved = db::resolve_skill_promotion_min_depth(&conn, "qual-3-promote-u64max");
+    let resolved = db::resolve_skill_promotion_min_depth(&conn, "qual-3-promote-u64max")
+        .expect("#4043: governance policy read");
     assert_eq!(
         resolved,
         Some(u32::MAX),
@@ -263,7 +265,8 @@ fn skill_promotion_min_depth_just_over_u32_max_saturates_fail_closed() {
             "skill_promotion_min_depth": overflow_value,
         }),
     );
-    let resolved = db::resolve_skill_promotion_min_depth(&conn, "qual-3-promote-edge");
+    let resolved = db::resolve_skill_promotion_min_depth(&conn, "qual-3-promote-edge")
+        .expect("#4043: governance policy read");
     assert_eq!(
         resolved,
         Some(u32::MAX),
@@ -286,7 +289,8 @@ fn skill_promotion_min_depth_in_range_value_round_trips() {
             "skill_promotion_min_depth": 3_u32,
         }),
     );
-    let resolved = db::resolve_skill_promotion_min_depth(&conn, "qual-3-promote-inrange");
+    let resolved = db::resolve_skill_promotion_min_depth(&conn, "qual-3-promote-inrange")
+        .expect("#4043: governance policy read");
     assert_eq!(
         resolved,
         Some(3),
