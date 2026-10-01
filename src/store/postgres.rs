@@ -110,6 +110,8 @@ mod swarm_rewind;
 mod lifecycle_tx_3152;
 // #4199 A1 — the postgres forensic-sink outage recorder (qual_10 budget).
 mod forensic_outage_4199;
+// v1.0.0 #4209/#4210 — one ascending-id lock order for multi-row `memories` locks.
+mod lock_order_4209;
 
 use crate::models::field_names;
 use std::time::Duration;
@@ -13119,6 +13121,12 @@ impl PostgresStore {
             .begin()
             .await
             .map_err(|e| to_store_err("begin link tx", e))?;
+        // #4210 — both endpoints in ascending id order BEFORE the gate's source
+        // `FOR UPDATE` and the INSERT's FK key-share on the target.
+        let ends = lock_order_4209::link_endpoint_locks(&link.source_id, &link.target_id);
+        lock_order_4209::lock_memories_in_id_order(&mut tx, &ends)
+            .await
+            .map_err(|e| to_store_err("lock link endpoints", e))?;
         self.validate_link_pre_create_pg(&mut *tx, ctx, link, keypair)
             .await?;
 
@@ -14576,6 +14584,16 @@ impl PostgresStore {
             .begin()
             .await
             .map_err(|e| ReflectError::Database(format!("begin reflect tx: {e}")))?;
+        // #4210 sibling — the reflects_on INSERTs key-share every source through
+        // the FK in caller order; take those locks first, ascending by id.
+        let src_locks: Vec<_> = input
+            .source_ids
+            .iter()
+            .map(|i| (i.as_str(), lock_order_4209::RowLock::KeyShare))
+            .collect();
+        lock_order_4209::lock_memories_in_id_order(&mut tx, &src_locks)
+            .await
+            .map_err(|e| ReflectError::Database(format!("lock reflect sources: {e}")))?;
 
         // APPEND-ONLY-SANCTIONED (#1823 G6 / #2948) — COW SUPERSEDE: probe the
         // existing (title, namespace) row's version BEFORE the reflection upsert
@@ -25898,6 +25916,11 @@ impl MemoryStore for PostgresStore {
             .begin()
             .await
             .map_err(|e| to_store_err("begin apply_remote_link tx", e))?;
+        // #4210 — the FK key-share locks, taken in ascending id order.
+        let ends = lock_order_4209::replay_endpoint_locks(&link.source_id, &link.target_id);
+        lock_order_4209::lock_memories_in_id_order(&mut tx, &ends)
+            .await
+            .map_err(|e| to_store_err("lock apply_remote_link endpoints", e))?;
 
         sqlx::query(
             "INSERT INTO memory_links (
@@ -28549,6 +28572,15 @@ impl MemoryStore for PostgresStore {
             .begin()
             .await
             .map_err(|e| to_store_err("begin consolidate tx", e))?;
+        // #4209 sibling — the sources are rewritten below in CALLER order; take
+        // their row locks first in ascending id order (CONCURRENCY-04).
+        let src_locks: Vec<_> = ids
+            .iter()
+            .map(|i| (i.as_str(), lock_order_4209::RowLock::Update))
+            .collect();
+        lock_order_4209::lock_memories_in_id_order(&mut tx, &src_locks)
+            .await
+            .map_err(|e| to_store_err("lock consolidate sources", e))?;
 
         // CONCURRENCY-04: lock in stable order, then preserve caller order for
         // metadata merging and expected-version alignment. Locks last to commit.
@@ -31516,6 +31548,13 @@ impl MemoryStore for PostgresStore {
                 // #2377 (FIX #9) — RETURNING carries `valid_from`/`valid_until` too so a
                 // restored already-invalidated edge re-projects into AGE ALREADY-carrying
                 // its validity (else the current-view Cypher reads would serve it as VALID).
+                // #4210 sibling — the INSERT below key-shares every other endpoint
+                // through the FK in plan order; take those locks first, ascending.
+                sqlx::query(lock_order_4209::SQL_KEY_SHARE_ARCHIVED_LINK_PEERS)
+                    .bind(id)
+                    .fetch_all(&mut *tx)
+                    .await
+                    .map_err(|e| to_store_err("archive_restore lock link peers", e))?;
                 let restored_edges: Vec<(
                     String,
                     String,
