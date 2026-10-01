@@ -12,6 +12,18 @@
 //! scope here — they cannot call the SAL gate; the B7 allowlist names
 //! their gated callers. `append_signed_event` stays ungated so resume
 //! can persist the attestation (ERRORS-09).
+//!
+//! ## Scope of the guarantee (#4023)
+//!
+//! The scan is a lexer-assisted TEXT scan, not a compiler. Its guarantee holds
+//! for source that compiles under `--features sal-postgres`; the required
+//! "Postgres feature gate" CI check (clippy `--features sal-postgres --tests`)
+//! is the backstop for source that does not compile, which the lexer
+//! heuristics in `mask_rust` cannot always resolve (an unclosed quote
+//! re-balanced by later SQL string quotes is not valid Rust and is rejected
+//! there). The desync checks assume rustfmt-formatted source. Known false red
+//! FR6: a plain (non-raw) string literal containing a newline followed by
+//! `//` fails closed with a file and offset message; write it as a raw string.
 
 use std::collections::{HashMap, HashSet};
 

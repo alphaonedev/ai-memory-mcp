@@ -276,6 +276,16 @@ impl std::error::Error for MaskError {}
 /// # Errors
 ///
 /// [`MaskError`] when a literal or comment is unterminated.
+///
+/// # Scope
+///
+/// The guarantee holds for source that compiles under `sal-postgres`. The
+/// required "Postgres feature gate" CI check is the backstop for non-compiling
+/// source, which these lexer heuristics cannot fully resolve. The desync checks
+/// (`//` after a plain string newline, column-0 brace depth) assume
+/// rustfmt-formatted source. Known false red FR6: a plain (non-raw) string
+/// containing a newline followed by `//` fails closed with a file and offset
+/// message; use a raw string instead.
 pub fn try_mask_rust(src: &str) -> Result<String, MaskError> {
     let b = src.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(b.len());
