@@ -416,14 +416,47 @@ count, so an acknowledgement can never become a blanket pass, and any later
 gap fails again. A listed range that matches no gap is reported on stderr, so
 a stale acknowledgement left in a cron line stays visible.
 
-**Limit: a loss at the tail before a restart leaves no gap.** A restart
-resumes numbering from the last event WRITTEN to the file. Events lost after
-that write and before the restart therefore have their numbers reused, and
-the trail shows no gap for them. The `ai_memory_audit_write_failures_total`
-counter (#3975) counted them, but only in the process that lost them, and it
-does not survive the restart. So "no gap" means no loss was detected BETWEEN
-two written events. It is not proof that nothing was lost at a tail. A
-persisted sequence high-water that closes this is tracked as #4086.
+**A loss at the tail before a restart is a gap too (#4086).** A restart used
+to resume numbering from the last event WRITTEN, so the numbers of events lost
+after that write were reused and no gap ever appeared. The trail now keeps a
+sequence high-water mark next to it (`audit.log.seq`, one fixed-width number).
+When a write fails, the lost event's number is recorded there, durably, before
+the failure is reported; the record is an in-place overwrite of bytes the file
+already owns, so it still works on the full disk that lost the event. A
+restart resumes from the larger of the trail's last sequence and the mark,
+prints the lost range on stderr, and never reuses those numbers. `verify`
+reports numbers the mark holds past the last written line as a gap even before
+the next event is written, and a later event turns them into an ordinary
+interior gap. That includes an EMPTY trail: if every event was lost (a disk
+full from the first write), the file has no lines and the mark holds N, and
+`verify` reports the gap 1..=N instead of reading clean.
+
+The mark adds no boot refusal on a full disk. An existing mark is updated in
+place at start-up, and only when its value changes; only a missing mark is
+created through a temp file and a rename. Start-up needs no new file once the
+mark exists, as before #4086.
+
+A mark that exists but cannot be read, or holds anything but one in-range
+number, is refused: `init` fails (so the daemon refuses to boot, #3651) and
+`verify` fails, because the trail can no longer tell whether events were
+lost. After investigating, remove the file to accept that; the next start
+recreates it from the trail. A missing mark (a new trail, or one written before
+#4086) is simply created.
+
+Remaining limits:
+
+- An event lost to a crash between being numbered and its write failing (the
+  process dies mid-write) is not recorded; a torn line fails `verify` with
+  `Parse` instead.
+- **Custody of the mark.** `audit.log.seq` is NOT signed and not chained; it
+  has exactly the custody of the trail (the same directory, the same
+  permissions). Deleting it, or rolling it back together with the trail's
+  tail, HIDES a tail loss: the loss is then indistinguishable from a trail
+  that simply ended there, and `verify` reads clean. The mark protects against
+  OPERATIONAL loss, like the acknowledgement below, not against anyone who
+  can write the audit directory. Keep the directory writable only by the
+  daemon's user, and ship the trail off-host (below) for evidence that
+  survives the host.
 
 **Honest limit.** The acknowledgement is a flag, not a signed record. On a
 hostile host, whoever can rewrite the trail (renumber the lines, recompute
