@@ -34,7 +34,7 @@ supplements `--help` with examples and context.
 | `AI_MEMORY_AGENT_ID` | Default `metadata.agent_id` for memories written by this process. |
 | `AI_MEMORY_DB_PASSPHRASE` | SQLCipher passphrase (operator-set; `--db-passphrase-file` does not populate this — #3213). |
 | `AI_MEMORY_NO_CONFIG=1` | Skip loading the platform config file (`$XDG_CONFIG_HOME/ai-memory/config.toml`, else `~/.config/ai-memory/config.toml`). Used by tests. **[#3167]** Only a truthy value (`1`/`true`/`yes`/`on`) skips it; an empty value or `0` loads the config and WARNs. |
-| `AI_MEMORY_ANONYMIZE=1` | Suppress hostname/PID from fallback `agent_id` generation. |
+| `AI_MEMORY_ANONYMIZE=1` | Suppresses the hostname in the synthesized fallback identity. The fallback is `anonymous:pid-<pid>-<uuid8>`, so it still includes the PID and is process-specific. It does not replace an explicitly supplied identity. |
 | `AI_MEMORY_AUTONOMOUS_HOOKS=1` | Enable post-store LLM hooks (v0.6.0.0). Overrides config. |
 | `AI_MEMORY_BOOT_ENABLED` | Enable/disable session-boot context. Set to `0` to disable. Overrides config. |
 | `AI_MEMORY_AUDIT_DIR` | Override directory for the security audit trail. Default: `~/.local/state/ai-memory/audit/`. |
