@@ -28573,7 +28573,9 @@ impl MemoryStore for PostgresStore {
             .await
             .map_err(|e| to_store_err("begin consolidate tx", e))?;
         // #4209 sibling — the sources are rewritten below in CALLER order; take
-        // their row locks first in ascending id order (CONCURRENCY-04).
+        // their row locks first in ascending bytewise id order (CONCURRENCY-04).
+        // This is the ONLY source lock: #4045's separate `ORDER BY id` lock used
+        // the default collation (#4459) and is redundant behind this one.
         let src_locks: Vec<_> = ids
             .iter()
             .map(|i| (i.as_str(), lock_order_4209::RowLock::Update))
@@ -28582,13 +28584,8 @@ impl MemoryStore for PostgresStore {
             .await
             .map_err(|e| to_store_err("lock consolidate sources", e))?;
 
-        // CONCURRENCY-04: lock in stable order, then preserve caller order for
-        // metadata merging and expected-version alignment. Locks last to commit.
-        sqlx::query("SELECT id FROM memories WHERE id = ANY($1) ORDER BY id FOR UPDATE")
-            .bind(ids)
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(|e| to_store_err("lock consolidation sources", e))?;
+        // The caller order is preserved below for metadata merging and
+        // expected-version alignment; the rows are already held.
 
         // Fetch source rows in one query, ordered by the input.
         let mut max_priority: i32 = 5;
