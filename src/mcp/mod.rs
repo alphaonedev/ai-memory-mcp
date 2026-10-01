@@ -4520,6 +4520,8 @@ pub fn run_mcp_server(
     // (single-operator trust-all default). The `?` makes the refuse posture
     // abort MCP startup before the stdio loop opens.
     crate::identity::enforce_owner_lockout_guard(&conn)?;
+    // #4285 — boot WARN listing every corrupt governance standard.
+    crate::storage::boot_warn_corrupt_governance_standards(&conn);
 
     // v1.0.0 #3383 — seed the process-wide admin allowlist from the resolved
     // operator configuration. MCP stdio has no `AppState`, so before this the

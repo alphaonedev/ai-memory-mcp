@@ -235,6 +235,7 @@ fn reflect_input(
 /// matches the row id).
 fn sync_push_apply(receiver: &Connection, mem: &Memory, sender_agent_id: &str) -> String {
     let cap = db::resolve_governance_policy(receiver, &mem.namespace)
+        .expect("#4043: governance policy read")
         .unwrap_or_default()
         .effective_max_reflection_depth();
     let stamped = reflection_bookkeeping::stamp_reflection_origin(mem, sender_agent_id, cap);
@@ -272,12 +273,15 @@ fn three_peer_federation_depth_replication_and_cross_peer_refusal() {
 
     // Sanity: B resolves to cap=2; A and C resolve to cap=3.
     let cap_a = db::resolve_governance_policy(&peer_a.conn, NAMESPACE)
+        .expect("#4043: governance policy read")
         .unwrap_or_default()
         .effective_max_reflection_depth();
     let cap_b = db::resolve_governance_policy(&peer_b.conn, NAMESPACE)
+        .expect("#4043: governance policy read")
         .unwrap_or_default()
         .effective_max_reflection_depth();
     let cap_c = db::resolve_governance_policy(&peer_c.conn, NAMESPACE)
+        .expect("#4043: governance policy read")
         .unwrap_or_default()
         .effective_max_reflection_depth();
     assert_eq!(cap_a, 3, "peer A retains compiled default cap=3");
