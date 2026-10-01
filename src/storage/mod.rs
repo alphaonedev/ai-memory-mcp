@@ -23093,42 +23093,66 @@ pub fn resolve_require_approval_above_depth(conn: &Connection, namespace: &str) 
             Ok(Some(m)) => m,
             _ => continue,
         };
-        // Governance blob must exist and not be null.
-        let gov = match mem.metadata.get(crate::META_KEY_GOVERNANCE) {
-            Some(g) if !g.is_null() => g,
-            _ => continue,
-        };
-        // The field is optional inside the blob — `None` means skip this
-        // level and keep walking (inherit semantics: an ancestor that sets
-        // the field governs if the leaf does not override it).
-        if let Some(threshold) = gov.get("require_approval_above_depth") {
-            if let Some(n) = threshold.as_u64() {
-                // QUAL-3 (FX-5): operator-controlled metadata. Reject the
-                // silent `n as u32` truncation that would let an operator
-                // who sets `require_approval_above_depth = 2^32` (which
-                // would silently land as 0) DISABLE the approval gate
-                // entirely (depth > 0 was the original intent, but
-                // `low_32(2^32) == 0` makes `depth > 0` the actual gate;
-                // any value ≥ 2^32 whose low-32 bits are also high turns
-                // off the gate). Fail-CLOSED on overflow: saturate to 0
-                // so EVERY depth triggers approval — this is the
-                // conservative posture per CLAUDE.md K3/K9 governance
-                // discipline. The companion regression test at
-                // `tests/governance_metadata_no_silent_truncation.rs`
-                // pins this behaviour.
-                return Some(u32::try_from(n).unwrap_or(0));
-            }
-            // Key present but null → no gate at this level; keep walking.
-        }
-        // Policy found at this level but no require_approval_above_depth
-        // key → no gate; stop walking (same leaf-first-wins semantics as
-        // the main resolve_governance_policy walker: a leaf policy that
-        // doesn't set the field takes precedence over a parent that does).
-        if GovernancePolicy::from_metadata(&mem.metadata).is_some() {
-            return None;
+        // #4357 — the per-level decision is the SHARED pure function both
+        // backends call, so the leaf-first walk cannot drift between them.
+        match approval_depth_level_decision(&mem.metadata) {
+            ApprovalDepthLevel::Threshold(n) => return Some(n),
+            ApprovalDepthLevel::Stop => return None,
+            ApprovalDepthLevel::Continue => {}
         }
     }
     None
+}
+
+/// #4357 — outcome of inspecting ONE namespace-chain level's standard metadata
+/// for the L1-8 `require_approval_above_depth` threshold. The leaf-first walk
+/// itself is backend-specific (it reads the chain and the standard memory from
+/// its own store); the per-level DECISION is this one pure function so the
+/// SQLite and PostgreSQL resolvers cannot drift (the pre-#4357 postgres path
+/// had no resolver at all).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalDepthLevel {
+    /// This level sets the threshold: it governs and the walk ends.
+    Threshold(u32),
+    /// This level carries a governance policy that does not set the field: the
+    /// leaf-first-wins rule ends the walk with NO gate (a parent's threshold
+    /// must not leak past a leaf policy that omits it).
+    Stop,
+    /// This level says nothing: keep walking toward the root.
+    Continue,
+}
+
+/// #4357 — the shared per-level decision for
+/// [`resolve_require_approval_above_depth`] and its postgres twin. See
+/// [`ApprovalDepthLevel`].
+#[must_use]
+pub fn approval_depth_level_decision(metadata: &serde_json::Value) -> ApprovalDepthLevel {
+    // Governance blob must exist and not be null.
+    let gov = match metadata.get(crate::META_KEY_GOVERNANCE) {
+        Some(g) if !g.is_null() => g,
+        _ => return ApprovalDepthLevel::Continue,
+    };
+    // The field is optional inside the blob — absent means inherit semantics:
+    // an ancestor that sets the field governs if the leaf does not override it.
+    if let Some(threshold) = gov.get("require_approval_above_depth") {
+        if let Some(n) = threshold.as_u64() {
+            // QUAL-3 (FX-5): operator-controlled metadata. Reject the silent
+            // `n as u32` truncation that would let an operator who sets
+            // `require_approval_above_depth = 2^32` (silently landing as 0)
+            // DISABLE the approval gate. Fail-CLOSED on overflow: saturate to
+            // 0 so EVERY depth triggers approval (CLAUDE.md K3/K9). Pinned by
+            // `tests/governance_metadata_no_silent_truncation.rs`.
+            return ApprovalDepthLevel::Threshold(u32::try_from(n).unwrap_or(0));
+        }
+        // Key present but null → no gate at this level; keep walking.
+    }
+    // Policy found at this level but no require_approval_above_depth key → no
+    // gate; stop walking (same leaf-first-wins semantics as the main
+    // resolve_governance_policy walker).
+    if GovernancePolicy::from_metadata(metadata).is_some() {
+        return ApprovalDepthLevel::Stop;
+    }
+    ApprovalDepthLevel::Continue
 }
 
 /// v0.7.0 L2-6 — read `governance.skill_promotion_min_depth` from the
@@ -24605,6 +24629,26 @@ pub fn execute_pending_action(conn: &Connection, pending_id: &str) -> Result<Opt
 /// (the substrate validator rejects empty values, so missing keys
 /// surface as a `Validation` error rather than a panic).
 fn execute_reflect_from_payload(conn: &Connection, pa: &PendingAction) -> Result<Option<String>> {
+    let input = reflect_input_from_pending(pa)?;
+    let outcome = crate::storage::reflect::reflect(conn, &input)
+        .map_err(|e| anyhow::anyhow!("reflect execute failed: {e}"))?;
+    Ok(Some(outcome.id))
+}
+
+/// Rebuild the [`crate::storage::reflect::ReflectInput`] a queued `reflect`
+/// pending action (see [`execute_reflect_from_payload`] for the payload shape)
+/// stands for. Shared by the SQLite executor above and the PostgreSQL
+/// `execute_pending_action` `reflect` arm (#4357): ONE payload decoder, so an
+/// approved reflection replays identically on both backends and a malformed
+/// payload is refused (never defaulted into a write) on both.
+///
+/// # Errors
+///
+/// A typed [`StorageError::InvalidArgument`] when `source_ids`, `title` or
+/// `content` is missing or the `tier` is present but unrecognised.
+pub fn reflect_input_from_pending(
+    pa: &PendingAction,
+) -> Result<crate::storage::reflect::ReflectInput> {
     let payload = &pa.payload;
     let source_ids: Vec<String> = payload
         .get(field_names::SOURCE_IDS)
@@ -24693,7 +24737,7 @@ fn execute_reflect_from_payload(conn: &Connection, pa: &PendingAction) -> Result
         .cloned()
         .unwrap_or_else(|| serde_json::json!({}));
 
-    let input = crate::storage::reflect::ReflectInput {
+    Ok(crate::storage::reflect::ReflectInput {
         source_ids,
         title,
         content,
@@ -24709,10 +24753,7 @@ fn execute_reflect_from_payload(conn: &Connection, pa: &PendingAction) -> Result
         source: crate::validate::DEFAULT_NHI_SOURCE.to_string(),
         agent_id,
         metadata,
-    };
-    let outcome = crate::storage::reflect::reflect(conn, &input)
-        .map_err(|e| anyhow::anyhow!("reflect execute failed: {e}"))?;
-    Ok(Some(outcome.id))
+    })
 }
 
 #[cfg(test)]
