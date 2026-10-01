@@ -386,6 +386,26 @@ and `--force-restore` is the recovery path.
 Nothing pushes wakes until an operator asks for it. The default posture is no
 forwarder, no socket and no identity load.
 
+**Before you start: the store directory must be owner-only (`0700`)
+([#3635](https://github.com/alphaonedev/ai-memory-mcp/issues/3635)).**
+`serve` keeps its crash-durable deferred-audit journal and spool beside the
+database file (`<db>.deferred-audit.journal`, spool under the same directory).
+At boot it checks every ancestor directory of that spool, up to `/`: each
+must be owned by root or by the daemon's own user, and must not be group- or
+world-writable unless the sticky bit is set
+(`src/governance/deferred_audit.rs::spool_ancestor_permissions_trusted`).
+A failing ancestor is not a warning: audit delivery fails CLOSED and the log
+shows `deferred-audit journal open failed … deferred-audit spool ancestor
+permits untrusted rename: <dir>`. A store directory created `0775` by a
+group-shared deploy is the usual cause; `chmod 0700 <store dir>` fixes it.
+
+**Certificates for the federation listener.** If the daemons that feed this
+hub also federate over mTLS, generate EC client/server keys as PKCS#8 with a
+NAMED curve. On macOS the stock `openssl` is LibreSSL, whose
+`req -newkey ec` output the daemon refuses at boot (`failed to parse private
+key as RSA, ECDSA, or EdDSA`); see the mTLS note in
+[`federation.md`](federation.md#operator-checklist) for the working recipe.
+
 **1. Run the hub.** `ai-memory wake-hub --allowlist <allow.json>` in its own
 process (see `docs/CLI_REFERENCE.md`; `--posture` prints the resolved socket,
 directory mode and fd budget without binding anything).
