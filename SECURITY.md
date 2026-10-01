@@ -342,13 +342,31 @@ these: it is reached only from `src/cli/wake_listen.rs`, i.e. the
 — and it is a same-host Unix socket, not a network client. MCP's code still
 serves nothing over a socket.
 
-**Pinned so it cannot decay.** `scripts/check-mcp-transport-isolation.py` refuses
-any server-socket construction anywhere under `src/mcp/**` and any network-client
-construction outside the single allowlisted forward file above, over production
-code (test modules and wiremock test servers are out of scope), with a
-`--self-test` that plants a `TcpListener::bind` and an out-of-allowlist `reqwest`
-client and proves the gate reds on each — a gate that cannot fail would pin
-nothing. The runtime guard is pinned separately by
+**Pinned, with its scope stated.** `scripts/check-mcp-transport-isolation.py`
+refuses any server-socket construction anywhere under `src/mcp/**` and any
+network-client construction outside the single allowlisted forward file above,
+over production code, with a `--self-test` that plants a `TcpListener::bind` and
+an out-of-allowlist `reqwest` client and proves the gate reds on each — a gate
+that cannot fail would pin nothing.
+
+What the gate does **not** see, stated so it is not mistaken for coverage
+(#4168): it walks `src/mcp/**` only, and inside that tree it skips files whose
+name contains `test` and every line at or below the first `#[cfg(test)]` module
+(#4145). So it pins **construction sites under `src/mcp/**`**, not *reachability
+from `run_mcp_server`*: a network client constructed in a helper elsewhere in the
+tree and called from the MCP process is invisible to it — which is exactly the
+shape of the two inference clients enumerated in the table above, built in
+`src/reload.rs` and `src/embeddings.rs`. That is a real gap in the gate, not in
+the certified claim: the claim this section makes is that **MCP binds no server
+socket and constructs no network client for its own serving transport**, and the
+inference and forward clients are neither. Widening the gate to every module
+reachable from `run_mcp_server` (a codegraph callee walk) is tracked on
+[#4168](https://github.com/alphaonedev/ai-memory-mcp/issues/4168); until it
+lands, the enumeration above — not the gate — is what keeps the outbound-client
+list honest, and a new outbound client built outside `src/mcp/**` must be added
+to it by hand.
+
+The runtime guard is pinned separately by
 `src/mcp/stdio_guard.rs::classify_fd`'s unit tests, which assert that a listening
 socket, an `AF_INET`/`AF_INET6` socket, a non-`AF_UNIX` family such as
 `AF_VSOCK`, a socket whose family cannot be read, a socket whose listening state
