@@ -34,7 +34,7 @@ supplements `--help` with examples and context.
 | `AI_MEMORY_AGENT_ID` | Default `metadata.agent_id` for memories written by this process. |
 | `AI_MEMORY_DB_PASSPHRASE` | SQLCipher passphrase (operator-set; `--db-passphrase-file` does not populate this — #3213). |
 | `AI_MEMORY_NO_CONFIG=1` | Skip loading the platform config file (`$XDG_CONFIG_HOME/ai-memory/config.toml`, else `~/.config/ai-memory/config.toml`). Used by tests. **[#3167]** Only a truthy value (`1`/`true`/`yes`/`on`) skips it; an empty value or `0` loads the config and WARNs. |
-| `AI_MEMORY_ANONYMIZE=1` | Suppress hostname/PID from fallback `agent_id` generation. |
+| `AI_MEMORY_ANONYMIZE=1` | Suppresses the hostname in the synthesized fallback identity. The fallback is `anonymous:pid-<pid>-<uuid8>`, so it still includes the PID and is process-specific. It does not replace an explicitly supplied identity. |
 | `AI_MEMORY_AUTONOMOUS_HOOKS=1` | Enable post-store LLM hooks (v0.6.0.0). Overrides config. |
 | `AI_MEMORY_BOOT_ENABLED` | Enable/disable session-boot context. Set to `0` to disable. Overrides config. |
 | `AI_MEMORY_AUDIT_DIR` | Override directory for the security audit trail. Default: `~/.local/state/ai-memory/audit/`. |
@@ -49,8 +49,13 @@ supplements `--help` with examples and context.
 | `AI_MEMORY_STORE_URL_FILE` | #1927 — **secret.** Path to a `0600`-enforced file holding the `--store-url` connection URL; takes precedence over `AI_MEMORY_STORE_URL`, which in turn takes precedence over the CLI arg. |
 | `RUST_LOG` | Tracing filter, e.g. `RUST_LOG=ai_memory=debug`. (Standard Rust ecosystem env, not product-specific.) |
 
-Resolution precedence for any setting: **CLI flag > `AI_MEMORY_*` env
-var > config file > compiled default**.
+Most scalar settings use **CLI flag > `AI_MEMORY_*` env var > config
+file > compiled default**; check the setting's resolver contract. Store
+URL uses `AI_MEMORY_STORE_URL_FILE` > `AI_MEMORY_STORE_URL` > `--store-url`.
+Application content encryption is enabled by a true config/seed OR a
+truthy `AI_MEMORY_ENCRYPT_AT_REST` value; a falsy env value does not
+override an enabled config. Removed downgrade controls and explicit
+refusal rules are not precedence fallbacks.
 
 ## Core memory operations
 

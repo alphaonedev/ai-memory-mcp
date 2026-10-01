@@ -11,7 +11,7 @@
 [![Rust](https://img.shields.io/badge/rust-1.98%2B-orange?logo=rust)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![SQLite](https://img.shields.io/badge/sqlite-FTS5-003B57?logo=sqlite)](https://www.sqlite.org/)
-[![Tests](https://img.shields.io/badge/tests-12%2C549_%E2%80%A2_%E2%89%A590%25_cov-brightgreen)](https://alphaonedev.github.io/ai-memory-mcp/evidence.html)
+[![Tests](https://img.shields.io/badge/test_attributes-15%2C885_%E2%80%A2_%E2%89%A590%25_cov-brightgreen)](https://alphaonedev.github.io/ai-memory-mcp/evidence.html)
 [![Evidence Hub](https://img.shields.io/badge/evidence--hub-campaigns-6ee7ff?logo=githubpages)](https://alphaonedev.github.io/ai-memory-mcp/evidence/)
 [![v0.6.4 Cert](https://img.shields.io/badge/v0.6.4_cert-CERT_GREEN-2ea043?logo=github)](https://github.com/alphaonedev/ai-memory-test-hub/blob/main/campaigns/v0.6.4.md)
 [![MCP](https://img.shields.io/badge/MCP-7_default_%2B_1_bootstrap_%E2%80%A2_104_full-blueviolet)]()
@@ -656,7 +656,7 @@ ai-memory serve   # TLS only (#3705): first boot generates <key_dir>/tls/ and re
 
 **Step 4: Done. Test it.**
 
-Restart your AI assistant. If using MCP, it now advertises **8 entries** on session boot — the 7 Core-family tools (the original 5 + `memory_load_family` + `memory_smart_load`) plus the always-on `memory_capabilities` bootstrap; the other 96 of the 103 callable tools load on demand via `--profile` or `memory_capabilities --include-schema`. Ask it: "Store a memory that my favorite language is Rust." Then in a new conversation, ask: "What is my favorite language?" It will remember.
+Restart your AI assistant. If using MCP, it now advertises **8 entries** on session boot — the 7 Core-family tools (the original 5 + `memory_load_family` + `memory_smart_load`) plus the always-on `memory_capabilities` bootstrap; the other 96 of the 103 callable tools become callable only when the server is restarted with a wider `--profile`; `memory_capabilities --include-schema` describes their schemas but does not load them. Ask it: "Store a memory that my favorite language is Rust." Then in a new conversation, ask: "What is my favorite language?" It will remember.
 
 ---
 
@@ -820,13 +820,13 @@ Beyond MCP, ai-memory also exposes a full HTTP REST API (103 route registrations
 - **Color CLI output** -- ANSI tier labels (red/yellow/green), priority bars, bold titles, cyan namespaces
 
 ### Quality
-- **12,549 test attributes across the workspace** — **7,882** under `src/` (6,660 `#[test]` + 1,222 `#[tokio::test]`) and **4,667** under `tests/` (2,793 `#[test]` + 1,874 `#[tokio::test]`), grown from the v0.6.4-era ~2,400-test baseline. Measured at this commit, re-derivable in four commands:
+- **15,885 test attributes under `src/` and `tests/`** at commit `626f52a482ebf42afe029917442250d225e8e352` — **9,429** under `src/` (8,130 `#[test]` + 1,299 `#[tokio::test...]`) and **6,456** under `tests/` (3,806 `#[test]` + 2,650 `#[tokio::test...]`), grown from the v0.6.4-era ~2,400-test baseline. This is a source-attribute count, not executed-test evidence. Re-derivable in four commands:
 
   ```bash
-  rg -c --no-filename '^\s*#\[test\]'      src/   | awk '{s+=$1} END {print s}'   # 6660
-  rg -c --no-filename '^\s*#\[tokio::test' src/   | awk '{s+=$1} END {print s}'   # 1222
-  rg -c --no-filename '^\s*#\[test\]'      tests/ | awk '{s+=$1} END {print s}'   # 2793
-  rg -c --no-filename '^\s*#\[tokio::test' tests/ | awk '{s+=$1} END {print s}'   # 1874
+  rg -c --no-filename '^\s*#\[test\]'      src/   | awk '{s+=$1} END {print s}'   # 8130
+  rg -c --no-filename '^\s*#\[tokio::test' src/   | awk '{s+=$1} END {print s}'   # 1299
+  rg -c --no-filename '^\s*#\[test\]'      tests/ | awk '{s+=$1} END {print s}'   # 3806
+  rg -c --no-filename '^\s*#\[tokio::test' tests/ | awk '{s+=$1} END {print s}'   # 2650
   ```
 
   The `#[tokio::test` prefix (no closing bracket) is deliberate — it also counts `#[tokio::test(flavor = "multi_thread")]`, which is a test. This is a count of test *attributes*, not of test cases executed by any one `cargo test` invocation. Re-derive before citing; the numbers move every release.
@@ -986,10 +986,10 @@ ai-memory supports 4 feature tiers, selected at startup with `ai-memory mcp --ti
 
 | Tier | Recall Method | Extra Capabilities | Approx. Overhead |
 |------|---------------|-------------------|-----------------|
-| **keyword** | FTS5 only | Baseline 104-entry surface — tier gates models/features, NOT the advertised tool surface | 0 MB |
-| **semantic** | FTS5 + cosine similarity (hybrid) | MiniLM-L6-v2 embeddings (384-dim), HNSW index — same 104-entry surface | ~256 MB |
-| **smart** | Hybrid + LLM query expansion | + nomic-embed-text (768-dim) + LLM-backed `memory_expand_query`, `memory_auto_tag`, `memory_detect_contradiction`, full 104-entry surface. LLM provider is operator-selected via `AI_MEMORY_LLM_BACKEND` ([#1067](https://github.com/alphaonedev/ai-memory-mcp/issues/1067)) — local Ollama, xAI, OpenAI, Anthropic, Gemini, Kimi, Qwen, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks, LMStudio, vLLM, or llama.cpp. | ~1 GB (local Ollama) / ~0 GB (remote API) |
-| **autonomous** | Hybrid + LLM expansion + cross-encoder reranking | + neural cross-encoder (ms-marco-MiniLM), memory reflection, full 104-entry surface. Same LLM-provider freedom as smart tier. | ~4 GB (local Ollama) / ~3 GB (remote LLM, local cross-encoder only) |
+| **keyword** | FTS5 only | Baseline surface (104 entries at `--profile full`; default `--profile core` advertises 8) — tier gates models/features, NOT the advertised tool surface | 0 MB |
+| **semantic** | FTS5 + cosine similarity (hybrid) | MiniLM-L6-v2 embeddings (384-dim), HNSW index — same surface (104 entries at `--profile full`) | ~256 MB |
+| **smart** | Hybrid + LLM query expansion | + nomic-embed-text (768-dim) + LLM-backed `memory_expand_query`, `memory_auto_tag`, `memory_detect_contradiction`, 104-entry surface at `--profile full`. LLM provider is operator-selected via `AI_MEMORY_LLM_BACKEND` ([#1067](https://github.com/alphaonedev/ai-memory-mcp/issues/1067)) — local Ollama, xAI, OpenAI, Anthropic, Gemini, Kimi, Qwen, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks, LMStudio, vLLM, or llama.cpp. | ~1 GB (local Ollama) / ~0 GB (remote API) |
+| **autonomous** | Hybrid + LLM expansion + cross-encoder reranking | + neural cross-encoder (ms-marco-MiniLM), memory reflection, 104-entry surface at `--profile full`. Same LLM-provider freedom as smart tier. | ~4 GB (local Ollama) / ~3 GB (remote LLM, local cross-encoder only) |
 
 ### Capability Matrix
 
@@ -1020,18 +1020,18 @@ Every capability mapped to its minimum tier. Each tier includes all capabilities
 | External dependencies | None | None | LLM backend (Ollama / xAI / OpenAI / Anthropic / Gemini / Kimi / Qwen / Mistral / Groq / Together / Cerebras / OpenRouter / Fireworks / LMStudio / vLLM / llama.cpp — #1067) | LLM backend (same choices as smart) |
 | MCP tools exposed (at `--profile full`) [^tools] | 104 | 104 | 104 | 104 |
 
-[^tools]: MCP tool surface is orthogonal to recall tier — every tier sees the same 104 advertised entries at `--profile full` (103 callable tools + the always-on `memory_capabilities` bootstrap). The default `--profile core` advertises **8** at boot regardless of tier, counted the same way: the 7 Core-family tools plus that same bootstrap entry; the other 96 callable tools load on demand. Both numbers on this page are *advertised entries*, so 8 and 104 are directly comparable. What tier gates is models (embedder, cross-encoder, LLM) and feature behaviour (cosine similarity, LLM expansion, reranking), not the advertised tool count. Pinned by `Profile::full().expected_tool_count()` + `const_count_matches_full_profile` in `src/mcp/registry.rs`.
+[^tools]: MCP tool surface is orthogonal to recall tier — every tier sees the same 104 advertised entries at `--profile full` (103 callable tools + the always-on `memory_capabilities` bootstrap). The default `--profile core` advertises **8** at boot regardless of tier, counted the same way: the 7 Core-family tools plus that same bootstrap entry; the other 96 callable tools are listed by `memory_capabilities` but are callable only after restarting the server with a wider `--profile` (no runtime call loads tools). Both numbers on this page are *advertised entries*, so 8 and 104 are directly comparable. What tier gates is models (embedder, cross-encoder, LLM) and feature behaviour (cosine similarity, LLM expansion, reranking), not the advertised tool count. Pinned by `Profile::full().expected_tool_count()` + `const_count_matches_full_profile` in `src/mcp/registry.rs`.
 
 **Semantic tier** (default) bundles the Candle ML framework and downloads the all-MiniLM-L6-v2 model on first run (~90 MB). **Smart** and **autonomous** tiers require an LLM backend — post-[#1067](https://github.com/alphaonedev/ai-memory-mcp/issues/1067) (v0.7.0) that can be local ([Ollama](https://ollama.com), LMStudio, vLLM, llama.cpp server) or any OpenAI-compatible remote endpoint (xAI, OpenAI, Anthropic via OpenAI shim, Google Gemini, Kimi, Qwen, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks). Selection is by `AI_MEMORY_LLM_BACKEND` env var; per-vendor API keys via `XAI_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `GEMINI_API_KEY` / `MOONSHOT_API_KEY` / `DASHSCOPE_API_KEY` / etc. or the canonical `AI_MEMORY_LLM_API_KEY`.
 
-**Tiers gate features, not models — and post-[#1067](https://github.com/alphaonedev/ai-memory-mcp/issues/1067) (v0.7.0), tiers gate features, not vendors either.** The `--tier` flag controls which tools are exposed. The LLM backend + model are independently configurable via `AI_MEMORY_LLM_BACKEND` + `AI_MEMORY_LLM_MODEL` env vars (or via the canonical `[llm]` section in `~/.config/ai-memory/config.toml` — see [docs/CONFIG_SCHEMA.md](docs/CONFIG_SCHEMA.md) for the v0.7.x enterprise schema and the migration tool). For example, run autonomous tier (full 104-entry surface + reranker) against xAI Grok 4 via the OpenAI-compatible alias:
+**Tiers do not choose tools — and post-[#1067](https://github.com/alphaonedev/ai-memory-mcp/issues/1067) (v0.7.0), tiers do not choose LLM vendors either.** The `--tier` flag selects recall capabilities and model requirements. The `--profile` flag determines the tools advertised and callable in this server session. `memory_capabilities` describes available families and schemas; it does not load additional tools. Restart the server with the desired profile to change the callable surface. The LLM backend + model are independently configurable via `AI_MEMORY_LLM_BACKEND` + `AI_MEMORY_LLM_MODEL` env vars (or via the canonical `[llm]` section in `~/.config/ai-memory/config.toml` — see [docs/CONFIG_SCHEMA.md](docs/CONFIG_SCHEMA.md) for the v0.7.x enterprise schema and the migration tool). For example, run autonomous tier with `--profile full` (the 104-entry surface at that profile + reranker; the default `--profile core` advertises 8) against xAI Grok 4 via the OpenAI-compatible alias:
 
 ```bash
 # Quick path: env vars
 export AI_MEMORY_LLM_BACKEND=xai
 export AI_MEMORY_LLM_MODEL=grok-4.3
 export XAI_API_KEY=xai-…   # or AI_MEMORY_LLM_API_KEY
-ai-memory mcp --tier autonomous
+ai-memory mcp --tier autonomous --profile full
 ```
 
 ```toml

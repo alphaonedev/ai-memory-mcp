@@ -661,7 +661,7 @@ ai-memory serve</pre>
         <h3>b · Design for boundaries</h3>
         <div class="meta"><span class="status ok">implemented</span></div>
       </div>
-      <p>Every boundary is declared, validated, and has a fail-CLOSED secure default: namespace isolation (storage-layer foreign-key invariant); Form 7 agent-EXTERNAL governance (agent-action policy boundary); the SAL <code>store::MemoryStore</code> trait (storage-adapter boundary, sqlite vs postgres+AGE); federation peer allowlist (network boundary); K3/K9 permissions model (operator-policy boundary); capabilities v3 envelope (wire-shape boundary published to consumers).</p>
+      <p>Every boundary is declared and validated: namespace isolation (storage-layer foreign-key invariant); Form 7 agent-EXTERNAL governance (agent-action policy boundary); the SAL <code>store::MemoryStore</code> trait (storage-adapter boundary, sqlite vs postgres+AGE); federation peer allowlist (network boundary); K3/K9 permissions model (operator-policy boundary); capabilities v3 envelope (wire-shape boundary published to consumers). Not every boundary defaults closed: the HTTP identity-binding posture defaults to <code>advisory</code>, and the governance and operator-policy boundaries are allow-on-silence. Governance evaluation errors fail closed. A namespace with no applicable rules or standards remains allow-on-silence; enforce mode alone is not a default-deny policy. Configure the intended rules or standards to refuse unwanted operations.</p>
     </div>
 
     <div class="recommendation" id="rec-c">
