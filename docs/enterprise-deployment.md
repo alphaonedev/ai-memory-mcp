@@ -1282,8 +1282,10 @@ api-key layer by design ([#702](https://github.com/alphaonedev/ai-memory-mcp/iss
 
 ### 8.7 Quorum cost in a 5-peer swarm
 
-Default W = ceil(5/2 + 1) = 3 (out of 5). Three peers must ack a
-write before it's canonical. Any single-peer outage is tolerated.
+There is no compiled majority default: bare `ai-memory serve` defaults to
+`--quorum-writes 0` (federation off), so W is set explicitly per
+deployment. A majority quorum for 5 nodes is W = 3 (out of 5): three
+nodes, counting the local commit, must ack a write before it's canonical. Any single-peer outage is tolerated.
 Two-peer simultaneous outage stalls writes.
 
 For deployments where the operator wants writes to land even with

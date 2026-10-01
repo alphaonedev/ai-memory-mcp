@@ -416,7 +416,7 @@ footer a{color:var(--text-muted)}
   <div class="container">
     <span class="eyebrow p3">Federation · W-of-N Quorum</span>
     <h2>Multi-machine sync without a coordinator.</h2>
-    <p class="lede">Each node accepts writes locally and fans out to peers via mTLS. The local commit lands first; the quorum (default W=2, counting the local commit) is met once W−1 peers ack within the deadline. Eventual consistency. Per-peer cursors for catchup after partition. Federation private endpoints under <code>/api/v1/sync/*</code>.</p>
+    <p class="lede">Each node accepts writes locally and fans out to peers via mTLS. The local commit lands first; the quorum is met once W−1 peers ack within the deadline (W includes the local commit). Bare <code>ai-memory serve</code> defaults to <code>--quorum-writes 0</code> (federation off); a quorum-enabled deployment must explicitly select W and peers. The DigitalOcean hive recipe defaults W to 2, while a majority quorum is a topology choice. Eventual consistency. Per-peer cursors for catchup after partition. Federation private endpoints under <code>/api/v1/sync/*</code>.</p>
 
     <svg class="flow-svg" viewBox="0 0 1180 460" xmlns="http://www.w3.org/2000/svg">
       <!-- Three peers -->
@@ -480,7 +480,7 @@ footer a{color:var(--text-muted)}
       </div>
       <div class="fusion-card f2">
         <h3>quorum write</h3>
-        <p>Local commit lands first; the write returns 200 once W is met — the local commit plus W−1 peer ACKs within the deadline. Default W=2 (majority).</p>
+        <p>Local commit lands first; the write returns 200 once W is met — the local commit plus W−1 peer ACKs within the deadline. W is set explicitly: bare <code>serve</code> defaults to <code>--quorum-writes 0</code>, the DigitalOcean hive recipe uses W=2, and a majority quorum is a topology choice. The diagram shows W=2.</p>
       </div>
       <div class="fusion-card f3">
         <h3>catchup loop</h3>
