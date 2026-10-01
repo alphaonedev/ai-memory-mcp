@@ -729,12 +729,16 @@ the remaining peers regardless.
 **Push DLQ + replay worker (Track D
 [#933](https://github.com/alphaonedev/ai-memory-mcp/issues/933)).**
 Per-peer fanout failures inside `broadcast_store_quorum` (peer
-unreachable, or no Ack before the deadline) are recorded as
-`federation_push_dlq` rows
+unreachable, or no Ack before the deadline) are submitted to the durable
+retry queue as `federation_push_dlq` rows
 ([`src/federation/push_dlq.rs`](../src/federation/push_dlq.rs);
-schema v48). A replay worker
+schema v48). If that enqueue itself fails, the failure is logged
+(`land_push_failures`, `src/federation/sync.rs`) and durable retry is not
+guaranteed for that peer. A replay worker
 (`spawn_replay_federation_push_dlq`) is spawned alongside the catchup
-loop at the same cadence (`--catchup-interval-secs`, default 30s); it
+loop at the same cadence (`--catchup-interval-secs`, default 30s; `0`
+disables both the catch-up loop and this replay worker, so persisted rows
+are retried only while replay is enabled); it
 re-POSTs the originally captured payload via `post_once` and stamps
 `replayed_at` on Ack. The per-tick batch is adaptive (#1579 B5):
 `min(backlog, cap)` with a floor of 64, where the cap defaults to
