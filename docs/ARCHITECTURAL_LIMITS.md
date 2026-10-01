@@ -17,7 +17,10 @@ auto-checkpoint) and documents the rest here.
 ## Legend
 
 - **Structural** — cannot be fixed in SQLite. Requires a different
-  backend (Postgres + pgvector, LanceDB, Qdrant, Chroma) via the v0.7 SAL.
+  backend via the SAL. For v1.0.0 deployments the shipped choices are SQLite
+  and the feature-gated PostgreSQL (+ pgvector) adapter; LanceDB, Qdrant and
+  Chroma, named in the earlier v0.6/v0.7 planning discussion, are unshipped
+  proposals, not available v1.0.0 deployment choices.
 - **Polished in v0.6.0 GA** — addressed within SQLite.
 - **Workaround** — possible but painful; not a design goal for v0.6.0.
 
@@ -25,17 +28,21 @@ auto-checkpoint) and documents the rest here.
 
 ### 1. Single writer per database file — **Structural**
 
-SQLite allows one writer at a time by design. WAL mode lets readers pass
-the writer, but writers never run concurrently. Our `Arc<Mutex<Connection>>`
-daemon compounds this by serializing readers too. A connection pool fixes
-the daemon-side serialization within SQLite, but the file-level single-writer
-ceiling (~500-2000 writes/sec on NVMe) remains.
+SQLite still permits one writer per database file. WAL mode lets readers
+pass the writer, but writers never run concurrently. File-backed HTTP
+get/list/search and recall read phases use the WAL read pool
+(`src/handlers/read_pool.rs`, #1580), whose default size is eight read-only
+connections (`DEFAULT_READ_POOL_SIZE`). These reads need not hold the shared
+writer connection. An unavailable read pool falls back to the writer
+connection; in-memory databases do not use the file-backed pool. Writes still
+serialize on the daemon's single writer connection, and the file-level
+single-writer ceiling (~500-2000 writes/sec on NVMe) remains.
 
 **Impact ceiling:** ~1000-2000 writes/sec regardless of hardware.
 **Workaround:** switch to Postgres via the v0.7 SAL when you need higher
 write throughput; Postgres MVCC gives concurrent writers.
-**v0.6.0 GA polish:** none. The connection pool was deferred to v0.7 SAL
-because it becomes moot when the user can just pick a different backend.
+**v0.6.0 GA polish:** none at the time; the read pool landed later
+(#1580) and covers reads only — it does not lift the single-writer limit.
 
 ### 2. Single-node only — **Structural**
 
@@ -44,9 +51,11 @@ differently in the places that matter (replication, consistency).
 
 **Impact ceiling:** you hit one box's disk and CPU and that is the entire
 budget.
-**Workaround:** the v0.7 SAL lands Postgres (vertical scaling via replica
-sets), Qdrant (horizontal sharding of the vector side), and LanceDB (S3
-object-store backing for horizontal read scaling).
+**Workaround:** for v1.0.0, choose the feature-gated PostgreSQL adapter
+(`serve --store-url postgres://…`, vertical scaling via replica sets). The
+v0.6/v0.7 planning discussion also proposed Qdrant (horizontal sharding of
+the vector side) and LanceDB (S3 object-store backing); neither adapter ships
+in v1.0.0.
 
 ### 3. No synchronous replication / HA — **Structural**
 
@@ -67,13 +76,16 @@ most container/Kubernetes shared-volume deployments without a dedicated
 PVC per replica — which means you cannot horizontally scale the daemon.
 
 **Impact:** rules out many cloud topologies.
-**Workaround:** single-node deployment with local disk, or v0.7 SAL with
-a backend that has a native wire protocol (Postgres, Qdrant).
+**Workaround:** single-node deployment with local disk, or the PostgreSQL
+adapter, whose server has a native wire protocol (Qdrant was a planning
+proposal and is not a shipped v1.0.0 adapter).
 
 ### 5. No native client-server protocol — **Structural**
 
-SQLite is embedded. Remote access goes through our HTTP daemon, which
-reintroduces the `Mutex<Connection>` bottleneck. Postgres, MySQL, Qdrant,
+SQLite is embedded. Remote access goes through our HTTP daemon. File-backed
+pooled reads do not hold the writer mutex, but every write (and any read that
+falls back from the pool) still serializes on the single writer
+`Mutex<Connection>`. Postgres, MySQL, Qdrant,
 pgvector all have real wire protocols.
 
 **Impact:** the HTTP daemon is the bottleneck at fleet scale, not SQLite's
@@ -82,25 +94,28 @@ write lock.
 connect directly to Postgres. Every request still terminates at the axum
 daemon: `serve --store-url postgres://…` routes through
 `postgres_route_gate` (`src/lib.rs` → `src/handlers/postgres_gate.rs`), which
-serves 59 of the 80 unique production HTTP paths from Postgres and returns a
-uniform `501 NOT IMPLEMENTED` on the other 21; the daemon additionally opens a
+supports at least one method on 76 of the 89 unique production HTTP paths
+from Postgres and returns a uniform `501 NOT IMPLEMENTED` on the 13 paths that
+are wholly unsupported there (path support does not imply every method on that
+path is supported — consult the method-level gate in
+`tests/pg_supported_route_inventory_gate_2799.rs`); the daemon additionally opens a
 scratch SQLite beside Postgres. So the daemon remains the fleet-scale
 bottleneck on both backends — the SAL work moved the *storage* off SQLite, not
 the *access path* off the daemon. A direct-to-Postgres agent wire protocol is
 not implemented and is not planned for v1.0.0. See
 [Backend parity](../README.md#backend-parity).
 
-### 6. FTS5 does not port — **Structural**
+### 6. FTS5 does not port — **Structural** (resolved per backend at v1.0.0)
 
-Every keyword-search query is SQLite-specific. Moving to Postgres means
-rewriting against `tsvector`; Qdrant uses its own full-text filter model;
-Chroma has no FTS at all.
+FTS5 itself is SQLite-only, so the keyword SQL differs per backend.
 
-**Impact:** the keyword recall path is not portable today.
-**v0.7 SAL:** `MemoryStore::keyword_search` is trait-level; each backend
-implements it natively. Chroma's missing FTS is handled by the
-`Capabilities::FULLTEXT` bit and a Rust-side fallback in the core
-layer.
+**v1.0.0 status:** SQLite implements keyword retrieval with FTS5. PostgreSQL
+implements it with its own full-text search over the stored `tsv` column
+(schema v57) through `MemoryStore::search` (`src/store/mod.rs`; the PostgreSQL
+override in `src/store/postgres.rs` delegates to `search_with_source_uri`). The
+storage-specific SQL differs, but keyword retrieval is implemented on both
+shipped backends. Chroma is not a shipped adapter, so this release makes no
+Chroma fallback guarantee.
 
 ### 7. No CDC / audit stream — **Structural**
 
@@ -215,15 +230,20 @@ design rationale.
 
 ## Use-case guidance
 
+For v1.0.0 deployments, choose SQLite or the feature-gated PostgreSQL
+adapter (`--features sal-postgres`; `postgres://` or `postgresql://` store
+URLs). Qdrant, LanceDB and Chroma in the earlier v0.6/v0.7 planning
+discussion are unshipped proposals, not available v1.0.0 deployment choices.
+
 | Deployment | Backend | Notes |
 |---|---|---|
 | Single user, local agent (Claude Code on one laptop) | SQLite | Ideal. Zero ops. Keep. |
 | Small team fleet, 1-25 agents, <100k memories | SQLite | v0.6.0 GA works well. |
-| Large fleet, 100+ agents, ≥1M memories | Postgres (v0.7) | Structural limits 1, 2, 10 bite. |
-| Multi-region / HA / zero-data-loss | Postgres (v0.7) | Structural limit 3 rules out SQLite. |
-| Shared filesystem / Kubernetes PVC-per-replica | Postgres or Qdrant (v0.7) | Structural limit 4. |
-| Vector-first workload, low metadata | Qdrant or LanceDB (v0.7) | Native ANN beats in-process HNSW. |
-| Change-data-capture (CDC) required | Postgres (v0.7) | Structural limit 7. |
+| Large fleet, 100+ agents, ≥1M memories | PostgreSQL | Structural limits 1, 2, 10 bite. |
+| Multi-region / HA / zero-data-loss | PostgreSQL | Structural limit 3 rules out SQLite. |
+| Shared filesystem / Kubernetes PVC-per-replica | PostgreSQL | Structural limit 4. Qdrant was a planning proposal, not a shipped adapter. |
+| Vector-first workload, low metadata | PostgreSQL (pgvector) | A dedicated vector store (Qdrant / LanceDB) was a planning proposal and is not a shipped v1.0.0 adapter. |
+| Change-data-capture (CDC) required | PostgreSQL | Structural limit 7 (CDC is operator-configured out-of-band; see limit 7). |
 
 ## What v0.6.0 GA does *not* fix
 

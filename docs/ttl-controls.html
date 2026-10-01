@@ -291,8 +291,8 @@ footer a{color:var(--text-muted)}
 short_ttl_secs = <span class="num">3600</span>      <span class="cm"># 1h instead of 6h</span>
 mid_ttl_secs   = <span class="num">2592000</span>   <span class="cm"># 30d instead of 7d</span>
 long_ttl_secs  = <span class="num">31536000</span>  <span class="cm"># 1 year (compliance: "no forever")</span>
-short_extend_secs = <span class="num">1800</span>   <span class="cm"># access resets expiry to now+30min</span>
-mid_extend_secs   = <span class="num">86400</span>  <span class="cm"># access resets expiry to now+1d</span></div>
+short_extend_secs = <span class="num">1800</span>   <span class="cm"># access maintenance extends to MAX(expiry, now+30min)</span>
+mid_extend_secs   = <span class="num">86400</span>  <span class="cm"># access maintenance extends to MAX(expiry, now+1d)</span></div>
     </div>
 
     <div class="dial config">
