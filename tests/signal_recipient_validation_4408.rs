@@ -12,6 +12,9 @@
 //! unreachable.
 
 #![cfg(feature = "sal")]
+// The federation cells hold a test-only std lock that serialises process-wide env
+// mutation across awaits (same precedent as `federation_receive_coord_screen_3049`).
+#![allow(clippy::await_holding_lock)]
 
 use ai_memory::config::{FeatureTier, ResolvedScoring, ResolvedTtl};
 use ai_memory::handlers::{ApiKeyState, AppState, Db, StorageBackend};
@@ -427,4 +430,267 @@ async fn valid_recipient_still_delivers_on_both_backends_4408() {
                 .expect("valid signal");
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Federation receive (`POST /api/v1/sync/push` signals[]) — both backends.
+// An invalid federated recipient is a PER-SIGNAL skip: no row, no quota charge,
+// the rest of the batch still applies, and the log line never carries the
+// value.
+// ---------------------------------------------------------------------------
+
+const SKIP_LOG: &str = "federation signal skipped: invalid recipient";
+
+fn fed_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    use std::sync::{Mutex as StdMutex, OnceLock};
+    static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| StdMutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Relax the orthogonal federation gates so an unsigned inbound signal reaches
+/// the recipient check (same posture as `federation_receive_coord_screen_3049`).
+fn relax_fed_gates() {
+    // SAFETY: serialised by `fed_env_lock`; no other thread reads these vars
+    // while a federation cell holds the lock.
+    unsafe {
+        std::env::set_var(
+            ai_memory::federation::receive_auth::REQUIRE_PUSH_NAMESPACE_SCOPE_ENV,
+            "0",
+        );
+        std::env::set_var(ai_memory::federation::signing::REQUIRE_SIG_ENV, "0");
+        std::env::set_var("AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT", "0");
+        std::env::set_var(
+            ai_memory::federation::receive_auth::REQUIRE_SIGNAL_SIG_ENV,
+            "0",
+        );
+        std::env::remove_var(ai_memory::federation::peer_attestation::PEER_ATTESTATION_ENV);
+    }
+}
+
+fn wire_signal(ns: &str, from: &str, to: Option<&str>) -> (String, Value) {
+    let s = signal_for(ns, from, to);
+    (s.id.clone(), serde_json::to_value(&s).expect("signal json"))
+}
+
+async fn push_batch(app: &AppState, peer: &str, signals: Vec<Value>) -> (StatusCode, Value) {
+    let router = ai_memory::build_router(
+        ApiKeyState {
+            key: None,
+            mtls_enforced: false,
+            enrolled_agent_keys: Arc::new(
+                ai_memory::handlers::identity_binding::EnrolledAgentKeys::empty(),
+            ),
+            identity_mode: ai_memory::config::HttpIdentityMode::default(),
+            ..Default::default()
+        },
+        app.clone(),
+    );
+    let body = json!({
+        "sender_agent_id": peer,
+        "sender_clock": {"entries": {}},
+        "memories": [],
+        "signals": signals,
+        "dry_run": false,
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/sync/push")
+        .header("content-type", "application/json")
+        .header(
+            ai_memory::federation::peer_attestation::PEER_ID_HEADER,
+            peer,
+        )
+        .body(Body::from(body.to_string()))
+        .expect("request");
+    let resp = router.oneshot(req).await.expect("route");
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), 4 * 1024 * 1024)
+        .await
+        .expect("body");
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+fn fed_invalid_targets() -> Vec<(&'static str, String)> {
+    let mut v = invalid_targets();
+    v.retain(|(l, _)| *l != "overlong_64k");
+    v.push(("overlong_8k", "q".repeat(8 * 1024)));
+    v
+}
+
+/// Outcome of one `[bad, good]` batch, comparable across backends.
+#[derive(Debug, PartialEq, Eq)]
+struct FedOutcome {
+    status: u16,
+    applied: i64,
+    skipped: i64,
+    rows: usize,
+    only_good_row: bool,
+    charged_bytes: i64,
+}
+
+async fn fed_outcome(app: &AppState, label: &str, bad: &str) -> FedOutcome {
+    let ns = unique(NS);
+    let from = unique("ai:peer4408");
+    let (_bad_id, bad_wire) = wire_signal(&ns, &from, Some(bad));
+    let (good_id, good_wire) = wire_signal(&ns, &from, Some(GOOD_TARGET));
+    let (status, resp) = push_batch(app, &from, vec![bad_wire, good_wire]).await;
+    let ctx = CallerContext::for_agent("ai:reader4408");
+    let rows = app
+        .store
+        .signal_inbox(&ctx, &ns, None, 100)
+        .await
+        .expect("inbox");
+    let charged = {
+        let conn = app.db.lock().await;
+        ai_memory::quotas::get_status(&conn.0, &from, &ns)
+            .expect("quota")
+            .current_storage_bytes
+    };
+    let good_bytes = i64::try_from(json!({"k": "v4408"}).to_string().len()).expect("len");
+    assert_eq!(charged, good_bytes, "{label}: skipped signal was charged");
+    FedOutcome {
+        status: status.as_u16(),
+        applied: resp["signals_applied"].as_i64().unwrap_or(-1),
+        skipped: resp["skipped"].as_i64().unwrap_or(-1),
+        rows: rows.len(),
+        only_good_row: rows.len() == 1 && rows[0].id == good_id,
+        charged_bytes: charged,
+    }
+}
+
+fn assert_fed_skip(label: &str, o: &FedOutcome) {
+    assert_eq!(o.status, 200, "{label}: batch must not fail: {o:?}");
+    assert_eq!(o.applied, 1, "{label}: valid signal must apply: {o:?}");
+    assert_eq!(o.skipped, 1, "{label}: invalid must be one skip: {o:?}");
+    assert!(
+        o.only_good_row,
+        "{label}: only the valid row may exist: {o:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sqlite_federated_invalid_recipient_is_skipped_per_signal_4408() {
+    let _g = fed_env_lock();
+    relax_fed_gates();
+    let dir = tempfile::tempdir().expect("dir");
+    let (store, path) = sqlite_store(&dir);
+    let app = sqlite_app(store, &path);
+    for (label, bad) in fed_invalid_targets() {
+        assert_fed_skip(label, &fed_outcome(&app, label, &bad).await);
+    }
+}
+
+#[cfg(feature = "sal-postgres")]
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_federated_invalid_recipient_is_skipped_per_signal_4408() {
+    let _g = fed_env_lock();
+    let Some(store) = pg_store().await else {
+        return;
+    };
+    relax_fed_gates();
+    let app = pg_app(store);
+    for (label, bad) in fed_invalid_targets() {
+        assert_fed_skip(label, &fed_outcome(&app, label, &bad).await);
+    }
+}
+
+#[cfg(feature = "sal-postgres")]
+#[tokio::test(flavor = "multi_thread")]
+async fn sqlite_and_pg_federated_receive_agree_4408() {
+    let _g = fed_env_lock();
+    let Some(pg) = pg_store().await else { return };
+    relax_fed_gates();
+    let dir = tempfile::tempdir().expect("dir");
+    let (sq, path) = sqlite_store(&dir);
+    let sq_app = sqlite_app(sq, &path);
+    let pg_app = pg_app(pg);
+    for (label, bad) in fed_invalid_targets() {
+        let a = fed_outcome(&sq_app, label, &bad).await;
+        let b = fed_outcome(&pg_app, label, &bad).await;
+        assert_eq!(a, b, "{label}: backends diverge on a federated signal");
+    }
+}
+
+#[derive(Clone, Default)]
+struct LogBuf(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogBuf {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend_from_slice(b);
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuf {
+    type Writer = LogBuf;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+async fn assert_skip_log_is_value_free(app: &AppState, backend: &str) {
+    let buf = LogBuf::default();
+    let sub = tracing_subscriber::fmt()
+        .with_writer(buf.clone())
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .finish();
+    let _d = tracing::subscriber::set_default(sub);
+    let ns = unique(NS);
+    let from = unique("ai:peer4408");
+    let bad = "ai:bad\u{200b}ECHOPROBE4408";
+    let (_id, wire) = wire_signal(&ns, &from, Some(bad));
+    let (status, _) = push_batch(app, &from, vec![wire]).await;
+    assert_eq!(status, StatusCode::OK);
+    let text = String::from_utf8_lossy(
+        &buf.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    )
+    .into_owned();
+    assert!(
+        text.contains(SKIP_LOG),
+        "{backend}: missing skip log: {text}"
+    );
+    assert!(
+        !text.contains("ECHOPROBE4408") && !text.contains('\u{200b}'),
+        "{backend}: log echoed the recipient"
+    );
+    assert!(
+        !text.contains("invalid signature"),
+        "{backend}: refusal mislabelled as a signature failure"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn sqlite_federated_skip_log_is_value_free_4408() {
+    let _g = fed_env_lock();
+    relax_fed_gates();
+    let dir = tempfile::tempdir().expect("dir");
+    let (store, path) = sqlite_store(&dir);
+    let app = sqlite_app(store, &path);
+    assert_skip_log_is_value_free(&app, "sqlite").await;
+}
+
+#[cfg(feature = "sal-postgres")]
+#[tokio::test(flavor = "current_thread")]
+async fn pg_federated_skip_log_is_value_free_4408() {
+    let _g = fed_env_lock();
+    let Some(store) = pg_store().await else {
+        return;
+    };
+    relax_fed_gates();
+    let app = pg_app(store);
+    assert_skip_log_is_value_free(&app, "pg").await;
 }
