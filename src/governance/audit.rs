@@ -5789,6 +5789,34 @@ mod tests {
         assert_eq!(std::fs::read(&today).unwrap(), format!("{a}\n").as_bytes());
     }
 
+    /// #4322 — the forensic start-up probe (every process start, and doctor)
+    /// never truncates through a link planted at the OLD predictable probe
+    /// name. Red on 4434125ca: `init` truncated the victim to 0 bytes.
+    #[cfg(unix)]
+    #[test]
+    fn init_does_not_truncate_through_a_planted_probe_link_4322() {
+        let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        shutdown();
+        let tmp = TempDir::new().unwrap();
+        let victim = tmp.path().join("victim.db");
+        std::fs::write(&victim, b"precious bytes").unwrap();
+        let dir = tmp.path().join("audit");
+        std::fs::create_dir(&dir).unwrap();
+        std::os::unix::fs::symlink(
+            &victim,
+            dir.join(format!(".ai-memory-write-probe-{}", std::process::id())),
+        )
+        .unwrap();
+        let _ = init(&dir, None);
+        shutdown();
+        let _ = inspect_forensic_tail(&dir);
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            b"precious bytes",
+            "the start-up probe truncated a file through a planted link"
+        );
+    }
+
     /// #4302 — a row the writer cannot persist is counted, not only traced.
     #[test]
     fn a_dropped_row_is_counted_4302() {
