@@ -164,7 +164,7 @@ pub fn apply_sqlite_v96(conn: &Connection) -> Result<()> {
 ///
 /// Propagates a rusqlite failure; the caller's transaction rolls both the
 /// trigger DDL and the cache clear back together (ERRORS-02).
-pub fn repair_sqlite_after_trigger_gap(conn: &Connection) -> Result<()> {
+pub(super) fn repair_sqlite_after_trigger_gap(conn: &Connection) -> Result<()> {
     apply_sqlite_v96(conn)?;
     conn.execute("DELETE FROM embed_skip", [])
         .context("clear embed_skip cache after the trigger gap")?;
