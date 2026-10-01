@@ -1465,3 +1465,21 @@ fn a_comment_ending_in_a_backslash_never_hides_a_writer_4148() {
     assert!(!lines.contains(&at("--title x \\")));
     assert!(!lines.contains(&at("trailing code comment \\")));
 }
+
+/// #4324 — an allowlisted migrate-only repair must not be `pub`: the B7
+/// exemption holds only because the sole callers are the open-time/ladder
+/// repair sites inside `crate::storage`, so a crate-visible-or-wider fn lets
+/// a future outside caller inherit the record-stop exemption unreviewed.
+#[test]
+fn migrate_only_repair_is_not_public_4324() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let src = fs::read_to_string(root.join("src/storage/embed_skip.rs")).expect("embed_skip.rs");
+    let decl = src
+        .lines()
+        .find(|l| l.contains("fn repair_sqlite_after_trigger_gap"))
+        .expect("repair_sqlite_after_trigger_gap must exist");
+    assert!(
+        decl.trim_start().starts_with("pub(super) fn "),
+        "#4324: allowlisted migrate-only repair must be `pub(super)`, found `{decl}`"
+    );
+}
