@@ -140,25 +140,29 @@ async fn begin_cell(
     };
     cell.cleanup().await;
     let ctx = CallerContext::for_agent("ai:tester");
-    for id in [&cell.z, &cell.a] {
-        cell.store
-            .store(&ctx, &mem(&cell.ns, id.clone(), expired))
-            .await
-            .expect("seed row");
-    }
-    // `a` becomes the OLDER row: a `(namespace, priority DESC, updated_at
-    // DESC)` index scan then yields `z` first, like the ctid order below,
-    // whichever access path the planner picks for the namespace predicate.
-    sqlx::query("UPDATE memories SET updated_at = updated_at - interval '1 hour' WHERE id = $1")
+    // Re-seed BOTH rows until `z` precedes `a` in heap (ctid) order AND in
+    // `(namespace, priority DESC, updated_at DESC)` index order: the reverse of
+    // id order, whichever access path the planner picks. Fresh inserts land
+    // wherever the free-space map says, so the arrangement is retried (a
+    // no-op UPDATE of `a` cannot move it once the table has free space);
+    // verified, not assumed, and bounded.
+    let mut arranged = false;
+    for _ in 0..200 {
+        for id in [&cell.z, &cell.a] {
+            cell.store
+                .store(&ctx, &mem(&cell.ns, id.clone(), expired))
+                .await
+                .expect("seed row");
+        }
+        // `a` becomes the OLDER row (the index order); this rewrite also moves
+        // its live tuple, so the heap order is read AFTER it.
+        sqlx::query(
+            "UPDATE memories SET updated_at = updated_at - interval '1 hour' WHERE id = $1",
+        )
         .bind(&cell.a)
         .execute(cell.store.pool())
         .await
         .expect("age a");
-    // Arrange the heap so `z`'s live tuple precedes `a`'s (ctid order, which a
-    // sequential or namespace-index scan follows): the reverse of id order.
-    // Rewriting `a` moves its live tuple; verified, not assumed.
-    let mut arranged = false;
-    for _ in 0..64 {
         let z_first: bool = sqlx::query_scalar(
             "SELECT (SELECT ctid FROM memories WHERE id = $1) \
                   < (SELECT ctid FROM memories WHERE id = $2)",
@@ -172,13 +176,12 @@ async fn begin_cell(
             arranged = true;
             break;
         }
-        sqlx::query("UPDATE memories SET priority = priority WHERE id = $1")
-            .bind(&cell.a)
-            .execute(cell.store.pool())
-            .await
-            .expect("order the heap");
+        cell.cleanup().await;
     }
-    assert!(arranged, "fixture: could not place z before a in the heap");
+    assert!(
+        arranged,
+        "fixture: could not place z before a in the heap after 200 re-seeds"
+    );
     Some((guard, cell))
 }
 
