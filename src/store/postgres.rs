@@ -16996,6 +16996,9 @@ struct PgFederationMergePreimage {
     content: String,
     /// The stored at-rest ciphertext envelope (NULL when encryption is off).
     encrypted_envelope: Option<Vec<u8>>,
+    /// #4206 — the row's `metadata.agent_id`, the identity its envelope is
+    /// sealed to (`""` for an unowned / legacy row).
+    owner_agent_id: String,
 }
 
 /// v1.0.0 #2954 — probe the `(title, namespace)` row
@@ -17004,17 +17007,18 @@ struct PgFederationMergePreimage {
 /// upsert are ONE atomic unit under READ COMMITTED (the row lock blocks a
 /// concurrent writer from slipping between the probe and the upsert, so the
 /// Rust-side won-and-changed predicate cannot diverge from the SQL `CASE`).
-/// `None` when the append-only spine is OFF (default → no probe, byte-identical)
-/// or when no prior row exists (a fresh INSERT destroys nothing). MUST run in
-/// the SAME tx as the upsert (caller-held).
+/// `None` when no live row holds the slot (a fresh INSERT destroys nothing).
+/// Always read (#4206: the pre-merge archive snapshot needs it whether or not
+/// the append-only spine is armed; the SUPERSEDE leaf itself stays gated inside
+/// [`pg_emit_revision_leaf_if_enabled`]). The row filter is the title-slot
+/// index predicate, so the probed row is exactly the one the partial
+/// `ON CONFLICT` target resolves to. MUST run in the SAME tx as the upsert
+/// (caller-held).
 async fn pg_probe_federation_merge_preimage(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     title: &str,
     namespace: &str,
 ) -> Result<Option<PgFederationMergePreimage>, sqlx::Error> {
-    if !crate::config::append_only_enabled() {
-        return Ok(None);
-    }
     // #2954 — serialize concurrent same-`(title, namespace)` applies WITHIN the
     // caller's tx so a FRESH-INSERT race cannot silently drop a leaf. The
     // `FOR UPDATE` below only locks an EXISTING row; when NO row holds the key
@@ -17023,13 +17027,15 @@ async fn pg_probe_federation_merge_preimage(
     // place with NO pre-image → no supersede leaf (the sqlite path is immune —
     // its `BEGIN IMMEDIATE` RESERVED lock already spans probe→upsert). Exactly
     // ONE key is locked per apply (a single memory), so there is no
-    // lock-ordering deadlock. Only taken on the armed path (this fn already
-    // returned above when the spine is off), so the default apply is unchanged.
+    // lock-ordering deadlock. #4206: taken on every apply, because the
+    // pre-merge archive snapshot needs the same race-free pre-image.
     pg_advisory_lock_title_namespace(tx, title, namespace).await?;
-    let row = sqlx::query(
-        "SELECT updated_at, id, version, content, encrypted_envelope \
-         FROM memories WHERE title = $1 AND namespace = $2 FOR UPDATE",
-    )
+    let row = sqlx::query(&format!(
+        "SELECT updated_at, id, version, content, encrypted_envelope, \
+                COALESCE(metadata->>'agent_id', '') AS owner_agent_id \
+         FROM memories WHERE title = $1 AND namespace = $2 AND {} FOR UPDATE",
+        crate::models::TITLE_SLOT_INDEX_PREDICATE
+    ))
     .bind(title)
     .bind(namespace)
     .fetch_optional(&mut **tx)
@@ -17043,7 +17049,24 @@ async fn pg_probe_federation_merge_preimage(
         version: row.try_get("version")?,
         content: row.try_get("content")?,
         encrypted_envelope: row.try_get(field_names::ENCRYPTED_ENVELOPE)?,
+        owner_agent_id: row.try_get("owner_agent_id")?,
     }))
+}
+
+/// #4206 — the inbound row wins the title-slot LWW tiebreak, byte-for-byte the
+/// `ON CONFLICT … CASE` arm of `apply_remote_memory` (`timestamptz` at
+/// MICROSECOND resolution, then `id`). `inbound_updated_at` is truncated to µs
+/// so a sub-µs tie cannot disagree with the SQL (#2954 FIX 4).
+fn pg_inbound_wins(
+    pre: &PgFederationMergePreimage,
+    inbound_updated_at: DateTime<Utc>,
+    inbound_id: &str,
+) -> bool {
+    use chrono::DurationRound;
+    let inbound_us = inbound_updated_at
+        .duration_trunc(chrono::Duration::microseconds(1))
+        .unwrap_or(inbound_updated_at);
+    inbound_us > pre.updated_at || (inbound_us == pre.updated_at && inbound_id > pre.id.as_str())
 }
 
 /// v0.9.0 G13-mem (#1859, COND 1) — the postgres half of the SINGLE
@@ -24996,16 +25019,47 @@ impl MemoryStore for PostgresStore {
             .begin()
             .await
             .map_err(|e| to_store_err("begin apply_remote_memory tx", e))?;
-        // #2954 — armed-only pre-image of the `(title, namespace)` row this
-        // upsert may overwrite, `SELECT … FOR UPDATE` inside this tx so the
-        // probe and the newer-wins upsert are atomic under READ COMMITTED (the
-        // row lock is load-bearing: it stops a concurrent writer from changing
-        // the row between the probe and the upsert whose verdict it mirrors).
-        // `None` when the spine is OFF (byte-identical) or no prior row exists.
+        // #2954 / #4206 — pre-image of the `(title, namespace)` row this upsert
+        // may overwrite, `SELECT … FOR UPDATE` inside this tx so the probe, the
+        // pre-merge snapshot and the newer-wins upsert are atomic under READ
+        // COMMITTED (the row lock is load-bearing: it stops a concurrent writer
+        // from changing the row between the probe and the upsert whose verdict
+        // it mirrors). `None` when no live row holds the slot.
         let merge_preimage =
             pg_probe_federation_merge_preimage(&mut tx, &memory.title, &memory.namespace)
                 .await
                 .map_err(|e| to_store_err("apply_remote_memory merge pre-image probe", e))?;
+        // #4206 (the title-slot half of #1773 / #3961) — when the inbound row
+        // wins the tiebreak AND its plaintext differs from the stored text,
+        // snapshot the pre-merge row into `archived_memories`
+        // (`federation_merge`, keyed by the LOCAL id) BEFORE the in-place
+        // rewrite, in this same tx, so the overwritten text stays recoverable.
+        // Compared on plaintext, before sealing (a fresh seal never matches), so
+        // a no-change replay leaves the earlier snapshot in place; an envelope
+        // that cannot be opened counts as changed. DELETE + INSERT keeps the
+        // most-recent snapshot (the sqlite `INSERT OR REPLACE` semantics).
+        if let Some(pre) = merge_preimage.as_ref()
+            && pg_inbound_wins(pre, updated_at, &memory.id)
+            && crate::storage::preimage_plaintext(
+                &pre.content,
+                pre.encrypted_envelope.as_deref(),
+                &pre.owner_agent_id,
+            )
+            .as_deref()
+                != Some(memory.content.as_str())
+        {
+            sqlx::query(SQL_DELETE_ARCHIVED_MEMORY_BY_ID)
+                .bind(&pre.id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("apply_remote_memory clear prior snapshot", e))?;
+            sqlx::query(SQL_ARCHIVE_SNAPSHOT_LIVE_ROW)
+                .bind(&pre.id)
+                .bind(crate::models::field_names::ARCHIVE_REASON_FEDERATION_MERGE)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("apply_remote_memory pre-merge snapshot", e))?;
+        }
         // Sealed to the identity the SURVIVING row RETAINS: the newer-wins arm
         // takes the INBOUND envelope while the metadata overlay keeps the LOCAL
         // row's `agent_id` (#1784), so a peer-keyed seal left a row nothing
@@ -25342,8 +25396,8 @@ impl MemoryStore for PostgresStore {
         // this same tx, gated on that same won-and-changed predicate — computed
         // against the `FOR UPDATE` pre-image so it cannot diverge from the live
         // `CASE`. Postgres twin of the sqlite `insert_if_newer` #2954 wiring;
-        // the superseded pre-merge content lives only in the row it replaced,
-        // never in the leaf.
+        // the leaf is identity-only — the superseded pre-merge text is
+        // recoverable from the #4206 `federation_merge` snapshot taken above.
         if let Some(pre) = merge_preimage.as_ref() {
             // #2954 (FIX 4) — the SQL `CASE` compares `EXCLUDED.updated_at` and
             // `memories.updated_at` as `timestamptz`, whose resolution is
@@ -25354,12 +25408,7 @@ impl MemoryStore for PostgresStore {
             // sub-µs tie where the id-tiebreak favours the LOCAL row can no
             // longer emit a spurious leaf. `duration_trunc` cannot fail for a
             // 1µs unit; the fallback is defensive only.
-            use chrono::DurationRound;
-            let inbound_us = updated_at
-                .duration_trunc(chrono::Duration::microseconds(1))
-                .unwrap_or(updated_at);
-            let inbound_won = inbound_us > pre.updated_at
-                || (inbound_us == pre.updated_at && memory.id.as_str() > pre.id.as_str());
+            let inbound_won = pg_inbound_wins(pre, updated_at, &memory.id);
             let content_changed = remote_content != pre.content.as_str()
                 || remote_envelope.map(Vec::as_slice) != pre.encrypted_envelope.as_deref();
             if inbound_won && content_changed {
