@@ -313,6 +313,10 @@ fn reviewed_consumers() -> BTreeMap<(&'static str, &'static str), &'static str> 
             "an ID collision (the archived id is already live), not a title collision; the title-key INSERT…SELECT has no ON CONFLICT and surfaces a unique violation",
         ),
         (
+            ("src/store/mod.rs", "consolidation_version_conflict"),
+            "#4045 optimistic-concurrency VERSION conflict (a consolidation source's stored version moved after it was summarized); carries only the memory id, never a (title, namespace) slot, so no title-slot admission decision is involved",
+        ),
+        (
             ("src/store/postgres.rs", "lease_acquire"),
             "a `leases` row conflict, not a `memories` title collision",
         ),
