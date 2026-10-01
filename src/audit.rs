@@ -2540,62 +2540,22 @@ mod tests {
         assert!(status.last_write_unix_ms.is_some());
     }
 
-    /// Captures formatted tracing output (no ANSI, no timestamps).
-    #[derive(Clone, Default)]
-    struct CapturedLines(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-    impl std::io::Write for CapturedLines {
-        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-            self.0
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .extend_from_slice(b);
-            Ok(b.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLines {
-        type Writer = CapturedLines;
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
-    }
-    /// Run `f` under a DEBUG-level capturing subscriber; returns the
-    /// (ERROR, DEBUG) line counts it produced.
-    fn count_error_and_debug_lines(f: impl FnOnce()) -> (usize, usize) {
-        let sink = CapturedLines::default();
-        let buf = sink.0.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::DEBUG)
-            .with_writer(sink)
-            .with_ansi(false)
-            .without_time()
-            .finish();
-        tracing::subscriber::with_default(subscriber, f);
-        let text = String::from_utf8_lossy(
-            &buf.lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        )
-        .into_owned();
-        let count = |level: &str| text.lines().filter(|l| l.contains(level)).count();
-        (count("ERROR"), count("DEBUG"))
-    }
-
     /// #4318 — a lost audit event is traced at DEBUG; the ERROR goes out only
-    /// with the rate-limited diagnostic (at most one inside an interval; the
-    /// interval is process-global, so an earlier cell may already hold it).
+    /// with the rate-limited diagnostic: exactly one for 10 losses inside one
+    /// interval (the shared clock is reset under the sink lock first, so a
+    /// fix that dropped the ERROR entirely fails here too, f2r's nit).
     /// Red on ed111a9eb: 10 ERROR lines for 10 lost events.
     #[test]
     fn lost_events_log_at_most_one_error_per_interval_4318() {
         let _g = sink_lock();
         let delivery = &RuntimeContext::global().audit.delivery;
         let failed0 = delivery.write_failures();
+        delivery.reset_diagnostic_clock_for_test();
         super::init_for_test_with_writer(Box::new(FillingDisk {
             budget: 0,
             fail_flush: false,
         }));
-        let (errors, debugs) = count_error_and_debug_lines(|| {
+        let (errors, debugs) = crate::test_support::count_error_and_debug_lines(|| {
             for _ in 0..10 {
                 emit_one();
             }
@@ -2606,7 +2566,7 @@ mod tests {
             10,
             "every loss counted"
         );
-        assert!(errors <= 1, "{errors} ERROR lines for 10 lost events");
+        assert_eq!(errors, 1, "{errors} ERROR lines for 10 lost events");
         assert_eq!(debugs, 10, "every lost event is still traced, at DEBUG");
     }
 

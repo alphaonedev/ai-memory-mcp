@@ -5962,48 +5962,6 @@ mod tests {
         );
     }
 
-    /// Captures formatted tracing output (no ANSI, no timestamps).
-    #[derive(Clone, Default)]
-    struct CapturedLines(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-    impl std::io::Write for CapturedLines {
-        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-            self.0
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .extend_from_slice(b);
-            Ok(b.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLines {
-        type Writer = CapturedLines;
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
-    }
-    /// Run `f` under a DEBUG-level capturing subscriber; returns the
-    /// (ERROR, DEBUG) line counts it produced.
-    fn count_error_and_debug_lines(f: impl FnOnce()) -> (usize, usize) {
-        let sink = CapturedLines::default();
-        let buf = sink.0.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::DEBUG)
-            .with_writer(sink)
-            .with_ansi(false)
-            .without_time()
-            .finish();
-        tracing::subscriber::with_default(subscriber, f);
-        let text = String::from_utf8_lossy(
-            &buf.lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        )
-        .into_owned();
-        let count = |level: &str| text.lines().filter(|l| l.contains(level)).count();
-        (count("ERROR"), count("DEBUG"))
-    }
-
     /// #4310 (f2r B1) — the tracing ERROR is rate-limited too. `serve` and
     /// `mcp` route tracing to stderr, so a per-row ERROR was the flood itself.
     /// Red on ed111a9eb: 10 ERROR lines for 10 dropped rows.
@@ -6012,7 +5970,7 @@ mod tests {
         let stats = crate::logging::DeliveryStats::default();
         let path = Path::new("/nonexistent/forensic-2026-07-31.jsonl");
         let err = std::io::Error::from_raw_os_error(30);
-        let (errors, debugs) = count_error_and_debug_lines(|| {
+        let (errors, debugs) = crate::test_support::count_error_and_debug_lines(|| {
             for i in 0..10 {
                 let _ = writer_failure_with(&stats, 1_000_000 + i, "appending to", path, &err);
             }
