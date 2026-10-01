@@ -298,12 +298,16 @@ fn probe_dir_writable_at_with(probe: &Path, between: impl FnOnce(&Path)) -> std:
     }
     let created = options.open(probe)?;
     let ours = created.metadata()?;
-    drop(created);
     between(probe);
     // `symlink_metadata` never follows a link; `remove_file` unlinks the NAME.
+    // `created` stays OPEN until after both: an open descriptor pins our inode,
+    // so its number cannot be handed to a file swapped in at the name. Closed
+    // first, ext4 reuses the freed number at once, the identity check matches
+    // the newcomer, and it would be deleted (r1 on de4a3bd82, OWNERSHIP-24).
     if std::fs::symlink_metadata(probe).is_ok_and(|now| same_file(&ours, &now)) {
         let _ = std::fs::remove_file(probe);
     }
+    drop(created);
     Ok(())
 }
 
