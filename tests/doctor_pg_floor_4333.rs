@@ -77,6 +77,14 @@ impl Drop for CountingListener {
 
 /// Run `ai-memory doctor --json` as a subprocess scoped to `store_url`.
 fn doctor_json(store_url: &str, home: &std::path::Path) -> serde_json::Value {
+    doctor_json_env(store_url, home, &[])
+}
+
+fn doctor_json_env(
+    store_url: &str,
+    home: &std::path::Path,
+    extra_env: &[(&str, &str)],
+) -> serde_json::Value {
     let keys = home.join("keys");
     std::fs::create_dir_all(&keys).expect("keys dir");
     #[cfg(unix)]
@@ -90,6 +98,7 @@ fn doctor_json(store_url: &str, home: &std::path::Path) -> serde_json::Value {
         .env("AI_MEMORY_NO_CONFIG", "1")
         .env("AI_MEMORY_KEY_DIR", &keys)
         .env("AI_MEMORY_STORE_URL", store_url)
+        .envs(extra_env.iter().copied())
         .args(["doctor", "--json"])
         .output()
         .expect("run doctor");
@@ -129,39 +138,139 @@ fn weak_urls(port: u16) -> Vec<String> {
     ]
 }
 
+/// Assert every doctor section that opens a postgres session refused `url`
+/// and that the listener saw no connection.
+fn assert_doctor_refused_without_connecting(
+    listener: &CountingListener,
+    url: &str,
+    extra_env: &[(&str, &str)],
+) {
+    let home = tempfile::tempdir().expect("scratch HOME");
+    let report = doctor_json_env(url, home.path(), extra_env);
+
+    let ext = section(&report, "Postgres extensions");
+    assert!(is_critical(ext), "extensions must be critical: {ext}");
+    assert!(
+        ext.to_string().contains(REFUSAL_MARK),
+        "extensions must report the floor refusal: {ext}"
+    );
+
+    let owners = section(&report, "Unstamped owners");
+    assert!(is_critical(owners), "owners must be critical: {owners}");
+    assert!(
+        owners.to_string().contains(REFUSAL_MARK),
+        "owners must report the floor refusal: {owners}"
+    );
+
+    let identity = section(&report, "Identity");
+    assert!(
+        identity.to_string().contains(REFUSAL_MARK),
+        "the identity key-registry inspection must report the floor refusal: {identity}"
+    );
+
+    assert_eq!(
+        listener.accepted(),
+        0,
+        "doctor opened a socket for a DSN below the #3705 floor: {url:?}"
+    );
+}
+
 #[test]
 fn doctor_refuses_every_pg_probe_below_the_sslmode_floor_without_connecting_4333() {
     let listener = CountingListener::start();
     for url in weak_urls(listener.port) {
-        let home = tempfile::tempdir().expect("scratch HOME");
-        let report = doctor_json(&url, home.path());
+        assert_doctor_refused_without_connecting(&listener, &url, &[]);
+    }
+}
 
-        let ext = section(&report, "Postgres extensions");
-        assert!(is_critical(ext), "extensions must be critical: {ext}");
-        assert!(
-            ext.to_string().contains(REFUSAL_MARK),
-            "extensions must report the floor refusal: {ext}"
-        );
+/// #4434 - DSNs the text floor approved while sqlx parsed a weaker sslmode:
+/// the `ssl-mode` alias after verify-full, an upper-case key, a
+/// percent-encoded key, sslmode text in the fragment, a tab / newline inside
+/// a key. Each must be refused with no socket, from every doctor section.
+fn bypass_urls(port: u16) -> Vec<(&'static str, String)> {
+    let base = format!("postgres://u:{SECRET}@127.0.0.1:{port}/db");
+    vec![
+        (
+            "alias key",
+            format!("{base}?sslmode=verify-full&ssl-mode=disable"),
+        ),
+        (
+            "upper-case key",
+            format!("{base}?sslmode=disable&SSLMODE=verify-full"),
+        ),
+        (
+            "percent-encoded key",
+            format!("{base}?sslmode=verify-full&%73slmode=disable"),
+        ),
+        (
+            "fragment",
+            format!("{base}?sslmode=disable#x&sslmode=verify-full"),
+        ),
+        ("fragment only", format!("{base}?a=1#&sslmode=verify-full")),
+        (
+            "tab in key",
+            format!("{base}?sslmode=verify-full&ss\tlmode=disable"),
+        ),
+        (
+            "newline in key",
+            format!("{base}?sslmode=verify-full&ss\nlmode=require"),
+        ),
+    ]
+}
 
-        let owners = section(&report, "Unstamped owners");
-        assert!(is_critical(owners), "owners must be critical: {owners}");
-        assert!(
-            owners.to_string().contains(REFUSAL_MARK),
-            "owners must report the floor refusal: {owners}"
-        );
+#[test]
+fn doctor_refuses_the_parser_differential_dsns_without_connecting_4434() {
+    let listener = CountingListener::start();
+    for (kind, url) in bypass_urls(listener.port) {
+        eprintln!("4434 row: {kind}");
+        assert_doctor_refused_without_connecting(&listener, &url, &[]);
+    }
+}
 
-        let identity = section(&report, "Identity");
-        assert!(
-            identity.to_string().contains(REFUSAL_MARK),
-            "the identity key-registry inspection must report the floor refusal: {identity}"
-        );
+#[test]
+fn floored_connect_options_refuses_the_parser_differential_dsns_4434() {
+    use ai_memory::store::postgres::dsn::{FlooredConnectError, floored_connect_options};
+    let mut not_refused = Vec::new();
+    for (kind, url) in bypass_urls(5432) {
+        match floored_connect_options(&url) {
+            Err(FlooredConnectError::Refused(m)) => {
+                assert!(m.contains(REFUSAL_MARK), "{kind}: {m}");
+                assert!(!m.contains(SECRET), "{kind}: refusal must not echo the DSN");
+            }
+            _ => not_refused.push(kind),
+        }
+    }
+    assert!(
+        not_refused.is_empty(),
+        "rows the floor approved while the driver parses a weaker sslmode: {not_refused:?}"
+    );
+}
 
-        assert_eq!(
-            listener.accepted(),
-            0,
-            "doctor opened a socket for a DSN below the #3705 floor: {url:?}"
+/// #4434 - PGSSLMODE is read by sqlx when the parsed URL names no sslmode.
+/// A DSN whose only sslmode sits in the fragment must be refused whatever
+/// PGSSLMODE says, with no socket; a URL that pins verify-full in its query
+/// keeps verify-full whatever PGSSLMODE says.
+#[test]
+fn pgsslmode_env_cannot_change_the_outcome_4434() {
+    let listener = CountingListener::start();
+    let base = format!("postgres://u:{SECRET}@127.0.0.1:{}/db", listener.port);
+    for env_mode in ["disable", "prefer", "require", "allow"] {
+        assert_doctor_refused_without_connecting(
+            &listener,
+            &format!("{base}?a=1#&sslmode=verify-full"),
+            &[("PGSSLMODE", env_mode)],
         );
     }
+    // Live: a verify-full URL with a hostile PGSSLMODE still verifies.
+    let Ok(url) = std::env::var("AI_MEMORY_TEST_POSTGRES_URL") else {
+        eprintln!("AI_MEMORY_TEST_POSTGRES_URL unset - skipping live half");
+        return;
+    };
+    let opts = ai_memory::store::postgres::dsn::floored_connect_options(&url).expect("floor ok");
+    assert!(matches!(
+        opts.get_ssl_mode(),
+        sqlx::postgres::PgSslMode::VerifyFull
+    ));
 }
 
 #[test]
@@ -177,6 +286,7 @@ fn the_floored_connect_options_refuses_every_weak_shape_4333() {
         }
     }
     for url in [
+        format!("postgres://u:{SECRET}@%2Fvar%2Frun%2Fpostgresql/db?sslmode=verify-full"),
         format!("postgres://u:{SECRET}@/db?host=/var/run/postgresql&sslmode=verify-full"),
         "not a url".to_string(),
     ] {
@@ -236,4 +346,42 @@ fn doctor_still_probes_a_verify_full_store_4333() {
         !identity.to_string().contains(REFUSAL_MARK),
         "a verify-full DSN must not be refused by the key registry read: {identity}"
     );
+}
+
+/// #4434 real-PG controls: DSNs whose parsed sslmode IS verify-full still
+/// connect, and the session is TLS (`pg_stat_ssl`). The first-weak/last-strong
+/// duplicate and the upper-case VALUE are the benign differentials.
+#[test]
+fn verify_full_controls_connect_over_tls_on_the_real_tier_4434() {
+    use sqlx::Connection as _;
+    let Ok(url) = std::env::var("AI_MEMORY_TEST_POSTGRES_URL") else {
+        eprintln!("AI_MEMORY_TEST_POSTGRES_URL unset - skipping (#4434 live controls)");
+        return;
+    };
+    let Some((head, query)) = url.split_once('?') else {
+        panic!("the test tier URL carries a query");
+    };
+    let controls = [
+        url.clone(),
+        format!("{head}?sslmode=disable&{query}"),
+        format!("{head}?{}", query.replace("verify-full", "VERIFY-FULL")),
+    ];
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    for control in controls {
+        let options = ai_memory::store::postgres::dsn::floored_connect_options(&control)
+            .expect("a verify-full control passes the floor");
+        let ssl: bool = rt.block_on(async {
+            let mut conn = sqlx::PgConnection::connect_with(&options)
+                .await
+                .expect("verify-full control connects");
+            sqlx::query_scalar("SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()")
+                .fetch_one(&mut conn)
+                .await
+                .expect("pg_stat_ssl")
+        });
+        assert!(ssl, "the control session must be TLS");
+    }
 }

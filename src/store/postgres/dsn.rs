@@ -42,7 +42,7 @@
 use std::borrow::Cow;
 use std::str::FromStr;
 
-use sqlx::postgres::PgConnectOptions;
+use sqlx::postgres::{PgConnectOptions, PgSslMode};
 
 /// Tracing target for this funnel's own events.
 const TRACE_TARGET: &str = "store::postgres::dsn";
@@ -207,9 +207,31 @@ pub fn floored_connect_options(dsn: &str) -> Result<PgConnectOptions, FlooredCon
     if let Some(refusal) = crate::transit_encryption::pg_dsn_floor_refusal(dsn) {
         return Err(FlooredConnectError::Refused(refusal));
     }
-    connect_options(dsn).map_err(|e| {
+    let options = connect_options(dsn).map_err(|e| {
         FlooredConnectError::Parse(crate::logging::redact_urls_in_message(&e.to_string()))
-    })
+    })?;
+    // #4434 - the AUTHORITATIVE check is on the options the driver will
+    // actually use, not on a second reading of the DSN text. sqlx matches
+    // keys case-sensitively, honours the `ssl-mode` alias, percent-decodes
+    // keys, drops tab/newline characters, ignores the fragment and falls
+    // back to PGSSLMODE when the URL names no sslmode; the text floor above
+    // reads none of that the same way. Deciding on the parsed value means the
+    // floor and the driver can never disagree (ERRORS-01 / ERRORS-09).
+    if options.get_socket().is_some() || options.get_host().starts_with('/') {
+        let dir = options.get_socket().map_or_else(
+            || options.get_host().to_string(),
+            |p| p.display().to_string(),
+        );
+        return Err(FlooredConnectError::Refused(
+            crate::transit_encryption::pg_unix_socket_refusal(&dir),
+        ));
+    }
+    if !matches!(options.get_ssl_mode(), PgSslMode::VerifyFull) {
+        return Err(FlooredConnectError::Refused(
+            crate::transit_encryption::pg_sslmode_refusal(),
+        ));
+    }
+    Ok(options)
 }
 
 #[cfg(test)]
