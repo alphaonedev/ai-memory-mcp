@@ -1139,7 +1139,7 @@ mod tests {
         remote.title = "new".into();
         remote.content = "new-c".into();
         remote.namespace = "new-ns".into();
-        remote.memory_kind = MemoryKind::Reflection;
+        remote.memory_kind = MemoryKind::Decision;
         remote.lifecycle_state = LifecycleState::Done;
 
         let merged = merge_memory(&local, &remote);
