@@ -386,8 +386,9 @@ SQLite with WAL mode, FTS5 virtual table for full-text search. **Current schema 
 
 ### Environment Variables
 
-**Precedence (universal).** Every knob in the table below resolves
-through the same ladder when more than one source is present:
+**Precedence (general — check each setting's resolver).** Most scalar
+knobs in the table below resolve through the same ladder when more than
+one source is present; the exceptions are named below:
 
 ```
 CLI flag  >  AI_MEMORY_* env var  >  config.toml field  >  compiled default
@@ -400,7 +401,7 @@ appropriate `effective_*` accessor at the point of use. Test-only
 vars (`AI_MEMORY_TEST_*`, `AI_MEMORY_AUTO_EXPORT_INJECT_PANIC`) are
 inert under production builds.
 
-**The one documented INVERSION.** The store-URL channel resolves
+**Exception 1 — the store-URL INVERSION.** The store-URL channel resolves
 `AI_MEMORY_STORE_URL_FILE` (#158) > `AI_MEMORY_STORE_URL` (#157) >
 the `--store-url` CLI flag — env BEATS flag, the reverse of the ladder
 above. This is deliberate and is the whole point of #1927: argv is
@@ -408,6 +409,13 @@ world-readable via `/proc/<pid>/cmdline`, so the leakier channel must
 not be able to override the safer one. `--store-url` carries no
 `#[arg(env = …)]`, so clap does not merge the two into one slot.
 Do not "fix" `resolve_store_url` to match the general ladder.
+
+**Exception 2 — additive encryption enabling.** `encryption_enabled`
+(`src/encryption/mod.rs`) turns at-rest content encryption ON when a true
+config/seed (`[encryption].at_rest`) OR a truthy `AI_MEMORY_ENCRYPT_AT_REST`
+is present; a falsy env value does NOT override an enabled config. This is
+an OR, not an env-over-config override. Removed downgrade controls and
+explicit refusal rules are not precedence fallbacks.
 
 **Classification.** `secret` = leaks credentials or override authority
 if logged or echoed; MUST NOT appear in capabilities, banners, audit
