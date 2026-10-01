@@ -227,3 +227,168 @@ pub fn pg_adapter_concat() -> String {
     }
     s
 }
+
+/// A copy of `src` with the CONTENT of every comment, string literal and
+/// char/byte literal replaced by spaces (#4023). Newlines are kept and every
+/// replaced byte becomes exactly one space, so byte offsets and line numbers
+/// match the original. Structural detection (fn spans, `impl`/item
+/// boundaries, `const`/`static` items) must run on this copy, so text inside a
+/// literal or comment can never re-segment a scan; SQL is then searched in the
+/// ORIGINAL text over the spans found here, because the SQL lives in strings.
+///
+/// Handles: `"..."` with escapes; raw strings with any number of `#`
+/// (`r".."`, `r#".."#`, `r##".."##`); byte (`b".."`, `br#".."#`) and C
+/// (`c".."`, `cr#".."#`) strings; char / byte literals (a lifetime such as
+/// `'a` is NOT a char literal); `//` line comments; nested `/* */` comments.
+///
+/// Delimiters (the quotes, `#`s and the `r`/`b`/`c` prefix) are kept; only
+/// the content between them is blanked. An unterminated literal or comment
+/// blanks to end of input (fail closed: nothing after it is mistaken for
+/// structure).
+#[must_use]
+pub fn mask_rust(src: &str) -> String {
+    let b = src.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(b.len());
+    let is_ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    let blank = |out: &mut Vec<u8>, c: u8| out.push(if c == b'\n' { b'\n' } else { b' ' });
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        let next = b.get(i + 1).copied();
+        // Line comment.
+        if c == b'/' && next == Some(b'/') {
+            while i < b.len() && b[i] != b'\n' {
+                out.push(b' ');
+                i += 1;
+            }
+            continue;
+        }
+        // Block comment (nested).
+        if c == b'/' && next == Some(b'*') {
+            let mut depth = 0usize;
+            while i < b.len() {
+                if b[i] == b'/' && b.get(i + 1) == Some(&b'*') {
+                    depth += 1;
+                    out.extend_from_slice(b"  ");
+                    i += 2;
+                } else if b[i] == b'*' && b.get(i + 1) == Some(&b'/') {
+                    depth -= 1;
+                    out.extend_from_slice(b"  ");
+                    i += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                } else {
+                    blank(&mut out, b[i]);
+                    i += 1;
+                }
+            }
+            continue;
+        }
+        // Raw string: r"..", r#".."#, with an optional b/c prefix. The `r`
+        // must start a token (not be the tail of an identifier).
+        if c == b'r' {
+            let prefixed = i > 0 && (b[i - 1] == b'b' || b[i - 1] == b'c');
+            let before = if prefixed {
+                i.checked_sub(2).map(|k| b[k])
+            } else {
+                i.checked_sub(1).map(|k| b[k])
+            };
+            if !before.is_some_and(is_ident) {
+                let mut j = i + 1;
+                let mut hashes = 0usize;
+                while b.get(j) == Some(&b'#') {
+                    hashes += 1;
+                    j += 1;
+                }
+                if b.get(j) == Some(&b'"') {
+                    out.extend_from_slice(&b[i..=j]);
+                    j += 1;
+                    loop {
+                        if j >= b.len() {
+                            break;
+                        }
+                        if b[j] == b'"'
+                            && b[j + 1..].iter().take(hashes).all(|&h| h == b'#')
+                            && b.len() - (j + 1) >= hashes
+                        {
+                            out.extend_from_slice(&b[j..=j + hashes]);
+                            j += hashes + 1;
+                            break;
+                        }
+                        blank(&mut out, b[j]);
+                        j += 1;
+                    }
+                    i = j;
+                    continue;
+                }
+            }
+        }
+        // Ordinary string (the b/c prefix, if any, was already copied).
+        if c == b'"' {
+            out.push(b'"');
+            i += 1;
+            while i < b.len() {
+                if b[i] == b'\\' {
+                    out.push(b' ');
+                    i += 1;
+                    if i < b.len() {
+                        blank(&mut out, b[i]);
+                        i += 1;
+                    }
+                    continue;
+                }
+                if b[i] == b'"' {
+                    out.push(b'"');
+                    i += 1;
+                    break;
+                }
+                blank(&mut out, b[i]);
+                i += 1;
+            }
+            continue;
+        }
+        // Char / byte literal vs lifetime.
+        if c == b'\'' {
+            let mut end: Option<usize> = None;
+            if next == Some(b'\\') {
+                // Escaped char: scan to the closing quote.
+                let mut j = i + 2;
+                if j < b.len() {
+                    j += 1; // the escaped char itself (e.g. the `'` of `'\''`)
+                }
+                while j < b.len() && b[j] != b'\'' && b[j] != b'\n' {
+                    j += 1;
+                }
+                if b.get(j) == Some(&b'\'') {
+                    end = Some(j);
+                }
+            } else if let Some(n) = next {
+                // One UTF-8 scalar then a closing quote => char literal.
+                let width = match n {
+                    0x00..=0x7F => 1,
+                    0xC0..=0xDF => 2,
+                    0xE0..=0xEF => 3,
+                    _ => 4,
+                };
+                if n != b'\n' && b.get(i + 1 + width) == Some(&b'\'') {
+                    end = Some(i + 1 + width);
+                }
+            }
+            if let Some(e) = end {
+                out.push(b'\'');
+                for &x in &b[i + 1..e] {
+                    blank(&mut out, x);
+                }
+                out.push(b'\'');
+                i = e + 1;
+                continue;
+            }
+        }
+        out.push(c);
+        i += 1;
+    }
+    // Only whole literal / comment contents were blanked byte-for-byte with
+    // ASCII spaces; everything else was copied verbatim, so this is valid UTF-8.
+    String::from_utf8(out).unwrap_or_else(|e| panic!("mask_rust produced invalid UTF-8: {e}"))
+}
