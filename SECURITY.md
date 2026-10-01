@@ -359,16 +359,17 @@ name contains `test` and every line at or below the first `#[cfg(test)]` module
 (#4145). So it pins **construction sites under `src/mcp/**`**, not *reachability
 from `run_mcp_server`*: a network client constructed in a helper elsewhere in the
 tree and called from the MCP process is invisible to it — which is exactly the
-shape of the two inference clients enumerated in the table above, built in
-`src/reload.rs` and `src/embeddings.rs`. That is a real gap in the gate, not in
+shape of every row but the first in the table above: the two inference clients
+built in `src/reload.rs` / `src/embeddings.rs`, and the weight fetches in
+`src/embeddings.rs` / `src/reranker.rs`. That is a real gap in the gate, not in
 the certified claim: the claim this section makes is that **MCP binds no server
 socket and constructs no network client for its own serving transport**, and the
-inference and forward clients are neither. Widening the gate to every module
-reachable from `run_mcp_server` (a codegraph callee walk) is tracked on
-[#4168](https://github.com/alphaonedev/ai-memory-mcp/issues/4168); until it
-lands, the enumeration above — not the gate — is what keeps the outbound-client
-list honest, and a new outbound client built outside `src/mcp/**` must be added
-to it by hand.
+inference, weight-fetch and forward clients are none of those. Widening the gate
+to every module reachable from `run_mcp_server` (a codegraph callee walk) is
+tracked on [#4399](https://github.com/alphaonedev/ai-memory-mcp/issues/4399);
+until it lands, the enumeration above — not the gate — is what keeps the
+outbound-connection list honest, and a new outbound client built outside
+`src/mcp/**` must be added to it by hand.
 
 The runtime guard is pinned separately by
 `src/mcp/stdio_guard.rs::classify_fd`'s unit tests, which assert that a listening
