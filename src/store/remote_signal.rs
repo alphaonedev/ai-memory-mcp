@@ -18,8 +18,13 @@ use crate::models::AttestLevel;
 ///
 /// # Invariants (#4026, 5-agent vote 4d3ea1c5, memory cc79c670)
 ///
-/// - An `Err` from `apply_remote_signal` means NO row was stored, so the caller
-///   may refund its pre-charge on `Err` without under-counting.
+/// - An `Err` from `apply_remote_signal` means NO row was stored (modulo the
+///   ambiguous-commit residual below), so the caller may refund its pre-charge
+///   on `Err` without under-counting. The residual: on PostgreSQL a connection
+///   that drops after the server committed but before the acknowledgement
+///   arrives returns `Err` with the row STORED, so the refund under-charges that
+///   author by one signal's bytes. No row is lost or corrupted and a peer cannot
+///   induce it.
 /// - An adapter that overrides `apply_remote_signal` with an insert-if-absent
 ///   statement (`INSERT .. ON CONFLICT DO NOTHING`) MUST map
 ///   `rows_affected == 0` to [`RemoteSignalApply::AlreadyPresent`], never to

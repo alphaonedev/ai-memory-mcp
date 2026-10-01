@@ -3131,11 +3131,15 @@ pub trait MemoryStore: Send + Sync {
     /// conflict a CONCURRENT duplicate hits when it inserts the same UUID after
     /// the existence probe.
     ///
-    /// **Invariant (#4026): `Err` means this call persisted nothing.** Every
-    /// error arm returns before the single `signal_send` insert, or IS that
-    /// insert failing atomically, so a caller may refund a pre-charge on `Err`
-    /// without risking an under-count. An adapter that overrides this method
-    /// must keep that invariant.
+    /// **Invariant (#4026): `Err` means this call persisted nothing**, modulo
+    /// one residual. Every error arm returns before the single `signal_send`
+    /// insert, or IS that insert failing atomically, so a caller may refund a
+    /// pre-charge on `Err` without risking an under-count. The residual is an
+    /// AMBIGUOUS COMMIT on PostgreSQL: a connection that drops after the server
+    /// committed but before the acknowledgement arrives returns `Err` with the
+    /// row stored, and the refund then under-charges that author by one signal's
+    /// bytes (no row is lost or corrupted; a peer cannot induce it). An adapter
+    /// that overrides this method must keep the invariant.
     async fn apply_remote_signal(
         &self,
         ctx: &CallerContext,
@@ -3909,8 +3913,11 @@ pub trait MemoryStore: Send + Sync {
     ///
     /// # Invariant (#4026)
     ///
-    /// An `Err` means no row was stored: [`apply_remote_signal`](MemoryStore::apply_remote_signal)
-    /// callers refund their quota pre-charge on `Err`. A future insert-if-absent
+    /// An `Err` means no row was stored, modulo the PostgreSQL ambiguous-commit
+    /// residual documented on [`apply_remote_signal`](MemoryStore::apply_remote_signal)
+    /// (a dropped acknowledgement can return `Err` with the row stored; the refund
+    /// then under-charges by one signal). Its callers refund their quota
+    /// pre-charge on `Err`. A future insert-if-absent
     /// override must report `rows_affected == 0` as
     /// [`RemoteSignalApply::AlreadyPresent`] (see that type), never as stored.
     ///

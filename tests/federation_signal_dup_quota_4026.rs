@@ -331,8 +331,20 @@ async fn concurrent_duplicate_signal_refunded_sqlite_4026() {
     tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
     other.execute_batch("COMMIT").expect("commit duplicate");
 
-    let (status, _) = task.await.expect("push task");
+    let (status, body) = task.await.expect("push task");
     assert_eq!(status, StatusCode::OK, "sqlite: push status");
+    // The receive must have REACHED the insert-failure arm (counted `skipped`,
+    // refunded), not merely probed after the other writer committed (`noop`,
+    // which would leave the charge at 0 on ANY code and make this cell pass
+    // vacuously under load).
+    assert_eq!(
+        (
+            body.get("skipped").and_then(Value::as_u64),
+            body.get("noop").and_then(Value::as_u64)
+        ),
+        (Some(1), Some(0)),
+        "sqlite: the push must hit the insert-failure arm (skipped=1, noop=0): {body}"
+    );
     let charged = charged_bytes(&db, &ns).await;
     assert_eq!(
         charged,
@@ -530,5 +542,155 @@ async fn racing_duplicate_signals_charge_once_pg_4026() {
     set_posture();
     let (router, store, db) = pg_router(&url).await;
     racing_cell("postgres", &router, &store, &db).await;
+    clear_posture();
+}
+
+// ---------------------------------------------------------------------
+// DETERMINISTIC `AlreadyPresent` refund (s4026 F1). A stub store whose
+// `signal_get` probe finds nothing (so the funnel charges) but whose
+// `apply_remote_signal` reports `AlreadyPresent` — the outcome a duplicate that
+// raced past the probe produces — pins the OUTCOME-based refund without any
+// timing or database race: with the refund removed the author keeps the charge
+// and this cell fails.
+// ---------------------------------------------------------------------
+
+struct AlreadyPresentStore;
+
+#[async_trait::async_trait]
+impl ai_memory::store::MemoryStore for AlreadyPresentStore {
+    fn capabilities(&self) -> ai_memory::store::Capabilities {
+        ai_memory::store::Capabilities::empty()
+    }
+    async fn store(
+        &self,
+        _ctx: &ai_memory::store::CallerContext,
+        memory: &ai_memory::models::Memory,
+    ) -> ai_memory::store::StoreResult<String> {
+        Ok(memory.id.clone())
+    }
+    async fn get(
+        &self,
+        _ctx: &ai_memory::store::CallerContext,
+        id: &str,
+    ) -> ai_memory::store::StoreResult<ai_memory::models::Memory> {
+        Err(ai_memory::store::StoreError::NotFound { id: id.to_string() })
+    }
+    async fn update(
+        &self,
+        _ctx: &ai_memory::store::CallerContext,
+        id: &str,
+        _patch: ai_memory::store::UpdatePatch,
+    ) -> ai_memory::store::StoreResult<()> {
+        Err(ai_memory::store::StoreError::NotFound { id: id.to_string() })
+    }
+    async fn delete(
+        &self,
+        _ctx: &ai_memory::store::CallerContext,
+        id: &str,
+    ) -> ai_memory::store::StoreResult<()> {
+        Err(ai_memory::store::StoreError::NotFound { id: id.to_string() })
+    }
+    async fn list(
+        &self,
+        _ctx: &ai_memory::store::CallerContext,
+        _filter: &ai_memory::store::Filter,
+    ) -> ai_memory::store::StoreResult<Vec<ai_memory::models::Memory>> {
+        Ok(Vec::new())
+    }
+    async fn search(
+        &self,
+        _ctx: &ai_memory::store::CallerContext,
+        _query: &str,
+        _filter: &ai_memory::store::Filter,
+    ) -> ai_memory::store::StoreResult<Vec<ai_memory::models::Memory>> {
+        Ok(Vec::new())
+    }
+    async fn verify(
+        &self,
+        _ctx: &ai_memory::store::CallerContext,
+        id: &str,
+    ) -> ai_memory::store::StoreResult<ai_memory::store::VerifyReport> {
+        Ok(ai_memory::store::VerifyReport {
+            memory_id: id.to_string(),
+            integrity_ok: true,
+            findings: Vec::new(),
+            signature_verified: false,
+            cid_ok: None,
+            cid_mismatch: None,
+        })
+    }
+    async fn link(
+        &self,
+        _ctx: &ai_memory::store::CallerContext,
+        _link: &ai_memory::models::MemoryLink,
+    ) -> ai_memory::store::StoreResult<()> {
+        Ok(())
+    }
+    async fn list_links(
+        &self,
+        _namespace: Option<&str>,
+    ) -> ai_memory::store::StoreResult<Vec<ai_memory::models::MemoryLink>> {
+        Ok(Vec::new())
+    }
+    async fn register_agent(
+        &self,
+        _ctx: &ai_memory::store::CallerContext,
+        _agent: &ai_memory::models::AgentRegistration,
+    ) -> ai_memory::store::StoreResult<()> {
+        Ok(())
+    }
+    // The probe finds nothing, so the funnel charges ...
+    async fn signal_get(
+        &self,
+        _ctx: &ai_memory::store::CallerContext,
+        _id: &str,
+    ) -> ai_memory::store::StoreResult<Option<Signal>> {
+        Ok(None)
+    }
+    // ... and the write reports a duplicate that stored nothing.
+    async fn apply_remote_signal(
+        &self,
+        _ctx: &ai_memory::store::CallerContext,
+        _signal: &Signal,
+    ) -> ai_memory::store::StoreResult<ai_memory::store::RemoteSignalApply> {
+        Ok(ai_memory::store::RemoteSignalApply::AlreadyPresent)
+    }
+}
+
+#[tokio::test]
+async fn already_present_outcome_refunds_the_charge_exactly_4026() {
+    let _g = FED_ENV_LOCK.lock().await;
+    set_posture();
+    let conn = ai_memory::db::open(std::path::Path::new(":memory:")).expect("scratch sqlite");
+    let db: Db = Arc::new(Mutex::new((
+        conn,
+        std::path::PathBuf::from(":memory:"),
+        ResolvedTtl::default(),
+        true,
+    )));
+    let store: Arc<dyn ai_memory::store::MemoryStore> = Arc::new(AlreadyPresentStore);
+    let router = router_for(app_state(db.clone(), StorageBackend::Postgres, store));
+    let ns = format!("ns-4026ap-{}", &uuid::Uuid::new_v4().to_string()[..8]);
+    let sig = make_signal(&ns);
+
+    let (status, body) = push(&router, &sig).await;
+    assert_eq!(status, StatusCode::OK, "push status: {body}");
+    // The duplicate is acknowledged as the converged no-op ...
+    assert_eq!(
+        (
+            body.get("signals_applied").and_then(Value::as_u64),
+            body.get("noop").and_then(Value::as_u64),
+            body.get("skipped").and_then(Value::as_u64),
+        ),
+        (Some(0), Some(1), Some(0)),
+        "an AlreadyPresent outcome must count noop (not applied, not skipped): {body}"
+    );
+    // ... and the pre-charge is restored EXACTLY: nothing was stored, so the
+    // author's cumulative storage-bytes counter is back at zero.
+    let charged = charged_bytes(&db, &ns).await;
+    assert_eq!(
+        charged, 0,
+        "#4026: AlreadyPresent must refund the charge exactly; charged={charged}"
+    );
     clear_posture();
 }
