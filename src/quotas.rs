@@ -78,6 +78,18 @@ use serde::{Deserialize, Serialize};
 /// string when the caller omits the optional `namespace` argument.
 pub const GLOBAL_NAMESPACE: &str = "_global";
 
+/// #4359 — reserved sentinel namespace of the per-SENDER notify aggregate
+/// row. The per-`(sender, recipient-inbox-namespace)` quota row (#3358) is
+/// opened fresh for every distinct recipient, so it bounds notifies per
+/// recipient, not per sender; this row is charged once per notify across ALL
+/// recipients and carries the same daily ceiling (existing defaults, no new
+/// knob). COUNT-ONLY: storage bytes stay on the per-namespace row, because
+/// an inbox delete never refunds an aggregate byte charge.
+/// Excluded from the namespace-omitted aggregate rollups
+/// ([`get_aggregate_status`]) so a notify is not reported twice; it stays
+/// visible via [`list_status`] and `get_status(agent, NOTIFY_AGGREGATE_NAMESPACE)`.
+pub const NOTIFY_AGGREGATE_NAMESPACE: &str = "_notify";
+
 /// Default daily memory store ceiling per (agent, namespace). Generous;
 /// tune down per-deployment by overwriting the row's
 /// `max_memories_per_day` after it auto-inserts on first use.
@@ -707,6 +719,47 @@ pub fn check_and_record(
     }
 }
 
+/// #4359 — charge a notify to BOTH the per-sender aggregate row
+/// ([`NOTIFY_AGGREGATE_NAMESPACE`], count-only) and the recipient-inbox
+/// namespace row (count + bytes, the #3358 charge). The aggregate is checked
+/// first so a distinct-recipient flood surfaces the sender-wide refusal; if
+/// the per-namespace charge then refuses, the aggregate charge is refunded so
+/// a refused notify consumes nothing.
+///
+/// # Errors
+/// As [`check_and_record`]; the refusal names the row that tripped.
+pub fn check_and_record_notify(
+    conn: &Connection,
+    sender: &str,
+    namespace: &str,
+    bytes: i64,
+) -> std::result::Result<(), QuotaCheckError> {
+    let agg = QuotaOp::Memory { bytes: 0 };
+    check_and_record(conn, sender, NOTIFY_AGGREGATE_NAMESPACE, agg)?;
+    if let Err(e) = check_and_record(conn, sender, namespace, QuotaOp::Memory { bytes }) {
+        if let Err(re) = refund_op(conn, sender, NOTIFY_AGGREGATE_NAMESPACE, agg) {
+            log_refund_op_failed(sender, &re);
+        }
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// #4359 — undo [`check_and_record_notify`] after a downstream failure.
+///
+/// # Errors
+/// Wrapped SQL errors on update failure (both refunds are attempted).
+pub fn refund_notify(conn: &Connection, sender: &str, namespace: &str, bytes: i64) -> Result<()> {
+    let ns = refund_op(conn, sender, namespace, QuotaOp::Memory { bytes });
+    let agg = refund_op(
+        conn,
+        sender,
+        NOTIFY_AGGREGATE_NAMESPACE,
+        QuotaOp::Memory { bytes: 0 },
+    );
+    ns.and(agg)
+}
+
 /// v0.7 K8 / H12 — refund a previously-recorded op. Used by callers
 /// that have already incremented the counters via
 /// [`check_and_record`] but whose downstream insert failed AFTER the
@@ -1145,11 +1198,11 @@ pub fn get_aggregate_status(conn: &Connection, agent_id: &str) -> Result<QuotaSt
                 COALESCE(MIN(day_started_at), ''),
                 COALESCE(MIN(created_at), ''),
                 COALESCE(MAX(updated_at), '')
-             FROM agent_quotas WHERE agent_id = ?1",
+             FROM agent_quotas WHERE agent_id = ?1 AND namespace <> ?2",
         )
         .context("failed to prepare aggregate quota query")?;
     let row: Option<(i64, i64, i64, i64, i64, i64, String, String, String)> = stmt
-        .query_row(params![agent_id], |r| {
+        .query_row(params![agent_id, NOTIFY_AGGREGATE_NAMESPACE], |r| {
             Ok((
                 r.get(0)?,
                 r.get(1)?,
