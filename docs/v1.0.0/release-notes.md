@@ -64,22 +64,25 @@ kinds, claim-bitemporal columns), and certifies the postgres + Apache
 AGE + pgvector storage backend.
 
 > **Certified-backend scope — read this before choosing Postgres.** The
-> two backends are **not one identical API**: **76 of the 89 unique
-> production HTTP paths support at least one method on Postgres; the
-> remaining 13 fail closed with a uniform `501 NOT IMPLEMENTED`** (the Agent
-> Skills surface, `/api/v1/share`, and the `memory_*` MCP-parity routes with
-> no pg SAL trait method yet; the legacy `/api/v1/find_paths` alias is
-> supported; path support does not imply every method is supported — pinned by
-> `tests/pg_supported_route_inventory_gate_2799.rs`), and **MCP-stdio is
+> two backends are **not one identical API**: **Postgres supports at least
+> one registered method on 76 of the 89 unique production HTTP paths; 13
+> paths are wholly unsupported on Postgres and fail closed with a uniform
+> `501 NOT IMPLEMENTED`** (the eight Agent Skills paths, `/api/v1/share`,
+> and four `memory_*` MCP-parity routes with no pg SAL trait method yet).
+> The legacy `POST /api/v1/find_paths` alias is supported. See the
+> method-level PostgreSQL gate (`src/handlers/postgres_gate.rs`) and
+> `tests/pg_supported_route_inventory_gate_2799.rs` for the supported and
+> unsupported inventories; path support does not imply all methods are
+> supported. **MCP-stdio is
 > structurally SQLite-only** ([#1675](https://github.com/alphaonedev/ai-memory-mcp/issues/1675)):
 > a Postgres-backed deployment serves MCP clients through the HTTP daemon,
 > not `ai-memory mcp`. The certified **PG 18.6 / AGE 1.8.0 / pgvector
-> 0.8.6** stack is now exercised in-PR on every `release/**` PR by
-> `.github/workflows/cert-postgres-age.yml`, which runs the pg-parity and
-> AGE cells `--include-ignored` against the certified image CI builds from
-> `deploy/docker-1461/Dockerfile.pg-age-vector` (SSOT-pinned PG 18.6 / AGE
-> 1.8.0 / pgvector 0.8.6) and hard-fails on any drift from the exact pinned
-> minors;
+> 0.8.6** stack is now exercised in-PR on every `release/**` PR: the
+> `.github/workflows/cert-postgres-age.yml` workflow runs the pg-parity and
+> AGE suites against a per-job database on the runner's native
+> PostgreSQL/AGE/pgvector tier and checks its live versions against the pins
+> in `deploy/docker-1461/provision/lib.sh`, hard-failing on any drift from
+> the exact pinned minors;
 > the PG 16 / AGE 1.6.0 combination in `coverage.yml` is the documented
 > **alternate** matrix (a line-coverage measurement). See §"Certified
 > backend versions" for the exact versions and evidence basis.
@@ -250,12 +253,14 @@ behavior changes here.
   for v1.x (D3-021 → D3-031 → D3-060). `off` opts out.
 - **Agent-attestation default surface-scoped ([#1985](https://github.com/alphaonedev/ai-memory-mcp/issues/1985), resolving [#1981](https://github.com/alphaonedev/ai-memory-mcp/issues/1981)).**
   `AI_MEMORY_REQUIRE_AGENT_ATTESTATION` (env-table row #48) is now
-  tri-state with a per-surface compiled default. With the env unset, an
-  unsigned direct-store write is fail-CLOSED (`403 ATTESTATION_FAILED`)
-  ONLY on the HTTP direct-write surface (`POST /api/v1/memories` +
-  `/memories/bulk`); the MCP `memory_store` and CLI `store` surfaces are
-  the operator-as-actor path and stay permissive (unsigned →
-  `attest_level="claimed"`). This CORRECTS the v0.9.0 #1751
+  tri-state with a per-surface compiled default. With
+  `AI_MEMORY_REQUIRE_AGENT_ATTESTATION` unset, the HTTP-direct default
+  applies to `POST /api/v1/memories`, `POST /api/v1/memories/bulk`, and
+  `POST /api/v1/capture_turn`: an unsigned direct-store write is
+  fail-CLOSED (`403 ATTESTATION_FAILED`), and HTTP capture requires a
+  valid host signature whose key is bound to the caller. MCP
+  `memory_store` and CLI `store` retain their separate operator-as-actor
+  default and stay permissive (unsigned → `attest_level="claimed"`). This CORRECTS the v0.9.0 #1751
   require-everywhere default, which was unsatisfiable on MCP (no MCP host
   can construct/sign the canonical `SignableWrite` envelope — the #1981
   external break). `=1` forces strict on every surface (the v0.9.0
@@ -319,17 +324,19 @@ AGE's release-vote convention; `CREATE EXTENSION age` reports extversion
 1.8.0), installed via the pinned pgdg `postgresql-18-age` `.deb`. As of
 [#2548](https://github.com/alphaonedev/ai-memory-mcp/issues/2548) /
 [#2512](https://github.com/alphaonedev/ai-memory-mcp/issues/2512) the
-AGE/KG + recall-purity suites run against this exact stack in-PR:
-`.github/workflows/cert-postgres-age.yml` BUILDS
-`deploy/docker-1461/Dockerfile.pg-age-vector` — the same recipe the
-docker-1461 mesh ships — with build-args resolved straight from this SSOT
-(`deploy/docker-1461/provision/lib.sh`), runs the resulting image as the
-postgres under test, runs the pg-parity and AGE cells `--include-ignored`,
-and version-asserts the EXACT pinned minors (PostgreSQL 18.6, Apache AGE
-1.8.0, pgvector 0.8.6 — not merely "PG 18" or "pgvector >= 0.8.6") — so the
-certified tier is proven by execution on the cert branch, not merely
-claimed, and CI's build artifact is the SAME artifact the deploy SSOT
-ships (zero drift by construction). The PG 16 / AGE 1.6.0 combination in
+AGE/KG + recall-purity suites run against this exact stack in-PR: the
+`.github/workflows/cert-postgres-age.yml` workflow runs the pg-parity and
+AGE suites (`--include-ignored`) against a per-job database on the
+runner's native PostgreSQL/AGE/pgvector tier and checks its live versions
+against the pins in `deploy/docker-1461/provision/lib.sh` — the EXACT
+pinned minors (PostgreSQL 18.6, Apache AGE 1.8.0, pgvector 0.8.6 — not
+merely "PG 18" or "pgvector >= 0.8.6") — so the certified version triple
+is proven by execution on the cert branch, not merely claimed. The
+workflow does NOT build or run the
+`deploy/docker-1461/Dockerfile.pg-age-vector` image: the former per-PR
+`docker build`/`docker run` path was removed in the v1.0.0 self-hosted CI
+rewrite, so CI certifies the pinned versions, not the deploy image
+artifact itself. The PG 16 / AGE 1.6.0 combination in
 `coverage.yml` remains as the documented alternate matrix.
 
 > **Cross-lane pgvector pin — reconciled ([#2872](https://github.com/alphaonedev/ai-memory-mcp/issues/2872)).**
@@ -394,11 +401,11 @@ exercised in-PR.** `.github/workflows/cert-postgres-age.yml`
 ([#2548](https://github.com/alphaonedev/ai-memory-mcp/issues/2548))
 triggers on `pull_request` + `push` to `release/**`, resolves every
 version pin from the ONE declaration source
-(`deploy/docker-1461/provision/lib.sh`), BUILDS
-`deploy/docker-1461/Dockerfile.pg-age-vector` with those pins as
-build-args (the same recipe the docker-1461 mesh ships — no second,
-drift-prone copy of the pins), runs the resulting image as the postgres
-under test, runs the `#[ignore]`-gated pg-parity binaries AND the
+(`deploy/docker-1461/provision/lib.sh` — no second, drift-prone copy of
+the pins), creates a per-job database on the runner's always-up native
+PostgreSQL/AGE/pgvector tier (no per-PR `docker build`/`docker run` —
+that path was removed in the v1.0.0 self-hosted CI rewrite), runs the
+`#[ignore]`-gated pg-parity binaries AND the
 AGE-backed cells (`AI_MEMORY_TEST_AGE_URL` set, so they stop
 self-skipping) under `--features sal-postgres --include-ignored`, and a
 version-assert step hard-fails on ANY drift from the exact pinned minors
@@ -525,8 +532,11 @@ tier via `cert-postgres-age.yml` and honestly labels the PG 16 alternate.
 - **Power-loss durability knob + named `asi-hard` posture ([#1961](https://github.com/alphaonedev/ai-memory-mcp/issues/1961), R23/R7).**
   `AI_MEMORY_DB_SYNCHRONOUS` (env-table row #128, default `NORMAL`)
   exposes `PRAGMA synchronous` — `FULL`/`EXTRA` fsync the WAL at every
-  commit so an acknowledged write survives a power cut. A fault-injection
-  harness (`AI_MEMORY_TEST_ABORT_AFTER_COMMIT`, row #129) proves it.
+  commit so an acknowledged write is durable on hardware that honours
+  fsync. A fault-injection harness (`AI_MEMORY_TEST_ABORT_AFTER_COMMIT`,
+  row #129) proves crash consistency across an unclean process exit; real
+  power-cut fsync behavior is not yet evidenced (see PERFORMANCE.md,
+  [#3561](https://github.com/alphaonedev/ai-memory-mcp/issues/3561)).
   `AI_MEMORY_SECURITY_PROFILE=asi-hard` (env-table row #130) engages the
   hardened NO-DISABLE posture: at boot it PINS the fail-closed security
   knobs ON (including `DB_SYNCHRONOUS=FULL`) and REFUSES to boot if an
@@ -597,8 +607,10 @@ program:
    ran, DO was the only place that exact triple had been exercised end to
    end; CI has since begun exercising the certified triple in-PR on
    `release/**` — now standardized to PG 18.6 / AGE 1.8.0 / pgvector 0.8.6
-   (operator directive 2026-08-18) — runs `deploy/docker-1461/Dockerfile.pg-age-vector`
-   built to the SSOT-pinned minors, and version-asserts the exact result — see
+   (operator directive 2026-08-18) — the `cert-postgres-age.yml` workflow
+   runs the pg-parity and AGE suites against a per-job database on the
+   runner's native PostgreSQL/AGE/pgvector tier and checks its live
+   versions against the pins in `deploy/docker-1461/provision/lib.sh` — see
    §"Certified backend versions" for the current in-PR posture)
    and attested (this also covers the v0.9.0 4-phase
    ship-gate boundary per ROADMAP §17's recorded exception, ruling
