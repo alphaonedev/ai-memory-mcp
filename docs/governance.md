@@ -105,15 +105,17 @@ owner, so an owner write is not locked out; a non-owner write is refused.
   the effective severed (Owner-floored) policy with `corrupt: true`, not the
   permissive default. Whole-`metadata` corruption also loses the stored owner
   id: the corrupt level has no owner, so the nearest ancestor standard's owner (if any) is the namespace owner, otherwise nobody is until the binding is repaired (fail closed).
-- **Documented limit (depth knobs).** A corrupt level also cannot state
+- **Documented limit (depth knobs).** A corrupt level cannot state
   `require_approval_above_depth` / `skill_promotion_min_depth`: those walks
-  continue to the ancestor (an ancestor's explicit value governs; with none,
-  the documented default applies, i.e. no approval gate), while the Owner floor
-  still gates WRITE at the corrupt level. A corrupt level that meant a stricter
-  depth gate degrades to the inherited one until repaired. For the skill
-  promotion floor only, a walk that passes a corrupt level and finds no explicit
-  value fails closed to `u32::MAX` (no promotion) until the standard is
-  repaired; an unconfigured chain keeps the default of 1.
+  continue to the ancestor, and an ancestor's explicit value governs. A walk
+  that passed a corrupt level and finds **no** explicit value anywhere fails
+  closed instead of reading as "no gate": the approval threshold resolves to
+  `0` (every reflection needs approval) and the skill-promotion floor to
+  `u32::MAX` (no promotion), until the standard is repaired. Only a chain with
+  no corrupt level and no explicit value keeps the documented default (no
+  approval gate; promotion floor 1). The Owner floor still gates WRITE at the
+  corrupt level. A corrupt level that meant a stricter depth gate than the
+  inherited one degrades to the inherited value until repaired.
 - **Repair.** Re-run `memory_namespace_set_standard` for the namespace with a
   valid policy; the row is then read normally and no floor is applied.
 - **Documented limit.** A corrupt policy that *meant* something stricter than
