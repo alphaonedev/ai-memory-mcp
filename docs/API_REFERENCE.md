@@ -33,7 +33,15 @@ x-api-key: <key>
 
 The header is the **only** credential channel.
 
-Failure → **401** `{"error": "missing or invalid API key"}`.
+Missing or invalid credentials on authenticated routes **ordinarily**
+return **401** `{"error": "missing or invalid API key"}`. The 401 is not
+invariant: source-IP authentication backoff (#2502) answers **429**
+`{"error": "auth_backoff"}` with `Retry-After` once a source has failed
+often enough, and it is consulted **before** the presented key is
+compared — so a backed-off source is refused with 429 even when it
+finally presents the right key. Route-specific authentication bypasses
+(`/api/v1/health`, and the mTLS-cleared `/api/v1/sync/*` lane) remain
+separately scoped.
 
 > **BREAKING CHANGE at v1.0.0 — `?api_key=` query credential REMOVED**
 > ([#2032](https://github.com/alphaonedev/ai-memory-mcp/issues/2032) L1;
