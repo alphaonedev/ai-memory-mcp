@@ -23133,19 +23133,21 @@ fn warn_severed_floor_applied(severed_namespace: &str, resolving_for: &str) {
 /// v0.7.0 L2-6 — read `governance.skill_promotion_min_depth` from the
 /// namespace's most-specific governance metadata blob, leaf-first.
 ///
-/// Mirrors [`resolve_require_approval_above_depth`] in shape and walk
-/// semantics: it's a free function (not a [`GovernancePolicy`] field)
-/// so it can land without churning every `GovernancePolicy { … }`
-/// literal in the codebase, and it's a per-namespace threshold rather
-/// than part of the resolved enforcement policy.
+/// Mirrors [`resolve_require_approval_above_depth`] (GOD final ruling,
+/// leaf-first-wins #2542): an explicit integer decides (overflow saturates to
+/// `u32::MAX`); an explicit `null` or a missing standard keeps walking; a
+/// well-formed policy that OMITS the key stops the walk; a corrupt or
+/// non-integer level keeps walking and, if the walk ends with nothing explicit
+/// after passing one, the floor is `u32::MAX` (no promotion). It's a free
+/// function (not a [`GovernancePolicy`] field) so it can land without churning
+/// every `GovernancePolicy { … }` literal, and it's a per-namespace threshold
+/// rather than part of the resolved enforcement policy.
 ///
-/// Returns `None` when:
-/// - no namespace standard is configured at any level of the chain, OR
-/// - the standard's `metadata.governance` blob is absent or null, OR
-/// - the blob does not contain a `skill_promotion_min_depth` key, OR
-/// - the key is present but `null`.
+/// Returns `None` when no level states a floor (no standard anywhere, or a
+/// well-formed policy that omits the key ended the walk) and no corrupt level
+/// was passed.
 ///
-/// Returns `Some(threshold)` when the key is a non-null unsigned integer.
+/// Returns `Some(threshold)` when a level's key is an unsigned integer.
 /// The `memory_skill_promote_from_reflection` MCP tool falls back to the
 /// compiled-in default of `1` when this returns `None` — a reflection
 /// must have at least one level of synthesised insight (depth ≥ 1)
