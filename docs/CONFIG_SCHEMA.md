@@ -495,7 +495,13 @@ consumes the corresponding `Resolved*` struct produced by these
 methods:
 
 - `AppConfig::resolve_llm(cli_backend, cli_model, cli_base_url)`
-- `AppConfig::resolve_llm_auto_tag()`
+- `AppConfig::resolve_llm_auto_tag()` — the one EXCEPTION to the sentence
+  above: at v1.0.0 it has no production caller (test-only, `src/config.rs:14055`
+  / `:14067` / `:14083`, all inside the `#[cfg(test)] mod tests` block at
+  `src/config.rs:10681`). Production consumes only `[llm.auto_tag].model`,
+  threaded through the PRIMARY `[llm]` client; its `backend` / `base_url` /
+  `api_key_env` / `api_key_file` are parsed, WARNed about at boot, and
+  otherwise ignored (#3808, #3902).
 - `AppConfig::resolve_embeddings()` — #1598: full per-field ladder
   (`AI_MEMORY_EMBED_*` env > `[embeddings]` section > legacy flat
   `embed_url`/`embedding_model`/`ollama_url` > compiled default), embed
@@ -703,8 +709,17 @@ operator does not override:
 | `vllm`           | `http://localhost:8000/v1`                        | `local-model`                                   |
 | `openai-compatible` | _(no meaningful default — operator must set `base_url`; the env-var path errors without it)_ | `gemma3:4b` (legacy fallthrough)                |
 
-Alias URLs for both `[llm]` and `[llm.auto_tag]` are resolved from the same
-canonical table as the environment-based client. Only `ollama` defaults to
+Alias URLs for `[llm]` are resolved from the same canonical table as the
+environment-based client. At v1.0.0 that resolution reaches production for
+`[llm]` ONLY: `AppConfig::resolve_llm_auto_tag` (`src/config.rs:9546`) does
+resolve an alias URL from the same canonical table for `[llm.auto_tag]`, but
+it has no production caller — its only callers are test cells inside the
+`#[cfg(test)] mod tests` block that begins at `src/config.rs:10681`
+(`src/config.rs:14055`, `:14067`, `:14083`). Production threads only the
+`[llm.auto_tag].model` string through the PRIMARY `[llm]` client, so setting
+`[llm.auto_tag].base_url` — or an aliased `[llm.auto_tag].backend` — does NOT
+point auto-tagging at a different endpoint, and the daemon WARNs at boot that
+the key is ignored (#3808, #3811, #3902). Only `ollama` defaults to
 port 11434; `vllm` defaults to port 8000 with `/v1`. `openai-compatible`
 requires an explicit `base_url`. An unknown or misspelled backend has no
 default URL and is refused by client construction and the LLM reachability
