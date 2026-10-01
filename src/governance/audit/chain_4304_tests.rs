@@ -85,6 +85,7 @@ fn writer_for(dir: &Path) -> ChainWriter {
             at: None,
         },
         file: None,
+        lock_contended_until: None,
     }
 }
 
@@ -377,4 +378,105 @@ fn a_planted_fifo_lock_file_does_not_hang_4304() {
     w.append(pending("ai:row-a")).expect("append");
     assert!(crate::metrics::forensic_lock_unavailable_count() > before);
     assert_eq!(rows(tmp.path()).len(), 1);
+}
+
+/// #4352 — a lock file that already exists wider than 0600 is tightened on
+/// the next append (`mode` alone applies only at creation).
+#[cfg(unix)]
+#[test]
+fn an_existing_wide_lock_file_is_made_owner_only_4352() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let _g = lock();
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join(FORENSIC_LOCK_FILE);
+    std::fs::write(&path, b"").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let mut w = writer_for(tmp.path());
+    w.append(pending("ai:row-a")).expect("append");
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o600, "mode {mode:o}");
+    assert_eq!(rows(tmp.path()).len(), 1);
+}
+
+fn hold_lock(dir: &Path) -> File {
+    let holder = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(dir.join(FORENSIC_LOCK_FILE))
+        .unwrap();
+    holder.lock().unwrap();
+    holder
+}
+
+/// #4353 — a lock held for good costs the FIRST append the full budget and
+/// every later one only the short breaker wait; all rows land, all counted.
+#[test]
+fn a_persistently_held_lock_costs_later_rows_only_the_breaker_wait_4353() {
+    let _g = lock();
+    let tmp = TempDir::new().unwrap();
+    let holder = hold_lock(tmp.path());
+    let before = crate::metrics::forensic_lock_unavailable_count();
+    let mut w = writer_for(tmp.path());
+    let t0 = std::time::Instant::now();
+    w.append(pending("ai:row-a")).expect("a");
+    assert!(
+        t0.elapsed() >= FORENSIC_LOCK_BUDGET,
+        "first row waits the budget"
+    );
+    assert!(w.lock_contended_until.is_some(), "the breaker opened");
+    let t1 = std::time::Instant::now();
+    for i in 0..3 {
+        w.append(pending(&format!("ai:row-{i}"))).expect("later");
+    }
+    let later = t1.elapsed();
+    assert!(
+        later < FORENSIC_LOCK_BUDGET,
+        "three rows inside the window cost less than one budget ({later:?})"
+    );
+    assert!(
+        later >= LOCK_BREAKER_WAIT * 3,
+        "each still waited ({later:?})"
+    );
+    assert!(crate::metrics::forensic_lock_unavailable_count() >= before + 4);
+    let recs = rows(tmp.path());
+    assert_eq!(recs.len(), 4);
+    assert_one_chain(&recs);
+    holder.unlock().unwrap();
+}
+
+/// #4353 — once the holder lets go, the next append takes the lock and the
+/// breaker closes.
+#[test]
+fn a_released_lock_closes_the_breaker_4353() {
+    let _g = lock();
+    let tmp = TempDir::new().unwrap();
+    let holder = hold_lock(tmp.path());
+    let mut w = writer_for(tmp.path());
+    w.lock_contended_until = std::time::Instant::now().checked_add(LOCK_BREAKER_WINDOW);
+    w.append(pending("ai:row-a")).expect("a");
+    assert!(w.lock_contended_until.is_some(), "still held: still open");
+    holder.unlock().unwrap();
+    drop(holder);
+    let before = crate::metrics::forensic_lock_unavailable_count();
+    w.append(pending("ai:row-b")).expect("b");
+    assert!(
+        w.lock_contended_until.is_none(),
+        "the lock was taken: closed"
+    );
+    assert_eq!(crate::metrics::forensic_lock_unavailable_count(), before);
+}
+
+/// #4353 — an expired window waits the full budget again.
+#[test]
+fn an_expired_breaker_window_waits_the_full_budget_4353() {
+    let _g = lock();
+    let tmp = TempDir::new().unwrap();
+    let holder = hold_lock(tmp.path());
+    let mut w = writer_for(tmp.path());
+    w.lock_contended_until = std::time::Instant::now().checked_sub(LOCK_BREAKER_WAIT);
+    let t0 = std::time::Instant::now();
+    w.append(pending("ai:row-a")).expect("a");
+    assert!(t0.elapsed() >= FORENSIC_LOCK_BUDGET);
+    holder.unlock().unwrap();
 }

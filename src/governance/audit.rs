@@ -1346,6 +1346,7 @@ pub fn init(dir: &Path, signing_key: Option<SigningKey>) -> Result<()> {
             at: None,
         },
         file: None,
+        lock_contended_until: None,
     });
     *guard = Some(ForensicSink {
         dir: dir.to_path_buf(),
@@ -1563,6 +1564,11 @@ struct ChainWriter {
     signing_key: Option<SigningKey>,
     cursor: ChainCursor,
     file: Option<(PathBuf, File)>,
+    /// #4353 — set when the lock could not be taken; until then an append
+    /// waits only [`LOCK_BREAKER_WAIT`] for it, so a holder that never lets go
+    /// costs each row that, not the full [`FORENSIC_LOCK_BUDGET`]. Any
+    /// successful lock clears it.
+    lock_contended_until: Option<std::time::Instant>,
 }
 
 static CHAIN: OnceLock<Mutex<Option<ChainWriter>>> = OnceLock::new();
@@ -1581,6 +1587,15 @@ struct DirLock(File);
 /// the bound the append goes ahead unlocked, counted.
 pub const FORENSIC_LOCK_BUDGET: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// #4353 — after the lock could not be taken, for this long an append waits
+/// only [`LOCK_BREAKER_WAIT`] (the 30 s cool-down of the LLM circuit breaker,
+/// `src/llm.rs`). Each further failure extends it; a successful lock ends it.
+const LOCK_BREAKER_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// #4353 — the wait inside the breaker window: long enough for a legitimate
+/// holder (one tail check and one write) to finish.
+const LOCK_BREAKER_WAIT: std::time::Duration = std::time::Duration::from_millis(50);
+
 /// The first and the largest pause between two `try_lock` attempts.
 const LOCK_RETRY_FIRST: std::time::Duration = std::time::Duration::from_millis(1);
 const LOCK_RETRY_MAX: std::time::Duration = std::time::Duration::from_millis(50);
@@ -1590,10 +1605,6 @@ impl DirLock {
     /// The caller then re-reads the tail on every append: still correct for
     /// this process, but two unlocked appenders can interleave, so it is
     /// WARNed (once) and counted.
-    fn acquire(dir: &Path) -> Option<Self> {
-        Self::acquire_within(dir, FORENSIC_LOCK_BUDGET)
-    }
-
     fn acquire_within(dir: &Path, budget: std::time::Duration) -> Option<Self> {
         let path = dir.join(FORENSIC_LOCK_FILE);
         let mut options = OpenOptions::new();
@@ -1605,6 +1616,7 @@ impl DirLock {
             options.mode(0o600);
         }
         let locked = open_forensic_file(&mut options, &path).and_then(|f| {
+            tighten_lock_file_mode(&f, &path);
             lock_within(&f, budget)?;
             Ok(f)
         });
@@ -1625,6 +1637,39 @@ impl DirLock {
         }
     }
 }
+
+/// #4352 — `mode(0o600)` applies only when the lock file is CREATED. A lock
+/// file that already exists wider (an earlier build, a hand-made file, a
+/// different creation path) is tightened through the opened handle, so no
+/// other user can open it to hold the lock. Best effort: a file this process
+/// does not own cannot be changed, which is WARNed once; the lock is still
+/// used.
+#[cfg(unix)]
+fn tighten_lock_file_mode(f: &File, path: &Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let Ok(meta) = f.metadata() else {
+        return;
+    };
+    if meta.permissions().mode() & 0o077 == 0 {
+        return;
+    }
+    if let Err(e) = f.set_permissions(std::fs::Permissions::from_mode(0o600)) {
+        if !LOCK_MODE_WARNED.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                target: AUDIT_TRACE_TARGET,
+                "forensic: {} is readable by other users and could not be made owner-only: \
+                 {e}; another user can hold the lock and slow every append (#4352)",
+                path.display()
+            );
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn tighten_lock_file_mode(_f: &File, _path: &Path) {}
+
+#[cfg(unix)]
+static LOCK_MODE_WARNED: AtomicBool = AtomicBool::new(false);
 
 /// Take `f`'s exclusive lock, retrying a held lock with backoff until
 /// `budget` is spent; then `TimedOut`.
@@ -1676,8 +1721,30 @@ fn append_to_chain(row: PendingRow) -> Result<()> {
 }
 
 impl ChainWriter {
+    /// #4353 — the forensic lock, waiting the full budget normally and only
+    /// [`LOCK_BREAKER_WAIT`] while a recent attempt found it held. The short
+    /// wait (not zero) still lets a legitimate holder, which keeps the lock for
+    /// milliseconds, finish first, so the breaker does not turn every ordinary
+    /// near-simultaneous writer into an unlocked one (vote 82ab94ec).
+    fn acquire_lock(&mut self) -> Option<DirLock> {
+        let now = std::time::Instant::now();
+        let contended = self.lock_contended_until.is_some_and(|until| now < until);
+        let budget = if contended {
+            LOCK_BREAKER_WAIT
+        } else {
+            FORENSIC_LOCK_BUDGET
+        };
+        let lock = DirLock::acquire_within(&self.dir, budget);
+        self.lock_contended_until = if lock.is_some() {
+            None
+        } else {
+            now.checked_add(LOCK_BREAKER_WINDOW)
+        };
+        lock
+    }
+
     fn append(&mut self, row: PendingRow) -> Result<()> {
-        let lock = DirLock::acquire(&self.dir);
+        let lock = self.acquire_lock();
         let path = daily_path(&self.dir, &row.now);
         // Fast path only when locked and the file is exactly as this process
         // left it: nobody else has written since, so the cached head is the
