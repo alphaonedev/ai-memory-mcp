@@ -12,6 +12,8 @@
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use prometheus::core::{Collector, Desc};
+use prometheus::proto::MetricFamily;
 use prometheus::{
     Encoder, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec,
     Registry, TextEncoder,
@@ -312,6 +314,11 @@ pub struct Metrics {
     /// dequarantine. Closes the #2444 silent-hide anti-pattern (the
     /// quarantine used to emit nothing while `/sync/push` returned 200).
     pub federation_quarantined_unattributed: IntCounter,
+
+    /// v1.0.0 #4199 — monotonic count of process starts whose forensic
+    /// audit sink was unavailable (its chain tail could not be established),
+    /// so the process ran WITHOUT it instead of forking the chain at genesis.
+    pub forensic_sink_unavailable: IntCounter,
 
     /// v1.0.0 #3699 (5-agent vote 4d3ea1c5) — monotonic count of inbound
     /// federated memories folded into a LOCAL row of a DIFFERENT id by the
@@ -1107,6 +1114,21 @@ impl Metrics {
             &mut err,
         );
 
+        // v1.0.0 #4199 — the forensic sink was unavailable at boot (no fork).
+        let forensic_sink_unavailable = int_counter(
+            &registry,
+            "ai_memory_forensic_sink_unavailable_total",
+            "Monotonic count of forensic-log integrity events at process start: \
+             the chain tail could not be established (an I/O error, or no parseable \
+             row in any non-empty file), so the process ran WITHOUT the sink instead \
+             of forking the signed chain at genesis (#4199); or a forensic file dated \
+             after today was found and skipped (#4203); or the sink cannot append (a \
+             read-only directory or daily file at start-up, or a failed open or append \
+             that dropped a row at run time, #4302). Any non-zero value needs an \
+             operator.",
+            &mut err,
+        );
+
         // #2966 (L6 5-agent vote 4d3ea1c5) — route-IN quarantine
         // observability. The provenance gate used to flip a row to
         // lifecycle_state=quarantined and emit NOTHING while /sync/push
@@ -1498,6 +1520,9 @@ impl Metrics {
             return Err(e);
         }
 
+        // #3651 — the operational log pipeline, read at scrape time.
+        registry.register(Box::new(LogPipelineCollector::new()?))?;
+
         Ok(Self {
             registry,
             store_total,
@@ -1539,6 +1564,7 @@ impl Metrics {
             federation_push_dlq_legacy_positional,
             federation_erasure_superseded,
             federation_quarantined_unattributed,
+            forensic_sink_unavailable,
             federation_cross_id_title_merge,
             operator_dequarantined,
             hnsw_evictions_total,
@@ -1699,6 +1725,19 @@ pub fn record_auto_export_spawn_failed() {
 /// quarantine knob (`AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED`) is off.
 pub fn inc_fed_quarantined_unattributed() {
     registry().federation_quarantined_unattributed.inc();
+}
+
+/// v1.0.0 #4199 — record that this process runs without the forensic audit
+/// sink (its chain tail could not be established). Pairs with the ERROR, the
+/// doctor Critical and the signed `audit.forensic_sink_unavailable` row.
+pub fn inc_forensic_sink_unavailable() {
+    registry().forensic_sink_unavailable.inc();
+}
+
+/// v1.0.0 #4199 — read [`inc_forensic_sink_unavailable`]'s counter.
+#[must_use]
+pub fn forensic_sink_unavailable_count() -> u64 {
+    registry().forensic_sink_unavailable.get()
 }
 
 /// v1.0.0 #3124 — record `rows` caller-scoped mutations admitted on
@@ -1920,6 +1959,115 @@ pub fn auto_export_spawn_failed_count() -> u64 {
     registry().auto_export_spawn_failed_total.get()
 }
 
+/// #3651 — failed writes and flushes of the operational log sink. Named by
+/// the sink's stderr diagnostic so an operator can go from one to the other.
+pub const LOG_WRITE_FAILURES_TOTAL: &str = "ai_memory_log_write_failures_total";
+
+/// #3651 — the operational log pipeline's state and delivery counters. They
+/// are owned by the worker-side writer in [`crate::logging`], so this
+/// collector reads a snapshot at scrape time rather than mirroring them into
+/// separately-updated metrics that could drift. The counters are emitted only
+/// while a pipeline is active: a number nothing measured is never exposed as
+/// zero.
+struct LogPipelineCollector {
+    active: IntGauge,
+    delivered: IntCounter,
+    write_failures: IntCounter,
+    queue_dropped: IntCounter,
+    last_delivery: IntGauge,
+    // Serialises scrapes: a counter is reset and re-set per collect.
+    scrape: std::sync::Mutex<()>,
+}
+
+impl LogPipelineCollector {
+    fn new() -> prometheus::Result<Self> {
+        Ok(Self {
+            active: IntGauge::new(
+                "ai_memory_log_pipeline_active",
+                "1 when the configured operational log sink is installed and \
+                 receiving events; 0 when logging is disabled. A sink that fails at \
+                 boot refuses the boot, so a running daemon never reports a failed \
+                 sink here; `ai-memory doctor` does (#3651).",
+            )?,
+            delivered: IntCounter::new(
+                "ai_memory_log_records_delivered_total",
+                "Log records written to the configured sink without error (#3651).",
+            )?,
+            write_failures: IntCounter::new(
+                LOG_WRITE_FAILURES_TOTAL,
+                "Failed writes and flushes of the configured log sink; each lost at \
+                 least one record (#3651).",
+            )?,
+            queue_dropped: IntCounter::new(
+                "ai_memory_log_queue_dropped_total",
+                "Log records dropped because the sink's worker queue was full (#3651).",
+            )?,
+            last_delivery: IntGauge::new(
+                "ai_memory_log_last_delivery_seconds",
+                "UNIX time of the most recent successful log delivery. Absent until \
+                 the first delivery: there is no time to report yet (#3651).",
+            )?,
+            scrape: std::sync::Mutex::new(()),
+        })
+    }
+}
+
+impl Collector for LogPipelineCollector {
+    fn desc(&self) -> Vec<&Desc> {
+        [
+            self.active.desc(),
+            self.delivered.desc(),
+            self.write_failures.desc(),
+            self.queue_dropped.desc(),
+            self.last_delivery.desc(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+
+    fn collect(&self) -> Vec<MetricFamily> {
+        self.families_for(&crate::logging::log_pipeline_status())
+    }
+}
+
+impl LogPipelineCollector {
+    /// Render `status` as metric families. A value nothing measured is
+    /// omitted, never rendered as `0`: absence is how a series says
+    /// "unknown", and a consumer does arithmetic on any number it sees.
+    fn families_for(&self, status: &crate::logging::LogPipelineStatus) -> Vec<MetricFamily> {
+        let _serialised = self
+            .scrape
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let is_active = status.state == crate::logging::LogPipelineState::Active;
+        self.active.set(i64::from(is_active));
+        let mut families = self.active.collect();
+        if !is_active {
+            return families;
+        }
+        for (counter, value) in [
+            (&self.delivered, status.records_delivered),
+            (&self.write_failures, status.write_failures),
+            (&self.queue_dropped, status.queue_dropped),
+        ] {
+            let Some(value) = value else { continue };
+            counter.reset();
+            counter.inc_by(value);
+            families.extend(counter.collect());
+        }
+        // No series until the first successful delivery. A `0` here would be
+        // 1970-01-01, so `time() - ai_memory_log_last_delivery_seconds > 300`
+        // would fire on every fresh node and then be muted.
+        if let Some(ms) = status.last_delivery_unix_ms {
+            self.last_delivery
+                .set(i64::try_from(ms / 1000).unwrap_or(i64::MAX));
+            families.extend(self.last_delivery.collect());
+        }
+        families
+    }
+}
+
 /// Render the current registry state to the Prometheus text exposition
 /// format. Ignores errors from the encoder (unreachable in practice) and
 /// returns an empty string — the scrape returns 200 with a possibly-empty
@@ -2000,6 +2148,64 @@ pub fn curator_cycle_completed(
 mod tests {
     use super::*;
     use crate::models::Tier;
+
+    /// #3651: an active pipeline that has not delivered yet exports NO
+    /// last-delivery series (a `0` would read as 1970-01-01), and a counter
+    /// nothing measured is omitted rather than rendered as `0`.
+    #[test]
+    fn log_pipeline_omits_values_nothing_measured_3651() {
+        use crate::logging::{LogPipelineState, LogPipelineStatus};
+        const LAST: &str = "ai_memory_log_last_delivery_seconds";
+        let names = |families: &[MetricFamily]| -> Vec<String> {
+            families.iter().map(|f| f.get_name().to_string()).collect()
+        };
+        let collector = LogPipelineCollector::new().expect("collector");
+        let mut status = LogPipelineStatus {
+            state: LogPipelineState::Active,
+            sink: None,
+            records_delivered: Some(0),
+            write_failures: Some(0),
+            queue_dropped: None,
+            last_delivery_unix_ms: None,
+            failure: None,
+        };
+
+        let before = names(&collector.families_for(&status));
+        assert!(
+            !before.iter().any(|n| n == LAST),
+            "no delivery yet: {before:?}"
+        );
+        assert!(
+            !before
+                .iter()
+                .any(|n| n == "ai_memory_log_queue_dropped_total"),
+            "an unmeasured counter is omitted: {before:?}"
+        );
+        assert!(
+            before
+                .iter()
+                .any(|n| n == "ai_memory_log_records_delivered_total")
+        );
+
+        status.last_delivery_unix_ms = Some(1_757_000_000_123);
+        let after = collector.families_for(&status);
+        let family = after
+            .iter()
+            .find(|f| f.get_name() == LAST)
+            .expect("the series appears after the first delivery");
+        let secs = family.get_metric()[0].get_gauge().get_value();
+        assert!(
+            (secs - 1_757_000_000.0).abs() < 0.5,
+            "whole seconds, got {secs}"
+        );
+
+        status.state = LogPipelineState::NotConfigured;
+        assert_eq!(
+            names(&collector.families_for(&status)),
+            vec!["ai_memory_log_pipeline_active".to_string()],
+            "a disabled pipeline reports only that it is not active"
+        );
+    }
 
     #[test]
     fn registry_is_singleton() {

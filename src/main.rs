@@ -39,7 +39,8 @@ use ai_memory::tls;
 //   - `subscriptions::validate_hmac_secret_hex` — subscriptions tests
 //   - `permissions::set_active_permission_rules` — permissions tests
 //   - `logging::init_file_logging` / `audit::init_from_config` — their
-//     own module tests
+//     own module tests; the #3651 sink-failure refusal (exit 78) and its
+//     `doctor` exception drive the real binary in `tests/logging_pipeline_3651.rs`
 //   - `init_forensic_audit` — see `tests::init_forensic_audit_*` below
 //   - `daemon_runtime::run` — the serve_*/cli_*/cov_* integration suite
 // The `std::process::exit(78)` arm (invalid hmac secret) is documented
@@ -357,13 +358,42 @@ fn main() -> Result<()> {
     // disabled. The `_log_guard` MUST stay in scope for the lifetime
     // of the process — when dropped it flushes the non-blocking
     // tracing writer to disk.
-    let _log_guard =
-        logging::init_file_logging(&app_config.effective_logging()).unwrap_or_else(|e| {
-            eprintln!("ai-memory: file logging init failed (continuing without): {e}");
+    //
+    // #3651 (5-agent vote, 5/5): an operator who enabled logging and whose
+    // selected sink cannot be initialised gets a refusal, not a process
+    // that runs while its collector receives nothing. `doctor` is the one
+    // exception, so the failure stays diagnosable (the #2386 precedent).
+    let _log_guard = match logging::init_file_logging(&app_config.effective_logging()) {
+        Ok(guard) => guard,
+        Err(e) if is_doctor => {
+            eprintln!(
+                "ai-memory: the configured log sink failed to initialise; `doctor` \
+                 continues so it can report it: {e:#}"
+            );
             None
-        });
+        }
+        Err(e) => {
+            eprintln!("{}", logging::boot_refusal_message(&e));
+            std::process::exit(config::EX_CONFIG);
+        }
+    };
+    // #3651 audit half (5-agent vote, 5/5 A, decision memory 25844fe7): the
+    // audit trail is off unless the operator enables it, so an enabled trail
+    // that cannot initialise (an explicit `hash_chain = false`, a mismatched
+    // `schema_version`, or an audit directory / file that cannot be created or
+    // opened) refuses boot exactly like the log sink above. Before this it
+    // printed "continuing without" and ran with NO audit trail, the opposite
+    // of every documented outcome. `doctor` stays runnable.
     if let Err(e) = audit::init_from_config(&app_config.effective_audit()) {
-        eprintln!("ai-memory: audit init failed (continuing without): {e}");
+        if is_doctor {
+            eprintln!(
+                "ai-memory: the audit trail failed to initialise; `doctor` \
+                 continues so the rest of its report is available: {e:#}"
+            );
+        } else {
+            eprintln!("{}", audit::boot_refusal_message(&e));
+            std::process::exit(config::EX_CONFIG);
+        }
     }
 
     // v0.7.0 #697 — bootstrap the Ed25519-signed forensic governance
@@ -374,12 +404,31 @@ fn main() -> Result<()> {
     // and swallowed so a missing key never blocks daemon startup.
     // #3354 — the WRITE PATH: a ledger-writing command gets its signing key
     // ensured (generated when absent) before its first row, or does not start.
-    init_forensic_audit(
+    if let Err(e) = init_forensic_audit(
         &app_config,
         hosts_ledger_writers(&cli.command),
         ledger_writer(&cli.command),
         is_key_provisioning_verb(&cli.command),
-    )?;
+        &app_config.effective_db_explicit(cli.db.as_deref()),
+    ) {
+        // #4199 — only under AI_MEMORY_REQUIRE_FORENSIC_SINK (pinned by
+        // asi-hard) does an unavailable forensic sink reach here: refuse,
+        // like the flat trail (#3651/#4190); `doctor` still runs.
+        if e.downcast_ref::<ai_memory::governance::audit::ForensicTailUnreadable>()
+            .is_none()
+        {
+            return Err(e);
+        }
+        if is_doctor {
+            eprintln!(
+                "ai-memory: the forensic audit log failed to initialise; `doctor` \
+                 continues so the rest of its report is available: {e:#}"
+            );
+        } else {
+            eprintln!("{}", ai_memory::governance::audit::boot_refusal_message(&e));
+            std::process::exit(config::EX_CONFIG);
+        }
+    }
 
     // v1.0.0 L4 (PR-3) — resolve the out-of-band audit pin HERE, in the same
     // SYNCHRONOUS pre-runtime phase as the posture enforcement above (the #1889
@@ -601,6 +650,7 @@ fn init_forensic_audit(
     hosts_writers: bool,
     ledger_writer: bool,
     key_provisioning: bool,
+    db_path: &std::path::Path,
 ) -> Result<()> {
     let audit_cfg = app_config.effective_audit();
     // Resolve the daemon's agent_id with the standard precedence chain.
@@ -663,15 +713,156 @@ fn init_forensic_audit(
     // (#3354), never a plain load that could predate generation.
     ai_memory::governance::audit::init_audit_signers(signing_key.as_ref());
     let log_path = ai_memory::audit::resolve_audit_path(&audit_cfg);
+    let record = hosts_writers || ledger_writer;
     let Some(dir) = log_path.parent() else {
-        eprintln!("ai-memory: forensic init skipped (could not resolve audit dir)");
-        return Ok(());
+        // #4272 — no forensic directory means no sink: the same outcome as any
+        // other failure to start it, never a silent skip.
+        return forensic_sink_unavailable(
+            ai_memory::governance::audit::ForensicTailUnreadable {
+                path: log_path.clone(),
+                cause: "the forensic audit directory could not be resolved".to_string(),
+            },
+            record,
+            db_path,
+        );
     };
     warn_if_plaintext_retention_requested(&audit_cfg);
-    if let Err(e) = ai_memory::governance::audit::init(dir, signing_key) {
-        eprintln!("ai-memory: forensic audit init failed (continuing unsigned): {e}");
+    let init_result = ai_memory::governance::audit::init(dir, signing_key);
+    report_future_dated_forensic_files(dir, record, db_path);
+    if let Err(e) = init_result {
+        // #4272 — EVERY failure to start the sink is "forensic sink
+        // unavailable", not only an unreadable tail: an uncreatable directory,
+        // a writer that cannot be spawned, a poisoned lock. It used to print
+        // "continuing unsigned" and exit 0 with NO sink, even under
+        // AI_MEMORY_REQUIRE_FORENSIC_SINK.
+        let unavailable = match e.downcast::<ai_memory::governance::audit::ForensicTailUnreadable>()
+        {
+            Ok(typed) => typed,
+            Err(other) => ai_memory::governance::audit::ForensicTailUnreadable {
+                path: dir.to_path_buf(),
+                cause: format!("{other:#}"),
+            },
+        };
+        return forensic_sink_unavailable(unavailable, record, db_path);
     }
     Ok(())
+}
+
+/// #4199 / #4272 — the forensic sink could not be started. Under
+/// `AI_MEMORY_REQUIRE_FORENSIC_SINK` (pinned by `asi-hard`) this is the typed
+/// refusal the caller turns into exit 78 (`doctor` exempt). Otherwise the
+/// process runs WITHOUT the sink (never a genesis fork) and says so four ways:
+/// an ERROR, the metric, the doctor Critical, and (from the ledger-writing
+/// verbs only) the signed outage row.
+fn forensic_sink_unavailable(
+    unavailable: ai_memory::governance::audit::ForensicTailUnreadable,
+    record: bool,
+    db_path: &std::path::Path,
+) -> Result<()> {
+    use ai_memory::governance::audit as forensic;
+    if forensic::require_forensic_sink_enabled() {
+        return Err(anyhow::Error::new(unavailable));
+    }
+    let e = anyhow::Error::new(unavailable.clone());
+    eprintln!("{}", forensic::degraded_boot_message(&e));
+    tracing::error!(target: "ai_memory::audit", "forensic sink unavailable: {e:#}");
+    ai_memory::metrics::inc_forensic_sink_unavailable();
+    // The signed outage row is written only by the verbs that write the
+    // ledger (f2r review of 15fde1499): `doctor`, the egress and remediation
+    // verbs and the read-only verbs must never open, let alone migrate, the
+    // store from here.
+    if record {
+        record_forensic_outage(db_path, &unavailable);
+    }
+    Ok(())
+}
+
+/// #4203 (f2r review of 15fde1499) — a future-dated forensic file is never
+/// the tail. Reported on every verb (ERROR + metric; `doctor` reports it as
+/// Critical) and, from the ledger-writing verbs only, attested by the same
+/// deduplicated signed outage row, because a backward clock step can make it
+/// the cause of a fork.
+fn report_future_dated_forensic_files(
+    dir: &std::path::Path,
+    record: bool,
+    db_path: &std::path::Path,
+) {
+    use ai_memory::governance::audit as forensic;
+    for file in forensic::future_dated_forensic_files(dir) {
+        eprintln!(
+            "ai-memory: ERROR: forensic file {} is dated after today (UTC); it is never used \
+             as the chain tail and is left in place. Check the system clock.",
+            file.display()
+        );
+        ai_memory::metrics::inc_forensic_sink_unavailable();
+        if record {
+            record_forensic_outage(db_path, &forensic::future_dated_outage(&file));
+        }
+    }
+}
+
+/// #4199 — append the signed `audit.forensic_sink_unavailable` row to the
+/// EXISTING database (best-effort). The library call opens without migrating,
+/// writes only on a store already at this binary's schema, and appends nothing
+/// when the newest outage row records the same `(path, cause)`.
+fn record_forensic_outage(
+    db_path: &std::path::Path,
+    err: &ai_memory::governance::audit::ForensicTailUnreadable,
+) {
+    use ai_memory::governance::audit::{OutageRecord, record_forensic_sink_unavailable};
+    if process_store_is_postgres() {
+        // #4199 A1 (GOD ruling) — deferred to the postgres store this process
+        // opens: `PostgresStore` attests it right after it connects. A verb
+        // that never opens its store records nothing, and the note says so.
+        eprintln!(
+            "ai-memory: the forensic-sink outage is recorded in the postgres signed_events \
+             chain when this process opens its store; a command that does not open the store \
+             does not record it (reported on stderr, by the metric and by `ai-memory doctor`)"
+        );
+        ai_memory::governance::audit::defer_forensic_outage(err.clone());
+        return;
+    }
+    match record_forensic_sink_unavailable(db_path, err) {
+        Ok(OutageRecord::Recorded | OutageRecord::Duplicate) => {}
+        Ok(OutageRecord::Skipped(why)) => {
+            eprintln!(
+                "ai-memory: the forensic-sink outage was NOT recorded in signed_events: {why}"
+            );
+        }
+        Err(e) => eprintln!(
+            "ai-memory: the forensic-sink outage was NOT recorded in signed_events ({}): {e:#}",
+            db_path.display()
+        ),
+    }
+}
+
+/// #4199 (f2r review of 15fde1499) — is this process's store postgres? Checks
+/// the two env channels and any `--store-url` on the command line, whichever
+/// verb carries it: a postgres-backed process must never have its outage
+/// written into a stray local sqlite file instead.
+fn process_store_is_postgres() -> bool {
+    use ai_memory::store_url::{is_postgres_url, resolve_store_url};
+    if resolve_store_url(None)
+        .ok()
+        .flatten()
+        .is_some_and(|u| is_postgres_url(&u))
+    {
+        return true;
+    }
+    let mut args = std::env::args();
+    while let Some(arg) = args.next() {
+        let url = if let Some(value) = arg.strip_prefix("--store-url=") {
+            Some(value.to_string())
+        } else if arg == "--store-url" {
+            args.next()
+        } else {
+            None
+        };
+        if url.is_some_and(|u| is_postgres_url(&u)) {
+            return true;
+        }
+    }
+    false
 }
 
 /// #3647 — `audit.redact_content = false` asks for plaintext retention, which
@@ -806,7 +997,14 @@ mod tests {
         ai_memory::governance::audit::shutdown();
         // A non-writer, non-host boot (#3354 reconciliation): the key is
         // ENSURED in the installed test key dir, so the sink signs.
-        init_forensic_audit(&app_config, false, false, false).expect("forensic boot");
+        init_forensic_audit(
+            &app_config,
+            false,
+            false,
+            false,
+            std::path::Path::new("does-not-exist-4199.db"),
+        )
+        .expect("forensic boot");
         assert!(
             ai_memory::governance::audit::is_enabled(),
             "the sink comes up on every boot (#1850 watermark lane)"
@@ -991,7 +1189,14 @@ mod tests {
 
         let app_config = config::AppConfig::default();
         // Must not panic and must leave the process bootable (unsigned).
-        init_forensic_audit(&app_config, false, false, false).expect("init");
+        init_forensic_audit(
+            &app_config,
+            false,
+            false,
+            false,
+            std::path::Path::new("does-not-exist-4199.db"),
+        )
+        .expect("init");
 
         match prev {
             Some(v) => unsafe { std::env::set_var("AI_MEMORY_AUDIT_DIR", v) },
