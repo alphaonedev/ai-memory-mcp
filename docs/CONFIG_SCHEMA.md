@@ -325,7 +325,12 @@ path                        = "~/.local/state/ai-memory/audit/"   # dir or file
 schema_version              = 1       # reserved; must equal the binary's emitted version
 redact_content              = true    # v1 only supports true (no content field on the wire)
 hash_chain                  = true    # per-line hash chain (load-bearing tamper evidence)
-attestation_cadence_minutes = 60      # periodic CHECKPOINT.sig marker; 0 disables
+attestation_cadence_minutes = 60      # reserved: v1.0.0 emits no periodic CHECKPOINT.sig marker;
+                                      # a nonzero effective cadence warns when audit is enabled,
+                                      # and an effective 0 suppresses that warning. Compliance
+                                      # cadence overrides only change the reserved value.
+                                      # Anti-truncation evidence uses the separate signed_events
+                                      # witness/watermark mechanism.
 append_only                 = true    # best-effort platform append-only file flag
 retention_days              = 90      # purge/verify horizon; compliance presets override
 
@@ -346,7 +351,7 @@ retention_days              = 90      # purge/verify horizon; compliance presets
   # pseudonymize_actors       = true
   [audit.compliance.fedramp]
   applied                     = false
-  attestation_cadence_minutes = 15
+  attestation_cadence_minutes = 15   # reserved: changes only the warned value; no marker is emitted
 ```
 
 Each `[audit.compliance.<preset>]` table is a `CompliancePreset`:
@@ -382,7 +387,10 @@ claimed compliance control. This is the operator cutline ruling
 (2026-08-01, §1-condition-2: a compliance defaults-lie is a hard boot
 ERROR); a compliance surface must fail closed, not serve while lying.
 Only `retention_days` and `attestation_cadence_minutes` are actually
-consumed by the preset resolver today.
+consumed by the preset resolver today — and the resolved cadence is
+consumed only by the one-shot reserved-feature WARN (`src/audit.rs`
+`warn_attestation_reserved_once`); no `CHECKPOINT.sig` marker is
+emitted at v1.0.0.
 
 ### `[transcripts]` — transcript lifecycle sweeper (I3)
 
@@ -534,7 +542,7 @@ methods:
 CLI flag  >  AI_MEMORY_LLM_* env  >  [llm] section  >  legacy flat fields  >  compiled default
 ```
 
-**The ONE documented inversion — the store-URL channel (#1927 / CWE-214).**
+**Precedence exception 1 — the store-URL inversion (#1927 / CWE-214).**
 `AppConfig::resolve_store_url` (`src/store_url.rs`) deliberately
 INVERTS the ladder above: `AI_MEMORY_STORE_URL_FILE` (env #158) >
 `AI_MEMORY_STORE_URL` (env #157) > the `--store-url` CLI flag. Here
@@ -547,6 +555,13 @@ Postgres DSN password) must NOT be able to override the safer ones
 slot; passing a password-bearing `--store-url` while an env channel is
 set logs a WARN naming both. Source:
 `src/store_url.rs::{STORE_URL_FILE_ENV, STORE_URL_ENV, resolve_store_url}`.
+
+**Precedence exception 2 — additive encryption enabling.** Application
+content encryption is enabled by a true `[encryption].at_rest` config/seed
+OR a truthy `AI_MEMORY_ENCRYPT_AT_REST` value
+(`src/encryption/mod.rs::encryption_enabled`); a falsy env value does not
+override an enabled config. This is an OR, not an env-over-config
+override.
 
 Resolvers are pure (no network I/O). File reads for `api_key_file`
 happen at resolve time; permission-bit enforcement is non-fatal and

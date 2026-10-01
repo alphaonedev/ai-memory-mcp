@@ -346,7 +346,7 @@ footer a{color:var(--text-muted)}
 
     <div class="feature fed">
       <div class="feature-head"><span class="feature-name">rustls TLS 1.3</span><span class="feature-tag live">live since v0.6</span></div>
-      <div class="feature-desc">Federation HTTP traffic uses <code>rustls</code> — Rust-native TLS, no OpenSSL dependency. TLS 1.3 only (no fallback to 1.2 or below). Forward secrecy via X25519 ECDHE. AEAD ciphers only.</div>
+      <div class="feature-desc">Federation HTTP traffic uses <code>rustls</code> — Rust-native TLS, no OpenSSL dependency. The server supports TLS 1.3 and TLS 1.2, with TLS 1.3 preferred and TLS 1.2 as the minimum supported version. TLS 1.1 and earlier are excluded. Forward secrecy via X25519 ECDHE. AEAD ciphers only.</div>
     </div>
 
     <div class="feature fed">
