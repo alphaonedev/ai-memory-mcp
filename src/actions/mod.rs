@@ -315,6 +315,243 @@ pub fn transition_cas(
     Ok(CasOutcome::Applied(action))
 }
 
+/// #4024 / F3 — the exact length of a federated transition's operation nonce.
+/// The producer (`handlers::coordination`) always mints 16 CSPRNG bytes; the
+/// receiver refuses any other length, so a recorded identity row has a bounded
+/// size (the table is never pruned).
+pub const OP_NONCE_LEN: usize = 16;
+
+/// #4024 — the signed operation identity (`ActionTransitionOp.nonce`) of a
+/// federated action transition, guaranteed EXACTLY [`OP_NONCE_LEN`] bytes by
+/// construction (ERRORS-09). Anything else (empty, short, oversized) cannot be
+/// built, so it can never be recorded.
+///
+/// **Verified-only contract (F2, 5-agent vote 4d3ea1c5 / decision f41cf98b):**
+/// an `OpNonce` is constructed ONLY on the receive path's VERIFIED arm
+/// (`TransitionAuthz::Accept`: the signature verified against the actor's
+/// enrolled key). An op admitted without verification (an unsigned op, or one
+/// from an unenrolled actor, under the rollout hatch
+/// `AI_MEMORY_FED_REQUIRE_TRANSITION_SIG=0`) takes the plain CAS and records NO
+/// identity - so an unauthenticated, sender-chosen nonce can never pre-empt the
+/// real actor's later signed op. Replay protection (#1805) therefore covers
+/// VERIFIED ops only.
+#[derive(Debug, Clone, Copy)]
+pub struct OpNonce<'a>(&'a [u8]);
+
+impl<'a> OpNonce<'a> {
+    /// `None` unless `bytes` is exactly [`OP_NONCE_LEN`] bytes.
+    #[must_use]
+    pub fn new(bytes: &'a [u8]) -> Option<Self> {
+        (bytes.len() == OP_NONCE_LEN).then_some(Self(bytes))
+    }
+
+    /// The raw nonce bytes (the durable key alongside the action id).
+    #[must_use]
+    pub fn as_bytes(&self) -> &'a [u8] {
+        self.0
+    }
+}
+
+/// #4024 v3d - the signer component of the identity key: the attested actor
+/// (`claimed_by`, whose enrolled key verified the op). Nonces are PER-SIGNER, so
+/// a node cannot front-run another node\'s nonce; the only collision left is a
+/// signer reusing its OWN nonce for different content. An op with no
+/// `claimed_by` keys under the empty signer.
+#[must_use]
+pub fn identity_signer(claimed_by: Option<&str>) -> &str {
+    claimed_by.unwrap_or("")
+}
+
+/// #4024 / F1 - SHA-256 of the canonical signed transition bytes (the exact
+/// bytes the op's Ed25519 signature covers: action, namespace, edge, actor,
+/// nonce, timestamp). It is stored with the identity row and compared on a
+/// probe hit: the SAME digest is an idempotent re-delivery (`noop`), a
+/// DIFFERENT digest under the same `(action_id, signer, nonce)` is an identity
+/// collision ([`RemoteCasOutcome::IdentityConflict`], never a `noop`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpDigest([u8; 32]);
+
+impl OpDigest {
+    /// Digest of `t`'s canonical signed bytes.
+    ///
+    /// # Errors
+    /// The CBOR encode error (pathological input only).
+    pub fn of(t: &crate::identity::sign::SignableTransition<'_>) -> anyhow::Result<Self> {
+        use sha2::{Digest, Sha256};
+        let bytes = crate::identity::sign::canonical_cbor_transition(t)?;
+        Ok(Self(Sha256::digest(&bytes).into()))
+    }
+
+    /// The raw digest bytes (the stored `op_digest` column).
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+/// #4024 — one inbound federated transition, applied under its operation
+/// identity by [`transition_cas_once`] (sqlite) or
+/// [`crate::store::MemoryStore::action_transition_cas_once`] (either backend).
+#[derive(Debug, Clone, Copy)]
+pub struct RemoteTransition<'a> {
+    /// Target action id.
+    pub action_id: &'a str,
+    /// Expected current state (the CAS guard).
+    pub from: crate::models::ActionState,
+    /// State to move to.
+    pub to: crate::models::ActionState,
+    /// Attested actor written to `claimed_by`.
+    pub claimed_by: Option<&'a str>,
+    /// The op's `updated_at` (epoch seconds) written to the action row.
+    pub now: i64,
+    /// The op's signed identity.
+    pub nonce: OpNonce<'a>,
+    /// Digest of the op's canonical signed bytes (binds the identity row to
+    /// the op that consumed it).
+    pub digest: OpDigest,
+}
+
+/// #4024 — outcome of [`transition_cas_once`].
+#[derive(Debug, Clone)]
+pub enum RemoteCasOutcome {
+    /// The operation identity was NOT previously applied here; carries the CAS
+    /// verdict. The identity was recorded **iff** this is
+    /// [`CasOutcome::Applied`] — every other verdict wrote nothing, so the op
+    /// stays applicable on a retry.
+    Fresh(CasOutcome),
+    /// This `(action_id, nonce)` was already APPLIED on this node: a re-delivery
+    /// (#1805 — a lost ack retried by the sender, or a captured signed op
+    /// re-wrapped in a fresh envelope after a cyclic edge returned the action
+    /// to its `from` state). Nothing written and nothing re-applied — the
+    /// identity probe runs BEFORE the CAS.
+    ///
+    /// The receivers report this as an idempotent `noop` SUCCESS, never
+    /// `skipped` (#4204): `skipped > 0` is the sender's #2341 non-ack, which
+    /// would retry an APPLIED op to DLQ quarantine.
+    AlreadyApplied,
+    /// `(action_id, signer, nonce)` is already recorded but for a DIFFERENT op (the
+    /// stored digest differs from this op's): an identity collision - another
+    /// signer, or the same signer reusing a nonce for different content. The
+    /// op is NOT applied and is NOT acknowledged as a `noop` (that would be an
+    /// acked, never-applied transition); the receivers report it `skipped`
+    /// with a distinct WARN. Nothing written.
+    IdentityConflict,
+}
+
+/// SQL: is `(action_id, nonce)` a durably recorded, applied operation?
+const SELECT_TRANSITION_NONCE_SQL: &str = "SELECT op_digest FROM action_transition_nonces \
+     WHERE action_id = ?1 AND nonce = ?2 AND claimed_by = ?3";
+
+/// SQL: record an applied operation identity (same transaction as the CAS).
+const INSERT_TRANSITION_NONCE_SQL: &str = "INSERT INTO action_transition_nonces \
+     (action_id, nonce, from_state, to_state, recorded_at, op_digest, claimed_by) \
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)";
+
+/// #4024 — compare-and-swap a FEDERATED transition and record its operation
+/// identity **atomically**: one `BEGIN IMMEDIATE` transaction holds the
+/// identity probe, the `UPDATE … WHERE state = from` guard and the identity
+/// `INSERT`, so "applied" and "recorded" commit or roll back together.
+///
+/// - identity already recorded with the SAME op digest →
+///   [`RemoteCasOutcome::AlreadyApplied`], no write (the #1805 replay refusal,
+///   durable across restarts and exact - no cache eviction can reopen it);
+/// - identity recorded with a DIFFERENT digest →
+///   [`RemoteCasOutcome::IdentityConflict`], no write (F1: a nonce collision
+///   must never read as an acknowledged replay of an op that never applied);
+/// - CAS miss / not-found / illegal edge → `Fresh(<verdict>)`, NOTHING written:
+///   a transition that arrived ahead of its causal predecessor keeps its
+///   identity, so the sender's retry applies once the predecessor lands;
+/// - any substrate error (CAS or identity write) → `Err`, the transaction
+///   rolls back: neither the state change nor the identity survives.
+///
+/// Pre-#4024 the receivers recorded the nonce in the in-memory replay cache
+/// BEFORE the CAS, so a miss or an error burned the identity of an op that was
+/// never applied (and a miss was acked as a `noop`).
+///
+/// # Errors
+/// Propagates `rusqlite` errors (including the record-stop refusal and
+/// `SQLITE_BUSY`); the transaction is rolled back on every error path.
+pub fn transition_cas_once(
+    conn: &Connection,
+    t: &RemoteTransition<'_>,
+) -> rusqlite::Result<RemoteCasOutcome> {
+    gate_record_stop_actions(conn)?;
+    let RemoteTransition {
+        action_id: id,
+        from,
+        to,
+        claimed_by,
+        now,
+        nonce,
+        digest,
+    } = *t;
+    // IMMEDIATE: take the write lock up front so no other connection (another
+    // process on the same file) can interleave between the probe and the
+    // writes. A dropped `Transaction` rolls back.
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    // Per-signer nonce namespace (v3d): the identity is `(action_id, signer,
+    // nonce)`, so another node can never occupy this signer's nonce.
+    let signer = identity_signer(claimed_by);
+    let stored: Option<Vec<u8>> = tx
+        .query_row(
+            SELECT_TRANSITION_NONCE_SQL,
+            params![id, nonce.as_bytes(), signer],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(stored) = stored {
+        // Same op (digest equal) = idempotent re-delivery; a different op under
+        // this identity = collision, never a noop (F1).
+        return Ok(if stored.as_slice() == digest.as_bytes().as_slice() {
+            RemoteCasOutcome::AlreadyApplied
+        } else {
+            RemoteCasOutcome::IdentityConflict
+        });
+    }
+    let verdict = transition_cas(&tx, id, from, to, claimed_by, now)?;
+    if matches!(verdict, CasOutcome::Applied(_)) {
+        tx.execute(
+            INSERT_TRANSITION_NONCE_SQL,
+            params![
+                id,
+                nonce.as_bytes(),
+                from.as_str(),
+                to.as_str(),
+                chrono::Utc::now().timestamp(),
+                digest.as_bytes().as_slice(),
+                signer
+            ],
+        )?;
+        tx.commit()?;
+    }
+    // Every non-Applied verdict wrote nothing; the dropped tx releases the lock.
+    Ok(RemoteCasOutcome::Fresh(verdict))
+}
+
+/// #4024 — how many operation identities `action_transition_nonces` holds
+/// (reported in `stats` and `ai-memory doctor`). The table is never pruned
+/// below the replay window, so this is the operator's growth signal. A
+/// database opened before schema v101 has no such table: that is an honest
+/// `0`, never an error.
+///
+/// # Errors
+/// Propagates the `rusqlite` error from the existence probe or the count.
+pub fn count_transition_nonces(conn: &Connection) -> rusqlite::Result<usize> {
+    let present: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' \
+         AND name = 'action_transition_nonces')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !present {
+        return Ok(0);
+    }
+    let n: i64 = conn.query_row("SELECT COUNT(*) FROM action_transition_nonces", [], |r| {
+        r.get(0)
+    })?;
+    Ok(usize::try_from(n).unwrap_or(0))
+}
+
 /// List actions filtered by optional `namespace` / `state`, newest-first,
 /// capped at `limit`.
 ///

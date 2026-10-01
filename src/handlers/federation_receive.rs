@@ -1741,6 +1741,137 @@ pub(super) fn pending_namespaces_authorized(
 /// start accepting an injection the other refuses.
 pub(super) const PENDING_STATUS_PENDING: &str = "pending";
 
+/// #4024 — how a receive funnel counts one AUTHORIZED federated transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TransitionTally {
+    /// The CAS applied (and, for a signed op, its identity was recorded).
+    Applied,
+    /// Nothing to do on this node: the action does not exist here.
+    Noop,
+    /// NOT applied and NOT acknowledged — `skipped > 0` is the sender's
+    /// non-ack trigger (`federation::sync::success_report_non_ack_reason`), so
+    /// the op is parked for retry rather than dropped.
+    Skipped,
+}
+
+/// #4024 — the ONE disposition of a remote transition's CAS outcome, shared
+/// by the sqlite (`sync_push`) and postgres (`sync_push_via_store`) funnels so
+/// the two cannot drift on what the sender is told.
+///
+/// - `Applied` → applied.
+/// - `AlreadyApplied` → noop (#4204): the op's identity is already recorded,
+///   so a re-delivery (a lost ack, a relay via another peer) is an idempotent
+///   SUCCESS. It is acknowledged and re-applies nothing, because the durable
+///   identity probe runs before the CAS (#1805 never-re-apply holds). It must
+///   NOT be `skipped`: `skipped > 0` is the sender's #2341 non-ack, which would
+///   retry an applied op to DLQ quarantine and record NotApplied for a
+///   successful op.
+/// - `StateMismatch` → skipped, NOT a `noop`. A mismatch only proves the
+///   action is not in the op's `from` state — e.g. the op arrived ahead of its
+///   causal predecessor — not that the op happened. Pre-#4024 it was acked as
+///   a successful `noop` and the op was silently lost.
+/// - `Illegal` → skipped: an edge the state machine forbids is refused, never
+///   acknowledged as if it had been handled.
+/// - `NotFound` → noop, the same disposition as the pre-CAS `actions::get`
+///   miss (the action is not on this node).
+/// - `IdentityConflict` → skipped with a distinct WARN (F1): the nonce is
+///   already recorded for a DIFFERENT signed op, so this op was not applied and
+///   must never be acknowledged as a `noop`.
+/// - `Err` → skipped: a substrate failure rolled the whole transaction back
+///   (state AND identity), so the retry applies.
+pub(super) fn tally_remote_transition<E: std::fmt::Display>(
+    op: &crate::federation::sync::ActionTransitionOp,
+    outcome: Result<crate::actions::RemoteCasOutcome, E>,
+    funnel: &str,
+) -> TransitionTally {
+    use crate::actions::{CasOutcome, RemoteCasOutcome};
+    match outcome {
+        Ok(RemoteCasOutcome::Fresh(CasOutcome::Applied(_))) => TransitionTally::Applied,
+        Ok(RemoteCasOutcome::AlreadyApplied) => {
+            tracing::warn!(
+                target: crate::federation::SIGNING_TRACE_TARGET,
+                action_id = %op.action_id,
+                "{funnel}: re-delivery of an already-applied action transition \
+                 acknowledged as a noop; nothing re-applied (#1805, #4204)"
+            );
+            TransitionTally::Noop
+        }
+        Ok(RemoteCasOutcome::IdentityConflict) => {
+            // F1 (#4024 security review): the nonce is already recorded for a
+            // DIFFERENT op (the SAME signer reusing its own nonce for
+            // different content). Never a noop: that would acknowledge an op
+            // that was not applied. Skipped = the sender's visible non-ack.
+            tracing::warn!(
+                target: crate::federation::SIGNING_TRACE_TARGET,
+                action_id = %op.action_id,
+                "{funnel}: action-transition identity collision - (action_id, nonce) is \
+                 already recorded for a DIFFERENT signed op (digest mismatch); not applied, \
+                 not acknowledged as a noop (#4024)"
+            );
+            TransitionTally::Skipped
+        }
+        Ok(RemoteCasOutcome::Fresh(CasOutcome::StateMismatch { current })) => {
+            tracing::info!(
+                action_id = %op.action_id,
+                expected = op.from_state.as_str(),
+                current = current.as_str(),
+                "{funnel}: action transition not applied (state mismatch); not acknowledged \
+                 so the sender retries (#4024)"
+            );
+            TransitionTally::Skipped
+        }
+        Ok(RemoteCasOutcome::Fresh(CasOutcome::Illegal { from, to })) => {
+            tracing::warn!(
+                action_id = %op.action_id,
+                "{funnel}: illegal action transition {} -> {} refused",
+                from.as_str(),
+                to.as_str()
+            );
+            TransitionTally::Skipped
+        }
+        Ok(RemoteCasOutcome::Fresh(CasOutcome::NotFound)) => TransitionTally::Noop,
+        Err(e) => {
+            tracing::warn!(
+                "{funnel}: action transition {} cas failed: {e}",
+                op.action_id
+            );
+            TransitionTally::Skipped
+        }
+    }
+}
+
+/// #4024 F1/F2/F3 - build the durable operation identity of a federated
+/// transition on the VERIFIED arm only (`TransitionAuthz::Accept`: the
+/// signature verified against the actor's enrolled key). `None` (the caller
+/// counts the op `skipped`) when the nonce is not exactly
+/// [`crate::actions::OP_NONCE_LEN`] bytes, or the canonical bytes cannot be
+/// encoded - a refusal before any write. Shared by both receive funnels.
+pub(super) fn verified_op_identity<'a>(
+    op: &'a crate::federation::sync::ActionTransitionOp,
+    signable: &crate::identity::sign::SignableTransition<'_>,
+    funnel: &str,
+) -> Option<(crate::actions::OpNonce<'a>, crate::actions::OpDigest)> {
+    let Some(nonce) = crate::actions::OpNonce::new(&op.nonce) else {
+        tracing::warn!(
+            action_id = %op.action_id,
+            nonce_len = op.nonce.len(),
+            "{funnel}: action transition refused - nonce is not exactly {} bytes (#4024)",
+            crate::actions::OP_NONCE_LEN
+        );
+        return None;
+    };
+    match crate::actions::OpDigest::of(signable) {
+        Ok(digest) => Some((nonce, digest)),
+        Err(e) => {
+            tracing::warn!(
+                action_id = %op.action_id,
+                "{funnel}: action transition refused - cannot encode its signed bytes: {e}"
+            );
+            None
+        }
+    }
+}
+
 /// #3075 — one by-id namespace probe's resolution, as fed to
 /// [`pending_namespaces_authorized_resolved`].
 ///
@@ -4220,48 +4351,57 @@ async fn sync_push_write(
             require_tx_sig,
         ) {
             crate::federation::receive_auth::TransitionAuthz::Accept => {
-                // #1805 — per-transition nonce anti-replay. The transition
-                // nonce is signed (tamper-evident) but was never recorded, so a
-                // captured signed transition re-wrapped in a FRESH outer
-                // envelope replays through CAS on a cyclic/ABA edge (CAS is
-                // causal ordering, not anti-replay). Record it in the per-peer
-                // nonce cache (the #30 envelope-nonce store) and refuse a
-                // repeat. Rides the #1718 / 4d3ea1c5 fail-closed posture; an
-                // empty nonce = unsigned op (heterogeneous rollout) → not gated.
-                if !op.nonce.is_empty() {
-                    use base64::Engine as _;
-                    let nstr = base64::engine::general_purpose::STANDARD.encode(&op.nonce);
-                    if matches!(
-                        app.federation_nonce_cache
-                            .record_and_check(peer_header_owned.as_deref().unwrap_or(""), &nstr),
-                        crate::identity::replay::ReplayDecision::Replay
-                    ) {
-                        tracing::warn!(
-                            target: crate::federation::SIGNING_TRACE_TARGET,
-                            action_id = %op.action_id,
-                            "sync_push: replayed action-transition nonce refused (#1805)"
-                        );
-                        skipped += 1;
-                        continue;
-                    }
+                // #1805 + #4024 - per-transition anti-replay, ATOMIC with the
+                // apply, on the VERIFIED arm only. The op's signed `(action_id,
+                // nonce)` identity - bound to the op by a digest of the
+                // canonical signed bytes (F1) - is recorded durably in the SAME
+                // transaction as the CAS (`transition_cas_once`), so it is
+                // consumed iff the op applied: a re-delivery of an applied op
+                // is an idempotent noop, a DIFFERENT op under the same identity
+                // is `skipped` (never a noop), and an op that missed the CAS or
+                // hit an error keeps its identity for the retry. A nonce that
+                // is not exactly 16 bytes is refused before the CAS (F3).
+                let Some((nonce, digest)) = verified_op_identity(op, &signable, "sync_push") else {
+                    skipped += 1;
+                    continue;
+                };
+                let outcome = crate::actions::transition_cas_once(
+                    &lock.0,
+                    &crate::actions::RemoteTransition {
+                        action_id: &op.action_id,
+                        from: op.from_state,
+                        to: op.to_state,
+                        claimed_by: op.claimed_by.as_deref(),
+                        now: op.updated_at,
+                        nonce,
+                        digest,
+                    },
+                );
+                match tally_remote_transition(op, outcome, "sync_push") {
+                    TransitionTally::Applied => action_transitions_applied += 1,
+                    TransitionTally::Noop => noop += 1,
+                    TransitionTally::Skipped => skipped += 1,
                 }
-                match crate::actions::transition_cas(
+            }
+            crate::federation::receive_auth::TransitionAuthz::AcceptUnverified => {
+                // F2: admitted WITHOUT a verified signature (rollout hatch
+                // `AI_MEMORY_FED_REQUIRE_TRANSITION_SIG=0`: unsigned op, or an
+                // actor with no enrolled key). Plain CAS; records NO identity,
+                // so an unauthenticated nonce can never pre-empt the real
+                // actor's later signed op.
+                let outcome = crate::actions::transition_cas(
                     &lock.0,
                     &op.action_id,
                     op.from_state,
                     op.to_state,
                     op.claimed_by.as_deref(),
                     op.updated_at,
-                ) {
-                    Ok(crate::actions::CasOutcome::Applied(_)) => action_transitions_applied += 1,
-                    Ok(_) => noop += 1, // CAS miss / not-found / illegal edge — safe no-op
-                    Err(e) => {
-                        tracing::warn!(
-                            "sync_push: action transition {} cas failed: {e}",
-                            op.action_id
-                        );
-                        skipped += 1;
-                    }
+                )
+                .map(crate::actions::RemoteCasOutcome::Fresh);
+                match tally_remote_transition(op, outcome, "sync_push") {
+                    TransitionTally::Applied => action_transitions_applied += 1,
+                    TransitionTally::Noop => noop += 1,
+                    TransitionTally::Skipped => skipped += 1,
                 }
             }
             verdict => {

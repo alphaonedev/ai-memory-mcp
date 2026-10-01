@@ -2569,6 +2569,18 @@ impl MemoryStore for SqliteStore {
         crate::actions::transition_cas(&conn, id, from, to, claimed_by, now).map_err(box_err)
     }
 
+    async fn action_transition_cas_once(
+        &self,
+        _ctx: &CallerContext,
+        t: &crate::actions::RemoteTransition<'_>,
+    ) -> StoreResult<crate::actions::RemoteCasOutcome> {
+        // #4024 — the ONE sqlite implementation (the direct-db receive funnel
+        // calls the same free fn), gated like `action_transition_cas`.
+        self.gate_record_stop()?;
+        let conn = self.state.lock().await;
+        crate::actions::transition_cas_once(&conn, t).map_err(box_err)
+    }
+
     async fn action_list(
         &self,
         _ctx: &CallerContext,

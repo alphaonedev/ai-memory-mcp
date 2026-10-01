@@ -403,7 +403,7 @@ impl McpTool for StatsTool {
     fn docs() -> &'static str {
         "Totals (physical `total` vs live `live` vs `expired_pending_gc`), per-tier + \
          per-namespace tallies, `expiring_soon`, `links_count`, `db_size_bytes`, \
-         `dim_violations`, `index_evictions_total`. #3171: NO archive counts — use \
+         `dim_violations`, `index_evictions_total`, `action_transition_nonces`. #3171: NO archive counts — use \
          memory_archive_stats for those."
     }
     fn input_schema() -> Value {
