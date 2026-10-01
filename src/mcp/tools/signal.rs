@@ -179,7 +179,9 @@ pub fn handle_signal_send_with_hooks(
     // #4408 — a present-but-non-string `to_agent` used to read as ABSENT and
     // silently turned a direct signal into a namespace broadcast; refuse the
     // wrong TYPE with the fixed (non-echoing) recipient refusal. Absent / null
-    // still means broadcast.
+    // still means broadcast. `param_guard::optional_str` is deliberately NOT used
+    // here: it trims, which would silently change the recipient (and accept a
+    // value the HTTP funnel refuses).
     let to_agent = match params.get(param_names::TO_AGENT) {
         None | Some(Value::Null) => None,
         Some(Value::String(s)) => Some(s.clone()),
@@ -1404,11 +1406,13 @@ mod handler_tests {
             // fix) directly; the ack gate must still refuse to stamp it.
             let id = send_to(&conn, Value::Null);
             if to_agent.is_string() {
-                conn.execute(
-                    "UPDATE signals SET to_agent = ?1 WHERE id = ?2",
-                    rusqlite::params![to_agent.as_str(), id],
-                )
-                .expect("seed legacy blank recipient");
+                let changed = conn
+                    .execute(
+                        "UPDATE signals SET to_agent = ?1 WHERE id = ?2",
+                        rusqlite::params![to_agent.as_str(), id],
+                    )
+                    .expect("seed legacy blank recipient");
+                assert_eq!(changed, 1, "seeding must update exactly one row");
             }
             let err = handle_signal_ack(&conn, &json!({ "id": id }), None)
                 .expect_err("a broadcast ack must be REFUSED");

@@ -714,6 +714,8 @@ pub fn validate_signal_recipient(
 ) -> std::result::Result<(), InvalidSignalRecipient> {
     match to_agent {
         None => Ok(()),
+        // ERRORS-15 exception: the underlying error is dropped on purpose because
+        // `validate_agent_id`'s messages (e.g. the reserved-id one) contain the value.
         Some(id) => validate_agent_id(id).map_err(|_| InvalidSignalRecipient),
     }
 }
