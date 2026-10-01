@@ -282,6 +282,19 @@ mod tests {
         assert_eq!(s.tracked_agents(), 1);
     }
 
+    /// #4125 (N5) — `record` carries its OWN length guard: even when an
+    /// over-long id is already in `known` (seeded directly, bypassing
+    /// `note_known`), recording a wake for it creates no pending set.
+    #[test]
+    fn record_refuses_an_over_long_agent_id_even_if_known_4125() {
+        let mut s = PendingStore::new(8, 3);
+        let long = "a".repeat(MAX_ID_BYTES + 1);
+        s.known.insert(long.clone());
+        assert!(!s.record(&long, "row-1"), "refused despite being known");
+        assert_eq!(s.tracked_agents(), 0, "no per-agent set was created");
+        assert_eq!(s.dropped_unknown(), 1);
+    }
+
     #[test]
     fn an_over_long_row_id_lags_instead_of_being_stored() {
         let mut s = store();
