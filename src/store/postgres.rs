@@ -30135,6 +30135,13 @@ impl MemoryStore for PostgresStore {
         keypair: Option<&crate::identity::keypair::AgentKeypair>,
     ) -> StoreResult<&'static str> {
         self.gate_record_stop().await?;
+        // #4408 — refuse an invalid recipient before any sign or write; the
+        // shared validator never echoes the value.
+        crate::validate::validate_signal_recipient(signal.to_agent.as_deref()).map_err(|e| {
+            StoreError::InvalidInput {
+                detail: e.to_string(),
+            }
+        })?;
         // #1709 Pillar 1 — JSON columns (body, reference_ids) stored as TEXT
         // (parity with sqlite); signature/sender_pubkey are BYTEA. Mirror
         // `link_signed`: sign a clone when a signing keypair is present, else
