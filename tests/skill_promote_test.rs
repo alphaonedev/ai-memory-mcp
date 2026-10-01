@@ -259,6 +259,9 @@ fn threshold_configurable_via_namespace_governance() {
         expires_at: None,
         metadata: json!({
             "governance": {
+                // #4285 — the typed shape requires `write`; an untyped blob is a
+                // CORRUPT level whose raw knobs are not honoured.
+                "write": "any",
                 "skill_promotion_min_depth": 2,
             }
         }),
