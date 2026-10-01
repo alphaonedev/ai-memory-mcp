@@ -1798,6 +1798,31 @@ impl MemoryStore for SqliteStore {
         db::merge_inbound(&conn, inbound, receiver_verified).map_err(box_err)
     }
 
+    async fn merge_inbound_authorized(
+        &self,
+        _ctx: &CallerContext,
+        inbound: &Memory,
+        receiver_verified: bool,
+        authorize_stored: crate::storage::StoredNamespaceAuthorizer<'_>,
+    ) -> StoreResult<String> {
+        self.gate_record_stop()?;
+        // #4023 — the re-check runs inside the free-fn's BEGIN IMMEDIATE.
+        let conn = self.state.lock().await;
+        db::merge_inbound_authorized(&conn, inbound, receiver_verified, Some(authorize_stored))
+            .map_err(|e| {
+                // Error parity with postgres (5-agent vote (4d3ea1c5), memory
+                // 179cf088): the in-transaction refusal is ONE typed variant.
+                match e.downcast::<crate::storage::InboundStoredNamespaceRefused>() {
+                    Ok(refused) => StoreError::PermissionDenied {
+                        action: crate::store::FEDERATION_MERGE_INBOUND.to_string(),
+                        target: refused.id.clone(),
+                        reason: refused.to_string(),
+                    },
+                    Err(other) => box_err(other),
+                }
+            })
+    }
+
     async fn apply_remote_link(
         &self,
         _ctx: &CallerContext,
