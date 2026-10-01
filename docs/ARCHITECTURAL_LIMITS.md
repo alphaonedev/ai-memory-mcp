@@ -17,7 +17,10 @@ auto-checkpoint) and documents the rest here.
 ## Legend
 
 - **Structural** — cannot be fixed in SQLite. Requires a different
-  backend (Postgres + pgvector, LanceDB, Qdrant, Chroma) via the v0.7 SAL.
+  backend via the SAL. For v1.0.0 deployments the shipped choices are SQLite
+  and the feature-gated PostgreSQL (+ pgvector) adapter; LanceDB, Qdrant and
+  Chroma, named in the earlier v0.6/v0.7 planning discussion, are unshipped
+  proposals, not available v1.0.0 deployment choices.
 - **Polished in v0.6.0 GA** — addressed within SQLite.
 - **Workaround** — possible but painful; not a design goal for v0.6.0.
 
@@ -44,9 +47,11 @@ differently in the places that matter (replication, consistency).
 
 **Impact ceiling:** you hit one box's disk and CPU and that is the entire
 budget.
-**Workaround:** the v0.7 SAL lands Postgres (vertical scaling via replica
-sets), Qdrant (horizontal sharding of the vector side), and LanceDB (S3
-object-store backing for horizontal read scaling).
+**Workaround:** for v1.0.0, choose the feature-gated PostgreSQL adapter
+(`serve --store-url postgres://…`, vertical scaling via replica sets). The
+v0.6/v0.7 planning discussion also proposed Qdrant (horizontal sharding of
+the vector side) and LanceDB (S3 object-store backing); neither adapter ships
+in v1.0.0.
 
 ### 3. No synchronous replication / HA — **Structural**
 
@@ -67,8 +72,9 @@ most container/Kubernetes shared-volume deployments without a dedicated
 PVC per replica — which means you cannot horizontally scale the daemon.
 
 **Impact:** rules out many cloud topologies.
-**Workaround:** single-node deployment with local disk, or v0.7 SAL with
-a backend that has a native wire protocol (Postgres, Qdrant).
+**Workaround:** single-node deployment with local disk, or the PostgreSQL
+adapter, whose server has a native wire protocol (Qdrant was a planning
+proposal and is not a shipped v1.0.0 adapter).
 
 ### 5. No native client-server protocol — **Structural**
 
@@ -215,15 +221,20 @@ design rationale.
 
 ## Use-case guidance
 
+For v1.0.0 deployments, choose SQLite or the feature-gated PostgreSQL
+adapter (`--features sal-postgres`; `postgres://` or `postgresql://` store
+URLs). Qdrant, LanceDB and Chroma in the earlier v0.6/v0.7 planning
+discussion are unshipped proposals, not available v1.0.0 deployment choices.
+
 | Deployment | Backend | Notes |
 |---|---|---|
 | Single user, local agent (Claude Code on one laptop) | SQLite | Ideal. Zero ops. Keep. |
 | Small team fleet, 1-25 agents, <100k memories | SQLite | v0.6.0 GA works well. |
-| Large fleet, 100+ agents, ≥1M memories | Postgres (v0.7) | Structural limits 1, 2, 10 bite. |
-| Multi-region / HA / zero-data-loss | Postgres (v0.7) | Structural limit 3 rules out SQLite. |
-| Shared filesystem / Kubernetes PVC-per-replica | Postgres or Qdrant (v0.7) | Structural limit 4. |
-| Vector-first workload, low metadata | Qdrant or LanceDB (v0.7) | Native ANN beats in-process HNSW. |
-| Change-data-capture (CDC) required | Postgres (v0.7) | Structural limit 7. |
+| Large fleet, 100+ agents, ≥1M memories | PostgreSQL | Structural limits 1, 2, 10 bite. |
+| Multi-region / HA / zero-data-loss | PostgreSQL | Structural limit 3 rules out SQLite. |
+| Shared filesystem / Kubernetes PVC-per-replica | PostgreSQL | Structural limit 4. Qdrant was a planning proposal, not a shipped adapter. |
+| Vector-first workload, low metadata | PostgreSQL (pgvector) | A dedicated vector store (Qdrant / LanceDB) was a planning proposal and is not a shipped v1.0.0 adapter. |
+| Change-data-capture (CDC) required | PostgreSQL | Structural limit 7 (CDC is operator-configured out-of-band; see limit 7). |
 
 ## What v0.6.0 GA does *not* fix
 
