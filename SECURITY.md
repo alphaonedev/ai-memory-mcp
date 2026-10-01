@@ -319,13 +319,28 @@ across every relay wiring the guard cannot establish "not network-served" as a
 deployment property — which is why this section scopes its claim to the code,
 and why a relay's transport is the relay's responsibility.
 
-**The one documented exception, and why it does not change the code claim.**
-`src/mcp/tools/store/transport.rs` (#881/#318) constructs an **outbound**
-`reqwest` client so an MCP-stdio `memory_store` can join the HTTP daemon's
-federation fanout. That is a **client to the HTTP daemon** (whose own TLS, mTLS
-and plaintext-peer refusals — #2448/#2477 — cover that hop), **not** MCP's
-serving transport. MCP's code still serves nothing over a socket; the static
-gate allowlists exactly this one file and no other.
+**Every outbound client the MCP PROCESS can construct, and why none changes the
+code claim.** "MCP binds no server socket" is unqualified. "MCP makes no
+outbound connection" is NOT, and was previously stated as a single exception —
+which was false by omission (#4169). The `ai-memory mcp` process can construct
+three kinds of outbound client; none of them is MCP's *serving* transport, so
+the stdio-only claim above is unaffected, but an operator sizing the process's
+egress needs all three:
+
+| Outbound client | Built at | Gate |
+|---|---|---|
+| **Federation forward** — an MCP-stdio `memory_store` joining the HTTP daemon's federation fanout (#881/#318) | `src/mcp/tools/store/transport.rs` (a blocking `reqwest` client, 15 s timeout) | A client **to the HTTP daemon**, whose own TLS, mTLS and plaintext-peer refusals (#2448/#2477) cover that hop. The one file on the static gate's client allowlist. |
+| **Chat / completion LLM** — query expansion, auto-tagging, contradiction detection | `crate::reload::resolve_and_build_mcp_llm`, called at MCP init (`src/mcp/mod.rs:4755`) and again on a live `config.toml` `[llm]` hot-swap (`:5355`) | `AI_MEMORY_INFERENCE_EGRESS` (`src/egress.rs`): `loopback-only` / `internal-only` / `deny` refuse the target, and **on refusal the client is not constructed** — enforcement is the absence of the egress path. `internal-only` additionally pins the boot-resolved addresses. |
+| **API embedder** — semantic-tier recall vectors | `Embedder::from_resolved_pinned` at MCP init (`src/mcp/mod.rs:4812`), only when the resolved embed lane egresses (`:4780`) | Same `AI_MEMORY_INFERENCE_EGRESS` gate. The local in-process candle embedder never egresses and is not gated; a refused or failed build degrades recall to keyword (#1593), it does not silently route through the chat client. |
+
+Both inference clients are built **outside** `src/mcp/**`, so the static gate
+does not and cannot see them — see "Pinned so it cannot decay" below for that
+scope boundary. The wake-hub UDS client (`src/wake_client/`) is **not** one of
+these: it is reached only from `src/cli/wake_listen.rs`, i.e. the
+`ai-memory wake-listen` subcommand and `ai-memory inbox --wait`
+(`src/cli/commands/inbox.rs:151-177`) — separate processes from `ai-memory mcp`
+— and it is a same-host Unix socket, not a network client. MCP's code still
+serves nothing over a socket.
 
 **Pinned so it cannot decay.** `scripts/check-mcp-transport-isolation.py` refuses
 any server-socket construction anywhere under `src/mcp/**` and any network-client
