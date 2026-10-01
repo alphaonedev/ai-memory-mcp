@@ -181,6 +181,10 @@ if [[ "${1:-}" == "--self-test" ]]; then
         echo "(cleanup may have failed in a prior run — remove manually)" >&2
         exit 2
     fi
+    # #4292: the probe is removed on ANY exit, including an interrupted one,
+    # and INT/TERM re-raise. See scripts/lib/selftest-probes.sh.
+    source "${ROOT}/scripts/lib/selftest-probes.sh"
+    selftest_probes_arm "$probe"
 
     # --- Leg 1: an OFF-allowlist extension must be HARD-BLOCKED ------------
     cat > "$probe" <<'EOF'
@@ -190,8 +194,7 @@ if [[ "${1:-}" == "--self-test" ]]; then
 CREATE EXTENSION IF NOT EXISTS foo;
 EOF
     set +e
-    block_out="$("$0" 2>&1)"
-    block_exit=$?
+    selftest_run block_out block_exit "$0"
     set -e
     rm -f "$probe"
     printf '%s\n' "$block_out"
@@ -216,10 +219,9 @@ EOF
 CREATE EXTENSION IF NOT EXISTS vector;
 EOF
     set +e
-    pass_out="$("$0" 2>&1)"
-    pass_exit=$?
+    selftest_run pass_out pass_exit "$0"
     set -e
-    rm -f "$probe"
+    selftest_probes_disarm
 
     if (( pass_exit != 0 )); then
         printf '%s\n' "$pass_out" >&2

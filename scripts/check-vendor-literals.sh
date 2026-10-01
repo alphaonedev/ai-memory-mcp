@@ -177,6 +177,10 @@ if [[ "${1:-}" == "--self-test" ]]; then
         echo "(cleanup may have failed in a prior run — remove manually)" >&2
         exit 2
     fi
+    # #4292: the probe is removed on ANY exit, including an interrupted one,
+    # and INT/TERM re-raise. See scripts/lib/selftest-probes.sh.
+    source "${ROOT}/scripts/lib/selftest-probes.sh"
+    selftest_probes_arm "$contrived"
     # Deliberately write a vendor literal at a "production" line (no
     # tests boundary above it) outside the allowlist.
     cat > "$contrived" <<'EOF'
@@ -189,10 +193,9 @@ EOF
     # the combined output so we can pattern-match on it deterministically
     # (a piped `tee /dev/stderr | grep -q` would race + drop status).
     set +e
-    gate_output="$("$0" 2>&1)"
-    gate_exit=$?
+    selftest_run gate_output gate_exit "$0"
     set -e
-    rm -f "$contrived"
+    selftest_probes_disarm
     printf '%s\n' "$gate_output"
     if (( gate_exit != 0 )) && printf '%s' "$gate_output" | grep -q 'Vendor monoculture violation'; then
         echo ""
