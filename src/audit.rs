@@ -2547,6 +2547,12 @@ mod tests {
     /// Red on ed111a9eb: 10 ERROR lines for 10 lost events.
     #[test]
     fn lost_events_log_at_most_one_error_per_interval_4318() {
+        // #4090: tracing capture; run alone in a child (callsite-interest cache).
+        if crate::config::run_env_isolated_child_or_spawn(
+            "audit::tests::lost_events_log_at_most_one_error_per_interval_4318",
+        ) {
+            return;
+        }
         let _g = sink_lock();
         let delivery = &RuntimeContext::global().audit.delivery;
         let failed0 = delivery.write_failures();
@@ -2555,11 +2561,13 @@ mod tests {
             budget: 0,
             fail_flush: false,
         }));
-        let (errors, debugs) = crate::test_support::count_error_and_debug_lines(|| {
+        let (subscriber, sink) = crate::test_support::error_debug_capture();
+        tracing::subscriber::with_default(subscriber, || {
             for _ in 0..10 {
                 emit_one();
             }
         });
+        let (errors, debugs) = crate::test_support::count_error_and_debug_lines(&sink);
         super::shutdown_for_test();
         assert_eq!(
             delivery.write_failures() - failed0,

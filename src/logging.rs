@@ -1744,6 +1744,14 @@ mod tests {
 
     #[test]
     fn init_file_logging_returns_guard_when_enabled() {
+        // #4090: the pipeline probe is captured through a scoped dispatcher; the
+        // process-global callsite-interest cache can starve it in the shared
+        // lib binary, so run alone in a child.
+        if crate::config::run_env_isolated_child_or_spawn(
+            "logging::tests::init_file_logging_returns_guard_when_enabled",
+        ) {
+            return;
+        }
         let _env = crate::test_support::env_lock();
         let tmp = tempfile::tempdir().unwrap();
         let cfg = LoggingConfig {
@@ -1820,6 +1828,14 @@ mod tests {
 
     #[test]
     fn init_file_logging_emits_structured_json_when_configured() {
+        // #4090: the pipeline probe is captured through a scoped dispatcher; the
+        // process-global callsite-interest cache can starve it in the shared
+        // lib binary, so run alone in a child.
+        if crate::config::run_env_isolated_child_or_spawn(
+            "logging::tests::init_file_logging_emits_structured_json_when_configured",
+        ) {
+            return;
+        }
         let _env = crate::test_support::env_lock();
         let tmp = tempfile::tempdir().unwrap();
         let cfg = LoggingConfig {

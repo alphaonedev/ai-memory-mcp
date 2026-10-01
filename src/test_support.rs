@@ -660,21 +660,30 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLines {
         self.clone()
     }
 }
-/// Run `f` under a DEBUG-level capturing subscriber; returns the
-/// (ERROR, DEBUG) line counts it produced. Shared by the #4310 (forensic
-/// writer) and #4318 (flat audit trail) rate-limit cells.
-pub(crate) fn count_error_and_debug_lines(f: impl FnOnce()) -> (usize, usize) {
+/// A DEBUG-level capturing subscriber plus the sink it writes to. Shared by
+/// the #4310 (forensic writer) and #4318 (flat audit trail) rate-limit cells.
+///
+/// #4090: the CALLER installs it (`tracing::subscriber::with_default`) inside
+/// a test guarded by `run_env_isolated_child_or_spawn`, so the install is
+/// visible to the isolation census; the install is deliberately not hidden in
+/// this shared helper where no guard can precede it.
+pub(crate) fn error_debug_capture() -> (impl tracing::Subscriber + Send + Sync, CapturedLines) {
     let sink = CapturedLines::default();
-    let buf = sink.0.clone();
     let subscriber = tracing_subscriber::fmt()
         .with_max_level(tracing::Level::DEBUG)
-        .with_writer(sink)
+        .with_writer(sink.clone())
         .with_ansi(false)
         .without_time()
         .finish();
-    tracing::subscriber::with_default(subscriber, f);
+    (subscriber, sink)
+}
+
+/// The (ERROR, DEBUG) line counts a [`error_debug_capture`] sink received.
+pub(crate) fn count_error_and_debug_lines(sink: &CapturedLines) -> (usize, usize) {
     let text = String::from_utf8_lossy(
-        &buf.lock()
+        &sink
+            .0
+            .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner),
     )
     .into_owned();
