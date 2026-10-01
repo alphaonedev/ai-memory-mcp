@@ -303,7 +303,11 @@ footer a{color:var(--text-muted)}
     .context(<span class="val">"PRAGMA key failed (wrong passphrase or unencrypted DB?)"</span>)?;
 
 <span class="cm">// Operator workflow — pass the passphrase by FILE (mode 0400), not env:
-// the CLI reads it once and exports AI_MEMORY_DB_PASSPHRASE for the process.</span>
+// --db-passphrase-file reads the passphrase once into process-private state.
+// It does NOT set or export AI_MEMORY_DB_PASSPHRASE and does not pass that
+// file-read secret to child processes (#3213). Operators may set
+// AI_MEMORY_DB_PASSPHRASE themselves. A passphrase requests whole-database
+// SQLCipher and is refused by a build without that feature.</span>
 <span class="ok">$</span> chmod 0400 /run/secrets/db-passphrase
 <span class="ok">$</span> ai-memory --db-passphrase-file /run/secrets/db-passphrase \
     serve --db /var/lib/ai-memory/data.sqlite
