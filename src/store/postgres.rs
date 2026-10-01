@@ -25248,12 +25248,6 @@ impl MemoryStore for PostgresStore {
             .begin()
             .await
             .map_err(|e| to_store_err("begin apply_remote_memory tx", e))?;
-        // #2954 — armed-only pre-image of the `(title, namespace)` row this
-        // upsert may overwrite, `SELECT … FOR UPDATE` inside this tx so the
-        // probe and the newer-wins upsert are atomic under READ COMMITTED (the
-        // row lock is load-bearing: it stops a concurrent writer from changing
-        // the row between the probe and the upsert whose verdict it mirrors).
-        // `None` when the spine is OFF (byte-identical) or no prior row exists.
         // #4216 / #4218 — the slot row's user data + version (locked), and the
         // inbound version bounded against it.
         let slot_pre =
@@ -25263,6 +25257,12 @@ impl MemoryStore for PostgresStore {
             memory.version,
             slot_pre.as_ref().map(|p| p.version),
         );
+        // #2954 — armed-only pre-image of the `(title, namespace)` row this
+        // upsert may overwrite, `SELECT … FOR UPDATE` inside this tx so the
+        // probe and the newer-wins upsert are atomic under READ COMMITTED (the
+        // row lock is load-bearing: it stops a concurrent writer from changing
+        // the row between the probe and the upsert whose verdict it mirrors).
+        // `None` when the spine is OFF (byte-identical) or no prior row exists.
         let merge_preimage =
             pg_probe_federation_merge_preimage(&mut tx, &memory.title, &memory.namespace)
                 .await

@@ -15,11 +15,14 @@
 //!
 //! * `*_stale_if_match_after_a_content_merge_is_refused_4216` — RED on the
 //!   carrier: the stale write succeeds and B's merged edit is lost. The
-//!   expected outcome (a `VersionConflict`) is the one every option in
-//!   `4216-OPTIONS-claude-l2b.md` must deliver.
-//! * `*_idempotent_redelivery_does_not_bump_4216` — GUARD (green on the
+//!   expected outcome (a `VersionConflict`) is the one the vote ruling
+//!   delivers.
+//! * `sqlite_idempotent_redelivery_does_not_bump_4216` — GUARD (green on the
 //!   carrier): re-delivering the same row must not move `version`, or every
 //!   replay would raise spurious conflicts. A fix must keep it green.
+//!   `pg_idempotent_redelivery_does_not_bump_4216` is RED on the carrier (its
+//!   first assertion is the +1 for the content change) and pins the same
+//!   replay rule after it.
 //!
 //! Ruling: 5-agent vote 4d3ea1c5 (memory ea23f404), verdict A as amended by
 //! f2r (the change predicate EXCLUDES `crdt_field_clocks` and
@@ -318,6 +321,23 @@ mod sqlite {
     }
 
     #[test]
+    fn sqlite_an_honest_edit_of_a_row_parked_at_the_clamp_ceiling_still_replicates_4373() {
+        let (_dir, conn) = open();
+        let id = uuid::Uuid::new_v4().to_string();
+        // An enrolled peer legally parks a NEW row exactly at the clamp ceiling.
+        let ceiling = ai_memory::models::replicated_version::MAX_REPLICATED_VERSION;
+        db::insert_if_newer(&conn, &row(&id, ceiling, "parked", &soon())).expect("park");
+        assert_eq!(version_of(&conn, &id), ceiling);
+        edit(&conn, &id, "honest local edit", ceiling).expect("local edit");
+        let edited = db::get_any(&conn, &id).expect("read").expect("row");
+        assert_eq!(edited.version, ceiling + 1);
+        assert!(
+            ai_memory::validate::validate_memory(&edited).is_ok(),
+            "#4373: every peer must still accept the honest edit of a parked row"
+        );
+    }
+
+    #[test]
     fn sqlite_a_local_update_at_the_version_ceiling_saturates_4218() {
         let (_dir, conn) = open();
         let id = node_a_at_v3(&conn);
@@ -558,6 +578,27 @@ mod pg {
                 version_of(&store, &id).await,
                 before + 38,
                 "{f:?}: GREATEST + 1"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs AI_MEMORY_TEST_POSTGRES_URL"]
+    async fn pg_an_honest_edit_of_a_row_parked_at_the_clamp_ceiling_still_replicates_4373() {
+        let store = connect().await;
+        for f in FUNNELS {
+            let id = uuid::Uuid::new_v4().to_string();
+            let ceiling = ai_memory::models::replicated_version::MAX_REPLICATED_VERSION;
+            apply(&store, f, &row(&id, ceiling, "parked", &soon())).await;
+            assert_eq!(version_of(&store, &id).await, ceiling, "{f:?}");
+            edit(&store, &id, "honest local edit", ceiling)
+                .await
+                .expect("local edit");
+            let edited = store.get(&ctx(), &id).await.expect("read");
+            assert_eq!(edited.version, ceiling + 1, "{f:?}");
+            assert!(
+                ai_memory::validate::validate_memory(&edited).is_ok(),
+                "#4373 {f:?}: every peer must still accept the honest edit of a parked row"
             );
         }
     }

@@ -46,7 +46,7 @@
 //! could pin a row at `i64::MAX` on every node (the merge only ever takes the
 //! larger value) and overflow the next local `version + 1`. The inbound value
 //! is now refused at the shared receive validation above
-//! [`MAX_REPLICATED_VERSION`] (per item; the rest of the batch is applied),
+//! [`MAX_INBOUND_VERSION_REFUSAL`] (far above the clamp, #4373) (per item; the rest of the batch is applied),
 //! and every merge funnel that knows the local row clamps it to
 //! `local + MAX_INBOUND_VERSION_JUMP` ([`bounded_inbound_version`]). Every
 //! `+ 1` is saturating.
@@ -57,9 +57,17 @@ use crate::models::Memory;
 use crate::models::crdt_merge::NODE_LOCAL_METADATA_KEYS;
 use crate::models::field_names;
 
-/// Largest `version` a peer may replicate (2^40, about 1.1e12 edits). Far
-/// beyond any honest counter, far below the `i64::MAX` overflow edge.
+/// The merge-clamp ceiling for an inbound `version` (2^40, about 1.1e12 edits):
+/// far beyond any honest counter, far below the `i64::MAX` overflow edge.
 pub const MAX_REPLICATED_VERSION: i64 = 1 << 40;
+
+/// The receive-refusal bound (2^62): only a value FAR above the merge clamp is
+/// refused outright. It must leave headroom over [`MAX_REPLICATED_VERSION`]: a
+/// row a peer legally parked AT the clamp ceiling is then bumped by the next
+/// honest local edit to ceiling + 1, which every peer must still accept (#4373;
+/// with one shared value the edit was refused by every peer forever). The clamp,
+/// not this refusal, is what stops a peer pinning the counter.
+pub const MAX_INBOUND_VERSION_REFUSAL: i64 = 1 << 62;
 
 /// Largest step an inbound `version` may take over the local row's version in
 /// one merge (2^32). A peer that is honestly ahead by more than this is
@@ -71,16 +79,16 @@ const BOOKKEEPING_METADATA_KEYS: [&str; 2] =
     [field_names::CRDT_FIELD_CLOCKS, field_names::VERSION_VECTOR];
 
 /// Refuse an inbound replicated `version` that is negative or above
-/// [`MAX_REPLICATED_VERSION`] (#4218). Called from the shared receive
+/// [`MAX_INBOUND_VERSION_REFUSAL`] (#4218, #4373). Called from the shared receive
 /// validation, so a refusal is per item.
 ///
 /// # Errors
 ///
 /// A distinct `replicated version` error naming the bound.
 pub fn validate_replicated_version(version: i64) -> anyhow::Result<()> {
-    if !(0..=MAX_REPLICATED_VERSION).contains(&version) {
+    if !(0..=MAX_INBOUND_VERSION_REFUSAL).contains(&version) {
         anyhow::bail!(
-            "replicated version {version} is outside the accepted bound 0..={MAX_REPLICATED_VERSION} (#4218)"
+            "replicated version {version} is outside the accepted bound 0..={MAX_INBOUND_VERSION_REFUSAL} (#4218)"
         );
     }
     Ok(())
@@ -232,8 +240,10 @@ mod tests {
     fn bound_refuses_the_i64_max_pin_4218() {
         assert!(validate_replicated_version(i64::MAX).is_err());
         assert!(validate_replicated_version(-1).is_err());
-        assert!(validate_replicated_version(MAX_REPLICATED_VERSION + 1).is_err());
-        assert!(validate_replicated_version(MAX_REPLICATED_VERSION).is_ok());
+        assert!(validate_replicated_version(MAX_INBOUND_VERSION_REFUSAL + 1).is_err());
+        assert!(validate_replicated_version(MAX_INBOUND_VERSION_REFUSAL).is_ok());
+        // #4373: an honest edit of a row parked at the clamp ceiling replicates.
+        assert!(validate_replicated_version(MAX_REPLICATED_VERSION + 1).is_ok());
         assert!(validate_replicated_version(0).is_ok());
     }
 

@@ -18440,15 +18440,14 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
     // v1.0.0 #2383 (N1) — same atomic seal/upsert/reconcile unit as
     // `insert_inner`: only taken under at-rest encryption, and only when this
     // call owns the transaction (the federation receive loop wraps batches in
-    // its own tx). Encryption off ⇒ byte-identical to pre-#2383.
-    // v1.0.0 #2383 (N1) seal/upsert/reconcile atomicity AND #2954 append-only
-    // COW-SUPERSEDE probe/upsert/leaf atomicity share ONE `BEGIN IMMEDIATE`: the
-    // write lock is taken up front so BOTH the encryption reconcile and the
-    // newer-wins pre-image probe cannot race the upsert they bracket. Only taken
-    // when this call owns the connection (autocommit) and at least one of the
-    // two concerns is live (the federation receive loop wraps batches in its own
-    // tx, whose lock already covers both). Neither concern live ⇒ byte-identical
-    // legacy path.
+    // its own tx).
+    // v1.0.0 #2383 (N1) seal/upsert/reconcile atomicity, #2954 append-only
+    // COW-SUPERSEDE probe/upsert/leaf atomicity AND the #4216 pre-image/upsert/
+    // version-bump unit share ONE `BEGIN IMMEDIATE`: the write lock is taken up
+    // front so the encryption reconcile, the newer-wins pre-image probe and the
+    // version rule cannot race the upsert they bracket. Taken whenever this call
+    // owns the connection (autocommit); the federation receive loop wraps
+    // batches in its own tx, whose lock already covers all of them.
     // #4216 — ALWAYS own the tx when the caller has none: the version rule
     // reads the slot pre-image and writes the bump around the upsert.
     let owns_tx = conn.is_autocommit();
@@ -18741,13 +18740,12 @@ pub fn merge_inbound(
                 // byte-identical to the verified inbound, restore `agent_attested`.
                 // No-op when `receiver_verified` is false (every non-receive
                 // caller) — byte-identical legacy merge.
-                let merged = crate::models::reassert_verified_attestation(
+                let mut merged = crate::models::reassert_verified_attestation(
                     merged,
                     inbound,
                     receiver_verified,
                 );
                 // #4216 — a merge that changed user data moves the version.
-                let mut merged = merged;
                 crate::models::replicated_version::apply_version_rule(&existing, &mut merged);
                 overwrite_full_row_by_id(conn, &merged)?;
                 Ok(Some(merged.id))

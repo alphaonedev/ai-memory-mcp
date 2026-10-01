@@ -21,6 +21,23 @@ pub(super) struct SlotPreimage {
     memory: Option<Memory>,
 }
 
+/// Read a row for the change comparison. A read or decode failure is logged
+/// with the row id (ERRORS-19) and kept as `None`, which the rule treats as
+/// CHANGED (the safe direction).
+fn read_for_compare(conn: &Connection, id: &str) -> Option<Memory> {
+    match super::get_any(conn, id) {
+        Ok(row) => row,
+        Err(e) => {
+            tracing::warn!(
+                memory_id = %id,
+                error = %e,
+                "#4216: could not read a row to compare a federation merge; treating it as changed"
+            );
+            None
+        }
+    }
+}
+
 /// Read the slot row, if any, before the upsert.
 pub(super) fn read_slot_preimage(
     conn: &Connection,
@@ -38,7 +55,7 @@ pub(super) fn read_slot_preimage(
         )
         .optional()?;
     Ok(found.map(|(id, version)| SlotPreimage {
-        memory: super::get_any(conn, &id).ok().flatten(),
+        memory: read_for_compare(conn, &id),
         id,
         version,
     }))
@@ -54,7 +71,7 @@ pub(super) fn bump_if_user_data_changed(
     merged_id: &str,
 ) -> Result<()> {
     let Some(pre) = pre else { return Ok(()) };
-    let post = super::get_any(conn, merged_id).ok().flatten();
+    let post = read_for_compare(conn, merged_id);
     let changed = match (pre.memory.as_ref(), post.as_ref()) {
         (Some(before), Some(after)) => user_data_changed(before, after),
         // An unreadable side cannot prove "unchanged": fail toward the bump.

@@ -9124,7 +9124,7 @@ pub async fn sync_cycle_once(
         let mut apply_halted = false;
         let mut last_durable: Option<String> = None;
         for mem in &pulled.memories {
-            if crate::validate::RequestValidator::validate_memory(mem).is_err() {
+            if !crate::federation::receive::catchup_row_valid(peer_key, mem) {
                 continue;
             }
             // #2715 (CB-11 / B-4) — per-write content attestation, the pull

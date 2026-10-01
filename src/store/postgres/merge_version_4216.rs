@@ -45,17 +45,35 @@ pub(super) async fn read_slot_preimage(
         .map_err(|e| to_store_err("apply_remote_memory slot version", e))?;
     Ok(Some(SlotPreimage {
         version,
-        memory: read_memory(tx, &id).await,
+        memory: read_memory(tx, &id).await?,
     }))
 }
 
-async fn read_memory(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, id: &str) -> Option<Memory> {
+/// Read one row for the change comparison. A SQL error is PROPAGATED (a
+/// swallowed one would abort the tx and surface later as 25P02, hiding the root
+/// cause); only a mapper / decrypt failure is logged with the row id and kept as
+/// `None`, which the rule treats as CHANGED (the safe direction).
+async fn read_memory(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    id: &str,
+) -> StoreResult<Option<Memory>> {
     let row = sqlx::query(&SQL_SELECT_MEMORY_ROW_BY_ID)
         .bind(id)
         .fetch_optional(&mut **tx)
         .await
-        .ok()??;
-    PostgresStore::row_to_memory(&row).ok()
+        .map_err(|e| to_store_err("apply_remote_memory compare read", e))?;
+    let Some(row) = row else { return Ok(None) };
+    match PostgresStore::row_to_memory(&row) {
+        Ok(memory) => Ok(Some(memory)),
+        Err(e) => {
+            tracing::warn!(
+                memory_id = %id,
+                error = %e,
+                "#4216: could not decode a row to compare a federation merge; treating it as changed"
+            );
+            Ok(None)
+        }
+    }
 }
 
 /// After the upsert: when the merge changed the slot row's user data, move its
@@ -68,7 +86,7 @@ pub(super) async fn bump_if_user_data_changed(
     merged_id: &str,
 ) -> StoreResult<()> {
     let Some(pre) = pre else { return Ok(()) };
-    let post = read_memory(tx, merged_id).await;
+    let post = read_memory(tx, merged_id).await?;
     let changed = match (pre.memory.as_ref(), post.as_ref()) {
         (Some(before), Some(after)) => user_data_changed(before, after),
         // An unreadable side cannot prove "unchanged": fail toward the bump.
