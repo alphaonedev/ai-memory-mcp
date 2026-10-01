@@ -36,7 +36,7 @@ Spans do **not** contain memory content, embeddings, prompts, recall results, or
 
 `ai-memory` makes one binding commitment about telemetry that distinguishes it from competing memory stacks and most observability libraries:
 
-> **No outbound network connection is initiated by the binary except to destinations the operator has explicitly configured.**
+> **No outbound network connection is initiated by the binary except to destinations the operator has explicitly configured — with one default exception: a one-time model download from HuggingFace on first start under the default `semantic` tier (below).**
 
 That means:
 
@@ -44,7 +44,7 @@ That means:
 - **No third-party SaaS sinks compiled in.** There is no Datadog client, no Honeycomb client, no Sentry hook, and no PostHog beacon in the binary. Adding one is an operator choice via the file-logging path or a custom hook.
 - **`RUST_LOG` controls verbosity, not destination.** Setting `RUST_LOG=ai_memory=debug` increases what the binary records to stderr or your configured file sink. It does not change where logs go.
 
-If you build with default Cargo features, the only outbound network calls the binary can make are: (a) federation push/pull to peers on your mTLS allowlist, (b) embedder fetches from HuggingFace if you have explicitly enabled the smart tier, and (c) LLM completions to your configured Ollama endpoint if you have enabled the autonomous tier. All three are off by default and named in the verbose `ai-memory doctor` report.
+If you build with default Cargo features, the only outbound network calls the binary can make are: (a) federation push/pull to peers on your mTLS allowlist; (b) a one-time embedder model download (all-MiniLM-L6-v2) from HuggingFace on first start under the **default** `semantic` tier, plus the cross-encoder model on first use of the `autonomous` tier — skipped with the `keyword` tier, or when the model is pre-staged and `AI_MEMORY_EMBED_OFFLINE=1` / `HF_HUB_OFFLINE=1` is set; and (c) LLM and API-embedding calls to the endpoint you configure (`AI_MEMORY_LLM_BACKEND` / `[llm]`, `AI_MEMORY_EMBED_BACKEND` / `[embeddings]`), on any tier. (a) and (c) are off until you configure them; (b) is **on by default** (the tier defaults to `semantic`, `src/config.rs`, and the offline flags default to off, `src/embeddings.rs::remote_fetch_disabled`). An air-gapped or regulated deployment should pre-stage the model and set the offline flag, or run `--tier keyword`.
 
 ---
 
