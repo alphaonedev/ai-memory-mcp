@@ -1907,6 +1907,24 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
         return Ok(());
     }
     if version == CURRENT_SCHEMA_VERSION {
+        // #4078: older binaries stamped v100 after dropping the v96 clear
+        // triggers. Repair that derived state even when no ladder runs.
+        // Probe first so a healthy store does not take another writer lock.
+        let clear_trigger_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name IN (?1, ?2)",
+            params![
+                crate::storage::embed_skip::TRIGGER_CLEAR_ON_CONTENT,
+                crate::storage::embed_skip::TRIGGER_CLEAR_ON_EMBED,
+            ],
+            |row| row.get(0),
+        )?;
+        if clear_trigger_count != 2 {
+            // ERRORS-02: propagate DDL/commit failures; the guard rolls back
+            // both definitions together if repair cannot complete.
+            let repair_txn = super::connection::WriteTxn::begin_exclusive(conn)?;
+            crate::storage::embed_skip::repair_sqlite_after_trigger_gap(conn)?;
+            repair_txn.commit()?;
+        }
         return Ok(());
     }
 
@@ -1948,8 +1966,8 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
         // revalidates every trigger body on RENAME / ALTER; a trigger
         // whose WHEN clause names `NEW.embedding` blows up on a
         // mid-ladder `memories` table that has not grown that column
-        // yet (v3). Idempotent. Recreated only by the v96 arm, and
-        // only when `embedding` exists.
+        // yet (v3). Idempotent. Recreated at the migration tail for ALL
+        // starting versions, and only when `embedding` exists.
         crate::storage::embed_skip::drop_sqlite_clear_triggers(conn)?;
         if version < 2 {
             let mut has_confidence = false;
@@ -4607,6 +4625,13 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
                 CURRENT_SCHEMA_VERSION
             )));
         }
+
+        // #4078: entry dropped these before any ALTER. The v96 arm is
+        // skipped by v96-v99 stores, so restore the final definitions here
+        // inside the SAME transaction, before publishing the new version. The
+        // skip cache is cleared with them: rows edited while the triggers were
+        // absent would otherwise keep a stale marker (L8 finding on #4078).
+        crate::storage::embed_skip::repair_sqlite_after_trigger_gap(conn)?;
 
         conn.execute(SQL_CLEAR_SCHEMA_VERSION, [])?;
         conn.execute(

@@ -3,14 +3,16 @@ Description=ai-memory sync-daemon — pulls/pushes memories to peer instances
 Documentation=https://github.com/alphaonedev/ai-memory-mcp
 After=network-online.target ai-memory.service
 Wants=network-online.target
-# Co-running only — sync-daemon talks to the local ai-memory.service via its
-# HTTP port, so the parent service must be up.
+# Sync opens the same local database directly and contacts peers over HTTP.
+# Start after the parent service has initialized that database.
 Requires=ai-memory.service
 
 [Service]
 Type=simple
 User=ai-memory
 Group=ai-memory
+Environment=AI_MEMORY_DB=/var/lib/ai-memory/ai-memory.db
+WorkingDirectory=/var/lib/ai-memory
 # Peers are per-deployment. Set via Environment file or drop-in:
 #   /etc/ai-memory/sync.env   →   PEERS=https://peer-a.example:9077,https://peer-b.example:9077
 EnvironmentFile=-/etc/ai-memory/sync.env
