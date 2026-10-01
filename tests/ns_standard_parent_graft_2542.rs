@@ -260,7 +260,8 @@ fn r2_inferred_cross_tenant_graft_excluded_from_governance() {
     );
 
     // But the attacker's `acme` policy must NOT govern the victim's `acme-sub`.
-    let resolved = db::resolve_governance_policy(&conn, "acme-sub");
+    let resolved =
+        db::resolve_governance_policy(&conn, "acme-sub").expect("#4043: governance policy read");
     assert!(
         resolved.is_none(),
         "#2542 Route 2: a CROSS-TENANT inferred ancestor must not layer governance; got {resolved:?}"
@@ -275,7 +276,7 @@ fn r2_same_owner_inferred_hierarchy_keeps_governance() {
     seed_standard_row(&conn, "acme", ALICE, Some(approve_gov(None)), None);
     seed_standard_row(&conn, "acme-sub", ALICE, None, None); // auto-detects `acme`
 
-    let resolved = db::resolve_governance_policy(&conn, "acme-sub").expect(
+    let resolved = db::resolve_governance_policy(&conn, "acme-sub").expect("#4043: governance policy read").expect(
         "#2542 Route 2: a SAME-OWNER inferred ancestor keeps governance (operator's own hierarchy)",
     );
     assert_eq!(resolved.core.write, GovernanceLevel::Approve);
@@ -293,9 +294,11 @@ fn r2_explicit_same_owner_flat_hierarchy_inherits_approval_gate() {
     seed_standard_row(&conn, "acme-corp", OP, Some(approve_gov(Some(1))), None);
     seed_standard_row(&conn, "acme-corp-frontend", OP, None, Some("acme-corp"));
 
-    let resolved = db::resolve_governance_policy(&conn, "acme-corp-frontend").expect(
-        "#2542 Finding 1: an explicitly-declared same-owner parent MUST layer its governance",
-    );
+    let resolved = db::resolve_governance_policy(&conn, "acme-corp-frontend")
+        .expect("#4043: governance policy read")
+        .expect(
+            "#2542 Finding 1: an explicitly-declared same-owner parent MUST layer its governance",
+        );
     assert_eq!(
         resolved.core.write,
         GovernanceLevel::Approve,
@@ -320,9 +323,11 @@ fn r2_explicit_non_coincident_same_owner_parent_inherits() {
     seed_standard_row(&conn, "orgpolicy", ALICE, Some(approve_gov(None)), None);
     seed_standard_row(&conn, "teamspace", ALICE, None, Some("orgpolicy"));
 
-    let resolved = db::resolve_governance_policy(&conn, "teamspace").expect(
-        "#2542 Route 2: an explicitly-declared same-owner parent MUST layer its governance",
-    );
+    let resolved = db::resolve_governance_policy(&conn, "teamspace")
+        .expect("#4043: governance policy read")
+        .expect(
+            "#2542 Route 2: an explicitly-declared same-owner parent MUST layer its governance",
+        );
     assert_eq!(resolved.core.write, GovernanceLevel::Approve);
     assert_eq!(resolved.core.approver, ApproverType::Human);
 }
@@ -335,7 +340,8 @@ fn r2_explicit_cross_tenant_parent_excluded_from_governance() {
     seed_standard_row(&conn, "victimns", ATTACKER, Some(approve_gov(None)), None);
     seed_standard_row(&conn, "childns", ALICE, None, Some("victimns"));
 
-    let resolved = db::resolve_governance_policy(&conn, "childns");
+    let resolved =
+        db::resolve_governance_policy(&conn, "childns").expect("#4043: governance policy read");
     assert!(
         resolved.is_none(),
         "#2542 Route 2: a cross-tenant explicit parent must not layer governance; got {resolved:?}"
@@ -354,7 +360,8 @@ fn r2_toctou_unowned_parent_bound_later_is_excluded() {
     // Later: the victim binds a governed standard at victimns.
     seed_standard_row(&conn, "victimns", ALICE, Some(approve_gov(None)), None);
 
-    let resolved = db::resolve_governance_policy(&conn, "attackerns");
+    let resolved =
+        db::resolve_governance_policy(&conn, "attackerns").expect("#4043: governance policy read");
     assert!(
         resolved.is_none(),
         "#2542 Finding 2: a parent bound by another tenant AFTER the graft must not \
@@ -381,7 +388,9 @@ fn r2_federation_in_scope_same_owner_parent_applies_through_unowned_leaf() {
     // `alpha/sub` has NO standard of its own — an unowned `/`-child.
 
     assert_eq!(
-        db::resolve_governance_policy(&conn, "alpha/sub").map(|p| p.core.write),
+        db::resolve_governance_policy(&conn, "alpha/sub")
+            .expect("#4043: governance policy read")
+            .map(|p| p.core.write),
         Some(GovernanceLevel::Any),
         "#2542/#2479: a same-owner in-scope parent must govern an unowned `/`-child \
          (per-hop entitlement against the declarer, not the leaf)"

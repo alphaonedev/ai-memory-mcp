@@ -309,7 +309,9 @@ async fn resolved_write_level(
     namespace: &str,
 ) -> Option<ai_memory::models::GovernanceLevel> {
     let guard = db.lock().await;
-    ai_memory::db::resolve_governance_policy(&guard.0, namespace).map(|p| p.core.write)
+    ai_memory::db::resolve_governance_policy(&guard.0, namespace)
+        .expect("#4043: governance policy read")
+        .map(|p| p.core.write)
 }
 
 async fn memory_exists(db: &ai_memory::handlers::Db, id: &str) -> bool {

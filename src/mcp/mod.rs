@@ -4520,6 +4520,8 @@ pub fn run_mcp_server(
     // (single-operator trust-all default). The `?` makes the refuse posture
     // abort MCP startup before the stdio loop opens.
     crate::identity::enforce_owner_lockout_guard(&conn)?;
+    // #4285 — boot WARN listing every corrupt governance standard.
+    crate::storage::boot_warn_corrupt_governance_standards(&conn);
 
     // v1.0.0 #3383 — seed the process-wide admin allowlist from the resolved
     // operator configuration. MCP stdio has no `AppState`, so before this the
@@ -12840,6 +12842,10 @@ mod tests {
     #[test]
     fn handle_reflect_approval_gate_queues_pending_above_threshold() {
         // Configure namespace with `require_approval_above_depth = 1`.
+        // #4285 — the fixture is a VALID policy on purpose (`write: any`): a
+        // knob-only blob is a corrupt level whose Owner floor refuses this
+        // non-owner caller before the gate; that shape is pinned by
+        // `tests/corrupt_governance_escape_4285.rs`.
         // A reflection that would land at depth 2 must be intercepted
         // BEFORE the substrate write, returning a `status: "pending"`
         // envelope with a fresh pending_id.
@@ -12847,7 +12853,7 @@ mod tests {
         reflect_test_seed_governance(
             &conn,
             "team/r-approve",
-            json!({"require_approval_above_depth": 1}),
+            json!({"write": "any", "require_approval_above_depth": 1}),
         );
         let s1 = reflect_test_seed_source(&conn, "team/r-approve", "src-1", 1);
         let req = make_tools_call(
@@ -13168,7 +13174,7 @@ mod tests {
         reflect_test_seed_governance(
             &conn,
             "team/r-defgate",
-            json!({"require_approval_above_depth": 0}),
+            json!({"write": "any", "require_approval_above_depth": 0}),
         );
         let s1 = reflect_test_seed_source(&conn, "team/r-defgate", "src", 0);
         let req = make_tools_call(
