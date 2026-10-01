@@ -1,657 +1,234 @@
+<!DOCTYPE html>
 <!--
   Copyright 2026 AlphaOne LLC
   SPDX-License-Identifier: Apache-2.0
-  T3 — Multi-node cluster. W-of-N quorum writes shipping today.
+  Tier 3 · Federated cluster (v1.0.0 GA).
+  Theme: the shared landing-page tokens in assets/site-theme.css (#4420).
+  Every capability drawn here is backed by code on the v1.0.0 tree; the
+  commit that introduced this page cites file:line for each one.
 -->
-<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>ai-memory · T3 — Multi-node cluster</title>
-<meta name="description" content="4 nodes × 5 agents per node, replicating via sync_push peer mesh. Memories, links, governance & pending decisions fan out across the cluster with vector-clock causality.">
-<meta property="og:title" content="ai-memory · T3 — Multi-node cluster">
-<meta property="og:description" content="W-of-N quorum writes, mTLS fingerprint allowlist, federated governance — all shipping today.">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ai-memory · Tier 3: federated cluster</title>
+<meta name="description" content="Tier 3 of ai-memory v1.0.0: several daemons in one rack replicate over mutual TLS with Ed25519-signed pushes, W-of-N quorum writes, the 202 under-replication contract, catch-up pulls, erasure propagation and cross-host wakes.">
+<meta name="theme-color" content="#0c0b08">
 <link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/architectures-t3.html">
-<style>
-:root{--bg:#000;--bg-raised:#0a0a0a;--bg-card:#111;--bg-elev:#161616;--bg-code:#1a1a1a;--border:#262626;--border-hl:#3d3d3d;--text:#fff;--text-muted:#999;--text-dim:#666;--p1:#6ee7ff;--p2:#ffb86b;--p3:#c8a2ff;--good:#6ee7ff;--bad:#ff6b9d;--gold:#ffd700;--font-mono:'SF Mono','Cascadia Code','Fira Code',Consolas,monospace;--font-sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;--max-w:1280px}
-*,*::before,*::after{margin:0;padding:0;box-sizing:border-box}
-html{scroll-behavior:smooth;scroll-padding-top:5rem}
-body{font-family:var(--font-sans);background:var(--bg);color:var(--text);line-height:1.6;-webkit-font-smoothing:antialiased;overflow-x:hidden}
-a{color:var(--text);text-decoration:none}a:hover{color:var(--p1)}
-code{font-family:var(--font-mono);font-size:.85rem;background:var(--bg-code);padding:.1em .35em;border-radius:4px}
-pre{font-family:var(--font-mono);font-size:.85rem;background:var(--bg-code);padding:1rem 1.1rem;border-radius:8px;border:1px solid var(--border);overflow-x:auto;line-height:1.55;color:var(--text-muted);margin:1rem 0}
-pre code{padding:0;background:none}
-.container{max-width:var(--max-w);margin:0 auto;padding:0 1.5rem}
-h1,h2,h3{font-weight:700;letter-spacing:-0.02em}h2{font-size:1.6rem;margin-bottom:.5rem;font-family:var(--font-mono)}h3{font-size:1.05rem;margin:1rem 0 .35rem}
-p{color:var(--text-muted);margin-bottom:.85rem}
-.topnav{position:sticky;top:0;z-index:50;background:rgba(0,0,0,0.85);backdrop-filter:blur(12px);border-bottom:1px solid var(--border)}
-.topnav .inner{display:flex;justify-content:space-between;max-width:var(--max-w);margin:0 auto;padding:.9rem 1.5rem;font-size:.875rem}
-.topnav a{color:var(--text-muted);margin-right:1.25rem}.topnav a:hover{color:var(--text)}
-.topnav .home-link{color:var(--text);font-weight:600}
-.topnav .right{display:flex;gap:1.25rem;flex-wrap:wrap}@media(max-width:800px){.topnav .right{display:none}}
-.hero{padding:4rem 1.5rem 2.5rem;text-align:center;background:radial-gradient(ellipse at center,rgba(200,162,255,0.08),transparent 60%);border-bottom:1px solid var(--border)}
-.hero h1{font-size:clamp(1.8rem,4vw,2.75rem);line-height:1.1;letter-spacing:-0.03em;margin-bottom:1rem}
-.hero .tagline{color:var(--text-muted);font-size:1.05rem;max-width:780px;margin:0 auto 1rem}
-.hero .pills{display:flex;justify-content:center;gap:.5rem;flex-wrap:wrap;margin-top:1.25rem}
-.hero .pill{padding:.4rem 1rem;border:1px solid var(--border-hl);border-radius:999px;font-family:var(--font-mono);font-size:.78rem;color:var(--text-muted)}
-
-section{padding:3rem 0;border-bottom:1px solid var(--border)}
-.eyebrow{display:inline-block;font-size:.72rem;font-weight:600;letter-spacing:.12em;text-transform:uppercase;color:var(--text-muted);margin-bottom:.5rem;padding:.2rem .6rem;border:1px solid var(--border-hl);border-radius:999px}
-.lede{color:var(--text-muted);font-size:.95rem;max-width:820px;margin-bottom:2rem}
-section h2{font-family:var(--font-sans);font-size:1.6rem;margin-bottom:.6rem}
-
-footer{padding:3rem 1.5rem;text-align:center;font-size:.85rem;color:var(--text-dim);border-top:1px solid var(--border)}
-footer a{color:var(--text-muted)}
-
-/* Grouped dropdown menu */
-.topnav .menu{position:relative;display:inline-block}
-.topnav .menu-btn{background:none;border:none;color:var(--text-muted);font-family:inherit;font-size:inherit;cursor:pointer;padding:.2rem 0;line-height:1;letter-spacing:0}
-.topnav .menu-btn:hover,.topnav .menu:focus-within .menu-btn{color:var(--text)}
-.topnav .menu-btn.active{color:var(--text)}
-.topnav .menu-btn .caret{opacity:.5;font-size:.7em;margin-left:.2em}
-.topnav .menu-pane{position:absolute;top:calc(100% + .55rem);right:0;background:var(--bg-card);border:1px solid var(--border-hl);border-radius:8px;padding:.4rem 0;min-width:240px;box-shadow:0 10px 28px rgba(0,0,0,0.5);z-index:60;visibility:hidden;opacity:0;transition:opacity .12s ease,visibility 0s .12s}
-.topnav .menu:focus-within .menu-pane,.topnav .menu:hover .menu-pane{visibility:visible;opacity:1;transition:opacity .12s ease}
-.topnav .menu-pane a{display:block;padding:.5rem 1rem;color:var(--text-muted);font-size:.85rem;margin-right:0;white-space:nowrap;text-decoration:none}
-.topnav .menu-pane a:hover{background:var(--bg-elev);color:var(--text)}
-.topnav .menu-pane a.current{color:var(--p1);background:var(--bg-elev)}
-
-/* capability badges */
-.cap-badge{display:inline-block;padding:.15em .55em;font-family:var(--font-mono);font-size:.7rem;font-weight:600;border-radius:4px;border:1px solid;letter-spacing:.04em;margin:.1em .15em}
-.cap-today{color:#6ee7ff;border-color:#2a6571;background:rgba(110,231,255,.08)}
-.cap-roadmap{color:#c8a2ff;border-color:#5a4280;background:rgba(200,162,255,.08)}
-.cap-partial{color:#ffb86b;border-color:#7a5328;background:rgba(255,184,107,.08)}
-.cap-future{color:#ff6b9d;border-color:#7a3251;background:rgba(255,107,157,.08)}
-
-/* arch-diagram block */
-.arch-diagram{background:var(--bg-card);border:1px solid var(--border);border-radius:14px;padding:1.5rem;margin:1.5rem 0}
-.arch-diagram-title{font-family:var(--font-mono);font-size:.85rem;color:var(--p2);letter-spacing:.04em;margin-bottom:1rem;text-transform:uppercase}
-.arch-svg{width:100%;height:auto;display:block;background:#0a0a0a;border-radius:8px}
-.arch-svg .node{fill:#161616;stroke:#3d3d3d;stroke-width:1.2}
-.arch-svg .node-label{fill:#fff;font-family:'SF Mono',monospace;font-size:12px;font-weight:600}
-.arch-svg .sub-label{fill:#999;font-family:'SF Mono',monospace;font-size:10px}
-.arch-svg .edge{fill:none}
-.arch-svg .edge-dashed{fill:none;stroke:#666;stroke-width:1.2;stroke-dasharray:4 3}
-.arch-svg .edge-roadmap{fill:none;stroke:#a78bfa;stroke-width:1.4;stroke-dasharray:5 4;opacity:.7}
-.arch-svg .flow{filter:drop-shadow(0 0 4px currentColor)}
-.arch-svg .flow-write{fill:#f97316;color:#f97316}
-.arch-svg .flow-recall{fill:#2dd4bf;color:#2dd4bf}
-.arch-svg .flow-sync{fill:#a78bfa;color:#a78bfa}
-.arch-svg .flow-policy{fill:#facc15;color:#facc15}
-.arch-svg .flow-attest{fill:#f472b6;color:#f472b6}
-.arch-svg .ring{fill:none;stroke:#6ee7ff;stroke-width:2;opacity:.7;animation:pulse 2.4s ease-out infinite}
-@keyframes pulse{0%{r:6;opacity:.85}100%{r:18;opacity:0}}
-.arch-legend{display:flex;flex-wrap:wrap;gap:1rem;margin-top:1rem;font-family:var(--font-mono);font-size:.75rem;color:var(--text-muted)}
-.arch-legend-item{display:inline-flex;align-items:center;gap:.4rem}
-.arch-legend-dot{display:inline-block;width:10px;height:10px;border-radius:50%}
-.arch-diagram-caption{font-size:.85rem;color:var(--text-dim);margin-top:1rem;line-height:1.5}
-
-ul,ol{padding-left:1.5rem;color:var(--text-muted);font-size:.92rem;margin:.5rem 0 1rem}
-ul li,ol li{margin-bottom:.4rem}
-
-table{width:100%;border-collapse:collapse;margin:1rem 0 1.5rem;font-size:.85rem;background:var(--bg-card);border:1px solid var(--border);border-radius:10px;overflow:hidden}
-table th,table td{padding:.65rem .85rem;text-align:left;border-bottom:1px solid var(--border)}
-table th{background:var(--bg-elev);font-family:var(--font-mono);font-size:.78rem;font-weight:600;color:var(--text);letter-spacing:.04em}
-table td{color:var(--text-muted)}
-table tr:last-child td{border-bottom:none}
-@media (prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important;scroll-behavior:auto!important}}
-
-/* Zero-JS mobile nav fallback — visible only when .right collapses */
-.topnav .mnav{display:none;position:relative}
-.topnav .mnav summary{list-style:none;cursor:pointer;color:var(--text-muted);border:1px solid var(--border-hl);border-radius:6px;padding:.3rem .8rem;font-size:.85rem;user-select:none}
-.topnav .mnav summary::-webkit-details-marker{display:none}
-.topnav .mnav[open] summary{color:var(--text);border-color:var(--text-muted)}
-.topnav .mnav-pane{position:absolute;top:calc(100% + .55rem);right:0;background:var(--bg-card);border:1px solid var(--border-hl);border-radius:8px;padding:.4rem 0;min-width:250px;max-height:72vh;overflow-y:auto;box-shadow:0 10px 28px rgba(0,0,0,0.5);z-index:60}
-.topnav .mnav-pane a{display:block;padding:.45rem 1rem;color:var(--text-muted);font-size:.85rem;margin:0;white-space:nowrap}
-.topnav .mnav-pane a:hover{background:var(--bg-elev);color:var(--text)}
-.topnav .mnav-group{padding:.6rem 1rem .25rem;font-family:var(--font-mono);font-size:.66rem;letter-spacing:.12em;text-transform:uppercase;color:var(--text-dim)}
-@media(max-width:800px){.topnav .mnav{display:block}}
-</style>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700;800;900&amp;family=IBM+Plex+Sans:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@500;600&amp;display=swap">
+<link rel="stylesheet" href="assets/site-theme.css">
 </head>
-<body>
-
-<nav class="topnav">
-  <div class="inner">
-    <a class="home-link" href="./">ai-memory <span style="opacity:.5">▸ Architectures · T3</span></a>
-    <div class="right">
-      <a href="at-a-glance.html" style="color:#6ee7ff">Atlas</a>
-      <a href="whats-new-v09.html" style="color:#ffb86b">What's new</a>
-      <div class="menu">
-        <button class="menu-btn">Audiences<span class="caret">▾</span></button>
-        <div class="menu-pane">
-          <a href="for-everyone.html">For Everyone</a>
-          <a href="audience/decision-maker.html">Decision Maker</a>
-          <a href="audience/developer.html">Developer</a>
-          <a href="audience/operator.html">Operator</a>
-          <a href="feature-matrix.html">Feature Matrix</a>
-          <a href="data-flow.html">Data Flow</a>
-          <a href="integrations.html">Integrations</a>
-          <a href="import-history.html">Import History</a>
-          <a href="release-pipeline.html">Release Pipeline</a>
-        </div>
-      </div>
-      <div class="menu">
-        <button class="menu-btn">Features<span class="caret">▾</span></button>
-        <div class="menu-pane">
-          <a href="memory-tiers.html">Memory Tiers</a>
-          <a href="memory-rules.html">Memory Rules</a>
-          <a href="ttl-controls.html">TTL Controls</a>
-          <a href="archival.html">Archival</a>
-          <a href="encryption.html">Encryption</a>
-          <a href="hierarchies.html">Hierarchies</a>
-          <a href="knowledge-graph.html">Knowledge Graph</a>
-          <a href="autonomous.html">Autonomous</a>
-          <a href="a2a-messaging.html">A2A Messaging</a>
-          <a href="a2a-integration.html">Integrate an Agent</a>
-          <a href="lifecycle.html">Lifecycle</a>
-          <a href="performance.html">Performance</a>
-          <a href="agent-identity.html">Agent Identity (NHI)</a>
-          <a href="zero-touch-trust.html">Zero-Touch Trust</a>
-        </div>
-      </div>
-      <div class="menu">
-        <button class="menu-btn active">Architectures<span class="caret">▾</span></button>
-        <div class="menu-pane">
-          <a href="architectures.html">Overview</a>
-          <a href="architectures-t1.html">T1 — Single Agent</a>
-          <a href="architectures-t2.html">T2 — Many Agents</a>
-          <a href="architectures-t3.html" class="current">T3 — Multi-Node Cluster</a>
-          <a href="architectures-t4.html">T4 — Data-Center Swarm</a>
-          <a href="architectures-t5.html">T5 — Global Hive</a>
-          <a href="reference-architecture/">Grand Slam — 3-Region Hive</a>
-          <a href="reference-architecture/enterprise-cpu-memory.html">Enterprise — CPU+Memory Nodes</a>
-          <a href="reference-architecture/enterprise-cpu-memory-gpu.html">Enterprise — CPU+Memory+GPU Nodes</a>
-        </div>
-      </div>
-      <div class="menu">
-        <button class="menu-btn">Internals<span class="caret">▾</span></button>
-        <div class="menu-pane">
-          <a href="schema.html">Schema</a>
-          <a href="types.html">Types</a>
-          <a href="validators.html">Validators</a>
-          <a href="governance.html">Governance</a>
-          <a href="batman-active-mode.html">Batman Mode</a>
-          <a href="tracing.html">Tracing</a>
-          <a href="spec/v1.html">Portability Spec v1</a>
-        </div>
-      </div>
-      <div class="menu">
-        <button class="menu-btn">Evidence<span class="caret">▾</span></button>
-        <div class="menu-pane">
-          <a href="evidence.html">Frozen Claims</a>
-          <a href="evidence/">Evidence Hub (campaigns)</a>
-          <a href="performance.html">Performance budgets</a>
-          <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/benchmarks/longmemeval/results.md">LongMemEval variants</a>
-        </div>
-      </div>
-      <a href="credits.html">Credits</a>
-      <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub →</a>
-    </div>
-    <details class="mnav">
-      <summary>Menu</summary>
-      <div class="mnav-pane">
-        <a href="./">Home</a>
-        <a href="at-a-glance.html">Atlas</a>
-        <a href="whats-new-v09.html">What's new</a>
-        <div class="mnav-group">Audiences</div>
-        <a href="for-everyone.html">For Everyone</a>
-        <a href="audience/decision-maker.html">Decision Maker</a>
-        <a href="audience/developer.html">Developer</a>
-        <a href="audience/operator.html">Operator</a>
-        <a href="feature-matrix.html">Feature Matrix</a>
-        <a href="data-flow.html">Data Flow</a>
-        <a href="integrations.html">Integrations</a>
-        <a href="import-history.html">Import History</a>
-        <a href="release-pipeline.html">Release Pipeline</a>
-        <div class="mnav-group">Features</div>
-        <a href="memory-tiers.html">Memory Tiers</a>
-        <a href="memory-rules.html">Memory Rules</a>
-        <a href="ttl-controls.html">TTL Controls</a>
-        <a href="archival.html">Archival</a>
-        <a href="encryption.html">Encryption</a>
-        <a href="hierarchies.html">Hierarchies</a>
-        <a href="knowledge-graph.html">Knowledge Graph</a>
-        <a href="autonomous.html">Autonomous</a>
-        <a href="a2a-messaging.html">A2A Messaging</a>
-          <a href="a2a-integration.html">Integrate an Agent</a>
-        <a href="lifecycle.html">Lifecycle</a>
-        <a href="performance.html">Performance</a>
-        <a href="agent-identity.html">Agent Identity (NHI)</a>
-        <a href="zero-touch-trust.html">Zero-Touch Trust</a>
-        <div class="mnav-group">Architectures</div>
-        <a href="architectures.html">Overview</a>
-        <a href="architectures-t1.html">T1 — Single Agent</a>
-        <a href="architectures-t2.html">T2 — Many Agents</a>
-        <a href="architectures-t3.html">T3 — Multi-Node Cluster</a>
-        <a href="architectures-t4.html">T4 — Data-Center Swarm</a>
-        <a href="architectures-t5.html">T5 — Global Hive</a>
-        <a href="reference-architecture/">Grand Slam — 3-Region Hive</a>
-        <a href="reference-architecture/enterprise-cpu-memory.html">Enterprise — CPU+Memory Nodes</a>
-        <a href="reference-architecture/enterprise-cpu-memory-gpu.html">Enterprise — CPU+Memory+GPU Nodes</a>
-        <div class="mnav-group">Internals</div>
-        <a href="schema.html">Schema</a>
-        <a href="types.html">Types</a>
-        <a href="validators.html">Validators</a>
-        <a href="governance.html">Governance</a>
-        <a href="batman-active-mode.html">Batman Mode</a>
-        <a href="tracing.html">Tracing</a>
-        <a href="spec/v1.html">Portability Spec v1</a>
-        <div class="mnav-group">Evidence</div>
-        <a href="evidence.html">Frozen Claims</a>
-        <a href="evidence/">Evidence Hub (campaigns)</a>
-        <a href="performance.html">Performance budgets</a>
-        <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/benchmarks/longmemeval/results.md">LongMemEval variants</a>
-        <div class="mnav-group">More</div>
-        <a href="credits.html">Credits</a>
-        <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub →</a>
-      </div>
-    </details>
-  </div>
-</nav>
-
-<section class="hero">
-  <span class="cap-badge cap-today">SHIPS TODAY · v1.0.0</span>
-  <h1>Tier 3 — Multi-node cluster</h1>
-  <p class="tagline">Twenty agents. Four nodes. One coherent knowledge mesh — with <strong>W-of-N quorum writes shipping today</strong>. Each node runs its own ai-memory + SQLite; writes, links, governance, and pending decisions fan out via <code>sync_push</code> with vector-clock causality.</p>
-  <div class="pills">
-    <span class="pill">4 nodes · 20 agents</span>
-    <span class="pill">W-of-N quorum</span>
-    <span class="pill">mTLS allowlist</span>
-    <span class="pill">federated governance</span>
-  </div>
-</section>
-
-<section>
-  <div class="container">
-    <p>This is the first <strong>distributed</strong> tier. Each node runs an ai-memory process backed by its own SQLite. Writes, links, archives, namespace metadata, and <strong>governance decisions</strong> fan out to every peer over <code>POST /api/v1/sync/push</code>. Vector-clock causality (<code>sync/since</code>) lets a peer that drops off the network catch up cleanly. The recall pipeline stays local on each node — fast hot reads, no cross-node round trips.</p>
-    <p>The big upgrade in current builds: <strong>quorum-write contract is wired</strong>. Set <code>--quorum-writes N --quorum-peers a,b,c</code> and every HTTP write fans out to every peer and only returns OK after the local commit + <code>W-1</code> peer acks land within <code>--quorum-timeout-ms</code>. Falling short returns HTTP 503 <code>quorum_not_met</code>. This is real durability, not best-effort.</p>
-  </div>
-</section>
-
-<section>
-  <div class="container">
-    <span class="eyebrow">Architecture diagram</span>
-    <h2>4 nodes · 5 agents each · sync_push mesh.</h2>
-
-    <div class="arch-diagram">
-      <div class="arch-diagram-title">T3 · 4 nodes · 5 agents each · sync_push mesh</div>
-
-      <svg class="arch-svg" viewBox="0 0 880 600" role="img" aria-label="Four ai-memory nodes in a peer mesh, each with five agents, syncing via sync_push">
-
-        <defs>
-          <marker id="t3-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
-            <path d="M0,0 L10,5 L0,10 z" fill="currentColor" />
-          </marker>
-
-          <linearGradient id="t3-node-grad" x1="0" x2="0" y1="0" y2="1">
-            <stop offset="0%" stop-color="#2dd4bf" stop-opacity="0.20"/>
-            <stop offset="100%" stop-color="#0d9488" stop-opacity="0.05"/>
-          </linearGradient>
-
-          <path id="t3-AB" d="M 250 130 C 350 100, 530 100, 630 130" />
-          <path id="t3-BA" d="M 630 150 C 530 180, 350 180, 250 150" />
-          <path id="t3-CD" d="M 250 470 C 350 500, 530 500, 630 470" />
-          <path id="t3-DC" d="M 630 450 C 530 420, 350 420, 250 450" />
-          <path id="t3-AC" d="M 200 195 L 200 415" />
-          <path id="t3-CA" d="M 220 415 L 220 195" />
-          <path id="t3-BD" d="M 660 195 L 660 415" />
-          <path id="t3-DB" d="M 680 415 L 680 195" />
-          <path id="t3-AD" d="M 245 200 L 635 415" />
-          <path id="t3-DA" d="M 635 430 L 245 215" />
-          <path id="t3-BC" d="M 635 200 L 245 415" />
-          <path id="t3-CB" d="M 245 430 L 635 215" />
-        </defs>
-
-        <!-- CENTER governance label -->
-        <g>
-          <rect x="370" y="270" width="160" height="60" rx="10" fill="rgba(250,204,21,0.12)" stroke="#facc15" stroke-width="1.4" stroke-dasharray="3 2" />
-          <text x="450" y="290" text-anchor="middle" class="sub-label" font-weight="700" fill="#a16207">Federated governance</text>
-          <text x="450" y="305" text-anchor="middle" class="sub-label">namespace_meta fanout</text>
-          <text x="450" y="319" text-anchor="middle" class="sub-label">pending_decision sync</text>
-        </g>
-
-        <!-- MESH EDGES -->
-        <use href="#t3-AB" class="edge" stroke="#a78bfa" stroke-width="1.2" marker-end="url(#t3-arrow)" style="color: #a78bfa; opacity: 0.4" />
-        <use href="#t3-BA" class="edge" stroke="#a78bfa" stroke-width="1.2" marker-end="url(#t3-arrow)" style="color: #a78bfa; opacity: 0.4" />
-        <use href="#t3-CD" class="edge" stroke="#a78bfa" stroke-width="1.2" marker-end="url(#t3-arrow)" style="color: #a78bfa; opacity: 0.4" />
-        <use href="#t3-DC" class="edge" stroke="#a78bfa" stroke-width="1.2" marker-end="url(#t3-arrow)" style="color: #a78bfa; opacity: 0.4" />
-        <use href="#t3-AC" class="edge" stroke="#a78bfa" stroke-width="1.2" marker-end="url(#t3-arrow)" style="color: #a78bfa; opacity: 0.4" />
-        <use href="#t3-CA" class="edge" stroke="#a78bfa" stroke-width="1.2" marker-end="url(#t3-arrow)" style="color: #a78bfa; opacity: 0.4" />
-        <use href="#t3-BD" class="edge" stroke="#a78bfa" stroke-width="1.2" marker-end="url(#t3-arrow)" style="color: #a78bfa; opacity: 0.4" />
-        <use href="#t3-DB" class="edge" stroke="#a78bfa" stroke-width="1.2" marker-end="url(#t3-arrow)" style="color: #a78bfa; opacity: 0.4" />
-        <use href="#t3-AD" class="edge" stroke="#a78bfa" stroke-width="1.2" marker-end="url(#t3-arrow)" style="color: #a78bfa; opacity: 0.4" />
-        <use href="#t3-DA" class="edge" stroke="#a78bfa" stroke-width="1.2" marker-end="url(#t3-arrow)" style="color: #a78bfa; opacity: 0.4" />
-        <use href="#t3-BC" class="edge" stroke="#a78bfa" stroke-width="1.2" marker-end="url(#t3-arrow)" style="color: #a78bfa; opacity: 0.4" />
-        <use href="#t3-CB" class="edge" stroke="#a78bfa" stroke-width="1.2" marker-end="url(#t3-arrow)" style="color: #a78bfa; opacity: 0.4" />
-
-        <!-- NODE A -->
-        <g>
-          <rect x="80" y="80" width="170" height="120" rx="14" fill="url(#t3-node-grad)" stroke="#2dd4bf" stroke-width="1.5" />
-          <text x="165" y="102" text-anchor="middle" class="node-label">node-a</text>
-          <text x="165" y="118" text-anchor="middle" class="sub-label">10.0.1.10:9077</text>
-          <text x="165" y="135" text-anchor="middle" class="sub-label">vector clock: 7421</text>
-          <rect x="104" y="150" width="55" height="38" rx="6" class="node" />
-          <text x="131" y="168" text-anchor="middle" class="sub-label" style="font-size: 9px">SQLite</text>
-          <text x="131" y="180" text-anchor="middle" class="sub-label">+ HNSW</text>
-          <rect x="171" y="150" width="55" height="38" rx="6" stroke="#facc15" fill="rgba(250,204,21,0.1)" stroke-width="1.2" />
-          <text x="199" y="168" text-anchor="middle" class="sub-label" style="font-size: 9px">policy</text>
-          <text x="199" y="180" text-anchor="middle" class="sub-label">gate</text>
-          <g><circle cx="98" cy="222" r="11" class="node"/><text x="98" y="226" text-anchor="middle" class="sub-label" style="font-size: 9px">a1</text></g>
-          <g><circle cx="131" cy="222" r="11" class="node"/><text x="131" y="226" text-anchor="middle" class="sub-label" style="font-size: 9px">a2</text></g>
-          <g><circle cx="164" cy="222" r="11" class="node"/><text x="164" y="226" text-anchor="middle" class="sub-label" style="font-size: 9px">a3</text></g>
-          <g><circle cx="197" cy="222" r="11" class="node"/><text x="197" y="226" text-anchor="middle" class="sub-label" style="font-size: 9px">a4</text></g>
-          <g><circle cx="230" cy="222" r="11" class="node"/><text x="230" y="226" text-anchor="middle" class="sub-label" style="font-size: 9px">a5</text></g>
-          <text x="165" y="255" text-anchor="middle" class="sub-label">5 agents · namespace-isolated</text>
-        </g>
-
-        <!-- NODE B -->
-        <g>
-          <rect x="530" y="80" width="170" height="120" rx="14" fill="url(#t3-node-grad)" stroke="#2dd4bf" stroke-width="1.5" />
-          <text x="615" y="102" text-anchor="middle" class="node-label">node-b</text>
-          <text x="615" y="118" text-anchor="middle" class="sub-label">10.0.1.11:9077</text>
-          <text x="615" y="135" text-anchor="middle" class="sub-label">vector clock: 7421</text>
-          <rect x="554" y="150" width="55" height="38" rx="6" class="node" />
-          <text x="581" y="168" text-anchor="middle" class="sub-label" style="font-size: 9px">SQLite</text>
-          <text x="581" y="180" text-anchor="middle" class="sub-label">+ HNSW</text>
-          <rect x="621" y="150" width="55" height="38" rx="6" stroke="#facc15" fill="rgba(250,204,21,0.1)" stroke-width="1.2" />
-          <text x="649" y="168" text-anchor="middle" class="sub-label" style="font-size: 9px">policy</text>
-          <text x="649" y="180" text-anchor="middle" class="sub-label">gate</text>
-          <g><circle cx="548" cy="222" r="11" class="node"/><text x="548" y="226" text-anchor="middle" class="sub-label" style="font-size: 9px">a1</text></g>
-          <g><circle cx="581" cy="222" r="11" class="node"/><text x="581" y="226" text-anchor="middle" class="sub-label" style="font-size: 9px">a2</text></g>
-          <g><circle cx="614" cy="222" r="11" class="node"/><text x="614" y="226" text-anchor="middle" class="sub-label" style="font-size: 9px">a3</text></g>
-          <g><circle cx="647" cy="222" r="11" class="node"/><text x="647" y="226" text-anchor="middle" class="sub-label" style="font-size: 9px">a4</text></g>
-          <g><circle cx="680" cy="222" r="11" class="node"/><text x="680" y="226" text-anchor="middle" class="sub-label" style="font-size: 9px">a5</text></g>
-          <text x="615" y="255" text-anchor="middle" class="sub-label">5 agents · namespace-isolated</text>
-        </g>
-
-        <!-- NODE C -->
-        <g>
-          <rect x="80" y="400" width="170" height="120" rx="14" fill="url(#t3-node-grad)" stroke="#2dd4bf" stroke-width="1.5" />
-          <text x="165" y="422" text-anchor="middle" class="node-label">node-c</text>
-          <text x="165" y="438" text-anchor="middle" class="sub-label">10.0.1.12:9077</text>
-          <text x="165" y="455" text-anchor="middle" class="sub-label">vector clock: 7421</text>
-          <rect x="104" y="470" width="55" height="38" rx="6" class="node" />
-          <text x="131" y="488" text-anchor="middle" class="sub-label" style="font-size: 9px">SQLite</text>
-          <text x="131" y="500" text-anchor="middle" class="sub-label">+ HNSW</text>
-          <rect x="171" y="470" width="55" height="38" rx="6" stroke="#facc15" fill="rgba(250,204,21,0.1)" stroke-width="1.2" />
-          <text x="199" y="488" text-anchor="middle" class="sub-label" style="font-size: 9px">policy</text>
-          <text x="199" y="500" text-anchor="middle" class="sub-label">gate</text>
-          <g><circle cx="98" cy="542" r="11" class="node"/><text x="98" y="546" text-anchor="middle" class="sub-label" style="font-size: 9px">a1</text></g>
-          <g><circle cx="131" cy="542" r="11" class="node"/><text x="131" y="546" text-anchor="middle" class="sub-label" style="font-size: 9px">a2</text></g>
-          <g><circle cx="164" cy="542" r="11" class="node"/><text x="164" y="546" text-anchor="middle" class="sub-label" style="font-size: 9px">a3</text></g>
-          <g><circle cx="197" cy="542" r="11" class="node"/><text x="197" y="546" text-anchor="middle" class="sub-label" style="font-size: 9px">a4</text></g>
-          <g><circle cx="230" cy="542" r="11" class="node"/><text x="230" y="546" text-anchor="middle" class="sub-label" style="font-size: 9px">a5</text></g>
-          <text x="165" y="575" text-anchor="middle" class="sub-label">5 agents · namespace-isolated</text>
-        </g>
-
-        <!-- NODE D -->
-        <g>
-          <rect x="530" y="400" width="170" height="120" rx="14" fill="url(#t3-node-grad)" stroke="#2dd4bf" stroke-width="1.5" />
-          <text x="615" y="422" text-anchor="middle" class="node-label">node-d</text>
-          <text x="615" y="438" text-anchor="middle" class="sub-label">10.0.1.13:9077</text>
-          <text x="615" y="455" text-anchor="middle" class="sub-label">vector clock: 7421</text>
-          <rect x="554" y="470" width="55" height="38" rx="6" class="node" />
-          <text x="581" y="488" text-anchor="middle" class="sub-label" style="font-size: 9px">SQLite</text>
-          <text x="581" y="500" text-anchor="middle" class="sub-label">+ HNSW</text>
-          <rect x="621" y="470" width="55" height="38" rx="6" stroke="#facc15" fill="rgba(250,204,21,0.1)" stroke-width="1.2" />
-          <text x="649" y="488" text-anchor="middle" class="sub-label" style="font-size: 9px">policy</text>
-          <text x="649" y="500" text-anchor="middle" class="sub-label">gate</text>
-          <g><circle cx="548" cy="542" r="11" class="node"/><text x="548" y="546" text-anchor="middle" class="sub-label" style="font-size: 9px">a1</text></g>
-          <g><circle cx="581" cy="542" r="11" class="node"/><text x="581" y="546" text-anchor="middle" class="sub-label" style="font-size: 9px">a2</text></g>
-          <g><circle cx="614" cy="542" r="11" class="node"/><text x="614" y="546" text-anchor="middle" class="sub-label" style="font-size: 9px">a3</text></g>
-          <g><circle cx="647" cy="542" r="11" class="node"/><text x="647" y="546" text-anchor="middle" class="sub-label" style="font-size: 9px">a4</text></g>
-          <g><circle cx="680" cy="542" r="11" class="node"/><text x="680" y="546" text-anchor="middle" class="sub-label" style="font-size: 9px">a5</text></g>
-          <text x="615" y="575" text-anchor="middle" class="sub-label">5 agents · namespace-isolated</text>
-        </g>
-
-        <!-- PARTICLES — sync_push -->
-        <circle r="3.5" class="flow flow-sync"><animateMotion dur="4.2s" repeatCount="indefinite" begin="0s"><mpath href="#t3-AB"/></animateMotion></circle>
-        <circle r="3.5" class="flow flow-sync"><animateMotion dur="4.2s" repeatCount="indefinite" begin="0.35s"><mpath href="#t3-BA"/></animateMotion></circle>
-        <circle r="3.5" class="flow flow-sync"><animateMotion dur="4.2s" repeatCount="indefinite" begin="0.7s"><mpath href="#t3-CD"/></animateMotion></circle>
-        <circle r="3.5" class="flow flow-sync"><animateMotion dur="4.2s" repeatCount="indefinite" begin="1.05s"><mpath href="#t3-DC"/></animateMotion></circle>
-        <circle r="3.5" class="flow flow-sync"><animateMotion dur="4.2s" repeatCount="indefinite" begin="1.4s"><mpath href="#t3-AC"/></animateMotion></circle>
-        <circle r="3.5" class="flow flow-sync"><animateMotion dur="4.2s" repeatCount="indefinite" begin="1.75s"><mpath href="#t3-CA"/></animateMotion></circle>
-        <circle r="3.5" class="flow flow-sync"><animateMotion dur="4.2s" repeatCount="indefinite" begin="2.1s"><mpath href="#t3-BD"/></animateMotion></circle>
-        <circle r="3.5" class="flow flow-sync"><animateMotion dur="4.2s" repeatCount="indefinite" begin="2.45s"><mpath href="#t3-DB"/></animateMotion></circle>
-        <circle r="3.5" class="flow flow-sync"><animateMotion dur="4.2s" repeatCount="indefinite" begin="2.8s"><mpath href="#t3-AD"/></animateMotion></circle>
-        <circle r="3.5" class="flow flow-sync"><animateMotion dur="4.2s" repeatCount="indefinite" begin="3.15s"><mpath href="#t3-DA"/></animateMotion></circle>
-        <circle r="3.5" class="flow flow-sync"><animateMotion dur="4.2s" repeatCount="indefinite" begin="3.5s"><mpath href="#t3-BC"/></animateMotion></circle>
-        <circle r="3.5" class="flow flow-sync"><animateMotion dur="4.2s" repeatCount="indefinite" begin="3.85s"><mpath href="#t3-CB"/></animateMotion></circle>
-
-        <!-- Pulsing rings on each node -->
-        <circle cx="165" cy="90" r="6" class="ring" />
-        <circle cx="615" cy="90" r="6" class="ring" />
-        <circle cx="165" cy="410" r="6" class="ring" />
-        <circle cx="615" cy="410" r="6" class="ring" />
-
-        <text x="40" y="595" class="sub-label" font-weight="700">12-edge full peer mesh · sync_push fanout · vector-clock causality (sync/since)</text>
-      </svg>
-
-      <div class="arch-legend">
-        <span class="arch-legend-item"><span class="arch-legend-dot" style="background: #a78bfa"></span>sync_push (memories · links · namespace_meta · pending decisions)</span>
-        <span class="arch-legend-item"><span class="arch-legend-dot" style="background: #facc15"></span>per-node governance gate</span>
-        <span class="arch-legend-item"><span class="arch-legend-dot" style="background: #2dd4bf"></span>local recall on each node</span>
-      </div>
-
-      <div class="arch-diagram-caption">
-        Each node holds its own SQLite + HNSW. Writes commit locally then fan out to peers. Recalls stay local.
-        Governance policies, namespace metadata, and pending-action decisions propagate the same way memories do.
+<body class="am-page">
+<a class="am-skip" href="#main">Skip to content</a>
+<header class="am-nav"><div class="am-nav-in">
+  <a class="am-brand" href="index.html" aria-label="ai-memory home">
+    <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 2l9 5.2v9.6L12 22 3 16.8V7.2z" stroke="var(--accent)" stroke-width="1.5"/><circle cx="12" cy="12" r="2.4" fill="var(--accent)"/><path d="M12 9.6V4.5M12 14.4v5.1M14.4 12h5M4.9 12h5" stroke="var(--accent)" stroke-width="1.1"/></svg>
+    ai-memory <span class="am-crumb">/ architectures / T3</span>
+  </a>
+  <nav class="am-links" aria-label="Primary">
+    <a href="architectures.html">Architectures</a>
+    <div class="am-dd">
+      <button aria-haspopup="true">Tiers ▾</button>
+      <div class="am-dd-menu">
+        <a href="architectures-t1.html">T1 · Single node<span>one agent, one store</span></a>
+        <a href="architectures-t2.html">T2 · Shared daemon<span>many agents, one host</span></a>
+        <a href="architectures-t3.html">T3 · Federated cluster<span>W-of-N quorum, signed sync</span></a>
+        <a href="architectures-t4.html">T4 · Data-center swarm<span>PostgreSQL tier</span></a>
+        <a href="architectures-t5.html">T5 · Federated hive<span>multi-DC / multi-region</span></a>
       </div>
     </div>
+    <div class="am-dd">
+      <button aria-haspopup="true">Reference ▾</button>
+      <div class="am-dd-menu">
+        <a href="reference-architecture/">3-region hive<span>the do-1461 run record</span></a>
+        <a href="reference-architecture/enterprise-cpu-memory.html">Enterprise · CPU + memory<span>API embeddings, no GPU</span></a>
+        <a href="reference-architecture/enterprise-cpu-memory-gpu.html">Enterprise · CPU + memory + GPU<span>local embeddings</span></a>
+        <a href="enterprise-deployment.html">Enterprise deployment guide<span>sizing, replication, backups</span></a>
+        <a href="ARCHITECTURAL_LIMITS.html">Architectural limits<span>what does not scale, and why</span></a>
+      </div>
+    </div>
+    <div class="am-dd">
+      <button aria-haspopup="true">Planes ▾</button>
+      <div class="am-dd-menu">
+        <a href="federation.html">Federation<span>signed sync, quorum, catch-up</span></a>
+        <a href="wake-hub.html">Wake plane<span>wake-hub, wake-listen</span></a>
+        <a href="a2a-integration.html">Integrate any agent<span>inbox, notify, wake</span></a>
+        <a href="governance.html">Governance<span>policies, approvals</span></a>
+        <a href="encryption.html">Encryption<span>at rest and in transit</span></a>
+        <a href="SECURITY.html">Security model<span>threat model, posture</span></a>
+      </div>
+    </div>
+  </nav>
+  <details class="am-mnav"><summary>Menu</summary><div class="am-mnav-pane">
+    <a href="index.html">Home</a>
+    <a href="architectures.html">Architectures overview</a>
+    <div class="am-g">Tiers</div>
+    <a href="architectures-t1.html">T1 · Single node</a>
+    <a href="architectures-t2.html">T2 · Shared daemon</a>
+    <a href="architectures-t3.html">T3 · Federated cluster</a>
+    <a href="architectures-t4.html">T4 · Data-center swarm</a>
+    <a href="architectures-t5.html">T5 · Federated hive</a>
+    <div class="am-g">Reference</div>
+    <a href="reference-architecture/">3-region hive</a>
+    <a href="reference-architecture/enterprise-cpu-memory.html">Enterprise · CPU + memory</a>
+    <a href="reference-architecture/enterprise-cpu-memory-gpu.html">Enterprise · CPU + memory + GPU</a>
+    <a href="ARCHITECTURAL_LIMITS.html">Architectural limits</a>
+    <div class="am-g">Planes</div>
+    <a href="federation.html">Federation</a>
+    <a href="wake-hub.html">Wake plane</a>
+    <a href="governance.html">Governance</a>
+    <a href="SECURITY.html">Security model</a>
+  </div></details>
+  <a class="am-cta" href="https://github.com/alphaonedev/ai-memory-mcp">GitHub</a>
+</div></header>
+<main id="main">
+<section class="am-hero"><div class="am-wrap">
+  <nav class="am-rail" aria-label="Tiers"><a href="architectures-t1.html">T1 · Single node</a><a href="architectures-t2.html">T2 · Shared daemon</a><a href="architectures-t3.html" aria-current="page">T3 · Federated cluster</a><a href="architectures-t4.html">T4 · Data-center swarm</a><a href="architectures-t5.html">T5 · Federated hive</a><a href="architectures.html">Overview</a></nav>
+  <span class="am-pill" style="margin-top:18px"><i></i>Tier 3 · ships in v1.0.0</span>
+  <h1 class="am-h1">A cluster that <span class="a">agrees enough</span>, and never loses a write.</h1>
+  <p class="am-sub">Several ai-memory daemons in one rack or data center replicate every HTTP write over <b>mutual TLS</b> with <b>Ed25519-signed</b> pushes. A write commits locally first, then waits for a <b>W-of-N quorum</b>; a miss is answered with <b>202</b> and the row stays safe. Peers that were away catch up by pulling, erasures travel through a durable outbox, and a replicated message wakes its recipient on the receiving host.</p>
+  <div class="am-proof">
+    <span><b>W-of-N</b> quorum writes</span>
+    <span><b>mTLS</b> fingerprint allowlist</span>
+    <span><b>X-Memory-Sig</b> · nonce · enrolled keys</span>
+    <span><b>202</b> quorum_met:false</span>
+    <span><b>/sync/since</b> catch-up</span>
   </div>
-</section>
+</div></section>
 
-<section>
-  <div class="container">
-    <span class="eyebrow">What ships today</span>
-    <h2>The mesh is real. Source-cited.</h2>
-    <ul>
-      <li><strong>W-of-N quorum-write contract</strong> — <code>src/daemon_runtime.rs</code> (<code>ServeArgs</code>): <code>--quorum-writes N --quorum-peers &lt;list&gt;</code> is wired into the write path. The handlers call <code>broadcast_store_quorum</code> then <code>finalise_quorum</code> to count peer acks; <code>503 quorum_not_met</code> returns when the deadline (<code>--quorum-timeout-ms</code>, default 2000) lapses without W-1 acks. ADR-0001 is realised, not aspirational. Same wiring applies to <code>broadcast_link_quorum</code>, <code>broadcast_consolidate_quorum</code>, <code>broadcast_pending_decision_quorum</code>, <code>broadcast_namespace_meta_quorum</code>.</li>
-      <li><strong><code>sync_push</code> fanout for everything</strong> — <code>src/federation/sync.rs</code> ships <strong>10 broadcast functions</strong>: store, delete, archive, restore, link, consolidate, pending action, pending decision, namespace metadata, namespace metadata clear. Each is invoked from the corresponding handler in <code>src/handlers/</code> after the local commit lands.</li>
-      <li><strong>Per-peer sync state + catch-up</strong> — The daemon tracks per-peer <code>sync_state</code> (last-seen / last-pulled). A peer that drops off polls <code>GET /api/v1/sync/since?peer=node-a&amp;since=&lt;rfc3339-ts&gt;</code> and gets only the rows updated after that point. The serve daemon also runs a <code>--catchup-interval-secs</code> loop (default 30s) that pulls peers proactively for any updates missed during partition.</li>
-      <li><strong>mTLS peer mesh with fingerprint allowlist</strong> — <code>--tls-cert</code> + <code>--tls-key</code> switches <code>serve</code> to TLS; adding <code>--mtls-allowlist &lt;path&gt;</code> enforces client-cert mTLS where every connection's peer must present a cert whose fingerprint is on the allowlist. Quorum POSTs use <code>--quorum-client-cert</code> / <code>--quorum-client-key</code> / <code>--quorum-ca-cert</code> for the outbound side.</li>
-      <li><strong>Federated governance</strong> — <code>broadcast_namespace_meta_quorum</code> (<code>src/federation/sync.rs</code>) propagates <code>GovernancePolicy</code> changes to every peer with quorum semantics. A new strict policy on <code>agents/secops</code> set on node-A is enforced on all 4 nodes within seconds, with the same W-of-N durability as memory writes.</li>
-      <li><strong>Federated pending decisions</strong> — <code>broadcast_pending_decision_quorum</code> (<code>src/federation/sync.rs</code>) means an approve/reject on one node turns into a committed (or audited) state on every peer with quorum-bounded latency.</li>
-      <li><strong>Per-node governance gate</strong> — Each node enforces its local policy at write time. The federated metadata keeps the policy itself consistent across nodes.</li>
-    </ul>
-    <p>This is real, durable, multi-node consistency for a knowledge mesh.</p>
+<section class="am-sec" id="diagram"><div class="am-wrap">
+  <div class="am-sec-h">
+    <span class="am-eyebrow">Architecture</span>
+    <h2>Three peers, <span class="a">one signed mesh</span>.</h2>
+    <p>Each peer is a full <code>ai-memory serve</code> with its own store and its own wake hub. With <code>--quorum-writes W</code> and a <code>--quorum-peers</code> list, every HTTP write fans out to every peer and is acknowledged once the local commit plus W−1 peer acknowledgements land inside <code>--quorum-timeout-ms</code>.</p>
   </div>
-</section>
+  <div class="am-legend"><span><i></i>signed push</span><span><i class="teal"></i>acknowledgement · wake</span></div>
+  <figure class="am-fig" style="--fig-min:920px">
+<svg class="dg" viewBox="0 0 1100 540" role="img" aria-labelledby="t3a-title" aria-describedby="t3a-desc" xmlns="http://www.w3.org/2000/svg">
+<title id="t3a-title">Tier 3: a federated cluster of three daemons</title><desc id="t3a-desc">Three ai-memory daemons in one rack or data center replicate every HTTP write over mutual TLS with Ed25519-signed pushes. A write commits locally and is acknowledged once the local commit plus W minus one peer acknowledgements land within the quorum timeout; otherwise the answer is 202 with quorum_met false and durability local. Each host keeps its own wake hub.</desc>
+<defs><marker id="t3a-ah" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow"/></marker><marker id="t3a-aa" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow acc"/></marker><marker id="t3a-at" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow teal"/></marker><marker id="t3a-ab" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow bad"/></marker><marker id="t3a-as" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow slate"/></marker></defs>
+<rect class="zone solid" x="20" y="20" width="1060" height="470" rx="18"/><text class="t-k" x="40" y="44">ONE RACK  ·  ONE DATA CENTER</text><text class="t-a" x="1060" y="44" text-anchor="end">mTLS allowlist · X-Memory-Sig · nonce · enrolled peer keys</text><g class="rise"><rect class="box" x="130" y="62" width="160" height="36" rx="10"/><text class="t-s" x="210" y="85" text-anchor="middle">agent → peer A</text><circle class="pulse good" cx="142" cy="72" r="2.6"/></g>
+<g class="rise" style="--d:0.1s"><rect class="box" x="810" y="62" width="160" height="36" rx="10"/><text class="t-s" x="890" y="85" text-anchor="middle">agent → peer B</text><circle class="pulse good" cx="822" cy="72" r="2.6" style="--d:0.5s"/></g>
+<path class="wire" d="M210 98 V116" marker-end="url(#t3a-aa)"/><path class="flow" d="M210 98 V116"/><path class="dot" pathLength="100" d="M210 98 V116"/><path class="wire" d="M890 98 V116" marker-end="url(#t3a-aa)"/><path class="flow" d="M890 98 V116"/><path class="dot" pathLength="100" d="M890 98 V116" style="--d:0.5s"/><g class="rise" style="--d:0.1s"><rect class="box acc" x="60" y="120" width="300" height="160" rx="14"/><text class="t-h" x="76" y="146">peer A · ai-memory serve</text><rect class="box" x="76" y="160" width="268" height="22" rx="6"/><text class="t-s" x="88" y="175">store: SQLite, or PostgreSQL + AGE</text><rect class="box" x="76" y="188" width="268" height="22" rx="6"/><text class="t-s" x="88" y="203">receive: verify sig · attest · apply</text><rect class="box" x="76" y="216" width="268" height="22" rx="6"/><text class="t-s" x="88" y="231">quorum: local commit + W−1 acks</text><rect class="box teal" x="76" y="244" width="268" height="22" rx="6"/><text class="t-s" x="88" y="259">wake-hub on this host</text></g>
+<g class="rise" style="--d:0.2s"><rect class="box acc" x="740" y="120" width="300" height="160" rx="14"/><text class="t-h" x="756" y="146">peer B · ai-memory serve</text><rect class="box" x="756" y="160" width="268" height="22" rx="6"/><text class="t-s" x="768" y="175">store: SQLite, or PostgreSQL + AGE</text><rect class="box" x="756" y="188" width="268" height="22" rx="6"/><text class="t-s" x="768" y="203">receive: verify sig · attest · apply</text><rect class="box" x="756" y="216" width="268" height="22" rx="6"/><text class="t-s" x="768" y="231">quorum: local commit + W−1 acks</text><rect class="box teal" x="756" y="244" width="268" height="22" rx="6"/><text class="t-s" x="768" y="259">wake-hub on this host</text></g>
+<g class="rise" style="--d:0.3s"><rect class="box acc" x="400" y="310" width="300" height="160" rx="14"/><text class="t-h" x="416" y="336">peer C · ai-memory serve</text><rect class="box" x="416" y="350" width="268" height="22" rx="6"/><text class="t-s" x="428" y="365">store: SQLite, or PostgreSQL + AGE</text><rect class="box" x="416" y="378" width="268" height="22" rx="6"/><text class="t-s" x="428" y="393">receive: verify sig · attest · apply</text><rect class="box" x="416" y="406" width="268" height="22" rx="6"/><text class="t-s" x="428" y="421">quorum: local commit + W−1 acks</text><rect class="box teal" x="416" y="434" width="268" height="22" rx="6"/><text class="t-s" x="428" y="449">wake-hub on this host</text></g>
+<path class="wire" d="M360 180 H736" marker-end="url(#t3a-aa)"/><path class="flow" d="M360 180 H736"/><path class="dot" pathLength="100" d="M360 180 H736" style="--d:0.8s"/><path class="wire" d="M740 222 H364" marker-end="url(#t3a-at)"/><path class="flow teal" d="M740 222 H364"/><path class="dot teal" pathLength="100" d="M740 222 H364" style="--d:1.6s"/><text class="t-a" x="550" y="172" text-anchor="middle">signed /sync/push</text><text class="t-teal" x="550" y="240" text-anchor="middle">ack</text><path class="wire" d="M210 280 V390 H396" marker-end="url(#t3a-aa)"/><path class="flow" d="M210 280 V390 H396"/><path class="dot" pathLength="100" d="M210 280 V390 H396" style="--d:1.2s"/><path class="wire" d="M890 280 V390 H704" marker-end="url(#t3a-aa)"/><path class="flow" d="M890 280 V390 H704"/><path class="dot" pathLength="100" d="M890 280 V390 H704" style="--d:1.9s"/><text class="t-a" x="220" y="380">push</text><text class="t-a" x="880" y="380" text-anchor="end">push</text><circle class="ring" cx="550" cy="200" r="12"/><circle class="ring" cx="550" cy="200" r="12" style="--d:1.4s"/><text class="t-s" x="40" y="512">Acknowledged when local commit + (W−1) peer acks land inside --quorum-timeout-ms; otherwise 202 Accepted, quorum_met:false, durability:"local".</text></svg>
 
-<section>
-  <div class="container">
-    <span class="eyebrow">What's still roadmap</span>
-    <h2>Honest about the remaining gaps.</h2>
-    <ul>
-      <li><strong>Strong consensus on the governance plane</strong> — Quorum writes give bounded staleness, not strong consistency. Two operators on opposite sides of a partition can each approve a pending action; reconciliation is last-decision-wins on rejoin. Distributed consensus (Raft/Paxos) is v1.0+ territory and only makes sense for the governance plane, not the memory write path.</li>
-      <li><strong>Cryptographic attestation — what remains</strong> — Signing has shipped: the <code>signature</code> column on <code>memory_links</code> (reserved v0.6.3 schema v15) is POPULATED with Ed25519 per-link attestation, <code>attest_level</code> + <code>signed_at</code> landed, and #626 Layer-3 verifies caller-presented store-surface signatures. Required by default on the <strong>HTTP direct-write surface only</strong> as of v1.0.0 (#1985, correcting #1751): an <em>unsigned</em> <code>POST /api/v1/memories</code>(+<code>/bulk</code>) is <strong>rejected</strong> (<code>403 ATTESTATION_FAILED</code>) while MCP <code>memory_store</code> / CLI <code>store</code> stay permissive and land <code>claimed</code> (<code>AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1</code> forces strict everywhere, <code>=0</code> permissive everywhere). The federation receive path defaults to mTLS + peer allowlist, plus receiver-side per-write content attestation (verify <code>metadata.write_signature</code> against the author's enrolled key) SHIPPED at v0.8.0 GA (#1464) and <strong>DEFAULT-ON since v1.0.0</strong> (#1801&rarr;#1954; <code>AI_MEMORY_FED_REQUIRE_WRITE_SIG=0</code> is the staged-rollout bridge, not the default); the sender-side emit + TOFU key distribution remain v0.9 (#1801).</li>
-      <li><strong>Postgres + pgvector backbone</strong> — <strong>SHIPPED GA</strong> via <code>--features sal-postgres</code> <em>as a store backend</em>. Apache AGE Cypher graph backend auto-detected when pg_extension installed. SAL trait abstracts sqlite vs postgres+AGE; <code>ai-memory serve --store-url postgres://…</code> selects the postgres path. <strong>Federation scope caveat (#3075):</strong> a Postgres-backed daemon is a first-class store, but as a federation <em>receiver</em> it replicates only the <code>memories[]</code> lane in v1.0.0 — the federated-governance lanes (<code>checkpoints</code>, <code>pendings</code>, <code>pending_decisions</code>, <code>namespace_meta</code>, <code>namespace_meta_clears</code>, <code>archives</code>, <code>restores</code>) return an honest <code>unsupported_on_postgres</code> non-ack and are SQLite-receiver-only until v1.1. Run governance-quorum receivers on the SQLite backend.</li>
-      <li><strong>CRDT-lite link tombstones</strong> — Delete-link fanout is deferred; the CHANGELOG (#325) tracks it. Local <code>DELETE /api/v1/links</code> works today.</li>
-    </ul>
-    <p>If your fleet needs strong cross-region governance consensus, that's v1.0+. Everything else listed is shipping.</p>
+  </figure>
+  <p class="am-figcap"><b>The 202 contract.</b> On a quorum miss the local row is already durable and is never rolled back, so the daemon answers <code>202 Accepted</code> with <code>{quorum_met:false, acks, needed, reason, durability:"local"}</code> and queues the push for redelivery, never a 5xx. Sources: <code>src/replication.rs</code>, <code>src/federation/sync.rs</code>, <code>src/federation/quorum.rs</code>, <code>src/handlers/parity.rs</code>, <code>src/federation/signing.rs</code>, <code>src/federation/peer_attestation.rs</code>.</p>
+</div></section>
+
+<section class="am-sec alt" id="recovery"><div class="am-wrap">
+  <div class="am-sec-h">
+    <span class="am-eyebrow">Failure, recovery, erasure</span>
+    <h2>Partitions cost <span class="a">latency</span>, not data.</h2>
+    <p>A peer that misses a push gets it later, twice over: the push dead-letter queue replays it, and the peer's own catch-up loop pulls everything it missed with <code>GET /api/v1/sync/since</code>. When the row that arrives is a message, the receiving node publishes a local wake only if the apply actually moved the row forward, so replays never wake anybody.</p>
   </div>
-</section>
+  <figure class="am-fig" style="--fig-min:920px">
+<svg class="dg" viewBox="0 0 1100 372" role="img" aria-labelledby="t3b-title" aria-describedby="t3b-desc" xmlns="http://www.w3.org/2000/svg">
+<title id="t3b-title">Tier 3: partition, recovery and erasure</title><desc id="t3b-desc">Peer C is partitioned. A write on peer A still meets quorum with peer B; the push to C lands in the push dead-letter queue. When C rejoins it pulls missed rows with sync since on its catch-up interval and the queue replays. A freshly applied inbox row on C publishes a local wake through applied_wake. A forget on A goes through the durable erasure outbox to every peer.</desc>
+<defs><marker id="t3b-ah" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow"/></marker><marker id="t3b-aa" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow acc"/></marker><marker id="t3b-at" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow teal"/></marker><marker id="t3b-ab" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow bad"/></marker><marker id="t3b-as" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow slate"/></marker></defs>
+<text class="t-k" x="30" y="30">PARTITION AND RECOVERY</text><g class="rise"><rect class="box acc" x="30" y="40" width="184" height="66" rx="12"/><text class="t-a" x="44" y="64">01</text><text class="t-m" x="70" y="64">C partitioned</text><text class="t-s" x="44" y="86">A and B keep serving</text></g>
+<path class="wire" d="M214 73 H240" marker-end="url(#t3b-aa)"/><path class="flow" d="M214 73 H240"/><path class="dot" pathLength="100" d="M214 73 H240"/><g class="rise" style="--d:0.1s"><rect class="box" x="244" y="40" width="184" height="66" rx="12"/><text class="t-a" x="258" y="64">02</text><text class="t-m" x="284" y="64">write on A</text><text class="t-s" x="258" y="86">A + B ack: quorum met</text></g>
+<path class="wire" d="M428 73 H454" marker-end="url(#t3b-aa)"/><path class="flow" d="M428 73 H454"/><path class="dot" pathLength="100" d="M428 73 H454" style="--d:0.35s"/><g class="rise" style="--d:0.2s"><rect class="box" x="458" y="40" width="184" height="66" rx="12"/><text class="t-a" x="472" y="64">03</text><text class="t-m" x="498" y="64">push to C fails</text><text class="t-s" x="472" y="86">kept in the push DLQ</text></g>
+<path class="wire" d="M642 73 H668" marker-end="url(#t3b-aa)"/><path class="flow" d="M642 73 H668"/><path class="dot" pathLength="100" d="M642 73 H668" style="--d:0.7s"/><g class="rise" style="--d:0.30000000000000004s"><rect class="box acc" x="672" y="40" width="184" height="66" rx="12"/><text class="t-a" x="686" y="64">04</text><text class="t-m" x="712" y="64">C rejoins</text><text class="t-s" x="686" y="86">catch-up pull loop</text></g>
+<path class="wire" d="M856 73 H882" marker-end="url(#t3b-aa)"/><path class="flow" d="M856 73 H882"/><path class="dot" pathLength="100" d="M856 73 H882" style="--d:1.0499999999999998s"/><g class="rise" style="--d:0.4s"><rect class="box" x="886" y="40" width="184" height="66" rx="12"/><text class="t-a" x="900" y="64">05</text><text class="t-m" x="926" y="64">converged</text><text class="t-s" x="900" y="86">/sync/since + replay</text></g>
+<text class="t-k" x="30" y="150">A MESSAGE ARRIVES ON C</text><g class="rise" style="--d:0.5s"><rect class="box teal" x="30" y="160" width="184" height="66" rx="12"/><text class="t-a" x="44" y="184">01</text><text class="t-m" x="70" y="184">notify on A</text><text class="t-s" x="44" y="206">inbox row committed</text></g>
+<path class="wire" d="M214 193 H240" marker-end="url(#t3b-at)"/><path class="flow teal" d="M214 193 H240"/><path class="dot teal" pathLength="100" d="M214 193 H240" style="--d:0.5s"/><g class="rise" style="--d:0.6s"><rect class="box" x="244" y="160" width="184" height="66" rx="12"/><text class="t-a" x="258" y="184">02</text><text class="t-m" x="284" y="184">replicated</text><text class="t-s" x="258" y="206">signed push or pull</text></g>
+<path class="wire" d="M428 193 H454" marker-end="url(#t3b-at)"/><path class="flow teal" d="M428 193 H454"/><path class="dot teal" pathLength="100" d="M428 193 H454" style="--d:0.85s"/><g class="rise" style="--d:0.7s"><rect class="box" x="458" y="160" width="184" height="66" rx="12"/><text class="t-a" x="472" y="184">03</text><text class="t-m" x="498" y="184">apply on C</text><text class="t-s" x="472" y="206">newer-wins merge</text></g>
+<path class="wire" d="M642 193 H668" marker-end="url(#t3b-at)"/><path class="flow teal" d="M642 193 H668"/><path class="dot teal" pathLength="100" d="M642 193 H668" style="--d:1.2s"/><g class="rise" style="--d:0.8s"><rect class="box teal" x="672" y="160" width="184" height="66" rx="12"/><text class="t-a" x="686" y="184">04</text><text class="t-m" x="712" y="184">applied_wake</text><text class="t-s" x="686" y="206">fresh apply only</text></g>
+<path class="wire" d="M856 193 H882" marker-end="url(#t3b-at)"/><path class="flow teal" d="M856 193 H882"/><path class="dot teal" pathLength="100" d="M856 193 H882" style="--d:1.5499999999999998s"/><g class="rise" style="--d:0.9s"><rect class="box" x="886" y="160" width="184" height="66" rx="12"/><text class="t-a" x="900" y="184">05</text><text class="t-m" x="926" y="184">wake on C</text><text class="t-s" x="900" y="206">C's hub, same host</text></g>
+<text class="t-k" x="30" y="270">ERASURE FROM MCP OR CLI  (HTTP DELETE broadcasts through the quorum directly)</text><g class="rise" style="--d:1.0s"><rect class="box acc" x="30" y="280" width="184" height="66" rx="12"/><text class="t-a" x="44" y="304">01</text><text class="t-m" x="70" y="304">forget on A</text><text class="t-s" x="44" y="326">via MCP or the CLI</text></g>
+<path class="wire" d="M214 313 H240" marker-end="url(#t3b-aa)"/><path class="flow" d="M214 313 H240"/><path class="dot" pathLength="100" d="M214 313 H240" style="--d:1.0s"/><g class="rise" style="--d:1.1s"><rect class="box" x="244" y="280" width="184" height="66" rx="12"/><text class="t-a" x="258" y="304">02</text><text class="t-m" x="284" y="304">local erase</text><text class="t-s" x="258" y="326">always succeeds</text></g>
+<path class="wire" d="M428 313 H454" marker-end="url(#t3b-aa)"/><path class="flow" d="M428 313 H454"/><path class="dot" pathLength="100" d="M428 313 H454" style="--d:1.35s"/><g class="rise" style="--d:1.2s"><rect class="box" x="458" y="280" width="184" height="66" rx="12"/><text class="t-a" x="472" y="304">03</text><text class="t-m" x="498" y="304">erasure outbox</text><text class="t-s" x="472" y="326">durable, network-free</text></g>
+<path class="wire" d="M642 313 H668" marker-end="url(#t3b-aa)"/><path class="flow" d="M642 313 H668"/><path class="dot" pathLength="100" d="M642 313 H668" style="--d:1.7s"/><g class="rise" style="--d:1.3s"><rect class="box acc" x="672" y="280" width="184" height="66" rx="12"/><text class="t-a" x="686" y="304">04</text><text class="t-m" x="712" y="304">daemon drains</text><text class="t-s" x="686" y="326">federation worker</text></g>
+<path class="wire" d="M856 313 H882" marker-end="url(#t3b-aa)"/><path class="flow" d="M856 313 H882"/><path class="dot" pathLength="100" d="M856 313 H882" style="--d:2.05s"/><g class="rise" style="--d:1.4s"><rect class="box" x="886" y="280" width="184" height="66" rx="12"/><text class="t-a" x="900" y="304">05</text><text class="t-m" x="926" y="304">peers delete</text><text class="t-s" x="900" y="326">replicas converge</text></g>
+</svg>
 
-<section>
-  <div class="container">
-    <span class="eyebrow">Walkthrough</span>
-    <h2>What's actually happening.</h2>
+  </figure>
+  <p class="am-figcap">Sources: <code>src/federation/push_dlq.rs</code>, <code>src/federation/receive.rs</code> (catch-up loop), <code>src/federation/applied_wake.rs</code>, <code>src/federation/erasure_outbox.rs</code>, <code>src/handlers/federation_receive.rs</code>.</p>
+</div></section>
 
-    <h3>Write path on node-A</h3>
-    <ol>
-      <li>Agent <code>a1</code> on node-A calls <code>memory_store</code>.</li>
-      <li>Local governance gate runs against the federated policy. <code>Allow</code> → continue, <code>Pending</code> → queue, <code>Deny</code> → reject.</li>
-      <li>Local <code>INSERT</code> succeeds. WAL fsynced. Vector clock bumped.</li>
-      <li><code>broadcast_store_quorum</code> spawns one HTTP <code>POST /api/v1/sync/push</code> per configured peer (B, C, D). With <code>--quorum-writes 0</code> the local response returns immediately; with quorum enabled it returns only after W-1 peer acks (or 503 <code>quorum_not_met</code> at the deadline).</li>
-      <li>Each peer receives the push, validates, applies, and bumps its own SyncState entry for node-A.</li>
-    </ol>
-
-    <h3>A peer rejoins after a partition</h3>
-    <p>Node-C drops off the cluster for 4 hours. When it comes back, its supervisor calls:</p>
-<pre><code>curl 'http://node-a:9077/api/v1/sync/since?peer=node-c&amp;since=2026-06-09T04:00:00Z'</code></pre>
-    <p>Node-A returns the delta — every row updated after that timestamp. Node-C applies them in causal order, bumps its own <code>sync_state</code>, and re-enters the steady-state mesh.</p>
-
-    <h3>Federated governance — a real example</h3>
-<pre><code># On node-A: tighten policy on a sensitive namespace
-# (the standard memory carries the policy; bind it by id)
-ai-memory namespace set-standard --namespace org/legal/contracts \
-  --id &lt;standard-memory-uuid&gt; \
-  --governance '{"write":"approve","delete":"approve"}'</code></pre>
-    <p>Within seconds:</p>
-    <ul>
-      <li><code>namespace_meta</code> row updated on node-A.</li>
-      <li><code>broadcast_namespace_meta_quorum</code> fires <code>POST /api/v1/sync/push</code> to B, C, D.</li>
-      <li>Each peer applies the new policy.</li>
-      <li>Any agent on any node attempting to write into <code>org/legal/contracts</code> now hits the local governance gate, which queues the write as <code>Pending</code>.</li>
-      <li>An approver agent on <strong>any</strong> node calls <code>memory_pending_approve</code>. The decision broadcasts via <code>broadcast_pending_decision_quorum</code>. All four nodes commit (or audit-reject) the queued write coherently.</li>
-    </ul>
-    <p>That's the honest version of "federated governance" — eventually consistent, but coherent.</p>
+<section class="am-sec" id="walkthrough"><div class="am-wrap">
+  <div class="am-sec-h">
+    <span class="am-eyebrow">Walkthrough</span>
+    <h2>One write, <span class="a">one recall</span>.</h2>
   </div>
-</section>
+  <ol class="am-steps">
+    <li><b>Write on peer A.</b> The row commits on A. A signs the canonical body (<code>X-Memory-Sig</code>) and pushes it over mutual TLS to B and C.</li>
+    <li><b>Receive on B.</b> B checks the client certificate fingerprint, the signature against A's enrolled Ed25519 key, the nonce, and that A may write the namespace it claims; then it applies the row and acknowledges.</li>
+    <li><b>Quorum.</b> With <code>--quorum-writes 2</code>, A's commit plus B's acknowledgement meet quorum and the client gets its success response. C, if slow, gets the row from the DLQ replay or its next catch-up pull.</li>
+    <li><b>Recall on C.</b> Recall is local to the peer that serves it: C answers from its own store. Immediately after a write, a recall on another peer can be a catch-up interval behind; read from the writing peer when you need the newest row.</li>
+  </ol>
+</div></section>
 
-<section>
-  <div class="container">
-    <span class="eyebrow">Deployment recipe</span>
-    <h2>Quorum writes + mTLS peer mesh.</h2>
-    <p>All real flags, all shipping today. Because <code>serve</code> binds <code>--host 0.0.0.0</code> (non-loopback), the daemon <strong>refuses to boot unless <code>api_key</code> is set in config</strong> (S5-C1 bind guard) — independent of mTLS. It is a top-level config field, not a serve flag (there is no <code>--api-key</code>), set in <code>~/.config/ai-memory/config.toml</code>:</p>
-<pre><code># ~/.config/ai-memory/config.toml — required for any non-loopback bind
-api_key = "REPLACE_WITH_A_LONG_RANDOM_SECRET"</code></pre>
-<pre><code># node-a — quorum writes require 2-of-3 peer acks within 2s
-ai-memory --db /var/lib/ai-memory/store.db serve \
+<section class="am-sec alt" id="recipe"><div class="am-wrap">
+  <div class="am-sec-h">
+    <span class="am-eyebrow">Deployment recipe</span>
+    <h2>Three peers <span class="a">in one rack</span>.</h2>
+  </div>
+<pre><code># Each peer: an Ed25519 identity, and every other peer's public key enrolled
+ai-memory identity generate --agent-id dc1/rack4/peer-a
+ai-memory identity import --agent-id dc1/rack4/peer-b --pub peer-b.pub
+ai-memory identity import --agent-id dc1/rack4/peer-c --pub peer-c.pub
+
+# Each peer: TLS, the mTLS fingerprint allowlist, quorum fan-out and catch-up
+# (a non-loopback bind also requires api_key in config.toml)
+ai-memory --db /var/lib/ai-memory/ai-memory.db serve \
   --host 0.0.0.0 --port 9077 \
+  --tls-cert /etc/ai-memory/peer-a.crt --tls-key /etc/ai-memory/peer-a.key \
+  --mtls-allowlist /etc/ai-memory/peer-fingerprints.allow \
+  --federation-identity dc1/rack4/peer-a \
   --quorum-writes 2 \
-  --quorum-peers https://node-b:9077,https://node-c:9077,https://node-d:9077 \
+  --quorum-peers https://peer-b.dc1:9077,https://peer-c.dc1:9077 \
   --quorum-timeout-ms 2000 \
-  --tls-cert /etc/ai-memory/tls.crt \
-  --tls-key /etc/ai-memory/tls.key \
-  --mtls-allowlist /etc/ai-memory/peer-fingerprints.txt \
-  --quorum-client-cert /etc/ai-memory/client.crt \
-  --quorum-client-key /etc/ai-memory/client.key \
+  --quorum-client-cert /etc/ai-memory/peer-a.crt --quorum-client-key /etc/ai-memory/peer-a.key \
   --quorum-ca-cert /etc/ai-memory/ca.crt \
   --catchup-interval-secs 30</code></pre>
-    <p>The <code>peer-fingerprints.txt</code> file is a newline-delimited list of SHA-256 fingerprints (with or without <code>:</code> separators; comments start with <code>#</code>). <code>serve</code> refuses any peer whose cert fingerprint is not on the list — that's the peer-mesh identity gate.</p>
-    <p>For long-running pull-based reconciliation, run a <code>sync-daemon</code> alongside <code>serve</code>:</p>
-<pre><code>ai-memory sync-daemon \
-  --peers https://node-b:9077,https://node-c:9077,https://node-d:9077 \
-  --interval 2 \
-  --client-cert /etc/ai-memory/client.crt \
-  --client-key /etc/ai-memory/client.key</code></pre>
+  <p class="am-figcap">Flags verified against <code>src/daemon_runtime.rs</code> (<code>ServeArgs</code>) and <code>src/cli/identity.rs</code>. Peer attestation JSON, enrolment posture and rotation are in the <a href="federation.html">federation guide</a>. <b>Hub-spoke alternative:</b> one PostgreSQL + Apache AGE hub daemon with spokes that push through <code>/sync/push</code> and pull through <code>/sync/since</code>, as described in <a href="enterprise-deployment.html">enterprise deployment</a> §4.2.</p>
+</div></section>
+
+<section class="am-sec" id="wiring"><div class="am-wrap">
+  <div class="am-sec-h">
+    <span class="am-eyebrow">Wiring</span>
+    <h2>Governance, wake plane and <span class="a">attestation</span> at Tier 3.</h2>
   </div>
-</section>
-
-<section>
-  <div class="container">
-    <span class="eyebrow">Substrate</span>
-    <h2>Pinned Enterprise Federated component versions.</h2>
-    <p>The postgres-backed substrate pins an exact, tested matrix. These are the single source of truth in <code>deploy/docker-1461/provision/lib.sh</code> and are asserted at bring-up — the validate harness refuses to certify a stack whose probed versions drift from the pins below.</p>
-    <table>
-      <thead>
-        <tr><th>Component</th><th>Canonical version</th><th>SSOT pin</th></tr>
-      </thead>
-      <tbody>
-        <tr><td>PostgreSQL</td><td><strong>18.6</strong></td><td><code>PG_APT_VERSION=18.6-1.pgdg13+2</code> · <code>EXPECTED_PG_VERSION=18.6</code></td></tr>
-        <tr><td>Apache AGE</td><td><strong>1.8.0</strong></td><td><code>AGE_APT_VERSION=1.8.0~rc0-2.pgdg13+1</code> · <code>EXPECTED_AGE_VERSION=1.8.0</code> (extversion 1.8.0, overlaid via pinned pgdg apt on the <code>release_PG18_1.7.0</code> base image)</td></tr>
-        <tr><td>pgvector (server extension)</td><td><strong>0.8.6</strong></td><td><code>PGVECTOR_APT_VERSION=0.8.6-1.pgdg13+1</code></td></tr>
-        <tr><td>pgvector (Rust binding crate)</td><td><strong>0.4</strong></td><td><code>Cargo.toml</code> → <code>pgvector = "0.4"</code></td></tr>
-        <tr><td>ai-memory postgres schema</td><td><strong>v90</strong></td><td>schema parity with SQLite at v90 (<code>CURRENT_SCHEMA_VERSION = 90</code> in both adapters; the v58–v70 arms are the v0.8.0 coordination + visibility + encryption-prep + archive-edge additive DDL, v71 adds the signed <code>forget_tombstones</code> table per #1821 / G30, the v72–v78 arms are the v0.9.0 append-only revision spine, audit cause-binding, BLAKE3 content-id, lineage-DAG, identity-lineage succession, recall-purity fold state, and model-attestation additive DDL, and the v79–v90 arms are the v1.0.0 crypto-core / claim-bitemporal valid-time / lineage-custody + M-of-N key-recovery / per-agent-api-key / embedding-space provenance / archive-column-parity additive DDL)</td></tr>
-      </tbody>
-    </table>
-    <p>The bundled stacked image at <code>deploy/docker-1461/Dockerfile.pg-age-vector</code> (<code>ARG AGE_BASE_IMAGE=apache/age:release_PG18_1.7.0</code>, <code>ARG PG_MAJOR=18</code>) overlays Apache AGE 1.8.0 and pgvector 0.8.6 via pinned pgdg apt onto the AGE base so K8s / ECS / Cloud Run operators don't build AGE from source. <strong>Alternate tested matrix:</strong> <code>infra/lan-parity-test/</code> legitimately runs PG 16 + AGE 1.6.0 + pgvector 0.8.2 as a second tested combination; the <em>recommended</em> install targets the PG 18.6 / AGE 1.8.0 matrix above.</p>
+  <div class="am-grid">
+    <div class="am-card gold"><span class="am-k">Governance</span><h3>Replicated decisions</h3><p>Namespace standards, pending actions and pending decisions replicate through the same quorum fan-out, so an approval on one peer resolves the action everywhere (<code>src/federation/sync.rs</code>).</p></div>
+    <div class="am-card teal"><span class="am-k">Wake plane</span><h3>Local hubs, federated rows</h3><p>Hubs never bridge hosts. A message crosses the cluster as a replicated inbox row, and <code>applied_wake</code> on the receiving peer turns a fresh apply into a local wake.</p></div>
+    <div class="am-card"><span class="am-k">Attestation</span><h3>Three layers</h3><p>The mTLS allowlist authenticates the transport, the signature and nonce authenticate the push, and peer attestation checks the claimed sender and its namespace scope on <code>/sync/push</code> and <code>/sync/since</code>.</p></div>
   </div>
-</section>
+</div></section>
 
-<section>
-  <div class="container">
-    <span class="eyebrow">Configuration</span>
-    <h2>Federated <code>config.toml</code> — the full option surface.</h2>
-    <p>Every deployment reads a single schema-versioned file at <code>~/.config/ai-memory/config.toml</code>. The precedence ladder is uniform: <strong>CLI flag &gt; <code>AI_MEMORY_*</code> env &gt; <code>[section]</code> &gt; legacy flat field &gt; compiled default</strong>. The complete field-by-field reference (with types, defaults, and resolver semantics) lives in <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/docs/CONFIG_SCHEMA.md">docs/CONFIG_SCHEMA.md</a>.</p>
-<pre><code>schema_version = 2
-tier = "autonomous"
-db   = "/var/lib/ai-memory/store.db"
-
-# Postgres connection-pool + query bounds.
-postgres_pool_max_connections   = 16    # env: AI_MEMORY_PG_POOL_MAX
-postgres_pool_min_connections   = 2     # env: AI_MEMORY_PG_POOL_MIN
-postgres_acquire_timeout_secs   = 30    # env: AI_MEMORY_PG_ACQUIRE_TIMEOUT_SECS
-postgres_statement_timeout_secs = 30    # 0 disables
-request_timeout_secs  = 60              # axum slowloris guard
-llm_call_timeout_secs = 30
-
-[llm]            # backend / model / base_url / api_key_env|api_key_file
-[embeddings]     # backend / url / model / backfill_batch
-[reranker]       # enabled / model
-[storage]        # default_namespace / archive_on_gc / archive_max_days / max_memory_mb
-[limits]         # max_memories_per_day / max_storage_bytes / max_links_per_day / max_page_size
-[identity]       # anonymize_default
-[audit]          # enabled / path / hash_chain / attestation_cadence_minutes / retention_days
-                 #   + [audit.compliance.{soc2,hipaa,gdpr,fedramp}]
-[transcripts]    # default_ttl_secs / archive_grace_secs / max_decompressed_bytes
-                 #   + [transcripts.namespaces."&lt;pattern&gt;"]
-[hooks]          # [hooks.subscription] hmac_secret  (secret; chmod 600)
-[subscriptions]  # allow_loopback_webhooks  (default false — SSRF guard)
-[verify]         # require_nonce  (link-verify replay protection)
-[agents]         # [agents.defaults.recall_scope] namespaces / since / tier / limit
-[governance]     # require_operator_pubkey  (fail-closed rule enforcement)
-[confidence]     # shadow_retention_days
-[admin]          # agent_ids = [...]  (default-closed admin allowlist)
-[mcp]            # profile
-[permissions]    # mode = "enforce" | "advisory" | "off"</code></pre>
-    <p>All sections are <strong>default-safe</strong> — an absent block selects the compiled default and preserves existing behaviour. Inline <code>api_key = "&lt;literal&gt;"</code> is rejected at parse time; reference secrets via <code>api_key_env</code> / <code>api_key_file</code> (mode 0400) only.</p>
+<section class="am-sec alt" id="limits"><div class="am-wrap">
+  <div class="am-sec-h">
+    <span class="am-eyebrow">Honest limits</span>
+    <h2>When Tier 3 <span class="a">stops fitting</span>.</h2>
   </div>
-</section>
-
-<section>
-  <div class="container">
-    <span class="eyebrow">Wiring</span>
-    <h2>Governance, skills, and attestations at T3.</h2>
-    <ul>
-      <li><strong>Governance</strong> — Federated, eventually consistent. A policy change on one node propagates to all peers. Pending decisions also propagate. <strong>Caveat:</strong> during a partition, two operators on different sides can both approve/reject the same pending action; reconciliation is last-decision-wins on rejoin.</li>
-      <li><strong>Skills</strong> — Skills running as registered agents (<code>memory_agent_register</code>) get the same scope visibility on every node. Auto-tagging on node-A produces tags that are stored as memory metadata and replicated to all peers — every node sees the same enriched view.</li>
-      <li><strong>Attestations</strong> — <strong>Ed25519 SHIPPED</strong>. Per-agent keypair signs every link; peers refuse syncs with invalid signatures (AI_MEMORY_FED_REQUIRE_SIG=1 default). V-4 cross-row hash chain (schema v34) seals the signed_events audit log against tampering.</li>
-    </ul>
-  </div>
-</section>
-
-<section>
-  <div class="container">
-    <span class="eyebrow">Limits</span>
-    <h2>Honest ceilings.</h2>
-    <table>
-      <thead>
-        <tr><th>Dimension</th><th>T3 ceiling</th><th>When it bites</th></tr>
-      </thead>
-      <tbody>
-        <tr><td>Cluster size</td><td>~10 nodes before fanout latency dominates</td><td>Beyond that, walk to T4</td></tr>
-        <tr><td>Concurrent writes per node</td><td>~10–20 (T2 ceiling, multiplied)</td><td>Each node is independently bottlenecked by its mutex</td></tr>
-        <tr><td>Write durability</td><td>W-of-N quorum-writes when <code>--quorum-writes &gt;= 1</code>; local-WAL-only when 0</td><td>Choose your contract per deployment</td></tr>
-        <tr><td>Cross-node consistency</td><td>Eventual; vector clocks resolve order; ties break last-writer-wins</td><td>Use <code>memory_detect_contradiction</code> to surface drift</td></tr>
-        <tr><td>Vector index</td><td>Per-node, independent</td><td>Each node holds its own HNSW; embedding cost paid N times</td></tr>
-        <tr><td>TLS</td><td>mTLS supported, not enforced by default</td><td>Enforce before joining real peers</td></tr>
-      </tbody>
-    </table>
-  </div>
-</section>
-
-<section>
-  <div class="container">
-    <span class="eyebrow">Source</span>
-    <h2>Source-of-truth references.</h2>
-    <ul>
-      <li><code>src/daemon_runtime.rs</code> (<code>ServeArgs</code>) — quorum-write CLI flags (<code>--quorum-writes</code>, <code>--quorum-peers</code>, <code>--quorum-timeout-ms</code>, <code>--quorum-client-cert</code>/<code>-key</code>/<code>-ca-cert</code>, <code>--catchup-interval-secs</code>)</li>
-      <li><code>src/daemon_runtime.rs</code> (<code>ServeArgs</code>) — TLS / mTLS allowlist flags (<code>--tls-cert</code>, <code>--tls-key</code>, <code>--mtls-allowlist</code>)</li>
-      <li><code>src/federation/quorum.rs</code> + handlers — <code>broadcast_store_quorum</code> + <code>finalise_quorum</code> ack-counting in the write path</li>
-      <li><code>src/federation/sync.rs</code> — 10 broadcast functions: <code>broadcast_store_quorum</code>, <code>broadcast_delete_quorum</code>, <code>broadcast_archive_quorum</code>, <code>broadcast_restore_quorum</code>, <code>broadcast_link_quorum</code>, <code>broadcast_consolidate_quorum</code>, <code>broadcast_pending_quorum</code>, <code>broadcast_pending_decision_quorum</code>, <code>broadcast_namespace_meta_quorum</code>, <code>broadcast_namespace_meta_clear_quorum</code></li>
-      <li><code>src/replication.rs</code> — <code>QuorumPolicy</code> + <code>AckTracker</code> implementation</li>
-      <li><code>src/handlers/</code> — <code>POST /api/v1/sync/push</code> ingress, <code>GET /api/v1/sync/since</code> causal catch-up</li>
-      <li><code>docs/ADR-0001-quorum-replication.md</code> — the realised design</li>
-      <li><code>CHANGELOG.md</code> — #325 link fanout, #326 consolidate fanout, #327 embedder readiness</li>
-    </ul>
-  </div>
-</section>
-
-<footer>
-  <p>© 2026 AlphaOne LLC. Licensed Apache-2.0. ai-memory v1.0.0 — <a href="https://github.com/alphaonedev/ai-memory-mcp">source on GitHub</a> · <a href="./">home</a></p>
-</footer>
-
+  <div class="am-tablewrap"><table class="am-table">
+    <thead><tr><th>Dimension</th><th>Tier 3 behaviour</th><th>Move up when</th></tr></thead>
+    <tbody>
+      <tr><td><b>Consistency</b></td><td>Quorum writes plus catch-up; no Raft or Paxos, no gossip discovery. Peers are listed explicitly.</td><td>Always true; size quorum for the failures you must survive.</td></tr>
+      <tr><td><b>Graph invalidation</b></td><td>Knowledge-graph invalidations reach other peers asynchronously.</td><td>Read from the writing peer when you need the result immediately.</td></tr>
+      <tr><td><b>Surfaces</b></td><td>Only HTTP writes fan out; MCP and CLI erasures reach peers through the erasure outbox drained by the daemon.</td><td>Route agents that need replication through HTTP.</td></tr>
+      <tr><td><b>Per-peer store</b></td><td>SQLite peers each keep one writer at a time and an in-process vector index.</td><td>Write load or corpus size grows: <a href="architectures-t4.html">PostgreSQL tier</a>.</td></tr>
+      <tr><td><b>Wake reach</b></td><td>Wakes are per host; the cross-host leg is federation, and the poll remains the guarantee.</td><td>No change needed at larger tiers.</td></tr>
+    </tbody>
+  </table></div>
+  <p class="am-figcap" style="margin-top:12px">Reasoning for each: <a href="ARCHITECTURAL_LIMITS.html">architectural limits</a> and <a href="federation.html">federation</a>.</p>
+  <div class="am-btns"><a class="am-btn" href="architectures-t2.html">← Tier 2 · Shared daemon</a><a class="am-btn primary" href="architectures-t4.html">Tier 4 · Data-center swarm →</a></div>
+</div></section>
+</main>
+<footer class="am-foot"><div class="am-wrap">
+  <span>© 2026 AlphaOne LLC · Apache-2.0 · ai-memory v1.0.0</span>
+  <span><a href="https://github.com/alphaonedev/ai-memory-mcp">source</a> · <a href="index.html">home</a> · <a href="architectures.html">architectures</a> · <a href="ARCHITECTURAL_LIMITS.html">limits</a></span>
+</div></footer>
+<button class="am-themetog" id="am-themetog" type="button" aria-label="Toggle light or dark theme">theme</button>
+<script>
+(function(){var d=document.documentElement;try{var s=localStorage.getItem('aim-site-theme');if(s)d.setAttribute('data-theme',s);}catch(e){}
+var b=document.getElementById('am-themetog');if(!b)return;b.addEventListener('click',function(){var c=d.getAttribute('data-theme');var n=c==='dark'?'light':c==='light'?'dark':(matchMedia('(prefers-color-scheme:dark)').matches?'light':'dark');d.setAttribute('data-theme',n);try{localStorage.setItem('aim-site-theme',n);}catch(e){}});})();
+</script>
 </body>
 </html>

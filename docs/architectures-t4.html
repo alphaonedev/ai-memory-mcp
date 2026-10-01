@@ -1,561 +1,265 @@
+<!DOCTYPE html>
 <!--
   Copyright 2026 AlphaOne LLC
   SPDX-License-Identifier: Apache-2.0
-  T4 — Data-center swarm. Multi-rack core today; pgvector backbone GA v0.8.0.
+  Tier 4: data-center swarm on the PostgreSQL tier (v1.0.0 GA).
+  Theme: the shared landing-page tokens in assets/site-theme.css (#4420).
+  Every capability drawn here is backed by code on the v1.0.0 tree; the
+  commit that introduced this page cites file:line for each one.
 -->
-<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>ai-memory · T4 — Data-center swarm</title>
-<meta name="description" content="Multi-rack deployment with Postgres+pgvector backbone + Apache AGE Cypher graph + mTLS peer mesh + per-rack governance — agents swarm across pods. GA at v0.8.0 via --features sal-postgres.">
-<meta property="og:title" content="ai-memory · T4 — Data-center swarm">
-<meta property="og:description" content="Multi-rack swarm. Quorum writes ship today; Postgres+pgvector backbone GA v0.8.0.">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ai-memory · T4: data-center swarm on PostgreSQL</title>
+<meta name="description" content="Tier 4 of ai-memory v1.0.0: racks of ai-memory daemons on an operator-run PostgreSQL 18 deployment with pgvector and optional Apache AGE, a fail-closed route gate, signed W-of-N federation and per-host wake hubs, with honest limits.">
+<meta name="theme-color" content="#0c0b08">
 <link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/architectures-t4.html">
-<style>
-:root{--bg:#000;--bg-raised:#0a0a0a;--bg-card:#111;--bg-elev:#161616;--bg-code:#1a1a1a;--border:#262626;--border-hl:#3d3d3d;--text:#fff;--text-muted:#999;--text-dim:#666;--p1:#6ee7ff;--p2:#ffb86b;--p3:#c8a2ff;--good:#6ee7ff;--bad:#ff6b9d;--gold:#ffd700;--font-mono:'SF Mono','Cascadia Code','Fira Code',Consolas,monospace;--font-sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;--max-w:1280px}
-*,*::before,*::after{margin:0;padding:0;box-sizing:border-box}
-html{scroll-behavior:smooth;scroll-padding-top:5rem}
-body{font-family:var(--font-sans);background:var(--bg);color:var(--text);line-height:1.6;-webkit-font-smoothing:antialiased;overflow-x:hidden}
-a{color:var(--text);text-decoration:none}a:hover{color:var(--p1)}
-code{font-family:var(--font-mono);font-size:.85rem;background:var(--bg-code);padding:.1em .35em;border-radius:4px}
-pre{font-family:var(--font-mono);font-size:.85rem;background:var(--bg-code);padding:1rem 1.1rem;border-radius:8px;border:1px solid var(--border);overflow-x:auto;line-height:1.55;color:var(--text-muted);margin:1rem 0}
-pre code{padding:0;background:none}
-.container{max-width:var(--max-w);margin:0 auto;padding:0 1.5rem}
-h1,h2,h3{font-weight:700;letter-spacing:-0.02em}h2{font-size:1.6rem;margin-bottom:.5rem;font-family:var(--font-mono)}h3{font-size:1.05rem;margin:1rem 0 .35rem}
-p{color:var(--text-muted);margin-bottom:.85rem}
-.topnav{position:sticky;top:0;z-index:50;background:rgba(0,0,0,0.85);backdrop-filter:blur(12px);border-bottom:1px solid var(--border)}
-.topnav .inner{display:flex;justify-content:space-between;max-width:var(--max-w);margin:0 auto;padding:.9rem 1.5rem;font-size:.875rem}
-.topnav a{color:var(--text-muted);margin-right:1.25rem}.topnav a:hover{color:var(--text)}
-.topnav .home-link{color:var(--text);font-weight:600}
-.topnav .right{display:flex;gap:1.25rem;flex-wrap:wrap}@media(max-width:800px){.topnav .right{display:none}}
-.hero{padding:4rem 1.5rem 2.5rem;text-align:center;background:radial-gradient(ellipse at center,rgba(200,162,255,0.10),transparent 60%);border-bottom:1px solid var(--border)}
-.hero h1{font-size:clamp(1.8rem,4vw,2.75rem);line-height:1.1;letter-spacing:-0.03em;margin-bottom:1rem}
-.hero .tagline{color:var(--text-muted);font-size:1.05rem;max-width:780px;margin:0 auto 1rem}
-.hero .pills{display:flex;justify-content:center;gap:.5rem;flex-wrap:wrap;margin-top:1.25rem}
-.hero .pill{padding:.4rem 1rem;border:1px solid var(--border-hl);border-radius:999px;font-family:var(--font-mono);font-size:.78rem;color:var(--text-muted)}
-
-section{padding:3rem 0;border-bottom:1px solid var(--border)}
-.eyebrow{display:inline-block;font-size:.72rem;font-weight:600;letter-spacing:.12em;text-transform:uppercase;color:var(--text-muted);margin-bottom:.5rem;padding:.2rem .6rem;border:1px solid var(--border-hl);border-radius:999px}
-.lede{color:var(--text-muted);font-size:.95rem;max-width:820px;margin-bottom:2rem}
-section h2{font-family:var(--font-sans);font-size:1.6rem;margin-bottom:.6rem}
-
-footer{padding:3rem 1.5rem;text-align:center;font-size:.85rem;color:var(--text-dim);border-top:1px solid var(--border)}
-footer a{color:var(--text-muted)}
-
-.topnav .menu{position:relative;display:inline-block}
-.topnav .menu-btn{background:none;border:none;color:var(--text-muted);font-family:inherit;font-size:inherit;cursor:pointer;padding:.2rem 0;line-height:1;letter-spacing:0}
-.topnav .menu-btn:hover,.topnav .menu:focus-within .menu-btn{color:var(--text)}
-.topnav .menu-btn.active{color:var(--text)}
-.topnav .menu-btn .caret{opacity:.5;font-size:.7em;margin-left:.2em}
-.topnav .menu-pane{position:absolute;top:calc(100% + .55rem);right:0;background:var(--bg-card);border:1px solid var(--border-hl);border-radius:8px;padding:.4rem 0;min-width:240px;box-shadow:0 10px 28px rgba(0,0,0,0.5);z-index:60;visibility:hidden;opacity:0;transition:opacity .12s ease,visibility 0s .12s}
-.topnav .menu:focus-within .menu-pane,.topnav .menu:hover .menu-pane{visibility:visible;opacity:1;transition:opacity .12s ease}
-.topnav .menu-pane a{display:block;padding:.5rem 1rem;color:var(--text-muted);font-size:.85rem;margin-right:0;white-space:nowrap;text-decoration:none}
-.topnav .menu-pane a:hover{background:var(--bg-elev);color:var(--text)}
-.topnav .menu-pane a.current{color:var(--p1);background:var(--bg-elev)}
-
-.cap-badge{display:inline-block;padding:.15em .55em;font-family:var(--font-mono);font-size:.7rem;font-weight:600;border-radius:4px;border:1px solid;letter-spacing:.04em;margin:.1em .15em}
-.cap-today{color:#6ee7ff;border-color:#2a6571;background:rgba(110,231,255,.08)}
-.cap-roadmap{color:#c8a2ff;border-color:#5a4280;background:rgba(200,162,255,.08)}
-.cap-partial{color:#ffb86b;border-color:#7a5328;background:rgba(255,184,107,.08)}
-.cap-future{color:#ff6b9d;border-color:#7a3251;background:rgba(255,107,157,.08)}
-
-.arch-diagram{background:var(--bg-card);border:1px solid var(--border);border-radius:14px;padding:1.5rem;margin:1.5rem 0}
-.arch-diagram-title{font-family:var(--font-mono);font-size:.85rem;color:var(--p2);letter-spacing:.04em;margin-bottom:1rem;text-transform:uppercase}
-.arch-svg{width:100%;height:auto;display:block;background:#0a0a0a;border-radius:8px}
-.arch-svg .node{fill:#161616;stroke:#3d3d3d;stroke-width:1.2}
-.arch-svg .node-label{fill:#fff;font-family:'SF Mono',monospace;font-size:12px;font-weight:600}
-.arch-svg .sub-label{fill:#999;font-family:'SF Mono',monospace;font-size:10px}
-.arch-svg .edge{fill:none}
-.arch-svg .edge-dashed{fill:none;stroke:#666;stroke-width:1.2;stroke-dasharray:4 3}
-.arch-svg .edge-roadmap{fill:none;stroke:#a78bfa;stroke-width:1.4;stroke-dasharray:5 4;opacity:.7}
-.arch-svg .flow{filter:drop-shadow(0 0 4px currentColor)}
-.arch-svg .flow-write{fill:#f97316;color:#f97316}
-.arch-svg .flow-recall{fill:#2dd4bf;color:#2dd4bf}
-.arch-svg .flow-sync{fill:#a78bfa;color:#a78bfa}
-.arch-svg .flow-policy{fill:#facc15;color:#facc15}
-.arch-svg .flow-attest{fill:#f472b6;color:#f472b6}
-.arch-svg .ring{fill:none;stroke:#6ee7ff;stroke-width:2;opacity:.7;animation:pulse 2.4s ease-out infinite}
-@keyframes pulse{0%{r:6;opacity:.85}100%{r:18;opacity:0}}
-.arch-legend{display:flex;flex-wrap:wrap;gap:1rem;margin-top:1rem;font-family:var(--font-mono);font-size:.75rem;color:var(--text-muted)}
-.arch-legend-item{display:inline-flex;align-items:center;gap:.4rem}
-.arch-legend-dot{display:inline-block;width:10px;height:10px;border-radius:50%}
-.arch-diagram-caption{font-size:.85rem;color:var(--text-dim);margin-top:1rem;line-height:1.5}
-
-ul,ol{padding-left:1.5rem;color:var(--text-muted);font-size:.92rem;margin:.5rem 0 1rem}
-ul li,ol li{margin-bottom:.4rem}
-
-table{width:100%;border-collapse:collapse;margin:1rem 0 1.5rem;font-size:.85rem;background:var(--bg-card);border:1px solid var(--border);border-radius:10px;overflow:hidden}
-table th,table td{padding:.65rem .85rem;text-align:left;border-bottom:1px solid var(--border)}
-table th{background:var(--bg-elev);font-family:var(--font-mono);font-size:.78rem;font-weight:600;color:var(--text);letter-spacing:.04em}
-table td{color:var(--text-muted)}
-table tr:last-child td{border-bottom:none}
-@media (prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important;scroll-behavior:auto!important}}
-
-/* Zero-JS mobile nav fallback — visible only when .right collapses */
-.topnav .mnav{display:none;position:relative}
-.topnav .mnav summary{list-style:none;cursor:pointer;color:var(--text-muted);border:1px solid var(--border-hl);border-radius:6px;padding:.3rem .8rem;font-size:.85rem;user-select:none}
-.topnav .mnav summary::-webkit-details-marker{display:none}
-.topnav .mnav[open] summary{color:var(--text);border-color:var(--text-muted)}
-.topnav .mnav-pane{position:absolute;top:calc(100% + .55rem);right:0;background:var(--bg-card);border:1px solid var(--border-hl);border-radius:8px;padding:.4rem 0;min-width:250px;max-height:72vh;overflow-y:auto;box-shadow:0 10px 28px rgba(0,0,0,0.5);z-index:60}
-.topnav .mnav-pane a{display:block;padding:.45rem 1rem;color:var(--text-muted);font-size:.85rem;margin:0;white-space:nowrap}
-.topnav .mnav-pane a:hover{background:var(--bg-elev);color:var(--text)}
-.topnav .mnav-group{padding:.6rem 1rem .25rem;font-family:var(--font-mono);font-size:.66rem;letter-spacing:.12em;text-transform:uppercase;color:var(--text-dim)}
-@media(max-width:800px){.topnav .mnav{display:block}}
-</style>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700;800;900&amp;family=IBM+Plex+Sans:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@500;600&amp;display=swap">
+<link rel="stylesheet" href="assets/site-theme.css">
 </head>
-<body>
-
-<nav class="topnav">
-  <div class="inner">
-    <a class="home-link" href="./">ai-memory <span style="opacity:.5">▸ Architectures · T4</span></a>
-    <div class="right">
-      <a href="at-a-glance.html" style="color:#6ee7ff">Atlas</a>
-      <a href="whats-new-v09.html" style="color:#ffb86b">What's new</a>
-      <div class="menu">
-        <button class="menu-btn">Audiences<span class="caret">▾</span></button>
-        <div class="menu-pane">
-          <a href="for-everyone.html">For Everyone</a>
-          <a href="audience/decision-maker.html">Decision Maker</a>
-          <a href="audience/developer.html">Developer</a>
-          <a href="audience/operator.html">Operator</a>
-          <a href="feature-matrix.html">Feature Matrix</a>
-          <a href="data-flow.html">Data Flow</a>
-          <a href="integrations.html">Integrations</a>
-          <a href="import-history.html">Import History</a>
-          <a href="release-pipeline.html">Release Pipeline</a>
-        </div>
-      </div>
-      <div class="menu">
-        <button class="menu-btn">Features<span class="caret">▾</span></button>
-        <div class="menu-pane">
-          <a href="memory-tiers.html">Memory Tiers</a>
-          <a href="memory-rules.html">Memory Rules</a>
-          <a href="ttl-controls.html">TTL Controls</a>
-          <a href="archival.html">Archival</a>
-          <a href="encryption.html">Encryption</a>
-          <a href="hierarchies.html">Hierarchies</a>
-          <a href="knowledge-graph.html">Knowledge Graph</a>
-          <a href="autonomous.html">Autonomous</a>
-          <a href="a2a-messaging.html">A2A Messaging</a>
-          <a href="a2a-integration.html">Integrate an Agent</a>
-          <a href="lifecycle.html">Lifecycle</a>
-          <a href="performance.html">Performance</a>
-          <a href="agent-identity.html">Agent Identity (NHI)</a>
-          <a href="zero-touch-trust.html">Zero-Touch Trust</a>
-        </div>
-      </div>
-      <div class="menu">
-        <button class="menu-btn active">Architectures<span class="caret">▾</span></button>
-        <div class="menu-pane">
-          <a href="architectures.html">Overview</a>
-          <a href="architectures-t1.html">T1 — Single Agent</a>
-          <a href="architectures-t2.html">T2 — Many Agents</a>
-          <a href="architectures-t3.html">T3 — Multi-Node Cluster</a>
-          <a href="architectures-t4.html" class="current">T4 — Data-Center Swarm</a>
-          <a href="architectures-t5.html">T5 — Global Hive</a>
-          <a href="reference-architecture/">Grand Slam — 3-Region Hive</a>
-          <a href="reference-architecture/enterprise-cpu-memory.html">Enterprise — CPU+Memory Nodes</a>
-          <a href="reference-architecture/enterprise-cpu-memory-gpu.html">Enterprise — CPU+Memory+GPU Nodes</a>
-        </div>
-      </div>
-      <div class="menu">
-        <button class="menu-btn">Internals<span class="caret">▾</span></button>
-        <div class="menu-pane">
-          <a href="schema.html">Schema</a>
-          <a href="types.html">Types</a>
-          <a href="validators.html">Validators</a>
-          <a href="governance.html">Governance</a>
-          <a href="batman-active-mode.html">Batman Mode</a>
-          <a href="tracing.html">Tracing</a>
-          <a href="spec/v1.html">Portability Spec v1</a>
-        </div>
-      </div>
-      <div class="menu">
-        <button class="menu-btn">Evidence<span class="caret">▾</span></button>
-        <div class="menu-pane">
-          <a href="evidence.html">Frozen Claims</a>
-          <a href="evidence/">Evidence Hub (campaigns)</a>
-          <a href="performance.html">Performance budgets</a>
-          <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/benchmarks/longmemeval/results.md">LongMemEval variants</a>
-        </div>
-      </div>
-      <a href="credits.html">Credits</a>
-      <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub →</a>
-    </div>
-    <details class="mnav">
-      <summary>Menu</summary>
-      <div class="mnav-pane">
-        <a href="./">Home</a>
-        <a href="at-a-glance.html">Atlas</a>
-        <a href="whats-new-v09.html">What's new</a>
-        <div class="mnav-group">Audiences</div>
-        <a href="for-everyone.html">For Everyone</a>
-        <a href="audience/decision-maker.html">Decision Maker</a>
-        <a href="audience/developer.html">Developer</a>
-        <a href="audience/operator.html">Operator</a>
-        <a href="feature-matrix.html">Feature Matrix</a>
-        <a href="data-flow.html">Data Flow</a>
-        <a href="integrations.html">Integrations</a>
-        <a href="import-history.html">Import History</a>
-        <a href="release-pipeline.html">Release Pipeline</a>
-        <div class="mnav-group">Features</div>
-        <a href="memory-tiers.html">Memory Tiers</a>
-        <a href="memory-rules.html">Memory Rules</a>
-        <a href="ttl-controls.html">TTL Controls</a>
-        <a href="archival.html">Archival</a>
-        <a href="encryption.html">Encryption</a>
-        <a href="hierarchies.html">Hierarchies</a>
-        <a href="knowledge-graph.html">Knowledge Graph</a>
-        <a href="autonomous.html">Autonomous</a>
-        <a href="a2a-messaging.html">A2A Messaging</a>
-          <a href="a2a-integration.html">Integrate an Agent</a>
-        <a href="lifecycle.html">Lifecycle</a>
-        <a href="performance.html">Performance</a>
-        <a href="agent-identity.html">Agent Identity (NHI)</a>
-        <a href="zero-touch-trust.html">Zero-Touch Trust</a>
-        <div class="mnav-group">Architectures</div>
-        <a href="architectures.html">Overview</a>
-        <a href="architectures-t1.html">T1 — Single Agent</a>
-        <a href="architectures-t2.html">T2 — Many Agents</a>
-        <a href="architectures-t3.html">T3 — Multi-Node Cluster</a>
-        <a href="architectures-t4.html">T4 — Data-Center Swarm</a>
-        <a href="architectures-t5.html">T5 — Global Hive</a>
-        <a href="reference-architecture/">Grand Slam — 3-Region Hive</a>
-        <a href="reference-architecture/enterprise-cpu-memory.html">Enterprise — CPU+Memory Nodes</a>
-        <a href="reference-architecture/enterprise-cpu-memory-gpu.html">Enterprise — CPU+Memory+GPU Nodes</a>
-        <div class="mnav-group">Internals</div>
-        <a href="schema.html">Schema</a>
-        <a href="types.html">Types</a>
-        <a href="validators.html">Validators</a>
-        <a href="governance.html">Governance</a>
-        <a href="batman-active-mode.html">Batman Mode</a>
-        <a href="tracing.html">Tracing</a>
-        <a href="spec/v1.html">Portability Spec v1</a>
-        <div class="mnav-group">Evidence</div>
-        <a href="evidence.html">Frozen Claims</a>
-        <a href="evidence/">Evidence Hub (campaigns)</a>
-        <a href="performance.html">Performance budgets</a>
-        <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/benchmarks/longmemeval/results.md">LongMemEval variants</a>
-        <div class="mnav-group">More</div>
-        <a href="credits.html">Credits</a>
-        <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub →</a>
-      </div>
-    </details>
-  </div>
-</nav>
-
-<section class="hero">
-  <span class="cap-badge cap-today">CORE TODAY</span>
-  <span class="cap-badge cap-today">PG+pgvector + Apache AGE · v0.8.0 SHIPPED</span>
-  <h1>Tier 4 — Data-center swarm</h1>
-  <p class="tagline">Multiple racks, one coherent memory fabric — sized as a <strong>certified ≤50-peer federation block carrying ~500–1000 agents</strong>. The core fabric shipped at v0.6.3; the shared distributed store (Postgres + pgvector + Apache AGE) is GA at v0.8.0. Scale past one block by composing independent clusters, not by growing one mesh past ~50 peers.</p>
-  <div class="pills">
-    <span class="pill">≤50-peer block · ~1000 agents</span>
-    <span class="pill">multi-rack</span>
-    <span class="pill">W-of-N quorum</span>
-    <span class="pill">mTLS allowlist</span>
-  </div>
-</section>
-
-<section>
-  <div class="container">
-    <p>The core fabric shipped at v0.6.3: the peer mesh, <strong>W-of-N quorum-writes</strong>, mTLS with fingerprint allowlist, federated governance, pending decisions, namespace metadata, capabilities introspection v2. The <strong>shared distributed store</strong> (Postgres + pgvector) is GA at v0.8.0 via <code>--features sal-postgres</code>.</p>
-    <p>The diagram distinguishes layers: solid edges = always-on; the Postgres + Apache AGE + pgvector layer ships via `--features sal-postgres`.</p>
-  </div>
-</section>
-
-<section>
-  <div class="container">
-    <span class="eyebrow">Architecture diagram</span>
-    <h2>Multi-rack swarm · pgvector + Apache AGE backbone (GA at v0.8.0).</h2>
-
-    <div class="arch-diagram">
-      <div class="arch-diagram-title">T4 · Multi-rack swarm · pgvector + Apache AGE backbone (GA at v0.8.0) · quorum writes (always-on)</div>
-
-      <svg class="arch-svg" viewBox="0 0 940 620" role="img" aria-label="Multi-rack ai-memory data center swarm with Postgres pgvector backbone">
-
-        <defs>
-          <marker id="t4-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
-            <path d="M0,0 L10,5 L0,10 z" fill="currentColor" />
-          </marker>
-
-          <linearGradient id="t4-rack-grad" x1="0" x2="0" y1="0" y2="1">
-            <stop offset="0%" stop-color="#2dd4bf" stop-opacity="0.10"/>
-            <stop offset="100%" stop-color="#0d9488" stop-opacity="0.04"/>
-          </linearGradient>
-
-          <linearGradient id="t4-pg-grad" x1="0" x2="0" y1="0" y2="1">
-            <stop offset="0%" stop-color="#a78bfa" stop-opacity="0.20"/>
-            <stop offset="100%" stop-color="#6366f1" stop-opacity="0.10"/>
-          </linearGradient>
-
-          <path id="t4-RaRb" d="M 230 290 C 320 280, 470 280, 540 290" />
-          <path id="t4-RbRa" d="M 540 310 C 470 320, 320 320, 230 310" />
-          <path id="t4-RbRc" d="M 700 290 C 760 280, 820 280, 850 290" />
-          <path id="t4-RcRb" d="M 850 310 C 820 320, 760 320, 700 310" />
-          <path id="t4-RaRc" d="M 200 320 C 380 480, 700 480, 850 320" />
-
-          <path id="t4-RaPg" d="M 150 380 L 470 545" />
-          <path id="t4-RbPg" d="M 620 380 L 480 545" />
-          <path id="t4-RcPg" d="M 870 380 L 510 545" />
-
-          <path id="t4-gov-Ra" d="M 470 95 L 150 240" />
-          <path id="t4-gov-Rb" d="M 470 95 L 620 240" />
-          <path id="t4-gov-Rc" d="M 470 95 L 870 240" />
-        </defs>
-
-        <!-- CENTRAL GOVERNANCE PLANE -->
-        <g>
-          <rect x="350" y="40" width="240" height="65" rx="10" fill="rgba(250,204,21,0.14)" stroke="#facc15" stroke-width="1.6" />
-          <text x="470" y="60" text-anchor="middle" class="node-label">Federated control plane</text>
-          <text x="470" y="76" text-anchor="middle" class="sub-label">namespace_meta · governance policy</text>
-          <text x="470" y="91" text-anchor="middle" class="sub-label">pending decisions · capabilities v2</text>
-        </g>
-
-        <!-- GOVERNANCE EDGES -->
-        <use href="#t4-gov-Ra" class="edge" stroke="#facc15" stroke-width="1.4" marker-end="url(#t4-arrow)" style="color: #facc15; opacity: 0.55" stroke-dasharray="3 2" />
-        <use href="#t4-gov-Rb" class="edge" stroke="#facc15" stroke-width="1.4" marker-end="url(#t4-arrow)" style="color: #facc15; opacity: 0.55" stroke-dasharray="3 2" />
-        <use href="#t4-gov-Rc" class="edge" stroke="#facc15" stroke-width="1.4" marker-end="url(#t4-arrow)" style="color: #facc15; opacity: 0.55" stroke-dasharray="3 2" />
-
-        <!-- RACK A -->
-        <g>
-          <rect x="50" y="160" width="180" height="240" rx="12" fill="url(#t4-rack-grad)" stroke="#2dd4bf" stroke-width="1.4" />
-          <text x="140" y="180" text-anchor="middle" class="node-label" style="font-size: 12px">Rack A · zone-a</text>
-          <text x="140" y="195" text-anchor="middle" class="sub-label">10.1.0.0/24</text>
-          <g><rect x="64" y="210" width="152" height="36" rx="6" class="node"/><text x="72" y="228" class="sub-label" style="font-size: 10px" font-weight="600">ai-memory-0-0</text><text x="72" y="240" class="sub-label">8 agents · scope-isolated</text><circle cx="180" cy="228" r="3" fill="#2dd4bf"/><circle cx="190" cy="228" r="3" fill="#facc15"/><circle cx="200" cy="228" r="3" fill="#a78bfa"/></g>
-          <g><rect x="64" y="255" width="152" height="36" rx="6" class="node"/><text x="72" y="273" class="sub-label" style="font-size: 10px" font-weight="600">ai-memory-0-1</text><text x="72" y="285" class="sub-label">8 agents · scope-isolated</text><circle cx="180" cy="273" r="3" fill="#2dd4bf"/><circle cx="190" cy="273" r="3" fill="#facc15"/><circle cx="200" cy="273" r="3" fill="#a78bfa"/></g>
-          <g><rect x="64" y="300" width="152" height="36" rx="6" class="node"/><text x="72" y="318" class="sub-label" style="font-size: 10px" font-weight="600">ai-memory-0-2</text><text x="72" y="330" class="sub-label">8 agents · scope-isolated</text><circle cx="180" cy="318" r="3" fill="#2dd4bf"/><circle cx="190" cy="318" r="3" fill="#facc15"/><circle cx="200" cy="318" r="3" fill="#a78bfa"/></g>
-          <g><rect x="64" y="345" width="152" height="36" rx="6" class="node"/><text x="72" y="363" class="sub-label" style="font-size: 10px" font-weight="600">ai-memory-0-3</text><text x="72" y="375" class="sub-label">8 agents · scope-isolated</text><circle cx="180" cy="363" r="3" fill="#2dd4bf"/><circle cx="190" cy="363" r="3" fill="#facc15"/><circle cx="200" cy="363" r="3" fill="#a78bfa"/></g>
-        </g>
-
-        <!-- RACK B -->
-        <g>
-          <rect x="510" y="160" width="180" height="240" rx="12" fill="url(#t4-rack-grad)" stroke="#2dd4bf" stroke-width="1.4" />
-          <text x="600" y="180" text-anchor="middle" class="node-label" style="font-size: 12px">Rack B · zone-a</text>
-          <text x="600" y="195" text-anchor="middle" class="sub-label">10.1.1.0/24</text>
-          <g><rect x="524" y="210" width="152" height="36" rx="6" class="node"/><text x="532" y="228" class="sub-label" style="font-size: 10px" font-weight="600">ai-memory-1-0</text><text x="532" y="240" class="sub-label">8 agents · scope-isolated</text><circle cx="640" cy="228" r="3" fill="#2dd4bf"/><circle cx="650" cy="228" r="3" fill="#facc15"/><circle cx="660" cy="228" r="3" fill="#a78bfa"/></g>
-          <g><rect x="524" y="255" width="152" height="36" rx="6" class="node"/><text x="532" y="273" class="sub-label" style="font-size: 10px" font-weight="600">ai-memory-1-1</text><text x="532" y="285" class="sub-label">8 agents · scope-isolated</text><circle cx="640" cy="273" r="3" fill="#2dd4bf"/><circle cx="650" cy="273" r="3" fill="#facc15"/><circle cx="660" cy="273" r="3" fill="#a78bfa"/></g>
-          <g><rect x="524" y="300" width="152" height="36" rx="6" class="node"/><text x="532" y="318" class="sub-label" style="font-size: 10px" font-weight="600">ai-memory-1-2</text><text x="532" y="330" class="sub-label">8 agents · scope-isolated</text><circle cx="640" cy="318" r="3" fill="#2dd4bf"/><circle cx="650" cy="318" r="3" fill="#facc15"/><circle cx="660" cy="318" r="3" fill="#a78bfa"/></g>
-          <g><rect x="524" y="345" width="152" height="36" rx="6" class="node"/><text x="532" y="363" class="sub-label" style="font-size: 10px" font-weight="600">ai-memory-1-3</text><text x="532" y="375" class="sub-label">8 agents · scope-isolated</text><circle cx="640" cy="363" r="3" fill="#2dd4bf"/><circle cx="650" cy="363" r="3" fill="#facc15"/><circle cx="660" cy="363" r="3" fill="#a78bfa"/></g>
-        </g>
-
-        <!-- RACK C -->
-        <g>
-          <rect x="760" y="160" width="180" height="240" rx="12" fill="url(#t4-rack-grad)" stroke="#2dd4bf" stroke-width="1.4" />
-          <text x="850" y="180" text-anchor="middle" class="node-label" style="font-size: 12px">Rack C · zone-b</text>
-          <text x="850" y="195" text-anchor="middle" class="sub-label">10.1.2.0/24</text>
-          <g><rect x="774" y="210" width="152" height="36" rx="6" class="node"/><text x="782" y="228" class="sub-label" style="font-size: 10px" font-weight="600">ai-memory-2-0</text><text x="782" y="240" class="sub-label">8 agents · scope-isolated</text><circle cx="890" cy="228" r="3" fill="#2dd4bf"/><circle cx="900" cy="228" r="3" fill="#facc15"/><circle cx="910" cy="228" r="3" fill="#a78bfa"/></g>
-          <g><rect x="774" y="255" width="152" height="36" rx="6" class="node"/><text x="782" y="273" class="sub-label" style="font-size: 10px" font-weight="600">ai-memory-2-1</text><text x="782" y="285" class="sub-label">8 agents · scope-isolated</text><circle cx="890" cy="273" r="3" fill="#2dd4bf"/><circle cx="900" cy="273" r="3" fill="#facc15"/><circle cx="910" cy="273" r="3" fill="#a78bfa"/></g>
-          <g><rect x="774" y="300" width="152" height="36" rx="6" class="node"/><text x="782" y="318" class="sub-label" style="font-size: 10px" font-weight="600">ai-memory-2-2</text><text x="782" y="330" class="sub-label">8 agents · scope-isolated</text><circle cx="890" cy="318" r="3" fill="#2dd4bf"/><circle cx="900" cy="318" r="3" fill="#facc15"/><circle cx="910" cy="318" r="3" fill="#a78bfa"/></g>
-          <g><rect x="774" y="345" width="152" height="36" rx="6" class="node"/><text x="782" y="363" class="sub-label" style="font-size: 10px" font-weight="600">ai-memory-2-3</text><text x="782" y="375" class="sub-label">8 agents · scope-isolated</text><circle cx="890" cy="363" r="3" fill="#2dd4bf"/><circle cx="900" cy="363" r="3" fill="#facc15"/><circle cx="910" cy="363" r="3" fill="#a78bfa"/></g>
-        </g>
-
-        <!-- RACK-TO-RACK MESH -->
-        <use href="#t4-RaRb" class="edge" stroke="#a78bfa" stroke-width="1.5" marker-end="url(#t4-arrow)" style="color: #a78bfa; opacity: 0.55" />
-        <use href="#t4-RbRa" class="edge" stroke="#a78bfa" stroke-width="1.5" marker-end="url(#t4-arrow)" style="color: #a78bfa; opacity: 0.55" />
-        <use href="#t4-RbRc" class="edge" stroke="#a78bfa" stroke-width="1.5" marker-end="url(#t4-arrow)" style="color: #a78bfa; opacity: 0.55" />
-        <use href="#t4-RcRb" class="edge" stroke="#a78bfa" stroke-width="1.5" marker-end="url(#t4-arrow)" style="color: #a78bfa; opacity: 0.55" />
-        <use href="#t4-RaRc" class="edge" stroke="#a78bfa" stroke-width="1.5" marker-end="url(#t4-arrow)" style="color: #a78bfa; opacity: 0.55" />
-
-        <!-- PGVECTOR BACKBONE -->
-        <g>
-          <rect x="370" y="510" width="240" height="80" rx="12" fill="url(#t4-pg-grad)" stroke="#a78bfa" stroke-width="1.6" stroke-dasharray="6 3" />
-          <text x="490" y="533" text-anchor="middle" class="node-label" style="font-size: 12px">Postgres + pgvector</text>
-          <text x="490" y="550" text-anchor="middle" class="sub-label">--features sal-postgres</text>
-          <text x="490" y="565" text-anchor="middle" class="sub-label">shared store · shared HNSW</text>
-          <text x="490" y="580" text-anchor="middle" class="sub-label" font-weight="700" fill="#a78bfa">SHIPPED · v0.8.0 sal-postgres + Apache AGE</text>
-        </g>
-
-        <use href="#t4-RaPg" class="edge-roadmap" marker-end="url(#t4-arrow)" style="color: #a78bfa" />
-        <use href="#t4-RbPg" class="edge-roadmap" marker-end="url(#t4-arrow)" style="color: #a78bfa" />
-        <use href="#t4-RcPg" class="edge-roadmap" marker-end="url(#t4-arrow)" style="color: #a78bfa" />
-
-        <!-- Particles — sync_push -->
-        <circle r="3.5" class="flow flow-sync"><animateMotion dur="3.2s" repeatCount="indefinite" begin="0s"><mpath href="#t4-RaRb"/></animateMotion></circle>
-        <circle r="3.5" class="flow flow-sync"><animateMotion dur="3.2s" repeatCount="indefinite" begin="0.4s"><mpath href="#t4-RbRa"/></animateMotion></circle>
-        <circle r="3.5" class="flow flow-sync"><animateMotion dur="3.2s" repeatCount="indefinite" begin="0.8s"><mpath href="#t4-RbRc"/></animateMotion></circle>
-        <circle r="3.5" class="flow flow-sync"><animateMotion dur="3.2s" repeatCount="indefinite" begin="1.2s"><mpath href="#t4-RcRb"/></animateMotion></circle>
-        <circle r="3.5" class="flow flow-sync"><animateMotion dur="3.2s" repeatCount="indefinite" begin="1.6s"><mpath href="#t4-RaRc"/></animateMotion></circle>
-
-        <!-- Governance plane particles -->
-        <circle r="3" class="flow flow-policy"><animateMotion dur="3.6s" repeatCount="indefinite" begin="0s"><mpath href="#t4-gov-Ra"/></animateMotion></circle>
-        <circle r="3" class="flow flow-policy"><animateMotion dur="3.6s" repeatCount="indefinite" begin="0.6s"><mpath href="#t4-gov-Rb"/></animateMotion></circle>
-        <circle r="3" class="flow flow-policy"><animateMotion dur="3.6s" repeatCount="indefinite" begin="1.2s"><mpath href="#t4-gov-Rc"/></animateMotion></circle>
-
-        <!-- pgvector particles -->
-        <circle r="2.5" class="flow flow-sync" opacity="0.6"><animateMotion dur="4.8s" repeatCount="indefinite" begin="0s"><mpath href="#t4-RaPg"/></animateMotion></circle>
-        <circle r="2.5" class="flow flow-sync" opacity="0.6"><animateMotion dur="4.8s" repeatCount="indefinite" begin="0.8s"><mpath href="#t4-RbPg"/></animateMotion></circle>
-        <circle r="2.5" class="flow flow-sync" opacity="0.6"><animateMotion dur="4.8s" repeatCount="indefinite" begin="1.6s"><mpath href="#t4-RcPg"/></animateMotion></circle>
-
-        <!-- QUORUM ANNOTATION -->
-        <g transform="translate(40, 430)">
-          <rect x="0" y="0" width="350" height="60" rx="8" fill="rgba(34,197,94,0.10)" stroke="#22c55e" stroke-width="1.4" />
-          <text x="12" y="22" class="sub-label" font-weight="700" fill="#16a34a">Quorum-write contract — SHIPS TODAY</text>
-          <text x="12" y="38" class="sub-label">--quorum-writes N --quorum-peers a,b,c</text>
-          <text x="12" y="52" class="sub-label">503 quorum_not_met on timeout · ADR-0001 realised</text>
-        </g>
-
-        <!-- mTLS annotation -->
-        <g transform="translate(560, 430)">
-          <rect x="0" y="0" width="340" height="60" rx="8" fill="rgba(45,212,191,0.10)" stroke="#2dd4bf" stroke-width="1.4" />
-          <text x="12" y="22" class="sub-label" font-weight="700" fill="#0d9488">mTLS peer mesh + fingerprint allowlist</text>
-          <text x="12" y="38" class="sub-label">--tls-cert · --tls-key · --mtls-allowlist (SHA-256)</text>
-          <text x="12" y="52" class="sub-label">peer-mesh identity gate — refuses unknown certs</text>
-        </g>
-
-      </svg>
-
-      <div class="arch-legend">
-        <span class="arch-legend-item"><span class="arch-legend-dot" style="background: #a78bfa"></span>sync_push mesh (today)</span>
-        <span class="arch-legend-item"><span class="arch-legend-dot" style="background: #facc15"></span>federated control plane</span>
-        <span class="arch-legend-item"><span class="arch-legend-dot" style="background: #a78bfa; opacity: 0.5"></span>pgvector / quorum / Apache AGE (GA)</span>
-        <span class="arch-legend-item"><span class="arch-legend-dot" style="background: #2dd4bf"></span>mTLS peer transport</span>
-      </div>
-
-      <div class="arch-diagram-caption">
-        Solid lines ship today. Dashed indigo lines are the Track B Postgres + pgvector backbone.
-        The federated control plane already propagates governance policy and pending decisions across all racks via sync_push.
+<body class="am-page">
+<a class="am-skip" href="#main">Skip to content</a>
+<header class="am-nav"><div class="am-nav-in">
+  <a class="am-brand" href="index.html" aria-label="ai-memory home">
+    <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 2l9 5.2v9.6L12 22 3 16.8V7.2z" stroke="var(--accent)" stroke-width="1.5"/><circle cx="12" cy="12" r="2.4" fill="var(--accent)"/><path d="M12 9.6V4.5M12 14.4v5.1M14.4 12h5M4.9 12h5" stroke="var(--accent)" stroke-width="1.1"/></svg>
+    ai-memory <span class="am-crumb">/ architectures / T4</span>
+  </a>
+  <nav class="am-links" aria-label="Primary">
+    <a href="architectures.html">Architectures</a>
+    <div class="am-dd">
+      <button aria-haspopup="true">Tiers ▾</button>
+      <div class="am-dd-menu">
+        <a href="architectures-t1.html">T1 · Single node<span>one agent, one store</span></a>
+        <a href="architectures-t2.html">T2 · Shared daemon<span>many agents, one host</span></a>
+        <a href="architectures-t3.html">T3 · Federated cluster<span>W-of-N quorum, signed sync</span></a>
+        <a href="architectures-t4.html">T4 · Data-center swarm<span>PostgreSQL tier</span></a>
+        <a href="architectures-t5.html">T5 · Federated hive<span>multi-DC / multi-region</span></a>
       </div>
     </div>
+    <div class="am-dd">
+      <button aria-haspopup="true">Reference ▾</button>
+      <div class="am-dd-menu">
+        <a href="reference-architecture/">3-region hive<span>the do-1461 run record</span></a>
+        <a href="reference-architecture/enterprise-cpu-memory.html">Enterprise · CPU + memory<span>API embeddings, no GPU</span></a>
+        <a href="reference-architecture/enterprise-cpu-memory-gpu.html">Enterprise · CPU + memory + GPU<span>local embeddings</span></a>
+        <a href="enterprise-deployment.html">Enterprise deployment guide<span>sizing, replication, backups</span></a>
+        <a href="ARCHITECTURAL_LIMITS.html">Architectural limits<span>what does not scale, and why</span></a>
+      </div>
+    </div>
+    <div class="am-dd">
+      <button aria-haspopup="true">Planes ▾</button>
+      <div class="am-dd-menu">
+        <a href="federation.html">Federation<span>signed sync, quorum, catch-up</span></a>
+        <a href="wake-hub.html">Wake plane<span>wake-hub, wake-listen</span></a>
+        <a href="a2a-integration.html">Integrate any agent<span>inbox, notify, wake</span></a>
+        <a href="governance.html">Governance<span>policies, approvals</span></a>
+        <a href="encryption.html">Encryption<span>at rest and in transit</span></a>
+        <a href="SECURITY.html">Security model<span>threat model, posture</span></a>
+      </div>
+    </div>
+  </nav>
+  <details class="am-mnav"><summary>Menu</summary><div class="am-mnav-pane">
+    <a href="index.html">Home</a>
+    <a href="architectures.html">Architectures overview</a>
+    <div class="am-g">Tiers</div>
+    <a href="architectures-t1.html">T1 · Single node</a>
+    <a href="architectures-t2.html">T2 · Shared daemon</a>
+    <a href="architectures-t3.html">T3 · Federated cluster</a>
+    <a href="architectures-t4.html">T4 · Data-center swarm</a>
+    <a href="architectures-t5.html">T5 · Federated hive</a>
+    <div class="am-g">Reference</div>
+    <a href="reference-architecture/">3-region hive</a>
+    <a href="reference-architecture/enterprise-cpu-memory.html">Enterprise · CPU + memory</a>
+    <a href="reference-architecture/enterprise-cpu-memory-gpu.html">Enterprise · CPU + memory + GPU</a>
+    <a href="ARCHITECTURAL_LIMITS.html">Architectural limits</a>
+    <div class="am-g">Planes</div>
+    <a href="federation.html">Federation</a>
+    <a href="wake-hub.html">Wake plane</a>
+    <a href="governance.html">Governance</a>
+    <a href="SECURITY.html">Security model</a>
+  </div></details>
+  <a class="am-cta" href="https://github.com/alphaonedev/ai-memory-mcp">GitHub</a>
+</div></header>
+<main id="main">
+<section class="am-hero"><div class="am-wrap">
+  <nav class="am-rail" aria-label="Tiers"><a href="architectures.html">Overview</a><a href="architectures-t1.html">T1 · Single node</a><a href="architectures-t2.html">T2 · Shared daemon</a><a href="architectures-t3.html">T3 · Federated cluster</a><a href="architectures-t4.html" aria-current="page">T4 · Data-center swarm</a><a href="architectures-t5.html">T5 · Federated hive</a></nav>
+  <span class="am-pill"><i></i>Tier 4 · the PostgreSQL tier</span>
+  <h1 class="am-h1">A data-center <span class="a">swarm</span> on PostgreSQL.</h1>
+  <p class="am-sub">Several racks of ai-memory daemons, each built with <b>sal-postgres</b> and started with a <code>postgres://</code> store URL, keep their memories in an operator-run <b>PostgreSQL 18</b> deployment with <b>pgvector</b> and, when installed, <b>Apache AGE</b>. The daemons federate across racks with signed W-of-N quorum writes. Agents never connect to PostgreSQL: every request terminates at a daemon.</p>
+  <div class="am-proof">
+    <span><b>PostgreSQL 18</b> + pgvector</span>
+    <span><b>Apache AGE</b> when installed</span>
+    <span><b>76 of the 89 unique paths</b> served</span>
+    <span><b>rack-spread</b> W-of-N quorum</span>
+    <span><b>wake-hub</b> per host</span>
   </div>
-</section>
+</div></section>
 
-<section>
-  <div class="container">
-    <span class="eyebrow">Quorum-write contract</span>
-    <h2>Shipping today.</h2>
-    <p>The big T4-relevant capability that's already wired:</p>
-    <ul>
-      <li><code>src/daemon_runtime.rs</code> (<code>ServeArgs</code>) — <code>--quorum-writes N</code> enables W-of-N replication; <code>--quorum-peers a,b,c</code> lists targets.</li>
-      <li><code>src/handlers/</code> — write path calls <code>broadcast_store_quorum</code> then <code>finalise_quorum</code>. Local commit + (W-1) peer acks within <code>--quorum-timeout-ms</code> (default 2000) → <code>200 OK</code> with the achieved ack count returned in the response. Falling short → <code>503 quorum_not_met</code>.</li>
-      <li>Same wiring on <code>link</code>, <code>consolidate</code>, <code>pending_decision</code>, <code>namespace_meta</code>, and the <code>clear_namespace_meta</code> path.</li>
-      <li>mTLS for the outbound side via <code>--quorum-client-cert</code> / <code>--quorum-client-key</code> / <code>--quorum-ca-cert</code>.</li>
-    </ul>
-    <p>ADR-0001 is realised, not aspirational. Phase 1 (scaffold) and Phase 2 (wired into write path) shipped. Phase 3 (chaos harness) and Phase 4 (formal convergence-bound report) are still work — the convergence guarantees in production are exercised by the a2a-gate scenario suite (CHANGELOG #325/#326/#327).</p>
+<section class="am-sec" id="diagram"><div class="am-wrap">
+  <div class="am-sec-h">
+    <span class="am-eyebrow">Architecture</span>
+    <h2>Daemons in every rack, <span class="a">one</span> PostgreSQL deployment underneath.</h2>
+    <p>Each host runs its agents, one daemon and one same-host wake hub. The daemons are first-class federation peers across racks. The PostgreSQL primary, its streaming replicas and the connection pooler are run by you: ai-memory does not know the replication topology and treats its configured <code>--store-url</code> as authoritative.</p>
   </div>
-</section>
-
-<section>
-  <div class="container">
-    <span class="eyebrow">Track B — SHIPPED v0.8.0</span>
-    <h2>Postgres + pgvector backbone.</h2>
-    <p>The single-SQLite-per-node ceiling bites at T4 scale (>10⁶ memories per node, hot writers). The structural fix is a <strong>shared store</strong>.</p>
-    <p><strong>Foundation (v0.6.x):</strong> <code>sal-postgres</code> Cargo feature flag exists; <code>sqlx</code> + <code>pgvector</code> deps wired. The Postgres adapter compiles and runs; correctness fixes shipped in v0.6.0 pre-tag (#294 SAL upsert key alignment, #295 <code>metadata.agent_id</code> immutability via <code>jsonb_set</code>, #296 tier-downgrade protection via SQL <code>tier_rank()</code>, #297 schema parity with 6 tables + generated <code>scope_idx</code> column). That work is the foundation.</p>
-    <p><strong>SHIPPED GA:</strong> Performance maturation complete, <code>ai-memory migrate --from sqlite:// --to postgres://</code> migration tool wired, pgvector + Apache AGE recipes in <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/docs/migration-v0.7.0-postgres.md">docs/migration-v0.7.0-postgres.md</a>, official deployment via <code>--features sal-postgres</code>.</p>
-    <p>What the shared store unlocks at GA:</p>
-    <ul>
-      <li>Horizontal read scaling (Postgres read replicas).</li>
-      <li>Shared vector index across the fleet — one embedding stored once.</li>
-      <li>Standard Postgres operational primitives — backups, PITR, monitoring.</li>
-      <li>Network filesystems no longer dangerous (the SQLite <code>fcntl</code> lock issue goes away).</li>
-    </ul>
+  <div class="am-legend">
+    <span><i></i>memory read/write · federation</span>
+    <span><i class="teal"></i>wake hint</span>
+    <span><i class="slate"></i>PostgreSQL replication (operator)</span>
+    <span><i class="dash"></i>operator-run component</span>
   </div>
-</section>
+  <figure class="am-fig" style="--fig-min:920px">
+<svg class="dg" viewBox="0 0 1100 560" role="img" aria-labelledby="t4h-title" aria-describedby="t4h-desc" xmlns="http://www.w3.org/2000/svg">
+<title id="t4h-title">Tier 4: a data-center swarm on the PostgreSQL tier</title><desc id="t4h-desc">Three racks, each with two hosts. Every host runs agents that reach a local ai-memory daemon over HTTP, a daemon built with the sal-postgres feature and started with a postgres store URL, and a same-host wake hub. The daemons federate over a signed mutual-TLS mesh with W-of-N quorum writes. Underneath, an operator-run PostgreSQL 18 deployment with pgvector and optionally Apache AGE: a connection pooler, one primary and streaming replicas. ai-memory sees only its store URL.</desc>
+<defs><marker id="t4h-ah" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow"/></marker><marker id="t4h-aa" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow acc"/></marker><marker id="t4h-at" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow teal"/></marker><marker id="t4h-ab" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow bad"/></marker><marker id="t4h-as" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow slate"/></marker></defs>
+<g class="rise"><rect class="zone solid" x="30" y="70" width="320" height="236" rx="18"/><text class="t-k" x="46" y="92">RACK A</text><rect class="box" x="42" y="102" width="142" height="192" rx="12"/><rect class="box" x="50" y="110" width="92" height="26" rx="7"/><text class="t-s" x="96" y="127" text-anchor="middle">agents · HTTP</text><rect class="box acc" x="50" y="146" width="126" height="64" rx="10"/><text class="t-m" x="60" y="166">ai-memory serve</text><text class="t-s" x="60" y="181">sal-postgres</text><text class="t-s" x="60" y="196">--store-url</text><rect class="box teal" x="50" y="222" width="92" height="62" rx="10"/><text class="t-m" x="96" y="244" text-anchor="middle">wake-hub</text><text class="t-s" x="96" y="259" text-anchor="middle">unix socket</text><text class="t-s" x="96" y="274" text-anchor="middle">this host</text><rect class="box" x="196" y="102" width="142" height="192" rx="12"/><rect class="box" x="204" y="110" width="92" height="26" rx="7"/><text class="t-s" x="250" y="127" text-anchor="middle">agents · HTTP</text><rect class="box acc" x="204" y="146" width="126" height="64" rx="10"/><text class="t-m" x="214" y="166">ai-memory serve</text><text class="t-s" x="214" y="181">sal-postgres</text><text class="t-s" x="214" y="196">--store-url</text><rect class="box teal" x="204" y="222" width="92" height="62" rx="10"/><text class="t-m" x="250" y="244" text-anchor="middle">wake-hub</text><text class="t-s" x="250" y="259" text-anchor="middle">unix socket</text><text class="t-s" x="250" y="274" text-anchor="middle">this host</text></g>
+<path class="wire" d="M96 136 V144" marker-end="url(#t4h-aa)"/><path class="flow" d="M96 136 V144"/><path class="wire" d="M82 210 V220" marker-end="url(#t4h-at)"/><path class="flow teal" d="M82 210 V220"/><path class="wire" d="M250 136 V144" marker-end="url(#t4h-aa)"/><path class="flow" d="M250 136 V144"/><path class="wire" d="M236 210 V220" marker-end="url(#t4h-at)"/><path class="flow teal" d="M236 210 V220"/><g class="rise" style="--d:0.12s"><rect class="zone solid" x="390" y="70" width="320" height="236" rx="18"/><text class="t-k" x="406" y="92">RACK B</text><rect class="box" x="402" y="102" width="142" height="192" rx="12"/><rect class="box" x="410" y="110" width="92" height="26" rx="7"/><text class="t-s" x="456" y="127" text-anchor="middle">agents · HTTP</text><rect class="box acc" x="410" y="146" width="126" height="64" rx="10"/><text class="t-m" x="420" y="166">ai-memory serve</text><text class="t-s" x="420" y="181">sal-postgres</text><text class="t-s" x="420" y="196">--store-url</text><rect class="box teal" x="410" y="222" width="92" height="62" rx="10"/><text class="t-m" x="456" y="244" text-anchor="middle">wake-hub</text><text class="t-s" x="456" y="259" text-anchor="middle">unix socket</text><text class="t-s" x="456" y="274" text-anchor="middle">this host</text><rect class="box" x="556" y="102" width="142" height="192" rx="12"/><rect class="box" x="564" y="110" width="92" height="26" rx="7"/><text class="t-s" x="610" y="127" text-anchor="middle">agents · HTTP</text><rect class="box acc" x="564" y="146" width="126" height="64" rx="10"/><text class="t-m" x="574" y="166">ai-memory serve</text><text class="t-s" x="574" y="181">sal-postgres</text><text class="t-s" x="574" y="196">--store-url</text><rect class="box teal" x="564" y="222" width="92" height="62" rx="10"/><text class="t-m" x="610" y="244" text-anchor="middle">wake-hub</text><text class="t-s" x="610" y="259" text-anchor="middle">unix socket</text><text class="t-s" x="610" y="274" text-anchor="middle">this host</text></g>
+<path class="wire" d="M456 136 V144" marker-end="url(#t4h-aa)"/><path class="flow" d="M456 136 V144"/><path class="wire" d="M442 210 V220" marker-end="url(#t4h-at)"/><path class="flow teal" d="M442 210 V220"/><path class="wire" d="M610 136 V144" marker-end="url(#t4h-aa)"/><path class="flow" d="M610 136 V144"/><path class="wire" d="M596 210 V220" marker-end="url(#t4h-at)"/><path class="flow teal" d="M596 210 V220"/><g class="rise" style="--d:0.24s"><rect class="zone solid" x="750" y="70" width="320" height="236" rx="18"/><text class="t-k" x="766" y="92">RACK C</text><rect class="box" x="762" y="102" width="142" height="192" rx="12"/><rect class="box" x="770" y="110" width="92" height="26" rx="7"/><text class="t-s" x="816" y="127" text-anchor="middle">agents · HTTP</text><rect class="box acc" x="770" y="146" width="126" height="64" rx="10"/><text class="t-m" x="780" y="166">ai-memory serve</text><text class="t-s" x="780" y="181">sal-postgres</text><text class="t-s" x="780" y="196">--store-url</text><rect class="box teal" x="770" y="222" width="92" height="62" rx="10"/><text class="t-m" x="816" y="244" text-anchor="middle">wake-hub</text><text class="t-s" x="816" y="259" text-anchor="middle">unix socket</text><text class="t-s" x="816" y="274" text-anchor="middle">this host</text><rect class="box" x="916" y="102" width="142" height="192" rx="12"/><rect class="box" x="924" y="110" width="92" height="26" rx="7"/><text class="t-s" x="970" y="127" text-anchor="middle">agents · HTTP</text><rect class="box acc" x="924" y="146" width="126" height="64" rx="10"/><text class="t-m" x="934" y="166">ai-memory serve</text><text class="t-s" x="934" y="181">sal-postgres</text><text class="t-s" x="934" y="196">--store-url</text><rect class="box teal" x="924" y="222" width="92" height="62" rx="10"/><text class="t-m" x="970" y="244" text-anchor="middle">wake-hub</text><text class="t-s" x="970" y="259" text-anchor="middle">unix socket</text><text class="t-s" x="970" y="274" text-anchor="middle">this host</text></g>
+<path class="wire" d="M816 136 V144" marker-end="url(#t4h-aa)"/><path class="flow" d="M816 136 V144"/><path class="wire" d="M802 210 V220" marker-end="url(#t4h-at)"/><path class="flow teal" d="M802 210 V220"/><path class="wire" d="M970 136 V144" marker-end="url(#t4h-aa)"/><path class="flow" d="M970 136 V144"/><path class="wire" d="M956 210 V220" marker-end="url(#t4h-at)"/><path class="flow teal" d="M956 210 V220"/><text class="t-k" x="550" y="22" text-anchor="middle">FEDERATION  ·  mTLS  ·  Ed25519 X-Memory-Sig + nonce  ·  W-of-N quorum  ·  /sync/since catch-up</text><path class="wire" d="M162 40 H1036"/><path class="flow slow" d="M162 40 H1036"/><path class="flow slow rev" d="M162 40 H1036"/><path class="dot" pathLength="100" d="M162 40 H1036" style="--d:0.3s"/><path class="dot" pathLength="100" d="M1036 40 H162" style="--d:1.9s"/><path class="wire" d="M162 146 V40"/><path class="flow slow" d="M162 146 V40"/><circle class="pulse" cx="162" cy="40" r="3.5"/><path class="wire" d="M316 146 V40"/><path class="flow slow" d="M316 146 V40"/><circle class="pulse" cx="316" cy="40" r="3.5" style="--d:0.25s"/><path class="wire" d="M522 146 V40"/><path class="flow slow" d="M522 146 V40"/><circle class="pulse" cx="522" cy="40" r="3.5" style="--d:0.5s"/><path class="wire" d="M676 146 V40"/><path class="flow slow" d="M676 146 V40"/><circle class="pulse" cx="676" cy="40" r="3.5" style="--d:0.75s"/><path class="wire" d="M882 146 V40"/><path class="flow slow" d="M882 146 V40"/><circle class="pulse" cx="882" cy="40" r="3.5" style="--d:1.0s"/><path class="wire" d="M1036 146 V40"/><path class="flow slow" d="M1036 146 V40"/><circle class="pulse" cx="1036" cy="40" r="3.5" style="--d:1.25s"/><rect class="zone" x="30" y="330" width="1040" height="216" rx="18"/><text class="t-k" x="48" y="354">OPERATOR-RUN POSTGRESQL  ·  NOT PART OF ai-memory</text><text class="t-s" x="1052" y="354" text-anchor="end">ai-memory follows only its --store-url</text><g class="rise" style="--d:0.5s"><rect class="box ghost" x="440" y="368" width="220" height="50" rx="10"/><text class="t-m" x="550" y="388" text-anchor="middle">connection pooler</text><text class="t-s" x="550" y="404" text-anchor="middle">e.g. PgBouncer, transaction mode</text></g>
+<g class="rise" style="--d:0.6s"><rect class="box slate" x="440" y="452" width="220" height="78" rx="12"/><ellipse class="box slate" cx="550" cy="458" rx="100" ry="5"/><text class="t-m" x="550" y="480" text-anchor="middle">PostgreSQL 18 primary</text><text class="t-s" x="550" y="496" text-anchor="middle">pgvector · AGE if installed</text><text class="t-s" x="550" y="512" text-anchor="middle">TLS · volume encryption attested</text></g>
+<g class="rise" style="--d:0.7s"><rect class="box ghost" x="90" y="452" width="220" height="78" rx="12"/><text class="t-m" x="200" y="478" text-anchor="middle">streaming replica</text><text class="t-s" x="200" y="494" text-anchor="middle">async or sync, operator-tuned</text><text class="t-s" x="200" y="510" text-anchor="middle">read scale + disaster recovery</text></g>
+<g class="rise" style="--d:0.7999999999999999s"><rect class="box ghost" x="790" y="452" width="220" height="78" rx="12"/><text class="t-m" x="900" y="478" text-anchor="middle">streaming replica</text><text class="t-s" x="900" y="494" text-anchor="middle">async or sync, operator-tuned</text><text class="t-s" x="900" y="510" text-anchor="middle">read scale + disaster recovery</text></g>
+<path class="wire" d="M440 491 H314" marker-end="url(#t4h-as)"/><path class="flow slate" d="M440 491 H314"/><path class="dot slate" pathLength="100" d="M440 491 H314" style="--d:1.0s"/><path class="wire" d="M660 491 H786" marker-end="url(#t4h-as)"/><path class="flow slate" d="M660 491 H786"/><path class="dot slate" pathLength="100" d="M660 491 H786" style="--d:1.3s"/><text class="t-slate" x="377" y="484" text-anchor="middle">WAL</text><text class="t-slate" x="723" y="484" text-anchor="middle">WAL</text><path class="wire" d="M550 418 V448" marker-end="url(#t4h-as)"/><path class="flow slate" d="M550 418 V448"/><path class="dot slate" pathLength="100" d="M550 418 V448" style="--d:0.8s"/><path class="wire" d="M162 210 V300 C162 330 462 330 462 364"/><path class="flow slow" d="M162 210 V300 C162 330 462 330 462 364"/><path class="dot" pathLength="100" d="M162 210 V300 C162 330 462 330 462 364"/><path class="wire" d="M316 210 V300 C316 330 497 330 497 364"/><path class="flow slow" d="M316 210 V300 C316 330 497 330 497 364"/><path class="dot" pathLength="100" d="M316 210 V300 C316 330 497 330 497 364" style="--d:0.4s"/><path class="wire" d="M522 210 V300 C522 330 532 330 532 364"/><path class="flow slow" d="M522 210 V300 C522 330 532 330 532 364"/><path class="dot" pathLength="100" d="M522 210 V300 C522 330 532 330 532 364" style="--d:0.8s"/><path class="wire" d="M676 210 V300 C676 330 567 330 567 364"/><path class="flow slow" d="M676 210 V300 C676 330 567 330 567 364"/><path class="dot" pathLength="100" d="M676 210 V300 C676 330 567 330 567 364" style="--d:1.2000000000000002s"/><path class="wire" d="M882 210 V300 C882 330 602 330 602 364"/><path class="flow slow" d="M882 210 V300 C882 330 602 330 602 364"/><path class="dot" pathLength="100" d="M882 210 V300 C882 330 602 330 602 364" style="--d:1.6s"/><path class="wire" d="M1036 210 V300 C1036 330 637 330 637 364"/><path class="flow slow" d="M1036 210 V300 C1036 330 637 330 637 364"/><path class="dot" pathLength="100" d="M1036 210 V300 C1036 330 637 330 637 364" style="--d:2.0s"/></svg>
 
-<section>
-  <div class="container">
-    <span class="eyebrow">What ships today at scale</span>
-    <h2>Every primitive used in the T3 diagram extends to T4.</h2>
-    <p class="lede">The topology just gets denser.</p>
-    <ul>
-      <li><strong>Rack-to-rack peer mesh</strong> — <code>sync_push</code> works the same whether you have 4 nodes or 40. The number of edges is <code>n*(n-1)/2</code> for full mesh, which is a gossip cost the operator should plan for. Most T4 deployments will use a <strong>partial mesh</strong> with a few designated bridge nodes per rack.</li>
-      <li><strong>Federated governance plane</strong> — <code>broadcast_namespace_meta_quorum</code> and <code>broadcast_pending_decision_quorum</code> propagate a tightening of policy on <code>org/eu/finance</code> across the mesh, but <strong>only to SQLite-backed receivers</strong>. <strong>Scope caveat (#3075):</strong> a receiver running the PostgreSQL store replicates only the <code>memories[]</code> lane; the federated-governance lanes — <code>checkpoints</code>, <code>pendings</code>, <code>pending_decisions</code>, <code>namespace_meta</code>, <code>namespace_meta_clears</code>, <code>archives</code>, <code>restores</code> — return an honest <code>unsupported_on_postgres</code> non-ack and are <strong>SQLite-receiver-only in v1.0.0</strong> (full PostgreSQL-receiver replication of these lanes is tracked for v1.1). So a policy quorum does <em>not</em> propagate to a Postgres-backed node; keep governance-quorum peers on the SQLite backend. v0.6.3 capabilities introspection lets every agent and operator confirm that the policy version they're seeing matches the published version.</li>
-      <li><strong>Per-rack pending queues</strong> — Approval workflows can be scoped to a rack (<code>rack-a/approvers</code>) so on-call shifts work cleanly even at fleet scale.</li>
-      <li><strong>mTLS</strong> — <code>rustls</code> is already wired in the peer transport. Enforcement is opt-in today; it's the obvious default at T4.</li>
-      <li><strong>Capabilities introspection v2</strong> — Operators can fleet-scan <code>/api/v1/capabilities</code> to confirm every node is on the same schema version and feature tier. Drift is an alerting condition, not a surprise.</li>
-    </ul>
+  </figure>
+  <p class="am-figcap"><b>What is ai-memory and what is yours.</b> The daemons, the federation mesh and the wake hubs are ai-memory; the pooler, primary and replicas are PostgreSQL, configured per the <a href="enterprise-deployment.html">enterprise deployment guide</a>. MCP over stdio is SQLite-only, so agents on this tier use HTTP. Sources: <code>src/daemon_runtime.rs</code> (<code>--store-url</code>), <code>src/store/postgres_schema.sql</code>, <code>src/store/postgres.rs</code>, <code>src/federation/sync.rs</code>, <code>src/wake_hub/server.rs</code>.</p>
+</div></section>
+
+<section class="am-sec alt" id="gate"><div class="am-wrap">
+  <div class="am-sec-h">
+    <span class="am-eyebrow">Request path</span>
+    <h2>A route gate that <span class="a">fails closed</span>.</h2>
+    <p>On PostgreSQL the daemon puts <code>postgres_route_gate</code> in front of every handler. It checks the method and path against an explicit allowlist: a supported path reaches the PostgreSQL storage layer, a registered path that is not yet supported answers a uniform <code>501 NOT IMPLEMENTED</code>, and an unregistered path answers <code>404</code>. No request ever reads or writes the wrong database.</p>
   </div>
-</section>
+  <figure class="am-fig" style="--fig-min:900px">
+<svg class="dg" viewBox="0 0 1100 340" role="img" aria-labelledby="t4r-title" aria-describedby="t4r-desc" xmlns="http://www.w3.org/2000/svg">
+<title id="t4r-title">Tier 4 request path through the PostgreSQL route gate</title><desc id="t4r-desc">An agent request reaches the daemon. The PostgreSQL route gate checks the method and path against an explicit allowlist. Supported paths go to the storage layer on PostgreSQL; knowledge-graph walks use Apache AGE when it was detected at boot, otherwise a recursive CTE over the links table. A registered but unsupported path gets a uniform 501, an unregistered path a 404.</desc>
+<defs><marker id="t4r-ah" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow"/></marker><marker id="t4r-aa" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow acc"/></marker><marker id="t4r-at" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow teal"/></marker><marker id="t4r-ab" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow bad"/></marker><marker id="t4r-as" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow slate"/></marker></defs>
+<g class="rise"><rect class="box" x="30" y="120" width="140" height="64" rx="12"/><text class="t-m" x="46" y="146">agent</text><text class="t-s" x="46" y="164">HTTP /api/v1/*</text></g>
+<path class="wire" d="M170 152 H206" marker-end="url(#t4r-aa)"/><path class="flow" d="M170 152 H206"/><path class="dot" pathLength="100" d="M170 152 H206"/><g class="rise" style="--d:0.1s"><rect class="box acc" x="210" y="110" width="190" height="84" rx="12"/><text class="t-m" x="226" y="134">ai-memory serve</text><text class="t-s" x="226" y="152">identity · governance</text><text class="t-a" x="226" y="170">postgres_route_gate</text></g>
+<path class="wire" d="M400 152 H436" marker-end="url(#t4r-aa)"/><path class="flow" d="M400 152 H436"/><path class="dot" pathLength="100" d="M400 152 H436" style="--d:0.4s"/><g class="rise" style="--d:0.2s"><path class="box acc" d="M500 102 L564 152 L500 202 L436 152z"/><text class="t-s" x="500" y="148" text-anchor="middle">on the PG</text><text class="t-s" x="500" y="161" text-anchor="middle">allowlist?</text></g>
+<text class="t-a" x="586" y="140">yes</text><path class="wire" d="M564 152 H616" marker-end="url(#t4r-aa)"/><path class="flow" d="M564 152 H616"/><path class="dot" pathLength="100" d="M564 152 H616" style="--d:0.8s"/><g class="rise" style="--d:0.3s"><rect class="box" x="620" y="110" width="190" height="84" rx="12"/><text class="t-m" x="636" y="134">handler → storage</text><text class="t-s" x="636" y="152">MemoryStore on</text><text class="t-s" x="636" y="170">PostgreSQL</text></g>
+<path class="wire" d="M810 140 C830 140 830 86 846 86" marker-end="url(#t4r-aa)"/><path class="flow" d="M810 140 C830 140 830 86 846 86"/><path class="dot" pathLength="100" d="M810 140 C830 140 830 86 846 86" style="--d:1.2s"/><path class="wire" d="M810 170 C830 170 830 224 846 224" marker-end="url(#t4r-aa)"/><path class="flow" d="M810 170 C830 170 830 224 846 224"/><path class="dot" pathLength="100" d="M810 170 C830 170 830 224 846 224" style="--d:1.4s"/><g class="rise" style="--d:0.4s"><rect class="box slate" x="850" y="40" width="220" height="92" rx="12"/><ellipse class="box slate" cx="960" cy="46" rx="100" ry="5"/><text class="t-m" x="866" y="72">PostgreSQL 18</text><text class="t-s" x="866" y="87">rows · tsvector · pgvector</text><text class="t-s" x="866" y="102">memory_links is the</text><text class="t-s" x="866" y="117">graph source of truth</text></g>
+<g class="rise" style="--d:0.5s"><rect class="box" x="850" y="170" width="220" height="108" rx="12"/><text class="t-m" x="866" y="194">knowledge-graph walks</text><text class="t-s" x="866" y="210">AGE detected at boot:</text><text class="t-a" x="866" y="226">Cypher projection</text><text class="t-s" x="866" y="242">otherwise: recursive CTE</text><text class="t-s" x="866" y="258">over memory_links</text></g>
+<path class="wire" d="M960 170 V136" marker-end="url(#t4r-as)"/><path class="flow slate" d="M960 170 V136"/><path class="dot slate" pathLength="100" d="M960 170 V136" style="--d:1.6s"/><text class="t-bad" x="466" y="236">no</text><path class="wire" d="M500 202 V250 H560" marker-end="url(#t4r-ab)"/><path class="flow bad" d="M500 202 V250 H560"/><path class="dot bad" pathLength="100" d="M500 202 V250 H560" style="--d:1.0s"/><g class="rise" style="--d:0.6s"><rect class="box bad" x="564" y="226" width="250" height="50" rx="10"/><text class="t-bad" x="578" y="246">registered, not yet on PG:</text><text class="t-s" x="578" y="262">uniform 501 NOT IMPLEMENTED</text></g>
+<g class="rise" style="--d:0.7s"><rect class="box" x="564" y="284" width="250" height="44" rx="10"/><text class="t-m" x="578" y="302">not a registered route:</text><text class="t-s" x="578" y="318">404, never a false 501</text></g>
+<path class="wire" d="M500 250 V306 H560" marker-end="url(#t4r-ah)"/><text class="t-slate" x="30" y="250">76 of the 89 unique paths</text><text class="t-s" x="30" y="268">are served on PostgreSQL;</text><text class="t-s" x="30" y="284">the rest fail closed and never</text><text class="t-s" x="30" y="300">touch the wrong database.</text></svg>
 
-<section>
-  <div class="container">
-    <span class="eyebrow">Limits</span>
-    <h2>Honest ceilings.</h2>
-    <table>
-      <thead>
-        <tr><th>Dimension</th><th>v0.6.4</th><th>v0.8.0 SHIPPED</th></tr>
-      </thead>
-      <tbody>
-        <tr><td>Total memories per cluster</td><td>bounded by per-node HNSW RAM</td><td>pgvector → 10⁸+</td></tr>
-        <tr><td>Write durability across racks</td><td><strong>W-of-N quorum</strong> (<code>--quorum-writes N</code>)</td><td>unchanged</td></tr>
-        <tr><td>Partition tolerance</td><td>quorum-bounded divergence; <code>503 quorum_not_met</code> on shortfall</td><td>unchanged</td></tr>
-        <tr><td>Operational primitives</td><td>per-node SQLite, replicated; backups per node</td><td>Postgres ecosystem (PITR, replicas, central monitoring)</td></tr>
-        <tr><td>Vector index drift</td><td>each node embeds &amp; indexes independently</td><td>shared pgvector</td></tr>
-        <tr><td>mTLS</td><td>enforced via fingerprint allowlist</td><td>unchanged</td></tr>
-      </tbody>
-    </table>
-    <p>The certified federation unit is a <strong>≤50-peer block carrying ~500–1000 agents</strong> (issue #2438 retired the earlier 1M-fabric framing). The peer dimension is MEASURED to N=50 on a single host (#2921 capacity bench); the largest cross-host federation actually run is 2 nodes, and the agent figure is an architected — not measured — ceiling. A multi-rack fleet within that ceiling is in scope today; scale past it by composing <em>independent</em> clusters, never by growing one mesh past ~50 peers. The piece that's still maturing is the <strong>Postgres backbone</strong> — the vector-index drift across nodes and the per-node SQLite operational footprint are the things shared-store fixes.</p>
+  </figure>
+  <p class="am-figcap"><b>Graph walks.</b> At boot the PostgreSQL store checks whether the AGE extension is installed; with it, knowledge-graph walks use a Cypher projection, without it they fall back to a recursive CTE. <code>memory_links</code> is the source of truth either way. Sources: <code>src/handlers/postgres_gate.rs</code>, <code>src/store/postgres.rs</code>; guide: <a href="kg-backend-fallback.html">graph backend fallback</a>.</p>
+</div></section>
+
+<section class="am-sec" id="walkthrough"><div class="am-wrap">
+  <div class="am-sec-h">
+    <span class="am-eyebrow">Walkthrough</span>
+    <h2>One write, <span class="a">one recall</span>.</h2>
   </div>
-</section>
+  <div class="am-grid two">
+    <div class="am-card gold"><span class="am-k">Write</span><h3>Commit in PostgreSQL, then replicate</h3>
+      <ol class="am-steps" style="margin-top:12px">
+        <li>An agent in rack A sends <code>POST /api/v1/memories</code> with its <code>X-Agent-Id</code> to the daemon on its host.</li>
+        <li>The route gate admits the path; identity and the namespace governance gate run as on every tier.</li>
+        <li>The row commits in PostgreSQL (MVCC, so concurrent writers from other daemons do not serialize on a file lock).</li>
+        <li>The daemon signs the body and fans it out to its <code>--quorum-peers</code> in the other racks; W acknowledgements in time acknowledge the write, a miss answers <code>202</code> with <code>quorum_met:false</code> and the row stays committed.</li>
+        <li>PostgreSQL streams the WAL to the replicas: that is your database, not ai-memory's replication.</li>
+      </ol></div>
+    <div class="am-card teal"><span class="am-k">Recall</span><h3>Keyword, vector and graph in one database</h3>
+      <ol class="am-steps" style="margin-top:12px">
+        <li>An agent in rack B sends <code>POST /api/v1/recall</code> to its local daemon.</li>
+        <li>Scope visibility filters what the caller may see, from its namespace position.</li>
+        <li>Keyword search runs on <code>tsvector</code>, semantic search on a pgvector column, graph walks on AGE or the CTE fallback.</li>
+        <li>The result returns over HTTP; nothing about the recall path is exposed as a PostgreSQL connection to the agent.</li>
+      </ol></div>
+  </div>
+</div></section>
 
-<section>
-  <div class="container">
-    <span class="eyebrow">Deployment recipe</span>
-    <h2>Today: quorum + mTLS allowlist.</h2>
-    <p>Both recipes bind <code>--host 0.0.0.0</code> (non-loopback). A non-loopback <code>serve</code> <strong>refuses to boot unless <code>api_key</code> is set in config</strong> (S5-C1, <code>daemon_runtime</code> bind guard) — this is independent of mTLS. There is no <code>--api-key</code> serve flag; set it in <code>~/.config/ai-memory/config.toml</code>:</p>
-<pre><code># ~/.config/ai-memory/config.toml — required for any non-loopback bind
-api_key = "REPLACE_WITH_A_LONG_RANDOM_SECRET"</code></pre>
-<pre><code># rack-a/node-2 — quorum 3-of-5 across the rack, mTLS enforced
-ai-memory --db /var/lib/ai-memory/store.db serve \
+<section class="am-sec alt" id="recipe"><div class="am-wrap">
+  <div class="am-sec-h">
+    <span class="am-eyebrow">Deployment recipe</span>
+    <h2>One daemon per host, <span class="a">every</span> flag real.</h2>
+    <p>Build with the <code>sal-postgres</code> feature. <code>--store-url</code> and <code>--db</code> are mutually exclusive; keep the URL out of argv with <code>AI_MEMORY_STORE_URL_FILE</code>. A non-loopback bind also needs <code>api_key</code> set in <code>config.toml</code>.</p>
+  </div>
+<pre><code># ai-memory, on each host (rack A host 1 shown)
+cargo build --release --features sal-postgres
+
+AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url \
+ai-memory serve \
   --host 0.0.0.0 --port 9077 \
-  --quorum-writes 3 \
-  --quorum-peers https://rack-a-1:9077,https://rack-a-3:9077,https://rack-b-1:9077,https://rack-b-2:9077,https://rack-c-1:9077 \
-  --quorum-timeout-ms 1500 \
-  --tls-cert /etc/ai-memory/tls.crt \
-  --tls-key /etc/ai-memory/tls.key \
-  --mtls-allowlist /etc/ai-memory/peer-fingerprints.txt \
-  --quorum-client-cert /etc/ai-memory/client.crt \
-  --quorum-client-key /etc/ai-memory/client.key \
-  --quorum-ca-cert /etc/ai-memory/ca.crt \
-  --catchup-interval-secs 15</code></pre>
+  --tls-cert /etc/ai-memory/tls.crt --tls-key /etc/ai-memory/tls.key \
+  --mtls-allowlist /etc/ai-memory/mtls-allow.txt \
+  --quorum-writes 2 \
+  --quorum-peers https://rack-b-1:9077,https://rack-c-1:9077 \
+  --quorum-timeout-ms 2000 \
+  --quorum-client-cert /etc/ai-memory/fed.crt --quorum-client-key /etc/ai-memory/fed.key \
+  --quorum-ca-cert /etc/ai-memory/fed-ca.crt \
+  --catchup-interval-secs 30
 
-    <p>Same node, swap to a Postgres-backed store:</p>
-<pre><code>ai-memory serve \
-  --store-url postgres://ai-memory@pg-cluster.svc.cluster.local:5432/store \
-  --host 0.0.0.0 --port 9077 \
-  --quorum-writes 3 \
-  --quorum-peers https://rack-a-1:9077,https://rack-a-3:9077,https://rack-b-1:9077</code></pre>
-    <p><strong>Scope caveat (#3075):</strong> quorum writes to a Postgres-backed receiver replicate the <code>memories[]</code> lane only. A Postgres receiver honestly non-acks (<code>unsupported_on_postgres</code>) the federated-governance lanes — <code>checkpoints</code>, <code>pendings</code>, <code>pending_decisions</code>, <code>namespace_meta</code>, <code>namespace_meta_clears</code>, <code>archives</code>, <code>restores</code> — which are <strong>SQLite-receiver-only in v1.0.0</strong> (full Postgres-receiver replication tracked for v1.1). Do not rely on <code>namespace_meta</code>/<code>pending_decision</code> quorum reaching a Postgres node; keep governance-quorum peers on the SQLite backend and use Postgres for the memory-store and vector-index scale-out.</p>
+# the same host's wake plane (Unix socket, same host only)
+ai-memory wake-hub --socket /run/ai-memory-hub/wake-hub.sock \
+  --hub-id rack-a-1 --allowlist /run/ai-memory-hub/hub-allow.json
 
-    <p>The <code>peer-fingerprints.txt</code> file lists trusted SHA-256 fingerprints (one per line, optional <code>:</code> separators, <code>#</code> comments). The <code>--mtls-allowlist</code> flag's presence is what makes mTLS enforcement <em>required</em> — if a peer's cert isn't on the list, the connection is refused at TLS handshake.</p>
+# health, locally and across the fleet
+ai-memory doctor --json
+ai-memory doctor --remote https://rack-b-1:9077 --api-key-file /etc/ai-memory/api.key
+
+# PostgreSQL side: OPERATOR configuration, not ai-memory
+#   primary + streaming replicas, a pooler in transaction mode,
+#   pg_basebackup + WAL archive for backups, TLS (sslmode=verify-full),
+#   a role allowed to create the vector extension (and age, optionally)</code></pre>
+  <p class="am-figcap">Flags: <code>src/daemon_runtime.rs</code> (<code>ServeArgs</code>, <code>DoctorCliArgs</code>), <code>src/cli/wake_hub.rs</code>. Enrol each peer's transport certificate pin and Ed25519 signing key before the first push: see <a href="federation.html">federation</a>. <code>ai-memory backup</code> refuses non-SQLite stores, so PostgreSQL backups are yours.</p>
+</div></section>
+
+<section class="am-sec" id="wiring"><div class="am-wrap">
+  <div class="am-sec-h">
+    <span class="am-eyebrow">Wiring</span>
+    <h2>Governance, wake and attestation <span class="a">at T4</span>.</h2>
   </div>
-</section>
-
-<section>
-  <div class="container">
-    <span class="eyebrow">Wiring</span>
-    <h2>Governance, skills, and attestations at T4.</h2>
-    <ul>
-      <li><strong>Governance</strong> — Same machinery as T2/T3, just at scale. The federated control plane is the central nervous system: a single policy update on <code>org/eu/finance</code> reaches every <strong>SQLite-backed</strong> node within seconds. Pending-action queues are visible per-rack for on-call routing. Per #3075, the governance lanes (<code>namespace_meta</code>, <code>pending_decisions</code>, and the rest) do not yet replicate to a Postgres-backed receiver in v1.0.0 — see the deployment-recipe scope caveat above.</li>
-      <li><strong>Skills</strong> — Skills register as agents and get the same scope visibility. At T4, skills are typically pinned to specific racks (latency, data-residency) but their outputs (tags, contradictions, consolidations) propagate fleet-wide via <code>sync_push</code>.</li>
-      <li><strong>Attestations</strong> — Attested identity (#626 Layer-3 Ed25519 store-surface signatures) is the gating capability for trustworthy multi-tenant T4. Since v1.0.0 (#1985, correcting #1751) attestation is required by default on the <strong>HTTP direct-write surface only</strong>: unsigned <code>POST /api/v1/memories</code>(+<code>/bulk</code>) writes are rejected (<code>403 ATTESTATION_FAILED</code>) while MCP/CLI stay permissive, and they land <code>attest_level = "claimed"</code> only under the explicit opt-out <code>AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0</code> — the default posture is now fail-closed. Restoring the permissive "trust-the-network" behavior (unsigned writes accepted as <code>claimed</code>) is operationally fine inside a controlled VPC, not fine for cross-tenant or cross-organization deployments.</li>
-    </ul>
+  <div class="am-grid">
+    <div class="am-card gold"><span class="am-k">Governance</span><h3>Same gate, now on PostgreSQL</h3><p>Namespace standards, Allow / Deny / Pending decisions and the pending-action queue are enforced on PostgreSQL. The rule inspection API (<code>memory_rule_list</code>, <code>memory_check_agent_action</code>) is in the fail-closed set; enforcement itself is not.</p></div>
+    <div class="am-card teal"><span class="am-k">Wake plane</span><h3>One hub per host</h3><p>A notify commits the inbox row in PostgreSQL, then wakes the host's hub. A recipient on another host learns of the row through federation, and its daemon publishes a local wake only for a fresh apply. Clients keep a backstop poll of at most a minute.</p></div>
+    <div class="am-card"><span class="am-k">Attestation</span><h3>Signed, enrolled, scoped</h3><p>Cross-rack pushes carry an Ed25519 <code>X-Memory-Sig</code> bound to an <code>X-Memory-Nonce</code>; receivers refuse unsigned, replayed and unenrolled pushes and check the sender's namespace scope.</p></div>
+    <div class="am-card"><span class="am-k">At rest</span><h3>Operator-attested</h3><p>The enterprise posture check verifies the TLS store URL and requires an explicit operator attestation (<code>AI_MEMORY_PG_AT_REST_ATTESTED</code>) that volume encryption is on. It does not probe the disk; SQLCipher and application content encryption are separate controls.</p></div>
   </div>
-</section>
+</div></section>
 
-<section>
-  <div class="container">
-    <span class="eyebrow">Source</span>
-    <h2>Source-of-truth references.</h2>
-    <ul>
-      <li><code>src/daemon_runtime.rs</code> (<code>ServeArgs</code>) — quorum-write CLI surface</li>
-      <li><code>src/daemon_runtime.rs</code> (<code>ServeArgs::store_url</code>) — <code>--store-url postgres://...</code> URL syntax</li>
-      <li><code>src/daemon_runtime.rs</code> (<code>ServeArgs</code>) — TLS / mTLS allowlist enforcement</li>
-      <li><code>src/handlers/</code> + <code>src/federation/{sync,quorum}.rs</code> — <code>broadcast_store_quorum</code> + ack counting</li>
-      <li><code>src/replication.rs</code> — <code>QuorumPolicy</code> + <code>AckTracker</code> (functional)</li>
-      <li><code>Cargo.toml</code> — <code>sal-postgres</code> feature, sqlx + pgvector deps</li>
-      <li><code>CHANGELOG.md</code> — v0.6.0 pre-tag SAL fixes (#294-#297), v0.6.2 fanout bugs (#325-#327)</li>
-      <li><code>docs/ADR-0001-quorum-replication.md</code> — realised design</li>
-      <li><code>docs/ARCHITECTURAL_LIMITS.md</code> — the honest ceiling on each dimension</li>
-    </ul>
+<section class="am-sec alt" id="limits"><div class="am-wrap">
+  <div class="am-sec-h">
+    <span class="am-eyebrow">Honest limits</span>
+    <h2>Where T4 <span class="a">stops</span>.</h2>
   </div>
-</section>
+  <div class="am-tablewrap"><table class="am-table">
+    <thead><tr><th>Limit</th><th>What it means</th><th>Where it is documented</th></tr></thead>
+    <tbody>
+      <tr><td><b>Daemon is the access path</b></td><td>No direct-to-PostgreSQL agent protocol; the daemons stay the throughput bottleneck. Add daemons, not database clients.</td><td><a href="ARCHITECTURAL_LIMITS.html">limits §5</a></td></tr>
+      <tr><td><b>Fail-closed routes</b></td><td>Paths outside the PostgreSQL allowlist answer <code>501</code> on this tier (for example the Agent Skills surface and <code>/api/v1/share</code>).</td><td><a href="https://github.com/alphaonedev/ai-memory-mcp#backend-parity">README · backend parity</a></td></tr>
+      <tr><td><b>MCP stdio</b></td><td>SQLite-only. Agents on the PostgreSQL tier use HTTP.</td><td><code>src/mcp/mod.rs</code></td></tr>
+      <tr><td><b>No CDC</b></td><td>No logical replication, publication or change stream is offered by ai-memory; observe changes through hooks and webhook subscriptions.</td><td><a href="ARCHITECTURAL_LIMITS.html">limits §7</a></td></tr>
+      <tr><td><b>Replication is yours</b></td><td>Streaming replicas, failover and pooling are PostgreSQL operations; ai-memory follows its store URL.</td><td><a href="enterprise-deployment.html">enterprise deployment §5</a></td></tr>
+      <tr><td><b>Eventual graph invalidation</b></td><td>A knowledge-graph invalidation reaches other peers asynchronously.</td><td><a href="ARCHITECTURAL_LIMITS.html">limits §13</a></td></tr>
+    </tbody>
+  </table></div>
+</div></section>
 
-<footer>
-  <p>© 2026 AlphaOne LLC. Licensed Apache-2.0. ai-memory v1.0.0 — <a href="https://github.com/alphaonedev/ai-memory-mcp">source on GitHub</a> · <a href="./">home</a></p>
-</footer>
-
+<section class="am-sec" id="sources"><div class="am-wrap">
+  <div class="am-sec-h"><span class="am-eyebrow">Sources</span><h2>Read the <span class="a">code</span>.</h2></div>
+  <div class="am-grid">
+    <div class="am-card"><span class="am-k">Backend</span><ul><li><code>src/handlers/postgres_gate.rs</code> · route gate, allowlist</li><li><code>src/store/postgres.rs</code> · store, AGE detection</li><li><code>src/store/postgres_schema.sql</code> · pgvector, tsvector</li></ul></div>
+    <div class="am-card"><span class="am-k">Federation</span><ul><li><code>src/replication.rs</code> · W-of-N quorum</li><li><code>src/handlers/parity.rs</code> · the 202 contract</li><li><code>src/federation/signing.rs</code> · signatures, nonces</li></ul></div>
+    <div class="am-card"><span class="am-k">Operations</span><ul><li><code>src/daemon_runtime.rs</code> · serve flags</li><li><code>src/enterprise_federation_posture.rs</code> · posture check</li><li><code>src/wake_hub/server.rs</code> · wake hub</li></ul></div>
+  </div>
+  <div class="am-btns"><a class="am-btn" href="architectures-t3.html">← T3 · Federated cluster</a><a class="am-btn primary" href="architectures-t5.html">T5 · Federated hive →</a></div>
+</div></section>
+</main>
+<footer class="am-foot"><div class="am-wrap">
+  <span>© 2026 AlphaOne LLC · Apache-2.0 · ai-memory v1.0.0</span>
+  <span><a href="https://github.com/alphaonedev/ai-memory-mcp">source</a> · <a href="index.html">home</a> · <a href="architectures.html">architectures</a> · <a href="ARCHITECTURAL_LIMITS.html">limits</a></span>
+</div></footer>
+<button class="am-themetog" id="am-themetog" type="button" aria-label="Toggle light or dark theme">theme</button>
+<script>
+(function(){var d=document.documentElement;try{var s=localStorage.getItem('aim-site-theme');if(s)d.setAttribute('data-theme',s);}catch(e){}
+var b=document.getElementById('am-themetog');if(!b)return;b.addEventListener('click',function(){var c=d.getAttribute('data-theme');var n=c==='dark'?'light':c==='light'?'dark':(matchMedia('(prefers-color-scheme:dark)').matches?'light':'dark');d.setAttribute('data-theme',n);try{localStorage.setItem('aim-site-theme',n);}catch(e){}});})();
+</script>
 </body>
 </html>
