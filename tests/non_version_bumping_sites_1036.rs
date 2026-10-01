@@ -38,6 +38,10 @@
 //! by their own existing test suites; this file focuses on the
 //! production decay path which is the only non-test, non-just-inserted
 //! UPDATE in the bypass list.
+//!
+//! #4217 — the structural successor of this list is the census gate
+//! `tests/version_bump_census_4217.rs`: every production write to an existing
+//! `memories` row must bump `version` or carry a justified allow-list entry.
 
 #![allow(clippy::similar_names)] // `conn` + `conf` flagged; intentional in this short test.
 
