@@ -24,12 +24,29 @@
 //!   ([`FederatedApproveOutcome::AlreadyApproved`]);
 //! * a conflicting decision (`rejected` / `expired`) stays refused.
 //!
-//! The residual window is the reverse one: a stop between the effect's commit
-//! and the approval's commit leaves the effect landed with the row `pending`,
-//! and a redelivery re-runs the effect. That is at-least-once over effects
-//! that re-apply onto the same state (store/promote land on the same
-//! `(title, namespace)` slot, delete is idempotent) — degraded, never an
-//! authorized decision with its effect missing.
+//! # Execution marker (#4345, GOD ruling on #4025)
+//!
+//! Immediately after the effect lands, the unit stamps a durable EXECUTION
+//! MARKER ([`EFFECT_MARKER_KEY`], a reserved key of the row's `payload` JSON —
+//! no schema migration) BEFORE it commits the approval. The marker makes the
+//! reverse window safe:
+//!
+//! * a row that is `pending` WITH a marker has an applied effect: the reject,
+//!   timeout-sweep and expire paths REFUSE to record a decision over it (see
+//!   [`EFFECT_MARKER_ABSENT_SQL`]), and a redelivered approval completes the
+//!   approval WITHOUT re-running the effect;
+//! * a row that is `approved` WITHOUT a marker is a legacy gap (approved before
+//!   the marker existed, or through a local surface whose execution failed or
+//!   was interrupted, #4172): [`FederatedApproveOutcome::AlreadyApprovedUnmarked`]
+//!   reports it honestly and `doctor` counts it (#4345).
+//!
+//! The marker is the write that FOLLOWS the effect, not part of it: the effect
+//! funnels commit on their own, and one transaction around effect + marker +
+//! approval is the redesign tracked in #4346. A stop in the sliver between the
+//! effect's commit and the marker's leaves the old residual: the effect landed
+//! with the row `pending` and no marker, and a redelivery re-runs the effect
+//! (at-least-once over effects that re-apply onto the same state; store/promote
+//! land on the same `(title, namespace)` slot, delete is idempotent).
 
 use anyhow::Result;
 use rusqlite::{Connection, params};
@@ -55,14 +72,82 @@ pub enum FederatedApproveOutcome {
     Executed(Option<String>),
     /// Consensus quorum not yet met; the vote was recorded, nothing executed.
     VotePending { votes: usize, quorum: u32 },
-    /// The row is already `approved`: the converged state a redelivered
-    /// decision finds once this funnel has completed it.
+    /// The row is already `approved` AND carries the execution marker: the
+    /// converged state a redelivered decision finds once this funnel has
+    /// completed it.
     AlreadyApproved,
+    /// The row is `approved` but carries NO execution marker (#4345): approved
+    /// before the marker existed, or through a local surface whose execution
+    /// failed or was interrupted (#4172). Whether its effect landed is
+    /// unknown; the redelivery is acknowledged (a retry could not fix it) but
+    /// reported, and `doctor` counts such rows.
+    AlreadyApprovedUnmarked,
     /// No pending row with this id exists (converged no-op).
     NotFound,
     /// Refused: approver not eligible, or the row carries a CONFLICTING
     /// decision (`rejected` / `expired`). Carries the operator-facing reason.
     Refused(String),
+}
+
+/// #4345 — the reserved `payload` key holding the RFC3339 stamp of the moment
+/// an approved action's effect landed (module docs).
+pub const EFFECT_MARKER_KEY: &str = "__effect_applied_at";
+
+/// #4345 — `WHERE`-clause fragment (sqlite) that is true when the row's payload
+/// carries NO execution marker. Every path that would record a refusal over a
+/// `pending` row (reject, timeout sweep) ANDs this in, so a refused decision is
+/// never recorded over an applied effect. A malformed payload counts as
+/// unmarked (the `CASE` keeps `json_extract` from erroring the whole statement).
+pub const EFFECT_MARKER_ABSENT_SQL: &str = "CASE WHEN json_valid(payload) THEN \
+     json_extract(payload, '$.__effect_applied_at') END IS NULL";
+
+/// #4345 — the postgres twin of [`EFFECT_MARKER_ABSENT_SQL`].
+pub const PG_EFFECT_MARKER_ABSENT_SQL: &str = "NOT (payload ? '__effect_applied_at')";
+
+/// #4345 — count of `approved` rows with no execution marker (sqlite).
+const SQL_COUNT_APPROVED_UNMARKED: &str = "SELECT COUNT(*) FROM pending_actions \
+     WHERE status = 'approved' AND CASE WHEN json_valid(payload) THEN \
+     json_extract(payload, '$.__effect_applied_at') END IS NULL";
+
+/// #4345 — count of `approved` rows with no execution marker (postgres).
+pub const PG_COUNT_APPROVED_UNMARKED_SQL: &str = "SELECT COUNT(*) FROM pending_actions \
+     WHERE status = 'approved' AND NOT (payload ? '__effect_applied_at')";
+
+/// #4345 — `true` when `payload` carries the execution marker.
+#[must_use]
+pub fn payload_has_effect_marker(payload: &serde_json::Value) -> bool {
+    payload
+        .as_object()
+        .is_some_and(|o| o.contains_key(EFFECT_MARKER_KEY))
+}
+
+/// #4345 — stamp the execution marker on `pending_id` (sqlite). Called right
+/// after the effect landed, before the approval commits. Idempotent: an
+/// existing marker is kept.
+///
+/// # Errors
+///
+/// Propagates the storage failure.
+pub fn mark_effect_applied(conn: &Connection, pending_id: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE pending_actions \
+         SET payload = json_set(payload, '$.__effect_applied_at', ?1) \
+         WHERE id = ?2 AND json_valid(payload) \
+           AND json_extract(payload, '$.__effect_applied_at') IS NULL",
+        params![chrono::Utc::now().to_rfc3339(), pending_id],
+    )?;
+    Ok(())
+}
+
+/// #4345 — number of `approved` pending actions that carry no execution marker
+/// (sqlite). Non-zero means an approval whose effect cannot be proven landed.
+///
+/// # Errors
+///
+/// Propagates the storage failure.
+pub fn count_approved_without_effect_marker(conn: &Connection) -> Result<u64> {
+    let n: i64 = conn.query_row(SQL_COUNT_APPROVED_UNMARKED, [], |r| r.get(0))?;
+    Ok(u64::try_from(n).unwrap_or(0))
 }
 
 /// #4025 — the approval-commit compare-and-set: lands the decision (and the
@@ -94,7 +179,11 @@ pub fn approve_execute_pending_action(
         return Ok(FederatedApproveOutcome::NotFound);
     };
     if pa.status == STATUS_APPROVED {
-        return Ok(FederatedApproveOutcome::AlreadyApproved);
+        return Ok(if payload_has_effect_marker(&pa.payload) {
+            FederatedApproveOutcome::AlreadyApproved
+        } else {
+            FederatedApproveOutcome::AlreadyApprovedUnmarked
+        });
     }
     if pa.status != STATUS_PENDING {
         return Ok(FederatedApproveOutcome::Refused(
@@ -149,12 +238,24 @@ pub fn approve_execute_pending_action(
 
     // Run the effect against the row AS-IF approved; nothing is durable yet.
     let decided_at = chrono::Utc::now().to_rfc3339();
+    let effect_already_applied = payload_has_effect_marker(&pa.payload);
     let mut as_approved = pa;
     as_approved.status = STATUS_APPROVED.to_string();
     as_approved.decided_by = Some(decider.clone());
     as_approved.decided_at = Some(decided_at.clone());
     as_approved.approvals = approvals;
-    let memory_id = execute_pending_effect(conn, &as_approved)?;
+    // #4345 — a `pending` row WITH the marker has its effect applied (a stop
+    // after the effect, before the approval): complete the approval, never
+    // re-run the effect.
+    let memory_id = if effect_already_applied {
+        None
+    } else {
+        let id = execute_pending_effect(conn, &as_approved)?;
+        // The marker is stamped BEFORE the approval commits, so a stop (or a
+        // lost race) from here on leaves a row the reject / sweep paths refuse.
+        mark_effect_applied(conn, pending_id)?;
+        id
+    };
 
     // The effect landed: commit the decision that authorized it.
     let committed = conn.execute(

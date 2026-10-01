@@ -898,7 +898,11 @@ pub mod migrations;
 pub mod model_attest;
 // #4025 — federated approval committed only after its effect landed.
 mod pending_approve_execute_4025;
-pub use pending_approve_execute_4025::{FederatedApproveOutcome, approve_execute_pending_action};
+pub use pending_approve_execute_4025::{
+    EFFECT_MARKER_ABSENT_SQL, EFFECT_MARKER_KEY, FederatedApproveOutcome,
+    PG_COUNT_APPROVED_UNMARKED_SQL, PG_EFFECT_MARKER_ABSENT_SQL, approve_execute_pending_action,
+    count_approved_without_effect_marker, mark_effect_applied, payload_has_effect_marker,
+};
 /// #1955 [P1][R45] — substrate record-stop actuator (storage layer): the
 /// non-feature-gated flag registry + attestation logic + the
 /// `StorageError::RecordStopped` `db::`-funnel gate. Lives here (not under
@@ -23795,9 +23799,18 @@ pub fn decide_pending_action(
     crate::storage::record_stop::gate_storage_conn(conn)?;
     let new_status = if approve { "approved" } else { "rejected" };
     let now = Utc::now().to_rfc3339();
+    // #4345 — a REFUSAL never lands over an applied effect: a `pending` row
+    // carrying the execution marker only moves forward (to `approved`).
     let updated = conn.execute(
-        "UPDATE pending_actions SET status = ?1, decided_by = ?2, decided_at = ?3
-         WHERE id = ?4 AND status = 'pending'",
+        &format!(
+            "UPDATE pending_actions SET status = ?1, decided_by = ?2, decided_at = ?3
+             WHERE id = ?4 AND status = 'pending' AND ({guard})",
+            guard = if approve {
+                "1 = 1"
+            } else {
+                EFFECT_MARKER_ABSENT_SQL
+            }
+        ),
         params![new_status, decided_by, now, id],
     )?;
     // S5-M2: emit a `pending_action.denied` audit row when the transition
@@ -23811,6 +23824,10 @@ pub fn decide_pending_action(
     }
     Ok(updated > 0)
 }
+
+/// #4025 — the audit event type appended once an approved pending action's
+/// effect has landed. One name for every emit site on both backends.
+pub(crate) const PENDING_ACTION_APPROVED_EVENT: &str = "pending_action.approved";
 
 /// v0.7.0 S5-M1/M2 — append a `pending_action.<state>` row to
 /// `signed_events` so the audit chain captures every governance
@@ -23833,10 +23850,6 @@ pub fn decide_pending_action(
 /// caller's primary mutation MUST NOT roll back on audit failure.
 /// Mirrors the same posture as `memory_link.invalidated` emit (the
 /// audit chain is allowed to gap, the underlying write is not).
-/// #4025 — the audit event type appended once an approved pending action's
-/// effect has landed. One name for every emit site on both backends.
-pub(crate) const PENDING_ACTION_APPROVED_EVENT: &str = "pending_action.approved";
-
 fn emit_pending_action_event(
     conn: &Connection,
     pa: &PendingAction,
@@ -24453,6 +24466,15 @@ pub fn execute_pending_action(conn: &Connection, pending_id: &str) -> Result<Opt
         ));
     }
     let memory_id = execute_pending_effect(conn, &pa)?;
+    // #4345 — stamp the execution marker so a later federated redelivery (and
+    // `doctor`) can tell this approval's effect landed. The effect already
+    // committed: a stamping failure is logged, never rolled into the result.
+    if let Err(e) = mark_effect_applied(conn, &pa.id) {
+        tracing::warn!(
+            "execute_pending_action: execution marker not stamped for {}: {e}",
+            pa.id
+        );
+    }
     // S5-M1: emit the approve audit row after the side-effecting write
     // succeeded so the audit chain reflects the post-execute state. The
     // emit is best-effort (warn-only) so an audit-side failure does not

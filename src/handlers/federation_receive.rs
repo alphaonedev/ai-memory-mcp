@@ -3939,6 +3939,17 @@ async fn sync_push_write(
                     db::FederatedApproveOutcome::AlreadyApproved
                     | db::FederatedApproveOutcome::NotFound,
                 ) => noop += 1,
+                // #4345 — approved WITHOUT an execution marker: acknowledged (a
+                // retry cannot change it) but never reported as a verified
+                // converge; `doctor` counts these rows.
+                Ok(db::FederatedApproveOutcome::AlreadyApprovedUnmarked) => {
+                    tracing::warn!(
+                        pending_id = %dec.id,
+                        "sync_push: pending action is approved but carries no execution \
+                         marker; its effect cannot be proven landed (#4345)"
+                    );
+                    noop += 1;
+                }
                 Ok(db::FederatedApproveOutcome::Refused(reason)) => {
                     tracing::warn!(
                         target: ATTESTATION_TRACE_TARGET,

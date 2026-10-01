@@ -233,6 +233,16 @@ trait Fixture {
     async fn arm_fault(&self, title: &str);
     async fn clear_fault(&self);
     async fn count_title(&self, namespace: &str, title: &str) -> i64;
+    /// #4345 — does the row's payload carry the execution marker?
+    async fn has_marker(&self, pid: &str) -> bool;
+    /// #4345 — stamp the marker directly: the durable state a stop between the
+    /// effect and the approval leaves behind.
+    async fn stamp_marker(&self, pid: &str);
+    /// #4345 — force `status = 'approved'` without executing (the legacy /
+    /// local-surface shape: approve committed, execution never ran).
+    async fn force_approved(&self, pid: &str);
+    /// #4345 — number of `approved` rows with no execution marker.
+    async fn count_unmarked_approved(&self) -> i64;
 }
 
 async fn run_cell(
@@ -342,6 +352,44 @@ impl Fixture for SqliteFixture {
         )
         .expect("count")
     }
+    async fn has_marker(&self, pid: &str) -> bool {
+        let conn = rusqlite::Connection::open(&self.path).expect("fixture connection");
+        conn.query_row(
+            "SELECT json_extract(payload, '$.__effect_applied_at') IS NOT NULL \
+             FROM pending_actions WHERE id = ?1",
+            rusqlite::params![pid],
+            |r| r.get(0),
+        )
+        .expect("marker probe")
+    }
+    async fn stamp_marker(&self, pid: &str) {
+        let conn = rusqlite::Connection::open(&self.path).expect("fixture connection");
+        conn.execute(
+            "UPDATE pending_actions SET payload = \
+             json_set(payload, '$.__effect_applied_at', '2026-01-01T00:00:00Z') WHERE id = ?1",
+            rusqlite::params![pid],
+        )
+        .expect("stamp marker");
+    }
+    async fn force_approved(&self, pid: &str) {
+        let conn = rusqlite::Connection::open(&self.path).expect("fixture connection");
+        conn.execute(
+            "UPDATE pending_actions SET status = 'approved', decided_by = 'legacy', \
+             decided_at = '2026-01-01T00:00:00Z' WHERE id = ?1",
+            rusqlite::params![pid],
+        )
+        .expect("force approved");
+    }
+    async fn count_unmarked_approved(&self) -> i64 {
+        let conn = rusqlite::Connection::open(&self.path).expect("fixture connection");
+        conn.query_row(
+            "SELECT COUNT(*) FROM pending_actions WHERE status = 'approved' \
+             AND json_extract(payload, '$.__effect_applied_at') IS NULL",
+            [],
+            |r| r.get(0),
+        )
+        .expect("count unmarked")
+    }
 }
 
 #[tokio::test]
@@ -414,6 +462,45 @@ impl Fixture for PgFixture {
             .await
             .expect("count")
     }
+    async fn has_marker(&self, pid: &str) -> bool {
+        sqlx::query_scalar(
+            "SELECT payload ? '__effect_applied_at' FROM pending_actions WHERE id = $1",
+        )
+        .bind(pid)
+        .fetch_one(&self.pool)
+        .await
+        .expect("marker probe")
+    }
+    async fn stamp_marker(&self, pid: &str) {
+        sqlx::query(
+            "UPDATE pending_actions SET payload = \
+             jsonb_set(payload, '{__effect_applied_at}', to_jsonb('2026-01-01T00:00:00Z'::text)) \
+             WHERE id = $1",
+        )
+        .bind(pid)
+        .execute(&self.pool)
+        .await
+        .expect("stamp marker");
+    }
+    async fn force_approved(&self, pid: &str) {
+        sqlx::query(
+            "UPDATE pending_actions SET status = 'approved', decided_by = 'legacy', \
+             decided_at = NOW() WHERE id = $1",
+        )
+        .bind(pid)
+        .execute(&self.pool)
+        .await
+        .expect("force approved");
+    }
+    async fn count_unmarked_approved(&self) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pending_actions WHERE status = 'approved' \
+             AND NOT (payload ? '__effect_applied_at')",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .expect("count unmarked")
+    }
 }
 
 #[cfg(feature = "sal-postgres")]
@@ -455,4 +542,273 @@ async fn federated_approval_completes_after_failed_execution_pg_4025() {
     };
     run_cell("postgres", &router, &store, &fixture).await;
     fixture.clear_fault().await;
+}
+
+// ---------------------------------------------------------------------
+// #4345 — the EXECUTION MARKER cells (GOD ruling on #4025), both backends.
+//
+//   marker      : an approval completed by the federated unit leaves the
+//                 durable marker on its row.
+//   reject/sweep: a `pending` row that carries the marker (the state a stop
+//                 between the effect and the approval leaves) must NOT be
+//                 refused/expired over its applied effect, and a redelivered
+//                 approval completes it WITHOUT re-running the effect.
+//   unmarked    : a row approved WITHOUT executing (legacy / local surface)
+//                 carries no marker and is counted; a LOCAL approve-then-execute
+//                 stamps the marker; a federated redelivery acknowledges.
+// ---------------------------------------------------------------------
+
+/// Common setup: a governed root and an enrolled approver (ONE posture per
+/// cell, so every row queued under it can be decided by the same approver).
+async fn governed(store: &Arc<dyn MemoryStore>, tag: &str) -> (String, String) {
+    let root = uniq(&format!("public-4345{tag}"));
+    let approver = uniq("ai:approver-4345");
+    set_posture(&root, &approver);
+    register_approver(store, &approver).await;
+    (root, approver)
+}
+
+/// Queue a pending row over the wire; returns `(pid, namespace, title)`.
+async fn queue_pending(router: &axum::Router, root: &str) -> (String, String, String) {
+    let ns = format!("{root}/ok");
+    let pid = uuid::Uuid::new_v4().to_string();
+    let title = uniq("governed-4345");
+    let report = push(router, vec![pending_entry(&pid, &ns, &title)], vec![]).await;
+    assert_eq!(counter(&report, "skipped"), 0, "queue pending: {report}");
+    (pid, ns, title)
+}
+
+async fn marker_cell_completion(
+    backend: &str,
+    router: &axum::Router,
+    store: &Arc<dyn MemoryStore>,
+    fixture: &impl Fixture,
+) {
+    let (root, approver) = governed(store, "m").await;
+    let (pid, ns, title) = queue_pending(router, &root).await;
+    let decision = json!({"id": pid, "approved": true, "decider": approver});
+    push(router, vec![], vec![decision]).await;
+    assert_eq!(pending_status(store, &pid).await, "approved", "{backend}");
+    assert_eq!(fixture.count_title(&ns, &title).await, 1, "{backend}");
+    assert!(
+        fixture.has_marker(&pid).await,
+        "#4345 ({backend}): an approval completed by the federated unit must leave the \
+         execution marker on its row"
+    );
+    clear_posture();
+}
+
+async fn marker_cell_refuse_over_marker(
+    backend: &str,
+    router: &axum::Router,
+    store: &Arc<dyn MemoryStore>,
+    fixture: &impl Fixture,
+) {
+    let (root, approver) = governed(store, "r").await;
+    let (pid, ns, title) = queue_pending(router, &root).await;
+    let (ctl_pid, ..) = queue_pending(router, &root).await;
+    let (swept_pid, ..) = queue_pending(router, &root).await;
+    // The crash state: effect applied (marker durable), decision still pending.
+    fixture.stamp_marker(&pid).await;
+    fixture.stamp_marker(&swept_pid).await;
+
+    // (b) reject refuses over the marker; the unmarked control is rejectable.
+    let rejected = store
+        .pending_decide(&admin_ctx(), &pid, false, "ai:rejecter-4345")
+        .await
+        .expect("pending_decide marked");
+    assert!(
+        !rejected,
+        "#4345 ({backend}): a reject must not be recorded over an applied effect"
+    );
+    assert_eq!(pending_status(store, &pid).await, "pending", "{backend}");
+    assert!(
+        store
+            .pending_decide(&admin_ctx(), &ctl_pid, false, "ai:rejecter-4345")
+            .await
+            .expect("pending_decide control"),
+        "{backend}: control — an unmarked pending row is still rejectable"
+    );
+
+    // (b) the timeout sweep leaves the marked row pending.
+    tokio::time::sleep(Duration::from_millis(2100)).await;
+    let swept = store.sweep_pending_action_timeouts(1).await.expect("sweep");
+    assert!(
+        !swept.iter().any(|(id, _)| id == &swept_pid),
+        "#4345 ({backend}): the sweep must not expire a row whose effect is applied"
+    );
+    assert_eq!(
+        pending_status(store, &swept_pid).await,
+        "pending",
+        "{backend}"
+    );
+
+    // A redelivered approval completes WITHOUT re-running the effect.
+    let decision = json!({"id": pid, "approved": true, "decider": approver});
+    let report = push(router, vec![], vec![decision]).await;
+    assert_eq!(
+        pending_status(store, &pid).await,
+        "approved",
+        "{backend}: {report}"
+    );
+    assert_eq!(
+        fixture.count_title(&ns, &title).await,
+        0,
+        "#4345 ({backend}): a marked row's approval must not re-run the applied effect"
+    );
+    clear_posture();
+}
+
+async fn marker_cell_unmarked(
+    backend: &str,
+    router: &axum::Router,
+    store: &Arc<dyn MemoryStore>,
+    fixture: &impl Fixture,
+) {
+    let (root, approver) = governed(store, "u").await;
+    let (legacy_pid, ..) = queue_pending(router, &root).await;
+    let (local_pid, local_ns, local_title) = queue_pending(router, &root).await;
+    let before = fixture.count_unmarked_approved().await;
+
+    // Legacy shape: approved, execution never ran, no marker.
+    fixture.force_approved(&legacy_pid).await;
+    assert_eq!(
+        fixture.count_unmarked_approved().await,
+        before + 1,
+        "{backend}: the approved-without-marker row is counted"
+    );
+    let decision = json!({"id": legacy_pid, "approved": true, "decider": approver});
+    let report = push(router, vec![], vec![decision]).await;
+    assert_eq!(counter(&report, "skipped"), 0, "{backend}: {report}");
+    assert_eq!(counter(&report, "noop"), 1, "{backend}: {report}");
+
+    // LOCAL approve-then-execute: the executor stamps the marker once the
+    // effect landed, so a local approval whose execution succeeded is not
+    // counted as a legacy gap.
+    store
+        .approve_with_approver_type(&admin_ctx(), &local_pid, &approver)
+        .await
+        .expect("local approve");
+    store
+        .execute_pending_action(&admin_ctx(), &local_pid)
+        .await
+        .expect("local execute");
+    assert_eq!(
+        fixture.count_title(&local_ns, &local_title).await,
+        1,
+        "{backend}"
+    );
+    assert!(
+        fixture.has_marker(&local_pid).await,
+        "#4345 ({backend}): a local execute that landed its effect must stamp the marker"
+    );
+    clear_posture();
+}
+
+fn sqlite_env() -> (axum::Router, Arc<dyn MemoryStore>, SqliteFixture) {
+    let db_tmp = tempfile::NamedTempFile::new().expect("db tempfile");
+    let db_path = db_tmp.path().to_path_buf();
+    std::mem::forget(db_tmp);
+    let conn = ai_memory::db::open(&db_path).expect("db::open");
+    let db: Db = Arc::new(Mutex::new((
+        conn,
+        db_path.clone(),
+        ResolvedTtl::default(),
+        true,
+    )));
+    let store: Arc<dyn MemoryStore> =
+        Arc::new(ai_memory::store::sqlite::SqliteStore::open(&db_path).expect("open SqliteStore"));
+    let router = router_for(app_state(db, StorageBackend::Sqlite, store.clone()));
+    (router, store, SqliteFixture { path: db_path })
+}
+
+#[tokio::test]
+async fn marker_stamped_on_completion_sqlite_4345() {
+    let _g = FED_ENV_LOCK.lock().await;
+    let (router, store, fx) = sqlite_env();
+    marker_cell_completion("sqlite", &router, &store, &fx).await;
+}
+
+#[tokio::test]
+async fn reject_and_sweep_refuse_over_marker_sqlite_4345() {
+    let _g = FED_ENV_LOCK.lock().await;
+    let (router, store, fx) = sqlite_env();
+    marker_cell_refuse_over_marker("sqlite", &router, &store, &fx).await;
+}
+
+#[tokio::test]
+async fn unmarked_approved_counted_and_local_execute_stamps_sqlite_4345() {
+    let _g = FED_ENV_LOCK.lock().await;
+    let (router, store, fx) = sqlite_env();
+    marker_cell_unmarked("sqlite", &router, &store, &fx).await;
+}
+
+#[cfg(feature = "sal-postgres")]
+async fn pg_env(url: &str) -> (axum::Router, Arc<dyn MemoryStore>, PgFixture) {
+    use ai_memory::store::postgres::PostgresStore;
+    let conn = ai_memory::db::open(std::path::Path::new(":memory:")).expect("scratch sqlite");
+    let db: Db = Arc::new(Mutex::new((
+        conn,
+        std::path::PathBuf::from(":memory:"),
+        ResolvedTtl::default(),
+        true,
+    )));
+    let store: Arc<dyn MemoryStore> =
+        Arc::new(PostgresStore::connect(url).await.expect("connect postgres"));
+    let router = router_for(app_state(db, StorageBackend::Postgres, store.clone()));
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .connect(url)
+        .await
+        .expect("fixture pool");
+    let fx = PgFixture {
+        pool,
+        suffix: uuid::Uuid::new_v4().simple().to_string()[..8].to_string(),
+    };
+    (router, store, fx)
+}
+
+#[cfg(feature = "sal-postgres")]
+fn pg_url_or_skip(name: &str) -> Option<String> {
+    let url = std::env::var("AI_MEMORY_TEST_POSTGRES_URL")
+        .ok()
+        .filter(|s| !s.is_empty());
+    if url.is_none() {
+        eprintln!("SKIP {name}: no AI_MEMORY_TEST_POSTGRES_URL");
+    }
+    url
+}
+
+#[cfg(feature = "sal-postgres")]
+#[tokio::test]
+async fn marker_stamped_on_completion_pg_4345() {
+    let Some(url) = pg_url_or_skip("marker_stamped_on_completion_pg_4345") else {
+        return;
+    };
+    let _g = FED_ENV_LOCK.lock().await;
+    let (router, store, fx) = pg_env(&url).await;
+    marker_cell_completion("postgres", &router, &store, &fx).await;
+}
+
+#[cfg(feature = "sal-postgres")]
+#[tokio::test]
+async fn reject_and_sweep_refuse_over_marker_pg_4345() {
+    let Some(url) = pg_url_or_skip("reject_and_sweep_refuse_over_marker_pg_4345") else {
+        return;
+    };
+    let _g = FED_ENV_LOCK.lock().await;
+    let (router, store, fx) = pg_env(&url).await;
+    marker_cell_refuse_over_marker("postgres", &router, &store, &fx).await;
+}
+
+#[cfg(feature = "sal-postgres")]
+#[tokio::test]
+async fn unmarked_approved_counted_and_local_execute_stamps_pg_4345() {
+    let Some(url) = pg_url_or_skip("unmarked_approved_counted_and_local_execute_stamps_pg_4345")
+    else {
+        return;
+    };
+    let _g = FED_ENV_LOCK.lock().await;
+    let (router, store, fx) = pg_env(&url).await;
+    marker_cell_unmarked("postgres", &router, &store, &fx).await;
 }

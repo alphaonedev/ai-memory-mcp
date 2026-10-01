@@ -170,7 +170,9 @@ pub fn sweep_pending_action_timeouts(
         "SELECT id, namespace FROM pending_actions
          WHERE status = 'pending'
            AND (julianday('now') - julianday(requested_at)) * 86400.0
-               > COALESCE(default_timeout_seconds, ?1)",
+               > COALESCE(default_timeout_seconds, ?1)
+           AND CASE WHEN json_valid(payload) THEN
+               json_extract(payload, '$.__effect_applied_at') END IS NULL",
     )?;
     let rows: Vec<(String, String)> = stmt
         .query_map(params![global_default_secs], |row| {
@@ -192,7 +194,9 @@ pub fn sweep_pending_action_timeouts(
         let mut update = tx_savepoint.prepare(
             "UPDATE pending_actions
              SET status = 'expired', expired_at = ?1
-             WHERE id = ?2 AND status = 'pending'",
+             WHERE id = ?2 AND status = 'pending'
+               AND CASE WHEN json_valid(payload) THEN
+                   json_extract(payload, '$.__effect_applied_at') END IS NULL",
         )?;
         for (id, _) in &rows {
             update.execute(params![now, id])?;

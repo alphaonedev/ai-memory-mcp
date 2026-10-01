@@ -26685,8 +26685,11 @@ impl MemoryStore for PostgresStore {
             .await
             .map_err(|e| to_store_err("pending_decide begin tx", e))?;
         let rows_affected = sqlx::query(
+            // #4345 — a REFUSAL never lands over an applied effect: a pending
+            // row carrying the execution marker only moves forward.
             "UPDATE pending_actions SET status = $1, decided_by = $2, decided_at = NOW()
-             WHERE id = $3 AND status = 'pending'",
+             WHERE id = $3 AND status = 'pending'
+               AND ($1 = 'approved' OR NOT (payload ? '__effect_applied_at'))",
         )
         .bind(new_status)
         .bind(decided_by)
@@ -30239,6 +30242,7 @@ impl MemoryStore for PostgresStore {
             "UPDATE pending_actions
                 SET status = 'expired', expired_at = NOW()
               WHERE status = 'pending'
+                AND NOT (payload ? '__effect_applied_at')
                 AND requested_at
                     + make_interval(secs => COALESCE(default_timeout_seconds, $1)::double precision)
                     < NOW()
@@ -32593,6 +32597,9 @@ impl MemoryStore for PostgresStore {
             });
         }
         let memory_id = self.pg_execute_pending_effect(ctx, &pa).await?;
+        // #4345 — stamp the execution marker (best-effort: the effect already
+        // committed; see `postgres/pending_approve_execute_4025.rs`).
+        self.pg_mark_effect_applied(pending_id).await;
         // v1.0.0 #3180 (v0.7.0 S5-M1) — append the `pending_action.approved`
         // audit row AFTER the side-effecting write succeeded, so the chain
         // reflects the post-execute state (byte-identical placement to the
