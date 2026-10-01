@@ -36,7 +36,7 @@
 > the United States Government do not endorse, certify, or recommend
 > ai-memory, AgenticMem, AlphaOne LLC, or any commercial product.
 
-**ai-memory is a persistent memory system for AI assistants.** It works with **any AI that supports MCP** -- Claude, ChatGPT, Grok, Llama, and more. It stores what your AI learns in a local SQLite database, ranks memories by relevance when recalling, and auto-promotes important knowledge to permanent storage. Install it once, and every AI assistant you use remembers your architecture, your preferences, your corrections -- forever.
+**ai-memory is a persistent memory system for AI assistants.** It works with **any AI that supports MCP** -- Claude, ChatGPT, Grok, Llama, and more. It stores what your AI learns in a local SQLite database, ranks memories by relevance when recalling, and lets your AI promote important knowledge to permanent storage with `memory_promote`. Install it once, and every AI assistant you use remembers your architecture, your preferences, your corrections -- forever.
 
 ---
 
@@ -782,9 +782,8 @@ Beyond MCP, ai-memory also exposes a full HTTP REST API (103 route registrations
 - **Hybrid recall** -- FTS5 keyword + cosine similarity with adaptive blending: the semantic weight varies 0.50 (short content) → 0.15 (long content) because embeddings lose information on long text
 - **6-factor recall scoring** -- FTS relevance + priority + access frequency + confidence + tier boost + recency decay
 - **Pure recall** -- a recall writes nothing to `memories`; it appends one `recall_observations` ledger row ([#1953](https://github.com/alphaonedev/ai-memory-mcp/issues/1953)). Safe on a read replica, idempotent under retry.
-- **Auto-promotion** -- memories accessed 5+ times promote from mid to long, applied by the fold job
 - **TTL extension** -- a recorded access raises expiry (short +1h, mid +1d; floor-only, never earlier), applied by the fold job
-- **Priority reinforcement** -- +1 every 10 accesses (max 10), applied by the fold job
+- **Explicit promotion only** -- recall never changes a memory's tier or priority; `memory_promote` is the only verb that raises a tier and `update` changes priority (Boids item 1, vote `4d3ea1c5`)
 - **Contradiction detection** -- warns when storing memories that conflict with existing ones
 - **Deduplication** -- upsert on title+namespace, tier never downgrades
 - **Confidence scoring** -- 0.0-1.0 certainty factored into ranking
@@ -1285,11 +1284,10 @@ score = (fts_relevance * -1)
 
 ### Automatic Behaviors
 
-Recall records the access in the append-only `recall_observations` ledger and returns without touching `memories`. The three ladders below are applied by the periodic **fold job** (`db::fold_recall_accesses`, `AI_MEMORY_ACCESS_FOLD_INTERVAL_SECS`, default 60 s, plus a fold at the top of every GC tick) — so on an MCP-stdio-only deployment with no `ai-memory serve` daemon they do not fire until a gc chokepoint.
+Recall records the access in the append-only `recall_observations` ledger and returns without touching `memories`. The access bookkeeping below is applied by the periodic **fold job** (`db::fold_recall_accesses`, `AI_MEMORY_ACCESS_FOLD_INTERVAL_SECS`, default 60 s, plus a fold at the top of every GC tick) — so on an MCP-stdio-only deployment with no `ai-memory serve` daemon it does not run until a gc chokepoint. The fold bumps `access_count` (capped at 1,000,000), `last_accessed_at` and the TTL floor only.
 
 - **TTL extension on a recorded access**: short memories get +1 hour, mid memories get +1 day (floor-only — an access can extend a memory's life, never shorten it)
-- **Auto-promotion**: mid-tier memories accessed 5+ times promote to long (expiry cleared)
-- **Priority reinforcement**: every 10 accesses, priority increases by 1 (capped at 10)
+- **No access-driven promotion**: recall access extends TTL only; tier promotion and priority changes are explicit operations (`memory_promote`, `update`). v1.0.0 Boids item 1 (vote `4d3ea1c5`) removed the former mid→long auto-promotion and the priority ladder on both backends
 - **Contradiction detection**: warns when a new memory conflicts with an existing one in the same namespace
 - **Deduplication**: upsert on title+namespace; tier never downgrades on update
 
