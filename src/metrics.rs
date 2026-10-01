@@ -320,6 +320,10 @@ pub struct Metrics {
     /// so the process ran WITHOUT it instead of forking the chain at genesis.
     pub forensic_sink_unavailable: IntCounter,
 
+    /// v1.0.0 #4304 — monotonic count of forensic appends made WITHOUT the
+    /// cross-process `forensic.lock` (it could not be opened or locked).
+    pub forensic_lock_unavailable: IntCounter,
+
     /// v1.0.0 #3699 (5-agent vote 4d3ea1c5) — monotonic count of inbound
     /// federated memories folded into a LOCAL row of a DIFFERENT id by the
     /// newer-wins `(title, namespace)` merge (the inbound id was never
@@ -1105,6 +1109,17 @@ impl Metrics {
             &mut err,
         );
 
+        // v1.0.0 #4304 — a forensic append ran without the cross-process lock.
+        let forensic_lock_unavailable = int_counter(
+            &registry,
+            "ai_memory_forensic_lock_unavailable_total",
+            "Monotonic count of forensic-log appends made without the cross-process \
+             forensic.lock (it could not be opened or locked). The tail is then \
+             re-read for every row, but two unlocked appenders can still interleave \
+             and fork the chain (#4304).",
+            &mut err,
+        );
+
         // v1.0.0 #4199 — the forensic sink was unavailable at boot (no fork).
         let forensic_sink_unavailable = int_counter(
             &registry,
@@ -1544,6 +1559,7 @@ impl Metrics {
             federation_erasure_superseded,
             federation_quarantined_unattributed,
             forensic_sink_unavailable,
+            forensic_lock_unavailable,
             federation_cross_id_title_merge,
             operator_dequarantined,
             hnsw_evictions_total,
@@ -1710,6 +1726,17 @@ pub fn inc_fed_quarantined_unattributed() {
 /// doctor Critical and the signed `audit.forensic_sink_unavailable` row.
 pub fn inc_forensic_sink_unavailable() {
     registry().forensic_sink_unavailable.inc();
+}
+
+/// v1.0.0 #4304 — a forensic append ran without the cross-process lock.
+pub fn inc_forensic_lock_unavailable() {
+    registry().forensic_lock_unavailable.inc();
+}
+
+/// v1.0.0 #4304 — read [`inc_forensic_lock_unavailable`]'s counter.
+#[must_use]
+pub fn forensic_lock_unavailable_count() -> u64 {
+    registry().forensic_lock_unavailable.get()
 }
 
 /// v1.0.0 #4199 — read [`inc_forensic_sink_unavailable`]'s counter.
