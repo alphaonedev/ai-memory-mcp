@@ -1017,11 +1017,7 @@ async fn concurrent_approvals_one_effect_4025(
     );
     clear_posture();
     assert_eq!(status, "approved", "{backend}");
-    assert_eq!(
-        effects,
-        if marked_first { 0 } else { 1 },
-        "{backend}: {outs:?}"
-    );
+    assert_eq!(effects, i64::from(!marked_first), "{backend}: {outs:?}");
     assert!(marked, "{backend}");
 }
 
