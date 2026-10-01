@@ -569,11 +569,27 @@ pub async fn handle_reflect_http(
         // re-resolution that used to live here; the owner rule now lives at ONE
         // site (`mcp::tools::reflect::resolve_reflect_owner`) that both backends
         // reach, instead of postgres overriding the parsed id after the fact.
-        let (input, caller_depth) =
+        let (mut input, caller_depth) =
             match crate::mcp::parse_reflect_input(&body, None, authenticated_caller.as_deref()) {
                 Ok(parsed) => parsed,
                 Err(e) => return err_response(e),
             };
+        // #4357 — the attestation posture crosses BEFORE the approval queue,
+        // exactly as the sqlite MCP handler does (#3014): under global-strict
+        // attestation an unsigned tenant reflect is refused here and never
+        // queued. `attest_level` is a substrate-stamped system key, so any
+        // caller-supplied value is scrubbed first (it must never ride the
+        // queued payload onto the durable row); the permissive-path `claimed`
+        // stamp goes onto a throwaway object so the queued payload stays what
+        // the caller supplied (#1176).
+        if let Some(obj) = input.metadata.as_object_mut() {
+            obj.remove(field_names::ATTEST_LEVEL);
+        }
+        let mut attest_sink = Value::Object(serde_json::Map::new());
+        if let Err(e) = crate::identity::attest::gate_unsigned_surface_attestation(&mut attest_sink)
+        {
+            return err_response(e.to_string());
+        }
         let caller = crate::store::CallerContext::for_agent(&input.agent_id);
         // #1325 caller-asserted depth pre-check (parity with the sqlite
         // MCP path): compare the asserted `depth` to the substrate-

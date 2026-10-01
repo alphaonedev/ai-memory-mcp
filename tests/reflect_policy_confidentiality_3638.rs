@@ -314,7 +314,10 @@ async fn issue_3638_sqlite_pending_response_hides_private_threshold() {
     let source = memory(ATTACKER, "attacker/sources", "approval source");
     store.store(&attacker, &source).await.expect("source");
     let mut standard = memory(VICTIM, "victim/standards", "approval standard");
-    standard.metadata["governance"] = json!({"require_approval_above_depth": 0});
+    // #4285 / #4357 — a typed-shape-valid policy (`write` is required); an
+    // untyped blob is a CORRUPT level that contributes no raw knobs. Same
+    // fixture change as the #4285 lane; the assertions are unchanged.
+    standard.metadata["governance"] = json!({"write": "any", "require_approval_above_depth": 0});
     store.store(&victim, &standard).await.expect("standard");
     store
         .set_namespace_standard(&victim, "victim/private", &standard.id, None)

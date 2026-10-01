@@ -555,7 +555,8 @@ fn sg_rl_4_approval_api_flow_for_deep_reflection() {
     src.memory_kind = MemoryKind::Reflection;
     let src_id = db::insert(&conn, &src).expect("insert depth-1 source");
 
-    let threshold = db::resolve_require_approval_above_depth(&conn, ns);
+    let threshold =
+        db::resolve_require_approval_above_depth(&conn, ns).expect("#4043: governance policy read");
     assert_eq!(threshold, Some(1), "L1-8 threshold resolves leaf-first");
 
     // Queue the pending row — what the MCP handler does in lieu of

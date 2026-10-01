@@ -305,7 +305,8 @@ fn r2_explicit_same_owner_flat_hierarchy_inherits_approval_gate() {
     // The approval-DEPTH gate (a separate resolver over the same governance
     // chain) must inherit too.
     assert_eq!(
-        db::resolve_require_approval_above_depth(&conn, "acme-corp-frontend"),
+        db::resolve_require_approval_above_depth(&conn, "acme-corp-frontend")
+            .expect("#4043: governance policy read"),
         Some(1),
         "#2542 Finding 1: the child must inherit the parent's require_approval_above_depth gate"
     );

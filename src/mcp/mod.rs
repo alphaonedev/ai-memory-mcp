@@ -12496,6 +12496,13 @@ mod tests {
         governance: Value,
     ) {
         let now = chrono::Utc::now().to_rfc3339();
+        // #4285 / #4357 — a standard whose governance blob does not satisfy the
+        // typed shape is a CORRUPT level that contributes no raw knobs, so the
+        // fixture must be a valid policy: the typed shape requires `write`.
+        let mut governance = governance;
+        if let Some(obj) = governance.as_object_mut() {
+            obj.entry("write").or_insert_with(|| json!("any"));
+        }
         let metadata = json!({
             "agent_id": "test-agent-reflect",
             "governance": governance,

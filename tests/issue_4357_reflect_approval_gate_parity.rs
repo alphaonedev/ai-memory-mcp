@@ -26,6 +26,9 @@ use std::sync::Arc;
 use tempfile::NamedTempFile;
 use tower::ServiceExt as _;
 
+/// Cells mutate process env (attestation / `why_trace` postures); one at a time.
+static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 const SHARED_KEY: &str = "issue-4357-transport-key";
 const OWNER: &str = "ai:owner-4357";
 const APPROVER: &str = "ai:approver-4357";
@@ -346,8 +349,19 @@ async fn exercise_resolver(store: Arc<dyn MemoryStore>) {
             json!({"write": "any", "require_approval_above_depth": 3}),
             Some(3),
         ),
-        // Leaf policy WITHOUT the field: leaf-first-wins, parent must not leak.
-        (json!({"write": "any"}), None),
+        // A well-formed standard that OMITS the field is not a policy
+        // statement: the parent's explicit value still governs (GOD rule 2).
+        (json!({"write": "any"}), Some(1)),
+        // A corrupt level (unparseable policy) never contributes its raw knob.
+        (
+            json!({"write": "not-a-level", "require_approval_above_depth": 99}),
+            Some(1),
+        ),
+        // A non-integer knob is not honoured as a value; the ancestor governs.
+        (
+            json!({"write": "any", "require_approval_above_depth": "3"}),
+            Some(1),
+        ),
         // 2^32 must not truncate to a disabled gate: fail closed to 0.
         (
             json!({"write": "any", "require_approval_above_depth": 4_294_967_296_u64}),
@@ -387,6 +401,7 @@ fn sqlite_store(file: &NamedTempFile) -> Arc<dyn MemoryStore> {
 
 #[tokio::test]
 async fn issue_4357_sqlite_http_reflect_above_threshold_is_parked() {
+    let _serial = SERIAL.lock().await;
     let file = NamedTempFile::new().expect("sqlite file");
     let out = exercise_http_gate(
         sqlite_store(&file),
@@ -399,6 +414,7 @@ async fn issue_4357_sqlite_http_reflect_above_threshold_is_parked() {
 
 #[tokio::test]
 async fn issue_4357_sqlite_http_threshold_boundary_and_no_gate() {
+    let _serial = SERIAL.lock().await;
     let file = NamedTempFile::new().expect("sqlite file");
     exercise_http_at_threshold(
         sqlite_store(&file),
@@ -417,6 +433,7 @@ async fn issue_4357_sqlite_http_threshold_boundary_and_no_gate() {
 
 #[tokio::test]
 async fn issue_4357_sqlite_resolver_leaf_first_semantics() {
+    let _serial = SERIAL.lock().await;
     let file = NamedTempFile::new().expect("sqlite file");
     exercise_resolver(sqlite_store(&file)).await;
 }
@@ -459,6 +476,7 @@ fn mcp_pending_outcome() -> (Outcome, Value) {
 
 #[test]
 fn issue_4357_mcp_reflect_above_threshold_is_parked() {
+    let _serial = SERIAL.blocking_lock();
     let (out, raw) = mcp_pending_outcome();
     assert_eq!(out.status, "pending", "{raw}");
     assert_eq!(out.reflections_written, 0, "{raw}");
@@ -478,6 +496,7 @@ async fn pg_store() -> Arc<dyn MemoryStore> {
 #[cfg(feature = "sal-postgres")]
 #[tokio::test]
 async fn issue_4357_postgres_http_reflect_above_threshold_is_parked() {
+    let _serial = SERIAL.lock().await;
     let out = exercise_http_gate(pg_store().await, StorageBackend::Postgres, None).await;
     assert_eq!(out.status, "pending");
 }
@@ -485,6 +504,7 @@ async fn issue_4357_postgres_http_reflect_above_threshold_is_parked() {
 #[cfg(feature = "sal-postgres")]
 #[tokio::test]
 async fn issue_4357_postgres_http_threshold_boundary_and_no_gate() {
+    let _serial = SERIAL.lock().await;
     exercise_http_at_threshold(pg_store().await, StorageBackend::Postgres, None).await;
     exercise_http_no_gate(pg_store().await, StorageBackend::Postgres, None).await;
 }
@@ -492,6 +512,7 @@ async fn issue_4357_postgres_http_threshold_boundary_and_no_gate() {
 #[cfg(feature = "sal-postgres")]
 #[tokio::test]
 async fn issue_4357_postgres_resolver_leaf_first_semantics() {
+    let _serial = SERIAL.lock().await;
     exercise_resolver(pg_store().await).await;
 }
 
@@ -500,6 +521,7 @@ async fn issue_4357_postgres_resolver_leaf_first_semantics() {
 #[cfg(feature = "sal-postgres")]
 #[tokio::test]
 async fn issue_4357_parity_same_request_same_outcome_on_both_backends() {
+    let _serial = SERIAL.lock().await;
     let (mcp, _) = mcp_pending_outcome();
     let file = NamedTempFile::new().expect("sqlite file");
     let sqlite = exercise_http_gate(
@@ -517,4 +539,323 @@ async fn issue_4357_parity_same_request_same_outcome_on_both_backends() {
         mcp, pg,
         "#4357: MCP(sqlite) vs postgres HTTP outcome diverged"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Review round 2: resolver inheritance, tenant-scoped replay, provenance,
+// attestation ordering.
+// ---------------------------------------------------------------------------
+
+const VICTIM: &str = "ai:victim-4357";
+
+async fn reflect_as(router: &axum::Router, agent: &str, body: &Value) -> (StatusCode, Value) {
+    let r = Request::builder()
+        .method("POST")
+        .uri("/api/v1/memory_reflect")
+        .header("x-api-key", SHARED_KEY)
+        .header("x-agent-id", agent)
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(body).expect("serialise body"),
+        ))
+        .expect("build request");
+    let resp = router.clone().oneshot(r).await.expect("route");
+    let status = resp.status();
+    let bytes = to_bytes(resp.into_body(), 1 << 20).await.expect("body");
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+/// Parent standard states threshold 0; the child standard is well-formed but
+/// OMITS the field. A depth-1 reflect into the child must be parked, never
+/// applied: the omitted field is not a policy statement, so the ancestor's
+/// explicit value governs. `declared` binds the parent explicitly, otherwise
+/// the chain is the `/` hierarchy.
+async fn exercise_child_omits_field(
+    store: Arc<dyn MemoryStore>,
+    backend: StorageBackend,
+    sqlite_path: Option<&std::path::Path>,
+    declared: bool,
+) {
+    enforce_mode();
+    let ctx = CallerContext::for_agent(OWNER);
+    let parent = format!("p4357e/{}", uuid::Uuid::new_v4().simple());
+    let mut pstd = memory(&format!("{parent}/standards"), "parent standard");
+    pstd.metadata["governance"] = json!({"write": "any", "require_approval_above_depth": 0});
+    store.store(&ctx, &pstd).await.expect("pstd");
+    store
+        .set_namespace_standard(&ctx, &parent, &pstd.id, None)
+        .await
+        .expect("bind parent");
+    let child = format!("{parent}/child");
+    let mut cstd = memory(&format!("{child}/standards"), "child standard");
+    cstd.metadata["governance"] = json!({"write": "any", "promote": "any", "delete": "owner"});
+    store.store(&ctx, &cstd).await.expect("cstd");
+    let parent_arg = declared.then_some(parent.as_str());
+    store
+        .set_namespace_standard(&ctx, &child, &cstd.id, parent_arg)
+        .await
+        .expect("bind child");
+    let src = memory(&child, "child source");
+    store.store(&ctx, &src).await.expect("src");
+    assert_eq!(
+        store
+            .resolve_require_approval_above_depth(&child)
+            .await
+            .expect("resolve"),
+        Some(0),
+        "#4357: the child inherits the ancestor's explicit threshold"
+    );
+    let (router, _f) = build_router(backend, Arc::clone(&store), sqlite_path);
+    let (status, body) = reflect_http(&router, &gate_body(&src.id, &child)).await;
+    assert!(
+        body.get("id").is_none() && body["status"] == "pending",
+        "#4357: a child omitting the field escaped the ancestor threshold: {status} {body}"
+    );
+    assert_eq!(reflection_count(&store, &child).await, 0);
+}
+
+/// Parent states threshold 0; the child namespace has NO standard at all.
+async fn exercise_child_without_standard(
+    store: Arc<dyn MemoryStore>,
+    backend: StorageBackend,
+    sqlite_path: Option<&std::path::Path>,
+) {
+    enforce_mode();
+    let ctx = CallerContext::for_agent(OWNER);
+    let parent = format!("p4357n/{}", uuid::Uuid::new_v4().simple());
+    let mut pstd = memory(&format!("{parent}/standards"), "parent standard");
+    pstd.metadata["governance"] = json!({"write": "any", "require_approval_above_depth": 0});
+    store.store(&ctx, &pstd).await.expect("pstd");
+    store
+        .set_namespace_standard(&ctx, &parent, &pstd.id, None)
+        .await
+        .expect("bind parent");
+    let child = format!("{parent}/child");
+    let src = memory(&child, "child source");
+    store.store(&ctx, &src).await.expect("src");
+    let (router, _f) = build_router(backend, Arc::clone(&store), sqlite_path);
+    let (status, body) = reflect_http(&router, &gate_body(&src.id, &child)).await;
+    assert!(
+        body.get("id").is_none() && body["status"] == "pending",
+        "#4357: unbound child must inherit the ancestor threshold: {status} {body}"
+    );
+}
+
+/// An approved replay must be refused exactly where the direct path is: a
+/// hidden private row of another principal holding the same (title,
+/// namespace) must survive untouched.
+async fn exercise_replay_no_overwrite(
+    store: Arc<dyn MemoryStore>,
+    backend: StorageBackend,
+    sqlite_path: Option<&std::path::Path>,
+) {
+    enforce_mode();
+    let (ns, sid) = seed_namespace(
+        &store,
+        json!({"write": "any", "require_approval_above_depth": 0}),
+    )
+    .await;
+    let victim = CallerContext::for_agent(VICTIM);
+    let title = format!("victim private {}", uuid::Uuid::new_v4());
+    let mut vm = memory(&ns, "x");
+    vm.title.clone_from(&title);
+    vm.content = "VICTIM ORIGINAL CONTENT".into();
+    vm.metadata = json!({"agent_id": VICTIM});
+    let vid = store.store(&victim, &vm).await.expect("victim store");
+    let (router, _f) = build_router(backend, Arc::clone(&store), sqlite_path);
+    let (status, body) = reflect_as(
+        &router,
+        OWNER,
+        &json!({"source_ids": [sid], "title": title, "content": "REPLAY CONTENT",
+                "namespace": ns, "agent_id": OWNER}),
+    )
+    .await;
+    assert_eq!(body["status"], "pending", "{status} {body}");
+    let pid = body["pending_id"].as_str().expect("pending_id").to_string();
+    let approver = CallerContext::for_agent(APPROVER);
+    assert!(
+        store
+            .pending_decide(&approver, &pid, true, APPROVER)
+            .await
+            .expect("approve")
+    );
+    let exec = store.execute_pending_action(&approver, &pid).await;
+    let admin = CallerContext::for_admin("ai:operator");
+    let after = store.get(&admin, &vid).await.expect("victim row");
+    assert_eq!(
+        after.content, "VICTIM ORIGINAL CONTENT",
+        "#4357: the replay overwrote another principal's row (exec={exec:?})"
+    );
+    assert!(exec.is_err(), "#4357: the replay must be refused: {exec:?}");
+}
+
+/// The replayed reflection carries the substrate-stamped provenance of the
+/// requester's tenant write: a caller-forged `attest_level` never survives and
+/// the row is not stamped substrate-authored.
+async fn exercise_replay_provenance(
+    store: Arc<dyn MemoryStore>,
+    backend: StorageBackend,
+    sqlite_path: Option<&std::path::Path>,
+) {
+    enforce_mode();
+    let (ns, sid) = seed_namespace(
+        &store,
+        json!({"write": "any", "require_approval_above_depth": 0}),
+    )
+    .await;
+    let (router, _f) = build_router(backend, Arc::clone(&store), sqlite_path);
+    let mut body = gate_body(&sid, &ns);
+    body["metadata"] = json!({"attest_level": "agent_attested"});
+    let (status, resp) = reflect_http(&router, &body).await;
+    assert_eq!(resp["status"], "pending", "{status} {resp}");
+    let pid = resp["pending_id"].as_str().expect("pending_id").to_string();
+    let queued = store
+        .list_pending_actions(Some("pending"), 1000)
+        .await
+        .expect("list pending")
+        .into_iter()
+        .find(|p| p.id == pid)
+        .expect("queued row");
+    assert!(
+        queued.payload["metadata"].get("attest_level").is_none(),
+        "#4357: a caller attest_level must not ride the queued payload: {}",
+        queued.payload
+    );
+    let approver = CallerContext::for_agent(APPROVER);
+    assert!(
+        store
+            .pending_decide(&approver, &pid, true, APPROVER)
+            .await
+            .expect("approve")
+    );
+    let rid = store
+        .execute_pending_action(&approver, &pid)
+        .await
+        .expect("execute")
+        .expect("id");
+    let admin = CallerContext::for_admin("ai:operator");
+    let md = store.get(&admin, &rid).await.expect("reflection").metadata;
+    assert_ne!(
+        md["attest_level"], "agent_attested",
+        "#4357: forged level landed: {md}"
+    );
+    assert_ne!(
+        md["why_trace"], "substrate:system-authored",
+        "#4357: tenant reflection stamped substrate-authored: {md}"
+    );
+    assert_eq!(
+        md["agent_id"], OWNER,
+        "#4357: authorship stays the requester: {md}"
+    );
+}
+
+/// With the `why_trace` requirement engaged the direct reflect is refused; the
+/// approved replay of the same request must be refused too.
+async fn exercise_why_trace_replay(
+    store: Arc<dyn MemoryStore>,
+    backend: StorageBackend,
+    sqlite_path: Option<&std::path::Path>,
+) {
+    enforce_mode();
+    let (ns, sid) = seed_namespace(
+        &store,
+        json!({"write": "any", "require_approval_above_depth": 0}),
+    )
+    .await;
+    let (router, _f) = build_router(backend, Arc::clone(&store), sqlite_path);
+    let (status, resp) = reflect_http(&router, &gate_body(&sid, &ns)).await;
+    assert_eq!(resp["status"], "pending", "{status} {resp}");
+    let pid = resp["pending_id"].as_str().expect("pending_id").to_string();
+    let approver = CallerContext::for_agent(APPROVER);
+    assert!(
+        store
+            .pending_decide(&approver, &pid, true, APPROVER)
+            .await
+            .expect("approve")
+    );
+    // SAFETY: serialised by SERIAL; removed before the guard drops.
+    unsafe { std::env::set_var("AI_MEMORY_REQUIRE_WHY_TRACE", "1") };
+    let exec = store.execute_pending_action(&approver, &pid).await;
+    unsafe { std::env::remove_var("AI_MEMORY_REQUIRE_WHY_TRACE") };
+    assert!(
+        !matches!(exec, Ok(Some(_))),
+        "#4357: the approved replay bypassed the why_trace gate: {exec:?}"
+    );
+    assert_eq!(reflection_count(&store, &ns).await, 0);
+}
+
+/// Global-strict attestation refuses an unsigned tenant reflect BEFORE it is
+/// queued: no pending row, no 2xx.
+async fn exercise_strict_attest_before_queue(
+    store: Arc<dyn MemoryStore>,
+    backend: StorageBackend,
+    sqlite_path: Option<&std::path::Path>,
+) {
+    enforce_mode();
+    let (ns, sid) = seed_namespace(
+        &store,
+        json!({"write": "any", "require_approval_above_depth": 0}),
+    )
+    .await;
+    let (router, _f) = build_router(backend, Arc::clone(&store), sqlite_path);
+    // SAFETY: serialised by SERIAL; removed before the guard drops.
+    unsafe { std::env::set_var("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "1") };
+    let (status, resp) = reflect_http(&router, &gate_body(&sid, &ns)).await;
+    unsafe { std::env::remove_var("AI_MEMORY_REQUIRE_AGENT_ATTESTATION") };
+    assert!(
+        status.is_client_error() && resp["status"] != "pending",
+        "#4357: strict attestation must refuse before queueing: {status} {resp}"
+    );
+    let queued = store
+        .list_pending_actions(Some("pending"), 10_000)
+        .await
+        .expect("list pending")
+        .into_iter()
+        .filter(|p| p.namespace == ns)
+        .count();
+    assert_eq!(
+        queued, 0,
+        "#4357: nothing may be queued under strict attestation"
+    );
+}
+
+macro_rules! round2_cells {
+    ($($name:ident => $f:ident $(, $arg:expr)?;)*) => {$(
+        paste_cell!($name, $f $(, $arg)?);
+    )*};
+}
+
+macro_rules! paste_cell {
+    ($name:ident, $f:ident $(, $arg:expr)?) => {
+        mod $name {
+            use super::*;
+
+            #[tokio::test]
+            async fn issue_4357_sqlite() {
+                let _serial = SERIAL.lock().await;
+                let file = NamedTempFile::new().expect("sqlite file");
+                $f(sqlite_store(&file), StorageBackend::Sqlite, Some(file.path()) $(, $arg)?).await;
+            }
+
+            #[cfg(feature = "sal-postgres")]
+            #[tokio::test]
+            async fn issue_4357_postgres() {
+                let _serial = SERIAL.lock().await;
+                $f(pg_store().await, StorageBackend::Postgres, None $(, $arg)?).await;
+            }
+        }
+    };
+}
+
+round2_cells! {
+    issue_4357_child_omits_field_hierarchy => exercise_child_omits_field, false;
+    issue_4357_child_omits_field_declared_parent => exercise_child_omits_field, true;
+    issue_4357_child_without_standard_inherits => exercise_child_without_standard;
+    issue_4357_replay_no_overwrite_hidden_row => exercise_replay_no_overwrite;
+    issue_4357_replay_provenance => exercise_replay_provenance;
+    issue_4357_why_trace_replay_refused => exercise_why_trace_replay;
+    issue_4357_strict_attestation_refuses_before_queue => exercise_strict_attest_before_queue;
 }
