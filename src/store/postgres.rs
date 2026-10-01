@@ -28015,7 +28015,9 @@ impl MemoryStore for PostgresStore {
         // statement_timeout, pool-checkout failure, OR an ordinary concurrent
         // write landing between them could leave the archived-set and
         // deleted-set diverging → a row DELETEd that the archive-SELECT never
-        // captured = irrecoverable loss. One tx pins both to the same snapshot.
+        // captured = irrecoverable loss. One tx alone does not (READ COMMITTED
+        // re-evaluates each statement's predicate); #4329 locks the victim set
+        // up front and binds the archive copy and the DELETE to those ids.
         // v1.0.0 #3520 — routed through the shared bounded-retry funnel. This
         // funnel touches the same relation set as `run_gc` / `size_gc`
         // (archive-copy + link snapshot + cascade DELETE), so a concurrent
@@ -28089,8 +28091,8 @@ impl MemoryStore for PostgresStore {
                 // #1771 (5-agent vote 4d3ea1c5) — snapshot the to-be-deleted
                 // memories' `memory_links` into `archived_memory_links` BEFORE the
                 // cascade `DELETE FROM memories` reaps them (FK `ON DELETE
-                // CASCADE`). Reuse the IDENTICAL forget predicate as a victim
-                // subquery so the snapshot and the delete pin to the same row set
+                // CASCADE`). Bind the snapshot to the locked victim ids
+                // (#4329) so the snapshot and the delete pin to the same row set
                 // inside this one tx; idempotent via the PK `ON CONFLICT`. Postgres
                 // twin of the SQLite `archive_links_for_memory` snapshot.
                 //
@@ -30852,8 +30854,9 @@ impl MemoryStore for PostgresStore {
                 // hit this because `BEGIN IMMEDIATE` holds the single writer lock for
                 // the whole sweep; on postgres the id pin is the equivalent guarantee.
                 // Such a row is simply left for the next gc tick, which tombstones it
-                // properly. `archive = true` binds NULL and keeps the original
-                // predicate: that path is a recoverable MOVE with no erasure to pair.
+                // properly. Since #4330 the archive path is pinned to the same locked
+                // set (its archive copy, link snapshot and DELETE), so a late-expiring
+                // row is never deleted without its archive copy.
                 let evicted: Vec<(String, String)> = sqlx::query_as(
                     "DELETE FROM memories WHERE expires_at IS NOT NULL AND expires_at < $1 \
                        AND id = ANY($2) \
