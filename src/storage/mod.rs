@@ -858,6 +858,9 @@ pub(crate) fn escape_like_pattern(s: &str) -> String {
 // only the re-exports below form the public surface. The
 // `pub use storage as db;` shim in `src/lib.rs` preserves the
 // historical `crate::db::*` paths used elsewhere.
+/// v1.0.0 #4029 — `test-support` pause point in the federation admission
+/// funnels (after the negative forget-tombstone probe).
+pub mod admission_hook;
 pub(crate) mod connection;
 pub(crate) mod contamination_marker;
 pub(crate) use contamination_marker::StampAuthority;
@@ -6504,6 +6507,17 @@ pub const FORGET_TOMBSTONE_TRACE_TARGET: &str = "forget.tombstone";
 /// The one resurrection-guard drop message, shared across backends.
 pub const FORGET_TOMBSTONE_DROP_MSG: &str =
     "rejected inbound federation write for a forgotten id (resurrection guard)";
+
+/// v1.0.0 #4029 — the ONE audit line every resurrection-guard drop site
+/// emits (sqlite admission funnels + the postgres `tombstone_serial_4029`
+/// gate), so the target and message cannot drift between sites.
+pub(crate) fn log_forget_tombstone_drop(memory_id: &str) {
+    tracing::info!(
+        target: FORGET_TOMBSTONE_TRACE_TARGET,
+        memory_id = %memory_id,
+        "{FORGET_TOMBSTONE_DROP_MSG}"
+    );
+}
 
 /// `forget_tombstones` row exists)? The federation RECEIVE funnel consults
 /// this BEFORE accepting an inbound write so a peer that still holds a
@@ -17115,11 +17129,45 @@ fn canonical_archived_expiry(conn: &Connection, id: &str) -> Result<Option<Strin
 }
 
 pub fn restore_archived(conn: &Connection, id: &str) -> Result<bool> {
+    restore_archived_gated(conn, id, RestoreTombstoneGate::OperatorUnforget)
+}
+
+/// v1.0.0 #4029 — whether a restore honours the G30 forget tombstone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestoreTombstoneGate {
+    /// The OPERATOR un-forget (#1771 recoverable-delete contract): no gate.
+    OperatorUnforget,
+    /// An AUTOMATIC federated `restores[]` apply: a tombstoned id is a no-op.
+    Federated,
+}
+
+/// v1.0.0 #4029 (SEC, erasure) — the federated `restores[]` apply: the G30
+/// forget-tombstone gate runs INSIDE the restore's `BEGIN IMMEDIATE`, so a
+/// forget committing on another connection between a separate probe and the
+/// restore can no longer leave a restored LIVE row beside its tombstone (the
+/// pre-#4029 callers probed in their own autocommit statement first).
+/// Returns `Ok(false)` (the lane's no-op) for a tombstoned id.
+///
+/// # Errors
+///
+/// As [`restore_archived`].
+pub fn restore_archived_unless_tombstoned(conn: &Connection, id: &str) -> Result<bool> {
+    restore_archived_gated(conn, id, RestoreTombstoneGate::Federated)
+}
+
+fn restore_archived_gated(conn: &Connection, id: &str, gate: RestoreTombstoneGate) -> Result<bool> {
     crate::storage::record_stop::gate_storage_conn(conn)?;
     let now = Utc::now().to_rfc3339();
     let _erasure_guard = crate::erasure::archive_sync::coordination_lock_if_enabled(conn)?;
     let write_txn = connection::WriteTxn::begin(conn)?;
     let result = (|| -> Result<bool> {
+        if gate == RestoreTombstoneGate::Federated {
+            if memory_is_tombstoned(conn, id)? {
+                log_forget_tombstone_drop(id);
+                return Ok(false);
+            }
+            crate::storage::admission_hook::checkpoint(id);
+        }
         let exists: bool = conn
             .query_row(
                 "SELECT COUNT(*) > 0 FROM archived_memories WHERE id = ?1",
@@ -18354,18 +18402,8 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
     // degrade on this same funnel).
     consult_why_trace_gate_inbound(mem);
 
-    // v0.8.1 W2.3 (#1821 / gap G30) — resurrection guard. If this id has a
-    // FORGET tombstone, a peer that still holds the row is trying to revive it
-    // via LWW; DROP the inbound write (tombstone-wins) so the erasure holds.
-    // Idempotent no-op return (the row stays forgotten); logged for audit.
-    if memory_is_tombstoned(conn, &mem.id)? {
-        tracing::info!(
-            target: FORGET_TOMBSTONE_TRACE_TARGET,
-            memory_id = %mem.id,
-            "{FORGET_TOMBSTONE_DROP_MSG}"
-        );
-        return Ok(mem.id.clone());
-    }
+    // v0.8.1 W2.3 (#1821 / gap G30) — the resurrection guard runs INSIDE
+    // the write transaction below (#4029), not here: see `sealed_merge`.
 
     // v0.8.1 W1 (#1821 / gap G29) + #1844 — credential REDACT on the
     // federation RECEIVE funnel. ALWAYS redact, NEVER refuse: a refused
@@ -18448,15 +18486,35 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
     // two concerns is live (the federation receive loop wraps batches in its own
     // tx, whose lock already covers both). Neither concern live ⇒ byte-identical
     // legacy path.
-    let owns_tx = (crate::encryption::encryption_enabled(None)
-        || crate::config::append_only_enabled())
-        && conn.is_autocommit();
+    //
+    // v1.0.0 #4029 (SEC, erasure) — and the G30 forget-tombstone guard. The
+    // guard used to read `forget_tombstones` in its OWN autocommit statement
+    // before this transaction, so a forget / hard delete committing on
+    // another connection (the daemon's dedicated catch-up connection, a CLI
+    // process) between that negative read and the upsert left a LIVE row
+    // beside its tombstone — erased content resurrected. The read now runs
+    // after `BEGIN IMMEDIATE` has taken the database write lock, which every
+    // tombstone-writing erasure also takes, so the probe and the upsert are
+    // one serialized unit. The transaction is therefore taken whenever this
+    // call owns the connection; inside a caller's transaction the probe and
+    // the upsert already share that (serializable) transaction.
+    let owns_tx = conn.is_autocommit();
     let write_txn = if owns_tx {
         Some(connection::WriteTxn::begin(conn)?)
     } else {
         None
     };
     let sealed_merge = (|| -> Result<String> {
+        // v0.8.1 W2.3 (#1821 / gap G30) — resurrection guard. If this id has a
+        // FORGET tombstone, a peer that still holds the row is trying to revive
+        // it via LWW; DROP the inbound write (tombstone-wins) so the erasure
+        // holds. Idempotent no-op return (the row stays forgotten); logged for
+        // audit. #4029 — under the write lock (see `owns_tx`).
+        if memory_is_tombstoned(conn, &mem.id)? {
+            log_forget_tombstone_drop(&mem.id);
+            return Ok(mem.id.clone());
+        }
+        crate::storage::admission_hook::checkpoint(&mem.id);
         // #2954 — armed-only pre-image of the `(title, namespace)` row this
         // upsert may overwrite. `None` when the spine is OFF (byte-identical) or
         // no prior row exists. Read under the `BEGIN IMMEDIATE` write lock above
@@ -18677,6 +18735,14 @@ pub fn merge_inbound(
     // `consolidate` / `size_gc`).
     let write_txn = connection::WriteTxn::begin(conn)?;
     let tx_result = (|| -> Result<Option<String>> {
+        // v1.0.0 #4029 — the G30 resurrection guard, under this write lock
+        // (postgres `merge_inbound` parity: the guard runs before any merge).
+        // A forgotten id is dropped whole — never merged, never re-inserted.
+        if memory_is_tombstoned(conn, &inbound.id)? {
+            log_forget_tombstone_drop(&inbound.id);
+            return Ok(Some(inbound.id.clone()));
+        }
+        crate::storage::admission_hook::checkpoint(&inbound.id);
         // Boids item 3 R2.2 (#3905) — `get_any`, not `get`: `get` hides
         // system-only rows, so a contaminated local row fell through to the
         // insert lane instead of reaching `merge_memory` (whose R2.1

@@ -60,6 +60,88 @@
 //! These are the convergence properties a CRDT needs: peers that
 //! receive the same set of replicas in any order reach the same state.
 //!
+//! **What makes the associativity claim true (v1.0.0 #4030 / #4031):**
+//! every timestamp is ordered by INSTANT, never by string
+//! ([`super::crdt_field_clock::temporal_cmp`]), so the content winner and
+//! the stamped `updated_at` always agree; and a value RETAINED from an
+//! operand the other side lacked keeps its OWN version (the per-path
+//! clocks in `metadata.crdt_field_clocks`) instead of inheriting the merged
+//! row's newer clock. **Documented exceptions:** the node-local fields
+//! (`agent_id`, `governance`, `valid_from`, `cid`, the node-local metadata
+//! keys, the containment lifecycle overlay) are local-wins by design, and an
+//! exactly-equal `(updated_at, attest_rank)` pair with different content is
+//! the #344 same-clock residual. **Bounded (#4032):** the tag union and the
+//! metadata join are capped at the replicated-state limits every receiver
+//! validates against; past a cap the join degrades deterministically (see
+//! `merge_tags` / `merge_memory`), WARNed on [`CRDT_BOUND_TRACE_TARGET`].
+//! The tag bound ("the k smallest of the union") is itself a join, so it
+//! stays associative. The METADATA bound is NOT: its fallback (the row-LWW
+//! winner's ordinary keys) depends on which intermediate join first crossed
+//! the byte cap, so replicas that join over-cap rows in different orders can
+//! keep different subsets of the LOSING operands' disjoint keys. That is the
+//! documented residual of a byte-bounded map (sizes differ per key, so no
+//! byte-bounded selection is a join); it is reachable only past the 512 KiB
+//! replicated cap, every drop is WARNed and the pre-merge row survives in the
+//! `federation_merge` archive snapshot. The visibility keys
+//! (`VISIBILITY_METADATA_KEYS`) are exempt from the fallback and always
+//! resolve through the full per-path join, so the residual never changes who
+//! can read a row.
+//!
+//! **Equal-clock residuals (extend #344; stated precisely).** Every claim
+//! above is for operands with DISTINCT `(updated_at, attest_rank)`. The `id`
+//! tie-break is inert inside `merge_memory` (both operands share the id), so
+//! at an exactly equal `(updated_at, attest_rank)`:
+//! * the metadata bounded fallback is NOT commutative — neither side "wins"
+//!   the row-LWW order, so the LOCAL operand's ordinary keys are kept in
+//!   both argument orders (`L@5{k1}` vs `R@5{k2}` keeps `k1` on L's node and
+//!   `k2` on R's);
+//! * an object/scalar flip at the same microsecond is not associative (the
+//!   flip is decided by `(version, rank, fingerprint)`, and which floor is
+//!   recorded depends on grouping);
+//! * the visibility keys fail CLOSED at a tie: at an equal VERSION an absence
+//!   beats any presence, whatever the attestation rank of either row, and two
+//!   different PRESENT `scope` values resolve to the NARROWER one (an
+//!   unrecognised or non-string value, then `private`, `team`, `unit`, `org`,
+//!   and `collective` / the legacy broad set last), so an equal-microsecond
+//!   `private` vs `collective` ends private in every grouping; only the
+//!   agent-id keys, which have no narrowness order, fall to the value
+//!   fingerprint (deterministic, not "most restrictive"). The visibility
+//!   register compares `(version, narrowness, fingerprint)` and never the rank
+//!   because the rank is read from the MERGED row's `attest_level`: a value
+//!   that landed in an attested row would carry rank 1 into the next merge and
+//!   the verdict would then depend on the merge grouping (f2r, rank
+//!   laundering; cell
+//!   `pure_visibility_register_never_fails_open_by_grouping_rank_laundering`).
+//!   The register applies to EVERY value shape: an object at a visibility key
+//!   is an opaque register value, never routed to the generic join (r11 F1:
+//!   there a one-sided presence survives and a later scalar beats the object);
+//! * the same rank laundering leaves an associativity residual for the
+//!   NON-visibility keys at an equal clock: with `a = {u:20, k:"x"}`,
+//!   `b = {u:20, attested}` and `c = {u:21, k:"y", leaf /k@20}`, `(a|b)|c`
+//!   keeps `"x"` while the other groupings keep `"y"`. Ordinary data only, it
+//!   never changes who can read a row.
+//!
+//! **Share revocation by an unrelated newer row (availability, fail closed).**
+//! A MISSING visibility key is dated at its row's clock, so any peer row newer
+//! than a share's own version revokes that share even when the peer never
+//! received it: local `{u:34, target_agent_id:"bob"@22, scope:"collective"@22}`
+//! merged with `{u:31, note:"y"}` loses both keys in both orders (plain
+//! row-LWW would have kept them). This is the design: an absence is a
+//! statement "as of this clock", so the merge can only narrow, never widen.
+//! It is operator-visible: a share made on one node can be revoked by an
+//! unrelated concurrent edit on a node that never saw it. To recover, the
+//! owner re-shares (a new write of `scope` / `target_agent_id` carries a fresh
+//! version that beats every older absence).
+//!
+//! **Clock-map bytes are not convergent.** The merged VALUES converge; the
+//! reserved `metadata.crdt_field_clocks` object can differ in BYTES between
+//! replicas that joined the same rows in different groupings:
+//! a leaf is recorded only when a retained value is older than that join's
+//! row clock, and floors are recorded per join. Anything that compares whole
+//! metadata objects to detect a USER edit (for example the #4216 merge
+//! version bump) MUST exclude `crdt_field_clocks` and `version_vector`, or it
+//! will report a change no user made.
+//!
 //! ## Metadata sub-rules (#224 + Task 1.8 #196)
 //!
 //! `metadata` is a deep JSON merge (objects merge key-wise recursively;
@@ -68,8 +150,14 @@
 //!
 //! * `metadata.agent_id` — **immutable, original (`local`) wins**
 //!   (NHI provenance is write-once; a peer must not rewrite it).
-//! * `metadata.scope` — **LWW by `(updated_at, id)`** (a conscious
-//!   visibility change, like `title`).
+//! * `metadata.scope`, `metadata.target_agent_id`,
+//!   `metadata.recipient_agent_id` (the visibility keys) — per-key LWW by the
+//!   key's own version (#4031), where ABSENCE is a versioned value too (f2r
+//!   review): an owner makes a row private by dropping `scope` and revokes a
+//!   share by dropping `target_agent_id`, so a NEWER absence beats an OLDER
+//!   presence. This is the one deliberate exception to "absence is never a
+//!   deletion": preserving a stale visibility value would re-widen a row its
+//!   owner narrowed.
 //! * `metadata.governance` — **keep `local`'s** (owner-only override; a
 //!   merge must never let a peer rewrite governance).
 //! * `metadata.version_vector` — **pointwise-max [`VectorClock`] merge**
@@ -81,6 +169,7 @@
 
 use serde_json::{Map, Value};
 
+use super::crdt_field_clock::FieldClockMerge;
 use super::crdt_primitives::{OrSet, PnCounter};
 use super::field_names;
 use super::link::VectorClock;
@@ -302,10 +391,11 @@ fn merge_counter<T: PartialOrd + Clone>(local: T, remote: T) -> T {
 /// property (it is a deterministic function of each operand) while
 /// preventing a same-`updated_at` unsigned edit from clobbering a
 /// locally-attested row by `id` manipulation.
-fn lww_updated_at_key(m: &Memory) -> String {
-    chrono::DateTime::parse_from_rfc3339(&m.updated_at)
-        .map(|dt| crate::validate::render_canonical_utc(dt.with_timezone(&chrono::Utc)))
-        .unwrap_or_else(|_| m.updated_at.clone())
+fn lww_updated_at_key(m: &Memory) -> Option<chrono::DateTime<chrono::Utc>> {
+    // #4030 — the SAME instant order the merged `updated_at` is chosen by
+    // ([`super::crdt_field_clock::later`]), so the content winner and the
+    // stamped clock can never disagree.
+    super::crdt_field_clock::instant_of(&m.updated_at)
 }
 
 fn remote_wins_lww(local: &Memory, remote: &Memory) -> bool {
@@ -330,36 +420,38 @@ fn lww<T: Clone>(local: &Memory, remote: &Memory, local_val: &T, remote_val: &T)
     }
 }
 
-/// "Prefer non-null, else LWW" pick for an `Option` field (#224
-/// provenance / structural fields): a present value beats absence
-/// (preservation over loss); when BOTH are present, the
-/// `(updated_at, attest_rank, id)` LWW winner's value is taken; when both
-/// are absent the result is absent. Deterministic + commutative because the
-/// both-present branch defers to the symmetric LWW order.
-fn prefer_non_null_else_lww<T: Clone>(
-    local: &Memory,
-    remote: &Memory,
-    local_val: &Option<T>,
-    remote_val: &Option<T>,
-) -> Option<T> {
-    match (local_val, remote_val) {
-        (Some(_), Some(_)) => lww(local, remote, local_val, remote_val),
-        (Some(_), None) => local_val.clone(),
-        (None, Some(_)) => remote_val.clone(),
-        (None, None) => None,
-    }
-}
-
 /// `tags` union with a deterministic, stable order: preserve `local`'s
 /// order first, then append the `remote` tags not already seen. Dedup
 /// is exact-string. The result is independent of argument order *as a
 /// set* (the merge is commutative on tag membership); the surface
 /// ordering is local-first by design and is asserted as a set in the
 /// commutativity test.
+///
+/// #4032 — the union is BOUNDED by the replicated-state tag cap
+/// ([`crate::validate::MAX_REPLICATED_TAGS`], the cap every full-row
+/// receiver validates against), so a joined row can always be relayed.
+/// Past the cap the join keeps the cap-many lexicographically SMALLEST tags:
+/// "the k smallest of a union" is itself a join (commutative, associative,
+/// idempotent), so replicas still converge; the drop is WARNed loudly and
+/// the pre-merge row stays in the `federation_merge` archive snapshot.
 fn merge_tags(local: &[String], remote: &[String]) -> Vec<String> {
-    OrSet::new(local.to_vec())
+    let mut union = OrSet::new(local.to_vec())
         .merge(&OrSet::new(remote.to_vec()))
-        .into_inner()
+        .into_inner();
+    let cap = crate::validate::MAX_REPLICATED_TAGS;
+    if union.len() > cap {
+        let joined = union.len();
+        union.sort();
+        union.truncate(cap);
+        tracing::warn!(
+            target: CRDT_BOUND_TRACE_TARGET,
+            joined,
+            cap,
+            "crdt merge: tag union exceeds the replicated-state cap; keeping the {cap} \
+             lexicographically smallest tags (#4032 bounded join)"
+        );
+    }
+    union
 }
 
 /// `tier` resolution (#224): **max durability** on the total order
@@ -387,169 +479,241 @@ fn merge_tier(local: &super::memory::Tier, remote: &super::memory::Tier) -> supe
 
 /// `expires_at` resolution (#224): **null = never expires, so null WINS
 /// over any non-null** (preservation over loss); when both are present,
-/// the later (lexically-greater RFC3339) expiry wins. RFC3339 strings
-/// in UTC compare lexically in chronological order, matching the
-/// substrate's existing `gc()` string-comparison contract.
+/// the later expiry wins — by INSTANT (#4030: a raw-string compare
+/// mis-orders offset renderings), keeping the winner's original bytes.
 fn merge_expires_at(local: &Option<String>, remote: &Option<String>) -> Option<String> {
     match (local, remote) {
         // Either side immortal ⇒ result immortal (null wins).
         (None, _) | (_, None) => None,
-        (Some(l), Some(r)) => {
-            if r > l {
-                Some(r.clone())
-            } else {
-                Some(l.clone())
-            }
-        }
+        (Some(l), Some(r)) => Some(super::crdt_field_clock::later(l, r).to_string()),
     }
 }
 
-/// Deep JSON merge of two `metadata` objects (#224 `metadata` rule,
-/// pre-override pass):
-///
-/// * two objects merge key-wise, recursing on keys present in both;
-/// * a key present on only one side is preserved (unknown keys kept);
-/// * a non-object collision (or object-vs-scalar) falls back to LWW by
-///   `(updated_at, id)` via the `remote_wins` flag.
-///
-/// The three metadata sub-rules (`agent_id` immutable→local, `scope`
-/// LWW, `governance`→local) are NOT applied here; [`merge_memory`]
-/// applies them on the top-level object after this deep merge so the
-/// recursion stays a generic value reconciler.
-fn deep_merge_json(local: &Value, remote: &Value, remote_wins: bool) -> Value {
-    match (local, remote) {
-        (Value::Object(lmap), Value::Object(rmap)) => {
-            let mut merged: Map<String, Value> = lmap.clone();
-            for (key, rval) in rmap {
-                match merged.get(key) {
-                    Some(lval) => {
-                        let combined = deep_merge_json(lval, rval, remote_wins);
-                        merged.insert(key.clone(), combined);
-                    }
-                    None => {
-                        merged.insert(key.clone(), rval.clone());
-                    }
-                }
-            }
-            Value::Object(merged)
-        }
-        // Non-object collision: LWW by the caller-supplied tiebreak.
-        _ => {
-            if remote_wins {
-                remote.clone()
-            } else {
-                local.clone()
-            }
-        }
+/// Pre-#4031 whole-value fallback for a MALFORMED (non-object) metadata
+/// operand: the row-level LWW winner's value is taken whole. The substrate's
+/// `metadata` is always an object (`{}` by default, and the validator refuses
+/// anything else), so this arm exists only so a corrupt row still merges.
+fn lww_whole_value(local: &Value, remote: &Value, remote_wins: bool) -> Value {
+    if remote_wins {
+        remote.clone()
+    } else {
+        local.clone()
     }
 }
 
-/// Resolve `metadata`: deep JSON merge, then apply the three #224
-/// sub-rules on the top-level object (`agent_id` immutable→local,
-/// `scope` LWW, `governance`→local).
-fn merge_metadata(local: &Memory, remote: &Memory) -> Value {
-    let remote_wins = remote_wins_lww(local, remote);
-    let mut merged = deep_merge_json(&local.metadata, &remote.metadata, remote_wins);
+/// Top-level metadata keys NOT resolved by the generic per-key LWW-element
+/// map: each has its own rule, applied below (the node-local keys are added
+/// from [`NODE_LOCAL_METADATA_KEYS`]).
+const SPECIAL_METADATA_KEYS: [&str; 4] = [
+    param_names::AGENT_ID,
+    field_names::GOVERNANCE,
+    field_names::VERSION_VECTOR,
+    field_names::CRDT_FIELD_CLOCKS,
+];
 
-    // The three sub-rules only have meaning when the merged result is an
-    // object (the substrate's `metadata` is always an object — `{}` by
-    // default — but a malformed scalar metadata falls through the deep
-    // merge as an LWW scalar, in which case the keys do not apply).
-    if let Value::Object(map) = &mut merged {
-        // agent_id — immutable, original (local) wins. Write-once NHI
-        // provenance (Task 1.8 #196): a peer must never rewrite it.
-        match local.metadata.get(param_names::AGENT_ID) {
-            Some(local_agent) => {
-                map.insert(param_names::AGENT_ID.to_string(), local_agent.clone());
-            }
-            None => {
-                // Local never had agent_id; a remote-introduced agent_id
-                // is NOT provenance the local row authored, so drop it to
-                // honour "original wins" (absence is the original).
-                map.remove(param_names::AGENT_ID);
-            }
+/// The metadata keys the visibility gate reads (`crate::visibility`): the
+/// scope arm and the private arm's inbox-target / legacy-recipient grants.
+/// The #4032 bounded fallback still resolves them through the full per-path
+/// join, so a bounded merge never widens who can read a row.
+const VISIBILITY_METADATA_KEYS: [&str; 3] = [
+    crate::META_KEY_SCOPE,
+    crate::META_KEY_TARGET_AGENT_ID,
+    crate::META_KEY_RECIPIENT_AGENT_ID,
+];
+
+/// Resolve `metadata` (#224 + #4031).
+///
+/// Every ordinary key — at any depth — is an LWW-element-map entry resolved
+/// by its OWN version ([`super::crdt_field_clock`]): a key present on one
+/// side survives with the clock it was written at (never the merged row's
+/// newer clock), a collision takes the newer version, objects merge
+/// key-wise. `scope` is such an ordinary key (LWW, a conscious visibility
+/// edit). Then the special keys: `agent_id` immutable→local, `governance`
+/// →local, `version_vector` pointwise-max, the node-local keys →local, and
+/// the rebuilt [`field_names::CRDT_FIELD_CLOCKS`] map.
+fn merge_metadata(
+    local: &Memory,
+    remote: &Memory,
+    clocks: &mut FieldClockMerge,
+    bounded: bool,
+) -> Value {
+    let (Value::Object(lmap), Value::Object(rmap)) = (&local.metadata, &remote.metadata) else {
+        return lww_whole_value(
+            &local.metadata,
+            &remote.metadata,
+            remote_wins_lww(local, remote),
+        );
+    };
+    let skip: Vec<&str> = SPECIAL_METADATA_KEYS
+        .iter()
+        .copied()
+        .chain(NODE_LOCAL_METADATA_KEYS)
+        .collect();
+    // #4032 bounded fallback: the row-LWW loser contributes no ordinary key —
+    // EXCEPT the authorization-bearing visibility keys, which always resolve
+    // through the full per-path join so the bounded fallback can never make a
+    // row visible to anyone the unbounded join would not (a retained older
+    // `scope=collective` on the winner must still lose to the loser's newer
+    // `scope=private`).
+    let loser_visibility = |m: &Map<String, Value>| -> Map<String, Value> {
+        VISIBILITY_METADATA_KEYS
+            .iter()
+            .filter_map(|k| m.get(*k).map(|v| ((*k).to_string(), v.clone())))
+            .collect()
+    };
+    let (l_bounded, r_bounded);
+    let (lgen, rgen) = match (bounded, remote_wins_lww(local, remote)) {
+        (false, _) => (lmap, rmap),
+        (true, true) => {
+            l_bounded = loser_visibility(lmap);
+            (&l_bounded, rmap)
         }
-
-        // scope — LWW by (updated_at, id), a conscious visibility edit.
-        let local_scope = local.metadata.get(param_names::SCOPE);
-        let remote_scope = remote.metadata.get(param_names::SCOPE);
-        let scope_winner = match (local_scope, remote_scope) {
-            (Some(_), Some(_)) => {
-                if remote_wins {
-                    remote_scope
-                } else {
-                    local_scope
-                }
-            }
-            (Some(_), None) => local_scope,
-            (None, Some(_)) => remote_scope,
-            (None, None) => None,
-        };
-        match scope_winner {
-            Some(v) => {
-                map.insert(param_names::SCOPE.to_string(), v.clone());
-            }
-            None => {
-                map.remove(param_names::SCOPE);
-            }
+        (true, false) => {
+            r_bounded = loser_visibility(rmap);
+            (lmap, &r_bounded)
         }
+    };
+    let mut map = clocks.merge_metadata_keys(lgen, rgen, &skip, &VISIBILITY_METADATA_KEYS);
 
-        // governance — keep local's (owner-only override; a merge must
-        // not let a peer rewrite governance).
-        match local.metadata.get(field_names::GOVERNANCE) {
-            Some(local_gov) => {
-                map.insert(field_names::GOVERNANCE.to_string(), local_gov.clone());
-            }
-            None => {
-                map.remove(field_names::GOVERNANCE);
-            }
-        }
+    // agent_id — immutable, original (local) wins. Write-once NHI
+    // provenance (Task 1.8 #196): a peer must never rewrite it. Local never
+    // had one ⇒ absent (a remote-introduced agent_id is NOT provenance the
+    // local row authored; absence is the original).
+    if let Some(local_agent) = lmap.get(param_names::AGENT_ID) {
+        map.insert(param_names::AGENT_ID.to_string(), local_agent.clone());
+    }
 
-        // version_vector — per-memory CRDT vector clock (#1756 / #1719
-        // item 2). MUST merge by pointwise-max (`VectorClock::merge`), NOT
-        // the `deep_merge_json` above: a deep merge resolves a per-peer
-        // timestamp collision by row-level LWW (`(updated_at, attest_rank,
-        // id)`), which would silently DISCARD a peer observation the
-        // LWW-losing row carried — corrupting the clock (the 5-agent vote
-        // 4d3ea1c5 correctness finding). The pointwise-max join keeps the
-        // later timestamp per peer regardless of which row won the row-LWW,
-        // preserving the commutative/associative/idempotent semilattice.
-        // Carried + merged only (ship-but-don't-gate, #1709 / 0623aebf):
-        // the clock advances and converges, but is NOT yet read to gate a
-        // dominant-side discard. Absent on both sides ⇒ key stays absent
-        // (the empty clock is the minimal element).
-        let mut merged_vc = parse_version_vector(&local.metadata);
-        merged_vc.merge(&parse_version_vector(&remote.metadata));
-        if merged_vc.entries.is_empty() {
-            map.remove(field_names::VERSION_VECTOR);
-        } else if let Ok(vc_value) = serde_json::to_value(&merged_vc) {
-            map.insert(field_names::VERSION_VECTOR.to_string(), vc_value);
-        }
+    // governance — keep local's (owner-only override; a merge must not let
+    // a peer rewrite governance).
+    if let Some(local_gov) = lmap.get(field_names::GOVERNANCE) {
+        map.insert(field_names::GOVERNANCE.to_string(), local_gov.clone());
+    }
 
-        // v0.9.0 G7 (#1824) — the three `contradiction_*` markers are
-        // node-local: they encode a LOCAL conserve decision + soft
-        // down-weight and MUST NOT leak to — or arrive from — a peer, or a
-        // peer's re-entry gate in `autonomy::forget_if_superseded` would
-        // trip on a marker it never authored (and a remote could otherwise
-        // silently soft-down-weight a local row). LOCAL wins: keep local's
-        // value, drop any remote-introduced key.
-        //
-        // Boids item 3 R2.3 (#3266) — the #3324 `contamination` marker is
-        // node-local by the SAME rule: a local taint's marker (its restore
-        // anchor) survives a peer write, and a peer's marker is never adopted.
-        for key in NODE_LOCAL_METADATA_KEYS {
-            match local.metadata.get(key) {
-                Some(local_val) => {
-                    map.insert(key.to_string(), local_val.clone());
-                }
-                None => {
-                    map.remove(key);
-                }
-            }
+    // version_vector — per-memory CRDT vector clock (#1756 / #1719 item 2).
+    // MUST merge by pointwise-max (`VectorClock::merge`): a per-peer
+    // timestamp collision resolved by any LWW would DISCARD a peer
+    // observation the losing row carried (the 5-agent vote 4d3ea1c5
+    // finding). Carried + merged only (ship-but-don't-gate, #1709 /
+    // 0623aebf). Absent on both sides ⇒ key stays absent.
+    let mut merged_vc = parse_version_vector(&local.metadata);
+    merged_vc.merge(&parse_version_vector(&remote.metadata));
+    if !merged_vc.entries.is_empty()
+        && let Ok(vc_value) = serde_json::to_value(&merged_vc)
+    {
+        map.insert(field_names::VERSION_VECTOR.to_string(), vc_value);
+    }
+
+    // v0.9.0 G7 (#1824) — the three `contradiction_*` markers are node-local:
+    // they encode a LOCAL conserve decision + soft down-weight and MUST NOT
+    // leak to — or arrive from — a peer, or a peer's re-entry gate in
+    // `autonomy::forget_if_superseded` would trip on a marker it never
+    // authored. LOCAL wins: keep local's value, drop any remote-introduced
+    // key. Boids item 3 R2.3 (#3266) — the #3324 `contamination` marker is
+    // node-local by the SAME rule.
+    for key in NODE_LOCAL_METADATA_KEYS {
+        if let Some(local_val) = lmap.get(key) {
+            map.insert(key.to_string(), local_val.clone());
         }
     }
 
-    merged
+    Value::Object(map)
+}
+
+/// Tracing target of the #4032 bounded-join WARNs (tags / metadata past the
+/// replicated-state caps).
+pub const CRDT_BOUND_TRACE_TARGET: &str = "crdt.bounded_join";
+
+/// The fields [`merge_memory`] resolves through the #4031 per-field clocks.
+struct ClockedFields {
+    metadata: Value,
+    valid_until: Option<String>,
+    entity_id: Option<String>,
+    persona_version: Option<i32>,
+    citations: Vec<super::memory::Citation>,
+    source_uri: Option<String>,
+    source_span: Option<super::memory::SourceSpan>,
+    confidence_signals: Option<super::memory::ConfidenceSignals>,
+    confidence_decayed_at: Option<String>,
+}
+
+/// #4032 — does a joined `metadata` exceed the replicated-state size cap
+/// (the bound every full-row receiver validates against)?
+fn metadata_exceeds_replicated_cap(metadata: &Value) -> bool {
+    // An unserializable value counts as over the cap (take the bounded
+    // fallback rather than persist something unmeasurable).
+    !serde_json::to_string(metadata)
+        .is_ok_and(|s| s.len() <= crate::validate::MAX_REPLICATED_METADATA_SIZE)
+}
+
+/// Resolve `metadata` and the optional provenance fields through ONE
+/// [`FieldClockMerge`] (#4031). `bounded` (#4032) drops the row-LWW LOSER's
+/// ordinary metadata keys — the deterministic fallback when the full join
+/// would exceed the replicated cap.
+fn resolve_clocked_fields(local: &Memory, remote: &Memory, bounded: bool) -> ClockedFields {
+    let mut clocks = FieldClockMerge::new(
+        &local.metadata,
+        &local.updated_at,
+        attest_rank(local),
+        &remote.metadata,
+        &remote.updated_at,
+        attest_rank(remote),
+    );
+    let mut metadata = merge_metadata(local, remote, &mut clocks, bounded);
+    let valid_until = clocks.merge_opt(
+        field_names::VALID_UNTIL,
+        &local.valid_until,
+        &remote.valid_until,
+    );
+    let entity_id = clocks.merge_opt(field_names::ENTITY_ID, &local.entity_id, &remote.entity_id);
+    let persona_version = clocks.merge_opt(
+        field_names::PERSONA_VERSION,
+        &local.persona_version,
+        &remote.persona_version,
+    );
+    // An empty `citations` vec is "absent" (a peer carrying fact-provenance
+    // is not clobbered by a row that recorded none).
+    let non_empty = |c: &Vec<super::memory::Citation>| (!c.is_empty()).then(|| c.clone());
+    let citations = clocks
+        .merge_opt(
+            param_names::CITATIONS,
+            &non_empty(&local.citations),
+            &non_empty(&remote.citations),
+        )
+        .unwrap_or_default();
+    let source_uri = clocks.merge_opt(
+        field_names::SOURCE_URI,
+        &local.source_uri,
+        &remote.source_uri,
+    );
+    let source_span = clocks.merge_opt(
+        field_names::SOURCE_SPAN,
+        &local.source_span,
+        &remote.source_span,
+    );
+    let confidence_signals = clocks.merge_opt(
+        field_names::CONFIDENCE_SIGNALS,
+        &local.confidence_signals,
+        &remote.confidence_signals,
+    );
+    let confidence_decayed_at = clocks.merge_opt(
+        field_names::CONFIDENCE_DECAYED_AT,
+        &local.confidence_decayed_at,
+        &remote.confidence_decayed_at,
+    );
+    if let (Some(clock_map), Value::Object(map)) = (clocks.finish(), &mut metadata) {
+        map.insert(field_names::CRDT_FIELD_CLOCKS.to_string(), clock_map);
+    }
+    ClockedFields {
+        metadata,
+        valid_until,
+        entity_id,
+        persona_version,
+        citations,
+        source_uri,
+        source_span,
+        confidence_signals,
+        confidence_decayed_at,
+    }
 }
 
 /// v0.8.0 Pillar-3 (#1709 / #224) — pure, deterministic CRDT-lite merge
@@ -563,13 +727,45 @@ fn merge_metadata(local: &Memory, remote: &Memory) -> Value {
 /// merge rule is chosen for it.
 ///
 /// Pure: no I/O, no clock reads. Commutative + associative (up to the
-/// `(updated_at, id)` LWW total order) + idempotent.
+/// `(updated_at, id)` LWW total order) + idempotent — except past the #4032
+/// metadata byte cap, where the bounded fallback is commutative (for distinct
+/// `(updated_at, attest_rank)`) but not associative (see the module docs).
 #[must_use]
 pub fn merge_memory(local: &Memory, remote: &Memory) -> Memory {
     debug_assert_eq!(
         local.id, remote.id,
         "merge_memory precondition: both operands must carry the same id"
     );
+
+    // #4031 — per-field clocks: every retained metadata value and optional
+    // field keeps the version it was written at, never the merged row's.
+    // #4032 — the joined metadata is bounded by the REPLICATED-state cap the
+    // receivers validate against; past it the join degrades deterministically
+    // to the row-LWW winner's metadata (commutative for distinct clocks, never
+    // unrelayable; see the module docs for the equal-clock residual).
+    let mut clocked = resolve_clocked_fields(local, remote, false);
+    if metadata_exceeds_replicated_cap(&clocked.metadata) {
+        tracing::warn!(
+            target: CRDT_BOUND_TRACE_TARGET,
+            memory_id = %local.id,
+            cap = crate::validate::MAX_REPLICATED_METADATA_SIZE,
+            "crdt merge: joined metadata exceeds the replicated-state cap; keeping the \
+             row-LWW winner's metadata (the loser's disjoint keys stay in the \
+             pre-merge archive snapshot) (#4032 bounded join)"
+        );
+        clocked = resolve_clocked_fields(local, remote, true);
+    }
+    let ClockedFields {
+        metadata,
+        valid_until,
+        entity_id,
+        persona_version,
+        citations,
+        source_uri,
+        source_span,
+        confidence_signals,
+        confidence_decayed_at,
+    } = clocked;
 
     Memory {
         // `id` — equality (precondition above). Both args share it; take
@@ -591,15 +787,10 @@ pub fn merge_memory(local: &Memory, remote: &Memory) -> Memory {
         // `valid_until = Some(T)`) would merge to the local OPEN value (`None`)
         // and replicas would DIVERGE on VALID-time (a `valid_at` recall on the
         // receiver would keep returning the closed claim as still-asserted).
-        // `prefer_non_null_else_lww` also preserves a close against a stale
-        // remote reopen-to-`None` (present beats absent), so a close is sticky.
+        // Present beats absent, so a close is sticky against a stale remote
+        // reopen-to-`None`; #4031 — with the close's OWN clock.
         valid_from: local.valid_from.clone(),
-        valid_until: prefer_non_null_else_lww(
-            local,
-            remote,
-            &local.valid_until,
-            &remote.valid_until,
-        ),
+        valid_until,
         // `tier` — max durability (short < mid < long); never downgrade.
         tier: merge_tier(&local.tier, &remote.tier),
         // `namespace` — LWW by updated_at (tiebreak id).
@@ -618,19 +809,15 @@ pub fn merge_memory(local: &Memory, remote: &Memory) -> Memory {
         source: lww(local, remote, &local.source, &remote.source),
         // `access_count` — max (PN-Counter).
         access_count: merge_counter(local.access_count, remote.access_count),
-        // `created_at` — min (earliest creation). RFC3339 UTC strings
-        // compare lexically in chronological order.
-        created_at: if remote.created_at < local.created_at {
-            remote.created_at.clone()
-        } else {
-            local.created_at.clone()
-        },
-        // `updated_at` — max (latest update).
-        updated_at: if remote.updated_at > local.updated_at {
-            remote.updated_at.clone()
-        } else {
-            local.updated_at.clone()
-        },
+        // `created_at` — min (earliest creation), by INSTANT (#4030); the
+        // winner keeps its original (signed) bytes.
+        created_at: super::crdt_field_clock::earlier(&local.created_at, &remote.created_at)
+            .to_string(),
+        // `updated_at` — max (latest update), by the SAME instant order the
+        // content LWW uses (#4030): the merged row's clock can never regress
+        // below the content it carries.
+        updated_at: super::crdt_field_clock::later(&local.updated_at, &remote.updated_at)
+            .to_string(),
         // `last_accessed_at` — max; absence is the floor, so a present
         // value beats None (prefer-non-null), and on both-present the
         // later stamp wins.
@@ -638,48 +825,22 @@ pub fn merge_memory(local: &Memory, remote: &Memory) -> Memory {
         // `expires_at` — max, BUT null (never-expires) wins over any
         // non-null (preservation over loss).
         expires_at: merge_expires_at(&local.expires_at, &remote.expires_at),
-        // `metadata` — deep JSON merge + 3 sub-rules (agent_id→local,
-        // scope LWW, governance→local).
-        metadata: merge_metadata(local, remote),
+        // `metadata` — per-key LWW-element map + the special keys (#4031).
+        metadata,
         // `reflection_depth` — max (PN-Counter; monotonic — the
         // reflection signal must not be lost on merge).
         reflection_depth: merge_counter(local.reflection_depth, remote.reflection_depth),
         // #224: memory_kind not in design table — LWW per table
         // philosophy (a conscious typing choice, like title).
         memory_kind: lww(local, remote, &local.memory_kind, &remote.memory_kind),
-        // #224: entity_id not in design table — prefer non-null, else LWW
-        // (structural / persona discriminator: preservation over loss).
-        entity_id: prefer_non_null_else_lww(local, remote, &local.entity_id, &remote.entity_id),
-        // #224: persona_version not in design table — prefer non-null,
-        // else LWW (structural).
-        persona_version: prefer_non_null_else_lww(
-            local,
-            remote,
-            &local.persona_version,
-            &remote.persona_version,
-        ),
-        // #224: citations not in design table — prefer non-null (a
-        // non-empty array beats empty), else LWW (provenance). An empty
-        // vec is treated as "absent" so a peer carrying fact-provenance
-        // does not get clobbered by a row that recorded none.
-        citations: if local.citations.is_empty() {
-            remote.citations.clone()
-        } else if remote.citations.is_empty() {
-            local.citations.clone()
-        } else {
-            lww(local, remote, &local.citations, &remote.citations)
-        },
-        // #224: source_uri not in design table — prefer non-null, else
-        // LWW (provenance).
-        source_uri: prefer_non_null_else_lww(local, remote, &local.source_uri, &remote.source_uri),
-        // #224: source_span not in design table — prefer non-null, else
-        // LWW (provenance).
-        source_span: prefer_non_null_else_lww(
-            local,
-            remote,
-            &local.source_span,
-            &remote.source_span,
-        ),
+        // #224 structural / provenance fields (entity_id, persona_version,
+        // citations, source_uri, source_span): prefer non-null, else the
+        // newer value — #4031 each by its OWN clock (resolved above).
+        entity_id,
+        persona_version,
+        citations,
+        source_uri,
+        source_span,
         // #224: confidence_source not in design table — LWW per table
         // philosophy (follows the confidence write).
         confidence_source: lww(
@@ -688,22 +849,10 @@ pub fn merge_memory(local: &Memory, remote: &Memory) -> Memory {
             &local.confidence_source,
             &remote.confidence_source,
         ),
-        // #224: confidence_signals not in design table — prefer non-null,
-        // else LWW (follows the confidence write).
-        confidence_signals: prefer_non_null_else_lww(
-            local,
-            remote,
-            &local.confidence_signals,
-            &remote.confidence_signals,
-        ),
-        // #224: confidence_decayed_at not in design table — prefer
-        // non-null, else LWW (follows the confidence write).
-        confidence_decayed_at: prefer_non_null_else_lww(
-            local,
-            remote,
-            &local.confidence_decayed_at,
-            &remote.confidence_decayed_at,
-        ),
+        // #224: confidence_signals / confidence_decayed_at — prefer
+        // non-null, else the newer value by its own clock (#4031).
+        confidence_signals,
+        confidence_decayed_at,
         // #224: version not in design table — max (PN-Counter; monotonic
         // optimistic-concurrency counter; never roll backwards).
         version: merge_counter(local.version, remote.version),
@@ -881,13 +1030,8 @@ pub fn normalise_inbound_node_local_overlay(mem: &mut Memory) -> bool {
 /// (later) stamp wins. Used for `last_accessed_at`.
 fn max_opt_string(local: &Option<String>, remote: &Option<String>) -> Option<String> {
     match (local, remote) {
-        (Some(l), Some(r)) => {
-            if r > l {
-                Some(r.clone())
-            } else {
-                Some(l.clone())
-            }
-        }
+        // #4030 — by instant, not bytes.
+        (Some(l), Some(r)) => Some(super::crdt_field_clock::later(l, r).to_string()),
         (Some(l), None) => Some(l.clone()),
         (None, Some(r)) => Some(r.clone()),
         (None, None) => None,

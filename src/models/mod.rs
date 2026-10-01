@@ -7,6 +7,7 @@ pub mod action;
 pub mod audit;
 pub mod capture_turn;
 pub mod checkpoint;
+pub mod crdt_field_clock;
 pub mod crdt_merge;
 pub mod crdt_primitives;
 pub mod field_names;

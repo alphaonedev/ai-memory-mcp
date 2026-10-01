@@ -455,7 +455,7 @@ fn private_visible(namespace: &str, metadata: &serde_json::Value, caller: &str) 
                 .as_object()
                 .is_some_and(|m| m.contains_key(crate::META_KEY_TARGET_AGENT_ID))
             && metadata
-                .get("recipient_agent_id")
+                .get(crate::META_KEY_RECIPIENT_AGENT_ID)
                 .and_then(serde_json::Value::as_str)
                 == Some(caller))
 }

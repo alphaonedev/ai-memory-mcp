@@ -281,7 +281,7 @@ pub(crate) fn inbox_message(m: &Memory) -> Value {
     let target_agent_id = m
         .metadata
         .get(field_names::TARGET_AGENT_ID)
-        .or_else(|| m.metadata.get("recipient_agent_id"))
+        .or_else(|| m.metadata.get(crate::META_KEY_RECIPIENT_AGENT_ID))
         .and_then(Value::as_str)
         .unwrap_or("");
     let namespace = m
