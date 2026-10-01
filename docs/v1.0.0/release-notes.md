@@ -213,12 +213,14 @@ behavior changes here.
   for v1.x (D3-021 → D3-031 → D3-060). `off` opts out.
 - **Agent-attestation default surface-scoped ([#1985](https://github.com/alphaonedev/ai-memory-mcp/issues/1985), resolving [#1981](https://github.com/alphaonedev/ai-memory-mcp/issues/1981)).**
   `AI_MEMORY_REQUIRE_AGENT_ATTESTATION` (env-table row #48) is now
-  tri-state with a per-surface compiled default. With the env unset, an
-  unsigned direct-store write is fail-CLOSED (`403 ATTESTATION_FAILED`)
-  ONLY on the HTTP direct-write surface (`POST /api/v1/memories` +
-  `/memories/bulk`); the MCP `memory_store` and CLI `store` surfaces are
-  the operator-as-actor path and stay permissive (unsigned →
-  `attest_level="claimed"`). This CORRECTS the v0.9.0 #1751
+  tri-state with a per-surface compiled default. With
+  `AI_MEMORY_REQUIRE_AGENT_ATTESTATION` unset, the HTTP-direct default
+  applies to `POST /api/v1/memories`, `POST /api/v1/memories/bulk`, and
+  `POST /api/v1/capture_turn`: an unsigned direct-store write is
+  fail-CLOSED (`403 ATTESTATION_FAILED`), and HTTP capture requires a
+  valid host signature whose key is bound to the caller. MCP
+  `memory_store` and CLI `store` retain their separate operator-as-actor
+  default and stay permissive (unsigned → `attest_level="claimed"`). This CORRECTS the v0.9.0 #1751
   require-everywhere default, which was unsatisfiable on MCP (no MCP host
   can construct/sign the canonical `SignableWrite` envelope — the #1981
   external break). `=1` forces strict on every surface (the v0.9.0
