@@ -100,9 +100,13 @@ pub mod age_version;
 // v1.0.0 #3674 — the ONE funnel a store DSN crosses on its way into sqlx:
 // query parameters sqlx would log instead of honour are removed first.
 pub mod dsn;
+// v1.0.0 #4023 — the federation same-`id` merge body (`pg_merge_inbound`) with
+// the in-transaction peer-scope re-check. Own module: postgres.rs is at its
+// qual_10 budget. Read by the pg structural scanners through
+// `tests/common/pg_sources.rs`.
+mod merge_inbound_4023;
 // v1.0.0 #3124 R4 — the audited `reown` sweep. Own module for the same
 // qual_10 budget reason as `parity_3064` above.
-mod merge_inbound_4023;
 mod reown_3124;
 mod swarm_rewind;
 // v1.0.0 #3152 — the lifecycle transition applied on the update's OWN
