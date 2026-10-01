@@ -1028,6 +1028,11 @@ pub struct RuleEngine {
     /// wraps a fresh `Vec` in `Arc::new`; cache hits clone the
     /// `Arc` (refcount bump, no row data copy).
     rules: Arc<Vec<Rule>>,
+    /// #4044 — the governance policy version `rules` were read under, in the
+    /// SAME read snapshot. `Some` for every attributed load (and every cached
+    /// load); `None` for the un-cached no-audit load and [`Self::from_rules`].
+    /// A signed verdict names THIS version — never one read after evaluation.
+    policy: Option<crate::governance::policy_version::PolicyVersion>,
 }
 
 impl RuleEngine {
@@ -1066,17 +1071,61 @@ impl RuleEngine {
         action: &AgentAction,
     ) -> Result<Self> {
         let kind = action.kind();
-        let rules = if let Some(c) = cache {
-            c.get_or_load(conn, kind).with_context(|| {
+        if let Some(c) = cache {
+            let (rules, policy) = c.get_or_load_attributed(conn, kind).with_context(|| {
                 format!("RuleEngine::load_for_action_cached: get_or_load({kind})")
+            })?;
+            return Ok(Self {
+                rules,
+                policy: Some(policy),
+            });
+        }
+        let v = crate::governance::rules_store::list_enabled_by_kind(conn, kind).with_context(
+            || format!("RuleEngine::load_for_action: list_enabled_by_kind({kind})"),
+        )?;
+        Ok(Self {
+            rules: Arc::new(v),
+            policy: None,
+        })
+    }
+
+    /// #4044 — load the rules for `action` TOGETHER with the governance
+    /// policy version they belong to, in ONE read snapshot (a cache hit
+    /// returns the pair cached together). Every path that SIGNS a policy
+    /// version into a verdict loads through here.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any SQLite / signature-verify / canonicalisation error.
+    pub fn load_for_action_attributed(
+        conn: &Connection,
+        cache: Option<&RuleCache>,
+        action: &AgentAction,
+    ) -> Result<Self> {
+        let kind = action.kind();
+        let (rules, policy) = if let Some(c) = cache {
+            c.get_or_load_attributed(conn, kind).with_context(|| {
+                format!("RuleEngine::load_for_action_attributed: get_or_load({kind})")
             })?
         } else {
-            let v = crate::governance::rules_store::list_enabled_by_kind(conn, kind).with_context(
-                || format!("RuleEngine::load_for_action: list_enabled_by_kind({kind})"),
-            )?;
-            Arc::new(v)
+            let (v, pv) =
+                crate::governance::policy_version::load_rules_with_policy_version(conn, kind)
+                    .with_context(|| {
+                        format!("RuleEngine::load_for_action_attributed: load({kind})")
+                    })?;
+            (Arc::new(v), pv)
         };
-        Ok(Self { rules })
+        Ok(Self {
+            rules,
+            policy: Some(policy),
+        })
+    }
+
+    /// #4044 — the policy version the loaded rules belong to (same snapshot),
+    /// or `None` when the engine was not loaded attributed.
+    #[must_use]
+    pub fn policy_version(&self) -> Option<crate::governance::policy_version::PolicyVersion> {
+        self.policy
     }
 
     /// Construct an engine directly from a pre-loaded rules slice.
@@ -1086,6 +1135,7 @@ impl RuleEngine {
     pub fn from_rules(rules: Vec<Rule>) -> Self {
         Self {
             rules: Arc::new(rules),
+            policy: None,
         }
     }
 
@@ -1267,16 +1317,42 @@ pub fn check_agent_action_cached(
     agent_id: &str,
     action: &AgentAction,
 ) -> Result<Decision> {
-    let engine = RuleEngine::load_for_action_cached(conn, cache, action).with_context(|| {
-        format!(
-            "check_agent_action_cached: load engine for {}",
-            action.kind()
-        )
-    })?;
+    check_agent_action_attributed(conn, cache, agent_id, action).map(|(decision, _)| decision)
+}
+
+/// #4044 — [`check_agent_action_cached`] that also returns the governance
+/// policy version that EVALUATED the verdict: the rules and the version are
+/// read in ONE snapshot ([`RuleEngine::load_for_action_attributed`]) and that
+/// same version is what the judge-signed verdict binds. A concurrent signed
+/// rule change (another connection or process) can therefore never make a
+/// verdict evaluated under policy P0 carry P1's sequence/digest.
+///
+/// Callers that sign a further artefact about this verdict (the CLI
+/// stopper enforcement anchor) MUST bind the returned version, not re-read.
+///
+/// # Errors
+///
+/// Returns an error if the SQLite query fails or the audit emit fails.
+pub fn check_agent_action_attributed(
+    conn: &Connection,
+    cache: Option<&RuleCache>,
+    agent_id: &str,
+    action: &AgentAction,
+) -> Result<(Decision, crate::governance::policy_version::PolicyVersion)> {
+    let engine =
+        RuleEngine::load_for_action_attributed(conn, cache, action).with_context(|| {
+            format!(
+                "check_agent_action_attributed: load engine for {}",
+                action.kind()
+            )
+        })?;
+    let policy = engine
+        .policy_version()
+        .context("check_agent_action_attributed: attributed load carried no policy version")?;
     let decision = engine.evaluate(agent_id, action);
-    emit_check_event(conn, agent_id, action, &decision)?;
+    emit_check_event(conn, agent_id, action, &decision, &policy)?;
     emit_forensic_decision(agent_id, action, &decision);
-    Ok(decision)
+    Ok((decision, policy))
 }
 
 /// #3647 — the forensic commitment preimage: the same `{action, decision}`
@@ -1332,6 +1408,7 @@ fn emit_check_event(
     agent_id: &str,
     action: &AgentAction,
     decision: &Decision,
+    policy: &crate::governance::policy_version::PolicyVersion,
 ) -> Result<()> {
     // #3818 (5-agent vote `4d3ea1c5`, #3818 comments 5774193216 + 5774241939) —
     // under an ENGAGED record-stop the `governance.check` row is a record-plane
@@ -1423,7 +1500,7 @@ fn emit_check_event(
     // verdict (allow AND block) when a judge key is enrolled. Fire-and-forget:
     // a failure NEVER fails the audit append. Opt-in: no judge key → no-op
     // (byte-identical legacy).
-    maybe_emit_governance_verdict(conn, agent_id, action, decision);
+    maybe_emit_governance_verdict(conn, agent_id, action, decision, policy);
     Ok(())
 }
 
@@ -1434,8 +1511,9 @@ fn maybe_emit_governance_verdict(
     agent_id: &str,
     action: &AgentAction,
     decision: &Decision,
+    policy: &crate::governance::policy_version::PolicyVersion,
 ) {
-    if let Err(e) = try_emit_governance_verdict(conn, agent_id, action, decision) {
+    if let Err(e) = try_emit_governance_verdict(conn, agent_id, action, decision, policy) {
         tracing::warn!("governance verdict checkpoint emission failed (swallowed): {e:#}");
     }
 }
@@ -1447,6 +1525,7 @@ fn try_emit_governance_verdict(
     agent_id: &str,
     action: &AgentAction,
     decision: &Decision,
+    pv: &crate::governance::policy_version::PolicyVersion,
 ) -> Result<()> {
     let Some(keypair) = crate::governance::audit::load_judge_signing_key()? else {
         return Ok(()); // opt-in: no judge key enrolled → no-op.
@@ -1455,11 +1534,13 @@ fn try_emit_governance_verdict(
     let action_bytes = action.canonical_bytes()?;
     let action_hash = crate::governance::audit::action_hash_hex(&action_bytes);
     let now = chrono::Utc::now().timestamp();
-    // v0.9.0 §25.3 S4 (F-41) — bind the live governance policy version
-    // that evaluated this verdict. The governance rules DB is always the
-    // sqlite `conn` here (Postgres ships no governance_rules table), so
-    // this reads the single source of truth on all backends.
-    let pv = crate::governance::policy_version::current_policy_version(conn)?;
+    // v0.9.0 §25.3 S4 (F-41) — bind the governance policy version that
+    // evaluated this verdict. #4044: `pv` was read in the SAME snapshot as the
+    // evaluated rules (see `RuleEngine::load_for_action_attributed`); it is
+    // NOT re-read here, because a signed rule change committed between the
+    // evaluation and this point would otherwise be attributed a verdict it
+    // never produced. The governance rules DB is always the sqlite `conn`
+    // (Postgres ships no governance_rules table), on all backends.
     let cp = crate::governance::audit::build_signed_verdict_checkpoint(
         agent_id,
         action.kind(),
@@ -1525,23 +1606,41 @@ pub fn gate_read(
     // Load the enabled `read_action` rules. A load error is a governance
     // outage: fail CLOSED unless the operator opted into the legacy
     // permissive posture (parity with the write pre-hook).
+    let load_failed = |e: anyhow::Error| {
+        if crate::daemon_runtime::governance_fail_open_on_error() {
+            tracing::warn!(
+                "read-gate: rule load failed, failing OPEN per \
+                 AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR: {e:#}"
+            );
+            return Ok(());
+        }
+        Err(crate::storage::GovernanceRefusal {
+            reason: "read governance unavailable (failing closed)".to_string(),
+        })
+    };
     let engine = match RuleEngine::load_for_action(conn, action) {
         Ok(e) => e,
-        Err(e) => {
-            if crate::daemon_runtime::governance_fail_open_on_error() {
-                tracing::warn!(
-                    "read-gate: rule load failed, failing OPEN per \
-                     AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR: {e:#}"
-                );
-                return Ok(());
-            }
-            return Err(crate::storage::GovernanceRefusal {
-                reason: "read governance unavailable (failing closed)".to_string(),
-            });
-        }
+        Err(e) => return load_failed(e),
     };
 
     // Zero-config fast-path: no read rules → allow, no eval, no audit.
+    if engine.rules().is_empty() {
+        return Ok(());
+    }
+
+    // #4044 — rules exist, so this verdict is audited and may be judge-signed
+    // with a policy version: re-load the rules TOGETHER with that version in
+    // one read snapshot and evaluate THOSE rules. (The zero-config probe above
+    // stays a single cheap read on the recall hot path.)
+    let engine = match RuleEngine::load_for_action_attributed(conn, None, action) {
+        Ok(e) => e,
+        Err(e) => return load_failed(e),
+    };
+    let Some(policy) = engine.policy_version() else {
+        return load_failed(anyhow::anyhow!(
+            "read-gate: attributed load carried no policy version"
+        ));
+    };
     if engine.rules().is_empty() {
         return Ok(());
     }
@@ -1550,7 +1649,7 @@ pub fn gate_read(
 
     // Best-effort audit — a read is NEVER blocked by an audit-append
     // failure (SPLIT fail-posture; the DLQ keeps the trail recoverable).
-    if let Err(e) = emit_check_event(conn, agent_id, action, &decision) {
+    if let Err(e) = emit_check_event(conn, agent_id, action, &decision, &policy) {
         tracing::warn!("read-gate: audit append failed (read proceeds; DLQ-backed): {e:#}");
     }
     emit_forensic_decision(agent_id, action, &decision);
