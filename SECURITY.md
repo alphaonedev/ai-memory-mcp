@@ -71,7 +71,7 @@ v1.0.0 flips the federation-receive and federation-transport lanes to fail-close
 | **#1936** Inbound federated commit-checkpoint RESOLUTION signature | `AI_MEMORY_FED_REQUIRE_CHECKPOINT_SIG=1` (fail-closed) | a resolved checkpoint is an authority-granting write; an unsigned / non-enrolled resolution is per-item skipped. `=0` for a heterogeneous-rollout window. |
 | **#1947** Cross-node governance `policy_version` staleness | `AI_MEMORY_FED_REQUIRE_POLICY_CURRENT=1` (refuse a DETECTED-stale push) | a push advertising a strictly-lower `sender_policy_seq` is refused `409 stale_policy_version`; an ABSENT/undeterminable epoch is fail-OPEN (existing federation is not hard-refused). `=0` accepts stale-policy pushes during a deliberate heterogeneous-governance rollout. |
 | **#3199** `restore` verifies an operator-signed manifest | an unsigned / legacy manifest is REFUSED; a bare `restore --from <dir>` is REFUSED | take a fresh `backup` after upgrading (it signs with the operator key; create one with `ai-memory rules keygen`). Name the backup with `--snapshot <id>` or pass `--latest`. A legacy backup restores with `--allow-unsigned-manifest` under the standard posture only. See the trust model below. |
-| **#2447** Inbound WRITE namespace confinement (Layer 2) | `AI_MEMORY_FED_REQUIRE_PUSH_NAMESPACE_SCOPE=1` (fail-closed for an ENROLLED peer that declares no scope) | short-circuits entirely on zero-config (no `AI_MEMORY_FED_PEER_ATTESTATION`), so it cannot brick zero-config federation. An enrolled peer with empty `allowed_namespaces` must declare its real scope (or `["**"]` for a deliberate per-peer allow-all); `=0` is a fleet-wide rollout window (NOT a header-less / unenrolled anonymity grant — those shapes are refused unconditionally). |
+| **#2447 / #3582** Inbound WRITE namespace confinement (Layer 2) | `AI_MEMORY_FED_REQUIRE_PUSH_NAMESPACE_SCOPE=1` (fail-closed for an ENROLLED peer that declares no scope, **and for an ABSENT peer-attestation map**) | With the default-on namespace requirement, inbound namespace mutations are refused when `AI_MEMORY_FED_PEER_ATTESTATION` is absent — not writes only: the same absent-map decision governs the by-id (deletions / archives / restores), pending-governance and namespace-metadata lanes, on both backends. Configure a peer allowlist with the intended namespaces. Standard permits the explicit `AI_MEMORY_FED_REQUIRE_PUSH_NAMESPACE_SCOPE=0` legacy opt-out; a configured map remains binding at `=0`, and `asi-hard` forbids disabling the requirement. An enrolled peer with empty `allowed_namespaces` must declare its real scope (or `["**"]` for a deliberate per-peer allow-all); `=0` is a fleet-wide rollout window (NOT a header-less / unenrolled anonymity grant — those shapes are refused unconditionally). Per-posture truth table: [federation posture and capabilities](docs/federation.md#current-defaults-and-boot-posture-3582). |
 
 **Known posture notes (by design — not vulnerabilities):**
 - **Store-path agent attestation is REQUIRED by default on the HTTP direct-write surface** (`AI_MEMORY_REQUIRE_AGENT_ATTESTATION` unset → an unsigned HTTP `POST /api/v1/memories` (+`/bulk`) is **rejected**, `403 ATTESTATION_FAILED`, rather than landing `attest_level="claimed"`). The MCP `memory_store` and CLI `store` operator-as-actor surfaces stay **permissive** by default (surface-scoped by #1985, correcting the v0.9.0 require-everywhere default that was unsatisfiable on MCP hosts — #1981); `=1` forces strict everywhere, `=0` permissive everywhere. See the table above (#1751/#1985). `metadata.agent_id` is a *claimed* identity even under attestation — do not use it for authorization decisions without checking `attest_level`.
@@ -192,7 +192,7 @@ Vulnerability reports involving the audit chain are CRITICAL severity by default
 
 **Honest tamper-evidence boundary (do not overclaim).** On an OSS build these surfaces provide tamper-**EVIDENCE**, not tamper-**PROOF**. The cross-row hash chain detects an in-place edit or a middle-of-chain deletion; the #1850 off-table forensic watermark + the #1873/#2202 head-hash anchor detect tail truncation and a same-length whole-suffix rewrite spanning the anchored row. Residuals that remain **by design**: an interior / mid-suffix rewrite *below* the anchored row, and a rewrite of the up-to-63 un-anchored rows *above* the last watermark, are NOT caught by the in-DB verdicts. An **imaged-disk attacker** who snapshots the DB and its sibling anchor together defeats the open-time rollback-evidence check (#1946) — so the rollback control is ESTIMABLE, not ATTESTABLE; whole-host resistance needs a TPM2 NV counter or an off-host anchor. Run with an enrolled audit-witness key + off-host `AI_MEMORY_LOG_SINK=syslog` shipping for the strongest evidence. Full statement: [`docs/security/audit-trail.md`](docs/security/audit-trail.md) §Threat model and [`docs/security/audit-trail-coverage.md`](docs/security/audit-trail-coverage.md).
 
-The v1.0 release (Q2 2027) will be audited by a named third-party firm. Audit firm selection criteria and dispute-resolution process are documented in [`ROADMAP.md`](ROADMAP.md) §7.7.
+**Who reviews v1.0.0.** The v1.0.0 security review is the AI-NHI multi-agent review described in [`ROADMAP.md`](ROADMAP.md) §27 Gate 3. A named third-party audit remains a later aspiration; it is not claimed as completed and is not required for this GA. ROADMAP §11.6's "public security audit by named third-party firm" line is explicitly superseded for the v1.0.0 epic (ROADMAP.md:994) and carries forward as the v1.x+ aspiration only.
 
 ## Caller authority — one resolver beneath every handler (#3549, v1.0.0)
 
@@ -319,21 +319,59 @@ across every relay wiring the guard cannot establish "not network-served" as a
 deployment property — which is why this section scopes its claim to the code,
 and why a relay's transport is the relay's responsibility.
 
-**The one documented exception, and why it does not change the code claim.**
-`src/mcp/tools/store/transport.rs` (#881/#318) constructs an **outbound**
-`reqwest` client so an MCP-stdio `memory_store` can join the HTTP daemon's
-federation fanout. That is a **client to the HTTP daemon** (whose own TLS, mTLS
-and plaintext-peer refusals — #2448/#2477 — cover that hop), **not** MCP's
-serving transport. MCP's code still serves nothing over a socket; the static
-gate allowlists exactly this one file and no other.
+**Every outbound client the MCP PROCESS can construct, and why none changes the
+code claim.** "MCP binds no server socket" is unqualified. "MCP makes no
+outbound connection" is NOT, and was previously stated as a single exception —
+which was false by omission (#4169). The `ai-memory mcp` process can construct
+four kinds of outbound connection; none of them is MCP's *serving* transport, so
+the stdio-only claim above is unaffected, but an operator sizing the process's
+egress needs all four — and note the last is NOT governed by the inference-egress
+knob that governs the two before it:
 
-**Pinned so it cannot decay.** `scripts/check-mcp-transport-isolation.py` refuses
-any server-socket construction anywhere under `src/mcp/**` and any network-client
-construction outside the single allowlisted forward file above, over production
-code (test modules and wiremock test servers are out of scope), with a
-`--self-test` that plants a `TcpListener::bind` and an out-of-allowlist `reqwest`
-client and proves the gate reds on each — a gate that cannot fail would pin
-nothing. The runtime guard is pinned separately by
+| Outbound client | Built at | Gate |
+|---|---|---|
+| **Federation forward** — an MCP-stdio `memory_store` joining the HTTP daemon's federation fanout (#881/#318) | `src/mcp/tools/store/transport.rs` (a blocking `reqwest` client, 15 s timeout) | A client **to the HTTP daemon**, whose own TLS, mTLS and plaintext-peer refusals (#2448/#2477) cover that hop. The one file on the static gate's client allowlist. |
+| **Chat / completion LLM** — query expansion, auto-tagging, contradiction detection | `crate::reload::resolve_and_build_mcp_llm`, called at MCP init (`src/mcp/mod.rs:4755`) and again on a live `config.toml` `[llm]` hot-swap (`:5355`) | `AI_MEMORY_INFERENCE_EGRESS` (`src/egress.rs`): `loopback-only` / `internal-only` / `deny` refuse the target, and **on refusal the client is not constructed** — enforcement is the absence of the egress path. `internal-only` additionally pins the boot-resolved addresses. |
+| **API embedder** — semantic-tier recall vectors | `Embedder::from_resolved_pinned` at MCP init (`src/mcp/mod.rs:4812`), only when the resolved embed lane egresses (`:4780`) | Same `AI_MEMORY_INFERENCE_EGRESS` gate. A refused or failed build degrades recall to keyword (#1593); it does not silently route through the chat client. The LOCAL in-process candle embedder sends no *inference* request and is not gated by this knob — but it is not network-free either: see the model-weight row below. |
+| **Model-weight fetch** — HuggingFace Hub HTTPS download of the local MiniLM embedder's and the neural cross-encoder's weights, on a COLD cache | MiniLM: `src/embeddings.rs:1048` → `download_via_hf_hub` (`:1949-1962`, three `repo.get` calls for `config.json` / `tokenizer.json` / `model.safetensors` from `sentence-transformers/all-MiniLM-L6-v2`, `:379`). Cross-encoder: `CrossEncoder::new_neural()` at MCP init (`src/mcp/mod.rs:5020`) → `resolve_cross_encoder_files` (`src/reranker.rs:1077-1095`, the same three files from `cross-encoder/ms-marco-MiniLM-L-6-v2`, `:366`) | **NOT `AI_MEMORY_INFERENCE_EGRESS`** — this lane is governed by `AI_MEMORY_EMBED_OFFLINE` / `HF_HUB_OFFLINE` (either truthy; `Embedder::remote_fetch_disabled`, `src/embeddings.rs:1978-1985`, shared by both loaders since #2086). Truthy ⇒ no network: both resolve only from the pre-staged HF cache and fail to the keyword / lexical path. Otherwise a cold cache fetches ~80-90 MB per model, bounded by `HF_DOWNLOAD_TIMEOUT`. A WARM cache makes the lane silent; it is not disabled. Indirect: the cross-encoder is built only when an embedder exists (`should_build_cross_encoder`, `src/reranker.rs:757-762`), so an egress-refused API-embedder deployment skips its download as a side effect — not because this knob was consulted. |
+
+Every row but the first is built **outside** `src/mcp/**` — the two inference
+clients in `src/reload.rs` / `src/embeddings.rs`, the weight fetches in
+`src/embeddings.rs` / `src/reranker.rs` — so the static gate does not and cannot
+see them; see "Pinned, with its scope stated" below for that scope boundary. The
+wake-hub UDS client (`src/wake_client/`) is **not** one of
+these: it is reached only from `src/cli/wake_listen.rs`, i.e. the
+`ai-memory wake-listen` subcommand and `ai-memory inbox --wait`
+(`src/cli/commands/inbox.rs:151-177`) — separate processes from `ai-memory mcp`
+— and it is a same-host Unix socket, not a network client. MCP's code still
+serves nothing over a socket.
+
+**Pinned, with its scope stated.** `scripts/check-mcp-transport-isolation.py`
+refuses any server-socket construction anywhere under `src/mcp/**` and any
+network-client construction outside the single allowlisted forward file above,
+over production code, with a `--self-test` that plants a `TcpListener::bind` and
+an out-of-allowlist `reqwest` client and proves the gate reds on each — a gate
+that cannot fail would pin nothing.
+
+What the gate does **not** see, stated so it is not mistaken for coverage
+(#4168): it walks `src/mcp/**` only, and inside that tree it skips files whose
+name contains `test` and every line at or below the first `#[cfg(test)]` module
+(#4145). So it pins **construction sites under `src/mcp/**`**, not *reachability
+from `run_mcp_server`*: a network client constructed in a helper elsewhere in the
+tree and called from the MCP process is invisible to it — which is exactly the
+shape of every row but the first in the table above: the two inference clients
+built in `src/reload.rs` / `src/embeddings.rs`, and the weight fetches in
+`src/embeddings.rs` / `src/reranker.rs`. That is a real gap in the gate, not in
+the certified claim: the claim this section makes is that **MCP binds no server
+socket and constructs no network client for its own serving transport**, and the
+inference, weight-fetch and forward clients are none of those. Widening the gate
+to every module reachable from `run_mcp_server` (a codegraph callee walk) is
+tracked on [#4399](https://github.com/alphaonedev/ai-memory-mcp/issues/4399);
+until it lands, the enumeration above — not the gate — is what keeps the
+outbound-connection list honest, and a new outbound client built outside
+`src/mcp/**` must be added to it by hand.
+
+The runtime guard is pinned separately by
 `src/mcp/stdio_guard.rs::classify_fd`'s unit tests, which assert that a listening
 socket, an `AF_INET`/`AF_INET6` socket, a non-`AF_UNIX` family such as
 `AF_VSOCK`, a socket whose family cannot be read, a socket whose listening state
