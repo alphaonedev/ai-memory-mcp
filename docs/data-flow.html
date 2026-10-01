@@ -279,7 +279,7 @@ footer a{color:var(--text-muted)}
 
       <g><rect class="stage-box optional" x="700" y="100" width="100" height="60" rx="10"/><text x="750" y="135" text-anchor="middle">contradict?</text></g>
 
-      <g><rect class="stage-box optional" x="830" y="60" width="140" height="60" rx="10"/><text x="900" y="95" text-anchor="middle">fanout_or_503</text><text x="900" y="110" text-anchor="middle" class="label" style="fill:var(--text-dim);font-size:9px">W-of-N peers</text></g>
+      <g><rect class="stage-box optional" x="830" y="60" width="140" height="60" rx="10"/><text x="900" y="95" text-anchor="middle">fanout_or_pending</text><text x="900" y="110" text-anchor="middle" class="label" style="fill:var(--text-dim);font-size:9px">W-of-N peers</text></g>
       <g><rect class="stage-box optional" x="830" y="150" width="140" height="60" rx="10"/><text x="900" y="180" text-anchor="middle">dispatch_event</text><text x="900" y="195" text-anchor="middle" class="label" style="fill:var(--text-dim);font-size:9px">webhook subs</text></g>
       <g><rect class="stage-box" x="830" y="240" width="140" height="60" rx="10"/><text x="900" y="270" text-anchor="middle">return Memory</text><text x="900" y="285" text-anchor="middle" class="label" style="fill:var(--good);font-size:9px">with id</text></g>
 
@@ -489,7 +489,7 @@ footer a{color:var(--text-muted)}
     </div>
 
     <div class="callout">
-      <strong>What if quorum can't be reached?</strong> The leader returns <strong>503 with structured peer status</strong>: which peers responded, which timed out, when the deadline hit. No silent partial writes. Caller can retry or escalate to the operator. The failure payload includes error classification (<code>QuorumFailureReason</code>: Unreachable / Timeout / IdDrift / InFlight; <code>QuorumError</code>: InvalidPolicy / LocalWriteFailed).
+      <strong>What if quorum can't be reached?</strong> After a local commit, a quorum shortfall returns <strong>HTTP 202 Accepted</strong> with <code>quorum_met:false</code>, <code>acks</code>, <code>needed</code>, <code>reason</code> and <code>durability:"local"</code>. The response does not enumerate individual peer outcomes. Treat the write as locally committed but under-replicated, not as a rejected write. The <code>reason</code> field carries the classification (<code>QuorumFailureReason</code>: Unreachable / Timeout / IdDrift / InFlight; <code>QuorumError</code>: InvalidPolicy / LocalWriteFailed).
     </div>
   </div>
 </section>
