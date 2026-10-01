@@ -2064,9 +2064,10 @@ mod tests {
             confidence: 1.0,
             // `validate_memory` enforces a source-allowlist (user, claude,
             // hook, api, cli, import, consolidation, system, chaos, notify).
-            // Use "system" so catchup_once's `validate_memory(&mem).is_err()`
-            // skip-branch isn't tripped — that's what we're trying NOT to
-            // exercise in the happy-path tests below.
+            // Use "system" so the catch-up row validation (`catchup_row_valid`,
+            // which counts and WARNs on a refused row, #4373) doesn't skip the
+            // row — that's what we're trying NOT to exercise in the happy-path
+            // tests below.
             source: "system".to_string(),
             access_count: 0,
             created_at: updated_at.to_string(),
@@ -3027,11 +3028,12 @@ mod tests {
         );
     }
 
-    /// W12-G #13: `catchup_once` skips memories that fail
-    /// `validate_memory` (e.g. invalid `source` enum). The valid memory
-    /// IS applied; sync_state advances to the latest TS seen. Exercises
-    /// the `if crate::validate::validate_memory(&mem).is_err() { continue; }`
-    /// branch which the F9 happy-path tests don't trigger.
+    /// W12-G #13: `catchup_once` skips memories that fail validation (e.g.
+    /// invalid `source` enum). The refused row is counted and WARNed with its
+    /// id by `catchup_row_valid` (#4373), never skipped silently. The valid
+    /// memory IS applied; sync_state advances to the latest TS seen. Exercises
+    /// the `if !catchup_row_valid(..) { continue; }` branch which the F9
+    /// happy-path tests don't trigger.
     #[test]
     fn catchup_once_skips_invalid_memory_but_applies_valid_neighbour() {
         with_scoped_catchup_env(

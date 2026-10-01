@@ -18437,10 +18437,9 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
     // peer's agent left a row nothing could decrypt. Seal to the identity the
     // surviving row RETAINS instead. A losing inbound row keeps the local
     // envelope, which is already consistent — nothing to reconcile there.
-    // v1.0.0 #2383 (N1) — same atomic seal/upsert/reconcile unit as
-    // `insert_inner`: only taken under at-rest encryption, and only when this
-    // call owns the transaction (the federation receive loop wraps batches in
-    // its own tx).
+    // v1.0.0 #2383 (N1) — the same atomic seal/upsert/reconcile unit as
+    // `insert_inner`; it runs in the transaction this call owns (the paragraph
+    // below says when that is) or in the caller's own tx.
     // v1.0.0 #2383 (N1) seal/upsert/reconcile atomicity, #2954 append-only
     // COW-SUPERSEDE probe/upsert/leaf atomicity AND the #4216 pre-image/upsert/
     // version-bump unit share ONE `BEGIN IMMEDIATE`: the write lock is taken up

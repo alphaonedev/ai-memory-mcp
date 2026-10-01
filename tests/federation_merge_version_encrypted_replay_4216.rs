@@ -65,17 +65,30 @@ fn version_of(conn: &rusqlite::Connection, id: &str) -> i64 {
     db::get_any(conn, id).expect("read").expect("row").version
 }
 
-fn soon() -> String {
-    (chrono::Utc::now() + chrono::Duration::seconds(2)).to_rfc3339()
-}
-
 fn open() -> rusqlite::Connection {
     let _ = key_dir_sandbox::pin();
     db::open(std::path::Path::new(":memory:")).expect("open")
 }
 
-#[test]
-fn encrypted_replay_through_merge_inbound_does_not_bump_4216() {
+fn envelope_of(conn: &rusqlite::Connection, id: &str) -> Vec<u8> {
+    conn.query_row(
+        "SELECT encrypted_envelope FROM memories WHERE id = ?1",
+        [id],
+        |r| r.get::<_, Vec<u8>>(0),
+    )
+    .expect("sealed envelope")
+}
+
+fn later(secs: i64) -> String {
+    (chrono::Utc::now() + chrono::Duration::seconds(secs)).to_rfc3339()
+}
+
+/// Replay the SAME plaintext row with a LATER `updated_at`: it wins
+/// last-writer-wins, so the merge re-seals the content under a fresh key and
+/// the stored envelope bytes change, but the user data (plaintext) does not, so
+/// the version must not move. (An equal-timestamp replay never re-seals and
+/// would not exercise this case.)
+fn assert_reseal_without_bump(merge: impl Fn(&rusqlite::Connection, &Memory)) {
     let _gate = EncryptGate::on();
     let conn = open();
     let id = uuid::Uuid::new_v4().to_string();
@@ -85,11 +98,16 @@ fn encrypted_replay_through_merge_inbound_does_not_bump_4216() {
     )
     .expect("insert");
     let before = version_of(&conn, &id);
-    let remote = memory(&id, "B's text", &soon());
-    db::merge_inbound(&conn, &remote, false).expect("merge");
+    merge(&conn, &memory(&id, "B's text", &later(2)));
     let once = version_of(&conn, &id);
     assert_eq!(once, before + 1, "the content change bumps");
-    db::merge_inbound(&conn, &remote, false).expect("replay");
+    let sealed_once = envelope_of(&conn, &id);
+    merge(&conn, &memory(&id, "B's text", &later(5)));
+    assert_ne!(
+        envelope_of(&conn, &id),
+        sealed_once,
+        "precondition: the later replay re-sealed the content under a fresh key"
+    );
     assert_eq!(
         version_of(&conn, &id),
         once,
@@ -102,24 +120,15 @@ fn encrypted_replay_through_merge_inbound_does_not_bump_4216() {
 }
 
 #[test]
+fn encrypted_replay_through_merge_inbound_does_not_bump_4216() {
+    assert_reseal_without_bump(|conn, m| {
+        db::merge_inbound(conn, m, false).expect("merge");
+    });
+}
+
+#[test]
 fn encrypted_replay_through_insert_if_newer_does_not_bump_4216() {
-    let _gate = EncryptGate::on();
-    let conn = open();
-    let id = uuid::Uuid::new_v4().to_string();
-    db::insert(
-        &conn,
-        &memory(&id, "A's text", &chrono::Utc::now().to_rfc3339()),
-    )
-    .expect("insert");
-    let before = version_of(&conn, &id);
-    let remote = memory(&id, "B's text", &soon());
-    db::insert_if_newer(&conn, &remote).expect("merge");
-    let once = version_of(&conn, &id);
-    assert_eq!(once, before + 1, "the content change bumps");
-    db::insert_if_newer(&conn, &remote).expect("replay");
-    assert_eq!(
-        version_of(&conn, &id),
-        once,
-        "a replay re-sealed under a fresh key must not look changed"
-    );
+    assert_reseal_without_bump(|conn, m| {
+        db::insert_if_newer(conn, m).expect("merge");
+    });
 }
