@@ -222,6 +222,11 @@ async fn warn_on_severed_out_of_scope_parent_via_store(
     );
 }
 
+/// #4024 - funnel label the postgres receive path passes to the shared
+/// transition helpers (one spelling for the log lines they emit).
+#[cfg(feature = "sal")]
+const PG_FUNNEL_LABEL: &str = "sync_push(store)";
+
 #[cfg(feature = "sal")]
 #[allow(clippy::too_many_lines)]
 pub(super) async fn sync_push_via_store(
@@ -1321,7 +1326,7 @@ pub(super) async fn sync_push_via_store(
                     crate::handlers::federation_receive::verified_op_identity(
                         op,
                         &signable,
-                        "sync_push(store)",
+                        PG_FUNNEL_LABEL,
                     )
                 else {
                     skipped += 1;
@@ -1345,7 +1350,7 @@ pub(super) async fn sync_push_via_store(
                 match crate::handlers::federation_receive::tally_remote_transition(
                     op,
                     outcome,
-                    "sync_push(store)",
+                    PG_FUNNEL_LABEL,
                 ) {
                     crate::handlers::federation_receive::TransitionTally::Applied => {
                         action_transitions_applied += 1;
@@ -1373,7 +1378,7 @@ pub(super) async fn sync_push_via_store(
                 match crate::handlers::federation_receive::tally_remote_transition(
                     op,
                     outcome,
-                    "sync_push(store)",
+                    PG_FUNNEL_LABEL,
                 ) {
                     crate::handlers::federation_receive::TransitionTally::Applied => {
                         action_transitions_applied += 1;
