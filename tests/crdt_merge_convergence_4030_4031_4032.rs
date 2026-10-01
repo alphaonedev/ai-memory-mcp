@@ -961,7 +961,7 @@ fn clock_map(row: u32, leaves: &[(&str, u32, &str)]) -> Value {
 
 /// f2r's counterexample: a={u:20, scope:collective}; b={u:22, ATTESTED, leaf
 /// /scope ABSENT@19}; c={u:21, leaf /scope ABSENT@20}. The merged row's
-/// attest_level used to supply the register rank, so a value that landed in an
+/// `attest_level` used to supply the register rank, so a value that landed in an
 /// attested row inherited rank 1 and the verdict depended on the grouping:
 /// (a|b)|c stayed collective while a|(b|c) was private.
 fn laundering_rows() -> [Memory; 3] {
@@ -1019,8 +1019,7 @@ async fn rank_laundering_converges_private_in_every_order(backend: &Backend) {
     let peer = uniq("ai:peer-f2r2");
     let ns = uniq("fit-f2r2");
     let _posture = Posture::new(&peer, &ns);
-    let [a, b, c] = laundering_rows();
-    let rows = [a, b, c];
+    let rows = laundering_rows();
     let orders: [[usize; 3]; 6] = [
         [0, 1, 2],
         [0, 2, 1],
@@ -1030,17 +1029,17 @@ async fn rank_laundering_converges_private_in_every_order(backend: &Backend) {
         [2, 1, 0],
     ];
     for order in orders {
-        let n = node(backend).await;
+        let node_under_test = node(backend).await;
         let id = uniq("mrank");
-        for i in order {
-            let mut v = serde_json::to_value(&rows[i]).expect("serialize");
-            v["id"] = json!(id);
-            v["namespace"] = json!(ns);
-            v["title"] = json!(format!("merge convergence probe {id}"));
-            v["metadata"]["agent_id"] = json!(peer);
-            n.push(&peer, &v).await;
+        for idx in order {
+            let mut wire = serde_json::to_value(&rows[idx]).expect("serialize");
+            wire["id"] = json!(id);
+            wire["namespace"] = json!(ns);
+            wire["title"] = json!(format!("merge convergence probe {id}"));
+            wire["metadata"]["agent_id"] = json!(peer);
+            node_under_test.push(&peer, &wire).await;
         }
-        let got = n.read(&id).await;
+        let got = node_under_test.read(&id).await;
         assert!(
             got.metadata.get("scope").is_none(),
             "order {order:?} left `scope` set (fails OPEN): {}",
