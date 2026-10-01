@@ -177,7 +177,9 @@ macro_rules! marker_absent_pg {
         )
     };
 }
-pub(crate) use {marker_absent_pg, marker_absent_sqlite, marker_present_pg, marker_present_sqlite};
+#[cfg(feature = "sal-postgres")]
+pub(crate) use {marker_absent_pg, marker_present_pg};
+pub(crate) use {marker_absent_sqlite, marker_present_sqlite};
 
 /// #4345 — `WHERE`-clause fragment (sqlite) that is true when the row's payload
 /// carries NO execution marker. Every path that would record a refusal over a
