@@ -4156,6 +4156,18 @@ async fn sync_push_write(
         match crate::signals::insert(&lock.0, sig) {
             Ok(_) => signals_applied += 1,
             Err(e) => {
+                // #4026 — the charge above bought no storage (a single INSERT
+                // fails atomically, e.g. a same-UUID row another connection
+                // stored after the probe fails the primary key): compensate it
+                // exactly, postgres-twin parity.
+                if let Err(re) = crate::quotas::refund_storage_only(
+                    &lock.0,
+                    &sig.from_agent,
+                    &sig.namespace,
+                    bytes,
+                ) {
+                    crate::quotas::log_refund_op_failed(&sig.from_agent, &re);
+                }
                 tracing::warn!("sync_push: signal insert failed for {}: {e}", sig.id);
                 skipped += 1;
             }

@@ -78,6 +78,9 @@ pub(crate) mod pg_migration_lock;
 /// stop-attestation. Backend-agnostic flag/attestation logic + the
 /// per-DB sqlite flag registry.
 pub mod record_stop;
+/// #4026 — the outcome type of `MemoryStore::apply_remote_signal`.
+mod remote_signal;
+pub use remote_signal::RemoteSignalApply;
 
 use bitflags::bitflags;
 use serde::{Deserialize, Serialize};
@@ -3109,22 +3112,37 @@ pub trait MemoryStore: Send + Sync {
     /// [`signal_send`](MemoryStore::signal_send) so both adapters get it with no
     /// per-backend SQL (mirrors [`apply_remote_deletion`](MemoryStore::apply_remote_deletion)).
     ///
-    /// Idempotent on the signal UUID (a replay no-ops, returning the
-    /// `unsigned` label). The signal is persisted verbatim with its embedded
-    /// signature / `sender_pubkey` (never re-signed). Returns `self_signed`
-    /// when that embedded signature verifies, else `unsigned`.
+    /// Idempotent on the signal UUID. The signal is persisted verbatim with its
+    /// embedded signature / `sender_pubkey` (never re-signed).
+    ///
+    /// # Returns
+    ///
+    /// #4026 — [`RemoteSignalApply::Inserted`] (carrying `SelfSigned` when the
+    /// embedded signature verifies, else `Unsigned`) when THIS call persisted
+    /// the signal, or [`RemoteSignalApply::AlreadyPresent`] when the UUID was
+    /// already stored and nothing was written. The federation receive funnel
+    /// charges storage quota before this call and refunds on every outcome that
+    /// is not `Inserted`, so the variants must describe what this call wrote.
     ///
     /// # Errors
     ///
-    /// Returns `InvalidInput` when the signal carries a present-but-invalid
-    /// signature (forged), or `Backend` on a storage error.
+    /// `InvalidInput` when the signal carries a present-but-invalid signature
+    /// (forged), or `Backend` on a storage error — including the primary-key
+    /// conflict a CONCURRENT duplicate hits when it inserts the same UUID after
+    /// the existence probe.
+    ///
+    /// **Invariant (#4026): `Err` means this call persisted nothing.** Every
+    /// error arm returns before the single `signal_send` insert, or IS that
+    /// insert failing atomically, so a caller may refund a pre-charge on `Err`
+    /// without risking an under-count. An adapter that overrides this method
+    /// must keep that invariant.
     async fn apply_remote_signal(
         &self,
         ctx: &CallerContext,
         signal: &crate::models::Signal,
-    ) -> StoreResult<&'static str> {
+    ) -> StoreResult<RemoteSignalApply> {
         if self.signal_get(ctx, &signal.id).await?.is_some() {
-            return Ok(crate::models::AttestLevel::Unsigned.as_str());
+            return Ok(RemoteSignalApply::AlreadyPresent);
         }
         let signed_ok = !signal.signature.is_empty() && crate::signals::verify(signal);
         if !signal.signature.is_empty() && !signed_ok {
@@ -3133,11 +3151,11 @@ pub trait MemoryStore: Send + Sync {
             });
         }
         self.signal_send(ctx, signal, None).await?;
-        Ok(if signed_ok {
-            crate::models::AttestLevel::SelfSigned.as_str()
+        Ok(RemoteSignalApply::Inserted(if signed_ok {
+            crate::models::AttestLevel::SelfSigned
         } else {
-            crate::models::AttestLevel::Unsigned.as_str()
-        })
+            crate::models::AttestLevel::Unsigned
+        }))
     }
 
     // ==================================================================
@@ -3888,6 +3906,13 @@ pub trait MemoryStore: Send + Sync {
     /// and `"self_signed"` is returned. Otherwise the signal lands verbatim
     /// (`signature` / `sender_pubkey` as supplied — empty for an unsigned
     /// send) and `"unsigned"` is returned.
+    ///
+    /// # Invariant (#4026)
+    ///
+    /// An `Err` means no row was stored: [`apply_remote_signal`](MemoryStore::apply_remote_signal)
+    /// callers refund their quota pre-charge on `Err`. A future insert-if-absent
+    /// override must report `rows_affected == 0` as
+    /// [`RemoteSignalApply::AlreadyPresent`] (see that type), never as stored.
     ///
     /// Default `UnsupportedCapability`.
     async fn signal_send(
