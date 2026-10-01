@@ -528,7 +528,10 @@ impl<'a> ConsolidationPass<'a> {
     /// (persist failed atomically) or was fully reversed (Stage-6 rollback
     /// restored every original). Best-effort by design: a leftover pending
     /// row is an honest over-retention an operator can see, never a loss.
-    async fn discard_pending_rollback_entry(&self, entry_id: &str) {
+    ///
+    /// Returns `true` only when the row was actually removed, so a caller can
+    /// keep `rollback_entries_written` equal to the entries that still exist.
+    async fn discard_pending_rollback_entry(&self, entry_id: &str) -> bool {
         if let Err(e) = self.store.delete(&self.ctx, entry_id).await {
             tracing::warn!(
                 target: COMPACTION_TRACE_TARGET,
@@ -537,7 +540,9 @@ impl<'a> ConsolidationPass<'a> {
                 error = %e,
                 "#3692: pending rollback row could not be removed (harmless over-retention)"
             );
+            return false;
         }
+        true
     }
 
     /// Verify the consolidated summary is readable from the store.
@@ -674,7 +679,12 @@ impl<'a> ConsolidationPass<'a> {
                 Err(e) => {
                     // The merge failed atomically: nothing was deleted, the
                     // pending row has nothing to reverse.
-                    self.discard_pending_rollback_entry(&entry_id).await;
+                    // #4350 — the entry is no longer written once discarded;
+                    // a failed discard leaves it, so the counter stays honest.
+                    if self.discard_pending_rollback_entry(&entry_id).await {
+                        report.rollback_entries_written =
+                            report.rollback_entries_written.saturating_sub(1);
+                    }
                     report
                         .errors
                         .push(format!("{}: persist failed: {e}", self.name()));
@@ -1609,9 +1619,9 @@ mod tests {
                     2,
                     "refused consolidation must not commit a summary"
                 );
-                if !edit {
-                    assert_eq!(report.rollback_entries_written, 0);
-                }
+                // #4350 — a refused consolidation (empty summary OR a stale
+                // source) leaves no rollback entry, so none may be reported.
+                assert_eq!(report.rollback_entries_written, 0);
                 for (index, source) in candidates.iter().enumerate() {
                     let row = store.get(&ctx, &source.id).await.unwrap();
                     let expected = if edit && index == 0 {
