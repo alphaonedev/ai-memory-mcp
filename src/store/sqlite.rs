@@ -4070,6 +4070,13 @@ impl MemoryStore for SqliteStore {
         tier: Option<&Tier>,
         why_trace: Option<&str>,
     ) -> StoreResult<String> {
+        // #4338 — refuse an invalid recipient before any quota charge, write
+        // or wake; the shared validator never echoes the value.
+        crate::validate::validate_notify_target(target_agent).map_err(|e| {
+            StoreError::InvalidInput {
+                detail: e.to_string(),
+            }
+        })?;
         // Compose the notify memory using the same shape as
         // `mcp::handle_notify`: a memory in `_inbox/<target_agent>` with
         // `metadata.target_agent_id` set so subsequent inbox pulls find it.

@@ -153,6 +153,18 @@ pub async fn notify(
     // unchanged and postgres is brought onto the documented domain.
     let priority = body.priority.map(crate::models::normalize_priority);
 
+    // #4338 — validate the recipient ONCE, above the backend branch, with the
+    // shared validator, so sqlite and postgres answer an invalid target with
+    // the identical 400 body before any quota charge, write or wake. The
+    // value is never echoed.
+    if let Err(e) = crate::validate::validate_notify_target(&body.target_agent_id) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response();
+    }
+
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
         let priority_i32 = priority;
