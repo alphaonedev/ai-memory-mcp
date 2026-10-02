@@ -147,6 +147,8 @@ const SECTION_IDENTITY: &str = "Identity";
 /// like a fleet but declared `singleton` is reported unprompted, at the top.
 /// This is the pre-upgrade detector; it never re-postures.
 pub const SECTION_DEPLOYMENT_SHAPE_DETECTOR: &str = "Deployment shape detector (#3700)";
+/// The `refuses` entry for a store URL whose sslmode the connect would refuse.
+const REFUSE_STORE_URL_SSLMODE: &str = "store URL sslmode";
 /// v1.0.0 #3705 — the transit-encryption section, THIRD in the default
 /// report (after the deployment shape), so every surface that would refuse
 /// under the "only encrypted data in transit" mandate is reported unprompted
@@ -1322,7 +1324,7 @@ fn section_transit_encryption_3705(conn: Option<&rusqlite::Connection>) -> Repor
                 format!("postgres over TCP ({host}): sslmode={PG_SSLMODE_FLOOR} pinned")
             }
             transit_encryption::SslmodeFloor::NotPinned { host } => {
-                refuses.push("store URL sslmode".to_string());
+                refuses.push(REFUSE_STORE_URL_SSLMODE.to_string());
                 format!(
                     "postgres over TCP ({host}): sslmode={PG_SSLMODE_FLOOR} NOT pinned — REFUSES at connect"
                 )
@@ -1337,10 +1339,26 @@ fn section_transit_encryption_3705(conn: Option<&rusqlite::Connection>) -> Repor
                 refuses.push("store URL".to_string());
                 "postgres: DSN not parseable by the driver — REFUSES at connect (#3866)".to_string()
             }
+            // #4434 — the driver dials a different host than the text names.
+            transit_encryption::SslmodeFloor::DriverHost { named, dialed } => {
+                refuses.push("store URL host".to_string());
+                format!(
+                    "postgres over TCP: the URL names host {named} but the driver will dial {dialed} — REFUSES at connect (#4434)"
+                )
+            }
+            // #4434 — a build without sal-postgres cannot resolve the
+            // driver's sslmode and refuses a postgres store at boot (#2679).
+            // Critical (it WILL refuse), never a claim of "pinned".
+            transit_encryption::SslmodeFloor::Unverifiable { host } => {
+                refuses.push(REFUSE_STORE_URL_SSLMODE.to_string());
+                format!(
+                    "postgres over TCP ({host}): sslmode UNVERIFIABLE in this build (no sal-postgres driver; the daemon refuses a postgres store, #2679) — REFUSES at boot (#4434)"
+                )
+            }
             // #4434 — the driver resolves a weaker sslmode than the text
             // shows; this is the SAME verdict the connect funnel enforces.
             transit_encryption::SslmodeFloor::DriverResolved { host, resolved } => {
-                refuses.push("store URL sslmode".to_string());
+                refuses.push(REFUSE_STORE_URL_SSLMODE.to_string());
                 format!(
                     "postgres over TCP ({host}): the driver resolves sslmode={resolved}, not {PG_SSLMODE_FLOOR} — REFUSES at connect (#4434)"
                 )

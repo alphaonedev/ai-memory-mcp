@@ -211,15 +211,17 @@ impl std::error::Error for FlooredConnectError {}
 /// made on the parsed value and the floor and the driver can never disagree
 /// (ERRORS-01 / ERRORS-09).
 fn evaluate(dsn: &str) -> Result<PgConnectOptions, FlooredConnectError> {
-    let text = crate::transit_encryption::dsn_sslmode_floor(dsn);
-    if !matches!(text, SslmodeFloor::Pinned { .. }) {
-        return Err(FlooredConnectError::Refused(text));
-    }
+    let text_host = match crate::transit_encryption::dsn_sslmode_floor(dsn) {
+        SslmodeFloor::Pinned { host } => host,
+        refused => return Err(FlooredConnectError::Refused(refused)),
+    };
     let options = connect_options(dsn).map_err(|e| {
         FlooredConnectError::Parse(crate::logging::redact_urls_in_message(&e.to_string()))
     })?;
     // The driver's own transport predicate (`fetch_socket`): a socket is set,
-    // or the host starts with `/`.
+    // or the host starts with `/`. The path-host arm is reachable: `PGHOST=/dir`
+    // with a URL whose only host key the driver does not recognise (an
+    // upper-case `HOST=`) leaves no socket set and host `/dir`.
     if options.get_socket().is_some() || options.get_host().starts_with('/') {
         let dir = options.get_socket().map_or_else(
             || options.get_host().to_string(),
@@ -230,7 +232,16 @@ fn evaluate(dsn: &str) -> Result<PgConnectOptions, FlooredConnectError> {
         }));
     }
     let resolved = match options.get_ssl_mode() {
-        PgSslMode::VerifyFull => return Ok(options),
+        PgSslMode::VerifyFull => {
+            // The host the text names must be the host the driver dials.
+            if !options.get_host().eq_ignore_ascii_case(text_host.trim()) {
+                return Err(FlooredConnectError::Refused(SslmodeFloor::DriverHost {
+                    named: text_host,
+                    dialed: options.get_host().to_string(),
+                }));
+            }
+            return Ok(options);
+        }
         PgSslMode::Disable => "disable",
         PgSslMode::Allow => "allow",
         PgSslMode::Prefer => "prefer",

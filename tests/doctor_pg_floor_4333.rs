@@ -249,6 +249,14 @@ fn bypass_urls(port: u16) -> Vec<(&'static str, String)> {
             format!("{base}?sslmode=disable#x&sslmode=verify-full"),
         ),
         ("fragment only", format!("{base}?a=1#&sslmode=verify-full")),
+        // TLS stays verify-full but the driver ignores the upper-case key and
+        // dials its default host, not the one the text names.
+        (
+            "upper-case host key",
+            format!(
+                "postgres:///db?user=u&password={SECRET}&HOST=127.0.0.1&port={port}&sslmode=verify-full"
+            ),
+        ),
         (
             "tab in key",
             format!("{base}?sslmode=verify-full&ss\tlmode=disable"),
@@ -273,11 +281,12 @@ fn doctor_refuses_the_parser_differential_dsns_without_connecting_4434() {
 fn floored_connect_options_refuses_the_parser_differential_dsns_4434() {
     use ai_memory::store::postgres::dsn::{FlooredConnectError, floored_connect_options};
     let mut not_refused = Vec::new();
-    // "fragment only" has no sslmode in the driver's view, so the ambient
-    // PGSSLMODE decides it; it runs in the env-scrubbed subprocess cells.
+    // "fragment only" (ambient PGSSLMODE) and "upper-case host key" (ambient
+    // PGHOST) are decided by the environment; they run in the env-scrubbed
+    // subprocess cells.
     for (kind, url) in bypass_urls(5432)
         .into_iter()
-        .filter(|(k, _)| *k != "fragment only")
+        .filter(|(k, _)| !matches!(*k, "fragment only" | "upper-case host key"))
     {
         match floored_connect_options(&url) {
             Err(refused @ FlooredConnectError::Refused(_)) => {
@@ -487,4 +496,27 @@ fn verify_full_controls_connect_over_tls_on_the_real_tier_4434() {
         });
         assert!(ssl, "the control session must be TLS");
     }
+}
+
+/// #4434 - the host-is-a-path branch: with `PGHOST=/tmp` and a URL whose only
+/// host is an upper-case `HOST=` key the driver sets NO socket but its host is
+/// the path `/tmp`; the text screen sees a TCP host. Refused, no socket.
+#[test]
+fn a_pghost_path_host_is_refused_4434() {
+    let listener = CountingListener::start();
+    let url = format!(
+        "postgres:///db?user=u&password={SECRET}&HOST=127.0.0.1&port={}&sslmode=verify-full",
+        listener.port
+    );
+    let home = tempfile::tempdir().expect("scratch HOME");
+    let report = doctor_json_env(&url, home.path(), &[("PGHOST", "/tmp")]);
+    for name in ["Postgres extensions", "Unstamped owners"] {
+        let sec = section(&report, name);
+        assert!(is_critical(sec), "{name}: {sec}");
+        assert!(
+            sec.to_string().contains("Unix-domain socket"),
+            "{name} must name the socket transport: {sec}"
+        );
+    }
+    assert_eq!(listener.accepted(), 0);
 }
