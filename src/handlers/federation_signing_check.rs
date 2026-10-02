@@ -114,6 +114,56 @@ fn federation_apply_ctx(receive_principal: String) -> crate::store::CallerContex
     crate::store::CallerContext::for_admin(receive_principal)
 }
 
+/// #4478 — the federated `namespace_meta[]` bind on the store backend, gated
+/// by the #4356 ancestor-owner check for the agent the pushing peer is
+/// authenticated to act for (`crate::federation::ns_meta_ancestor_gate`).
+/// Only the postgres adapter implements the in-transaction federated gate; any
+/// other store refuses the entry (fail closed) rather than fall back to the
+/// admin bypass.
+#[cfg(feature = "sal")]
+#[cfg_attr(
+    not(feature = "sal-postgres"),
+    allow(
+        unused_variables,
+        clippy::unused_async,
+        reason = "only the postgres arm uses the identity inputs; one signature for both legs"
+    )
+)]
+async fn federated_namespace_meta_bind(
+    app: &AppState,
+    peer_header: Option<&str>,
+    sender_agent_id: &str,
+    attest_cfg: &crate::federation::peer_attestation::PeerAttestationConfig,
+    namespace: &str,
+    standard_id: &str,
+    parent: Option<&str>,
+) -> Result<(), crate::store::StoreError> {
+    #[cfg(feature = "sal-postgres")]
+    if let Some(pg) = app
+        .store
+        .as_any()
+        .downcast_ref::<crate::store::postgres::PostgresStore>()
+    {
+        let bypass = crate::federation::peer_attestation::trust_body_agent_id_bypass();
+        let actor_for = |owner: Option<&str>| {
+            crate::federation::ns_meta_ancestor_gate::federated_bind_actor(
+                peer_header,
+                sender_agent_id,
+                owner,
+                attest_cfg,
+                bypass,
+            )
+        };
+        return pg
+            .set_namespace_standard_federated(&actor_for, namespace, standard_id, parent)
+            .await;
+    }
+    Err(crate::store::set_refusal_to_store_err(
+        crate::ns_standard_ancestor::SetRefusal::Unverifiable,
+        namespace,
+    ))
+}
+
 /// #2478 / #3075 — postgres PROBE half of the pending effect-namespace gate.
 ///
 /// The DECISION lives once in
@@ -2071,18 +2121,32 @@ pub(super) async fn sync_push_via_store(
             )
             .await;
         }
-        let apply_ctx = federation_apply_ctx(body.sender_agent_id.clone());
-        match app
-            .store
-            .set_namespace_standard(
-                &apply_ctx,
-                &entry.namespace,
-                &entry.standard_id,
-                entry.parent_namespace.as_deref(),
-            )
-            .await
+        // #4478 — NOT the admin apply context: the #4356 ancestor-owner gate
+        // runs in the bind's transaction for the agent the peer is
+        // authenticated to act for (sqlite-twin rule, one shared verdict). A
+        // refusal is a per-entry skip under `namespace_meta_refused` with the
+        // same fixed log line; nothing is written and the batch survives.
+        match federated_namespace_meta_bind(
+            &app,
+            peer_header_owned.as_deref(),
+            &body.sender_agent_id,
+            &attest_cfg,
+            &entry.namespace,
+            &entry.standard_id,
+            entry.parent_namespace.as_deref(),
+        )
+        .await
         {
             Ok(()) => namespace_meta_applied += 1,
+            Err(crate::store::StoreError::PermissionDenied { .. }) => {
+                tracing::warn!(
+                    target: super::federation_receive::ATTESTATION_TRACE_TARGET,
+                    "{}",
+                    crate::federation::ns_meta_ancestor_gate::ANCESTOR_GATE_SKIP_LOG
+                );
+                namespace_meta_refused += 1;
+                skipped += 1;
+            }
             Err(e) => {
                 tracing::warn!(
                     "sync_push(store): set_namespace_standard failed for {}: {e}",
