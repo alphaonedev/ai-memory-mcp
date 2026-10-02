@@ -393,8 +393,11 @@ jobs:
           # LEG B proves the #3016/#3067 born-dirty -> bootstrap-node -> clean
           # gate on a fresh sqlite node. Reuse the sal-postgres build cache for
           # the `ai-memory` binary so no second toolchain build is needed.
+          # #4333/#4434: LEG A is certified in two shapes. This build is the
+          # A-pg binary (sal-postgres); the gate self-builds the driverless
+          # binary for LEG A-driverless (a driverless binary must REFUSE).
           cargo build --features sal-postgres --bin ai-memory
-          AI_MEMORY_BIN="$(pwd)/target/debug/ai-memory" \
+          AI_MEMORY_BIN_PG="$(pwd)/target/debug/ai-memory" \
             bash scripts/check-bootstrap-cert-gate.sh
 
       # Drop the per-job ephemeral db (created by "Point at the native
