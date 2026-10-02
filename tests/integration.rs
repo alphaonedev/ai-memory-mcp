@@ -8707,6 +8707,14 @@ fn test_serve_native_tls_health_probe() {
         return;
     };
 
+    // #4463 — launch the binary once, untimed, before the boot window
+    // starts. On macOS the first launch of a freshly built (unsigned) binary
+    // from a new test process sits in `_dyld_start` for ~6.5-7.5 s while the
+    // OS checks it (measured with `sample`; `--version` alone took that long),
+    // which used up this cell's whole 5 s window in a filtered run. Later
+    // launches skip that cost, so the window below measures `serve`'s own
+    // boot (~0.25 s) again. On Linux the warm-up costs milliseconds.
+    let _ = cmd(bin).arg("--version").output();
     let port = free_port();
     let mut child = cmd(bin)
         .args([
