@@ -267,6 +267,27 @@ pub fn seed_from_conn(conn: &rusqlite::Connection) -> Result<()> {
     Ok(())
 }
 
+/// #3707 — the caller-facing text for each record-stop gate refusal, shared
+/// by the HTTP chokepoint and the MCP dispatch fence (#4400). Built
+/// from our own fields only: the stop names the operator principal and scope
+/// it was engaged with (byte-identical to the pre-#3707 body); the
+/// indeterminate refusal drops its foreign `reason`; the audit-trail latch
+/// uses the one canonical refusal text.
+pub fn caller_message(e: &crate::storage::StorageError) -> String {
+    use crate::storage::StorageError as SE;
+    match e {
+        SE::RecordStopped { issued_by, scope } => format!(
+            "substrate record plane stopped by {issued_by} (scope={scope}); \
+             mutating operations refused until resume"
+        ),
+        SE::RecordStopIndeterminate { .. } => "substrate record-stop state could not be read \
+             (fail-closed; mutating operation refused, retry)"
+            .to_string(),
+        SE::AuditTrailUnavailable { .. } => crate::audit::audit_trail_refusal_message(),
+        _ => "mutating operation refused".to_string(),
+    }
+}
+
 /// `db::`-surface gate for the bare-`Connection` funnel (the MCP stdio
 /// write path). Lazily seeds the flag from the audit chain the first
 /// time a given DB is touched so a freshly-opened `Connection` that
@@ -274,8 +295,20 @@ pub fn seed_from_conn(conn: &rusqlite::Connection) -> Result<()> {
 ///
 /// # Errors
 ///
-/// [`crate::storage::StorageError::RecordStopped`] when stopped.
+/// [`crate::storage::StorageError::RecordStopped`] when stopped;
+/// [`crate::storage::StorageError::RecordStopIndeterminate`] when the stop
+/// state cannot be read; [`crate::storage::StorageError::AuditTrailUnavailable`]
+/// when this process's audit trail failed under `AI_MEMORY_REQUIRE_AUDIT_TRAIL`
+/// (#4400). The operator's stop is checked first: it outranks a health
+/// condition of this process's sink.
 pub fn gate_storage_conn(conn: &rusqlite::Connection) -> Result<(), crate::storage::StorageError> {
+    gate_record_stop(conn)?;
+    crate::audit::audit_trail_gate()
+        .map_err(|e| crate::storage::StorageError::AuditTrailUnavailable { reason: e.reason })
+}
+
+/// The record-stop half of [`gate_storage_conn`].
+fn gate_record_stop(conn: &rusqlite::Connection) -> Result<(), crate::storage::StorageError> {
     let key = conn_key(conn);
     // #3877 (5-agent vote 4d3ea1c5 = B, fail-closed + de-latch). DE-LATCH: probe
     // the registry WITHOUT inserting, and cache ONLY after a SUCCESSFUL read. The
@@ -497,6 +530,34 @@ pub fn append_attestation_sqlite(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #4400 - the caller text for a gate refusal never carries the error's
+    /// foreign detail (the MCP dispatch fence renders it as an RPC error).
+    #[test]
+    fn caller_message_never_renders_the_foreign_reason_4400() {
+        use crate::storage::StorageError as SE;
+        let secret = "SQLITE_CORRUPT at /var/lib/ai-memory/x.db";
+        for e in [
+            SE::RecordStopIndeterminate {
+                reason: secret.to_string(),
+            },
+            SE::AuditTrailUnavailable {
+                reason: secret.to_string(),
+            },
+        ] {
+            let msg = caller_message(&e);
+            assert!(!msg.contains(secret), "{msg}");
+            assert!(
+                e.to_string().contains(secret),
+                "the Display keeps the detail for the log"
+            );
+        }
+        let stopped = caller_message(&SE::RecordStopped {
+            issued_by: "op".to_string(),
+            scope: "all".to_string(),
+        });
+        assert!(stopped.contains("stopped by op (scope=all)"), "{stopped}");
+    }
 
     #[test]
     fn storage_gate_running_is_none_stopped_refuses() {

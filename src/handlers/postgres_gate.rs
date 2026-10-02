@@ -862,6 +862,20 @@ pub async fn postgres_route_gate(
 #[must_use]
 pub fn store_err_to_response(e: crate::store::StoreError) -> Response {
     use crate::store::StoreError;
+    // #4400 — the audit-trail latch: a retryable 503 that carries its own
+    // code, byte-parity with the sqlite chokepoint's `record_stopped_response`
+    // body (`{code, error}`), so a client tells it from an operator's stop.
+    // The message names only the knob, so it is emitted unsanitised.
+    if let StoreError::AuditTrailUnavailable { .. } = &e {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "code": crate::errors::error_codes::AUDIT_TRAIL_UNAVAILABLE,
+                "error": e.to_string(),
+            })),
+        )
+            .into_response();
+    }
     // #1795 — over-quota tenant write → 429 with the full QUOTA_EXCEEDED
     // envelope (code/limit/current/max/agent_id), byte-parity with the
     // sqlite handler path's quota breach (src/handlers/create.rs).
@@ -974,6 +988,12 @@ pub fn store_err_to_response(e: crate::store::StoreError) -> Response {
         // reads are unaffected. The message is caller-safe (no adapter
         // internals) so no sanitisation is needed.
         StoreError::Stopped { .. } => (StatusCode::SERVICE_UNAVAILABLE, e.to_string()),
+        // #4400 — this process's audit trail is not recording and the operator
+        // required one: 503 (it clears itself once the trail records again).
+        // The message names only the knob, so it is emitted unsanitised.
+        StoreError::AuditTrailUnavailable { .. } => {
+            (StatusCode::SERVICE_UNAVAILABLE, e.to_string())
+        }
         // v1.0.0 #3196 — a find_paths traversal-budget refusal. 400, not 503:
         // the caller asked for a traversal too broad to serve within the
         // materialised-prefix budget, and the actionable fix is on the
@@ -2033,6 +2053,12 @@ mod transport_postgres_gate_tests {
             backend: "p".to_string(),
             sqlstate: None,
             detail: "d".to_string(),
+        });
+        assert_eq!(r.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+
+        // #4400 — the audit-trail latch maps to a retryable 503.
+        let r = store_err_to_response(StoreError::AuditTrailUnavailable {
+            reason: "r".to_string(),
         });
         assert_eq!(r.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
 

@@ -17427,3 +17427,82 @@ async fn http_share_owner_allowed_collective_reader_refused_3379() {
         assert_eq!(response.status(), status, "caller {caller}");
     }
 }
+
+/// #4400 (s4400 F1) — a latched audit trail refuses a federation push with the
+/// same retryable `503 AUDIT_TRAIL_UNAVAILABLE` on BOTH receive paths: the
+/// sqlite chokepoint (`refuse_if_record_stopped`) and the postgres chokepoint
+/// (`sync_push_via_store`). Red before the F1 fold: the postgres branch
+/// answered 200 with every item skipped.
+#[test]
+fn a_latched_audit_trail_refuses_sync_push_on_both_backends_4400() {
+    with_legacy_push_env(
+        "a_latched_audit_trail_refuses_sync_push_on_both_backends_4400",
+        async {
+            let _fed = PermissiveFedEnv::new();
+            let _sink = crate::audit::sink_test_lock();
+            #[cfg(feature = "sal")]
+            let backends = [StorageBackend::Sqlite, StorageBackend::Postgres];
+            #[cfg(not(feature = "sal"))]
+            let backends = [StorageBackend::Sqlite];
+            for backend in backends {
+                crate::audit::fail_closed_latch_for_test();
+                let mut app_state = test_app_state(test_state());
+                app_state.storage_backend = backend;
+                let app = Router::new()
+                    .route("/api/v1/sync/push", axum_post(sync_push))
+                    .with_state(app_state);
+                let now = Utc::now().to_rfc3339();
+                let body = serde_json::json!({
+                    "sender_agent_id": "peer-alice",
+                    "sender_clock": {"entries": {}},
+                    "memories": [{
+                        "id": Uuid::new_v4().to_string(),
+                        "tier": Tier::Long.as_str(),
+                        "namespace": "t4400",
+                        "title": "pushed while latched",
+                        "content": "c",
+                        "tags": [],
+                        "priority": 5,
+                        "confidence": 1.0,
+                        "source": "api",
+                        "access_count": 0,
+                        "created_at": now,
+                        "updated_at": now,
+                        "last_accessed_at": null,
+                        "expires_at": null,
+                        "metadata": {"agent_id": "peer-alice"}
+                    }],
+                    "dry_run": false
+                });
+                let resp = app
+                    .oneshot(
+                        axum::http::Request::builder()
+                            .uri("/api/v1/sync/push")
+                            .method("POST")
+                            .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
+                            .header("x-agent-id", "local-receiver")
+                            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let status = resp.status();
+                let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+                crate::audit::fail_closed_force_on_for_test(false);
+                assert_eq!(
+                    status,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "{backend:?}: a latched receiver refuses the push: {v}"
+                );
+                assert_eq!(
+                    v["code"],
+                    crate::errors::error_codes::AUDIT_TRAIL_UNAVAILABLE,
+                    "{backend:?}: {v}"
+                );
+            }
+        },
+    );
+}
