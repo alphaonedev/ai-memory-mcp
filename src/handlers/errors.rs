@@ -289,30 +289,10 @@ pub(crate) fn record_stopped_response(
         StatusCode::SERVICE_UNAVAILABLE,
         Json(json!({
             "code": code,
-            "error": record_stop_caller_message(e),
+            "error": crate::storage::record_stop::caller_message(e),
         })),
     )
         .into_response()
-}
-
-/// #3707 — the caller-facing text for each record-stop gate refusal. Built
-/// from our own fields only: the stop names the operator principal and scope
-/// it was engaged with (byte-identical to the pre-#3707 body); the
-/// indeterminate refusal drops its foreign `reason`; the audit-trail latch
-/// uses the one canonical refusal text.
-fn record_stop_caller_message(e: &crate::storage::StorageError) -> String {
-    use crate::storage::StorageError as SE;
-    match e {
-        SE::RecordStopped { issued_by, scope } => format!(
-            "substrate record plane stopped by {issued_by} (scope={scope}); \
-             mutating operations refused until resume"
-        ),
-        SE::RecordStopIndeterminate { .. } => "substrate record-stop state could not be read \
-             (fail-closed; mutating operation refused, retry)"
-            .to_string(),
-        SE::AuditTrailUnavailable { .. } => crate::audit::audit_trail_refusal_message(),
-        _ => "mutating operation refused".to_string(),
-    }
 }
 
 pub(crate) fn handler_error_500(e: &dyn std::fmt::Display) -> axum::response::Response {

@@ -267,6 +267,27 @@ pub fn seed_from_conn(conn: &rusqlite::Connection) -> Result<()> {
     Ok(())
 }
 
+/// #3707 — the caller-facing text for each record-stop gate refusal, shared
+/// by the HTTP chokepoint and the MCP dispatch fence (#4400). Built
+/// from our own fields only: the stop names the operator principal and scope
+/// it was engaged with (byte-identical to the pre-#3707 body); the
+/// indeterminate refusal drops its foreign `reason`; the audit-trail latch
+/// uses the one canonical refusal text.
+pub fn caller_message(e: &crate::storage::StorageError) -> String {
+    use crate::storage::StorageError as SE;
+    match e {
+        SE::RecordStopped { issued_by, scope } => format!(
+            "substrate record plane stopped by {issued_by} (scope={scope}); \
+             mutating operations refused until resume"
+        ),
+        SE::RecordStopIndeterminate { .. } => "substrate record-stop state could not be read \
+             (fail-closed; mutating operation refused, retry)"
+            .to_string(),
+        SE::AuditTrailUnavailable { .. } => crate::audit::audit_trail_refusal_message(),
+        _ => "mutating operation refused".to_string(),
+    }
+}
+
 /// `db::`-surface gate for the bare-`Connection` funnel (the MCP stdio
 /// write path). Lazily seeds the flag from the audit chain the first
 /// time a given DB is touched so a freshly-opened `Connection` that
@@ -509,6 +530,34 @@ pub fn append_attestation_sqlite(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #4400 - the caller text for a gate refusal never carries the error's
+    /// foreign detail (the MCP dispatch fence renders it as an RPC error).
+    #[test]
+    fn caller_message_never_renders_the_foreign_reason_4400() {
+        use crate::storage::StorageError as SE;
+        let secret = "SQLITE_CORRUPT at /var/lib/ai-memory/x.db";
+        for e in [
+            SE::RecordStopIndeterminate {
+                reason: secret.to_string(),
+            },
+            SE::AuditTrailUnavailable {
+                reason: secret.to_string(),
+            },
+        ] {
+            let msg = caller_message(&e);
+            assert!(!msg.contains(secret), "{msg}");
+            assert!(
+                e.to_string().contains(secret),
+                "the Display keeps the detail for the log"
+            );
+        }
+        let stopped = caller_message(&SE::RecordStopped {
+            issued_by: "op".to_string(),
+            scope: "all".to_string(),
+        });
+        assert!(stopped.contains("stopped by op (scope=all)"), "{stopped}");
+    }
 
     #[test]
     fn storage_gate_running_is_none_stopped_refuses() {

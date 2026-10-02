@@ -3743,7 +3743,14 @@ fn handle_request(
             // so a new tool cannot bypass the SSOT gates (ERRORS-09).
             if !mcp_tool_is_read_only(tool_name) {
                 if let Err(e) = crate::storage::record_stop::gate_storage_conn(conn) {
-                    return err_response(id, jsonrpc::INTERNAL_ERROR, e.to_string());
+                    // #4400: the caller gets our own text only; the error's
+                    // foreign detail goes to the log.
+                    tracing::warn!(code = e.code(), detail = %e, "record-stop gate refused an MCP tool call");
+                    return err_response(
+                        id,
+                        jsonrpc::INTERNAL_ERROR,
+                        crate::storage::record_stop::caller_message(&e),
+                    );
                 }
             }
             let Some(dispatch) = lookup_dispatch(tool_name) else {
@@ -9645,6 +9652,45 @@ mod tests {
             err.message
         );
         assert!(list.error.is_none(), "reads stay live: {:?}", list.error);
+    }
+
+    /// #4400 — the MCP dispatch fence never hands the caller the database
+    /// text behind a record-stop refusal. An unreadable audit chain makes the
+    /// gate refuse fail-closed (#3877) with `RecordStopIndeterminate`, whose
+    /// `reason` is the read error's text; the RPC error must carry our own
+    /// sentence and none of that text. Red if the fence renders
+    /// `e.to_string()` again. A file-backed DB gives the gate a key no other
+    /// test has cached.
+    #[test]
+    fn the_mcp_record_stop_fence_never_renders_database_text_4400() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let conn = db::open(&dir.path().join("fence-4400.db")).unwrap();
+        conn.execute(
+            "ALTER TABLE signed_events RENAME TO signed_events_4400_hidden",
+            [],
+        )
+        .expect("make the record-stop read fail");
+        let resp = invoke_handle_request(
+            &conn,
+            &make_tools_call(
+                "memory_store",
+                json!({"title": "t4400-fence", "content": "unreadable chain"}),
+            ),
+        );
+        let err = resp.error.expect("the write is refused fail-closed");
+        // The gate's `reason` is the read error's text; the caller gets our
+        // own sentence, exactly, and none of that reason.
+        let ours = crate::storage::record_stop::caller_message(
+            &crate::storage::StorageError::RecordStopIndeterminate {
+                reason: String::new(),
+            },
+        );
+        assert!(
+            !err.message.contains("read_state_sqlite"),
+            "no database text reaches the caller: {}",
+            err.message
+        );
+        assert_eq!(err.message, ours, "the refusal is our own sentence");
     }
 
     /// Same #3475 treatment as its sibling above.
