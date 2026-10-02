@@ -863,6 +863,16 @@ pub(crate) mod contamination_marker;
 pub(crate) use contamination_marker::StampAuthority;
 pub(crate) mod decontaminate;
 mod lifecycle_write;
+// #4023 — the in-transaction peer-scope re-check on the sqlite federation merge
+// (`merge_inbound_authorized` + its typed refusal + the shared refusal
+// builder). Its own child module so this file's qual_10 ceiling is not
+// consumed by it; re-exported below so every `db::` / `storage::` path is
+// unchanged.
+mod merge_inbound_authorized_4023;
+pub use merge_inbound_authorized_4023::{
+    InboundStoredNamespaceRefused, StoredNamespaceAuthorizer, inbound_stored_namespace_refused,
+    merge_inbound_authorized,
+};
 // `pub` (rather than `pub(crate)`) so the V-4 closeout
 // integration test suite (`tests/signed_events_chain_v34.rs`) can
 // invoke `migrate_v34_backfill_chain` directly to exercise the
@@ -18717,106 +18727,20 @@ pub fn archived_namespace_by_id(conn: &Connection, id: &str) -> Result<Option<St
 /// Bubbles up rusqlite / serde errors from the read, the merge-write, or
 /// the `insert_if_newer` fall-through. On any error inside the merge
 /// transaction the partial write is rolled back.
+///
+/// **UNCHECKED (#4023).** This wrapper does NOT re-authorize the pushing
+/// peer's namespace scope against the row it locks (it forwards a `None`
+/// authorizer). Tests and the sqlite adapter delegation only; every
+/// production federation caller must use [`merge_inbound_authorized`], and
+/// `tests/merge_inbound_unchecked_ceiling_4023.rs` pins that mechanically.
 pub fn merge_inbound(
     conn: &Connection,
     inbound: &Memory,
     receiver_verified: bool,
 ) -> Result<String> {
-    // Wave-2 B2 — record-stop fence on the same-id overwrite path.
-    // `insert_if_newer` (no-row fall-through) already gated; the existing-row
-    // branch used to bypass via `overwrite_full_row_by_id`. Federation-receive
-    // (`handlers/federation_receive.rs`) calls this free-fn directly, so the
-    // SAL `SqliteStore::merge_inbound` gate is not sufficient (ERRORS-09).
-    crate::storage::record_stop::gate_storage_conn(conn)?;
-    // Take the write lock up front so the read-merge-write is atomic
-    // against a concurrent peer push (BEGIN IMMEDIATE — same idiom as
-    // `consolidate` / `size_gc`).
-    let write_txn = connection::WriteTxn::begin(conn)?;
-    let tx_result = (|| -> Result<Option<String>> {
-        // Boids item 3 R2.2 (#3905) — `get_any`, not `get`: `get` hides
-        // system-only rows, so a contaminated local row fell through to the
-        // insert lane instead of reaching `merge_memory` (whose R2.1
-        // predicate keeps the local taint). The postgres twin already reads
-        // the raw row by id (`SQL_SELECT_MEMORY_ROW_BY_ID`).
-        match get_any(conn, &inbound.id)? {
-            Some(existing) => {
-                // #2123 — backend parity with `PostgresStore::merge_inbound`:
-                // the same-`id` field-merge path persists via
-                // `overwrite_full_row_by_id`, which (deliberately) bypasses
-                // the `insert` / `insert_if_newer` chokepoints — so pre-#2123
-                // this funnel consulted NEITHER the pre-write governance hook
-                // NOR the covenant clause-1 inbound why_trace gate NOR the
-                // secret screen, while the postgres twin runs all three.
-                // Screen first (ALWAYS redact, NEVER refuse — a refused
-                // inbound row would diverge replicas, env #95), then consult
-                // governance (refusal rolls the merge back, postgres parity),
-                // then the never-refuse inbound why_trace gate (advisory
-                // WARN + forensic record only — CRDT convergence is the
-                // load-bearing property of the merge primitive).
-                let screened = crate::secret_screen::redact_memory_for_receive(inbound);
-                let inbound = screened.as_ref().unwrap_or(inbound);
-                consult_governance_pre_write(inbound)?;
-                consult_why_trace_gate_inbound(inbound);
-                // #1719 item 3a — NEVER trust a peer's self-asserted
-                // attestation for the merge tiebreak: neutralize the
-                // inbound's `metadata.attest_level` to `claimed` so a
-                // forged remote cannot win the attested-identity LWW
-                // tiebreak by self-asserting `agent_attested`. Only the
-                // receiver's own stored local level can win on attestation.
-                let sanitized = crate::models::sanitize_inbound_attestation(inbound);
-                // #1755 item 3b — cap a relayed row's post-dated
-                // `updated_at` (the primary LWW key) to a freshness ceiling
-                // so an enrolled relay cannot win the merge by stamping a
-                // far-future timestamp. now + the attestation skew window.
-                let prepared = crate::models::clamp_inbound_updated_at(
-                    sanitized,
-                    &chrono::Utc::now().to_rfc3339(),
-                    crate::identity::attest::ATTEST_CREATED_AT_SKEW_SECS,
-                );
-                // #224 field-wise merge — the SAME pure reconciler the
-                // postgres adapter calls in Rust (no per-backend drift).
-                let merged = crate::models::merge_memory(&existing, &prepared);
-                // #2863 — re-assert the receiver-VERIFIED `agent_attested` level
-                // ATOMICALLY (inside this BEGIN IMMEDIATE tx, before the
-                // content-sealing `overwrite_full_row_by_id`). `sanitize` above
-                // demoted the inbound level to `claimed` for the LWW tiebreak
-                // (correct — a peer must not self-assert), but that must not
-                // DEMOTE a level THIS node verified over the persisted bytes:
-                // when the merged row's full SignableWrite surface + signature is
-                // byte-identical to the verified inbound, restore `agent_attested`.
-                // No-op when `receiver_verified` is false (every non-receive
-                // caller) — byte-identical legacy merge.
-                let merged = crate::models::reassert_verified_attestation(
-                    merged,
-                    inbound,
-                    receiver_verified,
-                );
-                overwrite_full_row_by_id(conn, &merged)?;
-                Ok(Some(merged.id))
-            }
-            // No row by this id — defer to the (title, namespace) dedup
-            // path OUTSIDE this transaction (signalled by `None`).
-            None => Ok(None),
-        }
-    })();
-
-    match tx_result {
-        Ok(Some(id)) => {
-            write_txn.commit()?;
-            Ok(id)
-        }
-        Ok(None) => {
-            // Nothing was written in the merge transaction; close it
-            // cleanly and fall through to the unchanged LWW path
-            // (handles fresh insert + (title, namespace) dedup-upsert).
-            write_txn.commit()?;
-            insert_if_newer(conn, inbound)
-        }
-        Err(e) => {
-            write_txn.rollback();
-            Err(e)
-        }
-    }
+    // UNCHECKED: no peer-scope re-check (#4023). Tests and the sqlite adapter
+    // delegation only — pinned by `tests/merge_inbound_unchecked_ceiling_4023.rs`.
+    merge_inbound_authorized(conn, inbound, receiver_verified, None)
 }
 
 /// v0.8.0 Pillar-3 (#1709 / #224) — persist a fully-merged [`Memory`] by
