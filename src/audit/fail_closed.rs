@@ -71,6 +71,13 @@ static LAST_PROBE_MS: AtomicU64 = AtomicU64::new(0);
 /// latch is set. A retry that succeeded clears the latch only if no failure
 /// landed meanwhile: otherwise that failure's `swap(true)` was a no-op on the
 /// still-set latch and the clear would erase it.
+///
+/// #4479 — every access to this and to [`LATCHED`] on the failure and clear
+/// paths MUST stay `SeqCst`. The proof that a failure is never erased needs
+/// one total order across both atomics: failure = `fetch_add` then `swap`,
+/// clear = `store(false)` then a re-read of this epoch. With Acquire/Release
+/// those can be reordered against each other and an erased failure goes
+/// unnoticed again.
 static FAILURE_EPOCH: AtomicU64 = AtomicU64::new(0);
 
 /// Whether the fail-closed mode is on (read per call, like the other
@@ -181,6 +188,7 @@ fn gate_with(
         // #4464 — clear, then re-check: a failure either set the latch after
         // this store (still latched), or bumped the epoch before it (re-latch
         // here). Either way it is never erased.
+        // Both operations below must stay SeqCst (#4479; see FAILURE_EPOCH).
         LATCHED.store(false, Ordering::SeqCst);
         if FAILURE_EPOCH.load(Ordering::SeqCst) == epoch {
             return Ok(());
