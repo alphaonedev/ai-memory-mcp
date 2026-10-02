@@ -315,10 +315,16 @@ fn fetch_signed_events_for(conn: &Connection, ids: &[String]) -> Result<Vec<Sign
 /// standard memories (walking leaf-first up to the global `*`
 /// standard). Returns `None` when no policy with a
 /// `max_reflection_depth` exists anywhere in the chain.
-fn governance_cap_for_namespace(conn: &Connection, namespace: &str) -> Option<u32> {
+///
+/// # Errors
+///
+/// #4043 — an unreadable policy is an error, never "no cap" (which would
+/// report an over-cap chain as clean).
+fn governance_cap_for_namespace(conn: &Connection, namespace: &str) -> Result<Option<u32>> {
     // #880 — `max_reflection_depth` lives on `CorePolicy` after the
     // governance decomposition; wire format unchanged.
-    crate::db::resolve_governance_policy(conn, namespace).and_then(|p| p.core.max_reflection_depth)
+    Ok(crate::db::resolve_governance_policy(conn, namespace)?
+        .and_then(|p| p.core.max_reflection_depth))
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -386,7 +392,7 @@ pub fn build_chain_report_at(
             if rd > *entry {
                 *entry = rd;
             }
-            if let Some(cap) = governance_cap_for_namespace(conn, &ns) {
+            if let Some(cap) = governance_cap_for_namespace(conn, &ns)? {
                 any_governance_row = true;
                 #[allow(clippy::cast_sign_loss)]
                 if rd > 0 && rd as u32 > cap {

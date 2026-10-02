@@ -102,7 +102,9 @@ pub mod age_version;
 pub mod dsn;
 // v1.0.0 #3124 R4 — the audited `reown` sweep. Own module for the same
 // qual_10 budget reason as `parity_3064` above.
+mod governance_corrupt_4285;
 mod reown_3124;
+pub use governance_corrupt_4285::list_corrupt_governance_standards_pg;
 mod swarm_rewind;
 // v1.0.0 #3152 — the lifecycle transition applied on the update's OWN
 // transaction (one commit per logical update). Own module for the same
@@ -3316,6 +3318,7 @@ impl PostgresStore {
                 // regression refuses the connect (fail closed) unless the
                 // operator override acknowledges it.
                 store.enforce_lineage_watermarks().await?;
+                store.warn_corrupt_governance_standards_at_boot().await; // #4285
                 // v1.0.0 #2578 — self-heal the v88 composite ordering
                 // indexes on EVERY connect, not only inside the v88 arm.
                 // The arm is FAIL-OPEN (an index is derived, disposable
@@ -32206,12 +32209,22 @@ impl MemoryStore for PostgresStore {
                 }
                 Err(e) => return Err(e),
             };
-            if let Some(Ok(p)) = crate::models::GovernancePolicy::from_metadata(&mem.metadata) {
-                return Ok(Some(if severed {
-                    p.with_severed_standard_floor()
-                } else {
-                    p
-                }));
+            match crate::models::GovernancePolicy::from_metadata(&mem.metadata) {
+                Some(Ok(p)) => {
+                    return Ok(Some(if severed {
+                        p.with_severed_standard_floor()
+                    } else {
+                        p
+                    }));
+                }
+                // #4285 — a corrupt `metadata.governance` is a SEVERED level
+                // (#2503): WARN, floor the result, keep walking to an intact
+                // ancestor. Never NoPolicy, never a hard refusal.
+                Some(Err(e)) => {
+                    governance_corrupt_4285::warn_corrupt(&ns, &standard_id, &e);
+                    severed = true;
+                }
+                None => {}
             }
         }
         if severed {
@@ -32220,6 +32233,68 @@ impl MemoryStore for PostgresStore {
             ));
         }
         Ok(None)
+    }
+
+    /// #4357 — postgres twin of `storage::resolve_require_approval_above_depth`.
+    /// Same governance chain (entitled parents only, #2542), same leaf-first
+    /// walk, and the per-level decision is the SHARED pure function
+    /// `storage::approval_depth_level_decision`, so the two backends cannot
+    /// drift. A level whose standard is unresolvable is skipped (the sqlite
+    /// walk's `continue`); a genuine DATABASE error is propagated so the
+    /// reflect refuses instead of skipping a configured approval gate (fail
+    /// closed — the sqlite helper has no error channel).
+    async fn resolve_require_approval_above_depth(
+        &self,
+        namespace: &str,
+    ) -> StoreResult<Option<u32>> {
+        use crate::storage::{
+            ApprovalDepthLevelState, ApprovalDepthWalk, StandardMetadata,
+            approval_depth_level_state, classify_standard_metadata_value,
+        };
+        let chain = pg_namespace_chain(&self.pool, namespace, true).await?;
+        let mut walk = ApprovalDepthWalk::default();
+        for ns in chain.into_iter().rev() {
+            let row: Option<(Option<String>,)> = sqlx::query_as(SQL_SELECT_STANDARD_ID_BY_NS)
+                .bind(&ns)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| to_store_err("resolve_require_approval_above_depth lookup", e))?;
+            // An unresolvable standard is `Missing` (the shared decision's
+            // `Continue`); #4285 adds the Severed handling in this one place.
+            let state = match row {
+                Some((Some(standard_id),)) => {
+                    // Substrate-internal policy read: admin context, exactly as
+                    // `resolve_governance_policy` (#955) — a private standard
+                    // must still gate.
+                    let ctx =
+                        CallerContext::for_admin(crate::identity::sentinels::GOVERNANCE_INTERNAL);
+                    match self.get(&ctx, &standard_id).await {
+                        Ok(m) => {
+                            // #4285 — the shared classifier: a corrupt or
+                            // non-object level is SEVERED (WARN, continue to the
+                            // ancestor, never a raw key), parity with the sqlite
+                            // walk and the policy walk.
+                            let class = classify_standard_metadata_value(&m.metadata);
+                            if let StandardMetadata::Corrupt(reason) = &class {
+                                governance_corrupt_4285::warn_corrupt_reason(
+                                    &ns,
+                                    &standard_id,
+                                    reason,
+                                );
+                            }
+                            approval_depth_level_state(&class)
+                        }
+                        Err(StoreError::NotFound { .. }) => ApprovalDepthLevelState::Missing,
+                        Err(e) => return Err(e),
+                    }
+                }
+                _ => ApprovalDepthLevelState::Missing,
+            };
+            if let Some(n) = walk.step(state) {
+                return Ok(Some(n));
+            }
+        }
+        Ok(walk.finish())
     }
 
     /// v1.0.0 #3448 — approver-gated REJECT (veto), the postgres twin of
@@ -32622,6 +32697,35 @@ impl MemoryStore for PostgresStore {
                     None
                 }
             }
+            // #4357 — the L1-8 / #3638 reflect pendings the postgres reflect
+            // gates queue. Pre-fix this arm did not exist: a queued
+            // reflection could never be applied on this backend ("unsupported
+            // action_type"). Same payload decoder as the sqlite executor
+            // (`storage::reflect_input_from_pending`); the replay is the
+            // approved write, so no gate re-runs (the approval IS the gate),
+            // exactly as sqlite replays through `storage::reflect::reflect`.
+            "reflect" => {
+                let input = crate::storage::reflect_input_from_pending(&pa).map_err(|e| {
+                    StoreError::InvalidInput {
+                        detail: e.to_string(),
+                    }
+                })?;
+                // #4357 — replay as the REQUESTER's tenant through the trait
+                // `reflect`, never admin: source visibility, the #3696
+                // title-slot admission (a hidden private row of another
+                // principal is refused, not merged into), the why_trace gate,
+                // the attestation posture and the provenance stamp all
+                // re-apply at execute time exactly as on the direct path. The
+                // payload agent is already bound to `requested_by` by
+                // `verify_payload_agent_id` above.
+                let requester = CallerContext::for_agent(&pa.requested_by);
+                let outcome = MemoryStore::reflect(self, &requester, &input, None)
+                    .await
+                    .map_err(|e| StoreError::InvalidInput {
+                        detail: format!("reflect execute failed: {e}"),
+                    })?;
+                Some(outcome.id)
+            }
             other => {
                 return Err(StoreError::InvalidInput {
                     detail: format!("unsupported action_type: {other}"),
@@ -32740,9 +32844,17 @@ impl MemoryStore for PostgresStore {
                 severed = true;
                 continue;
             };
-            if let Some(Ok(p)) = crate::models::GovernancePolicy::from_metadata(&m) {
-                resolved_policy = Some(p);
-                break;
+            match crate::models::GovernancePolicy::from_metadata(&m) {
+                Some(Ok(p)) => {
+                    resolved_policy = Some(p);
+                    break;
+                }
+                // #4285 — corrupt standard = SEVERED level (see the pool twin).
+                Some(Err(e)) => {
+                    governance_corrupt_4285::warn_corrupt(ns, &standard_id, &e);
+                    severed = true;
+                }
+                None => {}
             }
         }
         let resolved_policy = match (resolved_policy, severed) {
