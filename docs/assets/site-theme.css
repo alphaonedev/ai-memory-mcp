@@ -25,6 +25,8 @@
   /* ink (landing) */
   --ink:#1a1712; --ink-mid:#544b3d; --ink-soft:#7a7161;
   --line:#ddd4c2; --line-soft:#e9e2d4; --line-strong:#b9ad95;
+  /* diagram palette (operator 2026-10-02: darker, theme-aligned): strokes and fills deep enough to read on the panel */
+  --dg-stroke:#6b6150; --dg-stroke-soft:#7a7161; --dg-box:#ebe4d4; --dg-zone:#e2d9c5; --dg-teal-soft:#cfe0d6; --dg-slate-soft:#d2dde6; --dg-accent-soft:#ecdcb4; --dg-bad-soft:#f0d2c4; --dg-bad-ink:#8f3a26;
   /* brand (landing) */
   --accent:#b07d10; --accent-deep:#8a6314; --accent-soft:#f2e8cf; --accent-ink:#6e4f0f; --on-accent:#211a0a;
   --teal:#1c5245; --teal-soft:#dfeae3; --good:#2f7d5b;
@@ -38,7 +40,7 @@
   /* compatibility aliases for legacy pages that link this file last */
   /* (values that no landing token defines keep main's site-theme.css values, #4420 CR-5) */
   --bg-raised:#efe9dc; --bg-card:var(--panel); --bg-elev:var(--panel); --bg-code:#efe9dc; --code-bg:#efe9dc;
-  --text:var(--ink); --text-muted:#6f6656; --muted:#6f6656; --text-dim:#8a8272; --dim:#8a8272;
+  --text:var(--ink); --text-muted:#5e5546; --muted:#5e5546; --text-dim:#6f6656; --dim:#6f6656; /* darkened 2026-10-02 for diagram labels */
   --border:var(--line); --border-hi:#c9bfa8; --border-hl:#c9bfa8;
   --cyan:var(--accent); --accent-cyan:var(--accent); --p1:var(--accent);
   --font-sans:var(--sans); --font-mono:var(--mono);
@@ -48,6 +50,7 @@
   --bg:#0c0b08; --bg2:#120f0a; --panel:#15130e; --raise:#191610;
   --ink:#f3eee3; --ink-mid:#bdb2a0; --ink-soft:#988f7f;
   --line:#2a2619; --line-soft:#1f1c13; --line-strong:#4d4533;
+  --dg-stroke:#8a7f6b; --dg-stroke-soft:#988f7f; --dg-box:#1b1811; --dg-zone:#14120d; --dg-teal-soft:#12251f; --dg-slate-soft:#121a21; --dg-accent-soft:#241c0c; --dg-bad-soft:#2a140d; --dg-bad-ink:#e0805f;
   --accent:#e3ad33; --accent-deep:#caa02a; --accent-soft:#241c0c; --accent-ink:#f2c968; --on-accent:#1a1207;
   --teal:#3d7565; --teal-soft:#12251f; --good:#4cba86;
   --bad:#e0805f; --bad-soft:#2a140d;
@@ -60,6 +63,7 @@
   --bg:#0c0b08; --bg2:#120f0a; --panel:#15130e; --raise:#191610;
   --ink:#f3eee3; --ink-mid:#bdb2a0; --ink-soft:#988f7f;
   --line:#2a2619; --line-soft:#1f1c13; --line-strong:#4d4533;
+  --dg-stroke:#8a7f6b; --dg-stroke-soft:#988f7f; --dg-box:#1b1811; --dg-zone:#14120d; --dg-teal-soft:#12251f; --dg-slate-soft:#121a21; --dg-accent-soft:#241c0c; --dg-bad-soft:#2a140d; --dg-bad-ink:#e0805f;
   --accent:#e3ad33; --accent-deep:#caa02a; --accent-soft:#241c0c; --accent-ink:#f2c968; --on-accent:#1a1207;
   --teal:#3d7565; --teal-soft:#12251f; --good:#4cba86;
   --bad:#e0805f; --bad-soft:#2a140d;
@@ -229,49 +233,50 @@ a.am-card:hover{border-color:var(--accent);box-shadow:0 12px 30px -18px var(--ac
 .am-themetog{position:fixed;right:16px;bottom:16px;font-family:var(--mono);font-size:12px;background:var(--panel);border:1px solid var(--line);color:var(--ink-mid);padding:8px 12px;border-radius:10px;cursor:pointer;z-index:60;box-shadow:0 8px 22px -10px rgba(0,0,0,.3)}
 
 /* ------------------------------------------------- dg- inline SVG diagrams */
+/* diagram text: small labels (.t-s) and keys (.t-k) use full/mid ink, not soft ink -- soft ink (~4.4:1 on the panel) washed out at 10-11px (operator, 2026-10-02). */
 .dg{font-family:var(--mono)}
 .dg text{font-family:var(--mono);font-size:12px;fill:var(--ink)}
 .dg .t-h{font-family:var(--disp);font-size:15px;font-weight:800;fill:var(--ink);letter-spacing:-.01em}
 .dg .t-m{font-size:12px;fill:var(--ink)}
-.dg .t-s{font-size:10.5px;fill:var(--ink-soft)}
+.dg .t-s{font-size:10.5px;fill:var(--ink)}
 .dg .t-a{fill:var(--accent-ink);font-weight:600}
 .dg .t-teal{fill:var(--teal);font-weight:600}
 .dg .t-slate{fill:var(--slate);font-weight:600}
-.dg .t-bad{fill:var(--bad);font-weight:600}
-.dg .t-k{font-size:10px;letter-spacing:.14em;fill:var(--ink-soft);font-weight:600}
-.dg .zone{fill:var(--raise);stroke:var(--line-strong);stroke-width:1;stroke-dasharray:4 5}
+.dg .t-bad{fill:var(--dg-bad-ink);font-weight:600}
+.dg .t-k{font-size:10px;letter-spacing:.14em;fill:var(--ink-mid);font-weight:600}
+.dg .zone{fill:var(--dg-zone);stroke:var(--dg-stroke);stroke-width:1.2;stroke-dasharray:4 5}
 .dg .zone.solid{stroke-dasharray:none}
-.dg .zone.teal{fill:var(--teal-soft);stroke:var(--teal)}
-.dg .zone.slate{fill:var(--slate-soft);stroke:var(--slate)}
-.dg .zone.gold{fill:var(--accent-soft);stroke:var(--accent)}
-.dg .box{fill:var(--panel);stroke:var(--line-strong);stroke-width:1.2}
-.dg .box.acc{fill:var(--accent-soft);stroke:var(--accent);stroke-width:1.6}
-.dg .box.teal{fill:var(--teal-soft);stroke:var(--teal);stroke-width:1.4}
-.dg .box.slate{fill:var(--slate-soft);stroke:var(--slate);stroke-width:1.4}
-.dg .box.bad{fill:var(--bad-soft);stroke:var(--bad);stroke-width:1.4}
-.dg .box.ghost{fill:none;stroke:var(--ink-soft);stroke-dasharray:5 4}
+.dg .zone.teal{fill:var(--dg-teal-soft);stroke:var(--teal)}
+.dg .zone.slate{fill:var(--dg-slate-soft);stroke:var(--slate)}
+.dg .zone.gold{fill:var(--dg-accent-soft);stroke:var(--accent-deep)}
+.dg .box{fill:var(--dg-box);stroke:var(--dg-stroke);stroke-width:1.4}
+.dg .box.acc{fill:var(--dg-accent-soft);stroke:var(--accent-deep);stroke-width:1.6}
+.dg .box.teal{fill:var(--dg-teal-soft);stroke:var(--teal);stroke-width:1.4}
+.dg .box.slate{fill:var(--dg-slate-soft);stroke:var(--slate);stroke-width:1.4}
+.dg .box.bad{fill:var(--dg-bad-soft);stroke:var(--bad);stroke-width:1.4}
+.dg .box.ghost{fill:none;stroke:var(--dg-stroke-soft);stroke-dasharray:5 4}
 .dg .box.solidink{fill:var(--ink)}
-.dg .wire{fill:none;stroke:var(--line-strong);stroke-width:1.4}
-.dg .wire.ghost{stroke:var(--ink-soft);stroke-dasharray:3 4}
-.dg .flow{fill:none;stroke:var(--accent);stroke-width:2;stroke-dasharray:7 9;animation:dg-dash 1.6s linear infinite}
+.dg .wire{fill:none;stroke:var(--dg-stroke);stroke-width:1.5}
+.dg .wire.ghost{stroke:var(--dg-stroke-soft);stroke-dasharray:3 4}
+.dg .flow{fill:none;stroke:var(--accent-deep);stroke-width:2.2;stroke-dasharray:7 9;animation:dg-dash 1.6s linear infinite}
 .dg .flow.teal{stroke:var(--teal)}
 .dg .flow.slate{stroke:var(--slate)}
 .dg .flow.bad{stroke:var(--bad)}
 .dg .flow.slow{animation-duration:3.2s}
 .dg .flow.rev{animation-direction:reverse}
-.dg .dot{fill:none;stroke:var(--accent);stroke-width:7;stroke-linecap:round;stroke-dasharray:.5 99.5;animation:dg-travel 3.4s cubic-bezier(.45,.05,.55,.95) infinite;animation-delay:var(--d,0s)}
+.dg .dot{fill:none;stroke:var(--accent-deep);stroke-width:7;stroke-linecap:round;stroke-dasharray:.5 99.5;animation:dg-travel 3.4s cubic-bezier(.45,.05,.55,.95) infinite;animation-delay:var(--d,0s)}
 .dg .dot.teal{stroke:var(--teal)}
 .dg .dot.slate{stroke:var(--slate)}
 .dg .dot.bad{stroke:var(--bad)}
-.dg .pulse{fill:var(--accent);transform-box:fill-box;transform-origin:center;animation:dg-pulse 2.4s ease-out infinite;animation-delay:var(--d,0s)}
+.dg .pulse{fill:var(--accent-deep);transform-box:fill-box;transform-origin:center;animation:dg-pulse 2.4s ease-out infinite;animation-delay:var(--d,0s)}
 .dg .pulse.teal{fill:var(--teal)}
 .dg .pulse.good{fill:var(--good)}
-.dg .ring{fill:none;stroke:var(--accent);stroke-width:1.5;transform-box:fill-box;transform-origin:center;animation:dg-ring 2.8s ease-out infinite;animation-delay:var(--d,0s)}
+.dg .ring{fill:none;stroke:var(--accent-deep);stroke-width:1.5;transform-box:fill-box;transform-origin:center;animation:dg-ring 2.8s ease-out infinite;animation-delay:var(--d,0s)}
 .dg .ring.teal{stroke:var(--teal)}
 .dg .rise{animation:dg-rise .7s cubic-bezier(.2,.7,.2,1) both;animation-delay:var(--d,0s)}
 .dg .blink{animation:dg-blink 2.2s ease-in-out infinite;animation-delay:var(--d,0s)}
-.dg .arrow{fill:var(--line-strong)}
-.dg .arrow.acc{fill:var(--accent)}
+.dg .arrow{fill:var(--dg-stroke)}
+.dg .arrow.acc{fill:var(--accent-deep)}
 .dg .arrow.teal{fill:var(--teal)}
 .dg .arrow.slate{fill:var(--slate)}
 .dg .arrow.bad{fill:var(--bad)}
