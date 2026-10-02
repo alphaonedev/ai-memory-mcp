@@ -78,6 +78,9 @@ pub(crate) mod pg_migration_lock;
 /// stop-attestation. Backend-agnostic flag/attestation logic + the
 /// per-DB sqlite flag registry.
 pub mod record_stop;
+/// #4026 — the outcome type of `MemoryStore::apply_remote_signal`.
+mod remote_signal;
+pub use remote_signal::RemoteSignalApply;
 
 /// v1.0.0 #3152 — one commit per logical `update` (patch + lifecycle
 /// transition), proven by refusal, visibility and crash tests on both
@@ -3159,22 +3162,45 @@ pub trait MemoryStore: Send + Sync {
     /// [`signal_send`](MemoryStore::signal_send) so both adapters get it with no
     /// per-backend SQL (mirrors [`apply_remote_deletion`](MemoryStore::apply_remote_deletion)).
     ///
-    /// Idempotent on the signal UUID (a replay no-ops, returning the
-    /// `unsigned` label). The signal is persisted verbatim with its embedded
-    /// signature / `sender_pubkey` (never re-signed). Returns `self_signed`
-    /// when that embedded signature verifies, else `unsigned`.
+    /// Idempotent on the signal UUID. The signal is persisted verbatim with its
+    /// embedded signature / `sender_pubkey` (never re-signed).
+    ///
+    /// # Returns
+    ///
+    /// #4026 — [`RemoteSignalApply::Inserted`] (carrying `SelfSigned` when the
+    /// embedded signature verifies, else `Unsigned`) when THIS call persisted
+    /// the signal, or [`RemoteSignalApply::AlreadyPresent`] when the UUID was
+    /// already stored and nothing was written. The federation receive funnel
+    /// charges storage quota before this call and refunds on every outcome that
+    /// is not `Inserted`, so the variants must describe what this call wrote.
     ///
     /// # Errors
     ///
-    /// Returns `InvalidInput` when the signal carries a present-but-invalid
-    /// signature (forged), or `Backend` on a storage error.
+    /// `InvalidInput` when the signal carries a present-but-invalid signature
+    /// (forged), or `Backend` on a storage error. A CONCURRENT duplicate that
+    /// inserts the same UUID after the existence probe is NOT an error on
+    /// PostgreSQL (#4370): the adapter classifies the `signals` primary-key
+    /// loss (SQLSTATE 23505 on that constraint) and returns
+    /// [`RemoteSignalApply::AlreadyPresent`], the converged no-op, as the
+    /// existence probe does. This default composes `signal_send`, so an adapter
+    /// that does not override it still surfaces that loss as `Err`.
+    ///
+    /// **Invariant (#4026): `Err` means this call persisted nothing**, modulo
+    /// one residual. Every error arm returns before the single `signal_send`
+    /// insert, or IS that insert failing atomically, so a caller may refund a
+    /// pre-charge on `Err` without risking an under-count. The residual is an
+    /// AMBIGUOUS COMMIT on PostgreSQL: a connection that drops after the server
+    /// committed but before the acknowledgement arrives returns `Err` with the
+    /// row stored, and the refund then under-charges that author by one signal's
+    /// bytes (no row is lost or corrupted; a peer cannot induce it). An adapter
+    /// that overrides this method must keep the invariant.
     async fn apply_remote_signal(
         &self,
         ctx: &CallerContext,
         signal: &crate::models::Signal,
-    ) -> StoreResult<&'static str> {
+    ) -> StoreResult<RemoteSignalApply> {
         if self.signal_get(ctx, &signal.id).await?.is_some() {
-            return Ok(crate::models::AttestLevel::Unsigned.as_str());
+            return Ok(RemoteSignalApply::AlreadyPresent);
         }
         let signed_ok = !signal.signature.is_empty() && crate::signals::verify(signal);
         if !signal.signature.is_empty() && !signed_ok {
@@ -3183,11 +3209,11 @@ pub trait MemoryStore: Send + Sync {
             });
         }
         self.signal_send(ctx, signal, None).await?;
-        Ok(if signed_ok {
-            crate::models::AttestLevel::SelfSigned.as_str()
+        Ok(RemoteSignalApply::Inserted(if signed_ok {
+            crate::models::AttestLevel::SelfSigned
         } else {
-            crate::models::AttestLevel::Unsigned.as_str()
-        })
+            crate::models::AttestLevel::Unsigned
+        }))
     }
 
     // ==================================================================
@@ -3973,6 +3999,16 @@ pub trait MemoryStore: Send + Sync {
     /// and `"self_signed"` is returned. Otherwise the signal lands verbatim
     /// (`signature` / `sender_pubkey` as supplied — empty for an unsigned
     /// send) and `"unsigned"` is returned.
+    ///
+    /// # Invariant (#4026)
+    ///
+    /// An `Err` means no row was stored, modulo the PostgreSQL ambiguous-commit
+    /// residual documented on [`apply_remote_signal`](MemoryStore::apply_remote_signal)
+    /// (a dropped acknowledgement can return `Err` with the row stored; the refund
+    /// then under-charges by one signal). Its callers refund their quota
+    /// pre-charge on `Err`. A future insert-if-absent
+    /// override must report `rows_affected == 0` as
+    /// [`RemoteSignalApply::AlreadyPresent`] (see that type), never as stored.
     ///
     /// Default `UnsupportedCapability`.
     async fn signal_send(

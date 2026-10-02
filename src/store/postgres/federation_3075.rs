@@ -306,18 +306,24 @@ impl PostgresStore {
 
 /// Whether a `StoreError` carries a postgres UNIQUE / PRIMARY-KEY violation —
 /// the shape a losing concurrent INSERT of the same checkpoint id takes
-/// (`checkpoints.id` is the PRIMARY KEY). The sqlite twin asks the same
-/// question of `rusqlite::ErrorCode::ConstraintViolation`; both turn a lost
-/// insert race into the documented first-resolution-wins disposition instead of
-/// a hard error.
+/// (`checkpoints.id` is the PRIMARY KEY, and the table has no other unique
+/// index, so SQLSTATE `23505` from the single `checkpoint_create` INSERT can
+/// only be that key). The sqlite twin asks the same question of
+/// `rusqlite::ErrorCode::ConstraintViolation`; both turn a lost insert race
+/// into the documented first-resolution-wins disposition instead of a hard
+/// error.
+///
+/// #4370 — classified on the STRUCTURED SQLSTATE `to_store_err` preserves on
+/// `BackendUnavailable`. The previous body matched only `StoreError::Backend`
+/// and searched its rendered message, but this adapter never builds that
+/// variant for a database error, so the arm was unreachable and a lost race
+/// surfaced as a hard error (counted `skipped`).
 fn is_unique_violation(err: &super::StoreError) -> bool {
-    let super::StoreError::Backend(source) = err else {
-        return false;
-    };
-    // sqlx surfaces the SQLSTATE in the rendered message; the class is
-    // `23505 unique_violation`. Matching the CODE (not prose) keeps this
-    // independent of the server's locale and of sqlx's wrapper wording.
-    source.to_string().contains(PG_UNIQUE_VIOLATION_SQLSTATE)
+    matches!(
+        err,
+        super::StoreError::BackendUnavailable { sqlstate: Some(code), .. }
+            if code == PG_UNIQUE_VIOLATION_SQLSTATE
+    )
 }
 
 /// SQLSTATE `23505` — `unique_violation`.
