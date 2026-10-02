@@ -57,7 +57,7 @@ async fn serve(route: &str, body: Value) -> MockServer {
 }
 
 fn ollama_client(server: &MockServer) -> OllamaClient {
-    OllamaClient::new_for_tests_without_probe(&server.uri(), "test-model").unwrap()
+    OllamaClient::new_with_url_no_health_check(&server.uri(), "test-model").unwrap()
 }
 
 fn openai_client(server: &MockServer) -> OllamaClient {
