@@ -221,10 +221,22 @@ def self_test(out_dir: pathlib.Path) -> int:
         untr = mkrepo(os.path.join(d, 'untracked'), {'tests/new_fixture.rs': VIOL})
         rc, out = run_in(untr)
         scan_cells.append(('an UNTRACKED new test file is scanned (--untracked)', rc == 1 and 'INVARIANT VIOLATION' in out, f'rc={rc}'))
-        trk = mkrepo(os.path.join(d, 'tracked'), {'tests/committed.rs': VIOL})
+        # src/lib.rs carries the SAME violating text, so the out-of-corpus cell below proves the
+        # hazard (a non-test file named as a violator) and not merely a message: without the corpus
+        # guard this path is reported as an INVARIANT VIOLATION with rc 1.
+        trk = mkrepo(os.path.join(d, 'tracked'), {'tests/committed.rs': VIOL, 'src/lib.rs': VIOL})
         subprocess.run(['git', '-C', trk, 'add', '-A'], check=True)
         rc, out = run_in(trk)
         scan_cells.append(('a TRACKED test file is scanned (control)', rc == 1 and 'INVARIANT VIOLATION' in out, f'rc={rc}'))
+        rc, out = run_in(trk, args=('--only', 'tests/does-not-exist.rs'))
+        scan_cells.append(('--only on a MISSING path exits 2, not 1 (1 means "violation found")',
+                           rc == 2 and 'not a readable file' in out, f'rc={rc}'))
+        rc, out = run_in(trk, args=('--only', 'src/lib.rs'))
+        scan_cells.append(('--only OUTSIDE tests/**/*.rs is refused (no false mapping)',
+                           rc == 2 and 'outside this gate' in out, f'rc={rc}'))
+        rc, out = run_in(trk, args=('--only', 'tests/committed.rs'))
+        scan_cells.append(('--only on a corpus file still works (control)',
+                           rc == 1 and 'INVARIANT VIOLATION' in out, f'rc={rc}'))
     for name, ok, detail in scan_cells:
         passed, failed = passed + ok, failed + (not ok)
         print(f'  [{"ST-ok" if ok else "ST-FAIL"}] scan: {name} ({detail})')
@@ -242,6 +254,8 @@ def self_test(out_dir: pathlib.Path) -> int:
 ap = argparse.ArgumentParser(add_help=True)
 ap.add_argument('--self-test', action='store_true')
 ap.add_argument('--only', default=None)
+ap.add_argument('--force-only', action='store_true',
+                help='allow --only on a path outside tests/**/*.rs (verdict is advice, not a gate)')
 ap.add_argument('--selftest-dir', default='.local-runs/selftest-keydir')
 a = ap.parse_args()
 
@@ -249,7 +263,24 @@ if a.self_test:
     sys.exit(self_test(pathlib.Path(a.selftest_dir)))
 
 if a.only:
-    files = [pathlib.Path(a.only)]
+    # --only must not be able to produce a MISLEADING exit. Two holes found by probing my own gate
+    # after f2r found the enumeration one:
+    #   * a missing path raised FileNotFoundError and exited 1 -- the same code as "violation found",
+    #     so a typo read as a finding;
+    #   * a path outside the corpus could be reported as an INVARIANT VIOLATION. This script itself
+    #     does, because it embeds the self-test fixtures as string literals; a gate that can name a
+    #     non-test file as a violator is a false mapping (rule k), even on a path a human typed.
+    only = pathlib.Path(a.only)
+    if not re.fullmatch(r'tests/[^/]+\.rs|tests/.+/[^/]+\.rs', a.only) and not a.force_only:
+        print(f'REFUSED: --only {a.only} is outside this gate\'s corpus (tests/**/*.rs).\n'
+              '  The invariant is about TEST fixtures; naming anything else a violator would be a\n'
+              '  false mapping. Pass --force-only to scan it anyway (and read the verdict as advice).')
+        sys.exit(2)
+    if not only.is_file():
+        print(f'REFUSED: --only {a.only} is not a readable file -- exiting 2 rather than 1, because 1\n'
+              '  means "a violation was found" and a typo must not be able to look like a finding.')
+        sys.exit(2)
+    files = [only]
 else:
     try:
         files = candidates()
