@@ -50,11 +50,16 @@ COPY vendor/ vendor/
 # Default cargo features are only `sqlite-bundled`; without `sal`, SAL store
 # paths and several daemon federation workers stay compiled out. Gate3 cert
 # measured an asserted feature build; GHCR/deb must not silently ship less.
+# #4480 — the image is a shipped artifact with the same promise as the release
+# binaries: it is built with the feature set declared ONCE in
+# scripts/release-features.sh (sal,sal-postgres: PostgreSQL + AGE + pgvector,
+# sqlx on rustls, no libpq / system OpenSSL at runtime) and asserts the same set.
 COPY scripts/assert-compiled-features.sh scripts/assert-compiled-features.sh
-RUN cargo build --release --features sal \
+COPY scripts/release-features.sh scripts/release-features.sh
+RUN cargo build --release --features "$(bash scripts/release-features.sh)" \
     && strip target/release/ai-memory \
     && bash scripts/assert-compiled-features.sh target/release/ai-memory \
-         --require sqlite-bundled --require sal
+         $(bash scripts/release-features.sh --require-flags)
 
 # ---- Runtime stage ----
 FROM debian:bookworm-slim

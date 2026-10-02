@@ -20,7 +20,9 @@
 #   4. .github/workflows/release-shape.yml (the release-shaped proof) is
 #      missing or does not build from release-features.sh and run
 #      scripts/release-shape-pg-proof.sh;
-#   5. docs/INSTALL.md "Pre-built Binaries" does not name sal-postgres, or
+#   5. the Dockerfile (the published GHCR image) builds with
+#      `release-features.sh` and asserts `release-features.sh --require-flags`;
+#   6. docs/INSTALL.md "Pre-built Binaries" does not name sal-postgres, or
 #      still says the postgres daemon path needs a source build.
 #
 # Usage: scripts/check-release-features.sh [repo-root]
@@ -72,7 +74,20 @@ else
     || bad "release-shape.yml does not run scripts/release-shape-pg-proof.sh"
 fi
 
-# 5. the install docs state the shipped feature set.
+# 5. the Dockerfile follows the same declaration (the image ships the tier too).
+dockerfile="$root/Dockerfile"
+if [[ ! -f "$dockerfile" ]]; then
+  bad "Dockerfile is missing"
+else
+  grep -E 'cargo build' "$dockerfile" | grep -q 'scripts/release-features.sh' \
+    || bad "Dockerfile cargo build does not read scripts/release-features.sh"
+  grep -q 'release-features.sh --require-flags' "$dockerfile" \
+    || bad "Dockerfile assert step does not use 'release-features.sh --require-flags'"
+  grep -q 'COPY scripts/release-features.sh' "$dockerfile" \
+    || bad "Dockerfile does not COPY scripts/release-features.sh into the build stage"
+fi
+
+# 6. the install docs state the shipped feature set.
 section="$(sed -n '/^## Pre-built Binaries/,/^## /p' "$install" 2>/dev/null || true)"
 case "$section" in
   *sal-postgres*) ;;

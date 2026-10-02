@@ -15,9 +15,14 @@
 # is no skip path. What only the release matrix itself proves: the macOS and
 # aarch64-linux cross builds (this job builds the host target, x86_64 linux).
 #
-# Advisory until the tier is declared required (scripts/qc-allowlists/
-# required-contexts-not-required.txt does not cover this workflow: it is not
-# in COVERED_WORKFLOWS). The same feature declaration gates release.yml.
+# ADVISORY (continue-on-error) by GOD's ruling on #4480: this workflow lands
+# untried, so its failure must not block a merge or a release until it has run
+# green once. It flips to REQUIRED (drop `continue-on-error`, declare the
+# context) after the first green run on main. It is not in COVERED_WORKFLOWS of
+# scripts/check-required-contexts.sh and is named by no doc as an enforcing
+# gate (scripts/check-ci-job-claims.sh). The feature declaration itself is
+# enforced separately and BLOCKING by scripts/check-release-features.sh
+# (c8-precheck), and gates release.yml and the Dockerfile.
 
 name: Release-shaped build + PostgreSQL TLS proof (#4480)
 
@@ -51,6 +56,8 @@ jobs:
   release-shape:
     name: "Release-shaped build + PG TLS proof"
     runs-on: ubuntu-latest
+    # Advisory until the first green run on main (#4480, GOD ruling).
+    continue-on-error: true
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
