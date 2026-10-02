@@ -1443,6 +1443,22 @@ fn emit_check_event(
             );
             return Ok(());
         }
+        Err(crate::storage::StorageError::AuditTrailUnavailable { .. }) => {
+            // #4465 — the flat audit trail failed under
+            // AI_MEMORY_REQUIRE_AUDIT_TRAIL (#4400): the gate refuses every
+            // record-plane write in this process, this signed row included.
+            crate::metrics::inc_governance_check_audit_suppressed();
+            tracing::warn!(
+                target: crate::governance::GOVERNANCE_RULES_TRACE_TARGET,
+                agent_id,
+                kind = action.kind(),
+                "#4465: governance.check audit row SUPPRESSED — the flat audit trail \
+                 is not recording and {} is set (verdict returned; forensic emit \
+                 live; clears when the trail records again)",
+                crate::audit::REQUIRE_AUDIT_TRAIL_ENV
+            );
+            return Ok(());
+        }
         Err(e) => {
             crate::metrics::inc_governance_check_audit_suppressed();
             tracing::warn!(

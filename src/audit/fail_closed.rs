@@ -29,8 +29,12 @@
 //!   not from client events.
 //! - A one-shot CLI process cannot latch before its single write; it relies on
 //!   the #3651 boot refusal when the trail cannot initialise.
-//! - This is the flat SIEM trail (`src/audit.rs`), not the `signed_events` or
-//!   forensic chains.
+//! - This guards the flat SIEM trail (`src/audit.rs`), not the `signed_events`
+//!   or forensic chains. But it refuses through the record-stop gate, so a
+//!   latched process also refuses the signed `governance.check` rows it would
+//!   append (#4465; each counted, the verdict still returned).
+//! - `doctor` reports the latch of the `doctor` process itself. For a running
+//!   daemon, watch its `/metrics` gauge [`AUDIT_TRAIL_LATCHED_GAUGE`].
 //!
 //! # Clearing the latch
 //! A gated write that finds the latch set first appends a real
@@ -62,6 +66,12 @@ static LATCHED: AtomicBool = AtomicBool::new(false);
 
 /// Wall-clock milliseconds of the last retry; 0 = never.
 static LAST_PROBE_MS: AtomicU64 = AtomicU64::new(0);
+
+/// #4464 — bumped by every counted failure while the mode is on, BEFORE the
+/// latch is set. A retry that succeeded clears the latch only if no failure
+/// landed meanwhile: otherwise that failure's `swap(true)` was a no-op on the
+/// still-set latch and the clear would erase it.
+static FAILURE_EPOCH: AtomicU64 = AtomicU64::new(0);
 
 /// Whether the fail-closed mode is on (read per call, like the other
 /// direct-read `AI_MEMORY_REQUIRE_*` knobs).
@@ -95,7 +105,11 @@ pub fn audit_trail_latched() -> bool {
 
 /// Called on every counted emit failure: latch when the mode is on.
 pub(super) fn note_failure_for_latch() {
-    if require_audit_trail_enabled() && !LATCHED.swap(true, Ordering::SeqCst) {
+    if !require_audit_trail_enabled() {
+        return;
+    }
+    FAILURE_EPOCH.fetch_add(1, Ordering::SeqCst);
+    if !LATCHED.swap(true, Ordering::SeqCst) {
         let line = format!(
             "ai-memory: the audit trail failed and {REQUIRE_AUDIT_TRAIL_ENV} is set: \
              mutating operations are refused until the trail records again (reads \
@@ -157,14 +171,21 @@ fn gate_with(
     }
     let last = LAST_PROBE_MS.load(Ordering::SeqCst);
     let due = last == 0 || now_ms.saturating_sub(last) >= PROBE_INTERVAL_MS;
+    let epoch = FAILURE_EPOCH.load(Ordering::SeqCst);
     if due
         && LAST_PROBE_MS
             .compare_exchange(last, now_ms.max(1), Ordering::SeqCst, Ordering::SeqCst)
             .is_ok()
         && probe()
     {
+        // #4464 — clear, then re-check: a failure either set the latch after
+        // this store (still latched), or bumped the epoch before it (re-latch
+        // here). Either way it is never erased.
         LATCHED.store(false, Ordering::SeqCst);
-        return Ok(());
+        if FAILURE_EPOCH.load(Ordering::SeqCst) == epoch {
+            return Ok(());
+        }
+        LATCHED.store(true, Ordering::SeqCst);
     }
     Err(AuditTrailUnavailable {
         reason: format!(
@@ -271,6 +292,25 @@ mod tests {
             "a successful retry clears the latch"
         );
         reset_for_test();
+    }
+
+    /// #4464 — a failure that lands while the retry is appending (another
+    /// request's emit failing concurrently) is not erased by the retry's
+    /// success: the process stays latched and this request is refused.
+    /// Red before the fix: the clear was unconditional.
+    #[test]
+    fn a_failure_during_a_successful_retry_keeps_the_latch_4464() {
+        let _g = lock();
+        force_on_for_test(true);
+        LATCHED.store(true, Ordering::SeqCst);
+        let r = gate_with(true, 50_000, || {
+            // A concurrent emit failure, landing while the retry appends.
+            note_failure_for_latch();
+            true
+        });
+        assert!(r.is_err(), "the concurrent failure must keep refusing");
+        assert!(audit_trail_latched(), "the latch survives the retry");
+        force_on_for_test(false);
     }
 
     /// Latched but the mode was turned off: allowed, latch cleared, no retry.
