@@ -141,8 +141,9 @@ certification and triggers re-cert** (see §7).
 > lock): **`overall: PASS`, 15 `[PROVEN]` (`broken→RED (rc=101),
 > restored→GREEN (rc=0)` each), 0 `[CERT-RED]`**, rc 0; the tracked tree was
 > byte-identical after the run. Full log `cert-385da3a05/removal-proof-full.log`.
-> This is the ONE removal proof for the batch: the merger's landing guard
-> cites this run (copied with a provenance line) rather than running its own.
+> This standalone run is the §7 artifact. The batch-6 landing gate also ran
+> the removal proof in-gate on the same tip (`check-cert-removal-proof.sh`
+> EXIT 0), a second, independent run by the merger.
 >
 > **Bootstrap cert gate** — `scripts/check-bootstrap-cert-gate.sh` (the
 > two-shape gate from #4333 v2) on its SELF-BUILD path, both binaries built by
