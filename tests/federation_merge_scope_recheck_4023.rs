@@ -301,6 +301,93 @@ async fn stale_scope_verdict_refused_after_concurrent_move_sqlite_4023() {
 }
 
 // ---------------------------------------------------------------------
+// sqlite — the refusal comes from the IN-TRANSACTION re-check (review N3).
+// ---------------------------------------------------------------------
+
+/// Set by the narrow connection's busy handler the moment its write waits on
+/// the broader writer's lock: the exact barrier (no sleep-based guess).
+static BLOCKED_4023: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn busy_cb_4023(attempt: i32) -> bool {
+    BLOCKED_4023.store(true, std::sync::atomic::Ordering::SeqCst);
+    std::thread::sleep(Duration::from_millis(10));
+    attempt < 2000
+}
+
+/// The HTTP race cell above can only see counters, and it passes on a stalled
+/// host when the move commits BEFORE the push (the funnel's own pre-check then
+/// refuses without ever reaching the merge transaction). This cell drives
+/// `db::merge_inbound_authorized` directly behind a deterministic lock barrier
+/// and asserts the refusal is the typed in-transaction one: its text names
+/// "(#4023 in-transaction re-check)". With the in-transaction re-check
+/// disabled the merge lands instead and this cell is red.
+#[test]
+fn in_transaction_recheck_is_the_refusal_path_sqlite_4023() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("recheck-4023.db");
+    let public_root = uniq("public");
+    let secure_ns = uniq("secure/ops");
+    let in_scope_ns = format!("{public_root}/shared");
+    let id = uuid::Uuid::new_v4().to_string();
+    {
+        let seed = ai_memory::db::open(&path).expect("db::open");
+        let row = seed_row(&id, &in_scope_ns);
+        ai_memory::db::insert(&seed, &row).expect("seed row");
+    }
+    let broad = ai_memory::db::open(&path).expect("broad connection");
+    broad.execute_batch("BEGIN IMMEDIATE").expect("write lock");
+    BLOCKED_4023.store(false, std::sync::atomic::Ordering::SeqCst);
+
+    let narrow_path = path.clone();
+    let (id2, root2, ns2) = (id.clone(), public_root.clone(), in_scope_ns.clone());
+    let handle = std::thread::spawn(move || {
+        let narrow = ai_memory::db::open(&narrow_path).expect("narrow connection");
+        narrow
+            .busy_handler(Some(busy_cb_4023))
+            .expect("install busy handler");
+        let mut inbound = seed_row(&id2, &ns2);
+        inbound.content = "narrow peer overwrite".to_string();
+        inbound.updated_at = "2026-06-01T00:00:00+00:00".to_string();
+        let prefix = format!("{root2}/");
+        let auth = move |stored: &str| stored.starts_with(&prefix);
+        ai_memory::db::merge_inbound_authorized(&narrow, &inbound, false, Some(&auth))
+    });
+    let mut waited = false;
+    for _ in 0..2000 {
+        if BLOCKED_4023.load(std::sync::atomic::Ordering::SeqCst) {
+            waited = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(waited, "the merge never reached the write lock");
+    broad
+        .execute(
+            "UPDATE memories SET namespace = ?1 WHERE id = ?2",
+            rusqlite::params![secure_ns, id],
+        )
+        .expect("broader writer moves the row");
+    broad.execute_batch("COMMIT").expect("commit move");
+
+    let outcome = handle.join().expect("merge thread");
+    let err = outcome.expect_err("the merge must be refused on the moved row");
+    assert!(
+        err.to_string().contains("(#4023 in-transaction re-check)"),
+        "#4023 (sqlite): the refusal must come from the in-transaction re-check, got: {err}"
+    );
+    let check = ai_memory::db::open(&path).expect("check connection");
+    let (ns, content): (String, String) = check
+        .query_row(
+            "SELECT namespace, content FROM memories WHERE id = ?1",
+            rusqlite::params![id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .expect("moved row");
+    assert_eq!(ns, secure_ns);
+    assert_eq!(content, ORIGINAL_CONTENT);
+}
+
+// ---------------------------------------------------------------------
 // postgres — the issue's primary finding.
 // ---------------------------------------------------------------------
 
