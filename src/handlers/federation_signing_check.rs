@@ -909,6 +909,29 @@ pub(super) async fn sync_push_via_store(
             .into_response();
     }
 
+    // #4447 — the by-id lanes below (deletions / archives / restores / links)
+    // each probe a target row's STORED namespace on a read that precedes the
+    // write transaction; a broader writer on a second connection (or process)
+    // can move the row out of the peer's scope in between. Each lane's write is
+    // therefore the `*_authorized` store method, which re-evaluates THIS verdict on
+    // the namespace read under the row lock (`FOR UPDATE` / the write transaction). The verdict is the same shared
+    // `inbound_by_id_namespace_authorized` the pre-check uses, with the stored
+    // namespace elided exactly when the pre-check elides it (Layer 2 only).
+    let by_id_needs_stored = crate::federation::receive_auth::peer_declares_namespace_scope(
+        peer_header_owned.as_deref(),
+        &attest_cfg,
+    );
+    let by_id_verdict = |lane: &str, id: &str, stored: &str| -> bool {
+        crate::federation::receive_auth::inbound_by_id_namespace_authorized(
+            lane,
+            id,
+            by_id_needs_stored.then_some(stored),
+            &attest_cfg,
+            peer_header_owned.as_deref(),
+            require_push_ns_scope,
+        )
+    };
+
     // ---- deletions ---------------------------------------------------
     for del_id in &body.deletions {
         if validate::validate_id(del_id).is_err() {
@@ -986,7 +1009,13 @@ pub(super) async fn sync_push_via_store(
                 continue;
             }
         }
-        match app.store.apply_remote_deletion(&ctx, del_id).await {
+        match app
+            .store
+            .apply_remote_deletion_authorized(&ctx, del_id, &|id: &str, stored: &str| {
+                by_id_verdict(crate::federation::receive_auth::LANE_DELETIONS, id, stored)
+            })
+            .await
+        {
             Ok(true) => deleted += 1,
             Ok(false) => noop += 1,
             Err(e) => {
@@ -1142,7 +1171,13 @@ pub(super) async fn sync_push_via_store(
             }
             _ => crate::models::AttestLevel::Unsigned.as_str(),
         };
-        match app.store.apply_remote_link(&ctx, link, attest_level).await {
+        match app
+            .store
+            .apply_remote_link_authorized(&ctx, link, attest_level, &|id: &str, stored: &str| {
+                by_id_verdict(crate::federation::receive_auth::LANE_LINKS, id, stored)
+            })
+            .await
+        {
             Ok(()) => links_applied += 1,
             Err(e) => {
                 tracing::warn!(
@@ -1942,7 +1977,13 @@ pub(super) async fn sync_push_via_store(
             }
         }
         let apply_ctx = federation_apply_ctx(body.sender_agent_id.clone());
-        match app.store.apply_remote_archive(&apply_ctx, arch_id).await {
+        match app
+            .store
+            .apply_remote_archive_authorized(&apply_ctx, arch_id, &|id: &str, stored: &str| {
+                by_id_verdict(crate::federation::receive_auth::LANE_ARCHIVES, id, stored)
+            })
+            .await
+        {
             Ok(true) => archived += 1,
             Ok(false) => noop += 1,
             Err(e) => {
@@ -1994,7 +2035,13 @@ pub(super) async fn sync_push_via_store(
             }
         }
         let apply_ctx = federation_apply_ctx(body.sender_agent_id.clone());
-        match app.store.apply_remote_restore(&apply_ctx, res_id).await {
+        match app
+            .store
+            .apply_remote_restore_authorized(&apply_ctx, res_id, &|id: &str, stored: &str| {
+                by_id_verdict(crate::federation::receive_auth::LANE_RESTORES, id, stored)
+            })
+            .await
+        {
             Ok(true) => restored += 1,
             Ok(false) => noop += 1,
             Err(e) => {

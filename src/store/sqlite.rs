@@ -210,6 +210,20 @@ fn box_err<E: std::fmt::Display>(e: E) -> StoreError {
     StoreError::Backend(BoxBackendError::new(e.to_string()))
 }
 
+/// #4447 — map the typed in-transaction by-id refusal onto the ONE
+/// `PermissionDenied` envelope the postgres adapter returns (error parity);
+/// anything else stays a backend detail.
+fn by_id_refusal(e: anyhow::Error, action: &str) -> StoreError {
+    match e.downcast::<crate::storage::InboundByIdNamespaceRefused>() {
+        Ok(refused) => StoreError::PermissionDenied {
+            action: action.to_string(),
+            target: refused.id.clone(),
+            reason: refused.to_string(),
+        },
+        Err(other) => box_err(other),
+    }
+}
+
 /// Map the typed coordination-guard refusal onto the SAL error: quota and
 /// validation keep their structural variants (the postgres twin maps
 /// `prepare_action` to `IntegrityFailed` the same way); a driver fault
@@ -1852,6 +1866,68 @@ impl MemoryStore for SqliteStore {
         self.gate_record_stop()?;
         let conn = self.state.lock().await;
         db::delete(&conn, id).map_err(box_err)
+    }
+
+    /// #4447 — in-transaction peer-scope re-check on the `deletions[]` lane.
+    async fn apply_remote_deletion_authorized(
+        &self,
+        _ctx: &CallerContext,
+        id: &str,
+        authorize_stored: crate::storage::ByIdNamespaceAuthorizer<'_>,
+    ) -> StoreResult<bool> {
+        self.gate_record_stop()?;
+        let conn = self.state.lock().await;
+        db::delete_authorized(&conn, id, authorize_stored)
+            .map_err(|e| by_id_refusal(e, crate::store::FEDERATION_APPLY_DELETION))
+    }
+
+    /// #4447 — in-transaction peer-scope re-check on the `archives[]` lane.
+    async fn apply_remote_archive_authorized(
+        &self,
+        _ctx: &CallerContext,
+        id: &str,
+        authorize_stored: crate::storage::ByIdNamespaceAuthorizer<'_>,
+    ) -> StoreResult<bool> {
+        self.gate_record_stop()?;
+        let conn = self.state.lock().await;
+        db::archive_memory_authorized(
+            &conn,
+            id,
+            Some(crate::models::field_names::ARCHIVE_REASON_SYNC_PUSH),
+            authorize_stored,
+        )
+        .map_err(|e| by_id_refusal(e, crate::store::FEDERATION_APPLY_ARCHIVE))
+    }
+
+    /// #4447 — in-transaction peer-scope re-check on the `restores[]` lane. The
+    /// G30 forget-tombstone gate runs first, exactly as `apply_remote_restore`.
+    async fn apply_remote_restore_authorized(
+        &self,
+        _ctx: &CallerContext,
+        id: &str,
+        authorize_stored: crate::storage::ByIdNamespaceAuthorizer<'_>,
+    ) -> StoreResult<bool> {
+        self.gate_record_stop()?;
+        let conn = self.state.lock().await;
+        if db::memory_is_tombstoned(&conn, id).map_err(box_err)? {
+            return Ok(false);
+        }
+        db::restore_archived_authorized(&conn, id, authorize_stored)
+            .map_err(|e| by_id_refusal(e, crate::store::FEDERATION_APPLY_RESTORE))
+    }
+
+    /// #4447 — in-transaction peer-scope re-check on the `links[]` lane.
+    async fn apply_remote_link_authorized(
+        &self,
+        _ctx: &CallerContext,
+        link: &MemoryLink,
+        attest_level: &str,
+        authorize_stored: crate::storage::ByIdNamespaceAuthorizer<'_>,
+    ) -> StoreResult<()> {
+        self.gate_record_stop()?;
+        let conn = self.state.lock().await;
+        db::create_link_inbound_authorized(&conn, link, attest_level, authorize_stored)
+            .map_err(|e| by_id_refusal(e, crate::store::FEDERATION_APPLY_LINK))
     }
 
     /// #3075 — delegates VERBATIM to `db::upsert_pending_action`, the free
