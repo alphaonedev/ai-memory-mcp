@@ -229,16 +229,17 @@ a.am-card:hover{border-color:var(--accent);box-shadow:0 12px 30px -18px var(--ac
 .am-themetog{position:fixed;right:16px;bottom:16px;font-family:var(--mono);font-size:12px;background:var(--panel);border:1px solid var(--line);color:var(--ink-mid);padding:8px 12px;border-radius:10px;cursor:pointer;z-index:60;box-shadow:0 8px 22px -10px rgba(0,0,0,.3)}
 
 /* ------------------------------------------------- dg- inline SVG diagrams */
+/* diagram text: small labels (.t-s) and keys (.t-k) use full/mid ink, not soft ink -- soft ink (~4.4:1 on the panel) washed out at 10-11px (operator, 2026-10-02). */
 .dg{font-family:var(--mono)}
 .dg text{font-family:var(--mono);font-size:12px;fill:var(--ink)}
 .dg .t-h{font-family:var(--disp);font-size:15px;font-weight:800;fill:var(--ink);letter-spacing:-.01em}
 .dg .t-m{font-size:12px;fill:var(--ink)}
-.dg .t-s{font-size:10.5px;fill:var(--ink-soft)}
+.dg .t-s{font-size:10.5px;fill:var(--ink)}
 .dg .t-a{fill:var(--accent-ink);font-weight:600}
 .dg .t-teal{fill:var(--teal);font-weight:600}
 .dg .t-slate{fill:var(--slate);font-weight:600}
 .dg .t-bad{fill:var(--bad);font-weight:600}
-.dg .t-k{font-size:10px;letter-spacing:.14em;fill:var(--ink-soft);font-weight:600}
+.dg .t-k{font-size:10px;letter-spacing:.14em;fill:var(--ink-mid);font-weight:600}
 .dg .zone{fill:var(--raise);stroke:var(--line-strong);stroke-width:1;stroke-dasharray:4 5}
 .dg .zone.solid{stroke-dasharray:none}
 .dg .zone.teal{fill:var(--teal-soft);stroke:var(--teal)}
