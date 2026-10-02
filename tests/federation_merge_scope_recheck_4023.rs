@@ -266,8 +266,14 @@ async fn stale_scope_verdict_refused_after_concurrent_move_sqlite_4023() {
     // the in-transaction re-check. That failure direction is a vacuous pass,
     // not a corruption, and it is bounded by the mutation evidence: with the
     // in-transaction re-check disabled this cell goes red (#4023 review M2/M3).
-    // Replacing the sleep with a deterministic sqlite barrier is tracked as
-    // the review's N3 follow-up.
+    // The vacuous-pass direction is closed by the sibling cell
+    // `in_transaction_recheck_is_the_refusal_path_sqlite_4023` below: it drives
+    // `db::merge_inbound_authorized` behind a deterministic lock barrier (the
+    // narrow connection's busy handler is the exact "waiting on the lock"
+    // signal, no sleep) and asserts the refusal text names
+    // "(#4023 in-transaction re-check)", so a host too slow for this cell's
+    // 1500 ms still fails there instead of passing. This cell stays the
+    // end-to-end `/sync/push` check; that one pins the refusal path.
     tokio::time::sleep(Duration::from_millis(1500)).await;
     other
         .execute(
