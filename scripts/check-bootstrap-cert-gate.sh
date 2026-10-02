@@ -348,7 +348,6 @@ RAN_A_DRIVERLESS=0
 echo
 echo "== LEG A-pg — #3061 pg posture armability (binary WITH sal-postgres) =="
 echo "LEG A-pg: RUN"
-RAN_A_PG=1
 leg_a_setup "$BIN_PG"
 
 # Certified pg config → doctor --posture exits 0, and #15 is the pg
@@ -414,10 +413,11 @@ fi
 rm -rf "$WORK_A" "$FPFILE_A"
 
 # ── LEG A-driverless — binary WITHOUT sal-postgres: must REFUSE, on the ROW ─
+RAN_A_PG=1   # set AFTER the leg body: the flag means "this leg finished its assertions"
+
 echo
 echo "== LEG A-driverless — #4333/#4434 driverless binary must REFUSE a pg posture =="
 echo "LEG A-driverless: RUN"
-RAN_A_DRIVERLESS=1
 leg_a_setup "$BIN_ND"
 OUT_D="$EVIDENCE_DIR/driverless-posture-refuse.json"
 posture_env "$BIN_ND" 1 "$PG_DSN_VERIFY_FULL" > "$OUT_D" 2>"$EVIDENCE_DIR/driverless-posture-refuse.err"
@@ -436,6 +436,12 @@ else
 fi
 rm -rf "$WORK_A" "$FPFILE_A"
 
+RAN_A_DRIVERLESS=1   # likewise: set only once the driverless leg has finished its assertions
+
+# f2r 2026-10-02: as first written the flags were set at each leg's BANNER, so this guard was
+# unreachable and I wrongly cited it as a tested property. The flags now mean "the leg finished",
+# so an early return inside a leg body reaches this check. It remains a TRIPWIRE for future edits
+# (no current path returns early), and it is NOT cited as evidence in the landing record.
 if [[ $RAN_A_PG -ne 1 || $RAN_A_DRIVERLESS -ne 1 ]]; then
   fail "a LEG A shape did not RUN (A-pg=$RAN_A_PG A-driverless=$RAN_A_DRIVERLESS) — a skipped leg is never green"
 fi
