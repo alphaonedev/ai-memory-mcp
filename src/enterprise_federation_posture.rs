@@ -211,9 +211,10 @@ fn is_truthy(v: &str) -> bool {
 /// occurrence, so this mirrors that precedence and fails closed on a
 /// malformed / absent query (returns `false`), never opening the control.
 fn dsn_pins_sslmode_verify_full(dsn: &str) -> bool {
-    // #3705 — the parser is shared with the connect-funnel FLOOR
-    // (`store::postgres`) and doctor, so the posture check and the
-    // enforcement cannot disagree about what `verify-full` means.
+    // #3705 / #4434 — the verdict is the one the connect funnel enforces
+    // (`transit_encryption::dsn_floor_verdict`: the options the driver
+    // PARSES, not the DSN text), so the posture check and the enforcement
+    // cannot disagree about what `verify-full` means.
     crate::transit_encryption::dsn_pins_sslmode_verify_full(dsn)
 }
 
@@ -591,9 +592,10 @@ pub fn evaluate_with_live(
         let tls_verify_full = dsn_pins_sslmode_verify_full(dsn);
         // #3866 — the `actual` names the TRANSPORT so a socket DSN reads as
         // "TLS not applicable on this transport", never as a pinned floor.
-        let transport = match crate::transit_encryption::dsn_sslmode_floor(dsn) {
+        let transport = match crate::transit_encryption::dsn_floor_verdict(dsn) {
             crate::transit_encryption::SslmodeFloor::Pinned { host }
-            | crate::transit_encryption::SslmodeFloor::NotPinned { host } => {
+            | crate::transit_encryption::SslmodeFloor::NotPinned { host }
+            | crate::transit_encryption::SslmodeFloor::DriverResolved { host, .. } => {
                 format!("tcp host={host}")
             }
             crate::transit_encryption::SslmodeFloor::UnixSocket { dir } => {
