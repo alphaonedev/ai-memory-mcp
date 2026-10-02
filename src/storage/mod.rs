@@ -860,6 +860,7 @@ pub(crate) fn escape_like_pattern(s: &str) -> String {
 // historical `crate::db::*` paths used elsewhere.
 pub(crate) mod connection;
 pub(crate) mod contamination_marker;
+pub mod escalation_deferral;
 pub(crate) use contamination_marker::StampAuthority;
 pub(crate) mod decontaminate;
 mod lifecycle_write;
@@ -11085,10 +11086,8 @@ pub fn consolidate_with_expected_versions(
             write_txn.commit()?;
             Ok(id)
         }
-        Err(e) => {
-            write_txn.rollback();
-            Err(e)
-        }
+        // #4116 — settle deferred escalations, then report the REAL outcome.
+        Err(e) => Err(write_txn.rollback_resolving(e)),
     }
 }
 
@@ -17381,10 +17380,8 @@ pub fn restore_archived(conn: &Connection, id: &str) -> Result<bool> {
             }
             Ok(v)
         }
-        Err(e) => {
-            write_txn.rollback();
-            Err(e)
-        }
+        // #4116 — settle deferred escalations, then report the REAL outcome.
+        Err(e) => Err(write_txn.rollback_resolving(e)),
     }
 }
 
@@ -17627,10 +17624,8 @@ pub fn restore_archived_for_caller(conn: &Connection, id: &str, caller: &str) ->
             }
             Ok(v)
         }
-        Err(e) => {
-            write_txn.rollback();
-            Err(e)
-        }
+        // #4116 — settle deferred escalations, then report the REAL outcome.
+        Err(e) => Err(write_txn.rollback_resolving(e)),
     }
 }
 
@@ -18812,10 +18807,8 @@ pub fn merge_inbound(
             write_txn.commit()?;
             insert_if_newer(conn, inbound)
         }
-        Err(e) => {
-            write_txn.rollback();
-            Err(e)
-        }
+        // #4116 — settle deferred escalations, then report the REAL outcome.
+        Err(e) => Err(write_txn.rollback_resolving(e)),
     }
 }
 
@@ -23663,23 +23656,15 @@ pub fn queue_pending_action(
     requested_by: &str,
     payload: &serde_json::Value,
 ) -> Result<String> {
-    // Wave-2 B7 — sibling of gated `upsert_pending_action` (ERRORS-09).
-    crate::storage::record_stop::gate_storage_conn(conn)?;
     let id = uuid::Uuid::new_v4().to_string();
-    let now = Utc::now().to_rfc3339();
-    let payload_json = serde_json::to_string(payload)?;
-    conn.execute(
-        "INSERT INTO pending_actions (id, action_type, memory_id, namespace, payload, requested_by, requested_at, status)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending')",
-        params![
-            id,
-            action.as_str(),
-            memory_id,
-            namespace,
-            payload_json,
-            requested_by,
-            now,
-        ],
+    escalation_deferral::insert_pending_action_row(
+        conn,
+        &id,
+        action,
+        namespace,
+        memory_id,
+        requested_by,
+        payload,
     )?;
     Ok(id)
 }
