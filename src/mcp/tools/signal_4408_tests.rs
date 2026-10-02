@@ -67,6 +67,7 @@ fn mcp_params(to: &Value) -> Value {
 
 #[test]
 fn sqlite_mcp_signal_send_refuses_invalid_recipient_without_echo_4408() {
+    let _agent_id_env_lock = crate::identity::agent_id_env_test_lock();
     let (conn, kp) = mcp_fixture();
     for (label, target) in invalid_targets() {
         let err = crate::mcp::handle_signal_send(&conn, &mcp_params(&json!(target)), Some(&kp))
@@ -85,6 +86,7 @@ fn sqlite_mcp_signal_send_refuses_invalid_recipient_without_echo_4408() {
 /// a namespace broadcast.
 #[test]
 fn sqlite_mcp_signal_send_refuses_non_string_recipient_4408() {
+    let _agent_id_env_lock = crate::identity::agent_id_env_test_lock();
     let (conn, kp) = mcp_fixture();
     for bad in [json!(42), json!(true), json!(["ai:x"]), json!({"a": 1})] {
         let err = crate::mcp::handle_signal_send(&conn, &mcp_params(&bad), Some(&kp))
@@ -101,6 +103,7 @@ fn sqlite_mcp_signal_send_refuses_non_string_recipient_4408() {
 /// handler: the final recipient is re-validated before sign / charge / insert.
 #[test]
 fn sqlite_mcp_hook_modified_recipient_is_revalidated_4408() {
+    let _agent_id_env_lock = crate::identity::agent_id_env_test_lock();
     let (conn, kp) = mcp_fixture();
     let hooks = SignalHooks {
         pre_signal_send: Some(Box::new(|d| {
@@ -124,6 +127,7 @@ fn sqlite_mcp_hook_modified_recipient_is_revalidated_4408() {
 /// The recipient is counted in the #1807 storage-only quota bytes (MCP).
 #[test]
 fn sqlite_mcp_recipient_is_counted_in_quota_bytes_4408() {
+    let _agent_id_env_lock = crate::identity::agent_id_env_test_lock();
     let (conn, kp) = mcp_fixture();
     let to = "ai:quota-recipient-4408";
     crate::mcp::handle_signal_send(&conn, &mcp_params(&json!(to)), Some(&kp)).expect("direct send");
