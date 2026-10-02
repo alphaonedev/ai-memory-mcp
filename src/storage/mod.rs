@@ -896,6 +896,17 @@ pub mod lockout;
 pub mod migration_meta;
 pub mod migrations;
 pub mod model_attest;
+// #4025 — federated approval committed only after its effect landed.
+mod pending_approve_execute_4025;
+pub use pending_approve_execute_4025::{
+    EFFECT_MARKER_ABSENT_SQL, EFFECT_MARKER_KEY, FederatedApproveOutcome,
+    PG_COUNT_APPROVED_UNMARKED_SQL, PG_EFFECT_MARKER_ABSENT_SQL, RESERVED_PAYLOAD_KEYS,
+    approve_execute_pending_action, count_approved_without_effect_marker, mark_effect_applied,
+    payload_has_effect_marker, strip_reserved_payload_keys,
+};
+#[cfg(feature = "sal-postgres")]
+pub(crate) use pending_approve_execute_4025::{marker_absent_pg, marker_present_pg};
+pub(crate) use pending_approve_execute_4025::{marker_absent_sqlite, marker_present_sqlite};
 /// #1955 [P1][R45] — substrate record-stop actuator (storage layer): the
 /// non-feature-gated flag registry + attestation logic + the
 /// `StorageError::RecordStopped` `db::`-funnel gate. Lives here (not under
@@ -23667,7 +23678,10 @@ pub fn queue_pending_action(
     crate::storage::record_stop::gate_storage_conn(conn)?;
     let id = uuid::Uuid::new_v4().to_string();
     let now = Utc::now().to_rfc3339();
-    let payload_json = serde_json::to_string(payload)?;
+    // #4416 — the server-only execution marker is never caller-writable.
+    let mut payload = payload.clone();
+    strip_reserved_payload_keys(&mut payload);
+    let payload_json = serde_json::to_string(&payload)?;
     conn.execute(
         "INSERT INTO pending_actions (id, action_type, memory_id, namespace, payload, requested_by, requested_at, status)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending')",
@@ -23729,9 +23743,13 @@ pub fn queue_pending_action(
 /// (identical `requested_by`) still converges.
 pub fn upsert_pending_action(conn: &Connection, pa: &PendingAction) -> Result<()> {
     crate::storage::record_stop::gate_storage_conn(conn)?;
-    let payload_json = serde_json::to_string(&pa.payload)?;
+    // #4416 — the wire never carries the server-only execution marker.
+    let mut payload = pa.payload.clone();
+    strip_reserved_payload_keys(&mut payload);
+    let payload_json = serde_json::to_string(&payload)?;
     conn.execute(
-        "INSERT INTO pending_actions
+        concat!(
+            "INSERT INTO pending_actions
          (id, action_type, memory_id, namespace, payload, requested_by,
           requested_at, status, decided_by, decided_at, approvals)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', NULL, NULL, '[]')
@@ -23739,11 +23757,17 @@ pub fn upsert_pending_action(conn: &Connection, pa: &PendingAction) -> Result<()
             action_type  = excluded.action_type,
             memory_id    = excluded.memory_id,
             namespace    = excluded.namespace,
-            payload      = excluded.payload,
+            payload      = CASE WHEN ",
+            marker_present_sqlite!("pending_actions.payload"),
+            "
+                THEN json_set(excluded.payload, '$.__effect_applied_at',
+                              json_extract(pending_actions.payload, '$.__effect_applied_at'))
+                ELSE excluded.payload END,
             requested_by = excluded.requested_by,
             requested_at = excluded.requested_at
          WHERE pending_actions.status = 'pending'
-           AND pending_actions.requested_by = excluded.requested_by",
+           AND pending_actions.requested_by = excluded.requested_by"
+        ),
         params![
             pa.id,
             pa.action_type,
@@ -23848,9 +23872,18 @@ pub fn decide_pending_action(
     crate::storage::record_stop::gate_storage_conn(conn)?;
     let new_status = if approve { "approved" } else { "rejected" };
     let now = Utc::now().to_rfc3339();
+    // #4345 — a REFUSAL never lands over an applied effect: a `pending` row
+    // carrying the execution marker only moves forward (to `approved`).
     let updated = conn.execute(
-        "UPDATE pending_actions SET status = ?1, decided_by = ?2, decided_at = ?3
-         WHERE id = ?4 AND status = 'pending'",
+        &format!(
+            "UPDATE pending_actions SET status = ?1, decided_by = ?2, decided_at = ?3
+             WHERE id = ?4 AND status = 'pending' AND ({guard})",
+            guard = if approve {
+                "1 = 1"
+            } else {
+                EFFECT_MARKER_ABSENT_SQL
+            }
+        ),
         params![new_status, decided_by, now, id],
     )?;
     // S5-M2: emit a `pending_action.denied` audit row when the transition
@@ -23864,6 +23897,10 @@ pub fn decide_pending_action(
     }
     Ok(updated > 0)
 }
+
+/// #4025 — the audit event type appended once an approved pending action's
+/// effect has landed. One name for every emit site on both backends.
+pub(crate) const PENDING_ACTION_APPROVED_EVENT: &str = "pending_action.approved";
 
 /// v0.7.0 S5-M1/M2 — append a `pending_action.<state>` row to
 /// `signed_events` so the audit chain captures every governance
@@ -24259,10 +24296,9 @@ pub fn approve_with_approver_type(
         return Ok(ApproveOutcome::NotFound);
     };
     if pa.status != "pending" {
-        return Ok(ApproveOutcome::Rejected(format!(
-            "already decided: status={}",
-            pa.status
-        )));
+        return Ok(ApproveOutcome::Rejected(
+            crate::errors::msg::pending_already_decided(&pa.status),
+        ));
     }
     // Resolve the namespace's approver type. If no policy, default to Human —
     // which accepts any approval (back-compat with 1.9 callers).
@@ -24502,12 +24538,52 @@ pub fn execute_pending_action(conn: &Connection, pending_id: &str) -> Result<Opt
             },
         ));
     }
+    // #4416/F3 — a row whose execution marker is set (the marker is only ever
+    // written server-side, after an effect) has its effect applied: the local
+    // approve-then-execute path must not run it a second time.
+    if payload_has_effect_marker(&pa.payload) {
+        emit_pending_action_event(
+            conn,
+            &pa,
+            PENDING_ACTION_APPROVED_EVENT,
+            pa.decided_by.as_deref(),
+        );
+        return Ok(None);
+    }
+    let memory_id = execute_pending_effect(conn, &pa)?;
+    // #4345 — stamp the execution marker so a later federated redelivery (and
+    // `doctor`) can tell this approval's effect landed. The effect already
+    // committed: a stamping failure is logged, never rolled into the result.
+    if let Err(e) = mark_effect_applied(conn, &pa.id) {
+        tracing::warn!(
+            "execute_pending_action: execution marker not stamped for {}: {e}",
+            pa.id
+        );
+    }
+    // S5-M1: emit the approve audit row after the side-effecting write
+    // succeeded so the audit chain reflects the post-execute state. The
+    // emit is best-effort (warn-only) so an audit-side failure does not
+    // roll back the governance decision.
+    emit_pending_action_event(
+        conn,
+        &pa,
+        PENDING_ACTION_APPROVED_EVENT,
+        pa.decided_by.as_deref(),
+    );
+    Ok(memory_id)
+}
+
+/// #4025 — the side-effecting half of [`execute_pending_action`], split out so
+/// the federated approve funnel can run the effect BEFORE it commits the
+/// approval (see `pending_approve_execute_4025`). `pa` is the row to execute
+/// as-if approved; the caller owns the status contract.
+fn execute_pending_effect(conn: &Connection, pa: &PendingAction) -> Result<Option<String>> {
     // S5-H4: refuse approver-on-behalf laundering BEFORE the side-effecting
     // write. Emit an audit row on refusal so the laundering attempt is
     // captured by the signed_events chain even when the substrate
     // bails the execute.
-    if let Err(e) = verify_payload_agent_id(&pa) {
-        emit_pending_action_event(conn, &pa, "pending_action.refused_agent_id_mismatch", None);
+    if let Err(e) = verify_payload_agent_id(pa) {
+        emit_pending_action_event(conn, pa, "pending_action.refused_agent_id_mismatch", None);
         return Err(e);
     }
     let memory_id = match pa.action_type.as_str() {
@@ -24587,7 +24663,7 @@ pub fn execute_pending_action(conn: &Connection, pending_id: &str) -> Result<Opt
                     // execute must re-evaluate dest write (no queue: an
                     // Approve here would insert a second pending). Deny or
                     // still-Pending ⇒ refuse; do not clone into a forbidden ns.
-                    refuse_unapproved_destination_store(conn, &pa, to_ns)?;
+                    refuse_unapproved_destination_store(conn, pa, to_ns)?;
                     let clone_id =
                         promote_to_namespace(conn, &mid, to_ns, Some(pa.requested_by.as_str()))?;
                     Some(clone_id)
@@ -24612,7 +24688,7 @@ pub fn execute_pending_action(conn: &Connection, pending_id: &str) -> Result<Opt
                 None
             }
         }
-        "reflect" => execute_reflect_from_payload(conn, &pa)?,
+        "reflect" => execute_reflect_from_payload(conn, pa)?,
         other => {
             // #962 typed envelope.
             return Err(anyhow::Error::new(StorageError::InvalidArgument {
@@ -24620,16 +24696,6 @@ pub fn execute_pending_action(conn: &Connection, pending_id: &str) -> Result<Opt
             }));
         }
     };
-    // S5-M1: emit the approve audit row after the side-effecting write
-    // succeeded so the audit chain reflects the post-execute state. The
-    // emit is best-effort (warn-only) so an audit-side failure does not
-    // roll back the governance decision.
-    emit_pending_action_event(
-        conn,
-        &pa,
-        "pending_action.approved",
-        pa.decided_by.as_deref(),
-    );
     Ok(memory_id)
 }
 

@@ -1608,53 +1608,63 @@ pub(super) async fn sync_push_via_store(
                     ),
                     None => false,
                 };
+            // #4025 — ONE approve-then-effect unit: the approval (and a
+            // consensus threshold's final vote) commits in the transaction that
+            // holds the pending row `FOR UPDATE`, only after the effect landed.
+            // Pre-fix the approval committed first, so a failed or interrupted
+            // execution left an `approved` row with no effect that every
+            // redelivery refused as "already decided".
             match app
                 .store
-                .approve_with_approver_type(&apply_ctx, &dec.id, &bound_decider)
+                .approve_execute_pending_action(&apply_ctx, &dec.id, &bound_decider)
                 .await
             {
-                Ok(crate::store::ApproveOutcome::Approved) => {
+                Ok(crate::storage::FederatedApproveOutcome::Executed(_)) => {
                     pending_decisions_applied += 1;
-                    match app.store.execute_pending_action(&apply_ctx, &dec.id).await {
-                        Ok(_) => {
-                            if delete_target_existed {
-                                deleted += 1;
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "sync_push(store): execute_pending_action failed for {}: {e}",
-                                dec.id
-                            );
-                            // #2478 — without this the decision counted APPLIED
-                            // while its side effect never landed and `skipped`
-                            // stayed 0, so the sender ACKed a write that does
-                            // not exist here.
-                            skipped += 1;
-                        }
+                    if delete_target_existed {
+                        deleted += 1;
                     }
                 }
                 // Consensus-gated: the relayed vote was recorded but quorum is
                 // not yet met on this peer — nothing to execute.
-                Ok(crate::store::ApproveOutcome::Pending { .. }) => pending_decisions_applied += 1,
-                Ok(crate::store::ApproveOutcome::Rejected(reason)) => {
+                Ok(crate::storage::FederatedApproveOutcome::VotePending { .. }) => {
+                    pending_decisions_applied += 1;
+                }
+                // #4025 — `approved` means its effect landed: a redelivery
+                // (e.g. after a lost response) is the converged no-op.
+                Ok(
+                    crate::storage::FederatedApproveOutcome::AlreadyApproved
+                    | crate::storage::FederatedApproveOutcome::NotFound,
+                ) => noop += 1,
+                // #4345 — approved WITHOUT an execution marker: acknowledged (a
+                // retry cannot change it) but never reported as a verified
+                // converge; `doctor` counts these rows.
+                Ok(crate::storage::FederatedApproveOutcome::AlreadyApprovedUnmarked) => {
+                    tracing::warn!(
+                        pending_id = %dec.id,
+                        "sync_push: pending action is approved but carries no execution \
+                         marker; its effect cannot be proven landed (#4345)"
+                    );
+                    noop += 1;
+                }
+                Ok(crate::storage::FederatedApproveOutcome::Refused(reason)) => {
                     tracing::warn!(
                         target: ATTESTATION_TRACE_TARGET,
                         pending_id = %dec.id,
                         decider = %dec.decider,
                         bound_decider = %bound_decider,
-                        "sync_push(store): refusing forged / unauthorized federated approval \
-                         (#1920): {reason}"
+                        "sync_push(store): refusing forged / unauthorized / conflicting \
+                         federated approval (#1920): {reason}"
                     );
                     skipped += 1;
                 }
-                // The postgres adapter reports an unknown pending as a typed
-                // NotFound where the sqlite free function reports
-                // `ApproveOutcome::NotFound`; both are the converged no-op.
-                Err(crate::store::StoreError::NotFound { .. }) => noop += 1,
                 Err(e) => {
+                    // #4025 — the transaction rolled back: the row stays
+                    // `pending`, so the sender's retry re-runs the unit.
+                    // #2478 — `skipped`, so the sender never ACKs a write that
+                    // does not exist here.
                     tracing::warn!(
-                        "sync_push(store): approve_with_approver_type failed for {}: {e}",
+                        "sync_push(store): approve_execute_pending_action failed for {}: {e}",
                         dec.id
                     );
                     skipped += 1;

@@ -30,6 +30,8 @@ pub mod consolidate;
 pub mod crud;
 pub mod curator;
 pub mod doctor;
+/// #4345 — `doctor` census of approved pending actions with no execution marker.
+pub mod doctor_effect_marker_4345;
 /// v1.0.0 #3471 — the `ai-memory doctor` wake-hub posture section (socket and
 /// directory mode + ownership, file-descriptor budget, supervisor unit).
 pub mod doctor_wake_hub;

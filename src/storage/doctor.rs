@@ -166,12 +166,14 @@ pub fn sweep_pending_action_timeouts(
     if global_default_secs <= 0 {
         return Ok(Vec::new());
     }
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare(concat!(
         "SELECT id, namespace FROM pending_actions
          WHERE status = 'pending'
            AND (julianday('now') - julianday(requested_at)) * 86400.0
-               > COALESCE(default_timeout_seconds, ?1)",
-    )?;
+               > COALESCE(default_timeout_seconds, ?1)
+           AND ",
+        crate::storage::marker_absent_sqlite!("payload")
+    ))?;
     let rows: Vec<(String, String)> = stmt
         .query_map(params![global_default_secs], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -189,11 +191,13 @@ pub fn sweep_pending_action_timeouts(
     let now = Utc::now().to_rfc3339();
     let tx_savepoint = conn.unchecked_transaction()?;
     {
-        let mut update = tx_savepoint.prepare(
+        let mut update = tx_savepoint.prepare(concat!(
             "UPDATE pending_actions
              SET status = 'expired', expired_at = ?1
-             WHERE id = ?2 AND status = 'pending'",
-        )?;
+             WHERE id = ?2 AND status = 'pending'
+               AND ",
+            crate::storage::marker_absent_sqlite!("payload")
+        ))?;
         for (id, _) in &rows {
             update.execute(params![now, id])?;
         }

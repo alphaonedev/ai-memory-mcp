@@ -197,13 +197,13 @@ const MSG_PG_PROBE_PANIC: &str = "postgres extension probe thread panicked";
 /// exactly the case that must NOT hang it forever. Doubles as the pool's
 /// `acquire_timeout` (which alone bounds only connection checkout).
 #[cfg(feature = "sal-postgres")]
-const PG_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const PG_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// #3264 review fix (B4) — the probe exceeded [`PG_PROBE_TIMEOUT`].
 /// Reported as a CRITICAL section, not a silent omission: a store the
 /// daemon cannot reach in time is the fault it would hit at boot.
 #[cfg(feature = "sal-postgres")]
-const MSG_PG_PROBE_TIMEOUT: &str =
+pub(crate) const MSG_PG_PROBE_TIMEOUT: &str =
     "postgres extension probe exceeded its timeout — the configured store did not answer";
 
 /// #3264 review fix (S2) — the configured store URL could not be resolved
@@ -1636,6 +1636,10 @@ fn run_local(db_path: &Path, caller_agent_id: Option<&str>) -> Report {
     }
     #[cfg(feature = "sal-postgres")]
     if let Some(pg) = section_postgres_unstamped_owners_3124() {
+        sections.push(pg);
+    }
+    #[cfg(feature = "sal-postgres")]
+    if let Some(pg) = super::doctor_effect_marker_4345::postgres_section() {
         sections.push(pg);
     }
 
@@ -3815,6 +3819,21 @@ fn section_governance(conn: &rusqlite::Connection) -> ReportSection {
 
     let pending_count = db::count_pending_actions_by_status(conn, "pending").unwrap_or(0);
     facts.push(("pending_actions_total".into(), pending_count.to_string()));
+
+    // #4345 — `approved` rows with no execution marker: an approval whose
+    // effect cannot be proven landed (legacy rows, failed local executes).
+    match crate::storage::count_approved_without_effect_marker(conn) {
+        Ok(n) => {
+            facts.push(("approved_without_marker".into(), n.to_string()));
+            if let Some(warn) = super::doctor_effect_marker_4345::warning_note(n) {
+                if severity == Severity::Info {
+                    severity = Severity::Warning;
+                }
+                append_note(&mut note, &warn);
+            }
+        }
+        Err(e) => facts.push(("approved_without_marker_error".into(), e.to_string())),
+    }
 
     // v1.0.0 #3430 — the REAL agent-action rule posture. `enabled = 1`
     // is NOT the enforcement state: once an operator pubkey is resolved
@@ -6207,6 +6226,26 @@ mod tests {
             age_str.parse::<i64>().is_ok(),
             "expected numeric age, got {age_str}"
         );
+    }
+
+    #[test]
+    fn governance_section_warns_on_approved_without_marker_4345() {
+        let env = TestEnv::fresh();
+        {
+            let conn = crate::db::open(&env.db_path).unwrap();
+            let now = chrono::Utc::now().to_rfc3339();
+            conn.execute(
+                "INSERT INTO pending_actions \
+                 (id, action_type, namespace, payload, requested_by, requested_at, status) \
+                 VALUES ('p4345', 'store', 'ns', '{}', 'agent', ?1, 'approved')",
+                params![now],
+            )
+            .unwrap();
+        }
+        let report = run_local_collect(&env.db_path);
+        let gov = find(&report, "Governance");
+        assert_eq!(fact(gov, "approved_without_marker"), "1");
+        assert_eq!(gov.severity, Severity::Warning, "{gov:?}");
     }
 
     #[test]

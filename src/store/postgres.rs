@@ -108,6 +108,9 @@ mod swarm_rewind;
 // transaction (one commit per logical update). Own module for the same
 // qual_10 budget reason as `parity_3064` above.
 mod lifecycle_tx_3152;
+// #4025 — federated approval committed only after its effect landed. Own
+// module for the same qual_10 budget reason as `reown_3124` above.
+mod pending_approve_execute_4025;
 // #4199 A1 — the postgres forensic-sink outage recorder (qual_10 budget).
 mod forensic_outage_4199;
 
@@ -21102,6 +21105,187 @@ impl PostgresStore {
     }
 }
 
+impl PostgresStore {
+    /// #4025 — the side-effecting half of
+    /// [`MemoryStore::execute_pending_action`], split out so the federated
+    /// approve funnel can run the effect BEFORE it commits the approval
+    /// (`pending_approve_execute_4025`). `pa` is the row to execute as-if
+    /// approved; the caller owns the status contract.
+    async fn pg_execute_pending_effect(
+        &self,
+        ctx: &CallerContext,
+        pa: &crate::models::PendingAction,
+    ) -> StoreResult<Option<String>> {
+        // v1.0.0 #3175 (v0.7.0 S5-H4) [security, BLOCKING] — refuse
+        // approver-on-behalf LAUNDERING before the side-effecting write.
+        //
+        // The S5 audit closed this on sqlite: a caller queues a pending action
+        // with `requested_by = "alice"` but embeds a payload whose
+        // `metadata.agent_id = "bob"`, and on execute the new memory lands
+        // attributed to bob — the approver, not the requester, attributes the
+        // write. `db::execute_pending_action` has run
+        // `verify_payload_agent_id` before every arm since S5-H4; the postgres
+        // twin never did, so the whole gate was absent on the multi-tenant
+        // HTTP daemon — the ONE surface with a real adversary. Calling the
+        // storage-layer function directly (rather than re-implementing the
+        // payload probe) means the two backends cannot drift again.
+        //
+        // On refusal we FIRST append the
+        // `pending_action.refused_agent_id_mismatch` audit row so the attempt
+        // is captured by the signed chain even though the execute bails, then
+        // return 403. An audit-append failure does NOT convert the refusal
+        // into an allow — it is logged and the refusal still stands
+        // (fail closed).
+        if let Err(e) = crate::storage::verify_payload_agent_id(pa) {
+            if let Err(audit_err) = self
+                .pg_emit_pending_action_event(pa, "pending_action.refused_agent_id_mismatch", None)
+                .await
+            {
+                tracing::warn!(
+                    target: crate::signed_events::SIGNED_EVENTS_TRACE_TARGET,
+                    pending_id = %pa.id,
+                    "failed to append pending_action.refused_agent_id_mismatch audit row: {audit_err}"
+                );
+            }
+            return Err(StoreError::PermissionDenied {
+                action: crate::store::EXECUTE_PENDING_ACTION.to_string(),
+                target: pa.id.clone(),
+                reason: e.to_string(),
+            });
+        }
+        let memory_id: Option<String> = match pa.action_type.as_str() {
+            "store" => {
+                // v1.0.0 #3755 — the #3202 VERTICAL-promote payload. When the
+                // DESTINATION namespace of a cross-namespace promote requires
+                // approval, the destination STORE gate queues `action_type =
+                // "store"` carrying `{mode: "vertical", id, to_namespace}` —
+                // a clone REQUEST, not a `Memory`. The sqlite executor
+                // dispatches that shape onto `promote_to_namespace`
+                // (`db::execute_pending_action`, the #3202 arm); pre-#3755 this
+                // arm ran `from_value::<Memory>` over it, which cannot parse,
+                // so an APPROVED vertical store surfaced as
+                // `IntegrityFailed("invalid store payload …")` — on the
+                // federated lane counted `skipped` behind an HTTP 200 (the
+                // receiver approved and landed nothing). ONE predicate, the
+                // sqlite arm's: source = `memory_id` or the payload `id`,
+                // destination = `to_namespace`. No destination re-gate here —
+                // this pending row IS the destination-store approval; the
+                // re-gate belongs to the `promote` arm below (#3259).
+                let is_vertical_promote = pa
+                    .payload
+                    .get(crate::models::field_names::MODE)
+                    .and_then(|v| v.as_str())
+                    == Some(crate::models::field_names::MODE_VERTICAL);
+                if is_vertical_promote {
+                    let mid = pa.memory_id.clone().or_else(|| {
+                        pa.payload
+                            .get(PENDING_PAYLOAD_ID_KEY)
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string)
+                    });
+                    let to_ns = pa
+                        .payload
+                        .get(crate::models::field_names::TO_NAMESPACE)
+                        .and_then(|v| v.as_str());
+                    match (mid, to_ns) {
+                        (Some(mid), Some(to_ns)) => Some(
+                            self.pg_promote_to_namespace(
+                                ctx,
+                                &mid,
+                                to_ns,
+                                Some(pa.requested_by.as_str()),
+                            )
+                            .await?,
+                        ),
+                        _ => {
+                            return Err(StoreError::InvalidInput {
+                                detail: crate::storage::MSG_VERTICAL_STORE_PAYLOAD_INCOMPLETE
+                                    .to_string(),
+                            });
+                        }
+                    }
+                } else {
+                    let mut mem: Memory = match serde_json::from_value(pa.payload.clone()) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            return Err(StoreError::IntegrityFailed {
+                                detail: format!("invalid store payload: {e}"),
+                            });
+                        }
+                    };
+                    // Stamp fresh id + timestamps for idempotent replay.
+                    mem.id = uuid::Uuid::new_v4().to_string();
+                    let now = Utc::now().to_rfc3339();
+                    mem.created_at.clone_from(&now);
+                    mem.updated_at = now;
+                    mem.access_count = 0;
+                    Some(self.store(ctx, &mem).await?)
+                }
+            }
+            "delete" => {
+                if let Some(mid) = pa.memory_id.clone() {
+                    self.delete(ctx, &mid).await?;
+                    Some(mid)
+                } else {
+                    None
+                }
+            }
+            "promote" => {
+                if let Some(mid) = pa.memory_id.clone() {
+                    // v1.0.0 #3259 — honor a CROSS-NAMESPACE promote. When the
+                    // payload carries `to_namespace` this is a VERTICAL
+                    // promotion (clone into an ancestor namespace), not a tier
+                    // bump. Re-evaluate the destination STORE gate at execute
+                    // time (fail-closed, DECIDE-ONLY — the source Promote:Approve
+                    // queued this arm BEFORE the destination gate could run, and
+                    // an Approve here must not insert a second pending), then
+                    // clone — byte-for-byte the sqlite `db::execute_pending_action`
+                    // promote arm. Pre-fix this arm IGNORED `to_namespace` and
+                    // silently degraded every approved cross-namespace promote to
+                    // a tier-only bump: it reported SUCCESS while landing NO
+                    // clone (a silent wrong-result / data-divergence bug, worse
+                    // than a refusal). #3202 destination gate + parity.
+                    if let Some(to_ns) = pa
+                        .payload
+                        .get(crate::models::field_names::TO_NAMESPACE)
+                        .and_then(|v| v.as_str())
+                    {
+                        self.pg_refuse_unapproved_destination_store(pa, to_ns)
+                            .await?;
+                        let clone_id = self
+                            .pg_promote_to_namespace(
+                                ctx,
+                                &mid,
+                                to_ns,
+                                Some(pa.requested_by.as_str()),
+                            )
+                            .await?;
+                        Some(clone_id)
+                    } else {
+                        // Tier bump to long (historical behavior). The trait
+                        // `update`'s tier→long arm also clears `expires_at` in
+                        // SQL (#1626), matching the sqlite twin's `Some("")`.
+                        let patch = crate::store::UpdatePatch {
+                            tier: Some(Tier::Long),
+                            ..Default::default()
+                        };
+                        self.update(ctx, &mid, patch).await?;
+                        Some(mid)
+                    }
+                } else {
+                    None
+                }
+            }
+            other => {
+                return Err(StoreError::InvalidInput {
+                    detail: format!("unsupported action_type: {other}"),
+                });
+            }
+        };
+        Ok(memory_id)
+    }
+}
+
 #[async_trait]
 impl MemoryStore for PostgresStore {
     async fn write_durability(&self) -> StoreResult<crate::write_receipt::WriteDurability> {
@@ -26506,10 +26690,15 @@ impl MemoryStore for PostgresStore {
             .begin()
             .await
             .map_err(|e| to_store_err("pending_decide begin tx", e))?;
-        let rows_affected = sqlx::query(
+        let rows_affected = sqlx::query(concat!(
+            // #4345 — a REFUSAL never lands over an applied effect: a pending
+            // row carrying the execution marker only moves forward.
             "UPDATE pending_actions SET status = $1, decided_by = $2, decided_at = NOW()
-             WHERE id = $3 AND status = 'pending'",
-        )
+             WHERE id = $3 AND status = 'pending'
+               AND ($1 = 'approved' OR ",
+            crate::storage::marker_absent_pg!("payload"),
+            ")"
+        ))
         .bind(new_status)
         .bind(decided_by)
         .bind(id)
@@ -26574,6 +26763,10 @@ impl MemoryStore for PostgresStore {
     ) -> StoreResult<String> {
         self.gate_record_stop().await?;
         let pending_id = uuid::Uuid::new_v4().to_string();
+        // #4416 — the server-only execution marker is never caller-writable.
+        let mut payload = payload.clone();
+        crate::storage::strip_reserved_payload_keys(&mut payload);
+        let payload = &payload;
         sqlx::query(
             "INSERT INTO pending_actions \
              (id, action_type, memory_id, namespace, payload, requested_by, requested_at, status) \
@@ -30104,15 +30297,18 @@ impl MemoryStore for PostgresStore {
         if default_secs <= 0 {
             return Ok(Vec::new());
         }
-        let rows = sqlx::query(
+        let rows = sqlx::query(concat!(
             "UPDATE pending_actions
                 SET status = 'expired', expired_at = NOW()
               WHERE status = 'pending'
+                AND ",
+            crate::storage::marker_absent_pg!("payload"),
+            "
                 AND requested_at
                     + make_interval(secs => COALESCE(default_timeout_seconds, $1)::double precision)
                     < NOW()
-            RETURNING id, namespace",
-        )
+            RETURNING id, namespace"
+        ))
         .bind(default_secs)
         .fetch_all(&self.pool)
         .await
@@ -32293,10 +32489,9 @@ impl MemoryStore for PostgresStore {
                 id: pending_id.to_string(),
             })?;
         if pa.status != "pending" {
-            return Ok(super::ApproveOutcome::Rejected(format!(
-                "already decided: status={}",
-                pa.status
-            )));
+            return Ok(super::ApproveOutcome::Rejected(
+                crate::errors::msg::pending_already_decided(&pa.status),
+            ));
         }
 
         // Resolve namespace policy → approver type.
@@ -32462,171 +32657,16 @@ impl MemoryStore for PostgresStore {
                 detail: format!("cannot execute non-approved action (status={})", pa.status),
             });
         }
-        // v1.0.0 #3175 (v0.7.0 S5-H4) [security, BLOCKING] — refuse
-        // approver-on-behalf LAUNDERING before the side-effecting write.
-        //
-        // The S5 audit closed this on sqlite: a caller queues a pending action
-        // with `requested_by = "alice"` but embeds a payload whose
-        // `metadata.agent_id = "bob"`, and on execute the new memory lands
-        // attributed to bob — the approver, not the requester, attributes the
-        // write. `db::execute_pending_action` has run
-        // `verify_payload_agent_id` before every arm since S5-H4; the postgres
-        // twin never did, so the whole gate was absent on the multi-tenant
-        // HTTP daemon — the ONE surface with a real adversary. Calling the
-        // storage-layer function directly (rather than re-implementing the
-        // payload probe) means the two backends cannot drift again.
-        //
-        // On refusal we FIRST append the
-        // `pending_action.refused_agent_id_mismatch` audit row so the attempt
-        // is captured by the signed chain even though the execute bails, then
-        // return 403. An audit-append failure does NOT convert the refusal
-        // into an allow — it is logged and the refusal still stands
-        // (fail closed).
-        if let Err(e) = crate::storage::verify_payload_agent_id(&pa) {
-            if let Err(audit_err) = self
-                .pg_emit_pending_action_event(&pa, "pending_action.refused_agent_id_mismatch", None)
-                .await
-            {
-                tracing::warn!(
-                    target: crate::signed_events::SIGNED_EVENTS_TRACE_TARGET,
-                    pending_id = %pending_id,
-                    "failed to append pending_action.refused_agent_id_mismatch audit row: {audit_err}"
-                );
-            }
-            return Err(StoreError::PermissionDenied {
-                action: crate::store::EXECUTE_PENDING_ACTION.to_string(),
-                target: pending_id.to_string(),
-                reason: e.to_string(),
-            });
-        }
-        let memory_id: Option<String> = match pa.action_type.as_str() {
-            "store" => {
-                // v1.0.0 #3755 — the #3202 VERTICAL-promote payload. When the
-                // DESTINATION namespace of a cross-namespace promote requires
-                // approval, the destination STORE gate queues `action_type =
-                // "store"` carrying `{mode: "vertical", id, to_namespace}` —
-                // a clone REQUEST, not a `Memory`. The sqlite executor
-                // dispatches that shape onto `promote_to_namespace`
-                // (`db::execute_pending_action`, the #3202 arm); pre-#3755 this
-                // arm ran `from_value::<Memory>` over it, which cannot parse,
-                // so an APPROVED vertical store surfaced as
-                // `IntegrityFailed("invalid store payload …")` — on the
-                // federated lane counted `skipped` behind an HTTP 200 (the
-                // receiver approved and landed nothing). ONE predicate, the
-                // sqlite arm's: source = `memory_id` or the payload `id`,
-                // destination = `to_namespace`. No destination re-gate here —
-                // this pending row IS the destination-store approval; the
-                // re-gate belongs to the `promote` arm below (#3259).
-                let is_vertical_promote = pa
-                    .payload
-                    .get(crate::models::field_names::MODE)
-                    .and_then(|v| v.as_str())
-                    == Some(crate::models::field_names::MODE_VERTICAL);
-                if is_vertical_promote {
-                    let mid = pa.memory_id.clone().or_else(|| {
-                        pa.payload
-                            .get(PENDING_PAYLOAD_ID_KEY)
-                            .and_then(|v| v.as_str())
-                            .map(str::to_string)
-                    });
-                    let to_ns = pa
-                        .payload
-                        .get(crate::models::field_names::TO_NAMESPACE)
-                        .and_then(|v| v.as_str());
-                    match (mid, to_ns) {
-                        (Some(mid), Some(to_ns)) => Some(
-                            self.pg_promote_to_namespace(
-                                ctx,
-                                &mid,
-                                to_ns,
-                                Some(pa.requested_by.as_str()),
-                            )
-                            .await?,
-                        ),
-                        _ => {
-                            return Err(StoreError::InvalidInput {
-                                detail: crate::storage::MSG_VERTICAL_STORE_PAYLOAD_INCOMPLETE
-                                    .to_string(),
-                            });
-                        }
-                    }
-                } else {
-                    let mut mem: Memory = match serde_json::from_value(pa.payload.clone()) {
-                        Ok(m) => m,
-                        Err(e) => {
-                            return Err(StoreError::IntegrityFailed {
-                                detail: format!("invalid store payload: {e}"),
-                            });
-                        }
-                    };
-                    // Stamp fresh id + timestamps for idempotent replay.
-                    mem.id = uuid::Uuid::new_v4().to_string();
-                    let now = Utc::now().to_rfc3339();
-                    mem.created_at.clone_from(&now);
-                    mem.updated_at = now;
-                    mem.access_count = 0;
-                    Some(self.store(ctx, &mem).await?)
-                }
-            }
-            "delete" => {
-                if let Some(mid) = pa.memory_id.clone() {
-                    self.delete(ctx, &mid).await?;
-                    Some(mid)
-                } else {
-                    None
-                }
-            }
-            "promote" => {
-                if let Some(mid) = pa.memory_id.clone() {
-                    // v1.0.0 #3259 — honor a CROSS-NAMESPACE promote. When the
-                    // payload carries `to_namespace` this is a VERTICAL
-                    // promotion (clone into an ancestor namespace), not a tier
-                    // bump. Re-evaluate the destination STORE gate at execute
-                    // time (fail-closed, DECIDE-ONLY — the source Promote:Approve
-                    // queued this arm BEFORE the destination gate could run, and
-                    // an Approve here must not insert a second pending), then
-                    // clone — byte-for-byte the sqlite `db::execute_pending_action`
-                    // promote arm. Pre-fix this arm IGNORED `to_namespace` and
-                    // silently degraded every approved cross-namespace promote to
-                    // a tier-only bump: it reported SUCCESS while landing NO
-                    // clone (a silent wrong-result / data-divergence bug, worse
-                    // than a refusal). #3202 destination gate + parity.
-                    if let Some(to_ns) = pa
-                        .payload
-                        .get(crate::models::field_names::TO_NAMESPACE)
-                        .and_then(|v| v.as_str())
-                    {
-                        self.pg_refuse_unapproved_destination_store(&pa, to_ns)
-                            .await?;
-                        let clone_id = self
-                            .pg_promote_to_namespace(
-                                ctx,
-                                &mid,
-                                to_ns,
-                                Some(pa.requested_by.as_str()),
-                            )
-                            .await?;
-                        Some(clone_id)
-                    } else {
-                        // Tier bump to long (historical behavior). The trait
-                        // `update`'s tier→long arm also clears `expires_at` in
-                        // SQL (#1626), matching the sqlite twin's `Some("")`.
-                        let patch = crate::store::UpdatePatch {
-                            tier: Some(Tier::Long),
-                            ..Default::default()
-                        };
-                        self.update(ctx, &mid, patch).await?;
-                        Some(mid)
-                    }
-                } else {
-                    None
-                }
-            }
-            other => {
-                return Err(StoreError::InvalidInput {
-                    detail: format!("unsupported action_type: {other}"),
-                });
-            }
+        // #4416/F3 — a marked row's effect already landed (the marker is only
+        // written server-side, after an effect): never run it a second time.
+        let memory_id = if crate::storage::payload_has_effect_marker(&pa.payload) {
+            None
+        } else {
+            let id = self.pg_execute_pending_effect(ctx, &pa).await?;
+            // #4345 — stamp the execution marker (best-effort: the effect
+            // already committed; see `postgres/pending_approve_execute_4025.rs`).
+            self.pg_mark_effect_applied(pending_id).await;
+            id
         };
         // v1.0.0 #3180 (v0.7.0 S5-M1) — append the `pending_action.approved`
         // audit row AFTER the side-effecting write succeeded, so the chain
@@ -32635,7 +32675,11 @@ impl MemoryStore for PostgresStore {
         // an audit-side failure must not roll back a governance decision that
         // already landed (the chain is allowed to gap; the write is not).
         if let Err(e) = self
-            .pg_emit_pending_action_event(&pa, "pending_action.approved", pa.decided_by.as_deref())
+            .pg_emit_pending_action_event(
+                &pa,
+                crate::storage::PENDING_ACTION_APPROVED_EVENT,
+                pa.decided_by.as_deref(),
+            )
             .await
         {
             tracing::warn!(
@@ -32645,6 +32689,20 @@ impl MemoryStore for PostgresStore {
             );
         }
         Ok(memory_id)
+    }
+
+    async fn approve_execute_pending_action(
+        &self,
+        ctx: &CallerContext,
+        pending_id: &str,
+        approver_agent_id: &str,
+    ) -> StoreResult<crate::storage::FederatedApproveOutcome> {
+        // #4025 — see `postgres/pending_approve_execute_4025.rs`. Gated here
+        // too (the #3175 parity scanner reads this arm): record-stop refuses
+        // before any read or lock.
+        self.gate_record_stop().await?;
+        self.pg_approve_execute_pending_action(ctx, pending_id, approver_agent_id)
+            .await
     }
 
     async fn is_registered_agent(&self, agent_id: &str) -> StoreResult<bool> {
@@ -39333,13 +39391,11 @@ mod tests {
         );
     }
 
-    // ============================================================
-    // FX-C2-batch3 — Postgres live parity for read-only trait
+    // =====================================================    // FX-C2-batch3 — Postgres live parity for read-only trait
     // additions (list_namespaces, get_taxonomy, list_agents,
     // list_pending_actions, entity_get_by_alias, health_check,
     // stats). Gated on AI_MEMORY_TEST_POSTGRES_URL.
-    // ============================================================
-
+    // =====================================================
     #[tokio::test]
     async fn live_list_namespaces_groups_by_count() {
         let Some(url) = postgres_url() else {
@@ -42286,8 +42342,7 @@ mod tests {
         );
     }
 
-    // ===================================================================
-    // v0.9.0 coverage uplift — live-PG exercise of large `MemoryStore`
+    // ============================================================    // v0.9.0 coverage uplift — live-PG exercise of large `MemoryStore`
     // methods that had no direct in-module coverage: batch write + hybrid
     // recall, consolidate, forget (guard + archive), link listing +
     // verification, the audit-trail verifier, the AGE find-paths /
@@ -42301,8 +42356,7 @@ mod tests {
     // M-MOCKABLE-SYSCALLS / M-TAUTOLOGICAL-TESTS (assert observable
     // round-trip behaviour against the real backend, not restated
     // constants).
-    // ===================================================================
-
+    // ============================================================
     #[tokio::test]
     async fn live_cov1859_store_batch_then_recall_hybrid() {
         let Some(url) = postgres_url() else {

@@ -4195,6 +4195,27 @@ impl MemoryStore for SqliteStore {
         db::execute_pending_action(&conn, pending_id).map_err(box_err)
     }
 
+    /// #4025 — the federated approve-then-effect unit (see
+    /// `db::approve_execute_pending_action`): the approval commits only after
+    /// the effect landed. Store-backed surface ⇒ the Http eligibility posture,
+    /// parity with `approve_with_approver_type` above.
+    async fn approve_execute_pending_action(
+        &self,
+        _ctx: &CallerContext,
+        pending_id: &str,
+        approver_agent_id: &str,
+    ) -> StoreResult<crate::storage::FederatedApproveOutcome> {
+        self.gate_record_stop()?;
+        let conn = self.state.lock().await;
+        db::approve_execute_pending_action(
+            &conn,
+            pending_id,
+            approver_agent_id,
+            db::ApproveSurface::Http,
+        )
+        .map_err(box_err)
+    }
+
     /// FX-C2-batch5 — Sqlite override matching the nominal SQLite
     /// primitive name. Delegates to `db::approve_with_approver_type`
     /// directly (bypassing the trait's default forward to
