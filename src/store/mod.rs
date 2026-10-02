@@ -995,6 +995,18 @@ pub(crate) fn authorize_namespace_standard_mutation(
     )
 }
 
+/// #4356 — map the shared SET verdict's refusal to the SAL error type.
+pub(crate) fn set_refusal_to_store_err(
+    refusal: crate::ns_standard_ancestor::SetRefusal,
+    namespace: &str,
+) -> StoreError {
+    StoreError::PermissionDenied {
+        action: NamespaceStandardOp::Set.label().to_string(),
+        target: namespace.to_string(),
+        reason: crate::ns_standard_ancestor::refusal_reason(refusal).to_string(),
+    }
+}
+
 /// #3176 — the CLEAR arm of [`authorize_namespace_standard_mutation`].
 ///
 /// # Errors
@@ -3470,6 +3482,20 @@ pub trait MemoryStore: Send + Sync {
         })
     }
 
+    /// #4356 — the nearest governing ancestor of `namespace` for the
+    /// ancestor-owner bind gate (the HTTP funnel's pre-write probe; the
+    /// adapters' own `set_namespace_standard` re-runs the gate in-transaction
+    /// as the fail-closed floor). Default returns `UnsupportedCapability`
+    /// (fail-closed: an adapter that cannot answer cannot admit the bind).
+    async fn namespace_governing_ancestor(
+        &self,
+        _namespace: &str,
+    ) -> StoreResult<crate::ns_standard_ancestor::GoverningAncestor> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "GOVERNANCE_GOVERNING_ANCESTOR".to_string(),
+        })
+    }
+
     /// Clear the namespace standard. Returns `true` when a row was
     /// removed, `false` when no namespace_meta row matched. Default
     /// returns `UnsupportedCapability`.
@@ -4555,6 +4581,25 @@ pub trait MemoryStore: Send + Sync {
         _namespace: &str,
     ) -> StoreResult<Option<crate::models::GovernancePolicy>> {
         Ok(None)
+    }
+
+    /// v0.7.0 L1-8 / #4357 — resolve the namespace's
+    /// `governance.require_approval_above_depth` threshold, leaf-first, with
+    /// the SAME walk semantics on every backend (the per-level decision is the
+    /// shared [`crate::storage::approval_depth_level_decision`]). `Ok(None)`
+    /// means no gate is configured; `Ok(Some(t))` means a reflection whose
+    /// proposed depth exceeds `t` must be parked for approval, never written.
+    ///
+    /// Default returns `UnsupportedCapability` — NOT `Ok(None)`: an adapter
+    /// that has not wired the walk must fail the reflect loudly rather than
+    /// silently skip an approval gate the operator configured (fail closed).
+    async fn resolve_require_approval_above_depth(
+        &self,
+        _namespace: &str,
+    ) -> StoreResult<Option<u32>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "REFLECT_APPROVAL_GATE".to_string(),
+        })
     }
 
     /// Apply an approval vote against a pending action with full

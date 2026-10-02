@@ -912,7 +912,17 @@ async fn resolve_level(app: &AppState, delete_class: bool) -> Result<GovernanceL
         return Ok(level_of(policy.as_ref(), delete_class));
     }
     let lock = app.db.lock().await;
-    let policy = db::resolve_governance_policy(&lock.0, IDENTITY_NAMESPACE);
+    // #4043 — a read fault refuses (postgres parity above); never "no policy".
+    let policy = db::resolve_governance_policy(&lock.0, IDENTITY_NAMESPACE).map_err(|e| {
+        tracing::error!(error = %e, "identity-namespace governance policy unreadable; refusing (#4043)");
+        no_store(
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({
+                "error": crate::errors::error_codes::STORE_BACKEND_UNAVAILABLE,
+                "message": "identity-namespace governance policy could not be read; refusing",
+            }),
+        )
+    })?;
     Ok(level_of(policy.as_ref(), delete_class))
 }
 

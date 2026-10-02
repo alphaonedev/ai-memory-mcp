@@ -348,11 +348,31 @@ pub fn handle_namespace_set_standard_trusted(
     handle_namespace_set_standard_inner(conn, params, Some(trusted_caller))
 }
 
+/// Error context for the #4356 set-standard write transaction (begin / commit).
+const SET_STANDARD_TXN_CONTEXT: &str = "set-standard write transaction";
+
 fn handle_namespace_set_standard_inner(
     conn: &rusqlite::Connection,
     params: &Value,
     trusted_caller: Option<&str>,
 ) -> Result<Value, String> {
+    // #4356 — the owner gates (#3758 rebind, #4356 ancestor) and every write
+    // of a SET run inside ONE `BEGIN IMMEDIATE` transaction (joined when the
+    // caller already holds one), so the gate reads the chain under the single
+    // sqlite write lock: a concurrent ancestor bind from another connection or
+    // process is either committed before this read or ordered after this bind,
+    // never interleaved between check and write (#4023/#4447 TOCTOU class).
+    // Every early return (a refusal or an error) drops `txn`, which rolls back,
+    // so nothing partial lands; only the success path below commits.
+    let txn = if conn.is_autocommit() {
+        Some(
+            crate::storage::connection::WriteTxn::begin(conn).map_err(|e| {
+                crate::mcp::error_text::mcp_foreign_err(SET_STANDARD_TXN_CONTEXT, e)
+            })?,
+        )
+    } else {
+        None
+    };
     let namespace = params["namespace"]
         .as_str()
         .ok_or(crate::errors::msg::NAMESPACE_REQUIRED)?;
@@ -421,29 +441,18 @@ fn handle_namespace_set_standard_inner(
     // could REPLACE another tenant's governance standard with a memory of
     // their own. A read FAULT refuses (fail-closed): an unverifiable current
     // owner must never be treated as unowned.
-    let rebind_refusal: Option<String> = match db::namespace_standard_binding(conn, namespace) {
-        Err(err) => {
-            tracing::error!(
-                target: crate::mcp::error_text::TRACE_TARGET,
-                error = %err,
-                "namespace_set_standard: cannot verify the current standard owner; refusing the bind",
-            );
-            Some(
-                "cannot verify the current namespace-standard owner; refusing the bind \
-                 rather than treating the standard as unowned"
-                    .to_string(),
-            )
-        }
-        Ok(binding) => crate::visibility::namespace_standard_mutation_admission(
-            &caller,
-            caller == sentinels::DAEMON_PRINCIPAL,
-            namespace,
-            &binding,
-            crate::visibility::NamespaceStandardOp::Set,
-        )
-        .err()
-        .map(|_| crate::errors::msg::CALLER_DOES_NOT_OWN_NAMESPACE_STANDARD.to_string()),
-    };
+    // #4356 — the SAME shared verdict also gates the FIRST bind (and the
+    // severed-pointer repair) under a governed ancestor: only the nearest
+    // governing ancestor's owner may open a child standard that opts the
+    // subtree out of the ancestor's policy.
+    let rebind_refusal: Option<String> = crate::storage::ns_standard_ancestor::set_admission_conn(
+        conn,
+        &caller,
+        caller == sentinels::DAEMON_PRINCIPAL,
+        namespace,
+    )
+    .err()
+    .map(|r| crate::ns_standard_ancestor::refusal_reason(r).to_string());
     let bind_refusal: Option<String> = match (rebind_refusal, parent_standard) {
         (Some(refusal), _) => Some(refusal),
         (None, Err(err)) => {
@@ -571,6 +580,10 @@ fn handle_namespace_set_standard_inner(
     if let Some(g) = governance_val {
         resp[field_names::GOVERNANCE] = g.clone();
     }
+    if let Some(txn) = txn {
+        txn.commit()
+            .map_err(|e| crate::mcp::error_text::mcp_foreign_err(SET_STANDARD_TXN_CONTEXT, e))?;
+    }
     Ok(resp)
 }
 
@@ -616,7 +629,16 @@ pub fn handle_namespace_get_standard(
                 // would leak the resolved ancestor path).
                 super::StandardLookup::Withheld => withheld += 1,
                 super::StandardLookup::Visible(std) => {
-                    let gov = extract_governance(&std);
+                    let gov = match std["id"].as_str() {
+                        Some(sid) => standard_governance_response(conn, sid, &std["metadata"])
+                            .map_err(|e| {
+                                crate::mcp::error_text::mcp_foreign_err(
+                                    CTX_NAMESPACE_GET_STANDARD,
+                                    e,
+                                )
+                            })?,
+                        None => extract_governance(&std),
+                    };
                     let entry = json!({
                         "namespace": link,
                         (field_names::STANDARD_ID): std["id"].clone(),
@@ -644,7 +666,7 @@ pub fn handle_namespace_get_standard(
     // The binding is probed separately from the body so a DANGLING binding
     // (id set, memory deleted) keeps its distinct `warning` shape.
     let standard_id = db::get_namespace_standard(conn, namespace)
-        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("namespace_get_standard", e))?;
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err(CTX_NAMESPACE_GET_STANDARD, e))?;
     match standard_id {
         Some(id) => match super::lookup_namespace_standard(conn, namespace, caller) {
             super::StandardLookup::Visible(std) => {
@@ -661,7 +683,10 @@ pub fn handle_namespace_get_standard(
                 // `inherit` populate), then layer the raw blob keys
                 // back on top — preserving every field the operator
                 // sent on set, including off-struct fields.
-                let gov = merge_governance_for_response(&std["metadata"]);
+                let gov =
+                    standard_governance_response(conn, &id, &std["metadata"]).map_err(|e| {
+                        crate::mcp::error_text::mcp_foreign_err(CTX_NAMESPACE_GET_STANDARD, e)
+                    })?;
                 Ok(json!({
                     "namespace": namespace,
                     (field_names::STANDARD_ID): id,
@@ -711,37 +736,18 @@ pub(crate) fn merge_governance_for_response(metadata: &Value) -> Value {
     // governance metadata is present (matches pre-#1326 behaviour
     // for the well-known-fields surface).
     //
-    // #1384 — observability for stored-corruption on the GET path.
-    // `from_metadata` returns three shapes: `None` (no governance
-    // metadata, fall through to default), `Some(Ok(policy))` (typed
-    // parse succeeded), or `Some(Err(parse_err))` (governance JSON
-    // present but malformed — e.g. an unknown enum variant landed via
-    // direct SQL update or a stale binary). Pre-#1384 the
-    // `.map(Result::unwrap_or_default)` collapsed the `Err` arm
-    // silently into `GovernancePolicy::default()`, so the get-standard
-    // response showed `write: "any"` (the default) even when the
-    // stored row carried `write: "approval"` (an invalid variant the
-    // operator typo'd). Surface the drift via a tracing WARN so the
-    // silent fallback is observable in operator logs; preserve the
-    // backward-compat default-on-failure shape because the response
-    // body must always include a typed policy block.
-    let base = match GovernancePolicy::from_metadata(metadata) {
-        None => GovernancePolicy::default(),
-        Some(Ok(p)) => p,
-        Some(Err(parse_err)) => {
-            tracing::warn!(
-                target: "ai_memory::governance::policy_read",
-                error = %parse_err,
-                "stored metadata.governance failed typed deserialise on \
-                 the get-standard read path — the response will fall \
-                 back to GovernancePolicy::default() (write=any, \
-                 delete=owner, approver=human). Likely cause: direct \
-                 SQL update, older binary, or a typo'd enum variant \
-                 that bypassed the set-standard typed gate. Operator \
-                 should re-run `memory_namespace_set_standard` to \
-                 restore the typed shape."
-            );
-            GovernancePolicy::default()
+    // #4285 — a corrupt standard (whole `metadata` not an object, or
+    // `metadata.governance` failing the typed deserialise) is a SEVERED level in
+    // enforcement (Owner floor). The read MUST agree: report that effective
+    // floored policy plus `corrupt: true`, never the permissive default
+    // (`write: any`) the pre-#4285 read showed. The raw stored keys are NOT
+    // overlaid (an unparseable policy's fields are not honoured), and the
+    // reason is a fixed category — never the stored value (#4285 F3).
+    let base = match crate::db::classify_standard_metadata_value(metadata) {
+        crate::db::StandardMetadata::NoGovernance => GovernancePolicy::default(),
+        crate::db::StandardMetadata::Policy(p, _) => *p,
+        crate::db::StandardMetadata::Corrupt(reason) => {
+            return corrupt_governance_response(reason);
         }
     };
     let mut merged = serde_json::to_value(&base)
@@ -763,6 +769,42 @@ pub(crate) fn merge_governance_for_response(metadata: &Value) -> Value {
         }
     }
     Value::Object(merged)
+}
+
+/// Error-context label of the get-standard read surface.
+const CTX_NAMESPACE_GET_STANDARD: &str = "namespace_get_standard";
+
+/// #4285 — the get-standard governance block for a CORRUPT standard: the
+/// effective (severed, Owner-floored) policy enforcement applies, marked
+/// `corrupt: true` with a value-free `corrupt_reason`.
+pub(crate) fn corrupt_governance_response(reason: crate::db::CorruptReason) -> Value {
+    let mut out = serde_json::to_value(GovernancePolicy::default().with_severed_standard_floor())
+        .ok()
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default();
+    out.insert("corrupt".to_string(), Value::Bool(true));
+    out.insert(
+        "corrupt_reason".to_string(),
+        Value::String(reason.to_string()),
+    );
+    Value::Object(out)
+}
+
+/// #4285 — the governance block for a resolved standard on the sqlite read
+/// surface. The lenient row mapper turns a whole-`metadata` cell that is not a
+/// JSON object into `{}`, so the RAW column is classified first: corrupt there
+/// is reported as corrupt (floored), exactly as enforcement treats it.
+fn standard_governance_response(
+    conn: &rusqlite::Connection,
+    standard_id: &str,
+    metadata: &Value,
+) -> anyhow::Result<Value> {
+    Ok(
+        match crate::db::standard_metadata_corruption(conn, standard_id)? {
+            Some(reason) => corrupt_governance_response(reason),
+            None => merge_governance_for_response(metadata),
+        },
+    )
 }
 
 /// Task 1.8 — extract metadata.governance from a serialized memory value,

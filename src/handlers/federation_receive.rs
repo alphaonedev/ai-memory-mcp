@@ -2836,9 +2836,23 @@ async fn sync_push_write(
         // `resolve_inbound_attribution`). Done before the quota gate so the
         // gate charges the attributed agent, and so the persisted row's
         // owner (`metadata.agent_id`) reflects any re-attribution.
-        let cap_for_namespace = db::resolve_governance_policy(&lock.0, &mem.namespace)
-            .unwrap_or_else(crate::models::GovernancePolicy::default)
-            .effective_max_reflection_depth();
+        // #4043 — an unreadable policy refuses this row (reject-before-apply,
+        // the batch survives, the peer re-sends); it never stamps the compiled
+        // default as the local cap on evidence nobody read.
+        let cap_for_namespace = match db::resolve_governance_policy(&lock.0, &mem.namespace) {
+            Ok(policy) => policy.unwrap_or_default().effective_max_reflection_depth(),
+            Err(e) => {
+                tracing::warn!(
+                    target: ATTESTATION_TRACE_TARGET,
+                    memory_id = %mem.id,
+                    "sync_push: governance policy unreadable for {}: {e:#}; \
+                     refusing the write (#4043 fail-closed)",
+                    mem.namespace
+                );
+                skipped += 1;
+                continue;
+            }
+        };
         let mut to_insert = crate::federation::reflection_bookkeeping::stamp_reflection_origin(
             mem,
             &body.sender_agent_id,
