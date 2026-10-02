@@ -103,10 +103,16 @@ cannot be established (no `X-Peer-Id`, or the body-agent-id trust bypass)
 any bind that consults an owner is refused. A refused entry is skipped and
 counted in `namespace_meta_refused` (a missing standard memory is a plain
 not-found skip on both backends); the rest of the batch applies. The
-identity is only as strong as the peer authentication: in the zero-config
-legacy posture (no peer-attestation allowlist and the push-scope requirement
-off) an unsigned `X-Peer-Id` naming an owner is that owner, the same trust
-model every other lane has in that posture.
+identity is only as strong as the peer configuration. In the zero-config
+posture (no peer-attestation allowlist configured) ANY peer acts for whoever
+owns the memory it binds, and an unsigned `X-Peer-Id` naming an owner is that
+owner: the owner gates then hold against nobody the receive lane does not
+already trust on faith (the same model #1464 applies to row ownership there;
+the lane is refused in that posture unless the push-scope requirement is
+explicitly turned off). Governed deployments should configure
+`AI_MEMORY_FED_PEER_ATTESTATION` with per-peer `allowed_sender_agent_ids` and
+scopes, and peer attestation (signed pushes, enrolled keys, certificate
+binding), so a peer acts only for the agents it is allowlisted for.
 
 ### Corrupt standards resolve as SEVERED ([#4285](https://github.com/alphaonedev/ai-memory-mcp/issues/4285))
 
