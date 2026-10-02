@@ -89,8 +89,12 @@ stored metadata is corrupt (not a JSON object, or a `governance` blob that
 does not deserialize). The check runs inside the bind's write transaction
 on both backends, so it cannot pass on a chain a concurrent bind is
 changing. The global `*`
-default is not a governing ancestor for this gate, and the federated
-`namespace_meta` lanes keep their own peer-scope gate (#2479).
+default is not a governing ancestor for this gate. **Open gap
+([#4478](https://github.com/alphaonedev/ai-memory-mcp/issues/4478)):** the
+federated `namespace_meta[]` apply (`/sync/push`) does NOT run this gate yet.
+It is checked only by the #2479 / #2536 peer-scope gate, so a peer whose
+scope covers a child of a locally governed ancestor can still open that
+child's first standard until #4478 lands.
 
 ### Corrupt standards resolve as SEVERED ([#4285](https://github.com/alphaonedev/ai-memory-mcp/issues/4285))
 
