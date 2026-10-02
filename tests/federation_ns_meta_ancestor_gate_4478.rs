@@ -210,6 +210,19 @@ fn memory(owner: &str, namespace: &str, governance: Option<Value>) -> Memory {
     }
 }
 
+fn entry_with_parent(namespace: &str, standard_id: &str, parent: &str) -> Value {
+    let mut e = entry(namespace, standard_id);
+    e["parent_namespace"] = json!(parent);
+    e
+}
+
+async fn binding(store: &Arc<dyn MemoryStore>, ns: &str) -> Option<(String, Option<String>)> {
+    store
+        .get_namespace_standard(&CallerContext::for_admin("ai:admin-4478"), ns)
+        .await
+        .expect("read binding")
+}
+
 fn entry(namespace: &str, standard_id: &str) -> Value {
     json!({
         "namespace": namespace, "standard_id": standard_id, "parent_namespace": null,
@@ -264,6 +277,17 @@ struct Outcome {
     owner_child_bound: bool,
     bypass_refused: u64,
     bypass_child_bound: bool,
+    /// R2: one batch of (refused child, missing standard, control):
+    /// (refused, skipped, applied)
+    missing_counts: (u64, u64, u64),
+    /// #4495: a stranger peer's REBIND of a locally owned child standard:
+    /// (refused, child still on its own standard, reflect pending)
+    rebind: (u64, bool, bool),
+    /// #4495: a stranger peer's RE-PARENT of a locally owned root that
+    /// inherits P: (refused, parent link unchanged)
+    reparent: (u64, bool),
+    /// #4495 control: a peer acting for the child's owner rebinds it
+    owner_rebind_applied: u64,
 }
 
 async fn run(
@@ -357,6 +381,108 @@ async fn run(
     let bypass_report = push(&router, vec![entry(&byp_child, &o_std.id)]).await;
     let bypass_child_bound = bound(&store, &byp_child).await.is_some();
 
+    // 5. R2: existence before the gate on both backends (equal counters).
+    let free2 = format!("free4478b{u}");
+    let control2_std = memory(PEER, &format!("std4478{u}"), Some(json!({"write": "any"})));
+    store
+        .store(&peer_ctx, &control2_std)
+        .await
+        .expect("control standard 2");
+    set_posture(
+        &[
+            format!("{parent}/x2/**"),
+            format!("{parent}/x3/**"),
+            format!("{free2}/**"),
+        ],
+        &[PEER],
+        false,
+    );
+    let missing_report = push(
+        &router,
+        vec![
+            entry(&format!("{parent}/x2"), &s_std.id),
+            entry(&format!("{parent}/x3"), &format!("no-such-standard-{u}")),
+            entry(&free2, &control2_std.id),
+        ],
+    )
+    .await;
+    let missing_counts = (
+        counter(&missing_report, "namespace_meta_refused"),
+        counter(&missing_report, "skipped"),
+        counter(&missing_report, "namespace_meta_applied"),
+    );
+
+    // 6. #4495 rebind: P/c carries a standard the ancestor's owner bound
+    // locally (its own depth gate); a stranger peer may not replace it.
+    let pc = format!("{parent}/c");
+    let c_std = memory(
+        STD_OWNER,
+        &format!("std4478{u}"),
+        Some(json!({"write": "any", "require_approval_above_depth": 0})),
+    );
+    store
+        .store(&owner_ctx, &c_std)
+        .await
+        .expect("child standard");
+    store
+        .set_namespace_standard(&owner_ctx, &pc, &c_std.id, None)
+        .await
+        .expect("owner binds P/c locally");
+    let c_src = memory(PEER, &pc, None);
+    store.store(&peer_ctx, &c_src).await.expect("source in P/c");
+    set_posture(&[format!("{pc}/**")], &[PEER], false);
+    let rebind_report = push(&router, vec![entry(&pc, &s_std.id)]).await;
+    let still_own = binding(&store, &pc).await.map(|(sid, _)| sid) == Some(c_std.id.clone());
+    let (_, crb) = post(
+        &router,
+        "/api/v1/memory_reflect",
+        Some(PEER),
+        false,
+        &json!({
+            "source_ids": [c_src.id], "title": format!("r4495 {}", uuid::Uuid::new_v4()),
+            "content": "depth-1 reflection", "namespace": pc, "agent_id": PEER,
+        }),
+    )
+    .await;
+    let rebind = (
+        counter(&rebind_report, "namespace_meta_refused"),
+        still_own,
+        crb.get("id").is_none() && crb["status"] == "pending",
+    );
+
+    // 7. #4495 re-parent: a root T owned by P's owner inherits P through its
+    // explicit link; a stranger peer may not re-point it at its own root.
+    let t = format!("t4478{u}");
+    let q = format!("q4478{u}");
+    let t_std = memory(STD_OWNER, &format!("std4478{u}"), None);
+    store
+        .store(&owner_ctx, &t_std)
+        .await
+        .expect("root standard");
+    store
+        .set_namespace_standard(&owner_ctx, &t, &t_std.id, Some(&parent))
+        .await
+        .expect("owner binds T under P");
+    set_posture(&[format!("{t}/**"), format!("{q}/**")], &[PEER], false);
+    let reparent_report = push(&router, vec![entry_with_parent(&t, &s_std.id, &q)]).await;
+    let reparent = (
+        counter(&reparent_report, "namespace_meta_refused"),
+        binding(&store, &t).await.and_then(|(_, p)| p) == Some(parent.clone()),
+    );
+
+    // 8. Control: a peer acting for P/c's owner rebinds it.
+    let owner_new_std = memory(
+        STD_OWNER,
+        &format!("std4478{u}"),
+        Some(json!({"write": "any"})),
+    );
+    store
+        .store(&owner_ctx, &owner_new_std)
+        .await
+        .expect("owner's new standard");
+    set_posture(&[format!("{pc}/**")], &[PEER, STD_OWNER], false);
+    let owner_rebind_report = push(&router, vec![entry(&pc, &owner_new_std.id)]).await;
+
     Outcome {
         stranger_refused: counter(&report, "namespace_meta_refused"),
         stranger_applied: counter(&report, "namespace_meta_applied"),
@@ -368,6 +494,10 @@ async fn run(
         owner_child_bound,
         bypass_refused: counter(&bypass_report, "namespace_meta_refused"),
         bypass_child_bound,
+        missing_counts,
+        rebind,
+        reparent,
+        owner_rebind_applied: counter(&owner_rebind_report, "namespace_meta_applied"),
     }
 }
 
@@ -382,6 +512,10 @@ const WANT: Outcome = Outcome {
     owner_child_bound: true,
     bypass_refused: 1,
     bypass_child_bound: false,
+    missing_counts: (1, 2, 1),
+    rebind: (1, true, true),
+    reparent: (1, true),
+    owner_rebind_applied: 1,
 };
 
 async fn sqlite_outcome() -> Outcome {

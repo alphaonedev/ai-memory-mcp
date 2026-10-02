@@ -121,6 +121,14 @@ fn federation_apply_ctx(receive_principal: String) -> crate::store::CallerContex
 /// other store refuses the entry (fail closed) rather than fall back to the
 /// admin bypass.
 #[cfg(feature = "sal")]
+#[cfg_attr(
+    not(feature = "sal-postgres"),
+    allow(
+        unused_variables,
+        clippy::unused_async,
+        reason = "only the postgres arm uses the identity inputs; one signature for both legs"
+    )
+)]
 async fn federated_namespace_meta_bind(
     app: &AppState,
     peer_header: Option<&str>,
@@ -150,14 +158,6 @@ async fn federated_namespace_meta_bind(
             .set_namespace_standard_federated(&actor_for, namespace, standard_id, parent)
             .await;
     }
-    let _ = (
-        app,
-        peer_header,
-        sender_agent_id,
-        attest_cfg,
-        standard_id,
-        parent,
-    );
     Err(crate::store::set_refusal_to_store_err(
         crate::ns_standard_ancestor::SetRefusal::Unverifiable,
         namespace,

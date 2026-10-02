@@ -94,7 +94,12 @@ const SCOPED_ALLOWLIST: &str =
 /// #2536 requires tree coverage (`/**`) — a single-level `secure/*` matches
 /// `secure/ops` but not its descendants, so it may not set/clear hierarchical
 /// governance on that node.
-const SCOPED_ALLOWLIST_WITH_VICTIM: &str = r#"{"ai:evil":{"allowed_namespaces":["public/*","secure/**"],"allowed_sender_agent_ids":["ai:evil"]}}"#;
+///
+/// #4495 — a federated REBIND now needs the current owner (#3758 parity), so
+/// the control's peer is also allowlisted to act for the victim's owner
+/// (`ai:victim` authored both seeded standards); the exploit cell's
+/// `SCOPED_ALLOWLIST` differs from this only in scope, as before.
+const SCOPED_ALLOWLIST_WITH_VICTIM: &str = r#"{"ai:evil":{"allowed_namespaces":["public/*","secure/**"],"allowed_sender_agent_ids":["ai:evil","ai:victim"]}}"#;
 
 /// Root-namespace posture for the parent cell: the peer owns `alpha` but NOT the
 /// namespace it tries to attach as `alpha`'s inheritance parent.
@@ -732,7 +737,9 @@ async fn no_allowlist_namespace_meta_posture_matrix_3582() {
         (true, Some("1"), true),
     ] {
         let allowlist = scoped.then_some(
-            r#"{"ai:evil":{"allowed_namespaces":["**"],"allowed_sender_agent_ids":["ai:evil"]}}"#,
+            // #4495: also allowlisted for the seeded standards' owner, since a
+            // federated rebind needs the current owner (#3758 parity).
+            r#"{"ai:evil":{"allowed_namespaces":["**"],"allowed_sender_agent_ids":["ai:evil","ai:victim"]}}"#,
         );
         set_posture(allowlist, require);
         let (router, db) = build_router_with_db();
