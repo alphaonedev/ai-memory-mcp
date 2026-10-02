@@ -21,6 +21,9 @@
 //! deterministic: a held row lock plus a `pg_blocking_pids` barrier.
 #![cfg(all(feature = "sal", feature = "sal-postgres"))]
 
+#[path = "common/pg_barrier.rs"]
+mod pg_barrier;
+
 use std::sync::Arc;
 
 use ai_memory::config::{FeatureTier, HttpIdentityMode, ResolvedScoring, ResolvedTtl};
@@ -180,7 +183,7 @@ async fn metadata(pg: &PostgresStore, id: &str) -> Value {
 /// or queued behind a waiter that is (a second `FOR UPDATE` waiter on the same
 /// row blocks on the first waiter's tuple lock, not on the holder).
 async fn wait_blocked_behind(pg: &PostgresStore, holder_pid: i32, n: i64) {
-    let end = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+    let end = pg_barrier::deadline();
     loop {
         let blocked: i64 = sqlx::query_scalar(
             "WITH w AS (SELECT pid, pg_blocking_pids(pid) AS b FROM pg_stat_activity) \
