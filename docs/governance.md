@@ -76,7 +76,7 @@ namespaces inherit the parent's policy by default (`inherit: true`),
 so one standard at `org/` governs the subtree until a child opts out.
 Opting a child out is itself an authorized act (#4356): binding the
 **first** standard (or repairing a severed binding, the #3758 SET repair
-path) at a namespace
+path, or rebinding an UNOWNED standard, #4499) at a namespace
 under a governed ancestor requires the caller to own the **nearest
 governing ancestor's** standard — the nearest ancestor on the
 governance chain whose standard carries a `metadata.governance`
