@@ -34,6 +34,10 @@
 
 mod common;
 
+#[cfg(feature = "sal-postgres")]
+#[path = "common/pg_barrier.rs"]
+mod pg_barrier;
+
 use ai_memory::db;
 use ai_memory::identity::keypair::{self, AgentKeypair};
 use ai_memory::identity::lineage::{LineageError, LineageRecord};
@@ -1935,7 +1939,7 @@ mod postgres_parity {
         let sal_attempt = row.clone();
         let federation_attempt = row.clone();
         let (sal_result, federation_result) =
-            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::time::timeout(crate::pg_barrier::barrier_budget(), async {
                 tokio::join!(
                     store.store(&ctx, &sal_attempt),
                     store.apply_remote_memory(&ctx, &federation_attempt)
@@ -1988,9 +1992,45 @@ mod postgres_parity {
 
     #[tokio::test]
     async fn postgres_v97_cutover_lock_backfills_concurrent_generic_writer_3464() {
+        let Some(url) = postgres_url() else { return };
+        v97_cutover_scenario(url).await;
+    }
+
+    /// #4488 — the same cutover cell on a scratch database where every NEW
+    /// connection after the cell's schema exists takes the injected cold-login
+    /// delay (the pool acquire timeout minus 8 s, past the old 2 s poll window).
+    /// The barrier and the bounded cutover must ride the shared budget.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "live postgres: AI_MEMORY_TEST_POSTGRES_URL (postgres-ignored tier)"]
+    async fn postgres_v97_cutover_survives_a_cold_backend_4488() {
+        use sqlx::Connection as _;
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let scratch = crate::pg_barrier::ScratchDb::create(&url, "ai_memory_4488")
+            .await
+            .expect("create scratch database");
+        let scratch_url = scratch.url();
+        let mut admin = sqlx::PgConnection::connect(&scratch_url)
+            .await
+            .expect("connect scratch admin");
+        // Delay only connections made AFTER the cell's own schema exists, so the
+        // pool's first connection (which creates the schema) is not slowed.
+        sqlx::raw_sql(&crate::pg_barrier::login_delay_sql(
+            "slow_login_4488",
+            "EXISTS (SELECT 1 FROM pg_namespace WHERE nspname LIKE 'v97\\_cutover\\_%')",
+        ))
+        .execute(&mut admin)
+        .await
+        .expect("install login delay (needs a superuser role)");
+        drop(admin);
+        v97_cutover_scenario(scratch_url).await;
+    }
+
+    async fn v97_cutover_scenario(url: String) {
         use base64::Engine as _;
 
-        let Some(url) = postgres_url() else { return };
         let pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(4)
             .connect(&url)
@@ -2094,10 +2134,17 @@ mod postgres_parity {
             .execute(&mut *tx)
             .await
             .expect("scope migration schema");
-            sqlx::query("SET LOCAL lock_timeout = '10s'")
-                .execute(&mut *tx)
-                .await
-                .expect("bound v97 lock acquisition");
+            // The migration waits on the in-flight writer's lock until the poll
+            // below (which may itself need a NEW backend) observes it and
+            // releases the writer, so the bound is the shared barrier budget,
+            // not a free-standing 10 s (#4488).
+            sqlx::query(&format!(
+                "SET LOCAL lock_timeout = '{}s'",
+                crate::pg_barrier::barrier_budget().as_secs()
+            ))
+            .execute(&mut *tx)
+            .await
+            .expect("bound v97 lock acquisition");
             sqlx::raw_sql(include_str!(
                 "../migrations/postgres/0054_v97_agent_pubkey_history.sql"
             ))
@@ -2115,7 +2162,7 @@ mod postgres_parity {
         };
 
         let release_writer = async {
-            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::time::timeout(crate::pg_barrier::barrier_budget(), async {
                 loop {
                     let waiting: bool = sqlx::query_scalar(
                         "SELECT EXISTS (
@@ -2144,7 +2191,7 @@ mod postgres_parity {
             .expect("v97 migration must wait on the in-flight writer lock");
             writer.commit().await.expect("commit pre-v97 writer");
         };
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        tokio::time::timeout(crate::pg_barrier::barrier_budget(), async {
             tokio::join!(migration, release_writer)
         })
         .await
