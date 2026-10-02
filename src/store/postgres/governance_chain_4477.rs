@@ -106,3 +106,55 @@ pub(super) async fn build_chain_on(
     }
     Ok(chain)
 }
+
+/// #4492 — the postgres reader for the bind-time chain-depth refusal (the
+/// decision is `crate::governance::bind_chain_depth`, shared with sqlite).
+/// Called in the bind's transaction AFTER the bind advisory lock, before the
+/// upsert, so two binds cannot race past it. Owners are normalised exactly as
+/// [`build_chain_on`] normalises them.
+///
+/// # Errors
+///
+/// `InvalidInput` with the fixed #4492 text, or a storage fault (the bind is
+/// refused, fail closed).
+pub(super) async fn admit_bind_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    namespace: &str,
+    standard_id: &str,
+    new_parent: Option<&str>,
+) -> StoreResult<()> {
+    use crate::governance::bind_chain_depth::{
+        BIND_CHAIN_OVER_DEPTH, LinkRow, bind_exceeds_chain_depth,
+    };
+    let unowned = |o: Option<String>| {
+        o.filter(|o| !o.is_empty() && o != crate::identity::sentinels::SYSTEM_PRINCIPAL)
+    };
+    let rows: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT nm.namespace, nm.parent_namespace, m.metadata->>'agent_id' \
+         FROM namespace_meta nm LEFT JOIN memories m ON m.id = nm.standard_id",
+    )
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(|e| to_store_err("bind chain-depth link graph", e))?;
+    let new_owner: Option<Option<String>> =
+        sqlx::query_scalar("SELECT mm.metadata->>'agent_id' FROM memories mm WHERE mm.id = $1")
+            .bind(standard_id)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(|e| to_store_err("bind chain-depth standard owner", e))?;
+    let links: Vec<LinkRow> = rows
+        .into_iter()
+        .map(|(namespace, parent, owner)| LinkRow {
+            namespace,
+            parent,
+            owner: unowned(owner),
+        })
+        .collect();
+    let owner = unowned(new_owner.flatten());
+    if bind_exceeds_chain_depth(&links, namespace, new_parent, owner.as_deref()) {
+        return Err(StoreError::InvalidInput {
+            detail: BIND_CHAIN_OVER_DEPTH.to_string(),
+        });
+    }
+    Ok(())
+}

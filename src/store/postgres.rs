@@ -87,8 +87,8 @@ mod tx_retry;
 // take NO relation-level DDL lock on connect. Own module for the same
 // qual_10 budget reason as `parity_3064` above.
 mod bootstrap_ddl;
-mod governance_chain_4477;
-mod ns_standard_ancestor_4356; // #4356 bind gate (own module: qual_10 budget) // #4477 the one complete chain builder (qual_10 budget)
+mod governance_chain_4477; // #4477 one chain builder, #4492 bind depth (qual_10 budget)
+mod ns_standard_ancestor_4356; // #4356 bind gate (own module: qual_10 budget)
 // v1.0.0 #3614 — the lineage walk (recursive CTE + AGE Cypher + the backend
 // dispatcher + the #3041 cycle check) and its two helpers. Own module for the
 // same qual_10 budget reason as `parity_3064` above: a pure MOVE (rule l),
@@ -26382,6 +26382,9 @@ impl MemoryStore for PostgresStore {
             .await
             .map_err(|e| to_store_err("set_namespace_standard begin", e))?;
         ns_standard_ancestor_4356::set_gate_in_tx(&mut tx, ctx, namespace).await?;
+        let parent_link = resolved_parent.as_deref(); // #4492 chain-depth admission:
+        governance_chain_4477::admit_bind_in_tx(&mut tx, namespace, standard_id, parent_link)
+            .await?;
         sqlx::query(
             "INSERT INTO namespace_meta (namespace, standard_id, updated_at, parent_namespace)
              VALUES ($1, $2, NOW(), $3)

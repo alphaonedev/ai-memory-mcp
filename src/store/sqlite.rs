@@ -2190,7 +2190,17 @@ impl MemoryStore for SqliteStore {
             namespace,
         )
         .map_err(|r| crate::store::set_refusal_to_store_err(r, namespace))?;
-        db::set_namespace_standard(&conn, namespace, standard_id, parent).map_err(box_err)?;
+        db::set_namespace_standard(&conn, namespace, standard_id, parent).map_err(|e| {
+            // #4492 — the bind-time chain-depth refusal is typed input, not a
+            // backend fault (byte-identical to the postgres adapter).
+            if crate::storage::bind_chain_depth::is_bind_chain_over_depth(&e) {
+                StoreError::InvalidInput {
+                    detail: crate::governance::bind_chain_depth::BIND_CHAIN_OVER_DEPTH.to_string(),
+                }
+            } else {
+                box_err(e)
+            }
+        })?;
         write_txn.commit().map_err(box_err)
     }
 
