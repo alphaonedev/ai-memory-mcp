@@ -873,6 +873,15 @@ pub use merge_inbound_authorized_4023::{
     InboundStoredNamespaceRefused, StoredNamespaceAuthorizer, inbound_stored_namespace_refused,
     merge_inbound_authorized,
 };
+// #4447 — the in-transaction peer-scope re-check on the sqlite federation
+// by-id lanes (deletions / archives / restores / links). Own child module for
+// the same qual_10 reason as `merge_inbound_authorized_4023`.
+mod federation_by_id_4447;
+pub use federation_by_id_4447::{
+    ByIdNamespaceAuthorizer, InboundByIdNamespaceRefused, archive_memory_authorized,
+    create_link_inbound_authorized, delete_authorized, inbound_by_id_namespace_refused,
+    restore_archived_authorized,
+};
 // `pub` (rather than `pub(crate)`) so the V-4 closeout
 // integration test suite (`tests/signed_events_chain_v34.rs`) can
 // invoke `migrate_v34_backfill_chain` directly to exercise the
@@ -17175,6 +17184,17 @@ fn canonical_archived_expiry(conn: &Connection, id: &str) -> Result<Option<Strin
 }
 
 pub fn restore_archived(conn: &Connection, id: &str) -> Result<bool> {
+    restore_archived_impl(conn, id, None)
+}
+
+/// Body of [`restore_archived`] and (#4447) [`restore_archived_authorized`]:
+/// `authorize` is `None` for the unchecked operator restore and `Some` for the
+/// federated `restores[]` lane's in-transaction peer-scope re-check.
+fn restore_archived_impl(
+    conn: &Connection,
+    id: &str,
+    authorize: Option<ByIdNamespaceAuthorizer<'_>>,
+) -> Result<bool> {
     crate::storage::record_stop::gate_storage_conn(conn)?;
     let now = Utc::now().to_rfc3339();
     let _erasure_guard = crate::erasure::archive_sync::coordination_lock_if_enabled(conn)?;
@@ -17200,6 +17220,20 @@ pub fn restore_archived(conn: &Connection, id: &str) -> Result<bool> {
             {
                 return Ok(false);
             }
+        }
+        // #4447 — re-authorize the ARCHIVED row's stored namespace under this
+        // transaction's write lock (after any cold-tier reconstruction above):
+        // the funnel's scope gate ran on an earlier read, and a broader writer
+        // can have re-keyed the archived row since.
+        if let Some(authorize) = authorize
+            && let Some(stored) = archived_namespace_by_id(conn, id)?
+            && !authorize(id, &stored)
+        {
+            return Err(anyhow::Error::new(InboundByIdNamespaceRefused {
+                lane: crate::federation::receive_auth::LANE_RESTORES,
+                id: id.to_string(),
+                stored_namespace: stored,
+            }));
         }
         // #1848 reconciled to #1771 (5-agent vote 4d3ea1c5, option B): an
         // OPERATOR-initiated restore is an AUTHORIZED un-forget and must
