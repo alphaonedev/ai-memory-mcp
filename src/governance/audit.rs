@@ -546,7 +546,27 @@ fn register_exit_drain() {
 
 #[cfg(unix)]
 extern "C" fn drain_forensic_writer_at_exit() {
-    let _ = std::panic::catch_unwind(|| drain_bounded(EXIT_DRAIN_BUDGET));
+    let _ = std::panic::catch_unwind(drain_at_exit_once);
+}
+
+/// #4347 — the bounded exit drain, run AT MOST ONCE per process. The `atexit`
+/// hook and the `mcp` signal-stop path both call it; whichever arrives first
+/// drains, the other waits for that drain and gets its outcome, so a signal
+/// racing a normal exit is one drain, not two.
+pub fn drain_at_exit_once() -> DrainOutcome {
+    static OUTCOME: OnceLock<DrainOutcome> = OnceLock::new();
+    *OUTCOME.get_or_init(|| {
+        EXIT_DRAIN_RUNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        drain_bounded(EXIT_DRAIN_BUDGET)
+    })
+}
+
+static EXIT_DRAIN_RUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// #4347 — how many times the once-only exit drain actually ran (0 or 1).
+#[must_use]
+pub fn exit_drain_runs() -> u64 {
+    EXIT_DRAIN_RUNS.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 /// #4319 — test seam: sleep this many ms in the background writer before
@@ -6539,6 +6559,21 @@ mod tests {
         let body = std::fs::read_to_string(&today).expect("written inline, no flush");
         assert_eq!(body.lines().count(), 1, "{body}");
         shutdown();
+    }
+
+    /// #4347 — the exit drain runs once however often it is requested, and
+    /// every caller gets the same outcome (signal path + `atexit` race).
+    #[test]
+    fn the_exit_drain_runs_once_however_often_it_is_asked_4347() {
+        let first = drain_at_exit_once();
+        let handles: Vec<_> = (0..4)
+            .map(|_| std::thread::spawn(drain_at_exit_once))
+            .collect();
+        for h in handles {
+            assert_eq!(h.join().expect("drain thread"), first);
+        }
+        assert_eq!(drain_at_exit_once(), first);
+        assert_eq!(exit_drain_runs(), 1, "one drain, not one per caller");
     }
 
     /// #4304 — a row and its newline go out in ONE write call.

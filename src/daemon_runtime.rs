@@ -1803,17 +1803,18 @@ pub async fn run(
             // `OllamaClient::generate` are issued cleanly.
             let db_path_owned = db_path.clone();
             let app_config_owned = app_config.clone();
-            tokio::task::spawn_blocking(move || {
+            // #4347 — SIGTERM / SIGINT / SIGHUP stop the loop gracefully and
+            // run the exit drain; handlers are installed before it starts.
+            let stop_signals = mcp::shutdown::StopSignals::install();
+            let loop_handle = tokio::task::spawn_blocking(move || {
                 mcp::run_mcp_server(
                     &db_path_owned,
                     feature_tier,
                     &app_config_owned,
                     &resolved_profile,
                 )
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!("mcp join: {e}"))??;
-            Ok(())
+            });
+            mcp::shutdown::supervise(loop_handle, stop_signals).await
         }
         Command::Store(a) => {
             let stdout = std::io::stdout();

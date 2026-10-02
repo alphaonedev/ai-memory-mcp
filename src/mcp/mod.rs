@@ -54,6 +54,8 @@ pub mod param_names;
 // the handler's fallback branch (empty-success / filter dropped /
 // negative-as-absent / stringy-bool). These helpers refuse instead.
 pub mod param_guard;
+/// #4347 — graceful stop on SIGTERM / SIGINT / SIGHUP.
+pub mod shutdown;
 pub mod stdio_drain;
 
 // #3378 unit 2 — inline JSON-Schema `enum` lists for closed MCP string
@@ -5192,8 +5194,8 @@ pub fn run_mcp_server(
     // hot-swap. Between JSON-RPC requests (the stdio loop is single-
     // threaded, so the swap point is race-free by construction) we stat
     // config.toml; when its mtime changes we validate-then-swap the
-    // `[llm]` client. NO SIGHUP on the stdio child — a HUP would collide
-    // with parent-exit orphan semantics. Disabled under
+    // `[llm]` client. SIGHUP is not a reload on the stdio child: since
+    // #4347 it is a graceful STOP (with SIGTERM / SIGINT). Disabled under
     // `AI_MEMORY_NO_CONFIG` so tests stay hermetic.
     let reload_config_path: Option<std::path::PathBuf> = if crate::config::skip_config() {
         None
@@ -5208,6 +5210,10 @@ pub fn run_mcp_server(
     let mut stdin_locked = stdin.lock();
     let mut line_buf: Vec<u8> = Vec::with_capacity(8192);
     loop {
+        // #4347 — a stop signal was claimed: return so the exit drain runs.
+        if shutdown::gate().is_stopping() {
+            break;
+        }
         line_buf.clear();
         // Take a per-line slice of stdin sized to MCP_MAX_LINE_BYTES + 1
         // so we can detect overrun (read_until returns the byte count
@@ -5221,6 +5227,12 @@ pub fn run_mcp_server(
             // Clean EOF.
             break;
         }
+        // #4347 — held until the end of this iteration (every `continue`
+        // included). A stop claimed while a request is in flight lets it
+        // finish; a line read after the claim is not processed.
+        let Some(_request_guard) = shutdown::gate().begin_request() else {
+            break;
+        };
         let overrun = line_buf.last() != Some(&b'\n') && n > MCP_MAX_LINE_BYTES;
         if overrun {
             // Drain the rest of this line so the next iteration starts on a
