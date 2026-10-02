@@ -288,6 +288,17 @@ struct Outcome {
     reparent: (u64, bool),
     /// #4495 control: a peer acting for the child's owner rebinds it
     owner_rebind_applied: u64,
+    /// #4499: a stranger's rebind of an UNOWNED child standard under the
+    /// OWNED P, through every funnel: (HTTP status, HTTP not-owner, SAL
+    /// not-owner, MCP not-owner [true on postgres], federated refused,
+    /// child still on the unowned standard, stranger reflect pending)
+    unowned_rebind: (u16, bool, bool, bool, u64, bool, bool),
+    /// #4499: P's owner may rebind that child
+    unowned_owner_rebind_ok: bool,
+    /// #4499 control (#3758 unowned-PASS): with NO owned governing ancestor
+    /// a stranger may still rebind an unowned standard: (HTTP 2xx, federated
+    /// applied)
+    unowned_root_control: (bool, u64),
 }
 
 async fn run(
@@ -483,6 +494,102 @@ async fn run(
     set_posture(&[format!("{pc}/**")], &[PEER, STD_OWNER], false);
     let owner_rebind_report = push(&router, vec![entry(&pc, &owner_new_std.id)]).await;
 
+    // 9. #4499: an UNOWNED child standard under the OWNED P is P's owner's
+    // to rebind; with no owned ancestor the #3758 unowned-PASS still holds.
+    let admin = CallerContext::for_admin("ai:admin-4478");
+    let not_owner = ai_memory::errors::msg::CALLER_DOES_NOT_OWN_NAMESPACE_STANDARD;
+    let pu = format!("{parent}/u");
+    let u_std = memory("system", &format!("std4478{u}"), None);
+    store.store(&admin, &u_std).await.expect("unowned standard");
+    store
+        .set_namespace_standard(&admin, &pu, &u_std.id, None)
+        .await
+        .expect("operator binds an unowned child standard");
+    let u_src = memory(PEER, &pu, None);
+    store.store(&peer_ctx, &u_src).await.expect("source in P/u");
+    let (http_status, http_body) = post(
+        &router,
+        "/api/v1/namespaces",
+        Some(PEER),
+        false,
+        &json!({"namespace": pu, "id": s_std.id, "governance": {"write": "any"}}),
+    )
+    .await;
+    let sal = store
+        .set_namespace_standard(&peer_ctx, &pu, &s_std.id, None)
+        .await;
+    let sal_not_owner = matches!(
+        &sal,
+        Err(ai_memory::store::StoreError::PermissionDenied { reason, .. }) if reason == not_owner
+    );
+    let mcp_not_owner = if matches!(backend, StorageBackend::Sqlite) {
+        let conn = ai_memory::db::open(db_path).expect("mcp conn");
+        ai_memory::mcp::handle_namespace_set_standard(
+            &conn,
+            &json!({"namespace": pu, "id": s_std.id, "agent_id": PEER}),
+        )
+        .err()
+        .as_deref()
+            == Some(not_owner)
+    } else {
+        true
+    };
+    set_posture(&[format!("{pu}/**")], &[PEER], false);
+    let unowned_report = push(&router, vec![entry(&pu, &s_std.id)]).await;
+    let kept = binding(&store, &pu).await.map(|(sid, _)| sid) == Some(u_std.id.clone());
+    let (_, unowned_reflect) = post(
+        &router,
+        "/api/v1/memory_reflect",
+        Some(PEER),
+        false,
+        &json!({
+            "source_ids": [u_src.id], "title": format!("r4499 {}", uuid::Uuid::new_v4()),
+            "content": "depth-1 reflection", "namespace": pu, "agent_id": PEER,
+        }),
+    )
+    .await;
+    let unowned_rebind = (
+        http_status.as_u16(),
+        http_body["error"] == not_owner,
+        sal_not_owner,
+        mcp_not_owner,
+        counter(&unowned_report, "namespace_meta_refused"),
+        kept,
+        unowned_reflect.get("id").is_none() && unowned_reflect["status"] == "pending",
+    );
+    let p_owner_std = memory(STD_OWNER, &format!("std4478{u}"), None);
+    store
+        .store(&owner_ctx, &p_owner_std)
+        .await
+        .expect("owner standard");
+    let unowned_owner_rebind_ok = store
+        .set_namespace_standard(&owner_ctx, &pu, &p_owner_std.id, None)
+        .await
+        .is_ok();
+    // Control: an unowned standard at an ungoverned root.
+    let root_u = format!("ru4478{u}");
+    let root_u2 = format!("rv4478{u}");
+    for ns in [&root_u, &root_u2] {
+        store
+            .set_namespace_standard(&admin, ns, &u_std.id, None)
+            .await
+            .expect("operator binds an unowned root standard");
+    }
+    let (control_status, _) = post(
+        &router,
+        "/api/v1/namespaces",
+        Some(PEER),
+        false,
+        &json!({"namespace": root_u, "id": s_std.id}),
+    )
+    .await;
+    set_posture(&[format!("{root_u2}/**")], &[PEER], false);
+    let control_report = push(&router, vec![entry(&root_u2, &s_std.id)]).await;
+    let unowned_root_control = (
+        control_status.is_success(),
+        counter(&control_report, "namespace_meta_applied"),
+    );
+
     Outcome {
         stranger_refused: counter(&report, "namespace_meta_refused"),
         stranger_applied: counter(&report, "namespace_meta_applied"),
@@ -498,6 +605,9 @@ async fn run(
         rebind,
         reparent,
         owner_rebind_applied: counter(&owner_rebind_report, "namespace_meta_applied"),
+        unowned_rebind,
+        unowned_owner_rebind_ok,
+        unowned_root_control,
     }
 }
 
@@ -516,6 +626,9 @@ const WANT: Outcome = Outcome {
     rebind: (1, true, true),
     reparent: (1, true),
     owner_rebind_applied: 1,
+    unowned_rebind: (403, true, true, true, 1, true, true),
+    unowned_owner_rebind_ok: true,
+    unowned_root_control: (true, 1),
 };
 
 async fn sqlite_outcome() -> Outcome {
