@@ -32,7 +32,7 @@ Usage:
   scripts/check-test-keydir-mode.py --only tests/foo.rs
 Cargo-free, stdlib python3 only.
 """
-import argparse, pathlib, re, subprocess, sys
+import argparse, os, pathlib, re, subprocess, sys
 
 SANDBOX = re.compile(r'mkdir_0700|from_mode\(0o700\)')
 REFERENCES_KEY_DIR = re.compile(r'AI_MEMORY_KEY_DIR|_KEY_DIR"')
@@ -43,13 +43,38 @@ PASSED_AS_KEY_DIR = [
     re.compile(r'self\.keys'),
 ]
 
+def sandboxed(text: str, tok: str) -> bool:
+    """Is THIS token the one the sandbox helper created?
+
+    The replaced shell gate exempted a whole FILE that mentioned mkdir_0700 anywhere, so a fixture
+    with one sandboxed key dir and a second bare-created one was exempt (reviewer-f2r, N2). The
+    exemption is now per token, and it only narrows the file-level rule where the file mentions the
+    helper at all -- a file with no sandbox mention keeps the old, looser trigger, so this is
+    strictly more sensitive than before and never less.
+    """
+    t = re.escape(tok)
+    return bool(re.search(rf'mkdir_0700\s*\(\s*&?\s*{t}\b', text)
+                or re.search(rf'\b{t}\s*=\s*[^;]*mkdir_0700', text)
+                or re.search(rf'from_mode\(0o700\)[^;]*\b{t}\b', text)
+                or re.search(rf'\b{t}\b[^;]*from_mode\(0o700\)', text))
+
+def passed_as(text: str, tok: str) -> 're.Match | None':
+    t = re.escape(tok)
+    return (re.search(rf'KEY_DIR"?\s*,\s*&?\s*{t}\b', text)
+            or (re.search(r'KEY_DIR"\s*,\s*[a-z_]+(?:\.path\(\))?\.join\("keys"\)', text) if tok == 'keys' else None)
+            or (re.search(r'self\.keys', text) if tok == 'keys' else None))
+
 def scan_text(name: str, text: str) -> list[str]:
     if not REFERENCES_KEY_DIR.search(text):
         return []
+    bare = [m for m in BARE_CREATE.finditer(text)]
     if SANDBOX.search(text):
-        return []
-    created = BARE_CREATE.search(text)
-    passed = next((p.search(text) for p in PASSED_AS_KEY_DIR if p.search(text)), None)
+        # the file uses the helper: judge TOKEN BY TOKEN, so a second, unsandboxed key dir still fires
+        created = next((m for m in bare if not sandboxed(text, m.group(1)) and passed_as(text, m.group(1))), None)
+        passed = passed_as(text, created.group(1)) if created else None
+    else:
+        created = bare[0] if bare else None
+        passed = next((p.search(text) for p in PASSED_AS_KEY_DIR if p.search(text)), None)
     if created and passed:
         return [f'INVARIANT VIOLATION ({name}): a test that creates a key directory must use\n'
                 f'  key_dir_sandbox::mkdir_0700 (create + chmod 0700), not a bare create_dir --\n'
@@ -71,9 +96,24 @@ def line_based_match(text: str) -> bool:
     return (any(BARE_CREATE.search(l) for l in lines)
             and any(p.search(l) for p in PASSED_AS_KEY_DIR for l in lines))
 
+class ScanError(RuntimeError):
+    """The corpus could not be enumerated. Never reported as a clean scan."""
+
 def candidates() -> list[pathlib.Path]:
-    r = subprocess.run(['git', 'grep', '-lE', 'AI_MEMORY_KEY_DIR|_KEY_DIR"', '--',
+    """Tracked AND untracked test files that reference a key-dir env var.
+
+    git grep's exit status is LOAD-BEARING: 0 = matches, 1 = no match, >=2 (128 in practice) = error.
+    The first version of this port ignored it, so `GIT_DIR=/nonexistent` printed
+    "ok: ... (0 file(s) scanned)" and exited 0 -- a gate reporting green over a scan that never
+    happened, the #4090 class, found by reviewer-f2r. An error is fatal now, and so is an EMPTY
+    candidate set: this corpus has ~75 such files, so zero means the scan broke rather than that the
+    invariant holds. `--untracked` is passed because a NEW test file is exactly where this violation
+    gets introduced, and git grep would otherwise skip it until it was committed (f2r, N1).
+    """
+    r = subprocess.run(['git', 'grep', '-l', '--untracked', '-E', 'AI_MEMORY_KEY_DIR|_KEY_DIR"', '--',
                         'tests/*.rs', 'tests/**/*.rs'], capture_output=True, text=True)
+    if r.returncode >= 2:
+        raise ScanError(f'git grep failed (rc={r.returncode}): {(r.stderr or r.stdout).strip()[:200]}')
     return sorted({pathlib.Path(p) for p in r.stdout.split()})
 
 CELLS = [
@@ -117,6 +157,19 @@ CELLS = [
         let data = tmp.path().join("data");
         std::fs::create_dir(&data).unwrap();
     '''),
+    ('sandboxed key dir AND a second bare-created one (f2r N2)', True, '''
+        let keys = mkdir_0700(&tmp.path().join("keys"));
+        cmd.env("AI_MEMORY_KEY_DIR", &keys);
+        let kdir = tmp.path().join("kdir");
+        std::fs::create_dir(&kdir).unwrap();
+        other.env("AI_MEMORY_KEY_DIR", &kdir);
+    '''),
+    ('sandboxed key dir plus a bare-created UNRELATED dir', False, '''
+        let keys = mkdir_0700(&tmp.path().join("keys"));
+        cmd.env("AI_MEMORY_KEY_DIR", &keys);
+        let data = tmp.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+    '''),
 ]
 
 def self_test(out_dir: pathlib.Path) -> int:
@@ -140,6 +193,42 @@ def self_test(out_dir: pathlib.Path) -> int:
     added = [i for i, (_n, want, body) in enumerate(CELLS, 1)
              if want and scan_text('x', f'#[test]\nfn c() {{{body}}}\n')
              and not line_based_match(f'#[test]\nfn c() {{{body}}}\n')]
+    # ---- the ENUMERATION, end to end (reviewer-f2r's B1/N1) ----------------------------------
+    # scan_text cells prove the predicate. These prove the gate cannot report clean when the corpus
+    # was never enumerated -- the defect f2r found: GIT_DIR=/nonexistent printed
+    # "ok: ... (0 file(s) scanned)" with rc 0.
+    import tempfile
+    me = str(pathlib.Path(__file__).resolve())
+    VIOL = ('#[test]\nfn t() {\n    let keys = tmp.path().join("keys");\n'
+            '    std::fs::create_dir(&keys).unwrap();\n    cmd.env("AI_MEMORY_KEY_DIR", &keys);\n}\n')
+    def run_in(cwd, env=None, args=()):
+        e = dict(os.environ); e.pop('GIT_DIR', None)
+        if env: e.update(env)
+        r = subprocess.run([sys.executable, me, *args], cwd=cwd, env=e, capture_output=True, text=True)
+        return r.returncode, (r.stdout + r.stderr)
+    def mkrepo(d, files):
+        subprocess.run(['git', 'init', '-q', d], check=True)
+        for rel, body in files.items():
+            f = pathlib.Path(d, rel); f.parent.mkdir(parents=True, exist_ok=True); f.write_text(body)
+        return d
+    scan_cells = []
+    with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR', '/mnt/t9/tmp/god-f2')) as d:
+        rc, out = run_in(str(pathlib.Path(me).parent.parent), env={'GIT_DIR': '/nonexistent'})
+        scan_cells.append(('a broken git dir is an ERROR, not a clean scan', rc == 2 and 'SCAN FAILED' in out, f'rc={rc}'))
+        empty = mkrepo(os.path.join(d, 'empty'), {'tests/unrelated.rs': 'fn t() {}\n'})
+        rc, out = run_in(empty)
+        scan_cells.append(('an EMPTY candidate set is an ERROR, not a clean scan', rc == 2 and 'SCAN EMPTY' in out, f'rc={rc}'))
+        untr = mkrepo(os.path.join(d, 'untracked'), {'tests/new_fixture.rs': VIOL})
+        rc, out = run_in(untr)
+        scan_cells.append(('an UNTRACKED new test file is scanned (--untracked)', rc == 1 and 'INVARIANT VIOLATION' in out, f'rc={rc}'))
+        trk = mkrepo(os.path.join(d, 'tracked'), {'tests/committed.rs': VIOL})
+        subprocess.run(['git', '-C', trk, 'add', '-A'], check=True)
+        rc, out = run_in(trk)
+        scan_cells.append(('a TRACKED test file is scanned (control)', rc == 1 and 'INVARIANT VIOLATION' in out, f'rc={rc}'))
+    for name, ok, detail in scan_cells:
+        passed, failed = passed + ok, failed + (not ok)
+        print(f'  [{"ST-ok" if ok else "ST-FAIL"}] scan: {name} ({detail})')
+
     print(f'check-test-keydir-mode self-test: {passed} passed, {failed} failed '
           f'(fixtures under {out_dir})')
     if not added:
@@ -159,7 +248,19 @@ a = ap.parse_args()
 if a.self_test:
     sys.exit(self_test(pathlib.Path(a.selftest_dir)))
 
-files = [pathlib.Path(a.only)] if a.only else candidates()
+if a.only:
+    files = [pathlib.Path(a.only)]
+else:
+    try:
+        files = candidates()
+    except ScanError as ex:
+        print(f'SCAN FAILED: {ex}\n  refusing to report a clean tree over a scan that did not run (#4090 class)')
+        sys.exit(2)
+    if not files:
+        print('SCAN EMPTY: no tests/*.rs file references a key-dir env var.\n'
+              '  This corpus has ~75 of them, so an empty candidate set means the scan broke, not\n'
+              '  that the invariant holds. Refusing to report clean (#4090 class).')
+        sys.exit(2)
 fail = 0
 for f in files:
     for v in scan_text(str(f), f.read_text(errors='replace')):
