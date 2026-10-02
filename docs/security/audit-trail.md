@@ -832,6 +832,37 @@ advances before the write), and `audit verify` fails on it (#4021; see
 §"`ai-memory audit verify`"). The counter covers only the process that lost
 the event and only since it started; the gap stays in the file.
 
+### Refusing writes while the trail is down (opt-in, #4400)
+
+Counting a lost event is the default. Deployments that must not keep writing
+while the trail is down can set `AI_MEMORY_REQUIRE_AUDIT_TRAIL=1`. After a
+failed audit write or flush the process then refuses every later mutating
+operation with `503 AUDIT_TRAIL_UNAVAILABLE` (the MCP and CLI refusals carry
+the same text), through the same checkpoints the record-stop control uses
+(both storage backends, coordination writes, federation receive, every MCP
+write tool). Reads keep working.
+
+The next write after a failure retries the trail, at most once a second, by
+appending a real `trail_resumed` record. When that append succeeds the
+refusals stop, and the record marks in the trail where recording resumed; the
+events lost before it are the `sequence` gap `audit verify` reports. While
+refusing, `doctor` shows `fail_closed: on, LATCHED` (Critical) and
+`/metrics` shows `ai_memory_audit_trail_latched 1`.
+
+What it cannot do:
+
+- Every audit event is written after its memory operation commits, so the one
+  operation that discovers the failure has already happened. It is counted in
+  `ai_memory_audit_write_failures_total`, as before.
+- A single CLI command cannot refuse its own write; it relies on the refusal to
+  start when the trail cannot be opened (#3651).
+- It covers this flat trail only, not the signed event chain or the forensic
+  log.
+
+The mode is off by default and the `asi-hard` profile does not turn it on: it
+refuses live writes, so it runs for a release before it can become a hardened
+default.
+
 ### Off-host attestation
 
 Ship every line to an immutable off-host store (SIEM, S3 Object Lock,

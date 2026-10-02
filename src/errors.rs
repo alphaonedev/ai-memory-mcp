@@ -139,6 +139,11 @@ pub mod error_codes {
     /// the de-latch makes the next write re-probe, so it is a transient/retry code.
     pub const RECORD_STOP_INDETERMINATE: &str = "RECORD_STOP_INDETERMINATE";
 
+    /// #4400 — a mutating write refused because this process's flat audit
+    /// trail failed and `AI_MEMORY_REQUIRE_AUDIT_TRAIL` is set. Retryable (503):
+    /// the gate clears itself once the trail records again.
+    pub const AUDIT_TRAIL_UNAVAILABLE: &str = "AUDIT_TRAIL_UNAVAILABLE";
+
     /// v1.0.0 #2445 — this database's schema is AHEAD of the running binary's
     /// migration ladder, so the substrate refuses to operate it rather than
     /// write rows an older code path shapes wrongly. Un-prefixed (the
@@ -631,6 +636,7 @@ mod arch_9_slug_tests {
             StoreError::SchemaStampInvalid { detail: "d".into() },
             StoreError::SchemaVersionPoisoned { detail: "d".into() },
             StoreError::TraversalBudgetExceeded { detail: "d".into() },
+            StoreError::AuditTrailUnavailable { reason: "r".into() },
             StoreError::Backend(BoxBackendError::new("boom")),
         ];
         let expected = [
@@ -648,6 +654,7 @@ mod arch_9_slug_tests {
             SCHEMA_STAMP_INVALID,
             SCHEMA_VERSION_POISONED,
             TRAVERSAL_BUDGET_EXCEEDED,
+            AUDIT_TRAIL_UNAVAILABLE,
             DATABASE_ERROR,
         ];
         // #2445 — `zip` TRUNCATES to the shorter side, so a variant added to
@@ -712,6 +719,7 @@ mod arch_9_slug_tests {
             },
             StorageError::RecordStopIndeterminate { reason: "r".into() },
             StorageError::TraversalBudgetExceeded,
+            StorageError::AuditTrailUnavailable { reason: "r".into() },
         ];
         let expected = [
             NOT_FOUND,
@@ -730,6 +738,7 @@ mod arch_9_slug_tests {
             RECORD_STOPPED,
             RECORD_STOP_INDETERMINATE,
             TRAVERSAL_BUDGET_EXCEEDED,
+            AUDIT_TRAIL_UNAVAILABLE,
         ];
         // #3196 — pin the lengths so a variant added to only one array is a
         // loud failure, not a silently `zip`-truncated skip.
@@ -862,6 +871,10 @@ pub enum MemoryError {
     /// the MCP funnel passes it through unchanged (wire slug
     /// `QUOTA_EXCEEDED`, the same code the HTTP 429 envelope carries).
     QuotaExceeded(crate::quotas::QuotaError),
+    /// #4400 — a mutating operation refused while this process's flat audit
+    /// trail is not recording (`AI_MEMORY_REQUIRE_AUDIT_TRAIL`). Our own text,
+    /// passed through unchanged; HTTP 503 because it clears itself.
+    AuditTrailUnavailable(String),
 }
 
 impl MemoryError {
@@ -899,6 +912,7 @@ impl MemoryError {
             Self::Codec(_) => error_codes::CODEC_ERROR,
             Self::QuotaExceeded(_) => error_codes::QUOTA_EXCEEDED,
             Self::Refused(_) => error_codes::REFUSED,
+            Self::AuditTrailUnavailable(_) => error_codes::AUDIT_TRAIL_UNAVAILABLE,
         }
     }
 
@@ -927,6 +941,7 @@ impl MemoryError {
             }
             Self::QuotaExceeded(_) => StatusCode::TOO_MANY_REQUESTS,
             Self::Refused(_) => StatusCode::FORBIDDEN,
+            Self::AuditTrailUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
         }
     }
 
@@ -939,7 +954,8 @@ impl MemoryError {
             | Self::Filesystem(m)
             | Self::Llm(m)
             | Self::Codec(m)
-            | Self::Refused(m) => m.clone(),
+            | Self::Refused(m)
+            | Self::AuditTrailUnavailable(m) => m.clone(),
             Self::ReflectionDepthExceeded {
                 attempted,
                 cap,
@@ -1123,6 +1139,8 @@ impl From<anyhow::Error> for MemoryError {
                 // within budget), matching the SAL twin's BAD_REQUEST and the
                 // depth-ceiling InvalidArgument it sits beside.
                 SE::TraversalBudgetExceeded => Self::ValidationFailed(se.to_string()),
+                // #4400 — retryable and self-clearing: its own 503 variant.
+                SE::AuditTrailUnavailable { .. } => Self::AuditTrailUnavailable(se.to_string()),
             };
         }
         Self::DatabaseError(e.to_string())
