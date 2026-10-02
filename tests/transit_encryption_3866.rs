@@ -41,6 +41,10 @@ fn socket_dsn_does_not_pin_the_floor_3866() {
         "postgres:///mem?sslmode=verify-full",
         "postgres:///mem?host=h&host=/tmp&sslmode=verify-full",
         "postgresql:///mem?host=%2Fvar%2Frun%2Fpostgresql&sslmode=verify-full",
+        // #4434: the driver keeps the socket a `host=/...` parameter set and
+        // dials it in preference to a later TCP `host=`, so this DSN is a
+        // socket transport (it was pinned here while the floor read the text).
+        "postgres:///mem?host=/tmp&host=db.example&sslmode=verify-full",
     ] {
         assert!(
             !transit_encryption::dsn_pins_sslmode_verify_full(socket),
@@ -51,7 +55,6 @@ fn socket_dsn_does_not_pin_the_floor_3866() {
         "postgres://u@h/db?sslmode=verify-full",
         "postgres://u@h:5432/db?application_name=x&sslmode=Verify-Full&sslrootcert=/ca.crt",
         "postgres:///mem?host=db.example&sslmode=verify-full",
-        "postgres:///mem?host=/tmp&host=db.example&sslmode=verify-full",
         "postgres:///mem?hostaddr=10.0.0.5&sslmode=verify-full",
     ] {
         assert!(

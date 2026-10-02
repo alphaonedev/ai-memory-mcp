@@ -561,10 +561,10 @@ async fn enumerate_postgres(url: &str) -> Result<SchemaInitReport> {
     // and exits. We hold the pool for the duration of this function
     // and let it drop at the end so we don't keep a Postgres
     // connection slot warm.
-    // #3674 — the DSN screen, never a raw `.connect(url)`.
-    let options = crate::store::postgres::dsn::connect_options(url).with_context(|| {
+    // #4333 — the #3705 sslmode floor + the #3674 DSN screen, one function.
+    let options = crate::store::postgres::dsn::floored_connect_options(url).with_context(|| {
         format!(
-            "parse postgres store URL for enumeration: {}",
+            "refuse or parse postgres store URL for enumeration: {}",
             crate::url_display::store_url_display(url)
         )
     })?;
