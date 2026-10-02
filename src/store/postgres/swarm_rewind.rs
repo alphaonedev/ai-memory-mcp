@@ -462,10 +462,23 @@ impl PostgresStore {
             .await
             .map_err(|e| to_store_err("swarm_rewind begin", e))?;
 
-        // f1-review F3: lock the ROOT first and re-decide under that lock, so
-        // two concurrent rewinds serialise here and the second one sees the
-        // first's committed `rewind` marker (no duplicate signed event). An
-        // early return drops `tx`, rolling it back.
+        // #4010 / CONCURRENCY-04: acquire the entire memory lock set, INCLUDING
+        // the root, before the root decision or any write. Locking the root
+        // first inverts auto-stamping's order when a descendant sorts before
+        // it. C collation matches the Rust str::cmp order used by auto-stamp,
+        // independently of the database's locale. ANY also deduplicates ids.
+        sqlx::query(
+            "SELECT id FROM memories WHERE id = ANY($1) \
+             ORDER BY id COLLATE \"C\" FOR UPDATE",
+        )
+        .bind(&node_ids)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("swarm_rewind lock closure", e))?;
+
+        // f1-review F3: re-decide under the held root lock, so a second
+        // concurrent rewind sees the committed `rewind` marker (no duplicate
+        // signed event). An early return drops `tx`, rolling it back.
         let locked: Option<(String, Option<serde_json::Value>)> =
             sqlx::query_as(SELECT_STATE_METADATA_FOR_UPDATE)
                 .bind(root_id)
