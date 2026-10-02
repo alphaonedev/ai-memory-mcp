@@ -117,10 +117,12 @@ jobs:
           echo "::add-mask::$pw"
           echo "PGTLS_DIR=$d" >> "$GITHUB_ENV"
           echo "PGTLS_PW=$pw" >> "$GITHUB_ENV"
+          # Image: pgvector/pgvector 0.8.6-pg18 (canonical PostgreSQL 18.6 + pgvector 0.8.6
+          # stack of the repo SSOT), pinned by digest; no Apache AGE in this image.
           docker run -d --name release-shape-pg -p 127.0.0.1:55432:5432 \
             -e POSTGRES_PASSWORD="$pw" -e POSTGRES_DB=proof \
             -v "$d:/certs:ro" \
-            pgvector/pgvector:0.8.0-pg17 \
+            pgvector/pgvector@sha256:2ba9ca5f2e7daa0f0e7723cba1ee9167bab54efd3640516a44ac1a928dd67e7a \
             -c ssl=on -c ssl_cert_file=/certs/server.crt -c ssl_key_file=/certs/server.key \
             -c hba_file=/certs/pg_hba.conf
           for _ in $(seq 1 60); do
