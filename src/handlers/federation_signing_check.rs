@@ -34,7 +34,7 @@ use super::AppState;
 use super::federation_receive::{
     ATTESTATION_TRACE_TARGET, SyncPushBody, apply_inbound_write_attestation,
     check_sender_clock_skew, extract_peer_id, next_utc_midnight, resolve_inbound_attribution,
-    resolve_inbound_decider, signal_author_authorized,
+    resolve_inbound_decider, signal_author_authorized, signal_wire_signature_forged,
 };
 #[cfg(feature = "sal")]
 use crate::validate;
@@ -1151,11 +1151,25 @@ pub(super) async fn sync_push_via_store(
             skipped += 1;
             continue;
         }
+        // #4027 — refuse a forged (present-but-invalid) wire signature HERE, on
+        // the original bytes, BEFORE the #3049 secret screen below: the screen
+        // clears the attestation when it redacts a signed field, and the
+        // store-side check in `apply_remote_signal` only sees a non-empty
+        // signature — so a forged signal was laundered into an accepted
+        // unsigned one when `AI_MEMORY_FED_REQUIRE_SIGNAL_SIG=0`. One predicate
+        // shared with the sqlite twin (which always checked first).
+        if signal_wire_signature_forged(sig) {
+            tracing::warn!(
+                "sync_push(store): signal {} has an invalid signature — skipping (forged)",
+                sig.id
+            );
+            skipped += 1;
+            continue;
+        }
         // #1843 (v0.8.1) — bind `from_agent` to the enrolled peer's authorship
         // (sqlite-twin parity; see `federation_receive::signal_author_authorized`).
-        // The forged-signature check lives inside `apply_remote_signal` below; the
-        // author binding is checked here, before the quota charge + trait write,
-        // and is a PER-SIGNAL skip — the rest of the push still applies.
+        // The author binding is checked here, before the quota charge + trait
+        // write, and is a PER-SIGNAL skip — the rest of the push still applies.
         if !signal_author_authorized(
             sig,
             &body.sender_agent_id,
@@ -1183,6 +1197,23 @@ pub(super) async fn sync_push_via_store(
         ) {
             skipped += 1;
             continue;
+        }
+        // #4026 — idempotent replay: a signal already stored here is a
+        // converged no-op and must NOT be charged against the author's
+        // cumulative storage-bytes quota (sqlite-twin parity: that funnel probes
+        // before charging). The outcome-based refund after the write below
+        // covers the concurrent duplicate this probe cannot see.
+        match app.store.signal_get(&ctx, &sig.id).await {
+            Ok(Some(_)) => {
+                noop += 1;
+                continue;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!("sync_push(store): signal get failed for {}: {e}", sig.id);
+                skipped += 1;
+                continue;
+            }
         }
         if body.dry_run {
             noop += 1;
@@ -1217,8 +1248,23 @@ pub(super) async fn sync_push_via_store(
                 continue;
             }
         }
-        match app.store.apply_remote_signal(&ctx, sig).await {
-            Ok(_) => signals_applied += 1,
+        // #4026 — the charge above is committed on the SQLite metadata DB
+        // before this write on the postgres store, so it is compensated EXACTLY
+        // when this call stored nothing: `AlreadyPresent` (a duplicate that
+        // raced past the probe above) and any `Err`, which by the trait's
+        // documented invariant means nothing was persisted.
+        let outcome = app.store.apply_remote_signal(&ctx, sig).await;
+        if !matches!(&outcome, Ok(o) if o.stored_now()) {
+            let lock = app.db.lock().await;
+            if let Err(e) =
+                crate::quotas::refund_storage_only(&lock.0, &sig.from_agent, &sig.namespace, bytes)
+            {
+                crate::quotas::log_refund_op_failed(&sig.from_agent, &e);
+            }
+        }
+        match outcome {
+            Ok(crate::store::RemoteSignalApply::Inserted(_)) => signals_applied += 1,
+            Ok(crate::store::RemoteSignalApply::AlreadyPresent) => noop += 1,
             Err(crate::store::StoreError::InvalidInput { .. }) => {
                 tracing::warn!(
                     "sync_push(store): signal {} refused (invalid signature)",
