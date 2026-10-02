@@ -461,6 +461,15 @@ pub enum StoreError {
     #[error("{detail}")]
     TraversalBudgetExceeded { detail: String },
 
+    /// #4400 — a mutating operation refused because this process's flat audit
+    /// trail failed and `AI_MEMORY_REQUIRE_AUDIT_TRAIL` is set. Process-local and
+    /// self-clearing (the gate retries the trail); DISTINCT from
+    /// [`Self::Stopped`], an operator decision persisted in the chain.
+    ///
+    /// Wire shape (HTTP): `503` with code `AUDIT_TRAIL_UNAVAILABLE`.
+    #[error("{reason}")]
+    AuditTrailUnavailable { reason: String },
+
     #[error("underlying backend error: {0}")]
     Backend(#[from] BoxBackendError),
 }
@@ -543,6 +552,8 @@ impl StoreError {
             // backend-blind (the same budget on both adapters); it carries its
             // own slug rather than a generic backend fault.
             Self::TraversalBudgetExceeded { .. } => error_codes::TRAVERSAL_BUDGET_EXCEEDED,
+            // #4400 — retryable and self-clearing: its own slug.
+            Self::AuditTrailUnavailable { .. } => error_codes::AUDIT_TRAIL_UNAVAILABLE,
             Self::Backend(_) => error_codes::DATABASE_ERROR,
         }
     }

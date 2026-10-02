@@ -274,8 +274,20 @@ pub fn seed_from_conn(conn: &rusqlite::Connection) -> Result<()> {
 ///
 /// # Errors
 ///
-/// [`crate::storage::StorageError::RecordStopped`] when stopped.
+/// [`crate::storage::StorageError::RecordStopped`] when stopped;
+/// [`crate::storage::StorageError::RecordStopIndeterminate`] when the stop
+/// state cannot be read; [`crate::storage::StorageError::AuditTrailUnavailable`]
+/// when this process's audit trail failed under `AI_MEMORY_REQUIRE_AUDIT_TRAIL`
+/// (#4400). The operator's stop is checked first: it outranks a health
+/// condition of this process's sink.
 pub fn gate_storage_conn(conn: &rusqlite::Connection) -> Result<(), crate::storage::StorageError> {
+    gate_record_stop(conn)?;
+    crate::audit::audit_trail_gate()
+        .map_err(|e| crate::storage::StorageError::AuditTrailUnavailable { reason: e.reason })
+}
+
+/// The record-stop half of [`gate_storage_conn`].
+fn gate_record_stop(conn: &rusqlite::Connection) -> Result<(), crate::storage::StorageError> {
     let key = conn_key(conn);
     // #3877 (5-agent vote 4d3ea1c5 = B, fail-closed + de-latch). DE-LATCH: probe
     // the registry WITHOUT inserting, and cache ONLY after a SUCCESSFUL read. The
