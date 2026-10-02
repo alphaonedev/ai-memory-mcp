@@ -38805,6 +38805,20 @@ mod tests {
     // - `live_governance_inheritance_cap_at_five`       — depth-cap spec pin
     // ------------------------------------------------------------------
 
+    /// #4468 — the active `PermissionsMode` is process-global and other lib
+    /// tests flip it under [`crate::config::lock_permissions_mode_for_test`];
+    /// these live cells set `Enforce` WITHOUT that lock, so under multiple test
+    /// threads another cell's `Advisory` window turned the expected
+    /// Deny/Pending decisions into `Allow`. Take the same gate, THEN set
+    /// `Enforce`, and hold the guard for the whole cell.
+    fn enforce_mode_serialised() -> std::sync::MutexGuard<'static, ()> {
+        let guard = crate::config::lock_permissions_mode_for_test();
+        crate::config::override_active_permissions_mode_for_test(
+            crate::config::PermissionsMode::Enforce,
+        );
+        guard
+    }
+
     /// Seed a namespace standard memory and register it via
     /// `namespace_meta`. Returns the standard_id. Owner is the
     /// metadata.agent_id stamped on the standard memory.
@@ -38880,6 +38894,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // intentional: serialise the global permissions-mode window across the await (#4468)
     async fn live_governance_allow_owner_at_leaf() {
         // S53 phase B — owner writes to their own namespace under a
         // `write=owner` policy. Decision must be Allow.
@@ -38887,9 +38902,7 @@ mod tests {
             eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
             return;
         };
-        crate::config::override_active_permissions_mode_for_test(
-            crate::config::PermissionsMode::Enforce,
-        );
+        let _mode = enforce_mode_serialised();
         let store = PostgresStore::connect(&url).await.expect("connect");
         let pool = store.pool.clone();
         let owner = format!("ai:gov-owner-{}", uuid::Uuid::new_v4());
@@ -38924,6 +38937,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // intentional: serialise the global permissions-mode window across the await (#4468)
     async fn live_governance_deny_non_owner_inherited() {
         // S53/S60/S80 — a non-owner write to a deep child of a
         // `write=owner` parent must be Denied via the inheritance walk.
@@ -38931,9 +38945,7 @@ mod tests {
             eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
             return;
         };
-        crate::config::override_active_permissions_mode_for_test(
-            crate::config::PermissionsMode::Enforce,
-        );
+        let _mode = enforce_mode_serialised();
         let store = PostgresStore::connect(&url).await.expect("connect");
         let pool = store.pool.clone();
         let owner = format!("ai:gov-owner-{}", uuid::Uuid::new_v4());
@@ -39005,6 +39017,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // intentional: serialise the global permissions-mode window across the await (#4468)
     async fn live_governance_pending_on_approve_level() {
         // S34 — a `write=approve` policy on a namespace must route
         // non-owner writes through Pending. The decision payload must
@@ -39013,9 +39026,7 @@ mod tests {
             eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
             return;
         };
-        crate::config::override_active_permissions_mode_for_test(
-            crate::config::PermissionsMode::Enforce,
-        );
+        let _mode = enforce_mode_serialised();
         let store = PostgresStore::connect(&url).await.expect("connect");
         let pool = store.pool.clone();
         let owner = format!("ai:gov-owner-{}", uuid::Uuid::new_v4());
@@ -39063,6 +39074,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // intentional: serialise the global permissions-mode window across the await (#4468)
     async fn live_governance_inheritance_cap_at_five() {
         // F-A2A1.2 depth cap — a namespace at MAX_NAMESPACE_DEPTH (8
         // levels) under a `write=owner` parent at the root must still
@@ -39079,9 +39091,7 @@ mod tests {
             eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
             return;
         };
-        crate::config::override_active_permissions_mode_for_test(
-            crate::config::PermissionsMode::Enforce,
-        );
+        let _mode = enforce_mode_serialised();
         let store = PostgresStore::connect(&url).await.expect("connect");
         let pool = store.pool.clone();
         let owner = format!("ai:cap-owner-{}", uuid::Uuid::new_v4());
