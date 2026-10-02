@@ -851,9 +851,15 @@ refusing, `doctor` shows `fail_closed: on, LATCHED` (Critical) and
 
 What it cannot do:
 
-- Every audit event is written after its memory operation commits, so the one
-  operation that discovers the failure has already happened. It is counted in
+- Every audit event is written after its memory operation commits, so the
+  operations already under way when the trail fails have happened: at most one
+  unaudited write per write in flight at that moment (one for a single caller;
+  more under concurrent load on `serve`). Each is counted in
   `ai_memory_audit_write_failures_total`, as before.
+- A failed retry is a failed audit write too: it uses up a sequence number and
+  is counted in `ai_memory_audit_write_failures_total`. While the trail stays
+  down, that counter and the gaps `audit verify` reports therefore grow by
+  about one a second from retries alone, not only from lost client events.
 - A single CLI command cannot refuse its own write; it relies on the refusal to
   start when the trail cannot be opened (#3651).
 - It covers this flat trail only, not the signed event chain or the forensic
