@@ -33,6 +33,9 @@
 //! when `AI_MEMORY_TEST_POSTGRES_URL` is unset.
 #![cfg(all(feature = "sal", feature = "sal-postgres"))]
 
+#[path = "common/pg_barrier.rs"]
+mod pg_barrier;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -148,7 +151,7 @@ where
 
 /// Pid of the (single) backend currently blocked directly by `holder_pid`.
 async fn wait_blocked_by(pg: &PostgresStore, holder_pid: i32) -> i32 {
-    let end = tokio::time::Instant::now() + Duration::from_secs(20);
+    let end = pg_barrier::deadline();
     loop {
         let waiter: Option<i32> = sqlx::query_scalar(
             "SELECT pid FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid)) LIMIT 1",
@@ -259,12 +262,12 @@ async fn race_body(pg: Arc<PostgresStore>, explicit: bool) -> RaceOutcome {
     );
     park.commit().await.expect("release the content writer");
 
-    let (reown, seen) = tokio::time::timeout(Duration::from_secs(20), transfer)
+    let (reown, seen) = tokio::time::timeout(pg_barrier::barrier_budget(), transfer)
         .await
         .expect("transfer acquired the row")
         .expect("join transfer");
     reown.commit().await.expect("commit transfer");
-    let result = tokio::time::timeout(Duration::from_secs(20), writer)
+    let result = tokio::time::timeout(pg_barrier::barrier_budget(), writer)
         .await
         .expect("writer completed")
         .expect("join writer");
