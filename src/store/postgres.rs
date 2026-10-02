@@ -104,6 +104,9 @@ pub mod dsn;
 // qual_10 budget reason as `parity_3064` above.
 mod reown_3124;
 mod swarm_rewind;
+// v1.0.0 #4329 / #4330 — the ascending-id (COLLATE "C") row-lock step for the
+// forget and run_gc evict sets. Own module for the qual_10 budget.
+mod lock_order_4329;
 // v1.0.0 #3152 — the lifecycle transition applied on the update's OWN
 // transaction (one commit per logical update). Own module for the same
 // qual_10 budget reason as `parity_3064` above.
@@ -28018,7 +28021,9 @@ impl MemoryStore for PostgresStore {
         // statement_timeout, pool-checkout failure, OR an ordinary concurrent
         // write landing between them could leave the archived-set and
         // deleted-set diverging → a row DELETEd that the archive-SELECT never
-        // captured = irrecoverable loss. One tx pins both to the same snapshot.
+        // captured = irrecoverable loss. One tx alone does not (READ COMMITTED
+        // re-evaluates each statement's predicate); #4329 locks the victim set
+        // up front and binds the archive copy and the DELETE to those ids.
         // v1.0.0 #3520 — routed through the shared bounded-retry funnel. This
         // funnel touches the same relation set as `run_gc` / `size_gc`
         // (archive-copy + link snapshot + cascade DELETE), so a concurrent
@@ -28034,6 +28039,16 @@ impl MemoryStore for PostgresStore {
                     .begin()
                     .await
                     .map_err(|e| to_store_err("forget begin tx", e))?;
+                // #4329 — lock the whole victim set up front, ascending by
+                // `id COLLATE "C"` (CONCURRENCY-04), and run every later
+                // statement over exactly that locked set.
+                let locked = lock_order_4329::lock_forget_set(
+                    &mut tx,
+                    namespace,
+                    tier_str.as_deref(),
+                    pattern,
+                )
+                .await?;
 
                 if archive {
                     // Insert matching rows into archived_memories before deletion.
@@ -28065,6 +28080,7 @@ impl MemoryStore for PostgresStore {
                           AND ($2::text IS NULL OR tier = $2)
                           AND ($3::text IS NULL
                                OR tsv @@ plainto_tsquery('english', $3))
+                          AND id = ANY($5::text[])
                         -- #2195 - LAST-WINS re-archive parity with sqlite INSERT OR REPLACE.
                         {SQL_ARCHIVE_ON_CONFLICT_LAST_WINS}"
                     ))
@@ -28072,6 +28088,7 @@ impl MemoryStore for PostgresStore {
                     .bind(tier_str.as_deref())
                     .bind(pattern)
                     .bind(parse_rfc3339_required(&now)?)
+                    .bind(&locked)
                     .execute(&mut *tx)
                     .await
                     .map_err(|e| to_store_err("forget archive copy", e))?;
@@ -28080,8 +28097,8 @@ impl MemoryStore for PostgresStore {
                 // #1771 (5-agent vote 4d3ea1c5) — snapshot the to-be-deleted
                 // memories' `memory_links` into `archived_memory_links` BEFORE the
                 // cascade `DELETE FROM memories` reaps them (FK `ON DELETE
-                // CASCADE`). Reuse the IDENTICAL forget predicate as a victim
-                // subquery so the snapshot and the delete pin to the same row set
+                // CASCADE`). Bind the snapshot to the locked victim ids
+                // (#4329) so the snapshot and the delete pin to the same row set
                 // inside this one tx; idempotent via the PK `ON CONFLICT`. Postgres
                 // twin of the SQLite `archive_links_for_memory` snapshot.
                 //
@@ -28105,23 +28122,11 @@ impl MemoryStore for PostgresStore {
                                 ml.valid_from, ml.valid_until, ml.observed_by, ml.signature,
                                 ml.attest_level, now(), ml.source_cid, ml.target_cid
                          FROM memory_links ml
-                         WHERE ml.source_id IN (
-                                   SELECT id FROM memories
-                                   WHERE ($1::text IS NULL OR namespace = $1)
-                                     AND ($2::text IS NULL OR tier = $2)
-                                     AND ($3::text IS NULL
-                                          OR tsv @@ plainto_tsquery('english', $3)))
-                            OR ml.target_id IN (
-                                   SELECT id FROM memories
-                                   WHERE ($1::text IS NULL OR namespace = $1)
-                                     AND ($2::text IS NULL OR tier = $2)
-                                     AND ($3::text IS NULL
-                                          OR tsv @@ plainto_tsquery('english', $3)))
+                         WHERE ml.source_id = ANY($1::text[])
+                            OR ml.target_id = ANY($1::text[])
                          ON CONFLICT (source_id, target_id, relation) DO NOTHING",
                     )
-                    .bind(namespace)
-                    .bind(tier_str.as_deref())
-                    .bind(pattern)
+                    .bind(&locked)
                     .execute(&mut *tx)
                     .await
                     .map_err(|e| to_store_err("forget snapshot links", e))?;
@@ -28140,11 +28145,13 @@ impl MemoryStore for PostgresStore {
                        AND ($1::text IS NULL OR namespace = $1)
                        AND ($2::text IS NULL OR tier = $2)
                        AND ($3::text IS NULL
-                            OR tsv @@ plainto_tsquery('english', $3))",
+                            OR tsv @@ plainto_tsquery('english', $3))
+                       AND id = ANY($4::text[])",
                 )
                 .bind(namespace)
                 .bind(tier_str.as_deref())
                 .bind(pattern)
+                .bind(&locked)
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| to_store_err("forget scrub cid_genesis", e))?;
@@ -28169,12 +28176,14 @@ impl MemoryStore for PostgresStore {
                        AND ($2::text IS NULL OR tier = $2)
                        AND ($3::text IS NULL
                             OR tsv @@ plainto_tsquery('english', $3))
+                       AND id = ANY($5::text[])
                      RETURNING id",
                 )
                 .bind(namespace)
                 .bind(tier_str.as_deref())
                 .bind(pattern)
                 .bind(crate::encryption::crypto_erase_marker())
+                .bind(&locked)
                 .fetch_all(&mut *tx)
                 .await
                 .map_err(|e| to_store_err("forget crypto-erase envelope", e))?;
@@ -28192,11 +28201,13 @@ impl MemoryStore for PostgresStore {
                        AND ($2::text IS NULL OR tier = $2)
                        AND ($3::text IS NULL
                             OR tsv @@ plainto_tsquery('english', $3))
+                       AND id = ANY($4::text[])
                      RETURNING id, namespace, metadata->>'agent_id'",
                 )
                 .bind(namespace)
                 .bind(tier_str.as_deref())
                 .bind(pattern)
+                .bind(&locked)
                 .fetch_all(&mut *tx)
                 .await
                 .map_err(|e| to_store_err("forget delete", e))?;
@@ -30773,6 +30784,12 @@ impl MemoryStore for PostgresStore {
                     .begin()
                     .await
                     .map_err(|e| to_store_err("gc begin tx", e))?;
+                // #4330 — read AND lock the victim set up front, ascending by
+                // `id COLLATE "C"` (CONCURRENCY-04); every later statement runs
+                // over exactly that locked set, on both the archive and the
+                // hard-delete path.
+                let victims = lock_order_4329::lock_expired_set(&mut tx, now).await?;
+                let locked: Vec<String> = victims.iter().map(|(id, _, _)| id.clone()).collect();
 
                 if archive {
                     sqlx::query(&format!(
@@ -30799,10 +30816,12 @@ impl MemoryStore for PostgresStore {
                                mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until, cid, cid_genesis
                         FROM memories
                         WHERE expires_at IS NOT NULL AND expires_at < $1
+                          AND id = ANY($2::text[])
                         -- #2195 - LAST-WINS re-archive parity with sqlite INSERT OR REPLACE.
                         {SQL_ARCHIVE_ON_CONFLICT_LAST_WINS}"
                     ))
                     .bind(now)
+                    .bind(&locked)
                     .execute(&mut *tx)
                     .await
                     .map_err(|e| to_store_err("gc archive copy", e))?;
@@ -30829,15 +30848,12 @@ impl MemoryStore for PostgresStore {
                                 ml.signature, ml.attest_level, $1::timestamptz,
                                 ml.source_cid, ml.target_cid
                          FROM memory_links ml
-                         WHERE ml.source_id IN (
-                                   SELECT id FROM memories
-                                   WHERE expires_at IS NOT NULL AND expires_at < $1)
-                            OR ml.target_id IN (
-                                   SELECT id FROM memories
-                                   WHERE expires_at IS NOT NULL AND expires_at < $1)
+                         WHERE ml.source_id = ANY($2::text[])
+                            OR ml.target_id = ANY($2::text[])
                          ON CONFLICT (source_id, target_id, relation) DO NOTHING",
                     )
                     .bind(now)
+                    .bind(&locked)
                     .execute(&mut *tx)
                     .await
                     .map_err(|e| to_store_err("gc snapshot links", e))?;
@@ -30864,25 +30880,13 @@ impl MemoryStore for PostgresStore {
                 // there, exactly as the sqlite twin reasons; the archive reaper is the
                 // erasure point for archived rows.
                 //
-                // The victim set is read `FOR UPDATE` with the IDENTICAL predicate the
-                // DELETE below uses, inside this one transaction, so the erased +
-                // tombstoned set and the deleted set cannot diverge.
-                let tombstoned: Option<Vec<String>> = if archive {
-                    None
-                } else {
-                    let victims: Vec<(String, String, Option<String>)> = sqlx::query_as(
-                        "SELECT id, namespace, metadata->>'agent_id' FROM memories \
-                         WHERE expires_at IS NOT NULL AND expires_at < $1 \
-                         FOR UPDATE",
-                    )
-                    .bind(now)
-                    .fetch_all(&mut *tx)
-                    .await
-                    .map_err(|e| to_store_err("gc read evict victims", e))?;
+                // The victim set is read `FOR UPDATE` (ascending id, #4330) at the top
+                // of this transaction and every statement below is pinned to it, so the
+                // erased + tombstoned set and the deleted set cannot diverge.
+                if !archive {
                     crate::store::postgres_parity::evict_tombstone_and_erase_in_tx(&mut tx, &victims, now)
                         .await?;
-                    Some(victims.into_iter().map(|(id, _, _)| id).collect())
-                };
+                }
 
                 // #1783 — RETURNING id so the TTL-evicted set is known for AGE
                 // unprojection in THIS tx. gc is the most common delete path; the
@@ -30903,15 +30907,16 @@ impl MemoryStore for PostgresStore {
                 // hit this because `BEGIN IMMEDIATE` holds the single writer lock for
                 // the whole sweep; on postgres the id pin is the equivalent guarantee.
                 // Such a row is simply left for the next gc tick, which tombstones it
-                // properly. `archive = true` binds NULL and keeps the original
-                // predicate: that path is a recoverable MOVE with no erasure to pair.
+                // properly. Since #4330 the archive path is pinned to the same locked
+                // set (its archive copy, link snapshot and DELETE), so a late-expiring
+                // row is never deleted without its archive copy.
                 let evicted: Vec<(String, String)> = sqlx::query_as(
                     "DELETE FROM memories WHERE expires_at IS NOT NULL AND expires_at < $1 \
-                       AND ($2::text[] IS NULL OR id = ANY($2)) \
+                       AND id = ANY($2) \
                      RETURNING id, namespace",
                 )
                 .bind(now)
-                .bind(tombstoned.as_deref())
+                .bind(&locked)
                 .fetch_all(&mut *tx)
                 .await
                 .map_err(|e| to_store_err("gc delete", e))?;
