@@ -22,6 +22,10 @@
 //! - (e) the federated `namespace_meta[]` apply (both receive loops, the
 //!   postgres admin apply context included) applies the 8 legal links of a
 //!   pushed chain and refuses the one that crosses the bound;
+//! - (f) sever-later (#4492 B1): a chain whose top hop is unentitled today
+//!   (it points at a node another identity of the same principal bound) is
+//!   still refused at bind, because the hop becomes entitled with no bind
+//!   when that standard is deleted; the victim's writes stay 201;
 //! - (d) two binds, each legal alone, that together exceed the bound, racing
 //!   (deterministic: the first held open under the bind's own serialisation):
 //!   exactly one is refused.
@@ -48,6 +52,8 @@ mod common;
 const KEY: &str = "issue-4492-key";
 const ALICE: &str = "ai:alice-4492";
 const BOB: &str = "ai:bob-4492";
+/// B's second identity (the sever-later shape, #4492 B1).
+const XBOB: &str = "ai:xbob-4492";
 const TEXT: &str = ai_memory::governance::bind_chain_depth::BIND_CHAIN_OVER_DEPTH;
 
 const PEER: &str = "ai:peer-4492";
@@ -278,6 +284,11 @@ struct Outcome {
     /// (e) federated: a batch building the same 9-hop chain applies the 8
     /// legal links and refuses the crossing one: (applied, crossing root bound)
     fed: (u64, bool),
+    /// (f) sever-later (#4492 B1): B's root link whose chain is 8 ENTITLED
+    /// hops (the top hop goes to a node B's second identity bound) but 9
+    /// hops in all: (status, typed text, A's write AFTER that identity
+    /// deletes its standard and so makes the top hop entitled)
+    sever_later: (u16, bool, u16),
 }
 
 async fn run(
@@ -372,6 +383,70 @@ async fn run(
         true
     };
 
+    // (f) sever-later: the bound must hold however ownership changes later.
+    let v3 = format!("vf{u}");
+    let proj3 = format!("{v3}/proj");
+    let (s, b) = bind(
+        &router,
+        ALICE,
+        &proj3,
+        &a_std,
+        None,
+        Some(json!({"write": "owner"})),
+    )
+    .await;
+    assert!(s.is_success(), "alice governs v3/proj: {s} {b}");
+    for i in (1..=8).rev() {
+        let sid = standard(&router, BOB, &std_ns).await;
+        let (s, b) = bind(
+            &router,
+            BOB,
+            &format!("ef{i}x{u}"),
+            &sid,
+            Some(&format!("ef{}x{u}", i + 1)),
+            None,
+        )
+        .await;
+        assert!(s.is_success(), "sever-later link ef{i}: {s} {b}");
+    }
+    // B's second identity binds the chain's top node: B's hop to it is not
+    // entitled (different owner), so only 8 of the 9 hops are entitled.
+    let x_std = standard(&router, XBOB, &std_ns).await;
+    let (s, b) = bind(&router, XBOB, &format!("ef9x{u}"), &x_std, None, None).await;
+    assert!(
+        s.is_success(),
+        "the second identity binds the top node: {s} {b}"
+    );
+    let root_std = standard(&router, BOB, &std_ns).await;
+    let (fs, fb) = bind(
+        &router,
+        BOB,
+        &v3,
+        &root_std,
+        Some(&format!("ef1x{u}")),
+        None,
+    )
+    .await;
+    // The second identity deletes its own standard: the top node is severed,
+    // unowned, and the hop to it becomes entitled with no bind at all.
+    let (ds, db) = call(
+        &router,
+        "DELETE",
+        &format!("/api/v1/memories/{x_std}"),
+        XBOB,
+        None,
+    )
+    .await;
+    assert!(
+        ds.is_success(),
+        "the second identity deletes its standard: {ds} {db}"
+    );
+    let sever_later = (
+        fs.as_u16(),
+        is_refusal(fs, &fb),
+        write(&router, ALICE, &proj3).await,
+    );
+
     // (e) the federated `namespace_meta[]` apply runs the same refusal (sqlite
     // receive loop and the postgres SET arm alike, admin apply context too).
     let fed = {
@@ -461,6 +536,7 @@ async fn run(
         c_at_bound_accepted,
         c_alice_write,
         fed,
+        sever_later,
     }
 }
 
@@ -473,6 +549,7 @@ const WANT: Outcome = Outcome {
     c_at_bound_accepted: true,
     c_alice_write: 201,
     fed: (8, false),
+    sever_later: (400, true, 201),
 };
 
 async fn sqlite_outcome() -> Outcome {

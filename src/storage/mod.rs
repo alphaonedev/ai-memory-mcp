@@ -22487,7 +22487,7 @@ pub fn set_namespace_standard(
 ) -> Result<()> {
     crate::storage::record_stop::gate_storage_conn(conn)?;
     // Verify the memory exists (but allow cross-namespace — shared policy)
-    let mem = get(conn, standard_id)?.ok_or_else(|| {
+    let _mem = get(conn, standard_id)?.ok_or_else(|| {
         // #962 typed envelope — 404 NOT_FOUND.
         anyhow::Error::new(StorageError::MemoryNotFound {
             id: standard_id.to_string(),
@@ -22513,12 +22513,8 @@ pub fn set_namespace_standard(
     };
     let now = chrono::Utc::now().to_rfc3339();
     // #4492 — the chain-depth admission and the row in ONE write transaction.
-    let owner = mem
-        .metadata
-        .get(crate::META_KEY_AGENT_ID)
-        .and_then(|v| v.as_str());
     connection::in_write_txn(conn, || {
-        bind_chain_depth::admit_bind(conn, namespace, resolved_parent.as_deref(), owner)?;
+        bind_chain_depth::admit_bind(conn, namespace, resolved_parent.as_deref())?;
         conn.execute(
             "INSERT INTO namespace_meta (namespace, standard_id, updated_at, parent_namespace)
          VALUES (?1, ?2, ?3, ?4)
