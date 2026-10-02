@@ -85,7 +85,7 @@ fn parse_notify(params: &Value) -> Result<NotifyInput<'_>, MemoryError> {
         MemoryError::ValidationFailed(crate::errors::msg::invalid("tier", tier_str))
     })?;
 
-    validate::validate_agent_id(target)
+    validate::validate_notify_target(target)
         .map_err(|e| MemoryError::ValidationFailed(e.to_string()))?;
     validate::validate_title(title).map_err(|e| MemoryError::ValidationFailed(e.to_string()))?;
     validate::validate_content(payload)

@@ -457,6 +457,39 @@ pub fn validate_agent_id(agent_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Fixed refusal text for an invalid notify recipient (#4338). It never
+/// carries the offending value: a recipient id is wire input, so echoing it
+/// would reflect arbitrary bytes into logs and responses.
+pub const NOTIFY_TARGET_REFUSAL: &str =
+    "target_agent_id is not a valid agent id (1-128 bytes of alphanumeric or _-:@./, not reserved)";
+
+/// Typed refusal for a notify recipient that fails [`validate_agent_id`].
+/// Its `Display` is the fixed [`NOTIFY_TARGET_REFUSAL`] text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidNotifyTarget;
+
+impl std::fmt::Display for InvalidNotifyTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(NOTIFY_TARGET_REFUSAL)
+    }
+}
+
+impl std::error::Error for InvalidNotifyTarget {}
+
+/// The ONE validator for a notify `target_agent_id`, shared by every notify
+/// funnel on both backends (MCP, HTTP, sqlite and postgres `MemoryStore::notify`)
+/// so a recipient the sqlite path refuses is refused identically on postgres
+/// (#4338). Fails closed and must run BEFORE any quota charge or write.
+///
+/// # Errors
+///
+/// [`InvalidNotifyTarget`] when `target` is empty, longer than the agent-id
+/// bound, outside the agent-id charset, or a reserved internal id. The error
+/// never contains `target`.
+pub fn validate_notify_target(target: &str) -> std::result::Result<(), InvalidNotifyTarget> {
+    validate_agent_id(target).map_err(|_| InvalidNotifyTarget)
+}
+
 /// Validate a wire-supplied base64-encoded Ed25519 agent public key
 /// (#626 Layer-3, Task 1.3).
 ///
