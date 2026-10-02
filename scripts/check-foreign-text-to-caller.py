@@ -235,6 +235,45 @@ def analyze(ROOT, ALLOWF='', VERBOSE=False, ONLY=None, DUMP_DERIVED=False):
     # prefixes, and `Err(` under `src/mcp/`. The import envelope's `"errors": [..]` array, fed by
     # `errors.push(format!("..{e}"))` from a StoreError, was invisible to both.
     def last_seg(path): return path.strip().split('::')[-1]
+    # 2026-10-02 (#4501): depth must count angle brackets -- `HashMap<String, Value>` carries a
+    # top-level-looking comma that is not one -- but must NOT be skewed by the operators that contain
+    # a lone angle character. `->`, `=>`, `<=`, `>=`, `<<`, `>>` are blanked in a same-length SHADOW
+    # of the string used only for depth, so `code_of(|c| -> Result<i64, String> { .. }), e.to_string()`
+    # splits correctly while generics stay balanced. Measured both ways: dropping angle brackets
+    # entirely fixed the arrow case and silently LOST two mcp-result sinks (2890 -> 2888) where a
+    # comma inside generics split a json value into fragments; this keeps 2890 and fixes the arrow.
+    def _depth_shadow(s):
+        for op in ('->', '=>', '<=', '>=', '<<', '>>'):
+            s = s.replace(op, '  ')
+        return s
+    def split_args(s):
+        parts = []; depth = 0; cur = []; in_s = False; esc = False
+        shadow = _depth_shadow(s)
+        for i, c in enumerate(s):
+            if in_s:
+                cur.append(c)
+                if esc: esc = False
+                elif c == '\\': esc = True
+                elif c == '"': in_s = False
+                continue
+            if c == '"': in_s = True; cur.append(c); continue
+            sc = shadow[i]
+            if sc in '([{<': depth += 1
+            elif sc in ')]}>': depth -= 1
+            if c == ',' and depth == 0: parts.append(''.join(cur)); cur = []
+            else: cur.append(c)
+        if cur: parts.append(''.join(cur))
+        # 2026-10-02 (#4501, reviewer-f2r): a rustfmt TRAILING COMMA leaves a whitespace-only final
+        # part, and the sinks that judge `args[-1]` (S2 err_response at the rpc/http boundary, and
+        # the mapper walk) then judged that whitespace instead of the argument. Measured on the gate
+        # verbatim: "\n id,\n jsonrpc::INTERNAL_ERROR,\n e.to_string(),\n " splits to
+        # [... 'e.to_string()', '\n '], so src/mcp/mod.rs::handle_request -- which IS in the derived
+        # set -- read rc 0 wrapped and rc 1 FAIL collapsed to one line. src/mcp/mod.rs alone carries
+        # twelve wrapped err_response(..) calls with a trailing comma. A whitespace-only part is not
+        # an argument; Rust has no empty argument, so dropping them cannot lose a real one.
+        parts = [q for q in parts if q.strip()]
+        return [p.strip() for p in parts]
+
     HTTP_ROOTS = set(); MCP_ROOTS = set()
     lib = files.get('src/lib.rs')
     if lib:
@@ -256,28 +295,11 @@ def analyze(ROOT, ALLOWF='', VERBOSE=False, ONLY=None, DUMP_DERIVED=False):
             end = find_matching(txt, open_paren_idx, '(', ')')
             if end < 0: return []
             # split on TOP-LEVEL commas only; split_args is defined further down in analyze()
-            # One splitting rule in this file: angle brackets count, the operators that carry a
-            # lone angle character are blanked in a same-length depth shadow first (see split_args).
-            # Measured on from_fn_with_state(build(|x| -> Result<u8, String> { .. }), handler,): with
-            # a naive angle count this yielded NO arguments and lost the handler -- the same
-            # fail-open shape the root fix exists to remove.
-            seg = txt[open_paren_idx+1:end]
-            shadow = seg
-            for _op in ('->', '=>', '<=', '>=', '<<', '>>'):
-                shadow = shadow.replace(_op, '  ')
-            args, depth, cur = [], 0, ''
-            for _i, ch in enumerate(seg):
-                sch = shadow[_i]
-                if sch in '([{<': depth += 1
-                elif sch in ')]}>': depth -= 1
-                if ch == ',' and depth == 0:
-                    args.append(cur); cur = ''
-                else:
-                    cur += ch
-            args.append(cur)
+            # ONE splitter for roots and sinks (reviewer-f2r's ask): split_args is hoisted above
+            # this point so both sides share it. Two implementations of the same rule is how the
+            # trailing-comma defect survived in the sink half while the root half was being fixed.
             out = []
-            for arg in args:
-                a = arg.strip()
+            for a in split_args(txt[open_paren_idx+1:end]):
                 if re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)*', a):
                     out.append(last_seg(a))          # a bare path: a handler or a state binding;
             return out                               # a state binding simply never matches a fn name
@@ -520,44 +542,6 @@ def analyze(ROOT, ALLOWF='', VERBOSE=False, ONLY=None, DUMP_DERIVED=False):
             if i not in KEYWORDS: ids.add(i)
         return ids
 
-    # 2026-10-02 (#4501): depth must count angle brackets -- `HashMap<String, Value>` carries a
-    # top-level-looking comma that is not one -- but must NOT be skewed by the operators that contain
-    # a lone angle character. `->`, `=>`, `<=`, `>=`, `<<`, `>>` are blanked in a same-length SHADOW
-    # of the string used only for depth, so `code_of(|c| -> Result<i64, String> { .. }), e.to_string()`
-    # splits correctly while generics stay balanced. Measured both ways: dropping angle brackets
-    # entirely fixed the arrow case and silently LOST two mcp-result sinks (2890 -> 2888) where a
-    # comma inside generics split a json value into fragments; this keeps 2890 and fixes the arrow.
-    def _depth_shadow(s):
-        for op in ('->', '=>', '<=', '>=', '<<', '>>'):
-            s = s.replace(op, '  ')
-        return s
-    def split_args(s):
-        parts = []; depth = 0; cur = []; in_s = False; esc = False
-        shadow = _depth_shadow(s)
-        for i, c in enumerate(s):
-            if in_s:
-                cur.append(c)
-                if esc: esc = False
-                elif c == '\\': esc = True
-                elif c == '"': in_s = False
-                continue
-            if c == '"': in_s = True; cur.append(c); continue
-            sc = shadow[i]
-            if sc in '([{<': depth += 1
-            elif sc in ')]}>': depth -= 1
-            if c == ',' and depth == 0: parts.append(''.join(cur)); cur = []
-            else: cur.append(c)
-        if cur: parts.append(''.join(cur))
-        # 2026-10-02 (#4501, reviewer-f2r): a rustfmt TRAILING COMMA leaves a whitespace-only final
-        # part, and the sinks that judge `args[-1]` (S2 err_response at the rpc/http boundary, and
-        # the mapper walk) then judged that whitespace instead of the argument. Measured on the gate
-        # verbatim: "\n id,\n jsonrpc::INTERNAL_ERROR,\n e.to_string(),\n " splits to
-        # [... 'e.to_string()', '\n '], so src/mcp/mod.rs::handle_request -- which IS in the derived
-        # set -- read rc 0 wrapped and rc 1 FAIL collapsed to one line. src/mcp/mod.rs alone carries
-        # twelve wrapped err_response(..) calls with a trailing comma. A whitespace-only part is not
-        # an argument; Rust has no empty argument, so dropping them cannot lose a real one.
-        parts = [q for q in parts if q.strip()]
-        return [p.strip() for p in parts]
 
     # ----------------------------------------------------------- binding resolver
     memo = {}
