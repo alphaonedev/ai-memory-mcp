@@ -320,14 +320,17 @@ jobs:
       # #2676 packaging residual — release channel must not ship default-only
       # binaries that omit `sal` (federation/SAL surface). Assert via the same
       # pin Gate3 provision uses (`scripts/assert-compiled-features.sh`).
-      # Note: `sal-postgres` is NOT enabled here (sqlx/pgvector weight + native
-      # deps on every matrix OS); operators needing PG use an asserted
-      # sal-postgres build or the plan-c image. Agents never workflow_dispatch.
+      # #4480 — the PostgreSQL + AGE + pgvector tier SHIPS: every artifact is
+      # built with `sal-postgres` (sqlx on rustls: pure Rust, no libpq, no
+      # system OpenSSL, so no native dependency on any matrix OS). The feature
+      # set is declared ONCE in `scripts/release-features.sh`; the build, the
+      # assert step below and the `release-shape` CI job all read it.
+      # Agents never workflow_dispatch.
       - name: Build release binary
         # --locked (#2895): build against the COMMITTED Cargo.lock exactly.
         # A release must never silently resolve a newer transitive dependency
         # than the one that was reviewed/audited on the branch.
-        run: cargo build --locked --release --target ${{ matrix.target }} --features sal
+        run: cargo build --locked --release --target ${{ matrix.target }} --features "$(bash scripts/release-features.sh)"
 
       - name: Assert compiled features (#2676, #2728)
         shell: bash
@@ -343,7 +346,7 @@ jobs:
           # runnable on this host; for a non-native target, verify the built
           # artifact's ARCHITECTURE WITHOUT running it. The compiled feature
           # set is identical across both darwin targets (same
-          # `cargo build --release --features sal` invocation above), so the
+          # `cargo build --release --features <release-features.sh>` above), so the
           # native aarch64-apple-darwin job's feature assertion already covers
           # the feature contract; the x86_64 job additionally confirms the
           # cross-build actually emitted an x86_64 Mach-O, not a silent
@@ -361,8 +364,9 @@ jobs:
             # Native target — safe to execute; the script invokes the
             # `features` subcommand via the path.
             echo "native target ($target on $host_arch): executing feature self-report assertion"
+            # shellcheck disable=SC2046 # word-splitting the --require flags is intended
             bash scripts/assert-compiled-features.sh "$bin" \
-              --require sqlite-bundled --require sal
+              $(bash scripts/release-features.sh --require-flags)
           else
             echo "non-native target ($target on $host_arch): verifying arch WITHOUT executing (#2728)"
             # Expected Mach-O / `file` architecture token for the target CPU.
