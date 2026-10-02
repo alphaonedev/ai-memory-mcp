@@ -189,6 +189,17 @@ fn probe_trail() -> bool {
     super::try_emit(event).is_ok()
 }
 
+/// Test-only: latch this process now (mode forced on), with the retry not
+/// due for [`PROBE_INTERVAL_MS`], so a surface test sees the refusal without
+/// installing a failing sink. Callers hold `audit::sink_test_lock` and call
+/// [`force_on_for_test`]`(false)` afterwards.
+#[cfg(test)]
+pub(crate) fn latch_for_test() {
+    FORCE_ON_FOR_TEST.store(true, Ordering::SeqCst);
+    LATCHED.store(true, Ordering::SeqCst);
+    LAST_PROBE_MS.store(super::now_unix_ms().max(1), Ordering::SeqCst);
+}
+
 /// Test-only: let the next latched gate retry at once.
 #[cfg(test)]
 pub(crate) fn reset_probe_clock_for_test() {

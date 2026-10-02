@@ -864,6 +864,13 @@ What it cannot do:
   start when the trail cannot be opened (#3651).
 - It covers this flat trail only, not the signed event chain or the forensic
   log.
+- While refusing, it refuses every mutation this process would make, including
+  credential operations such as revoking an HTTP API key. An audit outage must
+  not be mistaken for "a compromised key cannot be revoked": run the revocation
+  from a separate CLI process (`ai-memory agents revoke-api-key …`), which has
+  its own latch and is not refused, or unset the knob and restart.
+- It only acts when the flat trail is configured (`[audit].enabled = true`).
+  With auditing off there is no trail to fail, so the knob changes nothing.
 
 The mode is off by default and the `asi-hard` profile does not turn it on: it
 refuses live writes, so it runs for a release before it can become a hardened
