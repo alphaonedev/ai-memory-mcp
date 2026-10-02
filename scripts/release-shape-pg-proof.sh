@@ -47,8 +47,10 @@ unset AI_MEMORY_STORE_URL AI_MEMORY_STORE_URL_FILE PGSSLMODE PGHOST PGHOSTADDR P
 marker="release-shape-proof-$$-$(date +%s)"
 
 # 1. the artifact reports the shipped feature set.
-# shellcheck disable=SC2046 # word-splitting the --require flags is intended
-bash "$here/assert-compiled-features.sh" "$bin" $(bash "$here/release-features.sh" --require-flags) \
+require_flags="$(bash "$here/release-features.sh" --require-flags)"
+[[ -n "$require_flags" ]] || die "the release feature declaration is empty"
+# shellcheck disable=SC2086 # word-splitting the --require flags is intended
+bash "$here/assert-compiled-features.sh" "$bin" --strict $require_flags \
   || die "the artifact does not report the release feature set"
 
 # 2. a real round trip through PostgreSQL over verify-full.

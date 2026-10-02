@@ -58,10 +58,14 @@ COPY vendor/ vendor/
 # a silently re-resolved dependency.
 COPY scripts/assert-compiled-features.sh scripts/assert-compiled-features.sh
 COPY scripts/release-features.sh scripts/release-features.sh
-RUN cargo build --locked --release --features "$(bash scripts/release-features.sh)" \
-    && strip target/release/ai-memory \
-    && bash scripts/assert-compiled-features.sh target/release/ai-memory \
-         $(bash scripts/release-features.sh --require-flags)
+RUN set -eu; \
+    FEATURES="$(bash scripts/release-features.sh)"; \
+    REQUIRE_FLAGS="$(bash scripts/release-features.sh --require-flags)"; \
+    test -n "$FEATURES"; \
+    test -n "$REQUIRE_FLAGS"; \
+    cargo build --locked --release --features "$FEATURES"; \
+    strip target/release/ai-memory; \
+    bash scripts/assert-compiled-features.sh target/release/ai-memory --strict $REQUIRE_FLAGS
 
 # ---- Runtime stage ----
 FROM debian:bookworm-slim

@@ -71,13 +71,20 @@ jobs:
         run: bash scripts/check-release-features.sh
 
       - name: Build release binary (exactly as release.yml)
-        run: cargo build --locked --release --features "$(bash scripts/release-features.sh)"
+        shell: bash
+        run: |
+          set -euo pipefail
+          FEATURES="$(bash scripts/release-features.sh)"
+          test -n "$FEATURES"
+          cargo build --locked --release --features "$FEATURES"
 
       - name: No OpenSSL / libpq / native-tls in the shipped dependency graph
         shell: bash
         run: |
           set -euo pipefail
-          tree="$(cargo tree --locked -e normal --features "$(bash scripts/release-features.sh)")"
+          FEATURES="$(bash scripts/release-features.sh)"
+          test -n "$FEATURES"
+          tree="$(cargo tree --locked -e normal --features "$FEATURES")"
           if printf '%s\n' "$tree" | grep -E '(^|[^a-z-])(openssl-sys|native-tls|openssl |libpq)'; then
             echo "::error::the release feature set pulls a native TLS / libpq dependency (#4480 requires pure-Rust rustls)"
             exit 1

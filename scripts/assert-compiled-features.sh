@@ -10,6 +10,8 @@
 # Usage:
 #   scripts/assert-compiled-features.sh [binary] [--require feat ...]
 # Defaults: binary=ai-memory (PATH), required=sqlite-bundled
+# --strict (#4480): refuse an EMPTY require list instead of defaulting, so a
+# release caller whose feature declaration came back empty fails closed.
 #
 # Examples:
 #   scripts/assert-compiled-features.sh ./target/release/ai-memory
@@ -19,8 +21,12 @@ set -euo pipefail
 
 bin="ai-memory"
 required=()
+strict=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --strict)
+      strict=1
+      ;;
     --require)
       shift
       required+=("${1:?--require needs a feature name}")
@@ -37,6 +43,10 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ ${#required[@]} -eq 0 ]]; then
+  if [[ $strict -eq 1 ]]; then
+    echo "assert-compiled-features: --strict with an empty require list: refusing to pass vacuously" >&2
+    exit 2
+  fi
   required=(sqlite-bundled)
 fi
 
