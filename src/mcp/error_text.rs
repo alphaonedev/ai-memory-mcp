@@ -72,7 +72,8 @@ pub fn mcp_error_text(e: &MemoryError) -> String {
         | MemoryError::RefusedByGovernance(_)
         | MemoryError::RefusedByGovernanceGate(_)
         | MemoryError::QuotaExceeded(_)
-        | MemoryError::Refused(_) => e.message(),
+        | MemoryError::Refused(_)
+        | MemoryError::AuditTrailUnavailable(_) => e.message(),
     }
 }
 

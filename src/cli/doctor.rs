@@ -2744,6 +2744,31 @@ fn section_audit_trail_3975(
     const NAME: &str = "Audit trail (#3975)";
     const SCOPE: &str = "this doctor process; a daemon reports ai_memory_audit_* on /metrics";
     match status.state {
+        // #4454 (s4400 F2) — the fail-closed knob is set but there is no trail
+        // for it to guard: writes go ahead with nothing recorded, while an
+        // operator reading "REQUIRE" may believe they are protected.
+        AuditTrailState::NotActive if !configured_enabled && status.fail_closed => ReportSection {
+            name: NAME.into(),
+            severity: Severity::Warning,
+            facts: vec![
+                (
+                    "state".into(),
+                    "not configured ([audit].enabled is off)".into(),
+                ),
+                (
+                    "fail_closed".into(),
+                    format!(
+                        "{} is set but has no effect: there is no trail to guard",
+                        crate::audit::REQUIRE_AUDIT_TRAIL_ENV
+                    ),
+                ),
+            ],
+            note: Some(format!(
+                "{} only refuses writes when the flat audit trail is on; set \
+                 [audit].enabled = true, or unset the knob (#4454)",
+                crate::audit::REQUIRE_AUDIT_TRAIL_ENV
+            )),
+        },
         AuditTrailState::NotActive if !configured_enabled => ReportSection {
             name: NAME.into(),
             severity: Severity::Info,
@@ -2774,9 +2799,24 @@ fn section_audit_trail_3975(
                 .and_then(|ms| i64::try_from(ms).ok())
                 .and_then(chrono::DateTime::from_timestamp_millis)
                 .map_or_else(|| "none yet".to_string(), |at| at.to_rfc3339());
+            let note = if status.latched {
+                Some(format!(
+                    "the trail failed and {} is set: this process REFUSES mutating \
+                     operations (reads stay live) until the trail records again; the \
+                     next write retries it (#4400)",
+                    crate::audit::REQUIRE_AUDIT_TRAIL_ENV
+                ))
+            } else {
+                (failures > 0).then(|| {
+                    "audit events may have been LOST in this process (a write or \
+                     flush failed); run `ai-memory audit verify` for the actual \
+                     gaps; stderr carries the rate-limited reason"
+                        .into()
+                })
+            };
             ReportSection {
                 name: NAME.into(),
-                severity: if failures > 0 {
+                severity: if failures > 0 || status.latched {
                     Severity::Critical
                 } else {
                     Severity::Info
@@ -2789,16 +2829,24 @@ fn section_audit_trail_3975(
                     ),
                     ("write_failures".into(), failures.to_string()),
                     ("last_write".into(), last),
+                    (
+                        "fail_closed".into(),
+                        fail_closed_fact(status.fail_closed, status.latched).into(),
+                    ),
                     ("scope".into(), SCOPE.into()),
                 ],
-                note: (failures > 0).then(|| {
-                    "audit events may have been LOST in this process (a write or \
-                     flush failed); run `ai-memory audit verify` for the actual \
-                     gaps; stderr carries the rate-limited reason"
-                        .into()
-                }),
+                note,
             }
         }
+    }
+}
+
+/// #4400 — the `fail_closed` fact of the audit-trail section.
+fn fail_closed_fact(fail_closed: bool, latched: bool) -> &'static str {
+    match (fail_closed, latched) {
+        (false, _) => "off (lost events are counted; writes proceed)",
+        (true, false) => "on (a failed audit write refuses later mutations)",
+        (true, true) => "on, LATCHED (mutating operations are refused)",
     }
 }
 
@@ -6952,6 +7000,8 @@ mod tests {
             records_written: None,
             write_failures: None,
             last_write_unix_ms: None,
+            fail_closed: false,
+            latched: false,
         };
         assert_eq!(
             section_audit_trail_3975(&off, false).severity,
@@ -6969,6 +7019,8 @@ mod tests {
             records_written: Some(7),
             write_failures: Some(0),
             last_write_unix_ms: Some(1_757_000_000_000),
+            fail_closed: false,
+            latched: false,
         };
         let s = section_audit_trail_3975(&healthy, true);
         assert_eq!(s.severity, Severity::Info);
@@ -6985,6 +7037,36 @@ mod tests {
         );
         assert_eq!(fact(&s, "write_failures"), "2");
         assert!(s.note.as_deref().unwrap_or("").contains("LOST"));
+        // #4400 — the latch is Critical on its own and says writes are refused.
+        let latched = AuditTrailStatus {
+            fail_closed: true,
+            latched: true,
+            ..healthy
+        };
+        let s = section_audit_trail_3975(&latched, true);
+        assert_eq!(
+            s.severity,
+            Severity::Critical,
+            "a latched trail refuses writes"
+        );
+        assert!(fact(&s, "fail_closed").contains("LATCHED"));
+        assert!(s.note.as_deref().unwrap_or("").contains("REFUSES"));
+        // #4454 — the knob without a trail is a Warning that names the knob.
+        let knob_without_trail = AuditTrailStatus {
+            fail_closed: true,
+            ..off
+        };
+        let s = section_audit_trail_3975(&knob_without_trail, false);
+        assert_eq!(s.severity, Severity::Warning, "the knob guards nothing");
+        assert!(fact(&s, "fail_closed").contains(crate::audit::REQUIRE_AUDIT_TRAIL_ENV));
+        assert!(s.note.as_deref().unwrap_or("").contains("[audit].enabled"));
+        let armed = AuditTrailStatus {
+            fail_closed: true,
+            ..healthy
+        };
+        let s = section_audit_trail_3975(&armed, true);
+        assert_eq!(s.severity, Severity::Info, "armed but healthy");
+        assert!(fact(&s, "fail_closed").starts_with("on"));
     }
 
     #[test]

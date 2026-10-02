@@ -2106,6 +2106,7 @@ struct AuditTrailCollector {
     written: IntCounter,
     write_failures: IntCounter,
     last_write: IntGauge,
+    latched: IntGauge,
     // Serialises scrapes: a counter is reset and re-set per collect.
     scrape: std::sync::Mutex<()>,
 }
@@ -2135,6 +2136,12 @@ impl AuditTrailCollector {
                 "UNIX time of the most recent successful audit write. Absent until \
                  the first write: there is no time to report yet (#3975).",
             )?,
+            latched: IntGauge::new(
+                crate::audit::AUDIT_TRAIL_LATCHED_GAUGE,
+                "1 while this process refuses mutating operations because its audit \
+                 trail failed under AI_MEMORY_REQUIRE_AUDIT_TRAIL; 0 otherwise. \
+                 Exported only when that mode is on (#4400).",
+            )?,
             scrape: std::sync::Mutex::new(()),
         })
     }
@@ -2149,6 +2156,11 @@ impl AuditTrailCollector {
         let is_active = status.state == crate::audit::AuditTrailState::Active;
         self.active.set(i64::from(is_active));
         let mut families = self.active.collect();
+        // #4400 — the latch is meaningful only when the mode is on.
+        if status.fail_closed {
+            self.latched.set(i64::from(status.latched));
+            families.extend(self.latched.collect());
+        }
         if !is_active {
             return families;
         }
@@ -2177,6 +2189,7 @@ impl Collector for AuditTrailCollector {
             self.written.desc(),
             self.write_failures.desc(),
             self.last_write.desc(),
+            self.latched.desc(),
         ]
         .into_iter()
         .flatten()
@@ -2343,6 +2356,8 @@ mod tests {
             records_written: Some(0),
             write_failures: Some(3),
             last_write_unix_ms: None,
+            fail_closed: false,
+            latched: false,
         };
         let before = collector.families_for(&status);
         assert!(!names(&before).iter().any(|n| n == LAST), "no write yet");

@@ -832,6 +832,55 @@ advances before the write), and `audit verify` fails on it (#4021; see
 §"`ai-memory audit verify`"). The counter covers only the process that lost
 the event and only since it started; the gap stays in the file.
 
+### Refusing writes while the trail is down (opt-in, #4400)
+
+Counting a lost event is the default. Deployments that must not keep writing
+while the trail is down can set `AI_MEMORY_REQUIRE_AUDIT_TRAIL=1`. After a
+failed audit write or flush the process then refuses every later mutating
+operation with `503 AUDIT_TRAIL_UNAVAILABLE` (the MCP and CLI refusals carry
+the same text), through the same checkpoints the record-stop control uses
+(both storage backends, coordination writes, federation receive, every MCP
+write tool). Reads keep working.
+
+The next write after a failure retries the trail, at most once a second, by
+appending a real `trail_resumed` record. When that append succeeds the
+refusals stop, and the record marks in the trail where recording resumed; the
+events lost before it are the `sequence` gap `audit verify` reports. While
+refusing, a daemon's `/metrics` shows `ai_memory_audit_trail_latched 1`; that
+gauge is the only view of a running daemon's state, because `doctor` reports
+its own process (`fail_closed: on, LATCHED`, Critical, only if `doctor` itself
+hit the failure).
+
+What it cannot do:
+
+- Every audit event is written after its memory operation commits, so the
+  operations already under way when the trail fails have happened: at most one
+  unaudited write per write in flight at that moment (one for a single caller;
+  more under concurrent load on `serve`). Each is counted in
+  `ai_memory_audit_write_failures_total`, as before.
+- A failed retry is a failed audit write too: it uses up a sequence number and
+  is counted in `ai_memory_audit_write_failures_total`. While the trail stays
+  down, that counter and the gaps `audit verify` reports therefore grow by
+  about one a second from retries alone, not only from lost client events.
+- A single CLI command cannot refuse its own write; it relies on the refusal to
+  start when the trail cannot be opened (#3651).
+- It guards this flat trail only, not the signed event chain or the forensic
+  log. But it refuses through the record-stop checkpoints, so a refusing
+  process also refuses the signed `governance.check` records it would add
+  (each counted; the verdict is still returned).
+- While refusing, it refuses every mutation this process would make, including
+  credential operations such as revoking an HTTP API key. An audit outage must
+  not be mistaken for "a compromised key cannot be revoked": run the revocation
+  from a separate CLI process (`ai-memory agents revoke-api-key …`), which has
+  its own latch and is not refused, or unset the knob and restart.
+- It only acts when the flat trail is configured (`[audit].enabled = true`).
+  With auditing off there is no trail to fail, so the knob changes nothing;
+  `ai-memory doctor` reports that combination as a Warning (#4454).
+
+The mode is off by default and the `asi-hard` profile does not turn it on: it
+refuses live writes, so it runs for a release before it can become a hardened
+default.
+
 ### Off-host attestation
 
 Ship every line to an immutable off-host store (SIEM, S3 Object Lock,

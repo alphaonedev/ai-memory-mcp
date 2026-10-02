@@ -137,6 +137,12 @@ pub enum StorageError {
     /// NOT in evidence here.
     RecordStopIndeterminate { reason: String },
 
+    /// #4400 — a mutating `db::` write refused because this process's flat
+    /// audit trail failed and `AI_MEMORY_REQUIRE_AUDIT_TRAIL` is set. Process-
+    /// local and self-clearing (the gate retries the trail); DISTINCT from
+    /// [`Self::RecordStopped`], an operator decision persisted in the chain.
+    AuditTrailUnavailable { reason: String },
+
     /// v1.0.0 #3196 — a `find_paths` traversal was refused because it would
     /// materialise more than
     /// [`crate::storage::FIND_PATHS_MAX_PREFIXES`] path-prefixes. Emitted by
@@ -222,6 +228,7 @@ impl std::fmt::Display for StorageError {
                 "substrate record-stop state could not be read (fail-closed; \
                  mutating operation refused, retry): {reason}",
             ),
+            Self::AuditTrailUnavailable { reason } => f.write_str(reason),
             // #3196 — routed through the shared message builder so the SQLite
             // and Postgres budget-exceeded surfaces are byte-identical.
             Self::TraversalBudgetExceeded => {
@@ -278,6 +285,9 @@ impl StorageError {
             Self::RecordStopped { .. } => crate::errors::error_codes::RECORD_STOPPED,
             Self::RecordStopIndeterminate { .. } => {
                 crate::errors::error_codes::RECORD_STOP_INDETERMINATE
+            }
+            Self::AuditTrailUnavailable { .. } => {
+                crate::errors::error_codes::AUDIT_TRAIL_UNAVAILABLE
             }
             Self::TraversalBudgetExceeded => crate::errors::error_codes::TRAVERSAL_BUDGET_EXCEEDED,
         }

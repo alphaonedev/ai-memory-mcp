@@ -42,12 +42,15 @@ pub fn gate_sqlite_path(path: &Path) -> Result<(), super::StoreError> {
 ///
 /// # Errors
 ///
-/// [`super::StoreError::Stopped`] when the record plane is stopped.
+/// [`super::StoreError::Stopped`] when the record plane is stopped;
+/// [`super::StoreError::AuditTrailUnavailable`] when it is not but this
+/// process's audit trail failed under `AI_MEMORY_REQUIRE_AUDIT_TRAIL` (#4400).
 pub fn gate_flag(flag: &RecordStopFlag) -> Result<(), super::StoreError> {
-    match flag.stop_refusal() {
-        Some((issued_by, scope)) => Err(super::StoreError::Stopped { issued_by, scope }),
-        None => Ok(()),
+    if let Some((issued_by, scope)) = flag.stop_refusal() {
+        return Err(super::StoreError::Stopped { issued_by, scope });
     }
+    crate::audit::audit_trail_gate()
+        .map_err(|e| super::StoreError::AuditTrailUnavailable { reason: e.reason })
 }
 
 #[cfg(test)]

@@ -53,6 +53,19 @@ use sha2::{Digest, Sha256};
 
 use crate::runtime_context::RuntimeContext;
 
+mod fail_closed;
+pub use fail_closed::{
+    AUDIT_TRAIL_LATCHED_GAUGE, AuditTrailUnavailable,
+    PROBE_INTERVAL_MS as AUDIT_TRAIL_PROBE_INTERVAL_MS, REQUIRE_AUDIT_TRAIL_ENV, audit_trail_gate,
+    audit_trail_latched, refusal_message as audit_trail_refusal_message,
+    require_audit_trail_enabled,
+};
+#[cfg(test)]
+pub(crate) use fail_closed::{
+    force_on_for_test as fail_closed_force_on_for_test,
+    latch_for_test as fail_closed_latch_for_test,
+};
+
 /// Canonical `consolidate` operation label — shared by the audit op
 /// vocabulary, the autonomy rollback tags, and the governance action
 /// adapter (#1558 batch 6).
@@ -136,6 +149,8 @@ pub mod synthesis_sources {
     pub const HTTP_HEADER: &str = "http_header";
     /// No explicit caller identity — default resolution ladder.
     pub const DEFAULT_FALLBACK: &str = "default_fallback";
+    /// #4400 — an event the substrate records about itself (no caller).
+    pub const SUBSTRATE: &str = "substrate";
 }
 
 /// Canonical action vocabulary. Adding a variant is a non-breaking
@@ -162,6 +177,11 @@ pub enum AuditAction {
     /// Informational (`outcome = Allow`); surfaces capture drift to the
     /// SIEM in real time rather than at next-session recovery (L2).
     CaptureLag,
+    /// #4400 — the flat trail records again after a failure latched this
+    /// process (`AI_MEMORY_REQUIRE_AUDIT_TRAIL`). Written by the retry that
+    /// clears the latch, so the trail itself shows where recording resumed;
+    /// the events lost before it are the sequence gap `audit verify` reports.
+    TrailResumed,
 }
 
 impl AuditAction {
@@ -183,6 +203,7 @@ impl AuditAction {
             Self::Reject => "reject",
             Self::SessionBoot => "session_boot",
             Self::CaptureLag => "capture_lag",
+            Self::TrailResumed => "trail_resumed",
         }
     }
 }
@@ -1167,6 +1188,9 @@ pub const AUDIT_WRITE_FAILURES_TOTAL: &str = "ai_memory_audit_write_failures_tot
 /// enabled, and the audit trail is the record an operator relies on when it
 /// is not.
 fn note_emit_failure(err: &anyhow::Error) {
+    // #4400 — under AI_MEMORY_REQUIRE_AUDIT_TRAIL a failure latches the
+    // process so later mutating operations are refused.
+    fail_closed::note_failure_for_latch();
     let delivery = &RuntimeContext::global().audit.delivery;
     if let Some(suppressed) = delivery.record_failure(now_unix_ms()) {
         let line = audit_failure_diagnostic(err, suppressed);
@@ -1214,6 +1238,11 @@ pub struct AuditTrailStatus {
     pub write_failures: Option<u64>,
     /// Wall-clock time of the most recent successful write.
     pub last_write_unix_ms: Option<u64>,
+    /// #4400 — `AI_MEMORY_REQUIRE_AUDIT_TRAIL` is on in this process.
+    pub fail_closed: bool,
+    /// #4400 — this process is refusing mutating operations because its trail
+    /// failed (only ever true when [`Self::fail_closed`] is).
+    pub latched: bool,
 }
 
 /// #3975 — the flat audit trail's state and delivery counters, read at call
@@ -1228,6 +1257,8 @@ pub fn audit_trail_status() -> AuditTrailStatus {
             records_written: None,
             write_failures: None,
             last_write_unix_ms: None,
+            fail_closed: require_audit_trail_enabled(),
+            latched: audit_trail_latched(),
         };
     }
     AuditTrailStatus {
@@ -1235,6 +1266,8 @@ pub fn audit_trail_status() -> AuditTrailStatus {
         records_written: Some(audit.delivery.delivered()),
         write_failures: Some(audit.delivery.write_failures()),
         last_write_unix_ms: audit.delivery.last_success_unix_ms(),
+        fail_closed: require_audit_trail_enabled(),
+        latched: audit_trail_latched(),
     }
 }
 
@@ -2173,6 +2206,9 @@ mod write_ahead_4299_tests;
 
 #[cfg(test)]
 mod verify_snapshot_4332_tests;
+
+#[cfg(test)]
+mod fail_closed_4400_tests;
 
 #[cfg(test)]
 mod tests {
