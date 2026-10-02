@@ -175,7 +175,7 @@ if [[ $SELF_TEST -eq 1 ]]; then
   mkstub "$ST/pg-refuses" "$F_PG" fixed2 "$ROW_ATT"
 
   echo "== --self-test: stub binaries, canned 'features --json' =="
-  st_case "positive control (right binaries)"          0 "CERT-BOOTSTRAP GATE: PASS" "$ST/pg-good" "$ST/nd-good"
+  st_case "positive control (right binaries)"          0 "CERT-BOOTSTRAP GATE LEG-A-ONLY: PASS" "$ST/pg-good" "$ST/nd-good"
   st_case "A-pg binary WITHOUT sal-postgres"           3 "INSTRUMENT ERROR"          "$ST/pg-nodrv" "$ST/nd-good"
   st_case "A-driverless binary WITH sal-postgres"      3 "INSTRUMENT ERROR"          "$ST/pg-good" "$ST/nd-hasdrv"
   st_case "SWAPPED binaries"                           3 "INSTRUMENT ERROR"          "$ST/nd-good" "$ST/pg-good"
@@ -423,10 +423,15 @@ OUT_D="$EVIDENCE_DIR/driverless-posture-refuse.json"
 posture_env "$BIN_ND" 1 "$PG_DSN_VERIFY_FULL" > "$OUT_D" 2>"$EVIDENCE_DIR/driverless-posture-refuse.err"
 RC=$?
 ROWS_D="$(failing_rows "$OUT_D" 2>/dev/null)"
-if [[ $RC -eq 2 ]] && grep -qE '^AI_MEMORY_PG_AT_REST_ATTESTED( |$)' <<<"$ROWS_D"; then
-  pass "driverless binary REFUSES the certified pg config: exit 2, FAIL-ROW AI_MEMORY_PG_AT_REST_ATTESTED (#4333 R4 fail-closed)"
+# N1 (f2r 2026-10-02, folded by GOD): the attested row must be the SOLE failing row, not merely
+# present. "Contained" would let the refusal be caused by something else entirely while this row
+# happens to appear. A SECOND failing row is therefore a red — and the message names the actual
+# set, so a future legitimate row is a self-describing review event, never a mystery red.
+ROWS_D_N="$(grep -c . <<<"${ROWS_D:-}" || true)"
+if [[ $RC -eq 2 ]] && grep -qE '^AI_MEMORY_PG_AT_REST_ATTESTED( |$)' <<<"$ROWS_D" && [[ "$ROWS_D_N" -eq 1 ]]; then
+  pass "driverless binary REFUSES the certified pg config: exit 2, SOLE FAIL-ROW AI_MEMORY_PG_AT_REST_ATTESTED (#4333 R4 fail-closed)"
 else
-  fail "driverless binary did not refuse on AI_MEMORY_PG_AT_REST_ATTESTED (exit $RC; failing rows: ${ROWS_D:-none parsed}) — see $OUT_D"
+  fail "driverless binary did not refuse on AI_MEMORY_PG_AT_REST_ATTESTED as the SOLE failing row (exit $RC; $ROWS_D_N failing row(s): ${ROWS_D:-none parsed}) — see $OUT_D"
   sed 's/^/    FAIL-ROW /' <<<"$ROWS_D"
 fi
 rm -rf "$WORK_A" "$FPFILE_A"
@@ -437,8 +442,10 @@ fi
 
 if [[ $LEG_A_ONLY -eq 1 ]]; then
   echo
-  if [[ $FAILED -eq 0 ]]; then echo "CERT-BOOTSTRAP GATE: PASS"; exit 0; fi
-  echo "CERT-BOOTSTRAP GATE: FAIL"; exit 1
+  # N2 (f2r 2026-10-02, folded by GOD): a partial run must never print the full-gate verdict —
+  # "CERT-BOOTSTRAP GATE: PASS" from a --leg-a-only run could be quoted as a full gate pass.
+  if [[ $FAILED -eq 0 ]]; then echo "CERT-BOOTSTRAP GATE LEG-A-ONLY: PASS (LEG B not run; NOT a full-gate pass)"; exit 0; fi
+  echo "CERT-BOOTSTRAP GATE LEG-A-ONLY: FAIL"; exit 1
 fi
 
 # LEG B is sqlite-only; run it with the superset (pg) binary.
