@@ -89,6 +89,7 @@ mod tx_retry;
 mod bootstrap_ddl;
 mod governance_chain_4477; // #4477 one chain builder, #4492 bind depth (qual_10 budget)
 mod ns_standard_ancestor_4356; // #4356 bind gate (own module: qual_10 budget)
+mod ns_standard_bind; // #4478 SET body, caller + federated gate (qual_10 budget)
 // v1.0.0 #3614 — the lineage walk (recursive CTE + AGE Cypher + the backend
 // dispatcher + the #3041 cycle check) and its two helpers. Own module for the
 // same qual_10 budget reason as `parity_3064` above: a pure MOVE (rule l),
@@ -26339,69 +26340,10 @@ impl MemoryStore for PostgresStore {
         standard_id: &str,
         parent: Option<&str>,
     ) -> StoreResult<()> {
-        // Wave-2 B7' — sqlite twin `db::set_namespace_standard` gates (ERRORS-09).
-        self.gate_record_stop().await?;
-        // Require the standard memory to exist first (parity with
-        // sqlite db::set_namespace_standard).
-        let exists: Option<(String,)> = sqlx::query_as(SQL_SELECT_MEMORY_ID_BY_ID)
-            .bind(standard_id)
-            .fetch_optional(&self.pool)
+        // #4478 — one body for the caller and the federated apply (own module).
+        let gate = ns_standard_bind::BindGate::Caller(ctx);
+        ns_standard_bind::set_namespace_standard_gated(self, gate, namespace, standard_id, parent)
             .await
-            .map_err(|e| to_store_err("set_namespace_standard verify memory", e))?;
-        if exists.is_none() {
-            return Err(StoreError::NotFound {
-                id: standard_id.to_string(),
-            });
-        }
-        if parent.is_some_and(|p| p == namespace) {
-            return Err(StoreError::InvalidInput {
-                detail: "namespace cannot be its own parent".to_string(),
-            });
-        }
-        // #3188 — CROSS-BACKEND PARITY. When the caller declares no parent,
-        // resolve the '-'-prefix ancestor EXACTLY as the sqlite twin
-        // (`db::set_namespace_standard` → `db::auto_detect_parent`) so both
-        // backends bind the SAME `parent_namespace`. Governance inheritance is
-        // resolved by walking `namespace_meta.parent_namespace`
-        // (`build_namespace_chain` / `pg_namespace_standard_owner_in_tx`), so a
-        // divergent bound parent means divergent governance: pre-#3188 pg bound
-        // NULL here, making e.g. `team-eng` an ungoverned ROOT on postgres while
-        // the sqlite twin inherited `team`'s standard. `pg_auto_detect_parent`
-        // FAILS CLOSED on a DB fault (it does not swallow the error into "no
-        // parent"), matching the sqlite `auto_detect_parent` contract.
-        let resolved_parent: Option<String> = match parent {
-            Some(p) => Some(p.to_string()),
-            None => pg_auto_detect_parent(&self.pool, namespace).await?,
-        };
-        // #3758 rebind gate + #4356 bind lock and ancestor-owner gate, read in
-        // THIS transaction with the upsert (#3237 item 5 TOCTOU discipline;
-        // see `ns_standard_ancestor_4356::set_gate_in_tx`).
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| to_store_err("set_namespace_standard begin", e))?;
-        ns_standard_ancestor_4356::set_gate_in_tx(&mut tx, ctx, namespace).await?;
-        let parent_link = resolved_parent.as_deref(); // #4492 chain-depth admission:
-        governance_chain_4477::admit_bind_in_tx(&mut tx, namespace, parent_link).await?;
-        sqlx::query(
-            "INSERT INTO namespace_meta (namespace, standard_id, updated_at, parent_namespace)
-             VALUES ($1, $2, NOW(), $3)
-             ON CONFLICT (namespace) DO UPDATE
-                SET standard_id = EXCLUDED.standard_id,
-                    updated_at = EXCLUDED.updated_at,
-                    parent_namespace = EXCLUDED.parent_namespace",
-        )
-        .bind(namespace)
-        .bind(standard_id)
-        .bind(resolved_parent.as_deref())
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| to_store_err("set_namespace_standard", e))?;
-        tx.commit()
-            .await
-            .map_err(|e| to_store_err("set_namespace_standard commit", e))?;
-        Ok(())
     }
 
     async fn namespace_governing_ancestor(

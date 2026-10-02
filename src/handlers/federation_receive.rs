@@ -4519,13 +4519,49 @@ async fn sync_push_write(
                 peer_header_owned.as_deref(),
             );
         }
-        match db::set_namespace_standard(
-            &lock.0,
-            &entry.namespace,
-            &entry.standard_id,
-            entry.parent_namespace.as_deref(),
-        ) {
-            Ok(()) => namespace_meta_applied += 1,
+        // #4478 — the #4356 ancestor-owner bind gate, read and decided INSIDE
+        // the write transaction that performs the bind (race-safe re-check on
+        // the single sqlite writer). The federated caller is the agent the
+        // peer is authenticated to act for (`ns_meta_ancestor_gate` docs); a
+        // refusal is a per-entry skip counted under `namespace_meta_refused`,
+        // nothing is written, and the batch survives.
+        let applied = crate::storage::in_write_txn(&lock.0, || {
+            let verdict = crate::federation::ns_meta_ancestor_gate::federated_bind_admission_conn(
+                &lock.0,
+                &entry.namespace,
+                &entry.standard_id,
+                |owner| {
+                    crate::federation::ns_meta_ancestor_gate::federated_bind_actor(
+                        peer_header_owned.as_deref(),
+                        &body.sender_agent_id,
+                        owner,
+                        &attest_cfg,
+                        peer_attestation::trust_body_agent_id_bypass(),
+                    )
+                },
+            );
+            if verdict.is_err() {
+                return Ok(false);
+            }
+            db::set_namespace_standard(
+                &lock.0,
+                &entry.namespace,
+                &entry.standard_id,
+                entry.parent_namespace.as_deref(),
+            )?;
+            Ok(true)
+        });
+        match applied {
+            Ok(true) => namespace_meta_applied += 1,
+            Ok(false) => {
+                tracing::warn!(
+                    target: ATTESTATION_TRACE_TARGET,
+                    "{}",
+                    crate::federation::ns_meta_ancestor_gate::ANCESTOR_GATE_SKIP_LOG
+                );
+                namespace_meta_refused += 1;
+                skipped += 1;
+            }
             Err(e) => {
                 tracing::warn!(
                     "sync_push: set_namespace_standard failed for {}: {e}",
