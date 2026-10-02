@@ -26340,6 +26340,9 @@ impl MemoryStore for PostgresStore {
         standard_id: &str,
         parent: Option<&str>,
     ) -> StoreResult<()> {
+        // Wave-2 B7' — the record-stop gate stays visible HERE (the #3175 / B7
+        // structural scanners read this method); the shared body repeats it.
+        self.gate_record_stop().await?;
         // #4478 — one body for the caller and the federated apply (own module).
         let gate = ns_standard_bind::BindGate::Caller(ctx);
         ns_standard_bind::set_namespace_standard_gated(self, gate, namespace, standard_id, parent)

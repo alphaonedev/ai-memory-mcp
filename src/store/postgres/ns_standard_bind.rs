@@ -16,7 +16,7 @@ use super::{
     ns_standard_ancestor_4356, pg_advisory_xact_lock_key, pg_auto_detect_parent,
     pg_namespace_standard_binding, to_store_err,
 };
-use crate::ns_standard_ancestor::{GoverningAncestor, PG_STANDARD_BIND_LOCK_KEY, needs_ancestor};
+use crate::ns_standard_ancestor::{GoverningAncestor, PG_STANDARD_BIND_LOCK_KEY};
 use crate::store::{CallerContext, StoreError};
 
 /// The federated actor resolver: the bound standard memory's stored owner in,
@@ -32,22 +32,22 @@ pub(crate) enum BindGate<'a> {
     Federated(ActorFor<'a>),
 }
 
-/// #4478 — the federated gate inside `tx`: lock, then (first bind / severed
-/// repair only) the governing ancestor and the bound memory's owner.
+/// #4478 / #4495 — the federated gate inside `tx`: lock, then the shared
+/// #3758 + #4356 verdict for the authenticated actor in EVERY binding state.
+/// Returns the actor and the governing ancestor BEFORE the write, for the
+/// detaching re-parent post-check. `actor_for` is pure (it runs inside the
+/// transaction; it must never do I/O).
 async fn federated_gate_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     actor_for: ActorFor<'_>,
     namespace: &str,
     standard_id: &str,
-) -> StoreResult<()> {
+) -> StoreResult<(Option<String>, GoverningAncestor)> {
     pg_advisory_xact_lock_key(tx, PG_STANDARD_BIND_LOCK_KEY)
         .await
         .map_err(|e| to_store_err("federated set_namespace_standard bind lock", e))?;
     let binding = pg_namespace_standard_binding(tx, namespace).await?;
-    if !needs_ancestor(&binding) {
-        return Ok(());
-    }
-    let ancestor: GoverningAncestor =
+    let before: GoverningAncestor =
         ns_standard_ancestor_4356::governing_ancestor_in_tx(tx, namespace).await?;
     let owner: Option<Option<String>> =
         sqlx::query_scalar("SELECT m.metadata->>'agent_id' FROM memories m WHERE m.id = $1")
@@ -60,9 +60,10 @@ async fn federated_gate_in_tx(
         actor.as_deref(),
         namespace,
         &binding,
-        &ancestor,
+        &before,
     )
-    .map_err(|r| crate::store::set_refusal_to_store_err(r, namespace))
+    .map_err(|r| crate::store::set_refusal_to_store_err(r, namespace))?;
+    Ok((actor, before))
 }
 
 /// The SET body (see the module docs).
@@ -115,14 +116,15 @@ pub(crate) async fn set_namespace_standard_gated(
         .begin()
         .await
         .map_err(|e| to_store_err("set_namespace_standard begin", e))?;
-    match gate {
+    let federated = match gate {
         BindGate::Caller(ctx) => {
             ns_standard_ancestor_4356::set_gate_in_tx(&mut tx, ctx, namespace).await?;
+            None
         }
         BindGate::Federated(actor_for) => {
-            federated_gate_in_tx(&mut tx, actor_for, namespace, standard_id).await?;
+            Some(federated_gate_in_tx(&mut tx, actor_for, namespace, standard_id).await?)
         }
-    }
+    };
     // #4492 — the bind-time chain-depth admission, for every gate (the
     // federated apply included), under the same lock and in the same tx.
     governance_chain_4477::admit_bind_in_tx(&mut tx, namespace, resolved_parent.as_deref()).await?;
@@ -140,6 +142,18 @@ pub(crate) async fn set_namespace_standard_gated(
     .execute(&mut *tx)
     .await
     .map_err(|e| to_store_err("set_namespace_standard", e))?;
+    // #4495 — a federated re-parent must not have detached the target from a
+    // governing ancestor the actor does not own (read after the write, in the
+    // same tx; a refusal drops the tx, rolling the write back).
+    if let Some((actor, before)) = federated {
+        let after = ns_standard_ancestor_4356::governing_ancestor_in_tx(&mut tx, namespace).await?;
+        crate::federation::ns_meta_ancestor_gate::federated_reparent_admission(
+            actor.as_deref(),
+            &before,
+            &after,
+        )
+        .map_err(|r| crate::store::set_refusal_to_store_err(r, namespace))?;
+    }
     tx.commit()
         .await
         .map_err(|e| to_store_err("set_namespace_standard commit", e))?;
