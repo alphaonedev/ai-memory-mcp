@@ -172,6 +172,23 @@ CELLS = [
     '''),
 ]
 
+def scratch_dir(out_dir: pathlib.Path) -> str:
+    """Where the enumeration cells may create throwaway git repos.
+
+    This used to be os.environ.get('TMPDIR', '/mnt/t9/tmp/god-f2'). On ubuntu-latest TMPDIR is unset
+    and /mnt/t9 does not exist, so tempfile raised FileNotFoundError and the CI step added for #4502
+    would have gone red on every PR -- it passed on the author's host only because that directory
+    happens to exist there (reviewer-f2r). A gate's self-test must not carry a host-specific path.
+    TMPDIR is honoured only when it actually names a directory; otherwise the scratch lives beside
+    the fixtures, under the repo-local .local-runs the standing rule already requires (never /tmp).
+    """
+    t = os.environ.get('TMPDIR')
+    if t and os.path.isdir(t):
+        return t
+    d = out_dir / 'scratch'
+    d.mkdir(parents=True, exist_ok=True)
+    return str(d)
+
 def self_test(out_dir: pathlib.Path) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     passed = failed = 0
@@ -212,7 +229,7 @@ def self_test(out_dir: pathlib.Path) -> int:
             f = pathlib.Path(d, rel); f.parent.mkdir(parents=True, exist_ok=True); f.write_text(body)
         return d
     scan_cells = []
-    with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR', '/mnt/t9/tmp/god-f2')) as d:
+    with tempfile.TemporaryDirectory(dir=scratch_dir(out_dir)) as d:
         rc, out = run_in(str(pathlib.Path(me).parent.parent), env={'GIT_DIR': '/nonexistent'})
         scan_cells.append(('a broken git dir is an ERROR, not a clean scan', rc == 2 and 'SCAN FAILED' in out, f'rc={rc}'))
         empty = mkrepo(os.path.join(d, 'empty'), {'tests/unrelated.rs': 'fn t() {}\n'})
@@ -237,6 +254,18 @@ def self_test(out_dir: pathlib.Path) -> int:
         rc, out = run_in(trk, args=('--only', 'tests/committed.rs'))
         scan_cells.append(('--only on a corpus file still works (control)',
                            rc == 1 and 'INVARIANT VIOLATION' in out, f'rc={rc}'))
+    # The CI shape itself: a TMPDIR that does not exist must not break the run. Re-invoked once with
+    # a broken TMPDIR and a marker that skips this cell in the child, so the recursion is depth 1.
+    if not os.environ.get('KEYDIR_SELFTEST_NO_TMPDIR_CELL'):
+        e = dict(os.environ)
+        e['TMPDIR'] = '/nonexistent-tmpdir-ci-shape'
+        e['KEYDIR_SELFTEST_NO_TMPDIR_CELL'] = '1'
+        r = subprocess.run([sys.executable, me, '--self-test'], capture_output=True, text=True,
+                           env=e, cwd=str(pathlib.Path(me).parent.parent))
+        scan_cells.append(('a TMPDIR that does not exist (the ubuntu-latest shape) does not break the run',
+                           r.returncode == 0 and 'FileNotFoundError' not in (r.stdout + r.stderr),
+                           f'child rc={r.returncode}'))
+
     for name, ok, detail in scan_cells:
         passed, failed = passed + ok, failed + (not ok)
         print(f'  [{"ST-ok" if ok else "ST-FAIL"}] scan: {name} ({detail})')
