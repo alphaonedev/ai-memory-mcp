@@ -120,7 +120,7 @@ fn build_governed_peer_post(
     let parsed = reqwest::Url::parse(url).ok();
     let host = parsed
         .as_ref()
-        .and_then(|u| u.host_str().map(str::to_string))
+        .and_then(crate::governance::host::egress_host)
         .unwrap_or_else(|| url.to_string());
     let scheme = parsed.map(|u| u.scheme().to_string()).unwrap_or_default();
     let net_action = crate::governance::agent_action::AgentAction::NetworkRequest {
