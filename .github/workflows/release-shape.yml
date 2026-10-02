@@ -8,7 +8,9 @@
 # in ONE file (scripts/release-features.sh); this job builds from it, asserts
 # the self-report, checks no OpenSSL/libpq is pulled in, and drives the binary
 # against a TLS PostgreSQL service it starts itself (a pgvector image, a
-# throwaway CA, hostssl-only pg_hba, sslmode=verify-full on 127.0.0.1).
+# throwaway CA, hostssl-only pg_hba, sslmode=verify-full on 127.0.0.1). The
+# image has pgvector but NO Apache AGE, so the proof covers the pgvector / CTE
+# path, not the AGE graph projection.
 #
 # NEVER VACUOUS. A missing docker, a server that does not come up, a URL that
 # does not verify, or a round trip that loses the memory FAILS the job; there
@@ -37,6 +39,8 @@ on:
       - "scripts/assert-compiled-features.sh"
       - "Cargo.toml"
       - "Cargo.lock"
+      - "src/**"
+      - "migrations/**"
   push:
     branches: ["release/**"]
   workflow_dispatch:
@@ -84,7 +88,7 @@ jobs:
           set -euo pipefail
           FEATURES="$(bash scripts/release-features.sh)"
           test -n "$FEATURES"
-          tree="$(cargo tree --locked -e normal --features "$FEATURES")"
+          tree="$(cargo tree --locked -e normal --target all --features "$FEATURES")"
           if printf '%s\n' "$tree" | grep -E '(^|[^a-z-])(openssl-sys|native-tls|openssl |libpq)'; then
             echo "::error::the release feature set pulls a native TLS / libpq dependency (#4480 requires pure-Rust rustls)"
             exit 1
@@ -116,7 +120,7 @@ jobs:
           docker run -d --name release-shape-pg -p 127.0.0.1:55432:5432 \
             -e POSTGRES_PASSWORD="$pw" -e POSTGRES_DB=proof \
             -v "$d:/certs:ro" \
-            pgvector/pgvector:pg17 \
+            pgvector/pgvector:0.8.0-pg17 \
             -c ssl=on -c ssl_cert_file=/certs/server.crt -c ssl_key_file=/certs/server.key \
             -c hba_file=/certs/pg_hba.conf
           for _ in $(seq 1 60); do

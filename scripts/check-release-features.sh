@@ -80,12 +80,76 @@ if [[ "${1:-}" == "--self-test" ]]; then
     done
   done
   : "$good"
+  # ---- the GUARD itself must not be bypassable (comment / multi-line forms).
+  mk_root() { # fresh copy of the repo files the guard reads
+    local r="$1"; rm -rf "$r"; mkdir -p "$r/.github/workflows" "$r/scripts" "$r/docs"
+    cp "$root/.github/workflows/release.yml" "$root/.github/workflows/release-shape.yml" "$r/.github/workflows/"
+    cp "$root/Dockerfile" "$r/"; cp "$root/docs/INSTALL.md" "$r/docs/"
+    cp "$root/scripts/release-features.sh" "$r/scripts/"
+  }
+  expect_guard() { # $1 name, $2 want (pass|fail), $3 root
+    if bash "$here/check-release-features.sh" "$3" >/dev/null 2>&1; then got=pass; else got=fail; fi
+    if [[ "$got" != "$2" ]]; then echo "self-test FAIL: guard case '$1' wanted $2, got $got" >&2; st=1; fi
+  }
+  # replace one block of text in a file (literal), via perl so no quoting games.
+  mutate() { # $1 file, $2 old-file, $3 new-file
+    OLD="$(cat "$2")" NEW="$(cat "$3")" perl -0pi -e 'BEGIN{$o=$ENV{OLD};$n=$ENV{NEW}} $i=index($_,$o); die "mutation anchor missing\n" if $i<0; substr($_,$i,length($o))=$n;' "$1"
+  }
+  g="$tmp/guard"; m="$tmp/mut"; mkdir -p "$m"
+  rel_build='          FEATURES="$(bash scripts/release-features.sh)"
+          test -n "$FEATURES"
+          cargo build --locked --release --target ${{ matrix.target }} --features "$FEATURES"'
+  printf '%s' "$rel_build" > "$m/old-build"
+  mk_root "$g"; expect_guard "unmutated" pass "$g"
+  # control: a VALID multi-line build must still pass.
+  mk_root "$g"
+  printf '%s' '          FEATURES="$(bash scripts/release-features.sh)"
+          test -n "$FEATURES"
+          cargo build --locked --release \
+            --target ${{ matrix.target }} \
+            --features "$FEATURES"' > "$m/new"
+  mutate "$g/.github/workflows/release.yml" "$m/old-build" "$m/new"
+  expect_guard "valid multi-line build" pass "$g"
+  # bypass 1: multi-line INLINE use.
+  mk_root "$g"
+  printf '%s' '          cargo build --locked --release \
+            --target ${{ matrix.target }} \
+            --features "$(bash scripts/release-features.sh)"' > "$m/new"
+  mutate "$g/.github/workflows/release.yml" "$m/old-build" "$m/new"
+  expect_guard "multi-line inline build" fail "$g"
+  # bypass 2: the assignment survives only inside a COMMENT.
+  mk_root "$g"
+  printf '%s' '          # FEATURES="$(bash scripts/release-features.sh)"
+          FEATURES=sal
+          cargo build --locked --release --target ${{ matrix.target }} --features "$FEATURES"' > "$m/new"
+  mutate "$g/.github/workflows/release.yml" "$m/old-build" "$m/new"
+  expect_guard "assignment only in a comment" fail "$g"
+  # bypass 3: Dockerfile builds WITHOUT --locked, a comment carries the text.
+  mk_root "$g"
+  printf '%s' 'cargo build --locked --release --features "$FEATURES"' > "$m/old"
+  printf '%s' 'cargo build --release --features "$FEATURES"' > "$m/new"
+  mutate "$g/Dockerfile" "$m/old" "$m/new"
+  printf '%s' 'RUN set -eu;' > "$m/old"
+  printf '%s' '# cargo build --locked --release --features "$FEATURES"
+RUN set -eu;' > "$m/new"
+  mutate "$g/Dockerfile" "$m/old" "$m/new"
+  expect_guard "Dockerfile --locked only in a comment" fail "$g"
   [[ $st -eq 0 ]] || exit 1
   echo "check-release-features: self-test OK (a failing or empty declaration fails the build step and the Dockerfile RUN)"
   exit 0
 fi
 
 # -------------------------------------------------------------------- guard --
+# Every check reads NORMALISED text: full-line comments dropped and `\`
+# continuations joined, so (1) a comment that merely CONTAINS the expected text
+# (`# FEATURES="$(...)"`, `# cargo build --locked ...`) cannot satisfy a check
+# and (2) a multi-line `run: |` / continued `RUN` is judged as the one command
+# it is.
+norm() {
+  sed -E '/^[[:space:]]*#/d' "$1" \
+    | awk '{ line=$0; if (sub(/\\[[:space:]]*$/, "", line)) { buf = buf line " " } else { print buf line; buf = "" } } END { if (buf != "") print buf }'
+}
+
 root="${1:-$(cd "$here/.." && pwd)}"
 rel="$root/.github/workflows/release.yml"
 shape="$root/.github/workflows/release-shape.yml"
@@ -103,31 +167,52 @@ case ",$declared," in
   *) bad "release-features.sh declares [$declared], without sal-postgres" ;;
 esac
 
+rel_n="$(norm "$rel")"
+shape_n=""; [[ -f "$shape" ]] && shape_n="$(norm "$shape")"
+docker_n=""; [[ -f "$dockerfile" ]] && docker_n="$(norm "$dockerfile")"
+has() { grep -qE -- "$2" <<<"$1"; }
+
 # 2. no inline use of the declaration: every use is its own assignment.
-assign_re='^[[:space:]]*(RUN set -eu; \\)?[[:space:]]*(FEATURES|REQUIRE_FLAGS)="\$\(bash scripts/release-features\.sh( --require-flags)?\)";?( \\)?$'
-for f in "$rel" "$shape" "$dockerfile"; do
-  [[ -f "$f" ]] || continue
-  while IFS= read -r line; do
-    [[ "$line" =~ ^[[:space:]]*# ]] && continue
-    if [[ "$line" == *'$(bash scripts/release-features.sh'* ]] && ! [[ "$line" =~ $assign_re ]]; then
-      bad "$(basename "$f"): inline use of the declaration (a failure would be swallowed): $line"
-    fi
-  done < "$f"
+allowed_re='(FEATURES|REQUIRE_FLAGS)="\$\(bash scripts/release-features\.sh( --require-flags)?\)"'
+for pair in "release.yml:$rel_n" "release-shape.yml:$shape_n" "Dockerfile:$docker_n"; do
+  name="${pair%%:*}"; text="${pair#*:}"
+  stripped="$(sed -E "s#$allowed_re##g" <<<"$text")"
+  if grep -qE '\$\(bash [^)]*release-features\.sh' <<<"$stripped"; then
+    bad "$name: inline use of the declaration (a failure would be swallowed; assign it in its own statement)"
+  fi
 done
 
 # 3. release.yml build / assert / SBOM follow the declaration.
-if grep -E '^[[:space:]]*cargo build .*--target' "$rel" | grep -qv -- '--features "\$FEATURES"'; then
-  bad "release.yml build step does not take --features \"\$FEATURES\""
+# The release matrix build (the mobile static-library builds use --target "$TARGET").
+build_lines="$(grep -E 'cargo build .*--target \$\{\{ matrix\.target \}\}' <<<"$rel_n" || true)"
+[[ -n "$build_lines" ]] || bad "release.yml has no release-matrix 'cargo build --target' command"
+if [[ -n "$build_lines" ]] && grep -qv -- '--features "\$FEATURES"' <<<"$build_lines"; then
+  bad "release.yml build command does not take --features \"\$FEATURES\""
 fi
-grep -qE '^[[:space:]]*cargo build .*--target .*--features "\$FEATURES"' "$rel" \
-  || bad "release.yml has no 'cargo build --target ... --features \"\$FEATURES\"' line"
-grep -q 'FEATURES="$(bash scripts/release-features.sh)"' "$rel" \
-  || bad "release.yml does not assign FEATURES from the declaration"
-grep -q 'REQUIRE_FLAGS="$(bash scripts/release-features.sh --require-flags)"' "$rel" \
+if [[ -n "$build_lines" ]] && grep -qv -- '--locked' <<<"$build_lines"; then
+  bad "release.yml build command does not use --locked"
+fi
+# The assignment must sit in the SAME step, just before the command that uses it
+# (an assignment elsewhere in the file does not protect this build).
+assigned_before() { # $1 normalised text, $2 command-line regex
+  RE="$2" awk '
+    BEGIN { re = ENVIRON["RE"] }
+    { a[NR]=$0 }
+    END { for (i=1;i<=NR;i++) if (a[i] ~ re) { ok=0
+            for (k=i-3;k<i;k++) if (k>0 && a[k] ~ /FEATURES="\$\(bash scripts\/release-features\.sh\)"/) ok=1
+            if (!ok) exit 1 ; found=1 }
+          if (!found) exit 1 }' <<<"$1"
+}
+assigned_before "$rel_n" 'cargo build .*--target \$\{\{ matrix\.target \}\}' \
+  || bad "release.yml build is not preceded by its own FEATURES=\"\$(bash scripts/release-features.sh)\" assignment"
+assigned_before "$rel_n" 'cargo cyclonedx' \
+  || bad "release.yml SBOM step is not preceded by its own FEATURES assignment"
+has "$rel_n" 'REQUIRE_FLAGS="\$\(bash scripts/release-features\.sh --require-flags\)"' \
   || bad "release.yml assert step does not assign REQUIRE_FLAGS from the declaration"
-grep -q 'assert-compiled-features.sh "\$bin" --strict \$REQUIRE_FLAGS' "$rel" \
+has "$rel_n" 'assert-compiled-features\.sh "\$bin" --strict \$REQUIRE_FLAGS' \
   || bad "release.yml assert step does not pass --strict \$REQUIRE_FLAGS"
-if ! grep -E 'cargo cyclonedx' "$rel" | grep -q -- '--features "\$FEATURES"'; then
+sbom_lines="$(grep -E 'cargo cyclonedx' <<<"$rel_n" || true)"
+if [[ -z "$sbom_lines" ]] || grep -qv -- '--features "\$FEATURES"' <<<"$sbom_lines"; then
   bad "release.yml SBOM step (cargo cyclonedx) does not pass --features \"\$FEATURES\" (the SBOM would omit what the artifact links)"
 fi
 
@@ -135,17 +220,17 @@ fi
 if [[ ! -f "$dockerfile" ]]; then
   bad "Dockerfile is missing"
 else
-  grep -qE 'cargo build --locked .*--features "\$FEATURES"' "$dockerfile" \
+  has "$docker_n" 'cargo build --locked [^;]*--features "\$FEATURES"' \
     || bad "Dockerfile cargo build does not use --locked and --features \"\$FEATURES\""
-  grep -q 'FEATURES="$(bash scripts/release-features.sh)"' "$dockerfile" \
+  has "$docker_n" 'FEATURES="\$\(bash scripts/release-features\.sh\)"' \
     || bad "Dockerfile does not assign FEATURES from scripts/release-features.sh"
-  grep -q 'REQUIRE_FLAGS="$(bash scripts/release-features.sh --require-flags)"' "$dockerfile" \
+  has "$docker_n" 'REQUIRE_FLAGS="\$\(bash scripts/release-features\.sh --require-flags\)"' \
     || bad "Dockerfile does not assign REQUIRE_FLAGS from the declaration"
-  grep -q -- '--strict \$REQUIRE_FLAGS' "$dockerfile" \
+  has "$docker_n" '--strict \$REQUIRE_FLAGS' \
     || bad "Dockerfile assert step does not pass --strict \$REQUIRE_FLAGS"
-  grep -q '^COPY Cargo.toml Cargo.lock' "$dockerfile" \
+  has "$docker_n" '^COPY Cargo\.toml Cargo\.lock' \
     || bad "Dockerfile does not COPY Cargo.lock before the build"
-  grep -q 'COPY scripts/release-features.sh' "$dockerfile" \
+  has "$docker_n" 'COPY scripts/release-features\.sh' \
     || bad "Dockerfile does not COPY scripts/release-features.sh into the build stage"
 fi
 
@@ -153,9 +238,9 @@ fi
 if [[ ! -f "$shape" ]]; then
   bad ".github/workflows/release-shape.yml is missing (no release-shaped proof)"
 else
-  grep -q 'scripts/release-features.sh' "$shape" \
+  has "$shape_n" 'scripts/release-features\.sh' \
     || bad "release-shape.yml does not build from scripts/release-features.sh"
-  grep -q 'scripts/release-shape-pg-proof.sh' "$shape" \
+  has "$shape_n" 'scripts/release-shape-pg-proof\.sh' \
     || bad "release-shape.yml does not run scripts/release-shape-pg-proof.sh"
 fi
 
