@@ -2744,6 +2744,31 @@ fn section_audit_trail_3975(
     const NAME: &str = "Audit trail (#3975)";
     const SCOPE: &str = "this doctor process; a daemon reports ai_memory_audit_* on /metrics";
     match status.state {
+        // #4454 (s4400 F2) — the fail-closed knob is set but there is no trail
+        // for it to guard: writes go ahead with nothing recorded, while an
+        // operator reading "REQUIRE" may believe they are protected.
+        AuditTrailState::NotActive if !configured_enabled && status.fail_closed => ReportSection {
+            name: NAME.into(),
+            severity: Severity::Warning,
+            facts: vec![
+                (
+                    "state".into(),
+                    "not configured ([audit].enabled is off)".into(),
+                ),
+                (
+                    "fail_closed".into(),
+                    format!(
+                        "{} is set but has no effect: there is no trail to guard",
+                        crate::audit::REQUIRE_AUDIT_TRAIL_ENV
+                    ),
+                ),
+            ],
+            note: Some(format!(
+                "{} only refuses writes when the flat audit trail is on; set \
+                 [audit].enabled = true, or unset the knob (#4454)",
+                crate::audit::REQUIRE_AUDIT_TRAIL_ENV
+            )),
+        },
         AuditTrailState::NotActive if !configured_enabled => ReportSection {
             name: NAME.into(),
             severity: Severity::Info,
@@ -7026,6 +7051,15 @@ mod tests {
         );
         assert!(fact(&s, "fail_closed").contains("LATCHED"));
         assert!(s.note.as_deref().unwrap_or("").contains("REFUSES"));
+        // #4454 — the knob without a trail is a Warning that names the knob.
+        let knob_without_trail = AuditTrailStatus {
+            fail_closed: true,
+            ..off
+        };
+        let s = section_audit_trail_3975(&knob_without_trail, false);
+        assert_eq!(s.severity, Severity::Warning, "the knob guards nothing");
+        assert!(fact(&s, "fail_closed").contains(crate::audit::REQUIRE_AUDIT_TRAIL_ENV));
+        assert!(s.note.as_deref().unwrap_or("").contains("[audit].enabled"));
         let armed = AuditTrailStatus {
             fail_closed: true,
             ..healthy

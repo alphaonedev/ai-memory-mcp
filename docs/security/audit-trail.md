@@ -870,7 +870,8 @@ What it cannot do:
   from a separate CLI process (`ai-memory agents revoke-api-key …`), which has
   its own latch and is not refused, or unset the knob and restart.
 - It only acts when the flat trail is configured (`[audit].enabled = true`).
-  With auditing off there is no trail to fail, so the knob changes nothing.
+  With auditing off there is no trail to fail, so the knob changes nothing;
+  `ai-memory doctor` reports that combination as a Warning (#4454).
 
 The mode is off by default and the `asi-hard` profile does not turn it on: it
 refuses live writes, so it runs for a release before it can become a hardened
