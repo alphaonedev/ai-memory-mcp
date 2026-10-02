@@ -1225,7 +1225,7 @@ operator's ruling) and `boot_verdict`. Critical when anything will refuse or
 a plaintext webhook target is stored, the local certificate is expired, or
 a declared non-singleton shape lacks enterprise PKI;
 Warning for plaintext model-server egress or a leaf inside its renewal
-window; Info otherwise. Doctor never refuses.
+window; Info otherwise. Doctor never refuses. The doctor sections that open their own postgres session (Postgres extensions, Unstamped owners, Identity key registry) apply the same `sslmode=verify-full` floor before any socket opens: below it they report the refusal as the section's fact (Critical for the first two, a Warning note for Identity) and never connect (#4333).
 
 ```bash
 ai-memory doctor

@@ -40,9 +40,10 @@
 //!
 //! Driven through the real binary (`CARGO_BIN_EXE_ai-memory`) so the
 //! assertions are over the same rendered `--json` payload the cert gate
-//! greps. NOT feature-gated: `doctor --posture` never opens the store, so the
-//! `postgres://` DSN below is parsed, never connected — the pg legs are
-//! meaningful on the default sqlite-only build too.
+//! greps. `doctor --posture` never opens the store, so the `postgres://` DSN
+//! below is parsed, never connected. #4434: a PASS on verify-full needs a
+//! build that can verify the driver's sslmode (`sal-postgres`); legs 1 and 4
+//! are gated on it and a build without it asserts the fail-closed twin.
 
 use std::path::{Path, PathBuf};
 use std::process::Output;
@@ -62,14 +63,18 @@ const PG_AT_REST_ENV: &str = ai_memory::enterprise_federation_posture::ENV_PG_AT
 /// The sqlite/sqlcipher STRUCTURAL half of control #15 (pre-#3061 verbatim).
 const SQLCIPHER_ENV: &str = ai_memory::encryption::ENV_ENCRYPT_AT_REST;
 /// The §5.3 boot-refusing gate; check #17 requires it armed.
+#[cfg(feature = "sal-postgres")]
 const REQUIRE_POSTURE_ENV: &str =
     ai_memory::enterprise_federation_posture::ENV_REQUIRE_ENTERPRISE_FEDERATION_POSTURE;
 /// No `pub const` declares the agent-id env (the identity module's copy is
 /// private, and clap owns the flag), so it is spelled once here.
+#[cfg(feature = "sal-postgres")]
 const AGENT_ID_ENV: &str = "AI_MEMORY_AGENT_ID";
 /// Agent id under which the daemon audit signing key (check #19) resolves.
+#[cfg(feature = "sal-postgres")]
 const AGENT_ID: &str = "cert-node-3106";
 /// Approver identity minted for the check #20 enrollment.
+#[cfg(feature = "sal-postgres")]
 const APPROVER_ID: &str = "cert-approver-3106";
 
 /// A fresh sandbox under `.local-runs/` (project no-`/tmp` HARD RULE).
@@ -163,6 +168,7 @@ fn row(rows: &[(String, bool)], prefix: &str) -> Option<bool> {
 /// resolution must be readable on its own, never inferred from the overall
 /// verdict — inferring it from the verdict is exactly what made the #3106
 /// regression read as a control-#15 failure.
+#[cfg(feature = "sal-postgres")]
 #[test]
 fn pg_dsn_resolves_control_15_to_the_compensating_control() {
     let sb = sandbox("pg-compensating");
@@ -191,6 +197,30 @@ fn pg_dsn_resolves_control_15_to_the_compensating_control() {
         row(&rows, SQLCIPHER_ENV).is_none(),
         "#3061: the sqlcipher predicate is UNSATISFIABLE on postgres and must not \
          be the #15 row there. rows={rows:?}"
+    );
+}
+
+/// #4434 - the fail-closed twin of legs 1 and 4 for a build WITHOUT
+/// `sal-postgres` (the shipped release configuration): it cannot verify the
+/// driver's sslmode, so #15 must FAIL on verify-full + attestation instead of
+/// reporting a pin it cannot prove. The flipped expectation encodes the old
+/// false claim, it does not weaken the assertion.
+#[cfg(not(feature = "sal-postgres"))]
+#[test]
+fn pg_control_15_never_passes_without_sal_postgres_4434() {
+    let sb = sandbox("pg-unverifiable");
+    let out = run_posture_json(
+        sb.path(),
+        &[
+            (ai_memory::store_url::STORE_URL_ENV, PG_DSN_VERIFY_FULL),
+            (PG_AT_REST_ENV, "1"),
+        ],
+    );
+    let rows = control_rows(&out);
+    assert_eq!(
+        row(&rows, PG_AT_REST_ENV),
+        Some(false),
+        "#4434: a build without sal-postgres cannot prove the pin; #15 must FAIL. rows={rows:?}"
     );
 }
 
@@ -244,6 +274,7 @@ fn sqlite_control_15_is_still_the_sqlcipher_predicate() {
 /// extending the certified env turns this red in the ADDING PR, on every CI
 /// leg — rather than a day later in a non-required cert job whose failure
 /// text names an unrelated control.
+#[cfg(feature = "sal-postgres")]
 #[test]
 fn certified_pg_config_reaches_all_pass() {
     let sb = sandbox("certified-pg");
