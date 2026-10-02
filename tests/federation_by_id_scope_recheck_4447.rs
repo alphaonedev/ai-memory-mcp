@@ -35,7 +35,6 @@
 #![allow(clippy::doc_markdown)]
 
 use std::path::Path;
-use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -100,7 +99,7 @@ fn in_scope(root: &str) -> impl Fn(&str, &str) -> bool + Send + Sync + use<> {
 /// The busy handler's "a lock wait happened" flag. The cells share ONE static
 /// (a fn-pointer handler cannot capture), so they serialise on `SQLITE_CELLS`.
 static BLOCKED: AtomicBool = AtomicBool::new(false);
-static SQLITE_CELLS: StdMutex<()> = StdMutex::new(());
+static SQLITE_CELLS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn busy_cb(attempt: i32) -> bool {
     BLOCKED.store(true, Ordering::SeqCst);
@@ -183,7 +182,7 @@ fn move_live(conn: &rusqlite::Connection, id: &str, ns: &str) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn deletions_lane_refused_after_concurrent_move_sqlite_4447() {
-    let _g = SQLITE_CELLS.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = SQLITE_CELLS.lock().await;
     let w = sqlite_world();
     let (root, secure) = (uniq("public"), uniq("secure/ops"));
     let id = uuid::Uuid::new_v4().to_string();
@@ -226,7 +225,7 @@ async fn deletions_lane_refused_after_concurrent_move_sqlite_4447() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn archives_lane_refused_after_concurrent_move_sqlite_4447() {
-    let _g = SQLITE_CELLS.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = SQLITE_CELLS.lock().await;
     let w = sqlite_world();
     let (root, secure) = (uniq("public"), uniq("secure/ops"));
     let id = uuid::Uuid::new_v4().to_string();
@@ -268,7 +267,7 @@ async fn archives_lane_refused_after_concurrent_move_sqlite_4447() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn restores_lane_refused_after_concurrent_move_sqlite_4447() {
-    let _g = SQLITE_CELLS.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = SQLITE_CELLS.lock().await;
     let w = sqlite_world();
     let (root, secure) = (uniq("public"), uniq("secure/ops"));
     let id = uuid::Uuid::new_v4().to_string();
@@ -326,7 +325,7 @@ async fn restores_lane_refused_after_concurrent_move_sqlite_4447() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn links_lane_refused_after_concurrent_move_sqlite_4447() {
-    let _g = SQLITE_CELLS.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = SQLITE_CELLS.lock().await;
     let w = sqlite_world();
     let (root, secure) = (uniq("public"), uniq("secure/ops"));
     let (a, b) = (
