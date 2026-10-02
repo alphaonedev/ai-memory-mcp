@@ -1953,12 +1953,14 @@ fn emit_upsert_supersede_leaf_if_enabled(
     Ok(())
 }
 
-/// v1.0.0 #2954 — the pre-merge image of the `(title, namespace)` row a
+/// v1.0.0 #2954 / #4206 — the pre-merge image of the `(title, namespace)` row a
 /// federation newer-wins upsert ([`insert_if_newer`]) is about to overwrite.
 /// Read under the SAME `BEGIN IMMEDIATE` write lock as the upsert (so the probe
-/// cannot race it), ONLY when the append-only spine is armed. Identity/version
-/// plus the two durable-content columns needed to decide whether the leaf fires
-/// — the plaintext/placeholder `content` and its at-rest `encrypted_envelope`.
+/// cannot race it). Identity/version plus the durable-content columns needed
+/// to decide whether the overwrite changes the row's text — the
+/// plaintext/placeholder `content`, its at-rest `encrypted_envelope` and the
+/// owner the envelope is sealed to. Feeds BOTH the #4206 pre-merge archive
+/// snapshot (always) and the #2954 SUPERSEDE leaf (armed spine only).
 struct FederationMergePreimage {
     /// The surviving local row's `updated_at` (the primary LWW key the
     /// `CASE WHEN excluded.updated_at > memories.updated_at` arm compares).
@@ -1974,14 +1976,87 @@ struct FederationMergePreimage {
     content: String,
     /// The stored at-rest ciphertext envelope (NULL when encryption is off).
     encrypted_envelope: Option<Vec<u8>>,
+    /// #4206 — the row's `metadata.agent_id`, the identity its envelope is
+    /// sealed to (`""` for an unowned / legacy row).
+    owner_agent_id: String,
 }
 
-/// v1.0.0 #2954 — probe the `(title, namespace)` row [`insert_if_newer`]'s
-/// newer-wins upsert may overwrite, under the caller's open `BEGIN IMMEDIATE`
-/// write lock. Returns `None` when the append-only spine is OFF (default → no
-/// extra read → byte-identical) or when no row currently holds
-/// `(title, namespace)` (a fresh INSERT, which destroys nothing). The write
-/// lock is what makes the probe atomic with the upsert that follows.
+impl FederationMergePreimage {
+    /// The inbound row wins the LWW tiebreak — byte-for-byte the same total
+    /// order the `ON CONFLICT … CASE` arm of [`INSERT_IF_NEWER_SQL`] applies
+    /// (`updated_at` as TEXT, then `id`).
+    fn inbound_wins(&self, mem: &Memory) -> bool {
+        mem.updated_at.as_str() > self.updated_at.as_str()
+            || (mem.updated_at == self.updated_at && mem.id.as_str() > self.id.as_str())
+    }
+
+    /// #4206 — `true` when the upsert will actually change the row's logical
+    /// text: the inbound row wins the tiebreak AND its plaintext differs from
+    /// the stored plaintext. Compared BEFORE sealing (a fresh seal has a fresh
+    /// nonce, so envelope bytes always differ), so a no-change replay never
+    /// replaces the last recoverable preimage. A stored envelope that cannot
+    /// be opened counts as changed (over-approximate: snapshot, never skip).
+    fn text_overwritten_by(&self, mem: &Memory) -> bool {
+        self.inbound_wins(mem)
+            && preimage_plaintext(
+                &self.content,
+                self.encrypted_envelope.as_deref(),
+                &self.owner_agent_id,
+            )
+            .as_deref()
+                != Some(mem.content.as_str())
+    }
+}
+
+/// #4206 — the logical (plaintext) text of a stored row: the `content` column
+/// when there is no at-rest envelope, else the envelope opened under the row's
+/// owner. `None` when the envelope cannot be opened (lost key, erased or
+/// corrupt) — callers treat that as "unknown, assume changed".
+pub(crate) fn preimage_plaintext(
+    content: &str,
+    envelope: Option<&[u8]>,
+    owner_agent_id: &str,
+) -> Option<String> {
+    match envelope {
+        None => Some(content.to_owned()),
+        Some(bytes) => crate::encryption::open_content(bytes, owner_agent_id).ok(),
+    }
+}
+
+/// #4206 — snapshot the `(title, namespace)` row a federation newer-wins
+/// upsert is about to overwrite into `archived_memories`
+/// (`archive_reason = federation_merge`, keyed by the LOCAL row's id), in the
+/// caller's open write transaction and BEFORE the upsert, so the pre-merge text
+/// stays recoverable. The same-id lane has done this since #1773
+/// ([`overwrite_full_row_by_id`]); the title-slot lane (an inbound id absent
+/// locally, including the #3699 cross-id fold) did not, so a newer peer row
+/// permanently replaced local text. Fires only when the text actually changes
+/// ([`FederationMergePreimage::text_overwritten_by`]); a losing inbound or a
+/// no-change replay archives nothing and leaves an earlier snapshot in place.
+///
+/// # Errors
+///
+/// Propagates the archive INSERT error; the caller rolls back its transaction.
+fn snapshot_title_slot_preimage_if_overwritten(
+    conn: &Connection,
+    pre: Option<&FederationMergePreimage>,
+    mem: &Memory,
+) -> Result<()> {
+    match pre {
+        Some(pre) if pre.text_overwritten_by(mem) => {
+            archive_memory_insert_only(conn, &pre.id, field_names::ARCHIVE_REASON_FEDERATION_MERGE)
+        }
+        _ => Ok(()),
+    }
+}
+
+/// v1.0.0 #2954 / #4206 — probe the `(title, namespace)` row
+/// [`insert_if_newer`]'s newer-wins upsert may overwrite, under the caller's
+/// open `BEGIN IMMEDIATE` write lock. Returns `None` when no live row holds
+/// `(title, namespace)` (a fresh INSERT, which destroys nothing). Always read
+/// (#4206: the pre-merge archive snapshot needs it whether or not the
+/// append-only spine is armed). The write lock is what makes the probe atomic
+/// with the upsert that follows.
 ///
 /// # Errors
 ///
@@ -1992,12 +2067,9 @@ fn probe_federation_merge_preimage(
     namespace: &str,
 ) -> Result<Option<FederationMergePreimage>> {
     use rusqlite::OptionalExtension;
-    if !crate::config::append_only_enabled() {
-        return Ok(None);
-    }
     conn.query_row(
         &format!(
-            "SELECT updated_at, id, version, content, encrypted_envelope \
+            "SELECT updated_at, id, version, content, encrypted_envelope, metadata \
              FROM memories WHERE title = ?1 AND namespace = ?2 AND {}",
             crate::models::TITLE_SLOT_INDEX_PREDICATE
         ),
@@ -2009,6 +2081,14 @@ fn probe_federation_merge_preimage(
                 version: r.get(2)?,
                 content: r.get(3)?,
                 encrypted_envelope: r.get(4)?,
+                // Parsed in Rust, not `json_extract`: a malformed or
+                // non-string `agent_id` reads as unowned (the envelope then
+                // fails to open → "changed" → snapshot), never as a probe error
+                // that would wedge every merge into this title slot.
+                owner_agent_id: serde_json::from_str::<serde_json::Value>(&r.get::<_, String>(5)?)
+                    .ok()
+                    .and_then(|m| m.get("agent_id")?.as_str().map(str::to_owned))
+                    .unwrap_or_default(),
             })
         },
     )
@@ -2026,8 +2106,9 @@ fn probe_federation_merge_preimage(
 /// evaluates — computed here in Rust against the write-lock-held pre-image so
 /// it cannot diverge from the live overwrite:
 ///
-///  * `pre` is `Some` ONLY when the spine is armed AND a prior `(title,
-///    namespace)` row existed (otherwise a fresh INSERT destroyed nothing);
+///  * `pre` is `Some` ONLY when a prior `(title, namespace)` row existed
+///    (otherwise a fresh INSERT destroyed nothing); the leaf itself is only
+///    appended when the spine is armed (`emit_revision_leaf_if_enabled`);
 ///  * the inbound row must WIN the tiebreak (`excluded.updated_at >
 ///    memories.updated_at` OR the equal-timestamp `excluded.id >
 ///    memories.id`), else the surviving content is the LOCAL row's and nothing
@@ -2061,9 +2142,7 @@ fn emit_federation_newer_wins_supersede_leaf_if_enabled(
     };
     // The inbound row wins the LWW tiebreak — byte-for-byte the same total
     // order the `ON CONFLICT … CASE` arm applies (updated_at, then id).
-    let inbound_won = mem.updated_at.as_str() > pre.updated_at.as_str()
-        || (mem.updated_at == pre.updated_at && mem.id.as_str() > pre.id.as_str());
-    if !inbound_won {
+    if !pre.inbound_wins(mem) {
         return Ok(());
     }
     // The overwrite actually changed durable content (content column or its
@@ -18502,22 +18581,33 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
     // newer-wins pre-image probe cannot race the upsert they bracket. Only taken
     // when this call owns the connection (autocommit) and at least one of the
     // two concerns is live (the federation receive loop wraps batches in its own
-    // tx, whose lock already covers both). Neither concern live ⇒ byte-identical
-    // legacy path.
-    let owns_tx = (crate::encryption::encryption_enabled(None)
-        || crate::config::append_only_enabled())
-        && conn.is_autocommit();
+    // tx, whose lock already covers both).
+    //
+    // #4206 — the pre-merge archive snapshot is a THIRD concern that is live on
+    // EVERY configuration: a newer inbound row that wins the title slot rewrites
+    // the local row's text, and the snapshot of the text it replaces must land
+    // in the same write transaction as that rewrite (probe → snapshot → upsert
+    // atomic, no window in which the text is neither archived nor live). So the
+    // write lock is now taken whenever this call owns the connection.
+    let owns_tx = conn.is_autocommit();
     let write_txn = if owns_tx {
         Some(connection::WriteTxn::begin(conn)?)
     } else {
         None
     };
     let sealed_merge = (|| -> Result<String> {
-        // #2954 — armed-only pre-image of the `(title, namespace)` row this
-        // upsert may overwrite. `None` when the spine is OFF (byte-identical) or
-        // no prior row exists. Read under the `BEGIN IMMEDIATE` write lock above
-        // so it cannot race the upsert whose newer-wins verdict it mirrors.
+        // #2954 / #4206 — pre-image of the `(title, namespace)` row this upsert
+        // may overwrite (`None` when no live row holds the slot). Read under the
+        // `BEGIN IMMEDIATE` write lock above so it cannot race the upsert whose
+        // newer-wins verdict it mirrors.
         let merge_preimage = probe_federation_merge_preimage(conn, &mem.title, &mem.namespace)?;
+        // #4206 — keep the text this upsert is about to overwrite recoverable:
+        // snapshot the pre-merge row into `archived_memories`
+        // (`federation_merge`) BEFORE the in-place rewrite, exactly as the
+        // same-id lane does (#1773 `overwrite_full_row_by_id`). Only when the
+        // inbound row wins AND its plaintext differs (a replay must not replace
+        // the last recoverable preimage).
+        snapshot_title_slot_preimage_if_overwritten(conn, merge_preimage.as_ref(), mem)?;
         let seal = seal_content_for_upsert(conn, mem)?;
         let content_to_store = seal.content_to_store.as_str();
         let encrypted_envelope: Option<&[u8]> = seal.envelope_bytes();
@@ -18596,8 +18686,9 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
         // row won the LWW tiebreak. Append ONE identity-only SUPERSEDE leaf in
         // this same tx, gated on that same won-and-changed predicate (evaluated
         // against the write-lock-held pre-image so it cannot diverge from the
-        // live `CASE`). Mirrors the create-funnel #2948 wiring; the superseded
-        // pre-merge content lives only in the row it replaced, never in the leaf.
+        // live `CASE`). Mirrors the create-funnel #2948 wiring; the leaf is
+        // identity-only — the superseded pre-merge text is recoverable from the
+        // #4206 `federation_merge` archive snapshot taken above, never the leaf.
         // #3699 (5-agent vote 4d3ea1c5) — a CROSS-ID title merge (the inbound
         // id was folded into a local row of a different id, and will never
         // exist here) is counted and WARNed, never silent inside a 200: on a
