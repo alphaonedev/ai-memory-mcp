@@ -273,6 +273,16 @@ pub async fn send_signal(
         },
         None => crate::models::SignalType::default(),
     };
+    // #4408 — validate a present `to_agent` ONCE, above the backend branch, so
+    // sqlite and postgres answer an invalid recipient with the identical 400
+    // body before any sign, quota charge, write or fan-out. Never echoed.
+    if let Err(e) = crate::validate::validate_signal_recipient(body.to_agent.as_deref()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response();
+    }
     let now = chrono::Utc::now().timestamp();
     // #3011 — wire `signals.expires_at` from an optional `ttl_secs` (validated +
     // overflow-checked), so the gc pruner can reap the caller-declared-ephemeral
@@ -361,7 +371,12 @@ pub async fn send_signal(
     // (memory `4d3ea1c5`) deemed #1807 legitimate.
     if !signal.from_agent.is_empty() {
         let bytes = crate::quotas::coordination_payload_bytes(
-            &[&signal.subject],
+            &[
+                &signal.subject,
+                // #4408 — the recipient is persisted and federated, so it is
+                // counted in the storage-only quota bytes.
+                signal.to_agent.as_deref().unwrap_or(""),
+            ],
             &[&signal.body, &signal.reference_ids],
         );
         let charge = {

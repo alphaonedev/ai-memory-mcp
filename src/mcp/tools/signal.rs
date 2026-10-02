@@ -176,10 +176,21 @@ pub fn handle_signal_send_with_hooks(
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
-    let to_agent = params
-        .get(param_names::TO_AGENT)
-        .and_then(Value::as_str)
-        .map(str::to_string);
+    // #4408 — a present-but-non-string `to_agent` used to read as ABSENT and
+    // silently turned a direct signal into a namespace broadcast; refuse the
+    // wrong TYPE with the fixed (non-echoing) recipient refusal. Absent / null
+    // still means broadcast. `param_guard::optional_str` is deliberately NOT used
+    // here: it trims, which would silently change the recipient (and accept a
+    // value the HTTP funnel refuses).
+    let to_agent = match params.get(param_names::TO_AGENT) {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => Some(s.clone()),
+        Some(_) => return Err(crate::validate::SIGNAL_RECIPIENT_REFUSAL.to_string()),
+    };
+    // #4408 — a present `to_agent` must satisfy the agent-id contract; the
+    // refusal text is fixed and never echoes the value. Runs before the hook,
+    // sign, quota charge, insert and audit.
+    crate::validate::validate_signal_recipient(to_agent.as_deref()).map_err(|e| e.to_string())?;
     let in_reply_to = params
         .get(param_names::IN_REPLY_TO)
         .and_then(Value::as_str)
@@ -301,6 +312,11 @@ pub fn handle_signal_send_with_hooks(
         }
     }
 
+    // #4408 — a `pre_signal_send` `Modify` may rewrite `to_agent`; the final
+    // recipient is what gets signed, charged and stored, so re-validate it.
+    crate::validate::validate_signal_recipient(signal.to_agent.as_deref())
+        .map_err(|e| e.to_string())?;
+
     let attest_level = match keypair {
         Some(kp) if kp.can_sign() => {
             crate::signals::sign_into(&mut signal, kp).map_err(|e| e.to_string())?;
@@ -318,7 +334,12 @@ pub fn handle_signal_send_with_hooks(
     // review (memory `4d3ea1c5`) deemed #1807 legitimate.
     if !signal.from_agent.is_empty() {
         let bytes = crate::quotas::coordination_payload_bytes(
-            &[&signal.subject],
+            &[
+                &signal.subject,
+                // #4408 — the recipient is persisted and federated, so it is
+                // counted in the storage-only quota bytes.
+                signal.to_agent.as_deref().unwrap_or(""),
+            ],
             &[&signal.body, &signal.reference_ids],
         );
         crate::quotas::check_and_record_storage_only(
@@ -1380,7 +1401,19 @@ mod handler_tests {
     fn ack_refuses_a_namespace_broadcast_3364() {
         let conn = fresh();
         for to_agent in [Value::Null, json!("   ")] {
-            let id = send_to(&conn, to_agent.clone());
+            // #4408 — a blank recipient is now REFUSED at send time, so the
+            // blank-recipient case seeds the LEGACY row (written before the
+            // fix) directly; the ack gate must still refuse to stamp it.
+            let id = send_to(&conn, Value::Null);
+            if to_agent.is_string() {
+                let changed = conn
+                    .execute(
+                        "UPDATE signals SET to_agent = ?1 WHERE id = ?2",
+                        rusqlite::params![to_agent.as_str(), id],
+                    )
+                    .expect("seed legacy blank recipient");
+                assert_eq!(changed, 1, "seeding must update exactly one row");
+            }
             let err = handle_signal_ack(&conn, &json!({ "id": id }), None)
                 .expect_err("a broadcast ack must be REFUSED");
             assert!(
@@ -1424,3 +1457,7 @@ mod handler_tests {
         assert_eq!(absent["acknowledged"].as_bool(), Some(false));
     }
 }
+
+#[cfg(test)]
+#[path = "signal_4408_tests.rs"]
+mod recipient_4408_tests;
