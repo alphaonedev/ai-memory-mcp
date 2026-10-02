@@ -9,9 +9,14 @@
 //! archive restore, `apply_remote_link`) MOVED here verbatim from
 //! `postgres.rs` (at its `qual_10_module_size_ceiling` budget; no ceiling
 //! raise), each gaining one `authorize_stored: Option<..>` parameter and ONE
-//! block that locks the target row `FOR UPDATE` inside the write transaction
-//! and refuses with `PermissionDenied` when the verdict says the row left the
-//! peer's scope. `None` is the unchecked legacy entry (tests, operator lanes);
+//! block that locks the target row inside the write transaction and refuses
+//! with `PermissionDenied` when the verdict says the row left the peer's scope.
+//! The deletions, archives and restores lanes lock `FOR UPDATE` (the first lock
+//! the transaction takes on the row). The LINKS lane locks BOTH endpoints
+//! `FOR SHARE`, one lock each in ascending id order through `lock_order_4209`:
+//! `FOR UPDATE` deadlocks with a local link write, key-share-then-update
+//! deadlocks two replays, and key-share alone would not hold a `namespace`
+//! relocation off. `None` is the unchecked legacy entry (tests, operator lanes);
 //! the trait `*_authorized` arms in `postgres.rs` pass `Some`. The `postgres.rs`
 //! trait arms for the unchecked methods forward here with `None`.
 //!
