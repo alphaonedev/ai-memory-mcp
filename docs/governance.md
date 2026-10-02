@@ -76,7 +76,7 @@ namespaces inherit the parent's policy by default (`inherit: true`),
 so one standard at `org/` governs the subtree until a child opts out.
 Opting a child out is itself an authorized act (#4356): binding the
 **first** standard (or repairing a severed binding, the #3758 SET repair
-path) at a namespace
+path, or rebinding an UNOWNED standard, #4499) at a namespace
 under a governed ancestor requires the caller to own the **nearest
 governing ancestor's** standard — the nearest ancestor on the
 governance chain whose standard carries a `metadata.governance`
@@ -89,12 +89,30 @@ stored metadata is corrupt (not a JSON object, or a `governance` blob that
 does not deserialize). The check runs inside the bind's write transaction
 on both backends, so it cannot pass on a chain a concurrent bind is
 changing. The global `*`
-default is not a governing ancestor for this gate. **Open gap
-([#4478](https://github.com/alphaonedev/ai-memory-mcp/issues/4478)):** the
-federated `namespace_meta[]` apply (`/sync/push`) does NOT run this gate yet.
-It is checked only by the #2479 / #2536 peer-scope gate, so a peer whose
-scope covers a child of a locally governed ancestor can still open that
-child's first standard until #4478 lands.
+default is not a governing ancestor for this gate. The federated
+`namespace_meta[]` apply (`/sync/push`, #4478 / #4495) runs the same owner
+gates on both backends after its #2479 peer-scope check, for every binding
+state: a first bind (or severed repair) needs the governing ancestor's owner,
+a rebind of an existing standard needs its current owner (#3758 parity), and a
+re-parent may not detach the namespace from a governing ancestor the caller
+does not own. The caller is the agent the pushing peer is authenticated to
+act for (the bound standard's owner when the peer is the attested sender for
+it or is allowlisted for it in `allowed_sender_agent_ids`, otherwise the
+attested sender), never the local admin apply context. When that identity
+cannot be established (no `X-Peer-Id`, or the body-agent-id trust bypass)
+any bind that consults an owner is refused. A refused entry is skipped and
+counted in `namespace_meta_refused` (a missing standard memory is a plain
+not-found skip on both backends); the rest of the batch applies. The
+identity is only as strong as the peer configuration. In the zero-config
+posture (no peer-attestation allowlist configured) ANY peer acts for whoever
+owns the memory it binds, and an unsigned `X-Peer-Id` naming an owner is that
+owner: the owner gates then hold against nobody the receive lane does not
+already trust on faith (the same model #1464 applies to row ownership there;
+the lane is refused in that posture unless the push-scope requirement is
+explicitly turned off). Governed deployments should configure
+`AI_MEMORY_FED_PEER_ATTESTATION` with per-peer `allowed_sender_agent_ids` and
+scopes, and peer attestation (signed pushes, enrolled keys, certificate
+binding), so a peer acts only for the agents it is allowlisted for.
 
 ### Corrupt standards resolve as SEVERED ([#4285](https://github.com/alphaonedev/ai-memory-mcp/issues/4285))
 

@@ -178,16 +178,19 @@ pub fn select_governing_ancestor<E>(
     Ok(GoverningAncestor::None)
 }
 
-/// Whether the ancestor must be consulted at all: only a bind that creates (or
-/// repairs) the target's OWN binding can opt out of an ancestor. A REBIND of a
-/// resolved standard is decided by its current owner (#3758) and never needs
-/// the chain read.
+/// Whether the ancestor must be consulted: a bind that creates (or repairs)
+/// the target's OWN binding, AND (#4499, GOD ruling) a rebind of an UNOWNED
+/// standard (owner absent, empty or `system`). #3758 lets anyone rebind an
+/// unowned standard; that unowned-PASS holds only where NO owned governing
+/// ancestor exists, so under one the ancestor's owner decides exactly as for
+/// a first bind. A rebind of an OWNED standard is decided by its current
+/// owner (#3758) alone.
 #[must_use]
-pub const fn needs_ancestor(binding: &NamespaceStandardBinding) -> bool {
-    matches!(
-        binding,
-        NamespaceStandardBinding::NoMetaRow | NamespaceStandardBinding::Unresolvable
-    )
+pub fn needs_ancestor(binding: &NamespaceStandardBinding) -> bool {
+    match binding {
+        NamespaceStandardBinding::NoMetaRow | NamespaceStandardBinding::Unresolvable => true,
+        NamespaceStandardBinding::Resolved(owner) => normalise_owner(owner.clone()).is_none(),
+    }
 }
 
 /// The ONE verdict for binding a namespace standard (SET): the #3758 rebind
@@ -227,7 +230,7 @@ pub fn set_admission(
         GoverningAncestor::Standard { owner: Some(_) } => {
             tracing::warn!(
                 target: crate::handlers::AUTHZ_TRACE_TARGET,
-                "namespace-standard ancestor-owner refusal: first bind on {namespace}: caller {caller} does not own the governing ancestor standard"
+                "namespace-standard ancestor-owner refusal: first bind or unowned rebind on {namespace}: caller {caller} does not own the governing ancestor standard"
             );
             Err(SetRefusal::NotOwner)
         }
@@ -381,6 +384,41 @@ mod tests {
                 "{unowned}"
             );
         }
+    }
+
+    /// #4499: a rebind of an UNOWNED standard under an OWNED governing
+    /// ancestor needs that ancestor's owner; with no owned ancestor (none, or
+    /// an unowned one) the #3758 unowned-PASS still admits anyone.
+    #[test]
+    fn unowned_rebind_under_an_owned_ancestor_needs_its_owner_4499() {
+        for unowned in [
+            NamespaceStandardBinding::Resolved(None),
+            NamespaceStandardBinding::Resolved(Some(String::new())),
+            NamespaceStandardBinding::Resolved(Some("system".into())),
+        ] {
+            assert!(needs_ancestor(&unowned));
+            assert_eq!(
+                set_admission("s", false, "gov/leaf", &unowned, &gov(Some("a"))),
+                Err(SetRefusal::NotOwner)
+            );
+            assert!(set_admission("a", false, "gov/leaf", &unowned, &gov(Some("a"))).is_ok());
+            assert!(set_admission("s", false, "root", &unowned, &GoverningAncestor::None).is_ok());
+            assert!(set_admission("s", false, "gov/leaf", &unowned, &gov(None)).is_ok());
+            assert_eq!(
+                set_admission(
+                    "s",
+                    false,
+                    "gov/leaf",
+                    &unowned,
+                    &GoverningAncestor::Severed
+                ),
+                Err(SetRefusal::AncestorUnresolvable)
+            );
+        }
+        // An OWNED standard's rebind stays the current owner's call (#3758).
+        let owned = NamespaceStandardBinding::Resolved(Some("c".into()));
+        assert!(!needs_ancestor(&owned));
+        assert!(set_admission("c", false, "gov/leaf", &owned, &gov(Some("a"))).is_ok());
     }
 
     #[test]
