@@ -14,8 +14,8 @@
 //! Both sides now pass through [`canonicalize_host`] /
 //! [`canonicalize_host_pattern`] before the glob engine runs. They share one
 //! implementation so a rule and a request can never be canonicalised
-//! differently (per ERRORS-09, the validated output is a plain `String` that
-//! only these constructors produce).
+//! differently (per ERRORS-09, the validated output is a [`CanonHost`] whose
+//! fields are private, so only these constructors can produce one).
 //!
 //! # Canonical form
 //!
@@ -81,12 +81,25 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 pub struct CanonHost {
     /// Canonical host: lowercase A-label name, dotted-quad IPv4 or bracketed
     /// compressed IPv6.
-    pub host: String,
+    host: String,
     /// Explicit port, leading zeros stripped.
-    pub port: Option<u16>,
+    port: Option<u16>,
 }
 
 impl CanonHost {
+    /// Canonical host: lowercase A-label name, dotted-quad IPv4 or bracketed
+    /// compressed IPv6.
+    #[must_use]
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
+    /// Explicit port, leading zeros stripped.
+    #[must_use]
+    pub fn port(&self) -> Option<u16> {
+        self.port
+    }
+
     /// The Unicode (U-label) spelling of the host when it differs from the
     /// A-label form; `None` when it is identical or cannot be decoded.
     #[must_use]
@@ -275,6 +288,9 @@ fn parse_port(p: &str) -> Result<u16, HostCanonError> {
     if p.is_empty() || p.len() > 5 || !p.bytes().all(|b| b.is_ascii_digit()) {
         return Err(HostCanonError::BadPort);
     }
+    // ERRORS-15: `HostCanonError` is a deliberately small `Copy` classification
+    // (fixed message, no payload); the std parse causes add nothing the caller
+    // can act on, and the string is untrusted so it is not echoed.
     p.parse::<u16>().map_err(|_| HostCanonError::BadPort)
 }
 
@@ -368,14 +384,36 @@ fn numeric_label_is_noncanonical(label: &str) -> bool {
     !canonical_octet
 }
 
-/// RFC 3492 punycode decode of one label body (the part after `xn--`).
-/// `None` on any malformed or overflowing input (checked arithmetic, PERF-02).
-fn punycode_decode(input: &str) -> Option<String> {
+/// RFC 3492 section 6.1 bias adaptation. Bounds (all `u32`, checked anyway):
+/// `delta <= u32::MAX` on entry; after the damping division it is at most
+/// `u32::MAX / 2`, so `delta + delta / numpoints` cannot overflow; the loop
+/// leaves `delta <= 455`, so the final product is at most `36 * 455`.
+fn adapt(delta: u32, numpoints: u32, first: bool) -> Option<u32> {
     const BASE: u32 = 36;
     const TMIN: u32 = 1;
     const TMAX: u32 = 26;
     const SKEW: u32 = 38;
     const DAMP: u32 = 700;
+    let mut delta = if first { delta / DAMP } else { delta / 2 };
+    delta = delta.checked_add(delta / numpoints)?;
+    let mut k = 0u32;
+    while delta > ((BASE - TMIN) * TMAX) / 2 {
+        delta /= BASE - TMIN;
+        k = k.checked_add(BASE)?;
+    }
+    let scaled = (BASE - TMIN + 1).checked_mul(delta)?;
+    k.checked_add(scaled / delta.checked_add(SKEW)?)
+}
+
+/// RFC 3492 punycode decode of one label body (the part after `xn--`).
+/// `None` on any malformed or overflowing input: every arithmetic step is
+/// checked (PERF-02) or bounded by a stated invariant (`i` is non-decreasing so
+/// `i - oldi` cannot underflow; `i % len < len` keeps the insert index valid;
+/// `bias` is at most `k + 36` with `k` itself checked).
+fn punycode_decode(input: &str) -> Option<String> {
+    const BASE: u32 = 36;
+    const TMIN: u32 = 1;
+    const TMAX: u32 = 26;
     let (basic, ext) = match input.rfind('-') {
         Some(i) => (&input[..i], &input[i + 1..]),
         None => ("", input),
@@ -401,7 +439,7 @@ fn punycode_decode(input: &str) -> Option<String> {
             i = i.checked_add(digit.checked_mul(w)?)?;
             let t = if k <= bias {
                 TMIN
-            } else if k >= bias + TMAX {
+            } else if k >= bias.checked_add(TMAX)? {
                 TMAX
             } else {
                 k - bias
@@ -413,20 +451,11 @@ fn punycode_decode(input: &str) -> Option<String> {
             k = k.checked_add(BASE)?;
         }
         let len = u32::try_from(out.len()).ok()?.checked_add(1)?;
-        // Bias adaptation (RFC 3492 section 6.1).
-        let mut delta = i - oldi;
-        delta = if oldi == 0 { delta / DAMP } else { delta / 2 };
-        delta += delta / len;
-        let mut kk = 0;
-        while delta > ((BASE - TMIN) * TMAX) / 2 {
-            delta /= BASE - TMIN;
-            kk += BASE;
-        }
-        bias = kk + (BASE - TMIN + 1) * delta / (delta + SKEW);
+        bias = adapt(i - oldi, len, oldi == 0)?;
         n = n.checked_add(i / len)?;
         i %= len;
         out.insert(usize::try_from(i).ok()?, char::from_u32(n)?);
-        i += 1;
+        i = i.checked_add(1)?;
     }
     Some(out.into_iter().collect())
 }
@@ -451,7 +480,7 @@ mod tests {
     use super::*;
 
     fn h(raw: &str) -> String {
-        canonicalize_host(raw).unwrap().host
+        canonicalize_host(raw).unwrap().host().to_string()
     }
 
     #[test]
@@ -485,7 +514,7 @@ mod tests {
         assert_eq!(
             canonicalize_host_pattern("*.b\u{fc}cher.example")
                 .unwrap()
-                .host,
+                .host(),
             "*.xn--bcher-kva.example"
         );
     }
@@ -552,7 +581,7 @@ mod tests {
         assert_eq!(
             canonicalize_host_pattern("[::ffff:127.0.0.1]")
                 .unwrap()
-                .host,
+                .host(),
             "127.0.0.1"
         );
         assert_eq!(h("[::ffff:7f00:2]"), "127.0.0.2");
@@ -563,8 +592,8 @@ mod tests {
     #[test]
     fn ports_parsed_and_matched() {
         let c = canonicalize_host("Evil.com.:0443").unwrap();
-        assert_eq!((c.host.as_str(), c.port), ("evil.com", Some(443)));
-        assert_eq!(canonicalize_host("[::1]:08080").unwrap().port, Some(8080));
+        assert_eq!((c.host(), c.port()), ("evil.com", Some(443)));
+        assert_eq!(canonicalize_host("[::1]:08080").unwrap().port(), Some(8080));
         assert!(canonicalize_host("evil.com:99999").is_err());
         assert!(canonicalize_host("evil.com:").is_err());
         assert!(canonicalize_host_pattern("evil.com:*").is_err());
@@ -573,5 +602,136 @@ mod tests {
         assert!(!port_matches(Some(443), None, "http"));
         assert!(!port_matches(Some(443), Some(8443), "https"));
         assert!(port_matches(Some(443), None, "gopher"));
+    }
+
+    /// RFC 3492 section 7.1 sample strings (Arabic, Chinese simplified and
+    /// traditional, Czech, Japanese, Russian, Spanish, mixed-case and
+    /// multi-code-point labels). Long inputs exercise bias adaptation and
+    /// damping after the first code point; expected strings cross-checked
+    /// against an independent encoder.
+    #[test]
+    fn punycode_rfc3492_vectors_decode() {
+        let vectors: &[(&str, &str)] = &[
+            (
+                "egbpdaj6bu4bxfgehfvwxn",
+                "\u{644}\u{64a}\u{647}\u{645}\u{627}\u{628}\u{62a}\u{643}\u{644}\u{645}\u{648}\u{634}\u{639}\u{631}\u{628}\u{64a}\u{61f}",
+            ),
+            (
+                "ihqwcrb4cv8a8dqg056pqjye",
+                "\u{4ed6}\u{4eec}\u{4e3a}\u{4ec0}\u{4e48}\u{4e0d}\u{8bf4}\u{4e2d}\u{6587}",
+            ),
+            (
+                "ihqwctvzc91f659drss3x8bo0yb",
+                "\u{4ed6}\u{5011}\u{7232}\u{4ec0}\u{9ebd}\u{4e0d}\u{8aaa}\u{4e2d}\u{6587}",
+            ),
+            (
+                "Proprostnemluvesky-uyb24dma41a",
+                "Pro\u{10d}prost\u{11b}nemluv\u{ed}\u{10d}esky",
+            ),
+            (
+                "4dbcagdahymbxekheh6e0a7fei0b",
+                "\u{5dc}\u{5de}\u{5d4}\u{5d4}\u{5dd}\u{5e4}\u{5e9}\u{5d5}\u{5d8}\u{5dc}\u{5d0}\u{5de}\u{5d3}\u{5d1}\u{5e8}\u{5d9}\u{5dd}\u{5e2}\u{5d1}\u{5e8}\u{5d9}\u{5ea}",
+            ),
+            (
+                "n8jok5ay5dzabd5bym9f0cm5685rrjetr6pdxa",
+                "\u{306a}\u{305c}\u{307f}\u{3093}\u{306a}\u{65e5}\u{672c}\u{8a9e}\u{3092}\u{8a71}\u{3057}\u{3066}\u{304f}\u{308c}\u{306a}\u{3044}\u{306e}\u{304b}",
+            ),
+            (
+                "b1abfaaepdrnnbgefbadotcwatmq2g4l",
+                "\u{43f}\u{43e}\u{447}\u{435}\u{43c}\u{443}\u{436}\u{435}\u{43e}\u{43d}\u{438}\u{43d}\u{435}\u{433}\u{43e}\u{432}\u{43e}\u{440}\u{44f}\u{442}\u{43f}\u{43e}\u{440}\u{443}\u{441}\u{441}\u{43a}\u{438}",
+            ),
+            (
+                "PorqunopuedensimplementehablarenEspaol-fmd56a",
+                "Porqu\u{e9}nopuedensimplementehablarenEspa\u{f1}ol",
+            ),
+            (
+                "3B-ww4c5e180e575a65lsy2b",
+                "3\u{5e74}B\u{7d44}\u{91d1}\u{516b}\u{5148}\u{751f}",
+            ),
+            (
+                "-with-SUPER-MONKEYS-pc58ag80a8qai00g7n9n",
+                "\u{5b89}\u{5ba4}\u{5948}\u{7f8e}\u{6075}-with-SUPER-MONKEYS",
+            ),
+            (
+                "Hello-Another-Way--fc4qua05auwb3674vfr0b",
+                "Hello-Another-Way-\u{305d}\u{308c}\u{305e}\u{308c}\u{306e}\u{5834}\u{6240}",
+            ),
+            (
+                "2-u9tlzr9756bt3uc0v",
+                "\u{3072}\u{3068}\u{3064}\u{5c4b}\u{6839}\u{306e}\u{4e0b}2",
+            ),
+            (
+                "MajiKoi5-783gue6qz075azm5e",
+                "Maji\u{3067}Koi\u{3059}\u{308b}5\u{79d2}\u{524d}",
+            ),
+            (
+                "de-jg4avhby1noc0d",
+                "\u{30d1}\u{30d5}\u{30a3}\u{30fc}de\u{30eb}\u{30f3}\u{30d0}",
+            ),
+            (
+                "eckwd4c7cu47r2wf",
+                "\u{30c9}\u{30e1}\u{30a4}\u{30f3}\u{540d}\u{4f8b}",
+            ),
+            ("evil-3raa", "evil\u{fc}\u{fc}"),
+            ("bcher-kva", "b\u{fc}cher"),
+            (
+                "989aomsvi5e83db1d2a355cv1e0vak1dwrv93d5xbh15a0dt30a5jpsd879ccm6fea98c",
+                "\u{c138}\u{acc4}\u{c758}\u{baa8}\u{b4e0}\u{c0ac}\u{b78c}\u{b4e4}\u{c774}\u{d55c}\u{ad6d}\u{c5b4}\u{b97c}\u{c774}\u{d574}\u{d55c}\u{b2e4}\u{ba74}\u{c5bc}\u{b9c8}\u{b098}\u{c88b}\u{c744}\u{ae4c}",
+            ),
+        ];
+        for (encoded, unicode) in vectors {
+            assert_eq!(
+                punycode_decode(encoded).as_deref(),
+                Some(*unicode),
+                "{encoded}"
+            );
+        }
+    }
+
+    #[test]
+    fn punycode_decode_fails_closed() {
+        // Invalid digit, truncated final digit, non-ASCII basic part.
+        assert_eq!(punycode_decode("bcher-kv!"), None);
+        assert_eq!(punycode_decode("bcher-kv"), None);
+        assert_eq!(punycode_decode("b\u{fc}-kva"), None);
+        // Overflow of the delta accumulator must return None, never panic.
+        assert_eq!(punycode_decode(&"9".repeat(40)), None);
+        assert_eq!(punycode_decode(&"z".repeat(40)), None);
+        // Code point beyond the Unicode range / surrogate.
+        assert_eq!(punycode_decode("99999999"), None);
+    }
+
+    #[test]
+    fn unicode_form_via_the_canonical_host() {
+        let c = canonicalize_host("xn--evil-3raa.com").unwrap();
+        assert_eq!(c.unicode_form().as_deref(), Some("evil\u{fc}\u{fc}.com"));
+    }
+
+    #[test]
+    fn egress_host_keeps_only_an_explicit_non_default_port() {
+        let host = |u: &str| egress_host(&reqwest::Url::parse(u).unwrap());
+        assert_eq!(
+            host("https://evil.invalid:8443/x").as_deref(),
+            Some("evil.invalid:8443")
+        );
+        assert_eq!(
+            host("http://evil.invalid:8080/").as_deref(),
+            Some("evil.invalid:8080")
+        );
+        // The URL parser drops an explicit scheme-default port; the engine
+        // re-applies the default from the action's scheme.
+        assert_eq!(
+            host("https://evil.invalid:443/").as_deref(),
+            Some("evil.invalid")
+        );
+        assert_eq!(
+            host("http://evil.invalid/").as_deref(),
+            Some("evil.invalid")
+        );
+        assert_eq!(
+            host("http://[::ffff:127.0.0.1]:9/").as_deref(),
+            Some("[::ffff:7f00:1]:9")
+        );
+        assert_eq!(host("http://[::1]:9/").as_deref(), Some("[::1]:9"));
     }
 }
