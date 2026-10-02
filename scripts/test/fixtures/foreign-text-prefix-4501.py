@@ -1,4 +1,11 @@
 #!/usr/bin/env python3
+# FROZEN VERBATIM pre-#4501 copy of scripts/check-foreign-text-to-caller.py (385da3a05), the R-203
+# control for the ROOT-DERIVATION fix: its self-test leg must MISS the handler and the layer that the
+# fixture installs through rustfmt-WRAPPED `get(..)` / `from_fn_with_state(..)` calls, because its
+# root patterns required the handler to be the last token before `)` on one line. In the real tree
+# that silence covered src/handlers/transport.rs::api_key_auth, authority_layer and the refusal
+# subtree beneath them. Never edit; replace only with a newer frozen prefix when the next defect
+# class lands.
 # check-foreign-text-to-caller.py — #3688 gate 7: FOREIGN TEXT CROSSING TO A CALLER.
 #
 # The rule keys on two properties of a VALUE, neither of which is a name:
@@ -239,58 +246,13 @@ def analyze(ROOT, ALLOWF='', VERBOSE=False, ONLY=None, DUMP_DERIVED=False):
     lib = files.get('src/lib.rs')
     if lib:
         t = lib['text']
-        # 2026-10-02 (#4501, GOD ai:god-zsg): take the handler out of the call's BALANCED argument
-        # list, not out of a single-line regex. The old patterns required the handler to be the last
-        # argument with no trailing comma and, for from_fn_with_state, a first argument free of
-        # parens -- so rustfmt's wrapped form
-        #     .layer(axum::middleware::from_fn_with_state(
-        #         api_key_state,
-        #         handlers::api_key_auth,
-        #     ))
-        # matched NOTHING and `api_key_auth` was not a root. Everything below it left the gate's
-        # scope with it: the whole transport refusal subtree (json_rejection_to_400, backoff_refusal,
-        # record_auth_failure) and the route-gate layers. MEASURED: the same db-error render planted
-        # in api_key_auth read 0 FAIL, while that identical plant in a derived fn (health) read 1
-        # FAIL. A formatter must not be able to change what a gate looks at.
-        def _path_args(txt, open_paren_idx):
-            end = find_matching(txt, open_paren_idx, '(', ')')
-            if end < 0: return []
-            # split on TOP-LEVEL commas only; split_args is defined further down in analyze()
-            # One splitting rule in this file: angle brackets count, the operators that carry a
-            # lone angle character are blanked in a same-length depth shadow first (see split_args).
-            # Measured on from_fn_with_state(build(|x| -> Result<u8, String> { .. }), handler,): with
-            # a naive angle count this yielded NO arguments and lost the handler -- the same
-            # fail-open shape the root fix exists to remove.
-            seg = txt[open_paren_idx+1:end]
-            shadow = seg
-            for _op in ('->', '=>', '<=', '>=', '<<', '>>'):
-                shadow = shadow.replace(_op, '  ')
-            args, depth, cur = [], 0, ''
-            for _i, ch in enumerate(seg):
-                sch = shadow[_i]
-                if sch in '([{<': depth += 1
-                elif sch in ')]}>': depth -= 1
-                if ch == ',' and depth == 0:
-                    args.append(cur); cur = ''
-                else:
-                    cur += ch
-            args.append(cur)
-            out = []
-            for arg in args:
-                a = arg.strip()
-                if re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)*', a):
-                    out.append(last_seg(a))          # a bare path: a handler or a state binding;
-            return out                               # a state binding simply never matches a fn name
         for m in re.finditer(r'\.route\s*\(', t):
             e = find_matching(t, m.end()-1, '(', ')')
             if e < 0: continue
-            seg = t[m.end():e]
-            for hm in re.finditer(r'\b(?:get|post|put|delete|patch|head|options|any|trace)\s*\(', seg):
-                for nm in _path_args(seg, hm.end()-1):
-                    HTTP_ROOTS.add(nm)
-        for hm in re.finditer(r'\bfrom_fn(?:_with_state)?\s*\(', t):
-            for nm in _path_args(t, hm.end()-1):
-                HTTP_ROOTS.add(nm)
+            for hm in re.finditer(r'\b(?:get|post|put|delete|patch|head|options|any|trace)\s*\(\s*([A-Za-z_][A-Za-z0-9_:]*)\s*\)', t[m.end():e]):
+                HTTP_ROOTS.add(last_seg(hm.group(1)))
+        for hm in re.finditer(r'\bfrom_fn(?:_with_state)?\s*\(\s*(?:[^,()]+,\s*)?([A-Za-z_][A-Za-z0-9_:]*)\s*\)', t):
+            HTTP_ROOTS.add(last_seg(hm.group(1)))
     mcp = files.get('src/mcp/mod.rs')
     if mcp:
         for hm in re.finditer(r'register_mcp_tool!\s*\(\s*[^,]+,\s*([A-Za-z_][A-Za-z0-9_:]*)\s*\)', mcp['text']):
@@ -520,21 +482,9 @@ def analyze(ROOT, ALLOWF='', VERBOSE=False, ONLY=None, DUMP_DERIVED=False):
             if i not in KEYWORDS: ids.add(i)
         return ids
 
-    # 2026-10-02 (#4501): depth must count angle brackets -- `HashMap<String, Value>` carries a
-    # top-level-looking comma that is not one -- but must NOT be skewed by the operators that contain
-    # a lone angle character. `->`, `=>`, `<=`, `>=`, `<<`, `>>` are blanked in a same-length SHADOW
-    # of the string used only for depth, so `code_of(|c| -> Result<i64, String> { .. }), e.to_string()`
-    # splits correctly while generics stay balanced. Measured both ways: dropping angle brackets
-    # entirely fixed the arrow case and silently LOST two mcp-result sinks (2890 -> 2888) where a
-    # comma inside generics split a json value into fragments; this keeps 2890 and fixes the arrow.
-    def _depth_shadow(s):
-        for op in ('->', '=>', '<=', '>=', '<<', '>>'):
-            s = s.replace(op, '  ')
-        return s
     def split_args(s):
         parts = []; depth = 0; cur = []; in_s = False; esc = False
-        shadow = _depth_shadow(s)
-        for i, c in enumerate(s):
+        for c in s:
             if in_s:
                 cur.append(c)
                 if esc: esc = False
@@ -542,21 +492,11 @@ def analyze(ROOT, ALLOWF='', VERBOSE=False, ONLY=None, DUMP_DERIVED=False):
                 elif c == '"': in_s = False
                 continue
             if c == '"': in_s = True; cur.append(c); continue
-            sc = shadow[i]
-            if sc in '([{<': depth += 1
-            elif sc in ')]}>': depth -= 1
+            if c in '([{<': depth += 1
+            elif c in ')]}>': depth -= 1
             if c == ',' and depth == 0: parts.append(''.join(cur)); cur = []
             else: cur.append(c)
         if cur: parts.append(''.join(cur))
-        # 2026-10-02 (#4501, reviewer-f2r): a rustfmt TRAILING COMMA leaves a whitespace-only final
-        # part, and the sinks that judge `args[-1]` (S2 err_response at the rpc/http boundary, and
-        # the mapper walk) then judged that whitespace instead of the argument. Measured on the gate
-        # verbatim: "\n id,\n jsonrpc::INTERNAL_ERROR,\n e.to_string(),\n " splits to
-        # [... 'e.to_string()', '\n '], so src/mcp/mod.rs::handle_request -- which IS in the derived
-        # set -- read rc 0 wrapped and rc 1 FAIL collapsed to one line. src/mcp/mod.rs alone carries
-        # twelve wrapped err_response(..) calls with a trailing comma. A whitespace-only part is not
-        # an argument; Rust has no empty argument, so dropping them cannot lose a real one.
-        parts = [q for q in parts if q.strip()]
         return [p.strip() for p in parts]
 
     # ----------------------------------------------------------- binding resolver
@@ -1945,30 +1885,6 @@ pub fn build_router() -> axum::Router {
         .route(handlers::routes::DETAIL, get(handlers::coord::detail_key_render).delete(handlers::coord::detail_key_render))
         .route(handlers::routes::KEYS, get(handlers::coord::resolved_path_render))
         .layer(axum::middleware::from_fn_with_state(state, handlers::coord::gate_layer))
-        // #4501 — the rustfmt-WRAPPED forms. These are what rustfmt produces as soon as the call
-        // passes the width limit, and they are how src/lib.rs really installs the auth middleware.
-        // The pre-fix root derivation matched NEITHER (the route handler is not the last token
-        // before `)`, and the from_fn_with_state state argument spans lines and carries parens), so
-        // both handlers below were outside the gate's scope entirely.
-        .route(
-            handlers::routes::WRAPPED,
-            get(
-                handlers::coord::wrapped_route_handler,
-            ),
-        )
-        .layer(axum::middleware::from_fn_with_state(
-            handlers::coord::WrappedLayerState {
-                app: app_state.clone(),
-            },
-            handlers::coord::wrapped_layer,
-        ))
-        // #4501 — the state argument carries a closure with an explicit `-> Result<..>` return
-        // type: the '>' has no matching '<'. Any depth counter that treats angle brackets as
-        // brackets loses the handler here.
-        .layer(axum::middleware::from_fn_with_state(
-            build_state(|probe| -> Result<u8, String> { Ok(probe) }),
-            handlers::coord::wrapped_arrow_layer,
-        ))
 }
 ''')
     _write(root, 'src/mcp/mod.rs', '''
@@ -2056,71 +1972,12 @@ async fn unrouted_leak(app: AppState) -> Response {
     }
     (StatusCode::OK, Json(json!({"ok": true}))).into_response()
 }
-// #4501 T1 — a handler installed through a rustfmt-WRAPPED `get(..)` is a sink.
-async fn wrapped_route_handler(app: AppState) -> Response {
-    if let Err(e) = app.store.get(&ctx, "wrapped").await {
-        return (StatusCode::CONFLICT, Json(json!({"error": e.to_string()}))).into_response();
-    }
-    (StatusCode::OK, Json(json!({"ok": true}))).into_response()
-}
-// #4501 T1 — installed through a wrapped from_fn_with_state whose state argument contains a
-// closure with an explicit `-> Result<..>` return type (the unmatched '>' case).
-async fn wrapped_arrow_layer(req: Request, next: Next) -> Response {
-    if let Err(e) = app.store.get(&ctx, "arrow").await {
-        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": format!("arrow: {e}")}))).into_response();
-    }
-    next.run(req).await
-}
-// #4501 T1 — a layer installed through a rustfmt-WRAPPED `from_fn_with_state(..)` is a sink.
-async fn wrapped_layer(req: Request, next: Next) -> Response {
-    if let Err(e) = app.store.get(&ctx, "wrapped-layer").await {
-        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": format!("layer: {e}")}))).into_response();
-    }
-    next.run(req).await
-}
 // T1 — a middleware layer the router installs is a sink too (#3760)
 async fn gate_layer(req: Request, next: Next) -> Response {
     if let Err(e) = app.store.get(&ctx, "gate").await {
         return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": format!("gate: {e}")}))).into_response();
     }
     next.run(req).await
-}
-''')
-    _write(root, 'src/mcp/tools/fence.rs', '''
-// #4501 — the S2 err_response sink, in the three layouts that decide whether args[-1] is the
-// message or an artefact of formatting. All three render db text to the caller and must FAIL.
-fn err_response(id: Value, code: i64, message: String) -> RpcResponse {
-    RpcResponse::error(id, code, message)
-}
-fn wrapped_fence(conn: &rusqlite::Connection, id: Value) -> Result<Value, String> {
-    if let Err(e) = db::get(conn, "x") {
-        // rustfmt's own layout: the TRAILING COMMA left a whitespace-only final part, so the
-        // pre-fix gate judged that whitespace and never looked at the message.
-        return Ok(err_response(
-            id,
-            jsonrpc::INTERNAL_ERROR,
-            e.to_string(),
-        ).into());
-    }
-    Ok(json!({"ok": true}))
-}
-fn oneline_fence(conn: &rusqlite::Connection, id: Value) -> Result<Value, String> {
-    // CONTROL — the same call collapsed: caught before the fix as well, so the wrapped row's
-    // silence was the defect and not a gate that cannot see this shape at all.
-    if let Err(e) = db::get(conn, "x") { return Ok(err_response(id, jsonrpc::INTERNAL_ERROR, e.to_string()).into()); }
-    Ok(json!({"ok": true}))
-}
-fn arrow_args_fence(conn: &rusqlite::Connection, id: Value) -> Result<Value, String> {
-    if let Err(e) = db::get(conn, "x") {
-        // An argument carrying a closure with an explicit `-> Result<..>` type: the unmatched '>'
-        // skewed the depth counter and moved args[-1] off the message.
-        return Ok(err_response(
-            id,
-            code_of(|c| -> Result<i64, String> { Ok(c) }),
-            e.to_string(),
-        ).into());
-    }
-    Ok(json!({"ok": true}))
 }
 ''')
     _write(root, 'src/cli/report.rs', '''
@@ -2191,45 +2048,6 @@ def self_test(scratch):
     expect(not has('src/handlers/import.rs', ':unrouted_leak:'), '#3760 DERIVATION CONTROL: the same leak in a response-shaped fn nothing routes or reaches is NOT a sink (dead code) — the set is derived, not a path prefix')
     expect(has('src/handlers/import.rs', ':resolved_path_render:http-body:path'), '#3760 / #3713: a std::fs::canonicalize-RESOLVED operator path under a non-"error" key in a routed handler is RED (the resolver is a path producer, not our normaliser)')
     expect(has('src/handlers/import.rs', ':gate_layer:http-body:db'), '#3760: a middleware layer the router installs (from_fn_with_state) is a derived sink')
-    # #4501 — formatting must not change the scope. Before the root-derivation fix both of these read
-    # CLEAN, and so did everything the wrapped layer reaches: in the real tree that was api_key_auth,
-    # authority_layer and the transport refusal subtree under them. Measured there with a positive
-    # control: the same planted db render was 0 FAIL in api_key_auth and 1 FAIL in a derived fn.
-    expect(has('src/handlers/import.rs', ':wrapped_layer:http-body:db'), '#4501: a layer installed through a rustfmt-WRAPPED from_fn_with_state(..) is a derived sink')
-    expect(has('src/handlers/import.rs', ':wrapped_route_handler:http-body:db'), '#4501: a handler installed through a rustfmt-WRAPPED get(..) is a derived sink')
-    expect(has('src/handlers/import.rs', ':wrapped_arrow_layer:http-body:db'), '#4501: the handler survives a state argument containing a closure with an explicit `-> Result<..>` type (unmatched \'>\' must not skew the argument split)')
-    # #4501 — the --dump-derived audit must actually print the scope, including a wrapped-install
-    # handler and the blind-spot section. A dump nobody tests is a dump that can quietly go empty.
-    import contextlib, io as _io
-    _buf = _io.StringIO()
-    with contextlib.redirect_stdout(_buf):
-        analyze(root, ALLOWF='/dev/null', DUMP_DERIVED=True)
-    _dump = _buf.getvalue()
-    expect('== DERIVED SCOPE' in _dump and '== BLIND SPOT' in _dump, '#4501: --dump-derived prints the derived scope and the blind-spot section')
-    expect('wrapped_layer' in _dump and 'wrapped_route_handler' in _dump, '#4501: the dump names the handlers installed through the wrapped calls')
-    expect('unrouted_leak' in _dump.split('== BLIND SPOT')[1], '#4501: the dump lists the unrouted response-shaped fn as a BLIND SPOT, so what the gate did not look at is readable')
-    # #4501 (reviewer-f2r's root cause) — the S2 sink judges args[-1], and a rustfmt TRAILING COMMA
-    # left a whitespace-only final part there, so the message expression was never examined. Measured
-    # on real code in both directions: src/mcp/mod.rs::handle_request with `e.to_string()` in the
-    # wrapped fence read 0 FAIL and 1 FAIL collapsed to one line; after the fix, both read 1 FAIL.
-    expect(has('src/mcp/tools/fence.rs', ':wrapped_fence:rpc-error:db'), '#4501: err_response(..) with a rustfmt TRAILING COMMA still judges the message, not the whitespace after it (f2r)')
-    expect(has('src/mcp/tools/fence.rs', ':oneline_fence:rpc-error:db'), '#4501 CONTROL: the same call on one line FAILs too, so the wrapped row\'s silence was the defect')
-    expect(has('src/mcp/tools/fence.rs', ':arrow_args_fence:rpc-error:db'), '#4501: an argument carrying `|c| -> Result<..>` does not move args[-1] off the message (unmatched \'>\')')
-    # R-203 for #4501 — the FROZEN pre-fix gate must MISS both wrapped installations, so the two
-    # expectations above are load-bearing rather than tautological, and must still catch the
-    # single-line layer, so its silence is the defect and not a broken run.
-    prefix_4501 = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'test', 'fixtures', 'foreign-text-prefix-4501.py')
-    try:
-        import subprocess
-        out = subprocess.run([sys.executable, prefix_4501, root, '--allowlist=/dev/null', '--json'], capture_output=True, text=True, timeout=600).stdout
-        frozen_4501 = {x['key'] for x in json.loads(out)['findings'] if x['sev'] == 'FAIL'}
-        expect(not any(':wrapped_layer:' in k for k in frozen_4501), 'R-203: the FROZEN pre-#4501 gate MISSES the rustfmt-wrapped from_fn_with_state layer — the defect reproduces')
-        expect(not any(':wrapped_route_handler:' in k for k in frozen_4501), 'R-203: the FROZEN pre-#4501 gate MISSES the rustfmt-wrapped get(..) handler — the defect reproduces')
-        expect(any(':gate_layer:http-body:db' in k for k in frozen_4501), 'R-203 sanity: the frozen gate still flags the SINGLE-LINE layer, so its silence on the wrapped ones is the defect, not a broken run')
-        expect(not any(':wrapped_fence:' in k for k in frozen_4501), 'R-203: the FROZEN pre-#4501 gate MISSES the trailing-comma err_response message — f2r\'s root cause reproduces')
-        expect(any(':oneline_fence:rpc-error:db' in k for k in frozen_4501), 'R-203 sanity: the frozen gate flags the one-line twin, so its silence on the trailing-comma form is the defect')
-    except (OSError, ValueError, KeyError, subprocess.TimeoutExpired) as ex:
-        expect(False, f'R-203: frozen pre-#4501 gate could not be run ({ex})')
     expect(has('src/mcp/tools/relay.rs', ':status_payload:mcp-result:db'), '#3760: a driver error carried in an Ok RESULT payload under a non-error key is RED (key-agnostic result walk)')
     expect(counts.get('derived:http_roots', 0) >= 3 and counts.get('derived:mcp_roots', 0) >= 10, f"#3760 CONTROL: the roots were DERIVED from the fixture router / dispatch table (http {counts.get('derived:http_roots', 0)}, mcp {counts.get('derived:mcp_roots', 0)})")
     prefix_3760 = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'test', 'fixtures', 'foreign-text-prefix-3760.py')
