@@ -2182,17 +2182,35 @@ impl MemoryStore for SqliteStore {
         // governance standard. Owner read + upsert in ONE WriteTxn (the #3237
         // item 5 TOCTOU discipline of the CLEAR twin).
         let write_txn = crate::storage::connection::WriteTxn::begin(&conn).map_err(box_err)?;
-        if !ctx.bypass_visibility {
-            let binding = db::namespace_standard_binding(&conn, namespace).map_err(box_err)?;
-            crate::store::authorize_namespace_standard_mutation(
-                ctx,
-                namespace,
-                &binding,
-                crate::store::NamespaceStandardOp::Set,
-            )?;
-        }
-        db::set_namespace_standard(&conn, namespace, standard_id, parent).map_err(box_err)?;
+        // #4356 — plus the ancestor-owner gate on a first bind (shared verdict).
+        crate::storage::ns_standard_ancestor::set_admission_conn(
+            &conn,
+            ctx.effective_principal(),
+            ctx.bypass_visibility,
+            namespace,
+        )
+        .map_err(|r| crate::store::set_refusal_to_store_err(r, namespace))?;
+        db::set_namespace_standard(&conn, namespace, standard_id, parent).map_err(|e| {
+            // #4492 — the bind-time chain-depth refusal is typed input, not a
+            // backend fault (byte-identical to the postgres adapter).
+            if crate::storage::bind_chain_depth::is_bind_chain_over_depth(&e) {
+                StoreError::InvalidInput {
+                    detail: crate::governance::bind_chain_depth::BIND_CHAIN_OVER_DEPTH.to_string(),
+                }
+            } else {
+                box_err(e)
+            }
+        })?;
         write_txn.commit().map_err(box_err)
+    }
+
+    async fn namespace_governing_ancestor(
+        &self,
+        namespace: &str,
+    ) -> StoreResult<crate::ns_standard_ancestor::GoverningAncestor> {
+        let conn = self.state.lock().await;
+        crate::storage::ns_standard_ancestor::governing_ancestor_binding(&conn, namespace)
+            .map_err(box_err)
     }
 
     async fn clear_namespace_standard(
@@ -3203,7 +3221,16 @@ impl MemoryStore for SqliteStore {
         namespace: &str,
     ) -> StoreResult<Option<crate::models::GovernancePolicy>> {
         let conn = self.state.lock().await;
-        Ok(db::resolve_governance_policy(&conn, namespace))
+        // #4043 — a read fault propagates (postgres parity); it is never `None`.
+        db::resolve_governance_policy(&conn, namespace).map_err(box_err)
+    }
+
+    async fn resolve_require_approval_above_depth(
+        &self,
+        namespace: &str,
+    ) -> StoreResult<Option<u32>> {
+        let conn = self.state.lock().await;
+        db::resolve_require_approval_above_depth(&conn, namespace).map_err(box_err)
     }
 
     async fn governance_approve_with_consensus(

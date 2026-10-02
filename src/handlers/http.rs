@@ -293,8 +293,9 @@ pub(crate) async fn try_enqueue_auto_atomise(
     // only, never an LLM call (the whole point of the deferral).
     let (configured, max_atom_tokens, db_path) = {
         let lock = app.db.lock().await;
+        // #4043 — optional feature knob: an unreadable policy leaves it OFF.
         let policy =
-            crate::storage::resolve_governance_policy(&lock.0, namespace).unwrap_or_default();
+            crate::storage::resolve_governance_policy_for_optional_feature(&lock.0, namespace);
         (
             policy.effective_auto_atomise_mode(),
             policy.effective_auto_atomise_max_atom_tokens(),
