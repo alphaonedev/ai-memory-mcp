@@ -17,9 +17,16 @@
 //! pinned by `asi-hard`.
 //!
 //! # What it does NOT promise
-//! - The write that DISCOVERS the outage has already committed (every
-//!   `audit::emit` runs after the durable write). It is the one counted,
-//!   unaudited write per outage per process.
+//! - Every `audit::emit` runs after its durable write, so a write that was
+//!   already past the gate when the trail failed still commits and fails its
+//!   own append. That is at most one unaudited write per write IN FLIGHT when
+//!   the trail fails (one for a sequential caller; up to the number of
+//!   concurrent requests on `serve`), each counted.
+//! - A failed retry (see below) is itself a failed append: it consumes a
+//!   sequence number and is counted in `ai_memory_audit_write_failures_total`.
+//!   During a latched outage the lost-event count and the `audit verify`
+//!   sequence gaps therefore grow by about one per second from retries alone,
+//!   not from client events.
 //! - A one-shot CLI process cannot latch before its single write; it relies on
 //!   the #3651 boot refusal when the trail cannot initialise.
 //! - This is the flat SIEM trail (`src/audit.rs`), not the `signed_events` or
