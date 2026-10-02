@@ -399,6 +399,13 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Run CI-job-claims gate
         run: bash scripts/check-ci-job-claims.sh
+      - name: Release feature-set guard (#4480)
+        # The release build, the assert pin, the release-shaped proof job and
+        # the INSTALL "pre-built binaries" claim all follow the one declaration
+        # in scripts/release-features.sh (sal-postgres ships).
+        run: bash scripts/check-release-features.sh
+      - name: Release feature-set guard self-test (a broken declaration must fail the build, #4480)
+        run: bash scripts/check-release-features.sh --self-test
       - name: Self-test the gate (regression evidence)
         # Plants all four historical claims. The C-31 leg is the
         # load-bearing one: the workflow EXISTS and its job EXISTS, so
