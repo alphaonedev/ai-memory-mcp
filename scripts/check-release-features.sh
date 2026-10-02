@@ -81,6 +81,10 @@ if [[ ! -f "$dockerfile" ]]; then
 else
   grep -E 'cargo build' "$dockerfile" | grep -q 'scripts/release-features.sh' \
     || bad "Dockerfile cargo build does not read scripts/release-features.sh"
+  grep -E 'cargo build' "$dockerfile" | grep -q -- '--locked' \
+    || bad "Dockerfile cargo build does not use --locked (#2895)"
+  grep -q '^COPY Cargo.toml Cargo.lock' "$dockerfile" \
+    || bad "Dockerfile does not COPY Cargo.lock before the build"
   grep -q 'release-features.sh --require-flags' "$dockerfile" \
     || bad "Dockerfile assert step does not use 'release-features.sh --require-flags'"
   grep -q 'COPY scripts/release-features.sh' "$dockerfile" \

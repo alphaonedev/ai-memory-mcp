@@ -54,9 +54,11 @@ COPY vendor/ vendor/
 # binaries: it is built with the feature set declared ONCE in
 # scripts/release-features.sh (sal,sal-postgres: PostgreSQL + AGE + pgvector,
 # sqlx on rustls, no libpq / system OpenSSL at runtime) and asserts the same set.
+# --locked (#2895): build against the COMMITTED Cargo.lock (copied above), never
+# a silently re-resolved dependency.
 COPY scripts/assert-compiled-features.sh scripts/assert-compiled-features.sh
 COPY scripts/release-features.sh scripts/release-features.sh
-RUN cargo build --release --features "$(bash scripts/release-features.sh)" \
+RUN cargo build --locked --release --features "$(bash scripts/release-features.sh)" \
     && strip target/release/ai-memory \
     && bash scripts/assert-compiled-features.sh target/release/ai-memory \
          $(bash scripts/release-features.sh --require-flags)
