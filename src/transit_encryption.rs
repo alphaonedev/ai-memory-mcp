@@ -390,11 +390,24 @@ pub enum SslmodeFloor {
     },
     /// Not a DSN the drivers parse.
     Unparseable,
+    /// #4434 - the DSN TEXT looks pinned but the DRIVER resolves a weaker
+    /// `sslmode` from it (key aliases, key letter case, percent-encoded or
+    /// tab/newline-split keys, a fragment, the `PGSSLMODE` fallback). Only
+    /// produced by the parsed-options verdict ([`dsn_floor_verdict`]).
+    DriverResolved {
+        /// The host the driver would dial.
+        host: String,
+        /// The sslmode the driver resolved (a fixed driver label, never DSN text).
+        resolved: String,
+    },
 }
 
-/// Evaluate the floor for `dsn` — see [`SslmodeFloor`].
+/// The TEXT reading of the floor for `dsn` - see [`SslmodeFloor`]. It is only
+/// the cheap first screen of [`dsn_floor_verdict`]: the DSN text is NOT what
+/// the driver uses (#4434), so nothing outside this module may decide from
+/// it alone.
 #[must_use]
-pub fn dsn_sslmode_floor(dsn: &str) -> SslmodeFloor {
+pub(crate) fn dsn_sslmode_floor(dsn: &str) -> SslmodeFloor {
     let host = match dsn_transport(dsn) {
         DsnTransport::Tcp { host } => host,
         DsnTransport::UnixSocket { dir } => return SslmodeFloor::UnixSocket { dir },
@@ -418,15 +431,37 @@ pub fn dsn_sslmode_floor(dsn: &str) -> SslmodeFloor {
     }
 }
 
-/// Whether a PostgreSQL DSN pins `sslmode=verify-full` ON A TCP TRANSPORT.
-/// Shared by the connect funnel (the floor), the enterprise posture (check
-/// #15) and doctor. #3866: a Unix-socket DSN is `false` whatever its query
-/// string says — TLS does not run on a socket; the three consumers render
-/// the transport via [`dsn_sslmode_floor`] rather than guessing from this
-/// bool.
+/// Whether the DRIVER will connect to a PostgreSQL DSN with
+/// `sslmode=verify-full` ON A TCP TRANSPORT: `true` iff
+/// [`dsn_floor_verdict`] is [`SslmodeFloor::Pinned`]. The enterprise posture
+/// (check #15) and every other consumer read the same verdict the connect
+/// funnel enforces (#4434); a Unix-socket DSN is `false` whatever its query
+/// string says (#3866).
 #[must_use]
 pub fn dsn_pins_sslmode_verify_full(dsn: &str) -> bool {
-    matches!(dsn_sslmode_floor(dsn), SslmodeFloor::Pinned { .. })
+    matches!(dsn_floor_verdict(dsn), SslmodeFloor::Pinned { .. })
+}
+
+/// THE floor decision for a PostgreSQL DSN (#3705 / #3866 / #4434), shared by
+/// the connect funnel (`store::postgres::dsn::floored_connect_options`),
+/// doctor's Transit-encryption section and enterprise posture check #15, so a
+/// report can never say "pinned" for a DSN the connect refuses.
+///
+/// With `sal-postgres` it is the text screen followed by a check of the
+/// options the sqlx driver PARSES from the DSN (sslmode must resolve to
+/// `verify-full`, transport must be TCP). Without `sal-postgres` there is no
+/// postgres connect path in the binary, and the text screen is the only
+/// reading available.
+#[must_use]
+pub fn dsn_floor_verdict(dsn: &str) -> SslmodeFloor {
+    #[cfg(feature = "sal-postgres")]
+    {
+        crate::store::postgres::dsn::floor_verdict(dsn)
+    }
+    #[cfg(not(feature = "sal-postgres"))]
+    {
+        dsn_sslmode_floor(dsn)
+    }
 }
 
 /// The refusal for a PostgreSQL DSN whose transport is a Unix-domain socket
@@ -472,20 +507,24 @@ pub fn pg_sslmode_refusal() -> String {
     )
 }
 
-/// The single decision "may a PostgreSQL socket be opened for this DSN at
-/// all" (#3705 / #3866 / #4333): `None` when the DSN pins
-/// `sslmode=verify-full` on a TCP transport, otherwise the refusal text
-/// (never echoing the DSN). Every production PostgreSQL connect - the store
-/// funnel AND every doctor / CLI probe - asks this one function through
-/// `store::postgres::dsn::floored_connect_options`, so no path can open a
-/// session below the floor.
+/// The operator-facing refusal for a floor verdict, `None` for
+/// [`SslmodeFloor::Pinned`]. Never echoes the DSN. Takes the typed verdict so
+/// the text and the decision cannot drift (#4434).
 #[must_use]
-pub fn pg_dsn_floor_refusal(dsn: &str) -> Option<String> {
-    match dsn_sslmode_floor(dsn) {
+pub fn pg_floor_refusal(verdict: &SslmodeFloor) -> Option<String> {
+    match verdict {
         SslmodeFloor::Pinned { .. } => None,
-        SslmodeFloor::UnixSocket { dir } => Some(pg_unix_socket_refusal(&dir)),
+        SslmodeFloor::UnixSocket { dir } => Some(pg_unix_socket_refusal(dir)),
         SslmodeFloor::Unparseable => Some(pg_dsn_unparseable_refusal()),
         SslmodeFloor::NotPinned { .. } => Some(pg_sslmode_refusal()),
+        SslmodeFloor::DriverResolved { resolved, .. } => Some(format!(
+            "{ISSUE_TAG}: refusing the PostgreSQL store DSN: the driver resolves \
+             sslmode={resolved} from it, not {PG_SSLMODE_FLOOR} (the driver, not the text of the \
+             query string, decides: key aliases, key letter case, percent-encoded keys, a \
+             fragment and the PGSSLMODE environment variable all change what it uses; #4434). \
+             Every row of memory would cross the socket unencrypted or to an unauthenticated \
+             server ({MANDATE}). Fix: {REMEDY_PG_SSLMODE}, spelled exactly `sslmode`."
+        )),
     }
 }
 

@@ -1317,7 +1317,7 @@ fn section_transit_encryption_3705(conn: Option<&rusqlite::Connection>) -> Repor
         }
         // #3866 — the transport is rendered, never inferred from the query
         // string: a Unix-socket DSN is refused at connect whatever it says.
-        Ok(Some(dsn)) => match transit_encryption::dsn_sslmode_floor(&dsn) {
+        Ok(Some(dsn)) => match transit_encryption::dsn_floor_verdict(&dsn) {
             transit_encryption::SslmodeFloor::Pinned { host } => {
                 format!("postgres over TCP ({host}): sslmode={PG_SSLMODE_FLOOR} pinned")
             }
@@ -1336,6 +1336,14 @@ fn section_transit_encryption_3705(conn: Option<&rusqlite::Connection>) -> Repor
             transit_encryption::SslmodeFloor::Unparseable => {
                 refuses.push("store URL".to_string());
                 "postgres: DSN not parseable by the driver — REFUSES at connect (#3866)".to_string()
+            }
+            // #4434 — the driver resolves a weaker sslmode than the text
+            // shows; this is the SAME verdict the connect funnel enforces.
+            transit_encryption::SslmodeFloor::DriverResolved { host, resolved } => {
+                refuses.push("store URL sslmode".to_string());
+                format!(
+                    "postgres over TCP ({host}): the driver resolves sslmode={resolved}, not {PG_SSLMODE_FLOOR} — REFUSES at connect (#4434)"
+                )
             }
         },
         Err(e) => format!("unresolvable: {e:#}"),
@@ -1972,7 +1980,7 @@ fn section_postgres_unstamped_owners_3124() -> Option<ReportSection> {
     // it is refused here and reported as the section's fact; no socket opens.
     let census: Result<crate::identity::owner_stamp::UnstampedCensus> =
         match crate::store::postgres::dsn::floored_connect_options(&url) {
-            Err(refused) => Err(anyhow::anyhow!("{refused}")),
+            Err(refused) => Err(anyhow::Error::new(refused)),
             Ok(options) => run_pg_probe(move || async move {
                 let probe = async {
                     let pool = sqlx::postgres::PgPoolOptions::new()

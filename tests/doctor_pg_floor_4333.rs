@@ -24,6 +24,25 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
+/// Every libpq environment variable sqlx 0.8.6 (or a future one) may read.
+const PG_ENV_VARS: &[&str] = &[
+    "PGSSLMODE",
+    "PGHOST",
+    "PGHOSTADDR",
+    "PGPORT",
+    "PGSSLROOTCERT",
+    "PGSSLCERT",
+    "PGSSLKEY",
+    "PGSERVICE",
+    "PGSERVICEFILE",
+    "PGUSER",
+    "PGPASSWORD",
+    "PGDATABASE",
+    "PGPASSFILE",
+    "PGOPTIONS",
+    "PGAPPNAME",
+];
+
 const SECRET: &str = "S3CRET-4333-pw";
 const REFUSAL_MARK: &str = "refusing the PostgreSQL store DSN";
 
@@ -92,8 +111,12 @@ fn doctor_json_env(
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::set_permissions(&keys, std::fs::Permissions::from_mode(0o700)).expect("chmod");
     }
-    let out = assert_cmd::Command::cargo_bin("ai-memory")
-        .expect("ai-memory binary")
+    let mut cmd = assert_cmd::Command::cargo_bin("ai-memory").expect("ai-memory binary");
+    // Hermetic: no ambient libpq variable may change what the driver resolves.
+    for var in PG_ENV_VARS {
+        cmd.env_remove(var);
+    }
+    let out = cmd
         .env("HOME", home)
         .env("AI_MEMORY_NO_CONFIG", "1")
         .env("AI_MEMORY_KEY_DIR", &keys)
@@ -167,6 +190,25 @@ fn assert_doctor_refused_without_connecting(
         identity.to_string().contains(REFUSAL_MARK),
         "the identity key-registry inspection must report the floor refusal: {identity}"
     );
+    assert_eq!(
+        identity["severity"]
+            .as_str()
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("warning"),
+        "a refused key-registry read is a Warning note: {identity}"
+    );
+
+    // #4434 - the Transit report decides with the SAME verdict as the connect:
+    // never "pinned" for a DSN the sections above refused.
+    let transit = section(&report, "Transit encryption");
+    let transit_text = transit.to_string();
+    assert!(
+        transit_text.contains("REFUSES at connect")
+            && !transit_text.contains("sslmode=verify-full pinned"),
+        "Transit must report REFUSES, not pinned, for {url:?}: {transit}"
+    );
+    assert!(is_critical(transit), "Transit must be critical: {transit}");
 
     assert_eq!(
         listener.accepted(),
@@ -231,9 +273,15 @@ fn doctor_refuses_the_parser_differential_dsns_without_connecting_4434() {
 fn floored_connect_options_refuses_the_parser_differential_dsns_4434() {
     use ai_memory::store::postgres::dsn::{FlooredConnectError, floored_connect_options};
     let mut not_refused = Vec::new();
-    for (kind, url) in bypass_urls(5432) {
+    // "fragment only" has no sslmode in the driver's view, so the ambient
+    // PGSSLMODE decides it; it runs in the env-scrubbed subprocess cells.
+    for (kind, url) in bypass_urls(5432)
+        .into_iter()
+        .filter(|(k, _)| *k != "fragment only")
+    {
         match floored_connect_options(&url) {
-            Err(FlooredConnectError::Refused(m)) => {
+            Err(refused @ FlooredConnectError::Refused(_)) => {
+                let m = refused.to_string();
                 assert!(m.contains(REFUSAL_MARK), "{kind}: {m}");
                 assert!(!m.contains(SECRET), "{kind}: refusal must not echo the DSN");
             }
@@ -247,9 +295,10 @@ fn floored_connect_options_refuses_the_parser_differential_dsns_4434() {
 }
 
 /// #4434 - PGSSLMODE is read by sqlx when the parsed URL names no sslmode.
-/// A DSN whose only sslmode sits in the fragment must be refused whatever
-/// PGSSLMODE says, with no socket; a URL that pins verify-full in its query
-/// keeps verify-full whatever PGSSLMODE says.
+/// (1) A DSN whose only sslmode sits in the fragment is refused under each
+/// WEAKER PGSSLMODE, with no socket. (2) A URL that pins verify-full in its
+/// query keeps verify-full under a hostile PGSSLMODE: doctor, run with
+/// `PGSSLMODE=disable`, still probes the live TLS tier.
 #[test]
 fn pgsslmode_env_cannot_change_the_outcome_4434() {
     let listener = CountingListener::start();
@@ -261,16 +310,67 @@ fn pgsslmode_env_cannot_change_the_outcome_4434() {
             &[("PGSSLMODE", env_mode)],
         );
     }
-    // Live: a verify-full URL with a hostile PGSSLMODE still verifies.
     let Ok(url) = std::env::var("AI_MEMORY_TEST_POSTGRES_URL") else {
         eprintln!("AI_MEMORY_TEST_POSTGRES_URL unset - skipping live half");
         return;
     };
-    let opts = ai_memory::store::postgres::dsn::floored_connect_options(&url).expect("floor ok");
-    assert!(matches!(
-        opts.get_ssl_mode(),
-        sqlx::postgres::PgSslMode::VerifyFull
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    rt.block_on(async {
+        ai_memory::store::postgres::PostgresStore::connect(&url)
+            .await
+            .expect("bootstrap the verify-full store")
+    });
+    for hostile in ["disable", "prefer", "require"] {
+        let home = tempfile::tempdir().expect("scratch HOME");
+        let report = doctor_json_env(&url, home.path(), &[("PGSSLMODE", hostile)]);
+        let ext = section(&report, "Postgres extensions");
+        assert!(
+            !ext.to_string().contains(REFUSAL_MARK)
+                && ext.to_string().contains("pgvector_installed"),
+            "PGSSLMODE={hostile} must not change a verify-full URL's outcome: {ext}"
+        );
+    }
+}
+
+/// #4434 - the enterprise posture check #15 reads the SAME verdict: a bypass
+/// shape must FAIL it (never `sslmode=verify-full=true`).
+#[test]
+fn enterprise_posture_check_15_fails_every_parser_differential_dsn_4434() {
+    let home = tempfile::tempdir().expect("scratch HOME");
+    let mut shapes = bypass_urls(5432);
+    shapes.push((
+        "weak control",
+        format!("postgres://u:{SECRET}@127.0.0.1:5432/db?sslmode=require"),
     ));
+    for (kind, url) in shapes {
+        let mut cmd = assert_cmd::Command::cargo_bin("ai-memory").expect("ai-memory binary");
+        for var in PG_ENV_VARS {
+            cmd.env_remove(var);
+        }
+        let out = cmd
+            .env("HOME", home.path())
+            .env("AI_MEMORY_NO_CONFIG", "1")
+            .env("AI_MEMORY_STORE_URL", &url)
+            .args(["doctor", "--posture", "enterprise-federation", "--json"])
+            .output()
+            .expect("run posture");
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(
+            !text.contains(SECRET),
+            "{kind}: posture output must not echo the DSN"
+        );
+        assert!(
+            text.contains("sslmode=verify-full=false"),
+            "{kind}: posture #15 must report the floor NOT met: {text}"
+        );
+        assert!(
+            !text.contains("sslmode=verify-full=true"),
+            "{kind}: posture #15 must never say pinned: {text}"
+        );
+    }
 }
 
 #[test]
@@ -278,7 +378,8 @@ fn the_floored_connect_options_refuses_every_weak_shape_4333() {
     use ai_memory::store::postgres::dsn::{FlooredConnectError, floored_connect_options};
     for url in weak_urls(5432) {
         match floored_connect_options(&url) {
-            Err(FlooredConnectError::Refused(m)) => {
+            Err(refused @ FlooredConnectError::Refused(_)) => {
+                let m = refused.to_string();
                 assert!(m.contains(REFUSAL_MARK), "{m}");
                 assert!(!m.contains(SECRET), "refusal must not echo the DSN");
             }
@@ -287,6 +388,8 @@ fn the_floored_connect_options_refuses_every_weak_shape_4333() {
     }
     for url in [
         format!("postgres://u:{SECRET}@%2Fvar%2Frun%2Fpostgresql/db?sslmode=verify-full"),
+        // The driver decodes the key and treats the value as a socket dir.
+        format!("postgres://u:{SECRET}@db.internal:5432/db?sslmode=verify-full&%68ost=/tmp"),
         format!("postgres://u:{SECRET}@/db?host=/var/run/postgresql&sslmode=verify-full"),
         "not a url".to_string(),
     ] {

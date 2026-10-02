@@ -2686,7 +2686,9 @@ impl PostgresStore {
         // #4333 — the floor and the DSN screen are ONE function shared with
         // every doctor / CLI probe (`dsn::floored_connect_options`).
         let options: PgConnectOptions = dsn::floored_connect_options(url).map_err(|e| match e {
-            dsn::FlooredConnectError::Refused(detail) => StoreError::InvalidInput { detail },
+            refused @ dsn::FlooredConnectError::Refused(_) => StoreError::InvalidInput {
+                detail: refused.to_string(),
+            },
             // #1579 A3 (SECURITY) — the parse text is URL-redacted
             // before it leaves the adapter.
             dsn::FlooredConnectError::Parse(detail) => StoreError::BackendUnavailable {
