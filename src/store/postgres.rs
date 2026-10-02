@@ -26383,8 +26383,7 @@ impl MemoryStore for PostgresStore {
             .map_err(|e| to_store_err("set_namespace_standard begin", e))?;
         ns_standard_ancestor_4356::set_gate_in_tx(&mut tx, ctx, namespace).await?;
         let parent_link = resolved_parent.as_deref(); // #4492 chain-depth admission:
-        governance_chain_4477::admit_bind_in_tx(&mut tx, namespace, standard_id, parent_link)
-            .await?;
+        governance_chain_4477::admit_bind_in_tx(&mut tx, namespace, parent_link).await?;
         sqlx::query(
             "INSERT INTO namespace_meta (namespace, standard_id, updated_at, parent_namespace)
              VALUES ($1, $2, NOW(), $3)

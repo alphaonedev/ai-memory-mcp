@@ -52,8 +52,9 @@ fn over_depth(e: crate::governance::chain_depth::ChainOverDepth) -> StoreError {
 ///
 /// # Errors
 ///
-/// A storage fault, or `InvalidInput` with the #4477 refusal when a walk
-/// would exceed `MAX_NAMESPACE_DEPTH` (never a truncated chain).
+/// A storage fault, or a backend error (`StoreError::Backend`, HTTP 500, the
+/// #4043 unreadable-policy class) with the #4477 refusal when a walk would
+/// exceed `MAX_NAMESPACE_DEPTH` (never a truncated chain).
 pub(super) async fn build_chain_on(
     conn: &mut sqlx::PgConnection,
     namespace: &str,
@@ -108,10 +109,10 @@ pub(super) async fn build_chain_on(
 }
 
 /// #4492 — the postgres reader for the bind-time chain-depth refusal (the
-/// decision is `crate::governance::bind_chain_depth`, shared with sqlite).
+/// decision is `crate::governance::bind_chain_depth`, shared with sqlite):
+/// the `namespace_meta` link column, every hop counted whoever owns it.
 /// Called in the bind's transaction AFTER the bind advisory lock, before the
-/// upsert, so two binds cannot race past it. Owners are normalised exactly as
-/// [`build_chain_on`] normalises them.
+/// upsert, so two binds cannot race past it.
 ///
 /// # Errors
 ///
@@ -120,38 +121,23 @@ pub(super) async fn build_chain_on(
 pub(super) async fn admit_bind_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     namespace: &str,
-    standard_id: &str,
     new_parent: Option<&str>,
 ) -> StoreResult<()> {
     use crate::governance::bind_chain_depth::{
         BIND_CHAIN_OVER_DEPTH, LinkRow, bind_exceeds_chain_depth,
     };
-    let unowned = |o: Option<String>| {
-        o.filter(|o| !o.is_empty() && o != crate::identity::sentinels::SYSTEM_PRINCIPAL)
-    };
-    let rows: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(
-        "SELECT nm.namespace, nm.parent_namespace, m.metadata->>'agent_id' \
-         FROM namespace_meta nm LEFT JOIN memories m ON m.id = nm.standard_id",
+    let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT nm.namespace, nm.parent_namespace FROM namespace_meta nm \
+         WHERE nm.parent_namespace IS NOT NULL",
     )
     .fetch_all(&mut **tx)
     .await
     .map_err(|e| to_store_err("bind chain-depth link graph", e))?;
-    let new_owner: Option<Option<String>> =
-        sqlx::query_scalar("SELECT mm.metadata->>'agent_id' FROM memories mm WHERE mm.id = $1")
-            .bind(standard_id)
-            .fetch_optional(&mut **tx)
-            .await
-            .map_err(|e| to_store_err("bind chain-depth standard owner", e))?;
     let links: Vec<LinkRow> = rows
         .into_iter()
-        .map(|(namespace, parent, owner)| LinkRow {
-            namespace,
-            parent,
-            owner: unowned(owner),
-        })
+        .map(|(namespace, parent)| LinkRow { namespace, parent })
         .collect();
-    let owner = unowned(new_owner.flatten());
-    if bind_exceeds_chain_depth(&links, namespace, new_parent, owner.as_deref()) {
+    if bind_exceeds_chain_depth(&links, namespace, new_parent) {
         return Err(StoreError::InvalidInput {
             detail: BIND_CHAIN_OVER_DEPTH.to_string(),
         });
