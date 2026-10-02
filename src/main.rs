@@ -462,12 +462,20 @@ fn main() -> Result<()> {
         .enable_all()
         .build()?;
     let result = runtime.block_on(daemon_runtime::run(cli, &app_config, audit_pubkey.as_ref()));
+    // #4347 — a signal stopped `mcp` and its exit drain already ran. Exit with
+    // the conventional 128 + signal code before the runtime drops: the stdio
+    // reader is an uncancellable blocking read that would stall the drop.
+    if let Some(stop) = result
+        .as_ref()
+        .err()
+        .and_then(|e| e.downcast_ref::<ai_memory::mcp::shutdown::SignalExit>())
+    {
+        std::process::exit(stop.code());
+    }
     // #4319 — on unix the exit drain is an `atexit` hook (it also covers every
     // `std::process::exit` inside the commands); elsewhere drain here, bounded.
     #[cfg(not(unix))]
-    let _ = ai_memory::governance::audit::drain_bounded(
-        ai_memory::governance::audit::EXIT_DRAIN_BUDGET,
-    );
+    let _ = ai_memory::governance::audit::drain_at_exit_once();
     if result.as_ref().err().is_some_and(|error| {
         error
             .downcast_ref::<daemon_runtime::FatalShutdownError>()
