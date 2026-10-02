@@ -4076,6 +4076,15 @@ async fn sync_push_write(
             skipped += 1;
             continue;
         }
+        // #4408 — a federated signal whose recipient fails the agent-id
+        // contract is a PER-SIGNAL skip on BOTH backends, before any quota
+        // charge, insert or audit; the rest of the push still applies. The
+        // value is never logged or echoed.
+        if crate::validate::validate_signal_recipient(sig.to_agent.as_deref()).is_err() {
+            tracing::warn!("federation signal skipped: invalid recipient");
+            skipped += 1;
+            continue;
+        }
         if !sig.signature.is_empty() && !crate::signals::verify(sig) {
             tracing::warn!(
                 "sync_push: signal {} has an invalid signature — skipping (forged)",
