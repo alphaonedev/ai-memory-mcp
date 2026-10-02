@@ -57,7 +57,8 @@ mod fail_closed;
 pub use fail_closed::{
     AUDIT_TRAIL_LATCHED_GAUGE, AuditTrailUnavailable,
     PROBE_INTERVAL_MS as AUDIT_TRAIL_PROBE_INTERVAL_MS, REQUIRE_AUDIT_TRAIL_ENV, audit_trail_gate,
-    audit_trail_latched, require_audit_trail_enabled,
+    audit_trail_latched, refusal_message as audit_trail_refusal_message,
+    require_audit_trail_enabled,
 };
 #[cfg(test)]
 pub(crate) use fail_closed::{

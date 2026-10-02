@@ -276,17 +276,43 @@ pub(crate) fn quota_exceeded_response(qe: &crate::quotas::QuotaError) -> axum::r
 /// the gate also refuses with `RECORD_STOP_INDETERMINATE` (#3877) and
 /// `AUDIT_TRAIL_UNAVAILABLE` (#4400), and a client must be able to tell an
 /// operator's stop from a retryable condition.
+///
+/// #3707 — the body carries a FIXED caller message per code, never the
+/// error's `Display`: `RecordStopIndeterminate` wraps a raw chain-read error
+/// (foreign text). The full error goes to a `tracing` line for the operator.
 pub(crate) fn record_stopped_response(
     e: &crate::storage::StorageError,
 ) -> axum::response::Response {
+    let code = e.code();
+    tracing::warn!(code, detail = %e, "record-stop gate refused a mutating request");
     (
         StatusCode::SERVICE_UNAVAILABLE,
         Json(json!({
-            "code": e.code(),
-            "error": e.to_string(),
+            "code": code,
+            "error": record_stop_caller_message(e),
         })),
     )
         .into_response()
+}
+
+/// #3707 — the caller-facing text for each record-stop gate refusal. Built
+/// from our own fields only: the stop names the operator principal and scope
+/// it was engaged with (byte-identical to the pre-#3707 body); the
+/// indeterminate refusal drops its foreign `reason`; the audit-trail latch
+/// uses the one canonical refusal text.
+fn record_stop_caller_message(e: &crate::storage::StorageError) -> String {
+    use crate::storage::StorageError as SE;
+    match e {
+        SE::RecordStopped { issued_by, scope } => format!(
+            "substrate record plane stopped by {issued_by} (scope={scope}); \
+             mutating operations refused until resume"
+        ),
+        SE::RecordStopIndeterminate { .. } => "substrate record-stop state could not be read \
+             (fail-closed; mutating operation refused, retry)"
+            .to_string(),
+        SE::AuditTrailUnavailable { .. } => crate::audit::audit_trail_refusal_message(),
+        _ => "mutating operation refused".to_string(),
+    }
 }
 
 pub(crate) fn handler_error_500(e: &dyn std::fmt::Display) -> axum::response::Response {
@@ -399,7 +425,7 @@ mod tests {
 
     use super::{
         VALIDATION_FAILED_LABEL, bad_request_opaque, governance_error_500, handler_error_500,
-        internal_error_response, sanitize_bulk_row_error, to_value_or_500,
+        internal_error_response, record_stopped_response, sanitize_bulk_row_error, to_value_or_500,
     };
     use axum::http::StatusCode;
 
@@ -468,6 +494,57 @@ mod tests {
             !label.contains("SELECT") && !label.contains("/var/db"),
             "default label must not leak the raw inner detail"
         );
+    }
+
+    /// #3707 (on #4400) — the record-stop gate's 503 body is a fixed caller
+    /// message per code: the stop keeps its pre-#3707 text built from its own
+    /// fields, the indeterminate refusal never echoes its foreign `reason`, and
+    /// the audit-trail latch renders the one canonical refusal text.
+    #[tokio::test]
+    async fn record_stop_gate_bodies_never_render_the_error_display_3707() {
+        use crate::storage::StorageError as SE;
+        let (status, body) = body_string(record_stopped_response(&SE::RecordStopped {
+            issued_by: "ai:operator".into(),
+            scope: "record-plane".into(),
+        }))
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["code"], crate::errors::error_codes::RECORD_STOPPED);
+        assert_eq!(
+            v["error"],
+            "substrate record plane stopped by ai:operator (scope=record-plane); \
+             mutating operations refused until resume"
+        );
+
+        let secret = "/var/lib/ai-memory/db.sqlite: database disk image is malformed";
+        let (status, body) = body_string(record_stopped_response(&SE::RecordStopIndeterminate {
+            reason: secret.into(),
+        }))
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            !body.contains(secret),
+            "the foreign reason must not reach the caller: {body}"
+        );
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            v["code"],
+            crate::errors::error_codes::RECORD_STOP_INDETERMINATE
+        );
+
+        let (status, body) = body_string(record_stopped_response(&SE::AuditTrailUnavailable {
+            reason: "anything".into(),
+        }))
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            v["code"],
+            crate::errors::error_codes::AUDIT_TRAIL_UNAVAILABLE
+        );
+        assert_eq!(v["error"], crate::audit::audit_trail_refusal_message());
+        assert!(!body.contains("anything"));
     }
 
     #[tokio::test]

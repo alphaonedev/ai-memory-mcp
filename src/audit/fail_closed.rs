@@ -188,11 +188,20 @@ fn gate_with(
         LATCHED.store(true, Ordering::SeqCst);
     }
     Err(AuditTrailUnavailable {
-        reason: format!(
-            "the audit trail is not recording and {REQUIRE_AUDIT_TRAIL_ENV} is set; \
-             mutating operations are refused until it records again (reads stay live)"
-        ),
+        reason: refusal_message(),
     })
+}
+
+/// #4400 — THE caller-facing refusal text: names the knob and nothing else
+/// (no path, no errno, no sink internals). Every surface renders this one
+/// string, so they cannot drift (#3707: the HTTP body never shows an error's
+/// `Display`).
+#[must_use]
+pub fn refusal_message() -> String {
+    format!(
+        "the audit trail is not recording and {REQUIRE_AUDIT_TRAIL_ENV} is set; \
+         mutating operations are refused until it records again (reads stay live)"
+    )
 }
 
 /// Append a real `trail_resumed` record. `true` when it reached the trail, or
