@@ -23,7 +23,9 @@
 //!   the stranger's promote / delete of its OWN row at depth 7 (ownership
 //!   alone would admit it, so only the root's governance can park it);
 //! - an explicit-parent chain of 9 entitled hops (one past the bound) above a
-//!   governed root refuses a write the same way on both backends.
+//!   governed root refuses a write the same way on both backends (since #4492
+//!   such a chain can no longer be BOUND, so its 9th hop is planted as
+//!   pre-existing data).
 
 #![cfg(feature = "sal")]
 #![allow(clippy::too_many_lines)]
@@ -203,10 +205,52 @@ struct Outcome {
     over_depth_owner_write: u16,
 }
 
+/// Write a `namespace_meta` link row directly (pre-existing data the bind
+/// path would refuse today, #4492). `pg_url` selects postgres.
+#[cfg_attr(
+    not(feature = "sal-postgres"),
+    expect(
+        clippy::unused_async,
+        reason = "only the postgres arm awaits; one signature for both feature legs"
+    )
+)]
+async fn plant_link(
+    pg_url: Option<&str>,
+    db_path: &std::path::Path,
+    ns: &str,
+    standard_id: &str,
+    parent: &str,
+) {
+    #[cfg(feature = "sal-postgres")]
+    if let Some(url) = pg_url {
+        let pool = sqlx::PgPool::connect(url).await.expect("raw pool");
+        sqlx::query(
+            "INSERT INTO namespace_meta (namespace, standard_id, parent_namespace) \
+             VALUES ($1, $2, $3)",
+        )
+        .bind(ns)
+        .bind(standard_id)
+        .bind(parent)
+        .execute(&pool)
+        .await
+        .expect("plant pg link");
+        return;
+    }
+    let _ = pg_url;
+    let conn = ai_memory::db::open(db_path).expect("raw sqlite");
+    conn.execute(
+        "INSERT INTO namespace_meta (namespace, standard_id, updated_at, parent_namespace) \
+         VALUES (?1, ?2, '2026-10-02T00:00:00Z', ?3)",
+        rusqlite::params![ns, standard_id, parent],
+    )
+    .expect("plant sqlite link");
+}
+
 async fn run(
     store: Arc<dyn MemoryStore>,
     backend: StorageBackend,
     db_path: &std::path::Path,
+    pg_url: Option<&str>,
 ) -> Outcome {
     ai_memory::config::override_active_permissions_mode_for_test(
         ai_memory::config::PermissionsMode::Enforce,
@@ -263,11 +307,17 @@ async fn run(
     )
     .await;
     let mut above = top.clone();
-    for i in (0..9).rev() {
+    for i in (1..9).rev() {
         let ns = format!("e{i}x{u}");
         govern(&store, &ns, OWNER, None, Some(&above), &std_ns).await;
         above = ns;
     }
+    // The 9th hop cannot be bound any more (#4492 refuses it at bind time), so
+    // it is planted as PRE-EXISTING data (a chain from before #4477), which is
+    // exactly what the resolver must still refuse rather than truncate.
+    let e0_std = memory(OWNER, &std_ns, None, Tier::Long);
+    store.store(&admin, &e0_std).await.expect("e0 standard");
+    plant_link(pg_url, db_path, &format!("e0x{u}"), &e0_std.id, &above).await;
     let bottom = format!("e0x{u}/leaf");
 
     let router = router(backend, Arc::clone(&store), db_path);
@@ -429,7 +479,7 @@ async fn sqlite_outcome() -> Outcome {
     let store: Arc<dyn MemoryStore> = Arc::new(
         ai_memory::store::sqlite::SqliteStore::open(path.clone()).expect("open SqliteStore"),
     );
-    run(store, StorageBackend::Sqlite, &path).await
+    run(store, StorageBackend::Sqlite, &path, None).await
 }
 
 #[tokio::test]
@@ -461,6 +511,7 @@ async fn postgres_chain_is_complete_to_max_depth_4477() {
         store,
         StorageBackend::Postgres,
         &dir.path().join("scratch.db"),
+        Some(url.as_str()),
     )
     .await;
     assert_governed(&pg, "postgres");

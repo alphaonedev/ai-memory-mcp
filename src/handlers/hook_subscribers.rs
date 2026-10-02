@@ -698,6 +698,13 @@ async fn set_namespace_standard_inner(
             {
                 (StatusCode::BAD_REQUEST, Json(json!({"error": reason}))).into_response()
             }
+            // #4492 — the bind-time chain-depth refusal: the sqlite arm's
+            // shape (400 with the fixed text), not the generic adapter text.
+            Err(crate::store::StoreError::InvalidInput { detail })
+                if detail == crate::governance::bind_chain_depth::BIND_CHAIN_OVER_DEPTH =>
+            {
+                (StatusCode::BAD_REQUEST, Json(json!({"error": detail}))).into_response()
+            }
             Err(e) => store_err_to_response(e),
         };
     }

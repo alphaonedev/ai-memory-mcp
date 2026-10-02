@@ -925,6 +925,8 @@ pub mod record_stop;
 // v1.0.0 #2445 — the schema DOWNGRADE guard (an OLDER binary must not
 // silently open and WRITE a NEWER database). Its own module so the pure
 // verdict is shared verbatim by the sqlite and postgres funnels.
+/// #4492 — sqlite reader for the bind-time chain-depth refusal.
+pub mod bind_chain_depth;
 /// #4356 — sqlite reader for the ancestor-owner bind gate.
 pub mod ns_standard_ancestor;
 pub(crate) mod reflect;
@@ -22485,7 +22487,7 @@ pub fn set_namespace_standard(
 ) -> Result<()> {
     crate::storage::record_stop::gate_storage_conn(conn)?;
     // Verify the memory exists (but allow cross-namespace — shared policy)
-    let _mem = get(conn, standard_id)?.ok_or_else(|| {
+    let mem = get(conn, standard_id)?.ok_or_else(|| {
         // #962 typed envelope — 404 NOT_FOUND.
         anyhow::Error::new(StorageError::MemoryNotFound {
             id: standard_id.to_string(),
@@ -22510,13 +22512,21 @@ pub fn set_namespace_standard(
         None => auto_detect_parent(conn, namespace)?,
     };
     let now = chrono::Utc::now().to_rfc3339();
-    conn.execute(
-        "INSERT INTO namespace_meta (namespace, standard_id, updated_at, parent_namespace)
+    // #4492 — the chain-depth admission and the row in ONE write transaction.
+    let owner = mem
+        .metadata
+        .get(crate::META_KEY_AGENT_ID)
+        .and_then(|v| v.as_str());
+    connection::in_write_txn(conn, || {
+        bind_chain_depth::admit_bind(conn, namespace, resolved_parent.as_deref(), owner)?;
+        conn.execute(
+            "INSERT INTO namespace_meta (namespace, standard_id, updated_at, parent_namespace)
          VALUES (?1, ?2, ?3, ?4)
          ON CONFLICT(namespace) DO UPDATE SET standard_id = ?2, updated_at = ?3, parent_namespace = ?4",
-        params![namespace, standard_id, now, resolved_parent],
-    )?;
-    Ok(())
+            params![namespace, standard_id, now, resolved_parent],
+        )?;
+        Ok(())
+    })
 }
 
 /// Auto-detect parent namespace by `-` prefix.
