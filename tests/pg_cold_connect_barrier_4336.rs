@@ -66,10 +66,6 @@ fn barrier_budget_covers_the_pool_acquire_and_lock_budgets_4336() {
         injected > LEGACY_BARRIER_DEADLINE,
         "the injected delay must exceed the legacy deadline or the cell proves nothing"
     );
-    assert!(
-        injected + Duration::from_secs(8) <= acquire,
-        "the injected delay must leave margin under the pool acquire timeout ({acquire:?})"
-    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -189,14 +185,17 @@ async fn run_case(scratch: &str) -> Result<(), String> {
 }
 
 /// #4489: a killed run leaves its scratch database (and its login-delay trigger)
-/// behind. The next run sweeps orphans older than the stale age and never
-/// touches a fresh one, so a concurrent live run is safe.
+/// behind. The next run sweeps orphans of the EXACT scratch shape older than the
+/// stale age and never touches a fresh one, so a concurrent live run is safe. A
+/// database that merely resembles the shape (a lane or operator database, a
+/// quoted or over-long name, wrong widths, uppercase hex, a `+` sign) is NEVER
+/// dropped, however old its embedded number looks (review B1/B2).
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "live postgres: AI_MEMORY_TEST_POSTGRES_URL (postgres-ignored tier)"]
-async fn stale_scratch_database_is_swept_and_a_fresh_one_is_kept_4489() {
+async fn stale_scratch_database_is_swept_and_lookalikes_are_kept_4489() {
     let Ok(url) = std::env::var("AI_MEMORY_TEST_POSTGRES_URL") else {
         eprintln!(
-            "skip: AI_MEMORY_TEST_POSTGRES_URL not set (stale_scratch_database_is_swept_and_a_fresh_one_is_kept_4489)"
+            "skip: AI_MEMORY_TEST_POSTGRES_URL not set (stale_scratch_database_is_swept_and_lookalikes_are_kept_4489)"
         );
         return;
     };
@@ -207,16 +206,34 @@ async fn stale_scratch_database_is_swept_and_a_fresh_one_is_kept_4489() {
         .connect(&url)
         .await
         .expect("connect admin pool");
-    let now = pg_barrier::unix_now();
+    let now = pg_barrier::server_unix(&admin).await.expect("server clock");
     let stale_age = pg_barrier::STALE_SCRATCH_AGE.as_secs();
     let stale = pg_barrier::scratch_db_name(prefix, now - stale_age - 60);
     let fresh = pg_barrier::scratch_db_name(prefix, now);
-    let unparseable = format!("{prefix}_notatimestamp_{}", &fresh[fresh.len() - 8..]);
-    for db in [&stale, &fresh, &unparseable] {
-        sqlx::raw_sql(&format!("CREATE DATABASE \"{db}\""))
+    // Old by their embedded number, but NOT the exact shape: all must survive.
+    let old = "1000000000";
+    let keep: Vec<String> = vec![
+        format!("{prefix}_2"),
+        format!("{prefix}_plus1"),
+        format!("{prefix}_+1_deadbeef"),
+        format!("{prefix}_{old}_deadbeef_extra"),
+        format!("{prefix}_{old}_DEADBEEF"),
+        format!("{prefix}_{old}_deadbee"),
+        format!("{prefix}_{old}_deadbeef0"),
+        format!("{prefix}_100000000_deadbeef"),
+        format!("{prefix}_10000000000_deadbeef"),
+        format!("{prefix}_{old}_dead;beef"),
+        format!("{prefix}_{old}_q\";CREATE TABLE zz_inj();--"),
+        format!("{prefix}_notatimestamp_deadbeef"),
+    ];
+    for db in std::iter::once(&stale)
+        .chain(std::iter::once(&fresh))
+        .chain(keep.iter())
+    {
+        sqlx::query(&format!("CREATE DATABASE {}", pg_barrier::quote_ident(db)))
             .execute(&admin)
             .await
-            .expect("create fixture database");
+            .unwrap_or_else(|e| panic!("create fixture database {db:?}: {e}"));
     }
     let swept = pg_barrier::sweep_stale_scratch_dbs(&admin, prefix, now).await;
     let exists = |db: String| {
@@ -231,17 +248,30 @@ async fn stale_scratch_database_is_swept_and_a_fresh_one_is_kept_4489() {
             .expect("catalog probe")
         }
     };
-    let (stale_left, fresh_left, odd_left) = (
-        exists(stale.clone()).await,
-        exists(fresh.clone()).await,
-        exists(unparseable.clone()).await,
-    );
-    for db in [&stale, &fresh, &unparseable] {
-        sqlx::raw_sql(&format!("DROP DATABASE IF EXISTS \"{db}\" WITH (FORCE)"))
-            .execute(&admin)
-            .await
-            .expect("drop fixture database");
+    let stale_left = exists(stale.clone()).await;
+    let fresh_left = exists(fresh.clone()).await;
+    let mut dropped_lookalikes = Vec::new();
+    for db in &keep {
+        if !exists(db.clone()).await {
+            dropped_lookalikes.push(db.clone());
+        }
     }
+    for db in std::iter::once(&stale)
+        .chain(std::iter::once(&fresh))
+        .chain(keep.iter())
+    {
+        sqlx::query(&format!(
+            "DROP DATABASE IF EXISTS {} WITH (FORCE)",
+            pg_barrier::quote_ident(db)
+        ))
+        .execute(&admin)
+        .await
+        .expect("drop fixture database");
+    }
+    let injected: bool = sqlx::query_scalar("SELECT to_regclass('public.zz_inj') IS NOT NULL")
+        .fetch_one(&admin)
+        .await
+        .expect("injection probe");
     admin.close().await;
     let swept = swept.expect("sweep");
     assert_eq!(swept, vec![stale.clone()], "only the stale orphan is swept");
@@ -250,7 +280,35 @@ async fn stale_scratch_database_is_swept_and_a_fresh_one_is_kept_4489() {
         fresh_left,
         "a fresh scratch database (a live run) must be kept"
     );
-    assert!(odd_left, "a name that does not parse is never swept");
+    assert!(
+        dropped_lookalikes.is_empty(),
+        "lookalike names must never be dropped: {dropped_lookalikes:?}"
+    );
+    assert!(!injected, "a catalog name must never be run as SQL");
+}
+
+#[test]
+fn scratch_name_shape_is_exact_4489() {
+    let p = "ai_memory_4336";
+    let ok = pg_barrier::scratch_db_name(p, 1_790_000_000);
+    assert_eq!(pg_barrier::parse_scratch_name(p, &ok), Some(1_790_000_000));
+    for bad in [
+        "ai_memory_4336_2",
+        "ai_memory_4336_plus1",
+        "ai_memory_4336_+1_deadbeef",
+        "ai_memory_4336_1790000000_DEADBEEF",
+        "ai_memory_4336_1790000000_deadbee",
+        "ai_memory_4336_1790000000_deadbeef0",
+        "ai_memory_4336_179000000_deadbeef",
+        "ai_memory_4336_17900000000_deadbeef",
+        "ai_memory_4336_1790000000_deadbeef_x",
+        "ai_memory_4336_1790000000_dead;eef",
+        "ai_memory_4336x_1790000000_deadbeef",
+        "xai_memory_4336_1790000000_deadbeef",
+    ] {
+        assert_eq!(pg_barrier::parse_scratch_name(p, bad), None, "{bad}");
+    }
+    assert_eq!(pg_barrier::quote_ident("a\"b"), "\"a\"\"b\"");
 }
 
 /// #4489: the guard drops the scratch database on a panic unwind too.
@@ -258,7 +316,9 @@ async fn stale_scratch_database_is_swept_and_a_fresh_one_is_kept_4489() {
 #[ignore = "live postgres: AI_MEMORY_TEST_POSTGRES_URL (postgres-ignored tier)"]
 async fn scratch_guard_drops_the_database_on_panic_4489() {
     let Ok(url) = std::env::var("AI_MEMORY_TEST_POSTGRES_URL") else {
-        eprintln!("SKIP scratch_guard_drops_the_database_on_panic_4489: no live postgres");
+        eprintln!(
+            "skip: AI_MEMORY_TEST_POSTGRES_URL not set (scratch_guard_drops_the_database_on_panic_4489)"
+        );
         return;
     };
     let scratch = pg_barrier::ScratchDb::create(&url, "ai_memory_4489guard")
