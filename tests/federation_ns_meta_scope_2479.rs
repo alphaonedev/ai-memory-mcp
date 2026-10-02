@@ -87,8 +87,13 @@ const IN_SCOPE_NS: &str = "public/ok";
 /// `ai:evil` may act inside the `public/**` tree only.
 /// Tree pattern (not `public/*`) so in-scope `namespace_meta` controls still
 /// pass the #2536 descendant-coverage probe on `public/ok`.
-const SCOPED_ALLOWLIST: &str =
-    r#"{"ai:evil":{"allowed_namespaces":["public/**"],"allowed_sender_agent_ids":["ai:evil"]}}"#;
+///
+/// #4495 — the peer is also allowlisted to act for the seeded standards'
+/// owner (`ai:victim`), exactly as `SCOPED_ALLOWLIST_WITH_VICTIM`, so the
+/// rebind exploit passes the owner gate and is refused by SCOPE alone: the
+/// exploit and its control differ only in scope (mutation-verified: with the
+/// #2479 scope check removed the exploit cell goes red).
+const SCOPED_ALLOWLIST: &str = r#"{"ai:evil":{"allowed_namespaces":["public/**"],"allowed_sender_agent_ids":["ai:evil","ai:victim"]}}"#;
 
 /// The CONTROL posture: the same peer, scoped to reach the victim namespace tree.
 /// #2536 requires tree coverage (`/**`) — a single-level `secure/*` matches
