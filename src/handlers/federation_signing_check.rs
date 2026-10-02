@@ -1177,6 +1177,15 @@ pub(super) async fn sync_push_via_store(
             skipped += 1;
             continue;
         }
+        // #4408 — a federated signal whose recipient fails the agent-id
+        // contract is a PER-SIGNAL skip on BOTH backends, before any quota
+        // charge, insert or audit; the rest of the push still applies. The
+        // value is never logged or echoed.
+        if crate::validate::validate_signal_recipient(sig.to_agent.as_deref()).is_err() {
+            tracing::warn!("federation signal skipped: invalid recipient");
+            skipped += 1;
+            continue;
+        }
         // #1843 (v0.8.1) — bind `from_agent` to the enrolled peer's authorship
         // (sqlite-twin parity; see `federation_receive::signal_author_authorized`).
         // The forged-signature check lives inside `apply_remote_signal` below; the
