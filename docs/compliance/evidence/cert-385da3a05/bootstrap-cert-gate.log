@@ -1,0 +1,29 @@
+building ai-memory (--features sal,sal-postgres) for LEG A-pg…
+building ai-memory (default features, no sal-postgres) for LEG A-driverless…
+A-pg binary:         <repo-root>/target/cert-gate-pg/debug/ai-memory
+A-driverless binary: <repo-root>/target/cert-gate-driverless/debug/ai-memory
+probe ok: A-pg features = [sal sal-postgres sqlite-bundled ]; A-driverless features = [sqlite-bundled ]
+
+== LEG A-pg — #3061 pg posture armability (binary WITH sal-postgres) ==
+LEG A-pg: RUN
+[PASS] fresh pg node in the certified config: doctor --posture exit 0 (#3061 armable)
+[PASS] control #15 is the pg COMPENSATING control, not the sqlcipher predicate
+[PASS] negative control: verify-full WITHOUT AI_MEMORY_PG_AT_REST_ATTESTED refuses (exit 2)
+[PASS] negative control: sslmode=require (not verify-full) + attestation refuses (exit 2)
+[PASS] negative control: certified pg config WITHOUT an enrolled R40 approver key refuses (exit 2)
+
+== LEG A-driverless — #4333/#4434 driverless binary must REFUSE a pg posture ==
+LEG A-driverless: RUN
+[PASS] driverless binary REFUSES the certified pg config: exit 2, SOLE FAIL-ROW AI_MEMORY_PG_AT_REST_ATTESTED (#4333 R4 fail-closed)
+
+== LEG B — #3016/#3067 born-dirty bring-up gate (certified asi-hard modes) ==
+[PASS] store-only-migrated node (empty spine) is BORN DIRTY under armed require-lineage (exit != 0)
+[PASS] bring-up resolved the SANDBOX db (hermetic — never a config/operator DB)
+[PASS] audit bootstrap-node CERTIFIED under full asi-hard modes with witness+recorder keys (exit 0)
+[PASS] CERTIFIED-READY names EXACTLY the armed require-modes for the verdict
+[PASS] after bring-up, verify-audit-trail exits 0 under the certified modes
+[PASS] bootstrap-node is idempotent: re-run without --recovery-pubkey stays certified
+[PASS] negative control: asi-hard armed WITHOUT custody keys REFUSES and names witness + role
+[PASS] negative control: certified modes NOT armed REFUSES the certified claim (no false-green)
+
+CERT-BOOTSTRAP GATE: PASS

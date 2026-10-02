@@ -12,15 +12,15 @@
 > (`docs/audit/3x7-v1-cutline-ruling-2026-08-01.md`) is the standard this
 > certification answers to; this document is the evidence-bound answer.
 
-**Binds to:** `eba96b30791f34cf7583e0ddc912857d4bbb1a54` (the promotion-4 rehearsal tip;
-re-issued 2026-09-26 after **2 §7-watched federation-wire files changed** since the prior bind
-`eae99be43` — 188 changed lines, **92 of them code**, from two commits — §5.4(2)–(5) re-run at the
-new SHA per §7). The 2026-09-23 re-issue at `eae99be43`, the 2026-09-22 re-issue at `92209ad91`, the 2026-09-21 re-issue at `f32c18dad`, the 2026-09-12 #3607 re-bind at `ab6f2175`, the 2026-09-11
+**Binds to:** `385da3a054c4f82bcdfd51ec2d8f07ca4947f9a5` (the re-assembled batch-6 tip;
+re-issued 2026-10-02 after **3 §7-watched federation-wire files changed** since the prior bind
+`eba96b307` — 74 changed lines, **49 of them code**, from five commits — §5.4(2)–(5) re-run at the
+new SHA per §7). The 2026-09-26 re-issue at `eba96b307`, the 2026-09-23 re-issue at `eae99be43`, the 2026-09-22 re-issue at `92209ad91`, the 2026-09-21 re-issue at `f32c18dad`, the 2026-09-12 #3607 re-bind at `ab6f2175`, the 2026-09-11
 re-issue at `b0483115`, the 2026-09-11 #3595 re-issue at `ad60bead` and the original 2026-08-12
 mint `e22bc93c` remain as historical records. Any change to the federation wire path or the `AI_MEMORY_FED_*` surface **voids this
 certification and triggers re-cert** (see §7).
 
-> ## STATUS — **LIVE as of 2026-09-26** (re-issued at the promotion-4 rehearsal tip `eba96b307` at 22 checks after 2 §7-watched federation-wire files changed by REAL CODE — #3266 item 3 part 5 and #3901; supersedes the 2026-09-23 bind at `eae99be43`)
+> ## STATUS — **LIVE as of 2026-10-02** (re-issued at the re-assembled batch-6 tip `385da3a05` at 22 checks after 3 §7-watched federation-wire files changed by REAL CODE — #4023, #4408, #4400/#4464 and #4300; supersedes the 2026-09-26 bind at `eba96b307`)
 >
 > Re-validated and re-bound against `f32c18dadf8a659567960747cc2802186bac9de9`
 > at the v1.0.0 promotion tip on 2026-09-21: §5.4(2) posture legs re-measured at 22 checks
@@ -78,6 +78,91 @@ certification and triggers re-cert** (see §7).
 > `git diff --stat e22bc93c b80e7fff` is empty). This re-issue adds the
 > committed evidence bundle under `docs/compliance/evidence/cert-54/`
 > and this document's own ratification / caveat corrections.
+>
+> **Re-issue (2026-10-02, batch 6 @ `385da3a05`).** The §7 re-cert trigger
+> FIRED: three watched federation-wire paths changed between `eba96b307` and
+> `385da3a05` — `src/handlers/federation_receive.rs` (+33/−2),
+> `src/handlers/federation_signing_check.rs` (+36/−1) and
+> `src/federation/sync.rs` (+1/−1) — from FIVE commits: `ba30231af`
+> (`fix(#4023)`: re-authorize peer namespace scope inside the federation
+> merge transaction), `249a48601` (`fix(#4408)`: skip federated signals with
+> an invalid recipient on both backends), `5881cfe19` (`fix(#4400)`: the
+> postgres `/sync/push` chokepoint consults the audit-trail latch),
+> `88c3201d7` (`fix(#4464,#4465)`: the audit-trail latch never erases a
+> concurrent failure) and `0a9d83760` (`fix(governance)` #4300/#4414/#4415:
+> host canonicaliser). **The diff is 74 lines, 49 of them code** (measured
+> with `git diff -U0`, comment / blank lines stripped). The `AI_MEMORY_FED_*`
+> identifier set is IDENTICAL across the range (30 = 30). Discharged by full
+> re-issue.
+>
+> §5.4(2)–(5) were **re-run at `385da3a05`**, not carried forward: the range
+> `eba96b307..385da3a05` is 360 commits (280 non-merge) — the promotion-4 →
+> release landings and the batch-6 assembly (#4338, #4443, #4341, #4462,
+> #4463, the diagram-twin trio, #4300, #4023, #4400 v4 `c0040eceb`, #4408,
+> #4333 v2 `26d8d9015`) — all on the binary the legs certify. The batch was
+> re-assembled from the first assembly `4d301e051` after its gate found two
+> reds (#4400's MCP record-stop fence rendered database text; the bootstrap
+> cert gate built a binary without `sal-postgres`); this record was re-run
+> on the re-assembled tree rather than carried from `4d301e051`, whose
+> watched federation-wire tree is byte-identical. Every figure below was measured on this SHA.
+>
+> **§5.4(2) posture legs** (evidence: `docs/compliance/evidence/cert-385da3a05/`;
+> reproducible with `cert-385da3a05/recapture-posture.sh`, a copy of the #3607
+> recapture script retargeted to this bundle, whose header declares the 22
+> checks): leg 1 bare — exit **2**, 12 PASS / 10 FAIL; leg 2 hardened, gate
+> unarmed — exit **2**, 20 / 2; leg 3 hardened, gate ARMED — exit **1**,
+> refuses boot; leg 4 certified configuration (sqlcipher build,
+> `ENCRYPT_AT_REST=1`, gate ARMED, `AI_MEMORY_DB_SYNCHRONOUS=FULL`, operator
+> key pair) — exit **0**, **22 PASS / 0 FAIL**. The four exit statuses are
+> recorded in `cert-385da3a05/posture-legs-exit-codes.txt`; the bare and
+> hardened legs fail exactly the same checks as at `eba96b307`.
+>
+> **§5.4(4)/(7) acceptance battery** — 11 invocations, default features, one
+> filter each; **11/11 green, zero failures**:
+> `boot_fail_closed_config_3166` 15 · `doctor_posture_exit_code_3003` 2 ·
+> `doctor_synchronous_posture_3553` 3 · `federation_catchup_posture_3582` 1 ·
+> `federation_namespace_gate_3582` 3 · `federation_peer_posture_3582` 10 ·
+> `federation_write_ns_scope_2447` 6 · `posture_control15_pg_resolution_3106` **3** ·
+> `--lib enterprise_federation_posture` **37** · `--lib federation::peer_posture` 5 ·
+> `--lib cli::backup::tests` 81. The lib slice was run as THREE separate
+> invocations. The two lower counts (4 → 3, 39 → 37) are #4434 (`7dc81b48a`,
+> `e7ddb40ea`): a build without `sal-postgres` cannot prove the driver's
+> `sslmode` pin, so pg control #15 must FAIL there and the cells asserting the
+> pg PASS are now gated on `sal-postgres` (a default build runs the
+> fail-closed twin `pg_control_15_never_passes_without_sal_postgres_4434`).
+> Because the default battery no longer reaches those cells, they were run in
+> a **`--features sal-postgres` coverage leg**: `posture_control15_pg_resolution_3106`
+> **4** (incl. `certified_pg_config_reaches_all_pass`) and
+> `--lib enterprise_federation_posture` **39**, both green, 0 failed. Exact
+> `test result:` lines in `cert-385da3a05/test-results.txt`.
+>
+> **§5.4(5) removal proof** — `scripts/check-cert-removal-proof.sh`, all 15
+> controls, no flags, umask 022, run bare (holding one deputy build-slot
+> lock): **`overall: PASS`, 15 `[PROVEN]` (`broken→RED (rc=101),
+> restored→GREEN (rc=0)` each), 0 `[CERT-RED]`**, rc 0; the tracked tree was
+> byte-identical after the run. Full log `cert-385da3a05/removal-proof-full.log`.
+> This is the ONE removal proof for the batch: the merger's landing guard
+> cites this run (copied with a provenance line) rather than running its own.
+>
+> **Bootstrap cert gate** — `scripts/check-bootstrap-cert-gate.sh` (the
+> two-shape gate from #4333 v2) on its SELF-BUILD path, both binaries built by
+> the gate itself: leg A-pg (`sal,sal-postgres`) 5/5 `[PASS]`, leg
+> A-driverless 1/1 `[PASS]` (the certified pg config is REFUSED with the sole
+> fail-row `AI_MEMORY_PG_AT_REST_ATTESTED`), leg B 8/8 `[PASS]`;
+> `CERT-BOOTSTRAP GATE: PASS`, rc 0. Output in
+> `cert-385da3a05/bootstrap-cert-gate.log`.
+>
+> **§5.4(3)** pg+AGE and the self-hosted federation lanes are cited from CI;
+> at the time of writing NO CI run exists on `385da3a05` (the re-assembled
+> batch-6 tip has no PR), so the run ids are **not
+> yet recorded here** and this leg is **pending** until CI on the merged
+> batch-6 tail reports. The earlier `eba96b307` runs are NOT carried forward
+> as if they covered this SHA.
+>
+> Labour split, recorded: f2h (ai:rehearsal-f2h) RAN every leg, WROTE this
+> record and generated `MANIFEST.sha256` LAST; f2r is asked to VERIFY every
+> number against the committed evidence (author ≠ reviewer) — until that is
+> recorded here the re-issue is author-attested only.
 >
 > **Re-issue (2026-09-26, promotion 4 @ `eba96b307`).** The §7 re-cert trigger
 > FIRED: two watched federation-wire paths changed between `eae99be43` and
