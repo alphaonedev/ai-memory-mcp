@@ -19,9 +19,12 @@
 //! * the budget is DERIVED from the production pool and lock timeouts and is
 //!   strictly larger than the old literal;
 //! * a live cell reproduces the cold backend deterministically: a login event
-//!   trigger makes every NEW connection to a scratch database take 24 s (more
-//!   than the old 20 s deadline, less than the pool's 30 s acquire timeout), and
-//!   the barrier must still be reached through the shared budget.
+//!   trigger makes every NEW connection to a scratch database take the pool's
+//!   acquire timeout minus 8 s (22 s: more than the old 20 s deadline, less than
+//!   the pool's 30 s), and the barrier must still be reached through the shared
+//!   budget;
+//! * the scratch database carries its creation time in its name and a later run
+//!   sweeps orphans of a killed run (#4489).
 //!
 //! Live-PG cell: `#[ignore]`-gated (the postgres-ignored tier), skipped when
 //! `AI_MEMORY_TEST_POSTGRES_URL` is unset, scratch database created and dropped
@@ -39,25 +42,10 @@ use sqlx::postgres::PgPoolOptions;
 
 /// The free-standing deadline every barrier used before #4336.
 const LEGACY_BARRIER_DEADLINE: Duration = Duration::from_secs(20);
-/// Cold-login latency injected for the live cell: past the legacy deadline and
-/// inside the pool's 30 s acquire timeout (a legitimate, if slow, connect).
-const INJECTED_LOGIN_DELAY_SECS: u64 = 24;
+/// Prefix of this suite's cluster-level scratch databases.
+const SCRATCH_PREFIX: &str = "ai_memory_4336";
 /// Advisory-lock key the holder takes and the writer queues behind.
 const LOCK_KEY: i64 = 4336;
-
-/// Swap the database name in a postgres URL, preserving the query string
-/// (this tier pins `sslmode=verify-full` + a CA path in it).
-fn with_database(url: &str, db: &str) -> String {
-    let (base, query) = url.split_once('?').map_or((url, ""), |(b, q)| (b, q));
-    let trimmed = base.trim_end_matches('/');
-    let cut = trimmed.rfind('/').expect("postgres url has a path segment");
-    let mut out = format!("{}/{db}", &trimmed[..cut]);
-    if !query.is_empty() {
-        out.push('?');
-        out.push_str(query);
-    }
-    out
-}
 
 #[test]
 fn barrier_budget_covers_the_pool_acquire_and_lock_budgets_4336() {
@@ -73,9 +61,14 @@ fn barrier_budget_covers_the_pool_acquire_and_lock_budgets_4336() {
         "a barrier must outlast a connection the pool is still willing to wait for \
          ({acquire:?}) plus the lock wait ({lock:?}); got {budget:?}"
     );
+    let injected = pg_barrier::injected_login_delay();
     assert!(
-        Duration::from_secs(INJECTED_LOGIN_DELAY_SECS) < acquire,
-        "the injected delay must be a connect the pool still accepts"
+        injected > LEGACY_BARRIER_DEADLINE,
+        "the injected delay must exceed the legacy deadline or the cell proves nothing"
+    );
+    assert!(
+        injected + Duration::from_secs(8) <= acquire,
+        "the injected delay must leave margin under the pool acquire timeout ({acquire:?})"
     );
 }
 
@@ -83,30 +76,18 @@ fn barrier_budget_covers_the_pool_acquire_and_lock_budgets_4336() {
 #[ignore = "live postgres: AI_MEMORY_TEST_POSTGRES_URL (postgres-ignored tier)"]
 async fn barrier_is_reached_when_the_writer_connects_cold_4336() {
     let Ok(url) = std::env::var("AI_MEMORY_TEST_POSTGRES_URL") else {
-        eprintln!("SKIP barrier_is_reached_when_the_writer_connects_cold_4336: no live postgres");
+        eprintln!(
+            "skip: AI_MEMORY_TEST_POSTGRES_URL not set (barrier_is_reached_when_the_writer_connects_cold_4336)"
+        );
         return;
     };
-    let db = format!("ai_memory_4336_{}", uuid::Uuid::new_v4().simple());
-    let scratch = with_database(&url, &db);
-    let admin = PgPoolOptions::new()
-        .max_connections(1)
-        .connect(&url)
-        .await
-        .expect("connect admin pool");
-    sqlx::raw_sql(&format!("CREATE DATABASE \"{db}\""))
-        .execute(&admin)
+    // The guard drops the scratch database on every exit, including a panic.
+    let scratch = pg_barrier::ScratchDb::create(&url, SCRATCH_PREFIX)
         .await
         .expect("create scratch database");
 
-    let outcome = run_case(&scratch).await;
+    let outcome = run_case(&scratch.url()).await;
 
-    let dropped = sqlx::raw_sql(&format!("DROP DATABASE IF EXISTS \"{db}\" WITH (FORCE)"))
-        .execute(&admin)
-        .await;
-    if let Err(e) = dropped {
-        eprintln!("WARN: could not drop scratch database {db}: {e}");
-    }
-    admin.close().await;
     if let Err(msg) = outcome {
         panic!("{msg}");
     }
@@ -142,15 +123,11 @@ async fn run_case(scratch: &str) -> Result<(), String> {
         .await
         .map_err(|e| format!("holder lock: {e}"))?;
 
-    // Every NEW login to this database now takes INJECTED_LOGIN_DELAY_SECS.
-    sqlx::raw_sql(&format!(
-        "CREATE FUNCTION slow_login_4336() RETURNS event_trigger LANGUAGE plpgsql AS \
-         $$ BEGIN PERFORM pg_sleep({INJECTED_LOGIN_DELAY_SECS}); END $$; \
-         CREATE EVENT TRIGGER slow_login_4336 ON login EXECUTE FUNCTION slow_login_4336();"
-    ))
-    .execute(&mut probe)
-    .await
-    .map_err(|e| format!("install login delay (needs a superuser role): {e}"))?;
+    // Every NEW login to this database now takes `injected_login_delay()`.
+    sqlx::raw_sql(&pg_barrier::login_delay_sql("slow_login_4336", "true"))
+        .execute(&mut probe)
+        .await
+        .map_err(|e| format!("install login delay (needs a superuser role): {e}"))?;
 
     let writer = {
         let pool = pool.clone();
@@ -209,4 +186,105 @@ async fn run_case(scratch: &str) -> Result<(), String> {
         .map_err(|e| format!("writer failed: {e}"))?;
     drop(held);
     Ok(())
+}
+
+/// #4489: a killed run leaves its scratch database (and its login-delay trigger)
+/// behind. The next run sweeps orphans older than the stale age and never
+/// touches a fresh one, so a concurrent live run is safe.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "live postgres: AI_MEMORY_TEST_POSTGRES_URL (postgres-ignored tier)"]
+async fn stale_scratch_database_is_swept_and_a_fresh_one_is_kept_4489() {
+    let Ok(url) = std::env::var("AI_MEMORY_TEST_POSTGRES_URL") else {
+        eprintln!(
+            "skip: AI_MEMORY_TEST_POSTGRES_URL not set (stale_scratch_database_is_swept_and_a_fresh_one_is_kept_4489)"
+        );
+        return;
+    };
+    // A prefix of its own so this cell never races the cold-backend cell's sweep.
+    let prefix = "ai_memory_4489sweep";
+    let admin = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&url)
+        .await
+        .expect("connect admin pool");
+    let now = pg_barrier::unix_now();
+    let stale_age = pg_barrier::STALE_SCRATCH_AGE.as_secs();
+    let stale = pg_barrier::scratch_db_name(prefix, now - stale_age - 60);
+    let fresh = pg_barrier::scratch_db_name(prefix, now);
+    let unparseable = format!("{prefix}_notatimestamp_{}", &fresh[fresh.len() - 8..]);
+    for db in [&stale, &fresh, &unparseable] {
+        sqlx::raw_sql(&format!("CREATE DATABASE \"{db}\""))
+            .execute(&admin)
+            .await
+            .expect("create fixture database");
+    }
+    let swept = pg_barrier::sweep_stale_scratch_dbs(&admin, prefix, now).await;
+    let exists = |db: String| {
+        let admin = admin.clone();
+        async move {
+            sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = $1)",
+            )
+            .bind(db)
+            .fetch_one(&admin)
+            .await
+            .expect("catalog probe")
+        }
+    };
+    let (stale_left, fresh_left, odd_left) = (
+        exists(stale.clone()).await,
+        exists(fresh.clone()).await,
+        exists(unparseable.clone()).await,
+    );
+    for db in [&stale, &fresh, &unparseable] {
+        sqlx::raw_sql(&format!("DROP DATABASE IF EXISTS \"{db}\" WITH (FORCE)"))
+            .execute(&admin)
+            .await
+            .expect("drop fixture database");
+    }
+    admin.close().await;
+    let swept = swept.expect("sweep");
+    assert_eq!(swept, vec![stale.clone()], "only the stale orphan is swept");
+    assert!(!stale_left, "the stale orphan must be gone");
+    assert!(
+        fresh_left,
+        "a fresh scratch database (a live run) must be kept"
+    );
+    assert!(odd_left, "a name that does not parse is never swept");
+}
+
+/// #4489: the guard drops the scratch database on a panic unwind too.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "live postgres: AI_MEMORY_TEST_POSTGRES_URL (postgres-ignored tier)"]
+async fn scratch_guard_drops_the_database_on_panic_4489() {
+    let Ok(url) = std::env::var("AI_MEMORY_TEST_POSTGRES_URL") else {
+        eprintln!("SKIP scratch_guard_drops_the_database_on_panic_4489: no live postgres");
+        return;
+    };
+    let scratch = pg_barrier::ScratchDb::create(&url, "ai_memory_4489guard")
+        .await
+        .expect("create scratch database");
+    let name = scratch.name().to_string();
+    let joined = tokio::spawn(async move {
+        let _guard = scratch;
+        panic!("planted panic with the guard in scope");
+    })
+    .await;
+    assert!(joined.is_err(), "the task must have panicked");
+    let admin = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&url)
+        .await
+        .expect("connect admin pool");
+    let left: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = $1)")
+            .bind(&name)
+            .fetch_one(&admin)
+            .await
+            .expect("catalog probe");
+    admin.close().await;
+    assert!(
+        !left,
+        "the guard must drop the scratch database on a panic unwind"
+    );
 }
