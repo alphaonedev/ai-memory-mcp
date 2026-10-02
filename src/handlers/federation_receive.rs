@@ -3275,6 +3275,29 @@ async fn sync_push_write(
             .into_response();
     }
 
+    // #4447 — the by-id lanes below (deletions / archives / restores / links)
+    // each probe a target row's STORED namespace on a read that precedes the
+    // write transaction; a broader writer on a second connection (or process)
+    // can move the row out of the peer's scope in between. Each lane's write is
+    // therefore the `*_authorized` free-fn, which re-evaluates THIS verdict on
+    // the namespace read under the write lock. The verdict is the same shared
+    // `inbound_by_id_namespace_authorized` the pre-check uses, with the stored
+    // namespace elided exactly when the pre-check elides it (Layer 2 only).
+    let by_id_needs_stored = crate::federation::receive_auth::peer_declares_namespace_scope(
+        peer_header_owned.as_deref(),
+        &attest_cfg,
+    );
+    let by_id_verdict = |lane: &str, id: &str, stored: &str| -> bool {
+        crate::federation::receive_auth::inbound_by_id_namespace_authorized(
+            lane,
+            id,
+            by_id_needs_stored.then_some(stored),
+            &attest_cfg,
+            peer_header_owned.as_deref(),
+            require_push_ns_scope,
+        )
+    };
+
     // Process deletions (v0.6.0.1 — scenario 10 fanout). Invalid ids are
     // skipped silently; missing rows count as no-op. Peers that have
     // already GC'd the row see identical post-state.
@@ -3368,7 +3391,9 @@ async fn sync_push_write(
                 continue;
             }
         }
-        match db::delete(&lock.0, del_id) {
+        match db::delete_authorized(&lock.0, del_id, &|id: &str, stored: &str| {
+            by_id_verdict(crate::federation::receive_auth::LANE_DELETIONS, id, stored)
+        }) {
             Ok(true) => deleted += 1,
             Ok(false) => noop += 1,
             Err(e) => {
@@ -3429,7 +3454,14 @@ async fn sync_push_write(
                 }
             }
         }
-        match db::archive_memory(&lock.0, arch_id, Some("sync_push")) {
+        match db::archive_memory_authorized(
+            &lock.0,
+            arch_id,
+            Some("sync_push"),
+            &|id: &str, stored: &str| {
+                by_id_verdict(crate::federation::receive_auth::LANE_ARCHIVES, id, stored)
+            },
+        ) {
             Ok(true) => archived += 1,
             Ok(false) => noop += 1,
             Err(e) => {
@@ -3509,7 +3541,9 @@ async fn sync_push_write(
                 continue;
             }
         }
-        match db::restore_archived(&lock.0, res_id) {
+        match db::restore_archived_authorized(&lock.0, res_id, &|id: &str, stored: &str| {
+            by_id_verdict(crate::federation::receive_auth::LANE_RESTORES, id, stored)
+        }) {
             Ok(true) => restored += 1,
             Ok(false) => noop += 1,
             Err(e) => {
@@ -3677,7 +3711,14 @@ async fn sync_push_write(
             _ => crate::models::AttestLevel::Unsigned.as_str(),
         };
 
-        match db::create_link_inbound(&lock.0, link, attest_level) {
+        match db::create_link_inbound_authorized(
+            &lock.0,
+            link,
+            attest_level,
+            &|id: &str, stored: &str| {
+                by_id_verdict(crate::federation::receive_auth::LANE_LINKS, id, stored)
+            },
+        ) {
             Ok(()) => links_applied += 1,
             Err(e) => {
                 tracing::warn!(
