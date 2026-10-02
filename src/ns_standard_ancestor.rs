@@ -24,11 +24,12 @@
 //! cannot classify the same chain differently (the #2488 lesson).
 //!
 //! Corrupt ancestor metadata (#4356 CR1): the deciding level is classified
-//! from the RAW stored metadata by [`classify_standard_metadata`], the local
-//! equivalent of the #4285 classifier (same three outcomes, same rule: not
-//! JSON, not an object, or a `governance` blob that fails the typed
-//! deserialise is corrupt). A corrupt level is [`AncestorLevel::Severed`] and
-//! refuses every non-bypass first bind below it, on both backends.
+//! from the stored metadata by the shared #4285 classifier
+//! (`crate::storage::classify_standard_metadata_value` / `_text`: not JSON,
+//! not an object, or a `governance` blob that fails the typed deserialise is
+//! corrupt); this module only ADDS the owner dimension (a non-string
+//! `agent_id` is corrupt too). A corrupt level is [`AncestorLevel::Severed`]
+//! and refuses every non-bypass first bind below it, on both backends.
 //!
 //! Race safety (#4023/#4447 TOCTOU class): every funnel re-reads the chain
 //! inside the bind's own write transaction. On sqlite that transaction is
@@ -108,23 +109,21 @@ pub const REASON_STANDARD_UNVERIFIABLE: &str = "cannot verify the namespace-stan
 pub const PG_STANDARD_BIND_LOCK_KEY: &str = "ai_memory:namespace_meta:standard_bind";
 
 /// #4356 CR1 — what a bound standard's stored metadata contributes to the
-/// gate. The local equivalent of the #4285 classifier
-/// (`classify_standard_metadata_value`): metadata that is not a JSON object,
-/// or whose `governance` blob fails the typed deserialise, is corrupt and the
-/// level is [`AncestorLevel::Severed`] (fail closed: a corrupt ancestor never
-/// lets a non-owner bind). A `governance` key that is absent or JSON `null`
-/// carries no policy ([`AncestorLevel::NoPolicy`]). A governing standard's
-/// owner is `metadata.agent_id`: absent / `null` / empty / `system` is
-/// unowned; a non-string `agent_id` is corrupt (Severed), never "unowned".
+/// gate. The corrupt / no-policy / policy partition is DELEGATED to the #4285
+/// classifier (`classify_standard_metadata_value`) so the two cannot drift;
+/// this adds only the owner: a governing standard's owner is
+/// `metadata.agent_id` (absent / `null` / empty / `system` is unowned; a
+/// non-string `agent_id` is corrupt, Severed, never "unowned" — stricter than
+/// #4285, fail closed). Corrupt (not JSON, not an object, or a `governance`
+/// blob failing the typed deserialise) is [`AncestorLevel::Severed`]; a
+/// `governance` key absent or JSON `null` is [`AncestorLevel::NoPolicy`].
 #[must_use]
 pub fn classify_standard_metadata(metadata: &serde_json::Value) -> AncestorLevel {
-    if !metadata.is_object() {
-        return AncestorLevel::Severed;
-    }
-    match crate::models::GovernancePolicy::from_metadata(metadata) {
-        None => AncestorLevel::NoPolicy,
-        Some(Err(_)) => AncestorLevel::Severed,
-        Some(Ok(_)) => match metadata.get(crate::mcp::param_names::AGENT_ID) {
+    use crate::storage::{StandardMetadata, classify_standard_metadata_value};
+    match classify_standard_metadata_value(metadata) {
+        StandardMetadata::Corrupt(_) => AncestorLevel::Severed,
+        StandardMetadata::NoGovernance => AncestorLevel::NoPolicy,
+        StandardMetadata::Policy(..) => match metadata.get(crate::mcp::param_names::AGENT_ID) {
             None | Some(serde_json::Value::Null) => AncestorLevel::Governing { owner: None },
             Some(serde_json::Value::String(o)) => AncestorLevel::Governing {
                 owner: normalise_owner(Some(o.clone())),
@@ -135,12 +134,20 @@ pub fn classify_standard_metadata(metadata: &serde_json::Value) -> AncestorLevel
 }
 
 /// [`classify_standard_metadata`] over the RAW stored text (the sqlite
-/// column). Unparseable text is corrupt ([`AncestorLevel::Severed`]); the
-/// lenient row mapper would read it as `{}` ("no policy") and fail open.
+/// column): the shared #4285 text classifier decides corrupt vs no-policy;
+/// unparseable text is corrupt ([`AncestorLevel::Severed`]) — the lenient row
+/// mapper would read it as `{}` ("no policy") and fail open.
 #[must_use]
 pub fn classify_standard_metadata_text(raw: &str) -> AncestorLevel {
-    serde_json::from_str::<serde_json::Value>(raw)
-        .map_or(AncestorLevel::Severed, |v| classify_standard_metadata(&v))
+    use crate::storage::{StandardMetadata, classify_standard_metadata_text as shared};
+    match shared(raw) {
+        StandardMetadata::Corrupt(_) => AncestorLevel::Severed,
+        StandardMetadata::NoGovernance => AncestorLevel::NoPolicy,
+        // Policy: parse once more for the owner (the shared Policy variant
+        // carries only the governance blob).
+        StandardMetadata::Policy(..) => serde_json::from_str::<serde_json::Value>(raw)
+            .map_or(AncestorLevel::Severed, |v| classify_standard_metadata(&v)),
+    }
 }
 
 /// Normalise a standard's owner: empty / `system` / absent = unowned.

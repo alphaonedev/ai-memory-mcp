@@ -287,7 +287,8 @@ pub fn classify_standard_metadata_value(metadata: &serde_json::Value) -> Standar
 }
 
 /// #4285 — classify the RAW stored `metadata` text of a bound standard. This is
-/// the reusable fail-closed classifier (#4356 reuses it): the lenient row mapper
+/// the reusable fail-closed classifier (`ns_standard_ancestor` delegates its
+/// corrupt / no-policy decision to it, #4356): the lenient row mapper
 /// defaults unparseable metadata to `{}`, which reads as "no policy" — fail
 /// OPEN — so a governance read must classify the raw column, not the mapped
 /// `Memory.metadata`.

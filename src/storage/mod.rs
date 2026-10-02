@@ -22903,7 +22903,10 @@ fn build_namespace_chain_view(
 /// # Errors
 ///
 /// #4043 — any `namespace_meta` / standard read fault on the walk.
-fn build_namespace_governance_chain(conn: &Connection, namespace: &str) -> Result<Vec<String>> {
+pub(crate) fn build_namespace_governance_chain(
+    conn: &Connection,
+    namespace: &str,
+) -> Result<Vec<String>> {
     build_namespace_chain_view(conn, namespace, ChainView::Governance)
 }
 

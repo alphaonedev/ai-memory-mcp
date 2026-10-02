@@ -6,12 +6,11 @@
 //! governance chain's levels (nearest-first, the target and `*` excluded).
 //!
 //! Every read here is FALLIBLE (a fault refuses the bind, vote amendment d):
-//! the chain is built by [`governance_chain_strict`], the fault-propagating
-//! twin of the lenient `build_namespace_governance_chain` (which swallows a
-//! parent / owner read fault into "no parent" and would drop an explicit
-//! ancestor, fail-open for this gate). The twin calls the same canonical
-//! helpers on the no-fault path and is pinned equal to the lenient builder by
-//! `strict_chain_matches_the_governance_chain_4356`.
+//! the chain is the shared [`super::build_namespace_governance_chain`], which
+//! (since #4043) propagates every parent / owner read fault as an `Err` instead
+//! of swallowing it into "no parent" — a dropped explicit ancestor would be
+//! fail-open for this gate. #4356 originally carried a separate strict twin;
+//! it is gone so the two builders cannot drift.
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -20,10 +19,6 @@ use crate::ns_standard_ancestor::{
     AncestorLevel, GoverningAncestor, SetRefusal, classify_standard_metadata_text,
     select_governing_ancestor, set_admission,
 };
-
-/// Explicit-parent hop cap; the SAME bound as the lenient builder
-/// (`build_namespace_chain_view`'s `MAX_EXPLICIT_DEPTH`).
-const MAX_EXPLICIT_DEPTH: usize = 8;
 
 /// The RAW level row: `namespace_meta.standard_id` and the bound memory's RAW
 /// `metadata` text. `LEFT JOIN` keeps a severed / dangling row visible.
@@ -58,98 +53,13 @@ fn read_level(conn: &Connection, namespace: &str) -> Result<AncestorLevel> {
     })
 }
 
-/// Fallible `namespace_meta.parent_namespace` read (twin of the lenient
-/// `get_namespace_parent`, same SQL).
-fn parent_strict(conn: &Connection, namespace: &str) -> Result<Option<String>> {
-    conn.query_row(
-        "SELECT parent_namespace FROM namespace_meta WHERE namespace = ?1 AND parent_namespace IS NOT NULL",
-        params![namespace],
-        |r| r.get(0),
-    )
-    .optional()
-    .context("#4356 ancestor chain: parent_namespace read")
-}
-
-/// Fallible twin of the lenient `namespace_standard_owner` (#2542 entitlement
-/// owner): the same `standard_id` probe, the same `db::get` row mapping and
-/// the same unowned set, but a read fault propagates.
-fn standard_owner_strict(conn: &Connection, namespace: &str) -> Result<Option<String>> {
-    let sid: Option<Option<String>> = conn
-        .query_row(
-            "SELECT nm.standard_id FROM namespace_meta nm WHERE nm.namespace = ?1",
-            params![namespace],
-            |r| r.get(0),
-        )
-        .optional()
-        .context("#4356 ancestor chain: standard_id read")?;
-    let Some(sid) = sid.flatten() else {
-        return Ok(None);
-    };
-    let owner = super::get(conn, &sid)?.and_then(|mem| {
-        mem.metadata
-            .get(crate::mcp::param_names::AGENT_ID)
-            .and_then(|v| v.as_str())
-            .map(str::to_string)
-    });
-    Ok(crate::ns_standard_ancestor::normalise_owner(owner))
-}
-
-/// The GOVERNANCE chain of `namespace` (top-down, `*` first), built exactly
-/// as the lenient `build_namespace_governance_chain` builds it — `/`-derived
-/// ancestors plus the ENTITLED explicit parents above the rootmost one
-/// (#2542 per-hop rule) — except that every read fault is an `Err`.
-///
-/// # Errors
-///
-/// Any SQLite read fault.
-pub(crate) fn governance_chain_strict(conn: &Connection, namespace: &str) -> Result<Vec<String>> {
-    let mut chain = vec!["*".to_string()];
-    if namespace == "*" {
-        return Ok(chain);
-    }
-    let hierarchy: Vec<String> = crate::models::namespace_ancestors(namespace)
-        .into_iter()
-        .rev()
-        .collect();
-    if let Some(root) = hierarchy.first().cloned() {
-        let mut explicit_above: Vec<String> = Vec::new();
-        let mut current = root;
-        for _ in 0..MAX_EXPLICIT_DEPTH {
-            let Some(p) = parent_strict(conn, &current)? else {
-                break;
-            };
-            if p == "*" || explicit_above.contains(&p) || hierarchy.contains(&p) {
-                break;
-            }
-            let entitled = match standard_owner_strict(conn, &p)? {
-                None => true,
-                Some(parent_owner) => {
-                    standard_owner_strict(conn, &current)?.as_deref() == Some(parent_owner.as_str())
-                }
-            };
-            if !entitled {
-                break;
-            }
-            explicit_above.push(p.clone());
-            current = p;
-        }
-        chain.extend(explicit_above.into_iter().rev());
-    }
-    for entry in hierarchy {
-        if !chain.contains(&entry) {
-            chain.push(entry);
-        }
-    }
-    Ok(chain)
-}
-
 /// The nearest governing ancestor of `namespace` on the GOVERNANCE chain.
 ///
 /// # Errors
 ///
 /// Any SQLite error (the caller refuses — fail-closed).
 pub fn governing_ancestor_binding(conn: &Connection, namespace: &str) -> Result<GoverningAncestor> {
-    let chain = governance_chain_strict(conn, namespace)?;
+    let chain = super::build_namespace_governance_chain(conn, namespace)?;
     select_governing_ancestor(
         chain
             .iter()
@@ -223,39 +133,6 @@ mod tests {
         .expect("insert namespace_meta");
     }
 
-    /// The strict twin is the lenient governance builder on every no-fault
-    /// fixture: no row, an entitled explicit parent, an UNENTITLED
-    /// (cross-tenant, dropped) parent, an unowned parent and a cycle.
-    #[test]
-    fn strict_chain_matches_the_governance_chain_4356() {
-        let c = conn();
-        let a = standard(&c, "s", r#"{"agent_id":"a"}"#);
-        let b = standard(&c, "s", r#"{"agent_id":"b"}"#);
-        let u = standard(&c, "s", r#"{"agent_id":"system"}"#);
-        meta(&c, "top", Some(&a), None);
-        meta(&c, "same", Some(&a), Some("top"));
-        meta(&c, "cross", Some(&b), Some("top"));
-        meta(&c, "free", Some(&u), None);
-        meta(&c, "tofree", Some(&b), Some("free"));
-        meta(&c, "cyc1", Some(&a), Some("cyc2"));
-        meta(&c, "cyc2", Some(&a), Some("cyc1"));
-        for ns in [
-            "none/x/y", "same", "same/x", "cross/x", "tofree/x", "cyc1/x", "*", "top",
-        ] {
-            assert_eq!(
-                governance_chain_strict(&c, ns).expect("strict"),
-                crate::storage::build_namespace_governance_chain(&c, ns),
-                "{ns}"
-            );
-        }
-        assert!(
-            !governance_chain_strict(&c, "cross/x")
-                .expect("strict")
-                .contains(&"top".to_string()),
-            "a cross-tenant explicit parent is not on the governance chain"
-        );
-    }
-
     /// #4356 CR1 at the reader: an ancestor whose stored metadata is a JSON
     /// array / string / invalid text / a corrupt governance blob is SEVERED,
     /// so a stranger's first bind below it is refused (never NoPolicy-skipped).
@@ -292,6 +169,49 @@ mod tests {
         assert_eq!(
             set_admission_conn(&c, "s", false, "gov/leaf"),
             Err(SetRefusal::Unverifiable)
+        );
+    }
+
+    /// F1 (code review, mutation-proven): the chain BUILDER must propagate a
+    /// read fault, not swallow it into "no parent". One hop's `parent_namespace`
+    /// is a BLOB (fails the String read on that hop only; every level read stays
+    /// intact), so a builder that swallowed the fault would drop the governed
+    /// `top` ancestor and ADMIT a stranger. The shared builder returns `Err` and
+    /// the gate refuses. Red if the shared builder swallows a read fault.
+    #[test]
+    fn chain_builder_propagates_a_parent_read_fault_4356() {
+        let c = conn();
+        let a = standard(
+            &c,
+            "s",
+            r#"{"agent_id":"a","governance":{"write":"owner"}}"#,
+        );
+        let n = standard(&c, "s", r#"{"agent_id":"a"}"#);
+        meta(&c, "top", Some(&a), None);
+        meta(&c, "root", Some(&n), Some("top"));
+        // Sanity (intact): the chain reaches `top`, the stranger is refused.
+        assert!(
+            crate::storage::build_namespace_governance_chain(&c, "root/leaf")
+                .expect("intact chain")
+                .contains(&"top".to_string())
+        );
+        assert_eq!(
+            set_admission_conn(&c, "stranger", false, "root/leaf"),
+            Err(SetRefusal::NotOwner)
+        );
+        c.execute(
+            "UPDATE namespace_meta SET parent_namespace = x'00ff' WHERE namespace = 'root'",
+            [],
+        )
+        .expect("blob the parent link");
+        assert!(
+            crate::storage::build_namespace_governance_chain(&c, "root/leaf").is_err(),
+            "the shared builder must propagate the read fault, not drop `top`"
+        );
+        assert_eq!(
+            set_admission_conn(&c, "stranger", false, "root/leaf"),
+            Err(SetRefusal::Unverifiable),
+            "a chain read fault refuses, never admits"
         );
     }
 }
