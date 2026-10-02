@@ -445,7 +445,8 @@ async fn pg_link_replay_locks_endpoints_in_id_order_4210() {
 /// writer's next lock, `a`, closes the cycle (40P01 on the writer, which checks
 /// first). Bytewise: consolidate parks on `B` holding nothing, the writer takes
 /// `a`, commits, and both finish. A bytewise-default database cannot invert, so
-/// the cell has nothing to prove there and returns.
+/// the cell cannot exercise the inversion there and FAILS with a message
+/// instead of passing vacuously.
 #[tokio::test]
 async fn pg_consolidate_locks_bytewise_not_default_collation_4459() {
     let _serial = SERIAL.lock().await;
@@ -460,12 +461,17 @@ async fn pg_consolidate_locks_bytewise_not_default_collation_4459() {
         .fetch_one(store.pool())
         .await
         .expect("compare default collation");
-    if !locale_inverts {
-        eprintln!(
-            "database default collation is bytewise: no inversion possible, nothing to prove"
-        );
-        return;
-    }
+    // Fail loudly, never vacuously: production's `ORDER BY id` uses the column's
+    // (database default) collation, so on a bytewise (C / POSIX) database the
+    // two orders cannot disagree and this cell would prove nothing. CI creates
+    // its ephemeral databases with `CREATE DATABASE` (inherits template1,
+    // en_US.UTF-8 on the f1 and f2 pg tier), so this holds there.
+    assert!(
+        locale_inverts,
+        "#4459 cell needs a database whose default collation orders {lo} after {hi} \
+         (a locale collation such as en_US.UTF-8); this database collates bytewise, \
+         so the cell cannot exercise the inversion"
+    );
     let ctx = CallerContext::for_agent("ai:tester");
     for id in [&lo, &hi] {
         store
