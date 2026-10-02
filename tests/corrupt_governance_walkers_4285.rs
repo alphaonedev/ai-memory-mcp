@@ -313,7 +313,7 @@ mod sqlite {
     }
 
     /// Sibling parity: an omitting child stops the skill-floor walk; null
-    /// continues; a corrupt leaf under an omitting parent is u32::MAX.
+    /// continues; a corrupt leaf under an omitting parent is `u32::MAX`.
     #[test]
     fn f2_skill_promotion_omitted_key_stops_the_walk_4285() {
         let conn = gate_chain(
