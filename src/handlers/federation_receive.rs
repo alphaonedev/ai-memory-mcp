@@ -324,7 +324,9 @@ fn stale_policy_refusal_response(sender_seq: i64, local_seq: i64) -> Response {
 /// fault clears, so a genuine transient fault degrades to a retry rather than
 /// data loss). The documented operator opt-out is UNCHANGED: with
 /// Wave-2 B5 — sqlite `/sync/push` write-dispatch record-stop CHOKEPOINT.
-/// Returns `Some(503 RECORD_STOPPED)` when the record plane is stopped so
+/// Returns `Some(503)` (code `RECORD_STOPPED`, or `RECORD_STOP_INDETERMINATE` /
+/// `AUDIT_TRAIL_UNAVAILABLE` for the gate's other refusals, #4400) when the
+/// record plane is stopped so
 /// every receive write in this request is fenced at one call site
 /// (ERRORS-09). `None` means the write-dispatch may proceed.
 fn refuse_if_record_stopped(conn: &rusqlite::Connection) -> Option<Response> {
