@@ -183,6 +183,8 @@ const NOT_OBSERVED_PRE_P3: &str = "not_observed (pre-P3 rolling counter)";
 const SECTION_POSTGRES_EXTENSIONS: &str = "Postgres extensions (#3264)";
 /// v1.0.0 #3124 — the unstamped-owner census row (both backends).
 const SECTION_UNSTAMPED_OWNERS: &str = "Unstamped owners (#3124)";
+/// #4285 — corrupt governance standards (resolved as SEVERED, Owner floor).
+const SECTION_CORRUPT_GOVERNANCE: &str = "Corrupt governance standards (#4285)";
 
 /// #3264 — anyhow context when the ephemeral probe runtime cannot be built.
 #[cfg(feature = "sal-postgres")]
@@ -1664,6 +1666,10 @@ fn run_local(db_path: &Path, caller_agent_id: Option<&str>) -> Report {
     if let Some(pg) = section_postgres_unstamped_owners_3124() {
         sections.push(pg);
     }
+    #[cfg(feature = "sal-postgres")]
+    if let Some(pg) = section_postgres_corrupt_governance_4285() {
+        sections.push(pg);
+    }
 
     // Open the connection once, READ-ONLY. A missing path is a refusal,
     // never a create-and-migrate (#3434 — clap advertises "never mutates").
@@ -1821,6 +1827,10 @@ fn run_local(db_path: &Path, caller_agent_id: Option<&str>) -> Report {
     ));
     sections.push(section_recall_local());
     sections.push(section_governance(&conn));
+    sections.push(section_corrupt_governance_4285(
+        crate::storage::list_corrupt_governance_standards(&conn),
+        crate::storage::CORRUPT_STANDARD_BACKEND_SQLITE,
+    ));
     sections.push(section_sync(&conn));
     sections.push(section_webhook(&conn));
     sections.push(section_capabilities_local());
@@ -2027,6 +2037,89 @@ fn section_postgres_unstamped_owners_3124() -> Option<ReportSection> {
     Some(section_unstamped_owners_3124(
         census,
         crate::identity::owner_stamp::BACKEND_LABEL_POSTGRES,
+    ))
+}
+
+/// #4285 — render the corrupt-governance-standard census for one backend.
+/// `Info` when none; `Critical` listing EVERY corrupt standard otherwise (each
+/// resolves as SEVERED: the Owner floor, which can only ever TIGHTEN — a policy
+/// that meant stricter than Owner is degraded to Owner until repaired). A
+/// census that could not be read is `Critical`, never reported as none.
+fn section_corrupt_governance_4285(
+    census: Result<Vec<crate::storage::CorruptStandard>>,
+    backend: &str,
+) -> ReportSection {
+    let mut facts = vec![("backend".into(), backend.to_string())];
+    let corrupt = match census {
+        Ok(c) => c,
+        Err(e) => {
+            facts.push(("error".into(), format!("{e:#}")));
+            return ReportSection {
+                name: SECTION_CORRUPT_GOVERNANCE.into(),
+                severity: Severity::Critical,
+                facts,
+                note: Some("the corrupt governance standard census could not be read".into()),
+            };
+        }
+    };
+    facts.push(("corrupt_standards".into(), corrupt.len().to_string()));
+    if corrupt.is_empty() {
+        return ReportSection {
+            name: SECTION_CORRUPT_GOVERNANCE.into(),
+            severity: Severity::Info,
+            facts,
+            note: None,
+        };
+    }
+    for c in &corrupt {
+        facts.push((
+            format!("corrupt::{}", c.namespace),
+            format!("standard {}: {}", c.standard_id, c.error),
+        ));
+    }
+    ReportSection {
+        name: SECTION_CORRUPT_GOVERNANCE.into(),
+        severity: Severity::Critical,
+        facts,
+        note: Some(format!(
+            "{} namespace governance standard(s) carry a metadata.governance blob that does not \
+             deserialize; each resolves as SEVERED (write/promote/delete floored to Owner, \
+             #2503/#4285) — a policy that meant stricter than Owner (approve/consensus) is \
+             degraded to Owner until repaired. Re-run `memory_namespace_set_standard` for each.",
+            corrupt.len()
+        )),
+    }
+}
+
+/// #4285 — the postgres twin of [`section_corrupt_governance_4285`]; `None` on
+/// a SQLite deployment.
+#[cfg(feature = "sal-postgres")]
+fn section_postgres_corrupt_governance_4285() -> Option<ReportSection> {
+    let url = match crate::store_url::resolve_store_url(None) {
+        Ok(Some(url)) if crate::store_url::is_postgres_url(&url) => url,
+        _ => return None,
+    };
+    let census: Result<Vec<crate::storage::CorruptStandard>> = run_pg_probe(|| async move {
+        let probe = async {
+            let options = crate::store::postgres::dsn::connect_options(&url)?;
+            let pool = sqlx::postgres::PgPoolOptions::new()
+                .max_connections(1)
+                .acquire_timeout(PG_PROBE_TIMEOUT)
+                .connect_with(options)
+                .await?;
+            let out = crate::store::postgres::list_corrupt_governance_standards_pg(&pool).await;
+            pool.close().await;
+            out
+        };
+        tokio::time::timeout(PG_PROBE_TIMEOUT, probe)
+            .await
+            .map_err(|_elapsed| anyhow::anyhow!(MSG_PG_PROBE_TIMEOUT))?
+            .map_err(anyhow::Error::from)
+    })
+    .and_then(|inner| inner);
+    Some(section_corrupt_governance_4285(
+        census,
+        crate::storage::CORRUPT_STANDARD_BACKEND_POSTGRES,
     ))
 }
 
@@ -5589,7 +5682,10 @@ mod tests {
         // filesystem and this process's own RLIMIT_NOFILE, so it costs nothing
         // on a host with no hub and reports `configured = no` there.
         // #4199 — "Forensic audit log (#4199)" renders before the database open.
-        assert_eq!(report.sections.len(), 25);
+        // #4285 note: "Corrupt governance standards (#4285)" is UNCONDITIONAL
+        // (a sqlite census right after "Governance"; a postgres twin is added
+        // only on a `postgres://` deployment), so the sqlite count is 26.
+        assert_eq!(report.sections.len(), 26);
         let names: Vec<&str> = report.sections.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(
             names,
@@ -5611,6 +5707,7 @@ mod tests {
                 SECTION_UNSTAMPED_OWNERS,
                 "Recall",
                 "Governance",
+                SECTION_CORRUPT_GOVERNANCE,
                 "Sync",
                 "Webhook",
                 "Capabilities",
@@ -6250,6 +6347,34 @@ mod tests {
     // -------------------------------------------------------------------
     // Severity rule cases — DB-backed
     // -------------------------------------------------------------------
+
+    #[test]
+    fn corrupt_governance_section_is_critical_and_lists_every_standard_4285() {
+        use crate::storage::CorruptStandard;
+        let none = section_corrupt_governance_4285(Ok(Vec::new()), "sqlite");
+        assert!(matches!(none.severity, Severity::Info));
+        let two = section_corrupt_governance_4285(
+            Ok(vec![
+                CorruptStandard {
+                    namespace: "a".into(),
+                    standard_id: "s1".into(),
+                    error: "e1".into(),
+                },
+                CorruptStandard {
+                    namespace: "b".into(),
+                    standard_id: "s2".into(),
+                    error: "e2".into(),
+                },
+            ]),
+            "postgres",
+        );
+        assert!(matches!(two.severity, Severity::Critical));
+        assert!(two.facts.iter().any(|(k, _)| k == "corrupt::a"));
+        assert!(two.facts.iter().any(|(k, _)| k == "corrupt::b"));
+        assert!(two.note.as_deref().unwrap_or("").contains("Owner"));
+        let unread = section_corrupt_governance_4285(Err(anyhow::anyhow!("boom")), "sqlite");
+        assert!(matches!(unread.severity, Severity::Critical));
+    }
 
     #[test]
     fn governance_section_critical_when_pending_older_than_24h() {

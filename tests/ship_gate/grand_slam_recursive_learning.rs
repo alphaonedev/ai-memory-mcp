@@ -474,6 +474,7 @@ fn sg_rl_3_federation_reflection_replication_with_cross_peer_refusal() {
         .expect("get r2 on A")
         .expect("r2 present on A");
     let cap_b = db::resolve_governance_policy(&conn_b, ns)
+        .expect("#4043: governance policy read")
         .unwrap_or_default()
         .effective_max_reflection_depth();
     assert_eq!(cap_b, 2, "peer B tightened cap = 2");
@@ -555,7 +556,8 @@ fn sg_rl_4_approval_api_flow_for_deep_reflection() {
     src.memory_kind = MemoryKind::Reflection;
     let src_id = db::insert(&conn, &src).expect("insert depth-1 source");
 
-    let threshold = db::resolve_require_approval_above_depth(&conn, ns);
+    let threshold =
+        db::resolve_require_approval_above_depth(&conn, ns).expect("#4043: governance policy read");
     assert_eq!(threshold, Some(1), "L1-8 threshold resolves leaf-first");
 
     // Queue the pending row — what the MCP handler does in lieu of
