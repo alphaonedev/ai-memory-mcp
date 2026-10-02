@@ -202,10 +202,19 @@ async fn exercise_stranger_cannot_open_subtree_and_reflect_is_pending(
     let bind = store
         .set_namespace_standard(&stranger, &child, &cstd.id, Some(&parent))
         .await;
-    assert!(
-        bind.is_err(),
-        "#4356: a stranger must not bind the first standard below a governed ancestor"
-    );
+    // The refusal KIND, not merely "it refused": the #4356 ancestor-owner
+    // gate's closed not-owner refusal (never a storage fault or a missing row).
+    match &bind {
+        Err(ai_memory::store::StoreError::PermissionDenied { reason, .. }) => assert_eq!(
+            reason,
+            ai_memory::errors::msg::CALLER_DOES_NOT_OWN_NAMESPACE_STANDARD,
+            "#4356: the stranger's first bind must be the not-owner refusal"
+        ),
+        other => panic!(
+            "#4356: a stranger must not bind the first standard below a governed \
+             ancestor (want the not-owner PermissionDenied), got {other:?}"
+        ),
+    }
     // With no child standard bound, the parent's explicit 0 governs: a stranger's
     // reflect is PENDING (never applied).
     let mut src = memory(&child, "source");
