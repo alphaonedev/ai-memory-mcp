@@ -83,27 +83,70 @@ pub fn with_database(url: &str, db: &str) -> String {
     out
 }
 
-/// A scratch database name: `<prefix>_<unix-seconds>_<8 hex>`. The embedded
-/// creation time is what lets a later run recognise an orphan.
+/// Digits in the creation-time field: Unix seconds, ten digits until the year 2286.
+const SCRATCH_TS_DIGITS: usize = 10;
+/// Lowercase hex characters in the random suffix.
+const SCRATCH_ID_HEX: usize = 8;
+
+/// A scratch database name: `<prefix>_<unix-seconds, 10 digits>_<8 lowercase hex>`.
+/// The embedded creation time is what lets a later run recognise an orphan.
 #[must_use]
 pub fn scratch_db_name(prefix: &str, now_unix: u64) -> String {
     let id = uuid::Uuid::new_v4().simple().to_string();
-    format!("{prefix}_{now_unix}_{}", &id[..8])
+    format!(
+        "{prefix}_{now_unix:0width$}_{}",
+        &id[..SCRATCH_ID_HEX],
+        width = SCRATCH_TS_DIGITS
+    )
 }
 
-/// Current unix time in seconds.
+/// Parse `name` against the EXACT whole-name scratch shape
+/// `^<prefix>_[0-9]{10}_[0-9a-f]{8}$` and return its creation time. Anything
+/// else (a lane or operator database, a `+` sign, uppercase or wrong-width
+/// fields, quotes, semicolons, trailing text) is `None` and must never be
+/// dropped (#4489 review B1).
 #[must_use]
-pub fn unix_now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
+pub fn parse_scratch_name(prefix: &str, name: &str) -> Option<u64> {
+    let rest = name.strip_prefix(prefix)?.strip_prefix('_')?;
+    let (ts, id) = rest.split_once('_')?;
+    let ts_ok = ts.len() == SCRATCH_TS_DIGITS && ts.bytes().all(|b| b.is_ascii_digit());
+    let id_ok = id.len() == SCRATCH_ID_HEX
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    if ts_ok && id_ok {
+        ts.parse::<u64>().ok()
+    } else {
+        None
+    }
 }
 
-/// Drop every `<prefix>_<ts>_*` database whose embedded timestamp is older than
-/// [`STALE_SCRATCH_AGE`] relative to `now_unix`; a fresh one (a concurrent live
-/// run) and any name that does not parse are left alone. Returns the dropped
-/// names. A killed run leaves its scratch database, and its login-delay
-/// trigger, behind (#4489).
+/// Quote an SQL identifier: wrap in double quotes and double any embedded
+/// double quote. Defence in depth; names are shape-checked before this is used.
+#[must_use]
+pub fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// The SERVER clock in Unix seconds, so naming and the sweep age never depend on
+/// the (possibly skewed) clock of the host running the test.
+///
+/// # Errors
+///
+/// The query failed.
+pub async fn server_unix(admin: &sqlx::PgPool) -> Result<u64, sqlx::Error> {
+    let secs: i64 = sqlx::query_scalar("SELECT extract(epoch FROM now())::bigint")
+        .fetch_one(admin)
+        .await?;
+    Ok(u64::try_from(secs).unwrap_or(0))
+}
+
+/// Drop every `<prefix>_<ts>_<id>` database (EXACT shape, see
+/// [`parse_scratch_name`]) whose timestamp is older than [`STALE_SCRATCH_AGE`]
+/// relative to `now_unix`. A fresh one (a concurrent live run) and every name
+/// that does not match the shape are left alone. Returns the dropped names. A
+/// killed run leaves its scratch database, and its login-delay trigger, behind
+/// (#4489). Each drop is ONE statement with a properly quoted identifier.
 ///
 /// # Errors
 ///
@@ -121,18 +164,18 @@ pub async fn sweep_stale_scratch_dbs(
             .await?;
     let mut dropped = Vec::new();
     for name in names {
-        let stamp = name
-            .strip_prefix(prefix)
-            .and_then(|rest| rest.strip_prefix('_'))
-            .and_then(|rest| rest.split('_').next())
-            .and_then(|ts| ts.parse::<u64>().ok());
-        let Some(created) = stamp else { continue };
+        let Some(created) = parse_scratch_name(prefix, &name) else {
+            continue;
+        };
         if now_unix.saturating_sub(created) <= STALE_SCRATCH_AGE.as_secs() {
             continue;
         }
-        match sqlx::raw_sql(&format!("DROP DATABASE IF EXISTS \"{name}\" WITH (FORCE)"))
-            .execute(admin)
-            .await
+        match sqlx::query(&format!(
+            "DROP DATABASE IF EXISTS {} WITH (FORCE)",
+            quote_ident(&name)
+        ))
+        .execute(admin)
+        .await
         {
             Ok(_) => dropped.push(name),
             Err(e) => eprintln!("WARN: could not sweep stale scratch database {name}: {e}"),
@@ -140,6 +183,10 @@ pub async fn sweep_stale_scratch_dbs(
     }
     Ok(dropped)
 }
+
+/// Bound on the guard's own connect and drop, so an unreachable host cannot hang
+/// a panicking test for the OS TCP timeout.
+const GUARD_IO_BOUND: Duration = Duration::from_secs(20);
 
 /// A cluster-level scratch database that is dropped when the guard goes out of
 /// scope, INCLUDING on a panic unwind (`Drop` runs, and the drop is driven on its
@@ -153,6 +200,7 @@ pub struct ScratchDb {
 
 impl ScratchDb {
     /// Sweep stale orphans of `prefix`, then create a fresh scratch database.
+    /// Both the name and the sweep age use the server clock.
     ///
     /// # Errors
     ///
@@ -162,9 +210,10 @@ impl ScratchDb {
             .max_connections(1)
             .connect(admin_url)
             .await?;
-        sweep_stale_scratch_dbs(&admin, prefix, unix_now()).await?;
-        let name = scratch_db_name(prefix, unix_now());
-        sqlx::raw_sql(&format!("CREATE DATABASE \"{name}\""))
+        let now = server_unix(&admin).await?;
+        sweep_stale_scratch_dbs(&admin, prefix, now).await?;
+        let name = scratch_db_name(prefix, now);
+        sqlx::query(&format!("CREATE DATABASE {}", quote_ident(&name)))
             .execute(&admin)
             .await?;
         admin.close().await;
@@ -190,40 +239,66 @@ impl ScratchDb {
 impl Drop for ScratchDb {
     fn drop(&mut self) {
         let (url, name) = (self.admin_url.clone(), self.name.clone());
-        // A fresh thread and runtime: `Drop` may run while the test's own runtime
-        // is shutting down after a panic, where `block_on` would be refused.
-        let joined = std::thread::spawn(move || {
-            let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            else {
-                eprintln!("WARN: could not build a runtime to drop scratch database {name}");
-                return;
-            };
-            rt.block_on(async {
-                use sqlx::Connection as _;
-                match sqlx::PgConnection::connect(&url).await {
-                    Ok(mut conn) => {
-                        if let Err(e) = sqlx::raw_sql(&format!(
-                            "DROP DATABASE IF EXISTS \"{name}\" WITH (FORCE)"
-                        ))
-                        .execute(&mut conn)
-                        .await
-                        {
-                            eprintln!("WARN: could not drop scratch database {name}: {e}");
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("WARN: could not connect to drop scratch database {name}: {e}");
-                    }
+        // OWNERSHIP-25: nothing here may panic (a panic during an unwind aborts).
+        // `Builder::spawn` returns an error instead of panicking when a thread
+        // cannot be created; log it and leave the sweep to clean up.
+        let log_name = name.clone();
+        let spawned = std::thread::Builder::new()
+            .name("scratch-db-drop".to_string())
+            .spawn(move || drop_scratch_blocking(&url, &name));
+        match spawned {
+            Ok(handle) => {
+                if handle.join().is_err() {
+                    eprintln!("WARN: scratch database drop thread panicked for {log_name}");
                 }
-            });
-        })
-        .join();
-        if joined.is_err() {
-            eprintln!("WARN: scratch database drop thread panicked");
+            }
+            Err(e) => eprintln!(
+                "WARN: could not spawn a thread to drop scratch database {log_name}: {e}; \
+                 the next run's sweep will remove it"
+            ),
         }
     }
+}
+
+/// Drop `name` on a private runtime. Every step is bounded and none can panic.
+fn drop_scratch_blocking(url: &str, name: &str) {
+    let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    else {
+        eprintln!("WARN: could not build a runtime to drop scratch database {name}");
+        return;
+    };
+    rt.block_on(async {
+        use sqlx::Connection as _;
+        let connected =
+            tokio::time::timeout(GUARD_IO_BOUND, sqlx::PgConnection::connect(url)).await;
+        let mut conn = match connected {
+            Ok(Ok(conn)) => conn,
+            Ok(Err(e)) => {
+                eprintln!("WARN: could not connect to drop scratch database {name}: {e}");
+                return;
+            }
+            Err(_) => {
+                eprintln!("WARN: timed out connecting to drop scratch database {name}");
+                return;
+            }
+        };
+        let dropped = tokio::time::timeout(
+            GUARD_IO_BOUND,
+            sqlx::query(&format!(
+                "DROP DATABASE IF EXISTS {} WITH (FORCE)",
+                quote_ident(name)
+            ))
+            .execute(&mut conn),
+        )
+        .await;
+        match dropped {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => eprintln!("WARN: could not drop scratch database {name}: {e}"),
+            Err(_) => eprintln!("WARN: timed out dropping scratch database {name}"),
+        }
+    });
 }
 
 /// SQL installing a login event trigger that makes a new connection to the
