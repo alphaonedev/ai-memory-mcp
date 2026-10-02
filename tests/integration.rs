@@ -8675,6 +8675,14 @@ fn gen_self_signed_cert(dir: &std::path::Path) -> Option<(std::path::PathBuf, st
             "-nodes",
             "-subj",
             "/CN=localhost",
+            // #4462 — with no extensions, LibreSSL (macOS /usr/bin/openssl)
+            // emits an X.509 v1 certificate, which rustls rejects
+            // (UnsupportedCertVersion). Any `-addext` makes both LibreSSL
+            // and OpenSSL emit v3.
+            "-addext",
+            "subjectAltName=DNS:localhost",
+            "-addext",
+            "basicConstraints=critical,CA:FALSE",
         ])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
