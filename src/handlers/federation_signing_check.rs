@@ -299,6 +299,16 @@ pub(super) async fn sync_push_via_store(
         Err(crate::store::StoreError::UnsupportedCapability { .. }) => {}
         Err(e) => return super::postgres_gate::store_err_to_response(e),
     }
+    // #4400 (s4400 F1) — the audit-trail latch, consulted here exactly as the
+    // sqlite twin's `refuse_if_record_stopped` -> `gate_storage_conn` does, so
+    // a latched postgres receiver refuses the whole push with a retryable 503
+    // instead of answering 200 with every item skipped (which a sender files
+    // as a peer refusal and quarantines).
+    if let Err(e) = crate::audit::audit_trail_gate() {
+        return super::postgres_gate::store_err_to_response(
+            crate::store::StoreError::AuditTrailUnavailable { reason: e.reason },
+        );
+    }
     let mut applied = 0usize;
     let mut noop = 0usize;
     let mut skipped = 0usize;

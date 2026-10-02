@@ -9618,6 +9618,35 @@ mod tests {
         assert_eq!(val["count"], 0);
     }
 
+    /// #4400 (vote ruling item 5) — the MCP `tools/call` dispatch fence refuses
+    /// a write tool while the audit trail is latched, and a read tool stays live.
+    /// No agent-id env guard: the fence refuses before any agent id is
+    /// resolved, and the read does not depend on one (#3523 arm (e)).
+    #[test]
+    fn a_latched_audit_trail_refuses_mcp_writes_but_not_reads_4400() {
+        let _sink = crate::audit::sink_test_lock();
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        crate::audit::fail_closed_latch_for_test();
+        let store = invoke_handle_request(
+            &conn,
+            &make_tools_call(
+                "memory_store",
+                json!({"title": "t4400", "content": "while latched"}),
+            ),
+        );
+        let list = invoke_handle_request(&conn, &make_tools_call("memory_list", json!({})));
+        crate::audit::fail_closed_force_on_for_test(false);
+        let err = store
+            .error
+            .expect("the write tool is refused while latched");
+        assert!(
+            err.message.contains(crate::audit::REQUIRE_AUDIT_TRAIL_ENV),
+            "the refusal names the knob: {}",
+            err.message
+        );
+        assert!(list.error.is_none(), "reads stay live: {:?}", list.error);
+    }
+
     /// Same #3475 treatment as its sibling above.
     #[test]
     fn handle_inbox_with_unread_only_filter() {
