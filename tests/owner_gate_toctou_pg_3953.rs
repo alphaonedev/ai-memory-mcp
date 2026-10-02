@@ -34,6 +34,9 @@
 //! when `AI_MEMORY_TEST_POSTGRES_URL` is unset.
 #![cfg(all(feature = "sal", feature = "sal-postgres"))]
 
+#[path = "common/pg_barrier.rs"]
+mod pg_barrier;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -159,7 +162,7 @@ async fn hold_table_lock(
 
 /// Pid of the (single) backend currently blocked directly by `holder_pid`.
 async fn wait_blocked_by(pg: &PostgresStore, holder_pid: i32) -> i32 {
-    let end = tokio::time::Instant::now() + Duration::from_secs(20);
+    let end = pg_barrier::deadline();
     loop {
         let waiter: Option<i32> = sqlx::query_scalar(
             "SELECT pid FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid)) LIMIT 1",
@@ -211,7 +214,7 @@ async fn attempt_reown_in_window(pg: &Arc<PostgresStore>, id: &str, writer_pid: 
             .await
             .map(|r| r.rows_affected())
     });
-    let end = tokio::time::Instant::now() + Duration::from_secs(20);
+    let end = pg_barrier::deadline();
     loop {
         if task.is_finished() {
             let rows = task.await.expect("join reown").expect("reown statement");
