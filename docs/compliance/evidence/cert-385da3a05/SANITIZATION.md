@@ -50,9 +50,11 @@ matching the `eba96b307` counts.
 
 ## Provenance note — the header of `posture-legs-exit-codes.txt`
 
-The header reads `2026-09-11 #3607 re-issue recapture (22 checks) @ 385da3a05`,
-and the hardened and certified `.out` files name the fixture path
-`<repo-root>/.local-runs/cert-3607-fixtures/`. Both are FIXED strings of the
+The header reads `2026-09-11 #3607 re-issue recapture (22 checks) @ 385da3a05`.
+Its date, 2026-09-11, is the recapture script's template date, not the run
+date: these legs ran on 2026-10-02. The hardened and certified `.out` files
+name the fixture path `<repo-root>/.local-runs/cert-3607-fixtures/`. The header
+and that path are both FIXED strings of the
 recapture script (its header line and its path-redaction label), which was
 retargeted in `OUT` / `FIX` only; the `@ 385da3a05` is the script's
 `git rev-parse --short HEAD` of the worktree it ran in, recorded verbatim,
@@ -92,8 +94,9 @@ two reds, the batch was re-assembled as `385da3a05` with #4400 v4
 (`c0040eceb`) and #4333 v2 (`26d8d9015`), and every leg here was re-run on the
 re-assembled tree. The watched federation-wire tree of the two tips is
 byte-identical; that is recorded, not relied on. The removal proof in this
-bundle is also the one the landing guard cites (`.local-runs/cert-alone-b6.out`,
-copied by the merger with a provenance line): one proof, run by the author.
+bundle is the §7 artifact, run by the author. The batch-6 landing gate also
+ran the removal proof in-gate on the same tip (EXIT 0): a second, independent
+run by the merger, recorded in the landing record, not in this bundle.
 
 ## Labour split (recorded, not stylistic)
 
