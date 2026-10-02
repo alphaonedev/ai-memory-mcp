@@ -288,7 +288,7 @@ curl -fsSL https://raw.githubusercontent.com/alphaonedev/ai-memory-mcp/main/inst
 sudo dnf copr enable alpha-one-ai/ai-memory && sudo dnf install ai-memory
 ```
 
-Pre-built release binaries are built with `--features sal,sal-postgres`: the PostgreSQL + Apache AGE + pgvector tier (`serve --store-url postgres://…`, `migrate`, `schema-init`) ships in the artifact, and `ai-memory features` prints what a given binary was compiled with.
+Pre-built release binaries and the container image (`ghcr.io/alphaonedev/ai-memory`) are built with `--features sal,sal-postgres`: the PostgreSQL + Apache AGE + pgvector tier (`serve --store-url postgres://…`, `migrate`, `schema-init`) ships in the artifact, and `ai-memory features` prints what a given binary was compiled with.
 
 **Step 1: Install Rust** (skip if using pre-built binaries)
 
