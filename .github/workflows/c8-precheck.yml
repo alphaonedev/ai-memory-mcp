@@ -604,6 +604,34 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Run key-dir mode gate
         run: bash scripts/check-test-keydir-mode.sh
+      - name: Key-dir mode gate self-test (#4502)
+        # The gate shipped with no self-test, so nothing proved it could still
+        # see a violation -- and its predicate was line-based, which a rustfmt
+        # wrap silently defeats (#4501 class). Seventeen cells, fixtures under
+        # .local-runs/ -- never /tmp, and never a host-specific path: the
+        # scratch directory honours TMPDIR only when it exists and otherwise
+        # lives beside the fixtures, so this step cannot depend on the author's
+        # machine (it did, and would have gone red here on every PR).
+        #
+        # NINE pin the predicate. Must be caught: a bare create of the dir
+        # passed as the key dir; the tmp.path().join("keys") form; the
+        # rustfmt-WRAPPED call; and a second bare-created key dir in a file
+        # that also uses the sandbox helper. Must stay clean: mkdir_0700;
+        # from_mode(0o700); a bare create of an unrelated dir while the key dir
+        # is the TempDir root; a file that never mentions a key dir.
+        #
+        # EIGHT pin the enumeration and the interface, in throwaway git repos
+        # the self-test builds: a broken git dir and an empty candidate set are
+        # errors rather than a clean scan; an untracked new test file is scanned
+        # as well as a tracked one; --only cannot exit 1 on a missing path (1
+        # means "violation found") and cannot name a file outside tests/**/*.rs
+        # as a violator; and a TMPDIR that does not exist -- this runner's own
+        # shape -- does not break the run.
+        #
+        # The run also asserts that at least one cell is caught whole-file and
+        # MISSED by the old line-based form, so the coverage this gate gained
+        # cannot quietly regress.
+        run: bash scripts/check-test-keydir-mode.sh --self-test
 
   migration-ladder-gate:
     # v1.0.0 guardrail-D (2x5-vote decision memory b682c76a) — fail-closed
