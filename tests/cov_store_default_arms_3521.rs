@@ -243,6 +243,14 @@ async fn unimplemented_default_arms_refuse_naming_their_capability() {
         s.merge_inbound(&ctx, &mem, false).await,
         "FEDERATION_MERGE_INBOUND",
     );
+    // #4023 — the authorized sibling must ALSO fail closed on an adapter that
+    // cannot re-check inside its merge transaction (never a silent unchecked
+    // merge). Distinct capability name from the unchecked arm above.
+    refused(
+        s.merge_inbound_authorized(&ctx, &mem, false, &|_: &str| true)
+            .await,
+        "FEDERATION_MERGE_INBOUND_AUTHORIZED",
+    );
     refused(
         s.archived_namespace_by_id(&ctx, &mem.id).await,
         "ARCHIVED_NAMESPACE_BY_ID",

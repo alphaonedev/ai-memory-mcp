@@ -680,12 +680,28 @@ pub(super) async fn sync_push_via_store(
             &to_insert,
         )
         .await;
+        // #4023 — the #2447 stored-namespace verdict above was taken on a pool
+        // read OUTSIDE the merge transaction; a broader writer can move the row
+        // in between and `merge_memory` LWWs `namespace`. Re-authorize the row
+        // `merge_inbound_authorized` locks `FOR UPDATE`, inside its transaction.
+        let authorize_stored = |stored: &str| {
+            crate::federation::receive_auth::inbound_write_namespace_authorized(
+                crate::federation::receive_auth::LANE_MEMORIES,
+                &mem.id,
+                &mem.namespace,
+                Some(stored),
+                &attest_cfg,
+                peer_header_owned.as_deref(),
+                require_push_ns_scope,
+            )
+        };
         match app
             .store
-            .merge_inbound(
+            .merge_inbound_authorized(
                 &ctx,
                 &to_insert,
                 crate::handlers::federation_receive::row_is_agent_attested(&to_insert),
+                &authorize_stored,
             )
             .await
         {
