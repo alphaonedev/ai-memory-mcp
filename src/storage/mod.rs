@@ -22671,7 +22671,7 @@ pub fn clear_namespace_standard(conn: &Connection, namespace: &str) -> Result<bo
 /// reuse the same walk.
 ///
 /// Properties (preserved from the prior MCP-only implementation):
-/// - cycle-safe (visited set + bounded by `MAX_EXPLICIT_DEPTH = 8`)
+/// - cycle-safe (visited set); complete up to `MAX_NAMESPACE_DEPTH`, refused beyond (#4477)
 /// - includes the global standard `*` as the most-general entry
 /// - prepends explicit `namespace_meta.parent_namespace` ancestors
 ///   before the `/`-derived hierarchy, supporting flat→hierarchical
@@ -22818,7 +22818,6 @@ fn build_namespace_chain_view(
     namespace: &str,
     view: ChainView,
 ) -> Result<Vec<String>> {
-    const MAX_EXPLICIT_DEPTH: usize = 8;
     let mut chain: Vec<String> = Vec::new();
 
     if namespace == "*" {
@@ -22831,13 +22830,13 @@ fn build_namespace_chain_view(
 
     // 1. /-derived ancestors. `namespace_ancestors` returns most-specific-first;
     //    reverse for top-down (root ancestor first, then namespace itself last).
-    let mut hierarchy_chain: Vec<String> = crate::models::namespace_ancestors(namespace)
-        .into_iter()
-        .rev()
-        .collect();
+    //    #4477 — complete, bounded by MAX_NAMESPACE_DEPTH with a fail-closed
+    //    refusal (`governance::chain_depth`, shared with postgres).
+    let mut hierarchy_chain: Vec<String> = crate::governance::chain_depth::slash_chain(namespace)?;
 
     // 2. If the ROOTmost of the /-chain has an explicit `namespace_meta` parent,
-    //    prepend that chain (bounded by MAX_EXPLICIT_DEPTH + cycle-safe).
+    //    prepend that chain (cycle-safe; #4477: every entitled parent is kept
+    //    and a walk past MAX_NAMESPACE_DEPTH hops REFUSES, never truncates).
     //    Supports legacy flat namespaces (e.g. `ai-memory` → `ai-memory-mcp`).
     //
     //    #2542 — the GOVERNANCE view STOPS at the first UNENTITLED (cross-tenant)
@@ -22852,7 +22851,7 @@ fn build_namespace_chain_view(
     if let Some(root) = hierarchy_chain.first().cloned() {
         let mut explicit_above: Vec<String> = Vec::new();
         let mut current = root;
-        for _ in 0..MAX_EXPLICIT_DEPTH {
+        loop {
             let parent = match view {
                 ChainView::Lookup => get_namespace_parent(conn, &current),
                 ChainView::Governance => try_get_namespace_parent(conn, &current)?,
@@ -22870,6 +22869,7 @@ fn build_namespace_chain_view(
                     break;
                 }
             }
+            crate::governance::chain_depth::admit_explicit_parent(&explicit_above)?;
             explicit_above.push(p.clone());
             current = p;
         }
@@ -23028,7 +23028,7 @@ fn read_namespace_level(conn: &Connection, namespace: &str) -> Result<NamespaceL
 /// a parent.
 ///
 /// Cycle-safety is inherited from `build_namespace_chain`
-/// (`MAX_EXPLICIT_DEPTH = 8` + visited set). No new cache is
+/// (`MAX_NAMESPACE_DEPTH` bound + visited set, #4477). No new cache is
 /// introduced — profile-driven optimization is a v0.7 item.
 /// **#2503 — the SEVERED FLOOR.** A level whose `namespace_meta` row EXISTS
 /// but whose standard cannot be resolved (severed by a reap, or a legacy

@@ -87,7 +87,8 @@ mod tx_retry;
 // take NO relation-level DDL lock on connect. Own module for the same
 // qual_10 budget reason as `parity_3064` above.
 mod bootstrap_ddl;
-mod ns_standard_ancestor_4356; // #4356 bind gate (own module: qual_10 budget)
+mod governance_chain_4477;
+mod ns_standard_ancestor_4356; // #4356 bind gate (own module: qual_10 budget) // #4477 the one complete chain builder (qual_10 budget)
 // v1.0.0 #3614 — the lineage walk (recursive CTE + AGE Cypher + the backend
 // dispatcher + the #3041 cycle check) and its two helpers. Own module for the
 // same qual_10 budget reason as `parity_3064` above: a pure MOVE (rule l),
@@ -18700,62 +18701,6 @@ async fn pg_auto_detect_parent(
     Ok(None)
 }
 
-/// v0.7.0 H10 — transaction-bound twin of
-/// [`PostgresStore::build_namespace_chain`]. Reads every
-/// `namespace_meta.parent_namespace` lookup through the supplied tx so
-/// the chain walk shares a snapshot with the downstream policy lookup +
-/// pending_actions INSERT. Logic identical to the trait method — the
-/// only delta is `fetch_optional(&mut *tx)` instead of `&self.pool`.
-///
-/// # F-A2A1.2 inheritance recursion cap
-///
-/// The governance-inheritance walk is capped at
-/// [`GOVERNANCE_INHERITANCE_DEPTH_CAP`] (= 5) intermediate levels per the
-/// v0.7.0 spec. Both the `/`-derived ancestor chain and the explicit
-/// `namespace_meta.parent_namespace` walk are bounded by the same cap so a
-/// pathological deep namespace cannot blow the policy resolver's bind list
-/// or its connection-hold budget. The implicit `"*"` global standard is
-/// always retained and is not counted toward the cap.
-/// #2542 — the concrete owner (`metadata.agent_id`) of `namespace`'s bound
-/// standard, or `None` when there is no standard bound, the pointer is severed /
-/// dangling, or the standard is UNOWNED (empty / exact `system`). Read through
-/// the supplied `tx` (snapshot parity with the chain walk). Postgres twin of
-/// `storage::namespace_standard_owner`.
-async fn pg_namespace_standard_owner_in_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    namespace: &str,
-) -> StoreResult<Option<String>> {
-    let row: Option<(Option<String>,)> = sqlx::query_as(
-        "SELECT m.metadata->>'agent_id' FROM namespace_meta nm \
-         JOIN memories m ON m.id = nm.standard_id WHERE nm.namespace = $1",
-    )
-    .bind(namespace)
-    .fetch_optional(&mut **tx)
-    .await
-    .map_err(|e| to_store_err("pg_namespace_standard_owner_in_tx", e))?;
-    Ok(row
-        .and_then(|(o,)| o)
-        .filter(|o| !o.is_empty() && o != "system"))
-}
-
-/// #2542 — pool-side twin of [`pg_namespace_standard_owner_in_tx`].
-async fn pg_namespace_standard_owner_pool(
-    pool: &sqlx::PgPool,
-    namespace: &str,
-) -> StoreResult<Option<String>> {
-    let row: Option<(Option<String>,)> = sqlx::query_as(
-        "SELECT m.metadata->>'agent_id' FROM namespace_meta nm \
-         JOIN memories m ON m.id = nm.standard_id WHERE nm.namespace = $1",
-    )
-    .bind(namespace)
-    .fetch_optional(pool)
-    .await
-    .map_err(|e| to_store_err("pg_namespace_standard_owner_pool", e))?;
-    Ok(row
-        .and_then(|(o,)| o)
-        .filter(|o| !o.is_empty() && o != "system"))
-}
-
 /// #2542 — one structured WARN per governance resolution that dropped a
 /// cross-tenant `parent_namespace` graft on postgres. Mirrors the sqlite
 /// `storage::warn_governance_graft_excluded`.
@@ -18773,197 +18718,39 @@ fn pg_warn_governance_graft_excluded(resolving_for: &str, child: &str, parent: &
     );
 }
 
-/// #2542 — build the namespace inheritance chain through the supplied `tx`.
-///
-/// `governance` selects the VIEW, mirroring the sqlite `ChainView`:
-/// - `false` (LOOKUP): follow every `parent_namespace` link.
-/// - `true` (GOVERNANCE): follow a `parent_namespace` link ONLY when ENTITLED —
-///   the parent is UNOWNED or owned by the SAME principal as the namespace being
-///   resolved. A cross-tenant parent (and everything above it) is dropped with a
-///   WARN, so it cannot graft governance/approver policy onto this write. This is
-///   the exact Route-1 bind ownership rule re-checked at resolution; it closes a
-///   TOCTOU-bound-later parent, a `-`-auto-detected cross-tenant parent that
-///   reached pg via import, and any pre-#2542 on-disk graft — WITHOUT relying on
-///   the deferred provenance-persistence.
-/// #2542 — pool-side twin of [`build_namespace_chain_in_tx`]. `governance = false`
-/// is the LOOKUP chain (every `parent_namespace` link — the trait
-/// [`PostgresStore::build_namespace_chain`] contract); `governance = true` is the
-/// entitled-parents-only GOVERNANCE chain used by `resolve_governance_policy`.
+/// #4477 — the pool twin: the LOOKUP (`governance = false`, the trait
+/// [`PostgresStore::build_namespace_chain`] contract) or the entitled-parents
+/// GOVERNANCE chain, built by the one builder in `governance_chain_4477` on a
+/// single pooled connection.
 async fn pg_namespace_chain(
     pool: &sqlx::PgPool,
     namespace: &str,
     governance: bool,
 ) -> StoreResult<Vec<String>> {
-    let mut chain: Vec<String> = Vec::new();
-
-    if namespace == "*" {
-        chain.push("*".to_string());
-        return Ok(chain);
-    }
-    chain.push("*".to_string());
-
-    let mut hierarchy_chain: Vec<String> = crate::models::namespace_ancestors(namespace)
-        .into_iter()
-        .rev()
-        .collect();
-
-    if let Some(root) = hierarchy_chain.first().cloned() {
-        let mut explicit_above: Vec<String> = Vec::new();
-        let mut current = root;
-        for _ in 0..GOVERNANCE_INHERITANCE_DEPTH_CAP {
-            let row: Option<(Option<String>,)> =
-                sqlx::query_as("SELECT parent_namespace FROM namespace_meta WHERE namespace = $1")
-                    .bind(&current)
-                    .fetch_optional(pool)
-                    .await
-                    .map_err(|e| to_store_err("build_namespace_chain parent lookup", e))?;
-            let next = row.and_then(|(p,)| p);
-            let Some(p) = next else { break };
-            if p == "*" || explicit_above.contains(&p) || hierarchy_chain.contains(&p) {
-                break;
-            }
-            // #2542 — the GOVERNANCE view stops at the first UNENTITLED
-            // (cross-tenant) parent so it cannot layer governance/approver policy.
-            // PER-HOP: entitled iff the parent is unowned OR owned by `current`'s
-            // (the DECLARING namespace's) principal — the Route-1 bind rule, which
-            // keeps a federated in-scope parent whose declarer shares its owner
-            // (#2479) while dropping a cross-tenant graft (mirrors sqlite).
-            if governance {
-                let declarer_owner = pg_namespace_standard_owner_pool(pool, &current).await?;
-                let parent_owner = pg_namespace_standard_owner_pool(pool, &p).await?;
-                let entitled = match parent_owner {
-                    None => true,
-                    Some(po) => declarer_owner.as_deref() == Some(po.as_str()),
-                };
-                if !entitled {
-                    pg_warn_governance_graft_excluded(namespace, &current, &p);
-                    break;
-                }
-            }
-            explicit_above.push(p.clone());
-            current = p;
-        }
-        for p in explicit_above.into_iter().rev() {
-            if !chain.contains(&p) {
-                chain.push(p);
-            }
-        }
-    }
-    // F-A2A1.2 — cap the `/`-derived ancestor chain to the same depth as the
-    // explicit walk (most-specific N levels).
-    let drained: Vec<String> = hierarchy_chain.drain(..).collect();
-    let drained_len = drained.len();
-    let kept: Vec<String> = if drained_len > GOVERNANCE_INHERITANCE_DEPTH_CAP {
-        drained
-            .into_iter()
-            .skip(drained_len - GOVERNANCE_INHERITANCE_DEPTH_CAP)
-            .collect()
-    } else {
-        drained
-    };
-    for entry in kept {
-        if !chain.contains(&entry) {
-            chain.push(entry);
-        }
-    }
-    Ok(chain)
+    let mut conn = pool
+        .acquire()
+        .await
+        .map_err(|e| to_store_err("build_namespace_chain acquire", e))?;
+    governance_chain_4477::build_chain_on(&mut conn, namespace, governance).await
 }
 
+/// v0.7.0 H10 / #4477 — the transaction twin: every read goes through `tx` so
+/// the walk shares a snapshot with the downstream policy lookup + write.
 async fn build_namespace_chain_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     namespace: &str,
     governance: bool,
 ) -> StoreResult<Vec<String>> {
-    let mut chain: Vec<String> = Vec::new();
-
-    if namespace == "*" {
-        chain.push("*".to_string());
-        return Ok(chain);
-    }
-    chain.push("*".to_string());
-
-    let mut hierarchy_chain: Vec<String> = crate::models::namespace_ancestors(namespace)
-        .into_iter()
-        .rev()
-        .collect();
-
-    if let Some(root) = hierarchy_chain.first().cloned() {
-        let mut explicit_above: Vec<String> = Vec::new();
-        let mut current = root;
-        for _ in 0..GOVERNANCE_INHERITANCE_DEPTH_CAP {
-            let row: Option<(Option<String>,)> =
-                sqlx::query_as("SELECT parent_namespace FROM namespace_meta WHERE namespace = $1")
-                    .bind(&current)
-                    .fetch_optional(&mut **tx)
-                    .await
-                    .map_err(|e| to_store_err("build_namespace_chain_in_tx parent lookup", e))?;
-            let next = row.and_then(|(p,)| p);
-            let Some(p) = next else { break };
-            if p == "*" || explicit_above.contains(&p) || hierarchy_chain.contains(&p) {
-                break;
-            }
-            // #2542 — PER-HOP entitled iff the parent is unowned OR owned by
-            // `current`'s (the DECLARING namespace's) principal (mirrors sqlite /
-            // the pool twin).
-            if governance {
-                let declarer_owner = pg_namespace_standard_owner_in_tx(tx, &current).await?;
-                let parent_owner = pg_namespace_standard_owner_in_tx(tx, &p).await?;
-                let entitled = match parent_owner {
-                    None => true,
-                    Some(po) => declarer_owner.as_deref() == Some(po.as_str()),
-                };
-                if !entitled {
-                    pg_warn_governance_graft_excluded(namespace, &current, &p);
-                    break;
-                }
-            }
-            explicit_above.push(p.clone());
-            current = p;
-        }
-        for p in explicit_above.into_iter().rev() {
-            if !chain.contains(&p) {
-                chain.push(p);
-            }
-        }
-    }
-    // F-A2A1.2 — cap the `/`-derived ancestor chain to the same depth as
-    // the explicit walk so a deeply nested namespace cannot bypass the
-    // resolver's bounded budget. The cap counts the most-specific N
-    // levels (the leaf and its closest ancestors) so an over-deep
-    // namespace still resolves against its most-relevant policy.
-    let drained: Vec<String> = hierarchy_chain.drain(..).collect();
-    let drained_len = drained.len();
-    let kept: Vec<String> = if drained_len > GOVERNANCE_INHERITANCE_DEPTH_CAP {
-        // hierarchy_chain is top-down (root → leaf); keep the LAST
-        // GOVERNANCE_INHERITANCE_DEPTH_CAP entries (most-specific).
-        drained
-            .into_iter()
-            .skip(drained_len - GOVERNANCE_INHERITANCE_DEPTH_CAP)
-            .collect()
-    } else {
-        drained
-    };
-    for entry in kept {
-        if !chain.contains(&entry) {
-            chain.push(entry);
-        }
-    }
-    Ok(chain)
+    governance_chain_4477::build_chain_on(&mut **tx, namespace, governance).await
 }
 
-/// F-A2A1.2 — maximum depth of the governance-inheritance walk.
-///
-/// Bounds both the `/`-derived ancestor decomposition AND the explicit
-/// `namespace_meta.parent_namespace` walk to a single cap of 5 levels.
-/// The implicit `"*"` global standard is always retained and is not
-/// counted toward the cap.
-///
-/// Pinned to 5 per the v0.7.0 fold-A2A1 spec (see
-/// `docs/v0.7.0/a2a-triage-wave4-r2.md` §F-A2A1.2). Real-world
-/// namespaces are 3-4 levels deep; the cap leaves headroom for one
-/// inherited override beyond the deepest authored ancestor while
-/// keeping the per-write resolver's connection-hold budget bounded.
-pub const GOVERNANCE_INHERITANCE_DEPTH_CAP: usize = 5;
+/// F-A2A1.2 / #4477 — the governance-chain depth bound. It is no longer a
+/// truncation (postgres used to keep only the 5 most-specific levels, so an
+/// ancestor deeper than that governed nothing): every walk is complete up to
+/// [`crate::models::MAX_NAMESPACE_DEPTH`] and refuses beyond it, identically
+/// on sqlite (`crate::governance::chain_depth`).
+pub const GOVERNANCE_INHERITANCE_DEPTH_CAP: usize =
+    crate::governance::chain_depth::GOVERNANCE_CHAIN_MAX_DEPTH;
 
 /// Maximum traversal depth supported by [`PostgresStore::kg_query`].
 ///
@@ -36749,28 +36536,28 @@ mod tests {
     // ------------------------------------------------------------------
 
     // ------------------------------------------------------------------
-    // F-A2A1.2 (#700) — governance inheritance depth cap.
+    // F-A2A1.2 (#700) / #4477 — governance inheritance depth bound.
     //
-    // These tests pin the depth-cap constant + the chain-build behaviour
-    // that does NOT require a live Postgres connection. The cap value is
-    // surface-visible via `GOVERNANCE_INHERITANCE_DEPTH_CAP`; the chain
-    // walk semantics (most-specific-N levels retained) ride the same
-    // helper for both the pool-side `build_namespace_chain` and the
-    // tx-side `build_namespace_chain_in_tx`. Live-PG variants below
+    // These tests pin the depth-bound constant + the chain-build behaviour
+    // that does NOT require a live Postgres connection. The bound is
+    // surface-visible via `GOVERNANCE_INHERITANCE_DEPTH_CAP`; since #4477
+    // every level is retained up to it (complete chain) and a deeper walk
+    // refuses, for both the pool-side `build_namespace_chain` and the
+    // tx-side `build_namespace_chain_in_tx` (one builder). Live-PG variants below
     // exercise the same paths through `enforce_governance_action` end-
     // to-end against a real schema; the unit tests here are the
     // structural pin so a future refactor cannot silently drift the cap.
     // ------------------------------------------------------------------
 
     #[test]
-    fn governance_inheritance_depth_cap_is_five() {
-        // Pinned to 5 per the v0.7.0 fold-A2A1 spec. Any change to this
-        // value must be reflected in
-        // `docs/v0.7.0/a2a-triage-wave4-r2.md` §F-A2A1.2 and
-        // accompanied by a CHANGELOG entry — the cap shapes the
-        // bind-list size and connection-hold budget of every governed
-        // write on postgres.
-        assert_eq!(super::GOVERNANCE_INHERITANCE_DEPTH_CAP, 5);
+    fn governance_inheritance_depth_bound_is_max_namespace_depth_4477() {
+        // #4477 (GOD ruling, supersedes the F-A2A1.2 value 5): the bound is
+        // MAX_NAMESPACE_DEPTH and it is a fail-closed REFUSAL, never a
+        // truncation; sqlite and postgres share it.
+        assert_eq!(
+            super::GOVERNANCE_INHERITANCE_DEPTH_CAP,
+            crate::models::MAX_NAMESPACE_DEPTH
+        );
     }
 
     #[test]
@@ -36790,36 +36577,16 @@ mod tests {
     }
 
     #[test]
-    fn namespace_ancestors_at_max_namespace_depth() {
-        // The compile-time `MAX_NAMESPACE_DEPTH` is 8; namespaces at
-        // that depth produce 8 ancestor levels. Our cap of 5 trims
-        // such a chain when applied in the governance walker.
+    fn namespace_chain_at_max_namespace_depth_keeps_every_level_4477() {
+        // #4477: a namespace at MAX_NAMESPACE_DEPTH keeps EVERY level, root
+        // included (pre-fix postgres dropped the 3 rootmost levels, so a root
+        // policy governed nothing at depth 6+); one level deeper refuses.
         let deep = "l1/l2/l3/l4/l5/l6/l7/l8";
-        let ancestors: Vec<String> = crate::models::namespace_ancestors(deep)
-            .into_iter()
-            .rev()
-            .collect();
-        assert_eq!(ancestors.len(), 8);
-        // Simulate the cap: keep last N most-specific entries.
-        let cap = super::GOVERNANCE_INHERITANCE_DEPTH_CAP;
-        let kept: Vec<String> = if ancestors.len() > cap {
-            ancestors
-                .iter()
-                .skip(ancestors.len() - cap)
-                .cloned()
-                .collect()
-        } else {
-            ancestors
-        };
-        assert_eq!(kept.len(), cap);
-        // The most-specific entry is the leaf itself.
+        let kept = crate::governance::chain_depth::slash_chain(deep).expect("within the bound");
+        assert_eq!(kept.len(), crate::models::MAX_NAMESPACE_DEPTH);
+        assert_eq!(kept.first().map(String::as_str), Some("l1"));
         assert_eq!(kept.last().map(String::as_str), Some(deep));
-        // The least-specific kept entry is the (cap-1)-from-leaf
-        // ancestor, NOT the root. The root ("l1") is dropped under
-        // the cap so resolution stays bounded — operators who want a
-        // root-level policy applied to deep children must seat that
-        // policy on a level within the cap reach.
-        assert_eq!(kept.first().map(String::as_str), Some("l1/l2/l3/l4"));
+        assert!(crate::governance::chain_depth::slash_chain("l1/l2/l3/l4/l5/l6/l7/l8/l9").is_err());
     }
 
     #[test]
@@ -39097,13 +38864,10 @@ mod tests {
 
     #[tokio::test]
     async fn live_governance_inheritance_cap_at_five() {
-        // F-A2A1.2 depth cap — a namespace at MAX_NAMESPACE_DEPTH (8
-        // levels) under a `write=owner` parent at the root must still
-        // resolve to Deny for a non-owner, because the cap retains the
-        // most-specific 5 levels which include the policy-anchored
-        // child path. Conversely, a policy seated at the root that's
-        // OUTSIDE the cap (depth 8 child, policy at depth 1 root) is
-        // expected NOT to apply — the cap is the explicit contract.
+        // F-A2A1.2 / #4477 — a deep leaf under a `write=owner` ancestor
+        // resolves to Deny for a non-owner (since #4477 the chain is
+        // complete to MAX_NAMESPACE_DEPTH, so a root-level policy governs
+        // depth-8 children too; see tests/governance_chain_depth_4477.rs).
         //
         // This test pins the "most-specific kept" semantics by seating
         // the policy 2 levels above the leaf (well within the cap)
