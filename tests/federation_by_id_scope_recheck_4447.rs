@@ -515,7 +515,14 @@ mod pg {
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        panic!("the authorized write never reached a lock wait");
+        let dump: Vec<(String, Option<String>, Option<String>, String)> = sqlx::query_as(
+            "SELECT application_name, wait_event_type, state, left(query, 70) \
+             FROM pg_stat_activity WHERE datname = current_database()",
+        )
+        .fetch_all(observer.pool())
+        .await
+        .unwrap_or_default();
+        panic!("the authorized write never reached a lock wait for `{app}`; activity: {dump:#?}");
     }
 
     async fn connect(url: &str) -> Arc<PostgresStore> {
@@ -912,6 +919,92 @@ mod pg {
         .await
         .expect("count");
         assert_eq!(edges, 2, "both replays must land their edge");
+    }
+
+    /// Lock STRENGTH of the authorized link replay (review F1/S5): it must hold
+    /// at least `FOR SHARE` on each endpoint, because `FOR KEY SHARE` does not
+    /// stop an UPDATE of the non-key `namespace` column, so the re-check would
+    /// read a namespace that can still change underneath it. Every other cell
+    /// stays green if the call site weakens the lock to key-share.
+    ///
+    /// Deterministic barrier, no parked threads: a second transaction INSERTs
+    /// the very link the replay is about to write (uncommitted), so the replay
+    /// takes its endpoint locks, passes its verdict and then BLOCKS on its own
+    /// INSERT (the unique-index conflict) while still holding them. From a third
+    /// connection a namespace relocation of an endpoint is attempted and must
+    /// BLOCK (a lock wait on that connection's own `application_name`); under
+    /// key-share it would proceed and the wait is never observed. Committing the
+    /// barrier then lets the replay (`ON CONFLICT DO NOTHING`) and the
+    /// relocation finish.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn authorized_link_replay_holds_at_least_for_share_pg_4447() {
+        let Some(url) = url() else {
+            eprintln!("SKIP authorized_link_replay_holds_at_least_for_share_pg_4447: no URL");
+            return;
+        };
+        let replay_app = uniq("f1-4447-replay");
+        let store = connect_app(&url, &replay_app).await;
+        let mover_app = uniq("f1-4447-mover");
+        let mover = connect_app(&url, &mover_app).await;
+        let barrier = connect(&url).await;
+        let (root, secure) = (uniq("public"), uniq("secure/ops"));
+        let (a, b) = (
+            uuid::Uuid::new_v4().to_string(),
+            uuid::Uuid::new_v4().to_string(),
+        );
+        for id in [&a, &b] {
+            store
+                .store(&admin_ctx(), &seed_row(id, &format!("{root}/shared")))
+                .await
+                .expect("seed");
+        }
+        let link = link_between(&a, &b);
+        let mut tx = barrier.pool().begin().await.expect("begin");
+        sqlx::query(
+            "INSERT INTO memory_links (source_id, target_id, relation, created_at, attest_level) \
+             VALUES ($1, $2, $3, now(), 'unsigned')",
+        )
+        .bind(&a)
+        .bind(&b)
+        .bind(link.relation.as_str())
+        .execute(&mut *tx)
+        .await
+        .expect("barrier inserts the same link, uncommitted");
+
+        let (s2, root2, l2) = (store.clone(), root.clone(), link.clone());
+        let replay = tokio::spawn(async move {
+            let auth = in_scope(&root2);
+            s2.apply_remote_link_authorized(&admin_ctx(), &l2, "unsigned", &auth)
+                .await
+        });
+        // The replay holds its endpoint locks and waits on the barrier's row.
+        wait_blocked(&barrier, &replay_app).await;
+
+        let (m2, b2, sec2) = (mover.clone(), b.clone(), secure.clone());
+        let relocate = tokio::spawn(async move {
+            sqlx::query("UPDATE memories SET namespace = $1 WHERE id = $2")
+                .bind(&sec2)
+                .bind(&b2)
+                .execute(m2.pool())
+                .await
+        });
+        // Must BLOCK on the replay's endpoint lock; under key-share it would not.
+        wait_blocked(&barrier, &mover_app).await;
+        assert!(
+            !relocate.is_finished(),
+            "a namespace relocation was not held off by the authorized link replay's lock"
+        );
+        tx.commit().await.expect("release the barrier");
+        tokio::time::timeout(Duration::from_secs(20), replay)
+            .await
+            .expect("replay finished")
+            .expect("task")
+            .expect("authorized link replay");
+        tokio::time::timeout(Duration::from_secs(20), relocate)
+            .await
+            .expect("relocation finished after the replay committed")
+            .expect("task")
+            .expect("relocation");
     }
 
     /// R1(a) (code review): even without #4209/#4369, the carrier's LOCAL link
