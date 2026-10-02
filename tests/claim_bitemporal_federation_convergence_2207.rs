@@ -201,8 +201,20 @@ fn both_merge_orders_converge_to_identical_rows() {
         {
             meta.remove("version_vector");
         }
+        // #4216 (vote 4d3ea1c5): `version` is a NODE-LOCAL optimistic-concurrency
+        // token. The replica that RECEIVED a data change (the close) bumps it;
+        // the replica that already held the close changed nothing and does not.
+        // The converged USER data is what must be byte-identical (pinned below).
+        if let Some(obj) = v.as_object_mut() {
+            obj.remove("version");
+        }
         v
     };
+    assert_eq!(
+        (row1.version, row2.version),
+        (2, 1),
+        "#4216: only the replica whose row changed bumps its node-local version"
+    );
     assert_eq!(
         strip_vv(&row1),
         strip_vv(&row2),

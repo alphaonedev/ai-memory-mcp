@@ -3779,7 +3779,7 @@ impl MemoryStore for SqliteStore {
         }
         let changed = tx
             .execute(
-                "UPDATE memories SET memory_kind = ?1, version = version + 1 \
+                "UPDATE memories SET memory_kind = ?1, version = MIN(version, 9223372036854775806) + 1 \
                  WHERE id = ?2 AND memory_kind NOT IN ('reflection', 'persona')",
                 rusqlite::params![new_kind_str, id],
             )

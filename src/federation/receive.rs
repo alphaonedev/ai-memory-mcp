@@ -137,6 +137,32 @@ fn accept_catchup_response(peer_id: &str, resp: reqwest::Response) -> Option<req
     }
 }
 
+/// Rows a catch-up pull refused at the shared validation (#4373): counted and
+/// logged at WARN with the row id, never skipped silently.
+static CATCHUP_VALIDATION_REFUSED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Validate a pulled row; on refusal count it and WARN with the peer, the row
+/// id and the cause (e.g. an out-of-bound replicated `version`). `false` means
+/// skip the row.
+pub fn catchup_row_valid(peer_id: &str, mem: &crate::models::Memory) -> bool {
+    match crate::validate::validate_memory(mem) {
+        Ok(()) => true,
+        Err(e) => {
+            let total = CATCHUP_VALIDATION_REFUSED
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                .saturating_add(1);
+            tracing::warn!(
+                peer = %peer_id,
+                memory_id = %mem.id,
+                refused_total = total,
+                "catchup: refusing a pulled memory that failed validation ({e}); skipping the row (#4373)"
+            );
+            false
+        }
+    }
+}
+
 fn log_catchup_unparseable_memory(peer_id: &str, e: impl std::fmt::Display) {
     tracing::warn!("catchup: unparseable memory from peer {peer_id}: {e}");
 }
@@ -624,7 +650,7 @@ pub(super) async fn catchup_once_with_store(
                         continue;
                     }
                 };
-                if crate::validate::validate_memory(&mem).is_err() {
+                if !catchup_row_valid(&peer.id, &mem) {
                     continue;
                 }
                 // #3195 — SAL stored-namespace probe. Admin ctx is already
@@ -747,7 +773,7 @@ pub(super) async fn catchup_once_with_store(
                         continue;
                     }
                 };
-                if crate::validate::validate_memory(&mem).is_err() {
+                if !catchup_row_valid(&peer.id, &mem) {
                     continue;
                 }
                 // #3195 — sqlite stored-namespace probe (legacy
@@ -940,7 +966,7 @@ async fn catchup_once_legacy(config: &FederationConfig, db: &crate::handlers::Db
                         continue;
                     }
                 };
-                if crate::validate::validate_memory(&mem).is_err() {
+                if !catchup_row_valid(&peer.id, &mem) {
                     continue;
                 }
                 // #3195 — no-sal catchup_once_legacy twin of the sqlite

@@ -1317,6 +1317,9 @@ pub fn validate_memory(mem: &Memory) -> Result<()> {
     if mem.access_count < 0 {
         bail!("access_count cannot be negative");
     }
+    // #4218 — a replicated `version` is bounded: one peer must not pin the
+    // optimistic-concurrency counter near `i64::MAX` on every node.
+    crate::models::replicated_version::validate_replicated_version(mem.version)?;
     if !is_valid_rfc3339(&mem.created_at) {
         bail!("created_at is not valid RFC3339");
     }

@@ -1067,7 +1067,11 @@ fn apply_all_classes(
                         .transpose()?,
                     mem.confidence_decayed_at,
                     row.mentioned_entity_id,
-                    mem.version,
+                    // #4390 — a bundle's `version` is remote-asserted: clamp it
+                    // exactly as the federation merge funnels do, so a restored
+                    // row's next honest edit still passes every peer's receive
+                    // validation (the #4373 divergence through this lane).
+                    crate::models::replicated_version::bounded_inbound_version(mem.version, None),
                     mem.lifecycle_state.as_str(),
                     encrypted_envelope,
                     row.kind_provenance,
