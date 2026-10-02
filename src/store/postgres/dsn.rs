@@ -42,7 +42,9 @@
 use std::borrow::Cow;
 use std::str::FromStr;
 
-use sqlx::postgres::PgConnectOptions;
+use sqlx::postgres::{PgConnectOptions, PgSslMode};
+
+use crate::transit_encryption::SslmodeFloor;
 
 /// Tracing target for this funnel's own events.
 const TRACE_TARGET: &str = "store::postgres::dsn";
@@ -169,6 +171,117 @@ pub fn connect_options(dsn: &str) -> Result<PgConnectOptions, sqlx::Error> {
         );
     }
     PgConnectOptions::from_str(&screened.dsn)
+}
+
+/// Why [`floored_connect_options`] produced no options.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum FlooredConnectError {
+    /// The DSN is below the #3705 transit-encryption floor. Carries the typed
+    /// verdict (never [`SslmodeFloor::Pinned`]); `Display` renders the
+    /// operator-facing refusal, which never echoes the DSN. No socket was
+    /// opened.
+    Refused(SslmodeFloor),
+    /// sqlx could not parse the DSN. The text is already URL-redacted.
+    /// ERRORS-15 exception: the `sqlx::Error` is not chained as `source()`
+    /// because its `Display` can interpolate the raw DSN (credential
+    /// included), and redaction has to run on text.
+    Parse(String),
+}
+
+impl std::fmt::Display for FlooredConnectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused(verdict) => f.write_str(
+                &crate::transit_encryption::pg_floor_refusal(verdict)
+                    .unwrap_or_else(crate::transit_encryption::pg_sslmode_refusal),
+            ),
+            Self::Parse(detail) => write!(f, "parse url: {detail}"),
+        }
+    }
+}
+
+impl std::error::Error for FlooredConnectError {}
+
+/// The one floor evaluation (#3705 / #4434): the text screen, then the
+/// options sqlx PARSES from the DSN. sqlx matches keys case-sensitively,
+/// honours the `ssl-mode` alias, percent-decodes keys, drops tab/newline
+/// characters, ignores the fragment and falls back to `PGSSLMODE` when the URL
+/// names no sslmode; the text reading does none of that, so the decision is
+/// made on the parsed value and the floor and the driver can never disagree
+/// (ERRORS-01 / ERRORS-09).
+fn evaluate(dsn: &str) -> Result<PgConnectOptions, FlooredConnectError> {
+    let text_host = match crate::transit_encryption::dsn_sslmode_floor(dsn) {
+        SslmodeFloor::Pinned { host } => host,
+        refused => return Err(FlooredConnectError::Refused(refused)),
+    };
+    let options = connect_options(dsn).map_err(|e| {
+        FlooredConnectError::Parse(crate::logging::redact_urls_in_message(&e.to_string()))
+    })?;
+    // The driver's own transport predicate (`fetch_socket`): a socket is set,
+    // or the host starts with `/`. The path-host arm is reachable: `PGHOST=/dir`
+    // with a URL whose only host key the driver does not recognise (an
+    // upper-case `HOST=`) leaves no socket set and host `/dir`.
+    if options.get_socket().is_some() || options.get_host().starts_with('/') {
+        let dir = options.get_socket().map_or_else(
+            || options.get_host().to_string(),
+            |p| p.display().to_string(),
+        );
+        return Err(FlooredConnectError::Refused(SslmodeFloor::UnixSocket {
+            dir,
+        }));
+    }
+    let resolved = match options.get_ssl_mode() {
+        PgSslMode::VerifyFull => {
+            // The host the text names must be the host the driver dials.
+            if !options.get_host().eq_ignore_ascii_case(text_host.trim()) {
+                return Err(FlooredConnectError::Refused(SslmodeFloor::DriverHost {
+                    named: text_host,
+                    dialed: options.get_host().to_string(),
+                }));
+            }
+            return Ok(options);
+        }
+        PgSslMode::Disable => "disable",
+        PgSslMode::Allow => "allow",
+        PgSslMode::Prefer => "prefer",
+        PgSslMode::Require => "require",
+        PgSslMode::VerifyCa => "verify-ca",
+    };
+    Err(FlooredConnectError::Refused(SslmodeFloor::DriverResolved {
+        host: options.get_host().to_string(),
+        resolved: resolved.to_string(),
+    }))
+}
+
+/// The typed floor verdict for `dsn` - what
+/// [`crate::transit_encryption::dsn_floor_verdict`] returns under
+/// `sal-postgres`. [`SslmodeFloor::Pinned`] only when
+/// [`floored_connect_options`] would succeed.
+#[must_use]
+pub fn floor_verdict(dsn: &str) -> SslmodeFloor {
+    match evaluate(dsn) {
+        Ok(options) => SslmodeFloor::Pinned {
+            host: options.get_host().to_string(),
+        },
+        Err(FlooredConnectError::Refused(verdict)) => verdict,
+        Err(FlooredConnectError::Parse(_)) => SslmodeFloor::Unparseable,
+    }
+}
+
+/// [`connect_options`] behind the #3705 transit-encryption floor (#4333):
+/// the ONE function production code uses to turn a store DSN into connect
+/// options. A DSN whose PARSED options are not `sslmode=verify-full` on a TCP
+/// transport (absent, weaker, a Unix socket, unparseable, or a shape the
+/// driver reads differently from the text, #4434) is refused HERE, before any
+/// socket exists. Fails closed (ERRORS-01).
+///
+/// # Errors
+///
+/// [`FlooredConnectError::Refused`] below the floor;
+/// [`FlooredConnectError::Parse`] when sqlx cannot parse the DSN.
+pub fn floored_connect_options(dsn: &str) -> Result<PgConnectOptions, FlooredConnectError> {
+    evaluate(dsn)
 }
 
 #[cfg(test)]

@@ -314,7 +314,9 @@ const RAW_DSN_TOKENS: &[&str] = &[
 ];
 
 /// The funnel call as it appears at a call site.
-const FUNNEL_CALL: &str = "dsn::connect_options(";
+/// #4333: the call sites use the FLOORED variant, which runs the #3705 sslmode
+/// floor before the #3674 screen; the bare `connect_options` is not accepted.
+const FUNNEL_CALL: &str = "dsn::floored_connect_options(";
 
 fn strip_vis(t: &str) -> &str {
     let t = t.trim_start();
@@ -463,7 +465,7 @@ fn every_production_sqlx_connect_goes_through_the_dsn_funnel_3674() {
     assert!(
         violations.is_empty(),
         "#3674: sqlx is handed a raw DSN outside {FUNNEL_FILE}; build options with \
-         `crate::store::postgres::dsn::connect_options` and connect with `connect_with`:\n{}",
+         `crate::store::postgres::dsn::floored_connect_options` and connect with `connect_with`:\n{}",
         violations.join("\n")
     );
     let expected: Vec<(String, usize, usize)> = LEDGER
@@ -473,7 +475,7 @@ fn every_production_sqlx_connect_goes_through_the_dsn_funnel_3674() {
     assert_eq!(
         observed, expected,
         "#3674: the production sqlx connection inventory changed. Every construction \
-         must take its options from `dsn::connect_options`; update LEDGER only for a \
+         must take its options from `dsn::floored_connect_options`; update LEDGER only for a \
          site that does."
     );
 }
