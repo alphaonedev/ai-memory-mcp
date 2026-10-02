@@ -125,7 +125,7 @@ async fn run_case(scratch: &str) -> Result<(), String> {
         .await
         .map_err(|e| format!("install login delay (needs a superuser role): {e}"))?;
 
-    let writer = {
+    let mut writer = {
         let pool = pool.clone();
         tokio::spawn(async move {
             let mut tx = pool
@@ -144,6 +144,20 @@ async fn run_case(scratch: &str) -> Result<(), String> {
     let started = Instant::now();
     let end = pg_barrier::deadline();
     let blocked_pid = loop {
+        // The writer can only be seen waiting while it is alive. If it already
+        // finished it failed (it cannot take the lock the holder owns), so
+        // surface ITS error or panic instead of waiting out the budget and
+        // reporting a bare "barrier not reached".
+        if writer.is_finished() {
+            let why = match (&mut writer).await {
+                Ok(Ok(())) => "finished without waiting".to_string(),
+                Ok(Err(e)) => format!("failed: {e}"),
+                Err(e) => format!("task panicked or was cancelled: {e}"),
+            };
+            return Err(format!(
+                "the writer ended before the barrier was reached: {why}"
+            ));
+        }
         let seen: Option<i32> = sqlx::query_scalar(
             "SELECT pid FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid)) LIMIT 1",
         )
