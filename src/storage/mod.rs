@@ -871,14 +871,19 @@ mod lifecycle_write;
 // #1720 B3 — boot owner-lockout probe (read-only COUNT over the indexed
 // visibility generated columns). Lives in its own submodule to keep this
 // already-large module under the qual_10 size ceiling.
+/// #1964 [P1][D14] — recall-completeness index-coverage reconciliation:
+/// reconciles what the FTS5 + ANN recall indexes cover against the
+/// `memories` table so recall can report its coverage honestly.
+mod approval_depth;
 /// #1802 (R-05, S1) — doctor / observability probes extracted verbatim from
 /// this module. PRIVATE module (M-SINGLE-ITEM-PATH): every public item is
 /// re-exported below so the only public paths stay `crate::storage::*` /
 /// `crate::db::*`, byte-identical to pre-split.
 mod doctor;
-/// #1964 [P1][D14] — recall-completeness index-coverage reconciliation:
-/// reconciles what the FTS5 + ANN recall indexes cover against the
-/// `memories` table so recall can report its coverage honestly.
+pub use approval_depth::{
+    ApprovalDepthLevel, ApprovalDepthLevelState, ApprovalDepthWalk, approval_depth_level_decision,
+    approval_depth_level_state, resolve_require_approval_above_depth,
+};
 pub mod embed_skip;
 /// v1.0.0 #3288 — sqlite half of the bounded, keyset-paged admin export.
 pub mod export_page;
@@ -23117,76 +23122,6 @@ fn warn_severed_floor_applied(severed_namespace: &str, resolving_for: &str) {
     );
 }
 
-/// v0.7.0 L1-8 — read `governance.require_approval_above_depth` from the
-/// namespace's most-specific governance metadata blob, leaf-first.
-///
-/// This is intentionally a free function (not a field on
-/// [`GovernancePolicy`]) to avoid introducing a new required struct field
-/// that would need updating at every `GovernancePolicy { … }` literal
-/// in the codebase. The existing `GovernancePolicy` struct represents
-/// the resolved enforcement policy; this field is a pre-write interception
-/// threshold that lives beside it, not inside it.
-///
-/// Returns `None` when:
-/// - no namespace standard is configured at any level of the chain, OR
-/// - the standard's `metadata.governance` blob is absent or null, OR
-/// - the blob does not contain a `require_approval_above_depth` key, OR
-/// - the key is present but `null`.
-///
-/// Returns `Some(threshold)` when the key is a non-null unsigned integer.
-/// Callers in `memory_reflect` compare `proposed_depth > threshold` and
-/// queue a `pending_actions` row when the condition is true.
-pub fn resolve_require_approval_above_depth(conn: &Connection, namespace: &str) -> Option<u32> {
-    // #2542 — governance/approver LAYERING follows only explicitly-declared
-    // parents; a `-`-inferred ancestor must not inject an approval threshold.
-    let chain = build_namespace_governance_chain(conn, namespace);
-    for level in chain.into_iter().rev() {
-        let standard_id = match get_namespace_standard(conn, &level) {
-            Ok(Some(id)) => id,
-            _ => continue,
-        };
-        let mem = match get(conn, &standard_id) {
-            Ok(Some(m)) => m,
-            _ => continue,
-        };
-        // Governance blob must exist and not be null.
-        let gov = match mem.metadata.get(crate::META_KEY_GOVERNANCE) {
-            Some(g) if !g.is_null() => g,
-            _ => continue,
-        };
-        // The field is optional inside the blob — `None` means skip this
-        // level and keep walking (inherit semantics: an ancestor that sets
-        // the field governs if the leaf does not override it).
-        if let Some(threshold) = gov.get("require_approval_above_depth") {
-            if let Some(n) = threshold.as_u64() {
-                // QUAL-3 (FX-5): operator-controlled metadata. Reject the
-                // silent `n as u32` truncation that would let an operator
-                // who sets `require_approval_above_depth = 2^32` (which
-                // would silently land as 0) DISABLE the approval gate
-                // entirely (depth > 0 was the original intent, but
-                // `low_32(2^32) == 0` makes `depth > 0` the actual gate;
-                // any value ≥ 2^32 whose low-32 bits are also high turns
-                // off the gate). Fail-CLOSED on overflow: saturate to 0
-                // so EVERY depth triggers approval — this is the
-                // conservative posture per CLAUDE.md K3/K9 governance
-                // discipline. The companion regression test at
-                // `tests/governance_metadata_no_silent_truncation.rs`
-                // pins this behaviour.
-                return Some(u32::try_from(n).unwrap_or(0));
-            }
-            // Key present but null → no gate at this level; keep walking.
-        }
-        // Policy found at this level but no require_approval_above_depth
-        // key → no gate; stop walking (same leaf-first-wins semantics as
-        // the main resolve_governance_policy walker: a leaf policy that
-        // doesn't set the field takes precedence over a parent that does).
-        if GovernancePolicy::from_metadata(&mem.metadata).is_some() {
-            return None;
-        }
-    }
-    None
-}
-
 /// v0.7.0 L2-6 — read `governance.skill_promotion_min_depth` from the
 /// namespace's most-specific governance metadata blob, leaf-first.
 ///
@@ -24661,6 +24596,26 @@ pub fn execute_pending_action(conn: &Connection, pending_id: &str) -> Result<Opt
 /// (the substrate validator rejects empty values, so missing keys
 /// surface as a `Validation` error rather than a panic).
 fn execute_reflect_from_payload(conn: &Connection, pa: &PendingAction) -> Result<Option<String>> {
+    let input = reflect_input_from_pending(pa)?;
+    let outcome = crate::storage::reflect::reflect(conn, &input)
+        .map_err(|e| anyhow::anyhow!("reflect execute failed: {e}"))?;
+    Ok(Some(outcome.id))
+}
+
+/// Rebuild the [`crate::storage::reflect::ReflectInput`] a queued `reflect`
+/// pending action (see [`execute_reflect_from_payload`] for the payload shape)
+/// stands for. Shared by the SQLite executor above and the PostgreSQL
+/// `execute_pending_action` `reflect` arm (#4357): ONE payload decoder, so an
+/// approved reflection replays identically on both backends and a malformed
+/// payload is refused (never defaulted into a write) on both.
+///
+/// # Errors
+///
+/// A typed [`StorageError::InvalidArgument`] when `source_ids`, `title` or
+/// `content` is missing or the `tier` is present but unrecognised.
+pub fn reflect_input_from_pending(
+    pa: &PendingAction,
+) -> Result<crate::storage::reflect::ReflectInput> {
     let payload = &pa.payload;
     let source_ids: Vec<String> = payload
         .get(field_names::SOURCE_IDS)
@@ -24744,12 +24699,19 @@ fn execute_reflect_from_payload(conn: &Connection, pa: &PendingAction) -> Result
         .and_then(|v| v.as_str())
         .map(str::to_string)
         .unwrap_or_else(|| pa.requested_by.clone());
-    let metadata = payload
+    let mut metadata = payload
         .get("metadata")
         .cloned()
         .unwrap_or_else(|| serde_json::json!({}));
+    // #4357 — `attest_level` is a substrate-stamped system key, never
+    // caller-authoritative: a value that rode the queued payload (a payload
+    // queued before this scrub existed, or by any other funnel) must not
+    // survive the replay onto the durable row.
+    if let Some(obj) = metadata.as_object_mut() {
+        obj.remove(field_names::ATTEST_LEVEL);
+    }
 
-    let input = crate::storage::reflect::ReflectInput {
+    Ok(crate::storage::reflect::ReflectInput {
         source_ids,
         title,
         content,
@@ -24765,10 +24727,7 @@ fn execute_reflect_from_payload(conn: &Connection, pa: &PendingAction) -> Result
         source: crate::validate::DEFAULT_NHI_SOURCE.to_string(),
         agent_id,
         metadata,
-    };
-    let outcome = crate::storage::reflect::reflect(conn, &input)
-        .map_err(|e| anyhow::anyhow!("reflect execute failed: {e}"))?;
-    Ok(Some(outcome.id))
+    })
 }
 
 #[cfg(test)]

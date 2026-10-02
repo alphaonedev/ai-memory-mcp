@@ -32222,6 +32222,53 @@ impl MemoryStore for PostgresStore {
         Ok(None)
     }
 
+    /// #4357 — postgres twin of `storage::resolve_require_approval_above_depth`.
+    /// Same governance chain (entitled parents only, #2542), same leaf-first
+    /// walk, and the per-level decision is the SHARED pure function
+    /// `storage::approval_depth_level_decision`, so the two backends cannot
+    /// drift. A level whose standard is unresolvable is skipped (the sqlite
+    /// walk's `continue`); a genuine DATABASE error is propagated so the
+    /// reflect refuses instead of skipping a configured approval gate (fail
+    /// closed — the sqlite helper has no error channel).
+    async fn resolve_require_approval_above_depth(
+        &self,
+        namespace: &str,
+    ) -> StoreResult<Option<u32>> {
+        use crate::storage::{
+            ApprovalDepthLevelState, ApprovalDepthWalk, approval_depth_level_state,
+        };
+        let chain = pg_namespace_chain(&self.pool, namespace, true).await?;
+        let mut walk = ApprovalDepthWalk::default();
+        for ns in chain.into_iter().rev() {
+            let row: Option<(Option<String>,)> = sqlx::query_as(SQL_SELECT_STANDARD_ID_BY_NS)
+                .bind(&ns)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| to_store_err("resolve_require_approval_above_depth lookup", e))?;
+            // An unresolvable standard is `Missing` (the shared decision's
+            // `Continue`); #4285 adds the Severed handling in this one place.
+            let state = match row {
+                Some((Some(standard_id),)) => {
+                    // Substrate-internal policy read: admin context, exactly as
+                    // `resolve_governance_policy` (#955) — a private standard
+                    // must still gate.
+                    let ctx =
+                        CallerContext::for_admin(crate::identity::sentinels::GOVERNANCE_INTERNAL);
+                    match self.get(&ctx, &standard_id).await {
+                        Ok(m) => approval_depth_level_state(&m.metadata),
+                        Err(StoreError::NotFound { .. }) => ApprovalDepthLevelState::Missing,
+                        Err(e) => return Err(e),
+                    }
+                }
+                _ => ApprovalDepthLevelState::Missing,
+            };
+            if let Some(n) = walk.step(state) {
+                return Ok(Some(n));
+            }
+        }
+        Ok(walk.finish())
+    }
+
     /// v1.0.0 #3448 — approver-gated REJECT (veto), the postgres twin of
     /// `db::reject_with_approver_type` (#3388) and the companion of
     /// [`Self::governance_approve_with_consensus`] above.
@@ -32621,6 +32668,35 @@ impl MemoryStore for PostgresStore {
                 } else {
                     None
                 }
+            }
+            // #4357 — the L1-8 / #3638 reflect pendings the postgres reflect
+            // gates queue. Pre-fix this arm did not exist: a queued
+            // reflection could never be applied on this backend ("unsupported
+            // action_type"). Same payload decoder as the sqlite executor
+            // (`storage::reflect_input_from_pending`); the replay is the
+            // approved write, so no gate re-runs (the approval IS the gate),
+            // exactly as sqlite replays through `storage::reflect::reflect`.
+            "reflect" => {
+                let input = crate::storage::reflect_input_from_pending(&pa).map_err(|e| {
+                    StoreError::InvalidInput {
+                        detail: e.to_string(),
+                    }
+                })?;
+                // #4357 — replay as the REQUESTER's tenant through the trait
+                // `reflect`, never admin: source visibility, the #3696
+                // title-slot admission (a hidden private row of another
+                // principal is refused, not merged into), the why_trace gate,
+                // the attestation posture and the provenance stamp all
+                // re-apply at execute time exactly as on the direct path. The
+                // payload agent is already bound to `requested_by` by
+                // `verify_payload_agent_id` above.
+                let requester = CallerContext::for_agent(&pa.requested_by);
+                let outcome = MemoryStore::reflect(self, &requester, &input, None)
+                    .await
+                    .map_err(|e| StoreError::InvalidInput {
+                        detail: format!("reflect execute failed: {e}"),
+                    })?;
+                Some(outcome.id)
             }
             other => {
                 return Err(StoreError::InvalidInput {
