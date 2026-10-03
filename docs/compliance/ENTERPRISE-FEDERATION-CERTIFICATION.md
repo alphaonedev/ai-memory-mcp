@@ -708,8 +708,8 @@ ai-memory doctor --posture enterprise-federation   # exits non-zero on ANY devia
      plus a mandatory `AI_MEMORY_DB_PASSPHRASE` (set via
      `--db-passphrase-file`). A sqlcipher build that is started without
      the passphrase **hard-refuses to open any database**
-     (`StorageError::SqlcipherMissingPassphrase`,
-     `src/storage/connection.rs:833-839` / `src/storage/error.rs:118-122`).
+     ([`StorageError::SqlcipherMissingPassphrase`](../../src/storage/error.rs),
+     raised by [`apply_sqlcipher_key`](../../src/storage/connection.rs)).
    - **Per-content envelope:** `AI_MEMORY_ENCRYPT_AT_REST=1` seals each
      memory's `content` under a per-agent X25519 / ChaCha20-Poly1305
      envelope (`src/encryption/mod.rs`, `ENV_ENCRYPT_AT_REST` at
@@ -839,8 +839,8 @@ ai-memory doctor --posture enterprise-federation   # exits non-zero on ANY devia
 
 `ai-memory doctor --posture enterprise-federation` renders PASS/FAIL per
 requirement and **exits non-zero on any deviation of the running process**
-(the ruling's "a non-zero exit is falsifiable" bar). `run_posture`
-(`src/cli/doctor.rs:739`) returns **0 iff all 22 checks pass, else 2**
+(the ruling's "a non-zero exit is falsifiable" bar). [`run_posture`](../../src/cli/doctor.rs)
+returns **0 iff all 22 checks pass, else 2**
 (the posture grew 16 → 18 when #2918/#2911 landed checks #17
 boot-refusal-env self-attest and #18 FED-RQ-03, then **18 → 19 when #2954
 landed check #19 append-only-audit-spine-armed** — append-only spine ON
@@ -861,8 +861,8 @@ directory's `SANITIZATION.md` + `MANIFEST.sha256`):
 
 > **Evidence note (2026-08-29 recapture, `cert-55/`):** the four-leg
 > §2 captures are **measured** at 20 checks on the release-built binary
-> at `23f943ca` (Wave-2 B10 certified tip). `ENTERPRISE_FEDERATION_CHECK_COUNT
-> = 20` (`src/enterprise_federation_posture.rs:129`). Raw output in
+> at `23f943ca` (Wave-2 B10 certified tip). [`ENTERPRISE_FEDERATION_CHECK_COUNT`](../../src/enterprise_federation_posture.rs)
+> was 20 at that tip (it is 22 on the current tree). Raw output in
 > `docs/compliance/evidence/cert-55/` (`SANITIZATION.md` +
 > `MANIFEST.sha256`). The `cert-54/` 18-check captures (2026-08-13)
 > remain the removal-proof evidence of record; they are **not** the
@@ -957,8 +957,8 @@ FED-RQ-03 policy-current, check #18).
 **Doctor caveats (do not over-read a PASS):**
 
 - `doctor --posture` attests the **resolved config of the process it
-  runs in** (`AppConfig::load()` + that process's env —
-  `src/cli/doctor.rs:749-751`). It does **not** inspect a running
+  runs in** (`AppConfig::load()` + that process's env, read inside
+  [`run_posture`](../../src/cli/doctor.rs)). It does **not** inspect a running
   daemon. Under systemd, run it with the daemon's exact
   `EnvironmentFile`.
 - **RESOLVED (#2911 items 1-2, PR #2918, 2026-08-13):** a doctor PASS
@@ -1421,14 +1421,15 @@ is observed:**
    *Log line that would show it:* a persisted row whose `namespace` is outside
    the sending peer's `allowed_namespaces` with no matching refusal in the
    `receive_auth` trace (`ATTESTATION_TRACE_TARGET` =
-   `"federation::attestation"`, `src/handlers/federation_receive.rs:33`),
+   `"federation::attestation"`, defined in
+   [`ATTESTATION_TRACE_TARGET`](../../src/handlers/federation_receive.rs)),
    i.e. an applied write with no `namespace_probe_unresolvable`
    (`src/federation/receive_auth.rs::CAUSE_NAMESPACE_PROBE_UNRESOLVABLE`)
    / refusal counterpart.
 2. **`ai-memory doctor --posture enterprise-federation` exits 0 on a process
    that is NOT in the hardened+sqlcipher configuration** (a false-green posture)
    voids it.
-   *Observable:* `run_posture` (`src/cli/doctor.rs:739`) returns `2` on any
+   *Observable:* [`run_posture`](../../src/cli/doctor.rs) returns `2` on any
    FAIL and prints `overall: FAIL`. A false-green is exit 0 + `overall: PASS`
    on a process that is not the hardened+sqlcipher configuration.
 3. **Any control in `scripts/check-cert-removal-proof.sh` failing its removal
