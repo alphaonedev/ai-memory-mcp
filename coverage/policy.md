@@ -495,8 +495,7 @@ the database mid-test (rejected as too brittle).
 This section records the #767 disposition, written when the module was
 the single file `mcp/tools/store.rs`. #881 PR-4 later split that file
 into `src/mcp/tools/store/{embed,legacy_classifier,mod,synthesis,tests,transport,validation}.rs`,
-and `coverage/thresholds.toml` now carries one floor per sub-module
-(`mod.rs` 87, the others 90) instead of the single-file floor, so the
+and `coverage/thresholds.toml` now carries a floor per production sub-module (`mod.rs` 87; `validation`, `embed`, `synthesis`, `transport` and `legacy_classifier` 90; `tests.rs` is the test module and has no floor) instead of the single-file floor, so the
 96 and 94 figures below are the #767-time history, not the current gate.
 Arms are cited by symbol in the current files; the old line numbers no
 longer exist.
