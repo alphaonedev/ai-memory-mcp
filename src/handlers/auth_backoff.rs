@@ -42,7 +42,7 @@
 //!   crossing the threshold, never per failure.
 //!
 //! Constants only, no env knob (ruling 7): nothing in the row-130 class
-//! requires operator tuning here, so no `ARCHITECTURE_REFERENCE.md` env-table row and no
+//! requires operator tuning here, so no `CLAUDE.md` env-table row and no
 //! docs SSOT gate is touched.
 
 use std::collections::{HashMap, VecDeque};
