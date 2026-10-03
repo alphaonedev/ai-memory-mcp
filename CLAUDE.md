@@ -287,6 +287,13 @@ The architecture reference (key modules, data model, recall pipeline, database, 
 It is deliberately NOT inlined here: `CLAUDE.md` loads eagerly into every session. Use CodeGraph first for code questions; grep the row or symbol you need in that file; do not read it whole.
 Gates that check the environment-variable table or pinned counts read it there.
 
+### Binding rules that live in the reference file
+
+These bind you even if you never open `docs/reference/ARCHITECTURE_REFERENCE.md`. Quoted verbatim (line breaks joined), anchored `file:line`:
+
+- `ARCHITECTURE_REFERENCE.md:141-143` "`secret` = leaks credentials or override authority if logged or echoed; MUST NOT appear in capabilities, banners, audit records, or `tracing` output."
+- `ARCHITECTURE_REFERENCE.md:144` "`test-only` = honored in test builds; never set in production."
+
 ## Adding New Functionality
 
 **New CLI command**: Add variant to `Command` enum → define `Args` struct → add dispatch case in `main()` → implement `cmd_*` handler taking `&Path` (db) + args.
@@ -379,6 +386,17 @@ but new public operations live on the trait.
 Code style detail lives in [`docs/reference/CODE_STYLE.md`](docs/reference/CODE_STYLE.md) (~50 KB).
 The Rust engineering standard is the `rust-1.98` skill: load it before writing or reviewing Rust.
 Do not inline the detail here; grep the rule you need in that file, do not read it whole.
+
+### Binding rules that live in the reference file
+
+These bind you even if you never open `docs/reference/CODE_STYLE.md`. Quoted verbatim (line breaks joined), anchored `file:line`:
+
+- `CODE_STYLE.md:103-105` "It is a ratchet: existing duplications are grandfathered, new duplication fails, and the baseline may only shrink ("thresholds rise, never fall")."
+- `CODE_STYLE.md:153-155` "Use the named constants from `src/lib.rs`: `SECS_PER_HOUR` (3_600), `SECS_PER_DAY` (86_400), `SECS_PER_WEEK` (604_800)."
+- `CODE_STYLE.md:195-199` "HARD-BLOCKS the case-insensitive pattern `rqgm|epoch_manifest|red.?queen` anywhere in `src/` (string literal or comment) — these are internal design-doc identifiers that must never leak into the shipped binary's symbol/string surface."
+- `CODE_STYLE.md:233` "**The historical guard is load-bearing and must not be weakened.**"
+- `CODE_STYLE.md:247-249` "a paragraph labelled `— current release` MUST attribute the Cargo.toml version."
+- `CODE_STYLE.md:466-467` "**The mirror is hand-authored from intent and must NEVER be regenerated from live API state:**"
 
 ## Prime directive (operator-set, 2026-05-17)
 
