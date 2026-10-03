@@ -118,8 +118,8 @@ operator-tunable via the daemon config):
    join-table rows are cleaned up automatically by `ON DELETE
    CASCADE`.
 
-Implementation: `sweep_transcript_lifecycle` at
-[`src/transcripts/storage.rs`](../src/transcripts/storage.rs).
+Implementation:
+[`sweep_transcript_lifecycle`](../src/transcripts/storage.rs).
 The supporting partial index
 `idx_memory_transcripts_archived_at WHERE archived_at IS NOT NULL`
 keeps the prune-phase scan O(archived rows) rather than O(total

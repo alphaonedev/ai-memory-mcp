@@ -18,7 +18,7 @@ is consumed single-use to defeat replay within that window.
   (the HMAC verification core),
   [`src/handlers/routes.rs`](../src/handlers/routes.rs)
   (`APPROVALS_STREAM = "/api/v1/approvals/stream"`),
-  [`src/lib.rs`](../src/lib.rs) (route registration).
+  [`build_router_with_timeout`](../src/lib.rs) (route registration).
 - **Schema:** [`migrations/sqlite/0015_v07_pending_action_timeouts.sql`](../migrations/sqlite/0015_v07_pending_action_timeouts.sql)
   + [`migrations/sqlite/0021_v07_a2a_correlation.sql`](../migrations/sqlite/0021_v07_a2a_correlation.sql).
 - **Reconciliation security-sweep commits:**
