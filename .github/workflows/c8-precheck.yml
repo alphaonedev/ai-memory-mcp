@@ -1322,12 +1322,11 @@ jobs:
     #      (src/daemon_runtime.rs); no short flags, no partial interpolation.
     #   4. scan_text: --tls-cert and --tls-key are both present (template
     #      policy, not a serve refusal).
-    #   5. dsn_hits: every postgres:// URL pins sslmode=verify-full (#3705 floor).
+    #   5. dsn_hits: every postgres:// URL pins sslmode=verify-full (#3705 floor), except a template listed in the shrink-only DSN_FLOOR_GAPS.
     #   6. store_channel_hits, exec_store_url_hits: the store URL reaches the
     #      daemon only through AI_MEMORY_STORE_URL_FILE (#4577), never argv, an
     #      environment variable or a password in a 0644 unit.
-    #   7. pin_hits: extension sources are fetched only by fetch_pinned at a
-    #      40-hex *_COMMIT, verified by rev-parse.
+    #   7. pin_hits: every plain git command is inside the one fetch_pinned, called with a 40-hex *_COMMIT that it verifies by rev-parse.
     name: Cloud-init serve-flags gate (#4616)
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -1339,6 +1338,5 @@ jobs:
         # Red probes for all seven rules (unknown and short flags, no serve,
         # missing TLS flag, weak or hidden sslmode, store URL on argv or in the
         # environment, unpinned or unverified git fetch, non-ASCII), most as
-        # mutations of the real AWS template. Green near-misses: the real
-        # templates and clean variants.
+        # mutations of the real AWS template. Green near-misses: the real AWS template and clean variants.
         run: python3 scripts/check-cloud-init-serve-flags.py --self-test

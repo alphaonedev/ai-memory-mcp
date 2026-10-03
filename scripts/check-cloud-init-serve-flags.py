@@ -23,8 +23,8 @@ every one:
      the argv.
   3. ``serve_arg_hits``: every ``--flag`` after ``serve`` is a long flag of
      ``ServeArgs`` in ``src/daemon_runtime.rs`` (``serve_flags`` parses it; clap
-     derives it from the field name or an explicit ``long = "name"``); short
-     flags and partly-interpolated values are refused; only a whole ``${name}``
+     derives it from the field name or an explicit ``long = "name"``); a short
+     flag is accepted only if ServeArgs defines it (none does today); partly-interpolated values are refused; only a whole ``${name}``
      or ``$${name}`` is accepted, and only as a flag value.
   4. ``scan_text``: ``--tls-cert`` and ``--tls-key`` are both present (a policy
      choice: the templates supply operator certificate material whose SAN
