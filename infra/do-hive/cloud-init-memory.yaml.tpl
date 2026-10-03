@@ -38,8 +38,9 @@ packages:
 write_files:
   # #4577: the Postgres DSN (it carries the db password) reaches the daemon
   # through AI_MEMORY_STORE_URL_FILE, never on the serve argv where every local
-  # UID can read it from /proc/<pid>/cmdline and `ps auxww`. Written 0600 so no
-  # window exists in which it is group/world-readable; provision.sh hands it to
+  # UID can read it from /proc/<pid>/cmdline and `ps auxww`. Declared 0600
+  # root:root (it is the only credential-bearing file here besides the 0700
+  # provision.sh); provision.sh hands it to
   # the aimemory service user once that user exists (serve refuses a file with
   # any group/world mode bit, src/store_url.rs). A trailing newline is trimmed.
   - path: /etc/ai-memory/store-url
@@ -442,11 +443,20 @@ write_files:
 
       : > "$FED_DIR/MESH-READY"
       echo "[fed-bootstrap] MESH READY node ${node_index}/${node_count} identity=$FED_ID peers=$PEERS author=$AUTHOR_ID"
+  # #4604: this script is rendered with the db password inline, so it is root
+  # only (0700), never 0755 where every local UID could read it.
   - path: /opt/ai-memory/provision.sh
-    permissions: '0755'
+    permissions: '0700'
+    owner: root:root
     content: |
       #!/usr/bin/env bash
       set -euxo pipefail
+      # #4609: the xtrace (set -x) stream and everything else is teed to a log.
+      # Create the log 0600 BEFORE the tee opens it (a world-readable log would
+      # expose any traced credential), and switch xtrace off around every line
+      # that handles the db password below.
+      ( umask 077; : >> /var/log/ai-memory-provision.log )
+      chmod 0600 /var/log/ai-memory-provision.log
       exec > >(tee -a /var/log/ai-memory-provision.log) 2>&1
       echo "=== ai-memory postgres+AGE+pgvector provision $(date -u) ==="
 
@@ -454,6 +464,8 @@ write_files:
       id aimemory >/dev/null 2>&1 || useradd -m -d /opt/ai-memory -s /bin/bash aimemory
       mkdir -p /opt/ai-memory/bin /var/log/ai-memory
       chown -R aimemory:aimemory /opt/ai-memory /var/log/ai-memory
+      chown root:root /opt/ai-memory/provision.sh   # holds the db password (#4604)
+      chmod 0700 /opt/ai-memory/provision.sh
       # #4577: hand the DSN file to the service user (mode stays 0600).
       chown aimemory:aimemory /etc/ai-memory/store-url
       chmod 0600 /etc/ai-memory/store-url
@@ -491,8 +503,17 @@ write_files:
       sleep 5
 
       # --- db + role + extensions (idempotent) ---
-      sudo -u postgres psql -tc "SELECT 1 FROM pg_roles WHERE rolname='aimemory'" | grep -q 1 || \
-        sudo -u postgres psql -c "CREATE USER aimemory WITH PASSWORD '${db_password}';"
+      # #4604/#4609: the role password reaches psql on STDIN from a 0600 SQL
+      # file (printf is a shell builtin: no argv, and umask 077 means no
+      # readable window), never as a psql -c argv word carrying the password;
+      # xtrace is off while the password is handled.
+      set +x
+      if ! sudo -u postgres psql -tc "SELECT 1 FROM pg_roles WHERE rolname='aimemory'" | grep -q 1; then
+        ( umask 077; printf "CREATE USER aimemory WITH PASSWORD '%s';\n" '${db_password}' > /root/.aimemory-role.sql )
+        sudo -u postgres psql -v ON_ERROR_STOP=1 -f - < /root/.aimemory-role.sql
+        rm -f /root/.aimemory-role.sql
+      fi
+      set -x
       sudo -u postgres psql -tc "SELECT 1 FROM pg_database WHERE datname='aimemory'" | grep -q 1 || \
         sudo -u postgres psql -c "CREATE DATABASE aimemory OWNER aimemory;"
       sudo -u postgres psql -d aimemory -c "CREATE EXTENSION IF NOT EXISTS vector;"
@@ -515,7 +536,9 @@ write_files:
       max_client_conn = 2000
       default_pool_size = 100
       PGB
-      printf '"aimemory" "${db_password}"\n' > /etc/pgbouncer/userlist.txt
+      set +x   # #4609: no xtrace of the userlist credential line
+      ( umask 077; printf '"aimemory" "${db_password}"\n' > /etc/pgbouncer/userlist.txt )
+      set -x
       chown postgres:postgres /etc/pgbouncer/pgbouncer.ini /etc/pgbouncer/userlist.txt
       chmod 0600 /etc/pgbouncer/userlist.txt
       systemctl enable --now pgbouncer
