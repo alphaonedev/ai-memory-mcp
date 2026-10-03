@@ -72,7 +72,13 @@ FETCH_PINNED_DEF_RE = re.compile(r"^[ \t]*fetch_pinned\(\)[ \t]*\{[^\n]*\n(?P<bo
 FETCH_PINNED_CALL_RE = re.compile(r'^[ \t]*fetch_pinned[ \t]+https://\S+[ \t]+\S+[ \t]+"\$(?P<var>\w+_COMMIT)"[ \t]*$')
 VERIFY_RE = re.compile(r'^\[ "\$\(git(?: -C "\$2")? rev-parse HEAD\)" = "\$3" \]$')
 COMMENT_LINE_RE = re.compile(r"^[ \t]*#.*$", re.M)
-DSN_RE = re.compile(r"^\s+(postgres(?:ql)?://\S+)\s*$", re.M)
+# A postgres URL anywhere (file line, Environment=, an argv, a heredoc), but not
+# a regex that merely begins with the scheme (s#^postgres://...#): the scheme
+# must start the text or follow whitespace, = " ' ( ` > , or {.
+DSN_RE = re.compile(r"(?<![^\s=\"'(`>,{])postgres(?:ql)?://[^\s\"']+")
+STORE_ENV_RE = re.compile(r"(?<!\w)AI_MEMORY_STORE_URL=")
+UNIT_ENTRY_RE = re.compile(r"^[ \t]*-[ \t]+path:[ \t]*(\S+)[ \t]*$", re.M)
+USERINFO_PW_RE = re.compile(r"[A-Za-z][\w+.-]*://[^/@\s:\"']+:[^/@\s\"']+@")
 STRUCT_RE = re.compile(r"pub struct ServeArgs \{(.*?)\n\}", re.S)
 FIELD_RE = re.compile(r"^\s{4}pub (\w+):", re.M)
 ATTR_RE = re.compile(r"#\[arg\((.*?)\)\]", re.S)
@@ -206,21 +212,50 @@ def serve_invocations(text: str) -> list:
 
 
 def dsn_hits(name: str, text: str) -> list:
+    """Every postgres:// URL in the template, wherever it is written, ends with
+    sslmode=verify-full as its last sslmode (the #3705 floor); #4659."""
     hits = []
-    dsns = DSN_RE.findall(text)
+    dsns = set()
+    for view in argv_views(text):
+        dsns.update(DSN_RE.findall(view))
     if not dsns:
-        hits.append("%s: no postgres:// store URL line found (cannot check the sslmode floor)" % name)
+        hits.append("%s: no postgres:// store URL found (cannot check the sslmode floor)" % name)
     floor_ok = True
-    for dsn in dsns:
+    for dsn in sorted(dsns):
         query = dsn.split("?", 1)[1] if "?" in dsn else ""
         modes = [p.split("=", 1)[1].strip().lower() for p in query.split("&") if p.lower().startswith("sslmode=")]
         if not modes or modes[-1] != "verify-full":
             floor_ok = False
             if name in DSN_FLOOR_GAPS:
                 continue
-            hits.append("%s: store URL has no sslmode=verify-full (serve refuses it at start, #3705 floor, src/transit_encryption.rs:436-446)" % name)
+            hits.append("%s: store URL %s has no sslmode=verify-full (serve refuses it at start, #3705 floor, src/transit_encryption.rs:436-446)" % (name, dsn.split("@")[-1][:60]))
     if name in DSN_FLOOR_GAPS and floor_ok and dsns:
         hits.append("%s: store URL now passes the sslmode floor; remove it from DSN_FLOOR_GAPS" % name)
+    return hits
+
+
+def store_channel_hits(name: str, text: str) -> list:
+    """#4659/#4664: the store URL reaches the daemon only through
+    AI_MEMORY_STORE_URL_FILE. AI_MEMORY_STORE_URL= (in a unit Environment=, an
+    export, anywhere) and --store-url are refused in any spelling, and a systemd
+    unit written to the node (0644, readable by every local user through
+    ``systemctl show``) may not hold a URL with a password at all."""
+    hits = []
+    for view in argv_views(text):
+        for rx, what in ((STORE_ENV_RE, "AI_MEMORY_STORE_URL= (a store URL in the environment)"), (STORE_FLAG_RE, "--store-url")):
+            if rx.search(view):
+                msg = "%s: %s is not allowed; use AI_MEMORY_STORE_URL_FILE (#4577, #4659, #4664)" % (name, what)
+                if msg not in hits:
+                    hits.append(msg)
+    blanked = CONT_RE.sub(" ", blank_comments(text))
+    entries = list(UNIT_ENTRY_RE.finditer(blanked))
+    for i, em in enumerate(entries):
+        path = em.group(1)
+        if not (path.endswith(".service") or "/systemd/" in path):
+            continue
+        end = entries[i + 1].start() if i + 1 < len(entries) else len(blanked)
+        if USERINFO_PW_RE.search(blanked[em.end():end]):
+            hits.append("%s: unit %s carries a URL with a password (the unit is 0644; use AI_MEMORY_STORE_URL_FILE, #4664)" % (name, path))
     return hits
 
 
@@ -340,6 +375,7 @@ def scan_text(name: str, text: str, known: set) -> list:
         if any(ord(ch) > 127 for ch in line):
             hits.append("%s:%d: non-ASCII byte (cloud-init discards the config, #1880)" % (name, lineno))
     hits.extend(dsn_hits(name, text))
+    hits.extend(store_channel_hits(name, text))
     hits.extend(pin_hits(name, text))
     hits.extend(exec_store_url_hits(name, text))
     invocations = serve_invocations(text)
@@ -421,6 +457,14 @@ def self_test(known: set) -> int:
         "4662 aws: global --store-url before serve": mutate(real, "ai-memory serve", "ai-memory --store-url postgres://aimemory:x@localhost/aimemory?sslmode=verify-full serve"),
         "4662 aws: shell -c wrapper around serve": mutate(real, "ExecStart=/opt/ai-memory/bin/ai-memory serve", "ExecStart=/bin/sh -c 'exec /opt/ai-memory/bin/ai-memory serve"). replace("--tls-key /etc/ai-memory/tls/node.key", "--tls-key /etc/ai-memory/tls/node.key'"),
         "4662 aws: runuser wrapper around serve": mutate(real, "ExecStart=/opt/ai-memory/bin/ai-memory serve", "ExecStart=/usr/sbin/runuser -u aimemory -- /opt/ai-memory/bin/ai-memory serve"),
+        "4659 aws: weak URL in Environment=AI_MEMORY_STORE_URL next to a compliant store-url file": mutate(real, "Environment=AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url", "Environment=AI_MEMORY_STORE_URL=postgres://aimemory:x@localhost/aimemory"),
+        "4659 aws: weak URL passed to another program": mutate(real, "      systemctl daemon-reload", '      psql "postgres://aimemory:x@localhost/aimemory?sslmode=require" -c "select 1"\n      systemctl daemon-reload'),
+        "4659 aws: weak URL after --store-url outside the unit": mutate(real, "      systemctl daemon-reload", "      /opt/ai-memory/bin/ai-memory schema-init --store-url postgres://aimemory:x@localhost/aimemory\n      systemctl daemon-reload"),
+        "4659 aws: Environment= name split by a bash continuation": mutate(real, "Environment=AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url", "Environment=AI_MEMORY_STORE_\\\nURL=postgres://aimemory:x@localhost/aimemory"),
+        "4664 aws: password-bearing DSN with verify-full in Environment=": mutate(real, "Environment=AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url", "Environment=AI_MEMORY_STORE_URL=postgres://aimemory:pw@localhost/aimemory?sslmode=verify-full"),
+        "4664 aws: quoted Environment= with a password DSN": mutate(real, "Environment=AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url", 'Environment="AI_MEMORY_STORE_URL=postgres://aimemory:pw@localhost/aimemory?sslmode=verify-full"'),
+        "4664 aws: Environment= store URL from a templated value": mutate(real, "Environment=AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url", "Environment=AI_MEMORY_STORE_URL=${dsn}"),
+        "4664 aws: password DSN under another name in the 0644 unit": mutate(real, "Environment=AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url", "Environment=AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url\n      Environment=COPY=postgres://aimemory:pw@localhost/aimemory?sslmode=verify-full"),
         "serve with unidentified binary": dsn + "ExecStart=/opt/ai-memory/bin/wrapper serve --host 0.0.0.0 --tls-cert /a --tls-key /b\n",
     }
     red = 0
