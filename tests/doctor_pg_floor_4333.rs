@@ -185,6 +185,15 @@ fn assert_doctor_refused_without_connecting(
         "owners must report the floor refusal: {owners}"
     );
 
+    // #4285 - the corrupt-governance census connects through the SAME floor.
+    let corrupt = section(&report, "Corrupt governance standards");
+    assert!(is_critical(corrupt), "census must be critical: {corrupt}");
+    assert!(
+        corrupt.to_string().contains(REFUSAL_MARK)
+            && corrupt.to_string().contains("doctor REFUSED to connect"),
+        "census must report the floor refusal: {corrupt}"
+    );
+
     let identity = section(&report, "Identity");
     assert!(
         identity.to_string().contains(REFUSAL_MARK),
