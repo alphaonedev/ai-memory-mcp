@@ -1759,8 +1759,9 @@ Six surfaces, each load-bearing for different ops scenarios:
    the span. Non-object `arguments`, an unresolvable caller authority, the
    record-stop gate, an unknown tool and an unrecognised wire format return
    inside the span without an `ok` or `err` event. Governance decisions are not tracing spans:
-   [`record_decision`](../src/governance/audit.rs) writes them to the
-   forensic audit log. Federation emits `tracing::info!` events on the push,
+   [`record_decision`](../src/governance/audit.rs) records them as forensic
+   audit rows when the forensic audit sink is running and does nothing when
+   it is not. Federation emits `tracing::info!` events on the push,
    DLQ-replay, receive and sync paths, not a span per event. The default
    filter is the bare level `info`
    ([`DEFAULT_LOG_DIRECTIVE`](../src/logging.rs), #3650), which is not limited
