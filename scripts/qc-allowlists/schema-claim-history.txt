@@ -17,6 +17,9 @@
 # FAILS the gate. A STALE entry (it suppresses no hit any more) FAILS the gate:
 # delete it. A missing ledger FAILS the gate.
 #
+# Needles match the line after the width suffix is removed: write "CURRENT_SCHEMA_VERSION = 50", not "CURRENT_SCHEMA_VERSION: i64 = 50".
+# A second entry with the same file and needle FAILS the gate as a duplicate.
+#
 # Admission test: the span must describe a value the ladder HELD in the past
 # (a dated release, an `X was N` or `vN rewrites ...` narrative, a pinned
 # historical checkout). A span that states the position of the ladder NOW is
@@ -29,3 +32,23 @@ docs/compliance/_inventory/v0.7.x-code-changes-test-plan.md	CURRENT_SCHEMA_VERSI
 docs/v1.0.0/release-notes.md	Not uniformly additive: v79	#3248 per-version ladder narrative inside the v1.0.0 schema row
 docs/v1.0.0/release-notes.md	v92 rebuilds SQLite's `schema_version	#3248 per-version ladder narrative
 docs/schema.html	v91), the schema_version	#3248 per-version ladder narrative (the same line also carries the live v100 claim, which stays policed)
+ROADMAP.md	v57** (postgres) — the v0.7.1 `CURRENT_SCHEMA_VERSION	#3248 v0.7.1 release HEAD row (frozen baseline value)
+ROADMAP.md	v57 sqlite + postgres lockstep (the v0.7.1 `CURRENT_SCHEMA_VERSION	#3248 v0.7.1 history
+docs/schema.html	v71 #1821), plus migration tracking ( schema_version	#3248 ladder history (v71 table-set narrative)
+docs/schema.html	92 v1.0.0 schema_version	#3248 ladder history (v92 row of the per-version table)
+CLAUDE.md	CURRENT_SCHEMA_VERSION 71→72	#1823 past bump v72 (history, the TO side is a past ladder value)
+CLAUDE.md	CURRENT_SCHEMA_VERSION 72→73	#1822 past bump v73 (history, the TO side is a past ladder value)
+CLAUDE.md	CURRENT_SCHEMA_VERSION 73→74	#1825 past bump v74 (history, the TO side is a past ladder value)
+CLAUDE.md	CURRENT_SCHEMA_VERSION 74→75	#1859 past bump v75 (history, the TO side is a past ladder value)
+CLAUDE.md	CURRENT_SCHEMA_VERSION 75→76	#1828 past bump v76 (history, the TO side is a past ladder value)
+CLAUDE.md	CURRENT_SCHEMA_VERSION 76→77	#1869 past bump v77 (history, the TO side is a past ladder value)
+CLAUDE.md	CURRENT_SCHEMA_VERSION 77→78	#1870 past bump v78 (history, the TO side is a past ladder value)
+CLAUDE.md	CURRENT_SCHEMA_VERSION 78→79	#1942 past bump v79 (history, the TO side is a past ladder value)
+CLAUDE.md	CURRENT_SCHEMA_VERSION 79→80	#1949 past bump v80 (history, the TO side is a past ladder value)
+CLAUDE.md	CURRENT_SCHEMA_VERSION 80→81	#1831 past bump v81 (history, the TO side is a past ladder value)
+CLAUDE.md	CURRENT_SCHEMA_VERSION 81→82	#2024 past bump v82 (history, the TO side is a past ladder value)
+CLAUDE.md	CURRENT_SCHEMA_VERSION 82→83	#2044 past bump v83 (history, the TO side is a past ladder value)
+CLAUDE.md	CURRENT_SCHEMA_VERSION 83→84	#2167 past bump v84 (history, the TO side is a past ladder value)
+CLAUDE.md	CURRENT_SCHEMA_VERSION 84→85	#2035 past bump v85 (history, the TO side is a past ladder value)
+CLAUDE.md	CURRENT_SCHEMA_VERSION 85→86	#1834 past bump v86 (history, the TO side is a past ladder value)
+CLAUDE.md	CURRENT_SCHEMA_VERSION 86→87	#2333 past bump v87 (history, the TO side is a past ladder value)
