@@ -36,6 +36,29 @@ What the gate refuses (exit 1):
     A systemd ``Environment=`` line carrying a credential URL is refused
     whatever the key spelling (#4689).
 
+List-form argv (#4614): a compose ``command:`` array, a Kubernetes ``args:`` list
+or a JSON argv array puts the flag and its value in separate items
+(``"--store-url", "postgres://u:pw@h/d"``); the flag-to-value separator accepts
+quotes, commas, newlines and a YAML ``- `` marker, so those are refused too.
+``migrate --from`` / ``--to`` take URLs on argv (#4600): a credential URL after
+either flag is refused (fail closed: whatever command owns it, a credential on an
+argv is exposed). The sanctioned forms are ``--from-url-file`` / ``--to-url-file``.
+
+Argv secret forms (#4813-#4819), on every text file: a literal secret on the argv
+of ``curl -u user:literal`` (#4813), ``mysql``/``mysqldump``/``mariadb`` ``-pLITERAL`` or
+``--password=LITERAL`` (#4814), ``sshpass -p LITERAL`` (#4815), ``redis-cli -a LITERAL``
+or ``--pass LITERAL`` (#4816), ``psql -v pw=LITERAL`` for a password-named variable
+(#4817), a ``curl -H 'Authorization: Bearer LITERAL'`` header (#4818) and
+``docker login -p LITERAL`` / ``--password LITERAL`` (#4819). A placeholder is not
+a secret and stays clean: a shell variable reference or command substitution
+(``$PW``, ``${PW}``, ``$(cat f)``), an angle-bracket or brace placeholder, a redaction
+token, or an obviously fake word (CHANGEME, PASSWORD, xxxx, YOUR_PASSWORD). The
+sanctioned forms are stdin / file channels (``curl --netrc-file``, ``MYSQL_PWD``,
+``sshpass -f``, ``REDISCLI_AUTH``, ``docker login --password-stdin``). A hit never
+prints the secret: it reports the form, and the file and line locate it. These seven
+rules extend the gate by the existing pattern (one rule plus red and green probes
+per form), so no crossroads vote applies.
+
 Rules from the #4600 line of work (text rules, also run on every shell-like or
 template file):
 
@@ -86,8 +109,11 @@ What the gate does NOT claim:
   * Prose (.md) is checked for ``--store-url`` only; a heredoc body is read as
     commands (stricter, not looser); .tf, .py and .rs sources are checked for
     ``--store-url`` only.
-  * changelog.d/, docs/reviews/, docs/handoff/ and CHANGELOG.md are records,
-    not recommendations, and are skipped.
+  * Nothing is skipped by path: changelog.d/, docs/reviews/, docs/handoff/ and
+    CHANGELOG.md are scanned like every other tracked file (#4615), because a
+    credential is no less exposed for sitting in a record. A text file over
+    MAX_BYTES or not valid UTF-8 cannot be read here; the PASS line counts those
+    so the skip is visible.
 
 Usage:
   scripts/check-docs-no-argv-secrets.py             exit 0 clean, 1 on a hit,
@@ -114,14 +140,15 @@ Hit = Tuple[str, int, str]
 
 # Redaction tokens that are not a credential.
 REDACTION_TOKENS = ("...", "…", "***", "redacted", "<redacted>", "xxxx")
+# A whole value made of one filler character ("xxxx", "****", "......").
+FILLER_RE = re.compile(r"(?:x{3,}|\*{3,}|\.{3,}|…+|_{3,}|-{3,})", re.I)
 
 # Files that quote the patterns on purpose: this gate.
 SELF_EXEMPT = {"scripts/check-docs-no-argv-secrets.py"}
 
-# Historical or machine-generated trees where quoted old commands are a record,
-# not a recommendation: the changelog fragments and the per-PR review evidence.
-SKIP_PREFIXES = ("changelog.d/", "docs/reviews/", "docs/handoff/")
-SKIP_FILES = {"CHANGELOG.md"}
+# No path is skipped (#4615). If a historical file ever needs an exemption, add a
+# path entry here that names its tracking issue and is proven load-bearing by the
+# self-test.
 
 # Known defects listed, not approved: (path, text on the hit's logical line,
 # tracking issue[, expected hit count, default 1]). An entry claims at most its
@@ -144,15 +171,21 @@ DSN_SCHEMES = ("postgres://", "postgresql://")
 # The serve flag, tolerating shell quotes split into the name (#4693):
 # --store-url, --"store-url", --store-'url', --store_url.
 FLAG = r"--[\"']*store[\"']*[-_][\"']*url[\"']*"
-# A --store-url argument (=, whitespace or backslash-newline), optional quote,
-# then the URL up to whitespace or a quote.
-ARG_RE = re.compile(FLAG + r"(?:=|(?:\s|\\)+)[\"']?(?P<url>" + SCHEME + r"[^\s\"']+)")
+# Flag-to-value separator: =, whitespace, backslash-newline, and the list-form
+# glue (a closing quote, a comma, a newline, a YAML "- " item marker, #4614).
+SEP = r"(?:[=\s,\\])+(?:-\s+)?"
+# A --store-url argument, optional quote, then the URL up to whitespace or a quote.
+ARG_RE = re.compile(FLAG + SEP + r"[\"']?(?P<url>" + SCHEME + r"[^\s\"']+)")
+# migrate --from / --to take a URL on argv (#4600, #4614). --from-url-file and
+# --to-url-file are the sanctioned forms and do not match.
+MIGRATE_ARG_RE = re.compile(
+    r"--(?:from|to)(?![\w-])[\"']?" + SEP + r"[\"']?(?P<url>" + SCHEME + r"[^\s\"']+)")
 
 # #4603: a runtime expansion of the store-URL env var, or of any variable named
 # like a DSN / URL, straight after the flag. A `_FILE` variable is the
 # sanctioned channel and is not matched.
 EXPANSION_RE = re.compile(
-    FLAG + r"(?:=|(?:\s|\\)+)[\"']?\\*\$\{?[A-Za-z0-9_]*(?:DSN|URL)(?![A-Za-z0-9_])",
+    FLAG + SEP + r"[\"']?\\*\$\{?[A-Za-z0-9_]*(?:DSN|URL)(?![A-Za-z0-9_])",
     re.IGNORECASE,
 )
 # #4609: xtrace echoes every expanded command, so a credential-bearing line
@@ -208,8 +241,10 @@ SEPARATORS = set(";|&()<>")
 
 
 def is_redaction(value: str) -> bool:
-    low = value.lower()
-    return any(tok in low for tok in REDACTION_TOKENS)
+    """True when the WHOLE value is a redaction token (#4612). A real password
+    that merely contains "..." or "***" is a credential, not a redaction."""
+    low = value.strip().strip("'\"").lower()
+    return low in REDACTION_TOKENS or bool(FILLER_RE.fullmatch(low))
 
 
 def url_credential(url: str) -> str:
@@ -229,7 +264,7 @@ def url_credential(url: str) -> str:
         query = rest.split("?", 1)[1].split("#", 1)[0]
         for pair in query.split("&"):
             key, _, value = pair.partition("=")
-            if unquote(key).strip().lower() == "password" and value and not is_redaction(value):
+            if unquote(key).strip().lower() in ("password", "sslpassword") and value and not is_redaction(value):
                 return value
     return ""
 
@@ -437,6 +472,11 @@ def flag_hits(rel: str, text: str) -> List[Hit]:
             continue
         line = text.count("\n", 0, m.start()) + 1
         hits.append((rel, line, redact(lines[line - 1].strip()) if lines else ""))
+    for m in MIGRATE_ARG_RE.finditer(text):
+        if not url_credential(m.group("url")):
+            continue
+        line = text.count("\n", 0, m.start()) + 1
+        hits.append((rel, line, "[migrate-argv-url] " + (redact(lines[line - 1].strip()) if lines else "")))
     return hits
 
 
@@ -500,6 +540,182 @@ def scan_xtrace(rel: str, text: str) -> List[Hit]:
     return hits
 
 
+# --- #4813-#4819: a literal secret on the argv of a well-known client ----------
+# A placeholder is not a secret: a variable reference or substitution, an
+# angle-bracket or brace placeholder, a redaction token, or an obviously fake word.
+FAKE_WORD_RE = re.compile(
+    r"(?:(?:your|my)[-_ ]?)?(?:password|passwd|pw)(?:[-_ ]?here)?|change[-_]?me|placeholder|dummy|fake|example",
+    re.I)
+PLACEHOLDER_SHAPE_RE = re.compile(r"<[^<>]*>|\{\{.*\}\}|\[[^\]]*\]")
+MYSQL_CLIS = {"mysql", "mysqldump", "mysqladmin", "mysqlimport", "mysqlcheck", "mysqlshow", "mariadb",
+              "mariadb-dump", "mariadb-admin"}
+FORM_VERB_RE = re.compile(r"\b(?:curl|mysql\w*|mariadb[\w-]*|sshpass|redis-cli|psql|docker|podman|nerdctl)\b")
+AUTH_HEADER_RE = re.compile(
+    r"^\s*(?:proxy-)?authorization\s*:\s*(?:(?:bearer|basic|token|digest|negotiate)\s+)?(?P<tok>.*)$", re.I)
+PSQL_SECRET_VAR_RE = re.compile(r"passw|(?:^|_)(?:pw|pwd|pass|secret|token)(?:$|_)", re.I)
+
+
+def is_placeholder(value: str) -> bool:
+    """True when ``value`` is not a literal secret: empty, a variable reference
+    or substitution, a bracketed placeholder, a redaction token, a fake word."""
+    v = value.strip().strip("'\"")
+    if not v or "$" in v or "`" in v:
+        return True
+    return bool(PLACEHOLDER_SHAPE_RE.fullmatch(v) or FAKE_WORD_RE.fullmatch(v) or is_redaction(v))
+
+
+def _literal(value: str) -> bool:
+    return not is_placeholder(value)
+
+
+def _after(words: List[str], j: int) -> str:
+    return words[j + 1] if j + 1 < len(words) else ""
+
+
+def _curl_forms(rest: List[str]) -> List[str]:
+    found: List[str] = []
+    for j, w in enumerate(rest):
+        user: Optional[str] = None
+        if w in ("-u", "--user", "-U", "--proxy-user") or re.fullmatch(r"-[A-Za-z]+[uU]", w):
+            user = _after(rest, j)
+        elif w.startswith(("--user=", "--proxy-user=")):
+            user = w.split("=", 1)[1]
+        elif re.match(r"-[uU][^-]", w) and ":" in w:
+            user = w[2:]
+        if user is not None and ":" in user and _literal(user.split(":", 1)[1]):
+            found.append("curl -u / --user value carries a literal password (#4813)")
+        header: Optional[str] = None
+        if w in ("-H", "--header"):
+            header = _after(rest, j)
+        elif w.startswith("--header="):
+            header = w.split("=", 1)[1]
+        elif w.startswith("-H") and len(w) > 2 and not w.startswith("--"):
+            header = w[2:]
+        if header is not None:
+            m = AUTH_HEADER_RE.match(header)
+            if m and _literal(m.group("tok")):
+                found.append("curl Authorization header carries a literal token (#4818)")
+    return found
+
+
+def _mysql_forms(rest: List[str]) -> List[str]:
+    found: List[str] = []
+    for w in rest:
+        val: Optional[str] = None
+        if w.startswith("--password="):
+            val = w.split("=", 1)[1]
+        elif w.startswith("-p") and len(w) > 2 and not w.startswith("--"):
+            val = w[2:]
+        if val is not None and _literal(val):
+            found.append("mysql client -p / --password carries a literal password (#4814)")
+    return found
+
+
+def _sshpass_forms(rest: List[str]) -> List[str]:
+    found: List[str] = []
+    for j, w in enumerate(rest):
+        val: Optional[str] = None
+        if w == "-p":
+            val = _after(rest, j)
+        elif w.startswith("-p") and len(w) > 2:
+            val = w[2:]
+        if val is not None and _literal(val):
+            found.append("sshpass -p carries a literal password (#4815)")
+    return found
+
+
+def _redis_forms(rest: List[str]) -> List[str]:
+    found: List[str] = []
+    for j, w in enumerate(rest):
+        val: Optional[str] = None
+        if w in ("-a", "--pass"):
+            val = _after(rest, j)
+        elif w.startswith("--pass="):
+            val = w.split("=", 1)[1]
+        if val is not None and _literal(val):
+            found.append("redis-cli -a / --pass carries a literal password (#4816)")
+    return found
+
+
+def _psql_forms(rest: List[str]) -> List[str]:
+    found: List[str] = []
+    for j, w in enumerate(rest):
+        pair: Optional[str] = None
+        if w in ("-v", "--set"):
+            pair = _after(rest, j)
+        elif w.startswith("--set="):
+            pair = w.split("=", 1)[1]
+        elif w.startswith("-v") and len(w) > 2 and not w.startswith("--"):
+            pair = w[2:]
+        if pair and "=" in pair:
+            name, _, value = pair.partition("=")
+            if PSQL_SECRET_VAR_RE.search(name) and _literal(value):
+                found.append("psql -v password-named variable carries a literal value (#4817)")
+    return found
+
+
+def _login_forms(rest: List[str]) -> List[str]:
+    found: List[str] = []
+    if "login" not in rest:
+        return found
+    tail = rest[rest.index("login") + 1:]
+    for j, w in enumerate(tail):
+        val: Optional[str] = None
+        if w in ("-p", "--password"):
+            val = _after(tail, j)
+        elif w.startswith("--password="):
+            val = w.split("=", 1)[1]
+        elif w.startswith("-p") and len(w) > 2 and not w.startswith("--"):
+            val = w[2:]
+        if val is not None and _literal(val):
+            found.append("docker login -p / --password carries a literal password (#4819)")
+    return found
+
+
+def form_command_hits(cmd: List[str], depth: int = 0) -> List[str]:
+    """Reasons one command carries a literal secret on a client argv (#4813-#4819).
+    A word that is itself a command string (sh -c "...", ssh host "...") is read
+    as commands too."""
+    reasons: List[str] = []
+    if depth < 3:
+        for w in cmd[1:]:
+            if any(c.isspace() for c in w) and FORM_VERB_RE.search(w):
+                for inner in commands(split_words(w)):
+                    reasons.extend(form_command_hits(inner, depth + 1))
+    for i, w in enumerate(cmd):
+        base = Path(w).name
+        rest = cmd[i + 1:]
+        if base == "curl":
+            reasons.extend(_curl_forms(rest))
+        elif base in MYSQL_CLIS:
+            reasons.extend(_mysql_forms(rest))
+        elif base == "sshpass":
+            reasons.extend(_sshpass_forms(rest))
+        elif base == "redis-cli":
+            reasons.extend(_redis_forms(rest))
+        elif base == "psql":
+            reasons.extend(_psql_forms(rest))
+        elif base in CONTAINER_CLIS:
+            reasons.extend(_login_forms(rest))
+    return reasons
+
+
+def scan_argv_forms(rel: str, text: str) -> List[Hit]:
+    """The seven argv-secret forms, line by line. The reported snippet names the
+    form and never repeats the line, so a hit cannot print the secret."""
+    hits: List[Hit] = []
+    for no, line in logical_lines(text):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or not FORM_VERB_RE.search(line):
+            continue
+        reasons: List[str] = []
+        for cmd in commands(split_words(line)):
+            reasons.extend(form_command_hits(cmd))
+        if reasons:
+            hits.append((rel, no, "[argv-secret-form] " + reasons[0]))
+    return hits
+
+
 def text_rule_hits(rel: str, text: str) -> List[Hit]:
     """The #4600-line text rules: expansion, psql -c password, docker -e / psql
     -v runtime-expanded password, readable cloud-init secret, traced secret."""
@@ -521,6 +737,7 @@ def text_rule_hits(rel: str, text: str) -> List[Hit]:
         hits.extend(scan_write_files(rel, text))
     if rel.endswith((".sh", ".tpl", ".yaml", ".yml")):
         hits.extend(scan_xtrace(rel, text))
+    hits.extend(scan_argv_forms(rel, text))
     return hits
 
 
@@ -550,24 +767,27 @@ def tracked_files() -> List[str]:
     return files
 
 
-def scan_paths(root: Path, files: List[str]) -> Tuple[List[Hit], int]:
+def scan_paths(root: Path, files: List[str], max_bytes: int = MAX_BYTES) -> Tuple[List[Hit], int, int]:
+    """(hits, files scanned, files skipped). A skipped file is a text-suffix file
+    that is over ``max_bytes`` or not valid UTF-8 (#4615): counted, never silent."""
     hits: List[Hit] = []
     scanned = 0
+    skipped = 0
     for rel in files:
-        if rel in SKIP_FILES or rel.startswith(SKIP_PREFIXES):
-            continue
         p = root / rel
         if p.suffix.lower() not in TEXT_SUFFIXES or not p.is_file() or p.is_symlink():
             continue
         try:
-            if p.stat().st_size > MAX_BYTES:
+            if p.stat().st_size > max_bytes:
+                skipped += 1
                 continue
             text = p.read_text(encoding="utf-8")
         except UnicodeDecodeError:
+            skipped += 1
             continue
         scanned += 1
         hits.extend(scan_text(rel, text))
-    return hits, scanned
+    return hits, scanned, skipped
 
 
 def split_pending(root: Path, hits: List[Hit], pending=PENDING) -> Tuple[List[Hit], List[str], List[str]]:
@@ -595,7 +815,7 @@ def split_pending(root: Path, hits: List[Hit], pending=PENDING) -> Tuple[List[Hi
 def run() -> int:
     try:
         files = tracked_files()
-        hits, scanned = scan_paths(ROOT, files)
+        hits, scanned, skipped = scan_paths(ROOT, files)
         hits, listed, stale = split_pending(ROOT, hits)
     except (RuntimeError, OSError, UnicodeDecodeError) as exc:
         print("FAIL: check-docs-no-argv-secrets: scanner fault: %s" % exc, file=sys.stderr)
@@ -620,8 +840,8 @@ def run() -> int:
             file=sys.stderr,
         )
         return 1
-    print("PASS: check-docs-no-argv-secrets: %d files scanned, 0 argv credentials, %d pending (listed, not approved)"
-          % (scanned, len(listed)))
+    print("PASS: check-docs-no-argv-secrets: %d files scanned, %d skipped (over %d bytes or not UTF-8), "
+          "0 argv credentials, %d pending (listed, not approved)" % (scanned, skipped, MAX_BYTES, len(listed)))
     return 0
 
 
@@ -814,6 +1034,87 @@ GREEN_PROBES_4600 = {
 
 
 
+# --- #4612 / #4614 / #4813-#4819 probes (a literal secret is the placeholder PW) ---
+RED_FORM_PROBES = {
+    # #4612: evasion classes of the original gate
+    "4612 serve in the same block as a schema-init line":
+        "ai-memory schema-init --store-url postgres://u@h/d\nai-memory serve %s postgres://u:%s@h/d" % (SU, PW),
+    "4612 empty user, password only": "ai-memory serve %s postgres://:%s@h/d" % (SU, PW),
+    "4612 sslpassword query key": "ai-memory serve %s 'postgres://u@h/d?sslpassword=%s'" % (SU, PW),
+    "4612 password that contains an ellipsis": "ai-memory serve %s postgres://u:ab...cd@h/d" % SU,
+    "4612 password that contains asterisks": "ai-memory serve %s postgres://u:p***w@h/d" % SU,
+    "4612 password that contains xxxx": "ai-memory serve %s postgres://u:pxxxxq@h/d" % SU,
+    # #4614: list-form argv and migrate --from / --to
+    "4614 YAML list": "command:\n  - serve\n  - %s\n  - postgres://u:%s@h/d" % (SU, PW),
+    "4614 compose array": 'command: ["serve", "%s", "postgres://u:%s@h/d"]' % (SU, PW),
+    "4614 JSON args array": '{"args": ["serve", "%s", "postgres://u:%s@h/d"]}' % (SU, PW),
+    "4614 list-form expansion of a DSN variable": 'command: ["serve", "%s", "${AI_MEMORY_STORE_URL}"]' % SU,
+    "4614 migrate --to": "ai-memory migrate --from sqlite:///a.db --to postgres://u:%s@h/d" % PW,
+    "4614 migrate --from=": "ai-memory migrate --from=postgres://u:%s@h/d --to sqlite:///a.db" % PW,
+    "4614 migrate YAML list": "args:\n  - migrate\n  - --to\n  - postgres://u:%s@h/d" % PW,
+    "4614 migrate JSON array": '["migrate", "--to", "postgres://u:%s@h/d"]' % PW,
+    # #4813-#4819: one literal-secret form each
+    "4813 curl -u user:literal": "curl -u admin:%s https://h/p" % PW,
+    "4813 curl --user user:literal": "curl --user admin:%s https://h/p" % PW,
+    "4813 curl -su cluster": "curl -su admin:%s https://h/p" % PW,
+    "4813 curl --user= form": "curl --user=admin:%s https://h/p" % PW,
+    "4814 mysql -pLITERAL": "mysql -u root -p%s db" % PW,
+    "4814 mysqldump --password=LITERAL": "mysqldump --password=%s db" % PW,
+    "4815 sshpass -p LITERAL": "sshpass -p %s ssh h" % PW,
+    "4815 sshpass -pLITERAL": "sshpass -p%s ssh h" % PW,
+    "4816 redis-cli -a LITERAL": "redis-cli -a %s ping" % PW,
+    "4816 redis-cli --pass LITERAL": "redis-cli --pass %s ping" % PW,
+    "4817 psql -v pw=LITERAL": "psql -v pw=%s -c 'select 1'" % PW,
+    "4817 psql --set password=LITERAL": "psql --set password=%s -f x.sql" % PW,
+    "4818 curl Authorization Bearer LITERAL": "curl -H 'Authorization: Bearer %s' https://h" % PW,
+    "4818 curl --header Authorization Basic LITERAL": 'curl --header "Authorization: Basic %s" https://h' % PW,
+    "4819 docker login -p LITERAL": "docker login -u u -p %s registry" % PW,
+    "4819 docker login --password LITERAL": "docker login --password %s registry" % PW,
+    "4813 curl inside ssh": 'ssh h "curl -u admin:%s https://h/p"' % PW,
+    "4819 podman login": "podman login -u u --password=%s registry" % PW,
+}
+GREEN_FORM_PROBES = {
+    # #4612 / #4614 near-misses
+    "4612 schema-init alone with a file channel": "AI_MEMORY_STORE_URL_FILE=/etc/s ai-memory schema-init",
+    "4612 empty user and no password": "ai-memory serve %s postgres://@h/d" % SU,
+    "4612 whole-token redaction": "ai-memory serve %s postgres://u:****@h/d" % SU,
+    "4614 list-form file channel": 'command: ["serve", "%s", "${AI_MEMORY_STORE_URL_FILE}"]' % SU,
+    "4614 list-form URL without a password": 'command: ["serve", "%s", "postgres://u@h/d"]' % SU,
+    "4614 migrate with file flags": "ai-memory migrate --from-url-file /s/from --to-url-file /s/to",
+    "4614 migrate with credential-free URLs": "ai-memory migrate --from sqlite:///a.db --to postgres://h/d",
+    "4614 migrate YAML list of file flags": "args:\n  - migrate\n  - --to-url-file\n  - /s/to",
+    # #4813-#4819 placeholders and sanctioned forms
+    "4813 curl -u user with no password": "curl -u admin https://h/p",
+    "4813 curl -u variable password": 'curl -u "admin:$API_PW" https://h/p',
+    "4813 curl -u brace variable": "curl -u admin:${API_PW} https://h/p",
+    "4813 curl -u substitution": "curl -u admin:$(cat /run/s/pw) https://h/p",
+    "4813 curl -u angle placeholder": "curl -u admin:<password> https://h/p",
+    "4813 curl -u CHANGEME": "curl -u admin:CHANGEME https://h/p",
+    "4813 curl --netrc-file": "curl --netrc-file /run/s/netrc https://h/p",
+    "4814 mysql -p prompts": "mysql -u root -p db",
+    "4814 mysql variable": 'mysql -u root -p"$DB_PW" db',
+    "4814 mysql PASSWORD word": "mysql -u root -pPASSWORD db",
+    "4814 mysql port flag": "mysql -h h -P 3306 --protocol=tcp db",
+    "4815 sshpass -f file": "sshpass -f /run/s/pw ssh h",
+    "4815 sshpass variable": 'sshpass -p "$SSH_PW" ssh h',
+    "4816 redis-cli REDISCLI_AUTH": "REDISCLI_AUTH=\"$(cat /run/s/r)\" redis-cli ping",
+    "4816 redis-cli variable": "redis-cli -a $REDIS_PW ping",
+    "4816 redis-cli xxxx": "redis-cli -a xxxx ping",
+    "4817 psql -v non-secret name": "psql -v ON_ERROR_STOP=1 -v dbname=app -f x.sql",
+    "4817 psql -v empty": "psql -v pw= -f x.sql",
+    "4818 curl Authorization variable": 'curl -H "Authorization: Bearer $API_TOKEN" https://h',
+    "4818 curl Authorization brace variable": "curl -H 'Authorization: Bearer ${API_TOKEN}' https://h",
+    "4818 curl Authorization placeholder": "curl -H 'Authorization: Bearer <token>' https://h",
+    "4818 curl Authorization redacted": "curl -H 'Authorization: Bearer REDACTED' https://h",
+    "4818 curl non-auth header": "curl -H 'Accept: application/json' https://h",
+    "4818 curl header from file": "curl -H @/run/s/hdr https://h",
+    "4819 docker login --password-stdin": "docker login -u u --password-stdin registry < /run/s/pw",
+    "4819 docker login variable": 'docker login -u u -p "$REG_PW" registry',
+    "4819 docker run -p publishes a port": "docker run -p 8080:80 img",
+    "4819 docker login without a password": "docker login registry",
+}
+
+
 DUMMY_PW = "DUMMY-pw-4609-must-not-leak"
 PROVISION_TPL = "infra/do-hive/cloud-init-memory.yaml.tpl"
 
@@ -949,6 +1250,29 @@ def self_test() -> int:
             if scan_text("probe" + suffix, text):
                 print("SELF-TEST FAIL: green shell probe %r (%s) was flagged" % (name, suffix), file=sys.stderr)
                 bad += 1
+    for suffix in (".md", ".sh"):
+        for name, text in RED_FORM_PROBES.items():
+            red += 1
+            if not scan_text("probe" + suffix, text):
+                print("SELF-TEST FAIL: red form probe %r (%s) was not flagged" % (name, suffix), file=sys.stderr)
+                bad += 1
+        for name, text in GREEN_FORM_PROBES.items():
+            green += 1
+            got = scan_text("probe" + suffix, text)
+            if got:
+                print("SELF-TEST FAIL: green form probe %r (%s) was flagged: %r" % (name, suffix, got), file=sys.stderr)
+                bad += 1
+    # A form hit reports the form, never the secret (#4813-#4819).
+    red += 1
+    form_hits = [h for t in RED_FORM_PROBES.values() for h in scan_text("probe.md", t)]
+    if any(PW in h[2] for h in form_hits):
+        print("SELF-TEST FAIL: a form hit prints the secret", file=sys.stderr)
+        bad += 1
+    # #4615: nothing is skipped by path; skipped files are counted.
+    red += 1
+    if "SKIP_PREFIXES" in globals() or "SKIP_FILES" in globals():
+        print("SELF-TEST FAIL: a path skip list is back (#4615)", file=sys.stderr)
+        bad += 1
     red += 1
     if scan_text("probe.md", RED_SHELL_PROBES["4663 psql with a literal password"]):
         print("SELF-TEST FAIL: a prose file (.md) was read as a shell file", file=sys.stderr)
@@ -973,13 +1297,13 @@ def self_test() -> int:
         (root / "bad.md").write_text(RED_PROBES["inline"] + "\n", encoding="utf-8")
         (root / "ok.md").write_text(GREEN_PROBES["file-form"] + "\n", encoding="utf-8")
         (root / "bad.sh").write_text(RED_SHELL_PROBES["4690 pg_dump --dbname= form"] + "\n", encoding="utf-8")
-        hits, scanned = scan_paths(root, ["bad.md", "ok.md", "bad.sh"])
+        hits, scanned, _ = scan_paths(root, ["bad.md", "ok.md", "bad.sh"])
         red += 1
         if scanned != 3 or sorted(h[0] for h in hits) != ["bad.md", "bad.sh"]:
             print("SELF-TEST FAIL: file walk gave hits=%r scanned=%d" % (hits, scanned), file=sys.stderr)
             bad += 1
         # A pending entry claims its hit; an entry with no hit is stale.
-        sh_hits, _ = scan_paths(root, ["bad.sh"])
+        sh_hits, _, _ = scan_paths(root, ["bad.sh"])
         left, listed, stale = split_pending(root, sh_hits, (("bad.sh", "pg_dump --dbname=", "#0"),))
         red += 1
         if left or len(listed) != 1 or stale:
@@ -994,7 +1318,7 @@ def self_test() -> int:
         (root / "two.sh").write_text(
             RED_SHELL_PROBES["4690 pg_dump --dbname= form"] + "\n" + RED_SHELL_PROBES["4690 pg_dump --dbname= form"] + "\n",
             encoding="utf-8")
-        two_hits, _ = scan_paths(root, ["two.sh"])
+        two_hits, _, _ = scan_paths(root, ["two.sh"])
         left, listed, stale = split_pending(root, two_hits, (("two.sh", "pg_dump --dbname=", "#0"),))
         red += 1
         if len(two_hits) != 2 or len(left) != 1 or len(listed) != 1 or stale:
@@ -1005,7 +1329,28 @@ def self_test() -> int:
         if left or len(listed) != 2 or stale:
             print("SELF-TEST FAIL: a pending entry with count 2 did not claim both hits (#4791)", file=sys.stderr)
             bad += 1
-        _, scanned = scan_paths(root, [])
+        # #4615: a changelog.d/ and a docs/handoff/ fixture are scanned, not skipped.
+        for sub in ("changelog.d", "docs/handoff", "docs/reviews"):
+            (root / sub).mkdir(parents=True, exist_ok=True)
+            (root / sub / "n.md").write_text(RED_PROBES["inline"] + "\n", encoding="utf-8")
+        (root / "CHANGELOG.md").write_text(RED_PROBES["inline"] + "\n", encoding="utf-8")
+        rels = ["changelog.d/n.md", "docs/handoff/n.md", "docs/reviews/n.md", "CHANGELOG.md"]
+        hits, scanned, skipped = scan_paths(root, rels)
+        red += 1
+        if scanned != 4 or skipped != 0 or sorted(h[0] for h in hits) != sorted(rels):
+            print("SELF-TEST FAIL: a record tree was skipped (#4615): hits=%r scanned=%d" % (hits, scanned),
+                  file=sys.stderr)
+            bad += 1
+        # #4615: size and encoding skips are counted.
+        (root / "big.md").write_text("x" * 200 + "\n", encoding="utf-8")
+        (root / "bin.md").write_bytes(b"\xff\xfe\x00bad\n")
+        _, scanned, skipped = scan_paths(root, ["big.md", "bin.md", "ok.md"], max_bytes=100)
+        red += 1
+        if scanned != 1 or skipped != 2:
+            print("SELF-TEST FAIL: skipped files not counted: scanned=%d skipped=%d" % (scanned, skipped),
+                  file=sys.stderr)
+            bad += 1
+        _, scanned, _ = scan_paths(root, [])
         red += 1
         if scanned != 0:
             print("SELF-TEST FAIL: empty file list scanned something", file=sys.stderr)
