@@ -1751,10 +1751,14 @@ Six surfaces, each load-bearing for different ops scenarios:
    [`prometheus_metrics`](../src/handlers/transport.rs)) — Prometheus scrape
    endpoint. Exports the substrate's metrics
    (`src/metrics.rs`).
-3. **Tracing on stderr** — every MCP tool call runs inside an
-   `mcp_tool_call` info span (fields `tool` and `rpc_id`, `tools/call` arm
-   of `src/mcp/mod.rs`) and reports an `ok` info event with `elapsed_ms`, or
-   an `err` warn event. Governance decisions are not tracing spans:
+3. **Tracing on stderr** — an MCP `tools/call` request that reaches the
+   dispatch call runs inside an `mcp_tool_call` info span (fields `tool` and
+   `rpc_id`, `tools/call` arm of `src/mcp/mod.rs`) and reports an `ok` info
+   event with `elapsed_ms`, or an `err` warn event. A request with a missing
+   tool name, or for a tool not loaded in the active profile, returns before
+   the span. Non-object `arguments`, an unresolvable caller authority, the
+   record-stop gate, an unknown tool and an unrecognised wire format return
+   inside the span without an `ok` or `err` event. Governance decisions are not tracing spans:
    [`record_decision`](../src/governance/audit.rs) writes them to the
    forensic audit log. Federation emits `tracing::info!` events on the push,
    DLQ-replay, receive and sync paths, not a span per event. The default
