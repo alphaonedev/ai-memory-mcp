@@ -1,5 +1,7 @@
 # v0.6.3 Mutation Testing Baseline Report
 
+> **Point-in-time record, as of 2026-04-26.** The src/ file:line references in this document describe the source tree at commit `ddcccfa20a8e` (read a file there with `git show ddcccfa20a8e:<path>`). They are a dated record and are not maintained, so they may not match the current code.
+
 ## Executive Summary
 
 Baseline mutation testing run initiated on v0.6.3 net-new code paths (src/db.rs, src/curator.rs, src/llm.rs, src/bench.rs). Run encountered infrastructure constraints: compilation time for heavy ML dependencies (tokenizers, candle-core, hyper) makes full mutation cycle prohibitively slow (>90min for 715 mutants).

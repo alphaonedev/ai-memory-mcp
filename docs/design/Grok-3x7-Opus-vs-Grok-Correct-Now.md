@@ -1,5 +1,7 @@
 # Grok 3×7 — Opus vs Grok: What Is Correct Now (Reconciliation)
 
+> **Point-in-time record, as of 2026-06-28.** The src/ file:line references in this document describe the source tree at commit `49a861493362` (read a file there with `git show 49a861493362:<path>`). They are a dated record and are not maintained, so they may not match the current code.
+
 **Assessment date:** 2026-06-28  
 **Method:** Second 21-lens council (3 waves × 7) comparing two first-party TRACT assessments of `release/v0.8.0`, with **CodeGraph** as tie-breaker (846 files / 27,062 nodes / 92,578 edges).  
 **Measuring stick:** [`TRACT-the-definitive-endpoint-ai-memory.md`](TRACT-the-definitive-endpoint-ai-memory.md)  

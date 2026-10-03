@@ -2,6 +2,9 @@
 layout: doc
 ---
 # AI NHI Execution Prompt — v0.8.0 Remaining-Work Closeout (gauntlet-verified)
+
+> **Point-in-time record, as of 2026-06-17.** The src/ file:line references in this document describe the source tree at commit `32c51b2c2f31` (read a file there with `git show 32c51b2c2f31:<path>`). They are a dated record and are not maintained, so they may not match the current code.
+
 ### Feed verbatim to the Claude Code CLI `/goal` loop driving EPIC #1709
 
 > **What this is.** The single load-bearing brief for the **remaining** v0.8.0 work — the genuinely-undone set, deconflicted against everything already shipped at `release/v0.8.0` HEAD by an 8-agent codegraph verification gauntlet (2026-06-17). Its first job is to **stop the loop redoing shipped work** (§2), its second is to close the verified residual in priority order (§5–§6). Source of truth: this doc + the #1709 body + `ROADMAP.md`. Companion kickoff: [`docs/v0.8.0/GOAL-EPIC-KICKOFF.md`](GOAL-EPIC-KICKOFF.html).

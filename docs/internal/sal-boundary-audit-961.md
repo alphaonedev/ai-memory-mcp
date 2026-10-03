@@ -3,6 +3,8 @@ layout: doc
 ---
 # SAL Boundary Audit — Issue #961
 
+> **Point-in-time record, as of 2026-05-21.** The src/ file:line references in this document describe the source tree at commit `1da915459925` (read a file there with `git show 1da915459925:<path>`). They are a dated record and are not maintained, so they may not match the current code.
+
 **Audit date:** 2026-05-21
 **Base SHA:** `1da91545992595bdd85422b85181d25b17e56f41`
 **Branch:** `agent/sub-g-961-<rand>` (Wave-2 Tier-B1 cleanup; closes #961)
