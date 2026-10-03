@@ -405,13 +405,18 @@ pub async fn skill_promote_route(
     match crate::mcp::handle_skill_promote_for_caller(&lock.0, &params, kp, &caller, read_caller) {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(e) => {
-            let e = e.to_string();
-            if e.contains("not found") {
-                (StatusCode::NOT_FOUND, Json(json!({"error": e}))).into_response()
-            } else {
-                (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response()
-            }
+            let status = promote_error_status(&e);
+            (status, Json(json!({"error": e.to_string()}))).into_response()
         }
+    }
+}
+
+/// #4622 - HTTP status for a failed skill-promote.
+fn promote_error_status(e: &anyhow::Error) -> StatusCode {
+    if e.to_string().contains("not found") {
+        StatusCode::NOT_FOUND
+    } else {
+        StatusCode::BAD_REQUEST
     }
 }
 
@@ -580,5 +585,120 @@ pub async fn skill_delete_route(
                 (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response()
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod promote_status_4622_tests {
+    use super::promote_error_status;
+    use crate::errors::{MemoryError, ReflectionNotFound};
+    use crate::models::{Memory, MemoryKind, MemoryLink, MemoryLinkRelation, Tier};
+    use axum::http::StatusCode;
+    use serde_json::json;
+
+    const CALLER: &str = "ai:alice4622";
+
+    fn seed(conn: &rusqlite::Connection, title: &str, kind: MemoryKind) -> String {
+        let now = chrono::Utc::now().to_rfc3339();
+        let memory = Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            title: title.to_string(),
+            content: "body".to_string(),
+            namespace: "ns4622".to_string(),
+            tier: Tier::Long,
+            metadata: json!({"agent_id": CALLER, "scope": "collective"}),
+            memory_kind: kind,
+            reflection_depth: i32::from(kind == MemoryKind::Reflection),
+            created_at: now.clone(),
+            updated_at: now,
+            ..Memory::default()
+        };
+        crate::db::insert(conn, &memory).expect("seed memory");
+        memory.id
+    }
+
+    fn promote(
+        conn: &rusqlite::Connection,
+        id: &str,
+        name: &str,
+    ) -> anyhow::Result<serde_json::Value> {
+        crate::mcp::handle_skill_promote_for_caller(
+            conn,
+            &json!({"reflection_id": id, "skill_name": name, "skill_description": "d"}),
+            None,
+            CALLER,
+            Some(CALLER),
+        )
+    }
+
+    fn db() -> (rusqlite::Connection, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let conn = crate::db::open(&dir.path().join("m.db")).expect("open db");
+        (conn, dir)
+    }
+
+    /// Pin 1: the MCP wire code and text for a missing reflection.
+    #[test]
+    fn issue_4622_mcp_code_and_text_are_unchanged() {
+        let (conn, _dir) = db();
+        let err = promote(&conn, "absent-id", "good-name").expect_err("missing reflection");
+        assert_eq!(err.to_string(), "reflection not found: absent-id");
+        assert_eq!(format!("{err:#}"), "reflection not found: absent-id");
+        let mapped = MemoryError::from(err);
+        assert_eq!(mapped.code(), "REFUSED");
+        assert_eq!(mapped.message(), "reflection not found: absent-id");
+    }
+
+    /// Pin 2: a different error whose text contains the words is not a 404.
+    #[test]
+    fn issue_4622_other_error_containing_not_found_is_not_404() {
+        let (conn, _dir) = db();
+        let id = seed(&conn, "r", MemoryKind::Reflection);
+        let err = promote(&conn, &id, "not found").expect_err("bad skill name");
+        assert!(err.to_string().contains("not found"), "{err}");
+        assert_eq!(promote_error_status(&err), StatusCode::BAD_REQUEST);
+    }
+
+    /// Pin 3: the 404 follows the type, not the Display text.
+    #[test]
+    fn issue_4622_reworded_display_keeps_404() {
+        let err =
+            anyhow::Error::new(ReflectionNotFound::new("x")).context("a wholly different wording");
+        assert!(!err.to_string().contains("not found"), "{err}");
+        assert_eq!(promote_error_status(&err), StatusCode::NOT_FOUND);
+    }
+
+    /// Pin 5: a missing or hidden source member still answers 404.
+    #[test]
+    fn issue_4622_missing_source_member_is_404() {
+        let (conn, _dir) = db();
+        let id = seed(&conn, "r", MemoryKind::Reflection);
+        conn.pragma_update(None, "foreign_keys", false)
+            .expect("foreign keys off");
+        let link = MemoryLink {
+            source_id: id.clone(),
+            target_id: uuid::Uuid::new_v4().to_string(),
+            relation: MemoryLinkRelation::ReflectsOn,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            signature: None,
+            observed_by: Some(CALLER.to_string()),
+            valid_from: None,
+            valid_until: None,
+            attest_level: None,
+            source_cid: None,
+            target_cid: None,
+        };
+        crate::db::create_link_inbound(&conn, &link, "unsigned").expect("dangling edge");
+        let err = promote(&conn, &id, "good-name").expect_err("missing source");
+        assert_eq!(err.to_string(), format!("reflection not found: {id}"));
+        assert_eq!(promote_error_status(&err), StatusCode::NOT_FOUND);
+    }
+
+    /// Pin 6: the typed root maps to `Refused`, never `NotFound`.
+    #[test]
+    fn issue_4622_mapping_to_refused_is_pinned() {
+        let mapped = MemoryError::from(anyhow::Error::new(ReflectionNotFound::new("z")));
+        assert!(matches!(&mapped, MemoryError::Refused(m) if m == "reflection not found: z"));
+        assert_eq!(mapped.code(), "REFUSED");
     }
 }
