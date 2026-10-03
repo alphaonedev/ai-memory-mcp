@@ -1751,8 +1751,13 @@ Six surfaces, each load-bearing for different ops scenarios:
    [`prometheus_metrics`](../src/handlers/transport.rs)) — Prometheus scrape
    endpoint. Exports the substrate's metrics
    (`src/metrics.rs`).
-3. **Tracing spans on stderr** — every MCP tool call, every governance
-   decision, every federation event emits a `tracing::info!` span.
+3. **Tracing on stderr** — every MCP tool call runs inside an
+   `mcp_tool_call` info span (fields `tool` and `rpc_id`, `tools/call` arm
+   of `src/mcp/mod.rs`) and reports an `ok` info event with `elapsed_ms`, or
+   an `err` warn event. Governance decisions are not tracing spans:
+   [`record_decision`](../src/governance/audit.rs) writes them to the
+   forensic audit log. Federation emits `tracing::info!` events on the push,
+   DLQ-replay, receive and sync paths, not a span per event.
    `RUST_LOG=ai_memory=info` is the default; `RUST_LOG=ai_memory=debug`
    for deep traces.
 4. **File logging** — opt-in via `[logging]` in `config.toml`.
