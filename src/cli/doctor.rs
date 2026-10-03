@@ -2070,9 +2070,32 @@ fn section_postgres_corrupt_governance_4285() -> Option<ReportSection> {
         Ok(Some(url)) if crate::store_url::is_postgres_url(&url) => url,
         _ => return None,
     };
-    let census: Result<Vec<crate::storage::CorruptStandard>> = run_pg_probe(|| async move {
+    // #4333 — the SAME #3705 sslmode floor as the store funnel, applied before
+    // any socket opens; a refusal is the section's Critical fact (mirrors
+    // `section_postgres_extensions_3264`).
+    let options = match crate::store::postgres::dsn::floored_connect_options(&url) {
+        Ok(o) => o,
+        Err(refused) => {
+            return Some(ReportSection {
+                name: SECTION_CORRUPT_GOVERNANCE.into(),
+                severity: Severity::Critical,
+                facts: vec![
+                    (
+                        "backend".into(),
+                        crate::storage::CORRUPT_STANDARD_BACKEND_POSTGRES.into(),
+                    ),
+                    ("error".into(), refused.to_string()),
+                ],
+                note: Some(
+                    "the configured postgres store is below the transit-encryption floor \
+                     (#3705): doctor REFUSED to connect — the daemon refuses the same DSN"
+                        .into(),
+                ),
+            });
+        }
+    };
+    let census: Result<Vec<crate::storage::CorruptStandard>> = run_pg_probe(move || async move {
         let probe = async {
-            let options = crate::store::postgres::dsn::connect_options(&url)?;
             let pool = sqlx::postgres::PgPoolOptions::new()
                 .max_connections(1)
                 .acquire_timeout(PG_PROBE_TIMEOUT)

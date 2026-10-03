@@ -287,7 +287,7 @@ const FUNNEL_FILE: &str = "src/store/postgres/dsn.rs";
 /// `(file, sqlx connection constructions, dsn::connect_options calls)`.
 /// A new construction, or one that stops calling the funnel, fails.
 const LEDGER: &[(&str, usize, usize)] = &[
-    ("src/cli/doctor.rs", 2, 2),
+    ("src/cli/doctor.rs", 3, 3),
     ("src/cli/keys.rs", 1, 1),
     ("src/cli/schema_init.rs", 1, 1),
     ("src/store/postgres.rs", 1, 1),
