@@ -334,7 +334,17 @@ PYTHONPATH=sdk/python python -m swarm
 infra/do-hive/teardown.sh
 ```
 
-The substrate is PostgreSQL 18.6, AGE 1.8.0, and pgvector 0.8.6. PgBouncer
-listens only on `127.0.0.1:6432`, uses transaction pooling, and admits 2000
-clients; the daemon points its store URL there so Phase A and Phase B share the
-same baseline.
+The substrate is PostgreSQL 18.6, AGE 1.8.0, and pgvector 0.8.6. The daemon
+connects straight to PostgreSQL on port 5432 over TLS with `sslmode=verify-full`
+(#4654); there is no PgBouncer on the path. Earlier campaign rounds ran the
+daemon through a transaction-pooling PgBouncer (`127.0.0.1:6432`, 2000 client
+admission, pool size 100), so results taken before this change and results taken
+after it are not like-for-like: the pooler hop and its pool are gone. Re-take
+the Phase A baseline on this topology before comparing it with Phase B, and do
+not compare either against an earlier round.
+
+The daemon's own connection pool defaults to 16 connections
+(`src/store/mod.rs:111`; the template sets no `AI_MEMORY_PG_POOL_MAX`), against
+PostgreSQL's `max_connections` default of 100 minus 3 reserved for superusers
+(`#max_connections = 100` and `#superuser_reserved_connections = 3` in
+`postgresql.conf.sample`; the template sets neither).

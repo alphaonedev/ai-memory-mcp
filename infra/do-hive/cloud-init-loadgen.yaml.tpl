@@ -55,7 +55,7 @@ write_files:
 try: print(json.load(open(sys.argv[1])).get("id",""))
 except Exception: print("")' "$BODYF" 2>/dev/null || echo "")
         # link prev->cur -- exercises the AGE graph write path (the real
-        # per-module throughput bound; PgBouncer fixes fan-in, NOT AGE writes).
+        # per-module throughput bound).
         if [ -n "$prev_id" ] && [ -n "$cur_id" ]; then
           t0=$(now_ms)
           code=$(curl -s -o /dev/null -w '%%{http_code}' -X POST "$BASE/links" \

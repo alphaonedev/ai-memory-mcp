@@ -25,8 +25,16 @@ The gate scans the files matching ``infra/*/cloud-init-memory*.tpl`` on disk
     node IP; serve itself would resolve its own certificate with no flags,
     ``resolve_tls_material``, src/daemon_runtime.rs:6163-6225);
   * the ``postgres://`` store URL has no ``sslmode=verify-full`` (the #3705
-    floor, src/transit_encryption.rs:436-446), except a template listed in
-    ``DSN_FLOOR_GAPS``; or
+    floor, src/transit_encryption.rs:436-446);
+  * the store URL dials the PgBouncer port 6432 (#4654: the daemon connects
+    straight to Postgres so one verified TLS hop covers the whole path);
+  * a template that configures a local Postgres lacks ``ssl = on`` or a
+    ``hostssl`` pg_hba line (#4654);
+  * a template that downloads ``ai_memory_image_url`` does not check
+    ``sha256sum -c`` before ``tar`` extracts it, or ignores a failed
+    download or extraction with ``|| true`` (#4637);
+  * a ``CREATE USER ... PASSWORD '${...}'`` puts a terraform value straight
+    into a SQL literal (#4638); or
   * the template runs ``git clone`` / ``git checkout`` of an extension source
     (#4636: use ``fetch_pinned`` with a ``*_COMMIT=<40 hex>`` variable), or a
     ``*_COMMIT=`` value is not a full 40-hex commit; or
@@ -54,17 +62,15 @@ SERVE_SRC = ROOT / "src" / "daemon_runtime.rs"
 TEMPLATE_GLOB = "infra/*/cloud-init-memory*.tpl"
 REQUIRED_FLAGS = ("--tls-cert", "--tls-key")
 
-# Templates that still lack the sslmode floor, each with its tracker. The
-# do-hive store URL dials PgBouncer on 127.0.0.1:6432 and its TLS shape has
-# more than one viable form (#4635 do-hive leg, awaiting a vote). The list may
-# only shrink: a listed template that passes the floor is itself a failure.
-DSN_FLOOR_GAPS = {
-    "infra/do-hive/cloud-init-memory.yaml.tpl": "#4635 do-hive pgbouncer leg",
-}
+# The PgBouncer listen port. No template store URL may dial it (#4654).
+PGBOUNCER_PORT = "6432"
 GIT_FLOAT_RE = re.compile(r"^\s*(?:[^#\s][^#]*?)?\bgit\s+(?:clone|checkout)\b", re.M)
 COMMIT_RE = re.compile(r"^\s*(\w+_COMMIT)=(\S+)\s*$", re.M)
 HEX40_RE = re.compile(r"^[0-9a-f]{40}$")
 DSN_RE = re.compile(r"^\s+(postgres(?:ql)?://\S+)\s*$", re.M)
+TF_INTERP_RE = re.compile(r"\$\{[^}]*\}")
+HOST_PORT_RE = re.compile(r"@([^/?#@]*)(?:[/?#]|$)")
+CREATE_USER_RE = re.compile(r"PASSWORD\s+'\$\{", re.I)
 STRUCT_RE = re.compile(r"pub struct ServeArgs \{(.*?)\n\}", re.S)
 FIELD_RE = re.compile(r"^\s{4}pub (\w+):", re.M)
 ATTR_RE = re.compile(r"#\[arg\((.*?)\)\]", re.S)
@@ -131,20 +137,41 @@ def serve_invocations(text: str) -> list:
 
 def dsn_hits(name: str, text: str) -> list:
     hits = []
-    dsns = DSN_RE.findall(text)
+    # A terraform interpolation (the urlencoded password) must not end the URL
+    # early or hide the query string: read it as one opaque character.
+    dsns = DSN_RE.findall(TF_INTERP_RE.sub("X", text))
     if not dsns:
         hits.append("%s: no postgres:// store URL line found (cannot check the sslmode floor)" % name)
-    floor_ok = True
     for dsn in dsns:
-        query = dsn.split("?", 1)[1] if "?" in dsn else ""
+        base, _, query = dsn.partition("?")
         modes = [p.split("=", 1)[1].strip().lower() for p in query.split("&") if p.lower().startswith("sslmode=")]
         if not modes or modes[-1] != "verify-full":
-            floor_ok = False
-            if name in DSN_FLOOR_GAPS:
-                continue
             hits.append("%s: store URL has no sslmode=verify-full (serve refuses it at start, #3705 floor, src/transit_encryption.rs:436-446)" % name)
-    if name in DSN_FLOOR_GAPS and floor_ok and dsns:
-        hits.append("%s: store URL now passes the sslmode floor; remove it from DSN_FLOOR_GAPS" % name)
+        hp = HOST_PORT_RE.search(base)
+        if hp and hp.group(1).rpartition(":")[2] == PGBOUNCER_PORT:
+            hits.append("%s: store URL dials the pgbouncer port %s (#4654: connect straight to postgres; a transaction pooler drops the session state the driver sets)" % (name, PGBOUNCER_PORT))
+    return hits
+
+
+def provision_hits(name: str, text: str) -> list:
+    """#4635/#4637/#4638: the Postgres TLS block, the digest check and the role password."""
+    hits = []
+    if "/etc/postgresql/" in text:
+        if "ssl = on" not in text:
+            hits.append("%s: configures a local postgres without 'ssl = on' (#4635)" % name)
+        if not re.search(r"hostssl\s", text):
+            hits.append("%s: configures a local postgres with no 'hostssl' pg_hba line (#4635)" % name)
+    for m in CREATE_USER_RE.finditer(text):
+        lineno = text.count("\n", 0, m.start()) + 1
+        hits.append("%s:%d: a terraform value is written straight into a SQL password literal (decode and quote it on the node, #4638)" % (name, lineno))
+    if "ai_memory_image_url" in text:
+        check = text.find("sha256sum -c")
+        extract = text.find("tar -xzf")
+        if check < 0 or (0 <= extract < check):
+            hits.append("%s: the ai-memory tarball is not digest-checked (sha256sum -c) before tar extracts it (#4637)" % name)
+        for m in re.finditer(r"^[^#\n]*\b(?:curl|tar)\b[^\n]*\|\|\s*true\s*$", text, re.M):
+            lineno = text.count("\n", 0, m.start()) + 1
+            hits.append("%s:%d: a failed tarball download or extraction is ignored with '|| true' (#4637)" % (name, lineno))
     return hits
 
 
@@ -168,6 +195,7 @@ def scan_text(name: str, text: str, known: set) -> list:
         if any(ord(ch) > 127 for ch in line):
             hits.append("%s:%d: non-ASCII byte (cloud-init discards the config, #1880)" % (name, lineno))
     hits.extend(dsn_hits(name, text))
+    hits.extend(provision_hits(name, text))
     hits.extend(pin_hits(name, text))
     invocations = serve_invocations(text)
     if not invocations:
@@ -200,6 +228,12 @@ def self_test(known: set) -> int:
     dsn = "      postgres://u:p@localhost/db?sslmode=verify-full&sslrootcert=/c\n"
     unit = "ExecStart=/opt/ai-memory/bin/ai-memory serve --host 0.0.0.0 --port 9077 --tls-cert /a --tls-key /b\n"
     good = dsn + unit
+    pg_conf = '      PGCONF="/etc/postgresql/18/main/postgresql.conf"\n'
+    ssl = '      printf "ssl = on\\n" >> "$PGCONF"\n'
+    hba = '      printf "hostssl aimemory aimemory 127.0.0.1/32 scram-sha-256\\n" >> "$HBA"\n'
+    fetch = '      curl -fsSL "${ai_memory_image_url}" -o "$DL/a.tar.gz"\n'
+    digest = '      echo "${ai_memory_image_sha256}  $DL/a.tar.gz" | sha256sum -c -\n'
+    extract = '      tar -xzf "$DL/a.tar.gz" -C /opt/ai-memory/bin\n'
     probes = {
         "bind flag": good.replace("--host 0.0.0.0", "--bind 0.0.0.0:9077"),
         "no tls": dsn + "ExecStart=/opt/ai-memory/bin/ai-memory serve --host 0.0.0.0 --port 9077\n",
@@ -218,6 +252,14 @@ def self_test(known: set) -> int:
         "git checkout of a branch": good + "        git checkout release/PG18/1.8.0\n",
         "short commit pin": good + "      AGE_COMMIT=e43dc1a\n",
         "serve with unidentified binary": dsn + "ExecStart=/opt/ai-memory/bin/wrapper serve --host 0.0.0.0 --tls-cert /a --tls-key /b\n",
+        "pgbouncer port": good.replace("@localhost/", "@localhost:6432/"),
+        "local postgres without ssl": good + pg_conf + hba,
+        "local postgres without hostssl": good + pg_conf + ssl,
+        "raw password in a SQL literal": good + "      psql -c \"CREATE USER aimemory WITH PASSWORD '${db_password}';\"\n",
+        "tarball with no digest check": good + fetch + extract,
+        "tarball extracted before the digest check": good + fetch + extract + digest,
+        "tarball download ignores failure": good + fetch.rstrip() + " || true\n" + digest + extract,
+        "tarball extraction ignores failure": good + fetch + digest + extract.rstrip() + " || true\n",
     }
     # #4654: probes judged under the do-hive template's own name, each with the
     # message fragment that must be among the hits, so neither a per-template
@@ -247,6 +289,9 @@ def self_test(known: set) -> int:
         "global flag before serve": good.replace("ai-memory serve", "ai-memory --db /x serve"),
         "continuation": good.replace("--port 9077", "\\\n  --port 9077"),
         "pinned fetch": good + "      AGE_COMMIT=e43dc1a12b78fba4acef9835b2b10379b8d243b4\n      # git clone is only mentioned in a comment\n",
+        "interpolated password in the url": good.replace("postgres://u:p@", "postgres://u:${urlencode(db_password)}@"),
+        "local postgres with tls": good + pg_conf + ssl + hba,
+        "digest checked before extract": good + fetch + digest + extract,
         "terraform directive": good.rstrip() + "%{ if x } --quorum-writes 2%{ endif }\n",
     }
     clean = 0

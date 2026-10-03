@@ -34,7 +34,6 @@ bootcmd:
 packages:
   - postgresql-18=18.6-1.pgdg24.04+2
   - postgresql-server-dev-18=18.6-1.pgdg24.04+2
-  - pgbouncer
   - build-essential
   - flex
   - bison
@@ -43,6 +42,7 @@ packages:
   - git
   - curl
   - jq
+  - openssl
 write_files:
   # #4577: the Postgres DSN (it carries the db password) reaches the daemon
   # through AI_MEMORY_STORE_URL_FILE, never on the serve argv where every local
@@ -52,11 +52,16 @@ write_files:
   # is what keeps other UIDs out during it. provision.sh hands the file to the
   # aimemory service user once that user exists (serve refuses a file with any
   # group/world mode bit, src/store_url.rs). A trailing newline is trimmed.
+  # #4654: the daemon connects straight to Postgres on the default port 5432
+  # (no pooler) with sslmode=verify-full against the CA that provision.sh mints
+  # (#4635); the host is localhost because that is the certificate SAN. The
+  # password is percent-encoded here and decoded by provision.sh, which reads
+  # the role password from this one file (as in the AWS template).
   - path: /etc/ai-memory/store-url
     permissions: '0600'
     owner: root:root
     content: |
-      postgres://aimemory:${db_password}@127.0.0.1:6432/aimemory
+      postgres://aimemory:${replace(urlencode(db_password),"+","%20")}@localhost/aimemory?sslmode=verify-full&sslrootcert=/etc/ai-memory/tls/pg-ca.crt
   - path: /etc/systemd/system/ai-memory.service
     permissions: '0644'
     content: |
@@ -456,15 +461,21 @@ write_files:
     permissions: '0755'
     content: |
       #!/usr/bin/env bash
-      set -euxo pipefail
-      exec > >(tee -a /var/log/ai-memory-provision.log) 2>&1
+      set -euo pipefail
+      # No `set -x` and a root-only log: the role password and the store URL
+      # pass through this script (#4638).
+      install -m 0600 /dev/null /var/log/ai-memory-provision.log
+      exec >> /var/log/ai-memory-provision.log 2>&1
       echo "=== ai-memory postgres+AGE+pgvector provision $(date -u) ==="
 
       # --- user + dirs ---
       id aimemory >/dev/null 2>&1 || useradd -m -d /opt/ai-memory -s /bin/bash aimemory
       mkdir -p /opt/ai-memory/bin /var/log/ai-memory
       chown -R aimemory:aimemory /opt/ai-memory /var/log/ai-memory
-      # #4577: hand the DSN file to the service user (mode stays 0600).
+      # #4577/#4619: the service user traverses /etc/ai-memory and owns the DSN
+      # file (mode stays 0600).
+      chown root:aimemory /etc/ai-memory
+      chmod 0750 /etc/ai-memory
       chown aimemory:aimemory /etc/ai-memory/store-url
       chmod 0600 /etc/ai-memory/store-url
 
@@ -509,17 +520,81 @@ write_files:
         make install PG_CONFIG=/usr/bin/pg_config
       fi
 
-      # --- preload AGE + restart postgres ---
+      # --- PostgreSQL server TLS (#4635) ---------------------------------
+      # The store URL pins sslmode=verify-full (the connect funnel refuses
+      # anything weaker: src/store/postgres/dsn.rs:213-283, floor
+      # src/transit_encryption.rs:436-446). A local RSA CA signs a server
+      # cert whose SAN is the host the URL dials (localhost). RSA, not
+      # Ed25519: libpq channel binding has no digest for Ed25519 (#2658).
+      # Shape follows infra/do-hive/crypto/gen-certs.sh:40-56 (RSA CA 4096,
+      # leaf 2048, CA-signed, SAN = dialed host) and the hostssl pg_hba of
+      # infra/do-hive/crypto/test-pg-verifyfull.sh (hostssl, scram-sha-256).
+      TLSD=/etc/ai-memory/tls
+      PGTLS=/etc/postgresql/18/main/tls
+      install -d -o root -g aimemory -m 0750 "$TLSD"
+      if [ ! -s "$TLSD/pg-ca.crt" ] || [ ! -s "$PGTLS/server.key" ]; then
+        ( umask 077
+          openssl genrsa -out "$TLSD/pg-ca.key" 4096
+          openssl req -x509 -new -key "$TLSD/pg-ca.key" -sha256 -days 365 \
+            -subj "/CN=ai-memory-hive-pg-CA" -out "$TLSD/pg-ca.crt"
+          openssl genrsa -out "$TLSD/pg-server.key" 2048
+          openssl req -new -key "$TLSD/pg-server.key" -subj "/CN=localhost" \
+            -out "$TLSD/pg-server.csr"
+          printf 'subjectAltName=DNS:localhost,IP:127.0.0.1,IP:0:0:0:0:0:0:0:1\n' \
+            > "$TLSD/pg-server.ext"
+          openssl x509 -req -in "$TLSD/pg-server.csr" -CA "$TLSD/pg-ca.crt" \
+            -CAkey "$TLSD/pg-ca.key" -CAcreateserial -days 365 -sha256 \
+            -extfile "$TLSD/pg-server.ext" -out "$TLSD/pg-server.crt" ) \
+          || { echo "could not mint the postgres TLS pair"; exit 1; }
+        install -d -o postgres -g postgres -m 0700 "$PGTLS"
+        install -o postgres -g postgres -m 0600 "$TLSD/pg-server.key" "$PGTLS/server.key"
+        install -o postgres -g postgres -m 0644 "$TLSD/pg-server.crt" "$PGTLS/server.crt"
+        rm -f "$TLSD/pg-server.key" "$TLSD/pg-server.csr" "$TLSD/pg-server.ext" "$TLSD/pg-server.crt"
+      fi
+      # The service user reads only the CA certificate (the trust anchor).
+      chown root:aimemory "$TLSD/pg-ca.crt"
+      chmod 0644 "$TLSD/pg-ca.crt"
+
+      # --- preload AGE + TLS settings + restart postgres ---
       PGCONF="/etc/postgresql/18/main/postgresql.conf"
       if ! grep -q "shared_preload_libraries.*age" "$PGCONF"; then
         echo "shared_preload_libraries = 'age'" >> "$PGCONF"
       fi
+      # Appended last, so it overrides the packaged snakeoil ssl settings.
+      if ! grep -q "^# ai-memory-tls (#4635)" "$PGCONF"; then
+        printf '%s\n' "# ai-memory-tls (#4635)" "ssl = on" \
+          "ssl_cert_file = '$PGTLS/server.crt'" "ssl_key_file = '$PGTLS/server.key'" \
+          "ssl_min_protocol_version = 'TLSv1.2'" >> "$PGCONF"
+      fi
+      # aimemory may only connect with TLS over TCP: hostssl lines first, then
+      # a reject for any non-TLS TCP attempt (first matching line wins).
+      HBA="/etc/postgresql/18/main/pg_hba.conf"
+      if ! grep -q "^# ai-memory-tls (#4635)" "$HBA"; then
+        { printf '%s\n' "# ai-memory-tls (#4635)" \
+            "hostssl aimemory aimemory 127.0.0.1/32 scram-sha-256" \
+            "hostssl aimemory aimemory ::1/128 scram-sha-256" \
+            "hostnossl aimemory aimemory all reject"
+          cat "$HBA"; } > "$HBA.new"
+        chown --reference="$HBA" "$HBA.new"
+        chmod --reference="$HBA" "$HBA.new"
+        mv "$HBA.new" "$HBA"
+      fi
       systemctl restart postgresql
       sleep 5
 
-      # --- db + role + extensions (idempotent) ---
+      # --- db + role + extensions (idempotent). The role password is read
+      # from the store-url file and reaches psql on stdin, never on an argv.
+      # The DSN userinfo is percent-encoded (a password containing @ : / ? # %
+      # must be written %40 etc. in the DSN, #4638/#4642): it is decoded here the
+      # way the daemon's URL parser decodes it, and any single quote is doubled
+      # for the SQL literal. psql runs with ON_ERROR_STOP so a failed statement
+      # stops the script instead of falling through to CREATE DATABASE.
+      DB_PASS="$(sed -n 's#^postgres://aimemory:\([^@]*\)@.*#\1#p' /etc/ai-memory/store-url)"
+      [ -n "$DB_PASS" ] || { echo "no db password in /etc/ai-memory/store-url"; exit 1; }
       sudo -u postgres psql -tc "SELECT 1 FROM pg_roles WHERE rolname='aimemory'" | grep -q 1 || \
-        sudo -u postgres psql -c "CREATE USER aimemory WITH PASSWORD '${db_password}';"
+        printf '%s' "$DB_PASS" \
+          | python3 -c 'import sys,urllib.parse as u;p=u.unquote(sys.stdin.read());q=chr(39);print("CREATE USER aimemory WITH PASSWORD "+q+p.replace(q,q+q)+q+";")' \
+          | sudo -u postgres psql -v ON_ERROR_STOP=1
       sudo -u postgres psql -tc "SELECT 1 FROM pg_database WHERE datname='aimemory'" | grep -q 1 || \
         sudo -u postgres psql -c "CREATE DATABASE aimemory OWNER aimemory;"
       sudo -u postgres psql -d aimemory -c "CREATE EXTENSION IF NOT EXISTS vector;"
@@ -528,36 +603,30 @@ write_files:
       sudo -u postgres psql -d aimemory -c "GRANT ALL ON SCHEMA ag_catalog TO aimemory;" || true
       sudo -u postgres psql -d aimemory -c "SELECT extname, extversion FROM pg_extension WHERE extname IN ('vector','age');"
 
-      # Transaction pooling is part of the Phase-A baseline so Phase-B results
-      # remain comparable. PostgreSQL stays loopback-only behind PgBouncer.
-      cat > /etc/pgbouncer/pgbouncer.ini <<'PGB'
-      [databases]
-      aimemory = host=127.0.0.1 port=5432 dbname=aimemory
-      [pgbouncer]
-      listen_addr = 127.0.0.1
-      listen_port = 6432
-      auth_type = scram-sha-256
-      auth_file = /etc/pgbouncer/userlist.txt
-      pool_mode = transaction
-      max_client_conn = 2000
-      default_pool_size = 100
-      PGB
-      printf '"aimemory" "${db_password}"\n' > /etc/pgbouncer/userlist.txt
-      chown postgres:postgres /etc/pgbouncer/pgbouncer.ini /etc/pgbouncer/userlist.txt
-      chmod 0600 /etc/pgbouncer/userlist.txt
-      systemctl enable --now pgbouncer
-
       echo "PostgreSQL: $(sudo -u postgres psql -Atc 'SELECT version()')"
       sudo -u postgres psql -d aimemory -Atc "SELECT extname || ': ' || extversion FROM pg_extension WHERE extname IN ('age','vector') ORDER BY extname"
 
       # --- ai-memory binary (operator-published sal-postgres tarball) ---
       # NOTE: the binary MUST be compiled with --features sal-postgres for the
-      # postgres+AGE path. For ad-hoc runs the operator scp's a local build over
-      # this and `systemctl restart ai-memory`.
+      # postgres+AGE path. For ad-hoc runs the operator leaves ai_memory_image_url
+      # empty, scp's a local build over /opt/ai-memory/bin/ai-memory and runs
+      # `systemctl restart ai-memory`.
+      # #4637 (form copied from infra/aws-gpu-burst/cloud-init-memory.yaml.tpl):
+      # the tarball is downloaded into a root-only directory, its SHA-256 is
+      # checked against the operator-supplied digest BEFORE it is extracted, and
+      # the version probe runs as the unprivileged service user, so the
+      # unverified download is not executed as root. A mismatch (or a malformed
+      # digest) stops the script before the systemctl enable line below.
       if [ -n "${ai_memory_image_url}" ]; then
-        curl -fsSL "${ai_memory_image_url}" -o /opt/ai-memory/ai-memory.tar.gz || true
-        tar -xzf /opt/ai-memory/ai-memory.tar.gz -C /opt/ai-memory/bin || true
-        chmod 0755 /opt/ai-memory/bin/ai-memory || true
+        DL=/var/cache/ai-memory-provision
+        install -d -m 0700 "$DL"
+        curl -fsSL "${ai_memory_image_url}" -o "$DL/ai-memory.tar.gz"
+        echo "${ai_memory_image_sha256}  $DL/ai-memory.tar.gz" | sha256sum -c - \
+          || { echo "ai-memory tarball digest mismatch"; rm -f "$DL/ai-memory.tar.gz"; exit 1; }
+        tar -xzf "$DL/ai-memory.tar.gz" --no-same-owner -C /opt/ai-memory/bin
+        chmod 0755 /opt/ai-memory/bin/ai-memory
+        chown -R aimemory:aimemory /opt/ai-memory/bin
+        runuser -u aimemory -- /opt/ai-memory/bin/ai-memory --version
       fi
       chown -R aimemory:aimemory /opt/ai-memory
 

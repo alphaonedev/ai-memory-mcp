@@ -209,6 +209,17 @@ variable "ai_memory_image_url" {
   default     = "https://github.com/alphaonedev/ai-memory-mcp/releases/latest/download/ai-memory-x86_64-unknown-linux-gnu.tar.gz"
 }
 
+variable "ai_memory_image_sha256" {
+  description = "Lowercase hex SHA-256 of the tarball at ai_memory_image_url. The memory node refuses to extract or run a tarball that does not match (#4637). Required whenever ai_memory_image_url is non-empty (a memory droplet precondition enforces it at plan time): pin a versioned URL, not releases/latest, so the digest stays valid. Leave both empty to supply the binary by scp."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.ai_memory_image_sha256 == "" || can(regex("^[0-9a-f]{64}$", var.ai_memory_image_sha256))
+    error_message = "ai_memory_image_sha256 must be empty or 64 lowercase hex characters."
+  }
+}
+
 variable "ironclaw_image_url" {
   description = "URL to the IronClaw v1.1.0 runner tarball."
   type        = string
@@ -264,16 +275,21 @@ resource "digitalocean_droplet" "memory" {
   // byte-identically to the pre-Track-D template (verified by rendering both
   // and diffing against the parent commit).
   user_data = templatefile("${path.module}/cloud-init-memory.yaml.tpl", {
-    ai_memory_image_url = var.ai_memory_image_url
-    db_password         = var.db_password
-    federation_enabled  = var.memory_count > 1
-    node_index          = count.index + 1
-    node_count          = var.memory_count
-    fed_identity        = "ai:hive-memory-${count.index + 1}"
-    quorum_writes       = var.quorum_writes
+    ai_memory_image_url    = var.ai_memory_image_url
+    ai_memory_image_sha256 = var.ai_memory_image_sha256
+    db_password            = var.db_password
+    federation_enabled     = var.memory_count > 1
+    node_index             = count.index + 1
+    node_count             = var.memory_count
+    fed_identity           = "ai:hive-memory-${count.index + 1}"
+    quorum_writes          = var.quorum_writes
   })
 
   lifecycle {
+    precondition {
+      condition     = var.ai_memory_image_url == "" || can(regex("^[0-9a-f]{64}$", var.ai_memory_image_sha256))
+      error_message = "ai_memory_image_sha256 must be 64 lowercase hex characters when ai_memory_image_url is set: the memory node refuses a tarball it cannot verify (#4637)."
+    }
     precondition {
       condition     = var.quorum_writes <= var.memory_count || var.memory_count == 1
       error_message = "quorum_writes must be <= memory_count. A W larger than N can never be satisfied: every federated write would burn the full --quorum-timeout-ms and then return 202 locally-durable, so the mesh would look alive while replicating nothing."
