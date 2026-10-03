@@ -416,6 +416,24 @@ do
     [[ "$_dup" == 0 ]] && HOOK_DOC_FILES+=("$_hd")
 done
 
+# Additional surfaces walked ONLY by the boot-banner `schema=vNN` check
+# (#3248 item 4): the integration pages and the quickstart that render the
+# `ai-memory boot` status block as sample output. Like HOOK_DOC_FILES this is
+# a SEPARATE list, not an extension of DOC_FILES (their other counts belong
+# to other lanes). Files already in DOC_FILES / HTML_DOC_FILES are skipped
+# here because the generalised scanner already runs the banner check on them
+# (a duplicate would report the same drift twice). Dated records
+# (docs/releases/, docs/audit/, docs/reviews/) are deliberately NOT globbed:
+# they quote the `schema=v19` banner of the release they describe.
+BANNER_DOC_FILES=()
+while IFS= read -r _bd; do
+    [[ -z "$_bd" ]] && continue
+    _bd="${_bd#./}"
+    _dup=0
+    for _e in "${DOC_FILES[@]}" "${HTML_DOC_FILES[@]}"; do [[ "$_e" == "$_bd" ]] && { _dup=1; break; }; done
+    [[ "$_dup" == 0 ]] && BANNER_DOC_FILES+=("$_bd")
+done < <({ find docs/integrations -maxdepth 1 -name '*.md' -type f 2>/dev/null; [[ -f docs/QUICKSTART.md ]] && echo docs/QUICKSTART.md; } | LC_ALL=C sort)
+
 # Doc surfaces the pgvector-certified-patch rule walks. Its own EXPLICIT
 # allowlist (the "one rule, one scan set" discipline the HookEvent /
 # HTML rules follow), NOT a shared list — the current-cert docs that cite
@@ -1061,6 +1079,7 @@ check_generalised_numeric_claims() {
     if ! out="$(
         GATE_DOC_FILES="${DOC_FILES[*]}" \
         GATE_HTML_FILES="${HTML_DOC_FILES[*]:-}" \
+        GATE_BANNER_FILES="${BANNER_DOC_FILES[*]:-}" \
         C_ROUTES="$CANONICAL_ROUTES_COUNT" \
         C_PATHS="$CANONICAL_UNIQUE_PATHS_COUNT" \
         C_SCHEMA="$CANONICAL_SCHEMA_VERSION" \
@@ -1181,16 +1200,21 @@ CURRENT_RELEASE = re.compile(
 # Release-narrative paragraph lead: `**v0.8.0 (`x`) — prior release.**`
 PARA_LEAD = re.compile(r"^\s*\*\*v([0-9]+\.[0-9]+\.[0-9]+)")
 # Unconditionally past-tense phrasings.
+# The version atom takes 3 OR 4 numeric parts: a 4-part patch release
+# (`v0.6.3.1`) is a real release and a real past-tense record (#3248 F6).
 PAST_TENSE = [
-    re.compile(r"\bAt the v[0-9]+\.[0-9]+\.[0-9]+ release\b"),
+    re.compile(r"\bAt the v[0-9]+(?:\.[0-9]+){2,3} release\b"),
     re.compile(r"\brelease, surface was\b"),
-    re.compile(r"\bat the v[0-9]+\.[0-9]+\.[0-9]+ release\b"),
+    re.compile(r"\bat the v[0-9]+(?:\.[0-9]+){2,3} release\b"),
 ]
 # Pre-existing historical-claim exclusions, preserved verbatim in intent
 # from the CURRENT_SCHEMA_VERSION rule above: `v52 added X`,
 # changelog-style headers, RFC back-references.
-HISTORICAL = [
-    re.compile(r"^\s*#{1,6}\s"),
+# The markdown-heading guard is a NAMED constant, not list element 0, so a
+# reorder of the lists below cannot silently swap which guard the boot-banner
+# check drops (#3248 F7).
+MD_HEADING_GUARD = re.compile(r"^\s*#{1,6}\s")
+NON_HEADING_HISTORICAL = [
     re.compile(r"\bv[0-9]+ added\b"),
     re.compile(r"\bwas [0-9]+ at v[0-9]"),
     re.compile(r"\bwas (?:four|five|six|seven|eight|nine|ten) at v[0-9]"),
@@ -1201,15 +1225,19 @@ HISTORICAL = [
     re.compile(r"\bShip state at v[0-9]+\.[0-9]+"),
     re.compile(r"\bFrozen v[0-9]+\.[0-9]+[^ ]* baseline\b"),
 ]
+HISTORICAL = [MD_HEADING_GUARD, *NON_HEADING_HISTORICAL]
 
 
-def is_historical(line):
+def is_historical(line, heading=True):
+    # heading=False drops ONLY the markdown-heading guard (see the boot-banner
+    # note below); every other guard still applies.
     m = PARA_LEAD.match(line)
     if m and m.group(1) != release:
         return True
     if any(p.search(line) for p in PAST_TENSE):
         return True
-    return any(p.search(line) for p in HISTORICAL)
+    guards = HISTORICAL if heading else NON_HEADING_HISTORICAL
+    return any(p.search(line) for p in guards)
 
 
 # ---- HTML HISTORICAL GUARD (#2977) ----------------------------------
@@ -1264,22 +1292,48 @@ def html_window_historical(window):
 # BOOT-BANNER SAMPLE OUTPUT (#3248 item 4). The integration docs show the
 # `ai-memory boot` status block as a `#`-prefixed transcript, e.g.
 # `#   db: ~/.claude/ai-memory.db (schema=v90, 161 memories)`. The shared
-# `^\s*#{1,6}\s` markdown-heading guard treats that `#` as a heading and
-# skips the line, so a stale `schema=vNN` went unpoliced. The `schema=vNN`
-# spelling is a PRESENT-tense statement about what the current binary prints
-# (ladder history never uses the `=` form), so it is matched with every
+# markdown-heading guard treats that `#` as a heading and skips the line (and
+# after tag-stripping so does an html `<pre># db: ...` line), so a stale
+# `schema=vNN` went unpoliced. The `schema=vNN` spelling is a present-tense
+# statement about what the current binary prints, so it is matched with every
 # historical guard EXCEPT the heading one.
-BOOT_BANNER_SCHEMA = re.compile(r"\bschema=v([0-9]+)\b")
-NON_HEADING_HISTORICAL = HISTORICAL[1:]
+#   * Spacing, case and a code-span around the number are tolerated
+#     (`schema = V90`, `SCHEMA=v90`, `schema=`v90``); the `v` stays MANDATORY
+#     because `schema_version = 2` (a config-file marker, a different SSOT)
+#     would otherwise be flagged 17 times.
+#   * The `=` form IS used in dated records (docs/releases/v0.6.3.1.md,
+#     docs/audit/e2e-smoke-report-v0631-issue-487.md,
+#     docs/reviews/v1.0.0-3x7-GROK-4.5-DOGFOOD-FULL-SPECTRUM.md), which carry
+#     TRUE history. They are safe ONLY because they are not enrolled; in an
+#     enrolled file a banner under a past release must say so on its own line
+#     (`At the vX.Y.Z[.W] release ...` or a `**vX.Y.Z` lead) to be spared.
+#   * Beyond DOC_FILES/HTML_DOC_FILES, the check also walks the pages that
+#     render the banner (GATE_BANNER_FILES, resolved at the top of the
+#     script), so a stale sample there cannot ship green.
+BOOT_BANNER_SCHEMA = re.compile(r"(?i)\bschema\s*=\s*`?v([0-9]+)\b(?!\.[0-9])")
+banner_docs = os.environ.get("GATE_BANNER_FILES", "").split()
 
 
-def is_historical_nonheading(line):
-    m = PARA_LEAD.match(line)
-    if m and m.group(1) != release:
-        return True
-    if any(p.search(line) for p in PAST_TENSE):
-        return True
-    return any(p.search(line) for p in NON_HEADING_HISTORICAL)
+def banner_scan(f, ln, text, hist_window):
+    if hist_window or is_historical(text, heading=False):
+        return
+    ctx = text.strip()[:160].replace("\t", " ")
+    for hit in BOOT_BANNER_SCHEMA.finditer(text):
+        if hit.group(1) != canon["CURRENT_SCHEMA_VERSION"]:
+            print(
+                "CURRENT_SCHEMA_VERSION\t"
+                f"{f}\t{ln}\t{hit.group(1)}\t"
+                f"{canon['CURRENT_SCHEMA_VERSION']}\t{ctx}"
+            )
+
+
+def scan_banner_only(f):
+    try:
+        text = open(f, encoding="utf-8").read()
+    except OSError:
+        return
+    for ln, line in enumerate(text.splitlines(), 1):
+        banner_scan(f, ln, line, False)
 
 
 def scan(f, is_html):
@@ -1291,9 +1345,13 @@ def scan(f, is_html):
     for ln, line in enumerate(lines, 1):
         ctx = line.strip()[:160].replace("\t", " ")
         if is_html:
-            if is_historical(plain(line)):
-                continue
-            if html_window_historical(lines[max(0, ln - 1 - HTML_WINDOW):ln]):
+            pl = plain(line)
+            window_hist = html_window_historical(
+                lines[max(0, ln - 1 - HTML_WINDOW):ln])
+            # The banner is checked BEFORE the numeric guards below: the
+            # heading guard would swallow a `<pre># db: ...` transcript line.
+            banner_scan(f, ln, pl, window_hist)
+            if is_historical(pl) or window_hist:
                 continue
         else:
             # RULE N1 is a MARKDOWN paragraph-lead rule; the html surface
@@ -1305,14 +1363,7 @@ def scan(f, is_html):
                     "CURRENT_RELEASE_ATTRIBUTION\t"
                     f"{f}\t{ln}\tv{m.group(1)}\tv{release}\t{ctx}"
                 )
-            if not is_historical_nonheading(line):
-                for hit in BOOT_BANNER_SCHEMA.finditer(line):
-                    if hit.group(1) != canon["CURRENT_SCHEMA_VERSION"]:
-                        print(
-                            "CURRENT_SCHEMA_VERSION\t"
-                            f"{f}\t{ln}\t{hit.group(1)}\t"
-                            f"{canon['CURRENT_SCHEMA_VERSION']}\t{ctx}"
-                        )
+            banner_scan(f, ln, line, False)
             if is_historical(line):
                 continue
         for key, pats in RULES:
@@ -1327,6 +1378,8 @@ for f in docs:
     scan(f, False)
 for f in html_docs:
     scan(f, True)
+for f in banner_docs:
+    scan_banner_only(f)
 PY
     )"; then
         # FAIL CLOSED (#2713): the numeric-claim analysis engine exited
@@ -2282,6 +2335,40 @@ EFGOOD
         cd "$REPO_ROOT"; exit 1
     fi
     echo "PASS: self-test — the canonical asi-hard knob (3) + EF check (5) counts PASS"
+
+    # ---- #3248 item 4: boot-banner `schema=vNN` in a `#`-prefixed transcript.
+    # Fixture canonical: schema 53. The `#   db:` transcript line opens with
+    # a `#` that the markdown-heading guard would treat as a heading, so the
+    # banner check must run past that guard (and past html `<pre>` markup),
+    # tolerate spacing / case / code-span variants, and still spare dated
+    # history. Lines 1,2,6 (md), the html line and the cursor.md line are
+    # STALE and must be flagged; lines 3,4,5 must NOT be.
+    mkdir -p "$tmpdir/docs/integrations"
+    cat > "$tmpdir/docs/integrations/README.md" <<'BOOTBANNER'
+#   db:         /home/u/.claude/ai-memory.db (schema=v52, 161 memories)
+#   db:         /home/u/.claude/ai-memory.db (schema = V52, 161 memories)
+#   db:         /home/u/.claude/ai-memory.db (schema=v53, 161 memories)
+**v0.6.3** boot sample: (schema=v19, 3 memories)
+At the v0.6.3.1 release the banner showed (schema=v19, 3 memories)
+#   db:         /home/u/.claude/ai-memory.db (schema=`v52`, 161 memories)
+BOOTBANNER
+    printf '<pre># db: /x.db (schema=v52, 1 memories)</pre>\n' > "$tmpdir/docs/banner-fixture.html"
+    # An integration page that is NOT in DOC_FILES: enrolled for this check only.
+    printf '#   db:         /home/u/.claude/ai-memory.db (schema=v52, 161 memories)\n' > "$tmpdir/docs/integrations/cursor.md"
+    bb_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1) && {
+        echo "FAIL: self-test #3248 - stale boot-banner schema=vNN not rejected" >&2; cd "$REPO_ROOT"; exit 1; }
+    for _want in \
+        'CURRENT_SCHEMA_VERSION: docs/integrations/README.md:1 claims "52"' \
+        'CURRENT_SCHEMA_VERSION: docs/integrations/README.md:2 claims "52"' \
+        'CURRENT_SCHEMA_VERSION: docs/integrations/README.md:6 claims "52"' \
+        'CURRENT_SCHEMA_VERSION: docs/banner-fixture.html:1 claims "52"' \
+        'CURRENT_SCHEMA_VERSION: docs/integrations/cursor.md:1 claims "52"'
+    do grep -qF "$_want" <<<"$bb_out" || { echo "FAIL: self-test #3248 - not flagged: $_want" >&2; cd "$REPO_ROOT"; exit 1; }; done
+    for _not in 'docs/integrations/README.md:3 ' 'docs/integrations/README.md:4 ' 'docs/integrations/README.md:5 '; do
+        grep -qF "$_not" <<<"$bb_out" && { echo "FAIL: self-test #3248 - canonical/historical banner flagged: $_not" >&2; cd "$REPO_ROOT"; exit 1; }
+    done
+    echo "PASS: self-test #3248 - boot-banner schema=vNN: stale REJECTED (md, html, spacing/case/code-span, banner-only page), canonical and dated history ACCEPTED"
+    rm -f "$tmpdir/docs/integrations/README.md" "$tmpdir/docs/integrations/cursor.md" "$tmpdir/docs/banner-fixture.html"
 
     # ---- FAIL-CLOSED-ONLY-WITH-A-CLAIM: remove both SSOTs. A doc that
     # narrates NO count has nothing to validate and must stay green;
