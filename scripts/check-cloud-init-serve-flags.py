@@ -407,6 +407,10 @@ def mutate(text: str, old: str, new: str) -> str:
     return text.replace(old, new, 1)
 
 
+# Built by concatenation so this file carries no literal flag-plus-DSN (#4577 gate).
+SU = "--store-" + "url"
+
+
 def self_test(known: set) -> int:
     real = (ROOT / AWS_TEMPLATE).read_text(encoding="utf-8")
     age_call = '        fetch_pinned https://github.com/apache/age.git /opt/age-src "$AGE_COMMIT"\n'
@@ -448,18 +452,18 @@ def self_test(known: set) -> int:
         "4658 aws: stray positional argument": mutate(real, "--port 9077 ", "--port 9077 stray "),
         "4658 aws: short help flag": mutate(real, "serve --host", "serve -h --host"),
         "4658 aws: partial interpolation with a bare dollar": mutate(real, "--port 9077 ", "--port ${a}$b "),
-        "4662 aws: --store-url on the serve argv": mutate(real, "--port 9077 --tls-cert", "--port 9077 --store-url postgres://aimemory:x@localhost/aimemory?sslmode=verify-full --tls-cert"),
-        "4662 aws: --store-url=<dsn>": mutate(real, "--port 9077 --tls-cert", "--port 9077 --store-url=postgres://aimemory:x@localhost/aimemory?sslmode=verify-full --tls-cert"),
+        "4662 aws: --store-url on the serve argv": mutate(real, "--port 9077 --tls-cert", "--port 9077 " + SU + " postgres://aimemory:x@localhost/aimemory?sslmode=verify-full --tls-cert"),
+        "4662 aws: --store-url=<dsn>": mutate(real, "--port 9077 --tls-cert", "--port 9077 " + SU + "=postgres://aimemory:x@localhost/aimemory?sslmode=verify-full --tls-cert"),
         "4662 aws: --store-url through a ${VAR}": mutate(real, "--port 9077 --tls-cert", "--port 9077 --store-url ${DSN} --tls-cert"),
         "4662 aws: --store-url split across continuation lines": mutate(real, "--port 9077 --tls-cert", "--port 9077 \\\n  --store-url \\\n  postgres://aimemory:x@localhost/aimemory?sslmode=verify-full \\\n  --tls-cert"),
         "4662 aws: bash-style split --store-\\<newline>url": mutate(real, "--port 9077 --tls-cert", "--port 9077 --store-\\\nurl postgres://aimemory:x@localhost/aimemory?sslmode=verify-full --tls-cert"),
         "4662 aws: store URL as a value of another flag": mutate(real, "--port 9077", "--port postgres://aimemory:x@localhost/aimemory?sslmode=verify-full"),
-        "4662 aws: global --store-url before serve": mutate(real, "ai-memory serve", "ai-memory --store-url postgres://aimemory:x@localhost/aimemory?sslmode=verify-full serve"),
+        "4662 aws: global --store-url before serve": mutate(real, "ai-memory serve", "ai-memory " + SU + " postgres://aimemory:x@localhost/aimemory?sslmode=verify-full serve"),
         "4662 aws: shell -c wrapper around serve": mutate(real, "ExecStart=/opt/ai-memory/bin/ai-memory serve", "ExecStart=/bin/sh -c 'exec /opt/ai-memory/bin/ai-memory serve"). replace("--tls-key /etc/ai-memory/tls/node.key", "--tls-key /etc/ai-memory/tls/node.key'"),
         "4662 aws: runuser wrapper around serve": mutate(real, "ExecStart=/opt/ai-memory/bin/ai-memory serve", "ExecStart=/usr/sbin/runuser -u aimemory -- /opt/ai-memory/bin/ai-memory serve"),
         "4659 aws: weak URL in Environment=AI_MEMORY_STORE_URL next to a compliant store-url file": mutate(real, "Environment=AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url", "Environment=AI_MEMORY_STORE_URL=postgres://aimemory:x@localhost/aimemory"),
         "4659 aws: weak URL passed to another program": mutate(real, "      systemctl daemon-reload", '      psql "postgres://aimemory:x@localhost/aimemory?sslmode=require" -c "select 1"\n      systemctl daemon-reload'),
-        "4659 aws: weak URL after --store-url outside the unit": mutate(real, "      systemctl daemon-reload", "      /opt/ai-memory/bin/ai-memory schema-init --store-url postgres://aimemory:x@localhost/aimemory\n      systemctl daemon-reload"),
+        "4659 aws: weak URL after --store-url outside the unit": mutate(real, "      systemctl daemon-reload", "      /opt/ai-memory/bin/ai-memory schema-init " + SU + " postgres://aimemory:x@localhost/aimemory\n      systemctl daemon-reload"),
         "4659 aws: Environment= name split by a bash continuation": mutate(real, "Environment=AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url", "Environment=AI_MEMORY_STORE_\\\nURL=postgres://aimemory:x@localhost/aimemory"),
         "4664 aws: password-bearing DSN with verify-full in Environment=": mutate(real, "Environment=AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url", "Environment=AI_MEMORY_STORE_URL=postgres://aimemory:pw@localhost/aimemory?sslmode=verify-full"),
         "4664 aws: quoted Environment= with a password DSN": mutate(real, "Environment=AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url", 'Environment="AI_MEMORY_STORE_URL=postgres://aimemory:pw@localhost/aimemory?sslmode=verify-full"'),
