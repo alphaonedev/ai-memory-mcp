@@ -80,6 +80,9 @@ LONG_NAMED_RE = re.compile(r'\blong\s*=\s*"([^"]+)"')
 LONG_BARE_RE = re.compile(r"(?<![\w=])long\s*(?:,|$)")
 SHORT_NAMED_RE = re.compile(r"\bshort\s*=\s*'(.)'")
 SHORT_BARE_RE = re.compile(r"(?<![\w=])short\s*(?:,|$)")
+STORE_FLAG_RE = re.compile(r"(?<![\w-])--store[-_]url\b")
+STORE_SCHEME_RE = re.compile(r"(?i)\b(?:postgres(?:ql)?|sqlite)://")
+ENV_WRAPPER_ARG_RE = re.compile(r"^(?:-i|--ignore-environment|\w+=\S*)$")
 INTERP_RE = re.compile(r"\$?\$\{[A-Za-z_]\w*\}")
 ALIAS_RE = re.compile(r'\b(?:visible_)?alias(?:es)?\s*=\s*"([^"]+)"')
 EXEC_RE = re.compile(r"^[ \t]*ExecStart=(?P<cmd>.*)$", re.M)
@@ -123,6 +126,40 @@ def strip_terraform(text: str) -> str:
     return re.sub(r"%\{[^}]*\}", " ", text)
 
 
+def argv_views(text: str) -> list:
+    """The same text as systemd joins it (backslash-newline becomes a space), as
+    a shell joins it (backslash-newline vanishes) and unjoined, comments blanked.
+    A forbidden spelling must not hide in any of them."""
+    t = blank_comments(text)
+    return [t, CONT_RE.sub(" ", t), re.sub(r"\\\n", "", t)]
+
+
+def exec_store_url_hits(name: str, text: str) -> list:
+    """#4662: no ExecStart may carry a store URL, in any spelling (``--store-url``
+    long form, ``=`` form, a value of another flag, a ${VAR}, a continuation split,
+    a global flag before serve): the DSN reaches the daemon only through
+    AI_MEMORY_STORE_URL_FILE (#4577), never on a world-readable argv."""
+    hits = []
+    for view in argv_views(text):
+        for m in EXEC_RE.finditer(view):
+            cmd = strip_terraform(m.group("cmd"))
+            if STORE_FLAG_RE.search(cmd) or STORE_SCHEME_RE.search(cmd):
+                msg = "%s: ExecStart carries a store URL (--store-url or a postgres:// value); use AI_MEMORY_STORE_URL_FILE (#4577, #4662)" % name
+                if msg not in hits:
+                    hits.append(msg)
+    return hits
+
+
+def prefix_is_env_wrapper(pre: list) -> bool:
+    """Tokens before the ai-memory binary may only be an ``env`` wrapper with
+    options/assignments; a shell, runuser or any other launcher is not parsed."""
+    if not pre:
+        return True
+    if posixpath.basename(pre[0].lstrip("-@+!:")) != "env":
+        return False
+    return all(ENV_WRAPPER_ARG_RE.match(t) for t in pre[1:])
+
+
 def serve_arg_hits(name: str, lineno: int, after: list, known: set) -> list:
     """Check every token after ``serve``: flags must be ServeArgs flags (long or
     short), a value must directly follow its flag, and an expansion may only be
@@ -160,7 +197,7 @@ def serve_invocations(text: str) -> list:
             continue
         line = line_at(m.start())
         bin_idx = next((i for i, t in enumerate(tokens) if posixpath.basename(t.lstrip("-@+!:")) == "ai-memory"), None)
-        if bin_idx is None or "serve" not in tokens[bin_idx + 1:]:
+        if bin_idx is None or "serve" not in tokens[bin_idx + 1:] or not prefix_is_env_wrapper(tokens[:bin_idx]):
             found.append((line, [], True))
             continue
         verb = tokens.index("serve", bin_idx + 1)
@@ -304,12 +341,13 @@ def scan_text(name: str, text: str, known: set) -> list:
             hits.append("%s:%d: non-ASCII byte (cloud-init discards the config, #1880)" % (name, lineno))
     hits.extend(dsn_hits(name, text))
     hits.extend(pin_hits(name, text))
+    hits.extend(exec_store_url_hits(name, text))
     invocations = serve_invocations(text)
     if not invocations:
         hits.append("%s: no ExecStart runs 'ai-memory serve' (nothing to check; a template that cannot start serve must not pass)" % name)
     for lineno, after, unparsed in invocations:
         if unparsed:
-            hits.append("%s:%d: ExecStart names serve but the ai-memory binary was not identified (cannot check its flags)" % (name, lineno))
+            hits.append("%s:%d: ExecStart names serve but is not 'ai-memory serve' or an env wrapper of it (a shell or other launcher hides the argv; cannot check its flags)" % (name, lineno))
             continue
         hits.extend(serve_arg_hits(name, lineno, after, known))
         flags = [t.strip("\"'").split("=", 1)[0] for t in after if t.strip("\"'").startswith("-")]
@@ -374,6 +412,15 @@ def self_test(known: set) -> int:
         "4658 aws: stray positional argument": mutate(real, "--port 9077 ", "--port 9077 stray "),
         "4658 aws: short help flag": mutate(real, "serve --host", "serve -h --host"),
         "4658 aws: partial interpolation with a bare dollar": mutate(real, "--port 9077 ", "--port ${a}$b "),
+        "4662 aws: --store-url on the serve argv": mutate(real, "--port 9077 --tls-cert", "--port 9077 --store-url postgres://aimemory:x@localhost/aimemory?sslmode=verify-full --tls-cert"),
+        "4662 aws: --store-url=<dsn>": mutate(real, "--port 9077 --tls-cert", "--port 9077 --store-url=postgres://aimemory:x@localhost/aimemory?sslmode=verify-full --tls-cert"),
+        "4662 aws: --store-url through a ${VAR}": mutate(real, "--port 9077 --tls-cert", "--port 9077 --store-url ${DSN} --tls-cert"),
+        "4662 aws: --store-url split across continuation lines": mutate(real, "--port 9077 --tls-cert", "--port 9077 \\\n  --store-url \\\n  postgres://aimemory:x@localhost/aimemory?sslmode=verify-full \\\n  --tls-cert"),
+        "4662 aws: bash-style split --store-\\<newline>url": mutate(real, "--port 9077 --tls-cert", "--port 9077 --store-\\\nurl postgres://aimemory:x@localhost/aimemory?sslmode=verify-full --tls-cert"),
+        "4662 aws: store URL as a value of another flag": mutate(real, "--port 9077", "--port postgres://aimemory:x@localhost/aimemory?sslmode=verify-full"),
+        "4662 aws: global --store-url before serve": mutate(real, "ai-memory serve", "ai-memory --store-url postgres://aimemory:x@localhost/aimemory?sslmode=verify-full serve"),
+        "4662 aws: shell -c wrapper around serve": mutate(real, "ExecStart=/opt/ai-memory/bin/ai-memory serve", "ExecStart=/bin/sh -c 'exec /opt/ai-memory/bin/ai-memory serve"). replace("--tls-key /etc/ai-memory/tls/node.key", "--tls-key /etc/ai-memory/tls/node.key'"),
+        "4662 aws: runuser wrapper around serve": mutate(real, "ExecStart=/opt/ai-memory/bin/ai-memory serve", "ExecStart=/usr/sbin/runuser -u aimemory -- /opt/ai-memory/bin/ai-memory serve"),
         "serve with unidentified binary": dsn + "ExecStart=/opt/ai-memory/bin/wrapper serve --host 0.0.0.0 --tls-cert /a --tls-key /b\n",
     }
     red = 0
@@ -384,6 +431,7 @@ def self_test(known: set) -> int:
             print("SELF-TEST FAIL: probe not flagged: " + label, file=sys.stderr)
     greens = {
         "4657 aws template as shipped": real,
+        "4662 env wrapper with an assignment": good.replace("ExecStart=/opt/", "ExecStart=/usr/bin/env -i HOME=/x /opt/"),
         "4658 value is a terraform interpolation": good.replace("--port 9077", "--port ${port}"),
         "4658 value is a systemd ${VAR} (do-hive quorum-peers shape)": good + "ExecStart=/opt/ai-memory/bin/ai-memory serve --tls-cert /a --tls-key /b --quorum-peers $${PEERS}\n",
         "4658 flag with = and an interpolation": good.replace("--port 9077", "--port=${port}"),
