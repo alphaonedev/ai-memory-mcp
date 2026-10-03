@@ -83,9 +83,13 @@ variable "ssh_source_cidr" {
 }
 
 variable "ai_memory_image_url" {
-  description = "URL to the ai-memory release tarball."
+  description = "URL of a VERSIONED ai-memory release tarball built with --features sal-postgres (for example .../releases/download/v1.0.0/ai-memory-x86_64-unknown-linux-gnu.tar.gz). Required; releases/latest is refused because ai_memory_image_sha256 pins one artifact."
   type        = string
-  default     = "https://github.com/alphaonedev/ai-memory-mcp/releases/latest/download/ai-memory-x86_64-unknown-linux-gnu.tar.gz"
+
+  validation {
+    condition     = !strcontains(var.ai_memory_image_url, "/releases/latest/")
+    error_message = "ai_memory_image_url must be a versioned release URL; /releases/latest/ moves and would not match ai_memory_image_sha256."
+  }
 }
 
 variable "ai_memory_image_sha256" {
@@ -112,7 +116,7 @@ resource "aws_vpc" "burst" {
   cidr_block           = "10.20.0.0/16"
   enable_dns_hostnames = true
   enable_dns_support   = true
-  tags = { Name = "ai-memory-burst-hive", Project = "ai-memory-track-e2" }
+  tags                 = { Name = "ai-memory-burst-hive", Project = "ai-memory-track-e2" }
 }
 
 resource "aws_internet_gateway" "burst" {
@@ -198,13 +202,13 @@ data "aws_ami" "ubuntu_2404" {
 // ---------------------------------------------------------------------------
 
 resource "aws_spot_instance_request" "vllm" {
-  ami                  = data.aws_ami.ubuntu_2404.id
-  instance_type        = "g5.2xlarge"
-  key_name             = var.ssh_key_name
-  subnet_id            = aws_subnet.burst.id
+  ami                    = data.aws_ami.ubuntu_2404.id
+  instance_type          = "g5.2xlarge"
+  key_name               = var.ssh_key_name
+  subnet_id              = aws_subnet.burst.id
   vpc_security_group_ids = [aws_security_group.burst.id]
-  wait_for_fulfillment = true
-  spot_type            = "one-time"
+  wait_for_fulfillment   = true
+  spot_type              = "one-time"
 
   // ~$0.60/hr; bump this if region quote is hotter than the estimate
   spot_price = "0.75"
@@ -250,15 +254,15 @@ resource "aws_instance" "memory" {
 // ---------------------------------------------------------------------------
 
 resource "aws_spot_instance_request" "agent" {
-  count                = var.agent_count
-  ami                  = data.aws_ami.ubuntu_2404.id
-  instance_type        = "t3.medium"
-  key_name             = var.ssh_key_name
-  subnet_id            = aws_subnet.burst.id
+  count                  = var.agent_count
+  ami                    = data.aws_ami.ubuntu_2404.id
+  instance_type          = "t3.medium"
+  key_name               = var.ssh_key_name
+  subnet_id              = aws_subnet.burst.id
   vpc_security_group_ids = [aws_security_group.burst.id]
-  wait_for_fulfillment = true
-  spot_type            = "one-time"
-  spot_price           = "0.06"
+  wait_for_fulfillment   = true
+  spot_type              = "one-time"
+  spot_price             = "0.06"
 
   user_data = templatefile("${path.module}/cloud-init-agent.yaml.tpl", {
     ironclaw_image_url = var.ironclaw_image_url
