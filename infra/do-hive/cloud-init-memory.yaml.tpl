@@ -497,7 +497,7 @@ write_files:
         make install PG_CONFIG=/usr/bin/pg_config
       fi
 
-      # --- build + install certified Apache AGE 1.8.0 against PG18 ---
+      # --- build + install Apache AGE 1.8.0 (commit AGE_COMMIT, tag PG18/v1.8.0-rc0, not a branch) against PG18 ---
       if [ ! -f "$(/usr/bin/pg_config --pkglibdir)/age.so" ]; then
         fetch_pinned https://github.com/apache/age.git /opt/age-src "$AGE_COMMIT"
         cd /opt/age-src

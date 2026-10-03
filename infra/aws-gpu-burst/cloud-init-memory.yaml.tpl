@@ -131,7 +131,7 @@ write_files:
       # https://github.com/apache/age.git refs/tags/PG18/v1.8.0-rc0).
       AGE_COMMIT=e43dc1a12b78fba4acef9835b2b10379b8d243b4
 
-      # --- build + install pgvector 0.8.6 against PG18 ---
+      # --- build + install pgvector 0.8.6 (commit PGVECTOR_COMMIT, tag v0.8.6) against PG18 ---
       if [ ! -f "$(/usr/bin/pg_config --pkglibdir)/vector.so" ]; then
         fetch_pinned https://github.com/pgvector/pgvector.git /opt/pgvector-src "$PGVECTOR_COMMIT"
         cd /opt/pgvector-src
@@ -139,7 +139,7 @@ write_files:
         make install PG_CONFIG=/usr/bin/pg_config
       fi
 
-      # --- build + install Apache AGE 1.8.0 against PG18 (source-only) ---
+      # --- build + install Apache AGE 1.8.0 (commit AGE_COMMIT, tag PG18/v1.8.0-rc0) against PG18 (source-only) ---
       if [ ! -f "$(/usr/bin/pg_config --pkglibdir)/age.so" ]; then
         fetch_pinned https://github.com/apache/age.git /opt/age-src "$AGE_COMMIT"
         cd /opt/age-src
