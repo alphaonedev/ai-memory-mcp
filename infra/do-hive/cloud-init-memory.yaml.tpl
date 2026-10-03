@@ -19,6 +19,14 @@
 package_update: true
 package_upgrade: false
 bootcmd:
+  # #4619: cloud-init write_files creates the file under the process umask and
+  # chmods it AFTER writing (cloudinit/util.py write_file: open, write, flush,
+  # chmod). bootcmd runs before write_files, so create /etc/ai-memory root-only
+  # (0700, umask 077) first: no other UID can traverse it while the store-url
+  # file briefly has the umask mode. Guarded so later boots never reset the
+  # 0750 root:aimemory mode the fed-bootstrap script sets (install -d) once the
+  # service user exists.
+  - [bash, -c, "[ -d /etc/ai-memory ] || (umask 077 && mkdir /etc/ai-memory)"]
   # PG 18 is supplied by PGDG on Ubuntu Noble. Install the signed repository
   # before cloud-init's packages module runs; never fall back to Ubuntu's PG16.
   - [bash, -c, "install -d -m 0755 /usr/share/postgresql-common/pgdg && curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc"]
@@ -38,11 +46,12 @@ packages:
 write_files:
   # #4577: the Postgres DSN (it carries the db password) reaches the daemon
   # through AI_MEMORY_STORE_URL_FILE, never on the serve argv where every local
-  # UID can read it from /proc/<pid>/cmdline and `ps auxww`. Declared 0600
-  # root:root (it is the only credential-bearing file here besides the 0700
-  # provision.sh); provision.sh hands it to
-  # the aimemory service user once that user exists (serve refuses a file with
-  # any group/world mode bit, src/store_url.rs). A trailing newline is trimmed.
+  # UID can read it from /proc/<pid>/cmdline and `ps auxww`. cloud-init writes
+  # the file first and applies permissions/owner afterwards (#4619), so the mode
+  # alone leaves a short window; the 0700 /etc/ai-memory created in bootcmd above
+  # is what keeps other UIDs out during it. provision.sh hands the file to the
+  # aimemory service user once that user exists (serve refuses a file with any
+  # group/world mode bit, src/store_url.rs). A trailing newline is trimmed.
   - path: /etc/ai-memory/store-url
     permissions: '0600'
     owner: root:root
