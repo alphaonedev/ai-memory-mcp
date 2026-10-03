@@ -14950,7 +14950,7 @@ async fn http_create_memory_invalid_x_agent_id_header_returns_400() {
 
 /// L11 (v0.7.0.1) — `metadata.agent_id` must be honoured as an
 /// explicit-caller source in the HTTP precedence chain, matching the
-/// MCP path (`crate::mcp::handle_store` (NHI precedence)) and the CLAUDE.md §Agent Identity
+/// MCP path (`crate::mcp::handle_store` (NHI precedence)) and the docs/reference/ARCHITECTURE_REFERENCE.md §Agent Identity
 /// contract.
 ///
 /// Regression scenario (NHI-D-fed-agentid-mutation): a peer reposts a

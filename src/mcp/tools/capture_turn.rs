@@ -80,7 +80,7 @@ use crate::signed_events::{self, SignedEvent};
 /// Mirrors the `AI_MEMORY_ADMIN_AGENT_IDS` shape — an operator-
 /// curated allowlist read at call time, no daemon-restart required
 /// for enrollment changes (each call re-reads the env). Documented
-/// in CLAUDE.md §"Environment Variables".
+/// in docs/reference/ARCHITECTURE_REFERENCE.md §"Environment Variables".
 pub(crate) const L4_HOST_PUBKEY_ALLOWLIST_ENV: &str = "AI_MEMORY_L4_HOST_PUBKEY_ALLOWLIST";
 
 /// #1558 batch 5 wave 3 — action label for the L4 capture-turn write

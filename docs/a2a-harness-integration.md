@@ -18,7 +18,7 @@ exercising this repo's binary.
 | config | `ai-memory-mcp` `config.toml` schema v3 | harness rendered config | harness MUST set `schema_version = "3"` and respect every `[agents.defaults]` / `[permissions]` / `[federation]` block. See `src/config.rs`. |
 | federation wire | `ai-memory-mcp` substrate | harness 2-of-N or 4-of-N nodes | `x-peer-id` header REQUIRED on every `/api/v1/sync/push` (#716 substrate cure). v0.7.0 also adds `X-Memory-Sig: ed25519=<base64>` on every outbound POST (#791); receivers MAY require it via `AI_MEMORY_FED_REQUIRE_SIG=1` (default in v0.7.0). |
 | TLS | optional | harness | `TLS_MODE=mtls` requires `/etc/ai-memory-a2a/tls/server.pem`; `TLS_MODE=off` is acceptable for harness-only smoke runs (no real-world peer exposure). |
-| identity | `AI_MEMORY_AGENT_ID` env | harness boot | every harness-spawned `ai-memory` process MUST set a unique `AI_MEMORY_AGENT_ID` (see CLAUDE.md §Agent Identity for the resolution ladder). |
+| identity | `AI_MEMORY_AGENT_ID` env | harness boot | every harness-spawned `ai-memory` process MUST set a unique `AI_MEMORY_AGENT_ID` (see docs/reference/ARCHITECTURE_REFERENCE.md §Agent Identity for the resolution ladder). |
 
 ## v1.0.0 substrate guarantees the harness can rely on
 

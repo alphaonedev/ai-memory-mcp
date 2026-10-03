@@ -9,7 +9,7 @@
 //! body contains exactly the expected number of `.route(` calls in
 //! its production scope plus the expected number of `#[cfg(test)]`
 //! test routes. Any change to the route table requires a matching
-//! bump to the constant so the docs (CLAUDE.md §"Architecture", the
+//! bump to the constant so the docs (docs/reference/ARCHITECTURE_REFERENCE.md §"Architecture", the
 //! release notes, integration docs) and the substrate move in
 //! lockstep.
 //!
