@@ -74,8 +74,10 @@ Since #3354 a ledger-writing command generates that key at boot when it
 is absent ([`ensure_daemon_signing_key`](../src/governance/audit.rs)) and
 refuses to start ([`unsigned_ledger_refusal`](../src/governance/audit.rs))
 when it can neither load nor generate one, so a writer never runs
-keyless. Every process except the key-provisioning verbs ensures the key
-at boot (serve, mcp and sync-daemon are all writers). A read-only, egress or
+keyless (a writer is every command outside the egress, remediation and
+read-only verbs enumerated by `ledger_writer` in `src/main.rs`; serve, mcp
+and sync-daemon are examples). Every process except the key-provisioning
+verbs ensures the key at boot. A read-only, egress or
 remediation verb whose key cannot be ensured runs keyless (it is not
 refused at boot). The state is reported by the `doctor` identity
 facts (`daemon_signing`, `signing`), not by a boot line.
