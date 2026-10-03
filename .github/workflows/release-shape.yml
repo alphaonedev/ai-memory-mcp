@@ -23,7 +23,7 @@
 # context) after the first green run on main. It is not in COVERED_WORKFLOWS of
 # scripts/check-required-contexts.sh and is named by no doc as an enforcing
 # gate (scripts/check-ci-job-claims.sh). The feature declaration itself is
-# enforced separately and BLOCKING by scripts/check-release-features.sh
+# enforced separately and BLOCKING by scripts/check_release_features.py
 # (c8-precheck), and gates release.yml and the Dockerfile.
 
 name: Release-shaped build + PostgreSQL TLS proof (#4480)
@@ -35,6 +35,7 @@ on:
       - ".github/workflows/release.yml"
       - ".github/workflows/release-shape.yml"
       - "scripts/release-features.sh"
+      - "scripts/check_release_features.py"
       - "scripts/release-shape-pg-proof.sh"
       - "scripts/assert-compiled-features.sh"
       - "Cargo.toml"
@@ -72,7 +73,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
       - name: Release feature declaration guard
-        run: bash scripts/check-release-features.sh
+        run: python3 scripts/check_release_features.py
 
       - name: Build release binary (exactly as release.yml)
         shell: bash
