@@ -203,7 +203,7 @@ The 2 v0.8.0 Pillar-1 additions:
 The discriminator strings (snake_case of the variant names via
 `#[serde(rename_all = "snake_case")]`) and the [`HookEvent`](../src/hooks/events.rs)
 enum live in `src/hooks/events.rs`; the canonical wire
-shapes for every event's payload (`MemoryDelta`, `RecallQuery`,
+shapes for every event's payload (`MemoryDelta`, `RecallExpandQuery`,
 `SearchResult`, `ReflectDelta`, `CompactionDelta`, …) start with
 [`MemoryDelta`](../src/hooks/events.rs) after the enum
 and span the rest of the module.
@@ -420,7 +420,7 @@ For deployment sizes:
 | Hook fires but result ignored | Returned `Modify` on a `post_*` event | Check [`is_pre_event`](../src/hooks/decision.rs) — `Modify` is only valid on pre-events. Daemon log carries the rejection reason. |
 | No hook log lines on any write | No `hooks.toml`, or zero matching rows (an empty chain is a silent no-op returning `Allow`) | This is the **expected v0.6.4-equivalent behavior**. Confirms hooks aren't quietly firing. |
 | Recall p95 regressed after enabling hook | Hook is `mode = "exec"` on a hot-path event | Switch to `mode = "daemon"`. If already daemon, reduce `timeout_ms` and inspect helper-binary tracing for the slow path. |
-| `timeout_violations_total` growing | A hook's class deadline tripping | Compare to per-hook `ExecutorMetrics` ([`ExecutorMetrics`](../src/hooks/executor.rs)) to identify the slow hook; widen its `timeout_ms` (cap is 30s) or migrate work off the synchronous path. |
+| `timeout_violations_total` growing | A hook's class deadline tripping | Compare to per-hook [`ExecutorMetrics`](../src/hooks/executor.rs) to identify the slow hook; widen its `timeout_ms` (cap is 30s) or migrate work off the synchronous path. |
 | Daemon-mode hook respawn loop | Helper binary panics on framed stdin | Inspect daemon log for the `hook spawn failed for <command>` error. Fix the helper, redeploy, `SIGHUP`. The chain fails open in the meantime (per `fail_mode = "open"` default). |
 | `mode = "exec"` hook intermittently DENIED under load (or spuriously fails-open) | The helper emits its decision and exits WITHOUT reading stdin, so the executor's envelope write hits `EPIPE` → `ExecutorError::Io` ("an I/O error occurred talking to the hook") | Make the exec helper drain stdin to EOF before writing its decision (`cat >/dev/null` in `sh`, or a `read`-to-EOF loop). See the exec stdin contract in §"Operator workflow". Daemon-mode helpers already read stdin and are unaffected. |
 | Reload didn't pick up new hook | TOML parse error | Look for `hooks: SIGHUP reload failed; keeping previous config` in the log. Validate the file with `cat ~/.config/ai-memory/hooks.toml | toml --check` (or `taplo lint`). |
