@@ -43,8 +43,8 @@
 //   so a missing binary surfaces as an executor error with full
 //   context, not a config-parse error before the daemon boots.
 // * `namespace` — non-empty string. Shape-only check here; the
-//   runtime matcher is `HookConfig::matches_namespace` (exact,
-//   or `prefix/*` glob), so no pattern is parsed at load time.
+//   runtime matcher is `HookConfig::matches_namespace` (`*`,
+//   exact, or `prefix/*` glob), so no pattern is parsed at load.
 // * Parse errors include the failing TOML span (line:col) via
 //   `toml::de::Error::span()` when the underlying error carries
 //   one.
@@ -200,10 +200,10 @@ impl HookConfig {
     /// contrary to explicit scope. This restores the intended semantics.
     ///
     /// Matching (mirrors [`crate::config::TranscriptsConfig::auto_extract_for`]):
-    /// a `*` pattern matches everything (the field is required, so there is no
-    /// schema default; load-time validation rejects empty, and an empty pattern
-    /// still matches all here, defensively), so a config that already uses
-    /// `namespace = "*"` is byte-identical to the pre-fix behaviour. A non-wildcard pattern matches EXACTLY, or as a
+    /// a `*` pattern matches everything (the field is required, so there is no schema
+    /// default; load-time validation rejects empty, and an empty pattern would match
+    /// all anyway), so a config that already uses `namespace = "*"` is byte-identical
+    /// to the pre-fix behaviour. A non-wildcard pattern matches EXACTLY, or as a
     /// `prefix/*` glob (the prefix itself and any child under `prefix/`). A
     /// scoped hook fired against a payload that carries NO namespace (`None` —
     /// eviction / some recall shapes) does NOT fire: the operator scoped it to
@@ -385,11 +385,10 @@ fn validate_hook(idx: usize, h: &HookConfig) -> Result<(), HooksConfigError> {
             reason: "must be a non-empty path".into(),
         });
     }
-    // Shape-only validation: any non-empty string is accepted
-    // here. The runtime matcher, `HookConfig::matches_namespace`
-    // (exact match or `prefix/*` glob), decides at fire time
-    // whether a hook covers a namespace; load does not parse
-    // the pattern.
+    // Shape-only validation: any non-empty string is accepted here. The runtime
+    // matcher, `HookConfig::matches_namespace` (`*`, exact match, or `prefix/*`
+    // glob), decides at fire time whether a hook covers a namespace; load does
+    // not parse the pattern.
     if h.namespace.trim().is_empty() {
         return Err(HooksConfigError::Validation {
             field: format!("hook[{idx}].namespace"),
