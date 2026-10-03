@@ -29,6 +29,7 @@ Usage:
   scripts/check-claude-md-size.py --self-test
 """
 import argparse
+import hashlib
 import os
 import re
 import shutil
@@ -486,6 +487,78 @@ def run_cases(base: Path) -> bool:
     return ok
 
 
+# R2-4: the limits above, restated as literals that do NOT derive from the constants. The cases in
+# run_cases build their fixtures from the constants, so raising CLAUDE_MD_MAX_BYTES or lowering a
+# floor would leave every case green; this table is the second, independent edit a deliberate change
+# must make (and a reviewer must see). Ceilings only fall, floors only rise.
+SELF_TEST_PINNED_LIMITS = {
+    "CLAUDE_MD_MAX_BYTES": 80_000,
+    "CLAUDE_MD_MIN_BYTES": 55_000,
+    "CLAUDE_MD_REQUIRED_HEADINGS_COUNT": 15,
+    # sha256 of the 15 pinned headings joined by newline: rewording or swapping one is a deliberate edit too.
+    "CLAUDE_MD_REQUIRED_HEADINGS_SHA256": "a96178554adeea9c1a96dc35950a8f8d6987c88f6a196c0683a52c725c8f9db4",
+    "REFERENCE_FLOOR ARCHITECTURE_REFERENCE": 300_000,
+    "REFERENCE_FLOOR CODE_STYLE": 45_000,
+    "INDEX_MIN_QUOTE_CHARS": 20,
+    "INDEX_MIN_ENTRIES ARCHITECTURE_REFERENCE": 5,
+    "INDEX_MIN_ENTRIES CODE_STYLE": 7,
+}
+
+
+def current_limits() -> dict:
+    """The limits as the guard will actually enforce them, keyed like SELF_TEST_PINNED_LIMITS."""
+    limits = {
+        "CLAUDE_MD_MAX_BYTES": CLAUDE_MD_MAX_BYTES,
+        "CLAUDE_MD_MIN_BYTES": CLAUDE_MD_MIN_BYTES,
+        "CLAUDE_MD_REQUIRED_HEADINGS_COUNT": len(CLAUDE_MD_REQUIRED_HEADINGS),
+        "CLAUDE_MD_REQUIRED_HEADINGS_SHA256": hashlib.sha256(
+            "\n".join(CLAUDE_MD_REQUIRED_HEADINGS).encode("utf-8")).hexdigest(),
+        "INDEX_MIN_QUOTE_CHARS": INDEX_MIN_QUOTE_CHARS,
+    }
+    for rel, _top, floor in REFERENCE_FILES:
+        limits[f"REFERENCE_FLOOR {Path(rel).stem}"] = floor
+    for _heading, name, minimum in INDEX_SECTIONS:
+        limits[f"INDEX_MIN_ENTRIES {name}"] = minimum
+    return limits
+
+
+def limit_drift(current: dict) -> list:
+    """Return one message per limit that differs from SELF_TEST_PINNED_LIMITS (or is missing/extra)."""
+    drift = []
+    for key, pinned in SELF_TEST_PINNED_LIMITS.items():
+        if current.get(key) != pinned:
+            drift.append(f"FAIL: limit {key} is {current.get(key)!r} but the self-test pins {pinned!r}; "
+                         "a deliberate change must edit SELF_TEST_PINNED_LIMITS as well (#4507)")
+    for key in current:
+        if key not in SELF_TEST_PINNED_LIMITS:
+            drift.append(f"FAIL: limit {key} is not pinned in SELF_TEST_PINNED_LIMITS (#4507)")
+    return drift
+
+
+def run_limit_cases() -> bool:
+    """The independent pins: the real limits match, and each deliberate mutation is refused."""
+    ok = True
+    real = limit_drift(current_limits())
+    if real:
+        print(real[0], file=sys.stderr)
+        ok = False
+    for key in SELF_TEST_PINNED_LIMITS:
+        for delta, label in ((1, "raised"), (-1, "lowered")):
+            mutated = dict(current_limits())
+            if isinstance(mutated[key], str):
+                mutated[key] = mutated[key][:-1] + ("0" if mutated[key][-1] != "0" else "1")
+            else:
+                mutated[key] += delta
+            if not any(key in line for line in limit_drift(mutated)):
+                print(f"FAIL: self-test - limit {key} {label} by one was NOT detected", file=sys.stderr)
+                ok = False
+    removed = {k: v for k, v in current_limits().items() if k != "INDEX_MIN_ENTRIES CODE_STYLE"}
+    if not limit_drift(removed):
+        print("FAIL: self-test - a removed limit was NOT detected", file=sys.stderr)
+        ok = False
+    return ok
+
+
 def self_test() -> int:
     # Scratch lives under <repo>/.local-runs/ (project no-/tmp hard rule), never system /tmp.
     scratch_base = Path(__file__).resolve().parent.parent / ".local-runs"
@@ -493,6 +566,7 @@ def self_test() -> int:
     tmp = tempfile.mkdtemp(prefix="claude-md-size-selftest-", dir=scratch_base)
     try:
         ok = run_cases(Path(tmp))
+        ok &= run_limit_cases()
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     if not ok:
