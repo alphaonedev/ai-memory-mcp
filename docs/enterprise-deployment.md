@@ -1759,11 +1759,15 @@ Six surfaces, each load-bearing for different ops scenarios:
    forensic audit log. Federation emits `tracing::info!` events on the push,
    DLQ-replay, receive and sync paths, not a span per event. The default
    filter is the bare level `info`
-   ([`DEFAULT_LOG_DIRECTIVE`](../src/logging.rs), #3650); do not set
-   `RUST_LOG=ai_memory=info`, a prefix filter that drops the events whose
-   targets sit outside `ai_memory` (`store::postgres`, `signed_events`,
-   `security.posture`, `http::auth` and others). `RUST_LOG=ai_memory=debug`
-   for deep traces.
+   ([`DEFAULT_LOG_DIRECTIVE`](../src/logging.rs), #3650), which is not limited
+   to the `ai_memory` prefix. A `RUST_LOG` directive is added on top of that base:
+   `RUST_LOG=ai_memory=debug` raises the `ai_memory` targets for deep traces
+   and leaves other targets at `info`, and a bare level such as
+   `RUST_LOG=error` replaces the base level. The sinks of the `[logging]`
+   pipeline (file, stdout and syslog) do not read `RUST_LOG`: their filter is
+   `[logging].level` alone (default `info`), so `level = "ai_memory=info"`
+   there has no directive for targets outside `ai_memory` and those events
+   are not written to that sink.
 4. **File logging** — opt-in via `[logging]` in `config.toml`.
    Rotating appender; off by default.
 5. **`ai-memory doctor`** — 10-section health dashboard run locally.
