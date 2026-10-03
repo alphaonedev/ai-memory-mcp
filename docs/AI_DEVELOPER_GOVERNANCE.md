@@ -880,7 +880,7 @@ their own context. Their use is governed:
 
 | Tier | Allowed contents | Examples |
 |------|------------------|----------|
-| `short` | Per-session debugging, transient task state | "Currently editing src/db.rs:312 to fix overflow" |
+| `short` | Per-session debugging, transient task state | "Currently fixing the overflow in the recall scorer" |
 | `mid` | Working knowledge for the current sprint or PR | "Plan for Sensitive PR #189" |
 | `long` | Permanent project knowledge — architecture, decisions, hard-won lessons, user preferences and corrections | "User prefers parameterized SQL with `params![]`" |
 
