@@ -214,10 +214,17 @@ write_files:
 
       # --- db + role + extensions (idempotent). The role password is read
       # from the store-url file and reaches psql on stdin, never on an argv.
+      # The DSN userinfo is percent-encoded (a password containing @ : / ? # %
+      # must be written %40 etc. in the DSN, #4638/#4642): it is decoded here the
+      # way the daemon's URL parser decodes it, and any single quote is doubled
+      # for the SQL literal. psql runs with ON_ERROR_STOP so a failed statement
+      # stops the script instead of falling through to CREATE DATABASE.
       DB_PASS="$(sed -n 's#^postgres://aimemory:\([^@]*\)@.*#\1#p' /etc/ai-memory/store-url)"
       [ -n "$DB_PASS" ] || { echo "no db password in /etc/ai-memory/store-url"; exit 1; }
       sudo -u postgres psql -tc "SELECT 1 FROM pg_roles WHERE rolname='aimemory'" | grep -q 1 || \
-        printf "CREATE USER aimemory WITH PASSWORD '%s';\n" "$DB_PASS" | sudo -u postgres psql
+        printf '%s' "$DB_PASS" \
+          | python3 -c 'import sys,urllib.parse as u;p=u.unquote(sys.stdin.read());q=chr(39);print("CREATE USER aimemory WITH PASSWORD "+q+p.replace(q,q+q)+q+";")' \
+          | sudo -u postgres psql -v ON_ERROR_STOP=1
       sudo -u postgres psql -tc "SELECT 1 FROM pg_database WHERE datname='aimemory'" | grep -q 1 || \
         sudo -u postgres psql -c "CREATE DATABASE aimemory OWNER aimemory;"
       sudo -u postgres psql -d aimemory -c "CREATE EXTENSION IF NOT EXISTS vector;"
