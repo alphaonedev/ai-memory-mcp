@@ -559,14 +559,66 @@ def run_limit_cases() -> bool:
     return ok
 
 
+def scratch_base_error(repo_root: Path):
+    """Return a failure message when `<repo_root>/.local-runs` is a symlink (or not a directory), else None.
+
+    The self-test writes and then deletes a fixture tree there; through a symlink that would write
+    outside the checkout (possibly onto /tmp or a tmpfs, which the project forbids) and delete there.
+    """
+    base = repo_root / ".local-runs"
+    try:
+        mode = os.lstat(base).st_mode
+    except FileNotFoundError:
+        return None  # will be created as a real directory
+    except OSError as exc:
+        return f"FAIL: cannot stat {base}: {exc}"
+    if stat.S_ISLNK(mode):
+        return f"FAIL: {base} is a symlink; the self-test refuses to write its fixtures through it (#4507)"
+    if not stat.S_ISDIR(mode):
+        return f"FAIL: {base} is not a directory (#4507)"
+    return None
+
+
+def run_scratch_cases(scratch_base: Path) -> bool:
+    """A symlinked or non-directory .local-runs is refused; a real or absent one is accepted."""
+    ok = True
+    probe = scratch_base / "scratch-probe"
+    probe.mkdir()
+    (probe / "elsewhere").mkdir()
+    (probe / ".local-runs").symlink_to(probe / "elsewhere")
+    if "symlink" not in (scratch_base_error(probe) or ""):
+        print("FAIL: self-test - a symlinked .local-runs was NOT refused", file=sys.stderr)
+        ok = False
+    (probe / ".local-runs").unlink()
+    (probe / ".local-runs").write_text("file", encoding="utf-8")
+    if "not a directory" not in (scratch_base_error(probe) or ""):
+        print("FAIL: self-test - a .local-runs that is a file was NOT refused", file=sys.stderr)
+        ok = False
+    (probe / ".local-runs").unlink()
+    if scratch_base_error(probe) is not None:
+        print("FAIL: self-test - an absent .local-runs was refused", file=sys.stderr)
+        ok = False
+    (probe / ".local-runs").mkdir()
+    if scratch_base_error(probe) is not None:
+        print("FAIL: self-test - a real .local-runs directory was refused", file=sys.stderr)
+        ok = False
+    return ok
+
+
 def self_test() -> int:
     # Scratch lives under <repo>/.local-runs/ (project no-/tmp hard rule), never system /tmp.
-    scratch_base = Path(__file__).resolve().parent.parent / ".local-runs"
+    repo_root = Path(__file__).resolve().parent.parent
+    refusal = scratch_base_error(repo_root)
+    if refusal:
+        print(refusal, file=sys.stderr)
+        return 1
+    scratch_base = repo_root / ".local-runs"
     scratch_base.mkdir(parents=True, exist_ok=True)
     tmp = tempfile.mkdtemp(prefix="claude-md-size-selftest-", dir=scratch_base)
     try:
         ok = run_cases(Path(tmp))
         ok &= run_limit_cases()
+        ok &= run_scratch_cases(Path(tmp))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     if not ok:
