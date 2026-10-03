@@ -49,8 +49,11 @@ A keepalive comment line fires every 15s
 intermediary timeouts. The stream is intentionally not HMAC-signed:
 beyond `api_key_auth` middleware it carries only the per-agent-key identity
 gate at stream open ([`enforce_idor_identity`](../src/handlers/identity_binding.rs),
-#2154; refuses a merely self-asserted named principal with
-`403 attested_identity_required` under `enforce`, inert otherwise) — SSE re-key handshakes are clunky,
+#2154). That gate refuses a merely self-asserted named principal with
+`403 attested_identity_required` only under `enforce` AND once at least
+one per-agent key is enrolled; with zero enrolled keys it is inert in every
+mode, `enforce` included ([`enforce_for_request`](../src/handlers/identity_binding.rs),
+#1985, #3155) — SSE re-key handshakes are clunky,
 and the HMAC gate sits on the **write** side (the decide endpoint),
 not the read side.
 
