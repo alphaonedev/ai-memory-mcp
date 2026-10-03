@@ -35,7 +35,7 @@ bootcmd:
   - [bash, -c, "[ -d /etc/ai-memory ] || (umask 077 && mkdir /etc/ai-memory)"]
   # PG 18 is supplied by PGDG on Ubuntu Noble. Install the signed repository
   # before cloud-init's packages module runs; never fall back to Ubuntu's PG16.
-  - [bash, -c, "install -d -m 0755 /usr/share/postgresql-common/pgdg && curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc"]
+  - [bash, -c, "install -d -m 0755 /usr/share/postgresql-common/pgdg && curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc && echo '0144068502a1eddd2a0280ede10ef607d1ec592ce819940991203941564e8e76  /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc' | sha256sum -c - || { rm -f /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc; exit 1; }"]
   - [bash, -c, "echo 'deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt noble-pgdg main' > /etc/apt/sources.list.d/pgdg.list && apt-get update"]
 packages:
   - postgresql-18=18.6-1.pgdg24.04+2
@@ -58,7 +58,8 @@ write_files:
   # is what keeps other UIDs out during it. The provision script hands the file
   # to the aimemory user once that user exists (serve refuses a file with any
   # group/world mode bit, src/store_url.rs). CHANGEME is the database password:
-  # replace it before real use. The provision script reads the role password
+  # replace it before real use; the provision script refuses to run with the
+  # placeholder (#4788, until #4610 generates the password on the node). The provision script reads the role password
   # from this one file, so there is no second copy to keep in step.
   - path: /etc/ai-memory/store-url
     permissions: '0600'
@@ -246,6 +247,7 @@ write_files:
       # stops the script instead of falling through to CREATE DATABASE.
       DB_PASS="$(sed -n 's#^postgres://aimemory:\([^@]*\)@.*#\1#p' /etc/ai-memory/store-url)"
       [ -n "$DB_PASS" ] || { echo "no db password in /etc/ai-memory/store-url"; exit 1; }
+      [ "$DB_PASS" != CHANGEME ] || { echo "placeholder db password in /etc/ai-memory/store-url"; exit 1; }
       sudo -u postgres psql -tc "SELECT 1 FROM pg_roles WHERE rolname='aimemory'" | grep -q 1 || \
         printf '%s' "$DB_PASS" \
           | python3 -c 'import sys,urllib.parse as u;p=u.unquote(sys.stdin.read());q=chr(39);print("CREATE USER aimemory WITH PASSWORD "+q+p.replace(q,q+q)+q+";")' \
