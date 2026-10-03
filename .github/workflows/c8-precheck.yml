@@ -1331,8 +1331,8 @@ jobs:
     #     scripts/qc-allowlists/cloud-init-token-allow.txt; malformed,
     #     stale entries fail; approved lines must keep the allowlist order
     #     and count (#4784); an empty scan fails closed.
-    #     Known do-hive defects sit in cloud-init-token-pending.txt (#4671,
-    #     #4712): listed, never approved.
+    #     Known defects sit in cloud-init-token-pending.txt (do-hive #4671,
+    #     #4712; aws-gpu-burst #4610): listed, never approved.
     #   - Companion rule (also heredoc bodies and unit Exec lines): no eval,
     #     decoder-into-shell, ANSI-C quoting, glob, $ or command substitution
     #     in command position.
