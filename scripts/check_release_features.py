@@ -11,36 +11,70 @@ and a check that the build, the assertion, the SBOM, the image, the proof job
 and the docs all follow it, and that a BROKEN declaration fails the build
 instead of silently degrading it.
 
-This is the Python port of scripts/check-release-features.sh (operator rule: no
-new shell). It fixes the four forms the shell guard accepted (#4719):
-
-  (a) ``FEATURES=...`` reassigned between the declaration and the build;
-  (b) the same inside the Dockerfile RUN;
-  (c) ``--locked`` present only in a trailing comment on the build line;
-  (d) ``--no-default-features`` (or ``--all-features`` / a literal feature list).
-
-DESIGN: AN ALLOWLIST, NOT A DENYLIST. Two review rounds showed that a list of
-bad bash statements is open-ended: the guard reads lines, bash reads a grammar
-(heredocs, functions, aliases, ``hash``, ``exec``, ``PATH``, ``cd``, quoted
-blocks, a folded YAML scalar...). So the units that decide what ships are
-compared to their EXACT expected text, after normalising only whitespace and
-``\\`` line continuation, and anything else is refused:
+DESIGN: AN ALLOWLIST OF TEXT *AND* OF POSITION. The units that decide what
+ships are compared to their EXACT expected text, after normalising only
+spaces/tabs and ``\\`` line continuation; anything else is refused:
 
   * the release.yml build step, the strict-assert step, the SBOM step and the
     release-shape build step (statement lists, below);
   * the Dockerfile builder ``RUN`` (one instruction string).
 
+Pinning the text alone is not enough: a unit can be copied into a position
+that never runs (a YAML block scalar, a dead Docker stage, a decoy job) while
+the unit that does run is changed, or the values GitHub substitutes into the
+pinned text (``${{ matrix.* }}``) can carry shell. So the guard also pins WHERE
+each unit is and WHAT is substituted into it:
+
+  * Workflows are read with a strict, fail-closed YAML SUBSET parser (stdlib
+    only, no PyYAML). It accepts ``key:``, ``key: value`` (a one-line plain,
+    quoted or flow-sequence value), ``key: |`` / ``|-`` / ``>`` / ``>-`` and
+    ``- `` sequence items whose first key sits exactly two columns after the
+    dash, with ONE indentation per mapping. It refuses every line it cannot
+    explain: tabs, a line more indented than its mapping or sequence (a
+    multi-line scalar or a stray key), quoted or complex keys, duplicate keys,
+    anchors, aliases, tags, flow mappings, multi-line quoted scalars, block
+    indentation indicators. A block scalar is allowed ONLY as a step ``run:``
+    or a step ``with:`` value, so ``name: |`` cannot hide steps.
+  * The units are located structurally: top-level ``jobs:`` -> ``release:`` ->
+    its ``steps:`` list (build, then strict assert, exactly one of each),
+    ``jobs:`` -> ``sbom:`` -> ``steps:`` (exactly one SBOM step; a second
+    ``cargo ... cyclonedx`` anywhere in release.yml is refused), and the
+    release-shape ``jobs:`` -> ``release-shape:`` -> ``steps:``.
+  * The release job SKELETON is pinned: its key set is exactly ``JOB_KEYS``,
+    ``runs-on`` is exactly ``${{ matrix.os }}``, and ``strategy`` is exactly
+    ``fail-fast: false`` plus ``matrix: include:`` entries whose keys are
+    ``target``/``os``/``artifact`` (+ ``nfpm_arch``) and whose values are
+    unquoted literals matching a strict pattern (no expression, quote, space or
+    shell metacharacter: they are substituted into the pinned build and assert
+    text before bash runs). The target set itself is pinned (``RELEASE_TARGETS``):
+    a legitimate matrix change updates that constant in the same commit. This
+    pin is deliberate: an exact skeleton is cheaper to keep correct than an
+    open-ended list of job keys that can skip, redirect or neutralise the
+    assert (``if:``, ``env:``, ``defaults:``, ``container:``,
+    ``continue-on-error:``...). A pinned step ``name:`` must not carry ``${{``.
+  * In the release job no step other than the canonical build may mention
+    ``cargo``, ``rustc``, ``cross`` or ``cargo-zigbuild`` (any case, any option
+    order, any ``+toolchain``), and in the whole of release.yml at most one
+    line runs one of them against ``matrix.target``. This is a REFUSAL, not
+    tracking: it does not prove the uploaded file is the asserted one (#4752).
+  * Dockerfile: line 1 must be exactly ``# syntax=docker/dockerfile:1`` and no
+    other parser directive (``escape``, ``check``, a second ``syntax``) may
+    appear anywhere; heredocs (``<<``), ``SHELL``, ``ONBUILD`` and unknown
+    instructions are refused. Stages are parsed: the final stage must COPY the
+    binary exactly once, from a NAMED earlier stage, and take nothing else
+    ``--from`` another stage or image; that stage (the builder) must not start
+    FROM another stage nor COPY ``--from``, must COPY Cargo.lock, and must end
+    with exactly the declaration COPY followed by the canonical RUN. ``cargo``
+    anywhere else in the Dockerfile is refused. The docker job must not pass a
+    ``target:`` or ``file:`` to docker/build-push-action (that would ship
+    another stage or file).
+
 Whole-line comments are dropped; a trailing ``#`` is NOT trusted (the statement
-then differs from the allowed one and is refused). Those steps may carry only the
-keys ``name``, ``shell: bash`` (not the SBOM) and ``run: |``: ``env:``,
-``working-directory:``, ``if:``, ``continue-on-error:`` and a folded ``>`` or
-quoted ``run`` are refused. The strict assert must sit in the SAME job as the
-matrix build, after it; that job may carry only a fixed set of keys, so it has
-no ``if:`` that can be false, no ``env:``, no ``defaults:``, no ``container:``.
-``BASH_ENV`` is refused anywhere in release.yml and the Dockerfile; a Dockerfile
-``SHELL`` instruction is refused; control characters (CR, form feed, NUL...) in
-the workflow or Dockerfile are refused because Python and bash disagree on what
-a line is.
+then differs from the allowed one and is refused). ``BASH_ENV`` is refused
+anywhere in release.yml and the Dockerfile. Control characters (CR, form feed,
+NUL...), NBSP and every other Unicode space or zero-width character in the
+workflows or Dockerfile are refused, never folded: Python, YAML and bash
+disagree on what a line and a blank are.
 
 OUT OF SCOPE (tracked): the shipped file differing from the asserted one
 (#4752), another step or Dockerfile instruction poisoning the environment or
@@ -67,7 +101,7 @@ import sys
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple, Union
+from typing import Callable, Dict, Iterator, List, Optional, Tuple, Union
 
 HERE = Path(__file__).resolve().parent
 
@@ -106,18 +140,62 @@ DOCKER_RUN = (
     + "strip target/release/ai-memory; "
     + ASSERT_DOCKER
 )
+DOCKER_SYNTAX = "# syntax=docker/dockerfile:1"
+DOCKER_DECL_COPY = "COPY scripts/release-features.sh scripts/release-features.sh"
+DOCKER_LOCK_COPY = "COPY Cargo.toml Cargo.lock ./"
+DOCKER_INSTRUCTIONS = frozenset((
+    "FROM", "RUN", "CMD", "LABEL", "EXPOSE", "ENV", "ADD", "COPY", "ENTRYPOINT",
+    "VOLUME", "USER", "WORKDIR", "ARG", "STOPSIGNAL", "HEALTHCHECK",
+))
+
 KEYS_SHELL = ("name", "shell", "run")
 KEYS_PLAIN = ("name", "run")
 TOP_KEYS = ("name", "on", "permissions", "concurrency", "jobs")
 JOB_KEYS = ("name", "needs", "runs-on", "permissions", "strategy", "steps")
+SBOM_JOB_KEYS = ("name", "needs", "runs-on", "permissions", "steps")
+RELEASE_RUNS_ON = "${{ matrix.os }}"
+# The release matrix. Every value is substituted textually into the pinned
+# build / assert units before bash runs, so each one is a strict literal.
+RELEASE_TARGETS = (
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+)
+MATRIX_REQUIRED = ("target", "os", "artifact")
+MATRIX_VALUE_RE = {
+    "target": re.compile(r"[a-z0-9_]+(?:-[a-z0-9_]+){2,3}"),
+    "os": re.compile(r"[a-z0-9]+(?:[.-][a-z0-9]+)*"),
+    "artifact": re.compile(r"ai-memory"),
+    "nfpm_arch": re.compile(r"[a-z0-9_]+"),
+}
 
-CARGO_BUILD_RE = re.compile(r"\bcargo(?:\s+\+\S+)?\s+build\b")
+# A build tool word: any case (macOS runners resolve `CARGO` on a case-insensitive
+# file system), not part of a longer word, option or file name (`Cargo.toml`).
+BUILD_TOOL_RE = re.compile(r"(?<![\w.-])(?:cargo-zigbuild|cargo|rustc|cross)(?![\w.-])", re.I)
+SBOM_TOOL_RE = re.compile(r"(?<![\w-])cargo(?![\w-]).*?\scyclonedx(?![\w-])", re.I)
 INLINE_USE_RE = re.compile(r"\$\(\s*bash [^)]*release-features\.sh|`\s*bash [^`]*release-features\.sh")
-PLAIN_KEY_RE = re.compile(r"^(?P<ind> *)(?P<key>[A-Za-z_][A-Za-z0-9_-]*):(?: +(?P<val>.*))?$")
-CONTROL_RE = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f  ]")
-SHELL_INSTR_RE = re.compile(r"^(?:ONBUILD\s+)?SHELL\b", re.I)
-STEP_ITEM_PREFIX = "      - "
-STEP_KEY_INDENT = len(STEP_ITEM_PREFIX)
+# C0/C1 controls (tab excepted: the YAML parser refuses it itself), every Unicode
+# space other than U+0020 (NBSP, ogham, en/em..., narrow NBSP, math space,
+# ideographic), zero-width characters and the BOM, line/paragraph separators.
+CONTROL_RE = re.compile(
+    "[\x00-\x08\x0b-\x1f\x7f-\x9f\u00a0\u1680\u180e\u2000-\u200f\u2028-\u202f\u205f-\u2064\u3000\ufeff]"
+)
+KEY_RE = re.compile(r"(?P<key>[A-Za-z_][A-Za-z0-9_-]*):(?: +(?P<val>.*))?")
+ITEM_RE = re.compile(r"-(?P<sp> *)(?P<rest>.*)")
+BLOCK_INDICATORS = ("|", "|-", ">", ">-")
+_TAIL = r"(?:[ ]+#.*)?"
+_FLOW_ITEM = r"(?:\"[^\"\\]*\"|'[^']*'|[^\s\[\]{},'\"#&*!|>%@`][^\[\]{},#]*?)"
+SCALAR_FORMS = (
+    ("double", re.compile(r'(?P<v>"(?:[^"\\]|\\.)*")' + _TAIL)),
+    ("single", re.compile(r"(?P<v>'(?:[^']|'')*')" + _TAIL)),
+    ("flow", re.compile(r"(?P<v>\[ *(?:" + _FLOW_ITEM + r"(?: *, *" + _FLOW_ITEM + r")*)? *\])" + _TAIL)),
+    ("plain", re.compile(r"(?P<v>(?:[^\s&*!{}\[\]|>%@`#,'\"?:-]|[-?:](?=\S))(?:(?!: |:$| #).)*?)" + _TAIL)),
+)
+FROM_RE = re.compile(r"FROM(?: --platform=\S+)? (?P<image>\S+)(?: AS (?P<name>[A-Za-z][A-Za-z0-9_.-]*))?", re.I)
+BINARY_COPY_RE = re.compile(r"COPY --from=(?P<stage>\S+) /build/target/release/ai-memory /usr/local/bin/ai-memory")
+FROM_FLAG_RE = re.compile(r"--from=(?P<src>\S+)", re.I)
+DIRECTIVE_RE = re.compile(r"^[ \t]*#[ \t]*(?:syntax|escape|check)[ \t]*=", re.I)
 
 
 # ------------------------------------------------------------ text helpers --
@@ -151,28 +229,30 @@ def indent_of(line: str) -> int:
 
 
 def is_blank_or_comment(line: str) -> bool:
-    s = line.strip()
+    s = line.strip(" \t")
     return not s or s.startswith("#")
 
 
 def logical_lines(lines: List[str]) -> List[str]:
     """Normalise to logical lines: whole-line comments and blanks dropped, ``\\``
-    continuations joined, whitespace collapsed. NOTHING else is interpreted: a
-    trailing ``#`` stays in the line, and a comment line inside a continuation is
-    kept (bash ends the command there), so extra text can only add refusals."""
+    continuations joined, runs of spaces/tabs collapsed (ONLY spaces and tabs:
+    any other Unicode space is refused by CONTROL_RE, never folded). NOTHING
+    else is interpreted: a trailing ``#`` stays in the line, and a comment line
+    inside a continuation is kept (bash ends the command there), so extra text
+    can only add refusals."""
     out: List[str] = []
     buf = ""
     for raw in lines:
-        line = raw.strip()
+        line = raw.strip(" \t")
         if not buf and (not line or line.startswith("#")):
             continue
         if line.endswith("\\"):
-            buf += line[:-1].rstrip() + " "
+            buf += line[:-1].rstrip(" \t") + " "
             continue
-        out.append(re.sub(r"\s+", " ", buf + line).strip())
+        out.append(re.sub(r"[ \t]+", " ", buf + line).strip(" "))
         buf = ""
-    if buf.strip():
-        out.append(re.sub(r"\s+", " ", buf).strip())
+    if buf.strip(" \t"):
+        out.append(re.sub(r"[ \t]+", " ", buf).strip(" "))
     return out
 
 
@@ -180,6 +260,15 @@ def code_lines(text: str) -> str:
     """PRESENCE view of a file: whole-line comments dropped, trailing comments
     stripped."""
     return "\n".join(strip_comment(ln) for ln in text.split("\n") if not is_blank_or_comment(ln))
+
+
+def first_diff(got: Tuple[str, ...], want: Tuple[str, ...]) -> str:
+    """Name the first statement where ``got`` and ``want`` differ."""
+    n = max(len(got), len(want))
+    first = next((i for i in range(n) if i >= len(got) or i >= len(want) or got[i] != want[i]), 0)
+    have = got[first] if first < len(got) else "<end of unit>"
+    exp = want[first] if first < len(want) else "<end of unit>"
+    return f"statement {first + 1} is `{have[:90]}`, the only allowed one is `{exp[:90]}`"
 
 
 # ------------------------------------------------------------------ report --
@@ -190,6 +279,9 @@ class Report:
     def bad(self, msg: str) -> None:
         self.errors.append(msg)
 
+    def first(self) -> str:
+        return self.errors[0] if self.errors else ""
+
 
 class InputError(Exception):
     """An input file could not be read or decoded: exit 2, never a traceback."""
@@ -198,7 +290,7 @@ class InputError(Exception):
 def load(path: Path, label: str, rep: Report, strict: bool) -> Optional[str]:
     """Read one input. Missing = a guard failure (None). Anything else that stops
     a read (non-UTF-8, a directory, a symlink loop, no permission) = InputError,
-    exit 2. ``strict`` refuses control characters (CR, form feed, NUL, ...)."""
+    exit 2. ``strict`` refuses control characters and non-ASCII spaces."""
     try:
         text = path.read_bytes().decode("utf-8")  # bytes: text mode would fold CR away
     except FileNotFoundError:
@@ -206,132 +298,302 @@ def load(path: Path, label: str, rep: Report, strict: bool) -> Optional[str]:
         return None
     except (OSError, ValueError) as exc:
         raise InputError(f"cannot read {label}: {exc}") from exc
-    if strict and CONTROL_RE.search(text):
-        rep.bad(f"{label} contains a control character (CR, form feed, NUL...): Python and bash disagree on line ends")
-        return None
+    if strict:
+        m = CONTROL_RE.search(text)
+        if m:
+            line = text.count("\n", 0, m.start()) + 1
+            rep.bad(f"{label}: line {line}: control character or non-ASCII space U+{ord(m.group(0)):04X} "
+                    "(Python, YAML and bash disagree on line ends and blanks; refused, never folded)")
+            return None
     return text
 
 
-# ------------------------------------------------------- YAML step grammar --
-def block_after(lines: List[str], idx: int) -> List[str]:
-    """The lines nested under ``lines[idx]`` (more indented than it)."""
-    base = indent_of(lines[idx])
-    out: List[str] = []
-    for ln in lines[idx + 1 :]:
-        if not is_blank_or_comment(ln) and indent_of(ln) <= base:
-            break
-        out.append(ln)
-    return out
+# --------------------------------------------------------- YAML subset ----
+class YamlError(Exception):
+    """A line outside the subset grammar."""
 
 
-def keys_at(lines: List[str], indent: int, allowed: Tuple[str, ...], label: str, rep: Report) -> None:
-    """Every mapping key at ``indent`` is a plain key, allowed, and unique."""
-    seen: List[str] = []
-    for ln in lines:
-        if is_blank_or_comment(ln) or indent_of(ln) != indent:
-            continue
-        m = PLAIN_KEY_RE.match(ln)
-        if m is None:
-            rep.bad(f"{label}: unsupported line at indent {indent}: {ln.strip()[:60]}")
-            continue
-        key = m.group("key")
-        if key not in allowed:
-            rep.bad(f"{label}: `{key}:` is not allowed here (allowed: {', '.join(allowed)})")
-        if key in seen:
-            rep.bad(f"{label}: duplicate key `{key}:`")
-        seen.append(key)
+class Node:
+    """One node of the subset grammar. ``kind`` is map | seq | scalar | block |
+    null; ``value`` is a dict (map), a list of nodes (seq), the text (scalar)
+    or the content lines (block); ``style`` is the scalar style or the block
+    indicator; ``line`` is the 0-based source line."""
+
+    def __init__(self, kind: str, line: int, value: object, style: str = "") -> None:
+        self.kind = kind
+        self.line = line
+        self.value = value
+        self.style = style
+
+    def get(self, key: str) -> Optional["Node"]:
+        if self.kind != "map" or not isinstance(self.value, dict):
+            return None
+        return self.value.get(key)
+
+    def keys(self) -> List[str]:
+        return list(self.value) if self.kind == "map" and isinstance(self.value, dict) else []
+
+    def text(self) -> str:
+        return self.value if self.kind == "scalar" and isinstance(self.value, str) else ""
 
 
-def split_steps(lines: List[str]) -> List[List[str]]:
-    """Group lines into workflow steps (``      - ...`` items); a step ends at the
-    next item or at a live line indented less than its keys."""
-    steps: List[List[str]] = []
-    cur: Optional[List[str]] = None
-    for ln in lines:
-        if ln.startswith(STEP_ITEM_PREFIX):
-            cur = [ln]
-            steps.append(cur)
-            continue
-        if cur is None:
-            continue
-        if not is_blank_or_comment(ln) and indent_of(ln) < STEP_KEY_INDENT:
-            cur = None
-            continue
-        cur.append(ln)
-    return steps
+class YamlSubset:
+    """Strict line parser; ``bad`` raises, so the first unexplained line stops
+    the parse. (Each refusal is followed by a fallback that only a mutant with
+    ``bad`` neutralised reaches: it lets ``--mutation-sweep`` prove the case.)"""
 
+    def __init__(self, text: str, label: str) -> None:
+        self.lines = text.split("\n")
+        self.label = label
+        self.i = 0
 
-def parse_step(step: List[str]) -> Tuple[Dict[str, str], List[str], str]:
-    """Parse one step as ``key: value`` lines plus one ``run: |`` literal block.
-    Anything it does not understand is refused (flow style, anchors, quoted keys,
-    folded blocks, inconsistent indentation, duplicate keys): the third item
-    returned is the reason, "" when the whole step parsed."""
-    keys: Dict[str, str] = {}
-    run: List[str] = []
-    in_block = False
-    block_indent = -1
-    for n, raw in enumerate(step):
-        line = " " * STEP_KEY_INDENT + raw[len(STEP_ITEM_PREFIX) :] if n == 0 else raw
-        if in_block:
-            if not line.strip():
-                run.append("")
+    def bad(self, n: int, msg: str) -> None:
+        raise YamlError(f"{self.label}: line {n + 1}: {msg}")
+
+    def peek(self) -> Optional[int]:
+        j = self.i
+        while j < len(self.lines) and is_blank_or_comment(self.lines[j]):
+            j += 1
+        return j if j < len(self.lines) else None
+
+    def parse(self) -> Node:
+        for n, ln in enumerate(self.lines):
+            if "\t" in ln:
+                self.bad(n, "tab character (refused everywhere: YAML forbids it in indentation and bash reads it as a blank)")
+        return self.parse_map(0)
+
+    def parse_map(self, ind: int) -> Node:
+        node = Node("map", self.i, {})
+        mapping: Dict[str, Node] = {}
+        node.value = mapping
+        while True:
+            j = self.peek()
+            if j is None:
+                break
+            line = self.lines[j]
+            li = indent_of(line)
+            if li < ind:
+                break
+            if li > ind:
+                self.bad(j, f"line is more indented than its mapping (indent {li}, mapping keys at {ind}: a multi-line "
+                            f"scalar or a stray key): {line.strip(' ')[:60]}")
+                self.i = j + 1
                 continue
-            ind = indent_of(line)
-            if ind > STEP_KEY_INDENT:
-                if block_indent < 0:
-                    block_indent = ind
-                if ind < block_indent:
-                    return keys, run, "the run block has inconsistent indentation"
-                run.append(line.strip())
+            m = KEY_RE.fullmatch(line[li:])
+            if m is None:
+                self.bad(j, f"line outside the subset grammar (quoted or complex key, flow mapping, document marker...): "
+                            f"{line.strip(' ')[:60]}")
+                self.i = j + 1
                 continue
-            in_block = False
-        if is_blank_or_comment(line):
+            key = m.group("key")
+            self.i = j + 1
+            child = self.parse_value(j, ind, m.group("val") or "")
+            if key in mapping:
+                self.bad(j, f"duplicate key `{key}:`")
+                continue
+            mapping[key] = child
+        return node
+
+    def parse_value(self, j: int, ind: int, val: str) -> Node:
+        if val.startswith("#"):
+            val = ""
+        if val == "":
+            k = self.peek()
+            if k is not None and indent_of(self.lines[k]) > ind:
+                ci = indent_of(self.lines[k])
+                if self.lines[k][ci:].startswith("-"):
+                    return self.parse_seq(ci)
+                return self.parse_map(ci)
+            return Node("null", j, None)
+        if val in BLOCK_INDICATORS:
+            return self.parse_block(j, ind, val)
+        return self.scalar(j, val)
+
+    def scalar(self, j: int, val: str) -> Node:
+        for style, rx in SCALAR_FORMS:
+            m = rx.fullmatch(val)
+            if m is not None:
+                return Node("scalar", j, m.group("v") if style == "plain" else m.group("v")[1:-1], style)
+        self.bad(j, f"value outside the subset grammar (multi-line or unterminated quote, anchor, alias, tag, flow "
+                    f"mapping, block indentation indicator, `: ` in a plain value...): {val[:60]}")
+        return Node("scalar", j, val, "plain")
+
+    def parse_block(self, j: int, ind: int, indicator: str) -> Node:
+        content: List[str] = []
+        cind = -1
+        k = j + 1
+        while k < len(self.lines):
+            raw = self.lines[k]
+            if not raw.strip(" "):
+                content.append("")
+                k += 1
+                continue
+            ri = indent_of(raw)
+            if ri <= ind:
+                break
+            if cind < 0:
+                cind = ri
+            if ri < cind:
+                self.bad(k, f"block scalar line less indented ({ri}) than its first line ({cind})")
+                content.append(raw.strip(" "))
+                k += 1
+                continue
+            content.append(raw[cind:])
+            k += 1
+        self.i = k
+        while content and content[-1] == "":
+            content.pop()
+        return Node("block", j, content, indicator)
+
+    def parse_seq(self, s: int) -> Node:
+        items: List[Node] = []
+        node = Node("seq", self.i, items)
+        while True:
+            j = self.peek()
+            if j is None:
+                break
+            line = self.lines[j]
+            li = indent_of(line)
+            if li < s:
+                break
+            if li > s:
+                self.bad(j, f"line is more indented than its sequence (indent {li}, items at {s}): {line.strip(' ')[:60]}")
+                self.i = j + 1
+                continue
+            m = ITEM_RE.fullmatch(line[li:])
+            if m is None or m.group("sp") != " " or not m.group("rest"):
+                self.bad(j, f"sequence line outside the subset grammar (`- ` takes exactly one space and a value on "
+                            f"the same line): {line.strip(' ')[:60]}")
+                if m is None:
+                    self.i = j + 1
+                    continue
+            rest = m.group("rest").lstrip(" ")
+            if KEY_RE.fullmatch(rest):
+                self.lines[j] = " " * (s + 2) + rest
+                self.i = j
+                items.append(self.parse_map(s + 2))
+            else:
+                self.i = j + 1
+                items.append(self.scalar(j, rest) if rest else Node("null", j, None))
+        return node
+
+
+def parse_yaml(text: str, label: str, rep: Report) -> Optional[Node]:
+    try:
+        return YamlSubset(text, label).parse()
+    except YamlError as exc:
+        rep.bad(str(exc))
+        return None
+
+
+def walk(node: Node, path: Tuple[str, ...] = ()) -> Iterator[Tuple[Tuple[str, ...], Node]]:
+    yield path, node
+    if node.kind == "map" and isinstance(node.value, dict):
+        for k, v in node.value.items():
+            yield from walk(v, path + (k,))
+    elif node.kind == "seq" and isinstance(node.value, list):
+        for n, v in enumerate(node.value):
+            yield from walk(v, path + (str(n),))
+
+
+def check_blocks(doc: Node, label: str, rep: Report) -> None:
+    """A block scalar is allowed only as a step ``run:`` or a step ``with:`` value."""
+    for path, node in walk(doc):
+        if node.kind != "block":
             continue
-        m = PLAIN_KEY_RE.match(line)
-        if m is None or len(m.group("ind")) != STEP_KEY_INDENT:
-            return keys, run, f"unsupported step line: {line.strip()[:60]}"
-        key = m.group("key")
-        if key in keys:
-            return keys, run, f"duplicate step key `{key}:`"
-        keys[key] = m.group("val") or ""
-        if key == "run" and keys[key] == "|":
-            in_block = True
-            block_indent = -1
-    return keys, run, ""
+        in_step = len(path) >= 5 and path[0] == "jobs" and path[2] == "steps"
+        if in_step and ((len(path) == 5 and path[4] == "run") or (len(path) == 6 and path[4] == "with")):
+            continue
+        rep.bad(f"{label}: line {node.line + 1}: a block scalar (`|`/`>`) at `{'.'.join(path)}`; only a step `run:` "
+                "or a step `with:` value may be one")
 
 
-def step_problem(step: List[str], want_keys: Tuple[str, ...], expected: Tuple[str, ...]) -> str:
-    """Why ``step`` is not the allowed one ("" when it is exactly the allowed one)."""
-    keys, run, why = parse_step(step)
-    if why:
-        return why
-    if set(keys) != set(want_keys):
-        return f"step keys {sorted(keys)} differ from the only allowed set {sorted(want_keys)}"
-    if keys["run"] != "|":
-        return "`run:` must be a literal block (`run: |`); a folded, quoted or inline run is refused"
-    if "shell" in want_keys and keys["shell"] != "bash":
-        return f"`shell: {keys['shell']}` (only `shell: bash` is allowed)"
-    got = tuple(logical_lines(run))
-    if got == expected:
-        return ""
-    first = next((i for i in range(max(len(got), len(expected))) if i >= len(got) or i >= len(expected) or got[i] != expected[i]), 0)
-    have = got[first] if first < len(got) else "<end of step>"
-    want = expected[first] if first < len(expected) else "<end of step>"
-    return f"statement {first + 1} is `{have[:90]}`, the only allowed one is `{want[:90]}`"
+def want_kind(node: Optional[Node], kind: str, what: str, rep: Report) -> bool:
+    if node is not None and node.kind == kind:
+        return True
+    rep.bad(f"{what} must be a {'mapping' if kind == 'map' else 'sequence' if kind == 'seq' else kind}"
+            f" (got {'nothing' if node is None else node.kind})")
+    return False
 
 
-def canonical_steps(steps: List[List[str]], want_keys: Tuple[str, ...], expected: Tuple[str, ...]) -> List[int]:
-    return [i for i, s in enumerate(steps) if not step_problem(s, want_keys, expected)]
+def node_texts(node: Node) -> Iterator[str]:
+    """Every executable-looking text under ``node`` (scalars, and the logical
+    lines of block scalars), skipping ``name:`` values."""
+    for path, sub in walk(node):
+        if path and path[-1] == "name":
+            continue
+        if sub.kind == "scalar":
+            yield sub.text()
+        elif sub.kind == "block" and isinstance(sub.value, list):
+            yield from logical_lines(sub.value)
 
 
-def nearest_problem(steps: List[List[str]], marker: str, want_keys: Tuple[str, ...], expected: Tuple[str, ...]) -> str:
-    """Reason for the first step that mentions ``marker`` but is not the allowed one."""
-    for s in steps:
-        if marker in "\n".join(s):
-            why = step_problem(s, want_keys, expected)
-            if why:
-                return why
-    return f"no step mentions `{marker}`"
+# ------------------------------------------------------------ step units --
+def step_label(i: int, step: Node) -> str:
+    name = step.get("name") or step.get("uses")
+    return f"step {i + 1} `{name.text()[:60] if name is not None else '?'}`"
+
+
+def run_lines(step: Node) -> Tuple[str, ...]:
+    run = step.get("run")
+    if run is None:
+        return ()
+    if run.kind == "block" and isinstance(run.value, list):
+        return tuple(logical_lines(run.value))
+    return tuple(logical_lines([run.text()]))
+
+
+def step_problem(step: Node, want_keys: Tuple[str, ...], expected: Tuple[str, ...]) -> str:
+    """Why ``step`` is not the allowed unit ("" when it is exactly that unit)."""
+    why = Report()
+    if set(step.keys()) != set(want_keys):
+        why.bad(f"step keys {sorted(step.keys())} differ from the only allowed set {sorted(want_keys)}")
+    name = step.get("name")
+    if name is not None and "${{" in name.text():
+        why.bad("the step `name:` carries a `${{ }}` expression (refused in a pinned unit)")
+    run = step.get("run")
+    if run is None or run.kind != "block" or run.style != "|":
+        why.bad("`run:` must be a literal block (`run: |`); a folded, quoted or inline run is refused")
+    shell = step.get("shell")
+    if "shell" in want_keys and (shell is None or shell.style != "plain" or shell.text() != "bash"):
+        why.bad(f"`shell: {shell.text() if shell is not None else ''}` (only an unquoted `shell: bash` is allowed)")
+    got = run_lines(step)
+    if got != expected:
+        why.bad(first_diff(got, expected))
+    return why.first()
+
+
+def job_steps(job: Node, where: str, rep: Report) -> List[Tuple[int, Node]]:
+    steps = job.get("steps")
+    if steps is None or steps.kind != "seq" or not isinstance(steps.value, list):
+        return []
+    return [(i, st) for i, st in enumerate(steps.value) if want_kind(st, "map", f"{where} step {i + 1}", rep)]
+
+
+def canonical(steps: List[Tuple[int, Node]], want_keys: Tuple[str, ...], expected: Tuple[str, ...]) -> List[int]:
+    return [i for i, st in steps if not step_problem(st, want_keys, expected)]
+
+
+def nearest_problem(steps: List[Tuple[int, Node]], want_keys: Tuple[str, ...], expected: Tuple[str, ...]) -> str:
+    """The step that shares the most statements with the unit, and why it is not it."""
+    best: Optional[Tuple[int, Node]] = None
+    score = 0
+    for i, st in steps:
+        s = len(set(run_lines(st)) & set(expected))
+        if s > score:
+            best, score = (i, st), s
+    if best is None:
+        return "no step shares a statement with it"
+    return f"nearest is {step_label(*best)}: {step_problem(best[1], want_keys, expected)}"
+
+
+def one_unit(steps: List[Tuple[int, Node]], want_keys: Tuple[str, ...], expected: Tuple[str, ...], what: str,
+             rep: Report) -> List[int]:
+    found = canonical(steps, want_keys, expected)
+    if len(found) != 1:
+        rep.bad(f"{what} must have exactly one step with exactly the allowed body (found {len(found)})"
+                + (": " + nearest_problem(steps, want_keys, expected) if not found else ""))
+    return found
 
 
 # ------------------------------------------------------------------ checks --
@@ -340,63 +602,193 @@ def check_no_bash_env(label: str, text: str, rep: Report) -> None:
         rep.bad(f"{label}: BASH_ENV runs a file before every non-interactive bash, so it can neutralise the assert (refused anywhere)")
 
 
-def check_single_build(name: str, text: str, matrix_only: bool, rep: Report) -> None:
-    """The allowed build (its presence is checked by the unit checks) is the ONLY
-    one in the file. In release.yml any other
-    ``cargo build`` of the matrix target (a later rebuild with another toolchain,
-    different flags, or the same line twice) is refused; in the Dockerfile any
-    other ``cargo build`` at all."""
-    hits = [ln for ln in logical_lines(text.split("\n"))
-            if CARGO_BUILD_RE.search(ln) and (not matrix_only or "matrix.target" in ln)]
-    if len(hits) > 1:
-        rep.bad(f"{name}: {len(hits)} release builds; only the allowed unit may build: {hits[-1][:90]}")
+def check_text_counts(text: str, rep: Report) -> None:
+    """Whole-file backstops (any job): at most one line builds the matrix target,
+    at most one runs ``cargo ... cyclonedx``."""
+    lines = logical_lines(text.split("\n"))
+    builds = [ln for ln in lines if BUILD_TOOL_RE.search(ln) and "matrix.target" in ln]
+    if len(builds) > 1:
+        rep.bad(f"release.yml: {len(builds)} lines run a build tool against the matrix target; only the allowed unit "
+                f"may build: {builds[-1][:90]}")
+    sboms = [ln for ln in lines if SBOM_TOOL_RE.search(ln)]
+    if len(sboms) > 1:
+        rep.bad(f"release.yml: {len(sboms)} lines run `cargo ... cyclonedx`; only the SBOM unit in the `sbom:` job may: "
+                f"{sboms[-1][:90]}")
+
+
+def check_matrix(job: Node, rep: Report) -> None:
+    st = job.get("strategy")
+    matrix = st.get("matrix") if st is not None else None
+    include = matrix.get("include") if matrix is not None else None
+    if (st is None or set(st.keys()) != {"fail-fast", "matrix"} or st.get("fail-fast") is None
+            or st.get("fail-fast").text() != "false" or matrix is None or matrix.keys() != ["include"]
+            or include is None or include.kind != "seq"):
+        rep.bad("release.yml release job `strategy:` must be exactly `fail-fast: false` plus `matrix:` with only "
+                "`include:` entries (no other axis, no `exclude:`, no expression)")
+        return
+    targets: List[str] = []
+    for n, entry in enumerate(include.value if isinstance(include.value, list) else []):
+        keys = set(entry.keys())
+        if entry.kind != "map" or not set(MATRIX_REQUIRED) <= keys <= set(MATRIX_VALUE_RE):
+            rep.bad(f"release.yml release matrix entry {n + 1}: keys {sorted(keys)}; the allowed keys are "
+                    f"{list(MATRIX_REQUIRED)} plus optionally `nfpm_arch`")
+        for key in sorted(keys):
+            val = entry.get(key)
+            rx = MATRIX_VALUE_RE.get(key)
+            if rx is not None and (val is None or val.style != "plain" or not rx.fullmatch(val.text())):
+                rep.bad(f"release.yml release matrix entry {n + 1}: `{key}:` must be an unquoted literal matching "
+                        f"`{rx.pattern}` (it is substituted into the pinned build and assert text before bash runs: "
+                        "no expression, quote, space or shell metacharacter)")
+        tv = entry.get("target")
+        targets.append(tv.text() if tv is not None else "")
+    if sorted(targets) != sorted(RELEASE_TARGETS):
+        rep.bad(f"release.yml release matrix targets {sorted(targets)} differ from the pinned set "
+                f"{sorted(RELEASE_TARGETS)}; if the release matrix legitimately changes, update RELEASE_TARGETS in "
+                "scripts/check_release_features.py in the same commit")
+
+
+def check_release_job(job: Node, rep: Report) -> None:
+    if set(job.keys()) != set(JOB_KEYS):
+        rep.bad(f"release.yml release job keys {job.keys()} differ from the pinned skeleton {list(JOB_KEYS)} (a job "
+                "`if:`, `env:`, `defaults:`, `container:` or `continue-on-error:` can skip or neutralise the assert)")
+    ro = job.get("runs-on")
+    if ro is None or ro.style != "plain" or ro.text() != RELEASE_RUNS_ON:
+        rep.bad(f"release.yml release job `runs-on:` must be exactly `{RELEASE_RUNS_ON}`")
+    check_matrix(job, rep)
+    steps = job_steps(job, "release.yml release job", rep)
+    builds = one_unit(steps, KEYS_SHELL, WF_BUILD, "release.yml: the release job build", rep)
+    asserts = one_unit(steps, KEYS_SHELL, WF_ASSERT, "release.yml: the release job strict assert", rep)
+    if builds and asserts and min(asserts) < max(builds):
+        rep.bad("release.yml: the strict assert must run after the build, in the same job")
+    for i, st in steps:
+        if i in builds:
+            continue
+        hit = next((m for m in (BUILD_TOOL_RE.search(t) for t in node_texts(st)) if m), None)
+        if hit is not None:
+            rep.bad(f"release.yml: release job {step_label(i, st)} runs `{hit.group(0)}`; only the canonical build "
+                    "step may run a build tool in the release job (any option order or +toolchain)")
+
+
+def check_sbom_job(job: Node, rep: Report) -> None:
+    if set(job.keys()) != set(SBOM_JOB_KEYS):
+        rep.bad(f"release.yml sbom job keys {job.keys()} differ from the pinned skeleton {list(SBOM_JOB_KEYS)}")
+    one_unit(job_steps(job, "release.yml sbom job", rep), KEYS_PLAIN, WF_SBOM, "release.yml: the `sbom:` job SBOM", rep)
+
+
+def check_image_build(jobs: Node, rep: Report) -> None:
+    """The image the docker job ships is the Dockerfile's final stage."""
+    for path, node in walk(jobs):
+        if node.kind == "map" and node.get("uses") is not None and node.get("uses").text().startswith("docker/build-push-action"):
+            with_ = node.get("with")
+            extra = sorted(set(with_.keys()) & {"target", "file"}) if with_ is not None else []
+            if extra:
+                rep.bad(f"release.yml: docker/build-push-action at jobs.{'.'.join(path)} sets {extra}: the guard pins "
+                        "the final stage of ./Dockerfile; another target or file ships something else")
 
 
 def check_release_yml(text: str, rep: Report) -> None:
     check_no_bash_env("release.yml", text, rep)
-    check_single_build("release.yml", text, True, rep)
-    lines = [ln.rstrip() for ln in text.split("\n")]
-    keys_at(lines, 0, TOP_KEYS, "release.yml top level", rep)
-    jobs_at = [i for i, ln in enumerate(lines) if ln == "jobs:"]
-    # a duplicate `jobs:` is refused by keys_at above; no `jobs:` leaves no release job
-    jobs = block_after(lines, jobs_at[0]) if jobs_at else []
-    release_at = [i for i, ln in enumerate(jobs) if ln == "  release:"]
-    if len(release_at) != 1:
-        rep.bad("release.yml must have exactly one `release:` job")
+    check_text_counts(text, rep)
+    doc = parse_yaml(text, "release.yml", rep)
+    if doc is None:
         return
-    job = block_after(jobs, release_at[0])
-    keys_at(job, 4, JOB_KEYS, "release.yml release job", rep)
-    steps = split_steps(job)
-    builds = canonical_steps(steps, KEYS_SHELL, WF_BUILD)
-    asserts = canonical_steps(steps, KEYS_SHELL, WF_ASSERT)
-    if not builds:
-        rep.bad("release.yml: the release job has no build step with exactly the allowed body: "
-                + nearest_problem(steps, "cargo", KEYS_SHELL, WF_BUILD))
-    if not asserts:
-        rep.bad("release.yml: the release job has no strict-assert step with exactly the allowed body: "
-                + nearest_problem(steps, "assert-compiled-features", KEYS_SHELL, WF_ASSERT))
-    if builds and asserts and max(builds) > max(asserts):
-        rep.bad("release.yml: the strict assert must run after the build, in the same job")
-    if not canonical_steps(split_steps(lines), KEYS_PLAIN, WF_SBOM):
-        rep.bad("release.yml: no SBOM step with exactly the allowed body: "
-                + nearest_problem(split_steps(lines), "cyclonedx", KEYS_PLAIN, WF_SBOM))
+    check_blocks(doc, "release.yml", rep)
+    for key in doc.keys():
+        if key not in TOP_KEYS:
+            rep.bad(f"release.yml top level: `{key}:` is not allowed (allowed: {', '.join(TOP_KEYS)})")
+    jobs = doc.get("jobs")
+    if not want_kind(jobs, "map", "release.yml `jobs:`", rep) or jobs is None:
+        return
+    release, sbom = jobs.get("release"), jobs.get("sbom")
+    if want_kind(release, "map", "release.yml `jobs.release`", rep) and release is not None:
+        check_release_job(release, rep)
+    if want_kind(sbom, "map", "release.yml `jobs.sbom`", rep) and sbom is not None:
+        check_sbom_job(sbom, rep)
+    check_image_build(jobs, rep)
+
+
+def docker_nearest(builder: List[str]) -> str:
+    want = tuple(DOCKER_RUN.split("; "))
+    runs = [ins for ins in builder if ins.upper().startswith("RUN ")]
+    if not runs:
+        return "the builder stage has no RUN"
+    got = max(runs, key=lambda r: len(set(r.split("; ")) & set(want)))
+    return "nearest builder RUN: " + first_diff(tuple(got.split("; ")), want)
 
 
 def check_dockerfile(text: str, rep: Report) -> None:
     check_no_bash_env("Dockerfile", text, rep)
-    check_single_build("Dockerfile", text, False, rep)
-    logical = logical_lines(text.split("\n"))
-    if not any(ln.startswith("COPY Cargo.toml Cargo.lock") for ln in logical):
-        rep.bad("Dockerfile does not COPY Cargo.lock before the build")
-    if not any(ln.startswith("COPY scripts/release-features.sh") for ln in logical):
-        rep.bad("Dockerfile does not COPY scripts/release-features.sh into the build stage")
-    for ln in logical:
-        if SHELL_INSTR_RE.match(ln):
-            rep.bad(f"Dockerfile: a SHELL instruction swaps the shell that runs the build RUN (refused): {ln[:60]}")
-    if DOCKER_RUN not in logical:
-        near = next((ln for ln in logical if re.match(r"RUN\b", ln, re.I) and "cargo" in ln), "<no RUN mentions cargo>")
-        rep.bad("Dockerfile: no RUN instruction is exactly the allowed build+assert RUN; "
-                f"nearest: {near[:120]}")
+    raw = text.split("\n")
+    if raw[0] != DOCKER_SYNTAX:
+        rep.bad(f"Dockerfile: line 1 must be exactly `{DOCKER_SYNTAX}` (the syntax directive picks the frontend that "
+                f"parses the file): {raw[0][:60]}")
+    for n, ln in enumerate(raw[1:], 2):
+        if DIRECTIVE_RE.match(ln):
+            rep.bad(f"Dockerfile: line {n}: a parser directive other than the pinned line-1 syntax (an `escape` "
+                    f"directive changes what a line continuation is): {ln.strip()[:60]}")
+    stages: List[Tuple[Optional[str], List[str]]] = []
+    names: Dict[str, int] = {}
+    for ins in logical_lines(raw):
+        word = ins.split(" ", 1)[0].upper()
+        if "<<" in ins:
+            rep.bad(f"Dockerfile: heredoc (`<<`) refused, the guard cannot see what it runs: {ins[:60]}")
+        if word not in DOCKER_INSTRUCTIONS:
+            rep.bad(f"Dockerfile: `{word}` refused (SHELL swaps the shell of the build RUN; ONBUILD and unknown "
+                    f"instructions are outside the subset): {ins[:60]}")
+            continue
+        if word == "FROM":
+            m = FROM_RE.fullmatch(ins)
+            if m is None:
+                rep.bad(f"Dockerfile: FROM outside `FROM [--platform=x] image [AS name]`: {ins[:80]}")
+                toks = ins.split(" ")
+                image, name = (toks[1] if len(toks) > 1 else ""), None
+            else:
+                image, name = m.group("image"), m.group("name")
+            if image.lower() in names:
+                rep.bad(f"Dockerfile: `{ins[:60]}` starts a stage FROM an earlier stage (a stage starts from a base image)")
+            if name is not None:
+                if name.lower() in names:
+                    rep.bad(f"Dockerfile: duplicate stage name `{name}`")
+                names.setdefault(name.lower(), len(stages))
+            stages.append((name, []))
+            continue
+        if not stages:
+            if word != "ARG":
+                rep.bad(f"Dockerfile: `{word}` before the first FROM: {ins[:60]}")
+            continue
+        stages[-1][1].append(ins)
+    final = stages[-1][1] if stages else []
+    copies = [m.group("stage").lower() for m in (BINARY_COPY_RE.fullmatch(i) for i in final) if m]
+    if len(copies) != 1:
+        rep.bad("Dockerfile: the final stage must COPY the binary exactly once: "
+                "`COPY --from=<stage> /build/target/release/ai-memory /usr/local/bin/ai-memory`")
+    src = copies[0] if copies else ""
+    for ins in final:
+        m = FROM_FLAG_RE.search(ins)
+        if m is not None and m.group("src").lower() != src:
+            rep.bad(f"Dockerfile: final-stage `{ins[:60]}` takes `--from={m.group('src')}`; only the stage that "
+                    "builds the binary may feed the image")
+    bidx = names.get(src)
+    if bidx is None or bidx == len(stages) - 1:
+        rep.bad(f"Dockerfile: the final image copies the binary from `{src}`, which is not an earlier named stage")
+        return
+    for k, (_, body) in enumerate(stages):
+        for pos, ins in enumerate(body):
+            canon = k == bidx and pos == len(body) - 1 and ins == DOCKER_RUN
+            if BUILD_TOOL_RE.search(ins) and not canon:
+                rep.bad(f"Dockerfile: a build tool outside the canonical build RUN (the last instruction of the stage the "
+                        f"image copies the binary from): {ins[:80]}")
+    builder = stages[bidx][1]
+    for ins in builder:
+        if FROM_FLAG_RE.search(ins):
+            rep.bad(f"Dockerfile: the builder stage takes `--from` another stage or image: {ins[:60]}")
+    if DOCKER_LOCK_COPY not in builder[:-2]:
+        rep.bad(f"Dockerfile: the builder stage does not `{DOCKER_LOCK_COPY}` before the build")
+    if builder[-2:-1] != [DOCKER_DECL_COPY]:
+        rep.bad(f"Dockerfile: the builder stage must `{DOCKER_DECL_COPY}` immediately before the build RUN")
+    if builder[-1:] != [DOCKER_RUN]:
+        rep.bad("Dockerfile: the builder stage must END with exactly the allowed build+assert RUN (nothing after it); "
+                + docker_nearest(builder))
 
 
 def check_inline_use(name: str, text: str, rep: Report) -> None:
@@ -412,10 +804,15 @@ def check_shape(text: str, rep: Report) -> None:
     view = code_lines(text)
     if "scripts/release-shape-pg-proof.sh" not in view:
         rep.bad("release-shape.yml does not run scripts/release-shape-pg-proof.sh")
-    steps = split_steps([ln.rstrip() for ln in text.split("\n")])
-    if not canonical_steps(steps, KEYS_SHELL, SHAPE_BUILD):
-        rep.bad("release-shape.yml: no build step with exactly the allowed body: "
-                + nearest_problem(steps, "cargo build", KEYS_SHELL, SHAPE_BUILD))
+    doc = parse_yaml(text, "release-shape.yml", rep)
+    if doc is None:
+        return
+    check_blocks(doc, "release-shape.yml", rep)
+    jobs = doc.get("jobs")
+    job = jobs.get("release-shape") if jobs is not None else None
+    if want_kind(job, "map", "release-shape.yml `jobs.release-shape`", rep) and job is not None:
+        one_unit(job_steps(job, "release-shape.yml release-shape job", rep), KEYS_SHELL, SHAPE_BUILD,
+                 "release-shape.yml: the `release-shape:` job build", rep)
 
 
 def check_install(text: str, rep: Report) -> None:
@@ -558,8 +955,45 @@ def _drop_assert_step(text: str) -> str:
     return text[:a] + text[p:]
 
 
-def _dir_in_place(_: str) -> str:  # pragma: no cover - placeholder, see ENTRY_CASES
-    return _
+NEEDS_REL = "    needs: [preflight, qualify, supply-chain]\n    runs-on: ${{ matrix.os }}\n"
+MATRIX_FF = "      fail-fast: false\n"
+ENTRY1 = "          - target: x86_64-unknown-linux-gnu\n            os: ubuntu-latest\n            artifact: ai-memory\n"
+SBOM_JOB = "  sbom:\n    name: SBOM (CycloneDX)\n"
+PUSH_WITH = "        with:\n          context: .\n"
+D_BUILDER = "FROM rust:1.98-slim-bookworm AS builder\n"
+D_FINAL = "FROM debian:bookworm-slim\n"
+D_WORKDIR = "WORKDIR /build\n"
+D_LOCK = DOCKER_LOCK_COPY + "\n"
+D_BIN = "COPY --from=builder /build/target/release/ai-memory /usr/local/bin/ai-memory\n"
+SHAPE_JOB = "\n  release-shape:\n"
+
+
+def _docker(old: str, new: Union[str, Transform], every: bool = False) -> Edit:
+    return (DOCKER, old, new, every)
+
+
+def _step_before_pkg(body: str) -> List[Edit]:
+    """A new release-job step (after the strict assert)."""
+    return [_rel(PKG_HDR, "      - name: extra\n" + body + PKG_HDR)]
+
+
+def _append_job(body: str) -> Transform:
+    return lambda t: t.rstrip("\n") + "\n\n  decoy:\n    runs-on: ubuntu-latest\n    steps:\n" + body
+
+
+def _move_sbom_to_decoy(text: str) -> str:
+    a = text.index(SBOM_HDR)
+    b = text.index("      - name:", a + len(SBOM_HDR))
+    block = text[a:b]
+    return _append_job(block)(text[:a] + text[b:])
+
+
+def _dead_stage_then_alter(text: str) -> str:
+    """D1: a dead stage holds the canonical RUN while the shipped builder changes."""
+    a, b = text.index(D_BUILDER), text.index(D_FINAL)
+    dead = text[a:b].replace(" AS builder", " AS decoy")
+    live = text[a:b].replace("strip target/release/ai-memory", "true")
+    return text[:a] + dead + live + text[b:]
 
 
 # name -> (want, edits). want: "pass" (guard accepts), "fail" (guard refuses),
@@ -794,6 +1228,85 @@ CASES: Dict[str, Tuple[str, List[Edit]]] = {
     # --- F5: unreadable input exits 2
     "F5 release.yml is not valid UTF-8": ("input-error", [(REL, "", "\udcff\udcfe\n", False)]),
     "F5 Dockerfile is not valid UTF-8": ("input-error", [(DOCKER, "", "\udcff\udcfe\n", False)]),
+    # --- #4719 SR-1/H1/M1: structural location, exact indentation (YAML subset)
+    "SR1 trailing tab after the assert statement": ("fail", [_rel(REL_ASSERT, REL_ASSERT + "\t")]),
+    "SR1/J1 job key at indent 5 (multi-line scalar or stray key)": ("fail", [_rel(JOB_NAME, JOB_NAME + "     if: false\n")]),
+    "SR1/J2 continuation line of a plain job name": ("fail", [_rel(JOB_NAME, JOB_NAME + "      continued\n")]),
+    "SR1 step-level key written with quotes": ("fail", [_rel(REL_ASSERT, REL_ASSERT + "\n        \"if\": false")]),
+    "SR1 anchor on a job value": ("fail", [_rel(NEEDS_REL, NEEDS_REL.replace("needs: [", "needs: &n ["))]),
+    "SR1 alias as a job value": ("fail", [_rel(NEEDS_REL, NEEDS_REL + "    timeout-minutes: *n\n")]),
+    "SR1 tag on a job value": ("fail", [_rel(NEEDS_REL, NEEDS_REL.replace("needs: [", "needs: !!seq ["))]),
+    "SR1 flow mapping value": ("fail", [_rel(NEEDS_REL, NEEDS_REL + "    env: {A: b}\n")]),
+    "SR1 multi-line double-quoted value": ("fail", [_rel(JOB_NAME, '    name: "Release\n      x"\n')]),
+    "SR1 block indentation indicator": ("fail", [_rel(JOB_NAME, "    name: |2\n      Release\n")]),
+    "SR1 sequence line more indented than its items": ("fail", [_rel(PKG_HDR, "       - name: stray\n" + PKG_HDR)]),
+    "SR1/J3 block scalar as the job name": ("fail", [_rel(JOB_NAME, "    name: |\n      Release (${{ matrix.target }})\n")]),
+    "SR1/J3 folded block as a step if": ("fail", _hdr_key(ASSERT_NAME, "if: >-\n          true")),
+    "SR1 release job runs-on changed": ("fail", [_rel(NEEDS_REL, NEEDS_REL.replace("${{ matrix.os }}", "self-hosted"))]),
+    "SR1 release job if: (skips the job)": ("fail", [_rel(JOB_NAME, JOB_NAME + "    if: false\n")]),
+    "SR1 release job container:": ("fail", [_rel(JOB_NAME, JOB_NAME + "    container: decoy:latest\n")]),
+    "SR1 a step is a plain scalar, not a mapping": ("fail", [_rel(PKG_HDR, "      - echo hi\n" + PKG_HDR)]),
+    "SR1 build step name carries an expression": ("fail", [_rel(BUILD_HDR, BUILD_HDR.replace("binary", "binary ${{ matrix.os }}"))]),
+    "SR1 run: |- on the assert step": ("fail", [_rel(ASSERT_RUN, ASSERT_RUN.replace("run: |", "run: |-"))]),
+    "SR1 jobs: is not a mapping": ("fail", [_rel("\njobs:\n", "\njobs: []\nx-jobs:\n")]),
+    "valid: comment lines inside the release job and a matrix entry": ("pass", [_rel(
+        NEEDS_REL, NEEDS_REL + "    # a comment\n"), _rel(ENTRY1, ENTRY1.replace("            os:", "            # c\n            os:"))]),
+    # --- #4719 SR-2/H2: matrix values substituted into the pinned units
+    "SR2 strategy fail-fast: true": ("fail", [_rel(MATRIX_FF, "      fail-fast: true\n")]),
+    "SR2 matrix gains an axis": ("fail", [_rel(MATRIX_FF + "      matrix:\n", MATRIX_FF + "      matrix:\n        x: [a]\n")]),
+    "SR2 matrix entry gains a key": ("fail", [_rel(ENTRY1, ENTRY1 + "            runner: x\n")]),
+    "SR2/J4 artifact quoted": ("fail", [_rel(ENTRY1, ENTRY1.replace("artifact: ai-memory", "artifact: 'ai-memory'"))]),
+    "SR2/J4 artifact carries shell": ("fail", [_rel(ENTRY1, ENTRY1.replace("artifact: ai-memory", "artifact: ai-memory;true"))]),
+    "SR2/J4 target carries a substitution": ("fail", [_rel(
+        ENTRY1, ENTRY1.replace("x86_64-unknown-linux-gnu", "x86_64-unknown-linux-gnu$(true)"))]),
+    "SR2/J4 os is an expression": ("fail", [_rel(ENTRY1, ENTRY1.replace("ubuntu-latest", "${{ github.event.inputs.tag }}"))]),
+    "SR2 a valid target outside the pinned set": ("fail", [_rel(
+        ENTRY1, ENTRY1.replace("x86_64-unknown-linux-gnu", "riscv64gc-unknown-linux-gnu"))]),
+    "SR2 a matrix entry dropped": ("fail", [_rel(ENTRY1 + "            nfpm_arch: amd64\n", "")]),
+    # --- #4719 L1: no other building cargo in the release job
+    "L1/J6 cargo -q build in a later release step": ("fail", _step_before_pkg("        run: cargo -q build --release\n")),
+    "L1/J6 CARGO build (case-insensitive file system)": ("fail", _step_before_pkg("        run: CARGO build --release\n")),
+    "L1/J6 cargo --config before the subcommand": ("fail", _step_before_pkg("        run: cargo --config x=y build\n")),
+    "L1/J6 cross build in a later step": ("fail", _step_before_pkg("        run: |\n          cross build --release\n")),
+    "L1/J6 rustc in a later step": ("fail", _step_before_pkg("        run: rustc -O src/main.rs\n")),
+    "L1/J6 a cargo action in a later step": ("fail", _step_before_pkg("        uses: actions-rs/cargo@v1\n")),
+    "L1 second matrix-target build in another job": ("fail", [_rel(
+        SBOM_HDR, "      - name: x\n        run: cargo build --target ${{ matrix.target }}\n" + SBOM_HDR)]),
+    "L1 image build picks another stage": ("fail", [_rel(PUSH_WITH, PUSH_WITH + "          target: builder\n")]),
+    # --- #4719 L6: the SBOM unit lives in the sbom: job
+    "L6/J5 SBOM step moved to a decoy job": ("fail", [_rel(SBOM_HDR, _move_sbom_to_decoy)]),
+    "L6/J5 SBOM copied into a decoy job": ("fail", [_rel(
+        SBOM_HDR, _append_job("      - name: x\n        run: cargo cyclonedx --format json --features sal\n"))]),
+    "L6 sbom job carries an if": ("fail", [_rel(SBOM_JOB, SBOM_JOB + "    if: false\n")]),
+    "release-shape build job renamed": ("fail", [(SHAPE, SHAPE_JOB, "\n  release-shape-x:\n", False)]),
+    # --- #4719 SR-3/M2: Dockerfile directives, heredocs, stage chain
+    "SR3 syntax directive changed": ("fail", [_docker(DOCKER_SYNTAX + "\n", "# syntax=docker/dockerfile:1.7\n")]),
+    "SR3 escape directive": ("fail", [_docker(DOCKER_SYNTAX + "\n", DOCKER_SYNTAX + "\n# escape=`\n")]),
+    "SR3 heredoc RUN in the final stage": ("fail", [_docker(D_BIN, D_BIN + "RUN cat <<<x\n")]),
+    "SR3 ONBUILD instruction": ("fail", [_docker(D_BIN, D_BIN + "ONBUILD RUN true\n")]),
+    "SR3 unknown instruction": ("fail", [_docker(D_BIN, D_BIN + "BOGUS x\n")]),
+    "SR3 instruction before the first FROM": ("fail", [_docker(D_BUILDER, "ENV X=1\n" + D_BUILDER)]),
+    "SR3 FROM outside the subset": ("fail", [_docker(D_FINAL, "FROM busybox junk AS dead\n" + D_FINAL)]),
+    "SR3 stage FROM an earlier stage": ("fail", [_docker(D_FINAL, "FROM builder AS other\n" + D_FINAL)]),
+    "SR3 duplicate stage name": ("fail", [_docker(D_FINAL, "FROM busybox AS builder\n" + D_FINAL)]),
+    "SR3 binary copied twice": ("fail", [_docker(D_BIN, D_BIN + D_BIN)]),
+    "SR3 final stage takes another --from": ("fail", [_docker(D_BIN, D_BIN + "COPY --from=busybox /bin/sh /bin/sh2\n")]),
+    "SR3 binary copied from an image, not a stage": ("fail", [_docker(D_BIN, D_BIN.replace("=builder", "=rust:1.98"))]),
+    "SR3 builder takes a --from": ("fail", [_docker(D_WORKDIR, D_WORKDIR + "COPY --from=busybox /bin/sh /bin/sh\n")]),
+    "SR3/D1 dead stage holds the canonical RUN, shipped builder altered": ("fail", [_docker(D_BUILDER, _dead_stage_then_alter)]),
+    "SR3 cargo fetch in the builder before the canonical RUN": ("fail", [_docker(D_LOCK, D_LOCK + "RUN cargo fetch\n")]),
+    "SR3 instruction between the declaration COPY and the RUN": ("fail", [_docker(DOCKER_RUN_HEAD, "ENV X=1\n" + DOCKER_RUN_HEAD)]),
+    "SR3 build dropped from the builder RUN (no build tool left)": ("fail", [_docker(DOCKER_BUILD, "true; \\")]),
+    "SR3 RUN appended after the canonical RUN": ("fail", [_docker(D_FINAL, "RUN true\n" + D_FINAL)]),
+    # --- #4719 L2: non-ASCII spaces and zero-width characters are refused, never folded
+    "L2/D2 NBSP inside the build statement": ("fail", [_rel(REL_BUILD_CMD, REL_BUILD_CMD.replace("cargo build", "cargo\u00a0build"))]),
+    "L2/D3 em space in the Dockerfile RUN": ("fail", [_docker(DOCKER_ASSERT, DOCKER_ASSERT.replace(" --strict", "\u2003--strict"))]),
+    "L2 zero-width space in release-shape.yml": ("fail", [(SHAPE, SHAPE_BUILD_CMD, SHAPE_BUILD_CMD.replace("cargo", "car\u200bgo"), False)]),
+    "L2 bare CR inside a comment line (a YAML line break) hides a job key": ("fail", [_rel(
+        JOB_NAME, JOB_NAME + "    # note\r    if: false\n")]),
+    "L2 U+2028 inside a comment line (a YAML 1.1 line break) hides a job key": ("fail", [_rel(
+        JOB_NAME, JOB_NAME + "    # note\u2028    if: false\n")]),
+    "L2 byte-order mark at the start of release.yml": ("fail", [_rel(JOB_NAME, lambda t: "\ufeff" + t)]),
 }
 
 
