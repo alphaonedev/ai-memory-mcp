@@ -4,18 +4,24 @@
 Keeps the header comments, keeps every existing 'both' choice where the two
 templates agree on order, lists a repeated line once per occurrence, lists each
 Terraform directive region (context tf-region) after the triggered lines, and
-skips lines that the pending list covers. The review of the diff stays human.
-Usage: regen-cloud-init-token-allow.py <repo-root>
+skips lines that the pending list covers. It only reorders by default: a line
+that is not already approved is listed and the file is left unchanged, unless
+--accept-new is given, and then every added and removed line is printed so
+the approval is named in the run output as well as in the diff.
+Usage: regen-cloud-init-token-allow.py [--accept-new] <repo-root>
 """
 import argparse
 import importlib.util
 import sys
+from collections import Counter
 from pathlib import Path
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("root")
+    ap.add_argument("--accept-new", action="store_true",
+                    help="write lines that are not in the current allowlist (each is printed)")
     a = ap.parse_args()
     root = Path(a.root)
     spec = importlib.util.spec_from_file_location("g", str(root / "scripts/check-cloud-init-serve-flags.py"))
@@ -56,6 +62,24 @@ def main():
         else:
             out.append(("do-hive",) + D[j])
             j += 1
+    def per_scope(entries):
+        c = Counter()
+        for sc, ctx, text in entries:
+            for s in (("aws-gpu-burst", "do-hive") if sc == "both" else (sc,)):
+                c[(s, ctx, text)] += 1
+        return c
+
+    was = per_scope((e[0], e[2], e[3]) for e in old)
+    now = per_scope(out)
+    added, removed = now - was, was - now
+    for k in sorted(removed.elements()):
+        print("REMOVED: %s | %s | %s" % k)
+    for k in sorted(added.elements()):
+        print("NEW: %s | %s | %s" % k)
+    if added and not a.accept_new:
+        print("refused: %d line(s) not in the allowlist; review them, then rerun with --accept-new"
+              % sum(added.values()), file=sys.stderr)
+        return 1
     head = [x for x in allow.splitlines() if x.startswith("#")]
     head = head[:next((k for k, x in enumerate(allow.splitlines()) if x and not x.startswith("#")), len(head))]
     body = ["%s | %s | %s" % e for e in out]
