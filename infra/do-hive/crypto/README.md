@@ -39,8 +39,9 @@ known_hosts model, CA chain ignored), so `allowlist.txt` = `sha256(client-good D
 Common: `AI_MEMORY_NO_CONFIG=1` skips the host `config.toml` (so `tier` falls back to
 the compiled default `semantic` → MiniLM-384, and no stray `db`/`embeddings` leak in).
 
-**Leg 1 — API mTLS** (`ServeArgs`: `--tls-cert` src/daemon_runtime.rs:757,
-`--tls-key` :760, `--mtls-allowlist` :771; wired at :5150/:5158/:5163):
+**Leg 1 — API mTLS** (the `--tls-cert`, `--tls-key` and `--mtls-allowlist` fields of
+[`ServeArgs`](../../../src/daemon_runtime.rs); passed to the listener by
+[`bootstrap_serve`](../../../src/daemon_runtime.rs)):
 ```bash
 # AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1 is redundant since v0.9.0 (#1751):
 # store-path attestation is REQUIRED by default (=0 opts out). Set explicitly here
@@ -63,7 +64,8 @@ AI_MEMORY_NO_CONFIG=1 ai-memory serve --host 0.0.0.0 --port 9077 --store-url "$P
   --quorum-ca-cert out/ca.crt --quorum-timeout-ms 8000
 ```
 
-**Leg 3 — daemon→Postgres verify-full** (sqlx `PgConnectOptions`, src/store/postgres.rs:829;
+**Leg 3 — daemon→Postgres verify-full** (sqlx `PgConnectOptions`, built by
+[`floored_connect_options`](../../../src/store/postgres/dsn.rs);
 sslmode/sslrootcert honoured from the URL query):
 ```bash
 PG_URL="postgres://aimemory:PW@<pg-host>:5432/aimemory?sslmode=verify-full&sslrootcert=/etc/ai-memory/ca.crt"
