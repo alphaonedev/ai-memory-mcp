@@ -57,9 +57,9 @@ Fields ([`HookConfig`](../src/hooks/config.rs)):
   `pre_recall_expand`), exec otherwise.
 - **`enabled`** — soft-disable without removing the row.
 - **`namespace`** — glob pattern; chain is filtered before invocation.
-  `*` or empty (the schema default) matches every namespace; otherwise the
+  `*` matches every namespace (the field is required: [`validate_hook`](../src/hooks/config.rs) rejects an empty value); otherwise the
   pattern matches EXACTLY, or as a `prefix/*` glob covering the prefix itself
-  and any child under it. Validation is shape-only ([`validate_hook`](../src/hooks/config.rs)); the runtime matcher is
+  and any child under it. Validation is shape-only; the runtime matcher is
   [`HookConfig::matches_namespace`](../src/hooks/config.rs). See
   §"Namespace scoping on pre-* events" below for how the in-flight namespace is
   resolved.
