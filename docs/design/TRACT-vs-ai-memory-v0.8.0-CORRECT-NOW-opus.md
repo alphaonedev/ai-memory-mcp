@@ -1,5 +1,7 @@
 # ai-memory v0.8.0 — What Is Correct Now (vs the TRACT definitive design)
 
+> **Point-in-time record, as of 2026-07-10.** The src/ file:line references in this document describe the source tree on that date. They are a dated record and are not maintained, so they may not match the current code. No commit is named because a sample of the references did not resolve against a single commit.
+
 ### An Opus full-spectrum, CodeGraph-anchored assessment of where ai-memory v0.8.0 already implements the definitive endpoint-AI-memory design.
 
 > **Method.** A 21-agent council (3 waves × 7) measured the definitive ideal design **TRACT** (`docs/design/TRACT-the-definitive-endpoint-ai-memory.md`) against the **actual ai-memory v0.8.0 codebase** (branch `release/v0.8.0`) and the **current `main` ROADMAP.md**, using the CodeGraph CLI as L1 evidence (846 files / 27,062 nodes indexed). Every claim below carries a `file:line` touchpoint. This document records **what is already correct**; the companion [`TRACT-vs-ai-memory-v0.8.0-DEVELOPMENT-GAPS-opus.md`](TRACT-vs-ai-memory-v0.8.0-DEVELOPMENT-GAPS-opus.md) records the gaps.

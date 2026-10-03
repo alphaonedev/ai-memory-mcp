@@ -3,6 +3,8 @@ layout: doc
 ---
 # Issue #487 — Requirements Coverage Matrix
 
+> **Point-in-time record, as of 2026-04-30.** The src/ file:line references in this document describe the source tree at commit `d974112abbb5` (read a file there with `git show d974112abbb5:<path>`). They are a dated record and are not maintained, so they may not match the current code.
+
 Generated: 2026-04-30
 Base: `release/v0.6.3.1` @ `d974112abbb56b2a036fcc32a15aebe101ea5efa`
 Auditor: PR-9 Audit Agent B (`release/v0.6.3.1-issue-487-pr9b-requirements-matrix`)

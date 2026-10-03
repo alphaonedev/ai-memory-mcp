@@ -3,6 +3,8 @@ layout: doc
 ---
 # v0.7.0 Documentation Drift Audit (DOC-F)
 
+> **Point-in-time record, as of 2026-05-22.** The src/ file:line references in this document describe the source tree on that date. They are a dated record and are not maintained, so they may not match the current code. No commit is named because a sample of the references did not resolve against a single commit.
+
 **Audit ID:** DOC-F (100% docs + GitHub Pages drift audit + remediation)
 **Branch:** `release/v0.7.0-mobile-ci-1068` (HEAD at audit start: `42401c1f2`)
 **Auditor:** AI NHI agent (Claude Opus 4.7, 1M context)

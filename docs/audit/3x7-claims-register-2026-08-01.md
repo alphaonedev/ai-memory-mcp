@@ -3,6 +3,8 @@
 
 # CLAIMS REGISTER — ai-memory v1.0.0 GA
 
+> **Point-in-time record, as of 2026-08-01.** The src/ file:line references in this document describe the source tree on that date. They are a dated record and are not maintained, so they may not match the current code. No commit is named because a sample of the references did not resolve against a single commit.
+
 **Repo:** `/home/fate_two/v07/v09-dev` · **Branch:** `release/v1.0.0` · **HEAD:** `2f32dde1` (was `cc61a899` when the seven surface passes began; re-verified at `2f32dde1`)
 **Standard applied (operator, verbatim):** *"enterprise ready means a fortune 500 company would bet their entire business in integrating all their AI Agents with ai-memory v1.0.0 GA release — they would bet the entire farm analogy on ai-memory doing everything it CLAIMS it can reliably, consistently, without error"*
 **Binding surface:** the published claims, not the code.

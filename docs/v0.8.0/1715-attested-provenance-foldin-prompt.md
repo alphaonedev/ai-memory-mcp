@@ -2,6 +2,9 @@
 layout: doc
 ---
 # AI NHI Build Prompt — Read-time Attested-Provenance Surfacing (§2.5)
+
+> **Point-in-time record, as of 2026-06-16.** The src/ file:line references in this document describe the source tree at commit `c5b4981efb91` (read a file there with `git show c5b4981efb91:<path>`). They are a dated record and are not maintained, so they may not match the current code.
+
 ### v0.8.0 EPIC #1709 fold-in · reframed from #1715 "confidence honesty"
 
 > **Feed this verbatim to the Claude Code CLI loop driving v0.8.0 EPIC #1709.**
