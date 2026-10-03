@@ -126,7 +126,7 @@ fn cli_subcommand_count_default_build_matches_ssot() {
         ai_memory::EXPECTED_CLI_SUBCOMMANDS_DEFAULT,
         "CLI subcommand drift: default-build variants in `pub enum Command` = {default_count}, \
          but ai_memory::EXPECTED_CLI_SUBCOMMANDS_DEFAULT = {}. \
-         If a subcommand was added/removed, update the constant AND the CLAUDE.md \
+         If a subcommand was added/removed, update the constant AND the ARCHITECTURE_REFERENCE.md \
          §\"Architecture\" narrative in the same commit. Multi-agent sweep ref: \
          scanner A finding F-A3.1 (memory `f19f73be`).",
         ai_memory::EXPECTED_CLI_SUBCOMMANDS_DEFAULT,
