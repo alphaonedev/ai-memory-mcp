@@ -258,11 +258,20 @@ write_files:
       chmod 0644 /etc/ai-memory/tls/node.crt
 
       # --- ai-memory binary (operator-published sal-postgres tarball) ---
-      curl -fsSL "${ai_memory_image_url}" -o /opt/ai-memory/ai-memory.tar.gz
-      tar -xzf /opt/ai-memory/ai-memory.tar.gz -C /opt/ai-memory/bin
+      # #4637: the tarball is downloaded into a root-only directory, its SHA-256
+      # is checked against the operator-supplied digest BEFORE it is extracted,
+      # and the version probe runs as the unprivileged service user, so the
+      # unverified download is not executed as root. A mismatch (or a malformed
+      # digest) stops the script before the systemctl enable line below.
+      DL=/var/cache/ai-memory-provision
+      install -d -m 0700 "$DL"
+      curl -fsSL "${ai_memory_image_url}" -o "$DL/ai-memory.tar.gz"
+      echo "${ai_memory_image_sha256}  $DL/ai-memory.tar.gz" | sha256sum -c - \
+        || { echo "ai-memory tarball digest mismatch"; rm -f "$DL/ai-memory.tar.gz"; exit 1; }
+      tar -xzf "$DL/ai-memory.tar.gz" --no-same-owner -C /opt/ai-memory/bin
       chmod 0755 /opt/ai-memory/bin/ai-memory
       chown -R aimemory:aimemory /opt/ai-memory/bin
-      /opt/ai-memory/bin/ai-memory --version
+      runuser -u aimemory -- /opt/ai-memory/bin/ai-memory --version
 
       systemctl daemon-reload
       systemctl enable --now ai-memory

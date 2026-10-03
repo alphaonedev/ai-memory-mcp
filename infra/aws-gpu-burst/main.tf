@@ -88,6 +88,16 @@ variable "ai_memory_image_url" {
   default     = "https://github.com/alphaonedev/ai-memory-mcp/releases/latest/download/ai-memory-x86_64-unknown-linux-gnu.tar.gz"
 }
 
+variable "ai_memory_image_sha256" {
+  description = "Lowercase hex SHA-256 of the tarball at ai_memory_image_url. The memory node refuses to extract or run a tarball that does not match (#4637). Required: pin a versioned URL, not releases/latest, so the digest stays valid."
+  type        = string
+
+  validation {
+    condition     = can(regex("^[0-9a-f]{64}$", var.ai_memory_image_sha256))
+    error_message = "ai_memory_image_sha256 must be 64 lowercase hex characters."
+  }
+}
+
 variable "ironclaw_image_url" {
   description = "URL to the IronClaw v1.1.0 runner tarball."
   type        = string
@@ -223,7 +233,8 @@ resource "aws_instance" "memory" {
   vpc_security_group_ids = [aws_security_group.burst.id]
 
   user_data = templatefile("${path.module}/cloud-init-memory.yaml.tpl", {
-    ai_memory_image_url = var.ai_memory_image_url
+    ai_memory_image_url    = var.ai_memory_image_url
+    ai_memory_image_sha256 = var.ai_memory_image_sha256
   })
 
   root_block_device {
