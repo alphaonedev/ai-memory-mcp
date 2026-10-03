@@ -725,9 +725,10 @@ OnceLock is independent), but that integration test is not counted in
 the per-module lib-only measurement.
 
 **v0.8.0 climb-back target**: 95% (tier B). Requires either lifting
-the OnceLock to a per-test injectable surface (rejected per
-CLAUDE.md §safety — OnceLock is the type-level guarantee that
-production cannot reset) or rolling integration coverage in.
+the OnceLock to a per-test injectable surface (rejected per the
+layering rationale in the `src/governance/wire_check.rs` module doc,
+item 1 — OnceLock is the type-level guarantee that production cannot
+reset) or rolling integration coverage in.
 
 ### v0.7.0 L1-6 E — errors.rs (post-cascade, ratchet-back)
 
