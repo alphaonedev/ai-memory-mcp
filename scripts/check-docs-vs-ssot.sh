@@ -2250,7 +2250,9 @@ EFSTALE
     done
     # The `PE-1 knobs` prose must NOT match: a bare `([0-9]+) knobs`
     # anchor would capture the `1` out of `PE-1` and report phantom drift.
-    if grep -qF 'KNOBS): docs/deploy/README.md:1' <<<"$knob_out"; then
+    # (Anchored on the SINGLE surviving rule name; #3248 item 3 collapsed the
+    # pair, and the old `KNOBS): ...` suffix literal went dead with it.)
+    if grep -qF 'ASI_HARD_PINNED_KNOB_COUNT: docs/deploy/README.md:1 claims' <<<"$knob_out"; then
         echo "FAIL: self-test — the knob rule falsely matched 'PE-1 knobs' prose" >&2
         cd "$REPO_ROOT"; exit 1
     fi
