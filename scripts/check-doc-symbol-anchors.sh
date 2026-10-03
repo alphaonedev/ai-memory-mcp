@@ -57,7 +57,7 @@
 # loudly instead of silently computing its own answer.
 #
 # BURN-DOWN ALLOWLIST: `scripts/qc-allowlists/doc-symbol-anchors-allow.txt`.
-# Unlike the two PENDING-FIX ledgers this campaign also ships, a STALE
+# Unlike the three PENDING-FIX ledgers this campaign also ships, a STALE
 # ENTRY HERE **FAILS** — the #2494 `required-contexts-joblevel-if-allow.txt`
 # discipline — because these anchors are not the subject of a
 # concurrent correction lane, so a rotted ledger here has no excuse.
@@ -195,7 +195,7 @@ MDEOF
         echo "FAIL: self-test allowlist — a STALE entry PASSED. This ledger must not be able to rot." >&2; exit 1; }
     run_fixture_out | grep -q 'STALE' || {
         echo "FAIL: self-test allowlist — stale entry rejected without naming it stale" >&2; exit 1; }
-    echo "PASS: self-test allowlist — a STALE entry FAILS (unlike the two pending-fix ledgers, by design)"
+    echo "PASS: self-test allowlist — a STALE entry FAILS (unlike the three pending-fix ledgers, by design)"
 
     write_clean
     printf 'README.md\n' > "$allow"
