@@ -78,8 +78,8 @@ INDEX_HEADING = "### Binding rules that live in the reference file"
 INDEX_MIN_QUOTE_CHARS = 20
 # (CLAUDE.md `## ` section, reference basename without .md, minimum entry count)
 INDEX_SECTIONS = (
-    ("## Architecture", "ARCHITECTURE_REFERENCE", 2),
-    ("## Code Style", "CODE_STYLE", 6),
+    ("## Architecture", "ARCHITECTURE_REFERENCE", 5),
+    ("## Code Style", "CODE_STYLE", 7),
 )
 INDEX_ENTRY = re.compile(r'^- `([A-Z_]+)\.md:(\d+)(?:-(\d+))?` "(.+)"$')
 
