@@ -136,7 +136,7 @@ the host config.
 `# ai-memory boot: warn` header when the DB's `schema_version` lies
 outside the binary's supported range. The canonical
 schema is **v100** (verified via `CURRENT_SCHEMA_VERSION` in
-`src/storage/migrations.rs`); an older DB is brought up to v100
+`src/storage/migrations.rs`); an older DB is brought up to that version
 via the in-process migration ladder applied on first daemon start. An agent or
 human running an older `ai-memory` binary against a newer DB (or
 vice versa) sees the drift directly in their session log instead of
