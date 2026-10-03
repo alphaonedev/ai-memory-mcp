@@ -205,7 +205,15 @@ pub fn handle_checkpoint_resolve(
             )
         })
         .ok_or_else(|| "state must be one of: resolved, rejected".to_string())?;
-    let resolved_by = crate::mcp::param_guard::require_str(params, param_names::RESOLVED_BY)?;
+    let resolved_by_raw = crate::mcp::param_guard::require_str(params, param_names::RESOLVED_BY)?;
+    // #3368 — shape-validate (and, under the multi-tenant posture, bind to the
+    // enforced caller) the resolver BEFORE any lookup, state change or audit
+    // emit, via the SAME funnel the create path uses for `created_by` (#2998 /
+    // #3363). Pre-#3368 a control-character value (`"ai:x\nINJECTED"`) reached
+    // the persisted row, the signed audit row and the log line (the #3009
+    // vector, closed for `claimed_by`). Fail closed: any refusal returns here.
+    let resolved_by_owned = crate::coordination_guard::resolve_actor(Some(resolved_by_raw))?;
+    let resolved_by = resolved_by_owned.as_str();
     let resolution = params.get(param_names::RESOLUTION).and_then(Value::as_str);
     let resolution_note = params
         .get(param_names::RESOLUTION_NOTE)
@@ -898,6 +906,65 @@ mod handler_tests {
             &json!({ "namespace": "team/ops", "title": "normal gate", "condition_type": "approval" }),
         )
         .expect("benign create ok");
+    }
+
+    /// #3368 — a `resolved_by` carrying control characters / injected text is
+    /// REFUSED before any state change or audit emit; a clean id still
+    /// resolves (denied AND allowed path).
+    #[test]
+    fn resolve_refuses_malformed_resolved_by_3368() {
+        let _envg = crate::identity::agent_id_env_unset_guard();
+        let conn = fresh();
+        let created = handle_checkpoint_create(
+            &conn,
+            &json!({ "namespace": "_cp", "title": "t", "created_by": "agent-a" }),
+        )
+        .expect("create ok");
+        let id = created[param_names::ID]
+            .as_str()
+            .expect("id present")
+            .to_string();
+        let audit_rows = |conn: &rusqlite::Connection| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM signed_events WHERE event_type = ?1",
+                rusqlite::params![crate::coordination_audit::CHECKPOINT_RESOLVE],
+                |r| r.get(0),
+            )
+            .expect("count audit rows")
+        };
+
+        for bad in [
+            "ai:x\nINJECTED",
+            "ai:x\r\nforged line",
+            "ai:x\u{0}nul",
+            "has spaces;DROP",
+        ] {
+            let err = handle_checkpoint_resolve(
+                &conn,
+                &json!({ "id": id, "state": "resolved", "resolved_by": bad }),
+                None,
+            )
+            .expect_err("a malformed resolved_by must be refused");
+            assert!(err.contains("invalid agent_id"), "got: {err}");
+            let cp = crate::checkpoints::get(&conn, &id)
+                .expect("get ok")
+                .expect("row present");
+            assert_eq!(cp.state, crate::models::CheckpointState::Pending);
+            assert!(cp.resolved_by.is_none(), "no state change on refusal");
+            assert_eq!(audit_rows(&conn), 0, "no audit row on refusal");
+        }
+
+        let ok = handle_checkpoint_resolve(
+            &conn,
+            &json!({ "id": id, "state": "resolved", "resolved_by": "ai:worker-1" }),
+            None,
+        )
+        .expect("a valid resolved_by still resolves");
+        assert_eq!(
+            ok["checkpoint"]["resolved_by"].as_str(),
+            Some("ai:worker-1")
+        );
+        assert_eq!(audit_rows(&conn), 1, "exactly one audit row on success");
     }
 
     /// #1722 — resolving a checkpoint appends one
