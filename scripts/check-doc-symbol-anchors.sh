@@ -241,17 +241,26 @@ MDEOF
     for rf in ARCHITECTURE_REFERENCE CODE_STYLE; do
         mv "$FIX/docs/reference/$rf.md" "$FIX/docs/reference/$rf.md.aside"
         rf_out="$(run_fixture_out)"
-        [[ "$(run_fixture)" != "0" ]] && grep -q "required reference file docs/reference/$rf.md" <<<"$rf_out" || {
+        [[ "$(run_fixture)" != "0" ]] && grep -q "docs/reference/$rf.md" <<<"$rf_out" || {
             echo "FAIL: self-test #4507 R3-6 — a MISSING $rf.md did not fail closed" >&2; exit 1; }
         echo "PASS: self-test #4507 R3-6 — a missing $rf.md FAILS CLOSED and names the file"
         ln -s "$rf.md.aside" "$FIX/docs/reference/$rf.md"
         rf_out="$(run_fixture_out)"
-        [[ "$(run_fixture)" != "0" ]] && grep -q "required reference file docs/reference/$rf.md" <<<"$rf_out" || {
+        [[ "$(run_fixture)" != "0" ]] && grep -q "docs/reference/$rf.md" <<<"$rf_out" || {
             echo "FAIL: self-test #4507 R3-6 — a SYMLINKED $rf.md did not fail closed" >&2; exit 1; }
         echo "PASS: self-test #4507 R3-6 — a symlinked $rf.md FAILS CLOSED"
         rm -f "$FIX/docs/reference/$rf.md"
         mv "$FIX/docs/reference/$rf.md.aside" "$FIX/docs/reference/$rf.md"
     done
+    # ---- #4507 R3-F7: a symlink ABOVE the file (docs/reference -> elsewhere) FAILS CLOSED ----
+    mv "$FIX/docs/reference" "$FIX/docs/reference.aside"
+    ln -s reference.aside "$FIX/docs/reference"
+    rf_out="$(run_fixture_out)"
+    [[ "$(run_fixture)" != "0" ]] && grep -q "is a symlink" <<<"$rf_out" || {
+        echo "FAIL: self-test #4507 R3-F7 — a SYMLINKED docs/reference did not fail closed" >&2; exit 1; }
+    echo "PASS: self-test #4507 R3-F7 — a symlinked docs/reference FAILS CLOSED"
+    rm -f "$FIX/docs/reference"
+    mv "$FIX/docs/reference.aside" "$FIX/docs/reference"
     exit 0
 fi
 
@@ -267,12 +276,12 @@ cd "$REPO_ROOT"
 # deleted reference file silently dropped out of the scan and the gate exited 0.
 # Unconditional, fixture included (a check waived under --self-test is a check
 # the self-test cannot prove).
-for _ref in docs/reference/ARCHITECTURE_REFERENCE.md docs/reference/CODE_STYLE.md; do
-    if [[ ! -f "$_ref" || -L "$_ref" ]]; then
-        printf 'FAIL: check-doc-symbol-anchors: required reference file %s is missing or not a regular file (#4507 fail-closed)\n' "$_ref" >&2
-        exit 1
-    fi
-done
+# R3-F7: the shared reference check refuses a symlink at EVERY level of each path
+# (docs, docs/reference, the file), not only the leaf.
+if ! python3 "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/check-claude-md-size.py" "$REPO_ROOT" --refs-only >&2; then
+    printf 'FAIL: check-doc-symbol-anchors: reference file check failed (#4507 fail-closed)\n' >&2
+    exit 1
+fi
 
 ALLOWLIST="$REPO_ROOT/scripts/qc-allowlists/doc-symbol-anchors-allow.txt"
 
