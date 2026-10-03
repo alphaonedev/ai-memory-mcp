@@ -3,15 +3,15 @@
 # infra/federation-lab/lib/posture.sh — the lab's asi-hard security posture.
 # =============================================================================
 # SSOT for the hardened posture is `src/security_profile.rs::KNOBS` (rendered
-# for operators as `docs/deploy/asi-hard.env`). That table has SEVENTEEN pinned
-# knobs and a NO-DISABLE contract: under `AI_MEMORY_SECURITY_PROFILE=asi-hard`
+# for operators as `docs/deploy/asi-hard.env`). That table pins every knob it lists
+# (the count is read from the table, never written here) under a NO-DISABLE contract: under `AI_MEMORY_SECURITY_PROFILE=asi-hard`
 # each knob is pinned to its hard floor, and setting any of them BELOW that
 # floor REFUSES boot.
 #
-# THE LAB RUNS 16 OF THE 17 — and does NOT set
+# THE LAB RUNS EVERY PINNED KNOB BUT ONE — and does NOT set
 # `AI_MEMORY_SECURITY_PROFILE=asi-hard`. Why, stated plainly:
 #
-#   The 17th knob, AI_MEMORY_REQUIRE_ROLLBACK_CHECK, cannot COLD-BOOT a fresh
+#   The one knob left out, AI_MEMORY_REQUIRE_ROLLBACK_CHECK, cannot COLD-BOOT a fresh
 #   node. In require-mode the open-time rollback-evidence check treats an
 #   ABSENT off-table head anchor as refuse-to-open, and that anchor is emitted
 #   only by the witness watermark cadence over the `signed_events` chain —
@@ -20,24 +20,24 @@
 #
 #   Because the profile knob's contract is pin-and-refuse, we cannot say
 #   "asi-hard, but with rollback-check off": setting the profile AND lowering
-#   one pin is exactly the case the profile refuses. So the lab sets the 16
-#   satisfiable knobs to their hard-floor values DIRECTLY and leaves
+#   one pin is exactly the case the profile refuses. So the lab sets every
+#   satisfiable knob to its hard-floor value DIRECTLY and leaves
 #   REQUIRE_ROLLBACK_CHECK at its safe default (emit-evidence-and-continue).
-#   This is the same 16/17 shape a persistent hive node runs today.
+#   This is the same shape a persistent hive node runs today.
 #
 #   The caveat probe (on by default; disable with `run.sh --no-caveat-probe`)
 #   DEMONSTRATES the caveat rather than asserting it: it cold-boots one
-#   throwaway node under the full 17-knob profile and records the actual exit
+#   throwaway node under the full profile and records the actual exit
 #   code and stderr.
 #
-# Two of the seventeen are PERMISSIVE hatches whose hard floor is "unset"
-# (AI_MEMORY_ALLOW_SCHEMA_AHEAD #2445, AI_MEMORY_FED_ALLOW_PLAINTEXT_PEERS
-# #2477). The lab actively UNSETS them rather than leaving whatever the
+# The PERMISSIVE hatches have a hard floor of "unset" (LAB_POSTURE_UNSET
+# below, e.g. AI_MEMORY_ALLOW_SCHEMA_AHEAD #2445 and
+# AI_MEMORY_FED_ALLOW_PLAINTEXT_PEERS #2477). The lab actively UNSETS them rather than leaving whatever the
 # operator's shell happened to export — an inherited hatch is exactly the
 # silent weakening the posture exists to prevent.
 # =============================================================================
 
-# The 14 knobs the lab SETS to their hard-floor value.
+# The knobs the lab SETS to their hard-floor value.
 # Format: NAME=VALUE. Order mirrors src/security_profile.rs::KNOBS.
 LAB_POSTURE_SET=(
   "AI_MEMORY_SECRET_SCREEN_MODE=refuse"
@@ -54,22 +54,37 @@ LAB_POSTURE_SET=(
   "AI_MEMORY_REQUIRE_IDENTITY_LINEAGE=1"
   "AI_MEMORY_FED_REQUIRE_SERVER_VERIFY=1"
   "AI_MEMORY_DB_SYNCHRONOUS=FULL"
+  "AI_MEMORY_FED_REQUIRE_SIG=1"
+  "AI_MEMORY_FED_REQUIRE_NONCE=1"
+  "AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT=1"
+  "AI_MEMORY_FED_REQUIRE_PUSH_NAMESPACE_SCOPE=1"
+  "AI_MEMORY_MIGRATION_REQUIRE_CORE_TABLES=1"
+  "AI_MEMORY_PERMISSIONS_MODE=enforce"
+  "AI_MEMORY_FED_REQUIRE_POLICY_CURRENT=1"
+  "AI_MEMORY_FED_CERT_PEER_BINDING=enforce"
+  "AI_MEMORY_UNSTAMPED_MUTATION=refuse"
+  "AI_MEMORY_REQUIRE_FORENSIC_SINK=1"
 )
 
-# The 2 PERMISSIVE hatches whose hard floor is "not in force" — unset them.
+# The PERMISSIVE hatches whose hard floor is "not in force" — unset them.
 LAB_POSTURE_UNSET=(
   "AI_MEMORY_ALLOW_SCHEMA_AHEAD"
   "AI_MEMORY_FED_ALLOW_PLAINTEXT_PEERS"
+  "AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR"
+  "AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS"
+  "AI_MEMORY_STORE_URL_FILE_ALLOW_LAX_PERMS"
+  "AI_MEMORY_AGENT_API_KEY_FILE_ALLOW_LAX_PERMS"
 )
 
-# The 1 knob deliberately NOT at its hard floor (issue #2942).
+# The knob deliberately NOT at its hard floor (issue #2942).
 LAB_POSTURE_OMITTED="AI_MEMORY_REQUIRE_ROLLBACK_CHECK"
 LAB_POSTURE_OMITTED_ISSUE="2942"
 
-# lab_posture_count — 14 set + 2 unset = 16 of the 17 pinned knobs.
+# lab_posture_count — the knobs at their hard floor: every SET plus every UNSET
+# entry (the one documented omission is not counted).
 lab_posture_count() { echo $(( ${#LAB_POSTURE_SET[@]} + ${#LAB_POSTURE_UNSET[@]} )); }
 
-# lab_posture_export — apply the 16/17 posture to the CURRENT shell.
+# lab_posture_export — apply the lab posture to the CURRENT shell.
 # Callers run each daemon in a subshell so the posture never leaks between
 # steps (the seeding phase deliberately runs WITHOUT it — see run.sh).
 lab_posture_export() {
@@ -99,9 +114,10 @@ lab_posture_render() {
 # source tree is present (the kit also works from a release tarball). Echoes
 # a one-line verdict; returns 0 on agreement, 1 on drift, 2 on "cannot check".
 #
-# Only the literal `env: "AI_MEMORY_…"` rows are machine-comparable; three
+# Only the literal `env: "AI_MEMORY_…"` rows are machine-comparable; the other
 # KNOBS rows name a Rust const instead of a literal, so their env NAMES are
-# resolved from the const definitions. If a future row uses a shape this
+# resolved from the const definitions (`pub const` and `pub(crate) const`, the
+# value on the same line or the next one). If a future row uses a shape this
 # cannot resolve, the check reports "cannot check" rather than passing —
 # a drift guard that silently degrades to green is worse than none.
 lab_posture_ssot_check() {
@@ -122,8 +138,8 @@ lab_posture_ssot_check() {
         local cname
         cname="$(printf '%s' "$line" | sed -n 's/.*env: crate::.*::\([A-Z0-9_]*\),.*/\1/p')"
         [ -n "$cname" ] || { echo "cannot check: unparseable KNOBS row: $line"; return 2; }
-        resolved="$(grep -rhoE "pub const ${cname}: &str = \"[^\"]*\"" "$root/src" \
-                    | head -1 | sed -n 's/.*= "\([^"]*\)".*/\1/p')"
+        resolved="$(grep -rhzoE "pub(\(crate\))? const ${cname}: &str =[[:space:]]*\"[^\"]*\"" "$root/src" \
+                    | tr '\0\n' '  ' | sed -n 's/^[^"]*"\([^"]*\)".*/\1/p')"
         [ -n "$resolved" ] || { echo "cannot check: could not resolve const $cname"; return 2; }
         ssot+=("$resolved")
         ;;
