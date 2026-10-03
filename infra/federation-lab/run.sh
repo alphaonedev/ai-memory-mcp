@@ -4,7 +4,7 @@
 # =============================================================================
 # ONE command stands up a two-node ai-memory federation on your laptop with
 # mutual TLS, fingerprint-pinned peers, required agent attestation and 16 of
-# the 17 `asi-hard` posture knobs at their hard floor; loads a sample of the
+# the `asi-hard` posture knobs at their hard floor; loads a sample of the
 # synthetic corpus; and then PROVES the thing works by asserting both positives
 # (an attested write replicates across the mesh and is recallable at the
 # peer) and negatives (an unpinned client, a plaintext client and an unsigned
@@ -73,7 +73,7 @@ usage: run.sh [options]
   --port-a N          node A port (default 19481)
   --port-b N          node B port (default 19482)
   --keep              keep run/ (daemons are still stopped) for post-mortem
-  --no-caveat-probe   skip the asi-hard 17-knob cold-boot demonstration (#2942)
+  --no-caveat-probe   skip the asi-hard cold-boot demonstration (#2942)
   -h, --help          this text
 USAGE
 }
@@ -354,18 +354,18 @@ fi
 step "5 · asi-hard posture"
 # ===========================================================================
 lab_posture_render | tee "$RUN/evidence/posture.env" | sed 's/^/   /'
-info "$(lab_posture_count) of 17 pinned knobs at their hard floor."
-info "AI_MEMORY_SECURITY_PROFILE is deliberately NOT set — see README §asi-hard 16/17."
+info "$(lab_posture_count) pinned knobs at their hard floor."
+info "AI_MEMORY_SECURITY_PROFILE is deliberately NOT set — see README §asi-hard."
 
 if [ "$CAVEAT_PROBE" -eq 1 ]; then
   # DEMONSTRATE the caveat instead of asserting it: cold-boot a throwaway node
-  # under the FULL 17-knob profile and record what actually happens.
+  # under the FULL asi-hard profile and record what actually happens.
   PROBE="$RUN/evidence/caveat-asi-hard-coldboot.txt"
   PROBE_HOME="$RUN/probe-home"; mkdir -p "$PROBE_HOME/.config/ai-memory"
   printf 'schema_version = 2\ntier = "keyword"\n' > "$PROBE_HOME/.config/ai-memory/config.toml"
   PROBE_PORT="$((PORT_B + 1))"
   {
-    echo "# asi-hard 17/17 cold-boot probe on a FRESH database (issue #2942)"
+    echo "# asi-hard full-profile cold-boot probe on a FRESH database (issue #2942)"
     echo "# command: AI_MEMORY_SECURITY_PROFILE=asi-hard ai-memory serve --db <fresh> ..."
     echo
   } > "$PROBE"
@@ -382,16 +382,16 @@ if [ "$CAVEAT_PROBE" -eq 1 ]; then
     # or any unrelated fault also exits non-zero. The refusal has to be the ONE
     # being documented, so the captured stderr must name the rollback check.
     if [ "$PROBE_RC" -ne 0 ] && grep -qi "rollback" "$PROBE"; then
-      ok "caveat demonstrated: full 17-knob asi-hard cold boot on a fresh DB exited $PROBE_RC naming the rollback check (issue #2942) — evidence in run/evidence/caveat-asi-hard-coldboot.txt"
+      ok "caveat demonstrated: full asi-hard cold boot on a fresh DB exited $PROBE_RC naming the rollback check (issue #2942) — evidence in run/evidence/caveat-asi-hard-coldboot.txt"
       info "$(grep -iE 'rollback|refuse|fatal' "$PROBE" | tail -2 | sed 's/^/     /')"
     elif [ "$PROBE_RC" -ne 0 ]; then
       no "caveat probe exited $PROBE_RC but did NOT name the rollback check — that is a different failure, not #2942"
       info "$(tail -3 "$PROBE" | sed 's/^/     /')"
     else
       # Not a lab failure — it would mean #2942 was FIXED. Say so, loudly.
-      warn "the 17-knob asi-hard cold boot SUCCEEDED (exit 0)."
-      warn "  If you are on a build where #2942 is fixed, this kit's 16/17 posture and"
-      warn "  its README caveat are now STALE and should be updated to 17/17."
+      warn "the full asi-hard cold boot SUCCEEDED (exit 0)."
+      warn "  If you are on a build where #2942 is fixed, this kit's reduced posture and"
+      warn "  its README caveat are now STALE and should be updated to the full profile."
       ok "caveat probe ran (exit 0 — #2942 appears fixed on this build; see the warning above)"
     fi
     rm -f "$RUN/probe.db"*
@@ -638,7 +638,7 @@ step "9 · run manifest"
   echo "host:           $(uname -srm)"
   echo "nodes:          node-a https://127.0.0.1:$PORT_A , node-b https://127.0.0.1:$PORT_B"
   echo "corpus:         $SEED_SRC_DESC (${LOADED:-0} rows in $CORPUS_NS)"
-  echo "posture:        $(lab_posture_count)/17 asi-hard knobs at hard floor; $LAB_POSTURE_OMITTED left at default (issue #$LAB_POSTURE_OMITTED_ISSUE)"
+  echo "posture:        $(lab_posture_count) asi-hard knobs at hard floor; $LAB_POSTURE_OMITTED left at default (issue #$LAB_POSTURE_OMITTED_ISSUE)"
   echo "result:         $LAB_PASS PASS / $LAB_FAIL FAIL"
 } > "$RUN/evidence/manifest.txt"
 cat "$RUN/evidence/manifest.txt" | sed 's/^/   /'

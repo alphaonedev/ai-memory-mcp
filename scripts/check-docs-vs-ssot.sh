@@ -488,88 +488,107 @@ emit_fail() {
     fail_count=$((fail_count + 1))
 }
 
-# CURRENT_SCHEMA_VERSION rule.
-# Patterns (current-state claims):
-#   - "Current schema = v<N>"
-#   - "current `CURRENT_SCHEMA_VERSION = <N>"
-#   - "CURRENT_SCHEMA_VERSION = <N>"
-#   - "schema_version=<N> — ladder complete"
-#   - "schema **v<N>** sqlite + postgres lockstep"
-#   - "logical schema **v<N>** — `CURRENT_SCHEMA_VERSION = <N>"
-#   - "backends sit at **schema_version=<N>"
-# Patterns INTENTIONALLY EXCLUDED (historical, not current-state):
-#   - "v52 added X" / "schema v52 (added X)"
-#   - changelog headers like "### schema v52 — table"
-#   - RFC doc references like "schema v52, see #1389"
+# CURRENT_SCHEMA_VERSION rule (fail-closed; #3248 items 3-4, review rounds 2-3).
+#
+# THE CLAIM SUBJECT. A schema-ladder position is claimed wherever a doc names
+# the ladder constant or the ladder table together with a number. The rule is
+# therefore CLOSED-WORLD on the subject, not a list of recognised wordings:
+# every enrolled line (DOC_FILES + HTML_DOC_FILES; html is tag-stripped and a
+# card under a `PRIOR RELEASE` eyebrow is history) that mentions the identifier
+# `CURRENT_SCHEMA_VERSION` or `schema_version` is checked, and every ladder
+# number (two or three digits) within SUBJECT_WINDOW characters of it, before
+# or after, is a claim that must equal the canonical constant. Typed constants
+# (`: i64 =`), quotes, backticks, bold, `=`/`:` separators and the schema-init
+# --json form are all just text between the identifier and the number. Round 2
+# found five wordings the old pattern list let through; the precedent for
+# replacing a recogniser with a closed-world check is ai-memory decision
+# 19497ef6-14f9-4482-86f0-a8a92219c930 (copying a recorded precedent, so no
+# crossroads vote).
+#   * A value below 10 is not a ladder claim: the capabilities envelope
+#     (`schema_version: 2|3`) and the config-file marker are different SSOTs
+#     and the ladder has been above 10 for the whole documented life of the
+#     product. This replaces the old whole-line pin-word skip, which a stale
+#     claim could hide behind by saying "pinned" (#4724).
+#   * The ONLY other exemption is the explicit history ledger
+#     scripts/qc-allowlists/schema-claim-history.txt (tab-separated `file`,
+#     `needle`, `#issue note`). A hit whose matched span (identifier, the gap
+#     and the number) contains the needle is true history; the exemption is
+#     per hit, so it never shields a real claim sharing the line. A version
+#     transition (`CURRENT_SCHEMA_VERSION 71→72`) is history by construction.
+#     A malformed entry FAILS, a STALE entry (file or needle no longer
+#     present) FAILS, a missing ledger FAILS, and a scan that reads zero files
+#     FAILS outside --self-test.
+# Ident-less phrasings (prose that says "schema" and a number without naming
+# the identifier) cannot be swept closed-world, because the ladder history is
+# narrated everywhere; they are covered by the explicit ANCHORS list in the
+# engine below. That residual gap is stated, not hidden.
 check_schema_version_rule() {
     local rule_name="CURRENT_SCHEMA_VERSION"
-    # #3248 item 4: the rule used to walk DOC_FILES only, so the rendered
-    # docs/**/*.html pages (evidence.html, schema.html, ...) carried stale
-    # schema claims with the gate green. HTML files are now walked too, with
-    # the html dialect handled inside the engine (tag-stripped view, release
-    # card window guard).
-    local f is_html
+    local ledger="$REPO_ROOT/scripts/qc-allowlists/schema-claim-history.txt"
+    if [[ ! -f "$ledger" ]]; then
+        printf 'FAIL: check-docs-vs-ssot: missing %s — refusing to run the closed-world schema-claim sweep without its history ledger (#3248 fail-closed)\n' \
+            "$ledger" >&2
+        exit 1
+    fi
+    local scan_files=() f
     for f in "${DOC_FILES[@]}" "${HTML_DOC_FILES[@]:-}"; do
-        [[ -n "$f" && -f "$f" ]] || continue
-        is_html=0
-        [[ "$f" == *.html ]] && is_html=1
-        # Capture-then-check rather than `done < <(python3 …)`: under
-        # `set -euo pipefail` a process-substitution's exit status is NOT
-        # observed, so a crashing engine (a non-UTF-8 byte → the unguarded
-        # `open()` raises UnicodeDecodeError) yielded an EMPTY row set
-        # and the rule silently passed — the #2713 swallowed-error shape.
-        # The engine reads its file from the environment through a QUOTED
-        # heredoc, so no bash interpolation can reach the python source.
-        local schema_rows
-        schema_rows="$(
-            GATE_SCHEMA_FILE="$f" GATE_SCHEMA_HTML="$is_html" python3 - <<'SCHEMAPY'
+        [[ -n "$f" && -f "$f" ]] && scan_files+=("$f")
+    done
+    if [[ ${#scan_files[@]} -eq 0 && -z "${AI_MEMORY_DOCS_GATE_ROOT:-}" ]]; then
+        printf 'FAIL: check-docs-vs-ssot: the CURRENT_SCHEMA_VERSION sweep resolved ZERO files — refusing to report PASS (#2444 fail-closed)\n' >&2
+        exit 2
+    fi
+    # Capture-then-check rather than `done < <(python3 …)`: under
+    # `set -euo pipefail` a process-substitution's exit status is NOT
+    # observed, so a crashing engine (a non-UTF-8 byte → the unguarded
+    # `open()` raises UnicodeDecodeError) yielded an EMPTY row set and the
+    # rule silently passed — the #2713 swallowed-error shape. The engine
+    # reads its inputs from the environment through a QUOTED heredoc, so no
+    # bash interpolation can reach the python source.
+    local schema_rows
+    schema_rows="$(
+        GATE_SCHEMA_FILES="${scan_files[*]:-}" GATE_SCHEMA_LEDGER="$ledger" \
+            GATE_SCHEMA_CANON="$CANONICAL_SCHEMA_VERSION" python3 - <<'SCHEMAPY'
 import html as htmlmod
 import os
 import re
 
-# \x60 is the backtick code-span delimiter, spelled as an escape so the
-# source stays readable in a shell heredoc.
-patterns = [
+# Characters either side of the identifier in which a number still belongs to
+# the claim (the longest real wording, the schema.html version row, is ~35).
+SUBJECT_WINDOW = 60
+IDENT = r'\b(?:CURRENT_SCHEMA_VERSION|schema_version)\b'
+# A ladder number: two or three digits, not part of a path, a line ref, an
+# issue ref, a version triple or a longer number. A leading `v` is skipped.
+NUM = r'(?<![\w.:#/-])v?([0-9]{2,3})(?![\w:/]|\.[0-9]|[0-9])'
+GAP = r'[^0-9\n]{0,%d}?' % SUBJECT_WINDOW
+SWEEP = [re.compile(IDENT + GAP + NUM), re.compile(NUM + GAP + IDENT)]
+# `CURRENT_SCHEMA_VERSION: i64 = 90` -> the width suffix is not a claim.
+TYPED = re.compile(r'(?<=[A-Za-z_]): *[iu](?:16|32|64|size)\b')
+
+# Explicit ident-less anchors (the residual, stated in the header). \x60 is
+# the backtick, spelled as an escape so the source stays readable in a heredoc.
+ANCHORS = [
     re.compile(r'Current schema = v([0-9]+)'),
-    re.compile(r'CURRENT_SCHEMA_VERSION *= *([0-9]+)'),
-    re.compile(r'schema_version=([0-9]+) — ladder complete'),
     re.compile(r'schema \*\*v([0-9]+)\*\* sqlite'),
-    re.compile(r'backends sit at \*\*schema_version=([0-9]+)'),
     re.compile(r'logical schema \*\*v([0-9]+)\*\*'),
-    # Markdown table form (release-notes.md Surface-at-vX.Y.Z table row):
-    #   | Schema | **v86** (CURRENT_SCHEMA_VERSION, both adapters) |
+    # release-notes.md table row: | Schema | **v86** (CURRENT_SCHEMA_VERSION ...
     re.compile(r'\| *Schema *\| *\*\*v([0-9]+)\*\* *\(\x60CURRENT_SCHEMA_VERSION'),
-    # ROADMAPs plain-prose current-state phrasing. Scoped to the exact
-    # phrase the current substrate has advanced to schema N (issue
-    # #2282) rather than a bare schema-([0-9]+) pattern -- a generic
-    # word-boundary pattern false-positives on legitimate HISTORICAL
-    # narrative mentions elsewhere in ROADMAP.md, e.g. advanced to
-    # schema 78 anchored to a past release, or schema 45 in ladder
-    # history, which are correct historical state, not drift.
+    # ROADMAP plain-prose current-state phrasing (#2282); scoped to the exact
+    # phrase because a bare schema-N pattern false-positives on history.
     re.compile(r'the current substrate has advanced to schema ([0-9]+)'),
-    # #3248 item 4. The postgres-guide schema-init summary
-    # (`schema_version: 90`) and the CONFIG_SCHEMA postgres row
-    # (`| ai-memory postgres schema | **v93** |`) are present-tense claims
-    # of the live ladder position that no anchor above could see.
-    re.compile(r'\bschema_version: ([0-9]+)\b'),
+    # CONFIG_SCHEMA postgres row: | ai-memory postgres schema | **v93** |
     re.compile(r'ai-memory postgres schema *\| *\*\*v([0-9]+)\*\*'),
-    # The schema.html version-row phrasings: `Current version: 97 at v1.0.0`
-    # and `Currently 98 (v1.0.0)`.
+    # schema.html phrasings.
     re.compile(r'\bCurrent version: ([0-9]+) at v[0-9]'),
     re.compile(r'\bCurrently ([0-9]+) \(v[0-9]+\.[0-9]+\.[0-9]+\)'),
-    # The html status-row cell `<td class="num">v90</td>` next to a
-    # `Schema version` label (tag-stripped: `Schema version (...) v90 Constant`).
     re.compile(r'\bSchema version \([^)]*\) v([0-9]+) Constant'),
+    re.compile(r'\bSchema version: v([0-9]+) at v[0-9]'),
+    re.compile(r'\bversion = ([0-9]+) \(v[0-9]+\.[0-9]+\.[0-9]+\)'),
 ]
-# The capabilities-envelope `schema_version: 2|3` is a wire-format pin, a
-# different SSOT from the storage ladder; a line that is about pinning or
-# negotiating it is not a ladder claim.
-CAPABILITY_PIN = re.compile(
-    r'\bpins?\b|\bpinned\b|capabilit|accept=|negotiat', re.IGNORECASE)
-LADDER_ANCHOR_SCHEMA_VERSION = patterns[8]
+# The html pill chip (`<span class="pill">v98 schema</span>`) is matched on the
+# RAW line: scoped to the chip so ladder prose never matches.
+PILL = re.compile(r'class="pill"[^>]*>\s*v([0-9]+) schema\s*<')
 
-path = os.environ['GATE_SCHEMA_FILE']
-is_html = os.environ['GATE_SCHEMA_HTML'] == '1'
 TAG = re.compile(r'<[^>]+>')
 WS = re.compile(r'\s+')
 PRIOR = re.compile(r'PRIOR RELEASE', re.IGNORECASE)
@@ -579,38 +598,94 @@ def plain(s):
     return WS.sub(' ', htmlmod.unescape(TAG.sub(' ', s))).strip()
 
 
-lines = open(path).read().splitlines()
-for ln, raw in enumerate(lines, 1):
-    line = raw
-    if is_html:
-        line = plain(raw)
-        # Release-card guard (mirrors html_window_historical in the numeric
-        # scanner): a card under a `PRIOR RELEASE` eyebrow is history.
-        window = ' '.join(plain(w) for w in lines[max(0, ln - 4):ln])
-        if PRIOR.search(window):
-            continue
-    seen = set()
-    for p in patterns:
-        if p is LADDER_ANCHOR_SCHEMA_VERSION and CAPABILITY_PIN.search(line):
-            continue
-        for m in p.finditer(line):
-            if m.group(1) in seen:
+canon = os.environ['GATE_SCHEMA_CANON']
+# A version TRANSITION (`CURRENT_SCHEMA_VERSION 71→72`) narrates a past bump:
+# the number before the arrow is history by construction, never a claim of the
+# current position.
+ARROW = re.compile(r'\s*(?:→|->)')
+
+rows = []
+# ---- the history ledger -------------------------------------------------
+ledger = {}
+for n, raw in enumerate(open(os.environ['GATE_SCHEMA_LEDGER'], encoding='utf-8').read().splitlines(), 1):
+    if not raw.strip() or raw.lstrip().startswith('#'):
+        continue
+    parts = raw.split('\t')
+    if len(parts) != 3 or not parts[0].strip() or not parts[1].strip() \
+            or not re.search(r'#[0-9]+', parts[2]):
+        rows.append(('LEDGER_BAD', 'schema-claim-history.txt', n, '-', raw.strip()[:160]))
+        continue
+    ledger.setdefault(parts[0].strip(), {})[parts[1]] = [n, False]
+
+files = os.environ.get('GATE_SCHEMA_FILES', '').split()
+for path in files:
+    is_html = path.endswith('.html')
+    lines = open(path, encoding='utf-8').read().splitlines()
+    entries = ledger.get(path, {})
+    for ln, raw in enumerate(lines, 1):
+        line = plain(raw) if is_html else raw
+        if is_html:
+            # Release-card guard (mirrors html_window_historical in the
+            # numeric scanner): a card under `PRIOR RELEASE` is history.
+            window = ' '.join(plain(w) for w in lines[max(0, ln - 4):ln])
+            if PRIOR.search(window):
                 continue
-            seen.add(m.group(1))
-            ctx = line.strip()[:160]
-            print(f'{ln}\t{m.group(1)}\t{ctx}')
+        probe = TYPED.sub('', line)
+        hits = []  # (value, matched span)
+        for rx in SWEEP:
+            for m in rx.finditer(probe):
+                if ARROW.match(probe, m.end(1)):
+                    continue
+                hits.append((m.group(1), m.group(0)))
+        for rx in ANCHORS:
+            hits.extend((m.group(1), m.group(0)) for m in rx.finditer(line))
+        if is_html:
+            hits.extend((m.group(1), m.group(0)) for m in PILL.finditer(raw))
+        seen = set()
+        for val, span in hits:
+            if val == canon or val in seen:
+                continue
+            # The ledger exempts ONE hit: the needle must sit inside the
+            # matched span, so a history phrase never shields a real claim
+            # that shares its line (schema.html carries both on one line).
+            hit_entry = [st for nd, st in entries.items() if nd in span]
+            if hit_entry:
+                for st in hit_entry:
+                    st[1] = True
+                continue
+            seen.add(val)
+            rows.append(('CLAIM', path, ln, val, line.strip()[:160]))
+
+for path, entries in ledger.items():
+    for needle, (n, used) in entries.items():
+        if not used:
+            rows.append(('LEDGER_STALE', path, n, '-', needle[:160]))
+for r in rows:
+    print('\t'.join(str(c) for c in r))
 SCHEMAPY
-        )" || {
-            printf 'FAIL: check-docs-vs-ssot: CURRENT_SCHEMA_VERSION analysis engine errored on %s (python exited non-zero) — refusing to report PASS (#2713 fail-closed)\n' "$f" >&2
-            exit 2
-        }
-        while IFS=$'\t' read -r ln val context; do
-            [[ -z "$val" ]] && continue
-            if [[ "$val" != "$CANONICAL_SCHEMA_VERSION" ]]; then
-                emit_fail "$rule_name" "$f" "$ln" "$val" "$CANONICAL_SCHEMA_VERSION" "$context"
-            fi
-        done <<< "$schema_rows"
-    done
+    )" || {
+        printf 'FAIL: check-docs-vs-ssot: CURRENT_SCHEMA_VERSION analysis engine errored (python exited non-zero) — refusing to report PASS (#2713 fail-closed)\n' >&2
+        exit 2
+    }
+    local kind file ln val context
+    while IFS=$'\t' read -r kind file ln val context; do
+        [[ -z "$kind" ]] && continue
+        case "$kind" in
+            CLAIM)
+                if [[ "$val" != "$CANONICAL_SCHEMA_VERSION" ]]; then
+                    emit_fail "$rule_name" "$file" "$ln" "$val" "$CANONICAL_SCHEMA_VERSION" "$context"
+                fi
+                ;;
+            LEDGER_BAD)
+                printf 'FAIL: schema-claim-history ledger: malformed entry at line %s "%s" (expected: <file><TAB><needle><TAB>#<issue> <note>)\n' "$ln" "$context" >&2
+                fail_count=$((fail_count + 1))
+                ;;
+            LEDGER_STALE)
+                printf 'FAIL: schema-claim-history ledger: STALE entry at line %s (%s no longer carries "%s") — delete it\n' "$ln" "$file" "$context" >&2
+                fail_count=$((fail_count + 1))
+                ;;
+        esac
+    done <<< "$schema_rows"
 }
 
 # Generic narrative-count rule.
@@ -1353,8 +1428,9 @@ def html_window_historical(window):
 # `schema=vNN` went unpoliced. The `schema=vNN` spelling is a present-tense
 # statement about what the current binary prints, so it is matched with every
 # historical guard EXCEPT the heading one.
-#   * Spacing, case and a code-span around the number are tolerated
-#     (`schema = V90`, `SCHEMA=v90`, `schema=`v90``); the `v` stays MANDATORY
+#   * Spacing, case, a code-span around the number and emphasis / escape
+#     markup are tolerated (`schema = V90`, `SCHEMA=v90`, `schema=`v90``,
+#     `schema\=v90`, `schema=**v90**`; see MD_MARKUP); the `v` stays MANDATORY
 #     because `schema_version = 2` (a config-file marker, a different SSOT)
 #     would otherwise be flagged 17 times.
 #   * The `=` form IS used in dated records (docs/releases/v0.6.3.1.md,
@@ -1366,7 +1442,13 @@ def html_window_historical(window):
 #   * Beyond DOC_FILES/HTML_DOC_FILES, the check also walks the pages that
 #     render the banner (GATE_BANNER_FILES, resolved at the top of the
 #     script), so a stale sample there cannot ship green.
-BOOT_BANNER_SCHEMA = re.compile(r"(?i)\bschema\s*=\s*`?v([0-9]+)\b(?!\.[0-9])")
+BOOT_BANNER_SCHEMA = re.compile(r"(?i)\bschema\s*=\s*v([0-9]+)\b(?!\.[0-9])")
+# Markdown markup that renders away (#4723): a backslash escape before
+# punctuation, emphasis (`*`, `_`) and code-span backticks of any width. The
+# matcher runs on the markup-stripped copy so `schema\=v90`, `schema=**v90**`,
+# `schema=_v90_` and a double-backtick span all read as the `schema=v90` they
+# render to. The original line stays the reported context.
+MD_MARKUP = re.compile(r"\\(?=[^\w\s])|[*_\x60]")
 banner_docs = os.environ.get("GATE_BANNER_FILES", "").split()
 
 
@@ -1374,7 +1456,7 @@ def banner_scan(f, ln, text, hist_window):
     if hist_window or is_historical(text, heading=False):
         return
     ctx = text.strip()[:160].replace("\t", " ")
-    for hit in BOOT_BANNER_SCHEMA.finditer(text):
+    for hit in BOOT_BANNER_SCHEMA.finditer(MD_MARKUP.sub("", text)):
         if hit.group(1) != canon["CURRENT_SCHEMA_VERSION"]:
             print(
                 "CURRENT_SCHEMA_VERSION\t"
@@ -1757,6 +1839,11 @@ run_self_test() {
 # fixture exemption SSOT
 docs/whats-new-v
 FROZENEOF
+    # #3248 (r3): the schema-claim history ledger the CURRENT_SCHEMA_VERSION
+    # sweep resolves against. One real entry so the allowlist direction is
+    # proven; the tabs are literal (file, needle, #issue note).
+    printf '# fixture ledger (comment-only; the schema phase seeds one real entry)\n' \
+        > scripts/qc-allowlists/schema-claim-history.txt
     # Minimal canonical fixture: CURRENT_SCHEMA_VERSION = 53
     cat > src/storage/migrations.rs <<EOF
 const CURRENT_SCHEMA_VERSION: i64 = 53;
@@ -2416,6 +2503,10 @@ EFGOOD
 **v0.6.3** boot sample: (schema=v19, 3 memories)
 At the v0.6.3.1 release the banner showed (schema=v19, 3 memories)
 #   db:         /home/u/.claude/ai-memory.db (schema=`v52`, 161 memories)
+#   db:         /home/u/.claude/ai-memory.db (schema\=v52, 161 memories)
+#   db:         /home/u/.claude/ai-memory.db (schema=**v52**, 161 memories)
+#   db:         /home/u/.claude/ai-memory.db (schema=_v52_, 161 memories)
+#   db:         /home/u/.claude/ai-memory.db (schema=``v52``, 161 memories)
 BOOTBANNER
     printf '<pre># db: /x.db (schema=v52, 1 memories)</pre>\n' > "$tmpdir/docs/banner-fixture.html"
     # An integration page that is NOT in DOC_FILES: enrolled for this check only.
@@ -2426,13 +2517,17 @@ BOOTBANNER
         'CURRENT_SCHEMA_VERSION: docs/integrations/README.md:1 claims "52"' \
         'CURRENT_SCHEMA_VERSION: docs/integrations/README.md:2 claims "52"' \
         'CURRENT_SCHEMA_VERSION: docs/integrations/README.md:6 claims "52"' \
+        'CURRENT_SCHEMA_VERSION: docs/integrations/README.md:7 claims "52"' \
+        'CURRENT_SCHEMA_VERSION: docs/integrations/README.md:8 claims "52"' \
+        'CURRENT_SCHEMA_VERSION: docs/integrations/README.md:9 claims "52"' \
+        'CURRENT_SCHEMA_VERSION: docs/integrations/README.md:10 claims "52"' \
         'CURRENT_SCHEMA_VERSION: docs/banner-fixture.html:1 claims "52"' \
         'CURRENT_SCHEMA_VERSION: docs/integrations/cursor.md:1 claims "52"'
     do grep -qF "$_want" <<<"$bb_out" || { echo "FAIL: self-test #3248 - not flagged: $_want" >&2; cd "$REPO_ROOT"; exit 1; }; done
     for _not in 'docs/integrations/README.md:3 ' 'docs/integrations/README.md:4 ' 'docs/integrations/README.md:5 '; do
         grep -qF "$_not" <<<"$bb_out" && { echo "FAIL: self-test #3248 - canonical/historical banner flagged: $_not" >&2; cd "$REPO_ROOT"; exit 1; }
     done
-    echo "PASS: self-test #3248 - boot-banner schema=vNN: stale REJECTED (md, html, spacing/case/code-span, banner-only page), canonical and dated history ACCEPTED"
+    echo "PASS: self-test #3248 - boot-banner schema=vNN: stale REJECTED (md, html, spacing/case/code-span, escaped-equals/bold/italic/double-backtick markup, banner-only page), canonical and dated history ACCEPTED"
     rm -f "$tmpdir/docs/integrations/README.md" "$tmpdir/docs/integrations/cursor.md" "$tmpdir/docs/banner-fixture.html"
 
     # ---- #3248 item 4: the schema-version rule reads the .html surface and the
@@ -2441,10 +2536,22 @@ BOOTBANNER
     # canonical value, a capabilities-envelope pin and a PRIOR RELEASE card
     # must not be.
     mkdir -p "$tmpdir/docs"
+    printf '# fixture ledger\ndocs/postgres-age-guide.md\tv52 rewrote the schema_version\t#3248 fixture history line\n' \
+        > scripts/qc-allowlists/schema-claim-history.txt
     cat > "$tmpdir/docs/postgres-age-guide.md" <<'SCHEMAMD'
    `schema_version: 52`) or the `--json` report.
    `schema_version: 53`) or the `--json` report.
 Clients that pin `schema_version: 2` keep receiving the v2 shape.
+the server pinned the ladder at schema_version: 52 today
+{"schema_version": 52, "tables": 35}
+doctor reports schema_version=52 for this db
+Tracks migration state. Current version: **52** (`CURRENT_SCHEMA_VERSION` in src/x.rs).
+the in-process upgrade ladder up to schema v52 (the current `CURRENT_SCHEMA_VERSION`) as a side effect
+# Expected: const CURRENT_SCHEMA_VERSION: i64 = 52;   (sqlite)
+# Expected: const CURRENT_SCHEMA_VERSION: i32 = 53;   (postgres)
+an unlisted wording: the ladder identifier schema_version sits at 52 on this host
+history: v52 rewrote the schema_version table
+{"schema_version": "3", "tier": "smart"}
 SCHEMAMD
     cat > "$tmpdir/docs/CONFIG_SCHEMA.md" <<'SCHEMACFG'
 | ai-memory postgres schema | **v52** | postgres ladder pinned in lockstep |
@@ -2458,6 +2565,14 @@ SCHEMACFG
 <div class="eyebrow">&#9656; PRIOR RELEASE</div>
 <div class="title">What's New in v0.5.0</div>
 <p>Then <code>CURRENT_SCHEMA_VERSION = 40</code></p>
+<p>filler line so the earlier release card has closed</p>
+<p>filler line so the earlier release card has closed</p>
+<p><strong>Schema version: v52 at v1.0.0</strong> (was v40 at v0.9.0)</p>
+<span class="pill">v52 schema</span>
+<text x="1" y="2">version = 52 (v1.0.0)</text>
+<p><strong>Schema version: v53 at v1.0.0</strong></p>
+<span class="pill">v53 schema</span>
+<text x="1" y="2">version = 53 (v1.0.0)</text>
 SCHEMAHTML
     sch_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1) && {
         echo "FAIL: self-test #3248 - stale schema claims (md anchors + html) not rejected" >&2; cd "$REPO_ROOT"; exit 1; }
@@ -2466,16 +2581,46 @@ SCHEMAHTML
         'CURRENT_SCHEMA_VERSION: docs/CONFIG_SCHEMA.md:1 claims "52"' \
         'CURRENT_SCHEMA_VERSION: docs/schema-fixture.html:1 claims "52"' \
         'CURRENT_SCHEMA_VERSION: docs/schema-fixture.html:2 claims "52"' \
-        'CURRENT_SCHEMA_VERSION: docs/schema-fixture.html:3 claims "52"'
+        'CURRENT_SCHEMA_VERSION: docs/schema-fixture.html:3 claims "52"' \
+        'CURRENT_SCHEMA_VERSION: docs/schema-fixture.html:10 claims "52"' \
+        'CURRENT_SCHEMA_VERSION: docs/schema-fixture.html:11 claims "52"' \
+        'CURRENT_SCHEMA_VERSION: docs/schema-fixture.html:12 claims "52"' \
+        'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:4 claims "52"' \
+        'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:5 claims "52"' \
+        'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:6 claims "52"' \
+        'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:7 claims "52"' \
+        'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:8 claims "52"' \
+        'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:9 claims "52"' \
+        'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:11 claims "52"'
     do grep -qF "$_want" <<<"$sch_out" || { echo "FAIL: self-test #3248 - not flagged: $_want" >&2; cd "$REPO_ROOT"; exit 1; }; done
     for _not in \
         'docs/postgres-age-guide.md:2 ' 'docs/postgres-age-guide.md:3 ' \
         'docs/CONFIG_SCHEMA.md:2 ' \
-        'docs/schema-fixture.html:4 ' 'docs/schema-fixture.html:7 '
+        'docs/schema-fixture.html:4 ' 'docs/schema-fixture.html:7 ' \
+        'docs/schema-fixture.html:13 ' 'docs/schema-fixture.html:14 ' 'docs/schema-fixture.html:15 ' \
+        'docs/postgres-age-guide.md:10 ' 'docs/postgres-age-guide.md:12 ' 'docs/postgres-age-guide.md:13 '
     do grep -qF "$_not" <<<"$sch_out" && { echo "FAIL: self-test #3248 - canonical/pin/history line flagged: $_not" >&2; cd "$REPO_ROOT"; exit 1; }
     done
-    echo "PASS: self-test #3248 - schema-version rule: stale md anchors + html REJECTED; canonical, capability pin and PRIOR RELEASE card ACCEPTED"
+    echo "PASS: self-test #3248 - schema-version rule: stale md anchors + html + json/bare/typed/pinned/unlisted wordings REJECTED; canonical, capability pin (value < 10), ledger history line and PRIOR RELEASE card ACCEPTED"
+    # Ledger fail-closed controls: malformed, stale and missing ledgers go red.
+    _led=scripts/qc-allowlists/schema-claim-history.txt
+    cp "$_led" "$_led.keep"
+    printf 'docs/postgres-age-guide.md\tneedle-without-issue-or-note\n' >> "$_led"
+    _led_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1 || true)
+    grep -qF 'malformed entry' <<<"$_led_out" \
+        || { echo "FAIL: self-test #3248 - malformed ledger entry not rejected" >&2; cd "$REPO_ROOT"; exit 1; }
+    cp "$_led.keep" "$_led"
+    printf 'docs/postgres-age-guide.md\tno such span anywhere\t#3248 stale on purpose\n' >> "$_led"
+    _led_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1 || true)
+    grep -qF 'STALE entry' <<<"$_led_out" \
+        || { echo "FAIL: self-test #3248 - stale ledger entry not rejected" >&2; cd "$REPO_ROOT"; exit 1; }
+    rm -f "$_led"
+    AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" >/dev/null 2>&1 \
+        && { echo "FAIL: self-test #3248 - missing ledger not rejected" >&2; cd "$REPO_ROOT"; exit 1; }
+    mv "$_led.keep" "$_led"
+    echo "PASS: self-test #3248 - schema sweep closed-world: planted wrong wordings (md, json, bare, typed-const, html tagline/pill/svg) REJECTED; ledger history and canonical ACCEPTED; malformed, stale and missing ledger REJECTED"
     rm -f "$tmpdir/docs/postgres-age-guide.md" "$tmpdir/docs/CONFIG_SCHEMA.md" "$tmpdir/docs/schema-fixture.html"
+    printf '# fixture ledger (comment-only)\n' > scripts/qc-allowlists/schema-claim-history.txt
 
     # ---- FAIL-CLOSED-ONLY-WITH-A-CLAIM: remove both SSOTs. A doc that
     # narrates NO count has nothing to validate and must stay green;
