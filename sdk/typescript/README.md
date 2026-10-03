@@ -592,5 +592,5 @@ AI_MEMORY_TEST_DAEMON=1 npm test   # integration tests against a live daemon
 
 - Main repo: <https://github.com/alphaone/ai-memory>
 - Architecture notes: [`docs/CLAUDE.md`](../../CLAUDE.md)
-- HTTP API handlers: [`src/handlers.rs`](../../src/handlers.rs)
+- HTTP API handlers: [`src/handlers/mod.rs`](../../src/handlers/mod.rs)
 - Validation rules: [`src/validate.rs`](../../src/validate.rs)
