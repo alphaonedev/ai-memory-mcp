@@ -433,30 +433,6 @@ PGVECTOR_DOC_FILES=(
     docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md
 )
 
-# Doc surfaces the asi-hard KNOBS-count rule walks. Its OWN scan set
-# ("one rule, one scan set"): the surfaces that narrate the pinned-knob
-# count as a PRESENT fact. Three of them (SECURITY.md, docs/deploy/*)
-# are in no other scan set at all, which is exactly why the post-#3033
-# 17-vs-21 drift was invisible.
-#
-# DELIBERATELY EXCLUDES:
-#   * CHANGELOG.md — every entry is a landing-time snapshot; "the
-#     existing 17-knob asi-hard hardened set" was TRUE when written.
-#   * docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md — it
-#     already says 21 in its current-state row AND carries a signed
-#     `17`-knob EVIDENCE note recording what the captured `.out`
-#     artifacts rendered PRE-#3033. Re-pointing an evidence note at the
-#     canonical would falsify the record the cert rests on.
-#   * infra/federation-lab/README.md — a campaign log, same class.
-KNOB_DOC_FILES=(
-    SECURITY.md
-    README.md
-    docs/deploy/README.md
-    docs/deploy/asi-hard.env
-    docs/deploy/enterprise-federation.env
-    docs/enterprise-deployment.md
-)
-
 # Doc surface the enterprise-federation posture check-count rule walks.
 CERT_CHECK_DOC_FILES=(
     docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md
@@ -1285,6 +1261,27 @@ def html_window_historical(window):
                for m in HTML_HIST_WHATSNEW.finditer(joined))
 
 
+# BOOT-BANNER SAMPLE OUTPUT (#3248 item 4). The integration docs show the
+# `ai-memory boot` status block as a `#`-prefixed transcript, e.g.
+# `#   db: ~/.claude/ai-memory.db (schema=v90, 161 memories)`. The shared
+# `^\s*#{1,6}\s` markdown-heading guard treats that `#` as a heading and
+# skips the line, so a stale `schema=vNN` went unpoliced. The `schema=vNN`
+# spelling is a PRESENT-tense statement about what the current binary prints
+# (ladder history never uses the `=` form), so it is matched with every
+# historical guard EXCEPT the heading one.
+BOOT_BANNER_SCHEMA = re.compile(r"\bschema=v([0-9]+)\b")
+NON_HEADING_HISTORICAL = HISTORICAL[1:]
+
+
+def is_historical_nonheading(line):
+    m = PARA_LEAD.match(line)
+    if m and m.group(1) != release:
+        return True
+    if any(p.search(line) for p in PAST_TENSE):
+        return True
+    return any(p.search(line) for p in NON_HEADING_HISTORICAL)
+
+
 def scan(f, is_html):
     try:
         text = open(f, encoding="utf-8").read()
@@ -1308,6 +1305,14 @@ def scan(f, is_html):
                     "CURRENT_RELEASE_ATTRIBUTION\t"
                     f"{f}\t{ln}\tv{m.group(1)}\tv{release}\t{ctx}"
                 )
+            if not is_historical_nonheading(line):
+                for hit in BOOT_BANNER_SCHEMA.finditer(line):
+                    if hit.group(1) != canon["CURRENT_SCHEMA_VERSION"]:
+                        print(
+                            "CURRENT_SCHEMA_VERSION\t"
+                            f"{f}\t{ln}\t{hit.group(1)}\t"
+                            f"{canon['CURRENT_SCHEMA_VERSION']}\t{ctx}"
+                        )
             if is_historical(line):
                 continue
         for key, pats in RULES:
@@ -1405,11 +1410,11 @@ run_all_rules() {
     # Known limitation (stated, not hidden): a NEW phrasing that none of these
     # alternatives match would evade the rule. Add its shape here in the same
     # commit that introduces it.
-    # CANONICAL RULE for this SSOT. PR #3169 proposes a second, overlapping
-    # asi-hard knob-count rule with its own scan set; this one supersedes it
-    # (it walks a strict superset of those surfaces) and the duplicate is to be
-    # collapsed into this rule at #3169's rebase — one rule, one SSOT, one
-    # scan set.
+    # CANONICAL AND ONLY RULE for this SSOT (#3248 item 3). A second,
+    # overlapping rule over a 6-file subset (five of this
+    # rule's twelve anchors) used to report every drift twice; it was removed
+    # because this rule walks a strict superset of its surfaces and anchors.
+    # One rule, one SSOT, one scan set.
     # Coverage as verified at this commit (a rule whose regex matches nothing
     # in a listed file is a no-op that still reports PASS, so this is stated
     # rather than assumed, and re-verified whenever a file is enrolled):
@@ -1555,17 +1560,6 @@ run_all_rules() {
         "$CANONICAL_CLI_SAL" \
         'default build / ([0-9]+) under' \
         "${HTML_DOC_FILES[@]}"
-    # asi-hard pinned-knob count (src/security_profile.rs::KNOBS).
-    # FIVE anchors, all BOLD- or hyphen-delimited so a bare integer next
-    # to the word "knobs" can never match. The bold delimiter on the
-    # `is **N** knobs` form is load-bearing: docs/deploy/README.md says
-    # "the config-backed PE-1 knobs and", and a bare `([0-9]+) knobs`
-    # anchor captures the `1` out of `PE-1` and reports phantom drift.
-    check_narrative_count_rule \
-        "asi-hard KNOBS count (src/security_profile.rs::KNOBS)" \
-        "$CANONICAL_ASI_HARD_KNOBS" \
-        'is \*\*([0-9]+) knobs\*\*|PINS \*\*([0-9]+)\*\* security env knobs|([0-9]+)-knob\b|([0-9]+)-entry pin-and-refuse|all \*\*([0-9]+)\*\* `KNOBS` entries' \
-        "${KNOB_DOC_FILES[@]}"
     # enterprise-federation posture check count
     # (enterprise_federation_posture::ENTERPRISE_FEDERATION_CHECK_COUNT).
     # ONE anchor: the cert doc's NORMATIVE exit contract. Scoped that
@@ -2244,9 +2238,9 @@ EFSTALE
         cd "$REPO_ROOT"; exit 1
     fi
     for _want in \
-        'asi-hard KNOBS count (src/security_profile.rs::KNOBS): SECURITY.md:1 claims "4"' \
-        'asi-hard KNOBS count (src/security_profile.rs::KNOBS): SECURITY.md:2 claims "4"' \
-        'asi-hard KNOBS count (src/security_profile.rs::KNOBS): docs/deploy/README.md:2 claims "4"' \
+        'ASI_HARD_PINNED_KNOB_COUNT: SECURITY.md:1 claims "4"' \
+        'ASI_HARD_PINNED_KNOB_COUNT: SECURITY.md:2 claims "4"' \
+        'ASI_HARD_PINNED_KNOB_COUNT: docs/deploy/README.md:2 claims "4"' \
         'ENTERPRISE_FEDERATION_CHECK_COUNT: docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md:1 claims "6"'
     do
         grep -qF "$_want" <<<"$knob_out" || {

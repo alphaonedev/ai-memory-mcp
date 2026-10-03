@@ -154,7 +154,7 @@ no black-box behaviour:
 ```text
 # ai-memory boot: ok
 #   version:    1.0.0
-#   db:         /home/u/.claude/ai-memory.db (schema=v90, 161 memories)
+#   db:         /home/u/.claude/ai-memory.db (schema=v100, 161 memories)
 #   tier:       autonomous (embedder=nomic-embed-text-v1.5, reranker=ms-marco-MiniLM-L-6-v2, llm=xai:grok-4.3)
 #   latency:    12ms
 #   namespace:  ai-memory-mcp (loaded 10 memories)
