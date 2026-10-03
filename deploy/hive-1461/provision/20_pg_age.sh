@@ -7,8 +7,12 @@
 # + ai-memory schema-init (v55 + ai_memory_kg graph). Peers only.
 #
 # Secret handling: a single fleet PG password is generated once into the
-# gitignored run dir (mode 0600) and passed by env / psql var — never written
-# to a committed file and never echoed.
+# gitignored run dir (mode 0600) and never written to a committed file or
+# echoed. It reaches the peers over ssh STDIN into 0600 files, and from those
+# files into docker (--env-file), psql (\getenv in bootstrap.sql) and
+# schema-init (AI_MEMORY_STORE_URL_FILE) — never as an argv word on this host,
+# on the peer (the ssh remote command string is argv there), or in docker's
+# process list (#4603, #4617).
 source "$(dirname "$0")/lib.sh"
 
 SECRETS_DIR="$RUN_DIR/secrets"; mkdir -p "$SECRETS_DIR"; chmod 700 "$SECRETS_DIR"
@@ -18,6 +22,14 @@ if [ ! -s "$PG_PW_FILE" ]; then openssl rand -hex 24 > "$PG_PW_FILE"; chmod 600 
 if [ ! -s "$SU_PW_FILE" ]; then openssl rand -hex 24 > "$SU_PW_FILE"; chmod 600 "$SU_PW_FILE"; log "generated postgres superuser password -> $SU_PW_FILE"; fi
 PG_PW="$(cat "$PG_PW_FILE")"
 SU_PW="$(cat "$SU_PW_FILE")"
+
+# put_secret <ip> <remote-path>: write STDIN to a 0600 root-only file on the peer.
+# ssh_node uses -n (no stdin), so this talks to ssh directly; the path is the
+# only argv, the secret travels on stdin.
+put_secret() {
+  # shellcheck disable=SC2086
+  ssh $SSH_OPTS "root@${1}" "umask 077; cat > '$2'"
+}
 
 DOCKERFILE="$HIVE_ROOT/provision/pg-age/Dockerfile"
 BOOTSTRAP="$HIVE_ROOT/provision/pg-age/bootstrap.sql"
@@ -31,26 +43,33 @@ inv_ips_by_role peer | while read -r ip; do
   scp_to "$BOOTSTRAP" "$ip" "/opt/hive/pg-age/bootstrap.sql"
   ssh_node "$ip" "docker build --build-arg AGE_IMAGE='$AGE_IMAGE' -t hive-pg-age:local /opt/hive/pg-age" >/dev/null
 
+  SECRET_DIR="/opt/hive/pg-age/.secrets"
+  ssh_node "$ip" "umask 077; mkdir -p '$SECRET_DIR'; chmod 0700 '$SECRET_DIR'"
+  printf 'POSTGRES_PASSWORD=%s\n' "$SU_PW" | put_secret "$ip" "$SECRET_DIR/su-init.env"
+  printf 'PGPASSWORD=%s\nAIMEMORY_PW=%s\n' "$SU_PW" "$PG_PW" | put_secret "$ip" "$SECRET_DIR/psql.env"
+  printf 'postgres://aimemory:%s@127.0.0.1:5432/aimemory\n' "$PG_PW" | put_secret "$ip" "$SECRET_DIR/store-url"
+
   log "[$host] (re)starting hive-pg-age container (localhost:5432, persistent volume)"
   ssh_node "$ip" "docker rm -f hive-pg-age 2>/dev/null || true; docker volume create hive-pgdata >/dev/null; \
     docker run -d --name hive-pg-age --restart unless-stopped \
       -p 127.0.0.1:5432:5432 -v hive-pgdata:/var/lib/postgresql/data \
-      -e POSTGRES_PASSWORD='$SU_PW' hive-pg-age:local >/dev/null"
+      --env-file '$SECRET_DIR/su-init.env' hive-pg-age:local >/dev/null"
 
   log "[$host] waiting for postgres ready"
   ssh_node "$ip" "for i in \$(seq 1 60); do docker exec hive-pg-age pg_isready -U postgres >/dev/null 2>&1 && exit 0; sleep 2; done; echo 'pg not ready' >&2; exit 1"
 
   log "[$host] running idempotent SQL bootstrap (role/db/age/vector/grants/search_path)"
-  ssh_node "$ip" "docker exec -i -e PGPASSWORD='$SU_PW' hive-pg-age psql -v ON_ERROR_STOP=1 -v pw='$PG_PW' -U postgres -f - < /opt/hive/pg-age/bootstrap.sql >/dev/null"
+  ssh_node "$ip" "docker exec -i --env-file '$SECRET_DIR/psql.env' hive-pg-age psql -v ON_ERROR_STOP=1 -U postgres -f - < /opt/hive/pg-age/bootstrap.sql >/dev/null"
 
   log "[$host] verifying extensions"
-  exts="$(ssh_node "$ip" "docker exec -e PGPASSWORD='$SU_PW' hive-pg-age psql -tAqc \"SELECT extname FROM pg_extension WHERE extname IN ('age','vector') ORDER BY extname\" -U postgres aimemory")"
+  exts="$(ssh_node "$ip" "docker exec --env-file '$SECRET_DIR/psql.env' hive-pg-age psql -tAqc \"SELECT extname FROM pg_extension WHERE extname IN ('age','vector') ORDER BY extname\" -U postgres aimemory")"
   echo "$exts" | grep -q age    || die "[$host] age extension missing"
   echo "$exts" | grep -q vector || die "[$host] vector(pgvector) extension missing"
   log "[$host] extensions OK: $(echo $exts | tr '\n' ' ')"
 
   log "[$host] ai-memory schema-init (v55 + ai_memory_kg graph, vector($EMBED_DIM))"
-  ssh_node "$ip" "/usr/local/bin/ai-memory schema-init --embedding-dim $EMBED_DIM --store-url 'postgres://aimemory:$PG_PW@127.0.0.1:5432/aimemory'"
+  ssh_node "$ip" "AI_MEMORY_STORE_URL_FILE='$SECRET_DIR/store-url' /usr/local/bin/ai-memory schema-init --embedding-dim $EMBED_DIM"
+  ssh_node "$ip" "rm -rf '$SECRET_DIR'"
   log "[$host] PG+AGE substrate ready"
 done
 log "peer DB substrate complete on all peers"
