@@ -28,8 +28,15 @@ The gate scans the files matching ``infra/*/cloud-init-memory*.tpl`` on disk
     floor, src/transit_encryption.rs:436-446);
   * the store URL dials the PgBouncer port 6432 (#4654: the daemon connects
     straight to Postgres so one verified TLS hop covers the whole path);
-  * a template that configures a local Postgres lacks ``ssl = on`` or a
-    ``hostssl`` pg_hba line (#4654);
+  * a template that configures a local Postgres lacks ``ssl = on``, a
+    ``hostssl`` pg_hba line, or the all-roles ``hostnossl all all all reject``
+    line that makes every packaged ``host`` line TLS-only (#4654, #4676);
+  * the store URL carries ``channel_binding`` (the connect funnel drops it, so
+    it would be false assurance, #4677);
+  * a script root runs (an ExecStart that is a ``.sh`` file) sits under a
+    directory the template chowns recursively to the service user (#4674);
+  * a ``content: |`` block holds a line indented less than the block, which
+    ends the block scalar and makes the whole cloud-config invalid YAML (#4707);
   * a template that downloads ``ai_memory_image_url`` does not check
     ``sha256sum -c`` before ``tar`` extracts it, or ignores a failed
     download or extraction with ``|| true`` (#4637);
@@ -60,6 +67,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 SERVE_SRC = ROOT / "src" / "daemon_runtime.rs"
 TEMPLATE_GLOB = "infra/*/cloud-init-memory*.tpl"
+ALL_TEMPLATE_GLOB = "infra/*/cloud-init-*.tpl"
 REQUIRED_FLAGS = ("--tls-cert", "--tls-key")
 
 # The PgBouncer listen port. No template store URL may dial it (#4654).
@@ -70,6 +78,11 @@ HEX40_RE = re.compile(r"^[0-9a-f]{40}$")
 DSN_RE = re.compile(r"^\s+(postgres(?:ql)?://\S+)\s*$", re.M)
 TF_INTERP_RE = re.compile(r"\$\{[^}]*\}")
 HOST_PORT_RE = re.compile(r"@([^/?#@]*)(?:[/?#]|$)")
+NOSSL_REJECT_RE = re.compile(r"^[^#\n]*\bhostnossl\s+all\s+all\s+all\s+reject\b", re.M)
+CHOWN_R_RE = re.compile(r"^[^#\n]*\bchown\s+-R\s+aimemory(?::\w+)?\s+[\"']?([/\w$.{}-]+)", re.M)
+ROOT_SCRIPT_RE = re.compile(r"^[ \t]*ExecStart=(/[^\s]+\.sh)\b", re.M)
+BLOCK_KEY_RE = re.compile(r"^(\s*)(?:- )?(?:\w[\w.-]*): [|>][-+]?\s*$")
+YAML_SHAPE_RE = re.compile(r"^\s*(?:#|%\{|- |[\w.-]+:(?:\s|$))")
 CREATE_USER_RE = re.compile(r"PASSWORD\s+'\$\{", re.I)
 STRUCT_RE = re.compile(r"pub struct ServeArgs \{(.*?)\n\}", re.S)
 FIELD_RE = re.compile(r"^\s{4}pub (\w+):", re.M)
@@ -147,6 +160,8 @@ def dsn_hits(name: str, text: str) -> list:
         modes = [p.split("=", 1)[1].strip().lower() for p in query.split("&") if p.lower().startswith("sslmode=")]
         if not modes or modes[-1] != "verify-full":
             hits.append("%s: store URL has no sslmode=verify-full (serve refuses it at start, #3705 floor, src/transit_encryption.rs:436-446)" % name)
+        if any(p.lower().startswith("channel_binding") for p in query.split("&")):
+            hits.append("%s: store URL carries channel_binding, which the connect funnel drops (src/store/postgres/dsn.rs:60-79): it would be false assurance (#4677)" % name)
         hp = HOST_PORT_RE.search(base)
         if hp and hp.group(1).rpartition(":")[2] == PGBOUNCER_PORT:
             hits.append("%s: store URL dials the pgbouncer port %s (#4654: connect straight to postgres; a transaction pooler drops the session state the driver sets)" % (name, PGBOUNCER_PORT))
@@ -161,6 +176,14 @@ def provision_hits(name: str, text: str) -> list:
             hits.append("%s: configures a local postgres without 'ssl = on' (#4635)" % name)
         if not re.search(r"hostssl\s", text):
             hits.append("%s: configures a local postgres with no 'hostssl' pg_hba line (#4635)" % name)
+        if not NOSSL_REJECT_RE.search(text):
+            hits.append("%s: configures a local postgres with no 'hostnossl all all all reject' pg_hba line: the packaged 'host all all' lines would admit non-TLS TCP logins (#4676)" % name)
+    for m in CHOWN_R_RE.finditer(text):
+        base = m.group(1).rstrip("/") + "/"
+        for sm in ROOT_SCRIPT_RE.finditer(text):
+            if sm.group(1).startswith(base):
+                lineno = text.count("\n", 0, sm.start()) + 1
+                hits.append("%s:%d: root-run script %s sits under %s, which is chowned to the service user: the service user could replace it and run as root (#4674)" % (name, lineno, sm.group(1), m.group(1)))
     for m in CREATE_USER_RE.finditer(text):
         lineno = text.count("\n", 0, m.start()) + 1
         hits.append("%s:%d: a terraform value is written straight into a SQL password literal (decode and quote it on the node, #4638)" % (name, lineno))
@@ -172,6 +195,34 @@ def provision_hits(name: str, text: str) -> list:
         for m in re.finditer(r"^[^#\n]*\b(?:curl|tar)\b[^\n]*\|\|\s*true\s*$", text, re.M):
             lineno = text.count("\n", 0, m.start()) + 1
             hits.append("%s:%d: a failed tarball download or extraction is ignored with '|| true' (#4637)" % (name, lineno))
+    return hits
+
+
+def yaml_block_hits(name: str, text: str) -> list:
+    """#4707: a block scalar line indented less than its block ends the scalar."""
+    hits = []
+    block = None  # indent of the key that opened the block, or None
+    inner = None  # indent of the first block line
+    for lineno, line in enumerate(text.splitlines(), 1):
+        m = BLOCK_KEY_RE.match(line)
+        if block is not None:
+            if not line.strip():
+                continue
+            indent = len(line) - len(line.lstrip(" "))
+            if inner is None and indent > block:
+                inner = indent
+            if indent > block and (inner is None or indent >= inner):
+                continue
+            if indent > block:
+                hits.append("%s:%d: line indented less than its 'content: |' block ends the block scalar (cloud-config would not parse, #4707)" % (name, lineno))
+                continue
+            block = None
+            inner = None
+            if not YAML_SHAPE_RE.match(line):
+                hits.append("%s:%d: line at column %d is not YAML: the 'content: |' block above ended early (#4707)" % (name, lineno, indent))
+        if block is None and m:
+            block = len(m.group(1))
+            inner = None
     return hits
 
 
@@ -197,6 +248,7 @@ def scan_text(name: str, text: str, known: set) -> list:
     hits.extend(dsn_hits(name, text))
     hits.extend(provision_hits(name, text))
     hits.extend(pin_hits(name, text))
+    hits.extend(yaml_block_hits(name, text))
     invocations = serve_invocations(text)
     if not invocations:
         hits.append("%s: no ExecStart runs 'ai-memory serve' (nothing to check; a template that cannot start serve must not pass)" % name)
@@ -230,7 +282,7 @@ def self_test(known: set) -> int:
     good = dsn + unit
     pg_conf = '      PGCONF="/etc/postgresql/18/main/postgresql.conf"\n'
     ssl = '      printf "ssl = on\\n" >> "$PGCONF"\n'
-    hba = '      printf "hostssl aimemory aimemory 127.0.0.1/32 scram-sha-256\\n" >> "$HBA"\n'
+    hba = '      printf "hostnossl all all all reject\\nhostssl aimemory aimemory 127.0.0.1/32 scram-sha-256\\n" >> "$HBA"\n'
     fetch = '      curl -fsSL "${ai_memory_image_url}" -o "$DL/a.tar.gz"\n'
     digest = '      echo "${ai_memory_image_sha256}  $DL/a.tar.gz" | sha256sum -c -\n'
     extract = '      tar -xzf "$DL/a.tar.gz" -C /opt/ai-memory/bin\n'
@@ -255,6 +307,11 @@ def self_test(known: set) -> int:
         "pgbouncer port": good.replace("@localhost/", "@localhost:6432/"),
         "local postgres without ssl": good + pg_conf + hba,
         "local postgres without hostssl": good + pg_conf + ssl,
+        "local postgres, reject scoped to one database": good + pg_conf + ssl + '      printf "hostssl aimemory aimemory 127.0.0.1/32 scram-sha-256\\nhostnossl aimemory aimemory all reject\\n" >> "$HBA"\n',
+        "local postgres, reject only in a comment": good + pg_conf + ssl + '      printf "hostssl aimemory aimemory 127.0.0.1/32 scram-sha-256\\n" >> "$HBA"\n      # hostnossl all all all reject\n',
+        "channel_binding in the store URL": good.replace("sslrootcert=/c", "sslrootcert=/c&channel_binding=require"),
+        "root-run script under a service-user-owned directory": good + "ExecStart=/opt/ai-memory/fed-bootstrap.sh\n      chown -R aimemory:aimemory /opt/ai-memory\n",
+        "block scalar line at column 0": good + "  - path: /x\n    content: |\n      #!/bin/sh\nimport os\n      echo hi\n",
         "raw password in a SQL literal": good + "      psql -c \"CREATE USER aimemory WITH PASSWORD '${db_password}';\"\n",
         "tarball with no digest check": good + fetch + extract,
         "tarball extracted before the digest check": good + fetch + extract + digest,
@@ -292,6 +349,8 @@ def self_test(known: set) -> int:
         "interpolated password in the url": good.replace("postgres://u:p@", "postgres://u:${urlencode(db_password)}@"),
         "local postgres with tls": good + pg_conf + ssl + hba,
         "digest checked before extract": good + fetch + digest + extract,
+        "root-run script outside the chowned directory": good + "ExecStart=/usr/local/sbin/fed-bootstrap.sh\n      chown -R aimemory:aimemory /var/lib/ai-memory\n",
+        "block scalar well indented": good + "  - path: /x\n    content: |\n      import os\n      echo hi\n  - path: /y\n",
         "terraform directive": good.rstrip() + "%{ if x } --quorum-writes 2%{ endif }\n",
     }
     clean = 0
@@ -330,6 +389,11 @@ def main(argv: list) -> int:
         hits = []
         for path in templates:
             hits.extend(scan_text(str(path.relative_to(ROOT)), path.read_text(encoding="utf-8"), known))
+        # Every cloud-init template (agent and loadgen too) must be valid YAML in
+        # its block scalars (#4707); the serve rules above apply to memory only.
+        for path in sorted(ROOT.glob(ALL_TEMPLATE_GLOB)):
+            if path not in templates:
+                hits.extend(yaml_block_hits(str(path.relative_to(ROOT)), path.read_text(encoding="utf-8")))
     except (OSError, RuntimeError, UnicodeDecodeError) as exc:
         print("FAULT: %s" % exc, file=sys.stderr)
         return 2

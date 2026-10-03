@@ -196,14 +196,17 @@ write_files:
           "ssl_cert_file = '$PGTLS/server.crt'" "ssl_key_file = '$PGTLS/server.key'" \
           "ssl_min_protocol_version = 'TLSv1.2'" >> "$PGCONF"
       fi
-      # aimemory may only connect with TLS over TCP: hostssl lines first, then
-      # a reject for any non-TLS TCP attempt (first matching line wins).
+      # No role may log in to any database over TCP without TLS (#4676): the
+      # first line rejects every non-TLS TCP attempt (hostnossl, all roles, all
+      # databases, all addresses), so the packaged `host all all` lines below
+      # are only reachable over TLS (first matching line wins). Unix-socket
+      # `local` lines are unaffected.
       HBA="/etc/postgresql/18/main/pg_hba.conf"
       if ! grep -q "^# ai-memory-tls (#4635)" "$HBA"; then
         { printf '%s\n' "# ai-memory-tls (#4635)" \
+            "hostnossl all all all reject" \
             "hostssl aimemory aimemory 127.0.0.1/32 scram-sha-256" \
-            "hostssl aimemory aimemory ::1/128 scram-sha-256" \
-            "hostnossl aimemory aimemory all reject"
+            "hostssl aimemory aimemory ::1/128 scram-sha-256"
           cat "$HBA"; } > "$HBA.new"
         chown --reference="$HBA" "$HBA.new"
         chmod --reference="$HBA" "$HBA.new"
