@@ -219,9 +219,25 @@ def self_test(known: set) -> int:
         "short commit pin": good + "      AGE_COMMIT=e43dc1a\n",
         "serve with unidentified binary": dsn + "ExecStart=/opt/ai-memory/bin/wrapper serve --host 0.0.0.0 --tls-cert /a --tls-key /b\n",
     }
+    # #4654: probes judged under the do-hive template's own name, each with the
+    # message fragment that must be among the hits, so neither a per-template
+    # exemption nor an unrelated hit can make them pass.
+    hive = "infra/do-hive/cloud-init-memory.yaml.tpl"
+    named_probes = {
+        "do-hive store URL without verify-full": (hive, good.replace("?sslmode=verify-full&sslrootcert=/c", ""), "no sslmode=verify-full"),
+        "do-hive store URL with weak sslmode": (hive, good.replace("verify-full", "require"), "no sslmode=verify-full"),
+        "do-hive store URL on the pgbouncer port": (hive, good.replace("@localhost/", "@127.0.0.1:6432/"), "pgbouncer port"),
+        "do-hive store URL on a host-qualified pgbouncer port": (hive, good.replace("@localhost/", "@localhost:6432/"), "pgbouncer port"),
+    }
     red = 0
     for label, text in probes.items():
         if scan_text(label, text, known):
+            red += 1
+        else:
+            print("SELF-TEST FAIL: probe not flagged: " + label, file=sys.stderr)
+    for label, (name, body, fragment) in named_probes.items():
+        probes[label] = body
+        if any(fragment in hit for hit in scan_text(name, body, known)):
             red += 1
         else:
             print("SELF-TEST FAIL: probe not flagged: " + label, file=sys.stderr)
