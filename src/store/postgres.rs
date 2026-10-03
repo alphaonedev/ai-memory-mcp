@@ -87,6 +87,8 @@ mod tx_retry;
 // take NO relation-level DDL lock on connect. Own module for the same
 // qual_10 budget reason as `parity_3064` above.
 mod bootstrap_ddl;
+mod governance_chain_4477; // #4477 one chain builder, #4492 bind depth (qual_10 budget)
+mod ns_standard_ancestor_4356; // #4356 bind gate (own module: qual_10 budget)
 // v1.0.0 #3614 — the lineage walk (recursive CTE + AGE Cypher + the backend
 // dispatcher + the #3041 cycle check) and its two helpers. Own module for the
 // same qual_10 budget reason as `parity_3064` above: a pure MOVE (rule l),
@@ -107,7 +109,9 @@ pub mod dsn;
 mod merge_inbound_4023;
 // v1.0.0 #3124 R4 — the audited `reown` sweep. Own module for the same
 // qual_10 budget reason as `parity_3064` above.
+mod governance_corrupt_4285;
 mod reown_3124;
+pub use governance_corrupt_4285::list_corrupt_governance_standards_pg;
 mod swarm_rewind;
 // v1.0.0 #4329 / #4330 — the ascending-id (COLLATE "C") row-lock step for the
 // forget and run_gc evict sets. Own module for the qual_10 budget.
@@ -3309,6 +3313,7 @@ impl PostgresStore {
                 // regression refuses the connect (fail closed) unless the
                 // operator override acknowledges it.
                 store.enforce_lineage_watermarks().await?;
+                store.warn_corrupt_governance_standards_at_boot().await; // #4285
                 // v1.0.0 #2578 — self-heal the v88 composite ordering
                 // indexes on EVERY connect, not only inside the v88 arm.
                 // The arm is FAIL-OPEN (an index is derived, disposable
@@ -18705,62 +18710,6 @@ async fn pg_auto_detect_parent(
     Ok(None)
 }
 
-/// v0.7.0 H10 — transaction-bound twin of
-/// [`PostgresStore::build_namespace_chain`]. Reads every
-/// `namespace_meta.parent_namespace` lookup through the supplied tx so
-/// the chain walk shares a snapshot with the downstream policy lookup +
-/// pending_actions INSERT. Logic identical to the trait method — the
-/// only delta is `fetch_optional(&mut *tx)` instead of `&self.pool`.
-///
-/// # F-A2A1.2 inheritance recursion cap
-///
-/// The governance-inheritance walk is capped at
-/// [`GOVERNANCE_INHERITANCE_DEPTH_CAP`] (= 5) intermediate levels per the
-/// v0.7.0 spec. Both the `/`-derived ancestor chain and the explicit
-/// `namespace_meta.parent_namespace` walk are bounded by the same cap so a
-/// pathological deep namespace cannot blow the policy resolver's bind list
-/// or its connection-hold budget. The implicit `"*"` global standard is
-/// always retained and is not counted toward the cap.
-/// #2542 — the concrete owner (`metadata.agent_id`) of `namespace`'s bound
-/// standard, or `None` when there is no standard bound, the pointer is severed /
-/// dangling, or the standard is UNOWNED (empty / exact `system`). Read through
-/// the supplied `tx` (snapshot parity with the chain walk). Postgres twin of
-/// `storage::namespace_standard_owner`.
-async fn pg_namespace_standard_owner_in_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    namespace: &str,
-) -> StoreResult<Option<String>> {
-    let row: Option<(Option<String>,)> = sqlx::query_as(
-        "SELECT m.metadata->>'agent_id' FROM namespace_meta nm \
-         JOIN memories m ON m.id = nm.standard_id WHERE nm.namespace = $1",
-    )
-    .bind(namespace)
-    .fetch_optional(&mut **tx)
-    .await
-    .map_err(|e| to_store_err("pg_namespace_standard_owner_in_tx", e))?;
-    Ok(row
-        .and_then(|(o,)| o)
-        .filter(|o| !o.is_empty() && o != "system"))
-}
-
-/// #2542 — pool-side twin of [`pg_namespace_standard_owner_in_tx`].
-async fn pg_namespace_standard_owner_pool(
-    pool: &sqlx::PgPool,
-    namespace: &str,
-) -> StoreResult<Option<String>> {
-    let row: Option<(Option<String>,)> = sqlx::query_as(
-        "SELECT m.metadata->>'agent_id' FROM namespace_meta nm \
-         JOIN memories m ON m.id = nm.standard_id WHERE nm.namespace = $1",
-    )
-    .bind(namespace)
-    .fetch_optional(pool)
-    .await
-    .map_err(|e| to_store_err("pg_namespace_standard_owner_pool", e))?;
-    Ok(row
-        .and_then(|(o,)| o)
-        .filter(|o| !o.is_empty() && o != "system"))
-}
-
 /// #2542 — one structured WARN per governance resolution that dropped a
 /// cross-tenant `parent_namespace` graft on postgres. Mirrors the sqlite
 /// `storage::warn_governance_graft_excluded`.
@@ -18778,197 +18727,39 @@ fn pg_warn_governance_graft_excluded(resolving_for: &str, child: &str, parent: &
     );
 }
 
-/// #2542 — build the namespace inheritance chain through the supplied `tx`.
-///
-/// `governance` selects the VIEW, mirroring the sqlite `ChainView`:
-/// - `false` (LOOKUP): follow every `parent_namespace` link.
-/// - `true` (GOVERNANCE): follow a `parent_namespace` link ONLY when ENTITLED —
-///   the parent is UNOWNED or owned by the SAME principal as the namespace being
-///   resolved. A cross-tenant parent (and everything above it) is dropped with a
-///   WARN, so it cannot graft governance/approver policy onto this write. This is
-///   the exact Route-1 bind ownership rule re-checked at resolution; it closes a
-///   TOCTOU-bound-later parent, a `-`-auto-detected cross-tenant parent that
-///   reached pg via import, and any pre-#2542 on-disk graft — WITHOUT relying on
-///   the deferred provenance-persistence.
-/// #2542 — pool-side twin of [`build_namespace_chain_in_tx`]. `governance = false`
-/// is the LOOKUP chain (every `parent_namespace` link — the trait
-/// [`PostgresStore::build_namespace_chain`] contract); `governance = true` is the
-/// entitled-parents-only GOVERNANCE chain used by `resolve_governance_policy`.
+/// #4477 — the pool twin: the LOOKUP (`governance = false`, the trait
+/// [`PostgresStore::build_namespace_chain`] contract) or the entitled-parents
+/// GOVERNANCE chain, built by the one builder in `governance_chain_4477` on a
+/// single pooled connection.
 async fn pg_namespace_chain(
     pool: &sqlx::PgPool,
     namespace: &str,
     governance: bool,
 ) -> StoreResult<Vec<String>> {
-    let mut chain: Vec<String> = Vec::new();
-
-    if namespace == "*" {
-        chain.push("*".to_string());
-        return Ok(chain);
-    }
-    chain.push("*".to_string());
-
-    let mut hierarchy_chain: Vec<String> = crate::models::namespace_ancestors(namespace)
-        .into_iter()
-        .rev()
-        .collect();
-
-    if let Some(root) = hierarchy_chain.first().cloned() {
-        let mut explicit_above: Vec<String> = Vec::new();
-        let mut current = root;
-        for _ in 0..GOVERNANCE_INHERITANCE_DEPTH_CAP {
-            let row: Option<(Option<String>,)> =
-                sqlx::query_as("SELECT parent_namespace FROM namespace_meta WHERE namespace = $1")
-                    .bind(&current)
-                    .fetch_optional(pool)
-                    .await
-                    .map_err(|e| to_store_err("build_namespace_chain parent lookup", e))?;
-            let next = row.and_then(|(p,)| p);
-            let Some(p) = next else { break };
-            if p == "*" || explicit_above.contains(&p) || hierarchy_chain.contains(&p) {
-                break;
-            }
-            // #2542 — the GOVERNANCE view stops at the first UNENTITLED
-            // (cross-tenant) parent so it cannot layer governance/approver policy.
-            // PER-HOP: entitled iff the parent is unowned OR owned by `current`'s
-            // (the DECLARING namespace's) principal — the Route-1 bind rule, which
-            // keeps a federated in-scope parent whose declarer shares its owner
-            // (#2479) while dropping a cross-tenant graft (mirrors sqlite).
-            if governance {
-                let declarer_owner = pg_namespace_standard_owner_pool(pool, &current).await?;
-                let parent_owner = pg_namespace_standard_owner_pool(pool, &p).await?;
-                let entitled = match parent_owner {
-                    None => true,
-                    Some(po) => declarer_owner.as_deref() == Some(po.as_str()),
-                };
-                if !entitled {
-                    pg_warn_governance_graft_excluded(namespace, &current, &p);
-                    break;
-                }
-            }
-            explicit_above.push(p.clone());
-            current = p;
-        }
-        for p in explicit_above.into_iter().rev() {
-            if !chain.contains(&p) {
-                chain.push(p);
-            }
-        }
-    }
-    // F-A2A1.2 — cap the `/`-derived ancestor chain to the same depth as the
-    // explicit walk (most-specific N levels).
-    let drained: Vec<String> = hierarchy_chain.drain(..).collect();
-    let drained_len = drained.len();
-    let kept: Vec<String> = if drained_len > GOVERNANCE_INHERITANCE_DEPTH_CAP {
-        drained
-            .into_iter()
-            .skip(drained_len - GOVERNANCE_INHERITANCE_DEPTH_CAP)
-            .collect()
-    } else {
-        drained
-    };
-    for entry in kept {
-        if !chain.contains(&entry) {
-            chain.push(entry);
-        }
-    }
-    Ok(chain)
+    let mut conn = pool
+        .acquire()
+        .await
+        .map_err(|e| to_store_err("build_namespace_chain acquire", e))?;
+    governance_chain_4477::build_chain_on(&mut conn, namespace, governance).await
 }
 
+/// v0.7.0 H10 / #4477 — the transaction twin: every read goes through `tx` so
+/// the walk shares a snapshot with the downstream policy lookup + write.
 async fn build_namespace_chain_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     namespace: &str,
     governance: bool,
 ) -> StoreResult<Vec<String>> {
-    let mut chain: Vec<String> = Vec::new();
-
-    if namespace == "*" {
-        chain.push("*".to_string());
-        return Ok(chain);
-    }
-    chain.push("*".to_string());
-
-    let mut hierarchy_chain: Vec<String> = crate::models::namespace_ancestors(namespace)
-        .into_iter()
-        .rev()
-        .collect();
-
-    if let Some(root) = hierarchy_chain.first().cloned() {
-        let mut explicit_above: Vec<String> = Vec::new();
-        let mut current = root;
-        for _ in 0..GOVERNANCE_INHERITANCE_DEPTH_CAP {
-            let row: Option<(Option<String>,)> =
-                sqlx::query_as("SELECT parent_namespace FROM namespace_meta WHERE namespace = $1")
-                    .bind(&current)
-                    .fetch_optional(&mut **tx)
-                    .await
-                    .map_err(|e| to_store_err("build_namespace_chain_in_tx parent lookup", e))?;
-            let next = row.and_then(|(p,)| p);
-            let Some(p) = next else { break };
-            if p == "*" || explicit_above.contains(&p) || hierarchy_chain.contains(&p) {
-                break;
-            }
-            // #2542 — PER-HOP entitled iff the parent is unowned OR owned by
-            // `current`'s (the DECLARING namespace's) principal (mirrors sqlite /
-            // the pool twin).
-            if governance {
-                let declarer_owner = pg_namespace_standard_owner_in_tx(tx, &current).await?;
-                let parent_owner = pg_namespace_standard_owner_in_tx(tx, &p).await?;
-                let entitled = match parent_owner {
-                    None => true,
-                    Some(po) => declarer_owner.as_deref() == Some(po.as_str()),
-                };
-                if !entitled {
-                    pg_warn_governance_graft_excluded(namespace, &current, &p);
-                    break;
-                }
-            }
-            explicit_above.push(p.clone());
-            current = p;
-        }
-        for p in explicit_above.into_iter().rev() {
-            if !chain.contains(&p) {
-                chain.push(p);
-            }
-        }
-    }
-    // F-A2A1.2 — cap the `/`-derived ancestor chain to the same depth as
-    // the explicit walk so a deeply nested namespace cannot bypass the
-    // resolver's bounded budget. The cap counts the most-specific N
-    // levels (the leaf and its closest ancestors) so an over-deep
-    // namespace still resolves against its most-relevant policy.
-    let drained: Vec<String> = hierarchy_chain.drain(..).collect();
-    let drained_len = drained.len();
-    let kept: Vec<String> = if drained_len > GOVERNANCE_INHERITANCE_DEPTH_CAP {
-        // hierarchy_chain is top-down (root → leaf); keep the LAST
-        // GOVERNANCE_INHERITANCE_DEPTH_CAP entries (most-specific).
-        drained
-            .into_iter()
-            .skip(drained_len - GOVERNANCE_INHERITANCE_DEPTH_CAP)
-            .collect()
-    } else {
-        drained
-    };
-    for entry in kept {
-        if !chain.contains(&entry) {
-            chain.push(entry);
-        }
-    }
-    Ok(chain)
+    governance_chain_4477::build_chain_on(&mut **tx, namespace, governance).await
 }
 
-/// F-A2A1.2 — maximum depth of the governance-inheritance walk.
-///
-/// Bounds both the `/`-derived ancestor decomposition AND the explicit
-/// `namespace_meta.parent_namespace` walk to a single cap of 5 levels.
-/// The implicit `"*"` global standard is always retained and is not
-/// counted toward the cap.
-///
-/// Pinned to 5 per the v0.7.0 fold-A2A1 spec (see
-/// `docs/v0.7.0/a2a-triage-wave4-r2.md` §F-A2A1.2). Real-world
-/// namespaces are 3-4 levels deep; the cap leaves headroom for one
-/// inherited override beyond the deepest authored ancestor while
-/// keeping the per-write resolver's connection-hold budget bounded.
-pub const GOVERNANCE_INHERITANCE_DEPTH_CAP: usize = 5;
+/// F-A2A1.2 / #4477 — the governance-chain depth bound. It is no longer a
+/// truncation (postgres used to keep only the 5 most-specific levels, so an
+/// ancestor deeper than that governed nothing): every walk is complete up to
+/// [`crate::models::MAX_NAMESPACE_DEPTH`] and refuses beyond it, identically
+/// on sqlite (`crate::governance::chain_depth`).
+pub const GOVERNANCE_INHERITANCE_DEPTH_CAP: usize =
+    crate::governance::chain_depth::GOVERNANCE_CHAIN_MAX_DEPTH;
 
 /// Maximum traversal depth supported by [`PostgresStore::kg_query`].
 ///
@@ -19641,58 +19432,7 @@ fn normalize_app_search_path(search_path: &str) -> Option<String> {
 }
 
 #[cfg(test)]
-mod normalize_app_search_path_tests {
-    use super::normalize_app_search_path;
-
-    #[test]
-    fn public_beats_user_and_ag_catalog_on_the_age_default() {
-        // The AGE-recommended database default: ag_catalog first + "$user"
-        // ahead of public. Both are demoted so `public` wins the create target
-        // (the CVE-2018-1058 `$user`-precedence split-brain fix); ag_catalog is
-        // kept LAST for type resolution.
-        assert_eq!(
-            normalize_app_search_path("ag_catalog, \"$user\", public").as_deref(),
-            Some("public, ag_catalog")
-        );
-        // The minor gap: a NON-leading ag_catalog that still precedes public.
-        assert_eq!(
-            normalize_app_search_path("\"$user\", ag_catalog, public").as_deref(),
-            Some("public, ag_catalog")
-        );
-        // `$user` ahead of public even without AGE -> still forced to public.
-        assert_eq!(
-            normalize_app_search_path("\"$user\", public").as_deref(),
-            Some("public")
-        );
-    }
-
-    #[test]
-    fn caller_pinned_and_already_ordered_paths_are_unchanged() {
-        // The #1381 per-test-schema harness pins its own path (no "$user", no
-        // ag_catalog): MUST be left alone so unqualified CREATE lands in the
-        // test schema.
-        assert_eq!(normalize_app_search_path("test_x_ab12, public"), None);
-        // An explicit non-$user app schema first is honoured (like the harness).
-        assert_eq!(normalize_app_search_path("myapp, public"), None);
-        // Already in order.
-        assert_eq!(normalize_app_search_path("public, ag_catalog"), None);
-        assert_eq!(normalize_app_search_path("public"), None);
-        assert_eq!(normalize_app_search_path(""), None);
-    }
-
-    #[test]
-    fn dedupes_extra_ag_catalog_and_handles_degenerate_paths() {
-        assert_eq!(
-            normalize_app_search_path("ag_catalog, public, ag_catalog").as_deref(),
-            Some("public, ag_catalog")
-        );
-        // All-special path -> fall back to public as the target.
-        assert_eq!(
-            normalize_app_search_path("\"$user\", ag_catalog").as_deref(),
-            Some("public, ag_catalog")
-        );
-    }
-}
+mod normalize_app_search_path_tests;
 
 /// v1.0.0 #3055 — relocate ai-memory app tables out of the AGE `ag_catalog`
 /// schema and into `public`, PRE-BOOTSTRAP.
@@ -26420,25 +26160,17 @@ impl MemoryStore for PostgresStore {
             Some(p) => Some(p.to_string()),
             None => pg_auto_detect_parent(&self.pool, namespace).await?,
         };
-        // #3758 — the REBIND gate: the standard CURRENTLY bound decides,
-        // through the same predicate CLEAR uses. Pre-fix this adapter
-        // discarded `ctx` and any caller could replace another tenant's
-        // governance standard. Owner read + upsert in ONE transaction (the
-        // #3237 item 5 TOCTOU discipline of the CLEAR twin).
+        // #3758 rebind gate + #4356 bind lock and ancestor-owner gate, read in
+        // THIS transaction with the upsert (#3237 item 5 TOCTOU discipline;
+        // see `ns_standard_ancestor_4356::set_gate_in_tx`).
         let mut tx = self
             .pool
             .begin()
             .await
             .map_err(|e| to_store_err("set_namespace_standard begin", e))?;
-        if !ctx.bypass_visibility {
-            let binding = pg_namespace_standard_binding(&mut tx, namespace).await?;
-            crate::store::authorize_namespace_standard_mutation(
-                ctx,
-                namespace,
-                &binding,
-                crate::store::NamespaceStandardOp::Set,
-            )?;
-        }
+        ns_standard_ancestor_4356::set_gate_in_tx(&mut tx, ctx, namespace).await?;
+        let parent_link = resolved_parent.as_deref(); // #4492 chain-depth admission:
+        governance_chain_4477::admit_bind_in_tx(&mut tx, namespace, parent_link).await?;
         sqlx::query(
             "INSERT INTO namespace_meta (namespace, standard_id, updated_at, parent_namespace)
              VALUES ($1, $2, NOW(), $3)
@@ -26457,6 +26189,13 @@ impl MemoryStore for PostgresStore {
             .await
             .map_err(|e| to_store_err("set_namespace_standard commit", e))?;
         Ok(())
+    }
+
+    async fn namespace_governing_ancestor(
+        &self,
+        namespace: &str,
+    ) -> StoreResult<crate::ns_standard_ancestor::GoverningAncestor> {
+        ns_standard_ancestor_4356::governing_ancestor_pool(&self.pool, namespace).await
     }
 
     async fn clear_namespace_standard(
@@ -32022,7 +31761,10 @@ impl MemoryStore for PostgresStore {
                 }
                 Err(e) => return Err(e),
             };
-            if let Some(Ok(p)) = crate::models::GovernancePolicy::from_metadata(&mem.metadata) {
+            let (policy, corrupt) =
+                governance_corrupt_4285::parse_level(&ns, &standard_id, &mem.metadata);
+            severed |= corrupt;
+            if let Some(p) = policy {
                 return Ok(Some(if severed {
                     p.with_severed_standard_floor()
                 } else {
@@ -32036,6 +31778,55 @@ impl MemoryStore for PostgresStore {
             ));
         }
         Ok(None)
+    }
+
+    /// #4357 — postgres twin of `storage::resolve_require_approval_above_depth`.
+    /// Same governance chain (entitled parents only, #2542), same leaf-first
+    /// walk, and the per-level decision is the SHARED pure function
+    /// `storage::approval_depth_level_decision`, so the two backends cannot
+    /// drift. A level whose standard is unresolvable is skipped (the sqlite
+    /// walk's `continue`); a genuine DATABASE error is propagated so the
+    /// reflect refuses instead of skipping a configured approval gate (fail
+    /// closed — the sqlite helper has no error channel).
+    async fn resolve_require_approval_above_depth(
+        &self,
+        namespace: &str,
+    ) -> StoreResult<Option<u32>> {
+        use crate::storage::{ApprovalDepthLevelState, ApprovalDepthWalk};
+        let chain = pg_namespace_chain(&self.pool, namespace, true).await?;
+        let mut walk = ApprovalDepthWalk::default();
+        for ns in chain.into_iter().rev() {
+            let row: Option<(Option<String>,)> = sqlx::query_as(SQL_SELECT_STANDARD_ID_BY_NS)
+                .bind(&ns)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| to_store_err("resolve_require_approval_above_depth lookup", e))?;
+            // An unresolvable standard is `Missing`; a corrupt one is Severed.
+            let state = match row {
+                Some((Some(standard_id),)) => {
+                    // Substrate-internal policy read: admin context, exactly as
+                    // `resolve_governance_policy` (#955) — a private standard
+                    // must still gate.
+                    let ctx =
+                        CallerContext::for_admin(crate::identity::sentinels::GOVERNANCE_INTERNAL);
+                    match self.get(&ctx, &standard_id).await {
+                        Ok(m) => {
+                            governance_corrupt_4285::level_state(&ns, &standard_id, &m.metadata)
+                        }
+                        Err(StoreError::NotFound { .. }) => ApprovalDepthLevelState::Missing,
+                        Err(e) => return Err(e),
+                    }
+                }
+                _ => ApprovalDepthLevelState::Missing,
+            };
+            if let Some(n) = walk.step(state) {
+                return Ok(Some(n));
+            }
+            if walk.is_done() {
+                break;
+            }
+        }
+        Ok(walk.finish())
     }
 
     /// v1.0.0 #3448 — approver-gated REJECT (veto), the postgres twin of
@@ -32438,6 +32229,35 @@ impl MemoryStore for PostgresStore {
                     None
                 }
             }
+            // #4357 — the L1-8 / #3638 reflect pendings the postgres reflect
+            // gates queue. Pre-fix this arm did not exist: a queued
+            // reflection could never be applied on this backend ("unsupported
+            // action_type"). Same payload decoder as the sqlite executor
+            // (`storage::reflect_input_from_pending`); the replay is the
+            // approved write, so no gate re-runs (the approval IS the gate),
+            // exactly as sqlite replays through `storage::reflect::reflect`.
+            "reflect" => {
+                let input = crate::storage::reflect_input_from_pending(&pa).map_err(|e| {
+                    StoreError::InvalidInput {
+                        detail: e.to_string(),
+                    }
+                })?;
+                // #4357 — replay as the REQUESTER's tenant through the trait
+                // `reflect`, never admin: source visibility, the #3696
+                // title-slot admission (a hidden private row of another
+                // principal is refused, not merged into), the why_trace gate,
+                // the attestation posture and the provenance stamp all
+                // re-apply at execute time exactly as on the direct path. The
+                // payload agent is already bound to `requested_by` by
+                // `verify_payload_agent_id` above.
+                let requester = CallerContext::for_agent(&pa.requested_by);
+                let outcome = MemoryStore::reflect(self, &requester, &input, None)
+                    .await
+                    .map_err(|e| StoreError::InvalidInput {
+                        detail: format!("reflect execute failed: {e}"),
+                    })?;
+                Some(outcome.id)
+            }
             other => {
                 return Err(StoreError::InvalidInput {
                     detail: format!("unsupported action_type: {other}"),
@@ -32556,7 +32376,9 @@ impl MemoryStore for PostgresStore {
                 severed = true;
                 continue;
             };
-            if let Some(Ok(p)) = crate::models::GovernancePolicy::from_metadata(&m) {
+            let (policy, corrupt) = governance_corrupt_4285::parse_level(ns, &standard_id, &m);
+            severed |= corrupt;
+            if let Some(p) = policy {
                 resolved_policy = Some(p);
                 break;
             }
@@ -36532,28 +36354,28 @@ mod tests {
     // ------------------------------------------------------------------
 
     // ------------------------------------------------------------------
-    // F-A2A1.2 (#700) — governance inheritance depth cap.
+    // F-A2A1.2 (#700) / #4477 — governance inheritance depth bound.
     //
-    // These tests pin the depth-cap constant + the chain-build behaviour
-    // that does NOT require a live Postgres connection. The cap value is
-    // surface-visible via `GOVERNANCE_INHERITANCE_DEPTH_CAP`; the chain
-    // walk semantics (most-specific-N levels retained) ride the same
-    // helper for both the pool-side `build_namespace_chain` and the
-    // tx-side `build_namespace_chain_in_tx`. Live-PG variants below
+    // These tests pin the depth-bound constant + the chain-build behaviour
+    // that does NOT require a live Postgres connection. The bound is
+    // surface-visible via `GOVERNANCE_INHERITANCE_DEPTH_CAP`; since #4477
+    // every level is retained up to it (complete chain) and a deeper walk
+    // refuses, for both the pool-side `build_namespace_chain` and the
+    // tx-side `build_namespace_chain_in_tx` (one builder). Live-PG variants below
     // exercise the same paths through `enforce_governance_action` end-
     // to-end against a real schema; the unit tests here are the
     // structural pin so a future refactor cannot silently drift the cap.
     // ------------------------------------------------------------------
 
     #[test]
-    fn governance_inheritance_depth_cap_is_five() {
-        // Pinned to 5 per the v0.7.0 fold-A2A1 spec. Any change to this
-        // value must be reflected in
-        // `docs/v0.7.0/a2a-triage-wave4-r2.md` §F-A2A1.2 and
-        // accompanied by a CHANGELOG entry — the cap shapes the
-        // bind-list size and connection-hold budget of every governed
-        // write on postgres.
-        assert_eq!(super::GOVERNANCE_INHERITANCE_DEPTH_CAP, 5);
+    fn governance_inheritance_depth_bound_is_max_namespace_depth_4477() {
+        // #4477 (GOD ruling, supersedes the F-A2A1.2 value 5): the bound is
+        // MAX_NAMESPACE_DEPTH and it is a fail-closed REFUSAL, never a
+        // truncation; sqlite and postgres share it.
+        assert_eq!(
+            super::GOVERNANCE_INHERITANCE_DEPTH_CAP,
+            crate::models::MAX_NAMESPACE_DEPTH
+        );
     }
 
     #[test]
@@ -36573,36 +36395,16 @@ mod tests {
     }
 
     #[test]
-    fn namespace_ancestors_at_max_namespace_depth() {
-        // The compile-time `MAX_NAMESPACE_DEPTH` is 8; namespaces at
-        // that depth produce 8 ancestor levels. Our cap of 5 trims
-        // such a chain when applied in the governance walker.
+    fn namespace_chain_at_max_namespace_depth_keeps_every_level_4477() {
+        // #4477: a namespace at MAX_NAMESPACE_DEPTH keeps EVERY level, root
+        // included (pre-fix postgres dropped the 3 rootmost levels, so a root
+        // policy governed nothing at depth 6+); one level deeper refuses.
         let deep = "l1/l2/l3/l4/l5/l6/l7/l8";
-        let ancestors: Vec<String> = crate::models::namespace_ancestors(deep)
-            .into_iter()
-            .rev()
-            .collect();
-        assert_eq!(ancestors.len(), 8);
-        // Simulate the cap: keep last N most-specific entries.
-        let cap = super::GOVERNANCE_INHERITANCE_DEPTH_CAP;
-        let kept: Vec<String> = if ancestors.len() > cap {
-            ancestors
-                .iter()
-                .skip(ancestors.len() - cap)
-                .cloned()
-                .collect()
-        } else {
-            ancestors
-        };
-        assert_eq!(kept.len(), cap);
-        // The most-specific entry is the leaf itself.
+        let kept = crate::governance::chain_depth::slash_chain(deep).expect("within the bound");
+        assert_eq!(kept.len(), crate::models::MAX_NAMESPACE_DEPTH);
+        assert_eq!(kept.first().map(String::as_str), Some("l1"));
         assert_eq!(kept.last().map(String::as_str), Some(deep));
-        // The least-specific kept entry is the (cap-1)-from-leaf
-        // ancestor, NOT the root. The root ("l1") is dropped under
-        // the cap so resolution stays bounded — operators who want a
-        // root-level policy applied to deep children must seat that
-        // policy on a level within the cap reach.
-        assert_eq!(kept.first().map(String::as_str), Some("l1/l2/l3/l4"));
+        assert!(crate::governance::chain_depth::slash_chain("l1/l2/l3/l4/l5/l6/l7/l8/l9").is_err());
     }
 
     #[test]
@@ -38880,13 +38682,10 @@ mod tests {
 
     #[tokio::test]
     async fn live_governance_inheritance_cap_at_five() {
-        // F-A2A1.2 depth cap — a namespace at MAX_NAMESPACE_DEPTH (8
-        // levels) under a `write=owner` parent at the root must still
-        // resolve to Deny for a non-owner, because the cap retains the
-        // most-specific 5 levels which include the policy-anchored
-        // child path. Conversely, a policy seated at the root that's
-        // OUTSIDE the cap (depth 8 child, policy at depth 1 root) is
-        // expected NOT to apply — the cap is the explicit contract.
+        // F-A2A1.2 / #4477 — a deep leaf under a `write=owner` ancestor
+        // resolves to Deny for a non-owner (since #4477 the chain is
+        // complete to MAX_NAMESPACE_DEPTH, so a root-level policy governs
+        // depth-8 children too; see tests/governance_chain_depth_4477.rs).
         //
         // This test pins the "most-specific kept" semantics by seating
         // the policy 2 levels above the leaf (well within the cap)
@@ -42889,262 +42688,7 @@ mod tests {
     }
 }
 
-// ── v1.0.0 #3264 — pgvector preflight decision-table unit tests ────────
-//
-// Placed at EOF (after the existing `#[cfg(test)]` modules) deliberately:
-// `scripts/check-hardcoded-literals.sh` treats everything after the FIRST
-// `#[cfg(test)]` module in a file as test code, so a new test module
-// spliced in beside the production consts would silently retire the
-// literal gate for the ~20k production lines that follow it.
+// Test module declarations live at EOF (the literal gate treats code after the
+// first `#[cfg(test)]` as test code).
 #[cfg(test)]
-mod pgvector_preflight_tests_3264 {
-    use super::{
-        PG_SQLSTATE_FEATURE_NOT_SUPPORTED, PG_SQLSTATE_INSUFFICIENT_PRIVILEGE, PgvectorPreflight,
-        PgvectorPreflightFacts, classify_init_sql_error, classify_pgvector_preflight,
-        render_database_for_operator,
-    };
-
-    /// The full 2^3 decision table, enumerated. `installed` wins outright:
-    /// an already-installed extension makes the bootstrap
-    /// `CREATE EXTENSION IF NOT EXISTS` privilege-free for ANY role, which
-    /// is exactly the supported managed-Postgres remedy.
-    #[test]
-    fn decision_table_is_exhaustive_and_installed_wins() {
-        for rolsuper in [false, true] {
-            for available in [false, true] {
-                assert_eq!(
-                    classify_pgvector_preflight(available, true, rolsuper),
-                    PgvectorPreflight::Installed,
-                    "installed must win (available={available}, rolsuper={rolsuper})"
-                );
-            }
-        }
-        // Not installed, not available -> the #1065 image case, whatever
-        // the role is: a superuser cannot create what the server does not
-        // ship.
-        assert_eq!(
-            classify_pgvector_preflight(false, false, false),
-            PgvectorPreflight::NotAvailableOnServer
-        );
-        assert_eq!(
-            classify_pgvector_preflight(false, false, true),
-            PgvectorPreflight::NotAvailableOnServer
-        );
-        // Available, not installed -> the role's superuser bit decides,
-        // because pgvector is not a TRUSTED extension.
-        assert_eq!(
-            classify_pgvector_preflight(true, false, false),
-            PgvectorPreflight::AvailableNeedsSuperuserCreate
-        );
-        assert_eq!(
-            classify_pgvector_preflight(true, false, true),
-            PgvectorPreflight::AvailableCreatableProceed
-        );
-    }
-
-    /// Exactly the two FAULT classes carry a classified detail, and each
-    /// one names its remedy. The two healthy classes carry none — that is
-    /// what keeps the happy path byte-identical to the pre-#3264 bootstrap.
-    #[test]
-    fn only_the_two_fault_classes_carry_a_classified_detail() {
-        assert!(
-            PgvectorPreflight::Installed
-                .classified_detail("db")
-                .is_none()
-        );
-        assert!(
-            PgvectorPreflight::AvailableCreatableProceed
-                .classified_detail("db")
-                .is_none()
-        );
-
-        let not_available = PgvectorPreflight::NotAvailableOnServer
-            .classified_detail("aimemory")
-            .expect("fault class must carry a detail");
-        assert!(
-            not_available.contains("0A000"),
-            "must name the SQLSTATE: {not_available}"
-        );
-        assert!(
-            not_available.contains("Dockerfile.pg-age-vector"),
-            "must name the shipped remedy image: {not_available}"
-        );
-        assert!(
-            not_available.contains("#1065"),
-            "must cite the documented-unsupported case: {not_available}"
-        );
-
-        let needs_su = PgvectorPreflight::AvailableNeedsSuperuserCreate
-            .classified_detail("aimemory")
-            .expect("fault class must carry a detail");
-        assert!(
-            needs_su.contains("42501"),
-            "must name the SQLSTATE: {needs_su}"
-        );
-        assert!(
-            needs_su.contains("CREATE EXTENSION vector;"),
-            "must name the one-time superuser command: {needs_su}"
-        );
-        assert!(
-            needs_su.contains("postInitApplicationSQL"),
-            "must name the CloudNativePG hook: {needs_su}"
-        );
-        assert!(
-            needs_su.contains("rds_superuser"),
-            "must name the RDS / Aurora path: {needs_su}"
-        );
-    }
-
-    /// `{DATABASE}` is substituted everywhere it appears — the operator is
-    /// told the exact database to run the one-time create in, with no
-    /// placeholder left over.
-    #[test]
-    fn database_placeholder_is_substituted_everywhere() {
-        let detail = PgvectorPreflight::AvailableNeedsSuperuserCreate
-            .classified_detail("prod_mem")
-            .expect("fault class must carry a detail");
-        assert!(
-            !detail.contains("{DATABASE}"),
-            "placeholder left in: {detail}"
-        );
-        assert!(
-            detail.matches("prod_mem").count() >= 3,
-            "every placeholder site must be substituted: {detail}"
-        );
-    }
-
-    /// The SQLSTATE mapping requires CORROBORATION. `42501` is NOT
-    /// pgvector-specific — on PG15+ a role without `CREATE` on schema
-    /// `public` gets the same code from `CREATE TABLE` — so when the
-    /// preflight says pgvector is fine, the opaque driver error is kept
-    /// rather than emitting a WRONG diagnosis.
-    #[test]
-    fn sqlstate_mapping_requires_corroboration() {
-        // No preflight (probe failed, or the schema-AHEAD hatch skipped
-        // it): the SQLSTATE is the only evidence there is.
-        assert_eq!(
-            classify_init_sql_error(Some(PG_SQLSTATE_INSUFFICIENT_PRIVILEGE), None),
-            Some(PgvectorPreflight::AvailableNeedsSuperuserCreate)
-        );
-        assert_eq!(
-            classify_init_sql_error(Some(PG_SQLSTATE_FEATURE_NOT_SUPPORTED), None),
-            Some(PgvectorPreflight::NotAvailableOnServer)
-        );
-        // Preflight corroborates.
-        assert_eq!(
-            classify_init_sql_error(
-                Some(PG_SQLSTATE_INSUFFICIENT_PRIVILEGE),
-                Some(PgvectorPreflight::AvailableNeedsSuperuserCreate)
-            ),
-            Some(PgvectorPreflight::AvailableNeedsSuperuserCreate)
-        );
-        // Preflight CONTRADICTS -> stay opaque.
-        for observed in [
-            PgvectorPreflight::Installed,
-            PgvectorPreflight::AvailableCreatableProceed,
-            PgvectorPreflight::NotAvailableOnServer,
-        ] {
-            assert_eq!(
-                classify_init_sql_error(Some(PG_SQLSTATE_INSUFFICIENT_PRIVILEGE), Some(observed)),
-                None,
-                "42501 with preflight {observed:?} is a different privilege fault"
-            );
-        }
-        // Anything else keeps the historical opaque `init schema: {e}`.
-        assert_eq!(classify_init_sql_error(Some("42P07"), None), None);
-        assert_eq!(classify_init_sql_error(None, None), None);
-        assert_eq!(
-            classify_init_sql_error(None, Some(PgvectorPreflight::AvailableNeedsSuperuserCreate)),
-            None,
-            "a driverless error must never be classified from the preflight alone"
-        );
-    }
-
-    /// #3264 review fix (B1) — ONLY the `0A000` class refuses bootstrap
-    /// before the DDL runs.
-    ///
-    /// `pg_roles.rolsuper` is not the privilege oracle on managed
-    /// PostgreSQL (RDS `rds_superuser`, Cloud SQL `cloudsqlsuperuser`,
-    /// Azure `azure_pg_admin` all create extensions without it), so a
-    /// preemptive refusal on `AvailableNeedsSuperuserCreate` would
-    /// fail-close a fresh managed deployment that boots fine. That verdict
-    /// still CARRIES its classified detail — rendered only once the real
-    /// `CREATE EXTENSION` has actually returned `42501`.
-    #[test]
-    fn only_the_0a000_class_refuses_before_the_ddl_runs() {
-        assert!(
-            PgvectorPreflight::NotAvailableOnServer
-                .preemptive_refusal_detail("aimemory")
-                .is_some_and(|d| d.contains("0A000")),
-            "the no-vector.so image must still refuse preemptively"
-        );
-        for proceeding in [
-            PgvectorPreflight::Installed,
-            PgvectorPreflight::AvailableCreatableProceed,
-            PgvectorPreflight::AvailableNeedsSuperuserCreate,
-        ] {
-            assert_eq!(
-                proceeding.preemptive_refusal_detail("aimemory"),
-                None,
-                "{proceeding:?} must let the real CREATE EXTENSION be the gate"
-            );
-        }
-        // The 42501 remedy is intact for the SQLSTATE path that DOES fire.
-        assert!(
-            PgvectorPreflight::AvailableNeedsSuperuserCreate
-                .classified_detail("aimemory")
-                .is_some_and(|d| d.contains("42501")),
-            "the classified 42501 remedy must survive the non-preemptive shape"
-        );
-    }
-
-    /// #3264 review fix (S1) — a server-supplied `current_database()` is
-    /// escaped before it reaches the pasteable `psql` remedy and the log
-    /// lines. A quote, a semicolon, a newline or an ANSI escape in a
-    /// database name must not break out of the superuser one-liner the
-    /// operator is invited to paste.
-    #[test]
-    fn database_name_is_escaped_before_it_reaches_an_operator() {
-        for plain in ["aimemory", "prod_mem_2", "A1", "<unknown>"] {
-            assert_eq!(
-                render_database_for_operator(plain),
-                plain,
-                "a legitimate name must reach the operator verbatim"
-            );
-        }
-        let hostile = "mem'; DROP DATABASE mem; --\n\u{1b}[31mFORGED";
-        let rendered = render_database_for_operator(hostile);
-        assert!(
-            !rendered.contains('\n') && !rendered.contains('\u{1b}'),
-            "control characters must be escaped: {rendered}"
-        );
-        let detail = PgvectorPreflight::AvailableNeedsSuperuserCreate
-            .classified_detail(hostile)
-            .expect("fault class must carry a detail");
-        assert!(
-            !detail.contains('\n') && !detail.contains('\u{1b}'),
-            "the pasteable remedy must carry no injected control characters: {detail}"
-        );
-        // An empty name is not "plain" either — it would silently produce
-        // `psql -d  -c ...`, which targets the wrong database.
-        assert_eq!(render_database_for_operator(""), "\"\"");
-    }
-
-    /// `PgvectorPreflightFacts::verdict` is the same pure table — the
-    /// live probe adds no second decision path.
-    #[test]
-    fn facts_verdict_matches_the_pure_table() {
-        let facts = PgvectorPreflightFacts {
-            available: true,
-            installed: false,
-            role_is_superuser: false,
-            age_catalog_usage: false,
-            database: "aimemory".to_string(),
-        };
-        assert_eq!(
-            facts.verdict(),
-            PgvectorPreflight::AvailableNeedsSuperuserCreate
-        );
-        assert_eq!(facts.verdict().label(), "available_needs_superuser_create");
-    }
-}
+mod pgvector_preflight_tests_3264;

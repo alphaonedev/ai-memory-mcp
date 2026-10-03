@@ -178,7 +178,8 @@ fn exploit_delete_strips_out_of_scope_victim_binding_2503() {
     // exists (a #2479-class trap — `set_namespace_standard` refuses an absent
     // standard, and that refusal is observationally identical to a scope
     // refusal, so the exploit must positively assert the seed took).
-    let before = db::resolve_governance_policy(&conn, "secure/ops");
+    let before =
+        db::resolve_governance_policy(&conn, "secure/ops").expect("#4043: governance policy read");
     assert_eq!(
         before.as_ref().map(|p| p.core.write.clone()),
         Some(GovernanceLevel::Approve),
@@ -216,6 +217,7 @@ fn exploit_delete_strips_out_of_scope_victim_binding_2503() {
     // parent commit this is `None`, i.e. the deletion silently widened the
     // victim's authority from `write: approve` to the permissive default.
     let after = db::resolve_governance_policy(&conn, "secure/ops")
+        .expect("#4043: governance policy read")
         .expect("#2503: a severed binding must resolve to the floor, never to None");
     assert_eq!(
         after.core.write,
@@ -236,7 +238,9 @@ fn exploit_global_standard_delete_disarms_whole_tree_2503() {
 
     for probe in ["secure/ops/deep", "unrelated", "other/tree/leaf"] {
         assert_eq!(
-            db::resolve_governance_policy(&conn, probe).map(|p| p.core.write),
+            db::resolve_governance_policy(&conn, probe)
+                .expect("#4043: governance policy read")
+                .map(|p| p.core.write),
             Some(GovernanceLevel::Approve),
             "precondition: {probe} inherits the global standard"
         );
@@ -250,6 +254,7 @@ fn exploit_global_standard_delete_disarms_whole_tree_2503() {
 
     for probe in ["secure/ops/deep", "unrelated", "other/tree/leaf"] {
         let after = db::resolve_governance_policy(&conn, probe)
+            .expect("#4043: governance policy read")
             .unwrap_or_else(|| panic!("#2503: {probe} must not fall back to allow-on-silence"));
         assert_eq!(
             after.core.write,
@@ -271,7 +276,9 @@ fn exploit_delete_fails_open_on_resolved_policy_2503() {
     let standard_id = seed_standard_memory(&conn, "public/ok", &approve_write_policy());
     db::set_namespace_standard(&conn, "secure/ops", &standard_id, None).expect("bind victim");
     assert_eq!(
-        db::resolve_governance_policy(&conn, "secure/ops").map(|p| p.core.write),
+        db::resolve_governance_policy(&conn, "secure/ops")
+            .expect("#4043: governance policy read")
+            .map(|p| p.core.write),
         Some(GovernanceLevel::Approve)
     );
 
@@ -279,11 +286,13 @@ fn exploit_delete_fails_open_on_resolved_policy_2503() {
 
     // At the parent commit this is `None` — allow-on-silence — so a caller the
     // operator gated behind `write: approve` writes freely.
-    let after = db::resolve_governance_policy(&conn, "secure/ops").expect(
-        "#2503 SECURITY: an in-scope delete must not leave the out-of-scope \
+    let after = db::resolve_governance_policy(&conn, "secure/ops")
+        .expect("#4043: governance policy read")
+        .expect(
+            "#2503 SECURITY: an in-scope delete must not leave the out-of-scope \
          victim resolving to None (allow-on-silence); that is the privilege \
          widening this issue is about",
-    );
+        );
     assert_eq!(after.core.write, GovernanceLevel::Owner);
 }
 
@@ -294,7 +303,11 @@ fn exploit_archive_strips_out_of_scope_victim_binding_2503() {
     let standard_id = seed_standard_memory(&conn, "public/ok", &approve_write_policy());
     db::set_namespace_standard(&conn, "secure/ops", &standard_id, Some("secure"))
         .expect("bind victim namespace");
-    assert!(db::resolve_governance_policy(&conn, "secure/ops").is_some());
+    assert!(
+        db::resolve_governance_policy(&conn, "secure/ops")
+            .expect("#4043: governance policy read")
+            .is_some()
+    );
 
     assert!(db::archive_memory(&conn, &standard_id, Some("manual")).expect("archive standard"));
 
@@ -306,7 +319,9 @@ fn exploit_archive_strips_out_of_scope_victim_binding_2503() {
     assert_eq!(standard, None);
     assert_eq!(parent.as_deref(), Some("secure"));
     assert_eq!(
-        db::resolve_governance_policy(&conn, "secure/ops").map(|p| p.core.write),
+        db::resolve_governance_policy(&conn, "secure/ops")
+            .expect("#4043: governance policy read")
+            .map(|p| p.core.write),
         Some(GovernanceLevel::Owner),
         "#2503: archive must fail closed to the floor too"
     );
@@ -386,7 +401,9 @@ fn control_delete_of_non_standard_memory_is_byte_identical_2503() {
     assert_eq!(before_count, after_count);
     // The victim is still fully governed — nothing was severed.
     assert_eq!(
-        db::resolve_governance_policy(&conn, "secure/ops").map(|p| p.core.write),
+        db::resolve_governance_policy(&conn, "secure/ops")
+            .expect("#4043: governance policy read")
+            .map(|p| p.core.write),
         Some(GovernanceLevel::Approve),
         "#2503: an unrelated delete must leave the policy exactly as it was"
     );
@@ -408,6 +425,7 @@ fn control_severed_child_does_not_downgrade_governed_ancestor_2503() {
     assert!(db::delete(&conn, &child_std).expect("reap the child's standard"));
 
     let resolved = db::resolve_governance_policy(&conn, "corp/team")
+        .expect("#4043: governance policy read")
         .expect("must resolve through the intact ancestor");
     assert_eq!(
         resolved.core.write,
@@ -417,7 +435,9 @@ fn control_severed_child_does_not_downgrade_governed_ancestor_2503() {
     );
     // The ancestor is untouched and still governs on its own.
     assert_eq!(
-        db::resolve_governance_policy(&conn, "corp").map(|p| p.core.write),
+        db::resolve_governance_policy(&conn, "corp")
+            .expect("#4043: governance policy read")
+            .map(|p| p.core.write),
         Some(GovernanceLevel::Approve)
     );
 }
@@ -450,7 +470,9 @@ fn control_gc_heals_dangling_pointer_to_severed_not_absent_2503() {
     assert_eq!(parent.as_deref(), Some("legacy"));
     // And the healed state still fails closed.
     assert_eq!(
-        db::resolve_governance_policy(&conn, "legacy/ns").map(|p| p.core.write),
+        db::resolve_governance_policy(&conn, "legacy/ns")
+            .expect("#4043: governance policy read")
+            .map(|p| p.core.write),
         Some(GovernanceLevel::Owner)
     );
 
@@ -475,7 +497,7 @@ fn control_ungoverned_namespace_keeps_allow_on_silence_2503() {
     let conn = open();
     let _ = plain_memory(&conn, "wide/open", "ordinary");
     assert_eq!(
-        db::resolve_governance_policy(&conn, "wide/open"),
+        db::resolve_governance_policy(&conn, "wide/open").expect("#4043: governance policy read"),
         None,
         "#1569: a namespace with no standard anywhere in its chain must still \
          resolve to None — #2503 must not tighten the never-configured case"

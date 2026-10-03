@@ -81,6 +81,10 @@ pub mod host;
 // `audit/forensic-<YYYY-MM-DD>.jsonl`. The `ai-memory audit verify
 // --since <ISO_DATE>` CLI walks the chain + signatures.
 pub mod audit;
+// #4477 — the one depth bound on the governance chain (both backends).
+pub mod chain_depth;
+// #4492 — bind-time refusal of a link that pushes an entitled chain past the bound.
+pub mod bind_chain_depth;
 // v0.7.0 Policy-Engine Item 3 — deferred audit-log queue for
 // storage-hook refusals. Closes the cryptographic-log gap on the
 // `GOVERNANCE_PRE_WRITE` path that previously routed through
