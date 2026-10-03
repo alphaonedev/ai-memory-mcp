@@ -15,7 +15,7 @@
 //!
 //! Lineage: replaces the prose-only count drift the v2 review lane
 //! ARCH lane surfaced (ARCH-14). The `awk` extraction trick the
-//! CLAUDE.md text documents is now mechanically pinned by this test
+//! ARCHITECTURE_REFERENCE.md text documents is now mechanically pinned by this test
 //! rather than relying on a discoverer re-running the awk recipe.
 
 use std::fs;
@@ -70,7 +70,7 @@ fn arch_14_route_count_invariant() {
         ai_memory::EXPECTED_PRODUCTION_ROUTES_COUNT,
         "ARCH-14 route count drift: production routes in build_router_with_timeout = {production_routes}, \
          but ai_memory::EXPECTED_PRODUCTION_ROUTES_COUNT = {}. \
-         If a route was added/removed, update the constant AND the CLAUDE.md \
+         If a route was added/removed, update the constant AND the ARCHITECTURE_REFERENCE.md \
          §\"Architecture\" narrative in the same commit.",
         ai_memory::EXPECTED_PRODUCTION_ROUTES_COUNT,
     );
