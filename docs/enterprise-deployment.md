@@ -795,12 +795,16 @@ PgBouncer.
 > shares server connections across clients, so session-scoped
 > server-side prepared statements are not guaranteed to survive across
 > transactions. ai-memory's sqlx layer does use sqlx's named prepared
-> statements on its hot path, so transaction mode is compatible only
-> with PgBouncer >= 1.21 and `max_prepared_statements` > 0 (the shipped
+> statements (cached per connection) on its hot path, so `transaction`
+> mode is supported only on PgBouncer >= 1.21 with prepared-statement
+> tracking enabled, `max_prepared_statements` > 0 (the shipped
 > [`infra/pgbouncer/pgbouncer.ini`](../infra/pgbouncer/pgbouncer.ini)
-> sets 256; omitting it makes every query re-plan). If you add a custom
-> query path, do not assume a named prepared statement persists beyond
-> its transaction under PgBouncer.
+> sets 256). With tracking disabled (`max_prepared_statements = 0`, or
+> PgBouncer < 1.21), a statement prepared on one server connection is
+> missing on the next one PgBouncer assigns, and queries fail with
+> "prepared statement does not exist" errors. If you add a custom query
+> path, do not assume a named prepared statement persists beyond its
+> transaction under PgBouncer.
 
 > **Caveat — `statement_timeout` / `lock_timeout` under transaction
 > mode (REQUIRED ops step).** The daemon installs its query-safety
