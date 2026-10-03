@@ -89,6 +89,10 @@ if [[ "${1:-}" == "--self-test" ]]; then
     FIX="$ROOT/.local-runs/doc-symbol-anchors-selftest-$$"
     rm -rf "$FIX"
     mkdir -p "$FIX/src/mcp/tools" "$FIX/src/store" "$FIX/docs" "$FIX/scripts/qc-allowlists"
+    # #4507 R3-6 - the gate refuses a tree without the two reference files.
+    mkdir -p "$FIX/docs/reference"
+    printf '# Architecture reference (fixture)\n' > "$FIX/docs/reference/ARCHITECTURE_REFERENCE.md"
+    printf '# Code style reference (fixture)\n' > "$FIX/docs/reference/CODE_STYLE.md"
     trap 'rm -rf "$FIX"' EXIT
 
     # The REAL shape of the audit's `decorate_memory` finding: the old
@@ -231,6 +235,23 @@ MDEOF
     [[ "$(run_fixture)" != "0" ]] || {
         echo "FAIL: self-test — an EMPTY src tree passed; the gate can no-op to green (#2444 shape)" >&2; exit 1; }
     echo "PASS: self-test — an empty src/ symbol set fails CLOSED rather than reporting an unearned pass"
+
+    # ---- #4507 R3-6: a missing or symlinked reference file FAILS CLOSED ----
+    write_clean
+    for rf in ARCHITECTURE_REFERENCE CODE_STYLE; do
+        mv "$FIX/docs/reference/$rf.md" "$FIX/docs/reference/$rf.md.aside"
+        rf_out="$(run_fixture_out)"
+        [[ "$(run_fixture)" != "0" ]] && grep -q "required reference file docs/reference/$rf.md" <<<"$rf_out" || {
+            echo "FAIL: self-test #4507 R3-6 — a MISSING $rf.md did not fail closed" >&2; exit 1; }
+        echo "PASS: self-test #4507 R3-6 — a missing $rf.md FAILS CLOSED and names the file"
+        ln -s "$rf.md.aside" "$FIX/docs/reference/$rf.md"
+        rf_out="$(run_fixture_out)"
+        [[ "$(run_fixture)" != "0" ]] && grep -q "required reference file docs/reference/$rf.md" <<<"$rf_out" || {
+            echo "FAIL: self-test #4507 R3-6 — a SYMLINKED $rf.md did not fail closed" >&2; exit 1; }
+        echo "PASS: self-test #4507 R3-6 — a symlinked $rf.md FAILS CLOSED"
+        rm -f "$FIX/docs/reference/$rf.md"
+        mv "$FIX/docs/reference/$rf.md.aside" "$FIX/docs/reference/$rf.md"
+    done
     exit 0
 fi
 
@@ -240,6 +261,18 @@ else
     REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 fi
 cd "$REPO_ROOT"
+
+# #4507 R3-6 - FAIL CLOSED on a missing reference file. The doc list below is
+# built with glob("docs/reference/*.md") and an os.path.exists() filter, so a
+# deleted reference file silently dropped out of the scan and the gate exited 0.
+# Unconditional, fixture included (a check waived under --self-test is a check
+# the self-test cannot prove).
+for _ref in docs/reference/ARCHITECTURE_REFERENCE.md docs/reference/CODE_STYLE.md; do
+    if [[ ! -f "$_ref" || -L "$_ref" ]]; then
+        printf 'FAIL: check-doc-symbol-anchors: required reference file %s is missing or not a regular file (#4507 fail-closed)\n' "$_ref" >&2
+        exit 1
+    fi
+done
 
 ALLOWLIST="$REPO_ROOT/scripts/qc-allowlists/doc-symbol-anchors-allow.txt"
 

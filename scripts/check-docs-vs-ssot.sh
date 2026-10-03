@@ -103,6 +103,19 @@ else
 fi
 cd "$REPO_ROOT"
 
+# #4507 R3-6 - FAIL CLOSED on a missing reference file. The Architecture and
+# Code Style bodies moved out of CLAUDE.md into these two files; the DOC_FILES
+# loop below skips an absent file (`[[ -f ]] || continue`) and the env-var
+# census greps one of them, so deleting either made this gate exit 0 (or fail
+# only by accident). Unconditional, fixture included: a check waived under the
+# --self-test is a check the self-test cannot prove.
+for _ref in docs/reference/ARCHITECTURE_REFERENCE.md docs/reference/CODE_STYLE.md; do
+    if [[ ! -f "$_ref" || -L "$_ref" ]]; then
+        printf 'FAIL: check-docs-vs-ssot: required reference file %s is missing or not a regular file (#4507 fail-closed)\n' "$_ref" >&2
+        exit 1
+    fi
+done
+
 # --------------------------------------------------------------------
 # Resolve canonical SSOT values from Rust source
 # --------------------------------------------------------------------
@@ -1648,6 +1661,12 @@ run_self_test() {
     # #2977 — the frozen-page exemption SSOT the html scan set resolves
     # against. A REAL one (not an empty stub) so the html legs below can
     # prove BOTH directions of the boundary.
+    # #4507 R3-6 - the gate refuses a tree without the two reference files, so
+    # the fixture carries real (stub) ones; the missing/symlink cases below
+    # remove or replace them one at a time.
+    mkdir -p docs/reference
+    printf '# Architecture reference (fixture)\n' > docs/reference/ARCHITECTURE_REFERENCE.md
+    printf '# Code style reference (fixture)\n' > docs/reference/CODE_STYLE.md
     mkdir -p scripts/qc-allowlists
     cat > scripts/qc-allowlists/html-doc-frozen-exempt.txt <<'FROZENEOF'
 # fixture exemption SSOT
@@ -2527,6 +2546,29 @@ HTMLSTAMPFROZEN
         cd "$REPO_ROOT"; exit 1
     fi
     echo "PASS: self-test #2977 — a frozen per-release page keeps its own historical chrome stamp"
+
+    # ---- #4507 R3-6: a missing or symlinked reference file FAILS CLOSED.
+    local _rf _out _rc
+    for _rf in ARCHITECTURE_REFERENCE CODE_STYLE; do
+        mv "$tmpdir/docs/reference/$_rf.md" "$tmpdir/docs/reference/$_rf.md.aside"
+        _rc=0
+        _out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1) || _rc=$?
+        if [[ "$_rc" == 0 ]] || ! grep -q "required reference file docs/reference/$_rf.md" <<<"$_out"; then
+            echo "FAIL: self-test #4507 R3-6 — a MISSING $_rf.md did not fail closed (rc=$_rc)" >&2
+            cd "$REPO_ROOT"; exit 1
+        fi
+        echo "PASS: self-test #4507 R3-6 — a missing $_rf.md FAILS CLOSED (rc=$_rc, names the file)"
+        ln -s "$_rf.md.aside" "$tmpdir/docs/reference/$_rf.md"
+        _rc=0
+        _out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1) || _rc=$?
+        if [[ "$_rc" == 0 ]] || ! grep -q "required reference file docs/reference/$_rf.md" <<<"$_out"; then
+            echo "FAIL: self-test #4507 R3-6 — a SYMLINKED $_rf.md did not fail closed (rc=$_rc)" >&2
+            cd "$REPO_ROOT"; exit 1
+        fi
+        echo "PASS: self-test #4507 R3-6 — a symlinked $_rf.md FAILS CLOSED (rc=$_rc)"
+        rm -f "$tmpdir/docs/reference/$_rf.md"
+        mv "$tmpdir/docs/reference/$_rf.md.aside" "$tmpdir/docs/reference/$_rf.md"
+    done
 
     cd "$REPO_ROOT"
 }
