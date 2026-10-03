@@ -65,9 +65,40 @@ each unit is and WHAT is substituted into it:
     ``--from`` another stage or image; that stage (the builder) must not start
     FROM another stage nor COPY ``--from``, must COPY Cargo.lock, and must end
     with exactly the declaration COPY followed by the canonical RUN. ``cargo``
-    anywhere else in the Dockerfile is refused. The docker job must not pass a
-    ``target:`` or ``file:`` to docker/build-push-action (that would ship
-    another stage or file).
+    anywhere else in the Dockerfile is refused. A blank or comment line inside a
+    ``\\`` continuation is refused (BuildKit drops it, a shell never sees it), a
+    ``FROM`` image containing ``$`` is refused (a build-arg base the guard cannot
+    resolve), and ``--mount`` is refused anywhere (a mount can import files the
+    guard never read). Logical lines are formed as BuildKit forms them: comment
+    and blank lines inside a continuation are dropped and the instruction keeps
+    joining (parity pinned by the PARITY table, recorded from the moby/buildkit
+    v0.23.2 parser).
+  * The docker job image build is an ALLOWLIST, not a denylist: the step keys
+    are exactly ``name``/``id``/``uses``/``with``; ``uses`` is exactly the pinned
+    ``docker/build-push-action`` SHA (owner and action case-exact, plain scalar);
+    ``with:`` carries exactly ``context: .``, the pinned ``push``, ``tags``,
+    ``labels``, ``cache-from`` and ``cache-to``, so ``file``, ``target``,
+    ``build-contexts``, ``build-args`` (a frontend override), another
+    ``context`` or any unread key is refused. The buildx and login actions are
+    pinned the same way. Any other image-builder ``uses`` (any case), any
+    reusable-workflow image builder, and any run text that spells
+    ``docker build|buildx|push``, ``buildctl``, ``buildah``... in command
+    position (quote and backslash characters ignored) is refused.
+  * Quoting. A double-quoted YAML scalar containing a backslash is refused (YAML
+    decodes escapes such as ``\\x63`` that this parser would read raw); a
+    single-quoted ``''`` is decoded to ``'`` as YAML does. Build-tool and image
+    command scans read the text with quote and backslash characters removed
+    (``c''argo`` reads as ``cargo``). That is a best-effort spelling view for
+    REFUSALS only; it cannot see a name built by expansion (#4768).
+  * The release-shape Postgres proof is located structurally: exactly one
+    ``run`` step in the ``release-shape:`` job whose statements equal the pinned
+    ``bash scripts/release-shape-pg-proof.sh target/release/ai-memory "$url"``
+    (the URL assignment may change its port only), with the step key set pinned
+    (so no step ``if:`` or ``continue-on-error:``), no job ``if:``, and ordered
+    after the release-shaped build. The ``paths:`` trigger filter is NOT evidence.
+    Job-level ``continue-on-error: true`` is the shipped, ruled advisory state
+    (#4480) and is deliberately allowed: the job still runs and its steps still
+    fail.
 
 Whole-line comments are dropped; a trailing ``#`` is NOT trusted (the statement
 then differs from the allowed one and is refused). ``BASH_ENV`` is refused
@@ -140,6 +171,36 @@ DOCKER_RUN = (
     + "strip target/release/ai-memory; "
     + ASSERT_DOCKER
 )
+SHAPE_PROOF_CMD = 'bash scripts/release-shape-pg-proof.sh target/release/ai-memory "$url"'
+SHAPE_PROOF_URL = "url=<the TLS verify-full proof URL>"
+SHAPE_PROOF = ("set -euo pipefail", SHAPE_PROOF_URL, SHAPE_PROOF_CMD)
+SHAPE_URL_RE = re.compile(
+    r'url="postgres://postgres:\$\{PGTLS_PW\}@127\.0\.0\.1:[0-9]+/proof\?sslmode=verify-full'
+    r'&sslrootcert=\$\{PGTLS_DIR\}/ca\.crt"')
+# The docker job. Every docker/* action is pinned to its exact (case-exact) `uses`;
+# the image-build step may carry only the keys below with exactly these values.
+BUILDX_USES = "docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f"
+LOGIN_USES = "docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9"
+IMAGE_BUILD_USES = "docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8"
+DOCKER_ACTIONS = frozenset((BUILDX_USES, LOGIN_USES, IMAGE_BUILD_USES))
+IMAGE_BUILD_KEYS = ("name", "id", "uses", "with")
+IMAGE_BUILD_SCALARS = {
+    "context": ".",
+    "push": "${{ github.event.inputs.dry_run == 'false' }}",
+    "cache-from": "type=gha",
+    "cache-to": "type=gha,mode=max",
+}
+IMAGE_BUILD_BLOCKS = {
+    "tags": (
+        "ghcr.io/${{ github.repository_owner }}/ai-memory:${{ steps.version.outputs.version }}",
+        "ghcr.io/${{ github.repository_owner }}/ai-memory:latest",
+    ),
+    "labels": (
+        "org.opencontainers.image.source=https://github.com/${{ github.repository }}",
+        "org.opencontainers.image.version=${{ steps.version.outputs.version }}",
+    ),
+}
+LOGIN_WITH_KEYS = ("registry", "username", "password")
 DOCKER_SYNTAX = "# syntax=docker/dockerfile:1"
 DOCKER_DECL_COPY = "COPY scripts/release-features.sh scripts/release-features.sh"
 DOCKER_LOCK_COPY = "COPY Cargo.toml Cargo.lock ./"
@@ -174,6 +235,14 @@ MATRIX_VALUE_RE = {
 # file system), not part of a longer word, option or file name (`Cargo.toml`).
 BUILD_TOOL_RE = re.compile(r"(?<![\w.-])(?:cargo-zigbuild|cargo|rustc|cross)(?![\w.-])", re.I)
 SBOM_TOOL_RE = re.compile(r"(?<![\w-])cargo(?![\w-]).*?\scyclonedx(?![\w-])", re.I)
+# An action that builds or pushes an image (matched on the lower-cased `uses`).
+IMAGE_BUILDER_RE = re.compile(r"build-push|buildx|buildah|buildkit|buildpack|kaniko|nerdctl|podman|docker")
+# A run-text command that builds or ships an image.
+IMAGE_CMD_RE = re.compile(
+    r"(?<![\w./-])(?:(?:docker|podman|nerdctl|buildah)\s+(?:-\S+\s+)*(?:build|buildx|bake|builder|push|image|commit|import|"
+    r"load|compose|run|manifest|buildx)|buildctl|kaniko)(?![\w-])", re.I)
+# Quote and backslash characters bash removes inside a word (`c''argo`, `ca\rgo`).
+QUOTE_RE = re.compile(r"['\"\\]")
 INLINE_USE_RE = re.compile(r"\$\(\s*bash [^)]*release-features\.sh|`\s*bash [^`]*release-features\.sh")
 # C0/C1 controls (tab excepted: the YAML parser refuses it itself), every Unicode
 # space other than U+0020 (NBSP, ogham, en/em..., narrow NBSP, math space,
@@ -199,31 +268,6 @@ DIRECTIVE_RE = re.compile(r"^[ \t]*#[ \t]*(?:syntax|escape|check)[ \t]*=", re.I)
 
 
 # ------------------------------------------------------------ text helpers --
-def strip_comment(line: str) -> str:
-    """Drop a shell comment (full-line or trailing), quote- and escape-aware.
-
-    ``#`` starts a comment only at the start of a word outside quotes. It is used
-    ONLY for PRESENCE checks ("is X really there"), never to hide text from a
-    refusal: a presence check that over-strips can only fail closed.
-    """
-    quote: Optional[str] = None
-    i = 0
-    while i < len(line):
-        c = line[i]
-        if c == "\\" and quote != "'":
-            i += 2
-            continue
-        if quote is None:
-            if c in ("'", '"'):
-                quote = c
-            elif c == "#" and (i == 0 or line[i - 1] in " \t;&|("):
-                return line[:i].rstrip()
-        elif c == quote:
-            quote = None
-        i += 1
-    return line.rstrip()
-
-
 def indent_of(line: str) -> int:
     return len(line) - len(line.lstrip(" "))
 
@@ -233,19 +277,33 @@ def is_blank_or_comment(line: str) -> bool:
     return not s or s.startswith("#")
 
 
-def logical_lines(lines: List[str]) -> List[str]:
+def logical_lines(lines: List[str], buildkit: bool = False) -> List[str]:
     """Normalise to logical lines: whole-line comments and blanks dropped, ``\\``
     continuations joined, runs of spaces/tabs collapsed (ONLY spaces and tabs:
     any other Unicode space is refused by CONTROL_RE, never folded). NOTHING
-    else is interpreted: a trailing ``#`` stays in the line, and a comment line
-    inside a continuation is kept (bash ends the command there), so extra text
-    can only add refusals."""
+    else is interpreted: a trailing ``#`` stays in the line.
+
+    Inside an open continuation the two readers differ, and each is modelled on
+    the reader that runs the text. SHELL text (``buildkit=False``): bash joins
+    only the backslash-newline, so a comment line inside the continuation is
+    KEPT (it can only add refusals) and a blank line ends the command.
+    DOCKERFILE text (``buildkit=True``, the BuildKit parser): a comment line is
+    DROPPED before the shell sees it and a blank line is an empty continuation
+    line, skipped, so the instruction keeps joining across both. A reader that
+    ended the instruction at a blank line would see a different instruction
+    boundary than BuildKit does."""
     out: List[str] = []
     buf = ""
     for raw in lines:
         line = raw.strip(" \t")
-        if not buf and (not line or line.startswith("#")):
-            continue
+        if not line or line.startswith("#"):
+            if buf and not buildkit:
+                if not line:
+                    out.append(re.sub(r"[ \t]+", " ", buf).strip(" "))
+                    buf = ""
+                    continue
+            else:
+                continue
         if line.endswith("\\"):
             buf += line[:-1].rstrip(" \t") + " "
             continue
@@ -256,10 +314,19 @@ def logical_lines(lines: List[str]) -> List[str]:
     return out
 
 
-def code_lines(text: str) -> str:
-    """PRESENCE view of a file: whole-line comments dropped, trailing comments
-    stripped."""
-    return "\n".join(strip_comment(ln) for ln in text.split("\n") if not is_blank_or_comment(ln))
+def continuation_noise(lines: List[str]) -> List[int]:
+    """1-based numbers of the blank and whole-line comment lines that sit inside an
+    open ``\\`` continuation (BuildKit drops them silently)."""
+    noise: List[int] = []
+    open_ = False
+    for n, raw in enumerate(lines, 1):
+        line = raw.strip(" \t")
+        if not line or line.startswith("#"):
+            if open_:
+                noise.append(n)
+            continue
+        open_ = line.endswith("\\")
+    return noise
 
 
 def first_diff(got: Tuple[str, ...], want: Tuple[str, ...]) -> str:
@@ -413,7 +480,13 @@ class YamlSubset:
         for style, rx in SCALAR_FORMS:
             m = rx.fullmatch(val)
             if m is not None:
-                return Node("scalar", j, m.group("v") if style == "plain" else m.group("v")[1:-1], style)
+                v = m.group("v")
+                if style == "double" and "\\" in v:
+                    self.bad(j, "a backslash inside a double-quoted scalar (YAML decodes escapes such as \\x63 or \\u0063 "
+                                f"that the guard would read raw; refused, never decoded): {val[:60]}")
+                if style == "single":
+                    return Node("scalar", j, v[1:-1].replace("''", "'"), style)
+                return Node("scalar", j, v if style == "plain" else v[1:-1], style)
         self.bad(j, f"value outside the subset grammar (multi-line or unterminated quote, anchor, alias, tag, flow "
                     f"mapping, block indentation indicator, `: ` in a plain value...): {val[:60]}")
         return Node("scalar", j, val, "plain")
@@ -543,7 +616,14 @@ def run_lines(step: Node) -> Tuple[str, ...]:
     return tuple(logical_lines([run.text()]))
 
 
-def step_problem(step: Node, want_keys: Tuple[str, ...], expected: Tuple[str, ...]) -> str:
+Norm = Callable[[Tuple[str, ...]], Tuple[str, ...]]
+
+
+def _same(lines: Tuple[str, ...]) -> Tuple[str, ...]:
+    return lines
+
+
+def step_problem(step: Node, want_keys: Tuple[str, ...], expected: Tuple[str, ...], norm: Norm = _same) -> str:
     """Why ``step`` is not the allowed unit ("" when it is exactly that unit)."""
     why = Report()
     if set(step.keys()) != set(want_keys):
@@ -557,7 +637,7 @@ def step_problem(step: Node, want_keys: Tuple[str, ...], expected: Tuple[str, ..
     shell = step.get("shell")
     if "shell" in want_keys and (shell is None or shell.style != "plain" or shell.text() != "bash"):
         why.bad(f"`shell: {shell.text() if shell is not None else ''}` (only an unquoted `shell: bash` is allowed)")
-    got = run_lines(step)
+    got = norm(run_lines(step))
     if got != expected:
         why.bad(first_diff(got, expected))
     return why.first()
@@ -570,29 +650,31 @@ def job_steps(job: Node, where: str, rep: Report) -> List[Tuple[int, Node]]:
     return [(i, st) for i, st in enumerate(steps.value) if want_kind(st, "map", f"{where} step {i + 1}", rep)]
 
 
-def canonical(steps: List[Tuple[int, Node]], want_keys: Tuple[str, ...], expected: Tuple[str, ...]) -> List[int]:
-    return [i for i, st in steps if not step_problem(st, want_keys, expected)]
+def canonical(steps: List[Tuple[int, Node]], want_keys: Tuple[str, ...], expected: Tuple[str, ...],
+              norm: Norm = _same) -> List[int]:
+    return [i for i, st in steps if not step_problem(st, want_keys, expected, norm)]
 
 
-def nearest_problem(steps: List[Tuple[int, Node]], want_keys: Tuple[str, ...], expected: Tuple[str, ...]) -> str:
+def nearest_problem(steps: List[Tuple[int, Node]], want_keys: Tuple[str, ...], expected: Tuple[str, ...],
+                    norm: Norm = _same) -> str:
     """The step that shares the most statements with the unit, and why it is not it."""
     best: Optional[Tuple[int, Node]] = None
     score = 0
     for i, st in steps:
-        s = len(set(run_lines(st)) & set(expected))
+        s = len(set(norm(run_lines(st))) & set(expected))
         if s > score:
             best, score = (i, st), s
     if best is None:
         return "no step shares a statement with it"
-    return f"nearest is {step_label(*best)}: {step_problem(best[1], want_keys, expected)}"
+    return f"nearest is {step_label(*best)}: {step_problem(best[1], want_keys, expected, norm)}"
 
 
 def one_unit(steps: List[Tuple[int, Node]], want_keys: Tuple[str, ...], expected: Tuple[str, ...], what: str,
-             rep: Report) -> List[int]:
-    found = canonical(steps, want_keys, expected)
+             rep: Report, norm: Norm = _same) -> List[int]:
+    found = canonical(steps, want_keys, expected, norm)
     if len(found) != 1:
         rep.bad(f"{what} must have exactly one step with exactly the allowed body (found {len(found)})"
-                + (": " + nearest_problem(steps, want_keys, expected) if not found else ""))
+                + (": " + nearest_problem(steps, want_keys, expected, norm) if not found else ""))
     return found
 
 
@@ -602,15 +684,22 @@ def check_no_bash_env(label: str, text: str, rep: Report) -> None:
         rep.bad(f"{label}: BASH_ENV runs a file before every non-interactive bash, so it can neutralise the assert (refused anywhere)")
 
 
+def unquoted(text: str) -> str:
+    """``text`` as bash reads a word: quote and backslash characters removed
+    (``c''argo`` and ``ca\\rgo`` read as ``cargo``). A best-effort spelling view
+    for REFUSALS only; it cannot see a name built by expansion."""
+    return QUOTE_RE.sub("", text)
+
+
 def check_text_counts(text: str, rep: Report) -> None:
     """Whole-file backstops (any job): at most one line builds the matrix target,
     at most one runs ``cargo ... cyclonedx``."""
     lines = logical_lines(text.split("\n"))
-    builds = [ln for ln in lines if BUILD_TOOL_RE.search(ln) and "matrix.target" in ln]
+    builds = [ln for ln in lines if BUILD_TOOL_RE.search(unquoted(ln)) and "matrix.target" in ln]
     if len(builds) > 1:
         rep.bad(f"release.yml: {len(builds)} lines run a build tool against the matrix target; only the allowed unit "
                 f"may build: {builds[-1][:90]}")
-    sboms = [ln for ln in lines if SBOM_TOOL_RE.search(ln)]
+    sboms = [ln for ln in lines if SBOM_TOOL_RE.search(unquoted(ln))]
     if len(sboms) > 1:
         rep.bad(f"release.yml: {len(sboms)} lines run `cargo ... cyclonedx`; only the SBOM unit in the `sbom:` job may: "
                 f"{sboms[-1][:90]}")
@@ -663,7 +752,7 @@ def check_release_job(job: Node, rep: Report) -> None:
     for i, st in steps:
         if i in builds:
             continue
-        hit = next((m for m in (BUILD_TOOL_RE.search(t) for t in node_texts(st)) if m), None)
+        hit = next((m for m in (BUILD_TOOL_RE.search(unquoted(t)) for t in node_texts(st)) if m), None)
         if hit is not None:
             rep.bad(f"release.yml: release job {step_label(i, st)} runs `{hit.group(0)}`; only the canonical build "
                     "step may run a build tool in the release job (any option order or +toolchain)")
@@ -675,15 +764,79 @@ def check_sbom_job(job: Node, rep: Report) -> None:
     one_unit(job_steps(job, "release.yml sbom job", rep), KEYS_PLAIN, WF_SBOM, "release.yml: the `sbom:` job SBOM", rep)
 
 
-def check_image_build(jobs: Node, rep: Report) -> None:
-    """The image the docker job ships is the Dockerfile's final stage."""
-    for path, node in walk(jobs):
-        if node.kind == "map" and node.get("uses") is not None and node.get("uses").text().startswith("docker/build-push-action"):
-            with_ = node.get("with")
-            extra = sorted(set(with_.keys()) & {"target", "file"}) if with_ is not None else []
-            if extra:
-                rep.bad(f"release.yml: docker/build-push-action at jobs.{'.'.join(path)} sets {extra}: the guard pins "
-                        "the final stage of ./Dockerfile; another target or file ships something else")
+def check_image_step(step: Node, at: str, rep: Report) -> None:
+    """The image-build step is an ALLOWLIST: its keys, its `uses` and every `with:`
+    key and value are pinned, so no `file`, `target`, `build-contexts`,
+    `build-args` (a frontend or syntax override), other `context` or any key the
+    guard has not read can be added."""
+    if set(step.keys()) != set(IMAGE_BUILD_KEYS):
+        rep.bad(f"release.yml: the image build at {at} has keys {sorted(step.keys())}; the only allowed set is "
+                f"{sorted(IMAGE_BUILD_KEYS)} (a step `env:`, `if:` or `working-directory:` changes what is built)")
+    name = step.get("name")
+    if name is not None and "${{" in name.text():
+        rep.bad(f"release.yml: the image build at {at}: the step `name:` carries a `${{{{ }}}}` expression")
+    ident = step.get("id")
+    if ident is None or ident.style != "plain" or ident.text() != "build":
+        rep.bad(f"release.yml: the image build at {at} must have `id: build` (the provenance step reads its digest)")
+    with_ = step.get("with")
+    if with_ is None or with_.kind != "map":
+        rep.bad(f"release.yml: the image build at {at} must have a `with:` mapping")
+        return
+    allowed = set(IMAGE_BUILD_SCALARS) | set(IMAGE_BUILD_BLOCKS)
+    if set(with_.keys()) != allowed:
+        extra, lost = sorted(set(with_.keys()) - allowed), sorted(allowed - set(with_.keys()))
+        rep.bad(f"release.yml: the image build at {at} `with:` keys differ from the only allowed set "
+                f"(extra {extra}, missing {lost}); `file`, `target`, `build-contexts`, `build-args` and any other input "
+                "would ship something the guard did not read")
+    for key, want in IMAGE_BUILD_SCALARS.items():
+        val = with_.get(key)
+        if val is not None and (val.style != "plain" or val.text() != want):
+            rep.bad(f"release.yml: the image build at {at} `with: {key}:` must be exactly the plain value `{want}`"
+                    + (" (the build context is the repository root, whose ./Dockerfile the guard reads)" if key == "context" else ""))
+    for key, want_lines in IMAGE_BUILD_BLOCKS.items():
+        val = with_.get(key)
+        if val is not None and not (val.kind == "block" and val.style == "|" and tuple(val.value) == want_lines):
+            rep.bad(f"release.yml: the image build at {at} `with: {key}:` must be exactly the pinned `|` block {list(want_lines)}")
+
+
+def check_docker_actions(jobs: Node, rep: Report) -> None:
+    """Every image-building action in release.yml is pinned case-exact, the image
+    build lives once in the `docker:` job, and no run text builds an image."""
+    builds: List[Tuple[str, Node]] = []
+    for jname, job in (jobs.value.items() if isinstance(jobs.value, dict) else []):
+        juses = job.get("uses")
+        if juses is not None and IMAGE_BUILDER_RE.search(juses.text().lower()):
+            rep.bad(f"release.yml: job `{jname}` calls the reusable workflow `{juses.text()[:60]}`, an image builder the guard cannot read")
+        steps = job.get("steps")
+        for i, st in enumerate(steps.value if steps is not None and steps.kind == "seq" and isinstance(steps.value, list) else []):
+            if st.kind != "map":
+                continue
+            at = f"jobs.{jname}.steps.{i + 1}"
+            uses = st.get("uses")
+            if uses is not None:
+                text = uses.text()
+                if IMAGE_BUILDER_RE.search(text.lower()):
+                    if uses.style != "plain" or text not in DOCKER_ACTIONS:
+                        rep.bad(f"release.yml: {at} uses `{text[:70]}`; an image builder must be exactly one of "
+                                f"{sorted(DOCKER_ACTIONS)} (owner/action are case-exact, the SHA is pinned)")
+                    elif text == IMAGE_BUILD_USES:
+                        builds.append((at, st))
+                    elif text == BUILDX_USES and set(st.keys()) != {"name", "uses"}:
+                        rep.bad(f"release.yml: {at} (buildx setup) may carry only `name` and `uses` (a driver or "
+                                "buildkitd option changes how the image is built)")
+                    elif text == LOGIN_USES:
+                        lw = st.get("with")
+                        if set(st.keys()) != {"name", "uses", "with"} or lw is None or set(lw.keys()) != set(LOGIN_WITH_KEYS):
+                            rep.bad(f"release.yml: {at} (registry login) may carry only `name`, `uses` and `with: "
+                                    f"{list(LOGIN_WITH_KEYS)}`")
+            for t in node_texts(st):
+                if IMAGE_CMD_RE.search(unquoted(t)):
+                    rep.bad(f"release.yml: {at} runs an image build or push command outside the pinned build action: {t[:70]}")
+    if len(builds) != 1 or not builds[0][0].startswith("jobs.docker."):
+        rep.bad(f"release.yml: the image must be built by exactly one `{IMAGE_BUILD_USES.split('@')[0]}` step in the "
+                f"`docker:` job (found {[at for at, _ in builds]})")
+    for at, st in builds:
+        check_image_step(st, at, rep)
 
 
 def check_release_yml(text: str, rep: Report) -> None:
@@ -704,7 +857,7 @@ def check_release_yml(text: str, rep: Report) -> None:
         check_release_job(release, rep)
     if want_kind(sbom, "map", "release.yml `jobs.sbom`", rep) and sbom is not None:
         check_sbom_job(sbom, rep)
-    check_image_build(jobs, rep)
+    check_docker_actions(jobs, rep)
 
 
 def docker_nearest(builder: List[str]) -> str:
@@ -728,8 +881,13 @@ def check_dockerfile(text: str, rep: Report) -> None:
                     f"directive changes what a line continuation is): {ln.strip()[:60]}")
     stages: List[Tuple[Optional[str], List[str]]] = []
     names: Dict[str, int] = {}
-    for ins in logical_lines(raw):
+    for n in continuation_noise(raw):
+        rep.bad(f"Dockerfile: line {n}: a blank or comment line inside a `\\` continuation (BuildKit drops it, a shell "
+                f"never sees it; the instruction text must be exactly what is written): {raw[n - 1].strip()[:60]}")
+    for ins in logical_lines(raw, buildkit=True):
         word = ins.split(" ", 1)[0].upper()
+        if "--mount" in ins.lower():
+            rep.bad(f"Dockerfile: `--mount` refused (a mount can overlay or import files the guard never read): {ins[:60]}")
         if "<<" in ins:
             rep.bad(f"Dockerfile: heredoc (`<<`) refused, the guard cannot see what it runs: {ins[:60]}")
         if word not in DOCKER_INSTRUCTIONS:
@@ -744,6 +902,9 @@ def check_dockerfile(text: str, rep: Report) -> None:
                 image, name = (toks[1] if len(toks) > 1 else ""), None
             else:
                 image, name = m.group("image"), m.group("name")
+            if "$" in image:
+                rep.bad(f"Dockerfile: FROM image `{image}` is a variable; a stage must start FROM a literal base image "
+                        f"(the guard cannot resolve it): {ins[:60]}")
             if image.lower() in names:
                 rep.bad(f"Dockerfile: `{ins[:60]}` starts a stage FROM an earlier stage (a stage starts from a base image)")
             if name is not None:
@@ -800,10 +961,14 @@ def check_inline_use(name: str, text: str, rep: Report) -> None:
             rep.bad(f"{name}: inline use of the declaration (a failure would be swallowed; assign it in its own statement): {ln[:80]}")
 
 
+def _shape_norm(lines: Tuple[str, ...]) -> Tuple[str, ...]:
+    """The proof statements with the TLS URL assignment (any port) replaced by its placeholder."""
+    if len(lines) == len(SHAPE_PROOF) and SHAPE_URL_RE.fullmatch(lines[1]):
+        return (lines[0], SHAPE_PROOF_URL, lines[2])
+    return lines
+
+
 def check_shape(text: str, rep: Report) -> None:
-    view = code_lines(text)
-    if "scripts/release-shape-pg-proof.sh" not in view:
-        rep.bad("release-shape.yml does not run scripts/release-shape-pg-proof.sh")
     doc = parse_yaml(text, "release-shape.yml", rep)
     if doc is None:
         return
@@ -811,8 +976,17 @@ def check_shape(text: str, rep: Report) -> None:
     jobs = doc.get("jobs")
     job = jobs.get("release-shape") if jobs is not None else None
     if want_kind(job, "map", "release-shape.yml `jobs.release-shape`", rep) and job is not None:
-        one_unit(job_steps(job, "release-shape.yml release-shape job", rep), KEYS_SHELL, SHAPE_BUILD,
-                 "release-shape.yml: the `release-shape:` job build", rep)
+        # Job-level `continue-on-error: true` is the shipped, ruled "advisory until the first green run"
+        # state (#4480): the job still runs and its steps still fail. A job `if:` would skip the proof.
+        if job.get("if") is not None:
+            rep.bad("release-shape.yml: the `release-shape:` job carries `if:`, which can skip the proof")
+        steps = job_steps(job, "release-shape.yml release-shape job", rep)
+        builds = one_unit(steps, KEYS_SHELL, SHAPE_BUILD, "release-shape.yml: the `release-shape:` job build", rep)
+        proofs = one_unit(steps, KEYS_SHELL, SHAPE_PROOF, "release-shape.yml: the `release-shape:` job pg proof "
+                          "(an executing `bash scripts/release-shape-pg-proof.sh` run step; the `paths:` filter does not count)",
+                          rep, _shape_norm)
+        if builds and proofs and proofs[0] < builds[0]:
+            rep.bad("release-shape.yml: the pg proof must run after the release-shaped build, in the same job")
 
 
 def check_install(text: str, rep: Report) -> None:
@@ -994,6 +1168,71 @@ def _dead_stage_then_alter(text: str) -> str:
     dead = text[a:b].replace(" AS builder", " AS decoy")
     live = text[a:b].replace("strip target/release/ai-memory", "true")
     return text[:a] + dead + live + text[b:]
+
+
+BUILD_IMG_NAME = "      - name: Build and push Docker image\n"
+ATTEST_NAME = "      - name: Attest build provenance (Docker image)\n"
+PUSH_USES = "        uses: " + IMAGE_BUILD_USES + " # v6\n"
+BUILDX_STEP = "      - name: Set up Docker Buildx\n        uses: " + BUILDX_USES + " # v3\n"
+LOGIN_NAME = "      - name: Log in to GitHub Container Registry\n"
+PUSH_CACHE = "          cache-from: type=gha\n          cache-to: type=gha,mode=max\n"
+PUSH_TAGS = "          tags: |\n"
+PUSH_LABELS = "          labels: |\n"
+SHAPE_PROOF_LINE = "          " + SHAPE_PROOF_CMD
+PROOF_NAME = "      - name: Prove the shipped binary reports sal-postgres and uses the tier over verify-full\n"
+SHAPE_BUILD_NAME = "      - name: Build release binary (exactly as release.yml)\n"
+
+
+def _image_step(text: str) -> str:
+    a = text.index(BUILD_IMG_NAME)
+    return text[a:text.index(ATTEST_NAME, a)]
+
+
+def _drop_image_with(text: str) -> str:
+    step = _image_step(text)
+    return text.replace(step, step[: step.index(PUSH_WITH)], 1)
+
+
+def _image_with_scalar(text: str) -> str:
+    step = _image_step(text)
+    return text.replace(step, step[: step.index(PUSH_WITH)] + "        with: none\n", 1)
+
+
+def _second_image_build(text: str) -> str:
+    step = _image_step(text)
+    return text.replace(step, step + step, 1)
+
+
+def _image_build_in_sbom_job(text: str) -> str:
+    step = _image_step(text)
+    return text.replace(step, "", 1).replace(SBOM_HDR, step + SBOM_HDR, 1)
+
+
+def _image_build_copy_in_sbom_job(text: str) -> str:
+    return text.replace(SBOM_HDR, _image_step(text) + SBOM_HDR, 1)
+
+
+def _swap_cache_order(text: str) -> str:
+    return text.replace(PUSH_CACHE, "          cache-to: type=gha,mode=max\n          cache-from: type=gha\n", 1)
+
+
+def _reusable_builder_job(text: str) -> str:
+    return text.rstrip("\n") + "\n\n  builder:\n    uses: docker/build-push-action/.github/workflows/x.yml@v6\n"
+
+
+def _proof_before_build(text: str) -> str:
+    b = text.index(PROOF_NAME)
+    step = text[b:text.index("      - name: Stop the PostgreSQL service", b)]
+    return text.replace(step, "", 1).replace(SHAPE_BUILD_NAME, step + SHAPE_BUILD_NAME, 1)
+
+
+def _drop_proof_step(text: str) -> str:
+    b = text.index(PROOF_NAME)
+    return text.replace(text[b:text.index("      - name: Stop the PostgreSQL service", b)], "", 1)
+
+
+def _d(old: str, new: str) -> Edit:
+    return _docker(old, new)
 
 
 # name -> (want, edits). want: "pass" (guard accepts), "fail" (guard refuses),
@@ -1307,6 +1546,97 @@ CASES: Dict[str, Tuple[str, List[Edit]]] = {
     "L2 U+2028 inside a comment line (a YAML 1.1 line break) hides a job key": ("fail", [_rel(
         JOB_NAME, JOB_NAME + "    # note\u2028    if: false\n")]),
     "L2 byte-order mark at the start of release.yml": ("fail", [_rel(JOB_NAME, lambda t: "\ufeff" + t)]),
+    # --- #4719 review round 2 (F1/SR-4): the image build is an allowlist
+    "IB file: on the image build": ("fail", [_rel(PUSH_WITH, PUSH_WITH + "          file: Dockerfile.alt\n")]),
+    "IB context other than the repository root": ("fail", [_rel(PUSH_WITH, PUSH_WITH.replace("context: .", "context: ./deploy"))]),
+    "IB with: is a scalar": ("fail", [_rel(BUILD_IMG_NAME, _image_with_scalar)]),
+    "IB context missing": ("fail", [_rel(PUSH_WITH, "        with:\n")]),
+    "IB with: missing": ("fail", [_rel(BUILD_IMG_NAME, _drop_image_with)]),
+    "IB build-contexts replaces the builder stage": ("fail", [_rel(
+        PUSH_WITH, PUSH_WITH + "          build-contexts: builder=docker-image://alpine\n")]),
+    "IB build-args overrides the frontend": ("fail", [_rel(
+        PUSH_WITH, PUSH_WITH + "          build-args: BUILDKIT_SYNTAX=ghcr.io/x/frontend\n")]),
+    "IB platforms added": ("fail", [_rel(PUSH_WITH, PUSH_WITH + "          platforms: linux/riscv64\n")]),
+    "IB owner/action in another case": ("fail", [_rel(PUSH_USES, PUSH_USES.replace("docker/build-push", "Docker/Build-Push"))]),
+    "IB uses spelled with a YAML escape": ("fail", [_rel(
+        PUSH_USES, '        uses: "\\x64ocker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8"\n')]),
+    "IB uses double-quoted (no escape)": ("fail", [_rel(PUSH_USES, PUSH_USES.replace(IMAGE_BUILD_USES, '"' + IMAGE_BUILD_USES + '"'))]),
+    "IB uses single-quoted": ("fail", [_rel(PUSH_USES, PUSH_USES.replace(IMAGE_BUILD_USES, "'" + IMAGE_BUILD_USES + "'"))]),
+    "IB uses pinned to another commit": ("fail", [_rel(PUSH_USES, PUSH_USES.replace("10e90e36", "00000000"))]),
+    "IB uses swapped for another image builder": ("fail", [_rel(PUSH_USES, "        uses: int128/kaniko-action@v1\n")]),
+    "IB step id changed": ("fail", [_rel("        id: build\n", "        id: image\n")]),
+    "IB step carries env": ("fail", [_rel(PUSH_USES, PUSH_USES + "        env:\n          DOCKER_BUILDKIT: '0'\n")]),
+    "IB step carries if": ("fail", [_rel(PUSH_USES, PUSH_USES + "        if: false\n")]),
+    "IB step name carries an expression": ("fail", [_rel(BUILD_IMG_NAME, "      - name: Build ${{ github.actor }}\n")]),
+    "IB push value changed": ("fail", [_rel("push: ${{ github.event.inputs.dry_run == 'false' }}", "push: true")]),
+    "IB push value quoted": ("fail", [_rel("push: ${{ github.event.inputs.dry_run == 'false' }}",
+                                          "push: '${{ github.event.inputs.dry_run == ''false'' }}'")]),
+    "IB tags changed": ("fail", [_rel(PUSH_TAGS, PUSH_TAGS + "            ghcr.io/other/ai-memory:latest\n")]),
+    "IB labels changed": ("fail", [_rel(PUSH_LABELS, PUSH_LABELS + "            extra=1\n")]),
+    "IB cache-from changed": ("fail", [_rel("cache-from: type=gha", "cache-from: type=registry,ref=x/y")]),
+    "IB cache-to changed": ("fail", [_rel("cache-to: type=gha,mode=max", "cache-to: type=gha")]),
+    "IB second image build in the docker job": ("fail", [_rel(BUILD_IMG_NAME, _second_image_build)]),
+    "IB image build moved to the sbom job": ("fail", [_rel(BUILD_IMG_NAME, _image_build_in_sbom_job)]),
+    "IB image build copied into the sbom job": ("fail", [_rel(BUILD_IMG_NAME, _image_build_copy_in_sbom_job)]),
+    "IB image build step deleted": ("fail", [_rel(BUILD_IMG_NAME, lambda t: t.replace(_image_step(t), "", 1))]),
+    "IB docker build in a run step": ("fail", _step_before_pkg("        run: docker build -t x .\n")),
+    "IB docker buildx build in a run step": ("fail", _step_before_pkg("        run: |\n          docker  buildx build --push .\n")),
+    "IB quoted docker build in a run step": ("fail", _step_before_pkg("        run: d''ocker build .\n")),
+    "IB buildctl in a run step": ("fail", _step_before_pkg("        run: buildctl build --frontend dockerfile.v0\n")),
+    "IB reusable image-build workflow job": ("fail", [_rel(BUILD_IMG_NAME, _reusable_builder_job)]),
+    "IB buildx setup carries with": ("fail", [_rel(BUILDX_STEP, BUILDX_STEP + "        with:\n          driver-opts: image=x\n")]),
+    "IB buildx setup in another case": ("fail", [_rel(BUILDX_STEP, BUILDX_STEP.replace("docker/setup", "Docker/setup"))]),
+    "IB login carries another key": ("fail", [_rel(LOGIN_NAME, LOGIN_NAME + "        env:\n          X: y\n")]),
+    "valid: image build with: keys reordered": ("pass", [_rel(PUSH_CACHE, _swap_cache_order)]),
+    # --- #4719 review round 2 (SR-5/F1): double-quoted escapes are never decoded
+    "SR5/S10 double-quoted run spells cargo with an escape": ("fail", _step_before_pkg(
+        '        run: "\\x63argo build --release --target ${{ matrix.target }}"\n')),
+    "SR5/S13 double-quoted second SBOM spelled with an escape": ("fail", [_rel(
+        SBOM_HDR, '      - name: x\n        run: "\\x63argo cyclonedx --format json"\n' + SBOM_HDR)]),
+    "SR5/S14 pinned step name spelled with an escape": ("fail", [_rel(ASSERT_NAME, '      - name: "\\x24{{ github.actor }}"\n')]),
+    "SR5 backslash in any double-quoted scalar": ("fail", [_rel(JOB_NAME, '    name: "Release\\tx"\n')]),
+    "SR5 valid double-quoted scalar without a backslash": ("pass", [_rel(PKG_HDR, '      - name: "Package binary"\n')]),
+    # --- #4719 SR-7: quote characters inside a command word
+    "SR7/S12 plain c''argo build in a later release step": ("fail", _step_before_pkg("        run: c''argo build --release\n")),
+    "SR7 c\"\"argo build in a later release step": ("fail", _step_before_pkg('        run: c""argo build --release\n')),
+    "SR7 ca\\rgo build in a later release step": ("fail", _step_before_pkg("        run: ca\\rgo build --release\n")),
+    "SR7 c'a'rgo build in a block run": ("fail", _step_before_pkg("        run: |\n          c'a'rgo build --release\n")),
+    "SR7 second matrix-target build spelled c''argo in another job": ("fail", [_rel(
+        SBOM_HDR, "      - name: x\n        run: c''argo build --target ${{ matrix.target }}\n" + SBOM_HDR)]),
+    "SR7 second SBOM spelled c''argo": ("fail", [_rel(
+        SBOM_HDR, "      - name: x\n        run: c''argo cyclonedx --format json\n" + SBOM_HDR)]),
+    # --- #4719 F3: YAML subset keys
+    "F3 space before the colon on runs-on": ("fail", [_rel(NEEDS_REL, NEEDS_REL.replace("runs-on:", "runs-on :"))]),
+    "F3 space before the colon on a step key": ("fail", _hdr_key(ASSERT_NAME, "if : false")),
+    "F3 space before the colon on the job key": ("fail", [_rel("\n  release:\n", "\n  release :\n")]),
+    # --- #4719 F2/F3/F4: Dockerfile parity with BuildKit
+    "D11 blank line inside a continuation swallows the binary COPY": ("fail", [_docker(D_BIN, "VOLUME /data \\\n\n" + D_BIN)]),
+    "D12 comment line inside the build RUN continuation": ("fail", [_docker(
+        '    strip target/release/ai-memory; \\', '    # note\n    strip target/release/ai-memory; \\')]),
+    "D12b comment line inside another instruction's continuation": ("fail", [_docker(D_BIN, "LABEL a=1 \\\n# c\n b=2\n" + D_BIN)]),
+    "D13 final stage FROM a variable": ("fail", [_docker(D_FINAL, "FROM ${BASE}\n")]),
+    "D13b builder stage FROM a variable": ("fail", [_docker(D_BUILDER, "FROM ${BASE} AS builder\n")]),
+    "D15 lowercase instruction in the final stage": ("pass", [_docker(D_BIN, D_BIN + "label org.example.x=1\n")]),
+    "D15b mixed-case binary COPY is not the binary COPY": ("fail", [_docker(D_BIN, D_BIN.replace("COPY", "Copy"))]),
+    "D16 RUN --mount from= in the builder": ("fail", [_docker(D_LOCK, D_LOCK + "RUN --mount=type=bind,from=busybox,target=/m true\n")]),
+    "D16b RUN --mount in the final stage": ("fail", [_docker(D_BIN, D_BIN + "RUN --mount=type=bind,from=busybox,target=/m true\n")]),
+    "D16c lowercase run --mount": ("fail", [_docker(D_BIN, D_BIN + "run --mount=type=cache,target=/m true\n")]),
+    # --- #4719 SR-6/P4/P5/P6: the pg proof is a real, executing, fatal run step
+    "P4 the only proof invocation replaced by true": ("fail", [(SHAPE, SHAPE_PROOF_CMD, "true", False)]),
+    "P6 continue-on-error on the proof step": ("fail", [(SHAPE, PROOF_NAME, PROOF_NAME + "        continue-on-error: true\n", False)]),
+    "P5 if: false on the proof step": ("fail", [(SHAPE, PROOF_NAME, PROOF_NAME + "        if: false\n", False)]),
+    "P5b if on the release-shape job": ("fail", [(SHAPE, "    runs-on: ubuntu-latest\n    # Advisory", "    runs-on: ubuntu-latest\n    if: false\n    # Advisory", False)]),
+    "P7 proof step deleted": ("fail", [(SHAPE, PROOF_NAME, _drop_proof_step, False)]),
+    "P8 proof runs before the build": ("fail", [(SHAPE, PROOF_NAME, _proof_before_build, False)]),
+    "P9 proof invocation made non-fatal": ("fail", [(SHAPE, SHAPE_PROOF_CMD, SHAPE_PROOF_CMD + " || true", False)]),
+    "P10 proof invocation prefixed with a false test": ("fail", [(SHAPE, SHAPE_PROOF_CMD, "false && " + SHAPE_PROOF_CMD, False)]),
+    "P11 proof run block gains a statement": ("fail", [(SHAPE, SHAPE_PROOF_LINE, "          exit 0\n" + SHAPE_PROOF_LINE, False)]),
+    "P12 proof step carries env": ("fail", [(SHAPE, PROOF_NAME, PROOF_NAME + "        env:\n          X: y\n", False)]),
+    "P13 proof invoked with a different binary": ("fail", [(SHAPE, SHAPE_PROOF_CMD, SHAPE_PROOF_CMD.replace("target/release/ai-memory", "/bin/true"), False)]),
+    "P14 proof step name carries an expression": ("fail", [(SHAPE, PROOF_NAME, PROOF_NAME.replace("tier", "tier ${{ github.actor }}"), False)]),
+    "P15 proof URL points at another host": ("fail", [(SHAPE, "127.0.0.1:55432/proof", "198.51.100.7:55432/proof", False)]),
+    "D16d uppercase RUN --MOUNT": ("fail", [_docker(D_BIN, D_BIN + "RUN --MOUNT=type=cache,target=/m true\n")]),
+    "valid: proof URL port changed": ("pass", [(SHAPE, "127.0.0.1:55432/proof", "127.0.0.1:55433/proof", False)]),
 }
 
 
@@ -1351,8 +1681,59 @@ ENTRY_CASES: Dict[str, Tuple[Callable[[Path], None], int]] = {
 }
 
 
-def self_test(root: Path) -> int:
+# BuildKit parity (expected outputs recorded from the moby/buildkit v0.23.2 dockerfile parser):
+# (physical lines, buildkit mode, logical lines).
+PARITY: Tuple[Tuple[Tuple[str, ...], bool, Tuple[str, ...]], ...] = (
+    (("FROM a", "VOLUME /data \\", "", "COPY x y"), True, ("FROM a", "VOLUME /data COPY x y")),
+    (("RUN echo \\", "# c", "  b"), True, ("RUN echo b",)),
+    (("RUN a \\  ", "b"), True, ("RUN a b",)),
+    (("RUN echo \\",), True, ("RUN echo",)),
+    (("# x", "", "  # y", "RUN  a\tb"), True, ("RUN a b",)),
+    (("label x=1",), True, ("label x=1",)),
+    (("a \\", "# c", "b"), False, ("a # c", "b")),
+    (("a \\", "", "b"), False, ("a", "b")),
+)
+# YAML scalar decoding: (document, key, expected text or None when the document is refused).
+SCALARS: Tuple[Tuple[str, str, Optional[str]], ...] = (
+    ("a: 'it''s'\n", "a", "it's"),
+    ("a: ''''\n", "a", "'"),
+    ('a: "plain"\n', "a", "plain"),
+    ('a: "x\\x63y"\n', "a", None),
+    ('a: "x\\"y"\n', "a", None),
+    ("a: 'x\\y'\n", "a", "x\\y"),
+    ("a: plain\n", "a", "plain"),
+)
+
+
+def unit_checks() -> int:
+    """Pure-function cases: logical_lines parity with BuildKit, noise detection, scalar decoding."""
     failures = 0
+    for lines, bk, want in PARITY:
+        got = tuple(logical_lines(list(lines), buildkit=bk))
+        if got != want:
+            print(f"self-test FAIL: logical_lines({list(lines)}, buildkit={bk}) = {list(got)}, wanted {list(want)}", file=sys.stderr)
+            failures += 1
+    if continuation_noise(["RUN a \\", "", "# c", "b", "# d"]) != [2, 3]:
+        print("self-test FAIL: continuation_noise misses a blank or comment inside a continuation", file=sys.stderr)
+        failures += 1
+    if continuation_noise(["# a", "", "RUN a \\", "b", "", "# d"]):
+        print("self-test FAIL: continuation_noise flags a line outside a continuation", file=sys.stderr)
+        failures += 1
+    for doc, key, want in SCALARS:
+        rep = Report()
+        node = parse_yaml(doc, "scalar", rep)
+        got: Optional[str] = None
+        if node is not None and not rep.errors:
+            val = node.get(key)
+            got = val.text() if val is not None else None
+        if got != want:
+            print(f"self-test FAIL: scalar {doc!r} decoded {got!r}, wanted {want!r}", file=sys.stderr)
+            failures += 1
+    return failures
+
+
+def self_test(root: Path) -> int:
+    failures = unit_checks()
     missing = [rel for rel in INPUT_FILES if not (root / rel).is_file()]
     if missing:
         print(f"check_release_features: self-test FAIL: missing inputs under {root}: {', '.join(missing)}", file=sys.stderr)
@@ -1421,7 +1802,7 @@ def self_test(root: Path) -> int:
     print(
         "check_release_features: self-test OK "
         f"(a failing or empty declaration fails the build step and the Dockerfile RUN; "
-        f"{len(CASES)} guard cases, {len(ENTRY_CASES)} entry-point cases)"
+        f"{len(CASES)} guard cases, {len(PARITY)} parity cases, {len(SCALARS)} scalar cases, {len(ENTRY_CASES)} entry-point cases)"
     )
     return 0
 
@@ -1471,11 +1852,87 @@ def mutation_sweep(root: Path) -> int:
     survivors = [line for _, line, killed in results if not killed]
     for k, line, killed in results:
         print(f"site {k:3d} line {line:4d}: {'killed' if killed else 'SURVIVED'}")
-    print(f"check_release_features: mutation sweep: {len(results)} mutants, {len(survivors)} survivors")
-    if survivors:
-        print(f"check_release_features: surviving refusal sites at lines {survivors}", file=sys.stderr)
+    cond_total, cond_survivors = condition_sweep(root, src)
+    print(f"check_release_features: mutation sweep: {len(results)} refusal mutants + {cond_total} condition mutants = "
+          f"{len(results) + cond_total} mutants, {len(survivors) + len(cond_survivors)} survivors")
+    if survivors or cond_survivors:
+        print(f"check_release_features: surviving refusal sites at lines {survivors}, condition mutants {cond_survivors}",
+              file=sys.stderr)
         return 1
     return 0
+
+
+def condition_sweep(root: Path, src: bytes) -> Tuple[int, List[str]]:
+    """Apply each CONDITION_MUTANTS entry (exact-once text substitution above CONDITION_MARKER)
+    and require ``--self-test`` to fail. An anchor that is not found exactly once is itself a survivor."""
+    me = Path(__file__).resolve()
+    text = src.decode("utf-8")
+    cut = text.index(CONDITION_MARKER + "\n")
+    head, tail = text[:cut], text[cut:]
+    base = os.environ.get("TMPDIR") or str(root / ".local-runs")
+    Path(base).mkdir(parents=True, exist_ok=True)
+    survivors: List[str] = []
+    with tempfile.TemporaryDirectory(prefix="relfeat-cond.", dir=base) as td:
+        tmp = Path(td)
+
+        def run(item: Tuple[int, Tuple[str, str, str]]) -> Tuple[int, str, str]:
+            k, (desc, old, new) = item
+            if head.count(old) != 1:
+                return k, desc, f"SURVIVED (anchor found {head.count(old)} times, not once)"
+            mutant = tmp / f"cond_{k}.py"
+            mutant.write_text(head.replace(old, new, 1) + tail, encoding="utf-8")
+            res = subprocess.run([sys.executable, str(mutant), "--self-test", str(root)], capture_output=True, text=True)
+            return k, desc, "killed" if res.returncode != 0 else "SURVIVED"
+
+        with ThreadPoolExecutor(max_workers=max(1, min(4, os.cpu_count() or 1))) as pool:
+            results = sorted(pool.map(run, list(enumerate(CONDITION_MUTANTS))))
+    for k, desc, state in results:
+        print(f"condition {k:3d} {desc}: {state}")
+        if state != "killed":
+            survivors.append(f"{k} ({desc})")
+    del me
+    return len(results), survivors
+
+
+
+
+# Condition mutants: (description, anchor, replacement). The sweep above only neutralises refusal CALLS;
+# these change a CONDITION or a regex, which that sweep cannot see. Each anchor must occur exactly once in
+# the source ABOVE the marker line below (so the table never matches itself); the mutant is killed when
+# --self-test exits non-zero.
+CONDITION_MARKER = "# --- end of condition mutants"
+# --- end of condition mutants
+CONDITION_MUTANTS: Tuple[Tuple[str, str, str], ...] = (
+    ("double-quoted backslash test never fires", 'if style == "double" and "\\\\" in v:', "if False:"),
+    ("single-quoted '' is not decoded", 'v[1:-1].replace("\'\'", "\'")', "v[1:-1]"),
+    ("single-quoted style test never fires", 'if style == "single":', "if False:"),
+    ("BuildKit continuation keeps shell semantics", "if buf and not buildkit:", "if buf and True:"),
+    ("continuation noise never recorded", "            if open_:\n", "            if False:\n"),
+    ("--mount refusal is case-sensitive", '"--mount" in ins.lower()', '"--mount" in ins'),
+    ("FROM variable refusal never fires", 'if "$" in image:', "if False:"),
+    ("instruction word is not case-folded", 'word = ins.split(" ", 1)[0].upper()', 'word = ins.split(" ", 1)[0]'),
+    ("final-stage binary COPY count not compared", "if len(copies) != 1:", "if False:"),
+    ("job-level if not refused in release-shape", 'if job.get("if") is not None:', "if False:"),
+    ("proof order against the build not compared", "if builds and proofs and proofs[0] < builds[0]:", "if False:"),
+    ("proof URL placeholder accepts any URL", "SHAPE_URL_RE.fullmatch(lines[1])", "True"),
+    ("image-builder uses not compared with the allowlist", "or text not in DOCKER_ACTIONS", "or False"),
+    ("image-builder uses may be quoted", 'uses.style != "plain" or', "False or"),
+    ("image-build with: key set not compared", "if set(with_.keys()) != allowed:", "if False:"),
+    ("image-build with: values not compared", 'if val is not None and (val.style != "plain" or val.text() != want):', "if False:"),
+    ("image-build with: blocks not compared", 'if val is not None and not (val.kind == "block"', "if False and (val.kind == \"block\""),
+    ("image-build step key set not compared", "if set(step.keys()) != set(IMAGE_BUILD_KEYS):", "if False:"),
+    ("image-build id not compared", 'ident.text() != "build"', "False"),
+    ("image-build step name expression allowed", 'if name is not None and "${{" in name.text():\n        rep.bad(f"release.yml: the image build', 'if False:\n        rep.bad(f"release.yml: the image build'),
+    ("pinned step name expression allowed", 'if name is not None and "${{" in name.text():\n        why.bad("the step', 'if False:\n        why.bad("the step'),
+    ("buildx setup extra keys allowed", 'set(st.keys()) != {"name", "uses"}', "False"),
+    ("login extra keys allowed", 'set(st.keys()) != {"name", "uses", "with"} or', "False or"),
+    ("single image build not required", "if len(builds) != 1 or", "if False or"),
+    ("image build may live outside the docker job", 'not builds[0][0].startswith("jobs.docker.")', "False"),
+    ("quoted image command spelling not unquoted", "IMAGE_CMD_RE.search(unquoted(t))", "IMAGE_CMD_RE.search(t)"),
+    ("quoted build tool spelling not unquoted", "BUILD_TOOL_RE.search(unquoted(t))", "BUILD_TOOL_RE.search(t)"),
+    ("KEY_RE accepts a space before the colon", 'KEY_RE = re.compile(r"(?P<key>[A-Za-z_][A-Za-z0-9_-]*):', 'KEY_RE = re.compile(r"(?P<key>[A-Za-z_][A-Za-z0-9_-]*) ?:'),
+    ("reusable image-build job never refused", "if juses is not None and IMAGE_BUILDER_RE.search(juses.text().lower()):", "if False:"),
+)
 
 
 # -------------------------------------------------------------------- main --
