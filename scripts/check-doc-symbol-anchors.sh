@@ -29,7 +29,8 @@
 #            pre-modularisation `src/handlers.rs` / `src/mcp.rs` /
 #            `src/db.rs` anchors still live in the operator guides.
 #   LINE   — a cited `src/<path>.rs:<N>` must name a line the file
-#            actually has. Cheap, dependency-free, and it catches the
+#            actually has: 1 <= N <= the file's line count (#4700; line
+#            0 never lands on code). Cheap, dependency-free, and it catches the
 #            whole truncated-anchor class without needing to know what
 #            is ON that line.
 #   QUAL   — every identifier in `src/<path>.rs::<sym>` and
@@ -184,6 +185,36 @@ MDEOF
     run_fixture_out | grep -q 'PATH' || {
         echo "FAIL: self-test #4680 — a ./src/ missing-file anchor rejected for the wrong reason (no PATH)" >&2; exit 1; }
     echo "PASS: self-test #4680 — a backticked ./src/ anchor to a missing file is REJECTED"
+
+
+    # ---- #4699/#4700/#4701: anchor path normalisation + line range ----
+    # anchor_red/anchor_green plant ONE line in the clean tree. A red case
+    # must be rejected by the named rule; a green control must pass.
+    anchor_red() {  # <issue> <rule> <description> <line planted in README.md>
+        write_clean
+        printf '\n\n%s\n' "$4" >> "$FIX/README.md"
+        [[ "$(run_fixture)" != "0" ]] || {
+            echo "FAIL: self-test #$1 — $3 was ACCEPTED" >&2; exit 1; }
+        run_fixture_out | grep -q "\[$2\]" || {
+            echo "FAIL: self-test #$1 — $3 rejected for the wrong reason (no $2)" >&2; exit 1; }
+        echo "PASS: self-test #$1 — $3 is REJECTED"
+    }
+    anchor_green() {  # <issue> <description> <line planted in README.md>
+        write_clean
+        printf '\n\n%s\n' "$3" >> "$FIX/README.md"
+        [[ "$(run_fixture)" = "0" ]] || {
+            echo "FAIL: self-test #$1 — $2 was REJECTED" >&2
+            run_fixture_out | sed 's/^/       /' >&2; exit 1; }
+        echo "PASS: self-test #$1 — $2 is ACCEPTED"
+    }
+
+    # #4700: a line number is 1-based; recall.rs has 4 lines.
+    anchor_red 4700 LINE "a :0 line anchor" 'See `src/mcp/tools/recall.rs:0`.'
+    anchor_red 4700 LINE "a ./ :0 line anchor" 'See `./src/mcp/tools/recall.rs:0`.'
+    anchor_red 4700 LINE "a :00 line anchor" 'See `src/mcp/tools/recall.rs:00`.'
+    anchor_red 4700 LINE "a line one past the end (:5 of 4)" 'See `src/mcp/tools/recall.rs:5`.'
+    anchor_green 4700 "the first line (:1)" 'See `src/mcp/tools/recall.rs:1`.'
+    anchor_green 4700 "the last line (:4)" 'See `src/mcp/tools/recall.rs:4`.'
 
     # ---- #4651: a BARE src/x.rs:N line anchor (no backtick) ----------
     # Every form the #4651 census found must FAIL as BARE_LN; the only
@@ -389,7 +420,9 @@ for p in sorted(glob.glob(os.path.join(root, "src/**/*.rs"), recursive=True)):
         text = open(p, encoding="utf-8", errors="replace").read()
     except OSError:
         continue
-    line_count[rel] = text.count("\n") + 1
+    # #4700: the number of lines, not newlines + 1 (a trailing newline
+    # does not start a line, so `N+1` of an N-line file was accepted).
+    line_count[rel] = text.count("\n") + (1 if text and not text.endswith("\n") else 0)
     names = {m.group(1) for m in DEF.finditer(text)}
     names |= {m.group(1) for m in MACRO.finditer(text)}
     names |= {m.group(1) for m in VARIANT.finditer(text)}
@@ -525,7 +558,7 @@ for doc in seen_docs:
             if f not in per_file:
                 if not absent_ok:
                     emit("PATH", doc, ln, f, ctx)
-            elif n > line_count[f]:
+            elif n < 1 or n > line_count[f]:
                 emit("LINE", doc, ln, f"{f}:{n}", ctx)
 
         for m in BARE_LN.finditer(line):
@@ -628,7 +661,7 @@ if [[ -n "$violations" ]]; then
         fi
         case "$rule" in
             PATH)  detail="cited src/ path does not exist" ;;
-            LINE)  detail="file:line anchor points past end-of-file" ;;
+            LINE)  detail="file:line anchor is out of range (line numbers are 1-based and must not pass end-of-file)" ;;
             QUAL)  detail="symbol is not defined in the file it is qualified against" ;;
             MDLINK) detail="markdown symbol link does not resolve in its target file" ;;
             BARE_LN) detail="bare file:line anchor in a live doc (rots silently); cite path::symbol, or pin a commit permalink" ;;
