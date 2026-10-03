@@ -783,6 +783,32 @@ jobs:
         # sentinel it planted instead of stranding it at a real probe path.
         run: bash scripts/test/test-gate-selftest-interrupt-cleanup.sh --harness-self-test
 
+  permissions-mode-lock-gate:
+    # Issue #4491 -- the mechanical enforcement #1465 proposed and never
+    # delivered. A lib test that writes the process-global PermissionsMode
+    # (set_active_permissions_mode / override_active_permissions_mode_for_test
+    # / clear_permissions_mode_override_for_test) without holding
+    # crate::config::lock_permissions_mode_for_test() races every other
+    # mode-flipping cell under a multi-thread `cargo test --lib`. Recurred
+    # three times: #1465, #2165, #4468. Function-scoped, test lines only
+    # (the #3623 production-lines boundary, ported to Python).
+    name: Test PermissionsMode lock gate (#4491)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Run permissions-mode-lock gate
+        run: python3 scripts/check_permissions_mode_lock.py
+      - name: Self-test the gate (regression evidence)
+        # Positive and negative fixtures: unpaired write refused, lock taken
+        # after the write refused, a lock named only in a comment refused,
+        # paired / delegate / guard-owning Drop writes accepted, production
+        # writes and comment/string false-positives ignored. Fixtures live
+        # under TMPDIR or .local-runs, never inside src/.
+        run: python3 scripts/check_permissions_mode_lock.py --self-test
+      - name: Boundary parity with scripts/lib/production-lines.awk
+        run: python3 scripts/check_permissions_mode_lock.py --parity
+
   required-contexts-gate:
     # Issues #2494 / #2496 — required-status-check SOUNDNESS. The required set
     # on `release/v1.0.0` read as 22 gates and functioned as far fewer, in
