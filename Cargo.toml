@@ -594,7 +594,7 @@ strip = true
 # NOT applied: `panic = "abort"`. The PERF-11 review notes this as a
 # size + icache win, but the substrate has at least one production
 # caller of `std::panic::catch_unwind` — the `auto_export` hook
-# recovery path at `src/hooks/post_reflect/auto_export.rs:130`.
+# recovery path at `src/hooks/post_reflect/auto_export.rs::build_post_reflect_hook`.
 # Flipping to `abort` would silently disable that recovery and
 # convert a contained hook panic into a process abort. Keeping
 # `panic = "unwind"` (the default) preserves the recovery contract.
