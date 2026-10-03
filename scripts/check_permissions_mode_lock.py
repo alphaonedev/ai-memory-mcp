@@ -42,7 +42,8 @@ nor satisfies the rule.
 
 SCOPE, stated honestly: roots default to ``src`` (lib tests, which share one process and are the
 #4468 shape). Integration binaries under tests/ are NOT scanned by default; ``--root tests`` scans
-them, and today several of those files write the mode without the lock (see the #4491 PR notes).
+them; on 5f66513a1 that reports 38 unlocked writes in 25 files (separate processes per
+binary; a follow-up).
 Delegate resolution is name-based and one flat namespace; a delegate called through a method
 receiver is matched by the method name.
 
@@ -79,7 +80,7 @@ STEM_TEST = re.compile(r"(^|_)tests?(_|$)")
 # --------------------------------------------------------------------------------------------
 def test_line_mask(path: pathlib.Path, lines: List[str]) -> List[bool]:
     """True for each line that is TEST code (blanked by production-lines)."""
-    if STEM_TEST.search(path.stem):
+    if STEM_TEST.search(path.stem) or "tests" in path.parts:
         return [True] * len(lines)
     if any(re.match(r"^\s*#!\[cfg\(test\)\]", ln) for ln in lines):
         return [True] * len(lines)
@@ -388,7 +389,7 @@ def parity(files: List[pathlib.Path], repo: pathlib.Path) -> int:
     for p in files:
         lines = p.read_text(encoding="utf-8", errors="replace").split("\n")
         mask = test_line_mask(p, lines)
-        if STEM_TEST.search(p.stem):
+        if STEM_TEST.search(p.stem) or "tests" in p.parts:
             awk_prod = [""] * len(lines)  # production_lines() prints nothing for these stems
         else:
             res = subprocess.run([awk, "-f", str(awk_script), str(p)], capture_output=True,
