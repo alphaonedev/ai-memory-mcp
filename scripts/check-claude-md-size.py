@@ -228,6 +228,10 @@ def fence_scan(text: str) -> list:
     return out
 
 
+RAW_BLOCK_OPEN = re.compile(r"^ {0,3}<(pre|script|style|textarea)(?:[\s>]|$)", re.IGNORECASE)
+COMMENT_BLOCK_OPEN = re.compile(r"^ {0,3}<!--")
+
+
 def visible_lines(text: str) -> list:
     """Return the lines that render as prose: outside fenced code and outside HTML comments.
 
@@ -236,12 +240,29 @@ def visible_lines(text: str) -> list:
     """
     out = []
     in_comment = False
+    raw_close = None
     for line, in_code in fence_scan(text):
         if in_code:
+            continue
+        if raw_close is not None:
+            # CommonMark HTML block type 1 (pre, script, style, textarea) runs to its closing tag.
+            if raw_close in line.lower():
+                raw_close = None
             continue
         if in_comment:
             if "-->" in line:
                 in_comment = False
+            continue
+        block = RAW_BLOCK_OPEN.match(line)
+        if block:
+            if f"</{block.group(1).lower()}" not in line.lower():
+                raw_close = f"</{block.group(1).lower()}"
+            continue
+        if COMMENT_BLOCK_OPEN.match(line):
+            # A line that begins with `<!--` is one HTML block (type 2): all of it, up to and including the
+            # line holding `-->`, is raw HTML, so text after the `-->` is never a heading.
+            if "-->" not in line:
+                in_comment = True
             continue
         kept = ""
         rest = line
@@ -1120,6 +1141,16 @@ def run_cases(base: Path) -> bool:
         ("comment opener only", "<!--\n{h}\n-->\n"),
         ("three-space-indented div", "   <div>\n{h}\n"),
     )
+    html_wraps += (
+        ("R3-code-F2(b) script wrap closed on its own line", "<script>\n{h}\n</script>\n"),
+        ("R3-code-F2(c) comment glued to the heading", "<!-- x -->{h}\n"),
+    )
+    root = fresh()
+    text = (root / claude_md).read_text(encoding="utf-8").replace(
+        heading + "\n", "```\n    ```\n" + heading + "\n    ```\n", 1)
+    (root / claude_md).write_text(text, encoding="utf-8")
+    ok &= expect(root, "R3-code-F2(a) a fence 'closed' only by a 4-space-indented decoy hides the section", True,
+                 "missing the required heading")
     for label, wrap in html_wraps:
         root = fresh()
         text = (root / claude_md).read_text(encoding="utf-8").replace(
