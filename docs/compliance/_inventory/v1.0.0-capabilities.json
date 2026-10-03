@@ -23,6 +23,16 @@
       "tests/federation_write_ns_scope_2447_pg.rs"
     ]
   },
+  "post_inventory_amendment_4527": {
+    "issue": "#4527",
+    "base_commit": "9f68ea41a978d6db14bc98e86b47b8a4152a52a0",
+    "scope": "Only the ai_memory_identity wording of the NSA CSI capability row that says the identity block is omitted when the daemon has no keypair is amended; the row text above is kept as the original 580d8427 record, where the 'continuing unsigned' boot posture was true. Corrected statement: since #3354 every process except the key-provisioning verbs ensures the daemon signing key at boot, and a ledger writer (serve, mcp and sync-daemon) that can neither load nor generate it refuses to start (unsigned_ledger_refusal); the block is omitted only when load_active_keypair_for_mcp finds no signing-capable keypair after boot. Historical verification SHA, counts and all other rows remain the original inventory record. This is not a fleet inventory recapture or certification re-issue.",
+    "source_paths": [
+      "src/main.rs",
+      "src/governance/audit.rs",
+      "src/mcp/mod.rs"
+    ]
+  },
   "prior_art": {
     "original_inventory": "docs/compliance/_inventory/v0.7.0-capabilities.json",
     "original_method": "docs/compliance/_inventory/v0.7.0-summary.md \u00a75 Reproducibility",
@@ -914,7 +924,7 @@
         "src/governance/audit.rs:875 (load_daemon_signing_key)",
         "tests/mcp_initialize_server_signing.rs"
       ],
-      "factual_description": "Composite defense, both halves shipped: (1) the substrate captures clientInfo.name from the MCP initialize handshake and threads it through downstream operations; (2) the substrate publishes a daemon-Ed25519-signed ai_memory_identity block on every MCP initialize response so clients can TOFU-pin the daemon fingerprint. Block is OMITTED when the daemon has no keypair (the unsigned posture of a non-writer host; a ledger-writing daemon ensures its key at boot since #3354). The v0.7.0 inventory's PARTIAL honesty note is retired \u2014 #1154 closed the serverInfo half.",
+      "factual_description": "Composite defense, both halves shipped: (1) the substrate captures clientInfo.name from the MCP initialize handshake and threads it through downstream operations; (2) the substrate publishes a daemon-Ed25519-signed ai_memory_identity block on every MCP initialize response so clients can TOFU-pin the daemon fingerprint. Block is OMITTED when the daemon has no keypair (the 'continuing unsigned' posture). The v0.7.0 inventory's PARTIAL honesty note is retired \u2014 #1154 closed the serverInfo half.",
       "verified_in_v0_7_0": true,
       "verified_in_v1_0_0": true,
       "issue_references": [
