@@ -109,12 +109,12 @@ cd "$REPO_ROOT"
 # census greps one of them, so deleting either made this gate exit 0 (or fail
 # only by accident). Unconditional, fixture included: a check waived under the
 # --self-test is a check the self-test cannot prove.
-for _ref in docs/reference/ARCHITECTURE_REFERENCE.md docs/reference/CODE_STYLE.md; do
-    if [[ ! -f "$_ref" || -L "$_ref" ]]; then
-        printf 'FAIL: check-docs-vs-ssot: required reference file %s is missing or not a regular file (#4507 fail-closed)\n' "$_ref" >&2
-        exit 1
-    fi
-done
+# R3-F7: the shared reference check refuses a symlink at EVERY level of each path
+# (docs, docs/reference, the file), not only the leaf.
+if ! python3 "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/check-claude-md-size.py" "$REPO_ROOT" --refs-only >&2; then
+    printf 'FAIL: check-docs-vs-ssot: reference file check failed (#4507 fail-closed)\n' >&2
+    exit 1
+fi
 
 # --------------------------------------------------------------------
 # Resolve canonical SSOT values from Rust source
@@ -2553,7 +2553,7 @@ HTMLSTAMPFROZEN
         mv "$tmpdir/docs/reference/$_rf.md" "$tmpdir/docs/reference/$_rf.md.aside"
         _rc=0
         _out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1) || _rc=$?
-        if [[ "$_rc" == 0 ]] || ! grep -q "required reference file docs/reference/$_rf.md" <<<"$_out"; then
+        if [[ "$_rc" == 0 ]] || ! grep -q "docs/reference/$_rf.md" <<<"$_out"; then
             echo "FAIL: self-test #4507 R3-6 — a MISSING $_rf.md did not fail closed (rc=$_rc)" >&2
             cd "$REPO_ROOT"; exit 1
         fi
@@ -2561,7 +2561,7 @@ HTMLSTAMPFROZEN
         ln -s "$_rf.md.aside" "$tmpdir/docs/reference/$_rf.md"
         _rc=0
         _out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1) || _rc=$?
-        if [[ "$_rc" == 0 ]] || ! grep -q "required reference file docs/reference/$_rf.md" <<<"$_out"; then
+        if [[ "$_rc" == 0 ]] || ! grep -q "docs/reference/$_rf.md" <<<"$_out"; then
             echo "FAIL: self-test #4507 R3-6 — a SYMLINKED $_rf.md did not fail closed (rc=$_rc)" >&2
             cd "$REPO_ROOT"; exit 1
         fi
@@ -2569,6 +2569,19 @@ HTMLSTAMPFROZEN
         rm -f "$tmpdir/docs/reference/$_rf.md"
         mv "$tmpdir/docs/reference/$_rf.md.aside" "$tmpdir/docs/reference/$_rf.md"
     done
+
+    # ---- #4507 R3-F7: a symlink ABOVE the file (docs/reference -> elsewhere) FAILS CLOSED.
+    mv "$tmpdir/docs/reference" "$tmpdir/docs/reference.aside"
+    ln -s reference.aside "$tmpdir/docs/reference"
+    _rc=0
+    _out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1) || _rc=$?
+    if [[ "$_rc" == 0 ]] || ! grep -q "is a symlink" <<<"$_out"; then
+        echo "FAIL: self-test #4507 R3-F7 — a SYMLINKED docs/reference did not fail closed (rc=$_rc)" >&2
+        cd "$REPO_ROOT"; exit 1
+    fi
+    echo "PASS: self-test #4507 R3-F7 — a symlinked docs/reference FAILS CLOSED (rc=$_rc)"
+    rm -f "$tmpdir/docs/reference"
+    mv "$tmpdir/docs/reference.aside" "$tmpdir/docs/reference"
 
     cd "$REPO_ROOT"
 }

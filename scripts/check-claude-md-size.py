@@ -416,6 +416,45 @@ def check_index(visible: list, ref_lines: dict, errors: list, index_pins=None) -
             )
 
 
+def path_symlink_errors(root: Path, rel: str) -> list:
+    """R3-F7: refuse a symlink (or a missing or non-directory parent) at EVERY level of `rel` below `root`.
+
+    The leaf must be a regular file. Walking each component closes the docs -> elsewhere swap that a check of
+    only the leaf and its parent directory would miss."""
+    errors = []
+    parts = Path(rel).parts
+    current = root
+    for index, part in enumerate(parts):
+        current = current / part
+        label = "/".join(parts[: index + 1])
+        try:
+            mode = os.lstat(current).st_mode
+        except OSError as exc:
+            errors.append(f"FAIL: cannot stat {label}: {exc}")
+            return errors
+        if stat.S_ISLNK(mode):
+            errors.append(f"FAIL: {label} is a symlink; every level of {rel} must be real (#4507 R3-F7)")
+            return errors
+        last = index == len(parts) - 1
+        if last and not stat.S_ISREG(mode):
+            errors.append(f"FAIL: {label} is not a regular file (#4507)")
+        if not last and not stat.S_ISDIR(mode):
+            errors.append(f"FAIL: {label} is not a directory (#4507)")
+            return errors
+    return errors
+
+
+def refs_errors(root: Path) -> list:
+    """R3-F7: the check the two doc gates share: each reference file is reached without a symlink."""
+    errors = []
+    for rel in REFERENCE_PATHS:
+        walk = path_symlink_errors(root, rel)
+        if walk:
+            errors += walk
+            continue
+    return errors
+
+
 def check(root: Path, index_pins=None) -> list:
     """Return a list of failure messages (empty means pass). `index_pins` is a self-test hook."""
     errors = []
@@ -449,14 +488,10 @@ def check(root: Path, index_pins=None) -> list:
             if heading not in present:
                 errors.append(f"FAIL: CLAUDE.md is missing the required heading: {heading}")
     ref_dir_ok = True
-    try:
-        dir_mode = os.lstat(root / REFERENCE_DIR).st_mode
-    except OSError as exc:
-        errors.append(f"FAIL: cannot stat {REFERENCE_DIR}: {exc}")
-        ref_dir_ok = False
-    else:
-        if stat.S_ISLNK(dir_mode) or not stat.S_ISDIR(dir_mode):
-            errors.append(f"FAIL: {REFERENCE_DIR} is a symlink or not a directory; it must be a real directory (#4507)")
+    for rel in REFERENCE_PATHS:
+        walk = path_symlink_errors(root, rel)
+        if walk:
+            errors += walk
             ref_dir_ok = False
     for rel, top_heading, min_bytes in REFERENCE_FILES:
         if not ref_dir_ok:
@@ -713,7 +748,7 @@ def run_cases(base: Path) -> bool:
     moved = root / "docs" / "reference-real"
     (root / REFERENCE_DIR).rename(moved)
     (root / REFERENCE_DIR).symlink_to(moved)
-    ok &= expect(root, "a symlinked docs/reference directory", True, "must be a real directory")
+    ok &= expect(root, "a symlinked docs/reference directory", True, "every level of")
 
     root = fresh()
     shutil.rmtree(root / REFERENCE_DIR)
@@ -944,6 +979,51 @@ def run_cases(base: Path) -> bool:
         '- `CODE_STYLE.md:3` "', '- CODE_STYLE.md:3 "', 1)
     (root / claude_md).write_text(text, encoding="utf-8")
     ok &= expect(root, "a malformed index entry", True, "malformed binding-rules index entry")
+    ok &= run_ref_cases(fresh, arch, style)
+    return ok
+
+
+def refs_expect(root: Path, label: str, want_fail: bool, needle: str = "") -> bool:
+    """Like expect(), for the shared reference checks the doc gates call (--refs-only)."""
+    errors = refs_errors(root)
+    if want_fail and not any(needle in line for line in errors):
+        print(f"FAIL: self-test - {label} was NOT rejected by refs_errors (wanted {needle!r})", file=sys.stderr)
+        return False
+    if not want_fail and errors:
+        print(f"FAIL: self-test - {label} was rejected by refs_errors: {errors[0]}", file=sys.stderr)
+        return False
+    return True
+
+
+def run_ref_cases(fresh, arch: str, style: str) -> bool:
+    """R3-F7: a symlink at any level of a reference path."""
+    ok = refs_expect(fresh(), "R3-F7 a valid reference pair", False)
+    # F7: docs -> elsewhere (the link sits above docs/reference), through both the full check and refs_errors.
+    root = fresh()
+    moved = root / "elsewhere"
+    (root / "docs").rename(moved)
+    (root / "docs").symlink_to(moved, target_is_directory=True)
+    ok &= expect(root, "R3-F7 docs is a symlink", True, "is a symlink")
+    ok &= refs_expect(root, "R3-F7 docs is a symlink", True, "is a symlink")
+    root = fresh()
+    moved = root / "elsewhere"
+    (root / "docs" / "reference").rename(moved)
+    (root / "docs" / "reference").symlink_to(moved, target_is_directory=True)
+    ok &= expect(root, "R3-F7 docs/reference is a symlink", True, "is a symlink")
+    ok &= refs_expect(root, "R3-F7 docs/reference is a symlink", True, "is a symlink")
+    for rel in (arch, style):
+        root = fresh()
+        target = root / rel
+        moved = root / "leaf.md"
+        target.rename(moved)
+        target.symlink_to(moved)
+        ok &= expect(root, f"R3-F7 {Path(rel).name} is a symlink", True, "is a symlink")
+        ok &= refs_expect(root, f"R3-F7 {Path(rel).name} is a symlink", True, "is a symlink")
+    # A dangling link at an intermediate level fails closed too.
+    root = fresh()
+    (root / "docs" / "reference").rename(root / "elsewhere")
+    (root / "docs" / "reference").symlink_to(root / "nowhere", target_is_directory=True)
+    ok &= refs_expect(root, "R3-F7 a dangling docs/reference link", True, "is a symlink")
     return ok
 
 
@@ -1274,9 +1354,16 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("root", nargs="?", default=str(Path(__file__).resolve().parent.parent))
     parser.add_argument("--self-test", action="store_true")
+    parser.add_argument("--refs-only", action="store_true",
+                        help="only the reference-file checks the doc gates call (symlink walk)")
     args = parser.parse_args()
     if args.self_test:
         return self_test()
+    if args.refs_only:
+        ref_errors = refs_errors(Path(args.root))
+        for line in ref_errors:
+            print(line, file=sys.stderr)
+        return 1 if ref_errors else 0
     errors = check(Path(args.root))
     errors += workflow_errors(Path(args.root) / WORKFLOW_PATH)
     for line in errors:
