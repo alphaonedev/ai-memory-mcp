@@ -15,6 +15,7 @@ Usage:
   scripts/check-claude-md-size.py --self-test
 """
 import argparse
+import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -49,7 +50,11 @@ def check(root: Path) -> list:
 
 
 def self_test() -> int:
-    with tempfile.TemporaryDirectory() as tmp:
+    # Scratch lives under <repo>/.local-runs/ (project no-/tmp hard rule), never system /tmp.
+    scratch_base = Path(__file__).resolve().parent.parent / ".local-runs"
+    scratch_base.mkdir(parents=True, exist_ok=True)
+    tmp = tempfile.mkdtemp(prefix="claude-md-size-selftest-", dir=scratch_base)
+    try:
         root = Path(tmp)
         for rel in REFERENCE_FILES:
             (root / rel).parent.mkdir(parents=True, exist_ok=True)
@@ -66,6 +71,8 @@ def self_test() -> int:
         if not check(root):
             print("FAIL: self-test - a missing reference file was NOT rejected", file=sys.stderr)
             return 1
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
     print("PASS: self-test #4507 - oversize and missing-reference are rejected, ceiling is inclusive")
     return 0
 
