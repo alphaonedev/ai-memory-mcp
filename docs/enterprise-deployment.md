@@ -714,7 +714,7 @@ ceiling (§10.2). PgBouncer is the middleman that decouples the two.
 > a `docker-compose.yml`, and a `smoke-test.sh` that proves an AGE cypher
 > transaction + the role-default timeouts survive transaction-mode pooling.
 
-`transaction` pooling mode is **REQUIRED** (rationale in §5.6.4):
+`transaction` pooling mode is **REQUIRED** (rationale in §5.6.6):
 
 ```ini
 [databases]
@@ -725,7 +725,8 @@ listen_addr = 0.0.0.0
 listen_port = 6432
 auth_type = scram-sha-256
 auth_file = /etc/pgbouncer/userlist.txt
-pool_mode = transaction          ; REQUIRED — see 5.6.4
+pool_mode = transaction          ; REQUIRED — see 5.6.6
+max_prepared_statements = 256    ; REQUIRED (PgBouncer >= 1.21) — see the prepared-statement caveat in 5.6.6
 max_client_conn = 1000           ; client-facing admission ceiling
 default_pool_size = 25           ; server conns per (user,db) pair
 reserve_pool_size = 5            ; burst headroom above default_pool_size
