@@ -10,26 +10,38 @@ define (the old ``--bind``) makes the unit exit at start and loop on
 ``Restart=on-failure``; cloud-init discards a config containing a non-ASCII
 byte (#1880). Neither failure shows up at provision time.
 
-For every ``ExecStart=`` line that runs ``ai-memory serve`` in a tracked
-``infra/*/cloud-init-memory*.tpl`` the gate fails when:
+The gate scans the files matching ``infra/*/cloud-init-memory*.tpl`` on disk
+(a filesystem glob, not ``git ls-files``). For each template it fails when:
 
-  * a ``--flag`` is not a field of ``ServeArgs`` in ``src/daemon_runtime.rs``
-    (clap derives the long flag from the field name); or
+  * the template has no ``ExecStart=`` that runs ``ai-memory serve`` (a gate
+    that finds nothing to check must not pass); the parser joins systemd
+    ``\\``-continued lines, accepts a ``/usr/bin/env`` wrapper, and accepts
+    global flags between the binary and ``serve``;
+  * a ``--flag`` after ``serve`` is not a long flag of ``ServeArgs`` in
+    ``src/daemon_runtime.rs`` (clap derives it from the field name, or from an
+    explicit ``long = "name"``);
   * ``--tls-cert`` / ``--tls-key`` are not both present (a policy choice: the
     templates supply operator certificate material whose SAN carries the
     node IP; serve itself would resolve its own certificate with no flags,
-    ``resolve_tls_material``, src/daemon_runtime.rs:6163-6225); or
+    ``resolve_tls_material``, src/daemon_runtime.rs:6163-6225);
+  * the ``postgres://`` store URL has no ``sslmode=verify-full`` (the #3705
+    floor, src/transit_encryption.rs:436-446), except a template listed in
+    ``DSN_FLOOR_GAPS``; or
   * the template contains a non-ASCII byte.
 
-Usage:
+Usage (any other argument exits 2):
   scripts/check-cloud-init-serve-flags.py             exit 0 clean, 1 on a
                                                       hit, 2 on a scanner fault
   scripts/check-cloud-init-serve-flags.py --self-test prove the rule is red on
-                                                      probes, green on a clean
-                                                      line
+                                                      probes, green on clean
+                                                      lines
 """
 from __future__ import annotations
 
+import argparse
+import contextlib
+import io
+import posixpath
 import re
 import sys
 from pathlib import Path
@@ -39,9 +51,6 @@ SERVE_SRC = ROOT / "src" / "daemon_runtime.rs"
 TEMPLATE_GLOB = "infra/*/cloud-init-memory*.tpl"
 REQUIRED_FLAGS = ("--tls-cert", "--tls-key")
 
-STRUCT_RE = re.compile(r"pub struct ServeArgs \{(.*?)\n\}", re.S)
-FIELD_RE = re.compile(r"^\s{4}pub (\w+):", re.M)
-EXEC_RE = re.compile(r"^\s*ExecStart=\S*ai-memory serve(?P<rest>.*)$", re.M)
 # Templates that still lack the sslmode floor, each with its tracker. The
 # do-hive store URL dials PgBouncer on 127.0.0.1:6432 and its TLS shape has
 # more than one viable form (#4635 do-hive leg, awaiting a vote). The list may
@@ -50,26 +59,72 @@ DSN_FLOOR_GAPS = {
     "infra/do-hive/cloud-init-memory.yaml.tpl": "#4635 do-hive pgbouncer leg",
 }
 DSN_RE = re.compile(r"^\s+(postgres(?:ql)?://\S+)\s*$", re.M)
-FLAG_RE = re.compile(r"(?<![\w-])(--[A-Za-z][\w-]*)")
+STRUCT_RE = re.compile(r"pub struct ServeArgs \{(.*?)\n\}", re.S)
+FIELD_RE = re.compile(r"^\s{4}pub (\w+):", re.M)
+ATTR_RE = re.compile(r"#\[arg\((.*?)\)\]", re.S)
+LONG_NAMED_RE = re.compile(r'\blong\s*=\s*"([^"]+)"')
+LONG_BARE_RE = re.compile(r"(?<![\w=])long\s*(?:,|$)")
+ALIAS_RE = re.compile(r'\b(?:visible_)?alias(?:es)?\s*=\s*"([^"]+)"')
+EXEC_RE = re.compile(r"^[ \t]*ExecStart=(?P<cmd>.*)$", re.M)
+CONT_RE = re.compile(r"\\[ \t]*\n[ \t]*")
+FLAG_RE = re.compile(r"^(--[A-Za-z][\w-]*)")
 
 
 def serve_flags(source: str) -> set:
-    """Long flags clap derives from the ServeArgs field names."""
+    """Long flags clap derives for ServeArgs: field name, or explicit long = name."""
     body = STRUCT_RE.search(source)
     if body is None:
         raise RuntimeError("pub struct ServeArgs not found in " + str(SERVE_SRC))
-    names = FIELD_RE.findall(body.group(1))
-    if not names:
+    text = body.group(1)
+    fields = list(FIELD_RE.finditer(text))
+    if not fields:
         raise RuntimeError("ServeArgs has no fields")
-    return {"--" + n.replace("_", "-") for n in names}
+    flags = set()
+    prev_end = 0
+    for fm in fields:
+        attrs = " ".join(ATTR_RE.findall(text[prev_end:fm.start()]))
+        prev_end = fm.end()
+        named = LONG_NAMED_RE.findall(attrs)
+        if named:
+            flags.update("--" + n for n in named)
+        elif LONG_BARE_RE.search(attrs):
+            flags.add("--" + fm.group(1).replace("_", "-"))
+        flags.update("--" + n for n in ALIAS_RE.findall(attrs))
+    if not flags:
+        raise RuntimeError("ServeArgs exposes no long flags")
+    return flags
 
 
-def scan_text(name: str, text: str, known: set) -> list:
-    """Return one message per defect found in a template's text."""
+def strip_terraform(text: str) -> str:
+    """Drop terraform directives and interpolations so their words are not read as flags."""
+    text = re.sub(r"%\{[^}]*\}", " ", text)
+    return re.sub(r"\$\$?\{[^}]*\}", " ", text)
+
+
+def serve_invocations(text: str) -> list:
+    """Return (line, tokens-after-serve, unparsed) for every ExecStart that runs serve.
+
+    ``unparsed`` is True when the line holds a ``serve`` token but the
+    ai-memory binary could not be identified (fail closed, never skip).
+    """
+    joined = CONT_RE.sub(" ", text)
+    found = []
+    for m in EXEC_RE.finditer(joined):
+        tokens = strip_terraform(m.group("cmd")).split()
+        if "serve" not in tokens:
+            continue
+        line = joined.count("\n", 0, m.start()) + 1
+        bin_idx = next((i for i, t in enumerate(tokens) if posixpath.basename(t.lstrip("-@+!:")) == "ai-memory"), None)
+        if bin_idx is None or "serve" not in tokens[bin_idx + 1:]:
+            found.append((line, [], True))
+            continue
+        verb = tokens.index("serve", bin_idx + 1)
+        found.append((line, tokens[verb + 1:], False))
+    return found
+
+
+def dsn_hits(name: str, text: str) -> list:
     hits = []
-    for lineno, line in enumerate(text.splitlines(), 1):
-        if any(ord(ch) > 127 for ch in line):
-            hits.append("%s:%d: non-ASCII byte (cloud-init discards the config, #1880)" % (name, lineno))
     dsns = DSN_RE.findall(text)
     if not dsns:
         hits.append("%s: no postgres:// store URL line found (cannot check the sslmode floor)" % name)
@@ -84,12 +139,28 @@ def scan_text(name: str, text: str, known: set) -> list:
             hits.append("%s: store URL has no sslmode=verify-full (serve refuses it at start, #3705 floor, src/transit_encryption.rs:436-446)" % name)
     if name in DSN_FLOOR_GAPS and floor_ok and dsns:
         hits.append("%s: store URL now passes the sslmode floor; remove it from DSN_FLOOR_GAPS" % name)
-    for m in EXEC_RE.finditer(text):
-        lineno = text.count("\n", 0, m.start()) + 1
-        # Strip terraform directives so their words are not read as flags.
-        rest = re.sub(r"%\{[^}]*\}", " ", m.group("rest"))
-        rest = re.sub(r"\$\$?\{[^}]*\}", " ", rest)
-        flags = FLAG_RE.findall(rest)
+    return hits
+
+
+def scan_text(name: str, text: str, known: set) -> list:
+    """Return one message per defect found in a template's text."""
+    hits = []
+    for lineno, line in enumerate(text.splitlines(), 1):
+        if any(ord(ch) > 127 for ch in line):
+            hits.append("%s:%d: non-ASCII byte (cloud-init discards the config, #1880)" % (name, lineno))
+    hits.extend(dsn_hits(name, text))
+    invocations = serve_invocations(text)
+    if not invocations:
+        hits.append("%s: no ExecStart runs 'ai-memory serve' (nothing to check; a template that cannot start serve must not pass)" % name)
+    for lineno, after, unparsed in invocations:
+        if unparsed:
+            hits.append("%s:%d: ExecStart names serve but the ai-memory binary was not identified (cannot check its flags)" % (name, lineno))
+            continue
+        flags = []
+        for tok in after:
+            fm = FLAG_RE.match(tok)
+            if fm:
+                flags.append(fm.group(1))
         for flag in flags:
             if flag not in known:
                 hits.append("%s:%d: serve flag %s is not a ServeArgs field (unit would exit at start)" % (name, lineno, flag))
@@ -99,15 +170,31 @@ def scan_text(name: str, text: str, known: set) -> list:
     return hits
 
 
+def build_parser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(description="#4616 cloud-init memory templates must start a daemon that can boot")
+    ap.add_argument("--self-test", action="store_true", help="prove the rules are red on probes and green on clean lines")
+    return ap
+
+
 def self_test(known: set) -> int:
-    good = "      postgres://u:p@localhost/db?sslmode=verify-full&sslrootcert=/c\nExecStart=/opt/ai-memory/bin/ai-memory serve --host 0.0.0.0 --port 9077 --tls-cert /a --tls-key /b\n"
+    dsn = "      postgres://u:p@localhost/db?sslmode=verify-full&sslrootcert=/c\n"
+    unit = "ExecStart=/opt/ai-memory/bin/ai-memory serve --host 0.0.0.0 --port 9077 --tls-cert /a --tls-key /b\n"
+    good = dsn + unit
     probes = {
         "bind flag": good.replace("--host 0.0.0.0", "--bind 0.0.0.0:9077"),
-        "no tls": "ExecStart=/opt/ai-memory/bin/ai-memory serve --host 0.0.0.0 --port 9077\n",
+        "no tls": dsn + "ExecStart=/opt/ai-memory/bin/ai-memory serve --host 0.0.0.0 --port 9077\n",
         "tls key missing": good.replace(" --tls-key /b", ""),
         "no sslmode": good.replace("?sslmode=verify-full&sslrootcert=/c", ""),
         "weak sslmode": good.replace("verify-full", "require"),
-        "non-ascii": "# em dash —\n" + good,
+        "non-ascii": "# em dash \u2014\n" + good,
+        "zero serve lines": dsn + "ExecStart=/opt/ai-memory/fed-bootstrap.sh\n",
+        "env wrapper, bad flag": good.replace("ExecStart=/opt/", "ExecStart=/usr/bin/env /opt/").replace("--host 0.0.0.0", "--bind 0.0.0.0:9077"),
+        "env wrapper, no tls": dsn + "ExecStart=/usr/bin/env ai-memory serve --host 0.0.0.0 --port 9077\n",
+        "global flag before serve, no tls": dsn + "ExecStart=/opt/ai-memory/bin/ai-memory --db /x serve --host 0.0.0.0\n",
+        "global flag before serve, bad flag": good.replace("ai-memory serve", "ai-memory --db /x serve").replace("--port", "--prot"),
+        "continuation, tls key on next line missing": dsn + "ExecStart=/opt/ai-memory/bin/ai-memory serve --host 0.0.0.0 \\\n  --tls-cert /a\n",
+        "continuation, bad flag": good.replace("--port 9077", "\\\n  --prot 9077"),
+        "serve with unidentified binary": dsn + "ExecStart=/opt/ai-memory/bin/wrapper serve --host 0.0.0.0 --tls-cert /a --tls-key /b\n",
     }
     red = 0
     for label, text in probes.items():
@@ -115,18 +202,41 @@ def self_test(known: set) -> int:
             red += 1
         else:
             print("SELF-TEST FAIL: probe not flagged: " + label, file=sys.stderr)
-    clean = scan_text("good", good, known) == [] and scan_text("directive", good.rstrip() + "%{ if x } --quorum-writes 2%{ endif }\n", known) == []
-    if red != len(probes) or not clean:
-        print("SELF-TEST FAIL: %d/%d probes flagged, clean=%s" % (red, len(probes), clean), file=sys.stderr)
+    greens = {
+        "clean": good,
+        "env wrapper": good.replace("ExecStart=/opt/", "ExecStart=/usr/bin/env /opt/"),
+        "global flag before serve": good.replace("ai-memory serve", "ai-memory --db /x serve"),
+        "continuation": good.replace("--port 9077", "\\\n  --port 9077"),
+        "terraform directive": good.rstrip() + "%{ if x } --quorum-writes 2%{ endif }\n",
+    }
+    clean = 0
+    for label, text in greens.items():
+        got = scan_text(label, text, known)
+        if got:
+            print("SELF-TEST FAIL: green probe flagged: %s: %s" % (label, got), file=sys.stderr)
+        else:
+            clean += 1
+    # An argument the parser does not define must exit 2, not run the scan.
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            build_parser().parse_args(["--selftest"])
+        argparse_red = False
+    except SystemExit as exc:
+        argparse_red = exc.code == 2
+    if not argparse_red:
+        print("SELF-TEST FAIL: a mistyped argument did not exit 2", file=sys.stderr)
+    if red != len(probes) or clean != len(greens) or not argparse_red:
+        print("SELF-TEST FAIL: %d/%d red, %d/%d green, argparse=%s" % (red, len(probes), clean, len(greens), argparse_red), file=sys.stderr)
         return 2
-    print("self-test: %d red probes flagged, 2 green probes clean" % red)
+    print("self-test: %d red probes flagged, %d green probes clean, mistyped argument exits 2" % (red, clean))
     return 0
 
 
 def main(argv: list) -> int:
+    args = build_parser().parse_args(argv[1:])
     try:
         known = serve_flags(SERVE_SRC.read_text(encoding="utf-8"))
-        if argv[1:] == ["--self-test"]:
+        if args.self_test:
             return self_test(known)
         templates = sorted(ROOT.glob(TEMPLATE_GLOB))
         if len(templates) < 2:
