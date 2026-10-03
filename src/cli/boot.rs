@@ -879,8 +879,8 @@ fn render_clustered_for_emit(
 /// **Format (text/toon)** — multi-line manifest, every field labelled:
 /// ```text
 /// # ai-memory boot: ok
-/// #   version:    0.6.3+patch.1
-/// #   db:         /home/u/.claude/ai-memory.db (schema=v19, 161 memories)
+/// #   version:    <crate version>
+/// #   db:         /home/u/.claude/ai-memory.db (schema=v<CURRENT_SCHEMA_VERSION>, 161 memories)
 /// #   tier:       autonomous (embedder=..., reranker=..., llm=...)
 /// #   latency:    12ms
 /// #   namespace:  ns-x (loaded 3 memories)
