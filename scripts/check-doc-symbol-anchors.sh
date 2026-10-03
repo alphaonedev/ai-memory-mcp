@@ -179,6 +179,28 @@ MDEOF
         echo "FAIL: self-test — a markdown symbol link to a renamed symbol was ACCEPTED" >&2; exit 1; }
     echo "PASS: self-test — a [\`sym\`](src/path.rs) link whose symbol is gone is REJECTED"
 
+    # ---- #4593: every scanned tree has a red probe AND a green control
+    # A stale symbol cite planted in each newly scanned doc must FAIL and
+    # name that doc; the corrected cite in the same doc must PASS.
+    for rel in SECURITY.md CONTRIBUTING.md docs/governance/x.md \
+               docs/strategy/x.md sdk/ts/README.md infra/lab/README.md \
+               docs/x.html; do
+        write_clean
+        mkdir -p "$FIX/$(dirname "$rel")"
+        printf 'Renamed: `src/mcp/tools/recall.rs::decorate_memory`.\n' > "$FIX/$rel"
+        [[ "$(run_fixture)" != "0" ]] || {
+            echo "FAIL: self-test — a stale anchor in $rel was ACCEPTED (tree not scanned)" >&2; exit 1; }
+        run_fixture_out | grep -q "$rel" || {
+            echo "FAIL: self-test — the violation in $rel did not name that doc" >&2; exit 1; }
+        echo "PASS: self-test red probe — a stale anchor in $rel is REJECTED"
+        printf 'Live: `src/mcp/tools/recall.rs::decorate_memory_many`.\n' > "$FIX/$rel"
+        [[ "$(run_fixture)" = "0" ]] || {
+            echo "FAIL: self-test — the corrected anchor in $rel was REJECTED" >&2
+            run_fixture_out | sed 's/^/       /' >&2; exit 1; }
+        echo "PASS: self-test green control — the corrected anchor in $rel is ACCEPTED"
+        rm -f "$FIX/$rel"
+    done
+
     # ---- BURN-DOWN allowlist: BOTH directions, stale FAILS -----------
     allow="$FIX/scripts/qc-allowlists/doc-symbol-anchors-allow.txt"
     write_clean
@@ -319,10 +341,16 @@ FROZEN = re.compile(
     r"^docs/(v0\.|internal/|audit/|rfc/|adr|BASELINE|"
     r"v1\.0\.0/perfect-endpoint-assessment/)")
 
-docs = ["CLAUDE.md", "README.md", "ROADMAP.md", "PERFORMANCE.md"]
+docs = ["CLAUDE.md", "README.md", "ROADMAP.md", "PERFORMANCE.md",
+        "SECURITY.md", "CONTRIBUTING.md"]
 docs += sorted(glob.glob(os.path.join(root, "docs/*.md")))
-for sub in ("security", "compliance", "spec", "integrations", "deploy", "v1.0.0"):
+docs += sorted(glob.glob(os.path.join(root, "docs/*.html")))
+for sub in ("security", "compliance", "spec", "integrations", "deploy", "v1.0.0",
+            "governance", "strategy"):
     docs += sorted(glob.glob(os.path.join(root, f"docs/{sub}/**/*.md"), recursive=True))
+# #4593: the SDK and infra trees carry operator-facing READMEs that cite src/.
+for top in ("sdk", "infra"):
+    docs += sorted(glob.glob(os.path.join(root, f"{top}/**/*.md"), recursive=True))
 
 seen_docs = []
 for d in docs:
