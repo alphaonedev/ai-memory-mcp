@@ -513,7 +513,7 @@ impl StopSignals {
         };
         let outcome = listener.await;
         // Ready: the future is finished, so drop it before anything can poll
-        // it again (CONCURRENCY-16).
+        // it again (CONCURRENCY-23, ERRORS-19).
         self.ctrl_c = None;
         match outcome {
             Ok(()) => {
