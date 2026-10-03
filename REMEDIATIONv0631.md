@@ -1,5 +1,7 @@
 # REMEDIATION v0.6.3 — Full-Spectrum Closure Plan
 
+> **Point-in-time record, as of 2026-04-29.** The src/ file:line references in this document describe the source tree at commit `3ce56067f07e` (read a file there with `git show 3ce56067f07e:<path>`). They are a dated record and are not maintained, so they may not match the current code.
+
 > **Scope:** Everything required to fully remediate v0.6.3 (shipped 2026-04-27) so the published capabilities, architectures, and tier claims are honest, complete, and load-bearing across T1–T5.
 > **Vehicle:** v0.6.3.1 patch release (Q2 2026, ~4 weeks).
 > **Companion docs:** `ROADMAP.md` (forward plan v0.6.3.1 → v1.0), `audits/v063-source-code-audit.md` (this audit), `architectures.html` + T1–T5 pages.

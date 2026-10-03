@@ -3,6 +3,8 @@ layout: doc
 ---
 # ai-memory vs Batman's 6-Form Write-Time-Investment Framework — Honest Audit
 
+> **Point-in-time record, as of 2026-05-15.** The src/ file:line references in this document describe the source tree at commit `53b4d399db7b` (read a file there with `git show 53b4d399db7b:<path>`). They are a dated record and are not maintained, so they may not match the current code.
+
 > ## Post-audit status (2026-05-15, HEAD `c9472c1`)
 >
 > **This document reflects state at commit `53b4d39` (audit baseline).**
