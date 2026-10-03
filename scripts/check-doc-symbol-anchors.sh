@@ -260,6 +260,13 @@ MDEOF
     anchor_green 4714 "a src/mcp/../mcp in-range line anchor" 'See `src/mcp/../mcp/tools/recall.rs:4`.'
     anchor_green 4714 "a src/./mcp live symbol anchor" 'See `src/./mcp/tools/recall.rs::RecallTool`.'
 
+    # #4716: both ends of a backticked :a-b range are range-checked.
+    anchor_red 4716 LINE "a range whose end passes end-of-file (:2-9999)" 'See `src/mcp/tools/recall.rs:2-9999`.'
+    anchor_red 4716 LINE "a reversed range (:3-2)" 'See `src/mcp/tools/recall.rs:3-2`.'
+    anchor_red 4716 LINE "a range that starts at 0 (:0-2)" 'See `src/mcp/tools/recall.rs:0-2`.'
+    anchor_green 4716 "a full-file range (:1-4)" 'See `src/mcp/tools/recall.rs:1-4`.'
+    anchor_green 4716 "a one-line range (:4-4)" 'See `src/mcp/tools/recall.rs:4-4`.'
+
     # ---- #4651: a BARE src/x.rs:N line anchor (no backtick) ----------
     # Every form the #4651 census found must FAIL as BARE_LN; the only
     # exemption is the label of a commit-pinned permalink (immutable).
@@ -538,7 +545,7 @@ def canon(line):
 
 
 PATH = re.compile(r"`(src/[A-Za-z0-9_/]+\.rs)`")
-PATHLN = re.compile(r"`(src/[A-Za-z0-9_/]+\.rs):(\d+)")
+PATHLN = re.compile(r"`(src/[A-Za-z0-9_/]+\.rs):(\d+)(?:-(\d+))?")
 # #4651: a BARE `src/x.rs:N` (no leading backtick: plain prose, a link
 # label, HTML text). Not preceded by a backtick (PATHLN owns that form),
 # a path separator, a dot or an alphanumeric, so URL path segments are
@@ -634,11 +641,13 @@ for doc in seen_docs:
 
         for m in PATHLN.finditer(line):
             f, n = m.group(1), int(m.group(2))
+            last = int(m.group(3)) if m.group(3) else n
             if f not in per_file:
                 if not absent_ok:
                     emit("PATH", doc, ln, f, ctx)
-            elif n < 1 or n > line_count[f]:
-                emit("LINE", doc, ln, f"{f}:{n}", ctx)
+            elif n < 1 or last < n or last > line_count[f]:
+                tok = f"{f}:{n}" if m.group(3) is None else f"{f}:{n}-{last}"
+                emit("LINE", doc, ln, tok, ctx)
 
         for m in BARE_LN.finditer(line):
             if pinned_label(line, m):
