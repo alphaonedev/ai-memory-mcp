@@ -85,12 +85,12 @@ POSTGRES_PASSWORD="$PW" docker compose -p "$PROJECT" -f "$POOL_COMPOSE" up -d --
 
 # ── 3. schema-init + serve THROUGH the pooler ────────────────────────────
 echo "[3/5] schema-init + serve (admission cap=${ADMISSION_CAP}) through pgbouncer:6432 ..."
-"$BIN" schema-init --store-url "$POOLED_URL"
-# #4577: serve reads the pooled DSN (it carries the db password) from a 0600 file
-# via AI_MEMORY_STORE_URL_FILE, not argv. schema-init above has no non-argv
-# channel (src/cli/schema_init.rs store_url is a required argv String, #4600).
+# #4577/#4600: schema-init and serve read the pooled DSN (it carries the db
+# password) from a 0600 file via AI_MEMORY_STORE_URL_FILE, not argv
+# (src/cli/schema_init.rs:293 -> src/store_url.rs:137).
 STORE_URL_FILE="$RESULTS_DIR/.store-url"
 ( umask 077; printf '%s\n' "$POOLED_URL" >"$STORE_URL_FILE" )
+AI_MEMORY_STORE_URL_FILE="$STORE_URL_FILE" "$BIN" schema-init
 AI_MEMORY_STORE_URL_FILE="$STORE_URL_FILE" AI_MEMORY_NO_CONFIG=1 AI_MEMORY_MAX_INFLIGHT_REQUESTS="$ADMISSION_CAP" \
   "$BIN" serve --host "$DAEMON_HOST" --port "$DAEMON_PORT" \
   >"$RESULTS_DIR/daemon.log" 2>&1 &
