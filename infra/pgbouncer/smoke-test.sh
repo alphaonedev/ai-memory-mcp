@@ -23,7 +23,10 @@ cd "$(dirname "$0")"
 PW="${POSTGRES_PASSWORD:-ai_memory_smoke}"
 PROJECT="ai-memory-pgbouncer-smoke"
 PG_CONTAINER="ai-memory-pgbouncer-postgres"
-POOLED_URL="postgres://ai_memory:${PW}@pgbouncer:6432/ai_memory"
+# #4617: the pooled URL carries NO password; psql reads PGPASSWORD, handed to the
+# container by `docker exec -e PGPASSWORD` (no value: inherited from this shell's
+# env), so the secret is never an argv word in the host or container process list.
+POOLED_URL="postgres://ai_memory@pgbouncer:6432/ai_memory"
 
 cleanup() {
   docker compose -p "$PROJECT" down -v >/dev/null 2>&1 || true
@@ -42,7 +45,7 @@ POSTGRES_PASSWORD="$PW" docker compose -p "$PROJECT" up -d --wait
 # psql THROUGH the pooler is run from inside the postgres container (it has
 # psql and shares the compose network, so `pgbouncer` resolves).
 psql_pooled() {
-  docker exec -e PGPASSWORD="$PW" "$PG_CONTAINER" \
+  PGPASSWORD="$PW" docker exec -e PGPASSWORD "$PG_CONTAINER" \
     psql "$POOLED_URL" -v ON_ERROR_STOP=1 -tA "$@"
 }
 
@@ -85,8 +88,8 @@ fi
 echo "      OK: role-default timeouts survive DISCARD ALL"
 
 echo "[4/4] pooler is in transaction mode ..."
-mode="$(docker exec -e PGPASSWORD="$PW" "$PG_CONTAINER" \
-  psql "postgres://ai_memory:${PW}@pgbouncer:6432/pgbouncer" -tA -c 'SHOW pool_mode;' 2>/dev/null | tr -dc 'a-z' || true)"
+mode="$(PGPASSWORD="$PW" docker exec -e PGPASSWORD "$PG_CONTAINER" \
+  psql "postgres://ai_memory@pgbouncer:6432/pgbouncer" -tA -c 'SHOW pool_mode;' 2>/dev/null | tr -dc 'a-z' || true)"
 # Some PgBouncer builds report per-database mode; the global is what matters.
 echo "      pool_mode = ${mode:-<unreported>}"
 

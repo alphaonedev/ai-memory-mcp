@@ -327,6 +327,16 @@ SSH_OPTS="-i $SSH_KEY -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o Co
 log()  { printf '[%s] %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
 die()  { printf 'FATAL: %s\n' "$*" >&2; exit 1; }
 
+# #4603: the units pass the store URL through AI_MEMORY_STORE_URL (the
+# EnvironmentFile), never as a `--store-url` argv word. That env channel
+# exists from 0.9.0 (#1927); an older pinned binary would ignore it and fall
+# back to the default sqlite store, so refuse (fail closed) instead.
+require_store_url_env_channel() {
+  local floor="0.9.0" lowest
+  lowest="$(printf '%s\n%s\n' "$floor" "$EXPECTED_VERSION" | sort -V | head -n1)"
+  [ "$lowest" = "$floor" ] || die "EXPECTED_VERSION=$EXPECTED_VERSION has no AI_MEMORY_STORE_URL env channel (needs >= $floor, #4603); refusing to render a unit that would silently fall back to sqlite"
+}
+
 # ssh_node <ip> <remote-command-string>
 # -n protects stdin so loops over `inv_*` output don't get consumed by ssh.
 ssh_node() {

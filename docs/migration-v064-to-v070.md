@@ -341,10 +341,11 @@ the AGE projection prime, and the cutover dance.
 3. **Install the v0.7.0 binary** (per §4.3 above).
 4. **Run the in-place upgrade** against the live postgres URL:
    ```bash
-   ai-memory schema-init \
-     --store-url postgres://aimemory:PASSWORD@HOST:5432/aimemory
+   # /etc/ai-memory/store-url: one line, mode 0600, owned by the user running this command:
+   #   postgres://aimemory:PASSWORD@HOST:5432/aimemory
+   AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url ai-memory schema-init
    ```
-   `schema-init` has no non-argv channel for its URL (`src/cli/schema_init.rs:111-112`, tracked in [#4600](https://github.com/alphaonedev/ai-memory-mcp/issues/4600)), so the password is visible in `ps` for the seconds this one-shot command runs; run it from a single-user admin host.
+   `schema-init` resolves its URL exactly like `serve`: `AI_MEMORY_STORE_URL_FILE` (a `0600` file) first, then `AI_MEMORY_STORE_URL`, then `--store-url` (`src/cli/schema_init.rs:293`, `src/store_url.rs:137`), so keep the password off argv and use the file form shown above ([#4600](https://github.com/alphaonedev/ai-memory-mcp/issues/4600)).
    Opening the store walks the postgres ladder up to schema v57
    idempotently, preserving data.
 5. **Verify schema parity:**

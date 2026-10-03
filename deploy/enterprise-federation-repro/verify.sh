@@ -29,7 +29,10 @@ set +e
 DK() { "$CONTAINER_RUNTIME" "$@"; }
 BIN="$(resolve_ai_memory_bin)" || die "verify: no ai-memory binary — run repro.sh first"
 [ -s "$STORE_URL_FILE" ] || die "verify: $STORE_URL_FILE missing — run repro.sh first"
-DSN="$(cat "$STORE_URL_FILE")"
+# #4603: the store URL carries the db password; verify-audit-trail reads it from
+# the 0600 file via the AI_MEMORY_STORE_URL_FILE channel (src/store_url.rs
+# resolve_store_url, src/daemon_runtime.rs:5222), never as a --store-url argv word.
+export AI_MEMORY_STORE_URL_FILE="$STORE_URL_FILE"
 
 PASS=0; FAIL=0; NOTE=0
 ok()   { printf '  \033[32mPASS\033[0m %s\n' "$*"; PASS=$((PASS+1)); }
@@ -132,7 +135,7 @@ if env -u AI_MEMORY_SECURITY_PROFILE -u AI_MEMORY_REQUIRE_ENTERPRISE_FEDERATION_
        -u AI_MEMORY_REQUIRE_CAUSE_BINDING -u AI_MEMORY_REQUIRE_IDENTITY_LINEAGE \
        -u AI_MEMORY_REQUIRE_ROLLBACK_CHECK \
        AI_MEMORY_NO_CONFIG=1 "$BIN" --db-passphrase-file "$DB_PASSPHRASE_FILE" \
-       verify-audit-trail --store-url "$DSN" >"$REPORTS_DIR/verify-audit-trail-core.txt" 2>&1; then
+       verify-audit-trail >"$REPORTS_DIR/verify-audit-trail-core.txt" 2>&1; then
   ok "core append-only signed_events chain integrity VERIFIES CLEAN (no truncation / no head-hash tamper) over the pg store"
   sed 's/^/    /' "$REPORTS_DIR/verify-audit-trail-core.txt" | head -20 || true
 else
@@ -140,7 +143,7 @@ else
   sed 's/^/    /' "$REPORTS_DIR/verify-audit-trail-core.txt" | head -30 || true
 fi
 # Full certified posture (require-mode anchors ON) — informational NOTE.
-if AI_MEMORY_NO_CONFIG=1 "$BIN" --db-passphrase-file "$DB_PASSPHRASE_FILE" verify-audit-trail --store-url "$DSN" >"$REPORTS_DIR/verify-audit-trail.txt" 2>&1; then
+if AI_MEMORY_NO_CONFIG=1 "$BIN" --db-passphrase-file "$DB_PASSPHRASE_FILE" verify-audit-trail >"$REPORTS_DIR/verify-audit-trail.txt" 2>&1; then
   ok "verify-audit-trail CLEAN under the full asi-hard verify-mode anchors"
   sed 's/^/    /' "$REPORTS_DIR/verify-audit-trail.txt" | head -20 || true
 else

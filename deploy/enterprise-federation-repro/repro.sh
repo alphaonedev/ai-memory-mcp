@@ -145,7 +145,7 @@ _pg_run() {
   local mode="$1"
   local run_args=(run -d --name "$PG_CONTAINER"
     -e POSTGRES_USER="$PG_USER"
-    -e POSTGRES_PASSWORD="$PGPW"
+    -e POSTGRES_PASSWORD
     -e POSTGRES_DB="$PG_DB"
     -e POSTGRES_INITDB_ARGS=--data-checksums
     -e PGDATA=/var/lib/postgresql/data/pgdata
@@ -177,7 +177,9 @@ _pg_run() {
     -c "install -d -o postgres -g postgres -m 0750 ${PG_TLS_INSTALL_DIR} && install -o postgres -g postgres -m 0644 /certs/server.pem ${PG_TLS_INSTALL_DIR}/server.pem && install -o postgres -g postgres -m 0600 /certs/server.key ${PG_TLS_INSTALL_DIR}/server.key && exec /usr/local/bin/docker-entrypoint.sh \"\$@\""
     bash)
   run_args+=("${pg_cmd[@]}")
-  DK "${run_args[@]}"
+  # #4617: `-e POSTGRES_PASSWORD` (no value) makes docker copy it from this
+  # process's environment, so the password is never an argv word.
+  POSTGRES_PASSWORD="$PGPW" DK "${run_args[@]}"
 }
 
 if _pg_running; then
@@ -308,7 +310,9 @@ TOML
 # --------------------------------------------------------------------------
 DSN="$(store_dsn)"
 log "repro: schema-init (embedding-dim $EMBED_DIM) over verify-full TLS + client-cert mTLS"
-AI_MEMORY_NO_CONFIG=1 "$BIN" schema-init --store-url "$DSN" --embedding-dim "$EMBED_DIM"
+# #4603/#4600: schema-init reads the DSN from the 0600 $STORE_URL_FILE (written above),
+# not argv (src/cli/schema_init.rs:293 -> src/store_url.rs:137).
+AI_MEMORY_STORE_URL_FILE="$STORE_URL_FILE" AI_MEMORY_NO_CONFIG=1 "$BIN" schema-init --embedding-dim "$EMBED_DIM"
 
 # --------------------------------------------------------------------------
 # 9. Deterministic seed corpus (sqlite) + migrate into the pg tier verbatim.

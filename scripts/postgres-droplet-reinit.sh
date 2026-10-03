@@ -224,20 +224,22 @@ run_schema_init() {
     local db="$1"
     local url="postgres://${PG_USER}:${PG_PWD}@${PG_HOST}:${PG_PORT}/${db}"
     local out="${SCHEMA_INIT_JSON%.json}-${db}.json"
-    local cmd
-
-    if [[ -n "$AI_MEMORY_SSH_HOST" ]]; then
-        cmd=(ssh "$AI_MEMORY_SSH_HOST" "$AI_MEMORY_BIN" schema-init --store-url "$url" --json)
-    else
-        cmd=("$AI_MEMORY_BIN" schema-init --store-url "$url" --json)
-    fi
-
+    # #4603: the store URL carries the db password, so it never goes on argv
+    # (local /proc/<pid>/cmdline, nor the ssh remote command string, which is
+    # argv on the remote host). It reaches schema-init through the
+    # AI_MEMORY_STORE_URL env channel (src/store_url.rs resolve_store_url): set
+    # in the local process env, or piped over ssh stdin and exported remotely.
     log "schema-init -> ${db} (output: ${out})"
     if [[ "$DRY_RUN" -eq 1 ]]; then
-        log "DRY-RUN: ${cmd[*]} | tee ${out}"
+        log "DRY-RUN: schema-init --json for ${db} via ${AI_MEMORY_SSH_HOST:-local} (store URL redacted) | tee ${out}"
         return 0
     fi
-    "${cmd[@]}" | tee "$out"
+    if [[ -n "$AI_MEMORY_SSH_HOST" ]]; then
+        printf '%s\n' "$url" | ssh "$AI_MEMORY_SSH_HOST" \
+            "IFS= read -r AI_MEMORY_STORE_URL; export AI_MEMORY_STORE_URL; exec '$AI_MEMORY_BIN' schema-init --json" | tee "$out"
+    else
+        AI_MEMORY_STORE_URL="$url" "$AI_MEMORY_BIN" schema-init --json | tee "$out"
+    fi
     echo
     # Quick sanity check
     if command -v jq >/dev/null 2>&1; then

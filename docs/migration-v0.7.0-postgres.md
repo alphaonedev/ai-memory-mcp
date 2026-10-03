@@ -94,11 +94,12 @@ Before you start:
 ## Step 1 — Bootstrap the postgres schema
 
 ```bash
-ai-memory schema-init \
-  --store-url postgres://aimemory:PASSWORD@HOST:5432/aimemory
+# /etc/ai-memory/store-url: one line, mode 0600, owned by the user running this command:
+#   postgres://aimemory:PASSWORD@HOST:5432/aimemory
+AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url ai-memory schema-init
 ```
 
-`schema-init` has no non-argv channel for its URL (`src/cli/schema_init.rs:111-112`, tracked in [#4600](https://github.com/alphaonedev/ai-memory-mcp/issues/4600)), so the password is visible in `ps` for the seconds this one-shot command runs; run it from a single-user admin host.
+`schema-init` resolves its URL exactly like `serve`: `AI_MEMORY_STORE_URL_FILE` (a `0600` file) first, then `AI_MEMORY_STORE_URL`, then `--store-url` (`src/cli/schema_init.rs:293`, `src/store_url.rs:137`), so keep the password off argv and use the file form shown above ([#4600](https://github.com/alphaonedev/ai-memory-mcp/issues/4600)).
 
 Idempotent on rerun. Exit code 0 + the human summary reporting
 `schema_version: 57` is the success signal (pass `--json` for the
@@ -291,11 +292,12 @@ If you're upgrading an existing v0.7-alpha postgres db (schema v15)
 to v0.7.0's v55 parity:
 
 ```bash
-ai-memory schema-init \
-  --store-url postgres://aimemory:PASSWORD@HOST:5432/aimemory
+# /etc/ai-memory/store-url: one line, mode 0600, owned by the user running this command:
+#   postgres://aimemory:PASSWORD@HOST:5432/aimemory
+AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url ai-memory schema-init
 ```
 
-`schema-init` has no non-argv channel for its URL (`src/cli/schema_init.rs:111-112`, tracked in [#4600](https://github.com/alphaonedev/ai-memory-mcp/issues/4600)), so the password is visible in `ps` for the seconds this one-shot command runs; run it from a single-user admin host.
+`schema-init` resolves its URL exactly like `serve`: `AI_MEMORY_STORE_URL_FILE` (a `0600` file) first, then `AI_MEMORY_STORE_URL`, then `--store-url` (`src/cli/schema_init.rs:293`, `src/store_url.rs:137`), so keep the password off argv and use the file form shown above ([#4600](https://github.com/alphaonedev/ai-memory-mcp/issues/4600)).
 
 Opening the store walks the v15 → v55 deltas idempotently (the
 v34 → v55 layer lands via in-process `migrate_v34()…migrate_v55()`

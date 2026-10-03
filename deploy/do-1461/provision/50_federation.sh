@@ -35,13 +35,14 @@
 # per-peer store URL (store_url_for_schema → the peer's REGION pg node's PRIVATE
 # VPC IP, the peer's within-region ic_peer_<K> search_path schema,
 # sslmode=verify-full) that lives ONLY in the per-node EnvironmentFile (mode
-# 0400, root-only) and is pulled into ExecStart via systemd
-# ${AI_MEMORY_STORE_URL} expansion — the unit file itself carries NO secret. The
-# daemon's `--store-url` has no env binding in the pinned golden binary, so the
-# expanded argv is visible to root via `ps`; on these single-tenant,
-# firewall-closed (pg_port tag-scoped east-west) hosts that residual is
-# acceptable and documented rather than hidden.
+# 0400, root-only) and reaches the daemon as the AI_MEMORY_STORE_URL
+# environment variable (systemd EnvironmentFile) — the unit file carries NO
+# secret and ExecStart carries no `--store-url` (#4603), so the DSN is never on
+# argv. `serve` resolves the env channel in src/store_url.rs resolve_store_url
+# (src/daemon_runtime.rs:5090); that channel needs a binary >= 0.9.0
+# (require_store_url_env_channel in lib.sh refuses an older pin).
 source "$(dirname "$0")/lib.sh"
+require_store_url_env_channel   # #4603: no --store-url on argv; env channel needs >= 0.9.0
 
 RENDER_DIR="$RUN_DIR/render"; mkdir -p "$RENDER_DIR"
 SECRETS_DIR="$RUN_DIR/secrets"
@@ -133,7 +134,6 @@ EnvironmentFile=$REMOTE_ENVFILE
 ExecStart=$BIN serve \\
   --host 0.0.0.0 \\
   --port $FEDERATION_PORT \\
-  --store-url \${AI_MEMORY_STORE_URL} \\
   --tls-cert $REMOTE_TLS/server.pem \\
   --tls-key $REMOTE_TLS/server.key \\
   --mtls-allowlist $REMOTE_TLS/mtls-allowlist.txt \\
