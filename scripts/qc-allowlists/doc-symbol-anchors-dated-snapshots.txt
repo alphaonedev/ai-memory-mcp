@@ -1,0 +1,52 @@
+# DATED-SNAPSHOT list for scripts/check-doc-symbol-anchors.sh (#4549).
+#
+# FORMAT: one repo-relative path per line; everything after `#` is comment.
+#
+# Each file below is a dated record (audit, campaign result, handoff,
+# execution prompt, inventory) whose src/ file:line references describe the
+# tree on its date and are not maintained. The gate SKIPS exactly these
+# files, and only while each exists and carries the "Point-in-time record"
+# banner in its first 40 lines; a missing or banner-less entry FAILS, so
+# this list cannot become a blanket exemption. A doc that describes CURRENT
+# behaviour never belongs here: repoint its anchors instead.
+#
+# Precedent: the FROZEN path-prefix class in the same gate, the historical
+# guard in scripts/check-docs-vs-ssot.sh, and the commit-pinned references
+# in docs/ROADMAP-v1.1.0-ADDENDUM.md.
+RELEASE_NOTES_v0.7.0.md
+REMEDIATIONv0631.md
+audits/v063-coverage-strategy/MUTANTS.md
+docs/BASELINE-v0.6.3.1.md
+docs/audit/3x7-claims-register-2026-08-01.md
+docs/audit/3x7-v1-cutline-ruling-2026-08-01.md
+docs/audit/requirements-coverage-matrix-v0631-issue-487.md
+docs/compliance/_inventory/v0.7.0-summary.md
+docs/compliance/_inventory/v0.7.x-code-changes-test-plan.md
+docs/compliance/_inventory/v1.0.0-summary.md
+docs/design/Grok-3x7-Opus-vs-Grok-Correct-Now.md
+docs/design/Grok-3x7-Opus-vs-Grok-Development-Gaps.md
+docs/design/Grok-TRACT-v0.8.0-Correct-Now.md
+docs/design/Grok-TRACT-v0.8.0-Development-Gaps.md
+docs/design/TRACT-v0.8.0-CORRECT-NOW-CANONICAL-opus.md
+docs/design/TRACT-v0.8.0-DEVELOPMENT-GAPS-CANONICAL-opus.md
+docs/design/TRACT-vs-ai-memory-v0.8.0-CORRECT-NOW-opus.md
+docs/design/TRACT-vs-ai-memory-v0.8.0-DEVELOPMENT-GAPS-opus.md
+docs/handoff/GROK-4.5-HANDOFF-v1.0.0-GA.md
+docs/internal/batman-framework-audit.md
+docs/internal/enum-proliferation-audit-970.md
+docs/internal/json-value-redundancy-audit-969.md
+docs/internal/sal-boundary-audit-961.md
+docs/internal/typed-errors-audit-964.md
+docs/internal/v070-doc-drift-audit.md
+docs/internal/v070-feature-inventory.md
+docs/internal/v070-review-synthesis.md
+docs/v0.6.4/v0.6.4-nhi-prompts.md
+docs/v0.7.1/v0.7.1-execution-prompt.md
+docs/v0.8.0/1715-attested-provenance-foldin-prompt.md
+docs/v0.8.0/1720-visibility-scope-unification-prompt.md
+docs/v0.8.0/GOAL-EPIC-KICKOFF.md
+docs/v0.8.0/REMAINING-WORK-EXECUTION-PROMPT.md
+docs/v0.8.1/V0.8.1-PATCH-1-WORK-PROMPT.md
+docs/v0.9.0/V0.9.0-AI-NHI-AUTONOMOUS-DEVELOPMENT-EPIC.md
+docs/v1.0.0/test-campaign-2026-08-08-enterprise-cert/PLAN.md
+docs/v1.0.0/test-campaign-2026-08-08-enterprise-cert/track-d-f-e2e-do-results.md
