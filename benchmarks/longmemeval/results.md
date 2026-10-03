@@ -20,7 +20,7 @@
 > `refuse` default it drops LongMemEval-S sessions carrying synthetic
 > credential-like strings and measures the screen, not the FTS5 ranker.
 > The 18 sessions still refused are the pre-existing `validate_content`
-> control-char rejections (`is_clean_string`, `src/validate.rs:148`) that
+> control-char rejections (`is_clean_string`, `src/validate.rs::is_clean_string`) that
 > v0.7.0 dropped identically — the corpus is apples-to-apples. Result: R@1
 > **86.6%** (433/500), R@5 **96.4%** (482/500), R@10 **98.4%** (492/500),
 > R@20 **99.6%** (498/500) — byte-identical to the 2026-05-31 v0.7.0

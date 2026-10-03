@@ -3,7 +3,7 @@
 # Prevents the v0.6.4 → v0.7.0 tool-count drift bug from recurring.
 # The single source of truth is `Profile::full().expected_tool_count()`
 # in `src/profile.rs` (and the per-family `Family::expected_tool_count`
-# match arm at `src/profile.rs:279-318`). At v0.7.0 the canonical
+# match arm at `src/profile.rs::expected_tool_count`). At v0.7.0 the canonical
 # answer is 74 entries at `--profile full` (72 callable + memory_capabilities
 # bootstrap) and 7 at `--profile core`.
 #
