@@ -140,9 +140,6 @@ fn declared_children(root_text: &str) -> Vec<DeclaredMod> {
     out
 }
 
-/// Every adapter source file: `postgres.rs` first, then each child module in
-/// sorted path order. Panics (fail closed) on any non-vacuity violation.
-#[must_use]
 /// #4504-adjacent instrument pin (2026-10-03, GOD): a trailing line comment on a `mod x;`
 /// declaration must not hide the module from the parser. `declared_children` took
 /// `rest.strip_suffix(';')`, so `mod governance_chain_4477; // #4477 ...` yielded None and the
@@ -176,6 +173,9 @@ fn declaration_with_a_trailing_comment_is_still_declared() {
     );
 }
 
+/// Every adapter source file: `postgres.rs` first, then each child module in
+/// sorted path order. Panics (fail closed) on any non-vacuity violation.
+#[must_use]
 pub fn pg_adapter_sources() -> Vec<PgSource> {
     let root_path = crate_root().join(PG_ROOT_REL);
     let root_text = read_lf(&root_path);
