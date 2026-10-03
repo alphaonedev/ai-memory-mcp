@@ -475,8 +475,9 @@ jobs:
           openssl x509 -req -in "$TLS_DIR/server.csr" -CA "$TLS_DIR/ca.crt" -CAkey "$TLS_DIR/ca.key" \
             -CAcreateserial -days 1 -extfile "$TLS_DIR/server.ext" -out "$TLS_DIR/server.crt"
           chmod 644 "$TLS_DIR/ca.crt" "$TLS_DIR/server.crt" "$TLS_DIR/server.key"
-          docker run -d --name pg-age -p 5432:5432 \
-            -e POSTGRES_USER=ai_memory -e POSTGRES_PASSWORD=ai_memory_test -e POSTGRES_DB=ai_memory_test \
+          # The password reaches the container from the environment, not the docker argv (#4694).
+          POSTGRES_PASSWORD=ai_memory_test docker run -d --name pg-age -p 5432:5432 \
+            -e POSTGRES_USER=ai_memory -e POSTGRES_PASSWORD -e POSTGRES_DB=ai_memory_test \
             -v "$TLS_DIR:/certs-src:ro" \
             apache/age:release_PG16_1.6.0 \
             bash -c 'mkdir -p /certs && cp /certs-src/server.crt /certs-src/server.key /certs && chown postgres:postgres /certs/* && chmod 600 /certs/server.key && exec docker-entrypoint.sh postgres -c ssl=on -c ssl_cert_file=/certs/server.crt -c ssl_key_file=/certs/server.key'

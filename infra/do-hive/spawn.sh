@@ -84,12 +84,32 @@ GATE
   fi
 }
 
+# #4678/#4637: a non-empty ai_memory_image_url needs the pinned digest of that
+# tarball. The launcher names the missing input before terraform runs; a value
+# supplied through -var or -var-file is still caught by the memory droplet
+# precondition in main.tf. Both empty means the binary is supplied by scp.
+require_image_pin() {
+  if [[ -n "${TF_VAR_ai_memory_image_url:-}" && -z "${TF_VAR_ai_memory_image_sha256:-}" ]]; then
+    echo "[spawn.sh] REFUSE: TF_VAR_ai_memory_image_sha256 must be set when TF_VAR_ai_memory_image_url is set (the lowercase hex SHA-256 of that versioned tarball; the node refuses a tarball it cannot verify)." >&2
+    exit 2
+  fi
+  if [[ "${TF_VAR_ai_memory_image_url:-}" == *[Rr]eleases/[Ll]atest* ]]; then
+    echo "[spawn.sh] REFUSE: TF_VAR_ai_memory_image_url must be a versioned release URL; releases/latest moves and would not match the pinned digest." >&2
+    exit 2
+  fi
+  if [[ -n "${TF_VAR_ai_memory_image_url:-}" ]] && ! [[ "${TF_VAR_ai_memory_image_url}" =~ ^https://[A-Za-z0-9][A-Za-z0-9._~/-]*$ ]]; then
+    echo "[spawn.sh] REFUSE: TF_VAR_ai_memory_image_url must be https:// followed only by letters, digits and ._~/- (it is written into a root-run script)." >&2
+    exit 2
+  fi
+}
+
 case "${cmd}" in
   cost)
     print_cost
     ;;
   plan)
     print_cost
+    require_image_pin
     terraform init -input=false
     # #2850: forward extra CLI args (e.g. -var memory_count=2) to terraform.
     # Without this the documented recipe `spawn.sh apply -var memory_count=2`
@@ -100,6 +120,7 @@ case "${cmd}" in
   apply)
     print_cost
     require_money_gate
+    require_image_pin
     terraform init -input=false
     mkdir -p "${SCRATCH_ROOT}/${NOW}"
     # #2850: forward extra CLI args (e.g. -var memory_count=2) — see plan case.

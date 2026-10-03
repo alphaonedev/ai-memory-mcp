@@ -196,17 +196,15 @@ variable "vpc_ip_range" {
   default     = "10.20.0.0/16"
 }
 
-variable "db_password" {
-  description = "PostgreSQL password for the ai-memory role (substrate-local; the daemon connects over localhost only — postgres is not exposed to the network). Pass via TF_VAR_db_password."
-  type        = string
-  default     = "aimem-do-substrate"
-  sensitive   = true
-}
-
 variable "ai_memory_image_url" {
-  description = "URL to the pre-built ai-memory release tarball (operator-published)."
+  description = "URL of a VERSIONED ai-memory release tarball built with --features sal-postgres (for example .../releases/download/v1.0.0/ai-memory-x86_64-unknown-linux-gnu.tar.gz), operator-published. Empty (the default) means the operator supplies the binary by scp. When set it needs ai_memory_image_sha256; releases/latest is refused because the digest pins one artifact (#4678)."
   type        = string
-  default     = "https://github.com/alphaonedev/ai-memory-mcp/releases/latest/download/ai-memory-x86_64-unknown-linux-gnu.tar.gz"
+  default     = ""
+
+  validation {
+    condition     = var.ai_memory_image_url == "" || (startswith(var.ai_memory_image_url, "https://") && length(var.ai_memory_image_url) > length("https://") && !strcontains(var.ai_memory_image_url, "%") && !strcontains(lower(var.ai_memory_image_url), "/releases/latest") && can(regex("^https://[A-Za-z0-9][A-Za-z0-9._~/-]*$", var.ai_memory_image_url)))
+    error_message = "ai_memory_image_url must be empty or a non-empty https:// URL of a versioned release, with no percent-encoding or shell metacharacters (only letters, digits and ._~/- after https://); /releases/latest moves (in any letter case) and would not match ai_memory_image_sha256."
+  }
 }
 
 variable "ai_memory_image_sha256" {
@@ -277,7 +275,6 @@ resource "digitalocean_droplet" "memory" {
   user_data = templatefile("${path.module}/cloud-init-memory.yaml.tpl", {
     ai_memory_image_url    = var.ai_memory_image_url
     ai_memory_image_sha256 = var.ai_memory_image_sha256
-    db_password            = var.db_password
     federation_enabled     = var.memory_count > 1
     node_index             = count.index + 1
     node_count             = var.memory_count

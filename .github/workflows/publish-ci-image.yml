@@ -120,9 +120,10 @@ jobs:
           # before it is pushed. Uses `docker exec` (no host port) so it is
           # robust regardless of runner networking. A drift off ANY SSOT pin
           # reds here and the push step never runs.
-          docker run -d --name ci-image-verify \
+          # Passwords reach docker from the environment, not its argv (#4694).
+          POSTGRES_PASSWORD=ci_verify docker run -d --name ci-image-verify \
             -e POSTGRES_USER=ai_memory \
-            -e POSTGRES_PASSWORD=ci_verify \
+            -e POSTGRES_PASSWORD \
             -e POSTGRES_DB=ci_verify \
             ai-memory-ci:verify
           for i in $(seq 1 60); do
@@ -132,7 +133,7 @@ jobs:
             sleep 2
             if [ "$i" = 60 ]; then echo "::error::postgres did not become ready"; docker logs ci-image-verify || true; exit 1; fi
           done
-          PSQL() { docker exec -e PGPASSWORD=ci_verify ci-image-verify psql -U ai_memory -d ci_verify -tAX "$@"; }
+          PSQL() { PGPASSWORD=ci_verify docker exec -e PGPASSWORD ci-image-verify psql -U ai_memory -d ci_verify -tAX "$@"; }
           PSQL -c "CREATE EXTENSION IF NOT EXISTS vector;" >/dev/null
           PSQL -c "CREATE EXTENSION IF NOT EXISTS age;" >/dev/null
           pg_ver=$(PSQL -c "SELECT split_part(current_setting('server_version'), ' ', 1);" | tr -d '[:space:]')
