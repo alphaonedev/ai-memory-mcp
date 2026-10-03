@@ -1323,11 +1323,18 @@ jobs:
         run: bash scripts/check-claude-plugin.sh --self-test
 
   docs-no-argv-secrets-gate:
-    # #4577 - a tracked doc, unit, template or script must not put a database
-    # password on the --store-url argv (visible in ps and /proc/<pid>/cmdline).
-    # The store URL has non-argv channels: AI_MEMORY_STORE_URL_FILE, then
-    # AI_MEMORY_STORE_URL, then --store-url (src/store_url.rs:137). The one
-    # allowlisted verb is schema-init, which has no non-argv channel (#4600).
+    # #4577 - a tracked doc, unit, template or script must not put a credential
+    # on a process argv (visible in ps and /proc/<pid>/cmdline; a unit is shown
+    # by systemctl show). The store URL has non-argv channels:
+    # AI_MEMORY_STORE_URL_FILE, then AI_MEMORY_STORE_URL (src/store_url.rs).
+    # Every file: a --store-url argument (quote-split names too) whose URL has a
+    # userinfo password or a query key that percent-decodes to password.
+    # Shell-like files: shlex words per logical line, scanned for a credential
+    # postgres URL (also --opt=<dsn> and inside sh -c / ssh strings), a keyword
+    # conninfo password=, a docker/podman/nerdctl -e NAME=<secret>, and a unit
+    # Environment= credential URL (#4689-#4694). Not claimed: runtime-assembled
+    # arguments and SQL literals in psql -c (see the script header). The one
+    # allowlisted verb is schema-init (#4600); PENDING lists the #4762 sites.
     name: No-credentials-on-argv gate (#4577)
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -1336,17 +1343,33 @@ jobs:
       - name: Run no-credentials-on-argv gate
         run: python3 scripts/check-docs-no-argv-secrets.py
       - name: Self-test the gate (regression evidence)
-        # Red probes: inline, =, quoted, continuation and curator forms.
-        # Green near-misses: file form, no password, redaction tokens,
-        # shell expansion, the schema-init allowlist.
+        # Red probes for every rule above in .md, .sh, .tpl and .service
+        # files, redacted hit snippets, the pending/stale mechanism and the
+        # file walk. Green near-misses: assignments, env prefixes, echo/printf,
+        # YAML values, redaction tokens, bare -e NAME, the schema-init verb.
         run: python3 scripts/check-docs-no-argv-secrets.py --self-test
 
   cloud-init-serve-flags-gate:
-    # #4616 - a cloud-init memory template must start a daemon that can boot:
-    # every serve flag is a ServeArgs field (src/daemon_runtime.rs), both TLS
-    # flags are present (template policy, not a serve refusal), the store URL
-    # pins sslmode=verify-full (#3705 floor), and the template is pure ASCII
-    # (#1880).
+    # #4616/#4657 - the cloud-init memory templates, as a fail-closed token
+    # allowlist (5-agent vote (4d3ea1c5)). Threat model: stops honest drift;
+    # does not claim to stop an author who hides a token AND edits the gate
+    # or its allowlist (that is caught by review of the allowlist diff).
+    #   - Every triggered line (case-insensitive, percent-decoded triggers)
+    #     must match an exact whitespace-normalised entry of
+    #     scripts/qc-allowlists/cloud-init-token-allow.txt; malformed,
+    #     stale entries fail; approved lines must keep the allowlist order
+    #     and count (#4784); an empty scan fails closed.
+    #     Known do-hive defects sit in cloud-init-token-pending.txt (#4671,
+    #     #4712): listed, never approved.
+    #   - Companion rule (also heredoc bodies and unit Exec lines): no eval,
+    #     decoder-into-shell, ANSI-C quoting, glob, $ or command substitution
+    #     in command position.
+    #   - Validators on approved lines: sslmode exactly verify-full, no
+    #     credential channel other than the 0600 store-url file, no
+    #     download piped to a shell or tar, no unit binary in the service home.
+    #   - Rendered user-data fits the provider limit or main.tf gzips it.
+    #   - Kept rules: ASCII, an ExecStart runs serve, ServeArgs flags only,
+    #     both TLS flags.
     name: Cloud-init serve-flags gate (#4616)
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -1355,6 +1378,9 @@ jobs:
       - name: Run cloud-init serve-flags gate
         run: python3 scripts/check-cloud-init-serve-flags.py
       - name: Self-test the gate (regression evidence)
-        # Red probes: unknown flag (--bind), no TLS, one TLS flag, non-ASCII.
-        # Green near-misses: a clean serve line, terraform directive words.
+        # Every round-1 and round-2 review probe and each condition of the
+        # #4657 decision as red probes, mostly mutations of the real AWS
+        # template (runcmd, write_files and embedded-script insertions),
+        # green near-misses, allowlist form faults, and a mutation of every
+        # allowlist entry of both templates; round-3 probes (#4784, #4793-#4795).
         run: python3 scripts/check-cloud-init-serve-flags.py --self-test

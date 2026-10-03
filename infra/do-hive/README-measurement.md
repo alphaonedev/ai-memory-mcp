@@ -64,11 +64,16 @@ the operator triggers the paid steps.
 source <operator DO token vault>          # exports DIGITALOCEAN_TOKEN
 export AI_MEMORY_OPERATOR_DO_SPEND_APPROVED=1
 export TF_VAR_ssh_pubkey_fingerprint=<operator key fingerprint>
+export TF_VAR_ai_memory_image_url=<versioned sal-postgres tarball URL, never releases/latest>
+export TF_VAR_ai_memory_image_sha256=<lowercase hex SHA-256 of that tarball>
+#    (or leave both unset to supply the binary by scp, see step 1)
 
 # 1. Provision: 5 smallest load-gen droplets + one bumped substrate droplet.
 #    ai_memory_image_url MUST be a --features sal-postgres build (see the
-#    cloud-init-memory NOTE); scp a local sal-postgres binary over the
-#    provisioned one for an ad-hoc run.
+#    cloud-init-memory NOTE) and needs its digest in ai_memory_image_sha256
+#    (the launcher and the plan both refuse the URL without it); scp a local
+#    sal-postgres binary over /usr/local/lib/ai-memory/bin/ai-memory for an
+#    ad-hoc run with both left empty.
 cd infra/do-hive
 ./spawn.sh apply -var-file=measurement.tfvars    # MONEY-GATED, operator only
 

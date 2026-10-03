@@ -35,7 +35,7 @@ bootcmd:
   - [bash, -c, "[ -d /etc/ai-memory ] || (umask 077 && mkdir /etc/ai-memory)"]
   # PG 18 is supplied by PGDG on Ubuntu Noble. Install the signed repository
   # before cloud-init's packages module runs; never fall back to Ubuntu's PG16.
-  - [bash, -c, "install -d -m 0755 /usr/share/postgresql-common/pgdg && curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc"]
+  - [bash, -c, "install -d -m 0755 /usr/share/postgresql-common/pgdg && curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc && echo '0144068502a1eddd2a0280ede10ef607d1ec592ce819940991203941564e8e76  /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc' | sha256sum -c - || { rm -f /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc; exit 1; }"]
   - [bash, -c, "echo 'deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt noble-pgdg main' > /etc/apt/sources.list.d/pgdg.list && apt-get update"]
 packages:
   - postgresql-18=18.6-1.pgdg24.04+2
@@ -58,7 +58,8 @@ write_files:
   # is what keeps other UIDs out during it. The provision script hands the file
   # to the aimemory user once that user exists (serve refuses a file with any
   # group/world mode bit, src/store_url.rs). CHANGEME is the database password:
-  # replace it before real use. The provision script reads the role password
+  # replace it before real use; the provision script refuses to run with the
+  # placeholder (#4788, until #4610 generates the password on the node). The provision script reads the role password
   # from this one file, so there is no second copy to keep in step.
   - path: /etc/ai-memory/store-url
     permissions: '0600'
@@ -84,7 +85,7 @@ write_files:
       Environment=AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url
       Environment=AI_MEMORY_PERMISSIONS_MODE=enforce
       Environment=AI_MEMORY_AUTONOMOUS_HOOKS=1
-      ExecStart=/opt/ai-memory/bin/ai-memory serve --host 0.0.0.0 --port 9077 --tls-cert /etc/ai-memory/tls/node.crt --tls-key /etc/ai-memory/tls/node.key
+      ExecStart=/usr/local/lib/ai-memory/bin/ai-memory serve --host 0.0.0.0 --port 9077 --tls-cert /etc/ai-memory/tls/node.crt --tls-key /etc/ai-memory/tls/node.key
       Restart=on-failure
 
       [Install]
@@ -102,8 +103,11 @@ write_files:
 
       # --- user + dirs ---
       id aimemory >/dev/null 2>&1 || useradd -m -d /opt/ai-memory -s /bin/bash aimemory
-      mkdir -p /opt/ai-memory/bin
-      chown -R aimemory:aimemory /opt/ai-memory
+      # #4695: useradd -m made the home service-owned. Root never chowns, writes
+      # or walks a path inside it (the service user could plant a symlink there);
+      # it only checks the owner. The binary lives outside it (#4696).
+      [ "$(stat -c %U /opt/ai-memory)" = aimemory ] \
+        || { echo "/opt/ai-memory is not owned by aimemory"; exit 1; }
       # #4577/#4619: the service user traverses /etc/ai-memory and owns the DSN
       # file (mode stays 0600).
       chown root:aimemory /etc/ai-memory
@@ -155,31 +159,50 @@ write_files:
       # anything weaker: src/store/postgres/dsn.rs:213-283, floor
       # src/transit_encryption.rs:436-446). A local RSA CA signs a server
       # cert whose SAN is the host the URL dials (localhost). RSA, not
-      # Ed25519: libpq channel binding has no digest for Ed25519 (#2658).
-      # Shape follows infra/do-hive/crypto/gen-certs.sh:40-56 (RSA CA 4096,
+      # Ed25519: RSA keeps the chain usable by libpq clients such as psql with channel_binding (#2658); the daemon itself does not channel-bind.
+      # Shape follows infra/do-hive/crypto/gen-certs.sh:62-72 and :97-99 (RSA CA 4096,
       # leaf 2048, CA-signed, SAN = dialed host) and the hostssl pg_hba of
       # infra/do-hive/crypto/test-pg-verifyfull.sh (hostssl, scram-sha-256).
       TLSD=/etc/ai-memory/tls
       PGTLS=/etc/postgresql/18/main/tls
+      # #4666: the CA private key exists only in a root-only work dir on tmpfs
+      # (RAM, never written to the volume) for the few seconds it takes to sign
+      # the server certificate. The dir is removed on success AND on any
+      # failure or exit, so a compromised node cannot mint certificates the
+      # daemon would trust.
+      PGCA=/run/ai-memory-pgca
+      wipe_pgca() { rm -rf "$PGCA"; }
+      trap wipe_pgca EXIT
       install -d -o root -g aimemory -m 0750 "$TLSD"
+      # An earlier image kept the CA key here: remove it unconditionally.
+      rm -f "$TLSD/pg-ca.key" "$TLSD/pg-ca.srl"
       if [ ! -s "$TLSD/pg-ca.crt" ] || [ ! -s "$PGTLS/server.key" ]; then
+        # #4698: the key may only be written to RAM: refuse unless /run is
+        # tmpfs and no swap device is active.
+        [ "$(findmnt -n -o FSTYPE --target /run)" = tmpfs ] \
+          || { echo "/run is not tmpfs: refusing to write the CA key"; exit 1; }
+        [ -z "$(swapon --show --noheadings)" ] \
+          || { echo "swap is active: refusing to write the CA key"; exit 1; }
+        wipe_pgca
+        install -d -m 0700 "$PGCA"
         ( umask 077
-          openssl genrsa -out "$TLSD/pg-ca.key" 4096
-          openssl req -x509 -new -key "$TLSD/pg-ca.key" -sha256 -days 365 \
-            -subj "/CN=ai-memory-burst-pg-CA" -out "$TLSD/pg-ca.crt"
-          openssl genrsa -out "$TLSD/pg-server.key" 2048
-          openssl req -new -key "$TLSD/pg-server.key" -subj "/CN=localhost" \
-            -out "$TLSD/pg-server.csr"
+          openssl genrsa -out "$PGCA/pg-ca.key" 4096
+          openssl req -x509 -new -key "$PGCA/pg-ca.key" -sha256 -days 365 \
+            -subj "/CN=ai-memory-burst-pg-CA" -out "$PGCA/pg-ca.crt"
+          openssl genrsa -out "$PGCA/pg-server.key" 2048
+          openssl req -new -key "$PGCA/pg-server.key" -subj "/CN=localhost" \
+            -out "$PGCA/pg-server.csr"
           printf 'subjectAltName=DNS:localhost,IP:127.0.0.1,IP:0:0:0:0:0:0:0:1\n' \
-            > "$TLSD/pg-server.ext"
-          openssl x509 -req -in "$TLSD/pg-server.csr" -CA "$TLSD/pg-ca.crt" \
-            -CAkey "$TLSD/pg-ca.key" -CAcreateserial -days 365 -sha256 \
-            -extfile "$TLSD/pg-server.ext" -out "$TLSD/pg-server.crt" ) \
+            > "$PGCA/pg-server.ext"
+          openssl x509 -req -in "$PGCA/pg-server.csr" -CA "$PGCA/pg-ca.crt" \
+            -CAkey "$PGCA/pg-ca.key" -CAcreateserial -days 365 -sha256 \
+            -extfile "$PGCA/pg-server.ext" -out "$PGCA/pg-server.crt" ) \
           || { echo "could not mint the postgres TLS pair"; exit 1; }
+        install -o root -g aimemory -m 0644 "$PGCA/pg-ca.crt" "$TLSD/pg-ca.crt"
         install -d -o postgres -g postgres -m 0700 "$PGTLS"
-        install -o postgres -g postgres -m 0600 "$TLSD/pg-server.key" "$PGTLS/server.key"
-        install -o postgres -g postgres -m 0644 "$TLSD/pg-server.crt" "$PGTLS/server.crt"
-        rm -f "$TLSD/pg-server.key" "$TLSD/pg-server.csr" "$TLSD/pg-server.ext" "$TLSD/pg-server.crt"
+        install -o postgres -g postgres -m 0600 "$PGCA/pg-server.key" "$PGTLS/server.key"
+        install -o postgres -g postgres -m 0644 "$PGCA/pg-server.crt" "$PGTLS/server.crt"
+        wipe_pgca
       fi
       # The service user reads only the CA certificate (the trust anchor).
       chown root:aimemory "$TLSD/pg-ca.crt"
@@ -196,14 +219,17 @@ write_files:
           "ssl_cert_file = '$PGTLS/server.crt'" "ssl_key_file = '$PGTLS/server.key'" \
           "ssl_min_protocol_version = 'TLSv1.2'" >> "$PGCONF"
       fi
-      # aimemory may only connect with TLS over TCP: hostssl lines first, then
-      # a reject for any non-TLS TCP attempt (first matching line wins).
+      # No role may log in to any database over TCP without TLS (#4676): the
+      # first line rejects every non-TLS TCP attempt (hostnossl, all roles, all
+      # databases, all addresses), so the packaged `host all all` lines below
+      # are only reachable over TLS (first matching line wins). Unix-socket
+      # `local` lines are unaffected.
       HBA="/etc/postgresql/18/main/pg_hba.conf"
       if ! grep -q "^# ai-memory-tls (#4635)" "$HBA"; then
         { printf '%s\n' "# ai-memory-tls (#4635)" \
+            "hostnossl all all all reject" \
             "hostssl aimemory aimemory 127.0.0.1/32 scram-sha-256" \
-            "hostssl aimemory aimemory ::1/128 scram-sha-256" \
-            "hostnossl aimemory aimemory all reject"
+            "hostssl aimemory aimemory ::1/128 scram-sha-256"
           cat "$HBA"; } > "$HBA.new"
         chown --reference="$HBA" "$HBA.new"
         chmod --reference="$HBA" "$HBA.new"
@@ -221,6 +247,7 @@ write_files:
       # stops the script instead of falling through to CREATE DATABASE.
       DB_PASS="$(sed -n 's#^postgres://aimemory:\([^@]*\)@.*#\1#p' /etc/ai-memory/store-url)"
       [ -n "$DB_PASS" ] || { echo "no db password in /etc/ai-memory/store-url"; exit 1; }
+      [ "$DB_PASS" != CHANGEME ] || { echo "placeholder db password in /etc/ai-memory/store-url"; exit 1; }
       sudo -u postgres psql -tc "SELECT 1 FROM pg_roles WHERE rolname='aimemory'" | grep -q 1 || \
         printf '%s' "$DB_PASS" \
           | python3 -c 'import sys,urllib.parse as u;p=u.unquote(sys.stdin.read());q=chr(39);print("CREATE USER aimemory WITH PASSWORD "+q+p.replace(q,q+q)+q+";")' \
@@ -243,12 +270,11 @@ write_files:
       chown root:root /etc/ai-memory/api-key
       chmod 0600 /etc/ai-memory/api-key
       API_KEY="$(cat /etc/ai-memory/api-key)"
-      CFG_DIR=/opt/ai-memory/.config/ai-memory
-      install -d -o aimemory -g aimemory -m 0750 /opt/ai-memory/.config "$CFG_DIR"
-      ( umask 077; printf 'schema_version = 2\napi_key = "%s"\n' "$API_KEY" > "$CFG_DIR/config.toml" ) \
+      # #4695: the config lives in the service-owned home, so it is written by
+      # the service user (never by root through a path it controls); the key
+      # reaches it on stdin.
+      printf '%s' "$API_KEY" | runuser -u aimemory -- bash -c 'umask 077 && d=/opt/ai-memory/.config/ai-memory && mkdir -p "$d" && k="$(cat)" && printf "schema_version = 2\napi_key = \"%s\"\n" "$k" > "$d/config.toml.new" && mv -f "$d/config.toml.new" "$d/config.toml"' \
         || { echo "could not write the daemon config"; exit 1; }
-      chown root:aimemory "$CFG_DIR/config.toml"
-      chmod 0640 "$CFG_DIR/config.toml"
 
       # --- self-signed TLS pair for the listener (--tls-cert/--tls-key) ----
       install -d -o root -g aimemory -m 0750 /etc/ai-memory/tls
@@ -275,10 +301,20 @@ write_files:
       curl -fsSL "${ai_memory_image_url}" -o "$DL/ai-memory.tar.gz"
       echo "${ai_memory_image_sha256}  $DL/ai-memory.tar.gz" | sha256sum -c - \
         || { echo "ai-memory tarball digest mismatch"; rm -f "$DL/ai-memory.tar.gz"; exit 1; }
-      tar -xzf "$DL/ai-memory.tar.gz" --no-same-owner -C /opt/ai-memory/bin
-      chmod 0755 /opt/ai-memory/bin/ai-memory
-      chown -R aimemory:aimemory /opt/ai-memory/bin
-      runuser -u aimemory -- /opt/ai-memory/bin/ai-memory --version
+      # #4665: extract only the one member into a root-only staging dir (never
+      # into a directory the service user can write). #4697: the member must be
+      # a regular file, not a symlink install would dereference. #4696: the
+      # binary goes to a root-owned prefix outside the service home, so the
+      # service user cannot rename its directory aside and substitute it.
+      rm -rf "$DL/x"
+      install -d -m 0700 "$DL/x"
+      tar -xzf "$DL/ai-memory.tar.gz" --no-same-owner -C "$DL/x" ai-memory
+      [ -f "$DL/x/ai-memory" ] && [ ! -L "$DL/x/ai-memory" ] \
+        || { echo "tarball member ai-memory is not a regular file"; exit 1; }
+      install -d -o root -g root -m 0755 /usr/local/lib/ai-memory /usr/local/lib/ai-memory/bin
+      install -o root -g root -m 0755 "$DL/x/ai-memory" /usr/local/lib/ai-memory/bin/ai-memory
+      rm -rf "$DL/x"
+      runuser -u aimemory -- /usr/local/lib/ai-memory/bin/ai-memory --version
 
       systemctl daemon-reload
       systemctl enable --now ai-memory
