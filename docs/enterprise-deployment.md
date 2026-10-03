@@ -266,9 +266,11 @@ correct as written. On any Postgres-backed topology (T3+) use `pg_dump`
 / `pg_basebackup` instead — `ai-memory backup` is SQLite-only and now
 REFUSES a Postgres store rather than emitting a plausible-looking empty
 snapshot ([#2444](https://github.com/alphaonedev/ai-memory-mcp/issues/2444)).
-Add `--store-url "$AI_MEMORY_STORE_URL"` to any backup cron on a host
-that might be re-pointed at Postgres, so the command fails loudly on the
-day it is.
+Export `AI_MEMORY_STORE_URL_FILE` (or `AI_MEMORY_STORE_URL`) in the environment of
+any backup cron on a host that might be re-pointed at Postgres, so the command
+fails loudly on the day it is: `backup` resolves the store from those channels
+itself (`src/cli/backup.rs:1112`). Do not copy the variable onto the command line
+as `--store-url "$AI_MEMORY_STORE_URL"`; that puts the password in argv.
 
 ### 2.7 When to graduate
 
@@ -471,6 +473,8 @@ Bootstrap a fresh postgres backend with:
 ```bash
 ai-memory schema-init --store-url postgres://aimemory:PWD@hub.dc1.internal:5432/aimemory
 ```
+
+`schema-init` has no non-argv channel for its URL (`src/cli/schema_init.rs:111-112`, tracked in [#4600](https://github.com/alphaonedev/ai-memory-mcp/issues/4600)), so the password is visible in `ps` for the seconds this one-shot command runs; run it from a single-user admin host.
 
 Opening the store runs the idempotent `postgres_schema.sql` bootstrap
 plus the in-process upgrade ladder to schema v91 as a side effect. The
@@ -760,10 +764,16 @@ as a secret surface in the §14 hardening checklist.
 
 #### 5.6.5 Reconciling the daemon pool with PgBouncer
 
-Point each daemon at PgBouncer instead of the primary:
+Point each daemon at PgBouncer instead of the primary. Put the URL in the
+`0600` file the daemon reads through `AI_MEMORY_STORE_URL_FILE` (not on
+`--store-url`, whose argv any local UID can read from `/proc/<pid>/cmdline`;
+`src/store_url.rs:137`, [#4577](https://github.com/alphaonedev/ai-memory-mcp/issues/4577)):
 
 ```
---store-url postgres://aimemory:PWD@pgbouncer.rackA.internal:6432/aimemory
+# /etc/ai-memory/store-url   (mode 0600, owned by the service user, one line)
+postgres://aimemory:PWD@pgbouncer.rackA.internal:6432/aimemory
+
+# unit:  Environment=AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url
 ```
 
 Then size the two pools so the daemon fleet never starves PgBouncer
