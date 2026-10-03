@@ -87,8 +87,8 @@ variable "ai_memory_image_url" {
   type        = string
 
   validation {
-    condition     = !strcontains(var.ai_memory_image_url, "/releases/latest/")
-    error_message = "ai_memory_image_url must be a versioned release URL; /releases/latest/ moves and would not match ai_memory_image_sha256."
+    condition     = startswith(var.ai_memory_image_url, "https://") && length(var.ai_memory_image_url) > length("https://") && !strcontains(var.ai_memory_image_url, "%") && !strcontains(lower(var.ai_memory_image_url), "/releases/latest")
+    error_message = "ai_memory_image_url must be a non-empty https:// URL of a versioned release, with no percent-encoding; /releases/latest moves (in any letter case) and would not match ai_memory_image_sha256."
   }
 }
 
@@ -236,10 +236,12 @@ resource "aws_instance" "memory" {
   subnet_id              = aws_subnet.burst.id
   vpc_security_group_ids = [aws_security_group.burst.id]
 
-  user_data = templatefile("${path.module}/cloud-init-memory.yaml.tpl", {
+  # #4703: the rendered template is over the 16 KB EC2 user-data limit, so it
+  # is sent gzip-compressed (cloud-init detects gzip user data).
+  user_data_base64 = base64gzip(templatefile("${path.module}/cloud-init-memory.yaml.tpl", {
     ai_memory_image_url    = var.ai_memory_image_url
     ai_memory_image_sha256 = var.ai_memory_image_sha256
-  })
+  }))
 
   root_block_device {
     volume_type = "gp3"

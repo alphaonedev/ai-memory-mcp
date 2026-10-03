@@ -84,7 +84,7 @@ write_files:
       Environment=AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url
       Environment=AI_MEMORY_PERMISSIONS_MODE=enforce
       Environment=AI_MEMORY_AUTONOMOUS_HOOKS=1
-      ExecStart=/opt/ai-memory/bin/ai-memory serve --host 0.0.0.0 --port 9077 --tls-cert /etc/ai-memory/tls/node.crt --tls-key /etc/ai-memory/tls/node.key
+      ExecStart=/usr/local/lib/ai-memory/bin/ai-memory serve --host 0.0.0.0 --port 9077 --tls-cert /etc/ai-memory/tls/node.crt --tls-key /etc/ai-memory/tls/node.key
       Restart=on-failure
 
       [Install]
@@ -102,11 +102,11 @@ write_files:
 
       # --- user + dirs ---
       id aimemory >/dev/null 2>&1 || useradd -m -d /opt/ai-memory -s /bin/bash aimemory
-      # #4665: the service owns its home, but NOT bin: the binary is installed
-      # root-owned below and must never be re-chowned to the service user.
-      install -d -o root -g root -m 0755 /opt/ai-memory/bin
-      find /opt/ai-memory -path /opt/ai-memory/bin -prune -o \
-        -exec chown aimemory:aimemory {} +
+      # #4695: useradd -m made the home service-owned. Root never chowns, writes
+      # or walks a path inside it (the service user could plant a symlink there);
+      # it only checks the owner. The binary lives outside it (#4696).
+      [ "$(stat -c %U /opt/ai-memory)" = aimemory ] \
+        || { echo "/opt/ai-memory is not owned by aimemory"; exit 1; }
       # #4577/#4619: the service user traverses /etc/ai-memory and owns the DSN
       # file (mode stays 0600).
       chown root:aimemory /etc/ai-memory
@@ -176,6 +176,12 @@ write_files:
       # An earlier image kept the CA key here: remove it unconditionally.
       rm -f "$TLSD/pg-ca.key" "$TLSD/pg-ca.srl"
       if [ ! -s "$TLSD/pg-ca.crt" ] || [ ! -s "$PGTLS/server.key" ]; then
+        # #4698: the key may only be written to RAM: refuse unless /run is
+        # tmpfs and no swap device is active.
+        [ "$(findmnt -n -o FSTYPE --target /run)" = tmpfs ] \
+          || { echo "/run is not tmpfs: refusing to write the CA key"; exit 1; }
+        [ -z "$(swapon --show --noheadings)" ] \
+          || { echo "swap is active: refusing to write the CA key"; exit 1; }
         wipe_pgca
         install -d -m 0700 "$PGCA"
         ( umask 077
@@ -259,12 +265,11 @@ write_files:
       chown root:root /etc/ai-memory/api-key
       chmod 0600 /etc/ai-memory/api-key
       API_KEY="$(cat /etc/ai-memory/api-key)"
-      CFG_DIR=/opt/ai-memory/.config/ai-memory
-      install -d -o aimemory -g aimemory -m 0750 /opt/ai-memory/.config "$CFG_DIR"
-      ( umask 077; printf 'schema_version = 2\napi_key = "%s"\n' "$API_KEY" > "$CFG_DIR/config.toml" ) \
+      # #4695: the config lives in the service-owned home, so it is written by
+      # the service user (never by root through a path it controls); the key
+      # reaches it on stdin.
+      printf '%s' "$API_KEY" | runuser -u aimemory -- bash -c 'umask 077 && d=/opt/ai-memory/.config/ai-memory && mkdir -p "$d" && k="$(cat)" && printf "schema_version = 2\napi_key = \"%s\"\n" "$k" > "$d/config.toml.new" && mv -f "$d/config.toml.new" "$d/config.toml"' \
         || { echo "could not write the daemon config"; exit 1; }
-      chown root:aimemory "$CFG_DIR/config.toml"
-      chmod 0640 "$CFG_DIR/config.toml"
 
       # --- self-signed TLS pair for the listener (--tls-cert/--tls-key) ----
       install -d -o root -g aimemory -m 0750 /etc/ai-memory/tls
@@ -292,16 +297,19 @@ write_files:
       echo "${ai_memory_image_sha256}  $DL/ai-memory.tar.gz" | sha256sum -c - \
         || { echo "ai-memory tarball digest mismatch"; rm -f "$DL/ai-memory.tar.gz"; exit 1; }
       # #4665: extract only the one member into a root-only staging dir (never
-      # into a directory the service user can write), then install a root-owned
-      # binary the service cannot modify; no root chmod/tar touches a path the
-      # service controls.
+      # into a directory the service user can write). #4697: the member must be
+      # a regular file, not a symlink install would dereference. #4696: the
+      # binary goes to a root-owned prefix outside the service home, so the
+      # service user cannot rename its directory aside and substitute it.
       rm -rf "$DL/x"
       install -d -m 0700 "$DL/x"
       tar -xzf "$DL/ai-memory.tar.gz" --no-same-owner -C "$DL/x" ai-memory
-      install -d -o root -g root -m 0755 /opt/ai-memory/bin
-      install -o root -g root -m 0755 "$DL/x/ai-memory" /opt/ai-memory/bin/ai-memory
+      [ -f "$DL/x/ai-memory" ] && [ ! -L "$DL/x/ai-memory" ] \
+        || { echo "tarball member ai-memory is not a regular file"; exit 1; }
+      install -d -o root -g root -m 0755 /usr/local/lib/ai-memory /usr/local/lib/ai-memory/bin
+      install -o root -g root -m 0755 "$DL/x/ai-memory" /usr/local/lib/ai-memory/bin/ai-memory
       rm -rf "$DL/x"
-      runuser -u aimemory -- /opt/ai-memory/bin/ai-memory --version
+      runuser -u aimemory -- /usr/local/lib/ai-memory/bin/ai-memory --version
 
       systemctl daemon-reload
       systemctl enable --now ai-memory
