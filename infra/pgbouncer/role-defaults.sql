@@ -1,11 +1,13 @@
 -- ai-memory — PgBouncer role-default timeouts (v0.8.0 Pillar-4 4.B, #1736).
 --
--- The per-session statement_timeout / lock_timeout that ai-memory sets in its
--- sqlx `after_connect` hook (src/store/postgres.rs) do NOT survive PgBouncer's
--- inter-transaction `DISCARD ALL` under transaction-mode pooling — a pooled
--- backend is reset between transactions, dropping the session GUCs. The robust
--- path is server-side role defaults: set them on the role so every backend the
--- pooler hands out already carries them.
+-- ai-memory sets statement_timeout / lock_timeout per session in its sqlx
+-- `after_connect` hook (src/store/postgres.rs). In `session` pool mode (the only
+-- supported mode, #4667) each client keeps its own backend and that hook is
+-- enough. Setting the same values as role defaults means a backend the client
+-- did not itself configure starts with them too; it is the narrowing step in
+-- docs/enterprise-deployment.md section 5.6.7 for deployments that ran
+-- transaction mode, where those per-session SETs can land on another client's
+-- backend.
 --
 -- Values quote the binary's compiled defaults:
 --   DEFAULT_STATEMENT_TIMEOUT_SECS = 30  (src/store/postgres.rs)

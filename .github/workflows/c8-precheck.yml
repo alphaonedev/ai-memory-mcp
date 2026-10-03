@@ -475,6 +475,31 @@ jobs:
         # the stale-entry hard-fail, and the empty-scan fail-closed.
         run: bash scripts/check-capacity-claims.sh --self-test
 
+  pgbouncer-pool-mode-claim-gate:
+    # #4667 (5-agent vote 4d3ea1c5, decision memory b6ed2e38). docs section 5.6
+    # once called PgBouncer `pool_mode = transaction` REQUIRED while the
+    # Postgres adapter keeps state on the server session (migration advisory
+    # lock, search_path, statement_timeout) and is not safe behind a
+    # transaction pooler (scripts/probe-pgbouncer-pool-mode.py exits 1). The
+    # shipped template infra/pgbouncer/pgbouncer.ini is now the single source
+    # of truth and this gate fails when an operator-facing document claims a
+    # different pool mode. Transaction mode returns with #4679.
+    name: PgBouncer pool-mode claim gate (#4667)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Run pool-mode claim gate
+        run: python3 scripts/check-pgbouncer-pool-mode-claims.py
+      - name: Self-test the gate (regression evidence)
+        # Plants the #4667 defect (a guide that says transaction while the
+        # template says session) and a flipped template; both MUST fail. Near
+        # misses MUST pass (a not-supported note, an earlier-revision quote, a
+        # frozen tree, a transaction word with no pooler named), and a guide
+        # with no pool_mode line, a template with two active lines and a
+        # non-PgBouncer mode MUST fail closed (exit 2).
+        run: python3 scripts/check-pgbouncer-pool-mode-claims.py --self-test
+
   benchmark-claim-gate:
     # CERT GATE (TRUTHFULNESS; #2879, following #2869 + CERT-GATE-2
     # #2629/#2492). The final cert vote caught `ROADMAP.md` §9.5 still

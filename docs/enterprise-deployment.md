@@ -668,17 +668,30 @@ some queries but the production guidance at v0.7.0 is:
   ([`postgres-age-guide.md §"AGE Cypher vs CTE fallback"`](postgres-age-guide.html);
   `PERFORMANCE.md` §"AGE-vs-CTE speedup").
 
-### 5.6 Connection pooling (PgBouncer enters at T4)
+### 5.6 Connection pooling (PgBouncer is optional at T4, session mode only)
+
+> **Status (#4667).** The supported pool mode behind the Postgres adapter is
+> `pool_mode = session`, or no pooler at all. `transaction` mode (the mode
+> earlier revisions of this section prescribed) and `statement` mode are not
+> supported today. The reason is measured, not assumed: the adapter keeps state
+> on the server session, and two clients that share one server backend see each
+> other's state (§5.6.6, with the probe output). Making the adapter safe under
+> transaction pooling is tracked in
+> [#4679](https://github.com/alphaonedev/ai-memory-mcp/issues/4679); this section
+> returns to transaction mode only when the probe in §5.6.6 is green on a
+> transaction-mode pooler. Decision: 5-agent vote (4d3ea1c5), memory
+> `b6ed2e38-4e37-4cd9-997e-49bb99d241c0`.
 
 #### 5.6.1 The two pools — daemon-side vs. server-side
 
-There are **two distinct pools** in a T4+ deployment, and operators
-must not conflate them:
+There are **two distinct pools** in a deployment that uses a pooler, and
+operators must not conflate them:
 
 1. **The per-daemon `sqlx` pool** (inside each ai-memory process).
    Compiled defaults are carried by `PoolConfig` (`src/store/mod.rs`):
-   `DEFAULT_MIN_CONNECTIONS`, `DEFAULT_MAX_CONNECTIONS`, and
-   `DEFAULT_ACQUIRE_TIMEOUT_SECS`. The sizing is operator-tunable via
+   `DEFAULT_MIN_CONNECTIONS` = 2, `DEFAULT_MAX_CONNECTIONS` = 16
+   (`src/store/mod.rs:111`) and `DEFAULT_ACQUIRE_TIMEOUT_SECS` = 30. The sizing
+   is operator-tunable via
    `AI_MEMORY_PG_POOL_MIN` / `AI_MEMORY_PG_POOL_MAX` /
    `AI_MEMORY_PG_ACQUIRE_TIMEOUT_SECS` (or the matching
    `postgres_pool_min_connections` / `postgres_pool_max_connections` /
@@ -688,37 +701,42 @@ must not conflate them:
    This pool bounds how many connections **one** daemon will open.
 
 2. **The PgBouncer server-side pool** (a separate process in front of
-   the primary). This bounds how many connections reach Postgres
-   **in aggregate** across every daemon, fanning many client
-   connections into a small set of server connections.
+   the primary). In `session` mode every client connection holds one server
+   connection for its whole life, so this pool does **not** fan many clients
+   into few server connections: with a daemon running through it, the PgBouncer
+   `SHOW POOLS` row read `cl_active = 4`, `sv_active = 4` (§5.6.6, step 2). What
+   it bounds is how many server connections it will open per `(user, db)`
+   (`default_pool_size`); a client past that number waits in PgBouncer's queue
+   (§5.6.6, the `session` row with `default_pool_size = 1`).
 
-At T4, with multiple daemons pointing at the same primary, the summed
-per-daemon `max_connections` can exceed the Postgres `max_connections`
-ceiling (§10.2). PgBouncer is the middleman that decouples the two.
+Because the two pools do not multiply down, the Postgres `max_connections`
+ceiling (§10.2) applies to the daemons' summed pool sizes whether or not a
+pooler is present. §5.6.5 gives the sizing rule and the T4 and T5 numbers.
 
 #### 5.6.2 What PgBouncer is — and is NOT
 
-- **It IS** a lightweight, config-only connection multiplexer. It
-  requires **zero ai-memory code changes** — the daemon speaks ordinary
-  libpq to it. Adopting PgBouncer is purely an ops-layer decision; the
-  `--store-url` is the only thing the daemon sees change.
+- **It IS** a config-only connection pass-through that needs no ai-memory code
+  change: the #4667 proof ran an unmodified ai-memory 1.0.0 daemon through it,
+  pointed at it by the store URL (with the TLS parameters the adapter demands,
+  §5.6.3). Adopting it is an ops-layer decision.
 - **It is NOT** a replication, failover, sharding, or load-balancing
-  layer. It does not read your queries, does not cache results, and
-  does not change AGE/Cypher semantics. Pair it with streaming
-  replication (§5.3) for HA — PgBouncer alone gives you fan-in, not
-  redundancy.
+  layer. It does not change AGE/Cypher semantics. Pair it with streaming
+  replication (§5.3) for HA; PgBouncer alone gives you neither fan-in (in
+  session mode) nor redundancy.
 - **It is NOT** a substitute for tuning the per-daemon pool. The two
-  pools compose; see the reconciliation in §5.6.5.
+  pools compose as §5.6.5 states.
 
 #### 5.6.3 Minimal `pgbouncer.ini`
 
 > **Copy-deployable templates (v0.8.0 Pillar-4 4.B, #1736):**
 > [`infra/pgbouncer/`](../infra/pgbouncer/) materializes this section into
 > runnable artifacts — `pgbouncer.ini`, `userlist.txt`, `role-defaults.sql`,
-> a `docker-compose.yml`, and a `smoke-test.sh` that proves an AGE cypher
-> transaction + the role-default timeouts survive transaction-mode pooling.
+> a `docker-compose.yml`, and a `smoke-test.sh` that runs an AGE cypher
+> transaction through the pooler and asserts the pooler reports session mode.
 
-`transaction` pooling mode is **REQUIRED** (rationale in §5.6.4):
+The supported mode is `session`. The documented mode is pinned to
+`infra/pgbouncer/pgbouncer.ini` by `scripts/check-pgbouncer-pool-mode-claims.py`
+(run in CI), so this block and the template cannot disagree.
 
 ```ini
 [databases]
@@ -729,13 +747,28 @@ listen_addr = 0.0.0.0
 listen_port = 6432
 auth_type = scram-sha-256
 auth_file = /etc/pgbouncer/userlist.txt
-pool_mode = transaction          ; REQUIRED — see 5.6.4
+pool_mode = session              ; supported mode, see 5.6.6
 max_client_conn = 1000           ; client-facing admission ceiling
-default_pool_size = 25           ; server conns per (user,db) pair
-reserve_pool_size = 5            ; burst headroom above default_pool_size
-server_tls_sslmode = verify-full ; mTLS to the primary (§14)
-client_tls_sslmode = verify-full ; mTLS from the daemons (§14)
+default_pool_size = 16           ; server conns per (user,db) pair: sum of the daemons' AI_MEMORY_PG_POOL_MAX
+reserve_pool_size = 4            ; burst headroom above default_pool_size
+client_tls_sslmode = require     ; the daemon pins verify-full, see below
+client_tls_key_file = /etc/pgbouncer/tls/server.key
+client_tls_cert_file = /etc/pgbouncer/tls/server.crt
 ```
+
+Authentication: the #4667 proof used `auth_type = md5` (the shipped template);
+`scram-sha-256` above was not exercised by it, so this section makes no claim
+about it beyond PgBouncer's own documentation.
+
+TLS to the daemon: the adapter refuses a store URL that does not pin
+`sslmode=verify-full` (`src/store/postgres.rs:2698`,
+`src/store/postgres/dsn.rs:283`, #3705), so the pooler must serve TLS to its
+clients and the daemon's URL must carry `sslmode=verify-full` and the CA that
+signed the pooler's certificate (`sslrootcert=`). The #4667 proof ran exactly
+that with `client_tls_sslmode = require` and a throwaway CA. TLS from the
+pooler to Postgres (`server_tls_sslmode`) and client-certificate verification
+(`client_tls_sslmode = verify-full`) were not exercised by that proof, so this
+section makes no claim about them; see §14 for the TLS hardening checklist.
 
 #### 5.6.4 `userlist.txt` (SCRAM, no plaintext)
 
@@ -753,7 +786,7 @@ chmod 0600 /etc/pgbouncer/userlist.txt
 The file is mode `0600`, owned by the PgBouncer service user. Treat it
 as a secret surface in the §14 hardening checklist.
 
-#### 5.6.5 Reconciling the daemon pool with PgBouncer
+#### 5.6.5 Reconciling the daemon pool with PgBouncer, and the sizing rule
 
 Point each daemon at PgBouncer instead of the primary. Put the URL in the
 `0600` file the daemon reads through `AI_MEMORY_STORE_URL_FILE` (not on
@@ -762,85 +795,139 @@ Point each daemon at PgBouncer instead of the primary. Put the URL in the
 
 ```
 # /etc/ai-memory/store-url   (mode 0600, owned by the service user, one line)
-postgres://aimemory:PWD@pgbouncer.rackA.internal:6432/aimemory
+postgres://aimemory:PWD@pgbouncer.rackA.internal:6432/aimemory?sslmode=verify-full&sslrootcert=/etc/ai-memory/pooler-ca.crt
 
 # unit:  Environment=AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url
 ```
 
-Then size the two pools so the daemon fleet never starves PgBouncer
-and PgBouncer never overruns Postgres:
+**Sizing rule (applies with or without a pooler):**
+
+```
+sum over all daemons of AI_MEMORY_PG_POOL_MAX
+    <= max_connections - superuser_reserved_connections
+```
+
+`superuser_reserved_connections` is 3 by default (`SHOW superuser_reserved_connections` on the PostgreSQL 18.6 server used for
+the #4667 proof returned 3, and that server was started with
+`max_connections=100`). Leave
+further headroom for every other client of the same server (replication
+tooling, backups, monitoring, an operator's `psql`); the rule bounds the
+daemons alone. Behind a `session`-mode pooler, `default_pool_size` for a
+`(user, db)` pair must also cover the sum of the `AI_MEMORY_PG_POOL_MAX` of the
+daemons using that pair, and `max_client_conn` must be at least that sum, or a
+daemon's connections queue in PgBouncer.
+
+**Recalculated for the tiers in §1** (per-daemon default `AI_MEMORY_PG_POOL_MAX`
+= `DEFAULT_MAX_CONNECTIONS` = 16, `src/store/mod.rs:111`; instance counts from the
+§1 table; `max_connections` from §10.2; `superuser_reserved_connections` = 3):
+
+| Tier | Daemons (§1) | Sum at the default pool (x 16) | `max_connections` (§10.2) | Available to daemons | Result |
+|---|---|---|---|---|---|
+| T4 | 5–15 | 80–240 | 200 | 197 | Fits up to 12 daemons (192). At 13–15 daemons the default sum (208–240) is over 197: lower `AI_MEMORY_PG_POOL_MAX` (at 15 daemons, 13 gives 195) or raise `max_connections`. |
+| T5 | 15–50 | 240–800 | 500 (the "raise to 500 at T5+" in §10.2) | 497 | Fits up to 31 daemons (496). At 32–50 daemons the default sum (512–800) is over 497: lower `AI_MEMORY_PG_POOL_MAX` (at 50 daemons, 9 gives 450) or raise `max_connections` further. The T4 value of 200 does not fit even the 15-daemon T5 minimum (240). |
+
+These are upper bounds: a daemon opens up to `AI_MEMORY_PG_POOL_MAX` connections
+under load and holds `AI_MEMORY_PG_POOL_MIN` (default 2) when idle. Lowering the
+cap trades peak per-daemon concurrency for fitting the server; raising
+`max_connections` costs server memory (§10.1).
 
 | Layer | Knob | Sizing rule |
 |---|---|---|
-| Daemon `sqlx` pool | `AI_MEMORY_PG_POOL_MAX` (→ `postgres_pool_max_connections` → `DEFAULT_MAX_CONNECTIONS`) | Per-daemon ceiling. Keep at the compiled default unless one daemon is provably the bottleneck; raising it on every daemon just pushes contention down to PgBouncer. |
-| Daemon `sqlx` pool | `AI_MEMORY_PG_POOL_MIN` (→ `postgres_pool_min_connections` → `DEFAULT_MIN_CONNECTIONS`) | Warm-connection floor per daemon. With PgBouncer fronting, a low floor is fine — PgBouncer keeps server conns warm. |
-| Daemon `sqlx` pool | `AI_MEMORY_PG_ACQUIRE_TIMEOUT_SECS` (→ `postgres_acquire_timeout_secs` → `DEFAULT_ACQUIRE_TIMEOUT_SECS`) | How long a daemon waits for a client slot before erroring. Keep ≥ PgBouncer's `query_wait_timeout` so the daemon doesn't give up before PgBouncer can hand it a server connection. |
-| PgBouncer | `default_pool_size` | Server conns per `(user, db)`. The sum across pools must stay below Postgres `max_connections` (§10.2) minus the superuser reserve. |
-| PgBouncer | `max_client_conn` | Total client admission. Set ≥ Σ(per-daemon `AI_MEMORY_PG_POOL_MAX`) across the fleet so no daemon is refused at the door. |
+| Daemon `sqlx` pool | `AI_MEMORY_PG_POOL_MAX` (→ `postgres_pool_max_connections` → `DEFAULT_MAX_CONNECTIONS`) | Per-daemon ceiling and the term in the sizing rule above. Keep the compiled default while the sum fits; lower it on every daemon when it does not. |
+| Daemon `sqlx` pool | `AI_MEMORY_PG_POOL_MIN` (→ `postgres_pool_min_connections` → `DEFAULT_MIN_CONNECTIONS`) | Warm-connection floor per daemon (default 2). |
+| Daemon `sqlx` pool | `AI_MEMORY_PG_ACQUIRE_TIMEOUT_SECS` (→ `postgres_acquire_timeout_secs` → `DEFAULT_ACQUIRE_TIMEOUT_SECS`) | How long a daemon waits for a free pool slot before erroring (default 30 s). |
+| PgBouncer | `default_pool_size` | Server connections per `(user, db)`; at least the sum of the daemons' `AI_MEMORY_PG_POOL_MAX` using that pair. |
+| PgBouncer | `max_client_conn` | Client admission; at least the same sum. |
 
-**Invariant:** `Σ(daemon AI_MEMORY_PG_POOL_MAX) ≤ max_client_conn`, and
-`default_pool_size + reserve_pool_size ≤ Postgres max_connections −
-superuser_reserved_connections`. Violating the first starves daemons at
-connect time; violating the second makes Postgres itself refuse
-PgBouncer.
+#### 5.6.6 Why `session` mode — the executed evidence
 
-#### 5.6.6 Why `transaction` mode is the only correct choice
+`scripts/probe-pgbouncer-pool-mode.py` opens two real client sessions (A and B)
+through the pooler under test, with `default_pool_size` small enough that they
+can share one server backend. It reads the migration advisory-lock key from the
+adapter source and checks three things: whether B is also granted the migration
+lock A holds, whether B sees A's `search_path`, and whether B sees A's
+`statement_timeout`. It exits 0 when none is observed, 1 when any is, 2 when it
+could not run. The adapter state it checks is real: the migration lock is a
+session-level `pg_try_advisory_lock`
+(`src/store/postgres.rs:2154`, taken at `:2825` and `:3871`, released by
+`pg_advisory_unlock_all` at `:2160`); the connect hook sets
+`search_path` with `set_config(.., false)` (`:2765`) and `statement_timeout` /
+`lock_timeout` with plain `SET` (`:2776`).
 
-- **`session` mode** pins one server connection per client for the
-  client's whole session — that forfeits the entire fan-in benefit
-  (you get a 1:1 passthrough with extra latency). Pointless here.
-- **`statement` mode** forbids any multi-statement transaction — it
-  would break the daemon's few multi-statement reads (e.g. the AGE
-  Cypher projection consistency dance in §5.5 and the bulk-ingest
-  transaction in `src/store/postgres.rs`). It WILL produce runtime
-  errors. Never use it.
-- **`transaction` mode** returns the server connection to the pool at
-  each `COMMIT`/`ROLLBACK`. The daemon's transactions are short and
-  self-contained, so this is the correct, lossless mode. Confirm with
-  `SHOW POOLS;` on the PgBouncer admin console (`psql -p 6432
-  pgbouncer`) that `pool_mode` reads `transaction` after any config
-  reload.
+Results of the #4667 run (PgBouncer 1.23.1, PostgreSQL 18.6, probe exit code in
+brackets):
 
-> **Caveat — server-side prepared statements.** `transaction` mode
-> shares server connections across clients, so session-scoped
-> server-side prepared statements are not guaranteed to survive across
-> transactions. ai-memory's sqlx layer pins query plans via the
-> generic-plan path (#1472 follow-on, see CLAUDE.md) rather than
-> relying on long-lived named prepared statements, so it is compatible;
-> if you add a custom query path, do not assume a named prepared
-> statement persists beyond its transaction under PgBouncer.
+| `pool_mode` | `default_pool_size` | Result |
+|---|---|---|
+| `transaction` | 1 | **UNSAFE** [1]: A and B shared backend pid 79; B got `pg_try_advisory_lock = t`, saw A's `search_path`, saw A's `statement_timeout = 7777ms`. |
+| `statement` | 2 | **UNSAFE** [1]: the same three hazards. A plain `BEGIN` is also refused: `FATAL: transaction blocks not allowed in statement pooling mode`. |
+| `session` | 2 | **SAFE** [0]: separate backends (82, 83); B got `pg_try_advisory_lock = f`, default `search_path`, `statement_timeout = 0`. |
+| `session` | 1 | **SAFE** [0]: B was blocked (no server connection while A held the only one, waited 6 s), so it was granted no lock and saw no state. |
+| `session` | 16 (the shipped template) | **SAFE** [0]: separate backends (145, 146); `pg_try_advisory_lock = f`. |
 
-> **Caveat — `statement_timeout` / `lock_timeout` under transaction
-> mode (REQUIRED ops step).** The daemon installs its query-safety
-> envelope through an `sqlx` `after_connect` hook
-> (`src/store/postgres.rs`) that issues a session-level `SET
-> statement_timeout = …; SET lock_timeout = …;` the moment a
-> connection is established (sized from `postgres_statement_timeout_secs`
-> / `DEFAULT_STATEMENT_TIMEOUT_SECS` + `DEFAULT_LOCK_TIMEOUT_SECS`).
-> That `SET` is correct for a **direct** Postgres connection and for
-> PgBouncer **session** mode. Under **transaction** mode it does NOT
-> persist — PgBouncer runs the standalone `SET` on whatever server
-> connection it assigns for that one statement, then returns the
-> connection to the pool, so the envelope is lost before the next
-> transaction. **Therefore, when you front the primary with a
-> transaction-mode PgBouncer, you MUST also pin the envelope at the
-> Postgres role level so every backend inherits it as its server
-> default:**
->
-> ```sql
-> ALTER ROLE aimemory SET statement_timeout = '30s';   -- match DEFAULT_STATEMENT_TIMEOUT_SECS
-> ALTER ROLE aimemory SET lock_timeout      = '5s';    -- match DEFAULT_LOCK_TIMEOUT_SECS
-> ```
->
-> Keep the two values in lockstep with the compiled
-> `DEFAULT_STATEMENT_TIMEOUT_SECS` / `DEFAULT_LOCK_TIMEOUT_SECS` (or
-> your `postgres_statement_timeout_secs` override) so the direct-connect
-> path and the pooled path enforce the same ceiling. The role-level
-> setting is version-independent; do NOT rely on the libpq `options`
-> startup parameter for this — PgBouncer releases older than 1.21
-> reject it and the daemon would fail to connect. Set
-> `postgres_statement_timeout_secs = 0` only if you are deliberately
-> disabling the envelope on BOTH layers.
+Session mode was also exercised end to end: an ai-memory 1.0.0 daemon with the
+`sal-postgres` backend started through a session-mode PgBouncer built from
+`infra/pgbouncer/pgbouncer.ini` (template pool values, `default_pool_size = 16`),
+bootstrapped the schema, accepted `POST /api/v1/memories` (HTTP 201) and returned
+the stored memory from `GET /api/v1/recall` with `"storage_backend":"postgres"`.
+The transaction-mode run of the same daemon was not performed; the probe is the
+evidence for it.
+
+What the evidence does not cover: it does not say how often the hazards trigger
+in production (that depends on how often two clients land on one backend), it
+does not exercise federation, and it does not test PgBouncer versions other than
+1.23.1. It shows that the hazards exist and that `session` mode removes them in
+the runs above. `statement_timeout` / `lock_timeout` in `session` mode: each
+daemon connection runs its own `SET` at connect (`:2776`) and keeps that session
+for its life.
+
+> **Caveat — prepared statements.** `pgbouncer.ini` ships
+> `max_prepared_statements = 256` (needs PgBouncer 1.21 or later). The proof ran
+> with that line present. In `session` mode each client keeps its own server
+> connection, so a client's prepared statements stay on one backend.
+
+#### 5.6.7 If you already deployed per the earlier text of this section
+
+An earlier revision of §5.6, §10.4 and `infra/pgbouncer` prescribed
+`pool_mode = transaction`. If you followed it:
+
+1. **Move to `session` mode and re-size.** Set `pool_mode = session`, set
+   `default_pool_size` and `max_client_conn` per §5.6.5, reload PgBouncer, and
+   confirm with `SHOW CONFIG;` on the admin console (`psql -p 6432 pgbouncer`)
+   that `pool_mode` reads `session`. Then run the probe (§5.6.6) against it and
+   expect exit 0. A transaction-mode setup that fit `max_connections` through
+   fan-in may not fit once every client connection pins a server connection:
+   redo the §5.6.5 sum first.
+2. **Until you have moved, narrow the exposure.** The migration lock is taken by the
+   schema bootstrap inside `PostgresStore::connect_with_dim_and_timeout`
+   (`src/store/postgres.rs:2825`) and by `PostgresStore::migrate` (`:3871`). Run
+   migrations and the first start after an upgrade over a **direct** connection
+   to Postgres (a store URL that bypasses the pooler), one daemon at a time, so
+   no second client holds or probes the lock; switch the daemon back to the
+   pooler URL after it is up. This avoids the lock hazard for those starts; it
+   does not remove the other two hazards for running daemons.
+3. **Pin the connect-time state at the role.** Under transaction mode the
+   connect-time `SET`s can land on another client's backend. Set the same
+   values as server defaults so every backend starts with them:
+
+   ```sql
+   ALTER ROLE aimemory SET search_path = public, ag_catalog;
+   ALTER ROLE aimemory SET statement_timeout = '30s';   -- match DEFAULT_STATEMENT_TIMEOUT_SECS
+   ALTER ROLE aimemory SET lock_timeout      = '5s';    -- match DEFAULT_LOCK_TIMEOUT_SECS
+   ```
+
+   `public, ag_catalog` is the path the adapter itself computes from the AGE
+   default (`normalize_app_search_path`, `src/store/postgres.rs:19608`: the
+   `ag_catalog, "$user", public` default becomes `public, ag_catalog`, and a
+   path already in that order is left unchanged). The timeout values are
+   `DEFAULT_STATEMENT_TIMEOUT_SECS` = 30 (`:2498`) and
+   `DEFAULT_LOCK_TIMEOUT_SECS` = 5 (`:2506`); mirror any
+   `postgres_statement_timeout_secs` override. This reduces the `search_path`
+   and timeout hazards; it does not touch the migration lock, so step 2 and then
+   step 1 are still the way out.
+
+   Setting `postgres_statement_timeout_secs = 0` disables the daemon-side
+   envelope (`src/store/postgres.rs:2770`); do it on both layers or neither.
 
 ### 5.7 Backups at T4
 
@@ -1468,7 +1555,7 @@ effective_cache_size = 24GB       # 75% of RAM
 work_mem = 32MB                   # per-operation; raise if you see disk sorts
 maintenance_work_mem = 1GB        # VACUUM, CREATE INDEX
 wal_buffers = 64MB
-max_connections = 200             # behind PgBouncer; raise to 500 at T5+
+max_connections = 200             # T4; raise to 500 at T5+; size per §5.6.5
 synchronous_commit = on
 synchronous_standby_names = 'ANY 1 (replica_b)'   # T4+ sync replica
 archive_mode = on
@@ -1511,10 +1598,14 @@ v0.7.0 reference: the `PoolConfig` carrier + `DEFAULT_MIN_CONNECTIONS` /
 `AI_MEMORY_PG_POOL_MAX` / `AI_MEMORY_PG_ACQUIRE_TIMEOUT_SECS` (or the
 matching `postgres_pool_*` config fields). This is the **per-daemon**
 `sqlx` pool. For T4+ multi-daemon deployments, front the primary with a
-**server-side** PgBouncer pool (`pool_mode = transaction`, REQUIRED) so
-the summed daemon connections fan into a bounded server-connection set.
-Full config — `pgbouncer.ini`, `userlist.txt`, the two-pool
-reconciliation table, and the transaction-mode rationale — is in §5.6.
+**server-side** PgBouncer pool in `pool_mode = session` (the only mode
+supported today; `transaction` is not, see §5.6.6 and
+[#4679](https://github.com/alphaonedev/ai-memory-mcp/issues/4679)). A
+session-mode pooler does not fan the daemons' connections down: each client
+connection holds one server connection, so the sizing rule in §5.6.5 applies
+with or without it. Full config — `pgbouncer.ini`, `userlist.txt`, the sizing
+rule with the T4 and T5 numbers, and the executed evidence for the pool mode
+— is in §5.6.
 
 ### 10.5 Backup strategy
 
@@ -1814,7 +1905,7 @@ cover the substrate's standard failure modes.
 | `federation_push_dlq_quarantined_total` increment | P1 page | DLQ row gave up; hand-replicate or escalate |
 | `verify-signed-events-chain` cron fail | P1 page | Suspected tamper; follow [`signed-events-v4.md §"Operator runbook (3am procedures)"`](signed-events-v4.html) |
 | `recall_latency_seconds p99 > 100ms` for >5 min | P3 trend | Investigate HNSW rebuild, DB lock contention, embedder availability |
-| `memory_store_latency_seconds p95 > 100ms` | P2 trend | Likely lock contention on SQLite (T2) or pool exhaustion on Postgres (T4+); raise `AI_MEMORY_PG_POOL_MAX` or front with PgBouncer |
+| `memory_store_latency_seconds p95 > 100ms` | P2 trend | Likely lock contention on SQLite (T2) or pool exhaustion on Postgres (T4+); check `AI_MEMORY_PG_POOL_MAX` against the sizing rule in §5.6.5 (a session-mode PgBouncer does not add capacity) |
 | Cross-DC sync lag > 5 min | P2 trend | Check WAN; inspect `federation::sync` tracing target for retry storms |
 
 ---
@@ -1993,7 +2084,7 @@ it, and flip it back.
 ### 14.8 Backup + tooling discipline
 
 - [ ] Backup cadence per §13.1; quarterly restore drill against a scratch host (§13.2).
-- [ ] Daemon binary version pinned per-host (no auto-update); AGE minor pinned (v1.0.0 reference: 1.8.0 extversion; upgrade procedure §10.6); PgBouncer version pinned with `pool_mode = transaction`.
+- [ ] Daemon binary version pinned per-host (no auto-update); AGE minor pinned (v1.0.0 reference: 1.8.0 extversion; upgrade procedure §10.6); PgBouncer version pinned with `pool_mode = session` (§5.6).
 
 ### 14.9 One-command hardened posture + the certified-posture gate
 
