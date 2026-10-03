@@ -69,12 +69,17 @@ struct-literal tail to leave them empty.
 
 **Unsigned posture.** Per-row Ed25519 `sig` population is gated on
 the resolved daemon `agent_id` having a `*.priv` keypair on disk
-under the key directory. When no signing key loads, the daemon boots
-with a stderr "continuing unsigned" line
-([`src/main.rs:118`](../src/main.rs)) and writes rows with an empty
-signature + `attest_level = "unsigned"`. The cross-row hash chain
-remains tamper-evident in either posture — only the per-row
-signature property is degraded.
+under the key directory ([`load_daemon_signing_key`](../src/governance/audit.rs)).
+Since #3354 a ledger-writing command generates that key at boot when it
+is absent ([`ensure_daemon_signing_key`](../src/governance/audit.rs)) and
+refuses to start ([`unsigned_ledger_refusal`](../src/governance/audit.rs))
+when it can neither load nor generate one, so a writer never appends an
+unsigned row. A process that is not a ledger writer and has no key
+prints the one-line [`unsigned_ledger_warning`](../src/governance/audit.rs)
+at boot and its rows carry an empty signature +
+`attest_level = "unsigned"`. The cross-row hash chain remains
+tamper-evident in either posture — only the per-row signature property
+is degraded.
 
 ## Backfill (v33 → v34)
 
@@ -133,7 +138,7 @@ Exit codes:
   `signature_failures` list contains any rows whose Ed25519
   signature did not verify against the supplied key set.
 
-JSON shape ([`src/cli/verify_signed_events.rs:57`](../src/cli/verify_signed_events.rs)):
+JSON shape ([`ChainVerificationReport`](../src/signed_events.rs), serialised by [`src/cli/verify_signed_events.rs`](../src/cli/verify_signed_events.rs)):
 
 ```jsonc
 {
@@ -156,7 +161,7 @@ Pinned by [`tests/cli_verify_chain.rs`](../tests/cli_verify_chain.rs).
 ## Three complementary verifiers
 
 The substrate ships three verifier surfaces, each pinning a distinct
-property ([`src/cli/verify_signed_events.rs:11-19`](../src/cli/verify_signed_events.rs)):
+property (module doc of [`src/cli/verify_signed_events.rs`](../src/cli/verify_signed_events.rs)):
 
 | Verifier | Property | Source of truth |
 |---|---|---|
