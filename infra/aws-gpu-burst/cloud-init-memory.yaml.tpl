@@ -28,6 +28,15 @@ write_files:
     owner: root:root
     content: |
       postgres://aimemory:CHANGEME@localhost/aimemory
+  # #4604: the role password never goes on a psql argv word (readable by every
+  # local UID via /proc/<pid>/cmdline). This 0600 root-only SQL file is fed to
+  # psql on STDIN by runcmd and removed straight after. CHANGEME must match the
+  # store-url password above.
+  - path: /root/.aimemory-role.sql
+    permissions: '0600'
+    owner: root:root
+    content: |
+      CREATE USER aimemory WITH PASSWORD 'CHANGEME';
   - path: /etc/systemd/system/ai-memory.service
     permissions: '0644'
     content: |
@@ -58,7 +67,8 @@ runcmd:
   - curl -fsSL "${ai_memory_image_url}" -o /tmp/ai-memory.tar.gz
   - tar -xzf /tmp/ai-memory.tar.gz -C /opt/ai-memory/bin
   - chmod 0755 /opt/ai-memory/bin/ai-memory
-  - sudo -u postgres psql -c "CREATE USER aimemory WITH PASSWORD 'CHANGEME';"
+  - sudo -u postgres psql -v ON_ERROR_STOP=1 -f - < /root/.aimemory-role.sql
+  - rm -f /root/.aimemory-role.sql
   - sudo -u postgres psql -c "CREATE DATABASE aimemory OWNER aimemory;"
   - sudo -u postgres psql -d aimemory -c "CREATE EXTENSION IF NOT EXISTS age;"
   - systemctl daemon-reload
