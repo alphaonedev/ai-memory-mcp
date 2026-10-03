@@ -250,6 +250,16 @@ MDEOF
     anchor_green 4701 "an unknown-root foo./src/ anchor (not a src/ anchor)" 'See `foo./src/mcp/tools/recall.rs:9999`.'
     anchor_green 4701 "an unknown-root x/./src/ anchor (not a src/ anchor)" 'See `x/./src/mcp/tools/recall.rs:9999`.'
 
+    # #4714: . and .. segments INSIDE the path resolve before any rule.
+    anchor_red 4714 LINE "a src/./mcp stale line anchor" 'See `src/./mcp/tools/recall.rs:9999`.'
+    anchor_red 4714 LINE "a src/mcp/../mcp stale line anchor" 'See `src/mcp/../mcp/tools/recall.rs:9999`.'
+    anchor_red 4714 QUAL "a src/./mcp symbol anchor to a removed symbol" 'See `src/./mcp/tools/recall.rs::no_such`.'
+    anchor_red 4714 PATH "a src/./ anchor to a missing file" 'See `src/./handlers.rs`.'
+    anchor_red 4714 PATH "a src/../ anchor that leaves src/" 'See `src/../nope.rs:5`.'
+    anchor_red 4714 BARE_LN "a bare src/./mcp line anchor" 'See src/./mcp/tools/recall.rs:2 here.'
+    anchor_green 4714 "a src/mcp/../mcp in-range line anchor" 'See `src/mcp/../mcp/tools/recall.rs:4`.'
+    anchor_green 4714 "a src/./mcp live symbol anchor" 'See `src/./mcp/tools/recall.rs::RecallTool`.'
+
     # ---- #4651: a BARE src/x.rs:N line anchor (no backtick) ----------
     # Every form the #4651 census found must FAIL as BARE_LN; the only
     # exemption is the label of a commit-pinned permalink (immutable).
@@ -425,6 +435,7 @@ if ! violations="$(
     REPO_ROOT="$REPO_ROOT" LADDER_TIP="$LADDER_TIP" python3 - <<'PY'
 import glob
 import os
+import posixpath
 import re
 
 root = os.environ["REPO_ROOT"].rstrip("/")
@@ -503,11 +514,27 @@ for d in docs:
 # the rules run, so PATH, PATHLN, BARE_LN and QUAL need no prefix group
 # of their own. A token preceded by a letter, digit, dot or slash is left
 # alone: its root is unknown (`foo./src/x.rs`, `x/./src/x.rs`).
-CANON = re.compile(r"(?<![A-Za-z0-9./])(?:\.{1,2}/+)*(src/[A-Za-z0-9_/]+\.rs)")
+CANON = re.compile(
+    r"(?<![A-Za-z0-9./])(?:\.{1,2}/+)*"
+    r"(src/+(?:(?:[A-Za-z0-9_]+|\.{1,2})/+)*[A-Za-z0-9_]+\.rs)")
 
 
 def canon(line):
-    return CANON.sub(lambda m: re.sub(r"/+", "/", m.group(1)), line)
+    """Rewrite every `src/<path>.rs` token to its normal form: leading ./
+    and ../ stripped, repeated slashes collapsed, and . and .. segments
+    INSIDE the path resolved (`src/a/../a/x.rs` -> `src/a/x.rs`). Returns
+    (line, escapes): a token whose .. segments leave src/ names no file the
+    gate can check, so it is returned for a PATH finding, never dropped."""
+    escapes = []
+
+    def norm(m):
+        p = posixpath.normpath(m.group(1))
+        if not p.startswith("src/"):
+            escapes.append(m.group(1))
+            return m.group(0)
+        return p
+
+    return CANON.sub(norm, line), escapes
 
 
 PATH = re.compile(r"`(src/[A-Za-z0-9_/]+\.rs)`")
@@ -592,9 +619,13 @@ for doc in seen_docs:
     doc_lines = text.splitlines()
     for ln, line in enumerate(doc_lines, 1):
         ctx = line.strip()
-        line = canon(line)
+        line, escapes = canon(line)
         window = "\n".join(doc_lines[max(0, ln - 2):ln + 1])
         absent_ok = bool(ABSENT_ASSERTION.search(window))
+
+        for tok in escapes:
+            if not absent_ok:
+                emit("PATH", doc, ln, tok, ctx)
 
         for m in PATH.finditer(line):
             f = m.group(1)
@@ -643,7 +674,7 @@ for doc in seen_docs:
 
         for m in MDLINK.finditer(line):
             sym = m.group(1)
-            tgt = re.sub(r"^(\.\./)+", "", m.group(2)).split("#")[0]
+            tgt = m.group(2).split("#")[0]
             if tgt not in per_file:
                 if not absent_ok:
                     emit("PATH", doc, ln, tgt, ctx)
