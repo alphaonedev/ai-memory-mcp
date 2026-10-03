@@ -918,7 +918,7 @@ Targets are calibrated for M4 reference hardware; full table and methodology in
 rows marked *[advisory]* have **no `Operation` variant in `src/bench.rs`** and
 are therefore never measured by `ai-memory bench` at all; and on macOS the
 effective pass bar is **3× the published budget**
-(`MACOS_BUDGET_MULT = 3.0`, `src/bench.rs:95`), so a macOS run that "passes"
+(`MACOS_BUDGET_MULT = 3.0` in `src/bench.rs`), so a macOS run that "passes"
 may be up to 3.3× the number in this table once the 10 % tolerance is applied.
 
 | Operation | Target p95 | Target p99 |
@@ -1367,7 +1367,7 @@ ai-memory includes hardening across all input paths:
 - **Transaction safety** -- all multi-step database operations use transactions; no partial writes on failure
 - **FTS injection prevention** -- user input is sanitized before reaching FTS5 queries; special characters are escaped
 - **Error sanitization** -- internal database paths and system details are stripped from error responses; clients see structured error types (NOT_FOUND, VALIDATION_FAILED, DATABASE_ERROR, CONFLICT)
-- **Body size limits** -- HTTP request bodies are capped at **2 MiB** (`HTTP_BODY_LIMIT_BYTES`, `src/lib.rs:87`) via Axum's `DefaultBodyLimit`, applied as a **root-level router layer** (the `.layer(DefaultBodyLimit::max(HTTP_BODY_LIMIT_BYTES))` on the root router in `src/lib.rs`) — so it covers every route, including `POST /api/v1/memories/bulk`, `POST /api/v1/import` and `POST /api/v1/sync/push`. Size your bulk ingest and federation batches against 2 MiB, not against a per-route exception; there is none. The MCP stdio line cap is separately 16 MiB (`-32700` on overrun)
+- **Body size limits** -- HTTP request bodies are capped at **2 MiB** (`HTTP_BODY_LIMIT_BYTES` in `src/lib.rs`) via Axum's `DefaultBodyLimit`, applied as a **root-level router layer** (the `.layer(DefaultBodyLimit::max(HTTP_BODY_LIMIT_BYTES))` on the root router in `src/lib.rs`) — so it covers every route, including `POST /api/v1/memories/bulk`, `POST /api/v1/import` and `POST /api/v1/sync/push`. Size your bulk ingest and federation batches against 2 MiB, not against a per-route exception; there is none. The MCP stdio line cap is separately 16 MiB (`-32700` on overrun)
 - **Bulk operation limits** -- bulk create endpoints enforce maximum batch sizes to prevent resource exhaustion
 - **CORS** -- permissive CORS layer enabled for localhost development workflows
 - **Input validation** -- every write path validates title length, content length, namespace format, source values, priority range (1-10), confidence range (0.0-1.0), tag format, tier values, relation types, and ID format
