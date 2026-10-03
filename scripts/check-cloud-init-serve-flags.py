@@ -40,6 +40,14 @@ REQUIRED_FLAGS = ("--tls-cert", "--tls-key")
 STRUCT_RE = re.compile(r"pub struct ServeArgs \{(.*?)\n\}", re.S)
 FIELD_RE = re.compile(r"^\s{4}pub (\w+):", re.M)
 EXEC_RE = re.compile(r"^\s*ExecStart=\S*ai-memory serve(?P<rest>.*)$", re.M)
+# Templates that still lack the sslmode floor, each with its tracker. The
+# do-hive store URL dials PgBouncer on 127.0.0.1:6432 and its TLS shape has
+# more than one viable form (#4635 do-hive leg, awaiting a vote). The list may
+# only shrink: a listed template that passes the floor is itself a failure.
+DSN_FLOOR_GAPS = {
+    "infra/do-hive/cloud-init-memory.yaml.tpl": "#4635 do-hive pgbouncer leg",
+}
+DSN_RE = re.compile(r"^\s+(postgres(?:ql)?://\S+)\s*$", re.M)
 FLAG_RE = re.compile(r"(?<![\w-])(--[A-Za-z][\w-]*)")
 
 
@@ -60,6 +68,20 @@ def scan_text(name: str, text: str, known: set) -> list:
     for lineno, line in enumerate(text.splitlines(), 1):
         if any(ord(ch) > 127 for ch in line):
             hits.append("%s:%d: non-ASCII byte (cloud-init discards the config, #1880)" % (name, lineno))
+    dsns = DSN_RE.findall(text)
+    if not dsns:
+        hits.append("%s: no postgres:// store URL line found (cannot check the sslmode floor)" % name)
+    floor_ok = True
+    for dsn in dsns:
+        query = dsn.split("?", 1)[1] if "?" in dsn else ""
+        modes = [p.split("=", 1)[1].strip().lower() for p in query.split("&") if p.lower().startswith("sslmode=")]
+        if not modes or modes[-1] != "verify-full":
+            floor_ok = False
+            if name in DSN_FLOOR_GAPS:
+                continue
+            hits.append("%s: store URL has no sslmode=verify-full (serve refuses it at start, #3705 floor, src/transit_encryption.rs:436-446)" % name)
+    if name in DSN_FLOOR_GAPS and floor_ok and dsns:
+        hits.append("%s: store URL now passes the sslmode floor; remove it from DSN_FLOOR_GAPS" % name)
     for m in EXEC_RE.finditer(text):
         lineno = text.count("\n", 0, m.start()) + 1
         # Strip terraform directives so their words are not read as flags.
@@ -76,11 +98,13 @@ def scan_text(name: str, text: str, known: set) -> list:
 
 
 def self_test(known: set) -> int:
-    good = "ExecStart=/opt/ai-memory/bin/ai-memory serve --host 0.0.0.0 --port 9077 --tls-cert /a --tls-key /b\n"
+    good = "      postgres://u:p@localhost/db?sslmode=verify-full&sslrootcert=/c\nExecStart=/opt/ai-memory/bin/ai-memory serve --host 0.0.0.0 --port 9077 --tls-cert /a --tls-key /b\n"
     probes = {
         "bind flag": good.replace("--host 0.0.0.0", "--bind 0.0.0.0:9077"),
         "no tls": "ExecStart=/opt/ai-memory/bin/ai-memory serve --host 0.0.0.0 --port 9077\n",
         "tls key missing": good.replace(" --tls-key /b", ""),
+        "no sslmode": good.replace("?sslmode=verify-full&sslrootcert=/c", ""),
+        "weak sslmode": good.replace("verify-full", "require"),
         "non-ascii": "# em dash —\n" + good,
     }
     red = 0

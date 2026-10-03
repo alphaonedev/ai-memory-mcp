@@ -58,7 +58,7 @@ write_files:
     permissions: '0600'
     owner: root:root
     content: |
-      postgres://aimemory:CHANGEME@localhost/aimemory
+      postgres://aimemory:CHANGEME@localhost/aimemory?sslmode=verify-full&sslrootcert=/etc/ai-memory/tls/pg-ca.crt
   - path: /etc/systemd/system/ai-memory.service
     permissions: '0644'
     content: |
@@ -127,10 +127,64 @@ write_files:
         make install PG_CONFIG=/usr/bin/pg_config
       fi
 
-      # --- preload AGE + restart postgres ---
+      # --- PostgreSQL server TLS (#4635) ---------------------------------
+      # The store URL pins sslmode=verify-full (the connect funnel refuses
+      # anything weaker: src/store/postgres/dsn.rs:213-283, floor
+      # src/transit_encryption.rs:436-446). A local RSA CA signs a server
+      # cert whose SAN is the host the URL dials (localhost). RSA, not
+      # Ed25519: libpq channel binding has no digest for Ed25519 (#2658).
+      # Shape follows infra/do-hive/crypto/gen-certs.sh:40-56 (RSA CA 4096,
+      # leaf 2048, CA-signed, SAN = dialed host) and the hostssl pg_hba of
+      # infra/do-hive/crypto/test-pg-verifyfull.sh (hostssl, scram-sha-256).
+      TLSD=/etc/ai-memory/tls
+      PGTLS=/etc/postgresql/18/main/tls
+      install -d -o root -g aimemory -m 0750 "$TLSD"
+      if [ ! -s "$TLSD/pg-ca.crt" ] || [ ! -s "$PGTLS/server.key" ]; then
+        ( umask 077
+          openssl genrsa -out "$TLSD/pg-ca.key" 4096
+          openssl req -x509 -new -key "$TLSD/pg-ca.key" -sha256 -days 365 \
+            -subj "/CN=ai-memory-burst-pg-CA" -out "$TLSD/pg-ca.crt"
+          openssl genrsa -out "$TLSD/pg-server.key" 2048
+          openssl req -new -key "$TLSD/pg-server.key" -subj "/CN=localhost" \
+            -out "$TLSD/pg-server.csr"
+          printf 'subjectAltName=DNS:localhost,IP:127.0.0.1,IP:0:0:0:0:0:0:0:1\n' \
+            > "$TLSD/pg-server.ext"
+          openssl x509 -req -in "$TLSD/pg-server.csr" -CA "$TLSD/pg-ca.crt" \
+            -CAkey "$TLSD/pg-ca.key" -CAcreateserial -days 365 -sha256 \
+            -extfile "$TLSD/pg-server.ext" -out "$TLSD/pg-server.crt" ) \
+          || { echo "could not mint the postgres TLS pair"; exit 1; }
+        install -d -o postgres -g postgres -m 0700 "$PGTLS"
+        install -o postgres -g postgres -m 0600 "$TLSD/pg-server.key" "$PGTLS/server.key"
+        install -o postgres -g postgres -m 0644 "$TLSD/pg-server.crt" "$PGTLS/server.crt"
+        rm -f "$TLSD/pg-server.key" "$TLSD/pg-server.csr" "$TLSD/pg-server.ext" "$TLSD/pg-server.crt"
+      fi
+      # The service user reads only the CA certificate (the trust anchor).
+      chown root:aimemory "$TLSD/pg-ca.crt"
+      chmod 0644 "$TLSD/pg-ca.crt"
+
+      # --- preload AGE + TLS settings + restart postgres ---
       PGCONF="/etc/postgresql/18/main/postgresql.conf"
       if ! grep -q "shared_preload_libraries.*age" "$PGCONF"; then
         echo "shared_preload_libraries = 'age'" >> "$PGCONF"
+      fi
+      # Appended last, so it overrides the packaged snakeoil ssl settings.
+      if ! grep -q "^# ai-memory-tls (#4635)" "$PGCONF"; then
+        printf '%s\n' "# ai-memory-tls (#4635)" "ssl = on" \
+          "ssl_cert_file = '$PGTLS/server.crt'" "ssl_key_file = '$PGTLS/server.key'" \
+          "ssl_min_protocol_version = 'TLSv1.2'" >> "$PGCONF"
+      fi
+      # aimemory may only connect with TLS over TCP: hostssl lines first, then
+      # a reject for any non-TLS TCP attempt (first matching line wins).
+      HBA="/etc/postgresql/18/main/pg_hba.conf"
+      if ! grep -q "^# ai-memory-tls (#4635)" "$HBA"; then
+        { printf '%s\n' "# ai-memory-tls (#4635)" \
+            "hostssl aimemory aimemory 127.0.0.1/32 scram-sha-256" \
+            "hostssl aimemory aimemory ::1/128 scram-sha-256" \
+            "hostnossl aimemory aimemory all reject"
+          cat "$HBA"; } > "$HBA.new"
+        chown --reference="$HBA" "$HBA.new"
+        chmod --reference="$HBA" "$HBA.new"
+        mv "$HBA.new" "$HBA"
       fi
       systemctl restart postgresql
       sleep 5
