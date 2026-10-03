@@ -8,6 +8,14 @@ packages:
   - git
   - curl
   - jq
+bootcmd:
+  # #4619: cloud-init write_files creates the file under the process umask and
+  # chmods it AFTER writing (cloudinit/util.py write_file: open, write, flush,
+  # chmod). bootcmd runs before write_files, so create /etc/ai-memory root-only
+  # (0700, umask 077) first: no other UID can traverse it while the store-url
+  # file briefly has the umask mode. Guarded so later boots never reset the
+  # 0750 root:aimemory mode runcmd sets once the service user exists.
+  - [bash, -c, "[ -d /etc/ai-memory ] || (umask 077 && mkdir /etc/ai-memory)"]
 write_files:
   # #4577: the Postgres DSN (it carries the db password) reaches the daemon
   # through AI_MEMORY_STORE_URL_FILE, never on the serve argv where every local
@@ -44,6 +52,8 @@ runcmd:
   - useradd -m -d /opt/ai-memory -s /bin/bash aimemory
   - mkdir -p /opt/ai-memory/bin
   - chown -R aimemory:aimemory /opt/ai-memory
+  - chown root:aimemory /etc/ai-memory
+  - chmod 0750 /etc/ai-memory
   - chown aimemory:aimemory /etc/ai-memory/store-url
   - curl -fsSL "${ai_memory_image_url}" -o /tmp/ai-memory.tar.gz
   - tar -xzf /tmp/ai-memory.tar.gz -C /opt/ai-memory/bin
