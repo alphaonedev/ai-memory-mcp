@@ -1743,7 +1743,8 @@ THAT FILE — each `::` component is checked, so
 must BE the module's file stem, which is a legitimate module citation), and **BARE_LN**
 (#4651: a bare, un-backticked `src/<p>.rs:<N>` in prose, a link label or
 HTML text is a finding that FAILS, unless it labels a commit-pinned
-`/blob/<hex sha>/` permalink, which is immutable).
+`https://github.com/<owner>/<repo>/blob/<40-hex sha>/` permalink whose path
+and `#L` line (or range) equal the label's, which is immutable).
 
 **What is deliberately NOT a rule:** a bare backticked identifier
 sharing a line with a `src/` path. Measured against the tree that
