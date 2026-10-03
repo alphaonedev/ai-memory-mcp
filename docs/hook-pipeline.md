@@ -241,7 +241,7 @@ The chain runner reads `event_class(event)`
 ([`src/hooks/timeouts.rs::event_class`](../src/hooks/timeouts.rs)) at fire
 entry and computes a wall-clock ceiling on the *entire* chain. Per-hook
 budgets are derived by `per_hook_budget_ms`
-([`src/hooks/timeouts.rs:264`](../src/hooks/timeouts.rs)) and shrink
+([`src/hooks/timeouts.rs::per_hook_budget_ms`](../src/hooks/timeouts.rs)) and shrink
 monotonically as earlier hooks consume time:
 
 | Class | Deadline | Events |
