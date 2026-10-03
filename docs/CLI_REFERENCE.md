@@ -1659,7 +1659,9 @@ Walks the `signed_events` cross-row hash chain end-to-end. Supports
 ### `schema-init` — postgres + AGE bootstrap (`--features sal`)
 
 Idempotent schema bootstrap for a fresh SAL store by URL
-(`--store-url <URL>`; flags: `--json`, `--embedding-dim`). When
+(`--store-url <URL>` or, to keep a password off argv, `AI_MEMORY_STORE_URL_FILE` /
+`AI_MEMORY_STORE_URL`, resolved FILE > ENV > flag as for `serve`:
+`src/cli/schema_init.rs:293`, `src/store_url.rs:137`; flags: `--json`, `--embedding-dim`). When
 `--embedding-dim` is omitted it resolves from the SAME config-driven
 source the daemon uses to pick its embedder (the effective tier's
 embedder dim; 384 for the keyword / no-embedder case) — so `schema-init`
