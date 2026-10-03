@@ -236,6 +236,11 @@ CANONICAL_HOOK_EVENTS=$(
 
 DOC_FILES=(
     CLAUDE.md
+    # #4507 — the Architecture / Code Style bodies moved out of CLAUDE.md
+    # (eager-loaded into every agent session) into these two files, verbatim.
+    # They are walked here so the narrative-count rules still see that content.
+    docs/reference/ARCHITECTURE_REFERENCE.md
+    docs/reference/CODE_STYLE.md
     README.md
     ROADMAP.md
     docs/spec/PORTABILITY-V2.md
@@ -953,7 +958,8 @@ PY
 
 # Env-var census rule (#836 3B / 2026-06-09 GA drive). Every
 # AI_MEMORY_* env var READ by production code must appear somewhere in
-# CLAUDE.md (the env-var table is the operator-facing contract; 13
+# docs/reference/ARCHITECTURE_REFERENCE.md (the env-var table moved there from
+# CLAUDE.md in #4507; it is the operator-facing contract; 13
 # missing rows were found by hand on 2026-06-09 — this makes the class
 # mechanical). Intentionally one-directional — extra rows in CLAUDE.md
 # for removed vars are caught by the symbol census, and vars only set
@@ -1020,8 +1026,8 @@ check_env_var_census_rule() {
         # Word-boundaried: a bare `grep -q` lets a LONGER var's mention
         # satisfy a shorter one (`AI_MEMORY_STORE_URL` would be answered
         # by `AI_MEMORY_STORE_URL_FILE_ALLOW_LAX_PERMS`).
-        if ! grep -qE "${var}([^A-Z0-9_]|\$)" "$REPO_ROOT/CLAUDE.md"; then
-            printf 'FAIL: %s: src reads %s but CLAUDE.md never mentions it (env-var table drift)\n' \
+        if ! grep -qE "${var}([^A-Z0-9_]|\$)" "$REPO_ROOT/docs/reference/ARCHITECTURE_REFERENCE.md"; then
+            printf 'FAIL: %s: src reads %s but docs/reference/ARCHITECTURE_REFERENCE.md never mentions it (env-var table drift)\n' \
                 "$rule_name" "$var" >&2
             fail_count=$((fail_count + 1))
         fi
@@ -1414,7 +1420,8 @@ run_all_rules() {
     # in a listed file is a no-op that still reports PASS, so this is stated
     # rather than assumed, and re-verified whenever a file is enrolled):
     # 17 anchored citations across 11 of the 12 surfaces, all reading the
-    # canonical — CLAUDE.md 3, README.md 1, SECURITY.md 2, PERFORMANCE.md 1,
+    # canonical — CLAUDE.md + docs/reference/ARCHITECTURE_REFERENCE.md (the
+    # citations moved there in #4507) 3, README.md 1, SECURITY.md 2, PERFORMANCE.md 1,
     # docs/deploy/README.md 1, docs/deploy/enterprise-federation.env 1, the
     # certification doc 2, docs/enterprise-deployment.md 1,
     # src/security_profile.rs 2, src/enterprise_federation_posture.rs 2,
@@ -1435,6 +1442,7 @@ run_all_rules() {
         "$CANONICAL_ASI_HARD_KNOBS" \
         '([0-9]+)-knob|(?:auto-)?[Pp]ins the ([0-9]+)(?: asi-hard)? knobs|holds \*\*([0-9]+)\*\* entries|names all ([0-9]+) correctly|SSOT for the ([0-9]+)|\*\*([0-9]+)\*\* post-#|shows `([0-9]+)/[0-9]+`|`PINNED_KNOB_COUNT` \(([0-9]+)\)|is \*\*([0-9]+) knobs\*\*|PINS \*\*([0-9]+)\*\* security env knobs|([0-9]+)-entry pin-and-refuse|all \*\*([0-9]+)\*\* `KNOBS` entries|All \*\*([0-9]+)\*\* of them' \
         CLAUDE.md \
+        docs/reference/ARCHITECTURE_REFERENCE.md \
         README.md \
         SECURITY.md \
         PERFORMANCE.md \
