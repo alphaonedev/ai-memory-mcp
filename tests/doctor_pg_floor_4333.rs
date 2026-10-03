@@ -13,8 +13,9 @@
 //! observe the defect on the wire: a counting TCP listener stands in for the
 //! database, and a weak-`sslmode` store URL must produce ZERO accepted
 //! connections from every doctor section that opens a postgres session
-//! (Postgres extensions, Unstamped owners, Identity key registry), each
-//! reporting the refusal as its own fact instead of connecting.
+//! (Postgres extensions, Unstamped owners, Identity key registry, and -- since
+//! #4285 -- the corrupt-governance census), each reporting the refusal as its
+//! own fact instead of connecting.
 //!
 //! The green cell (gated on `AI_MEMORY_TEST_POSTGRES_URL`, a verify-full DSN)
 //! proves the floor does not break a compliant URL.
@@ -192,6 +193,22 @@ fn assert_doctor_refused_without_connecting(
         corrupt.to_string().contains(REFUSAL_MARK)
             && corrupt.to_string().contains("doctor REFUSED to connect"),
         "census must report the floor refusal: {corrupt}"
+    );
+    // #4285 - and it must still name its BACKEND. The refusal arm builds this
+    // section inline rather than through `section_corrupt_governance_4285`, so
+    // the fact keys live in two places; without this assertion a rename drifts
+    // on the refusal path only, where no operator is looking. Facts serialize
+    // as [[key, value], ..]; "postgres" is `CORRUPT_STANDARD_BACKEND_POSTGRES`.
+    let backend = corrupt["facts"]
+        .as_array()
+        .expect("facts is a JSON array")
+        .iter()
+        .find(|f| f[0] == "backend")
+        .map(|f| f[1].clone());
+    assert_eq!(
+        backend.as_ref().and_then(serde_json::Value::as_str),
+        Some("postgres"),
+        "a refused census must still name its backend: {corrupt}"
     );
 
     let identity = section(&report, "Identity");
