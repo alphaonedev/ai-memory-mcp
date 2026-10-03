@@ -42,9 +42,9 @@
 //   checked here; the executor (G3) is the right layer for that
 //   so a missing binary surfaces as an executor error with full
 //   context, not a config-parse error before the daemon boots.
-// * `namespace` — non-empty string. A real glob/pattern matcher
-//   does not yet exist in this crate; G2/G3 will swap in the
-//   real one when it ships. See the TODO below.
+// * `namespace` — non-empty string. Shape-only check here; the
+//   runtime matcher is `HookConfig::matches_namespace` (exact,
+//   or `prefix/*` glob), so no pattern is parsed at load time.
 // * Parse errors include the failing TOML span (line:col) via
 //   `toml::de::Error::span()` when the underlying error carries
 //   one.
@@ -384,11 +384,11 @@ fn validate_hook(idx: usize, h: &HookConfig) -> Result<(), HooksConfigError> {
             reason: "must be a non-empty path".into(),
         });
     }
-    // TODO(G2/G3): validate namespace against the real
-    // pattern matcher once it ships. Today no glob matcher
-    // exists in src/ — `db::matches_subtree` is prefix-only
-    // and not callable from this layer. For now we accept any
-    // non-empty string.
+    // Shape-only validation: any non-empty string is accepted
+    // here. The runtime matcher, `HookConfig::matches_namespace`
+    // (exact match or `prefix/*` glob), decides at fire time
+    // whether a hook covers a namespace; load does not parse
+    // the pattern.
     if h.namespace.trim().is_empty() {
         return Err(HooksConfigError::Validation {
             field: format!("hook[{idx}].namespace"),
