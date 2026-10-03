@@ -1095,12 +1095,31 @@ const MIGRATE_BATCH_DEFAULT: usize = 1000;
 #[derive(Args)]
 pub struct MigrateArgs {
     /// Source URL. `sqlite:///path/to/file.db` or
-    /// `postgres://user:pass@host:port/dbname`.
+    /// `postgres://user:pass@host:port/dbname`. A password here is readable
+    /// through `ps`; prefer `--from-url-file`. Exactly one of `--from` /
+    /// `--from-url-file` is required.
+    #[arg(
+        long,
+        conflicts_with = "from_url_file",
+        required_unless_present = "from_url_file"
+    )]
+    pub from: Option<String>,
+    /// Read the source URL from this file (mode 0600, owner-only), keeping the
+    /// credential off argv (#4600). Same URL shape as `--from`.
     #[arg(long)]
-    pub from: String,
-    /// Destination URL. Same URL shape as `--from`.
+    pub from_url_file: Option<PathBuf>,
+    /// Destination URL. Same URL shape as `--from`. Prefer `--to-url-file`.
+    /// Exactly one of `--to` / `--to-url-file` is required.
+    #[arg(
+        long,
+        conflicts_with = "to_url_file",
+        required_unless_present = "to_url_file"
+    )]
+    pub to: Option<String>,
+    /// Read the destination URL from this file (mode 0600, owner-only),
+    /// keeping the credential off argv (#4600). Same URL shape as `--to`.
     #[arg(long)]
-    pub to: String,
+    pub to_url_file: Option<PathBuf>,
     /// Page-size hint. Default 1000. Retained for API compatibility —
     /// the current migrator reads one page capped at `MAX_ROWS`
     /// (1,000,000) and refuses loudly past it; see `src/migrate.rs`.
@@ -8728,7 +8747,21 @@ async fn cmd_migrate(args: &MigrateArgs) -> Result<()> {
     // v1.0.0 #3435 — the SOURCE is opened through the read-only,
     // never-creating funnel: a mistyped `--from` is a typed refusal, not a
     // freshly-created empty store reported as a `memories_read: 0` success.
-    let src = migrate::open_source_store(&args.from)
+    // #4600 — each endpoint comes from its plain flag or its `*-url-file`
+    // twin (5-agent vote (4d3ea1c5)); neither store-url env channel is read.
+    let from_url = migrate::resolve_endpoint(
+        "--from",
+        "--from-url-file",
+        args.from.as_deref(),
+        args.from_url_file.as_deref(),
+    )?;
+    let to_url = migrate::resolve_endpoint(
+        "--to",
+        "--to-url-file",
+        args.to.as_deref(),
+        args.to_url_file.as_deref(),
+    )?;
+    let src = migrate::open_source_store(&from_url)
         .await
         .context("open source store")?;
     let report = if args.dry_run {
@@ -8738,7 +8771,7 @@ async fn cmd_migrate(args: &MigrateArgs) -> Result<()> {
         // leave the filesystem exactly as it found it.
         migrate::plan(src.as_ref(), args.batch, args.namespace.clone()).await
     } else {
-        let dst = migrate::open_store(&args.to)
+        let dst = migrate::open_store(&to_url)
             .await
             .context("open destination store")?;
         migrate::migrate(
@@ -8753,8 +8786,8 @@ async fn cmd_migrate(args: &MigrateArgs) -> Result<()> {
     // #1579 A3 (SECURITY) — the migrate report echoes both store URLs;
     // mask the userinfo password so credentials never land in stdout /
     // captured CI logs.
-    let from_display = crate::url_display::store_url_display(&args.from);
-    let to_display = crate::url_display::store_url_display(&args.to);
+    let from_display = crate::url_display::store_url_display(&from_url);
+    let to_display = crate::url_display::store_url_display(&to_url);
     if args.json {
         let value = serde_json::json!({
             "from_url": from_display,

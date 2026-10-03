@@ -285,7 +285,7 @@ v1.0.0 wake plane (EPIC #3466) — a same-host, CONTENT-FREE push lane that turn
 
 ### `src/migrate.rs`
 
-Cross-backend migration tool — streams memories from one SAL backend to another (v0.7 track B, PR 2 of N). Gated behind `--features sal`; extended transparently by `--features sal-postgres`. Supported URLs: `sqlite:///abs/path.db`, `sqlite://./relative.db`, `postgres://user:pass@host:port/db`. CLI: `ai-memory migrate --from <url> --to <url> [--batch 1000] [--dry-run] [--namespace foo]`. Reads via `MemoryStore::list`, writes via `MemoryStore::store` with the source memory's id verbatim — adapter upsert-on-id semantics make repeated migration idempotent.
+Cross-backend migration tool — streams memories from one SAL backend to another (v0.7 track B, PR 2 of N). Gated behind `--features sal`; extended transparently by `--features sal-postgres`. Supported URLs: `sqlite:///abs/path.db`, `sqlite://./relative.db`, `postgres://user:pass@host:port/db`. CLI: `ai-memory migrate (--from <url> | --from-url-file <path>) (--to <url> | --to-url-file <path>) [--batch 1000] [--dry-run] [--namespace foo]`. Reads via `MemoryStore::list`, writes via `MemoryStore::store` with the source memory's id verbatim — adapter upsert-on-id semantics make repeated migration idempotent.
 
 ### `src/metrics.rs`
 

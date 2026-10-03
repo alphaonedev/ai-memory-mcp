@@ -368,7 +368,8 @@ the AGE projection prime, and the cutover dance.
 ### 5.2 If you want to switch sqlite → postgres at the same time
 
 The v0.7.0 SAL trait makes sqlite ↔ postgres a one-command migration.
-Run `ai-memory migrate --from sqlite:///path/to/memory.db --to postgres://...`
+Run `ai-memory migrate --from sqlite:///path/to/memory.db --to-url-file /etc/ai-memory/store-url`
+(a `0600` file holding the `postgres://...` URL, so the password stays off argv)
 per the postgres guide. You can do it before OR after the v0.7.0 upgrade —
 the SAL boundary is byte-stable across both backends at schema v57.
 

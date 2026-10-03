@@ -246,7 +246,7 @@ periodic fold job (`db::fold_recall_accesses`) from that ledger.
 Trait-based storage boundary (`MemoryStore`, `src/store/`). Adapters:
 `SqliteStore` (default), `PostgresStore` (pgvector-backed, under
 `--features sal-postgres`; GA at v0.7.0). Migration via
-`ai-memory migrate --from … --to …`; run the daemon against Postgres
+`ai-memory migrate --from … --to-url-file …` (a Postgres URL with a password goes in a `0600` file, not on argv); run the daemon against Postgres
 with `ai-memory serve --store-url postgres://…`. See
 `docs/RUNBOOK-adapter-selection.md`.
 

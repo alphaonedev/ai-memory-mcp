@@ -226,7 +226,7 @@ const LIBPQ_CREDENTIAL_QUERY_KEYS: [&str; 2] = ["password", "sslpassword"];
 /// non-empty userinfo password, or a libpq credential query key (compared
 /// percent-decoded and case-insensitively, so `%70assword=` counts)?
 /// (#1927 warning trigger; #3667 widened from userinfo-only.)
-fn url_carries_credentials(url: &str) -> bool {
+pub(crate) fn url_carries_credentials(url: &str) -> bool {
     let Ok(parsed) = reqwest::Url::parse(url.trim()) else {
         return false;
     };

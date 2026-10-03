@@ -1383,19 +1383,27 @@ One-shot bidirectional migration between SAL backends.
 
 | Flag | Type | Default | Notes |
 |------|------|---------|-------|
-| `--from <URL>` | string | required | `sqlite:///path.db` or `postgres://…` (needs `sal-postgres`). |
-| `--to <URL>` | string | required | Same shapes. |
+| `--from <URL>` | string | one of `--from` / `--from-url-file` | `sqlite:///path.db` or `postgres://…` (needs `sal-postgres`). A password here is readable through `ps`: a credential-bearing value logs a warning naming `--from-url-file`. |
+| `--from-url-file <PATH>` | path | one of the pair | Read the source URL from a one-line file, mode `0600` (group/world-readable refused; opt out with `AI_MEMORY_STORE_URL_FILE_ALLOW_LAX_PERMS=1`). Conflicts with `--from`. |
+| `--to <URL>` | string | one of `--to` / `--to-url-file` | Same shapes as `--from`. |
+| `--to-url-file <PATH>` | path | one of the pair | Same as `--from-url-file`, for the destination. Conflicts with `--to`. |
 | `--batch` | usize | `1000` (`MIGRATE_BATCH_DEFAULT`) | Page-size **hint**, retained for API compatibility — the current migrator reads one page capped at `MAX_ROWS` (1,000,000) and refuses loudly past it (see `src/migrate.rs`). |
 | `--namespace` | string | — | Restrict to one namespace. |
 | `--dry-run` | bool | — | Report only, no writes. |
 | `--json` | bool | — | Machine-parseable report. |
 
+Each side takes exactly one of the plain flag or its `*-url-file` twin; both, or neither, exits 2 at parse time. `migrate` never reads `AI_MEMORY_STORE_URL` / `AI_MEMORY_STORE_URL_FILE` (an exported variable cannot redirect a bulk write; [#4600](https://github.com/alphaonedev/ai-memory-mcp/issues/4600)). Keep the password off argv:
+
 ```bash
+# /etc/ai-memory/store-url: one line, mode 0600:
+#   postgres://ai_memory:PASSWORD@pg:5432/ai_memory
 ai-memory migrate \
   --from sqlite:///var/lib/ai-memory/ai-memory.db \
-  --to postgres://ai_memory:pass@pg:5432/ai_memory \
+  --to-url-file /etc/ai-memory/store-url \
   --dry-run
 ```
+
+CI and Kubernetes examples (secret written to a `0600` file, or mounted as a Secret volume with `defaultMode: 0400`) are in [`docs/migration-v0.7.0-postgres.md`](migration-v0.7.0-postgres.html) Step 2.
 
 ## v0.7.0 net-new CLI subcommands
 
