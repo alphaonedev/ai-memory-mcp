@@ -21,8 +21,7 @@ identically to v0.6.4 at the lifecycle layer.
   post-reflect hook subtree under [`src/hooks/post_reflect/`](../src/hooks/post_reflect/).
 - **Helper binary:** [`tools/auto-link-detector/`](../tools/auto-link-detector/)
   is the R3 reference `pre_link` hook (~775 LoC).
-- **Capability registry entry:** `CapabilityHooks` in
-  [`src/config.rs:944`](../src/config.rs).
+- **Capability registry entry:** [`CapabilityHooks`](../src/config.rs).
 - **Config file:** `~/.config/ai-memory/hooks.toml` — hot-reloadable
   via `SIGHUP` ([`spawn_reload_task`](../src/hooks/config.rs)).
 
