@@ -29,8 +29,7 @@ bootcmd:
   - [bash, -c, "[ -d /etc/ai-memory ] || (umask 077 && mkdir /etc/ai-memory)"]
   # PG 18 is supplied by PGDG on Ubuntu Noble. Install the signed repository
   # before cloud-init's packages module runs; never fall back to Ubuntu's PG16.
-  - [bash, -c, "install -d -m 0755 /usr/share/postgresql-common/pgdg && curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc && echo '0144068502a1eddd2a0280ede10ef607d1ec592ce819940991203941564e8e76  /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc' | sha256sum -c -"]
-  - [bash, -c, "echo 'deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt noble-pgdg main' > /etc/apt/sources.list.d/pgdg.list && apt-get update"]
+  - [bash, -c, "set -e; install -d -m 0755 /usr/share/postgresql-common/pgdg; rm -f /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc.new; curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc.new; echo '0144068502a1eddd2a0280ede10ef607d1ec592ce819940991203941564e8e76  /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc.new' | sha256sum -c -; mv -f /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc.new /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc; echo 'deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt noble-pgdg main' > /etc/apt/sources.list.d/pgdg.list; apt-get update"]
 packages:
   - postgresql-18=18.6-1.pgdg24.04+2
   - postgresql-server-dev-18=18.6-1.pgdg24.04+2
@@ -302,8 +301,10 @@ write_files:
           /usr/local/lib/ai-memory/bin/ai-memory identity generate --agent-id "$FED_ID" --key-dir "$KEY_DIR" \
           || fail "identity generate failed for $FED_ID"
       fi
-      cp "$KEY_DIR/$FED_ID.pub" "$FED_DIR/$FED_ID.pub"
-      chmod 0644 "$FED_DIR/$FED_ID.pub"
+      runuser -u aimemory -- cat "$KEY_DIR/$FED_ID.pub" > "$FED_DIR/$FED_ID.pub.new" \
+        || fail "could not read $KEY_DIR/$FED_ID.pub as the service user"
+      chmod 0644 "$FED_DIR/$FED_ID.pub.new"
+      mv -f "$FED_DIR/$FED_ID.pub.new" "$FED_DIR/$FED_ID.pub"
       echo "[fed-bootstrap] published $FED_DIR/$FED_ID.pub (public half only) for cross-enrollment"
 
       # --- B. local api_key + admin allowlist --------------------------
@@ -326,18 +327,12 @@ write_files:
       # config to $XDG_DIR left it UNREAD and serve fail-closed on the 0.0.0.0
       # bind ("api_key is unset", exit 75). Write to the path the daemon loads.
       DAEMON_CFG_DIR=/var/lib/ai-memory/.config/ai-memory
-      install -d -o aimemory -g aimemory -m 0750 "$DAEMON_CFG_DIR"
       ( umask 077
-        cat > "$DAEMON_CFG_DIR/config.toml" <<CFG
-      schema_version = 2
-      api_key = "$API_KEY"
-
-      [admin]
-      agent_ids = ["$ADMIN_ID"]
-      CFG
+        runuser -u aimemory -- mkdir -p "$DAEMON_CFG_DIR" \
+          && printf 'schema_version = 2\napi_key = "%s"\n\n[admin]\nagent_ids = ["%s"]\n' "$API_KEY" "$ADMIN_ID" \
+            | runuser -u aimemory -- tee "$DAEMON_CFG_DIR/config.toml.new" >/dev/null \
+          && runuser -u aimemory -- mv -f "$DAEMON_CFG_DIR/config.toml.new" "$DAEMON_CFG_DIR/config.toml"
       ) || fail "could not write the daemon config"
-      chown root:aimemory "$DAEMON_CFG_DIR/config.toml"
-      chmod 0640 "$DAEMON_CFG_DIR/config.toml"
       # Unit environment is explicit and auditable. Header trust is
       # intentionally absent/off: the mTLS-enrolled load generator must also
       # present this node's API key before its admin agent id is considered.
@@ -393,13 +388,18 @@ write_files:
       PEER_PUBS=$(ls -1 "$FED_DIR"/peers/*.pub 2>/dev/null | wc -l)
 %{ if federation_enabled }
       [ "$PEER_PUBS" -ge 1 ] || fail "no peer public keys under $FED_DIR/peers"
-      cp "$FED_DIR"/peers/*.pub "$KEY_DIR"/ || fail "could not install peer public keys"
 %{ endif }
       chown -R aimemory:aimemory "$KEY_DIR"
       # $FED_DIR stays root-owned (custody split above); the daemon reads it as
       # group aimemory and cannot rewrite its own trust anchors.
       chown -R root:aimemory "$FED_DIR"
       chmod 0750 "$FED_DIR" "$FED_DIR/peers"
+%{ if federation_enabled }
+      chmod 0644 "$FED_DIR"/peers/*.pub
+      # Copied as the service user: $KEY_DIR is the service user's directory, so
+      # root never writes through a link planted there.
+      runuser -u aimemory -- cp "$FED_DIR"/peers/*.pub "$KEY_DIR"/ || fail "could not install peer public keys"
+%{ endif }
       chmod 0640 "$FED_DIR/node.key"
       chmod 0644 "$FED_DIR/ca.crt" "$FED_DIR/node.crt" "$FED_DIR/peers.allowlist" "$FED_DIR/peers.conf"
       echo "[fed-bootstrap] enrolled $PEER_PUBS peer public key(s) into $KEY_DIR"

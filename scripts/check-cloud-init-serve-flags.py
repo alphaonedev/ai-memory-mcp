@@ -1297,6 +1297,14 @@ def dsn_problems(dsn: str, ctx: str) -> list:
             out.append("postgres URL %s has a case-variant sslmode key %r (sqlx keys are case-sensitive)" % (redact(dsn), k))
         if k.lower() in ("password", "passfile"):
             out.append("postgres URL %s carries a %s key" % (redact(dsn), k.lower()))
+        if k.lower() in ("host", "hostaddr", "port", "channel_binding"):
+            out.append("postgres URL %s carries a %s query key (the URL dials the authority only, #4702/#4677)" % (redact(dsn), k.lower()))
+    try:
+        port = parts.port
+    except ValueError:
+        port = -1
+    if port is not None and (port != 5432 or not re.search(r":5432$", parts.netloc)):
+        out.append("postgres URL %s names a port other than a literal 5432 (no pooler, #4702)" % redact(dsn))
     netloc = parts.netloc
     if "@" in netloc and ":" in netloc.rsplit("@", 1)[0] and ctx != STORE_URL_PATH:
         out.append("postgres URL with a userinfo password outside %s" % STORE_URL_PATH)
@@ -1339,6 +1347,18 @@ def validate_line(ln: Line, homes: set, binaries: set) -> list:
             out.append("curl/wget piped into a shell, tar or interpreter")
     if re.search(r"(?<![\w-])tar(?![\w-])", v1) and re.search(r"(?<![\w-])(?:-[a-z]*x[a-z]*|x[a-z]*f|--extract|--get)(?![\w-])", v1) and re.search(r"\|\|\s*true\b", v1):
         out.append("tar extract failure ignored with || true")
+    if re.search(r"(?<![\w-])sha(?:256|512)sum(?![\w-])", v1) and re.search(r"\|\|\s*(?:true|:)(?![\w-])", v1):
+        out.append("digest check failure ignored with || true or || : (#4704)")
+    if re.search(r"(?<![\w-])ssl\s*=\s*'?(?:off|false|no|0)\b", v1):
+        out.append("ssl turned off for a local Postgres (#4704)")
+    for hm in re.finditer(r"[\"'](hostnossl|host)\s+\S+\s+\S+\s+\S+\s+([^\"'\s]+)", v1):
+        if hm.group(2) != "reject":
+            out.append("pg_hba %s line that admits a login (only hostssl may admit, #4676/#4704)" % hm.group(1))
+    if ln.ctx == "bootcmd" and "apt.postgresql.org.asc" in v1 and re.search(r"(?<![\w-])curl(?![\w-])", v1):
+        if not re.search(r"(?<![\w-])sha256sum\s+-c(?![\w-])", v1):
+            out.append("bootcmd fetches the PGDG key without a sha256sum -c pin (#4805)")
+        elif not re.search(r"(?<![\w-])set\s+-\w*e|(?<![\w-])exit\s+1(?![\w-])", v1):
+            out.append("bootcmd PGDG key pin cannot stop the item (no set -e, no exit 1: cc_bootcmd runs the next item anyway, #4805)")
     em = re.match(r"^\s*exec\w*=\s*([-@+!:]*)(\S+)", v1)
     if em is not None and ln.kind == "unit":
         binary = em.group(2)
@@ -1511,6 +1531,12 @@ def run_scan(templates: dict, maintfs: dict, allow_text: str, pending_text: str,
         lines, phits, entries, trig, homes = analyse(nm, text, cache)
         binaries = {m.group(1) for m in (re.match(r"^\s*Exec\w*=\s*[-@+!:]*(/\S+)", x.joined) for x in lines if x.kind == "unit") if m}
         hits.extend(phits)
+        live = [x.joined for x in lines if not x.exempt]
+        if any("pg_hba" in x for x in live):
+            if not any('"hostnossl all all all reject"' in x for x in live):
+                hits.append("%s: writes pg_hba without a live \"hostnossl all all all reject\" line (#4676)" % nm)
+            if not any(re.search(r"[\"']ssl = on[\"']", x) for x in live):
+                hits.append("%s: writes pg_hba without a live \"ssl = on\" line (#4704)" % nm)
         if not trig:
             faults.append("%s: zero triggered lines (fail closed)" % nm)
         ntrig += len(trig)
@@ -1881,22 +1907,22 @@ def build_probes() -> list:
     def dred(label, muts, autolist=False, **kw):
         P.append((label, "red", dict(do=muts, autolist=autolist, **kw)))
 
-    dred("D-4676 hostnossl reject narrowed to one role", [(DNOSSL, "            \"hostnossl aimemory aimemory all reject\" \\\n")])
-    dred("D-4676 hostnossl reject line deleted", [(DNOSSL, "")])
-    dred("D-4676 hostnossl reject turned into an accept", [(DNOSSL, "            \"hostnossl all all all scram-sha-256\" \\\n")])
-    dred("D-4704 ssl = off with ssl = on only in a comment", [(DSSL, "# ssl = on\n        printf '%s\\n' \"# ai-memory-tls (#4635)\" \"ssl = off\" \\\n")])
-    dred("D-4704 hostssl turned into host for the aimemory role", [(DHBA, "            \"host aimemory aimemory 127.0.0.1/32 scram-sha-256\" \\\n")])
-    dred("D-4704 digest check ignored with || true (non-tar name)", [(DSHA, "| sha256sum -c - || true\n")])
-    dred("D-4704 digest check ignored with || :", [(DSHA, "| sha256sum -c - || :\n")])
-    dred("D-4702 store-url authority port with a leading zero", [(DDSN, DDSN.replace("@localhost/", "@localhost:06432/"))])
-    dred("D-4702 store-url port= query key", [(DDSN, DDSN + "&port=6432")])
-    dred("D-4702 store-url host= query key", [(DDSN, DDSN + "&host=db.example.com")])
-    dred("D-4702 provision writes a second store URL", [(RELOAD, "      printf '%s\\n' '" + PG + "aimemory:x@127.0.0.1:6432/aimemory?sslmode=verify-full' > /etc/ai-memory/store-url\n" + RELOAD)])
+    dred("D-4676 hostnossl reject narrowed to one role", [(DNOSSL, "            \"hostnossl aimemory aimemory all reject\" \\\n")], autolist=True)
+    dred("D-4676 hostnossl reject line deleted", [(DNOSSL, "")], autolist=True)
+    dred("D-4676 hostnossl reject turned into an accept", [(DNOSSL, "            \"hostnossl all all all scram-sha-256\" \\\n")], autolist=True)
+    dred("D-4704 ssl = off with ssl = on only in a comment", [(DSSL, "# ssl = on\n        printf '%s\\n' \"# ai-memory-tls (#4635)\" \"ssl = off\" \\\n")], autolist=True)
+    dred("D-4704 hostssl turned into host for the aimemory role", [(DHBA, "            \"host aimemory aimemory 127.0.0.1/32 scram-sha-256\" \\\n")], autolist=True)
+    dred("D-4704 digest check ignored with || true (non-tar name)", [(DSHA, "| sha256sum -c - || true\n")], autolist=True)
+    dred("D-4704 digest check ignored with || :", [(DSHA, "| sha256sum -c - || :\n")], autolist=True)
+    dred("D-4702 store-url authority port with a leading zero", [(DDSN, DDSN.replace("@localhost/", "@localhost:06432/"))], autolist=True)
+    dred("D-4702 store-url port= query key", [(DDSN, DDSN + "&port=6432")], autolist=True)
+    dred("D-4702 store-url host= query key", [(DDSN, DDSN + "&host=db.example.com")], autolist=True)
+    dred("D-4702 provision writes a second store URL", [(RELOAD, "      printf '%s\\n' '" + PG + "aimemory:x@127.0.0.1:6432/aimemory?sslmode=verify-full' > /etc/ai-memory/store-url\n" + RELOAD)], autolist=True)
     dred("D-4705 SQL E-string password literal with a terraform value", [(RELOAD, "      sudo -u postgres psql -c \"ALTER USER aimemory WITH PASSWORD E'$${db_password}';\"\n" + RELOAD)], autolist=True)
     dred("D-4705 SQL dollar-quoted password literal with a terraform value", [(RELOAD, "      sudo -u postgres psql -c 'ALTER USER aimemory WITH PASSWORD $$${db_password}$$;'\n" + RELOAD)], autolist=True)
     dred("D-4705 SQL password literal with a prefix before the terraform value", [(RELOAD, "      sudo -u postgres psql -c \"ALTER USER aimemory WITH PASSWORD 'pre$${db_password}';\"\n" + RELOAD)], autolist=True)
     dred("D-4671 terraform secret interpolated into the store-url", [(DDSN, DDSN.replace("CHANGEME", "$${db_password}"))], autolist=True)
-    dred("D-4677 channel_binding in the store-url", [(DDSN, DDSN + "&channel_binding=require")])
+    dred("D-4677 channel_binding in the store-url", [(DDSN, DDSN + "&channel_binding=require")], autolist=True)
     dred("D-4712 unit binary under the service user home", [("ExecStart=" + DBIN + " serve", "ExecStart=/var/lib/ai-memory/bin/ai-memory serve")], autolist=True)
     dred("D-4712 unit binary back under /opt/ai-memory", [("ExecStart=" + DBIN + " serve", "ExecStart=/opt/ai-memory/bin/ai-memory serve")])
     dred("D-4712 expanded command word in the identity step", [("          " + DBIN + " identity generate", "          \"$BIN\" identity generate")], autolist=True)
@@ -1904,6 +1930,8 @@ def build_probes() -> list:
     dred("D-4673 tarball extracted into the binary directory", [(DTAR, "tar -xzf \"$DL/ai-memory.tar.gz\" --no-same-owner -C /usr/local/lib/ai-memory/bin\n")])
     dred("D-4675 CA key written to the persistent TLS directory", [("PGCA=/run/ai-memory-pgca\n", "PGCA=/etc/ai-memory/tls\n")])
     dred("D-4675 CA key wipe removed", [("      trap wipe_pgca EXIT\n", "")])
+    dred("D-4805 PGDG key pin item without set -e", [("set -e; install -d -m 0755 /usr/share/postgresql-common/pgdg; rm -f", "install -d -m 0755 /usr/share/postgresql-common/pgdg; rm -f")], autolist=True)
+    dred("D-4805 PGDG key fetched with no sha256sum pin", [(" | sha256sum -c -;", " | cat;")], autolist=True)
     dred("D-4707 provision line de-indented below the block but inside it", [("      systemctl daemon-reload\n      # TLS is universal", "     systemctl daemon-reload\n      # TLS is universal")])
     P.append(("A real templates (green control)", "green", dict(autolist=False)))
     return P
