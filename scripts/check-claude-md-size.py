@@ -15,7 +15,11 @@ What this gate enforces (and nothing more):
      not count), so deleting, renaming or hiding a rule section fails.
   4. Each reference file starts with its expected top heading and is at least
      its minimum size, so truncating or emptying it fails.
-It does NOT verify the wording of any section body, and it does not prove that
+  5. The `### Binding rules that live in the reference file` index is present in the
+     Architecture and Code Style pointer sections with at least the pinned number of
+     entries, and every quote in it is present verbatim at its cited lines of the
+     reference file it names.
+It does NOT verify the wording of any other section body, and it does not prove that
 moved text is unchanged; those need review. Heading, size and ceiling constants
 are pinned: ceilings only fall, floors only rise, and a change to any of them is
 an explicit decision.
@@ -64,6 +68,20 @@ REFERENCE_FILES = (
     ("docs/reference/CODE_STYLE.md", "# ai-memory Code Style Reference", 45_000),
 )
 REFERENCE_PATHS = tuple(entry[0] for entry in REFERENCE_FILES)
+
+# The binding-rules index (#4507 L1): agent-directed prohibitions that live only in a reference file are
+# quoted verbatim in CLAUDE.md so they bind even if the reference file is never opened. Each pointer
+# section must carry the index heading and at least the listed number of entries; every entry's quote
+# must be present verbatim (line breaks joined by one space) at the cited lines of its reference file.
+# Floors only rise: adding an index entry raises the count here, removing one is an explicit decision.
+INDEX_HEADING = "### Binding rules that live in the reference file"
+INDEX_MIN_QUOTE_CHARS = 20
+# (CLAUDE.md `## ` section, reference basename without .md, minimum entry count)
+INDEX_SECTIONS = (
+    ("## Architecture", "ARCHITECTURE_REFERENCE", 2),
+    ("## Code Style", "CODE_STYLE", 6),
+)
+INDEX_ENTRY = re.compile(r'^- `([A-Z_]+)\.md:(\d+)(?:-(\d+))?` "(.+)"$')
 
 
 def regular_size(path: Path, label: str, errors: list):
@@ -138,9 +156,70 @@ def headings_outside_fences(text: str) -> list:
     return [line.rstrip() for line in visible_lines(text) if line.startswith("## ")]
 
 
+def sections_of(visible: list) -> dict:
+    """Map each visible `## ` heading to the visible lines under it (first occurrence wins)."""
+    sections = {}
+    current = None
+    for line in visible:
+        if line.startswith("## "):
+            current = line.rstrip()
+            sections.setdefault(current, [])
+        elif current is not None:
+            sections[current].append(line.rstrip())
+    return sections
+
+
+def check_index(visible: list, ref_lines: dict, errors: list) -> None:
+    """Fail unless each pointer section carries its binding-rules index and every quote is verbatim."""
+    sections = sections_of(visible)
+    for heading, name, minimum in INDEX_SECTIONS:
+        lines = sections.get(heading)
+        if lines is None:
+            continue  # the missing pinned heading is already reported
+        if INDEX_HEADING not in lines:
+            errors.append(f"FAIL: CLAUDE.md section '{heading}' has no '{INDEX_HEADING}' block (#4507)")
+            continue
+        block = []
+        for line in lines[lines.index(INDEX_HEADING) + 1:]:
+            if line.startswith("#"):
+                break
+            if line.startswith("- "):
+                block.append(line)
+        verified = 0
+        for line in block:
+            match = INDEX_ENTRY.match(line)
+            if not match or len(match.group(4)) < INDEX_MIN_QUOTE_CHARS:
+                errors.append(f"FAIL: malformed binding-rules index entry under '{heading}': {line[:120]}")
+                continue
+            lo = int(match.group(2))
+            hi = int(match.group(3) or match.group(2))
+            where = f"{match.group(1)}.md:{lo}-{hi}"
+            if match.group(1) != name:
+                errors.append(f"FAIL: index entry under '{heading}' cites {where}, expected {name}.md")
+                continue
+            ref = ref_lines.get(name)
+            if ref is None:
+                continue  # the unreadable reference file is already reported
+            if not 1 <= lo <= hi <= len(ref):
+                errors.append(f"FAIL: index entry cites {where}, outside the {len(ref)}-line reference file")
+                continue
+            span = " ".join(part.strip() for part in ref[lo - 1:hi])
+            if match.group(4) not in span:
+                errors.append(f"FAIL: index quote is not verbatim at {where}: {match.group(4)[:100]}")
+                continue
+            verified += 1
+        if verified < minimum:
+            errors.append(
+                f"FAIL: '{heading}' index has {verified} verified entries, under the pinned minimum "
+                f"{minimum} (INDEX_SECTIONS); a binding rule was removed or altered (#4507)"
+            )
+
+
 def check(root: Path) -> list:
     """Return a list of failure messages (empty means pass)."""
     errors = []
+    visible = []
+    ref_lines = {}
     claude = root / "CLAUDE.md"
     size = regular_size(claude, "CLAUDE.md", errors)
     if size is not None:
@@ -161,7 +240,8 @@ def check(root: Path) -> list:
         except (OSError, UnicodeDecodeError) as exc:
             errors.append(f"FAIL: cannot read CLAUDE.md as UTF-8: {exc}")
             text = ""
-        present = set(headings_outside_fences(text))
+        visible = visible_lines(text)
+        present = {line.rstrip() for line in visible if line.startswith("## ")}
         for heading in CLAUDE_MD_REQUIRED_HEADINGS:
             if heading not in present:
                 errors.append(f"FAIL: CLAUDE.md is missing the required heading: {heading}")
@@ -176,25 +256,48 @@ def check(root: Path) -> list:
                 "the moved reference content appears to have been truncated (#4507)."
             )
         try:
-            with path.open(encoding="utf-8") as handle:
-                first = handle.readline().rstrip("\n")
+            ref_text = path.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError) as exc:
             errors.append(f"FAIL: cannot read {rel} as UTF-8: {exc}")
             continue
+        ref_lines[Path(rel).stem] = split_lines(ref_text)
+        first = ref_lines[Path(rel).stem][0]
         if first != top_heading:
             errors.append(f"FAIL: {rel} must start with the heading {top_heading!r}, found {first!r}")
+    check_index(visible, ref_lines, errors)
     return errors
 
 
+def fixture_quote(name: str, number: int) -> str:
+    return f"fixture binding rule {number} of {name} must never be dropped from the index"
+
+
+def fixture_claude_text() -> str:
+    """CLAUDE.md text that passes check() apart from the byte floor: pinned headings plus the index blocks."""
+    counts = {heading: (name, minimum) for heading, name, minimum in INDEX_SECTIONS}
+    lines = []
+    for heading in CLAUDE_MD_REQUIRED_HEADINGS:
+        lines.append(heading)
+        if heading in counts:
+            name, minimum = counts[heading]
+            lines += ["", INDEX_HEADING, ""]
+            lines += [f'- `{name}.md:{n + 1}` "{fixture_quote(name, n)}"' for n in range(1, minimum + 1)]
+            lines.append("")
+    return "\n".join(lines) + "\n"
+
+
 def build_fixture(root: Path) -> None:
-    """Write a tree that passes check(): all pinned headings, files at their floors."""
-    body = "\n".join(CLAUDE_MD_REQUIRED_HEADINGS) + "\n"
+    """Write a tree that passes check(): all pinned headings and index blocks, files at their floors."""
+    body = fixture_claude_text()
     pad = max(0, CLAUDE_MD_MIN_BYTES - len(body.encode("utf-8")))
     (root / "CLAUDE.md").write_text(body + "x" * pad, encoding="utf-8")
+    minimums = {name: minimum for _heading, name, minimum in INDEX_SECTIONS}
     for rel, top_heading, min_bytes in REFERENCE_FILES:
         target = root / rel
         target.parent.mkdir(parents=True, exist_ok=True)
-        head = top_heading + "\n"
+        name = Path(rel).stem
+        head = top_heading + "\n" + "".join(
+            fixture_quote(name, n) + "\n" for n in range(1, minimums.get(name, 0) + 1))
         target.write_text(head + "x" * (min_bytes - len(head)), encoding="utf-8")
 
 
@@ -235,7 +338,7 @@ def run_cases(base: Path) -> bool:
     ok &= expect(root, "a CLAUDE.md just over the ceiling (inclusive bound)", True, "ceiling")
 
     root = fresh()
-    text = "\n".join(CLAUDE_MD_REQUIRED_HEADINGS) + "\n"
+    text = fixture_claude_text()
     (root / claude_md).write_text(text + "x" * (CLAUDE_MD_MAX_BYTES - len(text.encode("utf-8"))), encoding="utf-8")
     ok &= expect(root, "a CLAUDE.md exactly at the ceiling", False)
 
@@ -324,6 +427,62 @@ def run_cases(base: Path) -> bool:
     text = (root / claude_md).read_text(encoding="utf-8").replace(heading + "\n", heading + " <!-- note -->\n", 1)
     (root / claude_md).write_text(text, encoding="utf-8")
     ok &= expect(root, "a heading followed by a trailing HTML comment (still renders)", False)
+    arch_h, style_h = INDEX_SECTIONS[0][0], INDEX_SECTIONS[1][0]
+    for label, sections in (("Architecture", (arch_h,)), ("Code Style", (style_h,)), ("both", (arch_h, style_h))):
+        root = fresh()
+        text = (root / claude_md).read_text(encoding="utf-8")
+        for heading in sections:
+            start = text.index(heading + "\n")
+            at = text.index(INDEX_HEADING, start)
+            end = text.index("\n## ", at)
+            text = text[:at] + text[end + 1:]
+        (root / claude_md).write_text(text + "x" * 5000, encoding="utf-8")
+        ok &= expect(root, f"CLAUDE.md with the binding-rules index deleted from {label}", True, "block (#4507)")
+
+    root = fresh()
+    text = (root / claude_md).read_text(encoding="utf-8").replace(
+        INDEX_HEADING + "\n", "<!--\n" + INDEX_HEADING + "\n", 1)
+    start = text.index("<!--\n" + INDEX_HEADING)
+    end = text.index("\n## ", start)
+    text = text[:end] + "\n-->" + text[end:]
+    (root / claude_md).write_text(text, encoding="utf-8")
+    ok &= expect(root, "an index hidden inside an HTML comment", True, "block (#4507)")
+
+    quote = fixture_quote("CODE_STYLE", 1)
+    root = fresh()
+    text = (root / claude_md).read_text(encoding="utf-8").replace(quote, quote.replace("must never", "may"), 1)
+    (root / claude_md).write_text(text, encoding="utf-8")
+    ok &= expect(root, "an index quote altered in CLAUDE.md", True, "not verbatim")
+
+    root = fresh()
+    path = root / style
+    text = path.read_text(encoding="utf-8").replace(quote, "y" * len(quote), 1)
+    path.write_text(text, encoding="utf-8")
+    ok &= expect(root, "a quoted line removed from the reference file", True, "not verbatim")
+
+    root = fresh()
+    text = (root / claude_md).read_text(encoding="utf-8").replace("CODE_STYLE.md:2`", "CODE_STYLE.md:99999`", 1)
+    (root / claude_md).write_text(text, encoding="utf-8")
+    ok &= expect(root, "an index entry citing lines beyond the reference file", True, "outside the")
+
+    root = fresh()
+    lines = (root / claude_md).read_text(encoding="utf-8").split("\n")
+    drop = next(i for i, line in enumerate(lines) if line.startswith("- `ARCHITECTURE_REFERENCE.md:"))
+    del lines[drop]
+    (root / claude_md).write_text("\n".join(lines) + "x" * 5000, encoding="utf-8")
+    ok &= expect(root, "an index entry removed below the pinned minimum", True, "pinned minimum")
+
+    root = fresh()
+    text = (root / claude_md).read_text(encoding="utf-8").replace(
+        '- `CODE_STYLE.md:2`', '- `ARCHITECTURE_REFERENCE.md:2`', 1)
+    (root / claude_md).write_text(text, encoding="utf-8")
+    ok &= expect(root, "an index entry citing the other section's reference file", True, "expected CODE_STYLE.md")
+
+    root = fresh()
+    text = (root / claude_md).read_text(encoding="utf-8").replace(
+        '- `CODE_STYLE.md:3` "', '- CODE_STYLE.md:3 "', 1)
+    (root / claude_md).write_text(text, encoding="utf-8")
+    ok &= expect(root, "a malformed index entry", True, "malformed binding-rules index entry")
     return ok
 
 
