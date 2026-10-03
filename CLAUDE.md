@@ -1731,7 +1731,7 @@ ruling: *"Anchors that miss 6/6 are worse than no anchors — they cost
 the reviewer trust they cannot get back."* The class is worse than
 value drift because a wrong VALUE is falsifiable in one grep, while a
 wrong ANCHOR sends the reader to the wrong place and then makes them
-doubt everything else. FOUR rules, all keyed on PATH-QUALIFIED grammar:
+doubt everything else. FIVE rules, all keyed on PATH-QUALIFIED grammar:
 **PATH** (a cited `src/<p>.rs` must exist — this is what caught the
 pre-modularisation `src/handlers.rs` / `src/mcp.rs` / `src/db.rs`
 anchors still live in the operator guides), **LINE** (a `src/<p>.rs:<N>`
@@ -1740,7 +1740,10 @@ anchor must name a line the file has), **QUAL** (every identifier in
 THAT FILE — each `::` component is checked, so
 `VectorIndex::build_with_capacity` resolves only if both do), and
 **MDLINK** (a ``[`sym`](../src/<p>.rs)`` link must resolve, or `sym`
-must BE the module's file stem, which is a legitimate module citation).
+must BE the module's file stem, which is a legitimate module citation), and **BARE_LN**
+(#4651: a bare, un-backticked `src/<p>.rs:<N>` in prose, a link label or
+HTML text is a finding that FAILS, unless it labels a commit-pinned
+`/blob/<hex sha>/` permalink, which is immutable).
 
 **What is deliberately NOT a rule:** a bare backticked identifier
 sharing a line with a `src/` path. Measured against the tree that
