@@ -102,8 +102,11 @@ write_files:
 
       # --- user + dirs ---
       id aimemory >/dev/null 2>&1 || useradd -m -d /opt/ai-memory -s /bin/bash aimemory
-      mkdir -p /opt/ai-memory/bin
-      chown -R aimemory:aimemory /opt/ai-memory
+      # #4665: the service owns its home, but NOT bin: the binary is installed
+      # root-owned below and must never be re-chowned to the service user.
+      install -d -o root -g root -m 0755 /opt/ai-memory/bin
+      find /opt/ai-memory -path /opt/ai-memory/bin -prune -o \
+        -exec chown aimemory:aimemory {} +
       # #4577/#4619: the service user traverses /etc/ai-memory and owns the DSN
       # file (mode stays 0600).
       chown root:aimemory /etc/ai-memory
@@ -275,9 +278,16 @@ write_files:
       curl -fsSL "${ai_memory_image_url}" -o "$DL/ai-memory.tar.gz"
       echo "${ai_memory_image_sha256}  $DL/ai-memory.tar.gz" | sha256sum -c - \
         || { echo "ai-memory tarball digest mismatch"; rm -f "$DL/ai-memory.tar.gz"; exit 1; }
-      tar -xzf "$DL/ai-memory.tar.gz" --no-same-owner -C /opt/ai-memory/bin
-      chmod 0755 /opt/ai-memory/bin/ai-memory
-      chown -R aimemory:aimemory /opt/ai-memory/bin
+      # #4665: extract only the one member into a root-only staging dir (never
+      # into a directory the service user can write), then install a root-owned
+      # binary the service cannot modify; no root chmod/tar touches a path the
+      # service controls.
+      rm -rf "$DL/x"
+      install -d -m 0700 "$DL/x"
+      tar -xzf "$DL/ai-memory.tar.gz" --no-same-owner -C "$DL/x" ai-memory
+      install -d -o root -g root -m 0755 /opt/ai-memory/bin
+      install -o root -g root -m 0755 "$DL/x/ai-memory" /opt/ai-memory/bin/ai-memory
+      rm -rf "$DL/x"
       runuser -u aimemory -- /opt/ai-memory/bin/ai-memory --version
 
       systemctl daemon-reload
