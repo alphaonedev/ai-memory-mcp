@@ -291,8 +291,11 @@ Gates that check the environment-variable table or pinned counts read it there.
 
 These bind you even if you never open `docs/reference/ARCHITECTURE_REFERENCE.md`. Quoted verbatim (line breaks joined), anchored `file:line`:
 
+- `ARCHITECTURE_REFERENCE.md:132` "Do not "fix" `resolve_store_url` to match the general ladder."
 - `ARCHITECTURE_REFERENCE.md:141-143` "`secret` = leaks credentials or override authority if logged or echoed; MUST NOT appear in capabilities, banners, audit records, or `tracing` output."
 - `ARCHITECTURE_REFERENCE.md:144` "`test-only` = honored in test builds; never set in production."
+- `ARCHITECTURE_REFERENCE.md:646-647` "do not use it for security decisions without pairing with agent registration"
+- `ARCHITECTURE_REFERENCE.md:729` "**Special metadata keys produced by the system** (do not overwrite):"
 
 ## Adding New Functionality
 
@@ -392,6 +395,7 @@ Do not inline the detail here; grep the rule you need in that file, do not read 
 These bind you even if you never open `docs/reference/CODE_STYLE.md`. Quoted verbatim (line breaks joined), anchored `file:line`:
 
 - `CODE_STYLE.md:103-105` "It is a ratchet: existing duplications are grandfathered, new duplication fails, and the baseline may only shrink ("thresholds rise, never fall")."
+- `CODE_STYLE.md:142-143` "Every other production-code site must read the vendor string from `crate::llm::*` / `crate::config::*`"
 - `CODE_STYLE.md:153-155` "Use the named constants from `src/lib.rs`: `SECS_PER_HOUR` (3_600), `SECS_PER_DAY` (86_400), `SECS_PER_WEEK` (604_800)."
 - `CODE_STYLE.md:195-199` "HARD-BLOCKS the case-insensitive pattern `rqgm|epoch_manifest|red.?queen` anywhere in `src/` (string literal or comment) — these are internal design-doc identifiers that must never leak into the shipped binary's symbol/string surface."
 - `CODE_STYLE.md:233` "**The historical guard is load-bearing and must not be weakened.**"
