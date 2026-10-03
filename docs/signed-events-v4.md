@@ -74,12 +74,12 @@ Since #3354 a ledger-writing command generates that key at boot when it
 is absent ([`ensure_daemon_signing_key`](../src/governance/audit.rs)) and
 refuses to start ([`unsigned_ledger_refusal`](../src/governance/audit.rs))
 when it can neither load nor generate one, so a writer never appends an
-unsigned row. A process that is not a ledger writer and has no key
-prints the one-line [`unsigned_ledger_warning`](../src/governance/audit.rs)
-at boot and its rows carry an empty signature +
-`attest_level = "unsigned"`. The cross-row hash chain remains
-tamper-evident in either posture — only the per-row signature property
-is degraded.
+unsigned row. Every process except the key-provisioning verbs ensures
+the key at boot, and no flag or posture lets a writer continue unsigned
+(serve, mcp and sync-daemon are all writers). A read-only, egress or
+remediation verb whose key cannot be ensured runs keyless and appends no
+`signed_events` rows. The state is reported by the `doctor` identity
+facts (`daemon_signing`, `signing`), not by a boot line. The cross-row hash chain remains tamper-evident.
 
 ## Backfill (v33 → v34)
 

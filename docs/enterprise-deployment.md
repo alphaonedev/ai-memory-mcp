@@ -234,10 +234,12 @@ ledger-writing command generates that key at boot when it is absent
 ([`ensure_daemon_signing_key`](../src/governance/audit.rs)) and refuses to
 start ([`unsigned_ledger_refusal`](../src/governance/audit.rs)) when it can
 neither load nor generate one, so a writer never appends an unsigned row.
-A process that is not a ledger writer and has no key prints the one-line
-[`unsigned_ledger_warning`](../src/governance/audit.rs) at boot and its rows
-carry `attest_level=unsigned` (the cross-row hash chain is still
-tamper-evident).
+Every process except the key-provisioning verbs ensures the key at boot,
+and no flag or posture lets a writer continue unsigned (serve, mcp and
+sync-daemon are all writers). A read-only, egress or remediation verb whose
+key cannot be ensured runs keyless and appends no `signed_events` rows; the
+state is reported by the `doctor` identity facts (`daemon_signing`,
+`signing`), not by a boot line. The cross-row hash chain is tamper-evident.
 Graduating to T2/T3 is a no-op if keypairs already exist — you just
 import the peer's public key on the destination side; graduating from
 "no keypair" to "keypair" mid-flight rewrites the audit story.
@@ -1911,7 +1913,7 @@ for the single-instance baseline.
 - [ ] Every agent has its own Ed25519 keypair (`ai-memory identity generate`); private keys mode 0600 under the canonical key directory.
 - [ ] No keypair shared across agents.
 - [ ] Key rotation playbook documented; old keys preserved under `<id>.key.rotated-<timestamp>` for historical signature verification ([`signed-events-v4.md`](signed-events-v4.html)).
-- [ ] Daemon `agent_id` has a keypair on disk; the boot-time unsigned-ledger warning ([`unsigned_ledger_warning`](../src/governance/audit.rs)) is a T3-graduation blocker, and a ledger-writing command that cannot load or generate the key refuses to start ([`unsigned_ledger_refusal`](../src/governance/audit.rs)).
+- [ ] Daemon `agent_id` has a keypair on disk; a ledger writer that cannot load or generate the key refuses to start ([`unsigned_ledger_refusal`](../src/governance/audit.rs)), so the T3-graduation check is that the `doctor` identity facts report `daemon_signing` as `ready` and `signing` as `ready (<agent id>)`; any other value is a graduation blocker.
 
 ### 14.2 Transport — mTLS + API key (T3+)
 
