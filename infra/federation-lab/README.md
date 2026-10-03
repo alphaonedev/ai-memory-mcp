@@ -302,7 +302,7 @@ the posture exists to prevent.
 The kit does not ask you to take any of this on faith:
 
 - **Step 0** re-derives the pinned set from the Rust SSOT and fails on drift.
-- **Step 5** cold-boots a throwaway node under the *full* 17-knob profile and
+- **Step 5** cold-boots a throwaway node under the *full* asi-hard profile (every `src/security_profile.rs::KNOBS` entry) and
   records the real exit code, so the caveat is demonstrated rather than
   asserted. If that boot ever succeeds — i.e. #2942 is fixed on your build —
   the kit says so loudly and tells you this README is now stale.
