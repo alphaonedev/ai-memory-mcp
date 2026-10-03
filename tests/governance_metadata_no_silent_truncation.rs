@@ -35,7 +35,7 @@
 //! Fix-Closed Semantics
 //! --------------------
 //!
-//! Per K3/K9 substrate discipline (docs/reference/ARCHITECTURE_REFERENCE.md §"AI_MEMORY_PERMISSIONS_MODE"
+//! Per K3/K9 substrate discipline (`docs/reference/ARCHITECTURE_REFERENCE.md` §"AI_MEMORY_PERMISSIONS_MODE"
 //! / pm-v3 fail-CLOSED posture), overflow values are treated as
 //! operator misconfiguration and saturate to the SECURE extreme:
 //!

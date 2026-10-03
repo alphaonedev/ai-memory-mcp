@@ -2432,7 +2432,7 @@ impl AuditTrailReport {
 ///   evade detection. The residual-closing control for that hostile-host /
 ///   unsigned posture is shipping the forensic log OFF-HOST via the
 ///   `AI_MEMORY_LOG_SINK=syslog` tier (RFC 5424 over TLS, RFC 5425;
-///   ARCHITECTURE_REFERENCE.md env rows #86 / #88-90) so the anchor lands on a collector
+///   `ARCHITECTURE_REFERENCE.md` env rows #86 / #88-90) so the anchor lands on a collector
 ///   the host attacker cannot reach. A [`TruncationCheck::Unknown`]
 ///   verdict (no anchor available) withholds judgement — it never raises a
 ///   false alarm and never reports intact-because-of-anchor.

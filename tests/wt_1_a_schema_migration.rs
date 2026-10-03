@@ -504,7 +504,7 @@ async fn test_capabilities_db_schema_version_reports_36() {
 
 /// v0.7.0 #1112 — v49 archive-column-carry migration idempotency pin.
 ///
-/// Per docs/reference/ARCHITECTURE_REFERENCE.md §Architecture: v49 added 14 nullable columns to
+/// Per `docs/reference/ARCHITECTURE_REFERENCE.md` §Architecture: v49 added 14 nullable columns to
 /// `archived_memories` (`reflection_depth`, `atomised_into`,
 /// `atom_of`, `memory_kind`, `entity_id`, `persona_version`,
 /// `citations`, `source_uri`, `source_span`, `confidence_source`,
