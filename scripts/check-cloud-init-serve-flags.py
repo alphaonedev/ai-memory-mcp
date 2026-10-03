@@ -78,6 +78,9 @@ FIELD_RE = re.compile(r"^\s{4}pub (\w+):", re.M)
 ATTR_RE = re.compile(r"#\[arg\((.*?)\)\]", re.S)
 LONG_NAMED_RE = re.compile(r'\blong\s*=\s*"([^"]+)"')
 LONG_BARE_RE = re.compile(r"(?<![\w=])long\s*(?:,|$)")
+SHORT_NAMED_RE = re.compile(r"\bshort\s*=\s*'(.)'")
+SHORT_BARE_RE = re.compile(r"(?<![\w=])short\s*(?:,|$)")
+INTERP_RE = re.compile(r"\$?\$\{[A-Za-z_]\w*\}")
 ALIAS_RE = re.compile(r'\b(?:visible_)?alias(?:es)?\s*=\s*"([^"]+)"')
 EXEC_RE = re.compile(r"^[ \t]*ExecStart=(?P<cmd>.*)$", re.M)
 CONT_RE = re.compile(r"\\[ \t]*\n[ \t]*")
@@ -85,7 +88,8 @@ FLAG_RE = re.compile(r"^(--[A-Za-z][\w-]*)")
 
 
 def serve_flags(source: str) -> set:
-    """Long flags clap derives for ServeArgs: field name, or explicit long = name."""
+    """Flags clap derives for ServeArgs: ``--long`` (field name, or explicit
+    long = name) and ``-s`` (explicit short = 's', or bare short = first letter)."""
     body = STRUCT_RE.search(source)
     if body is None:
         raise RuntimeError("pub struct ServeArgs not found in " + str(SERVE_SRC))
@@ -104,15 +108,42 @@ def serve_flags(source: str) -> set:
         elif LONG_BARE_RE.search(attrs):
             flags.add("--" + fm.group(1).replace("_", "-"))
         flags.update("--" + n for n in ALIAS_RE.findall(attrs))
+        flags.update("-" + c for c in SHORT_NAMED_RE.findall(attrs))
+        if SHORT_BARE_RE.search(attrs):
+            flags.add("-" + fm.group(1)[0])
     if not flags:
-        raise RuntimeError("ServeArgs exposes no long flags")
+        raise RuntimeError("ServeArgs exposes no flags")
     return flags
 
 
 def strip_terraform(text: str) -> str:
-    """Drop terraform directives and interpolations so their words are not read as flags."""
-    text = re.sub(r"%\{[^}]*\}", " ", text)
-    return re.sub(r"\$\$?\{[^}]*\}", " ", text)
+    """Drop terraform ``%{ if }`` / ``%{ endif }`` directives so their words are
+    not read as flags. Interpolations (``${x}``, ``$${x}``) stay: they are
+    checked where they sit, because systemd expands them in ExecStart."""
+    return re.sub(r"%\{[^}]*\}", " ", text)
+
+
+def serve_arg_hits(name: str, lineno: int, after: list, known: set) -> list:
+    """Check every token after ``serve``: flags must be ServeArgs flags (long or
+    short), a value must directly follow its flag, and an expansion may only be
+    a whole ``${name}`` / ``$${name}`` inside a value (serve flags are literal)."""
+    hits = []
+    expect_value = False
+    for raw in after:
+        tok = raw.strip("\"'")
+        if "$" in INTERP_RE.sub("X", tok):
+            hits.append("%s:%d: serve argument %r holds an expansion that cannot be checked (flags must be literal; only a whole ${name} may be a value)" % (name, lineno, tok))
+        if tok.startswith("-") and tok != "-":
+            long_form = tok.startswith("--")
+            key = tok.split("=", 1)[0] if long_form else tok[:2]
+            if key not in known:
+                hits.append("%s:%d: serve flag %s is not a ServeArgs flag (unit would exit at start)" % (name, lineno, key))
+            expect_value = "=" not in tok if long_form else True
+        else:
+            if not expect_value:
+                hits.append("%s:%d: serve argument %r does not follow a flag (serve takes no positional arguments)" % (name, lineno, tok))
+            expect_value = False
+    return hits
 
 
 def serve_invocations(text: str) -> list:
@@ -121,13 +152,13 @@ def serve_invocations(text: str) -> list:
     ``unparsed`` is True when the line holds a ``serve`` token but the
     ai-memory binary could not be identified (fail closed, never skip).
     """
-    joined = CONT_RE.sub(" ", text)
+    joined, line_at = join_continuations(blank_comments(text))
     found = []
     for m in EXEC_RE.finditer(joined):
         tokens = strip_terraform(m.group("cmd")).split()
         if "serve" not in tokens:
             continue
-        line = joined.count("\n", 0, m.start()) + 1
+        line = line_at(m.start())
         bin_idx = next((i for i, t in enumerate(tokens) if posixpath.basename(t.lstrip("-@+!:")) == "ai-memory"), None)
         if bin_idx is None or "serve" not in tokens[bin_idx + 1:]:
             found.append((line, [], True))
@@ -280,14 +311,8 @@ def scan_text(name: str, text: str, known: set) -> list:
         if unparsed:
             hits.append("%s:%d: ExecStart names serve but the ai-memory binary was not identified (cannot check its flags)" % (name, lineno))
             continue
-        flags = []
-        for tok in after:
-            fm = FLAG_RE.match(tok)
-            if fm:
-                flags.append(fm.group(1))
-        for flag in flags:
-            if flag not in known:
-                hits.append("%s:%d: serve flag %s is not a ServeArgs field (unit would exit at start)" % (name, lineno, flag))
+        hits.extend(serve_arg_hits(name, lineno, after, known))
+        flags = [t.strip("\"'").split("=", 1)[0] for t in after if t.strip("\"'").startswith("-")]
         for req in REQUIRED_FLAGS:
             if req not in flags:
                 hits.append("%s:%d: serve has no %s (template policy: supply the listener certificate with the node IP SAN)" % (name, lineno, req))
@@ -342,6 +367,13 @@ def self_test(known: set) -> int:
         "4657 aws: second fetch_pinned definition": mutate(real, "      # pgvector v0.8.6 (git ls-remote", "      fetch_pinned() { true; }\n      # pgvector v0.8.6 (git ls-remote"),
         "4657 aws: failure handler replaced by true": mutate(real, handler, "|| true"),
         "4657 aws: git pull outside fetch_pinned": mutate(real, age_call, age_call + "        git -C /opt/age-src pull -q\n"),
+        "4658 aws: unknown short flag": mutate(real, "serve --host 0.0.0.0", "serve -b 0.0.0.0:9077 --host 0.0.0.0"),
+        "4658 aws: systemd ${VAR} after a value": mutate(real, "--port 9077 ", "--port 9077 ${EXTRA_SERVE_FLAGS} "),
+        "4658 aws: escaped $${VAR} after a value": mutate(real, "--port 9077 ", "--port 9077 $${EXTRA_SERVE_FLAGS} "),
+        "4658 aws: unbraced $VAR as a value": mutate(real, "--port 9077 ", "--port $PORT "),
+        "4658 aws: stray positional argument": mutate(real, "--port 9077 ", "--port 9077 stray "),
+        "4658 aws: short help flag": mutate(real, "serve --host", "serve -h --host"),
+        "4658 aws: partial interpolation with a bare dollar": mutate(real, "--port 9077 ", "--port ${a}$b "),
         "serve with unidentified binary": dsn + "ExecStart=/opt/ai-memory/bin/wrapper serve --host 0.0.0.0 --tls-cert /a --tls-key /b\n",
     }
     red = 0
@@ -352,6 +384,9 @@ def self_test(known: set) -> int:
             print("SELF-TEST FAIL: probe not flagged: " + label, file=sys.stderr)
     greens = {
         "4657 aws template as shipped": real,
+        "4658 value is a terraform interpolation": good.replace("--port 9077", "--port ${port}"),
+        "4658 value is a systemd ${VAR} (do-hive quorum-peers shape)": good + "ExecStart=/opt/ai-memory/bin/ai-memory serve --tls-cert /a --tls-key /b --quorum-peers $${PEERS}\n",
+        "4658 flag with = and an interpolation": good.replace("--port 9077", "--port=${port}"),
         "clean": good,
         "env wrapper": good.replace("ExecStart=/opt/", "ExecStart=/usr/bin/env /opt/"),
         "global flag before serve": good.replace("ai-memory serve", "ai-memory --db /x serve"),
