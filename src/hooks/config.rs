@@ -139,8 +139,7 @@ pub const MAX_TIMEOUT_MS: u32 = 30_000;
 
 /// v0.7.0 R3-S3 — default execution mode for a given event.
 ///
-/// The hook-pipeline reference (`docs/hook-pipeline.md`, section "Hot-path
-/// constraint") requires that hot-path events
+/// `docs/hook-pipeline.md` ("Hot-path constraint") requires that hot-path events
 /// must default to `mode = "daemon"` so a configured-but-unspecified
 /// hook does not pay subprocess spawn cost on every recall / search.
 /// Pre-R3 this was a documentation-only assertion: `HookConfig.mode`

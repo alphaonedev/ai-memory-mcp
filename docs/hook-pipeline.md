@@ -24,7 +24,7 @@ identically to v0.6.4 at the lifecycle layer.
 - **Capability registry entry:** `CapabilityHooks` in
   [`src/config.rs:944`](../src/config.rs).
 - **Config file:** `~/.config/ai-memory/hooks.toml` — hot-reloadable
-  via `SIGHUP` ([`src/hooks/config.rs:424`](../src/hooks/config.rs)).
+  via `SIGHUP` ([`spawn_reload_task`](../src/hooks/config.rs)).
 
 ## Configuration
 
@@ -40,28 +40,27 @@ namespace = "team/*"     # glob match (today: non-empty string accepted)
 fail_mode = "open"       # open (default) | closed
 ```
 
-Fields ([`src/hooks/config.rs:174-190`](../src/hooks/config.rs)):
+Fields ([`HookConfig`](../src/hooks/config.rs)):
 
 - **`event`** — one of the 22 events below.
 - **`command`** — absolute path to the helper binary.
 - **`priority`** — higher fires first; first `Deny` short-circuits the chain.
 - **`timeout_ms`** — wall-clock budget per call; capped at
-  `MAX_TIMEOUT_MS = 30_000` ([`src/hooks/config.rs:138`](../src/hooks/config.rs)).
+  `MAX_TIMEOUT_MS = 30_000` ([`MAX_TIMEOUT_MS`](../src/hooks/config.rs)).
   Exceeded → executor returns `Timeout`; chain converts per `fail_mode`.
 - **`mode`** — `daemon` (long-lived subprocess, stdin JSON-RPC) or
   `exec` (one-shot fork+exec; the helper MUST drain its stdin to EOF
   before exiting — see the exec stdin contract in §"Operator workflow",
   or it can be denied under load on `fail_mode = "closed"`). Optional in
   TOML; missing values resolve
-  via `default_mode_for_event` ([`src/hooks/config.rs:157`](../src/hooks/config.rs))
+  via [`default_mode_for_event`](../src/hooks/config.rs)
   — daemon for hot-path events (`post_recall`, `post_search`,
   `pre_recall_expand`), exec otherwise.
 - **`enabled`** — soft-disable without removing the row.
 - **`namespace`** — glob pattern; chain is filtered before invocation.
   `*` or empty (the schema default) matches every namespace; otherwise the
   pattern matches EXACTLY, or as a `prefix/*` glob covering the prefix itself
-  and any child under it. Validation is shape-only (`validate_hook` at
-  [`src/hooks/config.rs:297`](../src/hooks/config.rs)); the runtime matcher is
+  and any child under it. Validation is shape-only ([`validate_hook`](../src/hooks/config.rs)); the runtime matcher is
   [`HookConfig::matches_namespace`](../src/hooks/config.rs). See
   §"Namespace scoping on pre-* events" below for how the in-flight namespace is
   resolved.
@@ -70,7 +69,7 @@ Fields ([`src/hooks/config.rs:174-190`](../src/hooks/config.rs)):
   chain `Deny` and short-circuit). Use `closed` only for
   compliance-critical hooks (PII redaction, regulated-tenant access
   control) where silent fail-open is worse than a hard refusal.
-  Defined at [`src/hooks/config.rs:111-122`](../src/hooks/config.rs).
+  Defined as [`FailMode`](../src/hooks/config.rs).
 
 ## Namespace scoping on pre-\* events (#2390)
 
@@ -269,7 +268,7 @@ counter for the "did we trip a budget since boot" panel.
 ## Hot-path constraint
 
 `post_recall` and `post_search` default to `mode = "daemon"`
-([`src/hooks/config.rs:157`](../src/hooks/config.rs)). The v0.6.3
+([`default_mode_for_event`](../src/hooks/config.rs)). The v0.6.3
 recall p95 budget is 50 ms; the daemon subprocess keeps the hook
 chain off the synchronous fork/exec path. `mode = "exec"` is
 permitted for these events but requires the explicit setting — the
@@ -285,14 +284,14 @@ the recall path for a full second.
 
 ## Hot-reload (SIGHUP)
 
-`spawn_reload_task` ([`src/hooks/config.rs:424`](../src/hooks/config.rs))
+[`spawn_reload_task`](../src/hooks/config.rs)
 listens for `SIGHUP` on Linux/macOS and atomically swaps the chain's
 config snapshot (a shared `Arc<HookConfigSnapshot>`, i.e.
 `RwLock<Vec<HookConfig>>`). Read-side dispatch resolves the
 snapshot once per fire, so a reload mid-fire never tears: any
 in-flight chain finishes against the old config; new chains see the
 new config. On non-Unix targets the function is a no-op
-([`src/hooks/config.rs:473`](../src/hooks/config.rs)).
+(the `#[cfg(not(unix))]` stub of [`spawn_reload_task`](../src/hooks/config.rs)).
 
 **Race window discussion.** Between the operator's `kill -HUP <pid>`
 and the chain snapshot swap there is a sub-millisecond window where a
@@ -308,7 +307,7 @@ before treating the reload as effective.
 
 On parse failure (TOML error, validation error, missing file) the
 reload task logs an error and **keeps the previous config**
-([`src/hooks/config.rs:456`](../src/hooks/config.rs)). The daemon
+([`spawn_reload_task`](../src/hooks/config.rs)). The daemon
 never reloads to an empty config because of operator typo — silent
 hook removal would be a security regression.
 
