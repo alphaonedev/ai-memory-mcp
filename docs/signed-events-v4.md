@@ -73,13 +73,12 @@ under the key directory ([`load_daemon_signing_key`](../src/governance/audit.rs)
 Since #3354 a ledger-writing command generates that key at boot when it
 is absent ([`ensure_daemon_signing_key`](../src/governance/audit.rs)) and
 refuses to start ([`unsigned_ledger_refusal`](../src/governance/audit.rs))
-when it can neither load nor generate one, so a writer never appends an
-unsigned row. Every process except the key-provisioning verbs ensures
-the key at boot, and no flag or posture lets a writer continue unsigned
-(serve, mcp and sync-daemon are all writers). A read-only, egress or
+when it can neither load nor generate one, so a writer never runs
+keyless. Every process except the key-provisioning verbs ensures the key
+at boot (serve, mcp and sync-daemon are all writers). A read-only, egress or
 remediation verb whose key cannot be ensured runs keyless (it is not
 refused at boot). The state is reported by the `doctor` identity
-facts (`daemon_signing`, `signing`), not by a boot line. The cross-row hash chain remains tamper-evident.
+facts (`daemon_signing`, `signing`), not by a boot line.
 
 ## Backfill (v33 → v34)
 
