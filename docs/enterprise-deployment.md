@@ -794,11 +794,13 @@ PgBouncer.
 > **Caveat — server-side prepared statements.** `transaction` mode
 > shares server connections across clients, so session-scoped
 > server-side prepared statements are not guaranteed to survive across
-> transactions. ai-memory's sqlx layer pins query plans via the
-> generic-plan path (#1472 follow-on, see CLAUDE.md) rather than
-> relying on long-lived named prepared statements, so it is compatible;
-> if you add a custom query path, do not assume a named prepared
-> statement persists beyond its transaction under PgBouncer.
+> transactions. ai-memory's sqlx layer does use sqlx's named prepared
+> statements on its hot path, so transaction mode is compatible only
+> with PgBouncer >= 1.21 and `max_prepared_statements` > 0 (the shipped
+> [`infra/pgbouncer/pgbouncer.ini`](../infra/pgbouncer/pgbouncer.ini)
+> sets 256; omitting it makes every query re-plan). If you add a custom
+> query path, do not assume a named prepared statement persists beyond
+> its transaction under PgBouncer.
 
 > **Caveat — `statement_timeout` / `lock_timeout` under transaction
 > mode (REQUIRED ops step).** The daemon installs its query-safety
