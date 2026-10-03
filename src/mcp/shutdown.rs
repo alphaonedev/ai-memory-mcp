@@ -363,7 +363,11 @@ pub struct StopSignals {
     #[cfg(unix)]
     hup: Option<tokio::signal::unix::Signal>,
     #[cfg(not(unix))]
-    ctrl_c: std::pin::Pin<Box<dyn Future<Output = std::io::Result<()>> + Send>>,
+    ctrl_c: Option<std::pin::Pin<Box<dyn Future<Output = std::io::Result<()>> + Send>>>,
+    /// The listener already completed with `Ok`: the future is dropped and
+    /// never polled again (a finished async future panics when re-polled).
+    #[cfg(not(unix))]
+    fired: bool,
 }
 
 #[cfg(unix)]
@@ -469,13 +473,22 @@ impl StopSignals {
             Box::pin(tokio::signal::ctrl_c());
         let first =
             std::future::poll_fn(|cx| std::task::Poll::Ready(ctrl_c.as_mut().poll(cx))).await;
-        if let std::task::Poll::Ready(Err(source)) = first {
-            return Err(StopInstallError {
+        match first {
+            std::task::Poll::Ready(Err(source)) => Err(StopInstallError {
                 signal: "SIGINT",
                 source,
-            });
+            }),
+            // A Ctrl-C inside the registering poll is an immediate stop; the
+            // finished future is dropped, never polled again.
+            std::task::Poll::Ready(Ok(())) => Ok(Self {
+                ctrl_c: None,
+                fired: true,
+            }),
+            std::task::Poll::Pending => Ok(Self {
+                ctrl_c: Some(ctrl_c),
+                fired: false,
+            }),
         }
-        Ok(Self { ctrl_c })
     }
 
     /// Resolve with the first stop signal.
@@ -492,8 +505,21 @@ impl StopSignals {
     /// signal (ERRORS-19).
     #[cfg(not(unix))]
     pub async fn recv(&mut self) -> StopSignal {
-        match (&mut self.ctrl_c).await {
-            Ok(()) => StopSignal::Int,
+        if self.fired {
+            return StopSignal::Int;
+        }
+        let Some(listener) = self.ctrl_c.as_mut() else {
+            return std::future::pending::<StopSignal>().await;
+        };
+        let outcome = listener.await;
+        // Ready: the future is finished, so drop it before anything can poll
+        // it again (CONCURRENCY-16).
+        self.ctrl_c = None;
+        match outcome {
+            Ok(()) => {
+                self.fired = true;
+                StopSignal::Int
+            }
             Err(e) => {
                 eprintln!("ai-memory: the Ctrl-C listener failed: {e}; it will not stop mcp");
                 std::future::pending::<StopSignal>().await

@@ -535,6 +535,51 @@ fn a_request_past_its_budget_is_never_acknowledged_and_keeps_its_row_4347() {
     assert_acked_write_durable(home.path());
 }
 
+/// F2 (mid-drain) — the fenced request is released AFTER the budget fence and
+/// BEFORE the exit, while the drain is slowed by the writer-delay seam. Only
+/// the `commit_ack` refusal keeps it unacknowledged now (the process is still
+/// alive and the loop thread wakes up), so removing that refusal turns this
+/// cell red. Its forensic row (queued before the hold) is still on disk.
+#[test]
+fn a_fenced_request_released_mid_drain_is_never_acknowledged_4347() {
+    let home = sandbox();
+    let dir = barrier_dir(home.path());
+    let mut s = Session::start_with(
+        home.path(),
+        &[
+            hold_env(HELD_ID, &dir),
+            ("AI_MEMORY_TEST_IN_FLIGHT_BUDGET_MS", "300".to_string()),
+            (TEST_FORENSIC_WRITER_DELAY_ENV, "1000".to_string()),
+        ],
+    );
+    s.send(
+        &json!({"jsonrpc":"2.0","id":HELD_ID,"method":"tools/call","params":{
+        "name":"memory_delete","arguments":{"id":"00000000-0000-4000-8000-000000007777"}}}),
+    );
+    wait_entered(&dir);
+    s.signal("TERM");
+    // The fence has fired and the (slowed) drain is running: release now.
+    s.wait_stderr_contains("did not finish within");
+    std::fs::write(dir.join("release"), b"").expect("release mid-drain");
+    let resp = s.read_response();
+    let status = s.wait_bounded();
+    let stderr = s.stderr_text();
+    assert_eq!(status.code(), Some(SIGTERM_CODE), "stderr: {stderr}");
+    assert!(
+        resp.is_none(),
+        "a fenced request released mid-drain was acknowledged: {resp:?}; stderr: {stderr}"
+    );
+    let recs = rows(home.path());
+    assert_eq!(
+        delete_rows(&recs),
+        2,
+        "rows: {:?}",
+        recs.iter().map(|r| r.kind.clone()).collect::<Vec<_>>()
+    );
+    assert_one_unbroken_chain(&recs);
+    assert_acked_write_durable(home.path());
+}
+
 /// B1 — a stop listener that cannot be installed means `mcp` REFUSES TO
 /// START: non-zero exit, a clear message, and not one response served.
 #[test]
@@ -740,8 +785,15 @@ fn a_pipelined_burst_cut_by_sigterm_loses_no_acknowledged_write_4347() {
         }
         let recs = rows(home.path());
         if recs.is_empty() {
-            // The signal beat the first request: nothing was acknowledged.
-            assert!(resp.is_empty(), "round {round}: acked without a row");
+            // The signal beat the first delete: no row exists, so no TOOL
+            // call may have been acknowledged. The initialize response
+            // (id 1) is always acknowledged first and is not a tool call.
+            let mut acked: Vec<u64> = resp.keys().copied().filter(|id| *id != 1).collect();
+            acked.sort_unstable();
+            assert!(
+                acked.is_empty(),
+                "round {round}: tool-call ids {acked:?} acknowledged without a forensic row; {err}"
+            );
             continue;
         }
         assert_one_unbroken_chain(&recs);
