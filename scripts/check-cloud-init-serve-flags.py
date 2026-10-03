@@ -1037,7 +1037,7 @@ def parse_template(name: str, text: str):
         phys.pop()
     lines, hits, entries, stmts = [], [], {}, []
     top, cur_path, sq = None, None, None
-    item_ind = None
+    item_ind, key_ind = None, None
     i, n = 0, len(phys)
     block_no = 0
     while i < n:
@@ -1071,7 +1071,7 @@ def parse_template(name: str, text: str):
                 top = m.group(1)
                 if top in ("bootcmd", "runcmd") and m.group(2).strip():
                     hits.append("%s:%d: %s must be a block list" % (name, i + 1, top))
-            cur_path, item_ind = None, None
+            cur_path, item_ind, key_ind = None, None, None
             lines.append(Line("top", "struct", raw, i + 1, i + 1))
             sq = scan_quotes(s, None)
             i += 1
@@ -1087,6 +1087,7 @@ def parse_template(name: str, text: str):
                     if cur_path in entries:
                         hits.append("%s:%d: write_files path %s written twice" % (name, i + 1, cur_path))
                     entries[cur_path] = {}
+                key_ind = ind + 2
                 lines.append(Line(cur_path, "struct", raw, i + 1, i + 1))
                 i += 1
                 continue
@@ -1094,6 +1095,10 @@ def parse_template(name: str, text: str):
                 hits.append("%s:%d: write_files key outside an entry" % (name, i + 1))
                 cur_path = "?"
             km = re.match(r"^([A-Za-z_]\w*):(.*)$", s)
+            if km is None:
+                hits.append("%s:%d: write_files line is neither '- path:' nor a 'key:' of the entry (%r)" % (name, i + 1, s[:40]))
+            elif key_ind is not None and ind != key_ind:
+                hits.append("%s:%d: write_files key at indent %d, the entry's keys are at %d" % (name, i + 1, ind, key_ind))
             if km is not None and cur_path in entries:
                 entries[cur_path][km.group(1)] = km.group(2).strip()
             lines.append(Line(cur_path, "struct", raw, i + 1, i + 1))
@@ -1323,6 +1328,8 @@ def validate_line(ln: Line, homes: set, binaries: set) -> list:
         out.extend(dsn_problems(m.group(0), ln.ctx))
     if "allow_lax" in v1:
         out.append("lax store-url permission opt-out")
+    if ln.kind != "unit" and re.search(r"(?<![\w-])ai-memory[\"']?\s+(?:\S+\s+)*?serve(?![\w-])", v1):
+        out.append("ai-memory serve outside the unit ExecStart (serve flags are checked only on ExecStart)")
     if re.search(r"pgpassword|pgpassfile", v1):
         out.append("PGPASSWORD/PGPASSFILE")
     if re.search(r"ai_memory_store_url\s*=", v1):
@@ -1473,6 +1480,27 @@ def tf_render(text: str) -> str:
     t = re.sub(r"%\{[^}]*\}", "", t)
     t = re.sub(r"\$\{[^}]*\}", "TFVALUE", t)
     return t.replace("\x00", "${").replace("\x01", "%{")
+
+
+def tf_region_spans(text: str) -> list:
+    """(first, last) physical line index of each region tf_regions returns, same order."""
+    out, start, depth = [], None, 0
+    for i, raw in enumerate(text.split("\n")):
+        is_dir = DIRECTIVE_LINE_RE.match(raw) is not None
+        if depth == 0 and not is_dir:
+            continue
+        if start is None:
+            start = i
+        if is_dir and TF_OPEN_RE.match(raw):
+            depth += 1
+        elif is_dir and TF_CLOSE_RE.match(raw):
+            depth -= 1
+        if depth <= 0:
+            out.append((start, i))
+            start, depth = None, 0
+    if start is not None:
+        out.append((start, len(text.split("\n")) - 1))
+    return out
 
 
 def analyse(name: str, text: str, cache: dict):
@@ -1827,6 +1855,10 @@ def build_probes() -> list:
         ("unit ExecStartPre sh -c eval, listed (#4793)", [(daemon_env, daemon_env + "      ExecStartPre=/bin/sh -c 'eval \"$PRE\"'\n")]),
         ("quoted heredoc with eval, listed (#4793)", [(dec, "      cat > /usr/local/bin/pre <<'EOF'\n      #!/bin/sh\n      eval \"$1\"\n      EOF\n" + dec)]),
         ("quoted heredoc with base64 -d | sh, listed (#4793)", [(dec, "      cat > /usr/local/bin/pre <<'EOF'\n      echo Y3VybA== | base64 -d | sh\n      EOF\n" + dec)]),
+        ("ai-memory serve in the provision script, listed (#4837)", [(dec, "      /usr/local/lib/ai-memory/bin/ai-memory serve --bind 0.0.0.0:9077\n" + dec)]),
+        ("sudo -u ai-memory --db serve in the provision script, listed (#4837)", [(dec, "      sudo -u aimemory /usr/local/lib/ai-memory/bin/ai-memory --db /x serve\n" + dec)]),
+        ("eval indented below the content block, listed (#4836)", [(dec, dec + '    eval "$PRE"\n')]),
+        ("eval indented to the write_files key, listed (#4836)", [(dec, dec + '  eval "$PRE"\n')]),
         ("write_files encoding b64, listed", [(PROV, "  - path: /etc/x.sh\n    encoding: b64\n    content: |\n      Y3VybCBodHRwczovL3g=\n" + PROV)]),
     ]
     for lbl, muts in listed:
@@ -1981,8 +2013,7 @@ def case_inputs(base: tuple, spec: dict):
 def verdict(hits: list, faults: list, spec: dict) -> str:
     if faults:
         return "fault"
-    core = [h for h in hits if "stale entry" not in h and "not in the allowlist" not in h
-            and "not the allowlist sequence" not in h] if spec.get("autolist") or spec.get("core") else hits
+    core = [h for h in hits if "stale entry" not in h and "not in the allowlist" not in h] if spec.get("autolist") or spec.get("core") else hits
     return "red" if core else "green"
 
 
@@ -1992,14 +2023,24 @@ def entry_mutations(base: tuple, cache: dict) -> list:
     templates, _, allow, _ = base
     out = []
     by_scope = {scope_of(nm): nm for nm in templates}
+    tf_seen = {}
     for raw in allow.splitlines():
         if not raw or raw.startswith("#"):
             continue
         sc, ctx, line = raw.split(" | ", 2)
         nm = by_scope["aws-gpu-burst" if sc == "both" else sc]
         if ctx == "tf-region":
-            head = DIRECTIVE_LINE_RE.search(templates[nm]).group(0)
-            out.append((raw, nm, templates[nm].replace(head, "%{ if true }", 1)))
+            k = tf_seen.get(nm, 0)
+            tf_seen[nm] = k + 1
+            spans = tf_region_spans(templates[nm])
+            if k >= len(spans) or tf_regions(templates[nm])[k] != line:
+                raise RuntimeError("self-test: tf-region entry %d matches no region in order: %s" % (k + 1, raw[:80]))
+            phys = templates[nm].split("\n")
+            a, b = spans[k]
+            body = [x for x in range(a, b + 1) if DIRECTIVE_LINE_RE.match(phys[x]) is None]
+            at = body[-1] if body else a
+            phys[at] = phys[at] + " #m" if body else "%{ if true }"
+            out.append((raw, nm, "\n".join(phys)))
             continue
         lines, _, _, trig, _ = analyse(nm, templates[nm], cache)
         ln = next((x for x in trig if x.ctx == ctx and x.text == line), None)
@@ -2027,7 +2068,8 @@ def self_test(known: set) -> int:
         t = dict(base[0])
         t[nm] = text
         hits, faults, _ = run_scan(t, base[1], base[2], base[3], known, cache=cache)
-        if faults or not any("not in the allowlist" in h for h in hits):
+        want = "| tf-region: " if " | tf-region | " in raw else "not in the allowlist"
+        if faults or not any(want in h for h in hits):
             bad.append("entry mutation stayed green: " + raw[:100])
     with contextlib.redirect_stderr(io.StringIO()):
         try:
@@ -2066,6 +2108,7 @@ def main(argv: list) -> int:
     if hits:
         print("\n".join(hits), file=sys.stderr)
         print("FAIL: %d cloud-init template defect(s)" % len(hits), file=sys.stderr)
+        print("  re-list approved lines in template order: scripts/regen-cloud-init-token-allow.py <repo-root>, then review its diff", file=sys.stderr)
         return 1
     print("PASS: %d templates, %d allow entries, %d pending entries, %d triggered lines, %d serve flags known"
           % (stats["templates"], stats["allow"], stats["pending"], stats["triggered"], len(known)))
