@@ -4,13 +4,19 @@
 #
 # #4616: the prior template could not produce a running daemon. (1) serve
 # refuses a non-loopback bind without an API key (api_key_bind_guard,
-# src/daemon_runtime.rs); (2) serve also refuses any bind without in-process
-# TLS (tls_bind_guard, src/daemon_runtime.rs); (3) the apt postgresql-16
-# package ships no Apache AGE, so CREATE EXTENSION age failed. This template
-# follows the infra/do-hive/cloud-init-memory.yaml.tpl precedent: PostgreSQL 18
-# from PGDG, pgvector and AGE built from the certified tags, a per-node API
-# key and a self-signed TLS pair minted ON the node (never in user-data), and
-# serve flags that exist in ServeArgs (--host, --port, --tls-cert, --tls-key).
+# src/daemon_runtime.rs:5970); (2) the apt postgresql-16 package ships no
+# Apache AGE, so CREATE EXTENSION age failed. This template follows the
+# infra/do-hive/cloud-init-memory.yaml.tpl precedent: PostgreSQL 18 from PGDG,
+# pgvector and AGE built from source, a per-node API key and a self-signed
+# TLS pair minted ON the node (never in user-data), and serve flags that exist
+# in ServeArgs (--host, --port, --tls-cert, --tls-key). The TLS flags are a
+# policy choice, not a serve refusal: with no flags serve resolves its own
+# certificate (resolve_tls_material, src/daemon_runtime.rs:6163-6225; it mints
+# a local-CA certificate for the declared singleton shape and refuses a
+# declared fleet shape that has no operator certificate). Supplying the pair
+# here puts the node's private IP in the certificate SAN for agents on other
+# hosts, and a flag pair is accepted whatever shape is declared
+# (src/daemon_runtime.rs:6226-6232).
 # The tarball binary must be built with --features sal-postgres: serve refuses
 # a postgres store URL otherwise (refuse_postgres_store_url_without_feature),
 # so a wrong binary fails closed at start with a message naming the feature.
@@ -220,7 +226,7 @@ write_files:
       chown root:aimemory "$CFG_DIR/config.toml"
       chmod 0640 "$CFG_DIR/config.toml"
 
-      # --- self-signed TLS pair (serve refuses a plaintext bind) --------
+      # --- self-signed TLS pair for the listener (--tls-cert/--tls-key) ----
       install -d -o root -g aimemory -m 0750 /etc/ai-memory/tls
       if [ ! -s /etc/ai-memory/tls/node.key ]; then
         PRIV_IP="$(hostname -I | cut -d' ' -f1)"

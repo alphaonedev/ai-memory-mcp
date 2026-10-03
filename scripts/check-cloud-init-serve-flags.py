@@ -15,8 +15,10 @@ For every ``ExecStart=`` line that runs ``ai-memory serve`` in a tracked
 
   * a ``--flag`` is not a field of ``ServeArgs`` in ``src/daemon_runtime.rs``
     (clap derives the long flag from the field name); or
-  * ``--tls-cert`` / ``--tls-key`` are not both present (``tls_bind_guard``
-    refuses every bind without in-process TLS); or
+  * ``--tls-cert`` / ``--tls-key`` are not both present (a policy choice: the
+    templates supply operator certificate material whose SAN carries the
+    node IP; serve itself would resolve its own certificate with no flags,
+    ``resolve_tls_material``, src/daemon_runtime.rs:6163-6225); or
   * the template contains a non-ASCII byte.
 
 Usage:
@@ -93,7 +95,7 @@ def scan_text(name: str, text: str, known: set) -> list:
                 hits.append("%s:%d: serve flag %s is not a ServeArgs field (unit would exit at start)" % (name, lineno, flag))
         for req in REQUIRED_FLAGS:
             if req not in flags:
-                hits.append("%s:%d: serve has no %s (tls_bind_guard refuses a plaintext bind)" % (name, lineno, req))
+                hits.append("%s:%d: serve has no %s (template policy: supply the listener certificate with the node IP SAN)" % (name, lineno, req))
     return hits
 
 

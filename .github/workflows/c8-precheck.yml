@@ -1316,8 +1316,9 @@ jobs:
   cloud-init-serve-flags-gate:
     # #4616 - a cloud-init memory template must start a daemon that can boot:
     # every serve flag is a ServeArgs field (src/daemon_runtime.rs), both TLS
-    # flags are present (tls_bind_guard refuses a plaintext bind), and the
-    # template is pure ASCII (#1880).
+    # flags are present (template policy, not a serve refusal), the store URL
+    # pins sslmode=verify-full (#3705 floor), and the template is pure ASCII
+    # (#1880).
     name: Cloud-init serve-flags gate (#4616)
     runs-on: ubuntu-latest
     timeout-minutes: 5
