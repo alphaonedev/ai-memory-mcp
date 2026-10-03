@@ -196,14 +196,20 @@ MDEOF
         '_src/mcp/tools/recall.rs:2_'
     bare_red "a bare anchor whose permalink pins a branch, not a commit" \
         '<a href="https://github.com/o/r/blob/release/src/mcp/tools/recall.rs#L2">src/mcp/tools/recall.rs:2</a>'
+    bare_red "a bare anchor whose permalink carries an abbreviated (9-hex) sha" \
+        "<a href=\"https://github.com/o/r/blob/${pin40:0:9}/src/mcp/tools/recall.rs#L2\">src/mcp/tools/recall.rs:2</a>"
+    bare_red "a bare anchor whose permalink names a hex-only branch" \
+        '[src/mcp/tools/recall.rs:2](https://github.com/o/r/blob/cafe1234/src/mcp/tools/recall.rs#L2)'
+    bare_red "a bare anchor whose URL has /blob/<hex>/ only in a query string" \
+        "[src/mcp/tools/recall.rs:2](https://example.com/x?u=/blob/${pin40}/src/mcp/tools/recall.rs#L2)"
     write_clean
     printf '\n\n[src/mcp/tools/recall.rs:2](https://github.com/o/r/blob/%s/src/mcp/tools/recall.rs#L2)\n' "$pin40" >> "$FIX/README.md"
-    printf '<a href="https://github.com/o/r/blob/%s/src/mcp/tools/recall.rs#L3">src/mcp/tools/recall.rs:3</a>\n' "${pin40:0:9}" >> "$FIX/README.md"
+    printf '<a href="https://github.com/o/r/blob/%s/src/mcp/tools/recall.rs#L3">src/mcp/tools/recall.rs:3</a>\n' "$pin40" >> "$FIX/README.md"
     printf 'Raw URL path https://github.com/o/r/blob/%s/src/mcp/tools/recall.rs:2 is not a label.\n' "$pin40" >> "$FIX/README.md"
     [[ "$(run_fixture)" = "0" ]] || {
         echo "FAIL: self-test #4651 — a commit-pinned permalink label was REJECTED" >&2
         run_fixture_out | sed 's/^/       /' >&2; exit 1; }
-    echo "PASS: self-test #4651 green control — commit-pinned permalink labels (40-hex and abbreviated) are ACCEPTED"
+    echo "PASS: self-test #4651 green control — commit-pinned (40-hex) permalink labels are ACCEPTED"
 
     # ---- a stale migrate_vNN (the #2629 issue title's own example) ---
     write_clean
@@ -409,8 +415,8 @@ PATHLN = re.compile(r"`(?:\.\./)*(src/[A-Za-z0-9_/]+\.rs):(\d+)")
 # precede the path (#4668).
 BARE_LN = re.compile(r"(?<![`/A-Za-z0-9.])(?:\.{1,2}/)*(src/[A-Za-z0-9_/]+\.rs):(\d+)")
 # A bare anchor is exempt ONLY as the label of a link whose target is a
-# commit-pinned permalink (/blob/<7-40 hex>/): immutable, cannot rot.
-PIN_URL = re.compile(r"/blob/[0-9a-f]{7,40}/")
+# commit-pinned permalink (/blob/<40 hex>/): immutable, cannot rot.
+PIN_URL = re.compile(r"^https://github\.com/[^/]+/[^/]+/blob/[0-9a-f]{40}/")
 LABEL_MD = re.compile(r"^[^\]\n]*\]\(([^)\s]*)")
 LABEL_HTML = re.compile(r"^[^<\n]*</a>")
 QUAL = re.compile(
@@ -440,11 +446,11 @@ def pinned_label(line, start, end):
     `[label](URL)` markdown or `<a href="URL">label</a>` HTML (#4651)."""
     rest = line[end:]
     md = LABEL_MD.match(rest)
-    if md and line[:start].rfind("[") > line[:start].rfind("]") and PIN_URL.search(md.group(1)):
+    if md and line[:start].rfind("[") > line[:start].rfind("]") and PIN_URL.match(md.group(1)):
         return True
     if LABEL_HTML.match(rest):
         href = re.findall(r'href="([^"]*)"', line[:start])
-        return bool(href) and line[:start].rfind("<a ") >= 0 and bool(PIN_URL.search(href[-1]))
+        return bool(href) and line[:start].rfind("<a ") >= 0 and bool(PIN_URL.match(href[-1]))
     return False
 
 
