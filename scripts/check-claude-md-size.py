@@ -36,6 +36,7 @@ import shutil
 import stat
 import sys
 import tempfile
+import unicodedata
 from pathlib import Path
 
 # Ceilings only fall (#4507 target: <= 80 KB). Keep CLAUDE.md short rather than raising this.
@@ -289,6 +290,50 @@ def html_errors(text: str, label: str) -> list:
     return errors
 
 
+# R3-F6: characters that make the bytes an agent tokenises differ from what a reviewer sees. Everything in
+# Unicode category Cf (bidi controls U+202A-U+202E and U+2066-U+2069, zero-width U+200B-U+200F, U+2060-U+2064,
+# U+00AD, U+FEFF, tag characters, ...), controls other than tab and a CRLF/LF break, line and paragraph
+# separators, private use and surrogates, plus the blank-looking letters and selectors below. The one
+# allowed exception: U+FE0F directly after a symbol (the emoji presentation selector of a warning sign).
+INVISIBLE_EXTRA = frozenset(
+    [0x034F, 0x115F, 0x1160, 0x17B4, 0x17B5, 0x2800, 0x3164, 0xFFA0, 0xFFFC] + list(range(0x180B, 0x1810)) +
+    list(range(0xFE00, 0xFE10)) + list(range(0xE0100, 0xE01F0)))
+
+
+def read_utf8(path: Path) -> str:
+    """Read the file as UTF-8 WITHOUT newline translation, so a bare CR stays visible to char_errors."""
+    return path.read_bytes().decode("utf-8")
+
+
+def char_errors(text: str, label: str) -> list:
+    """R3-F6: one message per distinct refused character (with its first line) and for a bare CR."""
+    errors = []
+    seen = {}
+    previous = ""
+    line = 1
+    for index, char in enumerate(text):
+        code = ord(char)
+        category = unicodedata.category(char)
+        bad = None
+        if char == "\r":
+            if text[index + 1:index + 2] != "\n":
+                bad = "bare CR"
+        elif char in "\n\t":
+            bad = None
+        elif code == 0xFE0F and unicodedata.category(previous) == "So":
+            bad = None
+        elif category in ("Cf", "Cc", "Zl", "Zp", "Co", "Cs") or code in INVISIBLE_EXTRA:
+            bad = f"invisible or control character U+{code:04X}"
+        if bad and bad not in seen:
+            seen[bad] = line
+            errors.append(f"FAIL: {label}:{line} {bad} (bidi, zero-width and control characters are refused, "
+                          "#4507 R3-F6)")
+        if char == "\n":
+            line += 1
+        previous = char
+    return errors
+
+
 def headings_outside_fences(text: str) -> list:
     """Return the `## ` heading lines of `text` that render (not fenced, not in an HTML comment)."""
     return [line.rstrip() for line in visible_lines(text) if line.startswith("## ")]
@@ -392,10 +437,11 @@ def check(root: Path, index_pins=None) -> list:
                 "(CLAUDE_MD_MIN_BYTES); rule-section content appears to have been removed (#4507)."
             )
         try:
-            text = claude.read_text(encoding="utf-8")
+            text = read_utf8(claude)
         except (OSError, UnicodeDecodeError) as exc:
             errors.append(f"FAIL: cannot read CLAUDE.md as UTF-8: {exc}")
             text = ""
+        errors += char_errors(text, "CLAUDE.md")
         errors += html_errors(text, "CLAUDE.md")
         visible = visible_lines(text)
         present = {line.rstrip() for line in visible if line.startswith("## ")}
@@ -425,10 +471,11 @@ def check(root: Path, index_pins=None) -> list:
                 "the moved reference content appears to have been truncated (#4507)."
             )
         try:
-            ref_text = path.read_text(encoding="utf-8")
+            ref_text = read_utf8(path)
         except (OSError, UnicodeDecodeError) as exc:
             errors.append(f"FAIL: cannot read {rel} as UTF-8: {exc}")
             continue
+        errors += char_errors(ref_text, rel)
         errors += html_errors(ref_text, rel)
         ref_lines[Path(rel).stem] = split_lines(ref_text)
         first = ref_lines[Path(rel).stem][0]
@@ -851,6 +898,46 @@ def run_cases(base: Path) -> bool:
         heading + "\n", heading + "\nUse Vec<String> and <push-pattern> #<issue> here.\n", 1)
     (root / claude_md).write_text(text, encoding="utf-8")
     ok &= expect(root, "R3-F5 inline angle brackets in prose are accepted", False)
+
+    # R3-F6: bidi and invisible characters, bare CR.
+    heading = CLAUDE_MD_REQUIRED_HEADINGS[12]
+    invisible = (("U+202E bidi override", "\u202e"), ("U+202C pop directional", "\u202c"),
+                 ("U+200B zero-width space", "\u200b"), ("U+200D zero-width joiner", "\u200d"),
+                 ("U+200F right-to-left mark", "\u200f"), ("U+2060 word joiner", "\u2060"),
+                 ("U+FEFF inside the text", "\ufeff"), ("U+2066 isolate", "\u2066"),
+                 ("U+2069 pop isolate", "\u2069"), ("U+00AD soft hyphen", "\u00ad"),
+                 ("U+E0041 tag character", "\U000e0041"), ("U+061C arabic letter mark", "\u061c"),
+                 ("U+3164 hangul filler", "\u3164"), ("U+034F combining grapheme joiner", "\u034f"),
+                 ("U+FE01 variation selector after a letter", "\ufe01"), ("U+FE0F after a letter", "\ufe0f"),
+                 ("U+2028 line separator", "\u2028"), ("NUL", "\x00"), ("U+2800 braille blank", "\u2800"),
+                 ("U+180E mongolian vowel separator", "\u180e"))
+    for label, char in invisible:
+        for where, target in (("CLAUDE.md", claude_md), ("CODE_STYLE.md", style), ("ARCHITECTURE_REFERENCE.md", arch)):
+            if where != "CLAUDE.md" and char not in ("\u202e", "\ufeff", "\u200b"):
+                continue
+            root = fresh()
+            path = root / target
+            text = path.read_text(encoding="utf-8")
+            anchor = heading if where == "CLAUDE.md" else REFERENCE_FILES[0 if where.startswith("ARCH") else 1][1]
+            path.write_text(text.replace(anchor, anchor[:6] + char + anchor[6:], 1), encoding="utf-8")
+            ok &= expect(root, f"R3-F6 {label} in {where}", True, "invisible")
+    root = fresh()
+    path = root / claude_md
+    path.write_bytes(path.read_bytes().replace(b"\n", b"\r", 1))
+    ok &= expect(root, "R3-F6 a bare CR line break", True, "bare CR")
+    root = fresh()
+    path = root / claude_md
+    path.write_bytes(b"\xef\xbb\xbf" + path.read_bytes())
+    ok &= expect(root, "R3-F6 a leading byte-order mark", True, "invisible")
+    root = fresh()
+    path = root / claude_md
+    path.write_bytes(path.read_bytes().replace(b"\n", b"\r\n"))
+    ok &= expect(root, "R3-F6 CRLF line endings are accepted", False)
+    root = fresh()
+    path = root / claude_md
+    path.write_text(path.read_text(encoding="utf-8").replace(
+        heading + "\n", heading + "\nA warning \u26a0\ufe0f sign.\n", 1), encoding="utf-8")
+    ok &= expect(root, "R3-F6 an emoji presentation selector after a symbol is accepted", False)
 
     root = fresh()
     text = (root / claude_md).read_text(encoding="utf-8").replace(
