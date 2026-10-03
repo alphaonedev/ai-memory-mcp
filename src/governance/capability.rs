@@ -2412,7 +2412,7 @@ mod tests {
     }
 
     /// The env knob's NAME is part of the operator contract (it is pinned in
-    /// the CLAUDE.md env ledger, which `scripts/check-docs-vs-ssot.sh`
+    /// the ARCHITECTURE_REFERENCE.md env ledger, which `scripts/check-docs-vs-ssot.sh`
     /// enforces) — renaming it silently would strand every deployment that
     /// exports it.
     #[test]
