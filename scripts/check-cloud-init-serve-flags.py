@@ -27,6 +27,9 @@ The gate scans the files matching ``infra/*/cloud-init-memory*.tpl`` on disk
   * the ``postgres://`` store URL has no ``sslmode=verify-full`` (the #3705
     floor, src/transit_encryption.rs:436-446), except a template listed in
     ``DSN_FLOOR_GAPS``; or
+  * the template runs ``git clone`` / ``git checkout`` of an extension source
+    (#4636: use ``fetch_pinned`` with a ``*_COMMIT=<40 hex>`` variable), or a
+    ``*_COMMIT=`` value is not a full 40-hex commit; or
   * the template contains a non-ASCII byte.
 
 Usage (any other argument exits 2):
@@ -58,6 +61,9 @@ REQUIRED_FLAGS = ("--tls-cert", "--tls-key")
 DSN_FLOOR_GAPS = {
     "infra/do-hive/cloud-init-memory.yaml.tpl": "#4635 do-hive pgbouncer leg",
 }
+GIT_FLOAT_RE = re.compile(r"^\s*(?:[^#\s][^#]*?)?\bgit\s+(?:clone|checkout)\b", re.M)
+COMMIT_RE = re.compile(r"^\s*(\w+_COMMIT)=(\S+)\s*$", re.M)
+HEX40_RE = re.compile(r"^[0-9a-f]{40}$")
 DSN_RE = re.compile(r"^\s+(postgres(?:ql)?://\S+)\s*$", re.M)
 STRUCT_RE = re.compile(r"pub struct ServeArgs \{(.*?)\n\}", re.S)
 FIELD_RE = re.compile(r"^\s{4}pub (\w+):", re.M)
@@ -142,6 +148,19 @@ def dsn_hits(name: str, text: str) -> list:
     return hits
 
 
+def pin_hits(name: str, text: str) -> list:
+    """#4636: extension sources are fetched by full commit, never by a movable ref."""
+    hits = []
+    for m in GIT_FLOAT_RE.finditer(text):
+        lineno = text.count("\n", 0, m.start()) + 1
+        hits.append("%s:%d: git clone/checkout of a movable ref (use fetch_pinned with a *_COMMIT 40-hex pin, #4636)" % (name, lineno))
+    for m in COMMIT_RE.finditer(text):
+        if not HEX40_RE.match(m.group(2)):
+            lineno = text.count("\n", 0, m.start()) + 1
+            hits.append("%s:%d: %s is not a full 40-hex commit" % (name, lineno, m.group(1)))
+    return hits
+
+
 def scan_text(name: str, text: str, known: set) -> list:
     """Return one message per defect found in a template's text."""
     hits = []
@@ -149,6 +168,7 @@ def scan_text(name: str, text: str, known: set) -> list:
         if any(ord(ch) > 127 for ch in line):
             hits.append("%s:%d: non-ASCII byte (cloud-init discards the config, #1880)" % (name, lineno))
     hits.extend(dsn_hits(name, text))
+    hits.extend(pin_hits(name, text))
     invocations = serve_invocations(text)
     if not invocations:
         hits.append("%s: no ExecStart runs 'ai-memory serve' (nothing to check; a template that cannot start serve must not pass)" % name)
@@ -194,6 +214,9 @@ def self_test(known: set) -> int:
         "global flag before serve, bad flag": good.replace("ai-memory serve", "ai-memory --db /x serve").replace("--port", "--prot"),
         "continuation, tls key on next line missing": dsn + "ExecStart=/opt/ai-memory/bin/ai-memory serve --host 0.0.0.0 \\\n  --tls-cert /a\n",
         "continuation, bad flag": good.replace("--port 9077", "\\\n  --prot 9077"),
+        "git clone of a branch": good + "        git clone https://github.com/apache/age.git /opt/age-src\n",
+        "git checkout of a branch": good + "        git checkout release/PG18/1.8.0\n",
+        "short commit pin": good + "      AGE_COMMIT=e43dc1a\n",
         "serve with unidentified binary": dsn + "ExecStart=/opt/ai-memory/bin/wrapper serve --host 0.0.0.0 --tls-cert /a --tls-key /b\n",
     }
     red = 0
@@ -207,6 +230,7 @@ def self_test(known: set) -> int:
         "env wrapper": good.replace("ExecStart=/opt/", "ExecStart=/usr/bin/env /opt/"),
         "global flag before serve": good.replace("ai-memory serve", "ai-memory --db /x serve"),
         "continuation": good.replace("--port 9077", "\\\n  --port 9077"),
+        "pinned fetch": good + "      AGE_COMMIT=e43dc1a12b78fba4acef9835b2b10379b8d243b4\n      # git clone is only mentioned in a comment\n",
         "terraform directive": good.rstrip() + "%{ if x } --quorum-writes 2%{ endif }\n",
     }
     clean = 0
