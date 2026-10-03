@@ -17,8 +17,8 @@ What this gate enforces (and nothing more):
      its minimum size, so truncating or emptying it fails.
   5. The `### Binding rules that live in the reference file` index is present in the
      Architecture and Code Style pointer sections with at least the pinned number of
-     entries, and every quote in it is present verbatim at its cited lines of the
-     reference file it names.
+     entries, every quote in it EQUALS the full text of its cited lines of the
+     reference file it names, and the set of quotes equals INDEX_QUOTE_PINS.
 It does NOT verify the wording of any other section body, and it does not prove that
 moved text is unchanged; those need review. Heading, size and ceiling constants
 are pinned: ceilings only fall, floors only rise, and a change to any of them is
@@ -125,6 +125,35 @@ INDEX_SECTIONS = (
     ("## Architecture", "ARCHITECTURE_REFERENCE", 5),
     ("## Code Style", "CODE_STYLE", 7),
 )
+# R3-F2: the full set of index quotes, as (reference basename, sha256 of the quote text), sorted. A quote
+# must equal the whitespace-normalised text of its cited lines AND be in this set, and every pinned quote
+# must be present exactly once: reworded, re-pointed, dropped, duplicated or added entries all fail.
+INDEX_QUOTE_PINS = (
+    ("ARCHITECTURE_REFERENCE",
+     "123b8bbe696bb26fa77c2bf30545c3c5768b73904280534c126f74f88546ccd4"),
+    ("ARCHITECTURE_REFERENCE",
+     "3f0effa59a17a4b01509ca05416a1d85fa49f764d08484087ac7ab06764acbe1"),
+    ("ARCHITECTURE_REFERENCE",
+     "5e61b4d224673138fbe5172f055a5f00aebbef8bcfde90601a19a385c8587b22"),
+    ("ARCHITECTURE_REFERENCE",
+     "ec6619ab535cc1a47ebbaea40b2d1af0adc65e1a4e23da8db8b42d42f06e2d5c"),
+    ("ARCHITECTURE_REFERENCE",
+     "f071617d60a2f0124c2d79b503ab8465534611d8f4415c0510612391ba971062"),
+    ("CODE_STYLE",
+     "415e325e496f24029d2a8f97b11c757bf212da9ed8929aea245fa324e31bef7b"),
+    ("CODE_STYLE",
+     "5de1252f50a6753845a571f6a9dac544c98af8ea8b3e636887fdfbb05fca4814"),
+    ("CODE_STYLE",
+     "7629fb7d9c366b91c6c560ca280353dfde4f1bb3650d4100f6f5ebd77248de1e"),
+    ("CODE_STYLE",
+     "a79930c2e5745a8f71e7aec6fc110575e370f35c400337d1b7ade39d044d77d1"),
+    ("CODE_STYLE",
+     "b40ec9dc3d99bd43d0a44dac5c7a898a934969eafad6228939f0ffcc5e2d3574"),
+    ("CODE_STYLE",
+     "c164ff0843f842e3e44486bf31b8a6e0d10b7b32b27e03050542ad74fee4619f"),
+    ("CODE_STYLE",
+     "f2810c0ffb9adaa8716498fc7f8cc21bafba24c19096565290e5adcaabef9db8"),
+)
 INDEX_ENTRY = re.compile(r'^- `([A-Z_]+)\.md:(\d+)(?:-(\d+))?` "(.+)"$')
 
 
@@ -213,7 +242,7 @@ def sections_of(visible: list) -> dict:
     return sections
 
 
-def check_index(visible: list, ref_lines: dict, errors: list) -> None:
+def check_index(visible: list, ref_lines: dict, errors: list, index_pins=None) -> None:
     """Fail unless each pointer section carries its binding-rules index and every quote is verbatim."""
     sections = sections_of(visible)
     for heading, name, minimum in INDEX_SECTIONS:
@@ -230,6 +259,7 @@ def check_index(visible: list, ref_lines: dict, errors: list) -> None:
             if line.startswith("- "):
                 block.append(line)
         verified = 0
+        found = []
         for line in block:
             match = INDEX_ENTRY.match(line)
             if not match or len(match.group(4)) < INDEX_MIN_QUOTE_CHARS:
@@ -247,25 +277,37 @@ def check_index(visible: list, ref_lines: dict, errors: list) -> None:
             if not 1 <= lo <= hi <= len(ref):
                 errors.append(f"FAIL: index entry cites {where}, outside the {len(ref)}-line reference file")
                 continue
-            # What is compared (R3-11), exactly: the cited reference lines lo..hi inclusive, each stripped of
-            # leading and trailing whitespace ONLY (no case folding, no punctuation or markdown stripping,
-            # no Unicode normalisation), joined by ONE space; the CLAUDE.md quote must be a contiguous
-            # substring of that. So a quote may wrap across the cited lines and ignore their indentation
-            # (CODE_STYLE.md:153-155 is indented two spaces) but every character of it must match.
+            # What is compared (R3-11, tightened by R3-F2), exactly: the cited reference lines lo..hi
+            # inclusive, each stripped of leading and trailing whitespace ONLY (no case folding, no
+            # punctuation or markdown stripping, no Unicode normalisation), joined by ONE space; the
+            # CLAUDE.md quote must EQUAL that text. A substring is not enough: a prefix, a suffix or a
+            # clipped quote would drop the obligation while still citing the right lines.
             span = " ".join(part.strip() for part in ref[lo - 1:hi])
-            if match.group(4) not in span:
-                errors.append(f"FAIL: index quote is not verbatim at {where}: {match.group(4)[:100]}")
+            if match.group(4) != span:
+                errors.append(
+                    f"FAIL: index quote is not verbatim (it must equal the full text of the cited lines) "
+                    f"at {where}: {match.group(4)[:100]}")
                 continue
+            found.append((name, hashlib.sha256(match.group(4).encode("utf-8")).hexdigest()))
             verified += 1
         if verified < minimum:
             errors.append(
                 f"FAIL: '{heading}' index has {verified} verified entries, under the pinned minimum "
                 f"{minimum} (INDEX_SECTIONS); a binding rule was removed or altered (#4507)"
             )
+        pinned = sorted(pin for pin in (INDEX_QUOTE_PINS if index_pins is None else index_pins) if pin[0] == name)
+        if sorted(found) != pinned:
+            lost = len(pinned) - len([pin for pin in pinned if pin in found])
+            extra = len(found) - len([pin for pin in found if pin in pinned])
+            errors.append(
+                f"FAIL: '{heading}' index quote set differs from INDEX_QUOTE_PINS: {lost} pinned quote(s) "
+                f"missing, {extra} unpinned or duplicated quote(s) present; a binding rule was reworded, "
+                "re-pointed, dropped or added without updating the pins (#4507 R3-F2)"
+            )
 
 
-def check(root: Path) -> list:
-    """Return a list of failure messages (empty means pass)."""
+def check(root: Path, index_pins=None) -> list:
+    """Return a list of failure messages (empty means pass). `index_pins` is a self-test hook."""
     errors = []
     visible = []
     ref_lines = {}
@@ -340,7 +382,7 @@ def check(root: Path) -> list:
                     f"FAIL: CLAUDE.md section {heading!r} body is {body} bytes, under its {floor}-byte "
                     "floor (CLAUDE_MD_SECTION_MIN_BYTES); the rule section appears to have been emptied (#4507)"
                 )
-    check_index(visible, ref_lines, errors)
+    check_index(visible, ref_lines, errors, index_pins)
     return errors
 
 
@@ -379,8 +421,18 @@ def build_fixture(root: Path) -> None:
         target.write_text(head + "x" * (min_bytes - len(head)), encoding="utf-8")
 
 
+FIXTURE_PINS = [None]
+
+
+def fixture_index_pins() -> list:
+    """The pin list matching the fixture's index entries (see build_fixture)."""
+    return sorted(
+        (name, hashlib.sha256(fixture_quote(name, n).encode("utf-8")).hexdigest())
+        for _heading, name, minimum in INDEX_SECTIONS for n in range(1, minimum + 1))
+
+
 def expect(root: Path, label: str, want_fail: bool, needle: str = "") -> bool:
-    errors = check(root)
+    errors = check(root, FIXTURE_PINS[0])
     if want_fail and not any(needle in line for line in errors):
         print(f"FAIL: self-test - {label} was NOT rejected (wanted a message containing {needle!r})",
               file=sys.stderr)
@@ -404,6 +456,7 @@ def run_cases(base: Path) -> bool:
 
     claude_md = "CLAUDE.md"
     arch, style = REFERENCE_PATHS
+    FIXTURE_PINS[0] = fixture_index_pins()
     ok = expect(fresh(), "a valid tree", False)
 
     root = fresh()
@@ -631,6 +684,42 @@ def run_cases(base: Path) -> bool:
     (root / claude_md).write_text(text, encoding="utf-8")
     ok &= expect(root, "an index entry citing the other section's reference file", True, "expected CODE_STYLE.md")
 
+    # R3-F2: a quote must EQUAL the full cited span, and the set of quotes is pinned.
+    quote_a = fixture_quote("CODE_STYLE", 2)
+    root = fresh()
+    text = (root / claude_md).read_text(encoding="utf-8").replace(
+        f'"{quote_a}"', f'"{quote_a[:-6]}"', 1)
+    (root / claude_md).write_text(text, encoding="utf-8")
+    ok &= expect(root, "R3-F2 an index quote truncated to a prefix of its cited line", True, "not verbatim")
+
+    root = fresh()
+    text = (root / claude_md).read_text(encoding="utf-8").replace(
+        f'"{quote_a}"', '"' + quote_a.split(" ", 1)[1] + '"', 1)
+    (root / claude_md).write_text(text, encoding="utf-8")
+    ok &= expect(root, "R3-F2 an index quote with its leading word dropped", True, "not verbatim")
+
+    root = fresh()
+    altered = quote_a.replace("must never be dropped", "may be dropped")
+    text = (root / claude_md).read_text(encoding="utf-8").replace(quote_a, altered, 1)
+    (root / claude_md).write_text(text, encoding="utf-8")
+    path = root / style
+    path.write_text(path.read_text(encoding="utf-8").replace(quote_a, altered, 1), encoding="utf-8")
+    ok &= expect(root, "R3-F2 a quote and its reference line both reworded the same way", True,
+                 "index quote set")
+
+    root = fresh()
+    text = (root / claude_md).read_text(encoding="utf-8").replace(
+        f'`CODE_STYLE.md:3` "{quote_a}"', f'`CODE_STYLE.md:4` "{fixture_quote("CODE_STYLE", 3)}"', 1)
+    (root / claude_md).write_text(text, encoding="utf-8")
+    ok &= expect(root, "R3-F2 an entry re-pointed at a different complete line", True, "index quote set")
+
+    root = fresh()
+    text = (root / claude_md).read_text(encoding="utf-8")
+    extra = f'- `CODE_STYLE.md:3` "{quote_a}"\n'
+    text = text.replace(f'- `CODE_STYLE.md:3` "{quote_a}"\n', f'- `CODE_STYLE.md:3` "{quote_a}"\n' + extra, 1)
+    (root / claude_md).write_text(text, encoding="utf-8")
+    ok &= expect(root, "R3-F2 a duplicated index entry", True, "index quote set")
+
     root = fresh()
     text = (root / claude_md).read_text(encoding="utf-8").replace(
         '- `CODE_STYLE.md:3` "', '- CODE_STYLE.md:3 "', 1)
@@ -654,6 +743,8 @@ SELF_TEST_PINNED_LIMITS = {
     "REFERENCE_FLOOR ARCHITECTURE_REFERENCE": 300_000,
     "REFERENCE_FLOOR CODE_STYLE": 45_000,
     "INDEX_MIN_QUOTE_CHARS": 20,
+    # sha256 of the sorted "<file> <quote sha256>" index pin lines: any pinned quote change is a deliberate edit.
+    "INDEX_QUOTE_PINS_SHA256": "c0e321a920ba781d504d4d5f2ba265a25e663c43e483c24719490528cd039570",
     "REFERENCE_SUBSECTIONS ARCHITECTURE_REFERENCE": 9,
     "REFERENCE_SUBSECTIONS CODE_STYLE": 1,
     "INDEX_MIN_ENTRIES ARCHITECTURE_REFERENCE": 5,
@@ -671,6 +762,8 @@ def current_limits() -> dict:
             "\n".join(CLAUDE_MD_REQUIRED_HEADINGS).encode("utf-8")).hexdigest(),
         "INDEX_MIN_QUOTE_CHARS": INDEX_MIN_QUOTE_CHARS,
         "CLAUDE_MD_SECTION_MIN_BYTES": tuple(CLAUDE_MD_SECTION_MIN_BYTES),
+        "INDEX_QUOTE_PINS_SHA256": hashlib.sha256(
+            "\n".join(f"{name} {digest}" for name, digest in INDEX_QUOTE_PINS).encode("utf-8")).hexdigest(),
     }
     for rel, _top, floor in REFERENCE_FILES:
         limits[f"REFERENCE_FLOOR {Path(rel).stem}"] = floor
