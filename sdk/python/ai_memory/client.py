@@ -64,7 +64,7 @@ class AiMemoryClient:
             listener (#3705/#3709).
         api_key: If provided, sent as ``X-API-Key`` on every request.
         agent_id: If provided, sent as ``X-Agent-Id`` so the server stamps
-            this identity on stored memories (see CLAUDE.md §Agent Identity).
+            this identity on stored memories (see docs/reference/ARCHITECTURE_REFERENCE.md §Agent Identity).
         timeout: Seconds before a request is aborted.
         verify: ``httpx`` ``verify`` — path to server CA bundle or bool. A
             zero-config daemon serves a certificate from the local CA it

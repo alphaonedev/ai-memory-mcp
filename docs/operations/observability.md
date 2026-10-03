@@ -207,7 +207,7 @@ periodic `ai-memory doctor --remote <url> --json` sweep (exit 2 = critical).
   `info` when done.
 - **Never paste configuration or environment dumps.** Several knobs are
   secrets (API keys, store URLs with passwords, passphrases); see the
-  classification column of the environment-variable table in `CLAUDE.md`.
+  classification column of the environment-variable table in `docs/reference/ARCHITECTURE_REFERENCE.md`.
 - **Do not enable test-only knobs** (`AI_MEMORY_TEST_*`,
   `AI_MEMORY_AUTO_EXPORT_INJECT_PANIC`) on a production process.
 - **Do not "fix" the store while diagnosing it.** Take an

@@ -372,7 +372,7 @@ if (h.status !== "ok") throw new Error("memory daemon unhealthy");
 
 ## Agent identity (NHI)
 
-`agent_id` precedence (from `docs/CLAUDE.md` §Agent Identity):
+`agent_id` precedence (from `docs/reference/ARCHITECTURE_REFERENCE.md` §Agent Identity):
 
 1. Explicit body-level `agent_id` on `.store()` / `.registerAgent()` etc.
 2. `X-Agent-Id` HTTP header — set via `new AiMemoryClient({ agentId })` or
@@ -591,6 +591,6 @@ AI_MEMORY_TEST_DAEMON=1 npm test   # integration tests against a live daemon
 ## Links
 
 - Main repo: <https://github.com/alphaone/ai-memory>
-- Architecture notes: [`docs/CLAUDE.md`](../../CLAUDE.md)
+- Architecture notes: [`docs/reference/ARCHITECTURE_REFERENCE.md`](../../docs/reference/ARCHITECTURE_REFERENCE.md)
 - HTTP API handlers: [`src/handlers.rs`](../../src/handlers.rs)
 - Validation rules: [`src/validate.rs`](../../src/validate.rs)

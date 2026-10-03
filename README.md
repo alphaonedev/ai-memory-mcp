@@ -120,9 +120,9 @@ HTTP admission control ([#1733](https://github.com/alphaonedev/ai-memory-mcp/iss
 
 ### Schema v57 → v70 (all additive)
 
-Coordination + typed-cognition + visibility + encryption-prep + cold-path + archive-edge tables (v58–v70), mirrored on both the sqlite and postgres adapters; auto-migrates on first open and archive → restore round-trips losslessly. See CLAUDE.md §Database for the canonical v58–v70 ladder.
+Coordination + typed-cognition + visibility + encryption-prep + cold-path + archive-edge tables (v58–v70), mirrored on both the sqlite and postgres adapters; auto-migrates on first open and archive → restore round-trips losslessly. See docs/reference/ARCHITECTURE_REFERENCE.md §Database for the canonical v58–v70 ladder.
 
-> **Where to start:** [`docs/v0.8.0/release-notes.md`](docs/v0.8.0/release-notes.md) (full release notes), [`docs/coordination.md`](docs/coordination.md) (coordination tool reference), and CLAUDE.md §Database (schema-ladder SSOT).
+> **Where to start:** [`docs/v0.8.0/release-notes.md`](docs/v0.8.0/release-notes.md) (full release notes), [`docs/coordination.md`](docs/coordination.md) (coordination tool reference), and docs/reference/ARCHITECTURE_REFERENCE.md §Database (schema-ladder SSOT).
 
 ## What's new in v0.7
 

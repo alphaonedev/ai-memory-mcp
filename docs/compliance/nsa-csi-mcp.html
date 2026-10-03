@@ -290,7 +290,7 @@ footer a{color:var(--text-muted)}
           <td class="col-name">e · Misconfigurations and poor implementation</td>
           <td>Capabilities v3 envelope + namespace isolation + 6 fail-CLOSED secure-default env vars (#1053/#1054/#1055/#791/#922/governance)</td>
           <td><code>capabilities_v3_envelope</code>, <code>namespace_isolation</code></td>
-          <td><code>config</code> (env-var resolvers) · <code>security_profile::KNOBS</code> (the <code>asi-hard</code> pinned set) · <code>CLAUDE.md §Environment Variables</code></td>
+          <td><code>config</code> (env-var resolvers) · <code>security_profile::KNOBS</code> (the <code>asi-hard</code> pinned set) · <code>docs/reference/ARCHITECTURE_REFERENCE.md §Environment Variables</code></td>
           <td><span class="status ok">addressed</span></td>
         </tr>
         <tr>
@@ -536,7 +536,7 @@ ai-memory serve</pre>
           <li>config::PermissionsMode (default Enforce)</li>
           <li>security_profile::{SecurityPosture, KNOBS, enforce_at_boot} — the asi-hard pinned-knob SSOT</li>
           <li>storage::schema_guard::{evaluate, SchemaAheadOfBinary} (#2445 schema-downgrade guard)</li>
-          <li>The fail-CLOSED env-var resolvers documented in CLAUDE.md §Environment Variables</li>
+          <li>The fail-CLOSED env-var resolvers documented in docs/reference/ARCHITECTURE_REFERENCE.md §Environment Variables</li>
         </ul>
       </div>
     </div>

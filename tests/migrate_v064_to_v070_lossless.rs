@@ -7,7 +7,7 @@
 //! Context (operator directive, 2026-06-05): end users will migrate from
 //! ai-memory v0.6.4 to ai-memory v0.7.0, and the migration technical
 //! capability must be verified at 100%. Per the documented schema SSOT
-//! (`docs/MIGRATION_v0.7.md`, CLAUDE.md §Database), v0.6.4 ships logical
+//! (`docs/MIGRATION_v0.7.md`, docs/reference/ARCHITECTURE_REFERENCE.md §Database), v0.6.4 ships logical
 //! schema **v33** (the last v0.6.x bump — the first v0.7.0-era upgrade
 //! arm is `if version < 34` in `src/storage/migrations.rs`) and v0.7.0
 //! ships **v57** (`current_schema_version_for_tests()`).

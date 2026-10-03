@@ -70,7 +70,7 @@ scripts/check-cloud-init-ascii.sh       # cloud-init template ASCII-only HARD-BL
 
 - All ten checks must pass. CI will reject PRs that fail any of them.
   The six script/workflow gates are wired into `.github/workflows/c8-precheck.yml`
-  alongside the four cargo gates. See [CLAUDE.md §"Lint gates (issue #1174 PR10)"](CLAUDE.md)
+  alongside the four cargo gates. See [docs/reference/CODE_STYLE.md §"Lint gates (issue #1174 PR10)"](docs/reference/CODE_STYLE.md)
   for the full contract + allowlist policy.
 - `AI_MEMORY_NO_CONFIG=1` prevents loading `~/.config/ai-memory/config.toml` which may trigger embedder/LLM initialization.
 - New code must include tests. Bug fixes should include a regression test.

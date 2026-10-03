@@ -13,7 +13,7 @@
  * - `agentId` is sent as `X-Agent-Id`. Per-call `agentId` overrides the
  *   constructor default. `.store()` also accepts a body-level `agent_id`
  *   which the server prefers over the header (precedence documented in
- *   `docs/CLAUDE.md` Agent Identity §).
+ *   `docs/reference/ARCHITECTURE_REFERENCE.md` Agent Identity §).
  *
  * TLS: every daemon listener serves TLS (#3705/#3709 — `tls_bind_guard`
  * refuses to bind a plaintext listener, loopback included), so `baseUrl` is

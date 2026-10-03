@@ -22,7 +22,7 @@ Span format (canonical):
 
 ```
 operation_name     // e.g. "memory_store", "federation_push", "hook_pre_store"
-agent_id           // resolved per the precedence ladder in CLAUDE.md §Agent Identity
+agent_id           // resolved per the precedence ladder in docs/reference/ARCHITECTURE_REFERENCE.md §Agent Identity
 namespace          // logical store namespace, never the memory content
 duration_us        // wall-clock microseconds
 result             // "ok" | "denied" | "error"

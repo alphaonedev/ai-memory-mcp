@@ -5480,7 +5480,7 @@ pub(crate) fn install_governance_pre_write_hook(
             };
             // Resolve the agent_id from the memory's metadata
             // (every substrate-written memory carries it under
-            // `metadata.agent_id` — see CLAUDE.md §"Agent
+            // `metadata.agent_id` — see docs/reference/ARCHITECTURE_REFERENCE.md §"Agent
             // Identity"). Fall back to a stable hook-source tag
             // when the metadata key is missing so the audit row
             // still attributes the refusal.

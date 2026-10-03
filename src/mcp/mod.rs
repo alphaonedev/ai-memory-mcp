@@ -2885,7 +2885,7 @@ fn dispatch_memory_quota_status(ctx: &ToolDispatchCtx<'_>) -> Result<Value, Stri
 /// v0.7.0 #1389 L4 — `memory_capture_turn` dispatcher.
 ///
 /// Threads `ctx.mcp_client` (the host identity captured at
-/// `initialize.clientInfo.name` per CLAUDE.md §"Agent Identity")
+/// `initialize.clientInfo.name` per docs/reference/ARCHITECTURE_REFERENCE.md §"Agent Identity")
 /// into the handler so the #1413 agent_id-agreement check + the
 /// #1415 signed_events row carry the authenticated-via-MCP-
 /// handshake caller identity rather than a body-claimed one.
