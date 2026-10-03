@@ -813,6 +813,102 @@ def run_limit_cases() -> bool:
     return ok
 
 
+WORKFLOW_PATH = ".github/workflows/claude-md-guard.yml"
+
+
+WORKFLOW_BASE_BRANCHES = ("main", "develop", "release/**", "rehearsal/**")
+WORKFLOW_FORBIDDEN_KEYS = ("pull_request_target", "continue-on-error", "paths", "paths-ignore",
+                           "branches-ignore", "tags", "tags-ignore", "if", "shell", "working-directory",
+                           "defaults", "env", "container", "services", "strategy", "needs")
+WORKFLOW_RUN_LINES = ("run: python3 scripts/check-claude-md-size.py",
+                      "run: python3 scripts/check-claude-md-size.py --self-test")
+WORKFLOW_PR_TYPES = ("opened", "synchronize", "reopened")
+
+
+def workflow_blocks(lines: list) -> dict:
+    """Map each indent-2 key under the top-level `on:` to the (indent, text) lines beneath it."""
+    blocks = {}
+    in_on = False
+    current = None
+    for line in lines:
+        indent = len(line) - len(line.lstrip(" "))
+        text = line.strip()
+        if indent == 0:
+            in_on = text.rstrip(":") == "on" and text.endswith(":")
+            current = None
+        elif in_on and indent == 2 and text.endswith(":"):
+            current = text[:-1]
+            blocks[current] = []
+        elif in_on and current is not None and indent > 2:
+            blocks[current].append((indent, text))
+    return blocks
+
+
+def workflow_errors(path: Path, label: str = WORKFLOW_PATH) -> list:
+    """R3-F4: the guard's own workflow must run on every base branch with least privilege and pinned actions.
+
+    Text-level (the script is stdlib only): comments are dropped, then the trigger blocks, the permissions
+    block, every `uses:` pin and the two run lines are checked. Narrowing a trigger, adding a path filter,
+    widening permissions, unpinning an action, skipping a step or swallowing a failure all fail.
+    """
+    errors = []
+    if regular_size(path, label, errors) is None:
+        return errors
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        return [f"FAIL: cannot read {label} as UTF-8: {exc}"]
+    lines = []
+    for raw in split_lines(text):
+        stripped = re.sub(r"(^|\s)#.*$", "", raw).rstrip()
+        if stripped.strip():
+            lines.append(stripped)
+    blocks = workflow_blocks(lines)
+    for trigger in ("pull_request", "push"):
+        body = blocks.get(trigger)
+        if body is None:
+            errors.append(f"FAIL: {label} has no `{trigger}` trigger; the guard must run on every base branch (#4507 R3-F4)")
+            continue
+        branches = [t for _i, t in body if t.startswith("branches:")]
+        listed = set()
+        if len(branches) == 1:
+            listed = {item.strip().strip("\"'") for item in branches[0].split("[", 1)[-1].rstrip("]").split(",")}
+        missing = [b for b in WORKFLOW_BASE_BRANCHES if b not in listed]
+        if len(branches) != 1 or missing:
+            errors.append(
+                f"FAIL: {label} `{trigger}` branches must list {', '.join(WORKFLOW_BASE_BRANCHES)}; "
+                f"missing {missing or 'a single branches: list'} (#4507 R3-F4)")
+    types = [t for _i, t in blocks.get("pull_request", []) if t.startswith("types:")]
+    if types and not all(kind in types[0] for kind in WORKFLOW_PR_TYPES):
+        errors.append(f"FAIL: {label} pull_request types must include {', '.join(WORKFLOW_PR_TYPES)} (#4507 R3-F4)")
+    for key in WORKFLOW_FORBIDDEN_KEYS:
+        if any(re.match(rf"^\s*(- )?{re.escape(key)}:", line) for line in lines):
+            errors.append(f"FAIL: {label} uses `{key}:`, which can skip or weaken the guard (#4507 R3-F4)")
+    perm = [i for i, line in enumerate(lines) if re.match(r"^\s*permissions:", line)]
+    ok_perm = (len(perm) == 1 and lines[perm[0]] == "permissions:" and perm[0] + 1 < len(lines)
+               and lines[perm[0] + 1] == "  contents: read"
+               and (perm[0] + 2 >= len(lines) or not lines[perm[0] + 2].startswith("  ")))
+    if not ok_perm:
+        errors.append(f"FAIL: {label} permissions must be exactly one top-level `contents: read` (#4507 R3-F4)")
+    for line in lines:
+        if "uses:" in line and not re.search(r"uses:\s*\S+@[0-9a-f]{40}$", line):
+            errors.append(f"FAIL: {label} action is not pinned to a 40-hex commit sha: {line.strip()[:100]} (#4507 R3-F4)")
+        if re.match(r"^\s*(- )?run:", line) and re.search(r"\|\||;|&", line):
+            errors.append(f"FAIL: {label} run line could swallow a failure (|| ; &): {line.strip()[:100]} (#4507 R3-F4)")
+    jobs_at = [i for i, line in enumerate(lines) if line == "jobs:"]
+    job_names = [line for line in lines[jobs_at[0] + 1:] if re.match(r"^  \S", line)] if jobs_at else []
+    step_count = len([line for line in lines if re.match(r"^      - ", line)])
+    if len(job_names) != 1 or step_count != len(WORKFLOW_RUN_LINES) + 1:
+        errors.append(
+            f"FAIL: {label} must have exactly one job with exactly the checkout and the two guard steps; "
+            f"found {len(job_names)} job(s) and {step_count} step(s) (#4507 R3-F4)")
+    stripped_lines = [line.strip().removeprefix("- ") for line in lines]
+    for required in WORKFLOW_RUN_LINES:
+        if required not in stripped_lines:
+            errors.append(f"FAIL: {label} is missing the step `{required}` (check-claude-md-size.py) (#4507 R3-F4)")
+    return errors
+
+
 def scratch_base_error(repo_root: Path):
     """Return a failure message when `<repo_root>/.local-runs` is a symlink (or not a directory), else None.
 
@@ -859,6 +955,76 @@ def run_scratch_cases(scratch_base: Path) -> bool:
     return ok
 
 
+def run_workflow_cases(repo_root: Path, base: Path) -> bool:
+    """The guard's own workflow must exist and keep its triggers, permissions and pins (R3-F4)."""
+    ok = True
+    real = repo_root / WORKFLOW_PATH
+    if workflow_errors(real):
+        print(f"FAIL: self-test - the repository workflow was rejected: {workflow_errors(real)[0]}", file=sys.stderr)
+        ok = False
+    try:
+        good = real.read_text(encoding="utf-8")
+    except OSError as exc:
+        print(f"FAIL: self-test - cannot read {WORKFLOW_PATH}: {exc}", file=sys.stderr)
+        return False
+    wf = base / "wf"
+    wf.mkdir()
+
+    def case(label: str, text: str, needle: str) -> bool:
+        target = wf / "w.yml"
+        target.write_text(text, encoding="utf-8")
+        if not any(needle in line for line in workflow_errors(target, label)):
+            print(f"FAIL: self-test - workflow case {label!r} was NOT rejected (wanted {needle!r})", file=sys.stderr)
+            return False
+        return True
+
+    ok &= case("R3-F4 rehearsal/** removed from pull_request", good.replace(
+        '  pull_request:\n    branches: [main, develop, "release/**", "rehearsal/**"]',
+        '  pull_request:\n    branches: [main, develop, "release/**"]', 1), "pull_request")
+    ok &= case("R3-F4 rehearsal/** removed from push", good.replace(
+        '  push:\n    branches: [main, develop, "release/**", "rehearsal/**"]',
+        '  push:\n    branches: [main, develop, "release/**"]', 1), "push")
+    ok &= case("R3-F4 pull_request branches filter removed", good.replace(
+        '  pull_request:\n    branches: [main, develop, "release/**", "rehearsal/**"]',
+        '  pull_request:', 1), "pull_request")
+    ok &= case("R3-F4 paths filter added", good.replace(
+        '  pull_request:\n', '  pull_request:\n    paths: ["src/**"]\n', 1), "paths")
+    ok &= case("R3-F4 write permission", good.replace("  contents: read", "  contents: write", 1), "permissions")
+    ok &= case("R3-F4 extra permission", good.replace(
+        "  contents: read", "  contents: read\n  pull-requests: write", 1), "permissions")
+    ok &= case("R3-F4 unpinned action", good.replace(
+        "@11d5960a326750d5838078e36cf38b85af677262", "@v4", 1), "pinned")
+    ok &= case("R3-F4 guard step removed", good.replace(
+        "python3 scripts/check-claude-md-size.py\n", "true\n", 1), "check-claude-md-size.py")
+    ok &= case("R3-F4 self-test step removed", good.replace(" --self-test", "", 1), "--self-test")
+    ok &= case("R3-F4 continue-on-error", good.replace(
+        "    timeout-minutes: 5", "    timeout-minutes: 5\n    continue-on-error: true", 1), "continue-on-error")
+    ok &= case("R3-F4 pull_request_target", good.replace(
+        "  merge_group:", "  pull_request_target:\n    branches: [main]\n  merge_group:", 1), "pull_request_target")
+    ok &= case("R3-F4 failure swallowed with || true", good.replace(
+        "run: python3 scripts/check-claude-md-size.py\n", "run: python3 scripts/check-claude-md-size.py || true\n", 1),
+        "swallow")
+    ok &= case("R3-F4 extra step added", good.replace(
+        "      - name: Guard self-test", "      - run: git checkout -- CLAUDE.md\n      - name: Guard self-test", 1), "exactly one job")
+    ok &= case("R3-F4 second job added", good + "  other:\n    runs-on: ubuntu-latest\n    steps:\n      - run: true\n",
+               "exactly one job")
+    ok &= case("R3-F4 shell override", good.replace(
+        "        run: python3 scripts/check-claude-md-size.py\n",
+        "        shell: bash -c true {0}\n        run: python3 scripts/check-claude-md-size.py\n", 1), "shell")
+    ok &= case("R3-F4 step condition", good.replace(
+        "        run: python3 scripts/check-claude-md-size.py\n",
+        "        if: false\n        run: python3 scripts/check-claude-md-size.py\n", 1), "if")
+    ok &= case("R3-F4 env override", good.replace(
+        "    timeout-minutes: 5", "    timeout-minutes: 5\n    env:\n      PYTHONPATH: /x", 1), "env")
+    ok &= case("R3-F4 pull_request types closed only", good.replace(
+        '  pull_request:\n', '  pull_request:\n    types: [closed]\n', 1), "types")
+    missing = wf / "absent.yml"
+    if not any("cannot stat" in line for line in workflow_errors(missing, "absent")):
+        print("FAIL: self-test - a missing workflow file was NOT rejected", file=sys.stderr)
+        ok = False
+    return ok
+
+
 def self_test() -> int:
     # Scratch lives under <repo>/.local-runs/ (project no-/tmp hard rule), never system /tmp.
     repo_root = Path(__file__).resolve().parent.parent
@@ -873,6 +1039,7 @@ def self_test() -> int:
         ok = run_cases(Path(tmp))
         ok &= run_limit_cases()
         ok &= run_scratch_cases(Path(tmp))
+        ok &= run_workflow_cases(repo_root, Path(tmp))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     if not ok:
@@ -892,6 +1059,7 @@ def main() -> int:
     if args.self_test:
         return self_test()
     errors = check(Path(args.root))
+    errors += workflow_errors(Path(args.root) / WORKFLOW_PATH)
     for line in errors:
         print(line, file=sys.stderr)
     if errors:
