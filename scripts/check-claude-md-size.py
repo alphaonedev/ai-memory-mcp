@@ -19,8 +19,16 @@ What this gate enforces (and nothing more):
      Architecture and Code Style pointer sections with at least the pinned number of
      entries, every quote in it EQUALS the full text of its cited lines of the
      reference file it names, and the set of quotes equals INDEX_QUOTE_PINS.
-It does NOT verify the wording of any other section body, and it does not prove that
-moved text is unchanged; those need review. Heading, size and ceiling constants
+  6. Every rule section of CLAUDE.md (the raw text under each `## ` heading, fenced code
+     included, plus text before the first heading) hashes to its line in
+     scripts/qc-allowlists/claude-md-rule-sections.sha256. A reworded or refilled
+     section, a deleted section, an added unpinned section or a removed manifest line
+     fails; a missing, unreadable or symlinked manifest fails. `--update` rewrites the
+     manifest and prints the changed sections. This is tamper-evidence, not authority:
+     an agent that edits a rule can also run --update, so the two reviews and the sole
+     merger remain the enforcement. The base-branch comparison job
+     (.github/workflows/claude-md-guard.yml) makes a rule change loud in the PR.
+It does NOT prove that moved text is unchanged; that needs review. Heading, size and ceiling constants
 are pinned: ceilings only fall, floors only rise, and a change to any of them is
 an explicit decision.
 
@@ -501,6 +509,135 @@ def stale_citation_errors(root: Path) -> list:
     return errors
 
 
+# F1 (vote 4d3ea1c5, memory 0c41034e): the sha256 of every rule section is pinned in a SEPARATE tracked manifest,
+# the design of scripts/check-declaration-hash.sh + scripts/qc-allowlists/declaration.sha256 (#3557). One line per
+# section: `<sha256>  <heading>`. The hash covers the RAW section text (fenced code included, since a fenced
+# block in a rule section is rule text), the lines between its heading and the next. Text before the first
+# `## ` heading is pinned too, under PREAMBLE_KEY. A change needs `--update` AND a manifest line in the diff.
+MANIFEST_PATH = "scripts/qc-allowlists/claude-md-rule-sections.sha256"
+PREAMBLE_KEY = "(preamble before the first ## heading)"
+MANIFEST_LINE = re.compile(r"^([0-9a-f]{64})  (\S.*)$")
+MANIFEST_HEADER = (
+    "# #4507 F1 - sha256 of each CLAUDE.md rule section (raw text between a `## ` heading and the next).\n"
+    "# Enforced by scripts/check-claude-md-size.py. Change it only with `scripts/check-claude-md-size.py --update`\n"
+    "# in the same commit as the reviewed rule change. Format: <sha256>  <heading>\n"
+)
+
+
+def rule_section_hashes(text: str):
+    """Return (ordered {key: sha256 hex}, [duplicate keys]) of the raw sections of CLAUDE.md text."""
+    bodies = {PREAMBLE_KEY: []}
+    duplicates = []
+    current = PREAMBLE_KEY
+    for line, in_code in fence_scan(text):
+        if not in_code and line.startswith("## "):
+            current = line.rstrip()
+            if current in bodies:
+                duplicates.append(current)
+            else:
+                bodies[current] = []
+            continue
+        bodies[current].append(line)
+    hashes = {key: hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest() for key, lines in bodies.items()}
+    return hashes, duplicates
+
+
+def load_manifest(root: Path):
+    """Return (errors, {key: sha256}) for the manifest; every failure is an error, never an empty pass."""
+    walk = path_symlink_errors(root, MANIFEST_PATH)
+    if walk:
+        return walk, {}
+    try:
+        raw = read_utf8(root / MANIFEST_PATH)
+    except (OSError, UnicodeDecodeError) as exc:
+        return [f"FAIL: cannot read the rule-section manifest {MANIFEST_PATH}: {exc} (#4507 F1)"], {}
+    errors = []
+    pinned = {}
+    for number, line in enumerate(raw.split("\n"), 1):
+        if not line.strip() or line.startswith("# "):
+            continue
+        match = MANIFEST_LINE.match(line)
+        if match is None:
+            errors.append(f"FAIL: {MANIFEST_PATH}:{number} is not '<sha256>  <heading>' (#4507 F1)")
+        elif match.group(2) in pinned:
+            errors.append(f"FAIL: {MANIFEST_PATH}:{number} pins {match.group(2)!r} twice (#4507 F1)")
+        else:
+            pinned[match.group(2)] = match.group(1)
+    if not pinned:
+        errors.append(f"FAIL: {MANIFEST_PATH} pins no section (#4507 F1)")
+    return errors, pinned
+
+
+def manifest_errors(root: Path, text: str) -> list:
+    """F1: every rule section hashes to its manifest line; no pinned section is missing, none is unpinned."""
+    errors, pinned = load_manifest(root)
+    if errors:
+        return errors
+    current, duplicates = rule_section_hashes(text)
+    errors += [f"FAIL: CLAUDE.md has the heading {key!r} more than once (#4507 F1)" for key in duplicates]
+    for key, digest in pinned.items():
+        if key not in current:
+            errors.append(f"FAIL: pinned rule section {key!r} is missing from CLAUDE.md (#4507 F1)")
+        elif current[key] != digest:
+            errors.append(
+                f"FAIL: rule section {key!r} changed: sha256 {current[key][:16]} != pinned {digest[:16]}. "
+                "A reviewed rule change must run `scripts/check-claude-md-size.py --update` and carry the "
+                f"manifest line in the same commit (#4507 F1).")
+    for key in current:
+        if key not in pinned:
+            errors.append(f"FAIL: rule section {key!r} is not pinned in {MANIFEST_PATH} (#4507 F1)")
+    return errors
+
+
+def update_manifest(root: Path) -> int:
+    """--update: rewrite the manifest from CLAUDE.md and print which sections changed. 0 on success."""
+    walk = path_symlink_errors(root, "CLAUDE.md")
+    if walk:
+        print("\n".join(walk), file=sys.stderr)
+        return 1
+    try:
+        text = read_utf8(root / "CLAUDE.md")
+    except (OSError, UnicodeDecodeError) as exc:
+        print(f"FAIL: cannot read CLAUDE.md as UTF-8: {exc}", file=sys.stderr)
+        return 1
+    target = root / MANIFEST_PATH
+    try:
+        mode = os.lstat(target).st_mode
+    except FileNotFoundError:
+        old = {}
+    except OSError as exc:
+        print(f"FAIL: cannot stat {MANIFEST_PATH}: {exc}", file=sys.stderr)
+        return 1
+    else:
+        if stat.S_ISLNK(mode) or not stat.S_ISREG(mode):
+            print(f"FAIL: {MANIFEST_PATH} is a symlink or not a regular file; refusing to write (#4507 F1)",
+                  file=sys.stderr)
+            return 1
+        load_errors, old = load_manifest(root)
+        if load_errors:
+            old = {}
+    current, duplicates = rule_section_hashes(text)
+    if duplicates:
+        print(f"FAIL: CLAUDE.md repeats {duplicates[0]!r}; refusing to pin (#4507 F1)", file=sys.stderr)
+        return 1
+    if not target.parent.is_dir() or target.parent.is_symlink():
+        print(f"FAIL: {target.parent} is not a real directory (#4507 F1)", file=sys.stderr)
+        return 1
+    body = MANIFEST_HEADER + "".join(f"{digest}  {key}\n" for key, digest in current.items())
+    scratch = target.with_name(target.name + ".new")
+    scratch.write_bytes(body.encode("utf-8"))
+    os.replace(scratch, target)
+    changed = [key for key in current if key in old and old[key] != current[key]]
+    added = [key for key in current if key not in old]
+    removed = [key for key in old if key not in current]
+    for label, keys in (("changed", changed), ("added", added), ("removed", removed)):
+        for key in keys:
+            print(f"{label}: {key}")
+    print(f"manifest written: {len(current)} sections, {len(changed)} changed, {len(added)} added, "
+          f"{len(removed)} removed")
+    return 0
+
+
 def check(root: Path, index_pins=None) -> list:
     """Return a list of failure messages (empty means pass). `index_pins` is a self-test hook."""
     errors = []
@@ -528,6 +665,7 @@ def check(root: Path, index_pins=None) -> list:
             text = ""
         errors += char_errors(text, "CLAUDE.md")
         errors += html_errors(text, "CLAUDE.md")
+        errors += manifest_errors(root, text)
         visible = visible_lines(text)
         present = {line.rstrip() for line in visible if line.startswith("## ")}
         for heading in CLAUDE_MD_REQUIRED_HEADINGS:
@@ -606,6 +744,8 @@ def build_fixture(root: Path) -> None:
     body = fixture_claude_text()
     pad = max(0, CLAUDE_MD_MIN_BYTES - len(body.encode("utf-8")))
     (root / "CLAUDE.md").write_text(body + "x" * pad, encoding="utf-8")
+    (root / MANIFEST_PATH).parent.mkdir(parents=True, exist_ok=True)
+    update_manifest_quiet(root)
     minimums = {name: minimum for _heading, name, minimum in INDEX_SECTIONS}
     for rel, top_heading, min_bytes in REFERENCE_FILES:
         target = root / rel
@@ -615,6 +755,14 @@ def build_fixture(root: Path) -> None:
             fixture_quote(name, n) + "\n" for n in range(1, minimums.get(name, 0) + 1))
         head += "".join(sub + "\n" for sub in REFERENCE_SUBSECTIONS[name])
         target.write_text(head + "x" * (min_bytes - len(head)), encoding="utf-8")
+
+
+def update_manifest_quiet(root: Path) -> None:
+    """Self-test helper: reseal the fixture manifest from the fixture CLAUDE.md without printing."""
+    import contextlib
+    import io
+    with contextlib.redirect_stdout(io.StringIO()):
+        update_manifest(root)
 
 
 FIXTURE_PINS = [None]
@@ -627,7 +775,11 @@ def fixture_index_pins() -> list:
         for _heading, name, minimum in INDEX_SECTIONS for n in range(1, minimum + 1))
 
 
-def expect(root: Path, label: str, want_fail: bool, needle: str = "") -> bool:
+def expect(root: Path, label: str, want_fail: bool, needle: str = "", reseal: bool = True) -> bool:
+    """Run check(); a case that wants a PASS reseals the manifest first, since it edits CLAUDE.md to test some
+    other rule (the F1 cases call this with reseal=False, so the manifest is exercised unsealed)."""
+    if not want_fail and reseal and (root / "CLAUDE.md").exists():
+        update_manifest_quiet(root)
     errors = check(root, FIXTURE_PINS[0])
     if want_fail and not any(needle in line for line in errors):
         print(f"FAIL: self-test - {label} was NOT rejected (wanted a message containing {needle!r})",
@@ -1028,6 +1180,7 @@ def run_cases(base: Path) -> bool:
     ok &= expect(root, "a malformed index entry", True, "malformed binding-rules index entry")
     ok &= run_ref_cases(fresh, arch, style)
     ok &= run_citation_cases(fresh)
+    ok &= run_manifest_cases(fresh)
     return ok
 
 
@@ -1053,6 +1206,128 @@ def run_citation_cases(fresh) -> bool:
     doc.parent.mkdir(parents=True)
     doc.write_text(f'CLAUDE.md "{heading}" (frozen record)\n', encoding="utf-8")
     ok &= expect(root, "R3-F9 a frozen release record is not scanned", False)
+    return ok
+
+
+def run_manifest_cases(fresh) -> bool:
+    """F1: the rule-section manifest. Every case runs check() UNSEALED (reseal=False) except where noted."""
+    def raw(root: Path, label: str, want_fail: bool, needle: str = "") -> bool:
+        return expect(root, label, want_fail, needle, reseal=False)
+
+    def edit(root: Path, old: str, new: str, count: int = 1) -> None:
+        path = root / "CLAUDE.md"
+        text = path.read_text(encoding="utf-8")
+        if old not in text:
+            raise AssertionError(f"self-test fixture lacks {old!r}")
+        path.write_text(text.replace(old, new, count), encoding="utf-8")
+
+    heading = CLAUDE_MD_REQUIRED_HEADINGS[2]
+    ok = raw(fresh(), "F1 a sealed tree", False)
+    root = fresh()
+    edit(root, "section body x", "section body y")
+    ok &= raw(root, "F1 a same-size filler swap in a rule section", True, "changed")
+    root = fresh()
+    edit(root, "section body ", "section body must not ")
+    ok &= raw(root, "F1 a reworded rule section", True, "changed")
+    root = fresh()
+    edit(root, f"{heading}\n", f"{heading}\nA new rule sentence.\n")
+    ok &= raw(root, "F1 a rule sentence added", True, "changed")
+    root = fresh()
+    edit(root, f"{heading}\n", f"{heading}\n```\nfenced rule text\n```\n")
+    ok &= raw(root, "F1 fenced text added to a rule section (the raw hash covers fences)", True, "changed")
+    root = fresh()
+    edit(root, "## ", "A preamble rule.\n\n## ")
+    ok &= raw(root, "F1 text added before the first heading", True, "preamble")
+    root = fresh()
+    edit(root, "section body x", "<!-- section body x -->")
+    ok &= raw(root, "F1 a rule moved into an HTML comment", True, "changed")
+    root = fresh()
+    edit(root, f"{heading}\n", "")
+    ok &= raw(root, "F1 a section heading deleted", True, "is missing from CLAUDE.md")
+    root = fresh()
+    path = root / "CLAUDE.md"
+    text = path.read_text(encoding="utf-8")
+    start = text.index(heading)
+    end = text.index("\n## ", start) + 1
+    path.write_text(text[:start] + text[end:], encoding="utf-8")
+    ok &= raw(root, "F1 a whole rule section deleted", True, "is missing from CLAUDE.md")
+    root = fresh()
+    path = root / "CLAUDE.md"
+    path.write_text(path.read_text(encoding="utf-8") + "\n## An unpinned rule section\nNever do X.\n",
+                    encoding="utf-8")
+    ok &= raw(root, "F1 a rule section added", True, "is not pinned")
+    root = fresh()
+    edit(root, f"{heading}\n", f"{heading}\n\n{heading}\n")
+    ok &= raw(root, "F1 a duplicated heading", True, "more than once")
+    manifest = MANIFEST_PATH
+    root = fresh()
+    path = root / manifest
+    lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+    path.write_text("".join(line for line in lines if heading not in line), encoding="utf-8")
+    ok &= raw(root, "F1 a manifest line removed", True, "is not pinned")
+    root = fresh()
+    path = root / manifest
+    text = path.read_text(encoding="utf-8")
+    first = next(line for line in text.splitlines() if MANIFEST_LINE.match(line))
+    path.write_text(text.replace(first, "0" * 64 + first[64:], 1), encoding="utf-8")
+    ok &= raw(root, "F1 a manifest hash altered", True, "changed")
+    root = fresh()
+    path = root / manifest
+    path.write_text(path.read_text(encoding="utf-8") + first + "\n", encoding="utf-8")
+    ok &= raw(root, "F1 a manifest line duplicated", True, "twice")
+    root = fresh()
+    (root / manifest).write_text(MANIFEST_HEADER + "not a pin line\n", encoding="utf-8")
+    ok &= raw(root, "F1 a malformed manifest line", True, "is not '<sha256>")
+    root = fresh()
+    (root / manifest).write_text(MANIFEST_HEADER, encoding="utf-8")
+    ok &= raw(root, "F1 an empty manifest", True, "pins no section")
+    root = fresh()
+    (root / manifest).write_bytes(b"\xff\xfe\n")
+    ok &= raw(root, "F1 a manifest that is not UTF-8", True, "cannot read")
+    root = fresh()
+    (root / manifest).unlink()
+    ok &= raw(root, "F1 a missing manifest", True, "cannot stat")
+    root = fresh()
+    path = root / manifest
+    moved = root / "manifest.aside"
+    path.rename(moved)
+    path.symlink_to(moved)
+    ok &= raw(root, "F1 a symlinked manifest", True, "is a symlink")
+    root = fresh()
+    moved = root / "qc.aside"
+    (root / "scripts" / "qc-allowlists").rename(moved)
+    (root / "scripts" / "qc-allowlists").symlink_to(moved, target_is_directory=True)
+    ok &= raw(root, "F1 a symlinked manifest directory", True, "is a symlink")
+    if hasattr(os, "geteuid") and os.geteuid() != 0:
+        root = fresh()
+        os.chmod(root / manifest, 0)
+        try:
+            ok &= raw(root, "F1 an unreadable manifest", True, "cannot read")
+        finally:
+            os.chmod(root / manifest, 0o644)
+    # --update: rewrites the manifest, reports the changed section, refuses a symlinked manifest.
+    root = fresh()
+    edit(root, "section body x", "section body y")
+    import contextlib
+    import io
+    buffer = io.StringIO()
+    with contextlib.redirect_stdout(buffer):
+        code = update_manifest(root)
+    if code != 0 or "1 changed" not in buffer.getvalue() or "changed: ## " not in buffer.getvalue():
+        print(f"FAIL: self-test - F1 --update did not report one changed section: {buffer.getvalue()!r}",
+              file=sys.stderr)
+        ok = False
+    ok &= raw(root, "F1 the tree after --update", False)
+    root = fresh()
+    path = root / manifest
+    moved = root / "manifest.aside"
+    path.rename(moved)
+    path.symlink_to(moved)
+    with contextlib.redirect_stderr(io.StringIO()):
+        code = update_manifest(root)
+    if code == 0:
+        print("FAIL: self-test - F1 --update wrote through a symlinked manifest", file=sys.stderr)
+        ok = False
     return ok
 
 
@@ -1446,11 +1721,15 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("root", nargs="?", default=str(Path(__file__).resolve().parent.parent))
     parser.add_argument("--self-test", action="store_true")
+    parser.add_argument("--update", action="store_true",
+                        help="rewrite the rule-section manifest from CLAUDE.md and print the changed sections")
     parser.add_argument("--refs-only", action="store_true",
                         help="only the reference-file checks the doc gates call (symlink walk, readable, non-empty)")
     args = parser.parse_args()
     if args.self_test:
         return self_test()
+    if args.update:
+        return update_manifest(Path(args.root))
     if args.refs_only:
         ref_errors = refs_errors(Path(args.root))
         for line in ref_errors:
