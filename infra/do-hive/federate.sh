@@ -250,9 +250,10 @@ node_sh() { ssh $SSH_OPTS "${SSH_USER}@${PUBLIC_IPS[$1]}" "bash -s"; }
 # loopback mTLS listener, using the node's own cert + its own api key.
 node_get() {
   node_sh "$1" <<EOS 2>/dev/null
-curl -sS --max-time 15 --cacert /etc/ai-memory/fed/ca.crt \\
+printf 'header = "x-api-key: %s"\\n' "\$(cat /etc/ai-memory/api-key)" | curl -sS --max-time 15 --config - \\
+  --cacert /etc/ai-memory/fed/ca.crt \\
   --cert /etc/ai-memory/fed/node.crt --key /etc/ai-memory/fed/node.key \\
-  -H "x-api-key: \$(cat /etc/ai-memory/api-key)" -H 'x-agent-id: $AUTHOR_ID' \\
+  -H 'x-agent-id: $AUTHOR_ID' \\
   https://127.0.0.1:9077/api/v1/memories/$2 2>/dev/null
 EOS
 }
@@ -262,10 +263,11 @@ EOS
 node_post() {
   node_sh "$1" <<EOS 2>/dev/null
 BODY=\$(printf '%s' '$2' | base64 -d)
-curl -sS --max-time 30 --cacert /etc/ai-memory/fed/ca.crt \\
+printf 'header = "x-api-key: %s"\\n' "\$(cat /etc/ai-memory/api-key)" | curl -sS --max-time 30 --config - \\
+  --cacert /etc/ai-memory/fed/ca.crt \\
   --cert /etc/ai-memory/fed/node.crt --key /etc/ai-memory/fed/node.key \\
   -H 'content-type: application/json' \\
-  -H "x-api-key: \$(cat /etc/ai-memory/api-key)" -H 'x-agent-id: $AUTHOR_ID' \\
+  -H 'x-agent-id: $AUTHOR_ID' \\
   -X POST https://127.0.0.1:9077/api/v1/memories -d "\$BODY" -w '\\n%{http_code}' 2>/dev/null
 EOS
 }
@@ -330,7 +332,7 @@ EOS
   api_key="$(on_node "${PUBLIC_IPS[0]}" 'cat /etc/ai-memory/api-key' 2>/dev/null || true)"
   if [ -n "$api_key" ]; then
     probe="ai:verify-probe-$(date -u +%s)"
-    lg_curl() { curl -sS --max-time 15 --cacert "$OUT_DIR/ca.crt" --cert "$OUT_DIR/hive-loadgen-f2.crt" --key "$OUT_DIR/hive-loadgen-f2.key" -H "X-API-Key: $api_key" "$@"; }
+    lg_curl() { printf 'header = "X-API-Key: %s"\n' "$api_key" | curl -sS --max-time 15 --config - --cacert "$OUT_DIR/ca.crt" --cert "$OUT_DIR/hive-loadgen-f2.crt" --key "$OUT_DIR/hive-loadgen-f2.key" "$@"; }
     lg_curl -o /dev/null -X POST -H 'content-type: application/json' -H "X-Agent-Id: ai:hive-loadgen-f2" \
       -d "{\"agent_id\":\"$probe\",\"agent_type\":\"ai:verify\"}" "https://${PUBLIC_IPS[0]}:9077/api/v1/agents" 2>/dev/null || true
     dummy_pub="$(head -c 32 /dev/zero | base64)"

@@ -93,7 +93,7 @@ require_image_pin() {
     echo "[spawn.sh] REFUSE: TF_VAR_ai_memory_image_sha256 must be set when TF_VAR_ai_memory_image_url is set (the lowercase hex SHA-256 of that versioned tarball; the node refuses a tarball it cannot verify)." >&2
     exit 2
   fi
-  if [[ "${TF_VAR_ai_memory_image_url:-}" == *[Rr]eleases/[Ll]atest* ]]; then
+  if [[ "$(printf '%s' "${TF_VAR_ai_memory_image_url:-}" | tr '[:upper:]' '[:lower:]')" == *releases/latest* ]]; then
     echo "[spawn.sh] REFUSE: TF_VAR_ai_memory_image_url must be a versioned release URL; releases/latest moves and would not match the pinned digest." >&2
     exit 2
   fi

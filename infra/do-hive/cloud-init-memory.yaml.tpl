@@ -389,7 +389,6 @@ write_files:
 %{ if federation_enabled }
       [ "$PEER_PUBS" -ge 1 ] || fail "no peer public keys under $FED_DIR/peers"
 %{ endif }
-      chown -R aimemory:aimemory "$KEY_DIR"
       # $FED_DIR stays root-owned (custody split above); the daemon reads it as
       # group aimemory and cannot rewrite its own trust anchors.
       chown -R root:aimemory "$FED_DIR"
@@ -444,9 +443,9 @@ write_files:
       AUTHOR_ID="$(cat "$FED_DIR/author.id")"
       AUTHOR_PUB="$(cat "$FED_DIR/author.pub")"
       admin_call() {
-        curl -sS --max-time 15 \
+        printf 'header = "x-api-key: %s"\n' "$API_KEY" | curl -sS --max-time 15 --config - \
           --cacert "$FED_DIR/ca.crt" --cert "$FED_DIR/node.crt" --key "$FED_DIR/node.key" \
-          -H "content-type: application/json" -H "x-api-key: $API_KEY" -H "x-agent-id: $ADMIN_ID" \
+          -H "content-type: application/json" -H "x-agent-id: $ADMIN_ID" \
           -o /dev/null -w '%%{http_code}' "$@" 2>/dev/null
       }
       i=0
@@ -500,7 +499,9 @@ write_files:
       # file already carries.
       if grep -q CHANGEME /etc/ai-memory/store-url; then
         NEW_SECRET="$(openssl rand -hex 24)"
-        sed -i "s/CHANGEME/$NEW_SECRET/" /etc/ai-memory/store-url
+        # The script reaches sed on stdin: the secret is never on an argv.
+        printf 's/CHANGEME/%s/\n' "$NEW_SECRET" | sed -i -f - /etc/ai-memory/store-url
+        unset NEW_SECRET
       fi
       # Fail closed: the shipped placeholder must never reach a running node.
       if grep -q CHANGEME /etc/ai-memory/store-url; then
@@ -612,15 +613,18 @@ write_files:
           "ssl_cert_file = '$PGTLS/server.crt'" "ssl_key_file = '$PGTLS/server.key'" \
           "ssl_min_protocol_version = 'TLSv1.2'" >> "$PGCONF"
       fi
-      # No role may log in to any database over TCP without TLS (#4676): the
-      # first line rejects every non-TLS TCP attempt (hostnossl, all roles, all
-      # databases, all addresses), so the packaged `host all all` lines below
+      # No role may log in to any database, or open a physical-replication
+      # connection, over TCP without TLS (#4676): the first two lines reject
+      # every non-TLS TCP attempt (hostnossl, all roles, all addresses; `all`
+      # does not match the replication pseudo-database, so it has its own line),
+      # so the packaged `host all all` and `host replication all` lines below
       # are only reachable over TLS (first matching line wins). Unix-socket
       # `local` lines are unaffected.
       HBA="/etc/postgresql/18/main/pg_hba.conf"
       if ! grep -q "^# ai-memory-tls (#4635)" "$HBA"; then
         { printf '%s\n' "# ai-memory-tls (#4635)" \
             "hostnossl all all all reject" \
+            "hostnossl replication all all reject" \
             "hostssl aimemory aimemory 127.0.0.1/32 scram-sha-256" \
             "hostssl aimemory aimemory ::1/128 scram-sha-256"
           cat "$HBA"; } > "$HBA.new"

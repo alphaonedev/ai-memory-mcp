@@ -129,7 +129,7 @@ aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | printf '%s\n' "# ai-mem
 aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | fi
 aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | HBA="/etc/postgresql/18/main/pg_hba.conf"
 aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | if ! grep -q "^# ai-memory-tls (#4635)" "$HBA"; then
-aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | { printf '%s\n' "# ai-memory-tls (#4635)" \ "hostnossl all all all reject" \ "hostssl aimemory aimemory 127.0.0.1/32 scram-sha-256" \ "hostssl aimemory aimemory ::1/128 scram-sha-256"
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | { printf '%s\n' "# ai-memory-tls (#4635)" \ "hostnossl all all all reject" \ "hostnossl replication all all reject" \ "hostssl aimemory aimemory 127.0.0.1/32 scram-sha-256" \ "hostssl aimemory aimemory ::1/128 scram-sha-256"
 aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | cat "$HBA"; } > "$HBA.new"
 aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | chown --reference="$HBA" "$HBA.new"
 aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | chmod --reference="$HBA" "$HBA.new"
@@ -273,7 +273,6 @@ do-hive | /usr/local/sbin/ai-memory-fed-bootstrap.sh | IFS=$OLD_IFS
 do-hive | /usr/local/sbin/ai-memory-fed-bootstrap.sh | [ "$BAD_PEER" -eq 0 ] || fail "peers.conf contains a non-https peer URL; refused locally (the daemon refuses the same shape at boot, #2477)"
 do-hive | /usr/local/sbin/ai-memory-fed-bootstrap.sh | PEER_PUBS=$(ls -1 "$FED_DIR"/peers/*.pub 2>/dev/null | wc -l)
 do-hive | /usr/local/sbin/ai-memory-fed-bootstrap.sh | [ "$PEER_PUBS" -ge 1 ] || fail "no peer public keys under $FED_DIR/peers"
-do-hive | /usr/local/sbin/ai-memory-fed-bootstrap.sh | chown -R aimemory:aimemory "$KEY_DIR"
 do-hive | /usr/local/sbin/ai-memory-fed-bootstrap.sh | chown -R root:aimemory "$FED_DIR"
 do-hive | /usr/local/sbin/ai-memory-fed-bootstrap.sh | chmod 0750 "$FED_DIR" "$FED_DIR/peers"
 do-hive | /usr/local/sbin/ai-memory-fed-bootstrap.sh | chmod 0644 "$FED_DIR"/peers/*.pub
@@ -312,7 +311,7 @@ do-hive | /usr/local/sbin/ai-memory-fed-bootstrap.sh | IFS=$OLD_IFS
 do-hive | /usr/local/sbin/ai-memory-fed-bootstrap.sh | AUTHOR_ID="$(cat "$FED_DIR/author.id")"
 do-hive | /usr/local/sbin/ai-memory-fed-bootstrap.sh | AUTHOR_PUB="$(cat "$FED_DIR/author.pub")"
 do-hive | /usr/local/sbin/ai-memory-fed-bootstrap.sh | admin_call() {
-do-hive | /usr/local/sbin/ai-memory-fed-bootstrap.sh | curl -sS --max-time 15 \ --cacert "$FED_DIR/ca.crt" --cert "$FED_DIR/node.crt" --key "$FED_DIR/node.key" \ -H "content-type: application/json" -H "x-api-key: $API_KEY" -H "x-agent-id: $ADMIN_ID" \ -o /dev/null -w '%%{http_code}' "$@" 2>/dev/null
+do-hive | /usr/local/sbin/ai-memory-fed-bootstrap.sh | printf 'header = "x-api-key: %s"\n' "$API_KEY" | curl -sS --max-time 15 --config - \ --cacert "$FED_DIR/ca.crt" --cert "$FED_DIR/node.crt" --key "$FED_DIR/node.key" \ -H "content-type: application/json" -H "x-agent-id: $ADMIN_ID" \ -o /dev/null -w '%%{http_code}' "$@" 2>/dev/null
 do-hive | /usr/local/sbin/ai-memory-fed-bootstrap.sh | }
 do-hive | /usr/local/sbin/ai-memory-fed-bootstrap.sh | i=0
 do-hive | /usr/local/sbin/ai-memory-fed-bootstrap.sh | while :; do
@@ -349,7 +348,8 @@ do-hive | /usr/local/sbin/ai-memory-provision.sh | chown root:aimemory /etc/ai-m
 do-hive | /usr/local/sbin/ai-memory-provision.sh | chmod 0750 /etc/ai-memory
 do-hive | /usr/local/sbin/ai-memory-provision.sh | if grep -q CHANGEME /etc/ai-memory/store-url; then
 do-hive | /usr/local/sbin/ai-memory-provision.sh | NEW_SECRET="$(openssl rand -hex 24)"
-do-hive | /usr/local/sbin/ai-memory-provision.sh | sed -i "s/CHANGEME/$NEW_SECRET/" /etc/ai-memory/store-url
+do-hive | /usr/local/sbin/ai-memory-provision.sh | printf 's/CHANGEME/%s/\n' "$NEW_SECRET" | sed -i -f - /etc/ai-memory/store-url
+do-hive | /usr/local/sbin/ai-memory-provision.sh | unset NEW_SECRET
 do-hive | /usr/local/sbin/ai-memory-provision.sh | fi
 do-hive | /usr/local/sbin/ai-memory-provision.sh | if grep -q CHANGEME /etc/ai-memory/store-url; then
 do-hive | /usr/local/sbin/ai-memory-provision.sh | echo "placeholder db password still in /etc/ai-memory/store-url"; exit 1
@@ -410,7 +410,7 @@ do-hive | /usr/local/sbin/ai-memory-provision.sh | printf '%s\n' "# ai-memory-tl
 do-hive | /usr/local/sbin/ai-memory-provision.sh | fi
 do-hive | /usr/local/sbin/ai-memory-provision.sh | HBA="/etc/postgresql/18/main/pg_hba.conf"
 do-hive | /usr/local/sbin/ai-memory-provision.sh | if ! grep -q "^# ai-memory-tls (#4635)" "$HBA"; then
-do-hive | /usr/local/sbin/ai-memory-provision.sh | { printf '%s\n' "# ai-memory-tls (#4635)" \ "hostnossl all all all reject" \ "hostssl aimemory aimemory 127.0.0.1/32 scram-sha-256" \ "hostssl aimemory aimemory ::1/128 scram-sha-256"
+do-hive | /usr/local/sbin/ai-memory-provision.sh | { printf '%s\n' "# ai-memory-tls (#4635)" \ "hostnossl all all all reject" \ "hostnossl replication all all reject" \ "hostssl aimemory aimemory 127.0.0.1/32 scram-sha-256" \ "hostssl aimemory aimemory ::1/128 scram-sha-256"
 do-hive | /usr/local/sbin/ai-memory-provision.sh | cat "$HBA"; } > "$HBA.new"
 do-hive | /usr/local/sbin/ai-memory-provision.sh | chown --reference="$HBA" "$HBA.new"
 do-hive | /usr/local/sbin/ai-memory-provision.sh | chmod --reference="$HBA" "$HBA.new"

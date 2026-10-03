@@ -1563,6 +1563,8 @@ def run_scan(templates: dict, maintfs: dict, allow_text: str, pending_text: str,
         if any("pg_hba" in x for x in live):
             if not any('"hostnossl all all all reject"' in x for x in live):
                 hits.append("%s: writes pg_hba without a live \"hostnossl all all all reject\" line (#4676)" % nm)
+            if not any('"hostnossl replication all all reject"' in x for x in live):
+                hits.append("%s: writes pg_hba without a live \"hostnossl replication all all reject\" line: `all` does not match the replication pseudo-database (#4676)" % nm)
             if not any(re.search(r"[\"']ssl = on[\"']", x) for x in live):
                 hits.append("%s: writes pg_hba without a live \"ssl = on\" line (#4704)" % nm)
         if not trig:
@@ -1690,6 +1692,10 @@ def build_probes() -> list:
         P.append((label, "green", dict(aws=muts, autolist=autolist, **kw)))
 
     # ---- security reviewer round 1 (#4662/#4663/#4664) and round 2 (#4687-#4693)
+    REPL = '            "hostnossl replication all all reject" \\\n'
+    red("S-4676 replication reject line deleted (aws)", [(REPL, "")])
+    red("S-4676 replication reject turned into an accept (aws)", [(REPL, '            "hostnossl replication all all scram-sha-256" \\\n')])
+    red("S-4676 replication reject narrowed to one role (aws)", [(REPL, '            "hostnossl replication aimemory all reject" \\\n')])
     red("S-R1 runtime argv via sh -c", [(EXEC, "ExecStart=/bin/sh -c 'exec " + BIN + " serve " + SU + " \"$(cat /etc/ai-memory/store-url)\" --host 0.0.0.0'")])
     red("S-R2 password= query on serve", [(EXEC, EXEC.replace("serve", "serve " + SU + " " + NOPW.replace("?", "?password=" + PW + "&")))])
     red("S-R3 Environment= DSN in a 0644 unit", [(ENVF, "      Environment=AI_MEMORY_STORE_URL=" + DSN + "\n")])
@@ -1940,6 +1946,10 @@ def build_probes() -> list:
         P.append((label, "red", dict(do=muts, autolist=autolist, **kw)))
 
     dred("D-4676 hostnossl reject narrowed to one role", [(DNOSSL, "            \"hostnossl aimemory aimemory all reject\" \\\n")], autolist=True)
+    DREPL = '            "hostnossl replication all all reject" \\\n'
+    dred("D-4676 replication reject line deleted", [(DREPL, "")], autolist=True)
+    dred("D-4676 replication reject turned into an accept", [(DREPL, '            "hostnossl replication all all scram-sha-256" \\\n')], autolist=True)
+    dred("D-4676 replication reject narrowed to one role", [(DREPL, '            "hostnossl replication postgres all reject" \\\n')], autolist=True)
     dred("D-4676 hostnossl reject line deleted", [(DNOSSL, "")], autolist=True)
     dred("D-4676 hostnossl reject turned into an accept", [(DNOSSL, "            \"hostnossl all all all scram-sha-256\" \\\n")], autolist=True)
     dred("D-4704 ssl = off with ssl = on only in a comment", [(DSSL, "# ssl = on\n        printf '%s\\n' \"# ai-memory-tls (#4635)\" \"ssl = off\" \\\n")], autolist=True)

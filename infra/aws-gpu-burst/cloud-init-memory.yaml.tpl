@@ -219,15 +219,18 @@ write_files:
           "ssl_cert_file = '$PGTLS/server.crt'" "ssl_key_file = '$PGTLS/server.key'" \
           "ssl_min_protocol_version = 'TLSv1.2'" >> "$PGCONF"
       fi
-      # No role may log in to any database over TCP without TLS (#4676): the
-      # first line rejects every non-TLS TCP attempt (hostnossl, all roles, all
-      # databases, all addresses), so the packaged `host all all` lines below
+      # No role may log in to any database, or open a physical-replication
+      # connection, over TCP without TLS (#4676): the first two lines reject
+      # every non-TLS TCP attempt (hostnossl, all roles, all addresses; `all`
+      # does not match the replication pseudo-database, so it has its own line),
+      # so the packaged `host all all` and `host replication all` lines below
       # are only reachable over TLS (first matching line wins). Unix-socket
       # `local` lines are unaffected.
       HBA="/etc/postgresql/18/main/pg_hba.conf"
       if ! grep -q "^# ai-memory-tls (#4635)" "$HBA"; then
         { printf '%s\n' "# ai-memory-tls (#4635)" \
             "hostnossl all all all reject" \
+            "hostnossl replication all all reject" \
             "hostssl aimemory aimemory 127.0.0.1/32 scram-sha-256" \
             "hostssl aimemory aimemory ::1/128 scram-sha-256"
           cat "$HBA"; } > "$HBA.new"
