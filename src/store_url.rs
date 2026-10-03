@@ -128,23 +128,53 @@ pub fn store_url_from_file(path: &Path) -> Result<String> {
 /// Resolution order (first hit wins):
 ///   1. [`STORE_URL_FILE_ENV`] — read the URL from a `0600` file.
 ///   2. [`STORE_URL_ENV`] — read the URL from the owner-only environment.
-///   3. the `--store-url` CLI argument (unchanged). When it carries a userinfo
+///   3. the `--store-url` CLI argument. When it is given AND channel 1 or 2 names a
+///      DIFFERENT store, the call is refused (#4611, the backup precedent); an
+///      equal URL is accepted. When it is the only channel and carries a userinfo
 ///      password a warning points at the /proc/cmdline exposure and the
 ///      non-argv alternatives.
 ///
 /// Returns `Ok(None)` when no channel supplies a URL (the caller then falls
 /// back to the local sqlite `--db` path).
 pub fn resolve_store_url(cli_arg: Option<&str>) -> Result<Option<String>> {
-    if let Ok(path) = std::env::var(STORE_URL_FILE_ENV) {
-        if !path.trim().is_empty() {
-            return Ok(Some(store_url_from_file(Path::new(path.trim()))?));
+    // #4611: the env/file channel that names a store, with the channel's name
+    // for the refusal and the info line (never the URL itself).
+    let channel = if let Some(path) = std::env::var(STORE_URL_FILE_ENV)
+        .ok()
+        .filter(|p| !p.trim().is_empty())
+    {
+        Some((
+            STORE_URL_FILE_ENV,
+            store_url_from_file(Path::new(path.trim()))?,
+        ))
+    } else {
+        std::env::var(STORE_URL_ENV)
+            .ok()
+            .map(|u| u.trim().to_string())
+            .filter(|u| !u.is_empty())
+            .map(|u| (STORE_URL_ENV, u))
+    };
+    if let Some((name, url)) = channel {
+        if let Some(arg) = cli_arg {
+            // Ambiguity is REFUSED, never silently resolved (#4611, the
+            // backup/restore precedent #2444): an explicit `--store-url` that
+            // names a different store than the environment channel must not
+            // be dropped while the daemon reports healthy on the other store.
+            if arg.trim() != url {
+                anyhow::bail!(
+                    "ambiguous store: --store-url names {} but {name} names {}. Refusing to \
+                     guess which store to use - unset one of them (#4611).",
+                    crate::url_display::store_url_display(arg),
+                    crate::url_display::store_url_display(&url),
+                );
+            }
         }
-    }
-    if let Ok(url) = std::env::var(STORE_URL_ENV) {
-        let trimmed = url.trim();
-        if !trimmed.is_empty() {
-            return Ok(Some(trimmed.to_string()));
-        }
+        tracing::info!(
+            channel = name,
+            "store URL taken from {name} ({})",
+            crate::url_display::store_url_display(&url)
+        );
+        return Ok(Some(url));
     }
     if let Some(url) = cli_arg {
         if url_carries_credentials(url) {

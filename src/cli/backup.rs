@@ -1089,26 +1089,8 @@ pub(crate) fn resolve_sqlite_store(
     use crate::daemon_runtime::{SQLITE_URL_SCHEME, is_postgres_url, resolve_store_url};
     use crate::url_display::store_url_display;
 
-    // Ambiguity is REFUSED, never silently resolved. `resolve_store_url` gives
-    // the env channels precedence over the argv flag (#1927), so an explicit
-    // `--store-url` that DISAGREES with an exported AI_MEMORY_STORE_URL would
-    // otherwise capture a store the operator did not name — on a durability
-    // command "which store did I actually snapshot?" must never be a guess.
-    if let Some(arg) = store_url_arg {
-        if let Some(env_url) = resolve_store_url(None)? {
-            if env_url.trim() != arg.trim() {
-                anyhow::bail!(
-                    "ambiguous store: --store-url names {} but the environment \
-                     (AI_MEMORY_STORE_URL / AI_MEMORY_STORE_URL_FILE) names {}. \
-                     Refusing to guess which store `{verb}` should act on — \
-                     unset one of them (#2444).",
-                    store_url_display(arg),
-                    store_url_display(&env_url),
-                );
-            }
-        }
-    }
-
+    // Ambiguity (a `--store-url` that disagrees with the env/file channel) is
+    // refused inside `resolve_store_url` itself (#4611, the #2444 rule).
     let Some(url) = resolve_store_url(store_url_arg)? else {
         // No store URL on any channel: the configured store IS the local
         // sqlite `--db` path. Unchanged pre-#2444 behaviour.

@@ -76,36 +76,82 @@ fn schema_init_4600_env_channel_without_flag_succeeds() {
 }
 
 #[test]
-fn schema_init_4600_precedence_file_then_env_then_flag() {
+fn schema_init_4600_precedence_file_then_env_and_flag_alone() {
     let tmp = TempDir::new().unwrap();
     let file_url = sqlite_url(tmp.path(), "p-file.db");
     let env_url = sqlite_url(tmp.path(), "p-env.db");
     let flag_url = sqlite_url(tmp.path(), "p-flag.db");
     let f = write_url_file(tmp.path(), "store-url", &file_url, 0o600);
-    // FILE beats ENV and flag.
+    // FILE beats ENV (the two non-argv channels; no flag involved).
     schema_init(&tmp.path().join("main.db"))
         .env("AI_MEMORY_STORE_URL_FILE", &f)
         .env("AI_MEMORY_STORE_URL", &env_url)
-        .args(["--store-url", &flag_url])
         .assert()
         .success();
     assert!(tmp.path().join("p-file.db").exists());
     assert!(!tmp.path().join("p-env.db").exists());
-    assert!(!tmp.path().join("p-flag.db").exists());
-    // ENV beats the flag.
-    schema_init(&tmp.path().join("main.db"))
-        .env("AI_MEMORY_STORE_URL", &env_url)
-        .args(["--store-url", &flag_url])
-        .assert()
-        .success();
-    assert!(tmp.path().join("p-env.db").exists());
-    assert!(!tmp.path().join("p-flag.db").exists());
     // The flag still works alone (unchanged argv form).
     schema_init(&tmp.path().join("main.db"))
         .args(["--store-url", &flag_url])
         .assert()
         .success();
     assert!(tmp.path().join("p-flag.db").exists());
+}
+
+/// #4611: the winning env/file channel is named at info (never the URL's
+/// password), so an operator can see which channel bound the store.
+#[test]
+fn schema_init_4611_winning_channel_is_logged_without_the_secret() {
+    let tmp = TempDir::new().unwrap();
+    let url = sqlite_url(tmp.path(), "l-file.db");
+    let f = write_url_file(tmp.path(), "store-url", &url, 0o600);
+    let out = schema_init(&tmp.path().join("main.db"))
+        .env("AI_MEMORY_STORE_URL_FILE", &f)
+        .env("RUST_LOG", "info")
+        .assert()
+        .success()
+        .get_output()
+        .stderr
+        .clone();
+    let err = String::from_utf8_lossy(&out);
+    assert!(
+        err.contains("store URL taken from AI_MEMORY_STORE_URL_FILE"),
+        "the winning channel must be logged; stderr: {err}"
+    );
+}
+
+/// #4611: a `--store-url` that DISAGREES with a set env/file channel is
+/// refused (it used to be silently dropped in favour of the channel), and the
+/// refusal creates neither store. An equal URL is accepted.
+#[test]
+fn schema_init_4611_flag_disagreeing_with_a_channel_is_refused() {
+    let tmp = TempDir::new().unwrap();
+    let file_url = sqlite_url(tmp.path(), "r-file.db");
+    let env_url = sqlite_url(tmp.path(), "r-env.db");
+    let flag_url = sqlite_url(tmp.path(), "r-flag.db");
+    let f = write_url_file(tmp.path(), "store-url", &file_url, 0o600);
+    schema_init(&tmp.path().join("main.db"))
+        .env("AI_MEMORY_STORE_URL_FILE", &f)
+        .args(["--store-url", &flag_url])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("ambiguous store"));
+    schema_init(&tmp.path().join("main.db"))
+        .env("AI_MEMORY_STORE_URL", &env_url)
+        .args(["--store-url", &flag_url])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("ambiguous store"));
+    for n in ["r-file.db", "r-env.db", "r-flag.db"] {
+        assert!(!tmp.path().join(n).exists(), "{n} must not be created");
+    }
+    // Same URL on both channels is not ambiguous.
+    schema_init(&tmp.path().join("main.db"))
+        .env("AI_MEMORY_STORE_URL", &flag_url)
+        .args(["--store-url", &flag_url])
+        .assert()
+        .success();
+    assert!(tmp.path().join("r-flag.db").exists());
 }
 
 #[test]
