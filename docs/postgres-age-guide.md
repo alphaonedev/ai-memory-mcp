@@ -329,10 +329,12 @@ a backend that *does* come up; use `doctor` to diagnose one that does not.
 way to bootstrap a fresh postgres backend:
 
 ```bash
-ai-memory schema-init --store-url 'postgres://aimemory:changeme-please@localhost:5432/aimemory?sslmode=verify-full&sslrootcert=/etc/ai-memory/pg-ca.crt'
+# /etc/ai-memory/store-url: one line, mode 0600:
+#   postgres://aimemory:changeme-please@localhost:5432/aimemory?sslmode=verify-full&sslrootcert=/etc/ai-memory/pg-ca.crt
+AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url ai-memory schema-init
 ```
 
-`schema-init` is one of two verbs with no non-argv channel: it reads its URL only from the required `--store-url` argument (`src/cli/schema_init.rs:111-112`, tracked in [#4600](https://github.com/alphaonedev/ai-memory-mcp/issues/4600)), so the password is visible in `ps` for the seconds this one-shot command runs; run it from a single-user admin host, and start the long-running `serve` through `AI_MEMORY_STORE_URL_FILE` (see [Daemon configuration](#daemon-configuration)).
+`schema-init` resolves its URL exactly like `serve`: `AI_MEMORY_STORE_URL_FILE` (a `0600` file) first, then `AI_MEMORY_STORE_URL`, then `--store-url` (`src/cli/schema_init.rs:293`, `src/store_url.rs:137`), so the password never has to be on argv ([#4600](https://github.com/alphaonedev/ai-memory-mcp/issues/4600)); `migrate --from/--to` still takes both URLs on argv only.
 
 Since v1.0.0 (#3705, "only encrypted data in transit") every DSN the
 daemon or CLI opens MUST pin `sslmode=verify-full&sslrootcert=<ca>`; a DSN

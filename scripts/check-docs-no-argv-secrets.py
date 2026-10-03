@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 # Copyright 2026 AlphaOne LLC
 # SPDX-License-Identifier: Apache-2.0
-"""#4577 - no credential on a process argv in a tracked file.
+"""#4577 / #4600 / #4603 / #4604 / #4609 / #4617 / #4689-#4694 - no credential on a
+process argv, and no secret in a readable file, in a tracked file.
 
 Threat model. A process argv is world-readable: ``/proc/<pid>/cmdline`` and
 ``ps auxww`` show it to every local UID, and a systemd unit (``ExecStart=``,
@@ -29,6 +30,35 @@ What the gate refuses (exit 1):
     A systemd ``Environment=`` line carrying a credential URL is refused
     whatever the key spelling (#4689).
 
+Rules from the #4600 line of work (text rules, also run on every shell-like or
+template file):
+
+  store-url-expansion  ``--store-url`` followed by an ``AI_MEMORY_STORE_URL`` or
+                     DSN/URL-named variable expansion: the shell or systemd
+                     expands the secret onto argv at run time (#4603). A
+                     ``_FILE`` variable is the sanctioned channel.
+  psql-password-argv  a ``psql`` line with ``-c`` / ``--command`` whose SQL text
+                     carries ``PASSWORD '<value>'`` (#4604). Feed the statement
+                     from a 0600 file on stdin.
+  env-password-argv  ``docker run/exec -e PGPASSWORD=$X`` / ``-e
+                     POSTGRES_PASSWORD=$X`` or ``psql -v pw=$X`` (#4617).
+                     ``-e NAME`` with no value and ``--env-file`` are the
+                     sanctioned forms.
+  cloud-init-readable-secret  a cloud-init ``write_files`` entry left group or
+                     world readable (or with no ``permissions``) whose content
+                     interpolates a ``${..password|secret|token|key|cred..}``
+                     template variable (#4604).
+  xtrace-secret      a line that expands a password-named variable while xtrace
+                     is on and not switched off by ``set +x`` (#4609). The
+                     ``--self-test`` also runs the #4609 runtime probe: it
+                     executes the credential-handling lines of the do-hive
+                     ``provision.sh`` with a dummy password and proves the
+                     provision log never contains it and is mode 0600.
+
+``schema-init`` is no longer an argv-only verb: it resolves
+``AI_MEMORY_STORE_URL_FILE`` then ``AI_MEMORY_STORE_URL`` (#4600), so an inline
+credential on its ``--store-url`` is refused like any other verb's.
+
 Known defects that the rules find in tracked files are listed in PENDING
 with their tracking issue: reported, not approved, and a PENDING entry that
 matches no hit fails the gate as stale.
@@ -38,7 +68,7 @@ Not an argv, so not refused: a variable assignment before the command word
 a comment; a line that is only a URL (a file line the script writes); a YAML
 ``key: value`` mapping line; echo/printf (shell builtins); a redaction token
 (an ellipsis, asterisks, ``REDACTED``, ``<redacted>``); a value with no
-credential (``"$DSN"``); the argv-only verb ``schema-init`` (#4600).
+credential (``"$DSN"``).
 
 What the gate does NOT claim:
 
@@ -47,9 +77,6 @@ What the gate does NOT claim:
     is not seen here. For the two cloud-init templates that class is closed
     by scripts/check-cloud-init-serve-flags.py, which approves every sensitive
     template line from an exact allowlist.
-  * A password in a SQL literal inside a ``psql -c`` argument
-    (``PASSWORD '...'``) is not modelled here; the cloud-init gate refuses it
-    in the templates and lists the do-hive instance as pending #4671.
   * Prose (.md) is checked for ``--store-url`` only; a heredoc body is read as
     commands (stricter, not looser); .tf, .py and .rs sources are checked for
     ``--store-url`` only.
@@ -79,9 +106,6 @@ ROOT = Path(__file__).resolve().parent.parent
 
 Hit = Tuple[str, int, str]
 
-# Verbs that offer no non-argv channel. verb -> tracking issue.
-ARGV_ONLY_VERBS = {"schema-init": "#4600"}
-
 # Redaction tokens that are not a credential.
 REDACTION_TOKENS = ("...", "…", "***", "redacted", "<redacted>", "xxxx")
 
@@ -97,11 +121,7 @@ SKIP_FILES = {"CHANGELOG.md"}
 # tracking issue). A listed hit is reported as PENDING and does not fail the
 # gate; an entry that matches no hit is stale and fails it, so the entry must
 # go when the defect is fixed.
-PENDING = (
-    ("deploy/hive-1461/provision/20_pg_age.sh", "-e POSTGRES_PASSWORD='$SU_PW'", "#4762"),
-    ("deploy/hive-1461/provision/20_pg_age.sh", "docker exec -i -e PGPASSWORD='$SU_PW'", "#4762"),
-    ("deploy/hive-1461/provision/20_pg_age.sh", "exts=\"$(ssh_node \"$ip\" \"docker exec -e PGPASSWORD='$SU_PW'", "#4762"),
-)
+PENDING = ()
 
 TEXT_SUFFIXES = {
     ".md", ".html", ".yaml", ".yml", ".tpl", ".sh", ".bash", ".py", ".toml",
@@ -120,6 +140,39 @@ FLAG = r"--[\"']*store[\"']*[-_][\"']*url[\"']*"
 # A --store-url argument (=, whitespace or backslash-newline), optional quote,
 # then the URL up to whitespace or a quote.
 ARG_RE = re.compile(FLAG + r"(?:=|(?:\s|\\)+)[\"']?(?P<url>" + SCHEME + r"[^\s\"']+)")
+
+# #4603: a runtime expansion of the store-URL env var, or of any variable named
+# like a DSN / URL, straight after the flag. A `_FILE` variable is the
+# sanctioned channel and is not matched.
+EXPANSION_RE = re.compile(
+    FLAG + r"(?:=|(?:\s|\\)+)[\"']?\\*\$\{?[A-Za-z0-9_]*(?:DSN|URL)(?![A-Za-z0-9_])",
+    re.IGNORECASE,
+)
+# #4609: xtrace echoes every expanded command, so a credential-bearing line
+# must sit between `set +x` and `set -x`.
+XTRACE_ON_RE = re.compile(r"^\s*set\s+-[a-z]*x")
+XTRACE_OFF_RE = re.compile(r"^\s*set\s+\+[a-z]*x")
+TRACED_SECRET_RE = re.compile(
+    r"\$\{?(?:[A-Za-z0-9_]*(?:password|passwd|secret|token|_pw)|pw)(?![A-Za-z0-9])",
+    re.IGNORECASE,
+)
+# #4604: a password literal in a psql -c / --command SQL string.
+PSQL_ARGV_RE = re.compile(
+    r"\bpsql\b[^\n]*?\s(?:-c|--command)(?:=|\s)\s*[\"'][^\n]*?\bPASSWORD\s+\\?'(?P<pw>[^'\s]+)",
+    re.IGNORECASE,
+)
+# #4617: a runtime-expanded password on a docker -e / psql -v argv word.
+ENV_ARGV_RE = re.compile(
+    r"(?:\s-e|\s--env)(?:=|\s)\s*[\"']?(?:PGPASSWORD|POSTGRES_PASSWORD)=[\"']?(?P<pw>\$[^\s\"']+)"
+    r"|\spsql\b[^\n]*?\s-v\s+(?:pw|password|passwd)=[\"']?(?P<pw2>\$[^\s\"']+)",
+    re.IGNORECASE,
+)
+SECRET_VAR_RE = re.compile(
+    r"\$\{[A-Za-z0-9_]*(?:password|passwd|secret|token|key|cred)[A-Za-z0-9_]*\}",
+    re.IGNORECASE,
+)
+ENTRY_RE = re.compile(r"^(?P<indent>\s*)- path:\s*(?P<path>\S+)")
+PERM_RE = re.compile(r"^\s*permissions:\s*[\"']?(?P<mode>[0-7]{3,4})[\"']?")
 
 # A postgres URL inside a word: at the word start, after = (an option value or
 # a conninfo dbname), or after a separator inside a -c script string.
@@ -169,24 +222,6 @@ def redact(text: str) -> str:
     text = re.sub(r"(://[^\s/@:\"']*:)[^\s/@\"']+@", r"\1***@", text)
     text = re.sub(r"(?i)((?:password|%70assword|pass\w*|secret\w*|token\w*)\s*=\s*)[^\s&\"']+", r"\1***", text)
     return text[:140]
-
-
-def verb_allowed(words: List[str]) -> str:
-    joined = " ".join(words)
-    for verb, ref in ARGV_ONLY_VERBS.items():
-        if re.search(r"(?<![\w-])" + re.escape(verb) + r"(?![\w-])", joined):
-            return ref
-    return ""
-
-
-def window_verb_allowed(text: str, start: int) -> str:
-    """For prose: the verb owning a --store-url is the text since the last
-    blank line (or 400 characters), so a continuation line still sees it."""
-    window = text[max(0, start - 400):start].rsplit("\n\n", 1)[-1]
-    for verb, ref in ARGV_ONLY_VERBS.items():
-        if re.search(r"(?<![\w-])" + re.escape(verb) + r"(?![\w-])", window):
-            return ref
-    return ""
 
 
 def logical_lines(text: str) -> List[Tuple[int, str]]:
@@ -329,7 +364,7 @@ def command_hits(cmd: List[str], depth: int = 0) -> List[str]:
                 for inner in commands(split_words(text)):
                     reasons.extend(command_hits(inner, depth + 1))
     words = argv_words(cmd)
-    if words and not verb_allowed(words):
+    if words:
         reasons.extend(word_hits(words, depth))
     return reasons
 
@@ -355,10 +390,94 @@ def flag_hits(rel: str, text: str) -> List[Hit]:
     hits: List[Hit] = []
     lines = text.splitlines()
     for m in ARG_RE.finditer(text):
-        if not url_credential(m.group("url")) or window_verb_allowed(text, m.start()):
+        if not url_credential(m.group("url")):
             continue
         line = text.count("\n", 0, m.start()) + 1
         hits.append((rel, line, redact(lines[line - 1].strip()) if lines else ""))
+    return hits
+
+
+def _line_of(text: str, pos: int) -> Tuple[int, str]:
+    line = text.count("\n", 0, pos) + 1
+    snippet = text.splitlines()[line - 1].strip() if text else ""
+    return line, redact(snippet)
+
+
+def scan_write_files(rel: str, text: str) -> List[Hit]:
+    """cloud-init write_files entries that interpolate a secret into a file
+    left group/world readable (#4604)."""
+    hits: List[Hit] = []
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):
+        m = ENTRY_RE.match(lines[i])
+        if not m:
+            i += 1
+            continue
+        indent = len(m.group("indent"))
+        j = i + 1
+        mode = 0o644  # cloud-init default when permissions is absent
+        body: List[Tuple[int, str]] = []
+        while j < len(lines):
+            ln = lines[j]
+            stripped = ln.strip()
+            cur = len(ln) - len(ln.lstrip())
+            if stripped and cur <= indent and not stripped.startswith("#"):
+                break
+            pm = PERM_RE.match(ln)
+            if pm and cur == indent + 2:
+                mode = int(pm.group("mode"), 8)
+            body.append((j + 1, ln))
+            j += 1
+        if mode & 0o077:
+            for lineno, ln in body:
+                if SECRET_VAR_RE.search(ln):
+                    hits.append((rel, lineno, "[cloud-init-readable-secret %o %s] %s"
+                                 % (mode, m.group("path"), ln.strip()[:100])))
+                    break
+        i = j
+    return hits
+
+
+def scan_xtrace(rel: str, text: str) -> List[Hit]:
+    """Credential-bearing lines executed while xtrace is on (#4609)."""
+    hits: List[Hit] = []
+    traced = False
+    for n, ln in enumerate(text.splitlines(), 1):
+        if ln.lstrip().startswith("#"):
+            continue
+        if XTRACE_OFF_RE.match(ln):
+            traced = False
+            continue
+        if XTRACE_ON_RE.match(ln):
+            traced = True
+            continue
+        if traced and TRACED_SECRET_RE.search(ln):
+            hits.append((rel, n, "[xtrace-secret] " + ln.strip()[:120]))
+    return hits
+
+
+def text_rule_hits(rel: str, text: str) -> List[Hit]:
+    """The #4600-line text rules: expansion, psql -c password, docker -e / psql
+    -v runtime-expanded password, readable cloud-init secret, traced secret."""
+    hits: List[Hit] = []
+    for m in EXPANSION_RE.finditer(text):
+        line, snippet = _line_of(text, m.start())
+        hits.append((rel, line, "[store-url-expansion] " + snippet))
+    for m in PSQL_ARGV_RE.finditer(text):
+        if is_redaction(m.group("pw")):
+            continue
+        line, snippet = _line_of(text, m.start())
+        hits.append((rel, line, "[psql-password-argv] " + snippet))
+    for m in ENV_ARGV_RE.finditer(text):
+        if is_redaction(m.group("pw") or m.group("pw2") or ""):
+            continue
+        line, snippet = _line_of(text, m.start())
+        hits.append((rel, line, "[env-password-argv] " + snippet))
+    if rel.endswith((".tpl", ".yaml", ".yml")):
+        hits.extend(scan_write_files(rel, text))
+    if rel.endswith((".sh", ".tpl", ".yaml", ".yml")):
+        hits.extend(scan_xtrace(rel, text))
     return hits
 
 
@@ -369,6 +488,8 @@ def scan_text(rel: str, text: str) -> List[Hit]:
     if Path(rel).suffix.lower() in SHELL_SUFFIXES:
         seen = {h[:2] for h in hits}
         hits.extend(h for h in shell_hits(rel, text) if h[:2] not in seen)
+    seen = {h[:2] for h in hits}
+    hits.extend(h for h in text_rule_hits(rel, text) if h[:2] not in seen)
     return hits
 
 
@@ -475,6 +596,15 @@ RED_PROBES = {
     "4663 password= query parameter, = form": "ai-memory serve %s=postgres://u@h/d?password=%s" % (SU, PW),
     "4691 percent-encoded password key": "ai-memory serve %s 'postgres://u@h/d?%%70assword=%s'" % (SU, PW),
     "4691 upper-case encoded key": "ai-memory serve %s 'postgres://u@h/d?PASS%%57ORD=%s'" % (SU, PW),
+    # #4600: schema-init resolves the file/env channels now, so an inline
+    # credential on its flag is refused like any other verb's (these three were
+    # green probes while the verb was argv-only). The expansion of the store-URL
+    # variable puts the credential on argv at run time (#4603), so the former
+    # green probe "shell-expansion" is red.
+    "4600 schema-init inline": "ai-memory schema-init %s postgres://u:%s@h/d" % (SU, PW),
+    "4600 schema-init continued": "ai-memory schema-init \\\n  %s postgres://u:%s@h/d" % (SU, PW),
+    "4600 schema-init quote-split": "ai-memory schema-init --store-\"url\" postgres://u:%s@h/d" % PW,
+    "4603 shell-expansion of the store URL": 'ai-memory keys %s "$AI_MEMORY_STORE_URL" prune' % SU,
     "4693 quote-split flag name": "ai-memory serve --store-\"url\" postgres://u:%s@h/d" % PW,
     "4693 single-quote-split flag name": "ai-memory serve --'store'-url postgres://u:%s@h/d" % PW,
 }
@@ -518,26 +648,195 @@ GREEN_SHELL_PROBES = {
     "4692 passfile is not a password": "psql 'host=h passfile=/etc/pgpass dbname=d'",
     "4691 a key that only contains password": "psql 'postgres://u@h/d?xpassword=1'",
     "4689 Environment= without a credential": "Environment=AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url",
-    "argv-only verb": "ai-memory schema-init %s postgres://u:%s@h/d" % (SU, PW),
 }
 GREEN_PROBES = {
     "file-form": "AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url ai-memory serve",
     "no-password": "ai-memory serve %s postgres://u@h/d" % SU,
     "no-userinfo": "ai-memory serve %s postgres://h:5432/d" % SU,
-    "shell-expansion": 'ai-memory keys %s "$AI_MEMORY_STORE_URL" prune' % SU,
     "ellipsis": "ai-memory serve %s postgres://aimemory:...@10.0.0.4:5432/db" % SU,
     "redacted": "ai-memory serve %s postgres://aimemory:REDACTED@h/db" % SU,
     "ellipsis-char": "ai-memory serve %s postgres://user:…@h/db" % SU,
     "lookalike-flag": "wake_abab.sh %s-src postgres://u:p@h/d" % SU,
     "prose-mention": "the `serve %s` connection URL (e.g. postgres://user:pass@host/db)" % SU,
-    "argv-only-verb": "ai-memory schema-init %s postgres://u:%s@h/d" % (SU, PW),
-    "argv-only-verb-continued": "ai-memory schema-init \\\n  %s postgres://u:%s@h/d" % (SU, PW),
 }
+
+
+RED_PROBES_4600 = {
+    "inline": "ai-memory serve --store-url postgres://u:hunter2@h:5432/d",
+    "equals": "ai-memory serve --store-url=postgres://u:hunter2@h/d",
+    "quoted": 'ExecStart=/bin/ai-memory serve --store-url "postgres://u:${db_password}@h/d"',
+    "single-quoted": "x serve --store-url 'postgresql://u:p%40ss@h/d?sslmode=require'",
+    "shell-var": "ssh h \"ai-memory serve --store-url 'postgres://u:$PG_PW@h/d'\"",
+    "continuation": "ai-memory serve \\\n  --store-url \\\n  postgres://u:hunter2@h/d",
+    "other-verb": "ai-memory curator --store-url postgres://u:hunter2@h/d",
+    "schema-init": "ai-memory schema-init --store-url postgres://u:hunter2@h/d",
+    "schema-init-continued": "ai-memory schema-init \\\n  --store-url postgres://u:hunter2@h/d",
+    # #4603: a runtime expansion of the env var onto the --store-url argv.
+    "expansion-systemd": "ExecStart=/bin/ai-memory serve --store-url ${AI_MEMORY_STORE_URL} --port 1",
+    "expansion-heredoc-escaped": "ExecStart=$BIN curator --daemon --store-url \\\\\\${AI_MEMORY_STORE_URL} --x 1",
+    "expansion-shell-quoted": 'exec ai-memory serve --store-url "$AI_MEMORY_STORE_URL" \\',
+    "expansion-continued": "serve \\\n  --store-url \\\n  $AI_MEMORY_STORE_URL",
+    # #4603: verify.sh's shape, a DSN variable on --store-url.
+    "expansion-dsn-var": 'AI_MEMORY_NO_CONFIG=1 "$BIN" verify-audit-trail --store-url "$DSN" >out 2>&1',
+    "expansion-pooled-url": '"$BIN" schema-init --store-url "$POOLED_URL"',
+    # #4617: password on a docker -e / psql -v argv word.
+    "docker-exec-pgpassword": "ssh h \"docker exec -e PGPASSWORD='$SU_PW' c psql -U postgres\"",
+    "docker-run-postgres-password": "docker run -d -e POSTGRES_PASSWORD=\"$PGPW\" img",
+    "psql-v-pw": "docker exec -i c psql -v ON_ERROR_STOP=1 -v pw='$PG_PW' -f -",
+    # #4609: xtrace on while the password is handled.
+    "xtrace-secret": "set -euxo pipefail\nprintf '%s' ${db_password} > /etc/x\n",
+    "xtrace-secret-after-restore": "set -x\nset +x\nset -x\necho $PG_PW\n",
+    # #4604: the role password in a psql -c statement, and a readable script.
+    "psql-create-user": "sudo -u postgres psql -c \"CREATE USER aimemory WITH PASSWORD '${db_password}';\"",
+    "psql-alter-role": "psql -h h -d d --command=\"ALTER ROLE a WITH PASSWORD 'hunter2'\"",
+    "cloud-init-0755": "write_files:\n  - path: /opt/p.sh\n    permissions: '0755'\n    content: |\n      x '${db_password}'\n",
+    "cloud-init-no-perms": "write_files:\n  - path: /opt/p.sh\n    content: |\n      x ${api_token}\n",
+}
+GREEN_PROBES_4600 = {
+    "file-form": "AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url ai-memory serve",
+    "no-password": "ai-memory serve --store-url postgres://u@h/d",
+    "no-userinfo": "ai-memory serve --store-url postgres://h:5432/d",
+    "file-env-expansion": 'ai-memory keys --store-url "$AI_MEMORY_STORE_URL_FILE" prune',
+    "ellipsis": "ai-memory serve --store-url postgres://aimemory:...@10.0.0.4:5432/db",
+    "redacted": "ai-memory serve --store-url postgres://aimemory:REDACTED@h/db",
+    "ellipsis-char": "ai-memory serve --store-url postgres://user:…@h/db",
+    "lookalike-flag": "wake_abab.sh --store-url-src postgres://u:p@h/d",
+    "prose-mention": "the `serve --store-url` connection URL (e.g. postgres://user:pass@host/db)",
+    "schema-init-file-form": "AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url ai-memory schema-init",
+    "expansion-of-other-var": 'ai-memory keys --store-url "$SQLITE_PATH" prune',
+    "docker-e-inherit": 'PGPASSWORD="$PW" docker exec -e PGPASSWORD c psql -U u',
+    "docker-env-file": "docker run -d --env-file /run/s/su.env img",
+    "psql-v-no-secret": "psql -v ON_ERROR_STOP=1 -f -",
+    "xtrace-off-around-secret": "set -euxo pipefail\nset +x\nprintf '%s' ${db_password} > /etc/x\nset -x\n",
+    "xtrace-no-secret": "set -x\necho ${node_index}\n",
+    "no-xtrace-secret": "set -euo pipefail\nprintf '%s' ${db_password} > /etc/x\n",
+    "xtrace-comment-only": "set -x\n# ${db_password} is handled below\n",
+    "env-var-not-after-flag": "export AI_MEMORY_STORE_URL=postgres://u@h/d; ai-memory serve",
+    "psql-stdin-file": "sudo -u postgres psql -f - < /etc/ai-memory/create-role.sql",
+    "psql-select": 'sudo -u postgres psql -tc "SELECT 1 FROM pg_roles WHERE rolname=\'a\'"',
+    "psql-redacted": "psql -c \"CREATE USER a WITH PASSWORD '...'\"",
+    "sql-file-not-psql": "CREATE USER aimemory WITH PASSWORD 'x';",
+    "cloud-init-0600": "write_files:\n  - path: /etc/s\n    permissions: '0600'\n    content: |\n      pw ${db_password}\n",
+    "cloud-init-0700": "write_files:\n  - path: /opt/p.sh\n    permissions: '0700'\n    content: |\n      x '${db_password}'\n",
+    "cloud-init-readable-no-secret": "write_files:\n  - path: /opt/p.sh\n    permissions: '0755'\n    content: |\n      echo ${node_index}\n",
+}
+
+
+
+DUMMY_PW = "DUMMY-pw-4609-must-not-leak"
+PROVISION_TPL = "infra/do-hive/cloud-init-memory.yaml.tpl"
+
+
+def _provision_body(tpl: str) -> List[str]:
+    """The de-indented provision.sh body from the cloud-init template."""
+    lines = tpl.splitlines()
+    start = next(i for i, ln in enumerate(lines) if ln.strip() == "- path: /opt/ai-memory/provision.sh")
+    cont = next(i for i in range(start, len(lines)) if lines[i].strip() == "content: |")
+    body = []
+    for ln in lines[cont + 1:]:
+        if ln.strip() and not ln.startswith("      "):
+            break
+        body.append(ln[6:] if ln.startswith("      ") else "")
+    return body
+
+
+def _credential_harness(body: List[str], scratch: Path) -> str:
+    """Preamble + role block + userlist block of provision.sh, paths pointed
+    at ``scratch`` (no /etc, /root or /var/log writes)."""
+    pre_end = next(i for i, ln in enumerate(body) if ln.startswith('echo "=== ai-memory'))
+    role_start = next(i for i, ln in enumerate(body) if "db + role + extensions" in ln)
+    role_end = next(i for i in range(role_start, len(body)) if "CREATE DATABASE" in body[i])
+    ul = next(i for i, ln in enumerate(body) if "userlist.txt" in ln and "printf" in ln)
+    ul_start = ul - 1 if body[ul - 1].lstrip().startswith("set +x") else ul
+    ul_end = next(i for i in range(ul, len(body)) if "chmod 0600 /etc/pgbouncer/userlist.txt" in body[i])
+    picked = body[:pre_end + 1] + body[role_start:role_end + 1] + body[ul_start:ul_end + 1]
+    text = "\n".join(picked) + "\n"
+    for real, fake in (("/var/log/ai-memory-provision.log", str(scratch / "provision.log")),
+                       ("/root/.aimemory-role.sql", str(scratch / "role.sql")),
+                       ("/etc/pgbouncer/userlist.txt", str(scratch / "userlist.txt")),
+                       ("/etc/pgbouncer/pgbouncer.ini", str(scratch / "pgbouncer.ini"))):
+        text = text.replace(real, fake)
+    return text.replace("${db_password}", DUMMY_PW)
+
+
+def _run_provision_probe(tpl: str) -> Tuple[str, int, str]:
+    """Run the harness under bash with stubbed sudo/chown. Returns
+    (log text, log mode, stderr)."""
+    scratch_parent = ROOT / ".local-runs"
+    scratch_parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=str(scratch_parent)) as td:
+        scratch = Path(td)
+        stubs = scratch / "bin"
+        stubs.mkdir()
+        for name in ("sudo", "chown"):
+            stub = stubs / name
+            stub.write_text("#!/bin/sh\ncat >/dev/null 2>&1 </dev/null || true\nexit 0\n", encoding="utf-8")
+            stub.chmod(0o755)
+        script = scratch / "harness.sh"
+        script.write_text(_credential_harness(_provision_body(tpl), scratch), encoding="utf-8")
+        proc = subprocess.run(
+            ["bash", str(script)], capture_output=True, text=True, timeout=60, check=False,
+            env={"PATH": "%s:/usr/bin:/bin" % stubs, "HOME": str(scratch)},
+        )
+        import time
+        time.sleep(0.5)  # let the `tee` process substitution flush the log
+        log = scratch / "provision.log"
+        mode = (log.stat().st_mode & 0o777) if log.exists() else -1
+        leaked = log.read_text(encoding="utf-8") if log.exists() else ""
+        if proc.returncode != 0:
+            leaked += "\n[harness rc=%d] %s" % (proc.returncode, proc.stderr[-300:])
+        return leaked, mode, proc.stderr
+
+
+def runtime_probe() -> int:
+    """#4609 red-then-green: dummy password, real bash, real xtrace + tee."""
+    tpl_path = ROOT / PROVISION_TPL
+    if not tpl_path.exists():
+        print("SELF-TEST FAIL: %s missing" % PROVISION_TPL, file=sys.stderr)
+        return 1
+    tpl = tpl_path.read_text(encoding="utf-8")
+    bad = 0
+    log, mode, _ = _run_provision_probe(tpl)
+    if DUMMY_PW in log or "harness rc=" in log:
+        print("SELF-TEST FAIL: provision.sh leaks the dummy password (or the harness failed) in its log", file=sys.stderr)
+        bad += 1
+    if mode != 0o600:
+        print("SELF-TEST FAIL: provision log mode is %s, want 0600" % oct(mode), file=sys.stderr)
+        bad += 1
+    # Red: remove the protections from a copy; the same probe must now leak.
+    regressed = "\n".join(
+        ln for ln in tpl.splitlines()
+        if ln.strip() not in ("set +x", "set +x   # #4609: no xtrace of the userlist credential line")
+        and "chmod 0600 /var/log/ai-memory-provision.log" not in ln
+        and ": >> /var/log/ai-memory-provision.log" not in ln
+    ) + "\n"
+    rlog, rmode, _ = _run_provision_probe(regressed)
+    if DUMMY_PW not in rlog:
+        print("SELF-TEST FAIL: regressed provision.sh did not leak the dummy password; the probe is vacuous", file=sys.stderr)
+        bad += 1
+    return bad
 
 
 def self_test() -> int:
     bad = 0
     red = green = 0
+    bad += runtime_probe()
+    for name, text in RED_PROBES_4600.items():
+        red += 1
+        if not scan_text("probe.yaml.tpl", text):
+            print("SELF-TEST FAIL: red probe (#4600 set) %r was not flagged" % name, file=sys.stderr)
+            bad += 1
+    for name, text in GREEN_PROBES_4600.items():
+        green += 1
+        # A credential URL after a look-alike flag, or in prose, is clean in a
+        # prose file (the same probes are in GREEN_PROBES) but on a script line it
+        # is a credential on another command's argv, which the shell reader
+        # refuses: decided by whether a credential reaches argv (#4762 merge).
+        suffix = "probe.md" if name in ("lookalike-flag", "prose-mention") else "probe.yaml.tpl"
+        got = scan_text(suffix, text)
+        if got:
+            print("SELF-TEST FAIL: green probe (#4600 set) %r was flagged: %r" % (name, got), file=sys.stderr)
+            bad += 1
     for name, text in RED_PROBES.items():
         red += 1
         if not scan_text("probe.md", text):

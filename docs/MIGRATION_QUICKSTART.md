@@ -285,8 +285,10 @@ ai-memory config migrate || true
 
 # --- 3. Postgres schema migration (idempotent — schema-init re-runs safely;
 #         requires a --features sal,sal-postgres build of the binary)
-if [ -n "${AI_MEMORY_STORE_URL:-}" ]; then
-  ai-memory schema-init --store-url "$AI_MEMORY_STORE_URL" || true
+# schema-init reads AI_MEMORY_STORE_URL_FILE, then AI_MEMORY_STORE_URL, on its own
+# (src/cli/schema_init.rs:293, src/store_url.rs:137): no --store-url, so no argv password.
+if [ -n "${AI_MEMORY_STORE_URL_FILE:-}" ] || [ -n "${AI_MEMORY_STORE_URL:-}" ]; then
+  ai-memory schema-init || true
 fi
 
 # --- 4. Governance → permissions (idempotent — in-place merge)

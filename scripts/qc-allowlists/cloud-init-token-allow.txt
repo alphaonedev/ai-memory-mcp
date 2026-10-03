@@ -273,7 +273,6 @@ do-hive | /opt/ai-memory/fed-bootstrap.sh | echo "[fed-bootstrap] author $AUTHOR
 do-hive | /opt/ai-memory/fed-bootstrap.sh | : > "$FED_DIR/MESH-READY"
 do-hive | /opt/ai-memory/fed-bootstrap.sh | echo "[fed-bootstrap] MESH READY node ${node_index}/${node_count} identity=$FED_ID peers=$PEERS author=$AUTHOR_ID"
 do-hive | /opt/ai-memory/provision.sh | - path: /opt/ai-memory/provision.sh
-do-hive | /opt/ai-memory/provision.sh | permissions: '0755'
 do-hive | /opt/ai-memory/provision.sh | content: |
 do-hive | /opt/ai-memory/provision.sh | #!/usr/bin/env bash
 do-hive | /opt/ai-memory/provision.sh | set -euxo pipefail
@@ -323,4 +322,16 @@ do-hive | /opt/ai-memory/provision.sh | systemctl enable ai-memory || true
 do-hive | /opt/ai-memory/provision.sh | systemctl enable ai-memory-fed-bootstrap || true
 do-hive | /opt/ai-memory/provision.sh | systemctl start --no-block ai-memory-fed-bootstrap || true
 do-hive | /opt/ai-memory/provision.sh | echo "=== provision complete $(date -u) ==="
+do-hive | /opt/ai-memory/provision.sh | permissions: '0700'
+do-hive | /opt/ai-memory/provision.sh | owner: root:root
+do-hive | /opt/ai-memory/provision.sh | ( umask 077; : >> /var/log/ai-memory-provision.log )
+do-hive | /opt/ai-memory/provision.sh | chmod 0600 /var/log/ai-memory-provision.log
+do-hive | /opt/ai-memory/provision.sh | chown root:root /opt/ai-memory/provision.sh # holds the db password (#4604)
+do-hive | /opt/ai-memory/provision.sh | chmod 0700 /opt/ai-memory/provision.sh
+do-hive | /opt/ai-memory/provision.sh | set +x
+do-hive | /opt/ai-memory/provision.sh | if ! sudo -u postgres psql -tc "SELECT 1 FROM pg_roles WHERE rolname='aimemory'" | grep -q 1; then
+do-hive | /opt/ai-memory/provision.sh | sudo -u postgres psql -v ON_ERROR_STOP=1 -f - < /root/.aimemory-role.sql
+do-hive | /opt/ai-memory/provision.sh | rm -f /root/.aimemory-role.sql
+do-hive | /opt/ai-memory/provision.sh | set -x
+do-hive | /opt/ai-memory/provision.sh | set +x # #4609: no xtrace of the userlist credential line
 do-hive | runcmd | - bash /opt/ai-memory/provision.sh

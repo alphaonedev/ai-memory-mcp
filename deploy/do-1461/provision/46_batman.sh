@@ -202,6 +202,7 @@ activate_form7_on_peer() {
 # systemd unit; the Form-5 env battery is already in the EnvironmentFile so the
 # curator inherits AUTO_CONFIDENCE / SHADOW / DECAY when 50 (re)starts the stack.
 install_curator_on_peer() {
+  require_store_url_env_channel
   local ip="$1" host="$2"
   local unit="/etc/systemd/system/ai-memory-curator.service"
   ssh_node "$ip" "cat > '$unit' <<UNIT
@@ -214,12 +215,12 @@ Wants=network-online.target
 Type=simple
 Environment=HOME=/root
 EnvironmentFile=$REMOTE_ENVFILE
-# systemd does literal \${VAR} substitution (NOT shell :+ expansion); the
-# postgres peers always carry AI_MEMORY_STORE_URL (50_federation), so pass it
-# unconditionally. #1547: --store-url is a `curator` subcommand flag, so it
-# MUST appear AFTER the `curator` token (clap rejects it as a global flag and
-# exits 2 -> crash-loop otherwise). Mirrors `curator --store-url ...` usage.
-ExecStart=$BIN curator --daemon --store-url \\\${AI_MEMORY_STORE_URL} --interval-secs $BATMAN_CURATOR_INTERVAL_SECS --max-ops $BATMAN_CURATOR_MAX_OPS
+# #4603: no --store-url on argv (a systemd \${VAR} expansion would put the DSN,
+# which carries the db password, in /proc/<pid>/cmdline). The postgres peers
+# always carry AI_MEMORY_STORE_URL in the EnvironmentFile (50_federation) and
+# the curator resolves it through src/store_url.rs resolve_store_url
+# (src/daemon_runtime.rs:5090, build_store_handle).
+ExecStart=$BIN curator --daemon --interval-secs $BATMAN_CURATOR_INTERVAL_SECS --max-ops $BATMAN_CURATOR_MAX_OPS
 Restart=on-failure
 RestartSec=30
 Nice=5

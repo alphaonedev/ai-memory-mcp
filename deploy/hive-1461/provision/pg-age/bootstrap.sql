@@ -2,12 +2,16 @@
 -- SPDX-License-Identifier: Apache-2.0
 --
 -- Idempotent peer-DB bootstrap. Run as the postgres superuser with the
--- aimemory role password supplied out-of-band as the psql variable :pw
--- (NEVER hard-coded here):  psql -v pw="$AIMEMORY_PG_PASSWORD" -f bootstrap.sql
+-- aimemory role password supplied out-of-band in the AIMEMORY_PW environment
+-- variable (NEVER hard-coded here, and never a `-v pw=...` argv word, which any
+-- local user can read from the process list, #4617):
+--   AIMEMORY_PW="$AIMEMORY_PG_PASSWORD" psql -f bootstrap.sql   (psql >= 15)
 --
 -- Creates the aimemory role + database, installs age + vector, and pins the
 -- AGE-aware search_path. The ai-memory `schema-init` step (run separately)
 -- then lays down the v55 application schema + the ai_memory_kg graph.
+
+\getenv pw AIMEMORY_PW
 
 SELECT format('CREATE ROLE aimemory LOGIN PASSWORD %L', :'pw')
 WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'aimemory')
