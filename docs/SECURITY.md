@@ -652,8 +652,10 @@ in `_curator/rollback/<ts>`.
 
 For compliance-grade audit, also:
 
-- Enable daemon structured logs (`RUST_LOG=ai_memory=info`) and ship
-  to syslog.
+- Enable daemon structured logs (the default filter is the bare level
+  `info`; do not narrow it to `RUST_LOG=ai_memory=info`, which drops
+  security and degradation events whose targets sit outside `ai_memory`,
+  #3650) and ship to syslog.
 - Enable Prometheus `/metrics` and scrape the full counter set.
 - Retain `archive` memories (don't `archive purge`).
 

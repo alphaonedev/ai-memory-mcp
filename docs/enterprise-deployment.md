@@ -1757,8 +1757,12 @@ Six surfaces, each load-bearing for different ops scenarios:
    an `err` warn event. Governance decisions are not tracing spans:
    [`record_decision`](../src/governance/audit.rs) writes them to the
    forensic audit log. Federation emits `tracing::info!` events on the push,
-   DLQ-replay, receive and sync paths, not a span per event.
-   `RUST_LOG=ai_memory=info` is the default; `RUST_LOG=ai_memory=debug`
+   DLQ-replay, receive and sync paths, not a span per event. The default
+   filter is the bare level `info`
+   ([`DEFAULT_LOG_DIRECTIVE`](../src/logging.rs), #3650); do not set
+   `RUST_LOG=ai_memory=info`, a prefix filter that drops the events whose
+   targets sit outside `ai_memory` (`store::postgres`, `signed_events`,
+   `security.posture`, `http::auth` and others). `RUST_LOG=ai_memory=debug`
    for deep traces.
 4. **File logging** — opt-in via `[logging]` in `config.toml`.
    Rotating appender; off by default.
