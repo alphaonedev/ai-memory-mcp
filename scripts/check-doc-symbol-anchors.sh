@@ -91,8 +91,8 @@ if [[ "${1:-}" == "--self-test" ]]; then
     mkdir -p "$FIX/src/mcp/tools" "$FIX/src/store" "$FIX/docs" "$FIX/scripts/qc-allowlists"
     # #4507 R3-6 - the gate refuses a tree without the two reference files.
     mkdir -p "$FIX/docs/reference"
-    printf '# Architecture reference (fixture)\n' > "$FIX/docs/reference/ARCHITECTURE_REFERENCE.md"
-    printf '# Code style reference (fixture)\n' > "$FIX/docs/reference/CODE_STYLE.md"
+    printf '# Architecture reference (fixture)\nFixture body line.\n' > "$FIX/docs/reference/ARCHITECTURE_REFERENCE.md"
+    printf '# Code style reference (fixture)\nFixture body line.\n' > "$FIX/docs/reference/CODE_STYLE.md"
     trap 'rm -rf "$FIX"' EXIT
 
     # The REAL shape of the audit's `decorate_memory` finding: the old
@@ -252,6 +252,33 @@ MDEOF
         rm -f "$FIX/docs/reference/$rf.md"
         mv "$FIX/docs/reference/$rf.md.aside" "$FIX/docs/reference/$rf.md"
     done
+    # ---- #4507 R3-F8: an empty or heading-only reference file FAILS CLOSED ----
+    for rf in ARCHITECTURE_REFERENCE CODE_STYLE; do
+        cp "$FIX/docs/reference/$rf.md" "$FIX/docs/reference/$rf.md.aside"
+        : > "$FIX/docs/reference/$rf.md"
+        rf_out="$(run_fixture_out)"
+        [[ "$(run_fixture)" != "0" ]] && grep -q "$rf.md is empty" <<<"$rf_out" || {
+            echo "FAIL: self-test #4507 R3-F8 — an EMPTY $rf.md did not fail closed" >&2; exit 1; }
+        printf '# Heading only\n\n## Sub\n' > "$FIX/docs/reference/$rf.md"
+        rf_out="$(run_fixture_out)"
+        [[ "$(run_fixture)" != "0" ]] && grep -q "$rf.md has only headings" <<<"$rf_out" || {
+            echo "FAIL: self-test #4507 R3-F8 — a HEADING-ONLY $rf.md did not fail closed" >&2; exit 1; }
+        mv "$FIX/docs/reference/$rf.md.aside" "$FIX/docs/reference/$rf.md"
+        echo "PASS: self-test #4507 R3-F8 — an empty and a heading-only $rf.md FAIL CLOSED"
+    done
+    # ---- #4507 R3-F8: an unreadable file the engine must scan is a FAILURE, never a skip ----
+    if [[ "$(id -u)" != 0 ]]; then
+        write_clean
+        mkdir -p "$FIX/src/store"
+        rf_src="$FIX/src/store/unreadable_fixture.rs"
+        printf 'pub fn unreadable_fixture() {}\n' > "$rf_src"
+        chmod 000 "$rf_src"
+        rf_out="$(run_fixture_out)"
+        chmod 644 "$rf_src"
+        [[ "$(run_fixture)" != "0" ]] && grep -q "cannot read" <<<"$rf_out" || {
+            echo "FAIL: self-test #4507 R3-F8 — an UNREADABLE scanned file was skipped, not failed" >&2; exit 1; }
+        echo "PASS: self-test #4507 R3-F8 — an unreadable scanned file FAILS CLOSED"
+    fi
     # ---- #4507 R3-F7: a symlink ABOVE the file (docs/reference -> elsewhere) FAILS CLOSED ----
     mv "$FIX/docs/reference" "$FIX/docs/reference.aside"
     ln -s reference.aside "$FIX/docs/reference"
@@ -338,8 +365,8 @@ for p in sorted(glob.glob(os.path.join(root, "src/**/*.rs"), recursive=True)):
     rel = p[len(root) + 1:]
     try:
         text = open(p, encoding="utf-8", errors="replace").read()
-    except OSError:
-        continue
+    except OSError as exc:
+        raise RuntimeError(f"cannot read {rel}: {exc} (#4507 R3-F8 fail-closed)")
     line_count[rel] = text.count("\n") + 1
     names = {m.group(1) for m in DEF.finditer(text)}
     names |= {m.group(1) for m in MACRO.finditer(text)}
@@ -407,8 +434,8 @@ def emit(rule, doc, ln, token, ctx):
 for doc in seen_docs:
     try:
         text = open(os.path.join(root, doc), encoding="utf-8", errors="replace").read()
-    except OSError:
-        continue
+    except OSError as exc:
+        raise RuntimeError(f"cannot read {doc}: {exc} (#4507 R3-F8 fail-closed)")
     doc_lines = text.splitlines()
     for ln, line in enumerate(doc_lines, 1):
         ctx = line.strip()

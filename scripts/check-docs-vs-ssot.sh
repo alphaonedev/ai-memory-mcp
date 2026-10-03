@@ -1665,8 +1665,8 @@ run_self_test() {
     # the fixture carries real (stub) ones; the missing/symlink cases below
     # remove or replace them one at a time.
     mkdir -p docs/reference
-    printf '# Architecture reference (fixture)\n' > docs/reference/ARCHITECTURE_REFERENCE.md
-    printf '# Code style reference (fixture)\n' > docs/reference/CODE_STYLE.md
+    printf '# Architecture reference (fixture)\nFixture body line.\n' > docs/reference/ARCHITECTURE_REFERENCE.md
+    printf '# Code style reference (fixture)\nFixture body line.\n' > docs/reference/CODE_STYLE.md
     mkdir -p scripts/qc-allowlists
     cat > scripts/qc-allowlists/html-doc-frozen-exempt.txt <<'FROZENEOF'
 # fixture exemption SSOT
@@ -2568,6 +2568,37 @@ HTMLSTAMPFROZEN
         echo "PASS: self-test #4507 R3-6 — a symlinked $_rf.md FAILS CLOSED (rc=$_rc)"
         rm -f "$tmpdir/docs/reference/$_rf.md"
         mv "$tmpdir/docs/reference/$_rf.md.aside" "$tmpdir/docs/reference/$_rf.md"
+    done
+
+    # ---- #4507 R3-F8: an empty, heading-only or unreadable reference file FAILS CLOSED (clean FAIL, no traceback).
+    for _rf in ARCHITECTURE_REFERENCE CODE_STYLE; do
+        cp "$tmpdir/docs/reference/$_rf.md" "$tmpdir/docs/reference/$_rf.md.aside"
+        : > "$tmpdir/docs/reference/$_rf.md"
+        _rc=0
+        _out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1) || _rc=$?
+        if [[ "$_rc" == 0 ]] || ! grep -q "$_rf.md is empty" <<<"$_out"; then
+            echo "FAIL: self-test #4507 R3-F8 — an EMPTY $_rf.md did not fail closed (rc=$_rc)" >&2
+            cd "$REPO_ROOT"; exit 1
+        fi
+        printf '# Heading only\n\n## Sub\n' > "$tmpdir/docs/reference/$_rf.md"
+        _rc=0
+        _out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1) || _rc=$?
+        if [[ "$_rc" == 0 ]] || ! grep -q "$_rf.md has only headings" <<<"$_out"; then
+            echo "FAIL: self-test #4507 R3-F8 — a HEADING-ONLY $_rf.md did not fail closed (rc=$_rc)" >&2
+            cd "$REPO_ROOT"; exit 1
+        fi
+        if [[ "$(id -u)" != 0 ]]; then
+            chmod 000 "$tmpdir/docs/reference/$_rf.md"
+            _rc=0
+            _out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1) || _rc=$?
+            chmod 644 "$tmpdir/docs/reference/$_rf.md"
+            if [[ "$_rc" == 0 ]] || grep -q "Traceback" <<<"$_out" || ! grep -q "cannot read docs/reference/$_rf.md" <<<"$_out"; then
+                echo "FAIL: self-test #4507 R3-F8 — an UNREADABLE $_rf.md did not fail cleanly (rc=$_rc)" >&2
+                cd "$REPO_ROOT"; exit 1
+            fi
+        fi
+        mv "$tmpdir/docs/reference/$_rf.md.aside" "$tmpdir/docs/reference/$_rf.md"
+        echo "PASS: self-test #4507 R3-F8 — an empty, heading-only and unreadable $_rf.md FAIL CLOSED with a clean message"
     done
 
     # ---- #4507 R3-F7: a symlink ABOVE the file (docs/reference -> elsewhere) FAILS CLOSED.
