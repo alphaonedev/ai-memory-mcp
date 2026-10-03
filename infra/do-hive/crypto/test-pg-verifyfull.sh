@@ -1,15 +1,20 @@
 #!/usr/bin/env bash
 # =============================================================================
-# test-pg-verifyfull.sh — LEG 3 (daemon->Postgres sslmode=verify-full) pos+neg.
+# test-pg-verifyfull.sh — LEG 3 (Postgres sslmode=verify-full) pos+neg.
 # =============================================================================
 # Spins an EPHEMERAL PostgreSQL 16 cluster on $PGPORT with TLS enabled using the
-# CA-signed pg-server cert from gen-certs.sh, then proves the exact sslmode
-# surface the daemon's sqlx PgConnectOptions consumes:
+# CA-signed pg-server cert from gen-certs.sh, then proves with psql/libpq how
+# that certificate chain behaves under each sslmode, and (last step) that the
+# real daemon connects to it with a verify-full store URL. The psql legs
+# (POS..NEG3) are libpq checks of the chain; the daemon does NOT channel-bind
+# (the connect funnel drops channel_binding, src/store/postgres/dsn.rs:60-79),
+# so POS2 is a psql/libpq check only and says nothing about the daemon:
 #
 #   POS  sslmode=verify-full + sslrootcert=ca.crt against host=localhost (matches
 #        the cert SAN) CONNECTS with full server-cert verification.
-#   POS2 the SAME connect under scram-sha-256 auth with channel_binding=require
-#        succeeds. This is the leg that guards the cert KEY ALGORITHM: libpq's
+#   POS2 the SAME connect, as a psql/libpq client, under scram-sha-256 auth with
+#        channel_binding=require succeeds. This is the leg that guards the cert
+#        KEY ALGORITHM for libpq clients (not for the daemon): libpq's
 #        tls-server-end-point channel binding hashes the server cert with the
 #        digest in its signatureAlgorithm, so an Ed25519 chain aborts here with
 #        "could not find digest for NID UNDEF" while the RSA/SHA-256 chain
@@ -26,11 +31,15 @@
 #        chain verification ("self-signed certificate" / "unable to get local
 #        issuer").
 #
-# If the ai-memory binary was built --features sal,sal-postgres, ALSO proves the
-# real daemon serves a verify-full store-url end to end (best-effort; skipped
-# with a clear note otherwise).
+# DAEMON step (#4708): the ai-memory binary (built --features sal,sal-postgres)
+# is started with a verify-full store URL file and must serve
+# https://127.0.0.1:19078/api/v1/health. The step polls (DAEMON_WAIT_TRIES x 2 s,
+# default 60) and stops as soon as the daemon exits; a daemon that exits or never
+# answers is a FAIL with the log tail. The only SKIP is a binary that is missing
+# or built without sal-postgres (REQUIRE_DAEMON=1 turns that SKIP into a FAIL).
 #
-# Requires: ./out from gen-certs.sh (PG_HOST=localhost), pg16 initdb/pg_ctl/psql.
+# Requires: ./out from gen-certs.sh (PG_HOST=localhost), pg16 initdb/pg_ctl/psql,
+# and TMPDIR pointing at a project-local scratch directory (never /tmp).
 # =============================================================================
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -39,12 +48,13 @@ ROOT="$HERE/../../.."
 BIN="${BIN:-$ROOT/target/release/ai-memory}"
 PGBIN="${PGBIN:-/usr/lib/postgresql/16/bin}"
 PGPORT="${PGPORT:-5433}"
-PGDATA="$(mktemp -d)/data"
+WORK="$(mktemp -d -p "${TMPDIR:?set TMPDIR to a project-local scratch dir (never /tmp)}")"
+PGDATA="$WORK/data"
 PGUSER=aimemory; PGPASS=aimempw; PGDB=aimemory
 pass=0; fail=0
 ok(){ echo "PASS: $1"; pass=$((pass+1)); }
 no(){ echo "FAIL: $1"; fail=$((fail+1)); }
-cleanup(){ "$PGBIN/pg_ctl" -D "$PGDATA" -m immediate stop >/dev/null 2>&1; [ -n "${DPID:-}" ] && kill "$DPID" 2>/dev/null; rm -rf "$(dirname "$PGDATA")"; }
+cleanup(){ "$PGBIN/pg_ctl" -D "$PGDATA" -m immediate stop >/dev/null 2>&1; [ -n "${DPID:-}" ] && kill "$DPID" 2>/dev/null; rm -rf "$WORK"; }
 trap cleanup EXIT
 
 # --- init ephemeral cluster --------------------------------------------------
@@ -129,26 +139,43 @@ else
 fi
 rm -f "$OUT/../otherca.key" "$OUT/../otherca.crt" "$OUT/../pg.*.err" 2>/dev/null
 
-# --- Optional: real daemon serves a verify-full store-url (needs sal-postgres)
+# --- DAEMON: the real daemon serves a verify-full store-url (needs sal-postgres)
 STORE="postgres://$PGUSER:$PGPASS@localhost:$PGPORT/$PGDB?sslmode=verify-full&sslrootcert=$CA"
-DLOG="$(mktemp)"
+DLOG="$WORK/daemon.log"
 # #4577: the DSN carries the db password; hand it over through a 0600 file
 # (AI_MEMORY_STORE_URL_FILE), not the serve argv. mktemp creates mode 0600 and
 # printf is a shell builtin, so the secret is never on a command line.
-STORE_FILE="$(mktemp)"
+STORE_FILE="$(mktemp -p "$WORK")"
 printf '%s\n' "$STORE" >"$STORE_FILE"
-AI_MEMORY_STORE_URL_FILE="$STORE_FILE" AI_MEMORY_NO_CONFIG=1 AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0 \
-  "$BIN" serve --host 127.0.0.1 --port 19078 >"$DLOG" 2>&1 &
+DAEMON_WAIT_TRIES="${DAEMON_WAIT_TRIES:-60}"
+mkdir -p "$WORK/daemon"
+# The daemon opens a local ai-memory.db: keep it (and the CWD) in $WORK.
+( cd "$WORK/daemon" && exec env AI_MEMORY_STORE_URL_FILE="$STORE_FILE" AI_MEMORY_NO_CONFIG=1 \
+    AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0 AI_MEMORY_DB="$WORK/daemon/ai-memory.db" \
+    "$BIN" serve --host 127.0.0.1 --port 19078 ) >"$DLOG" 2>&1 &
 DPID=$!
-sleep 8
-if grep -qiE "sal-postgres|requires .*features" "$DLOG"; then
-  echo "SKIP: daemon binary lacks --features sal-postgres; psql-level verify-full proof stands. (DO round uses a sal-postgres build.)"
-elif curl -s --max-time 5 "http://127.0.0.1:19078/api/v1/health" -o /dev/null; then
-  ok "leg3 EXTRA: daemon connected over verify-full TLS and served /health"
+DAEMON_UP=0; DAEMON_EXITED=0; i=0
+while [ "$i" -lt "$DAEMON_WAIT_TRIES" ]; do
+  if ! kill -0 "$DPID" 2>/dev/null; then DAEMON_EXITED=1; break; fi
+  # serve is TLS-universal (#3705): probe over https. -k: only reachability is
+  # checked here (the serve certificate is not the Postgres chain under test).
+  if curl -sk --max-time 5 -o /dev/null -f "https://127.0.0.1:19078/api/v1/health"; then DAEMON_UP=1; break; fi
+  i=$((i+1)); sleep 2
+done
+if [ "$DAEMON_UP" -eq 1 ]; then
+  ok "leg3 DAEMON: daemon connected over verify-full TLS and served /health"
+elif [ ! -x "$BIN" ] || grep -qiE "sal-postgres|requires .*features" "$DLOG"; then
+  if [ "${REQUIRE_DAEMON:-0}" = "1" ]; then
+    no "leg3 DAEMON: binary '$BIN' is missing or lacks --features sal-postgres (REQUIRE_DAEMON=1)"
+  else
+    echo "SKIP: daemon binary '$BIN' is missing or lacks --features sal-postgres; psql-level verify-full proof stands. (DO round uses a sal-postgres build; set REQUIRE_DAEMON=1 to fail instead.)"
+  fi
 else
-  echo "INFO: daemon did not bind within window; log tail:"; tail -5 "$DLOG"
+  if [ "$DAEMON_EXITED" -eq 1 ]; then why="daemon exited before it answered"; else why="daemon did not answer /health within $((DAEMON_WAIT_TRIES * 2))s"; fi
+  no "leg3 DAEMON: $why; last log lines follow"
+  tail -n 15 "$DLOG" | sed 's/^/    | /'
 fi
-kill "$DPID" 2>/dev/null; rm -f "$DLOG" "$STORE_FILE"
+kill "$DPID" 2>/dev/null; wait "$DPID" 2>/dev/null; DPID=""
 
 echo "----"; echo "leg3 summary: $pass PASS / $fail FAIL"
 [ "$fail" -eq 0 ]
