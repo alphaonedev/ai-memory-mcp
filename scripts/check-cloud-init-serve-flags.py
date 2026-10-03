@@ -11,26 +11,37 @@ define (the old ``--bind``) makes the unit exit at start and loop on
 byte (#1880). Neither failure shows up at provision time.
 
 The gate scans the files matching ``infra/*/cloud-init-memory*.tpl`` on disk
-(a filesystem glob, not ``git ls-files``). For each template it fails when:
+(a filesystem glob, not ``git ls-files``). It enforces seven rules; the function
+that proves each is named, and ``--self-test`` carries red and green probes for
+every one:
 
-  * the template has no ``ExecStart=`` that runs ``ai-memory serve`` (a gate
-    that finds nothing to check must not pass); the parser joins systemd
-    ``\\``-continued lines, accepts a ``/usr/bin/env`` wrapper, and accepts
-    global flags between the binary and ``serve``;
-  * a ``--flag`` after ``serve`` is not a long flag of ``ServeArgs`` in
-    ``src/daemon_runtime.rs`` (clap derives it from the field name, or from an
-    explicit ``long = "name"``);
-  * ``--tls-cert`` / ``--tls-key`` are not both present (a policy choice: the
-    templates supply operator certificate material whose SAN carries the
-    node IP; serve itself would resolve its own certificate with no flags,
-    ``resolve_tls_material``, src/daemon_runtime.rs:6163-6225);
-  * the ``postgres://`` store URL has no ``sslmode=verify-full`` (the #3705
-    floor, src/transit_encryption.rs:436-446), except a template listed in
-    ``DSN_FLOOR_GAPS``; or
-  * the template runs ``git clone`` / ``git checkout`` of an extension source
-    (#4636: use ``fetch_pinned`` with a ``*_COMMIT=<40 hex>`` variable), or a
-    ``*_COMMIT=`` value is not a full 40-hex commit; or
-  * the template contains a non-ASCII byte.
+  1. ``scan_text``: no non-ASCII byte (cloud-init discards the config, #1880).
+  2. ``serve_invocations``: some ``ExecStart=`` runs ``ai-memory serve`` (a gate
+     that finds nothing to check must not pass); the parser joins systemd
+     ``\\``-continued lines, accepts a ``/usr/bin/env`` wrapper and global flags
+     before ``serve``, and fails closed on a shell or other launcher that hides
+     the argv.
+  3. ``serve_arg_hits``: every ``--flag`` after ``serve`` is a long flag of
+     ``ServeArgs`` in ``src/daemon_runtime.rs`` (``serve_flags`` parses it; clap
+     derives it from the field name or an explicit ``long = "name"``); short
+     flags and partly-interpolated values are refused; only a whole ``${name}``
+     or ``$${name}`` is accepted, and only as a flag value.
+  4. ``scan_text``: ``--tls-cert`` and ``--tls-key`` are both present (a policy
+     choice: the templates supply operator certificate material whose SAN
+     carries the node IP; serve itself would resolve its own certificate with no
+     flags, ``resolve_tls_material``, src/daemon_runtime.rs:6163-6225).
+  5. ``dsn_hits``: every ``postgres://`` URL, wherever it is written, ends with
+     ``sslmode=verify-full`` as its last sslmode (the #3705 floor,
+     src/transit_encryption.rs:436-446), except a template listed in
+     ``DSN_FLOOR_GAPS`` (``main`` fails a listed template that now passes).
+  6. ``store_channel_hits`` and ``exec_store_url_hits``: the store URL reaches
+     the daemon only through ``AI_MEMORY_STORE_URL_FILE`` (#4577): no
+     ``AI_MEMORY_STORE_URL=`` and no ``--store-url`` in any spelling, no store
+     URL on an ``ExecStart``, and no URL with a password inside a systemd unit.
+  7. ``pin_hits`` (with ``fetch_pinned_body_hits`` and ``git_verb``): extension
+     sources are fetched only by the one ``fetch_pinned`` function that ends
+     in a ``rev-parse HEAD = "$3"`` check, every call passes a ``*_COMMIT``
+     variable, and every ``*_COMMIT=`` value is a full 40-hex commit (#4636).
 
 Usage (any other argument exits 2):
   scripts/check-cloud-init-serve-flags.py             exit 0 clean, 1 on a

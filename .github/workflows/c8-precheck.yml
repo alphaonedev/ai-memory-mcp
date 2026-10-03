@@ -1314,11 +1314,20 @@ jobs:
         run: python3 scripts/check-docs-no-argv-secrets.py --self-test
 
   cloud-init-serve-flags-gate:
-    # #4616 - a cloud-init memory template must start a daemon that can boot:
-    # every serve flag is a ServeArgs field (src/daemon_runtime.rs), both TLS
-    # flags are present (template policy, not a serve refusal), the store URL
-    # pins sslmode=verify-full (#3705 floor), and the template is pure ASCII
-    # (#1880).
+    # #4616 - a cloud-init memory template must start a daemon that can boot.
+    # Seven rules, each proved by one function in the script:
+    #   1. scan_text: the template is pure ASCII (#1880).
+    #   2. serve_invocations: an ExecStart runs ai-memory serve (no vacuous pass).
+    #   3. serve_arg_hits: every serve flag is a ServeArgs field
+    #      (src/daemon_runtime.rs); no short flags, no partial interpolation.
+    #   4. scan_text: --tls-cert and --tls-key are both present (template
+    #      policy, not a serve refusal).
+    #   5. dsn_hits: every postgres:// URL pins sslmode=verify-full (#3705 floor).
+    #   6. store_channel_hits, exec_store_url_hits: the store URL reaches the
+    #      daemon only through AI_MEMORY_STORE_URL_FILE (#4577), never argv, an
+    #      environment variable or a password in a 0644 unit.
+    #   7. pin_hits: extension sources are fetched only by fetch_pinned at a
+    #      40-hex *_COMMIT, verified by rev-parse.
     name: Cloud-init serve-flags gate (#4616)
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -1327,6 +1336,9 @@ jobs:
       - name: Run cloud-init serve-flags gate
         run: python3 scripts/check-cloud-init-serve-flags.py
       - name: Self-test the gate (regression evidence)
-        # Red probes: unknown flag (--bind), no TLS, one TLS flag, non-ASCII.
-        # Green near-misses: a clean serve line, terraform directive words.
+        # Red probes for all seven rules (unknown and short flags, no serve,
+        # missing TLS flag, weak or hidden sslmode, store URL on argv or in the
+        # environment, unpinned or unverified git fetch, non-ASCII), most as
+        # mutations of the real AWS template. Green near-misses: the real
+        # templates and clean variants.
         run: python3 scripts/check-cloud-init-serve-flags.py --self-test
