@@ -62,6 +62,27 @@ CLAUDE_MD_REQUIRED_HEADINGS = (
     "## No agent-created files under /tmp, /var/tmp, /private/tmp, or any tmpfs (project hard rule)",
 )
 
+# R3-8: minimum visible body bytes per pinned heading (about 90% of the size at the split, rounded down to
+# 100). Without it a rule section could be emptied to its heading and CLAUDE.md would still clear the
+# whole-file floor. One table, same order as CLAUDE_MD_REQUIRED_HEADINGS; floors only rise.
+CLAUDE_MD_SECTION_MIN_BYTES = (
+    1900,   # Hard rule - memory_store FIRST
+    5700,   # Required Reading at Session Start
+    1600,   # Build & Test Commands
+    900,    # Dogfooding release branches
+    700,    # Reproducing the v0.7.0 recursive-learning primitive
+    1100,   # Architecture (pointer + binding-rules index)
+    4300,   # Adding New Functionality
+    1300,   # Code Style (pointer + binding-rules index)
+    14600,  # Prime directive
+    3100,   # Crossroads decision protocol
+    1100,   # v0.7.0 release gate
+    7100,   # Sole-authority operator + no-external-code-injection
+    5700,   # Commit & push policy
+    4100,   # Multi-agent worktree discipline
+    2600,   # No agent-created files under /tmp
+)
+
 # (path, expected first line, minimum bytes). Floors only rise. Measured at the split:
 # ARCHITECTURE_REFERENCE.md 333,930 bytes; CODE_STYLE.md 51,204 bytes.
 REFERENCE_FILES = (
@@ -265,6 +286,17 @@ def check(root: Path) -> list:
         first = ref_lines[Path(rel).stem][0]
         if first != top_heading:
             errors.append(f"FAIL: {rel} must start with the heading {top_heading!r}, found {first!r}")
+    if size is not None:
+        sections = sections_of(visible)
+        for heading, floor in zip(CLAUDE_MD_REQUIRED_HEADINGS, CLAUDE_MD_SECTION_MIN_BYTES):
+            if heading not in sections:
+                continue  # the missing heading is already reported
+            body = len("\n".join(sections[heading]).encode("utf-8"))
+            if body < floor:
+                errors.append(
+                    f"FAIL: CLAUDE.md section {heading!r} body is {body} bytes, under its {floor}-byte "
+                    "floor (CLAUDE_MD_SECTION_MIN_BYTES); the rule section appears to have been emptied (#4507)"
+                )
     check_index(visible, ref_lines, errors)
     return errors
 
@@ -277,8 +309,9 @@ def fixture_claude_text() -> str:
     """CLAUDE.md text that passes check() apart from the byte floor: pinned headings plus the index blocks."""
     counts = {heading: (name, minimum) for heading, name, minimum in INDEX_SECTIONS}
     lines = []
-    for heading in CLAUDE_MD_REQUIRED_HEADINGS:
+    for heading, floor in zip(CLAUDE_MD_REQUIRED_HEADINGS, CLAUDE_MD_SECTION_MIN_BYTES):
         lines.append(heading)
+        lines.append("section body " + "x" * floor)
         if heading in counts:
             name, minimum = counts[heading]
             lines += ["", INDEX_HEADING, ""]
@@ -428,6 +461,19 @@ def run_cases(base: Path) -> bool:
     text = (root / claude_md).read_text(encoding="utf-8").replace(heading + "\n", heading + " <!-- note -->\n", 1)
     (root / claude_md).write_text(text, encoding="utf-8")
     ok &= expect(root, "a heading followed by a trailing HTML comment (still renders)", False)
+    for index, heading in enumerate(CLAUDE_MD_REQUIRED_HEADINGS):
+        root = fresh()
+        text = (root / claude_md).read_text(encoding="utf-8")
+        start = text.index(heading + "\n") + len(heading) + 1
+        end = text.find("\n## ", start)
+        end = len(text) if end < 0 else end + 1
+        text = text[:start] + text[end:]
+        (root / claude_md).write_text("x" * 30000 + "\n" + text, encoding="utf-8")  # pad above every section
+        ok &= expect(root, f"the rule section {heading[:40]!r} emptied to its heading (floor #{index})", True,
+                     "appears to have been emptied")
+
+    root = fresh()
+    ok &= expect(root, "every section exactly at its floor", False)
     arch_h, style_h = INDEX_SECTIONS[0][0], INDEX_SECTIONS[1][0]
     for label, sections in (("Architecture", (arch_h,)), ("Code Style", (style_h,)), ("both", (arch_h, style_h))):
         root = fresh()
@@ -497,6 +543,8 @@ SELF_TEST_PINNED_LIMITS = {
     "CLAUDE_MD_REQUIRED_HEADINGS_COUNT": 15,
     # sha256 of the 15 pinned headings joined by newline: rewording or swapping one is a deliberate edit too.
     "CLAUDE_MD_REQUIRED_HEADINGS_SHA256": "a96178554adeea9c1a96dc35950a8f8d6987c88f6a196c0683a52c725c8f9db4",
+    "CLAUDE_MD_SECTION_MIN_BYTES": (1900, 5700, 1600, 900, 700, 1100, 4300, 1300, 14600, 3100, 1100, 7100,
+                                    5700, 4100, 2600),
     "REFERENCE_FLOOR ARCHITECTURE_REFERENCE": 300_000,
     "REFERENCE_FLOOR CODE_STYLE": 45_000,
     "INDEX_MIN_QUOTE_CHARS": 20,
@@ -514,6 +562,7 @@ def current_limits() -> dict:
         "CLAUDE_MD_REQUIRED_HEADINGS_SHA256": hashlib.sha256(
             "\n".join(CLAUDE_MD_REQUIRED_HEADINGS).encode("utf-8")).hexdigest(),
         "INDEX_MIN_QUOTE_CHARS": INDEX_MIN_QUOTE_CHARS,
+        "CLAUDE_MD_SECTION_MIN_BYTES": tuple(CLAUDE_MD_SECTION_MIN_BYTES),
     }
     for rel, _top, floor in REFERENCE_FILES:
         limits[f"REFERENCE_FLOOR {Path(rel).stem}"] = floor
@@ -547,6 +596,8 @@ def run_limit_cases() -> bool:
             mutated = dict(current_limits())
             if isinstance(mutated[key], str):
                 mutated[key] = mutated[key][:-1] + ("0" if mutated[key][-1] != "0" else "1")
+            elif isinstance(mutated[key], tuple):
+                mutated[key] = (mutated[key][0] + delta,) + mutated[key][1:]
             else:
                 mutated[key] += delta
             if not any(key in line for line in limit_drift(mutated)):
