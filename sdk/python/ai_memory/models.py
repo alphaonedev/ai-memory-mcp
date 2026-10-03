@@ -396,6 +396,11 @@ class InboxMessage(_Base):
     # nothing.
 
 
+# ---------------------------------------------------------------------------
+# Bulk create
+# ---------------------------------------------------------------------------
+
+
 class BulkCreateResponse(_Base):
     """Response envelope for ``POST /api/v1/memories/bulk``.
 

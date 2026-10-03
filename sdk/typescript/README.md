@@ -173,8 +173,9 @@ you override `agentId`, pass an `AbortSignal`, or add custom headers.
 `/api/v1/memories/:id/grant`, `/api/v1/memories/:id/revoke` and
 `/api/v1/cluster`, none of which the daemon registers — every call 404'd, in
 every release that shipped them. Their request/response types (`GrantRequest`,
-`RevokeRequest`, `ClusterPeer`, `ClusterRequest`, `ClusterResponse`) are removed
-from the exported type surface as well. Replacements:
+`RevokeRequest`, `ClusterPeer`, `ClusterRequest`, `ClusterResponse`) are marked
+`@deprecated` and stay exported for one release; they will then be removed.
+Replacements:
 
 - **Per-memory access control** — set `metadata.scope` (`"private"` |
   `"collective"`) on the write, and attach a namespace governance standard for
