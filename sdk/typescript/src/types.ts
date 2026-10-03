@@ -450,18 +450,6 @@ export interface ListSubscriptionsResponse {
   count: number;
 }
 
-/** Memory ACL grant/revoke (Task 1.5 extensions). */
-export interface GrantRequest {
-  /** Agent receiving access. */
-  agent_id: string;
-  /** Permission level granted. */
-  permission: "read" | "write" | "admin";
-}
-
-export interface RevokeRequest {
-  agent_id: string;
-}
-
 /** Agent-to-agent notification (inbox). */
 export interface NotifyRequest {
   /** Recipient agent_id. */
@@ -528,26 +516,6 @@ export interface InboxQuery {
    */
   unread_only?: boolean;
   limit?: number;
-}
-
-/** Cluster peer info. */
-export interface ClusterPeer {
-  agent_id: string;
-  endpoint: string;
-  last_seen_at: string;
-  status: "healthy" | "degraded" | "unreachable";
-}
-
-export interface ClusterRequest {
-  /** Action: "join", "leave", "list", "status". */
-  action: "join" | "leave" | "list" | "status";
-  endpoint?: string;
-  agent_id?: string;
-}
-
-export interface ClusterResponse {
-  peers: ClusterPeer[];
-  self: ClusterPeer;
 }
 
 /** Raw Prometheus text-format payload wrapper. */
