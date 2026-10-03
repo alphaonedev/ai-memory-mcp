@@ -11,8 +11,8 @@ What this gate enforces (and nothing more):
      file: a symlink or any other non-regular file is refused.
   2. CLAUDE.md is at most CLAUDE_MD_MAX_BYTES and at least CLAUDE_MD_MIN_BYTES.
   3. Every `## ` heading in CLAUDE_MD_REQUIRED_HEADINGS is present in CLAUDE.md
-     (headings inside code fences do not count), so deleting or renaming a rule
-     section fails.
+     (headings inside backtick or tilde code fences or inside HTML comments do
+     not count), so deleting, renaming or hiding a rule section fails.
   4. Each reference file starts with its expected top heading and is at least
      its minimum size, so truncating or emptying it fails.
 It does NOT verify the wording of any section body, and it does not prove that
@@ -26,6 +26,7 @@ Usage:
 """
 import argparse
 import os
+import re
 import shutil
 import stat
 import sys
@@ -81,16 +82,60 @@ def regular_size(path: Path, label: str, errors: list):
     return path.stat().st_size
 
 
+FENCE_OPEN = re.compile(r"^\s*(`{3,}|~{3,})")
+
+
+def split_lines(text: str) -> list:
+    """Split on \\n only (as an editor or renderer does); Python's splitlines also splits on U+2028 and friends."""
+    return text.replace("\r\n", "\n").split("\n")
+
+
+def visible_lines(text: str) -> list:
+    """Return the lines that render as prose: outside fenced code and outside HTML comments.
+
+    Fences follow CommonMark: a run of 3+ backticks or tildes opens one, and only a bare run of the
+    same character, at least as long, closes it. An unclosed fence hides the rest of the file.
+    HTML comments (`<!--` to `-->`, on one line or many) are removed; text outside them is kept.
+    """
+    out = []
+    fence = None
+    in_comment = False
+    for line in split_lines(text):
+        if in_comment:
+            if "-->" in line:
+                in_comment = False
+            continue
+        if fence is not None:
+            match = FENCE_OPEN.match(line)
+            if match and match.group(1)[0] == fence[0] and len(match.group(1)) >= fence[1] \
+                    and not line.strip().strip(fence[0]):
+                fence = None
+            continue
+        match = FENCE_OPEN.match(line)
+        if match:
+            fence = (match.group(1)[0], len(match.group(1)))
+            continue
+        kept = ""
+        rest = line
+        while True:
+            start = rest.find("<!--")
+            if start < 0:
+                kept += rest
+                break
+            kept += rest[:start]
+            end = rest.find("-->", start + 4)
+            if end < 0:
+                in_comment = True
+                break
+            rest = rest[end + 3:]
+        if kept.strip() or not line.strip():
+            out.append(kept)
+    return out
+
+
 def headings_outside_fences(text: str) -> list:
-    """Return the `## ` heading lines of `text`, ignoring fenced code blocks."""
-    found = []
-    in_fence = False
-    for line in text.splitlines():
-        if line.lstrip().startswith("```"):
-            in_fence = not in_fence
-        elif not in_fence and line.startswith("## "):
-            found.append(line.rstrip())
-    return found
+    """Return the `## ` heading lines of `text` that render (not fenced, not in an HTML comment)."""
+    return [line.rstrip() for line in visible_lines(text) if line.startswith("## ")]
 
 
 def check(root: Path) -> list:
@@ -241,6 +286,44 @@ def run_cases(base: Path) -> bool:
     text = (root / claude_md).read_text(encoding="utf-8").replace(heading + "\n", "```\n" + heading + "\n```\n", 1)
     (root / claude_md).write_text(text, encoding="utf-8")
     ok &= expect(root, "a required heading that exists only inside a code fence", True, "missing the required heading")
+
+    root = fresh()
+    heading = CLAUDE_MD_REQUIRED_HEADINGS[11]
+    text = (root / claude_md).read_text(encoding="utf-8").replace(heading + "\n", "~~~\n" + heading + "\n~~~\n", 1)
+    (root / claude_md).write_text(text, encoding="utf-8")
+    ok &= expect(root, "a required heading that exists only inside a tilde fence", True, "missing the required heading")
+
+    root = fresh()
+    heading = CLAUDE_MD_REQUIRED_HEADINGS[11]
+    text = (root / claude_md).read_text(encoding="utf-8").replace(heading + "\n", "<!--\n" + heading + "\n-->\n", 1)
+    (root / claude_md).write_text(text, encoding="utf-8")
+    ok &= expect(root, "a required heading that exists only inside an HTML comment", True, "missing the required heading")
+
+    root = fresh()
+    heading = CLAUDE_MD_REQUIRED_HEADINGS[11]
+    text = (root / claude_md).read_text(encoding="utf-8").replace(heading + "\n", "<!-- " + heading + " -->\n", 1)
+    (root / claude_md).write_text(text, encoding="utf-8")
+    ok &= expect(root, "a required heading wrapped in a one-line HTML comment", True, "missing the required heading")
+
+    root = fresh()
+    heading = CLAUDE_MD_REQUIRED_HEADINGS[11]
+    text = (root / claude_md).read_text(encoding="utf-8").replace(
+        heading + "\n", "````\n```\n" + heading + "\n````\n", 1)
+    (root / claude_md).write_text(text, encoding="utf-8")
+    ok &= expect(root, "a heading after a shorter inner fence inside a four-backtick fence", True,
+                 "missing the required heading")
+
+    root = fresh()
+    text = (root / claude_md).read_text(encoding="utf-8")
+    text = "~~~\nfenced\n~~~\n<!-- a comment\nspanning lines -->\n<!-- one line -->\n" + text
+    (root / claude_md).write_text(text, encoding="utf-8")
+    ok &= expect(root, "headings after a closed tilde fence and closed HTML comments", False)
+
+    root = fresh()
+    heading = CLAUDE_MD_REQUIRED_HEADINGS[11]
+    text = (root / claude_md).read_text(encoding="utf-8").replace(heading + "\n", heading + " <!-- note -->\n", 1)
+    (root / claude_md).write_text(text, encoding="utf-8")
+    ok &= expect(root, "a heading followed by a trailing HTML comment (still renders)", False)
     return ok
 
 
