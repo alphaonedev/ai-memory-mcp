@@ -292,9 +292,9 @@ Gates that check the environment-variable table or pinned counts read it there.
 These bind you even if you never open `docs/reference/ARCHITECTURE_REFERENCE.md`. Quoted verbatim (line breaks joined), anchored `file:line`:
 
 - `ARCHITECTURE_REFERENCE.md:132` "Do not "fix" `resolve_store_url` to match the general ladder."
-- `ARCHITECTURE_REFERENCE.md:141-143` "`secret` = leaks credentials or override authority if logged or echoed; MUST NOT appear in capabilities, banners, audit records, or `tracing` output."
-- `ARCHITECTURE_REFERENCE.md:144` "`test-only` = honored in test builds; never set in production."
-- `ARCHITECTURE_REFERENCE.md:646-647` "do not use it for security decisions without pairing with agent registration"
+- `ARCHITECTURE_REFERENCE.md:141-143` "**Classification.** `secret` = leaks credentials or override authority if logged or echoed; MUST NOT appear in capabilities, banners, audit records, or `tracing` output. `config` = operational knob, safe to"
+- `ARCHITECTURE_REFERENCE.md:144` "echo. `test-only` = honored in test builds; never set in production."
+- `ARCHITECTURE_REFERENCE.md:646-647` "not an *attested* one** — do not use it for security decisions without pairing with agent registration (Task 1.3, upcoming)."
 - `ARCHITECTURE_REFERENCE.md:729` "**Special metadata keys produced by the system** (do not overwrite):"
 
 ## Adding New Functionality
@@ -394,13 +394,13 @@ Do not inline the detail here; grep the rule you need in that file, do not read 
 
 These bind you even if you never open `docs/reference/CODE_STYLE.md`. Quoted verbatim (line breaks joined), anchored `file:line`:
 
-- `CODE_STYLE.md:103-105` "It is a ratchet: existing duplications are grandfathered, new duplication fails, and the baseline may only shrink ("thresholds rise, never fall")."
-- `CODE_STYLE.md:142-143` "Every other production-code site must read the vendor string from `crate::llm::*` / `crate::config::*`"
-- `CODE_STYLE.md:153-155` "Use the named constants from `src/lib.rs`: `SECS_PER_HOUR` (3_600), `SECS_PER_DAY` (86_400), `SECS_PER_WEEK` (604_800)."
-- `CODE_STYLE.md:195-199` "HARD-BLOCKS the case-insensitive pattern `rqgm|epoch_manifest|red.?queen` anywhere in `src/` (string literal or comment) — these are internal design-doc identifiers that must never leak into the shipped binary's symbol/string surface."
+- `CODE_STYLE.md:103-105` "baseline** at `scripts/qc-allowlists/hardcoded-literals-baseline.txt`. It is a ratchet: existing duplications are grandfathered, new duplication fails, and the baseline may only shrink ("thresholds rise, never fall")."
+- `CODE_STYLE.md:142-143` "Every other production-code site must read the vendor string from `crate::llm::*` / `crate::config::*` (e.g."
+- `CODE_STYLE.md:153-155` "HARD-BLOCKed. Use the named constants from `src/lib.rs`: `SECS_PER_HOUR` (3_600), `SECS_PER_DAY` (86_400), `SECS_PER_WEEK` (604_800)."
+- `CODE_STYLE.md:195-199` "`scripts/check-l3-boundary.sh`. HARD-BLOCKS the case-insensitive pattern `rqgm|epoch_manifest|red.?queen` anywhere in `src/` (string literal or comment) — these are internal design-doc identifiers that must never leak into the shipped binary's symbol/string surface. The ruled PUBLIC identifiers"
 - `CODE_STYLE.md:233` "**The historical guard is load-bearing and must not be weakened.**"
-- `CODE_STYLE.md:247-249` "a paragraph labelled `— current release` MUST attribute the Cargo.toml version."
-- `CODE_STYLE.md:466-467` "**The mirror is hand-authored from intent and must NEVER be regenerated from live API state:**"
+- `CODE_STYLE.md:247-249` "That guard would be a hole on its own, so **rule N1** closes it: a paragraph labelled `— current release` MUST attribute the Cargo.toml version. That is what catches a README paragraph whose lead names a"
+- `CODE_STYLE.md:466-467` "than the neighbourhood. **The mirror is hand-authored from intent and must NEVER be regenerated from live API state:** the canonical"
 
 ## Prime directive (operator-set, 2026-05-17)
 
