@@ -16,10 +16,24 @@ WRITERS (the three functions in src/config.rs that mutate the slot):
   clear_permissions_mode_override_for_test.
 The lock: lock_permissions_mode_for_test.
 
+THE LOCK'S IDENTITY (#4776). The lock is the ONE top-level ``fn lock_permissions_mode_for_test`` in
+src/config.rs. A definition of that name anywhere else (a test-module homonym would make any mutex
+count) exits 2, and so does a scanned src/config.rs that does not define it exactly once. A
+``let <lock>`` binding counts only when its callee is the bare name or a ``config::`` path (``super``
+/ ``self`` / ``crate`` inside src/config.rs); a method call or another module's path does not.
+Refused outright: a ``use .. as`` rename to or from the lock or a delegate name, a ``use`` of the
+lock from a module other than ``config``, and any mention of the lock or a delegate that is not a
+call, its ``fn`` definition or a ``use`` (a local ``let lock_permissions_mode_for_test = ..``, a fn
+pointer). Delegates are recognised only by the yield rule below and by calling the real lock.
+
 THE SLOT ITSELF (#4763). The static behind the setters, ``ACTIVE_PERMISSIONS_MODE`` in
 src/config.rs, is modelled too: any mention of it that is not its declaration or a ``.read()`` is a
 write and is checked like a writer call. The scan exits 2 if src/config.rs is scanned and the static
-is not declared exactly once.
+is not declared exactly once. Outside the setter bodies the slot may only be read (``.read()`` /
+``.try_read()``) or written in one statement of the form ``*[path::]SLOT.write()..``; a reference
+(``&SLOT``), a let-bound write guard, a raw pointer (``addr_of!``) or any other mention is refused,
+because it can outlive the mode lock. A ``use`` of the slot outside src/config.rs, a ``use .. as``
+rename of it, and a ``pub use`` re-export are refused.
 
 WHO MAY WRITE WITHOUT THE LOCK (fail closed: an allowlist of exact (repo-relative file, TOP-LEVEL
 fn) pairs, not a classification of lines). ``main`` in src/main.rs (the boot setter), and in
@@ -27,17 +41,22 @@ src/config.rs the alias ``override_active_permissions_mode_for_test`` plus the t
 the slot, ``set_active_permissions_mode`` and ``clear_permissions_mode_override_for_test``. The path
 is compared against the repository-relative path only (``tests/src/main.rs`` is not ``src/main.rs``)
 and the fn must sit at brace depth 0 (a ``fn main`` in a test module or an impl is not the boot
-setter, #4764). Every other writer call in the scanned tree is checked, whatever the #3623 test/production
+setter, #4764). ``main`` is allowlisted only when it is the UNIQUE top-level ``fn main`` of
+src/main.rs, carries no ``#[cfg(..)]`` / ``#[cfg_attr(..)]`` attribute and no test attribute, and is
+referenced nowhere (a call ``main()``, a ``::main`` path, ``main`` in a ``use`` or passed as a value
+in the binary crate): a test that runs ``main`` would run its unlocked write. Every other writer call in the scanned tree is checked, whatever the #3623 test/production
 boundary says about its line, so a ``#[test]`` fn on a line the boundary mis-classes as production
 (src/bench.rs, #4755), a ``#[cfg(any(test, ..))]`` item, or a test module in a separately named
-file cannot hide a write. A fn carrying ``#[test]`` / ``#[tokio::test]`` / ``#[sqlx::test]``, or the same through
-``#[cfg_attr(<cond>, test)]``, is never allowlisted.
+file cannot hide a write. A fn carrying ``#[test]`` / ``#[tokio::test]`` / ``#[sqlx::test]`` (also ``rstest`` / ``test_case``),
+written with a leading ``::`` (``#[::core::prelude::v1::test]``), as ``r#test``, through a
+``use .. test as X`` rename, or through ``#[cfg_attr(<cond>, test)]``, is never allowlisted.
 
 RULE, per writer call that is not allowlisted: the enclosing fn must hold a LIVE guard at that call.
 A guard is live when ALL of these hold:
   1. it is bound by ``let [mut] <ident> = <lock>(..);`` where ``<lock>`` is the lock itself or a
      DELEGATE; ``let _ = ..``, a bare ``<lock>();`` statement and a longer expression drop the
-     guard at once and do not count;
+     guard at once and do not count, and neither does a binding statement carrying ANY
+     ``#[cfg(..)]`` / ``#[cfg_attr(..)]`` attribute (it may be compiled out, #4777);
   2. the binding statement ends before the writer call and the writer call sits inside the block
      the guard is bound in (a guard bound in an inner block that has closed, in a branch not
      taken, or in a closure that is not the writer's, covers nothing outside it);
@@ -45,10 +64,12 @@ A guard is live when ALL of these hold:
      mention (``drop(g)``, a rebind, a move into a Vec / struct / inner block, a reassignment, a
      by-value pass) may end the guard's life, so the guard's cover ends at its next mention after
      binding (fail closed; live code never mentions the guard again);
-  4. a writer call inside the argument of ``spawn`` / ``spawn_blocking`` / ``spawn_local`` /
-     ``spawn_scoped`` (thread, tokio, ``Builder``) may run after the spawner's guard is released, so
-     it is covered only by a guard acquired INSIDE that argument or moved INTO it (a ``move``
-     closure that rebinds the guard, or borrows it with ``&``, and does not mention it again).
+  4. DEFERRED EXECUTION (#4766): a writer call inside ANY closure body (``|..| { .. }`` or
+     ``|..| expr``) or ``async [move] { .. }`` block may run after the guard that encloses the
+     closure is released (called after ``drop``, handed to ``thread::spawn`` under any name,
+     returned from a fn, awaited later), so it is covered only by a guard bound INSIDE that
+     body (the innermost one). This replaces the earlier spawn-name heuristics; on 5f66513a1 it
+     affects 0 of the 86 checked live writes.
 Every writer call in the fn is checked, not only the first.
 A DELEGATE is a fn that returns the guard to its caller: its return type is ``MutexGuard<..>`` or a
 struct that owns one, it binds the lock (or another delegate) as in 1. in its own top-level block,
@@ -66,7 +87,9 @@ A writer call in no function at all is refused.
 
 ALIASING (refused, since a lexical gate cannot follow it): ``use .. writer as x``, and any mention
 of a writer that is not a direct call and not a plain ``use`` import or its ``fn`` definition (a fn
-pointer, ``let f = path::writer;``, passing it as an argument).
+pointer, ``let f = path::writer;``, passing it as an argument). TOKEN PASTING (#4779): any mention
+of ``paste`` (``paste!``, ``use paste::paste as p``) or ``concat_idents`` is refused outright,
+because a pasted identifier can spell a writer, the lock or the slot without the name appearing.
 
 BOUNDARY (secondary). The #3623 policy of scripts/lib/production-lines.{sh,awk} is ported
 (a file whose stem matches ``(^|_)tests?(_|$)``, or that sits under a directory named ``tests``
@@ -76,15 +99,49 @@ non-failing note listing ``#[test]`` fns on production-classed lines (visible, n
 excluded: src/bench.rs is the live case, #4755). The directory rule is a deliberate deviation from
 the awk, which has none; ``--parity`` skips those files.
 
-LEXING. Comments (``//``, nested ``/* */``) and string/char literals (including raw strings) are
-blanked before any matching, so a writer or lock name inside a comment or a string neither raises
-nor satisfies the rule.
+LEXING. Comments (``//``, nested ``/* */``) and string/char literals are blanked before any
+matching, so a writer or lock name inside a comment or a string neither raises nor satisfies the
+rule. Every literal prefix is lexed as such (#4778): ``"..``, ``r#".."#``, ``b".."``, ``br#".."#``,
+``c".."``, ``cr#".."#`` (any number of ``#``) and ``b'..'`` / ``'..'``; a prefix letter is never read
+as an identifier followed by a fresh string.
+
+THE SCAN SET IS THE COMPILED SET (#4774, #4775). Directories are walked with ``os.scandir``: a
+directory that cannot be listed exits 2, and so does a symlinked directory (its target is outside
+what the root names; scan the target explicitly). The walked files are then closed over what they
+compile in: ``mod x;`` (``x.rs`` / ``x/mod.rs`` relative to the declaring file's module directory,
+through any inline ``mod a { .. }`` chain, and any ``#[path = ".."]`` literal, plain or through
+``cfg_attr``), ``include!("..")`` of any file and ``include_str!("...rs")``. A ``mod`` that resolves
+to no file, an ``include!`` whose argument is not a literal, and an include of a missing file exit
+2. On 5f66513a1 this adds tests/unit/archive_gc_3383.rs (pulled in by ``#[path]``): 593 -> 594 files.
 
 SCOPE, stated honestly: roots default to ``src`` (lib tests, which share one process and are the
 #4468 shape). Integration binaries under tests/ are NOT scanned by default (``--root tests`` scans
 them; 38 unlocked writes in 25 files on 5f66513a1, tracked as #4754). The check is lexical and
 name-based: it does not follow the guard into another owner (a mention ends its cover instead), or control flow
-beyond the brace structure and the guard's mentions.
+beyond the brace structure and the guard's mentions. Imports of a homonym from an EXTERNAL crate are
+not modelled (no dependency defines these names).
+
+KNOWN FAIL-CLOSED FALSE POSITIVES (sound code the gate refuses; 0 live occurrences on 5f66513a1;
+restructure the code rather than weaken the gate):
+  - a writer called through a macro under the lock (the macro body has no enclosing guard);
+  - a nested fn whose CALLER holds the lock (the nested fn has no binding of its own);
+  - a guard bound by a tuple / pattern destructure, or passed to ``mem::forget`` (any later
+    mention ends the cover);
+  - any closure or async block under an OUTER guard, including ``std::thread::scope`` spawns
+    (joined before the scope returns) and a guard moved INTO a ``move`` closure: only a guard
+    bound inside the body counts (#4766);
+  - an inner-block shadow ``{ let _g = 1; drop(_g); }`` of the guard's name (the outer guard's
+    name is mentioned, so its cover ends);
+  - delegate tails other than the bare binding / a struct built from it (``loop { break g }``,
+    ``match c { _ => g }``);
+  - a guard binding with any ``cfg`` / ``cfg_attr`` attribute (#4777);
+  - a ``fn main`` with any ``cfg`` / ``cfg_attr`` attribute, or referenced anywhere (#4764);
+  - ``&SLOT`` or a let-bound slot guard even inside a locked test (#4763);
+  - any ``paste`` / ``concat_idents`` mention, including ones that build unrelated names (#4779);
+  - a symlinked directory, an unresolvable ``mod`` / ``include!`` (#4775);
+  - a binary ``||`` that the closure heuristic reads as a closure header (it treats ``||`` /
+    ``|x|`` as a closure unless the previous token is an operand: an identifier that is not a
+    keyword, a literal, ``)``, ``]``, ``}`` or ``?``).
 
 Usage:
   scripts/check_permissions_mode_lock.py              # scan src/ -- exit 1 on any violation
@@ -116,6 +173,7 @@ LOCK = "lock_permissions_mode_for_test"
 # the slot itself and is modelled exactly like a writer call (#4763).
 SLOT = "ACTIVE_PERMISSIONS_MODE"
 SLOT_READ = re.compile(r"\s*\.\s*(?:try_)?read\s*\(")
+SLOT_WRITE = re.compile(r"\s*\.\s*(?:try_)?write\s*\(")
 
 # Production writers allowed without the lock: (path relative to the scan root or its parent, fn).
 # Only a TOP-LEVEL fn of that name in that file counts (#4764): not a nested or test-module fn.
@@ -127,9 +185,38 @@ ALLOWED_WRITERS = (
 )
 
 STEM_TEST = re.compile(r"(^|_)tests?(_|$)")
-TEST_ATTR = re.compile(r"#\s*\[\s*(?:\w+\s*::\s*)*(?:test|rstest|test_case)\b")
+TEST_NAMES = ("test", "rstest", "test_case")
 CFG_ATTR = re.compile(r"#\s*\[\s*cfg_attr\s*\(")
-TEST_ITEM = re.compile(r"^(?:\w+\s*::\s*)*(?:test|rstest|test_case)\b")
+# Any `#[cfg(..)]` / `#[cfg_attr(..)]` attribute (#4764 main, #4777 guard bindings).
+ANY_CFG = re.compile(r"#\s*\[\s*cfg(?:_attr)?\s*\(")
+# `use .. test as check;` (also rstest / test_case, grouped or not): `#[check]` is a test (#4764).
+TEST_RENAME = re.compile(r"\b(?:r#)?(?:test|rstest|test_case)\s+as\s+(?:r#)?([A-Za-z_]\w*)")
+# Token pasting builds identifiers the lexical model cannot see (#4779): any code mention of the
+# paste crate or concat_idents is refused outright (0 uses in src today).
+PASTE_RE = re.compile(r"\b(?:paste|concat_idents)\b")
+# Names imported as test attributes under another name (filled per scan from `use .. as`).
+TEST_RENAMES: Set[str] = set()
+
+
+def _test_name_alt() -> str:
+    names = list(TEST_NAMES) + (sorted(TEST_RENAMES) if on("test_attr_renames") else [])
+    return "(?:" + "|".join(re.escape(n) for n in names) + ")"
+
+
+def test_attr_re() -> "re.Pattern[str]":
+    """`#[test]`, `#[tokio::test]`, `#[::core::prelude::v1::test]`, `#[r#test]`, a renamed import."""
+    if on("test_attr_paths"):
+        return re.compile(r"#\s*\[\s*(?:::\s*)?(?:(?:r#)?\w+\s*::\s*)*(?:r#)?" + _test_name_alt()
+                          + r"\b")
+    return re.compile(r"#\s*\[\s*(?:\w+\s*::\s*)*" + _test_name_alt() + r"\b")
+
+
+def test_item_re() -> "re.Pattern[str]":
+    """The same, as one item of `#[cfg_attr(<cond>, item, ..)]`."""
+    if on("test_attr_paths"):
+        return re.compile(r"^(?:::\s*)?(?:(?:r#)?\w+\s*::\s*)*(?:r#)?" + _test_name_alt() + r"\b")
+    return re.compile(r"^(?:\w+\s*::\s*)*" + _test_name_alt() + r"\b")
+
 
 # Check names, for --mutation-sweep: disabling any ONE must turn the self-test red.
 CHECKS = (
@@ -137,9 +224,13 @@ CHECKS = (
     "top_level_binding", "bound_ident", "lock_before_write", "each_write",
     "delegate_return_type", "delegate_return_expr", "delegate_homonym", "fixpoint",
     "drop_mode_guard", "alias_use", "alias_value", "tests_dir_relative", "strict_read",
-    "boundary_note", "mention_ends_cover", "spawn_refuse", "spawn_moved_in_strict",
-    "cfg_attr_test", "repo_relative_allowlist", "allowlist_top_level", "slot_write",
-    "slot_decl_once",
+    "boundary_note", "mention_ends_cover", "cfg_attr_test", "repo_relative_allowlist",
+    "allowlist_top_level", "slot_write", "slot_decl_once",
+    # third review (#4763-#4766 residues, #4774-#4779)
+    "deferred_body", "closure_body", "lock_decl_once", "lock_rename", "lock_alias",
+    "lock_path", "slot_use", "slot_alias", "main_no_cfg", "main_unique", "main_not_called",
+    "test_attr_paths", "test_attr_renames", "cfg_binding", "lexer_prefixes", "token_paste",
+    "unreadable_dir", "symlink_dir", "follow_path_mod", "follow_include", "unresolved_mod",
 )
 DISABLED: Set[str] = set()
 
@@ -187,15 +278,17 @@ def repo_rel(path: pathlib.Path) -> Optional[str]:
 
 def has_test_attribute(seg: str) -> bool:
     """`seg` (the attribute run before a fn) carries a test attribute, directly or through
-    ``#[cfg_attr(<cond>, .., test, ..)]`` (the condition itself does not count)."""
-    if TEST_ATTR.search(seg):
+    ``#[cfg_attr(<cond>, .., test, ..)]`` (the condition itself does not count). A leading ``::``,
+    ``r#test`` and a ``use .. test as X`` rename all count (#4764)."""
+    if test_attr_re().search(seg):
         return True
     if not on("cfg_attr_test"):
         return False
+    item_re = test_item_re()
     for m in CFG_ATTR.finditer(seg):
         close = match_paren(seg, m.end() - 1)
         for item in split_top(seg[m.end():close - 1])[1:]:
-            if TEST_ITEM.match(item.strip()):
+            if item_re.match(item.strip()):
                 return True
     return False
 
@@ -262,7 +355,20 @@ def test_line_mask(path: pathlib.Path, lines: List[str]) -> List[bool]:
 # --------------------------------------------------------------------------------------------
 # Lexer: blank comments and string/char literals, keep newlines and offsets
 # --------------------------------------------------------------------------------------------
+CHAR_LIT = re.compile(r"'(\\(?:u\{[0-9a-fA-F_]+\}|x[0-9a-fA-F]{2}|.)|[^\\'])'")
+LEX_CACHE: Dict[Tuple[str, frozenset], str] = {}
+
+
 def blank_literals(src: str) -> str:
+    key = (src, frozenset(DISABLED))
+    hit = LEX_CACHE.get(key)
+    if hit is None:
+        hit = _blank_literals(src)
+        LEX_CACHE[key] = hit
+    return hit
+
+
+def _blank_literals(src: str) -> str:
     if not on("lexer"):
         return src
     out = list(src)
@@ -293,6 +399,34 @@ def blank_literals(src: str) -> str:
                     j += 1
             blank(i, j)
             i = j
+        elif on("lexer_prefixes") and (c.isalpha() or c == "_") and not _ident_before(src, i):
+            # #4778: every literal prefix -- r"", r#""#, b"", br"", br#""#, c"", cr"", cr#""#, b''
+            # -- is recognised at the start of a token; any other identifier is skipped whole so
+            # its tail can never be mistaken for a prefix.
+            head = src[i:i + 300]
+            m = re.match(r"(?:br|cr|r)(#*)\"", head)
+            if m is not None:
+                close = '"' + m.group(1)
+                j = src.find(close, i + m.end())
+                j = n if j < 0 else j + len(close)
+                blank(i, j)
+                i = j
+                continue
+            if re.match(r"[bc]\"", head):
+                j = i + 2
+                while j < n and src[j] != '"':
+                    j += 2 if src[j] == "\\" else 1
+                blank(i, j + 1)
+                i = j + 1
+                continue
+            if head.startswith("b'"):
+                m = CHAR_LIT.match(src, i + 1)
+                if m is not None:
+                    blank(i, m.end())
+                    i = m.end()
+                    continue
+            m = re.match(r"\w+", head)
+            i += m.end() if m is not None else 1
         elif c in "rb" and re.match(r"b?r#*\"", src[i:i + 40]) and not _ident_before(src, i):
             m = re.match(r"b?r(#*)\"", src[i:i + 40])
             if m is None:
@@ -309,10 +443,10 @@ def blank_literals(src: str) -> str:
             blank(i, j + 1)
             i = j + 1
         elif c == "'":
-            m = re.match(r"'(\\(?:u\{[0-9a-fA-F_]+\}|x[0-9a-fA-F]{2}|.)|[^\\'])'", src[i:i + 16])
+            m = CHAR_LIT.match(src, i)
             if m:
-                blank(i, i + m.end())
-                i += m.end()
+                blank(i, m.end())
+                i = m.end()
             else:
                 i += 1  # lifetime / label
         else:
@@ -336,7 +470,11 @@ class Fn(NamedTuple):
     is_test: bool    # `fn` keyword sits on a line the #3623 boundary classes as test
     in_drop_of: Optional[str]  # type T when inside `impl Drop for T`
     sig: str         # text between the name and the body `{`
-    has_test_attr: bool
+    attrs: str       # the attribute run before the fn (since the previous `;`, `{` or `}`)
+
+    def has_test_attr(self) -> bool:
+        # Evaluated lazily: `use .. test as X` renames are collected over the whole tree (#4764).
+        return has_test_attribute(self.attrs)
 
 
 FN_RE = re.compile(r"\bfn\s+([A-Za-z_]\w*)")
@@ -400,9 +538,8 @@ def find_fns(text: str, line_starts: List[int], mask: List[bool], path: pathlib.
                 in_drop = t
         seg_start = max(text.rfind(";", 0, m.start()), text.rfind("{", 0, m.start()),
                         text.rfind("}", 0, m.start())) + 1
-        has_attr = has_test_attribute(text[seg_start:m.start()])
         fns.append(Fn(m.group(1), path, m.start(), body_open, match_brace(text, body_open),
-                      mask[line], in_drop, text[m.end():body_open], has_attr))
+                      mask[line], in_drop, text[m.end():body_open], text[seg_start:m.start()]))
     return fns
 
 
@@ -422,6 +559,7 @@ class FileModel(NamedTuple):
     line_starts: List[int]
     mask: List[bool]
     fns: List[Fn]
+    raw: str  # the unblanked source (path / include literals)
 
 
 def read_source(path: pathlib.Path) -> str:
@@ -443,7 +581,7 @@ def load(path: pathlib.Path) -> FileModel:
     for ln in lines:
         starts.append(off)
         off += len(ln) + 1
-    return FileModel(path, text, starts, mask, find_fns(text, starts, mask, path))
+    return FileModel(path, text, starts, mask, find_fns(text, starts, mask, path), raw)
 
 
 def line_of(fm: FileModel, off: int) -> int:
@@ -556,14 +694,20 @@ def lock_bindings(fm: FileModel, f: Fn, lockers: Set[str]) -> List[Binding]:
         if ident == "_" and on("bound_ident"):
             continue  # `let _ = ..` drops the guard at once
         if innermost(fm.fns, m.start()) is not f:
-            continue  # belongs to a nested fn
+            # Redundant defense in depth (equivalent mutant, 3rd review): a nested fn's binding
+            # has a scope_end inside that fn, where no write of f can sit.
+            continue
         semi = statement_end(text, m.end(), f.close_off)
         if semi < 0:
             continue
+        if on("cfg_binding") and ANY_CFG.search(text[stmt_start(text, m.start()):m.start()]):
+            continue  # #4777: a cfg'd / cfg_attr'd binding may not be compiled in
         rhs = text[m.end():semi].strip()
         h = CALL_HEAD.match(rhs)
         if h is None or h.group(1) not in lockers:
             continue
+        if h.group(1) == LOCK and on("lock_path") and not lock_path_ok(fm, rhs[:h.start(1)]):
+            continue  # #4776: `other::lock..()` / `self.lock..()` is not the mode lock
         if rhs[match_paren(rhs, h.end() - 1):].strip() != "":
             continue  # the guard is a temporary of a longer expression
         scope_end = min((e for o, e in spans if o < m.start() < e), key=lambda e: e,
@@ -601,60 +745,117 @@ def guard_live_at(fm: FileModel, bindings: List[Binding], write: int) -> bool:
     return False
 
 
-SPAWN_RE = re.compile(r"\bspawn(?:_[A-Za-z0-9_]+)?\s*\(")
-REBIND_RE = re.compile(r"\blet\s+(?:mut\s+)?([A-Za-z_]\w*)\s*(?::[^=;]*)?=\s*$")
+def stmt_start(text: str, off: int) -> int:
+    """Start of the statement / item containing `off`: one past the previous `;`, `{` or `}`."""
+    return max(text.rfind(";", 0, off), text.rfind("{", 0, off), text.rfind("}", 0, off)) + 1
 
 
-def spawn_spans(fm: FileModel, f: Fn) -> List[Tuple[int, int]]:
-    """(open paren, one past close paren) of every spawn / spawn_blocking / spawn_local .. call."""
+def lock_path_ok(fm: FileModel, prefix: str) -> bool:
+    """The path before a LOCK call (`crate::config::`, `config::`, none) names src/config.rs."""
+    if re.search(r"\.\s*$", prefix):
+        return False  # a method of some value, not the free fn
+    segs = re.findall(r"([A-Za-z_]\w*)\s*::", prefix)
+    if not segs or segs[-1] == "config":
+        return True
+    return segs[-1] in ("super", "self", "crate") and repo_rel(fm.path) == "src/config.rs"
+
+
+CLOSURE_PREV_WORDS = {"move", "async", "return", "break", "in", "yield", "static", "else"}
+
+
+def _closure_headers(text: str, raw: str, a: int, b: int) -> List[Tuple[int, int]]:
+    """(start, end) of every closure parameter header `|..|` / `||` in text[a:b].
+
+    A `|` is a binary operator when a left operand precedes it (an identifier other than a
+    keyword above, a number, `)`, `]`, `}`, `?`, or a blanked literal); otherwise it opens a
+    closure header. Heuristic, fail closed: a misread `||` puts the code after it in a deferred
+    body, where only a guard bound inside counts.
+    """
     out: List[Tuple[int, int]] = []
-    for m in SPAWN_RE.finditer(fm.text, f.open_off + 1, f.close_off):
-        if re.search(r"\bfn\s+$", fm.text[max(0, m.start() - 12):m.start()]):
+    k = a
+    while k < b:
+        if text[k] != "|":
+            k += 1
             continue
-        a = m.end() - 1
-        out.append((a, match_paren(fm.text, a)))
+        j = k - 1
+        while j >= a and text[j].isspace():
+            j -= 1
+        binary = False
+        if j >= a:
+            ch = text[j]
+            gap = raw[j + 1:k].strip()
+            if gap and gap[-1] in "\"'#":
+                binary = True  # a string / char literal (blanked) is the left operand
+            elif ch.isalnum() or ch == "_":
+                w = re.search(r"\w+$", text[a:j + 1])
+                binary = not (w is not None and w.group(0) in CLOSURE_PREV_WORDS)
+            elif ch in ")]}?":
+                binary = True
+        if binary:
+            k += 2 if text[k:k + 2] in ("||", "|=") else 1
+            continue
+        if text[k:k + 2] == "||":
+            out.append((k, k + 2))
+            k += 2
+            continue
+        q = k + 1
+        while q < b and text[q] not in "|;{}":
+            q += 1
+        if q < b and text[q] == "|":
+            out.append((k, q + 1))
+            k = q + 1
+        else:
+            k += 1
     return out
 
 
-def moved_into_spawn(fm: FileModel, b: Binding, a: int, c: int, write: int) -> bool:
-    """The outer guard `b` is moved into the spawn argument (a, c) and still held at `write`."""
-    if b.ident is None or b.end > a or a >= b.scope_end:
-        return False
-    found = mentions(fm.text, b.ident, b.end, b.scope_end)
-    if not found:
-        return False
-    first = b.end + found[0].start()
-    if not (a < first < write < c):
-        return False
-    if not on("spawn_moved_in_strict"):
-        return True
-    if not re.search(r"\bmove\b", fm.text[a:first]):
-        return False  # a non-`move` closure borrows the guard; the task may outlive it
-    before = fm.text[max(a, first - 80):first]
-    after = fm.text[first + len(b.ident):first + len(b.ident) + 8].lstrip()
-    reb = REBIND_RE.search(before)
-    if reb is not None and after.startswith(";"):
-        # `let k = g;` -- the new owner must live to the write and be unmentioned before it
-        spans = [(o, e) for o, e in brace_spans(fm.text, a, c) if o < first < e]
-        blk_end = min((e for o, e in spans), default=c)
-        return write < blk_end and not mentions(fm.text, reb.group(1), first, write)
-    if re.search(r"&\s*(?:mut\s+)?$", before) and not mentions(fm.text, b.ident, first + 1, write):
-        return True  # `&g` / `&mut g` inside a `move` closure keeps the captured guard alive
-    return False
+def deferred_bodies(fm: FileModel, f: Fn) -> List[Tuple[int, int]]:
+    """(start, end) of every closure body and `async` block in f (#4766).
+
+    Code there may run after the enclosing guard is released: a closure called after `drop(g)`,
+    passed to `thread::spawn` (under any name), returned from a fn; a future awaited later or
+    spawned. So a write there is covered only by a guard bound INSIDE that body.
+    """
+    text = fm.text
+    a, b = f.open_off + 1, f.close_off - 1
+    out: List[Tuple[int, int]] = []
+    for m in re.finditer(r"\basync\s+(?:move\s+)?\{", text[a:b]):
+        o = a + m.end() - 1
+        out.append((o, match_brace(text, o)))
+    if not on("closure_body"):
+        return out
+    for _h0, h in _closure_headers(text, fm.raw, a, b):
+        k = h
+        m = re.compile(r"\s*(?:->[^{]*)?\{").match(text, k)
+        if m is not None and m.end() <= b:
+            o = m.end() - 1
+            out.append((o, match_brace(text, o)))
+            continue
+        depth, e = 0, k
+        while e < b:
+            ch = text[e]
+            if ch in "([{":
+                depth += 1
+            elif ch in ")]}":
+                depth -= 1
+                if depth < 0:
+                    break
+            elif ch in ",;" and depth == 0:
+                break
+            e += 1
+        out.append((k, e))
+    return out
 
 
 def covered(fm: FileModel, f: Fn, bindings: List[Binding], write: int) -> bool:
-    """A live guard at `write`; a write inside a spawn(..) argument may run after the spawner's
-    guard is released, so there the guard must be acquired inside the closure or moved into it."""
-    spans = [(a, c) for a, c in spawn_spans(fm, f) if a < write < c] if on("spawn_refuse") else []
-    if not spans:
-        return guard_live_at(fm, bindings, write)
-    for a, c in spans:
-        ok = any(guard_live_at(fm, [b], write) for b in bindings if b.end > a) or \
-            any(moved_into_spawn(fm, b, a, c, write) for b in bindings)
-        if not ok:
-            return False
-    return True
+    """A live guard at `write`. Inside a closure body or an async block (the innermost one that
+    holds the write) only a guard bound inside that same body counts (#4766)."""
+    if on("deferred_body"):
+        bodies = [(o, c) for o, c in deferred_bodies(fm, f) if o < write < c]
+        if bodies:
+            o, c = max(bodies)
+            return guard_live_at(fm, [x for x in bindings if o < x.end <= c], write)
+    return guard_live_at(fm, bindings, write)
 
 
 # --------------------------------------------------------------------------------------------
@@ -809,14 +1010,30 @@ def writer_refs(fm: FileModel) -> Tuple[List[int], List[Tuple[int, str]]]:
             elif on("alias_value"):
                 bad.append((off, f"writer {w} used as a value (alias / fn pointer)"))
     if on("slot_write"):
+        in_config = repo_rel(fm.path) == "src/config.rs"
         for m in re.finditer(r"\b" + SLOT + r"\b", fm.text):
             off = m.start()
-            if any(a <= off < b for a, b in spans):
+            use = next(((a, b) for a, b in spans if a <= off < b), None)
+            if use is not None:
+                vis = fm.text[stmt_start(fm.text, use[0]):use[0]]
+                if on("slot_use") and (not in_config or re.match(r"\s+as\b", fm.text[m.end():])
+                                       or re.search(r"\bpub\b", vis)):
+                    bad.append((off, f"the slot {SLOT} imported outside src/config.rs, renamed "
+                                     f"with `as`, or re-exported (#4763)"))
                 continue
             if re.search(r"\bstatic\s+$", fm.text[max(0, off - 12):off]):
                 continue  # the declaration itself
             if SLOT_READ.match(fm.text, m.end()):
                 continue  # a read of the slot is not a write
+            f = innermost(fm.fns, off)
+            if on("slot_alias") and not (f is not None and allowed_writer(fm, f)):
+                head = fm.text[stmt_start(fm.text, off):off]
+                if not (SLOT_WRITE.match(fm.text, m.end())
+                        and re.fullmatch(r"\s*\*\s*(?:[A-Za-z_]\w*\s*::\s*)*", head)):
+                    bad.append((off, f"the slot {SLOT} referenced outside a src/config.rs setter "
+                                     f"other than `.read()` or a `*{SLOT}.write()..= ..` "
+                                     f"statement (reference / guard / pointer alias, #4763)"))
+                    continue
             calls.append(off)
     return sorted(calls), sorted(bad)
 
@@ -826,7 +1043,7 @@ def brace_depth_at(text: str, off: int) -> int:
 
 
 def allowed_writer(fm: FileModel, f: Fn) -> bool:
-    if f.has_test_attr and on("allowlist_test_attr"):
+    if f.has_test_attr() and on("allowlist_test_attr"):
         return False
     if on("repo_relative_allowlist"):
         here = repo_rel(fm.path)
@@ -837,8 +1054,147 @@ def allowed_writer(fm: FileModel, f: Fn) -> bool:
         if f.name == name and (not on("allowlist_path") or path in forms):
             if on("allowlist_top_level") and brace_depth_at(fm.text, f.kw_off) != 0:
                 continue
+            if name == "main" and not main_is_boot_setter(fm, f):
+                continue
             return True
     return False
+
+
+def main_is_boot_setter(fm: FileModel, f: Fn) -> bool:
+    """#4764: the boot setter is the ONE top-level `fn main` of src/main.rs, with no cfg/cfg_attr
+    attribute (a cfg'd main may be a test-only twin), and nothing in the tree calls or names it."""
+    if on("main_no_cfg") and ANY_CFG.search(f.attrs):
+        return False
+    if on("main_unique") and sum(1 for g in fm.fns if g.name == "main"
+                                 and brace_depth_at(fm.text, g.kw_off) == 0) != 1:
+        return False
+    return not (on("main_not_called") and MAIN_REFS)
+
+
+# Tree-level facts, recomputed by every scan().
+MAIN_REFS: List[str] = []  # `file:line` of each reference to `main` other than a definition
+
+
+def in_attribute(text: str, off: int) -> bool:
+    k = text.rfind("#", 0, off)
+    return k >= 0 and re.match(r"#\s*!?\s*\[", text[k:]) is not None and "]" not in text[k:off]
+
+
+def main_references(models: List[FileModel]) -> List[str]:
+    """References that can reach the binary's `fn main`: a call `main(..)` or a `..::main` path
+    anywhere, `main` in a `use`, and a bare value mention (`spawn(main)`, `let f = main;`) in the
+    binary crate (src/main.rs, or every file once src/main.rs declares a file module). A local
+    named `main` in a library file is not the binary's main."""
+    bin_files = {"src/main.rs"}
+    for fm in models:
+        if repo_rel(fm.path) == "src/main.rs" and re.search(r"\bmod\s+\w+\s*;", fm.text):
+            bin_files = {repo_rel(m.path) or "" for m in models}
+    out: List[str] = []
+    for fm in models:
+        spans = use_spans(fm.text)
+        in_bin = repo_rel(fm.path) in bin_files
+        for m in re.finditer(r"\bmain\b", fm.text):
+            off = m.start()
+            before = fm.text[max(0, off - 24):off]
+            if re.search(r"\bfn\s+(?:r#)?$", before) or re.search(r"\.\s*$", before):
+                continue  # a definition, or a method / field of some value
+            if re.match(r"\s*!", fm.text[m.end():]) or in_attribute(fm.text, off):
+                continue  # a macro, or an attribute path such as #[tokio::main]
+            reaches = (re.match(r"\s*\(", fm.text[m.end():]) is not None
+                       or re.search(r"::\s*(?:r#)?$", before) is not None
+                       or any(x <= off < y for x, y in spans) or in_bin)
+            if reaches:
+                out.append(f"{fm.path}:{line_of(fm, off)}")
+    return out
+
+
+def collect_test_renames(models: List[FileModel]) -> None:
+    TEST_RENAMES.clear()
+    for fm in models:
+        for a, b in use_spans(fm.text):
+            TEST_RENAMES.update(m.group(1) for m in TEST_RENAME.finditer(fm.text[a:b]))
+
+
+def check_lock_declared(models: List[FileModel], require: bool) -> None:
+    """#4776: the mode lock is the ONE top-level fn in src/config.rs. A definition anywhere else
+    (a test-module homonym would make any mutex count) is a GateError; with `require`, so is a
+    src/config.rs that does not define it exactly once."""
+    if not on("lock_decl_once"):
+        return
+    count, seen = 0, False
+    for fm in models:
+        rel = repo_rel(fm.path)
+        seen = seen or rel == "src/config.rs"
+        for m in re.finditer(r"\bfn\s+(?:r#)?" + LOCK + r"\b", fm.text):
+            if rel != "src/config.rs" or brace_depth_at(fm.text, m.start()) != 0:
+                raise GateError(f"{fm.path}:{line_of(fm, m.start())}: {LOCK} defined outside the "
+                                f"top level of src/config.rs: the lock model cannot vouch for it")
+            count += 1
+    if require and seen and count != 1:
+        raise GateError(f"{LOCK} is defined {count} times in src/config.rs (expected 1)")
+
+
+def use_parent(seg: str) -> Optional[str]:
+    """The last path segment before the item that ends `seg` (the text of a `use` up to it)."""
+    tail = re.split(r"[{,]", seg)[-1]
+    segs = re.findall(r"([A-Za-z_]\w*)\s*::", tail)
+    if segs:
+        return segs[-1]
+    stack: List[int] = []
+    for k, ch in enumerate(seg):
+        if ch == "{":
+            stack.append(k)
+        elif ch == "}" and stack:
+            stack.pop()
+    if not stack:
+        return None
+    m = re.search(r"([A-Za-z_]\w*)\s*::\s*$", seg[:stack[-1]])
+    return m.group(1) if m else None
+
+
+def lock_refs(fm: FileModel, dg: "Delegates") -> List[Tuple[int, str]]:
+    """#4776: the lock (and every delegate) is named only by calls, its definition and plain
+    imports from config; a rename to / from it, a non-config import path, or any other mention
+    (a shadowing binding, a parameter, a fn pointer) is refused."""
+    names = {LOCK, *dg.names}
+    spans = use_spans(fm.text)
+    out: List[Tuple[int, str]] = []
+    if on("lock_rename"):
+        for a, b in spans:
+            for m in re.finditer(r"(?:r#)?([A-Za-z_]\w*)\s+as\s+(?:r#)?([A-Za-z_]\w*)",
+                                 fm.text[a:b]):
+                if m.group(1) in names or m.group(2) in names:
+                    out.append((a + m.start(), "the mode lock or a delegate renamed with `as` "
+                                               "in a use (#4776)"))
+    in_config = repo_rel(fm.path) == "src/config.rs"
+    for name in sorted(names):
+        for m in re.finditer(r"\b" + re.escape(name) + r"\b", fm.text):
+            off = m.start()
+            use = next(((a, b) for a, b in spans if a <= off < b), None)
+            if use is not None:
+                if name == LOCK and on("lock_path"):
+                    parent = use_parent(fm.text[use[0]:off])
+                    if not (parent == "config" or (in_config and parent in ("super", "self",
+                                                                             "crate"))):
+                        out.append((off, f"{LOCK} imported from a path other than "
+                                         f"crate::config (#4776)"))
+                continue
+            if re.search(r"\bfn\s+(?:r#)?$", fm.text[max(0, off - 16):off]):
+                continue
+            if re.match(r"\s*\(", fm.text[m.end():m.end() + 8]):
+                continue
+            if on("lock_alias"):
+                out.append((off, f"{name} (the mode lock or a delegate) mentioned other than "
+                                 f"as a call (shadowing binding / parameter / fn pointer, #4776)"))
+    return out
+
+
+def paste_refs(fm: FileModel) -> List[Tuple[int, str]]:
+    if not on("token_paste"):
+        return []
+    return [(m.start(), "token pasting (paste / concat_idents) can build a writer, lock or slot "
+                        "name the gate cannot see; refused outright (#4779)")
+            for m in PASTE_RE.finditer(fm.text)]
 
 
 def check_slot_declared(models: List[FileModel]) -> None:
@@ -865,12 +1221,17 @@ def drop_exempt(f: Fn, dg: Delegates) -> bool:
 # --------------------------------------------------------------------------------------------
 def scan(files: List[pathlib.Path], require_slot: bool = False) -> List[Violation]:
     models = [load(p) for p in files]
+    collect_test_renames(models)
     if require_slot:
         check_slot_declared(models)
+    check_lock_declared(models, require_slot)
     dg = compute_delegates(models)
     lockers = {LOCK, *dg.names}
+    MAIN_REFS[:] = main_references(models)
     out: List[Violation] = []
     for fm in models:
+        for off, why in paste_refs(fm) + lock_refs(fm, dg):
+            out.append(Violation(fm.path, line_of(fm, off), "<reference>", why))
         calls, bad = writer_refs(fm)
         for off, why in bad:
             out.append(Violation(fm.path, line_of(fm, off), "<reference>", why))
@@ -915,22 +1276,126 @@ def boundary_gaps(files: List[pathlib.Path]) -> Dict[pathlib.Path, int]:
     gaps: Dict[pathlib.Path, int] = {}
     for p in files:
         fm = load(p)
-        n = sum(1 for f in fm.fns if f.has_test_attr and not fm.mask[line_of(fm, f.kw_off) - 1])
+        n = sum(1 for f in fm.fns if f.has_test_attr() and not fm.mask[line_of(fm, f.kw_off) - 1])
         if n:
             gaps[p] = n
     return gaps
 
 
+def walk_rs(root: pathlib.Path) -> List[pathlib.Path]:
+    """Every .rs file under `root`. An unreadable directory (#4774) or a symlinked directory
+    (#4775: its target is outside what the scan root names) is a GateError, never skipped."""
+    found: List[pathlib.Path] = []
+    stack = [root]
+    while stack:
+        d = stack.pop()
+        try:
+            with os.scandir(d) as it:
+                entries = sorted(it, key=lambda e: e.name)
+        except OSError as e:
+            if on("unreadable_dir"):
+                raise GateError(f"{d}: cannot list directory ({type(e).__name__}: {e})")
+            continue
+        for e in entries:
+            ep = pathlib.Path(d) / e.name
+            if e.is_symlink() and e.is_dir():
+                if on("symlink_dir"):
+                    raise GateError(f"{ep}: symlinked directory; scan its target explicitly")
+                continue
+            if e.is_dir(follow_symlinks=False):
+                stack.append(ep)
+            elif e.name.endswith(".rs"):
+                found.append(ep)
+    return sorted(found)
+
+
+def _abs(p: pathlib.Path) -> pathlib.Path:
+    return pathlib.Path(os.path.abspath(os.path.normpath(str(p))))
+
+
+def _literal_at(raw: str, k: int) -> Optional[str]:
+    """The string literal (plain or raw, no escapes) starting at raw[k] after whitespace."""
+    m = re.compile(r"\s*(?:\"([^\"\\]*)\"|r(#*)\"(.*?)\"\2)", re.S).match(raw, k)
+    if m is None:
+        return None
+    return m.group(1) if m.group(1) is not None else m.group(3)
+
+
+def compiled_children(path: pathlib.Path) -> List[pathlib.Path]:
+    """Files this file pulls into the crate (#4775): `mod x;` (with `#[path]`, plain or through
+    cfg_attr), `include!("..")` of any file and `include_str!("...rs")`. A declaration that
+    resolves to no file, or an include! whose argument is not a literal, is a GateError."""
+    raw = read_source(path)
+    text = blank_literals(raw)
+    d, stem = path.parent, path.stem
+    inline = []
+    for m in re.finditer(r"\bmod\s+(?:r#)?([A-Za-z_]\w*)\s*\{", text):
+        inline.append((m.group(1), m.end() - 1, match_brace(text, m.end() - 1)))
+    out: List[pathlib.Path] = []
+    if on("follow_path_mod"):
+        for m in re.finditer(r"\bmod\s+(?:r#)?([A-Za-z_]\w*)\s*;", text):
+            name = m.group(1)
+            chain = [n for n, o, c in sorted(inline, key=lambda t: t[1]) if o < m.start() < c]
+            bases = [d.joinpath(*chain), d.joinpath(stem, *chain)]
+            seg_at = stmt_start(text, m.start())
+            values = []
+            for pm in re.finditer(r"\bpath\s*=", text[seg_at:m.start()]):
+                lit = _literal_at(raw, seg_at + pm.end())
+                if lit is None:
+                    raise GateError(f"{path}: `mod {name};` has a path attribute that is not a literal")
+                values.append(lit)
+            unconditional = re.search(r"#\s*\[\s*path\s*=", text[seg_at:m.start()]) is not None
+            pbases = [d] if not chain else bases
+            hit = []
+            for v in values:
+                hit += [c for c in (_abs(b / v) for b in pbases) if c.is_file()]
+            if not unconditional:
+                hit += [c for c in (_abs(b / f"{name}.rs") for b in bases) if c.is_file()]
+                hit += [c for c in (_abs(b / name / "mod.rs") for b in bases) if c.is_file()]
+            if not hit and on("unresolved_mod"):
+                raise GateError(f"{path}: `mod {name};` resolves to no file: the scan cannot "
+                                f"vouch for the compiled set")
+            out += hit
+    if on("follow_include"):
+        for m in re.finditer(r"\binclude(_str)?\s*!\s*\(", text):
+            lit = _literal_at(raw, m.end())
+            is_str = m.group(1) is not None
+            if lit is None:
+                if is_str:
+                    continue  # include_str! of a computed path is data, not compiled code
+                raise GateError(f"{path}: include! with a non-literal argument")
+            if is_str and not lit.endswith(".rs"):
+                continue
+            c = _abs(d / lit)
+            if not c.is_file():
+                raise GateError(f"{path}: include of {lit!r} resolves to no file")
+            out.append(c)
+    return out
+
+
 def rust_files(roots: List[pathlib.Path]) -> List[pathlib.Path]:
+    """The scan set: every .rs file under the roots, closed over the files they compile in."""
     found: List[pathlib.Path] = []
     for r in roots:
         if r.is_file():
             found.append(r)
             ROOT_OF[r] = r
         elif r.is_dir():
-            for p in sorted(r.rglob("*.rs")):
+            for p in walk_rs(r):
                 found.append(p)
                 ROOT_OF[p] = r
+    seen = {_abs(p) for p in found}
+    queue = list(found)
+    while queue:
+        for c in compiled_children(queue.pop()):
+            if c in seen:
+                continue
+            seen.add(c)
+            found.append(c)
+            queue.append(c)
+            rel = repo_rel(c)
+            ROOT_OF[c] = (_abs(REPO_ROOT) / pathlib.PurePosixPath(rel).parts[0]
+                          if REPO_ROOT is not None and rel is not None else c.parent)
     return found
 
 
@@ -1028,8 +1493,8 @@ FIXTURES: List[Tuple[str, Dict[str, str], bool]] = [
         t_fn(f"        with_env(async {{\n            {L}\n            {W}\n        }});"))}, False),
     ("guard bound in an inner block covers writes in that block and its sub-blocks", {"src/j5.rs": tm(
         t_fn(f"        {{\n            {L}\n            if c {{ {W} }}\n        }}"))}, False),
-    ("write inside a closure under a top-level guard is accepted", {"src/j3.rs": tm(
-        t_fn(f"        {L}\n        let f = || {{ {W} }};\n        f();"))}, False),
+    ("write inside a closure under an outer guard is refused (#4766 fail-closed false positive)", {"src/j3.rs": tm(
+        t_fn(f"        {L}\n        let f = || {{ {W} }};\n        f();"))}, True),
     ("registered delegate returning the guard (one level) is accepted", {"src/k.rs": tm(
         f"    fn rules_scope() -> {GT} {{\n        let g = {LK};\n        g\n    }}\n"
         + t_fn(f"        let _s = rules_scope();\n        {W}"))}, False),
@@ -1150,8 +1615,8 @@ FIXTURES: List[Tuple[str, Dict[str, str], bool]] = [
         t_fn(f"        {L}\n        std::thread::spawn(move || {{ consume(_g); {W} }});"))}, True),
     ("guard acquired INSIDE the spawn closure is accepted", {"src/w9.rs": tm(
         t_fn(f"        std::thread::spawn(|| {{ {L} {W} }}).join().unwrap();"))}, False),
-    ("guard moved INTO a move spawn closure and kept is accepted", {"src/w10.rs": tm(
-        t_fn(f"        {L}\n        std::thread::spawn(move || {{ let _k = _g; {W} }}).join().unwrap();"))}, False),
+    ("guard moved INTO a move spawn closure is refused (#4766 fail-closed false positive)", {"src/w10.rs": tm(
+        t_fn(f"        {L}\n        std::thread::spawn(move || {{ let _k = _g; {W} }}).join().unwrap();"))}, True),
     # ---- N3 (#4767): a delegate must yield the mode guard on every path ----
     ("delegate that borrows the guard and returns an unrelated guard is refused", {"src/y1.rs": tm(
         f"    fn sneaky() -> {GT} {{ let g = {LK}; let _r = &g; OTHER.lock().unwrap_or_else(|e| e.into_inner()) }}\n"
@@ -1170,8 +1635,8 @@ FIXTURES: List[Tuple[str, Dict[str, str], bool]] = [
         f"#[cfg_attr(test, test)]\nfn main() {{\n    {W}\n}}\n"}, True),
     ("#[cfg_attr(feature, tokio::test)] fn main in src/main.rs is refused", {"src/main.rs":
         f"#[cfg_attr(feature = \"x\", tokio::test)]\nasync fn main() {{\n    {W}\n}}\n"}, True),
-    ("#[cfg_attr(test, derive(Debug))] on the real fn main is not a test attribute (accepted)", {"src/main.rs":
-        f"#[cfg_attr(test, allow(dead_code))]\nfn main() {{\n    crate::config::set_active_permissions_mode(m);\n}}\n"}, False),
+    ("any cfg_attr on fn main forfeits the boot-setter allowlist (#4764)", {"src/main.rs":
+        f"#[cfg_attr(test, allow(dead_code))]\nfn main() {{\n    crate::config::set_active_permissions_mode(m);\n}}\n"}, True),
     ("a nested `fn main` in a cfg(test) module of src/main.rs is refused", {"src/main.rs":
         f"fn main() {{}}\n#[cfg(test)]\nmod tests {{\n    fn main() {{\n        {W}\n    }}\n}}\n"}, True),
     ("a `fn main` method in an impl in src/main.rs is refused", {"src/main.rs":
@@ -1195,7 +1660,134 @@ FIXTURES: List[Tuple[str, Dict[str, str], bool]] = [
         "pub fn set_active_permissions_mode(m: u8) {\n    if let Ok(mut w) = ACTIVE_PERMISSIONS_MODE.write() { *w = Some(m); }\n}\n"
         "pub fn clear_permissions_mode_override_for_test() {\n    if let Ok(mut w) = ACTIVE_PERMISSIONS_MODE.write() { *w = None; }\n}\n"
         "pub fn active() -> Option<u8> {\n    ACTIVE_PERMISSIONS_MODE.read().ok().and_then(|g| *g)\n}\n"}, False),
+    ("#[cfg_attr(test, test)] on an allowlisted config.rs setter makes it a test (refused)", {"src/config.rs":
+        "#[cfg_attr(test, test)]\npub fn clear_permissions_mode_override_for_test() {\n"
+        "    set_active_permissions_mode(m);\n}\n"}, True),
+    # ---- #4766 residue (R1): deferred execution -- closures and async bodies ----
+    ("closure defined under the guard, called after drop(guard), is refused", {"src/r1a.rs": tm(
+        t_fn(f"        {L}\n        let f = || {{ {W} }};\n        drop(_g);\n        f();"))}, True),
+    ("async block built under the guard, awaited after drop(guard), is refused", {"src/r1b.rs": tm(
+        t_fn(f"        {L}\n        let fut = async {{ {W} }};\n        drop(_g);\n        fut.await;",
+             attr="#[tokio::test]").replace("fn t", "async fn t"))}, True),
+    ("closure defined under the guard and handed to thread::spawn is refused", {"src/r1c.rs": tm(
+        t_fn(f"        {L}\n        let f = || {{ {W} }};\n        std::thread::spawn(f);"))}, True),
+    ("closure returned from a fn that holds the guard is refused", {"src/r1d.rs": tm(
+        f"    fn mk() -> impl Fn() {{\n        {L}\n        move || {{ {W} }}\n    }}\n")}, True),
+    ("spawn through a renamed import is refused", {"src/r1e.rs": tm(
+        "    use std::thread::spawn as go;\n" + t_fn(f"        {L}\n        go(|| {{ {W} }});"))}, True),
+    ("a brace-less closure body under an outer guard is refused", {"src/r1f.rs": tm(
+        t_fn(f"        {L}\n        let f = || {W[:-1]};\n        f();"))}, True),
+    ("an async move block under an outer guard is refused", {"src/r1g.rs": tm(
+        t_fn(f"        {L}\n        let fut = async move {{ {W} }};\n        fut.await;",
+             attr="#[tokio::test]").replace("fn t", "async fn t"))}, True),
+    ("guard bound INSIDE the closure that writes is accepted", {"src/r1h.rs": tm(
+        t_fn(f"        let f = || {{ {L} {W} }};\n        f();"))}, False),
+    ("`a || b` and `s == \"x\" || t` are binary ORs, not closures (accepted)", {"src/r1i.rs": tm(
+        t_fn(f"        {L}\n        if a || b {{ {W} }}\n        if s == \"x\" || t {{ {W} }}\n        if (a) || [b][0] {{ {W} }}"))}, False),
+    # ---- #4776 + R2: the lock is the one fn in src/config.rs ----
+    ("a test-module homonym of the lock (any mutex) exits 2", {"src/lk1.rs": tm(
+        f"    fn lock_permissions_mode_for_test() -> {GT} {{ OTHER.lock().unwrap_or_else(|e| e.into_inner()) }}\n"
+        + t_fn(f"        let _g = lock_permissions_mode_for_test();\n        {W}"))}, True),
+    ("`use .. as lock_permissions_mode_for_test` is refused", {"src/lk2.rs": tm(
+        "    use crate::config::my_lock as lock_permissions_mode_for_test;\n"
+        + t_fn(f"        let _g = lock_permissions_mode_for_test();\n        {W}"))}, True),
+    ("a rename of a delegate's name onto another fn is refused", {"src/lk3.rs": tm(
+        f"    fn rules_scope() -> {GT} {{ let g = {LK}; g }}\n"
+        "    mod m {\n        use crate::x::evil as rules_scope;\n    }\n"
+        + t_fn(f"        let _s = rules_scope();\n        {W}"))}, True),
+    ("a local binding shadowing the lock name is refused", {"src/lk4.rs": tm(
+        t_fn(f"        let lock_permissions_mode_for_test = || OTHER.lock().unwrap_or_else(|e| e.into_inner());\n"
+             f"        let _g = lock_permissions_mode_for_test();\n        {W}"))}, True),
+    ("a lock call through a path other than config does not count", {"src/lk5.rs": tm(
+        t_fn(f"        let _g = other::lock_permissions_mode_for_test();\n        {W}"))}, True),
+    ("a lock import from a path other than config is refused", {"src/lk6.rs": tm(
+        "    use other::lock_permissions_mode_for_test;\n"
+        + t_fn(f"        let _g = lock_permissions_mode_for_test();\n        {W}"))}, True),
+    ("the real lock in src/config.rs, imported from crate::config, is accepted", {
+        "src/config.rs": f"pub fn lock_permissions_mode_for_test() -> {GT} {{\n    M.lock().unwrap_or_else(|e| e.into_inner())\n}}\n",
+        "src/lk7.rs": tm("    use crate::config::{lock_permissions_mode_for_test, PermissionsMode};\n"
+                         + t_fn(f"        let _g = lock_permissions_mode_for_test();\n        {W}"))}, False),
+    # ---- #4763 residue (R3): slot aliasing ----
+    ("the slot imported with `as` in config.rs is refused", {"src/config.rs":
+        "static ACTIVE_PERMISSIONS_MODE: std::sync::RwLock<Option<u8>> = std::sync::RwLock::new(None);\n"
+        f"#[cfg(test)]\nmod tests {{\n    use super::ACTIVE_PERMISSIONS_MODE as S;\n    #[test]\n    fn t() {{\n        *S.write().unwrap() = Some(1);\n    }}\n}}\n"}, True),
+    ("the slot imported outside config.rs is refused", {"src/sl2.rs":
+        f"use crate::config::ACTIVE_PERMISSIONS_MODE;\n#[test]\nfn t() {{\n    {L}\n    let _r = ACTIVE_PERMISSIONS_MODE.read();\n}}\n"}, True),
+    ("the slot re-exported from config.rs is refused", {"src/config.rs":
+        "static ACTIVE_PERMISSIONS_MODE: std::sync::RwLock<Option<u8>> = std::sync::RwLock::new(None);\n"
+        "pub use self::ACTIVE_PERMISSIONS_MODE;\n"}, True),
+    ("a reference to the slot escaping the guard's block is refused", {"src/config.rs":
+        "static ACTIVE_PERMISSIONS_MODE: std::sync::RwLock<Option<u8>> = std::sync::RwLock::new(None);\n"
+        f"#[cfg(test)]\nmod tests {{\n    #[test]\n    fn t() {{\n        let p = {{ {L} &ACTIVE_PERMISSIONS_MODE }};\n        *p.write().unwrap() = Some(1);\n    }}\n}}\n"}, True),
+    ("a slot write guard bound by let (outlives the lock) is refused", {"src/config.rs":
+        "static ACTIVE_PERMISSIONS_MODE: std::sync::RwLock<Option<u8>> = std::sync::RwLock::new(None);\n"
+        f"#[cfg(test)]\nmod tests {{\n    #[test]\n    fn t() {{\n        {L}\n        let mut w = ACTIVE_PERMISSIONS_MODE.write().unwrap();\n        drop(_g);\n        *w = Some(1);\n    }}\n}}\n"}, True),
+    ("a raw pointer to the slot is refused", {"src/config.rs":
+        "static ACTIVE_PERMISSIONS_MODE: std::sync::RwLock<Option<u8>> = std::sync::RwLock::new(None);\n"
+        f"#[cfg(test)]\nmod tests {{\n    #[test]\n    fn t() {{\n        {L}\n        let _p = std::ptr::addr_of!(ACTIVE_PERMISSIONS_MODE);\n    }}\n}}\n"}, True),
+    # ---- #4764 residue (R4): the boot setter `main` ----
+    ("a single cfg'd fn main in src/main.rs is refused", {"src/main.rs":
+        "#[cfg(not(test))]\nfn main() {\n    crate::config::set_active_permissions_mode(m);\n}\n"}, True),
+    ("a second top-level fn main in src/main.rs forfeits the allowlist", {"src/main.rs":
+        "fn main() {\n    crate::config::set_active_permissions_mode(m);\n}\nfn main() {}\n"}, True),
+    ("a test that calls main() forfeits the allowlist", {"src/main.rs":
+        "fn main() {\n    crate::config::set_active_permissions_mode(m);\n}\n"
+        "#[cfg(test)]\nmod tests {\n    #[test]\n    fn t() {\n        super::main();\n    }\n}\n"}, True),
+    ("main passed as a value forfeits the allowlist", {"src/main.rs":
+        "fn main() {\n    crate::config::set_active_permissions_mode(m);\n}\n"
+        "#[cfg(test)]\nmod tests {\n    #[test]\n    fn t() {\n        std::thread::spawn(main);\n    }\n}\n"}, True),
+    ("#[::core::prelude::v1::test] fn main is a test (refused)", {"src/main.rs":
+        f"#[::core::prelude::v1::test]\nfn main() {{\n    {W}\n}}\n"}, True),
+    ("#[r#test] fn main is a test (refused)", {"src/main.rs":
+        f"#[r#test]\nfn main() {{\n    {W}\n}}\n"}, True),
+    ("a renamed test attribute (`use .. test as check`) on fn main is a test (refused)", {"src/main.rs":
+        f"use core::prelude::v1::test as check;\n#[check]\nfn main() {{\n    {W}\n}}\n"}, True),
+    # ---- #4777: a cfg'd guard binding is not held ----
+    ("a guard binding under #[cfg(any())] is not held", {"src/cb1.rs": tm(
+        t_fn(f"        #[cfg(any())]\n        {L}\n        {W}"))}, True),
+    ("a guard binding under #[cfg(not(test))] is not held", {"src/cb2.rs": tm(
+        t_fn(f"        #[cfg(not(test))]\n        {L}\n        {W}"))}, True),
+    ("a guard binding under cfg_attr is not held (fail closed)", {"src/cb3.rs": tm(
+        t_fn(f"        #[cfg_attr(test, allow(unused))]\n        {L}\n        {W}"))}, True),
+    # ---- #4778: every literal prefix is lexed ----
+    ("a cr#\"..\"# literal containing a quote cannot hide code", {"src/lx1.rs": tm(
+        t_fn(f"        let _s = cr#\"\"\"#;\n        {W}\n        let _t = \"\";"))}, True),
+    ("a cr##\"..\"## literal cannot hide code", {"src/lx2.rs": tm(
+        t_fn(f"        let _s = cr##\"a\"#\"##;\n        {W}\n        let _t = \"\";"))}, True),
+    ("writer names inside c\"..\", br\"..\", cr#\"..\"# and b'..' literals are ignored", {"src/lx3_tests.rs":
+        "fn t() {\n    let _a = c\"set_active_permissions_mode(x)\";\n"
+        "    let _b = br\"override_active_permissions_mode_for_test(y)\";\n"
+        "    let _c = cr#\"clear_permissions_mode_override_for_test()\"#;\n    let _d = b'\"';\n}\n"}, False),
+    ("a b'\"' byte literal does not open a string", {"src/lx4.rs": tm(
+        t_fn(f"        let _b = b'\"';\n        {W}\n        let _t = \"\";"))}, True),
+    # ---- #4779: token pasting is refused outright ----
+    ("paste! building the slot name is refused", {"src/pa1.rs": tm(
+        t_fn(f"        {L}\n        paste::paste! {{ *[<ACTIVE_ PERMISSIONS_MODE>].write().unwrap() = None; }}"))}, True),
+    ("paste! building a writer name is refused", {"src/pa2.rs": tm(
+        t_fn("        paste::paste! { [<set_active_ permissions_mode>](m); }"))}, True),
+    ("concat_idents! is refused", {"src/pa3.rs": tm(
+        t_fn("        concat_idents!(set_active_, permissions_mode)(m);"))}, True),
+    ("a renamed import of paste is refused", {"src/pa4.rs": "use paste::paste as p;\n"}, True),
 ]
+
+
+LOCK_DEF = f"pub fn {LOCK}() -> {GT} {{\n    M.lock().unwrap_or_else(|e| e.into_inner())\n}}\n"
+
+
+def scan_rc(top: pathlib.Path, files: Dict[str, str], root: str, require: bool = False) -> int:
+    """Build `files` under `top`, scan `top/root` as main() would: 0 clean, 1 refused, 2 GateError."""
+    global REPO_ROOT
+    for rel, content in files.items():
+        q = top / rel
+        q.parent.mkdir(parents=True, exist_ok=True)
+        q.write_text(content, encoding="utf-8")
+    saved, REPO_ROOT = REPO_ROOT, top
+    try:
+        return 1 if scan(rust_files([top / root]), require_slot=require) else 0
+    except GateError:
+        return 2
+    finally:
+        REPO_ROOT = saved
 
 
 def extra_checks(work: pathlib.Path) -> List[Tuple[str, Callable[[], bool]]]:
@@ -1267,23 +1859,93 @@ def extra_checks(work: pathlib.Path) -> List[Tuple[str, Callable[[], bool]]]:
             res = []
             for n in (0, 2):
                 decl = "static ACTIVE_PERMISSIONS_MODE: u8 = 0;\n" * n
-                cfg.write_text(decl + "pub fn f() {}\n", encoding="utf-8")
+                cfg.write_text(decl + LOCK_DEF, encoding="utf-8")
                 try:
                     scan(rust_files([top / "src"]), require_slot=True)
                     res.append(False)
                 except GateError:
                     res.append(True)
-            cfg.write_text("static ACTIVE_PERMISSIONS_MODE: u8 = 0;\n", encoding="utf-8")
+            cfg.write_text("static ACTIVE_PERMISSIONS_MODE: u8 = 0;\n" + LOCK_DEF, encoding="utf-8")
             res.append(scan(rust_files([top / "src"]), require_slot=True) == [])
         finally:
             REPO_ROOT = saved
         return all(res)
+
+    def lock_declared_exactly_once() -> bool:
+        # #4776: src/config.rs defining the lock 0 or 2 times exits 2; exactly once is clean.
+        top = work / "x_lock"
+        res = []
+        for n in (0, 2, 1):
+            files = {"src/config.rs": "static ACTIVE_PERMISSIONS_MODE: u8 = 0;\n" + LOCK_DEF * n}
+            res.append(scan_rc(top / f"n{n}", files, "src", require=True) == (0 if n == 1 else 2))
+        return all(res)
+
+    def unreadable_dir_exit2() -> bool:
+        # #4774: a directory that cannot be listed is never silently skipped.
+        top = work / "x_unreaddir"
+        sub = top / "src" / "locked"
+        sub.mkdir(parents=True, exist_ok=True)
+        (sub / "hidden.rs").write_text(tm(t_fn(W)), encoding="utf-8")
+        (top / "src" / "ok.rs").write_text("pub fn f() {}\n", encoding="utf-8")
+        os.chmod(str(sub), 0)
+        try:
+            if os.access(str(sub), os.R_OK):
+                return True  # running as root: the shape cannot be built, nothing to prove
+            return scan_rc(top, {}, "src") == 2
+        finally:
+            os.chmod(str(sub), 0o755)
+
+    def symlink_dir_exit2() -> bool:
+        # #4775: a symlinked directory exits 2 (its target is outside what the root names).
+        top = work / "x_symdir"
+        (top / "elsewhere").mkdir(parents=True, exist_ok=True)
+        (top / "elsewhere" / "w.rs").write_text(tm(t_fn(W)), encoding="utf-8")
+        (top / "src").mkdir(parents=True, exist_ok=True)
+        (top / "src" / "ok.rs").write_text("pub fn f() {}\n", encoding="utf-8")
+        link = top / "src" / "linked"
+        if not link.exists():
+            link.symlink_to(top / "elsewhere", target_is_directory=True)
+        return scan_rc(top, {}, "src") == 2
+
+    def path_mod_is_followed() -> bool:
+        # #4775: `#[path = ".."] mod x;` outside the scan root is part of the compiled set.
+        files = {"src/lib.rs": "#[cfg(test)]\n#[path = \"../tests/unit/x_4775.rs\"]\nmod x_4775;\n",
+                 "tests/unit/x_4775.rs": tm(t_fn(W))}
+        return scan_rc(work / "x_pathmod", files, "src") == 1
+
+    def plain_mod_is_followed() -> bool:
+        # #4775: `mod a;` resolves a/b.rs through the inline-module chain of the parent.
+        files = {"src/lib.rs": "mod outer {\n    mod inner;\n}\n",
+                 "src/outer/inner.rs": tm(t_fn(W))}
+        return scan_rc(work / "x_plainmod", files, "src/lib.rs") == 1
+
+    def include_is_followed() -> bool:
+        # #4775: include!("x.inc") compiles the file in; a write inside it is checked.
+        files = {"src/lib.rs": "include!(\"gen/x.inc\");\n", "src/gen/x.inc": tm(t_fn(W))}
+        return scan_rc(work / "x_include", files, "src") == 1
+
+    def include_nonliteral_exit2() -> bool:
+        files = {"src/lib.rs": "include!(concat!(env!(\"OUT_DIR\"), \"/x.rs\"));\n"}
+        return scan_rc(work / "x_inclcomp", files, "src") == 2
+
+    def unresolved_mod_exit2() -> bool:
+        files = {"src/lib.rs": "mod missing_4775;\n"}
+        return scan_rc(work / "x_nomod", files, "src") == 2
 
     return [
         ("tests/src/main.rs under --root tests is not the allowlisted src/main.rs",
          tests_src_main_not_allowlisted),
         ("the slot static declared 0 or 2 times exits 2; exactly once is clean",
          slot_declared_exactly_once),
+        ("the mode lock defined 0 or 2 times in src/config.rs exits 2; once is clean (#4776)",
+         lock_declared_exactly_once),
+        ("an unreadable directory exits 2 (#4774)", unreadable_dir_exit2),
+        ("a symlinked directory exits 2 (#4775)", symlink_dir_exit2),
+        ("a #[path] mod outside the root is scanned (#4775)", path_mod_is_followed),
+        ("a mod inside an inline module chain is scanned (#4775)", plain_mod_is_followed),
+        ("an include!d file is scanned (#4775)", include_is_followed),
+        ("include! of a computed path exits 2 (#4775)", include_nonliteral_exit2),
+        ("a mod that resolves to no file exits 2 (#4775)", unresolved_mod_exit2),
         ("a non-UTF-8 file exits 2 (fail closed)", undecodable_exit2),
         ("an unreadable file (dangling symlink) exits 2 (fail closed)", unreadable_exit2),
         ("`tests` in an ancestor dir does not class src/ as test (root-relative rule)",
