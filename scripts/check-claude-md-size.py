@@ -470,6 +470,37 @@ def refs_errors(root: Path) -> list:
     return errors
 
 
+# R3-F9: live docs (docs/internal, docs/v1.0.0) must not cite a moved section as a CLAUDE.md section. The frozen
+# per-release records (docs/v0.7.0 and older, CHANGELOG.md) quote history and are not scanned.
+CITATION_DIRS = ("docs/internal", "docs/v1.0.0")
+CLAUDE_CITATION = re.compile(r'CLAUDE\.md`?\s+(?:\u00a7\s*)?[\u201c"]([^"\u201d]+)[\u201d"]')
+
+
+def stale_citation_errors(root: Path) -> list:
+    """One message per cited `CLAUDE.md "<heading>"` whose heading now lives in a reference file."""
+    moved = {sub.lstrip("#").strip() for subs in REFERENCE_SUBSECTIONS.values() for sub in subs}
+    errors = []
+    for directory in CITATION_DIRS:
+        base = root / directory
+        if not base.is_dir() or base.is_symlink():
+            continue
+        for path in sorted(base.rglob("*.md")):
+            if path.is_symlink() or not path.is_file():
+                continue
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError as exc:
+                errors.append(f"FAIL: cannot read {path.relative_to(root)}: {exc}")
+                continue
+            for match in CLAUDE_CITATION.finditer(text):
+                if match.group(1).strip() in moved:
+                    line = text.count("\n", 0, match.start()) + 1
+                    errors.append(
+                        f"FAIL: {path.relative_to(root)}:{line} cites CLAUDE.md {match.group(1).strip()!r}, "
+                        "which moved to a docs/reference file; cite the reference file (#4507 R3-F9)")
+    return errors
+
+
 def check(root: Path, index_pins=None) -> list:
     """Return a list of failure messages (empty means pass). `index_pins` is a self-test hook."""
     errors = []
@@ -547,6 +578,7 @@ def check(root: Path, index_pins=None) -> list:
                     "floor (CLAUDE_MD_SECTION_MIN_BYTES); the rule section appears to have been emptied (#4507)"
                 )
     check_index(visible, ref_lines, errors, index_pins)
+    errors += stale_citation_errors(root)
     return errors
 
 
@@ -995,6 +1027,32 @@ def run_cases(base: Path) -> bool:
     (root / claude_md).write_text(text, encoding="utf-8")
     ok &= expect(root, "a malformed index entry", True, "malformed binding-rules index entry")
     ok &= run_ref_cases(fresh, arch, style)
+    ok &= run_citation_cases(fresh)
+    return ok
+
+
+def run_citation_cases(fresh) -> bool:
+    """R3-F9: a live doc citing a moved section as a CLAUDE.md section is refused."""
+    ok = True
+    heading = next(iter(REFERENCE_SUBSECTIONS["ARCHITECTURE_REFERENCE"])).lstrip("#").strip()
+    for directory in CITATION_DIRS:
+        for form in ('CLAUDE.md "{h}" 2', 'CLAUDE.md \u00a7"{h}"', 'CLAUDE.md` \u00a7\u201c{h}\u201d'):
+            root = fresh()
+            doc = root / directory / "nested" / "note.md"
+            doc.parent.mkdir(parents=True)
+            doc.write_text("See " + form.format(h=heading) + ".\n", encoding="utf-8")
+            ok &= expect(root, f"R3-F9 stale citation in {directory} ({form[:14]})", True, "R3-F9")
+    root = fresh()
+    doc = root / "docs" / "internal" / "note.md"
+    doc.parent.mkdir(parents=True)
+    doc.write_text(f'See docs/reference/ARCHITECTURE_REFERENCE.md "{heading}"; CLAUDE.md "Hard rule".\n',
+                   encoding="utf-8")
+    ok &= expect(root, "R3-F9 a citation of the reference file is accepted", False)
+    root = fresh()
+    doc = root / "docs" / "v0.7.0" / "note.md"
+    doc.parent.mkdir(parents=True)
+    doc.write_text(f'CLAUDE.md "{heading}" (frozen record)\n', encoding="utf-8")
+    ok &= expect(root, "R3-F9 a frozen release record is not scanned", False)
     return ok
 
 
