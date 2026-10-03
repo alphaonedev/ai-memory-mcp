@@ -190,6 +190,10 @@ MDEOF
         '<td>src/mcp/tools/recall.rs:2</td>'
     bare_red "a bare anchor with a relative ../ prefix" \
         'See ../src/mcp/tools/recall.rs:2 for it.'
+    bare_red "a bare anchor with a ./ prefix" \
+        'See ./src/mcp/tools/recall.rs:2 here.'
+    bare_red "a bare anchor wrapped in markdown underscore emphasis" \
+        '_src/mcp/tools/recall.rs:2_'
     bare_red "a bare anchor whose permalink pins a branch, not a commit" \
         '<a href="https://github.com/o/r/blob/release/src/mcp/tools/recall.rs#L2">src/mcp/tools/recall.rs:2</a>'
     write_clean
@@ -400,8 +404,10 @@ PATH = re.compile(r"`(?:\.\./)*(src/[A-Za-z0-9_/]+\.rs)`")
 PATHLN = re.compile(r"`(?:\.\./)*(src/[A-Za-z0-9_/]+\.rs):(\d+)")
 # #4651: a BARE `src/x.rs:N` (no leading backtick: plain prose, a link
 # label, HTML text). Not preceded by a backtick (PATHLN owns that form),
-# a path character or a word character, so URL path segments are skipped.
-BARE_LN = re.compile(r"(?<![`/\w.])(?:\.\./)*(src/[A-Za-z0-9_/]+\.rs):(\d+)")
+# a path separator, a dot or an alphanumeric, so URL path segments are
+# skipped; a ./ or ../ prefix is consumed and `_` (markdown emphasis) may
+# precede the path (#4668).
+BARE_LN = re.compile(r"(?<![`/A-Za-z0-9.])(?:\.{1,2}/)*(src/[A-Za-z0-9_/]+\.rs):(\d+)")
 # A bare anchor is exempt ONLY as the label of a link whose target is a
 # commit-pinned permalink (/blob/<7-40 hex>/): immutable, cannot rot.
 PIN_URL = re.compile(r"/blob/[0-9a-f]{7,40}/")
