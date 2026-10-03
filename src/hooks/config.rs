@@ -200,9 +200,10 @@ impl HookConfig {
     /// contrary to explicit scope. This restores the intended semantics.
     ///
     /// Matching (mirrors [`crate::config::TranscriptsConfig::auto_extract_for`]):
-    /// a `*` (or empty) pattern matches everything — the schema default, so a
-    /// config that already uses `namespace = "*"` is byte-identical to the
-    /// pre-fix behaviour. A non-wildcard pattern matches EXACTLY, or as a
+    /// a `*` pattern matches everything (the field is required, so there is no
+    /// schema default; load-time validation rejects empty, and an empty pattern
+    /// still matches all here, defensively), so a config that already uses
+    /// `namespace = "*"` is byte-identical to the pre-fix behaviour. A non-wildcard pattern matches EXACTLY, or as a
     /// `prefix/*` glob (the prefix itself and any child under `prefix/`). A
     /// scoped hook fired against a payload that carries NO namespace (`None` —
     /// eviction / some recall shapes) does NOT fire: the operator scoped it to
@@ -976,7 +977,7 @@ namespace = "team/*"
             fail_mode: FailMode::Open,
         };
 
-        // Wildcard (schema default) matches every namespace AND a
+        // Wildcard (explicit; the field is required) matches every namespace AND a
         // namespace-less payload (byte-identical to the pre-fix behaviour).
         assert!(mk("*").matches_namespace(Some("anything")));
         assert!(mk("*").matches_namespace(None));
