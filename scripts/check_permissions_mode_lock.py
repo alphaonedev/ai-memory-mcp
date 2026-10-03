@@ -16,14 +16,22 @@ WRITERS (the three functions in src/config.rs that mutate the slot):
   clear_permissions_mode_override_for_test.
 The lock: lock_permissions_mode_for_test.
 
-WHO MAY WRITE WITHOUT THE LOCK (fail closed: an allowlist of exact (file, fn) pairs, not a
-classification of lines). ``main`` in src/main.rs (the boot setter) and
-``override_active_permissions_mode_for_test`` in src/config.rs (the alias that forwards to the
-setter). Every other writer call in the scanned tree is checked, whatever the #3623 test/production
+THE SLOT ITSELF (#4763). The static behind the setters, ``ACTIVE_PERMISSIONS_MODE`` in
+src/config.rs, is modelled too: any mention of it that is not its declaration or a ``.read()`` is a
+write and is checked like a writer call. The scan exits 2 if src/config.rs is scanned and the static
+is not declared exactly once.
+
+WHO MAY WRITE WITHOUT THE LOCK (fail closed: an allowlist of exact (repo-relative file, TOP-LEVEL
+fn) pairs, not a classification of lines). ``main`` in src/main.rs (the boot setter), and in
+src/config.rs the alias ``override_active_permissions_mode_for_test`` plus the two bodies that touch
+the slot, ``set_active_permissions_mode`` and ``clear_permissions_mode_override_for_test``. The path
+is compared against the repository-relative path only (``tests/src/main.rs`` is not ``src/main.rs``)
+and the fn must sit at brace depth 0 (a ``fn main`` in a test module or an impl is not the boot
+setter, #4764). Every other writer call in the scanned tree is checked, whatever the #3623 test/production
 boundary says about its line, so a ``#[test]`` fn on a line the boundary mis-classes as production
 (src/bench.rs, #4755), a ``#[cfg(any(test, ..))]`` item, or a test module in a separately named
-file cannot hide a write. A fn carrying ``#[test]`` / ``#[tokio::test]`` / ``#[sqlx::test]`` is never
-allowlisted.
+file cannot hide a write. A fn carrying ``#[test]`` / ``#[tokio::test]`` / ``#[sqlx::test]``, or the same through
+``#[cfg_attr(<cond>, test)]``, is never allowlisted.
 
 RULE, per writer call that is not allowlisted: the enclosing fn must hold a LIVE guard at that call.
 A guard is live when ALL of these hold:
@@ -33,12 +41,21 @@ A guard is live when ALL of these hold:
   2. the binding statement ends before the writer call and the writer call sits inside the block
      the guard is bound in (a guard bound in an inner block that has closed, in a branch not
      taken, or in a closure that is not the writer's, covers nothing outside it);
-  3. there is no ``drop(<ident>)`` between the binding and the writer call.
+  3. the guard identifier is not mentioned again between the binding and the writer call: a later
+     mention (``drop(g)``, a rebind, a move into a Vec / struct / inner block, a reassignment, a
+     by-value pass) may end the guard's life, so the guard's cover ends at its next mention after
+     binding (fail closed; live code never mentions the guard again);
+  4. a writer call inside the argument of ``spawn`` / ``spawn_blocking`` / ``spawn_local`` /
+     ``spawn_scoped`` (thread, tokio, ``Builder``) may run after the spawner's guard is released, so
+     it is covered only by a guard acquired INSIDE that argument or moved INTO it (a ``move``
+     closure that rebinds the guard, or borrows it with ``&``, and does not mention it again).
 Every writer call in the fn is checked, not only the first.
 A DELEGATE is a fn that returns the guard to its caller: its return type is ``MutexGuard<..>`` or a
-struct that owns one, it binds the lock (or another delegate) as in 1., and that binding is used
-again after the statement (moved into the return value) without a ``drop``. A helper that locks and
-releases on return (unit return) is NOT a delegate. Delegates are derived by a fixpoint over the
+struct that owns one, it binds the lock (or another delegate) as in 1. in its own top-level block,
+and its tail expression and every ``return`` operand yield that binding (the bare identifier, or a
+struct literal / tuple struct of a guard-owning type built from it); every mention of the binding
+must sit in such an operand. Returning ``None`` / ``Some(..)``, another guard, or a borrow of the
+guard does not qualify. A helper that locks and releases on return (unit return) is NOT a delegate. Delegates are derived by a fixpoint over the
 scanned tree; the name counts only when EVERY fn carrying it qualifies (one unlocked homonym
 disqualifies it).
 A ``fn drop`` in ``impl Drop for T`` may reset the mode without a binding when T is a struct (a
@@ -66,8 +83,8 @@ nor satisfies the rule.
 SCOPE, stated honestly: roots default to ``src`` (lib tests, which share one process and are the
 #4468 shape). Integration binaries under tests/ are NOT scanned by default (``--root tests`` scans
 them; 38 unlocked writes in 25 files on 5f66513a1, tracked as #4754). The check is lexical and
-name-based: it does not model moves of the guard into another owner, shadowing, or control flow
-beyond the brace structure.
+name-based: it does not follow the guard into another owner (a mention ends its cover instead), or control flow
+beyond the brace structure and the guard's mentions.
 
 Usage:
   scripts/check_permissions_mode_lock.py              # scan src/ -- exit 1 on any violation
@@ -95,23 +112,34 @@ WRITERS = (
     "clear_permissions_mode_override_for_test",
 )
 LOCK = "lock_permissions_mode_for_test"
+# The static behind the setters (src/config.rs). A mention of it that is not a read is a write of
+# the slot itself and is modelled exactly like a writer call (#4763).
+SLOT = "ACTIVE_PERMISSIONS_MODE"
+SLOT_READ = re.compile(r"\s*\.\s*(?:try_)?read\s*\(")
 
 # Production writers allowed without the lock: (path relative to the scan root or its parent, fn).
+# Only a TOP-LEVEL fn of that name in that file counts (#4764): not a nested or test-module fn.
 ALLOWED_WRITERS = (
     ("src/main.rs", "main"),
     ("src/config.rs", "override_active_permissions_mode_for_test"),
+    ("src/config.rs", "set_active_permissions_mode"),
+    ("src/config.rs", "clear_permissions_mode_override_for_test"),
 )
 
 STEM_TEST = re.compile(r"(^|_)tests?(_|$)")
 TEST_ATTR = re.compile(r"#\s*\[\s*(?:\w+\s*::\s*)*(?:test|rstest|test_case)\b")
+CFG_ATTR = re.compile(r"#\s*\[\s*cfg_attr\s*\(")
+TEST_ITEM = re.compile(r"^(?:\w+\s*::\s*)*(?:test|rstest|test_case)\b")
 
 # Check names, for --mutation-sweep: disabling any ONE must turn the self-test red.
 CHECKS = (
     "lexer", "no_enclosing_fn", "all_lines", "allowlist_path", "allowlist_test_attr",
-    "top_level_binding", "bound_ident", "lock_before_write", "drop_check", "each_write",
-    "delegate_return_type", "delegate_guard_moved", "delegate_homonym", "fixpoint",
+    "top_level_binding", "bound_ident", "lock_before_write", "each_write",
+    "delegate_return_type", "delegate_return_expr", "delegate_homonym", "fixpoint",
     "drop_mode_guard", "alias_use", "alias_value", "tests_dir_relative", "strict_read",
-    "boundary_note",
+    "boundary_note", "mention_ends_cover", "spawn_refuse", "spawn_moved_in_strict",
+    "cfg_attr_test", "repo_relative_allowlist", "allowlist_top_level", "slot_write",
+    "slot_decl_once",
 )
 DISABLED: Set[str] = set()
 
@@ -139,6 +167,53 @@ def rel_forms(path: pathlib.Path) -> Tuple[str, str]:
     except ValueError:
         return path.as_posix(), path.as_posix()
     return a, b
+
+
+# Repository root for the exact-path allowlist (set by main(), and per fixture by the self-test).
+REPO_ROOT: Optional[pathlib.Path] = None
+
+
+def repo_rel(path: pathlib.Path) -> Optional[str]:
+    """Posix path of `path` relative to the repository root, or None if it is not under it."""
+    if REPO_ROOT is None:
+        return None
+    for a, b in ((path, REPO_ROOT), (path.resolve(), REPO_ROOT.resolve())):
+        try:
+            return a.relative_to(b).as_posix()
+        except ValueError:
+            continue
+    return None
+
+
+def has_test_attribute(seg: str) -> bool:
+    """`seg` (the attribute run before a fn) carries a test attribute, directly or through
+    ``#[cfg_attr(<cond>, .., test, ..)]`` (the condition itself does not count)."""
+    if TEST_ATTR.search(seg):
+        return True
+    if not on("cfg_attr_test"):
+        return False
+    for m in CFG_ATTR.finditer(seg):
+        close = match_paren(seg, m.end() - 1)
+        for item in split_top(seg[m.end():close - 1])[1:]:
+            if TEST_ITEM.match(item.strip()):
+                return True
+    return False
+
+
+def split_top(s: str) -> List[str]:
+    """Split on commas that are not nested in (), [], {}."""
+    parts: List[str] = []
+    depth, last = 0, 0
+    for k, ch in enumerate(s):
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            parts.append(s[last:k])
+            last = k + 1
+    parts.append(s[last:])
+    return parts
 
 
 def in_tests_dir(path: pathlib.Path) -> bool:
@@ -325,7 +400,7 @@ def find_fns(text: str, line_starts: List[int], mask: List[bool], path: pathlib.
                 in_drop = t
         seg_start = max(text.rfind(";", 0, m.start()), text.rfind("{", 0, m.start()),
                         text.rfind("}", 0, m.start())) + 1
-        has_attr = bool(TEST_ATTR.search(text[seg_start:m.start()]))
+        has_attr = has_test_attribute(text[seg_start:m.start()])
         fns.append(Fn(m.group(1), path, m.start(), body_open, match_brace(text, body_open),
                       mask[line], in_drop, text[m.end():body_open], has_attr))
     return fns
@@ -497,11 +572,21 @@ def lock_bindings(fm: FileModel, f: Fn, lockers: Set[str]) -> List[Binding]:
     return found
 
 
-def dropped(text: str, ident: Optional[str], a: int, b: int) -> bool:
-    if ident is None or not on("drop_check"):
-        return False
-    return re.search(r"\bdrop\s*\(\s*(?:&\s*mut\s+|&\s*)?" + re.escape(ident) + r"\b",
-                     text[a:b]) is not None
+def mentions(text: str, ident: str, a: int, b: int) -> List["re.Match[str]"]:
+    return list(re.finditer(r"\b" + re.escape(ident) + r"\b", text[a:b]))
+
+
+def cover_end(fm: FileModel, b: Binding) -> int:
+    """Where the binding stops covering writes: its block's end, or (N1) its next mention.
+
+    Any later mention of the guard identifier -- `drop(g)`, a rebind, a move into a Vec / struct /
+    inner block, a reassignment -- may end the guard's life, and a lexical gate cannot follow it,
+    so cover ends there (fail closed). Live code never mentions the guard again after binding it.
+    """
+    if b.ident is None or not on("mention_ends_cover"):
+        return b.scope_end
+    found = mentions(fm.text, b.ident, b.end, b.scope_end)
+    return b.end + found[0].start() if found else b.scope_end
 
 
 def guard_live_at(fm: FileModel, bindings: List[Binding], write: int) -> bool:
@@ -510,10 +595,66 @@ def guard_live_at(fm: FileModel, bindings: List[Binding], write: int) -> bool:
             continue
         if on("top_level_binding") and write >= b.scope_end:
             continue  # the guard's block closed before this write
-        if dropped(fm.text, b.ident, b.end, write):
-            continue
+        if write >= cover_end(fm, b):
+            continue  # the guard was mentioned (moved / dropped / reassigned) before this write
         return True
     return False
+
+
+SPAWN_RE = re.compile(r"\bspawn(?:_[A-Za-z0-9_]+)?\s*\(")
+REBIND_RE = re.compile(r"\blet\s+(?:mut\s+)?([A-Za-z_]\w*)\s*(?::[^=;]*)?=\s*$")
+
+
+def spawn_spans(fm: FileModel, f: Fn) -> List[Tuple[int, int]]:
+    """(open paren, one past close paren) of every spawn / spawn_blocking / spawn_local .. call."""
+    out: List[Tuple[int, int]] = []
+    for m in SPAWN_RE.finditer(fm.text, f.open_off + 1, f.close_off):
+        if re.search(r"\bfn\s+$", fm.text[max(0, m.start() - 12):m.start()]):
+            continue
+        a = m.end() - 1
+        out.append((a, match_paren(fm.text, a)))
+    return out
+
+
+def moved_into_spawn(fm: FileModel, b: Binding, a: int, c: int, write: int) -> bool:
+    """The outer guard `b` is moved into the spawn argument (a, c) and still held at `write`."""
+    if b.ident is None or b.end > a or a >= b.scope_end:
+        return False
+    found = mentions(fm.text, b.ident, b.end, b.scope_end)
+    if not found:
+        return False
+    first = b.end + found[0].start()
+    if not (a < first < write < c):
+        return False
+    if not on("spawn_moved_in_strict"):
+        return True
+    if not re.search(r"\bmove\b", fm.text[a:first]):
+        return False  # a non-`move` closure borrows the guard; the task may outlive it
+    before = fm.text[max(a, first - 80):first]
+    after = fm.text[first + len(b.ident):first + len(b.ident) + 8].lstrip()
+    reb = REBIND_RE.search(before)
+    if reb is not None and after.startswith(";"):
+        # `let k = g;` -- the new owner must live to the write and be unmentioned before it
+        spans = [(o, e) for o, e in brace_spans(fm.text, a, c) if o < first < e]
+        blk_end = min((e for o, e in spans), default=c)
+        return write < blk_end and not mentions(fm.text, reb.group(1), first, write)
+    if re.search(r"&\s*(?:mut\s+)?$", before) and not mentions(fm.text, b.ident, first + 1, write):
+        return True  # `&g` / `&mut g` inside a `move` closure keeps the captured guard alive
+    return False
+
+
+def covered(fm: FileModel, f: Fn, bindings: List[Binding], write: int) -> bool:
+    """A live guard at `write`; a write inside a spawn(..) argument may run after the spawner's
+    guard is released, so there the guard must be acquired inside the closure or moved into it."""
+    spans = [(a, c) for a, c in spawn_spans(fm, f) if a < write < c] if on("spawn_refuse") else []
+    if not spans:
+        return guard_live_at(fm, bindings, write)
+    for a, c in spans:
+        ok = any(guard_live_at(fm, [b], write) for b in bindings if b.end > a) or \
+            any(moved_into_spawn(fm, b, a, c, write) for b in bindings)
+        if not ok:
+            return False
+    return True
 
 
 # --------------------------------------------------------------------------------------------
@@ -522,6 +663,80 @@ def guard_live_at(fm: FileModel, bindings: List[Binding], write: int) -> bool:
 class Delegates(NamedTuple):
     names: Set[str]
     types: Set[str]  # struct names returned by a qualifying delegate
+
+
+def tail_expr(body: str) -> str:
+    """The trailing expression of a block body: the text after the last depth-0 `;`, or after a
+    depth-0 block statement `{..}` that something still follows (so `if c { return g; } g` -> `g`,
+    while a trailing struct literal `S { m: g }` stays whole)."""
+    depth, last = 0, -1
+    for k, ch in enumerate(body):
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+            if ch == "}" and depth == 0 and body[k + 1:].strip():
+                last = k
+        elif ch == ";" and depth == 0:
+            last = k
+    return body[last + 1:].strip()
+
+
+def return_operands(fm: FileModel, f: Fn) -> List[Tuple[int, int]]:
+    """(start, end) of the operand of every `return` in f (nested fns excluded)."""
+    out: List[Tuple[int, int]] = []
+    for m in re.finditer(r"\breturn\b", fm.text[f.open_off + 1:f.close_off]):
+        start = f.open_off + 1 + m.end()
+        if innermost(fm.fns, start) is not f:
+            continue
+        depth, k = 0, start
+        while k < f.close_off:
+            ch = fm.text[k]
+            if ch in "([{":
+                depth += 1
+            elif ch in ")]}":
+                depth -= 1
+                if depth < 0:
+                    break
+            elif ch == ";" and depth == 0:
+                break
+            k += 1
+        out.append((start, k))
+    return out
+
+
+def yields_guard(expr: str, ident: str, guard_types: Set[str]) -> bool:
+    """`expr` is the guard itself, or a struct (of a guard-owning type) built from it."""
+    e = expr.strip()
+    if e == ident:
+        return True
+    m = re.match(r"^([A-Za-z_]\w*)\s*\{(.*)\}$", e, re.S)
+    if m and (m.group(1) in guard_types or m.group(1) == "Self"):
+        return any(re.fullmatch(r"(?:\w+\s*:\s*)?" + re.escape(ident), p.strip())
+                   for p in split_top(m.group(2)))
+    m = re.match(r"^([A-Za-z_]\w*)\s*\((.*)\)$", e, re.S)
+    if m and (m.group(1) in guard_types or m.group(1) == "Self"):
+        return any(p.strip() == ident for p in split_top(m.group(2)))
+    return False
+
+
+def returns_guard(fm: FileModel, f: Fn, b: Binding, guard_types: Set[str]) -> bool:
+    """Every path of f (its tail expression and each `return`) yields the guard bound by b."""
+    if b.ident is None or b.scope_end != f.close_off:
+        return False  # the guard must live in the fn's own top-level block
+    body = fm.text[f.open_off + 1:f.close_off - 1]
+    tail = tail_expr(body)
+    if not tail or not yields_guard(tail, b.ident, guard_types):
+        return False
+    tail_at = f.open_off + 1 + body.rfind(tail)
+    spans = [(tail_at, tail_at + len(tail))]
+    for a, c in return_operands(fm, f):
+        if not yields_guard(fm.text[a:c], b.ident, guard_types):
+            return False
+        spans.append((a, c))
+    total = mentions(fm.text, b.ident, b.end, f.close_off)
+    inside = [m for m in total if any(a <= b.end + m.start() < c for a, c in spans)]
+    return len(total) == len(inside)  # any other mention (&g, drop, reassignment) disqualifies
 
 
 def qualifies(fm: FileModel, f: Fn, lockers: Set[str], guard_types: Set[str]) -> Optional[str]:
@@ -533,15 +748,8 @@ def qualifies(fm: FileModel, f: Fn, lockers: Set[str], guard_types: Set[str]) ->
         if not ok:
             return None
     binds = lock_bindings(fm, f, lockers)
-    if on("delegate_guard_moved"):
-        moved = False
-        for b in binds:
-            if b.ident is None:
-                continue
-            if (re.search(r"\b" + re.escape(b.ident) + r"\b", fm.text[b.end:b.scope_end])
-                    and not dropped(fm.text, b.ident, b.end, b.scope_end)):
-                moved = True
-        if not moved:
+    if on("delegate_return_expr"):
+        if not any(returns_guard(fm, f, b, guard_types) for b in binds):
             return None
     elif not binds:
         return None
@@ -600,17 +808,48 @@ def writer_refs(fm: FileModel) -> Tuple[List[int], List[Tuple[int, str]]]:
                 calls.append(off)
             elif on("alias_value"):
                 bad.append((off, f"writer {w} used as a value (alias / fn pointer)"))
+    if on("slot_write"):
+        for m in re.finditer(r"\b" + SLOT + r"\b", fm.text):
+            off = m.start()
+            if any(a <= off < b for a, b in spans):
+                continue
+            if re.search(r"\bstatic\s+$", fm.text[max(0, off - 12):off]):
+                continue  # the declaration itself
+            if SLOT_READ.match(fm.text, m.end()):
+                continue  # a read of the slot is not a write
+            calls.append(off)
     return sorted(calls), sorted(bad)
+
+
+def brace_depth_at(text: str, off: int) -> int:
+    return text.count("{", 0, off) - text.count("}", 0, off)
 
 
 def allowed_writer(fm: FileModel, f: Fn) -> bool:
     if f.has_test_attr and on("allowlist_test_attr"):
         return False
-    rels = rel_forms(fm.path)
+    if on("repo_relative_allowlist"):
+        here = repo_rel(fm.path)
+        forms: Tuple[str, ...] = () if here is None else (here,)
+    else:
+        forms = rel_forms(fm.path)
     for path, name in ALLOWED_WRITERS:
-        if f.name == name and (not on("allowlist_path") or path in rels):
+        if f.name == name and (not on("allowlist_path") or path in forms):
+            if on("allowlist_top_level") and brace_depth_at(fm.text, f.kw_off) != 0:
+                continue
             return True
     return False
+
+
+def check_slot_declared(models: List[FileModel]) -> None:
+    """When src/config.rs is scanned, the slot static must be declared exactly once (else the
+    slot model is blind): fail closed (exit 2) rather than scan a tree the gate cannot vouch for."""
+    if not on("slot_decl_once") or not any(repo_rel(m.path) == "src/config.rs" for m in models):
+        return
+    n = sum(len(re.findall(r"\bstatic\s+" + SLOT + r"\b", m.text)) for m in models)
+    if n != 1:
+        raise GateError(f"the {SLOT} static is declared {n} times in the scanned tree (expected "
+                        f"1): the slot-write model cannot vouch for it")
 
 
 def drop_exempt(f: Fn, dg: Delegates) -> bool:
@@ -624,8 +863,10 @@ def drop_exempt(f: Fn, dg: Delegates) -> bool:
 # --------------------------------------------------------------------------------------------
 # Scan
 # --------------------------------------------------------------------------------------------
-def scan(files: List[pathlib.Path]) -> List[Violation]:
+def scan(files: List[pathlib.Path], require_slot: bool = False) -> List[Violation]:
     models = [load(p) for p in files]
+    if require_slot:
+        check_slot_declared(models)
     dg = compute_delegates(models)
     lockers = {LOCK, *dg.names}
     out: List[Violation] = []
@@ -651,7 +892,7 @@ def scan(files: List[pathlib.Path]) -> List[Violation]:
                 continue
             bindings = lock_bindings(fm, f, lockers)
             for off in (offs if on("each_write") else offs[:1]):
-                if guard_live_at(fm, bindings, off):
+                if covered(fm, f, bindings, off):
                     continue
                 anywhere = [o for g in sorted(lockers)
                             for o in call_offsets(fm.text, g, f.open_off, f.close_off)]
@@ -807,6 +1048,9 @@ FIXTURES: List[Tuple[str, Dict[str, str], bool]] = [
     ("helper that moves the guard into a call but returns unit is not a delegate", {"src/l6.rs": tm(
         f"    fn sneaky() {{ let g = {LK}; consume(g); }}\n"
         + t_fn(f"        let _s = sneaky();\n        {W}"))}, True),
+    ("helper whose return type is not a guard type is not a delegate even if it returns the binding", {"src/l7.rs": tm(
+        f"    fn sneaky() -> u8 {{ let g = {LK}; g }}\n"
+        + t_fn(f"        let _s = sneaky();\n        {W}"))}, True),
     ("helper returning a guard type that never keeps the mode guard is not a delegate", {"src/l5.rs": tm(
         f"    fn sneaky() -> {GT} {{\n        let g = {LK};\n        OTHER.lock().unwrap_or_else(|e| e.into_inner())\n    }}\n"
         + t_fn(f"        let _s = sneaky();\n        {W}"))}, True),
@@ -869,6 +1113,88 @@ FIXTURES: List[Tuple[str, Dict[str, str], bool]] = [
         + t_fn(f"        {L}\n        set_active_permissions_mode(m);"))}, False),
     ("test file under tests/ with an unlocked write is refused", {"tests/x.rs":
         f"#[test]\nfn t() {{\n    {W}\n}}\n"}, True),
+
+    # ---- N1 (#4765): a moved / rebound / dropped / reassigned guard no longer covers ----
+    ("guard rebound then the rebind dropped before the write is refused", {"src/v1.rs": tm(
+        t_fn(f"        {L}\n        let g2 = _g;\n        drop(g2);\n        {W}"))}, True),
+    ("guard moved into a Vec that is dropped before the write is refused", {"src/v2.rs": tm(
+        t_fn(f"        {L}\n        let v = vec![_g];\n        drop(v);\n        {W}"))}, True),
+    ("guard moved into a struct that is dropped before the write is refused", {"src/v3.rs": tm(
+        f"    struct H({GT});\n" + t_fn(f"        {L}\n        let h = H(_g);\n        drop(h);\n        {W}"))}, True),
+    ("guard moved into an inner block that closes before the write is refused", {"src/v4.rs": tm(
+        t_fn(f"        {L}\n        {{ let _m = _g; }}\n        {W}"))}, True),
+    ("guard reassigned (the mode guard dropped) before the write is refused", {"src/v5.rs": tm(
+        t_fn(f"        let mut _g = {LK};\n        _g = OTHER.lock().unwrap_or_else(|e| e.into_inner());\n        {W}"))}, True),
+    ("guard dropped through an aliased mem::drop is refused", {"src/v6.rs": tm(
+        "    use core::mem::drop as release;\n" + t_fn(f"        {L}\n        release(_g);\n        {W}"))}, True),
+    ("std::mem::drop(guard) before the write is refused", {"src/v7.rs": tm(
+        t_fn(f"        {L}\n        std::mem::drop(_g);\n        {W}"))}, True),
+    ("guard mentioned only AFTER the last write (dropped at the end) is accepted", {"src/v8.rs": tm(
+        t_fn(f"        {L}\n        {W}\n        {CLR}\n        drop(_g);"))}, False),
+    # ---- N2 (#4766): a write inside a spawn(..) argument ----
+    ("write in a thread spawned from a block whose guard ended is refused", {"src/w1.rs": tm(
+        t_fn(f"        let h = {{ {L} std::thread::spawn(|| {{ {W} }}) }};\n        h.join().unwrap();"))}, True),
+    ("write in a thread spawned under a guard that is dropped before the join is refused", {"src/w2.rs": tm(
+        t_fn(f"        {L}\n        let h = std::thread::spawn(|| {{ {W} }});\n        drop(_g);\n        h.join().unwrap();"))}, True),
+    ("write in a tokio::spawn task under a guard the task outlives is refused", {"src/w3.rs": tm(
+        t_fn(f"        {L}\n        tokio::spawn(async {{ {W} }});", attr="#[tokio::test]").replace("fn t", "async fn t"))}, True),
+    ("write in spawn_blocking under a guard is refused", {"src/w4.rs": tm(
+        t_fn(f"        {L}\n        tokio::task::spawn_blocking(|| {{ {W} }});"))}, True),
+    ("write in a std::thread::Builder spawn under a guard is refused", {"src/w5.rs": tm(
+        t_fn(f"        {L}\n        std::thread::Builder::new().spawn(|| {{ {W} }}).unwrap();"))}, True),
+    ("a non-move spawn closure that only borrows the guard is refused", {"src/w6.rs": tm(
+        t_fn(f"        {L}\n        std::thread::spawn(|| {{ let _r = &_g; {W} }});"))}, True),
+    ("a move closure that rebinds the guard and drops the rebind is refused", {"src/w7.rs": tm(
+        t_fn(f"        {L}\n        std::thread::spawn(move || {{ let k = _g; drop(k); {W} }});"))}, True),
+    ("a move closure that hands the guard to a fn (may drop it) is refused", {"src/w8.rs": tm(
+        t_fn(f"        {L}\n        std::thread::spawn(move || {{ consume(_g); {W} }});"))}, True),
+    ("guard acquired INSIDE the spawn closure is accepted", {"src/w9.rs": tm(
+        t_fn(f"        std::thread::spawn(|| {{ {L} {W} }}).join().unwrap();"))}, False),
+    ("guard moved INTO a move spawn closure and kept is accepted", {"src/w10.rs": tm(
+        t_fn(f"        {L}\n        std::thread::spawn(move || {{ let _k = _g; {W} }}).join().unwrap();"))}, False),
+    # ---- N3 (#4767): a delegate must yield the mode guard on every path ----
+    ("delegate that borrows the guard and returns an unrelated guard is refused", {"src/y1.rs": tm(
+        f"    fn sneaky() -> {GT} {{ let g = {LK}; let _r = &g; OTHER.lock().unwrap_or_else(|e| e.into_inner()) }}\n"
+        + t_fn(f"        let _s = sneaky();\n        {W}"))}, True),
+    ("delegate returning Some(guard) / None is refused", {"src/y2.rs": tm(
+        f"    fn maybe(c: bool) -> Option<{GT}> {{ let g = {LK}; if c {{ Some(g) }} else {{ None }} }}\n"
+        + t_fn(f"        let _s = maybe(false);\n        {W}"))}, True),
+    ("delegate with an early `return` of another guard is refused", {"src/y3.rs": tm(
+        f"    fn early(c: bool) -> {GT} {{ let g = {LK}; if c {{ return OTHER.lock().unwrap_or_else(|e| e.into_inner()); }} g }}\n"
+        + t_fn(f"        let _s = early(true);\n        {W}"))}, True),
+    ("delegate whose every path (tail and return) yields the guard is accepted", {"src/y4.rs": tm(
+        f"    fn both(c: bool) -> {GT} {{ let g = {LK}; if c {{ return g; }} g }}\n"
+        + t_fn(f"        let _s = both(true);\n        {W}"))}, False),
+    # ---- N4 (#4764): cfg_attr tests, exact top-level allowlist ----
+    ("#[cfg_attr(test, test)] fn main in src/main.rs is refused", {"src/main.rs":
+        f"#[cfg_attr(test, test)]\nfn main() {{\n    {W}\n}}\n"}, True),
+    ("#[cfg_attr(feature, tokio::test)] fn main in src/main.rs is refused", {"src/main.rs":
+        f"#[cfg_attr(feature = \"x\", tokio::test)]\nasync fn main() {{\n    {W}\n}}\n"}, True),
+    ("#[cfg_attr(test, derive(Debug))] on the real fn main is not a test attribute (accepted)", {"src/main.rs":
+        f"#[cfg_attr(test, allow(dead_code))]\nfn main() {{\n    crate::config::set_active_permissions_mode(m);\n}}\n"}, False),
+    ("a nested `fn main` in a cfg(test) module of src/main.rs is refused", {"src/main.rs":
+        f"fn main() {{}}\n#[cfg(test)]\nmod tests {{\n    fn main() {{\n        {W}\n    }}\n}}\n"}, True),
+    ("a `fn main` method in an impl in src/main.rs is refused", {"src/main.rs":
+        f"struct X;\nimpl X {{\n    fn main(&self) {{\n        {W}\n    }}\n}}\n"}, True),
+    # ---- #4763: a direct write to the mode slot ----
+    ("a direct slot .write() in a cfg(test) mod of config.rs is refused", {"src/config.rs":
+        "static ACTIVE_PERMISSIONS_MODE: std::sync::RwLock<Option<u8>> = std::sync::RwLock::new(None);\n"
+        "pub fn set_active_permissions_mode(m: u8) {\n    if let Ok(mut w) = ACTIVE_PERMISSIONS_MODE.write() { *w = Some(m); }\n}\n"
+        "#[cfg(test)]\nmod tests {\n    #[test]\n    fn t() {\n        *ACTIVE_PERMISSIONS_MODE.write().unwrap() = Some(1);\n    }\n}\n"}, True),
+    ("a new raw slot setter fn in config.rs is refused", {"src/config.rs":
+        "static ACTIVE_PERMISSIONS_MODE: std::sync::RwLock<Option<u8>> = std::sync::RwLock::new(None);\n"
+        "pub fn raw(m: u8) {\n    if let Ok(mut w) = ACTIVE_PERMISSIONS_MODE.write() { *w = Some(m); }\n}\n"}, True),
+    ("the slot taken by reference (alias) outside a setter is refused", {"src/config.rs":
+        "static ACTIVE_PERMISSIONS_MODE: std::sync::RwLock<Option<u8>> = std::sync::RwLock::new(None);\n"
+        "pub fn leak() -> &'static std::sync::RwLock<Option<u8>> {\n    &ACTIVE_PERMISSIONS_MODE\n}\n"}, True),
+    ("the slot written in a locked test is accepted", {"src/config.rs":
+        "static ACTIVE_PERMISSIONS_MODE: std::sync::RwLock<Option<u8>> = std::sync::RwLock::new(None);\n"
+        f"#[cfg(test)]\nmod tests {{\n    #[test]\n    fn t() {{\n        {L}\n        *ACTIVE_PERMISSIONS_MODE.write().unwrap() = Some(1);\n    }}\n}}\n"}, False),
+    ("the real setter, clearer and reader of the slot are accepted", {"src/config.rs":
+        "static ACTIVE_PERMISSIONS_MODE: std::sync::RwLock<Option<u8>> = std::sync::RwLock::new(None);\n"
+        "pub fn set_active_permissions_mode(m: u8) {\n    if let Ok(mut w) = ACTIVE_PERMISSIONS_MODE.write() { *w = Some(m); }\n}\n"
+        "pub fn clear_permissions_mode_override_for_test() {\n    if let Ok(mut w) = ACTIVE_PERMISSIONS_MODE.write() { *w = None; }\n}\n"
+        "pub fn active() -> Option<u8> {\n    ACTIVE_PERMISSIONS_MODE.read().ok().and_then(|g| *g)\n}\n"}, False),
 ]
 
 
@@ -912,7 +1238,52 @@ def extra_checks(work: pathlib.Path) -> List[Tuple[str, Callable[[], bool]]]:
         ok = rust_files([d])
         return boundary_gaps(ok) == {f: 2}
 
+    def tests_src_main_not_allowlisted() -> bool:
+        # `--root tests` over tests/src/main.rs: root-relative `src/main.rs` is NOT the repo's.
+        global REPO_ROOT
+        top = work / "x_testsmain"
+        d = top / "tests" / "src"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "main.rs").write_text("fn main() {\n    crate::config::set_active_permissions_mode(m);\n}\n",
+                                   encoding="utf-8")
+        saved, REPO_ROOT = REPO_ROOT, top
+        try:
+            refused = bool(scan(rust_files([top / "tests"])))
+            (top / "src").mkdir(exist_ok=True)
+            (top / "src" / "main.rs").write_text((d / "main.rs").read_text(encoding="utf-8"),
+                                                 encoding="utf-8")
+            accepted = not scan(rust_files([top / "src"]))
+        finally:
+            REPO_ROOT = saved
+        return refused and accepted
+
+    def slot_declared_exactly_once() -> bool:
+        global REPO_ROOT
+        top = work / "x_slot"
+        (top / "src").mkdir(parents=True, exist_ok=True)
+        cfg = top / "src" / "config.rs"
+        saved, REPO_ROOT = REPO_ROOT, top
+        try:
+            res = []
+            for n in (0, 2):
+                decl = "static ACTIVE_PERMISSIONS_MODE: u8 = 0;\n" * n
+                cfg.write_text(decl + "pub fn f() {}\n", encoding="utf-8")
+                try:
+                    scan(rust_files([top / "src"]), require_slot=True)
+                    res.append(False)
+                except GateError:
+                    res.append(True)
+            cfg.write_text("static ACTIVE_PERMISSIONS_MODE: u8 = 0;\n", encoding="utf-8")
+            res.append(scan(rust_files([top / "src"]), require_slot=True) == [])
+        finally:
+            REPO_ROOT = saved
+        return all(res)
+
     return [
+        ("tests/src/main.rs under --root tests is not the allowlisted src/main.rs",
+         tests_src_main_not_allowlisted),
+        ("the slot static declared 0 or 2 times exits 2; exactly once is clean",
+         slot_declared_exactly_once),
         ("a non-UTF-8 file exits 2 (fail closed)", undecodable_exit2),
         ("an unreadable file (dangling symlink) exits 2 (fail closed)", unreadable_exit2),
         ("`tests` in an ancestor dir does not class src/ as test (root-relative rule)",
@@ -933,6 +1304,8 @@ def run_main(argv: List[str]) -> int:
 
 
 def self_test(quiet: bool = False) -> int:
+    global REPO_ROOT
+    saved_root = REPO_ROOT
     base = pathlib.Path(os.environ.get("TMPDIR") or ".local-runs")
     base.mkdir(parents=True, exist_ok=True)
     failures = 0
@@ -946,6 +1319,7 @@ def self_test(quiet: bool = False) -> int:
     try:
         for idx, (label, files_, expect_bad) in enumerate(FIXTURES):
             root = work / f"c{idx}"
+            REPO_ROOT = root
             for rel, content in files_.items():
                 p = root / rel
                 p.parent.mkdir(parents=True, exist_ok=True)
@@ -968,6 +1342,7 @@ def self_test(quiet: bool = False) -> int:
             total += 1
             report(ok, label, "behaved" if ok else "did NOT behave")
     finally:
+        REPO_ROOT = saved_root
         shutil.rmtree(work, ignore_errors=True)
     if not quiet:
         print(f"self-test: {total - failures}/{total} fixtures behaved")
@@ -994,6 +1369,7 @@ def mutation_sweep() -> int:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    global REPO_ROOT
     ap = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     ap.add_argument("--root", action="append", default=None,
                     help="directory or .rs file to scan (repeatable; default: src)")
@@ -1009,6 +1385,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             return self_test()
         if args.mutation_sweep:
             return mutation_sweep()
+        REPO_ROOT = repo
         roots = [pathlib.Path(r) for r in (args.root or [str(repo / "src")])]
         files = rust_files(roots)
         if not files:
@@ -1017,7 +1394,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             return 2
         if args.parity:
             return parity(files, repo)
-        bad = scan(files)
+        bad = scan(files, require_slot=True)
         gaps = boundary_gaps(files)
     except GateError as e:
         print(f"check_permissions_mode_lock: {e}", file=sys.stderr)
