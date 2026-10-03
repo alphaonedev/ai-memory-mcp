@@ -400,9 +400,10 @@ impl HookChain {
         for (hook_index, (cfg, executor)) in prepared.into_iter().enumerate() {
             // FBL-29 — skip a hook whose configured `namespace` pattern does
             // not cover the in-flight namespace. A `*`/empty pattern (the
-            // schema default) matches everything, so configs that don't scope
-            // hooks are byte-identical. A scoped hook no longer fires (Modify /
-            // Deny) in namespaces the operator scoped it OUT of.
+            // field is required, so there is no schema default) matches
+            // everything, so configs that use `*` are byte-identical. A scoped
+            // hook no longer fires (Modify / Deny) in namespaces the operator
+            // scoped it OUT of.
             //
             // #2390 (N9) — the namespace set is now resolved by the CALLER and
             // fixed for the whole chain, so a hook's `Modify` cannot rewrite the
