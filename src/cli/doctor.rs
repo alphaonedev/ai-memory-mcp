@@ -186,6 +186,11 @@ const SECTION_UNSTAMPED_OWNERS: &str = "Unstamped owners (#3124)";
 /// #4285 — corrupt governance standards (resolved as SEVERED, Owner floor).
 const SECTION_CORRUPT_GOVERNANCE: &str = "Corrupt governance standards (#4285)";
 
+/// #4715 — the over-depth governance chain finding. A child module (private
+/// items of this file are visible to it) kept in its own file beside `keys.rs`.
+#[path = "over_depth_4715.rs"]
+mod over_depth_4715;
+
 /// #3264 — anyhow context when the ephemeral probe runtime cannot be built.
 #[cfg(feature = "sal-postgres")]
 const MSG_PG_PROBE_RUNTIME: &str = "build ephemeral runtime for the postgres extension probe";
@@ -1668,6 +1673,10 @@ fn run_local(db_path: &Path, caller_agent_id: Option<&str>) -> Report {
     }
     #[cfg(feature = "sal-postgres")]
     if let Some(pg) = section_postgres_corrupt_governance_4285() {
+        sections.push(pg);
+    }
+    #[cfg(feature = "sal-postgres")]
+    if let Some(pg) = over_depth_4715::section_postgres() {
         sections.push(pg);
     }
 
@@ -3929,7 +3938,19 @@ fn section_governance(conn: &rusqlite::Connection) -> ReportSection {
     facts.push(("capabilities_enabled".into(), cap.enabled.to_string()));
     facts.push(("capability_issuers".into(), cap.issuer_count().to_string()));
 
-    let (with, without) = db::doctor_governance_coverage(conn).unwrap_or((0, 0));
+    // #4715 — surface a coverage read fault instead of reporting 0/0.
+    let (with, without) = match db::doctor_governance_coverage(conn) {
+        Ok(c) => c,
+        Err(e) => {
+            severity = Severity::Critical;
+            facts.push(("governance_coverage_error".into(), format!("{e:#}")));
+            append_note(
+                &mut note,
+                "the namespace governance coverage could not be read (#4715)",
+            );
+            (0, 0)
+        }
+    };
     facts.push(("namespaces_with_policy".into(), with.to_string()));
     facts.push(("namespaces_without_policy".into(), without.to_string()));
 
@@ -3960,7 +3981,25 @@ fn section_governance(conn: &rusqlite::Connection) -> ReportSection {
         );
     }
 
-    let dist = db::doctor_governance_depth_distribution(conn).unwrap_or_default();
+    // #4715 — a read fault is a Critical finding, never an empty histogram.
+    let dist = match db::doctor_governance_depth_distribution(conn) {
+        Ok(d) => d,
+        Err(e) => {
+            severity = Severity::Critical;
+            facts.push(("inheritance_depth_error".into(), format!("{e:#}")));
+            append_note(
+                &mut note,
+                "the namespace inheritance depth histogram could not be read (#4715)",
+            );
+            Vec::new()
+        }
+    };
+    over_depth_4715::apply(
+        db::doctor_over_depth_chains(conn),
+        &mut facts,
+        &mut severity,
+        &mut note,
+    );
     let depth_summary: String = dist
         .iter()
         .enumerate()

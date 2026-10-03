@@ -94,6 +94,41 @@ impl<'a> Graph<'a> {
     }
 }
 
+/// #4715 — one stored explicit chain that already exceeds the bound.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OverDepthChain {
+    /// The root-segment namespace the walk starts at.
+    pub root: String,
+    /// Every explicit hop the walk counted (always greater than
+    /// [`GOVERNANCE_CHAIN_MAX_DEPTH`]).
+    pub hops: usize,
+}
+
+/// #4715 — every stored explicit chain (walked from root segments only, the
+/// same walk and the same every-hop count as the bind check) that is already
+/// past [`GOVERNANCE_CHAIN_MAX_DEPTH`], sorted by root. The bind-time check
+/// (#4492) stops NEW over-depth chains; pre-#4477 data and imported rows can
+/// still hold one, and #4477 refuses every governed operation under it.
+#[must_use]
+pub fn over_depth_chains(rows: &[LinkRow]) -> Vec<OverDepthChain> {
+    let graph = Graph::new(rows);
+    let mut found: Vec<OverDepthChain> = graph
+        .parent
+        .keys()
+        .copied()
+        .filter(|ns| !ns.contains('/'))
+        .filter_map(|start| {
+            let (hops, _) = graph.walk(start);
+            (hops > GOVERNANCE_CHAIN_MAX_DEPTH).then(|| OverDepthChain {
+                root: start.to_string(),
+                hops,
+            })
+        })
+        .collect();
+    found.sort_by(|a, b| a.root.cmp(&b.root));
+    found
+}
+
 /// Would binding `bound` with `new_parent` as its explicit link push an
 /// explicit chain (every hop counted) past the bound? `rows` is the current
 /// `namespace_meta` link graph.
@@ -180,5 +215,26 @@ mod tests {
         // A cycle is not a chain: it terminates.
         let rows = vec![row("a", Some("b")), row("b", Some("a"))];
         assert!(!bind_exceeds_chain_depth(&rows, "a", Some("b")));
+    }
+
+    /// #4715: nine hops from a root segment is flagged, eight is not, a
+    /// slash-named node is never a walk start, and a cycle terminates.
+    #[test]
+    fn over_depth_chains_flags_nine_hops_not_eight_4715() {
+        let nine = chain("c", 0, 9);
+        let found = over_depth_chains(&nine);
+        assert_eq!(
+            found,
+            vec![OverDepthChain {
+                root: "c0".into(),
+                hops: 9
+            }]
+        );
+        assert!(over_depth_chains(&chain("c", 0, 8)).is_empty());
+        let mut slashed = chain("c", 1, 10);
+        slashed.push(row("x/y", Some("c1")));
+        assert!(over_depth_chains(&slashed).iter().all(|c| c.root != "x/y"));
+        let cycle = vec![row("a", Some("b")), row("b", Some("a"))];
+        assert!(over_depth_chains(&cycle).is_empty());
     }
 }
