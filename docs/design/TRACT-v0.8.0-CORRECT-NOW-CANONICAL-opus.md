@@ -1,5 +1,7 @@
 # ai-memory v0.8.0 — What Is Correct Now (Canonical, vs TRACT)
 
+> **Point-in-time record, as of 2026-06-28.** The src/ file:line references in this document describe the source tree at commit `8e30d6a034c8` (read a file there with `git show 8e30d6a034c8:<path>`). They are a dated record and are not maintained, so they may not match the current code.
+
 ### The single reconciled correctness record — adjudicated across Grok and Opus, CodeGraph-anchored, 21-agent-council-reduced.
 
 > **Method.** Four independent assessment passes across two decorrelated model families — Grok/xAI and Opus/Anthropic — measured the definitive design **TRACT** (`docs/design/TRACT-the-definitive-endpoint-ai-memory.md`) against ai-memory **`release/v0.8.0`** and the **`main` ROADMAP.md**: two first-party 21-agent councils, two reconciliations, then a final **21-agent adjudication council** that codegraph-verified every contested anchor (846 files / 27,062 nodes / 92,578 edges). This document is the canonical reduction; it supersedes the prior first-party and reconciliation drafts. Companion: [`TRACT-v0.8.0-DEVELOPMENT-GAPS-CANONICAL-opus.md`](TRACT-v0.8.0-DEVELOPMENT-GAPS-CANONICAL-opus.md).

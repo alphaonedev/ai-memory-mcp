@@ -3,6 +3,8 @@ layout: doc
 ---
 # v0.7.0 Feature Inventory — Net-New from v0.6.4
 
+> **Point-in-time record, as of 2026-05-23.** The src/ file:line references in this document describe the source tree on that date. They are a dated record and are not maintained, so they may not match the current code. No commit is named because a sample of the references did not resolve against a single commit.
+
 > Baseline: **v0.6.4** (tag `v0.6.4`)
 > Target:   **v0.7.0** release HEAD on `release/v0.7.0`
 > Compiled: 2026-05-15 by the AI NHI ship-readiness initiative; re-anchored 2026-05-22 against schema v49 / 73-tool surface during the SR-5 documentation drift sweep; bumped to schema v50 on 2026-05-23 after #1156 per-namespace K8 quota dimension extension landed; re-anchored 2026-06-05 to schema v55 (#1507 drift sweep) after v51 federation_nonces (#1255), v52 transcript_line_dedup (#1389 L4), v53 memories_au FTS5 trigger scoping (#1418), v54 tier-default expiry backfill (#1466), and v55 sargable federation-catchup query + idx_memories_updated_at (#1476) landed; re-anchored 2026-06-15 to schema v57 / 89-route surface (v0.7.1 EPIC drift sweep) after v56 composite list/archive indexes (#1579 A2) and v57 postgres stored generated tsvector (#1579 B2) landed.
