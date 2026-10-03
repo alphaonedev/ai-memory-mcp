@@ -66,7 +66,8 @@ run_posture() {
     AI_MEMORY_AGENT_ID=ai-memory \
     AI_MEMORY_KEY_DIR="$FIX/keys" \
     "$@" \
-    "$bin" doctor --posture enterprise-federation
+    bash -c 'if [ -n "${POSTURE_PASSFILE:-}" ]; then export AI_MEMORY_DB_PASSPHRASE="$(cat "$POSTURE_PASSFILE")"; fi; unset POSTURE_PASSFILE; exec "$@"' \
+    _ "$bin" doctor --posture enterprise-federation
 }
 
 # --- leg 1: bare ---
@@ -125,11 +126,12 @@ else
   [[ -f "$FIX/db-passphrase" ]] || { umask 077; od -An -N32 -tx1 /dev/urandom | tr -d ' \n' > "$FIX/db-passphrase"; }
   # doctor opens the store read-only and refuses to create it: seed the encrypted fixture store first (schema-init).
   [[ -f "$FIX/leg4-sqlcipher.db" ]] || env -i PATH="/usr/bin:/bin:$HOME/.cargo/bin" HOME="$HOME" TMPDIR="$TMPDIR" AI_MEMORY_NO_CONFIG=1 \
-    AI_MEMORY_DB="$FIX/leg4-sqlcipher.db" AI_MEMORY_DB_PASSPHRASE="$(cat "$FIX/db-passphrase")" "$SQLCIPHER_BIN" stats --json >/dev/null 2>&1 || true
+    AI_MEMORY_DB="$FIX/leg4-sqlcipher.db" \
+    bash -c 'export AI_MEMORY_DB_PASSPHRASE="$(cat "$1")"; shift; exec "$@"' _ "$FIX/db-passphrase" "$SQLCIPHER_BIN" stats --json >/dev/null 2>&1 || true
   set +e
   run_posture "$SQLCIPHER_BIN" "${HARD[@]}" \
     AI_MEMORY_DB="$FIX/leg4-sqlcipher.db" \
-    AI_MEMORY_DB_PASSPHRASE="$(cat "$FIX/db-passphrase")" \
+    POSTURE_PASSFILE="$FIX/db-passphrase" \
     AI_MEMORY_REQUIRE_ENTERPRISE_FEDERATION_POSTURE=1 \
     >"$OUT/posture-sqlcipher-pass.out.raw" 2>&1
   e4=$?

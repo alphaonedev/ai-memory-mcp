@@ -282,7 +282,7 @@ write_files:
       [ -x "$BIN" ] || fail "no ai-memory binary at $BIN; scp a --features sal-postgres build over it, then: systemctl restart ai-memory-fed-bootstrap"
       if [ ! -f "$KEY_DIR/$FED_ID.priv" ]; then
         sudo -u aimemory env AI_MEMORY_NO_CONFIG=1 AI_MEMORY_DB=/opt/ai-memory/identity.db \
-          "$BIN" identity generate --agent-id "$FED_ID" --key-dir "$KEY_DIR" \
+          /opt/ai-memory/bin/ai-memory identity generate --agent-id "$FED_ID" --key-dir "$KEY_DIR" \
           || fail "identity generate failed for $FED_ID"
       fi
       cp "$KEY_DIR/$FED_ID.pub" "$FED_DIR/$FED_ID.pub"
@@ -479,22 +479,39 @@ write_files:
       chown aimemory:aimemory /etc/ai-memory/store-url
       chmod 0600 /etc/ai-memory/store-url
 
+      # Fetch ONE full commit and refuse anything else (#4636): a branch or a
+      # re-pointed tag cannot change the code built here and loaded into the
+      # postgres server (shared_preload_libraries).
+      fetch_pinned() { # <url> <dir> <full 40-hex commit>
+        rm -rf "$2" && git init -q "$2" \
+          && git -C "$2" remote add origin "$1" \
+          && git -C "$2" fetch -q --depth 1 origin "$3" \
+          && git -C "$2" checkout -q --detach FETCH_HEAD \
+          && [ "$(git -C "$2" rev-parse HEAD)" = "$3" ] \
+          || { echo "pin mismatch: $1 did not resolve to $3"; return 1; }
+      }
+      # pgvector v0.8.6 (git ls-remote https://github.com/pgvector/pgvector.git
+      # refs/tags/v0.8.6).
+      PGVECTOR_COMMIT=8ee86c96f0fd72390f890aa8a336fda6d3ab4c6c
+      # Apache AGE 1.8.0 for PG18 = tag PG18/v1.8.0-rc0 (AGE tags every release
+      # X.Y.Z-rc0; docs/v1.0.0/release-notes.md:322), the release the certified
+      # pgdg 1.8.0~rc0 package ships (git ls-remote
+      # https://github.com/apache/age.git refs/tags/PG18/v1.8.0-rc0).
+      AGE_COMMIT=e43dc1a12b78fba4acef9835b2b10379b8d243b4
+
       # --- build + install certified pgvector 0.8.6 against PG18 ---
-      # Build the exact certified v0.8.6 tag rather than accepting apt drift.
+      # Build the exact certified v0.8.6 commit rather than accepting apt drift.
       if [ ! -f "$(/usr/bin/pg_config --pkglibdir)/vector.so" ]; then
-        rm -rf /opt/pgvector-src
-        git clone --branch v0.8.6 --depth 1 https://github.com/pgvector/pgvector.git /opt/pgvector-src
+        fetch_pinned https://github.com/pgvector/pgvector.git /opt/pgvector-src "$PGVECTOR_COMMIT"
         cd /opt/pgvector-src
         make PG_CONFIG=/usr/bin/pg_config
         make install PG_CONFIG=/usr/bin/pg_config
       fi
 
-      # --- build + install certified Apache AGE 1.8.0 against PG18 ---
+      # --- build + install Apache AGE 1.8.0 (commit AGE_COMMIT, tag PG18/v1.8.0-rc0, not a branch) against PG18 ---
       if [ ! -f "$(/usr/bin/pg_config --pkglibdir)/age.so" ]; then
-        rm -rf /opt/age-src
-        git clone https://github.com/apache/age.git /opt/age-src
+        fetch_pinned https://github.com/apache/age.git /opt/age-src "$AGE_COMMIT"
         cd /opt/age-src
-        git checkout release/PG18/1.8.0
         # bison 3.8 flags AGE's %pure-parser as deprecated; under -Werror that is
         # fatal (same fix as the f1 macOS tier build). Drop -Werror outright -
         # "-Wno-error=other" is not a valid gcc warning name and fails the build.

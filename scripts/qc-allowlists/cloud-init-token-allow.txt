@@ -1,0 +1,419 @@
+# #4616/#4657 cloud-init token allowlist (5-agent vote (4d3ea1c5), memory 19497ef6).
+# Read by scripts/check-cloud-init-serve-flags.py. One entry per line:
+#   <scope> | <context> | <line>
+# scope: aws-gpu-burst, do-hive (the template directory) or both (must match in both templates).
+# context: top, a top-level key (bootcmd, runcmd, packages, ...) or the write_files path.
+# line: the template's logical line, whitespace-normalised (runs of blanks collapsed, no edge blanks).
+# Adding an entry approves the exact line for review: the gate still runs the companion rule and the
+# validators on it. A malformed, duplicate, non-normalised, unknown-scope or stale entry fails the gate.
+both | top | package_update: true
+do-hive | top | package_upgrade: false
+both | top | bootcmd:
+both | bootcmd | - [bash, -c, "[ -d /etc/ai-memory ] || (umask 077 && mkdir /etc/ai-memory)"]
+aws-gpu-burst | bootcmd | - [bash, -c, "install -d -m 0755 /usr/share/postgresql-common/pgdg && curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc && echo '0144068502a1eddd2a0280ede10ef607d1ec592ce819940991203941564e8e76 /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc' | sha256sum -c - || { rm -f /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc; exit 1; }"]
+do-hive | bootcmd | - [bash, -c, "install -d -m 0755 /usr/share/postgresql-common/pgdg && curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc"]
+both | bootcmd | - [bash, -c, "echo 'deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt noble-pgdg main' > /etc/apt/sources.list.d/pgdg.list && apt-get update"]
+both | top | packages:
+both | packages | - postgresql-18=18.6-1.pgdg24.04+2
+both | packages | - postgresql-server-dev-18=18.6-1.pgdg24.04+2
+do-hive | packages | - pgbouncer
+both | packages | - build-essential
+both | packages | - flex
+both | packages | - bison
+both | packages | - libreadline-dev
+both | packages | - zlib1g-dev
+both | packages | - git
+both | packages | - curl
+both | packages | - jq
+aws-gpu-burst | packages | - openssl
+both | top | write_files:
+both | /etc/ai-memory/store-url | - path: /etc/ai-memory/store-url
+both | /etc/ai-memory/store-url | permissions: '0600'
+both | /etc/ai-memory/store-url | owner: root:root
+both | /etc/ai-memory/store-url | content: |
+both | /etc/systemd/system/ai-memory.service | - path: /etc/systemd/system/ai-memory.service
+both | /etc/systemd/system/ai-memory.service | permissions: '0644'
+both | /etc/systemd/system/ai-memory.service | content: |
+both | /etc/systemd/system/ai-memory.service | [Unit]
+aws-gpu-burst | /etc/systemd/system/ai-memory.service | Description=ai-memory MCP daemon (Track E2 burst substrate)
+do-hive | /etc/systemd/system/ai-memory.service | Description=ai-memory daemon (autonomous tier, Track E1 postgres+AGE substrate)
+both | /etc/systemd/system/ai-memory.service | After=postgresql.service network-online.target
+both | /etc/systemd/system/ai-memory.service | Wants=postgresql.service network-online.target
+both | /etc/systemd/system/ai-memory.service | [Service]
+both | /etc/systemd/system/ai-memory.service | Type=simple
+both | /etc/systemd/system/ai-memory.service | User=aimemory
+both | /etc/systemd/system/ai-memory.service | Group=aimemory
+both | /etc/systemd/system/ai-memory.service | WorkingDirectory=/opt/ai-memory
+both | /etc/systemd/system/ai-memory.service | Environment=AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url
+both | /etc/systemd/system/ai-memory.service | Environment=AI_MEMORY_PERMISSIONS_MODE=enforce
+aws-gpu-burst | /etc/systemd/system/ai-memory.service | Environment=AI_MEMORY_AUTONOMOUS_HOOKS=1
+aws-gpu-burst | /etc/systemd/system/ai-memory.service | ExecStart=/usr/local/lib/ai-memory/bin/ai-memory serve --host 0.0.0.0 --port 9077 --tls-cert /etc/ai-memory/tls/node.crt --tls-key /etc/ai-memory/tls/node.key
+do-hive | /etc/systemd/system/ai-memory.service | Environment=AI_MEMORY_AUTONOMOUS_HOOKS=0
+do-hive | /etc/systemd/system/ai-memory.service | Environment=RUST_LOG=ai_memory=info,store::postgres=info
+do-hive | /etc/systemd/system/ai-memory.service | EnvironmentFile=/etc/ai-memory/fed/runtime.env
+both | /etc/systemd/system/ai-memory.service | Restart=on-failure
+do-hive | /etc/systemd/system/ai-memory.service | RestartSec=5
+both | /etc/systemd/system/ai-memory.service | [Install]
+both | /etc/systemd/system/ai-memory.service | WantedBy=multi-user.target
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | - path: /usr/local/sbin/ai-memory-provision.sh
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | permissions: '0700'
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | content: |
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | #!/usr/bin/env bash
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | set -euo pipefail
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | install -m 0600 /dev/null /var/log/ai-memory-provision.log
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | exec >> /var/log/ai-memory-provision.log 2>&1
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | echo "=== ai-memory postgres+AGE+pgvector provision $(date -u) ==="
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | id aimemory >/dev/null 2>&1 || useradd -m -d /opt/ai-memory -s /bin/bash aimemory
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | [ "$(stat -c %U /opt/ai-memory)" = aimemory ] \ || { echo "/opt/ai-memory is not owned by aimemory"; exit 1; }
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | chown root:aimemory /etc/ai-memory
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | chmod 0750 /etc/ai-memory
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | chown aimemory:aimemory /etc/ai-memory/store-url
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | chmod 0600 /etc/ai-memory/store-url
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | fetch_pinned() { # <url> <dir> <full 40-hex commit>
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | rm -rf "$2" && git init -q "$2" \ && git -C "$2" remote add origin "$1" \ && git -C "$2" fetch -q --depth 1 origin "$3" \ && git -C "$2" checkout -q --detach FETCH_HEAD \ && [ "$(git -C "$2" rev-parse HEAD)" = "$3" ] \ || { echo "pin mismatch: $1 did not resolve to $3"; return 1; }
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | }
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | PGVECTOR_COMMIT=8ee86c96f0fd72390f890aa8a336fda6d3ab4c6c
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | AGE_COMMIT=e43dc1a12b78fba4acef9835b2b10379b8d243b4
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | if [ ! -f "$(/usr/bin/pg_config --pkglibdir)/vector.so" ]; then
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | fetch_pinned https://github.com/pgvector/pgvector.git /opt/pgvector-src "$PGVECTOR_COMMIT"
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | cd /opt/pgvector-src
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | make PG_CONFIG=/usr/bin/pg_config
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | make install PG_CONFIG=/usr/bin/pg_config
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | fi
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | if [ ! -f "$(/usr/bin/pg_config --pkglibdir)/age.so" ]; then
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | fetch_pinned https://github.com/apache/age.git /opt/age-src "$AGE_COMMIT"
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | cd /opt/age-src
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | sed -i 's/-Werror//g' Makefile
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | make PG_CONFIG=/usr/bin/pg_config
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | make install PG_CONFIG=/usr/bin/pg_config
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | fi
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | TLSD=/etc/ai-memory/tls
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | PGTLS=/etc/postgresql/18/main/tls
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | PGCA=/run/ai-memory-pgca
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | wipe_pgca() { rm -rf "$PGCA"; }
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | trap wipe_pgca EXIT
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | install -d -o root -g aimemory -m 0750 "$TLSD"
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | rm -f "$TLSD/pg-ca.key" "$TLSD/pg-ca.srl"
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | if [ ! -s "$TLSD/pg-ca.crt" ] || [ ! -s "$PGTLS/server.key" ]; then
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | [ "$(findmnt -n -o FSTYPE --target /run)" = tmpfs ] \ || { echo "/run is not tmpfs: refusing to write the CA key"; exit 1; }
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | [ -z "$(swapon --show --noheadings)" ] \ || { echo "swap is active: refusing to write the CA key"; exit 1; }
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | wipe_pgca
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | install -d -m 0700 "$PGCA"
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | ( umask 077
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | openssl genrsa -out "$PGCA/pg-ca.key" 4096
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | openssl req -x509 -new -key "$PGCA/pg-ca.key" -sha256 -days 365 \ -subj "/CN=ai-memory-burst-pg-CA" -out "$PGCA/pg-ca.crt"
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | openssl genrsa -out "$PGCA/pg-server.key" 2048
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | openssl req -new -key "$PGCA/pg-server.key" -subj "/CN=localhost" \ -out "$PGCA/pg-server.csr"
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | printf 'subjectAltName=DNS:localhost,IP:127.0.0.1,IP:0:0:0:0:0:0:0:1\n' \ > "$PGCA/pg-server.ext"
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | openssl x509 -req -in "$PGCA/pg-server.csr" -CA "$PGCA/pg-ca.crt" \ -CAkey "$PGCA/pg-ca.key" -CAcreateserial -days 365 -sha256 \ -extfile "$PGCA/pg-server.ext" -out "$PGCA/pg-server.crt" ) \ || { echo "could not mint the postgres TLS pair"; exit 1; }
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | install -o root -g aimemory -m 0644 "$PGCA/pg-ca.crt" "$TLSD/pg-ca.crt"
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | install -d -o postgres -g postgres -m 0700 "$PGTLS"
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | install -o postgres -g postgres -m 0600 "$PGCA/pg-server.key" "$PGTLS/server.key"
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | install -o postgres -g postgres -m 0644 "$PGCA/pg-server.crt" "$PGTLS/server.crt"
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | wipe_pgca
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | fi
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | chown root:aimemory "$TLSD/pg-ca.crt"
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | chmod 0644 "$TLSD/pg-ca.crt"
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | PGCONF="/etc/postgresql/18/main/postgresql.conf"
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | if ! grep -q "shared_preload_libraries.*age" "$PGCONF"; then
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | echo "shared_preload_libraries = 'age'" >> "$PGCONF"
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | fi
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | if ! grep -q "^# ai-memory-tls (#4635)" "$PGCONF"; then
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | printf '%s\n' "# ai-memory-tls (#4635)" "ssl = on" \ "ssl_cert_file = '$PGTLS/server.crt'" "ssl_key_file = '$PGTLS/server.key'" \ "ssl_min_protocol_version = 'TLSv1.2'" >> "$PGCONF"
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | fi
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | HBA="/etc/postgresql/18/main/pg_hba.conf"
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | if ! grep -q "^# ai-memory-tls (#4635)" "$HBA"; then
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | { printf '%s\n' "# ai-memory-tls (#4635)" \ "hostssl aimemory aimemory 127.0.0.1/32 scram-sha-256" \ "hostssl aimemory aimemory ::1/128 scram-sha-256" \ "hostnossl aimemory aimemory all reject"
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | cat "$HBA"; } > "$HBA.new"
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | chown --reference="$HBA" "$HBA.new"
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | chmod --reference="$HBA" "$HBA.new"
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | mv "$HBA.new" "$HBA"
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | fi
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | systemctl restart postgresql
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | sleep 5
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | DB_PASS="$(sed -n 's#^postgres://aimemory:\([^@]*\)@.*#\1#p' /etc/ai-memory/store-url)"
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | [ -n "$DB_PASS" ] || { echo "no db password in /etc/ai-memory/store-url"; exit 1; }
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | [ "$DB_PASS" != CHANGEME ] || { echo "placeholder db password in /etc/ai-memory/store-url"; exit 1; }
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | sudo -u postgres psql -tc "SELECT 1 FROM pg_roles WHERE rolname='aimemory'" | grep -q 1 || \ printf '%s' "$DB_PASS" \ | python3 -c 'import sys,urllib.parse as u;p=u.unquote(sys.stdin.read());q=chr(39);print("CREATE USER aimemory WITH PASSWORD "+q+p.replace(q,q+q)+q+";")' \ | sudo -u postgres psql -v ON_ERROR_STOP=1
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | sudo -u postgres psql -tc "SELECT 1 FROM pg_database WHERE datname='aimemory'" | grep -q 1 || \ sudo -u postgres psql -c "CREATE DATABASE aimemory OWNER aimemory;"
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | sudo -u postgres psql -d aimemory -c "CREATE EXTENSION IF NOT EXISTS vector;"
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | sudo -u postgres psql -d aimemory -c "CREATE EXTENSION IF NOT EXISTS age;"
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | sudo -u postgres psql -d aimemory -c "GRANT ALL ON SCHEMA ag_catalog TO aimemory;"
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | sudo -u postgres psql -d aimemory -Atc "SELECT extname || ': ' || extversion FROM pg_extension WHERE extname IN ('age','vector') ORDER BY extname"
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | if [ ! -s /etc/ai-memory/api-key ]; then
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | ( umask 077; openssl rand -hex 32 > /etc/ai-memory/api-key ) \ || { echo "could not mint the api key"; exit 1; }
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | fi
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | chown root:root /etc/ai-memory/api-key
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | chmod 0600 /etc/ai-memory/api-key
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | API_KEY="$(cat /etc/ai-memory/api-key)"
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | printf '%s' "$API_KEY" | runuser -u aimemory -- bash -c 'umask 077 && d=/opt/ai-memory/.config/ai-memory && mkdir -p "$d" && k="$(cat)" && printf "schema_version = 2\napi_key = \"%s\"\n" "$k" > "$d/config.toml.new" && mv -f "$d/config.toml.new" "$d/config.toml"' \ || { echo "could not write the daemon config"; exit 1; }
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | install -d -o root -g aimemory -m 0750 /etc/ai-memory/tls
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | if [ ! -s /etc/ai-memory/tls/node.key ]; then
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | PRIV_IP="$(hostname -I | cut -d' ' -f1)"
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | ( umask 077; openssl req -x509 -newkey rsa:3072 -nodes -days 365 \ -subj "/CN=ai-memory-burst" \ -addext "subjectAltName=DNS:localhost,IP:127.0.0.1,IP:$PRIV_IP" \ -keyout /etc/ai-memory/tls/node.key -out /etc/ai-memory/tls/node.crt ) \ || { echo "could not mint the TLS pair"; exit 1; }
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | fi
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | chown root:aimemory /etc/ai-memory/tls/node.key /etc/ai-memory/tls/node.crt
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | chmod 0640 /etc/ai-memory/tls/node.key
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | chmod 0644 /etc/ai-memory/tls/node.crt
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | DL=/var/cache/ai-memory-provision
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | install -d -m 0700 "$DL"
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | curl -fsSL "${ai_memory_image_url}" -o "$DL/ai-memory.tar.gz"
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | echo "${ai_memory_image_sha256} $DL/ai-memory.tar.gz" | sha256sum -c - \ || { echo "ai-memory tarball digest mismatch"; rm -f "$DL/ai-memory.tar.gz"; exit 1; }
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | rm -rf "$DL/x"
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | install -d -m 0700 "$DL/x"
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | tar -xzf "$DL/ai-memory.tar.gz" --no-same-owner -C "$DL/x" ai-memory
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | [ -f "$DL/x/ai-memory" ] && [ ! -L "$DL/x/ai-memory" ] \ || { echo "tarball member ai-memory is not a regular file"; exit 1; }
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | install -d -o root -g root -m 0755 /usr/local/lib/ai-memory /usr/local/lib/ai-memory/bin
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | install -o root -g root -m 0755 "$DL/x/ai-memory" /usr/local/lib/ai-memory/bin/ai-memory
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | rm -rf "$DL/x"
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | runuser -u aimemory -- /usr/local/lib/ai-memory/bin/ai-memory --version
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | systemctl daemon-reload
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | systemctl enable --now ai-memory
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | echo "=== provision complete $(date -u) ==="
+do-hive | /etc/systemd/system/ai-memory.service.d/10-federation.conf | - path: /etc/systemd/system/ai-memory.service.d/10-federation.conf
+do-hive | /etc/systemd/system/ai-memory.service.d/10-federation.conf | permissions: '0644'
+do-hive | /etc/systemd/system/ai-memory.service.d/10-federation.conf | content: |
+do-hive | /etc/systemd/system/ai-memory.service.d/10-federation.conf | [Service]
+do-hive | /etc/systemd/system/ai-memory.service.d/10-federation.conf | Environment=AI_MEMORY_FED_IDENTITY=${fed_identity}
+do-hive | /etc/systemd/system/ai-memory.service.d/10-federation.conf | Environment=AI_MEMORY_KEY_DIR=/etc/ai-memory/keys
+do-hive | /etc/systemd/system/ai-memory.service.d/10-federation.conf | Environment=XDG_CONFIG_HOME=/etc/ai-memory/xdg
+do-hive | /etc/systemd/system/ai-memory.service.d/10-federation.conf | Environment=HOME=/opt/ai-memory
+do-hive | /etc/systemd/system/ai-memory.service.d/10-federation.conf | EnvironmentFile=/etc/ai-memory/fed/peers.conf
+do-hive | /etc/systemd/system/ai-memory.service.d/10-federation.conf | ExecStart=
+do-hive | /etc/systemd/system/ai-memory-fed-bootstrap.service | - path: /etc/systemd/system/ai-memory-fed-bootstrap.service
+do-hive | /etc/systemd/system/ai-memory-fed-bootstrap.service | permissions: '0644'
+do-hive | /etc/systemd/system/ai-memory-fed-bootstrap.service | content: |
+do-hive | /etc/systemd/system/ai-memory-fed-bootstrap.service | [Unit]
+do-hive | /etc/systemd/system/ai-memory-fed-bootstrap.service | Description=ai-memory Track D federation bootstrap (identity mint, peer enrollment, mesh verify)
+do-hive | /etc/systemd/system/ai-memory-fed-bootstrap.service | After=network-online.target postgresql.service
+do-hive | /etc/systemd/system/ai-memory-fed-bootstrap.service | Wants=network-online.target
+do-hive | /etc/systemd/system/ai-memory-fed-bootstrap.service | [Service]
+do-hive | /etc/systemd/system/ai-memory-fed-bootstrap.service | Type=oneshot
+do-hive | /etc/systemd/system/ai-memory-fed-bootstrap.service | RemainAfterExit=yes
+do-hive | /etc/systemd/system/ai-memory-fed-bootstrap.service | TimeoutStartSec=0
+do-hive | /etc/systemd/system/ai-memory-fed-bootstrap.service | [Install]
+do-hive | /etc/systemd/system/ai-memory-fed-bootstrap.service | WantedBy=multi-user.target
+do-hive | /opt/ai-memory/fed-bootstrap.sh | - path: /opt/ai-memory/fed-bootstrap.sh
+do-hive | /opt/ai-memory/fed-bootstrap.sh | permissions: '0755'
+do-hive | /opt/ai-memory/fed-bootstrap.sh | content: |
+do-hive | /opt/ai-memory/fed-bootstrap.sh | #!/usr/bin/env bash
+do-hive | /opt/ai-memory/fed-bootstrap.sh | set -uo pipefail
+do-hive | /opt/ai-memory/fed-bootstrap.sh | exec > >(tee -a /var/log/ai-memory-federation.log) 2>&1
+do-hive | /opt/ai-memory/fed-bootstrap.sh | echo "=== ai-memory federation bootstrap node ${node_index}/${node_count} $(date -u) ==="
+do-hive | /opt/ai-memory/fed-bootstrap.sh | FED_DIR=/etc/ai-memory/fed
+do-hive | /opt/ai-memory/fed-bootstrap.sh | KEY_DIR=/etc/ai-memory/keys
+do-hive | /opt/ai-memory/fed-bootstrap.sh | XDG_DIR=/etc/ai-memory/xdg
+do-hive | /opt/ai-memory/fed-bootstrap.sh | FED_ID='${fed_identity}'
+do-hive | /opt/ai-memory/fed-bootstrap.sh | BIN=/opt/ai-memory/bin/ai-memory
+do-hive | /opt/ai-memory/fed-bootstrap.sh | ADMIN_ID=ai:hive-admin
+do-hive | /opt/ai-memory/fed-bootstrap.sh | LOCAL=https://127.0.0.1:9077
+do-hive | /opt/ai-memory/fed-bootstrap.sh | MATERIAL_TRIES=720
+do-hive | /opt/ai-memory/fed-bootstrap.sh | MATERIAL_SLEEP=10
+do-hive | /opt/ai-memory/fed-bootstrap.sh | PEER_TRIES=240
+do-hive | /opt/ai-memory/fed-bootstrap.sh | PEER_SLEEP=5
+do-hive | /opt/ai-memory/fed-bootstrap.sh | fail() { echo "[fed-bootstrap] FAIL: $*" >&2; exit 1; }
+do-hive | /opt/ai-memory/fed-bootstrap.sh | install -d -m 0750 -o root -g aimemory \ /etc/ai-memory "$FED_DIR" "$FED_DIR/peers" "$XDG_DIR" "$XDG_DIR/ai-memory"
+do-hive | /opt/ai-memory/fed-bootstrap.sh | install -d -m 0700 -o aimemory -g aimemory "$KEY_DIR"
+do-hive | /opt/ai-memory/fed-bootstrap.sh | [ -x "$BIN" ] || fail "no ai-memory binary at $BIN; scp a --features sal-postgres build over it, then: systemctl restart ai-memory-fed-bootstrap"
+do-hive | /opt/ai-memory/fed-bootstrap.sh | if [ ! -f "$KEY_DIR/$FED_ID.priv" ]; then
+do-hive | /opt/ai-memory/fed-bootstrap.sh | sudo -u aimemory env AI_MEMORY_NO_CONFIG=1 AI_MEMORY_DB=/opt/ai-memory/identity.db \ /opt/ai-memory/bin/ai-memory identity generate --agent-id "$FED_ID" --key-dir "$KEY_DIR" \ || fail "identity generate failed for $FED_ID"
+do-hive | /opt/ai-memory/fed-bootstrap.sh | fi
+do-hive | /opt/ai-memory/fed-bootstrap.sh | cp "$KEY_DIR/$FED_ID.pub" "$FED_DIR/$FED_ID.pub"
+do-hive | /opt/ai-memory/fed-bootstrap.sh | chmod 0644 "$FED_DIR/$FED_ID.pub"
+do-hive | /opt/ai-memory/fed-bootstrap.sh | echo "[fed-bootstrap] published $FED_DIR/$FED_ID.pub (public half only) for cross-enrollment"
+do-hive | /opt/ai-memory/fed-bootstrap.sh | if [ ! -s /etc/ai-memory/api-key ]; then
+do-hive | /opt/ai-memory/fed-bootstrap.sh | ( umask 077; openssl rand -hex 32 > /etc/ai-memory/api-key ) \ || fail "could not mint the local api key"
+do-hive | /opt/ai-memory/fed-bootstrap.sh | fi
+do-hive | /opt/ai-memory/fed-bootstrap.sh | chown root:aimemory /etc/ai-memory/api-key
+do-hive | /opt/ai-memory/fed-bootstrap.sh | chmod 0640 /etc/ai-memory/api-key
+do-hive | /opt/ai-memory/fed-bootstrap.sh | API_KEY="$(cat /etc/ai-memory/api-key)"
+do-hive | /opt/ai-memory/fed-bootstrap.sh | DAEMON_CFG_DIR=/opt/ai-memory/.config/ai-memory
+do-hive | /opt/ai-memory/fed-bootstrap.sh | install -d -o aimemory -g aimemory -m 0750 "$DAEMON_CFG_DIR"
+do-hive | /opt/ai-memory/fed-bootstrap.sh | ( umask 077
+do-hive | /opt/ai-memory/fed-bootstrap.sh | cat > "$DAEMON_CFG_DIR/config.toml" <<CFG
+do-hive | /opt/ai-memory/fed-bootstrap.sh | schema_version = 2
+do-hive | /opt/ai-memory/fed-bootstrap.sh | api_key = "$API_KEY"
+do-hive | /opt/ai-memory/fed-bootstrap.sh | [admin]
+do-hive | /opt/ai-memory/fed-bootstrap.sh | agent_ids = ["$ADMIN_ID"]
+do-hive | /opt/ai-memory/fed-bootstrap.sh | CFG
+do-hive | /opt/ai-memory/fed-bootstrap.sh | ) || fail "could not write the daemon config"
+do-hive | /opt/ai-memory/fed-bootstrap.sh | chown root:aimemory "$DAEMON_CFG_DIR/config.toml"
+do-hive | /opt/ai-memory/fed-bootstrap.sh | chmod 0640 "$DAEMON_CFG_DIR/config.toml"
+do-hive | /opt/ai-memory/fed-bootstrap.sh | printf 'AI_MEMORY_ADMIN_AGENT_IDS=ai:hive-loadgen-f2\n' > "$FED_DIR/runtime.env"
+do-hive | /opt/ai-memory/fed-bootstrap.sh | chown root:aimemory "$FED_DIR/runtime.env"
+do-hive | /opt/ai-memory/fed-bootstrap.sh | chmod 0640 "$FED_DIR/runtime.env"
+do-hive | /opt/ai-memory/fed-bootstrap.sh | i=0
+do-hive | /opt/ai-memory/fed-bootstrap.sh | while [ ! -f "$FED_DIR/ENROLLED" ]; do
+do-hive | /opt/ai-memory/fed-bootstrap.sh | i=$((i + 1))
+do-hive | /opt/ai-memory/fed-bootstrap.sh | if [ "$i" -gt "$MATERIAL_TRIES" ]; then
+do-hive | /opt/ai-memory/fed-bootstrap.sh | fail "timed out after $((MATERIAL_TRIES * MATERIAL_SLEEP))s waiting for $FED_DIR/ENROLLED; run infra/do-hive/federate.sh on the orchestrator host, then: systemctl restart ai-memory-fed-bootstrap"
+do-hive | /opt/ai-memory/fed-bootstrap.sh | fi
+do-hive | /opt/ai-memory/fed-bootstrap.sh | if [ $((i % 30)) -eq 1 ]; then
+do-hive | /opt/ai-memory/fed-bootstrap.sh | echo "[fed-bootstrap] waiting for $FED_DIR/ENROLLED (federate.sh) ... try $i/$MATERIAL_TRIES"
+do-hive | /opt/ai-memory/fed-bootstrap.sh | fi
+do-hive | /opt/ai-memory/fed-bootstrap.sh | sleep "$MATERIAL_SLEEP"
+do-hive | /opt/ai-memory/fed-bootstrap.sh | done
+do-hive | /opt/ai-memory/fed-bootstrap.sh | for f in ca.crt node.crt node.key peers.allowlist peers.conf author.id author.pub; do
+do-hive | /opt/ai-memory/fed-bootstrap.sh | [ -s "$FED_DIR/$f" ] || fail "federation material incomplete: $FED_DIR/$f missing or empty"
+do-hive | /opt/ai-memory/fed-bootstrap.sh | done
+do-hive | /opt/ai-memory/fed-bootstrap.sh | PEERS="$(sed -n 's/^AI_MEMORY_QUORUM_PEERS=//p' "$FED_DIR/peers.conf" | tail -1 | tr -d '"\r')"
+do-hive | /opt/ai-memory/fed-bootstrap.sh | [ -n "$PEERS" ] || fail "peers.conf carries no AI_MEMORY_QUORUM_PEERS; refusing to start a federated node with an empty peer list"
+do-hive | /opt/ai-memory/fed-bootstrap.sh | BAD_PEER=0
+do-hive | /opt/ai-memory/fed-bootstrap.sh | OLD_IFS=$IFS
+do-hive | /opt/ai-memory/fed-bootstrap.sh | IFS=,
+do-hive | /opt/ai-memory/fed-bootstrap.sh | for u in $PEERS; do
+do-hive | /opt/ai-memory/fed-bootstrap.sh | case "$u" in
+do-hive | /opt/ai-memory/fed-bootstrap.sh | https://*) ;;
+do-hive | /opt/ai-memory/fed-bootstrap.sh | *) echo "[fed-bootstrap] non-https peer URL in peers.conf: $u"; BAD_PEER=1 ;;
+do-hive | /opt/ai-memory/fed-bootstrap.sh | esac
+do-hive | /opt/ai-memory/fed-bootstrap.sh | done
+do-hive | /opt/ai-memory/fed-bootstrap.sh | IFS=$OLD_IFS
+do-hive | /opt/ai-memory/fed-bootstrap.sh | [ "$BAD_PEER" -eq 0 ] || fail "peers.conf contains a non-https peer URL; refused locally (the daemon refuses the same shape at boot, #2477)"
+do-hive | /opt/ai-memory/fed-bootstrap.sh | PEER_PUBS=$(ls -1 "$FED_DIR"/peers/*.pub 2>/dev/null | wc -l)
+do-hive | /opt/ai-memory/fed-bootstrap.sh | [ "$PEER_PUBS" -ge 1 ] || fail "no peer public keys under $FED_DIR/peers"
+do-hive | /opt/ai-memory/fed-bootstrap.sh | cp "$FED_DIR"/peers/*.pub "$KEY_DIR"/ || fail "could not install peer public keys"
+do-hive | /opt/ai-memory/fed-bootstrap.sh | chown -R aimemory:aimemory "$KEY_DIR"
+do-hive | /opt/ai-memory/fed-bootstrap.sh | chown -R root:aimemory "$FED_DIR"
+do-hive | /opt/ai-memory/fed-bootstrap.sh | chmod 0750 "$FED_DIR" "$FED_DIR/peers"
+do-hive | /opt/ai-memory/fed-bootstrap.sh | chmod 0640 "$FED_DIR/node.key"
+do-hive | /opt/ai-memory/fed-bootstrap.sh | chmod 0644 "$FED_DIR/ca.crt" "$FED_DIR/node.crt" "$FED_DIR/peers.allowlist" "$FED_DIR/peers.conf"
+do-hive | /opt/ai-memory/fed-bootstrap.sh | echo "[fed-bootstrap] enrolled $PEER_PUBS peer public key(s) into $KEY_DIR"
+do-hive | /opt/ai-memory/fed-bootstrap.sh | systemctl daemon-reload
+do-hive | /opt/ai-memory/fed-bootstrap.sh | systemctl enable ai-memory >/dev/null 2>&1 || true
+do-hive | /opt/ai-memory/fed-bootstrap.sh | systemctl restart ai-memory || fail "ai-memory failed to start (journalctl -u ai-memory)"
+do-hive | /opt/ai-memory/fed-bootstrap.sh | mtls_code() {
+do-hive | /opt/ai-memory/fed-bootstrap.sh | curl -sS --max-time 10 \ --cacert "$FED_DIR/ca.crt" --cert "$FED_DIR/node.crt" --key "$FED_DIR/node.key" \ -o /dev/null -w '%%{http_code}' "$1" 2>/dev/null
+do-hive | /opt/ai-memory/fed-bootstrap.sh | }
+do-hive | /opt/ai-memory/fed-bootstrap.sh | i=0
+do-hive | /opt/ai-memory/fed-bootstrap.sh | until [ "$(mtls_code "$LOCAL/api/v1/health")" = "200" ]; do
+do-hive | /opt/ai-memory/fed-bootstrap.sh | i=$((i + 1))
+do-hive | /opt/ai-memory/fed-bootstrap.sh | [ "$i" -gt 60 ] && fail "local daemon never answered /api/v1/health over mTLS (journalctl -u ai-memory)"
+do-hive | /opt/ai-memory/fed-bootstrap.sh | sleep 5
+do-hive | /opt/ai-memory/fed-bootstrap.sh | done
+do-hive | /opt/ai-memory/fed-bootstrap.sh | echo "[fed-bootstrap] local daemon healthy over mTLS"
+do-hive | /opt/ai-memory/fed-bootstrap.sh | IFS=,
+do-hive | /opt/ai-memory/fed-bootstrap.sh | for u in $PEERS; do
+do-hive | /opt/ai-memory/fed-bootstrap.sh | i=0
+do-hive | /opt/ai-memory/fed-bootstrap.sh | until [ "$(mtls_code "$u/api/v1/health")" = "200" ]; do
+do-hive | /opt/ai-memory/fed-bootstrap.sh | i=$((i + 1))
+do-hive | /opt/ai-memory/fed-bootstrap.sh | if [ "$i" -gt "$PEER_TRIES" ]; then
+do-hive | /opt/ai-memory/fed-bootstrap.sh | IFS=$OLD_IFS
+do-hive | /opt/ai-memory/fed-bootstrap.sh | fail "peer $u never answered /api/v1/health over the mutually authenticated channel after $((PEER_TRIES * PEER_SLEEP))s"
+do-hive | /opt/ai-memory/fed-bootstrap.sh | fi
+do-hive | /opt/ai-memory/fed-bootstrap.sh | [ $((i % 12)) -eq 1 ] && echo "[fed-bootstrap] waiting for peer $u ... try $i/$PEER_TRIES"
+do-hive | /opt/ai-memory/fed-bootstrap.sh | sleep "$PEER_SLEEP"
+do-hive | /opt/ai-memory/fed-bootstrap.sh | done
+do-hive | /opt/ai-memory/fed-bootstrap.sh | echo "[fed-bootstrap] peer $u reachable over mTLS"
+do-hive | /opt/ai-memory/fed-bootstrap.sh | done
+do-hive | /opt/ai-memory/fed-bootstrap.sh | IFS=$OLD_IFS
+do-hive | /opt/ai-memory/fed-bootstrap.sh | AUTHOR_ID="$(cat "$FED_DIR/author.id")"
+do-hive | /opt/ai-memory/fed-bootstrap.sh | AUTHOR_PUB="$(cat "$FED_DIR/author.pub")"
+do-hive | /opt/ai-memory/fed-bootstrap.sh | admin_call() {
+do-hive | /opt/ai-memory/fed-bootstrap.sh | curl -sS --max-time 15 \ --cacert "$FED_DIR/ca.crt" --cert "$FED_DIR/node.crt" --key "$FED_DIR/node.key" \ -H "content-type: application/json" -H "x-api-key: $API_KEY" -H "x-agent-id: $ADMIN_ID" \ -o /dev/null -w '%%{http_code}' "$@" 2>/dev/null
+do-hive | /opt/ai-memory/fed-bootstrap.sh | }
+do-hive | /opt/ai-memory/fed-bootstrap.sh | i=0
+do-hive | /opt/ai-memory/fed-bootstrap.sh | while :; do
+do-hive | /opt/ai-memory/fed-bootstrap.sh | RC=$(admin_call -X POST "$LOCAL/api/v1/agents" -d "{\"agent_id\":\"$AUTHOR_ID\",\"agent_type\":\"system\"}")
+do-hive | /opt/ai-memory/fed-bootstrap.sh | case "$RC" in 200|201|409) break ;; esac
+do-hive | /opt/ai-memory/fed-bootstrap.sh | i=$((i + 1))
+do-hive | /opt/ai-memory/fed-bootstrap.sh | [ "$i" -gt 12 ] && fail "could not register author $AUTHOR_ID (last HTTP $RC)"
+do-hive | /opt/ai-memory/fed-bootstrap.sh | sleep 5
+do-hive | /opt/ai-memory/fed-bootstrap.sh | done
+do-hive | /opt/ai-memory/fed-bootstrap.sh | i=0
+do-hive | /opt/ai-memory/fed-bootstrap.sh | while :; do
+do-hive | /opt/ai-memory/fed-bootstrap.sh | RC=$(admin_call -X PUT "$LOCAL/api/v1/agents/$AUTHOR_ID/pubkey" -d "{\"pubkey_b64\":\"$AUTHOR_PUB\"}")
+do-hive | /opt/ai-memory/fed-bootstrap.sh | [ "$RC" = "200" ] && break
+do-hive | /opt/ai-memory/fed-bootstrap.sh | i=$((i + 1))
+do-hive | /opt/ai-memory/fed-bootstrap.sh | [ "$i" -gt 12 ] && fail "could not bind author pubkey for $AUTHOR_ID (last HTTP $RC)"
+do-hive | /opt/ai-memory/fed-bootstrap.sh | sleep 5
+do-hive | /opt/ai-memory/fed-bootstrap.sh | done
+do-hive | /opt/ai-memory/fed-bootstrap.sh | echo "[fed-bootstrap] author $AUTHOR_ID pubkey bound on this node"
+do-hive | /opt/ai-memory/fed-bootstrap.sh | : > "$FED_DIR/MESH-READY"
+do-hive | /opt/ai-memory/fed-bootstrap.sh | echo "[fed-bootstrap] MESH READY node ${node_index}/${node_count} identity=$FED_ID peers=$PEERS author=$AUTHOR_ID"
+do-hive | /opt/ai-memory/provision.sh | - path: /opt/ai-memory/provision.sh
+do-hive | /opt/ai-memory/provision.sh | permissions: '0700'
+do-hive | /opt/ai-memory/provision.sh | owner: root:root
+do-hive | /opt/ai-memory/provision.sh | content: |
+do-hive | /opt/ai-memory/provision.sh | #!/usr/bin/env bash
+do-hive | /opt/ai-memory/provision.sh | set -euxo pipefail
+do-hive | /opt/ai-memory/provision.sh | ( umask 077; : >> /var/log/ai-memory-provision.log )
+do-hive | /opt/ai-memory/provision.sh | chmod 0600 /var/log/ai-memory-provision.log
+do-hive | /opt/ai-memory/provision.sh | exec > >(tee -a /var/log/ai-memory-provision.log) 2>&1
+do-hive | /opt/ai-memory/provision.sh | echo "=== ai-memory postgres+AGE+pgvector provision $(date -u) ==="
+do-hive | /opt/ai-memory/provision.sh | id aimemory >/dev/null 2>&1 || useradd -m -d /opt/ai-memory -s /bin/bash aimemory
+do-hive | /opt/ai-memory/provision.sh | mkdir -p /opt/ai-memory/bin /var/log/ai-memory
+do-hive | /opt/ai-memory/provision.sh | chown -R aimemory:aimemory /opt/ai-memory /var/log/ai-memory
+do-hive | /opt/ai-memory/provision.sh | chown root:root /opt/ai-memory/provision.sh # holds the db password (#4604)
+do-hive | /opt/ai-memory/provision.sh | chmod 0700 /opt/ai-memory/provision.sh
+do-hive | /opt/ai-memory/provision.sh | chown aimemory:aimemory /etc/ai-memory/store-url
+do-hive | /opt/ai-memory/provision.sh | chmod 0600 /etc/ai-memory/store-url
+do-hive | /opt/ai-memory/provision.sh | fetch_pinned() { # <url> <dir> <full 40-hex commit>
+do-hive | /opt/ai-memory/provision.sh | rm -rf "$2" && git init -q "$2" \ && git -C "$2" remote add origin "$1" \ && git -C "$2" fetch -q --depth 1 origin "$3" \ && git -C "$2" checkout -q --detach FETCH_HEAD \ && [ "$(git -C "$2" rev-parse HEAD)" = "$3" ] \ || { echo "pin mismatch: $1 did not resolve to $3"; return 1; }
+do-hive | /opt/ai-memory/provision.sh | }
+do-hive | /opt/ai-memory/provision.sh | PGVECTOR_COMMIT=8ee86c96f0fd72390f890aa8a336fda6d3ab4c6c
+do-hive | /opt/ai-memory/provision.sh | AGE_COMMIT=e43dc1a12b78fba4acef9835b2b10379b8d243b4
+do-hive | /opt/ai-memory/provision.sh | if [ ! -f "$(/usr/bin/pg_config --pkglibdir)/vector.so" ]; then
+do-hive | /opt/ai-memory/provision.sh | fetch_pinned https://github.com/pgvector/pgvector.git /opt/pgvector-src "$PGVECTOR_COMMIT"
+do-hive | /opt/ai-memory/provision.sh | cd /opt/pgvector-src
+do-hive | /opt/ai-memory/provision.sh | make PG_CONFIG=/usr/bin/pg_config
+do-hive | /opt/ai-memory/provision.sh | make install PG_CONFIG=/usr/bin/pg_config
+do-hive | /opt/ai-memory/provision.sh | fi
+do-hive | /opt/ai-memory/provision.sh | if [ ! -f "$(/usr/bin/pg_config --pkglibdir)/age.so" ]; then
+do-hive | /opt/ai-memory/provision.sh | fetch_pinned https://github.com/apache/age.git /opt/age-src "$AGE_COMMIT"
+do-hive | /opt/ai-memory/provision.sh | cd /opt/age-src
+do-hive | /opt/ai-memory/provision.sh | sed -i 's/-Werror//g' Makefile
+do-hive | /opt/ai-memory/provision.sh | make PG_CONFIG=/usr/bin/pg_config
+do-hive | /opt/ai-memory/provision.sh | make install PG_CONFIG=/usr/bin/pg_config
+do-hive | /opt/ai-memory/provision.sh | fi
+do-hive | /opt/ai-memory/provision.sh | PGCONF="/etc/postgresql/18/main/postgresql.conf"
+do-hive | /opt/ai-memory/provision.sh | if ! grep -q "shared_preload_libraries.*age" "$PGCONF"; then
+do-hive | /opt/ai-memory/provision.sh | echo "shared_preload_libraries = 'age'" >> "$PGCONF"
+do-hive | /opt/ai-memory/provision.sh | fi
+do-hive | /opt/ai-memory/provision.sh | systemctl restart postgresql
+do-hive | /opt/ai-memory/provision.sh | sleep 5
+do-hive | /opt/ai-memory/provision.sh | set +x
+do-hive | /opt/ai-memory/provision.sh | if ! sudo -u postgres psql -tc "SELECT 1 FROM pg_roles WHERE rolname='aimemory'" | grep -q 1; then
+do-hive | /opt/ai-memory/provision.sh | sudo -u postgres psql -v ON_ERROR_STOP=1 -f - < /root/.aimemory-role.sql
+do-hive | /opt/ai-memory/provision.sh | rm -f /root/.aimemory-role.sql
+do-hive | /opt/ai-memory/provision.sh | fi
+do-hive | /opt/ai-memory/provision.sh | set -x
+do-hive | /opt/ai-memory/provision.sh | sudo -u postgres psql -tc "SELECT 1 FROM pg_database WHERE datname='aimemory'" | grep -q 1 || \ sudo -u postgres psql -c "CREATE DATABASE aimemory OWNER aimemory;"
+do-hive | /opt/ai-memory/provision.sh | sudo -u postgres psql -d aimemory -c "CREATE EXTENSION IF NOT EXISTS vector;"
+do-hive | /opt/ai-memory/provision.sh | sudo -u postgres psql -d aimemory -c "ALTER EXTENSION vector UPDATE;" || true
+do-hive | /opt/ai-memory/provision.sh | sudo -u postgres psql -d aimemory -c "CREATE EXTENSION IF NOT EXISTS age;"
+do-hive | /opt/ai-memory/provision.sh | sudo -u postgres psql -d aimemory -c "GRANT ALL ON SCHEMA ag_catalog TO aimemory;" || true
+do-hive | /opt/ai-memory/provision.sh | sudo -u postgres psql -d aimemory -c "SELECT extname, extversion FROM pg_extension WHERE extname IN ('vector','age');"
+do-hive | /opt/ai-memory/provision.sh | cat > /etc/pgbouncer/pgbouncer.ini <<'PGB'
+do-hive | /opt/ai-memory/provision.sh | [databases]
+do-hive | /opt/ai-memory/provision.sh | aimemory = host=127.0.0.1 port=5432 dbname=aimemory
+do-hive | /opt/ai-memory/provision.sh | [pgbouncer]
+do-hive | /opt/ai-memory/provision.sh | listen_addr = 127.0.0.1
+do-hive | /opt/ai-memory/provision.sh | listen_port = 6432
+do-hive | /opt/ai-memory/provision.sh | auth_type = scram-sha-256
+do-hive | /opt/ai-memory/provision.sh | auth_file = /etc/pgbouncer/userlist.txt
+do-hive | /opt/ai-memory/provision.sh | pool_mode = transaction
+do-hive | /opt/ai-memory/provision.sh | max_client_conn = 2000
+do-hive | /opt/ai-memory/provision.sh | default_pool_size = 100
+do-hive | /opt/ai-memory/provision.sh | PGB
+do-hive | /opt/ai-memory/provision.sh | set +x # #4609: no xtrace of the userlist credential line
+do-hive | /opt/ai-memory/provision.sh | set -x
+do-hive | /opt/ai-memory/provision.sh | chown postgres:postgres /etc/pgbouncer/pgbouncer.ini /etc/pgbouncer/userlist.txt
+do-hive | /opt/ai-memory/provision.sh | chmod 0600 /etc/pgbouncer/userlist.txt
+do-hive | /opt/ai-memory/provision.sh | systemctl enable --now pgbouncer
+do-hive | /opt/ai-memory/provision.sh | echo "PostgreSQL: $(sudo -u postgres psql -Atc 'SELECT version()')"
+do-hive | /opt/ai-memory/provision.sh | sudo -u postgres psql -d aimemory -Atc "SELECT extname || ': ' || extversion FROM pg_extension WHERE extname IN ('age','vector') ORDER BY extname"
+do-hive | /opt/ai-memory/provision.sh | if [ -n "${ai_memory_image_url}" ]; then
+do-hive | /opt/ai-memory/provision.sh | fi
+do-hive | /opt/ai-memory/provision.sh | chown -R aimemory:aimemory /opt/ai-memory
+do-hive | /opt/ai-memory/provision.sh | systemctl daemon-reload
+do-hive | /opt/ai-memory/provision.sh | if [ -x /opt/ai-memory/bin/ai-memory ]; then
+do-hive | /opt/ai-memory/provision.sh | systemctl enable ai-memory || true
+do-hive | /opt/ai-memory/provision.sh | fi
+do-hive | /opt/ai-memory/provision.sh | systemctl enable ai-memory-fed-bootstrap || true
+do-hive | /opt/ai-memory/provision.sh | systemctl start --no-block ai-memory-fed-bootstrap || true
+do-hive | /opt/ai-memory/provision.sh | echo "=== provision complete $(date -u) ==="
+both | top | runcmd:
+aws-gpu-burst | runcmd | - [bash, /usr/local/sbin/ai-memory-provision.sh]
+do-hive | runcmd | - bash /opt/ai-memory/provision.sh
+do-hive | tf-region | %{ if federation_enabled } [ -n "$PEERS" ] || fail "peers.conf carries no AI_MEMORY_QUORUM_PEERS; refusing to start a federated node with an empty peer list" %{ endif }
+do-hive | tf-region | %{ if federation_enabled } [ "$PEER_PUBS" -ge 1 ] || fail "no peer public keys under $FED_DIR/peers" cp "$FED_DIR"/peers/*.pub "$KEY_DIR"/ || fail "could not install peer public keys" %{ endif }
