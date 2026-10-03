@@ -450,6 +450,31 @@ export interface ListSubscriptionsResponse {
   count: number;
 }
 
+/**
+ * Memory ACL grant request.
+ *
+ * @deprecated The daemon serves no grant, revoke or cluster route and the client
+ * methods that used it were removed. Kept exported for one release for
+ * importers; it will then be removed.
+ */
+export interface GrantRequest {
+  /** Agent receiving access. */
+  agent_id: string;
+  /** Permission level granted. */
+  permission: "read" | "write" | "admin";
+}
+
+/**
+ * Memory ACL revoke request.
+ *
+ * @deprecated The daemon serves no grant, revoke or cluster route and the client
+ * methods that used it were removed. Kept exported for one release for
+ * importers; it will then be removed.
+ */
+export interface RevokeRequest {
+  agent_id: string;
+}
+
 /** Agent-to-agent notification (inbox). */
 export interface NotifyRequest {
   /** Recipient agent_id. */
@@ -516,6 +541,46 @@ export interface InboxQuery {
    */
   unread_only?: boolean;
   limit?: number;
+}
+
+/**
+ * Cluster peer info.
+ *
+ * @deprecated The daemon serves no grant, revoke or cluster route and the client
+ * methods that used it were removed. Kept exported for one release for
+ * importers; it will then be removed.
+ */
+export interface ClusterPeer {
+  agent_id: string;
+  endpoint: string;
+  last_seen_at: string;
+  status: "healthy" | "degraded" | "unreachable";
+}
+
+/**
+ * Cluster membership request.
+ *
+ * @deprecated The daemon serves no grant, revoke or cluster route and the client
+ * methods that used it were removed. Kept exported for one release for
+ * importers; it will then be removed.
+ */
+export interface ClusterRequest {
+  /** Action: "join", "leave", "list", "status". */
+  action: "join" | "leave" | "list" | "status";
+  endpoint?: string;
+  agent_id?: string;
+}
+
+/**
+ * Cluster membership response.
+ *
+ * @deprecated The daemon serves no grant, revoke or cluster route and the client
+ * methods that used it were removed. Kept exported for one release for
+ * importers; it will then be removed.
+ */
+export interface ClusterResponse {
+  peers: ClusterPeer[];
+  self: ClusterPeer;
 }
 
 /** Raw Prometheus text-format payload wrapper. */
