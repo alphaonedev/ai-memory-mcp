@@ -655,8 +655,9 @@ For compliance-grade audit, also:
 - Enable daemon structured logs (the default filter is the bare level
   `info`, which is not limited to the `ai_memory` prefix, #3650) and ship to syslog.
   The `[logging]` sinks (file, stdout, syslog) filter on `[logging].level`
-  alone, not on `RUST_LOG`; a target-prefixed value there such as
-  `ai_memory=info` leaves out events whose targets sit outside `ai_memory`.
+  plus the two `sqlx_postgres::options` credential floors at `error`, not on
+  `RUST_LOG`; a target-prefixed value there such as `ai_memory=info` leaves out
+  events whose targets sit outside `ai_memory`, except `error` events from those two floor targets.
 - Enable Prometheus `/metrics` and scrape the full counter set.
 - Retain `archive` memories (don't `archive purge`).
 

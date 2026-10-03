@@ -1770,9 +1770,9 @@ Six surfaces, each load-bearing for different ops scenarios:
    and leaves other targets at `info`, and a bare level such as
    `RUST_LOG=error` replaces the base level. The sinks of the `[logging]`
    pipeline (file, stdout and syslog) do not read `RUST_LOG`: their filter is
-   `[logging].level` alone (default `info`), so `level = "ai_memory=info"`
-   there has no directive for targets outside `ai_memory` and those events
-   are not written to that sink.
+   `[logging].level` (default `info`) plus the two `sqlx_postgres::options`
+   credential floors at `error`, so with `level = "ai_memory=info"` those sinks
+   write nothing from other targets except `error` events from those two floor targets.
 4. **File logging** — opt-in via `[logging]` in `config.toml`.
    Rotating appender; off by default.
 5. **`ai-memory doctor`** — 10-section health dashboard run locally.
