@@ -96,6 +96,9 @@ set -euo pipefail
 # stages a contrived fixture tree in a tmpdir and needs the gate to
 # resolve canonical SSOTs + doc files against the fixture rather than
 # the real checkout.
+# The self-test re-invokes THIS file (not a path under the checkout), so a
+# scratch copy with a check deleted is what the fixture runs (mutation proofs, #4856).
+GATE_SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 if [[ -n "${AI_MEMORY_DOCS_GATE_ROOT:-}" ]]; then
     REPO_ROOT="$AI_MEMORY_DOCS_GATE_ROOT"
 else
@@ -560,8 +563,16 @@ IDENT = r'\b(?:CURRENT_SCHEMA_VERSION|schema_version)\b'
 # A ladder number: two or three digits, not part of a path, a line ref, an
 # issue ref, a version triple or a longer number. A leading `v` is skipped.
 NUM = r'(?<![\w.:#/-])v?([0-9]{2,3})(?![\w:/]|\.[0-9]|[0-9])'
-GAP = r'[^0-9\n]{0,%d}?' % SUBJECT_WINDOW
+# An issue ref (`#2555`) or a release triple (`v1.0.0`) between the identifier
+# and its value is one gap token, never a value.
+GAP = r'(?:#[0-9]+|[0-9]+(?:\.[0-9]+){2}|[^0-9\n]){0,%d}?' % SUBJECT_WINDOW
 SWEEP = [re.compile(IDENT + GAP + NUM), re.compile(NUM + GAP + IDENT)]
+# The identifier glued to its value by `:`/`=` (compact json `"schema_version":99`).
+ADJ_SEP = r'["\x60\'*]*[ \t]*[:=][ \t]*["\x60\'*]*'
+SWEEP.append(re.compile(IDENT + ADJ_SEP + r'v?([0-9]{2,3})(?![\w:/]|\.[0-9]|[0-9])'))
+# A transition (`CURRENT_SCHEMA_VERSION 71→72`): the FROM side is history, the
+# TO side is a claim (a stale `98 → 99` is stale); true past bumps are ledgered.
+SWEEP.append(re.compile(IDENT + GAP + r'v?[0-9]{2,3}[ \t]*(?:→|->)[ \t]*' + NUM))
 # `CURRENT_SCHEMA_VERSION: i64 = 90` -> the width suffix is not a claim.
 TYPED = re.compile(r'(?<=[A-Za-z_]): *[iu](?:16|32|64|size)\b')
 
@@ -575,7 +586,22 @@ ANCHORS = [
     re.compile(r'\| *Schema *\| *\*\*v([0-9]+)\*\* *\(\x60CURRENT_SCHEMA_VERSION'),
     # ROADMAP plain-prose current-state phrasing (#2282); scoped to the exact
     # phrase because a bare schema-N pattern false-positives on history.
-    re.compile(r'the current substrate has advanced to schema ([0-9]+)'),
+    re.compile(r'the current (?:v[0-9]+\.[0-9]+\.[0-9]+ )?substrate has advanced to schema \**([0-9]+)'),
+    # Ident-less table row: | Schema version | v99 |
+    re.compile(r'\| *Schema version *\| *\**v?([0-9]{2,3})\** *\|'),
+    # at-a-glance schema card (applied to the tag-stripped line).
+    re.compile(r'\bSchema v([0-9]+) \(was v'),
+    re.compile(r'\bv([0-9]+) current \(v[0-9]+–v[0-9]+ add'),  # #4845 second wording on the same card
+    # compliance index tagline: re-stamped to v1.0.0 (schema v100)
+    re.compile(r'\bre-stamped to v[0-9.]+ \(schema v([0-9]+)\)'),
+    # ROADMAP header parenthetical: (schema v100 on `release/v1.0.0` ...
+    re.compile(r'\(schema v([0-9]+) on \x60release/v1\.0\.0\x60'),
+    # at-a-glance stat tile: <span class="stat-num">v100</span> Schema version (v1.0.0)
+    re.compile(r'\bv([0-9]+) Schema version \(v[0-9.]+\)'),
+    # index.html upgrade paragraph: "steps up to v100 on the first ..." and
+    # "a v0.8.x DB steps v70 -> v100" (tag-stripped, entity-decoded).
+    re.compile(r'\bv([0-9]+) on the first ai-memory serve after the upgrade'),
+    re.compile(r'\bsteps v[0-9]+ (?:→|->) v([0-9]+)'),
     # CONFIG_SCHEMA postgres row: | ai-memory postgres schema | **v93** |
     re.compile(r'ai-memory postgres schema *\| *\*\*v([0-9]+)\*\*'),
     # schema.html phrasings.
@@ -587,7 +613,7 @@ ANCHORS = [
 ]
 # The html pill chip (`<span class="pill">v98 schema</span>`) is matched on the
 # RAW line: scoped to the chip so ladder prose never matches.
-PILL = re.compile(r'class="pill"[^>]*>\s*v([0-9]+) schema\s*<')
+PILL = re.compile(r'class="pill"[^>]*>\s*v([0-9]+)\s+schema\s*<')
 
 TAG = re.compile(r'<[^>]+>')
 WS = re.compile(r'\s+')
@@ -615,6 +641,9 @@ for n, raw in enumerate(open(os.environ['GATE_SCHEMA_LEDGER'], encoding='utf-8')
             or not re.search(r'#[0-9]+', parts[2]):
         rows.append(('LEDGER_BAD', 'schema-claim-history.txt', n, '-', raw.strip()[:160]))
         continue
+    if parts[1] in ledger.get(parts[0].strip(), {}):
+        rows.append(('LEDGER_BAD', 'schema-claim-history.txt', n, '-', 'duplicate entry: ' + raw.strip()[:140]))
+        continue
     ledger.setdefault(parts[0].strip(), {})[parts[1]] = [n, False]
 
 files = os.environ.get('GATE_SCHEMA_FILES', '').split()
@@ -637,10 +666,21 @@ for path in files:
                 if ARROW.match(probe, m.end(1)):
                     continue
                 hits.append((m.group(1), m.group(0)))
+        # A claim wrapped across two source lines: the identifier ends the
+        # previous line, the value opens this one. Only values on THIS line count.
+        if ln > 1:
+            prev = lines[ln - 2]
+            prev = plain(prev) if is_html else prev
+            prev = TYPED.sub('', prev)
+            joined = prev + ' ' + probe
+            for m in SWEEP[0].finditer(joined):
+                if m.start(1) > len(prev) and m.start() <= len(prev) \
+                        and not ARROW.match(joined, m.end(1)):
+                    hits.append((m.group(1), m.group(0)))
         for rx in ANCHORS:
             hits.extend((m.group(1), m.group(0)) for m in rx.finditer(line))
         if is_html:
-            hits.extend((m.group(1), m.group(0)) for m in PILL.finditer(raw))
+            hits.extend((m.group(1), m.group(0)) for m in PILL.finditer(htmlmod.unescape(raw)))
         seen = set()
         for val, span in hits:
             if val == canon or val in seen:
@@ -1939,7 +1979,7 @@ EOF
     # resolves SSOTs + doc files against the fixture (not the real
     # checkout).
     local gate_output
-    if gate_output=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1); then
+    if gate_output=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1); then
         echo "FAIL: self-test — gate did NOT catch the contrived drift"
         cd "$REPO_ROOT"
         exit 1
@@ -2005,7 +2045,7 @@ STALEEOF
     fi
     echo "PASS: self-test R-203 — frozen pre-fix gate ACCEPTS all five stale README shapes (the #2492 defect, reproduced)"
 
-    if new_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1); then
+    if new_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1); then
         echo "FAIL: self-test — the WIDENED gate accepted the stale README shapes" >&2
         cd "$REPO_ROOT"
         exit 1
@@ -2049,9 +2089,9 @@ STALEEOF
 schema v41 added the widget table; v40 added the gadget table.
 ### schema v39 — historical heading
 HISTEOF
-    if ! AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" >/dev/null 2>&1; then
+    if ! AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" >/dev/null 2>&1; then
         echo "FAIL: self-test — the widened gate fired on LEGITIMATE HISTORICAL mentions." >&2
-        AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1 >/dev/null | sed 's/^/       /' >&2
+        AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1 >/dev/null | sed 's/^/       /' >&2
         cd "$REPO_ROOT"
         exit 1
     fi
@@ -2064,7 +2104,7 @@ HISTEOF
     cat > README.md <<'ATTREOF'
 **v9.8.7 — current release.** A perfectly ordinary paragraph.
 ATTREOF
-    if new_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1); then
+    if new_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1); then
         echo "FAIL: self-test — gate accepted a stale '— current release' attribution" >&2
         cd "$REPO_ROOT"
         exit 1
@@ -2082,7 +2122,7 @@ Surface: **92** HTTP route registrations (73 unique URL paths).
 a **28-field** `Memory`.
 LEDEOF
     printf 'README.md EXPECTED_PRODUCTION_ROUTES_COUNT 92 #1\n' > "$led"
-    new_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1) && {
+    new_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1) && {
         echo "FAIL: self-test — ledger suppressed an UNLEDGERED claim (28-field Memory)" >&2
         cd "$REPO_ROOT"; exit 1; }
     grep -q 'FAIL: EXPECTED_PRODUCTION_ROUTES_COUNT:' <<<"$new_out" && {
@@ -2101,7 +2141,7 @@ LEDEOF
 Nothing to see here.
 CLEANDOC
     printf 'README.md EXPECTED_PRODUCTION_ROUTES_COUNT 92 #1\n' > "$led"
-    if ! new_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1); then
+    if ! new_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1); then
         echo "FAIL: self-test — a STALE ledger entry FAILED the gate (must be a NOTICE)" >&2
         cd "$REPO_ROOT"; exit 1
     fi
@@ -2112,7 +2152,7 @@ CLEANDOC
 
     # MALFORMED entry => HARD FAIL (the ledger cannot rot into prose).
     printf 'README.md EXPECTED_PRODUCTION_ROUTES_COUNT\n' > "$led"
-    new_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1) && {
+    new_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1) && {
         echo "FAIL: self-test — a MALFORMED ledger entry did not fail the gate" >&2
         cd "$REPO_ROOT"; exit 1; }
     grep -q 'malformed entry' <<<"$new_out" || {
@@ -2136,7 +2176,7 @@ CLEANDOC
         echo "FAIL: self-test R-203 — the pre-fix \`|| true\` shape did not reproduce the false-PASS fail-open" >&2
         cd "$REPO_ROOT"; exit 1; }
     fault_rc=0
-    fault_out="$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" AI_MEMORY_DOCS_GATE_SELFTEST_FAULT=1 "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1)" || fault_rc=$?
+    fault_out="$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" AI_MEMORY_DOCS_GATE_SELFTEST_FAULT=1 "$GATE_SELF" 2>&1)" || fault_rc=$?
     [[ "$fault_rc" -ne 0 ]] || {
         echo "FAIL: self-test #2713 — the gate exited 0 on an injected analysis-engine fault (fail-OPEN)" >&2
         printf '%s\n' "$fault_out" | sed 's/^/       /' >&2; cd "$REPO_ROOT"; exit 1; }
@@ -2167,7 +2207,7 @@ HTMLCLEANREADME
 <td>RequestValidator surface (94 production HTTP route registrations over 80 unique paths + 103 advertised MCP entries at <code>--profile full</code> + 89 CLI subcommands in the default build / 91 under <code>sal</code>)</td>
 <span class="com"># Expected: 89 CLI subcommands in the default build / 91 under `sal`</span>
 HTMLSTALEEOF
-    if new_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1); then
+    if new_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1); then
         echo "FAIL: self-test — gate did NOT catch the stale HTML CLI counts (89/91 vs fixture 78/80)" >&2
         printf '%s\n' "$new_out" >&2
         cd "$REPO_ROOT"; exit 1
@@ -2188,9 +2228,9 @@ HTMLSTALEEOF
     cat > "$tmpdir/docs/compliance/nsa-csi-mcp.html" <<'HTMLGOODEOF'
 <td>RequestValidator surface (78 CLI subcommands in the default build / 80 under <code>sal</code>)</td>
 HTMLGOODEOF
-    if ! AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" >/dev/null 2>&1; then
+    if ! AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" >/dev/null 2>&1; then
         echo "FAIL: self-test — html rule fired on CORRECT HTML CLI counts (78/80)" >&2
-        AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1 >/dev/null | sed 's/^/       /' >&2
+        AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1 >/dev/null | sed 's/^/       /' >&2
         cd "$REPO_ROOT"; exit 1
     fi
     echo "PASS: self-test — correct HTML CLI counts (78/80) still PASS"
@@ -2221,7 +2261,7 @@ HOOKSTALEDEV
     cat > "$tmpdir/docs/essays/brass-tacks-3-why.html" <<'HOOKSTALEBT'
   <p>The hook pipeline fires on 27 named substrate events.</p>
 HOOKSTALEBT
-    if hook_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1); then
+    if hook_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1); then
         echo "FAIL: self-test — widened HookEvent rule did NOT catch the five planted 27-vs-25 claims" >&2
         printf '%s\n' "$hook_out" >&2
         cd "$REPO_ROOT"; exit 1
@@ -2252,9 +2292,9 @@ HOOKHISTPD
     rm -f "$tmpdir/docs/strategy/coala-mapping.md" \
           "$tmpdir/docs/audience/developer.html" \
           "$tmpdir/docs/essays/brass-tacks-3-why.html"
-    if ! AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" >/dev/null 2>&1; then
+    if ! AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" >/dev/null 2>&1; then
         echo "FAIL: self-test — widened HookEvent rule fired on LEGITIMATE HISTORICAL hook mentions" >&2
-        AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1 >/dev/null | sed 's/^/       /' >&2
+        AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1 >/dev/null | sed 's/^/       /' >&2
         cd "$REPO_ROOT"; exit 1
     fi
     echo "PASS: self-test — historical hook mentions (prior-release lead, 'ships N', frozen baseline) still PASS"
@@ -2287,7 +2327,7 @@ PGVECCLEANREADME
 The image layers pgvector 0.8.5 onto the AGE base.
 > Alternate tested matrix: PG 16 + AGE 1.6.0 + pgvector 0.8.2 is a second tested combination.
 PGVECSTALE
-    if pgv_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1); then
+    if pgv_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1); then
         echo "FAIL: self-test — gate did NOT catch the stale pgvector patch (0.8.5 vs SSOT 0.8.6)" >&2
         printf '%s\n' "$pgv_out" >&2
         cd "$REPO_ROOT"; exit 1
@@ -2314,9 +2354,9 @@ PGVECSTALE
 The image layers pgvector 0.8.6 onto the AGE base.
 > Alternate tested matrix: PG 16 + AGE 1.6.0 + pgvector 0.8.2 is a second tested combination.
 PGVECGOOD
-    if ! AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" >/dev/null 2>&1; then
+    if ! AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" >/dev/null 2>&1; then
         echo "FAIL: self-test — pgvector rule fired on the CORRECT patch (0.8.6)" >&2
-        AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1 >/dev/null | sed 's/^/       /' >&2
+        AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1 >/dev/null | sed 's/^/       /' >&2
         cd "$REPO_ROOT"; exit 1
     fi
     echo "PASS: self-test — the certified pgvector patch (0.8.6) still PASSES"
@@ -2366,7 +2406,7 @@ KNOBSTALESH
 
 Fixture CLAUDE.md — deliberately carries no CURRENT narrative counts.
 KNOBHEADINGMD
-    if knob_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1); then
+    if knob_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1); then
         echo "FAIL: self-test — gate did NOT catch the stale knob count in a SHELL COMMENT (9 vs SSOT 3)" >&2
         printf '%s\n' "$knob_out" >&2
         cd "$REPO_ROOT"; exit 1
@@ -2390,9 +2430,9 @@ KNOBHEADINGMD
 # Shared certified env for a pg backend. asi-hard auto-pins the 3 knobs in
 # the binary's pre-runtime phase.
 KNOBGOODSH
-    if ! AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" >/dev/null 2>&1; then
+    if ! AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" >/dev/null 2>&1; then
         echo "FAIL: self-test — the asi-hard knob-count rule fired on the CORRECT count (3)" >&2
-        AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1 >/dev/null | sed 's/^/       /' >&2
+        AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1 >/dev/null | sed 's/^/       /' >&2
         cd "$REPO_ROOT"; exit 1
     fi
     echo "PASS: self-test #3113 — the correct asi-hard knob count still PASSES"
@@ -2437,7 +2477,7 @@ KNOBSTALEDEPLOY
 `run_posture` returns **0 iff all 6 checks pass, else 2**.
 > Evidence note: the captures below PREDATE the last two checks and reflect the 4-check posture.
 EFSTALE
-    if knob_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1); then
+    if knob_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1); then
         echo "FAIL: self-test — gate did NOT catch the stale asi-hard knob / EF check counts" >&2
         printf '%s\n' "$knob_out" >&2
         cd "$REPO_ROOT"; exit 1
@@ -2481,9 +2521,9 @@ KNOBGOODDEPLOY
     cat > "$tmpdir/docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md" <<'EFGOOD'
 `run_posture` returns **0 iff all 5 checks pass, else 2**.
 EFGOOD
-    if ! AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" >/dev/null 2>&1; then
+    if ! AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" >/dev/null 2>&1; then
         echo "FAIL: self-test — the knob / EF check rules fired on the CANONICAL counts" >&2
-        AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1 >/dev/null | sed 's/^/       /' >&2
+        AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1 >/dev/null | sed 's/^/       /' >&2
         cd "$REPO_ROOT"; exit 1
     fi
     echo "PASS: self-test — the canonical asi-hard knob (3) + EF check (5) counts PASS"
@@ -2511,7 +2551,7 @@ BOOTBANNER
     printf '<pre># db: /x.db (schema=v52, 1 memories)</pre>\n' > "$tmpdir/docs/banner-fixture.html"
     # An integration page that is NOT in DOC_FILES: enrolled for this check only.
     printf '#   db:         /home/u/.claude/ai-memory.db (schema=v52, 161 memories)\n' > "$tmpdir/docs/integrations/cursor.md"
-    bb_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1) && {
+    bb_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1) && {
         echo "FAIL: self-test #3248 - stale boot-banner schema=vNN not rejected" >&2; cd "$REPO_ROOT"; exit 1; }
     for _want in \
         'CURRENT_SCHEMA_VERSION: docs/integrations/README.md:1 claims "52"' \
@@ -2574,7 +2614,7 @@ SCHEMACFG
 <span class="pill">v53 schema</span>
 <text x="1" y="2">version = 53 (v1.0.0)</text>
 SCHEMAHTML
-    sch_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1) && {
+    sch_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1) && {
         echo "FAIL: self-test #3248 - stale schema claims (md anchors + html) not rejected" >&2; cd "$REPO_ROOT"; exit 1; }
     for _want in \
         'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:1 claims "52"' \
@@ -2606,20 +2646,118 @@ SCHEMAHTML
     _led=scripts/qc-allowlists/schema-claim-history.txt
     cp "$_led" "$_led.keep"
     printf 'docs/postgres-age-guide.md\tneedle-without-issue-or-note\n' >> "$_led"
-    _led_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1 || true)
+    _led_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1 || true)
     grep -qF 'malformed entry' <<<"$_led_out" \
         || { echo "FAIL: self-test #3248 - malformed ledger entry not rejected" >&2; cd "$REPO_ROOT"; exit 1; }
     cp "$_led.keep" "$_led"
     printf 'docs/postgres-age-guide.md\tno such span anywhere\t#3248 stale on purpose\n' >> "$_led"
-    _led_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1 || true)
+    _led_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1 || true)
     grep -qF 'STALE entry' <<<"$_led_out" \
         || { echo "FAIL: self-test #3248 - stale ledger entry not rejected" >&2; cd "$REPO_ROOT"; exit 1; }
     rm -f "$_led"
-    AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" >/dev/null 2>&1 \
+    _led_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1) \
         && { echo "FAIL: self-test #3248 - missing ledger not rejected" >&2; cd "$REPO_ROOT"; exit 1; }
+    # The fixture tree already carries planted claims, so a non-zero exit alone
+    # would pass with the missing-ledger check deleted (#4856): require the
+    # ledger check's own message.
+    grep -qF 'without its history ledger' <<<"$_led_out" \
+        || { echo "FAIL: self-test #3248 - missing ledger rejected for another reason, not by the ledger check" >&2; cd "$REPO_ROOT"; exit 1; }
     mv "$_led.keep" "$_led"
+    # A duplicate file+needle entry must FAIL, never silently overwrite (#4858).
+    cp "$_led" "$_led.keep"
+    tail -n 1 "$_led" >> "$_led"
+    _led_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1) \
+        && { echo "FAIL: self-test #4858 - duplicate ledger entry not rejected (rc 0)" >&2; cd "$REPO_ROOT"; exit 1; }
+    grep -qF 'duplicate entry' <<<"$_led_out" \
+        || { echo "FAIL: self-test #4858 - duplicate ledger entry rejected for another reason" >&2; cd "$REPO_ROOT"; exit 1; }
+    mv "$_led.keep" "$_led"
+    echo "PASS: self-test #4858 - duplicate ledger entry (same file + needle) REJECTED with 'duplicate entry'"
     echo "PASS: self-test #3248 - schema sweep closed-world: planted wrong wordings (md, json, bare, typed-const, html tagline/pill/svg) REJECTED; ledger history and canonical ACCEPTED; malformed, stale and missing ledger REJECTED"
-    rm -f "$tmpdir/docs/postgres-age-guide.md" "$tmpdir/docs/CONFIG_SCHEMA.md" "$tmpdir/docs/schema-fixture.html"
+
+    # ---- #3248 round 4 (#4849-#4855, #4845, #4846, #4844): wordings the sweep
+    # missed. Fixture canonical: schema 53. Every line below marked REJECT
+    # carries a stale 52 (or 51 in a transition) and must be flagged by line
+    # number; every line marked ACCEPT must not. Red without the round-4 gate
+    # changes: each REJECT line passed green before them.
+    printf 'docs/postgres-age-guide.md\tCURRENT_SCHEMA_VERSION 49→50\t#3248 fixture past bump\n' \
+        > scripts/qc-allowlists/schema-claim-history.txt
+    cat > "$tmpdir/docs/postgres-age-guide.md" <<'R4MD'
+The current `CURRENT_SCHEMA_VERSION` is
+52 on both backends.
+The current `CURRENT_SCHEMA_VERSION` is
+53 on both backends.
+{"schema_version":52,"ok":true}
+{"schema_version":53,"ok":true}
+the `CURRENT_SCHEMA_VERSION` constant (#2555) is 52
+the `CURRENT_SCHEMA_VERSION` constant (#2555) is 53
+schema_version at v1.0.0: 52
+schema_version at v1.0.0: 53
+bumps `CURRENT_SCHEMA_VERSION` 51 → 52 on both
+bumps `CURRENT_SCHEMA_VERSION` 52 -> 53 on both
+past CURRENT_SCHEMA_VERSION 49→50 is ledgered history
+| Schema version | v52 |
+| Schema version | **v53** |
+the current v1.0.0 substrate has advanced to schema **52**
+the current v1.0.0 substrate has advanced to schema **53**
+> **Current release:** v1.0.0 (schema v52 on `release/v1.0.0`, 104 tools)
+> **Current release:** v1.0.0 (schema v53 on `release/v1.0.0`, 104 tools)
+R4MD
+    cat > "$tmpdir/docs/schema-fixture.html" <<'R4HTML'
+<span class="pill">v52&nbsp;schema</span>
+<span class="pill">v53&nbsp;schema</span>
+<p><strong>Schema v52</strong> (was v33 at v0.6.4)</p>
+<p><strong>Schema v53</strong> (was v33 at v0.6.4)</p>
+<p><strong>The pair is re-stamped to v1.0.0 (schema v52);</strong></p>
+<p><strong>The pair is re-stamped to v1.0.0 (schema v53);</strong></p>
+<div class="stat-item"><span class="stat-num">v52</span><span class="stat-label">Schema version (v1.0.0)</span></div>
+<div class="stat-item"><span class="stat-num">v53</span><span class="stat-label">Schema version (v1.0.0)</span></div>
+<p>steps <strong>v40&nbsp;&rarr;&nbsp;v52</strong> on the first</p>
+<p>steps <strong>v40&nbsp;&rarr;&nbsp;v53</strong> on the first</p>
+<p>v52 current (v58–v71 add the typed-cognition layer)</p>
+<p>v53 current (v58–v71 add the typed-cognition layer)</p>
+<p>an older DB steps to <strong>v52</strong> on the first ai-memory serve after the upgrade</p>
+<p>an older DB steps to <strong>v53</strong> on the first ai-memory serve after the upgrade</p>
+R4HTML
+    r4_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1) && {
+        echo "FAIL: self-test #3248 r4 - stale wordings not rejected" >&2; cd "$REPO_ROOT"; exit 1; }
+    for _want in \
+        'docs/postgres-age-guide.md:2 claims "52"' \
+        'docs/postgres-age-guide.md:5 claims "52"' \
+        'docs/postgres-age-guide.md:7 claims "52"' \
+        'docs/postgres-age-guide.md:9 claims "52"' \
+        'docs/postgres-age-guide.md:11 claims "52"' \
+        'docs/postgres-age-guide.md:14 claims "52"' \
+        'docs/postgres-age-guide.md:16 claims "52"' \
+        'docs/postgres-age-guide.md:18 claims "52"' \
+        'docs/schema-fixture.html:1 claims "52"' \
+        'docs/schema-fixture.html:3 claims "52"' \
+        'docs/schema-fixture.html:5 claims "52"' \
+        'docs/schema-fixture.html:7 claims "52"' \
+        'docs/schema-fixture.html:9 claims "52"' \
+        'docs/schema-fixture.html:11 claims "52"' \
+        'docs/schema-fixture.html:13 claims "52"'
+    do grep -qF "$_want" <<<"$r4_out" || { echo "FAIL: self-test #3248 r4 - not flagged: $_want" >&2; cd "$REPO_ROOT"; exit 1; }; done
+    for _not in \
+        'docs/postgres-age-guide.md:3 ' 'docs/postgres-age-guide.md:4 ' \
+        'docs/postgres-age-guide.md:6 ' 'docs/postgres-age-guide.md:8 ' \
+        'docs/postgres-age-guide.md:10 ' 'docs/postgres-age-guide.md:12 ' \
+        'docs/postgres-age-guide.md:13 ' 'docs/postgres-age-guide.md:15 ' \
+        'docs/postgres-age-guide.md:17 ' 'docs/postgres-age-guide.md:19 ' \
+        'docs/schema-fixture.html:2 ' 'docs/schema-fixture.html:4 ' \
+        'docs/schema-fixture.html:6 ' 'docs/schema-fixture.html:8 ' \
+        'docs/schema-fixture.html:10 ' 'docs/schema-fixture.html:12 ' 'docs/schema-fixture.html:14 '
+    do grep -qF "$_not" <<<"$r4_out" && { echo "FAIL: self-test #3248 r4 - canonical/history line flagged: $_not" >&2; cd "$REPO_ROOT"; exit 1; }
+    done
+    echo "PASS: self-test #4850 - claim wrapped across two lines: planted 52 REJECTED, 53 ACCEPTED"
+    echo "PASS: self-test #4851 - compact json schema_version:52 REJECTED, :53 ACCEPTED"
+    echo "PASS: self-test #4852 - issue ref / release triple between identifier and value: planted 52 REJECTED, 53 ACCEPTED"
+    echo "PASS: self-test #4853 - transition 51 -> 52 REJECTED (TO side), 52 -> 53 ACCEPTED, ledgered 49→50 history ACCEPTED"
+    echo "PASS: self-test #4854 - html pill with a non-breaking space REJECTED, canonical ACCEPTED"
+    echo "PASS: self-test #4855 - ident-less table row | Schema version | v52 | REJECTED, **v53** ACCEPTED"
+    echo "PASS: self-test #4849 - drifted current-state wording (v1.0.0 substrate, bold value) REJECTED, canonical ACCEPTED"
+    echo "PASS: self-test #4844/#4845/#4846 - ROADMAP header parenthetical, at-a-glance card + stat tile, compliance tagline, index upgrade paragraph: stale REJECTED, canonical ACCEPTED"
+    rm -f "$tmpdir/docs/postgres-age-guide.md" "$tmpdir/docs/schema-fixture.html"
+    rm -f "$tmpdir/docs/CONFIG_SCHEMA.md" "$tmpdir/docs/schema-fixture.html"
     printf '# fixture ledger (comment-only)\n' > scripts/qc-allowlists/schema-claim-history.txt
 
     # ---- FAIL-CLOSED-ONLY-WITH-A-CLAIM: remove both SSOTs. A doc that
@@ -2628,14 +2766,14 @@ SCHEMAHTML
     rm -f "$tmpdir/src/security_profile.rs" "$tmpdir/src/enterprise_federation_posture.rs"
     rm -f "$tmpdir/SECURITY.md" "$tmpdir/docs/deploy/README.md"
     rm -f "$tmpdir/docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md"
-    if ! AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" >/dev/null 2>&1; then
+    if ! AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" >/dev/null 2>&1; then
         echo "FAIL: self-test — an ABSENT knob/EF SSOT with no claim to validate did not stay green" >&2
         cd "$REPO_ROOT"; exit 1
     fi
     cat > "$tmpdir/SECURITY.md" <<'KNOBORPHAN'
 - The pinned SSOT (`src/security_profile.rs::KNOBS`) is **3 knobs** — see the deploy template.
 KNOBORPHAN
-    if orphan_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1); then
+    if orphan_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1); then
         echo "FAIL: self-test — a knob claim with an UNRESOLVABLE SSOT passed silently (fail-open)" >&2
         cd "$REPO_ROOT"; exit 1
     fi
@@ -2676,7 +2814,7 @@ HTML2977README
 <p>The record is a <strong>28-field</strong> <code>Memory</code>.</p>
 <p>The CLI ships <strong>89</strong> subcommands under <code>--features sal</code>.</p>
 HTMLSTALECLAIMS
-    if html_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1); then
+    if html_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1); then
         echo "FAIL: self-test #2977 — the widened gate ACCEPTED html-dialect stale SSOT claims" >&2
         printf '%s\n' "$html_out" >&2
         cd "$REPO_ROOT"; exit 1
@@ -2708,9 +2846,9 @@ HTMLSTALECLAIMS
 <p>The record is a <strong>26-field</strong> <code>Memory</code>.</p>
 <p>The CLI ships <strong>80</strong> subcommands under <code>--features sal</code>.</p>
 HTMLGOODCLAIMS
-    if ! AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" >/dev/null 2>&1; then
+    if ! AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" >/dev/null 2>&1; then
         echo "FAIL: self-test #2977 GREEN — the CORRECTED html page was still rejected" >&2
-        AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1 >/dev/null | sed 's/^/       /' >&2
+        AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1 >/dev/null | sed 's/^/       /' >&2
         cd "$REPO_ROOT"; exit 1
     fi
     echo "PASS: self-test #2977 GREEN — the same html page carrying the canonical values PASSES"
@@ -2723,9 +2861,9 @@ HTMLGOODCLAIMS
     cat > "$tmpdir/docs/at-a-glance.html" <<'HTMLLADDER'
 <p>Backing this, schema <strong>v67</strong> added the <code>target_agent_id_idx</code> column.</p>
 HTMLLADDER
-    if ! AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" >/dev/null 2>&1; then
+    if ! AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" >/dev/null 2>&1; then
         echo "FAIL: self-test #2977 — the html guard fired on a LEGITIMATE tag-split ladder mention" >&2
-        AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1 >/dev/null | sed 's/^/       /' >&2
+        AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1 >/dev/null | sed 's/^/       /' >&2
         cd "$REPO_ROOT"; exit 1
     fi
     echo "PASS: self-test #2977 — a tag-split 'schema <strong>vNN</strong> added' ladder mention still PASSES"
@@ -2740,9 +2878,9 @@ HTMLLADDER
 <div class="card-title">What's New in v0.7.0 — attested-cortex</div>
 <p class="card-body"><strong>74</strong> MCP tools at <code>--profile full</code>, 27-event hook pipeline.</p>
 HTMLCARD
-    if ! AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" >/dev/null 2>&1; then
+    if ! AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" >/dev/null 2>&1; then
         echo "FAIL: self-test #2977 — the window guard did NOT spare an html PRIOR-RELEASE card" >&2
-        AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1 >/dev/null | sed 's/^/       /' >&2
+        AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1 >/dev/null | sed 's/^/       /' >&2
         cd "$REPO_ROOT"; exit 1
     fi
     echo "PASS: self-test #2977 — an html release CARD (eyebrow + title in the divs above) is spared"
@@ -2750,7 +2888,7 @@ HTMLCARD
     cat > "$tmpdir/docs/at-a-glance.html" <<'HTMLCARDLESS'
 <p class="card-body"><strong>74</strong> MCP tools at <code>--profile full</code>, 27-event hook pipeline.</p>
 HTMLCARDLESS
-    if card_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1); then
+    if card_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1); then
         echo "FAIL: self-test #2977 — the SAME numbers WITHOUT the release-card markers were accepted." >&2
         echo "       The window guard would then be a blanket exemption, not a guard." >&2
         cd "$REPO_ROOT"; exit 1
@@ -2773,9 +2911,9 @@ HTMLCARDLESS
     cat > "$tmpdir/docs/whats-new-v09.html" <<'HTMLFROZEN'
 <p>Surface: schema <strong>v78</strong>, <strong>101</strong> MCP tools at <code>--profile full</code>.</p>
 HTMLFROZEN
-    if ! AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" >/dev/null 2>&1; then
+    if ! AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" >/dev/null 2>&1; then
         echo "FAIL: self-test #2977 — a FROZEN page (html-doc-frozen-exempt.txt) was scanned" >&2
-        AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1 >/dev/null | sed 's/^/       /' >&2
+        AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1 >/dev/null | sed 's/^/       /' >&2
         cd "$REPO_ROOT"; exit 1
     fi
     echo "PASS: self-test #2977 — a page named in html-doc-frozen-exempt.txt is EXEMPT (the same claims pass there)"
@@ -2787,7 +2925,7 @@ HTMLFROZEN
     # than waived under --self-test, because a check the self-test cannot
     # reach is a check nobody has proven.
     mv "$tmpdir/scripts/qc-allowlists/html-doc-frozen-exempt.txt" "$tmpdir/exempt.bak"
-    if ex_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1); then
+    if ex_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1); then
         echo "FAIL: self-test #2977 — a MISSING frozen-exemption SSOT did not fail the gate" >&2
         cd "$REPO_ROOT"; exit 1
     fi
@@ -2806,7 +2944,7 @@ HTMLFROZEN
   <p>© 2026 AlphaOne LLC. Licensed Apache-2.0. ai-memory v0.9.0 — source on GitHub</p>
 </footer>
 HTMLSTAMPBAD
-    if stamp_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1); then
+    if stamp_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1); then
         echo "FAIL: self-test #2977 — a stale sitewide chrome version stamp was ACCEPTED" >&2
         cd "$REPO_ROOT"; exit 1
     fi
@@ -2837,9 +2975,9 @@ HTMLSTAMPBAD
   <p>Install the published build: <code>cargo install ai-memory v0.9.0</code></p>
 </footer>
 HTMLSTAMPGOOD
-    if ! AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" >/dev/null 2>&1; then
+    if ! AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" >/dev/null 2>&1; then
         echo "FAIL: self-test #2977 GREEN — a current chrome stamp + a published-install reference were rejected" >&2
-        AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1 >/dev/null | sed 's/^/       /' >&2
+        AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1 >/dev/null | sed 's/^/       /' >&2
         cd "$REPO_ROOT"; exit 1
     fi
     echo "PASS: self-test #2977 GREEN — a current chrome stamp PASSES and a published-install reference is SKIPPED"
@@ -2849,7 +2987,7 @@ HTMLSTAMPGOOD
     cat > "$tmpdir/docs/whats-new-v09.html" <<'HTMLSTAMPFROZEN'
 <footer><p>ai-memory v0.9.0 — what shipped in v0.9.0</p></footer>
 HTMLSTAMPFROZEN
-    if ! AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" >/dev/null 2>&1; then
+    if ! AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" >/dev/null 2>&1; then
         echo "FAIL: self-test #2977 — the chrome rule fired on a FROZEN per-release page" >&2
         cd "$REPO_ROOT"; exit 1
     fi
