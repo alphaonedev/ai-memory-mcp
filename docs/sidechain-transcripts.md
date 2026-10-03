@@ -119,7 +119,7 @@ operator-tunable via the daemon config):
    CASCADE`.
 
 Implementation: `sweep_transcript_lifecycle` at
-[`src/transcripts/storage.rs:363`](../src/transcripts/storage.rs).
+[`src/transcripts/storage.rs`](../src/transcripts/storage.rs).
 The supporting partial index
 `idx_memory_transcripts_archived_at WHERE archived_at IS NOT NULL`
 keeps the prune-phase scan O(archived rows) rather than O(total
@@ -130,13 +130,13 @@ transcripts).
 `memory_replay(memory_id, depth=N)` returns the **union** of
 transcripts reachable by walking `reflects_on` edges from the target
 memory up to `depth` levels (`replay_transcript_union` at
-[`src/transcripts/replay.rs:95`](../src/transcripts/replay.rs)).
+[`replay_transcript_union`](../src/transcripts/replay.rs)).
 `depth=0` reproduces the pre-L2-4 shape (direct link only). The walk
 respects the per-namespace `max_reflection_depth` cap —
 composition cannot bypass.
 
 Each returned entry is a `ReplayEntry`
-([`src/transcripts/replay.rs:67`](../src/transcripts/replay.rs))
+([`ReplayEntry`](../src/transcripts/replay.rs))
 carrying transcript id, namespace, decompressed content (or the
 relevant span if `span_start`/`span_end` were set on the link),
 created_at, and the originating memory id.
@@ -146,7 +146,7 @@ created_at, and the originating memory id.
 The v0.7.0 release/v0.7.0 branch landed
 **`TranscriptsConfig.max_decompressed_bytes`** as a config-driven
 cap (commit `26fab06`) with a default of `MAX_DECOMPRESSED_BYTES =
-16 * 1024 * 1024` (16 MiB, [`src/transcripts/storage.rs:33`](../src/transcripts/storage.rs)).
+16 * 1024 * 1024` (16 MiB, [`MAX_DECOMPRESSED_BYTES`](../src/transcripts/storage.rs)).
 Prior to I1, a malicious peer could push a 1 KiB zstd payload that
 decompressed to hundreds of MiB and exhaust the daemon's memory. The
 cap is checked on every `fetch`; payloads above the cap are refused
