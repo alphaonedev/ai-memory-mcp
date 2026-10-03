@@ -215,7 +215,7 @@ await memory.store(
 #### Write attestation
 
 `POST /api/v1/memories` is `WriteSurface::HttpDirect`, which fails **closed**
-by default (`src/identity/attest.rs:130-136`). A store without a valid
+by default ([`resolve_require_agent_attestation`](../../src/identity/attest.rs)). A store without a valid
 Ed25519 attestation is `403 ATTESTATION_FAILED`.
 
 ```ts
