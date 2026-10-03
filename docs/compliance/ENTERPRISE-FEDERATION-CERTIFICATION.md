@@ -1197,10 +1197,10 @@ harness MAP):**
 
 | Lane | Test | File | Note |
 |---|---|---|---|
-| links outside peer scope | `federated_link_outside_peer_scope_refused_2711_pg` | `tests/federation_confine_ns_scope_2711_pg.rs:270` | **pg-only**; no sqlite twin. Twin tracked in [#2912](https://github.com/alphaonedev/ai-memory-mcp/issues/2912) item 2. |
-| signals outside peer scope | `federated_signal_outside_peer_scope_refused_2711_pg` | `tests/federation_confine_ns_scope_2711_pg.rs:349` | **pg-only**; same #2912 item 2. |
-| REJECT cannot veto out-of-scope pending | `foreign_reject_cannot_veto_out_of_scope_pending_2532` | `tests/federation_pending_reject_ns_2532.rs:197` | |
-| anti-entropy watermark past a fully-filtered page | `cursor_advances_when_every_row_is_out_of_scope_2441` | `tests/federation_sync_since_watermark_2441.rs:247` | |
+| links outside peer scope | [`federated_link_outside_peer_scope_refused_2711_pg`](../../tests/federation_confine_ns_scope_2711_pg.rs) | `tests/federation_confine_ns_scope_2711_pg.rs` | **pg-only**; no sqlite twin. Twin tracked in [#2912](https://github.com/alphaonedev/ai-memory-mcp/issues/2912) item 2. |
+| signals outside peer scope | [`federated_signal_outside_peer_scope_refused_2711_pg`](../../tests/federation_confine_ns_scope_2711_pg.rs) | `tests/federation_confine_ns_scope_2711_pg.rs` | **pg-only**; same #2912 item 2. |
+| REJECT cannot veto out-of-scope pending | [`foreign_reject_cannot_veto_out_of_scope_pending_2532`](../../tests/federation_pending_reject_ns_2532.rs) | `tests/federation_pending_reject_ns_2532.rs` | |
+| anti-entropy watermark past a fully-filtered page | [`cursor_advances_when_every_row_is_out_of_scope_2441`](../../tests/federation_sync_since_watermark_2441.rs) | `tests/federation_sync_since_watermark_2441.rs` | |
 | erasure replicates | `tests/federation_erasure_replication_2446.rs` (e.g. `drain_expands_sentinel_and_delivers_deletion_to_peer_2446` at `:574`) | `tests/federation_erasure_replication_2446.rs` | |
 
 **Removal proof (§5.4.5) — `scripts/check-cert-removal-proof.sh`.** For each
