@@ -1329,11 +1329,13 @@ jobs:
     #   - Every triggered line (case-insensitive, percent-decoded triggers)
     #     must match an exact whitespace-normalised entry of
     #     scripts/qc-allowlists/cloud-init-token-allow.txt; malformed,
-    #     duplicate or stale entries fail; an empty scan fails closed.
+    #     stale entries fail; approved lines must keep the allowlist order
+    #     and count (#4784); an empty scan fails closed.
     #     Known do-hive defects sit in cloud-init-token-pending.txt (#4671,
     #     #4712): listed, never approved.
-    #   - Companion rule: no eval, decoder-into-shell, ANSI-C quoting, or
-    #     $/command substitution in command position.
+    #   - Companion rule (also heredoc bodies and unit Exec lines): no eval,
+    #     decoder-into-shell, ANSI-C quoting, glob, $ or command substitution
+    #     in command position.
     #   - Validators on approved lines: sslmode exactly verify-full, no
     #     credential channel other than the 0600 store-url file, no
     #     download piped to a shell or tar, no unit binary in the service home.
@@ -1352,5 +1354,5 @@ jobs:
         # #4657 decision as red probes, mostly mutations of the real AWS
         # template (runcmd, write_files and embedded-script insertions),
         # green near-misses, allowlist form faults, and a mutation of every
-        # allowlist entry of both templates.
+        # allowlist entry of both templates; round-3 probes (#4784, #4793-#4795).
         run: python3 scripts/check-cloud-init-serve-flags.py --self-test

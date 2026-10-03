@@ -165,6 +165,14 @@ echo "ok 2 - rendered; every service declares its entrypoint and restarts on a r
 # `env -i` reproduces that, so no host AI_MEMORY_* (e.g. AI_MEMORY_NO_CONFIG,
 # which would hide the config.toml and its api_key) can make this pass or fail.
 BASE_ENV=(PATH="${T}/bin:/usr/local/bin:/usr/bin:/bin" HOME="${T}/home" TMPDIR="${T}/tmp")
+# The key reaches the init through a 0600 file read inside the child: NAME=value after
+# env would sit on env's argv, readable by every local UID (#4792).
+init_with_key() {
+    local key="$1"
+    ( umask 077; printf '%s' "${key}" > "${T}/api-key.0600" )
+    env -i "${BASE_ENV[@]}" "${INIT_ENV[@]}" \
+        bash -c 'export AI_MEMORY_API_KEY="$(cat "$1")"; shift; exec "$@"' _ "${T}/api-key.0600" "${INIT_ARGV[@]}"
+}
 
 # ---- 3. run the rendered init-batman script ---------------------------------
 env -i "${BASE_ENV[@]}" "${INIT_ENV[@]}" "${INIT_ARGV[@]}" > "${T}/init.log" 2>&1 \
@@ -234,7 +242,7 @@ echo "ok 7 - the sync service's effective argv idles cleanly without peers"
 # ---- 8. the key whitelist and minimum length refuse, without touching the file --
 BEFORE="$(sha256sum "${CFG}")"
 for bad in "bad\"quote$(printf 'x%.0s' {1..40})" 'short-key'; do
-    if env -i "${BASE_ENV[@]}" "${INIT_ENV[@]}" AI_MEMORY_API_KEY="${bad}" "${INIT_ARGV[@]}" > "${T}/init-bad.log" 2>&1; then
+    if init_with_key "${bad}" > "${T}/init-bad.log" 2>&1; then
         fail "init accepted an invalid AI_MEMORY_API_KEY (${#bad} chars)"
     else
         rc=$?
@@ -246,7 +254,7 @@ echo "ok 8 - a key outside the charset, or shorter than 32, is refused (64) and 
 
 # ---- 9. rotation (#4213): a new AI_MEMORY_API_KEY replaces the old one --------
 NEW_KEY="rotated3838$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
-env -i "${BASE_ENV[@]}" "${INIT_ENV[@]}" AI_MEMORY_API_KEY="${NEW_KEY}" "${INIT_ARGV[@]}" > "${T}/init-rot.log" 2>&1 \
+init_with_key "${NEW_KEY}" > "${T}/init-rot.log" 2>&1 \
     || fail "init failed on a rotated key: $(tail -10 "${T}/init-rot.log")"
 grep -q 'API key rotated' "${T}/init-rot.log" || fail "init did not report the rotation: $(tail -5 "${T}/init-rot.log")"
 [[ "$(grep -c '^api_key' "${CFG}")" == 1 ]] || fail "config.toml does not carry exactly one api_key after rotation"
@@ -277,7 +285,7 @@ echo "ok 9 - a changed AI_MEMORY_API_KEY rotates the key: old 401, new 200 (#421
 # the table key must survive, the top-level key must come back, nothing rotated.
 { grep -v '^api_key[[:space:]]*=' "${CFG}"; printf '\n[llm]\napi_key = "table-scoped-keep-me"\n'; } > "${T}/cfg.edit"
 cat "${T}/cfg.edit" > "${CFG}"
-env -i "${BASE_ENV[@]}" "${INIT_ENV[@]}" AI_MEMORY_API_KEY="${NEW_KEY}" "${INIT_ARGV[@]}" > "${T}/init-table.log" 2>&1 \
+init_with_key "${NEW_KEY}" > "${T}/init-table.log" 2>&1 \
     || fail "init failed with a table-scoped api_key present: $(tail -10 "${T}/init-table.log")"
 grep -q 'API key rotated' "${T}/init-table.log" && fail "init reported a rotation that did not happen (#4291)"
 grep -q '^api_key = "table-scoped-keep-me"$' "${CFG}" || fail "init dropped the table-scoped api_key (#4291)"

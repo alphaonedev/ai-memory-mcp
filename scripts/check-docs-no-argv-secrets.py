@@ -26,7 +26,13 @@ What the gate refuses (exit 1):
         ``=`` (``--dbname=<dsn>``, #4690) or inside a ``-c`` script string;
       - a keyword conninfo ``password=<value>`` (``host=h password=x``, #4692);
       - ``-e`` / ``--env`` ``NAME=<value>`` on a docker, podman or nerdctl argv
-        where NAME names a password, secret, token or key (#4694).
+        where NAME names a password, secret, token or key, or is a ``PW``
+        part (``PG_PW``) (#4694);
+      - a ``NAME=<value>`` word (also ``--opt=NAME=<value>``) after a wrapper
+        that keeps its argv while the child runs or stores it (sudo, doas,
+        runuser, timeout, systemd-run, kubectl, oc) where NAME names a
+        password, secret, token or API key. ``env NAME=v cmd`` execs in place
+        and is treated like an env prefix.
     A systemd ``Environment=`` line carrying a credential URL is refused
     whatever the key spelling (#4689).
 
@@ -118,7 +124,8 @@ SKIP_PREFIXES = ("changelog.d/", "docs/reviews/", "docs/handoff/")
 SKIP_FILES = {"CHANGELOG.md"}
 
 # Known defects listed, not approved: (path, text on the hit's logical line,
-# tracking issue). A listed hit is reported as PENDING and does not fail the
+# tracking issue[, expected hit count, default 1]). An entry claims at most its
+# count of hits, so a second matching line is a new failing hit (#4791). A listed hit is reported as PENDING and does not fail the
 # gate; an entry that matches no hit is stale and fails it, so the entry must
 # go when the defect is fixed.
 PENDING = ()
@@ -182,7 +189,17 @@ CONNINFO_PW_RE = re.compile(r"(?:^|[\s-])password\s*=\s*(?P<pw>'[^']*'|\S+)", re
 ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?\+?=")
 UNIT_EXEC_RE = re.compile(r"^(?:Exec[A-Za-z]*)=[-@+!:]*")
 UNIT_ENV_RE = re.compile(r"^\s*Environment\s*=", re.I)
-SECRET_NAME_RE = re.compile(r"pass|secret|token|key|cred", re.I)
+SECRET_NAME_RE = re.compile(r"pass|secret|token|key|cred|(?:^|_)pw(?:_|$)|pwd|auth", re.I)
+# Wrappers whose NAME=value words are their own argv, not a shell env prefix.
+# A name that holds a location, not the secret itself (AI_MEMORY_KEY_DIR).
+LOCATOR_NAME_RE = re.compile(r"_(?:DIR|FILE|PATH|ID)$", re.I)
+ENV_WRAPPERS = {"env", "sudo", "doas", "runuser", "su"}
+# A NAME=value word on the argv of a wrapper that stays resident while its child
+# runs (sudo/doas/runuser/timeout keep their argv; systemd-run and kubectl store
+# it in a unit or pod spec): sudo PGPASSWORD=v psql, kubectl run --env=NAME=v.
+RESIDENT_WRAPPERS = {"sudo", "doas", "runuser", "timeout", "systemd-run", "kubectl", "oc"}
+ARGV_ASSIGN_RE = re.compile(r"^(?:--?[A-Za-z][\w-]*=)?(?P<name>[A-Za-z_][A-Za-z0-9_]*)=(?P<value>.+)$")
+ARGV_SECRET_NAME_RE = re.compile(r"passw|passwd|(?:^|_)pg?pass(?:$|_)|secret|token|api_?key|(?:^|_)pw(?:$|_)", re.I)
 
 DECLARE_BUILTINS = {"export", "local", "readonly", "declare", "typeset"}
 BUILTIN_PRINTERS = {"echo", "printf"}
@@ -320,7 +337,7 @@ def container_env_hits(words: List[str]) -> List[str]:
                 val = w[2:]
             if val is not None and "=" in val:
                 name, _, value = val.partition("=")
-                if SECRET_NAME_RE.search(name) and value and not is_redaction(value):
+                if (SECRET_NAME_RE.search(name) or ARGV_SECRET_NAME_RE.search(name)) and value and not is_redaction(value):
                     found.append(name)
         i += 1
     return found
@@ -344,7 +361,33 @@ def word_hits(words: List[str], depth: int = 0) -> List[str]:
             if pw and not is_redaction(pw) and not pw.startswith(("://",)):
                 reasons.append("conninfo password")
     reasons.extend("container env %s" % n for n in container_env_hits(words))
+    reasons.extend("wrapper env %s" % n for n in wrapper_env_hits(words))
+    resident = False
+    for w in words:
+        if Path(w).name in RESIDENT_WRAPPERS:
+            resident = True
+            continue
+        m = ARGV_ASSIGN_RE.match(w) if resident else None
+        if m and ARGV_SECRET_NAME_RE.search(m.group("name")) and not is_redaction(m.group("value")):
+            reasons.append("NAME=value on a resident wrapper argv %s" % m.group("name"))
     return reasons
+
+
+def wrapper_env_hits(words: List[str]) -> List[str]:
+    """env/sudo NAME=<value>: the assignment is an argv word of the wrapper,
+    so /proc/<pid>/cmdline of env or sudo shows it to every local UID."""
+    found: List[str] = []
+    in_wrapper = False
+    for w in words:
+        if Path(w).name in ENV_WRAPPERS:
+            in_wrapper = True
+            continue
+        if in_wrapper and ASSIGN_RE.match(w):
+            name, _, value = w.partition("=")
+            if (SECRET_NAME_RE.search(name) and not LOCATOR_NAME_RE.search(name)
+                    and value and not is_redaction(value)):
+                found.append(name)
+    return found
 
 
 def command_hits(cmd: List[str], depth: int = 0) -> List[str]:
@@ -534,14 +577,16 @@ def split_pending(root: Path, hits: List[Hit], pending=PENDING) -> Tuple[List[Hi
     claimed = set()
     listed: List[str] = []
     stale: List[str] = []
-    for rel, needle, issue in pending:
+    for entry in pending:
+        rel, needle, issue = entry[0], entry[1], entry[2]
+        count = entry[3] if len(entry) > 3 else 1
         if rel not in texts:
             p = root / rel
             texts[rel] = dict(logical_lines(p.read_text(encoding="utf-8"))) if p.is_file() else {}
         matched = [h for h in hits if h[0] == rel and needle in texts[rel].get(h[1], "")]
         if not matched:
             stale.append("%s %s: %s" % (rel, issue, redact(needle)))
-        for h in matched:
+        for h in matched[:count]:
             claimed.add(h)
             listed.append("%s:%d %s" % (h[0], h[1], issue))
     return [h for h in hits if h not in claimed], listed, stale
@@ -610,6 +655,11 @@ RED_PROBES = {
 }
 # Shell-like files (probe.sh): a credential on another program's argv.
 RED_SHELL_PROBES = {
+    "r3 env NAME=value: env's own argv holds the value (security A11, #4792; the code verdict's A18 expected green, the stricter result wins)": "env PGPASSWORD=\"$PW\" psql -h h",
+    "r3 sudo NAME=value keeps the password on the sudo argv": "sudo PGPASSWORD=%s psql -h h -U u d" % PW,
+    "r3 runuser -- env NAME=value": "runuser -u postgres -- env PGPASSWORD=%s psql -h h" % PW,
+    "r3 kubectl run --env=NAME=value": "kubectl run t --image=i --env=PGPASSWORD=%s" % PW,
+    "r3 docker -e abbreviated PG_PW name": "docker run --rm -e PG_PW=%s img" % PW,
     "4663 psql with a ${VAR} password": 'psql "postgres://aimemory:$DB_PASS@localhost/aimemory" -c "select 1"',
     "4663 psql with a literal password": "psql postgres://u:%s@h/d -c x" % PW,
     "4663 psql with a password= query parameter": 'psql "postgres://u@h/d?sslmode=verify-full&password=%s"' % PW,
@@ -633,6 +683,7 @@ RED_SHELL_PROBES = {
     "yaml runcmd list item": "  - psql postgres://u:%s@h/d -c x" % PW,
 }
 GREEN_SHELL_PROBES = {
+    "r3 sudo with a non-secret NAME=value": "sudo AI_MEMORY_KEY_DIR=/k ai-memory serve",
     "4663 assignment": 'PGURL="postgres://u:$PW@h/d"',
     "4663 exported assignment": "export PGURL=postgres://u:$PW@h/d",
     "env prefix of a command": "PGPASSWORD=\"$PW\" psql postgres://u@h/d -c x",
@@ -649,6 +700,46 @@ GREEN_SHELL_PROBES = {
     "4691 a key that only contains password": "psql 'postgres://u@h/d?xpassword=1'",
     "4689 Environment= without a credential": "Environment=AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url",
 }
+RED_SHELL_PROBES.update({
+    # round 3, security reviewer A-series (#4792): wrapper and abbreviated-name forms
+    "r3-S docker run --env NAME=val": "docker run --env POSTGRES_PASSWORD=%s img" % PW,
+    "r3-S psql with a URL password": "psql \"postgres://u:%s@h/db\" -c 'select 1'" % PW,
+    "r3-S ssh host runs psql with a URL password": "ssh host \"psql postgres://u:%s@h/d -c 'select 1'\"" % PW,
+    "r3-S mysql --password=": "mysql -u root --password=%s db" % PW,
+    "r3-S docker -e DB_PW=": "docker run -e DB_PW=%s img" % PW,
+    "r3-S sudo -u postgres PGPASSWORD=x psql": "sudo -u postgres PGPASSWORD=%s psql -h h" % PW,
+    "r3-S kubectl --from-literal=password=": "kubectl create secret generic s --from-literal=password=%s" % PW,
+    "r3-S conninfo in an ssh string": "ssh h \"psql 'host=h user=u password=%s'\"" % PW,
+    "r3-S docker run -e via $(...) assignment": "X=$(docker run -e POSTGRES_PASSWORD=%s img)" % PW,
+    "r3-S podman --env=TOKEN": "podman run --env=API_TOKEN=%s img" % PW,
+    "r3-S xargs-fed docker": "echo img | xargs docker run -e POSTGRES_PASSWORD=%s" % PW,
+    # round 3, code reviewer A-series
+    "r3-C psql DSN double-quoted": 'psql "postgresql://u:%s@h/d" -c "SELECT 1"' % PW,
+    "r3-C psql DSN with a split scheme": "psql 'postgres''ql://u:%s@h/d'" % PW,
+    "r3-C store flag split by quotes, = form": "ai-memory serve --'store'-url=postgres://u:%s@h/d" % PW,
+    "r3-C docker run -e K=V": "docker run --rm -e PGPASSWORD=%s img" % PW,
+    "r3-C docker run --env=K=V": "docker run --rm --env=DB_PASSWORD=%s img" % PW,
+    "r3-C docker run -eK=V glued": "docker run --rm -eAPI_TOKEN=%s img" % PW,
+    "r3-C docker -e STORE_URL=DSN": 'docker run -e "AI_MEMORY_STORE_URL=postgres://u:%s@h/d" img' % PW,
+    "r3-C psql keyword conninfo": 'psql "host=h dbname=d user=u password=%s"' % PW,
+    "r3-C psql query password key, encoded": 'psql "postgresql://u@h/d?pass%%77ord=%s"' % PW,
+    "r3-C ssh remote command string with a DSN": 'ssh host "psql postgresql://u:%s@h/d -c \'SELECT 1\'"' % PW,
+    "r3-C ssh unquoted remote docker -e": "ssh host docker exec -e PGPASSWORD=%s c psql" % PW,
+    "r3-C bash -c wrapping docker -e": 'bash -c "docker run -e PGPASSWORD=%s img"' % PW,
+    "r3-C substitution in an assignment runs docker -e": 'OUT="$(docker exec -e PGPASSWORD=%s c psql)"' % PW,
+    "r3-C a variable password is still a credential on argv": 'psql "postgresql://u:$PW@h/d"',
+    "r3-C backslash continuation splitting docker -e": "docker run --rm \\\n  -e PGPASSWORD=%s \\\n  img" % PW,
+    "r3-C YAML list item with an ExecStart DSN": "  - ExecStart=/usr/bin/x %s postgres://u:%s@h/d" % (SU, PW),
+})
+GREEN_SHELL_PROBES.update({
+    "r3-S docker run --env-file": "docker run --env-file ./pg.env img",
+    "r3-S PGPASSWORD=x psql (environment, not argv)": "PGPASSWORD=%s psql -h h -U u" % PW,
+    "r3-S docker exec -e PGPASSWORD (bare name)": "docker exec -e PGPASSWORD c psql -U u",
+    "r3-C here-string carries a DSN on stdin": 'psql -f - <<< "postgresql://u:%s@h/d"' % PW,
+    "r3-C docker run -e bare name": "docker run --rm -e PGPASSWORD img",
+    "r3-C redaction token ***": 'psql "postgresql://u:***@h/d"',
+    "r3-C echo of a DSN (builtin, no argv)": 'echo "postgresql://u:%s@h/d" > f' % PW,
+})
 GREEN_PROBES = {
     "file-form": "AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url ai-memory serve",
     "no-password": "ai-memory serve %s postgres://u@h/d" % SU,
@@ -898,6 +989,21 @@ def self_test() -> int:
         red += 1
         if len(stale) != 1:
             print("SELF-TEST FAIL: stale pending entry was not reported", file=sys.stderr)
+            bad += 1
+        # #4791: an entry claims its expected count of hits, not every matching line.
+        (root / "two.sh").write_text(
+            RED_SHELL_PROBES["4690 pg_dump --dbname= form"] + "\n" + RED_SHELL_PROBES["4690 pg_dump --dbname= form"] + "\n",
+            encoding="utf-8")
+        two_hits, _ = scan_paths(root, ["two.sh"])
+        left, listed, stale = split_pending(root, two_hits, (("two.sh", "pg_dump --dbname=", "#0"),))
+        red += 1
+        if len(two_hits) != 2 or len(left) != 1 or len(listed) != 1 or stale:
+            print("SELF-TEST FAIL: a pending entry claimed more hits than its count (#4791)", file=sys.stderr)
+            bad += 1
+        left, listed, stale = split_pending(root, two_hits, (("two.sh", "pg_dump --dbname=", "#0", 2),))
+        green += 1
+        if left or len(listed) != 2 or stale:
+            print("SELF-TEST FAIL: a pending entry with count 2 did not claim both hits (#4791)", file=sys.stderr)
             bad += 1
         _, scanned = scan_paths(root, [])
         red += 1

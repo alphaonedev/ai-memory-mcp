@@ -11,3 +11,4 @@ do-hive #4671 | /opt/ai-memory/provision.sh | tar -xzf /opt/ai-memory/ai-memory.
 do-hive #4671 | /opt/ai-memory/provision.sh | chmod 0755 /opt/ai-memory/bin/ai-memory || true
 do-hive #4671 | /opt/ai-memory/provision.sh | ( umask 077; printf "CREATE USER aimemory WITH PASSWORD '%s';\n" '${db_password}' > /root/.aimemory-role.sql )
 do-hive #4671 | /opt/ai-memory/provision.sh | ( umask 077; printf '"aimemory" "${db_password}"\n' > /etc/pgbouncer/userlist.txt )
+aws-gpu-burst #4610 | /etc/ai-memory/store-url | postgres://aimemory:CHANGEME@localhost/aimemory?sslmode=verify-full&sslrootcert=/etc/ai-memory/tls/pg-ca.crt
