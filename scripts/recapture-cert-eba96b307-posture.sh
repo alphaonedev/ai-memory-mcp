@@ -5,7 +5,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="$ROOT/docs/compliance/evidence/cert-eba96b307"
-FIX="$ROOT/.local-runs/cert-eba96b307-fixtures"
+export FIX="$ROOT/.local-runs/cert-eba96b307-fixtures"
 DEFAULT_BIN="${DEFAULT_BIN:-/mnt/t9/v07/cargo-target-gate-tip/release/ai-memory}"
 SQLCIPHER_BIN="${SQLCIPHER_BIN:-/mnt/t9/v07/cargo-target-gate-live/release/ai-memory}"
 export TMPDIR="${TMPDIR:-$ROOT/.local-runs/tmp}"
@@ -18,7 +18,7 @@ import os, base64
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat, PrivateFormat, NoEncryption
 
-fix = Path(os.environ.get("FIX") or Path.cwd() / ".local-runs/cert-eba96b307-fixtures")
+fix = Path(os.environ["FIX"])
 fix.mkdir(parents=True, exist_ok=True)
 keys = fix / "keys"
 keys.mkdir(mode=0o700, exist_ok=True)
@@ -66,7 +66,7 @@ run_posture() {
     AI_MEMORY_AGENT_ID=ai-memory \
     AI_MEMORY_KEY_DIR="$FIX/keys" \
     "$@" \
-    bash -c 'if [ -n "${POSTURE_PASSFILE:-}" ]; then export AI_MEMORY_DB_PASSPHRASE="$(cat "$POSTURE_PASSFILE")"; fi; unset POSTURE_PASSFILE; exec "$@"' \
+    bash -c 'if [ -n "${POSTURE_PASSFILE:-}" ]; then k="$(cat "$POSTURE_PASSFILE")" || exit 70; export AI_MEMORY_DB_PASSPHRASE="$k"; fi; unset POSTURE_PASSFILE; exec "$@"' \
     _ "$bin" doctor --posture enterprise-federation
 }
 
@@ -127,7 +127,7 @@ else
   # doctor opens the store read-only and refuses to create it: seed the encrypted fixture store first (schema-init).
   [[ -f "$FIX/leg4-sqlcipher.db" ]] || env -i PATH="/usr/bin:/bin:$HOME/.cargo/bin" HOME="$HOME" TMPDIR="$TMPDIR" AI_MEMORY_NO_CONFIG=1 \
     AI_MEMORY_DB="$FIX/leg4-sqlcipher.db" \
-    bash -c 'export AI_MEMORY_DB_PASSPHRASE="$(cat "$1")"; shift; exec "$@"' _ "$FIX/db-passphrase" "$SQLCIPHER_BIN" stats --json >/dev/null 2>&1 || true
+    bash -c 'k="$(cat "$1")" || exit 70; export AI_MEMORY_DB_PASSPHRASE="$k"; shift; exec "$@"' _ "$FIX/db-passphrase" "$SQLCIPHER_BIN" stats --json >/dev/null 2>&1 || true
   set +e
   run_posture "$SQLCIPHER_BIN" "${HARD[@]}" \
     AI_MEMORY_DB="$FIX/leg4-sqlcipher.db" \
