@@ -3789,7 +3789,7 @@ pub struct AdminConfig {
     /// verbatim. Validation: the SAL accepts the same NHI
     /// `agent_id` charset that
     /// [`crate::validate::validate_agent_id`] enforces (see the
-    /// "Agent Identity (NHI)" section of docs/reference/ARCHITECTURE_REFERENCE.md). Entries that
+    /// "Agent Identity (NHI)" section of `docs/reference/ARCHITECTURE_REFERENCE.md`). Entries that
     /// fail validation at boot are logged at `warn` and dropped
     /// from the in-memory allowlist; the daemon still starts so
     /// a single typo does not lock the operator out.

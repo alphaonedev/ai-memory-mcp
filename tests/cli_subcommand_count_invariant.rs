@@ -21,7 +21,7 @@
 //! Variants gated by `#[cfg(feature = "sal")]` (`Migrate` +
 //! `SchemaInit` at v0.7.0) count toward the SAL total but not the
 //! default total. Adding a new variant requires a matching bump to
-//! the appropriate const so the docs surface (docs/reference/ARCHITECTURE_REFERENCE.md §"Architecture",
+//! the appropriate const so the docs surface (`docs/reference/ARCHITECTURE_REFERENCE.md` §"Architecture",
 //! release notes, audience pages) can never drift silently again.
 
 use std::fs;
@@ -41,7 +41,7 @@ fn keys_prune_is_present_in_the_counted_cli_surface() {
 /// is the FULL count when `--features sal` (or `sal-postgres`) is
 /// active (default variants + sal-gated variants).
 ///
-/// Matches the canonical docs/reference/ARCHITECTURE_REFERENCE.md §"Architecture" recipe:
+/// Matches the canonical `docs/reference/ARCHITECTURE_REFERENCE.md` §"Architecture" recipe:
 /// `awk '/^pub enum Command/,/^}/' src/daemon_runtime.rs |
 /// grep -E '^    [A-Z]' | wc -l`. That recipe counts every line
 /// inside the `pub enum Command { ... }` body whose first 4 columns

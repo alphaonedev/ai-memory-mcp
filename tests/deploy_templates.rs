@@ -235,7 +235,7 @@ fn asi_hard_config_pins_the_pe1_knobs() {
 }
 
 /// #3113 — `docs/deploy/asi-hard.env` is the operator-facing enumeration of
-/// the hardened posture, and ARCHITECTURE_REFERENCE.md's env-table row #130 states it "names
+/// the hardened posture, and `ARCHITECTURE_REFERENCE.md`'s env-table row #130 states it "names
 /// all N correctly". NOTHING enforced that claim: the template names the
 /// knobs in PROSE (comment lines), so a knob added to `KNOBS` left the
 /// template silently one short while every assertion here still passed —

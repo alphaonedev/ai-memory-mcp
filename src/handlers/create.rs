@@ -191,7 +191,7 @@ pub(crate) fn http_pre_governance_decision_gate(
 ///   2. embedded `body.metadata.agent_id` (caller's NHI claim — load-
 ///      bearing for federation receivers and clients that prefer the
 ///      metadata-only shape; mirrors the MCP precedence at
-///      `crate::mcp::handle_store` (NHI precedence) and the docs/reference/ARCHITECTURE_REFERENCE.md §Agent Identity (NHI)
+///      `crate::mcp::handle_store` (NHI precedence) and the `docs/reference/ARCHITECTURE_REFERENCE.md` §Agent Identity (NHI)
 ///      contract).
 ///   3. `X-Agent-Id` request header
 ///   4. per-request anonymous fallback

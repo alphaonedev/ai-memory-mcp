@@ -59,7 +59,7 @@
 //!
 //! - `AI_MEMORY_FED_PERMISSIONS_MODE=enforce` — no `AI_MEMORY_FED_*`
 //!   permissions-mode knob exists. The real K3/K9 governance gate is
-//!   `AI_MEMORY_PERMISSIONS_MODE` (ARCHITECTURE_REFERENCE.md env-table row #10,
+//!   `AI_MEMORY_PERMISSIONS_MODE` (`ARCHITECTURE_REFERENCE.md` env-table row #10,
 //!   `crate::config::AppConfig::effective_permissions_mode`), which
 //!   this module checks resolves to [`crate::config::PermissionsMode::Enforce`].
 //! - `AI_MEMORY_FED_GOVERNANCE_FAIL_OPEN_ON_ERROR=0` — no `FED_`-prefixed

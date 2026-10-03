@@ -93,7 +93,7 @@ pub const TEST_BODY_READ_CAP: usize = HTTP_BODY_LIMIT_BYTES;
 /// from `ConfidenceTier::LIKELY_MIN` (also 0.7, a different concept).
 pub const RECALL_PRIMARY_CTX_BLEND: f32 = 0.7;
 /// F-B10 — recall cosine-similarity gate (relaxed 0.3 → 0.2 in v0.6.2 Patch 2,
-/// scenario-18; load-bearing per docs/reference/ARCHITECTURE_REFERENCE.md §"Recall Pipeline").
+/// scenario-18; load-bearing per `docs/reference/ARCHITECTURE_REFERENCE.md` §"Recall Pipeline").
 pub const RECALL_COSINE_GATE: f64 = 0.2;
 
 /// #1558 batch 5 wave 3 — canonical secret-redaction placeholder
@@ -261,7 +261,7 @@ pub const HEADER_AI_MEMORY_TIMESTAMP: &str = "x-ai-memory-timestamp";
 // ---------------------------------------------------------------------------
 
 /// `metadata.agent_id` — the NHI identity stamp written on every
-/// substrate row per docs/reference/ARCHITECTURE_REFERENCE.md §"Agent Identity". Read by visibility
+/// substrate row per `docs/reference/ARCHITECTURE_REFERENCE.md` §"Agent Identity". Read by visibility
 /// predicates, governance rule evaluator, federation peer attestation,
 /// audit chain. Immutable post-write (preserved across update / dedup
 /// / import / sync / consolidate per `identity::preserve_agent_id`).
@@ -284,13 +284,13 @@ pub const META_KEY_GOVERNANCE: &str = "governance";
 /// `metadata.imported_from_agent_id` — original NHI claim preserved
 /// when `ai-memory import` restamps `agent_id` with the importing
 /// caller's id (absent when `--trust-source` is passed). Documented at
-/// docs/reference/ARCHITECTURE_REFERENCE.md §"Agent Identity (NHI)" → "Special metadata keys".
+/// `docs/reference/ARCHITECTURE_REFERENCE.md` §"Agent Identity (NHI)" → "Special metadata keys".
 pub const META_KEY_IMPORTED_FROM_AGENT_ID: &str = "imported_from_agent_id";
 
 /// `metadata.consolidated_from_agents` — array of source authors,
 /// preserved on `memory_consolidate` (the consolidator's id becomes
 /// `agent_id`; the original authors stay readable from this array).
-/// Documented at docs/reference/ARCHITECTURE_REFERENCE.md §"Agent Identity (NHI)" → "Special metadata
+/// Documented at `docs/reference/ARCHITECTURE_REFERENCE.md` §"Agent Identity (NHI)" → "Special metadata
 /// keys".
 pub const META_KEY_CONSOLIDATED_FROM_AGENTS: &str = "consolidated_from_agents";
 
@@ -365,7 +365,7 @@ macro_rules! reserved_upsert_metadata_keys_sql {
 
 /// `metadata.mined_from` — source-format tag (`claude` / `chatgpt` /
 /// `slack`) stamped by `ai-memory mine` alongside the caller's
-/// `agent_id`. Documented at docs/reference/ARCHITECTURE_REFERENCE.md §"Agent Identity (NHI)" →
+/// `agent_id`. Documented at `docs/reference/ARCHITECTURE_REFERENCE.md` §"Agent Identity (NHI)" →
 /// "Special metadata keys".
 pub const META_KEY_MINED_FROM: &str = "mined_from";
 
