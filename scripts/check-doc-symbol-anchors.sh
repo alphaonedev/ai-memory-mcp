@@ -69,12 +69,6 @@
 # wave artefacts describe a tree AS IT WAS. Re-pointing their anchors
 # at HEAD would falsify the record they exist to keep.
 #
-# DATED SNAPSHOTS (#4549): `scripts/qc-allowlists/doc-symbol-anchors-dated-snapshots.txt`
-# enumerates the dated records (audits, campaign results, handoffs,
-# execution prompts) the gate skips. Unlike the FROZEN prefix class it is an
-# explicit per-file list, and each entry must exist and carry the
-# "Point-in-time record" banner or the gate fails.
-#
 # CLI:
 #   scripts/check-doc-symbol-anchors.sh              — run (exit 0/1)
 #   scripts/check-doc-symbol-anchors.sh --self-test  — plant the
@@ -120,8 +114,6 @@ RSEOF
 
     write_clean() {
         : > "$FIX/scripts/qc-allowlists/doc-symbol-anchors-allow.txt"
-        : > "$FIX/scripts/qc-allowlists/doc-symbol-anchors-dated-snapshots.txt"
-        rm -f "$FIX/docs/snapshot.md"
         # NEAR-MISS CONTROLS, every one must PASS:
         #  * the CORRECT symbol name, path-qualified
         #  * a brace list with a `Type::method` component
@@ -210,51 +202,6 @@ MDEOF
     [[ "$(run_fixture)" != "0" ]] || {
         echo "FAIL: self-test allowlist — a MALFORMED entry did not fail" >&2; exit 1; }
     echo "PASS: self-test allowlist — a MALFORMED entry HARD-FAILS"
-
-    # ---- DATED-SNAPSHOT list (#4549): enumerated, banner-checked ------
-    # A dated record (audit, campaign result, handoff, execution prompt)
-    # states what was true on its date; its src/ anchors are not
-    # maintained. The gate skips exactly the files enumerated in
-    # doc-symbol-anchors-dated-snapshots.txt, and only while each listed
-    # file exists and carries the "Point-in-time record" banner.
-    dated="$FIX/scripts/qc-allowlists/doc-symbol-anchors-dated-snapshots.txt"
-    write_snapshot() {
-        cat > "$FIX/docs/snapshot.md" <<'MDEOF'
-# Dated audit
-
-> **Point-in-time record, as of 2026-05-01.** The src/ file:line references describe the tree on that date.
-
-The decorator was `src/mcp/tools/recall.rs::decorate_memory` and the anchor `src/mcp/tools/recall.rs:9999`.
-MDEOF
-    }
-    write_clean
-    write_snapshot
-    [[ "$(run_fixture)" != "0" ]] || {
-        echo "FAIL: self-test #4549 — an UNLISTED dated doc with stale anchors was ACCEPTED" >&2; exit 1; }
-    run_fixture_out | grep -q 'docs/snapshot.md' || {
-        echo "FAIL: self-test #4549 — the unlisted stale doc was rejected without naming it" >&2; exit 1; }
-    echo "PASS: self-test #4549 — an unlisted doc with stale anchors still FAILS"
-
-    printf 'docs/snapshot.md\n' > "$dated"
-    [[ "$(run_fixture)" = "0" ]] || {
-        echo "FAIL: self-test #4549 — a LISTED, bannered dated doc was not skipped" >&2
-        run_fixture_out | sed 's/^/       /' >&2; exit 1; }
-    echo "PASS: self-test #4549 — a listed dated snapshot with stale anchors is SKIPPED"
-
-    sed -i '/Point-in-time record/d' "$FIX/docs/snapshot.md"
-    [[ "$(run_fixture)" != "0" ]] || {
-        echo "FAIL: self-test #4549 — a listed doc WITHOUT the banner was accepted" >&2; exit 1; }
-    run_fixture_out | grep -q 'banner' || {
-        echo "FAIL: self-test #4549 — missing banner rejected without naming it" >&2; exit 1; }
-    echo "PASS: self-test #4549 — a listed doc that lost its banner FAILS"
-
-    write_clean
-    printf 'docs/gone.md\n' > "$dated"
-    [[ "$(run_fixture)" != "0" ]] || {
-        echo "FAIL: self-test #4549 — a listed path that does not exist was accepted" >&2; exit 1; }
-    run_fixture_out | grep -q 'STALE' || {
-        echo "FAIL: self-test #4549 — missing listed path rejected without naming it STALE" >&2; exit 1; }
-    echo "PASS: self-test #4549 — a listed path that no longer exists FAILS as STALE"
 
     # ---- fail CLOSED on an analysis-engine error (CB-2 / #2713) -------
     # An internal engine error must NEVER print PASS — the exact fail-open
@@ -372,32 +319,6 @@ FROZEN = re.compile(
     r"^docs/(v0\.|internal/|audit/|rfc/|adr|BASELINE|"
     r"v1\.0\.0/perfect-endpoint-assessment/)")
 
-# DATED SNAPSHOTS (#4549). A dated record (audit, campaign result, handoff,
-# execution prompt, inventory) states what was true on its date; its src/
-# anchors describe that tree and are not maintained, so re-pointing them
-# at HEAD would falsify the record (same reasoning as FROZEN above).
-# FROZEN is a path-prefix class; this is an ENUMERATED list, one repo path
-# per line, in doc-symbol-anchors-dated-snapshots.txt. A listed file is
-# skipped only while it EXISTS and still carries the "Point-in-time
-# record" banner; a missing or banner-less entry is a violation, so the
-# list cannot rot into a blanket exemption.
-BANNER = "Point-in-time record"
-dated = []
-dated_path = os.path.join(root, "scripts/qc-allowlists/doc-symbol-anchors-dated-snapshots.txt")
-if os.path.exists(dated_path):
-    for raw in open(dated_path, encoding="utf-8").read().splitlines():
-        entry = raw.split("#", 1)[0].strip()
-        if entry and entry not in dated:
-            dated.append(entry)
-for entry in dated:
-    full = os.path.join(root, entry)
-    if not os.path.isfile(full):
-        print(f"DATED\t{entry}\t0\t{entry}\tSTALE dated-snapshot entry (file does not exist) - delete it")
-        continue
-    head = open(full, encoding="utf-8", errors="replace").read().splitlines()[:40]
-    if not any(BANNER in h for h in head):
-        print(f"DATED\t{entry}\t1\t{entry}\tdated-snapshot entry carries no '{BANNER}' banner in its first 40 lines")
-
 docs = ["CLAUDE.md", "README.md", "ROADMAP.md", "PERFORMANCE.md"]
 docs += sorted(glob.glob(os.path.join(root, "docs/*.md")))
 for sub in ("security", "compliance", "spec", "integrations", "deploy", "v1.0.0"):
@@ -406,7 +327,7 @@ for sub in ("security", "compliance", "spec", "integrations", "deploy", "v1.0.0"
 seen_docs = []
 for d in docs:
     rel = d[len(root) + 1:] if d.startswith(root + "/") else d
-    if FROZEN.match(rel) or rel in dated or rel in seen_docs:
+    if FROZEN.match(rel) or rel in seen_docs:
         continue
     if os.path.exists(os.path.join(root, rel)):
         seen_docs.append(rel)
@@ -561,7 +482,6 @@ if [[ -n "$violations" ]]; then
             LINE)  detail="file:line anchor points past end-of-file" ;;
             QUAL)  detail="symbol is not defined in the file it is qualified against" ;;
             MDLINK) detail="markdown symbol link does not resolve in its target file" ;;
-            DATED) detail="dated-snapshot list entry is invalid (missing file or missing banner)" ;;
             LADDER_TIP) detail="claimed ladder tip disagrees with the tip scripts/check-migration-ladder.sh computes (left=cited, right=actual)" ;;
             *)     detail="unresolved anchor" ;;
         esac
