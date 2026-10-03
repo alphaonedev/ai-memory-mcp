@@ -216,6 +216,18 @@ MDEOF
     anchor_green 4700 "the first line (:1)" 'See `src/mcp/tools/recall.rs:1`.'
     anchor_green 4700 "the last line (:4)" 'See `src/mcp/tools/recall.rs:4`.'
 
+    # #4699: a ./ prefix on a symbol anchor is checked like no prefix.
+    anchor_red 4699 QUAL "a ./src/ symbol anchor to a removed symbol" \
+        'See `./src/mcp/tools/recall.rs::decorate_memory`.'
+    anchor_red 4699 QUAL "a ./src/ brace list with a removed symbol" \
+        'See `./src/mcp/tools/recall.rs::{RecallTool, no_such}`.'
+    anchor_red 4699 QUAL "a ././src/ symbol anchor to a removed symbol" \
+        'See `././src/mcp/tools/recall.rs::no_such`.'
+    anchor_green 4699 "a ./src/ symbol anchor to a live symbol" \
+        'See `./src/mcp/tools/recall.rs::decorate_memory_many`.'
+    anchor_green 4699 "a ./src/ brace list of live symbols" \
+        'See `./src/mcp/tools/recall.rs::{RecallTool, decorate_memory_many}`.'
+
     # ---- #4651: a BARE src/x.rs:N line anchor (no backtick) ----------
     # Every form the #4651 census found must FAIL as BARE_LN; the only
     # exemption is the label of a commit-pinned permalink (immutable).
@@ -462,15 +474,26 @@ for d in docs:
     if os.path.exists(os.path.join(root, rel)):
         seen_docs.append(rel)
 
-# #4680: a backticked ./ or ../ prefix is consumed like no prefix.
-PATH = re.compile(r"`(?:\.{1,2}/)*(src/[A-Za-z0-9_/]+\.rs)`")
-PATHLN = re.compile(r"`(?:\.{1,2}/)*(src/[A-Za-z0-9_/]+\.rs):(\d+)")
+# #4699: every rule below sees ONE canonical form. canon() strips any
+# leading ./ and ../ segments from a `src/<path>.rs` token before the
+# rules run (so PATH, PATHLN, BARE_LN and QUAL need no prefix group of
+# their own). A token preceded by a letter, digit, dot or slash is left
+# alone: its root is unknown (`foo./src/x.rs`, `x/./src/x.rs`).
+CANON = re.compile(r"(?<![A-Za-z0-9./])(?:\.{1,2}/)*(src/[A-Za-z0-9_/]+\.rs)")
+
+
+def canon(line):
+    return CANON.sub(lambda m: m.group(1), line)
+
+
+PATH = re.compile(r"`(src/[A-Za-z0-9_/]+\.rs)`")
+PATHLN = re.compile(r"`(src/[A-Za-z0-9_/]+\.rs):(\d+)")
 # #4651: a BARE `src/x.rs:N` (no leading backtick: plain prose, a link
 # label, HTML text). Not preceded by a backtick (PATHLN owns that form),
 # a path separator, a dot or an alphanumeric, so URL path segments are
-# skipped; a ./ or ../ prefix is consumed and `_` (markdown emphasis) may
-# precede the path (#4668).
-BARE_LN = re.compile(r"(?<![`/A-Za-z0-9.])(?:\.{1,2}/)*(src/[A-Za-z0-9_/]+\.rs):(\d+)")
+# skipped; canon() has already removed a ./ or ../ prefix and `_` (markdown
+# emphasis) may precede the path (#4668).
+BARE_LN = re.compile(r"(?<![`/A-Za-z0-9.])(src/[A-Za-z0-9_/]+\.rs):(\d+)")
 # A bare anchor is exempt ONLY as the label of a link whose target is a
 # commit-pinned permalink (/blob/<40 hex>/): immutable, cannot rot, and
 # only when the label's path and line (or range) equal the URL's (#4670).
@@ -478,7 +501,7 @@ PIN_URL = re.compile(r"^https://github\.com/[^/]+/[^/]+/blob/[0-9a-f]{40}/")
 LABEL_MD = re.compile(r"^[^\]\n]*\]\(([^)\s]*)")
 LABEL_HTML = re.compile(r"^[^<\n]*</a>")
 QUAL = re.compile(
-    r"`(?:\.\./)*(src/[A-Za-z0-9_/]+\.rs)::(?:\{([^}]*)\}|([A-Za-z_][A-Za-z0-9_:]*))")
+    r"`(src/[A-Za-z0-9_/]+\.rs)::(?:\{([^}]*)\}|([A-Za-z_][A-Za-z0-9_:]*))")
 MDLINK = re.compile(r"\[`([A-Za-z_][A-Za-z0-9_]*)`\]\(([^)]*src/[A-Za-z0-9_/]+\.rs)[^)]*\)")
 IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -545,6 +568,7 @@ for doc in seen_docs:
     doc_lines = text.splitlines()
     for ln, line in enumerate(doc_lines, 1):
         ctx = line.strip()
+        line = canon(line)
         window = "\n".join(doc_lines[max(0, ln - 2):ln + 1])
         absent_ok = bool(ABSENT_ASSERTION.search(window))
 
