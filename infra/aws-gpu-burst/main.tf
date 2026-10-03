@@ -87,8 +87,8 @@ variable "ai_memory_image_url" {
   type        = string
 
   validation {
-    condition     = startswith(var.ai_memory_image_url, "https://") && length(var.ai_memory_image_url) > length("https://") && !strcontains(var.ai_memory_image_url, "%") && !strcontains(lower(var.ai_memory_image_url), "/releases/latest")
-    error_message = "ai_memory_image_url must be a non-empty https:// URL of a versioned release, with no percent-encoding; /releases/latest moves (in any letter case) and would not match ai_memory_image_sha256."
+    condition     = startswith(var.ai_memory_image_url, "https://") && length(var.ai_memory_image_url) > length("https://") && !strcontains(var.ai_memory_image_url, "%") && !strcontains(lower(var.ai_memory_image_url), "/releases/latest") && can(regex("^https://[A-Za-z0-9][A-Za-z0-9._~/-]*$", var.ai_memory_image_url))
+    error_message = "ai_memory_image_url must be a non-empty https:// URL of a versioned release, with no percent-encoding and only letters, digits and . _ ~ / - after the scheme (no shell metacharacter reaches the root provision script, #4787); /releases/latest moves (in any letter case) and would not match ai_memory_image_sha256."
   }
 }
 
@@ -222,6 +222,14 @@ resource "aws_spot_instance_request" "vllm" {
     volume_size = 100
   }
 
+  # #4789: IMDSv2 only (session tokens, hop limit 1), so a request-forwarding
+  # flaw or a container on the node cannot read the instance credentials.
+  metadata_options {
+    http_endpoint               = "enabled"
+    http_tokens                 = "required"
+    http_put_response_hop_limit = 1
+  }
+
   tags = { Name = "ai-memory-burst-vllm", Project = "ai-memory-track-e2" }
 }
 
@@ -248,6 +256,14 @@ resource "aws_instance" "memory" {
     volume_size = 100
   }
 
+  # #4789: IMDSv2 only (session tokens, hop limit 1), so a request-forwarding
+  # flaw or a container on the node cannot read the instance credentials.
+  metadata_options {
+    http_endpoint               = "enabled"
+    http_tokens                 = "required"
+    http_put_response_hop_limit = 1
+  }
+
   tags = { Name = "ai-memory-burst-substrate", Project = "ai-memory-track-e2" }
 }
 
@@ -272,6 +288,14 @@ resource "aws_spot_instance_request" "agent" {
     memory_private_ip  = aws_instance.memory.private_ip
     agent_index        = count.index + 1
   })
+
+  # #4789: IMDSv2 only (session tokens, hop limit 1), so a request-forwarding
+  # flaw or a container on the node cannot read the instance credentials.
+  metadata_options {
+    http_endpoint               = "enabled"
+    http_tokens                 = "required"
+    http_put_response_hop_limit = 1
+  }
 
   tags = { Name = "ai-memory-burst-agent-${count.index + 1}", Project = "ai-memory-track-e2" }
 }

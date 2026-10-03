@@ -11,3 +11,4 @@ do-hive #4671 | /opt/ai-memory/provision.sh | printf '"aimemory" "${db_password}
 do-hive #4671 | /opt/ai-memory/provision.sh | curl -fsSL "${ai_memory_image_url}" -o /opt/ai-memory/ai-memory.tar.gz || true
 do-hive #4671 | /opt/ai-memory/provision.sh | tar -xzf /opt/ai-memory/ai-memory.tar.gz -C /opt/ai-memory/bin || true
 do-hive #4671 | /opt/ai-memory/provision.sh | chmod 0755 /opt/ai-memory/bin/ai-memory || true
+aws-gpu-burst #4610 | /etc/ai-memory/store-url | postgres://aimemory:CHANGEME@localhost/aimemory?sslmode=verify-full&sslrootcert=/etc/ai-memory/tls/pg-ca.crt
