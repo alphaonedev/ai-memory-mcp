@@ -282,7 +282,7 @@ write_files:
       [ -x "$BIN" ] || fail "no ai-memory binary at $BIN; scp a --features sal-postgres build over it, then: systemctl restart ai-memory-fed-bootstrap"
       if [ ! -f "$KEY_DIR/$FED_ID.priv" ]; then
         sudo -u aimemory env AI_MEMORY_NO_CONFIG=1 AI_MEMORY_DB=/opt/ai-memory/identity.db \
-          "$BIN" identity generate --agent-id "$FED_ID" --key-dir "$KEY_DIR" \
+          /opt/ai-memory/bin/ai-memory identity generate --agent-id "$FED_ID" --key-dir "$KEY_DIR" \
           || fail "identity generate failed for $FED_ID"
       fi
       cp "$KEY_DIR/$FED_ID.pub" "$FED_DIR/$FED_ID.pub"
