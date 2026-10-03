@@ -26,8 +26,16 @@ What this gate enforces (and nothing more):
      fails; a missing, unreadable or symlinked manifest fails. `--update` rewrites the
      manifest and prints the changed sections. This is tamper-evidence, not authority:
      an agent that edits a rule can also run --update, so the two reviews and the sole
-     merger remain the enforcement. The base-branch comparison job
-     (.github/workflows/claude-md-guard.yml) makes a rule change loud in the PR.
+     merger remain the enforcement.
+  7. The pull_request_target workflow .github/workflows/claude-md-rule-compare.yml equals
+     its pinned canonical form. That job runs the BASE guard and BASE manifest over the head
+     (read from git objects, never executed) via scripts/claude-md-rule-compare.py, prints
+     every changed, added or removed rule section with its diff ("RULE TEXT CHANGED", or
+     "COUNT CHANGED" for digit-only edits) and fails a rule change unless a commit in the
+     range carries a `Rule-Change-Approved-By: <who>` trailer. TAMPER-EVIDENCE, not
+     authority: an agent can write the trailer; the two reviews and the sole merger enforce.
+     Bootstrap: it runs only once the workflow is on the base branch, so PR #4508 itself is
+     judged by review.
 It does NOT prove that moved text is unchanged; that needs review. Heading, size and ceiling constants
 are pinned: ceilings only fall, floors only rise, and a change to any of them is
 an explicit decision.
@@ -1575,6 +1583,94 @@ def workflow_errors(path: Path, label: str = WORKFLOW_PATH) -> list:
     return errors
 
 
+COMPARE_WORKFLOW_PATH = ".github/workflows/claude-md-rule-compare.yml"
+COMPARE_CHECKOUT = "uses: actions/checkout@"
+# R3-F3: the pull_request_target workflow runs with the BASE checkout and treats the head as data. It is
+# pinned to this canonical form (comments and blank lines dropped), so a changed trigger, a wider permission,
+# a head checkout, an extra step or a `run:` that is not the comparison script fails the guard.
+COMPARE_WORKFLOW_LINES = (
+    "name: CLAUDE.md rule-change comparison",
+    "on:",
+    "pull_request_target:",
+    'branches: [main, develop, "release/**", "rehearsal/**"]',
+    "types: [opened, synchronize, reopened]",
+    "permissions:",
+    "contents: read",
+    "concurrency:",
+    "group: claude-md-rule-compare-${{ github.event.pull_request.number }}",
+    "cancel-in-progress: true",
+    "jobs:",
+    "compare:",
+    "name: CLAUDE.md rule-change comparison",
+    "runs-on: ubuntu-latest",
+    "timeout-minutes: 10",
+    "steps:",
+    "- name: Check out the BASE commit only",
+    COMPARE_CHECKOUT,
+    "with:",
+    "ref: ${{ github.event.pull_request.base.sha }}",
+    "fetch-depth: 0",
+    "persist-credentials: false",
+    "- name: Fetch the pull request head as git objects (data, never checked out)",
+    "env:",
+    "PR_NUMBER: ${{ github.event.pull_request.number }}",
+    'run: git fetch --no-tags origin "+refs/pull/${PR_NUMBER}/head:refs/remotes/pull/head"',
+    "- name: Comparison self-test (base code)",
+    "run: python3 scripts/claude-md-rule-compare.py --self-test",
+    "- name: Compare the head rule sections with the base manifest",
+    "env:",
+    "BASE_SHA: ${{ github.event.pull_request.base.sha }}",
+    "HEAD_SHA: ${{ github.event.pull_request.head.sha }}",
+    'run: python3 scripts/claude-md-rule-compare.py --base-root . --repo . --base-sha "$BASE_SHA" '
+    '--head-sha "$HEAD_SHA" --scratch "$RUNNER_TEMP/rule-compare" --summary "$GITHUB_STEP_SUMMARY"',
+)
+COMPARE_DANGER = (
+    ("if:", "a condition can skip the comparison"),
+    ("paths:", "a paths filter can skip the comparison"),
+    ("paths-ignore:", "a paths filter can skip the comparison"),
+    ("continue-on-error:", "it can swallow a failure"),
+    ("shell:", "it can swallow a failure"),
+    ("head.ref", "the head branch name must never reach the job"),
+    ("head.repo", "the head repository must never be checked out"),
+    ("head_ref", "the head branch name must never reach the job"),
+    ("/merge", "the merge ref contains head content"),
+    ("secrets.", "no secret may be exposed to a pull_request_target job"),
+)
+
+
+def compare_workflow_errors(path: Path, label: str = COMPARE_WORKFLOW_PATH) -> list:
+    """R3-F3: the pull_request_target comparison workflow must equal its pinned canonical form."""
+    errors = []
+    if regular_size(path, label, errors) is None:
+        return errors
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        return [f"FAIL: cannot read {label} as UTF-8: {exc}"]
+    lines = []
+    for raw in split_lines(text):
+        stripped = re.sub(r"(^|\s)#.*$", "", raw).strip()
+        if stripped:
+            lines.append(stripped)
+    for token, why in COMPARE_DANGER:
+        if any(token in line for line in lines):
+            errors.append(f"FAIL: {label} contains `{token}`: {why} (#4507 R3-F3)")
+    for line in lines:
+        if line.startswith(("- uses:", "uses:")) and not re.search(r"uses:\s*\S+@[0-9a-f]{40}$", line):
+            errors.append(f"FAIL: {label} action is not pinned to a 40-hex commit sha: {line[:100]} (#4507 R3-F3)")
+    expected = list(COMPARE_WORKFLOW_LINES)
+    if len(lines) != len(expected):
+        errors.append(f"FAIL: {label} has {len(lines)} meaningful lines, the pinned form has {len(expected)} (#4507 R3-F3)")
+    for number, (got, want) in enumerate(zip(lines, expected), 1):
+        if want == COMPARE_CHECKOUT:
+            if not re.fullmatch(r"uses: actions/checkout@[0-9a-f]{40}", got):
+                errors.append(f"FAIL: {label} meaningful line {number} must be the pinned checkout action, got {got[:100]} (#4507 R3-F3)")
+        elif got != want:
+            errors.append(f"FAIL: {label} meaningful line {number} differs from the pinned form: {got[:100]} (#4507 R3-F3)")
+            break
+    return errors
+
+
 def scratch_base_error(repo_root: Path):
     """Return a failure message when `<repo_root>/.local-runs` is a symlink (or not a directory), else None.
 
@@ -1688,6 +1784,59 @@ def run_workflow_cases(repo_root: Path, base: Path) -> bool:
     if not any("cannot stat" in line for line in workflow_errors(missing, "absent")):
         print("FAIL: self-test - a missing workflow file was NOT rejected", file=sys.stderr)
         ok = False
+    ok &= run_compare_workflow_cases(repo_root, base)
+    return ok
+
+
+def run_compare_workflow_cases(repo_root: Path, base: Path) -> bool:
+    """R3-F3: the pull_request_target comparison workflow is pinned; each unsafe edit is refused."""
+    ok = True
+    real = repo_root / COMPARE_WORKFLOW_PATH
+    if compare_workflow_errors(real):
+        print(f"FAIL: self-test - the comparison workflow was rejected: {compare_workflow_errors(real)[0]}",
+              file=sys.stderr)
+        return False
+    good = real.read_text(encoding="utf-8")
+    wf = base / "cwf"
+    wf.mkdir()
+
+    def case(label: str, text: str, needle: str) -> bool:
+        target = wf / "w.yml"
+        target.write_text(text, encoding="utf-8")
+        if not any(needle in line for line in compare_workflow_errors(target, label)):
+            print(f"FAIL: self-test - compare workflow case {label!r} was NOT rejected (wanted {needle!r})",
+                  file=sys.stderr)
+            return False
+        return True
+
+    checkout = "        with:\n          ref: ${{ github.event.pull_request.base.sha }}\n"
+    ok &= case("R3-F3 head checked out", good.replace(
+        "ref: ${{ github.event.pull_request.base.sha }}\n          fetch", "ref: ${{ github.event.pull_request.head.sha }}\n          fetch", 1),
+        "differs from the pinned form")
+    ok &= case("R3-F3 head repo checked out", good.replace(
+        checkout, checkout + "          repository: ${{ github.event.pull_request.head.repo.full_name }}\n", 1), "head.repo")
+    ok &= case("R3-F3 merge ref", good.replace("refs/pull/${PR_NUMBER}/head", "refs/pull/${PR_NUMBER}/merge", 1), "/merge")
+    ok &= case("R3-F3 write permission", good.replace("  contents: read", "  contents: write", 1), "differs from the pinned form")
+    ok &= case("R3-F3 extra permission", good.replace("  contents: read", "  contents: read\n  pull-requests: write", 1),
+               "meaningful lines")
+    ok &= case("R3-F3 job-level if", good.replace("    timeout-minutes: 10", "    timeout-minutes: 10\n    if: false", 1), "`if:`")
+    ok &= case("R3-F3 paths filter", good.replace("    branches:", "    paths: [\"src/**\"]\n    branches:", 1), "`paths:`")
+    ok &= case("R3-F3 branch removed", good.replace(', "rehearsal/**"]', "]", 1), "differs from the pinned form")
+    ok &= case("R3-F3 unpinned action", good.replace("@11d5960a326750d5838078e36cf38b85af677262", "@v4", 1), "pinned")
+    ok &= case("R3-F3 step removed", good.replace(
+        "      - name: Comparison self-test (base code)\n        run: python3 scripts/claude-md-rule-compare.py --self-test\n", "", 1),
+        "meaningful lines")
+    ok &= case("R3-F3 extra step", good + "      - run: python3 CLAUDE.md\n", "meaningful lines")
+    ok &= case("R3-F3 swallowed failure", good.replace(
+        "--self-test\n", "--self-test\n        continue-on-error: true\n", 1), "continue-on-error")
+    ok &= case("R3-F3 secret exposed", good.replace(
+        "          PR_NUMBER:", "          TOKEN: ${{ secrets.GITHUB_TOKEN }}\n          PR_NUMBER:", 1), "secrets.")
+    ok &= case("R3-F3 pull_request trigger instead", good.replace("  pull_request_target:\n", "  pull_request:\n", 1),
+               "differs from the pinned form")
+    missing = wf / "absent.yml"
+    if not any("cannot stat" in line for line in compare_workflow_errors(missing, "absent")):
+        print("FAIL: self-test - a missing comparison workflow was NOT rejected", file=sys.stderr)
+        ok = False
     return ok
 
 
@@ -1737,6 +1886,7 @@ def main() -> int:
         return 1 if ref_errors else 0
     errors = check(Path(args.root))
     errors += workflow_errors(Path(args.root) / WORKFLOW_PATH)
+    errors += compare_workflow_errors(Path(args.root) / COMPARE_WORKFLOW_PATH)
     for line in errors:
         print(line, file=sys.stderr)
     if errors:

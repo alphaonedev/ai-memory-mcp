@@ -1,0 +1,74 @@
+# Copyright 2026 AlphaOne LLC
+# SPDX-License-Identifier: Apache-2.0
+#
+# CLAUDE.md rule-change comparison (issue #4507, PR #4508 review R3-F3).
+#
+# WHAT IT IS. Tamper-EVIDENCE, not authority. A pull request that changes the
+# text of a CLAUDE.md rule section cannot hide behind a re-sealed manifest: this
+# job runs the BASE branch's guard and the BASE branch's manifest over the pull
+# request head's copies, prints every changed, added or removed rule section
+# with its diff to the job summary under "RULE TEXT CHANGED" (digit-only edits
+# print "COUNT CHANGED"), and fails unless a commit in the PR range carries a
+# `Rule-Change-Approved-By: <who>` trailer. An agent can also write that
+# trailer. The two independent Opus reviews and the sole merger are what
+# enforce a rule change; this job makes sure the change is loud and cannot be
+# silent. The residual (nothing separates operator from agent: one account, one
+# signing key) is tracked as a GitHub issue with a hardware-key signing design.
+#
+# WHY pull_request_target. The pull_request run of claude-md-guard.yml executes
+# the head's own guard and manifest, so a head that rewrites both passes. This
+# trigger runs the workflow FILE OF THE BASE BRANCH with the base checkout, and
+# the head is DATA: scripts/claude-md-rule-compare.py reads CLAUDE.md and the two
+# docs/reference files out of git objects (ls-tree, cat-file), refuses a symlink
+# blob, and never executes, imports or checks out anything from the head.
+# Permissions are contents: read. No secret is used.
+#
+# BOOTSTRAP. pull_request_target only runs a workflow that already exists on the
+# base branch, so the pull request that introduces this file (PR #4508) is not
+# judged by it; that PR is judged by review. From the first landing on, it is.
+#
+# DELIBERATE CHOICES. No paths filter and no job-level `if` (a skipped required
+# context reads as pending and wedges the queue; scripts/check-required-
+# contexts.sh rule f). No merge_group trigger: the comparison needs a pull
+# request head to compare, and the merge-queue ref is the base plus that head,
+# which the pull_request_target run has already judged. The guard also checks
+# THIS file (compare_workflow_errors in scripts/check-claude-md-size.py) against
+# a pinned canonical form, so widening permissions, checking out the head or
+# adding a step fails the guard.
+name: CLAUDE.md rule-change comparison
+
+on:
+  pull_request_target:
+    branches: [main, develop, "release/**", "rehearsal/**"]
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: claude-md-rule-compare-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  compare:
+    name: CLAUDE.md rule-change comparison
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out the BASE commit only
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Fetch the pull request head as git objects (data, never checked out)
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: git fetch --no-tags origin "+refs/pull/${PR_NUMBER}/head:refs/remotes/pull/head"
+      - name: Comparison self-test (base code)
+        run: python3 scripts/claude-md-rule-compare.py --self-test
+      - name: Compare the head rule sections with the base manifest
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: python3 scripts/claude-md-rule-compare.py --base-root . --repo . --base-sha "$BASE_SHA" --head-sha "$HEAD_SHA" --scratch "$RUNNER_TEMP/rule-compare" --summary "$GITHUB_STEP_SUMMARY"
