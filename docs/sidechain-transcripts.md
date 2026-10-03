@@ -131,15 +131,20 @@ transcripts).
 transcripts reachable by walking `reflects_on` edges from the target
 memory up to `depth` levels
 ([`replay_transcript_union`](../src/transcripts/replay.rs)).
-`depth=0` reproduces the pre-L2-4 shape (direct link only). The walk
-respects the per-namespace `max_reflection_depth` cap —
-composition cannot bypass.
+`depth=0` reproduces the pre-L2-4 shape (the memory's own links only);
+`depth` omitted or null walks the full chain, and a visited set stops
+cycles. Only a reflection is walked; for any other kind `depth` is ignored. The cap is the `depth` argument; the walk does not consult
+`max_reflection_depth`.
 
-Each returned entry is a `ReplayEntry`
-([`ReplayEntry`](../src/transcripts/replay.rs))
-carrying transcript id, namespace, decompressed content (or the
-relevant span if `span_start`/`span_end` were set on the link),
-created_at, and the originating memory id.
+Each returned entry is a
+[`ReplayEntry`](../src/transcripts/replay.rs) with three fields:
+`memory_id` (the memory the link was found through), `link` (the I2 link
+row, including the optional `span_start`/`span_end`) and `meta` (the
+transcript metadata: id, namespace, sizes, `created_at`). It does not
+carry the content: the blob is not loaded by the walk. The `memory_replay`
+handler ([`handle_replay`](../src/mcp/tools/replay.rs)) decompresses it
+on demand, and omits it (setting `truncated`) for transcripts over
+`REPLAY_VERBOSE_THRESHOLD_BYTES` (100 KiB) unless `verbose=true`.
 
 ## Security hardening (I1)
 
