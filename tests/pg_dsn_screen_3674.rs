@@ -277,15 +277,22 @@ async fn screened_dsn_connects_and_keeps_honoured_parameters_3674() {
 
 // ---------------------------------------------------------------------------
 // Funnel inventory — every production sqlx connection is built from
-// `dsn::connect_options`. Production/test boundary heuristic mirrors
+// `dsn::floored_connect_options`, which applies the #3705 transit-encryption
+// floor. `dsn::connect_options` returns UNFLOORED options and is for the
+// funnel's own internals and for tests; a production call to it is the #4285
+// bypass and is counted as a violation below. Production/test boundary
+// heuristic mirrors
 // `tests/db_open_funnel_ceiling_2445.rs`.
 // ---------------------------------------------------------------------------
 
 /// The funnel. Its own `PgConnectOptions::from_str` is the one permitted.
 const FUNNEL_FILE: &str = "src/store/postgres/dsn.rs";
 
-/// `(file, sqlx connection constructions, dsn::connect_options calls)`.
-/// A new construction, or one that stops calling the funnel, fails.
+/// `(file, sqlx connection constructions, dsn::floored_connect_options calls)`.
+/// A new construction, or one that stops calling the funnel, fails. #4505: the
+/// two counts must be EQUAL -- see
+/// `the_funnel_ledger_only_ever_records_floored_constructions_3674`, which
+/// makes a row that records a bypass fail on its own.
 const LEDGER: &[(&str, usize, usize)] = &[
     ("src/cli/doctor.rs", 3, 3),
     ("src/cli/keys.rs", 1, 1),
@@ -304,6 +311,12 @@ const CONSTRUCTION_TOKENS: &[&str] = &[
 /// Tokens that hand sqlx a DSN STRING (or parse one) — forbidden outside the
 /// funnel.
 const RAW_DSN_TOKENS: &[&str] = &[
+    // #4505 (f2r's attack) -- hand-built options carry NO sslmode floor at all:
+    // `PgConnectOptions::new().host(..).password(..)` then `connect_with` never
+    // touches the funnel. Measured zero production uses, so this forbids a shape
+    // nothing uses rather than breaking one.
+    "PgConnectOptions::new(",
+    "PgConnectOptions::default(",
     "PgConnectOptions::from_str",
     "parse::<PgConnectOptions>",
     "PgConnectOptions::from_url",
@@ -411,6 +424,29 @@ fn raw_pool_connects(lines: &[&str]) -> usize {
     raw
 }
 
+/// #4505 (f2r's attack) -- production calls of the UNFLOORED funnel helper.
+///
+/// Counted as "every `connect_options(` that is not `floored_connect_options(`",
+/// which is why it is path-spelling agnostic: it catches
+/// `crate::store::postgres::dsn::connect_options(`, a bare `connect_options(`
+/// reached through `use ...dsn::connect_options` (measured: no such import
+/// today), and any future module alias. A fixed `dsn::connect_options(` token
+/// would miss the bare call.
+///
+/// Only [`FUNNEL_FILE`] may spell it; the caller `continue`s on that file before
+/// reaching here. `floored_connect_options(` contains `connect_options(` exactly
+/// once, so the per-line difference can never be negative.
+fn unfloored_funnel_calls(lines: &[&str]) -> usize {
+    lines
+        .iter()
+        .map(|l| {
+            l.matches("connect_options(")
+                .count()
+                .saturating_sub(l.matches("floored_connect_options(").count())
+        })
+        .sum()
+}
+
 fn walk_rs(dir: &Path, out: &mut Vec<PathBuf>) {
     for entry in std::fs::read_dir(dir).expect("read_dir") {
         let path = entry.expect("dir entry").path();
@@ -455,6 +491,17 @@ fn every_production_sqlx_connect_goes_through_the_dsn_funnel_3674() {
         if raw > 0 {
             violations.push(format!("{rel}: {raw} raw-DSN sqlx entry point(s)"));
         }
+        // #4505 -- the R1 CLASS, not the R1 line: options built by the unfloored
+        // helper skip the #3705 transit-encryption floor even when the LEDGER
+        // counts balance (a decoy `let _ = floored_connect_options(..)` makes
+        // them balance). This is the check that fails on the bypass itself.
+        let unfloored = unfloored_funnel_calls(&lines);
+        if unfloored > 0 {
+            violations.push(format!(
+                "{rel}: {unfloored} call(s) of the UNFLOORED `connect_options(` -- those options \
+                 skip the #3705 sslmode floor; call `{FUNNEL_CALL}` instead"
+            ));
+        }
         let constructions = count(&lines, CONSTRUCTION_TOKENS);
         let funnel_calls = count(&lines, &[FUNNEL_CALL]);
         if constructions > 0 || funnel_calls > 0 {
@@ -480,6 +527,28 @@ fn every_production_sqlx_connect_goes_through_the_dsn_funnel_3674() {
     );
 }
 
+/// #4505 -- a LEDGER row whose two counts DIFFER records a production connect
+/// that skips the #3705 transit-encryption floor. The inventory cell above
+/// asserts only `observed == expected`, and its panic text says "update LEDGER
+/// only for a site that does [go through the funnel]" -- an instruction that
+/// lived nowhere in code. A reviewer who bumped the row to `(3, 2)` to green the
+/// gate would have laundered exactly the #4285 bypass.
+///
+/// This is the cheap half of the fix; `unfloored_funnel_calls` is the half that
+/// survives f2r's decoy attack.
+#[test]
+fn the_funnel_ledger_only_ever_records_floored_constructions_3674() {
+    for (file, constructions, funnel_calls) in LEDGER {
+        assert_eq!(
+            constructions, funnel_calls,
+            "#3674 LEDGER: {file} declares {constructions} sqlx construction(s) but only \
+             {funnel_calls} `{FUNNEL_CALL}` call(s). A row whose counts differ RECORDS a \
+             connect that skips the #3705 transit-encryption floor -- fix the call site, \
+             never the row."
+        );
+    }
+}
+
 #[test]
 fn the_funnel_inventory_heuristics_are_load_bearing_3674() {
     let raw_chain =
@@ -497,4 +566,46 @@ fn the_funnel_inventory_heuristics_are_load_bearing_3674() {
     let test_mod =
         "fn prod() {}\n#[cfg(test)]\nmod tests {\n    fn t() { PgConnection::connect(url); }\n}\n";
     assert_eq!(count(&code_lines(test_mod), RAW_DSN_TOKENS), 0);
+
+    // #4505 -- f2r's attack shapes. (a) the bare unfloored call; (b) the DECOY:
+    // ledger counts balance (1 construction : 1 floored call) and the RAW scan is
+    // clean, so only `unfloored_funnel_calls` fails it; (c) hand-built options;
+    // (d) the correct shape, which must stay silent in every check.
+    let unfloored = "let o = crate::store::postgres::dsn::connect_options(&url)?;\n";
+    assert_eq!(unfloored_funnel_calls(&code_lines(unfloored)), 1);
+    assert_eq!(count(&code_lines(unfloored), RAW_DSN_TOKENS), 0);
+
+    let decoy = "let _ = dsn::floored_connect_options(&url);\nlet o = dsn::connect_options(&url)?;\nlet p = PgPoolOptions::new()\n    .connect_with(o)\n    .await?;\n";
+    let decoy_lines = code_lines(decoy);
+    assert_eq!(count(&decoy_lines, CONSTRUCTION_TOKENS), 1);
+    assert_eq!(
+        count(&decoy_lines, &[FUNNEL_CALL]),
+        1,
+        "the decoy BALANCES the ledger"
+    );
+    assert_eq!(count(&decoy_lines, RAW_DSN_TOKENS), 0);
+    assert_eq!(raw_pool_connects(&decoy_lines), 0);
+    assert_eq!(
+        unfloored_funnel_calls(&decoy_lines),
+        1,
+        "the decoy shape must be caught by the unfloored check and nothing else"
+    );
+
+    let aliased =
+        "use crate::store::postgres::dsn::connect_options;\nlet o = connect_options(&url)?;\n";
+    assert_eq!(
+        unfloored_funnel_calls(&code_lines(aliased)),
+        1,
+        "a bare call reached through a `use` alias must count too"
+    );
+
+    let hand_built = "let o = PgConnectOptions::new().host(\"h\").password(\"p\");\n";
+    assert_eq!(count(&code_lines(hand_built), RAW_DSN_TOKENS), 1);
+
+    let correct = "let o = crate::store::postgres::dsn::floored_connect_options(&url)?;\nlet p = PgPoolOptions::new()\n    .connect_with(o)\n    .await?;\n";
+    let correct_lines = code_lines(correct);
+    assert_eq!(unfloored_funnel_calls(&correct_lines), 0);
+    assert_eq!(count(&correct_lines, RAW_DSN_TOKENS), 0);
+    assert_eq!(raw_pool_connects(&correct_lines), 0);
+    assert_eq!(count(&correct_lines, &[FUNNEL_CALL]), 1);
 }
