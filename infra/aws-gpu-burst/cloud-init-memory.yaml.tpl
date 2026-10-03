@@ -57,10 +57,12 @@ write_files:
   # alone leaves a short window; the 0700 /etc/ai-memory created in bootcmd above
   # is what keeps other UIDs out during it. The provision script hands the file
   # to the aimemory user once that user exists (serve refuses a file with any
-  # group/world mode bit, src/store_url.rs). CHANGEME is the database password:
-  # replace it before real use; the provision script refuses to run with the
-  # placeholder (#4788, until #4610 generates the password on the node). The provision script reads the role password
-  # from this one file, so there is no second copy to keep in step.
+  # group/world mode bit, src/store_url.rs). CHANGEME is a placeholder, not a
+  # credential: no secret is interpolated into user-data, which the instance
+  # metadata service serves to any local process (#4610). The provision script
+  # replaces it with a random role password minted on the node and refuses to
+  # run if the placeholder survives (#4788). It reads the role password from this
+  # one file, so there is no second copy to keep in step.
   - path: /etc/ai-memory/store-url
     permissions: '0600'
     owner: root:root
@@ -245,9 +247,18 @@ write_files:
       # way the daemon's URL parser decodes it, and any single quote is doubled
       # for the SQL literal. psql runs with ON_ERROR_STOP so a failed statement
       # stops the script instead of falling through to CREATE DATABASE.
+      # #4610/#4788: the role password is minted here, on the node, from the
+      # placeholder (hex, so it needs no URL or SQL quoting); a re-run keeps the
+      # one the file already carries. Fail closed if the placeholder survives.
+      if grep -q CHANGEME /etc/ai-memory/store-url; then
+        NEW_SECRET="$(openssl rand -hex 24)"
+        sed -i "s/CHANGEME/$NEW_SECRET/" /etc/ai-memory/store-url
+      fi
+      if grep -q CHANGEME /etc/ai-memory/store-url; then
+        echo "placeholder db password still in /etc/ai-memory/store-url"; exit 1
+      fi
       DB_PASS="$(sed -n 's#^postgres://aimemory:\([^@]*\)@.*#\1#p' /etc/ai-memory/store-url)"
       [ -n "$DB_PASS" ] || { echo "no db password in /etc/ai-memory/store-url"; exit 1; }
-      [ "$DB_PASS" != CHANGEME ] || { echo "placeholder db password in /etc/ai-memory/store-url"; exit 1; }
       sudo -u postgres psql -tc "SELECT 1 FROM pg_roles WHERE rolname='aimemory'" | grep -q 1 || \
         printf '%s' "$DB_PASS" \
           | python3 -c 'import sys,urllib.parse as u;p=u.unquote(sys.stdin.read());q=chr(39);print("CREATE USER aimemory WITH PASSWORD "+q+p.replace(q,q+q)+q+";")' \

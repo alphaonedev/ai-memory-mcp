@@ -126,7 +126,9 @@ case "${cmd}" in
     # #2850: forward extra CLI args (e.g. -var memory_count=2) — see plan case.
     terraform apply -input=false -auto-approve "${@:2}"
     terraform output -json > "${SCRATCH_ROOT}/${NOW}/outputs.json"
-    cp terraform.tfstate "${SCRATCH_ROOT}/${NOW}/terraform.tfstate"
+    # #4610: owner-only copy (state holds no db password any more, but it does
+    # hold droplet addresses and the rendered user-data).
+    ( umask 077; cp terraform.tfstate "${SCRATCH_ROOT}/${NOW}/terraform.tfstate" )
     echo "[spawn.sh] Apply complete. Audit dump: ${SCRATCH_ROOT}/${NOW}/"
     ;;
   outputs)

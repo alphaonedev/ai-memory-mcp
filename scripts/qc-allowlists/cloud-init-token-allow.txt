@@ -31,6 +31,7 @@ both | /etc/ai-memory/store-url | - path: /etc/ai-memory/store-url
 both | /etc/ai-memory/store-url | permissions: '0600'
 both | /etc/ai-memory/store-url | owner: root:root
 both | /etc/ai-memory/store-url | content: |
+aws-gpu-burst | /etc/ai-memory/store-url | postgres://aimemory:CHANGEME@localhost/aimemory?sslmode=verify-full&sslrootcert=/etc/ai-memory/tls/pg-ca.crt
 do-hive | /etc/ai-memory/store-url | postgres://aimemory:CHANGEME@localhost/aimemory?sslmode=verify-full&sslrootcert=/etc/ai-memory/tls/pg-ca.crt
 both | /etc/systemd/system/ai-memory.service | - path: /etc/systemd/system/ai-memory.service
 both | /etc/systemd/system/ai-memory.service | permissions: '0644'
@@ -134,9 +135,15 @@ aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | mv "$HBA.new" "$HBA"
 aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | fi
 aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | systemctl restart postgresql
 aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | sleep 5
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | if grep -q CHANGEME /etc/ai-memory/store-url; then
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | NEW_SECRET="$(openssl rand -hex 24)"
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | sed -i "s/CHANGEME/$NEW_SECRET/" /etc/ai-memory/store-url
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | fi
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | if grep -q CHANGEME /etc/ai-memory/store-url; then
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | echo "placeholder db password still in /etc/ai-memory/store-url"; exit 1
+aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | fi
 aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | DB_PASS="$(sed -n 's#^postgres://aimemory:\([^@]*\)@.*#\1#p' /etc/ai-memory/store-url)"
 aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | [ -n "$DB_PASS" ] || { echo "no db password in /etc/ai-memory/store-url"; exit 1; }
-aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | [ "$DB_PASS" != CHANGEME ] || { echo "placeholder db password in /etc/ai-memory/store-url"; exit 1; }
 aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | sudo -u postgres psql -tc "SELECT 1 FROM pg_roles WHERE rolname='aimemory'" | grep -q 1 || \ printf '%s' "$DB_PASS" \ | python3 -c 'import sys,urllib.parse as u;p=u.unquote(sys.stdin.read());q=chr(39);print("CREATE USER aimemory WITH PASSWORD "+q+p.replace(q,q+q)+q+";")' \ | sudo -u postgres psql -v ON_ERROR_STOP=1
 aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | sudo -u postgres psql -tc "SELECT 1 FROM pg_database WHERE datname='aimemory'" | grep -q 1 || \ sudo -u postgres psql -c "CREATE DATABASE aimemory OWNER aimemory;"
 aws-gpu-burst | /usr/local/sbin/ai-memory-provision.sh | sudo -u postgres psql -d aimemory -c "CREATE EXTENSION IF NOT EXISTS vector;"

@@ -2,4 +2,3 @@
 #   <scope> #<issue> | <context> | <line>
 # A pending line passes the allowlist but is never approved: the validators do not run on it, and it
 # must not be moved to cloud-init-token-allow.txt until its tracker lands. Stale entries fail the gate.
-aws-gpu-burst #4610 | /etc/ai-memory/store-url | postgres://aimemory:CHANGEME@localhost/aimemory?sslmode=verify-full&sslrootcert=/etc/ai-memory/tls/pg-ca.crt
