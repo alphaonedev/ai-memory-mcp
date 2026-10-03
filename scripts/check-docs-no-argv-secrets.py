@@ -1,54 +1,83 @@
 #!/usr/bin/env python3
 # Copyright 2026 AlphaOne LLC
 # SPDX-License-Identifier: Apache-2.0
-"""#4577 - no-credentials-on-argv gate for the store URL.
+"""#4577 - no credential on a process argv in a tracked file.
 
-``ai-memory serve --store-url postgres://user:password@host/db`` puts the
-database password in ``/proc/<pid>/cmdline`` and ``ps auxww``, readable by
-every local UID, and (in a systemd ``ExecStart=``) in a unit file. The product
-already has non-argv channels (``AI_MEMORY_STORE_URL_FILE`` first, then
-``AI_MEMORY_STORE_URL``; ``src/store_url.rs`` ``resolve_store_url``), so a
-tracked doc, unit, template or script must not recommend the argv form.
+Threat model. A process argv is world-readable: ``/proc/<pid>/cmdline`` and
+``ps auxww`` show it to every local UID, and a systemd unit (``ExecStart=``,
+``Environment=``) is shown to every user by ``systemctl show``. The product
+has non-argv channels for the store URL (``AI_MEMORY_STORE_URL_FILE`` first,
+then ``AI_MEMORY_STORE_URL``; ``src/store_url.rs`` ``resolve_store_url``), and
+libpq clients read ``PGPASSWORD`` / ``PGPASSFILE`` from the environment. So a
+tracked doc, unit, template or script must not put a credential on an argv.
 
-The gate fails when a tracked text file contains a ``--store-url`` argument
-whose value carries an inline userinfo password (``scheme://user:pass@``),
-unless:
+What the gate refuses (exit 1):
 
-  * the password is a redaction token (an ellipsis, asterisks, ``REDACTED``,
-    ``<redacted>``); or
-  * the command is a verb with no non-argv channel at all. ``schema-init``
-    takes its URL ONLY on argv (``src/cli/schema_init.rs`` ``store_url:
-    String``, required); tracked as #4600. Drop the entry from
-    ``ARGV_ONLY_VERBS`` when #4600 lands.
+  * Every text file: a ``--store-url`` argument (the flag name may be split by
+    shell quotes, #4693) whose URL carries a credential: a userinfo password
+    (``scheme://user:pass@``) or a query key that percent-decodes to
+    ``password`` (#4663, #4691).
+  * Shell-like files (.sh .bash .tpl .yaml .yml .service .conf): each logical
+    line (backslash continuations joined) is split into words with shell
+    quoting removed (shlex) and cut into commands at ``; | & ( ) < >``. In
+    every command whose words reach a process argv:
+      - a postgres URL with a credential in any word, at the word start, after
+        ``=`` (``--dbname=<dsn>``, #4690) or inside a ``-c`` script string;
+      - a keyword conninfo ``password=<value>`` (``host=h password=x``, #4692);
+      - ``-e`` / ``--env`` ``NAME=<value>`` on a docker, podman or nerdctl argv
+        where NAME names a password, secret, token or key (#4694).
+    A systemd ``Environment=`` line carrying a credential URL is refused
+    whatever the key spelling (#4689).
 
-#4663 widened the gate: a ``password=`` query parameter counts as a
-credential the same as userinfo, and a credential postgres URL on the argv of
-ANY command in a shell-like file (.sh .tpl .yaml .yml .service), for example
-``psql "postgres://u:$PW@h/d"``, is flagged. Not flagged there: a comment, a
-whole-URL content line, the value of an assignment (``X=url``, ``key: "url"``),
-and echo/printf (shell builtins, no process argv). Prose files (.md) are
-checked for ``--store-url`` only.
+Known defects that the rules find in tracked files are listed in PENDING
+with their tracking issue: reported, not approved, and a PENDING entry that
+matches no hit fails the gate as stale.
 
-A value such as ``"$DSN"`` is not flagged: no literal credential is tracked.
-The gate looks only at what is written in tracked files; it cannot see a
-runtime expansion.
+Not an argv, so not refused: a variable assignment before the command word
+(``PGPASSWORD=x psql``) or after ``export``/``local``/``readonly``/``declare``;
+a comment; a line that is only a URL (a file line the script writes); a YAML
+``key: value`` mapping line; echo/printf (shell builtins); a redaction token
+(an ellipsis, asterisks, ``REDACTED``, ``<redacted>``); a value with no
+credential (``"$DSN"``); the argv-only verb ``schema-init`` (#4600).
+
+What the gate does NOT claim:
+
+  * It reads text, not a running shell. A credential assembled at runtime
+    (a flag built from variables, ``eval``, a wrapper written over a binary)
+    is not seen here. For the two cloud-init templates that class is closed
+    by scripts/check-cloud-init-serve-flags.py, which approves every sensitive
+    template line from an exact allowlist.
+  * A password in a SQL literal inside a ``psql -c`` argument
+    (``PASSWORD '...'``) is not modelled here; the cloud-init gate refuses it
+    in the templates and lists the do-hive instance as pending #4671.
+  * Prose (.md) is checked for ``--store-url`` only; a heredoc body is read as
+    commands (stricter, not looser); .tf, .py and .rs sources are checked for
+    ``--store-url`` only.
+  * changelog.d/, docs/reviews/, docs/handoff/ and CHANGELOG.md are records,
+    not recommendations, and are skipped.
 
 Usage:
   scripts/check-docs-no-argv-secrets.py             exit 0 clean, 1 on a hit,
                                                     2 on a scanner fault
-  scripts/check-docs-no-argv-secrets.py --self-test prove the rule is red on
+  scripts/check-docs-no-argv-secrets.py --self-test prove the rules are red on
                                                     probes and green on
                                                     near-misses
 """
 from __future__ import annotations
 
+import argparse
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from typing import List, Optional, Tuple
+from urllib.parse import unquote
 
 ROOT = Path(__file__).resolve().parent.parent
+
+Hit = Tuple[str, int, str]
 
 # Verbs that offer no non-argv channel. verb -> tracking issue.
 ARGV_ONLY_VERBS = {"schema-init": "#4600"}
@@ -56,7 +85,7 @@ ARGV_ONLY_VERBS = {"schema-init": "#4600"}
 # Redaction tokens that are not a credential.
 REDACTION_TOKENS = ("...", "…", "***", "redacted", "<redacted>", "xxxx")
 
-# Files that quote the pattern on purpose: this gate and its own docs.
+# Files that quote the patterns on purpose: this gate.
 SELF_EXEMPT = {"scripts/check-docs-no-argv-secrets.py"}
 
 # Historical or machine-generated trees where quoted old commands are a record,
@@ -64,120 +93,286 @@ SELF_EXEMPT = {"scripts/check-docs-no-argv-secrets.py"}
 SKIP_PREFIXES = ("changelog.d/", "docs/reviews/", "docs/handoff/")
 SKIP_FILES = {"CHANGELOG.md"}
 
-# `--store-url`, optional `=` or whitespace / backslash-newline continuation,
-# optional opening quote, then scheme://user:PASSWORD@ (userinfo cannot contain
-# `/`, `@`, whitespace or a quote; a percent-encoded password is still literal).
-ARG_RE = re.compile(
-    r"--store-url(?:=|(?:\s|\\)+)"
-    r"[\"']?"
-    r"[A-Za-z][A-Za-z0-9+.\-]*://"
-    r"[^\s/@\"':]+"  # user
-    r":(?P<pw>[^\s/@\"']+)"  # password (non-empty)
-    r"@"
+# Known defects listed, not approved: (path, text on the hit's logical line,
+# tracking issue). A listed hit is reported as PENDING and does not fail the
+# gate; an entry that matches no hit is stale and fails it, so the entry must
+# go when the defect is fixed.
+PENDING = (
+    ("deploy/hive-1461/provision/20_pg_age.sh", "-e POSTGRES_PASSWORD='$SU_PW'", "#4762"),
+    ("deploy/hive-1461/provision/20_pg_age.sh", "docker exec -i -e PGPASSWORD='$SU_PW'", "#4762"),
+    ("deploy/hive-1461/provision/20_pg_age.sh", "exts=\"$(ssh_node \"$ip\" \"docker exec -e PGPASSWORD='$SU_PW'", "#4762"),
 )
-
-# #4663: (a) a credential in the ``password=`` query parameter of a store URL
-# (sqlx honours it), and (b) a credential-bearing DSN on the argv of ANY command
-# in a shell-like file (a psql call in a provision script), not only on
-# ``--store-url``. A DSN that is the value of an assignment (``X=...``), a whole
-# YAML ``content:`` block line (a file the script writes), a regex that merely
-# begins with the scheme, or an argument of the echo/printf builtins is not on a
-# process argv.
-QUERY_PW_RE = re.compile(
-    r"--store-url(?:=|(?:\s|\\)+)[\"']?[A-Za-z][A-Za-z0-9+.\-]*://[^\s\"']*[?&]password=(?P<pw>[^&\s\"']+)"
-)
-CMD_DSN_RE = re.compile(r"(?<![^\s=\"'(`>,{])(?P<url>[A-Za-z][A-Za-z0-9+.\-]*://[^\s\"']+)")
-CMD_SUFFIXES = {".sh", ".tpl", ".yaml", ".yml", ".service"}
-DSN_SCHEMES = ("postgres://", "postgresql://")
-USERINFO_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.\-]*://[^\s/@\"':]+:(?P<pw>[^\s/@\"']+)@")
-BUILTIN_PRINTERS = ("echo", "printf")
 
 TEXT_SUFFIXES = {
-    ".md", ".html", ".yaml", ".yml", ".tpl", ".sh", ".py", ".toml", ".txt",
-    ".service", ".conf", ".ini", ".tf", ".tfvars", ".json", ".env", ".rs",
-    ".csv", ".cfg", "",
+    ".md", ".html", ".yaml", ".yml", ".tpl", ".sh", ".bash", ".py", ".toml",
+    ".txt", ".service", ".conf", ".ini", ".tf", ".tfvars", ".json", ".env",
+    ".rs", ".csv", ".cfg", "",
 }
+SHELL_SUFFIXES = {".sh", ".bash", ".tpl", ".yaml", ".yml", ".service", ".conf"}
 MAX_BYTES = 4 * 1024 * 1024
 
+SCHEME = r"[A-Za-z][A-Za-z0-9+.\-]*://"
+DSN_SCHEMES = ("postgres://", "postgresql://")
 
-def is_redaction(pw: str) -> bool:
-    low = pw.lower()
+# The serve flag, tolerating shell quotes split into the name (#4693):
+# --store-url, --"store-url", --store-'url', --store_url.
+FLAG = r"--[\"']*store[\"']*[-_][\"']*url[\"']*"
+# A --store-url argument (=, whitespace or backslash-newline), optional quote,
+# then the URL up to whitespace or a quote.
+ARG_RE = re.compile(FLAG + r"(?:=|(?:\s|\\)+)[\"']?(?P<url>" + SCHEME + r"[^\s\"']+)")
+
+# A postgres URL inside a word: at the word start, after = (an option value or
+# a conninfo dbname), or after a separator inside a -c script string.
+WORD_URL_RE = re.compile(r"(?:^|[\s=,\[{(\"'])(?P<url>(?:postgres|postgresql)://[^\s,\]\"')]+)", re.I)
+# Keyword conninfo password (libpq: password = value, whitespace allowed).
+CONNINFO_PW_RE = re.compile(r"(?:^|[\s-])password\s*=\s*(?P<pw>'[^']*'|\S+)", re.I)
+ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?\+?=")
+UNIT_EXEC_RE = re.compile(r"^(?:Exec[A-Za-z]*)=[-@+!:]*")
+UNIT_ENV_RE = re.compile(r"^\s*Environment\s*=", re.I)
+SECRET_NAME_RE = re.compile(r"pass|secret|token|key|cred", re.I)
+
+DECLARE_BUILTINS = {"export", "local", "readonly", "declare", "typeset"}
+BUILTIN_PRINTERS = {"echo", "printf"}
+CONTAINER_CLIS = {"docker", "podman", "nerdctl"}
+SEPARATORS = set(";|&()<>")
+
+
+def is_redaction(value: str) -> bool:
+    low = value.lower()
     return any(tok in low for tok in REDACTION_TOKENS)
 
 
-def verb_allowed(text: str, start: int) -> str:
-    """Return the tracking ref when the command owning this --store-url is an
-    argv-only verb, else ''. The command is the text since the last blank line
-    (or 400 characters), so a continuation line still sees its verb."""
-    window = text[max(0, start - 400):start]
-    window = window.rsplit("\n\n", 1)[-1]
+def url_credential(url: str) -> str:
+    """The credential a URL carries: the userinfo password, or the value of a
+    query key that percent-decodes (case-insensitively) to ``password``
+    (libpq and sqlx both decode keys, #4691). '' when there is none or it is
+    a redaction token."""
+    rest = url.split("://", 1)[1] if "://" in url else url
+    authority = re.split(r"[/?#]", rest, 1)[0]
+    if "@" in authority:
+        userinfo = authority.rsplit("@", 1)[0]
+        if ":" in userinfo:
+            pw = userinfo.split(":", 1)[1]
+            if pw and not is_redaction(pw):
+                return pw
+    if "?" in rest:
+        query = rest.split("?", 1)[1].split("#", 1)[0]
+        for pair in query.split("&"):
+            key, _, value = pair.partition("=")
+            if unquote(key).strip().lower() == "password" and value and not is_redaction(value):
+                return value
+    return ""
+
+
+def redact(text: str) -> str:
+    """Hide credentials in a reported snippet: never print a secret."""
+    text = re.sub(r"(://[^\s/@:\"']*:)[^\s/@\"']+@", r"\1***@", text)
+    text = re.sub(r"(?i)((?:password|%70assword|pass\w*|secret\w*|token\w*)\s*=\s*)[^\s&\"']+", r"\1***", text)
+    return text[:140]
+
+
+def verb_allowed(words: List[str]) -> str:
+    joined = " ".join(words)
+    for verb, ref in ARGV_ONLY_VERBS.items():
+        if re.search(r"(?<![\w-])" + re.escape(verb) + r"(?![\w-])", joined):
+            return ref
+    return ""
+
+
+def window_verb_allowed(text: str, start: int) -> str:
+    """For prose: the verb owning a --store-url is the text since the last
+    blank line (or 400 characters), so a continuation line still sees it."""
+    window = text[max(0, start - 400):start].rsplit("\n\n", 1)[-1]
     for verb, ref in ARGV_ONLY_VERBS.items():
         if re.search(r"(?<![\w-])" + re.escape(verb) + r"(?![\w-])", window):
             return ref
     return ""
 
 
-def cmd_dsn_credential(url: str) -> str:
-    """The credential a store URL carries: the userinfo password or the
-    ``password=`` query value, else ''."""
-    um = USERINFO_RE.match(url)
-    if um:
-        return um.group("pw")
-    qm = re.search(r"[?&]password=([^&\s\"']+)", url)
-    return qm.group(1) if qm else ""
-
-
-def cmd_dsn_hits(rel: str, text: str) -> list[tuple[str, int, str]]:
-    """#4663: a credential-bearing postgres URL on the argv of a command."""
-    hits: list[tuple[str, int, str]] = []
-    if Path(rel).suffix.lower() not in CMD_SUFFIXES:
-        return hits
-    lines = text.splitlines()
-    for m in CMD_DSN_RE.finditer(text):
-        url = m.group("url")
-        if not url.lower().startswith(DSN_SCHEMES):
+def logical_lines(text: str) -> List[Tuple[int, str]]:
+    """Join backslash-newline continuations; keep each start line number."""
+    out: List[Tuple[int, str]] = []
+    buf: List[str] = []
+    start = 0
+    for no, raw in enumerate(text.splitlines(), 1):
+        if not buf:
+            start = no
+        stripped = raw.rstrip()
+        if stripped.endswith("\\") and not stripped.endswith("\\\\"):
+            buf.append(stripped[:-1])
             continue
-        pw = cmd_dsn_credential(url)
-        if not pw or is_redaction(pw):
+        buf.append(raw)
+        out.append((start, " ".join(buf)))
+        buf = []
+    if buf:
+        out.append((start, " ".join(buf)))
+    return out
+
+
+def split_words(line: str) -> List[str]:
+    """Shell words with quoting removed, separators as their own words. An
+    unbalanced line (a YAML scalar, a fragment) falls back to whitespace words
+    with quote characters stripped, so it is still scanned (fail closed)."""
+    try:
+        lex = shlex.shlex(line, posix=True, punctuation_chars=True)
+        lex.whitespace_split = True
+        return list(lex)
+    except ValueError:
+        words: List[str] = []
+        for w in line.split():
+            if w.startswith("#"):
+                break
+            words.append(w.replace('"', "").replace("'", ""))
+        return words
+
+
+def commands(words: List[str]) -> List[List[str]]:
+    out: List[List[str]] = []
+    cur: List[str] = []
+    for w in words:
+        if w and all(c in SEPARATORS for c in w):
+            if cur:
+                out.append(cur)
+            cur = []
+        else:
+            cur.append(w)
+    if cur:
+        out.append(cur)
+    return out
+
+
+def argv_words(cmd: List[str]) -> List[str]:
+    """The words of one command that reach a process argv, or [] when none do
+    (a declaration builtin, echo/printf, a bare assignment, a YAML key line,
+    a line that is only a URL)."""
+    i = 0
+    while i < len(cmd) and cmd[i] == "-":  # a YAML list item marker
+        i += 1
+    if i < len(cmd) and UNIT_EXEC_RE.match(cmd[i]):
+        first = UNIT_EXEC_RE.sub("", cmd[i])
+        cmd = ([first] if first else []) + cmd[i + 1:]
+        i = 0
+    while i < len(cmd) and ASSIGN_RE.match(cmd[i]):
+        i += 1  # env prefix of the command: environment, not argv
+    rest = cmd[i:]
+    if not rest:
+        return []
+    head = rest[0]
+    if head.endswith(":") or head.lower().startswith(DSN_SCHEMES):
+        return []  # a YAML mapping key, or a URL line the script writes
+    if head in DECLARE_BUILTINS or head in BUILTIN_PRINTERS:
+        return []
+    return rest
+
+
+def container_env_hits(words: List[str]) -> List[str]:
+    """#4694: -e/--env NAME=<value> on a container CLI argv."""
+    found: List[str] = []
+    in_cli = False
+    i = 0
+    while i < len(words):
+        w = words[i]
+        if Path(w).name in CONTAINER_CLIS:
+            in_cli = True
+        elif in_cli:
+            val: Optional[str] = None
+            if w in ("-e", "--env") and i + 1 < len(words):
+                val = words[i + 1]
+                i += 1
+            elif w.startswith("--env="):
+                val = w[len("--env="):]
+            elif w.startswith("-e") and len(w) > 2 and not w.startswith("--"):
+                val = w[2:]
+            if val is not None and "=" in val:
+                name, _, value = val.partition("=")
+                if SECRET_NAME_RE.search(name) and value and not is_redaction(value):
+                    found.append(name)
+        i += 1
+    return found
+
+
+def word_hits(words: List[str], depth: int = 0) -> List[str]:
+    reasons: List[str] = []
+    if depth < 3:
+        # A word that is itself a command string (sh -c "...", ssh host "...")
+        # is scanned as commands too.
+        for w in words[1:]:
+            if any(c.isspace() for c in w):
+                for cmd in commands(split_words(w)):
+                    reasons.extend(command_hits(cmd, depth + 1))
+    for w in words:
+        for m in WORD_URL_RE.finditer(w):
+            if url_credential(m.group("url")):
+                reasons.append("credential URL")
+        for m in CONNINFO_PW_RE.finditer(w):
+            pw = m.group("pw").strip("'")
+            if pw and not is_redaction(pw) and not pw.startswith(("://",)):
+                reasons.append("conninfo password")
+    reasons.extend("container env %s" % n for n in container_env_hits(words))
+    return reasons
+
+
+def command_hits(cmd: List[str], depth: int = 0) -> List[str]:
+    """Reasons one command puts a credential on an argv. A command
+    substitution in an assignment value (X="$(docker exec -e ...)") runs a
+    command, so the value is scanned as commands too."""
+    reasons: List[str] = []
+    if depth < 3:
+        for k, w in enumerate(cmd):
+            if not ASSIGN_RE.match(w):
+                break
+            value = w.split("=", 1)[1]
+            if "$(" in value or "`" in value:
+                # Quote removal may have glued the substitution to the words
+                # after it; the substitution text runs to the end of the command.
+                text = " ".join([value] + cmd[k + 1:]).replace("`", " ")
+                for inner in commands(split_words(text)):
+                    reasons.extend(command_hits(inner, depth + 1))
+    words = argv_words(cmd)
+    if words and not verb_allowed(words):
+        reasons.extend(word_hits(words, depth))
+    return reasons
+
+
+def shell_hits(rel: str, text: str) -> List[Hit]:
+    hits: List[Hit] = []
+    raw_lines = text.splitlines()
+    for no, line in logical_lines(text):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if UNIT_ENV_RE.match(stripped):
+            body = UNIT_ENV_RE.sub("", stripped, 1)
+            if any(url_credential(m.group("url")) for m in WORD_URL_RE.finditer(" " + body)):
+                hits.append((rel, no, redact(raw_lines[no - 1].strip())))
+            continue
+        if any(command_hits(cmd) for cmd in commands(split_words(line))):
+            hits.append((rel, no, redact(raw_lines[no - 1].strip())))
+    return hits
+
+
+def flag_hits(rel: str, text: str) -> List[Hit]:
+    hits: List[Hit] = []
+    lines = text.splitlines()
+    for m in ARG_RE.finditer(text):
+        if not url_credential(m.group("url")) or window_verb_allowed(text, m.start()):
             continue
         line = text.count("\n", 0, m.start()) + 1
-        raw = lines[line - 1]
-        before = raw[: m.start() - (text.rfind("\n", 0, m.start()) + 1)]
-        if raw.strip().startswith("#") or raw.strip() == url:
-            continue  # a comment, or a file line the script writes
-        if before.rstrip().endswith("=") or before.rstrip(" \t\"'").endswith("="):
-            continue  # the value of an assignment, not an argv
-        if before.rstrip(" \t\"'").endswith(":"):
-            continue  # a YAML mapping value (key: "url"), not an argv
-        segment = re.split(r"[;|&(]", before)[-1].split()
-        if segment and segment[0] in BUILTIN_PRINTERS:
-            continue  # a shell builtin: no process argv
-        if verb_allowed(text, m.start()):
-            continue
-        hits.append((rel, line, raw.strip()[:140]))
+        hits.append((rel, line, redact(lines[line - 1].strip()) if lines else ""))
     return hits
 
 
-def scan_text(rel: str, text: str) -> list[tuple[str, int, str]]:
-    hits: list[tuple[str, int, str]] = []
+def scan_text(rel: str, text: str) -> List[Hit]:
     if rel in SELF_EXEMPT:
-        return hits
-    for rx in (ARG_RE, QUERY_PW_RE):
-        for m in rx.finditer(text):
-            if is_redaction(m.group("pw")):
-                continue
-            if verb_allowed(text, m.start()):
-                continue
-            line = text.count("\n", 0, m.start()) + 1
-            snippet = text.splitlines()[line - 1].strip() if text else ""
-            hits.append((rel, line, snippet[:140]))
-    for hit in cmd_dsn_hits(rel, text):
-        if all(h[:2] != hit[:2] for h in hits):
-            hits.append(hit)
+        return []
+    hits = flag_hits(rel, text)
+    if Path(rel).suffix.lower() in SHELL_SUFFIXES:
+        seen = {h[:2] for h in hits}
+        hits.extend(h for h in shell_hits(rel, text) if h[:2] not in seen)
     return hits
 
 
-def tracked_files() -> list[str]:
+def tracked_files() -> List[str]:
     try:
         out = subprocess.run(
             ["git", "-C", str(ROOT), "ls-files", "-z"],
@@ -191,8 +386,8 @@ def tracked_files() -> list[str]:
     return files
 
 
-def scan_paths(root: Path, files: list[str]) -> tuple[list[tuple[str, int, str]], int]:
-    hits: list[tuple[str, int, str]] = []
+def scan_paths(root: Path, files: List[str]) -> Tuple[List[Hit], int]:
+    hits: List[Hit] = []
     scanned = 0
     for rel in files:
         if rel in SKIP_FILES or rel.startswith(SKIP_PREFIXES):
@@ -211,100 +406,174 @@ def scan_paths(root: Path, files: list[str]) -> tuple[list[tuple[str, int, str]]
     return hits, scanned
 
 
+def split_pending(root: Path, hits: List[Hit], pending=PENDING) -> Tuple[List[Hit], List[str], List[str]]:
+    """(failing hits, pending report lines, stale entry lines). An entry
+    claims the hits whose logical line in that file contains its text."""
+    texts = {}
+    claimed = set()
+    listed: List[str] = []
+    stale: List[str] = []
+    for rel, needle, issue in pending:
+        if rel not in texts:
+            p = root / rel
+            texts[rel] = dict(logical_lines(p.read_text(encoding="utf-8"))) if p.is_file() else {}
+        matched = [h for h in hits if h[0] == rel and needle in texts[rel].get(h[1], "")]
+        if not matched:
+            stale.append("%s %s: %s" % (rel, issue, redact(needle)))
+        for h in matched:
+            claimed.add(h)
+            listed.append("%s:%d %s" % (h[0], h[1], issue))
+    return [h for h in hits if h not in claimed], listed, stale
+
+
 def run() -> int:
     try:
         files = tracked_files()
         hits, scanned = scan_paths(ROOT, files)
-    except (RuntimeError, OSError) as exc:
+        hits, listed, stale = split_pending(ROOT, hits)
+    except (RuntimeError, OSError, UnicodeDecodeError) as exc:
         print("FAIL: check-docs-no-argv-secrets: scanner fault: %s" % exc, file=sys.stderr)
         return 2
     if scanned == 0:
         print("FAIL: check-docs-no-argv-secrets: scanned 0 files; refusing to pass", file=sys.stderr)
         return 2
+    for item in listed:
+        print("PENDING %s" % item)
+    for item in stale:
+        print("STALE pending entry (matches no hit; remove it): %s" % item, file=sys.stderr)
+    if stale and not hits:
+        print("FAIL: check-docs-no-argv-secrets: %d stale pending entr(ies)" % len(stale), file=sys.stderr)
+        return 1
     if hits:
         for rel, line, snippet in hits:
             print("HIT %s:%d: %s" % (rel, line, snippet), file=sys.stderr)
         print(
-            "FAIL: check-docs-no-argv-secrets: %d tracked --store-url argument(s) carry an inline "
-            "password (#4577). Use AI_MEMORY_STORE_URL_FILE (a 0600 file); see docs/CLI_REFERENCE.md."
-            % len(hits),
+            "FAIL: check-docs-no-argv-secrets: %d tracked line(s) put a credential on a process "
+            "argv (#4577). Use AI_MEMORY_STORE_URL_FILE (a 0600 file) or the PGPASSWORD "
+            "environment; see docs/CLI_REFERENCE.md." % len(hits),
             file=sys.stderr,
         )
         return 1
-    print("PASS: check-docs-no-argv-secrets: %d files scanned, 0 argv credentials" % scanned)
+    print("PASS: check-docs-no-argv-secrets: %d files scanned, 0 argv credentials, %d pending (listed, not approved)"
+          % (scanned, len(listed)))
     return 0
 
 
+# Probe strings avoid a literal flag-plus-DSN in this file: the flag is built.
+SU = "--store-" + "url"
+PW = "ProbePlaceholder1"
+
 RED_PROBES = {
-    "inline": "ai-memory serve --store-url postgres://u:hunter2@h:5432/d",
-    "equals": "ai-memory serve --store-url=postgres://u:hunter2@h/d",
-    "quoted": 'ExecStart=/bin/ai-memory serve --store-url "postgres://u:${db_password}@h/d"',
-    "single-quoted": "x serve --store-url 'postgresql://u:p%40ss@h/d?sslmode=require'",
-    "shell-var": "ssh h \"ai-memory serve --store-url 'postgres://u:$PG_PW@h/d'\"",
-    "continuation": "ai-memory serve \\\n  --store-url \\\n  postgres://u:hunter2@h/d",
-    "other-verb": "ai-memory curator --store-url postgres://u:hunter2@h/d",
-    "4663 password= query parameter": 'ai-memory serve --store-url "postgres://u@h/d?sslmode=verify-full&password=hunter2"',
-    "4663 password= query parameter, = form": "ai-memory serve --store-url=postgres://u@h/d?password=hunter2",
+    "inline": "ai-memory serve %s postgres://u:%s@h:5432/d" % (SU, PW),
+    "equals": "ai-memory serve %s=postgres://u:%s@h/d" % (SU, PW),
+    "quoted": 'ExecStart=/bin/ai-memory serve %s "postgres://u:${db_password}@h/d"' % SU,
+    "single-quoted": "x serve %s 'postgresql://u:p%%40ss@h/d?sslmode=require'" % SU,
+    "shell-var": "ssh h \"ai-memory serve %s 'postgres://u:$PG_PW@h/d'\"" % SU,
+    "continuation": "ai-memory serve \\\n  %s \\\n  postgres://u:%s@h/d" % (SU, PW),
+    "other-verb": "ai-memory curator %s postgres://u:%s@h/d" % (SU, PW),
+    "4663 password= query parameter": 'ai-memory serve %s "postgres://u@h/d?sslmode=verify-full&password=%s"' % (SU, PW),
+    "4663 password= query parameter, = form": "ai-memory serve %s=postgres://u@h/d?password=%s" % (SU, PW),
+    "4691 percent-encoded password key": "ai-memory serve %s 'postgres://u@h/d?%%70assword=%s'" % (SU, PW),
+    "4691 upper-case encoded key": "ai-memory serve %s 'postgres://u@h/d?PASS%%57ORD=%s'" % (SU, PW),
+    "4693 quote-split flag name": "ai-memory serve --store-\"url\" postgres://u:%s@h/d" % PW,
+    "4693 single-quote-split flag name": "ai-memory serve --'store'-url postgres://u:%s@h/d" % PW,
 }
-# #4663: shell-like files (probe.sh), a credential DSN on another program's argv.
+# Shell-like files (probe.sh): a credential on another program's argv.
 RED_SHELL_PROBES = {
     "4663 psql with a ${VAR} password": 'psql "postgres://aimemory:$DB_PASS@localhost/aimemory" -c "select 1"',
-    "4663 psql with a literal password": "psql postgres://u:hunter2@h/d -c x",
-    "4663 psql with a password= query parameter": 'psql "postgres://u@h/d?sslmode=verify-full&password=hunter2"',
+    "4663 psql with a literal password": "psql postgres://u:%s@h/d -c x" % PW,
+    "4663 psql with a password= query parameter": 'psql "postgres://u@h/d?sslmode=verify-full&password=%s"' % PW,
     "4663 psql inside a docker exec line": 'docker exec c psql "postgres://u:${PW}@pgbouncer:6432/db" -tA',
     "4663 pg_dump continued onto the next line": 'pg_dump \\\n  "postgres://u:$PW@h/d"',
+    "4690 pg_dump --dbname= form": "pg_dump --dbname=postgres://u:%s@h/d -f out" % PW,
+    "4690 pg_isready -d= quoted": "pg_isready \"-d=postgresql://u:$PW@h/d\"",
+    "4691 psql percent-encoded password key": "psql 'postgres://u@h/d?%%70assword=%s'" % PW,
+    "4692 keyword conninfo": "psql \"host=h user=u password=$DB_PASS dbname=d\" -c x",
+    "4692 keyword conninfo with spaces around =": "pg_dump 'host=h password = %s dbname=d'" % PW,
+    "4692 conninfo inside sh -c": "sudo -u x sh -c \"psql 'host=h password=%s'\"" % PW,
+    "4694 docker exec -e PGPASSWORD=value": 'docker exec -e PGPASSWORD="$PW" c psql -c x',
+    "4694 docker run --env=NAME=value": "docker run --env=POSTGRES_PASSWORD=%s img" % PW,
+    "4694 podman -eNAME=value": "sudo podman run -eDB_SECRET=%s img" % PW,
+    "4693 env wrapper puts the DSN on argv": "env AI_MEMORY_STORE_URL=postgres://u:%s@h/d ai-memory serve" % PW,
+    "4693 nohup launch with a quote-split flag": "nohup ai-memory serve --store-\"url\" \"postgres://u:$PW@h/d\" &",
+    "4689 unit Environment= with a space before =": "Environment=AI_MEMORY_STORE_URL =postgres://u:%s@h/d" % PW,
+    "4689 unit Environment= quoted": "Environment=\"AI_MEMORY_STORE_URL=postgres://u@h/d?password=%s\"" % PW,
+    "command substitution in an assignment": "exts=\"$(ssh h \"docker exec -e PGPASSWORD='$X' c psql\")\"",
+    "unit ExecStartPre psql": "ExecStartPre=-/usr/bin/psql postgres://u:%s@h/d -c x" % PW,
+    "yaml runcmd list item": "  - psql postgres://u:%s@h/d -c x" % PW,
 }
 GREEN_SHELL_PROBES = {
     "4663 assignment": 'PGURL="postgres://u:$PW@h/d"',
     "4663 exported assignment": "export PGURL=postgres://u:$PW@h/d",
+    "env prefix of a command": "PGPASSWORD=\"$PW\" psql postgres://u@h/d -c x",
     "4663 yaml content block line": "      postgres://aimemory:CHANGEME@localhost/aimemory?sslmode=verify-full",
     "4663 yaml mapping value": '      AI_MEMORY_STORE_URL: "postgres://u:p@h/d"',
     "4663 redaction token": "psql postgres://u:REDACTED@h/d",
     "4663 no password": "psql postgres://u@h/d",
     "4663 regex that begins with the scheme": "sed -n 's#^postgres://aimemory:\\([^@]*\\)@.*#\\1#p' /etc/ai-memory/store-url",
     "4663 printf builtin writes a file": "printf 'postgres://u:%s@h/d\\n' \"$PW\" > f",
-    "4663 comment": "# psql postgres://u:hunter2@h/d",
+    "4663 comment": "# psql postgres://u:%s@h/d" % PW,
+    "4694 docker -e NAME with no value": "docker exec -e PGPASSWORD c psql -c x",
+    "4694 docker -e of a non-secret name": "docker run -e PGHOST=db img",
+    "4692 passfile is not a password": "psql 'host=h passfile=/etc/pgpass dbname=d'",
+    "4691 a key that only contains password": "psql 'postgres://u@h/d?xpassword=1'",
+    "4689 Environment= without a credential": "Environment=AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url",
+    "argv-only verb": "ai-memory schema-init %s postgres://u:%s@h/d" % (SU, PW),
 }
 GREEN_PROBES = {
     "file-form": "AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url ai-memory serve",
-    "no-password": "ai-memory serve --store-url postgres://u@h/d",
-    "no-userinfo": "ai-memory serve --store-url postgres://h:5432/d",
-    "shell-expansion": 'ai-memory keys --store-url "$AI_MEMORY_STORE_URL" prune',
-    "ellipsis": "ai-memory serve --store-url postgres://aimemory:...@10.0.0.4:5432/db",
-    "redacted": "ai-memory serve --store-url postgres://aimemory:REDACTED@h/db",
-    "ellipsis-char": "ai-memory serve --store-url postgres://user:…@h/db",
-    "lookalike-flag": "wake_abab.sh --store-url-src postgres://u:p@h/d",
-    "prose-mention": "the `serve --store-url` connection URL (e.g. postgres://user:pass@host/db)",
-    "argv-only-verb": "ai-memory schema-init --store-url postgres://u:hunter2@h/d",
-    "argv-only-verb-continued": "ai-memory schema-init \\\n  --store-url postgres://u:hunter2@h/d",
+    "no-password": "ai-memory serve %s postgres://u@h/d" % SU,
+    "no-userinfo": "ai-memory serve %s postgres://h:5432/d" % SU,
+    "shell-expansion": 'ai-memory keys %s "$AI_MEMORY_STORE_URL" prune' % SU,
+    "ellipsis": "ai-memory serve %s postgres://aimemory:...@10.0.0.4:5432/db" % SU,
+    "redacted": "ai-memory serve %s postgres://aimemory:REDACTED@h/db" % SU,
+    "ellipsis-char": "ai-memory serve %s postgres://user:…@h/db" % SU,
+    "lookalike-flag": "wake_abab.sh %s-src postgres://u:p@h/d" % SU,
+    "prose-mention": "the `serve %s` connection URL (e.g. postgres://user:pass@host/db)" % SU,
+    "argv-only-verb": "ai-memory schema-init %s postgres://u:%s@h/d" % (SU, PW),
+    "argv-only-verb-continued": "ai-memory schema-init \\\n  %s postgres://u:%s@h/d" % (SU, PW),
 }
 
 
 def self_test() -> int:
     bad = 0
+    red = green = 0
     for name, text in RED_PROBES.items():
+        red += 1
         if not scan_text("probe.md", text):
             print("SELF-TEST FAIL: red probe %r was not flagged" % name, file=sys.stderr)
             bad += 1
     for name, text in GREEN_PROBES.items():
-        got = scan_text("probe.md", text)
-        if got:
-            print("SELF-TEST FAIL: green probe %r was flagged: %r" % (name, got), file=sys.stderr)
+        green += 1
+        if scan_text("probe.md", text):
+            print("SELF-TEST FAIL: green probe %r was flagged" % name, file=sys.stderr)
             bad += 1
-    for name, text in RED_SHELL_PROBES.items():
-        if not scan_text("probe.sh", text):
-            print("SELF-TEST FAIL: red shell probe %r was not flagged" % name, file=sys.stderr)
-            bad += 1
-    for name, text in GREEN_SHELL_PROBES.items():
-        got = scan_text("probe.sh", text)
-        if got:
-            print("SELF-TEST FAIL: green shell probe %r was flagged: %r" % (name, got), file=sys.stderr)
-            bad += 1
+    for suffix in (".sh", ".tpl", ".service"):
+        for name, text in RED_SHELL_PROBES.items():
+            red += 1
+            if not scan_text("probe" + suffix, text):
+                print("SELF-TEST FAIL: red shell probe %r (%s) was not flagged" % (name, suffix), file=sys.stderr)
+                bad += 1
+        for name, text in GREEN_SHELL_PROBES.items():
+            green += 1
+            if scan_text("probe" + suffix, text):
+                print("SELF-TEST FAIL: green shell probe %r (%s) was flagged" % (name, suffix), file=sys.stderr)
+                bad += 1
+    red += 1
     if scan_text("probe.md", RED_SHELL_PROBES["4663 psql with a literal password"]):
         print("SELF-TEST FAIL: a prose file (.md) was read as a shell file", file=sys.stderr)
         bad += 1
+    red += 1
     if scan_text("scripts/check-docs-no-argv-secrets.py", RED_PROBES["inline"]):
         print("SELF-TEST FAIL: self-exempt path was flagged", file=sys.stderr)
+        bad += 1
+    # A reported snippet never carries the placeholder secret.
+    red += 1
+    reported = scan_text("probe.sh", RED_SHELL_PROBES["4692 keyword conninfo with spaces around ="])
+    reported += scan_text("probe.md", RED_PROBES["inline"])
+    reported += scan_text("probe.sh", RED_SHELL_PROBES["4694 docker run --env=NAME=value"])
+    if len(reported) != 3 or any(PW in h[2] for h in reported):
+        print("SELF-TEST FAIL: a hit snippet is missing or prints the secret: %r" % reported, file=sys.stderr)
         bad += 1
     # End to end through the file walker, in a scratch dir inside the repo.
     scratch_parent = ROOT / ".local-runs"
@@ -313,27 +582,52 @@ def self_test() -> int:
         root = Path(td)
         (root / "bad.md").write_text(RED_PROBES["inline"] + "\n", encoding="utf-8")
         (root / "ok.md").write_text(GREEN_PROBES["file-form"] + "\n", encoding="utf-8")
-        hits, scanned = scan_paths(root, ["bad.md", "ok.md"])
-        if scanned != 2 or [h[0] for h in hits] != ["bad.md"]:
+        (root / "bad.sh").write_text(RED_SHELL_PROBES["4690 pg_dump --dbname= form"] + "\n", encoding="utf-8")
+        hits, scanned = scan_paths(root, ["bad.md", "ok.md", "bad.sh"])
+        red += 1
+        if scanned != 3 or sorted(h[0] for h in hits) != ["bad.md", "bad.sh"]:
             print("SELF-TEST FAIL: file walk gave hits=%r scanned=%d" % (hits, scanned), file=sys.stderr)
             bad += 1
-        hits, scanned = scan_paths(root, [])
+        # A pending entry claims its hit; an entry with no hit is stale.
+        sh_hits, _ = scan_paths(root, ["bad.sh"])
+        left, listed, stale = split_pending(root, sh_hits, (("bad.sh", "pg_dump --dbname=", "#0"),))
+        red += 1
+        if left or len(listed) != 1 or stale:
+            print("SELF-TEST FAIL: pending entry did not claim its hit", file=sys.stderr)
+            bad += 1
+        left, listed, stale = split_pending(root, [], (("bad.sh", "pg_dump --dbname=", "#0"),))
+        red += 1
+        if len(stale) != 1:
+            print("SELF-TEST FAIL: stale pending entry was not reported", file=sys.stderr)
+            bad += 1
+        _, scanned = scan_paths(root, [])
+        red += 1
         if scanned != 0:
             print("SELF-TEST FAIL: empty file list scanned something", file=sys.stderr)
             bad += 1
     if bad:
+        print("SELF-TEST FAIL: %d case(s) wrong" % bad, file=sys.stderr)
         return 2
-    print("PASS: check-docs-no-argv-secrets self-test: %d red probes flagged, %d green probes clean"
-          % (len(RED_PROBES) + len(RED_SHELL_PROBES), len(GREEN_PROBES) + len(GREEN_SHELL_PROBES)))
+    print("PASS: check-docs-no-argv-secrets self-test: %d red cases flagged, %d green cases clean"
+          % (red, green))
     return 0
 
 
-def main(argv: list[str]) -> int:
-    if argv[1:] == ["--self-test"]:
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Refuse a credential on a process argv in a tracked file (#4577).")
+    parser.add_argument("--self-test", action="store_true",
+                        help="run the red/green probe set instead of the repository scan")
+    return parser
+
+
+def main(argv: List[str]) -> int:
+    try:
+        args = build_parser().parse_args(argv[1:])
+    except SystemExit as exc:
+        return 2 if exc.code else 0
+    if args.self_test:
         return self_test()
-    if len(argv) > 1:
-        print(__doc__, file=sys.stderr)
-        return 2
     return run()
 
 
