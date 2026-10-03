@@ -164,25 +164,38 @@ write_files:
       # infra/do-hive/crypto/test-pg-verifyfull.sh (hostssl, scram-sha-256).
       TLSD=/etc/ai-memory/tls
       PGTLS=/etc/postgresql/18/main/tls
+      # #4666: the CA private key exists only in a root-only work dir on tmpfs
+      # (RAM, never written to the volume) for the few seconds it takes to sign
+      # the server certificate. The dir is removed on success AND on any
+      # failure or exit, so a compromised node cannot mint certificates the
+      # daemon would trust.
+      PGCA=/run/ai-memory-pgca
+      wipe_pgca() { rm -rf "$PGCA"; }
+      trap wipe_pgca EXIT
       install -d -o root -g aimemory -m 0750 "$TLSD"
+      # An earlier image kept the CA key here: remove it unconditionally.
+      rm -f "$TLSD/pg-ca.key" "$TLSD/pg-ca.srl"
       if [ ! -s "$TLSD/pg-ca.crt" ] || [ ! -s "$PGTLS/server.key" ]; then
+        wipe_pgca
+        install -d -m 0700 "$PGCA"
         ( umask 077
-          openssl genrsa -out "$TLSD/pg-ca.key" 4096
-          openssl req -x509 -new -key "$TLSD/pg-ca.key" -sha256 -days 365 \
-            -subj "/CN=ai-memory-burst-pg-CA" -out "$TLSD/pg-ca.crt"
-          openssl genrsa -out "$TLSD/pg-server.key" 2048
-          openssl req -new -key "$TLSD/pg-server.key" -subj "/CN=localhost" \
-            -out "$TLSD/pg-server.csr"
+          openssl genrsa -out "$PGCA/pg-ca.key" 4096
+          openssl req -x509 -new -key "$PGCA/pg-ca.key" -sha256 -days 365 \
+            -subj "/CN=ai-memory-burst-pg-CA" -out "$PGCA/pg-ca.crt"
+          openssl genrsa -out "$PGCA/pg-server.key" 2048
+          openssl req -new -key "$PGCA/pg-server.key" -subj "/CN=localhost" \
+            -out "$PGCA/pg-server.csr"
           printf 'subjectAltName=DNS:localhost,IP:127.0.0.1,IP:0:0:0:0:0:0:0:1\n' \
-            > "$TLSD/pg-server.ext"
-          openssl x509 -req -in "$TLSD/pg-server.csr" -CA "$TLSD/pg-ca.crt" \
-            -CAkey "$TLSD/pg-ca.key" -CAcreateserial -days 365 -sha256 \
-            -extfile "$TLSD/pg-server.ext" -out "$TLSD/pg-server.crt" ) \
+            > "$PGCA/pg-server.ext"
+          openssl x509 -req -in "$PGCA/pg-server.csr" -CA "$PGCA/pg-ca.crt" \
+            -CAkey "$PGCA/pg-ca.key" -CAcreateserial -days 365 -sha256 \
+            -extfile "$PGCA/pg-server.ext" -out "$PGCA/pg-server.crt" ) \
           || { echo "could not mint the postgres TLS pair"; exit 1; }
+        install -o root -g aimemory -m 0644 "$PGCA/pg-ca.crt" "$TLSD/pg-ca.crt"
         install -d -o postgres -g postgres -m 0700 "$PGTLS"
-        install -o postgres -g postgres -m 0600 "$TLSD/pg-server.key" "$PGTLS/server.key"
-        install -o postgres -g postgres -m 0644 "$TLSD/pg-server.crt" "$PGTLS/server.crt"
-        rm -f "$TLSD/pg-server.key" "$TLSD/pg-server.csr" "$TLSD/pg-server.ext" "$TLSD/pg-server.crt"
+        install -o postgres -g postgres -m 0600 "$PGCA/pg-server.key" "$PGTLS/server.key"
+        install -o postgres -g postgres -m 0644 "$PGCA/pg-server.crt" "$PGTLS/server.crt"
+        wipe_pgca
       fi
       # The service user reads only the CA certificate (the trust anchor).
       chown root:aimemory "$TLSD/pg-ca.crt"
