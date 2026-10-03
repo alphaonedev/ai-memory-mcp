@@ -52,6 +52,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 SERVE_SRC = ROOT / "src" / "daemon_runtime.rs"
 TEMPLATE_GLOB = "infra/*/cloud-init-memory*.tpl"
+AWS_TEMPLATE = "infra/aws-gpu-burst/cloud-init-memory.yaml.tpl"
 REQUIRED_FLAGS = ("--tls-cert", "--tls-key")
 
 # Templates that still lack the sslmode floor, each with its tracker. The
@@ -61,9 +62,16 @@ REQUIRED_FLAGS = ("--tls-cert", "--tls-key")
 DSN_FLOOR_GAPS = {
     "infra/do-hive/cloud-init-memory.yaml.tpl": "#4635 do-hive pgbouncer leg",
 }
-GIT_FLOAT_RE = re.compile(r"^\s*(?:[^#\s][^#]*?)?\bgit\s+(?:clone|checkout)\b", re.M)
-COMMIT_RE = re.compile(r"^\s*(\w+_COMMIT)=(\S+)\s*$", re.M)
+# Any `<NAME>_COMMIT=<value>` assignment; every one must be a full 40-hex commit.
+COMMIT_RE = re.compile(r"(?<![\w$])(\w+_COMMIT)=(\S*)")
 HEX40_RE = re.compile(r"^[0-9a-f]{40}$")
+# A shell command `git ...` (not `.git` in a URL, not the word in a package list).
+GIT_CMD_RE = re.compile(r"(?<![\w./$-])git[ \t]+(?P<args>[^;&|\n)]*)")
+GIT_OPT_WITH_ARG = ("-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--config-env")
+FETCH_PINNED_DEF_RE = re.compile(r"^[ \t]*fetch_pinned\(\)[ \t]*\{[^\n]*\n(?P<body>.*?)\n[ \t]*\}[ \t]*$", re.M | re.S)
+FETCH_PINNED_CALL_RE = re.compile(r'^[ \t]*fetch_pinned[ \t]+https://\S+[ \t]+\S+[ \t]+"\$(?P<var>\w+_COMMIT)"[ \t]*$')
+VERIFY_RE = re.compile(r'^\[ "\$\(git(?: -C "\$2")? rev-parse HEAD\)" = "\$3" \]$')
+COMMENT_LINE_RE = re.compile(r"^[ \t]*#.*$", re.M)
 DSN_RE = re.compile(r"^\s+(postgres(?:ql)?://\S+)\s*$", re.M)
 STRUCT_RE = re.compile(r"pub struct ServeArgs \{(.*?)\n\}", re.S)
 FIELD_RE = re.compile(r"^\s{4}pub (\w+):", re.M)
@@ -148,16 +156,112 @@ def dsn_hits(name: str, text: str) -> list:
     return hits
 
 
-def pin_hits(name: str, text: str) -> list:
-    """#4636: extension sources are fetched by full commit, never by a movable ref."""
+def blank_comments(text: str) -> str:
+    """Blank whole-line comments (keeping the newline). Done before continuation
+    joining: a comment line ending in a backslash does not continue."""
+    return COMMENT_LINE_RE.sub("", text)
+
+
+def join_continuations(text: str):
+    """Collapse backslash-newline continuations; return (joined, line_at) where
+    line_at maps a joined offset back to its line number in ``text``."""
+    parts, cuts, last, out_len = [], [], 0, 0
+    for m in CONT_RE.finditer(text):
+        seg = text[last:m.start()]
+        parts.append(seg)
+        out_len += len(seg) + 1
+        parts.append(" ")
+        cuts.append(out_len)
+        last = m.end()
+    parts.append(text[last:])
+    joined = "".join(parts)
+
+    def line_at(off: int) -> int:
+        return joined.count("\n", 0, off) + 1 + sum(1 for c in cuts if c <= off)
+
+    return joined, line_at
+
+
+def git_verb(args: str):
+    """Return (verb, rest) of a ``git <global options> <verb> ...`` argument string."""
+    toks = args.split()
+    i = 0
+    while i < len(toks) and toks[i].startswith("-"):
+        i += 2 if toks[i] in GIT_OPT_WITH_ARG else 1
+    if i >= len(toks):
+        return "", []
+    return toks[i], toks[i + 1:]
+
+
+def fetch_pinned_body_hits(name: str, line: int, body: str) -> list:
+    """The one function allowed to run git must fetch the pin, check out what it
+    fetched, and fail unless HEAD is exactly the pin."""
     hits = []
-    for m in GIT_FLOAT_RE.finditer(text):
-        lineno = text.count("\n", 0, m.start()) + 1
-        hits.append("%s:%d: git clone/checkout of a movable ref (use fetch_pinned with a *_COMMIT 40-hex pin, #4636)" % (name, lineno))
-    for m in COMMIT_RE.finditer(text):
-        if not HEX40_RE.match(m.group(2)):
-            lineno = text.count("\n", 0, m.start()) + 1
-            hits.append("%s:%d: %s is not a full 40-hex commit" % (name, lineno, m.group(1)))
+    chain, sep, handler = body.partition("||")
+    segs = [x.strip() for x in chain.split("&&")]
+    seen = set()
+    for i, seg in enumerate(segs):
+        gm = GIT_CMD_RE.match(seg)
+        if seg == 'rm -rf "$2"':
+            continue
+        if VERIFY_RE.match(seg):
+            seen.add("verify")
+            if i != len(segs) - 1:
+                hits.append("%s:%d: fetch_pinned: the rev-parse check must be the last step of the chain" % (name, line))
+            continue
+        if gm is None:
+            hits.append("%s:%d: fetch_pinned: unrecognised step %r" % (name, line, seg[:60]))
+            continue
+        verb, rest = git_verb(gm.group("args"))
+        if verb == "init":
+            continue
+        if verb == "remote" and rest[:1] == ["add"]:
+            continue
+        if verb == "fetch" and rest and rest[-1] == '"$3"':
+            seen.add("fetch")
+            continue
+        if verb == "checkout" and rest and rest[-1] == "FETCH_HEAD":
+            seen.add("checkout")
+            continue
+        hits.append("%s:%d: fetch_pinned: git %s is not a pinned step (fetch the commit as \"$3\", check out FETCH_HEAD)" % (name, line, verb or "?"))
+    for need, why in (("fetch", 'git fetch ... "$3"'), ("checkout", "git checkout ... FETCH_HEAD"), ("verify", '[ "$(git -C "$2" rev-parse HEAD)" = "$3" ]')):
+        if need not in seen:
+            hits.append("%s:%d: fetch_pinned has no %s step (%s, #4636)" % (name, line, need, why))
+    if not sep or not re.search(r"\breturn[ \t]+1\b", handler):
+        hits.append("%s:%d: fetch_pinned has no failure handler that returns 1 (a pin mismatch must stop the script)" % (name, line))
+    return hits
+
+
+def pin_hits(name: str, text: str) -> list:
+    """#4636/#4657: every git use is the one verified fetch_pinned, called with a
+    40-hex commit variable assigned only 40-hex values."""
+    hits = []
+    joined, line_at = join_continuations(blank_comments(text))
+    commits = set()
+    for m in COMMIT_RE.finditer(joined):
+        if HEX40_RE.match(m.group(2)):
+            commits.add(m.group(1))
+        else:
+            hits.append("%s:%d: %s is not a full 40-hex commit" % (name, line_at(m.start()), m.group(1)))
+    defs = list(FETCH_PINNED_DEF_RE.finditer(joined))
+    spans = [(d.start("body"), d.end("body")) for d in defs]
+    gits = list(GIT_CMD_RE.finditer(joined))
+    for m in gits:
+        if not any(a <= m.start() < b for a, b in spans):
+            hits.append("%s:%d: git %s outside fetch_pinned (every git fetch/checkout goes through fetch_pinned with a *_COMMIT 40-hex pin, #4636)" % (name, line_at(m.start()), m.group("args").strip()[:40]))
+    ndefs = joined.count("fetch_pinned()")
+    call_lines = [m for m in re.finditer(r"^.*fetch_pinned.*$", joined, re.M) if "fetch_pinned()" not in m.group(0)]
+    if gits or call_lines or ndefs:
+        if ndefs != 1 or len(defs) != 1:
+            hits.append("%s: expected exactly one multi-line fetch_pinned() definition, found %d (%d parsed)" % (name, ndefs, len(defs)))
+        for d in defs:
+            hits.extend(fetch_pinned_body_hits(name, line_at(d.start("body")), d.group("body")))
+    for m in call_lines:
+        cm = FETCH_PINNED_CALL_RE.match(m.group(0))
+        if cm is None:
+            hits.append("%s:%d: fetch_pinned call must be exactly: fetch_pinned https://<url> <dir> \"$<NAME>_COMMIT\" (got %r)" % (name, line_at(m.start()), m.group(0).strip()[:60]))
+        elif cm.group("var") not in commits:
+            hits.append("%s:%d: fetch_pinned uses $%s, which is not assigned a 40-hex commit in this template" % (name, line_at(m.start()), cm.group("var")))
     return hits
 
 
@@ -196,7 +300,20 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
+def mutate(text: str, old: str, new: str) -> str:
+    """Replace ``old`` with ``new`` or fail loudly: a probe built from the real
+    template must not silently stop mutating it when the template changes."""
+    if old not in text:
+        raise RuntimeError("self-test fixture drift: %r not found in the AWS template" % old[:60])
+    return text.replace(old, new, 1)
+
+
 def self_test(known: set) -> int:
+    real = (ROOT / AWS_TEMPLATE).read_text(encoding="utf-8")
+    age_call = '        fetch_pinned https://github.com/apache/age.git /opt/age-src "$AGE_COMMIT"\n'
+    rev_line = '          && [ "$(git -C "$2" rev-parse HEAD)" = "$3" ] \\\n'
+    handler = '|| { echo "pin mismatch: $1 did not resolve to $3"; return 1; }'
+    age_assign = "      AGE_COMMIT=e43dc1a12b78fba4acef9835b2b10379b8d243b4\n"
     dsn = "      postgres://u:p@localhost/db?sslmode=verify-full&sslrootcert=/c\n"
     unit = "ExecStart=/opt/ai-memory/bin/ai-memory serve --host 0.0.0.0 --port 9077 --tls-cert /a --tls-key /b\n"
     good = dsn + unit
@@ -217,6 +334,14 @@ def self_test(known: set) -> int:
         "git clone of a branch": good + "        git clone https://github.com/apache/age.git /opt/age-src\n",
         "git checkout of a branch": good + "        git checkout release/PG18/1.8.0\n",
         "short commit pin": good + "      AGE_COMMIT=e43dc1a\n",
+        "4657 aws: git -C fetch of a branch then checkout FETCH_HEAD": mutate(real, age_call, "        git init -q /opt/age-src\n        git -C /opt/age-src fetch -q origin release/PG18/1.8.0\n        git -C /opt/age-src checkout -q FETCH_HEAD\n"),
+        "4657 aws: fetch_pinned without its rev-parse check": mutate(real, rev_line, ""),
+        "4657 aws: fetch_pinned called with a branch": mutate(real, age_call, '        fetch_pinned https://github.com/apache/age.git /opt/age-src release/PG18/1.8.0\n'),
+        "4657 aws: fetch_pinned called with an unassigned variable": mutate(real, '/opt/age-src "$AGE_COMMIT"', '/opt/age-src "$OTHER_COMMIT"'),
+        "4657 aws: pin reassigned from a command": mutate(real, age_assign, age_assign + "      AGE_COMMIT=$(curl -fsS https://example.invalid/head)\n"),
+        "4657 aws: second fetch_pinned definition": mutate(real, "      # pgvector v0.8.6 (git ls-remote", "      fetch_pinned() { true; }\n      # pgvector v0.8.6 (git ls-remote"),
+        "4657 aws: failure handler replaced by true": mutate(real, handler, "|| true"),
+        "4657 aws: git pull outside fetch_pinned": mutate(real, age_call, age_call + "        git -C /opt/age-src pull -q\n"),
         "serve with unidentified binary": dsn + "ExecStart=/opt/ai-memory/bin/wrapper serve --host 0.0.0.0 --tls-cert /a --tls-key /b\n",
     }
     red = 0
@@ -226,6 +351,7 @@ def self_test(known: set) -> int:
         else:
             print("SELF-TEST FAIL: probe not flagged: " + label, file=sys.stderr)
     greens = {
+        "4657 aws template as shipped": real,
         "clean": good,
         "env wrapper": good.replace("ExecStart=/opt/", "ExecStart=/usr/bin/env /opt/"),
         "global flag before serve": good.replace("ai-memory serve", "ai-memory --db /x serve"),
