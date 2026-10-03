@@ -173,7 +173,13 @@ def regular_size(path: Path, label: str, errors: list):
     return path.stat().st_size
 
 
-FENCE_OPEN = re.compile(r"^\s*(`{3,}|~{3,})")
+# R3-F5: CommonMark fences. An opener or closer has at most 3 SPACES of indent (a tab, a no-break space or 4+
+# spaces make the line indented code or text, not a fence); a backtick opener's info string has no backtick;
+# a closer is a bare run of the same character, at least as long, followed only by spaces or tabs.
+FENCE_OPEN = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
+FENCE_CLOSE = re.compile(r"^ {0,3}(`{3,}|~{3,})[ \t]*$")
+ODD_INDENT_FENCE = re.compile(r"^[ \t\u00a0\u1680\u2000-\u200a\u202f\u205f\u3000]*[\t\u00a0\u1680\u2000-\u200a"
+                              r"\u202f\u205f\u3000][ \t\u00a0\u1680\u2000-\u200a\u202f\u205f\u3000]*(`{3,}|~{3,})")
 
 
 def split_lines(text: str) -> list:
@@ -181,30 +187,44 @@ def split_lines(text: str) -> list:
     return text.replace("\r\n", "\n").split("\n")
 
 
-def visible_lines(text: str) -> list:
-    """Return the lines that render as prose: outside fenced code and outside HTML comments.
+def fence_scan(text: str) -> list:
+    """Return (line, in_code) per line; in_code is True for fence delimiters and fenced content.
 
-    Fences follow CommonMark: a run of 3+ backticks or tildes opens one, and only a bare run of the
-    same character, at least as long, closes it. An unclosed fence hides the rest of the file.
-    HTML comments (`<!--` to `-->`, on one line or many) are removed; text outside them is kept.
+    An unclosed fence hides the rest of the file (CommonMark closes it at the end of the document, so
+    nothing after it renders as prose).
     """
     out = []
     fence = None
-    in_comment = False
     for line in split_lines(text):
-        if in_comment:
-            if "-->" in line:
-                in_comment = False
-            continue
         if fence is not None:
-            match = FENCE_OPEN.match(line)
-            if match and match.group(1)[0] == fence[0] and len(match.group(1)) >= fence[1] \
-                    and not line.strip().strip(fence[0]):
+            out.append((line, True))
+            match = FENCE_CLOSE.match(line)
+            if match and match.group(1)[0] == fence[0] and len(match.group(1)) >= fence[1]:
                 fence = None
             continue
         match = FENCE_OPEN.match(line)
-        if match:
+        if match and not (match.group(1)[0] == "`" and "`" in match.group(2)):
             fence = (match.group(1)[0], len(match.group(1)))
+            out.append((line, True))
+            continue
+        out.append((line, False))
+    return out
+
+
+def visible_lines(text: str) -> list:
+    """Return the lines that render as prose: outside fenced code and outside HTML comments.
+
+    HTML comments (`<!--` to `-->`, on one line or many) are removed from what counts as visible; they are
+    also refused outright by html_errors, so this only keeps a hidden heading from satisfying a pin.
+    """
+    out = []
+    in_comment = False
+    for line, in_code in fence_scan(text):
+        if in_code:
+            continue
+        if in_comment:
+            if "-->" in line:
+                in_comment = False
             continue
         kept = ""
         rest = line
@@ -222,6 +242,51 @@ def visible_lines(text: str) -> list:
         if kept.strip() or not line.strip():
             out.append(kept)
     return out
+
+
+HTML_BLOCK_STARTS = (
+    re.compile(r"^<(?:script|pre|style|textarea)(?:[\s>]|$)", re.IGNORECASE),
+    re.compile(r"^<!--"),
+    re.compile(r"^<\?"),
+    re.compile(r"^<![A-Za-z]"),
+    re.compile(r"^<!\[CDATA\["),
+    re.compile(
+        r"^</?(?:address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|dd|details|"
+        r"dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|frameset|h[1-6]|head|header|hr|"
+        r"html|iframe|legend|li|link|main|menu|menuitem|nav|noframes|ol|optgroup|option|p|param|search|"
+        r"section|summary|table|tbody|td|tfoot|th|thead|title|tr|track|ul)(?:[\s>]|/>|$)", re.IGNORECASE),
+    re.compile(r"^(?:<[A-Za-z][A-Za-z0-9-]*(?:\s+[^<>]*)?/?>|</[A-Za-z][A-Za-z0-9-]*\s*>)\s*$"),
+)
+CONTAINER_PREFIX = re.compile(r"^(?: {0,3}>[ ]?| {0,3}(?:[-+*]|\d{1,9}[.)])[ \t]+| +)")
+
+
+def html_errors(text: str, label: str) -> list:
+    """R3-F5: refuse raw HTML blocks, HTML comments and odd-indent fences outside code fences.
+
+    A CommonMark HTML block (start conditions 1-7, also behind blockquote or list markers) or a comment
+    renders nothing the way the source reads, so a rule heading or body can be hidden in one. Inline tags
+    inside a sentence are not blocks and stay allowed.
+    """
+    errors = []
+    for number, (line, in_code) in enumerate(fence_scan(text), 1):
+        if in_code:
+            continue
+        if ODD_INDENT_FENCE.match(line):
+            errors.append(
+                f"FAIL: {label}:{number} a fence marker indented with a tab or a no-break space is not a "
+                "CommonMark fence (#4507 R3-F5)")
+        if "<!--" in line:
+            errors.append(f"FAIL: {label}:{number} raw HTML comment outside a code fence (#4507 R3-F5)")
+            continue
+        rest = line
+        while True:
+            stripped = CONTAINER_PREFIX.sub("", rest, count=1)
+            if stripped == rest:
+                break
+            rest = stripped
+        if any(pattern.match(rest) for pattern in HTML_BLOCK_STARTS):
+            errors.append(f"FAIL: {label}:{number} raw HTML block outside a code fence: {line.strip()[:60]} (#4507 R3-F5)")
+    return errors
 
 
 def headings_outside_fences(text: str) -> list:
@@ -331,6 +396,7 @@ def check(root: Path, index_pins=None) -> list:
         except (OSError, UnicodeDecodeError) as exc:
             errors.append(f"FAIL: cannot read CLAUDE.md as UTF-8: {exc}")
             text = ""
+        errors += html_errors(text, "CLAUDE.md")
         visible = visible_lines(text)
         present = {line.rstrip() for line in visible if line.startswith("## ")}
         for heading in CLAUDE_MD_REQUIRED_HEADINGS:
@@ -363,6 +429,7 @@ def check(root: Path, index_pins=None) -> list:
         except (OSError, UnicodeDecodeError) as exc:
             errors.append(f"FAIL: cannot read {rel} as UTF-8: {exc}")
             continue
+        errors += html_errors(ref_text, rel)
         ref_lines[Path(rel).stem] = split_lines(ref_text)
         first = ref_lines[Path(rel).stem][0]
         if first != top_heading:
@@ -551,13 +618,13 @@ def run_cases(base: Path) -> bool:
     text = (root / claude_md).read_text(encoding="utf-8")
     text = "~~~\nfenced\n~~~\n<!-- a comment\nspanning lines -->\n<!-- one line -->\n" + text
     (root / claude_md).write_text(text, encoding="utf-8")
-    ok &= expect(root, "headings after a closed tilde fence and closed HTML comments", False)
+    ok &= expect(root, "headings after a closed tilde fence and closed HTML comments", True, "raw HTML")
 
     root = fresh()
     heading = CLAUDE_MD_REQUIRED_HEADINGS[11]
     text = (root / claude_md).read_text(encoding="utf-8").replace(heading + "\n", heading + " <!-- note -->\n", 1)
     (root / claude_md).write_text(text, encoding="utf-8")
-    ok &= expect(root, "a heading followed by a trailing HTML comment (still renders)", False)
+    ok &= expect(root, "a heading followed by a trailing HTML comment (refused outright, R3-F5)", True, "raw HTML")
     for index, heading in enumerate(CLAUDE_MD_REQUIRED_HEADINGS):
         root = fresh()
         text = (root / claude_md).read_text(encoding="utf-8")
@@ -719,6 +786,71 @@ def run_cases(base: Path) -> bool:
     text = text.replace(f'- `CODE_STYLE.md:3` "{quote_a}"\n', f'- `CODE_STYLE.md:3` "{quote_a}"\n' + extra, 1)
     (root / claude_md).write_text(text, encoding="utf-8")
     ok &= expect(root, "R3-F2 a duplicated index entry", True, "index quote set")
+
+    # R3-F5: CommonMark fences (at most 3 spaces of indent) and raw HTML blocks.
+    heading = CLAUDE_MD_REQUIRED_HEADINGS[14]
+    for label, closer in (("4 spaces", "    ```"), ("a no-break space", "\u00a0```"), ("a tab", "\t```")):
+        root = fresh()
+        text = (root / claude_md).read_text(encoding="utf-8").replace(
+            heading + "\n", "```\nhidden\n" + closer + "\n" + heading + "\n", 1)
+        (root / claude_md).write_text(text, encoding="utf-8")
+        ok &= expect(root, f"R3-F5 a fence 'closed' by a backtick line indented with {label}", True,
+                     "missing the required heading")
+    root = fresh()
+    text = (root / claude_md).read_text(encoding="utf-8").replace(
+        heading + "\n", "```\nfenced\n   ```\n" + heading + "\n", 1)
+    (root / claude_md).write_text(text, encoding="utf-8")
+    ok &= expect(root, "R3-F5 a fence legitimately closed by a 3-space-indented run", False)
+    root = fresh()
+    text = (root / claude_md).read_text(encoding="utf-8").replace(
+        heading + "\n", "```\nhidden\n``` trailing\n" + heading + "\n", 1)
+    (root / claude_md).write_text(text, encoding="utf-8")
+    ok &= expect(root, "R3-F5 a fence 'closed' by a run followed by text", True, "missing the required heading")
+    for label, lead in (("a tab", "\t"), ("a no-break space", "\u00a0")):
+        root = fresh()
+        text = (root / claude_md).read_text(encoding="utf-8").replace(
+            heading + "\n", lead + "```\n" + heading + "\n", 1)
+        (root / claude_md).write_text(text, encoding="utf-8")
+        ok &= expect(root, f"R3-F5 a fence opener indented with {label}", True, "fence")
+    html_wraps = (
+        ("pre block", "<pre>\n{h}\n</pre>\n"),
+        ("div line above a heading", "<div>\n{h}\n"),
+        ("details block", "<details>\n{h}\n</details>\n"),
+        ("uppercase PRE", "<PRE>\n{h}\n</PRE>\n"),
+        ("script block", "<script>\n{h}\n"),
+        ("style block", "<style>\n{h}\n"),
+        ("table block", "<table>\n{h}\n"),
+        ("blockquote-nested div", "> <div>\n{h}\n"),
+        ("list-nested div", "- <div>\n{h}\n"),
+        ("closing tag only", "</div>\n{h}\n"),
+        ("complete custom tag alone", "<span>\n{h}\n"),
+        ("processing instruction", "<?php\n{h}\n"),
+        ("declaration", "<!DOCTYPE html>\n{h}\n"),
+        ("CDATA", "<![CDATA[\n{h}\n"),
+        ("comment mid-line", "text <!-- x -->\n{h}\n"),
+        ("comment opener only", "<!--\n{h}\n-->\n"),
+        ("three-space-indented div", "   <div>\n{h}\n"),
+    )
+    for label, wrap in html_wraps:
+        root = fresh()
+        text = (root / claude_md).read_text(encoding="utf-8").replace(
+            heading + "\n", wrap.replace("{h}", heading), 1)
+        (root / claude_md).write_text(text, encoding="utf-8")
+        ok &= expect(root, f"R3-F5 raw HTML: {label}", True, "raw HTML")
+    root = fresh()
+    path = root / style
+    path.write_text(path.read_text(encoding="utf-8") + "\n<div>\n", encoding="utf-8")
+    ok &= expect(root, "R3-F5 raw HTML in a reference file", True, "raw HTML")
+    root = fresh()
+    text = (root / claude_md).read_text(encoding="utf-8").replace(
+        heading + "\n", "```html\n<div>\n<!-- c -->\n```\n" + heading + "\n", 1)
+    (root / claude_md).write_text(text, encoding="utf-8")
+    ok &= expect(root, "R3-F5 HTML inside a closed code fence is plain text", False)
+    root = fresh()
+    text = (root / claude_md).read_text(encoding="utf-8").replace(
+        heading + "\n", heading + "\nUse Vec<String> and <push-pattern> #<issue> here.\n", 1)
+    (root / claude_md).write_text(text, encoding="utf-8")
+    ok &= expect(root, "R3-F5 inline angle brackets in prose are accepted", False)
 
     root = fresh()
     text = (root / claude_md).read_text(encoding="utf-8").replace(
