@@ -19,7 +19,8 @@ import sys
 import tempfile
 from pathlib import Path
 
-CLAUDE_MD_MAX_BYTES = 100_000
+# Ceilings only fall (#4507 target: <= 80 KB). Keep CLAUDE.md short rather than raising this.
+CLAUDE_MD_MAX_BYTES = 80_000
 REFERENCE_FILES = (
     "docs/reference/ARCHITECTURE_REFERENCE.md",
     "docs/reference/CODE_STYLE.md",
