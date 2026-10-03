@@ -1761,10 +1761,28 @@ Six surfaces, each load-bearing for different ops scenarios:
    [`prometheus_metrics`](../src/handlers/transport.rs)) — Prometheus scrape
    endpoint. Exports the substrate's metrics
    (`src/metrics.rs`).
-3. **Tracing spans on stderr** — every MCP tool call, every governance
-   decision, every federation event emits a `tracing::info!` span.
-   `RUST_LOG=ai_memory=info` is the default; `RUST_LOG=ai_memory=debug`
-   for deep traces.
+3. **Tracing on stderr** — an MCP `tools/call` request that reaches the
+   dispatch call runs inside an `mcp_tool_call` info span (fields `tool` and
+   `rpc_id`, `tools/call` arm of `src/mcp/mod.rs`) and reports an `ok` info
+   event with `elapsed_ms`, or an `err` warn event. A request with a missing
+   tool name, or for a tool not loaded in the active profile, returns before
+   the span. Non-object `arguments`, an unresolvable caller authority, the
+   record-stop gate, an unknown tool and an unrecognised wire format return
+   inside the span without an `ok` or `err` event. Governance decisions are not tracing spans:
+   [`record_decision`](../src/governance/audit.rs) records them as forensic
+   audit rows when the forensic audit sink is running and does nothing when
+   it is not. Federation emits `tracing::info!` events on the push,
+   DLQ-replay, receive and sync paths, not a span per event. The default
+   filter is the bare level `info`
+   ([`DEFAULT_LOG_DIRECTIVE`](../src/logging.rs), #3650), which is not limited
+   to the `ai_memory` prefix. A `RUST_LOG` directive is added on top of that base:
+   `RUST_LOG=ai_memory=debug` raises the `ai_memory` targets for deep traces
+   and leaves other targets at `info`, and a bare level such as
+   `RUST_LOG=error` replaces the base level. The sinks of the `[logging]`
+   pipeline (file, stdout and syslog) do not read `RUST_LOG`: their filter is
+   `[logging].level` (default `info`) plus the two `sqlx_postgres::options`
+   credential floors at `error`, so with `level = "ai_memory=info"` those sinks
+   write nothing from other targets except `error` events from those two floor targets.
 4. **File logging** — opt-in via `[logging]` in `config.toml`.
    Rotating appender; off by default.
 5. **`ai-memory doctor`** — 10-section health dashboard run locally.
