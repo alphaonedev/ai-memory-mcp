@@ -90,6 +90,28 @@ REFERENCE_FILES = (
     ("docs/reference/CODE_STYLE.md", "# ai-memory Code Style Reference", 45_000),
 )
 REFERENCE_PATHS = tuple(entry[0] for entry in REFERENCE_FILES)
+REFERENCE_DIR = "docs/reference"
+
+# R3-9: the visible `## ` and `### ` subsection headings of each reference file at the split. A file with
+# the right top heading and enough junk to clear its byte floor still fails if a subsection is gone.
+# Headings inside code fences or HTML comments do not count. Keyed by file stem; removing an entry is an
+# explicit decision.
+REFERENCE_SUBSECTIONS = {
+    "ARCHITECTURE_REFERENCE": (
+        "### Key Modules",
+        "### Data Model",
+        "### Recall Pipeline",
+        "### Upsert Behavior",
+        "### Mobile target support (v0.7.0 Posture-1a, issue #1068)",
+        "### Database",
+        "### Environment Variables",
+        "### Config schema v0.7.x (#1146) \u2014 sectioned `[llm]` / `[embeddings]` / `[reranker]` / `[storage]` / `[limits]`",
+        "### Agent Identity (NHI) \u2014 `metadata.agent_id`",
+    ),
+    "CODE_STYLE": (
+        "### Lint gates (issue #1174 PR10 \u2014 pm-v3.1 vendor-monoculture + SECS_PER_*)",
+    ),
+}
 
 # The binding-rules index (#4507 L1): agent-directed prohibitions that live only in a reference file are
 # quoted verbatim in CLAUDE.md so they bind even if the reference file is never opened. Each pointer
@@ -267,7 +289,19 @@ def check(root: Path) -> list:
         for heading in CLAUDE_MD_REQUIRED_HEADINGS:
             if heading not in present:
                 errors.append(f"FAIL: CLAUDE.md is missing the required heading: {heading}")
+    ref_dir_ok = True
+    try:
+        dir_mode = os.lstat(root / REFERENCE_DIR).st_mode
+    except OSError as exc:
+        errors.append(f"FAIL: cannot stat {REFERENCE_DIR}: {exc}")
+        ref_dir_ok = False
+    else:
+        if stat.S_ISLNK(dir_mode) or not stat.S_ISDIR(dir_mode):
+            errors.append(f"FAIL: {REFERENCE_DIR} is a symlink or not a directory; it must be a real directory (#4507)")
+            ref_dir_ok = False
     for rel, top_heading, min_bytes in REFERENCE_FILES:
+        if not ref_dir_ok:
+            break
         path = root / rel
         ref_size = regular_size(path, rel, errors)
         if ref_size is None:
@@ -286,6 +320,10 @@ def check(root: Path) -> list:
         first = ref_lines[Path(rel).stem][0]
         if first != top_heading:
             errors.append(f"FAIL: {rel} must start with the heading {top_heading!r}, found {first!r}")
+        present = {line.rstrip() for line in visible_lines(ref_text) if line.startswith(("## ", "### "))}
+        for sub in REFERENCE_SUBSECTIONS[Path(rel).stem]:
+            if sub not in present:
+                errors.append(f"FAIL: {rel} is missing the pinned subsection heading {sub!r} (#4507)")
     if size is not None:
         sections = sections_of(visible)
         for heading, floor in zip(CLAUDE_MD_REQUIRED_HEADINGS, CLAUDE_MD_SECTION_MIN_BYTES):
@@ -332,6 +370,7 @@ def build_fixture(root: Path) -> None:
         name = Path(rel).stem
         head = top_heading + "\n" + "".join(
             fixture_quote(name, n) + "\n" for n in range(1, minimums.get(name, 0) + 1))
+        head += "".join(sub + "\n" for sub in REFERENCE_SUBSECTIONS[name])
         target.write_text(head + "x" * (min_bytes - len(head)), encoding="utf-8")
 
 
@@ -474,6 +513,39 @@ def run_cases(base: Path) -> bool:
 
     root = fresh()
     ok &= expect(root, "every section exactly at its floor", False)
+
+    root = fresh()
+    path = root / arch
+    path.write_text("# ai-memory Architecture Reference\n" + "junk body line\n" * 25000, encoding="utf-8")
+    ok &= expect(root, "a reference file with the right top heading and junk padding to its floor", True,
+                 "missing the pinned subsection heading")
+
+    for name, rel in (("ARCHITECTURE_REFERENCE", arch), ("CODE_STYLE", style)):
+        root = fresh()
+        path = root / rel
+        sub = REFERENCE_SUBSECTIONS[name][-1]
+        path.write_text(path.read_text(encoding="utf-8").replace(sub + "\n", "x" * len(sub) + "\n", 1),
+                        encoding="utf-8")
+        ok &= expect(root, f"{name}.md with its last subsection heading removed", True,
+                     "missing the pinned subsection heading")
+
+    root = fresh()
+    path = root / arch
+    sub = REFERENCE_SUBSECTIONS["ARCHITECTURE_REFERENCE"][0]
+    path.write_text(path.read_text(encoding="utf-8").replace(sub + "\n", "```\n" + sub + "\n```\n", 1),
+                    encoding="utf-8")
+    ok &= expect(root, "a pinned subsection heading that exists only inside a code fence", True,
+                 "missing the pinned subsection heading")
+
+    root = fresh()
+    moved = root / "docs" / "reference-real"
+    (root / REFERENCE_DIR).rename(moved)
+    (root / REFERENCE_DIR).symlink_to(moved)
+    ok &= expect(root, "a symlinked docs/reference directory", True, "must be a real directory")
+
+    root = fresh()
+    shutil.rmtree(root / REFERENCE_DIR)
+    ok &= expect(root, "a missing docs/reference directory", True, "cannot stat docs/reference")
     arch_h, style_h = INDEX_SECTIONS[0][0], INDEX_SECTIONS[1][0]
     for label, sections in (("Architecture", (arch_h,)), ("Code Style", (style_h,)), ("both", (arch_h, style_h))):
         root = fresh()
@@ -548,6 +620,8 @@ SELF_TEST_PINNED_LIMITS = {
     "REFERENCE_FLOOR ARCHITECTURE_REFERENCE": 300_000,
     "REFERENCE_FLOOR CODE_STYLE": 45_000,
     "INDEX_MIN_QUOTE_CHARS": 20,
+    "REFERENCE_SUBSECTIONS ARCHITECTURE_REFERENCE": 9,
+    "REFERENCE_SUBSECTIONS CODE_STYLE": 1,
     "INDEX_MIN_ENTRIES ARCHITECTURE_REFERENCE": 5,
     "INDEX_MIN_ENTRIES CODE_STYLE": 7,
 }
@@ -568,6 +642,8 @@ def current_limits() -> dict:
         limits[f"REFERENCE_FLOOR {Path(rel).stem}"] = floor
     for _heading, name, minimum in INDEX_SECTIONS:
         limits[f"INDEX_MIN_ENTRIES {name}"] = minimum
+    for name, subs in REFERENCE_SUBSECTIONS.items():
+        limits[f"REFERENCE_SUBSECTIONS {name}"] = len(subs)
     return limits
 
 
