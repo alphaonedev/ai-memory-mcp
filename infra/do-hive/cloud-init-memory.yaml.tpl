@@ -7,7 +7,8 @@
 # apt package -- and `CREATE EXTENSION age` failed). It also used the invalid
 # `--bind` flag. This template installs pgvector, builds AGE from source
 # against pg16, preloads AGE, creates the db + both extensions, and runs serve
-# with the correct `--host/--port` flags + a postgres `--store-url`.
+# with the correct `--host/--port` flags and the postgres store URL read from
+# AI_MEMORY_STORE_URL_FILE (#4577; never on argv).
 #
 # #2293 fix (v1.0.0): the noble apt package `postgresql-16-pgvector` pins
 # pgvector 0.6.0, below the daemon's tested 0.7.x-0.8.x range (the v0.9.0 GA
@@ -35,6 +36,17 @@ packages:
   - curl
   - jq
 write_files:
+  # #4577: the Postgres DSN (it carries the db password) reaches the daemon
+  # through AI_MEMORY_STORE_URL_FILE, never on the serve argv where every local
+  # UID can read it from /proc/<pid>/cmdline and `ps auxww`. Written 0600 so no
+  # window exists in which it is group/world-readable; provision.sh hands it to
+  # the aimemory service user once that user exists (serve refuses a file with
+  # any group/world mode bit, src/store_url.rs). A trailing newline is trimmed.
+  - path: /etc/ai-memory/store-url
+    permissions: '0600'
+    owner: root:root
+    content: |
+      postgres://aimemory:${db_password}@127.0.0.1:6432/aimemory
   - path: /etc/systemd/system/ai-memory.service
     permissions: '0644'
     content: |
@@ -53,13 +65,14 @@ write_files:
       # write, so the open fails SQLITE_CANTOPEN (exit 75). Give it the aimemory
       # home (writable) as CWD so the relative ai-memory.db lands there.
       WorkingDirectory=/opt/ai-memory
+      Environment=AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url
       Environment=AI_MEMORY_PERMISSIONS_MODE=enforce
       Environment=AI_MEMORY_AUTONOMOUS_HOOKS=0
       Environment=RUST_LOG=ai_memory=info,store::postgres=info
       # Public binding is permitted only with TLS + fingerprint-pinned mTLS.
       # Request authn additionally uses the per-node API key; header trust stays off.
       EnvironmentFile=/etc/ai-memory/fed/runtime.env
-      ExecStart=/opt/ai-memory/bin/ai-memory serve --host 0.0.0.0 --port 9077 --store-url "postgres://aimemory:${db_password}@127.0.0.1:6432/aimemory" --tls-cert /etc/ai-memory/fed/node.crt --tls-key /etc/ai-memory/fed/node.key --mtls-allowlist /etc/ai-memory/fed/peers.allowlist
+      ExecStart=/opt/ai-memory/bin/ai-memory serve --host 0.0.0.0 --port 9077 --tls-cert /etc/ai-memory/fed/node.crt --tls-key /etc/ai-memory/fed/node.key --mtls-allowlist /etc/ai-memory/fed/peers.allowlist
       Restart=on-failure
       RestartSec=5
 
@@ -166,7 +179,7 @@ write_files:
       Environment=HOME=/opt/ai-memory
       EnvironmentFile=/etc/ai-memory/fed/peers.conf
       ExecStart=
-      ExecStart=/opt/ai-memory/bin/ai-memory serve --host 0.0.0.0 --port 9077 --store-url "postgres://aimemory:${db_password}@127.0.0.1:6432/aimemory" --tls-cert /etc/ai-memory/fed/node.crt --tls-key /etc/ai-memory/fed/node.key --mtls-allowlist /etc/ai-memory/fed/peers.allowlist%{ if federation_enabled } --quorum-writes ${quorum_writes} --quorum-peers $${AI_MEMORY_QUORUM_PEERS} --quorum-client-cert /etc/ai-memory/fed/node.crt --quorum-client-key /etc/ai-memory/fed/node.key --quorum-ca-cert /etc/ai-memory/fed/ca.crt --quorum-timeout-ms 8000%{ endif }
+      ExecStart=/opt/ai-memory/bin/ai-memory serve --host 0.0.0.0 --port 9077 --tls-cert /etc/ai-memory/fed/node.crt --tls-key /etc/ai-memory/fed/node.key --mtls-allowlist /etc/ai-memory/fed/peers.allowlist%{ if federation_enabled } --quorum-writes ${quorum_writes} --quorum-peers $${AI_MEMORY_QUORUM_PEERS} --quorum-client-cert /etc/ai-memory/fed/node.crt --quorum-client-key /etc/ai-memory/fed/node.key --quorum-ca-cert /etc/ai-memory/fed/ca.crt --quorum-timeout-ms 8000%{ endif }
   - path: /etc/systemd/system/ai-memory-fed-bootstrap.service
     permissions: '0644'
     content: |
@@ -441,6 +454,9 @@ write_files:
       id aimemory >/dev/null 2>&1 || useradd -m -d /opt/ai-memory -s /bin/bash aimemory
       mkdir -p /opt/ai-memory/bin /var/log/ai-memory
       chown -R aimemory:aimemory /opt/ai-memory /var/log/ai-memory
+      # #4577: hand the DSN file to the service user (mode stays 0600).
+      chown aimemory:aimemory /etc/ai-memory/store-url
+      chmod 0600 /etc/ai-memory/store-url
 
       # --- build + install certified pgvector 0.8.6 against PG18 ---
       # Build the exact certified v0.8.6 tag rather than accepting apt drift.

@@ -1293,3 +1293,22 @@ jobs:
         run: bash scripts/check-claude-plugin.sh
       - name: Self-test the gate (regression evidence)
         run: bash scripts/check-claude-plugin.sh --self-test
+
+  docs-no-argv-secrets-gate:
+    # #4577 - a tracked doc, unit, template or script must not put a database
+    # password on the --store-url argv (visible in ps and /proc/<pid>/cmdline).
+    # The store URL has non-argv channels: AI_MEMORY_STORE_URL_FILE, then
+    # AI_MEMORY_STORE_URL, then --store-url (src/store_url.rs:137). The one
+    # allowlisted verb is schema-init, which has no non-argv channel (#4600).
+    name: No-credentials-on-argv gate (#4577)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Run no-credentials-on-argv gate
+        run: python3 scripts/check-docs-no-argv-secrets.py
+      - name: Self-test the gate (regression evidence)
+        # Red probes: inline, =, quoted, continuation and curator forms.
+        # Green near-misses: file form, no password, redaction tokens,
+        # shell expansion, the schema-init allowlist.
+        run: python3 scripts/check-docs-no-argv-secrets.py --self-test
