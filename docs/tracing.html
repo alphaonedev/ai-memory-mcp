@@ -259,7 +259,7 @@ footer a{color:var(--text-muted)}
   <div class="container">
     <span class="eyebrow">Setup</span>
     <h2 style="font-family:var(--font-sans);font-size:1.75rem">How tracing initializes.</h2>
-    <p class="lede">The daemon installs a <code>tracing_subscriber::fmt</code> layer with the standard <code>EnvFilter</code> chain. A bare <code>info</code> base admits every target (#3650), the <code>tower_http=info</code> caller extra keeps request logs, and any <code>RUST_LOG</code> override layers last so the operator wins.</p>
+    <p class="lede">The daemon installs a <code>tracing_subscriber::fmt</code> layer with the standard <code>EnvFilter</code> chain. A bare <code>info</code> base admits every target (#3650), the <code>tower_http=info</code> caller extra keeps request logs, and any <code>RUST_LOG</code> override layers last so the operator wins. A target directive such as <code>ai_memory=error</code> changes only the targets under that prefix; a bare level such as <code>error</code> replaces the base level.</p>
     <div class="snip">// src/logging.rs::build_log_filter() — one builder serves every subscriber
 let built = crate::logging::build_log_filter(
     crate::logging::DEFAULT_LOG_DIRECTIVE, <span class="cm">// "info": bare base admits every target (#3650)</span>
@@ -268,8 +268,11 @@ let built = crate::logging::build_log_filter(
 );
 tracing_subscriber::fmt().with_env_filter(built.filter).try_init();</div>
     <p class="lede" style="margin-top:1rem">To turn the volume up:</p>
-    <div class="snip"><span class="cm"># quiet — only errors</span>
+    <div class="snip"><span class="cm"># ai_memory targets at error; other targets stay at the info default</span>
 RUST_LOG=ai_memory=error ai-memory serve
+
+<span class="cm"># error level for the base stream (serve keeps tower_http at info)</span>
+RUST_LOG=error ai-memory serve
 
 <span class="cm"># standard — what runs in prod</span>
 RUST_LOG=ai_memory=info,tower_http=info ai-memory serve
