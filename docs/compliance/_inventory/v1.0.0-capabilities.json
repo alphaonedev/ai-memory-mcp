@@ -914,7 +914,7 @@
         "src/governance/audit.rs:875 (load_daemon_signing_key)",
         "tests/mcp_initialize_server_signing.rs"
       ],
-      "factual_description": "Composite defense, both halves shipped: (1) the substrate captures clientInfo.name from the MCP initialize handshake and threads it through downstream operations; (2) the substrate publishes a daemon-Ed25519-signed ai_memory_identity block on every MCP initialize response so clients can TOFU-pin the daemon fingerprint. Block is OMITTED when the daemon has no keypair (the 'continuing unsigned' posture). The v0.7.0 inventory's PARTIAL honesty note is retired \u2014 #1154 closed the serverInfo half.",
+      "factual_description": "Composite defense, both halves shipped: (1) the substrate captures clientInfo.name from the MCP initialize handshake and threads it through downstream operations; (2) the substrate publishes a daemon-Ed25519-signed ai_memory_identity block on every MCP initialize response so clients can TOFU-pin the daemon fingerprint. Block is OMITTED when the daemon has no keypair (the unsigned posture of a non-writer host; a ledger-writing daemon ensures its key at boot since #3354). The v0.7.0 inventory's PARTIAL honesty note is retired \u2014 #1154 closed the serverInfo half.",
       "verified_in_v0_7_0": true,
       "verified_in_v1_0_0": true,
       "issue_references": [
