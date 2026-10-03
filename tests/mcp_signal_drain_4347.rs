@@ -493,6 +493,10 @@ fn an_in_flight_request_is_acknowledged_and_durable_after_the_signal_4347() {
 /// acknowledged, and the drain still covers its forensic row. Held after the
 /// `memory_delete` ran (its row is queued) and never released before the
 /// stop: the in-flight budget is shortened by the debug seam.
+///
+/// This cell pins the budget expiry only; the fence end to end (a request
+/// released after the fence while the drain runs) is pinned by
+/// `a_fenced_request_released_mid_drain_is_never_acknowledged_4347`.
 #[test]
 fn a_request_past_its_budget_is_never_acknowledged_and_keeps_its_row_4347() {
     let home = sandbox();
@@ -559,7 +563,7 @@ fn a_fenced_request_released_mid_drain_is_never_acknowledged_4347() {
     wait_entered(&dir);
     s.signal("TERM");
     // The fence has fired and the (slowed) drain is running: release now.
-    s.wait_stderr_contains("did not finish within");
+    s.wait_stderr_contains("the in-flight request did not finish within");
     std::fs::write(dir.join("release"), b"").expect("release mid-drain");
     let resp = s.read_response();
     let status = s.wait_bounded();
