@@ -35,7 +35,7 @@ priority = 100
 timeout_ms = 5000
 mode = "daemon"          # daemon | exec (optional; default per event class)
 enabled = true
-namespace = "team/*"     # glob match (today: non-empty string accepted)
+namespace = "team/*"     # "*", exact, or "prefix/*" (see matches_namespace)
 fail_mode = "open"       # open (default) | closed
 ```
 
@@ -56,7 +56,7 @@ Fields ([`HookConfig`](../src/hooks/config.rs)):
   — daemon for hot-path events (`post_recall`, `post_search`,
   `pre_recall_expand`), exec otherwise.
 - **`enabled`** — soft-disable without removing the row.
-- **`namespace`** — glob pattern; chain is filtered before invocation.
+- **`namespace`** — namespace pattern (`*`, exact, or `prefix/*`); chain is filtered before invocation.
   `*` matches every namespace (the field is required: [`validate_hook`](../src/hooks/config.rs) rejects an empty value); otherwise the
   pattern matches EXACTLY, or as a `prefix/*` glob covering the prefix itself
   and any child under it. Validation is shape-only; the runtime matcher is
