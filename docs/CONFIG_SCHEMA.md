@@ -314,15 +314,19 @@ applies regardless of this marker. It does not by itself select a separate
 parser or prove a future schema is supported.
 ```
 
-There is exactly one deserialization on this path: `AppConfig::from_toml_contents`
-runs the deprecation and unknown-key validation
-(`src/config.rs::refuse_unknown_keys`) and then a single
-`toml::from_str` (`src/config.rs:8605`) for every marker value. The
-inspected version predicate (`src/config.rs:8664`) selects only the drift
-WARN, and `AppConfig::resolve_llm` (`src/config.rs:9450`) resolves sectioned
-`[llm]` values without consulting the marker at all. The field is
-`Option<u32>` (`src/config.rs:3533`), so omitting it is not the same as
-storing the integer `1`.
+There is exactly one TYPED deserialization on this path:
+`AppConfig::from_toml_contents` runs the deprecation and unknown-key
+validation (`src/config.rs::enforce_deprecated_keys`,
+`src/config.rs::refuse_unknown_keys`; each parses the document into an
+untyped `toml::Value` only to validate it) and then a single typed
+`toml::from_str` into `AppConfig` (`src/config.rs::from_toml_contents_unchecked`)
+for every marker value. The inspected version predicate
+(`src/config.rs::warn_legacy_schema_drift`) selects only the drift WARN,
+and `AppConfig::resolve_llm` (`src/config.rs::resolve_llm`) resolves
+sectioned `[llm]` values without consulting the marker at all. The field
+is `Option<u32>` (`AppConfig::schema_version`, declared in
+`src/config.rs::AppConfig`), so omitting it is not the same as storing the
+integer `1`.
 
 ### `[identity]` — identity-resolution fallback (#198)
 
@@ -533,9 +537,10 @@ methods:
 
 - `AppConfig::resolve_llm(cli_backend, cli_model, cli_base_url)`
 - `AppConfig::resolve_llm_auto_tag()` — the one EXCEPTION to the sentence
-  above: at v1.0.0 it has no production caller (test-only, `src/config.rs:14055`
-  / `:14067` / `:14083`, all inside the `#[cfg(test)] mod tests` block at
-  `src/config.rs:10681`). Production consumes only `[llm.auto_tag].model`,
+  above: at v1.0.0 it has no production caller (test-only: the cells
+  `resolve_llm_alias_url_parity_and_auto_tag_3811` and
+  `resolve_llm_unknown_has_no_default_and_builders_refuse_3860`, both inside
+  the `#[cfg(test)]` `src/config.rs::tests` module). Production consumes only `[llm.auto_tag].model`,
   threaded through the PRIMARY `[llm]` client; its `backend` / `base_url` /
   `api_key_env` / `api_key_file` are parsed, WARNed about at boot, and
   otherwise ignored (#3808, #3902).
@@ -670,9 +675,10 @@ migrate` rather than relying on the stale target.
 flat and its `[storage]` form are parsed and carried for compatibility
 but enforce **no memory or storage limit** and emit a warning: the
 resolver carries the value and fires a one-shot WARN on `target:
-config.max_memory_mb` whenever it is set (`src/config.rs:213`, fired
-from `src/config.rs:10109`), and the deprecated-key ledger records the
-same exception (`src/config/deprecated_keys.rs:103`). Use
+config.max_memory_mb` whenever it is set (`src/config.rs::warn_max_memory_mb_inert_once`, fired
+from `src/config.rs::resolve_storage`), and the deprecated-key ledger records
+the same exception (the `max_memory_mb` row of
+`src/config/deprecated_keys.rs::DEPRECATED_KEYS`). Use
 `[limits].max_storage_bytes` / `AI_MEMORY_MAX_STORAGE_BYTES` for a
 per-agent storage quota; it is **not** a process RAM limit. Nothing
 caps process RAM at v1.0.0.
@@ -767,11 +773,13 @@ operator does not override:
 
 Alias URLs for `[llm]` are resolved from the same canonical table as the
 environment-based client. At v1.0.0 that resolution reaches production for
-`[llm]` ONLY: `AppConfig::resolve_llm_auto_tag` (`src/config.rs:9546`) does
+`[llm]` ONLY: `AppConfig::resolve_llm_auto_tag` (`src/config.rs::resolve_llm_auto_tag`) does
 resolve an alias URL from the same canonical table for `[llm.auto_tag]`, but
 it has no production caller — its only callers are test cells inside the
-`#[cfg(test)] mod tests` block that begins at `src/config.rs:10681`
-(`src/config.rs:14055`, `:14067`, `:14083`). Production threads only the
+`#[cfg(test)]` `src/config.rs::tests` module
+(`resolve_llm_alias_url_parity_and_auto_tag_3811` and
+`resolve_llm_unknown_has_no_default_and_builders_refuse_3860`). Production
+threads only the
 `[llm.auto_tag].model` string through the PRIMARY `[llm]` client, so setting
 `[llm.auto_tag].base_url` — or an aliased `[llm.auto_tag].backend` — does NOT
 point auto-tagging at a different endpoint, and the daemon WARNs at boot that
