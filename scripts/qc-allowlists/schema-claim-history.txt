@@ -1,0 +1,31 @@
+# History ledger for the closed-world CURRENT_SCHEMA_VERSION sweep in
+# scripts/check-docs-vs-ssot.sh (check_schema_version_rule; #3248).
+#
+# The sweep treats EVERY ladder number (two or three digits) near the
+# identifier `CURRENT_SCHEMA_VERSION` or `schema_version` as a claim of the
+# current ladder position. A line that narrates a PAST value on purpose is
+# listed here so it is the explicit exception, never the silent default.
+#
+# FORMAT, one entry per line, three TAB-separated fields:
+#
+#     <doc-file> <TAB> <needle> <TAB> #<issue> <note>
+#
+# The needle is matched against the MATCHED SPAN only (the identifier, the
+# characters between, and the number, html tag-stripped), so it exempts that
+# one hit and never a real claim on the same line, and a reflow of the
+# surrounding text does not silently re-open or widen it. A MALFORMED entry
+# FAILS the gate. A STALE entry (it suppresses no hit any more) FAILS the gate:
+# delete it. A missing ledger FAILS the gate.
+#
+# Admission test: the span must describe a value the ladder HELD in the past
+# (a dated release, an `X was N` or `vN rewrites ...` narrative, a pinned
+# historical checkout). A span that states the position of the ladder NOW is
+# fixed in the doc, never listed here.
+README.md	CURRENT_SCHEMA_VERSION` was 57	#3248 v0.7.0 release narrative (the sentence continues to the current ladder)
+README.md	v57, where `CURRENT_SCHEMA_VERSION	#3248 v0.7.0 release narrative
+ROADMAP.md	CURRENT_SCHEMA_VERSION` was 57	#3248 frozen v0.7.1 baseline row and ship-state note
+docs/spec/PORTABILITY-V2.md	80` at this spec's anchor	#3248 the value at the PORTABILITY-V2 spec anchor, stated as such
+docs/compliance/_inventory/v0.7.x-code-changes-test-plan.md	CURRENT_SCHEMA_VERSION = 50	#3248 expected output at the pinned v0.7.0 verification commit
+docs/v1.0.0/release-notes.md	Not uniformly additive: v79	#3248 per-version ladder narrative inside the v1.0.0 schema row
+docs/v1.0.0/release-notes.md	v92 rebuilds SQLite's `schema_version	#3248 per-version ladder narrative
+docs/schema.html	v91), the schema_version	#3248 per-version ladder narrative (the same line also carries the live v100 claim, which stays policed)

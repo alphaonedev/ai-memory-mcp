@@ -789,10 +789,10 @@ git checkout release/v1.0.0
 
     <h3>2. Verify the schema version (both adapters, lockstep)</h3>
 <pre class="codeblock">grep -n 'CURRENT_SCHEMA_VERSION: i64' src/storage/migrations.rs
-<span class="com"># Expected: const CURRENT_SCHEMA_VERSION: i64 = 90;   (sqlite)</span>
+<span class="com"># Expected: const CURRENT_SCHEMA_VERSION: i64 = 100;   (sqlite)</span>
 
 grep -n 'CURRENT_SCHEMA_VERSION: i32' src/store/postgres.rs
-<span class="com"># Expected: const CURRENT_SCHEMA_VERSION: i32 = 90;   (postgres, lockstep)</span></pre>
+<span class="com"># Expected: const CURRENT_SCHEMA_VERSION: i32 = 100;   (postgres, lockstep)</span></pre>
 
     <h3>3. Verify the MCP tool count anchors</h3>
 <pre class="codeblock">cargo test --lib profile::tests::profile_full_matches_registry_all
