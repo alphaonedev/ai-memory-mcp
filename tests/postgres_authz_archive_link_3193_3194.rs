@@ -463,7 +463,11 @@ async fn postgres_link_k9_denies_based_on_the_caller_3194() {
     };
     let alice = "ai:3194-k9-caller-pin";
     let ns = "ns-3194-k9-caller";
-    ai_memory::config::set_active_permissions_mode(ai_memory::config::PermissionsMode::Enforce);
+    let mode_guard = ai_memory::config::lock_permissions_mode_for_test();
+    ai_memory::config::set_active_permissions_mode(
+        &mode_guard,
+        ai_memory::config::PermissionsMode::Enforce,
+    );
     ai_memory::permissions::set_active_permission_rules(vec![
         ai_memory::permissions::PermissionRule {
             namespace_pattern: ns.to_string(),

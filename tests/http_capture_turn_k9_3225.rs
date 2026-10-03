@@ -36,7 +36,9 @@ fn postgres_url() -> Option<String> {
 
 async fn build_pg_router(url: &str) -> axum::Router {
     ai_memory::handlers::admin_role::mark_request_authn_configured(true);
+    let mode_guard = ai_memory::config::lock_permissions_mode_for_test();
     ai_memory::config::override_active_permissions_mode_for_test(
+        &mode_guard,
         ai_memory::config::PermissionsMode::Enforce,
     );
     let conn = ai_memory::db::open(std::path::Path::new(":memory:")).expect("scratch sqlite");

@@ -116,7 +116,9 @@ async fn seed_human_approver_ns(store: &PostgresStore, ns: &str, owner: &str) {
 
 /// Queue an approve-gated pending Store action authored by `requester`.
 async fn seed_pending(store: &PostgresStore, ns: &str, requester: &str) -> String {
+    let mode_guard = ai_memory::config::lock_permissions_mode_for_test();
     ai_memory::config::override_active_permissions_mode_for_test(
+        &mode_guard,
         ai_memory::config::PermissionsMode::Enforce,
     );
     let queued = mem(&uid("pa3448"), ns, "needs approval", requester);

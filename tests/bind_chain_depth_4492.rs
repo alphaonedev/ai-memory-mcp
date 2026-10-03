@@ -566,7 +566,9 @@ async fn sqlite_outcome() -> Outcome {
 async fn sqlite_over_depth_link_is_refused_at_bind_4492() {
     let _serial = SERIAL.lock().await;
     common::permissive_attestation_for_tests();
+    let mode_guard = ai_memory::config::lock_permissions_mode_for_test();
     ai_memory::config::override_active_permissions_mode_for_test(
+        &mode_guard,
         ai_memory::config::PermissionsMode::Enforce,
     );
     assert_eq!(sqlite_outcome().await, WANT);
@@ -582,7 +584,9 @@ async fn postgres_over_depth_link_is_refused_at_bind_4492() {
     };
     let _serial = SERIAL.lock().await;
     common::permissive_attestation_for_tests();
+    let mode_guard = ai_memory::config::lock_permissions_mode_for_test();
     ai_memory::config::override_active_permissions_mode_for_test(
+        &mode_guard,
         ai_memory::config::PermissionsMode::Enforce,
     );
     let store: Arc<dyn MemoryStore> = Arc::new(

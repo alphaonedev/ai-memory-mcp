@@ -920,8 +920,9 @@ mod tests {
         // strict path (Advisory is the v0.7.0 default and would Allow
         // the delete unconditionally). Holds the central gate-mode
         // Mutex from `config::lock_permissions_mode_for_test`.
-        let _gate = crate::config::lock_permissions_mode_for_test();
+        let gate = crate::config::lock_permissions_mode_for_test();
         crate::config::override_active_permissions_mode_for_test(
+            &gate,
             crate::config::PermissionsMode::Enforce,
         );
 

@@ -80,7 +80,9 @@ async fn build_postgres_app_state(url: &str) -> AppState {
     // is the v0.7.0 default. Without this, the test in-process daemon
     // boots in Advisory mode (the static OnceLock fallback) and Bucket C
     // governance scenarios silently pass through Allow.
+    let mode_guard = ai_memory::config::lock_permissions_mode_for_test();
     ai_memory::config::override_active_permissions_mode_for_test(
+        &mode_guard,
         ai_memory::config::PermissionsMode::Enforce,
     );
 

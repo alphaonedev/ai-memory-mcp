@@ -41,9 +41,9 @@ use rusqlite::Connection;
 /// ship-gate scenarios still drive the blocking path. Returns the
 /// process-wide gate-mode Mutex guard so concurrent scenarios in
 /// this binary cannot flip the atomic mid-test.
-fn pin_enforce_mode() -> std::sync::MutexGuard<'static, ()> {
+fn pin_enforce_mode() -> ai_memory::config::PermissionsModeGuard {
     let guard = lock_permissions_mode_for_test();
-    override_active_permissions_mode_for_test(PermissionsMode::Enforce);
+    override_active_permissions_mode_for_test(&guard, PermissionsMode::Enforce);
     guard
 }
 

@@ -302,7 +302,11 @@ async fn h10_concurrent_governance_actions_every_pending_persists() {
     // Pre-flight: ensure enforce mode is active for the duration of
     // this test by setting via the config global (the production
     // wiring reads this on every call).
-    ai_memory::config::set_active_permissions_mode(ai_memory::config::PermissionsMode::Enforce);
+    let mode_guard = ai_memory::config::lock_permissions_mode_for_test();
+    ai_memory::config::set_active_permissions_mode(
+        &mode_guard,
+        ai_memory::config::PermissionsMode::Enforce,
+    );
 
     let namespace = format!("h10-gov-{}", uuid::Uuid::new_v4());
 

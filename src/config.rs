@@ -6801,82 +6801,101 @@ pub struct PermissionsConfig {
 // Process-wide permissions-mode handle (K3)
 // ---------------------------------------------------------------------------
 //
-// The gate (`db::enforce_governance`) needs to consult the active mode
-// at decision time but lives in the `db` module, which has no handle on
-// `AppConfig`. We hold the active mode in a single `RwLock<Option<…>>`
-// set by `main` (and the daemon runtime) so the gate can read the mode
-// without an API churn through every callsite. When the lock is unset
-// — the case for unit and integration tests that drive
-// `db::enforce_governance` directly without booting the daemon — the
-// gate defaults to [`PermissionsMode::Advisory`] (the v0.7.0 K3
-// secure-but-non-blocking posture). Tests opt into `Enforce` via the
-// `set_active_permissions_mode` setter or the
-// `override_active_permissions_mode_for_test` alias.
-//
-// **#1174 pm-v3.1 PR7 (this commit)**: collapsed the previous
-// dual-source-of-truth (a `OnceLock<PermissionsMode>` for production +
-// an `AtomicU8` test-only override that secretly took precedence over
-// it) into a single `RwLock<Option<PermissionsMode>>`. The previous
-// `OnceLock` shape blocked legitimate runtime reload paths — a SIGHUP
-// handler that wanted to re-resolve `[permissions].mode` from
-// `config.toml` and call `set_active_permissions_mode` again would
-// silently no-op, leaving the gate on the boot-time value while every
-// other resolver caught the new value. The new shape supports
-// last-writer-wins so a future SIGHUP / `ai-memory reload` surface
-// can refresh the mode without restart. The test-override semantics
-// are preserved: tests still hold the
-// [`lock_permissions_mode_for_test`] guard around their mutations and
-// the public setter / overrider signatures are unchanged.
+// `db::enforce_governance` reads the mode at decision time from ONE
+// last-writer-wins slot (#1174 PR7). #4491 (5-agent vote 4d3ea1c5, option B):
+// every write needs a `&PermissionsModeGuard`, so an unlocked write is a
+// compile error; boot (`src/main.rs`) uses `install_boot_permissions_mode`.
 
 static ACTIVE_PERMISSIONS_MODE: std::sync::RwLock<Option<PermissionsMode>> =
     std::sync::RwLock::new(None);
 
-/// Set the process-wide active [`PermissionsMode`]. Called from `main`
-/// (CLI) and the daemon bootstrap path with the value resolved from
-/// `[permissions].mode` in `config.toml`. Last-writer-wins so a future
-/// SIGHUP / `ai-memory reload` surface can refresh the mode without
-/// restart (#1174 PR7); the previous `OnceLock` shape made repeat
-/// callers silently no-op.
-pub fn set_active_permissions_mode(mode: PermissionsMode) {
-    if let Ok(mut w) = ACTIVE_PERMISSIONS_MODE.write() {
-        *w = Some(mode);
+/// The serialisation lock behind every [`PermissionsModeGuard`].
+static PERMISSIONS_MODE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+thread_local! {
+    /// Whether THIS thread holds [`PERMISSIONS_MODE_LOCK`]: a re-entrant lock
+    /// call panics instead of hanging (std `Mutex` is not re-entrant).
+    static PERMISSIONS_MODE_LOCK_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Proof that the caller holds the process-wide permissions-mode lock (#4491).
+///
+/// Every writer of the active [`PermissionsMode`] takes `&PermissionsModeGuard`.
+/// The field is private and the only constructor is
+/// [`lock_permissions_mode_for_test`], so a write without the lock is a
+/// compile error, not a race. The guard wraps a `MutexGuard`, so it is `!Send`.
+///
+/// ```compile_fail,E0061
+/// // A writer call without the guard does not compile (#4491).
+/// use ai_memory::config::{override_active_permissions_mode_for_test, PermissionsMode};
+/// override_active_permissions_mode_for_test(PermissionsMode::Enforce);
+/// ```
+///
+/// ```compile_fail,E0451
+/// // The guard cannot be forged from another mutex: its field is private.
+/// static OTHER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// let forged = ai_memory::config::PermissionsModeGuard { _held: OTHER.lock().unwrap() };
+/// ```
+///
+/// ```compile_fail,E0505
+/// // A write after the guard is released does not compile.
+/// use ai_memory::config::{lock_permissions_mode_for_test, set_active_permissions_mode};
+/// let g = lock_permissions_mode_for_test();
+/// let proof = &g;
+/// drop(g);
+/// set_active_permissions_mode(proof, ai_memory::config::PermissionsMode::Enforce);
+/// ```
+///
+/// ```compile_fail,E0277
+/// // The guard cannot be moved into another thread.
+/// let g = ai_memory::config::lock_permissions_mode_for_test();
+/// std::thread::spawn(move || drop(g));
+/// ```
+#[must_use = "dropping the guard releases the permissions-mode lock"]
+pub struct PermissionsModeGuard {
+    _held: std::sync::MutexGuard<'static, ()>,
+}
+
+impl Drop for PermissionsModeGuard {
+    fn drop(&mut self) {
+        // `_held` unlocks right after this returns, on this same thread (`!Send`).
+        let _ = PERMISSIONS_MODE_LOCK_HELD.try_with(|h| h.set(false));
     }
 }
 
-/// The pre-initialization fallback mode for [`active_permissions_mode`].
+/// The ONLY write of [`ACTIVE_PERMISSIONS_MODE`]; the guard proves the lock is held.
+fn store_permissions_mode(_proof: &PermissionsModeGuard, mode: Option<PermissionsMode>) {
+    // Poison-tolerant: the boot install must never be silently skipped.
+    *ACTIVE_PERMISSIONS_MODE
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = mode;
+}
+
+/// Production boot entry: install the mode resolved from `[permissions].mode`.
+/// Called ONLY from `main` in `src/main.rs` (pinned by
+/// `scripts/check_permissions_mode_lock.py`); it takes the lock itself.
 ///
-/// Every production entry point (CLI, MCP, HTTP `serve`) resolves the
-/// real mode via [`AppConfig::effective_permissions_mode`] — whose
-/// v0.7.0 secure default is [`PermissionsMode::Enforce`] — and installs
-/// it via [`set_active_permissions_mode`] during boot, BEFORE any write
-/// can reach the governance gate. This constant is therefore only ever
-/// observed when the gate is consulted before boot ran (a library
-/// embedding that never called the setter, or a unit test that does not
-/// opt into a specific mode). It is held at `Advisory` to preserve the
-/// historical pre-init behaviour the test suite relies on; the
-/// [`active_permissions_mode`] reader emits a one-shot WARN when it has
-/// to fall back to this value so the uninitialized-gate condition is
-/// observable rather than silent.
+/// # Panics
+/// If the calling thread already holds a [`PermissionsModeGuard`].
+pub fn install_boot_permissions_mode(mode: PermissionsMode) {
+    let guard = lock_permissions_mode_for_test();
+    store_permissions_mode(&guard, Some(mode));
+}
+
+/// Set the process-wide active [`PermissionsMode`] (last writer wins) while
+/// holding the permissions-mode lock.
+pub fn set_active_permissions_mode(guard: &PermissionsModeGuard, mode: PermissionsMode) {
+    store_permissions_mode(guard, Some(mode));
+}
+
+/// Pre-init fallback for [`active_permissions_mode`]: only observed when the
+/// gate runs before boot installed the resolved mode (secure default
+/// `Enforce`); `Advisory` keeps the historical pre-init test behaviour.
 const UNINITIALIZED_PERMISSIONS_MODE_FALLBACK: PermissionsMode = PermissionsMode::Advisory;
 
-/// Read the process-wide active [`PermissionsMode`] installed at boot by
-/// [`set_active_permissions_mode`] (sourced from
-/// [`AppConfig::effective_permissions_mode`], whose v0.7.0 secure
-/// default is [`PermissionsMode::Enforce`]).
-///
-/// When the slot is unset — i.e. boot has NOT run — this returns
-/// [`UNINITIALIZED_PERMISSIONS_MODE_FALLBACK`] and emits a one-shot
-/// operator-visible WARN, because consulting the governance gate before
-/// the mode is installed is a defense-in-depth gap: the gate would run
-/// against the pre-init fallback rather than the operator's resolved
-/// mode. In production this path is unreachable (boot always installs
-/// the mode first); the WARN exists to surface a regression if that
-/// ordering ever breaks.
-///
-/// Test note: the K1 ship-gate matrix asserts `Pending`/`Deny`
-/// outcomes from `db::enforce_governance` and therefore opts into
-/// `Enforce` via [`set_active_permissions_mode`] at the start of each
-/// scenario.
+/// Read the active [`PermissionsMode`] installed at boot. Unset (boot never
+/// ran) returns [`UNINITIALIZED_PERMISSIONS_MODE_FALLBACK`] with a one-shot
+/// WARN, so an uninitialized gate is observable rather than silent.
 #[must_use]
 pub fn active_permissions_mode() -> PermissionsMode {
     match ACTIVE_PERMISSIONS_MODE.read().ok().and_then(|g| *g) {
@@ -6898,57 +6917,40 @@ pub fn active_permissions_mode() -> PermissionsMode {
     }
 }
 
-/// Test-only override of the active mode. Production code MUST use
-/// [`set_active_permissions_mode`]; this helper exists so the K3 test
-/// matrix can flip mode mid-test without spinning up a fresh process.
-///
-/// **#1174 PR7**: with the dual-source-of-truth collapse the override
-/// is now a thin alias around [`set_active_permissions_mode`]. The
-/// two functions are wire-equivalent at every callsite. The alias is
-/// kept (rather than renaming all test callers in one pass) because
-/// the `_for_test` suffix at every callsite documents the intent —
-/// "this is a test poking the global gate" — better than an
-/// unsuffixed setter would.
+/// Test-only alias of [`set_active_permissions_mode`]; the `_for_test`
+/// suffix documents "a test poking the global gate" at every callsite.
 #[doc(hidden)]
-pub fn override_active_permissions_mode_for_test(mode: PermissionsMode) {
-    set_active_permissions_mode(mode);
+pub fn override_active_permissions_mode_for_test(
+    guard: &PermissionsModeGuard,
+    mode: PermissionsMode,
+) {
+    store_permissions_mode(guard, Some(mode));
 }
 
-/// Test-only: clear any test-override so subsequent tests start from
-/// the unset state (the [`PermissionsMode::Advisory`] default).
-///
-/// **#1174 PR7**: previously this cleared the `OVERRIDE_PERMISSIONS_MODE`
-/// atomic without touching the production-side `OnceLock`, which let
-/// a test that called the production setter once leak its value into
-/// the next test. With the single-source-of-truth collapse, clearing
-/// resets the lone slot — subsequent reads see `Advisory` until the
-/// next setter call, which is the documented contract.
+/// Test-only: reset the slot to unset (reads see the pre-init fallback).
 #[doc(hidden)]
-pub fn clear_permissions_mode_override_for_test() {
-    if let Ok(mut w) = ACTIVE_PERMISSIONS_MODE.write() {
-        *w = None;
-    }
+pub fn clear_permissions_mode_override_for_test(guard: &PermissionsModeGuard) {
+    store_permissions_mode(guard, None);
 }
 
-/// Test-only: acquire the global gate-mode serialization lock.
+/// Acquire the permissions-mode lock and return the [`PermissionsModeGuard`]
+/// every writer demands; hold it for the whole test. Poison-tolerant.
 ///
-/// The active [`PermissionsMode`] lives in a process-wide atomic so
-/// the gate at `db::enforce_governance` can read it without an API
-/// churn through every callsite. Multiple lib tests flip the mode
-/// (the K3 mode-matrix file, the CLI / HTTP gate scenarios, the
-/// capabilities zero-state round-trip) and `cargo test --lib` runs
-/// them in parallel by default. Each scenario MUST hold this guard
-/// for its duration so two scenarios cannot race the atomic. The
-/// returned guard poisons-OK so one panicking scenario does not
-/// chain-fail the rest.
+/// # Panics
+/// If the calling thread already holds the guard: std `Mutex` is not
+/// re-entrant, so re-locking would deadlock. Pass `&PermissionsModeGuard`
+/// to the helper instead.
 #[doc(hidden)]
-#[must_use]
-pub fn lock_permissions_mode_for_test() -> std::sync::MutexGuard<'static, ()> {
-    use std::sync::Mutex;
-    static GATE_LOCK: Mutex<()> = Mutex::new(());
-    GATE_LOCK
+pub fn lock_permissions_mode_for_test() -> PermissionsModeGuard {
+    let reentered = PERMISSIONS_MODE_LOCK_HELD.with(|h| h.replace(true));
+    assert!(
+        !reentered,
+        "lock_permissions_mode_for_test re-entered on one thread: this would deadlock (#4491)"
+    );
+    let _held = PERMISSIONS_MODE_LOCK
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    PermissionsModeGuard { _held }
 }
 
 // ---------------------------------------------------------------------------
@@ -10869,11 +10871,11 @@ mod tests {
     /// shaped correctly, runtime-state defaults conservative.
     #[test]
     fn capabilities_v2_zero_state_round_trip() {
-        let _gate = lock_permissions_mode_for_test();
+        let gate = lock_permissions_mode_for_test();
         // K3 default is `advisory` — clear any override that a
         // sibling test might have left behind so the
         // `permissions.mode` field reflects the documented zero-state.
-        clear_permissions_mode_override_for_test();
+        clear_permissions_mode_override_for_test(&gate);
         let caps = FeatureTier::Keyword.config().capabilities();
         let val: serde_json::Value = serde_json::to_value(&caps).unwrap();
 
@@ -12835,21 +12837,21 @@ legacy_scoring = false
         // the gate reader returns the explicit
         // UNINITIALIZED_PERMISSIONS_MODE_FALLBACK constant (and emits a
         // one-shot WARN). Once a mode is installed, the reader honors it.
-        let _serialise = lock_permissions_mode_for_test();
-        clear_permissions_mode_override_for_test();
+        let serialise = lock_permissions_mode_for_test();
+        clear_permissions_mode_override_for_test(&serialise);
         assert_eq!(
             active_permissions_mode(),
             UNINITIALIZED_PERMISSIONS_MODE_FALLBACK,
             "unset gate must return the named pre-init fallback"
         );
-        set_active_permissions_mode(PermissionsMode::Enforce);
+        set_active_permissions_mode(&serialise, PermissionsMode::Enforce);
         assert_eq!(
             active_permissions_mode(),
             PermissionsMode::Enforce,
             "installed mode must win over the fallback"
         );
         // Restore the unset state for subsequent tests.
-        clear_permissions_mode_override_for_test();
+        clear_permissions_mode_override_for_test(&serialise);
     }
 
     #[test]

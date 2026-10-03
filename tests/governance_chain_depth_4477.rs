@@ -252,7 +252,9 @@ async fn run(
     db_path: &std::path::Path,
     pg_url: Option<&str>,
 ) -> Outcome {
+    let mode_guard = ai_memory::config::lock_permissions_mode_for_test();
     ai_memory::config::override_active_permissions_mode_for_test(
+        &mode_guard,
         ai_memory::config::PermissionsMode::Enforce,
     );
     let u = uuid::Uuid::new_v4().simple().to_string();

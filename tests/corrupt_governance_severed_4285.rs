@@ -91,7 +91,8 @@ mod sqlite {
     }
 
     fn store_decision(conn: &Connection, ns: &str, agent: &str) -> GovernanceDecision {
-        set_active_permissions_mode(PermissionsMode::Enforce);
+        let mode_guard = ai_memory::config::lock_permissions_mode_for_test();
+        set_active_permissions_mode(&mode_guard, PermissionsMode::Enforce);
         db::enforce_governance(
             conn,
             GovernedAction::Store,
@@ -272,7 +273,8 @@ mod pg {
     }
 
     async fn store_decision(store: &PostgresStore, ns: &str, agent: &str) -> GovernanceDecision {
-        set_active_permissions_mode(PermissionsMode::Enforce);
+        let mode_guard = ai_memory::config::lock_permissions_mode_for_test();
+        set_active_permissions_mode(&mode_guard, PermissionsMode::Enforce);
         store
             .enforce_governance_action(
                 StoreAction::Store,

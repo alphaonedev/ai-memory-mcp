@@ -8146,8 +8146,8 @@ mod tests {
         // v0.7.0 K3: serialize on the gate-mode atomic + clear any
         // sibling-test override so `permissions.mode` reflects the
         // documented `advisory` zero-state.
-        let _gate = crate::config::lock_permissions_mode_for_test();
-        crate::config::clear_permissions_mode_override_for_test();
+        let gate = crate::config::lock_permissions_mode_for_test();
+        crate::config::clear_permissions_mode_override_for_test(&gate);
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();
         let req = make_tools_call("memory_capabilities", json!({"accept": "v2"}));
         let resp = invoke_handle_request(&conn, &req);
@@ -14585,9 +14585,9 @@ mod tests {
     /// Acquire the gate-mode mutex (and clear any override). All tests in
     /// chunk-C that flip the rule set hold this guard for their duration
     /// so parallel runs cannot race the atomic.
-    fn chunkc_lock_perms() -> std::sync::MutexGuard<'static, ()> {
+    fn chunkc_lock_perms() -> crate::config::PermissionsModeGuard {
         let g = crate::config::lock_permissions_mode_for_test();
-        crate::config::clear_permissions_mode_override_for_test();
+        crate::config::clear_permissions_mode_override_for_test(&g);
         crate::permissions::clear_active_permission_rules_for_test();
         g
     }
@@ -14689,8 +14689,9 @@ mod tests {
     /// the `Decision::Ask` branch. Scoped to a unique agent pattern.
     #[test]
     fn chunkc_archive_purge_ask_returns_pending_payload() {
-        let _gate = chunkc_lock_perms();
+        let gate = chunkc_lock_perms();
         crate::config::override_active_permissions_mode_for_test(
+            &gate,
             crate::config::PermissionsMode::Advisory,
         );
         crate::permissions::set_active_permission_rules(vec![crate::permissions::PermissionRule {
@@ -15172,8 +15173,9 @@ mod tests {
     /// Authz — consolidate prompts (Ask) under advisory.
     #[test]
     fn chunkc_consolidate_ask_returns_pending_payload() {
-        let _gate = chunkc_lock_perms();
+        let gate = chunkc_lock_perms();
         crate::config::override_active_permissions_mode_for_test(
+            &gate,
             crate::config::PermissionsMode::Advisory,
         );
         crate::permissions::set_active_permission_rules(vec![crate::permissions::PermissionRule {
@@ -15435,8 +15437,9 @@ mod tests {
     /// `team/eng-askrule` to avoid colliding with other tests.
     #[test]
     fn chunkc_replay_ask_returns_pending_payload() {
-        let _gate = chunkc_lock_perms();
+        let gate = chunkc_lock_perms();
         crate::config::override_active_permissions_mode_for_test(
+            &gate,
             crate::config::PermissionsMode::Advisory,
         );
         crate::permissions::set_active_permission_rules(vec![crate::permissions::PermissionRule {
@@ -16049,8 +16052,9 @@ mod tests {
     #[test]
     fn chunkc_promote_governance_pending() {
         use crate::models::{ApproverType, CorePolicy, GovernanceLevel, GovernancePolicy};
-        let _gate = chunkc_lock_perms();
+        let gate = chunkc_lock_perms();
         crate::config::override_active_permissions_mode_for_test(
+            &gate,
             crate::config::PermissionsMode::Enforce,
         );
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();
@@ -16121,8 +16125,9 @@ mod tests {
     #[test]
     fn chunkc_promote_governance_denied() {
         use crate::models::{ApproverType, CorePolicy, GovernanceLevel, GovernancePolicy};
-        let _gate = chunkc_lock_perms();
+        let gate = chunkc_lock_perms();
         crate::config::override_active_permissions_mode_for_test(
+            &gate,
             crate::config::PermissionsMode::Enforce,
         );
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();

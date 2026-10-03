@@ -177,9 +177,10 @@ mod tests {
     /// strict path. Holds the central gate-mode Mutex from
     /// [`crate::config::lock_permissions_mode_for_test`] so parallel
     /// tests in other modules cannot race the atomic.
-    fn pin_governance_enforce_for_test() -> std::sync::MutexGuard<'static, ()> {
+    fn pin_governance_enforce_for_test() -> crate::config::PermissionsModeGuard {
         let guard = crate::config::lock_permissions_mode_for_test();
         crate::config::override_active_permissions_mode_for_test(
+            &guard,
             crate::config::PermissionsMode::Enforce,
         );
         guard

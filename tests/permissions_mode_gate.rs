@@ -109,8 +109,8 @@ fn approve_write_policy() -> GovernancePolicy {
 /// returns `Pending(_)` and a `pending_actions` row lands.
 #[test]
 fn k3_enforce_mode_blocks_with_pending() {
-    let _guard = lock_permissions_mode_for_test();
-    override_active_permissions_mode_for_test(PermissionsMode::Enforce);
+    let guard = lock_permissions_mode_for_test();
+    override_active_permissions_mode_for_test(&guard, PermissionsMode::Enforce);
     reset_permissions_decision_counts_for_test();
 
     let conn = db::open(std::path::Path::new(":memory:")).unwrap();
@@ -149,7 +149,7 @@ fn k3_enforce_mode_blocks_with_pending() {
     assert_eq!(counts.advisory, 0);
     assert_eq!(counts.off, 0);
 
-    clear_permissions_mode_override_for_test();
+    clear_permissions_mode_override_for_test(&guard);
 }
 
 /// REGRESSION (fail-open fix) — with the OPT-IN strict admission posture
@@ -165,8 +165,8 @@ fn k3_enforce_mode_blocks_with_pending() {
 /// operator who means "govern everything" gets the fail-closed posture.
 #[test]
 fn enforce_mode_ungoverned_namespace_is_deny_under_strict_posture() {
-    let _guard = lock_permissions_mode_for_test();
-    override_active_permissions_mode_for_test(PermissionsMode::Enforce);
+    let guard = lock_permissions_mode_for_test();
+    override_active_permissions_mode_for_test(&guard, PermissionsMode::Enforce);
     // SAFETY-of-scope: single-threaded within the mode lock; removed below.
     unsafe { std::env::set_var(ai_memory::governance::ENV_REQUIRE_GOVERNED_NAMESPACE, "1") };
 
@@ -209,7 +209,7 @@ fn enforce_mode_ungoverned_namespace_is_deny_under_strict_posture() {
         other => panic!("enforce + strict posture + no policy must REFUSE, got {other:?}"),
     }
 
-    clear_permissions_mode_override_for_test();
+    clear_permissions_mode_override_for_test(&guard);
 }
 
 /// THE DEFAULT MUST NOT CHANGE — with the knob unset, an ungoverned namespace
@@ -224,9 +224,9 @@ fn enforce_mode_ungoverned_namespace_is_deny_under_strict_posture() {
 /// is a product-semantics decision, not remediation.
 #[test]
 fn ungoverned_namespace_allows_by_default_under_enforce() {
-    let _guard = lock_permissions_mode_for_test();
+    let guard = lock_permissions_mode_for_test();
     unsafe { std::env::remove_var(ai_memory::governance::ENV_REQUIRE_GOVERNED_NAMESPACE) };
-    override_active_permissions_mode_for_test(PermissionsMode::Enforce);
+    override_active_permissions_mode_for_test(&guard, PermissionsMode::Enforce);
 
     let conn = db::open(std::path::Path::new(":memory:")).unwrap();
     // A GOVERNED sibling subtree — the multi-tenant shape the ship gate pins.
@@ -249,15 +249,15 @@ fn ungoverned_namespace_allows_by_default_under_enforce() {
          sibling subtree present; got {decision:?}"
     );
 
-    clear_permissions_mode_override_for_test();
+    clear_permissions_mode_override_for_test(&guard);
 }
 
 /// `advisory` is UNCHANGED even with the strict posture engaged: it logs
 /// rather than blocks, by contract.
 #[test]
 fn advisory_mode_no_policy_still_allows_under_strict_posture() {
-    let _guard = lock_permissions_mode_for_test();
-    override_active_permissions_mode_for_test(PermissionsMode::Advisory);
+    let guard = lock_permissions_mode_for_test();
+    override_active_permissions_mode_for_test(&guard, PermissionsMode::Advisory);
     // SAFETY-of-scope: single-threaded within the mode lock; removed below.
     unsafe { std::env::set_var(ai_memory::governance::ENV_REQUIRE_GOVERNED_NAMESPACE, "1") };
 
@@ -278,7 +278,7 @@ fn advisory_mode_no_policy_still_allows_under_strict_posture() {
     unsafe { std::env::remove_var(ai_memory::governance::ENV_REQUIRE_GOVERNED_NAMESPACE) };
     assert!(matches!(decision, GovernanceDecision::Allow));
 
-    clear_permissions_mode_override_for_test();
+    clear_permissions_mode_override_for_test(&guard);
 }
 
 /// Fable HIGH (#3133): the strict-admission resolver must accept the house
@@ -317,8 +317,8 @@ fn require_governed_namespace_uses_shared_truthy_grammar() {
 /// the caller observes `Allow`.
 #[test]
 fn k3_advisory_mode_logs_and_allows_no_pending_row() {
-    let _guard = lock_permissions_mode_for_test();
-    override_active_permissions_mode_for_test(PermissionsMode::Advisory);
+    let guard = lock_permissions_mode_for_test();
+    override_active_permissions_mode_for_test(&guard, PermissionsMode::Advisory);
     reset_permissions_decision_counts_for_test();
 
     let conn = db::open(std::path::Path::new(":memory:")).unwrap();
@@ -364,7 +364,7 @@ fn k3_advisory_mode_logs_and_allows_no_pending_row() {
     assert_eq!(counts.enforce, 0);
     assert_eq!(counts.off, 0);
 
-    clear_permissions_mode_override_for_test();
+    clear_permissions_mode_override_for_test(&guard);
 }
 
 /// `off` mode skips the gate entirely — no policy resolution, no
@@ -372,8 +372,8 @@ fn k3_advisory_mode_logs_and_allows_no_pending_row() {
 /// for incident response.
 #[test]
 fn k3_off_mode_skips_gate_entirely() {
-    let _guard = lock_permissions_mode_for_test();
-    override_active_permissions_mode_for_test(PermissionsMode::Off);
+    let guard = lock_permissions_mode_for_test();
+    override_active_permissions_mode_for_test(&guard, PermissionsMode::Off);
     reset_permissions_decision_counts_for_test();
 
     let conn = db::open(std::path::Path::new(":memory:")).unwrap();
@@ -416,7 +416,7 @@ fn k3_off_mode_skips_gate_entirely() {
     assert_eq!(counts.enforce, 0);
     assert_eq!(counts.advisory, 0);
 
-    clear_permissions_mode_override_for_test();
+    clear_permissions_mode_override_for_test(&guard);
 }
 
 /// Capabilities surface — the active mode + decision counts must be
@@ -426,8 +426,8 @@ fn k3_off_mode_skips_gate_entirely() {
 ///   `{ mode: "enforce", decision_counts: { enforce: 1, ... } }`.
 #[test]
 fn k3_capabilities_reports_active_mode_and_decision_counts() {
-    let _guard = lock_permissions_mode_for_test();
-    override_active_permissions_mode_for_test(PermissionsMode::Enforce);
+    let guard = lock_permissions_mode_for_test();
+    override_active_permissions_mode_for_test(&guard, PermissionsMode::Enforce);
     reset_permissions_decision_counts_for_test();
 
     let conn = db::open(std::path::Path::new(":memory:")).unwrap();
@@ -453,5 +453,5 @@ fn k3_capabilities_reports_active_mode_and_decision_counts() {
     assert_eq!(v["permissions"]["decision_counts"]["advisory"], 0);
     assert_eq!(v["permissions"]["decision_counts"]["off"], 0);
 
-    clear_permissions_mode_override_for_test();
+    clear_permissions_mode_override_for_test(&guard);
 }

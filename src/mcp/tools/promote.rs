@@ -452,8 +452,9 @@ mod tests {
     fn promote_to_namespace_enforces_destination_governance_3202() {
         use crate::models::{CorePolicy, GovernanceLevel, GovernancePolicy};
         let _envg = crate::identity::agent_id_env_test_lock();
-        let _modeg = crate::config::lock_permissions_mode_for_test();
+        let modeg = crate::config::lock_permissions_mode_for_test();
         crate::config::override_active_permissions_mode_for_test(
+            &modeg,
             crate::config::PermissionsMode::Enforce,
         );
         let conn = open_conn();
@@ -521,8 +522,9 @@ mod tests {
     fn promote_source_approve_cannot_bypass_dest_owner_3202() {
         use crate::models::{CorePolicy, GovernanceLevel, GovernancePolicy};
         let _envg = crate::identity::agent_id_env_test_lock();
-        let _modeg = crate::config::lock_permissions_mode_for_test();
+        let modeg = crate::config::lock_permissions_mode_for_test();
         crate::config::override_active_permissions_mode_for_test(
+            &modeg,
             crate::config::PermissionsMode::Enforce,
         );
         let conn = open_conn();
@@ -591,8 +593,9 @@ mod tests {
     fn promote_destination_approve_queues_and_allow_restamps_3202() {
         use crate::models::{CorePolicy, GovernanceLevel, GovernancePolicy};
         let _envg = crate::identity::agent_id_env_test_lock();
-        let _modeg = crate::config::lock_permissions_mode_for_test();
+        let modeg = crate::config::lock_permissions_mode_for_test();
         crate::config::override_active_permissions_mode_for_test(
+            &modeg,
             crate::config::PermissionsMode::Enforce,
         );
         let conn = open_conn();

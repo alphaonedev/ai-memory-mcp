@@ -6074,8 +6074,9 @@ mod tests {
         // makes "no policy in the chain" mode-DEPENDENT (Advisory allows,
         // Enforce refuses), so a sibling test flipping the process-wide mode
         // would otherwise make this assertion racy.
-        let _mode = crate::config::lock_permissions_mode_for_test();
+        let mode = crate::config::lock_permissions_mode_for_test();
         crate::config::override_active_permissions_mode_for_test(
+            &mode,
             crate::config::PermissionsMode::Advisory,
         );
         let store = fresh_store();
@@ -6092,7 +6093,7 @@ mod tests {
             .await
             .expect("enforce_governance_action");
         assert!(matches!(decision, crate::models::GovernanceDecision::Allow));
-        crate::config::clear_permissions_mode_override_for_test();
+        crate::config::clear_permissions_mode_override_for_test(&mode);
     }
 
     #[tokio::test]

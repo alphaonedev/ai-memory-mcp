@@ -386,7 +386,11 @@ fn governance_store_owner_is_namespace_owner_not_caller_claim_3176() {
     // this binary: none of them binds a `governance` blob, so
     // `resolve_governance_policy` returns `None` and `enforce_governance`
     // short-circuits to `Allow` under every mode.
-    ai_memory::config::set_active_permissions_mode(ai_memory::config::PermissionsMode::Enforce);
+    let mode_guard = ai_memory::config::lock_permissions_mode_for_test();
+    ai_memory::config::set_active_permissions_mode(
+        &mode_guard,
+        ai_memory::config::PermissionsMode::Enforce,
+    );
     let (_dir, path) = fresh_db_path();
     let conn = ai_memory::db::open(&path).expect("db::open");
 

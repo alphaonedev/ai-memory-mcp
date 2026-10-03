@@ -564,12 +564,12 @@ mod tests {
 
     struct RulesScope {
         _rules: std::sync::MutexGuard<'static, ()>,
-        _mode: std::sync::MutexGuard<'static, ()>,
+        mode: crate::config::PermissionsModeGuard,
     }
     impl Drop for RulesScope {
         fn drop(&mut self) {
             crate::permissions::clear_active_permission_rules_for_test();
-            crate::config::clear_permissions_mode_override_for_test();
+            crate::config::clear_permissions_mode_override_for_test(&self.mode);
         }
     }
     fn rules_scope() -> RulesScope {
@@ -579,11 +579,12 @@ mod tests {
         // Advisory keeps Ask as Ask (Enforce escalates Ask → Deny) and
         // still enforces explicit Deny rules.
         crate::config::override_active_permissions_mode_for_test(
+            &mode,
             crate::config::PermissionsMode::Advisory,
         );
         RulesScope {
             _rules: rules,
-            _mode: mode,
+            mode,
         }
     }
 
@@ -713,8 +714,9 @@ mod tests {
     // non-owner. Requires Enforce mode (Advisory just logs).
     #[test]
     fn governance_deny_blocks_delete() {
-        let _gate = crate::config::lock_permissions_mode_for_test();
+        let gate = crate::config::lock_permissions_mode_for_test();
         crate::config::override_active_permissions_mode_for_test(
+            &gate,
             crate::config::PermissionsMode::Enforce,
         );
         let conn = fresh_conn();
@@ -747,15 +749,16 @@ mod tests {
             err.contains("governance") || err.contains("denied") || err.contains("owner"),
             "got: {err}"
         );
-        crate::config::clear_permissions_mode_override_for_test();
+        crate::config::clear_permissions_mode_override_for_test(&gate);
     }
 
     // Governance Pending path (lines 96-105): Approve policy queues a
     // pending action and returns an envelope. Requires Enforce mode.
     #[test]
     fn governance_pending_returns_pending_envelope() {
-        let _gate = crate::config::lock_permissions_mode_for_test();
+        let gate = crate::config::lock_permissions_mode_for_test();
         crate::config::override_active_permissions_mode_for_test(
+            &gate,
             crate::config::PermissionsMode::Enforce,
         );
         let conn = fresh_conn();
@@ -781,7 +784,7 @@ mod tests {
         assert_eq!(out["status"].as_str(), Some("pending"));
         assert_eq!(out["action"].as_str(), Some("delete"));
         assert!(out["pending_id"].as_str().is_some());
-        crate::config::clear_permissions_mode_override_for_test();
+        crate::config::clear_permissions_mode_override_for_test(&gate);
     }
 
     #[test]
@@ -794,8 +797,9 @@ mod tests {
         // #1874 — crate-wide lock (was a module-local mutex, which could not
         // exclude the cross-module readers/mutators of AI_MEMORY_AGENT_ID).
         let _envg = crate::identity::agent_id_env_test_lock();
-        let _pm = crate::config::lock_permissions_mode_for_test();
+        let pm = crate::config::lock_permissions_mode_for_test();
         crate::config::override_active_permissions_mode_for_test(
+            &pm,
             crate::config::PermissionsMode::Off,
         );
         let conn = fresh_conn();
@@ -823,7 +827,7 @@ mod tests {
         );
 
         unsafe { std::env::remove_var("AI_MEMORY_AGENT_ID") };
-        crate::config::clear_permissions_mode_override_for_test();
+        crate::config::clear_permissions_mode_override_for_test(&pm);
     }
 
     #[test]
@@ -834,8 +838,9 @@ mod tests {
         // the tamper-evident audit chain for a delete that was then refused.
         // DENIED: the wire principal disagrees with the enforced caller.
         let _envg = crate::identity::agent_id_env_test_lock();
-        let _pm = crate::config::lock_permissions_mode_for_test();
+        let pm = crate::config::lock_permissions_mode_for_test();
         crate::config::override_active_permissions_mode_for_test(
+            &pm,
             crate::config::PermissionsMode::Off,
         );
         let conn = fresh_conn();
@@ -873,6 +878,6 @@ mod tests {
         assert!(db::get(&conn, &id).unwrap().is_none());
 
         unsafe { std::env::remove_var("AI_MEMORY_AGENT_ID") };
-        crate::config::clear_permissions_mode_override_for_test();
+        crate::config::clear_permissions_mode_override_for_test(&pm);
     }
 }

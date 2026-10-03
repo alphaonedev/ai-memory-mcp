@@ -126,7 +126,9 @@ async fn s34_write_to_approve_namespace_pends() {
         eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
         return;
     };
+    let mode_guard = ai_memory::config::lock_permissions_mode_for_test();
     ai_memory::config::override_active_permissions_mode_for_test(
+        &mode_guard,
         ai_memory::config::PermissionsMode::Enforce,
     );
     let store = PostgresStore::connect(&url).await.expect("connect");
@@ -196,7 +198,9 @@ async fn s35_child_inherits_parent_policy() {
         eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
         return;
     };
+    let mode_guard = ai_memory::config::lock_permissions_mode_for_test();
     ai_memory::config::override_active_permissions_mode_for_test(
+        &mode_guard,
         ai_memory::config::PermissionsMode::Enforce,
     );
     let store = PostgresStore::connect(&url).await.expect("connect");
@@ -257,7 +261,9 @@ async fn s53_enforce_owner_at_leaf() {
         eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
         return;
     };
+    let mode_guard = ai_memory::config::lock_permissions_mode_for_test();
     ai_memory::config::override_active_permissions_mode_for_test(
+        &mode_guard,
         ai_memory::config::PermissionsMode::Enforce,
     );
     let store = PostgresStore::connect(&url).await.expect("connect");
@@ -342,7 +348,9 @@ async fn s60_inheritance_deep_child() {
         eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
         return;
     };
+    let mode_guard = ai_memory::config::lock_permissions_mode_for_test();
     ai_memory::config::override_active_permissions_mode_for_test(
+        &mode_guard,
         ai_memory::config::PermissionsMode::Enforce,
     );
     let store = PostgresStore::connect(&url).await.expect("connect");
@@ -445,7 +453,9 @@ async fn s80_postgres_inheritance_deep_child() {
         eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
         return;
     };
+    let mode_guard = ai_memory::config::lock_permissions_mode_for_test();
     ai_memory::config::override_active_permissions_mode_for_test(
+        &mode_guard,
         ai_memory::config::PermissionsMode::Enforce,
     );
     let store = PostgresStore::connect(&url).await.expect("connect");
@@ -522,7 +532,9 @@ async fn inheritance_walk_capped_at_five_levels() {
         eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
         return;
     };
+    let mode_guard = ai_memory::config::lock_permissions_mode_for_test();
     ai_memory::config::override_active_permissions_mode_for_test(
+        &mode_guard,
         ai_memory::config::PermissionsMode::Enforce,
     );
     let store = PostgresStore::connect(&url).await.expect("connect");
@@ -598,7 +610,9 @@ async fn bulk_create_postgres_enforces_governance() {
         eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
         return;
     };
+    let mode_guard = ai_memory::config::lock_permissions_mode_for_test();
     ai_memory::config::override_active_permissions_mode_for_test(
+        &mode_guard,
         ai_memory::config::PermissionsMode::Enforce,
     );
     let store = PostgresStore::connect(&url).await.expect("connect");
@@ -674,7 +688,9 @@ async fn import_memories_postgres_enforces_governance() {
         eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
         return;
     };
+    let mode_guard = ai_memory::config::lock_permissions_mode_for_test();
     ai_memory::config::override_active_permissions_mode_for_test(
+        &mode_guard,
         ai_memory::config::PermissionsMode::Enforce,
     );
     let store = PostgresStore::connect(&url).await.expect("connect");
@@ -742,7 +758,9 @@ async fn entity_register_postgres_enforces_governance() {
         eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
         return;
     };
+    let mode_guard = ai_memory::config::lock_permissions_mode_for_test();
     ai_memory::config::override_active_permissions_mode_for_test(
+        &mode_guard,
         ai_memory::config::PermissionsMode::Enforce,
     );
     let store = PostgresStore::connect(&url).await.expect("connect");

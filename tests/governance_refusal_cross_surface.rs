@@ -125,7 +125,9 @@ fn owner_write_policy() -> GovernancePolicy {
 /// separate process under the default cargo test harness, so this
 /// override is local to the test.
 fn force_enforce_mode() {
+    let mode_guard = ai_memory::config::lock_permissions_mode_for_test();
     ai_memory::config::override_active_permissions_mode_for_test(
+        &mode_guard,
         ai_memory::config::PermissionsMode::Enforce,
     );
 }

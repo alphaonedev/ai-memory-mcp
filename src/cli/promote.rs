@@ -284,9 +284,10 @@ mod tests {
     /// process default and would Allow). Holds the central
     /// gate-mode Mutex; see `cli::governance::tests` for the full
     /// rationale.
-    fn pin_governance_enforce_for_test() -> std::sync::MutexGuard<'static, ()> {
+    fn pin_governance_enforce_for_test() -> crate::config::PermissionsModeGuard {
         let guard = crate::config::lock_permissions_mode_for_test();
         crate::config::override_active_permissions_mode_for_test(
+            &guard,
             crate::config::PermissionsMode::Enforce,
         );
         guard

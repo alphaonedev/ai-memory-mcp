@@ -151,8 +151,9 @@ fn cli_pending_receipt_3555() -> anyhow::Result<()> {
     use ai_memory::models::{
         CorePolicy, GovernanceLevel, GovernancePolicy, GovernedAction, Memory, Tier,
     };
-    let _gate = ai_memory::config::lock_permissions_mode_for_test();
+    let gate = ai_memory::config::lock_permissions_mode_for_test();
     ai_memory::config::override_active_permissions_mode_for_test(
+        &gate,
         ai_memory::config::PermissionsMode::Enforce,
     );
     let scratch = tempfile::tempdir_in(scratch_root())?;

@@ -30154,10 +30154,10 @@ mod tests {
         // serialisation guard so parallel lib tests cannot flip the
         // mode out from under us. See `pin_governance_enforce_for_test`
         // in handlers/mod.rs for the same pattern.
-        let _gate = lock_permissions_mode_for_test();
+        let gate = lock_permissions_mode_for_test();
         // Pin mode to Off so the K9 evaluator stays out of the way —
         // this test only exercises the cycle gate.
-        override_active_permissions_mode_for_test(PermissionsMode::Off);
+        override_active_permissions_mode_for_test(&gate, PermissionsMode::Off);
 
         let conn = test_db();
         let a = make_memory("a3-a", "ns", Tier::Long, 5);
@@ -30200,8 +30200,8 @@ mod tests {
             PermissionRule, RuleDecision, clear_active_permission_rules_for_test,
             set_active_permission_rules,
         };
-        let _gate = lock_permissions_mode_for_test();
-        override_active_permissions_mode_for_test(PermissionsMode::Enforce);
+        let gate = lock_permissions_mode_for_test();
+        override_active_permissions_mode_for_test(&gate, PermissionsMode::Enforce);
         clear_active_permission_rules_for_test();
         set_active_permission_rules(vec![PermissionRule {
             namespace_pattern: "a3-deny/**".to_string(),
@@ -30228,7 +30228,7 @@ mod tests {
         // Cleanup so the global registry does not leak into other tests
         // running in the same process.
         clear_active_permission_rules_for_test();
-        override_active_permissions_mode_for_test(PermissionsMode::Advisory);
+        override_active_permissions_mode_for_test(&gate, PermissionsMode::Advisory);
     }
 
     // v0.7.0 fix-campaign A3 (LINK-PARITY, #690) — federation receive
@@ -30245,8 +30245,8 @@ mod tests {
             PermissionRule, RuleDecision, clear_active_permission_rules_for_test,
             set_active_permission_rules,
         };
-        let _gate = lock_permissions_mode_for_test();
-        override_active_permissions_mode_for_test(PermissionsMode::Enforce);
+        let gate = lock_permissions_mode_for_test();
+        override_active_permissions_mode_for_test(&gate, PermissionsMode::Enforce);
         clear_active_permission_rules_for_test();
         // #2165 — this rule used to be namespace_pattern "**" (matching
         // EVERY namespace). Since `_gate` only serialises against other
@@ -30322,7 +30322,7 @@ mod tests {
         );
 
         clear_active_permission_rules_for_test();
-        override_active_permissions_mode_for_test(PermissionsMode::Advisory);
+        override_active_permissions_mode_for_test(&gate, PermissionsMode::Advisory);
     }
 
     // v0.7.0 fix-campaign A3 (LINK-PARITY, #690) — even a trusted
@@ -30335,8 +30335,8 @@ mod tests {
             override_active_permissions_mode_for_test,
         };
         let _lineage = crate::test_support::no_lineage_dag_guard();
-        let _gate = lock_permissions_mode_for_test();
-        override_active_permissions_mode_for_test(PermissionsMode::Off);
+        let gate = lock_permissions_mode_for_test();
+        override_active_permissions_mode_for_test(&gate, PermissionsMode::Off);
 
         let conn = test_db();
         // #3577 — insert the pre-seed TARGET first so a --reflects_on--> b
@@ -30969,8 +30969,8 @@ mod tests {
             override_active_permissions_mode_for_test,
         };
         use crate::models::{GovernanceDecision, GovernedAction};
-        let _gate = lock_permissions_mode_for_test();
-        override_active_permissions_mode_for_test(PermissionsMode::Enforce);
+        let gate = lock_permissions_mode_for_test();
+        override_active_permissions_mode_for_test(&gate, PermissionsMode::Enforce);
 
         let ns = "g10-3/court-promote";
         let conn = court_ns_conn(ns);
@@ -31003,8 +31003,8 @@ mod tests {
             override_active_permissions_mode_for_test,
         };
         use crate::models::{GovernanceDecision, GovernedAction};
-        let _gate = lock_permissions_mode_for_test();
-        override_active_permissions_mode_for_test(PermissionsMode::Enforce);
+        let gate = lock_permissions_mode_for_test();
+        override_active_permissions_mode_for_test(&gate, PermissionsMode::Enforce);
 
         let ns = "g10-3/court-write";
         let conn = court_ns_conn(ns);
@@ -31148,8 +31148,8 @@ mod tests {
             GovernedAction, default_metadata,
         };
 
-        let _gate = lock_permissions_mode_for_test();
-        override_active_permissions_mode_for_test(PermissionsMode::Enforce);
+        let gate = lock_permissions_mode_for_test();
+        override_active_permissions_mode_for_test(&gate, PermissionsMode::Enforce);
 
         let conn = test_db();
 
@@ -31292,8 +31292,8 @@ mod tests {
             GovernedAction, default_metadata,
         };
 
-        let _gate = lock_permissions_mode_for_test();
-        override_active_permissions_mode_for_test(PermissionsMode::Enforce);
+        let gate = lock_permissions_mode_for_test();
+        override_active_permissions_mode_for_test(&gate, PermissionsMode::Enforce);
 
         let conn = test_db();
 
@@ -33176,8 +33176,9 @@ mod tests {
     #[test]
     fn test_execute_promote_arm_destination_owner_refuses_3202() {
         use crate::models::{CorePolicy, GovernanceLevel, GovernancePolicy};
-        let _modeg = crate::config::lock_permissions_mode_for_test();
+        let modeg = crate::config::lock_permissions_mode_for_test();
         crate::config::override_active_permissions_mode_for_test(
+            &modeg,
             crate::config::PermissionsMode::Enforce,
         );
         let conn = test_db();
@@ -34416,8 +34417,9 @@ mod tests {
         // `create_link_signed(...).unwrap()` seed-write is equally exposed
         // to `a3_create_link_inbound_peer_attested_bypasses_governance`'s
         // transient global deny-all-links rule. Hold the same gate.
-        let _gate = crate::config::lock_permissions_mode_for_test();
+        let gate = crate::config::lock_permissions_mode_for_test();
         crate::config::override_active_permissions_mode_for_test(
+            &gate,
             crate::config::PermissionsMode::Off,
         );
         crate::permissions::clear_active_permission_rules_for_test();
@@ -34454,8 +34456,9 @@ mod tests {
         // inside that window and see the unsigned create wrongly refused.
         // Pin mode to Off + clear rules so we observe a clean baseline
         // (either pre- or post-a3, never mid-a3).
-        let _gate = crate::config::lock_permissions_mode_for_test();
+        let gate = crate::config::lock_permissions_mode_for_test();
         crate::config::override_active_permissions_mode_for_test(
+            &gate,
             crate::config::PermissionsMode::Off,
         );
         crate::permissions::clear_active_permission_rules_for_test();

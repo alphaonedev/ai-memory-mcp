@@ -70,7 +70,8 @@ fn build_router(backend: StorageBackend) -> (axum::Router, NamedTempFile, std::p
     // The governance gate short-circuits to Allow under `Off` and only logs
     // under `Advisory`; a test binary that never installs a mode falls back to
     // `Advisory`. Production boot resolves `enforce` by default, so pin it.
-    ai_memory::config::set_active_permissions_mode(PermissionsMode::Enforce);
+    let mode_guard = ai_memory::config::lock_permissions_mode_for_test();
+    ai_memory::config::set_active_permissions_mode(&mode_guard, PermissionsMode::Enforce);
 
     let f = NamedTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();

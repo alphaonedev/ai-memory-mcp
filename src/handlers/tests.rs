@@ -2050,8 +2050,8 @@ fn http_sync_push_refuses_reflection_cycle_from_peer() {
             PermissionsMode, lock_permissions_mode_for_test,
             override_active_permissions_mode_for_test,
         };
-        let _gate = lock_permissions_mode_for_test();
-        override_active_permissions_mode_for_test(PermissionsMode::Off);
+        let gate = lock_permissions_mode_for_test();
+        override_active_permissions_mode_for_test(&gate, PermissionsMode::Off);
 
         let state = test_state();
         // Seed two memories on the receiver and a pre-existing
@@ -2197,14 +2197,14 @@ fn http_sync_push_governance_bypass_on_peer_attested() {
             PermissionsMode, lock_permissions_mode_for_test,
             override_active_permissions_mode_for_test,
         };
-        let _gate = lock_permissions_mode_for_test();
+        let gate = lock_permissions_mode_for_test();
         // K9 in Off mode — exercising the cycle-only fast path. (A
         // full peer_attested verify needs an enrolled pubkey and a
         // signed CBOR payload; that's covered by the inbound storage
         // tests in storage/mod.rs::a3_create_link_inbound_*. Here we
         // assert the wire-level happy path: a federation push lands a
         // legitimate link even when K9 governance is configured.)
-        override_active_permissions_mode_for_test(PermissionsMode::Off);
+        override_active_permissions_mode_for_test(&gate, PermissionsMode::Off);
 
         let state = test_state();
         let now = Utc::now().to_rfc3339();
@@ -10952,8 +10952,8 @@ async fn http_capabilities_v2_schema_includes_all_blocks() {
     // v0.7.0 K3: serialize against the gate-mode atomic and clear
     // any sibling-test override so `permissions.mode` reflects
     // the documented zero-state default (`advisory`).
-    let _gate = crate::config::lock_permissions_mode_for_test();
-    crate::config::clear_permissions_mode_override_for_test();
+    let gate = crate::config::lock_permissions_mode_for_test();
+    crate::config::clear_permissions_mode_override_for_test(&gate);
     let state = test_state();
     let app = Router::new()
         .route("/api/v1/capabilities", axum_get(get_capabilities))
@@ -13143,8 +13143,8 @@ async fn http_create_link_refuses_cycle() {
     use crate::config::{
         PermissionsMode, lock_permissions_mode_for_test, override_active_permissions_mode_for_test,
     };
-    let _gate = lock_permissions_mode_for_test();
-    override_active_permissions_mode_for_test(PermissionsMode::Off);
+    let gate = lock_permissions_mode_for_test();
+    override_active_permissions_mode_for_test(&gate, PermissionsMode::Off);
 
     let state = test_state();
     // #3577 — pin created_at so the pre-seed is strictly newer→older
@@ -13247,8 +13247,8 @@ async fn http_create_link_respects_governance() {
         PermissionRule, RuleDecision, clear_active_permission_rules_for_test,
         set_active_permission_rules,
     };
-    let _gate = lock_permissions_mode_for_test();
-    override_active_permissions_mode_for_test(PermissionsMode::Enforce);
+    let gate = lock_permissions_mode_for_test();
+    override_active_permissions_mode_for_test(&gate, PermissionsMode::Enforce);
     clear_active_permission_rules_for_test();
     set_active_permission_rules(vec![PermissionRule {
         namespace_pattern: "a3-http-gov/**".to_string(),
@@ -13292,7 +13292,7 @@ async fn http_create_link_respects_governance() {
     );
 
     clear_active_permission_rules_for_test();
-    override_active_permissions_mode_for_test(PermissionsMode::Advisory);
+    override_active_permissions_mode_for_test(&gate, PermissionsMode::Advisory);
 }
 
 #[tokio::test]
@@ -15134,9 +15134,10 @@ async fn http_archive_by_ids_with_no_reason_defaults_to_archive() {
 /// flip the gate out from under this scenario. The lock is
 /// process-wide because the active mode lives in a process-wide
 /// atomic.
-fn pin_governance_enforce_for_test() -> std::sync::MutexGuard<'static, ()> {
+fn pin_governance_enforce_for_test() -> crate::config::PermissionsModeGuard {
     let guard = crate::config::lock_permissions_mode_for_test();
     crate::config::override_active_permissions_mode_for_test(
+        &guard,
         crate::config::PermissionsMode::Enforce,
     );
     guard
@@ -16557,9 +16558,10 @@ async fn http_capture_turn_respects_namespace_deny() {
     // mutex, so a sibling gate test cannot reset the mode/rules mid-request
     // and drop this Deny to an ungated 201 (cross-test isolation flake,
     // same class as the capabilities-v2 mode leak).
-    let _mode = crate::config::lock_permissions_mode_for_test();
+    let mode = crate::config::lock_permissions_mode_for_test();
     clear_active_permission_rules_for_test();
     crate::config::override_active_permissions_mode_for_test(
+        &mode,
         crate::config::PermissionsMode::Enforce,
     );
     set_active_permission_rules(vec![PermissionRule {
@@ -16610,12 +16612,13 @@ async fn http_capture_turn_k9_ask_returns_202() {
     let _g = LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let _mode = crate::config::lock_permissions_mode_for_test();
+    let mode = crate::config::lock_permissions_mode_for_test();
     clear_active_permission_rules_for_test();
     // Enforce escalates K9 Ask → Deny. Advisory is the mode where
     // `Permissions::evaluate` actually returns `Decision::Ask`, which
     // is the HTTP 202 arm Fable asked for (3712a9bc).
     crate::config::override_active_permissions_mode_for_test(
+        &mode,
         crate::config::PermissionsMode::Advisory,
     );
     set_active_permission_rules(vec![PermissionRule {

@@ -1373,8 +1373,9 @@ mod tests {
     fn governance_deny_blocks_update_by_non_owner() {
         // #1874 — depends-on-unset AI_MEMORY_AGENT_ID (see mcp::link tests).
         let _agent_env = crate::identity::agent_id_env_unset_guard();
-        let _gate = crate::config::lock_permissions_mode_for_test();
+        let gate = crate::config::lock_permissions_mode_for_test();
         crate::config::override_active_permissions_mode_for_test(
+            &gate,
             crate::config::PermissionsMode::Enforce,
         );
         let conn = fresh_conn();
@@ -1396,7 +1397,7 @@ mod tests {
             err.contains("governance") || err.contains("denied") || err.contains("owner"),
             "non-owner update must be gated; got: {err}"
         );
-        crate::config::clear_permissions_mode_override_for_test();
+        crate::config::clear_permissions_mode_override_for_test(&gate);
     }
 
     /// v0.7.x issue #1600 regression — explicit `edit_source: "agent"`

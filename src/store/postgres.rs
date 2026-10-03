@@ -37616,9 +37616,10 @@ mod tests {
     /// threads another cell's `Advisory` window turned the expected
     /// Deny/Pending decisions into `Allow`. Take the same gate, THEN set
     /// `Enforce`, and hold the guard for the whole cell.
-    fn enforce_mode_serialised() -> std::sync::MutexGuard<'static, ()> {
+    fn enforce_mode_serialised() -> crate::config::PermissionsModeGuard {
         let guard = crate::config::lock_permissions_mode_for_test();
         crate::config::override_active_permissions_mode_for_test(
+            &guard,
             crate::config::PermissionsMode::Enforce,
         );
         guard

@@ -420,8 +420,9 @@ async fn auto_tag_governed_namespace_queues_pending_3381() {
     let uri = server.uri();
     let (out, stored) = tokio::task::spawn_blocking(move || {
         let _identity = ai_memory::identity::test_agent_id::AgentIdOverride::set("ai:alice");
-        let _pm = ai_memory::config::lock_permissions_mode_for_test();
+        let pm = ai_memory::config::lock_permissions_mode_for_test();
         ai_memory::config::override_active_permissions_mode_for_test(
+            &pm,
             ai_memory::config::PermissionsMode::Enforce,
         );
         let (conn, _tmp) = fresh_db();
@@ -448,7 +449,7 @@ async fn auto_tag_governed_namespace_queues_pending_3381() {
             "#3171: preserve the caller"
         );
         let mem = db::get(&conn, &id).unwrap().unwrap();
-        ai_memory::config::clear_permissions_mode_override_for_test();
+        ai_memory::config::clear_permissions_mode_override_for_test(&pm);
         (out, mem.tags)
     })
     .await

@@ -201,7 +201,9 @@ async fn exercise_write_admission_precedes_policy_read_3638(
     // the sibling cells in this binary are mode-agnostic, and a clear racing
     // the other backend's cell would flip its gate permissive mid-flight; a
     // std mutex guard cannot be held across the awaits below).
+    let mode_guard = ai_memory::config::lock_permissions_mode_for_test();
     ai_memory::config::override_active_permissions_mode_for_test(
+        &mode_guard,
         ai_memory::config::PermissionsMode::Enforce,
     );
     let attacker = CallerContext::for_agent(ATTACKER);

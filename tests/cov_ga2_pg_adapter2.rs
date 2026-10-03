@@ -157,7 +157,9 @@ async fn seed_owner_standard(store: &PostgresStore, ns: &str, owner: &str) {
 
 #[tokio::test]
 async fn enforce_governance_action_denies_non_owner_on_owner_standard() {
+    let mode_guard = ai_memory::config::lock_permissions_mode_for_test();
     ai_memory::config::override_active_permissions_mode_for_test(
+        &mode_guard,
         ai_memory::config::PermissionsMode::Enforce,
     );
     let Some(store) = connect().await else {

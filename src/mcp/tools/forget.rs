@@ -885,8 +885,9 @@ mod tests {
     #[test]
     fn forget_governance_gate_1772() {
         let _envg = crate::identity::agent_id_env_test_lock();
-        let _modeg = crate::config::lock_permissions_mode_for_test();
+        let modeg = crate::config::lock_permissions_mode_for_test();
         crate::config::override_active_permissions_mode_for_test(
+            &modeg,
             crate::config::PermissionsMode::Enforce,
         );
         let conn = fresh_conn();
@@ -956,7 +957,7 @@ mod tests {
             "single-operator forget deleted the row"
         );
 
-        crate::config::clear_permissions_mode_override_for_test();
+        crate::config::clear_permissions_mode_override_for_test(&modeg);
     }
 
     // #1849 (CWE-862) — THE KEY TEST. A match set LARGER than the #1602
@@ -969,8 +970,9 @@ mod tests {
     #[test]
     fn forget_namespace_none_gate_sees_past_preview_cap_1849() {
         let _envg = crate::identity::agent_id_env_test_lock();
-        let _modeg = crate::config::lock_permissions_mode_for_test();
+        let modeg = crate::config::lock_permissions_mode_for_test();
         crate::config::override_active_permissions_mode_for_test(
+            &modeg,
             crate::config::PermissionsMode::Enforce,
         );
         let conn = fresh_conn();
@@ -1047,7 +1049,7 @@ mod tests {
         );
 
         unsafe { std::env::remove_var("AI_MEMORY_AGENT_ID") };
-        crate::config::clear_permissions_mode_override_for_test();
+        crate::config::clear_permissions_mode_override_for_test(&modeg);
     }
 
     // #1849 — delete:Owner caller-owned rows are STILL ALLOWED under a
@@ -1056,8 +1058,9 @@ mod tests {
     #[test]
     fn forget_namespace_none_owner_level_allowed_1849() {
         let _envg = crate::identity::agent_id_env_test_lock();
-        let _modeg = crate::config::lock_permissions_mode_for_test();
+        let modeg = crate::config::lock_permissions_mode_for_test();
         crate::config::override_active_permissions_mode_for_test(
+            &modeg,
             crate::config::PermissionsMode::Enforce,
         );
         let conn = fresh_conn();
@@ -1073,7 +1076,7 @@ mod tests {
             "owner's row deleted under namespace=None forget"
         );
         unsafe { std::env::remove_var("AI_MEMORY_AGENT_ID") };
-        crate::config::clear_permissions_mode_override_for_test();
+        crate::config::clear_permissions_mode_override_for_test(&modeg);
     }
 
     // #1849 — NO REGRESSION: owner=None (single-operator trust-all default,
@@ -1082,8 +1085,9 @@ mod tests {
     #[test]
     fn forget_namespace_none_trust_all_byte_unchanged_1849() {
         let _envg = crate::identity::agent_id_env_test_lock();
-        let _modeg = crate::config::lock_permissions_mode_for_test();
+        let modeg = crate::config::lock_permissions_mode_for_test();
         crate::config::override_active_permissions_mode_for_test(
+            &modeg,
             crate::config::PermissionsMode::Enforce,
         );
         // Single-operator trust-all default: env unset → owner None.
@@ -1107,7 +1111,7 @@ mod tests {
             db::get(&conn, &id).expect("get").is_none(),
             "single-operator forget deleted the row"
         );
-        crate::config::clear_permissions_mode_override_for_test();
+        crate::config::clear_permissions_mode_override_for_test(&modeg);
     }
 
     // #3761 — a driver fault behind the dry-run count reaches the caller

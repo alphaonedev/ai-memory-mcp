@@ -947,12 +947,12 @@ mod tests {
 
     struct RulesScope {
         _rules: std::sync::MutexGuard<'static, ()>,
-        _mode: std::sync::MutexGuard<'static, ()>,
+        mode: crate::config::PermissionsModeGuard,
     }
     impl Drop for RulesScope {
         fn drop(&mut self) {
             crate::permissions::clear_active_permission_rules_for_test();
-            crate::config::clear_permissions_mode_override_for_test();
+            crate::config::clear_permissions_mode_override_for_test(&self.mode);
         }
     }
     fn rules_scope() -> RulesScope {
@@ -960,11 +960,12 @@ mod tests {
         let rules = lock_rules();
         crate::permissions::clear_active_permission_rules_for_test();
         crate::config::override_active_permissions_mode_for_test(
+            &mode,
             crate::config::PermissionsMode::Advisory,
         );
         RulesScope {
             _rules: rules,
-            _mode: mode,
+            mode,
         }
     }
 

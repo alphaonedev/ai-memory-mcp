@@ -157,7 +157,9 @@ fn gate_body(source_id: &str, ns: &str) -> Value {
 }
 
 fn enforce_mode() {
+    let mode_guard = ai_memory::config::lock_permissions_mode_for_test();
     ai_memory::config::override_active_permissions_mode_for_test(
+        &mode_guard,
         ai_memory::config::PermissionsMode::Enforce,
     );
 }

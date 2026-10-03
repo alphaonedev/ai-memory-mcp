@@ -133,7 +133,9 @@ async fn seed_pending(store: &PostgresStore, ns: &str, requester: &str) -> Strin
     // process-wide default in a test binary is otherwise permissive and the
     // approve-level write would resolve `Allow` (the `cov_ga2_pg_handlers_1`
     // `seed_pending_store` convention).
+    let mode_guard = ai_memory::config::lock_permissions_mode_for_test();
     ai_memory::config::override_active_permissions_mode_for_test(
+        &mode_guard,
         ai_memory::config::PermissionsMode::Enforce,
     );
     let queued = mem(&uid("pa2538"), ns, "needs approval", requester);

@@ -722,12 +722,12 @@ fn lock_rules() -> std::sync::MutexGuard<'static, ()> {
 /// resetting both on drop (panic-safe). See delete.rs companion.
 struct RulesGuard {
     _rules: std::sync::MutexGuard<'static, ()>,
-    _mode: std::sync::MutexGuard<'static, ()>,
+    mode: crate::config::PermissionsModeGuard,
 }
 impl Drop for RulesGuard {
     fn drop(&mut self) {
         crate::permissions::clear_active_permission_rules_for_test();
-        crate::config::clear_permissions_mode_override_for_test();
+        crate::config::clear_permissions_mode_override_for_test(&self.mode);
     }
 }
 fn rules_scope() -> RulesGuard {
@@ -735,11 +735,12 @@ fn rules_scope() -> RulesGuard {
     let rules = lock_rules();
     crate::permissions::clear_active_permission_rules_for_test();
     crate::config::override_active_permissions_mode_for_test(
+        &mode,
         crate::config::PermissionsMode::Advisory,
     );
     RulesGuard {
         _rules: rules,
-        _mode: mode,
+        mode,
     }
 }
 
@@ -1309,8 +1310,9 @@ fn install_legacy_classifier_policy(conn: &rusqlite::Connection, ns: &str) {
 // non-owner. Requires Enforce mode (Advisory just logs allow).
 #[test]
 fn governance_deny_blocks_store() {
-    let _gate = crate::config::lock_permissions_mode_for_test();
+    let gate = crate::config::lock_permissions_mode_for_test();
     crate::config::override_active_permissions_mode_for_test(
+        &gate,
         crate::config::PermissionsMode::Enforce,
     );
     let conn = fresh_conn();
@@ -1335,15 +1337,16 @@ fn governance_deny_blocks_store() {
         err.contains("governance") || err.contains("denied") || err.contains("owner"),
         "got: {err}"
     );
-    crate::config::clear_permissions_mode_override_for_test();
+    crate::config::clear_permissions_mode_override_for_test(&gate);
 }
 
 // Governance Pending path (lines 338-352): Approve policy returns
 // a pending envelope. Requires Enforce mode.
 #[test]
 fn governance_pending_returns_pending_envelope_for_store() {
-    let _gate = crate::config::lock_permissions_mode_for_test();
+    let gate = crate::config::lock_permissions_mode_for_test();
     crate::config::override_active_permissions_mode_for_test(
+        &gate,
         crate::config::PermissionsMode::Enforce,
     );
     let conn = fresh_conn();
@@ -1367,7 +1370,7 @@ fn governance_pending_returns_pending_envelope_for_store() {
     assert_eq!(out["status"].as_str(), Some("pending"));
     assert_eq!(out["action"].as_str(), Some("store"));
     assert!(out["pending_id"].as_str().is_some());
-    crate::config::clear_permissions_mode_override_for_test();
+    crate::config::clear_permissions_mode_override_for_test(&gate);
 }
 
 /// #3292 M6 — sqlite Approve arm auto-allows the namespace-standard owner
@@ -1375,8 +1378,9 @@ fn governance_pending_returns_pending_envelope_for_store() {
 /// principal, must land not queue.
 #[test]
 fn governance_approve_owner_allows_store_3292() {
-    let _gate = crate::config::lock_permissions_mode_for_test();
+    let gate = crate::config::lock_permissions_mode_for_test();
     crate::config::override_active_permissions_mode_for_test(
+        &gate,
         crate::config::PermissionsMode::Enforce,
     );
     let conn = fresh_conn();
@@ -1402,7 +1406,7 @@ fn governance_approve_owner_allows_store_3292() {
         Some("pending"),
         "owner must not be queued on Approve (sqlite↔pg parity); got {out}"
     );
-    crate::config::clear_permissions_mode_override_for_test();
+    crate::config::clear_permissions_mode_override_for_test(&gate);
 }
 
 // ---- #1720 C: required_scope (refuse-only) at the sqlite gate -----------
@@ -1505,8 +1509,9 @@ fn enforce_store_with_scope(
 
 #[test]
 fn required_scope_refuses_mismatched_store() {
-    let _gate = crate::config::lock_permissions_mode_for_test();
+    let gate = crate::config::lock_permissions_mode_for_test();
     crate::config::override_active_permissions_mode_for_test(
+        &gate,
         crate::config::PermissionsMode::Enforce,
     );
     let conn = fresh_conn();
@@ -1526,13 +1531,14 @@ fn required_scope_refuses_mismatched_store() {
         }
         other => panic!("expected Deny for scope mismatch, got {other:?}"),
     }
-    crate::config::clear_permissions_mode_override_for_test();
+    crate::config::clear_permissions_mode_override_for_test(&gate);
 }
 
 #[test]
 fn required_scope_allows_matching_store() {
-    let _gate = crate::config::lock_permissions_mode_for_test();
+    let gate = crate::config::lock_permissions_mode_for_test();
     crate::config::override_active_permissions_mode_for_test(
+        &gate,
         crate::config::PermissionsMode::Enforce,
     );
     let conn = fresh_conn();
@@ -1544,13 +1550,14 @@ fn required_scope_allows_matching_store() {
         matches!(decision, crate::models::GovernanceDecision::Allow),
         "matching scope must be allowed, got {decision:?}"
     );
-    crate::config::clear_permissions_mode_override_for_test();
+    crate::config::clear_permissions_mode_override_for_test(&gate);
 }
 
 #[test]
 fn required_scope_treats_absent_scope_as_private() {
-    let _gate = crate::config::lock_permissions_mode_for_test();
+    let gate = crate::config::lock_permissions_mode_for_test();
     crate::config::override_active_permissions_mode_for_test(
+        &gate,
         crate::config::PermissionsMode::Enforce,
     );
     let conn = fresh_conn();
@@ -1563,7 +1570,7 @@ fn required_scope_treats_absent_scope_as_private() {
         matches!(decision, crate::models::GovernanceDecision::Allow),
         "absent scope must default to private and be allowed, got {decision:?}"
     );
-    crate::config::clear_permissions_mode_override_for_test();
+    crate::config::clear_permissions_mode_override_for_test(&gate);
 }
 
 // confirmed_contradictions populated in response (line 615+) —

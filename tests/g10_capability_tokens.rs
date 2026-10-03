@@ -374,11 +374,11 @@ mod gate_wiring {
     fn pin_gates(
         cap_cfg: CapabilityConfig,
     ) -> (
-        std::sync::MutexGuard<'static, ()>,
+        ai_memory::config::PermissionsModeGuard,
         std::sync::MutexGuard<'static, ()>,
     ) {
         let perm = lock_permissions_mode_for_test();
-        override_active_permissions_mode_for_test(PermissionsMode::Enforce);
+        override_active_permissions_mode_for_test(&perm, PermissionsMode::Enforce);
         let cap = lock_capability_config_for_test();
         set_active_capability_config(cap_cfg);
         (perm, cap)
@@ -941,8 +941,8 @@ mod pg_parity {
             eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
             return;
         };
-        let _perm = lock_permissions_mode_for_test();
-        override_active_permissions_mode_for_test(PermissionsMode::Enforce);
+        let perm = lock_permissions_mode_for_test();
+        override_active_permissions_mode_for_test(&perm, PermissionsMode::Enforce);
         let _cap = lock_capability_config_for_test();
         set_active_capability_config(config(OpLevel::Write, true));
 

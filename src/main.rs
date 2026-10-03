@@ -34,7 +34,7 @@ use ai_memory::tls;
 //   - `config::AppConfig::load_for_boot` / `write_default_if_missing` — config tests
 //     (+ `tests/boot_fail_closed_config_3166.rs` drives the real binary)
 //   - `daemon_runtime::apply_startup_env` / `apply_anonymize_default` — daemon_runtime tests
-//   - `config::set_active_permissions_mode` / `set_active_hooks_hmac_secret`
+//   - `config::install_boot_permissions_mode` / `set_active_hooks_hmac_secret`
 //     / `set_allow_loopback_webhooks` — config tests
 //   - `subscriptions::validate_hmac_secret_hex` — subscriptions tests
 //   - `permissions::set_active_permission_rules` — permissions tests
@@ -288,8 +288,8 @@ fn main() -> Result<()> {
 
     // v0.7.0 K3 — pin the process-wide governance gate posture before
     // any subcommand has a chance to call `db::enforce_governance`.
-    // Idempotent (`OnceLock::set`); first writer wins.
-    config::set_active_permissions_mode(app_config.effective_permissions_mode());
+    // The sole production writer; it takes the mode lock itself (#4491).
+    config::install_boot_permissions_mode(app_config.effective_permissions_mode());
 
     // v0.7.0 K7 — pin the process-wide webhook HMAC override (if any)
     // before the daemon spawns any subscription-dispatch worker thread.

@@ -352,7 +352,11 @@ async fn pg_enforce_governance_action_honours_severed_floor_2503() {
     // downgraded to `Allow` before the walk's verdict can be observed. Without
     // this the cell would pass at the parent commit AND fail after the fix for
     // the same reason: the mode, not the gate.
-    ai_memory::config::set_active_permissions_mode(ai_memory::config::PermissionsMode::Enforce);
+    let mode_guard = ai_memory::config::lock_permissions_mode_for_test();
+    ai_memory::config::set_active_permissions_mode(
+        &mode_guard,
+        ai_memory::config::PermissionsMode::Enforce,
+    );
 
     // A DIFFERENT agent than the (now unknowable) owner. Under the severed
     // floor `write` is `Owner`, so this must NOT be a clean Allow; pre-#2503

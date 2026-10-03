@@ -420,7 +420,9 @@ async fn seed_approve_standard(store: &PostgresStore, ns: &str, owner: &str) {
 
 #[tokio::test]
 async fn pending_action_get_list_and_decide() {
+    let mode_guard = ai_memory::config::lock_permissions_mode_for_test();
     ai_memory::config::override_active_permissions_mode_for_test(
+        &mode_guard,
         ai_memory::config::PermissionsMode::Enforce,
     );
     let Some(store) = connect().await else {
@@ -485,7 +487,9 @@ async fn pending_action_get_list_and_decide() {
 
 #[tokio::test]
 async fn governance_consensus_and_execute_pending() {
+    let mode_guard = ai_memory::config::lock_permissions_mode_for_test();
     ai_memory::config::override_active_permissions_mode_for_test(
+        &mode_guard,
         ai_memory::config::PermissionsMode::Enforce,
     );
     let Some(store) = connect().await else {
@@ -557,7 +561,9 @@ async fn governance_consensus_and_execute_pending() {
 /// only via the inherently multi-tenant HTTP daemon).
 #[tokio::test]
 async fn human_arm_refuses_self_approval_and_unregistered_1793() {
+    let mode_guard = ai_memory::config::lock_permissions_mode_for_test();
     ai_memory::config::override_active_permissions_mode_for_test(
+        &mode_guard,
         ai_memory::config::PermissionsMode::Enforce,
     );
     let Some(store) = connect().await else {

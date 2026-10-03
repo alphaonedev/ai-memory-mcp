@@ -98,8 +98,8 @@ fn issue_4043_namespace_meta_read_fault_refuses_under_enforce() {
         PermissionsMode, lock_permissions_mode_for_test, override_active_permissions_mode_for_test,
     };
     use crate::models::GovernanceDecision;
-    let _gate = lock_permissions_mode_for_test();
-    override_active_permissions_mode_for_test(PermissionsMode::Enforce);
+    let gate = lock_permissions_mode_for_test();
+    override_active_permissions_mode_for_test(&gate, PermissionsMode::Enforce);
     let ns = "gov4043/meta";
     let conn = owner_gated_conn_4043(ns);
 
@@ -116,7 +116,7 @@ fn issue_4043_namespace_meta_read_fault_refuses_under_enforce() {
             panic!("#4043: an unreadable namespace policy must refuse the write, got {other:?}")
         }
     }
-    override_active_permissions_mode_for_test(PermissionsMode::Advisory);
+    override_active_permissions_mode_for_test(&gate, PermissionsMode::Advisory);
 }
 
 /// #4043 red-first — the bound standard itself is unreadable (the
@@ -127,8 +127,8 @@ fn issue_4043_standard_read_fault_refuses_under_enforce() {
         PermissionsMode, lock_permissions_mode_for_test, override_active_permissions_mode_for_test,
     };
     use crate::models::GovernanceDecision;
-    let _gate = lock_permissions_mode_for_test();
-    override_active_permissions_mode_for_test(PermissionsMode::Enforce);
+    let gate = lock_permissions_mode_for_test();
+    override_active_permissions_mode_for_test(&gate, PermissionsMode::Enforce);
     let ns = "gov4043/standard";
     let conn = owner_gated_conn_4043(ns);
 
@@ -139,7 +139,7 @@ fn issue_4043_standard_read_fault_refuses_under_enforce() {
             panic!("#4043: an unreadable namespace standard must refuse the write, got {other:?}")
         }
     }
-    override_active_permissions_mode_for_test(PermissionsMode::Advisory);
+    override_active_permissions_mode_for_test(&gate, PermissionsMode::Advisory);
 }
 
 /// #4043 red-first — the realistic fault: the standard's at-rest envelope
@@ -150,8 +150,8 @@ fn issue_4043_undecryptable_standard_refuses_under_enforce() {
         PermissionsMode, lock_permissions_mode_for_test, override_active_permissions_mode_for_test,
     };
     use crate::models::GovernanceDecision;
-    let _gate = lock_permissions_mode_for_test();
-    override_active_permissions_mode_for_test(PermissionsMode::Enforce);
+    let gate = lock_permissions_mode_for_test();
+    override_active_permissions_mode_for_test(&gate, PermissionsMode::Enforce);
     let ns = "gov4043/envelope";
     let conn = owner_gated_conn_4043(ns);
     let sid: String = conn
@@ -174,7 +174,7 @@ fn issue_4043_undecryptable_standard_refuses_under_enforce() {
             "#4043: an undecryptable namespace standard must refuse the write, got {other:?}"
         ),
     }
-    override_active_permissions_mode_for_test(PermissionsMode::Advisory);
+    override_active_permissions_mode_for_test(&gate, PermissionsMode::Advisory);
 }
 
 /// #4043 — a read fault on a PARENT link of the governance chain must
@@ -186,8 +186,8 @@ fn issue_4043_parent_link_read_fault_refuses_under_enforce() {
         PermissionsMode, lock_permissions_mode_for_test, override_active_permissions_mode_for_test,
     };
     use crate::models::GovernanceDecision;
-    let _gate = lock_permissions_mode_for_test();
-    override_active_permissions_mode_for_test(PermissionsMode::Enforce);
+    let gate = lock_permissions_mode_for_test();
+    override_active_permissions_mode_for_test(&gate, PermissionsMode::Enforce);
     let parent = "gov4043parent";
     let conn = owner_gated_conn_4043(parent);
     let leaf = "gov4043leaf";
@@ -211,7 +211,7 @@ fn issue_4043_parent_link_read_fault_refuses_under_enforce() {
             panic!("#4043: an unreadable parent link must refuse the write, got {other:?}")
         }
     }
-    override_active_permissions_mode_for_test(PermissionsMode::Advisory);
+    override_active_permissions_mode_for_test(&gate, PermissionsMode::Advisory);
 }
 
 /// #4043 — Advisory never blocks by contract, including on a read fault.
@@ -221,8 +221,8 @@ fn issue_4043_read_fault_under_advisory_allows() {
         PermissionsMode, lock_permissions_mode_for_test, override_active_permissions_mode_for_test,
     };
     use crate::models::GovernanceDecision;
-    let _gate = lock_permissions_mode_for_test();
-    override_active_permissions_mode_for_test(PermissionsMode::Advisory);
+    let gate = lock_permissions_mode_for_test();
+    override_active_permissions_mode_for_test(&gate, PermissionsMode::Advisory);
     let ns = "gov4043/advisory";
     let conn = owner_gated_conn_4043(ns);
     inject_read_fault_4043(&conn, "namespace_meta");

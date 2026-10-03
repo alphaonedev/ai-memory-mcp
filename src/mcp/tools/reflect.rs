@@ -2079,8 +2079,9 @@ mod tests {
     #[test]
     fn write_admission_precedes_the_private_depth_cap_3638() {
         let _agent_id_env = crate::identity::agent_id_env_test_lock();
-        let _mode = crate::config::lock_permissions_mode_for_test();
+        let mode = crate::config::lock_permissions_mode_for_test();
         crate::config::override_active_permissions_mode_for_test(
+            &mode,
             crate::config::PermissionsMode::Enforce,
         );
         let (conn, tmp) = fresh_db();
@@ -2185,6 +2186,6 @@ mod tests {
         )
         .expect("#3638: an ungoverned namespace still admits the tenant");
         assert_eq!(ok["reflection_depth"].as_i64(), Some(1));
-        crate::config::clear_permissions_mode_override_for_test();
+        crate::config::clear_permissions_mode_override_for_test(&mode);
     }
 }

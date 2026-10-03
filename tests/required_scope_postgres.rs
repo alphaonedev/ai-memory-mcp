@@ -103,7 +103,9 @@ async fn required_scope_refuses_mismatched_store_pg() {
         eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
         return;
     };
+    let mode_guard = ai_memory::config::lock_permissions_mode_for_test();
     ai_memory::config::override_active_permissions_mode_for_test(
+        &mode_guard,
         ai_memory::config::PermissionsMode::Enforce,
     );
     let store = PostgresStore::connect(&url).await.expect("connect");
@@ -155,7 +157,9 @@ async fn required_scope_allows_matching_and_absent_store_pg() {
         eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
         return;
     };
+    let mode_guard = ai_memory::config::lock_permissions_mode_for_test();
     ai_memory::config::override_active_permissions_mode_for_test(
+        &mode_guard,
         ai_memory::config::PermissionsMode::Enforce,
     );
     let store = PostgresStore::connect(&url).await.expect("connect");
