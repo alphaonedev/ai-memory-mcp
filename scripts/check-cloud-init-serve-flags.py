@@ -1737,7 +1737,7 @@ def build_probes() -> list:
               '        || { echo "tarball member ai-memory is not a regular file"; exit 1; }\n')
     owner = ('      [ "$(stat -c %U /opt/ai-memory)" = aimemory ] \\\n'
              '        || { echo "/opt/ai-memory is not owned by aimemory"; exit 1; }\n')
-    hba = '            "hostnossl aimemory aimemory all reject"\n'
+    hba = '            "hostnossl all all all reject" \\\n'
     inst = '      install -o root -g root -m 0755 "$DL/x/ai-memory" /usr/local/lib/ai-memory/bin/ai-memory\n'
     curl_bin = '      curl -fsSL "${ai_memory_image_url}" -o "$DL/ai-memory.tar.gz"\n'
     unit_exec = "      ExecStart=/usr/local/lib/ai-memory/bin/ai-memory serve"
@@ -1869,6 +1869,42 @@ def build_probes() -> list:
     P.append(("A fewer than two templates", "fault", dict(drop_do=True)))
     P.append(("A two templates in one directory", "fault", dict(add_template=("infra/aws-gpu-burst/cloud-init-memory-2.yaml.tpl", "aws"))))
     P.append(("A template with zero triggered lines", "fault", dict(do_text="")))
+    # ---- do-hive template, fix round for PR 4671 (#4654): every probe mutates the do-hive template
+    DBIN = "/usr/local/lib/ai-memory/bin/ai-memory"
+    DDSN = PG + "aimemory:CHANGEME@localhost/aimemory?sslmode=verify-full&sslrootcert=/etc/ai-memory/tls/pg-ca.crt"
+    DNOSSL = "            \"hostnossl all all all reject\" \\\n"
+    DSSL = "printf '%s\\n' \"# ai-memory-tls (#4635)\" \"ssl = on\" \\\n"
+    DHBA = "            \"hostssl aimemory aimemory 127.0.0.1/32 scram-sha-256\" \\\n"
+    DSHA = "| sha256sum -c - \\\n          || { echo \"ai-memory tarball digest mismatch\"; rm -f \"$DL/ai-memory.tar.gz\"; exit 1; }\n"
+    DTAR = "tar -xzf \"$DL/ai-memory.tar.gz\" --no-same-owner -C \"$DL/x\" ai-memory\n"
+
+    def dred(label, muts, autolist=False, **kw):
+        P.append((label, "red", dict(do=muts, autolist=autolist, **kw)))
+
+    dred("D-4676 hostnossl reject narrowed to one role", [(DNOSSL, "            \"hostnossl aimemory aimemory all reject\" \\\n")])
+    dred("D-4676 hostnossl reject line deleted", [(DNOSSL, "")])
+    dred("D-4676 hostnossl reject turned into an accept", [(DNOSSL, "            \"hostnossl all all all scram-sha-256\" \\\n")])
+    dred("D-4704 ssl = off with ssl = on only in a comment", [(DSSL, "# ssl = on\n        printf '%s\\n' \"# ai-memory-tls (#4635)\" \"ssl = off\" \\\n")])
+    dred("D-4704 hostssl turned into host for the aimemory role", [(DHBA, "            \"host aimemory aimemory 127.0.0.1/32 scram-sha-256\" \\\n")])
+    dred("D-4704 digest check ignored with || true (non-tar name)", [(DSHA, "| sha256sum -c - || true\n")])
+    dred("D-4704 digest check ignored with || :", [(DSHA, "| sha256sum -c - || :\n")])
+    dred("D-4702 store-url authority port with a leading zero", [(DDSN, DDSN.replace("@localhost/", "@localhost:06432/"))])
+    dred("D-4702 store-url port= query key", [(DDSN, DDSN + "&port=6432")])
+    dred("D-4702 store-url host= query key", [(DDSN, DDSN + "&host=db.example.com")])
+    dred("D-4702 provision writes a second store URL", [(RELOAD, "      printf '%s\\n' '" + PG + "aimemory:x@127.0.0.1:6432/aimemory?sslmode=verify-full' > /etc/ai-memory/store-url\n" + RELOAD)])
+    dred("D-4705 SQL E-string password literal with a terraform value", [(RELOAD, "      sudo -u postgres psql -c \"ALTER USER aimemory WITH PASSWORD E'$${db_password}';\"\n" + RELOAD)], autolist=True)
+    dred("D-4705 SQL dollar-quoted password literal with a terraform value", [(RELOAD, "      sudo -u postgres psql -c 'ALTER USER aimemory WITH PASSWORD $$${db_password}$$;'\n" + RELOAD)], autolist=True)
+    dred("D-4705 SQL password literal with a prefix before the terraform value", [(RELOAD, "      sudo -u postgres psql -c \"ALTER USER aimemory WITH PASSWORD 'pre$${db_password}';\"\n" + RELOAD)], autolist=True)
+    dred("D-4671 terraform secret interpolated into the store-url", [(DDSN, DDSN.replace("CHANGEME", "$${db_password}"))], autolist=True)
+    dred("D-4677 channel_binding in the store-url", [(DDSN, DDSN + "&channel_binding=require")])
+    dred("D-4712 unit binary under the service user home", [("ExecStart=" + DBIN + " serve", "ExecStart=/var/lib/ai-memory/bin/ai-memory serve")], autolist=True)
+    dred("D-4712 unit binary back under /opt/ai-memory", [("ExecStart=" + DBIN + " serve", "ExecStart=/opt/ai-memory/bin/ai-memory serve")])
+    dred("D-4712 expanded command word in the identity step", [("          " + DBIN + " identity generate", "          \"$BIN\" identity generate")], autolist=True)
+    dred("D-4674 root-run bootstrap script under the service user home", [("ExecStart=/usr/local/sbin/ai-memory-fed-bootstrap.sh", "ExecStart=/var/lib/ai-memory/fed-bootstrap.sh")])
+    dred("D-4673 tarball extracted into the binary directory", [(DTAR, "tar -xzf \"$DL/ai-memory.tar.gz\" --no-same-owner -C /usr/local/lib/ai-memory/bin\n")])
+    dred("D-4675 CA key written to the persistent TLS directory", [("PGCA=/run/ai-memory-pgca\n", "PGCA=/etc/ai-memory/tls\n")])
+    dred("D-4675 CA key wipe removed", [("      trap wipe_pgca EXIT\n", "")])
+    dred("D-4707 provision line de-indented below the block but inside it", [("      systemctl daemon-reload\n      # TLS is universal", "     systemctl daemon-reload\n      # TLS is universal")])
     P.append(("A real templates (green control)", "green", dict(autolist=False)))
     return P
 

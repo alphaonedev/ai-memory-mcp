@@ -37,3 +37,8 @@ memory_droplet_size = "s-2vcpu-4gb"
 # cloud-init-memory template flags this). Point ai_memory_image_url at a
 # sal-postgres tarball or scp a local build over the provisioned one, per the
 # cloud-init NOTE. ssh_pubkey_fingerprint is supplied via TF_VAR (operator key).
+# #4637/#4678: a non-empty ai_memory_image_url must be a VERSIONED release URL
+# (releases/latest is refused) and also needs ai_memory_image_sha256 (the
+# lowercase hex SHA-256 of that tarball, via TF_VAR_ai_memory_image_sha256);
+# spawn.sh and plan fail without it, and the node refuses a tarball that does
+# not match. Leave both empty to supply the binary by scp.

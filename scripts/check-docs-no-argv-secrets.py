@@ -1115,14 +1115,15 @@ GREEN_FORM_PROBES = {
 }
 
 
-DUMMY_PW = "DUMMY-pw-4609-must-not-leak"
 PROVISION_TPL = "infra/do-hive/cloud-init-memory.yaml.tpl"
+PROVISION_PATH = "/usr/local/sbin/ai-memory-provision.sh"
+PLACEHOLDER_URL = "postgres://aimemory:CHANGEME@127.0.0.1:5432/aimemory?sslmode=verify-full\n"
 
 
 def _provision_body(tpl: str) -> List[str]:
-    """The de-indented provision.sh body from the cloud-init template."""
+    """The de-indented provision script body from the cloud-init template."""
     lines = tpl.splitlines()
-    start = next(i for i, ln in enumerate(lines) if ln.strip() == "- path: /opt/ai-memory/provision.sh")
+    start = next(i for i, ln in enumerate(lines) if ln.strip() == "- path: " + PROVISION_PATH)
     cont = next(i for i in range(start, len(lines)) if lines[i].strip() == "content: |")
     body = []
     for ln in lines[cont + 1:]:
@@ -1133,78 +1134,74 @@ def _provision_body(tpl: str) -> List[str]:
 
 
 def _credential_harness(body: List[str], scratch: Path) -> str:
-    """Preamble + role block + userlist block of provision.sh, paths pointed
-    at ``scratch`` (no /etc, /root or /var/log writes)."""
+    """Preamble (shebang, set flags, log setup) plus the block that mints the role
+    password on the node, with the log and the store-url file pointed at
+    ``scratch`` (no /etc or /var/log writes)."""
     pre_end = next(i for i, ln in enumerate(body) if ln.startswith('echo "=== ai-memory'))
-    role_start = next(i for i, ln in enumerate(body) if "db + role + extensions" in ln)
-    role_end = next(i for i in range(role_start, len(body)) if "CREATE DATABASE" in body[i])
-    ul = next(i for i, ln in enumerate(body) if "userlist.txt" in ln and "printf" in ln)
-    ul_start = ul - 1 if body[ul - 1].lstrip().startswith("set +x") else ul
-    ul_end = next(i for i in range(ul, len(body)) if "chmod 0600 /etc/pgbouncer/userlist.txt" in body[i])
-    picked = body[:pre_end + 1] + body[role_start:role_end + 1] + body[ul_start:ul_end + 1]
-    text = "\n".join(picked) + "\n"
+    mint = [i for i, ln in enumerate(body) if "grep -q CHANGEME /etc/ai-memory/store-url" in ln]
+    if len(mint) < 2:
+        raise RuntimeError("provision script no longer has the mint + fail-closed CHANGEME blocks")
+    end = next(i for i in range(mint[1], len(body)) if body[i].strip() == "fi")
+    text = "\n".join(body[:pre_end + 1] + body[mint[0]:end + 1]) + "\n"
     for real, fake in (("/var/log/ai-memory-provision.log", str(scratch / "provision.log")),
-                       ("/root/.aimemory-role.sql", str(scratch / "role.sql")),
-                       ("/etc/pgbouncer/userlist.txt", str(scratch / "userlist.txt")),
-                       ("/etc/pgbouncer/pgbouncer.ini", str(scratch / "pgbouncer.ini"))):
+                       ("/etc/ai-memory/store-url", str(scratch / "store-url"))):
         text = text.replace(real, fake)
-    return text.replace("${db_password}", DUMMY_PW)
+    return text
 
 
-def _run_provision_probe(tpl: str) -> Tuple[str, int, str]:
-    """Run the harness under bash with stubbed sudo/chown. Returns
-    (log text, log mode, stderr)."""
+def _run_provision_probe(tpl: str) -> Tuple[str, int, str, int]:
+    """Run the harness under bash against a placeholder store-url file. Returns
+    (log text, log mode, minted secret, exit code)."""
     scratch_parent = ROOT / ".local-runs"
     scratch_parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=str(scratch_parent)) as td:
         scratch = Path(td)
-        stubs = scratch / "bin"
-        stubs.mkdir()
-        for name in ("sudo", "chown"):
-            stub = stubs / name
-            stub.write_text("#!/bin/sh\ncat >/dev/null 2>&1 </dev/null || true\nexit 0\n", encoding="utf-8")
-            stub.chmod(0o755)
+        (scratch / "store-url").write_text(PLACEHOLDER_URL, encoding="utf-8")
         script = scratch / "harness.sh"
         script.write_text(_credential_harness(_provision_body(tpl), scratch), encoding="utf-8")
         proc = subprocess.run(
             ["bash", str(script)], capture_output=True, text=True, timeout=60, check=False,
-            env={"PATH": "%s:/usr/bin:/bin" % stubs, "HOME": str(scratch)},
+            env={"PATH": "/usr/bin:/bin", "HOME": str(scratch)},
         )
-        import time
-        time.sleep(0.5)  # let the `tee` process substitution flush the log
         log = scratch / "provision.log"
         mode = (log.stat().st_mode & 0o777) if log.exists() else -1
         leaked = log.read_text(encoding="utf-8") if log.exists() else ""
-        if proc.returncode != 0:
-            leaked += "\n[harness rc=%d] %s" % (proc.returncode, proc.stderr[-300:])
-        return leaked, mode, proc.stderr
+        url = (scratch / "store-url").read_text(encoding="utf-8").strip()
+        minted = url.split("://", 1)[1].split("@", 1)[0].split(":", 1)[1] if "@" in url else ""
+        return leaked, mode, minted, proc.returncode
 
 
 def runtime_probe() -> int:
-    """#4609 red-then-green: dummy password, real bash, real xtrace + tee."""
+    """#4609 red-then-green: real bash against the real credential-handling lines
+    of the provision script. The role password is minted on the node, so the probe
+    reads it back from the store-url file and proves it never reaches the log, and
+    that the log is mode 0600. The red copy puts xtrace back and drops the log
+    protection; the same probe must then see the secret."""
     tpl_path = ROOT / PROVISION_TPL
     if not tpl_path.exists():
         print("SELF-TEST FAIL: %s missing" % PROVISION_TPL, file=sys.stderr)
         return 1
     tpl = tpl_path.read_text(encoding="utf-8")
     bad = 0
-    log, mode, _ = _run_provision_probe(tpl)
-    if DUMMY_PW in log or "harness rc=" in log:
-        print("SELF-TEST FAIL: provision.sh leaks the dummy password (or the harness failed) in its log", file=sys.stderr)
+    log, mode, minted, rc = _run_provision_probe(tpl)
+    if rc != 0 or len(minted) < 16 or "CHANGEME" in minted:
+        print("SELF-TEST FAIL: provision harness did not mint a secret (rc=%d)" % rc, file=sys.stderr)
+        bad += 1
+    elif minted in log:
+        print("SELF-TEST FAIL: provision script writes the minted role password to its log", file=sys.stderr)
         bad += 1
     if mode != 0o600:
         print("SELF-TEST FAIL: provision log mode is %s, want 0600" % oct(mode), file=sys.stderr)
         bad += 1
-    # Red: remove the protections from a copy; the same probe must now leak.
     regressed = "\n".join(
-        ln for ln in tpl.splitlines()
-        if ln.strip() not in ("set +x", "set +x   # #4609: no xtrace of the userlist credential line")
-        and "chmod 0600 /var/log/ai-memory-provision.log" not in ln
-        and ": >> /var/log/ai-memory-provision.log" not in ln
+        ln.replace("set -euo pipefail", "set -euxo pipefail")
+        for ln in tpl.splitlines()
+        if "( umask 077; : >> /var/log/ai-memory-provision.log )" not in ln
     ) + "\n"
-    rlog, rmode, _ = _run_provision_probe(regressed)
-    if DUMMY_PW not in rlog:
-        print("SELF-TEST FAIL: regressed provision.sh did not leak the dummy password; the probe is vacuous", file=sys.stderr)
+    rlog, rmode, rminted, _ = _run_provision_probe(regressed)
+    if not rminted or rminted not in rlog:
+        print("SELF-TEST FAIL: regressed provision script did not leak the secret; the probe is vacuous",
+              file=sys.stderr)
         bad += 1
     return bad
 
