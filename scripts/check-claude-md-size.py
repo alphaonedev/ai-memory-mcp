@@ -444,14 +444,29 @@ def path_symlink_errors(root: Path, rel: str) -> list:
     return errors
 
 
+def has_body_line(text: str) -> bool:
+    """True when the text has at least one line that is neither blank nor a Markdown heading."""
+    return any(line.strip() and not line.lstrip().startswith("#") for line in text.splitlines())
+
+
 def refs_errors(root: Path) -> list:
-    """R3-F7: the check the two doc gates share: each reference file is reached without a symlink."""
+    """R3-F7/F8: the checks the two doc gates share. Each reference file is reached without a symlink, is
+    a regular readable valid-UTF-8 file, and has body content beyond its headings."""
     errors = []
     for rel in REFERENCE_PATHS:
         walk = path_symlink_errors(root, rel)
         if walk:
             errors += walk
             continue
+        try:
+            text = read_utf8(root / rel)
+        except (OSError, UnicodeDecodeError) as exc:
+            errors.append(f"FAIL: cannot read {rel} as UTF-8: {exc}")
+            continue
+        if not text.strip():
+            errors.append(f"FAIL: {rel} is empty (#4507 R3-F8)")
+        elif not has_body_line(text):
+            errors.append(f"FAIL: {rel} has only headings, no body content (#4507 R3-F8)")
     return errors
 
 
@@ -996,7 +1011,7 @@ def refs_expect(root: Path, label: str, want_fail: bool, needle: str = "") -> bo
 
 
 def run_ref_cases(fresh, arch: str, style: str) -> bool:
-    """R3-F7: a symlink at any level of a reference path."""
+    """R3-F7 and R3-F8: a symlink at any level of a reference path; empty, heading-only, unreadable files."""
     ok = refs_expect(fresh(), "R3-F7 a valid reference pair", False)
     # F7: docs -> elsewhere (the link sits above docs/reference), through both the full check and refs_errors.
     root = fresh()
@@ -1024,6 +1039,25 @@ def run_ref_cases(fresh, arch: str, style: str) -> bool:
     (root / "docs" / "reference").rename(root / "elsewhere")
     (root / "docs" / "reference").symlink_to(root / "nowhere", target_is_directory=True)
     ok &= refs_expect(root, "R3-F7 a dangling docs/reference link", True, "is a symlink")
+    # F8: empty, heading-only, whitespace-only, invalid UTF-8, unreadable.
+    for rel in (arch, style):
+        name = Path(rel).name
+        top = next(entry[1] for entry in REFERENCE_FILES if entry[0] == rel)
+        for label, payload in (("empty", b""), ("whitespace-only", b"  \n\n"),
+                               ("heading-only", (top + "\n\n## Sub\n").encode("utf-8")),
+                               ("invalid UTF-8", b"# T\n\xff\xfe body\n")):
+            root = fresh()
+            (root / rel).write_bytes(payload)
+            want = "cannot read" if label == "invalid UTF-8" else ("empty" if "empty" in label or "white" in label
+                                                                    else "only headings")
+            ok &= refs_expect(root, f"R3-F8 {name} {label}", True, want)
+        if hasattr(os, "geteuid") and os.geteuid() != 0:
+            root = fresh()
+            os.chmod(root / rel, 0)
+            try:
+                ok &= refs_expect(root, f"R3-F8 {name} unreadable (mode 000)", True, "cannot read")
+            finally:
+                os.chmod(root / rel, 0o644)
     return ok
 
 
@@ -1355,7 +1389,7 @@ def main() -> int:
     parser.add_argument("root", nargs="?", default=str(Path(__file__).resolve().parent.parent))
     parser.add_argument("--self-test", action="store_true")
     parser.add_argument("--refs-only", action="store_true",
-                        help="only the reference-file checks the doc gates call (symlink walk)")
+                        help="only the reference-file checks the doc gates call (symlink walk, readable, non-empty)")
     args = parser.parse_args()
     if args.self_test:
         return self_test()
