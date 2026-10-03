@@ -42,8 +42,8 @@ No cloud account, no Docker, no network egress, no `sudo`. Prereqs are
 `openssl`, `curl`, `jq`, `sqlite3`. The kit writes only inside its own
 directory and cleans up after itself — including on Ctrl-C.
 
-**Honest by construction.** The lab runs **16 of the 17** `asi-hard` posture
-knobs at their hard floor and tells you exactly why the seventeenth is missing:
+**Honest by construction.** The lab runs every `asi-hard` posture
+knob but one at its hard floor and tells you exactly why that one is missing:
 `AI_MEMORY_REQUIRE_ROLLBACK_CHECK` cannot cold-boot a fresh node (no off-table
 head anchor exists yet — [#2942](https://github.com/alphaonedev/ai-memory-mcp/issues/2942)),
 so the kit *demonstrates* that limitation with a captured exit code rather than

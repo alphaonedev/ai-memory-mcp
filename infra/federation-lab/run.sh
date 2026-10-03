@@ -3,8 +3,8 @@
 # infra/federation-lab/run.sh — the ai-memory v1.0.0 laptop federation lab.
 # =============================================================================
 # ONE command stands up a two-node ai-memory federation on your laptop with
-# mutual TLS, fingerprint-pinned peers, required agent attestation and 16 of
-# the `asi-hard` posture knobs at their hard floor; loads a sample of the
+# mutual TLS, fingerprint-pinned peers, required agent attestation and every
+# `asi-hard` posture knob but one at its hard floor; loads a sample of the
 # synthetic corpus; and then PROVES the thing works by asserting both positives
 # (an attested write replicates across the mesh and is recallable at the
 # peer) and negatives (an unpinned client, a plaintext client and an unsigned
