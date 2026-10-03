@@ -294,8 +294,8 @@ These bind you even if you never open `docs/reference/ARCHITECTURE_REFERENCE.md`
 - `ARCHITECTURE_REFERENCE.md:132` "Do not "fix" `resolve_store_url` to match the general ladder."
 - `ARCHITECTURE_REFERENCE.md:141-143` "**Classification.** `secret` = leaks credentials or override authority if logged or echoed; MUST NOT appear in capabilities, banners, audit records, or `tracing` output. `config` = operational knob, safe to"
 - `ARCHITECTURE_REFERENCE.md:144` "echo. `test-only` = honored in test builds; never set in production."
-- `ARCHITECTURE_REFERENCE.md:646-647` "not an *attested* one** — do not use it for security decisions without pairing with agent registration (Task 1.3, upcoming)."
-- `ARCHITECTURE_REFERENCE.md:729` "**Special metadata keys produced by the system** (do not overwrite):"
+- `ARCHITECTURE_REFERENCE.md:645-647` "marker. See design discussion on issue #148. **agent_id is a *claimed* identity, not an *attested* one** — do not use it for security decisions without pairing with agent registration (Task 1.3, upcoming)."
+- `ARCHITECTURE_REFERENCE.md:729-736` "**Special metadata keys produced by the system** (do not overwrite):  - `imported_from_agent_id` — original claim preserved when `ai-memory import` restamps agent_id with caller's id (absent when `--trust-source` is passed) - `consolidated_from_agents` — array of source authors, preserved on `memory_consolidate` (the consolidator's id becomes `agent_id`) - `mined_from` — source format tag (`claude` / `chatgpt` / `slack`) stamped by `ai-memory mine` alongside the caller's `agent_id`"
 
 ## Adding New Functionality
 

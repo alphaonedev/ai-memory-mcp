@@ -145,15 +145,18 @@ INDEX_SECTIONS = (
 # R3-F2: the full set of index quotes, as (reference basename, sha256 of the quote text), sorted. A quote
 # must equal the whitespace-normalised text of its cited lines AND be in this set, and every pinned quote
 # must be present exactly once: reworded, re-pointed, dropped, duplicated or added entries all fail.
+# code-R3-F3: sha256 of the exact index lines (both sections, in file order, joined by a newline), so the cited
+# range and the quote text are pinned together. Also pinned in SELF_TEST_PINNED_LIMITS: a change is two edits.
+INDEX_ENTRIES_SHA256 = "de11dd7af07f6e340e2c7d7a75b451f4e41c67cd66548d59165cf7c81c19b6f7"
 INDEX_QUOTE_PINS = (
     ("ARCHITECTURE_REFERENCE",
      "123b8bbe696bb26fa77c2bf30545c3c5768b73904280534c126f74f88546ccd4"),
     ("ARCHITECTURE_REFERENCE",
-     "3f0effa59a17a4b01509ca05416a1d85fa49f764d08484087ac7ab06764acbe1"),
+     "19f3d0432d655574ba1f9c167e0dd88cb986fed84b7be8926c44ca87a8523e0a"),
     ("ARCHITECTURE_REFERENCE",
      "5e61b4d224673138fbe5172f055a5f00aebbef8bcfde90601a19a385c8587b22"),
     ("ARCHITECTURE_REFERENCE",
-     "ec6619ab535cc1a47ebbaea40b2d1af0adc65e1a4e23da8db8b42d42f06e2d5c"),
+     "3aee9c961d4cf176c9e681ebf30becbfb21fef0b5c65a8371fe4db60fcfeb424"),
     ("ARCHITECTURE_REFERENCE",
      "f071617d60a2f0124c2d79b503ab8465534611d8f4415c0510612391ba971062"),
     ("CODE_STYLE",
@@ -392,9 +395,13 @@ def sections_of(visible: list) -> dict:
 def check_index(visible: list, ref_lines: dict, errors: list, index_pins=None) -> None:
     """Fail unless each pointer section carries its binding-rules index and every quote is verbatim."""
     sections = sections_of(visible)
+    all_index_lines = []
+    cited = set()
+    complete = True
     for heading, name, minimum in INDEX_SECTIONS:
         lines = sections.get(heading)
         if lines is None:
+            complete = False
             continue  # the missing pinned heading is already reported
         if INDEX_HEADING not in lines:
             errors.append(f"FAIL: CLAUDE.md section '{heading}' has no '{INDEX_HEADING}' block (#4507)")
@@ -405,6 +412,7 @@ def check_index(visible: list, ref_lines: dict, errors: list, index_pins=None) -
                 break
             if line.startswith("- "):
                 block.append(line)
+        all_index_lines += block
         verified = 0
         found = []
         for line in block:
@@ -418,6 +426,11 @@ def check_index(visible: list, ref_lines: dict, errors: list, index_pins=None) -
             if match.group(1) != name:
                 errors.append(f"FAIL: index entry under '{heading}' cites {where}, expected {name}.md")
                 continue
+            if (match.group(1), lo, hi) in cited:
+                errors.append(f"FAIL: index entry {where} appears more than once; entries must be unique "
+                              "(#4507 code-R3-F3)")
+                continue
+            cited.add((match.group(1), lo, hi))
             ref = ref_lines.get(name)
             if ref is None:
                 continue  # the unreadable reference file is already reported
@@ -451,6 +464,13 @@ def check_index(visible: list, ref_lines: dict, errors: list, index_pins=None) -
                 f"missing, {extra} unpinned or duplicated quote(s) present; a binding rule was reworded, "
                 "re-pointed, dropped or added without updating the pins (#4507 R3-F2)"
             )
+    if complete and index_pins is None:
+        digest = hashlib.sha256("\n".join(all_index_lines).encode("utf-8")).hexdigest()
+        if digest != INDEX_ENTRIES_SHA256:
+            errors.append(
+                f"FAIL: the binding-rules index lines hash to {digest[:16]}, not the pinned "
+                f"{INDEX_ENTRIES_SHA256[:16]} (INDEX_ENTRIES_SHA256): an entry's text or cited range changed; a "
+                "deliberate edit must update INDEX_ENTRIES_SHA256 and SELF_TEST_PINNED_LIMITS (#4507 code-R3-F3)")
 
 
 def path_symlink_errors(root: Path, rel: str) -> list:
@@ -1095,7 +1115,14 @@ def run_cases(base: Path) -> bool:
     extra = f'- `CODE_STYLE.md:3` "{quote_a}"\n'
     text = text.replace(f'- `CODE_STYLE.md:3` "{quote_a}"\n', f'- `CODE_STYLE.md:3` "{quote_a}"\n' + extra, 1)
     (root / claude_md).write_text(text, encoding="utf-8")
-    ok &= expect(root, "R3-F2 a duplicated index entry", True, "index quote set")
+    ok &= expect(root, "R3-F2 a duplicated index entry", True, "appears more than once")
+    # code-R3-F3: the same file:range cited twice with a different (still verbatim) quote cannot slip through.
+    root = fresh()
+    text = (root / claude_md).read_text(encoding="utf-8")
+    extra = f'- `CODE_STYLE.md:3` "{fixture_quote("CODE_STYLE", 3)}" \n'
+    text = text.replace(f'- `CODE_STYLE.md:3` "{quote_a}"\n', f'- `CODE_STYLE.md:3` "{quote_a}"\n' + extra, 1)
+    (root / claude_md).write_text(text, encoding="utf-8")
+    ok &= expect(root, "code-R3-F3 the same file:range cited twice", True, "appears more than once")
 
     # R3-F5: CommonMark fences (at most 3 spaces of indent) and raw HTML blocks.
     heading = CLAUDE_MD_REQUIRED_HEADINGS[14]
@@ -1449,7 +1476,8 @@ SELF_TEST_PINNED_LIMITS = {
     "REFERENCE_FLOOR CODE_STYLE": 45_000,
     "INDEX_MIN_QUOTE_CHARS": 20,
     # sha256 of the sorted "<file> <quote sha256>" index pin lines: any pinned quote change is a deliberate edit.
-    "INDEX_QUOTE_PINS_SHA256": "c0e321a920ba781d504d4d5f2ba265a25e663c43e483c24719490528cd039570",
+    "INDEX_ENTRIES_SHA256": "de11dd7af07f6e340e2c7d7a75b451f4e41c67cd66548d59165cf7c81c19b6f7",
+    "INDEX_QUOTE_PINS_SHA256": "9d4c301ad7f479615115f9605e0ea6d1d86d0ea04b653c08bedb4ed72986eaeb",
     "REFERENCE_SUBSECTIONS ARCHITECTURE_REFERENCE": 9,
     "REFERENCE_SUBSECTIONS CODE_STYLE": 1,
     "INDEX_MIN_ENTRIES ARCHITECTURE_REFERENCE": 5,
@@ -1467,6 +1495,7 @@ def current_limits() -> dict:
             "\n".join(CLAUDE_MD_REQUIRED_HEADINGS).encode("utf-8")).hexdigest(),
         "INDEX_MIN_QUOTE_CHARS": INDEX_MIN_QUOTE_CHARS,
         "CLAUDE_MD_SECTION_MIN_BYTES": tuple(CLAUDE_MD_SECTION_MIN_BYTES),
+        "INDEX_ENTRIES_SHA256": INDEX_ENTRIES_SHA256,
         "INDEX_QUOTE_PINS_SHA256": hashlib.sha256(
             "\n".join(f"{name} {digest}" for name, digest in INDEX_QUOTE_PINS).encode("utf-8")).hexdigest(),
     }
