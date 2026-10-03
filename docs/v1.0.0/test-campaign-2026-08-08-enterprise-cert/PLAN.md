@@ -3,7 +3,7 @@ layout: doc
 ---
 # v1.0.0 Enterprise-Certification Test Campaign — PLAN
 
-> **Point-in-time record, as of 2026-08-11.** The src/ file:line references in this document describe the source tree on that date. They are a dated record and are not maintained, so they may not match the current code. No commit is named because a sample of the references did not resolve against a single commit.
+> **Point-in-time record, dated 2026-08-08.** The src/ file:line references in this document refer to the source tree as of that date and are not maintained, so they may not match the current code.
 
 **Campaign date:** 2026-08-08
 **Base commit (cert tip):** `715cb38f` on `release/v1.0.0`

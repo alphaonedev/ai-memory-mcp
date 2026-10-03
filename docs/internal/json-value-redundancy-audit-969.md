@@ -3,7 +3,7 @@ layout: doc
 ---
 # JSON Value Serialization Redundancy Audit — Issue #969
 
-> **Point-in-time record, as of 2026-05-21.** The src/ file:line references in this document describe the source tree on that date. They are a dated record and are not maintained, so they may not match the current code. No commit is named because a sample of the references did not resolve against a single commit.
+> **Point-in-time record, dated 2026-05-21.** The src/ file:line references in this document refer to the source tree as of that date and are not maintained, so they may not match the current code.
 
 **Status:** AUDIT + targeted refactor (v0.7.0)
 **Severity:** LOW (issue body)

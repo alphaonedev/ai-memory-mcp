@@ -3,7 +3,7 @@ layout: doc
 ---
 # `/goal` EPIC kickoff — ai-memory **v0.8.0** "Distributed Coordination Substrate"
 
-> **Point-in-time record, as of 2026-06-15.** The src/ file:line references in this document describe the source tree on that date. They are a dated record and are not maintained, so they may not match the current code. No commit is named because a sample of the references did not resolve against a single commit.
+> **Point-in-time record, dated 2026-06-15.** The src/ file:line references in this document refer to the source tree as of that date and are not maintained, so they may not match the current code.
 
 > **What this document is.** The full-spectrum, holistic execution prompt to feed to a fresh Claude Code CLI session via `/goal` to drive the **v0.8.0 development EPIC** end-to-end. It is the single load-bearing brief: North Star, scope (codegraph-verified), phased build order, disciplines, gates, and the cutline. Tracking hub: **issue #1709**. Source of truth: `ROADMAP.md` §11.4 + §22 + §5. Companion: the v0.7.1 hub #1683.
 >

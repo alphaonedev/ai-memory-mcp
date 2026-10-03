@@ -1,6 +1,6 @@
 # ai-memory v0.8.0 — Development Gaps (vs the TRACT definitive design)
 
-> **Point-in-time record, as of 2026-06-28.** The src/ file:line references in this document describe the source tree on that date. They are a dated record and are not maintained, so they may not match the current code. No commit is named because a sample of the references did not resolve against a single commit.
+> **Point-in-time record, dated 2026-06-28.** The src/ file:line references in this document refer to the source tree as of that date and are not maintained, so they may not match the current code.
 
 ### An Opus full-spectrum, CodeGraph-anchored catalog of what must still be developed for ai-memory v0.8.0 to fully realize the definitive endpoint-AI-memory design.
 

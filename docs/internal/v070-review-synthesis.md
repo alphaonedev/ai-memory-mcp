@@ -3,7 +3,7 @@ layout: doc
 ---
 # v0.7.0 Review Synthesis — Fix Dispatch Backlog
 
-> **Point-in-time record, as of 2026-05-15.** The src/ file:line references in this document describe the source tree on that date. They are a dated record and are not maintained, so they may not match the current code. No commit is named because a sample of the references did not resolve against a single commit.
+> **Point-in-time record, dated 2026-05-15.** The src/ file:line references in this document refer to the source tree as of that date and are not maintained, so they may not match the current code.
 
 > Synthesized from 6 parallel reviewers (security/correctness/perf/API-UX/docs/coverage)
 > Base commit: `0536e96` (feat/v0.7.0-grand-slam HEAD with CHANGELOG + ship-readiness fixes)
