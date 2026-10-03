@@ -292,6 +292,7 @@ for _wf in \
     docs/install-quickstart.md \
     docs/integration-guide.md \
     docs/postgres-age-guide.md \
+    docs/compliance/honest-limitations.md \
     docs/hook-pipeline.md \
     docs/agent-skills.md \
     docs/batman-active-mode.md \
@@ -502,17 +503,32 @@ emit_fail() {
 #   - RFC doc references like "schema v52, see #1389"
 check_schema_version_rule() {
     local rule_name="CURRENT_SCHEMA_VERSION"
-    for f in "${DOC_FILES[@]}"; do
-        [[ -f "$f" ]] || continue
+    # #3248 item 4: the rule used to walk DOC_FILES only, so the rendered
+    # docs/**/*.html pages (evidence.html, schema.html, ...) carried stale
+    # schema claims with the gate green. HTML files are now walked too, with
+    # the html dialect handled inside the engine (tag-stripped view, release
+    # card window guard).
+    local f is_html
+    for f in "${DOC_FILES[@]}" "${HTML_DOC_FILES[@]:-}"; do
+        [[ -n "$f" && -f "$f" ]] || continue
+        is_html=0
+        [[ "$f" == *.html ]] && is_html=1
         # Capture-then-check rather than `done < <(python3 …)`: under
         # `set -euo pipefail` a process-substitution's exit status is NOT
         # observed, so a crashing engine (a non-UTF-8 byte → the unguarded
-        # `open('$f')` raises UnicodeDecodeError) yielded an EMPTY row set
+        # `open()` raises UnicodeDecodeError) yielded an EMPTY row set
         # and the rule silently passed — the #2713 swallowed-error shape.
+        # The engine reads its file from the environment through a QUOTED
+        # heredoc, so no bash interpolation can reach the python source.
         local schema_rows
         schema_rows="$(
-            python3 -c "
+            GATE_SCHEMA_FILE="$f" GATE_SCHEMA_HTML="$is_html" python3 - <<'SCHEMAPY'
+import html as htmlmod
+import os
 import re
+
+# \x60 is the backtick code-span delimiter, spelled as an escape so the
+# source stays readable in a shell heredoc.
 patterns = [
     re.compile(r'Current schema = v([0-9]+)'),
     re.compile(r'CURRENT_SCHEMA_VERSION *= *([0-9]+)'),
@@ -522,10 +538,6 @@ patterns = [
     re.compile(r'logical schema \*\*v([0-9]+)\*\*'),
     # Markdown table form (release-notes.md Surface-at-vX.Y.Z table row):
     #   | Schema | **v86** (CURRENT_SCHEMA_VERSION, both adapters) |
-    # \x60 is the backtick code-span delimiter, spelled as a hex escape
-    # rather than a literal backtick character -- this whole block is
-    # interpolated inside a double-quoted python3 -c string, and a
-    # literal backtick there would trigger bash command substitution.
     re.compile(r'\| *Schema *\| *\*\*v([0-9]+)\*\* *\(\x60CURRENT_SCHEMA_VERSION'),
     # ROADMAPs plain-prose current-state phrasing. Scoped to the exact
     # phrase the current substrate has advanced to schema N (issue
@@ -535,15 +547,59 @@ patterns = [
     # schema 78 anchored to a past release, or schema 45 in ladder
     # history, which are correct historical state, not drift.
     re.compile(r'the current substrate has advanced to schema ([0-9]+)'),
+    # #3248 item 4. The postgres-guide schema-init summary
+    # (`schema_version: 90`) and the CONFIG_SCHEMA postgres row
+    # (`| ai-memory postgres schema | **v93** |`) are present-tense claims
+    # of the live ladder position that no anchor above could see.
+    re.compile(r'\bschema_version: ([0-9]+)\b'),
+    re.compile(r'ai-memory postgres schema *\| *\*\*v([0-9]+)\*\*'),
+    # The schema.html version-row phrasings: `Current version: 97 at v1.0.0`
+    # and `Currently 98 (v1.0.0)`.
+    re.compile(r'\bCurrent version: ([0-9]+) at v[0-9]'),
+    re.compile(r'\bCurrently ([0-9]+) \(v[0-9]+\.[0-9]+\.[0-9]+\)'),
+    # The html status-row cell `<td class="num">v90</td>` next to a
+    # `Schema version` label (tag-stripped: `Schema version (...) v90 Constant`).
+    re.compile(r'\bSchema version \([^)]*\) v([0-9]+) Constant'),
 ]
-for ln, line in enumerate(open('$f').read().splitlines(), 1):
+# The capabilities-envelope `schema_version: 2|3` is a wire-format pin, a
+# different SSOT from the storage ladder; a line that is about pinning or
+# negotiating it is not a ladder claim.
+CAPABILITY_PIN = re.compile(
+    r'\bpins?\b|\bpinned\b|capabilit|accept=|negotiat', re.IGNORECASE)
+LADDER_ANCHOR_SCHEMA_VERSION = patterns[8]
+
+path = os.environ['GATE_SCHEMA_FILE']
+is_html = os.environ['GATE_SCHEMA_HTML'] == '1'
+TAG = re.compile(r'<[^>]+>')
+WS = re.compile(r'\s+')
+PRIOR = re.compile(r'PRIOR RELEASE', re.IGNORECASE)
+
+
+def plain(s):
+    return WS.sub(' ', htmlmod.unescape(TAG.sub(' ', s))).strip()
+
+
+lines = open(path).read().splitlines()
+for ln, raw in enumerate(lines, 1):
+    line = raw
+    if is_html:
+        line = plain(raw)
+        # Release-card guard (mirrors html_window_historical in the numeric
+        # scanner): a card under a `PRIOR RELEASE` eyebrow is history.
+        window = ' '.join(plain(w) for w in lines[max(0, ln - 4):ln])
+        if PRIOR.search(window):
+            continue
+    seen = set()
     for p in patterns:
-        m = p.search(line)
-        if m:
+        if p is LADDER_ANCHOR_SCHEMA_VERSION and CAPABILITY_PIN.search(line):
+            continue
+        for m in p.finditer(line):
+            if m.group(1) in seen:
+                continue
+            seen.add(m.group(1))
             ctx = line.strip()[:160]
             print(f'{ln}\t{m.group(1)}\t{ctx}')
-            break
-"
+SCHEMAPY
         )" || {
             printf 'FAIL: check-docs-vs-ssot: CURRENT_SCHEMA_VERSION analysis engine errored on %s (python exited non-zero) — refusing to report PASS (#2713 fail-closed)\n' "$f" >&2
             exit 2
@@ -1465,9 +1521,18 @@ run_all_rules() {
     # commit that introduces it.
     # CANONICAL AND ONLY RULE for this SSOT (#3248 item 3). A second,
     # overlapping rule over a 6-file subset (five of this
-    # rule's twelve anchors) used to report every drift twice; it was removed
+    # rule's thirteen anchors) used to report every drift twice; it was removed
     # because this rule walks a strict superset of its surfaces and anchors.
     # One rule, one SSOT, one scan set.
+    # DELIBERATELY NOT WALKED (the rationale the removed rule documented, kept):
+    #   * CHANGELOG.md - every entry is a landing-time snapshot; "the existing
+    #     17-knob asi-hard hardened set" was TRUE when written.
+    #   * infra/federation-lab/README.md - a campaign log, same class. Its one
+    #     live-looking sentence (the "all of them" knob walk) was reworded to
+    #     carry no number, so it cannot go stale.
+    # The certification doc IS walked: its signed 17-knob EVIDENCE note records
+    # what the captured artifacts rendered pre-#3033 and is spared by the
+    # historical guards (is_historical), not by omission from the scan set.
     # Coverage as verified at this commit (a rule whose regex matches nothing
     # in a listed file is a no-op that still reports PASS, so this is stated
     # rather than assumed, and re-verified whenever a file is enrolled):
@@ -2369,6 +2434,48 @@ BOOTBANNER
     done
     echo "PASS: self-test #3248 - boot-banner schema=vNN: stale REJECTED (md, html, spacing/case/code-span, banner-only page), canonical and dated history ACCEPTED"
     rm -f "$tmpdir/docs/integrations/README.md" "$tmpdir/docs/integrations/cursor.md" "$tmpdir/docs/banner-fixture.html"
+
+    # ---- #3248 item 4: the schema-version rule reads the .html surface and the
+    # `schema_version: N` / `postgres schema | **vN**` / `Currently N (vX)`
+    # anchors. Fixture canonical: schema 53. Stale lines must be flagged, the
+    # canonical value, a capabilities-envelope pin and a PRIOR RELEASE card
+    # must not be.
+    mkdir -p "$tmpdir/docs"
+    cat > "$tmpdir/docs/postgres-age-guide.md" <<'SCHEMAMD'
+   `schema_version: 52`) or the `--json` report.
+   `schema_version: 53`) or the `--json` report.
+Clients that pin `schema_version: 2` keep receiving the v2 shape.
+SCHEMAMD
+    cat > "$tmpdir/docs/CONFIG_SCHEMA.md" <<'SCHEMACFG'
+| ai-memory postgres schema | **v52** | postgres ladder pinned in lockstep |
+| ai-memory postgres schema | **v53** | postgres ladder pinned in lockstep |
+SCHEMACFG
+    cat > "$tmpdir/docs/schema-fixture.html" <<'SCHEMAHTML'
+<td class="note"><strong>Currently 52 (v1.0.0)</strong>. Canonical: <code>CURRENT_SCHEMA_VERSION = 53</code></td>
+<tr><td>Schema version (sqlite + postgres)</td><td class="num">v52</td><td class="src">Constant <code>CURRENT_SCHEMA_VERSION = 53</code> in x</td></tr>
+<p><strong>Current version: 52 at v1.0.0</strong> (was 40 at v0.9.0)</p>
+<p>Canonical: <code>CURRENT_SCHEMA_VERSION = 53</code></p>
+<div class="eyebrow">&#9656; PRIOR RELEASE</div>
+<div class="title">What's New in v0.5.0</div>
+<p>Then <code>CURRENT_SCHEMA_VERSION = 40</code></p>
+SCHEMAHTML
+    sch_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1) && {
+        echo "FAIL: self-test #3248 - stale schema claims (md anchors + html) not rejected" >&2; cd "$REPO_ROOT"; exit 1; }
+    for _want in \
+        'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:1 claims "52"' \
+        'CURRENT_SCHEMA_VERSION: docs/CONFIG_SCHEMA.md:1 claims "52"' \
+        'CURRENT_SCHEMA_VERSION: docs/schema-fixture.html:1 claims "52"' \
+        'CURRENT_SCHEMA_VERSION: docs/schema-fixture.html:2 claims "52"' \
+        'CURRENT_SCHEMA_VERSION: docs/schema-fixture.html:3 claims "52"'
+    do grep -qF "$_want" <<<"$sch_out" || { echo "FAIL: self-test #3248 - not flagged: $_want" >&2; cd "$REPO_ROOT"; exit 1; }; done
+    for _not in \
+        'docs/postgres-age-guide.md:2 ' 'docs/postgres-age-guide.md:3 ' \
+        'docs/CONFIG_SCHEMA.md:2 ' \
+        'docs/schema-fixture.html:4 ' 'docs/schema-fixture.html:7 '
+    do grep -qF "$_not" <<<"$sch_out" && { echo "FAIL: self-test #3248 - canonical/pin/history line flagged: $_not" >&2; cd "$REPO_ROOT"; exit 1; }
+    done
+    echo "PASS: self-test #3248 - schema-version rule: stale md anchors + html REJECTED; canonical, capability pin and PRIOR RELEASE card ACCEPTED"
+    rm -f "$tmpdir/docs/postgres-age-guide.md" "$tmpdir/docs/CONFIG_SCHEMA.md" "$tmpdir/docs/schema-fixture.html"
 
     # ---- FAIL-CLOSED-ONLY-WITH-A-CLAIM: remove both SSOTs. A doc that
     # narrates NO count has nothing to validate and must stay green;
