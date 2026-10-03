@@ -974,7 +974,8 @@ PY
 # docs/reference/ARCHITECTURE_REFERENCE.md (the env-var table moved there from
 # CLAUDE.md in #4507; it is the operator-facing contract; 13
 # missing rows were found by hand on 2026-06-09 — this makes the class
-# mechanical). Intentionally one-directional — extra rows in CLAUDE.md
+# mechanical). Intentionally one-directional — extra rows in
+# docs/reference/ARCHITECTURE_REFERENCE.md
 # for removed vars are caught by the symbol census, and vars only set
 # (not read) by code are not operator knobs.
 #
