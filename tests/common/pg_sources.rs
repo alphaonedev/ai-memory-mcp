@@ -151,8 +151,14 @@ fn declared_children(root_text: &str) -> Vec<DeclaredMod> {
 #[test]
 fn declaration_with_a_trailing_comment_is_still_declared() {
     let root = "mod plain;\nmod commented; // a reason a human wrote here\npub mod pub_commented; // and here\n#[path = \"sub/renamed.rs\"]\nmod renamed; // with a path attribute too\n";
-    let got: Vec<String> = declared_children(root).into_iter().map(|d| d.name).collect();
-    assert!(got.contains(&"plain".to_string()), "plain declaration lost: {got:?}");
+    let got: Vec<String> = declared_children(root)
+        .into_iter()
+        .map(|d| d.name)
+        .collect();
+    assert!(
+        got.contains(&"plain".to_string()),
+        "plain declaration lost: {got:?}"
+    );
     assert!(
         got.contains(&"commented".to_string()),
         "a trailing `// comment` hid the declaration from the parser: {got:?}"
@@ -165,7 +171,10 @@ fn declaration_with_a_trailing_comment_is_still_declared() {
         got.contains(&"renamed".to_string()),
         "a trailing comment hid a #[path]-attributed declaration: {got:?}"
     );
-    let renamed = declared_children(root).into_iter().find(|d| d.name == "renamed").unwrap();
+    let renamed = declared_children(root)
+        .into_iter()
+        .find(|d| d.name == "renamed")
+        .unwrap();
     assert_eq!(
         renamed.path_attr.as_deref(),
         Some("sub/renamed.rs"),
