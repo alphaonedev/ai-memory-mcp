@@ -23,7 +23,7 @@ module-composition track; 4.D measures the per-module knee only.
 
 The measurement's value is the **number**, and producing it requires running
 load against a live pooled stack — i.e. the 4.B container backbone. The harness
-is therefore **Docker-gated** (like `infra/pgbouncer/smoke-test.sh`) and is
+is therefore **Docker-gated** (like `infra/pgbouncer/smoke-test.py`) and is
 **not** part of the 8-workflow CI gate. The local dev socket is
 permission-denied, so the harness ships ready-to-run and the measurement run is
 handed to a Docker-capable host (operator/CI). Until X lands, the 1000/module
@@ -33,7 +33,7 @@ figure is labelled **PROVISIONAL** in the design docs (operator flag (b)).
 
 ```bash
 cd infra/pillar4-envelope
-POSTGRES_PASSWORD=secret ./measure-envelope.sh
+./measure-envelope.sh
 ```
 
 What it does:
@@ -41,13 +41,15 @@ What it does:
 1. **Builds** the release binary fresh (`--features sal-postgres`) — pm-v3.3
    recompile-retest discipline; never measures a stale daemon.
 2. Brings up the **4.B pooled stack** (`../pgbouncer/docker-compose.yml`:
-   postgres+AGE behind PgBouncer on `6432`, host-mapped).
+   postgres+AGE behind a session-mode PgBouncer on `6432`, TLS on both hops;
+   `infra/pgbouncer/smoke-test.py up` brings it up and writes the daemon's
+   verified-TLS store URL to a `0600` file).
 3. `schema-init` + `serve`s the binary **through the pooler**
    (`postgres://…@127.0.0.1:6432/ai_memory`).
 4. Ramps concurrency over `CONCURRENCY_STEPS`. Each worker = one simulated
    agent looping **store → link → recall** (the `link` op drives the **AGE
-   graph write path** — the real per-module throughput bound; PgBouncer fixes
-   connection fan-in, *not* AGE write concurrency).
+   graph write path** — the real per-module throughput bound; the session-mode
+   pooler adds neither connection fan-in nor AGE write concurrency).
 5. Per step, records p50/p95/p99 latency + the **503 shed-rate**, and stops at
    the first step that crosses `P95_BUDGET_MS` or `SHED_RATE_KNEE`. That step's
    concurrency is **X**.

@@ -703,11 +703,9 @@ operators must not conflate them:
 2. **The PgBouncer server-side pool** (a separate process in front of
    the primary). In `session` mode every client connection holds one server
    connection for its whole life, so this pool does **not** fan many clients
-   into few server connections: with a daemon running through it, the PgBouncer
-   `SHOW POOLS` row read `cl_active = 4`, `sv_active = 4` (§5.6.6, step 2). What
+   into few server connections. What
    it bounds is how many server connections it will open per `(user, db)`
-   (`default_pool_size`); a client past that number waits in PgBouncer's queue
-   (§5.6.6, the `session` row with `default_pool_size = 1`).
+   (`default_pool_size`); a client past that number waits in PgBouncer's queue for up to `reserve_pool_timeout` and then takes one of `reserve_pool_size` extra server connections.
 
 Because the two pools do not multiply down, the Postgres `max_connections`
 ceiling (§10.2) applies to the daemons' summed pool sizes whether or not a
@@ -731,8 +729,9 @@ pooler is present. §5.6.5 gives the sizing rule and the T4 and T5 numbers.
 > **Copy-deployable templates (v0.8.0 Pillar-4 4.B, #1736):**
 > [`infra/pgbouncer/`](../infra/pgbouncer/) materializes this section into
 > runnable artifacts — `pgbouncer.ini`, `userlist.txt`, `role-defaults.sql`,
-> a `docker-compose.yml`, and a `smoke-test.sh` that runs an AGE cypher
-> transaction through the pooler and asserts the pooler reports session mode.
+> a `docker-compose.yml`, and a `smoke-test.py` that runs an AGE cypher
+> transaction through the pooler, over TLS on both hops, and asserts the pooler
+> reports session mode.
 
 The supported mode is `session`. The documented mode is pinned to
 `infra/pgbouncer/pgbouncer.ini` by `scripts/check-pgbouncer-pool-mode-claims.py`
@@ -743,32 +742,45 @@ The supported mode is `session`. The documented mode is pinned to
 aimemory = host=primary.rackA.internal port=5432 dbname=aimemory
 
 [pgbouncer]
-listen_addr = 0.0.0.0
+listen_addr = 0.0.0.0            ; bind the interface the daemons reach; both hops require TLS below
 listen_port = 6432
 auth_type = scram-sha-256
 auth_file = /etc/pgbouncer/userlist.txt
 pool_mode = session              ; supported mode, see 5.6.6
+server_reset_query = DISCARD ALL ; pinned, see 5.6.6
+server_reset_query_always = 0
 max_client_conn = 1000           ; client-facing admission ceiling
 default_pool_size = 16           ; server conns per (user,db) pair: sum of the daemons' AI_MEMORY_PG_POOL_MAX
 reserve_pool_size = 4            ; burst headroom above default_pool_size
-client_tls_sslmode = require     ; the daemon pins verify-full, see below
+client_tls_sslmode = verify-full ; client certificates are verified (mTLS)
+client_tls_ca_file = /etc/pgbouncer/tls/ca.crt
 client_tls_key_file = /etc/pgbouncer/tls/server.key
 client_tls_cert_file = /etc/pgbouncer/tls/server.crt
+server_tls_sslmode = verify-full ; the pooler verifies the Postgres certificate and host name
+server_tls_ca_file = /etc/pgbouncer/tls/ca.crt
+admin_users = pgbouncer_admin    ; never the application role
+stats_users = pgbouncer_stats
 ```
 
-Authentication: the #4667 proof used `auth_type = md5` (the shipped template);
-`scram-sha-256` above was not exercised by it, so this section makes no claim
-about it beyond PgBouncer's own documentation.
+Authentication: `auth_type = scram-sha-256`, with the role's SCRAM verifier in
+`userlist.txt` (§5.6.4). The shipped template and its smoke test run exactly
+this (`infra/pgbouncer/smoke-test.py`, SCRAM passthrough verified).
 
-TLS to the daemon: the adapter refuses a store URL that does not pin
+TLS on both hops: the adapter refuses a store URL that does not pin
 `sslmode=verify-full` (`src/store/postgres.rs:2698`,
 `src/store/postgres/dsn.rs:283`, #3705), so the pooler must serve TLS to its
 clients and the daemon's URL must carry `sslmode=verify-full` and the CA that
-signed the pooler's certificate (`sslrootcert=`). The #4667 proof ran exactly
-that with `client_tls_sslmode = require` and a throwaway CA. TLS from the
-pooler to Postgres (`server_tls_sslmode`) and client-certificate verification
-(`client_tls_sslmode = verify-full`) were not exercised by that proof, so this
-section makes no claim about them; see §14 for the TLS hardening checklist.
+signed the pooler's certificate (`sslrootcert=`). The pooler must also verify
+the Postgres side: `server_tls_sslmode = verify-full` keeps the daemon's
+`verify-full` true end to end instead of ending at the pooler, and
+`client_tls_sslmode = verify-full` makes the pooler require a client
+certificate (`sslcert=` and `sslkey=` in the daemon's URL, which the adapter's
+DSN parser accepts). Do not lower either to `require` or `prefer`. The smoke
+test runs both hops at `verify-full`; see §14 for the TLS hardening checklist.
+
+The application role is not an admin role: `admin_users` and `stats_users` name
+separate roles that exist only in `userlist.txt`, so a daemon's credentials
+cannot `SET`, `PAUSE`, `KILL` or `SHUTDOWN` the pooler from the admin console.
 
 #### 5.6.4 `userlist.txt` (SCRAM, no plaintext)
 
@@ -776,12 +788,20 @@ Store the SCRAM verifier, never the plaintext password. Generate it
 from the role's stored verifier:
 
 ```bash
-# On the primary, copy the stored SCRAM verifier for the role:
-psql -At -U postgres -c \
-  "SELECT '\"aimemory\" \"' || rolpassword || '\"' \
-   FROM pg_authid WHERE rolname='aimemory';" > /etc/pgbouncer/userlist.txt
-chmod 0600 /etc/pgbouncer/userlist.txt
+# On the primary, copy the stored SCRAM verifier for the role. The file is
+# created 0600 before anything is written to it (umask), then handed over:
+( umask 077
+  psql -At -U postgres -c \
+    "SELECT '\"aimemory\" \"' || rolpassword || '\"' \
+     FROM pg_authid WHERE rolname='aimemory';" > /etc/pgbouncer/userlist.txt )
+chown pgbouncer: /etc/pgbouncer/userlist.txt
 ```
+
+The verifier must be the role's own `rolpassword` (same salt and iteration
+count): PgBouncer passes the client's SCRAM proof through to Postgres, which
+only works when both hold the same verifier. Add the `admin_users` and
+`stats_users` roles to the same file with verifiers PgBouncer generates for
+them; they are not Postgres roles.
 
 The file is mode `0600`, owned by the PgBouncer service user. Treat it
 as a secret surface in the §14 hardening checklist.
@@ -803,7 +823,7 @@ postgres://aimemory:PWD@pgbouncer.rackA.internal:6432/aimemory?sslmode=verify-fu
 **Sizing rule (applies with or without a pooler):**
 
 ```
-sum over all daemons of AI_MEMORY_PG_POOL_MAX
+sum over all daemons of AI_MEMORY_PG_POOL_MAX (+ reserve_pool_size per PgBouncer pool)
     <= max_connections - superuser_reserved_connections
 ```
 
@@ -823,8 +843,8 @@ daemon's connections queue in PgBouncer.
 
 | Tier | Daemons (§1) | Sum at the default pool (x 16) | `max_connections` (§10.2) | Available to daemons | Result |
 |---|---|---|---|---|---|
-| T4 | 5–15 | 80–240 | 200 | 197 | Fits up to 12 daemons (192). At 13–15 daemons the default sum (208–240) is over 197: lower `AI_MEMORY_PG_POOL_MAX` (at 15 daemons, 13 gives 195) or raise `max_connections`. |
-| T5 | 15–50 | 240–800 | 500 (the "raise to 500 at T5+" in §10.2) | 497 | Fits up to 31 daemons (496). At 32–50 daemons the default sum (512–800) is over 497: lower `AI_MEMORY_PG_POOL_MAX` (at 50 daemons, 9 gives 450) or raise `max_connections` further. The T4 value of 200 does not fit even the 15-daemon T5 minimum (240). |
+| T4 | 5–15 | 80–240 | 200 | 197 | Fits up to 12 daemons (192, plus `reserve_pool_size` 4 = 196). At 13–15 daemons the default sum (208–240) is over 197: lower `AI_MEMORY_PG_POOL_MAX` (at 15 daemons, 12 gives 180, plus `reserve_pool_size` 4 = 184) or raise `max_connections`. |
+| T5 | 15–50 | 240–800 | 500 (the "raise to 500 at T5+" in §10.2) | 497 | Fits up to 30 daemons (480, plus `reserve_pool_size` 4 = 484; at 31 daemons 496 + 4 = 500 is over 497). At 31–50 daemons the default sum (496–800) is over 497 once the reserve is counted: lower `AI_MEMORY_PG_POOL_MAX` (at 50 daemons, 9 gives 450, plus 4 = 454) or raise `max_connections` further. The T4 value of 200 does not fit even the 15-daemon T5 minimum (240). |
 
 These are upper bounds: a daemon opens up to `AI_MEMORY_PG_POOL_MAX` connections
 under load and holds `AI_MEMORY_PG_POOL_MIN` (default 2) when idle. Lowering the
@@ -841,37 +861,53 @@ cap trades peak per-daemon concurrency for fitting the server; raising
 
 #### 5.6.6 Why `session` mode — the executed evidence
 
-`scripts/probe-pgbouncer-pool-mode.py` opens two real client sessions (A and B)
-through the pooler under test, with `default_pool_size` small enough that they
-can share one server backend. It reads the migration advisory-lock key from the
-adapter source and checks three things: whether B is also granted the migration
-lock A holds, whether B sees A's `search_path`, and whether B sees A's
-`statement_timeout`. It exits 0 when none is observed, 1 when any is, 2 when it
-could not run. The adapter state it checks is real: the migration lock is a
-session-level `pg_try_advisory_lock`
+`scripts/probe-pgbouncer-pool-mode.py` runs two legs through the pooler under
+test, over verified TLS and SCRAM, with `default_pool_size` small enough that two
+clients can share one server backend. It reads the migration advisory-lock key
+from the adapter source.
+
+- **Concurrent leg.** Clients A and B are open at the same time. It checks
+  whether B is also granted the migration lock A holds, whether B sees A's
+  `search_path`, and whether B sees A's `statement_timeout`. If B cannot get a
+  server connection at all, the leg is inconclusive, not safe.
+- **Reuse leg.** A sets `search_path`, `statement_timeout`, a temporary table and
+  a prepared statement, then disconnects. B connects until it lands on A's
+  backend (up to 12 tries) and checks that none of that state survived. This is
+  the check that `server_reset_query = DISCARD ALL` is doing its job.
+
+It reads `pool_mode`, `default_pool_size` and `server_reset_query` with
+`SHOW CONFIG` as the stats role (`SHOW pool_mode` is not a PgBouncer command).
+Exit codes: 0 when no hazard is observed, 1 when any is, 2 when it could not
+run or a leg was inconclusive. The adapter state it checks is real: the
+migration lock is a session-level `pg_try_advisory_lock`
 (`src/store/postgres.rs:2154`, taken at `:2825` and `:3871`, released by
 `pg_advisory_unlock_all` at `:2160`); the connect hook sets
 `search_path` with `set_config(.., false)` (`:2765`) and `statement_timeout` /
 `lock_timeout` with plain `SET` (`:2776`).
 
-Results of the #4667 run (PgBouncer 1.23.1, PostgreSQL 18.6, probe exit code in
-brackets):
+Results of the #4667 fix-round run (PgBouncer 1.23.1, PostgreSQL 16 with Apache
+AGE 1.6.0, TLS `verify-full` on both hops, SCRAM, probe exit code in brackets):
 
 | `pool_mode` | `default_pool_size` | Result |
 |---|---|---|
-| `transaction` | 1 | **UNSAFE** [1]: A and B shared backend pid 79; B got `pg_try_advisory_lock = t`, saw A's `search_path`, saw A's `statement_timeout = 7777ms`. |
-| `statement` | 2 | **UNSAFE** [1]: the same three hazards. A plain `BEGIN` is also refused: `FATAL: transaction blocks not allowed in statement pooling mode`. |
-| `session` | 2 | **SAFE** [0]: separate backends (82, 83); B got `pg_try_advisory_lock = f`, default `search_path`, `statement_timeout = 0`. |
-| `session` | 1 | **SAFE** [0]: B was blocked (no server connection while A held the only one, waited 6 s), so it was granted no lock and saw no state. |
-| `session` | 16 (the shipped template) | **SAFE** [0]: separate backends (145, 146); `pg_try_advisory_lock = f`. |
+| `transaction` | 1 | **UNSAFE** [1]: A and B shared backend pid 96; B got `pg_try_advisory_lock = t`, saw A's `search_path` and `statement_timeout = 7777ms`; the reused backend kept A's `search_path`, `statement_timeout`, temporary table and prepared statement. |
+| `statement` | 2 | **UNSAFE** [1]: the same seven hazards (backend pid 97). A plain `BEGIN` is also refused: `FATAL: transaction blocks not allowed in statement pooling mode`. |
+| `session` | 16 (the shipped template) | **SAFE** [0]: separate backends (106, 107); B got `pg_try_advisory_lock = f`, default `search_path`, `statement_timeout = 30s`; on the reused backend B saw no temporary table and no prepared statement. |
+| `session` | 2, `reserve_pool_size = 0` | **SAFE** [0]: separate backends (108, 109); reuse leg clean. |
+| `session` | 1, `reserve_pool_size = 0` | **INCONCLUSIVE** [2]: B was blocked (no server connection while A held the only one, waited 6 s); the reuse leg ran clean. A blocked client is not evidence of safety. |
+| `session` | 1, template `reserve_pool_size = 4` | **SAFE** [0]: B was given a reserve backend (pid 144, not A's pid 134), `pg_try_advisory_lock = f`; reuse leg clean. |
 
-Session mode was also exercised end to end: an ai-memory 1.0.0 daemon with the
-`sal-postgres` backend started through a session-mode PgBouncer built from
-`infra/pgbouncer/pgbouncer.ini` (template pool values, `default_pool_size = 16`),
+Session mode was also exercised end to end in the first #4667 run: an ai-memory
+1.0.0 daemon with the `sal-postgres` backend started through a session-mode
+PgBouncer built from `infra/pgbouncer/pgbouncer.ini` (template pool values,
+`default_pool_size = 16`, PostgreSQL 18.6, before the TLS and SCRAM hardening),
 bootstrapped the schema, accepted `POST /api/v1/memories` (HTTP 201) and returned
 the stored memory from `GET /api/v1/recall` with `"storage_backend":"postgres"`.
 The transaction-mode run of the same daemon was not performed; the probe is the
-evidence for it.
+evidence for it. `infra/pgbouncer/smoke-test.py` checks a fresh stack end to end (TLS
+and SCRAM on both hops, `SHOW CONFIG` reads `session`, an AGE cypher round trip,
+the role defaults, and the admin console refusing the application role); it does
+not repeat the probe.
 
 What the evidence does not cover: it does not say how often the hazards trigger
 in production (that depends on how often two clients land on one backend), it
@@ -893,7 +929,8 @@ An earlier revision of §5.6, §10.4 and `infra/pgbouncer` prescribed
 
 1. **Move to `session` mode and re-size.** Set `pool_mode = session`, set
    `default_pool_size` and `max_client_conn` per §5.6.5, reload PgBouncer, and
-   confirm with `SHOW CONFIG;` on the admin console (`psql -p 6432 pgbouncer`)
+   confirm with `SHOW CONFIG;` on the admin console, as the `stats_users` role
+   (`psql -p 6432 -U pgbouncer_stats pgbouncer`, never the application role),
    that `pool_mode` reads `session`. Then run the probe (§5.6.6) against it and
    expect exit 0. A transaction-mode setup that fit `max_connections` through
    fan-in may not fit once every client connection pins a server connection:

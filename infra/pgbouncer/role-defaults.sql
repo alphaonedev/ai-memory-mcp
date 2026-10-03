@@ -9,6 +9,10 @@
 -- transaction mode, where those per-session SETs can land on another client's
 -- backend.
 --
+-- search_path mirrors the path the adapter itself sets per session
+-- (normalize_app_search_path in src/store/postgres.rs); docs/enterprise-deployment.md
+-- section 5.6.7 step 3 prescribes the same three role defaults.
+--
 -- Values quote the binary's compiled defaults:
 --   DEFAULT_STATEMENT_TIMEOUT_SECS = 30  (src/store/postgres.rs)
 --   DEFAULT_LOCK_TIMEOUT_SECS      = 5   (src/store/postgres.rs)
@@ -17,5 +21,6 @@
 -- Run once against the REAL postgres backend (port 5432), as a superuser:
 --   psql "postgres://postgres@postgres:5432/ai_memory" -f role-defaults.sql
 
+ALTER ROLE ai_memory SET search_path = public, ag_catalog;
 ALTER ROLE ai_memory SET statement_timeout = '30s';
 ALTER ROLE ai_memory SET lock_timeout = '5s';

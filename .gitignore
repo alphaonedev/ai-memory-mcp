@@ -105,3 +105,5 @@ coverage/*.profdata
 # release-time artifact generated fresh per tag in CI and attached to the
 # GitHub Release; never committed to the tree.
 /*.cdx.json
+
+infra/pgbouncer/.smoke/

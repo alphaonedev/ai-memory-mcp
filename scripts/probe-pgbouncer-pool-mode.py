@@ -22,17 +22,29 @@ one server backend, and checks three hazards:
   3. TIMEOUT  a session ``statement_timeout`` set by A must NOT be visible to B.
 
 A client that cannot obtain a server connection at all while A holds one
-(session mode, pool size 1) is *blocked*: it was not granted the lock and saw no
-state, so the hazard is absent.
+(``default_pool_size`` 1 and ``reserve_pool_size`` 0) is *blocked*. That run is
+INCONCLUSIVE, not safe (#4745): B never reached a server, so nothing was tested
+about shared state. The probe exits 2 for it.
 
-Exit codes: 0 = no hazard observed (the pool mode is safe for the adapter),
-1 = at least one hazard observed (UNSAFE), 2 = the probe could not run.
+A second leg tests backend REUSE (#4736): A sets the same state and
+disconnects, then B connects until it lands on A's server backend. B must see a
+clean session (no marker ``search_path``, no marker ``statement_timeout``, no
+temporary table, no prepared statement). This is what the pooler's
+``server_reset_query`` provides in ``session`` mode. If B never lands on A's
+backend the leg is inconclusive (exit 2).
 
-Requires the ``psql`` client. The password is read from ``PGPASSWORD`` (never
-argv). Usage::
+Exit codes: 0 = both legs ran and no hazard was observed, 1 = at least one
+hazard observed (UNSAFE), 2 = the probe could not run or a leg was inconclusive.
 
-    PGPASSWORD=... scripts/probe-pgbouncer-pool-mode.py \\
-        --host 127.0.0.1 --port 6432 --user ai_memory --dbname ai_memory
+Requires the ``psql`` client. Passwords come from the environment, never argv:
+``PGPASSWORD`` for the application role and, for the admin-console ``SHOW
+CONFIG``, ``PGADMIN_PASSWORD`` (falls back to ``PGPASSWORD``) for ``--admin-user``
+(a stats or admin role, not the application role, #4731). TLS settings are the
+standard ``PGSSLMODE`` / ``PGSSLROOTCERT`` / ``PGSSLCERT`` / ``PGSSLKEY``. Usage::
+
+    PGPASSWORD=... PGADMIN_PASSWORD=... scripts/probe-pgbouncer-pool-mode.py \\
+        --host 127.0.0.1 --port 6432 --user ai_memory --dbname ai_memory \\
+        --admin-user pgbouncer_stats
 """
 from __future__ import annotations
 
@@ -51,6 +63,9 @@ SOURCE_FILE = REPO_ROOT / "src" / "store" / "postgres.rs"
 LOCK_KEY_RE = re.compile(r"const\s+MIGRATION_ADVISORY_LOCK_KEY\s*:\s*i64\s*=\s*([0-9A-Fa-fx_]+)\s*;")
 SENTINEL = "__PROBE_END__"
 PATH_MARKER = "probe_4667_marker_schema"
+TEMP_TABLE = "probe_4667_tmp"
+PREPARED = "probe_4667_prep"
+REUSE_TRIES = 12
 TIMEOUT_MARKER_MS = 7777
 EXIT_SAFE, EXIT_UNSAFE, EXIT_FAULT = 0, 1, 2
 
@@ -125,13 +140,21 @@ class Session:
 
 def admin_show(dsn_base: List[str], admin_db: str, what: str) -> List[Tuple[str, str]]:
     """Rows of a PgBouncer admin SHOW command, as (key, value) pairs."""
+    env = dict(os.environ)
+    if "PGADMIN_PASSWORD" in env:
+        env["PGPASSWORD"] = env["PGADMIN_PASSWORD"]
     done = subprocess.run(
         ["psql", "-X", "-A", "-t", "-q", "-F", "|"] + dsn_base + ["--dbname", admin_db, "-c", "SHOW %s;" % what],
+        env=env,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         universal_newlines=True,
         timeout=30,
     )
+    return _admin_rows(done, what)
+
+
+def _admin_rows(done: "subprocess.CompletedProcess", what: str) -> List[Tuple[str, str]]:
     if done.returncode != 0:
         raise ProbeFault("pgbouncer admin console SHOW %s failed: %s" % (what, done.stderr.strip()))
     rows = []
@@ -146,15 +169,9 @@ def dsn_args(args: argparse.Namespace, dbname: str) -> List[str]:
     return ["--host", args.host, "--port", str(args.port), "--username", args.user, "--dbname", dbname]
 
 
-def run_probe(args: argparse.Namespace) -> int:
-    key = read_lock_key(Path(args.source))
-    config = dict(admin_show(["--host", args.host, "--port", str(args.port), "--username", args.user], args.admin_dbname, "CONFIG"))
-    pool_mode = config.get("pool_mode", "<unreported>")
-    pool_size = config.get("default_pool_size", "<unreported>")
-    print("pooler: %s:%s  pool_mode=%s  default_pool_size=%s" % (args.host, args.port, pool_mode, pool_size))
-    print("lock key: %d (MIGRATION_ADVISORY_LOCK_KEY, %s)" % (key, SOURCE_FILE.relative_to(REPO_ROOT)))
+def concurrent_leg(args: argparse.Namespace, key: int, hazards: List[str]) -> str:
+    """A and B connected at once. Returns "ran" or "blocked"."""
     dsn = dsn_args(args, args.dbname)
-    hazards: List[str] = []
     a = Session("A", dsn, args.wait_secs)
     b: Optional[Session] = None
     try:
@@ -162,42 +179,100 @@ def run_probe(args: argparse.Namespace) -> int:
         got_a = a.query("SELECT pg_try_advisory_lock(%d);" % key)
         a.query("SET search_path = %s, public;" % PATH_MARKER)
         a.query("SET statement_timeout = %d;" % TIMEOUT_MARKER_MS)
-        print("client A: backend pid=%s  pg_try_advisory_lock=%s  (search_path and statement_timeout set)" % (pid_a, got_a))
+        print("concurrent leg - client A: backend pid=%s  pg_try_advisory_lock=%s  (search_path and statement_timeout set)" % (pid_a, got_a))
         if got_a != "t":
             raise ProbeFault("client A did not get the lock on an idle server (got %r)" % got_a)
         b = Session("B", dsn, args.wait_secs)
         pid_b = b.query("SELECT pg_backend_pid();")
         if b.blocked:
-            print("client B: BLOCKED (no server connection while A holds one, waited %.0fs): lock not granted, no state seen" % args.wait_secs)
-        else:
-            got_b = b.query("SELECT pg_try_advisory_lock(%d);" % key)
-            path_b = b.query("SHOW search_path;")
-            stmt_b = b.query("SHOW statement_timeout;")
-            print("client B: backend pid=%s  pg_try_advisory_lock=%s  search_path=%s  statement_timeout=%s" % (pid_b, got_b, path_b, stmt_b))
-            if got_b == "t":
-                hazards.append("LOCK: a second client was also granted the migration advisory lock")
-            if path_b is not None and PATH_MARKER in path_b:
-                hazards.append("PATH: a session search_path set by one client was seen by another")
-            if stmt_b == "%dms" % TIMEOUT_MARKER_MS:
-                hazards.append("TIMEOUT: a session statement_timeout set by one client was seen by another")
-            if pid_a is not None and pid_a == pid_b:
-                print("note: A and B shared server backend pid %s" % pid_a)
-            b.query("SELECT pg_advisory_unlock_all();")
-            b.query("RESET search_path;")
-            b.query("RESET statement_timeout;")
+            print("concurrent leg - client B: BLOCKED (no server connection while A holds one, waited %.0fs): INCONCLUSIVE" % args.wait_secs)
+            return "blocked"
+        got_b = b.query("SELECT pg_try_advisory_lock(%d);" % key)
+        path_b = b.query("SHOW search_path;")
+        stmt_b = b.query("SHOW statement_timeout;")
+        print("concurrent leg - client B: backend pid=%s  pg_try_advisory_lock=%s  search_path=%s  statement_timeout=%s" % (pid_b, got_b, path_b, stmt_b))
+        if got_b == "t":
+            hazards.append("LOCK: a second client was also granted the migration advisory lock")
+        if path_b is not None and PATH_MARKER in path_b:
+            hazards.append("PATH: a session search_path set by one client was seen by another")
+        if stmt_b == "%dms" % TIMEOUT_MARKER_MS:
+            hazards.append("TIMEOUT: a session statement_timeout set by one client was seen by another")
+        if pid_a is not None and pid_a == pid_b:
+            print("note: A and B shared server backend pid %s" % pid_a)
+        b.query("SELECT pg_advisory_unlock_all();")
+        b.query("RESET search_path;")
+        b.query("RESET statement_timeout;")
         a.query("SELECT pg_advisory_unlock_all();")
         a.query("RESET search_path;")
         a.query("RESET statement_timeout;")
+        return "ran"
     finally:
         if b is not None:
             b.close()
         a.close()
+
+
+def reuse_leg(args: argparse.Namespace, hazards: List[str]) -> str:
+    """A dirties a session and disconnects; B must get a clean one. "ran" or "no-reuse"."""
+    dsn = dsn_args(args, args.dbname)
+    for attempt in range(1, REUSE_TRIES + 1):
+        a = Session("A", dsn, args.wait_secs)
+        try:
+            pid_a = a.query("SELECT pg_backend_pid();")
+            a.query("SET search_path = %s, public;" % PATH_MARKER)
+            a.query("SET statement_timeout = %d;" % TIMEOUT_MARKER_MS)
+            a.query("CREATE TEMPORARY TABLE %s (x int);" % TEMP_TABLE)
+            a.query("PREPARE %s AS SELECT 1;" % PREPARED)
+            if a.blocked:
+                return "no-reuse"
+        finally:
+            a.close()
+        b = Session("B", dsn, args.wait_secs)
+        try:
+            pid_b = b.query("SELECT pg_backend_pid();")
+            if b.blocked or pid_b != pid_a:
+                print("reuse leg attempt %d: B landed on pid %s, A had pid %s; retrying" % (attempt, pid_b, pid_a))
+                continue
+            path_b = b.query("SHOW search_path;")
+            stmt_b = b.query("SHOW statement_timeout;")
+            temp_b = b.query("SELECT to_regclass('pg_temp.%s') IS NOT NULL;" % TEMP_TABLE)
+            prep_b = b.query("SELECT count(*) FROM pg_prepared_statements WHERE name = '%s';" % PREPARED)
+            print("reuse leg - client B on A's backend pid=%s: search_path=%s  statement_timeout=%s  temp_table_visible=%s  prepared_visible=%s" % (pid_b, path_b, stmt_b, temp_b, prep_b))
+            if path_b is not None and PATH_MARKER in path_b:
+                hazards.append("REUSE-PATH: a reused backend kept the previous client's search_path")
+            if stmt_b == "%dms" % TIMEOUT_MARKER_MS:
+                hazards.append("REUSE-TIMEOUT: a reused backend kept the previous client's statement_timeout")
+            if temp_b == "t":
+                hazards.append("REUSE-TEMP: a reused backend kept the previous client's temporary table")
+            if prep_b not in (None, "0"):
+                hazards.append("REUSE-PREPARED: a reused backend kept the previous client's prepared statement")
+            return "ran"
+        finally:
+            b.close()
+    return "no-reuse"
+
+
+def run_probe(args: argparse.Namespace) -> int:
+    key = read_lock_key(Path(args.source))
+    admin_base = ["--host", args.host, "--port", str(args.port), "--username", args.admin_user]
+    config = dict(admin_show(admin_base, args.admin_dbname, "CONFIG"))
+    pool_mode = config.get("pool_mode", "<unreported>")
+    pool_size = config.get("default_pool_size", "<unreported>")
+    reset_query = config.get("server_reset_query", "<unreported>")
+    print("pooler: %s:%s  pool_mode=%s  default_pool_size=%s  server_reset_query=%s" % (args.host, args.port, pool_mode, pool_size, reset_query))
+    print("lock key: %d (MIGRATION_ADVISORY_LOCK_KEY, %s)" % (key, SOURCE_FILE.relative_to(REPO_ROOT)))
+    hazards: List[str] = []
+    concurrent = concurrent_leg(args, key, hazards)
+    reuse = reuse_leg(args, hazards)
     if hazards:
         print("RESULT: UNSAFE under pool_mode=%s default_pool_size=%s" % (pool_mode, pool_size))
         for hazard in hazards:
             print("  HAZARD %s" % hazard)
         return EXIT_UNSAFE
-    print("RESULT: SAFE under pool_mode=%s default_pool_size=%s (no hazard observed)" % (pool_mode, pool_size))
+    if concurrent == "blocked" or reuse == "no-reuse":
+        print("RESULT: INCONCLUSIVE under pool_mode=%s default_pool_size=%s (concurrent leg: %s; reuse leg: %s)" % (pool_mode, pool_size, concurrent, reuse))
+        return EXIT_FAULT
+    print("RESULT: SAFE under pool_mode=%s default_pool_size=%s (no hazard observed in the concurrent leg or the reuse leg)" % (pool_mode, pool_size))
     return EXIT_SAFE
 
 
@@ -207,6 +282,7 @@ def main(argv: List[str]) -> int:
     parser.add_argument("--port", type=int, default=6432)
     parser.add_argument("--user", default="ai_memory")
     parser.add_argument("--dbname", default="ai_memory")
+    parser.add_argument("--admin-user", default="pgbouncer_stats", help="stats or admin role for SHOW CONFIG (not the application role)")
     parser.add_argument("--admin-dbname", default="pgbouncer", help="PgBouncer admin console database")
     parser.add_argument("--source", default=str(SOURCE_FILE), help="file holding MIGRATION_ADVISORY_LOCK_KEY")
     parser.add_argument("--wait-secs", type=float, default=6.0, help="how long client B may wait for a server connection")

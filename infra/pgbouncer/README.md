@@ -28,10 +28,11 @@ bounded by the postgres+AGE backbone — see 4.D).
 | File | Purpose |
 |---|---|
 | `pgbouncer.ini` | Pooler config. **`pool_mode = session` is required** (pinned to the guide by `scripts/check-pgbouncer-pool-mode-claims.py`); `max_prepared_statements = 256` (PgBouncer ≥ 1.21). `default_pool_size = 16` covers one daemon at `DEFAULT_MAX_CONNECTIONS = 16`; for N daemons use the sizing rule in guide §5.6.5. |
-| `userlist.txt` | Auth template (md5). Render from your secret store at deploy (mode 0400); never commit a real credential. |
-| `role-defaults.sql` | `ALTER ROLE ai_memory SET statement_timeout = '30s'; SET lock_timeout = '5s';` — role defaults matching the session GUCs ai-memory sets in `after_connect`; the narrowing step in guide §5.6.7 for deployments that ran transaction mode. Values quote `DEFAULT_STATEMENT_TIMEOUT_SECS=30` / `DEFAULT_LOCK_TIMEOUT_SECS=5`. |
-| `docker-compose.yml` | postgres+AGE + pgbouncer, wired (clients → `pgbouncer:6432`). |
-| `smoke-test.sh` | Infra test: proves an AGE cypher transaction + the role-default timeouts work through the pooler and that the pooler reports session mode. |
+| `userlist.txt` | Auth template (SCRAM-SHA-256: the role's `pg_authid` verifier plus the separate `pgbouncer_admin` / `pgbouncer_stats` roles). Render from your secret store at deploy (mode 0600); never commit a real credential. |
+| `role-defaults.sql` | `ALTER ROLE ai_memory SET search_path = public, ag_catalog; SET statement_timeout = '30s'; SET lock_timeout = '5s';` — role defaults matching the session GUCs ai-memory sets in `after_connect`; the narrowing step in guide §5.6.7 for deployments that ran transaction mode. Values quote `DEFAULT_STATEMENT_TIMEOUT_SECS=30` / `DEFAULT_LOCK_TIMEOUT_SECS=5` and the path `normalize_app_search_path` computes. |
+| `docker-compose.yml` | postgres+AGE + pgbouncer, wired (clients → `pgbouncer:6432`, published on `127.0.0.1` only). TLS on both hops; the password and all keys come from `smoke-test.py`. |
+| `docker-compose.host.yml` | Override for hosts where Docker cannot create bridge networks (`--network host`). |
+| `smoke-test.py` | Infra test: proves an AGE cypher transaction + the role-default timeouts work through the pooler, that the pooler reports session mode (`SHOW CONFIG` as the stats role), that both hops are TLS and that the application role cannot use the admin console. |
 
 ## Wire ai-memory at the pooler
 
@@ -54,29 +55,35 @@ AGE cypher path (`LOAD 'age'` + `SET LOCAL search_path` + `cypher()` in one
 transaction) needs. Full results, the daemon run through the pooler and the
 sizing rule: `docs/enterprise-deployment.md` §5.6.
 
-## TLS
+## TLS and authentication
 
 The adapter refuses a store URL that does not pin `sslmode=verify-full`
-(#3705), so a daemon behind this pooler needs the pooler to serve TLS. The
-shipped `pgbouncer.ini` has no TLS block; add `client_tls_sslmode`,
-`client_tls_key_file` and `client_tls_cert_file` (see guide §5.6.3) and give the
-daemon `sslmode=verify-full&sslrootcert=...`.
+(#3705), so the pooler serves TLS to its clients and verifies Postgres in turn:
+the shipped `pgbouncer.ini` sets `client_tls_sslmode = verify-full` (client
+certificates are required) and `server_tls_sslmode = verify-full`, and
+`auth_type = scram-sha-256`. Give the daemon
+`sslmode=verify-full&sslrootcert=...&sslcert=...&sslkey=...` (guide §5.6.3).
+`admin_users` and `stats_users` are separate roles, never the application role.
 
 ## Validate
 
 ```bash
 cd infra/pgbouncer
-POSTGRES_PASSWORD=secret ./smoke-test.sh
+./smoke-test.py                  # add --network host where Docker cannot create bridges
 ```
 
-The smoke test brings the stack up, runs an AGE cypher MERGE+MATCH **through
-the pooler on 6432** in one transaction, confirms the role-default
-`statement_timeout` is visible through the pooler, asserts the pooler reports
-`pool_mode = session`, and tears down. Exit 0 = validated.
+The smoke test generates a throwaway CA, certificates, the SCRAM userlist and a
+random password under `./.smoke/` (git-ignored, removed on exit), brings the
+stack up, runs an AGE cypher MERGE+MATCH **through the pooler on 6432** in one
+transaction, confirms the role-default `statement_timeout`, `lock_timeout` and
+`search_path` are visible through the pooler, reads `pool_mode` with
+`SHOW CONFIG` as the stats role and asserts it is `session`, checks that a
+plaintext client is refused and the pooler-to-Postgres hop is TLS, and tears
+down. Exit 0 = validated. No password appears on any command line.
 
 > **Validation note.** Requires Docker + Docker Compose; the smoke test is not
 > part of the 8-workflow CI gate (it needs a container runtime, like the
-> `infra/lan-parity-test` harness). Run it on a host/CI runner with Docker
+> `infra/lan-parity-test` harness); it needs `psql` and `openssl` on the host too. Run it on a host/CI runner with Docker
 > before adopting the templates. The smoke stack uses the upstream
 > `apache/age` image (validating the pooler needs only the AGE path); a
 > production module backbone also needs **pgvector** for ai-memory's

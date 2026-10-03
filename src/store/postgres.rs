@@ -2716,7 +2716,7 @@ impl PostgresStore {
         // explicitly opted out of the safety envelope.
         //
         // POOLER NOTE (#4667): this session-level `SET`, the `search_path`
-        // set_config above and the migration advisory lock are server-SESSION
+        // set_config in after_connect below and the migration advisory lock are server-SESSION
         // state. They are correct on a direct Postgres connection and behind a
         // PgBouncer in `session` mode. They are NOT safe behind `transaction` or
         // `statement` mode: PgBouncer runs each on whichever server connection

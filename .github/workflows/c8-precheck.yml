@@ -476,14 +476,16 @@ jobs:
         run: bash scripts/check-capacity-claims.sh --self-test
 
   pgbouncer-pool-mode-claim-gate:
-    # #4667 (5-agent vote 4d3ea1c5, decision memory b6ed2e38). docs section 5.6
-    # once called PgBouncer `pool_mode = transaction` REQUIRED while the
-    # Postgres adapter keeps state on the server session (migration advisory
-    # lock, search_path, statement_timeout) and is not safe behind a
-    # transaction pooler (scripts/probe-pgbouncer-pool-mode.py exits 1). The
-    # shipped template infra/pgbouncer/pgbouncer.ini is now the single source
-    # of truth and this gate fails when an operator-facing document claims a
-    # different pool mode. Transaction mode returns with #4679.
+    # #4667 (5-agent vote 4d3ea1c5, decision memory b6ed2e38; gate form = the
+    # allowlist form of the PR 4655 gate vote, memory 19497ef6). The guide once
+    # called PgBouncer `pool_mode = transaction` REQUIRED while the Postgres
+    # adapter keeps state on the server session (migration advisory lock,
+    # search_path, statement_timeout) and is not safe behind that pooler
+    # (scripts/probe-pgbouncer-pool-mode.py exits 1). The gate does not try to
+    # recognise bad wordings. It scans every tracked text file for a line that
+    # mentions a pooler mode; each such line must state session mode or be on
+    # scripts/qc-allowlists/pgbouncer-pool-mode-allow.txt (file plus exact
+    # normalised line). A stale entry, a malformed entry or an empty scan fails.
     name: PgBouncer pool-mode claim gate (#4667)
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -492,12 +494,13 @@ jobs:
       - name: Run pool-mode claim gate
         run: python3 scripts/check-pgbouncer-pool-mode-claims.py
       - name: Self-test the gate (regression evidence)
-        # Plants the #4667 defect (a guide that says transaction while the
-        # template says session) and a flipped template; both MUST fail. Near
-        # misses MUST pass (a not-supported note, an earlier-revision quote, a
-        # frozen tree, a transaction word with no pooler named), and a guide
-        # with no pool_mode line, a template with two active lines and a
-        # non-PgBouncer mode MUST fail closed (exit 2).
+        # Plants 20 different wordings of the retired claim (case, YAML and env
+        # forms, wrapped lines, HTML entities, ini, yml, txt, a per-database
+        # override, a nearby retirement word) and requires each to fail; checks
+        # the near misses pass; mutates the text, the file and the presence of
+        # every real allowlist entry and requires the gate to fail; and checks
+        # the fail-closed cases (missing allowlist, template without exactly
+        # one active session line) exit 2.
         run: python3 scripts/check-pgbouncer-pool-mode-claims.py --self-test
 
   benchmark-claim-gate:

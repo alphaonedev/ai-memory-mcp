@@ -20,11 +20,11 @@
 #     rate crosses SHED_RATE_KNEE. That step's concurrency is X.
 #
 # This harness is DOCKER-GATED (it needs the 4.B container stack), exactly like
-# infra/pgbouncer/smoke-test.sh; it is NOT part of the 8-workflow CI gate. Run
+# infra/pgbouncer/smoke-test.py; it is NOT part of the 8-workflow CI gate. Run
 # it on a Docker-capable host. The local dev socket is permission-denied.
 #
 #   cd infra/pillar4-envelope
-#   POSTGRES_PASSWORD=secret ./measure-envelope.sh
+#   ./measure-envelope.sh
 #
 # Exit 0 = a knee was found and printed (the measured X). Exit non-zero = the
 # stack failed to come up or no knee was reached within CONCURRENCY_STEPS (X is
@@ -35,12 +35,9 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 # ── Tunables (env-overridable) ───────────────────────────────────────────
-PW="${POSTGRES_PASSWORD:-ai_memory_envelope}"
-POOL_COMPOSE="../pgbouncer/docker-compose.yml"
-PROJECT="ai-memory-4d-envelope"
+POOL_SMOKE="../pgbouncer/smoke-test.py"
 DAEMON_PORT="${DAEMON_PORT:-9077}"
 DAEMON_HOST="127.0.0.1"
-POOLED_URL="postgres://ai_memory:${PW}@127.0.0.1:6432/ai_memory"
 # Concurrency ramp. Geometric so the knee is bracketed without 1000 steps.
 CONCURRENCY_STEPS="${CONCURRENCY_STEPS:-8 16 32 64 128 256 512 1024}"
 STEP_DURATION_SECS="${STEP_DURATION_SECS:-20}"
@@ -59,8 +56,8 @@ DAEMON_PID=""
 
 cleanup() {
   [ -n "$DAEMON_PID" ] && kill "$DAEMON_PID" 2>/dev/null || true
-  docker compose -p "$PROJECT" -f "$POOL_COMPOSE" down -v >/dev/null 2>&1 || true
-  rm -f "../pgbouncer/.userlist.generated.txt" "${STORE_URL_FILE:-}"
+  python3 "$POOL_SMOKE" down >/dev/null 2>&1 || true
+  rm -f "${STORE_URL_FILE:-}"
 }
 trap cleanup EXIT
 
@@ -78,10 +75,14 @@ BIN="$(cd ../.. && echo "$PWD/target/release/ai-memory")"
 
 # ── 2. Bring up the 4.B pooled stack ─────────────────────────────────────
 echo "[2/5] bringing up postgres+AGE + pgbouncer (4.B stack) ..."
-# Render the pooler's md5 userlist from the password (same as 4.B smoke-test).
-md5hash="$(printf '%s%s' "$PW" ai_memory | md5sum | cut -d' ' -f1)"
-printf '"ai_memory" "md5%s"\n' "$md5hash" > "../pgbouncer/.userlist.generated.txt"
-POSTGRES_PASSWORD="$PW" docker compose -p "$PROJECT" -f "$POOL_COMPOSE" up -d --wait
+# smoke-test.py generates the throwaway CA, the SCRAM userlist and the random
+# password, brings the stack up (session mode, TLS verify-full on both hops) and
+# writes the daemon's store URL to a 0600 file. The URL carries the password;
+# it is read from that file, never taken from this script's environment.
+STORE_URL_FILE="$RESULTS_DIR/.store-url"
+rm -f "$STORE_URL_FILE"
+python3 "$POOL_SMOKE" up --url-file "$STORE_URL_FILE"
+POOLED_URL="$(cat "$STORE_URL_FILE")"
 
 # ── 3. schema-init + serve THROUGH the pooler ────────────────────────────
 echo "[3/5] schema-init + serve (admission cap=${ADMISSION_CAP}) through pgbouncer:6432 ..."
@@ -89,8 +90,6 @@ echo "[3/5] schema-init + serve (admission cap=${ADMISSION_CAP}) through pgbounc
 # #4577: serve reads the pooled DSN (it carries the db password) from a 0600 file
 # via AI_MEMORY_STORE_URL_FILE, not argv. schema-init above has no non-argv
 # channel (src/cli/schema_init.rs store_url is a required argv String, #4600).
-STORE_URL_FILE="$RESULTS_DIR/.store-url"
-( umask 077; printf '%s\n' "$POOLED_URL" >"$STORE_URL_FILE" )
 AI_MEMORY_STORE_URL_FILE="$STORE_URL_FILE" AI_MEMORY_NO_CONFIG=1 AI_MEMORY_MAX_INFLIGHT_REQUESTS="$ADMISSION_CAP" \
   "$BIN" serve --host "$DAEMON_HOST" --port "$DAEMON_PORT" \
   >"$RESULTS_DIR/daemon.log" 2>&1 &
@@ -126,7 +125,7 @@ worker() {
 try: print(json.load(open(sys.argv[1])).get("id",""))
 except Exception: print("")' "$bodyf" 2>/dev/null || echo "")
     # link prev->cur — exercises the AGE graph write path (the 4.D throughput
-    # bound; PgBouncer fixes fan-in, NOT AGE write concurrency).
+    # bound; the session-mode pooler adds no fan-in and no AGE write concurrency).
     if [ -n "$prev_id" ] && [ -n "$cur_id" ]; then
       t0=$(now_ms)
       code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/links" \

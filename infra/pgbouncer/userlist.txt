@@ -1,11 +1,17 @@
 # ai-memory PgBouncer auth template (v0.8.0 Pillar-4 4.B, #1736).
 #
-# Format: "<user>" "<md5-hash-or-plaintext>"
-# For auth_type=md5 the second field is: 'md5' + md5(password + username).
-# Generate without echoing the password into shell history, e.g.:
-#   PW=...; printf 'md5%s\n' "$(printf '%s%s' "$PW" ai_memory | md5sum | cut -d' ' -f1)"
+# Format: "<user>" "<SCRAM-SHA-256 verifier>" (auth_type = scram-sha-256, #4732).
+# For the application role the verifier is the role's own pg_authid.rolpassword
+# (same salt and iteration count), so PgBouncer can pass the client's SCRAM proof
+# through to Postgres. Copy it without the password ever reaching a command line:
+#   see docs/enterprise-deployment.md section 5.6.4 (the file is created 0600
+#   before it is written, #4735).
+# pgbouncer_admin and pgbouncer_stats exist only in this file; give them
+# verifiers PgBouncer-side, never the application role's.
 #
-# The smoke-test stack (docker-compose.yml) injects this from POSTGRES_PASSWORD;
-# in production, render this file from your secret store (mode 0400) — do NOT
-# commit a real credential. Replace the placeholder below.
-"ai_memory" "md5REPLACE_WITH_MD5_OF_PASSWORD_PLUS_USERNAME"
+# smoke-test.py generates every secret per run under ./.smoke/ (0600) and mounts
+# the result; in production render this file from your secret store (mode 0600)
+# - do NOT commit a real credential. Replace the placeholders below.
+"ai_memory" "SCRAM-SHA-256$4096:REPLACE_SALT$REPLACE_STORED_KEY:REPLACE_SERVER_KEY"
+"pgbouncer_admin" "SCRAM-SHA-256$4096:REPLACE_SALT$REPLACE_STORED_KEY:REPLACE_SERVER_KEY"
+"pgbouncer_stats" "SCRAM-SHA-256$4096:REPLACE_SALT$REPLACE_STORED_KEY:REPLACE_SERVER_KEY"

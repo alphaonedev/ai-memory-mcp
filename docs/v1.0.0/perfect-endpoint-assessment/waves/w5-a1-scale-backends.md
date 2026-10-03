@@ -38,7 +38,7 @@
                             │ federation (/sync/push|since)
                             │ Ed25519 + nonce + peer enrollment
 ┌─ L1 MODULE HUB ───────────▼───────────────────────────────────┐
-│  Postgres + pgvector + AGE · sqlx pool · PgBouncer (txn mode) │
+│  Postgres + pgvector + AGE · sqlx pool · PgBouncer (session)  │
 │  Caps: + TRANSACTIONS + NATIVE_VECTOR                         │
 │  Role: multi-writer fleet store, durable ANN, KG Cypher/CTE   │
 │  Bound: AGE write throughput per backbone — NOT connection fan│
@@ -98,7 +98,7 @@ Not unbounded rows in one connection. Infinity = **N modules × M edges**, each 
 | **G11** | **TTL_NATIVE never advertised** | Both adapters app-sweep expiry — fine for parity, weak for true multi-tenant SaaS hub SLAs |
 | **G12** | **Sqlite TRANSACTIONS bit withheld** | No caller-facing `begin_transaction` on SQLite adapter — multi-op composition only via baked-in atoms |
 
-**What already holds (do not rebuild):** dual-backend SAL; capability honesty (#1670); schema ladder parity → v78; PgBouncer txn-mode templates; hub-spoke + W-of-N federation; enterprise T1–T8 continuum; fail-closed federation auth defaults.
+**What already holds (do not rebuild):** dual-backend SAL; capability honesty (#1670); schema ladder parity → v78; PgBouncer session-mode templates (#4667); hub-spoke + W-of-N federation; enterprise T1–T8 continuum; fail-closed federation auth defaults.
 
 ---
 

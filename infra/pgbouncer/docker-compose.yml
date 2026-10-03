@@ -4,51 +4,67 @@
 # Demonstrates the production wiring: clients (ai-memory) connect to the
 # pooler on 6432; the pooler holds one backend connection per client on the
 # real postgres+AGE backend on 5432 in session mode (#4667: the only supported
-# mode). Used by ./smoke-test.sh to prove an AGE cypher transaction runs
-# through the pooler and that the pooler reports session mode.
+# mode). TLS is required on both hops with certificate verification (#4733).
+# Used by ./smoke-test.py, which generates everything under ./.smoke/ (a
+# throwaway CA, the certificates, the SCRAM userlist and the random password)
+# before it runs `docker compose up`; there is no fixed password (#4734).
+#
+# The pooler port is published on 127.0.0.1 only (#4734). Do not run this
+# stack bare: smoke-test.py exports the variables below.
 #
 # NOTE on the postgres image: this smoke stack uses the upstream apache/age
 # image (postgres + AGE) because validating the POOLER only needs the AGE
-# cypher path. A PRODUCTION module backbone also needs pgvector for ai-memory's
-# `sal-postgres` adapter — build that from infra/lan-parity-test/
-# Dockerfile.pg-age-vector and swap the `postgres.image` below for it.
+# cypher path. The tag is the one the repo's CI already pins for PG16
+# (.github/workflows/ci.yml, apache/age:release_PG16_1.6.0). A PRODUCTION module
+# backbone also needs pgvector for ai-memory's `sal-postgres` adapter — build
+# that from infra/lan-parity-test/Dockerfile.pg-age-vector and swap the
+# `postgres.image` below for it.
 # ─────────────────────────────────────────────────────────────────────────
 
 name: ai-memory-pgbouncer-smoke
 
 services:
   postgres:
-    image: apache/age:PG16_latest
+    image: apache/age:release_PG16_1.6.0
     container_name: ai-memory-pgbouncer-postgres
     environment:
       POSTGRES_USER: ai_memory
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ai_memory_smoke}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?run ./smoke-test.py, it generates the password}
       POSTGRES_DB: ai_memory
+    # Server TLS for the pooler-to-Postgres hop. Postgres refuses a private key
+    # it does not own, so the key is copied to a file owned by `postgres`.
+    command:
+      - sh
+      - -c
+      - >-
+        install -m 0600 -o postgres -g postgres /tls/server.key /var/lib/postgresql/server.key
+        && exec docker-entrypoint.sh postgres
+        -c ssl=on
+        -c ssl_cert_file=/tls/server.crt
+        -c ssl_key_file=/var/lib/postgresql/server.key
+        -c ssl_ca_file=/tls/ca.crt
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ai_memory -d ai_memory"]
       interval: 3s
       timeout: 3s
       retries: 20
-    # Apply the role-default timeouts that PgBouncer's DISCARD ALL would
-    # otherwise strip from the per-session GUCs.
+    # Apply the role defaults (search_path and timeouts) that PgBouncer's
+    # DISCARD ALL would otherwise strip from the per-session GUCs.
     volumes:
       - ./role-defaults.sql:/docker-entrypoint-initdb.d/10-role-defaults.sql:ro
+      - ./.smoke/tls:/tls:ro
 
   pgbouncer:
     image: edoburu/pgbouncer:v1.23.1-p2
     container_name: ai-memory-pgbouncer
+    # Runs as the caller, so the 0600 key and userlist stay owned by one user.
+    user: "${PGB_UID:-70}:${PGB_GID:-70}"
     depends_on:
       postgres:
         condition: service_healthy
     ports:
-      - "6432:6432"
-    # The smoke test renders userlist.txt from POSTGRES_PASSWORD (see
-    # smoke-test.sh) so the committed placeholder never needs a real secret.
+      - "127.0.0.1:${PGB_PORT:-6432}:6432"
     volumes:
       - ./pgbouncer.ini:/etc/pgbouncer/pgbouncer.ini:ro
-      - ./.userlist.generated.txt:/etc/pgbouncer/userlist.txt:ro
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 6432 -U ai_memory -d ai_memory || exit 1"]
-      interval: 3s
-      timeout: 3s
-      retries: 20
+      - ./.smoke/userlist.txt:/etc/pgbouncer/userlist.txt:ro
+      - ./.smoke/tls:/etc/pgbouncer/tls:ro

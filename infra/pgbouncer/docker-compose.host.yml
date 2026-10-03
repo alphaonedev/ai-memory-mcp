@@ -1,0 +1,28 @@
+# Host-network override for ./smoke-test.py --network host, used on a machine
+# where docker cannot create bridge networks. smoke-test.py renders
+# ./.smoke/pgbouncer.host.ini from pgbouncer.ini with only the three
+# host/port values changed, and exports PG_PORT / PGB_PORT.
+services:
+  postgres:
+    network_mode: host
+    command:
+      - sh
+      - -c
+      - >-
+        install -m 0600 -o postgres -g postgres /tls/server.key /var/lib/postgresql/server.key
+        && exec docker-entrypoint.sh postgres
+        -c port=${PG_PORT}
+        -c listen_addresses=127.0.0.1
+        -c ssl=on
+        -c ssl_cert_file=/tls/server.crt
+        -c ssl_key_file=/var/lib/postgresql/server.key
+        -c ssl_ca_file=/tls/ca.crt
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p ${PG_PORT} -U ai_memory -d ai_memory"]
+  pgbouncer:
+    network_mode: host
+    ports: !reset []
+    volumes:
+      - ./.smoke/pgbouncer.host.ini:/etc/pgbouncer/pgbouncer.ini:ro
+      - ./.smoke/userlist.txt:/etc/pgbouncer/userlist.txt:ro
+      - ./.smoke/tls:/etc/pgbouncer/tls:ro
