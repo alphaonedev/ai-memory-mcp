@@ -320,6 +320,8 @@ FROZEN = re.compile(
     r"v1\.0\.0/perfect-endpoint-assessment/)")
 
 docs = ["CLAUDE.md", "README.md", "ROADMAP.md", "PERFORMANCE.md"]
+# #4507: Architecture / Code Style bodies moved out of CLAUDE.md into docs/reference/.
+docs += sorted(glob.glob(os.path.join(root, "docs/reference/*.md")))
 docs += sorted(glob.glob(os.path.join(root, "docs/*.md")))
 for sub in ("security", "compliance", "spec", "integrations", "deploy", "v1.0.0"):
     docs += sorted(glob.glob(os.path.join(root, f"docs/{sub}/**/*.md"), recursive=True))
