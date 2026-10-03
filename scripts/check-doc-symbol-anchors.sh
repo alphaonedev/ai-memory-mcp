@@ -47,6 +47,13 @@
 #            whose symbol equals the module's file stem is a module
 #            citation, which is legitimate).
 #
+# PATH FORMS. Before any rule runs, a `src/<path>.rs` token is
+# normalised (#4699/#4701): any leading ./ and ../ segments are stripped
+# and repeated slashes collapse, so `src/x.rs`, `./src/x.rs`,
+# `.//src/x.rs`, `././src/x.rs`, `../src/x.rs` and `src//x.rs` are one
+# anchor. A token preceded by a letter, digit, dot or slash has an
+# unknown root and is not a `src/` anchor.
+#
 # WHAT IS DELIBERATELY *NOT* A RULE. A bare backticked identifier
 # sharing a line with a `src/` path is NOT checked. Measured against
 # the tree that grammar produces 1,827 hits over 879 distinct tokens —
@@ -227,6 +234,21 @@ MDEOF
         'See `./src/mcp/tools/recall.rs::decorate_memory_many`.'
     anchor_green 4699 "a ./src/ brace list of live symbols" \
         'See `./src/mcp/tools/recall.rs::{RecallTool, decorate_memory_many}`.'
+
+
+    # #4701: repeated slashes and stacked ./ segments normalise to one form.
+    anchor_red 4701 LINE "a .//src/ stale line anchor" 'See `.//src/mcp/tools/recall.rs:9999`.'
+    anchor_red 4701 LINE "a ././src/ stale line anchor" 'See `././src/mcp/tools/recall.rs:9999`.'
+    anchor_red 4701 LINE "a ./../src/ stale line anchor" 'See `./../src/mcp/tools/recall.rs:9999`.'
+    anchor_red 4701 LINE "a src//mcp//tools stale line anchor" 'See `src//mcp//tools/recall.rs:9999`.'
+    anchor_red 4701 LINE "a .//src//mcp stale :00 anchor" 'See `.//src//mcp/tools/recall.rs:00`.'
+    anchor_red 4701 QUAL "a src//mcp symbol anchor to a removed symbol" 'See `src//mcp/tools/recall.rs::no_such`.'
+    anchor_red 4701 PATH "a .//src/ anchor to a missing file" 'See `.//src/handlers.rs`.'
+    anchor_red 4701 BARE_LN "a bare .//src/ line anchor" 'See .//src/mcp/tools/recall.rs:2 here.'
+    anchor_green 4701 "a .//src/ in-range line anchor" 'See `.//src/mcp/tools/recall.rs:1`.'
+    anchor_green 4701 "a src//mcp in-range line anchor" 'See `src//mcp/tools/recall.rs:2`.'
+    anchor_green 4701 "an unknown-root foo./src/ anchor (not a src/ anchor)" 'See `foo./src/mcp/tools/recall.rs:9999`.'
+    anchor_green 4701 "an unknown-root x/./src/ anchor (not a src/ anchor)" 'See `x/./src/mcp/tools/recall.rs:9999`.'
 
     # ---- #4651: a BARE src/x.rs:N line anchor (no backtick) ----------
     # Every form the #4651 census found must FAIL as BARE_LN; the only
@@ -474,16 +496,18 @@ for d in docs:
     if os.path.exists(os.path.join(root, rel)):
         seen_docs.append(rel)
 
-# #4699: every rule below sees ONE canonical form. canon() strips any
-# leading ./ and ../ segments from a `src/<path>.rs` token before the
-# rules run (so PATH, PATHLN, BARE_LN and QUAL need no prefix group of
-# their own). A token preceded by a letter, digit, dot or slash is left
+# #4699/#4701: every rule below sees ONE canonical form. canon() strips
+# any leading ./ and ../ segments (with any run of slashes after each)
+# from a `src/<path>.rs` token and collapses repeated slashes inside it
+# (`.//src/x.rs`, `././src/x.rs`, `src//a//x.rs` -> `src/a/x.rs`) before
+# the rules run, so PATH, PATHLN, BARE_LN and QUAL need no prefix group
+# of their own. A token preceded by a letter, digit, dot or slash is left
 # alone: its root is unknown (`foo./src/x.rs`, `x/./src/x.rs`).
-CANON = re.compile(r"(?<![A-Za-z0-9./])(?:\.{1,2}/)*(src/[A-Za-z0-9_/]+\.rs)")
+CANON = re.compile(r"(?<![A-Za-z0-9./])(?:\.{1,2}/+)*(src/[A-Za-z0-9_/]+\.rs)")
 
 
 def canon(line):
-    return CANON.sub(lambda m: m.group(1), line)
+    return CANON.sub(lambda m: re.sub(r"/+", "/", m.group(1)), line)
 
 
 PATH = re.compile(r"`(src/[A-Za-z0-9_/]+\.rs)`")
