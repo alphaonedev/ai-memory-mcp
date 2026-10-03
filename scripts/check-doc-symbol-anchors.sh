@@ -169,6 +169,22 @@ MDEOF
         echo "FAIL: self-test — out-of-range anchor rejected for the wrong reason" >&2; exit 1; }
     echo "PASS: self-test — a file:line anchor past end-of-file is REJECTED"
 
+    # ---- #4680: a backticked ./src/ anchor is checked like src/ ------
+    write_clean
+    printf '\n\nSee `./src/mcp/tools/recall.rs:9999` for the decorator.\n' >> "$FIX/README.md"
+    [[ "$(run_fixture)" != "0" ]] || {
+        echo "FAIL: self-test #4680 — a ./src/ anchor with a stale line was ACCEPTED" >&2; exit 1; }
+    run_fixture_out | grep -q 'LINE' || {
+        echo "FAIL: self-test #4680 — a ./src/ stale-line anchor rejected for the wrong reason (no LINE)" >&2; exit 1; }
+    echo "PASS: self-test #4680 — a backticked ./src/ anchor with a stale line is REJECTED"
+    write_clean
+    printf '\n\nHandlers live in `./src/handlers.rs`.\n' >> "$FIX/README.md"
+    [[ "$(run_fixture)" != "0" ]] || {
+        echo "FAIL: self-test #4680 — a ./src/ anchor to a missing file was ACCEPTED" >&2; exit 1; }
+    run_fixture_out | grep -q 'PATH' || {
+        echo "FAIL: self-test #4680 — a ./src/ missing-file anchor rejected for the wrong reason (no PATH)" >&2; exit 1; }
+    echo "PASS: self-test #4680 — a backticked ./src/ anchor to a missing file is REJECTED"
+
     # ---- #4651: a BARE src/x.rs:N line anchor (no backtick) ----------
     # Every form the #4651 census found must FAIL as BARE_LN; the only
     # exemption is the label of a commit-pinned permalink (immutable).
@@ -413,8 +429,9 @@ for d in docs:
     if os.path.exists(os.path.join(root, rel)):
         seen_docs.append(rel)
 
-PATH = re.compile(r"`(?:\.\./)*(src/[A-Za-z0-9_/]+\.rs)`")
-PATHLN = re.compile(r"`(?:\.\./)*(src/[A-Za-z0-9_/]+\.rs):(\d+)")
+# #4680: a backticked ./ or ../ prefix is consumed like no prefix.
+PATH = re.compile(r"`(?:\.{1,2}/)*(src/[A-Za-z0-9_/]+\.rs)`")
+PATHLN = re.compile(r"`(?:\.{1,2}/)*(src/[A-Za-z0-9_/]+\.rs):(\d+)")
 # #4651: a BARE `src/x.rs:N` (no leading backtick: plain prose, a link
 # label, HTML text). Not preceded by a backtick (PATHLN owns that form),
 # a path separator, a dot or an alphanumeric, so URL path segments are
