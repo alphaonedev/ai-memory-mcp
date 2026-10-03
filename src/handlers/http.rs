@@ -74,7 +74,7 @@ pub(super) async fn get_with_visibility_retry(
 ///
 /// Gates (ALL must pass):
 ///   - `app.autonomous_hooks` is true. **This is the #2587 fix** — the
-///     doc (CLAUDE.md env #8, `AI_MEMORY_AUTONOMOUS_HOOKS`) always
+///     doc (ARCHITECTURE_REFERENCE.md env #8, `AI_MEMORY_AUTONOMOUS_HOOKS`) always
 ///     claimed `auto_tag` fires "synchronously after every
 ///     `memory_store`" ONLY when this flag is on, mirroring the sibling
 ///     [`maybe_detect_conflicts`]'s identical gate (line ~192 below).

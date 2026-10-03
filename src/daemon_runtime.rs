@@ -4324,7 +4324,7 @@ fn spawn_postgres_fold_loop_if_enabled(
 /// the local sqlite `Db` mutex and call rusqlite free-functions, so on a
 /// `--store-url postgres://…` daemon they ticked against the placeholder sqlite
 /// DB while the pg corpus's expired rows / stale archives / expired leases
-/// accumulated unbounded (the CLAUDE.md "GC runs every 30 minutes; expired
+/// accumulated unbounded (the `docs/reference/ARCHITECTURE_REFERENCE.md` "GC runs every 30 minutes; expired
 /// memories are archived before deletion" contract was silently false on pg).
 /// Only `spawn_postgres_fold_loop_if_enabled` had a pg twin.
 ///
@@ -4623,7 +4623,7 @@ fn spawn_gc_loop_with_shadow_retention_tracked(
             }
             // #1690 — recall_observations retention sweep. The pruner
             // (observations::gc::prune, honouring AI_MEMORY_OBSERVATIONS_TTL_DAYS
-            // — CLAUDE.md env #42) previously had NO production caller, so the
+            // — ARCHITECTURE_REFERENCE.md env #42) previously had NO production caller, so the
             // recall-observation ledger grew unbounded with recall traffic.
             match crate::observations::gc::prune(&lock.0) {
                 Ok(n) if n > 0 => {
@@ -7851,7 +7851,7 @@ pub async fn bootstrap_serve(
     // lease-sweep). The sqlite gc/lease/pending loops above all bind the local
     // sqlite `Db` mutex, so a `--store-url postgres://…` daemon never reaped
     // expired rows / stale archives / expired leases on its pg corpus (the
-    // CLAUDE.md GC contract was silently false on postgres). This drives the
+    // ARCHITECTURE_REFERENCE.md GC contract was silently false on postgres). This drives the
     // existing SAL trait methods on the pg backend at the same GC cadence.
     #[cfg(feature = "sal")]
     {
