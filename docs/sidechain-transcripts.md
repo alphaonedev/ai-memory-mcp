@@ -129,8 +129,8 @@ transcripts).
 
 `memory_replay(memory_id, depth=N)` returns the **union** of
 transcripts reachable by walking `reflects_on` edges from the target
-memory up to `depth` levels (`replay_transcript_union` at
-[`replay_transcript_union`](../src/transcripts/replay.rs)).
+memory up to `depth` levels
+([`replay_transcript_union`](../src/transcripts/replay.rs)).
 `depth=0` reproduces the pre-L2-4 shape (direct link only). The walk
 respects the per-namespace `max_reflection_depth` cap —
 composition cannot bypass.
