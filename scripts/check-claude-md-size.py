@@ -247,6 +247,11 @@ def check_index(visible: list, ref_lines: dict, errors: list) -> None:
             if not 1 <= lo <= hi <= len(ref):
                 errors.append(f"FAIL: index entry cites {where}, outside the {len(ref)}-line reference file")
                 continue
+            # What is compared (R3-11), exactly: the cited reference lines lo..hi inclusive, each stripped of
+            # leading and trailing whitespace ONLY (no case folding, no punctuation or markdown stripping,
+            # no Unicode normalisation), joined by ONE space; the CLAUDE.md quote must be a contiguous
+            # substring of that. So a quote may wrap across the cited lines and ignore their indentation
+            # (CODE_STYLE.md:153-155 is indented two spaces) but every character of it must match.
             span = " ".join(part.strip() for part in ref[lo - 1:hi])
             if match.group(4) not in span:
                 errors.append(f"FAIL: index quote is not verbatim at {where}: {match.group(4)[:100]}")
@@ -572,6 +577,35 @@ def run_cases(base: Path) -> bool:
     text = (root / claude_md).read_text(encoding="utf-8").replace(quote, quote.replace("must never", "may"), 1)
     (root / claude_md).write_text(text, encoding="utf-8")
     ok &= expect(root, "an index quote altered in CLAUDE.md", True, "not verbatim")
+
+    root = fresh()
+    path = root / style
+    text = path.read_text(encoding="utf-8").replace("never be dropped", "never be droppe", 1)
+    path.write_text(text, encoding="utf-8")
+    ok &= expect(root, "an index quote whose reference text differs by one trailing letter", True, "not verbatim")
+
+    root = fresh()
+    path = root / style
+    text = path.read_text(encoding="utf-8").replace(quote, quote.replace("fixture binding", "Fixture binding"), 1)
+    path.write_text(text, encoding="utf-8")
+    ok &= expect(root, "an index quote whose reference text differs only by case", True, "not verbatim")
+
+    # Wrap the LAST CODE_STYLE entry so no later citation shifts by the extra line.
+    last = INDEX_SECTIONS[1][2]
+    quote_last = fixture_quote("CODE_STYLE", last)
+    wrapped = quote_last.replace(f"rule {last} of", f"rule {last}\n    of", 1)
+    root = fresh()
+    path = root / style
+    path.write_text(path.read_text(encoding="utf-8").replace(quote_last, wrapped, 1), encoding="utf-8")
+    text = (root / claude_md).read_text(encoding="utf-8").replace(
+        f"CODE_STYLE.md:{last + 1}`", f"CODE_STYLE.md:{last + 1}-{last + 2}`", 1)
+    (root / claude_md).write_text(text, encoding="utf-8")
+    ok &= expect(root, "a quote wrapped over two indented reference lines, cited as that range", False)
+
+    root = fresh()
+    path = root / style
+    path.write_text(path.read_text(encoding="utf-8").replace(quote_last, wrapped, 1), encoding="utf-8")
+    ok &= expect(root, "the same wrapped quote cited with only its first line", True, "not verbatim")
 
     root = fresh()
     path = root / style
