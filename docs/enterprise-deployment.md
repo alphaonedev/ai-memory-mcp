@@ -177,7 +177,7 @@ protocol design — a length-capped manual `read_until(b'\n')` reader
 (post-#1249 DoS guard, `MCP_MAX_LINE_BYTES`; the pre-#1249 form was
 `for line in stdin.lock().lines()`) in `src/mcp/mod.rs` — so there is
 no concurrent dispatch and no mutex is required. The HTTP daemon uses `Arc<Mutex<Connection>>`
-(`src/handlers/transport.rs:22`) protecting a single SQLite connection;
+(the [`Db`](../src/handlers/transport.rs) alias) protecting a single SQLite connection;
 lock contention is the bottleneck under concurrent HTTP load but at
 T1 scale (1 agent, single-host) the contention is unobservable.
 
@@ -227,11 +227,17 @@ the test-contract shim `VectorIndex::rebuild()`.
 
 Even a singleton should establish per-agent Ed25519 keypairs on the
 first session: `ai-memory identity generate --agent-id "alice@laptop"`.
-The `signed_events` per-row signature column is filled only when the
+The `signed_events` per-row signature column is filled when the
 daemon resolves an `agent_id` with a `*.priv` keypair on disk
-(`load_daemon_signing_key`, `src/main.rs:116-118`); without it, the
-daemon boots with the stderr "continuing unsigned" line and rows get
-blank signatures (the cross-row hash chain is still tamper-evident).
+([`load_daemon_signing_key`](../src/governance/audit.rs)). Since #3354 a
+ledger-writing command generates that key at boot when it is absent
+([`ensure_daemon_signing_key`](../src/governance/audit.rs)) and refuses to
+start ([`unsigned_ledger_refusal`](../src/governance/audit.rs)) when it can
+neither load nor generate one, so a writer never appends an unsigned row.
+A process that is not a ledger writer and has no key prints the one-line
+[`unsigned_ledger_warning`](../src/governance/audit.rs) at boot and its rows
+carry `attest_level=unsigned` (the cross-row hash chain is still
+tamper-evident).
 Graduating to T2/T3 is a no-op if keypairs already exist — you just
 import the peer's public key on the destination side; graduating from
 "no keypair" to "keypair" mid-flight rewrites the audit story.
@@ -354,7 +360,7 @@ host — federation attestation is not in play.
 | Concurrent writers | Effectively 1 (mutex on daemon's `Connection`) |
 | Sustained write throughput (p95 <100 ms) | 15–25 stores/sec |
 | Sustained read throughput | 200–500 recalls/sec |
-| Lock-contention hotspot | `src/handlers/transport.rs:22` `Db = Arc<Mutex<(Connection, …)>>` |
+| Lock-contention hotspot | [`Db`](../src/handlers/transport.rs) `= Arc<Mutex<(Connection, …)>>` |
 
 If you observe sustained write queues longer than 50 ms, graduate to
 T3. The Postgres path removes the mutex bottleneck via MVCC.
@@ -564,8 +570,8 @@ Operator overrides:
 
 The vector-clock merge handles concurrent writes via standard
 CRDT-lite semantics (`src/federation/vector_clock.rs`). The
-`enforce_local_cap_on_derived` function
-(`src/federation/reflection_bookkeeping.rs:200`) is the additional
+[`enforce_local_cap_on_derived`](../src/federation/reflection_bookkeeping.rs)
+function is the additional
 v0.7.0 guard against depth-cap laundering across peers — even if a
 sending peer's `max_reflection_depth` is higher, the receiving peer
 refuses incoming reflections that exceed its **local** cap.
@@ -901,13 +907,13 @@ x-peer-id: <peer-id>
 ```
 
 Receivers verify the signature against the enrolled peer key
-(`src/federation/signing.rs:120 verify_header`) and check the nonce
+([`verify_header`](../src/federation/signing.rs)) and check the nonce
 freshness against a per-peer bounded LRU. Replay of a valid
 `(body, sig)` pair under a stale nonce produces
 `401 x_memory_nonce_replay`.
 
 The signature is bound to the nonce by `body || 0x00 || nonce`
-(`NONCE_DOMAIN_SEP = 0x00` in `src/federation/signing.rs:39`), so a
+([`NONCE_DOMAIN_SEP`](../src/federation/signing.rs)` = 0x00`), so a
 captured signed body cannot be replayed under a fresh nonce without
 the private key.
 
@@ -939,7 +945,8 @@ writes. Three options:
 3. **Move to three DCs.** Three-of-three or three-of-five quorum;
    single-DC failure becomes tolerable.
 
-The `FederationConfig` in `src/federation/peer.rs:30` exposes the
+The [`FederationConfig`](../src/federation/mod.rs) `policy` field
+([`QuorumPolicy`](../src/replication.rs), its `w` member) carries the
 quorum width; the operator chooses it explicitly.
 
 ### 6.5 sync/push and sync/since across DCs
@@ -961,8 +968,8 @@ Federation peers exchange data via two endpoints:
   archive and restore lanes (#1934 / #2447), so data-residency scope is
   enforced in both directions rather than on reads alone.
 
-The catchup loop (`spawn_catchup_loop`,
-`src/federation/receive.rs:35`) drives the periodic pull; default
+The catchup loop ([`spawn_catchup_loop`](../src/federation/receive.rs))
+drives the periodic pull; default
 cadence is operator-set via `FederationConfig`. For T5 deployments:
 60–120 s catchup cadence is the practical sweet-spot (small enough
 that pull-lag is bounded; large enough that the cross-DC bandwidth
@@ -972,7 +979,8 @@ cost stays predictable).
 
 A push to a peer that fails (network error, peer down, peer-side
 refusal) is **durably queued** — it lands in the `federation_push_dlq`
-table (added schema v48; `src/federation/sync.rs:464+`). A
+table (added schema v48; written through
+[`FederationDlqSink`](../src/federation/push_dlq.rs)). A
 
 > ⚠️ **The queued payload can be replayed to the WRONG peer.** The
 > durable DLQ key is a **positional index**: peers are identified as
@@ -996,7 +1004,7 @@ background worker (`replay_federation_push_dlq`) re-attempts the
 push on a fixed cadence; after exhausting the operator-configured
 retry budget the row is quarantined (counted via the
 `ai_memory_federation_push_dlq_quarantined_total` Prometheus counter,
-`src/metrics.rs:310`).
+the `federation_push_dlq_quarantined` field of [`Metrics`](../src/metrics.rs)).
 
 Operator action on a non-zero quarantine counter: inspect the row's
 `last_error`, decide whether to retry (clear `quarantined_at`) or
@@ -1087,7 +1095,7 @@ is where data-residency policy is enforced:
 Namespace globs are the load-bearing primitive — they let the operator
 constrain which regions can pull which rows. A pull of `shared/eu/**`
 from outside `eu-west-1` is refused at the `namespace_allowed` gate
-(`src/federation/peer_attestation.rs:338`), before any row crosses
+([`namespace_allowed`](../src/federation/peer_attestation.rs)), before any row crosses
 the wire.
 
 ### 7.4 GDPR + data-residency callouts
@@ -1168,7 +1176,7 @@ write locally, and accept that cross-region peers see the write
 
 Every region runs its own Prometheus + Grafana + alert manager. The
 `/api/v1/metrics` endpoint exports the standard substrate metrics
-(`src/lib.rs:257`). Region-local dashboards; per-region on-call.
+([`prometheus_metrics`](../src/handlers/transport.rs)). Region-local dashboards; per-region on-call.
 
 Cross-region SLO monitoring lands at a higher layer — typically a
 central monitoring system that scrapes each region's `/metrics` over
@@ -1406,7 +1414,7 @@ For an operator piloting a hive in v0.7.0, the responsible shape is:
 2. **Mesh federation between the three** via the T6 wire shape (signed + nonce + attestation).
 3. **Strict trust gates** — every cross-cluster `PeerScope` row narrows to specific allowed namespaces. No `**` globs cross-cluster.
 4. **Per-cluster signed-events chain** — each cluster verifies independently. No global chain; V-4 is per-host tamper-evidence.
-5. **Per-cluster Prometheus.** The `ai_memory_federation_push_dlq_depth` gauge (`src/metrics.rs:299`) is the load-bearing pilot metric — a non-zero depth means cross-cluster pushes are failing.
+5. **Per-cluster Prometheus.** The `ai_memory_federation_push_dlq_depth` gauge (the `federation_push_dlq_depth` field of [`Metrics`](../src/metrics.rs)) is the load-bearing pilot metric — a non-zero depth means cross-cluster pushes are failing.
 6. **Edge-tier "pull-only" leaves.** Mobile/IoT/browser leaves configured with empty `allowed_sender_agent_ids` on inbound; pull-only via narrow `allowed_namespaces` outbound.
 7. **Manual escalation on hot-key writes.** No distributed lock ships; the Memory `version` column (Gap-1 optimistic concurrency, schema v45) detects conflicts and the operator resolves.
 
@@ -1736,7 +1744,8 @@ Six surfaces, each load-bearing for different ops scenarios:
    the `X-API-Key` requirement so load balancers can scrape without
    credentials.
 2. **`GET /api/v1/metrics`** (and the bare `/metrics` at the community
-   convention path, `src/lib.rs:253-257`) — Prometheus scrape
+   convention path; both routes dispatch to
+   [`prometheus_metrics`](../src/handlers/transport.rs)) — Prometheus scrape
    endpoint. Exports the substrate's metrics
    (`src/metrics.rs`).
 3. **Tracing spans on stderr** — every MCP tool call, every governance
@@ -1849,7 +1858,7 @@ Every restored snapshot must pass `verify-signed-events-chain` before
 production traffic reopens. The chain integrity property is binary
 (`chain_holds: true` or `false`) and the substrate refuses to append
 new rows against a partially-backfilled chain (the COR-9 fix,
-`read_chain_head`, `src/signed_events.rs:207`).
+[`read_chain_head`](../src/signed_events.rs)).
 
 Restore-time chain workflow:
 
@@ -1863,7 +1872,7 @@ Restore-time chain workflow:
 ### 13.4 Federation re-sync after restore
 
 A restored peer in a federation cluster needs to catch up. The
-catchup loop (`spawn_catchup_loop`, `src/federation/receive.rs:35`)
+catchup loop ([`spawn_catchup_loop`](../src/federation/receive.rs))
 handles this automatically — the restored peer's `/sync/since`
 watermark is behind the live peers', and the next pull cycle fills
 in the gap.
@@ -1902,7 +1911,7 @@ for the single-instance baseline.
 - [ ] Every agent has its own Ed25519 keypair (`ai-memory identity generate`); private keys mode 0600 under the canonical key directory.
 - [ ] No keypair shared across agents.
 - [ ] Key rotation playbook documented; old keys preserved under `<id>.key.rotated-<timestamp>` for historical signature verification ([`signed-events-v4.md`](signed-events-v4.html)).
-- [ ] Daemon `agent_id` has a keypair on disk; the stderr "continuing unsigned" line at boot is a T3-graduation blocker (`load_daemon_signing_key`, `src/main.rs:116-118`).
+- [ ] Daemon `agent_id` has a keypair on disk; the boot-time unsigned-ledger warning ([`unsigned_ledger_warning`](../src/governance/audit.rs)) is a T3-graduation blocker, and a ledger-writing command that cannot load or generate the key refuses to start ([`unsigned_ledger_refusal`](../src/governance/audit.rs)).
 
 ### 14.2 Transport — mTLS + API key (T3+)
 
