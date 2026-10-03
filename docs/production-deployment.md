@@ -301,7 +301,10 @@ Fleet rollout pattern (systemd):
 EnvironmentFile=/etc/ai-memory/llm.env
 # NOTE: `serve` does NOT accept a --tier flag — the daemon's tier comes
 # from the `tier` field in config.toml (compiled default: semantic).
-ExecStart=/usr/local/bin/ai-memory serve --store-url postgres://...
+# The DSN (with its password) lives in a 0600 file, not on the argv that any
+# local UID can read from /proc/<pid>/cmdline (src/store_url.rs:137, #4577).
+Environment=AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url
+ExecStart=/usr/local/bin/ai-memory serve
 User=ai-memory
 Group=ai-memory
 ```

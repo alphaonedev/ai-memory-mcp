@@ -98,6 +98,8 @@ ai-memory schema-init \
   --store-url postgres://aimemory:PASSWORD@HOST:5432/aimemory
 ```
 
+`schema-init` has no non-argv channel for its URL (`src/cli/schema_init.rs:111-112`, tracked in [#4600](https://github.com/alphaonedev/ai-memory-mcp/issues/4600)), so the password is visible in `ps` for the seconds this one-shot command runs; run it from a single-user admin host.
+
 Idempotent on rerun. Exit code 0 + the human summary reporting
 `schema_version: 57` is the success signal (pass `--json` for the
 machine-parseable report, which also carries `age_projection_created`
@@ -236,14 +238,18 @@ Once verification passes:
 # (a) Stop the sqlite-backed daemon if it's still running.
 sudo systemctl stop ai-memory   # or your service manager
 
-# (b) Reconfigure for postgres. The daemon takes the URL via the
-#     --store-url FLAG only (the AI_MEMORY_STORE_URL env fallback was
-#     deliberately dropped — commit 1e8ad69b). Recommended: systemd
-#     drop-in that overrides ExecStart:
+# (b) Reconfigure for postgres. The daemon reads the URL from
+#     AI_MEMORY_STORE_URL_FILE (a 0600 file), then AI_MEMORY_STORE_URL,
+#     then the --store-url flag (src/store_url.rs:137); keep the password
+#     off the flag so it never reaches /proc/<pid>/cmdline (#4577).
+#     Create the file without the URL on any command line (tee reads stdin):
+sudo install -m 0600 -o ai-memory -g ai-memory /dev/null /etc/ai-memory/store-url
+sudo -u ai-memory tee /etc/ai-memory/store-url >/dev/null
+#     ...paste postgres://aimemory:PASSWORD@HOST:5432/aimemory, Enter, Ctrl-D.
+#     Then a systemd drop-in names the file:
 sudo systemctl edit ai-memory <<EOF
 [Service]
-ExecStart=
-ExecStart=/usr/local/bin/ai-memory serve --store-url postgres://aimemory:PASSWORD@HOST:5432/aimemory
+Environment=AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url
 EOF
 
 # (c) Start the daemon.
@@ -288,6 +294,8 @@ to v0.7.0's v55 parity:
 ai-memory schema-init \
   --store-url postgres://aimemory:PASSWORD@HOST:5432/aimemory
 ```
+
+`schema-init` has no non-argv channel for its URL (`src/cli/schema_init.rs:111-112`, tracked in [#4600](https://github.com/alphaonedev/ai-memory-mcp/issues/4600)), so the password is visible in `ps` for the seconds this one-shot command runs; run it from a single-user admin host.
 
 Opening the store walks the v15 → v55 deltas idempotently (the
 v34 → v55 layer lands via in-process `migrate_v34()…migrate_v55()`
@@ -354,15 +362,16 @@ installed).
 
 ### Auth secrets in URLs
 
-If you put `aimemory:PASSWORD@…` directly in `--store-url`, the URL
-appears in `ps` output and (on some shells) in `~/.bash_history`.
-Note the daemon does NOT read an `AI_MEMORY_STORE_URL` env var (that
-fallback was deliberately dropped in commit `1e8ad69b`) — `--store-url`
-is a flag-only surface. To keep the password out of `ps` / history,
-reference it indirectly inside the unit, e.g. a systemd
-`EnvironmentFile=` (`chmod 0600`) defining `PGPASS_URL` and
-`ExecStart=… serve --store-url ${PGPASS_URL}`, or use a `.pgpass`-style
-credential and a password-less URL where your postgres setup allows it.
+A password written in `--store-url` appears in `ps` output, in
+`/proc/<pid>/cmdline` (readable by every local UID) and, on some shells, in
+`~/.bash_history`. The daemon resolves its store URL in this order, first hit
+wins: `AI_MEMORY_STORE_URL_FILE`, then `AI_MEMORY_STORE_URL`, then
+`--store-url` (`src/store_url.rs:137`). Use the file: a `0600` file owned by the
+service user whose only content is the URL. A file with any group or world
+permission bit is refused (`src/store_url.rs:87-103`), and a trailing newline is
+trimmed (`src/store_url.rs:116`). With a systemd unit, name the file in the
+unit with `Environment=AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url`
+and leave `--store-url` out of `ExecStart=` ([#4577](https://github.com/alphaonedev/ai-memory-mcp/issues/4577)).
 
 ## References
 

@@ -332,6 +332,8 @@ way to bootstrap a fresh postgres backend:
 ai-memory schema-init --store-url 'postgres://aimemory:changeme-please@localhost:5432/aimemory?sslmode=verify-full&sslrootcert=/etc/ai-memory/pg-ca.crt'
 ```
 
+`schema-init` is one of two verbs with no non-argv channel: it reads its URL only from the required `--store-url` argument (`src/cli/schema_init.rs:111-112`, tracked in [#4600](https://github.com/alphaonedev/ai-memory-mcp/issues/4600)), so the password is visible in `ps` for the seconds this one-shot command runs; run it from a single-user admin host, and start the long-running `serve` through `AI_MEMORY_STORE_URL_FILE` (see [Daemon configuration](#daemon-configuration)).
+
 Since v1.0.0 (#3705, "only encrypted data in transit") every DSN the
 daemon or CLI opens MUST pin `sslmode=verify-full&sslrootcert=<ca>`; a DSN
 without it is refused at the connect funnel before any socket is opened —
@@ -378,21 +380,26 @@ recursive-CTE fallback serves `kg_query`/`kg_timeline`/etc.
 `--store-url` on `serve` is still accepted, but as of v0.9.0 ([#1927](https://github.com/alphaonedev/ai-memory-mcp/issues/1927)) two
 non-argv channels exist and are preferred, since a password on
 `--store-url` is exposed via world-readable `/proc/<pid>/cmdline` and
-`ps auxww` to any local UID. `resolve_store_url()` (`src/daemon_runtime.rs`)
-resolves the store URL in this order, first hit wins:
+`ps auxww` to any local UID. `resolve_store_url()` (`src/store_url.rs:137`)
+resolves the store URL in this order, first hit wins (when more than one is set the others are ignored, with no error):
 
 1. `AI_MEMORY_STORE_URL_FILE` — a `0600` file whose sole contents are the store URL (the most restrictive channel).
 2. `AI_MEMORY_STORE_URL` — the owner-only process environment (`/proc/<pid>/environ` is mode `0400`, strictly better than argv).
 3. the `--store-url` CLI argument (unchanged; a userinfo password on this flag emits a warning pointing at the non-argv alternatives).
 
 ```bash
-# Preferred (v0.9.0+): non-argv channel
-export AI_MEMORY_STORE_URL='postgres://aimemory:PASSWORD@HOST:5432/aimemory?sslmode=verify-full&sslrootcert=/etc/ai-memory/pg-ca.crt'
-ai-memory serve
-
-# Still accepted, but the password is exposed via /proc/<pid>/cmdline and `ps`
-ai-memory serve --store-url 'postgres://aimemory:PASSWORD@HOST:5432/aimemory?sslmode=verify-full&sslrootcert=/etc/ai-memory/pg-ca.crt'
+# Preferred (v0.9.0+): a 0600 file, created without the URL touching a command line
+( umask 077; cat > /etc/ai-memory/store-url )   # paste the URL, then Ctrl-D
+# file content (one line):
+#   postgres://aimemory:PASSWORD@HOST:5432/aimemory?sslmode=verify-full&sslrootcert=/etc/ai-memory/pg-ca.crt
+AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url ai-memory serve
 ```
+
+The file is read once and its surrounding whitespace, including the trailing newline, is trimmed
+(`src/store_url.rs:116`); an empty file is refused (`src/store_url.rs:117-118`). A file with any
+group or world permission bit is refused fail-closed (`src/store_url.rs:87-103`); only the mode is
+checked, not the owner, so make the service user the owner (`chown aimemory:aimemory`, `chmod 0600`).
+`AI_MEMORY_STORE_URL` (the environment channel) is the fallback when a file is not practical.
 
 URL shapes accepted by `--store-url` (and the env/file channels above):
 
@@ -514,12 +521,14 @@ and append the three flags to the `ExecStart=` line:
 
 ```ini
 [Service]
+Environment=AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url
 ExecStart=/usr/local/bin/ai-memory serve \
-    --store-url 'postgres://aimemory:PWD@10.20.0.4:5432/aimemory?sslmode=verify-full&sslrootcert=/etc/ai-memory/pg-ca.crt' \
     --tls-cert /etc/ai-memory/tls/server.pem \
     --tls-key  /etc/ai-memory/tls/server.key \
     --mtls-allowlist /etc/ai-memory/tls/mtls-allowlist.txt
 ```
+
+The store URL is deliberately not in `ExecStart=`: a unit file is normally mode `0644` and the argv of a running service is readable by any local UID, so the DSN password goes in the `0600` file named by `AI_MEMORY_STORE_URL_FILE` ([#4577](https://github.com/alphaonedev/ai-memory-mcp/issues/4577), see [Daemon configuration](#daemon-configuration)).
 
 Reload + restart:
 
