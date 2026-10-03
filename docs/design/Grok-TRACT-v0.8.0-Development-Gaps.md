@@ -1,6 +1,6 @@
 # Grok 3×7 Assessment — ai-memory v0.8.0 Development Gaps
 
-> **Point-in-time record, as of 2026-06-28.** The src/ file:line references in this document describe the source tree on that date. They are a dated record and are not maintained, so they may not match the current code. No commit is named because a sample of the references did not resolve against a single commit.
+> **Point-in-time record, dated 2026-06-28.** The src/ file:line references in this document refer to the source tree as of that date and are not maintained, so they may not match the current code.
 
 **Assessment date:** 2026-06-28  
 **Method:** 21-lens adversarial audit (3 waves × 7 lenses) of `docs/design/TRACT-the-definitive-endpoint-ai-memory.md` against `release/v0.8.0` @ `14a34566`, cross-checked with [main `ROADMAP.md`](https://raw.githubusercontent.com/alphaonedev/ai-memory-mcp/refs/heads/main/ROADMAP.md) and **CodeGraph** structural probes.  

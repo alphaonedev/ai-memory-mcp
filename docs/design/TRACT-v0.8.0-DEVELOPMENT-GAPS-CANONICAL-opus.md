@@ -1,6 +1,6 @@
 # ai-memory v0.8.0 — TRACT Development-Gaps Catalog (Canonical · 32 Gaps)
 
-> **Point-in-time record, as of 2026-06-28.** The src/ file:line references in this document describe the source tree on that date. They are a dated record and are not maintained, so they may not match the current code. No commit is named because a sample of the references did not resolve against a single commit.
+> **Point-in-time record, dated 2026-06-28.** The src/ file:line references in this document refer to the source tree as of that date and are not maintained, so they may not match the current code.
 
 ### The single reconciled gap roadmap — Grok↔Opus adjudicated, CodeGraph-anchored, ROADMAP §5-crosswalked, TRACKED/UNTRACKED-tagged.
 

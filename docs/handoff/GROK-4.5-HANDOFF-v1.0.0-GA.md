@@ -1,6 +1,6 @@
 # ai-memory v1.0.0 GA — Engineering Handoff to Grok 4.5
 
-> **Point-in-time record, as of 2026-08-03.** The src/ file:line references in this document describe the source tree on that date. They are a dated record and are not maintained, so they may not match the current code. No commit is named because a sample of the references did not resolve against a single commit.
+> **Point-in-time record, dated 2026-08-03.** The src/ file:line references in this document refer to the source tree as of that date and are not maintained, so they may not match the current code.
 
 **Prepared by:** Fable 5 (outgoing orchestrator / reviewer / auditor / sole merge approver)
 **Date:** 2026-08-03
