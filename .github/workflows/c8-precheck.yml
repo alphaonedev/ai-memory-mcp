@@ -284,7 +284,9 @@ jobs:
         # anchor, a module link, and CLAUDE.md's deliberate `test ! -f
         # src/handlers.rs` absent-path assertion) that must each PASS,
         # so the rule is proven to fire on the defect and not on its
-        # neighbourhood. Both allowlist directions are exercised, and an
+        # neighbourhood. #4651: a bare un-backticked file:line anchor in
+        # prose, a link label or HTML text (red) versus a commit-pinned
+        # permalink label (green control). Both allowlist directions are exercised, and an
         # empty src/ tree must fail CLOSED rather than green a no-op.
         run: bash scripts/check-doc-symbol-anchors.sh --self-test
 

@@ -22,7 +22,7 @@
 # falsifiable by a reader in one grep, while a wrong ANCHOR sends the
 # reader to the wrong place and then makes them doubt the rest.
 #
-# FOUR RULES, all conservative, all keyed on PATH-QUALIFIED grammar so
+# FIVE RULES, all conservative, all keyed on PATH-QUALIFIED grammar so
 # a bare backticked identifier in prose is never guessed at:
 #
 #   PATH   — a cited `src/<path>.rs` must EXIST. This is what caught the
@@ -37,6 +37,10 @@
 #            Each `::`-separated component is checked, so
 #            `VectorIndex::build_with_capacity` resolves only if both
 #            the type and the method are in that file.
+#   BARE_LN — (#4651) a BARE `src/<path>.rs:<N>` (no backtick: prose, a
+#            link label, HTML text) is a finding unless it labels a
+#            commit-pinned permalink (`/blob/<hex sha>/`, immutable).
+#            Burn-down class: a finding FAILS, like a stale entry.
 #   MDLINK — `[`sym`](../src/path.rs)` must resolve: the file must
 #            exist AND `sym` must be defined in it (or BE it — a link
 #            whose symbol equals the module's file stem is a module
@@ -164,6 +168,38 @@ MDEOF
     run_fixture_out | grep -q 'LINE' || {
         echo "FAIL: self-test — out-of-range anchor rejected for the wrong reason" >&2; exit 1; }
     echo "PASS: self-test — a file:line anchor past end-of-file is REJECTED"
+
+    # ---- #4651: a BARE src/x.rs:N line anchor (no backtick) ----------
+    # Every form the #4651 census found must FAIL as BARE_LN; the only
+    # exemption is the label of a commit-pinned permalink (immutable).
+    pin40="a1403c742f9d590a08b6fd170deec5f50ca8e940"
+    bare_red() {  # <description> <line planted in README.md>
+        write_clean
+        printf '\n\n%s\n' "$2" >> "$FIX/README.md"
+        [[ "$(run_fixture)" != "0" ]] || {
+            echo "FAIL: self-test #4651 — $1 was ACCEPTED (bare line anchor invisible)" >&2; exit 1; }
+        run_fixture_out | grep -q 'BARE_LN' || {
+            echo "FAIL: self-test #4651 — $1 rejected for the wrong reason (no BARE_LN)" >&2; exit 1; }
+        echo "PASS: self-test #4651 red probe — $1 is REJECTED"
+    }
+    bare_red "a bare anchor in plain prose" \
+        'The decorator lives at src/mcp/tools/recall.rs:2 in the tree.'
+    bare_red "a bare anchor in a markdown link label with a branch URL" \
+        '[src/mcp/tools/recall.rs:2](https://github.com/o/r/blob/main/src/mcp/tools/recall.rs#L2)'
+    bare_red "a bare anchor in HTML text" \
+        '<td>src/mcp/tools/recall.rs:2</td>'
+    bare_red "a bare anchor with a relative ../ prefix" \
+        'See ../src/mcp/tools/recall.rs:2 for it.'
+    bare_red "a bare anchor whose permalink pins a branch, not a commit" \
+        '<a href="https://github.com/o/r/blob/release/src/mcp/tools/recall.rs#L2">src/mcp/tools/recall.rs:2</a>'
+    write_clean
+    printf '\n\n[src/mcp/tools/recall.rs:2](https://github.com/o/r/blob/%s/src/mcp/tools/recall.rs#L2)\n' "$pin40" >> "$FIX/README.md"
+    printf '<a href="https://github.com/o/r/blob/%s/src/mcp/tools/recall.rs#L3">src/mcp/tools/recall.rs:3</a>\n' "${pin40:0:9}" >> "$FIX/README.md"
+    printf 'Raw URL path https://github.com/o/r/blob/%s/src/mcp/tools/recall.rs:2 is not a label.\n' "$pin40" >> "$FIX/README.md"
+    [[ "$(run_fixture)" = "0" ]] || {
+        echo "FAIL: self-test #4651 — a commit-pinned permalink label was REJECTED" >&2
+        run_fixture_out | sed 's/^/       /' >&2; exit 1; }
+    echo "PASS: self-test #4651 green control — commit-pinned permalink labels (40-hex and abbreviated) are ACCEPTED"
 
     # ---- a stale migrate_vNN (the #2629 issue title's own example) ---
     write_clean
@@ -362,6 +398,15 @@ for d in docs:
 
 PATH = re.compile(r"`(?:\.\./)*(src/[A-Za-z0-9_/]+\.rs)`")
 PATHLN = re.compile(r"`(?:\.\./)*(src/[A-Za-z0-9_/]+\.rs):(\d+)")
+# #4651: a BARE `src/x.rs:N` (no leading backtick: plain prose, a link
+# label, HTML text). Not preceded by a backtick (PATHLN owns that form),
+# a path character or a word character, so URL path segments are skipped.
+BARE_LN = re.compile(r"(?<![`/\w.])(?:\.\./)*(src/[A-Za-z0-9_/]+\.rs):(\d+)")
+# A bare anchor is exempt ONLY as the label of a link whose target is a
+# commit-pinned permalink (/blob/<7-40 hex>/): immutable, cannot rot.
+PIN_URL = re.compile(r"/blob/[0-9a-f]{7,40}/")
+LABEL_MD = re.compile(r"^[^\]\n]*\]\(([^)\s]*)")
+LABEL_HTML = re.compile(r"^[^<\n]*</a>")
 QUAL = re.compile(
     r"`(?:\.\./)*(src/[A-Za-z0-9_/]+\.rs)::(?:\{([^}]*)\}|([A-Za-z_][A-Za-z0-9_:]*))")
 MDLINK = re.compile(r"\[`([A-Za-z_][A-Za-z0-9_]*)`\]\(([^)]*src/[A-Za-z0-9_/]+\.rs)[^)]*\)")
@@ -382,6 +427,19 @@ ABSENT_ASSERTION = re.compile(
     r"removed in|deleted in|STALE BASE|does not exist|(?:->|\u2192)\s*`?src/",
     re.IGNORECASE,
 )
+
+
+def pinned_label(line, start, end):
+    """True when line[start:end] is the label of a commit-pinned permalink:
+    `[label](URL)` markdown or `<a href="URL">label</a>` HTML (#4651)."""
+    rest = line[end:]
+    md = LABEL_MD.match(rest)
+    if md and line[:start].rfind("[") > line[:start].rfind("]") and PIN_URL.search(md.group(1)):
+        return True
+    if LABEL_HTML.match(rest):
+        href = re.findall(r'href="([^"]*)"', line[:start])
+        return bool(href) and line[:start].rfind("<a ") >= 0 and bool(PIN_URL.search(href[-1]))
+    return False
 
 
 def emit(rule, doc, ln, token, ctx):
@@ -411,6 +469,11 @@ for doc in seen_docs:
                     emit("PATH", doc, ln, f, ctx)
             elif n > line_count[f]:
                 emit("LINE", doc, ln, f"{f}:{n}", ctx)
+
+        for m in BARE_LN.finditer(line):
+            if pinned_label(line, m.start(), m.end()):
+                continue
+            emit("BARE_LN", doc, ln, f"{m.group(1)}:{m.group(2)}", ctx)
 
         for m in QUAL.finditer(line):
             f = m.group(1)
@@ -510,6 +573,7 @@ if [[ -n "$violations" ]]; then
             LINE)  detail="file:line anchor points past end-of-file" ;;
             QUAL)  detail="symbol is not defined in the file it is qualified against" ;;
             MDLINK) detail="markdown symbol link does not resolve in its target file" ;;
+            BARE_LN) detail="bare file:line anchor in a live doc (rots silently); cite path::symbol, or pin a commit permalink" ;;
             LADDER_TIP) detail="claimed ladder tip disagrees with the tip scripts/check-migration-ladder.sh computes (left=cited, right=actual)" ;;
             *)     detail="unresolved anchor" ;;
         esac
