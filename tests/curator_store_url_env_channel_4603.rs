@@ -114,4 +114,12 @@ fn lax_file_channel_fails_closed() {
         !out.status.success(),
         "a group/world-readable URL file must be refused"
     );
+    // Pin the refusal to the channel check itself: without the #4820 hunk the
+    // command still exits non-zero for an unrelated reason (verified by
+    // mutation in the PR 4810 R2 review), so exit status alone is not evidence.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("lax permissions"),
+        "refusal must come from the store-URL file permission check; stderr: {stderr}"
+    );
 }
