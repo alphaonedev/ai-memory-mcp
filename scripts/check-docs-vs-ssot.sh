@@ -2853,6 +2853,10 @@ a v0.8.x DB steps `v40 ->
 v53` on boot.
 | Schema version | _v52_ |
 | Schema version | _v53_ |
+a v0.8.x DB steps **v40** →
+**v52** on boot.
+a v0.8.x DB steps **v40** →
+**v53** on boot.
 R4MD
     cat > "$tmpdir/docs/schema-fixture.html" <<'R4HTML'
 <span class="pill">v52&nbsp;schema</span>
@@ -3021,6 +3025,7 @@ R4HTML
         'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:69 claims "52"' \
         'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:73 claims "52"' \
         'docs/postgres-age-guide.md:76 claims "52"' \
+        'docs/postgres-age-guide.md:79 claims "52"' \
         'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:41 claims "52"' \
         'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:43 claims "52"' \
         'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:45 claims "52"' \
@@ -3051,7 +3056,8 @@ R4HTML
         'docs/postgres-age-guide.md:42 ' 'docs/postgres-age-guide.md:44 ' 'docs/postgres-age-guide.md:46 ' \
         'docs/postgres-age-guide.md:48 ' 'docs/postgres-age-guide.md:50 ' 'docs/postgres-age-guide.md:51 ' \
         'docs/postgres-age-guide.md:52 ' 'docs/postgres-age-guide.md:53 ' \
-        'docs/postgres-age-guide.md:77 '
+        'docs/postgres-age-guide.md:77 ' \
+        'docs/postgres-age-guide.md:81 '
     do grep -qF "$_not" <<<"$r4_out" && { echo "FAIL: self-test #3248 r4 - canonical/history line flagged: $_not" >&2; cd "$REPO_ROOT"; exit 1; }
     done
     grep -qF 'STALE entry' <<<"$r4_out" && { echo "FAIL: self-test #3248 r4 - a ledger entry reported STALE although its line is present" >&2; cd "$REPO_ROOT"; exit 1; }
@@ -3065,6 +3071,7 @@ R4HTML
     echo "PASS: self-test #5337 - join boundaries pinned: a line ending with an OPENING block tag still joins (52 REJECTED), markdown is not tag-aware (a closing tag at the end of a markdown line, or an opening tag at the start of the next, still joins; 52 REJECTED), html literal backticks are not folded (documented bound)"
     echo "PASS: self-test #5340 - a markdown transition in bold or a code span wrapped across a line break (steps **v40 -> / v52**): planted 52 REJECTED, 53 ACCEPTED"
     echo "PASS: self-test #5386 - a bare underscore-emphasis table cell (| Schema version | _v52_ |): planted 52 REJECTED, 53 ACCEPTED; pins the trailing underscore arm of MARKS"
+    echo "PASS: self-test #5387 - a markdown transition with markers on BOTH versions wrapped across a line break (steps **v40** -> / **v52**): planted 52 REJECTED, 53 ACCEPTED; pins the fold of the continuation line"
     echo "PASS: self-test #5261/#5338 - markdown steps anchor wrapped in bold, a code span or underscore emphasis (steps **v40 -> v52**, a backtick span, _v40 -> v52_, __v40 -> v52__): planted 52 REJECTED, 53 ACCEPTED; an identifier with an inner underscore (v4_0) is not rewritten by the fold"
     echo "PASS: self-test #5195 - a claim wrapped across a <br> line or split across table cells is still joined: planted 52 REJECTED, 53 ACCEPTED"
     echo "PASS: self-test #5196 - the look-back bound is pinned both ways: 3 inline tag-only lines join (52 REJECTED), 4 do not"
