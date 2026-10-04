@@ -848,6 +848,8 @@ TAR_EXEC_OPTS = ("-I", "-F", "--use-compress-program", "--to-command", "--checkp
 # tar options that rename members as they are written: the gate finds the binary by its
 # name, so a rename hides it (#5093). GNU tar takes any unambiguous prefix of a long option.
 TAR_RENAME_OPTS = ("--transform", "--xform", "--rename")
+TAR_ENV_HIT = "TAR_OPTIONS set: tar reads options from it, so it can rename members or run a program"
+
 # short tar options that run a program or rename (bsdtar -s), alone or in a cluster
 TAR_EXEC_SHORT = "IFs"
 # find actions that run a command per file: its operands come from the file system (#5093)
@@ -2398,6 +2400,11 @@ def analyse(name: str, text: str, cache: dict):
         for where, stmt, st in stmts:
             for why in companion_hits(tf_render(stmt), st, 0, bins):
                 comp.append("%s: companion rule: %s" % (where, why))
+            if re.search(r"(?<![\w$])TAR_OPTIONS(?!\w)", re.sub(r"[\"'\\]", "", tf_render(stmt))):
+                # GNU tar reads options from TAR_OPTIONS too: a rename or program option
+                # there is invisible to tar_risky, which reads argv (#5093 R11). Quotes and
+                # backslashes are dropped first: export TAR_""OPTIONS=x sets the same name
+                comp.append("%s: companion rule: %s" % (where, TAR_ENV_HIT))
         homes = service_homes(lines)
         trig = [ln for ln in lines if triggered(ln)]
         cache[key] = (lines, hits + comp, entries, trig, homes)
@@ -2821,6 +2828,9 @@ def build_probes() -> list:
         ('ai-memory named by a glob behind taskset, listed (#4837 R12 R4, #5093)', [(dec, '      taskset -c 0 /usr/local/lib/ai-memory/bin/ai-mem* --db /x stats\n' + dec)]),
         ('ai-memory named by a brace behind taskset, listed (#4837 R12 R4, #5093)', [(dec, '      taskset -c 0 /usr/local/lib/ai-memory/bin/ai-{memory,x} --db /x stats\n' + dec)]),
         ('tar --transform with no binary name in sight, listed (#4837 R12 R4, #5093)', [(dec, '      tar -C /usr/local/bin -xf /root/b.tar --transform s/x/aim/\n' + dec)]),
+        ('tar options from a TAR_OPTIONS prefix, listed (#4837 R12 R4, #5093 R11)', [(dec, '      TAR_OPTIONS=--transform=s/x/aim/ tar -C /usr/local/bin -xf /root/b.tar\n' + dec)]),
+        ('tar options from an exported TAR_OPTIONS, listed (#4837 R12 R4, #5093 R11)', [(dec, '      export TAR_OPTIONS=--xform=s/x/aim/\n      tar -C /usr/local/bin -xf /root/b.tar\n' + dec)]),
+        ('tar options from a quote-split exported TAR_OPTIONS, listed (#4837 R12 R4, #5093 R11)', [(dec, '      export TAR_""OPTIONS=--xform=s/x/aim/\n      tar -C /usr/local/bin -xf /root/b.tar\n' + dec)]),
         ('tar abbreviated --transf option, listed (#4837 R12 R4, #5093)', [(dec, '      tar -C /usr/local/bin -xf /root/b.tar --transf=s/x/aim/\n' + dec)]),
         ('tar --rename option, listed (#4837 R12 R4, #5093)', [(dec, '      tar -C /usr/local/bin -xf /root/b.tar --rename=s/x/aim/\n' + dec)]),
         ('tar program option in a short cluster, listed (#4837 R12 R4, #5093)', [(dec, '      tar -xvIsh -f /x.tar\n' + dec)]),
