@@ -474,10 +474,12 @@ impl MemoryStore for SqliteStore {
         //   any mid-failure — `reflect` (src/storage/reflect.rs),
         //   `consolidate` + the bulk-insert / archive+insert paths
         //   (src/storage/mod.rs) as `BEGIN IMMEDIATE … COMMIT`. That is the
-        //   rule for every sqlite write path (`WriteTxn::begin` or
-        //   `TransactionBehavior::Immediate`), with exactly these measured
-        //   exceptions in production code (sweep of src/ at this tree: 98
-        //   transaction-open sites, 39 test-only sites excluded):
+        //   rule for every sqlite write path (`WriteTxn::begin`,
+        //   `TransactionBehavior::Immediate`, or a raw `BEGIN IMMEDIATE`
+        //   as in the delete arm of `sqlite` in src/cli/keys.rs), with
+        //   exactly these measured exceptions in production code (the list
+        //   names functions, not a site count, because no gate keeps a
+        //   count true):
         //   * BEGIN EXCLUSIVE: `migrate` (src/storage/migrations.rs) and the
         //     `lock_exclusive` probe (src/cli/backup.rs).
         //   * DEFERRED (15 functions; atomic, but the write lock is taken at
@@ -496,9 +498,9 @@ impl MemoryStore for SqliteStore {
         //     `run_repair_schema_version` (src/cli/doctor.rs),
         //     `sweep_pending_action_timeouts` (src/storage/doctor.rs) and
         //     `set_embeddings_batch_reembed` (src/storage/mod.rs). Read-only
-        //     snapshots, no write at all: `with_read_snapshot`
-        //     (src/governance/policy_version.rs) and the preview arm of
-        //     `sqlite` (src/cli/keys.rs).
+        //     snapshots, no write at all, which stay DEFERRED:
+        //     `with_read_snapshot` (src/governance/policy_version.rs) and the
+        //     preview arm of `sqlite` (src/cli/keys.rs).
         //   A partial multi-row write can never commit, so the property the
         //   bit names genuinely holds.
         // * TRANSACTIONS ("adapter supports `begin_transaction` for
