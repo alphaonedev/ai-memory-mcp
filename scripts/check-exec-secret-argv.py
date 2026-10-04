@@ -1038,6 +1038,21 @@ def allow_like_vanished_pending(allow: List[Entry], base_allow: List[Entry], bas
     return out
 
 
+def _show_or_absent(root: Path, mb: str, path: str) -> str:
+    """The text of path at the merge base. Empty only when the base proves the path does not exist
+    there; a git failure of any kind (corrupt or missing object, partial clone, permission) is an
+    error, never an empty list: unresolved means red (#5297)."""
+    spec = "%s:%s" % (mb, path)
+    try:
+        return _git(root, "show", spec)
+    except subprocess.CalledProcessError:
+        pass
+    # show failed: it is "absent" only if the base tree has no such path (a failing ls-tree raises)
+    if _git(root, "ls-tree", "--name-only", mb, "--", path).strip():
+        raise RuntimeError("cannot read %s although the merge base lists it (fail closed)" % spec)
+    return ""
+
+
 def in_ci() -> bool:
     """True on a CI runner (GitHub Actions sets both variables)."""
     return (os.environ.get("GITHUB_ACTIONS", "").strip().lower() == "true"
@@ -1064,14 +1079,8 @@ def merge_base_hits(root: Path, allow: List[Entry], pend: Optional[List[Entry]] 
             cols = row.split("\t")
             if len(cols) == 3 and cols[0].startswith("R"):
                 renames[cols[1]] = cols[2]
-        try:
-            old = _git(root, "show", "%s:%s" % (mb, PENDING_FILE))
-        except subprocess.CalledProcessError:
-            old = ""
-        try:
-            old_allow = _git(root, "show", "%s:%s" % (mb, ALLOW_FILE))
-        except subprocess.CalledProcessError:
-            old_allow = ""
+        old = _show_or_absent(root, mb, PENDING_FILE)
+        old_allow = _show_or_absent(root, mb, ALLOW_FILE)
     except subprocess.CalledProcessError as exc:
         raise RuntimeError("cannot resolve the merge base against %s (fail closed): %s" % (ref, exc))
     base_pend = parse_entries(old, "base-pending", False, [])
@@ -1586,6 +1595,29 @@ def _run_wiring_cases(root: Path, t: Path) -> Tuple[List[str], int]:
         rc, out = gate(EXEC_SECRET_ARGV_BASE=base2)
         if rc != 0:
             bad.append("the second merge-base fixture is not green (%d): %s" % (rc, out.strip()[:160]))
+        # the base pending list is unreadable (git show fails): a FAULT, not an empty list (#5297)
+        blob = git("rev-parse", "%s:%s" % (base2, PENDING_FILE)).strip()
+        loose = t / ".git" / "objects" / blob[:2] / blob[2:]
+        if not loose.is_file():
+            bad.append("the unreadable-base case could not find the loose blob (#5297)")
+        else:
+            aside = t / ".git" / "unreadable-blob"
+            loose.rename(aside)
+            try:
+                if gate(EXEC_SECRET_ARGV_BASE=base2)[0] != 2 or \
+                        gate(EXEC_SECRET_ARGV_BASE=base2, GITHUB_ACTIONS="true")[0] != 2:
+                    bad.append("run() passed when the base pending list could not be read (#5297)")
+            finally:
+                aside.rename(loose)
+        # a base without the list files is proven absent, not unreadable: green (#5297)
+        git("rm", "-q", "--", ALLOW_FILE, PENDING_FILE)
+        commit_all("lists absent")
+        git("update-ref", "refs/remotes/origin/self-test-base3", "HEAD")
+        git("checkout", base2, "--", ALLOW_FILE, PENDING_FILE)
+        commit_all("lists back")
+        rc, out = gate(EXEC_SECRET_ARGV_BASE="refs/remotes/origin/self-test-base3")
+        if rc != 0:
+            bad.append("run() refused a base where the list files do not exist (%d): %s" % (rc, out.strip()[:160]))
         from_base2("rename2")
         git("mv", "a.sh", "b.sh")
         git("rm", "-q", "c.sh")
