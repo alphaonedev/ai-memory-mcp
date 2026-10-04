@@ -1,18 +1,15 @@
-# #4667: lines that mention a PgBouncer pool mode without stating session mode, each reviewed.
-# Format: <file> | <normalised line>  (normalised = scripts/check-pgbouncer-pool-mode-claims.py normalise()).
-# Anything not approved and not listed here fails the gate; an entry that no longer matches a line fails it too.
-# Gate form: 5-agent vote 4d3ea1c5 / memory 19497ef6 (the allowlist form of the PR 4655 gate vote). Do not add an entry to silence a real claim;
-# fix the line to say session mode instead.
+# #4667: mention units (a line, a wrapped pair or a paragraph pair) that name a pooler mode and are not an approved
+# bare pool_mode = session assignment; each one reviewed. Format: <file> | <normalised unit> (normalise() in
+# scripts/check-pgbouncer-pool-mode-claims.py), one entry per occurrence. Every entry sits under a reason comment
+# (the comment block above its group); a missing reason, a reason shorter than a sentence or the regen placeholder
+# fails the gate with rc 2 (#4961). A stale entry fails too. Gate form: closed world, fail closed (memories 19497ef6,
+# d517ebcd). Do not add an entry to silence a real claim; fix the line to say session mode instead.
 
 # this gate's own CI job: names the gate, the probe and the modes it rejects
 .github/workflows/c8-precheck.yml | pgbouncer-pool-mode-claim-gate:
 .github/workflows/c8-precheck.yml | # called pgbouncer pool_mode = transaction required while the postgres
-.github/workflows/c8-precheck.yml | # (scripts/probe-pgbouncer-pool-mode.py exits 1). the gate does not try to
-.github/workflows/c8-precheck.yml | # scripts/qc-allowlists/pgbouncer-pool-mode-allow.txt (file plus exact
 .github/workflows/c8-precheck.yml | name: pgbouncer pool-mode claim gate (#4667)
 .github/workflows/c8-precheck.yml | - name: run pool-mode claim gate
-.github/workflows/c8-precheck.yml | run: python3 scripts/check-pgbouncer-pool-mode-claims.py
-.github/workflows/c8-precheck.yml | run: python3 scripts/check-pgbouncer-pool-mode-claims.py --self-test
 
 # roadmap 4.B: states the retired setting to say it is withdrawn and that session mode ships
 ROADMAP.md | > - 4.b ([#1736](https://github.com/alphaonedev/ai-memory-mcp/issues/1736)) — pgbouncer per-module pooler: copy-deployable templates in [infra/pgbouncer/](infra/pgbouncer/) (session-mode pgbouncer.ini with max_prepared_statements = 256, role-defaults.sql, docker-compose.yml, smoke-test.py) + the rationale in docs/enterprise-deployment.md §5.6 (the config-only guidance the directory materializes; the design's "§10.4" placeholder landed as §5.6). the smoke-test.py proves an age cypher transaction + role-default timeouts work through the pooler and that it reports pool_mode = session (#4667: session is the only supported mode; transaction is tracked in [#4679](https://github.com/alphaonedev/ai-memory-mcp/issues/4679)); it is a docker-rig test, deliberately outside the 8-workflow ci gate (like infra/lan-parity-test/).
@@ -28,7 +25,6 @@ changelog.d/4667.fixed.md | pool_mode = transaction, which the postgres adapter 
 changelog.d/4667.fixed.md | probe scripts/probe-pgbouncer-pool-mode.py exits 1 on transaction and
 changelog.d/4667.fixed.md | statement pooling (a second client was granted the migration lock, saw the
 changelog.d/4667.fixed.md | recalculated, and guidance for deployments that already ran transaction mode.
-changelog.d/4667.fixed.md | passes secrets by environment only). scripts/check-pgbouncer-pool-mode-claims.py
 changelog.d/4667.fixed.md | (ci job pgbouncer pool-mode claim gate (#4667), not yet a required context)
 changelog.d/4667.fixed.md | making the adapter safe under transaction pooling is tracked in #4679.
 
@@ -40,8 +36,6 @@ docs/enterprise-deployment.md | > transaction pooling is tracked in
 docs/enterprise-deployment.md | > returns to transaction mode only when the probe in §5.6.6 is green on a
 docs/enterprise-deployment.md | > transaction-mode pooler. decision: 5-agent vote (4d3ea1c5), memory
 docs/enterprise-deployment.md | > transaction through the pooler, over tls on both hops, and asserts the pooler
-docs/enterprise-deployment.md | infra/pgbouncer/pgbouncer.ini by scripts/check-pgbouncer-pool-mode-claims.py
-docs/enterprise-deployment.md | scripts/probe-pgbouncer-pool-mode.py runs two legs through the pooler under
 docs/enterprise-deployment.md | it reads pool_mode, default_pool_size and server_reset_query with
 docs/enterprise-deployment.md | | pool_mode | default_pool_size | result |
 docs/enterprise-deployment.md | | statement | 2 | unsafe [1]: the same seven hazards (backend pid 97). a plain begin is also refused: fatal: transaction blocks not allowed in statement pooling mode. |
@@ -82,7 +76,6 @@ infra/do-hive/README-measurement.md | daemon through a transaction-pooling pgbou
 
 # pgbouncer template README: states which modes are unsupported and why; session mode is stated in the same file
 infra/pgbouncer/README.md | > pool mode (#4667). session is the only supported mode. transaction
-infra/pgbouncer/README.md | > [scripts/probe-pgbouncer-pool-mode.py](../../scripts/probe-pgbouncer-pool-mode.py)
 infra/pgbouncer/README.md | > session. making the adapter safe under transaction pooling is tracked in
 infra/pgbouncer/README.md | > returns to transaction mode only when that probe is green on a
 infra/pgbouncer/README.md | > transaction-mode pooler.
@@ -97,7 +90,6 @@ infra/pgbouncer/README.md | stack up, runs an age cypher merge+match through the
 infra/pgbouncer/pgbouncer.ini | # supported session pool mode it is a connection pass-through (one server
 infra/pgbouncer/pgbouncer.ini | # ── pool_mode = session (#4667). do not set transaction or statement. ──
 infra/pgbouncer/pgbouncer.ini | # statement_timeout / lock_timeout (:2776). under transaction mode a second
-infra/pgbouncer/pgbouncer.ini | # (scripts/probe-pgbouncer-pool-mode.py exits 1: the second client was granted
 infra/pgbouncer/pgbouncer.ini | # under session mode the probe exits 0. statement mode is not supported
 infra/pgbouncer/pgbouncer.ini | # transaction mode returns only when the adapter work in #4679 lands and the
 infra/pgbouncer/pgbouncer.ini | # probe is green on a transaction-mode pooler; scripts/check-pgbouncer-pool-mode-claims.py
@@ -110,7 +102,6 @@ infra/pgbouncer/role-defaults.sql | -- transaction mode, where those per-session
 # #4961 (hand-added by the 4655 merge, now justified): docstring: names the shell predecessor and says its pool-mode read was wrong; recommends no mode
 infra/pgbouncer/smoke-test.py | ported from the earlier smoke-test.sh (#4739: the shell version read the pool mode with an admin command pgbouncer rejects, so it could never pass).
 # #4961 (hand-added by the 4655 merge, now justified): docstring: points at the probe; names no mode to use
-infra/pgbouncer/smoke-test.py | scripts/probe-pgbouncer-pool-mode.py for the executed proof.
 # #4961 (hand-added by the 4655 merge, now justified): progress line: "transaction" is the SQL transaction of the cypher test, not a pool mode
 infra/pgbouncer/smoke-test.py | print("[2/6] age cypher transaction through the pooler ...")
 # #4961 (hand-added by the 4655 merge, now justified): code comment: says statement pool mode refuses a transaction block (why the test needs session mode)
@@ -126,7 +117,6 @@ infra/pgbouncer/smoke-test.py | raise failure("pooler pool_mode is %r, want 'ses
 scripts/probe-pgbouncer-pool-mode.py | """#4667 - executed probe: is a pgbouncer pool_mode safe for the postgres adapter?
 scripts/probe-pgbouncer-pool-mode.py | the postgres adapter keeps state on the server session that a transaction pooler does not preserve:
 scripts/probe-pgbouncer-pool-mode.py | temporary table, no prepared statement). this is what the pooler's
-scripts/probe-pgbouncer-pool-mode.py | pgpassword=... pgadmin_password=... scripts/probe-pgbouncer-pool-mode.py \\
 scripts/probe-pgbouncer-pool-mode.py | pool_mode = config.get("pool_mode", "")
 scripts/probe-pgbouncer-pool-mode.py | print("result: unsafe under pool_mode=%s default_pool_size=%s" % (pool_mode, pool_size))
 scripts/probe-pgbouncer-pool-mode.py | print("result: inconclusive under pool_mode=%s default_pool_size=%s (concurrent leg: %s; reuse leg: %s)" % (pool_mode, pool_size, concurrent, reuse))
@@ -138,7 +128,6 @@ scripts/qc-allowlists/required-contexts-not-required.txt | c8-precheck.yml pgbou
 # adapter comment (#4667): says the session-level state is unsafe behind the retired modes
 src/store/postgres.rs | // pgbouncer in session mode. they are not safe behind transaction or
 src/store/postgres.rs | // statement mode: pgbouncer runs each on whichever server connection
-src/store/postgres.rs | // the migration lock (scripts/probe-pgbouncer-pool-mode.py exits 1 on
 src/store/postgres.rs | // session mode (docs/enterprise-deployment.md §5.6). transaction mode
 src/store/postgres.rs | // green. deployments that already ran transaction mode: §5.6.7 (role-
 
@@ -152,7 +141,6 @@ ROADMAP.md | it is session mode, because the postgres adapter keeps migration-lo
 # #4710 R3 (regen --accept-new, reviewed line by line): changelog of this fix: states session mode is the only supported mode, and describes the gate
 changelog.d/4667.fixed.md | never got a server connection. the guide states session mode (or no pooler), the
 changelog.d/4667.fixed.md | pgbouncer: session mode is the only supported pool mode (#4667). the
-changelog.d/4667.fixed.md | session mode or be on scripts/qc-allowlists/pgbouncer-pool-mode-allow.txt.
 
 # #4710 R3 (regen --accept-new, reviewed line by line): architecture notes: an optional pooler in session mode; the second line is an HTML run-on cell that names "pgbouncer, session mode"
 docs/architectures-t4.html | # primary + streaming replicas, an optional pooler in session mode,
@@ -241,9 +229,81 @@ scripts/probe-pgbouncer-pool-mode.py | server_reset_query provides in session mo
 
 # added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
 # regen tool self-reference: these lines are the tool's own source, naming this gate or its allowlist file; none recommends a non-session mode
-scripts/regen-pgbouncer-pool-mode-allow.py | """rewrite scripts/qc-allowlists/pgbouncer-pool-mode-allow.txt from the tree (#4667, #4741).
-scripts/regen-pgbouncer-pool-mode-allow.py | "# reason required before review - say why each line below may name a non-session mode"]
-scripts/regen-pgbouncer-pool-mode-allow.py | out += ["", "# added by regen-pgbouncer-pool-mode-allow.py --accept-new on %s:" % datetime.date.today().isoformat(),
-scripts/regen-pgbouncer-pool-mode-allow.py | path = root / "scripts" / "check-pgbouncer-pool-mode-claims.py"
-scripts/regen-pgbouncer-pool-mode-allow.py | scripts/regen-pgbouncer-pool-mode-allow.py [--root dir] [--check] [--accept-new] [--drop-stale]
 scripts/regen-pgbouncer-pool-mode-allow.py | spec = importlib.util.spec_from_file_location("pool_mode_gate", str(path))
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# pool statements here means two separate SQL statements on the sqlx connection pool (an upsert race note); no pooler mode is named or advised
+CHANGELOG.md | probe and the on conflict do nothing insert as two independent pool statements, so under read committed two concurrent adds of opposing arcs
+
+# this PR's own changelog fragment: it states session mode is the only supported mode and describes how the gate rejects the other modes
+changelog.d/4667.fixed.md | (plurals, tx/xact, session next to a pool word, a bare mode = key) must be a bare pool_mode = session assignment, optionally with a fixed-vocabulary
+changelog.d/4667.fixed.md | be a bare pool_mode = session assignment, optionally with a fixed-vocabulary
+changelog.d/4667.fixed.md | infra/pgbouncer ships pool_mode = session, scram, server_reset_query =
+changelog.d/4667.fixed.md | lines and paragraph neighbourhood that mentions a pooler mode in any spelling (plurals, tx/xact, session next to a pool word, a bare mode = key) must
+changelog.d/4667.fixed.md | statement pooling (a second client was granted the migration lock, saw the table and prepared statement), exits 0 on session, and exits 2 when a client
+changelog.d/4667.fixed.md | table and prepared statement), exits 0 on session, and exits 2 when a client never got a server connection. the guide states session mode (or no pooler), the
+
+# guide section 5.6 prose and the probe result table: each line states session mode as the only supported mode or records transaction and statement as unsafe
+docs/enterprise-deployment.md | 1. move to session mode and re-size. set pool_mode = session, set
+docs/enterprise-deployment.md | > caveat — prepared statements. pgbouncer.ini ships
+docs/enterprise-deployment.md | > with that line present. in session mode each client keeps its own server > connection, so a client's prepared statements stay on one backend.
+docs/enterprise-deployment.md | server-side pgbouncer pool in pool_mode = session (the only mode
+docs/enterprise-deployment.md | supported today; transaction is not, see §5.6.6 and session-mode pooler does not fan the daemons' connections down: each client
+docs/enterprise-deployment.md | | pool_mode | default_pool_size | result | | transaction | 1 | unsafe [1]: a and b shared backend pid 96; b got pg_try_advisory_lock = t, saw a's search_path and statement_timeout = 7777ms; the reused backend kept a's search_path, statement_timeout, temporary table and prepared statement. |
+docs/enterprise-deployment.md | | statement | 2 | unsafe [1]: the same seven hazards (backend pid 97). a plain begin is also refused: fatal: transaction blocks not allowed in statement pooling mode. | | session | 16 (the shipped template) | safe [0]: separate backends (106, 107); b got pg_try_advisory_lock = f, default search_path, statement_timeout = 30s; on the reused backend b saw no temporary table and no prepared statement. |
+docs/enterprise-deployment.md | | transaction | 1 | unsafe [1]: a and b shared backend pid 96; b got pg_try_advisory_lock = t, saw a's search_path and statement_timeout = 7777ms; the reused backend kept a's search_path, statement_timeout, temporary table and prepared statement. | | statement | 2 | unsafe [1]: the same seven hazards (backend pid 97). a plain begin is also refused: fatal: transaction blocks not allowed in statement pooling mode. |
+
+# an archived review issue row: tx is a SQL transaction inside ensure_memory_graph, not a pooler mode
+docs/reviews/gpt6-astra-20260905-evidence/issues-coverage.csv | 1639,closed,completed,"ensure_memory_graph still ships the pre-#1542 shape: tolerated create_graph error inside the tx, no savepoint — commit is silently rollback on every steady-state connect (benign today by accident)",https://github.com/alphaonedev/ai-memory-mcp/issues/1639,2026-06-11t21:48:10z,f38e8bdd35de1373328339eeb564d5ceebf11ae45e11e9f7bc8f959b6f67a53c,1,f6ff3eda489dc4aa12abfc35f91375eb6a0deb09e0cd4bbc6e0c4aec84cb06fc,root,full-input automated screen; bounded body/closure panel screen; selected threads read fully 1641,closed,completed,"pg update_with_expected_version: governance evaluated on a pre-read snapshot, update on a separate pool statement — toctou window when expected_version=none (unconfirmed — needs live interleaving)",https://github.com/alphaonedev/ai-memory-mcp/issues/1641,2026-06-11t21:48:13z,2968e4580275375694bfd3c93ac4a916091c74a678f66e1a29ddd3d9a98f9853,1,5b9ec9b6593ffffbd22a1356718e54943512231777431c5c878c479b5530a407,security,full-input automated screen; bounded body/closure panel screen; selected threads read fully
+
+# archived v0.7.0 design prompt kept as a historical record; its transaction-mode plan is superseded by guide section 5.6 and tracked in #4679
+docs/v0.7.0/config-driven-pg-pool-prompt.md | > 3. compat caveat 1 — prepared statements (fix #4): pin pgbouncer ≥1.21 and
+docs/v0.7.0/config-driven-pg-pool-prompt.md | > 3. compat caveat 1 — prepared statements (fix #4): pin pgbouncer ≥1.21 and > set max_prepared_statements > 0 so sqlx's named prepared statements (the fix #4
+docs/v0.7.0/config-driven-pg-pool-prompt.md | > ai-memory runs behind a transaction-mode pooler that issues discard all between > transactions (which silently clears the after_connect session sets). evaluate the
+docs/v0.7.0/config-driven-pg-pool-prompt.md | > partially-applied multi-statement graph writes. transaction mode pins the whole > transaction to one backend, which is exactly what age needs.
+docs/v0.7.0/config-driven-pg-pool-prompt.md | > search_path + the cypher() call as multiple statements that must execute on > the same backend within one transaction. statement-mode pooling can route each
+docs/v0.7.0/config-driven-pg-pool-prompt.md | > set max_prepared_statements > 0 so sqlx's named prepared statements (the fix #4 > plan-caching hot path) survive transaction-mode multiplexing. state plainly that
+docs/v0.7.0/config-driven-pg-pool-prompt.md | > statement mode is forbidden and session mode forfeits the fan-in benefit. > search_path + the cypher() call as multiple statements that must execute on
+docs/v0.7.0/config-driven-pg-pool-prompt.md | > statement to a different backend — the cypher() call then lands on a backend > partially-applied multi-statement graph writes. transaction mode pins the whole
+docs/v0.7.0/config-driven-pg-pool-prompt.md | > the same backend within one transaction. statement-mode pooling can route each > statement to a different backend — the cypher() call then lands on a backend
+docs/v0.7.0/config-driven-pg-pool-prompt.md | discard all. the age cypher path is already transaction-mode-safe (every call site does load 'age' + set local search_path inside its own transaction and runs age
+docs/v0.7.0/config-driven-pg-pool-prompt.md | discard all. the age cypher path is already transaction-mode-safe (every call site statements .persistent(false)).
+docs/v0.7.0/config-driven-pg-pool-prompt.md | prepared-statement plan caching, and push statement_timeout / lock_timeout to discard all. the age cypher path is already transaction-mode-safe (every call site
+docs/v0.7.0/config-driven-pg-pool-prompt.md | prepared-statement plan caching, and push statement_timeout / lock_timeout to role defaults (alter role) so they survive pgbouncer's inter-transaction
+docs/v0.7.0/config-driven-pg-pool-prompt.md | role defaults (alter role) so they survive pgbouncer's inter-transaction does load 'age' + set local search_path inside its own transaction and runs age
+
+# an assessment wave note: transactions means the adapter transaction capability bit, and its pgbouncer box says session
+docs/v1.0.0/perfect-endpoint-assessment/waves/w5-a1-scale-backends.md | surfaces: docs/architectural_limits.md, sal (src/store/{mod,sqlite,postgres}.rs), enterprise t1–t8 continuum, federation w-of-n, pgbouncer module backbone. code anchors: memorystore + capabilities bitflags; sqlitestore (fulltext|durable|strong|atomic_multi_write, no native_vector/transactions); postgresstore (transactions|native_vector|fulltext|… + age/pgvector); http serve --store-url; mcp stdio sqlite-only (#1675); hnsw::default_max_entries=100_000; poolconfig (default max 16).
+docs/v1.0.0/perfect-endpoint-assessment/waves/w5-a1-scale-backends.md | | g12 | sqlite transactions bit withheld | no caller-facing begin_transaction on sqlite adapter — multi-op composition only via baked-in atoms | what already holds (do not rebuild): dual-backend sal; capability honesty (#1670); schema ladder parity → v78; pgbouncer session-mode templates (#4667); hub-spoke + w-of-n federation; enterprise t1–t8 continuum; fail-closed federation auth defaults.
+docs/v1.0.0/perfect-endpoint-assessment/waves/w5-a1-scale-backends.md | │ postgres + pgvector + age · sqlx pool · pgbouncer (session) │ │ caps: + transactions + native_vector │
+
+# the pgbouncer bundle README: each line states session mode as required and explains why transaction and statement modes are unsafe
+infra/pgbouncer/README.md | ## why pool_mode = session
+infra/pgbouncer/README.md | (transaction, statement), the probe observes all three crossing between (fatal: transaction blocks not allowed in statement pooling mode), which the
+infra/pgbouncer/README.md | (transaction, statement), the probe observes all three crossing between clients. statement mode also refuses a transaction block
+infra/pgbouncer/README.md | > pool mode (#4667). session is the only supported mode. transaction > and statement are not supported today: the postgres adapter keeps state on
+infra/pgbouncer/README.md | transaction, confirms the role-default statement_timeout, lock_timeout and that the daemon's pool runs in session mode in show pools and that no
+infra/pgbouncer/README.md | | pgbouncer.ini | pooler config. pool_mode = session is required (pinned to the guide by scripts/check-pgbouncer-pool-mode-claims.py); max_prepared_statements = 256 (pgbouncer ≥ 1.21). default_pool_size = 16 covers one daemon at default_max_connections = 16; for n daemons use the sizing rule in guide §5.6.5. |
+
+# template comments around the pinned pool_mode = session line: they explain why transaction and statement modes are not supported
+infra/pgbouncer/pgbouncer.ini | # either: it cannot hold the multi-statement transactions the adapter issues. # probe is green on a transaction-mode pooler; scripts/check-pgbouncer-pool-mode-claims.py
+infra/pgbouncer/pgbouncer.ini | # either: it cannot hold the multi-statement transactions the adapter issues. # transaction mode returns only when the adapter work in #4679 lands and the
+infra/pgbouncer/pgbouncer.ini | # line present). it is kept as shipped; in session mode every client owns its # server connection, so the daemon's prepared statements stay on one backend.
+infra/pgbouncer/pgbouncer.ini | # pins the documented mode to this line. pool_mode = session
+infra/pgbouncer/pgbouncer.ini | # under session mode the probe exits 0. statement mode is not supported # either: it cannot hold the multi-statement transactions the adapter issues.
+infra/pgbouncer/pgbouncer.ini | # ── prepared statements. ───────────────────────────────────────────────── # line present). it is kept as shipped; in session mode every client owns its
+infra/pgbouncer/pgbouncer.ini | # ── prepared statements. ───────────────────────────────────────────────── # requires pgbouncer >= 1.21 (the proof in #4667 ran pgbouncer 1.23.1 with this
+infra/pgbouncer/pgbouncer.ini | pool_mode = session # the next client only after pgbouncer resets it; the reset is what stops one
+
+# the smoke test docstring: it asserts the pooler reports pool_mode = session, which is the supported mode
+infra/pgbouncer/smoke-test.py | 3. the pooler reports pool_mode = session, read with show config as the
+
+# the executed probe docstring: it explains that the adapter session state is unsafe under transaction and statement pooling
+scripts/probe-pgbouncer-pool-mode.py | """#4667 - executed probe: is a pgbouncer pool_mode safe for the postgres adapter? the postgres adapter keeps state on the server session that a transaction
+
+# pool statements here means two separate SQL statements on the sqlx connection pool (an upsert race note); no pooler mode is named or advised
+src/store/postgres.rs | /// insert as two independent pool statements: under read committed two
+
+# pool statements here means two separate SQL statements on the sqlx connection pool (an upsert race note); no pooler mode is named or advised
+tests/pg_parity_batch_2.rs | //! probe and the insert as two independent pool statements, so concurrent
+tests/pg_parity_batch_2.rs | /// independent pool statements, so under read committed both probes could see a

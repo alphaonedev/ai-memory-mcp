@@ -9,8 +9,12 @@ The allowlist is a review surface, so this tool never changes it silently:
   * a stale entry (fewer matching mentions than entries) is removed only with
     --drop-stale, and each removal is printed;
   * a mention that is neither approved nor listed is added only with
-    --accept-new, appended at the end under a dated comment that names the
-    reason as still to be written, and each addition is printed.
+    --accept-new, appended at the end under a dated comment and each
+    addition is printed. The reason comment above the new entries is the text
+    given with --reason (checked by the gate: a sentence of at least six words,
+    not the placeholder); without --reason it is the placeholder, which the gate
+    rejects with rc 2, so this tool cannot turn a red line green on its own
+    (#4961). Replace the placeholder with a real reason per entry group.
 
 Without those flags the tool prints what it would change and exits 1, leaving
 the file untouched. With --check it never writes. Exit codes: 0 the file already
@@ -18,7 +22,7 @@ matches the tree (or was rewritten as asked), 1 changes are pending and were
 refused, 2 fault.
 
 Usage:
-    scripts/regen-pgbouncer-pool-mode-allow.py [--root DIR] [--check] [--accept-new] [--drop-stale]
+    scripts/regen-pgbouncer-pool-mode-allow.py [--root DIR] [--check] [--accept-new [--reason TEXT]] [--drop-stale]
 """
 import argparse
 import datetime
@@ -44,9 +48,16 @@ def main(argv):
     ap.add_argument("--check", action="store_true", help="report only; never write")
     ap.add_argument("--accept-new", action="store_true", help="append unlisted mentions (printed) for review")
     ap.add_argument("--drop-stale", action="store_true", help="remove stale entries (printed)")
+    ap.add_argument("--reason", default="", help="the written reason for every line --accept-new adds")
     a = ap.parse_args(argv)
     root = Path(a.root).resolve()
     gate = load_gate(root)
+    reason = " ".join(a.reason.split())
+    if reason:
+        problem = gate.reason_problem(reason)
+        if problem:
+            print("regen: FAULT: --reason is not a reason: %s" % problem, file=sys.stderr)
+            return 2
     allow_path = root / gate.ALLOW_REL
     try:
         raw = allow_path.read_text(encoding="utf-8")
@@ -90,7 +101,7 @@ def main(argv):
         out.append(line)
     if new:
         out += ["", "# added by regen-pgbouncer-pool-mode-allow.py --accept-new on %s:" % datetime.date.today().isoformat(),
-                "# REASON REQUIRED before review - say why each line below may name a non-session mode"]
+                "# " + (reason or gate.PLACEHOLDER + " before review: say why each line below is safe")]
         for (rel, text), n in sorted(new.items()):
             out += ["%s%s%s" % (rel, gate.SEPARATOR, text)] * n
     tmp = allow_path.with_name(allow_path.name + ".regen")

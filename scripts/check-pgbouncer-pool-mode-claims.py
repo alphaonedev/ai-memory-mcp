@@ -11,51 +11,71 @@ not safe behind a transaction or statement pooler
 drifted from the adapter and nothing noticed.
 
 Threat model. Honest drift: a tired author, a copy of an old paragraph, a
-rewording. This gate is not a defence against an adversary who writes a
-sentence the patterns do not know; it removes the failure of a RECOGNISED bad
-wording slipping past a list of recognised bad wordings.
+rewording. The gate does not try to recognise bad wordings; three review rounds
+of PR 4710 each found a wording a list did not name (#4741, #4950, #4960).
 
-Form (same as the PR 4655 cloud-init gate, memory 19497ef6): the gate does not
-recognise bad wordings. It finds every line that MENTIONS a pooler mode and
-requires each one to either state session mode in an approved form or be listed
-on the allowlist (scripts/qc-allowlists/pgbouncer-pool-mode-allow.txt).
+Form: a closed world that fails closed (precedent: the PR 4655 cloud-init gate,
+memories 19497ef6 and d517ebcd; copying that precedent, so no new vote). The
+gate finds every line that MENTIONS a pooler mode, and a mention passes only if
+it has one of a small set of APPROVED SHAPES or an ALLOWLIST entry with a
+written reason. No list of bad or negating words decides anything.
 
   Scan      every tracked text file (git ls-files; a directory walk when the
-            root is not a git checkout), not only .md and .html. A line is
-            HTML-unescaped, stripped of tags, backticks and asterisks,
-            whitespace-normalised and case-folded first. Two adjacent lines are
-            also joined, so a mention wrapped across a line break is seen, and so
-            is a mode word on the line after an approved line (#4950).
-  Mention   `pool_mode` in any spelling (pool_mode, pool-mode, pool mode,
-            POOL_MODE, PGBOUNCER_POOL_MODE, YAML `pool_mode:`, per-database
-            `pool_mode=` overrides, and `pooling mode` in the same spellings), a bare `mode =` / `mode:` key set to a
-            non-session mode, a mode word (transaction, transactional,
-            statement, txn) anywhere on the same line as a pooler product
-            (pgbouncer, pooler, odyssey, supavisor, pgcat), or within sixty
-            characters, either order, of pooling or multiplex (#4951), or multiplex within forty characters before
-            transactions / statements. A bare `pool` is not a pooler word:
-            sqlx and r2d2 connection pools are not PgBouncer modes. Session
-            mode / session pooling prose is a mention as well.
-  Approved  the line carries a `pool_mode` assignment, every assignment on it is
-            `session`, it names no other mode and it holds no negation or hazard
-            word (never, not, no, avoid, unsafe, don't, instead, without,
-            deprecated, forbidden, retired). Prose that merely says `session
-            mode` is NOT approved (#4741 round 2: an inversion such as "session
-            mode is unsafe" read as approval); such a line goes on the allowlist,
-            where a reviewer reads it. There is no proximity exemption.
-  Allowlist `<file> | <normalised line>`, one entry per occurrence: a text that
-            occurs twice in a file needs two entries. A stale entry (fewer such
-            mentions in that file than entries), a malformed entry and an empty
-            scan fail. scripts/regen-pgbouncer-pool-mode-allow.py rewrites the
-            file without reordering; it refuses additions and removals unless
-            asked (--accept-new / --drop-stale) and prints each one.
+            root is not a git checkout). A line is HTML-unescaped, stripped of
+            tags, backticks and asterisks, whitespace-normalised and case-folded.
+  Mention   (wide; R-rules, each pinned by a self-test mutant)
+            R1 name: `pool_mode` in any spelling and plural (pool mode, pool-mode,
+               pooling mode, POOL_MODE, PGBOUNCER_POOL_MODE, `pool_modes`).
+            R2 prose: a mode word (transaction(s), transactional, statement(s),
+               txn, tx, xact) next to a pool word (mode(s), pool(s), pooling,
+               pooler), a pool word followed by a mode word, a mode word within
+               sixty characters of a pooler word, a mode word anywhere on a line
+               that names a pooler product (pgbouncer, pooler, odyssey,
+               supavisor, pgcat), multiplexed transactions/statements, session
+               next to a pool word, and a bare `mode =` / `mode:` key set to a
+               mode word.
+            R3 path tokens: a file path or file name (`a/b`, `x.py`) is reduced
+               to the product and mode words it contains before R1/R2 run, so
+               naming scripts/check-pgbouncer-pool-mode-claims.py is not a
+               mention, while `pgbouncer.ini ... transaction` still is.
+            R4 wrap: two adjacent lines that only mention when joined.
+            R5 paragraph: a line that names a mode word within the two nearest
+               non-blank lines (blank lines skipped) of a mention line is joined
+               with it and judged as one unit.
+            R6 approved-line context: each of the two nearest non-blank lines on
+               either side of an approved line must itself be a mention (judged
+               on its own) or a NEUTRAL line: a code fence, a config section
+               header, or a short config `key = value` line with no mode word.
+               Anything else (prose, a prose comment) is joined with the
+               approved line and judged as one unit, so `pool_mode = session`
+               followed by "is unsafe" is not approved.
+  Approved  (closed set, matched against the WHOLE normalised line)
+            A1 an assignment: an optional list/quote prefix, a pool-mode key in
+               any spelling, `=` or `:`, the value `session` (optionally quoted),
+               nothing else.
+            A2 the same assignment followed by a `;` / `#` comment whose words
+               all come from a closed vocabulary (supported, required, only,
+               the, is, mode, session, default, pinned, see, and #NNNN / section
+               numbers).
+            Prose is never approved: no shape tells "set pool_mode = session"
+            from "stop using pool_mode = session" (#4960).
+  Allowlist `<file> | <normalised unit>`, one entry per occurrence, every entry
+            under a reason comment: the comment block directly above it, or the
+            reason of the entry directly above it. A reason that is empty, is
+            the regen placeholder (`REASON REQUIRED`), or is shorter than six
+            words / thirty characters is a FAULT (rc 2), and so is any comment
+            line that still holds the placeholder. A stale entry, a malformed
+            entry and an empty scan fail. scripts/regen-pgbouncer-pool-mode-allow.py
+            rewrites the file without reordering and cannot make a red line
+            green on its own: --accept-new writes the placeholder unless
+            --reason gives a real one.
 
 Also: infra/pgbouncer/pgbouncer.ini holds exactly one active global
 `pool_mode = session`, and docs/enterprise-deployment.md holds at least one
-approved `pool_mode = session` line (the pin has something to compare).
+approved assignment line (the pin has something to compare).
 
 Exit codes: 0 clean, 1 a mention is neither approved nor allowlisted, 2 usage /
-fault / stale or malformed allowlist / empty scan / self-test failure.
+fault / stale, malformed or unreasoned allowlist / empty scan / self-test failure.
 
 Usage:
     scripts/check-pgbouncer-pool-mode-claims.py [--root DIR]
@@ -72,7 +92,7 @@ import sys
 import tempfile
 from pathlib import Path
 from collections import Counter
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 INI_REL = Path("infra") / "pgbouncer" / "pgbouncer.ini"
@@ -82,55 +102,114 @@ SELF_REL = Path("scripts") / "check-pgbouncer-pool-mode-claims.py"
 SEPARATOR = " | "
 EXIT_OK, EXIT_FINDING, EXIT_FAULT = 0, 1, 2
 
+# ------------------------------------------------------------ mention (wide)
+
 POOL_MODE = r"pool(?:ing)?[\s_-]*mode"
-MENTION_NAME = re.compile(POOL_MODE)
-_MODE_WORD = r"(?:transaction(?:al)?|statement|txn)"
+MENTION_NAME = re.compile(POOL_MODE + r"s?")  # R1
+_MODE_WORD = r"(?:transaction(?:s|al)?|statements?|txn|tx|xact)"
+_ANY_MODE = r"(?:%s|sessions?)" % _MODE_WORD
 _POOLER = r"(?:pgbouncer|pooler|pooling|odyssey|supavisor|pgcat|multiplex(?:es|ed|ing)?)"
 _PRODUCT = r"(?:pgbouncer|pooler|odyssey|supavisor|pgcat)"
-MENTION_PROSE = re.compile(
-    # transaction mode / transaction pooling / transaction-level pooling / statement pool
-    r"\b%s[\s-]+(?:level[\s-]+|mode[\s-]+)?(?:mode|pooling|pooler|pool)\b"
-    # pooler in transaction mode / pool: transaction / pooling = txn
-    r"|\b(?:pooling|pooler|pgbouncer|odyssey|pool)[\s:=-]+(?:(?:in|to|with|using|at|of|is|=)\s+)?%s\b"
+MENTION_PROSE = re.compile(  # R2
+    # transaction mode / transaction pooling / transaction-level pooling / statement pools / session mode
+    r"\b%s[\s-]+(?:level[\s-]+|mode[\s-]+|scoped[\s-]+)?(?:modes?|pooling|pooler|pools?)\b"
+    # pooler in transaction mode / pool: transaction / pooling = txn / pgbouncer in session
+    r"|\b(?:pooling|pooler|pgbouncer|odyssey|pools?)[\s:=-]+(?:(?:in|to|with|using|at|of|is|per|=)\s+)?%s\b"
     # a pooler word within sixty characters of a mode word, either order
     r"|\b%s\b.{0,60}?\b%s\b|\b%s\b.{0,60}?\b%s\b"
     # a pooler product (pgbouncer, pooler, odyssey, ...) anywhere on the same line as a mode word, either order
     r"|\b%s\b.*?\b%s\b|\b%s\b.*?\b%s\b"
-    # a pooler that multiplexes transactions / statements
-    r"|\bmultiplex(?:es|ed|ing)?\b.{0,40}?\b(?:transactions|statements)\b"
-    # session-mode prose is a mention too, so an inversion ("session mode is unsafe") is scanned
-    r"|\bsession[\s-]+(?:mode|pooling|pooler)\b"
     # a bare mode key (supavisor / pgcat / odyssey configs): mode = transaction, mode: statement
     r"|\bmode\s*[:=]\s*[\"']?%s\b"
-    % (_MODE_WORD, _MODE_WORD, _POOLER, _MODE_WORD, _MODE_WORD, _POOLER,
+    % (_ANY_MODE, _ANY_MODE, _POOLER, _MODE_WORD, _MODE_WORD, _POOLER,
        _PRODUCT, _MODE_WORD, _MODE_WORD, _PRODUCT, _MODE_WORD)
 )
-ASSIGNMENT = re.compile(POOL_MODE + r"\s*(?:[=:]|\bis\b)?\s*[\"']?([a-z]+)")
 OTHER_MODE = re.compile(r"\b%s\b" % _MODE_WORD)
-NEGATION = re.compile(r"\b(?:never|not|no|avoid|unsafe|don'?t|instead|without|deprecated|forbidden|retired)\b")
+_QUICK = re.compile(r"mode|pool|pgbouncer|odyssey|supavisor|pgcat|multiplex")
+# R3: a file path (has a slash) or a file name (has a known extension).
+TOOL_PATH = re.compile(
+    r"[\w.~+-]*(?:/[\w.~+#%-]*)+"
+    r"|\b[\w-]+(?:\.[\w-]+)*\.(?:py|txt|md|ini|sh|rs|toml|ya?ml|json|sql|conf|cfg|html?|tf|env|log)\b")
+_PATH_KEEP = re.compile(r"pgbouncer|pooler|odyssey|supavisor|pgcat|transaction(?:s|al)?|statements?|sessions?|txn|xact|\btx\b")
+
 TAG = re.compile(r"<[^>]*>")
 INI_ACTIVE = re.compile(r"^\s*pool_mode\s*=\s*([A-Za-z]+)\s*(?:[;#].*)?$")
 MAX_BYTES = 4 * 1024 * 1024
+NEIGHBOURS = 2  # non-blank lines inspected on each side (R5, R6)
+
+# ------------------------------------------------------- approved (closed set)
+
+_PREFIX = r"(?:[-*>]\s*)*"
+_KEY = r"[\"']?(?:[a-z0-9_]*_)?pool(?:ing)?[_-]?mode[\"']?"
+_SESSION = r"[\"']?session[\"']?,?"
+_VOCAB = r"(?:supported|required|only|the|is|mode|session|default|pinned|see|#\d+|\(#\d+\)|§?\d+(?:\.\d+)*)"
+_COMMENT = r"\s*[;#]\s*%s(?:[\s,.]+%s)*[\s,.]*" % (_VOCAB, _VOCAB)
+APPROVED_SHAPES = (
+    ("A1 assignment", re.compile(r"^%s%s\s*[=:]\s*%s$" % (_PREFIX, _KEY, _SESSION))),
+    ("A2 assignment with a closed-vocabulary comment", re.compile(r"^%s%s\s*[=:]\s*%s%s$" % (_PREFIX, _KEY, _SESSION, _COMMENT))),
+)
+# Neutral context lines for R6 (closed set).
+FENCE = re.compile(r"^(?:```|~~~)[A-Za-z0-9_+-]*$")
+_TOKEN = r"[^\s;#]+"
+_KV_TOKEN = r"[a-z_][a-z0-9_.-]*=[^\s;#]*"  # host=pg, port=5432: no prose has this shape
+NEUTRAL_SHAPES = (
+    FENCE,                                                                  # code fence
+    re.compile(r"^\[[a-z0-9_.* -]+\]$"),                                    # config section header
+    re.compile(r"^%s[a-z_][a-z0-9_.]*\s*=\s*(?:%s(?:\s+%s)?)?(?:%s)?$" % (_PREFIX, _TOKEN, _TOKEN, _COMMENT)),
+    re.compile(r"^[a-z_][a-z0-9_.]*\s*=\s*(?:%s\s*)+$" % _KV_TOKEN),         # a [databases] line: name = k=v k=v
+    re.compile(r"^%s[a-z0-9]*[_.][a-z0-9_.]*\s*:\s*(?:%s(?:\s+%s)?)?(?:%s)?$" % (_PREFIX, _TOKEN, _TOKEN, _COMMENT)),
+)
+
+# ------------------------------------------------------------------ reasons
+
+PLACEHOLDER = "REASON REQUIRED"
+REGEN_HEADER = "added by regen-pgbouncer-pool-mode-allow.py"
+MIN_REASON_WORDS, MIN_REASON_CHARS = 6, 30
 
 Unit = Tuple[str, int, str]  # (relative path, line number, normalised text)
 
 
 def normalise(line: str) -> str:
+    fence = line.strip()
+    if FENCE.match(fence):
+        return fence.casefold()  # kept whole: a fence is a neutral context line (R6)
     text = TAG.sub("", html.unescape(line))
     text = re.sub(r"[`*]", "", text)
     return " ".join(text.split()).casefold()
 
 
+def _path_words(match: "re.Match[str]") -> str:
+    return " " + " ".join(_PATH_KEEP.findall(match.group(0))) + " "
+
+
 def mentions(text: str) -> bool:
+    if not _QUICK.search(text):
+        return False  # speed only: every R1/R2 pattern needs one of these words
+    text = TOOL_PATH.sub(_path_words, text)
     return bool(MENTION_NAME.search(text) or MENTION_PROSE.search(text))
 
 
 def approved(text: str) -> bool:
-    """The line states session mode in an approved form and names no other mode."""
-    if OTHER_MODE.search(text) or NEGATION.search(text):
-        return False
-    assignments = ASSIGNMENT.findall(text)
-    return bool(assignments) and all(a == "session" for a in assignments)
+    """The whole line has one of the approved shapes (A1, A2). Nothing else is approved."""
+    return any(shape.match(text) for _, shape in APPROVED_SHAPES)
+
+
+def neutral(text: str) -> bool:
+    """A context line that cannot qualify an approved line (R6): fence, section, short config line."""
+    return not OTHER_MODE.search(text) and any(shape.match(text) for shape in NEUTRAL_SHAPES)
+
+
+def reason_problem(reason: str) -> Optional[str]:
+    """Why a reason comment is not a reason, or None when it is one."""
+    words = reason.split()
+    if not words:
+        return "no reason comment above it"
+    if PLACEHOLDER.casefold() in reason.casefold():
+        return "the reason is the regen placeholder %r" % PLACEHOLDER
+    if len(words) < MIN_REASON_WORDS or len(reason) < MIN_REASON_CHARS:
+        return "the reason %r is shorter than a sentence (%d words / %d characters minimum)" % (
+            reason[:60], MIN_REASON_WORDS, MIN_REASON_CHARS)
+    return None
 
 
 def tracked_files(root: Path) -> List[str]:
@@ -149,8 +228,50 @@ def tracked_files(root: Path) -> List[str]:
     return sorted(found)
 
 
+def _neighbours(lines: List[str], i: int) -> List[int]:
+    """Indices of the NEIGHBOURS nearest non-blank lines before and after line i."""
+    found: List[int] = []
+    for step in (-1, 1):
+        j, got = i + step, 0
+        while 0 <= j < len(lines) and got < NEIGHBOURS:
+            if lines[j]:
+                found.append(j)
+                got += 1
+            j += step
+    return found
+
+
+def scan_lines(rel: str, lines: List[str]) -> List[Unit]:
+    """The mention units of one file (rules R1-R6)."""
+    units: List[Unit] = []
+    is_mention = [bool(t) and mentions(t) for t in lines]
+    pairs: Set[Tuple[int, int]] = set()
+
+    def pair(a: int, b: int) -> None:
+        lo, hi = min(a, b), max(a, b)
+        if (lo, hi) not in pairs:
+            pairs.add((lo, hi))
+            units.append((rel, hi + 1, lines[lo] + " " + lines[hi]))
+
+    for i, text in enumerate(lines):
+        if is_mention[i]:
+            units.append((rel, i + 1, text))
+            ok = approved(text)
+            for j in _neighbours(lines, i):
+                if is_mention[j]:
+                    continue  # judged on its own
+                if ok and not neutral(lines[j]):
+                    pair(i, j)  # R6: prose next to an approved line
+                elif OTHER_MODE.search(lines[j]):
+                    pair(i, j)  # R5: a mode word in the same paragraph
+        elif text and i + 1 < len(lines) and lines[i + 1] and not is_mention[i + 1]:
+            if mentions(text + " " + lines[i + 1]):
+                pair(i, i + 1)  # R4: wrapped across a line break
+    return units
+
+
 def scan(root: Path) -> Tuple[List[Unit], int]:
-    """Every mentioning line (single or two joined) and the number of files read."""
+    """Every mention unit and the number of files read."""
     units: List[Unit] = []
     read = 0
     for rel in tracked_files(root):
@@ -166,22 +287,12 @@ def scan(root: Path) -> Tuple[List[Unit], int]:
         if b"\0" in data[:8192]:
             continue
         read += 1
-        lines = [normalise(l) for l in data.decode("utf-8", "replace").splitlines()]
-        for i, text in enumerate(lines):
-            if text and mentions(text):
-                units.append((rel, i + 1, text))
-            if i + 1 < len(lines) and text and lines[i + 1]:
-                joined = text + " " + lines[i + 1]
-                nxt = lines[i + 1]
-                if mentions(joined) and not mentions(text) and not mentions(nxt):
-                    units.append((rel, i + 2, joined))
-                elif mentions(text) and approved(text) and not mentions(nxt) and OTHER_MODE.search(nxt):
-                    # An approved line must not be qualified by a mode word on the next line (#4950).
-                    units.append((rel, i + 2, joined))
+        units += scan_lines(rel, [normalise(l) for l in data.decode("utf-8", "replace").splitlines()])
     return units, read
 
 
 def load_allowlist(root: Path) -> Tuple[List[Tuple[str, str]], List[str]]:
+    """Entries and errors. Every entry needs a real reason (see reason_problem)."""
     entries: List[Tuple[str, str]] = []
     errors: List[str] = []
     path = root / ALLOW_REL
@@ -189,15 +300,35 @@ def load_allowlist(root: Path) -> Tuple[List[Tuple[str, str]], List[str]]:
         raw = path.read_text(encoding="utf-8")
     except OSError as exc:
         return [], ["%s: unreadable: %s" % (ALLOW_REL, exc)]
+    block: List[str] = []   # the comment block being read
+    reason: Optional[str] = None  # the reason of the entry directly above, if any
     for number, line in enumerate(raw.splitlines(), 1):
-        if not line.strip() or line.lstrip().startswith("#"):
+        if line.lstrip().startswith("#") and "reason required" in line.casefold():
+            # regen --accept-new writes this placeholder; an entry nobody gave a reason is not reviewed (#4961)
+            errors.append("%s:%d: placeholder comment left by --accept-new; write the reason for each entry below it" % (ALLOW_REL, number))
+            block, reason = [], None
             continue
+        if not line.strip():
+            block, reason = [], None
+            continue
+        if line.lstrip().startswith("#"):
+            text = line.lstrip().lstrip("#").strip()
+            if not text.startswith(REGEN_HEADER):
+                block.append(text)
+            reason = None
+            continue
+        if block:
+            reason, block = " ".join(block), []
         if SEPARATOR not in line:
             errors.append("%s:%d: malformed entry (want `<file> | <normalised line>`)" % (ALLOW_REL, number))
             continue
         rel, text = line.split(SEPARATOR, 1)
         if not rel or " " in rel or not text or text != normalise(text):
             errors.append("%s:%d: malformed entry (file empty/has spaces, or text empty/not normalised)" % (ALLOW_REL, number))
+            continue
+        problem = reason_problem(reason or "")
+        if problem:
+            errors.append("%s:%d: entry without a written reason (%s)" % (ALLOW_REL, number, problem))
             continue
         entries.append((rel, text))
     return entries, errors
@@ -213,7 +344,7 @@ def judge(units: Sequence[Unit], entries: Sequence[Tuple[str, str]]) -> Tuple[Li
         if budget[(rel, text)] > 0:
             budget[(rel, text)] -= 1
             continue
-        findings.append("%s:%d: mentions a pooler mode without stating session mode: %s" % (rel, number, text[:170]))
+        findings.append("%s:%d: mentions a pooler mode without an approved session-mode shape: %s" % (rel, number, text[:170]))
     stale = ["%s: stale allowlist entry (x%d unused): %s | %s" % (ALLOW_REL, n, r, t[:120]) for (r, t), n in budget.items() if n > 0]
     return findings, stale
 
@@ -249,7 +380,7 @@ def run(root: Path) -> int:
         for err in errors:
             print("check-pgbouncer-pool-mode-claims: FAULT: %s" % err, file=sys.stderr)
         return EXIT_FAULT
-    guide_ok = [u for u in units if u[0] == GUIDE_REL.as_posix() and approved(u[2]) and ASSIGNMENT.search(u[2])]
+    guide_ok = [u for u in units if u[0] == GUIDE_REL.as_posix() and approved(u[2])]
     if not guide_ok:
         return fault("%s holds no approved `pool_mode = session` line; the pin has nothing to compare (fail closed)" % GUIDE_REL)
     findings, stale = judge(units, entries)
@@ -258,12 +389,13 @@ def run(root: Path) -> int:
             print("check-pgbouncer-pool-mode-claims: FAULT: %s" % line, file=sys.stderr)
         return EXIT_FAULT
     if findings:
-        print("check-pgbouncer-pool-mode-claims: %d mention(s) of a pooler mode do not state session mode:" % len(findings))
+        print("check-pgbouncer-pool-mode-claims: %d mention(s) of a pooler mode have no approved shape:" % len(findings))
         for finding in findings:
             print("  " + finding)
-        print("  fix the wording to the `pool_mode = session` form, or run scripts/regen-pgbouncer-pool-mode-allow.py --accept-new and give each new entry in %s a reason comment for review." % ALLOW_REL)
+        print("  fix the wording to a bare `pool_mode = session` line, or run scripts/regen-pgbouncer-pool-mode-allow.py "
+              "--accept-new --reason '<why each new line is safe>' and review the diff of %s." % ALLOW_REL)
         return EXIT_FINDING
-    print("check-pgbouncer-pool-mode-claims: OK (%d files scanned; %d mention lines; %d allowlisted; %d approved pool_mode lines in %s)"
+    print("check-pgbouncer-pool-mode-claims: OK (%d files scanned; %d mention units; %d allowlisted; %d approved lines in %s)"
           % (read, len(units), len(entries), len(guide_ok), GUIDE_REL))
     return EXIT_OK
 
@@ -272,8 +404,9 @@ def run(root: Path) -> int:
 
 GOOD_GUIDE = "```ini\npool_mode = session\n```\n"
 GOOD_INI = "[pgbouncer]\npool_mode = session\n"
+REASON = "# reviewed: this line states the retired mode only to say it is withdrawn\n"
 
-# The 20 wordings the PR 4710 review planted (and variants of the same shapes).
+# Red probes: every wording the PR 4710 reviews planted, rounds 1 to 3.
 PLANTED: List[Tuple[str, str, str]] = [
     ("lowercase ini line", "docs/a.md", "pool_mode = transaction\n"),
     ("uppercase POOL_MODE", "docs/a.md", "POOL_MODE = transaction\n"),
@@ -288,14 +421,16 @@ PLANTED: List[Tuple[str, str, str]] = [
     ("prose: txn pooler", "docs/a.md", "Put a txn pooler in front.\n"),
     ("prose: statement pooling", "ROADMAP.md", "statement pooling cuts connection count\n"),
     ("line-wrapped prose", "docs/a.md", "Front the primary with a pooler in\ntransaction mode.\n"),
+    ("wrap: neither line mentions alone", "docs/a.md", "Put PgBouncer in front of the primary and\nswitch it to transaction for the daemon.\n"),
     ("html entity underscore", "docs/a.html", "<p>pool&#95;mode = transaction</p>\n"),
     ("split code spans", "docs/a.html", "<code>pool_mode</code> = <code>transaction</code>\n"),
     ("ini file, not markdown", "infra/other/pgb.ini", "pool_mode=transaction\n"),
     ("txt file", "notes/pooling.txt", "pool_mode = statement\n"),
     ("per-database override", "infra/pgbouncer/extra.ini", "ai_memory = host=pg dbname=ai_memory pool_mode=transaction\n"),
+    ("[users] override", "infra/x/pgb.ini", "[users]\nai_memory = pool_mode=transaction\n"),
     ("retirement word nearby does not excuse (#4667)", "docs/a.md", "see #4667\nno longer an issue\npool_mode = transaction\n"),
     ("unrelated word nearby does not excuse", "docs/a.md", "an earlier revision\nPgBouncer in transaction mode\n"),
-    # PR 4710 round-2 security review (#4741): wordings outside the round-1 mention set.
+    # round 2 (#4741)
     ("pooling mode to transaction", "docs/a.md", "Set the pooling mode to transaction for the daemon.\n"),
     ("pooling mode to transaction, short form", "docs/a.md", "Set the pooling mode to transaction.\n"),
     ("wrap after an approved line", "docs/a.md", "Run PgBouncer with pool_mode = session or, for more fan-in,\ntransaction.\n"),
@@ -306,11 +441,59 @@ PLANTED: List[Tuple[str, str, str]] = [
     ("transaction-scoped pooling", "docs/a.md", "Front the daemon with transaction-scoped pooling.\n"),
     ("pooling per transaction", "docs/a.md", "Use connection pooling per transaction for the daemon.\n"),
     ("multiplex transactions", "docs/a.md", "Have PgBouncer multiplex transactions for the daemon.\n"),
+    ("pooling word alone, mode word in the same sentence", "docs/a.md", "Pooling client sessions by transaction suits the daemon.\n"),
+    ("multiplexing, no product named", "docs/a.md", "Multiplexing statements onto fewer backends suits the daemon.\n"),
     ("bare yaml mode key", "deploy/supavisor.yaml", "supavisor:\n  mode: transaction\n"),
-    # approval inversions: naming session mode is not approval
+    ("bare ini mode key in a [pgbouncer] block", "docs/a.md", "[pgbouncer]\nmode = transaction\n"),
     ("inversion: pool_mode = session is unsafe", "docs/a.md", "Never use pool_mode = session for the daemon; it is unsafe.\n"),
     ("inversion: session mode is unsafe", "docs/a.md", "PgBouncer session mode is unsafe for the daemon.\n"),
     ("inversion: avoid session pooling", "docs/a.md", "Avoid session pooling; pool_mode = session wastes backends.\n"),
+    # round 3 security review (#4950, #4741): neighbourhood of an approved line, abbreviations
+    ("mode word on the line before an approved line", "docs/a.md", "For the most fan-in pick transaction; otherwise\npool_mode = session\n"),
+    ("ini comment before the approved line", "infra/x/pgb.ini", "; transaction also works here\npool_mode = session\n"),
+    ("three-line wrap after an approved line", "docs/a.md", "Set pool_mode = session or, if you need more fan-in\nand accept the risk described above,\ntransaction.\n"),
+    ("blank line after an approved line", "docs/a.md", "pool_mode = session\n\nor transaction, for more fan-in.\n"),
+    ("approved line then a mentioning line", "docs/a.md", "pool_mode = session\n(PgBouncer transaction mode also works)\n"),
+    ("tx abbreviation with a pooler product", "docs/a.md", "Run PgBouncer in tx mode for the daemon.\n"),
+    ("xact abbreviation with a pooler product", "docs/a.md", "PgBouncer xact pooling suits the daemon.\n"),
+    # round 3 code review (#4960, #4951): inversions outside any word list, keys, plurals
+    ("pooling_mode key alone (pins the pooling spelling)", "deploy/x.yaml", "pooling_mode: transaction\n"),
+    ("bare mode key alone (pins the mode-key rule)", "deploy/x.conf", "  mode: transaction\n"),
+    ("inversion outside any word list: stop using", "docs/a.md", "Stop using pool_mode = session.\n"),
+    ("inversion outside any word list: breaks", "docs/a.md", "pool_mode = session breaks the daemon.\n"),
+    ("inversion outside any word list: harmful", "docs/a.md", "pool_mode = session is harmful for the daemon.\n"),
+    ("inversion wrapped onto the next line", "docs/a.md", "pool_mode = session\nis unsafe for the daemon.\n"),
+    ("inversion two lines after, past a blank line", "docs/a.md", "pool_mode = session\n\nfor the daemon\nis harmful.\n"),
+    ("inversion right after a closing code fence", "docs/a.md", "```ini\npool_mode = session\n```\nThe line above is unsafe.\n"),
+    ("inversion in a free-text config comment", "infra/x/pgb.ini", "pool_mode = session ; stop using this\n"),
+    ("plural: transaction modes", "docs/a.md", "Use transaction or statement modes for the daemon.\n"),
+    ("plural: pool modes key", "docs/a.md", "pool_modes: transaction\n"),
+    ("plural: transactions next to PgBouncer", "docs/a.md", "PgBouncer pools transactions for the daemon.\n"),
+    ("a mode claim beside a tool path is still a mention", "docs/a.md", "Run scripts/probe-pgbouncer-pool-mode.py, then set pool_mode = transaction.\n"),
+    ("product named only in a file name", "docs/a.md", "In pgbouncer.ini choose transaction for the daemon.\n"),
+]
+
+# Green probes: one per approved shape, plus neutral context and path tokens.
+GREEN: List[Tuple[str, str, str]] = [
+    ("A1 ini assignment", "docs/a.md", "pool_mode = session\n"),
+    ("A1 yaml assignment", "deploy/pgb.yaml", "pool_mode: session\n"),
+    ("A1 env assignment", "deploy/.env", "PGBOUNCER_POOL_MODE=session\n"),
+    ("A1 compose list item, quoted", "deploy/compose.yml", "    - PGBOUNCER_POOL_MODE='session'\n"),
+    ("A1 json member", "deploy/x.json", "  \"pool_mode\": \"session\",\n"),
+    ("A2 assignment with a vocabulary comment", "infra/x/pgb.ini", "pool_mode = session ; supported mode\n"),
+    ("A2 comment with a section and an issue", "infra/x/pgb.ini", "pool_mode = session ; supported mode, see 5.6.6 (#4667)\n"),
+    ("R6 neutral context: config block", "infra/x/pgb.ini",
+     "[pgbouncer]\nauth_type = scram-sha-256\npool_mode = session\nserver_reset_query = discard all ; pinned, see 5.6.6\nlisten_port = 6432\n"),
+    ("R6 neutral context: fenced block, prose beyond two lines", "docs/a.md",
+     "Set this:\n\n```ini\n[pgbouncer]\npool_mode = session\nlisten_port = 6432\n```\n\nThen reload.\n"),
+    ("R6 a blank line inside the block is skipped, not judged", "docs/a.md",
+     "```ini\npool_mode = session\n\nlisten_port = 6432\n```\n"),
+    ("R6 neutral context: a [databases] line of key=value tokens", "infra/x/pgb.ini",
+     "[databases]\nai_memory = host=pg port=5432 dbname=ai_memory\n[pgbouncer]\npool_mode = session\n"),
+    ("R3 naming the gate or its allowlist is not a mention", "docs/a.md",
+     "Run scripts/check-pgbouncer-pool-mode-claims.py; see scripts/qc-allowlists/pgbouncer-pool-mode-allow.txt.\n"),
+    ("R3 a bare tool file name is not a mention", "docs/a.md", "regen-pgbouncer-pool-mode-allow.py rewrites the file.\n"),
+    ("sqlx pool and a SQL transaction are not a pooler", "src/a.rs", "let mut tx = pool.begin().await?;\n"),
 ]
 
 
@@ -341,55 +524,150 @@ def run_quiet(root: Path) -> int:
         sink.close()
 
 
-def self_test() -> int:
-    scratch_base = os.environ.get("TMPDIR") or str(REPO_ROOT / ".local-runs")
-    Path(scratch_base).mkdir(parents=True, exist_ok=True)
-    cases: List[Tuple[str, Dict[str, str], int]] = []
+def cases() -> List[Tuple[str, Dict[str, str], int]]:
+    out: List[Tuple[str, Dict[str, str], int]] = []
     for name, rel, body in PLANTED:
-        cases.append(("planted: " + name, tree({rel: body}), EXIT_FINDING))
-    stale_line = "docs/gone.md | pool_mode = transaction"
-    cases += [
+        out.append(("red: " + name, tree({rel: body}), EXIT_FINDING))
+    for name, rel, body in GREEN:
+        out.append(("green: " + name, tree({rel: body}), EXIT_OK))
+    retired = {"docs/a.md": "Transaction mode is not supported (#4667).\n"}
+    retired_entry = "docs/a.md | transaction mode is not supported (#4667).\n"
+    out += [
         ("agreeing tree passes", tree(), EXIT_OK),
         ("session prose alone is not approved", tree({"docs/a.md": "PgBouncer session mode is supported.\n"}), EXIT_FINDING),
-        ("session prose passes once allowlisted",
-         tree({"docs/a.md": "PgBouncer session mode is supported.\n"}, "docs/a.md | pgbouncer session mode is supported.\n"), EXIT_OK),
-        ("approved: ini session with comment", tree({"docs/a.md": "pool_mode = session ; supported mode\n"}), EXIT_OK),
-        ("approved: yaml session", tree({"deploy/pgb.yaml": "pool_mode: session\n"}), EXIT_OK),
-        ("approved: env session", tree({"deploy/.env": "PGBOUNCER_POOL_MODE=session\n"}), EXIT_OK),
+        ("session prose passes once allowlisted with a reason",
+         tree({"docs/a.md": "PgBouncer session mode is supported.\n"}, REASON + "docs/a.md | pgbouncer session mode is supported.\n"), EXIT_OK),
+        ("R5: an allowlisted line does not cover a mode word on the next line",
+         tree({"docs/a.md": "PgBouncer session mode is supported, or\nstatement.\n"},
+              REASON + "docs/a.md | pgbouncer session mode is supported, or\n"), EXIT_FINDING),
         ("a mixed line (session and transaction) is not approved", tree({"docs/a.md": "pool_mode = session, not transaction mode\n"}), EXIT_FINDING),
-        ("allowlisted retirement line passes",
-         tree({"docs/a.md": "Transaction mode is not supported (#4667).\n"}, "docs/a.md | transaction mode is not supported (#4667).\n"), EXIT_OK),
+        ("allowlisted retirement line passes", tree(retired, REASON + retired_entry), EXIT_OK),
+        ("an entry continues the reason of the entry above",
+         tree({"docs/a.md": "Transaction mode is not supported.\nx\nStatement mode is not supported.\n"},
+              REASON + "docs/a.md | transaction mode is not supported.\ndocs/a.md | statement mode is not supported.\n"), EXIT_OK),
         ("allowlist entry is bound to its file",
-         tree({"docs/b.md": "Transaction mode is not supported (#4667).\n"}, "docs/a.md | transaction mode is not supported (#4667).\n"), EXIT_FAULT),
-        ("stale allowlist entry fails", tree({}, stale_line + "\n"), EXIT_FAULT),
-        ("malformed allowlist entry fails", tree({}, "no separator here\n"), EXIT_FAULT),
+         tree({"docs/b.md": "Transaction mode is not supported (#4667).\n"}, REASON + retired_entry), EXIT_FAULT),
+        ("stale allowlist entry fails", tree({}, REASON + "docs/gone.md | pool_mode = transaction\n"), EXIT_FAULT),
+        ("malformed allowlist entry fails", tree({}, REASON + "no separator here\n"), EXIT_FAULT),
         ("an entry beyond the occurrence count is stale",
-         tree({"docs/a.md": "Transaction mode is not supported.\n"}, "docs/a.md | transaction mode is not supported.\ndocs/a.md | transaction mode is not supported.\n"), EXIT_FAULT),
+         tree({"docs/a.md": "Transaction mode is not supported.\n"},
+              REASON + "docs/a.md | transaction mode is not supported.\ndocs/a.md | transaction mode is not supported.\n"), EXIT_FAULT),
         ("one entry does not cover a second occurrence",
-         tree({"docs/a.md": "Transaction mode is not supported.\nx\nTransaction mode is not supported.\n"}, "docs/a.md | transaction mode is not supported.\n"), EXIT_FINDING),
-        ("two entries cover two occurrences",
-         tree({"docs/a.md": "Transaction mode is not supported.\nx\nTransaction mode is not supported.\n"}, "docs/a.md | transaction mode is not supported.\ndocs/a.md | transaction mode is not supported.\n"), EXIT_OK),
+         tree({"docs/a.md": "Transaction mode is not supported.\nx\nTransaction mode is not supported.\n"},
+              REASON + "docs/a.md | transaction mode is not supported.\n"), EXIT_FINDING),
         ("non-normalised allowlist text fails",
-         tree({"docs/a.md": "Transaction mode is not supported.\n"}, "docs/a.md | Transaction mode is not supported.\n"), EXIT_FAULT),
+         tree({"docs/a.md": "Transaction mode is not supported.\n"}, REASON + "docs/a.md | Transaction mode is not supported.\n"), EXIT_FAULT),
+        # reasons (#4961): the placeholder, no reason, a short reason, a reason cut off by a blank line
+        ("regen placeholder left in the allowlist fails",
+         tree(retired, "# REASON REQUIRED before review - say why each line below is safe\n" + retired_entry), EXIT_FAULT),
+        ("placeholder in any wording or case fails", tree(retired, "# reason required: todo\n" + REASON + retired_entry), EXIT_FAULT),
+        ("a placeholder line above a blank line still fails",
+         tree(retired, "# REASON REQUIRED before review\n\n" + REASON + retired_entry), EXIT_FAULT),
+        ("an entry with no reason comment fails", tree(retired, retired_entry), EXIT_FAULT),
+        ("an entry whose reason is only the regen date header fails",
+         tree(retired, "# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:\n" + retired_entry), EXIT_FAULT),
+        ("a reason shorter than a sentence fails", tree(retired, "# ok\n" + retired_entry), EXIT_FAULT),
+        ("a blank line ends a reason", tree(retired, REASON + "\n" + retired_entry), EXIT_FAULT),
+        # fail closed
         ("fail closed: guide with no approved pool_mode line", tree(guide="No pooler section here.\n"), EXIT_FAULT),
+        ("fail closed: guide with only session prose", tree(guide="Use pool_mode = session in production.\n"), EXIT_FAULT),
         ("fail closed: template with two active pool_mode lines", tree(ini=GOOD_INI + "pool_mode = session\n"), EXIT_FAULT),
         ("fail closed: template mode is transaction", tree(ini="[pgbouncer]\npool_mode = transaction\n"), EXIT_FAULT),
         ("fail closed: missing allowlist file", {k: v for k, v in tree().items() if k != ALLOW_REL.as_posix()}, EXIT_FAULT),
     ]
+    return out
+
+
+def _scratch_base() -> str:
+    base = os.environ.get("TMPDIR") or str(REPO_ROOT / ".local-runs")
+    Path(base).mkdir(parents=True, exist_ok=True)
+    return base
+
+
+def run_cases(verbose: bool) -> int:
+    scratch_base = _scratch_base()
     failures = 0
-    for name, files, want in cases:
+    for name, files, want in cases():
         with tempfile.TemporaryDirectory(dir=scratch_base) as tmp:
             root = Path(tmp)
             write_tree(root, files)
             got = run_quiet(root)
         ok = got == want
         failures += 0 if ok else 1
-        print("self-test %s %-70s want=%d got=%d" % ("ok  " if ok else "FAIL", name, want, got))
+        if verbose or not ok:
+            print("self-test %s %-70s want=%d got=%d" % ("ok  " if ok else "FAIL", name, want, got))
+    return failures
+
+
+# One mutant per rule: the source edit that disables the rule. The self-test runs
+# the case set against each mutated copy (in scratch, never in place) and needs at
+# least one case to fail; a mutant that survives, or whose text is absent from this
+# file, fails the self-test.
+MUTANTS: List[Tuple[str, str, str]] = [
+    ("R1 name rule", 'MENTION_NAME = re.compile(POOL_MODE + r"s?")', 'MENTION_NAME = re.compile(r"(?!)")'),
+    ("R1 pooling spelling", 'POOL_MODE = r"pool(?:ing)?[\\s_-]*mode"', 'POOL_MODE = r"pool[\\s_-]*mode"'),
+    ("R1 plural key", 'MENTION_NAME = re.compile(POOL_MODE + r"s?")', 'MENTION_NAME = re.compile(POOL_MODE + r"\\b")'),
+    ("R2 abbreviations tx/xact", '|statements?|txn|tx|xact)"', '|statements?|txn)"'),
+    ("R2 plural modes", "(?:modes?|pooling|pooler|pools?)", "(?:mode|pooling|pooler|pool)"),
+    ("R2 plural transactions", '_MODE_WORD = r"(?:transaction(?:s|al)?|', '_MODE_WORD = r"(?:transaction(?:al)?|'),
+    ("R2 transactional", '_MODE_WORD = r"(?:transaction(?:s|al)?|', '_MODE_WORD = r"(?:transactions?|'),
+    ("R2 multiplex counts as a pooler word", '_POOLER = r"(?:pgbouncer|pooler|pooling|odyssey|supavisor|pgcat|multiplex(?:es|ed|ing)?)"', '_POOLER = r"(?:pgbouncer|pooler|pooling|odyssey|supavisor|pgcat)"'),
+    ("R2 session next to a pool word", '_ANY_MODE = r"(?:%s|sessions?)" % _MODE_WORD', '_ANY_MODE = r"(?:%s)" % _MODE_WORD'),
+    ("R2 pooling word in _POOLER", '_POOLER = r"(?:pgbouncer|pooler|pooling|', '_POOLER = r"(?:pgbouncer|pooler|'),
+    ("R2 product anywhere on the line", '    r"|\\b%s\\b.*?\\b%s\\b|\\b%s\\b.*?\\b%s\\b"\n', '    r"|\\b%s\\b(?!)\\b%s\\b|\\b%s\\b(?!)\\b%s\\b"\n'),
+    ("R2 bare mode key", 'r"|\\bmode\\s*[:=]\\s*[\\"\']?%s\\b"', 'r"|(?!)%s"'),
+    ("R3 path tokens", "    text = TOOL_PATH.sub(_path_words, text)\n", ""),
+    ("R3 path keeps product words", 'return " " + " ".join(_PATH_KEEP.findall(match.group(0))) + " "', 'return " "'),
+    ("R4 wrap", "                pair(i, i + 1)  # R4", "                pass  # R4"),
+    ("R5 paragraph", "                    pair(i, j)  # R5", "                    pass  # R5"),
+    ("R6 approved-line context", "                    pair(i, j)  # R6", "                    pass  # R6"),
+    ("R6 key=value tokens are neutral", '    re.compile(r"^[a-z_][a-z0-9_.]*\\s*=\\s*(?:%s\\s*)+$" % _KV_TOKEN),', '    re.compile(r"(?!)"),'),
+    ("R6 blank lines skipped", "            if lines[j]:\n                found.append(j)", "            if True:\n                found.append(j)"),
+    ("A1/A2 closed shapes (prose approves again)", "    return any(shape.match(text) for _, shape in APPROVED_SHAPES)",
+     '    return bool(re.search(r"pool_mode = session", text)) and not OTHER_MODE.search(text)'),
+    ("A2 closed comment vocabulary", '_COMMENT = r"\\s*[;#]\\s*%s(?:[\\s,.]+%s)*[\\s,.]*" % (_VOCAB, _VOCAB)', '_COMMENT = r"\\s*[;#].*"'),
+    ("allowlist reason required", "        problem = reason_problem(reason or \"\")\n", "        problem = None\n"),
+    ("allowlist placeholder", 'if line.lstrip().startswith("#") and "reason required" in line.casefold():', "if False:"),
+    ("allowlist reason length", "    if len(words) < MIN_REASON_WORDS or len(reason) < MIN_REASON_CHARS:", "    if not words:"),
+    ("allowlist per-occurrence budget", "            budget[(rel, text)] -= 1\n", ""),
+    ("guide pin", "    if not guide_ok:\n", "    if False:\n"),
+]
+
+
+def run_mutants() -> int:
+    """Kill every mutant; return the number that survived or did not apply."""
+    src = Path(__file__).read_text(encoding="utf-8")
+    cut = src.index("\nMUTANTS: List[")  # the rules live above the table; the table itself is not mutated
+    head, table = src[:cut], src[cut:]
+    scratch_base = _scratch_base()
+    bad = 0
+    for label, old, new in MUTANTS:
+        if head.count(old) != 1:
+            bad += 1
+            print("self-test FAIL mutant %-44s does not apply (text found %d times)" % (label, head.count(old)))
+            continue
+        with tempfile.TemporaryDirectory(dir=scratch_base) as tmp:
+            copy = Path(tmp) / "gate.py"
+            copy.write_text(head.replace(old, new) + table, encoding="utf-8")
+            out = subprocess.run([sys.executable, str(copy), "--cases-only"], stdout=subprocess.PIPE,
+                                 stderr=subprocess.STDOUT, universal_newlines=True, check=False)
+        killed = out.returncode != 0
+        bad += 0 if killed else 1
+        first = next((l for l in out.stdout.splitlines() if "FAIL" in l), "")
+        print("self-test %s mutant %-44s %s %s" % ("ok  " if killed else "FAIL", label,
+                                                   "killed by" if killed else "SURVIVED", first[15:90].strip()))
+    return bad
+
+
+def self_test() -> int:
+    failures = run_cases(verbose=True)
+    failures += run_mutants()
     failures += mutate_real_allowlist()
     if failures:
         print("check-pgbouncer-pool-mode-claims: SELF-TEST FAILED (%d case(s))" % failures, file=sys.stderr)
         return EXIT_FAULT
-    print("check-pgbouncer-pool-mode-claims: self-test OK (%d planted/near-miss cases + allowlist mutations)" % len(cases))
+    print("check-pgbouncer-pool-mode-claims: self-test OK (%d cases: %d red probes, %d green probes; %d of %d mutants killed; real allowlist load-bearing)"
+          % (len(cases()), len(PLANTED), len(GREEN), len(MUTANTS), len(MUTANTS)))
     return EXIT_OK
 
 
@@ -401,7 +679,7 @@ def mutate_real_allowlist() -> int:
     units, _ = scan(REPO_ROOT)
     entries, errors = load_allowlist(REPO_ROOT)
     if errors:
-        print("self-test FAIL real allowlist malformed")
+        print("self-test FAIL real allowlist has %d fault(s), first: %s" % (len(errors), errors[0]))
         return 1
     findings, stale = judge(units, entries)
     if findings or stale:
@@ -426,8 +704,11 @@ def mutate_real_allowlist() -> int:
 def main(argv: Iterable[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--root", default=str(REPO_ROOT), help="repository root to scan")
-    parser.add_argument("--self-test", action="store_true", help="plant wordings, mutate the allowlist and assert the verdicts")
+    parser.add_argument("--self-test", action="store_true", help="red and green probes, a mutant per rule, allowlist mutations")
+    parser.add_argument("--cases-only", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args(list(argv))
+    if args.cases_only:
+        return EXIT_FAULT if run_cases(verbose=False) else EXIT_OK
     if args.self_test:
         return self_test()
     try:
