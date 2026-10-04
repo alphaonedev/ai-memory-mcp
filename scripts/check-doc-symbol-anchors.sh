@@ -312,6 +312,12 @@ MDEOF
         'See [the handler](src/nope.rs) for it.'
     anchor_red 5190 PATH "a plain-label ../ link to a missing file" \
         'See [the handler](../src/nope.rs#L3) for it.'
+    anchor_red 5190 PATH "a plain-label link to a missing file on a 'formerly' line" \
+        'Formerly [the handler](src/nope.rs) held it.'
+    anchor_red 5190 PATH "a backticked-label link to a missing file on a 'pre-split' line" \
+        'The pre-split [`handler`](src/nope.rs) held it.'
+    anchor_red 5190 PATH "a plain-label link to a missing file under a 'renamed to' line" \
+        $'It was renamed to something else.\nSee [the handler](src/nope.rs) for it.'
     anchor_green 5190 "a plain-label link to a live file" \
         'See [the handler](src/mcp/tools/recall.rs) for it.'
 
@@ -802,8 +808,9 @@ for doc in seen_docs:
             sym = m.group(1)
             tgt = m.group(2).split("#")[0]
             if tgt not in per_file:
-                if not absent_ok:
-                    emit("PATH", doc, ln, tgt, ctx)
+                # A link to a missing file is a dead link whatever the
+                # surrounding wording says: no absence exemption.
+                emit("PATH", doc, ln, tgt, ctx)
             elif sym not in per_file[tgt]:
                 emit("MDLINK", doc, ln, f"{tgt}::{sym}", ctx)
 
@@ -821,7 +828,7 @@ for doc in seen_docs:
                         emit("LINE", doc, ln, f"{tgt}{m.group(2)}", ctx)
             if m.start(1) in md_starts:
                 continue
-            if tgt not in per_file and not absent_ok:
+            if tgt not in per_file:
                 emit("PATH", doc, ln, tgt, ctx)
 
         # `migrate_vNN` claimed as the LADDER TIP must equal the tip the
