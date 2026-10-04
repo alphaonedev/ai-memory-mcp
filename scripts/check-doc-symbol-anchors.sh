@@ -53,7 +53,9 @@
 #            whose symbol equals the module's file stem is a module
 #            citation, which is legitimate). A relative link to a
 #            `src/` file with ANY label must point at an existing file
-#            (#5190).
+#            (#5190), as must a link with a title, a reference
+#            definition (`[h]: src/x.rs`) and an HTML relative href
+#            (#5269).
 #   LADDER_TIP — a claimed end of the migration ladder
 #            (`migrate_vNN`) must be the real tip.
 #
@@ -330,6 +332,27 @@ MDEOF
         $'It was renamed to something else.\nSee [the handler](src/nope.rs) for it.'
     anchor_green 5190 "a plain-label link to a live file" \
         'See [the handler](src/mcp/tools/recall.rs) for it.'
+
+    # #5269: a link title, a reference definition and an HTML relative href
+    # are relative links to a src/ file too.
+    anchor_red 5269 PATH "a titled link to a missing file" \
+        'See [the handler](src/nope.rs "the handler") for it.'
+    anchor_red 5269 LINE "a titled link with #L past end-of-file" \
+        "See [the handler](src/mcp/tools/recall.rs#L9999 'h') for it."
+    anchor_red 5269 PATH "a reference definition to a missing file" \
+        '[handler]: src/nope.rs'
+    anchor_red 5269 LINE "a reference definition with #L past end-of-file" \
+        '[handler]: src/mcp/tools/recall.rs#L9999 "title"'
+    anchor_red 5269 PATH "an HTML relative href to a missing file" \
+        'See <a href="../src/nope.rs">the handler</a> for it.'
+    anchor_red 5269 LINE "an HTML relative href with #L past end-of-file" \
+        'See <a href="src/mcp/tools/recall.rs#L9999">the handler</a> for it.'
+    anchor_green 5269 "a titled link to a live file" \
+        'See [the handler](src/mcp/tools/recall.rs "the handler") for it.'
+    anchor_green 5269 "a reference definition to a live file" \
+        '[handler]: src/mcp/tools/recall.rs#L2 "title"'
+    anchor_green 5269 "an HTML relative href to a live file" \
+        'See <a href="src/mcp/tools/recall.rs#L2">the handler</a> for it.'
 
     # #5189: the #L fragment of a relative src link is range-checked.
     anchor_red 5189 LINE "a backticked-label link with #L past end-of-file" \
@@ -728,7 +751,14 @@ MDLINK = re.compile(r"\[`([A-Za-z_][A-Za-z0-9_]*)`\]\(([^)]*src/[A-Za-z0-9_/]+\.
 # #5190: ANY relative markdown link to a src/ file, whatever its label
 # (MDLINK only sees a backticked-identifier label). canon() has already
 # removed a ./ or ../ prefix, so the target starts with src/.
-RELLINK = re.compile(r"\]\((src/[A-Za-z0-9_/]+\.rs)(#[^)\s]*)?\)")
+RELLINK = re.compile(
+    r"\]\((src/[A-Za-z0-9_/]+\.rs)(#[^)\s]*)?(?:\s+(?:\"[^\"]*\"|'[^']*'))?\)")
+# #5269: two more relative-link forms to a src/ file: a markdown reference
+# definition (`[h]: src/x.rs "title"`) and an HTML relative href.
+REFDEF = re.compile(
+    r"^\s{0,3}\[[^\]\n]+\]:\s*<?(src/[A-Za-z0-9_/]+\.rs)(#[^\s>]*)?>?"
+    r"(?:\s+(?:\"[^\"]*\"|'[^']*'|\([^)]*\)))?\s*$")
+HREF = re.compile(r"\bhref=[\"'](src/[A-Za-z0-9_/]+\.rs)(#[^\"'\s]*)?[\"']")
 # #5189: the #L<a>[-L<b>] line fragment of such a link names lines too.
 # Only a RELATIVE link is range-checked; a commit-pinned permalink (an
 # https URL) is immutable and never reaches this rule.
@@ -890,16 +920,21 @@ for doc in seen_docs:
         # #5190: a relative link with a plain-text label must still point at
         # a file that exists. MDLINK already reported a backticked-label link.
         md_starts = {m.start(2) for m in MDLINK.finditer(line)}
-        for m in RELLINK.finditer(line):
-            tgt = m.group(1)
-            if tgt in per_file and m.group(2):
-                fm = LINEFRAG.match(m.group(2))
+        rel_hits = [(m.group(1), m.group(2), m.start(1), True)
+                    for m in RELLINK.finditer(line)]
+        rel_hits += [(m.group(1), m.group(2), m.start(1), False)
+                     for m in REFDEF.finditer(line)]
+        rel_hits += [(m.group(1), m.group(2), m.start(1), False)
+                     for m in HREF.finditer(line)]
+        for tgt, frag, start, is_md in rel_hits:
+            if tgt in per_file and frag:
+                fm = LINEFRAG.match(frag)
                 if fm:
                     n = int(fm.group(1))
                     last = int(fm.group(2)) if fm.group(2) else n
                     if n < 1 or last < n or last > line_count[tgt]:
-                        emit("LINE", doc, ln, f"{tgt}{m.group(2)}", ctx)
-            if m.start(1) in md_starts:
+                        emit("LINE", doc, ln, f"{tgt}{frag}", ctx)
+            if is_md and start in md_starts:
                 continue
             if tgt not in per_file:
                 emit("PATH", doc, ln, tgt, ctx)
