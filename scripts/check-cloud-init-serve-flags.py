@@ -828,6 +828,59 @@ COPY_CMDS = {"cp": {"-S", "--suffix"}, "ln": {"-S", "--suffix"}, "mv": {"-S", "-
              "install": {"-m", "-o", "-g", "-S", "--mode", "--owner", "--group", "--suffix"}}
 TAR_EXEC_OPTS = ("-I", "-F", "--use-compress-program", "--to-command", "--checkpoint-action", "--info-script",
                  "--new-volume-script", "--rsh-command", "--rmt-command")
+# tar options that rename members as they are written: the gate finds the binary by its
+# name, so a rename hides it (#5093). GNU tar takes any unambiguous prefix of a long option.
+TAR_RENAME_OPTS = ("--transform", "--xform", "--rename")
+# short tar options that run a program or rename (bsdtar -s), alone or in a cluster
+TAR_EXEC_SHORT = "IFs"
+# find actions that run a command per file: its operands come from the file system (#5093)
+FIND_EXEC_ACTIONS = {"-exec", "-execdir", "-ok", "-okdir"}
+
+
+def tar_risky(args: list):
+    """The first tar argument that runs a program or renames members, or None (#5093):
+    an exec or rename long option or any prefix of one, or a short option cluster (also
+    the dashless first-argument form) holding I, F or s."""
+    for k, a in enumerate(args):
+        if a == "--":
+            break
+        if a.startswith("--"):
+            key = a.split("=", 1)[0]
+            if len(key) > 3 and any(o.startswith(key) for o in TAR_EXEC_OPTS + TAR_RENAME_OPTS if o.startswith("--")):
+                return a
+            continue
+        if re.fullmatch(r"-[A-Za-z]+", a) or (k == 0 and re.fullmatch(r"[A-Za-z]+", a)):
+            if any(c in TAR_EXEC_SHORT for c in a.lstrip("-")):
+                return a
+    return None
+
+
+def built_name_matches(val: str) -> bool:
+    """True when a word the shell builds (a brace or glob) can expand to a path whose
+    basename is ai-memory (fail closed, #5093). Braces are expanded first, so a brace that
+    holds a slash is read whole; a range, or more than 64 words, counts as any text."""
+    alts, rounds = [val], 0
+    while rounds < 16 and any(re.search(r"\{[^{}]*\}", a) for a in alts):
+        rounds += 1
+        nxt = []
+        for a in alts:
+            m = re.search(r"\{([^{}]*)\}", a)
+            if m is None:
+                nxt.append(a)
+            elif ".." in m.group(1) or "," not in m.group(1):
+                # a range, or a literal {x}: stands for any text here (fail closed)
+                nxt.append(a[:m.start()] + "*" + a[m.end():])
+            else:
+                nxt.extend(a[:m.start()] + alt + a[m.end():] for alt in m.group(1).split(","))
+        alts = nxt
+        if len(alts) > 64:
+            return True
+    for a in alts:
+        pat = re.sub(r"\[[^]]*\]?|\*", "\0", posixpath.basename(a))
+        pat = "".join(".*" if c == "\0" else ("." if c == "?" else re.escape(c)) for c in pat)
+        if re.fullmatch(pat, "ai-memory", re.S) is not None:
+            return True
+    return False
 
 
 def binary_ref(w: str, bins, shells: bool = False) -> bool:
@@ -842,6 +895,9 @@ def binary_ref(w: str, bins, shells: bool = False) -> bool:
     # data home is also an R5 hit, which the #4998 probe requires to be reported.
     base = posixpath.basename(val)
     if base == "ai-memory" or (shells and (base in SHELLS or INTERP_BASE_RE.match(base))):
+        return True
+    # only an unquoted glob or brace is expanded by the shell; a quoted one is literal text
+    if re.search(r"[*?\[{]", unquoted_chars(w)) and built_name_matches(val):
         return True
     return any(val in ("$" + b, "${" + b + "}") for b in bins)
 
@@ -868,6 +924,8 @@ def copy_problem(base: str, args: list, bins):
             continue
         ops.append(a)
         k += 1
+    if any(binary_ref(o, bins) for o in ops) and any(re.search(r"[*?\[{]", unquote(o)[0]) for o in ops):
+        return "%s copies the ai-memory binary with a brace or glob operand (the copy's name is not readable)" % base
     if target_dir or len(ops) < 2:
         return None
     dest = unquote(ops[-1])[0]
@@ -891,13 +949,23 @@ def operand_problem(words: list, idx, bins):
         if k != idx and not ASSIGN_RE.match(w) and binary_ref(w, bins, shells):
             refs.append(k)
         k += 1
+    if base == "tar":
+        risky = tar_risky(words[idx + 1:])
+        if risky is not None:
+            # the archive's members are not visible here: a program option or a rename is
+            # red whatever the operands name (#5093)
+            return "tar option %r runs a program or renames members (the gate finds the binary by its name)" % risky[:40]
+    if base == "find" and any(unquote(a)[0] in FIND_EXEC_ACTIONS for a in words[idx + 1:]):
+        return "find runs a command per file (its operands come from the file system, so a copy's name is not readable)"
+    if base in COPY_CMDS and any(posixpath.basename(unquote(w)[0]) == "xargs" for w in words[:idx]):
+        return "%s under xargs (its operands come from stdin, so a copy's name is not readable)" % base
     if not refs:
         return None
     if base == "ai-memory":
         return None
     if base in COPY_CMDS:
         return copy_problem(base, words[idx + 1:], bins)
-    if base == "tar" and not any(a.split("=", 1)[0] in TAR_EXEC_OPTS or a.startswith(TAR_EXEC_OPTS) for a in words[idx + 1:]):
+    if base == "tar":
         return None
     if base in KNOWN_NONEXEC and base != "tar":
         return None
@@ -2420,6 +2488,20 @@ def build_probes() -> list:
         ('ai-memory behind runuser without --, listed (#4837 R12 R4)', [(dec, '      runuser aimemory /usr/local/lib/ai-memory/bin/ai-memory --db $${X} stats\n' + dec)]),
         ('ai-memory at a data-home parent behind taskset, listed (#4837 R12 R4, #5092)', [(dec, '      taskset -c 0 /opt/ai-memory --db $${X} stats\n' + dec)]),
         ('ai-memory at a data home copied to another name, listed (#4837 R12 R4, #5092)', [(dec, '      cp /etc/ai-memory /usr/local/bin/aim\n' + dec)]),
+        ('ai-memory copied by a glob source to another name, listed (#4837 R12 R4, #5093)', [(dec, '      cp /usr/local/lib/ai-memory/bin/ai-mem* /usr/local/bin/aim\n' + dec)]),
+        ('ai-memory installed by a ? glob source to another name, listed (#4837 R12 R4, #5093)', [(dec, '      install -m 0755 /usr/local/lib/ai-memory/bin/ai-memor? /usr/local/bin/aim\n' + dec)]),
+        ('ai-memory copied with a brace operand, listed (#4837 R12 R4, #5093)', [(dec, '      cp /usr/local/lib/ai-memory/bin/ai-memory{,.real}\n' + dec)]),
+        ('ai-memory copied by a brace that holds both paths, listed (#4837 R12 R4, #5093)', [(dec, '      cp {/usr/local/lib/ai-memory/bin/ai-memory,/usr/local/bin/aim}\n' + dec)]),
+        ('ai-memory named by a glob behind taskset, listed (#4837 R12 R4, #5093)', [(dec, '      taskset -c 0 /usr/local/lib/ai-memory/bin/ai-mem* --db /x stats\n' + dec)]),
+        ('ai-memory named by a brace behind taskset, listed (#4837 R12 R4, #5093)', [(dec, '      taskset -c 0 /usr/local/lib/ai-memory/bin/ai-{memory,x} --db /x stats\n' + dec)]),
+        ('tar --transform with no binary name in sight, listed (#4837 R12 R4, #5093)', [(dec, '      tar -C /usr/local/bin -xf /root/b.tar --transform s/x/aim/\n' + dec)]),
+        ('tar abbreviated --transf option, listed (#4837 R12 R4, #5093)', [(dec, '      tar -C /usr/local/bin -xf /root/b.tar --transf=s/x/aim/\n' + dec)]),
+        ('tar --rename option, listed (#4837 R12 R4, #5093)', [(dec, '      tar -C /usr/local/bin -xf /root/b.tar --rename=s/x/aim/\n' + dec)]),
+        ('tar program option in a short cluster, listed (#4837 R12 R4, #5093)', [(dec, '      tar -xvIsh -f /x.tar\n' + dec)]),
+        ('tar program option in the dashless first argument, listed (#4837 R12 R4, #5093)', [(dec, '      tar xIf gzip /x.tar\n' + dec)]),
+        ('tar abbreviated --to-com option, listed (#4837 R12 R4, #5093)', [(dec, '      tar -xf /x.tar --to-com=/usr/local/bin/x\n' + dec)]),
+        ('find -exec copies its match, listed (#4837 R12 R4, #5093)', [(dec, '      find /usr/local/lib -type f -exec cp {} /usr/local/bin/aim \\;\n' + dec)]),
+        ('cp under xargs, listed (#4837 R12 R4, #5093)', [(dec, '      ls /usr/local/lib/ai-memory/bin | xargs -I{} cp {} /usr/local/bin/aim\n' + dec)]),
         ('ai-memory through a variable behind taskset, listed (#4837 R12 R4)', [(dec, '      AIM=/usr/local/lib/ai-memory/bin/ai-memory; taskset -c 0 "$${AIM}" --db $${X} stats\n' + dec)]),
         ('shell run by an unknown wrapper, listed (#4837 R12 R4)', [(dec, "      taskset -c 0 sh -c '/usr/local/lib/ai-memory/bin/ai-memory --db $${X} stats'\n" + dec)]),
         ('ai-memory copied to another name with cp, listed (#4837 R12 R4)', [(dec, '      cp /usr/local/lib/ai-memory/bin/ai-memory /usr/local/bin/aim\n' + dec)]),
