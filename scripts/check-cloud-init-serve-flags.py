@@ -2133,6 +2133,13 @@ def userdata_hits(name: str, scope: str, text: str, maintf) -> list:
 
 
 # ---------------------------------------------------------------- allowlist
+# A pending entry skips the validators, so its tracker is a closed set with a ceiling on
+# the entries each one may hold (#5098): moving an approved line to the pending list, or
+# citing a placeholder issue, is a fault. Change this only in the PR that lands or files
+# the tracker; a ceiling only falls.
+PENDING_TRACKERS = {"#4610": 1, "#4671": 6, "#4712": 3}
+
+
 def load_entries(text: str, pending: bool, faults: list, label: str) -> list:
     """Parse allowlist text into (scope, issue, ctx, line, file_lineno)."""
     out = []
@@ -2146,11 +2153,14 @@ def load_entries(text: str, pending: bool, faults: list, label: str) -> list:
         head, ctx, line = parts[0], parts[1], parts[2]
         issue = None
         if pending:
-            hm = re.match(r"^(\S+) (#\d+)$", head)
+            hm = re.match(r"^(\S+) (#[1-9]\d*)$", head)
             if hm is None:
                 faults.append("%s:%d: malformed pending head %r (want '<scope> #<issue>')" % (label, no, head))
                 continue
             head, issue = hm.group(1), hm.group(2)
+            if issue not in PENDING_TRACKERS:
+                faults.append("%s:%d: tracker %s is not a known pending tracker" % (label, no, issue))
+                continue
         if head not in SCOPES:
             faults.append("%s:%d: unknown scope %r" % (label, no, head))
             continue
@@ -2161,6 +2171,10 @@ def load_entries(text: str, pending: bool, faults: list, label: str) -> list:
             faults.append("%s:%d: line is not whitespace-normalised" % (label, no))
             continue
         out.append((head, issue, ctx, line, no))
+    for tr, cap in sorted(PENDING_TRACKERS.items()) if pending else ():
+        n = sum(1 for e in out if e[1] == tr)
+        if n > cap:
+            faults.append("%s: tracker %s holds %d entries, more than its %d" % (label, tr, n, cap))
     return out
 
 
@@ -2941,7 +2955,12 @@ def build_probes() -> list:
     P.append(("A empty allowlist", "fault", dict(allow_text="# only a comment\n")))
     P.append(("A stale entry", "red", dict(allow_add="aws-gpu-burst | top | nothing-matches:", autolist=False)))
     P.append(("A stale both entry (one template only)", "red", dict(allow_add="both | " + PROV_PATH + " | echo only-in-aws > /x", aws=[ins(RELOAD, ["echo only-in-aws > /x"], before=True)], autolist=False)))
-    P.append(("A stale pending entry", "red", dict(pend_add="do-hive #4671 | top | nothing-matches:", autolist=False)))
+    P.append(("A stale pending entry", "red", dict(pend_sub=("do-hive #4671 | /etc/ai-memory/store-url | ", "do-hive #4671 | top | nothing-matches: "), autolist=False)))
+    # an approved line moved to the pending list skips the validators: the tracker must be known and under its ceiling (#5098)
+    P.append(("A approved line moved under a tracker over its ceiling (#5098)", "fault", dict(pend_move="#4671", autolist=False)))
+    P.append(("A approved line moved under a placeholder tracker #0 (#5098)", "fault", dict(pend_move="#0", autolist=False)))
+    P.append(("A approved line moved under a zero-led tracker #00 (#5098)", "fault", dict(pend_move="#00", autolist=False)))
+    P.append(("A approved line moved under an unknown tracker (#5098)", "fault", dict(pend_move="#99999999", autolist=False)))
     P.append(("A fewer than two templates", "fault", dict(drop_do=True)))
     P.append(("A two templates in one directory", "fault", dict(add_template=("infra/aws-gpu-burst/cloud-init-memory-2.yaml.tpl", "aws"))))
     P.append(("A template with zero triggered lines", "fault", dict(do_text="")))
@@ -2987,6 +3006,16 @@ def case_inputs(base: tuple, spec: dict):
         p = p + first.split(" | ", 1)[0] + " #4671 | " + first.split(" | ", 1)[1] + "\n"
     if "pend_add" in spec:
         p = p + spec["pend_add"] + "\n"
+    if "pend_move" in spec:
+        moved = next(x for x in a.splitlines() if x and not x.startswith("#") and not x.startswith("both | "))
+        a = a.replace(moved + "\n", "", 1)
+        sc, rest = moved.split(" | ", 1)
+        p = p + sc + " " + spec["pend_move"] + " | " + rest + "\n"
+    if "pend_sub" in spec:
+        old, new = spec["pend_sub"]
+        if old not in p:
+            raise RuntimeError("self-test fixture drift in the pending list")
+        p = p.replace(old, new, 1)
     return t, mt, a, p, spec.get("autolist", False), spec.get("extra", ())
 
 
