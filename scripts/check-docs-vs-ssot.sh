@@ -621,6 +621,10 @@ PRIOR = re.compile(r'PRIOR RELEASE', re.IGNORECASE)
 # A block that ends a claim's paragraph. Not `br` (a break inside the paragraph)
 # and not `td`/`th` (a subject cell and its value cell are one row's claim; #5195).
 BLOCK_TAG = re.compile(r'</?(?:p|div|li|ul|ol|tr|table|h[1-6]|section)\b', re.IGNORECASE)
+# Two adjacent block elements are two claims (#5199): the previous raw line ends
+# with a closing block tag, or this raw line opens with a block tag.
+BLOCK_END = re.compile(r'</(?:p|div|li|ul|ol|tr|table|h[1-6]|section)\s*>\s*$', re.IGNORECASE)
+BLOCK_OPEN = re.compile(r'\s*</?(?:p|div|li|ul|ol|tr|table|h[1-6]|section)\b', re.IGNORECASE)
 
 
 def plain(s):
@@ -684,6 +688,8 @@ for path in files:
                     and not BLOCK_TAG.search(lines[back]):
                 back -= 1
                 prev = plain(lines[back])
+            if is_html and (BLOCK_END.search(lines[back]) or BLOCK_OPEN.match(raw)):
+                prev = ''
             # Whitespace at the wrap point is not part of the claim: markdown
             # hard-break spaces, list-continuation indents and tabs are folded.
             prev = WS.sub(' ', TYPED.sub('', prev)).strip()
@@ -2841,6 +2847,14 @@ v52</a></span></em></strong>)</p>
 <em>
 <span>
 v52</span></em></strong>)</p>
+<p>See CURRENT_SCHEMA_VERSION</p>
+<p>52 tools ship today.</p>
+<p>The CURRENT_SCHEMA_VERSION is
+52 on both backends.</p>
+<p>The CURRENT_SCHEMA_VERSION is
+53 on both backends.</p>
+See CURRENT_SCHEMA_VERSION
+<p>52 tools ship here.</p>
 R4HTML
     # #5196: every block tag, opening and closing, stops the look-back; every inline or
     # in-row tag does not. One triple per tag (subject, tag-only line, value). block-fixture.html
@@ -2899,7 +2913,8 @@ R4HTML
         'docs/block-control.html:39 claims "52"' \
         'docs/block-control.html:42 claims "52"' \
         'docs/block-control.html:45 claims "52"' \
-        'docs/schema-fixture.html:79 claims "52"'
+        'docs/schema-fixture.html:79 claims "52"' \
+        'docs/schema-fixture.html:83 claims "52"'
     do grep -qF "$_want" <<<"$r4_out" || { echo "FAIL: self-test #3248 r4 - not flagged: $_want" >&2; cd "$REPO_ROOT"; exit 1; }; done
     for _not in \
         'docs/postgres-age-guide.md:3 ' 'docs/postgres-age-guide.md:4 ' \
@@ -2918,7 +2933,8 @@ R4HTML
         'docs/schema-fixture.html:42 ' \
         'docs/postgres-age-guide.md:38 ' 'docs/postgres-age-guide.md:40 ' 'docs/schema-fixture.html:46 ' \
         'docs/schema-fixture.html:52 ' 'docs/schema-fixture.html:62 ' 'docs/schema-fixture.html:68 ' \
-        'docs/schema-fixture.html:74 ' 'docs/block-fixture.html:'
+        'docs/schema-fixture.html:74 ' 'docs/block-fixture.html:' \
+        'docs/schema-fixture.html:81 ' 'docs/schema-fixture.html:85 ' 'docs/schema-fixture.html:87 '
     do grep -qF "$_not" <<<"$r4_out" && { echo "FAIL: self-test #3248 r4 - canonical/history line flagged: $_not" >&2; cd "$REPO_ROOT"; exit 1; }
     done
     echo "PASS: self-test #4850 - claim wrapped across two lines: planted 52 REJECTED, 53 ACCEPTED"
@@ -2926,6 +2942,7 @@ R4HTML
     echo "PASS: self-test #4511-R5 - wrapped claim with an issue ref / release triple in the subject tail, whitespace at the wrap point, and a tag-only middle line: planted 52 REJECTED, 53 ACCEPTED"
     echo "PASS: self-test #5140 - steps anchor with two spaces or a tab before the FROM version: planted 52 REJECTED, 53 ACCEPTED"
     echo "PASS: self-test #5154/#5196 - html look-back stops at every block-boundary tag, opening and closing (p div li ul ol tr table h1-h6 section, any case, with attributes): the unrelated 52 is not joined; an inline, br or table-cell tag-only line does not stop it (52 REJECTED)"
+    echo "PASS: self-test #5199 - two adjacent html block elements are two claims: a paragraph ending with the identifier does not join the next paragraph's 52 (also when the next line opens with a block tag); a claim wrapped inside one paragraph is still joined (52 REJECTED, 53 ACCEPTED)"
     echo "PASS: self-test #5195 - a claim wrapped across a <br> line or split across table cells is still joined: planted 52 REJECTED, 53 ACCEPTED"
     echo "PASS: self-test #5196 - the look-back bound is pinned both ways: 3 inline tag-only lines join (52 REJECTED), 4 do not"
     echo "PASS: self-test #4511-R6 - html look-back skips up to 3 tag-only lines (52 REJECTED, 53 ACCEPTED), stops past 3, and markdown never looks back past a blank line"
