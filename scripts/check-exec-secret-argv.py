@@ -1249,6 +1249,305 @@ def _mutate(text: str, start: int, end: int) -> str:
     return "\n".join(phys)
 
 
+# Round-3 probes (#4891): each rule of CRED_TOOL_RE and the Dockerfile join has red probes that
+# must be denylist-tagged (so never allow-able) and green probes that must stay allow-able.
+ROUND3_RED = [
+    # combined short flags and the long forms of every curl and wget credential option (#4993)
+    ("curl -su", 'curl -su "u:$X" h'),
+    ("curl -fsSLu", 'curl -fsSLu u:"$X" h'),
+    ("curl -sU proxy user", 'curl -sU "p:$X" h'),
+    ("curl --proxy-user", 'curl --proxy-user "p:$X" h'),
+    ("curl -sE cert password", 'curl -sE "c.pem:$X" h'),
+    ("curl --cert password", 'curl --cert c.pem:"$X" h'),
+    ("curl -E quoted cert password", "curl -E 'c.pem':\"$X\" h"),
+    ("curl --oauth2-bearer", 'curl --oauth2-bearer "$X" h'),
+    ("curl --pass", 'curl --pass "$X" --key k.pem h'),
+    ("wget --password=", 'wget --password="$X" h'),
+    ("wget --http-password", 'wget --http-password "$X" h'),
+    ("wget --ftp-password", 'wget --ftp-password "$X" h'),
+    ("wget -e http_password", 'wget -e "http_password=$X" h'),
+    ("wget -qe password", 'wget -qe password="$X" h'),
+    ("wget --execute=proxy_passwd", 'wget --execute=proxy_passwd="$X" h'),
+    # quoted and partly quoted user parts (#5101)
+    ("curl -u single-quoted user", "curl -u 'u':\"$X\" h"),
+    ("curl -u double-quoted user", 'curl -u "u":"$X" h'),
+    ("curl --user braced", 'curl --user u:"${X}" h'),
+    ("curl -u three quoted parts", "curl -u \"u\"':'\"$X\" h"),
+    # header names in any letter case, with tabs, after combined flags, partly quoted (#4997, #4993)
+    ("curl -H upper case", 'curl -H "AUTHORIZATION: Bearer $X" h'),
+    ("curl -H tab after colon", 'curl -H "X-Api-Key:\t$X" h'),
+    ("curl -H tab before colon", 'curl -H "X-Auth-Token\t: $X" h'),
+    ("curl -sSH partly quoted", "curl -sSH 'Authorization: Bearer '\"$X\" h"),
+    ("wget --header= Authorization", 'wget --header="Authorization: token $X" h'),
+    ("curl --proxy-header", 'curl --proxy-header "Proxy-Authorization: Basic $X" h'),
+]
+ROUND3_GREEN = [
+    ("curl --user-agent= is not --user", 'curl --user-agent="$UA" h'),
+    ("wget -U is the user agent", 'wget -U "$UA" h'),
+    ("curl -E with a file only", 'curl -E "$CERT_PATH" h'),
+    ("curl -E with a default file", 'curl -E "${CERT_FILE:-/x.pem}" h'),
+    ("curl body from stdin", 'curl --data @- https://h/ < "$TOKEN_FILE"'),
+    ("curl config from stdin", 'curl -K - https://h/ < "$TOKEN_FILE"'),
+    ("docker login --password-stdin", 'docker login -u u --password-stdin reg < "$TOKEN_FILE"'),
+    ("curl -sH non-credential header", 'curl -sH "X-Request-Id: $REQ_ID" h'),
+    ("sort -u after curl", 'curl -o "$OUT" h && sort -u "$TOKEN_FILE"'),
+    ("curl --cert-type is not --cert", 'curl --cert-type=P12:$CERT_TYPE -o "$TOKEN_FILE" h'),
+]
+# Dockerfile continuations: comment lines, blank lines, CRLF and the escape directive (#4995)
+ROUND3_DOCKER_RED = [
+    ("CRLF continuation", 'FROM x\r\nRUN apk add y \\\r\n  && curl -u "u:$X" h\r\n'),
+    ("CRLF comment in continuation", 'FROM x\r\nRUN apk add y \\\r\n  # note\r\n  && curl -u "u:$X" h\r\n'),
+    ("comment, blank, comment ending in a backslash",
+     'FROM x\nRUN apk add y \\\n  # note\n\n  # more \\\n  && curl -sH "Authorization: Bearer $X" h\n'),
+    ("escape directive with a comment", '# escape=`\nFROM x\nRUN apk add y `\n  # note\n  && curl -su "u:$X" h\n'),
+]
+ROUND3_DOCKER_GREEN = [
+    ("a credential only in a comment line", 'FROM x\nRUN apk add y \\\n  # curl -u "u:$X" h\n  && true\n'),
+]
+
+
+def round3_probe_cases(dl) -> Tuple[List[str], int]:
+    """Red probes are denylist-tagged and refused for allow; green probes are not tagged and,
+    when triggered, an allow entry approves them through the real gate checks."""
+    bad: List[str] = []
+    n = 0
+    for label, line in ROUND3_RED:
+        n += 1
+        res = scan_exec_file(dl, "c.sh", "#!/bin/bash\n%s\n" % line) or []
+        if not any("denylist" in r[2] for r in res):
+            bad.append("round-3 red probe is not tagged denylist: %s" % label)
+        elif not check_allow_vs_denylist({"c.sh": res}, [("reason: r", "c.sh", 1, norm(line), 1)]):
+            bad.append("round-3 red probe could be allowed: %s" % label)
+    for label, line in ROUND3_GREEN:
+        n += 1
+        res = scan_exec_file(dl, "c.sh", "#!/bin/bash\n%s\n" % line) or []
+        ent = [("reason: r", "c.sh", 1, r[1], 1) for r in res]
+        if any("denylist" in r[2] for r in res) or check_allow_vs_denylist({"c.sh": res}, ent) or \
+                judge({"c.sh": res}, ent, [], dl)[0]:
+            bad.append("round-3 green probe is not allow-able: %s" % label)
+    for label, text in ROUND3_DOCKER_RED:
+        n += 1
+        if not any("denylist" in r[2] for r in scan_exec_file(dl, "Dockerfile", text) or []):
+            bad.append("round-3 Dockerfile probe hid the credential line: %s" % label)
+    for label, text in ROUND3_DOCKER_GREEN:
+        n += 1
+        if any("denylist" in r[2] for r in scan_exec_file(dl, "Dockerfile", text) or []):
+            bad.append("round-3 Dockerfile green probe was tagged: %s" % label)
+    return bad, n
+
+
+def _run_wiring_cases(root: Path, t: Path) -> Tuple[List[str], int]:
+    """Drive run() on a throwaway git repository under .local-runs. A control whose helper is
+    proved elsewhere must also change the exit code of the real gate path (#4910)."""
+    import shutil
+    bad: List[str] = []
+    keys = ("EXEC_SECRET_ARGV_BASE", "GITHUB_BASE_REF", "GITHUB_ACTIONS", "CI")
+    saved = {k: os.environ.get(k) for k in keys}
+    ok_line = "export API_TOKEN"
+    deny_line = 'mysql -u r -p"$PW" db'
+    pl = "x --token $T"
+    base_ref = "refs/remotes/origin/self-test-base"
+
+    def git(*a: str) -> str:
+        return subprocess.run(["git", "-C", str(t), "-c", "user.name=self-test", "-c",
+                               "user.email=self-test@invalid", "-c", "commit.gpgsign=false"] + list(a),
+                              check=True, capture_output=True).stdout.decode("utf-8", "replace")
+
+    def lists(allow: List[str], pend: List[str], rel: str = "a.sh") -> None:
+        (t / ALLOW_FILE).write_text("".join("reason: self-test | %s | 1 | %s\n" % (rel, x) for x in allow))
+        (t / PENDING_FILE).write_text("".join("#1 | %s | 1 | %s\n" % (rel, x) for x in pend))
+
+    def gate(**env: str) -> Tuple[int, str]:
+        for k in keys:
+            os.environ.pop(k, None)
+        os.environ.update(env)
+        out = io.StringIO()
+        with contextlib.redirect_stderr(out), contextlib.redirect_stdout(out):
+            rc = run(t)
+        return rc, out.getvalue()
+
+    def from_pending(msg: str) -> None:
+        git("reset", "-q", "--hard", base_ref)
+        git("clean", "-q", "-fdx")
+        git("add", "-A")
+        git("commit", "-q", "--allow-empty", "-m", msg)
+
+    try:
+        (t / "scripts" / "qc-allowlists").mkdir(parents=True)
+        shutil.copy(str(root / DENYLIST), str(t / DENYLIST))
+        (t / "a.sh").write_text("#!/bin/bash\n%s\n" % ok_line)
+        lists([ok_line], [])
+        git("init", "-q")
+        git("add", "-A")
+        git("commit", "-q", "-m", "base")
+        rc, out = gate()
+        if rc != 0:
+            return ["the run() wiring fixture is not green (%d): %s" % (rc, out.strip()[:160])], 1
+        # outside CI with no base named the run says the merge-base rule was not evaluated (#4996)
+        if "NOT evaluated" not in out or "merge-base rule not evaluated" not in out:
+            bad.append("run() outside CI with no base did not say the merge-base rule was not evaluated (#4996)")
+        # in CI with no base named the run is a FAULT: unresolved means red (#4996)
+        if gate(GITHUB_ACTIONS="true")[0] != 2:
+            bad.append("run() in GitHub Actions with no merge base named passed (#4996)")
+        if gate(CI="true")[0] != 2:
+            bad.append("run() in CI with no merge base named passed (#4996)")
+        # an empty allowlist and no triggered line are faults of run(), not only of the helper
+        lists([], [])
+        (t / "a.sh").write_text("#!/bin/bash\ntrue\n")
+        if gate()[0] != 2:
+            bad.append("run() passed an empty scan (#4910)")
+        # an allow entry for a denylist-flagged line is red in run()
+        (t / "a.sh").write_text("#!/bin/bash\n%s\n%s\n" % (ok_line, deny_line))
+        lists([ok_line, deny_line], [])
+        if gate()[0] != 1:
+            bad.append("run() let an allow entry approve a denylist-flagged line (#4910)")
+        # an executable file with no scan class is a fault of run() (#4923)
+        (t / "a.sh").write_text("#!/bin/bash\n%s\n" % ok_line)
+        lists([ok_line], [])
+        (t / "tool.bin").write_text("plain data\n")
+        os.chmod(str(t / "tool.bin"), 0o755)
+        git("add", "tool.bin")
+        if gate()[0] != 2:
+            bad.append("run() passed an executable file with no scan class (#4923)")
+        git("rm", "-q", "--cached", "tool.bin")
+        (t / "tool.bin").unlink()
+        # a line pending at the merge base cannot move to allow by a list edit (#4919): both base sources
+        (t / "a.sh").write_text("#!/bin/bash\n%s\n%s\n" % (ok_line, pl))
+        lists([ok_line], [pl])
+        git("add", "-A")
+        git("commit", "-q", "-m", "pending")
+        git("update-ref", base_ref, "HEAD")
+        lists([ok_line, pl], [])
+        git("add", "-A")
+        git("commit", "-q", "-m", "launder")
+        if gate(EXEC_SECRET_ARGV_BASE=base_ref)[0] != 1:
+            bad.append("run() let an allow entry approve a line pending at the merge base (#4919)")
+        if gate(GITHUB_BASE_REF="self-test-base")[0] != 1:
+            bad.append("run() ignored GITHUB_BASE_REF for the merge-base check (#4919)")
+        if gate(EXEC_SECRET_ARGV_BASE="refs/heads/no-such-base")[0] != 2:
+            bad.append("run() passed with a merge base it cannot resolve (#4919)")
+        # the same move with an unrelated edit of the file is still refused (#4996)
+        from_pending("edit")
+        (t / "a.sh").write_text("#!/bin/bash\n# note\n%s\n%s\n" % (ok_line, pl))
+        lists([ok_line, pl], [])
+        git("add", "-A")
+        git("commit", "-q", "-m", "edit and launder")
+        if gate(EXEC_SECRET_ARGV_BASE=base_ref, GITHUB_ACTIONS="true")[0] != 1:
+            bad.append("run() let a pending line move to allow next to an unrelated edit of its file (#4996)")
+        # ... and with a rename of the file (#4996)
+        from_pending("rename")
+        git("mv", "a.sh", "b.sh")
+        lists([ok_line, pl], [], "b.sh")
+        git("add", "-A")
+        git("commit", "-q", "-m", "rename and launder")
+        if gate(EXEC_SECRET_ARGV_BASE=base_ref)[0] != 1:
+            bad.append("run() let a pending line move to allow under a renamed file (#4996)")
+        # ... and as a lightly edited copy of the line (#5103)
+        from_pending("cosmetic")
+        (t / "a.sh").write_text("#!/bin/bash\n%s\n%s\n" % (ok_line, pl + "2"))
+        lists([ok_line, pl + "2"], [])
+        git("add", "-A")
+        git("commit", "-q", "-m", "cosmetic edit and launder")
+        if gate(EXEC_SECRET_ARGV_BASE=base_ref)[0] != 1:
+            bad.append("run() let an edited copy of a pending line move to allow (#5103)")
+        # a real fix takes the line off the argv: no entry is needed and the run is green
+        from_pending("fix")
+        (t / "a.sh").write_text("#!/bin/bash\n%s\n" % ok_line)
+        lists([ok_line], [])
+        git("add", "-A")
+        git("commit", "-q", "-m", "fix")
+        rc, out = gate(EXEC_SECRET_ARGV_BASE=base_ref, GITHUB_ACTIONS="true")
+        if rc != 0:
+            bad.append("run() refused a real fix of a pending line (%d): %s" % (rc, out.strip()[:160]))
+        # base 2: the pending line of a.sh is also allowed in c.sh, so the text-counted rule skips it
+        # and only the (file, text) rule with the rename map can see the move (#4996)
+        base2 = "refs/remotes/origin/self-test-base2"
+
+        def rows(allow: List[Tuple[str, str]], pend: List[Tuple[str, str]]) -> None:
+            (t / ALLOW_FILE).write_text("".join("reason: self-test | %s | 1 | %s\n" % r for r in allow))
+            (t / PENDING_FILE).write_text("".join("#1 | %s | 1 | %s\n" % r for r in pend))
+
+        def from_base2(msg: str) -> None:
+            git("reset", "-q", "--hard", base2)
+            git("clean", "-q", "-fdx")
+            git("add", "-A")
+            git("commit", "-q", "--allow-empty", "-m", msg)
+
+        def commit_all(msg: str) -> None:
+            git("add", "-A")
+            git("commit", "-q", "-m", msg)
+
+        git("reset", "-q", "--hard", base_ref)
+        (t / "c.sh").write_text("#!/bin/bash\n%s\n" % pl)
+        rows([("a.sh", ok_line), ("c.sh", pl)], [("a.sh", pl)])
+        commit_all("base2")
+        git("update-ref", base2, "HEAD")
+        rc, out = gate(EXEC_SECRET_ARGV_BASE=base2)
+        if rc != 0:
+            bad.append("the second merge-base fixture is not green (%d): %s" % (rc, out.strip()[:160]))
+        from_base2("rename2")
+        git("mv", "a.sh", "b.sh")
+        git("rm", "-q", "c.sh")
+        rows([("b.sh", ok_line), ("b.sh", pl)], [])
+        commit_all("rename, drop the allowed copy and launder")
+        if gate(EXEC_SECRET_ARGV_BASE=base2)[0] != 1:
+            bad.append("run() let a pending line move to allow under a renamed file when its text is "
+                       "also allowed elsewhere (#4996)")
+        from_base2("move2")
+        git("rm", "-q", "c.sh")
+        rows([("a.sh", ok_line), ("a.sh", pl)], [])
+        commit_all("drop the allowed copy and launder")
+        if gate(EXEC_SECRET_ARGV_BASE=base2)[0] != 1:
+            bad.append("run() let a pending line move to allow when its text is also allowed elsewhere (#4919)")
+        # a new line that only looks like a line still pending is not a launder: green
+        from_base2("near2")
+        (t / "a.sh").write_text("#!/bin/bash\n%s\n%s\n%s\n" % (ok_line, pl, pl + "2"))
+        rows([("a.sh", ok_line), ("c.sh", pl), ("a.sh", pl + "2")], [("a.sh", pl)])
+        commit_all("a new line near a line that stays pending")
+        rc, out = gate(EXEC_SECRET_ARGV_BASE=base2)
+        if rc != 0:
+            bad.append("run() refused a new line near a line that is still pending (%d): %s"
+                       % (rc, out.strip()[:160]))
+        # a real fix of the pending line keeps the copy allowed at the base: green
+        from_base2("fix2")
+        (t / "a.sh").write_text("#!/bin/bash\n%s\n" % ok_line)
+        rows([("a.sh", ok_line), ("c.sh", pl)], [])
+        commit_all("fix the pending line")
+        rc, out = gate(EXEC_SECRET_ARGV_BASE=base2)
+        if rc != 0:
+            bad.append("run() refused a real fix next to an allow entry kept from the base (%d): %s"
+                       % (rc, out.strip()[:160]))
+        # regen main(): a pending row pruned from the working tree but committed at HEAD is still
+        # refused for allow by --accept-new (#4996), through the real argument path
+        from_base2("regen")
+        pr = "unset API_TOKEN"
+        (t / "a.sh").write_text("#!/bin/bash\n%s\n%s\n%s\n" % (ok_line, pl, pr))
+        rows([("a.sh", ok_line), ("c.sh", pl)], [("a.sh", pl), ("a.sh", pr)])
+        commit_all("a second pending line")
+        rows([("a.sh", ok_line), ("c.sh", pl)], [("a.sh", pl)])
+        shutil.copy(str(root / "scripts" / "check-exec-secret-argv.py"), str(t / "scripts"))
+        spec = importlib.util.spec_from_file_location("regen_self_test",
+                                                      str(root / "scripts" / "regen-exec-secret-argv-allow.py"))
+        if spec is None or spec.loader is None:
+            raise RuntimeError("cannot load the regen tool for the self-test")
+        regen = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(regen)  # type: ignore[union-attr]
+        out = io.StringIO()
+        with contextlib.redirect_stderr(out), contextlib.redirect_stdout(out):
+            rc = regen.main(["regen", "--accept-new", "--why", "reason: self-test", "--match", "unset",
+                             "--root", str(t)])
+        if rc != 1 or "the line is pending" not in out.getvalue():
+            bad.append("regen --accept-new approved a pending line pruned before the run (%d): %s"
+                       % (rc, out.getvalue().strip()[:160]))
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    return bad, 20
+
+
 def hardening_cases(root: Path, dl) -> Tuple[List[str], int]:
     """Fail-closed cases of the gate itself (#4901, #4909, #4919, #4920, #4922). Returns
     (failures, case count)."""
@@ -1320,6 +1619,9 @@ def hardening_cases(root: Path, dl) -> Tuple[List[str], int]:
     sl = 'docker login -u u --password-stdin reg < "$TOKEN_FILE"'
     if any("denylist" in r[2] for r in scan_exec_file(dl, "c.sh", "#!/bin/bash\n%s\n" % sl) or []):
         bad.append("docker login --password-stdin is tagged denylist (#4994)")
+    rb, rn = round3_probe_cases(dl)
+    bad.extend(rb)
+    n += rn
     # a Dockerfile comment line inside a RUN continuation does not end the instruction (#4995)
     for label, mid in (("comment", "  # note\n"), ("comment ending in a backslash", "  # note \\\n"),
                        ("blank line", "\n")):
@@ -1389,7 +1691,11 @@ def hardening_cases(root: Path, dl) -> Tuple[List[str], int]:
             pass
         if read_tracked(t, "in.sh") != "#!/bin/bash\ntrue\n":
             bad.append("a symlink inside the tree was not followed (#4909)")
-    return bad, n
+    # the real gate path applies every control, not only its helper (#4910)
+    with tempfile.TemporaryDirectory(dir=str(scratch)) as td:
+        wb, wn = _run_wiring_cases(root, Path(td))
+    bad.extend(wb)
+    return bad, n + wn
 
 
 def self_test(root: Path) -> int:

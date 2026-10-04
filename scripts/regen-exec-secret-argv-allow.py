@@ -236,7 +236,7 @@ def retag(gate, allow: List[Entry], pend: List[Entry], source: str, match: Optio
 
 
 # ---------------------------------------------------------------- refusal cases
-REFUSAL_CASE_COUNT = 22
+REFUSAL_CASE_COUNT = 24
 
 
 def _f(gate, rel: str, line: str, flagged: bool = False):
@@ -322,6 +322,12 @@ def refusal_cases(root: Path) -> List[str]:
     rc, *_ = retag(gate, allowed, pend_e, "pending", "x.sh", "#1", True)
     if rc != 2:
         bad.append("regen: --to-pending moved a pending entry toward allow (#4911)")
+    rc, *_ = retag(gate, allowed, pend_e, "allow", "x.sh", "#1", True)
+    if rc != 2:
+        bad.append("regen: --to-pending duplicated a line that is already pending (#4911)")
+    rc, na, _np, _m = plan(gate, base, [], [], True, True, "reason: r", False, None, dl)
+    if rc != 2 or _np:
+        bad.append("regen: a pending addition took a reason with no issue number (#4911)")
     rc, na, npd, _m = retag(gate, allowed, [], "allow", "x.sh", "reason: unsafe", True)
     if rc != 2 or na != allowed:
         bad.append("regen: a pending entry took a reason with no issue number (#4911)")
