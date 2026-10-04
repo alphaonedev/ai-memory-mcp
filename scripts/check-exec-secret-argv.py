@@ -558,9 +558,6 @@ CRED_TOOL_RE = re.compile(
     r"|\bcurl\b[^|;&]*\s(?:-[A-Za-z]*E|--(?:proxy-)?cert(?![\w-]))[\s=]*"
     r"(?:[^\s\"':]|\"[^\":]*\"|'[^':]*')*(?:[\"'][^\"':]*)?:"
     r"(?:[^\s\"'$]|\"[^\"$]*\"|'[^']*')*(?:[\"'][^\"'$]*)?\$"
-    # wget -e/--execute runs a wgetrc command; its password settings take the secret (#4891 round 3)
-    r"|\bwget\b[^|;&]*\s(?:-[A-Za-z]*e|--execute(?![\w-]))[\s=]*[\"']?(?:http_|ftp_|proxy_)?passw(?:or)?d"
-    r"\s*=[^\"'$\s]*(?:[\"'](?:[^\s\"'$]|\"[^\"$]*\"|'[^']*')*(?:\"[^\"$]*)?)?\$"
     # --password-stdin is the safe form and is not matched (#4994)
     r"|\b(?:docker|podman)\s+login\b[^|;&]*\s(?:-p|--password)(?![\w-])"
     # a credential header in any letter case (#4997), after a combined short flag or --header=
@@ -568,6 +565,55 @@ CRED_TOOL_RE = re.compile(
     r"|(?:(?<![\w-])-[A-Za-z]*H|--(?:proxy-)?header)[\s=]*[\"']?"
     r"(?i:x-api-key|authorization|proxy-authorization|x-auth-token)\s*:"
     r"[^\"'$]*(?:[\"'](?:[^\s\"'$]|\"[^\"$]*\"|'[^']*')*(?:\"[^\"$]*)?)?\$")
+
+
+# wget -e/--execute runs a wgetrc command. wgetrc ignores case, dashes and underscores in a
+# command name and allows spaces around "=", so the name is folded and read, not matched (#5293).
+WGET_EXEC_RE = re.compile(r"\bwget\b[^|;&]*?(?:(?<![\w-])-[A-Za-z]*e|--execute(?![\w-]))[\s=]*")
+WGETRC_PASSWORD_RE = re.compile(r"(?:https?|ftp|proxy)?passw(?:or)?d")
+
+
+def _shell_word(text: str, pos: int) -> str:
+    """The shell word starting at pos, with quotes and backslashes removed. A backslash before a
+    quote (an ssh or sh -c payload) is read as that quote."""
+    out: List[str] = []
+    quote = ""
+    i = pos
+    while i < len(text):
+        ch = text[i]
+        if ch == "\\" and i + 1 < len(text):
+            nxt = text[i + 1]
+            if nxt in "\"'":
+                ch, i = nxt, i + 1
+            else:
+                out.append(nxt)
+                i += 2
+                continue
+        if quote:
+            if ch == quote:
+                quote = ""
+            else:
+                out.append(ch)
+        elif ch in "\"'":
+            quote = ch
+        elif ch.isspace() or ch in ";|&":
+            break
+        else:
+            out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def wgetrc_credential(raw: str) -> bool:
+    """True when a wget -e/--execute value sets a password, or names a setting the gate cannot
+    resolve (an expansion in the name): unresolved means flagged (#4869, #5293)."""
+    for m in WGET_EXEC_RE.finditer(raw):
+        name = _shell_word(raw, m.end()).split("=", 1)[0]
+        if "$" in name or "`" in name:
+            return True
+        if WGETRC_PASSWORD_RE.fullmatch(re.sub(r"[-_\s]", "", name).lower()):
+            return True
+    return False
 
 
 def scan_exec_file(dl, rel: str, text: str) -> Optional[List[Found]]:
@@ -583,7 +629,7 @@ def scan_exec_file(dl, rel: str, text: str) -> Optional[List[Found]]:
     for start, end, raw in units:
         reasons = trigger_reasons(raw, is_make)
         flagged = [deny[k] for k in range(start, end + 1) if k in deny]
-        if flagged or CRED_TOOL_RE.search(raw):
+        if flagged or CRED_TOOL_RE.search(raw) or wgetrc_credential(raw):
             reasons.append("denylist")
         if reasons:
             found.append((start, norm(raw), reasons))
@@ -1274,6 +1320,15 @@ ROUND3_RED = [
     ("wget -e http_password", 'wget -e "http_password=$X" h'),
     ("wget -qe password", 'wget -qe password="$X" h'),
     ("wget --execute=proxy_passwd", 'wget --execute=proxy_passwd="$X" h'),
+    # wgetrc names ignore case, dashes and underscores and allow spaces around = (#5293)
+    ("wget -e spaces around =", 'wget -e "http_password = $X" h'),
+    ("wget -e no separator", 'wget -e "httppassword=$X" h'),
+    ("wget -e upper case", 'wget -e "HTTP_PASSWORD=$X" h'),
+    ("wget -e dashed proxy alias", 'wget -e "proxy-passwd=$X" h'),
+    ("wget -e ftpPassword", 'wget -e ftpPassword="$X" h'),
+    ("wget -e doubled separators", 'wget --execute "HTTP__PASS-WORD=$X" h'),
+    ("wget -e name from an expansion", 'wget -e "$K=$V" h'),
+    ("wget -e inside sh -c", 'sh -c "wget -e \\"HTTP_PASSWORD=$X\\" h"'),
     # quoted and partly quoted user parts (#5101)
     ("curl -u single-quoted user", "curl -u 'u':\"$X\" h"),
     ("curl -u double-quoted user", 'curl -u "u":"$X" h'),
@@ -1290,6 +1345,7 @@ ROUND3_RED = [
 ROUND3_GREEN = [
     ("mysql --password-file is not --password", 'mysql -u r --password-file="$PW_FILE" db'),
     ("redis-cli --pass-file is not --pass", 'redis-cli --pass-file "$PW_FILE" ping'),
+    ("wget -e non-credential settings", 'wget -e robots=off -e "https_proxy=$PROXY_HOST" -O "$TOKEN_FILE" h'),
     ("curl --user-agent= is not --user", 'curl --user-agent="$UA" h'),
     ("wget -U is the user agent", 'wget -U "$UA" h'),
     ("curl -E with a file only", 'curl -E "$CERT_PATH" h'),
