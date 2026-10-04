@@ -183,10 +183,19 @@ PSQL_ARGV_RE = re.compile(
 # expanded value. #4802: a glued -eNAME=, AI_MEMORY_STORE_URL, and sh -c.
 ENV_ARGV_RE = re.compile(
     r"(?:\s-e|\s--env)(?:=|\s)?\s*[\"']?(?:PGPASSWORD|POSTGRES_PASSWORD|AI_MEMORY_STORE_URL)=[\"']?(?P<pw>\$[^\s\"']+)"
-    r"|\b(?:ba)?sh\s+-c\s+[\"'][^\"'\n]*\bPGPASSWORD=(?P<pw3>\$[^\s\"']+)"
-    r"|(?:^|[\s;|&(`/\"'])psql\b[^\n]*?\s(?:-v\s*|--set(?:=|\s+)|--variable(?:=|\s+))"
-    r"[\"']?(?:pw|password|passwd)=[\"']?(?P<pw2>[^\s\"']+)",
+    r"|\b(?:ba)?sh\s+-c\s+[\"'][^\"'\n]*\bPGPASSWORD=(?P<pw3>\$[^\s\"']+)",
     re.IGNORECASE | re.MULTILINE,
+)
+# #4859 R2 (PR 4810 security re-review): psql -v / --set / --variable NAME=value
+# for ANY secret NAME (secret_name(): pw, db_password, new_pw, secret, token),
+# combined short flags (-qv, -Xqv), getopt_long abbreviations (--se, --va..),
+# psql reached through a variable ($PSQL, ${PSQL_BIN}) and a backslash-newline
+# continuation. Every option after the psql word is checked, not the first.
+PSQL_HEAD_RE = re.compile(r"(?:^|[\s;|&(`/\"'${])psql[A-Za-z0-9_]*\b", re.IGNORECASE | re.MULTILINE)
+PSQL_VAR_OPT_RE = re.compile(
+    r"\s(?:-[A-Za-z]*v\s*|--(?:set?|va[a-z]*)(?:=|\s+))"
+    r"[\"']?(?P<name>[A-Za-z_][A-Za-z0-9_]*)=[\"']?(?P<pw2>[^\s\"']+)",
+    re.IGNORECASE,
 )
 SECRET_VAR_RE = re.compile(
     r"\$\{[A-Za-z0-9_]*(?:(?:password|passwd|secret|token|key|cred)[A-Za-z0-9_]*|pw|pass)\}",
@@ -597,10 +606,20 @@ def text_rule_hits(rel: str, text: str) -> List[Hit]:
         line, snippet = _line_of(text, m.start())
         hits.append((rel, line, "[psql-password-argv] " + snippet))
     for m in ENV_ARGV_RE.finditer(text):
-        if is_redaction(m.group("pw") or m.group("pw2") or m.group("pw3") or ""):
+        if is_redaction(m.group("pw") or m.group("pw3") or ""):
             continue
         line, snippet = _line_of(text, m.start())
         hits.append((rel, line, "[env-password-argv] " + snippet))
+    # A backslash-newline is two characters; two spaces keep every offset, so
+    # _line_of on the original text still names the right line.
+    joined = text.replace("\\\n", "  ")
+    for head in PSQL_HEAD_RE.finditer(joined):
+        eol = joined.find("\n", head.end())
+        segment = joined[head.end():eol if eol >= 0 else len(joined)]
+        if any(secret_name(m.group("name")) and not is_redaction(m.group("pw2"))
+               for m in PSQL_VAR_OPT_RE.finditer(segment)):
+            line, snippet = _line_of(text, head.start())
+            hits.append((rel, line, "[env-password-argv] " + snippet))
     for rule, tag in ((PSQL_URL_RE, "psql-url-password"), (DOCKER_ENV_DSN_RE, "env-dsn-argv"),
                       (SSH_REMOTE_URL_RE, "ssh-remote-url-password")):
         for m in rule.finditer(text):
@@ -915,6 +934,15 @@ RED_PROBES_4600 = {
     "psql-variable-pw": 'psql --variable=pw="$PG_PW" -f x.sql',
     "psql-v-pw-joined": 'psql -vpw="$PG_PW" -f x.sql',
     "psql-v-pw-literal": "psql -v pw=litsecret9 -f x.sql",
+    # #4859 R2 (PR 4810 security re-review): any secret variable NAME, other spellings.
+    "4859-psql-v-db-password": 'psql -v db_password="$PG_PW" -f x.sql',
+    "4859-psql-v-new-pw": 'psql -v new_pw="$PG_PW" -f x.sql',
+    "4859-psql-v-aimemory-pw": 'psql -v aimemory_pw="$PG_PW" -f x.sql',
+    "4859-psql-v-secret": 'psql -v secret="$S" -f x.sql',
+    "4859-psql-continuation": 'psql -U postgres \\\n  -v pw="$PG_PW" \\\n  -f x.sql',
+    "4859-psql-combined-qv": 'psql -qv pw="$PG_PW" -f x.sql',
+    "4859-psql-abbrev-vari": 'psql --vari=pw="$PG_PW" -f x.sql',
+    "4859-psql-via-variable": '"$PSQL" -v pw="$PG_PW" -f x.sql',
     # #4808: the forms the #4782 gate missed.
     "4808-docker-e-dsn-literal": "docker run -e DATABASE_URL=postgres://u:hunter2@h/d img",
     "4808-psql-set-equals-pw": 'psql --set=pw="$PG_PW" -f bootstrap.sql',
