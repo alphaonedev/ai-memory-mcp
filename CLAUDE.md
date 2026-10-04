@@ -1767,8 +1767,10 @@ a path as absent (CLAUDE.md's own worktree pre-flight asserts
 THREE-LINE
 window because this repo hard-wraps prose and the disclaimer routinely
 lands on the line above the path it disclaims (wording that names a
-destination, "split into", "split out" or an arrow, exempts only an
-anchor BEFORE it, never the live file after it); and frozen doc trees
+destination, "split into", "split out" or an arrow followed by a `src/`
+path, exempts only an anchor BEFORE it, never the live file after it; an
+arrow with no `src/` path after it, such as a Rust signature or an HTML
+comment end, names no destination and exempts nothing); and frozen doc trees
 (`docs/v0.*/`, `docs/internal/`, `docs/audit/`, `docs/rfc/`, `docs/adr*`,
 `docs/BASELINE-*.md`, the `perfect-endpoint-assessment` wave artefacts)
 are out of scope for the CHANGELOG reason — they describe a tree AS IT

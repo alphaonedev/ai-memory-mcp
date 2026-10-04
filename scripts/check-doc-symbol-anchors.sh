@@ -505,6 +505,20 @@ MDEOF
         '`src/missing_5264.rs` -> `src/mcp/tools/recall.rs`'
     anchor_green 5264 "a source path on the line above a wrapped arrow" \
         $'The module `src/missing_5264.rs`\n-> `src/mcp/tools/recall.rs` now.'
+    # #5341: an arrow that is not followed by a src/ path names no
+    # destination, so the missing file before it is still a stale anchor.
+    anchor_red 5341 PATH "a missing file before a Rust signature arrow" \
+        'The file `src/missing_5341.rs` exposes `fn f() -> u32`.'
+    anchor_red 5341 PATH "a missing file before an HTML comment end" \
+        'See `src/missing_5341.rs` <!-- note -->'
+    anchor_red 5341 PATH "a missing file before a unicode arrow in prose" \
+        'The file `src/missing_5341.rs` maps a → b.'
+    anchor_red 5341 PATH "a missing file with a line anchor before a signature arrow" \
+        'See `src/missing_5341.rs:3` for `fn g() -> bool`.'
+    anchor_red 5341 PATH "a missing file above a next line that starts with a non-path arrow" \
+        $'The file `src/missing_5341.rs`\n-> returns u32'
+    anchor_green 5341 "a missing source before an arrow to a live path" \
+        '`src/missing_5341.rs` -> `./src/mcp/tools/recall.rs`'
 
     # ---- a stale migrate_vNN (the #2629 issue title's own example) ---
     write_clean
@@ -796,8 +810,13 @@ ABSENT_ASSERTION = re.compile(
 # "-> X") says the file AFTER it is live, so it must never exempt a missing
 # file. It exempts only an anchor BEFORE it on the same line (the source,
 # which the sentence says has gone: "`src/old.rs` was split into ...").
+# #5341: an arrow is destination wording ONLY when a src/ path follows it
+# (`-> `src/new.rs``); any other arrow (a Rust signature `-> u32`, an HTML
+# comment end `-->`, a table cell `a -> b`) names no destination and must
+# not exempt the missing file before it.
 ABSENT_DEST = re.compile(
-    r"\bsplit (?:into|out)\b|->|" + chr(0x2192), re.IGNORECASE)
+    r"\bsplit (?:into|out)\b|(?:->|" + chr(0x2192) + r")(?=\s*`?(?:\.{0,2}/)*src/)",
+    re.IGNORECASE)
 
 
 PIN_TARGET = re.compile(
