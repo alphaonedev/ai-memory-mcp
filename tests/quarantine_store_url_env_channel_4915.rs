@@ -145,3 +145,32 @@ fn recover_4915_file_channel_routes_to_the_configured_store() {
         .env("AI_MEMORY_STORE_URL_FILE", &f);
     assert_fails_closed_without_echo(&mut cmd, "recover-previous-session (file channel)");
 }
+
+/// #5290 — the recover path refuses a group/world-readable store-URL file, and
+/// the refusal comes from the channel permission check itself (the message
+/// names the lax permissions), not from some unrelated failure.
+#[cfg(feature = "sal")]
+#[test]
+fn recover_5290_lax_file_channel_fails_closed_with_the_permission_refusal() {
+    let dir = TempDir::new().unwrap();
+    let f = write_url_file(dir.path(), &pg_url(), 0o644);
+    let out = ai_memory(&dir.path().join("sidecar.db"), RECOVER)
+        .env("HOME", dir.path())
+        .env("AI_MEMORY_STORE_URL_FILE", &f)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "a 0644 URL file must be refused.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("lax permissions"),
+        "refusal must come from the store-URL file permission check; stderr: {stderr}"
+    );
+    assert!(
+        !stdout.contains(PW) && !stderr.contains(PW),
+        "password echoed"
+    );
+}
