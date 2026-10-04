@@ -7,7 +7,7 @@ The lists are the approval record of the closed-world gate scripts/check-exec-se
 (precedent 19497ef6, fail-closed allowlist gate). This tool is built so that it cannot
 launder a finding into the allowlist:
 
-  * DEFAULT MODE only deletes and reorders. It never adds an entry. A triggered line that is
+  * DEFAULT MODE writes nothing that adds or deletes an entry. A triggered line that is
     not listed makes the run fail (exit 1) and prints it as file:line with its text.
   * A STALE entry (the line is gone or occurs fewer times than the entry's count) makes the
     default run fail (exit 1). ``--prune`` deletes stale entries and lowers counts; that is
@@ -15,7 +15,8 @@ launder a finding into the allowlist:
   * ADDING needs ``--accept-new --why <#issue | reason: text>``. Each addition is printed as
     file:line and its text. ``--why`` is required and must be an issue number or a reason, so
     every entry says why it was accepted.
-  * It REFUSES to add to the allowlist a line the imported denylist rules flag
+  * It REFUSES to add to the allowlist a pending line (same text, even under a renamed file), a
+    line the prose rules flag, and a line the imported denylist rules flag
     (check-docs-no-argv-secrets.py), and any prose line (prose is never approved). A flagged
     or prose line can only go to the pending list: ``--accept-new --pending --why #<issue>``
     (a pending entry needs an issue number or a reason line, never an approval).
@@ -64,6 +65,12 @@ def load_gate(root: Path):
     return mod
 
 
+def foreign_comments(head: str, text: str) -> List[str]:
+    """Comment lines of an existing list file that render() would drop (#4902)."""
+    keep = set(head.splitlines())
+    return [ln for ln in text.splitlines() if ln.lstrip().startswith("#") and ln not in keep]
+
+
 def render(head: str, entries: List[Entry]) -> str:
     rows = sorted(entries, key=lambda e: (e[1], e[3]))
     return head + "".join("%s | %s | %d | %s\n" % (e[0], e[1], e[2], e[3]) for e in rows)
@@ -74,7 +81,7 @@ def is_prose(rel: str) -> bool:
 
 
 def plan(gate, found, allow: List[Entry], pend: List[Entry], accept_new: bool, pending: bool,
-         why: Optional[str], prune: bool, match: Optional[str] = None) -> Tuple[int, List[Entry], List[Entry], List[str]]:
+         why: Optional[str], prune: bool, match: Optional[str] = None, dl=None) -> Tuple[int, List[Entry], List[Entry], List[str]]:
     """Pure core. Returns (exit code, new allow, new pending, messages)."""
     msgs: List[str] = []
     if accept_new and (why is None or not (gate.PEND_WHY_RE if pending else gate.WHY_RE).match(why)):
@@ -83,6 +90,7 @@ def plan(gate, found, allow: List[Entry], pend: List[Entry], accept_new: bool, p
         return 2, allow, pend, ["--pending only works with --accept-new"]
     amap: Dict[Tuple[str, str], Entry] = {(e[1], e[3]): e for e in allow}
     pmap: Dict[Tuple[str, str], Entry] = {(e[1], e[3]): e for e in pend}
+    pend_texts = {e[3] for e in pend}
     rc = 0
     occ: Dict[Tuple[str, str], list] = {}
     for rel, lines in found.items():
@@ -132,6 +140,20 @@ def plan(gate, found, allow: List[Entry], pend: List[Entry], accept_new: bool, p
             msgs.append("REFUSED %s:%d: %s line cannot be allowed (pending only): %s" % (
                 rel, extra[0][0], "denylist-flagged" if flagged else "prose", text[:120]))
             continue
+        if not pending:
+            # #4902: an allow addition may not launder a pending line (same key, same text under a
+            # renamed file, even one pruned in this run) and may not hold a line the prose rules flag.
+            if key in pmap or text in pend_texts:
+                rc = 1
+                msgs.append("REFUSED %s:%d: the line is pending (or was, under another file); an allow entry "
+                            "cannot replace a pending one: %s" % (rel, extra[0][0], text[:120]))
+                continue
+            hits = gate.prose_rule_hits(dl, text)
+            if hits:
+                rc = 1
+                msgs.append("REFUSED %s:%d: the prose rules flag this line (%s); it can only be pending: %s" % (
+                    rel, extra[0][0], ",".join(hits[:3]), text[:120]))
+                continue
         tgt = pmap if pending else amap
         if key in tgt:
             e = tgt[key]
@@ -146,7 +168,7 @@ def plan(gate, found, allow: List[Entry], pend: List[Entry], accept_new: bool, p
 
 
 # ---------------------------------------------------------------- refusal cases
-REFUSAL_CASE_COUNT = 11
+REFUSAL_CASE_COUNT = 15
 
 
 def _f(gate, rel: str, line: str, flagged: bool = False):
@@ -155,49 +177,65 @@ def _f(gate, rel: str, line: str, flagged: bool = False):
 
 def refusal_cases(root: Path) -> List[str]:
     gate = load_gate(root)
+    dl = gate.load_denylist(root)
     bad: List[str] = []
     a_line = 'MYSQL_PWD="$PW" mysql db'
     base = _f(gate, "x.sh", a_line)
     allowed: List[Entry] = [("reason: r", "x.sh", 1, gate.norm(a_line), 1)]
 
-    rc, na, _np, _m = plan(gate, base, [], [], False, False, None, False)
+    rc, na, _np, _m = plan(gate, base, [], [], False, False, None, False, None, dl)
     if rc != 1 or na:
         bad.append("regen: default mode added or accepted an unlisted line")
-    rc, *_ = plan(gate, base, [], [], True, False, None, False)
+    rc, *_ = plan(gate, base, [], [], True, False, None, False, None, dl)
     if rc != 2:
         bad.append("regen: --accept-new without --why was accepted")
-    rc, *_ = plan(gate, base, [], [], True, False, "because", False)
+    rc, *_ = plan(gate, base, [], [], True, False, "because", False, None, dl)
     if rc != 2:
         bad.append("regen: a free-text --why without 'reason:' was accepted")
-    rc, na, _np, _m = plan(gate, _f(gate, "x.sh", 'curl -u a:$B h', True), [], [], True, False, "reason: r", False)
+    rc, na, _np, _m = plan(gate, _f(gate, "x.sh", 'curl -u a:$B h', True), [], [], True, False, "reason: r", False, None, dl)
     if rc != 1 or na:
         bad.append("regen: a denylist-flagged line was added to the allowlist")
-    rc, na, _np, _m = plan(gate, _f(gate, "d.md", "mysql -p$PW db"), [], [], True, False, "reason: r", False)
+    rc, na, _np, _m = plan(gate, _f(gate, "d.md", "mysql -p$PW db"), [], [], True, False, "reason: r", False, None, dl)
     if rc != 1 or na:
         bad.append("regen: a prose line was added to the allowlist")
-    rc, na, _np, _m = plan(gate, {}, allowed, [], False, False, None, False)
+    rc, na, _np, _m = plan(gate, {}, allowed, [], False, False, None, False, None, dl)
     if rc != 1 or not na:
         bad.append("regen: a stale entry did not fail the default run")
-    rc, na, _np, _m = plan(gate, {}, allowed, [], False, False, None, True)
+    rc, na, _np, _m = plan(gate, {}, allowed, [], False, False, None, True, None, dl)
     if rc != 0 or na:
         bad.append("regen: --prune did not delete a stale entry")
-    rc, na, _np, msgs = plan(gate, base, [], [], True, False, "reason: reviewed", False)
+    rc, na, _np, msgs = plan(gate, base, [], [], True, False, "reason: reviewed", False, None, dl)
     if rc != 0 or len(na) != 1 or not any(m.startswith("ADDED allow x.sh:3") for m in msgs):
         bad.append("regen: --accept-new did not add and print file:line")
     else:
         t1 = render(ALLOW_HEAD, na)
-        rc2, na2, _p2, _m2 = plan(gate, base, na, [], False, False, None, False)
+        rc2, na2, _p2, _m2 = plan(gate, base, na, [], False, False, None, False, None, dl)
         if rc2 != 0 or render(ALLOW_HEAD, na2) != t1:
             bad.append("regen: a second run changed the output (not idempotent)")
     # #4921: a bump takes the new reason, and a bulk accept needs --match
     base2 = {"x.sh": base["x.sh"] * 2}
-    rc, na, _np, msgs = plan(gate, base2, allowed, [], True, False, "reason: second site", False)
+    rc, na, _np, msgs = plan(gate, base2, allowed, [], True, False, "reason: second site", False, None, dl)
     if rc != 0 or not na or na[0][0] != "reason: second site" or not any(m.startswith("BUMP") for m in msgs):
         bad.append("regen: a count bump kept the old reason (#4921)")
     many = {"x.sh": [(3, gate.norm(a_line), ["assign:PW"]), (4, "tool --token $T", ["assign:T"])]}
-    rc, na, _np, _m = plan(gate, many, [], [], True, False, "reason: r", False)
+    rc, na, _np, _m = plan(gate, many, [], [], True, False, "reason: r", False, None, dl)
     if rc != 2 or na:
         bad.append("regen: --accept-new without --match took several new keys at once (#4921)")
+    # #4902: laundering a pending line into allow
+    pend_e: List[Entry] = [("#1", "x.sh", 1, gate.norm(a_line), 1)]
+    rc, na, _np, _m = plan(gate, base2, [], pend_e, True, False, "reason: r", False, None, dl)
+    if rc != 1 or na:
+        bad.append("regen: --accept-new moved a pending key into allow (#4902)")
+    renamed = _f(gate, "y.sh", a_line)
+    rc, na, _np, _m = plan(gate, renamed, [], pend_e, True, False, "reason: renamed", True, None, dl)
+    if rc != 1 or na:
+        bad.append("regen: a renamed file moved a pending line into allow (#4902)")
+    hdr = 'curl -H "X-API-Key: $k" http://h/'
+    rc, na, _np, _m = plan(gate, _f(gate, "x.sh", hdr), [], [], True, False, "reason: r", False, None, dl)
+    if rc != 1 or na:
+        bad.append("regen: a line the prose rules flag was added to allow (#4902)")
+    if not foreign_comments(ALLOW_HEAD, ALLOW_HEAD + "# a hand note\n"):
+        bad.append("regen: a hand-written comment line would be dropped silently (#4902)")
     return bad
 
 
@@ -228,15 +266,21 @@ def main(argv: List[str]) -> int:
     if faults:
         print("\n".join("FAULT: " + f for f in faults), file=sys.stderr)
         return 2
-    rc, na, np_, msgs = plan(gate, found, allow, pend, args.accept_new, args.pending, args.why, args.prune, args.match)
+    cur_allow = (root / gate.ALLOW_FILE).read_text(encoding="utf-8")
+    cur_pend = (root / gate.PENDING_FILE).read_text(encoding="utf-8")
+    dropped = foreign_comments(ALLOW_HEAD, cur_allow) + foreign_comments(PENDING_HEAD, cur_pend)
+    if dropped:
+        print("FAULT: a hand-written comment line would be dropped; remove it or move it into the head "
+              "of the tool (#4902): %s" % dropped[0][:100], file=sys.stderr)
+        return 2
+    rc, na, np_, msgs = plan(gate, found, allow, pend, args.accept_new, args.pending, args.why, args.prune,
+                             args.match, dl)
     for m in msgs:
         print(m, file=sys.stderr if m.startswith(("NEW", "STALE", "REFUSED")) else sys.stdout)
     if rc == 2:
         return 2
     new_allow = render(ALLOW_HEAD, na)
     new_pend = render(PENDING_HEAD, np_)
-    cur_allow = (root / gate.ALLOW_FILE).read_text(encoding="utf-8")
-    cur_pend = (root / gate.PENDING_FILE).read_text(encoding="utf-8")
     changed = (new_allow != cur_allow) or (new_pend != cur_pend)
     if args.check:
         if changed:
