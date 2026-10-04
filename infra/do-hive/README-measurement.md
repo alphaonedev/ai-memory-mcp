@@ -64,6 +64,7 @@ the operator triggers the paid steps.
 source <operator DO token vault>          # exports DIGITALOCEAN_TOKEN
 export AI_MEMORY_OPERATOR_DO_SPEND_APPROVED=1
 export TF_VAR_ssh_pubkey_fingerprint=<operator key fingerprint>
+export TF_VAR_db_password="$(openssl rand -hex 24)"   # required, no default (#4809)
 
 # 1. Provision: 5 smallest load-gen droplets + one bumped substrate droplet.
 #    ai_memory_image_url MUST be a --features sal-postgres build (see the
@@ -192,6 +193,7 @@ is the one `crypto/KNOWN-DO-STAGING.md` §1 already prescribes.
 source <operator DO token vault>                  # exports DIGITALOCEAN_TOKEN
 export AI_MEMORY_OPERATOR_DO_SPEND_APPROVED=1
 export TF_VAR_ssh_pubkey_fingerprint=<operator key fingerprint>
+export TF_VAR_db_password="$(openssl rand -hex 24)"   # required, no default (#4809)
 
 # 1. Build the artifacts federate.sh needs on THIS host.
 cargo build --release --features sal,sal-postgres
@@ -309,6 +311,7 @@ only `--quorum-*` flags are conditional on `memory_count >= 2`.
 
 ```bash
 export TF_VAR_ssh_pubkey_fingerprint=b5:bf:33:9d:6f:a7:22:60:87:49:36:0b:7a:fe:ba:e9
+export TF_VAR_db_password="$(openssl rand -hex 24)"   # required, no default (#4809)
 infra/do-hive/spawn.sh plan -var memory_count=1 -var agent_count=0 \
   -var memory_droplet_size=c-8 -var 'loadgen_sources=["108.45.154.178/32"]'
 
