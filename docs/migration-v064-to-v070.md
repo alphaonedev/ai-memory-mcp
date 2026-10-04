@@ -334,8 +334,10 @@ the AGE projection prime, and the cutover dance.
 1. **Snapshot the postgres database first.** `pg_dump` of the database
    schema + data:
    ```bash
+   # The password never goes on the argv: libpq reads it from ~/.pgpass (mode 0600),
+   # one line `HOST:5432:aimemory:aimemory:PASSWORD` (or the file named by PGPASSFILE).
    pg_dump --format=custom --file=ai-memory.pre-v07.dump \
-     postgres://aimemory:PASSWORD@HOST:5432/aimemory
+     -h HOST -p 5432 -U aimemory -d aimemory
    ```
 2. **Stop the daemon.** `systemctl stop ai-memory` or your service manager.
 3. **Install the v0.7.0 binary** (per §4.3 above).
@@ -350,7 +352,7 @@ the AGE projection prime, and the cutover dance.
    idempotently, preserving data.
 5. **Verify schema parity:**
    ```bash
-   psql 'postgres://aimemory:PASSWORD@HOST:5432/aimemory' \
+   psql -h HOST -p 5432 -U aimemory -d aimemory \
      -tAc "SELECT MAX(version) FROM schema_version;"
    # → 55
    ```

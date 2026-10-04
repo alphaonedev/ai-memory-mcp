@@ -257,7 +257,9 @@ sqlite3 ~/.local/share/ai-memory/memory.db \
    UNION ALL SELECT 'signed_events', COUNT(*) FROM signed_events
    UNION ALL SELECT 'memory_transcripts', COUNT(*) FROM memory_transcripts;"
 
-psql 'postgres://aimemory:PASSWORD@HOST:5432/aimemory' -c "
+# The password never goes on the psql argv: libpq reads it from ~/.pgpass (mode 0600),
+# one line `HOST:5432:aimemory:aimemory:PASSWORD` (or the file named by PGPASSFILE).
+psql -h HOST -p 5432 -U aimemory -d aimemory -c "
   SELECT 'memories' AS tbl, COUNT(*) FROM memories
   UNION ALL SELECT 'memory_links', COUNT(*) FROM memory_links
   UNION ALL SELECT 'namespaces', COUNT(*) FROM namespaces
@@ -274,7 +276,7 @@ pre-Wave-1 binary — re-run with the v0.7.0 binary that has Stream A's
 
 ```bash
 # Schema parity.
-psql 'postgres://aimemory:PASSWORD@HOST:5432/aimemory' \
+psql -h HOST -p 5432 -U aimemory -d aimemory \
   -tAc "SELECT MAX(version) FROM schema_version;"
 # → 55
 ```
