@@ -1467,7 +1467,10 @@ def _run_wiring_cases(root: Path, t: Path) -> Tuple[List[str], int]:
         (t / ALLOW_FILE).write_text("".join("reason: self-test | %s | 1 | %s\n" % (rel, x) for x in allow))
         (t / PENDING_FILE).write_text("".join("#1 | %s | 1 | %s\n" % (rel, x) for x in pend))
 
+    cases = [0]  # every driven run() and every regen main() call is one case: the count cannot drift (#5303)
+
     def gate(**env: str) -> Tuple[int, str]:
+        cases[0] += 1
         for k in keys:
             os.environ.pop(k, None)
         os.environ.update(env)
@@ -1492,7 +1495,7 @@ def _run_wiring_cases(root: Path, t: Path) -> Tuple[List[str], int]:
         git("commit", "-q", "-m", "base")
         rc, out = gate()
         if rc != 0:
-            return ["the run() wiring fixture is not green (%d): %s" % (rc, out.strip()[:160])], 1
+            return ["the run() wiring fixture is not green (%d): %s" % (rc, out.strip()[:160])], cases[0]
         # outside CI with no base named the run says the merge-base rule was not evaluated (#4996)
         if "NOT evaluated" not in out or "merge-base rule not evaluated" not in out:
             bad.append("run() outside CI with no base did not say the merge-base rule was not evaluated (#4996)")
@@ -1665,6 +1668,7 @@ def _run_wiring_cases(root: Path, t: Path) -> Tuple[List[str], int]:
             raise RuntimeError("cannot load the regen tool for the self-test")
         regen = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(regen)  # type: ignore[union-attr]
+        cases[0] += 1
         out = io.StringIO()
         with contextlib.redirect_stderr(out), contextlib.redirect_stdout(out):
             rc = regen.main(["regen", "--accept-new", "--why", "reason: self-test", "--match", "unset",
@@ -1678,7 +1682,7 @@ def _run_wiring_cases(root: Path, t: Path) -> Tuple[List[str], int]:
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
-    return bad, 20
+    return bad, cases[0]
 
 
 def hardening_cases(root: Path, dl) -> Tuple[List[str], int]:
