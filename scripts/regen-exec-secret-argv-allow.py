@@ -169,7 +169,7 @@ def refusal_cases(root: Path) -> List[str]:
     rc, *_ = plan(gate, base, [], [], True, False, "because", False)
     if rc != 2:
         bad.append("regen: a free-text --why without 'reason:' was accepted")
-    rc, na, _np, _m = plan(gate, _f(gate, "x.sh", 'curl -u a:b h', True), [], [], True, False, "reason: r", False)
+    rc, na, _np, _m = plan(gate, _f(gate, "x.sh", 'curl -u a:$B h', True), [], [], True, False, "reason: r", False)
     if rc != 1 or na:
         bad.append("regen: a denylist-flagged line was added to the allowlist")
     rc, na, _np, _m = plan(gate, _f(gate, "d.md", "mysql -p$PW db"), [], [], True, False, "reason: r", False)
