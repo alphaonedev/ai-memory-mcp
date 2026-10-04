@@ -286,8 +286,12 @@ node_sh() { ssh $SSH_BATCH $SSH_OPTS "${SSH_USER}@${PUBLIC_IPS[$1]}" "bash -s"; 
 # verify a node reply only ever goes to a file or to /dev/null. A PASS or FAIL line names a node-derived
 # value only through these three helpers, whose output comes from a closed set. A static test follows
 # node-derived names to ok, no, die, echo, printf, cat and tee, flags any positional parameter on such a
-# line outside ok, no, die and these helpers, and refuses constructs it cannot follow, such as eval, read,
-# mapfile, printf -v, indirect expansion, here-strings and here-documents not fed to a node (#5236);
+# line outside ok, no, die and these helpers, and refuses (outside main) constructs it cannot follow, such as eval, read,
+# mapfile, printf -v, indirect expansion, here-strings, here-documents not fed to a node, indexed and
+# escaped-space assignments and default-assign expansions (#5236, #5359); it follows a function that wraps
+# a node channel as a source (#5360), refuses a command outside those sinks that names a node-derived
+# variable unless it is a test builtin, grep, sed, a node channel or a helper (#5361), and refuses a
+# command substitution or a cat of a file in a terminal line (#5362). It is a static aid and not a proof;
 # whole-verify probes check the printed bytes for hostile replies. reply_status prints a 3-digit HTTP
 # status, or the word non-status for anything else. reply_len prints the reply's byte count.
 # reply_version prints a version token only when it is 1 to 3 dot-separated groups of 1 to 3 ASCII
