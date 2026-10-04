@@ -231,13 +231,21 @@ EOS
   install -m 0600 "$OUT_DIR/ca.crt" "$run_dir/ca.crt"
   echo "[federate] loadgen bundle: $run_dir"
   # The key is a credential: it goes to a 0600 file in the 0700 run dir, never to the terminal or a log.
-  local keyf="$run_dir/api-key"
+  local keyf="$run_dir/api-key" keytmp
   rm -f -- "$keyf"
-  # noclobber makes the redirect O_EXCL: a planted symlink or file is refused, never followed.
-  if ! ( umask 077; set -o noclobber; on_node "${PUBLIC_IPS[0]}" 'cat /etc/ai-memory/api-key' > "$keyf" ) \
-     || [ "$(LC_ALL=C wc -c < "$keyf")" -gt 65 ] \
-     || [ "$(LC_ALL=C grep -Ecx '[0123456789abcdef]{64}' "$keyf")" != 1 ]; then
-    rm -f -- "$keyf"
+  # bash noclobber adds O_EXCL only when the name does not exist yet; an entry planted at a known
+  # name (a symlink to a FIFO or a terminal) is still opened and written through. So the key goes
+  # to an unpredictable new name (O_EXCL), is checked there, and is renamed over
+  # api-key: rename replaces whatever entry sits at that name and never writes through it.
+  # The file is at most 65 bytes, has exactly one line of 64 hex, and starts with a hex digit (so an
+  # empty first line followed by the key is refused): the key, optionally one newline, nothing else.
+  keytmp="$(mktemp -u "$run_dir/.api-key.XXXXXXXXXX")" || die "mktemp failed in $run_dir"
+  if ! ( umask 077; set -o noclobber; on_node "${PUBLIC_IPS[0]}" 'cat /etc/ai-memory/api-key' > "$keytmp" ) \
+     || [ "$(LC_ALL=C wc -c < "$keytmp")" -gt 65 ] \
+     || [ "$(LC_ALL=C grep -Ecx '[0123456789abcdef]{64}' "$keytmp")" != 1 ] \
+     || ! LC_ALL=C head -c 1 -- "$keytmp" | LC_ALL=C grep -q '[0123456789abcdef]' \
+     || ! mv -f -T -- "$keytmp" "$keyf"; then
+    rm -f -- "$keytmp"
     die "could not fetch a 64-hex node API key into $keyf"
   fi
   echo "[federate] Phase A API key written to $keyf (0600)"
@@ -258,6 +266,11 @@ node_sh() { ssh $SSH_OPTS "${SSH_USER}@${PUBLIC_IPS[$1]}" "bash -s"; }
 
 # node_get <idx0> <memory-id> -- read one memory from that node over its own
 # loopback mTLS listener, using the node's own cert + its own api key.
+# plain_id <id> -- the verify steps ask this BEFORE node_get so a refused id is reported as a
+# refused id, not retried 20 times as a replication failure. Same list as the node_get check
+# below (a test pins that the two accept the same characters); explicit, locale-proof: a range would match non-ASCII.
+plain_id() { [[ "$1" =~ ^[abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-]{1,64}$ ]]; }
+
 node_get() {
   # The id comes from a node HTTP response and is spliced into a root heredoc on
   # another node: accept only a plain id (explicit list, locale-proof: a range would match non-ASCII).
@@ -410,6 +423,10 @@ EOS
     202) ok "quorum write at node 1 locally durable (202; peer ack timing) -- the mesh channel carried it" ;;
     *)   no "quorum write at node 1 got '$qcode' ($qjson)" ;;
   esac
+  if [ -n "$QID" ] && ! plain_id "$QID"; then
+    no "quorum write at node 1 returned a memory id that is not a plain id; it is not read back"
+    QID=""
+  fi
   if [ -n "$QID" ]; then
     landed=""
     for _ in $(seq 1 20); do
@@ -449,6 +466,10 @@ EOS
       scode=$(echo "$sresp" | tail -1)
       sjson=$(echo "$sresp" | sed '$d')
       SID=$(echo "$sjson" | jq -r '.id // empty' 2>/dev/null)
+      if [ -n "$SID" ] && ! plain_id "$SID"; then
+        no "signed write at node 1 returned a memory id that is not a plain id; it is not read back"
+        SID=""
+      fi
       if [ "$scode" = "201" ] && [ -n "$SID" ]; then
         ok "signed write accepted at node 1 (201 id=$SID)"
       else
