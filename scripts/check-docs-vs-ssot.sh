@@ -617,8 +617,10 @@ PILL = re.compile(r'class="pill"[^>]*>\s*v([0-9]+)\s+schema\s*<')
 
 TAG = re.compile(r'<[^>]+>')
 WS = re.compile(r'\s+')
-# Markdown emphasis and code-span markers (\x60 is the backtick).
-MARKS = re.compile(r'[*_\x60]+')
+# Markdown emphasis and code-span markers (\x60 is the backtick). An underscore is
+# a marker only at a word edge: between alphanumerics it is part of an identifier
+# (CURRENT_SCHEMA_VERSION, v4_0) and the folded view must not rewrite it (#5338).
+MARKS = re.compile(r'[*\x60]+|(?<![A-Za-z0-9])_+|_+(?![A-Za-z0-9])')
 PRIOR = re.compile(r'PRIOR RELEASE', re.IGNORECASE)
 # A block that ends a claim's paragraph. Not `br` (a break inside the paragraph)
 # and not `td`/`th` (a subject cell and its value cell are one row's claim; #5195).
@@ -2818,6 +2820,10 @@ See CURRENT_SCHEMA_VERSION</p>
 52 tools ship here.
 See CURRENT_SCHEMA_VERSION
 <p>52 tools ship here.</p>
+a v0.8.x DB steps _v40 -> v52_ on boot.
+a v0.8.x DB steps _v40 -> v53_ on boot.
+a v0.8.x DB steps v4_0 -> v52 on boot.
+a v0.8.x DB steps __v40 -> v52__ on boot.
 R4MD
     cat > "$tmpdir/docs/schema-fixture.html" <<'R4HTML'
 <span class="pill">v52&nbsp;schema</span>
@@ -2978,6 +2984,8 @@ R4HTML
         'docs/schema-fixture.html:93 claims "52"' \
         'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:55 claims "52"' \
         'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:57 claims "52"' \
+        'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:58 claims "52"' \
+        'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:61 claims "52"' \
         'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:41 claims "52"' \
         'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:43 claims "52"' \
         'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:45 claims "52"' \
@@ -3002,7 +3010,7 @@ R4HTML
         'docs/postgres-age-guide.md:38 ' 'docs/postgres-age-guide.md:40 ' 'docs/schema-fixture.html:46 ' \
         'docs/schema-fixture.html:52 ' 'docs/schema-fixture.html:62 ' 'docs/schema-fixture.html:68 ' \
         'docs/schema-fixture.html:74 ' 'docs/block-fixture.html:' \
-        'docs/schema-fixture.html:81 ' 'docs/schema-fixture.html:85 ' 'docs/schema-fixture.html:87 ' 'docs/schema-fixture.html:89 ' 'docs/schema-fixture.html:94 ' \
+        'docs/schema-fixture.html:81 ' 'docs/schema-fixture.html:85 ' 'docs/schema-fixture.html:87 ' 'docs/schema-fixture.html:89 ' 'docs/schema-fixture.html:94 ' 'docs/postgres-age-guide.md:59 ' 'docs/postgres-age-guide.md:60 ' \
         'docs/postgres-age-guide.md:42 ' 'docs/postgres-age-guide.md:44 ' 'docs/postgres-age-guide.md:46 ' \
         'docs/postgres-age-guide.md:48 ' 'docs/postgres-age-guide.md:50 ' 'docs/postgres-age-guide.md:51 ' \
         'docs/postgres-age-guide.md:52 ' 'docs/postgres-age-guide.md:53 '
@@ -3017,7 +3025,7 @@ R4HTML
     echo "PASS: self-test #5199 - two adjacent html block elements are two claims: a paragraph ending with the identifier does not join the next paragraph's 52 (also when the next line opens with a block tag, and when the previous line ends with a closing block tag and the next line carries no tag); a closing tag in the MIDDLE of the previous line does not cut a claim wrapped inside the next paragraph; a claim wrapped inside one paragraph is still joined (52 REJECTED, 53 ACCEPTED)"
     echo "PASS: self-test #5200 - ident-less anchors (Current schema = vN, re-stamped to v1.0.0 (schema vN)) match a markdown claim with doubled spaces or a tab: planted 52 REJECTED, 53 ACCEPTED"
     echo "PASS: self-test #5337 - join boundaries pinned: a line ending with an OPENING block tag still joins (52 REJECTED), markdown is not tag-aware (a closing tag at the end of a markdown line, or an opening tag at the start of the next, still joins; 52 REJECTED), html literal backticks are not folded (documented bound)"
-    echo "PASS: self-test #5261 - markdown steps anchor wrapped in bold or a code span (steps **v40 -> v52**, a backtick span): planted 52 REJECTED, 53 ACCEPTED"
+    echo "PASS: self-test #5261/#5338 - markdown steps anchor wrapped in bold, a code span or underscore emphasis (steps **v40 -> v52**, a backtick span, _v40 -> v52_, __v40 -> v52__): planted 52 REJECTED, 53 ACCEPTED; an identifier with an inner underscore (v4_0) is not rewritten by the fold"
     echo "PASS: self-test #5195 - a claim wrapped across a <br> line or split across table cells is still joined: planted 52 REJECTED, 53 ACCEPTED"
     echo "PASS: self-test #5196 - the look-back bound is pinned both ways: 3 inline tag-only lines join (52 REJECTED), 4 do not"
     echo "PASS: self-test #4511-R6 - html look-back skips up to 3 tag-only lines (52 REJECTED, 53 ACCEPTED), stops past 3, and markdown never looks back past a blank line"
