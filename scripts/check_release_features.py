@@ -1022,12 +1022,15 @@ def check_docker_job(jobs: Node, rep: Report) -> None:
                 "the pinned `docker:` job)")
         return
     want_keys = set(DOCKER_JOB) | {"steps"}
-    if set(job.keys()) != want_keys:
-        extra, lost = sorted(set(job.keys()) - want_keys), sorted(want_keys - set(job.keys()))
+    present = set(job.keys())
+    if present != want_keys:
+        extra, lost = sorted(present - want_keys), sorted(want_keys - present)
         rep.bad(pin_message("release.yml", f"`jobs.docker` keys differ from the pinned set (extra {extra}, missing "
                             f"{lost}; a job `env:`, `container:`, `defaults:`, `services:` or `strategy:` changes what is "
                             "built or pushed)", "DOCKER_JOB"))
     for key, spec in DOCKER_JOB.items():
+        if key not in present:
+            continue  # #4984: a missing key is already reported (and refused) by the key-set message above
         why = pin_problem(job.get(key), spec, f"jobs.docker.{key}")
         if why:
             rep.bad(pin_message("release.yml", why, "DOCKER_JOB"))
@@ -1579,6 +1582,9 @@ CRATES_STEPS = ("    # CARGO_REGISTRY_TOKEN is scoped to the `release` Environme
 COPR_HDR = "  copr:\n    name: Fedora COPR\n"
 LOGIN_PW = "          password: ${{ secrets.GITHUB_TOKEN }}\n"
 SHAPE_NAME = '    name: "Release-shaped build + PG TLS proof"\n'
+DOCKER_PERMS = ("    permissions:\n      contents: read\n      packages: write\n      # #2487 \u2014 OIDC-bound Sigstore "
+                "provenance for the GHCR image, the\n      # container-registry form of the same mechanism the SDK OIDC "
+                "jobs use.\n      id-token: write\n      attestations: write\n")
 REL_PERMS = "      id-token: write\n      attestations: write\n    strategy:\n"
 
 
@@ -2026,6 +2032,8 @@ CASES: Dict[str, Tuple[str, List[Edit]]] = {
     "SR8 crates-io declares permissions": ("fail", [_rel(CRATES_STEPS, CRATES_STEPS.replace(
         "    environment:", "    permissions:\n      packages: write\n    environment:"))]),
     "SR8 release job permissions changed": ("fail", [_rel(REL_PERMS, "      id-token: write\n    strategy:\n")]),
+    "SR8 docker job permissions write-all (#4987)": ("fail", [_rel(DOCKER_PERMS, "    permissions: write-all\n")]),
+    "SR8 docker job adds actions: write (#4987)": ("fail", [_rel(DOCKER_PERMS, DOCKER_PERMS + "      actions: write\n")]),
     "SR8 copr job calls a reusable workflow": ("fail", [_rel(COPR_HDR, COPR_HDR + "    uses: ./.github/workflows/x.yml\n")]),
     "SR8 an extra job": ("fail", [_rel(COPR_HDR, _append_job("      - run: echo\n"))]),
     "SR8 unpinned secret": ("fail", _step_before_pkg("        env:\n          T: ${{ secrets.NPM_TOKEN }}\n        run: echo\n")),
@@ -2149,15 +2157,17 @@ MESSAGE_CASES: Dict[str, Tuple[List[Edit], int, str]] = {
         [_d("    strip target/release/ai-memory; \\", "    strip target/release/ai-memory; \\ "),
          _d(D_BIN, D_BIN + "LABEL a=1 \\\n b=2\n")], 2,
         "update DOCKER_RUN_LINES in scripts/check_release_features.py"),
+    "message: 4984 removing the docker permissions block is one message naming DOCKER_JOB": (
+        [_rel(DOCKER_PERMS, "")], 1, "update DOCKER_JOB in scripts/check_release_features.py"),
     "message: 4941 a docker permissions drift is one message naming DOCKER_JOB": (
         [_rel("      packages: write\n      # #2487", "      packages: read\n      # #2487")], 1,
         "update DOCKER_JOB in scripts/check_release_features.py"),
 }
 
 
-# #4944: a tab never reaches the run-line check through the whole guard (the text scan refuses every
-# tab, parse_yaml refuses it too, and a decoded `\\t` escape is refused as a backslash in a
-# double-quoted scalar), so the tab half of its `rstrip(" \\t")` is pinned on hand-built nodes.
+# #4944: a tab never reaches the run-line check through the whole guard (the YAML parser refuses every
+# tab, the text scan deliberately does not, and a decoded `\\t` escape is refused as a backslash in a
+# double-quoted scalar), so the tab half of its `rstrip(" \\t")` is pinned on hand-built nodes (#4985).
 RUN_LINE_UNITS: Tuple[Tuple[str, Tuple[str, ...], int], ...] = (
     ("a run line ending in a backslash and a tab", ("echo a \\\t", "echo b"), 1),
     ("a run line ending in a backslash and a space", ("echo a \\ ", "echo b"), 1),
@@ -2529,6 +2539,8 @@ CONDITION_MUTANTS: Tuple[Tuple[str, str, str], ...] = (
     ("workflow run continuation strips spaces only (#4944)", 'if text.rstrip(" \\t").endswith("\\\\"):', 'if text.rstrip(" ").endswith("\\\\"):'),
     ("#4946 whitelist widened to the whole file", "                canon_lines.update(set(range(first, last + 1)))\n", "                canon_lines.update(set(range(1, len(raw) + 1)))\n"),
     ("docker permissions pinned twice: RELEASE_JOB_PERMISSIONS again (#4941 F1)", '        if name == "docker":\n', '        if False:\n'),
+    ("docker permissions not pinned: DOCKER_JOB loop skips `permissions` (#4987)", '    for key, spec in DOCKER_JOB.items():\n', '    for key, spec in [kv for kv in DOCKER_JOB.items() if kv[0] != "permissions"]:\n'),
+    ("docker missing key reported twice: the key-set skip never fires (#4984)", '        if key not in present:\n', '        if False:\n'),
     ("canonical RUN written differently: its lines not whitelisted (#4946)", "                canon_lines.update(set(range(first, last + 1)))\n", "                pass\n"),
 )
 
