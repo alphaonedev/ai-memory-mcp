@@ -26,7 +26,7 @@ changelog.d/4667.fixed.md | probe scripts/probe-pgbouncer-pool-mode.py exits 1 o
 changelog.d/4667.fixed.md | statement pooling (a second client was granted the migration lock, saw the | ctx:e9961ed87721
 changelog.d/4667.fixed.md | recalculated, and guidance for deployments that already ran transaction mode. | ctx:4d430826d0f0
 changelog.d/4667.fixed.md | (ci job pgbouncer pool-mode claim gate (#4667), not yet a required context) | ctx:005e182d51f4
-changelog.d/4667.fixed.md | making the adapter safe under transaction pooling is tracked in #4679. | ctx:67a287611cac
+changelog.d/4667.fixed.md | making the adapter safe under transaction pooling is tracked in #4679. | ctx:022de6156bc8
 
 # guide 5.6: states which modes are unsupported, the probe results and migration steps; session mode is the supported mode and is stated in the same section
 docs/enterprise-deployment.md | > status (#4667). the supported pool mode behind the postgres adapter is | ctx:51f8076f07ce
@@ -236,8 +236,8 @@ scripts/regen-pgbouncer-pool-mode-allow.py | spec = importlib.util.spec_from_fil
 CHANGELOG.md | probe and the on conflict do nothing insert as two independent pool statements, so under read committed two concurrent adds of opposing arcs | ctx:679d9d0d5d89
 
 # this PR's own changelog fragment: it states session mode is the only supported mode and describes how the gate rejects the other modes
-changelog.d/4667.fixed.md | (plurals, tx/xact, session next to a pool word, a bare mode = key) must be a bare pool_mode = session assignment, optionally with a fixed-vocabulary | ctx:59141ce8e651
-changelog.d/4667.fixed.md | be a bare pool_mode = session assignment, optionally with a fixed-vocabulary | ctx:fb87387cf42f
+changelog.d/4667.fixed.md | (plurals, tx/xact, session next to a pool word, a bare mode = key) must be a bare pool_mode = session assignment, optionally with a fixed-vocabulary | ctx:d64203ee73a6
+changelog.d/4667.fixed.md | be a bare pool_mode = session assignment, optionally with a fixed-vocabulary | ctx:aa644780285e
 changelog.d/4667.fixed.md | infra/pgbouncer ships pool_mode = session, scram, server_reset_query = | ctx:f2324c27bbd4
 changelog.d/4667.fixed.md | lines and paragraph neighbourhood that mentions a pooler mode in any spelling (plurals, tx/xact, session next to a pool word, a bare mode = key) must | ctx:d96ecbbdb579
 changelog.d/4667.fixed.md | statement pooling (a second client was granted the migration lock, saw the table and prepared statement), exits 0 on session, and exits 2 when a client | ctx:8d1e287a9fa6
@@ -582,3 +582,7 @@ docs/enterprise-deployment.md | > with that line present. in session mode each c
 # added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
 # Pairs the section 5.6.6 session-mode caveat with the added prepared-statement failure-mode sentences (#5076): they explain why the pooler must not share a server connection between live clients until #4679 lands, and name no mode to set. Reviewed, none sets or recommends transaction mode.
 docs/enterprise-deployment.md | > with that line present. in session mode each client keeps its own server > this matters because ai-memory's sqlx layer uses named prepared statements | ctx:6e22e729f89f
+
+# added by regen-pgbouncer-pool-mode-allow.py --accept-new on 2026-10-04:
+# This PR's own changelog fragment for the guide caveat: it records why the pooler stays in session mode with DISCARD ALL until #4679 lands and recommends no other mode.
+changelog.d/5076.docs.md | #5076 — the prepared-statement caveat in docs/enterprise-deployment.md section 5.6.6 now names every failure mode. sqlx names its statements sqlx_s_ from a counter that restarts on every client connection, so clients that share one server connection without prepared-statement tracking can hit "does not exist" or "already exists" errors, or run a same-named statement another client prepared. the caveat records this as a further reason the pooler stays in session mode (with server_reset_query = discard all) until #4679 lands. | ctx:e3b0c44298fc
