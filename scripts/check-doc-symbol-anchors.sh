@@ -297,6 +297,11 @@ MDEOF
     anchor_red 5267 LINE "a spaced en-dash range whose end passes end-of-file" 'See `src/mcp/tools/recall.rs:2 – 9999`.'
     anchor_red 5267 LINE "a spaced em-dash range whose end passes end-of-file" 'See `src/mcp/tools/recall.rs:2 — 9999`.'
     anchor_green 5267 "a valid spaced range (:2 - 4)" 'See `src/mcp/tools/recall.rs:2 - 4`.'
+    # #5350: a run of spaces or a tab around the dash is still a range.
+    anchor_red 5350 LINE "a range with two spaces around the dash" 'See `src/mcp/tools/recall.rs:2  -  9999`.'
+    anchor_red 5350 LINE "a range with a tab around the dash" $'See `src/mcp/tools/recall.rs:2\t-\t9999`.'
+    anchor_red 5350 LINE "a range with spaces only before the dash" 'See `src/mcp/tools/recall.rs:2 -9999`.'
+    anchor_red 5350 LINE "a range with spaces only after the dash" 'See `src/mcp/tools/recall.rs:2- 9999`.'
     anchor_green 5267 "a closed code span followed by a spaced dash and a number" 'See `src/mcp/tools/recall.rs:2` - 9999 other things.'
     # #5345: a doubled hyphen and the minus sign (U+2212) are range separators.
     anchor_red 5345 LINE "a doubled-hyphen range whose end passes end-of-file" 'See `src/mcp/tools/recall.rs:2--9999`.'
