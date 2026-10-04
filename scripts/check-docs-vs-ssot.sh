@@ -669,31 +669,39 @@ for path in files:
         # A claim wrapped across two source lines: the subject ends the previous
         # line, the value opens this one. Only values on THIS line count.
         if ln > 1:
-            prev = lines[ln - 2]
-            prev = plain(prev) if is_html else prev
-            prev = TYPED.sub('', prev)
+            # The nearest previous line with text: an html line that is only a
+            # tag (`<strong>`) is empty once plain()ed and must not break the join.
+            back = ln - 2
+            prev = plain(lines[back]) if is_html else lines[back]
+            while is_html and not prev and back > 0 and ln - 2 - back < 3:
+                back -= 1
+                prev = plain(lines[back])
+            # Whitespace at the wrap point is not part of the claim: markdown
+            # hard-break spaces, list-continuation indents and tabs are folded.
+            prev = WS.sub(' ', TYPED.sub('', prev)).strip()
+            body = WS.sub(' ', probe).strip()
             # Identifier form (#4850, window per #5080): the last identifier on
             # the previous line stands alone and the SUBJECT_WINDOW is counted
             # from the START of this line, so the previous line's tail (a
             # trailing word or two, never more than one window) does not eat
             # the window of the value it introduces.
             idents = list(re.finditer(IDENT, prev))
-            # An issue ref (#2555) or a release triple (v1.0.0) in the tail is a
-            # GAP token, not a value, so only a ladder NUM disqualifies the tail.
             # A tail that already carries a number is a claim of its own (flagged
             # on that line), not a subject waiting for a value.
+            # An issue ref (#2555) or a release triple (v1.0.0) in the tail is a
+            # GAP token, not a value, so only a ladder NUM disqualifies the tail.
             if idents and len(prev) - idents[-1].end() <= SUBJECT_WINDOW \
                     and not re.search(NUM, prev[idents[-1].end():]):
                 stub = idents[-1].group(0) + ' '
-                for m in SWEEP[0].finditer(stub + probe):
+                for m in SWEEP[0].finditer(stub + body):
                     if m.start() == 0 and m.start(1) >= len(stub) \
-                            and not ARROW.match(stub + probe, m.end(1)):
+                            and not ARROW.match(stub + body, m.end(1)):
                         hits.append((m.group(1), m.group(0)))
             # Anchor form (#5026): an anchor whose subject words end the previous
             # line and whose value opens this one (docs/index.html "a v0.8.x DB
             # steps" / "v70 -> v100"). The match must start on the previous line
             # and its value on this one; same-line matches are counted below.
-            joined = prev + ' ' + probe
+            joined = prev + ' ' + body
             for rx in ANCHORS:
                 for m in rx.finditer(joined):
                     if m.start() < len(prev) < m.start(1):
@@ -2730,6 +2738,10 @@ probe: `CURRENT_SCHEMA_VERSION` (#2555) at v1.0.0 is
 v52 on this build.
 probe: `CURRENT_SCHEMA_VERSION` (#2555) at v1.0.0 is
 v53 on this build.
+a v0.8.x DB steps  
+	v40 → v52 on boot.
+a v0.8.x DB steps  
+	v40 → v53 on boot.
 R4MD
     cat > "$tmpdir/docs/schema-fixture.html" <<'R4HTML'
 <span class="pill">v52&nbsp;schema</span>
@@ -2750,6 +2762,12 @@ R4MD
 <strong>v40&nbsp;&rarr;&nbsp;v52</strong>; a v0.7.x DB)</p>
 <p>(a v0.8.x DB steps
 <strong>v40&nbsp;&rarr;&nbsp;v53</strong>; a v0.7.x DB)</p>
+<p>(a v0.8.x DB steps
+<strong>
+v40&nbsp;&rarr;&nbsp;v52</strong>)</p>
+<p>(a v0.8.x DB steps
+<strong>
+v40&nbsp;&rarr;&nbsp;v53</strong>)</p>
 R4HTML
     r4_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1) && {
         echo "FAIL: self-test #3248 r4 - stale wordings not rejected" >&2; cd "$REPO_ROOT"; exit 1; }
@@ -2771,7 +2789,9 @@ R4HTML
         'docs/schema-fixture.html:13 claims "52"' \
         'docs/schema-fixture.html:16 claims "52"' \
         'docs/postgres-age-guide.md:21 claims "52"' \
-        'docs/postgres-age-guide.md:25 claims "52"'
+        'docs/postgres-age-guide.md:25 claims "52"' \
+        'docs/postgres-age-guide.md:29 claims "52"' \
+        'docs/schema-fixture.html:21 claims "52"'
     do grep -qF "$_want" <<<"$r4_out" || { echo "FAIL: self-test #3248 r4 - not flagged: $_want" >&2; cd "$REPO_ROOT"; exit 1; }; done
     for _not in \
         'docs/postgres-age-guide.md:3 ' 'docs/postgres-age-guide.md:4 ' \
@@ -2784,11 +2804,12 @@ R4HTML
         'docs/schema-fixture.html:10 ' 'docs/schema-fixture.html:12 ' 'docs/schema-fixture.html:14 ' \
         'docs/schema-fixture.html:15 ' 'docs/schema-fixture.html:17 ' 'docs/schema-fixture.html:18 ' \
         'docs/postgres-age-guide.md:20 ' 'docs/postgres-age-guide.md:22 ' 'docs/postgres-age-guide.md:23 ' \
-        'docs/postgres-age-guide.md:27 '
+        'docs/postgres-age-guide.md:27 ' 'docs/postgres-age-guide.md:31 ' 'docs/schema-fixture.html:24 '
     do grep -qF "$_not" <<<"$r4_out" && { echo "FAIL: self-test #3248 r4 - canonical/history line flagged: $_not" >&2; cd "$REPO_ROOT"; exit 1; }
     done
     echo "PASS: self-test #4850 - claim wrapped across two lines: planted 52 REJECTED, 53 ACCEPTED"
     echo "PASS: self-test #5026/#5080 - anchor wrapped across two lines (steps / v40 -> v52) and identifier value more than 60 chars after the identifier: planted 52 REJECTED, 53 ACCEPTED"
+    echo "PASS: self-test #4511-R5 - wrapped claim with an issue ref / release triple in the subject tail, whitespace at the wrap point, and a tag-only middle line: planted 52 REJECTED, 53 ACCEPTED"
     echo "PASS: self-test #4851 - compact json schema_version:52 REJECTED, :53 ACCEPTED"
     echo "PASS: self-test #4852 - issue ref / release triple between identifier and value: planted 52 REJECTED, 53 ACCEPTED"
     echo "PASS: self-test #4853 - transition 51 -> 52 REJECTED (TO side), 52 -> 53 ACCEPTED, ledgered 49→50 history ACCEPTED"
