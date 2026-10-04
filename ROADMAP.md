@@ -761,24 +761,25 @@ queue-collapse.
 
 ##### §11.4.Pillar4.B PgBouncer per-module pooler (+1.5 sessions)
 
-PgBouncer (≥1.21, for `max_prepared_statements`) as the per-module connection pooler
-in front of each module's Postgres+AGE backbone. As planned, this was
-transaction-mode multiplexing with `max_prepared_statements` set; **as shipped (#4667)
-it is `session` mode**, because the Postgres adapter keeps migration-lock, `search_path`
-and timeout state on the server session and the executed probe
-`scripts/probe-pgbouncer-pool-mode.py` fails on `transaction` and `statement` modes
-(see `docs/enterprise-deployment.md §5.6`). Transaction mode returns when
-[#4679](https://github.com/alphaonedev/ai-memory-mcp/issues/4679) lands. `max_prepared_statements`
-stays set (PgBouncer ≥1.21). Deliverables: deploy templates (compose + k8s), expansion of
-`docs/enterprise-deployment.md §10.4`, and an `infra/lan-parity-test/` integration
-test that runs the suite through PgBouncer. The sqlx layer uses named prepared
-statements; no production code sets `plan_cache_mode` or forces generic plans, so there is no
-plan pinning for the pooler to preserve (#5077). **Supavisor is explicitly NOT
-adopted** — the documented hive (Topology 8/9, `docs/reference-architectures.md`)
-absorbs millions-agent fan-in via hierarchical tiering (1:10–1:100 per tier) + the
-HMAC-batching edge sync gateway *before* Postgres, so the millions-of-concurrent-PG-
-connections condition Supavisor exists to solve never arises; PgBouncer is the
-documented pooler and the module model keeps each backbone's writer count bounded.
+PgBouncer (≥1.21, for `max_prepared_statements`) as the per-module connection pooler in
+front of each module's Postgres+AGE backbone. As planned, this was transaction-mode
+multiplexing with `max_prepared_statements` set; **as shipped (#4667) it is `session`
+mode**, because the Postgres adapter keeps migration-lock, `search_path` and timeout
+state on the server session and the executed probe
+`scripts/probe-pgbouncer-pool-mode.py` fails on `transaction` and `statement` modes (see
+`docs/enterprise-deployment.md §5.6`). Transaction mode returns when
+[#4679](https://github.com/alphaonedev/ai-memory-mcp/issues/4679) lands.
+`max_prepared_statements` stays set (PgBouncer ≥1.21). Deliverables: deploy templates
+(compose + k8s), expansion of `docs/enterprise-deployment.md §10.4`, and an
+`infra/lan-parity-test/` integration test that runs the suite through PgBouncer. The
+sqlx layer uses named prepared statements; no production code (src/) sets
+`plan_cache_mode` or forces generic plans, so there is no plan pinning for the pooler to
+preserve (#5077). **Supavisor is explicitly NOT adopted** — the documented hive
+(Topology 8/9, `docs/reference-architectures.md`) absorbs millions-agent fan-in via
+hierarchical tiering (1:10–1:100 per tier) + the HMAC-batching edge sync gateway
+*before* Postgres, so the millions-of-concurrent-PG-connections condition Supavisor
+exists to solve never arises; PgBouncer is the documented pooler and the module model
+keeps each backbone's writer count bounded.
 
 ##### §11.4.Pillar4.C Module consolidation contract — Hot/Cold + staggered AGE-cold-path (+3 sessions) — **cutline-protected**
 
