@@ -216,9 +216,10 @@ services:
       # uses the env-injected value (passed via the AI_MEMORY_API_KEY
       # env var above so the in-container `curl` reads the same value
       # the daemon authenticates against).
+      # #4876: the key is piped to `curl --config -` (printf builtin, stdin), never an argv word.
       # #3705 — the listener is TLS-only; probe it by the hostname the
       # certificate names, trusting the fleet CA (never `-k`).
-      test: ["CMD-SHELL", "curl -f -sS --max-time 3 --cacert /tls/ca.pem -H \"X-API-Key: $$AI_MEMORY_API_KEY\" https://ic-parity-alice:19077/api/v1/capabilities"]
+      test: ["CMD-SHELL", "printf 'header = \"X-API-Key: %s\"\\n' \"$$AI_MEMORY_API_KEY\" | curl -f -sS --max-time 3 --cacert /tls/ca.pem --config - https://ic-parity-alice:19077/api/v1/capabilities"]
       interval: 10s
       timeout: 5s
       retries: 6
@@ -276,7 +277,7 @@ services:
     healthcheck:
       # See alice's block for the X-API-Key healthcheck rationale; #3705 —
       # TLS-only listener, probed by certificate hostname against the CA.
-      test: ["CMD-SHELL", "curl -f -sS --max-time 3 --cacert /tls/ca.pem -H \"X-API-Key: $$AI_MEMORY_API_KEY\" https://ic-parity-bob:19077/api/v1/capabilities"]
+      test: ["CMD-SHELL", "printf 'header = \"X-API-Key: %s\"\\n' \"$$AI_MEMORY_API_KEY\" | curl -f -sS --max-time 3 --cacert /tls/ca.pem --config - https://ic-parity-bob:19077/api/v1/capabilities"]
       interval: 10s
       timeout: 5s
       retries: 6
