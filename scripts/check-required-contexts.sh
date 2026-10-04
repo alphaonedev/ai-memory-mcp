@@ -1247,11 +1247,13 @@ selftest() {
     local wf="$scratch/wf" al="$scratch/allow.txt" mi="$scratch/mirror.txt"
     local dal="$scratch/duptrig-allow.txt" nrq="$scratch/not-required.txt"
     local nwd="$scratch/gates-not-wired.txt" sd="$scratch/scripts"
+    local sx="$scratch/scope-excluded.txt"   # #5331 exclusion ledger fixture
     mkdir -p "$wf" "$sd"
     : > "$al"
     : > "$dal"
     : > "$nrq"
     : > "$nwd"
+    : > "$sx"
     # Rule (g)'s fixture script set: ONE gate, wired by the clean workflow's
     # classify body below (a non-comment `run:` line). Every leg that is not
     # about rule (g) therefore sees a wired set and cannot fail on (g).
@@ -1351,8 +1353,9 @@ TXT
         : > "$al"
         : > "$dal"
         : > "$nrq"
+        : > "$sx"
         covered="ci.yml"
-        rm -f "$wf/dup.yml"
+        rm -f "$wf/dup.yml" "$wf/pr.yml" "$wf/disp.yml"
     }
 
     run_fixture() {
@@ -1361,6 +1364,7 @@ TXT
             RQC_WORKFLOW_DIR="$wf" RQC_MIRROR_FILE="$mi" RQC_ALLOW_FILE="$al" \
                 RQC_DUPTRIG_ALLOW_FILE="$dal" RQC_NOTREQ_FILE="$nrq" \
                 RQC_SCRIPTS_DIR="$sd" RQC_NOTWIRED_FILE="$nwd" \
+                RQC_SCOPE_EXCLUDED_FILE="$sx" \
                 RQC_COVERED_WORKFLOWS="$covered" \
                 RQC_PROTECTED_BRANCH="release/v1.0.0" \
                 bash "${BASH_SOURCE[0]}" >/dev/null 2>&1
@@ -1666,6 +1670,7 @@ YAML
         RQC_WORKFLOW_DIR="$wf" RQC_MIRROR_FILE="$mi" RQC_ALLOW_FILE="$al" \
             RQC_DUPTRIG_ALLOW_FILE="$dal" RQC_NOTREQ_FILE="$nrq" \
             RQC_SCRIPTS_DIR="$sd" RQC_NOTWIRED_FILE="$nwd" \
+            RQC_SCOPE_EXCLUDED_FILE="$sx" \
             RQC_COVERED_WORKFLOWS="$covered" \
             RQC_PROTECTED_BRANCH="release/v1.0.0" \
             bash "${BASH_SOURCE[0]}" 2>&1 || true
@@ -1893,6 +1898,124 @@ YAML
     write_clean
     g_expect "clean control" 0 "" || return 2
     echo "  [g] a gate script no workflow references: CAUGHT BY RULE (g) (a commented-out reference does not count; a dated+tracked ledger entry passes; undated / non-#issue / stale / wired-but-ledgered entries and an empty script set all FAIL)"
+
+    # ---- (f) SCOPE is derived from TRIGGERS, not from a hand-kept list (#5331)
+    #
+    # Before #5331 rule (f) only saw the five workflows in a hardcoded list, so
+    # seven PR-triggered workflows (15 jobs, including token-budget.yml and
+    # tool-count-drift.yml) could carry a gate that merged red. The scope is now
+    # every workflow whose `on:` includes pull_request, pull_request_target or
+    # merge_group, minus a dated, tracked exclusion ledger. These legs plant
+    # each trigger SHAPE in a second workflow whose one job is well-formed,
+    # unfiltered, matrix-free and `needs`-free, so no rule except (f) can claim
+    # the verdict (isolation is asserted, not assumed).
+    local s_out
+    scope_wf() { # $1 file  $2 literal `on:` block (printf-escaped)
+        {
+            printf 'name: scope-probe\n'
+            printf "$2"
+            printf '\njobs:\n  scopegate:\n    name: Scope probe gate\n    runs-on: ubuntu-latest\n'
+            printf '    steps:\n      - uses: actions/checkout@v4\n      - name: run\n        run: echo ok\n'
+        } > "$wf/$1"
+    }
+    scope_expect() { # $1 label  $2 0|nonzero  $3 needle-or-empty
+        local o r
+        o="$(run_out)"
+        r="$(run_fixture)"
+        if [ "$2" = "0" ] && [ "$r" != "0" ]; then
+            echo "  [scope] $1: expected PASS, got exit $r. Output was:" >&2; printf '%s\n' "$o" >&2; return 2
+        fi
+        if [ "$2" != "0" ] && [ "$r" = "0" ]; then
+            echo "  [scope] $1: NOT CAUGHT (gate passed) — FAIL" >&2; return 2
+        fi
+        if [ -n "$3" ]; then
+            case "$o" in
+                *"$3"*) ;;
+                *) echo "  [scope] $1: rejected, but NOT via the expected rule ('$3' absent) — the leg would pass for the wrong reason. Output was:" >&2; printf '%s\n' "$o" >&2; return 2 ;;
+            esac
+            case "$o" in
+                *"RULE (a)"*|*"RULE (b"*|*"RULE (c)"*|*"RULE (d)"*|*"RULE (e)"*)
+                    echo "  [scope] $1: another rule ALSO fired — this leg is not isolating the scope rule. Output was:" >&2; printf '%s\n' "$o" >&2; return 2 ;;
+            esac
+        fi
+        return 0
+    }
+    local pr_needle="RULE (f) — pr.yml job 'scopegate'"
+
+    # 1. a PR-triggered workflow absent from EVERY ledger FAILS
+    write_clean
+    scope_wf pr.yml 'on:\n  pull_request:\n    branches: [main, develop, "release/**"]\n'
+    scope_expect "PR-triggered workflow absent from every ledger" nonzero "$pr_needle" || return 2
+    # 2. pull_request_target is the ONLY PR trigger of claude-md-rule-compare.yml
+    write_clean
+    scope_wf pr.yml 'on:\n  pull_request_target:\n    branches: [main]\n'
+    scope_expect "pull_request_target-only workflow" nonzero "$pr_needle" || return 2
+    # 3. merge_group alone
+    write_clean
+    scope_wf pr.yml 'on:\n  merge_group:\n'
+    scope_expect "merge_group-only workflow" nonzero "$pr_needle" || return 2
+    # 4. the flow-sequence / scalar / block-sequence `on:` forms
+    write_clean
+    scope_wf pr.yml 'on: [push, pull_request]\n'
+    scope_expect "flow-sequence on: [push, pull_request]" nonzero "$pr_needle" || return 2
+    scope_wf pr.yml 'on: pull_request_target\n'
+    scope_expect "scalar on: pull_request_target" nonzero "$pr_needle" || return 2
+    scope_wf pr.yml 'on:\n  - push\n  - merge_group\n'
+    scope_expect "block-sequence on: [push, merge_group]" nonzero "$pr_needle" || return 2
+    # 5. workflows with NO PR trigger are out of scope (control: must PASS)
+    write_clean
+    scope_wf pr.yml 'on:\n  workflow_dispatch:\n'
+    scope_expect "workflow_dispatch-only workflow" 0 "" || return 2
+    scope_wf pr.yml 'on:\n  push:\n    branches: [main]\n  schedule:\n    - cron: "0 3 * * *"\n  workflow_dispatch:\n'
+    scope_expect "push+schedule+dispatch workflow (no PR trigger)" 0 "" || return 2
+    # 6. a trigger block this parser cannot read FAILS CLOSED, never reads as out-of-scope
+    write_clean
+    printf 'name: scope-probe\njobs:\n  scopegate:\n    name: Scope probe gate\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n' > "$wf/pr.yml"
+    scope_expect "workflow with no recognisable trigger" nonzero "RULE (f) SCOPE — workflow 'pr.yml' declares no trigger" || return 2
+    # 7. both legitimate dispositions of an in-scope job still PASS
+    write_clean
+    scope_wf pr.yml 'on:\n  pull_request:\n    branches: [main]\n'
+    printf 'pr.yml scopegate 2026-10-04 #5331 deliberate, tracked\n' > "$nrq"
+    scope_expect "in-scope job declared in the not-required ledger" 0 "" || return 2
+    write_clean
+    scope_wf pr.yml 'on:\n  pull_request:\n    branches: [main]\n'
+    printf 'Scope probe gate\n' >> "$mi"
+    scope_expect "in-scope job declared in the mirror" 0 "" || return 2
+    # 8. the exclusion ledger: a dated, tracked row removes a PR-triggered workflow from scope
+    write_clean
+    scope_wf pr.yml 'on:\n  pull_request:\n    branches: [main]\n'
+    printf 'pr.yml 2026-10-04 #5331 deliberate: probe workflow is advisory\n' > "$sx"
+    scope_expect "dated+tracked exclusion row" 0 "" || return 2
+    # 9. ...and the ledger cannot rot: stale / absent-file / malformed rows FAIL
+    write_clean
+    scope_wf pr.yml 'on:\n  workflow_dispatch:\n'
+    printf 'pr.yml 2026-10-04 #5331 workflow lost its PR trigger\n' > "$sx"
+    scope_expect "exclusion row for a workflow that is no longer PR-triggered (stale)" nonzero "SCOPE-EXCLUDED LEDGER STALE" || return 2
+    write_clean
+    printf 'ghost.yml 2026-10-04 #5331 workflow does not exist\n' > "$sx"
+    scope_expect "exclusion row for a workflow file that does not exist" nonzero "SCOPE-EXCLUDED LEDGER STALE" || return 2
+    write_clean
+    scope_wf pr.yml 'on:\n  pull_request:\n    branches: [main]\n'
+    printf 'pr.yml #5331 no date\n' > "$sx"
+    scope_expect "undated exclusion row" nonzero "SCOPE-EXCLUDED LEDGER MALFORMED" || return 2
+    printf 'pr.yml 2026-10-04 5331 issue is not #n\n' > "$sx"
+    scope_expect "exclusion row whose issue is not #<n>" nonzero "SCOPE-EXCLUDED LEDGER MALFORMED" || return 2
+    printf 'pr.yml 2026-10-04 #5331\n' > "$sx"
+    scope_expect "exclusion row with no note" nonzero "SCOPE-EXCLUDED LEDGER MALFORMED" || return 2
+    # 10. excluding a workflow that CARRIES a required context is a contradiction
+    write_clean
+    scope_wf pr.yml 'on:\n  pull_request:\n    branches: [main, develop, "release/**"]\n'
+    printf 'Scope probe gate\n' >> "$mi"
+    printf 'pr.yml 2026-10-04 #5331 contradiction probe\n' > "$sx"
+    scope_expect "excluded workflow carrying a mirror context" nonzero "RULE (f) SCOPE" || return 2
+    # 11. a declared carrier (the qualify-sha.py attribution set) outside the derived scope FAILS
+    write_clean
+    scope_wf disp.yml 'on:\n  workflow_dispatch:\n'
+    covered="ci.yml disp.yml"
+    scope_expect "declared carrier that is not PR-triggered" nonzero "RULE (f) CARRIER" || { covered="ci.yml"; return 2; }
+    covered="ci.yml"
+    write_clean
+    echo "  [scope] #5331 trigger-derived scope: PR / pull_request_target / merge_group / flow / scalar / block-seq triggers CAUGHT; dispatch-only and push-only PASS; unreadable triggers FAIL CLOSED; both dispositions PASS; exclusion ledger (valid PASSES; stale / absent-file / malformed / mirror-carrying FAIL); carrier-outside-scope FAILS"
 
     echo "required-contexts gate self-test: PASS (load-bearing — catches the #2494 (b1) wedge, the (a) unmatched-context class, the (c) path-filtered carrier, the (b3) unguarded step, the (b4) unallowlistable decider 'if:', both directions of the (b2) ratchet, the (d) #2508 cancelled-duplicate carrier in its verbatim historical form, and the (f) #2636 unenforced-by-default job with its ledger-rot and scope cross-checks, and the (g) #3967 gate script no workflow runs with its own ledger hygiene; spares a clean tree, all four (d) near-miss shapes, both legitimate (f) dispositions, and a dated (g) ledger entry)"
 }
