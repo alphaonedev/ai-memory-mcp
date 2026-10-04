@@ -731,12 +731,25 @@ for path in files:
                 for m in rx.finditer(joined):
                     if m.start() < len(prev) < m.start(1):
                         hits.append((m.group(1), m.group(0)))
+            # Markdown only: the same join with the emphasis / code-span markers
+            # folded out of both lines, so a bold or code-span transition wrapped
+            # across the line break is seen too (#5340). The marker fold reaches one
+            # line back, like the join itself.
+            if not is_html:
+                fprev = MARKS.sub('', prev)
+                fjoined = fprev + ' ' + MARKS.sub('', body)
+                for rx in ANCHORS:
+                    for m in rx.finditer(fjoined):
+                        if m.start() < len(fprev) < m.start(1):
+                            hits.append((m.group(1), m.group(0)))
         # Every anchor spells a gap as one space, so match it against the
         # whitespace-folded line (html is already folded by plain(); #5200).
         aline = WS.sub(' ', line)
         # A markdown claim wrapped in emphasis or a code span (`steps **v40 -> v52**`)
         # is also matched with those markers folded out (#5261); html lost its
         # tags in plain(). The raw view stays, so anchors that spell markers still match.
+        # Same-line view; the wrapped-across-a-line view is the markdown fold in the
+        # join block above (#5340).
         # Bounds pinned by the self-test (#5337): html literal markers (a backtick span
         # typed into html text) are NOT folded, and the html join reset above is html-only.
         views = [aline] if is_html else [aline, MARKS.sub('', aline)]
@@ -2830,6 +2843,14 @@ Schema v52	(was v51)
 Schema v53	(was v51)
 Current version:  52 at v1.0.0
 Current version:  53 at v1.0.0
+a v0.8.x DB steps **v40 →
+v52** on boot.
+a v0.8.x DB steps **v40 →
+v53** on boot.
+a v0.8.x DB steps `v40 ->
+v52` on boot.
+a v0.8.x DB steps `v40 ->
+v53` on boot.
 R4MD
     cat > "$tmpdir/docs/schema-fixture.html" <<'R4HTML'
 <span class="pill">v52&nbsp;schema</span>
@@ -2995,6 +3016,8 @@ R4HTML
         'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:62 claims "52"' \
         'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:64 claims "52"' \
         'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:66 claims "52"' \
+        'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:69 claims "52"' \
+        'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:73 claims "52"' \
         'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:41 claims "52"' \
         'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:43 claims "52"' \
         'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:45 claims "52"' \
@@ -3021,6 +3044,7 @@ R4HTML
         'docs/schema-fixture.html:74 ' 'docs/block-fixture.html:' \
         'docs/schema-fixture.html:81 ' 'docs/schema-fixture.html:85 ' 'docs/schema-fixture.html:87 ' 'docs/schema-fixture.html:89 ' 'docs/schema-fixture.html:94 ' 'docs/postgres-age-guide.md:59 ' 'docs/postgres-age-guide.md:60 ' \
         'docs/postgres-age-guide.md:63 ' 'docs/postgres-age-guide.md:65 ' 'docs/postgres-age-guide.md:67 ' \
+        'docs/postgres-age-guide.md:71 ' 'docs/postgres-age-guide.md:75 ' \
         'docs/postgres-age-guide.md:42 ' 'docs/postgres-age-guide.md:44 ' 'docs/postgres-age-guide.md:46 ' \
         'docs/postgres-age-guide.md:48 ' 'docs/postgres-age-guide.md:50 ' 'docs/postgres-age-guide.md:51 ' \
         'docs/postgres-age-guide.md:52 ' 'docs/postgres-age-guide.md:53 '
@@ -3035,6 +3059,7 @@ R4HTML
     echo "PASS: self-test #5199 - two adjacent html block elements are two claims: a paragraph ending with the identifier does not join the next paragraph's 52 (also when the next line opens with a block tag, and when the previous line ends with a closing block tag and the next line carries no tag); a closing tag in the MIDDLE of the previous line does not cut a claim wrapped inside the next paragraph; a claim wrapped inside one paragraph is still joined (52 REJECTED, 53 ACCEPTED)"
     echo "PASS: self-test #5200/#5339 - ident-less anchors (re-stamped to v1.0.0 (schema vN), Schema vN (was vM), Current version: N at v1.0.0) each match a markdown claim in BOTH a doubled-space and a tab variant: planted 52 REJECTED, 53 ACCEPTED"
     echo "PASS: self-test #5337 - join boundaries pinned: a line ending with an OPENING block tag still joins (52 REJECTED), markdown is not tag-aware (a closing tag at the end of a markdown line, or an opening tag at the start of the next, still joins; 52 REJECTED), html literal backticks are not folded (documented bound)"
+    echo "PASS: self-test #5340 - a markdown transition in bold or a code span wrapped across a line break (steps **v40 -> / v52**): planted 52 REJECTED, 53 ACCEPTED"
     echo "PASS: self-test #5261/#5338 - markdown steps anchor wrapped in bold, a code span or underscore emphasis (steps **v40 -> v52**, a backtick span, _v40 -> v52_, __v40 -> v52__): planted 52 REJECTED, 53 ACCEPTED; an identifier with an inner underscore (v4_0) is not rewritten by the fold"
     echo "PASS: self-test #5195 - a claim wrapped across a <br> line or split across table cells is still joined: planted 52 REJECTED, 53 ACCEPTED"
     echo "PASS: self-test #5196 - the look-back bound is pinned both ways: 3 inline tag-only lines join (52 REJECTED), 4 do not"
