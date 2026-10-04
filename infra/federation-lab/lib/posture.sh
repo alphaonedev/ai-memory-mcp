@@ -152,9 +152,10 @@ _lab_posture_expr() {
     crate::*)
       cname="$(printf '%s' "$expr" | sed -n 's/.*::\([A-Z0-9_]*\)$/\1/p')"
       [ -n "$cname" ] || return 1
-      # Module path of the const: `crate::a::b::NAME` -> a/b; a type segment
-      # (`AppConfig::NAME`) is dropped so the file that owns the type is searched.
-      modp="$(printf '%s' "$expr" | sed -n 's/^crate:://; s/::[A-Z0-9_]*$//; s/::[A-Z][A-Za-z0-9]*$//; s|::|/|gp')"
+      # Module path of the const: `crate::a::b::NAME` -> a/b, `crate::tls::NAME` -> tls; a
+      # type segment (`AppConfig::NAME`) is dropped so the file that owns the type is
+      # searched. Every row prints a path (#4511-R6: `p` must not depend on a `::` left).
+      modp="$(printf '%s' "$expr" | sed -n 's/^crate:://; s/::[A-Z0-9_]*$//; s/::[A-Z][A-Za-z0-9]*$//; s|::|/|g; p')"
       val="$(_lab_posture_const "$root" "$cname" "$modp")"
       [ -n "$val" ] || return 1
       printf '%s' "$val"; return 0 ;;
@@ -259,7 +260,10 @@ lab_posture_selftest() {
   printf 'pub const MODE_REFUSE: &str = "warn";\n' > "$shadow/src/aaa_shadow.rs"
   local real_root="$root"; root="$shadow"
   ( _leg "a shadow duplicate of a path-named const does not change the result" 0 ) || bad=1
-  printf 'pub const ENV_PERMISSIONS_MODE: &str = "SHADOW_ENV";\n' >> "$shadow/src/aaa_shadow.rs"
+  printf 'pub const FED_CERT_PEER_BINDING_ENV: &str = "SHADOW_ENV";\n' >> "$shadow/src/aaa_shadow.rs"
+  ( _leg "a shadow duplicate of a single-module path-named const (crate::tls) does not change the result" 0 ) || bad=1
+  # ENV_DB_SYNCHRONOUS is a re-export (`crate::storage` does not define it), so it is found by name.
+  printf 'pub const ENV_DB_SYNCHRONOUS: &str = "SHADOW_ENV";\n' >> "$shadow/src/aaa_shadow.rs"
   ( _leg "a name-only const with two distinct values is cannot-check, not first-match" 2 ) || bad=1
   root="$real_root"; rm -rf "$shadow"
   unset -f _leg
