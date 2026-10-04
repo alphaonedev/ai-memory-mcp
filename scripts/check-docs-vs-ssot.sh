@@ -617,6 +617,8 @@ PILL = re.compile(r'class="pill"[^>]*>\s*v([0-9]+)\s+schema\s*<')
 
 TAG = re.compile(r'<[^>]+>')
 WS = re.compile(r'\s+')
+# Markdown emphasis and code-span markers (\x60 is the backtick).
+MARKS = re.compile(r'[*_\x60]+')
 PRIOR = re.compile(r'PRIOR RELEASE', re.IGNORECASE)
 # A block that ends a claim's paragraph. Not `br` (a break inside the paragraph)
 # and not `td`/`th` (a subject cell and its value cell are one row's claim; #5195).
@@ -723,8 +725,13 @@ for path in files:
         # Every anchor spells a gap as one space, so match it against the
         # whitespace-folded line (html is already folded by plain(); #5200).
         aline = WS.sub(' ', line)
+        # A markdown claim wrapped in emphasis or a code span (`steps **v40 -> v52**`)
+        # is also matched with those markers folded out (#5261); html lost its
+        # tags in plain(). The raw view stays, so anchors that spell markers still match.
+        views = [aline] if is_html else [aline, MARKS.sub('', aline)]
         for rx in ANCHORS:
-            hits.extend((m.group(1), m.group(0)) for m in rx.finditer(aline))
+            for view in views:
+                hits.extend((m.group(1), m.group(0)) for m in rx.finditer(view))
         if is_html:
             hits.extend((m.group(1), m.group(0)) for m in PILL.finditer(htmlmod.unescape(raw)))
         seen = set()
@@ -2775,6 +2782,10 @@ Schema v52  (was v51)
 Schema v53  (was v51)
 Current version:	52 at v1.0.0
 Current version:	53 at v1.0.0
+a v0.8.x DB steps **v40 → v52** on boot.
+a v0.8.x DB steps **v40 → v53** on boot.
+a v0.8.x DB steps `v40 -> v52` on boot.
+a v0.8.x DB steps `v40 -> v53` on boot.
 R4MD
     cat > "$tmpdir/docs/schema-fixture.html" <<'R4HTML'
 <span class="pill">v52&nbsp;schema</span>
@@ -2926,7 +2937,9 @@ R4HTML
         'docs/schema-fixture.html:83 claims "52"' \
         'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:41 claims "52"' \
         'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:43 claims "52"' \
-        'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:45 claims "52"'
+        'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:45 claims "52"' \
+        'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:47 claims "52"' \
+        'CURRENT_SCHEMA_VERSION: docs/postgres-age-guide.md:49 claims "52"'
     do grep -qF "$_want" <<<"$r4_out" || { echo "FAIL: self-test #3248 r4 - not flagged: $_want" >&2; cd "$REPO_ROOT"; exit 1; }; done
     for _not in \
         'docs/postgres-age-guide.md:3 ' 'docs/postgres-age-guide.md:4 ' \
@@ -2947,7 +2960,8 @@ R4HTML
         'docs/schema-fixture.html:52 ' 'docs/schema-fixture.html:62 ' 'docs/schema-fixture.html:68 ' \
         'docs/schema-fixture.html:74 ' 'docs/block-fixture.html:' \
         'docs/schema-fixture.html:81 ' 'docs/schema-fixture.html:85 ' 'docs/schema-fixture.html:87 ' \
-        'docs/postgres-age-guide.md:42 ' 'docs/postgres-age-guide.md:44 ' 'docs/postgres-age-guide.md:46 '
+        'docs/postgres-age-guide.md:42 ' 'docs/postgres-age-guide.md:44 ' 'docs/postgres-age-guide.md:46 ' \
+        'docs/postgres-age-guide.md:48 ' 'docs/postgres-age-guide.md:50 '
     do grep -qF "$_not" <<<"$r4_out" && { echo "FAIL: self-test #3248 r4 - canonical/history line flagged: $_not" >&2; cd "$REPO_ROOT"; exit 1; }
     done
     echo "PASS: self-test #4850 - claim wrapped across two lines: planted 52 REJECTED, 53 ACCEPTED"
@@ -2957,6 +2971,7 @@ R4HTML
     echo "PASS: self-test #5154/#5196 - html look-back stops at every block-boundary tag, opening and closing (p div li ul ol tr table h1-h6 section, any case, with attributes): the unrelated 52 is not joined; an inline, br or table-cell tag-only line does not stop it (52 REJECTED)"
     echo "PASS: self-test #5199 - two adjacent html block elements are two claims: a paragraph ending with the identifier does not join the next paragraph's 52 (also when the next line opens with a block tag); a claim wrapped inside one paragraph is still joined (52 REJECTED, 53 ACCEPTED)"
     echo "PASS: self-test #5200 - ident-less anchors (Current schema = vN, re-stamped to v1.0.0 (schema vN)) match a markdown claim with doubled spaces or a tab: planted 52 REJECTED, 53 ACCEPTED"
+    echo "PASS: self-test #5261 - markdown steps anchor wrapped in bold or a code span (steps **v40 -> v52**, a backtick span): planted 52 REJECTED, 53 ACCEPTED"
     echo "PASS: self-test #5195 - a claim wrapped across a <br> line or split across table cells is still joined: planted 52 REJECTED, 53 ACCEPTED"
     echo "PASS: self-test #5196 - the look-back bound is pinned both ways: 3 inline tag-only lines join (52 REJECTED), 4 do not"
     echo "PASS: self-test #4511-R6 - html look-back skips up to 3 tag-only lines (52 REJECTED, 53 ACCEPTED), stops past 3, and markdown never looks back past a blank line"
