@@ -216,7 +216,7 @@ def retag(gate, allow: List[Entry], pend: List[Entry], source: str, match: Optio
 
 
 # ---------------------------------------------------------------- refusal cases
-REFUSAL_CASE_COUNT = 18
+REFUSAL_CASE_COUNT = 20
 
 
 def _f(gate, rel: str, line: str, flagged: bool = False):
@@ -243,6 +243,9 @@ def refusal_cases(root: Path) -> List[str]:
     rc, na, _np, _m = plan(gate, _f(gate, "x.sh", 'curl -u a:$B h', True), [], [], True, False, "reason: r", False, None, dl)
     if rc != 1 or na:
         bad.append("regen: a denylist-flagged line was added to the allowlist")
+    rc, na, _np, _m = plan(gate, _f(gate, "x.sh", a_line, True), [], [], True, False, "reason: r", False, None, dl)
+    if rc != 1 or na:
+        bad.append("regen: a denylist-tagged line the prose rules pass was added to allow (#4910)")
     rc, na, _np, _m = plan(gate, _f(gate, "d.md", "mysql -p$PW db"), [], [], True, False, "reason: r", False, None, dl)
     if rc != 1 or na:
         bad.append("regen: a prose line was added to the allowlist")
@@ -295,6 +298,9 @@ def refusal_cases(root: Path) -> List[str]:
     rc, na, npd, _m = retag(gate, allowed, [], "allow", "x.sh", "#7", True)
     if rc != 0 or na or len(npd) != 1 or npd[0][0] != "#7":
         bad.append("regen: --to-pending did not move the allow entry (#4911)")
+    rows = render(ALLOW_HEAD, [("#2", "b.sh", 1, "y", 1), ("#1", "a.sh", 1, "x", 1)]).split("\n")
+    if rows[-3:-1] != ["#1 | a.sh | 1 | x", "#2 | b.sh | 1 | y"]:
+        bad.append("regen: rendered rows are not sorted by file then text (#4910)")
     if foreign_comments(ALLOW_HEAD, ALLOW_HEAD + "#12 | f | 1 | x\n"):
         bad.append("regen: an issue-keyed entry row was taken for a hand comment (#4902)")
     if not foreign_comments(ALLOW_HEAD, ALLOW_HEAD + "# a hand note\n"):

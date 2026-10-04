@@ -930,6 +930,18 @@ def merge_base_hits(root: Path, allow: List[Entry]) -> List[str]:
     return allow_from_pending(allow, parse_entries(old, "base-pending", False, []), changed)
 
 
+def empty_scan_faults(n_exec: int, allow: List[Entry], found: Dict[str, List[Found]]) -> List[str]:
+    """A scan that saw nothing is a fault, never a pass (fail closed)."""
+    out: List[str] = []
+    if n_exec == 0:
+        out.append("scanned 0 executable files (fail closed)")
+    if not allow:
+        out.append("allowlist is empty (fail closed)")
+    if not any(not r.lower().endswith((".md", ".html", ".htm")) for r in found):
+        out.append("zero triggered lines (fail closed)")
+    return out
+
+
 def run(root: Path) -> int:
     try:
         dl = load_denylist(root)
@@ -939,12 +951,7 @@ def run(root: Path) -> int:
     except Exception as exc:  # noqa: BLE001 - fail closed
         print("FAULT: %s" % exc, file=sys.stderr)
         return 2
-    if n_exec == 0:
-        faults.append("scanned 0 executable files (fail closed)")
-    if not allow:
-        faults.append("allowlist is empty (fail closed)")
-    if not any(not r.lower().endswith((".md", ".html", ".htm")) for r in found):
-        faults.append("zero triggered lines (fail closed)")
+    faults.extend(empty_scan_faults(n_exec, allow, found))
     if faults:
         print("\n".join("FAULT: " + f for f in faults), file=sys.stderr)
         return 2
@@ -1184,6 +1191,24 @@ def hardening_cases(root: Path, dl) -> Tuple[List[str], int]:
             bad.append("%s fed from a variable is not tagged denylist (#4920)" % label)
         elif not check_allow_vs_denylist({"c.sh": res}, [("reason: r", "c.sh", 1, norm(line), 1)]):
             bad.append("%s fed from a variable could be allowed (#4920)" % label)
+    # the judge refuses a line held in both lists, and a prose line held in allow (#4910)
+    n += 3
+    one = {"a.sh": [(1, "x --token $T", ["flag"])]}
+    both = judge(one, [("reason: r", "a.sh", 1, "x --token $T", 1)], [("#1", "a.sh", 1, "x --token $T", 1)], dl)[0]
+    if not any("both allowed and pending" in h for h in both):
+        bad.append("a line held in both lists passed the judge (#4910)")
+    prose_hit = judge({"a.md": [(1, "x --token $T", ["flag"])]},
+                      [("reason: r", "a.md", 1, "x --token $T", 1)], [], dl)[0]
+    if not any("cannot be allowed" in h for h in prose_hit):
+        bad.append("a prose line held in allow passed the judge (#4910)")
+    if len(empty_scan_faults(0, [("reason: r", "a.sh", 1, "x", 1)], one)) != 1:
+        bad.append("a scan of zero executable files was not a fault (#4910)")
+    # an extensionless dotfile is a script only when its first line is a shell shebang (#4910)
+    n += 2
+    if file_class(".runner", "#!/bin/bash\ncurl x\n") != "shell":
+        bad.append("a dotfile with a shell shebang was not classed as shell (#4910)")
+    if file_class(".runner", "plain notes\n") is not None:
+        bad.append("a dotfile with no shebang was classed as a script (#4910)")
     # #4922 and #4909: scratch roots under the checkout's .local-runs
     scratch = root / ".local-runs"
     scratch.mkdir(parents=True, exist_ok=True)
