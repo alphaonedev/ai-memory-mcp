@@ -656,6 +656,35 @@ def self_test() -> int:
     else:
         print("PASS: self-test - R6 a base-side trusted change after the fork is not charged to the head (#5179)")
 
+    # #5180: the COUNT CHANGED branch uses the same dynamic fence as the rule branch; no other census diff carries
+    # a backtick run, so a static fence there was never caught.
+    work, _, _ = fresh_pair("countfence")
+    repo = work / "repo"
+    claude = repo / "CLAUDE.md"
+    census_line = "The surface has 103 MCP tools"
+    claude.write_text(claude.read_text(encoding="utf-8").replace(
+        census_line, "````\n````\n" + census_line, 1), encoding="utf-8")
+    guard.update_manifest_quiet(repo)
+    fence_base = commit_all(repo, "base with a backtick run next to the census")
+    base_root = work / "baseroot2"
+    shutil.copytree(repo, base_root, ignore=shutil.ignore_patterns(".git"))
+    shutil.copyfile(guard_path, base_root / GUARD_REL)
+    claude.write_text(claude.read_text(encoding="utf-8").replace(census_line, "The surface has 104 MCP tools", 1),
+                      encoding="utf-8")
+    guard.update_manifest_quiet(repo)
+    head_sha = commit_all(repo, "head change")
+    try:
+        report, failed = compare(base_root, repo, fence_base, head_sha, work / "scratch", guard.fixture_index_pins())
+    except RuntimeError as exc:
+        report, failed = f"RESULT: FAIL (closed) - {exc}", True
+    if failed or "COUNT CHANGED" not in report or "`````diff" not in report:
+        print(f"FAIL: self-test - R6 the COUNT CHANGED fence is not longer than a backtick run\n{report}",
+              file=sys.stderr)
+        failures.append("count fence")
+    else:
+        print("PASS: self-test - R6 the COUNT CHANGED fence is longer than a backtick run in the census section "
+              "(#5180)")
+
     def base_claude_symlink(root):
         target = root / "CLAUDE.md"
         target.rename(root / "CLAUDE.real.md")
