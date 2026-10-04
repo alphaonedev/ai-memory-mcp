@@ -942,14 +942,23 @@ def bare_operand_problem(words: list, idx, bins):
     if base in KNOWN_NONEXEC or base in PRINT_ONLY or base == "ai-memory":
         return None
     resolved = getattr(bins, "resolved", None) or frozenset()
+    runner = base in SHELLS or base in STDIN_RUNNERS or INTERP_BASE_RE.match(base) is not None
     k = idx + 1
     while k < len(words):
         w = words[k]
         rm = REDIR_RE.match(w)
         if rm is not None and not w.startswith(("<(", ">(")):
+            op = w[:len(w) - len(rm.group(1))]
+            tgt = rm.group(1) or (words[k + 1] if k + 1 < len(words) else "")
             k += 1 if rm.group(1) else 2
-            continue
-        k += 1
+            # a shell or interpreter runs what its stdin redirection or here-string names
+            # (#5095): that target must resolve like an operand; a heredoc body is read
+            # by rule R3 as script text
+            if not (runner and "<" in op and ">" not in op and not re.fullmatch(r"\d*<<-?", op)):
+                continue
+            w = tgt
+        else:
+            k += 1
         val, exp = unquote(w)
         if not exp or mask_expansions(val) != "\x01":
             continue
@@ -1083,6 +1092,8 @@ def operand_problem(words: list, idx, bins):
 # Anything else is executed: its lines are checked as script lines. A no-shebang file that
 # a later line runs (bash PATH, PATH as a command, . PATH, ExecStart=PATH) is executed.
 DATA_HOMES = ("/etc/ai-memory/", "/opt/ai-memory/.config/ai-memory/", "/etc/pgbouncer/")
+# commands that run the words or text they read on stdin (#5095)
+STDIN_RUNNERS = {"xargs", "parallel", "source", ".", "eval", "env"}
 DATA_SAFE = {"chown", "chgrp", "test", "[", "[[", "stat", "ls", "rm", "echo", "printf", "tee", "mkdir", "useradd"}
 SED_SUBST_RE = re.compile(r"^s([^\\\n])(?:\\.|(?!\1).)*\1(?:\\.|(?!\1).)*\1[gpI0-9]*$", re.S)
 
@@ -1154,7 +1165,7 @@ def path_uses(stmt: str, consts: dict, out: list, depth: int = 0) -> None:
         out.append((subst_consts(stmt, consts), False))
         return
     cmds, subs, _ansi = t
-    for words, _pipe_in, term in cmds:
+    for ci, (words, _pipe_in, term) in enumerate(cmds):
         idx, scripts = resolve(words)
         for sv, _sexp in scripts:
             path_uses(sv, consts, out, depth + 1)
@@ -1165,6 +1176,17 @@ def path_uses(stmt: str, consts: dict, out: list, depth: int = 0) -> None:
             if has_c and sw is not None:
                 path_uses(unquote(sw)[0], consts, out, depth + 1)
         safe = base in DATA_SAFE
+        nxt = cmds[ci + 1][0] if term == "|" and ci + 1 < len(cmds) else None
+        if nxt:
+            # words piped into a shell, an interpreter or xargs are run, not data (#5095)
+            # the wrappers too: resolve() looks through xargs and env to the command they run
+            ni, _ns = resolve(nxt)
+            fi = skip_prefix(nxt, 0)
+            last = fi if ni is None else max(ni, fi)
+            for nw in nxt[fi:last + 1]:
+                nb = posixpath.basename(unquote(nw)[0])
+                if nb in SHELLS or nb in STDIN_RUNNERS or INTERP_BASE_RE.match(nb):
+                    safe = False
         if base == "chmod":
             # a mode with an execute bit makes the named file runnable; on a parent
             # directory it only grants traversal, so it counts for an exact match only
@@ -1199,22 +1221,51 @@ def path_uses(stmt: str, consts: dict, out: list, depth: int = 0) -> None:
         path_uses(s, consts, out, depth + 1)
 
 
+def use_glob(val: str) -> str:
+    """A use's text as a glob over absolute paths (#5095). An expansion, substitution,
+    brace or tilde stands for any text; repeated slashes, ./ and ../ segments collapse
+    (a ../ after any wildcard may climb anywhere); a relative name may sit under any
+    working directory. So no spelling of a path can hide it from rule R5."""
+    g = re.sub(r"\$\{[^}]*\}|\$\([^)]*\)|\$\w+|\$[@*#?!$-]|`[^`]*`|\{[^{}]*\}|~[^/]*", "*", val)
+    g = re.sub(r"/+", "/", g)
+    segs = g.split("/")
+    ups = [i for i, sg in enumerate(segs) if sg == ".."]
+    if ups and any(re.search(r"[*?\[]", sg) for sg in segs[:ups[-1]]):
+        g = "*/" + "/".join(segs[ups[-1] + 1:])
+    elif g:
+        g = posixpath.normpath(g)
+        g = "/" + g.lstrip("/") if g.startswith("/") else g
+    if g in (".", ""):
+        return ""
+    return g if g.startswith(("/", "*")) else "*/" + g
+
+
 def runs_path(path: str, uses: list) -> bool:
-    """True when a use that is not known safe names path, a glob matching it, or a parent."""
+    """True when a use that is not known safe names path, a glob matching it, or a parent.
+    Every use is compared in canonical glob form (use_glob, #5095)."""
+    path = "/" + posixpath.normpath(path).lstrip("/")
     for val, safe in uses:
         if safe is True or not val:
             continue
+        g = use_glob(val)
+        if g == "/":
+            return True
+        if not re.search(r"[^*/]", g):
+            # a bare expansion names no place; where it is run, bare_operand_problem
+            # requires it to resolve (closed world, #5095)
+            continue
+        wild = re.search(r"[*?\[]", g) is not None
         if safe == "exact":
-            if val == path or (val.startswith("/") and re.search(r"[*?\[]", val) and fnmatch.fnmatchcase(path, val)):
+            if g == path or (wild and fnmatch.fnmatchcase(path, g)):
                 return True
             continue
-        if path in val:
+        if path in val or path in g:
             return True
-        # only an absolute glob or directory names a file; a relative one depends on
-        # the working directory, which the gate cannot know (case patterns are relative)
-        if val.startswith("/") and re.search(r"[*?\[]", val) and fnmatch.fnmatchcase(path, val):
+        if wild and fnmatch.fnmatchcase(path, g):
             return True
-        if val.startswith("/") and path.startswith(val.rstrip("/") + "/"):
+        # a directory names every file under it; a relative bare word with no slash is
+        # not a directory operand the gate can place (systemctl unit names and the like)
+        if (g.startswith("/") or "/" in val) and fnmatch.fnmatchcase(path, g.rstrip("/") + "/*"):
             return True
     return False
 
@@ -2144,8 +2195,62 @@ def classify(name: str, text: str):
         uses = []
         for _w, stmt, _st in live:
             path_uses(tf_render(stmt), consts, uses)
-        info = {"modes": modes, "consts": consts, "uses": uses}
+        info = {"modes": modes, "consts": consts, "uses": expand_uses(uses, var_values(live))}
     return lines, hits + ["%s: rule R5 did not settle on which files are data" % name], entries, stmts
+
+
+def var_values(stmts: list) -> dict:
+    """NAME -> every literal text the template assigns it (assignment, export, local,
+    declare, for-loop word), for names never read from input (#5095)."""
+    vals, unknown = {}, set()
+    for _w, stmt, _st in stmts:
+        text = tf_render(stmt)
+        for m in re.finditer(r"(?<![\w$])([A-Za-z_]\w*)(?:\[[^]]*\])?\+?=(\S*)", text):
+            vals.setdefault(m.group(1), set()).add(unquote(m.group(2).rstrip(";"))[0])
+        for m in re.finditer(r"(?:^|[\s;&|(])for\s+([A-Za-z_]\w*)\s+in\s+([^;\n]*)", text):
+            for wd in m.group(2).split():
+                vals.setdefault(m.group(1), set()).add(unquote(wd)[0])
+        for m in re.finditer(r"(?:^|[\s;&|(])(?:read|mapfile|readarray)\b([^;&|\n]*)", text):
+            unknown.update(re.findall(r"(?<![\w$-])[A-Za-z_]\w*", m.group(1)))
+        unknown.update(re.findall(r"\bprintf\s+-v\s*([A-Za-z_]\w*)", text))
+        unknown.update(re.findall(r"\bgetopts\s+\S+\s+([A-Za-z_]\w*)", text))
+    return {k: v for k, v in vals.items() if k not in unknown}
+
+
+EXPAND_CAP = 64
+
+
+def expand_uses(uses: list, values: dict) -> list:
+    """Each use with every plain $NAME / ${NAME} replaced by each value the template
+    assigns NAME, to depth 4 (#5095). The original use stays, so an unknown or operator
+    form still reads as a wildcard in use_glob. Past EXPAND_CAP variants the use stays
+    a wildcard only (fail closed: a wildcard matches more, never less)."""
+    ref = re.compile(r"\$\{([A-Za-z_]\w*)\}|\$([A-Za-z_]\w*)")
+    out = []
+    for val, safe in uses:
+        out.append((val, safe))
+        if safe is True or "$" not in val:
+            continue
+        seen, todo = {val}, [val]
+        for _ in range(4):
+            nxt = []
+            for v in todo:
+                m = next((x for x in ref.finditer(v) if (x.group(1) or x.group(2)) in values), None)
+                if m is None:
+                    continue
+                for rep in values[m.group(1) or m.group(2)]:
+                    w = v[:m.start()] + rep + v[m.end():]
+                    if w not in seen:
+                        seen.add(w)
+                        nxt.append(w)
+            todo = nxt
+            if len(seen) > EXPAND_CAP:
+                break
+        if len(seen) <= EXPAND_CAP:
+            out.extend((v, safe) for v in seen if v != val)
+        else:
+            out.append(("/*", safe))
+    return out
 
 
 def binary_vars(stmts: list) -> frozenset:
@@ -2666,6 +2771,19 @@ def build_probes() -> list:
         ('ai-memory installed under another name, listed (#4837 R12 R4)', [(dec, '      install -m 0755 /usr/local/lib/ai-memory/bin/ai-memory /usr/local/bin/aim\n' + dec)]),
         ('ai-memory moved to another name through a variable, listed (#4837 R12 R4)', [(dec, '      AIM=/usr/local/lib/ai-memory/bin/ai-memory; mv "$${AIM}" /usr/local/bin/aim\n' + dec)]),
         ('no-shebang write_files file run by bash from the script, listed (#4837 R12 R5)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      bash /etc/ai-memory/run.conf\n" + dec)]),
+        ('data-home file run through a doubled slash, listed (#4837 R12 R5, #5095)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      bash /etc//ai-memory/run.conf\n" + dec)]),
+        ('data-home file run through a ./ segment, listed (#4837 R12 R5, #5095)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      bash /etc/ai-memory/./run.conf\n" + dec)]),
+        ('data-home file run through a ../ segment, listed (#4837 R12 R5, #5095)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      bash /etc/ai-memory/../ai-memory/run.conf\n" + dec)]),
+        ('data-home file run through a brace, listed (#4837 R12 R5, #5095)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      bash /etc/ai-memory/run.con{f,x}\n" + dec)]),
+        ('data-home file run by a relative name, listed (#4837 R12 R5, #5095)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      bash etc/ai-memory/run.conf\n" + dec)]),
+        ('data-home file run through a parameter operator, listed (#4837 R12 R5, #5095)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      D=/etc/ai-memory/\n      bash \"$${D%/}/run.conf\"\n" + dec)]),
+        ('data-home file run through a directory from a substitution, listed (#4837 R12 R5, #5095)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      D=$(echo /etc/ai-memory); bash \"$${D}/run.conf\"\n" + dec)]),
+        ('data-home file run by a loop variable, listed (#4837 R12 R5, #5095)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      for f in /etc/ai-memory/run; do bash \"$f.conf\"; done\n" + dec)]),
+        ('data-home file run by words piped to xargs, listed (#4837 R12 R5, #5095)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      printf %s /etc/ai-memory/run.conf | xargs taskset -c 0\n" + dec)]),
+        ('data-home file run by a dot after PATH, listed (#4837 R12 R5, #5095)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      PATH=/etc/ai-memory:$PATH; . run.conf\n" + dec)]),
+        ('data-home file run as an unresolved operand, listed (#4837 R12 R5, #5095)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      F=$(cat /etc/x); bash \"$${F}\"\n" + dec)]),
+        ('data-home file run as an unresolved stdin target, listed (#4837 R12 R5, #5095)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      read F < /etc/x; bash < \"$${F}\"\n" + dec)]),
+        ('data-home file run by a unit ExecStartPre through a doubled slash, listed (#4837 R12 R5, #5095)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (ENVF, ENVF + "      ExecStartPre=/bin/sh /etc//ai-memory/run.conf\n")]),
         ('no-shebang write_files file run as a command, listed (#4837 R12 R5)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      /etc/ai-memory/run.conf\n" + dec)]),
         ('no-shebang write_files file at mode 0755, listed (#4837 R12 R5)', [(PROV, wf("/etc/ai-memory/run.conf", "0755", ["${X} --db /x stats"]))]),
         ('no-shebang write_files file outside the data homes, listed (#4837 R12 R5)', [(PROV, wf("/etc/default/ai-memory-run", "0644", ["${X} --db /x stats"]))]),
@@ -2731,7 +2849,8 @@ def build_probes() -> list:
     green("ai-memory --version with redirections before any subcommand (#4837 R12 R1)", [(RELOAD, RELOAD + '      /usr/local/lib/ai-memory/bin/ai-memory --version >/dev/null 2>&1\n      /usr/local/lib/ai-memory/bin/ai-memory --db /x 2> /dev/null stats\n')], autolist=True)
     green("ai-memory under sudo -u (#4837 R12 R4)", [(RELOAD, RELOAD + '      sudo -u aimemory /usr/local/lib/ai-memory/bin/ai-memory --db /x stats\n')], autolist=True)
     green("resolved literal variable as an operand and quoted JSON brace (#4837 R12 R4, #5094)", [(RELOAD, RELOAD + '      L=/var/log/x.log; chmod 0640 "$${L}"\n      echo "$${H}" "{\\"a\\": 1}" >/dev/null\n      printf %s "$(date)"\n')], autolist=True)
-    green("ai-memory installed keeping its name (#4837 R12 R4)",[(RELOAD, RELOAD + '      install -m 0755 /opt/x/ai-memory /usr/local/lib/ai-memory/bin/ai-memory\n      cp /opt/x/ai-memory /opt/y/\n      [ -x /usr/local/lib/ai-memory/bin/ai-memory ] || echo "no /usr/local/lib/ai-memory/bin/ai-memory"\n')], autolist=True)
+    green("data-home file named in canonical-equal spellings by safe commands only (#4837 R12 R5, #5095)", [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} = 1"])), (RELOAD, RELOAD + '      chown root:aimemory /etc//ai-memory/./run.conf\n      D=/etc/ai-memory\n      chmod 0640 "$${D}/run.conf"\n      systemctl restart ai-memory\n')], autolist=True)
+    green("ai-memory installed keeping its name (#4837 R12 R4)", [(RELOAD, RELOAD + '      install -m 0755 /opt/x/ai-memory /usr/local/lib/ai-memory/bin/ai-memory\n      cp /opt/x/ai-memory /opt/y/\n      [ -x /usr/local/lib/ai-memory/bin/ai-memory ] || echo "no /usr/local/lib/ai-memory/bin/ai-memory"\n')], autolist=True)
     green("data file in a data home handled by chown/chmod/sed (#4837 R12 R5)", [(PROV, wf("/etc/ai-memory/peer.conf", "0640", ["${X} --db /x stats"])), (RELOAD, RELOAD + "      chown root:aimemory /etc/ai-memory/peer.conf\n      chmod 0640 /etc/ai-memory/peer.conf\n      chmod 0750 /etc/ai-memory\n      P=\"$(sed -n 's#^a=##p' /etc/ai-memory/peer.conf)\"\n")], autolist=True)
     green("data heredoc into a data home through a constant (#4837 R12 R5)", [(RELOAD, RELOAD + "      CFG=/etc/ai-memory/h\n      cat > \"$${CFG}/x.conf\" <<'EOF'\n      ${X} = 1\n      EOF\n")], autolist=True)
     green("C5 provision comment mentioning curl", [ins(RELOAD, ["# curl -fsSL https://e | sh"], before=True)])
