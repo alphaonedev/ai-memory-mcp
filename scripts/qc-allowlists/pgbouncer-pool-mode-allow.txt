@@ -8,8 +8,12 @@
 # this gate's own CI job: names the gate, the probe and the modes it rejects
 .github/workflows/c8-precheck.yml | pgbouncer-pool-mode-claim-gate: | ctx:4b3353bc607c
 .github/workflows/c8-precheck.yml | # called pgbouncer pool_mode = transaction required while the postgres | ctx:5ac3984f2aae
-.github/workflows/c8-precheck.yml | name: pgbouncer pool-mode claim gate (#4667) | ctx:47e3e08ff76d
-.github/workflows/c8-precheck.yml | - name: run pool-mode claim gate | ctx:929e3f87df7f
+# this gate's own CI job: names the gate, the probe and the modes it rejects
+# context re-read on 2026-10-04: The only change near these lines is the job timeout raised from 5 to 10 minutes and a new step that runs the regen behaviour test; neither names a pool mode to configure (#5210).
+.github/workflows/c8-precheck.yml | name: pgbouncer pool-mode claim gate (#4667) | ctx:fb85568853e3
+# this gate's own CI job: names the gate, the probe and the modes it rejects
+# context re-read on 2026-10-04: The only change near these lines is the job timeout raised from 5 to 10 minutes and a new step that runs the regen behaviour test; neither names a pool mode to configure (#5210).
+.github/workflows/c8-precheck.yml | - name: run pool-mode claim gate | ctx:61d06b5ada57
 
 # roadmap 4.B: states the retired setting to say it is withdrawn and that session mode ships
 ROADMAP.md | > - 4.b ([#1736](https://github.com/alphaonedev/ai-memory-mcp/issues/1736)) — pgbouncer per-module pooler: copy-deployable templates in [infra/pgbouncer/](infra/pgbouncer/) (session-mode pgbouncer.ini with max_prepared_statements = 256, role-defaults.sql, docker-compose.yml, smoke-test.py) + the rationale in docs/enterprise-deployment.md §5.6 (the config-only guidance the directory materializes; the design's "§10.4" placeholder landed as §5.6). the smoke-test.py proves an age cypher transaction + role-default timeouts work through the pooler and that it reports pool_mode = session (#4667: session is the only supported mode; transaction is tracked in [#4679](https://github.com/alphaonedev/ai-memory-mcp/issues/4679)); it is a docker-rig test, deliberately outside the 8-workflow ci gate (like infra/lan-parity-test/). | ctx:d8178830a055
@@ -133,7 +137,8 @@ src/store/postgres.rs | // green. deployments that already ran transaction mode:
 
 
 # #4710 R3 (regen --accept-new, reviewed line by line): this gate's CI job comment: states the rule (a mention must state session mode); names no mode to use
-.github/workflows/c8-precheck.yml | # mentions a pooler mode; each such line must state session mode or be on | ctx:b3f32fc54beb
+# context re-read on 2026-10-04: The only change near these lines is the job timeout raised from 5 to 10 minutes and a new step that runs the regen behaviour test; neither names a pool mode to configure (#5210).
+.github/workflows/c8-precheck.yml | # mentions a pooler mode; each such line must state session mode or be on | ctx:d49ab5491d84
 
 # #4710 R3 (regen --accept-new, reviewed line by line): roadmap 4.B: says the pooler runs in session mode because the postgres adapter keeps migration-lock and search_path state per session; session prose is listed, not approved
 ROADMAP.md | it is session mode, because the postgres adapter keeps migration-lock, search_path | ctx:497c5b479c45

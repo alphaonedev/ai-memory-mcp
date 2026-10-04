@@ -488,7 +488,7 @@ jobs:
     # normalised line). A stale entry, a malformed entry or an empty scan fails.
     name: PgBouncer pool-mode claim gate (#4667)
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Run pool-mode claim gate
@@ -502,6 +502,12 @@ jobs:
         # the fail-closed cases (missing allowlist, template without exactly
         # one active session line) exit 2.
         run: python3 scripts/check-pgbouncer-pool-mode-claims.py --self-test
+      - name: Behaviour test of the allowlist regen tool (round-5 code review)
+        # The regen tool writes the allowlist the gate trusts: refuse without a flag,
+        # --check never writes, no stock reason, forbidden lines never written,
+        # --drop-stale / --refresh-context / --reasons-file / skip-list reason
+        # promises; each promise has a mutant that must be killed.
+        run: python3 scripts/test-regen-pool-allow.py --mutants
 
   benchmark-claim-gate:
     # CERT GATE (TRUTHFULNESS; #2879, following #2869 + CERT-GATE-2
