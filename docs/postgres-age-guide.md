@@ -792,7 +792,7 @@ the table, the index and the SQLSTATE `23505` class an operator would
 grep for:
 
 ```
-RUST_LOG=store::postgres::chain_append=warn ai-memory serve --store-url postgres://...
+RUST_LOG=store::postgres::chain_append=warn AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url ai-memory serve
 ```
 
 Sustained WARNs mean genuine audit-append contention on that database,
