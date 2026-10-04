@@ -58,7 +58,9 @@ from typing import Dict, List, Optional
 
 HERE = Path(__file__).resolve().parent
 SMOKE = HERE / ".smoke"
-PROJECT = "ai-memory-pgbouncer-smoke"
+# One compose project per checkout: two trees running the smoke test at once
+# must not recreate, answer for or tear down each other's stack (#4710 round 2).
+PROJECT = "ai-memory-pgbouncer-smoke-" + hashlib.sha256(str(Path(__file__).resolve().parent).encode("utf-8")).hexdigest()[:10]
 APP_ROLE = "ai_memory"
 ADMIN_ROLE = "pgbouncer_admin"
 STATS_ROLE = "pgbouncer_stats"
@@ -120,13 +122,31 @@ class Stack:
         files = ["-f", str(HERE / "docker-compose.yml")]
         if self.host:
             files += ["-f", str(HERE / "docker-compose.host.yml")]
-        return self.docker("compose", "-p", PROJECT, *files, *a, check=check)
+        return self.docker("compose", "-p", self.args.project, *files, *a, check=check)
 
     # -- generated material --------------------------------------------
     def write_secret(self, path: Path, text: str) -> None:
-        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as handle:
-            handle.write(text)
+        """Write a secret file that is 0600 whatever existed at the path before.
+
+        A fresh 0600 file is created beside the target (O_EXCL, O_NOFOLLOW) and
+        renamed over it, so a pre-existing wider-mode file or a symlink at the
+        path never receives the secret.
+        """
+        path = Path(path)
+        tmp = path.with_name(".%s.%d.tmp" % (path.name, os.getpid()))
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        try:
+            with os.fdopen(fd, "w") as handle:
+                handle.write(text)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(str(tmp), str(path))
+        except BaseException:
+            try:
+                os.unlink(str(tmp))
+            except OSError:
+                pass
+            raise
 
     def make_tls(self) -> None:
         tls = SMOKE / "tls"
@@ -173,6 +193,16 @@ class Stack:
         argv = ["psql", "-X", "-q", "-tA", "-v", "ON_ERROR_STOP=1", "-h", "127.0.0.1",
                 "-p", str(port or self.pgb_port), "-U", user, "-d", dbname]
         return run(argv, env=env, input_text=sql, check=check)
+
+    def admin_rows(self, what: str) -> list:
+        """Rows of a PgBouncer admin SHOW command as dicts keyed by column header (stats role)."""
+        out = self.psql(STATS_ROLE, self.stats_pw, "pgbouncer",
+                        "\\pset tuples_only off\n\\pset footer off\nSHOW %s;" % what).stdout
+        lines = [line for line in out.splitlines() if line]
+        if not lines:
+            return []
+        header = lines[0].split("|")
+        return [dict(zip(header, line.split("|"))) for line in lines[1:]]
 
     # -- lifecycle -----------------------------------------------------
     def up(self) -> None:
@@ -257,10 +287,37 @@ COMMIT;
             mode, values.get("server_reset_query"), values.get("admin_users"), values.get("stats_users")))
         if mode != "session":
             raise Failure("pooler pool_mode is %r, want 'session' (#4667)" % mode)
+        # #4742: SHOW CONFIG is the global value only. [databases] and [users]
+        # entries override it, so read the effective mode of the pool the
+        # daemon uses (SHOW POOLS: a pool exists after steps 2-3) and every
+        # override row; fail closed when the row or the column is missing.
+        effective = self.admin_rows("POOLS")
+        row = [r for r in effective if r.get("database") == "ai_memory" and r.get("user") == APP_ROLE]
+        if not row or "pool_mode" not in row[0]:
+            raise Failure("SHOW POOLS has no ai_memory/%s row with a pool_mode column (#4742)" % APP_ROLE)
+        print("      effective pool_mode for %s@ai_memory = %s" % (APP_ROLE, row[0]["pool_mode"]))
+        if row[0]["pool_mode"] != "session":
+            raise Failure("the ai_memory pool runs pool_mode %r, want 'session' (#4742)" % row[0]["pool_mode"])
+        for what in ("DATABASES", "USERS"):
+            for r in self.admin_rows(what):
+                # the admin console's own pseudo-database always reports statement
+                if what == "DATABASES" and r.get("name") == "pgbouncer":
+                    continue
+                if r.get("pool_mode") not in (None, "", "session"):
+                    raise Failure("SHOW %s: %s overrides pool_mode to %r, want 'session' (#4742)" % (
+                        what, r.get("name"), r.get("pool_mode")))
         if values.get("server_reset_query") != "DISCARD ALL":
             raise Failure("server_reset_query is %r, want 'DISCARD ALL' (#4736)" % values.get("server_reset_query"))
         if APP_ROLE in (values.get("admin_users") or "").split(","):
             raise Failure("the application role is an admin_users member (#4731)")
+        # #4954: step 5 proves TLS is on, not that it verifies. Assert both hops
+        # run verify-full as PgBouncer reports it, so lowering either to
+        # `require` turns this test red.
+        for key in ("client_tls_sslmode", "server_tls_sslmode"):
+            if values.get(key) != "verify-full":
+                raise Failure("%s is %r, want 'verify-full' (#4729, #4730, #4954)" % (key, values.get(key)))
+        print("      client_tls_sslmode = %s  server_tls_sslmode = %s" % (
+            values.get("client_tls_sslmode"), values.get("server_tls_sslmode")))
 
         print("[5/6] TLS on both hops ...")
         plain = self.psql(APP_ROLE, self.pw, "ai_memory", "SELECT 1;", tls=False, check=False)
@@ -310,6 +367,10 @@ def main(argv: List[str]) -> int:
     parser.add_argument("--pg-port", type=int, default=15432, help="host-network mode only")
     parser.add_argument("--pgb-port", type=int, default=16432, help="host-network mode only")
     parser.add_argument("--keep", action="store_true", help="keep ./.smoke/ for inspection")
+    parser.add_argument("--project", default=PROJECT,
+                        help="compose project name (default: derived from this checkout's path, so two checkouts never "
+                             "share containers; container names derive from it, #4955, #4962). Material lives in this "
+                             "checkout's ./.smoke/, so concurrent runs need separate checkouts")
     parser.add_argument("command", nargs="?", choices=("test", "up", "down"), default="test")
     parser.add_argument("--url-file", help="up: write the daemon's verified-TLS store URL here (mode 0600)")
     args = parser.parse_args(argv)

@@ -26,7 +26,6 @@ name: ai-memory-pgbouncer-smoke
 services:
   postgres:
     image: apache/age:release_PG16_1.6.0
-    container_name: ai-memory-pgbouncer-postgres
     environment:
       POSTGRES_USER: ai_memory
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?run ./smoke-test.py, it generates the password}
@@ -56,7 +55,6 @@ services:
 
   pgbouncer:
     image: edoburu/pgbouncer:v1.23.1-p2
-    container_name: ai-memory-pgbouncer
     # Runs as the caller, so the 0600 key and userlist stay owned by one user.
     user: "${PGB_UID:-70}:${PGB_GID:-70}"
     depends_on:
