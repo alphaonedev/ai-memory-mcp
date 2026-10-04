@@ -803,7 +803,7 @@ from the role's stored verifier:
     [ "$(printf '%s\n' "$line" | wc -l)" -eq 1 ] ||
     { echo "no SCRAM verifier read; userlist.txt left unchanged" >&2; exit 1; }
   if [ -f /etc/pgbouncer/userlist.txt ]; then
-    grep -v '^"aimemory" ' /etc/pgbouncer/userlist.txt >> "$tmp" || [ "$?" -eq 1 ]
+    grep -v '^"aimemory"[[:space:]]' /etc/pgbouncer/userlist.txt >> "$tmp" || [ "$?" -eq 1 ]
   fi
   printf '%s\n' "$line" >> "$tmp"
   chown pgbouncer: "$tmp"; chmod 0600 "$tmp"
