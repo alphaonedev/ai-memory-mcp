@@ -66,9 +66,9 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: git fetch --no-tags origin "+refs/pull/${PR_NUMBER}/head:refs/remotes/pull/head"
       - name: Comparison self-test (base code)
-        run: python3 scripts/claude-md-rule-compare.py --self-test
+        run: python3 -I scripts/claude-md-rule-compare.py --self-test
       - name: Compare the head rule sections with the base manifest
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: python3 scripts/claude-md-rule-compare.py --base-root . --repo . --base-sha "$BASE_SHA" --head-sha "$HEAD_SHA" --scratch "$RUNNER_TEMP/rule-compare" --summary "$GITHUB_STEP_SUMMARY"
+        run: python3 -I scripts/claude-md-rule-compare.py --base-root . --repo . --base-sha "$BASE_SHA" --head-sha "$HEAD_SHA" --scratch "$RUNNER_TEMP/rule-compare" --summary "$GITHUB_STEP_SUMMARY"
