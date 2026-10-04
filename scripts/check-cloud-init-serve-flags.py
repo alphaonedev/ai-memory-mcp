@@ -106,6 +106,9 @@ ROOT = Path(__file__).resolve().parent.parent
 SERVE_SRC = ROOT / "src" / "daemon_runtime.rs"
 TEMPLATE_GLOB = "infra/*/cloud-init-memory*.tpl"
 ALLOW_FILE = ROOT / "scripts" / "qc-allowlists" / "cloud-init-token-allow.txt"
+HBA_CAT = 'cat "$HBA"; } > "$HBA.new"'
+HBA_SHAPE = {'HBA="/etc/postgresql/18/main/pg_hba.conf"', 'if ! grep -q "^# ai-memory-tls (#4635)" "$HBA"; then', HBA_CAT,
+             'chown --reference="$HBA" "$HBA.new"', 'chmod --reference="$HBA" "$HBA.new"', 'mv "$HBA.new" "$HBA"'}
 PENDING_FILE = ROOT / "scripts" / "qc-allowlists" / "cloud-init-token-pending.txt"
 AWS_TEMPLATE = "infra/aws-gpu-burst/cloud-init-memory.yaml.tpl"
 DO_TEMPLATE = "infra/do-hive/cloud-init-memory.yaml.tpl"
@@ -1561,12 +1564,34 @@ def run_scan(templates: dict, maintfs: dict, allow_text: str, pending_text: str,
         hits.extend(phits)
         live = [x.joined for x in lines if not x.exempt]
         if any("pg_hba" in x for x in live):
-            if not any('"hostnossl all all all reject"' in x for x in live):
-                hits.append("%s: writes pg_hba without a live \"hostnossl all all all reject\" line (#4676)" % nm)
-            if not any('"hostnossl replication all all reject"' in x for x in live):
-                hits.append("%s: writes pg_hba without a live \"hostnossl replication all all reject\" line: `all` does not match the replication pseudo-database (#4676)" % nm)
+            # Presence of the string is not protection: the reject must be an argument of
+            # the printf whose output is written AHEAD of the packaged lines (first match
+            # wins), i.e. the live line right before `cat "$HBA"; } > "$HBA.new"`, and
+            # that file must replace $HBA.
+            def hba_prepends(needle):
+                for i in range(len(live) - 1):
+                    s = live[i].strip()
+                    if (re.match(r"^\{\s*printf '%s\\n' ", s) and needle in s
+                            and live[i + 1].strip() == 'cat "$HBA"; } > "$HBA.new"'):
+                        return any(x.strip() == 'mv "$HBA.new" "$HBA"' for x in live[i + 2:])
+                return False
+            if not hba_prepends('"hostnossl all all all reject"'):
+                hits.append("%s: writes pg_hba without \"hostnossl all all all reject\" in the printf prepended ahead of the packaged lines (#4676)" % nm)
+            if not hba_prepends('"hostnossl replication all all reject"'):
+                hits.append("%s: writes pg_hba without \"hostnossl replication all all reject\" in the printf prepended ahead of the packaged lines: `all` does not match the replication pseudo-database (#4676)" % nm)
             if not any(re.search(r"[\"']ssl = on[\"']", x) for x in live):
                 hits.append("%s: writes pg_hba without a live \"ssl = on\" line (#4704)" % nm)
+            # Position, not presence (#4784): both rejects sit in ONE printf written BEFORE the
+            # packaged file, and no other live line touches pg_hba (a stray write, a decoy
+            # line or a second file replacing $HBA is a hit).
+            lv = [x.joined.strip() for x in lines if not x.exempt]
+            head = [i for i, x in enumerate(lv) if x.startswith("{ printf ") and '"hostnossl all all all reject"' in x
+                    and '"hostnossl replication all all reject"' in x and i + 1 < len(lv) and lv[i + 1] == HBA_CAT]
+            if len(head) != 1:
+                hits.append("%s: the hostnossl rejects are not written ahead of the packaged pg_hba lines (#4676/#4784)" % nm)
+            for x in lv:
+                if ("$HBA" in x or "pg_hba.conf" in x) and x not in HBA_SHAPE and not (head and x == lv[head[0]]):
+                    hits.append("%s: pg_hba touched outside the pinned write: %s (#4784)" % (nm, x[:80]))
         if not trig:
             faults.append("%s: zero triggered lines (fail closed)" % nm)
         ntrig += len(trig)
@@ -1696,6 +1721,10 @@ def build_probes() -> list:
     red("S-4676 replication reject line deleted (aws)", [(REPL, "")])
     red("S-4676 replication reject turned into an accept (aws)", [(REPL, '            "hostnossl replication all all scram-sha-256" \\\n')])
     red("S-4676 replication reject narrowed to one role (aws)", [(REPL, '            "hostnossl replication aimemory all reject" \\\n')])
+    HCAT = '          cat "$HBA"; } > "$HBA.new"\n'
+    red("S-4676 replication reject moved after the packaged lines (aws)", [(REPL, ""), (HCAT, '          cat "$HBA"\n          printf \'%s\\n\' "hostnossl replication all all reject"; } > "$HBA.new"\n')])
+    red("S-4676 replication reject only on a no-op command (aws)", [(REPL, ""), (HCAT, HCAT + '          : "hostnossl replication all all reject"\n')])
+    red("S-4676 all-roles reject only printed to /dev/null (aws)", [('            "hostnossl all all all reject" \\\n', ""), (HCAT, HCAT + '          printf \'%s\\n\' "hostnossl all all all reject" > /dev/null\n')])
     red("S-R1 runtime argv via sh -c", [(EXEC, "ExecStart=/bin/sh -c 'exec " + BIN + " serve " + SU + " \"$(cat /etc/ai-memory/store-url)\" --host 0.0.0.0'")])
     red("S-R2 password= query on serve", [(EXEC, EXEC.replace("serve", "serve " + SU + " " + NOPW.replace("?", "?password=" + PW + "&")))])
     red("S-R3 Environment= DSN in a 0644 unit", [(ENVF, "      Environment=AI_MEMORY_STORE_URL=" + DSN + "\n")])
@@ -1947,9 +1976,21 @@ def build_probes() -> list:
 
     dred("D-4676 hostnossl reject narrowed to one role", [(DNOSSL, "            \"hostnossl aimemory aimemory all reject\" \\\n")], autolist=True)
     DREPL = '            "hostnossl replication all all reject" \\\n'
+    HHEAD = "        { printf '%s\\n' \"# ai-memory-tls (#4635)\" \\\n"
+    HCAT2 = '          cat "$HBA"; } > "$HBA.new"\n'
+    HMUTS = (("packaged pg_hba lines written before the rejects", [(HHEAD, "        { cat \"$HBA\"; printf '%s\\n' \"# ai-memory-tls (#4635)\" \\\n"), (HCAT2, '          } > "$HBA.new"\n')]),
+             ("rejects appended after the packaged file", [(HCAT2, HCAT2 + '        cat "$HBA" "$HBA.new" > "$HBA.new2"; mv "$HBA.new2" "$HBA.new"\n')]),
+             ("replication reject removed, decoy line keeps the text", [('            "hostnossl replication all all reject" \\\n', ""), (HCAT2, HCAT2 + '        echo "hostnossl replication all all reject" >/dev/null\n')]))
+    for hl, hm in HMUTS:
+        dred("D-4784 " + hl, hm, autolist=True)
+        red("S-4784 " + hl + " (aws)", hm)
     dred("D-4676 replication reject line deleted", [(DREPL, "")], autolist=True)
     dred("D-4676 replication reject turned into an accept", [(DREPL, '            "hostnossl replication all all scram-sha-256" \\\n')], autolist=True)
     dred("D-4676 replication reject narrowed to one role", [(DREPL, '            "hostnossl replication postgres all reject" \\\n')], autolist=True)
+    DHCAT = '          cat "$HBA"; } > "$HBA.new"\n'
+    dred("D-4676 replication reject moved after the packaged lines", [(DREPL, ""), (DHCAT, '          cat "$HBA"\n          printf \'%s\\n\' "hostnossl replication all all reject"; } > "$HBA.new"\n')], autolist=True)
+    dred("D-4676 replication reject only inside if false", [(DREPL, ""), (DHCAT, DHCAT + '          if false; then echo "hostnossl replication all all reject"; fi\n')], autolist=True)
+    dred("D-4676 all-roles reject only on a no-op command", [(DNOSSL, ""), (DHCAT, DHCAT + '          : "hostnossl all all all reject"\n')], autolist=True)
     dred("D-4676 hostnossl reject line deleted", [(DNOSSL, "")], autolist=True)
     dred("D-4676 hostnossl reject turned into an accept", [(DNOSSL, "            \"hostnossl all all all scram-sha-256\" \\\n")], autolist=True)
     dred("D-4704 ssl = off with ssl = on only in a comment", [(DSSL, "# ssl = on\n        printf '%s\\n' \"# ai-memory-tls (#4635)\" \"ssl = off\" \\\n")], autolist=True)
