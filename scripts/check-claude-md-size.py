@@ -58,7 +58,7 @@ from pathlib import Path
 # Ceilings only fall (#4507 target: <= 80 KB). Keep CLAUDE.md short rather than raising this.
 CLAUDE_MD_MAX_BYTES = 80_000
 # Floors only rise. Measured at the #4507 split: 64,378 bytes plus the binding-rules index.
-CLAUDE_MD_MIN_BYTES = 55_000
+CLAUDE_MD_MIN_BYTES = 60_000
 
 # Pinned `## ` headings of CLAUDE.md, identical to the pre-split file at 9f68ea41a (15 headings).
 CLAUDE_MD_REQUIRED_HEADINGS = (
@@ -889,7 +889,12 @@ def run_cases(base: Path) -> bool:
 
     root = fresh()
     (root / claude_md).write_text("\n".join(CLAUDE_MD_REQUIRED_HEADINGS) + "\n", encoding="utf-8")
-    ok &= expect(root, "a CLAUDE.md under the byte floor", True, "floor")
+    ok &= expect(root, "a CLAUDE.md under the byte floor", True, "CLAUDE_MD_MIN_BYTES")
+
+    root = fresh()
+    text = fixture_claude_text()
+    (root / claude_md).write_text(text + "x" * (CLAUDE_MD_MIN_BYTES - 1 - len(text.encode("utf-8"))), encoding="utf-8")
+    ok &= expect(root, "R5 a CLAUDE.md one byte under the floor, every section floor met", True, "CLAUDE_MD_MIN_BYTES")
 
     root = fresh()
     (root / arch).unlink()
@@ -1502,7 +1507,7 @@ def run_ref_cases(fresh, arch: str, style: str) -> bool:
 # must make (and a reviewer must see). Ceilings only fall, floors only rise.
 SELF_TEST_PINNED_LIMITS = {
     "CLAUDE_MD_MAX_BYTES": 80_000,
-    "CLAUDE_MD_MIN_BYTES": 55_000,
+    "CLAUDE_MD_MIN_BYTES": 60_000,
     "CLAUDE_MD_REQUIRED_HEADINGS_COUNT": 15,
     # sha256 of the 15 pinned headings joined by newline: rewording or swapping one is a deliberate edit too.
     "CLAUDE_MD_REQUIRED_HEADINGS_SHA256": "a96178554adeea9c1a96dc35950a8f8d6987c88f6a196c0683a52c725c8f9db4",
