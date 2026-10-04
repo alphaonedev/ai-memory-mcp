@@ -981,10 +981,12 @@ def bare_operand_problem(words: list, idx, bins):
         val, exp = unquote(w)
         if not exp or mask_expansions(val) != "\x01":
             continue
-        m = re.match(r"\$\{?[#!]?([A-Za-z_]\w*)", val)
-        if m is None and re.match(r"\$\{?[#!]?[0-9@*#?$!-]", val):
+        # only a plain $X or ${X} reads a resolved name's value: an operator, default,
+        # indirection, length, case or subscript form builds other text (fail closed, #5173)
+        m = re.fullmatch(r"\$(?:([A-Za-z_]\w*)|\{([A-Za-z_]\w*)\})", val)
+        if m is None and re.fullmatch(r"\$(?:[0-9@*#?$!-]|\{(?:[0-9]+|[@*#?$!-])\})", val):
             continue
-        name = None if m is None or val.startswith("${!") else m.group(1)
+        name = None if m is None else (m.group(1) or m.group(2))
         if name is None or (name not in resolved and name not in bins):
             return ("%r is an operand of %r whose value the gate cannot read (an unresolved expansion may "
                     "name the ai-memory binary)" % (w[:40], base))
@@ -2852,6 +2854,9 @@ def build_probes() -> list:
         ('append-built name run behind taskset, listed (#4837 R12 R4, #5094 R11)', [(dec, '      C=/usr/local/lib/ai-memory/bin/ai-; C+=memory; taskset -c 0 "$C" --db /x stats\n' + dec)]),
         ('glob value run unquoted behind taskset, listed (#4837 R12 R4, #5094 R11)', [(dec, '      C="/usr/local/lib/ai-memory/bin/ai-mem*"; taskset -c 0 $C --db /x stats\n' + dec)]),
         ('unassigned variable run behind taskset, listed (#4837 R12 R4, #5094)', [(dec, '      taskset -c 0 "$${UNSET}" --db /x stats\n' + dec)]),
+        ('resolved name through a default operator behind taskset, listed (#4837 R12 R4, #5173)', [(dec, '      A=; taskset -c 0 "$${A:-/usr/local/lib/ai-memory/bin/ai-memory}" --db /x stats\n' + dec)]),
+        ('resolved name through a pattern operator behind taskset, listed (#4837 R12 R4, #5173)', [(dec, '      A=/usr/local/lib/ai-memory/bin/ai-memorx; taskset -c 0 "$${A/x/y}" --db /x stats\n' + dec)]),
+        ('resolved name through a case operator behind taskset, listed (#4837 R12 R4, #5173)', [(dec, '      A=/usr/local/lib/ai-memory/bin/AI-MEMORY; taskset -c 0 "$${A,,}" --db /x stats\n' + dec)]),
         ('ai-memory through a variable behind taskset, listed (#4837 R12 R4)', [(dec, '      AIM=/usr/local/lib/ai-memory/bin/ai-memory; taskset -c 0 "$${AIM}" --db $${X} stats\n' + dec)]),
         ('shell run by an unknown wrapper, listed (#4837 R12 R4)', [(dec, "      taskset -c 0 sh -c '/usr/local/lib/ai-memory/bin/ai-memory --db $${X} stats'\n" + dec)]),
         ('ai-memory copied to another name with cp, listed (#4837 R12 R4)', [(dec, '      cp /usr/local/lib/ai-memory/bin/ai-memory /usr/local/bin/aim\n' + dec)]),
@@ -2873,6 +2878,8 @@ def build_probes() -> list:
         ('data-home file run by a dot after PATH, listed (#4837 R12 R5, #5095)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      PATH=/etc/ai-memory:$PATH; . run.conf\n" + dec)]),
         ('data-home file run as an unresolved operand, listed (#4837 R12 R5, #5095)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      F=$(cat /etc/x); bash \"$${F}\"\n" + dec)]),
         ('data-home file run as an unresolved stdin target, listed (#4837 R12 R5, #5095)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      read F < /etc/x; bash < \"$${F}\"\n" + dec)]),
+        ('data-home file run through a default operator on an empty name, listed (#4837 R12 R5, #5173)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, '      A=; bash "$${A:-/etc/ai-memory/run.conf}"\n' + dec)]),
+        ('data-home file run through a suffix operator, listed (#4837 R12 R5, #5173)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, '      A=/etc/ai-memory/run.conf.x; bash "$${A%.x}"\n' + dec)]),
         ('data-home file copied by tee from its stdin, then the copy run, listed (#4837 R12 R5, #5096)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      tee /usr/local/bin/r.sh < /etc/ai-memory/run.conf > /dev/null\n      bash /usr/local/bin/r.sh\n" + dec)]),
         ('data-home file copied by sed in a redirected group, then the copy run, listed (#4837 R12 R5, #5096)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      { sed 's/a/a/' /etc/ai-memory/run.conf; } > /usr/local/bin/r.sh\n      bash /usr/local/bin/r.sh\n" + dec)]),
         ('data-home file named by echo in a substitution, then the copy run, listed (#4837 R12 R5, #5096)', [(PROV, wf("/etc/ai-memory/run.conf", "0644", ["${X} --db /x stats"])), (dec, "      taskset -c 0 \"$(echo /etc/ai-memory/run.conf)\".x\n      bash /usr/local/bin/r.sh\n" + dec)]),
