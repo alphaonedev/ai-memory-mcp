@@ -308,6 +308,9 @@ def shadow(text: str) -> str:
 # after the shadow fold may hide a word, and U+FFFD marks an invalid byte the decoder replaced.
 DECLARED = frozenset(map(chr, range(0x20, 0x7F))) | frozenset(
     "\u2018\u2019\u201c\u201d\u2013\u2014\u2026\u2190\u2192\u2194\u21d2\u00a7\u00b7\u00d7\u2264\u2265\u2500\u2502")
+# #5364: format characters that reorder a line (embeddings, overrides, isolates, directional marks, Arabic letter mark):
+# the shadow view drops format characters to join words, so these are reported before that and make a line unreadable.
+BIDI = frozenset(map(chr, list(range(0x202A, 0x202F)) + list(range(0x2066, 0x206A)) + [0x200E, 0x200F, 0x061C]))
 _ANSI_CSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")  # colour codes in recorded terminal logs render as nothing
 
 
@@ -320,7 +323,9 @@ def hidden_chars(text: str) -> str:
     if text.isascii() and text.isprintable():
         return ""
     found = {"\ufffd"} if "\ufffd" in text else set()
-    view = shadow(_ANSI_CSI.sub("", text))
+    plain = _ANSI_CSI.sub("", text)
+    found |= {c for c in plain if c in BIDI}
+    view = shadow(plain)
     for i, c in enumerate(view):
         if c in DECLARED or c.isspace():
             continue
@@ -349,7 +354,7 @@ def unreadable(text: str) -> bool:
     """R9: a line that may hide a pooler claim: U+FFFD anywhere, or a hiding character on a line that names a
     pool, mode or product word."""
     hidden = hidden_chars(text)
-    return bool(hidden) and ("\ufffd" in hidden or bool(_QUICK.search(shadow(text))) or _lookalike_word(shadow(text)))
+    return bool(hidden) and ("\ufffd" in hidden or any(c in BIDI for c in hidden) or bool(_QUICK.search(shadow(text))) or _lookalike_word(shadow(text)))
 
 
 def _mentions_one(text: str) -> bool:
@@ -825,6 +830,17 @@ PLANTED: List[Tuple[str, str, str]] = [
     # #5363: a mode word made only of letters the fold does not know (small capitals), with or without an ASCII neighbour
     ("R9 #5363: a mode word of small capitals only", "docs/a.md", "Run PgBouncer in \u1d1b\u0280\u1d00\u0274\ua731\u1d00\u1d04\u1d1b\u026a\u1d0f\u0274 \u1d0d\u1d0f\u1d05\u1d07.\n"),
     ("R9 #5363: small capitals pooling after an ASCII-touching letter", "docs/a.md", "Use \u1d1b\u0280\u1d00\u0274s\u1d00\u1d04\u1d1b\u026a\u1d0f\u0274 \u1d18\u1d0f\u1d0f\u029f\u026a\u0274\u0262.\n"),
+    # #5364: bidi controls reorder a line; they are reported, never dropped silently
+    ("R9 #5364: a reversed mode word between bidi overrides", "docs/a.md", "Run PgBouncer in \u202enoitcasnart\u202c mode.\n"),
+    ("R9 #5364: a reversed pooling word between bidi overrides", "docs/a.md", "Use \u202enoitcasnart\u202c pooling.\n"),
+    ("R9 #5364: a bidi isolate on a line with no pool word", "docs/a.md", "Use \u2067noitcasnart\u2069 here.\n"),
+    ("R9 #5364: a left-to-right mark on a line with no pool word", "docs/a.md", "Use it\u200e now.\n"),
+    ("R9 #5364: a right-to-left mark on a line with no pool word", "docs/a.md", "Use it\u200f now.\n"),
+    ("R9 #5364: an Arabic letter mark on a line with no pool word", "docs/a.md", "Use it\u061c now.\n"),
+    ("R9 #5364: the first embedding control on a line with no pool word", "docs/a.md", "Use it\u202a now.\n"),
+    ("R9 #5364: the last override control on a line with no pool word", "docs/a.md", "Use it\u202e now.\n"),
+    ("R9 #5364: the last isolate control on a line with no pool word", "docs/a.md", "Use it\u2069 now.\n"),
+    ("R9 #5364: the first isolate control on a line with no pool word", "docs/a.md", "Use it\u2066 now.\n"),
     ("R9 #5363: a letter the fold does not know, spaced, on a pool line", "docs/a.md", "Run PgBouncer in \u0434\u0436\u0437\u0438\u044f mode.\n"),
     ("R9 #5363: small capitals on a config context line fold to the mode word", "docs/a.md",
      "```ini\npool_mode = session\ndefault = \u1d1b\u0280\u1d00\u0274s\u1d00\u1d04\u1d1b\u026a\u1d0f\u0274\n```\n"),
@@ -1334,8 +1350,19 @@ MUTANTS: List[Tuple[str, str, str]] = [
     ("R9 U+FFFD always counts", '    found = {"\\ufffd"} if "\\ufffd" in text else set()', "    found = set()"),
     ("R9 approved shapes hold DECLARED characters", "    if not all(c in DECLARED for c in text):\n        return False", "    if False:\n        return False"),
     ("R9 needs a pool word", "or bool(_QUICK.search(shadow(text))) or _lookalike", "or True or _lookalike"),
-    ("R9 colour codes dropped", '    view = shadow(_ANSI_CSI.sub("", text))', "    view = shadow(text)"),
+    ("R9 colour codes dropped", '    plain = _ANSI_CSI.sub("", text)', "    plain = text"),
     ("R9 a character touching a letter", "        elif (i and _ascii_letter(view[i - 1])) or (i + 1 < len(view) and _ascii_letter(view[i + 1])):", "        elif False:"),
+    ("R9 #5364 bidi controls are reported", "    found |= {c for c in plain if c in BIDI}", "    found |= set()"),
+    ("R9 #5364 a bidi control makes a line unreadable on its own", 'or any(c in BIDI for c in hidden) or', "or"),
+    ("R9 #5364 bidi set keeps the overrides", "list(range(0x202A, 0x202F))", "list(range(0x202A, 0x202A))"),
+    ("R9 #5364 bidi set keeps the isolates", "list(range(0x2066, 0x206A))", "list(range(0x2066, 0x2066))"),
+    ("R9 #5364 bidi set keeps the left-to-right mark", "[0x200E, 0x200F, 0x061C]", "[0x200F, 0x061C]"),
+    ("R9 #5364 bidi set keeps the right-to-left mark", "[0x200E, 0x200F, 0x061C]", "[0x200E, 0x061C]"),
+    ("R9 #5364 bidi set keeps the Arabic letter mark", "[0x200E, 0x200F, 0x061C]", "[0x200E, 0x200F]"),
+    ("R9 #5364 bidi overrides start at U+202A", "list(range(0x202A, 0x202F))", "list(range(0x202B, 0x202F))"),
+    ("R9 #5364 bidi overrides end at U+202E", "list(range(0x202A, 0x202F))", "list(range(0x202A, 0x202E))"),
+    ("R9 #5364 bidi isolates start at U+2066", "list(range(0x2066, 0x206A))", "list(range(0x2067, 0x206A))"),
+    ("R9 #5364 bidi isolates end at U+2069", "list(range(0x2066, 0x206A))", "list(range(0x2066, 0x2069))"),
     ("R9 #5363 any non-ASCII letter counts", '        if unicodedata.category(c).startswith("L"):', "        if False:"),
     ("R9 #5363 Latin letters fold by name", "    t = t.translate(_LATIN).casefold()", "    t = t.casefold()"),
     ("R9 #5363 a foreign word is unreadable without a pool word", "or _lookalike_word(shadow(text)))", ")"),
