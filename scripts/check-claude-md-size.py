@@ -530,7 +530,17 @@ def refs_errors(root: Path) -> list:
 # R3-F9: live docs (docs/internal, docs/v1.0.0) must not cite a moved section as a CLAUDE.md section. The frozen
 # per-release records (docs/v0.7.0 and older, CHANGELOG.md) quote history and are not scanned.
 CITATION_DIRS = ("docs/internal", "docs/v1.0.0")
-CLAUDE_CITATION = re.compile(r'CLAUDE\.md`?\s+(?:\u00a7\s*)?[\u201c"]([^"\u201d]+)[\u201d"]')
+# R4 (#4507): also the possessive (`CLAUDE.md's "X"`), the word form (`CLAUDE.md section "X"`) and a heading
+# anchor link (`CLAUDE.md#x-y`, matched against the GitHub slug of each moved heading below).
+CLAUDE_CITATION = re.compile(
+    r'CLAUDE\.md`?(?:\u2019s|\'s)?\s+(?:(?:section|heading|rule)\s+)?(?:\u00a7\s*)?[\u201c"]([^"\u201d]+)[\u201d"]',
+    re.IGNORECASE)
+CLAUDE_ANCHOR = re.compile(r'CLAUDE\.md#([a-z0-9_-]+)', re.IGNORECASE)
+
+
+def github_slug(heading: str) -> str:
+    """The GitHub anchor of a Markdown heading: lower case, punctuation dropped, spaces to hyphens."""
+    return re.sub(r"[^\w\- ]", "", heading.strip().lower()).replace(" ", "-")
 
 
 def stale_citation_errors(root: Path) -> list:
@@ -549,6 +559,13 @@ def stale_citation_errors(root: Path) -> list:
             except OSError as exc:
                 errors.append(f"FAIL: cannot read {path.relative_to(root)}: {exc}")
                 continue
+            slugs = {github_slug(sub): sub for sub in moved}
+            for match in CLAUDE_ANCHOR.finditer(text):
+                if match.group(1).lower() in slugs:
+                    line = text.count("\n", 0, match.start()) + 1
+                    errors.append(
+                        f"FAIL: {path.relative_to(root)}:{line} links CLAUDE.md#{match.group(1)}, which moved to a "
+                        "docs/reference file; cite the reference file (#4507 R4)")
             for match in CLAUDE_CITATION.finditer(text):
                 if match.group(1).strip() in moved:
                     line = text.count("\n", 0, match.start()) + 1
@@ -1255,12 +1272,31 @@ def run_citation_cases(fresh) -> bool:
     ok = True
     heading = next(iter(REFERENCE_SUBSECTIONS["ARCHITECTURE_REFERENCE"])).lstrip("#").strip()
     for directory in CITATION_DIRS:
-        for form in ('CLAUDE.md "{h}" 2', 'CLAUDE.md \u00a7"{h}"', 'CLAUDE.md` \u00a7\u201c{h}\u201d'):
+        for form in ('CLAUDE.md "{h}" 2', 'CLAUDE.md \u00a7"{h}"', 'CLAUDE.md` \u00a7\u201c{h}\u201d',
+                     "CLAUDE.md's \"{h}\"", 'CLAUDE.md section "{h}"', "CLAUDE.md\u2019s heading \u201c{h}\u201d"):
             root = fresh()
             doc = root / directory / "nested" / "note.md"
             doc.parent.mkdir(parents=True)
             doc.write_text("See " + form.format(h=heading) + ".\n", encoding="utf-8")
             ok &= expect(root, f"R3-F9 stale citation in {directory} ({form[:14]})", True, "R3-F9")
+        root = fresh()
+        doc = root / directory / "anchor.md"
+        doc.parent.mkdir(parents=True, exist_ok=True)
+        doc.write_text(f"See [it](../../CLAUDE.md#{github_slug(heading)}).\n", encoding="utf-8")
+        ok &= expect(root, f"R4 stale anchor link in {directory}", True, "R4")
+    for label, form, want in (
+            ("upper-case file name", 'See CLAUDE.MD section "{h}".', True),
+            ("the word rule", 'See CLAUDE.md rule "{h}".', True),
+            ("upper-case anchor", "See CLAUDE.md#" + github_slug(heading).upper() + ".", True),
+            ("anchor of a heading that did not move", "See [rule](CLAUDE.md#hard-rule).", False),
+            ("anchor that names no heading", "See CLAUDE.md#no-such-heading.", False),
+            ("possessive of a section that stayed", 'See CLAUDE.md\'s "Hard rule".', False),
+            ("section word with a section that stayed", 'See CLAUDE.md section "Build & Test Commands".', False)):
+        root = fresh()
+        doc = root / "docs" / "internal" / "form.md"
+        doc.parent.mkdir(parents=True, exist_ok=True)
+        doc.write_text(form.format(h=heading) + "\n", encoding="utf-8")
+        ok &= expect(root, f"R5 citation form: {label}", want, "R4" if "anchor" in label else "R3-F9")
     root = fresh()
     doc = root / "docs" / "internal" / "note.md"
     doc.parent.mkdir(parents=True)
