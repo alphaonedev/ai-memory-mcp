@@ -892,6 +892,10 @@ BANNED_CONSTRUCTS = (
     (r"\$\{!", "indirect expansion"), (r"(?<![\w-])(?:declare|local|typeset)\s+-\w*n", "nameref"),
     (r"(?<![\w-])read(?![\w-])", "read"), (r"(?<![\w-])(?:mapfile|readarray)(?![\w-])", "mapfile"),
     (r"(?<![\w-])tee(?![\w-])", "tee"), (r"(?<![\w-])source(?![\w-])|(?:^|[;&|]\s*)\.\s", "source"),
+    # #5359: an assignment whose target the taint scan cannot record.
+    (r"(?<![\w$])\w+\[[^\]]*\]\+?=", "indexed assignment"),
+    (r"(?<![\w$])\w+\+?=[^\s]*\\\s", "escaped space in an assignment"),
+    (r"\$\{\w+:?=", "default-assign expansion"),
 )
 
 
@@ -969,7 +973,13 @@ def closed_world_taint(fs):
                         ("read", 'read -r t <<< "$qjson"'), ("printf -v", "printf -v t '%s' \"$qjson\""),
                         ("an indirect expansion", 'n=qjson\nno "x ${!n}"'), ("a nameref", 'declare -n r=qjson\nno "x $r"'),
                         ("mapfile", 'mapfile -t arr < "$f"'), ("tee", 'tee < "$f"'), ("source", 'source "$f"'),
-                        ("a here-document in verify", 'cat <<EOF\n$qjson\nEOF')):
+                        ("a here-document in verify", 'cat <<EOF\n$qjson\nEOF'),
+                        # #5359: assignment forms whose target the name-based scan cannot record.
+                        ("an indexed assignment", 'arr[0]=$qjson\nno "x ${arr[0]}"'),
+                        ("an indexed append assignment", 'arr[1]+=$qjson\nno "x ${arr[1]}"'),
+                        ("an escaped space in an assignment", 't=x\\ $qjson\nno "x $t"'),
+                        ("a default-assign expansion", ': "${t:=$qjson}"\nno "x $t"'),
+                        ("a default-assign expansion without the colon", ': "${t=$qjson}"\nno "x $t"')):
         probe("V1 construct negative control is flagged: %s" % label, len(construct_findings(wrap(body))) > len(cb))
     # Accepted by design (#5236): reply_status prints only a 3-digit status or the word non-status, so a
     # reply body passed to it reaches the terminal as one of those 1001 closed values, never as its bytes.
